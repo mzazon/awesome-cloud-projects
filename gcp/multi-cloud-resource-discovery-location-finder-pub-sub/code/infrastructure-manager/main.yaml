@@ -1,0 +1,593 @@
+# Google Cloud Infrastructure Manager Configuration
+# Multi-Cloud Resource Discovery with Cloud Location Finder and Pub/Sub
+# This configuration deploys a complete multi-cloud location intelligence system
+
+deployments:
+  multi-cloud-location-discovery:
+    imports:
+    - path: pubsub.yaml
+    - path: storage.yaml
+    - path: functions.yaml
+    - path: scheduler.yaml
+    - path: monitoring.yaml
+    - path: iam.yaml
+
+# Project-level configuration and APIs
+terraform:
+  source:
+    repo: https://github.com/terraform-google-modules/terraform-google-project-factory
+    sourceRef: v15.0.1
+
+# Enable required Google Cloud APIs
+- name: enable-apis
+  type: gcp-types/serviceusage-v1:services
+  properties:
+    name: projects/{{ env["project"] }}/services/cloudlocationfinder.googleapis.com
+    parent: projects/{{ env["project"] }}
+  metadata:
+    dependsOn:
+    - name: enable-pubsub-api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        name: projects/{{ env["project"] }}/services/pubsub.googleapis.com
+        parent: projects/{{ env["project"] }}
+
+- name: enable-functions-api
+  type: gcp-types/serviceusage-v1:services
+  properties:
+    name: projects/{{ env["project"] }}/services/cloudfunctions.googleapis.com
+    parent: projects/{{ env["project"] }}
+
+- name: enable-scheduler-api
+  type: gcp-types/serviceusage-v1:services
+  properties:
+    name: projects/{{ env["project"] }}/services/cloudscheduler.googleapis.com
+    parent: projects/{{ env["project"] }}
+
+- name: enable-storage-api
+  type: gcp-types/serviceusage-v1:services
+  properties:
+    name: projects/{{ env["project"] }}/services/storage.googleapis.com
+    parent: projects/{{ env["project"] }}
+
+- name: enable-monitoring-api
+  type: gcp-types/serviceusage-v1:services
+  properties:
+    name: projects/{{ env["project"] }}/services/monitoring.googleapis.com
+    parent: projects/{{ env["project"] }}
+
+# Pub/Sub Topic for Location Data Processing
+- name: location-discovery-topic
+  type: gcp-types/pubsub-v1:projects.topics
+  properties:
+    name: projects/{{ env["project"] }}/topics/location-discovery-{{ env["deployment"] }}
+    messageRetentionDuration: 604800s  # 7 days
+    labels:
+      purpose: multi-cloud-location-discovery
+      environment: "{{ properties["environment"] }}"
+      managed-by: infrastructure-manager
+  metadata:
+    dependsOn:
+    - enable-pubsub-api
+
+# Pub/Sub Subscription for Cloud Function Processing
+- name: location-discovery-subscription
+  type: gcp-types/pubsub-v1:projects.subscriptions
+  properties:
+    name: projects/{{ env["project"] }}/subscriptions/location-discovery-{{ env["deployment"] }}-sub
+    topic: $(ref.location-discovery-topic.name)
+    ackDeadlineSeconds: 300  # 5 minutes for complex processing
+    messageRetentionDuration: 604800s  # 7 days
+    retryPolicy:
+      minimumBackoff: 10s
+      maximumBackoff: 600s
+    deadLetterPolicy:
+      deadLetterTopic: $(ref.location-discovery-dlq-topic.name)
+      maxDeliveryAttempts: 10
+    labels:
+      purpose: multi-cloud-location-discovery
+      environment: "{{ properties["environment"] }}"
+      managed-by: infrastructure-manager
+  metadata:
+    dependsOn:
+    - location-discovery-topic
+    - location-discovery-dlq-topic
+
+# Dead Letter Queue Topic for Failed Messages
+- name: location-discovery-dlq-topic
+  type: gcp-types/pubsub-v1:projects.topics
+  properties:
+    name: projects/{{ env["project"] }}/topics/location-discovery-{{ env["deployment"] }}-dlq
+    messageRetentionDuration: 604800s  # 7 days
+    labels:
+      purpose: dead-letter-queue
+      environment: "{{ properties["environment"] }}"
+      managed-by: infrastructure-manager
+  metadata:
+    dependsOn:
+    - enable-pubsub-api
+
+# Cloud Storage Bucket for Location Reports and Data
+- name: location-reports-bucket
+  type: gcp-types/storage-v1:buckets
+  properties:
+    name: location-reports-{{ env["project"] }}-{{ env["deployment"] }}
+    location: "{{ properties["region"] }}"
+    storageClass: STANDARD
+    versioning:
+      enabled: true
+    lifecycle:
+      rule:
+      - action:
+          type: Delete
+        condition:
+          age: 90  # Delete files older than 90 days
+          isLive: false
+      - action:
+          type: SetStorageClass
+          storageClass: NEARLINE
+        condition:
+          age: 30  # Move to Nearline after 30 days
+          isLive: true
+    uniformBucketLevelAccess:
+      enabled: true
+    labels:
+      purpose: location-intelligence-storage
+      environment: "{{ properties["environment"] }}"
+      managed-by: infrastructure-manager
+  metadata:
+    dependsOn:
+    - enable-storage-api
+
+# IAM Service Account for Cloud Function
+- name: location-function-service-account
+  type: gcp-types/iam-v1:projects.serviceAccounts
+  properties:
+    accountId: location-func-{{ env["deployment"] }}
+    displayName: Multi-Cloud Location Discovery Function Service Account
+    description: Service account for processing location data from Cloud Location Finder
+    serviceAccount:
+      displayName: Location Discovery Function SA
+  metadata:
+    dependsOn:
+    - enable-functions-api
+
+# IAM Binding for Service Account - Storage Admin
+- name: storage-admin-binding
+  type: gcp-types/cloudresourcemanager-v1:projects.iamMemberBinding
+  properties:
+    resource: {{ env["project"] }}
+    member: serviceAccount:$(ref.location-function-service-account.email)
+    role: roles/storage.objectAdmin
+  metadata:
+    dependsOn:
+    - location-function-service-account
+
+# IAM Binding for Service Account - Pub/Sub Subscriber
+- name: pubsub-subscriber-binding
+  type: gcp-types/cloudresourcemanager-v1:projects.iamMemberBinding
+  properties:
+    resource: {{ env["project"] }}
+    member: serviceAccount:$(ref.location-function-service-account.email)
+    role: roles/pubsub.subscriber
+  metadata:
+    dependsOn:
+    - location-function-service-account
+
+# IAM Binding for Service Account - Monitoring Metric Writer
+- name: monitoring-writer-binding
+  type: gcp-types/cloudresourcemanager-v1:projects.iamMemberBinding
+  properties:
+    resource: {{ env["project"] }}
+    member: serviceAccount:$(ref.location-function-service-account.email)
+    role: roles/monitoring.metricWriter
+  metadata:
+    dependsOn:
+    - location-function-service-account
+
+# IAM Binding for Service Account - Location Finder User
+- name: location-finder-binding
+  type: gcp-types/cloudresourcemanager-v1:projects.iamMemberBinding
+  properties:
+    resource: {{ env["project"] }}
+    member: serviceAccount:$(ref.location-function-service-account.email)
+    role: roles/cloudlocationfinder.user
+  metadata:
+    dependsOn:
+    - location-function-service-account
+
+# Cloud Function Source Code ZIP Upload
+- name: function-source-archive
+  type: gcp-types/storage-v1:objects
+  properties:
+    bucket: $(ref.location-reports-bucket.name)
+    name: function-source/location-processor-{{ env["deployment"] }}.zip
+    contentType: application/zip
+    # Function source code will be uploaded as base64 encoded content
+    # In practice, this would be generated from the Python source files
+  metadata:
+    dependsOn:
+    - location-reports-bucket
+
+# Cloud Function for Location Data Processing
+- name: location-processor-function
+  type: gcp-types/cloudfunctions-v1:projects.locations.functions
+  properties:
+    location: projects/{{ env["project"] }}/locations/{{ properties["region"] }}
+    name: process-locations-{{ env["deployment"] }}
+    description: Processes multi-cloud location data from Cloud Location Finder API
+    sourceArchiveUrl: gs://$(ref.location-reports-bucket.name)/function-source/location-processor-{{ env["deployment"] }}.zip
+    entryPoint: process_location_data
+    runtime: python39
+    timeout: 300s
+    availableMemoryMb: 512
+    serviceAccountEmail: $(ref.location-function-service-account.email)
+    environmentVariables:
+      BUCKET_NAME: $(ref.location-reports-bucket.name)
+      PROJECT_ID: {{ env["project"] }}
+      TOPIC_NAME: $(ref.location-discovery-topic.name)
+    eventTrigger:
+      eventType: providers/cloud.pubsub/eventTypes/topic.publish
+      resource: $(ref.location-discovery-topic.name)
+      failurePolicy:
+        retry: true
+    labels:
+      purpose: multi-cloud-location-processing
+      environment: "{{ properties["environment"] }}"
+      managed-by: infrastructure-manager
+  metadata:
+    dependsOn:
+    - location-discovery-topic
+    - location-function-service-account
+    - function-source-archive
+    - enable-functions-api
+
+# Cloud Scheduler Job for Automated Discovery
+- name: location-discovery-scheduler
+  type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+  properties:
+    name: projects/{{ env["project"] }}/locations/{{ properties["region"] }}/jobs/location-sync-{{ env["deployment"] }}
+    description: Automated multi-cloud location discovery trigger
+    schedule: "0 */6 * * *"  # Every 6 hours
+    timeZone: UTC
+    pubsubTarget:
+      topicName: $(ref.location-discovery-topic.name)
+      data: |
+        ewogICJ0cmlnZ2VyIjogInNjaGVkdWxlZF9kaXNjb3ZlcnkiLAogICJ0aW1lc3RhbXAiOiAie3sgZW52WyJkZXBsb3ltZW50Il0gfX0iCn0=
+      # Base64 encoded: {"trigger": "scheduled_discovery", "timestamp": "{{ env["deployment"] }}"}
+    retryConfig:
+      retryCount: 3
+      maxRetryDuration: 300s
+      minBackoffDuration: 5s
+      maxBackoffDuration: 3600s
+      maxDoublings: 5
+    labels:
+      purpose: automated-location-discovery
+      environment: "{{ properties["environment"] }}"
+      managed-by: infrastructure-manager
+  metadata:
+    dependsOn:
+    - location-discovery-topic
+    - enable-scheduler-api
+
+# Monitoring Dashboard for Location Discovery
+- name: location-discovery-dashboard
+  type: gcp-types/monitoring-v1:projects.dashboards
+  properties:
+    displayName: Multi-Cloud Location Discovery Dashboard
+    gridLayout:
+      widgets:
+      - title: Total Locations Discovered
+        xyChart:
+          dataSets:
+          - timeSeriesQuery:
+              timeSeriesFilter:
+                filter: 'metric.type="custom.googleapis.com/multicloud/total_locations"'
+                aggregation:
+                  alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_MEAN
+                  crossSeriesReducer: REDUCE_SUM
+          timeshiftDuration: 0s
+          yAxis:
+            label: Locations
+            scale: LINEAR
+      - title: Function Execution Count
+        xyChart:
+          dataSets:
+          - timeSeriesQuery:
+              timeSeriesFilter:
+                filter: 'resource.type="cloud_function" AND metric.type="cloudfunctions.googleapis.com/function/executions"'
+                aggregation:
+                  alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+          timeshiftDuration: 0s
+          yAxis:
+            label: Executions/sec
+            scale: LINEAR
+      - title: Function Execution Duration
+        xyChart:
+          dataSets:
+          - timeSeriesQuery:
+              timeSeriesFilter:
+                filter: 'resource.type="cloud_function" AND metric.type="cloudfunctions.googleapis.com/function/execution_times"'
+                aggregation:
+                  alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_DELTA
+                  crossSeriesReducer: REDUCE_PERCENTILE_95
+          timeshiftDuration: 0s
+          yAxis:
+            label: Duration (ms)
+            scale: LINEAR
+      - title: Pub/Sub Message Count
+        xyChart:
+          dataSets:
+          - timeSeriesQuery:
+              timeSeriesFilter:
+                filter: 'resource.type="pubsub_topic" AND metric.type="pubsub.googleapis.com/topic/send_message_operation_count"'
+                aggregation:
+                  alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+          timeshiftDuration: 0s
+          yAxis:
+            label: Messages/sec
+            scale: LINEAR
+    labels:
+      purpose: location-discovery-monitoring
+      environment: "{{ properties["environment"] }}"
+      managed-by: infrastructure-manager
+  metadata:
+    dependsOn:
+    - enable-monitoring-api
+
+# Alert Policy for Function Failures
+- name: function-failure-alert
+  type: gcp-types/monitoring-v1:projects.alertPolicies
+  properties:
+    displayName: Location Discovery Function Failures
+    documentation:
+      content: Alert when Cloud Function execution failures exceed threshold
+      mimeType: text/markdown
+    conditions:
+    - displayName: Function execution failures
+      conditionThreshold:
+        filter: 'resource.type="cloud_function" AND resource.labels.function_name="process-locations-{{ env["deployment"] }}" AND metric.type="cloudfunctions.googleapis.com/function/execution_count"'
+        comparison: COMPARISON_GREATER_THAN
+        thresholdValue:
+          doubleValue: 5
+        duration: 300s
+        aggregations:
+        - alignmentPeriod: 60s
+          perSeriesAligner: ALIGN_RATE
+          crossSeriesReducer: REDUCE_SUM
+        trigger:
+          count: 1
+    alertStrategy:
+      autoClose: 1800s  # Auto-close after 30 minutes
+    enabled: true
+    labels:
+      purpose: function-failure-monitoring
+      environment: "{{ properties["environment"] }}"
+      managed-by: infrastructure-manager
+  metadata:
+    dependsOn:
+    - location-processor-function
+    - enable-monitoring-api
+
+# Alert Policy for High Message Processing Delay
+- name: message-delay-alert
+  type: gcp-types/monitoring-v1:projects.alertPolicies
+  properties:
+    displayName: Location Discovery Message Processing Delay
+    documentation:
+      content: Alert when Pub/Sub message processing delay is high
+      mimeType: text/markdown
+    conditions:
+    - displayName: High message processing delay
+      conditionThreshold:
+        filter: 'resource.type="pubsub_subscription" AND resource.labels.subscription_id="location-discovery-{{ env["deployment"] }}-sub" AND metric.type="pubsub.googleapis.com/subscription/oldest_unacked_message_age"'
+        comparison: COMPARISON_GREATER_THAN
+        thresholdValue:
+          doubleValue: 600  # 10 minutes
+        duration: 300s
+        aggregations:
+        - alignmentPeriod: 60s
+          perSeriesAligner: ALIGN_MAX
+          crossSeriesReducer: REDUCE_MAX
+        trigger:
+          count: 1
+    alertStrategy:
+      autoClose: 1800s  # Auto-close after 30 minutes
+    enabled: true
+    labels:
+      purpose: message-delay-monitoring
+      environment: "{{ properties["environment"] }}"
+      managed-by: infrastructure-manager
+  metadata:
+    dependsOn:
+    - location-discovery-subscription
+    - enable-monitoring-api
+
+# Custom Log Sink for Location Processing Events
+- name: location-processing-log-sink
+  type: gcp-types/logging-v2:projects.sinks
+  properties:
+    name: location-processing-events-{{ env["deployment"] }}
+    description: Export location processing logs to BigQuery for analysis
+    destination: bigquery.googleapis.com/projects/{{ env["project"] }}/datasets/location_discovery_logs
+    filter: |
+      resource.type="cloud_function"
+      resource.labels.function_name="process-locations-{{ env["deployment"] }}"
+      (textPayload:"locations" OR textPayload:"recommendations" OR textPayload:"analysis")
+    uniqueWriterIdentity: true
+    bigqueryOptions:
+      usePartitionedTables: true
+  metadata:
+    dependsOn:
+    - location-processor-function
+
+# Notification Channel for Alerts (Email)
+- name: email-notification-channel
+  type: gcp-types/monitoring-v1:projects.notificationChannels
+  properties:
+    type: email
+    displayName: Location Discovery Alerts
+    description: Email notifications for location discovery system alerts
+    labels:
+      email_address: "{{ properties["alert_email"] }}"
+    enabled: true
+  metadata:
+    dependsOn:
+    - enable-monitoring-api
+
+# Associate Alert Policies with Notification Channel
+- name: function-failure-notification
+  type: gcp-types/monitoring-v1:projects.alertPolicies.notificationChannels
+  properties:
+    alertPolicy: $(ref.function-failure-alert.name)
+    notificationChannel: $(ref.email-notification-channel.name)
+  metadata:
+    dependsOn:
+    - function-failure-alert
+    - email-notification-channel
+
+- name: message-delay-notification
+  type: gcp-types/monitoring-v1:projects.alertPolicies.notificationChannels
+  properties:
+    alertPolicy: $(ref.message-delay-alert.name)
+    notificationChannel: $(ref.email-notification-channel.name)
+  metadata:
+    dependsOn:
+    - message-delay-alert
+    - email-notification-channel
+
+# Outputs section for important resource information
+outputs:
+- name: topic_name
+  value: $(ref.location-discovery-topic.name)
+  description: Pub/Sub topic for location discovery messages
+
+- name: subscription_name
+  value: $(ref.location-discovery-subscription.name)
+  description: Pub/Sub subscription for processing location data
+
+- name: function_name
+  value: $(ref.location-processor-function.name)
+  description: Cloud Function for processing location intelligence
+
+- name: bucket_name
+  value: $(ref.location-reports-bucket.name)
+  description: Cloud Storage bucket for location reports and data
+
+- name: scheduler_job_name
+  value: $(ref.location-discovery-scheduler.name)
+  description: Cloud Scheduler job for automated discovery
+
+- name: dashboard_id
+  value: $(ref.location-discovery-dashboard.name)
+  description: Monitoring dashboard for location discovery system
+
+- name: service_account_email
+  value: $(ref.location-function-service-account.email)
+  description: Service account used by the location processing function
+
+# Input parameters for customization
+properties:
+  - name: region
+    type: string
+    default: "us-central1"
+    description: Google Cloud region for resource deployment
+
+  - name: environment
+    type: string
+    default: "production"
+    description: Environment label for resource organization
+    allowedValues:
+    - "development"
+    - "staging"
+    - "production"
+
+  - name: alert_email
+    type: string
+    description: Email address for alert notifications
+    pattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+
+  - name: function_memory_mb
+    type: integer
+    default: 512
+    description: Memory allocation for Cloud Function (MB)
+    allowedValues:
+    - 128
+    - 256
+    - 512
+    - 1024
+    - 2048
+
+  - name: discovery_schedule
+    type: string
+    default: "0 */6 * * *"
+    description: Cron schedule for automated location discovery (default: every 6 hours)
+
+  - name: message_retention_days
+    type: integer
+    default: 7
+    description: Pub/Sub message retention period in days
+    minimum: 1
+    maximum: 31
+
+  - name: storage_lifecycle_days
+    type: integer
+    default: 90
+    description: Days before old files are deleted from Cloud Storage
+    minimum: 30
+    maximum: 365
+
+metadata:
+  version: "1.0"
+  description: "Multi-Cloud Resource Discovery with Cloud Location Finder and Pub/Sub"
+  author: "Infrastructure Manager Generator"
+  created: "2025-07-12"
+  category: "management-governance"
+  difficulty: "intermediate"
+  estimated_deployment_time: "15-20 minutes"
+  estimated_cost_per_month: "$15-25 USD"
+  
+  # Required Google Cloud APIs
+  required_apis:
+  - cloudlocationfinder.googleapis.com
+  - pubsub.googleapis.com
+  - cloudfunctions.googleapis.com
+  - cloudscheduler.googleapis.com
+  - storage.googleapis.com
+  - monitoring.googleapis.com
+  - logging.googleapis.com
+  
+  # Required IAM permissions for deploying this configuration
+  required_permissions:
+  - roles/owner  # For comprehensive resource creation
+  # Or specific permissions:
+  # - roles/pubsub.admin
+  # - roles/storage.admin
+  # - roles/cloudfunctions.admin
+  # - roles/cloudscheduler.admin
+  # - roles/monitoring.admin
+  # - roles/iam.serviceAccountAdmin
+  
+  # Security considerations
+  security_notes:
+  - Service account follows principle of least privilege
+  - Uniform bucket-level access enabled for Cloud Storage
+  - Dead letter queue configured for failed message handling
+  - Monitoring and alerting configured for operational visibility
+  - Log sinks configured for audit trail
+  
+  # Best practices implemented
+  best_practices:
+  - Resource labeling for organization and cost tracking
+  - Lifecycle policies for cost optimization
+  - Retry policies for resilience
+  - Monitoring dashboards for operational visibility
+  - Alert policies for proactive issue detection
+  - Dead letter queues for error handling
+  - Service account with minimal required permissions

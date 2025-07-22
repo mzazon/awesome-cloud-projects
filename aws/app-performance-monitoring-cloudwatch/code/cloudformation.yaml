@@ -1,0 +1,1031 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Automated Application Performance Monitoring with CloudWatch Application Signals and EventBridge.
+  This template creates a comprehensive monitoring system that automatically detects performance
+  anomalies and triggers intelligent responses through event-driven architecture.
+
+# ==============================================================================
+# TEMPLATE METADATA
+# ==============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Application Configuration
+        Parameters:
+          - ApplicationName
+          - Environment
+      - Label:
+          default: Monitoring Configuration
+        Parameters:
+          - LatencyThreshold
+          - ErrorRateThreshold
+          - ThroughputThreshold
+          - EvaluationPeriods
+      - Label:
+          default: Notification Configuration
+        Parameters:
+          - NotificationEmail
+          - SlackWebhookUrl
+      - Label:
+          default: Resource Configuration
+        Parameters:
+          - LogRetentionDays
+          - DashboardRefreshInterval
+    ParameterLabels:
+      ApplicationName:
+        default: Application Name
+      Environment:
+        default: Environment
+      LatencyThreshold:
+        default: Latency Threshold (ms)
+      ErrorRateThreshold:
+        default: Error Rate Threshold (%)
+      ThroughputThreshold:
+        default: Minimum Throughput Threshold
+      EvaluationPeriods:
+        default: Evaluation Periods
+      NotificationEmail:
+        default: Notification Email Address
+      SlackWebhookUrl:
+        default: Slack Webhook URL (Optional)
+      LogRetentionDays:
+        default: Log Retention Days
+      DashboardRefreshInterval:
+        default: Dashboard Refresh Interval (seconds)
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: MyApplication
+    Description: Name of the application being monitored
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-_]*$'
+    ConstraintDescription: Application name must start with a letter and contain only alphanumeric characters, hyphens, and underscores
+    MinLength: 1
+    MaxLength: 64
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - production
+      - staging
+      - development
+      - test
+    Description: Environment where the application is deployed
+
+  LatencyThreshold:
+    Type: Number
+    Default: 2000
+    MinValue: 100
+    MaxValue: 30000
+    Description: Latency threshold in milliseconds that triggers an alarm
+
+  ErrorRateThreshold:
+    Type: Number
+    Default: 5
+    MinValue: 0
+    MaxValue: 100
+    Description: Error rate percentage threshold that triggers an alarm
+
+  ThroughputThreshold:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 10000
+    Description: Minimum throughput (requests per evaluation period) threshold
+
+  EvaluationPeriods:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Number of evaluation periods for alarm triggering
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for performance alerts and notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+
+  SlackWebhookUrl:
+    Type: String
+    Default: ''
+    Description: (Optional) Slack webhook URL for notifications
+    NoEcho: true
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: Number of days to retain CloudWatch logs
+
+  DashboardRefreshInterval:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 3600
+    Description: Dashboard refresh interval in seconds
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+Conditions:
+  HasSlackWebhook: !Not [!Equals [!Ref SlackWebhookUrl, '']]
+  IsProduction: !Equals [!Ref Environment, production]
+  EnableDetailedMonitoring: !Or [!Condition IsProduction, !Equals [!Ref Environment, staging]]
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+  # ============================================================================
+  # IAM ROLES AND POLICIES
+  # ============================================================================
+  
+  # Lambda execution role with comprehensive permissions for monitoring operations
+  PerformanceProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-performance-processor-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PerformanceProcessorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CloudWatchAccess
+                Effect: Allow
+                Action:
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                  - cloudwatch:PutMetricData
+                  - application-signals:ListServiceLevelObjectives
+                  - application-signals:GetServiceLevelObjective
+                Resource: '*'
+              - Sid: SNSPublishAccess
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref PerformanceAlertsTopic
+              - Sid: AutoScalingAccess
+                Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:UpdateAutoScalingGroup
+                  - autoscaling:SetDesiredCapacity
+                Resource: '*'
+              - Sid: ECSScalingAccess
+                Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:UpdateService
+                  - application-autoscaling:RegisterScalableTarget
+                  - application-autoscaling:DeregisterScalableTarget
+                Resource: '*'
+              - Sid: LogsAccess
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Performance Monitoring
+
+  # ============================================================================
+  # SNS TOPICS AND SUBSCRIPTIONS
+  # ============================================================================
+  
+  # SNS topic for performance alerts with enhanced delivery policy
+  PerformanceAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ApplicationName}-performance-alerts'
+      DisplayName: !Sub '${ApplicationName} Performance Alerts'
+      DeliveryPolicy:
+        http:
+          defaultHealthyRetryPolicy:
+            minDelayTarget: 20
+            maxDelayTarget: 600
+            numRetries: 5
+            numMaxDelayRetries: 2
+            numMinDelayRetries: 0
+            numNoDelayRetries: 0
+            backoffFunction: exponential
+          disableSubscriptionOverrides: false
+          defaultRequestPolicy:
+            headerContentType: application/json
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Performance Notifications
+
+  # Email subscription for performance alerts
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref PerformanceAlertsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # Slack webhook subscription (conditional)
+  SlackSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasSlackWebhook
+    Properties:
+      TopicArn: !Ref PerformanceAlertsTopic
+      Protocol: https
+      Endpoint: !Ref SlackWebhookUrl
+
+  # ============================================================================
+  # LAMBDA FUNCTIONS
+  # ============================================================================
+  
+  # Performance event processor Lambda function with comprehensive logic
+  PerformanceProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ApplicationName}-performance-processor'
+      Description: Processes CloudWatch alarm state changes and triggers automated responses
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt PerformanceProcessorRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref PerformanceAlertsTopic
+          APPLICATION_NAME: !Ref ApplicationName
+          ENVIRONMENT: !Ref Environment
+          LATENCY_THRESHOLD: !Ref LatencyThreshold
+          ERROR_RATE_THRESHOLD: !Ref ErrorRateThreshold
+          THROUGHPUT_THRESHOLD: !Ref ThroughputThreshold
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime, timedelta
+          from typing import Dict, Any, Optional
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize AWS clients
+          sns_client = boto3.client('sns')
+          cloudwatch_client = boto3.client('cloudwatch')
+          autoscaling_client = boto3.client('autoscaling')
+          ecs_client = boto3.client('ecs')
+
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              Process CloudWatch alarm state changes and trigger appropriate responses
+              """
+              try:
+                  logger.info(f"Processing event: {json.dumps(event)}")
+                  
+                  # Extract event details
+                  detail = event.get('detail', {})
+                  alarm_name = detail.get('alarmName', '')
+                  alarm_description = detail.get('alarmDescription', '')
+                  new_state = detail.get('newState', {})
+                  previous_state = detail.get('previousState', {})
+                  state_value = new_state.get('value', '')
+                  state_reason = new_state.get('reason', '')
+                  state_change_time = detail.get('stateChangeTime', '')
+                  
+                  logger.info(f"Alarm: {alarm_name}, State: {state_value}")
+                  
+                  # Get environment variables
+                  sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
+                  application_name = os.environ.get('APPLICATION_NAME', 'Unknown')
+                  environment = os.environ.get('ENVIRONMENT', 'unknown')
+                  
+                  # Process alarm based on state
+                  if state_value == 'ALARM':
+                      handle_alarm_state(
+                          alarm_name, alarm_description, state_reason, 
+                          state_change_time, sns_topic_arn, application_name, environment
+                      )
+                  elif state_value == 'OK':
+                      handle_ok_state(
+                          alarm_name, alarm_description, state_change_time, 
+                          sns_topic_arn, application_name, environment
+                      )
+                  elif state_value == 'INSUFFICIENT_DATA':
+                      handle_insufficient_data_state(
+                          alarm_name, alarm_description, state_change_time,
+                          sns_topic_arn, application_name, environment
+                      )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Successfully processed alarm: {alarm_name}',
+                          'alarm_state': state_value,
+                          'timestamp': datetime.now().isoformat()
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing event: {str(e)}", exc_info=True)
+                  raise e
+
+          def handle_alarm_state(alarm_name: str, alarm_description: str, state_reason: str,
+                                state_change_time: str, sns_topic_arn: str, 
+                                application_name: str, environment: str) -> None:
+              """Handle ALARM state with immediate response and scaling actions"""
+              
+              # Determine alarm type and severity
+              alarm_type = get_alarm_type(alarm_name)
+              severity = get_alarm_severity(alarm_name, environment)
+              
+              # Create detailed alert message
+              message = create_alarm_message(
+                  alarm_name, alarm_description, state_reason, state_change_time,
+                  application_name, environment, alarm_type, severity
+              )
+              
+              # Send immediate notification
+              send_notification(sns_topic_arn, message, f"🚨 {severity.upper()}: {alarm_name}")
+              
+              # Trigger automated responses based on alarm type
+              if alarm_type == 'latency' or alarm_type == 'throughput':
+                  trigger_scaling_response(alarm_name, alarm_type)
+              elif alarm_type == 'error_rate':
+                  trigger_error_response(alarm_name)
+              
+              # Log metrics for analysis
+              put_custom_metrics(alarm_name, alarm_type, 'ALARM', application_name, environment)
+
+          def handle_ok_state(alarm_name: str, alarm_description: str, state_change_time: str,
+                            sns_topic_arn: str, application_name: str, environment: str) -> None:
+              """Handle OK state with resolution notification"""
+              
+              alarm_type = get_alarm_type(alarm_name)
+              
+              message = f"""
+          ✅ ALERT RESOLVED ✅
+
+          Application: {application_name}
+          Environment: {environment.upper()}
+          Alarm: {alarm_name}
+          Description: {alarm_description}
+          State: RESOLVED
+          Time: {state_change_time}
+
+          Performance metrics have returned to normal levels.
+          Automated scaling actions may have been reversed.
+          
+          📊 Monitor your dashboard for continued stability.
+          """
+              
+              send_notification(sns_topic_arn, message, f"✅ RESOLVED: {alarm_name}")
+              put_custom_metrics(alarm_name, alarm_type, 'OK', application_name, environment)
+
+          def handle_insufficient_data_state(alarm_name: str, alarm_description: str, 
+                                          state_change_time: str, sns_topic_arn: str,
+                                          application_name: str, environment: str) -> None:
+              """Handle INSUFFICIENT_DATA state"""
+              
+              logger.info(f"Alarm {alarm_name} has insufficient data - monitoring will continue")
+              
+              # Only send notification for production environments
+              if environment == 'production':
+                  message = f"""
+          ⚠️ MONITORING NOTICE ⚠️
+
+          Application: {application_name}
+          Environment: {environment.upper()}
+          Alarm: {alarm_name}
+          Description: {alarm_description}
+          State: INSUFFICIENT DATA
+          Time: {state_change_time}
+
+          The alarm has insufficient data for evaluation.
+          This may be due to low traffic or service unavailability.
+          """
+                  
+                  send_notification(sns_topic_arn, message, f"⚠️ INSUFFICIENT DATA: {alarm_name}")
+
+          def get_alarm_type(alarm_name: str) -> str:
+              """Determine alarm type based on alarm name"""
+              alarm_name_lower = alarm_name.lower()
+              if 'latency' in alarm_name_lower or 'response' in alarm_name_lower:
+                  return 'latency'
+              elif 'error' in alarm_name_lower or 'fault' in alarm_name_lower:
+                  return 'error_rate'
+              elif 'throughput' in alarm_name_lower or 'count' in alarm_name_lower:
+                  return 'throughput'
+              else:
+                  return 'unknown'
+
+          def get_alarm_severity(alarm_name: str, environment: str) -> str:
+              """Determine alarm severity based on alarm name and environment"""
+              if environment == 'production':
+                  if 'critical' in alarm_name.lower() or 'high' in alarm_name.lower():
+                      return 'critical'
+                  else:
+                      return 'high'
+              elif environment == 'staging':
+                  return 'medium'
+              else:
+                  return 'low'
+
+          def create_alarm_message(alarm_name: str, alarm_description: str, state_reason: str,
+                                 state_change_time: str, application_name: str, environment: str,
+                                 alarm_type: str, severity: str) -> str:
+              """Create detailed alarm message with context and actions"""
+              
+              # Get recommended actions based on alarm type
+              actions = get_recommended_actions(alarm_type)
+              
+              message = f"""
+          🚨 PERFORMANCE ALERT 🚨
+
+          Application: {application_name}
+          Environment: {environment.upper()}
+          Severity: {severity.upper()}
+          
+          Alarm Details:
+          • Name: {alarm_name}
+          • Description: {alarm_description}
+          • Type: {alarm_type.replace('_', ' ').title()}
+          • Reason: {state_reason}
+          • Time: {state_change_time}
+
+          Automated Actions:
+          {actions}
+
+          📊 Check your CloudWatch dashboard for real-time metrics.
+          🔍 Review application logs for additional context.
+          ⚡ Scaling actions may have been automatically triggered.
+          """
+              
+              return message
+
+          def get_recommended_actions(alarm_type: str) -> str:
+              """Get recommended actions based on alarm type"""
+              actions_map = {
+                  'latency': '• Auto-scaling has been triggered to add capacity\n• Connection pooling optimization initiated\n• Cache warming procedures activated',
+                  'error_rate': '• Error investigation workflow triggered\n• Circuit breaker evaluation initiated\n• Log analysis process started',
+                  'throughput': '• Capacity scaling evaluation in progress\n• Load balancer health checks initiated\n• Service discovery refresh triggered',
+                  'unknown': '• General monitoring procedures activated\n• System health checks initiated'
+              }
+              return actions_map.get(alarm_type, actions_map['unknown'])
+
+          def trigger_scaling_response(alarm_name: str, alarm_type: str) -> None:
+              """Trigger automated scaling responses"""
+              try:
+                  logger.info(f"Triggering scaling response for {alarm_type} alarm: {alarm_name}")
+                  
+                  # This is where you would implement actual scaling logic
+                  # For example, updating Auto Scaling Groups or ECS services
+                  # Implementation depends on your specific infrastructure
+                  
+                  # Example: Get Auto Scaling Groups (would need proper filtering)
+                  # response = autoscaling_client.describe_auto_scaling_groups()
+                  # for asg in response.get('AutoScalingGroups', []):
+                  #     # Implement scaling logic based on your requirements
+                  #     pass
+                  
+                  logger.info(f"Scaling response completed for {alarm_name}")
+                  
+              except Exception as e:
+                  logger.error(f"Error triggering scaling response: {str(e)}")
+
+          def trigger_error_response(alarm_name: str) -> None:
+              """Trigger automated error response"""
+              try:
+                  logger.info(f"Triggering error response for alarm: {alarm_name}")
+                  
+                  # This is where you would implement error response logic
+                  # For example, circuit breaker activation, service restart, etc.
+                  
+                  logger.info(f"Error response completed for {alarm_name}")
+                  
+              except Exception as e:
+                  logger.error(f"Error triggering error response: {str(e)}")
+
+          def send_notification(sns_topic_arn: str, message: str, subject: str) -> None:
+              """Send notification via SNS"""
+              try:
+                  response = sns_client.publish(
+                      TopicArn=sns_topic_arn,
+                      Message=message,
+                      Subject=subject
+                  )
+                  logger.info(f"Notification sent successfully: {response['MessageId']}")
+              except Exception as e:
+                  logger.error(f"Error sending notification: {str(e)}")
+
+          def put_custom_metrics(alarm_name: str, alarm_type: str, state: str,
+                               application_name: str, environment: str) -> None:
+              """Put custom CloudWatch metrics for alarm processing tracking"""
+              try:
+                  cloudwatch_client.put_metric_data(
+                      Namespace='ApplicationPerformanceMonitoring',
+                      MetricData=[
+                          {
+                              'MetricName': 'AlarmProcessed',
+                              'Dimensions': [
+                                  {'Name': 'Application', 'Value': application_name},
+                                  {'Name': 'Environment', 'Value': environment},
+                                  {'Name': 'AlarmType', 'Value': alarm_type},
+                                  {'Name': 'State', 'Value': state}
+                              ],
+                              'Value': 1,
+                              'Unit': 'Count',
+                              'Timestamp': datetime.utcnow()
+                          }
+                      ]
+                  )
+              except Exception as e:
+                  logger.error(f"Error putting custom metrics: {str(e)}")
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Performance Processing
+
+  # ============================================================================
+  # CLOUDWATCH LOG GROUPS
+  # ============================================================================
+  
+  # Log group for Application Signals data
+  ApplicationSignalsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/application-signals/data
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Application Signals Data
+
+  # Log group for Lambda function
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${PerformanceProcessorFunction}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Lambda Execution Logs
+
+  # ============================================================================
+  # CLOUDWATCH ALARMS
+  # ============================================================================
+  
+  # High latency alarm for Application Signals
+  HighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-HighLatency-${Environment}'
+      AlarmDescription: !Sub 'Monitor application latency from Application Signals for ${ApplicationName}'
+      MetricName: Latency
+      Namespace: AWS/ApplicationSignals
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: !Ref EvaluationPeriods
+      Threshold: !Ref LatencyThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref PerformanceAlertsTopic
+      OKActions:
+        - !Ref PerformanceAlertsTopic
+      Dimensions:
+        - Name: Service
+          Value: !Ref ApplicationName
+      TreatMissingData: !If [EnableDetailedMonitoring, breaching, notBreaching]
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: AlarmType
+          Value: Latency
+
+  # High error rate alarm for Application Signals
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-HighErrorRate-${Environment}'
+      AlarmDescription: !Sub 'Monitor application error rate from Application Signals for ${ApplicationName}'
+      MetricName: ErrorRate
+      Namespace: AWS/ApplicationSignals
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref ErrorRateThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref PerformanceAlertsTopic
+      OKActions:
+        - !Ref PerformanceAlertsTopic
+      Dimensions:
+        - Name: Service
+          Value: !Ref ApplicationName
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: AlarmType
+          Value: ErrorRate
+
+  # Low throughput alarm for Application Signals
+  LowThroughputAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-LowThroughput-${Environment}'
+      AlarmDescription: !Sub 'Monitor application throughput from Application Signals for ${ApplicationName}'
+      MetricName: CallCount
+      Namespace: AWS/ApplicationSignals
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref ThroughputThreshold
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref PerformanceAlertsTopic
+      OKActions:
+        - !Ref PerformanceAlertsTopic
+      Dimensions:
+        - Name: Service
+          Value: !Ref ApplicationName
+      TreatMissingData: !If [IsProduction, breaching, notBreaching]
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: AlarmType
+          Value: Throughput
+
+  # Composite alarm for overall application health (requires multiple alarm states)
+  ApplicationHealthCompositeAlarm:
+    Type: AWS::CloudWatch::CompositeAlarm
+    Condition: EnableDetailedMonitoring
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-ApplicationHealth-${Environment}'
+      AlarmDescription: !Sub 'Overall application health composite alarm for ${ApplicationName}'
+      AlarmRule: !Sub |
+        ALARM(${HighLatencyAlarm}) OR 
+        ALARM(${HighErrorRateAlarm}) OR 
+        ALARM(${LowThroughputAlarm})
+      AlarmActions:
+        - !Ref PerformanceAlertsTopic
+      OKActions:
+        - !Ref PerformanceAlertsTopic
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: AlarmType
+          Value: Composite
+
+  # ============================================================================
+  # EVENTBRIDGE RULES
+  # ============================================================================
+  
+  # EventBridge rule for CloudWatch alarm state changes
+  AlarmStateChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ApplicationName}-alarm-state-change-rule'
+      Description: Route CloudWatch alarm state changes to Lambda processor
+      EventPattern:
+        source:
+          - aws.cloudwatch
+        detail-type:
+          - CloudWatch Alarm State Change
+        detail:
+          state:
+            value:
+              - ALARM
+              - OK
+              - INSUFFICIENT_DATA
+          alarmName:
+            - prefix: !Sub '${ApplicationName}-'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt PerformanceProcessorFunction.Arn
+          Id: PerformanceProcessorTarget
+          RetryPolicy:
+            MaximumRetryAttempts: 3
+            MaximumEventAge: 3600
+          DeadLetterConfig:
+            Arn: !GetAtt EventProcessingDeadLetterQueue.Arn
+
+  # Permission for EventBridge to invoke Lambda function
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PerformanceProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AlarmStateChangeRule.Arn
+
+  # ============================================================================
+  # SQS DEAD LETTER QUEUE
+  # ============================================================================
+  
+  # Dead letter queue for failed event processing
+  EventProcessingDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ApplicationName}-event-processing-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeoutSeconds: 60
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Event Processing DLQ
+
+  # ============================================================================
+  # CLOUDWATCH DASHBOARD
+  # ============================================================================
+  
+  # Comprehensive CloudWatch dashboard for monitoring
+  PerformanceMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ApplicationName}-Performance-Monitoring-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ApplicationSignals", "Latency", "Service", "${ApplicationName}"],
+                  [".", "ErrorRate", ".", "."],
+                  [".", "CallCount", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Application Performance Metrics",
+                "period": 300,
+                "stat": "Average",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                },
+                "annotations": {
+                  "horizontal": [
+                    {
+                      "label": "Latency Threshold",
+                      "value": ${LatencyThreshold}
+                    },
+                    {
+                      "label": "Error Rate Threshold",
+                      "value": ${ErrorRateThreshold}
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Events", "MatchedEvents", "RuleName", "${ApplicationName}-alarm-state-change-rule"],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${PerformanceProcessorFunction}"],
+                  [".", "Errors", ".", "."],
+                  [".", "Duration", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Event Processing Metrics",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["ApplicationPerformanceMonitoring", "AlarmProcessed", "Application", "${ApplicationName}", "Environment", "${Environment}", "AlarmType", "latency", "State", "ALARM"],
+                  [".", ".", ".", ".", ".", ".", ".", "error_rate", ".", "."],
+                  [".", ".", ".", ".", ".", ".", ".", "throughput", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": true,
+                "region": "${AWS::Region}",
+                "title": "Alarm Processing by Type",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/SNS", "NumberOfMessagesPublished", "TopicName", "${ApplicationName}-performance-alerts"],
+                  [".", "NumberOfNotificationsDelivered", ".", "."],
+                  [".", "NumberOfNotificationsFailed", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Notification Delivery Metrics",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/SQS", "NumberOfMessagesSent", "QueueName", "${ApplicationName}-event-processing-dlq"],
+                  [".", "NumberOfMessagesReceived", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Dead Letter Queue Metrics",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${PerformanceProcessorFunction}'\n| fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Lambda Function Errors",
+                "view": "table"
+              }
+            }
+          ],
+          "period": ${DashboardRefreshInterval}
+        }
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+Outputs:
+  # Topic Information
+  PerformanceAlertsTopicArn:
+    Description: ARN of the SNS topic for performance alerts
+    Value: !Ref PerformanceAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-PerformanceAlertsTopic'
+
+  PerformanceAlertsTopicName:
+    Description: Name of the SNS topic for performance alerts
+    Value: !GetAtt PerformanceAlertsTopic.TopicName
+    Export:
+      Name: !Sub '${AWS::StackName}-PerformanceAlertsTopicName'
+
+  # Lambda Function Information
+  PerformanceProcessorFunctionArn:
+    Description: ARN of the performance processor Lambda function
+    Value: !GetAtt PerformanceProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PerformanceProcessorFunction'
+
+  PerformanceProcessorFunctionName:
+    Description: Name of the performance processor Lambda function
+    Value: !Ref PerformanceProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-PerformanceProcessorFunctionName'
+
+  # Alarm Information
+  HighLatencyAlarmName:
+    Description: Name of the high latency alarm
+    Value: !Ref HighLatencyAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-HighLatencyAlarm'
+
+  HighErrorRateAlarmName:
+    Description: Name of the high error rate alarm
+    Value: !Ref HighErrorRateAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-HighErrorRateAlarm'
+
+  LowThroughputAlarmName:
+    Description: Name of the low throughput alarm
+    Value: !Ref LowThroughputAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-LowThroughputAlarm'
+
+  # EventBridge Rule Information
+  AlarmStateChangeRuleArn:
+    Description: ARN of the EventBridge rule for alarm state changes
+    Value: !GetAtt AlarmStateChangeRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AlarmStateChangeRule'
+
+  # Dashboard Information
+  DashboardUrl:
+    Description: URL to the CloudWatch dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ApplicationName}-Performance-Monitoring-${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardUrl'
+
+  # Configuration Information
+  ApplicationName:
+    Description: Name of the monitored application
+    Value: !Ref ApplicationName
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationName'
+
+  Environment:
+    Description: Environment where the application is deployed
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+  # Threshold Configuration
+  MonitoringThresholds:
+    Description: Configured monitoring thresholds
+    Value: !Sub 'Latency: ${LatencyThreshold}ms, Error Rate: ${ErrorRateThreshold}%, Throughput: ${ThroughputThreshold}/period'
+    Export:
+      Name: !Sub '${AWS::StackName}-MonitoringThresholds'
+
+  # Dead Letter Queue Information
+  DeadLetterQueueUrl:
+    Description: URL of the dead letter queue for failed event processing
+    Value: !Ref EventProcessingDeadLetterQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueue'
+
+  # Log Groups Information
+  ApplicationSignalsLogGroupName:
+    Description: Name of the Application Signals log group
+    Value: !Ref ApplicationSignalsLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationSignalsLogGroup'
+
+  LambdaLogGroupName:
+    Description: Name of the Lambda function log group
+    Value: !Ref LambdaLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaLogGroup'

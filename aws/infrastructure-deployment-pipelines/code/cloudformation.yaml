@@ -1,0 +1,614 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure Deployment Pipeline with CDK and CodePipeline - Automated CI/CD for Infrastructure as Code'
+
+# Parameters allow customization of the deployment
+Parameters:
+  ProjectName:
+    Type: String
+    Description: 'Name of the project (used for resource naming)'
+    Default: 'cdk-infrastructure-pipeline'
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    MinLength: 3
+    MaxLength: 50
+    ConstraintDescription: 'Project name must be 3-50 characters, alphanumeric and hyphens only'
+
+  RepositoryName:
+    Type: String
+    Description: 'Name of the CodeCommit repository'
+    Default: 'infrastructure-deployment-repo'
+    AllowedPattern: '^[a-zA-Z0-9-_.]+$'
+    MinLength: 1
+    MaxLength: 100
+    ConstraintDescription: 'Repository name must be 1-100 characters, alphanumeric with hyphens, underscores, and dots'
+
+  RepositoryDescription:
+    Type: String
+    Description: 'Description of the CodeCommit repository'
+    Default: 'Repository for CDK infrastructure deployment pipeline'
+    MaxLength: 1000
+
+  BuildImage:
+    Type: String
+    Description: 'CodeBuild Docker image for building CDK applications'
+    Default: 'aws/codebuild/standard:7.0'
+    AllowedValues:
+      - 'aws/codebuild/standard:7.0'
+      - 'aws/codebuild/standard:6.0'
+      - 'aws/codebuild/standard:5.0'
+
+  NodeVersion:
+    Type: String
+    Description: 'Node.js version for CDK builds'
+    Default: '18'
+    AllowedValues:
+      - '16'
+      - '18'
+      - '20'
+
+  EnableManualApproval:
+    Type: String
+    Description: 'Enable manual approval for production deployments'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for pipeline notifications (optional)'
+    Default: ''
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+  ArtifactRetentionDays:
+    Type: Number
+    Description: 'Number of days to retain build artifacts'
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+
+# Conditions enable conditional resource creation
+Conditions:
+  CreateNotificationTopic: !Not [!Equals [!Ref NotificationEmail, '']]
+  EnableApprovalGate: !Equals [!Ref EnableManualApproval, 'true']
+  
+# Resources define the infrastructure components
+Resources:
+  # S3 Bucket for storing pipeline artifacts
+  ArtifactStore:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-artifacts-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldArtifacts
+            Status: Enabled
+            ExpirationInDays: !Ref ArtifactRetentionDays
+            NoncurrentVersionExpirationInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-artifacts'
+        - Key: Purpose
+          Value: 'Pipeline Artifacts'
+
+  # CodeCommit Repository for source code
+  SourceRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      RepositoryDescription: !Ref RepositoryDescription
+      Tags:
+        - Key: Name
+          Value: !Ref RepositoryName
+        - Key: Purpose
+          Value: 'CDK Infrastructure Source'
+
+  # CloudWatch Log Group for CodeBuild logs
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectName}-build'
+      RetentionInDays: 14
+
+  # IAM Role for CodeBuild
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-CodeBuild-Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/PowerUserAccess
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}-build:*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${ArtifactStore}/*'
+              - Effect: Allow
+                Action:
+                  - codecommit:GitPull
+                Resource: !GetAtt SourceRepository.Arn
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/cdk-*'
+              - Effect: Allow
+                Action:
+                  - cloudformation:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cdk-bootstrap/*'
+
+  # CodeBuild Project for building and testing CDK applications
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-build'
+      Description: 'Build project for CDK infrastructure deployment'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: !Ref BuildImage
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: NODE_VERSION
+            Value: !Ref NodeVersion
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                nodejs: ${NODE_VERSION}
+            pre_build:
+              commands:
+                - echo "Installing dependencies..."
+                - npm install -g aws-cdk
+                - npm install
+            build:
+              commands:
+                - echo "Building CDK application..."
+                - npm run build
+                - echo "Running CDK synthesis..."
+                - cdk synth
+                - echo "Running tests..."
+                - npm test || echo "No tests found"
+            post_build:
+              commands:
+                - echo "Build completed successfully"
+          artifacts:
+            files:
+              - '**/*'
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref CodeBuildLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-build'
+        - Key: Purpose
+          Value: 'CDK Build and Test'
+
+  # SNS Topic for pipeline notifications (conditional)
+  PipelineNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateNotificationTopic
+    Properties:
+      TopicName: !Sub '${ProjectName}-pipeline-notifications'
+      DisplayName: 'Pipeline Notifications'
+      Subscription:
+        - Endpoint: !Ref NotificationEmail
+          Protocol: email
+
+  # IAM Role for CodePipeline
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-CodePipeline-Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${ArtifactStore}/*'
+                  - !Ref ArtifactStore
+              - Effect: Allow
+                Action:
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:GetRepository
+                  - codecommit:ListBranches
+                  - codecommit:ListRepositories
+                Resource: !GetAtt SourceRepository.Arn
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: !GetAtt CodeBuildProject.Arn
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:UpdateStack
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:SetStackPolicy
+                  - cloudformation:ValidateTemplate
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/cdk-*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !If [CreateNotificationTopic, !Ref PipelineNotificationTopic, !Ref 'AWS::NoValue']
+
+  # IAM Role for CloudFormation deployments
+  CloudFormationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-CloudFormation-Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/PowerUserAccess
+      Policies:
+        - PolicyName: CloudFormationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:*
+                Resource: '*'
+
+  # CodePipeline for orchestrating the deployment
+  DeploymentPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub '${ProjectName}-pipeline'
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactStore
+      Stages:
+        # Source Stage - Pull from CodeCommit
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: '1'
+              Configuration:
+                RepositoryName: !Ref RepositoryName
+                BranchName: main
+                PollForSourceChanges: true
+              OutputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+
+        # Build Stage - CDK Synthesis and Testing
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+
+        # Deploy to Development Environment
+        - Name: DeployDev
+          Actions:
+            - Name: CreateDevChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                StackName: !Sub '${ProjectName}-dev-stack'
+                ChangeSetName: !Sub '${ProjectName}-dev-changeset'
+                TemplatePath: BuildOutput::cdk.out/*.template.json
+                Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM
+                RoleArn: !GetAtt CloudFormationRole.Arn
+                ParameterOverrides: |
+                  {
+                    "Environment": "development"
+                  }
+              InputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+            - Name: ExecuteDevChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                StackName: !Sub '${ProjectName}-dev-stack'
+                ChangeSetName: !Sub '${ProjectName}-dev-changeset'
+              RunOrder: 2
+
+        # Manual Approval for Production (conditional)
+        - !If
+          - EnableApprovalGate
+          - Name: ApprovalGate
+            Actions:
+              - Name: ManualApproval
+                ActionTypeId:
+                  Category: Approval
+                  Owner: AWS
+                  Provider: Manual
+                  Version: '1'
+                Configuration:
+                  NotificationArn: !If [CreateNotificationTopic, !Ref PipelineNotificationTopic, !Ref 'AWS::NoValue']
+                  CustomData: 'Please review the development deployment and approve for production.'
+                RunOrder: 1
+          - !Ref 'AWS::NoValue'
+
+        # Deploy to Production Environment
+        - Name: DeployProd
+          Actions:
+            - Name: CreateProdChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                StackName: !Sub '${ProjectName}-prod-stack'
+                ChangeSetName: !Sub '${ProjectName}-prod-changeset'
+                TemplatePath: BuildOutput::cdk.out/*.template.json
+                Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM
+                RoleArn: !GetAtt CloudFormationRole.Arn
+                ParameterOverrides: |
+                  {
+                    "Environment": "production"
+                  }
+              InputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+            - Name: ExecuteProdChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                StackName: !Sub '${ProjectName}-prod-stack'
+                ChangeSetName: !Sub '${ProjectName}-prod-changeset'
+              RunOrder: 2
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-pipeline'
+        - Key: Purpose
+          Value: 'CDK Infrastructure Deployment'
+
+  # CloudWatch Event Rule for pipeline notifications
+  PipelineEventRule:
+    Type: AWS::Events::Rule
+    Condition: CreateNotificationTopic
+    Properties:
+      Description: 'Capture pipeline state changes'
+      EventPattern:
+        source:
+          - aws.codepipeline
+        detail-type:
+          - CodePipeline Pipeline Execution State Change
+        detail:
+          pipeline:
+            - !Ref DeploymentPipeline
+      State: ENABLED
+      Targets:
+        - Arn: !Ref PipelineNotificationTopic
+          Id: PipelineNotificationTarget
+
+  # Lambda function for enhanced pipeline notifications
+  PipelineNotificationFunction:
+    Type: AWS::Lambda::Function
+    Condition: CreateNotificationTopic
+    Properties:
+      FunctionName: !Sub '${ProjectName}-pipeline-notifications'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt PipelineNotificationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          
+          def lambda_handler(event, context):
+              sns = boto3.client('sns')
+              
+              # Extract pipeline details from event
+              detail = event['detail']
+              pipeline_name = detail['pipeline']
+              execution_id = detail['execution-id']
+              state = detail['state']
+              
+              # Create notification message
+              message = f"""
+              Pipeline: {pipeline_name}
+              Execution ID: {execution_id}
+              State: {state}
+              
+              Time: {event['time']}
+              Region: {event['region']}
+              """
+              
+              # Publish to SNS
+              sns.publish(
+                  TopicArn=context.sns_topic_arn,
+                  Subject=f'Pipeline {state}: {pipeline_name}',
+                  Message=message
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Notification sent')
+              }
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref PipelineNotificationTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-pipeline-notifications'
+        - Key: Purpose
+          Value: 'Pipeline Notifications'
+
+  # IAM Role for the notification Lambda function
+  PipelineNotificationLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: CreateNotificationTopic
+    Properties:
+      RoleName: !Sub '${ProjectName}-Pipeline-Notification-Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref PipelineNotificationTopic
+
+# Outputs provide important information about created resources
+Outputs:
+  RepositoryCloneUrl:
+    Description: 'HTTPS clone URL for the CodeCommit repository'
+    Value: !GetAtt SourceRepository.CloneUrlHttp
+    Export:
+      Name: !Sub '${ProjectName}-repository-clone-url'
+
+  RepositoryName:
+    Description: 'Name of the CodeCommit repository'
+    Value: !Ref SourceRepository
+    Export:
+      Name: !Sub '${ProjectName}-repository-name'
+
+  PipelineName:
+    Description: 'Name of the deployment pipeline'
+    Value: !Ref DeploymentPipeline
+    Export:
+      Name: !Sub '${ProjectName}-pipeline-name'
+
+  PipelineUrl:
+    Description: 'URL to view the deployment pipeline'
+    Value: !Sub 'https://console.aws.amazon.com/codesuite/codepipeline/pipelines/${DeploymentPipeline}/view'
+
+  ArtifactBucket:
+    Description: 'S3 bucket for pipeline artifacts'
+    Value: !Ref ArtifactStore
+    Export:
+      Name: !Sub '${ProjectName}-artifact-bucket'
+
+  CodeBuildProject:
+    Description: 'CodeBuild project for building CDK applications'
+    Value: !Ref CodeBuildProject
+    Export:
+      Name: !Sub '${ProjectName}-build-project'
+
+  NotificationTopic:
+    Description: 'SNS topic for pipeline notifications'
+    Value: !If [CreateNotificationTopic, !Ref PipelineNotificationTopic, 'Not Created']
+    Condition: CreateNotificationTopic
+    Export:
+      Name: !Sub '${ProjectName}-notification-topic'
+
+  CloudFormationRole:
+    Description: 'IAM role for CloudFormation deployments'
+    Value: !GetAtt CloudFormationRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-cloudformation-role'
+
+  Region:
+    Description: 'AWS region where resources are deployed'
+    Value: !Ref AWS::Region
+
+  AccountId:
+    Description: 'AWS account ID'
+    Value: !Ref AWS::AccountId

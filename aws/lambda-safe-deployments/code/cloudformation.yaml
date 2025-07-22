@@ -1,0 +1,562 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Lambda Function Deployment Patterns with Blue-Green and Canary Releases - Complete infrastructure for safe serverless deployments'
+
+# Template Parameters for customization
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'deploy-patterns-demo'
+    Description: 'Name prefix for all resources'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+    MaxLength: 50
+    MinLength: 3
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment for deployment'
+
+  InitialVersion:
+    Type: String
+    Default: '1.0.0'
+    Description: 'Initial version number for the Lambda function'
+
+  CanaryTrafficPercent:
+    Type: Number
+    Default: 10
+    MinValue: 0
+    MaxValue: 100
+    Description: 'Percentage of traffic to route to canary version (0-100)'
+
+  EnableCloudWatchAlarms:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable CloudWatch alarms for monitoring'
+
+  ErrorRateThreshold:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 100
+    Description: 'Error rate threshold for CloudWatch alarms'
+
+  LambdaRuntime:
+    Type: String
+    Default: 'python3.9'
+    AllowedValues: ['python3.8', 'python3.9', 'python3.10', 'python3.11', 'nodejs16.x', 'nodejs18.x', 'nodejs20.x']
+    Description: 'Lambda runtime version'
+
+# Conditions for conditional resource creation
+Conditions:
+  CreateCloudWatchAlarms: !Equals [!Ref EnableCloudWatchAlarms, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  EnableCanaryDeployment: !Not [!Equals [!Ref CanaryTrafficPercent, 0]]
+
+# Resources section - all infrastructure components
+Resources:
+  # IAM Role for Lambda function execution
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CustomMetricsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda function - the core compute component
+  DeploymentPatternsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-function-${Environment}'
+      Description: !Sub 'Demo function for deployment patterns - ${InitialVersion}'
+      Runtime: !Ref LambdaRuntime
+      Handler: !If
+        - !Or
+          - !Equals [!Ref LambdaRuntime, 'python3.8']
+          - !Equals [!Ref LambdaRuntime, 'python3.9']
+          - !Equals [!Ref LambdaRuntime, 'python3.10']
+          - !Equals [!Ref LambdaRuntime, 'python3.11']
+        - lambda_function.lambda_handler
+        - index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Code:
+        ZipFile: !Sub |
+          import json
+          import os
+          
+          def lambda_handler(event, context):
+              version = "${InitialVersion}"
+              message = f"Hello from Lambda Version {version} - Blue Environment"
+              
+              # Extract API Gateway context for better responses
+              http_method = event.get('httpMethod', 'UNKNOWN')
+              path = event.get('path', '/')
+              
+              response_body = {
+                  'version': version,
+                  'message': message,
+                  'timestamp': context.aws_request_id,
+                  'environment': 'blue',
+                  'method': http_method,
+                  'path': path,
+                  'function_name': context.function_name,
+                  'function_version': context.function_version,
+                  'log_group': context.log_group_name,
+                  'remaining_time': context.get_remaining_time_in_millis()
+              }
+              
+              return {
+                  'statusCode': 200,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                      'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+                  },
+                  'body': json.dumps(response_body, indent=2)
+              }
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+          VERSION: !Ref InitialVersion
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-function'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda function version - immutable snapshot for blue environment
+  FunctionVersionBlue:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref DeploymentPatternsFunction
+      Description: !Sub 'Blue version ${InitialVersion} - Initial production version'
+
+  # Production alias - enables traffic routing and blue-green deployments
+  ProductionAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref DeploymentPatternsFunction
+      FunctionVersion: !GetAtt FunctionVersionBlue.Version
+      Name: production
+      Description: 'Production alias for blue-green and canary deployments'
+
+  # API Gateway REST API - provides HTTP interface to Lambda function
+  DeploymentPatternsApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-api-${Environment}'
+      Description: 'API Gateway for Lambda deployment patterns demonstration'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 'execute-api:Invoke'
+            Resource: '*'
+            Condition:
+              IpAddress:
+                aws:SourceIp: '0.0.0.0/0'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-api'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # API Gateway resource for demo endpoint
+  DemoResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DeploymentPatternsApi
+      ParentId: !GetAtt DeploymentPatternsApi.RootResourceId
+      PathPart: 'demo'
+
+  # API Gateway GET method configuration
+  DemoGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DeploymentPatternsApi
+      ResourceId: !Ref DemoResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DeploymentPatternsFunction}:production/invocations'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+
+  # API Gateway OPTIONS method for CORS support
+  DemoOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DeploymentPatternsApi
+      ResourceId: !Ref DemoResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+          ResponseModels:
+            application/json: Empty
+
+  # API Gateway deployment - creates the live stage
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - DemoGetMethod
+      - DemoOptionsMethod
+    Properties:
+      RestApiId: !Ref DeploymentPatternsApi
+      StageName: !Ref Environment
+      StageDescription: !Sub 'Deployment stage for ${Environment} environment'
+      Description: !Sub 'Initial deployment for ${ProjectName} API'
+
+  # Lambda permission for API Gateway to invoke the function
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Sub '${DeploymentPatternsFunction}:production'
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DeploymentPatternsApi}/*/*/*'
+
+  # CloudWatch Log Group for Lambda function logs
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DeploymentPatternsFunction}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarm for Lambda function errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors-${Environment}'
+      AlarmDescription: 'Monitor Lambda function error rate for deployment patterns'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref ErrorRateThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DeploymentPatternsFunction
+      AlarmActions:
+        - !Ref SNSAlarmTopic
+      OKActions:
+        - !Ref SNSAlarmTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for Lambda function duration
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-duration-${Environment}'
+      AlarmDescription: 'Monitor Lambda function duration for performance issues'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 20000  # 20 seconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DeploymentPatternsFunction
+      AlarmActions:
+        - !Ref SNSAlarmTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for API Gateway 4xx errors
+  ApiGateway4xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-api-4xx-errors-${Environment}'
+      AlarmDescription: 'Monitor API Gateway 4xx error rate'
+      MetricName: 4XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub '${ProjectName}-api-${Environment}'
+        - Name: Stage
+          Value: !Ref Environment
+      AlarmActions:
+        - !Ref SNSAlarmTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for API Gateway 5xx errors
+  ApiGateway5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-api-5xx-errors-${Environment}'
+      AlarmDescription: 'Monitor API Gateway 5xx error rate'
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub '${ProjectName}-api-${Environment}'
+        - Name: Stage
+          Value: !Ref Environment
+      AlarmActions:
+        - !Ref SNSAlarmTopic
+      TreatMissingData: notBreaching
+
+  # SNS Topic for CloudWatch alarms
+  SNSAlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      TopicName: !Sub '${ProjectName}-alarms-${Environment}'
+      DisplayName: !Sub 'CloudWatch Alarms for ${ProjectName}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alarms'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Dashboard for monitoring deployment patterns
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      DashboardName: !Sub '${ProjectName}-deployment-patterns-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${DeploymentPatternsFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApiGateway", "Count", "ApiName", "${ProjectName}-api-${Environment}", "Stage", "${Environment}" ],
+                  [ ".", "4XXError", ".", ".", ".", "." ],
+                  [ ".", "5XXError", ".", ".", ".", "." ],
+                  [ ".", "Latency", ".", ".", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "API Gateway Metrics"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${DeploymentPatternsFunction}' | fields @timestamp, @message\n| sort @timestamp desc\n| limit 50",
+                "region": "${AWS::Region}",
+                "title": "Recent Lambda Logs"
+              }
+            }
+          ]
+        }
+
+# Outputs section - important values for verification and integration
+Outputs:
+  # Lambda function information
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function'
+    Value: !Ref DeploymentPatternsFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function'
+    Value: !GetAtt DeploymentPatternsFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  ProductionAliasArn:
+    Description: 'ARN of the production alias for blue-green deployments'
+    Value: !Ref ProductionAlias
+    Export:
+      Name: !Sub '${AWS::StackName}-ProductionAlias'
+
+  BlueVersionNumber:
+    Description: 'Blue version number for deployment patterns'
+    Value: !GetAtt FunctionVersionBlue.Version
+    Export:
+      Name: !Sub '${AWS::StackName}-BlueVersion'
+
+  # API Gateway information
+  ApiGatewayId:
+    Description: 'ID of the API Gateway REST API'
+    Value: !Ref DeploymentPatternsApi
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiGatewayId'
+
+  ApiGatewayUrl:
+    Description: 'URL of the API Gateway endpoint'
+    Value: !Sub 'https://${DeploymentPatternsApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/demo'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiGatewayUrl'
+
+  ApiGatewayStage:
+    Description: 'API Gateway deployment stage'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiGatewayStage'
+
+  # IAM role information
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ExecutionRole'
+
+  # Monitoring information
+  CloudWatchLogGroup:
+    Description: 'CloudWatch Log Group for Lambda function'
+    Value: !Ref LambdaLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  SNSTopicArn:
+    Description: 'SNS Topic ARN for CloudWatch alarms'
+    Value: !If [CreateCloudWatchAlarms, !Ref SNSAlarmTopic, 'Not created']
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopic'
+
+  DashboardUrl:
+    Description: 'CloudWatch Dashboard URL for monitoring'
+    Value: !If 
+      - CreateCloudWatchAlarms
+      - !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-deployment-patterns-${Environment}'
+      - 'Not created'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardUrl'
+
+  # Deployment commands for manual version management
+  CreateVersionCommand:
+    Description: 'AWS CLI command to create a new version'
+    Value: !Sub 'aws lambda publish-version --function-name ${DeploymentPatternsFunction} --description "New version"'
+
+  CanaryDeploymentCommand:
+    Description: 'AWS CLI command to setup canary deployment'
+    Value: !Sub 'aws lambda update-alias --function-name ${DeploymentPatternsFunction} --name production --function-version NEW_VERSION --routing-config "AdditionalVersionWeights={\"${FunctionVersionBlue.Version}\"=0.9}"'
+
+  BlueGreenDeploymentCommand:
+    Description: 'AWS CLI command to complete blue-green deployment'
+    Value: !Sub 'aws lambda update-alias --function-name ${DeploymentPatternsFunction} --name production --function-version NEW_VERSION --routing-config "{}"'
+
+  RollbackCommand:
+    Description: 'AWS CLI command to rollback to blue version'
+    Value: !Sub 'aws lambda update-alias --function-name ${DeploymentPatternsFunction} --name production --function-version ${FunctionVersionBlue.Version} --routing-config "{}"'
+
+  # Configuration information
+  ProjectConfiguration:
+    Description: 'Project configuration summary'
+    Value: !Sub |
+      Project: ${ProjectName}
+      Environment: ${Environment}
+      Initial Version: ${InitialVersion}
+      Canary Traffic: ${CanaryTrafficPercent}%
+      Runtime: ${LambdaRuntime}
+      CloudWatch Alarms: ${EnableCloudWatchAlarms}

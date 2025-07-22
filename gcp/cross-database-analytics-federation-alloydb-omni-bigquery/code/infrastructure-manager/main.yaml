@@ -1,0 +1,672 @@
+# Infrastructure Manager Configuration for Cross-Database Analytics Federation
+# Recipe: Cross-Database Analytics Federation with AlloyDB Omni and BigQuery
+# Version: 1.0
+# Description: Deploy comprehensive federated analytics platform with AlloyDB Omni simulation,
+#              BigQuery, Dataplex governance, and Cloud Functions orchestration
+
+# IMPORTANT: This configuration simulates AlloyDB Omni using Cloud SQL for PostgreSQL
+# In production, replace Cloud SQL with actual AlloyDB Omni on-premises deployment
+
+apiVersion: config.cloud.google.com/v1
+kind: InfrastructureManagerConfiguration
+metadata:
+  name: cross-database-analytics-federation
+  description: "Federated analytics platform integrating AlloyDB Omni simulation with BigQuery data warehouse"
+  labels:
+    environment: production
+    recipe-id: "2f8a9c1d"
+    category: analytics
+    services: "alloydb-omni,bigquery,dataplex,cloud-functions"
+
+# Configuration variables for customization
+variables:
+  # Project and location configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID for deployment"
+    validation:
+      pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+  
+  region:
+    type: string
+    description: "Primary deployment region"
+    default: "us-central1"
+    validation:
+      allowed_values: ["us-central1", "us-east1", "us-west1", "europe-west1", "asia-southeast1"]
+  
+  zone:
+    type: string
+    description: "Primary deployment zone"
+    default: "us-central1-a"
+  
+  # Resource naming configuration
+  resource_suffix:
+    type: string
+    description: "Unique suffix for resource names to avoid conflicts"
+    default: "{{ random_id(3) }}"
+  
+  # AlloyDB Omni simulation configuration (Cloud SQL PostgreSQL)
+  alloydb_instance_tier:
+    type: string
+    description: "Cloud SQL instance tier for AlloyDB Omni simulation"
+    default: "db-standard-2"
+    validation:
+      allowed_values: ["db-standard-1", "db-standard-2", "db-standard-4", "db-standard-8"]
+  
+  alloydb_storage_size:
+    type: integer
+    description: "Storage size in GB for AlloyDB Omni simulation"
+    default: 20
+    validation:
+      min: 10
+      max: 500
+  
+  # Database configuration
+  database_name:
+    type: string
+    description: "Database name for transactional data"
+    default: "transactions"
+  
+  database_password:
+    type: string
+    description: "Database root password"
+    sensitive: true
+    validation:
+      min_length: 12
+  
+  # BigQuery configuration
+  analytics_dataset_location:
+    type: string
+    description: "Location for BigQuery datasets"
+    default: "US"
+    validation:
+      allowed_values: ["US", "EU", "us-central1", "europe-west1"]
+  
+  # Cloud Storage configuration
+  storage_class:
+    type: string
+    description: "Cloud Storage bucket storage class"
+    default: "STANDARD"
+    validation:
+      allowed_values: ["STANDARD", "NEARLINE", "COLDLINE", "ARCHIVE"]
+  
+  # Cloud Functions configuration
+  function_memory:
+    type: integer
+    description: "Memory allocation for Cloud Functions in MB"
+    default: 256
+    validation:
+      allowed_values: [128, 256, 512, 1024, 2048]
+  
+  function_timeout:
+    type: integer
+    description: "Timeout for Cloud Functions in seconds"
+    default: 60
+    validation:
+      min: 30
+      max: 540
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: "projects/{{ var.project_id }}/services/bigquery.googleapis.com"
+    metadata:
+      dependsOn: []
+  
+  - name: enable-dataplex-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: "projects/{{ var.project_id }}/services/dataplex.googleapis.com"
+    metadata:
+      dependsOn: [enable-apis]
+  
+  - name: enable-functions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: "projects/{{ var.project_id }}/services/cloudfunctions.googleapis.com"
+    metadata:
+      dependsOn: [enable-dataplex-api]
+  
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: "projects/{{ var.project_id }}/services/storage.googleapis.com"
+    metadata:
+      dependsOn: [enable-functions-api]
+  
+  - name: enable-sql-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: "projects/{{ var.project_id }}/services/sqladmin.googleapis.com"
+    metadata:
+      dependsOn: [enable-storage-api]
+
+  # Service Account for cross-service authentication
+  - name: federation-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      parent: "projects/{{ var.project_id }}"
+      accountId: "federation-sa-{{ var.resource_suffix }}"
+      serviceAccount:
+        displayName: "Analytics Federation Service Account"
+        description: "Service account for federated analytics operations"
+    metadata:
+      dependsOn: [enable-sql-api]
+
+  # IAM bindings for service account
+  - name: service-account-bigquery-connection-user
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: "{{ var.project_id }}"
+      role: "roles/bigquery.connectionUser"
+      member: "serviceAccount:{{ federation-service-account.email }}"
+    metadata:
+      dependsOn: [federation-service-account]
+
+  - name: service-account-bigquery-data-editor
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: "{{ var.project_id }}"
+      role: "roles/bigquery.dataEditor"
+      member: "serviceAccount:{{ federation-service-account.email }}"
+    metadata:
+      dependsOn: [service-account-bigquery-connection-user]
+
+  - name: service-account-dataplex-editor
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: "{{ var.project_id }}"
+      role: "roles/dataplex.editor"
+      member: "serviceAccount:{{ federation-service-account.email }}"
+    metadata:
+      dependsOn: [service-account-bigquery-data-editor]
+
+  # Cloud Storage Data Lake Foundation
+  - name: analytics-data-lake-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: "analytics-lake-{{ var.resource_suffix }}"
+      project: "{{ var.project_id }}"
+      location: "{{ var.region }}"
+      storageClass: "{{ var.storage_class }}"
+      versioning:
+        enabled: true
+      labels:
+        purpose: "data-lake"
+        recipe: "cross-database-analytics-federation"
+        component: "storage"
+      lifecycle:
+        rule:
+          - action:
+              type: "SetStorageClass"
+              storageClass: "NEARLINE"
+            condition:
+              age: 30
+          - action:
+              type: "SetStorageClass"
+              storageClass: "COLDLINE"
+            condition:
+              age: 90
+    metadata:
+      dependsOn: [service-account-dataplex-editor]
+
+  # BigQuery Datasets for Federated Analytics
+  - name: analytics-federation-dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      projectId: "{{ var.project_id }}"
+      datasetId: "analytics_federation"
+      location: "{{ var.analytics_dataset_location }}"
+      description: "Federated analytics workspace for cross-database queries"
+      labels:
+        purpose: "federation"
+        recipe: "cross-database-analytics-federation"
+        component: "bigquery"
+      access:
+        - role: "OWNER"
+          userByEmail: "{{ federation-service-account.email }}"
+        - role: "WRITER"
+          specialGroup: "projectWriters"
+        - role: "READER"
+          specialGroup: "projectReaders"
+    metadata:
+      dependsOn: [analytics-data-lake-bucket]
+
+  - name: cloud-analytics-dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      projectId: "{{ var.project_id }}"
+      datasetId: "cloud_analytics"
+      location: "{{ var.analytics_dataset_location }}"
+      description: "Cloud-native analytics data for federation testing"
+      labels:
+        purpose: "cloud-analytics"
+        recipe: "cross-database-analytics-federation"
+        component: "bigquery"
+      access:
+        - role: "OWNER"
+          userByEmail: "{{ federation-service-account.email }}"
+        - role: "WRITER"
+          specialGroup: "projectWriters"
+        - role: "READER"
+          specialGroup: "projectReaders"
+    metadata:
+      dependsOn: [analytics-federation-dataset]
+
+  # BigQuery Tables with Sample Data
+  - name: customers-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: "{{ var.project_id }}"
+      datasetId: "cloud_analytics"
+      tableId: "customers"
+      description: "Customer master data for federation testing"
+      labels:
+        purpose: "sample-data"
+        recipe: "cross-database-analytics-federation"
+      schema:
+        fields:
+          - name: "customer_id"
+            type: "INTEGER"
+            mode: "REQUIRED"
+            description: "Unique customer identifier"
+          - name: "customer_name"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Customer company name"
+          - name: "region"
+            type: "STRING"
+            mode: "NULLABLE"
+            description: "Customer geographic region"
+          - name: "signup_date"
+            type: "DATE"
+            mode: "NULLABLE"
+            description: "Customer registration date"
+    metadata:
+      dependsOn: [cloud-analytics-dataset]
+
+  # AlloyDB Omni Simulation (Cloud SQL PostgreSQL)
+  - name: alloydb-omni-simulation
+    type: gcp-types/sqladmin-v1beta4:instances
+    properties:
+      name: "alloydb-omni-sim-{{ var.resource_suffix }}"
+      project: "{{ var.project_id }}"
+      region: "{{ var.region }}"
+      databaseVersion: "POSTGRES_14"
+      settings:
+        tier: "{{ var.alloydb_instance_tier }}"
+        dataDiskSizeGb: "{{ var.alloydb_storage_size }}"
+        dataDiskType: "PD_SSD"
+        storageAutoResize: true
+        storageAutoResizeLimit: "{{ var.alloydb_storage_size * 2 }}"
+        activationPolicy: "ALWAYS"
+        availabilityType: "ZONAL"
+        pricingPlan: "PER_USE"
+        replicationType: "SYNCHRONOUS"
+        # Security and performance configurations
+        ipConfiguration:
+          ipv4Enabled: true
+          requireSsl: false
+          authorizedNetworks:
+            - name: "allow-all-temporary"
+              value: "0.0.0.0/0"
+              expirationTime: "{{ now() + duration('7d') }}"
+        backupConfiguration:
+          enabled: true
+          startTime: "03:00"
+          location: "{{ var.region }}"
+          pointInTimeRecoveryEnabled: true
+          transactionLogRetentionDays: 7
+        # Performance insights and monitoring
+        insightsConfig:
+          queryInsightsEnabled: true
+          recordApplicationTags: true
+          recordClientAddress: true
+        userLabels:
+          purpose: "alloydb-omni-simulation"
+          recipe: "cross-database-analytics-federation"
+          component: "database"
+      # Root user password configuration
+      rootPassword: "{{ var.database_password }}"
+    metadata:
+      dependsOn: [customers-table]
+
+  # Database for transactional data
+  - name: transactions-database
+    type: gcp-types/sqladmin-v1beta4:databases
+    properties:
+      project: "{{ var.project_id }}"
+      instance: "{{ alloydb-omni-simulation.name }}"
+      name: "{{ var.database_name }}"
+      charset: "UTF8"
+      collation: "en_US.UTF8"
+    metadata:
+      dependsOn: [alloydb-omni-simulation]
+
+  # BigQuery External Connection for Federation
+  - name: bigquery-federation-connection
+    type: gcp-types/bigqueryconnection-v1beta1:projects.locations.connections
+    properties:
+      parent: "projects/{{ var.project_id }}/locations/{{ var.region }}"
+      connectionId: "alloydb-federation-{{ var.resource_suffix }}"
+      connection:
+        friendlyName: "AlloyDB Omni Federation Connection"
+        description: "Federated connection to AlloyDB Omni for cross-database analytics"
+        cloudSql:
+          instanceId: "{{ var.project_id }}:{{ var.region }}:{{ alloydb-omni-simulation.name }}"
+          database: "{{ var.database_name }}"
+          type: "POSTGRES"
+          credential:
+            username: "postgres"
+            password: "{{ var.database_password }}"
+    metadata:
+      dependsOn: [transactions-database]
+
+  # Dataplex Lake for Unified Data Governance
+  - name: analytics-federation-lake
+    type: gcp-types/dataplex-v1:projects.locations.lakes
+    properties:
+      parent: "projects/{{ var.project_id }}/locations/{{ var.region }}"
+      lakeId: "analytics-federation-lake-{{ var.resource_suffix }}"
+      lake:
+        displayName: "Analytics Federation Lake"
+        description: "Unified governance for federated analytics across AlloyDB Omni and BigQuery"
+        labels:
+          purpose: "data-governance"
+          recipe: "cross-database-analytics-federation"
+          component: "dataplex"
+    metadata:
+      dependsOn: [bigquery-federation-connection]
+
+  # Dataplex Zone for Analytics Organization
+  - name: analytics-zone
+    type: gcp-types/dataplex-v1:projects.locations.lakes.zones
+    properties:
+      parent: "{{ analytics-federation-lake.name }}"
+      zoneId: "analytics-zone"
+      zone:
+        displayName: "Analytics Zone"
+        description: "Zone for organizing federated analytics assets"
+        type: "RAW"
+        resourceSpec:
+          locationType: "SINGLE_REGION"
+        labels:
+          purpose: "analytics-organization"
+          recipe: "cross-database-analytics-federation"
+    metadata:
+      dependsOn: [analytics-federation-lake]
+
+  # Dataplex Asset for BigQuery Datasets
+  - name: bigquery-analytics-asset
+    type: gcp-types/dataplex-v1:projects.locations.lakes.zones.assets
+    properties:
+      parent: "{{ analytics-zone.name }}"
+      assetId: "bigquery-analytics-asset"
+      asset:
+        displayName: "BigQuery Analytics Asset"
+        description: "BigQuery datasets for federated analytics"
+        resourceSpec:
+          name: "projects/{{ var.project_id }}/datasets/analytics_federation"
+          type: "BIGQUERY_DATASET"
+        labels:
+          purpose: "bigquery-governance"
+          recipe: "cross-database-analytics-federation"
+    metadata:
+      dependsOn: [analytics-zone]
+
+  # Dataplex Asset for Cloud Storage Data Lake
+  - name: storage-lake-asset
+    type: gcp-types/dataplex-v1:projects.locations.lakes.zones.assets
+    properties:
+      parent: "{{ analytics-zone.name }}"
+      assetId: "storage-lake-asset"
+      asset:
+        displayName: "Cloud Storage Data Lake Asset"
+        description: "Cloud Storage bucket for data lake foundation"
+        resourceSpec:
+          name: "projects/{{ var.project_id }}/buckets/{{ analytics-data-lake-bucket.name }}"
+          type: "STORAGE_BUCKET"
+        labels:
+          purpose: "storage-governance"
+          recipe: "cross-database-analytics-federation"
+    metadata:
+      dependsOn: [bigquery-analytics-asset]
+
+  # Cloud Storage bucket for Cloud Functions source code
+  - name: functions-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: "functions-source-{{ var.resource_suffix }}"
+      project: "{{ var.project_id }}"
+      location: "{{ var.region }}"
+      storageClass: "STANDARD"
+      labels:
+        purpose: "functions-source"
+        recipe: "cross-database-analytics-federation"
+        component: "cloud-functions"
+    metadata:
+      dependsOn: [storage-lake-asset]
+
+  # Cloud Function for Metadata Synchronization
+  - name: federation-metadata-sync-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: "projects/{{ var.project_id }}/locations/{{ var.region }}"
+      function:
+        name: "federation-metadata-sync"
+        description: "Synchronize metadata between AlloyDB Omni and Dataplex catalog"
+        sourceArchiveUrl: "gs://{{ functions-source-bucket.name }}/function-source.zip"
+        entryPoint: "sync_metadata"
+        runtime: "python39"
+        timeout: "{{ var.function_timeout }}s"
+        availableMemoryMb: "{{ var.function_memory }}"
+        serviceAccountEmail: "{{ federation-service-account.email }}"
+        httpsTrigger: {}
+        environmentVariables:
+          PROJECT_ID: "{{ var.project_id }}"
+          REGION: "{{ var.region }}"
+          CONNECTION_ID: "alloydb-federation-{{ var.resource_suffix }}"
+          LAKE_ID: "analytics-federation-lake-{{ var.resource_suffix }}"
+        labels:
+          purpose: "metadata-orchestration"
+          recipe: "cross-database-analytics-federation"
+          component: "cloud-functions"
+    metadata:
+      dependsOn: [functions-source-bucket]
+
+  # Cloud Scheduler Job for Automated Metadata Sync
+  - name: metadata-sync-scheduler
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: "projects/{{ var.project_id }}/locations/{{ var.region }}"
+      job:
+        name: "federation-metadata-sync-job"
+        description: "Automated metadata synchronization for federated analytics"
+        schedule: "0 */6 * * *"  # Every 6 hours
+        timeZone: "UTC"
+        httpTarget:
+          uri: "{{ federation-metadata-sync-function.httpsTrigger.url }}"
+          httpMethod: "POST"
+          headers:
+            Content-Type: "application/json"
+          body: |
+            {
+              "project_id": "{{ var.project_id }}",
+              "connection_id": "alloydb-federation-{{ var.resource_suffix }}",
+              "lake_id": "analytics-federation-lake-{{ var.resource_suffix }}"
+            }
+          oidcToken:
+            serviceAccountEmail: "{{ federation-service-account.email }}"
+    metadata:
+      dependsOn: [federation-metadata-sync-function]
+
+# Output values for verification and integration
+outputs:
+  # Project and deployment information
+  project_id:
+    description: "Google Cloud Project ID"
+    value: "{{ var.project_id }}"
+  
+  deployment_region:
+    description: "Primary deployment region"
+    value: "{{ var.region }}"
+  
+  resource_suffix:
+    description: "Unique resource suffix used for naming"
+    value: "{{ var.resource_suffix }}"
+  
+  # Service account information
+  federation_service_account_email:
+    description: "Service account email for federation operations"
+    value: "{{ federation-service-account.email }}"
+  
+  # AlloyDB Omni simulation details
+  alloydb_instance_name:
+    description: "AlloyDB Omni simulation instance name"
+    value: "{{ alloydb-omni-simulation.name }}"
+  
+  alloydb_instance_ip:
+    description: "AlloyDB Omni simulation instance IP address"
+    value: "{{ alloydb-omni-simulation.ipAddresses[0].ipAddress }}"
+  
+  alloydb_connection_name:
+    description: "AlloyDB Omni simulation connection name"
+    value: "{{ var.project_id }}:{{ var.region }}:{{ alloydb-omni-simulation.name }}"
+  
+  database_name:
+    description: "Transactional database name"
+    value: "{{ var.database_name }}"
+  
+  # BigQuery configuration
+  analytics_federation_dataset:
+    description: "BigQuery dataset for federated analytics"
+    value: "{{ var.project_id }}.analytics_federation"
+  
+  cloud_analytics_dataset:
+    description: "BigQuery dataset for cloud analytics"
+    value: "{{ var.project_id }}.cloud_analytics"
+  
+  bigquery_connection_id:
+    description: "BigQuery connection ID for federation"
+    value: "{{ var.project_id }}.{{ var.region }}.alloydb-federation-{{ var.resource_suffix }}"
+  
+  # Cloud Storage information
+  data_lake_bucket_name:
+    description: "Cloud Storage data lake bucket name"
+    value: "{{ analytics-data-lake-bucket.name }}"
+  
+  data_lake_bucket_url:
+    description: "Cloud Storage data lake bucket URL"
+    value: "gs://{{ analytics-data-lake-bucket.name }}"
+  
+  # Dataplex governance
+  dataplex_lake_name:
+    description: "Dataplex lake name for unified governance"
+    value: "{{ analytics-federation-lake.name }}"
+  
+  dataplex_zone_name:
+    description: "Dataplex zone name for analytics organization"
+    value: "{{ analytics-zone.name }}"
+  
+  # Cloud Functions orchestration
+  metadata_sync_function_url:
+    description: "Cloud Function URL for metadata synchronization"
+    value: "{{ federation-metadata-sync-function.httpsTrigger.url }}"
+  
+  metadata_sync_scheduler_name:
+    description: "Cloud Scheduler job name for automated metadata sync"
+    value: "{{ metadata-sync-scheduler.name }}"
+  
+  # Federation testing query
+  sample_federation_query:
+    description: "Sample BigQuery federated query for testing"
+    value: |
+      SELECT 
+        c.customer_id,
+        c.customer_name,
+        c.region,
+        c.signup_date,
+        COUNT(o.order_id) as total_orders,
+        SUM(o.order_amount) as total_revenue
+      FROM `{{ var.project_id }}.cloud_analytics.customers` c
+      LEFT JOIN EXTERNAL_QUERY(
+        '{{ var.project_id }}.{{ var.region }}.alloydb-federation-{{ var.resource_suffix }}',
+        'SELECT customer_id, order_id, order_amount FROM orders'
+      ) o ON c.customer_id = o.customer_id
+      GROUP BY c.customer_id, c.customer_name, c.region, c.signup_date
+      ORDER BY total_revenue DESC NULLS LAST;
+
+# Deployment validation and health checks
+healthChecks:
+  # Verify BigQuery datasets are accessible
+  - name: bigquery-datasets-accessible
+    type: "gcp-bigquery-query"
+    query: "SELECT COUNT(*) FROM `{{ var.project_id }}.cloud_analytics.INFORMATION_SCHEMA.TABLES`"
+    expectedResult: 
+      type: "numeric"
+      operator: ">=1"
+  
+  # Verify AlloyDB Omni simulation connectivity
+  - name: alloydb-connectivity
+    type: "gcp-sql-connectivity"
+    instance: "{{ alloydb-omni-simulation.name }}"
+    database: "{{ var.database_name }}"
+  
+  # Verify Cloud Function deployment
+  - name: cloud-function-deployed
+    type: "gcp-function-status"
+    function: "{{ federation-metadata-sync-function.name }}"
+    expectedStatus: "ACTIVE"
+  
+  # Verify Dataplex lake creation
+  - name: dataplex-lake-active
+    type: "gcp-dataplex-lake-status"
+    lake: "{{ analytics-federation-lake.name }}"
+    expectedState: "ACTIVE"
+
+# Post-deployment setup instructions
+postDeploymentInstructions: |
+  🎉 Cross-Database Analytics Federation infrastructure deployed successfully!
+  
+  📋 NEXT STEPS:
+  
+  1. 📊 **Populate Sample Data**:
+     # Connect to AlloyDB Omni simulation and create sample tables
+     gcloud sql connect {{ alloydb-omni-simulation.name }} --user=postgres --database={{ var.database_name }}
+     
+     # Insert sample customer data into BigQuery
+     bq query --use_legacy_sql=false "INSERT INTO \`{{ var.project_id }}.cloud_analytics.customers\` VALUES (1, 'Acme Corp', 'North America', '2023-01-15'), (2, 'Global Tech Ltd', 'Europe', '2023-02-20'), (3, 'Pacific Solutions', 'Asia Pacific', '2023-03-10')"
+  
+  2. 🔗 **Test Federation Connection**:
+     # Verify BigQuery connection to AlloyDB Omni
+     bq query --use_legacy_sql=false "SELECT COUNT(*) FROM EXTERNAL_QUERY('{{ var.project_id }}.{{ var.region }}.alloydb-federation-{{ var.resource_suffix }}', 'SELECT 1')"
+  
+  3. 📈 **Execute Federated Analytics**:
+     # Run the sample federation query
+     bq query --use_legacy_sql=false --format=table "{{ outputs.sample_federation_query }}"
+  
+  4. 🛡️ **Configure Security**:
+     # Update SQL instance to use private IP and remove temporary allow-all rule
+     # Implement proper VPN or Cloud Interconnect for production use
+  
+  5. 📊 **Verify Dataplex Governance**:
+     # Check Dataplex lake and asset discovery
+     gcloud dataplex lakes describe {{ analytics-federation-lake.name }}
+  
+  6. ⚡ **Test Cloud Function**:
+     # Trigger metadata synchronization manually
+     curl -X POST "{{ federation-metadata-sync-function.httpsTrigger.url }}" \
+       -H "Content-Type: application/json" \
+       -d '{"project_id":"{{ var.project_id }}","connection_id":"alloydb-federation-{{ var.resource_suffix }}"}'
+  
+  📚 **Documentation**: Refer to the recipe documentation for detailed usage examples and advanced configuration options.
+  
+  ⚠️  **Production Notes**:
+  - Replace Cloud SQL simulation with actual AlloyDB Omni deployment
+  - Implement proper network security and private connectivity
+  - Configure backup and disaster recovery procedures
+  - Set up monitoring and alerting for federated queries
+  - Review and optimize BigQuery slot allocation for federation workloads

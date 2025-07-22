@@ -1,0 +1,836 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Advanced Data Lake Governance with Lake Formation and DataZone - Enterprise-grade data governance platform with fine-grained access control and data discovery'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Domain Configuration"
+        Parameters:
+          - DomainName
+          - BusinessGlossaryName
+      - Label:
+          default: "Data Lake Configuration"
+        Parameters:
+          - DataLakeBucketName
+          - GlueDatabaseName
+          - EnableDataQualityMonitoring
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - CreateDataAnalystRole
+          - NotificationEmail
+      - Label:
+          default: "Resource Configuration"
+        Parameters:
+          - Environment
+          - ResourcePrefix
+
+Parameters:
+  DomainName:
+    Type: String
+    Default: enterprise-data-governance
+    Description: Name for the Amazon DataZone domain
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+
+  BusinessGlossaryName:
+    Type: String
+    Default: Enterprise Business Glossary
+    Description: Name for the business glossary in DataZone
+    MaxLength: 50
+
+  DataLakeBucketName:
+    Type: String
+    Default: ''
+    Description: Name for the S3 data lake bucket (leave empty for auto-generated name)
+    AllowedPattern: '^[a-z0-9.-]*$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, periods, and hyphens
+
+  GlueDatabaseName:
+    Type: String
+    Default: enterprise_data_catalog
+    Description: Name for the Glue database
+    AllowedPattern: '^[a-z0-9_]+$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and underscores
+
+  CreateDataAnalystRole:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to create a sample data analyst IAM role
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: Email address for data quality notifications (optional)
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address or empty
+
+  EnableDataQualityMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to enable CloudWatch monitoring and alerts
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, staging, prod]
+    Description: Environment designation for resource tagging
+
+  ResourcePrefix:
+    Type: String
+    Default: dlg
+    Description: Prefix for resource names (data lake governance)
+    AllowedPattern: '^[a-z0-9-]+$'
+    MaxLength: 10
+
+Conditions:
+  CreateBucketName: !Equals [!Ref DataLakeBucketName, '']
+  CreateAnalystRole: !Equals [!Ref CreateDataAnalystRole, 'true']
+  EnableMonitoring: !Equals [!Ref EnableDataQualityMonitoring, 'true']
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  CreateNotifications: !And [!Condition EnableMonitoring, !Condition HasNotificationEmail]
+
+Resources:
+  # ============================================================================
+  # S3 Data Lake Infrastructure
+  # ============================================================================
+  
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !If
+        - CreateBucketName
+        - !Sub '${ResourcePrefix}-datalake-${AWS::AccountId}-${AWS::Region}'
+        - !Ref DataLakeBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldVersions
+            Status: Enabled
+            NoncurrentVersionTransitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: data-lake-access-logs/
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !If [EnableMonitoring, !Ref DataLakeLogGroup, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: DataLake
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ResourcePrefix}-access-logs-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: AccessLogs
+
+  # ============================================================================
+  # IAM Roles and Policies
+  # ============================================================================
+
+  LakeFormationServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-LakeFormationServiceRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lakeformation.amazonaws.com
+                - glue.amazonaws.com
+                - datazone.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/LakeFormationServiceRolePolicy
+      Policies:
+        - PolicyName: DataLakeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:ListMultipartUploadParts
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub '${DataLakeBucket}'
+                  - !Sub '${DataLakeBucket}/*'
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:CreateDatabase
+                  - glue:UpdateDatabase
+                  - glue:DeleteDatabase
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:DeleteTable
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:CreatePartition
+                  - glue:UpdatePartition
+                  - glue:DeletePartition
+                  - glue:BatchCreatePartition
+                  - glue:BatchDeletePartition
+                  - glue:BatchUpdatePartition
+                  - glue:GetCrawler
+                  - glue:StartCrawler
+                  - glue:StopCrawler
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                  - lakeformation:GrantPermissions
+                  - lakeformation:RevokePermissions
+                  - lakeformation:BatchGrantPermissions
+                  - lakeformation:BatchRevokePermissions
+                  - lakeformation:ListPermissions
+                  - lakeformation:GetResourceLFTags
+                  - lakeformation:ListLFTags
+                  - lakeformation:GetLFTag
+                  - lakeformation:CreateLFTag
+                  - lakeformation:UpdateLFTag
+                  - lakeformation:DeleteLFTag
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: LakeFormationService
+
+  DataAnalystRole:
+    Type: AWS::IAM::Role
+    Condition: CreateAnalystRole
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-DataAnalystRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:PrincipalTag/Department': 'Analytics'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonAthenaFullAccess
+        - arn:aws:iam::aws:policy/AmazonRedshiftReadOnlyAccess
+      Policies:
+        - PolicyName: DataLakeReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                  - lakeformation:GetTable
+                  - lakeformation:GetDatabase
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${DataLakeBucket}/curated-data/*'
+                  - !Sub '${DataLakeBucket}/analytics-data/*'
+                  - !Sub '${DataLakeBucket}'
+              - Effect: Allow
+                Action:
+                  - datazone:ListDomains
+                  - datazone:GetDomain
+                  - datazone:ListProjects
+                  - datazone:GetProject
+                  - datazone:SearchTypes
+                  - datazone:Search
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: DataAnalysis
+
+  # ============================================================================
+  # AWS Glue Data Catalog
+  # ============================================================================
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+        Description: Enterprise data catalog for governed data lake
+        LocationUri: !Sub 's3://${DataLakeBucket}/curated-data/'
+        Parameters:
+          classification: curated
+          environment: !Ref Environment
+          created_by: cloudformation
+
+  CustomerDataTable:
+    Type: AWS::Glue::Table
+    DependsOn: GlueDatabase
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabaseName
+      TableInput:
+        Name: customer_data
+        Description: Customer information with PII protection
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: csv
+          delimiter: ','
+          has_encrypted_data: 'false'
+          data_classification: confidential
+          compressionType: none
+          typeOfData: file
+        StorageDescriptor:
+          Columns:
+            - Name: customer_id
+              Type: bigint
+              Comment: Unique customer identifier
+            - Name: first_name
+              Type: string
+              Comment: Customer first name - PII
+            - Name: last_name
+              Type: string
+              Comment: Customer last name - PII
+            - Name: email
+              Type: string
+              Comment: Customer email - PII
+            - Name: phone
+              Type: string
+              Comment: Customer phone - PII
+            - Name: registration_date
+              Type: date
+              Comment: Account registration date
+            - Name: customer_segment
+              Type: string
+              Comment: Business customer segment
+            - Name: lifetime_value
+              Type: double
+              Comment: Customer lifetime value
+            - Name: region
+              Type: string
+              Comment: Customer geographic region
+          Location: !Sub 's3://${DataLakeBucket}/curated-data/customer_data/'
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+            Parameters:
+              field.delim: ','
+              skip.header.line.count: '1'
+          StoredAsSubDirectories: false
+        PartitionKeys:
+          - Name: year
+            Type: string
+          - Name: month
+            Type: string
+
+  TransactionDataTable:
+    Type: AWS::Glue::Table
+    DependsOn: GlueDatabase
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabaseName
+      TableInput:
+        Name: transaction_data
+        Description: Customer transaction records
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          data_classification: internal
+          compressionType: snappy
+          typeOfData: file
+        StorageDescriptor:
+          Columns:
+            - Name: transaction_id
+              Type: string
+              Comment: Unique transaction identifier
+            - Name: customer_id
+              Type: bigint
+              Comment: Associated customer ID
+            - Name: transaction_date
+              Type: timestamp
+              Comment: Transaction timestamp
+            - Name: amount
+              Type: double
+              Comment: Transaction amount
+            - Name: currency
+              Type: string
+              Comment: Transaction currency
+            - Name: merchant_category
+              Type: string
+              Comment: Merchant category code
+            - Name: payment_method
+              Type: string
+              Comment: Payment method used
+            - Name: status
+              Type: string
+              Comment: Transaction status
+          Location: !Sub 's3://${DataLakeBucket}/curated-data/transaction_data/'
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          StoredAsSubDirectories: false
+        PartitionKeys:
+          - Name: year
+            Type: string
+          - Name: month
+            Type: string
+          - Name: day
+            Type: string
+
+  # ============================================================================
+  # ETL Job Configuration
+  # ============================================================================
+
+  ETLJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-GlueETLRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/GlueServiceRole
+      Policies:
+        - PolicyName: ETLDataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${DataLakeBucket}'
+                  - !Sub '${DataLakeBucket}/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: ETLProcessing
+
+  CustomerDataETLJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${ResourcePrefix}-CustomerDataETLWithLineage-${Environment}'
+      Description: ETL job for customer data with lineage tracking
+      Role: !GetAtt ETLJobRole.Arn
+      GlueVersion: '4.0'
+      MaxRetries: 1
+      Timeout: 60
+      MaxCapacity: 2.0
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 's3://${DataLakeBucket}/scripts/customer_data_etl.py'
+        PythonVersion: '3'
+      DefaultArguments:
+        '--job-language': python
+        '--job-bookmark-option': job-bookmark-enable
+        '--enable-metrics': 'true'
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--enable-spark-ui': 'true'
+        '--spark-event-logs-path': !Sub 's3://${DataLakeBucket}/spark-logs/'
+        '--enable-glue-datacatalog': 'true'
+        '--DATA_LAKE_BUCKET': !Ref DataLakeBucket
+        '--GLUE_DATABASE': !Ref GlueDatabaseName
+      Tags:
+        Environment: !Ref Environment
+        Purpose: DataProcessing
+
+  # ============================================================================
+  # Monitoring and Alerting
+  # ============================================================================
+
+  DataLakeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableMonitoring
+    Properties:
+      LogGroupName: !Sub '/aws/datazone/${ResourcePrefix}-data-quality'
+      RetentionInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: DataQualityMonitoring
+
+  DataQualityAlertsTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnableMonitoring
+    Properties:
+      TopicName: !Sub '${ResourcePrefix}-DataQualityAlerts-${Environment}'
+      DisplayName: Data Quality Alerts
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: DataQualityAlerts
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateNotifications
+    Properties:
+      Protocol: email
+      TopicArn: !Ref DataQualityAlertsTopic
+      Endpoint: !Ref NotificationEmail
+
+  ETLFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-DataLakeETLFailures-${Environment}'
+      AlarmDescription: Alert when ETL jobs fail
+      MetricName: glue.ALL.job.failure
+      Namespace: AWS/Glue
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DataQualityAlertsTopic
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: DataQualityMonitoring
+
+  # ============================================================================
+  # Lake Formation Configuration
+  # ============================================================================
+
+  # Note: Lake Formation settings and DataZone domain creation
+  # require custom resources as they're not directly supported in CloudFormation
+
+  LakeFormationSettings:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt LakeFormationCustomResourceFunction.Arn
+      DataLakeAdmins:
+        - !GetAtt LakeFormationServiceRole.Arn
+      CreateDatabaseDefaultPermissions: []
+      CreateTableDefaultPermissions: []
+      TrustedResourceOwners:
+        - !Ref AWS::AccountId
+
+  LakeFormationCustomResourceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-LakeFormationSetup-${Environment}'
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt LakeFormationCustomResourceRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+          
+          def handler(event, context):
+              try:
+                  lf_client = boto3.client('lakeformation')
+                  
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      # Configure Lake Formation settings
+                      response = lf_client.put_data_lake_settings(
+                          DataLakeSettings={
+                              'DataLakeAdmins': [{'DataLakePrincipalIdentifier': arn} 
+                                               for arn in event['ResourceProperties']['DataLakeAdmins']],
+                              'CreateDatabaseDefaultPermissions': [],
+                              'CreateTableDefaultPermissions': [],
+                              'Parameters': {
+                                  'CROSS_ACCOUNT_VERSION': '3'
+                              },
+                              'TrustedResourceOwners': event['ResourceProperties']['TrustedResourceOwners'],
+                              'AllowExternalDataFiltering': True,
+                              'ExternalDataFilteringAllowList': event['ResourceProperties']['TrustedResourceOwners']
+                          }
+                      )
+                      
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  LakeFormationCustomResourceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LakeFormationAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lakeformation:PutDataLakeSettings
+                  - lakeformation:GetDataLakeSettings
+                  - lakeformation:RegisterResource
+                  - lakeformation:DeregisterResource
+                Resource: '*'
+
+  S3LocationRegistration:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: LakeFormationSettings
+    Properties:
+      ServiceToken: !GetAtt S3RegistrationFunction.Arn
+      S3BucketArn: !Sub '${DataLakeBucket}'
+
+  S3RegistrationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-S3Registration-${Environment}'
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt S3RegistrationRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+          
+          def handler(event, context):
+              try:
+                  lf_client = boto3.client('lakeformation')
+                  
+                  if event['RequestType'] == 'Create':
+                      # Register S3 location with Lake Formation
+                      response = lf_client.register_resource(
+                          ResourceArn=event['ResourceProperties']['S3BucketArn'],
+                          UseServiceLinkedRole=True
+                      )
+                  elif event['RequestType'] == 'Delete':
+                      # Deregister S3 location
+                      try:
+                          response = lf_client.deregister_resource(
+                              ResourceArn=event['ResourceProperties']['S3BucketArn']
+                          )
+                      except Exception as e:
+                          print(f"Deregistration error (may be expected): {str(e)}")
+                      
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  S3RegistrationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LakeFormationResourceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lakeformation:RegisterResource
+                  - lakeformation:DeregisterResource
+                  - lakeformation:DescribeResource
+                  - iam:PutRolePolicy
+                  - iam:CreateServiceLinkedRole
+                Resource: '*'
+
+# ============================================================================
+# Outputs
+# ============================================================================
+
+Outputs:
+  DataLakeBucketName:
+    Description: Name of the S3 data lake bucket
+    Value: !Ref DataLakeBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataLakeBucket'
+
+  DataLakeBucketArn:
+    Description: ARN of the S3 data lake bucket
+    Value: !GetAtt DataLakeBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataLakeBucketArn'
+
+  GlueDatabaseName:
+    Description: Name of the Glue database
+    Value: !Ref GlueDatabaseName
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabaseName'
+
+  LakeFormationServiceRoleArn:
+    Description: ARN of the Lake Formation service role
+    Value: !GetAtt LakeFormationServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LakeFormationServiceRole'
+
+  DataAnalystRoleArn:
+    Condition: CreateAnalystRole
+    Description: ARN of the data analyst IAM role
+    Value: !GetAtt DataAnalystRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataAnalystRole'
+
+  CustomerDataTableName:
+    Description: Name of the customer data table in Glue catalog
+    Value: !Ref CustomerDataTable
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomerDataTable'
+
+  TransactionDataTableName:
+    Description: Name of the transaction data table in Glue catalog
+    Value: !Ref TransactionDataTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TransactionDataTable'
+
+  ETLJobName:
+    Description: Name of the Glue ETL job
+    Value: !Ref CustomerDataETLJob
+    Export:
+      Name: !Sub '${AWS::StackName}-ETLJob'
+
+  DataQualityAlertsTopicArn:
+    Condition: EnableMonitoring
+    Description: ARN of the SNS topic for data quality alerts
+    Value: !Ref DataQualityAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-DataQualityAlertsTopic'
+
+  DataLakeLogGroupName:
+    Condition: EnableMonitoring
+    Description: Name of the CloudWatch log group for data lake monitoring
+    Value: !Ref DataLakeLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-DataLakeLogGroup'
+
+  NextSteps:
+    Description: Next steps to complete the data lake governance setup
+    Value: !Sub |
+      1. Create DataZone Domain: aws datazone create-domain --name ${DomainName} --domain-execution-role ${LakeFormationServiceRole.Arn}
+      2. Upload ETL script to: s3://${DataLakeBucket}/scripts/customer_data_etl.py
+      3. Upload sample data to: s3://${DataLakeBucket}/raw-data/
+      4. Run ETL job: aws glue start-job-run --job-name ${CustomerDataETLJob}
+      5. Configure Lake Formation permissions using the AWS Console or CLI
+      6. Set up DataZone business glossary and projects
+
+  ManagementConsoleLinks:
+    Description: AWS Management Console links for governance services
+    Value: !Sub |
+      Lake Formation: https://${AWS::Region}.console.aws.amazon.com/lakeformation/
+      DataZone: https://${AWS::Region}.console.aws.amazon.com/datazone/
+      Glue: https://${AWS::Region}.console.aws.amazon.com/glue/
+      S3 Bucket: https://s3.console.aws.amazon.com/s3/buckets/${DataLakeBucket}

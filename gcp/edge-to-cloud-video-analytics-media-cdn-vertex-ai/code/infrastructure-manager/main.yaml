@@ -1,0 +1,421 @@
+# Infrastructure Manager Configuration for Edge-to-Cloud Video Analytics
+# This configuration deploys a complete video analytics pipeline using Media CDN and Vertex AI
+#
+# Architecture Overview:
+# - Cloud Storage buckets for video content and analytics results
+# - Cloud Functions for event-driven video processing
+# - Vertex AI for video analytics and object detection
+# - Media CDN for global content delivery
+# - IAM roles and policies for secure service integration
+
+apiVersion: v1
+kind: InfrastructureManager
+metadata:
+  name: edge-cloud-video-analytics
+  description: "Complete video analytics pipeline with Media CDN and Vertex AI"
+  version: "1.0"
+
+# Configuration parameters for customization
+parameters:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    required: true
+  
+  region:
+    type: string
+    description: "Primary region for resources"
+    default: "us-central1"
+    
+  zone:
+    type: string
+    description: "Primary zone for resources"
+    default: "us-central1-a"
+    
+  random_suffix:
+    type: string
+    description: "Random suffix for unique resource naming"
+    default: "{{ generateRandomString(6) }}"
+    
+  video_bucket_name:
+    type: string
+    description: "Name for video content storage bucket"
+    default: "video-content-{{ .random_suffix }}"
+    
+  results_bucket_name:
+    type: string
+    description: "Name for analytics results storage bucket"
+    default: "analytics-results-{{ .random_suffix }}"
+    
+  cdn_service_name:
+    type: string
+    description: "Name for Media CDN service"
+    default: "media-cdn-{{ .random_suffix }}"
+
+# Required Google Cloud APIs
+resources:
+  # Enable required APIs
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ .project_id }}/services/storage.googleapis.com
+      
+  - name: enable-functions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ .project_id }}/services/cloudfunctions.googleapis.com
+      
+  - name: enable-aiplatform-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ .project_id }}/services/aiplatform.googleapis.com
+      
+  - name: enable-videointelligence-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ .project_id }}/services/videointelligence.googleapis.com
+      
+  - name: enable-networkconnectivity-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ .project_id }}/services/networkconnectivity.googleapis.com
+      
+  - name: enable-eventarc-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ .project_id }}/services/eventarc.googleapis.com
+
+  # Cloud Storage bucket for video content
+  - name: video-content-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: {{ .video_bucket_name }}
+      project: {{ .project_id }}
+      location: {{ .region }}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      encryption:
+        defaultKmsKeyName: null
+      uniformBucketLevelAccess:
+        enabled: true
+      cors:
+        - origin: ["*"]
+          method: ["GET", "HEAD", "PUT", "POST", "DELETE"]
+          responseHeader: ["Content-Type", "Access-Control-Allow-Origin"]
+          maxAgeSeconds: 3600
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90
+          - action:
+              type: Delete
+            condition:
+              age: 365
+    depends_on:
+      - enable-storage-api
+
+  # Cloud Storage bucket for analytics results
+  - name: analytics-results-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: {{ .results_bucket_name }}
+      project: {{ .project_id }}
+      location: {{ .region }}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      encryption:
+        defaultKmsKeyName: null
+      uniformBucketLevelAccess:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 60
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 180
+    depends_on:
+      - enable-storage-api
+
+  # Service Account for Cloud Functions
+  - name: video-analytics-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: video-analytics-sa-{{ .random_suffix }}
+      displayName: "Video Analytics Service Account"
+      description: "Service account for video analytics Cloud Functions"
+      project: {{ .project_id }}
+
+  # IAM binding for service account - Storage Admin
+  - name: sa-storage-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ .project_id }}
+      role: roles/storage.admin
+      member: serviceAccount:$(ref.video-analytics-service-account.email)
+    depends_on:
+      - video-analytics-service-account
+
+  # IAM binding for service account - Vertex AI User
+  - name: sa-vertex-ai-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ .project_id }}
+      role: roles/aiplatform.user
+      member: serviceAccount:$(ref.video-analytics-service-account.email)
+    depends_on:
+      - video-analytics-service-account
+
+  # IAM binding for service account - Video Intelligence Admin
+  - name: sa-video-intelligence-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ .project_id }}
+      role: roles/videointelligence.admin
+      member: serviceAccount:$(ref.video-analytics-service-account.email)
+    depends_on:
+      - video-analytics-service-account
+
+  # Primary video processing Cloud Function
+  - name: video-processor-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/{{ .project_id }}/locations/{{ .region }}
+      function: video-processor-{{ .random_suffix }}
+      sourceArchiveUrl: gs://{{ .video_bucket_name }}/function-source/video-processor.zip
+      entryPoint: process_video
+      runtime: python39
+      timeout: 540s
+      availableMemoryMb: 512
+      serviceAccountEmail: $(ref.video-analytics-service-account.email)
+      environmentVariables:
+        PROJECT_ID: {{ .project_id }}
+        REGION: {{ .region }}
+        RESULTS_BUCKET: {{ .results_bucket_name }}
+      eventTrigger:
+        eventType: google.storage.object.finalize
+        resource: projects/_/buckets/{{ .video_bucket_name }}
+      description: "Function to process uploaded videos and trigger analytics"
+    depends_on:
+      - enable-functions-api
+      - video-content-bucket
+      - analytics-results-bucket
+      - video-analytics-service-account
+
+  # Advanced video analytics Cloud Function
+  - name: advanced-video-analytics-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/{{ .project_id }}/locations/{{ .region }}
+      function: advanced-video-analytics-{{ .random_suffix }}
+      sourceArchiveUrl: gs://{{ .video_bucket_name }}/function-source/advanced-analytics.zip
+      entryPoint: analyze_video_content
+      runtime: python39
+      timeout: 540s
+      availableMemoryMb: 1024
+      serviceAccountEmail: $(ref.video-analytics-service-account.email)
+      environmentVariables:
+        PROJECT_ID: {{ .project_id }}
+        REGION: {{ .region }}
+        RESULTS_BUCKET: {{ .results_bucket_name }}
+      eventTrigger:
+        eventType: google.storage.object.finalize
+        resource: projects/_/buckets/{{ .video_bucket_name }}
+        failurePolicy:
+          retry: {}
+      description: "Advanced video analytics using Vertex AI Video Intelligence"
+    depends_on:
+      - enable-functions-api
+      - enable-videointelligence-api
+      - video-content-bucket
+      - analytics-results-bucket
+      - video-analytics-service-account
+
+  # Results processing Cloud Function
+  - name: results-processor-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/{{ .project_id }}/locations/{{ .region }}
+      function: results-processor-{{ .random_suffix }}
+      sourceArchiveUrl: gs://{{ .results_bucket_name }}/function-source/results-processor.zip
+      entryPoint: process_analytics_results
+      runtime: python39
+      timeout: 300s
+      availableMemoryMb: 512
+      serviceAccountEmail: $(ref.video-analytics-service-account.email)
+      environmentVariables:
+        PROJECT_ID: {{ .project_id }}
+        REGION: {{ .region }}
+      eventTrigger:
+        eventType: google.storage.object.finalize
+        resource: projects/_/buckets/{{ .results_bucket_name }}
+      description: "Process completed video analytics results and generate insights"
+    depends_on:
+      - enable-functions-api
+      - analytics-results-bucket
+      - video-analytics-service-account
+
+  # Vertex AI Dataset for video analytics
+  - name: video-analytics-dataset
+    type: gcp-types/aiplatform-v1:projects.locations.datasets
+    properties:
+      parent: projects/{{ .project_id }}/locations/{{ .region }}
+      dataset:
+        displayName: video-analytics-dataset-{{ .random_suffix }}
+        description: "Dataset for video analytics and object detection"
+        metadataSchemaUri: gs://google-cloud-aiplatform/schema/dataset/metadata/video_1.0.0.yaml
+        encryptionSpec:
+          kmsKeyName: null
+    depends_on:
+      - enable-aiplatform-api
+
+  # Network Edge Security Service for Media CDN origin
+  - name: media-cdn-origin-security-service
+    type: gcp-types/networkconnectivity-v1:projects.locations.networkEdgeSecurityServices
+    properties:
+      parent: projects/{{ .project_id }}/locations/{{ .region }}
+      networkEdgeSecurityServiceId: {{ .cdn_service_name }}-origin
+      networkEdgeSecurityService:
+        description: "Origin security service for video content storage"
+        securityPolicy: null
+    depends_on:
+      - enable-networkconnectivity-api
+      - video-content-bucket
+
+  # Pub/Sub topic for video processing notifications
+  - name: video-processing-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/{{ .project_id }}/topics/video-processing-{{ .random_suffix }}
+      labels:
+        environment: production
+        purpose: video-analytics
+      messageRetentionDuration: 604800s # 7 days
+      
+  # Pub/Sub subscription for video processing
+  - name: video-processing-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/{{ .project_id }}/subscriptions/video-processing-sub-{{ .random_suffix }}
+      topic: $(ref.video-processing-topic.name)
+      ackDeadlineSeconds: 600
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+      deadLetterPolicy:
+        deadLetterTopic: $(ref.video-processing-topic.name)
+        maxDeliveryAttempts: 5
+    depends_on:
+      - video-processing-topic
+
+  # Monitoring notification channel for alerts
+  - name: email-notification-channel
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      name: projects/{{ .project_id }}/notificationChannels/email-{{ .random_suffix }}
+      type: email
+      displayName: "Video Analytics Alerts"
+      description: "Email notifications for video analytics pipeline"
+      labels:
+        email_address: admin@example.com # Replace with actual email
+      enabled: true
+
+  # Cloud Monitoring alert policy for function failures
+  - name: function-failure-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: "Video Analytics Function Failures"
+      documentation:
+        content: "Alert when video analytics functions experience high failure rates"
+      conditions:
+        - displayName: "Function error rate"
+          conditionThreshold:
+            filter: 'resource.type="cloud_function" AND metric.type="cloudfunctions.googleapis.com/function/execution_count"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 5
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_SUM
+                groupByFields:
+                  - resource.function_name
+      notificationChannels:
+        - $(ref.email-notification-channel.name)
+      enabled: true
+    depends_on:
+      - email-notification-channel
+
+# Outputs for reference and integration
+outputs:
+  video_content_bucket:
+    description: "Name of the video content storage bucket"
+    value: $(ref.video-content-bucket.name)
+    
+  analytics_results_bucket:
+    description: "Name of the analytics results storage bucket"
+    value: $(ref.analytics-results-bucket.name)
+    
+  video_processor_function:
+    description: "Name of the primary video processing function"
+    value: $(ref.video-processor-function.name)
+    
+  advanced_analytics_function:
+    description: "Name of the advanced video analytics function"
+    value: $(ref.advanced-video-analytics-function.name)
+    
+  results_processor_function:
+    description: "Name of the results processing function"
+    value: $(ref.results-processor-function.name)
+    
+  service_account_email:
+    description: "Email of the service account used by functions"
+    value: $(ref.video-analytics-service-account.email)
+    
+  vertex_ai_dataset:
+    description: "Name of the Vertex AI dataset for video analytics"
+    value: $(ref.video-analytics-dataset.name)
+    
+  pubsub_topic:
+    description: "Name of the Pub/Sub topic for video processing notifications"
+    value: $(ref.video-processing-topic.name)
+    
+  cdn_origin_service:
+    description: "Name of the Media CDN origin security service"
+    value: $(ref.media-cdn-origin-security-service.name)
+    
+  project_id:
+    description: "Google Cloud Project ID"
+    value: {{ .project_id }}
+    
+  region:
+    description: "Primary region for deployed resources"
+    value: {{ .region }}
+
+# Deployment metadata
+metadata:
+  labels:
+    solution: video-analytics
+    provider: gcp
+    category: analytics
+    difficulty: intermediate
+  annotations:
+    recipe-id: a8f3d5e7
+    recipe-version: "1.0"
+    infrastructure-version: "1.0"
+    last-updated: "2025-07-12"

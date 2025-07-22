@@ -1,0 +1,778 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Comprehensive multi-account governance framework using AWS Organizations with Service Control Policies.
+  Creates organizational units, implements policy-based controls for cost management and security compliance,
+  and establishes automated governance workflows.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Organization Configuration"
+        Parameters:
+          - OrganizationName
+          - EnableAllFeatures
+      - Label:
+          default: "Logging Configuration"
+        Parameters:
+          - CloudTrailBucketName
+          - ConfigBucketName
+          - EnableCloudTrailEncryption
+          - CloudTrailKeyRetentionPeriod
+      - Label:
+          default: "Cost Management"
+        Parameters:
+          - MasterBudgetAmount
+          - BudgetCurrency
+          - BudgetThresholds
+          - NotificationEmail
+      - Label:
+          default: "Regional Restrictions"
+        Parameters:
+          - ApprovedRegions
+          - RestrictSandboxRegions
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - RequireEncryption
+          - AllowRootUser
+          - MaxInstanceTypes
+    ParameterLabels:
+      OrganizationName:
+        default: "Organization Name"
+      EnableAllFeatures:
+        default: "Enable All Organization Features"
+      CloudTrailBucketName:
+        default: "CloudTrail S3 Bucket Name"
+      ConfigBucketName:
+        default: "Config S3 Bucket Name"
+      MasterBudgetAmount:
+        default: "Master Budget Amount"
+      NotificationEmail:
+        default: "Budget Notification Email"
+
+Parameters:
+  OrganizationName:
+    Type: String
+    Description: Name for the AWS Organization (will have random suffix added)
+    Default: enterprise-org
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+
+  EnableAllFeatures:
+    Type: String
+    Description: Enable all organization features including Service Control Policies
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  CloudTrailBucketName:
+    Type: String
+    Description: S3 bucket name for organization-wide CloudTrail logs (will have random suffix added)
+    Default: org-cloudtrail
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z0-9][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must be a valid S3 bucket name
+
+  ConfigBucketName:
+    Type: String
+    Description: S3 bucket name for AWS Config (will have random suffix added)
+    Default: org-config
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z0-9][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must be a valid S3 bucket name
+
+  EnableCloudTrailEncryption:
+    Type: String
+    Description: Enable CloudTrail log encryption with KMS
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  CloudTrailKeyRetentionPeriod:
+    Type: Number
+    Description: KMS key retention period in days for CloudTrail encryption
+    Default: 90
+    MinValue: 7
+    MaxValue: 365
+
+  MasterBudgetAmount:
+    Type: Number
+    Description: Monthly budget amount for the organization in USD
+    Default: 5000
+    MinValue: 100
+    MaxValue: 1000000
+
+  BudgetCurrency:
+    Type: String
+    Description: Currency for budget calculations
+    Default: USD
+    AllowedValues: [USD, EUR, GBP, JPY, CAD, AUD]
+
+  BudgetThresholds:
+    Type: CommaDelimitedList
+    Description: Budget alert thresholds as percentages (e.g., 80,100,120)
+    Default: "80,100,120"
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for budget and governance notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+
+  ApprovedRegions:
+    Type: CommaDelimitedList
+    Description: List of approved AWS regions for deployment
+    Default: "us-east-1,us-west-2,eu-west-1"
+
+  RestrictSandboxRegions:
+    Type: String
+    Description: Apply regional restrictions to sandbox environments
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  RequireEncryption:
+    Type: String
+    Description: Require encryption for S3 objects and EBS volumes
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  AllowRootUser:
+    Type: String
+    Description: Allow root user access (NOT RECOMMENDED for production)
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+
+  MaxInstanceTypes:
+    Type: CommaDelimitedList
+    Description: Maximum EC2 instance types to block (e.g., *.8xlarge,*.16xlarge)
+    Default: "*.8xlarge,*.12xlarge,*.16xlarge,*.24xlarge,p3.*,p4.*,x1e.*"
+
+Conditions:
+  EnableEncryption: !Equals [!Ref EnableCloudTrailEncryption, 'true']
+  DenyRootUser: !Equals [!Ref AllowRootUser, 'false']
+  RestrictRegions: !Equals [!Ref RestrictSandboxRegions, 'true']
+  RequireS3Encryption: !Equals [!Ref RequireEncryption, 'true']
+
+Resources:
+  # Generate random suffix for resource names
+  RandomSuffixFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-random-suffix-generator'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import string
+          import random
+          
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  # Generate 6-character random suffix
+                  suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+                  
+                  response_data = {
+                      'RandomSuffix': suffix
+                  }
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+      Role: !GetAtt RandomSuffixFunctionRole.Arn
+
+  RandomSuffixFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  RandomSuffix:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt RandomSuffixFunction.Arn
+
+  # KMS Key for CloudTrail encryption
+  CloudTrailKMSKey:
+    Type: AWS::KMS::Key
+    Condition: EnableEncryption
+    Properties:
+      Description: KMS key for CloudTrail log encryption
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM root permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudTrail service
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+      KeyRotationStatus: true
+      PendingWindowInDays: !Ref CloudTrailKeyRetentionPeriod
+
+  CloudTrailKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: EnableEncryption
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-cloudtrail'
+      TargetKeyId: !Ref CloudTrailKMSKey
+
+  # S3 Buckets for logging
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${CloudTrailBucketName}-${RandomSuffix.RandomSuffix}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: CloudTrailLogRetention
+            Status: Enabled
+            ExpirationInDays: 2555  # 7 years
+            NoncurrentVersionExpirationInDays: 365
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+              - StorageClass: DEEP_ARCHIVE
+                TransitionInDays: 365
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref CloudTrailLogGroup
+
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CloudTrailBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ConfigBucketName}-${RandomSuffix.RandomSuffix}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  # CloudWatch Log Group for CloudTrail
+  CloudTrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/cloudtrail/${AWS::StackName}'
+      RetentionInDays: 365
+
+  # Organization-wide CloudTrail
+  OrganizationCloudTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailBucketPolicy
+    Properties:
+      TrailName: !Sub '${AWS::StackName}-organization-trail'
+      S3BucketName: !Ref CloudTrailBucket
+      S3KeyPrefix: 'organization-trail-logs'
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      IsOrganizationTrail: true
+      EnableLogFileValidation: true
+      KMSKeyId: !If [EnableEncryption, !Ref CloudTrailKMSKey, !Ref 'AWS::NoValue']
+      CloudWatchLogsLogGroupArn: !GetAtt CloudTrailLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailLogGroupRole.Arn
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: 'AWS::S3::Object'
+              Values: ['arn:aws:s3:::*/*']
+            - Type: 'AWS::S3::Bucket'
+              Values: ['arn:aws:s3:::*']
+
+  CloudTrailLogGroupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudTrailLogGroupPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt CloudTrailLogGroup.Arn
+
+  # Service Control Policies
+  CostControlPolicy:
+    Type: AWS::Organizations::Policy
+    Properties:
+      Name: CostControlPolicy
+      Description: Policy to control costs and enforce tagging across the organization
+      Type: SERVICE_CONTROL_POLICY
+      Content: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "DenyExpensiveInstances",
+              "Effect": "Deny",
+              "Action": [
+                "ec2:RunInstances"
+              ],
+              "Resource": "arn:aws:ec2:*:*:instance/*",
+              "Condition": {
+                "ForAnyValue:StringLike": {
+                  "ec2:InstanceType": ${MaxInstanceTypes}
+                }
+              }
+            },
+            {
+              "Sid": "DenyExpensiveRDSInstances",
+              "Effect": "Deny",
+              "Action": [
+                "rds:CreateDBInstance",
+                "rds:CreateDBCluster"
+              ],
+              "Resource": "*",
+              "Condition": {
+                "ForAnyValue:StringLike": {
+                  "rds:db-instance-class": [
+                    "*.8xlarge",
+                    "*.12xlarge", 
+                    "*.16xlarge",
+                    "*.24xlarge"
+                  ]
+                }
+              }
+            },
+            {
+              "Sid": "RequireCostAllocationTags",
+              "Effect": "Deny",
+              "Action": [
+                "ec2:RunInstances",
+                "rds:CreateDBInstance",
+                "s3:CreateBucket"
+              ],
+              "Resource": "*",
+              "Condition": {
+                "ForAllValues:StringNotEquals": {
+                  "aws:TagKeys": [
+                    "Department",
+                    "Project", 
+                    "Environment",
+                    "Owner"
+                  ]
+                }
+              }
+            },
+            {
+              "Sid": "DenyUntaggedResourceCreation",
+              "Effect": "Deny",
+              "Action": [
+                "ec2:RunInstances"
+              ],
+              "Resource": [
+                "arn:aws:ec2:*:*:instance/*",
+                "arn:aws:ec2:*:*:volume/*"
+              ],
+              "Condition": {
+                "Null": {
+                  "aws:RequestTag/Department": "true"
+                }
+              }
+            }
+          ]
+        }
+      TargetIds: []
+
+  SecurityBaselinePolicy:
+    Type: AWS::Organizations::Policy
+    Properties:
+      Name: SecurityBaselinePolicy
+      Description: Baseline security controls for all organization accounts
+      Type: SERVICE_CONTROL_POLICY
+      Content: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            ${DenyRootUser}
+            {
+              "Sid": "DenyCloudTrailDisable",
+              "Effect": "Deny",
+              "Action": [
+                "cloudtrail:StopLogging",
+                "cloudtrail:DeleteTrail",
+                "cloudtrail:PutEventSelectors",
+                "cloudtrail:UpdateTrail"
+              ],
+              "Resource": "*"
+            },
+            {
+              "Sid": "DenyConfigDisable", 
+              "Effect": "Deny",
+              "Action": [
+                "config:DeleteConfigRule",
+                "config:DeleteConfigurationRecorder",
+                "config:DeleteDeliveryChannel",
+                "config:StopConfigurationRecorder"
+              ],
+              "Resource": "*"
+            },
+            ${RequireS3Encryption}
+            {
+              "Sid": "DenyUnencryptedEBSVolumes",
+              "Effect": "Deny",
+              "Action": [
+                "ec2:CreateVolume"
+              ],
+              "Resource": "*",
+              "Condition": {
+                "Bool": {
+                  "ec2:Encrypted": "false"
+                }
+              }
+            },
+            {
+              "Sid": "DenyPublicS3Buckets",
+              "Effect": "Deny",
+              "Action": [
+                "s3:PutBucketPublicAccessBlock"
+              ],
+              "Resource": "*",
+              "Condition": {
+                "Bool": {
+                  "s3:PublicAccessBlockConfiguration.BlockPublicAcls": "false"
+                }
+              }
+            }
+          ]
+        }
+      TargetIds: []
+
+  RegionRestrictionPolicy:
+    Type: AWS::Organizations::Policy
+    Condition: RestrictRegions
+    Properties:
+      Name: RegionRestrictionPolicy
+      Description: Restrict sandbox accounts to approved regions only
+      Type: SERVICE_CONTROL_POLICY
+      Content: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "DenyNonApprovedRegions",
+              "Effect": "Deny",
+              "NotAction": [
+                "iam:*",
+                "organizations:*",
+                "route53:*",
+                "cloudfront:*",
+                "waf:*",
+                "wafv2:*",
+                "waf-regional:*",
+                "support:*",
+                "trustedadvisor:*",
+                "budgets:*",
+                "ce:*",
+                "aws-portal:*",
+                "pricing:*"
+              ],
+              "Resource": "*",
+              "Condition": {
+                "StringNotEquals": {
+                  "aws:RequestedRegion": ${ApprovedRegions}
+                }
+              }
+            }
+          ]
+        }
+      TargetIds: []
+
+  # Budget for cost monitoring
+  OrganizationBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub '${AWS::StackName}-organization-budget'
+        BudgetLimit:
+          Amount: !Ref MasterBudgetAmount
+          Unit: !Ref BudgetCurrency
+        TimeUnit: MONTHLY
+        BudgetType: COST
+        CostFilters:
+          LinkedAccount:
+            - !Ref 'AWS::AccountId'
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: !Select [0, !Ref BudgetThresholds]
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref NotificationEmail
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: !Select [1, !Ref BudgetThresholds]
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref NotificationEmail
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: !Select [2, !Ref BudgetThresholds]
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref NotificationEmail
+
+  # CloudWatch Dashboard for governance monitoring
+  GovernanceDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-governance-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/CloudTrail", "ErrorCount", "TrailName", "${OrganizationCloudTrail}"],
+                  ["AWS/CloudTrail", "LogDeliveryTime", "TrailName", "${OrganizationCloudTrail}"]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "CloudTrail Metrics",
+                "period": 300,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${CloudTrailLogGroup}' | fields @timestamp, sourceIPAddress, userIdentity.type, eventName, errorMessage\n| filter eventName like /organizations/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Organization API Activity",
+                "view": "table"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Billing", "EstimatedCharges", "Currency", "${BudgetCurrency}"]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "us-east-1",
+                "title": "Organization Billing Metrics",
+                "period": 86400,
+                "stat": "Maximum"
+              }
+            }
+          ]
+        }
+
+  # SNS Topic for governance alerts
+  GovernanceAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-governance-alerts'
+      DisplayName: Organization Governance Alerts
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Alarms for governance monitoring
+  CloudTrailErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-cloudtrail-errors'
+      AlarmDescription: Alert when CloudTrail experiences errors
+      MetricName: ErrorCount
+      Namespace: AWS/CloudTrail
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref GovernanceAlertsTopic
+      Dimensions:
+        - Name: TrailName
+          Value: !Ref OrganizationCloudTrail
+
+  BudgetExceededAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-budget-exceeded'
+      AlarmDescription: Alert when organization budget is exceeded
+      MetricName: EstimatedCharges
+      Namespace: AWS/Billing
+      Statistic: Maximum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: !Ref MasterBudgetAmount
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref GovernanceAlertsTopic
+      Dimensions:
+        - Name: Currency
+          Value: !Ref BudgetCurrency
+
+Outputs:
+  OrganizationId:
+    Description: AWS Organization ID
+    Value: !Ref 'AWS::NoValue'  # This would need to be populated by an organization resource
+    Export:
+      Name: !Sub '${AWS::StackName}-organization-id'
+
+  CloudTrailBucketName:
+    Description: S3 bucket name for CloudTrail logs
+    Value: !Ref CloudTrailBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-cloudtrail-bucket'
+
+  ConfigBucketName:
+    Description: S3 bucket name for Config
+    Value: !Ref ConfigBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-config-bucket'
+
+  CloudTrailArn:
+    Description: ARN of the organization-wide CloudTrail
+    Value: !GetAtt OrganizationCloudTrail.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-cloudtrail-arn'
+
+  CostControlPolicyId:
+    Description: ID of the cost control Service Control Policy
+    Value: !Ref CostControlPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-cost-control-policy-id'
+
+  SecurityBaselinePolicyId:
+    Description: ID of the security baseline Service Control Policy
+    Value: !Ref SecurityBaselinePolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-security-baseline-policy-id'
+
+  RegionRestrictionPolicyId:
+    Description: ID of the region restriction Service Control Policy
+    Condition: RestrictRegions
+    Value: !Ref RegionRestrictionPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-region-restriction-policy-id'
+
+  GovernanceDashboardURL:
+    Description: URL to the governance monitoring dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${GovernanceDashboard}'
+
+  BudgetName:
+    Description: Name of the organization budget
+    Value: !Sub '${AWS::StackName}-organization-budget'
+
+  CloudTrailKMSKeyId:
+    Description: KMS Key ID for CloudTrail encryption
+    Condition: EnableEncryption
+    Value: !Ref CloudTrailKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-cloudtrail-kms-key'
+
+  GovernanceAlertsTopicArn:
+    Description: SNS Topic ARN for governance alerts
+    Value: !Ref GovernanceAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-governance-alerts-topic'
+
+  RandomSuffix:
+    Description: Random suffix used for resource names
+    Value: !GetAtt RandomSuffix.RandomSuffix
+    Export:
+      Name: !Sub '${AWS::StackName}-random-suffix'

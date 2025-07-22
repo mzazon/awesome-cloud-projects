@@ -1,0 +1,664 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Serverless ETL Pipeline with AWS Glue and Lambda - Complete infrastructure deployment for building scalable data processing workflows'
+
+# Parameters section for customizable deployment options
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'serverless-etl-pipeline'
+    Description: 'Project name used for resource naming and tagging'
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'test', 'staging', 'prod']
+    Description: 'Environment name for resource tagging and naming'
+
+  GlueWorkerType:
+    Type: String
+    Default: 'G.1X'
+    AllowedValues: ['G.1X', 'G.2X', 'G.025X']
+    Description: 'Glue worker type for ETL job execution'
+
+  NumberOfWorkers:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    MaxValue: 100
+    Description: 'Number of Glue workers for ETL job execution'
+
+  EnableS3Notifications:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable S3 event notifications to trigger ETL pipeline'
+
+  GlueJobTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 1
+    MaxValue: 2880
+    Description: 'Glue job timeout in minutes (1-2880)'
+
+  EnableWorkflowSchedule:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable scheduled execution of Glue workflow'
+
+  WorkflowSchedule:
+    Type: String
+    Default: 'cron(0 2 * * ? *)'
+    Description: 'Cron expression for workflow schedule (daily at 2 AM by default)'
+
+# Conditions for conditional resource creation
+Conditions:
+  EnableS3NotificationsCondition: !Equals [!Ref EnableS3Notifications, 'true']
+  EnableWorkflowScheduleCondition: !Equals [!Ref EnableWorkflowSchedule, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+# Resources section defining all infrastructure components
+Resources:
+  # S3 Bucket for data storage with encryption and versioning
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-data-lake-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [IsProduction, 'Enabled', 'Suspended']
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Prefix: processed-data/
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Prefix: processed-data/
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - !If
+            - EnableS3NotificationsCondition
+            - Event: 's3:ObjectCreated:*'
+              Function: !GetAtt ETLOrchestratorFunction.Arn
+              Filter:
+                S3Key:
+                  Rules:
+                    - Name: prefix
+                      Value: raw-data/
+                    - Name: suffix
+                      Value: .csv
+            - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: DataLake
+
+  # IAM Role for AWS Glue with necessary permissions
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-GlueServiceRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueS3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${DataLakeBucket}/*'
+                  - !GetAtt DataLakeBucket.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for Lambda function with Glue and S3 permissions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-LambdaExecutionRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaGlueAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                  - glue:StartCrawler
+                  - glue:GetCrawler
+                  - glue:StartWorkflowRun
+                  - glue:GetWorkflowRun
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${DataLakeBucket}/*'
+                  - !GetAtt DataLakeBucket.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Glue Database for data catalog
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectName}_database_${Environment}'
+        Description: 'Database for serverless ETL pipeline data catalog'
+
+  # Glue Crawler to discover and catalog data schemas
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ProjectName}-crawler-${Environment}'
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Description: 'Crawler to discover and catalog raw data schemas'
+      Targets:
+        S3Targets:
+          - Path: !Sub '${DataLakeBucket}/raw-data/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # Custom resource to upload Glue ETL script to S3
+  GlueScriptUpload:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt ScriptUploadFunction.Arn
+      BucketName: !Ref DataLakeBucket
+      ScriptKey: 'scripts/glue_etl_script.py'
+
+  # Lambda function to upload Glue script during stack creation
+  ScriptUploadFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-script-upload-${Environment}'
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt ScriptUploadRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      s3 = boto3.client('s3')
+                      bucket_name = event['ResourceProperties']['BucketName']
+                      script_key = event['ResourceProperties']['ScriptKey']
+                      
+                      # Glue ETL script content
+                      script_content = '''
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql import functions as F
+from pyspark.sql.types import *
+
+# Parse job arguments
+args = getResolvedOptions(sys.argv, [
+    'JOB_NAME',
+    'database_name',
+    'table_prefix',
+    'output_path'
+])
+
+# Initialize contexts
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+try:
+    # Read data from Glue Data Catalog
+    sales_df = glueContext.create_dynamic_frame.from_catalog(
+        database=args['database_name'],
+        table_name=f"{args['table_prefix']}_sales_data_csv"
+    ).toDF()
+    
+    customer_df = glueContext.create_dynamic_frame.from_catalog(
+        database=args['database_name'],
+        table_name=f"{args['table_prefix']}_customer_data_csv"
+    ).toDF()
+    
+    # Data transformations
+    # 1. Convert price to numeric and calculate total
+    sales_df = sales_df.withColumn("price", F.col("price").cast("double"))
+    sales_df = sales_df.withColumn("total_amount", 
+        F.col("quantity") * F.col("price"))
+    
+    # 2. Convert order_date to proper date format
+    sales_df = sales_df.withColumn("order_date", 
+        F.to_date(F.col("order_date"), "yyyy-MM-dd"))
+    
+    # 3. Join sales with customer data
+    enriched_df = sales_df.join(customer_df, "customer_id", "inner")
+    
+    # 4. Calculate aggregated metrics
+    daily_sales = enriched_df.groupBy("order_date", "region").agg(
+        F.sum("total_amount").alias("daily_revenue"),
+        F.count("order_id").alias("daily_orders"),
+        F.countDistinct("customer_id").alias("unique_customers")
+    )
+    
+    # 5. Calculate customer metrics
+    customer_metrics = enriched_df.groupBy("customer_id", "name", "status").agg(
+        F.sum("total_amount").alias("total_spent"),
+        F.count("order_id").alias("total_orders"),
+        F.avg("total_amount").alias("avg_order_value")
+    )
+    
+    # Write processed data to S3
+    # Convert back to DynamicFrame for writing
+    daily_sales_df = DynamicFrame.fromDF(daily_sales, glueContext, "daily_sales")
+    customer_metrics_df = DynamicFrame.fromDF(customer_metrics, glueContext, "customer_metrics")
+    
+    # Write daily sales data
+    glueContext.write_dynamic_frame.from_options(
+        frame=daily_sales_df,
+        connection_type="s3",
+        connection_options={
+            "path": f"{args['output_path']}/daily_sales/",
+            "partitionKeys": ["order_date"]
+        },
+        format="parquet"
+    )
+    
+    # Write customer metrics
+    glueContext.write_dynamic_frame.from_options(
+        frame=customer_metrics_df,
+        connection_type="s3",
+        connection_options={
+            "path": f"{args['output_path']}/customer_metrics/"
+        },
+        format="parquet"
+    )
+    
+    # Log processing statistics
+    print(f"Processed {sales_df.count()} sales records")
+    print(f"Processed {customer_df.count()} customer records")
+    print(f"Generated {daily_sales.count()} daily sales records")
+    print(f"Generated {customer_metrics.count()} customer metric records")
+    
+    job.commit()
+    
+except Exception as e:
+    print(f"Job failed with error: {str(e)}")
+    job.commit()
+    raise e
+'''
+                      
+                      # Upload script to S3
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key=script_key,
+                          Body=script_content,
+                          ContentType='text/plain'
+                      )
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'ScriptLocation': f's3://{bucket_name}/{script_key}'
+                      })
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+              except Exception as e:
+                  print(f'Error: {str(e)}')
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  # IAM Role for script upload Lambda function
+  ScriptUploadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3UploadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub '${DataLakeBucket}/*'
+
+  # Glue ETL Job definition
+  GlueETLJob:
+    Type: AWS::Glue::Job
+    DependsOn: GlueScriptUpload
+    Properties:
+      Name: !Sub '${ProjectName}-etl-job-${Environment}'
+      Role: !GetAtt GlueServiceRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub '${DataLakeBucket}/scripts/glue_etl_script.py'
+        PythonVersion: '3'
+      DefaultArguments:
+        '--database_name': !Ref GlueDatabase
+        '--table_prefix': 'raw_data'
+        '--output_path': !Sub '${DataLakeBucket}/processed-data'
+        '--TempDir': !Sub '${DataLakeBucket}/temp/'
+        '--enable-metrics': ''
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--job-language': 'python'
+        '--enable-auto-scaling': 'true'
+      MaxRetries: 1
+      Timeout: !Ref GlueJobTimeout
+      GlueVersion: '4.0'
+      WorkerType: !Ref GlueWorkerType
+      NumberOfWorkers: !Ref NumberOfWorkers
+      Description: 'ETL job for processing sales and customer data'
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # Lambda function for ETL orchestration
+  ETLOrchestratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-etl-orchestrator-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          GLUE_JOB_NAME: !Ref GlueETLJob
+          GLUE_DATABASE: !Ref GlueDatabase
+          OUTPUT_PATH: !Sub '${DataLakeBucket}/processed-data'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          # Initialize AWS clients
+          glue_client = boto3.client('glue')
+          s3_client = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              """
+              Lambda function to orchestrate ETL pipeline
+              """
+              try:
+                  # Extract configuration from environment or event
+                  job_name = event.get('job_name') or os.environ.get('GLUE_JOB_NAME')
+                  database_name = event.get('database_name') or os.environ.get('GLUE_DATABASE')
+                  output_path = event.get('output_path') or os.environ.get('OUTPUT_PATH')
+                  
+                  if not job_name:
+                      raise ValueError("job_name is required")
+                  
+                  logger.info(f"Starting ETL pipeline with job: {job_name}")
+                  
+                  # Start Glue job
+                  response = glue_client.start_job_run(
+                      JobName=job_name,
+                      Arguments={
+                          '--database_name': database_name,
+                          '--table_prefix': 'raw_data',
+                          '--output_path': output_path
+                      }
+                  )
+                  
+                  job_run_id = response['JobRunId']
+                  logger.info(f"Started Glue job {job_name} with run ID: {job_run_id}")
+                  
+                  # Return success response
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'ETL pipeline initiated successfully',
+                          'job_name': job_name,
+                          'job_run_id': job_run_id,
+                          'timestamp': datetime.now().isoformat()
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in ETL pipeline: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'timestamp': datetime.now().isoformat()
+                      })
+                  }
+      Description: 'Lambda function to orchestrate serverless ETL pipeline'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda permission for S3 to invoke the function
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableS3NotificationsCondition
+    Properties:
+      FunctionName: !Ref ETLOrchestratorFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt DataLakeBucket.Arn
+
+  # Glue Workflow for pipeline orchestration
+  GlueWorkflow:
+    Type: AWS::Glue::Workflow
+    Properties:
+      Name: !Sub '${ProjectName}-workflow-${Environment}'
+      Description: 'Serverless ETL Pipeline Workflow'
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # Glue Trigger for scheduled workflow execution
+  GlueWorkflowTrigger:
+    Type: AWS::Glue::Trigger
+    Condition: EnableWorkflowScheduleCondition
+    Properties:
+      Name: !Sub '${ProjectName}-workflow-trigger-${Environment}'
+      WorkflowName: !Ref GlueWorkflow
+      Type: SCHEDULED
+      Schedule: !Ref WorkflowSchedule
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref GlueETLJob
+      Description: 'Scheduled trigger for ETL workflow'
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # CloudWatch Log Group for Glue job logs
+  GlueJobLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws-glue/jobs/${ProjectName}-etl-job-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group for Lambda function logs
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-etl-orchestrator-${Environment}'
+      RetentionInDays: !If [IsProduction, 14, 7]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+# Outputs section providing important resource information
+Outputs:
+  DataLakeBucketName:
+    Description: 'Name of the S3 bucket for data lake storage'
+    Value: !Ref DataLakeBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataLakeBucket'
+
+  DataLakeBucketArn:
+    Description: 'ARN of the S3 bucket for data lake storage'
+    Value: !GetAtt DataLakeBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataLakeBucketArn'
+
+  GlueDatabaseName:
+    Description: 'Name of the Glue database for data catalog'
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabase'
+
+  GlueJobName:
+    Description: 'Name of the Glue ETL job'
+    Value: !Ref GlueETLJob
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueJob'
+
+  GlueCrawlerName:
+    Description: 'Name of the Glue crawler for data discovery'
+    Value: !Ref GlueCrawler
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueCrawler'
+
+  LambdaFunctionName:
+    Description: 'Name of the Lambda orchestrator function'
+    Value: !Ref ETLOrchestratorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda orchestrator function'
+    Value: !GetAtt ETLOrchestratorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  GlueWorkflowName:
+    Description: 'Name of the Glue workflow'
+    Value: !Ref GlueWorkflow
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueWorkflow'
+
+  GlueServiceRoleArn:
+    Description: 'ARN of the Glue service role'
+    Value: !GetAtt GlueServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueServiceRole'
+
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRole'
+
+  RawDataPath:
+    Description: 'S3 path for raw data upload'
+    Value: !Sub '${DataLakeBucket}/raw-data/'
+    Export:
+      Name: !Sub '${AWS::StackName}-RawDataPath'
+
+  ProcessedDataPath:
+    Description: 'S3 path for processed data output'
+    Value: !Sub '${DataLakeBucket}/processed-data/'
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessedDataPath'
+
+  DeploymentInstructions:
+    Description: 'Quick start instructions for using the deployed infrastructure'
+    Value: !Sub |
+      1. Upload sample data to: s3://${DataLakeBucket}/raw-data/
+      2. Run crawler: aws glue start-crawler --name ${GlueCrawler}
+      3. Trigger ETL job: aws lambda invoke --function-name ${ETLOrchestratorFunction} --payload '{"job_name":"${GlueETLJob}","database_name":"${GlueDatabase}"}' response.json
+      4. Monitor job: aws glue get-job-runs --job-name ${GlueETLJob}
+      5. View results: aws s3 ls s3://${DataLakeBucket}/processed-data/ --recursive

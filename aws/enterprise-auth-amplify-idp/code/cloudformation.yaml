@@ -1,0 +1,725 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Enterprise Authentication with AWS Amplify and External Identity Providers
+  This template creates a complete authentication infrastructure including:
+  - Amazon Cognito User Pool with SAML/OIDC federation support
+  - Cognito Identity Pool for AWS resource access
+  - Sample AWS Amplify application
+  - IAM roles for authenticated and unauthenticated users
+  - Optional API Gateway for backend services
+
+Parameters:
+  # Basic Configuration
+  ProjectName:
+    Type: String
+    Default: enterprise-auth
+    Description: Project name used for resource naming and tagging
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    MaxLength: 32
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, staging, prod]
+    Description: Environment name for resource tagging and configuration
+
+  # Identity Provider Configuration
+  EnableSAMLProvider:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable SAML 2.0 identity provider integration
+
+  SAMLMetadataURL:
+    Type: String
+    Default: ''
+    Description: SAML metadata URL from your identity provider (required if EnableSAMLProvider is true)
+
+  SAMLProviderName:
+    Type: String
+    Default: EnterpriseAD
+    Description: Name for the SAML identity provider
+    AllowedPattern: '^[a-zA-Z0-9_-]+$'
+
+  EnableOIDCProvider:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable OpenID Connect identity provider integration
+
+  OIDCProviderURL:
+    Type: String
+    Default: ''
+    Description: OIDC provider URL (required if EnableOIDCProvider is true)
+
+  OIDCClientId:
+    Type: String
+    Default: ''
+    Description: OIDC client ID (required if EnableOIDCProvider is true)
+    NoEcho: true
+
+  OIDCClientSecret:
+    Type: String
+    Default: ''
+    Description: OIDC client secret (required if EnableOIDCProvider is true)
+    NoEcho: true
+
+  # User Pool Configuration
+  UserPoolDomainPrefix:
+    Type: String
+    Default: ''
+    Description: Custom domain prefix for Cognito hosted UI (leave empty for auto-generated)
+    AllowedPattern: '^[a-z0-9-]*$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+
+  CallbackURL:
+    Type: String
+    Default: 'http://localhost:3000/auth/callback'
+    Description: Callback URL for OAuth flow (update for production)
+
+  LogoutURL:
+    Type: String
+    Default: 'http://localhost:3000/auth/logout'
+    Description: Logout URL for OAuth flow (update for production)
+
+  # Amplify Configuration
+  CreateAmplifyApp:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Create AWS Amplify application for frontend hosting
+
+  GitHubRepository:
+    Type: String
+    Default: ''
+    Description: GitHub repository URL for Amplify app (optional)
+
+  GitHubAccessToken:
+    Type: String
+    Default: ''
+    Description: GitHub personal access token for repository access
+    NoEcho: true
+
+  # API Gateway Configuration
+  CreateAPIGateway:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Create API Gateway for backend services with Cognito authorization
+
+Conditions:
+  # Identity Provider Conditions
+  CreateSAMLProvider: !Equals [!Ref EnableSAMLProvider, 'true']
+  CreateOIDCProvider: !Equals [!Ref EnableOIDCProvider, 'true']
+  HasSAMLMetadata: !Not [!Equals [!Ref SAMLMetadataURL, '']]
+  HasOIDCConfig: !And
+    - !Condition CreateOIDCProvider
+    - !Not [!Equals [!Ref OIDCProviderURL, '']]
+    - !Not [!Equals [!Ref OIDCClientId, '']]
+
+  # Application Conditions
+  CreateAmplify: !Equals [!Ref CreateAmplifyApp, 'true']
+  CreateAPI: !Equals [!Ref CreateAPIGateway, 'true']
+  HasGitHubRepo: !Not [!Equals [!Ref GitHubRepository, '']]
+  HasCustomDomain: !Not [!Equals [!Ref UserPoolDomainPrefix, '']]
+
+  # Environment Conditions
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # CloudWatch Log Group for Cognito Lambda Triggers
+  CognitoLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-cognito-triggers'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  # Amazon Cognito User Pool
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${ProjectName}-user-pool-${Environment}'
+      
+      # User Pool Policies
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 7
+      
+      # User Attributes
+      AliasAttributes:
+        - email
+        - preferred_username
+      
+      AutoVerifiedAttributes:
+        - email
+      
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: given_name
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+        - Name: family_name
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+        - Name: department
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+          DeveloperOnlyAttribute: false
+
+      # Account Recovery
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+      # Admin Configuration
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+        InviteMessageAction: EMAIL
+        TemporaryPasswordValidityDays: 7
+
+      # Email Configuration
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+
+      # MFA Configuration
+      MfaConfiguration: OPTIONAL
+      EnabledMfas:
+        - SOFTWARE_TOKEN_MFA
+
+      # User Pool Add-ons
+      UserPoolAddOns:
+        AdvancedSecurityMode: !If [IsProduction, 'ENFORCED', 'AUDIT']
+
+      # Tags
+      UserPoolTags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        ManagedBy: CloudFormation
+
+  # SAML Identity Provider
+  SAMLIdentityProvider:
+    Type: AWS::Cognito::UserPoolIdentityProvider
+    Condition: CreateSAMLProvider
+    Properties:
+      UserPoolId: !Ref UserPool
+      ProviderName: !Ref SAMLProviderName
+      ProviderType: SAML
+      ProviderDetails:
+        MetadataURL: !Ref SAMLMetadataURL
+      AttributeMapping:
+        email: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress'
+        given_name: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/givenname'
+        family_name: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/surname'
+        'custom:department': 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/department'
+
+  # OIDC Identity Provider
+  OIDCIdentityProvider:
+    Type: AWS::Cognito::UserPoolIdentityProvider
+    Condition: HasOIDCConfig
+    Properties:
+      UserPoolId: !Ref UserPool
+      ProviderName: OIDC
+      ProviderType: OIDC
+      ProviderDetails:
+        oidc_issuer: !Ref OIDCProviderURL
+        client_id: !Ref OIDCClientId
+        client_secret: !Ref OIDCClientSecret
+        attributes_request_method: GET
+        authorize_scopes: 'openid profile email'
+      AttributeMapping:
+        email: email
+        given_name: given_name
+        family_name: family_name
+
+  # User Pool Client for Web Application
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${ProjectName}-web-client-${Environment}'
+      UserPoolId: !Ref UserPool
+      
+      # OAuth Configuration
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+        - aws.cognito.signin.user.admin
+      
+      # Supported Identity Providers
+      SupportedIdentityProviders: !If
+        - CreateSAMLProvider
+        - !If
+          - CreateOIDCProvider
+          - [COGNITO, !Ref SAMLProviderName, OIDC]
+          - [COGNITO, !Ref SAMLProviderName]
+        - !If
+          - CreateOIDCProvider
+          - [COGNITO, OIDC]
+          - [COGNITO]
+      
+      # Callback URLs
+      CallbackURLs:
+        - !Ref CallbackURL
+      LogoutURLs:
+        - !Ref LogoutURL
+      
+      # Security Configuration
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      RefreshTokenValidity: 30
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+      
+      # Read and Write Attributes
+      ReadAttributes:
+        - email
+        - email_verified
+        - given_name
+        - family_name
+        - custom:department
+      WriteAttributes:
+        - email
+        - given_name
+        - family_name
+
+  # User Pool Domain
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !If
+        - HasCustomDomain
+        - !Ref UserPoolDomainPrefix
+        - !Sub '${ProjectName}-auth-${Environment}-${AWS::AccountId}'
+      UserPoolId: !Ref UserPool
+
+  # Identity Pool for AWS Resource Access
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub '${ProjectName}_identity_pool_${Environment}'
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref UserPoolClient
+          ProviderName: !GetAtt UserPool.ProviderName
+
+  # IAM Role for Authenticated Users
+  AuthenticatedUserRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-authenticated-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref IdentityPool
+              'ForAnyValue:StringLike':
+                'cognito-identity.amazonaws.com:amr': authenticated
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+      Policies:
+        - PolicyName: CognitoIdentityPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - mobileanalytics:PutEvents
+                  - cognito-sync:*
+                  - cognito-identity:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub 'arn:aws:s3:::${ProjectName}-user-content-${Environment}/*'
+
+  # IAM Role for Unauthenticated Users (minimal permissions)
+  UnauthenticatedUserRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-unauthenticated-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref IdentityPool
+              'ForAnyValue:StringLike':
+                'cognito-identity.amazonaws.com:amr': unauthenticated
+      Policies:
+        - PolicyName: UnauthenticatedPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - mobileanalytics:PutEvents
+                  - cognito-sync:CognitoUnauthenticated
+                Resource: '*'
+
+  # Identity Pool Role Attachment
+  IdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        authenticated: !GetAtt AuthenticatedUserRole.Arn
+        unauthenticated: !GetAtt UnauthenticatedUserRole.Arn
+
+  # S3 Bucket for User Content
+  UserContentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-user-content-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # API Gateway for Backend Services
+  RestAPI:
+    Type: AWS::ApiGateway::RestApi
+    Condition: CreateAPI
+    Properties:
+      Name: !Sub '${ProjectName}-api-${Environment}'
+      Description: Backend API for enterprise authentication demo
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # API Gateway Authorizer
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Condition: CreateAPI
+    Properties:
+      RestApiId: !Ref RestAPI
+      Name: CognitoAuthorizer
+      Type: COGNITO_USER_POOLS
+      ProviderARNs:
+        - !GetAtt UserPool.Arn
+      IdentitySource: method.request.header.Authorization
+
+  # API Gateway Resource
+  UserResource:
+    Type: AWS::ApiGateway::Resource
+    Condition: CreateAPI
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !GetAtt RestAPI.RootResourceId
+      PathPart: user
+
+  # API Gateway Method
+  UserMethod:
+    Type: AWS::ApiGateway::Method
+    Condition: CreateAPI
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref UserResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: |
+                {
+                  "message": "Hello from authenticated API",
+                  "user": "$context.authorizer.claims.email",
+                  "timestamp": "$context.requestTime"
+                }
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+
+  # API Gateway Deployment
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Condition: CreateAPI
+    DependsOn:
+      - UserMethod
+    Properties:
+      RestApiId: !Ref RestAPI
+      StageName: !Ref Environment
+      StageDescription: !Sub 'API deployment for ${Environment}'
+
+  # AWS Amplify Application
+  AmplifyApp:
+    Type: AWS::Amplify::App
+    Condition: CreateAmplify
+    Properties:
+      Name: !Sub '${ProjectName}-app-${Environment}'
+      Description: Enterprise authentication demo application
+      Repository: !If
+        - HasGitHubRepo
+        - !Ref GitHubRepository
+        - !Ref AWS::NoValue
+      AccessToken: !If
+        - HasGitHubRepo
+        - !Ref GitHubAccessToken
+        - !Ref AWS::NoValue
+      BuildSpec: |
+        version: 1
+        frontend:
+          phases:
+            preBuild:
+              commands:
+                - npm ci
+            build:
+              commands:
+                - npm run build
+          artifacts:
+            baseDirectory: build
+            files:
+              - '**/*'
+          cache:
+            paths:
+              - node_modules/**/*
+      EnvironmentVariables:
+        - Name: REACT_APP_AWS_REGION
+          Value: !Ref AWS::Region
+        - Name: REACT_APP_USER_POOL_ID
+          Value: !Ref UserPool
+        - Name: REACT_APP_USER_POOL_CLIENT_ID
+          Value: !Ref UserPoolClient
+        - Name: REACT_APP_IDENTITY_POOL_ID
+          Value: !Ref IdentityPool
+        - Name: REACT_APP_COGNITO_DOMAIN
+          Value: !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
+        - Name: REACT_APP_API_ENDPOINT
+          Value: !If
+            - CreateAPI
+            - !Sub 'https://${RestAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+            - ''
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Amplify Branch
+  AmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Condition: CreateAmplify
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      BranchName: main
+      EnableAutoBuild: !If [HasGitHubRepo, true, false]
+      Stage: !If [IsProduction, 'PRODUCTION', 'DEVELOPMENT']
+
+  # CloudWatch Dashboard
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-auth-monitoring-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Cognito", "SignInSuccesses", "UserPool", "${UserPool}", "UserPoolClient", "${UserPoolClient}" ],
+                  [ ".", "SignInThrottles", ".", ".", ".", "." ],
+                  [ ".", "SignUpSuccesses", ".", ".", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Cognito Authentication Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${CognitoLogGroup}'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Authentication Logs",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  # User Pool Outputs
+  UserPoolId:
+    Description: ID of the Cognito User Pool
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolId'
+
+  UserPoolArn:
+    Description: ARN of the Cognito User Pool
+    Value: !GetAtt UserPool.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolArn'
+
+  UserPoolClientId:
+    Description: ID of the Cognito User Pool Client
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolClientId'
+
+  # Identity Pool Outputs
+  IdentityPoolId:
+    Description: ID of the Cognito Identity Pool
+    Value: !Ref IdentityPool
+    Export:
+      Name: !Sub '${AWS::StackName}-IdentityPoolId'
+
+  # Authentication Domain
+  CognitoDomain:
+    Description: Cognito Hosted UI Domain
+    Value: !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-CognitoDomain'
+
+  # OAuth Endpoints
+  AuthorizationEndpoint:
+    Description: OAuth Authorization Endpoint
+    Value: !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/authorize'
+
+  TokenEndpoint:
+    Description: OAuth Token Endpoint
+    Value: !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/token'
+
+  # SAML Configuration
+  SAMLEntityId:
+    Condition: CreateSAMLProvider
+    Description: SAML Entity ID for IdP configuration
+    Value: !Sub 'urn:amazon:cognito:sp:${UserPool}'
+
+  SAMLReplyURL:
+    Condition: CreateSAMLProvider
+    Description: SAML Reply URL for IdP configuration
+    Value: !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/saml2/idpresponse'
+
+  # API Gateway
+  APIEndpoint:
+    Condition: CreateAPI
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${RestAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-APIEndpoint'
+
+  # Amplify App
+  AmplifyAppId:
+    Condition: CreateAmplify
+    Description: Amplify App ID
+    Value: !GetAtt AmplifyApp.AppId
+
+  AmplifyDefaultDomain:
+    Condition: CreateAmplify
+    Description: Amplify Default Domain
+    Value: !GetAtt AmplifyApp.DefaultDomain
+
+  # Storage
+  UserContentBucketName:
+    Description: S3 bucket for user content
+    Value: !Ref UserContentBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-UserContentBucket'
+
+  # IAM Roles
+  AuthenticatedRoleArn:
+    Description: ARN of the authenticated user IAM role
+    Value: !GetAtt AuthenticatedUserRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AuthenticatedRoleArn'
+
+  # Configuration for Frontend
+  AmplifyConfig:
+    Description: Amplify configuration for frontend applications
+    Value: !Sub |
+      {
+        "Auth": {
+          "region": "${AWS::Region}",
+          "userPoolId": "${UserPool}",
+          "userPoolWebClientId": "${UserPoolClient}",
+          "identityPoolId": "${IdentityPool}",
+          "oauth": {
+            "domain": "${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com",
+            "scope": ["openid", "email", "profile"],
+            "redirectSignIn": "${CallbackURL}",
+            "redirectSignOut": "${LogoutURL}",
+            "responseType": "code"
+          }
+        },
+        "Storage": {
+          "AWSS3": {
+            "bucket": "${UserContentBucket}",
+            "region": "${AWS::Region}"
+          }
+        }
+      }
+
+  # Monitoring
+  DashboardURL:
+    Description: CloudWatch Dashboard URL
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-auth-monitoring-${Environment}'

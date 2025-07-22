@@ -1,0 +1,727 @@
+# Google Cloud Infrastructure Manager Configuration
+# Recipe: Cloud Operations Automation with Gemini Cloud Assist and Hyperdisk ML
+# This configuration deploys an AI-powered ML operations platform with high-performance storage
+
+metadata:
+  name: ml-ops-automation-platform
+  labels:
+    solution: "ml-operations-automation"
+    ai-powered: "true"
+    storage-type: "hyperdisk-ml"
+    version: "1.0"
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud project ID"
+    validation:
+      condition: "length(var.project_id) > 0"
+      error_message: "Project ID must not be empty"
+
+  region:
+    type: string
+    description: "Primary region for resource deployment"
+    default: "us-central1"
+    validation:
+      condition: "can(regex(\"^[a-z]+-[a-z0-9]+-[0-9]+$\", var.region))"
+      error_message: "Region must be a valid Google Cloud region"
+
+  zone:
+    type: string
+    description: "Primary zone for zonal resources"
+    default: "us-central1-a"
+    validation:
+      condition: "can(regex(\"^[a-z]+-[a-z0-9]+-[0-9]+[a-z]$\", var.zone))"
+      error_message: "Zone must be a valid Google Cloud zone"
+
+  cluster_name:
+    type: string
+    description: "Name for the GKE cluster"
+    default: "ml-ops-cluster"
+
+  hyperdisk_size_gb:
+    type: number
+    description: "Size of Hyperdisk ML volume in GB"
+    default: 10240  # 10TB
+    validation:
+      condition: "var.hyperdisk_size_gb >= 1024"
+      error_message: "Hyperdisk ML minimum size is 1TB (1024 GB)"
+
+  hyperdisk_throughput:
+    type: number
+    description: "Provisioned throughput for Hyperdisk ML in MiB/s"
+    default: 100000
+    validation:
+      condition: "var.hyperdisk_throughput >= 1000 && var.hyperdisk_throughput <= 1200000"
+      error_message: "Hyperdisk ML throughput must be between 1,000 and 1,200,000 MiB/s"
+
+  enable_gpu_nodes:
+    type: bool
+    description: "Enable GPU node pool for ML training workloads"
+    default: true
+
+  max_nodes:
+    type: number
+    description: "Maximum number of nodes in the cluster"
+    default: 10
+    validation:
+      condition: "var.max_nodes >= 1 && var.max_nodes <= 50"
+      error_message: "Max nodes must be between 1 and 50"
+
+# Local values for resource naming and configuration
+locals:
+  random_suffix: "${random_id.suffix.hex}"
+  hyperdisk_name: "${var.cluster_name}-hyperdisk-${local.random_suffix}"
+  dataset_bucket: "${var.project_id}-ml-datasets-${local.random_suffix}"
+  function_name: "ml-ops-automation-${local.random_suffix}"
+  
+  # Standard labels applied to all resources
+  common_labels: {
+    environment: "ml-ops"
+    solution: "ai-powered-automation"
+    managed-by: "infrastructure-manager"
+    recipe: "cloud-operations-automation-gemini-cloud-assist-hyperdisk-ml"
+  }
+
+# Random suffix for unique resource naming
+resource "random_id" "suffix" {
+  byte_length: 3
+}
+
+# Enable required Google Cloud APIs
+resource "google_project_service" "required_apis" {
+  for_each = toset([
+    "compute.googleapis.com",
+    "container.googleapis.com",
+    "aiplatform.googleapis.com",
+    "monitoring.googleapis.com",
+    "cloudfunctions.googleapis.com",
+    "cloudscheduler.googleapis.com",
+    "storage.googleapis.com",
+    "logging.googleapis.com",
+    "cloudresourcemanager.googleapis.com"
+  ])
+
+  project                    = var.project_id
+  service                   = each.value
+  disable_dependent_services = false
+  disable_on_destroy        = false
+}
+
+# Service account for Vertex AI operations with least privilege permissions
+resource "google_service_account" "vertex_ai_agent" {
+  account_id   = "vertex-ai-agent-${local.random_suffix}"
+  display_name = "Vertex AI Operations Agent"
+  description  = "Service account for AI-powered ML operations automation"
+  project      = var.project_id
+
+  depends_on = [google_project_service.required_apis]
+}
+
+# IAM bindings for Vertex AI agent with minimal required permissions
+resource "google_project_iam_member" "vertex_ai_permissions" {
+  for_each = toset([
+    "roles/aiplatform.user",
+    "roles/monitoring.metricWriter",
+    "roles/logging.logWriter",
+    "roles/compute.instanceAdmin.v1",
+    "roles/container.clusterAdmin",
+    "roles/storage.objectViewer"
+  ])
+
+  project = var.project_id
+  role    = each.value
+  member  = "serviceAccount:${google_service_account.vertex_ai_agent.email}"
+
+  depends_on = [google_service_account.vertex_ai_agent]
+}
+
+# Hyperdisk ML volume for ultra-high throughput ML workloads
+resource "google_compute_disk" "hyperdisk_ml" {
+  name = local.hyperdisk_name
+  type = "hyperdisk-ml"
+  zone = var.zone
+  size = var.hyperdisk_size_gb
+
+  # Enable high throughput for ML workloads
+  provisioned_iops       = null  # Not applicable for Hyperdisk ML
+  provisioned_throughput = var.hyperdisk_throughput
+
+  # Enable multi-attach for distributed ML training
+  multi_writer = true
+
+  # Encryption and security settings
+  disk_encryption_key {
+    # Use Google-managed encryption keys for simplicity
+    # In production, consider customer-managed keys
+  }
+
+  labels = merge(local.common_labels, {
+    storage-type = "hyperdisk-ml"
+    workload     = "machine-learning"
+  })
+
+  depends_on = [google_project_service.required_apis]
+}
+
+# VPC network for secure ML workload communication
+resource "google_compute_network" "ml_ops_vpc" {
+  name                    = "ml-ops-network-${local.random_suffix}"
+  auto_create_subnetworks = false
+  mtu                     = 1460
+  project                 = var.project_id
+
+  depends_on = [google_project_service.required_apis]
+}
+
+# Subnet for GKE cluster with appropriate IP ranges
+resource "google_compute_subnetwork" "ml_ops_subnet" {
+  name          = "ml-ops-subnet-${local.random_suffix}"
+  ip_cidr_range = "10.0.0.0/24"
+  region        = var.region
+  network       = google_compute_network.ml_ops_vpc.id
+  project       = var.project_id
+
+  # Secondary IP ranges for GKE pods and services
+  secondary_ip_range {
+    range_name    = "pods"
+    ip_cidr_range = "10.1.0.0/16"
+  }
+
+  secondary_ip_range {
+    range_name    = "services"
+    ip_cidr_range = "10.2.0.0/16"
+  }
+
+  # Enable private Google access for container image pulling
+  private_ip_google_access = true
+}
+
+# Firewall rules for secure ML workload communication
+resource "google_compute_firewall" "allow_internal" {
+  name    = "allow-internal-${local.random_suffix}"
+  network = google_compute_network.ml_ops_vpc.name
+  project = var.project_id
+
+  allow {
+    protocol = "tcp"
+    ports    = ["0-65535"]
+  }
+
+  allow {
+    protocol = "udp"
+    ports    = ["0-65535"]
+  }
+
+  allow {
+    protocol = "icmp"
+  }
+
+  source_ranges = ["10.0.0.0/8"]
+  target_tags   = ["ml-ops"]
+}
+
+# GKE cluster with ML-optimized configuration
+resource "google_container_cluster" "ml_ops_cluster" {
+  name     = var.cluster_name
+  location = var.zone
+  project  = var.project_id
+
+  # Use VPC-native networking for better performance
+  network    = google_compute_network.ml_ops_vpc.name
+  subnetwork = google_compute_subnetwork.ml_ops_subnet.name
+
+  # Remove default node pool to use custom node pools
+  remove_default_node_pool = true
+  initial_node_count       = 1
+
+  # IP allocation for pods and services
+  ip_allocation_policy {
+    cluster_secondary_range_name  = "pods"
+    services_secondary_range_name = "services"
+  }
+
+  # Enable network policy for enhanced security
+  network_policy {
+    enabled  = true
+    provider = "CALICO"
+  }
+
+  # Enable workload identity for secure pod-to-GCP authentication
+  workload_identity_config {
+    workload_pool = "${var.project_id}.svc.id.goog"
+  }
+
+  # Enable monitoring and logging
+  monitoring_config {
+    enable_components = [
+      "SYSTEM_COMPONENTS",
+      "WORKLOADS",
+      "APISERVER",
+      "CONTROLLER_MANAGER",
+      "SCHEDULER"
+    ]
+  }
+
+  logging_config {
+    enable_components = [
+      "SYSTEM_COMPONENTS",
+      "WORKLOADS",
+      "APISERVER",
+      "CONTROLLER_MANAGER",
+      "SCHEDULER"
+    ]
+  }
+
+  # Enable advanced cluster features
+  addons_config {
+    gce_persistent_disk_csi_driver_config {
+      enabled = true
+    }
+    horizontal_pod_autoscaling {
+      disabled = false
+    }
+    http_load_balancing {
+      disabled = false
+    }
+    network_policy_config {
+      disabled = false
+    }
+  }
+
+  # Enable maintenance policy for automatic updates
+  maintenance_policy {
+    recurring_window {
+      start_time = "2023-01-01T02:00:00Z"
+      end_time   = "2023-01-01T06:00:00Z"
+      recurrence = "FREQ=WEEKLY;BYDAY=SA"
+    }
+  }
+
+  depends_on = [
+    google_project_service.required_apis,
+    google_compute_subnetwork.ml_ops_subnet
+  ]
+}
+
+# Primary node pool for general ML workloads
+resource "google_container_node_pool" "ml_primary_nodes" {
+  name       = "primary-pool"
+  location   = var.zone
+  cluster    = google_container_cluster.ml_ops_cluster.name
+  project    = var.project_id
+
+  # Enable autoscaling for dynamic workload handling
+  autoscaling {
+    min_node_count = 1
+    max_node_count = var.max_nodes
+  }
+
+  # Node configuration optimized for ML workloads
+  node_config {
+    preemptible  = false
+    machine_type = "c3-standard-4"  # High-performance CPU for ML tasks
+
+    # Service account for node identity
+    service_account = google_service_account.vertex_ai_agent.email
+    oauth_scopes = [
+      "https://www.googleapis.com/auth/cloud-platform"
+    ]
+
+    # Enable workload identity
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
+
+    # Security and networking configuration
+    tags = ["ml-ops"]
+
+    # Boot disk configuration
+    disk_size_gb = 100
+    disk_type    = "pd-ssd"
+
+    # Metadata for security hardening
+    metadata = {
+      disable-legacy-endpoints = "true"
+    }
+
+    # Labels for resource management
+    labels = merge(local.common_labels, {
+      node-type = "ml-primary"
+    })
+  }
+
+  # Node management policies
+  management {
+    auto_repair  = true
+    auto_upgrade = true
+  }
+
+  # Update strategy for minimal disruption
+  upgrade_settings {
+    max_surge       = 1
+    max_unavailable = 0
+  }
+
+  depends_on = [google_container_cluster.ml_ops_cluster]
+}
+
+# GPU node pool for intensive ML training (conditional)
+resource "google_container_node_pool" "ml_gpu_nodes" {
+  count = var.enable_gpu_nodes ? 1 : 0
+
+  name       = "gpu-pool"
+  location   = var.zone
+  cluster    = google_container_cluster.ml_ops_cluster.name
+  project    = var.project_id
+
+  # Start with 0 nodes, scale up as needed
+  autoscaling {
+    min_node_count = 0
+    max_node_count = 5
+  }
+
+  # GPU-enabled node configuration
+  node_config {
+    preemptible  = false
+    machine_type = "g2-standard-4"
+
+    # Attach NVIDIA L4 GPUs
+    guest_accelerator {
+      type  = "nvidia-l4"
+      count = 1
+    }
+
+    # Service account for node identity
+    service_account = google_service_account.vertex_ai_agent.email
+    oauth_scopes = [
+      "https://www.googleapis.com/auth/cloud-platform"
+    ]
+
+    # Enable workload identity
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
+
+    # Security and networking configuration
+    tags = ["ml-ops", "gpu-enabled"]
+
+    # Larger boot disk for GPU drivers and ML frameworks
+    disk_size_gb = 200
+    disk_type    = "pd-ssd"
+
+    # Metadata for security and GPU driver installation
+    metadata = {
+      disable-legacy-endpoints = "true"
+    }
+
+    # Labels for resource management
+    labels = merge(local.common_labels, {
+      node-type = "ml-gpu"
+      gpu-type  = "nvidia-l4"
+    })
+  }
+
+  # Node management policies
+  management {
+    auto_repair  = true
+    auto_upgrade = true
+  }
+
+  # Update strategy for minimal disruption
+  upgrade_settings {
+    max_surge       = 1
+    max_unavailable = 0
+  }
+
+  depends_on = [google_container_cluster.ml_ops_cluster]
+}
+
+# Cloud Storage bucket for ML datasets with lifecycle management
+resource "google_storage_bucket" "ml_datasets" {
+  name     = local.dataset_bucket
+  location = var.region
+  project  = var.project_id
+
+  # Enable uniform bucket-level access for security
+  uniform_bucket_level_access = true
+
+  # Configure automatic lifecycle management for cost optimization
+  lifecycle_rule {
+    condition {
+      age = 30
+      matches_storage_class = ["STANDARD"]
+    }
+    action {
+      type          = "SetStorageClass"
+      storage_class = "NEARLINE"
+    }
+  }
+
+  lifecycle_rule {
+    condition {
+      age = 90
+      matches_storage_class = ["NEARLINE"]
+    }
+    action {
+      type          = "SetStorageClass"
+      storage_class = "COLDLINE"
+    }
+  }
+
+  # Enable versioning for data protection
+  versioning {
+    enabled = true
+  }
+
+  # Enable encryption at rest
+  encryption {
+    default_kms_key_name = null  # Use Google-managed keys
+  }
+
+  # Labels for resource management
+  labels = merge(local.common_labels, {
+    storage-purpose = "ml-datasets"
+    data-lifecycle  = "managed"
+  })
+
+  depends_on = [google_project_service.required_apis]
+}
+
+# IAM binding for dataset bucket access
+resource "google_storage_bucket_iam_binding" "ml_dataset_access" {
+  bucket = google_storage_bucket.ml_datasets.name
+  role   = "roles/storage.objectViewer"
+
+  members = [
+    "serviceAccount:${google_service_account.vertex_ai_agent.email}"
+  ]
+
+  depends_on = [google_storage_bucket.ml_datasets]
+}
+
+# Cloud Function for ML operations automation
+resource "google_cloudfunctions_function" "ml_ops_automation" {
+  name        = local.function_name
+  description = "AI-powered ML operations automation function"
+  runtime     = "python39"
+  region      = var.region
+  project     = var.project_id
+
+  available_memory_mb   = 512
+  timeout               = 540
+  entry_point          = "ml_ops_automation"
+  service_account_email = google_service_account.vertex_ai_agent.email
+
+  # HTTP trigger for automation requests
+  trigger {
+    http_trigger {}
+  }
+
+  # Source code archive (placeholder - would contain actual function code)
+  source_archive_bucket = google_storage_bucket.ml_datasets.name
+  source_archive_object = "functions/ml-ops-automation.zip"
+
+  # Environment variables for function configuration
+  environment_variables = {
+    PROJECT_ID     = var.project_id
+    REGION         = var.region
+    CLUSTER_NAME   = var.cluster_name
+    HYPERDISK_NAME = local.hyperdisk_name
+  }
+
+  # Labels for resource management
+  labels = merge(local.common_labels, {
+    function-type = "ml-automation"
+    runtime       = "python39"
+  })
+
+  depends_on = [
+    google_project_service.required_apis,
+    google_storage_bucket.ml_datasets
+  ]
+}
+
+# Cloud Scheduler jobs for automated ML operations
+resource "google_cloud_scheduler_job" "ml_ops_scheduler" {
+  name        = "ml-ops-scheduler-${local.random_suffix}"
+  description = "Scheduled ML operations optimization"
+  schedule    = "*/15 * * * *"  # Every 15 minutes
+  time_zone   = "UTC"
+  region      = var.region
+  project     = var.project_id
+
+  http_target {
+    http_method = "POST"
+    uri         = google_cloudfunctions_function.ml_ops_automation.https_trigger_url
+
+    headers = {
+      "Content-Type" = "application/json"
+    }
+
+    body = base64encode(jsonencode({
+      trigger = "scheduled_optimization"
+      type    = "ml_workload_analysis"
+    }))
+  }
+
+  depends_on = [
+    google_project_service.required_apis,
+    google_cloudfunctions_function.ml_ops_automation
+  ]
+}
+
+# Performance monitoring scheduler
+resource "google_cloud_scheduler_job" "performance_monitor" {
+  name        = "performance-monitor-${local.random_suffix}"
+  description = "Hyperdisk ML performance monitoring"
+  schedule    = "*/5 * * * *"  # Every 5 minutes
+  time_zone   = "UTC"
+  region      = var.region
+  project     = var.project_id
+
+  http_target {
+    http_method = "POST"
+    uri         = google_cloudfunctions_function.ml_ops_automation.https_trigger_url
+
+    headers = {
+      "Content-Type" = "application/json"
+    }
+
+    body = base64encode(jsonencode({
+      trigger = "performance_check"
+      type    = "hyperdisk_monitoring"
+    }))
+  }
+
+  depends_on = [
+    google_project_service.required_apis,
+    google_cloudfunctions_function.ml_ops_automation
+  ]
+}
+
+# Custom Cloud Monitoring metrics for ML workloads
+resource "google_logging_metric" "ml_training_duration" {
+  name   = "ml_training_duration_${local.random_suffix}"
+  filter = "resource.type=\"gke_container\" AND jsonPayload.event_type=\"training_complete\""
+
+  metric_descriptor {
+    metric_kind = "GAUGE"
+    value_type  = "DOUBLE"
+    unit        = "s"
+    display_name = "ML Training Duration"
+  }
+
+  value_extractor = "EXTRACT(jsonPayload.duration)"
+
+  label_extractors = {
+    job_name = "EXTRACT(jsonPayload.job_name)"
+    cluster  = "EXTRACT(resource.labels.cluster_name)"
+  }
+
+  depends_on = [google_project_service.required_apis]
+}
+
+# Storage throughput monitoring metric
+resource "google_logging_metric" "storage_throughput" {
+  name   = "storage_throughput_${local.random_suffix}"
+  filter = "resource.type=\"gce_disk\" AND jsonPayload.disk_type=\"hyperdisk-ml\""
+
+  metric_descriptor {
+    metric_kind = "GAUGE"
+    value_type  = "DOUBLE"
+    unit        = "MiBy/s"
+    display_name = "Hyperdisk ML Throughput"
+  }
+
+  value_extractor = "EXTRACT(jsonPayload.throughput_mbps)"
+
+  label_extractors = {
+    disk_name = "EXTRACT(resource.labels.disk_name)"
+    zone      = "EXTRACT(resource.labels.zone)"
+  }
+
+  depends_on = [google_project_service.required_apis]
+}
+
+# Cloud Monitoring alert policy for ML workload anomalies
+resource "google_monitoring_alert_policy" "ml_workload_alert" {
+  display_name = "ML Workload Performance Alert"
+  project      = var.project_id
+
+  conditions {
+    display_name = "High ML training duration"
+
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/ml_training_duration_${local.random_suffix}\""
+      duration        = "60s"
+      comparison      = "COMPARISON_GT"
+      threshold_value = 3600  # Alert if training takes more than 1 hour
+
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_MEAN"
+      }
+    }
+  }
+
+  alert_strategy {
+    auto_close = "1800s"  # Auto-close after 30 minutes
+  }
+
+  enabled = true
+
+  depends_on = [
+    google_project_service.required_apis,
+    google_logging_metric.ml_training_duration
+  ]
+}
+
+# Output values for integration and verification
+outputs:
+  project_id:
+    description = "Google Cloud project ID"
+    value       = var.project_id
+
+  cluster_name:
+    description = "Name of the GKE cluster"
+    value       = google_container_cluster.ml_ops_cluster.name
+
+  cluster_endpoint:
+    description = "GKE cluster endpoint"
+    value       = google_container_cluster.ml_ops_cluster.endpoint
+    sensitive   = true
+
+  hyperdisk_name:
+    description = "Name of the Hyperdisk ML volume"
+    value       = google_compute_disk.hyperdisk_ml.name
+
+  hyperdisk_throughput:
+    description = "Provisioned throughput of Hyperdisk ML volume (MiB/s)"
+    value       = google_compute_disk.hyperdisk_ml.provisioned_throughput
+
+  dataset_bucket:
+    description = "Cloud Storage bucket for ML datasets"
+    value       = google_storage_bucket.ml_datasets.name
+
+  automation_function_url:
+    description = "URL of the ML operations automation function"
+    value       = google_cloudfunctions_function.ml_ops_automation.https_trigger_url
+    sensitive   = true
+
+  service_account_email:
+    description = "Email of the Vertex AI agent service account"
+    value       = google_service_account.vertex_ai_agent.email
+
+  vpc_network:
+    description = "VPC network for ML workloads"
+    value       = google_compute_network.ml_ops_vpc.name
+
+  subnet_name:
+    description = "Subnet for ML workloads"
+    value       = google_compute_subnetwork.ml_ops_subnet.name
+
+  random_suffix:
+    description = "Random suffix used for resource naming"
+    value       = local.random_suffix

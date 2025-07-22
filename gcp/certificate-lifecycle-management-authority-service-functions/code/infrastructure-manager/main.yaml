@@ -1,0 +1,473 @@
+# Google Cloud Infrastructure Manager Configuration
+# Certificate Lifecycle Management with Certificate Authority Service and Cloud Functions
+# Recipe: certificate-lifecycle-management-authority-service-functions
+
+metadata:
+  name: certificate-lifecycle-management
+  description: "Automated certificate lifecycle management using CA Service, Cloud Functions, and Cloud Scheduler"
+  labels:
+    recipe: "certificate-lifecycle-management-authority-service-functions"
+    category: "security"
+    difficulty: "300"
+
+# Input variables for customization
+variables:
+  project_id:
+    description: "GCP Project ID"
+    type: string
+    required: true
+  
+  region:
+    description: "GCP region for resources"
+    type: string
+    default: "us-central1"
+  
+  ca_pool_name:
+    description: "Certificate Authority Pool name"
+    type: string
+    default: "enterprise-ca-pool"
+  
+  root_ca_name:
+    description: "Root Certificate Authority name"
+    type: string
+    default: "root-ca"
+  
+  subordinate_ca_name:
+    description: "Subordinate Certificate Authority name"
+    type: string
+    default: "subordinate-ca"
+  
+  renewal_threshold_days:
+    description: "Days before expiration to trigger renewal"
+    type: integer
+    default: 30
+  
+  certificate_validity_days:
+    description: "Default certificate validity period in days"
+    type: integer
+    default: 365
+  
+  monitoring_schedule:
+    description: "Cron schedule for certificate monitoring"
+    type: string
+    default: "0 8 * * *"
+
+# Resource definitions
+resources:
+  # Enable required APIs
+  privateca_api:
+    type: "gcp-types/serviceusage-v1:serviceusage.services.batchEnable"
+    properties:
+      parent: projects/${var.project_id}
+      services:
+        - privateca.googleapis.com
+        - cloudfunctions.googleapis.com
+        - cloudscheduler.googleapis.com
+        - secretmanager.googleapis.com
+        - cloudbuild.googleapis.com
+        - logging.googleapis.com
+        - monitoring.googleapis.com
+
+  # Service Account for Certificate Automation
+  cert_automation_service_account:
+    type: "gcp-types/iam-v1:projects.serviceAccounts"
+    properties:
+      accountId: "cert-automation-sa"
+      serviceAccount:
+        displayName: "Certificate Automation Service Account"
+        description: "Service account for automated certificate lifecycle management"
+    metadata:
+      dependsOn:
+        - privateca_api
+
+  # IAM bindings for service account
+  privateca_manager_binding:
+    type: "gcp-types/cloudresourcemanager-v1:projects.setIamPolicy"
+    properties:
+      resource: ${var.project_id}
+      policy:
+        bindings:
+          - role: "roles/privateca.certificateManager"
+            members:
+              - serviceAccount:cert-automation-sa@${var.project_id}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - cert_automation_service_account
+
+  secret_manager_admin_binding:
+    type: "gcp-types/cloudresourcemanager-v1:projects.setIamPolicy"
+    properties:
+      resource: ${var.project_id}
+      policy:
+        bindings:
+          - role: "roles/secretmanager.admin"
+            members:
+              - serviceAccount:cert-automation-sa@${var.project_id}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - cert_automation_service_account
+
+  logging_writer_binding:
+    type: "gcp-types/cloudresourcemanager-v1:projects.setIamPolicy"
+    properties:
+      resource: ${var.project_id}
+      policy:
+        bindings:
+          - role: "roles/logging.logWriter"
+            members:
+              - serviceAccount:cert-automation-sa@${var.project_id}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - cert_automation_service_account
+
+  # Certificate Authority Pool (Enterprise Tier)
+  ca_pool:
+    type: "gcp-types/privateca-v1:projects.locations.caPools"
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      caPoolId: ${var.ca_pool_name}
+      caPool:
+        tier: "ENTERPRISE"
+        subject:
+          commonName: "Enterprise PKI Pool"
+          organization: "Organization"
+          country: "US"
+        publishingOptions:
+          includeCaCertUrl: true
+          includeCrlAccessUrl: true
+        issuancePolicy: {}
+    metadata:
+      dependsOn:
+        - privateca_api
+
+  # Root Certificate Authority
+  root_ca:
+    type: "gcp-types/privateca-v1:projects.locations.caPools.certificateAuthorities"
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}/caPools/${var.ca_pool_name}
+      certificateAuthorityId: ${var.root_ca_name}
+      certificateAuthority:
+        type: "SELF_SIGNED"
+        config:
+          subjectConfig:
+            subject:
+              commonName: "Root CA"
+              organization: "Organization"
+              country: "US"
+          x509Config:
+            caOptions:
+              isCa: true
+              maxIssuerPathLength: 2
+            keyUsage:
+              baseKeyUsage:
+                certSign: true
+                crlSign: true
+              extendedKeyUsage: {}
+        lifetime: "315360000s"  # 10 years
+        keySpec:
+          algorithm: "RSA_PKCS1_4096_SHA256"
+    metadata:
+      dependsOn:
+        - ca_pool
+
+  # Enable Root CA
+  root_ca_enable:
+    type: "gcp-types/privateca-v1:projects.locations.caPools.certificateAuthorities.enable"
+    properties:
+      name: projects/${var.project_id}/locations/${var.region}/caPools/${var.ca_pool_name}/certificateAuthorities/${var.root_ca_name}
+    metadata:
+      dependsOn:
+        - root_ca
+
+  # Subordinate Certificate Authority
+  subordinate_ca:
+    type: "gcp-types/privateca-v1:projects.locations.caPools.certificateAuthorities"
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}/caPools/${var.ca_pool_name}
+      certificateAuthorityId: ${var.subordinate_ca_name}
+      certificateAuthority:
+        type: "SUBORDINATE"
+        config:
+          subjectConfig:
+            subject:
+              commonName: "Subordinate CA"
+              organization: "Organization"
+              organizationalUnit: "Operations"
+              country: "US"
+          x509Config:
+            caOptions:
+              isCa: true
+            keyUsage:
+              baseKeyUsage:
+                certSign: true
+                crlSign: true
+                digitalSignature: true
+              extendedKeyUsage: {}
+        lifetime: "157680000s"  # 5 years
+        keySpec:
+          algorithm: "RSA_PKCS1_2048_SHA256"
+        issuer:
+          caCertificateAccessUrl: projects/${var.project_id}/locations/${var.region}/caPools/${var.ca_pool_name}/certificateAuthorities/${var.root_ca_name}
+    metadata:
+      dependsOn:
+        - root_ca_enable
+
+  # Enable Subordinate CA
+  subordinate_ca_enable:
+    type: "gcp-types/privateca-v1:projects.locations.caPools.certificateAuthorities.enable"
+    properties:
+      name: projects/${var.project_id}/locations/${var.region}/caPools/${var.ca_pool_name}/certificateAuthorities/${var.subordinate_ca_name}
+    metadata:
+      dependsOn:
+        - subordinate_ca
+
+  # Certificate Template for Web Server Certificates
+  web_server_template:
+    type: "gcp-types/privateca-v1:projects.locations.certificateTemplates"
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      certificateTemplateId: "web-server-template"
+      certificateTemplate:
+        description: "Standard template for web server certificates"
+        predefinedValues:
+          keyUsage:
+            baseKeyUsage:
+              digitalSignature: true
+              keyEncipherment: true
+            extendedKeyUsage:
+              serverAuth: true
+              clientAuth: true
+          caOptions:
+            isCa: false
+          policyIds:
+            - objectIdPath: [1, 3, 6, 1, 4, 1, 11129, 2, 5, 2]
+        identityConstraints:
+          celExpression:
+            expression: 'subject_alt_names.all(san, san.type == DNS)'
+            title: "DNS SANs only"
+            description: "Only DNS Subject Alternative Names are allowed"
+        passthroughExtensions:
+          knownExtensions:
+            - "SUBJECT_ALT_NAME"
+          additionalExtensions:
+            - objectIdPath: [2, 5, 29, 17]
+    metadata:
+      dependsOn:
+        - subordinate_ca_enable
+
+  # Cloud Storage Bucket for Function Source Code
+  function_source_bucket:
+    type: "gcp-types/storage-v1:buckets"
+    properties:
+      name: ${var.project_id}-cert-functions-source
+      location: ${var.region}
+      storageClass: "REGIONAL"
+      versioning:
+        enabled: true
+    metadata:
+      dependsOn:
+        - privateca_api
+
+  # Certificate Monitor Cloud Function
+  certificate_monitor_function:
+    type: "gcp-types/cloudfunctions-v1:projects.locations.functions"
+    properties:
+      location: projects/${var.project_id}/locations/${var.region}
+      function:
+        name: projects/${var.project_id}/locations/${var.region}/functions/certificate-monitor
+        description: "Monitor certificates for expiration and trigger renewal"
+        sourceArchiveUrl: gs://${var.project_id}-cert-functions-source/monitor-function.zip
+        httpsTrigger: {}
+        runtime: "python39"
+        entryPoint: "certificate_monitor"
+        timeout: "540s"
+        availableMemoryMb: 256
+        serviceAccountEmail: cert-automation-sa@${var.project_id}.iam.gserviceaccount.com
+        environmentVariables:
+          PROJECT_ID: ${var.project_id}
+          CA_POOL_NAME: ${var.ca_pool_name}
+          REGION: ${var.region}
+          RENEWAL_THRESHOLD_DAYS: ${var.renewal_threshold_days}
+    metadata:
+      dependsOn:
+        - function_source_bucket
+        - cert_automation_service_account
+        - subordinate_ca_enable
+
+  # Certificate Renewal Cloud Function
+  certificate_renewal_function:
+    type: "gcp-types/cloudfunctions-v1:projects.locations.functions"
+    properties:
+      location: projects/${var.project_id}/locations/${var.region}
+      function:
+        name: projects/${var.project_id}/locations/${var.region}/functions/certificate-renewal
+        description: "Renew expiring certificates using Certificate Authority Service"
+        sourceArchiveUrl: gs://${var.project_id}-cert-functions-source/renewal-function.zip
+        httpsTrigger: {}
+        runtime: "python39"
+        entryPoint: "certificate_renewal"
+        timeout: "540s"
+        availableMemoryMb: 512
+        serviceAccountEmail: cert-automation-sa@${var.project_id}.iam.gserviceaccount.com
+        environmentVariables:
+          PROJECT_ID: ${var.project_id}
+          CA_POOL_NAME: ${var.ca_pool_name}
+          SUB_CA_NAME: ${var.subordinate_ca_name}
+          REGION: ${var.region}
+    metadata:
+      dependsOn:
+        - function_source_bucket
+        - cert_automation_service_account
+        - subordinate_ca_enable
+
+  # Certificate Revocation Cloud Function
+  certificate_revocation_function:
+    type: "gcp-types/cloudfunctions-v1:projects.locations.functions"
+    properties:
+      location: projects/${var.project_id}/locations/${var.region}
+      function:
+        name: projects/${var.project_id}/locations/${var.region}/functions/certificate-revocation
+        description: "Revoke compromised certificates and update CRL"
+        sourceArchiveUrl: gs://${var.project_id}-cert-functions-source/revocation-function.zip
+        httpsTrigger: {}
+        runtime: "python39"
+        entryPoint: "certificate_revocation"
+        timeout: "540s"
+        availableMemoryMb: 256
+        serviceAccountEmail: cert-automation-sa@${var.project_id}.iam.gserviceaccount.com
+        environmentVariables:
+          PROJECT_ID: ${var.project_id}
+          CA_POOL_NAME: ${var.ca_pool_name}
+          SUB_CA_NAME: ${var.subordinate_ca_name}
+          REGION: ${var.region}
+    metadata:
+      dependsOn:
+        - function_source_bucket
+        - cert_automation_service_account
+        - subordinate_ca_enable
+
+  # Cloud Scheduler Job for Certificate Monitoring
+  certificate_monitoring_job:
+    type: "gcp-types/cloudscheduler-v1:projects.locations.jobs"
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      job:
+        name: projects/${var.project_id}/locations/${var.region}/jobs/certificate-monitoring
+        description: "Daily certificate expiration monitoring"
+        schedule: ${var.monitoring_schedule}
+        timeZone: "America/New_York"
+        httpTarget:
+          uri: $(ref.certificate_monitor_function.httpsTrigger.url)
+          httpMethod: "POST"
+          headers:
+            Content-Type: "application/json"
+          body: '{"source":"scheduler","action":"monitor"}'
+          oidcToken:
+            serviceAccountEmail: cert-automation-sa@${var.project_id}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - certificate_monitor_function
+
+  # Log-based Alerting Policy for Certificate Errors
+  certificate_alert_policy:
+    type: "gcp-types/monitoring-v1:projects.alertPolicies"
+    properties:
+      name: projects/${var.project_id}/alertPolicies/certificate-expiration-alert
+      alertPolicy:
+        displayName: "Certificate Expiration Alert"
+        documentation:
+          content: "Alert when certificates are approaching expiration or functions encounter errors"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "Certificate Monitor Function Errors"
+            conditionThreshold:
+              filter: 'resource.type="cloud_function" AND resource.labels.function_name="certificate-monitor"'
+              comparison: "COMPARISON_GREATER_THAN"
+              thresholdValue: 0
+              duration: "300s"
+              aggregations:
+                - alignmentPeriod: "300s"
+                  perSeriesAligner: "ALIGN_RATE"
+                  crossSeriesReducer: "REDUCE_SUM"
+        alertStrategy:
+          autoClose: "86400s"
+        enabled: true
+    metadata:
+      dependsOn:
+        - certificate_monitor_function
+
+  # Custom Log Metric for Certificate Renewals
+  certificate_renewal_metric:
+    type: "gcp-types/logging-v2:projects.metrics"
+    properties:
+      parent: projects/${var.project_id}
+      metric:
+        name: "certificate_renewals_total"
+        description: "Total number of certificate renewals"
+        filter: 'resource.type="cloud_function" AND resource.labels.function_name="certificate-renewal" AND textPayload:"Successfully renewed certificate"'
+        metricDescriptor:
+          metricKind: "CUMULATIVE"
+          valueType: "INT64"
+          displayName: "Certificate Renewals"
+    metadata:
+      dependsOn:
+        - certificate_renewal_function
+
+# Output values for reference and integration
+outputs:
+  ca_pool_name:
+    description: "Certificate Authority Pool name"
+    value: $(ref.ca_pool.name)
+  
+  root_ca_name:
+    description: "Root Certificate Authority name"
+    value: $(ref.root_ca.name)
+  
+  subordinate_ca_name:
+    description: "Subordinate Certificate Authority name"
+    value: $(ref.subordinate_ca.name)
+  
+  monitor_function_url:
+    description: "Certificate Monitor Function trigger URL"
+    value: $(ref.certificate_monitor_function.httpsTrigger.url)
+  
+  renewal_function_url:
+    description: "Certificate Renewal Function trigger URL"
+    value: $(ref.certificate_renewal_function.httpsTrigger.url)
+  
+  revocation_function_url:
+    description: "Certificate Revocation Function trigger URL"
+    value: $(ref.certificate_revocation_function.httpsTrigger.url)
+  
+  service_account_email:
+    description: "Service account email for certificate automation"
+    value: cert-automation-sa@${var.project_id}.iam.gserviceaccount.com
+  
+  scheduler_job_name:
+    description: "Cloud Scheduler job name for monitoring"
+    value: $(ref.certificate_monitoring_job.name)
+  
+  certificate_template_name:
+    description: "Certificate template name for web server certificates"
+    value: $(ref.web_server_template.name)
+  
+  function_source_bucket:
+    description: "Cloud Storage bucket for function source code"
+    value: $(ref.function_source_bucket.name)
+
+# Infrastructure Manager deployment configuration
+deployment:
+  # Resource creation timeout
+  timeout: "1800s"
+  
+  # Deployment labels for tracking
+  labels:
+    recipe: "certificate-lifecycle-management"
+    environment: "production"
+    managed-by: "infrastructure-manager"
+  
+  # Resource deletion policy
+  deletionPolicy: "DELETE"
+  
+  # Preview mode for validation
+  preview: false

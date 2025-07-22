@@ -1,0 +1,518 @@
+# Infrastructure Manager Configuration for Secure API Configuration Management
+# This configuration deploys a secure API architecture using Secret Manager and Cloud Run
+# Reference: https://cloud.google.com/infrastructure-manager/docs
+
+# Define the deployment specification
+apiVersion: v1
+kind: Config
+metadata:
+  name: secure-api-configuration-management
+  description: "Secure API deployment with Secret Manager integration and Cloud Run hosting"
+  labels:
+    recipe: "secure-api-configuration-management-secret-manager-run"
+    version: "1.0"
+    environment: "development"
+
+# Define input variables for customization
+inputs:
+  - name: project_id
+    description: "Google Cloud Project ID"
+    type: string
+    required: true
+    
+  - name: region
+    description: "Google Cloud region for resource deployment"
+    type: string
+    default: "us-central1"
+    
+  - name: service_name
+    description: "Name for the Cloud Run service"
+    type: string
+    default: "secure-api"
+    
+  - name: secret_prefix
+    description: "Prefix for Secret Manager secret names"
+    type: string
+    default: "api-config"
+    
+  - name: gateway_name
+    description: "Name for the API Gateway"
+    type: string
+    default: "api-gateway"
+    
+  - name: container_image
+    description: "Container image for Cloud Run service"
+    type: string
+    default: "gcr.io/PROJECT_ID/secure-api:latest"
+
+# Resource definitions following Google Cloud best practices
+resources:
+  # Enable required APIs for the project
+  - name: secret-manager-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_id)/services/secretmanager.googleapis.com
+      parent: projects/$(ref.project_id)
+    metadata:
+      dependsOn: []
+      
+  - name: cloud-run-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_id)/services/run.googleapis.com
+      parent: projects/$(ref.project_id)
+    metadata:
+      dependsOn: []
+      
+  - name: api-gateway-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_id)/services/apigateway.googleapis.com
+      parent: projects/$(ref.project_id)
+    metadata:
+      dependsOn: []
+      
+  - name: service-control-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_id)/services/servicecontrol.googleapis.com
+      parent: projects/$(ref.project_id)
+    metadata:
+      dependsOn: []
+      
+  - name: service-management-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_id)/services/servicemanagement.googleapis.com
+      parent: projects/$(ref.project_id)
+    metadata:
+      dependsOn: []
+
+  # Create Secret Manager secrets for application configuration
+  - name: database-config-secret
+    type: gcp-types/secretmanager-v1:projects.secrets
+    properties:
+      parent: projects/$(ref.project_id)
+      secretId: $(ref.secret_prefix)-db
+      secret:
+        replication:
+          automatic: {}
+        labels:
+          purpose: "database-configuration"
+          environment: "development"
+    metadata:
+      dependsOn:
+        - secret-manager-api
+        
+  - name: api-keys-secret
+    type: gcp-types/secretmanager-v1:projects.secrets
+    properties:
+      parent: projects/$(ref.project_id)
+      secretId: $(ref.secret_prefix)-keys
+      secret:
+        replication:
+          automatic: {}
+        labels:
+          purpose: "api-keys"
+          environment: "development"
+    metadata:
+      dependsOn:
+        - secret-manager-api
+        
+  - name: app-config-secret
+    type: gcp-types/secretmanager-v1:projects.secrets
+    properties:
+      parent: projects/$(ref.project_id)
+      secretId: $(ref.secret_prefix)-config
+      secret:
+        replication:
+          automatic: {}
+        labels:
+          purpose: "application-configuration"
+          environment: "development"
+    metadata:
+      dependsOn:
+        - secret-manager-api
+
+  # Create initial secret versions with secure default values
+  - name: database-config-version
+    type: gcp-types/secretmanager-v1:projects.secrets.versions
+    properties:
+      parent: $(ref.database-config-secret.name)
+      payload:
+        data: '{"host":"db.example.com","port":5432,"username":"api_user","password":"secure_db_password_123"}'
+    metadata:
+      dependsOn:
+        - database-config-secret
+        
+  - name: api-keys-version
+    type: gcp-types/secretmanager-v1:projects.secrets.versions
+    properties:
+      parent: $(ref.api-keys-secret.name)
+      payload:
+        data: '{"external_api_key":"sk-1234567890abcdef","jwt_secret":"jwt_signing_key_xyz789","encryption_key":"aes256_encryption_key_abc123"}'
+    metadata:
+      dependsOn:
+        - api-keys-secret
+        
+  - name: app-config-version
+    type: gcp-types/secretmanager-v1:projects.secrets.versions
+    properties:
+      parent: $(ref.app-config-secret.name)
+      payload:
+        data: '{"debug_mode":false,"rate_limit":1000,"cache_ttl":3600,"log_level":"INFO"}'
+    metadata:
+      dependsOn:
+        - app-config-secret
+
+  # Create service account for Cloud Run with least privilege access
+  - name: secure-api-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      name: projects/$(ref.project_id)
+      accountId: secure-api-sa
+      serviceAccount:
+        displayName: "Secure API Service Account"
+        description: "Service account for secure API with Secret Manager access"
+    metadata:
+      dependsOn: []
+
+  # Grant Secret Manager accessor role to service account for each secret
+  - name: db-secret-iam-binding
+    type: gcp-types/secretmanager-v1:projects.secrets.setIamPolicy
+    properties:
+      resource: $(ref.database-config-secret.name)
+      policy:
+        bindings:
+          - role: roles/secretmanager.secretAccessor
+            members:
+              - serviceAccount:$(ref.secure-api-service-account.email)
+    metadata:
+      dependsOn:
+        - secure-api-service-account
+        - database-config-secret
+        
+  - name: keys-secret-iam-binding
+    type: gcp-types/secretmanager-v1:projects.secrets.setIamPolicy
+    properties:
+      resource: $(ref.api-keys-secret.name)
+      policy:
+        bindings:
+          - role: roles/secretmanager.secretAccessor
+            members:
+              - serviceAccount:$(ref.secure-api-service-account.email)
+    metadata:
+      dependsOn:
+        - secure-api-service-account
+        - api-keys-secret
+        
+  - name: config-secret-iam-binding
+    type: gcp-types/secretmanager-v1:projects.secrets.setIamPolicy
+    properties:
+      resource: $(ref.app-config-secret.name)
+      policy:
+        bindings:
+          - role: roles/secretmanager.secretAccessor
+            members:
+              - serviceAccount:$(ref.secure-api-service-account.email)
+    metadata:
+      dependsOn:
+        - secure-api-service-account
+        - app-config-secret
+
+  # Deploy Cloud Run service with secure configuration
+  - name: secure-api-cloud-run-service
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/$(ref.project_id)
+      location: $(ref.region)
+      apiVersion: serving.knative.dev/v1
+      kind: Service
+      metadata:
+        name: $(ref.service_name)
+        labels:
+          app: "secure-api"
+          environment: "development"
+        annotations:
+          run.googleapis.com/ingress: "all"
+          run.googleapis.com/ingress-status: "all"
+      spec:
+        template:
+          metadata:
+            annotations:
+              run.googleapis.com/service-account: $(ref.secure-api-service-account.email)
+              autoscaling.knative.dev/maxScale: "10"
+              run.googleapis.com/memory: "512Mi"
+              run.googleapis.com/cpu: "1"
+          spec:
+            containerConcurrency: 80
+            timeoutSeconds: 300
+            containers:
+              - image: $(ref.container_image)
+                ports:
+                  - name: http1
+                    containerPort: 8080
+                    protocol: TCP
+                env:
+                  - name: DB_SECRET_NAME
+                    value: $(ref.secret_prefix)-db
+                  - name: KEYS_SECRET_NAME
+                    value: $(ref.secret_prefix)-keys
+                  - name: CONFIG_SECRET_NAME
+                    value: $(ref.secret_prefix)-config
+                  - name: GOOGLE_CLOUD_PROJECT
+                    value: $(ref.project_id)
+                resources:
+                  limits:
+                    memory: "512Mi"
+                    cpu: "1"
+                  requests:
+                    memory: "256Mi"
+                    cpu: "0.5"
+                livenessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8080
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+                readinessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8080
+                  initialDelaySeconds: 5
+                  periodSeconds: 5
+        traffic:
+          - percent: 100
+            latestRevision: true
+    metadata:
+      dependsOn:
+        - cloud-run-api
+        - secure-api-service-account
+        - db-secret-iam-binding
+        - keys-secret-iam-binding
+        - config-secret-iam-binding
+
+  # Create IAM policy to allow unauthenticated access to Cloud Run service
+  - name: cloud-run-invoker-policy
+    type: gcp-types/run-v1:projects.locations.services.setIamPolicy
+    properties:
+      resource: projects/$(ref.project_id)/locations/$(ref.region)/services/$(ref.service_name)
+      policy:
+        bindings:
+          - role: roles/run.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - secure-api-cloud-run-service
+
+  # Create API Gateway API
+  - name: secure-api-gateway-api
+    type: gcp-types/apigateway-v1:projects.locations.apis
+    properties:
+      parent: projects/$(ref.project_id)/locations/global
+      apiId: $(ref.gateway_name)
+      api:
+        displayName: "Secure API Gateway"
+        labels:
+          purpose: "secure-api-management"
+          environment: "development"
+    metadata:
+      dependsOn:
+        - api-gateway-api
+
+  # Create API Gateway configuration with OpenAPI specification
+  - name: secure-api-gateway-config
+    type: gcp-types/apigateway-v1:projects.locations.apis.configs
+    properties:
+      parent: $(ref.secure-api-gateway-api.name)
+      apiConfigId: $(ref.gateway_name)-config
+      apiConfig:
+        displayName: "Secure API Gateway Configuration"
+        openapiDocuments:
+          - document:
+              path: "openapi.yaml"
+              contents: |
+                swagger: '2.0'
+                info:
+                  title: Secure API Gateway
+                  description: API Gateway for secure configuration management
+                  version: 1.0.0
+                schemes:
+                  - https
+                produces:
+                  - application/json
+                securityDefinitions:
+                  api_key:
+                    type: apiKey
+                    name: key
+                    in: query
+                paths:
+                  /health:
+                    get:
+                      summary: Health check endpoint
+                      operationId: healthCheck
+                      responses:
+                        200:
+                          description: Service is healthy
+                      x-google-backend:
+                        address: $(ref.secure-api-cloud-run-service.status.url)
+                  /config:
+                    get:
+                      summary: Get application configuration
+                      operationId: getConfig
+                      security:
+                        - api_key: []
+                      responses:
+                        200:
+                          description: Configuration retrieved successfully
+                        500:
+                          description: Configuration unavailable
+                      x-google-backend:
+                        address: $(ref.secure-api-cloud-run-service.status.url)
+                  /database/status:
+                    get:
+                      summary: Check database connectivity
+                      operationId: databaseStatus
+                      security:
+                        - api_key: []
+                      responses:
+                        200:
+                          description: Database status retrieved
+                        500:
+                          description: Database configuration unavailable
+                      x-google-backend:
+                        address: $(ref.secure-api-cloud-run-service.status.url)
+                  /api/data:
+                    get:
+                      summary: Get secure API data
+                      operationId: getSecureData
+                      security:
+                        - api_key: []
+                      parameters:
+                        - name: Authorization
+                          in: header
+                          type: string
+                          required: true
+                      responses:
+                        200:
+                          description: Data retrieved successfully
+                        401:
+                          description: Unauthorized access
+                        500:
+                          description: API keys unavailable
+                      x-google-backend:
+                        address: $(ref.secure-api-cloud-run-service.status.url)
+        labels:
+          purpose: "secure-api-configuration"
+          environment: "development"
+    metadata:
+      dependsOn:
+        - secure-api-gateway-api
+        - secure-api-cloud-run-service
+
+  # Deploy API Gateway with security configuration
+  - name: secure-api-gateway
+    type: gcp-types/apigateway-v1:projects.locations.gateways
+    properties:
+      parent: projects/$(ref.project_id)/locations/$(ref.region)
+      gatewayId: $(ref.gateway_name)
+      gateway:
+        apiConfig: $(ref.secure-api-gateway-config.name)
+        displayName: "Secure API Gateway"
+        labels:
+          purpose: "secure-api-gateway"
+          environment: "development"
+    metadata:
+      dependsOn:
+        - secure-api-gateway-config
+
+  # Create monitoring alert policy for secret access patterns
+  - name: secret-access-monitoring-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      name: projects/$(ref.project_id)
+      alertPolicy:
+        displayName: "Secret Manager Access Monitoring"
+        documentation:
+          content: "Alert for high secret access rates indicating potential security issues"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "High secret access rate"
+            conditionThreshold:
+              filter: 'resource.type="secret_manager_secret"'
+              comparison: "COMPARISON_GREATER_THAN"
+              thresholdValue: 100
+              duration: "300s"
+              aggregations:
+                - alignmentPeriod: "60s"
+                  perSeriesAligner: "ALIGN_RATE"
+                  crossSeriesReducer: "REDUCE_SUM"
+                  groupByFields:
+                    - "resource.label.secret_id"
+        alertStrategy:
+          autoClose: "1800s"
+        enabled: true
+        notificationChannels: []
+    metadata:
+      dependsOn:
+        - database-config-secret
+        - api-keys-secret
+        - app-config-secret
+
+# Define outputs for verification and integration
+outputs:
+  - name: project_id
+    description: "Google Cloud Project ID"
+    value: $(ref.project_id)
+    
+  - name: cloud_run_service_url
+    description: "URL of the deployed Cloud Run service"
+    value: $(ref.secure-api-cloud-run-service.status.url)
+    
+  - name: api_gateway_url
+    description: "URL of the API Gateway"
+    value: $(ref.secure-api-gateway.defaultHostname)
+    
+  - name: service_account_email
+    description: "Email of the service account used by Cloud Run"
+    value: $(ref.secure-api-service-account.email)
+    
+  - name: database_secret_name
+    description: "Name of the database configuration secret"
+    value: $(ref.database-config-secret.name)
+    
+  - name: api_keys_secret_name
+    description: "Name of the API keys secret"
+    value: $(ref.api-keys-secret.name)
+    
+  - name: app_config_secret_name
+    description: "Name of the application configuration secret"
+    value: $(ref.app-config-secret.name)
+    
+  - name: gateway_api_name
+    description: "Name of the API Gateway API"
+    value: $(ref.secure-api-gateway-api.name)
+    
+  - name: gateway_config_name
+    description: "Name of the API Gateway configuration"
+    value: $(ref.secure-api-gateway-config.name)
+    
+  - name: monitoring_policy_name
+    description: "Name of the secret access monitoring policy"
+    value: $(ref.secret-access-monitoring-policy.name)
+
+# Metadata for deployment tracking and management
+metadata:
+  annotations:
+    deployment.cloud.google.com/recipe: "secure-api-configuration-management-secret-manager-run"
+    deployment.cloud.google.com/version: "1.0"
+    deployment.cloud.google.com/created-by: "infrastructure-manager"
+    deployment.cloud.google.com/security-reviewed: "true"
+    deployment.cloud.google.com/compliance-framework: "cis-gcp-benchmark"
+  labels:
+    purpose: "secure-api-deployment"
+    security-level: "high"
+    data-classification: "confidential"
+    environment: "development"
+    cost-center: "engineering"

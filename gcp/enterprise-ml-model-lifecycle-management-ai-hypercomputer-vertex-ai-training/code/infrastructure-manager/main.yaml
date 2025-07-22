@@ -1,0 +1,700 @@
+# Infrastructure Manager Configuration for Enterprise ML Model Lifecycle Management
+# This configuration deploys an enterprise-grade ML model lifecycle management system
+# using AI Hypercomputer infrastructure, Vertex AI Training, and Cloud Workstations
+
+# Global Configuration
+variables:
+  project_id:
+    description: "The GCP project ID"
+    type: string
+    default: "ml-lifecycle-project"
+  
+  region:
+    description: "The GCP region for deployment"
+    type: string
+    default: "us-central1"
+  
+  zone:
+    description: "The GCP zone for deployment"
+    type: string
+    default: "us-central1-a"
+  
+  prefix:
+    description: "Prefix for resource names"
+    type: string
+    default: "ml-enterprise"
+  
+  environment:
+    description: "Environment name (dev, staging, prod)"
+    type: string
+    default: "dev"
+  
+  billing_account:
+    description: "The billing account ID"
+    type: string
+    default: ""
+
+# Resource definitions
+resources:
+  # =================
+  # Core Infrastructure
+  # =================
+  
+  # Enable Required APIs
+  enable_apis:
+    type: gcp:projects:Service
+    properties:
+      project: ${project_id}
+      services:
+        - aiplatform.googleapis.com
+        - workstations.googleapis.com
+        - compute.googleapis.com
+        - storage.googleapis.com
+        - bigquery.googleapis.com
+        - artifactregistry.googleapis.com
+        - container.googleapis.com
+        - tpu.googleapis.com
+        - logging.googleapis.com
+        - monitoring.googleapis.com
+        - secretmanager.googleapis.com
+    options:
+      dependsOn:
+        - ${project_id}
+  
+  # =================
+  # Storage & Data Resources
+  # =================
+  
+  # Cloud Storage bucket for ML artifacts
+  ml_artifacts_bucket:
+    type: gcp:storage:Bucket
+    properties:
+      project: ${project_id}
+      name: ${prefix}-ml-artifacts-${environment}
+      location: ${region}
+      storageClass: STANDARD
+      uniformBucketLevelAccess: true
+      versioning:
+        enabled: true
+      lifecycleRule:
+        - condition:
+            age: 90
+          action:
+            type: Delete
+        - condition:
+            age: 30
+            isLive: false
+          action:
+            type: Delete
+      labels:
+        environment: ${environment}
+        purpose: ml-artifacts
+        cost-center: ml-platform
+    options:
+      dependsOn:
+        - ${enable_apis}
+  
+  # BigQuery dataset for experiment tracking
+  ml_experiments_dataset:
+    type: gcp:bigquery:Dataset
+    properties:
+      project: ${project_id}
+      datasetId: ${prefix}_ml_experiments_${environment}
+      location: ${region}
+      description: "Dataset for ML experiment tracking and governance"
+      defaultTableExpirationMs: 7776000000  # 90 days
+      labels:
+        environment: ${environment}
+        purpose: ml-experiments
+        cost-center: ml-platform
+      access:
+        - role: OWNER
+          userByEmail: "ml-admin@${project_id}.iam.gserviceaccount.com"
+        - role: READER
+          userByEmail: "ml-scientist@${project_id}.iam.gserviceaccount.com"
+    options:
+      dependsOn:
+        - ${enable_apis}
+  
+  # Artifact Registry for ML containers
+  ml_container_registry:
+    type: gcp:artifactregistry:Repository
+    properties:
+      project: ${project_id}
+      repositoryId: ${prefix}-ml-containers-${environment}
+      location: ${region}
+      format: DOCKER
+      description: "Container registry for ML training and inference images"
+      labels:
+        environment: ${environment}
+        purpose: ml-containers
+        cost-center: ml-platform
+      dockerConfig:
+        immutableTags: true
+    options:
+      dependsOn:
+        - ${enable_apis}
+  
+  # =================
+  # AI Hypercomputer Infrastructure
+  # =================
+  
+  # TPU v5e Node Pool for large model training
+  tpu_v5e_node:
+    type: gcp:tpu:Node
+    properties:
+      project: ${project_id}
+      name: ${prefix}-tpu-training-${environment}
+      zone: ${zone}
+      acceleratorType: v5litepod-4
+      runtimeVersion: tpu-ubuntu2204-base
+      description: "TPU v5e infrastructure for enterprise ML training"
+      network: default
+      schedulingConfig:
+        preemptible: false
+      labels:
+        environment: ${environment}
+        purpose: ml-training
+        cost-center: ml-platform
+        infrastructure: ai-hypercomputer
+      metadata:
+        startup-script: |
+          #!/bin/bash
+          # Install ML framework dependencies
+          pip install tensorflow torch jax
+          # Configure monitoring
+          curl -sSO https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh
+          sudo bash add-google-cloud-ops-agent-repo.sh --also-install
+    options:
+      dependsOn:
+        - ${enable_apis}
+  
+  # GPU Instance for mixed workloads
+  gpu_training_instance:
+    type: gcp:compute:Instance
+    properties:
+      project: ${project_id}
+      name: ${prefix}-gpu-training-${environment}
+      zone: ${zone}
+      machineType: a3-highgpu-8g
+      description: "GPU infrastructure for enterprise ML training"
+      bootDisk:
+        initializeParams:
+          size: 200
+          type: pd-ssd
+          image: projects/deeplearning-platform-release/global/images/family/pytorch-latest-gpu-debian-11
+      guestAccelerator:
+        - type: nvidia-h100-80gb
+          count: 8
+      scheduling:
+        onHostMaintenance: TERMINATE
+        provisioningModel: STANDARD
+      networkInterface:
+        - network: default
+          accessConfig:
+            - natIp: ""
+      serviceAccount:
+        email: ${ml_training_service_account.email}
+        scopes:
+          - https://www.googleapis.com/auth/cloud-platform
+      labels:
+        environment: ${environment}
+        purpose: ml-training
+        cost-center: ml-platform
+        infrastructure: ai-hypercomputer
+      metadata:
+        startup-script: |
+          #!/bin/bash
+          # Install GPU drivers (if not already installed)
+          /opt/deeplearning/install-driver.sh
+          # Configure monitoring
+          curl -sSO https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh
+          sudo bash add-google-cloud-ops-agent-repo.sh --also-install
+    options:
+      dependsOn:
+        - ${enable_apis}
+        - ${ml_training_service_account}
+  
+  # =================
+  # Cloud Workstations Environment
+  # =================
+  
+  # Cloud Workstations Cluster
+  workstation_cluster:
+    type: gcp:workstations:WorkstationCluster
+    properties:
+      project: ${project_id}
+      workstationClusterId: ${prefix}-workstations-${environment}
+      location: ${region}
+      displayName: "ML Enterprise Development Cluster"
+      network: projects/${project_id}/global/networks/default
+      subnetwork: projects/${project_id}/regions/${region}/subnetworks/default
+      privateClusterConfig:
+        enablePrivateEndpoint: true
+        clusterHostname: ml-workstations-${environment}.${project_id}.com
+      labels:
+        environment: ${environment}
+        purpose: ml-development
+        cost-center: ml-platform
+      annotations:
+        managed-by: "infrastructure-manager"
+        use-case: "enterprise-ml-development"
+    options:
+      dependsOn:
+        - ${enable_apis}
+  
+  # Cloud Workstations Configuration
+  workstation_config:
+    type: gcp:workstations:WorkstationConfig
+    properties:
+      project: ${project_id}
+      workstationConfigId: ${prefix}-ml-config-${environment}
+      workstationClusterId: ${workstation_cluster.workstationClusterId}
+      location: ${region}
+      displayName: "ML Development Configuration"
+      container:
+        image: us-central1-docker.pkg.dev/cloud-workstations-images/predefined/code-oss:latest
+        workingDir: /workspace
+        env:
+          - name: VERTEX_AI_PROJECT
+            value: ${project_id}
+          - name: VERTEX_AI_REGION
+            value: ${region}
+          - name: ML_BUCKET
+            value: ${ml_artifacts_bucket.name}
+      host:
+        gceInstance:
+          machineType: n1-standard-8
+          bootDiskSizeGb: 200
+          disks:
+            - diskType: pd-ssd
+              diskSizeGb: 200
+          serviceAccount: ${ml_workstation_service_account.email}
+          serviceAccountScopes:
+            - https://www.googleapis.com/auth/cloud-platform
+          tags:
+            - ml-workstations
+            - ${environment}
+          shieldedInstanceConfig:
+            enableSecureBoot: true
+            enableVtpm: true
+            enableIntegrityMonitoring: true
+      encryptionKey:
+        kmsKey: projects/${project_id}/locations/${region}/keyRings/ml-workstations/cryptoKeys/workstation-key
+      labels:
+        environment: ${environment}
+        purpose: ml-development
+        cost-center: ml-platform
+    options:
+      dependsOn:
+        - ${workstation_cluster}
+        - ${ml_workstation_service_account}
+  
+  # =================
+  # Service Accounts & IAM
+  # =================
+  
+  # Service Account for ML Training
+  ml_training_service_account:
+    type: gcp:serviceaccount:Account
+    properties:
+      project: ${project_id}
+      accountId: ${prefix}-ml-training-${environment}
+      displayName: "ML Training Service Account"
+      description: "Service account for ML training workloads"
+  
+  # Service Account for Workstations
+  ml_workstation_service_account:
+    type: gcp:serviceaccount:Account
+    properties:
+      project: ${project_id}
+      accountId: ${prefix}-ml-workstation-${environment}
+      displayName: "ML Workstation Service Account"
+      description: "Service account for ML development workstations"
+  
+  # IAM bindings for ML Training Service Account
+  ml_training_iam_bindings:
+    type: gcp:projects:IAMBinding
+    properties:
+      project: ${project_id}
+      role: roles/aiplatform.user
+      members:
+        - serviceAccount:${ml_training_service_account.email}
+  
+  ml_training_storage_iam:
+    type: gcp:projects:IAMBinding
+    properties:
+      project: ${project_id}
+      role: roles/storage.objectAdmin
+      members:
+        - serviceAccount:${ml_training_service_account.email}
+  
+  ml_training_bigquery_iam:
+    type: gcp:projects:IAMBinding
+    properties:
+      project: ${project_id}
+      role: roles/bigquery.dataEditor
+      members:
+        - serviceAccount:${ml_training_service_account.email}
+  
+  # IAM bindings for Workstation Service Account
+  ml_workstation_iam_bindings:
+    type: gcp:projects:IAMBinding
+    properties:
+      project: ${project_id}
+      role: roles/aiplatform.user
+      members:
+        - serviceAccount:${ml_workstation_service_account.email}
+  
+  ml_workstation_storage_iam:
+    type: gcp:projects:IAMBinding
+    properties:
+      project: ${project_id}
+      role: roles/storage.objectAdmin
+      members:
+        - serviceAccount:${ml_workstation_service_account.email}
+  
+  # =================
+  # Vertex AI Resources
+  # =================
+  
+  # Vertex AI Model Registry
+  vertex_ai_model:
+    type: gcp:vertex:AiModel
+    properties:
+      project: ${project_id}
+      region: ${region}
+      displayName: ${prefix}-enterprise-model-template-${environment}
+      description: "Enterprise ML model template with governance metadata"
+      containerSpec:
+        imageUri: gcr.io/cloud-aiplatform/prediction/tf2-cpu.2-11:latest
+        env:
+          - name: MODEL_NAME
+            value: enterprise-ml-model
+          - name: ENVIRONMENT
+            value: ${environment}
+      artifactUri: gs://${ml_artifacts_bucket.name}/models/
+      labels:
+        environment: ${environment}
+        purpose: ml-model-registry
+        cost-center: ml-platform
+        governance: enterprise
+      metadata:
+        framework: tensorflow
+        version: "2.11"
+        training-data-lineage: "gs://${ml_artifacts_bucket.name}/datasets/lineage.json"
+        model-explanation: "Enterprise classification model"
+        bias-evaluation: "Completed"
+        security-scan: "Passed"
+    options:
+      dependsOn:
+        - ${enable_apis}
+        - ${ml_artifacts_bucket}
+  
+  # =================
+  # Monitoring & Logging
+  # =================
+  
+  # Cloud Monitoring Dashboard
+  ml_monitoring_dashboard:
+    type: gcp:monitoring:Dashboard
+    properties:
+      project: ${project_id}
+      dashboardId: ${prefix}-ml-monitoring-${environment}
+      displayName: "ML Enterprise Monitoring Dashboard"
+      mosaicLayout:
+        tiles:
+          - width: 6
+            height: 4
+            widget:
+              title: "Training Job Status"
+              scorecard:
+                timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: resource.type="aiplatform.googleapis.com/CustomJob"
+                    aggregation:
+                      alignmentPeriod: 300s
+                      perSeriesAligner: ALIGN_RATE
+                      crossSeriesReducer: REDUCE_SUM
+                gaugeView:
+                  upperBound: 100
+                  lowerBound: 0
+          - width: 6
+            height: 4
+            widget:
+              title: "GPU Utilization"
+              scorecard:
+                timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: resource.type="gce_instance" AND metric.type="compute.googleapis.com/instance/accelerator/utilization"
+                    aggregation:
+                      alignmentPeriod: 300s
+                      perSeriesAligner: ALIGN_MEAN
+                      crossSeriesReducer: REDUCE_MEAN
+                gaugeView:
+                  upperBound: 1.0
+                  lowerBound: 0.0
+  
+  # Log-based Metrics for ML Operations
+  ml_training_job_metric:
+    type: gcp:logging:Metric
+    properties:
+      project: ${project_id}
+      name: ${prefix}_ml_training_jobs_${environment}
+      description: "Count of ML training jobs by status"
+      filter: |
+        resource.type="aiplatform.googleapis.com/CustomJob"
+        protoPayload.methodName="google.cloud.aiplatform.v1.JobService.CreateCustomJob"
+      labelExtractors:
+        job_state: EXTRACT(protoPayload.response.state)
+        job_type: EXTRACT(protoPayload.response.displayName)
+      bucketOptions:
+        exponentialBuckets:
+          numFiniteBuckets: 64
+          growthFactor: 2.0
+          scale: 1.0
+  
+  # Alerting Policy for Training Job Failures
+  ml_training_alert_policy:
+    type: gcp:monitoring:AlertPolicy
+    properties:
+      project: ${project_id}
+      displayName: "ML Training Job Failures - ${environment}"
+      conditions:
+        - displayName: "Training job failure rate"
+          conditionThreshold:
+            filter: resource.type="aiplatform.googleapis.com/CustomJob"
+            comparison: COMPARISON_GT
+            thresholdValue: 0.1
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_SUM
+      alertStrategy:
+        autoClose: 86400s  # 24 hours
+      combiner: OR
+      enabled: true
+      notificationChannels:
+        - ${ml_notification_channel.name}
+  
+  # Notification Channel for ML Operations
+  ml_notification_channel:
+    type: gcp:monitoring:NotificationChannel
+    properties:
+      project: ${project_id}
+      type: email
+      displayName: "ML Operations Team - ${environment}"
+      description: "Email notifications for ML operations alerts"
+      labels:
+        email_address: ml-ops@${project_id}.iam.gserviceaccount.com
+  
+  # =================
+  # Security & Compliance
+  # =================
+  
+  # KMS Key Ring for ML Workstations
+  ml_workstations_keyring:
+    type: gcp:kms:KeyRing
+    properties:
+      project: ${project_id}
+      name: ml-workstations
+      location: ${region}
+  
+  # KMS Crypto Key for Workstation Encryption
+  ml_workstations_crypto_key:
+    type: gcp:kms:CryptoKey
+    properties:
+      project: ${project_id}
+      name: workstation-key
+      keyRing: ${ml_workstations_keyring.id}
+      purpose: ENCRYPT_DECRYPT
+      rotationPeriod: 7776000s  # 90 days
+      versionTemplate:
+        algorithm: GOOGLE_SYMMETRIC_ENCRYPTION
+        protectionLevel: SOFTWARE
+  
+  # Secret Manager for ML Model Secrets
+  ml_model_secrets:
+    type: gcp:secretmanager:Secret
+    properties:
+      project: ${project_id}
+      secretId: ${prefix}-ml-model-secrets-${environment}
+      labels:
+        environment: ${environment}
+        purpose: ml-model-secrets
+        cost-center: ml-platform
+      replication:
+        automatic: true
+  
+  # =================
+  # Network Security
+  # =================
+  
+  # Firewall rules for ML workloads
+  ml_workloads_firewall:
+    type: gcp:compute:Firewall
+    properties:
+      project: ${project_id}
+      name: ${prefix}-ml-workloads-${environment}
+      description: "Firewall rules for ML workloads"
+      network: default
+      direction: INGRESS
+      priority: 1000
+      sourceRanges:
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+      targetTags:
+        - ml-workstations
+        - ml-training
+      allow:
+        - protocol: tcp
+          ports:
+            - "22"    # SSH
+            - "80"    # HTTP
+            - "443"   # HTTPS
+            - "8080"  # Jupyter
+            - "8888"  # Jupyter Lab
+        - protocol: udp
+          ports:
+            - "53"    # DNS
+  
+  # =================
+  # Backup & Disaster Recovery
+  # =================
+  
+  # Backup policy for ML artifacts
+  ml_artifacts_backup_policy:
+    type: gcp:storage:BucketIAMPolicy
+    properties:
+      bucket: ${ml_artifacts_bucket.name}
+      policyData: |
+        {
+          "bindings": [
+            {
+              "role": "roles/storage.objectViewer",
+              "members": [
+                "serviceAccount:${project_id}@gs-project-accounts.iam.gserviceaccount.com"
+              ]
+            },
+            {
+              "role": "roles/storage.objectAdmin",
+              "members": [
+                "serviceAccount:${ml_training_service_account.email}",
+                "serviceAccount:${ml_workstation_service_account.email}"
+              ]
+            }
+          ]
+        }
+    options:
+      dependsOn:
+        - ${ml_artifacts_bucket}
+        - ${ml_training_service_account}
+        - ${ml_workstation_service_account}
+
+# =================
+# Outputs
+# =================
+outputs:
+  project_id:
+    description: "The GCP project ID"
+    value: ${project_id}
+  
+  region:
+    description: "The deployment region"
+    value: ${region}
+  
+  ml_artifacts_bucket:
+    description: "Cloud Storage bucket for ML artifacts"
+    value: ${ml_artifacts_bucket.name}
+  
+  ml_experiments_dataset:
+    description: "BigQuery dataset for ML experiments"
+    value: ${ml_experiments_dataset.datasetId}
+  
+  ml_container_registry:
+    description: "Artifact Registry for ML containers"
+    value: ${ml_container_registry.name}
+  
+  tpu_node_name:
+    description: "TPU v5e node for training"
+    value: ${tpu_v5e_node.name}
+  
+  gpu_instance_name:
+    description: "GPU instance for training"
+    value: ${gpu_training_instance.name}
+  
+  workstation_cluster:
+    description: "Cloud Workstations cluster"
+    value: ${workstation_cluster.name}
+  
+  workstation_config:
+    description: "Cloud Workstations configuration"
+    value: ${workstation_config.name}
+  
+  ml_training_service_account:
+    description: "Service account for ML training"
+    value: ${ml_training_service_account.email}
+  
+  ml_workstation_service_account:
+    description: "Service account for ML workstations"
+    value: ${ml_workstation_service_account.email}
+  
+  vertex_ai_model:
+    description: "Vertex AI model registry entry"
+    value: ${vertex_ai_model.name}
+  
+  monitoring_dashboard:
+    description: "Cloud Monitoring dashboard"
+    value: ${ml_monitoring_dashboard.name}
+  
+  kms_key_ring:
+    description: "KMS key ring for encryption"
+    value: ${ml_workstations_keyring.name}
+  
+  deployment_commands:
+    description: "Commands to deploy and manage the infrastructure"
+    value: |
+      # Deploy the infrastructure
+      gcloud infra-manager deployments apply projects/${project_id}/locations/${region}/deployments/${prefix}-ml-lifecycle-${environment} \
+        --service-account=${ml_training_service_account.email} \
+        --local-source=. \
+        --input-values=project_id=${project_id},region=${region},environment=${environment}
+      
+      # Create a workstation instance
+      gcloud workstations create ml-dev-workstation \
+        --cluster=${workstation_cluster.workstationClusterId} \
+        --config=${workstation_config.workstationConfigId} \
+        --region=${region}
+      
+      # Submit a training job
+      gcloud ai custom-jobs create \
+        --region=${region} \
+        --display-name=enterprise-training-job \
+        --config=training_job_config.json
+      
+      # Monitor infrastructure
+      gcloud monitoring dashboards list --project=${project_id}
+  
+  cost_optimization_tips:
+    description: "Tips for optimizing costs"
+    value: |
+      1. Use preemptible instances for non-critical training workloads
+      2. Enable automatic scaling for Vertex AI training jobs
+      3. Set up lifecycle policies for Cloud Storage buckets
+      4. Monitor resource utilization with Cloud Monitoring
+      5. Use committed use discounts for long-running workloads
+      6. Implement proper resource tagging for cost allocation
+  
+  security_best_practices:
+    description: "Security best practices implemented"
+    value: |
+      1. Private cluster configuration for Cloud Workstations
+      2. Service account-based authentication
+      3. KMS encryption for sensitive data
+      4. IAM roles with least privilege access
+      5. Network security with firewall rules
+      6. Secret Manager for sensitive configuration
+      7. Audit logging enabled for all operations
+      8. Shielded VM instances for enhanced security

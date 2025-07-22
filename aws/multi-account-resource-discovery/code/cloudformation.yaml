@@ -1,0 +1,900 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Automated Multi-Account Resource Discovery with AWS Resource Explorer and Config.
+  This template creates a centralized governance platform that automatically discovers,
+  catalogs, and monitors resources across your entire AWS organization while enabling
+  proactive compliance enforcement and automated remediation workflows.
+  Version: 1.0
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - OrganizationId
+      - Label:
+          default: "Resource Explorer Configuration"
+        Parameters:
+          - EnableResourceExplorer
+          - ResourceExplorerViewName
+      - Label:
+          default: "Config Service Configuration"
+        Parameters:
+          - EnableConfigService
+          - ConfigRecorderName
+          - ConfigDeliveryChannelName
+          - ConfigAggregatorName
+      - Label:
+          default: "Lambda Function Configuration"
+        Parameters:
+          - LambdaFunctionName
+          - LambdaTimeout
+          - LambdaMemorySize
+      - Label:
+          default: "EventBridge Configuration"
+        Parameters:
+          - EnableScheduledDiscovery
+          - DiscoveryScheduleExpression
+      - Label:
+          default: "Compliance Monitoring"
+        Parameters:
+          - DeployComplianceRules
+          - NotificationEmail
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      OrganizationId:
+        default: "AWS Organization ID"
+      EnableResourceExplorer:
+        default: "Enable Resource Explorer"
+      ResourceExplorerViewName:
+        default: "Resource Explorer View Name"
+      EnableConfigService:
+        default: "Enable AWS Config Service"
+      ConfigRecorderName:
+        default: "Config Recorder Name"
+      ConfigDeliveryChannelName:
+        default: "Config Delivery Channel Name"
+      ConfigAggregatorName:
+        default: "Config Aggregator Name"
+      LambdaFunctionName:
+        default: "Lambda Function Name"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      EnableScheduledDiscovery:
+        default: "Enable Scheduled Discovery"
+      DiscoveryScheduleExpression:
+        default: "Discovery Schedule Expression"
+      DeployComplianceRules:
+        default: "Deploy Compliance Rules"
+      NotificationEmail:
+        default: "Notification Email Address"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: multi-account-discovery
+    Description: Name prefix for all resources created by this template
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: Must contain only letters, numbers, and hyphens
+    MaxLength: 50
+
+  OrganizationId:
+    Type: String
+    Description: AWS Organization ID (e.g., o-example123456)
+    AllowedPattern: '^o-[a-z0-9]{10}$'
+    ConstraintDescription: Must be a valid AWS Organization ID starting with 'o-' followed by 10 alphanumeric characters
+
+  EnableResourceExplorer:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable AWS Resource Explorer aggregated index
+
+  ResourceExplorerViewName:
+    Type: String
+    Default: organization-view
+    Description: Name for the Resource Explorer view
+    MaxLength: 64
+
+  EnableConfigService:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable AWS Config service with organizational aggregator
+
+  ConfigRecorderName:
+    Type: String
+    Description: Name for the AWS Config configuration recorder
+    MaxLength: 256
+    Default: !Sub '${ProjectName}-recorder'
+
+  ConfigDeliveryChannelName:
+    Type: String
+    Description: Name for the AWS Config delivery channel
+    MaxLength: 256
+    Default: !Sub '${ProjectName}-channel'
+
+  ConfigAggregatorName:
+    Type: String
+    Description: Name for the AWS Config organizational aggregator
+    MaxLength: 256
+    Default: !Sub '${ProjectName}-aggregator'
+
+  LambdaFunctionName:
+    Type: String
+    Description: Name for the Lambda processing function
+    MaxLength: 64
+    Default: !Sub '${ProjectName}-processor'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+    Description: Lambda function timeout in seconds
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+    Description: Lambda function memory size in MB
+
+  EnableScheduledDiscovery:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable scheduled resource discovery scans
+
+  DiscoveryScheduleExpression:
+    Type: String
+    Default: rate(1 day)
+    Description: Schedule expression for periodic resource discovery
+    AllowedPattern: '^(rate\([1-9][0-9]* (minute|minutes|hour|hours|day|days)\)|cron\(.+\))$'
+
+  DeployComplianceRules:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Deploy AWS Config compliance rules for governance
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for compliance notifications (optional)
+    Default: ''
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address or empty
+
+Conditions:
+  CreateResourceExplorer: !Equals [!Ref EnableResourceExplorer, 'true']
+  CreateConfigService: !Equals [!Ref EnableConfigService, 'true']
+  CreateScheduledDiscovery: !Equals [!Ref EnableScheduledDiscovery, 'true']
+  CreateComplianceRules: !Equals [!Ref DeployComplianceRules, 'true']
+  CreateNotifications: !Not [!Equals [!Ref NotificationEmail, '']]
+
+Resources:
+  # ============================================================================
+  # S3 Bucket for AWS Config Data
+  # ============================================================================
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateConfigService
+    Properties:
+      BucketName: !Sub 'aws-config-bucket-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ConfigDataRetention
+            Status: Enabled
+            ExpirationInDays: 2555  # 7 years
+            NoncurrentVersionExpirationInDays: 365
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Purpose
+          Value: ConfigService
+        - Key: ManagedBy
+          Value: !Ref ProjectName
+
+  ConfigBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateConfigService
+    Properties:
+      Bucket: !Ref ConfigBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSConfigBucketPermissionsCheck
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt ConfigBucket.Arn
+            Condition:
+              StringEquals:
+                'AWS:SourceAccount': !Ref AWS::AccountId
+          - Sid: AWSConfigBucketExistenceCheck
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:ListBucket
+            Resource: !GetAtt ConfigBucket.Arn
+            Condition:
+              StringEquals:
+                'AWS:SourceAccount': !Ref AWS::AccountId
+          - Sid: AWSConfigBucketDelivery
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${ConfigBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+                'AWS:SourceAccount': !Ref AWS::AccountId
+
+  # ============================================================================
+  # AWS Resource Explorer Configuration
+  # ============================================================================
+  ResourceExplorerIndex:
+    Type: AWS::ResourceExplorer2::Index
+    Condition: CreateResourceExplorer
+    Properties:
+      Type: AGGREGATOR
+      Tags:
+        Purpose: MultiAccountDiscovery
+        ManagedBy: !Ref ProjectName
+
+  ResourceExplorerView:
+    Type: AWS::ResourceExplorer2::View
+    Condition: CreateResourceExplorer
+    DependsOn: ResourceExplorerIndex
+    Properties:
+      ViewName: !Ref ResourceExplorerViewName
+      IncludedProperties:
+        - Name: tags
+        - Name: region
+        - Name: resourceType
+        - Name: service
+        - Name: owningAccountId
+      Tags:
+        Purpose: MultiAccountDiscovery
+        ManagedBy: !Ref ProjectName
+
+  ResourceExplorerDefaultViewAssociation:
+    Type: AWS::ResourceExplorer2::DefaultViewAssociation
+    Condition: CreateResourceExplorer
+    Properties:
+      ViewArn: !GetAtt ResourceExplorerView.ViewArn
+
+  # ============================================================================
+  # AWS Config Service Configuration
+  # ============================================================================
+  ConfigServiceRole:
+    Type: AWS::IAM::ServiceLinkedRole
+    Condition: CreateConfigService
+    Properties:
+      AWSServiceName: config.amazonaws.com
+      Description: Service-linked role for AWS Config
+
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Condition: CreateConfigService
+    DependsOn: ConfigServiceRole
+    Properties:
+      Name: !Ref ConfigRecorderName
+      RoleARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/config.amazonaws.com/AWSServiceRoleForConfig'
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+        ResourceTypes: []
+        RecordingModeOverrides: []
+        ExclusionByResourceTypes:
+          ResourceTypes: []
+
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Condition: CreateConfigService
+    Properties:
+      Name: !Ref ConfigDeliveryChannelName
+      S3BucketName: !Ref ConfigBucket
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: TwentyFour_Hours
+
+  ConfigAggregator:
+    Type: AWS::Config::ConfigurationAggregator
+    Condition: CreateConfigService
+    DependsOn: ConfigServiceRole
+    Properties:
+      ConfigurationAggregatorName: !Ref ConfigAggregatorName
+      OrganizationAggregationSource:
+        RoleArn: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/config.amazonaws.com/AWSServiceRoleForConfig'
+        AwsRegions:
+          - !Ref AWS::Region
+        AllAwsRegions: false
+      Tags:
+        - Key: Purpose
+          Value: MultiAccountCompliance
+        - Key: ManagedBy
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # AWS Config Rules for Compliance Monitoring
+  # ============================================================================
+  S3BucketPublicAccessProhibitedRule:
+    Type: AWS::Config::ConfigRule
+    Condition: CreateComplianceRules
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ProjectName}-s3-bucket-public-access-prohibited'
+      Description: Checks that S3 buckets do not allow public access
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_PUBLIC_ACCESS_PROHIBITED
+      Tags:
+        - Key: Purpose
+          Value: SecurityCompliance
+        - Key: ManagedBy
+          Value: !Ref ProjectName
+
+  EC2SecurityGroupAttachedToEniRule:
+    Type: AWS::Config::ConfigRule
+    Condition: CreateComplianceRules
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ProjectName}-ec2-security-group-attached-to-eni'
+      Description: Checks that security groups are attached to EC2 instances or network interfaces
+      Source:
+        Owner: AWS
+        SourceIdentifier: EC2_SECURITY_GROUP_ATTACHED_TO_ENI
+      Tags:
+        - Key: Purpose
+          Value: SecurityCompliance
+        - Key: ManagedBy
+          Value: !Ref ProjectName
+
+  RootAccessKeyCheckRule:
+    Type: AWS::Config::ConfigRule
+    Condition: CreateComplianceRules
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ProjectName}-root-access-key-check'
+      Description: Checks whether the root user access key is available
+      Source:
+        Owner: AWS
+        SourceIdentifier: ROOT_ACCESS_KEY_CHECK
+      Tags:
+        - Key: Purpose
+          Value: SecurityCompliance
+        - Key: ManagedBy
+          Value: !Ref ProjectName
+
+  EncryptedVolumesRule:
+    Type: AWS::Config::ConfigRule
+    Condition: CreateComplianceRules
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ProjectName}-encrypted-volumes'
+      Description: Checks whether Amazon EBS volumes are encrypted
+      Source:
+        Owner: AWS
+        SourceIdentifier: ENCRYPTED_VOLUMES
+      Tags:
+        - Key: Purpose
+          Value: SecurityCompliance
+        - Key: ManagedBy
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # SNS Topic for Notifications
+  # ============================================================================
+  ComplianceNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateNotifications
+    Properties:
+      TopicName: !Sub '${ProjectName}-compliance-notifications'
+      DisplayName: Multi-Account Compliance Notifications
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Purpose
+          Value: ComplianceNotifications
+        - Key: ManagedBy
+          Value: !Ref ProjectName
+
+  ComplianceNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateNotifications
+    Properties:
+      Protocol: email
+      TopicArn: !Ref ComplianceNotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # ============================================================================
+  # IAM Role for Lambda Function
+  # ============================================================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-lambda-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${LambdaFunctionName}:*'
+              - Effect: Allow
+                Action:
+                  - config:GetComplianceDetailsByConfigRule
+                  - config:GetAggregateComplianceDetailsByConfigRule
+                  - config:GetAggregateComplianceSummary
+                  - config:DescribeConfigRules
+                  - config:DescribeComplianceByConfigRule
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - resource-explorer-2:Search
+                  - resource-explorer-2:GetIndex
+                  - resource-explorer-2:ListViews
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - organizations:ListAccounts
+                  - organizations:DescribeOrganization
+                Resource: '*'
+              - !If
+                - CreateNotifications
+                - Effect: Allow
+                  Action:
+                    - sns:Publish
+                  Resource: !Ref ComplianceNotificationTopic
+                - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Purpose
+          Value: AutomatedGovernance
+        - Key: ManagedBy
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # Lambda Function for Event Processing
+  # ============================================================================
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Description: Multi-account resource discovery and compliance processor
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ORGANIZATION_ID: !Ref OrganizationId
+          CONFIG_AGGREGATOR_NAME: !If [CreateConfigService, !Ref ConfigAggregatorName, '']
+          SNS_TOPIC_ARN: !If [CreateNotifications, !Ref ComplianceNotificationTopic, '']
+          AWS_REGION: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          from typing import Dict, List, Any, Optional
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize AWS clients
+          config_client = boto3.client('config')
+          resource_explorer_client = boto3.client('resource-explorer-2')
+          organizations_client = boto3.client('organizations')
+          sns_client = boto3.client('sns')
+
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """Main handler for multi-account resource discovery events"""
+              logger.info(f"Processing event: {json.dumps(event, default=str)}")
+              
+              try:
+                  # Process Config compliance events
+                  if event.get('source') == 'aws.config':
+                      return process_config_event(event)
+                  
+                  # Process Resource Explorer events
+                  elif event.get('source') == 'aws.resource-explorer-2':
+                      return process_resource_explorer_event(event)
+                  
+                  # Handle scheduled discovery tasks
+                  elif event.get('source') == 'aws.events' and 'Scheduled Event' in event.get('detail-type', ''):
+                      return process_scheduled_discovery()
+                  
+                  else:
+                      logger.warning(f"Unknown event source: {event.get('source')}")
+                      
+              except Exception as e:
+                  logger.error(f"Error processing event: {str(e)}")
+                  # Send error notification if SNS is configured
+                  if os.environ.get('SNS_TOPIC_ARN'):
+                      send_notification(f"Error in multi-account discovery: {str(e)}", "ERROR")
+                  raise
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Event processed successfully')
+              }
+
+          def process_config_event(event: Dict[str, Any]) -> Dict[str, Any]:
+              """Process AWS Config compliance events with enhanced logging and notifications"""
+              detail = event.get('detail', {})
+              compliance_type = detail.get('newEvaluationResult', {}).get('complianceType')
+              resource_type = detail.get('resourceType')
+              resource_id = detail.get('resourceId')
+              account_id = detail.get('awsAccountId')
+              config_rule_name = detail.get('configRuleName')
+              
+              logger.info(f"Config event - Resource: {resource_type}, "
+                          f"ID: {resource_id}, Account: {account_id}, "
+                          f"Rule: {config_rule_name}, Compliance: {compliance_type}")
+              
+              if compliance_type == 'NON_COMPLIANT':
+                  logger.warning(f"Non-compliant resource detected: {resource_type} in account {account_id}")
+                  handle_compliance_violation(detail)
+              
+              return {'statusCode': 200, 'compliance_processed': True}
+
+          def process_resource_explorer_event(event: Dict[str, Any]) -> Dict[str, Any]:
+              """Process Resource Explorer events for resource discovery"""
+              logger.info("Processing Resource Explorer event for cross-account discovery")
+              
+              try:
+                  # Perform sample resource discovery across the organization
+                  response = resource_explorer_client.search(
+                      QueryString="service:ec2",
+                      MaxResults=50
+                  )
+                  
+                  resources = response.get('Resources', [])
+                  resource_count = len(resources)
+                  
+                  # Group resources by account for reporting
+                  accounts_with_resources = {}
+                  for resource in resources:
+                      account = resource.get('OwningAccountId', 'unknown')
+                      if account not in accounts_with_resources:
+                          accounts_with_resources[account] = 0
+                      accounts_with_resources[account] += 1
+                  
+                  logger.info(f"Discovered {resource_count} EC2 resources across {len(accounts_with_resources)} accounts")
+                  
+                  # Send summary notification if enabled
+                  if os.environ.get('SNS_TOPIC_ARN'):
+                      message = f"Resource Discovery Summary:\n"
+                      message += f"Total EC2 resources: {resource_count}\n"
+                      message += f"Accounts with resources: {len(accounts_with_resources)}\n"
+                      for account, count in accounts_with_resources.items():
+                          message += f"  Account {account}: {count} resources\n"
+                      
+                      send_notification(message, "INFO")
+                  
+              except Exception as e:
+                  logger.error(f"Error in resource discovery: {str(e)}")
+                  raise
+              
+              return {'statusCode': 200, 'discovery_processed': True}
+
+          def handle_compliance_violation(detail: Dict[str, Any]) -> None:
+              """Handle compliance violations with detailed logging and notifications"""
+              resource_type = detail.get('resourceType')
+              resource_id = detail.get('resourceId')
+              config_rule_name = detail.get('configRuleName')
+              account_id = detail.get('awsAccountId')
+              region = detail.get('awsRegion')
+              
+              violation_message = f"Compliance Violation Detected:\n"
+              violation_message += f"Account: {account_id}\n"
+              violation_message += f"Region: {region}\n"
+              violation_message += f"Rule: {config_rule_name}\n"
+              violation_message += f"Resource Type: {resource_type}\n"
+              violation_message += f"Resource ID: {resource_id}\n"
+              violation_message += f"Timestamp: {datetime.utcnow().isoformat()}"
+              
+              logger.warning(violation_message)
+              
+              # Send notification if SNS topic is configured
+              if os.environ.get('SNS_TOPIC_ARN'):
+                  send_notification(violation_message, "WARNING")
+
+          def process_scheduled_discovery() -> Dict[str, Any]:
+              """Process scheduled resource discovery tasks with comprehensive reporting"""
+              logger.info("Processing scheduled resource discovery scan")
+              
+              try:
+                  # Get organization accounts
+                  accounts = organizations_client.list_accounts()
+                  active_accounts = [acc for acc in accounts['Accounts'] if acc['Status'] == 'ACTIVE']
+                  
+                  logger.info(f"Monitoring {len(active_accounts)} active accounts in organization")
+                  
+                  # Perform comprehensive resource search across service types
+                  service_types = ['ec2', 's3', 'lambda', 'rds', 'iam']
+                  total_resources = 0
+                  service_summary = {}
+                  
+                  for service in service_types:
+                      try:
+                          search_results = resource_explorer_client.search(
+                              QueryString=f"service:{service}",
+                              MaxResults=100
+                          )
+                          
+                          count = len(search_results.get('Resources', []))
+                          service_summary[service] = count
+                          total_resources += count
+                          
+                          logger.info(f"Service {service}: {count} resources")
+                          
+                      except Exception as e:
+                          logger.error(f"Error searching {service} resources: {str(e)}")
+                          service_summary[service] = 'error'
+                  
+                  # Generate compliance summary if Config is enabled
+                  compliance_summary = {}
+                  if os.environ.get('CONFIG_AGGREGATOR_NAME'):
+                      try:
+                          compliance_response = config_client.get_aggregate_compliance_summary(
+                              ConfigurationAggregatorName=os.environ['CONFIG_AGGREGATOR_NAME']
+                          )
+                          compliance_summary = compliance_response.get('AggregateComplianceSummary', {})
+                      except Exception as e:
+                          logger.error(f"Error getting compliance summary: {str(e)}")
+                  
+                  # Send comprehensive report
+                  if os.environ.get('SNS_TOPIC_ARN'):
+                      report_message = f"Scheduled Discovery Report - {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n\n"
+                      report_message += f"Organization Overview:\n"
+                      report_message += f"  Active Accounts: {len(active_accounts)}\n"
+                      report_message += f"  Total Resources Discovered: {total_resources}\n\n"
+                      
+                      report_message += f"Resources by Service:\n"
+                      for service, count in service_summary.items():
+                          report_message += f"  {service.upper()}: {count}\n"
+                      
+                      if compliance_summary:
+                          report_message += f"\nCompliance Summary:\n"
+                          compliant_count = compliance_summary.get('ComplianceSummary', {}).get('ComplianceByConfigRule', {}).get('COMPLIANT', 0)
+                          non_compliant_count = compliance_summary.get('ComplianceSummary', {}).get('ComplianceByConfigRule', {}).get('NON_COMPLIANT', 0)
+                          report_message += f"  Compliant Rules: {compliant_count}\n"
+                          report_message += f"  Non-Compliant Rules: {non_compliant_count}\n"
+                      
+                      send_notification(report_message, "INFO")
+                  
+                  logger.info(f"Scheduled discovery completed. Total resources: {total_resources}")
+                  
+              except Exception as e:
+                  logger.error(f"Error in scheduled discovery: {str(e)}")
+                  raise
+              
+              return {'statusCode': 200, 'scheduled_discovery_complete': True}
+
+          def send_notification(message: str, severity: str) -> None:
+              """Send notification via SNS if topic is configured"""
+              try:
+                  sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
+                  if not sns_topic_arn:
+                      return
+                  
+                  subject = f"Multi-Account Discovery [{severity}] - {os.environ.get('PROJECT_NAME', 'Unknown')}"
+                  
+                  sns_client.publish(
+                      TopicArn=sns_topic_arn,
+                      Subject=subject,
+                      Message=message
+                  )
+                  
+                  logger.info(f"Notification sent with severity: {severity}")
+                  
+              except Exception as e:
+                  logger.error(f"Failed to send notification: {str(e)}")
+
+      Tags:
+        - Key: Purpose
+          Value: AutomatedGovernance
+        - Key: ManagedBy
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # EventBridge Rules for Automation
+  # ============================================================================
+  ConfigComplianceRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-config-rule'
+      Description: Route Config compliance violations to Lambda processor
+      EventPattern:
+        source:
+          - aws.config
+        detail-type:
+          - Config Rules Compliance Change
+        detail:
+          newEvaluationResult:
+            complianceType:
+              - NON_COMPLIANT
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LambdaFunction.Arn
+          Id: ConfigComplianceTarget
+
+  ScheduledDiscoveryRule:
+    Type: AWS::Events::Rule
+    Condition: CreateScheduledDiscovery
+    Properties:
+      Name: !Sub '${ProjectName}-discovery-schedule'
+      Description: Scheduled resource discovery across accounts
+      ScheduleExpression: !Ref DiscoveryScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LambdaFunction.Arn
+          Id: ScheduledDiscoveryTarget
+
+  # ============================================================================
+  # Lambda Permissions for EventBridge
+  # ============================================================================
+  ConfigComplianceLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ConfigComplianceRule.Arn
+
+  ScheduledDiscoveryLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Condition: CreateScheduledDiscovery
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledDiscoveryRule.Arn
+
+  # ============================================================================
+  # CloudWatch Log Group for Lambda Function
+  # ============================================================================
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LambdaFunctionName}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Purpose
+          Value: AutomatedGovernance
+        - Key: ManagedBy
+          Value: !Ref ProjectName
+
+Outputs:
+  # Resource Explorer Outputs
+  ResourceExplorerIndexArn:
+    Description: ARN of the Resource Explorer aggregated index
+    Value: !If [CreateResourceExplorer, !GetAtt ResourceExplorerIndex.Arn, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-ResourceExplorerIndexArn'
+
+  ResourceExplorerViewArn:
+    Description: ARN of the Resource Explorer view
+    Value: !If [CreateResourceExplorer, !GetAtt ResourceExplorerView.ViewArn, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-ResourceExplorerViewArn'
+
+  # Config Service Outputs
+  ConfigBucketName:
+    Description: Name of the S3 bucket for Config data
+    Value: !If [CreateConfigService, !Ref ConfigBucket, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigBucketName'
+
+  ConfigAggregatorName:
+    Description: Name of the Config organizational aggregator
+    Value: !If [CreateConfigService, !Ref ConfigAggregatorName, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigAggregatorName'
+
+  # Lambda Function Outputs
+  LambdaFunctionArn:
+    Description: ARN of the Lambda processing function
+    Value: !GetAtt LambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  LambdaFunctionName:
+    Description: Name of the Lambda processing function
+    Value: !Ref LambdaFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  # EventBridge Outputs
+  ConfigComplianceRuleArn:
+    Description: ARN of the Config compliance EventBridge rule
+    Value: !GetAtt ConfigComplianceRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigComplianceRuleArn'
+
+  ScheduledDiscoveryRuleArn:
+    Description: ARN of the scheduled discovery EventBridge rule
+    Value: !If [CreateScheduledDiscovery, !GetAtt ScheduledDiscoveryRule.Arn, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-ScheduledDiscoveryRuleArn'
+
+  # SNS Topic Outputs
+  ComplianceNotificationTopicArn:
+    Description: ARN of the SNS topic for compliance notifications
+    Value: !If [CreateNotifications, !Ref ComplianceNotificationTopic, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-ComplianceNotificationTopicArn'
+
+  # Deployment Information
+  ProjectName:
+    Description: Project name used for resource naming
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectName'
+
+  OrganizationId:
+    Description: AWS Organization ID monitored by this solution
+    Value: !Ref OrganizationId
+    Export:
+      Name: !Sub '${AWS::StackName}-OrganizationId'
+
+  DeploymentRegion:
+    Description: AWS Region where the solution is deployed
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentRegion'
+
+  # Quick Start Commands
+  ResourceExplorerSearchCommand:
+    Description: AWS CLI command to search resources using Resource Explorer
+    Value: !If 
+      - CreateResourceExplorer
+      - !Sub 'aws resource-explorer-2 search --query-string "service:ec2" --max-results 20 --region ${AWS::Region}'
+      - 'Resource Explorer not enabled'
+
+  ConfigComplianceCheckCommand:
+    Description: AWS CLI command to check organizational compliance status
+    Value: !If
+      - CreateConfigService
+      - !Sub 'aws configservice get-aggregate-compliance-summary --configuration-aggregator-name ${ConfigAggregatorName} --region ${AWS::Region}'
+      - 'Config Service not enabled'
+
+  LambdaLogsCommand:
+    Description: AWS CLI command to view Lambda function logs
+    Value: !Sub 'aws logs tail /aws/lambda/${LambdaFunctionName} --follow --region ${AWS::Region}'

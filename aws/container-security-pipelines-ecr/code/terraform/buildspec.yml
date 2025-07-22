@@ -1,0 +1,274 @@
+version: 0.2
+
+# Multi-stage container security scanning pipeline buildspec
+# This file should be placed in the root of your source repository
+
+phases:
+  pre_build:
+    commands:
+      - echo "=== PRE-BUILD PHASE ==="
+      - echo "Build started on $(date)"
+      - echo "Logging in to Amazon ECR..."
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_URI
+      - IMAGE_TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:-latest}
+      - echo "Image tag will be: $IMAGE_TAG"
+      
+      # Install security scanning tools
+      - echo "Installing security scanning tools..."
+      
+      # Install Snyk CLI (if enabled)
+      - |
+        if [ "${SNYK_ENABLED:-true}" = "true" ]; then
+          echo "Installing Snyk CLI..."
+          curl -o snyk https://static.snyk.io/cli/latest/snyk-linux
+          chmod +x snyk
+          mv snyk /usr/local/bin/
+          
+          # Get Snyk token from Secrets Manager
+          SNYK_TOKEN=$(aws secretsmanager get-secret-value --secret-id $SNYK_TOKEN_SECRET --query SecretString --output text 2>/dev/null || echo "")
+          if [ -n "$SNYK_TOKEN" ]; then
+            export SNYK_TOKEN
+            echo "✅ Snyk authentication configured"
+          else
+            echo "⚠️  Snyk token not found in Secrets Manager"
+          fi
+        fi
+      
+      # Install Prisma Cloud/Twistlock CLI (if enabled)
+      - |
+        if [ "${PRISMA_ENABLED:-false}" = "true" ]; then
+          echo "Installing Prisma Cloud CLI..."
+          PRISMA_CREDS=$(aws secretsmanager get-secret-value --secret-id $PRISMA_CREDENTIALS_SECRET --query SecretString --output text 2>/dev/null || echo "{}")
+          if [ "$PRISMA_CREDS" != "{}" ]; then
+            export PRISMA_CONSOLE=$(echo $PRISMA_CREDS | jq -r '.console')
+            export PRISMA_USER=$(echo $PRISMA_CREDS | jq -r '.username')
+            export PRISMA_PASSWORD=$(echo $PRISMA_CREDS | jq -r '.password')
+            
+            curl -k -u $PRISMA_USER:$PRISMA_PASSWORD https://$PRISMA_CONSOLE/api/v1/util/twistcli > twistcli
+            chmod +x twistcli
+            echo "✅ Prisma Cloud CLI configured"
+          else
+            echo "⚠️  Prisma Cloud credentials not found in Secrets Manager"
+          fi
+        fi
+      
+      # Install additional security tools
+      - echo "Installing additional security tools..."
+      - apt-get update && apt-get install -y jq curl wget
+      
+      # Create results directory
+      - mkdir -p security-results
+
+  build:
+    commands:
+      - echo "=== BUILD PHASE ==="
+      - echo "Building the Docker image..."
+      
+      # Build the container image
+      - docker build -t $ECR_REPO_NAME:$IMAGE_TAG .
+      - docker tag $ECR_REPO_NAME:$IMAGE_TAG $ECR_URI:$IMAGE_TAG
+      
+      # Create scan results summary
+      - echo '{"scan_results": {}, "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}' > security-results/scan-summary.json
+      
+      # Run Snyk container security scan
+      - |
+        if [ "${SNYK_ENABLED:-true}" = "true" ] && [ -n "$SNYK_TOKEN" ]; then
+          echo "🔍 Running Snyk container scan..."
+          snyk container test $ECR_REPO_NAME:$IMAGE_TAG \
+            --severity-threshold=low \
+            --json > security-results/snyk-results.json || true
+          
+          # Extract key metrics from Snyk results
+          if [ -f security-results/snyk-results.json ]; then
+            SNYK_CRITICAL=$(jq -r '.vulnerabilities | map(select(.severity == "critical")) | length' security-results/snyk-results.json 2>/dev/null || echo "0")
+            SNYK_HIGH=$(jq -r '.vulnerabilities | map(select(.severity == "high")) | length' security-results/snyk-results.json 2>/dev/null || echo "0")
+            SNYK_MEDIUM=$(jq -r '.vulnerabilities | map(select(.severity == "medium")) | length' security-results/snyk-results.json 2>/dev/null || echo "0")
+            SNYK_LOW=$(jq -r '.vulnerabilities | map(select(.severity == "low")) | length' security-results/snyk-results.json 2>/dev/null || echo "0")
+            
+            echo "✅ Snyk scan completed - Critical: $SNYK_CRITICAL, High: $SNYK_HIGH, Medium: $SNYK_MEDIUM, Low: $SNYK_LOW"
+            
+            # Update scan summary
+            jq --arg critical "$SNYK_CRITICAL" --arg high "$SNYK_HIGH" --arg medium "$SNYK_MEDIUM" --arg low "$SNYK_LOW" \
+              '.scan_results.snyk = {critical: ($critical | tonumber), high: ($high | tonumber), medium: ($medium | tonumber), low: ($low | tonumber)}' \
+              security-results/scan-summary.json > security-results/scan-summary.tmp && mv security-results/scan-summary.tmp security-results/scan-summary.json
+          fi
+        fi
+      
+      # Run Prisma Cloud/Twistlock scan
+      - |
+        if [ "${PRISMA_ENABLED:-false}" = "true" ] && [ -f twistcli ]; then
+          echo "🔍 Running Prisma Cloud scan..."
+          ./twistcli images scan \
+            --address $PRISMA_CONSOLE \
+            --user $PRISMA_USER \
+            --password $PRISMA_PASSWORD \
+            --details \
+            --output-file security-results/prisma-results.json \
+            $ECR_REPO_NAME:$IMAGE_TAG || true
+          
+          if [ -f security-results/prisma-results.json ]; then
+            echo "✅ Prisma Cloud scan completed"
+          fi
+        fi
+      
+      # Run additional custom security checks
+      - |
+        echo "🔍 Running custom security checks..."
+        
+        # Check for common security issues in Dockerfile
+        if [ -f Dockerfile ]; then
+          echo "Analyzing Dockerfile for security issues..."
+          
+          # Check for root user
+          if grep -q "USER root" Dockerfile; then
+            echo "⚠️  WARNING: Dockerfile uses root user"
+          fi
+          
+          # Check for COPY without --chown
+          if grep -q "COPY [^-]" Dockerfile; then
+            echo "⚠️  INFO: Consider using COPY --chown for better security"
+          fi
+          
+          # Check for outdated base images
+          if grep -q "FROM.*:latest" Dockerfile; then
+            echo "⚠️  WARNING: Using 'latest' tag in base image"
+          fi
+        fi
+      
+      # Create security policy check
+      - |
+        echo "🔍 Checking security policies..."
+        
+        # Check Snyk results against policy
+        if [ -f security-results/snyk-results.json ]; then
+          CRITICAL_COUNT=$(jq -r '.vulnerabilities | map(select(.severity == "critical")) | length' security-results/snyk-results.json 2>/dev/null || echo "0")
+          HIGH_COUNT=$(jq -r '.vulnerabilities | map(select(.severity == "high")) | length' security-results/snyk-results.json 2>/dev/null || echo "0")
+          
+          if [ "$CRITICAL_COUNT" -gt 0 ]; then
+            echo "❌ POLICY VIOLATION: $CRITICAL_COUNT critical vulnerabilities found"
+            jq --arg status "FAIL" --arg reason "Critical vulnerabilities detected" \
+              '.policy_check = {status: $status, reason: $reason, critical_count: ('$CRITICAL_COUNT')}' \
+              security-results/scan-summary.json > security-results/scan-summary.tmp && mv security-results/scan-summary.tmp security-results/scan-summary.json
+          elif [ "$HIGH_COUNT" -gt 5 ]; then
+            echo "⚠️  POLICY WARNING: $HIGH_COUNT high vulnerabilities found (threshold: 5)"
+            jq --arg status "WARN" --arg reason "High vulnerability count exceeds threshold" \
+              '.policy_check = {status: $status, reason: $reason, high_count: ('$HIGH_COUNT')}' \
+              security-results/scan-summary.json > security-results/scan-summary.tmp && mv security-results/scan-summary.tmp security-results/scan-summary.json
+          else
+            echo "✅ Security policy check passed"
+            jq --arg status "PASS" --arg reason "No critical policy violations" \
+              '.policy_check = {status: $status, reason: $reason}' \
+              security-results/scan-summary.json > security-results/scan-summary.tmp && mv security-results/scan-summary.tmp security-results/scan-summary.json
+          fi
+        fi
+
+  post_build:
+    commands:
+      - echo "=== POST-BUILD PHASE ==="
+      - echo "Build completed on $(date)"
+      
+      # Push image to ECR (only if security checks pass)
+      - |
+        POLICY_STATUS=$(jq -r '.policy_check.status // "UNKNOWN"' security-results/scan-summary.json)
+        if [ "$POLICY_STATUS" != "FAIL" ]; then
+          echo "✅ Security checks passed, pushing image to ECR..."
+          docker push $ECR_URI:$IMAGE_TAG
+          echo "✅ Image pushed successfully: $ECR_URI:$IMAGE_TAG"
+        else
+          echo "❌ Security checks failed, image will not be pushed"
+          exit 1
+        fi
+      
+      # Wait for ECR enhanced scanning to complete
+      - |
+        echo "⏳ Waiting for ECR enhanced scanning to complete..."
+        sleep 30
+        
+        # Check scan status
+        SCAN_STATUS=$(aws ecr describe-image-scan-findings \
+          --repository-name $ECR_REPO_NAME \
+          --image-id imageTag=$IMAGE_TAG \
+          --query 'imageScanStatus.status' \
+          --output text 2>/dev/null || echo "IN_PROGRESS")
+        
+        echo "ECR scan status: $SCAN_STATUS"
+        
+        # Wait up to 5 minutes for scan completion
+        TIMEOUT=300
+        ELAPSED=0
+        while [ "$SCAN_STATUS" = "IN_PROGRESS" ] && [ $ELAPSED -lt $TIMEOUT ]; do
+          sleep 30
+          ELAPSED=$((ELAPSED + 30))
+          SCAN_STATUS=$(aws ecr describe-image-scan-findings \
+            --repository-name $ECR_REPO_NAME \
+            --image-id imageTag=$IMAGE_TAG \
+            --query 'imageScanStatus.status' \
+            --output text 2>/dev/null || echo "IN_PROGRESS")
+          echo "ECR scan status: $SCAN_STATUS (elapsed: ${ELAPSED}s)"
+        done
+      
+      # Get ECR scan results
+      - |
+        if [ "$SCAN_STATUS" = "COMPLETE" ]; then
+          echo "✅ ECR enhanced scanning completed"
+          aws ecr describe-image-scan-findings \
+            --repository-name $ECR_REPO_NAME \
+            --image-id imageTag=$IMAGE_TAG > security-results/ecr-scan-results.json || true
+          
+          if [ -f security-results/ecr-scan-results.json ]; then
+            # Extract finding counts
+            ECR_CRITICAL=$(jq -r '.imageScanFindings.findingCounts.CRITICAL // 0' security-results/ecr-scan-results.json)
+            ECR_HIGH=$(jq -r '.imageScanFindings.findingCounts.HIGH // 0' security-results/ecr-scan-results.json)
+            ECR_MEDIUM=$(jq -r '.imageScanFindings.findingCounts.MEDIUM // 0' security-results/ecr-scan-results.json)
+            ECR_LOW=$(jq -r '.imageScanFindings.findingCounts.LOW // 0' security-results/ecr-scan-results.json)
+            
+            echo "ECR scan results - Critical: $ECR_CRITICAL, High: $ECR_HIGH, Medium: $ECR_MEDIUM, Low: $ECR_LOW"
+            
+            # Update scan summary
+            jq --arg critical "$ECR_CRITICAL" --arg high "$ECR_HIGH" --arg medium "$ECR_MEDIUM" --arg low "$ECR_LOW" \
+              '.scan_results.ecr = {critical: ($critical | tonumber), high: ($high | tonumber), medium: ($medium | tonumber), low: ($low | tonumber)}' \
+              security-results/scan-summary.json > security-results/scan-summary.tmp && mv security-results/scan-summary.tmp security-results/scan-summary.json
+          fi
+        else
+          echo "⚠️  ECR scan did not complete within timeout"
+        fi
+      
+      # Generate final security report
+      - |
+        echo "📊 Generating final security report..."
+        
+        # Add metadata to summary
+        jq --arg image_uri "$ECR_URI:$IMAGE_TAG" \
+           --arg build_id "$CODEBUILD_BUILD_ID" \
+           --arg commit_id "${CODEBUILD_RESOLVED_SOURCE_VERSION:-unknown}" \
+           '.metadata = {image_uri: $image_uri, build_id: $build_id, commit_id: $commit_id}' \
+           security-results/scan-summary.json > security-results/scan-summary.tmp && mv security-results/scan-summary.tmp security-results/scan-summary.json
+        
+        # Display summary
+        echo "=== SECURITY SCAN SUMMARY ==="
+        cat security-results/scan-summary.json | jq '.'
+        
+        # Create human-readable report
+        echo "=== SECURITY SCAN REPORT ===" > security-results/security-report.txt
+        echo "Image: $ECR_URI:$IMAGE_TAG" >> security-results/security-report.txt
+        echo "Build ID: $CODEBUILD_BUILD_ID" >> security-results/security-report.txt
+        echo "Commit: ${CODEBUILD_RESOLVED_SOURCE_VERSION:-unknown}" >> security-results/security-report.txt
+        echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> security-results/security-report.txt
+        echo "" >> security-results/security-report.txt
+        
+        if [ -f security-results/scan-summary.json ]; then
+          echo "VULNERABILITY SUMMARY:" >> security-results/security-report.txt
+          jq -r '.scan_results | to_entries[] | "\(.key | ascii_upcase): Critical=\(.value.critical), High=\(.value.high), Medium=\(.value.medium), Low=\(.value.low)"' security-results/scan-summary.json >> security-results/security-report.txt
+          echo "" >> security-results/security-report.txt
+          
+          echo "POLICY CHECK:" >> security-results/security-report.txt
+          jq -r '.policy_check | "Status: \(.status), Reason: \(.reason)"' security-results/scan-summary.json >> security-results/security-report.txt
+        fi
+        
+        echo "✅ Security scanning pipeline completed"
+
+artifacts:
+  files:
+    - security-results/**/*
+  name: SecurityScanResults

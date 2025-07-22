@@ -1,0 +1,1983 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'API Composition with Step Functions and API Gateway - Complete serverless orchestration solution for microservices'
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: api-composition
+    Description: Project name used for resource naming and tagging
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: Must start with lowercase letter, contain only lowercase letters, numbers, and hyphens
+    MinLength: 3
+    MaxLength: 32
+
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment name (dev, test, prod)
+    AllowedValues:
+      - dev
+      - test
+      - prod
+
+  ApiStage:
+    Type: String
+    Default: v1
+    Description: API Gateway deployment stage name
+    AllowedPattern: '^[a-zA-Z0-9-_]+$'
+    MinLength: 1
+    MaxLength: 32
+
+  DynamoDBReadCapacity:
+    Type: Number
+    Default: 5
+    Description: DynamoDB read capacity units for tables
+    MinValue: 1
+    MaxValue: 100
+
+  DynamoDBWriteCapacity:
+    Type: Number
+    Default: 5
+    Description: DynamoDB write capacity units for tables
+    MinValue: 1
+    MaxValue: 100
+
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    Description: Enable detailed monitoring and logging
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 128
+    Description: Memory allocation for Lambda functions (MB)
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    Description: Lambda function timeout in seconds
+    MinValue: 3
+    MaxValue: 900
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  EnableMonitoring: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  UseProvisionedCapacity: !Equals [!Ref Environment, 'prod']
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # ---------------------------------------------------------------------------
+  # DynamoDB Tables
+  # ---------------------------------------------------------------------------
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-orders'
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserIdIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: orderId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - UseProvisionedCapacity
+            - ReadCapacityUnits: !Ref DynamoDBReadCapacity
+              WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+            - !Ref AWS::NoValue
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: orderId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - UseProvisionedCapacity
+            - ReadCapacityUnits: !Ref DynamoDBReadCapacity
+              WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+            - !Ref AWS::NoValue
+      BillingMode: !If
+        - UseProvisionedCapacity
+        - PROVISIONED
+        - PAY_PER_REQUEST
+      ProvisionedThroughput: !If
+        - UseProvisionedCapacity
+        - ReadCapacityUnits: !Ref DynamoDBReadCapacity
+          WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+        - !Ref AWS::NoValue
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+        KMSMasterKeyId: alias/aws/dynamodb
+      StreamSpecification: !If
+        - EnableMonitoring
+        - StreamViewType: NEW_AND_OLD_IMAGES
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-orders'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Order storage and tracking
+
+  AuditTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-audit'
+      AttributeDefinitions:
+        - AttributeName: auditId
+          AttributeType: S
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: auditId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: OrderIdIndex
+          KeySchema:
+            - AttributeName: orderId
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - UseProvisionedCapacity
+            - ReadCapacityUnits: !Ref DynamoDBReadCapacity
+              WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+            - !Ref AWS::NoValue
+      BillingMode: !If
+        - UseProvisionedCapacity
+        - PROVISIONED
+        - PAY_PER_REQUEST
+      ProvisionedThroughput: !If
+        - UseProvisionedCapacity
+        - ReadCapacityUnits: !Ref DynamoDBReadCapacity
+          WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+        - !Ref AWS::NoValue
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+        KMSMasterKeyId: alias/aws/dynamodb
+      TimeToLiveSpecification: !If
+        - IsProduction
+        - !Ref AWS::NoValue
+        - AttributeName: ttl
+          Enabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-audit'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Audit trail and compliance logging
+
+  ReservationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-reservations'
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: orderId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - UseProvisionedCapacity
+            - ReadCapacityUnits: !Ref DynamoDBReadCapacity
+              WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+            - !Ref AWS::NoValue
+      BillingMode: !If
+        - UseProvisionedCapacity
+        - PROVISIONED
+        - PAY_PER_REQUEST
+      ProvisionedThroughput: !If
+        - UseProvisionedCapacity
+        - ReadCapacityUnits: !Ref DynamoDBReadCapacity
+          WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+        - !Ref AWS::NoValue
+      SSESpecification:
+        SSEEnabled: true
+        KMSMasterKeyId: alias/aws/dynamodb
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-reservations'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Inventory reservations for order processing
+
+  # ---------------------------------------------------------------------------
+  # IAM Roles and Policies
+  # ---------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt OrdersTable.Arn
+                  - !GetAtt AuditTable.Arn
+                  - !GetAtt ReservationsTable.Arn
+                  - !Sub '${OrdersTable.Arn}/index/*'
+                  - !Sub '${AuditTable.Arn}/index/*'
+                  - !Sub '${ReservationsTable.Arn}/index/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-lambda-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-stepfunctions-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt UserValidationFunction.Arn
+                  - !GetAtt InventoryServiceFunction.Arn
+                  - !GetAtt PaymentServiceFunction.Arn
+                  - !GetAtt ShippingServiceFunction.Arn
+                  - !GetAtt NotificationServiceFunction.Arn
+        - PolicyName: DynamoDBDirectAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt OrdersTable.Arn
+                  - !GetAtt AuditTable.Arn
+                  - !GetAtt ReservationsTable.Arn
+                  - !Sub '${OrdersTable.Arn}/index/*'
+                  - !Sub '${AuditTable.Arn}/index/*'
+                  - !Sub '${ReservationsTable.Arn}/index/*'
+        - PolicyName: LogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+        - PolicyName: XRayPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-stepfunctions-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  APIGatewayExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-apigateway-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                  - states:DescribeExecution
+                  - states:StopExecution
+                Resource: !Ref OrderProcessingStateMachine
+        - PolicyName: DynamoDBReadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt OrdersTable.Arn
+                  - !Sub '${OrdersTable.Arn}/index/*'
+        - PolicyName: LogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-apigateway-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # Lambda Functions (Microservices)
+  # ---------------------------------------------------------------------------
+  UserValidationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-user-service'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref OrdersTable
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: !If [EnableMonitoring, DEBUG, INFO]
+      TracingConfig:
+        Mode: !If [EnableMonitoring, Active, PassThrough]
+      Code:
+        ZipFile: |
+          import json
+          import random
+          import logging
+          import os
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+
+          def lambda_handler(event, context):
+              """
+              User validation service that validates user credentials and retrieves user data.
+              Implements business logic for user authentication and authorization.
+              """
+              try:
+                  logger.info(f"Processing user validation request: {event}")
+                  
+                  user_id = event.get('userId', '')
+                  
+                  # Input validation
+                  if not user_id or len(user_id) < 3:
+                      logger.warning(f"Invalid user ID provided: {user_id}")
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({
+                              'valid': False,
+                              'error': 'Invalid user ID - must be at least 3 characters',
+                              'userId': user_id
+                          })
+                      }
+                  
+                  # Simulate user validation logic
+                  # In production, this would query user database or identity provider
+                  if user_id.startswith('invalid') or user_id == 'xx':
+                      logger.info(f"User validation failed for: {user_id}")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'valid': False,
+                              'error': 'User not found or inactive',
+                              'userId': user_id
+                          })
+                      }
+                  
+                  # Generate mock user data
+                  user_data = {
+                      'valid': True,
+                      'userId': user_id,
+                      'name': f'User {user_id}',
+                      'email': f'{user_id}@example.com',
+                      'creditLimit': random.randint(1000, 5000),
+                      'tier': random.choice(['bronze', 'silver', 'gold', 'platinum']),
+                      'verified': True
+                  }
+                  
+                  logger.info(f"User validation successful for: {user_id}")
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(user_data)
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in user validation: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'valid': False,
+                          'error': 'Internal service error',
+                          'details': str(e)
+                      })
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-user-service'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Service
+          Value: user-validation
+
+  InventoryServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-inventory-service'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          RESERVATIONS_TABLE: !Ref ReservationsTable
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: !If [EnableMonitoring, DEBUG, INFO]
+      TracingConfig:
+        Mode: !If [EnableMonitoring, Active, PassThrough]
+      Code:
+        ZipFile: |
+          import json
+          import random
+          import logging
+          import os
+          from decimal import Decimal
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+
+          def lambda_handler(event, context):
+              """
+              Inventory service that checks product availability and calculates pricing.
+              Implements inventory management and reservation logic.
+              """
+              try:
+                  logger.info(f"Processing inventory check request: {event}")
+                  
+                  items = event.get('items', [])
+                  
+                  if not items:
+                      logger.warning("No items provided for inventory check")
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({
+                              'allItemsAvailable': False,
+                              'error': 'No items provided',
+                              'inventoryStatus': []
+                          })
+                      }
+                  
+                  inventory_status = []
+                  total_cost = Decimal('0')
+                  
+                  for item in items:
+                      product_id = item.get('productId', '')
+                      requested_qty = item.get('quantity', 0)
+                      
+                      # Simulate inventory lookup
+                      available_qty = random.randint(0, 100)
+                      unit_price = Decimal(str(random.randint(10, 500)))
+                      
+                      # Determine availability
+                      sufficient = available_qty >= requested_qty
+                      
+                      item_status = {
+                          'productId': product_id,
+                          'requested': requested_qty,
+                          'available': available_qty,
+                          'sufficient': sufficient,
+                          'unitPrice': float(unit_price),
+                          'totalPrice': float(unit_price * requested_qty),
+                          'category': random.choice(['electronics', 'clothing', 'books', 'home'])
+                      }
+                      
+                      inventory_status.append(item_status)
+                      
+                      if sufficient:
+                          total_cost += unit_price * requested_qty
+                      
+                      logger.debug(f"Inventory check for {product_id}: {item_status}")
+                  
+                  all_available = all(item['sufficient'] for item in inventory_status)
+                  
+                  response_data = {
+                      'inventoryStatus': inventory_status,
+                      'allItemsAvailable': all_available,
+                      'totalCost': float(total_cost),
+                      'itemCount': len(items),
+                      'checkedAt': context.aws_request_id
+                  }
+                  
+                  logger.info(f"Inventory check complete. All available: {all_available}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(response_data)
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in inventory service: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'allItemsAvailable': False,
+                          'error': 'Internal inventory service error',
+                          'details': str(e)
+                      })
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-inventory-service'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Service
+          Value: inventory-management
+
+  PaymentServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-payment-service'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: !If [EnableMonitoring, DEBUG, INFO]
+      TracingConfig:
+        Mode: !If [EnableMonitoring, Active, PassThrough]
+      Code:
+        ZipFile: |
+          import json
+          import random
+          import logging
+          import os
+          from decimal import Decimal
+          import uuid
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+
+          def lambda_handler(event, context):
+              """
+              Payment processing service that handles payment authorization and capture.
+              Implements payment gateway integration and fraud detection logic.
+              """
+              try:
+                  logger.info(f"Processing payment request: {event}")
+                  
+                  order_id = event.get('orderId', '')
+                  user_info = event.get('userInfo', {})
+                  amount = Decimal(str(event.get('amount', 0)))
+                  
+                  if not order_id or amount <= 0:
+                      logger.warning(f"Invalid payment request - Order: {order_id}, Amount: {amount}")
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({
+                              'success': False,
+                              'error': 'Invalid order ID or amount',
+                              'orderId': order_id
+                          })
+                      }
+                  
+                  # Simulate payment processing logic
+                  transaction_id = str(uuid.uuid4())
+                  
+                  # Simulate payment gateway response (90% success rate)
+                  payment_success = random.random() > 0.1
+                  
+                  if payment_success:
+                      response_data = {
+                          'success': True,
+                          'transactionId': transaction_id,
+                          'orderId': order_id,
+                          'amount': float(amount),
+                          'status': 'authorized',
+                          'paymentMethod': 'credit_card',
+                          'authCode': f'AUTH{random.randint(100000, 999999)}',
+                          'processedAt': context.aws_request_id
+                      }
+                      logger.info(f"Payment authorized for order {order_id}: {transaction_id}")
+                  else:
+                      response_data = {
+                          'success': False,
+                          'transactionId': transaction_id,
+                          'orderId': order_id,
+                          'amount': float(amount),
+                          'status': 'declined',
+                          'error': 'Payment declined by payment processor',
+                          'errorCode': random.choice(['INSUFFICIENT_FUNDS', 'EXPIRED_CARD', 'FRAUD_DETECTED'])
+                      }
+                      logger.warning(f"Payment declined for order {order_id}: {response_data['errorCode']}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(response_data)
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in payment service: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'success': False,
+                          'error': 'Internal payment service error',
+                          'details': str(e)
+                      })
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-payment-service'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Service
+          Value: payment-processing
+
+  ShippingServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-shipping-service'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: !If [EnableMonitoring, DEBUG, INFO]
+      TracingConfig:
+        Mode: !If [EnableMonitoring, Active, PassThrough]
+      Code:
+        ZipFile: |
+          import json
+          import random
+          import logging
+          import os
+          import uuid
+          from datetime import datetime, timedelta
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+
+          def lambda_handler(event, context):
+              """
+              Shipping service that creates shipping labels and calculates delivery estimates.
+              Implements logistics and carrier integration logic.
+              """
+              try:
+                  logger.info(f"Processing shipping request: {event}")
+                  
+                  order_id = event.get('orderId', '')
+                  user_info = event.get('userInfo', {})
+                  items = event.get('items', [])
+                  
+                  if not order_id or not items:
+                      logger.warning(f"Invalid shipping request - Order: {order_id}, Items: {len(items)}")
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({
+                              'success': False,
+                              'error': 'Invalid order ID or no items provided',
+                              'orderId': order_id
+                          })
+                      }
+                  
+                  # Generate shipping details
+                  tracking_number = f'TRACK{random.randint(1000000000, 9999999999)}'
+                  carrier = random.choice(['UPS', 'FedEx', 'USPS', 'DHL'])
+                  shipping_method = random.choice(['standard', 'expedited', 'overnight'])
+                  
+                  # Calculate estimated delivery
+                  business_days = {
+                      'standard': random.randint(5, 7),
+                      'expedited': random.randint(2, 3),
+                      'overnight': 1
+                  }
+                  
+                  estimated_delivery = datetime.now() + timedelta(days=business_days[shipping_method])
+                  
+                  # Calculate shipping cost based on items and method
+                  base_cost = sum(item.get('quantity', 0) for item in items) * 2.5
+                  method_multipliers = {'standard': 1.0, 'expedited': 1.5, 'overnight': 3.0}
+                  shipping_cost = base_cost * method_multipliers[shipping_method]
+                  
+                  response_data = {
+                      'success': True,
+                      'orderId': order_id,
+                      'trackingNumber': tracking_number,
+                      'carrier': carrier,
+                      'shippingMethod': shipping_method,
+                      'estimatedDelivery': estimated_delivery.isoformat(),
+                      'shippingCost': round(shipping_cost, 2),
+                      'labelUrl': f'https://shipping-labels.example.com/{tracking_number}.pdf',
+                      'status': 'label_created',
+                      'createdAt': context.aws_request_id
+                  }
+                  
+                  logger.info(f"Shipping label created for order {order_id}: {tracking_number}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(response_data)
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in shipping service: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'success': False,
+                          'error': 'Internal shipping service error',
+                          'details': str(e)
+                      })
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-shipping-service'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Service
+          Value: shipping-logistics
+
+  NotificationServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-notification-service'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: !If [EnableMonitoring, DEBUG, INFO]
+      TracingConfig:
+        Mode: !If [EnableMonitoring, Active, PassThrough]
+      Code:
+        ZipFile: |
+          import json
+          import random
+          import logging
+          import os
+          import uuid
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+
+          def lambda_handler(event, context):
+              """
+              Notification service that sends order confirmations and updates.
+              Implements multi-channel communication (email, SMS, push notifications).
+              """
+              try:
+                  logger.info(f"Processing notification request: {event}")
+                  
+                  order_id = event.get('orderId', '')
+                  user_info = event.get('userInfo', {})
+                  notification_type = event.get('type', 'order_confirmation')
+                  
+                  if not order_id:
+                      logger.warning(f"Invalid notification request - Order: {order_id}")
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({
+                              'success': False,
+                              'error': 'Invalid order ID',
+                              'orderId': order_id
+                          })
+                      }
+                  
+                  user_email = user_info.get('email', 'customer@example.com')
+                  user_name = user_info.get('name', 'Valued Customer')
+                  
+                  # Generate notification IDs
+                  email_id = str(uuid.uuid4())
+                  sms_id = str(uuid.uuid4())
+                  
+                  # Simulate notification sending (95% success rate)
+                  notifications_sent = []
+                  
+                  # Email notification
+                  if random.random() > 0.05:
+                      notifications_sent.append({
+                          'channel': 'email',
+                          'recipient': user_email,
+                          'messageId': email_id,
+                          'status': 'sent',
+                          'subject': f'Order Confirmation - {order_id}'
+                      })
+                      logger.info(f"Email notification sent to {user_email}")
+                  else:
+                      notifications_sent.append({
+                          'channel': 'email',
+                          'recipient': user_email,
+                          'messageId': email_id,
+                          'status': 'failed',
+                          'error': 'Email delivery failed'
+                      })
+                  
+                  # SMS notification (if phone number available)
+                  if random.random() > 0.1:  # 90% success rate
+                      notifications_sent.append({
+                          'channel': 'sms',
+                          'recipient': '+1555-555-0123',  # Mock phone number
+                          'messageId': sms_id,
+                          'status': 'sent',
+                          'message': f'Your order {order_id} has been confirmed!'
+                      })
+                      logger.info(f"SMS notification sent for order {order_id}")
+                  
+                  response_data = {
+                      'success': True,
+                      'orderId': order_id,
+                      'notificationType': notification_type,
+                      'notificationsSent': notifications_sent,
+                      'totalSent': len([n for n in notifications_sent if n['status'] == 'sent']),
+                      'processedAt': context.aws_request_id
+                  }
+                  
+                  logger.info(f"Notifications processed for order {order_id}: {len(notifications_sent)} sent")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(response_data)
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in notification service: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'success': False,
+                          'error': 'Internal notification service error',
+                          'details': str(e)
+                      })
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-notification-service'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Service
+          Value: customer-notifications
+
+  # ---------------------------------------------------------------------------
+  # Step Functions State Machine
+  # ---------------------------------------------------------------------------
+  OrderProcessingStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-${Environment}-order-processing'
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      TracingConfiguration: !If
+        - EnableMonitoring
+        - Enabled: true
+        - !Ref AWS::NoValue
+      LoggingConfiguration: !If
+        - EnableMonitoring
+        - Level: ALL
+          IncludeExecutionData: true
+          Destinations:
+            - CloudWatchLogsLogGroup:
+                LogGroupArn: !GetAtt StepFunctionsLogGroup.Arn
+        - !Ref AWS::NoValue
+      DefinitionString: !Sub |
+        {
+          "Comment": "Enhanced Order Processing Workflow with API Composition and Error Handling",
+          "StartAt": "ValidateOrder",
+          "States": {
+            "ValidateOrder": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${UserValidationFunction}",
+                "Payload": {
+                  "userId.$": "$.userId",
+                  "requestId.$": "$$.Execution.Name"
+                }
+              },
+              "ResultPath": "$.userValidation",
+              "Next": "CheckUserValid",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "CompensateOrder",
+                  "ResultPath": "$.error"
+                }
+              ]
+            },
+            "CheckUserValid": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.userValidation.Payload.body",
+                  "StringMatches": "*\"valid\":true*",
+                  "Next": "CheckInventory"
+                }
+              ],
+              "Default": "CompensateOrder"
+            },
+            "CheckInventory": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${InventoryServiceFunction}",
+                "Payload": {
+                  "items.$": "$.items",
+                  "orderId.$": "$.orderId",
+                  "requestId.$": "$$.Execution.Name"
+                }
+              },
+              "ResultPath": "$.inventoryCheck",
+              "Next": "ProcessInventoryResult",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "CompensateOrder",
+                  "ResultPath": "$.error"
+                }
+              ]
+            },
+            "ProcessInventoryResult": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.inventoryCheck.Payload.body",
+                  "StringMatches": "*\"allItemsAvailable\":true*",
+                  "Next": "CalculateOrderTotal"
+                }
+              ],
+              "Default": "CompensateOrder"
+            },
+            "CalculateOrderTotal": {
+              "Type": "Pass",
+              "Parameters": {
+                "orderId.$": "$.orderId",
+                "userId.$": "$.userId",
+                "items.$": "$.items",
+                "userInfo.$": "$.userValidation.Payload.body",
+                "inventoryInfo.$": "$.inventoryCheck.Payload.body",
+                "orderTotal.$": "$.inventoryCheck.Payload.body",
+                "status": "processing",
+                "processedAt.$": "$$.State.EnteredTime"
+              },
+              "Next": "ReserveInventory"
+            },
+            "ReserveInventory": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:putItem",
+              "Parameters": {
+                "TableName": "${ReservationsTable}",
+                "Item": {
+                  "orderId": {
+                    "S.$": "$.orderId"
+                  },
+                  "status": {
+                    "S": "reserved"
+                  },
+                  "items": {
+                    "S.$": "States.JsonToString($.items)"
+                  },
+                  "timestamp": {
+                    "S.$": "$$.State.EnteredTime"
+                  },
+                  "ttl": {
+                    "N": "1800"
+                  }
+                }
+              },
+              "ResultPath": "$.reservation",
+              "Next": "ProcessPayment",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "CompensateOrder",
+                  "ResultPath": "$.error"
+                }
+              ]
+            },
+            "ProcessPayment": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${PaymentServiceFunction}",
+                "Payload": {
+                  "orderId.$": "$.orderId",
+                  "userInfo.$": "$.userInfo",
+                  "amount.$": "$.inventoryInfo.totalCost",
+                  "requestId.$": "$$.Execution.Name"
+                }
+              },
+              "ResultPath": "$.paymentResult",
+              "Next": "CheckPaymentSuccess",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "ReleaseReservation",
+                  "ResultPath": "$.error"
+                }
+              ]
+            },
+            "CheckPaymentSuccess": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.paymentResult.Payload.body",
+                  "StringMatches": "*\"success\":true*",
+                  "Next": "ParallelProcessing"
+                }
+              ],
+              "Default": "ReleaseReservation"
+            },
+            "ParallelProcessing": {
+              "Type": "Parallel",
+              "Branches": [
+                {
+                  "StartAt": "SaveOrder",
+                  "States": {
+                    "SaveOrder": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::dynamodb:putItem",
+                      "Parameters": {
+                        "TableName": "${OrdersTable}",
+                        "Item": {
+                          "orderId": {
+                            "S.$": "$.orderId"
+                          },
+                          "userId": {
+                            "S.$": "$.userId"
+                          },
+                          "status": {
+                            "S": "processing"
+                          },
+                          "orderTotal": {
+                            "N.$": "States.Format('{}', $.inventoryInfo.totalCost)"
+                          },
+                          "items": {
+                            "S.$": "States.JsonToString($.items)"
+                          },
+                          "userInfo": {
+                            "S.$": "States.JsonToString($.userInfo)"
+                          },
+                          "paymentInfo": {
+                            "S.$": "States.JsonToString($.paymentResult.Payload.body)"
+                          },
+                          "timestamp": {
+                            "S.$": "$$.State.EnteredTime"
+                          }
+                        }
+                      },
+                      "End": true
+                    }
+                  }
+                },
+                {
+                  "StartAt": "CreateShipping",
+                  "States": {
+                    "CreateShipping": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${ShippingServiceFunction}",
+                        "Payload": {
+                          "orderId.$": "$.orderId",
+                          "userInfo.$": "$.userInfo",
+                          "items.$": "$.items",
+                          "requestId.$": "$$.Execution.Name"
+                        }
+                      },
+                      "ResultPath": "$.shippingResult",
+                      "End": true,
+                      "Retry": [
+                        {
+                          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                          "IntervalSeconds": 1,
+                          "MaxAttempts": 2,
+                          "BackoffRate": 2.0
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "StartAt": "SendNotifications",
+                  "States": {
+                    "SendNotifications": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${NotificationServiceFunction}",
+                        "Payload": {
+                          "orderId.$": "$.orderId",
+                          "userInfo.$": "$.userInfo",
+                          "type": "order_confirmation",
+                          "requestId.$": "$$.Execution.Name"
+                        }
+                      },
+                      "ResultPath": "$.notificationResult",
+                      "End": true,
+                      "Retry": [
+                        {
+                          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                          "IntervalSeconds": 1,
+                          "MaxAttempts": 2,
+                          "BackoffRate": 2.0
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "StartAt": "LogAudit",
+                  "States": {
+                    "LogAudit": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::dynamodb:putItem",
+                      "Parameters": {
+                        "TableName": "${AuditTable}",
+                        "Item": {
+                          "auditId": {
+                            "S.$": "$$.Execution.Name"
+                          },
+                          "orderId": {
+                            "S.$": "$.orderId"
+                          },
+                          "action": {
+                            "S": "order_created"
+                          },
+                          "status": {
+                            "S": "success"
+                          },
+                          "details": {
+                            "S.$": "States.JsonToString($.inventoryInfo)"
+                          },
+                          "timestamp": {
+                            "S.$": "$$.State.EnteredTime"
+                          }
+                        }
+                      },
+                      "End": true
+                    }
+                  }
+                }
+              ],
+              "Next": "UpdateOrderStatus",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "ReleaseReservation",
+                  "ResultPath": "$.parallelError"
+                }
+              ]
+            },
+            "UpdateOrderStatus": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:updateItem",
+              "Parameters": {
+                "TableName": "${OrdersTable}",
+                "Key": {
+                  "orderId": {
+                    "S.$": "$.orderId"
+                  }
+                },
+                "UpdateExpression": "SET #status = :status, #completedAt = :completedAt",
+                "ExpressionAttributeNames": {
+                  "#status": "status",
+                  "#completedAt": "completedAt"
+                },
+                "ExpressionAttributeValues": {
+                  ":status": {
+                    "S": "completed"
+                  },
+                  ":completedAt": {
+                    "S.$": "$$.State.EnteredTime"
+                  }
+                }
+              },
+              "Next": "OrderProcessed"
+            },
+            "OrderProcessed": {
+              "Type": "Pass",
+              "Parameters": {
+                "orderId.$": "$.orderId",
+                "status": "completed",
+                "message": "Order processed successfully",
+                "orderTotal.$": "$.inventoryInfo.totalCost",
+                "processedAt.$": "$$.State.EnteredTime"
+              },
+              "End": true
+            },
+            "ReleaseReservation": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:deleteItem",
+              "Parameters": {
+                "TableName": "${ReservationsTable}",
+                "Key": {
+                  "orderId": {
+                    "S.$": "$.orderId"
+                  }
+                }
+              },
+              "ResultPath": "$.releaseResult",
+              "Next": "CompensateOrder"
+            },
+            "CompensateOrder": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:putItem",
+              "Parameters": {
+                "TableName": "${AuditTable}",
+                "Item": {
+                  "auditId": {
+                    "S.$": "$$.Execution.Name"
+                  },
+                  "orderId": {
+                    "S.$": "$.orderId"
+                  },
+                  "action": {
+                    "S": "order_failed"
+                  },
+                  "status": {
+                    "S": "error"
+                  },
+                  "error": {
+                    "S.$": "States.JsonToString($.error)"
+                  },
+                  "timestamp": {
+                    "S.$": "$$.State.EnteredTime"
+                  }
+                }
+              },
+              "Next": "OrderFailed"
+            },
+            "OrderFailed": {
+              "Type": "Pass",
+              "Parameters": {
+                "orderId.$": "$.orderId",
+                "status": "failed",
+                "message": "Order processing failed",
+                "error.$": "$.error",
+                "failedAt.$": "$$.State.EnteredTime"
+              },
+              "End": true
+            }
+          }
+        }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-order-processing'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Order orchestration and workflow management
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Log Groups
+  # ---------------------------------------------------------------------------
+  StepFunctionsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableMonitoring
+    Properties:
+      LogGroupName: !Sub '/aws/stepfunctions/${ProjectName}-${Environment}-order-processing'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      KmsKeyId: !If [IsProduction, !Ref LogsKMSKey, !Ref AWS::NoValue]
+
+  APIGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableMonitoring
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}-${Environment}-composition-api'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      KmsKeyId: !If [IsProduction, !Ref LogsKMSKey, !Ref AWS::NoValue]
+
+  LogsKMSKey:
+    Type: AWS::KMS::Key
+    Condition: IsProduction
+    Properties:
+      Description: KMS key for encrypting CloudWatch logs
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+
+  LogsKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: IsProduction
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-${Environment}-logs'
+      TargetKeyId: !Ref LogsKMSKey
+
+  # ---------------------------------------------------------------------------
+  # API Gateway
+  # ---------------------------------------------------------------------------
+  CompositionAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-composition-api'
+      Description: API Composition with Step Functions and API Gateway
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: execute-api:Invoke
+            Resource: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:*'
+            Condition:
+              IpAddress:
+                aws:SourceIp:
+                  - '0.0.0.0/0'  # In production, restrict to specific IP ranges
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-composition-api'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # API Gateway Resources
+  OrdersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CompositionAPI
+      ParentId: !GetAtt CompositionAPI.RootResourceId
+      PathPart: orders
+
+  OrderIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CompositionAPI
+      ParentId: !Ref OrdersResource
+      PathPart: '{orderId}'
+
+  StatusResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CompositionAPI
+      ParentId: !Ref OrderIdResource
+      PathPart: status
+
+  # API Gateway Methods
+  OrdersPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CompositionAPI
+      ResourceId: !Ref OrdersResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      RequestValidatorId: !Ref OrderRequestValidator
+      RequestModels:
+        application/json: !Ref OrderRequestModel
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:states:action/StartExecution'
+        Credentials: !GetAtt APIGatewayExecutionRole.Arn
+        RequestTemplates:
+          application/json: !Sub |
+            {
+              "input": "$util.escapeJavaScript($input.json('$'))",
+              "stateMachineArn": "${OrderProcessingStateMachine}"
+            }
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseTemplates:
+              application/json: |
+                {
+                  "executionArn": "$input.json('$.executionArn')",
+                  "status": "started",
+                  "message": "Order processing started successfully"
+                }
+          - StatusCode: '400'
+            SelectionPattern: '4\d{2}'
+            ResponseTemplates:
+              application/json: |
+                {
+                  "error": "Bad Request",
+                  "message": "Invalid request format"
+                }
+          - StatusCode: '500'
+            SelectionPattern: '5\d{2}'
+            ResponseTemplates:
+              application/json: |
+                {
+                  "error": "Internal Server Error",
+                  "message": "Failed to start order processing"
+                }
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: !Ref OrderResponseModel
+        - StatusCode: '400'
+          ResponseModels:
+            application/json: !Ref ErrorResponseModel
+        - StatusCode: '500'
+          ResponseModels:
+            application/json: !Ref ErrorResponseModel
+
+  StatusGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CompositionAPI
+      ResourceId: !Ref StatusResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.orderId: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:dynamodb:action/GetItem'
+        Credentials: !GetAtt APIGatewayExecutionRole.Arn
+        RequestTemplates:
+          application/json: !Sub |
+            {
+              "TableName": "${OrdersTable}",
+              "Key": {
+                "orderId": {
+                  "S": "$input.params('orderId')"
+                }
+              }
+            }
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseTemplates:
+              application/json: |
+                #if($input.json('$.Item') != "")
+                {
+                  "orderId": "$input.json('$.Item.orderId.S')",
+                  "status": "$input.json('$.Item.status.S')",
+                  "orderTotal": $input.json('$.Item.orderTotal.N'),
+                  "timestamp": "$input.json('$.Item.timestamp.S')"
+                }
+                #else
+                {
+                  "error": "Order not found",
+                  "orderId": "$input.params('orderId')"
+                }
+                #end
+          - StatusCode: '404'
+            SelectionPattern: '.*"Item":\s*\{\s*\}.*'
+            ResponseTemplates:
+              application/json: |
+                {
+                  "error": "Order not found",
+                  "orderId": "$input.params('orderId')"
+                }
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: !Ref StatusResponseModel
+        - StatusCode: '404'
+          ResponseModels:
+            application/json: !Ref ErrorResponseModel
+
+  # Request/Response Models
+  OrderRequestModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref CompositionAPI
+      ContentType: application/json
+      Name: OrderRequest
+      Schema:
+        $schema: http://json-schema.org/draft-04/schema#
+        type: object
+        required:
+          - orderId
+          - userId
+          - items
+        properties:
+          orderId:
+            type: string
+            minLength: 1
+            maxLength: 100
+            pattern: '^[a-zA-Z0-9-_]+$'
+          userId:
+            type: string
+            minLength: 1
+            maxLength: 100
+          items:
+            type: array
+            minItems: 1
+            maxItems: 50
+            items:
+              type: object
+              required:
+                - productId
+                - quantity
+              properties:
+                productId:
+                  type: string
+                  minLength: 1
+                  maxLength: 100
+                quantity:
+                  type: integer
+                  minimum: 1
+                  maximum: 1000
+        additionalProperties: false
+
+  OrderResponseModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref CompositionAPI
+      ContentType: application/json
+      Name: OrderResponse
+      Schema:
+        $schema: http://json-schema.org/draft-04/schema#
+        type: object
+        properties:
+          executionArn:
+            type: string
+          status:
+            type: string
+          message:
+            type: string
+
+  StatusResponseModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref CompositionAPI
+      ContentType: application/json
+      Name: StatusResponse
+      Schema:
+        $schema: http://json-schema.org/draft-04/schema#
+        type: object
+        properties:
+          orderId:
+            type: string
+          status:
+            type: string
+          orderTotal:
+            type: number
+          timestamp:
+            type: string
+
+  ErrorResponseModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref CompositionAPI
+      ContentType: application/json
+      Name: ErrorResponse
+      Schema:
+        $schema: http://json-schema.org/draft-04/schema#
+        type: object
+        properties:
+          error:
+            type: string
+          message:
+            type: string
+          orderId:
+            type: string
+
+  OrderRequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      RestApiId: !Ref CompositionAPI
+      Name: OrderRequestValidator
+      ValidateRequestBody: true
+      ValidateRequestParameters: true
+
+  # API Gateway Deployment
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - OrdersPostMethod
+      - StatusGetMethod
+    Properties:
+      RestApiId: !Ref CompositionAPI
+      StageName: !Ref ApiStage
+      StageDescription: !Sub 'API Composition ${Environment} deployment'
+      DeploymentCanarySettings: !If
+        - IsProduction
+        - PercentTraffic: 10
+          UseStageCache: false
+        - !Ref AWS::NoValue
+
+  # API Gateway Stage
+  APIStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref CompositionAPI
+      DeploymentId: !Ref APIDeployment
+      StageName: !Ref ApiStage
+      Description: !Sub 'API Composition ${Environment} stage'
+      CacheClusterEnabled: !If [IsProduction, true, false]
+      CacheClusterSize: !If [IsProduction, '0.5', !Ref AWS::NoValue]
+      ThrottleSettings:
+        RateLimit: !If [IsProduction, 1000, 100]
+        BurstLimit: !If [IsProduction, 2000, 200]
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: !If [EnableMonitoring, INFO, 'OFF']
+          DataTraceEnabled: !If [EnableMonitoring, true, false]
+          MetricsEnabled: true
+          ThrottlingRateLimit: !If [IsProduction, 500, 50]
+          ThrottlingBurstLimit: !If [IsProduction, 1000, 100]
+      AccessLogSetting: !If
+        - EnableMonitoring
+        - DestinationArn: !GetAtt APIGatewayLogGroup.Arn
+          Format: >
+            {"requestId":"$context.requestId","ip":"$context.identity.sourceIp",
+            "caller":"$context.identity.caller","user":"$context.identity.user",
+            "requestTime":"$context.requestTime","httpMethod":"$context.httpMethod",
+            "resourcePath":"$context.resourcePath","status":"$context.status",
+            "protocol":"$context.protocol","responseLength":"$context.responseLength"}
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-api-stage'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Alarms (Production Only)
+  # ---------------------------------------------------------------------------
+  StepFunctionExecutionFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-stepfunctions-execution-failures'
+      AlarmDescription: 'Step Functions execution failures'
+      MetricName: ExecutionsFailed
+      Namespace: AWS/States
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref OrderProcessingStateMachine
+      TreatMissingData: notBreaching
+
+  APIGateway5XXErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-apigateway-5xx-errors'
+      AlarmDescription: 'API Gateway 5XX errors'
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref CompositionAPI
+        - Name: Stage
+          Value: !Ref ApiStage
+      TreatMissingData: notBreaching
+
+  APIGatewayLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-apigateway-high-latency'
+      AlarmDescription: 'API Gateway high latency'
+      MetricName: Latency
+      Namespace: AWS/ApiGateway
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref CompositionAPI
+        - Name: Stage
+          Value: !Ref ApiStage
+      TreatMissingData: notBreaching
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  # API Gateway Outputs
+  APIGatewayURL:
+    Description: 'API Gateway endpoint URL for order composition'
+    Value: !Sub 'https://${CompositionAPI}.execute-api.${AWS::Region}.amazonaws.com/${ApiStage}'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-api-url'
+
+  APIGatewayId:
+    Description: 'API Gateway REST API ID'
+    Value: !Ref CompositionAPI
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-api-id'
+
+  OrdersEndpoint:
+    Description: 'Complete endpoint URL for creating orders'
+    Value: !Sub 'https://${CompositionAPI}.execute-api.${AWS::Region}.amazonaws.com/${ApiStage}/orders'
+
+  StatusEndpoint:
+    Description: 'Complete endpoint URL for checking order status'
+    Value: !Sub 'https://${CompositionAPI}.execute-api.${AWS::Region}.amazonaws.com/${ApiStage}/orders/{orderId}/status'
+
+  # Step Functions Outputs
+  StateMachineArn:
+    Description: 'Step Functions state machine ARN for order processing'
+    Value: !Ref OrderProcessingStateMachine
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-statemachine-arn'
+
+  StateMachineName:
+    Description: 'Step Functions state machine name'
+    Value: !Ref OrderProcessingStateMachine
+
+  # DynamoDB Outputs
+  OrdersTableName:
+    Description: 'DynamoDB table name for orders'
+    Value: !Ref OrdersTable
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-orders-table'
+
+  AuditTableName:
+    Description: 'DynamoDB table name for audit logs'
+    Value: !Ref AuditTable
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-audit-table'
+
+  ReservationsTableName:
+    Description: 'DynamoDB table name for inventory reservations'
+    Value: !Ref ReservationsTable
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-reservations-table'
+
+  # Lambda Function Outputs
+  UserValidationFunctionArn:
+    Description: 'User validation service Lambda function ARN'
+    Value: !GetAtt UserValidationFunction.Arn
+
+  InventoryServiceFunctionArn:
+    Description: 'Inventory service Lambda function ARN'
+    Value: !GetAtt InventoryServiceFunction.Arn
+
+  PaymentServiceFunctionArn:
+    Description: 'Payment service Lambda function ARN'
+    Value: !GetAtt PaymentServiceFunction.Arn
+
+  ShippingServiceFunctionArn:
+    Description: 'Shipping service Lambda function ARN'
+    Value: !GetAtt ShippingServiceFunction.Arn
+
+  NotificationServiceFunctionArn:
+    Description: 'Notification service Lambda function ARN'
+    Value: !GetAtt NotificationServiceFunction.Arn
+
+  # Testing and Monitoring Outputs
+  SampleCurlCommand:
+    Description: 'Sample curl command to test the API'
+    Value: !Sub |
+      curl -X POST "${CompositionAPI}.execute-api.${AWS::Region}.amazonaws.com/${ApiStage}/orders" \
+        -H "Content-Type: application/json" \
+        -d '{"orderId":"test-order-001","userId":"testuser123","items":[{"productId":"prod-1","quantity":2}]}'
+
+  StepFunctionsConsoleURL:
+    Description: 'AWS Console URL for Step Functions state machine'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/states/home?region=${AWS::Region}#/statemachines/view/${OrderProcessingStateMachine}'
+
+  CloudWatchDashboardURL:
+    Description: 'CloudWatch dashboard URL for monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:'
+
+  # Security and IAM Outputs
+  StepFunctionsExecutionRoleArn:
+    Description: 'Step Functions execution role ARN'
+    Value: !GetAtt StepFunctionsExecutionRole.Arn
+
+  APIGatewayExecutionRoleArn:
+    Description: 'API Gateway execution role ARN'
+    Value: !GetAtt APIGatewayExecutionRole.Arn
+
+  LambdaExecutionRoleArn:
+    Description: 'Lambda execution role ARN'
+    Value: !GetAtt LambdaExecutionRole.Arn
+
+  # Cost and Resource Information
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for this infrastructure (USD)'
+    Value: !If
+      - IsProduction
+      - '$50-100 (production workload with reserved capacity)'
+      - '$10-25 (development/testing workload)'
+
+  ResourceCount:
+    Description: 'Total number of AWS resources created'
+    Value: '25+ resources including DynamoDB tables, Lambda functions, Step Functions, API Gateway, IAM roles, and CloudWatch resources'

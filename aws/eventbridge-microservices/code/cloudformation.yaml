@@ -1,0 +1,758 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Event-Driven Architecture with Amazon EventBridge - Complete infrastructure for e-commerce order processing workflow'
+
+# ================================
+# PARAMETERS
+# ================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: eventbridge-demo
+    Description: 'Project name used for resource naming and tagging'
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+    MinLength: 3
+    MaxLength: 20
+
+  Environment:
+    Type: String
+    Default: dev
+    Description: 'Environment name (dev, staging, prod)'
+    AllowedValues: [dev, staging, prod]
+
+  LogRetentionInDays:
+    Type: Number
+    Default: 14
+    Description: 'CloudWatch log retention period in days'
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+  PaymentQueueDelaySeconds:
+    Type: Number
+    Default: 30
+    Description: 'Delay in seconds for payment processing queue messages'
+    MinValue: 0
+    MaxValue: 900
+
+  PaymentQueueVisibilityTimeout:
+    Type: Number
+    Default: 300
+    Description: 'Visibility timeout in seconds for payment processing queue'
+    MinValue: 0
+    MaxValue: 43200
+
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    Description: 'Enable detailed CloudWatch monitoring for Lambda functions'
+    AllowedValues: ['true', 'false']
+
+# ================================
+# CONDITIONS
+# ================================
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+  EnableMonitoring: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  ExtendedRetention: !Or [!Equals [!Ref Environment, prod], !Equals [!Ref Environment, staging]]
+
+# ================================
+# RESOURCES
+# ================================
+Resources:
+  # ================================
+  # IAM ROLES AND POLICIES
+  # ================================
+  
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EventBridgeInteractionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                  - events:ListRules
+                  - events:DescribeRule
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: EventBridgeDemoLambdaExecution
+
+  # EventBridge Service Role for CloudWatch Logs
+  EventBridgeLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-eventbridge-log-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogsDelivery
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/events/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ================================
+  # EVENTBRIDGE RESOURCES
+  # ================================
+  
+  # Custom Event Bus for E-commerce Domain
+  EcommerceEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-ecommerce-events'
+      Description: 'Custom event bus for e-commerce domain events'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: EcommerceDomainEventBus
+
+  # ================================
+  # LAMBDA FUNCTIONS
+  # ================================
+  
+  # Order Processing Lambda Function
+  OrderProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-order-processor'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      ReservedConcurrencyLimit: !If [IsProduction, 50, 10]
+      Environment:
+        Variables:
+          EVENT_BUS_NAME: !Ref EcommerceEventBus
+          LOG_LEVEL: !If [IsProduction, INFO, DEBUG]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          import logging
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+
+          eventbridge = boto3.client('events')
+
+          def lambda_handler(event, context):
+              logger.info(f"Processing order event: {json.dumps(event, indent=2)}")
+              
+              # Extract order details from the event
+              order_details = event.get('detail', {})
+              order_id = order_details.get('orderId', 'unknown')
+              customer_id = order_details.get('customerId', 'unknown')
+              total_amount = order_details.get('totalAmount', 0)
+              
+              try:
+                  # Simulate order processing logic
+                  logger.info(f"Processing order {order_id} for customer {customer_id}")
+                  logger.info(f"Order total: ${total_amount}")
+                  
+                  # Validate order amount
+                  if total_amount <= 0:
+                      raise ValueError("Invalid order amount")
+                  
+                  # Emit order processed event
+                  response = eventbridge.put_events(
+                      Entries=[
+                          {
+                              'Source': 'ecommerce.order',
+                              'DetailType': 'Order Processed',
+                              'Detail': json.dumps({
+                                  'orderId': order_id,
+                                  'customerId': customer_id,
+                                  'totalAmount': total_amount,
+                                  'status': 'processed',
+                                  'timestamp': datetime.utcnow().isoformat(),
+                                  'processingDuration': context.get_remaining_time_in_millis()
+                              }),
+                              'EventBusName': os.environ.get('EVENT_BUS_NAME', 'default')
+                          }
+                      ]
+                  )
+                  
+                  logger.info(f"Emitted order processed event: {response}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Order {order_id} processed successfully',
+                          'eventId': response['Entries'][0]['EventId']
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing order: {str(e)}")
+                  
+                  # Emit order failed event
+                  try:
+                      eventbridge.put_events(
+                          Entries=[
+                              {
+                                  'Source': 'ecommerce.order',
+                                  'DetailType': 'Order Processing Failed',
+                                  'Detail': json.dumps({
+                                      'orderId': order_id,
+                                      'customerId': customer_id,
+                                      'error': str(e),
+                                      'timestamp': datetime.utcnow().isoformat()
+                                  }),
+                                  'EventBusName': os.environ.get('EVENT_BUS_NAME', 'default')
+                              }
+                          ]
+                      )
+                  except Exception as emit_error:
+                      logger.error(f"Failed to emit error event: {str(emit_error)}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: OrderProcessing
+
+  # Inventory Management Lambda Function
+  InventoryManagerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-inventory-manager'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      ReservedConcurrencyLimit: !If [IsProduction, 30, 5]
+      Environment:
+        Variables:
+          EVENT_BUS_NAME: !Ref EcommerceEventBus
+          LOG_LEVEL: !If [IsProduction, INFO, DEBUG]
+          INVENTORY_SUCCESS_RATE: !If [IsProduction, '0.95', '0.75']
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import random
+          from datetime import datetime
+          import logging
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+
+          eventbridge = boto3.client('events')
+
+          def lambda_handler(event, context):
+              logger.info(f"Processing inventory event: {json.dumps(event, indent=2)}")
+              
+              # Extract order details from the event
+              order_details = event.get('detail', {})
+              order_id = order_details.get('orderId', 'unknown')
+              
+              try:
+                  # Simulate inventory check and reservation
+                  logger.info(f"Checking inventory for order {order_id}")
+                  
+                  # Get success rate from environment (for simulation)
+                  success_rate = float(os.environ.get('INVENTORY_SUCCESS_RATE', '0.75'))
+                  inventory_available = random.random() < success_rate
+                  
+                  if inventory_available:
+                      # Emit inventory reserved event
+                      response = eventbridge.put_events(
+                          Entries=[
+                              {
+                                  'Source': 'ecommerce.inventory',
+                                  'DetailType': 'Inventory Reserved',
+                                  'Detail': json.dumps({
+                                      'orderId': order_id,
+                                      'status': 'reserved',
+                                      'reservationId': f"res-{order_id}-{int(datetime.now().timestamp())}",
+                                      'timestamp': datetime.utcnow().isoformat(),
+                                      'expiresAt': datetime.utcnow().isoformat()
+                                  }),
+                                  'EventBusName': os.environ.get('EVENT_BUS_NAME', 'default')
+                              }
+                          ]
+                      )
+                      
+                      logger.info(f"Inventory reserved for order {order_id}")
+                      
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': f'Inventory reserved for order {order_id}',
+                              'eventId': response['Entries'][0]['EventId']
+                          })
+                      }
+                  else:
+                      # Emit inventory unavailable event
+                      eventbridge.put_events(
+                          Entries=[
+                              {
+                                  'Source': 'ecommerce.inventory',
+                                  'DetailType': 'Inventory Unavailable',
+                                  'Detail': json.dumps({
+                                      'orderId': order_id,
+                                      'status': 'unavailable',
+                                      'reason': 'Insufficient stock',
+                                      'timestamp': datetime.utcnow().isoformat()
+                                  }),
+                                  'EventBusName': os.environ.get('EVENT_BUS_NAME', 'default')
+                              }
+                          ]
+                      )
+                      
+                      logger.warning(f"Inventory unavailable for order {order_id}")
+                      
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': f'Inventory unavailable for order {order_id}'
+                          })
+                      }
+                  
+              except Exception as e:
+                  logger.error(f"Error managing inventory: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: InventoryManagement
+
+  # Event Generator Lambda Function
+  EventGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-event-generator'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          EVENT_BUS_NAME: !Ref EcommerceEventBus
+          LOG_LEVEL: !If [IsProduction, INFO, DEBUG]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import random
+          from datetime import datetime
+          import logging
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+
+          eventbridge = boto3.client('events')
+
+          def lambda_handler(event, context):
+              try:
+                  # Generate sample order data
+                  order_id = f"ord-{int(datetime.now().timestamp())}-{random.randint(1000, 9999)}"
+                  customer_id = f"cust-{random.randint(1000, 9999)}"
+                  total_amount = round(random.uniform(25.99, 299.99), 2)
+                  
+                  # Create order event
+                  order_event = {
+                      'Source': 'ecommerce.api',
+                      'DetailType': 'Order Created',
+                      'Detail': json.dumps({
+                          'orderId': order_id,
+                          'customerId': customer_id,
+                          'totalAmount': total_amount,
+                          'items': [
+                              {
+                                  'productId': f'prod-{random.randint(100, 999)}',
+                                  'quantity': random.randint(1, 3),
+                                  'price': round(total_amount / random.randint(1, 3), 2)
+                              }
+                          ],
+                          'timestamp': datetime.utcnow().isoformat(),
+                          'source': 'web-checkout'
+                      }),
+                      'EventBusName': os.environ.get('EVENT_BUS_NAME', 'default')
+                  }
+                  
+                  response = eventbridge.put_events(Entries=[order_event])
+                  
+                  logger.info(f"Generated order event for order {order_id}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Order event generated successfully',
+                          'orderId': order_id,
+                          'eventId': response['Entries'][0]['EventId']
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error generating event: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: EventGeneration
+
+  # ================================
+  # SQS RESOURCES
+  # ================================
+  
+  # Payment Processing Queue
+  PaymentProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-payment-processing'
+      DelaySeconds: !Ref PaymentQueueDelaySeconds
+      VisibilityTimeoutSeconds: !Ref PaymentQueueVisibilityTimeout
+      MessageRetentionPeriod: 1209600  # 14 days
+      ReceiveMessageWaitTimeSeconds: 20  # Enable long polling
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt PaymentDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: PaymentProcessing
+
+  # Payment Processing Dead Letter Queue
+  PaymentDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-payment-processing-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: PaymentProcessingDLQ
+
+  # ================================
+  # CLOUDWATCH LOGS
+  # ================================
+  
+  # Event Monitoring Log Group
+  EventMonitoringLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/events/${ProjectName}-${Environment}-ecommerce-events'
+      RetentionInDays: !If [ExtendedRetention, 90, !Ref LogRetentionInDays]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: EventMonitoring
+
+  # ================================
+  # EVENTBRIDGE RULES
+  # ================================
+  
+  # Rule 1: Route new orders to order processing Lambda
+  OrderProcessingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-order-processing-rule'
+      Description: 'Route new orders to processing Lambda'
+      EventBusName: !Ref EcommerceEventBus
+      State: ENABLED
+      EventPattern:
+        source: ['ecommerce.api']
+        detail-type: ['Order Created']
+        detail:
+          totalAmount:
+            - numeric: ['>', 0]
+      Targets:
+        - Id: '1'
+          Arn: !GetAtt OrderProcessorFunction.Arn
+
+  # Lambda permission for order processing rule
+  OrderProcessingRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OrderProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt OrderProcessingRule.Arn
+
+  # Rule 2: Route processed orders to inventory management
+  InventoryCheckRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-inventory-check-rule'
+      Description: 'Route processed orders to inventory check'
+      EventBusName: !Ref EcommerceEventBus
+      State: ENABLED
+      EventPattern:
+        source: ['ecommerce.order']
+        detail-type: ['Order Processed']
+        detail:
+          status: ['processed']
+      Targets:
+        - Id: '1'
+          Arn: !GetAtt InventoryManagerFunction.Arn
+
+  # Lambda permission for inventory check rule
+  InventoryCheckRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref InventoryManagerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt InventoryCheckRule.Arn
+
+  # Rule 3: Route inventory reserved events to payment processing
+  PaymentProcessingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-payment-processing-rule'
+      Description: 'Route inventory reserved events to payment'
+      EventBusName: !Ref EcommerceEventBus
+      State: ENABLED
+      EventPattern:
+        source: ['ecommerce.inventory']
+        detail-type: ['Inventory Reserved']
+        detail:
+          status: ['reserved']
+      Targets:
+        - Id: '1'
+          Arn: !GetAtt PaymentProcessingQueue.Arn
+          SqsParameters:
+            MessageGroupId: 'payment-processing'
+
+  # SQS permission for payment processing rule
+  PaymentProcessingRulePermission:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref PaymentProcessingQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt PaymentProcessingQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt PaymentProcessingRule.Arn
+
+  # Rule 4: Archive all events to CloudWatch Logs for monitoring
+  MonitoringRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-monitoring-rule'
+      Description: 'Archive all ecommerce events for monitoring'
+      EventBusName: !Ref EcommerceEventBus
+      State: ENABLED
+      EventPattern:
+        source:
+          - prefix: 'ecommerce.'
+      Targets:
+        - Id: '1'
+          Arn: !GetAtt EventMonitoringLogGroup.Arn
+          RoleArn: !GetAtt EventBridgeLogRole.Arn
+
+  # ================================
+  # CLOUDWATCH ALARMS (Optional)
+  # ================================
+  
+  # Lambda Error Alarm for Order Processor
+  OrderProcessorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-order-processor-errors'
+      AlarmDescription: 'Order processor Lambda function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref OrderProcessorFunction
+      TreatMissingData: notBreaching
+
+  # EventBridge Failed Invocations Alarm
+  EventBridgeFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-eventbridge-failures'
+      AlarmDescription: 'EventBridge rule failed invocations'
+      MetricName: FailedInvocations
+      Namespace: AWS/Events
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: EventBusName
+          Value: !Ref EcommerceEventBus
+      TreatMissingData: notBreaching
+
+# ================================
+# OUTPUTS
+# ================================
+Outputs:
+  # Event Bus Information
+  EcommerceEventBusName:
+    Description: 'Name of the custom EventBridge event bus'
+    Value: !Ref EcommerceEventBus
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBusName'
+
+  EcommerceEventBusArn:
+    Description: 'ARN of the custom EventBridge event bus'
+    Value: !GetAtt EcommerceEventBus.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBusArn'
+
+  # Lambda Function Information
+  OrderProcessorFunctionArn:
+    Description: 'ARN of the order processor Lambda function'
+    Value: !GetAtt OrderProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OrderProcessorArn'
+
+  InventoryManagerFunctionArn:
+    Description: 'ARN of the inventory manager Lambda function'
+    Value: !GetAtt InventoryManagerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-InventoryManagerArn'
+
+  EventGeneratorFunctionArn:
+    Description: 'ARN of the event generator Lambda function'
+    Value: !GetAtt EventGeneratorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventGeneratorArn'
+
+  # Queue Information
+  PaymentProcessingQueueUrl:
+    Description: 'URL of the payment processing SQS queue'
+    Value: !Ref PaymentProcessingQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-PaymentQueueUrl'
+
+  PaymentProcessingQueueArn:
+    Description: 'ARN of the payment processing SQS queue'
+    Value: !GetAtt PaymentProcessingQueue.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PaymentQueueArn'
+
+  # Monitoring Information
+  EventMonitoringLogGroupName:
+    Description: 'Name of the CloudWatch log group for event monitoring'
+    Value: !Ref EventMonitoringLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-MonitoringLogGroup'
+
+  # Testing Commands
+  TestOrderCreationCommand:
+    Description: 'AWS CLI command to generate a test order event'
+    Value: !Sub |
+      aws lambda invoke --function-name ${EventGeneratorFunction} --payload '{}' --cli-binary-format raw-in-base64-out response.json && cat response.json
+
+  MonitorEventsCommand:
+    Description: 'AWS CLI command to monitor events in CloudWatch logs'
+    Value: !Sub |
+      aws logs tail /aws/events/${ProjectName}-${Environment}-ecommerce-events --follow
+
+  CheckPaymentQueueCommand:
+    Description: 'AWS CLI command to check payment processing queue messages'
+    Value: !Sub |
+      aws sqs receive-message --queue-url ${PaymentProcessingQueue} --max-number-of-messages 5
+
+  # Architecture Summary
+  ArchitectureSummary:
+    Description: 'Summary of deployed event-driven architecture components'
+    Value: !Sub |
+      Event-driven architecture deployed with:
+      - Custom EventBridge bus: ${EcommerceEventBus}
+      - 3 Lambda functions for order processing, inventory management, and event generation
+      - 4 EventBridge rules for intelligent event routing
+      - SQS queue for asynchronous payment processing
+      - CloudWatch monitoring and logging
+      Environment: ${Environment} | Project: ${ProjectName}

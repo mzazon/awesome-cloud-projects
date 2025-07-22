@@ -1,0 +1,548 @@
+# Infrastructure Manager configuration for Real-Time Document Intelligence Pipelines
+# This configuration deploys a complete serverless document processing pipeline
+# using Cloud Storage, Document AI, Pub/Sub, and Cloud Functions
+
+# Import required modules and define the deployment
+imports:
+  - path: terraform/google/modules/project-services/~> 7.0
+    name: project_services
+  - path: terraform/google/modules/storage/~> 5.0
+    name: storage_bucket
+  - path: terraform/google/modules/pubsub/~> 6.0
+    name: pubsub_module
+  - path: terraform/google/modules/cloud-functions/~> 0.4
+    name: cloud_functions
+
+# Deployment configuration
+deployment:
+  name: "document-intelligence-pipeline"
+  description: "Real-time document processing pipeline with Document AI"
+  
+# Input variables for customization
+variables:
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    required: true
+  
+  region:
+    description: "Google Cloud region for resources"
+    type: string
+    default: "us-central1"
+  
+  location:
+    description: "Location for Document AI processor"
+    type: string
+    default: "us"
+  
+  processor_display_name:
+    description: "Display name for Document AI processor"
+    type: string
+    default: "invoice-processor"
+  
+  bucket_prefix:
+    description: "Prefix for Cloud Storage bucket name"
+    type: string
+    default: "documents"
+  
+  enable_versioning:
+    description: "Enable versioning on Cloud Storage bucket"
+    type: boolean
+    default: true
+  
+  function_memory:
+    description: "Memory allocation for Cloud Functions"
+    type: string
+    default: "512Mi"
+  
+  function_timeout:
+    description: "Timeout for Cloud Functions in seconds"
+    type: number
+    default: 540
+  
+  max_instances:
+    description: "Maximum instances for Cloud Functions"
+    type: number
+    default: 10
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable_apis
+    type: google.cloud.resourcemanager.v1.Project
+    properties:
+      projectId: ${project_id}
+      services:
+        - documentai.googleapis.com
+        - pubsub.googleapis.com
+        - storage.googleapis.com
+        - cloudfunctions.googleapis.com
+        - firestore.googleapis.com
+        - cloudbuild.googleapis.com
+        - eventarc.googleapis.com
+    
+  # Create Document AI processor for document analysis
+  - name: document_ai_processor
+    type: google.cloud.documentai.v1.Processor
+    properties:
+      parent: projects/${project_id}/locations/${location}
+      displayName: ${processor_display_name}
+      type: FORM_PARSER_PROCESSOR
+      defaultProcessorVersion:
+        displayName: "default"
+    depends_on:
+      - enable_apis
+    
+  # Generate unique suffix for resource names
+  - name: random_suffix
+    type: google.cloud.random.v1.Id
+    properties:
+      byteLength: 3
+    
+  # Create Cloud Storage bucket for document ingestion
+  - name: documents_bucket
+    type: google.cloud.storage.v1.Bucket
+    properties:
+      name: ${bucket_prefix}-$(ref.random_suffix.hex)
+      location: ${region}
+      project: ${project_id}
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: ${enable_versioning}
+      iamConfiguration:
+        bucketPolicyOnly:
+          enabled: true
+      labels:
+        purpose: document-processing
+        environment: production
+        component: storage
+    depends_on:
+      - enable_apis
+    
+  # Create Pub/Sub topic for document upload events
+  - name: document_events_topic
+    type: google.cloud.pubsub.v1.Topic
+    properties:
+      name: projects/${project_id}/topics/document-events-$(ref.random_suffix.hex)
+      labels:
+        purpose: document-events
+        component: messaging
+    depends_on:
+      - enable_apis
+    
+  # Create Pub/Sub topic for processing results
+  - name: results_topic
+    type: google.cloud.pubsub.v1.Topic
+    properties:
+      name: projects/${project_id}/topics/document-results-$(ref.random_suffix.hex)
+      labels:
+        purpose: processing-results
+        component: messaging
+    depends_on:
+      - enable_apis
+    
+  # Create subscription for document processing
+  - name: processing_subscription
+    type: google.cloud.pubsub.v1.Subscription
+    properties:
+      name: projects/${project_id}/subscriptions/process-docs-$(ref.random_suffix.hex)
+      topic: $(ref.document_events_topic.name)
+      ackDeadlineSeconds: 600
+      messageRetentionDuration: "604800s"  # 7 days
+      labels:
+        purpose: document-processing
+        component: messaging
+    depends_on:
+      - document_events_topic
+    
+  # Create subscription for consuming results
+  - name: results_subscription
+    type: google.cloud.pubsub.v1.Subscription
+    properties:
+      name: projects/${project_id}/subscriptions/consume-results-$(ref.random_suffix.hex)
+      topic: $(ref.results_topic.name)
+      ackDeadlineSeconds: 300
+      messageRetentionDuration: "604800s"  # 7 days
+      labels:
+        purpose: results-consumption
+        component: messaging
+    depends_on:
+      - results_topic
+    
+  # Create service account for Cloud Functions
+  - name: function_service_account
+    type: google.cloud.iam.v1.ServiceAccount
+    properties:
+      accountId: doc-processor-sa-$(ref.random_suffix.hex)
+      displayName: "Document Processor Service Account"
+      description: "Service account for document processing functions"
+      project: ${project_id}
+    depends_on:
+      - enable_apis
+    
+  # Grant necessary IAM roles to service account
+  - name: storage_admin_binding
+    type: google.cloud.resourcemanager.v1.ProjectIamMember
+    properties:
+      project: ${project_id}
+      role: roles/storage.objectViewer
+      member: serviceAccount:$(ref.function_service_account.email)
+    depends_on:
+      - function_service_account
+    
+  - name: documentai_user_binding
+    type: google.cloud.resourcemanager.v1.ProjectIamMember
+    properties:
+      project: ${project_id}
+      role: roles/documentai.apiUser
+      member: serviceAccount:$(ref.function_service_account.email)
+    depends_on:
+      - function_service_account
+    
+  - name: pubsub_publisher_binding
+    type: google.cloud.resourcemanager.v1.ProjectIamMember
+    properties:
+      project: ${project_id}
+      role: roles/pubsub.publisher
+      member: serviceAccount:$(ref.function_service_account.email)
+    depends_on:
+      - function_service_account
+    
+  - name: firestore_user_binding
+    type: google.cloud.resourcemanager.v1.ProjectIamMember
+    properties:
+      project: ${project_id}
+      role: roles/datastore.user
+      member: serviceAccount:$(ref.function_service_account.email)
+    depends_on:
+      - function_service_account
+    
+  # Create Cloud Storage bucket notification for event triggers
+  - name: bucket_notification
+    type: google.cloud.storage.v1.Notification
+    properties:
+      bucket: $(ref.documents_bucket.name)
+      topic: $(ref.document_events_topic.name)
+      payloadFormat: JSON_API_V1
+      eventTypes:
+        - OBJECT_FINALIZE
+    depends_on:
+      - documents_bucket
+      - document_events_topic
+    
+  # Create Cloud Function source code archive
+  - name: function_source_archive
+    type: google.cloud.storage.v1.Object
+    properties:
+      bucket: $(ref.documents_bucket.name)
+      name: source/process-document-source.zip
+      source:
+        # Inline Python code for document processing function
+        content: |
+          import base64
+          import json
+          import os
+          from google.cloud import documentai
+          from google.cloud import pubsub_v1
+          from google.cloud import storage
+          import functions_framework
+
+          # Initialize clients
+          document_client = documentai.DocumentProcessorServiceClient()
+          publisher = pubsub_v1.PublisherClient()
+          storage_client = storage.Client()
+
+          @functions_framework.cloud_event
+          def process_document(cloud_event):
+              """Process uploaded document with Document AI"""
+              
+              # Parse the Cloud Storage event
+              data = cloud_event.data
+              bucket_name = data["bucket"]
+              file_name = data["name"]
+              
+              # Skip processing if not a document file
+              if not file_name.lower().endswith(('.pdf', '.png', '.jpg', '.jpeg', '.tiff')):
+                  print(f"Skipping non-document file: {file_name}")
+                  return
+              
+              try:
+                  # Download document from Cloud Storage
+                  bucket = storage_client.bucket(bucket_name)
+                  blob = bucket.blob(file_name)
+                  document_content = blob.download_as_bytes()
+                  
+                  # Configure Document AI request
+                  processor_name = f"projects/{os.environ['PROJECT_ID']}/locations/{os.environ['LOCATION']}/processors/{os.environ['PROCESSOR_ID']}"
+                  
+                  # Determine document MIME type
+                  mime_type = "application/pdf" if file_name.lower().endswith('.pdf') else "image/png"
+                  
+                  # Process document with Document AI
+                  document = documentai.Document(
+                      content=document_content,
+                      mime_type=mime_type
+                  )
+                  
+                  request = documentai.ProcessRequest(
+                      name=processor_name,
+                      document=document
+                  )
+                  
+                  result = document_client.process_document(request=request)
+                  
+                  # Extract text and form fields
+                  extracted_data = {
+                      "source_file": file_name,
+                      "bucket": bucket_name,
+                      "text": result.document.text,
+                      "pages": len(result.document.pages),
+                      "form_fields": [],
+                      "tables": []
+                  }
+                  
+                  # Extract form fields if available
+                  for page in result.document.pages:
+                      for form_field in page.form_fields:
+                          field_name = ""
+                          field_value = ""
+                          
+                          if form_field.field_name:
+                              field_name = form_field.field_name.text_anchor.content
+                          if form_field.field_value:
+                              field_value = form_field.field_value.text_anchor.content
+                          
+                          extracted_data["form_fields"].append({
+                              "name": field_name.strip(),
+                              "value": field_value.strip()
+                          })
+                  
+                  # Publish results to Pub/Sub
+                  results_topic = f"projects/{os.environ['PROJECT_ID']}/topics/{os.environ['RESULTS_TOPIC']}"
+                  message_data = json.dumps(extracted_data).encode('utf-8')
+                  
+                  publisher.publish(results_topic, message_data)
+                  
+                  print(f"Successfully processed {file_name} and published results")
+                  
+              except Exception as e:
+                  print(f"Error processing {file_name}: {str(e)}")
+                  raise
+        contentType: application/zip
+    depends_on:
+      - documents_bucket
+    
+  # Create document processing Cloud Function
+  - name: process_document_function
+    type: google.cloud.functions.v2.Function
+    properties:
+      name: projects/${project_id}/locations/${region}/functions/process-document
+      description: "Process documents with Document AI and publish results"
+      buildConfig:
+        runtime: python311
+        entryPoint: process_document
+        source:
+          storageSource:
+            bucket: $(ref.documents_bucket.name)
+            object: $(ref.function_source_archive.name)
+        environmentVariables:
+          PROJECT_ID: ${project_id}
+          LOCATION: ${location}
+          PROCESSOR_ID: $(ref.document_ai_processor.name | basename)
+          RESULTS_TOPIC: $(ref.results_topic.name | basename)
+      serviceConfig:
+        maxInstanceCount: ${max_instances}
+        availableMemory: ${function_memory}
+        timeoutSeconds: ${function_timeout}
+        serviceAccountEmail: $(ref.function_service_account.email)
+        environmentVariables:
+          PROJECT_ID: ${project_id}
+          LOCATION: ${location}
+          PROCESSOR_ID: $(ref.document_ai_processor.name | basename)
+          RESULTS_TOPIC: $(ref.results_topic.name | basename)
+        ingressSettings: ALLOW_INTERNAL_ONLY
+      eventTrigger:
+        trigger: providers/cloud.pubsub/eventTypes/topic.publish
+        resource: $(ref.document_events_topic.name)
+        eventType: google.pubsub.topic.publish
+      labels:
+        purpose: document-processing
+        component: compute
+    depends_on:
+      - document_ai_processor
+      - document_events_topic
+      - results_topic
+      - function_service_account
+      - function_source_archive
+    
+  # Create results consumer function source
+  - name: consumer_source_archive
+    type: google.cloud.storage.v1.Object
+    properties:
+      bucket: $(ref.documents_bucket.name)
+      name: source/consume-results-source.zip
+      source:
+        content: |
+          import base64
+          import json
+          import functions_framework
+          from google.cloud import firestore
+
+          # Initialize clients
+          firestore_client = firestore.Client()
+
+          @functions_framework.cloud_event
+          def consume_results(cloud_event):
+              """Consume and process Document AI results"""
+              
+              try:
+                  # Parse the Pub/Sub message
+                  message_data = base64.b64decode(cloud_event.data["message"]["data"])
+                  document_data = json.loads(message_data)
+                  
+                  # Store results in Firestore for real-time access
+                  doc_ref = firestore_client.collection('processed_documents').document()
+                  doc_ref.set({
+                      'source_file': document_data['source_file'],
+                      'bucket': document_data['bucket'],
+                      'text_length': len(document_data['text']),
+                      'pages': document_data['pages'],
+                      'form_fields_count': len(document_data['form_fields']),
+                      'processed_at': firestore.SERVER_TIMESTAMP,
+                      'form_fields': document_data['form_fields']
+                  })
+                  
+                  # Log processing summary
+                  print(f"Processed document: {document_data['source_file']}")
+                  print(f"Pages: {document_data['pages']}")
+                  print(f"Form fields extracted: {len(document_data['form_fields'])}")
+                  print(f"Text length: {len(document_data['text'])} characters")
+                  
+                  # Example: Extract specific business data
+                  for field in document_data['form_fields']:
+                      if 'total' in field['name'].lower() or 'amount' in field['name'].lower():
+                          print(f"Found financial data - {field['name']}: {field['value']}")
+                  
+                  print("✅ Results processed and stored successfully")
+                  
+              except Exception as e:
+                  print(f"Error consuming results: {str(e)}")
+                  raise
+        contentType: application/zip
+    depends_on:
+      - documents_bucket
+    
+  # Create results consumer Cloud Function
+  - name: consume_results_function
+    type: google.cloud.functions.v2.Function
+    properties:
+      name: projects/${project_id}/locations/${region}/functions/consume-results
+      description: "Consume Document AI processing results and store in Firestore"
+      buildConfig:
+        runtime: python311
+        entryPoint: consume_results
+        source:
+          storageSource:
+            bucket: $(ref.documents_bucket.name)
+            object: $(ref.consumer_source_archive.name)
+      serviceConfig:
+        maxInstanceCount: 10
+        availableMemory: 256Mi
+        timeoutSeconds: 300
+        serviceAccountEmail: $(ref.function_service_account.email)
+        ingressSettings: ALLOW_INTERNAL_ONLY
+      eventTrigger:
+        trigger: providers/cloud.pubsub/eventTypes/topic.publish
+        resource: $(ref.results_topic.name)
+        eventType: google.pubsub.topic.publish
+      labels:
+        purpose: results-processing
+        component: compute
+    depends_on:
+      - results_topic
+      - function_service_account
+      - consumer_source_archive
+    
+  # Create Firestore database for storing processed results
+  - name: firestore_database
+    type: google.cloud.firestore.v1.Database
+    properties:
+      name: projects/${project_id}/databases/(default)
+      type: FIRESTORE_NATIVE
+      locationId: ${region}
+    depends_on:
+      - enable_apis
+
+# Output values for verification and integration
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${project_id}
+  
+  bucket_name:
+    description: "Cloud Storage bucket name for document uploads"
+    value: $(ref.documents_bucket.name)
+  
+  bucket_url:
+    description: "Cloud Storage bucket URL"
+    value: gs://$(ref.documents_bucket.name)
+  
+  document_ai_processor_id:
+    description: "Document AI processor ID"
+    value: $(ref.document_ai_processor.name | basename)
+  
+  document_ai_processor_name:
+    description: "Full Document AI processor resource name"
+    value: $(ref.document_ai_processor.name)
+  
+  document_events_topic:
+    description: "Pub/Sub topic for document events"
+    value: $(ref.document_events_topic.name)
+  
+  results_topic:
+    description: "Pub/Sub topic for processing results"
+    value: $(ref.results_topic.name)
+  
+  processing_subscription:
+    description: "Pub/Sub subscription for document processing"
+    value: $(ref.processing_subscription.name)
+  
+  results_subscription:
+    description: "Pub/Sub subscription for consuming results"
+    value: $(ref.results_subscription.name)
+  
+  process_function_name:
+    description: "Document processing Cloud Function name"
+    value: $(ref.process_document_function.name)
+  
+  consumer_function_name:
+    description: "Results consumer Cloud Function name"
+    value: $(ref.consume_results_function.name)
+  
+  service_account_email:
+    description: "Service account email for functions"
+    value: $(ref.function_service_account.email)
+  
+  deployment_region:
+    description: "Deployment region"
+    value: ${region}
+  
+  firestore_database:
+    description: "Firestore database for storing results"
+    value: $(ref.firestore_database.name)
+
+# Deployment metadata and labels
+metadata:
+  labels:
+    recipe: real-time-document-intelligence-pipelines
+    provider: gcp
+    category: analytics
+    difficulty: "200"
+    version: "1.0"
+  annotations:
+    description: "Complete serverless document intelligence pipeline with real-time processing"
+    documentation: "https://cloud.google.com/document-ai/docs"
+    cost-estimate: "5-15 USD for testing with 100-500 documents"
+    estimated-deployment-time: "10-15 minutes"

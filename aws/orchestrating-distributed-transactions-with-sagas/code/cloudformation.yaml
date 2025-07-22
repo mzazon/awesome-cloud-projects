@@ -1,0 +1,1203 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for Orchestrating Distributed Transactions with Saga Patterns'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'demo'
+    Description: 'Environment name (demo, dev, staging, prod)'
+    AllowedValues:
+      - demo
+      - dev
+      - staging
+      - prod
+  
+  RandomSuffix:
+    Type: String
+    Default: 'saga01'
+    Description: 'Random suffix for resource names to ensure uniqueness'
+    AllowedPattern: '^[a-z0-9]{6}$'
+    ConstraintDescription: 'Must be exactly 6 lowercase alphanumeric characters'
+  
+  PaymentFailureRate:
+    Type: Number
+    Default: 0.2
+    Description: 'Simulated payment failure rate (0.0 to 1.0)'
+    MinValue: 0.0
+    MaxValue: 1.0
+  
+  RetryAttempts:
+    Type: Number
+    Default: 3
+    Description: 'Number of retry attempts for Step Functions tasks'
+    MinValue: 1
+    MaxValue: 10
+  
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    Description: 'Lambda function timeout in seconds'
+    MinValue: 1
+    MaxValue: 900
+
+Conditions:
+  IsProductionEnvironment: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # DynamoDB Tables
+  OrderTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'saga-orders-${RandomSuffix}'
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProductionEnvironment, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SagaPattern
+        - Key: ResourceType
+          Value: Database
+      DeletionProtectionEnabled: !If [IsProductionEnvironment, true, false]
+
+  InventoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'saga-inventory-${RandomSuffix}'
+      AttributeDefinitions:
+        - AttributeName: productId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: productId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProductionEnvironment, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SagaPattern
+        - Key: ResourceType
+          Value: Database
+      DeletionProtectionEnabled: !If [IsProductionEnvironment, true, false]
+
+  PaymentTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'saga-payments-${RandomSuffix}'
+      AttributeDefinitions:
+        - AttributeName: paymentId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: paymentId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProductionEnvironment, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SagaPattern
+        - Key: ResourceType
+          Value: Database
+      DeletionProtectionEnabled: !If [IsProductionEnvironment, true, false]
+
+  # SNS Topic for Notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'saga-notifications-${RandomSuffix}'
+      DisplayName: 'Saga Pattern Notifications'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SagaPattern
+        - Key: ResourceType
+          Value: Messaging
+
+  # CloudWatch Log Group for Step Functions
+  StepFunctionsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/stepfunctions/saga-logs-${RandomSuffix}'
+      RetentionInDays: !If [IsProductionEnvironment, 30, 7]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SagaPattern
+        - Key: ResourceType
+          Value: Logging
+
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'saga-lambda-role-${RandomSuffix}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAndSNSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt OrderTable.Arn
+                  - !GetAtt InventoryTable.Arn
+                  - !GetAtt PaymentTable.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SagaPattern
+        - Key: ResourceType
+          Value: Security
+
+  # IAM Role for Step Functions
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'saga-orchestrator-role-${RandomSuffix}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt OrderServiceFunction.Arn
+                  - !GetAtt InventoryServiceFunction.Arn
+                  - !GetAtt PaymentServiceFunction.Arn
+                  - !GetAtt NotificationServiceFunction.Arn
+                  - !GetAtt CancelOrderFunction.Arn
+                  - !GetAtt RevertInventoryFunction.Arn
+                  - !GetAtt RefundPaymentFunction.Arn
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SagaPattern
+        - Key: ResourceType
+          Value: Security
+
+  # Lambda Functions - Business Services
+  OrderServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'saga-order-service-${RandomSuffix}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          from datetime import datetime
+          
+          dynamodb = boto3.resource('dynamodb')
+          
+          def lambda_handler(event, context):
+              try:
+                  table_name = event['tableName']
+                  table = dynamodb.Table(table_name)
+                  
+                  order_id = str(uuid.uuid4())
+                  order_data = {
+                      'orderId': order_id,
+                      'customerId': event['customerId'],
+                      'productId': event['productId'],
+                      'quantity': event['quantity'],
+                      'status': 'PENDING',
+                      'timestamp': datetime.utcnow().isoformat()
+                  }
+                  
+                  table.put_item(Item=order_data)
+                  
+                  return {
+                      'statusCode': 200,
+                      'status': 'ORDER_PLACED',
+                      'orderId': order_id,
+                      'message': 'Order placed successfully'
+                  }
+                  
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'status': 'ORDER_FAILED',
+                      'error': str(e)
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SagaPattern
+        - Key: ResourceType
+          Value: Compute
+
+  InventoryServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'saga-inventory-service-${RandomSuffix}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from boto3.dynamodb.conditions import Key
+          
+          dynamodb = boto3.resource('dynamodb')
+          
+          def lambda_handler(event, context):
+              try:
+                  table_name = event['tableName']
+                  table = dynamodb.Table(table_name)
+                  
+                  product_id = event['productId']
+                  quantity_needed = int(event['quantity'])
+                  
+                  # Get current inventory
+                  response = table.get_item(Key={'productId': product_id})
+                  
+                  if 'Item' not in response:
+                      return {
+                          'statusCode': 404,
+                          'status': 'INVENTORY_NOT_FOUND',
+                          'message': 'Product not found in inventory'
+                      }
+                  
+                  item = response['Item']
+                  available_quantity = int(item['quantity']) - int(item.get('reserved', 0))
+                  
+                  if available_quantity < quantity_needed:
+                      return {
+                          'statusCode': 400,
+                          'status': 'INSUFFICIENT_INVENTORY',
+                          'message': f'Only {available_quantity} items available'
+                      }
+                  
+                  # Reserve inventory
+                  table.update_item(
+                      Key={'productId': product_id},
+                      UpdateExpression='SET reserved = reserved + :qty',
+                      ExpressionAttributeValues={':qty': quantity_needed}
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'status': 'INVENTORY_RESERVED',
+                      'productId': product_id,
+                      'quantity': quantity_needed,
+                      'message': 'Inventory reserved successfully'
+                  }
+                  
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'status': 'INVENTORY_FAILED',
+                      'error': str(e)
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SagaPattern
+        - Key: ResourceType
+          Value: Compute
+
+  PaymentServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'saga-payment-service-${RandomSuffix}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PAYMENT_FAILURE_RATE: !Ref PaymentFailureRate
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import random
+          import os
+          from datetime import datetime
+          
+          dynamodb = boto3.resource('dynamodb')
+          
+          def lambda_handler(event, context):
+              try:
+                  table_name = event['tableName']
+                  table = dynamodb.Table(table_name)
+                  
+                  # Get failure rate from environment variable
+                  failure_rate = float(os.environ.get('PAYMENT_FAILURE_RATE', 0.2))
+                  
+                  # Simulate payment processing with configurable failure rate
+                  if random.random() < failure_rate:
+                      return {
+                          'statusCode': 400,
+                          'status': 'PAYMENT_FAILED',
+                          'message': 'Payment processing failed'
+                      }
+                  
+                  payment_id = str(uuid.uuid4())
+                  payment_data = {
+                      'paymentId': payment_id,
+                      'orderId': event['orderId'],
+                      'customerId': event['customerId'],
+                      'amount': event['amount'],
+                      'status': 'COMPLETED',
+                      'timestamp': datetime.utcnow().isoformat()
+                  }
+                  
+                  table.put_item(Item=payment_data)
+                  
+                  return {
+                      'statusCode': 200,
+                      'status': 'PAYMENT_COMPLETED',
+                      'paymentId': payment_id,
+                      'amount': event['amount'],
+                      'message': 'Payment processed successfully'
+                  }
+                  
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'status': 'PAYMENT_FAILED',
+                      'error': str(e)
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SagaPattern
+        - Key: ResourceType
+          Value: Compute
+
+  NotificationServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'saga-notification-service-${RandomSuffix}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              try:
+                  topic_arn = event['topicArn']
+                  message = event['message']
+                  subject = event.get('subject', 'Order Notification')
+                  
+                  response = sns.publish(
+                      TopicArn=topic_arn,
+                      Subject=subject,
+                      Message=json.dumps(message, indent=2)
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'status': 'NOTIFICATION_SENT',
+                      'messageId': response['MessageId'],
+                      'message': 'Notification sent successfully'
+                  }
+                  
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'status': 'NOTIFICATION_FAILED',
+                      'error': str(e)
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SagaPattern
+        - Key: ResourceType
+          Value: Compute
+
+  # Lambda Functions - Compensation Services
+  CancelOrderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'saga-cancel-order-${RandomSuffix}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          
+          dynamodb = boto3.resource('dynamodb')
+          
+          def lambda_handler(event, context):
+              try:
+                  table_name = event['tableName']
+                  table = dynamodb.Table(table_name)
+                  
+                  order_id = event['orderId']
+                  
+                  # Update order status to cancelled
+                  table.update_item(
+                      Key={'orderId': order_id},
+                      UpdateExpression='SET #status = :status',
+                      ExpressionAttributeNames={'#status': 'status'},
+                      ExpressionAttributeValues={':status': 'CANCELLED'}
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'status': 'ORDER_CANCELLED',
+                      'orderId': order_id,
+                      'message': 'Order cancelled successfully'
+                  }
+                  
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'status': 'CANCELLATION_FAILED',
+                      'error': str(e)
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SagaPattern
+        - Key: ResourceType
+          Value: Compute
+
+  RevertInventoryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'saga-revert-inventory-${RandomSuffix}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          
+          dynamodb = boto3.resource('dynamodb')
+          
+          def lambda_handler(event, context):
+              try:
+                  table_name = event['tableName']
+                  table = dynamodb.Table(table_name)
+                  
+                  product_id = event['productId']
+                  quantity = int(event['quantity'])
+                  
+                  # Release reserved inventory
+                  table.update_item(
+                      Key={'productId': product_id},
+                      UpdateExpression='SET reserved = reserved - :qty',
+                      ExpressionAttributeValues={':qty': quantity}
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'status': 'INVENTORY_REVERTED',
+                      'productId': product_id,
+                      'quantity': quantity,
+                      'message': 'Inventory reservation reverted'
+                  }
+                  
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'status': 'REVERT_FAILED',
+                      'error': str(e)
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SagaPattern
+        - Key: ResourceType
+          Value: Compute
+
+  RefundPaymentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'saga-refund-payment-${RandomSuffix}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          from datetime import datetime
+          
+          dynamodb = boto3.resource('dynamodb')
+          
+          def lambda_handler(event, context):
+              try:
+                  table_name = event['tableName']
+                  table = dynamodb.Table(table_name)
+                  
+                  # Create refund record
+                  refund_id = str(uuid.uuid4())
+                  refund_data = {
+                      'paymentId': refund_id,
+                      'originalPaymentId': event['paymentId'],
+                      'orderId': event['orderId'],
+                      'customerId': event['customerId'],
+                      'amount': event['amount'],
+                      'status': 'REFUNDED',
+                      'type': 'REFUND',
+                      'timestamp': datetime.utcnow().isoformat()
+                  }
+                  
+                  table.put_item(Item=refund_data)
+                  
+                  return {
+                      'statusCode': 200,
+                      'status': 'PAYMENT_REFUNDED',
+                      'refundId': refund_id,
+                      'amount': event['amount'],
+                      'message': 'Payment refunded successfully'
+                  }
+                  
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'status': 'REFUND_FAILED',
+                      'error': str(e)
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SagaPattern
+        - Key: ResourceType
+          Value: Compute
+
+  # Step Functions State Machine
+  SagaStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub 'saga-orchestrator-${RandomSuffix}'
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StepFunctionsLogGroup.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Saga Pattern Orchestrator for E-commerce Transactions",
+          "StartAt": "PlaceOrder",
+          "States": {
+            "PlaceOrder": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${OrderServiceFunction.Arn}",
+                "Payload": {
+                  "tableName": "${OrderTable}",
+                  "customerId.$": "$.customerId",
+                  "productId.$": "$.productId",
+                  "quantity.$": "$.quantity"
+                }
+              },
+              "ResultPath": "$.orderResult",
+              "Next": "CheckOrderStatus",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": ${RetryAttempts},
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "OrderFailed",
+                  "ResultPath": "$.error"
+                }
+              ]
+            },
+            "CheckOrderStatus": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.orderResult.Payload.status",
+                  "StringEquals": "ORDER_PLACED",
+                  "Next": "ReserveInventory"
+                }
+              ],
+              "Default": "OrderFailed"
+            },
+            "ReserveInventory": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${InventoryServiceFunction.Arn}",
+                "Payload": {
+                  "tableName": "${InventoryTable}",
+                  "productId.$": "$.productId",
+                  "quantity.$": "$.quantity"
+                }
+              },
+              "ResultPath": "$.inventoryResult",
+              "Next": "CheckInventoryStatus",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": ${RetryAttempts},
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "CancelOrder",
+                  "ResultPath": "$.error"
+                }
+              ]
+            },
+            "CheckInventoryStatus": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.inventoryResult.Payload.status",
+                  "StringEquals": "INVENTORY_RESERVED",
+                  "Next": "ProcessPayment"
+                }
+              ],
+              "Default": "CancelOrder"
+            },
+            "ProcessPayment": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${PaymentServiceFunction.Arn}",
+                "Payload": {
+                  "tableName": "${PaymentTable}",
+                  "orderId.$": "$.orderResult.Payload.orderId",
+                  "customerId.$": "$.customerId",
+                  "amount.$": "$.amount"
+                }
+              },
+              "ResultPath": "$.paymentResult",
+              "Next": "CheckPaymentStatus",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": ${RetryAttempts},
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "RevertInventory",
+                  "ResultPath": "$.error"
+                }
+              ]
+            },
+            "CheckPaymentStatus": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.paymentResult.Payload.status",
+                  "StringEquals": "PAYMENT_COMPLETED",
+                  "Next": "SendSuccessNotification"
+                }
+              ],
+              "Default": "RevertInventory"
+            },
+            "SendSuccessNotification": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${NotificationServiceFunction.Arn}",
+                "Payload": {
+                  "topicArn": "${NotificationTopic}",
+                  "subject": "Order Completed Successfully",
+                  "message": {
+                    "orderId.$": "$.orderResult.Payload.orderId",
+                    "customerId.$": "$.customerId",
+                    "status": "SUCCESS",
+                    "details": "Your order has been processed successfully"
+                  }
+                }
+              },
+              "ResultPath": "$.notificationResult",
+              "Next": "Success"
+            },
+            "Success": {
+              "Type": "Pass",
+              "Result": {
+                "status": "SUCCESS",
+                "message": "Transaction completed successfully"
+              },
+              "End": true
+            },
+            "RevertInventory": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${RevertInventoryFunction.Arn}",
+                "Payload": {
+                  "tableName": "${InventoryTable}",
+                  "productId.$": "$.productId",
+                  "quantity.$": "$.quantity"
+                }
+              },
+              "ResultPath": "$.revertResult",
+              "Next": "CancelOrder",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "CompensationFailed",
+                  "ResultPath": "$.compensationError"
+                }
+              ]
+            },
+            "CancelOrder": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${CancelOrderFunction.Arn}",
+                "Payload": {
+                  "tableName": "${OrderTable}",
+                  "orderId.$": "$.orderResult.Payload.orderId"
+                }
+              },
+              "ResultPath": "$.cancelResult",
+              "Next": "RefundPayment",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "CompensationFailed",
+                  "ResultPath": "$.compensationError"
+                }
+              ]
+            },
+            "RefundPayment": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${RefundPaymentFunction.Arn}",
+                "Payload": {
+                  "tableName": "${PaymentTable}",
+                  "paymentId.$": "$.paymentResult.Payload.paymentId",
+                  "orderId.$": "$.orderResult.Payload.orderId",
+                  "customerId.$": "$.customerId",
+                  "amount.$": "$.amount"
+                }
+              },
+              "ResultPath": "$.refundResult",
+              "Next": "SendFailureNotification",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "CompensationFailed",
+                  "ResultPath": "$.compensationError"
+                }
+              ]
+            },
+            "SendFailureNotification": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${NotificationServiceFunction.Arn}",
+                "Payload": {
+                  "topicArn": "${NotificationTopic}",
+                  "subject": "Order Processing Failed",
+                  "message": {
+                    "orderId.$": "$.orderResult.Payload.orderId",
+                    "customerId.$": "$.customerId",
+                    "status": "FAILED",
+                    "details": "Your order could not be processed and has been cancelled"
+                  }
+                }
+              },
+              "ResultPath": "$.notificationResult",
+              "Next": "TransactionFailed"
+            },
+            "OrderFailed": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${NotificationServiceFunction.Arn}",
+                "Payload": {
+                  "topicArn": "${NotificationTopic}",
+                  "subject": "Order Creation Failed",
+                  "message": {
+                    "customerId.$": "$.customerId",
+                    "status": "FAILED",
+                    "details": "Order creation failed"
+                  }
+                }
+              },
+              "ResultPath": "$.notificationResult",
+              "Next": "TransactionFailed"
+            },
+            "TransactionFailed": {
+              "Type": "Pass",
+              "Result": {
+                "status": "FAILED",
+                "message": "Transaction failed and compensations completed"
+              },
+              "End": true
+            },
+            "CompensationFailed": {
+              "Type": "Pass",
+              "Result": {
+                "status": "COMPENSATION_FAILED",
+                "message": "Transaction failed and compensation actions also failed"
+              },
+              "End": true
+            }
+          }
+        }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SagaPattern
+        - Key: ResourceType
+          Value: Workflow
+
+  # IAM Role for API Gateway
+  ApiGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'saga-api-gateway-role-${RandomSuffix}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref SagaStateMachine
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SagaPattern
+        - Key: ResourceType
+          Value: Security
+
+  # API Gateway
+  SagaApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub 'saga-api-${RandomSuffix}'
+      Description: 'API for initiating saga transactions'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SagaPattern
+        - Key: ResourceType
+          Value: API
+
+  # API Gateway Resources
+  OrdersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SagaApi
+      ParentId: !GetAtt SagaApi.RootResourceId
+      PathPart: 'orders'
+
+  # API Gateway Method
+  OrdersPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SagaApi
+      ResourceId: !Ref OrdersResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:states:action/StartExecution'
+        Credentials: !GetAtt ApiGatewayRole.Arn
+        RequestTemplates:
+          application/json: !Sub |
+            {
+              "stateMachineArn": "${SagaStateMachine}",
+              "input": "$util.escapeJavaScript($input.body)"
+            }
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: |
+                {
+                  "executionArn": "$input.path('$.executionArn')",
+                  "startDate": "$input.path('$.startDate')"
+                }
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: 'Empty'
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: OrdersPostMethod
+    Properties:
+      RestApiId: !Ref SagaApi
+      StageName: prod
+      StageDescription: 'Production stage for Saga API'
+
+  # Initialize Sample Inventory Data using Lambda Custom Resource
+  InitializeInventoryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'saga-initialize-inventory-${RandomSuffix}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          
+          dynamodb = boto3.resource('dynamodb')
+          
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Create':
+                      table_name = event['ResourceProperties']['TableName']
+                      table = dynamodb.Table(table_name)
+                      
+                      # Create sample inventory items
+                      sample_items = [
+                          {
+                              'productId': 'laptop-001',
+                              'quantity': 10,
+                              'price': 999.99,
+                              'reserved': 0
+                          },
+                          {
+                              'productId': 'phone-002',
+                              'quantity': 25,
+                              'price': 599.99,
+                              'reserved': 0
+                          }
+                      ]
+                      
+                      for item in sample_items:
+                          table.put_item(Item=item)
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  InitializeInventoryCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: InventoryTable
+    Properties:
+      ServiceToken: !GetAtt InitializeInventoryFunction.Arn
+      TableName: !Ref InventoryTable
+
+Outputs:
+  # DynamoDB Table Names
+  OrderTableName:
+    Description: 'Name of the Order DynamoDB table'
+    Value: !Ref OrderTable
+    Export:
+      Name: !Sub '${AWS::StackName}-OrderTableName'
+
+  InventoryTableName:
+    Description: 'Name of the Inventory DynamoDB table'
+    Value: !Ref InventoryTable
+    Export:
+      Name: !Sub '${AWS::StackName}-InventoryTableName'
+
+  PaymentTableName:
+    Description: 'Name of the Payment DynamoDB table'
+    Value: !Ref PaymentTable
+    Export:
+      Name: !Sub '${AWS::StackName}-PaymentTableName'
+
+  # SNS Topic
+  NotificationTopicArn:
+    Description: 'ARN of the SNS notification topic'
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopicArn'
+
+  # Step Functions State Machine
+  SagaStateMachineArn:
+    Description: 'ARN of the Saga orchestrator state machine'
+    Value: !Ref SagaStateMachine
+    Export:
+      Name: !Sub '${AWS::StackName}-SagaStateMachineArn'
+
+  # API Gateway
+  ApiEndpoint:
+    Description: 'API Gateway endpoint URL'
+    Value: !Sub 'https://${SagaApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiEndpoint'
+
+  # Lambda Function ARNs
+  OrderServiceFunctionArn:
+    Description: 'ARN of the Order Service Lambda function'
+    Value: !GetAtt OrderServiceFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OrderServiceFunctionArn'
+
+  InventoryServiceFunctionArn:
+    Description: 'ARN of the Inventory Service Lambda function'
+    Value: !GetAtt InventoryServiceFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-InventoryServiceFunctionArn'
+
+  PaymentServiceFunctionArn:
+    Description: 'ARN of the Payment Service Lambda function'
+    Value: !GetAtt PaymentServiceFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PaymentServiceFunctionArn'
+
+  NotificationServiceFunctionArn:
+    Description: 'ARN of the Notification Service Lambda function'
+    Value: !GetAtt NotificationServiceFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationServiceFunctionArn'
+
+  # Usage Instructions
+  TestCommand:
+    Description: 'Sample curl command to test the API'
+    Value: !Sub |
+      curl -X POST https://${SagaApi}.execute-api.${AWS::Region}.amazonaws.com/prod/orders \
+      -H "Content-Type: application/json" \
+      -d '{"customerId": "customer-123", "productId": "laptop-001", "quantity": 2, "amount": 1999.98}'
+
+  # Monitoring
+  StepFunctionsConsoleUrl:
+    Description: 'URL to view Step Functions executions in AWS Console'
+    Value: !Sub 'https://console.aws.amazon.com/states/home?region=${AWS::Region}#/statemachines/view/${SagaStateMachine}'
+
+  CloudWatchLogGroupName:
+    Description: 'CloudWatch Log Group name for Step Functions'
+    Value: !Ref StepFunctionsLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchLogGroupName'

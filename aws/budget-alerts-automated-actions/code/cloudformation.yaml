@@ -1,0 +1,689 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure as Code for Budget Alerts and Automated Cost Actions - Comprehensive cost monitoring with automated alerts and actions that proactively manage spending'
+
+# CloudFormation template parameters for customizing the budget solution
+Parameters:
+  BudgetAmount:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 1000000
+    Description: 'Monthly budget amount in USD for cost monitoring and alerts'
+    
+  NotificationEmail:
+    Type: String
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    ConstraintDescription: 'Must be a valid email address for budget notifications'
+    Description: 'Email address to receive budget alerts and notifications'
+    
+  BudgetName:
+    Type: String
+    Default: 'cost-control-budget'
+    MinLength: 3
+    MaxLength: 100
+    AllowedPattern: '^[a-zA-Z0-9\-_]+$'
+    ConstraintDescription: 'Budget name must contain only alphanumeric characters, hyphens, and underscores'
+    Description: 'Unique name for the AWS Budget to identify in console and alerts'
+    
+  EnvironmentType:
+    Type: String
+    Default: 'Production'
+    AllowedValues:
+      - 'Development'
+      - 'Testing'
+      - 'Staging'
+      - 'Production'
+    Description: 'Environment type for resource tagging and cost allocation'
+    
+  EnableAutomatedActions:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable automated Lambda-based actions when budget thresholds are exceeded'
+    
+  MaxInstanceTypesAllowed:
+    Type: CommaDelimitedList
+    Default: 't3.nano,t3.micro,t3.small'
+    Description: 'Comma-separated list of allowed EC2 instance types when budget restrictions are active'
+
+# Conditional resource creation based on parameters
+Conditions:
+  EnableLambdaActions: !Equals [!Ref EnableAutomatedActions, 'true']
+  IsProductionEnvironment: !Equals [!Ref EnvironmentType, 'Production']
+
+# Metadata for CloudFormation console and documentation
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Budget Configuration'
+        Parameters:
+          - BudgetName
+          - BudgetAmount
+          - NotificationEmail
+      - Label:
+          default: 'Automation Settings'
+        Parameters:
+          - EnableAutomatedActions
+          - MaxInstanceTypesAllowed
+      - Label:
+          default: 'Environment Configuration'
+        Parameters:
+          - EnvironmentType
+    ParameterLabels:
+      BudgetAmount:
+        default: 'Monthly Budget Limit ($)'
+      NotificationEmail:
+        default: 'Notification Email Address'
+      BudgetName:
+        default: 'Budget Name'
+      EnvironmentType:
+        default: 'Environment Type'
+      EnableAutomatedActions:
+        default: 'Enable Automated Actions'
+      MaxInstanceTypesAllowed:
+        default: 'Allowed Instance Types'
+
+Resources:
+  # SNS Topic for budget alert notifications with comprehensive configuration
+  BudgetAlertTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      TopicName: !Sub '${BudgetName}-alerts'
+      DisplayName: !Sub 'Budget Alerts for ${BudgetName}'
+      KmsMasterKeyId: 'alias/aws/sns'  # Enable encryption at rest
+      Tags:
+        - Key: 'Purpose'
+          Value: 'BudgetAlerts'
+        - Key: 'Environment'
+          Value: !Ref EnvironmentType
+        - Key: 'ManagedBy'
+          Value: 'CloudFormation'
+        - Key: 'Budget'
+          Value: !Ref BudgetName
+
+  # Email subscription to SNS topic for human notifications
+  BudgetEmailSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      Protocol: 'email'
+      TopicArn: !Ref BudgetAlertTopic
+      Endpoint: !Ref NotificationEmail
+      # Email subscriptions require manual confirmation
+
+  # IAM execution role for Lambda function with comprehensive permissions
+  LambdaBudgetActionRole:
+    Type: 'AWS::IAM::Role'
+    Condition: EnableLambdaActions
+    Properties:
+      RoleName: !Sub '${BudgetName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'  # CloudWatch Logs permissions
+      Policies:
+        - PolicyName: 'BudgetActionPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # EC2 permissions for instance management
+              - Effect: Allow
+                Action:
+                  - 'ec2:DescribeInstances'
+                  - 'ec2:DescribeInstanceStatus'
+                  - 'ec2:StopInstances'
+                  - 'ec2:StartInstances'
+                Resource: '*'
+              # SNS permissions for sending notifications
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref BudgetAlertTopic
+              # CloudWatch Logs permissions for function logging
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+              # Budget permissions for monitoring
+              - Effect: Allow
+                Action:
+                  - 'budgets:ViewBudget'
+                  - 'budgets:ModifyBudget'
+                Resource: '*'
+      Tags:
+        - Key: 'Purpose'
+          Value: 'BudgetAutomation'
+        - Key: 'Environment'
+          Value: !Ref EnvironmentType
+
+  # Lambda function for automated budget actions with intelligent cost control
+  BudgetActionFunction:
+    Type: 'AWS::Lambda::Function'
+    Condition: EnableLambdaActions
+    Properties:
+      FunctionName: !Sub '${BudgetName}-automated-actions'
+      Runtime: 'python3.9'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaBudgetActionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Description: 'Automated budget action function for intelligent cost control'
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref BudgetAlertTopic
+          BUDGET_NAME: !Ref BudgetName
+          ENVIRONMENT_TYPE: !Ref EnvironmentType
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from typing import List, Dict, Any
+          
+          # Configure logging for comprehensive observability
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              Main Lambda handler for processing budget alerts and executing automated cost control actions.
+              
+              This function responds to SNS notifications from AWS Budgets by:
+              1. Parsing budget alert messages to understand severity
+              2. Identifying development instances eligible for shutdown
+              3. Executing targeted cost control measures
+              4. Sending detailed notifications about actions taken
+              
+              Args:
+                  event: SNS event containing budget alert information
+                  context: Lambda execution context with runtime information
+                  
+              Returns:
+                  Dict containing execution status and actions taken
+              """
+              try:
+                  # Initialize AWS service clients
+                  ec2_client = boto3.client('ec2')
+                  sns_client = boto3.client('sns')
+                  
+                  # Extract environment variables
+                  sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
+                  budget_name = os.environ.get('BUDGET_NAME', 'Unknown')
+                  environment_type = os.environ.get('ENVIRONMENT_TYPE', 'Unknown')
+                  
+                  # Parse SNS message to extract budget alert details
+                  if 'Records' in event and len(event['Records']) > 0:
+                      sns_message = event['Records'][0]['Sns']['Message']
+                      try:
+                          budget_alert = json.loads(sns_message)
+                          logger.info(f"Processing budget alert: {budget_alert}")
+                      except json.JSONDecodeError:
+                          # Handle test messages or non-JSON content
+                          budget_alert = {
+                              'BudgetName': budget_name,
+                              'AccountId': context.invoked_function_arn.split(':')[4],
+                              'AlertType': 'TEST',
+                              'Message': sns_message
+                          }
+                  else:
+                      # Handle direct invocation or test events
+                      budget_alert = {
+                          'BudgetName': budget_name,
+                          'AccountId': context.invoked_function_arn.split(':')[4],
+                          'AlertType': 'DIRECT_INVOCATION'
+                      }
+                  
+                  alert_budget_name = budget_alert.get('BudgetName', budget_name)
+                  account_id = budget_alert.get('AccountId', 'Unknown')
+                  alert_type = budget_alert.get('AlertType', 'Unknown')
+                  
+                  logger.info(f"Budget alert triggered - Budget: {alert_budget_name}, Account: {account_id}, Type: {alert_type}")
+                  
+                  # Identify development instances for potential shutdown
+                  development_instances = find_development_instances(ec2_client)
+                  
+                  actions_taken = []
+                  instances_stopped = []
+                  
+                  # Execute cost control measures based on alert severity
+                  if development_instances:
+                      instances_stopped = stop_development_instances(ec2_client, development_instances)
+                      if instances_stopped:
+                          actions_taken.append(f"Stopped {len(instances_stopped)} development instances")
+                          logger.info(f"Successfully stopped {len(instances_stopped)} development instances: {instances_stopped}")
+                  
+                  # Send comprehensive notification about actions taken
+                  if sns_topic_arn:
+                      send_action_notification(
+                          sns_client, 
+                          sns_topic_arn, 
+                          alert_budget_name, 
+                          actions_taken, 
+                          instances_stopped,
+                          alert_type
+                      )
+                  
+                  # Return execution summary
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Budget action completed for {alert_budget_name}',
+                          'budget_name': alert_budget_name,
+                          'account_id': account_id,
+                          'alert_type': alert_type,
+                          'instances_stopped': len(instances_stopped),
+                          'actions_taken': actions_taken,
+                          'environment': environment_type
+                      })
+                  }
+                  
+              except Exception as e:
+                  error_message = f"Error executing budget action: {str(e)}"
+                  logger.error(error_message, exc_info=True)
+                  
+                  # Send error notification if possible
+                  try:
+                      sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
+                      if sns_topic_arn:
+                          sns_client = boto3.client('sns')
+                          sns_client.publish(
+                              TopicArn=sns_topic_arn,
+                              Subject=f'Budget Action Error - {budget_name}',
+                              Message=f'Error executing automated budget action:\n\n{error_message}\n\nPlease review CloudWatch logs for detailed information.'
+                          )
+                  except Exception as notification_error:
+                      logger.error(f"Failed to send error notification: {notification_error}")
+                  
+                  # Re-raise the original exception
+                  raise e
+          
+          def find_development_instances(ec2_client) -> List[Dict[str, Any]]:
+              """
+              Identify EC2 instances tagged as development environments that are eligible for automated shutdown.
+              
+              This function searches for running instances with development-related tags,
+              ensuring production workloads are protected from automated actions.
+              
+              Args:
+                  ec2_client: Boto3 EC2 client for instance operations
+                  
+              Returns:
+                  List of development instance dictionaries with metadata
+              """
+              try:
+                  # Query for running development instances using multiple tag patterns
+                  response = ec2_client.describe_instances(
+                      Filters=[
+                          {'Name': 'instance-state-name', 'Values': ['running']},
+                          {'Name': 'tag:Environment', 'Values': ['Development', 'Dev', 'development', 'dev']}
+                      ]
+                  )
+                  
+                  development_instances = []
+                  
+                  # Extract instance details for cost control decisions
+                  for reservation in response['Reservations']:
+                      for instance in reservation['Instances']:
+                          instance_info = {
+                              'InstanceId': instance['InstanceId'],
+                              'InstanceType': instance.get('InstanceType', 'Unknown'),
+                              'LaunchTime': instance.get('LaunchTime'),
+                              'Tags': {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])}
+                          }
+                          development_instances.append(instance_info)
+                  
+                  logger.info(f"Found {len(development_instances)} development instances eligible for cost control")
+                  return development_instances
+                  
+              except Exception as e:
+                  logger.error(f"Error finding development instances: {e}")
+                  return []
+          
+          def stop_development_instances(ec2_client, instances: List[Dict[str, Any]]) -> List[str]:
+              """
+              Stop development instances to implement immediate cost control measures.
+              
+              This function safely stops development instances while maintaining
+              audit trails and error handling for reliable cost management.
+              
+              Args:
+                  ec2_client: Boto3 EC2 client for instance operations
+                  instances: List of development instance dictionaries
+                  
+              Returns:
+                  List of successfully stopped instance IDs
+              """
+              if not instances:
+                  return []
+              
+              instance_ids = [instance['InstanceId'] for instance in instances]
+              stopped_instances = []
+              
+              try:
+                  # Execute instance shutdown with error handling
+                  response = ec2_client.stop_instances(InstanceIds=instance_ids)
+                  
+                  # Verify stopping instances and collect successful actions
+                  for instance_change in response.get('StoppingInstances', []):
+                      instance_id = instance_change['InstanceId']
+                      current_state = instance_change['CurrentState']['Name']
+                      
+                      if current_state in ['stopping', 'stopped']:
+                          stopped_instances.append(instance_id)
+                          logger.info(f"Successfully initiated stop for instance {instance_id}")
+                      else:
+                          logger.warning(f"Unexpected state {current_state} for instance {instance_id}")
+                  
+              except Exception as e:
+                  logger.error(f"Error stopping development instances: {e}")
+                  # Continue execution to send notifications about partial success
+              
+              return stopped_instances
+          
+          def send_action_notification(sns_client, topic_arn: str, budget_name: str, 
+                                     actions_taken: List[str], instances_stopped: List[str], 
+                                     alert_type: str) -> None:
+              """
+              Send comprehensive notification about budget actions taken.
+              
+              This function provides detailed reporting on automated cost control
+              measures, enabling stakeholders to understand and audit actions.
+              
+              Args:
+                  sns_client: Boto3 SNS client for notifications
+                  topic_arn: SNS topic ARN for message delivery
+                  budget_name: Name of the budget that triggered actions
+                  actions_taken: List of action descriptions
+                  instances_stopped: List of stopped instance IDs
+                  alert_type: Type of budget alert that triggered actions
+              """
+              try:
+                  # Construct detailed notification message
+                  if actions_taken:
+                      subject = f'Budget Action Executed - {budget_name}'
+                      message_lines = [
+                          f'Automated budget action completed for budget: {budget_name}',
+                          f'Alert Type: {alert_type}',
+                          f'Timestamp: {boto3.Session().region_name} time',
+                          '',
+                          'Actions Taken:',
+                          *[f'• {action}' for action in actions_taken],
+                          ''
+                      ]
+                      
+                      if instances_stopped:
+                          message_lines.extend([
+                              'Stopped Instances:',
+                              *[f'• {instance_id}' for instance_id in instances_stopped],
+                              '',
+                              'Cost Impact: Immediate reduction in compute charges',
+                              'Next Steps: Review stopped instances and restart when appropriate'
+                          ])
+                  else:
+                      subject = f'Budget Alert Processed - {budget_name}'
+                      message_lines = [
+                          f'Budget alert processed for budget: {budget_name}',
+                          f'Alert Type: {alert_type}',
+                          '',
+                          'No automated actions were required at this time.',
+                          'All development instances may already be stopped or no eligible instances found.'
+                      ]
+                  
+                  message = '\n'.join(message_lines)
+                  
+                  # Send notification via SNS
+                  sns_client.publish(
+                      TopicArn=topic_arn,
+                      Subject=subject,
+                      Message=message
+                  )
+                  
+                  logger.info(f"Sent action notification for budget {budget_name}")
+                  
+              except Exception as e:
+                  logger.error(f"Error sending action notification: {e}")
+      Tags:
+        - Key: 'Purpose'
+          Value: 'BudgetAutomation'
+        - Key: 'Environment'
+          Value: !Ref EnvironmentType
+
+  # Lambda permission to allow SNS to invoke the function
+  LambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Condition: EnableLambdaActions
+    Properties:
+      FunctionName: !Ref BudgetActionFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'sns.amazonaws.com'
+      SourceArn: !Ref BudgetAlertTopic
+
+  # SNS subscription for Lambda function to receive budget alerts
+  LambdaSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Condition: EnableLambdaActions
+    Properties:
+      Protocol: 'lambda'
+      TopicArn: !Ref BudgetAlertTopic
+      Endpoint: !GetAtt BudgetActionFunction.Arn
+
+  # IAM role for AWS Budgets service to execute budget actions
+  BudgetServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${BudgetName}-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: budgets.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/BudgetsActionsWithAWSResourceControlAccess'
+      Tags:
+        - Key: 'Purpose'
+          Value: 'BudgetService'
+        - Key: 'Environment'
+          Value: !Ref EnvironmentType
+
+  # IAM policy for restricting resource creation when budget limits are exceeded
+  BudgetRestrictionPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: !Sub '${BudgetName}-restriction-policy'
+      Description: 'Policy to restrict expensive resource creation when budget limits are exceeded'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Deny large EC2 instances to prevent budget overruns
+          - Effect: Deny
+            Action:
+              - 'ec2:RunInstances'
+              - 'ec2:StartInstances'
+            Resource: 'arn:aws:ec2:*:*:instance/*'
+            Condition:
+              StringNotEquals:
+                'ec2:InstanceType': !Ref MaxInstanceTypesAllowed
+          # Deny large RDS instances to control database costs
+          - Effect: Deny
+            Action:
+              - 'rds:CreateDBInstance'
+              - 'rds:StartDBInstance'
+            Resource: '*'
+            Condition:
+              StringNotEquals:
+                'rds:db-instance-class':
+                  - 'db.t3.micro'
+                  - 'db.t3.small'
+                  - 'db.t4g.micro'
+                  - 'db.t4g.small'
+          # Deny expensive storage classes to control storage costs
+          - Effect: Deny
+            Action:
+              - 'ec2:CreateVolume'
+            Resource: '*'
+            Condition:
+              StringNotEquals:
+                'ec2:VolumeType':
+                  - 'gp3'
+                  - 'gp2'
+                  - 'standard'
+
+  # AWS Budget with comprehensive cost monitoring and multi-threshold alerts
+  CostControlBudget:
+    Type: 'AWS::Budgets::Budget'
+    Properties:
+      Budget:
+        BudgetName: !Ref BudgetName
+        BudgetLimit:
+          Amount: !Ref BudgetAmount
+          Unit: 'USD'
+        BudgetType: 'COST'
+        TimeUnit: 'MONTHLY'
+        CostTypes:
+          IncludeCredit: false
+          IncludeDiscount: true
+          IncludeOtherSubscription: true
+          IncludeRecurring: true
+          IncludeRefund: true
+          IncludeSubscription: true
+          IncludeSupport: true
+          IncludeTax: true
+          IncludeUpfront: true
+          UseBlended: false
+          UseAmortized: false
+        # Optional cost filters for targeted budget monitoring
+        CostFilters:
+          Service:
+            - 'Amazon Elastic Compute Cloud - Compute'
+            - 'Amazon Relational Database Service'
+            - 'Amazon Simple Storage Service'
+            - 'AWS Lambda'
+      # Multi-threshold notification system for graduated cost control
+      NotificationsWithSubscribers:
+        # Early warning at 80% actual spend
+        - Notification:
+            NotificationType: 'ACTUAL'
+            ComparisonOperator: 'GREATER_THAN'
+            Threshold: 80
+            ThresholdType: 'PERCENTAGE'
+          Subscribers:
+            - SubscriptionType: 'EMAIL'
+              Address: !Ref NotificationEmail
+            - SubscriptionType: 'SNS'
+              Address: !Ref BudgetAlertTopic
+        # Forecasted alert at 90% predicted spend
+        - Notification:
+            NotificationType: 'FORECASTED'
+            ComparisonOperator: 'GREATER_THAN'
+            Threshold: 90
+            ThresholdType: 'PERCENTAGE'
+          Subscribers:
+            - SubscriptionType: 'EMAIL'
+              Address: !Ref NotificationEmail
+            - SubscriptionType: 'SNS'
+              Address: !Ref BudgetAlertTopic
+        # Critical alert at 100% actual spend
+        - Notification:
+            NotificationType: 'ACTUAL'
+            ComparisonOperator: 'GREATER_THAN'
+            Threshold: 100
+            ThresholdType: 'PERCENTAGE'
+          Subscribers:
+            - SubscriptionType: 'EMAIL'
+              Address: !Ref NotificationEmail
+            - SubscriptionType: 'SNS'
+              Address: !Ref BudgetAlertTopic
+
+# Comprehensive outputs for integration and monitoring
+Outputs:
+  BudgetName:
+    Description: 'Name of the created AWS Budget for cost monitoring'
+    Value: !Ref BudgetName
+    Export:
+      Name: !Sub '${AWS::StackName}-BudgetName'
+
+  BudgetAmount:
+    Description: 'Monthly budget limit in USD for cost control'
+    Value: !Ref BudgetAmount
+    Export:
+      Name: !Sub '${AWS::StackName}-BudgetAmount'
+
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for budget alerts and notifications'
+    Value: !Ref BudgetAlertTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopic'
+
+  SNSTopicName:
+    Description: 'Name of the SNS topic for integration with other services'
+    Value: !GetAtt BudgetAlertTopic.TopicName
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicName'
+
+  LambdaFunctionArn:
+    Condition: EnableLambdaActions
+    Description: 'ARN of the Lambda function for automated budget actions'
+    Value: !GetAtt BudgetActionFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
+
+  LambdaFunctionName:
+    Condition: EnableLambdaActions
+    Description: 'Name of the Lambda function for monitoring and integration'
+    Value: !Ref BudgetActionFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  BudgetServiceRoleArn:
+    Description: 'ARN of the IAM role used by AWS Budgets service for actions'
+    Value: !GetAtt BudgetServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BudgetServiceRole'
+
+  RestrictionPolicyArn:
+    Description: 'ARN of the IAM policy for budget-based resource restrictions'
+    Value: !Ref BudgetRestrictionPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-RestrictionPolicy'
+
+  NotificationEmail:
+    Description: 'Email address configured for budget notifications'
+    Value: !Ref NotificationEmail
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationEmail'
+
+  EnvironmentType:
+    Description: 'Environment type for resource classification and cost allocation'
+    Value: !Ref EnvironmentType
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+  StackRegion:
+    Description: 'AWS region where the budget monitoring stack is deployed'
+    Value: !Ref 'AWS::Region'
+    Export:
+      Name: !Sub '${AWS::StackName}-Region'
+
+  CloudFormationConsoleURL:
+    Description: 'Direct link to CloudFormation stack in AWS Console for monitoring'
+    Value: !Sub 'https://console.aws.amazon.com/cloudformation/home?region=${AWS::Region}#/stacks/stackinfo?stackId=${AWS::StackId}'
+
+  BudgetConsoleURL:
+    Description: 'Direct link to AWS Budgets console for budget monitoring and management'
+    Value: !Sub 'https://console.aws.amazon.com/billing/home?region=${AWS::Region}#/budgets'
+
+  DeploymentInstructions:
+    Description: 'Next steps after successful CloudFormation deployment'
+    Value: '1. Confirm email subscription in your inbox 2. Tag development EC2 instances with Environment=Development 3. Monitor budget alerts in SNS topic 4. Review Lambda function logs in CloudWatch'

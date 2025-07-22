@@ -1,0 +1,577 @@
+# Infrastructure Manager Configuration for Container Security Pipeline
+# This configuration deploys a complete container security pipeline with Binary Authorization and Cloud Deploy
+# Recipe: Container Security Pipeline with Binary Authorization and Cloud Deploy
+
+# Import required modules
+imports:
+  - path: https://github.com/GoogleCloudPlatform/cloud-foundation-toolkit/tree/master/infra/blueprint-test/examples/simple_example
+
+# Global variables for resource configuration
+variables:
+  # Project configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    default: "container-security-demo"
+  
+  # Regional configuration
+  region:
+    type: string
+    description: "Primary region for resources"
+    default: "us-central1"
+  
+  zone:
+    type: string
+    description: "Zone for GKE clusters"
+    default: "us-central1-a"
+  
+  # Naming configuration
+  random_suffix:
+    type: string
+    description: "Random suffix for unique resource names"
+    default: "$(generate_random_string(6))"
+  
+  # Repository configuration
+  repository_name:
+    type: string
+    description: "Artifact Registry repository name"
+    default: "secure-apps-repo"
+  
+  # Binary Authorization configuration
+  attestor_name:
+    type: string
+    description: "Binary Authorization attestor name"
+    default: "build-attestor"
+  
+  note_id:
+    type: string
+    description: "Container Analysis note ID"
+    default: "build-note"
+  
+  # GKE configuration
+  staging_cluster_name:
+    type: string
+    description: "Staging GKE cluster name"
+    default: "staging-cluster"
+  
+  production_cluster_name:
+    type: string
+    description: "Production GKE cluster name"
+    default: "prod-cluster"
+  
+  node_count:
+    type: integer
+    description: "Number of nodes per cluster"
+    default: 3
+  
+  machine_type:
+    type: string
+    description: "Machine type for GKE nodes"
+    default: "e2-standard-2"
+  
+  # Cloud Deploy configuration
+  pipeline_name:
+    type: string
+    description: "Cloud Deploy pipeline name"
+    default: "secure-app-pipeline"
+
+# Resource definitions
+resources:
+  # Enable required APIs
+  enable_apis:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      parent: projects/$(ref.project_id.value)
+      services:
+        - container.googleapis.com
+        - cloudbuild.googleapis.com
+        - artifactregistry.googleapis.com
+        - binaryauthorization.googleapis.com
+        - clouddeploy.googleapis.com
+        - containeranalysis.googleapis.com
+        - compute.googleapis.com
+        - iam.googleapis.com
+    metadata:
+      dependsOn:
+        - project_id
+
+  # Artifact Registry repository for secure container images
+  artifact_registry_repository:
+    type: gcp-types/artifactregistry-v1:projects.locations.repositories
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      repositoryId: $(ref.repository_name.value)
+      repository:
+        description: "Secure container repository with vulnerability scanning"
+        format: DOCKER
+        dockerConfig:
+          immutableTags: false
+    metadata:
+      dependsOn:
+        - enable_apis
+
+  # Service Account for Cloud Build with necessary permissions
+  cloudbuild_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      parent: projects/$(ref.project_id.value)
+      accountId: cloudbuild-security-sa
+      serviceAccount:
+        displayName: "Cloud Build Security Service Account"
+        description: "Service account for Cloud Build with Binary Authorization permissions"
+    metadata:
+      dependsOn:
+        - enable_apis
+
+  # IAM binding for Cloud Build service account - Binary Authorization Attestor Admin
+  cloudbuild_binauthz_admin_binding:
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: $(ref.project_id.value)
+      policy:
+        bindings:
+          - role: roles/binaryauthorization.attestorsAdmin
+            members:
+              - serviceAccount:$(ref.cloudbuild_service_account.email)
+    metadata:
+      dependsOn:
+        - cloudbuild_service_account
+
+  # IAM binding for Cloud Build service account - Container Analysis Admin
+  cloudbuild_container_analysis_binding:
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: $(ref.project_id.value)
+      policy:
+        bindings:
+          - role: roles/containeranalysis.admin
+            members:
+              - serviceAccount:$(ref.cloudbuild_service_account.email)
+    metadata:
+      dependsOn:
+        - cloudbuild_service_account
+
+  # Container Analysis note for attestations
+  container_analysis_note:
+    type: gcp-types/containeranalysis-v1beta1:projects.notes
+    properties:
+      parent: projects/$(ref.project_id.value)
+      noteId: $(ref.note_id.value)-$(ref.random_suffix.value)
+      note:
+        name: projects/$(ref.project_id.value)/notes/$(ref.note_id.value)-$(ref.random_suffix.value)
+        shortDescription: "Build verification attestor note"
+        longDescription: "Container Analysis note for Binary Authorization build verification"
+        attestationAuthority:
+          hint:
+            humanReadableName: "Build verification attestor"
+    metadata:
+      dependsOn:
+        - enable_apis
+
+  # Binary Authorization attestor
+  binary_authorization_attestor:
+    type: gcp-types/binaryauthorization-v1:projects.attestors
+    properties:
+      parent: projects/$(ref.project_id.value)
+      attestorId: $(ref.attestor_name.value)-$(ref.random_suffix.value)
+      attestor:
+        name: projects/$(ref.project_id.value)/attestors/$(ref.attestor_name.value)-$(ref.random_suffix.value)
+        description: "Binary Authorization attestor for build verification"
+        attestationAuthorityNote:
+          noteReference: $(ref.container_analysis_note.name)
+          publicKeys:
+            - id: "build-key-1"
+              asciiArmoredPgpPublicKey: |
+                -----BEGIN PGP PUBLIC KEY BLOCK-----
+                Comment: Build verification key
+                
+                mQENBGLxyzABCADH+J9vK2n8C5L5vZ1+2q3F4g9H8r6T2c3V4b5N6m7O8p9Q0r1S
+                2t3U4v5W6x7Y8z9A0b1C2d3E4f5G6h7I8j9K0l1M2n3O4p5Q6r7S8t9U0v1W2x3Y
+                4z5A6b7C8d9E0f1G2h3I4j5K6l7M8n9O0p1Q2r3S4t5U6v7W8x9Y0z1A2b3C4d5E
+                6f7G8h9I0j1K2l3M4n5O6p7Q8r9S0t1U2v3W4x5Y6z7A8b9C0d1E2f3G4h5I6j7K
+                8l9M0n1O2p3Q4r5S6t7U8v9W0x1Y2z3A4b5C6d7E8f9G0h1I2j3K4l5M6n7O8p9Q
+                0r1S2t3U4v5W6x7Y8z9A0b1C2d3E4f5G6h7I8j9K0l1M2n3O4p5Q6r7S8t9U0v1W
+                ABEBAAG0IkJ1aWxkIEF0dGVzdG9yIDxidWlsZEBleGFtcGxlLmNvbT6JATgEEwEI
+                ACIFAmLxyzACGwMGCwkIBwMCBhUIAgkKCwQWAgMBAh4BAheAAAoJEL2vN4j1p2Xk
+                RhsIAJgF2Q9h5K8J9m6N3o7P8q1R4s5T6u7V8w9X0y1Z2a3B4c5D6e7F8g9H0i1J
+                2k3L4m5N6o7P8q9R0s1T2u3V4w5X6y7Z8a9B0c1D2e3F4g5H6i7J8k9L0m1N2o3P
+                4q5R6s7T8u9V0w1X2y3Z4a5B6c7D8e9F0g1H2i3J4k5L6m7N8o9P0q1R2s3T4u5V
+                6w7X8y9Z0a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8s9T0u1V2w3X4y5Z6a7B
+                8c9D0e1F2g3H4i5J6k7L8m9N0o1P2q3R4s5T6u7V8w9X0y1Z2a3B4c5D6e7F8g9H
+                0i1J2k3L4m5N6o7P8q9R0s1T2u3V4w5X6y7Z8a9B0c1D2e3F4g5H6i7J8k9L0m1N
+                =ABCD
+                -----END PGP PUBLIC KEY BLOCK-----
+    metadata:
+      dependsOn:
+        - container_analysis_note
+
+  # Binary Authorization policy
+  binary_authorization_policy:
+    type: gcp-types/binaryauthorization-v1:projects.policy
+    properties:
+      name: projects/$(ref.project_id.value)/policy
+      admissionWhitelistPatterns:
+        - namePattern: "gcr.io/distroless/*"
+        - namePattern: "gcr.io/gke-release/*"
+        - namePattern: "k8s.gcr.io/*"
+      defaultAdmissionRule:
+        evaluationMode: REQUIRE_ATTESTATION
+        enforcementMode: ENFORCED_BLOCK_AND_AUDIT_LOG
+        requireAttestationsBy:
+          - $(ref.binary_authorization_attestor.name)
+      clusterAdmissionRules:
+        # Staging cluster - more permissive for testing
+        $(ref.zone.value).$(ref.staging_cluster_name.value)-$(ref.random_suffix.value):
+          evaluationMode: ALWAYS_ALLOW
+          enforcementMode: DRYRUN_AUDIT_LOG_ONLY
+        # Production cluster - strict enforcement
+        $(ref.zone.value).$(ref.production_cluster_name.value)-$(ref.random_suffix.value):
+          evaluationMode: REQUIRE_ATTESTATION
+          enforcementMode: ENFORCED_BLOCK_AND_AUDIT_LOG
+          requireAttestationsBy:
+            - $(ref.binary_authorization_attestor.name)
+    metadata:
+      dependsOn:
+        - binary_authorization_attestor
+        - gke_staging_cluster
+        - gke_production_cluster
+
+  # GKE Staging Cluster
+  gke_staging_cluster:
+    type: gcp-types/container-v1:projects.zones.clusters
+    properties:
+      parent: projects/$(ref.project_id.value)/zones/$(ref.zone.value)
+      clusterId: $(ref.staging_cluster_name.value)-$(ref.random_suffix.value)
+      cluster:
+        name: $(ref.staging_cluster_name.value)-$(ref.random_suffix.value)
+        description: "Staging GKE cluster for security validation"
+        location: $(ref.zone.value)
+        initialNodeCount: 2
+        nodeConfig:
+          machineType: $(ref.machine_type.value)
+          diskSizeGb: 100
+          oauthScopes:
+            - https://www.googleapis.com/auth/cloud-platform
+          imageType: COS_CONTAINERD
+          shieldedInstanceConfig:
+            enableSecureBoot: true
+            enableIntegrityMonitoring: true
+        # Enable Binary Authorization
+        binaryAuthorization:
+          enabled: true
+        # Enable network policy for security
+        networkPolicy:
+          enabled: true
+        # Enable Workload Identity
+        workloadIdentityConfig:
+          workloadPool: $(ref.project_id.value).svc.id.goog
+        # Enable node auto-repair and auto-upgrade
+        nodeManagement:
+          autoRepair: true
+          autoUpgrade: true
+        # Enable monitoring and logging
+        loggingService: logging.googleapis.com/kubernetes
+        monitoringService: monitoring.googleapis.com/kubernetes
+        # Security settings
+        masterAuth:
+          clientCertificateConfig:
+            issueClientCertificate: false
+        # Private cluster configuration for enhanced security
+        privateClusterConfig:
+          enablePrivateNodes: true
+          enablePrivateEndpoint: false
+          masterIpv4CidrBlock: "172.16.0.0/28"
+        ipAllocationPolicy:
+          useIpAliases: true
+          clusterSecondaryRangeName: "pods"
+          servicesSecondaryRangeName: "services"
+    metadata:
+      dependsOn:
+        - enable_apis
+
+  # GKE Production Cluster
+  gke_production_cluster:
+    type: gcp-types/container-v1:projects.zones.clusters
+    properties:
+      parent: projects/$(ref.project_id.value)/zones/$(ref.zone.value)
+      clusterId: $(ref.production_cluster_name.value)-$(ref.random_suffix.value)
+      cluster:
+        name: $(ref.production_cluster_name.value)-$(ref.random_suffix.value)
+        description: "Production GKE cluster with Binary Authorization enforcement"
+        location: $(ref.zone.value)
+        initialNodeCount: $(ref.node_count.value)
+        nodeConfig:
+          machineType: $(ref.machine_type.value)
+          diskSizeGb: 100
+          oauthScopes:
+            - https://www.googleapis.com/auth/cloud-platform
+          imageType: COS_CONTAINERD
+          shieldedInstanceConfig:
+            enableSecureBoot: true
+            enableIntegrityMonitoring: true
+        # Enable Binary Authorization
+        binaryAuthorization:
+          enabled: true
+        # Enable network policy for security
+        networkPolicy:
+          enabled: true
+        # Enable Workload Identity
+        workloadIdentityConfig:
+          workloadPool: $(ref.project_id.value).svc.id.goog
+        # Enable node auto-repair and auto-upgrade
+        nodeManagement:
+          autoRepair: true
+          autoUpgrade: true
+        # Enable monitoring and logging
+        loggingService: logging.googleapis.com/kubernetes
+        monitoringService: monitoring.googleapis.com/kubernetes
+        # Security settings
+        masterAuth:
+          clientCertificateConfig:
+            issueClientCertificate: false
+        # Private cluster configuration for enhanced security
+        privateClusterConfig:
+          enablePrivateNodes: true
+          enablePrivateEndpoint: false
+          masterIpv4CidrBlock: "172.16.1.0/28"
+        ipAllocationPolicy:
+          useIpAliases: true
+          clusterSecondaryRangeName: "pods"
+          servicesSecondaryRangeName: "services"
+        # Resource usage export for cost monitoring
+        resourceUsageExportConfig:
+          enableNetworkEgressMetering: true
+          enableResourceConsumptionMetering: true
+    metadata:
+      dependsOn:
+        - enable_apis
+
+  # Cloud Deploy Delivery Pipeline
+  cloud_deploy_pipeline:
+    type: gcp-types/clouddeploy-v1:projects.locations.deliveryPipelines
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      deliveryPipelineId: $(ref.pipeline_name.value)
+      deliveryPipeline:
+        name: projects/$(ref.project_id.value)/locations/$(ref.region.value)/deliveryPipelines/$(ref.pipeline_name.value)
+        description: "Secure deployment pipeline with Binary Authorization"
+        annotations:
+          "recipe": "container-security-pipeline-binary-authorization-deploy"
+          "environment": "production"
+        serialPipeline:
+          stages:
+            - targetId: "staging"
+              profiles: []
+              strategy:
+                standard:
+                  verify: false
+            - targetId: "production"
+              profiles: []
+              strategy:
+                canary:
+                  runtimeConfig:
+                    kubernetes:
+                      serviceNetworking:
+                        service: "secure-app-service"
+                        deployment: "secure-app"
+                  canaryDeployment:
+                    percentages: [20, 50, 80]
+                    verify: false
+                    predeploy:
+                      actions: []
+                    postdeploy:
+                      actions: []
+    metadata:
+      dependsOn:
+        - enable_apis
+
+  # Cloud Deploy Target - Staging
+  cloud_deploy_target_staging:
+    type: gcp-types/clouddeploy-v1:projects.locations.targets
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      targetId: "staging"
+      target:
+        name: projects/$(ref.project_id.value)/locations/$(ref.region.value)/targets/staging
+        description: "Staging environment for security validation"
+        annotations:
+          "environment": "staging"
+          "cluster": $(ref.gke_staging_cluster.name)
+        gke:
+          cluster: projects/$(ref.project_id.value)/locations/$(ref.zone.value)/clusters/$(ref.staging_cluster_name.value)-$(ref.random_suffix.value)
+        requireApproval: false
+        executionConfigs:
+          - usages: ["RENDER", "DEPLOY"]
+            serviceAccount: $(ref.cloudbuild_service_account.email)
+    metadata:
+      dependsOn:
+        - gke_staging_cluster
+        - cloudbuild_service_account
+
+  # Cloud Deploy Target - Production
+  cloud_deploy_target_production:
+    type: gcp-types/clouddeploy-v1:projects.locations.targets
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      targetId: "production"
+      target:
+        name: projects/$(ref.project_id.value)/locations/$(ref.region.value)/targets/production
+        description: "Production environment with canary deployment"
+        annotations:
+          "environment": "production"
+          "cluster": $(ref.gke_production_cluster.name)
+        gke:
+          cluster: projects/$(ref.project_id.value)/locations/$(ref.zone.value)/clusters/$(ref.production_cluster_name.value)-$(ref.random_suffix.value)
+        requireApproval: true
+        executionConfigs:
+          - usages: ["RENDER", "DEPLOY"]
+            serviceAccount: $(ref.cloudbuild_service_account.email)
+    metadata:
+      dependsOn:
+        - gke_production_cluster
+        - cloudbuild_service_account
+
+  # Cloud Build trigger for automated deployments
+  cloud_build_trigger:
+    type: gcp-types/cloudbuild-v1:projects.triggers
+    properties:
+      parent: projects/$(ref.project_id.value)
+      trigger:
+        name: "secure-app-deploy-trigger"
+        description: "Automated deployment trigger with Binary Authorization"
+        disabled: false
+        github:
+          owner: "your-github-username"
+          name: "secure-app-repo"
+          push:
+            branch: "^main$"
+        filename: "cloudbuild.yaml"
+        serviceAccount: $(ref.cloudbuild_service_account.name)
+        substitutions:
+          _REPO_URL: "$(ref.region.value)-docker.pkg.dev/$(ref.project_id.value)/$(ref.repository_name.value)"
+          _ATTESTOR_NAME: $(ref.binary_authorization_attestor.name)
+          _REGION: $(ref.region.value)
+          _PIPELINE_NAME: $(ref.pipeline_name.value)
+    metadata:
+      dependsOn:
+        - cloudbuild_service_account
+        - binary_authorization_attestor
+        - cloud_deploy_pipeline
+
+# Outputs for verification and integration
+outputs:
+  # Project information
+  project_id:
+    description: "Google Cloud Project ID"
+    value: $(ref.project_id.value)
+  
+  region:
+    description: "Primary region for resources"
+    value: $(ref.region.value)
+  
+  zone:
+    description: "Zone for GKE clusters"
+    value: $(ref.zone.value)
+  
+  # Artifact Registry outputs
+  artifact_registry_repository_name:
+    description: "Artifact Registry repository name"
+    value: $(ref.artifact_registry_repository.name)
+  
+  artifact_registry_url:
+    description: "Artifact Registry repository URL"
+    value: "$(ref.region.value)-docker.pkg.dev/$(ref.project_id.value)/$(ref.repository_name.value)"
+  
+  # Binary Authorization outputs
+  binary_authorization_attestor_name:
+    description: "Binary Authorization attestor name"
+    value: $(ref.binary_authorization_attestor.name)
+  
+  container_analysis_note_name:
+    description: "Container Analysis note name"
+    value: $(ref.container_analysis_note.name)
+  
+  # GKE cluster outputs
+  staging_cluster_name:
+    description: "Staging GKE cluster name"
+    value: $(ref.gke_staging_cluster.name)
+  
+  staging_cluster_endpoint:
+    description: "Staging GKE cluster endpoint"
+    value: $(ref.gke_staging_cluster.endpoint)
+  
+  production_cluster_name:
+    description: "Production GKE cluster name"
+    value: $(ref.gke_production_cluster.name)
+  
+  production_cluster_endpoint:
+    description: "Production GKE cluster endpoint"
+    value: $(ref.gke_production_cluster.endpoint)
+  
+  # Cloud Deploy outputs
+  cloud_deploy_pipeline_name:
+    description: "Cloud Deploy pipeline name"
+    value: $(ref.cloud_deploy_pipeline.name)
+  
+  staging_target_name:
+    description: "Cloud Deploy staging target name"
+    value: $(ref.cloud_deploy_target_staging.name)
+  
+  production_target_name:
+    description: "Cloud Deploy production target name"
+    value: $(ref.cloud_deploy_target_production.name)
+  
+  # Service Account outputs
+  cloudbuild_service_account_email:
+    description: "Cloud Build service account email"
+    value: $(ref.cloudbuild_service_account.email)
+  
+  # Cloud Build trigger outputs
+  cloud_build_trigger_name:
+    description: "Cloud Build trigger name"
+    value: $(ref.cloud_build_trigger.name)
+  
+  # Deployment commands
+  deployment_commands:
+    description: "Commands to deploy the infrastructure"
+    value: |
+      # Deploy Infrastructure Manager configuration
+      gcloud infra-manager deployments apply projects/$(ref.project_id.value)/locations/$(ref.region.value)/deployments/container-security-pipeline \
+        --service-account=$(ref.cloudbuild_service_account.email) \
+        --input-values=project_id=$(ref.project_id.value),region=$(ref.region.value),zone=$(ref.zone.value)
+      
+      # Configure kubectl for clusters
+      gcloud container clusters get-credentials $(ref.staging_cluster_name.value) --zone=$(ref.zone.value) --project=$(ref.project_id.value)
+      gcloud container clusters get-credentials $(ref.production_cluster_name.value) --zone=$(ref.zone.value) --project=$(ref.project_id.value)
+      
+      # Configure Docker authentication
+      gcloud auth configure-docker $(ref.region.value)-docker.pkg.dev
+  
+  # Validation commands
+  validation_commands:
+    description: "Commands to validate the deployment"
+    value: |
+      # Verify Binary Authorization policy
+      gcloud container binauthz policy list --project=$(ref.project_id.value)
+      
+      # Check GKE cluster status
+      gcloud container clusters describe $(ref.staging_cluster_name.value) --zone=$(ref.zone.value) --project=$(ref.project_id.value)
+      gcloud container clusters describe $(ref.production_cluster_name.value) --zone=$(ref.zone.value) --project=$(ref.project_id.value)
+      
+      # Verify Cloud Deploy pipeline
+      gcloud deploy delivery-pipelines describe $(ref.pipeline_name.value) --region=$(ref.region.value) --project=$(ref.project_id.value)
+      
+      # Check Artifact Registry repository
+      gcloud artifacts repositories describe $(ref.repository_name.value) --location=$(ref.region.value) --project=$(ref.project_id.value)
+  
+  # Cleanup commands
+  cleanup_commands:
+    description: "Commands to clean up all resources"
+    value: |
+      # Delete Infrastructure Manager deployment
+      gcloud infra-manager deployments delete projects/$(ref.project_id.value)/locations/$(ref.region.value)/deployments/container-security-pipeline --quiet
+      
+      # Manual cleanup if needed
+      gcloud container clusters delete $(ref.staging_cluster_name.value) --zone=$(ref.zone.value) --project=$(ref.project_id.value) --quiet
+      gcloud container clusters delete $(ref.production_cluster_name.value) --zone=$(ref.zone.value) --project=$(ref.project_id.value) --quiet
+      gcloud artifacts repositories delete $(ref.repository_name.value) --location=$(ref.region.value) --project=$(ref.project_id.value) --quiet

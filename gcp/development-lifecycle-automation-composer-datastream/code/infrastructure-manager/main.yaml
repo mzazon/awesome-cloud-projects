@@ -1,0 +1,883 @@
+# Infrastructure Manager Configuration for Development Lifecycle Automation
+# Recipe: Development Lifecycle Automation with Cloud Composer and Datastream
+# This configuration deploys an intelligent CI/CD automation system using Cloud Composer 3,
+# Datastream for change data capture, Artifact Registry with security scanning,
+# and Cloud Workflows for compliance validation.
+
+metadata:
+  version: "1.0"
+  description: "Intelligent development lifecycle automation with Cloud Composer and Datastream"
+  author: "Cloud Recipes"
+  created: "2025-07-12"
+
+imports:
+  # Import Google Cloud resource types
+  - path: https://www.googleapis.com/compute/v1/projects/PROJECT_ID/global/networks
+    name: compute-v1
+  - path: https://storage.googleapis.com/cloud-foundation-templates/cloud-sql/cloud-sql.jinja
+    name: cloud-sql-template
+
+resources:
+  # Project-level API enablement
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/composer.googleapis.com
+      parent: projects/$(ref.project.projectId)
+    metadata:
+      dependsOn:
+        - project
+
+  - name: enable-datastream-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/datastream.googleapis.com
+      parent: projects/$(ref.project.projectId)
+
+  - name: enable-artifactregistry-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/artifactregistry.googleapis.com
+      parent: projects/$(ref.project.projectId)
+
+  - name: enable-workflows-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/workflows.googleapis.com
+      parent: projects/$(ref.project.projectId)
+
+  - name: enable-cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/cloudbuild.googleapis.com
+      parent: projects/$(ref.project.projectId)
+
+  - name: enable-containeranalysis-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/containeranalysis.googleapis.com
+      parent: projects/$(ref.project.projectId)
+
+  - name: enable-sql-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/sqladmin.googleapis.com
+      parent: projects/$(ref.project.projectId)
+
+  - name: enable-binaryauthorization-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/binaryauthorization.googleapis.com
+      parent: projects/$(ref.project.projectId)
+
+  # Cloud Storage bucket for workflow assets and artifacts
+  - name: devops-automation-bucket
+    type: gcp-types/storage-v1:bucket
+    properties:
+      name: devops-automation-$(ref.random-suffix.hex)-bucket
+      location: $(ref.region)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90
+              isLive: false
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      encryption:
+        defaultKmsKeyName: $(ref.kms-key.selfLink)
+    metadata:
+      dependsOn:
+        - enable-apis
+        - kms-key
+
+  # KMS key for encryption
+  - name: kms-key
+    type: gcp-types/cloudkms-v1:projects.locations.keyRings.cryptoKeys
+    properties:
+      parent: projects/$(ref.project.projectId)/locations/$(ref.region)/keyRings/$(ref.kms-keyring.name)
+      cryptoKeyId: devops-automation-key
+      purpose: ENCRYPT_DECRYPT
+      versionTemplate:
+        algorithm: GOOGLE_SYMMETRIC_ENCRYPTION
+        protectionLevel: SOFTWARE
+      destroyScheduledDuration: 2592000s  # 30 days
+    metadata:
+      dependsOn:
+        - kms-keyring
+
+  - name: kms-keyring
+    type: gcp-types/cloudkms-v1:projects.locations.keyRings
+    properties:
+      parent: projects/$(ref.project.projectId)/locations/$(ref.region)
+      keyRingId: devops-automation-keyring
+
+  # Artifact Registry repository for secure container images
+  - name: secure-containers-repo
+    type: gcp-types/artifactregistry-v1:projects.locations.repositories
+    properties:
+      parent: projects/$(ref.project.projectId)/locations/$(ref.region)
+      repositoryId: secure-containers-$(ref.random-suffix.hex)
+      repository:
+        format: DOCKER
+        description: "Secure container repository with automated vulnerability scanning"
+        kmsKeyName: $(ref.kms-key.selfLink)
+        dockerConfig:
+          immutableTags: false
+    metadata:
+      dependsOn:
+        - enable-artifactregistry-api
+        - kms-key
+
+  # Cloud SQL PostgreSQL instance for development database
+  - name: dev-database-instance
+    type: gcp-types/sqladmin-v1beta4:instance
+    properties:
+      name: dev-database-$(ref.random-suffix.hex)
+      region: $(ref.region)
+      databaseVersion: POSTGRES_15
+      settings:
+        tier: db-f1-micro
+        availabilityType: ZONAL
+        diskType: PD_SSD
+        diskSize: 20
+        diskAutoresize: true
+        diskAutoresizeLimit: 100
+        backupConfiguration:
+          enabled: true
+          startTime: "23:00"
+          location: $(ref.region)
+          pointInTimeRecoveryEnabled: true
+          transactionLogRetentionDays: 7
+          backupRetentionSettings:
+            retentionUnit: COUNT
+            retainedBackups: 7
+        maintenanceWindow:
+          day: 7  # Sunday
+          hour: 2
+          updateTrack: stable
+        insightsConfig:
+          queryInsightsEnabled: true
+          recordApplicationTags: true
+          recordClientAddress: true
+        ipConfiguration:
+          ipv4Enabled: true
+          requireSsl: true
+          authorizedNetworks:
+            - name: "composer-network"
+              value: "0.0.0.0/0"  # Note: Restrict this in production
+        databaseFlags:
+          - name: log_checkpoints
+            value: "on"
+          - name: log_connections
+            value: "on"
+          - name: log_disconnections
+            value: "on"
+          - name: log_lock_waits
+            value: "on"
+          - name: log_temp_files
+            value: "0"
+          - name: track_activity_query_size
+            value: "2048"
+        userLabels:
+          environment: development
+          purpose: change-data-capture
+          recipe: development-lifecycle-automation
+    metadata:
+      dependsOn:
+        - enable-sql-api
+
+  # Cloud SQL database for application development
+  - name: app-development-database
+    type: gcp-types/sqladmin-v1beta4:database
+    properties:
+      name: app_development
+      instance: $(ref.dev-database-instance.name)
+      charset: UTF8
+      collation: en_US.UTF8
+    metadata:
+      dependsOn:
+        - dev-database-instance
+
+  # Cloud SQL user for Datastream
+  - name: datastream-user
+    type: gcp-types/sqladmin-v1beta4:user
+    properties:
+      name: datastream_user
+      instance: $(ref.dev-database-instance.name)
+      password: $(ref.datastream-password.password)
+      type: BUILT_IN
+    metadata:
+      dependsOn:
+        - dev-database-instance
+        - datastream-password
+
+  # Datastream connection profile for source database
+  - name: source-connection-profile
+    type: gcp-types/datastream-v1:projects.locations.connectionProfiles
+    properties:
+      parent: projects/$(ref.project.projectId)/locations/$(ref.region)
+      connectionProfileId: dev-database-profile-$(ref.random-suffix.hex)
+      connectionProfile:
+        displayName: "Development Database Connection Profile"
+        postgresqlProfile:
+          hostname: $(ref.dev-database-instance.ipAddresses[0].ipAddress)
+          port: 5432
+          username: $(ref.datastream-user.name)
+          password: $(ref.datastream-password.password)
+          database: $(ref.app-development-database.name)
+        labels:
+          environment: development
+          purpose: change-data-capture
+    metadata:
+      dependsOn:
+        - enable-datastream-api
+        - dev-database-instance
+        - datastream-user
+        - app-development-database
+
+  # Datastream connection profile for Cloud Storage destination
+  - name: storage-destination-profile
+    type: gcp-types/datastream-v1:projects.locations.connectionProfiles
+    properties:
+      parent: projects/$(ref.project.projectId)/locations/$(ref.region)
+      connectionProfileId: storage-destination-$(ref.random-suffix.hex)
+      connectionProfile:
+        displayName: "Cloud Storage Destination Profile"
+        gcsProfile:
+          bucket: $(ref.devops-automation-bucket.name)
+          rootPath: /datastream
+        labels:
+          environment: development
+          purpose: change-data-capture
+    metadata:
+      dependsOn:
+        - enable-datastream-api
+        - devops-automation-bucket
+
+  # Datastream for real-time change data capture
+  - name: schema-changes-stream
+    type: gcp-types/datastream-v1:projects.locations.streams
+    properties:
+      parent: projects/$(ref.project.projectId)/locations/$(ref.region)
+      streamId: schema-changes-stream-$(ref.random-suffix.hex)
+      stream:
+        displayName: "Schema Changes Stream"
+        sourceConfig:
+          sourceConnectionProfile: $(ref.source-connection-profile.name)
+          postgresqlSourceConfig:
+            includeObjects:
+              postgresqlSchemas:
+                - schema: public
+                  postgresqlTables:
+                    - table: "*"
+            replicationSlot: datastream_slot
+            publication: datastream_publication
+        destinationConfig:
+          destinationConnectionProfile: $(ref.storage-destination-profile.name)
+          gcsDestinationConfig:
+            path: /
+            fileRotationMb: 100
+            fileRotationInterval: 900s  # 15 minutes
+            jsonFileFormat:
+              schemaFileFormat: SINGLE_FILE
+              compression: GZIP
+        backfillAll: {}
+        labels:
+          environment: development
+          purpose: change-data-capture
+    metadata:
+      dependsOn:
+        - enable-datastream-api
+        - source-connection-profile
+        - storage-destination-profile
+
+  # Cloud Composer 3 environment with Apache Airflow 3
+  - name: intelligent-devops-composer
+    type: gcp-types/composer-v1:projects.locations.environments
+    properties:
+      parent: projects/$(ref.project.projectId)/locations/$(ref.region)
+      environmentId: intelligent-devops-$(ref.random-suffix.hex)
+      environment:
+        name: intelligent-devops-$(ref.random-suffix.hex)
+        config:
+          nodeCount: 3
+          nodeConfig:
+            location: $(ref.zone)
+            machineType: n1-standard-2
+            diskSizeGb: 30
+            preemptible: false
+            serviceAccount: $(ref.composer-service-account.email)
+            tags:
+              - composer-environment
+              - intelligent-devops
+          softwareConfig:
+            imageVersion: composer-3-airflow-3
+            pypiPackages:
+              google-cloud-datastream: ">=1.0.0"
+              google-cloud-workflows: ">=1.0.0"
+              google-cloud-artifact-registry: ">=1.0.0"
+              google-cloud-monitoring: ">=2.0.0"
+              google-cloud-bigquery: ">=3.0.0"
+            envVariables:
+              BUCKET_NAME: $(ref.devops-automation-bucket.name)
+              PROJECT_ID: $(ref.project.projectId)
+              ARTIFACT_REPO: $(ref.secure-containers-repo.repositoryId)
+              REGION: $(ref.region)
+              DATASTREAM_NAME: $(ref.schema-changes-stream.streamId)
+          encryptionConfig:
+            kmsKeyName: $(ref.kms-key.selfLink)
+          privateEnvironmentConfig:
+            enablePrivateEndpoint: false
+            enablePrivatelyUsedPublicIps: true
+          webServerNetworkAccessControl:
+            allowedIpRanges:
+              - value: "0.0.0.0/0"  # Note: Restrict this in production
+                description: "Allow access from anywhere"
+          workloadsConfig:
+            scheduler:
+              cpu: 1.0
+              memoryGb: 2.0
+              storageGb: 2.0
+              count: 1
+            webServer:
+              cpu: 1.0
+              memoryGb: 2.0
+              storageGb: 2.0
+            worker:
+              cpu: 1.0
+              memoryGb: 2.0
+              storageGb: 2.0
+              minCount: 1
+              maxCount: 3
+        labels:
+          environment: development
+          purpose: intelligent-devops
+          recipe: development-lifecycle-automation
+    metadata:
+      dependsOn:
+        - enable-apis
+        - composer-service-account
+        - kms-key
+        - devops-automation-bucket
+
+  # Service account for Cloud Composer
+  - name: composer-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: composer-sa-$(ref.random-suffix.hex)
+      serviceAccount:
+        displayName: "Cloud Composer Service Account"
+        description: "Service account for Cloud Composer environment"
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # IAM binding for Composer service account
+  - name: composer-sa-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project.projectId)
+      role: roles/composer.worker
+      member: serviceAccount:$(ref.composer-service-account.email)
+    metadata:
+      dependsOn:
+        - composer-service-account
+
+  - name: composer-sa-storage-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project.projectId)
+      role: roles/storage.admin
+      member: serviceAccount:$(ref.composer-service-account.email)
+    metadata:
+      dependsOn:
+        - composer-service-account
+
+  - name: composer-sa-workflows-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project.projectId)
+      role: roles/workflows.editor
+      member: serviceAccount:$(ref.composer-service-account.email)
+    metadata:
+      dependsOn:
+        - composer-service-account
+
+  - name: composer-sa-artifactregistry-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project.projectId)
+      role: roles/artifactregistry.admin
+      member: serviceAccount:$(ref.composer-service-account.email)
+    metadata:
+      dependsOn:
+        - composer-service-account
+
+  - name: composer-sa-cloudbuild-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project.projectId)
+      role: roles/cloudbuild.builds.editor
+      member: serviceAccount:$(ref.composer-service-account.email)
+    metadata:
+      dependsOn:
+        - composer-service-account
+
+  # Cloud Workflows for compliance validation
+  - name: compliance-workflow
+    type: gcp-types/workflows-v1:projects.locations.workflows
+    properties:
+      parent: projects/$(ref.project.projectId)/locations/$(ref.region)
+      workflowId: intelligent-deployment-workflow-$(ref.random-suffix.hex)
+      workflow:
+        description: "Intelligent deployment workflow with compliance validation"
+        labels:
+          environment: development
+          purpose: compliance-validation
+        sourceContents: |
+          main:
+            params: [input]
+            steps:
+              - validate_input:
+                  assign:
+                    - schema_changes: ${input.schema_changes}
+                    - security_scan: ${input.security_scan}
+                    - timestamp: ${sys.now()}
+              
+              - evaluate_schema_impact:
+                  switch:
+                    - condition: ${default(map.get(schema_changes, "breaking_changes"), 0) > 0}
+                      steps:
+                        - require_approval:
+                            call: sys.log
+                            args:
+                              text: ${"Breaking schema changes detected, requiring approval: " + string(schema_changes)}
+                              severity: WARNING
+                        - wait_for_approval:
+                            call: sys.sleep
+                            args:
+                              seconds: 60
+                    - condition: true
+                      steps:
+                        - auto_approve_schema:
+                            assign:
+                              - schema_approved: true
+              
+              - evaluate_security_findings:
+                  switch:
+                    - condition: ${default(map.get(security_scan, "critical_vulnerabilities"), 0) > 0}
+                      steps:
+                        - block_deployment:
+                            assign:
+                              - deployment_blocked: true
+                              - reason: "Critical security vulnerabilities found"
+                        - log_security_alert:
+                            call: sys.log
+                            args:
+                              text: ${"Critical vulnerabilities detected: " + string(security_scan)}
+                              severity: ERROR
+                    - condition: ${default(map.get(security_scan, "high_vulnerabilities"), 0) > 5}
+                      steps:
+                        - require_security_review:
+                            call: sys.log
+                            args:
+                              text: ${"High vulnerability threshold exceeded: " + string(security_scan)}
+                              severity: WARNING
+                    - condition: true
+                      steps:
+                        - approve_security:
+                            assign:
+                              - security_approved: true
+              
+              - make_deployment_decision:
+                  switch:
+                    - condition: ${default(map.get(vars, "deployment_blocked"), false)}
+                      return:
+                        status: "BLOCKED"
+                        reason: ${default(map.get(vars, "reason"), "Security policy violation")}
+                        timestamp: ${timestamp}
+                    - condition: ${default(map.get(vars, "schema_approved"), false) AND default(map.get(vars, "security_approved"), false)}
+                      steps:
+                        - approve_deployment:
+                            return:
+                              status: "APPROVED"
+                              deployment_environment: "staging"
+                              next_steps: ["deploy_to_staging", "run_integration_tests", "promote_to_production"]
+                              timestamp: ${timestamp}
+                    - condition: true
+                      return:
+                        status: "PENDING"
+                        reason: "Awaiting manual approval"
+                        timestamp: ${timestamp}
+    metadata:
+      dependsOn:
+        - enable-workflows-api
+
+  # Binary Authorization policy for container security
+  - name: binary-authorization-policy
+    type: gcp-types/binaryauthorization-v1:projects.policy
+    properties:
+      name: projects/$(ref.project.projectId)/policy
+      policy:
+        description: "Security policy for intelligent DevOps automation"
+        defaultAdmissionRule:
+          evaluationMode: REQUIRE_ATTESTATION
+          enforcementMode: ENFORCED_BLOCK_AND_AUDIT_LOG
+          requireAttestationsBy:
+            - projects/$(ref.project.projectId)/attestors/$(ref.security-attestor.name)
+        clusterAdmissionRules:
+          "$(ref.region).production-cluster":
+            evaluationMode: REQUIRE_ATTESTATION
+            enforcementMode: ENFORCED_BLOCK_AND_AUDIT_LOG
+            requireAttestationsBy:
+              - projects/$(ref.project.projectId)/attestors/$(ref.security-attestor.name)
+              - projects/$(ref.project.projectId)/attestors/$(ref.compliance-attestor.name)
+    metadata:
+      dependsOn:
+        - enable-binaryauthorization-api
+        - security-attestor
+        - compliance-attestor
+
+  # Security scan attestor
+  - name: security-attestor
+    type: gcp-types/binaryauthorization-v1:projects.attestors
+    properties:
+      parent: projects/$(ref.project.projectId)
+      attestorId: security-scan-attestor-$(ref.random-suffix.hex)
+      attestor:
+        description: "Attestor for security scan validation"
+        userOwnedGrafeasNote:
+          noteReference: projects/$(ref.project.projectId)/notes/security-scan-note
+          publicKeys:
+            - asciiArmoredPgpPublicKey: |
+                -----BEGIN PGP PUBLIC KEY BLOCK-----
+                
+                mQENBFzQo8kBCAC5/2f5DjJ9vE4dKrr9vU3Q5Y2h0J2X3d5GgJ9e6HjKl2r3NlYu
+                -----END PGP PUBLIC KEY BLOCK-----
+              id: security-key
+    metadata:
+      dependsOn:
+        - enable-binaryauthorization-api
+
+  # Compliance attestor
+  - name: compliance-attestor
+    type: gcp-types/binaryauthorization-v1:projects.attestors
+    properties:
+      parent: projects/$(ref.project.projectId)
+      attestorId: compliance-attestor-$(ref.random-suffix.hex)
+      attestor:
+        description: "Attestor for compliance validation"
+        userOwnedGrafeasNote:
+          noteReference: projects/$(ref.project.projectId)/notes/compliance-note
+          publicKeys:
+            - asciiArmoredPgpPublicKey: |
+                -----BEGIN PGP PUBLIC KEY BLOCK-----
+                
+                mQENBFzQo8kBCAC5/2f5DjJ9vE4dKrr9vU3Q5Y2h0J2X3d5GgJ9e6HjKl2r3NlYu
+                -----END PGP PUBLIC KEY BLOCK-----
+              id: compliance-key
+    metadata:
+      dependsOn:
+        - enable-binaryauthorization-api
+
+  # BigQuery dataset for pipeline metrics
+  - name: devops-metrics-dataset
+    type: gcp-types/bigquery-v2:dataset
+    properties:
+      datasetId: devops_metrics_$(ref.random-suffix.hex)
+      projectId: $(ref.project.projectId)
+      location: $(ref.region)
+      description: "Dataset for storing DevOps pipeline metrics and analytics"
+      labels:
+        environment: development
+        purpose: metrics-analytics
+      access:
+        - role: OWNER
+          userByEmail: $(ref.composer-service-account.email)
+        - role: READER
+          specialGroup: projectReaders
+      defaultEncryptionConfiguration:
+        kmsKeyName: $(ref.kms-key.selfLink)
+    metadata:
+      dependsOn:
+        - enable-apis
+        - composer-service-account
+        - kms-key
+
+  # BigQuery table for pipeline runs
+  - name: pipeline-runs-table
+    type: gcp-types/bigquery-v2:table
+    properties:
+      tableId: pipeline_runs
+      datasetId: $(ref.devops-metrics-dataset.datasetId)
+      projectId: $(ref.project.projectId)
+      description: "Table for storing pipeline execution metrics"
+      schema:
+        fields:
+          - name: timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "Execution timestamp"
+          - name: dag_runs_success
+            type: INTEGER
+            mode: NULLABLE
+            description: "Number of successful DAG runs"
+          - name: dag_runs_failed
+            type: INTEGER
+            mode: NULLABLE
+            description: "Number of failed DAG runs"
+          - name: avg_execution_time_minutes
+            type: FLOAT
+            mode: NULLABLE
+            description: "Average execution time in minutes"
+          - name: security_scans_blocked
+            type: INTEGER
+            mode: NULLABLE
+            description: "Number of deployments blocked by security scans"
+          - name: deployments_approved
+            type: INTEGER
+            mode: NULLABLE
+            description: "Number of approved deployments"
+          - name: compliance_violations
+            type: INTEGER
+            mode: NULLABLE
+            description: "Number of compliance violations detected"
+      labels:
+        environment: development
+        purpose: pipeline-metrics
+    metadata:
+      dependsOn:
+        - devops-metrics-dataset
+
+  # Cloud Monitoring notification channel
+  - name: notification-channel
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      name: projects/$(ref.project.projectId)
+      notificationChannel:
+        type: email
+        displayName: "DevOps Team Notifications"
+        description: "Email notifications for intelligent DevOps automation"
+        labels:
+          email_address: devops-team@example.com
+        enabled: true
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # Cloud Monitoring alert policy for failed deployments
+  - name: deployment-failure-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      name: projects/$(ref.project.projectId)
+      alertPolicy:
+        displayName: "Deployment Failure Alert"
+        documentation:
+          content: "Alert when deployment failures exceed threshold"
+          mimeType: text/markdown
+        conditions:
+          - displayName: "High deployment failure rate"
+            conditionThreshold:
+              filter: 'resource.type="composer_environment"'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 2
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+        combiner: OR
+        enabled: true
+        notificationChannels:
+          - $(ref.notification-channel.name)
+        alertStrategy:
+          autoClose: 86400s  # 24 hours
+    metadata:
+      dependsOn:
+        - enable-apis
+        - notification-channel
+
+# Helper resources for generating unique identifiers
+  - name: random-suffix
+    type: gcp-types/runtimeconfig-v1beta1:config
+    properties:
+      config: random-config
+      description: "Configuration for generating random suffixes"
+    metadata:
+      runtimePolicy:
+        CREATE: true
+        UPDATE: false
+        DELETE: true
+
+  - name: random-hex
+    type: gcp-types/runtimeconfig-v1beta1:variable
+    properties:
+      parent: $(ref.random-suffix.name)
+      variable: hex
+      text: $(ref.generate-random.hex)
+    metadata:
+      dependsOn:
+        - random-suffix
+        - generate-random
+
+  - name: generate-random
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project.projectId)/locations/$(ref.region)
+      function:
+        name: generate-random-$(ref.timestamp.value)
+        sourceArchiveUrl: gs://cloud-foundation-templates/random-generator.zip
+        entryPoint: generateHex
+        runtime: python39
+        timeout: 60s
+        availableMemoryMb: 128
+        environmentVariables:
+          LENGTH: "6"
+    metadata:
+      runtimePolicy:
+        CREATE: true
+        UPDATE: false
+        DELETE: true
+
+  - name: timestamp
+    type: gcp-types/runtimeconfig-v1beta1:variable
+    properties:
+      parent: $(ref.random-suffix.name)
+      variable: timestamp
+      text: $(ref.current-time.timestamp)
+    metadata:
+      dependsOn:
+        - random-suffix
+
+  - name: current-time
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project.projectId)/locations/$(ref.region)
+      function:
+        name: current-time-generator
+        sourceArchiveUrl: gs://cloud-foundation-templates/timestamp-generator.zip
+        entryPoint: getCurrentTimestamp
+        runtime: python39
+        timeout: 60s
+        availableMemoryMb: 128
+    metadata:
+      runtimePolicy:
+        CREATE: true
+        UPDATE: false
+        DELETE: true
+
+  # Secret for database password
+  - name: datastream-password
+    type: gcp-types/secretmanager-v1:projects.secrets
+    properties:
+      secretId: datastream-db-password
+      parent: projects/$(ref.project.projectId)
+      secret:
+        replication:
+          automatic: {}
+        labels:
+          environment: development
+          purpose: datastream-authentication
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  - name: datastream-password-version
+    type: gcp-types/secretmanager-v1:projects.secrets.versions
+    properties:
+      parent: $(ref.datastream-password.name)
+      secretVersion:
+        payload:
+          data: $(ref.generated-password.password)
+    metadata:
+      dependsOn:
+        - datastream-password
+        - generated-password
+
+  - name: generated-password
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project.projectId)/locations/$(ref.region)
+      function:
+        name: password-generator-$(ref.timestamp.value)
+        sourceArchiveUrl: gs://cloud-foundation-templates/password-generator.zip
+        entryPoint: generatePassword
+        runtime: python39
+        timeout: 60s
+        availableMemoryMb: 128
+        environmentVariables:
+          LENGTH: "32"
+          COMPLEXITY: "high"
+    metadata:
+      runtimePolicy:
+        CREATE: true
+        UPDATE: false
+        DELETE: true
+
+# Template variables for customization
+variables:
+  project:
+    description: "Google Cloud Project ID"
+    type: string
+    default: ""
+    
+  region:
+    description: "Google Cloud region for resources"
+    type: string
+    default: "us-central1"
+    
+  zone:
+    description: "Google Cloud zone for compute resources"
+    type: string
+    default: "us-central1-a"
+
+# Output values for reference
+outputs:
+  composer_environment_name:
+    description: "Name of the Cloud Composer environment"
+    value: $(ref.intelligent-devops-composer.name)
+    
+  composer_airflow_uri:
+    description: "Airflow web server URI"
+    value: $(ref.intelligent-devops-composer.config.airflowUri)
+    
+  bucket_name:
+    description: "Cloud Storage bucket for workflow assets"
+    value: $(ref.devops-automation-bucket.name)
+    
+  artifact_registry_url:
+    description: "Artifact Registry repository URL"
+    value: "$(ref.region)-docker.pkg.dev/$(ref.project.projectId)/$(ref.secure-containers-repo.repositoryId)"
+    
+  database_instance_name:
+    description: "Cloud SQL instance name"
+    value: $(ref.dev-database-instance.name)
+    
+  database_connection_name:
+    description: "Cloud SQL connection name"
+    value: "$(ref.project.projectId):$(ref.region):$(ref.dev-database-instance.name)"
+    
+  datastream_name:
+    description: "Datastream name for change data capture"
+    value: $(ref.schema-changes-stream.name)
+    
+  workflow_name:
+    description: "Cloud Workflows name for compliance validation"
+    value: $(ref.compliance-workflow.name)
+    
+  bigquery_dataset:
+    description: "BigQuery dataset for metrics"
+    value: $(ref.devops-metrics-dataset.datasetId)
+    
+  kms_key_name:
+    description: "KMS key for encryption"
+    value: $(ref.kms-key.name)
+
+# Configuration schema
+configVersion: v1

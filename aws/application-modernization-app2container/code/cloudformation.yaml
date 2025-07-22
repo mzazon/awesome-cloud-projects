@@ -1,0 +1,1046 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Infrastructure as Code for AWS App2Container Application Modernization.
+  This template creates the complete infrastructure needed for containerizing
+  legacy applications using AWS App2Container, including ECS cluster, ECR repository,
+  CI/CD pipeline, and supporting services. Generated for recipe: Building Application
+  Modernization with AWS App2Container.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Application Configuration"
+        Parameters:
+          - ApplicationId
+          - ContainerPort
+          - DesiredTaskCount
+      - Label:
+          default: "CI/CD Configuration"
+        Parameters:
+          - EnableCICDPipeline
+          - RepositoryName
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - SubnetIds
+          - CreateLoadBalancer
+      - Label:
+          default: "Monitoring and Scaling"
+        Parameters:
+          - EnableAutoScaling
+          - EnableContainerInsights
+          - CreateCloudWatchDashboard
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Name of the project (used for resource naming)
+    Default: app2container-modernization
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+
+  Environment:
+    Type: String
+    Description: Environment name (dev, staging, prod)
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  ApplicationId:
+    Type: String
+    Description: Application identifier from App2Container analysis
+    Default: modernized-app
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+
+  ContainerPort:
+    Type: Number
+    Description: Port that the containerized application listens on
+    Default: 8080
+    MinValue: 1
+    MaxValue: 65535
+
+  DesiredTaskCount:
+    Type: Number
+    Description: Number of ECS tasks to run initially
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+
+  EnableCICDPipeline:
+    Type: String
+    Description: Create CI/CD pipeline with CodePipeline, CodeBuild, and CodeCommit
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  RepositoryName:
+    Type: String
+    Description: Name for the CodeCommit repository (only used if CI/CD is enabled)
+    Default: app2container-source
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-_.]*$'
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters, hyphens, underscores, and periods
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where resources will be created
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of subnet IDs for ECS tasks and load balancer (minimum 2 for ALB)
+
+  CreateLoadBalancer:
+    Type: String
+    Description: Create Application Load Balancer for the containerized application
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableAutoScaling:
+    Type: String
+    Description: Enable auto scaling for ECS service based on CPU utilization
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableContainerInsights:
+    Type: String
+    Description: Enable CloudWatch Container Insights for enhanced monitoring
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  CreateCloudWatchDashboard:
+    Type: String
+    Description: Create CloudWatch dashboard for monitoring the application
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Conditions:
+  CreateCICDPipeline: !Equals [!Ref EnableCICDPipeline, 'true']
+  CreateALB: !Equals [!Ref CreateLoadBalancer, 'true']
+  EnableScaling: !Equals [!Ref EnableAutoScaling, 'true']
+  EnableInsights: !Equals [!Ref EnableContainerInsights, 'true']
+  CreateDashboard: !Equals [!Ref CreateCloudWatchDashboard, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # S3 Bucket for App2Container artifacts and CI/CD pipeline artifacts
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-artifacts-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: CleanupMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-artifacts-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: App2Container artifacts storage
+
+  # ECR Repository for container images
+  ContainerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}-${ApplicationId}'
+      ImageTagMutability: MUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only the latest 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${ApplicationId}-repository'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Container image storage
+
+  # ECS Cluster with Container Insights (optional)
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-cluster'
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+          Base: !If [IsProduction, 1, 0]
+        - CapacityProvider: FARGATE_SPOT
+          Weight: !If [IsProduction, 1, 4]
+      ClusterSettings:
+        - Name: containerInsights
+          Value: !If [EnableInsights, enabled, disabled]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cluster'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group for ECS tasks
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}-${ApplicationId}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${ApplicationId}-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for ECS Task Execution
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-task-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ECRAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: '*'
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-task-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for ECS Tasks (application runtime permissions)
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ApplicationPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${ECSLogGroup}:*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${ArtifactsBucket}/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-task-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Security Group for ECS Tasks
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-ecs-sg'
+      GroupDescription: Security group for ECS tasks
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !If [CreateALB, !Ref ALBSecurityGroup, !Ref 'AWS::NoValue']
+          Description: Allow traffic from ALB
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ecs-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Security Group for Application Load Balancer (conditional)
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateALB
+    Properties:
+      GroupName: !Sub '${ProjectName}-alb-sg'
+      GroupDescription: Security group for Application Load Balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTP traffic from internet
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTPS traffic from internet
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alb-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Application Load Balancer (conditional)
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Condition: CreateALB
+    Properties:
+      Name: !Sub '${ProjectName}-alb'
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets: !Ref SubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alb'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ALB Target Group
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: CreateALB
+    Properties:
+      Name: !Sub '${ProjectName}-tg'
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VpcId
+      HealthCheckEnabled: true
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200,404'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-target-group'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ALB Listener
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: CreateALB
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # ECS Task Definition
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${ApplicationId}'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: !Sub '${ApplicationId}-container'
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ContainerRepository}:latest'
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Environment:
+            - Name: ENVIRONMENT
+              Value: !Ref Environment
+            - Name: APPLICATION_ID
+              Value: !Ref ApplicationId
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - !Sub 'curl -f http://localhost:${ContainerPort}/ || exit 1'
+            Interval: 30
+            Retries: 3
+            StartPeriod: 60
+            Timeout: 5
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${ApplicationId}-task'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ECS Service
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListener
+    Properties:
+      ServiceName: !Sub '${ProjectName}-${ApplicationId}-service'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ECSTaskDefinition
+      DesiredCount: !Ref DesiredTaskCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+          Subnets: !Ref SubnetIds
+          AssignPublicIp: ENABLED
+      LoadBalancers:
+        - !If
+          - CreateALB
+          - ContainerName: !Sub '${ApplicationId}-container'
+            ContainerPort: !Ref ContainerPort
+            TargetGroupArn: !Ref ALBTargetGroup
+          - !Ref 'AWS::NoValue'
+      HealthCheckGracePeriodSeconds: !If [CreateALB, 300, !Ref 'AWS::NoValue']
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      EnableExecuteCommand: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${ApplicationId}-service'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Auto Scaling Target (conditional)
+  ECSAutoScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Condition: EnableScaling
+    Properties:
+      ServiceNamespace: ecs
+      ResourceId: !Sub 'service/${ECSCluster}/${ECSService.Name}'
+      ScalableDimension: ecs:service:DesiredCount
+      MinCapacity: 1
+      MaxCapacity: 10
+      RoleARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService'
+
+  # Auto Scaling Policy - CPU (conditional)
+  ECSAutoScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Condition: EnableScaling
+    Properties:
+      PolicyName: !Sub '${ProjectName}-cpu-scaling-policy'
+      PolicyType: TargetTrackingScaling
+      ServiceNamespace: ecs
+      ResourceId: !Ref ECSAutoScalingTarget
+      ScalableDimension: ecs:service:DesiredCount
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 70.0
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleOutCooldown: 300
+        ScaleInCooldown: 300
+
+  # CodeCommit Repository (conditional)
+  CodeCommitRepository:
+    Type: AWS::CodeCommit::Repository
+    Condition: CreateCICDPipeline
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      RepositoryDescription: !Sub 'Source code repository for ${ProjectName} App2Container modernization'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-codecommit-repo'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for CodeBuild
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Condition: CreateCICDPipeline
+    Properties:
+      RoleName: !Sub '${ProjectName}-codebuild-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildServicePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource: !Sub '${ArtifactsBucket}/*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:GetAuthorizationToken
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - codecommit:GitPull
+                Resource: !Sub '${CodeCommitRepository.Arn}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-codebuild-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CodeBuild Project
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Condition: CreateCICDPipeline
+    Properties:
+      Name: !Sub '${ProjectName}-build'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: IMAGE_REPO_NAME
+            Value: !Ref ContainerRepository
+          - Name: IMAGE_TAG
+            Value: latest
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Logging in to Amazon ECR...
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+            build:
+              commands:
+                - echo Build started on `date`
+                - echo Building the Docker image...
+                - docker build -t $IMAGE_REPO_NAME:$IMAGE_TAG .
+                - docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+            post_build:
+              commands:
+                - echo Build completed on `date`
+                - echo Pushing the Docker image...
+                - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+                - echo Writing image definitions file...
+                - printf '[{"name":"%s","imageUri":"%s"}]' "${APPLICATION_ID}-container" "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG" > imagedefinitions.json
+          artifacts:
+            files:
+              - imagedefinitions.json
+          environment-variables:
+            APPLICATION_ID: !Ref ApplicationId
+      TimeoutInMinutes: 15
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-codebuild'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for CodePipeline
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Condition: CreateCICDPipeline
+    Properties:
+      RoleName: !Sub '${ProjectName}-codepipeline-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelineServicePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !Sub '${ArtifactsBucket}/*'
+                  - !Ref ArtifactsBucket
+              - Effect: Allow
+                Action:
+                  - codecommit:CancelUploadArchive
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:GetRepository
+                  - codecommit:ListBranches
+                  - codecommit:ListRepositories
+                Resource: !Sub '${CodeCommitRepository.Arn}'
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: !Sub '${CodeBuildProject.Arn}'
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:DescribeTaskDefinition
+                  - ecs:DescribeTasks
+                  - ecs:ListTasks
+                  - ecs:RegisterTaskDefinition
+                  - ecs:UpdateService
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !GetAtt ECSTaskExecutionRole.Arn
+                  - !GetAtt ECSTaskRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-codepipeline-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CodePipeline
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Condition: CreateCICDPipeline
+    Properties:
+      Name: !Sub '${ProjectName}-pipeline'
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactsBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: '1'
+              Configuration:
+                RepositoryName: !GetAtt CodeCommitRepository.Name
+                BranchName: main
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceOutput
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+        - Name: Deploy
+          Actions:
+            - Name: DeployAction
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: ECS
+                Version: '1'
+              Configuration:
+                ClusterName: !Ref ECSCluster
+                ServiceName: !Ref ECSService
+                FileName: imagedefinitions.json
+              InputArtifacts:
+                - Name: BuildOutput
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-pipeline'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Event Rule for CodeCommit (to trigger pipeline)
+  CodeCommitEventRule:
+    Type: AWS::Events::Rule
+    Condition: CreateCICDPipeline
+    Properties:
+      Name: !Sub '${ProjectName}-codecommit-rule'
+      Description: Trigger CodePipeline on CodeCommit changes
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - CodeCommit Repository State Change
+        resources:
+          - !Sub '${CodeCommitRepository.Arn}'
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName:
+            - main
+      State: ENABLED
+      Targets:
+        - Arn: !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:pipeline/${CodePipeline}'
+          Id: CodePipelineTarget
+          RoleArn: !GetAtt CodeCommitEventRole.Arn
+
+  # IAM Role for CodeCommit Event Rule
+  CodeCommitEventRole:
+    Type: AWS::IAM::Role
+    Condition: CreateCICDPipeline
+    Properties:
+      RoleName: !Sub '${ProjectName}-codecommit-event-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeCommitEventPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codepipeline:StartPipelineExecution
+                Resource: !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:pipeline/${CodePipeline}'
+
+  # CloudWatch Dashboard (conditional)
+  CloudWatchDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateDashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${ApplicationId}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ECS", "CPUUtilization", "ServiceName", "${ECSService}", "ClusterName", "${ECSCluster}" ],
+                  [ ".", "MemoryUtilization", ".", ".", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "ECS Service Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${ApplicationLoadBalancer.LoadBalancerFullName}" ],
+                  [ ".", "RequestCount", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Load Balancer Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${ECSLogGroup}' | fields @timestamp, @message\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Application Logs"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  # Infrastructure Outputs
+  VpcId:
+    Description: VPC ID where resources were created
+    Value: !Ref VpcId
+    Export:
+      Name: !Sub '${ProjectName}-vpc-id'
+
+  ECSClusterName:
+    Description: Name of the ECS cluster
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${ProjectName}-ecs-cluster'
+
+  ECSServiceName:
+    Description: Name of the ECS service
+    Value: !Ref ECSService
+    Export:
+      Name: !Sub '${ProjectName}-ecs-service'
+
+  ECRRepositoryURI:
+    Description: URI of the ECR repository for container images
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ContainerRepository}'
+    Export:
+      Name: !Sub '${ProjectName}-ecr-uri'
+
+  ECRRepositoryName:
+    Description: Name of the ECR repository
+    Value: !Ref ContainerRepository
+    Export:
+      Name: !Sub '${ProjectName}-ecr-name'
+
+  S3BucketName:
+    Description: Name of the S3 bucket for artifacts
+    Value: !Ref ArtifactsBucket
+    Export:
+      Name: !Sub '${ProjectName}-s3-bucket'
+
+  # Load Balancer Outputs
+  LoadBalancerDNS:
+    Condition: CreateALB
+    Description: DNS name of the Application Load Balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${ProjectName}-alb-dns'
+
+  LoadBalancerZone:
+    Condition: CreateALB
+    Description: Canonical hosted zone ID of the load balancer
+    Value: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
+    Export:
+      Name: !Sub '${ProjectName}-alb-zone'
+
+  ApplicationURL:
+    Condition: CreateALB
+    Description: URL of the deployed application
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+    Export:
+      Name: !Sub '${ProjectName}-app-url'
+
+  # CI/CD Outputs
+  CodeCommitRepositoryCloneURL:
+    Condition: CreateCICDPipeline
+    Description: Clone URL for the CodeCommit repository
+    Value: !GetAtt CodeCommitRepository.CloneUrlHttp
+    Export:
+      Name: !Sub '${ProjectName}-repo-clone-url'
+
+  CodeCommitRepositoryName:
+    Condition: CreateCICDPipeline
+    Description: Name of the CodeCommit repository
+    Value: !Ref CodeCommitRepository
+    Export:
+      Name: !Sub '${ProjectName}-repo-name'
+
+  CodePipelineName:
+    Condition: CreateCICDPipeline
+    Description: Name of the CodePipeline
+    Value: !Ref CodePipeline
+    Export:
+      Name: !Sub '${ProjectName}-pipeline-name'
+
+  CodeBuildProjectName:
+    Condition: CreateCICDPipeline
+    Description: Name of the CodeBuild project
+    Value: !Ref CodeBuildProject
+    Export:
+      Name: !Sub '${ProjectName}-codebuild-name'
+
+  # Monitoring Outputs
+  CloudWatchLogGroup:
+    Description: CloudWatch log group for ECS tasks
+    Value: !Ref ECSLogGroup
+    Export:
+      Name: !Sub '${ProjectName}-log-group'
+
+  CloudWatchDashboardURL:
+    Condition: CreateDashboard
+    Description: URL to the CloudWatch dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${ApplicationId}'
+    Export:
+      Name: !Sub '${ProjectName}-dashboard-url'
+
+  # Security Outputs
+  ECSSecurityGroupId:
+    Description: Security group ID for ECS tasks
+    Value: !Ref ECSSecurityGroup
+    Export:
+      Name: !Sub '${ProjectName}-ecs-sg'
+
+  ALBSecurityGroupId:
+    Condition: CreateALB
+    Description: Security group ID for Application Load Balancer
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub '${ProjectName}-alb-sg'
+
+  # IAM Role Outputs
+  ECSTaskExecutionRoleArn:
+    Description: ARN of the ECS task execution role
+    Value: !GetAtt ECSTaskExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-task-execution-role'
+
+  ECSTaskRoleArn:
+    Description: ARN of the ECS task role
+    Value: !GetAtt ECSTaskRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-task-role'
+
+  # Deployment Information
+  StackName:
+    Description: Name of the CloudFormation stack
+    Value: !Ref 'AWS::StackName'
+
+  StackId:
+    Description: ID of the CloudFormation stack
+    Value: !Ref 'AWS::StackId'
+
+  Region:
+    Description: AWS Region where the stack was deployed
+    Value: !Ref 'AWS::Region'
+
+  AccountId:
+    Description: AWS Account ID where the stack was deployed
+    Value: !Ref 'AWS::AccountId'
+
+  DeploymentInstructions:
+    Description: Next steps for App2Container deployment
+    Value: !Sub |
+      1. Build your container image: docker build -t ${ContainerRepository} .
+      2. Tag for ECR: docker tag ${ContainerRepository}:latest ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ContainerRepository}:latest
+      3. Push to ECR: docker push ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ContainerRepository}:latest
+      4. Update ECS service to deploy new image
+      ${CreateALB:+5. Access application at: http://${ApplicationLoadBalancer.DNSName}}

@@ -1,0 +1,471 @@
+# Infrastructure Manager Configuration for Gaming Backend Performance
+# This configuration deploys a high-performance gaming backend using Cloud Memorystore,
+# Cloud CDN, and Compute Engine to deliver sub-millisecond response times for players globally.
+
+imports:
+  - path: https://raw.githubusercontent.com/GoogleCloudPlatform/cloud-foundation-toolkit/master/dm/templates/compute_engine/instance.py
+    name: compute_instance.py
+  - path: https://raw.githubusercontent.com/GoogleCloudPlatform/cloud-foundation-toolkit/master/dm/templates/network/firewall.py
+    name: firewall.py
+
+resources:
+  # Enable required APIs for gaming infrastructure
+  - name: compute-api
+    type: deploymentmanager.v2.virtual.enableService
+    properties:
+      consumerId: project:{{ env["project"] }}
+      serviceName: compute.googleapis.com
+
+  - name: redis-api
+    type: deploymentmanager.v2.virtual.enableService
+    properties:
+      consumerId: project:{{ env["project"] }}
+      serviceName: redis.googleapis.com
+
+  - name: storage-api
+    type: deploymentmanager.v2.virtual.enableService
+    properties:
+      consumerId: project:{{ env["project"] }}
+      serviceName: storage.googleapis.com
+
+  - name: cloudcdn-api
+    type: deploymentmanager.v2.virtual.enableService
+    properties:
+      consumerId: project:{{ env["project"] }}
+      serviceName: cloudcdn.googleapis.com
+
+  # Cloud Memorystore Redis Instance for Gaming Data
+  # Provides ultra-fast caching for player sessions, leaderboards, and game state
+  - name: gaming-redis-cluster
+    type: redis.v1.instance
+    properties:
+      instanceId: gaming-redis-cluster
+      parent: projects/{{ env["project"] }}/locations/us-central1
+      tier: STANDARD_HA  # High availability for production gaming workloads
+      memorySizeGb: 1
+      redisVersion: REDIS_7_0
+      authEnabled: true
+      redisConfigs:
+        maxmemory-policy: allkeys-lru  # Optimal for gaming workloads with fluctuating activity
+      displayName: Gaming Redis Cluster for Session Management
+      labels:
+        environment: gaming
+        component: cache
+        workload: real-time
+    metadata:
+      dependsOn:
+        - redis-api
+
+  # Cloud Storage Bucket for Game Assets
+  # Serves as origin for CDN distribution of textures, audio, and configuration files
+  - name: gaming-assets-bucket
+    type: storage.v1.bucket
+    properties:
+      name: gaming-assets-{{ env["deployment"] }}-$(ref.random-suffix.value)
+      location: US-CENTRAL1
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      publicAccessPrevention: inherited
+      versioning:
+        enabled: false
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 365  # Auto-cleanup old assets after 1 year
+      labels:
+        environment: gaming
+        component: storage
+        content-type: game-assets
+    metadata:
+      dependsOn:
+        - storage-api
+
+  # Generate random suffix for unique resource naming
+  - name: random-suffix
+    type: deploymentmanager.v2.virtual.function
+    properties:
+      sourceCode: |
+        import random
+        import string
+        def generate_value(context):
+            return ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+
+  # Game Server Instance Template
+  # Optimized compute configuration for handling player connections and game logic
+  - name: game-server-template
+    type: compute.v1.instanceTemplate
+    properties:
+      name: game-server-template-{{ env["deployment"] }}
+      description: Template for auto-scaling game servers with Redis integration
+      properties:
+        machineType: n2-standard-2  # Balanced CPU/memory for gaming workloads
+        networkInterfaces:
+          - network: global/networks/default
+            accessConfigs:
+              - name: External NAT
+                type: ONE_TO_ONE_NAT
+                networkTier: PREMIUM  # Global network for low latency
+        disks:
+          - deviceName: boot
+            type: PERSISTENT
+            boot: true
+            autoDelete: true
+            initializeParams:
+              sourceImage: projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts
+              diskType: pd-standard
+              diskSizeGb: 20
+        tags:
+          items:
+            - game-server
+            - http-server
+        metadata:
+          items:
+            - key: startup-script
+              value: |
+                #!/bin/bash
+                # Install Redis tools and web server for game backend
+                apt-get update
+                apt-get install -y redis-tools nginx python3-pip
+                
+                # Configure nginx for game server
+                systemctl enable nginx
+                systemctl start nginx
+                
+                # Create health check endpoint
+                echo "OK" > /var/www/html/health
+                
+                # Log startup completion
+                echo "Game server startup completed at $(date)" >> /var/log/game-server.log
+        serviceAccounts:
+          - email: default
+            scopes:
+              - https://www.googleapis.com/auth/cloud-platform
+        labels:
+          environment: gaming
+          component: compute
+          role: game-server
+    metadata:
+      dependsOn:
+        - compute-api
+
+  # Managed Instance Group for Auto-Scaling
+  # Provides high availability and automatic scaling based on player demand
+  - name: game-server-group
+    type: compute.v1.instanceGroupManager
+    properties:
+      name: game-server-group-{{ env["deployment"] }}
+      zone: us-central1-a
+      targetSize: 1
+      instanceTemplate: $(ref.game-server-template.selfLink)
+      baseInstanceName: game-server
+      description: Managed instance group for auto-scaling game servers
+      namedPorts:
+        - name: http
+          port: 80
+        - name: game-protocol
+          port: 8080
+      autoHealingPolicies:
+        - healthCheck: $(ref.game-server-health.selfLink)
+          initialDelaySec: 300
+      updatePolicy:
+        type: PROACTIVE
+        instanceRedistributionType: PROACTIVE
+        maxSurge:
+          fixed: 1
+        maxUnavailable:
+          fixed: 0
+    metadata:
+      dependsOn:
+        - game-server-template
+        - game-server-health
+
+  # Health Check for Game Servers
+  # Monitors server health and enables auto-healing and load balancing
+  - name: game-server-health
+    type: compute.v1.healthCheck
+    properties:
+      name: game-server-health-{{ env["deployment"] }}
+      description: Health check for game server instances
+      type: HTTP
+      httpHealthCheck:
+        port: 80
+        requestPath: /health
+        proxyHeader: NONE
+      checkIntervalSec: 30
+      timeoutSec: 10
+      healthyThreshold: 2
+      unhealthyThreshold: 3
+    metadata:
+      dependsOn:
+        - compute-api
+
+  # Backend Service for Game Servers
+  # Provides load balancing and CDN integration for dynamic content
+  - name: game-backend-service
+    type: compute.v1.backendService
+    properties:
+      name: game-backend-service-{{ env["deployment"] }}
+      description: Backend service for game server load balancing with CDN
+      protocol: HTTP
+      portName: http
+      timeoutSec: 30
+      healthChecks:
+        - $(ref.game-server-health.selfLink)
+      backends:
+        - group: $(ref.game-server-group.instanceGroup)
+          balancingMode: UTILIZATION
+          maxUtilization: 0.8
+          capacityScaler: 1.0
+      loadBalancingScheme: EXTERNAL
+      cdnPolicy:
+        cacheMode: CACHE_ALL_STATIC
+        signedUrlCacheMaxAgeSec: 7200
+        defaultTtl: 3600
+        maxTtl: 86400
+        negativeCaching: true
+        negativeCachingPolicy:
+          - code: 404
+            ttl: 120
+          - code: 500
+            ttl: 60
+      enableCDN: true
+      sessionAffinity: NONE
+    metadata:
+      dependsOn:
+        - game-server-group
+        - game-server-health
+
+  # Backend Bucket for Static Game Assets
+  # CDN-enabled storage backend for fast global asset delivery
+  - name: game-assets-backend
+    type: compute.v1.backendBucket
+    properties:
+      name: game-assets-backend-{{ env["deployment"] }}
+      description: CDN-enabled backend for game assets storage
+      bucketName: $(ref.gaming-assets-bucket.name)
+      enableCdn: true
+      cdnPolicy:
+        cacheMode: FORCE_CACHE_ALL
+        defaultTtl: 604800  # 7 days for static assets
+        maxTtl: 2592000     # 30 days maximum
+        negativeCaching: true
+        negativeCachingPolicy:
+          - code: 404
+            ttl: 3600
+    metadata:
+      dependsOn:
+        - gaming-assets-bucket
+
+  # URL Map for Intelligent Traffic Routing
+  # Routes asset requests to CDN and API calls to game servers
+  - name: game-backend-map
+    type: compute.v1.urlMap
+    properties:
+      name: game-backend-map-{{ env["deployment"] }}
+      description: URL map for routing game traffic to appropriate backends
+      defaultService: $(ref.game-backend-service.selfLink)
+      pathMatchers:
+        - name: assets-matcher
+          description: Route static assets to CDN-enabled storage
+          defaultService: $(ref.game-assets-backend.selfLink)
+          pathRules:
+            - paths:
+                - /assets/*
+                - /configs/*
+              service: $(ref.game-assets-backend.selfLink)
+      hostRules:
+        - hosts:
+            - "*"
+          pathMatcher: assets-matcher
+    metadata:
+      dependsOn:
+        - game-backend-service
+        - game-assets-backend
+
+  # Managed SSL Certificate for Secure Gaming
+  # Provides automatic SSL certificate management for HTTPS traffic
+  - name: game-ssl-cert
+    type: compute.v1.managedSslCertificate
+    properties:
+      name: game-ssl-cert-{{ env["deployment"] }}
+      description: Managed SSL certificate for secure gaming connections
+      managed:
+        domains:
+          - gaming-backend-{{ env["deployment"] }}.example.com
+      type: MANAGED
+    metadata:
+      dependsOn:
+        - compute-api
+
+  # HTTPS Target Proxy
+  # Terminates SSL and forwards traffic to URL map
+  - name: game-https-proxy
+    type: compute.v1.targetHttpsProxy
+    properties:
+      name: game-https-proxy-{{ env["deployment"] }}
+      description: HTTPS proxy for secure game traffic termination
+      urlMap: $(ref.game-backend-map.selfLink)
+      sslCertificates:
+        - $(ref.game-ssl-cert.selfLink)
+      sslPolicy: null  # Use default SSL policy
+    metadata:
+      dependsOn:
+        - game-backend-map
+        - game-ssl-cert
+
+  # Global Static IP Address
+  # Provides single entry point for players worldwide
+  - name: game-frontend-ip
+    type: compute.v1.globalAddress
+    properties:
+      name: game-frontend-ip-{{ env["deployment"] }}
+      description: Global static IP for gaming frontend
+      addressType: EXTERNAL
+      ipVersion: IPV4
+    metadata:
+      dependsOn:
+        - compute-api
+
+  # Global HTTPS Forwarding Rule
+  # Routes HTTPS traffic from global IP to target proxy
+  - name: game-https-rule
+    type: compute.v1.globalForwardingRule
+    properties:
+      name: game-https-rule-{{ env["deployment"] }}
+      description: Global HTTPS forwarding rule for gaming traffic
+      IPAddress: $(ref.game-frontend-ip.address)
+      IPProtocol: TCP
+      portRange: "443"
+      target: $(ref.game-https-proxy.selfLink)
+      loadBalancingScheme: EXTERNAL
+    metadata:
+      dependsOn:
+        - game-frontend-ip
+        - game-https-proxy
+
+  # Firewall Rule for Game Server Traffic
+  # Allows HTTP/HTTPS and game protocol traffic to servers
+  - name: allow-game-server-traffic
+    type: compute.v1.firewall
+    properties:
+      name: allow-game-server-traffic-{{ env["deployment"] }}
+      description: Allow HTTP/HTTPS and game protocol traffic to game servers
+      network: global/networks/default
+      direction: INGRESS
+      priority: 1000
+      sourceRanges:
+        - 0.0.0.0/0
+      targetTags:
+        - game-server
+      allowed:
+        - IPProtocol: tcp
+          ports:
+            - "80"
+            - "443"
+            - "8080"
+    metadata:
+      dependsOn:
+        - compute-api
+
+  # Firewall Rule for Health Check Traffic
+  # Allows Google Cloud health check probes to reach game servers
+  - name: allow-health-check-traffic
+    type: compute.v1.firewall
+    properties:
+      name: allow-health-check-traffic-{{ env["deployment"] }}
+      description: Allow Google Cloud health check traffic to game servers
+      network: global/networks/default
+      direction: INGRESS
+      priority: 1000
+      sourceRanges:
+        - 35.191.0.0/16    # Google Cloud health check ranges
+        - 130.211.0.0/22
+      targetTags:
+        - game-server
+      allowed:
+        - IPProtocol: tcp
+          ports:
+            - "80"
+    metadata:
+      dependsOn:
+        - compute-api
+
+outputs:
+  # Gaming Infrastructure Endpoints
+  - name: frontend-ip-address
+    description: Global IP address for gaming frontend
+    value: $(ref.game-frontend-ip.address)
+
+  - name: gaming-domain
+    description: Domain name for gaming backend (configure DNS)
+    value: gaming-backend-{{ env["deployment"] }}.example.com
+
+  - name: cdn-url
+    description: CDN URL for game assets
+    value: https://$(ref.game-frontend-ip.address)/assets/
+
+  # Redis Connection Information
+  - name: redis-host
+    description: Redis instance IP address for game server connections
+    value: $(ref.gaming-redis-cluster.host)
+
+  - name: redis-port
+    description: Redis instance port
+    value: $(ref.gaming-redis-cluster.port)
+
+  - name: redis-auth-enabled
+    description: Redis authentication status
+    value: $(ref.gaming-redis-cluster.authEnabled)
+
+  # Storage Information
+  - name: assets-bucket-name
+    description: Cloud Storage bucket name for game assets
+    value: $(ref.gaming-assets-bucket.name)
+
+  - name: assets-bucket-url
+    description: Cloud Storage bucket URL for asset uploads
+    value: gs://$(ref.gaming-assets-bucket.name)
+
+  # Load Balancer Information
+  - name: backend-service-name
+    description: Backend service name for game servers
+    value: $(ref.game-backend-service.name)
+
+  - name: health-check-url
+    description: Health check endpoint URL
+    value: https://$(ref.game-frontend-ip.address)/health
+
+  # Deployment Information
+  - name: deployment-region
+    description: Primary deployment region
+    value: us-central1
+
+  - name: instance-group-name
+    description: Managed instance group name for game servers
+    value: $(ref.game-server-group.name)
+
+  - name: ssl-certificate-status
+    description: SSL certificate provisioning status
+    value: $(ref.game-ssl-cert.managed.status)
+
+metadata:
+  version: "1.0"
+  description: "High-performance gaming backend infrastructure with Redis caching and global CDN"
+  author: "Cloud Recipe Generator"
+  tags:
+    - gaming
+    - performance
+    - redis
+    - cdn
+    - load-balancing
+    - memorystore
+  estimated-cost: "$50-100/month for testing workload"
+  scaling-capability: "Auto-scaling based on player demand"
+  global-reach: "CDN edge locations worldwide"
+  performance-target: "Sub-millisecond Redis latency, global asset delivery"

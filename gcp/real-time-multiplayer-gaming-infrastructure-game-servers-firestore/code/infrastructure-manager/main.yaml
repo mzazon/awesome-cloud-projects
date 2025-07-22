@@ -1,0 +1,737 @@
+# Infrastructure Manager Configuration for Real-Time Multiplayer Gaming Infrastructure
+# This configuration deploys a complete gaming infrastructure with Game Servers and Cloud Firestore
+#
+# Components deployed:
+# - GKE cluster with Agones for game server management
+# - Cloud Firestore for real-time database synchronization
+# - Cloud Run for serverless matchmaking API
+# - Cloud Load Balancing for global traffic distribution
+# - VPC network with proper security configurations
+# - IAM service accounts with least-privilege access
+
+terraform:
+  required_version: ">= 1.0"
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 5.0"
+    kubernetes:
+      source: "hashicorp/kubernetes"
+      version: "~> 2.0"
+    helm:
+      source: "hashicorp/helm"
+      version: "~> 2.0"
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud project ID for the gaming infrastructure"
+    
+  region:
+    type: string
+    description: "Primary region for the gaming infrastructure"
+    default: "us-central1"
+    
+  zone:
+    type: string
+    description: "Primary zone for the GKE cluster"
+    default: "us-central1-a"
+    
+  cluster_name:
+    type: string
+    description: "Name of the GKE cluster for game servers"
+    default: "gaming-cluster"
+    
+  environment:
+    type: string
+    description: "Environment name (dev, staging, prod)"
+    default: "dev"
+    
+  game_server_min_nodes:
+    type: number
+    description: "Minimum number of game server nodes"
+    default: 1
+    
+  game_server_max_nodes:
+    type: number
+    description: "Maximum number of game server nodes"
+    default: 10
+    
+  machine_type:
+    type: string
+    description: "Machine type for game server nodes"
+    default: "e2-standard-4"
+
+# Local values for resource naming and configuration
+locals:
+  common_labels:
+    environment: "${var.environment}"
+    project: "multiplayer-gaming"
+    managed-by: "infrastructure-manager"
+  
+  network_name: "gaming-vpc-${var.environment}"
+  subnet_name: "gaming-subnet-${var.environment}"
+  firestore_database: "gaming-db-${var.environment}"
+  matchmaking_service: "matchmaking-api-${var.environment}"
+
+# Configure providers
+provider_config:
+  google:
+    project: "${var.project_id}"
+    region: "${var.region}"
+    
+  google-beta:
+    project: "${var.project_id}"
+    region: "${var.region}"
+    
+  kubernetes:
+    host: "https://${google_container_cluster.gaming_cluster.endpoint}"
+    token: "${data.google_client_config.default.access_token}"
+    cluster_ca_certificate: "${base64decode(google_container_cluster.gaming_cluster.master_auth.0.cluster_ca_certificate)}"
+    
+  helm:
+    kubernetes:
+      host: "https://${google_container_cluster.gaming_cluster.endpoint}"
+      token: "${data.google_client_config.default.access_token}"
+      cluster_ca_certificate: "${base64decode(google_container_cluster.gaming_cluster.master_auth.0.cluster_ca_certificate)}"
+
+# Data sources
+data:
+  google_client_config:
+    default: {}
+
+# Enable required Google Cloud APIs
+resources:
+  # Enable APIs required for gaming infrastructure
+  google_project_service:
+    gameservices_api:
+      project: "${var.project_id}"
+      service: "gameservices.googleapis.com"
+      disable_dependent_services: true
+      
+    container_api:
+      project: "${var.project_id}"
+      service: "container.googleapis.com"
+      disable_dependent_services: true
+      
+    run_api:
+      project: "${var.project_id}"
+      service: "run.googleapis.com"
+      disable_dependent_services: true
+      
+    firestore_api:
+      project: "${var.project_id}"
+      service: "firestore.googleapis.com"
+      disable_dependent_services: true
+      
+    compute_api:
+      project: "${var.project_id}"
+      service: "compute.googleapis.com"
+      disable_dependent_services: true
+      
+    iam_api:
+      project: "${var.project_id}"
+      service: "iam.googleapis.com"
+      disable_dependent_services: true
+
+  # VPC Network for gaming infrastructure
+  google_compute_network:
+    gaming_vpc:
+      name: "${local.network_name}"
+      project: "${var.project_id}"
+      auto_create_subnetworks: false
+      delete_default_routes_on_create: false
+      description: "VPC network for multiplayer gaming infrastructure"
+      
+      labels: "${local.common_labels}"
+      
+      depends_on:
+        - "google_project_service.compute_api"
+
+  # Subnet for game servers and services
+  google_compute_subnetwork:
+    gaming_subnet:
+      name: "${local.subnet_name}"
+      project: "${var.project_id}"
+      region: "${var.region}"
+      network: "${google_compute_network.gaming_vpc.id}"
+      ip_cidr_range: "10.0.0.0/16"
+      description: "Subnet for gaming infrastructure components"
+      
+      # Secondary IP ranges for pods and services
+      secondary_ip_range:
+        - range_name: "pods"
+          ip_cidr_range: "10.1.0.0/16"
+        - range_name: "services"
+          ip_cidr_range: "10.2.0.0/16"
+      
+      private_ip_google_access: true
+
+  # Firewall rules for gaming traffic
+  google_compute_firewall:
+    # Allow game server traffic (UDP ports 7000-8000)
+    game_server_traffic:
+      name: "allow-game-server-traffic"
+      project: "${var.project_id}"
+      network: "${google_compute_network.gaming_vpc.name}"
+      description: "Allow UDP traffic for game servers"
+      
+      allow:
+        - protocol: "udp"
+          ports: ["7000-8000"]
+      
+      source_ranges: ["0.0.0.0/0"]
+      target_tags: ["game-server"]
+    
+    # Allow health check traffic
+    health_check_traffic:
+      name: "allow-health-check-traffic"
+      project: "${var.project_id}"
+      network: "${google_compute_network.gaming_vpc.name}"
+      description: "Allow health check traffic from load balancers"
+      
+      allow:
+        - protocol: "tcp"
+          ports: ["8080", "9376"]
+      
+      source_ranges: ["130.211.0.0/22", "35.191.0.0/16"]
+      target_tags: ["gke-node"]
+
+  # Service account for GKE nodes
+  google_service_account:
+    gke_service_account:
+      account_id: "gke-gaming-sa-${var.environment}"
+      project: "${var.project_id}"
+      display_name: "GKE Gaming Service Account"
+      description: "Service account for GKE gaming cluster nodes"
+
+  # IAM bindings for GKE service account
+  google_project_iam_member:
+    gke_node_service_account:
+      project: "${var.project_id}"
+      role: "roles/container.nodeServiceAccount"
+      member: "serviceAccount:${google_service_account.gke_service_account.email}"
+      
+    gke_registry_reader:
+      project: "${var.project_id}"
+      role: "roles/storage.objectViewer"
+      member: "serviceAccount:${google_service_account.gke_service_account.email}"
+      
+    gke_firestore_user:
+      project: "${var.project_id}"
+      role: "roles/datastore.user"
+      member: "serviceAccount:${google_service_account.gke_service_account.email}"
+
+  # GKE cluster optimized for gaming workloads
+  google_container_cluster:
+    gaming_cluster:
+      name: "${var.cluster_name}"
+      project: "${var.project_id}"
+      location: "${var.zone}"
+      
+      # Network configuration
+      network: "${google_compute_network.gaming_vpc.name}"
+      subnetwork: "${google_compute_subnetwork.gaming_subnet.name}"
+      
+      # IP allocation for pods and services
+      ip_allocation_policy:
+        cluster_secondary_range_name: "pods"
+        services_secondary_range_name: "services"
+      
+      # Remove default node pool
+      remove_default_node_pool: true
+      initial_node_count: 1
+      
+      # Network policy for security
+      network_policy:
+        enabled: true
+        provider: "CALICO"
+      
+      # Workload Identity for secure pod-to-service authentication
+      workload_identity_config:
+        workload_pool: "${var.project_id}.svc.id.goog"
+      
+      # Cluster features for gaming
+      addons_config:
+        horizontal_pod_autoscaling:
+          disabled: false
+        http_load_balancing:
+          disabled: false
+        network_policy_config:
+          disabled: false
+      
+      # Master authorized networks for security
+      master_authorized_networks_config:
+        cidr_blocks:
+          - cidr_block: "10.0.0.0/16"
+            display_name: "VPC CIDR"
+      
+      # Private cluster configuration
+      private_cluster_config:
+        enable_private_nodes: true
+        enable_private_endpoint: false
+        master_ipv4_cidr_block: "172.16.0.0/28"
+      
+      # Maintenance window
+      maintenance_policy:
+        daily_maintenance_window:
+          start_time: "03:00"
+      
+      labels: "${local.common_labels}"
+      
+      depends_on:
+        - "google_project_service.container_api"
+        - "google_compute_subnetwork.gaming_subnet"
+
+  # Node pool for game servers
+  google_container_node_pool:
+    game_server_nodes:
+      name: "game-server-pool"
+      project: "${var.project_id}"
+      location: "${var.zone}"
+      cluster: "${google_container_cluster.gaming_cluster.name}"
+      
+      # Autoscaling configuration
+      autoscaling:
+        min_node_count: "${var.game_server_min_nodes}"
+        max_node_count: "${var.game_server_max_nodes}"
+      
+      # Node configuration optimized for gaming
+      node_config:
+        machine_type: "${var.machine_type}"
+        disk_size_gb: 100
+        disk_type: "pd-ssd"
+        image_type: "COS_CONTAINERD"
+        
+        # Service account
+        service_account: "${google_service_account.gke_service_account.email}"
+        
+        # OAuth scopes
+        oauth_scopes:
+          - "https://www.googleapis.com/auth/cloud-platform"
+        
+        # Node labels for game server targeting
+        labels:
+          node-type: "game-server"
+          environment: "${var.environment}"
+        
+        # Node taints for dedicated game server nodes
+        taint:
+          - key: "dedicated"
+            value: "game-server"
+            effect: "NO_SCHEDULE"
+        
+        # Network tags for firewall rules
+        tags: ["gke-node", "game-server"]
+        
+        # Metadata for node management
+        metadata:
+          disable-legacy-endpoints: "true"
+        
+        # Shielded VM features for security
+        shielded_instance_config:
+          enable_secure_boot: true
+          enable_integrity_monitoring: true
+      
+      # Upgrade settings
+      upgrade_settings:
+        max_surge: 1
+        max_unavailable: 0
+      
+      # Management settings
+      management:
+        auto_repair: true
+        auto_upgrade: true
+
+  # Cloud Firestore database for real-time game state
+  google_firestore_database:
+    gaming_database:
+      project: "${var.project_id}"
+      name: "${local.firestore_database}"
+      location_id: "${var.region}"
+      type: "FIRESTORE_NATIVE"
+      
+      # Enable point-in-time recovery
+      point_in_time_recovery_enablement: "POINT_IN_TIME_RECOVERY_ENABLED"
+      
+      # Deletion protection
+      delete_protection_state: "DELETE_PROTECTION_ENABLED"
+      deletion_policy: "ABANDON"
+      
+      depends_on:
+        - "google_project_service.firestore_api"
+
+  # Service account for Cloud Run matchmaking service
+  google_service_account:
+    matchmaking_service_account:
+      account_id: "matchmaking-sa-${var.environment}"
+      project: "${var.project_id}"
+      display_name: "Matchmaking Service Account"
+      description: "Service account for Cloud Run matchmaking service"
+
+  # IAM bindings for matchmaking service
+  google_project_iam_member:
+    matchmaking_firestore_user:
+      project: "${var.project_id}"
+      role: "roles/datastore.user"
+      member: "serviceAccount:${google_service_account.matchmaking_service_account.email}"
+      
+    matchmaking_container_user:
+      project: "${var.project_id}"
+      role: "roles/container.viewer"
+      member: "serviceAccount:${google_service_account.matchmaking_service_account.email}"
+
+  # Cloud Run service for matchmaking API
+  google_cloud_run_service:
+    matchmaking_service:
+      name: "${local.matchmaking_service}"
+      project: "${var.project_id}"
+      location: "${var.region}"
+      
+      template:
+        metadata:
+          labels: "${local.common_labels}"
+          annotations:
+            "autoscaling.knative.dev/maxScale": "100"
+            "autoscaling.knative.dev/minScale": "1"
+            "run.googleapis.com/execution-environment": "gen2"
+        
+        spec:
+          service_account_name: "${google_service_account.matchmaking_service_account.email}"
+          container_concurrency: 1000
+          timeout_seconds: 300
+          
+          containers:
+            - image: "gcr.io/google-samples/hello-app:1.0"  # Placeholder image
+              name: "matchmaking-container"
+              
+              # Resource limits optimized for matchmaking
+              resources:
+                limits:
+                  cpu: "1000m"
+                  memory: "512Mi"
+                requests:
+                  cpu: "100m"
+                  memory: "128Mi"
+              
+              # Environment variables for configuration
+              env:
+                - name: "PROJECT_ID"
+                  value: "${var.project_id}"
+                - name: "FIRESTORE_DATABASE"
+                  value: "${local.firestore_database}"
+                - name: "ENVIRONMENT"
+                  value: "${var.environment}"
+                - name: "CLUSTER_NAME"
+                  value: "${var.cluster_name}"
+                - name: "CLUSTER_ZONE"
+                  value: "${var.zone}"
+              
+              # Health check configuration
+              liveness_probe:
+                http_get:
+                  path: "/health"
+                  port: 8080
+                initial_delay_seconds: 30
+                timeout_seconds: 5
+                period_seconds: 10
+                failure_threshold: 3
+              
+              readiness_probe:
+                http_get:
+                  path: "/ready"
+                  port: 8080
+                initial_delay_seconds: 5
+                timeout_seconds: 5
+                period_seconds: 5
+                failure_threshold: 3
+              
+              ports:
+                - container_port: 8080
+                  name: "http1"
+      
+      traffic:
+        - percent: 100
+          latest_revision: true
+      
+      depends_on:
+        - "google_project_service.run_api"
+        - "google_firestore_database.gaming_database"
+
+  # Cloud Run IAM policy for public access
+  google_cloud_run_service_iam_member:
+    matchmaking_public_access:
+      project: "${var.project_id}"
+      location: "${var.region}"
+      service: "${google_cloud_run_service.matchmaking_service.name}"
+      role: "roles/run.invoker"
+      member: "allUsers"
+
+  # Backend service for load balancer
+  google_compute_backend_service:
+    matchmaking_backend:
+      name: "matchmaking-backend-${var.environment}"
+      project: "${var.project_id}"
+      protocol: "HTTP"
+      port_name: "http"
+      timeout_sec: 30
+      enable_cdn: true
+      
+      # Health check configuration
+      health_checks: ["${google_compute_health_check.matchmaking_health_check.id}"]
+      
+      # Backend configuration for Cloud Run
+      backend:
+        - group: "${google_compute_region_network_endpoint_group.matchmaking_neg.id}"
+          balancing_mode: "UTILIZATION"
+          capacity_scaler: 1.0
+      
+      # CDN configuration for static content
+      cdn_policy:
+        cache_mode: "CACHE_ALL_STATIC"
+        default_ttl: 3600
+        max_ttl: 86400
+        negative_caching: true
+        
+        cache_key_policy:
+          include_host: true
+          include_protocol: true
+          include_query_string: false
+      
+      # Security policy can be attached here
+      log_config:
+        enable: true
+        sample_rate: 0.1
+
+  # Health check for matchmaking service
+  google_compute_health_check:
+    matchmaking_health_check:
+      name: "matchmaking-health-check-${var.environment}"
+      project: "${var.project_id}"
+      timeout_sec: 5
+      check_interval_sec: 30
+      healthy_threshold: 2
+      unhealthy_threshold: 3
+      
+      http_health_check:
+        port: 8080
+        request_path: "/health"
+        port_specification: "USE_FIXED_PORT"
+
+  # Network Endpoint Group for Cloud Run service
+  google_compute_region_network_endpoint_group:
+    matchmaking_neg:
+      name: "matchmaking-neg-${var.environment}"
+      project: "${var.project_id}"
+      region: "${var.region}"
+      network_endpoint_type: "SERVERLESS"
+      
+      cloud_run:
+        service: "${google_cloud_run_service.matchmaking_service.name}"
+
+  # URL map for load balancer routing
+  google_compute_url_map:
+    gaming_load_balancer:
+      name: "gaming-lb-${var.environment}"
+      project: "${var.project_id}"
+      default_service: "${google_compute_backend_service.matchmaking_backend.id}"
+      description: "Load balancer for gaming infrastructure"
+      
+      # Path matchers for different services
+      path_matcher:
+        - name: "matchmaking-paths"
+          default_service: "${google_compute_backend_service.matchmaking_backend.id}"
+          
+          path_rule:
+            - paths: ["/matchmake", "/matchmake/*"]
+              service: "${google_compute_backend_service.matchmaking_backend.id}"
+            - paths: ["/health", "/ready"]
+              service: "${google_compute_backend_service.matchmaking_backend.id}"
+      
+      # Host rules for routing
+      host_rule:
+        - hosts: ["*"]
+          path_matcher: "matchmaking-paths"
+
+  # HTTP(S) proxy for the load balancer
+  google_compute_target_http_proxy:
+    gaming_proxy:
+      name: "gaming-proxy-${var.environment}"
+      project: "${var.project_id}"
+      url_map: "${google_compute_url_map.gaming_load_balancer.id}"
+      description: "HTTP proxy for gaming load balancer"
+
+  # Global forwarding rule for external access
+  google_compute_global_forwarding_rule:
+    gaming_forwarding_rule:
+      name: "gaming-forwarding-rule-${var.environment}"
+      project: "${var.project_id}"
+      target: "${google_compute_target_http_proxy.gaming_proxy.id}"
+      port_range: "80"
+      ip_protocol: "TCP"
+      load_balancing_scheme: "EXTERNAL"
+      description: "Global forwarding rule for gaming infrastructure"
+
+# Install Agones using Helm
+  helm_release:
+    agones:
+      name: "agones"
+      chart: "agones"
+      repository: "https://agones.dev/chart/stable"
+      version: "1.39.0"
+      namespace: "agones-system"
+      create_namespace: true
+      
+      # Agones configuration values
+      values:
+        - |
+          gameservers:
+            minPort: 7000
+            maxPort: 8000
+            podPreserveUnknownFields: false
+          
+          agones:
+            controller:
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+            
+            ping:
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 100m
+                  memory: 128Mi
+            
+            allocator:
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+          
+          # Image configuration
+          image:
+            registry: "us-docker.pkg.dev/agones-images/release"
+            tag: "1.39.0"
+            pullPolicy: "IfNotPresent"
+      
+      depends_on:
+        - "google_container_cluster.gaming_cluster"
+        - "google_container_node_pool.game_server_nodes"
+
+  # Example Game Server Fleet
+  kubernetes_manifest:
+    game_server_fleet:
+      manifest:
+        apiVersion: "agones.dev/v1"
+        kind: "Fleet"
+        metadata:
+          name: "simple-game-server-fleet"
+          namespace: "default"
+          labels: "${local.common_labels}"
+        
+        spec:
+          replicas: 2
+          template:
+            spec:
+              # Port configuration for game server
+              ports:
+                - name: "default"
+                  containerPort: 7654
+                  protocol: "UDP"
+              
+              # Health check configuration
+              health:
+                disabled: false
+                initialDelaySeconds: 5
+                periodSeconds: 5
+                failureThreshold: 3
+              
+              # Pod template
+              template:
+                spec:
+                  # Node selector for dedicated game server nodes
+                  nodeSelector:
+                    node-type: "game-server"
+                  
+                  # Toleration for dedicated nodes
+                  tolerations:
+                    - key: "dedicated"
+                      operator: "Equal"
+                      value: "game-server"
+                      effect: "NoSchedule"
+                  
+                  containers:
+                    - name: "simple-game-server"
+                      image: "gcr.io/agones-images/simple-game-server:0.12"
+                      
+                      # Resource requirements
+                      resources:
+                        requests:
+                          memory: "64Mi"
+                          cpu: "20m"
+                        limits:
+                          memory: "128Mi"
+                          cpu: "50m"
+                      
+                      # Environment variables
+                      env:
+                        - name: "GAMESERVER_NAME"
+                          valueFrom:
+                            fieldRef:
+                              fieldPath: "metadata.name"
+                        - name: "POD_NAMESPACE"
+                          valueFrom:
+                            fieldRef:
+                              fieldPath: "metadata.namespace"
+      
+      depends_on:
+        - "helm_release.agones"
+
+# Output values for reference
+outputs:
+  cluster_name:
+    description: "Name of the GKE cluster"
+    value: "${google_container_cluster.gaming_cluster.name}"
+  
+  cluster_endpoint:
+    description: "Endpoint of the GKE cluster"
+    value: "${google_container_cluster.gaming_cluster.endpoint}"
+    sensitive: true
+  
+  firestore_database:
+    description: "Name of the Firestore database"
+    value: "${google_firestore_database.gaming_database.name}"
+  
+  matchmaking_service_url:
+    description: "URL of the Cloud Run matchmaking service"
+    value: "${google_cloud_run_service.matchmaking_service.status[0].url}"
+  
+  load_balancer_ip:
+    description: "IP address of the global load balancer"
+    value: "${google_compute_global_forwarding_rule.gaming_forwarding_rule.ip_address}"
+  
+  vpc_network:
+    description: "Name of the VPC network"
+    value: "${google_compute_network.gaming_vpc.name}"
+  
+  project_id:
+    description: "Google Cloud project ID"
+    value: "${var.project_id}"
+  
+  region:
+    description: "Primary region for the infrastructure"
+    value: "${var.region}"

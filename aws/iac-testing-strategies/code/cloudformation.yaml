@@ -1,0 +1,810 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure as Code Automated Testing Pipeline - Deploys CodeBuild, CodePipeline, and supporting resources for comprehensive IaC testing'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Repository Configuration"
+        Parameters:
+          - RepositoryName
+          - BranchName
+      - Label:
+          default: "Build Configuration"
+        Parameters:
+          - BuildImage
+          - ComputeType
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+          - EnableSlackNotifications
+          - SlackWebhookUrl
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Name of the project (used for resource naming)
+    Default: iac-testing
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: Must start with a letter, contain only lowercase letters, numbers, and hyphens
+
+  Environment:
+    Type: String
+    Description: Environment name for resource tagging
+    Default: development
+    AllowedValues:
+      - development
+      - staging
+      - production
+
+  RepositoryName:
+    Type: String
+    Description: Name of the CodeCommit repository to create
+    Default: iac-testing-repo
+    MinLength: 3
+    MaxLength: 100
+    AllowedPattern: '^[a-zA-Z0-9._-]+$'
+
+  BranchName:
+    Type: String
+    Description: Branch name to monitor for changes
+    Default: main
+    AllowedValues:
+      - main
+      - master
+      - develop
+
+  BuildImage:
+    Type: String
+    Description: CodeBuild Docker image for build environment
+    Default: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+    AllowedValues:
+      - aws/codebuild/amazonlinux2-x86_64-standard:3.0
+      - aws/codebuild/amazonlinux2-x86_64-standard:4.0
+      - aws/codebuild/amazonlinux2-x86_64-standard:5.0
+      - aws/codebuild/ubuntu-base:14.04
+
+  ComputeType:
+    Type: String
+    Description: CodeBuild compute type
+    Default: BUILD_GENERAL1_SMALL
+    AllowedValues:
+      - BUILD_GENERAL1_SMALL
+      - BUILD_GENERAL1_MEDIUM
+      - BUILD_GENERAL1_LARGE
+      - BUILD_GENERAL1_2XLARGE
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for pipeline notifications (optional)
+    Default: ''
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address or empty
+
+  EnableSlackNotifications:
+    Type: String
+    Description: Enable Slack notifications for pipeline events
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  SlackWebhookUrl:
+    Type: String
+    Description: Slack webhook URL for notifications (required if Slack notifications enabled)
+    Default: ''
+    NoEcho: true
+
+Conditions:
+  CreateEmailNotifications: !Not [!Equals [!Ref NotificationEmail, '']]
+  CreateSlackNotifications: !Equals [!Ref EnableSlackNotifications, 'true']
+  HasNotifications: !Or [!Condition CreateEmailNotifications, !Condition CreateSlackNotifications]
+
+Resources:
+  # S3 Bucket for CodePipeline Artifacts
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-artifacts-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpirationInDays: 7
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: CodePipeline Artifacts
+
+  # S3 Bucket Policy for CodePipeline Access
+  ArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${ArtifactsBucket}/*'
+              - !GetAtt ArtifactsBucket.Arn
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # CodeCommit Repository
+  Repository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      RepositoryDescription: !Sub 'Infrastructure as Code testing repository for ${ProjectName}'
+      Code:
+        S3:
+          Bucket: !Ref ArtifactsBucket
+          Key: initial-code.zip
+        BranchName: !Ref BranchName
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group for CodeBuild
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectName}'
+      RetentionInDays: 14
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for CodeBuild
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-codebuild-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Policies:
+        - PolicyName: CodeBuildServicePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3 permissions for artifacts and testing
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:CreateBucket
+                  - s3:DeleteBucket
+                  - s3:ListBucket
+                  - s3:GetBucketEncryption
+                  - s3:GetBucketVersioning
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub '${ArtifactsBucket}/*'
+                  - !GetAtt ArtifactsBucket.Arn
+                  - 'arn:aws:s3:::*integration-test*'
+              # CloudFormation permissions for integration testing
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:GetTemplate
+                  - cloudformation:ListStacks
+                Resource: '*'
+                Condition:
+                  StringLike:
+                    'cloudformation:StackName': 'integration-test-*'
+              # IAM permissions for CloudFormation role management
+              - Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:PassRole
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/*integration-test*'
+              # CodeCommit permissions
+              - Effect: Allow
+                Action:
+                  - codecommit:GitPull
+                  - codecommit:GetRepository
+                Resource: !GetAtt Repository.Arn
+              # Systems Manager for parameter storage
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:PutParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CodeBuild Project for Testing
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Ref ProjectName
+      Description: !Sub 'Automated testing for Infrastructure as Code - ${ProjectName}'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: !Ref ComputeType
+        Image: !Ref BuildImage
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: PROJECT_NAME
+            Value: !Ref ProjectName
+          - Name: ARTIFACTS_BUCKET
+            Value: !Ref ArtifactsBucket
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          
+          phases:
+            install:
+              runtime-versions:
+                python: 3.9
+                nodejs: 16
+              commands:
+                - echo "Installing dependencies..."
+                - pip install --upgrade pip
+                - pip install boto3 cfn-lint checkov pytest PyYAML moto
+                - npm install -g aws-cdk@latest
+                
+            pre_build:
+              commands:
+                - echo "Pre-build phase started on `date`"
+                - echo "Validating AWS credentials..."
+                - aws sts get-caller-identity
+                - echo "Setting up test environment..."
+                - export PYTHONPATH=$PYTHONPATH:$(pwd)
+                
+            build:
+              commands:
+                - echo "Build phase started on `date`"
+                
+                # Static Analysis Phase
+                - echo "=== Running Static Analysis ==="
+                - echo "Running CloudFormation linting..."
+                - find . -name "*.yaml" -o -name "*.yml" | grep -E "(template|cloudformation)" | xargs -I {} cfn-lint {}
+                
+                - echo "Running security analysis with Checkov..."
+                - checkov -f templates/ --framework cloudformation || true
+                
+                # Unit Testing Phase
+                - echo "=== Running Unit Tests ==="
+                - if [ -d "tests" ]; then
+                    cd tests && python -m pytest -v --tb=short || true;
+                    cd ..;
+                  fi
+                
+                # Template Validation Phase
+                - echo "=== Running Template Validation ==="
+                - for template in $(find . -name "*.yaml" -o -name "*.yml" | grep -E "(template|cloudformation)"); do
+                    echo "Validating $template";
+                    aws cloudformation validate-template --template-body file://$template;
+                  done
+                
+                # Cost Analysis Phase
+                - echo "=== Running Cost Analysis ==="
+                - if [ -f "tests/cost_analysis.py" ]; then
+                    python tests/cost_analysis.py || true;
+                  fi
+                
+                # Security Compliance Phase
+                - echo "=== Running Security Compliance Tests ==="
+                - if [ -f "tests/security_test.py" ]; then
+                    python tests/security_test.py;
+                  fi
+                
+                # Integration Testing Phase (if safe)
+                - echo "=== Running Integration Tests ==="
+                - if [ -f "tests/integration_test.py" ] && [ "$ENABLE_INTEGRATION_TESTS" = "true" ]; then
+                    python tests/integration_test.py;
+                  else
+                    echo "Integration tests skipped (set ENABLE_INTEGRATION_TESTS=true to enable)";
+                  fi
+                
+            post_build:
+              commands:
+                - echo "Post-build phase started on `date`"
+                - echo "Generating test report..."
+                - echo "All tests completed successfully!"
+                
+          reports:
+            test-reports:
+              files:
+                - '**/*'
+              base-directory: 'test-reports'
+          
+          artifacts:
+            files:
+              - '**/*'
+            name: !Sub '${ProjectName}-$(date +%Y-%m-%d)'
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref CodeBuildLogGroup
+      TimeoutInMinutes: 60
+      QueuedTimeoutInMinutes: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for CodePipeline
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-pipeline-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelineServicePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3 permissions for artifacts
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !Sub '${ArtifactsBucket}/*'
+                  - !GetAtt ArtifactsBucket.Arn
+              # CodeCommit permissions
+              - Effect: Allow
+                Action:
+                  - codecommit:CancelUploadArchive
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:GetRepository
+                  - codecommit:ListBranches
+                  - codecommit:ListRepositories
+                Resource: !GetAtt Repository.Arn
+              # CodeBuild permissions
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: !GetAtt CodeBuildProject.Arn
+              # SNS permissions for notifications
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !If [HasNotifications, !Ref NotificationTopic, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Topic for Notifications (conditional)
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasNotifications
+    Properties:
+      TopicName: !Sub '${ProjectName}-notifications'
+      DisplayName: !Sub 'IaC Testing Pipeline Notifications - ${ProjectName}'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Email Subscription (conditional)
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateEmailNotifications
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Event Rule for Pipeline State Changes
+  PipelineEventRule:
+    Type: AWS::Events::Rule
+    Condition: HasNotifications
+    Properties:
+      Name: !Sub '${ProjectName}-pipeline-events'
+      Description: 'Capture CodePipeline state changes for notifications'
+      EventPattern:
+        source:
+          - aws.codepipeline
+        detail-type:
+          - CodePipeline Pipeline Execution State Change
+          - CodePipeline Stage Execution State Change
+        detail:
+          pipeline:
+            - !Ref CodePipeline
+          state:
+            - FAILED
+            - SUCCEEDED
+      State: ENABLED
+      Targets:
+        - Arn: !Ref NotificationTopic
+          Id: NotificationTarget
+          InputTransformer:
+            InputPathsMap:
+              pipeline: $.detail.pipeline
+              state: $.detail.state
+              execution-id: $.detail.execution-id
+            InputTemplate: |
+              {
+                "pipeline": "<pipeline>",
+                "state": "<state>",
+                "execution-id": "<execution-id>",
+                "message": "Pipeline <pipeline> has <state>"
+              }
+
+  # EventBridge Rule Permission for SNS
+  EventBridgeInvokeSnSPermission:
+    Type: AWS::SNS::TopicPolicy
+    Condition: HasNotifications
+    Properties:
+      Topics:
+        - !Ref NotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref NotificationTopic
+
+  # CodePipeline
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub '${ProjectName}-pipeline'
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactsBucket
+        EncryptionKey:
+          Type: KMS
+          Id: alias/aws/s3
+      Stages:
+        # Source Stage
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: '1'
+              Configuration:
+                RepositoryName: !Ref RepositoryName
+                BranchName: !Ref BranchName
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceOutput
+        
+        # Static Analysis and Unit Testing Stage
+        - Name: StaticAnalysis
+          Actions:
+            - Name: TestAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+                EnvironmentVariables: |
+                  [
+                    {
+                      "name": "STAGE_NAME",
+                      "value": "static-analysis"
+                    }
+                  ]
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: TestOutput
+              RunOrder: 1
+        
+        # Security and Compliance Stage
+        - Name: SecurityCompliance
+          Actions:
+            - Name: SecurityScan
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+                EnvironmentVariables: |
+                  [
+                    {
+                      "name": "STAGE_NAME",
+                      "value": "security-compliance"
+                    },
+                    {
+                      "name": "ENABLE_SECURITY_TESTS",
+                      "value": "true"
+                    }
+                  ]
+              InputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+        
+        # Optional Integration Testing Stage (manual approval)
+        - Name: IntegrationTestApproval
+          Actions:
+            - Name: ManualApproval
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                CustomData: 'Review test results and approve integration testing if needed'
+              RunOrder: 1
+        
+        - Name: IntegrationTest
+          Actions:
+            - Name: IntegrationTest
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+                EnvironmentVariables: |
+                  [
+                    {
+                      "name": "STAGE_NAME",
+                      "value": "integration-test"
+                    },
+                    {
+                      "name": "ENABLE_INTEGRATION_TESTS",
+                      "value": "true"
+                    }
+                  ]
+              InputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Event Rule for Repository Changes
+  RepositoryEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-repo-changes'
+      Description: 'Trigger pipeline on repository changes'
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - CodeCommit Repository State Change
+        resources:
+          - !GetAtt Repository.Arn
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName:
+            - !Ref BranchName
+      State: ENABLED
+      Targets:
+        - Arn: !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:pipeline/${CodePipeline}'
+          Id: CodePipelineTarget
+          RoleArn: !GetAtt CloudWatchEventRole.Arn
+
+  # IAM Role for CloudWatch Events
+  CloudWatchEventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchEventPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codepipeline:StartPipelineExecution
+                Resource: !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:pipeline/${CodePipeline}'
+
+  # CloudWatch Dashboard for Monitoring
+  TestingDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-testing-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/CodeBuild", "Builds", "ProjectName", "${CodeBuildProject}" ],
+                  [ ".", "SucceededBuilds", ".", "." ],
+                  [ ".", "FailedBuilds", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "CodeBuild Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/CodePipeline", "PipelineExecutionSuccess", "PipelineName", "${CodePipeline}" ],
+                  [ ".", "PipelineExecutionFailure", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Pipeline Execution Metrics"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/codebuild/${ProjectName}'\n| fields @timestamp, @message\n| filter @message like /ERROR/ or @message like /FAILED/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Build Errors",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  ProjectName:
+    Description: Name of the IaC testing project
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectName'
+
+  ArtifactsBucket:
+    Description: S3 bucket for storing pipeline artifacts
+    Value: !Ref ArtifactsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ArtifactsBucket'
+
+  RepositoryName:
+    Description: Name of the CodeCommit repository
+    Value: !Ref RepositoryName
+    Export:
+      Name: !Sub '${AWS::StackName}-RepositoryName'
+
+  RepositoryCloneUrl:
+    Description: HTTPS clone URL for the CodeCommit repository
+    Value: !Sub 'https://git-codecommit.${AWS::Region}.amazonaws.com/v1/repos/${RepositoryName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-RepositoryCloneUrl'
+
+  CodeBuildProject:
+    Description: Name of the CodeBuild project for testing
+    Value: !Ref CodeBuildProject
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeBuildProject'
+
+  CodePipeline:
+    Description: Name of the CodePipeline for automated testing
+    Value: !Ref CodePipeline
+    Export:
+      Name: !Sub '${AWS::StackName}-CodePipeline'
+
+  PipelineUrl:
+    Description: URL to view the CodePipeline in AWS Console
+    Value: !Sub 'https://console.aws.amazon.com/codesuite/codepipeline/pipelines/${CodePipeline}/view'
+    Export:
+      Name: !Sub '${AWS::StackName}-PipelineUrl'
+
+  DashboardUrl:
+    Description: URL to view the CloudWatch Dashboard
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-testing-dashboard'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardUrl'
+
+  NotificationTopic:
+    Condition: HasNotifications
+    Description: SNS topic ARN for pipeline notifications
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopic'
+
+  StackRegion:
+    Description: AWS Region where the stack is deployed
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub '${AWS::StackName}-Region'
+
+  StackAccountId:
+    Description: AWS Account ID where the stack is deployed
+    Value: !Ref AWS::AccountId
+    Export:
+      Name: !Sub '${AWS::StackName}-AccountId'

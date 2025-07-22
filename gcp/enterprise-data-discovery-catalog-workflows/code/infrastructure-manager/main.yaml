@@ -1,0 +1,706 @@
+# Google Cloud Infrastructure Manager Configuration
+# Enterprise Data Discovery with Data Catalog and Cloud Workflows
+# This configuration deploys the complete infrastructure for automated data discovery and cataloging
+
+apiVersion: blueprints.infrastructure.manager.google.com/v1alpha1
+kind: Blueprint
+metadata:
+  name: enterprise-data-discovery
+  labels:
+    category: analytics
+    solution: data-discovery
+    automation: true
+
+spec:
+  # Input variables for customization
+  inputValues:
+    - name: project_id
+      description: "Google Cloud Project ID"
+      type: string
+      required: true
+    
+    - name: region
+      description: "Primary region for resource deployment"
+      type: string
+      default: "us-central1"
+      
+    - name: zone
+      description: "Primary zone for compute resources"
+      type: string
+      default: "us-central1-a"
+      
+    - name: environment
+      description: "Environment name (dev, staging, prod)"
+      type: string
+      default: "dev"
+      
+    - name: org_name
+      description: "Organization name for resource naming"
+      type: string
+      default: "enterprise"
+      
+    - name: enable_scheduler
+      description: "Enable automated scheduling of discovery workflows"
+      type: boolean
+      default: true
+      
+    - name: discovery_schedule_daily
+      description: "Cron schedule for daily discovery (default: 2 AM daily)"
+      type: string
+      default: "0 2 * * *"
+      
+    - name: discovery_schedule_weekly
+      description: "Cron schedule for weekly comprehensive discovery (default: 1 AM Sunday)"
+      type: string
+      default: "0 1 * * 0"
+
+  # Resource definitions
+  resources:
+    # Enable required Google Cloud APIs
+    - name: enable_apis
+      type: gcp-types/serviceusage-v1:serviceusage.services.batchEnable
+      properties:
+        parent: projects/$(ref.project_id.projectId)
+        serviceIds:
+          - datacatalog.googleapis.com
+          - workflows.googleapis.com
+          - cloudfunctions.googleapis.com
+          - cloudscheduler.googleapis.com
+          - bigquery.googleapis.com
+          - cloudbuild.googleapis.com
+          - storage.googleapis.com
+          - logging.googleapis.com
+          - monitoring.googleapis.com
+
+    # Service account for Cloud Functions and Workflows
+    - name: discovery_service_account
+      type: gcp-types/iam-v1:projects.serviceAccounts
+      properties:
+        accountId: discovery-automation-sa
+        serviceAccount:
+          displayName: "Data Discovery Automation Service Account"
+          description: "Service account for automated data discovery workflows"
+      metadata:
+        dependsOn:
+          - enable_apis
+
+    # IAM bindings for the service account
+    - name: discovery_sa_data_catalog_admin
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: $(ref.project_id.projectId)
+        role: roles/datacatalog.admin
+        member: serviceAccount:$(ref.discovery_service_account.email)
+
+    - name: discovery_sa_bigquery_admin
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: $(ref.project_id.projectId)
+        role: roles/bigquery.admin
+        member: serviceAccount:$(ref.discovery_service_account.email)
+
+    - name: discovery_sa_storage_admin
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: $(ref.project_id.projectId)
+        role: roles/storage.admin
+        member: serviceAccount:$(ref.discovery_service_account.email)
+
+    - name: discovery_sa_workflows_admin
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: $(ref.project_id.projectId)
+        role: roles/workflows.admin
+        member: serviceAccount:$(ref.discovery_service_account.email)
+
+    - name: discovery_sa_functions_invoker
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: $(ref.project_id.projectId)
+        role: roles/cloudfunctions.invoker
+        member: serviceAccount:$(ref.discovery_service_account.email)
+
+    - name: discovery_sa_logging_writer
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: $(ref.project_id.projectId)
+        role: roles/logging.logWriter
+        member: serviceAccount:$(ref.discovery_service_account.email)
+
+    # Cloud Storage bucket for staging and function source code
+    - name: discovery_staging_bucket
+      type: gcp-types/storage-v1:buckets
+      properties:
+        name: $(ref.project_id.projectId)-data-catalog-staging-$(ref.environment.value)
+        location: $(ref.region.value)
+        storageClass: STANDARD
+        uniformBucketLevelAccess:
+          enabled: true
+        versioning:
+          enabled: true
+        lifecycle:
+          rule:
+            - action:
+                type: Delete
+              condition:
+                age: 30
+                matchesStorageClass: ["STANDARD"]
+        labels:
+          purpose: data-discovery
+          environment: $(ref.environment.value)
+          managed-by: infrastructure-manager
+      metadata:
+        dependsOn:
+          - enable_apis
+
+    # Data Catalog Tag Template for Data Classification
+    - name: data_classification_tag_template
+      type: gcp-types/datacatalog-v1:projects.locations.tagTemplates
+      properties:
+        parent: projects/$(ref.project_id.projectId)/locations/$(ref.region.value)
+        tagTemplateId: data_classification
+        tagTemplate:
+          displayName: "Data Classification Template"
+          fields:
+            sensitivity:
+              displayName: "Data Sensitivity"
+              type:
+                enumType:
+                  allowedValues:
+                    - displayName: "PUBLIC"
+                      description: "Data suitable for public consumption"
+                    - displayName: "INTERNAL"
+                      description: "Data for internal organizational use"
+                    - displayName: "CONFIDENTIAL"
+                      description: "Sensitive data requiring protection"
+                    - displayName: "RESTRICTED"
+                      description: "Highly sensitive data with strict access controls"
+              isRequired: true
+            owner:
+              displayName: "Data Owner"
+              type:
+                primitiveType: STRING
+              isRequired: true
+            department:
+              displayName: "Department"
+              type:
+                primitiveType: STRING
+              isRequired: false
+            last_updated:
+              displayName: "Last Updated"
+              type:
+                primitiveType: TIMESTAMP
+              isRequired: false
+      metadata:
+        dependsOn:
+          - enable_apis
+
+    # Data Catalog Tag Template for Data Quality Metrics
+    - name: data_quality_tag_template
+      type: gcp-types/datacatalog-v1:projects.locations.tagTemplates
+      properties:
+        parent: projects/$(ref.project_id.projectId)/locations/$(ref.region.value)
+        tagTemplateId: data_quality
+        tagTemplate:
+          displayName: "Data Quality Metrics"
+          fields:
+            completeness_score:
+              displayName: "Completeness Score"
+              type:
+                primitiveType: DOUBLE
+              isRequired: false
+            accuracy_score:
+              displayName: "Accuracy Score"
+              type:
+                primitiveType: DOUBLE
+              isRequired: false
+            freshness_days:
+              displayName: "Data Freshness (Days)"
+              type:
+                primitiveType: DOUBLE
+              isRequired: false
+            validation_date:
+              displayName: "Last Validation"
+              type:
+                primitiveType: TIMESTAMP
+              isRequired: false
+      metadata:
+        dependsOn:
+          - enable_apis
+
+    # Cloud Function for metadata extraction
+    - name: metadata_extractor_function
+      type: gcp-types/cloudfunctions-v1:projects.locations.functions
+      properties:
+        location: projects/$(ref.project_id.projectId)/locations/$(ref.region.value)
+        function:
+          name: projects/$(ref.project_id.projectId)/locations/$(ref.region.value)/functions/metadata-extractor-$(ref.environment.value)
+          description: "Cloud Function for intelligent metadata extraction and cataloging"
+          sourceArchiveUrl: gs://$(ref.discovery_staging_bucket.name)/function-source.zip
+          httpsTrigger: {}
+          runtime: python311
+          entryPoint: discover_and_catalog
+          timeout: 540s
+          availableMemoryMb: 1024
+          maxInstances: 10
+          serviceAccountEmail: $(ref.discovery_service_account.email)
+          environmentVariables:
+            GOOGLE_CLOUD_PROJECT: $(ref.project_id.projectId)
+            DATACATALOG_LOCATION: $(ref.region.value)
+            LOG_LEVEL: INFO
+          labels:
+            purpose: data-discovery
+            environment: $(ref.environment.value)
+            managed-by: infrastructure-manager
+      metadata:
+        dependsOn:
+          - discovery_service_account
+          - discovery_staging_bucket
+          - data_classification_tag_template
+          - data_quality_tag_template
+
+    # Cloud Workflows for discovery orchestration
+    - name: discovery_workflow
+      type: gcp-types/workflows-v1:projects.locations.workflows
+      properties:
+        parent: projects/$(ref.project_id.projectId)/locations/$(ref.region.value)
+        workflowId: data-discovery-workflow-$(ref.environment.value)
+        workflow:
+          description: "Automated data discovery and cataloging workflow"
+          labels:
+            purpose: data-discovery
+            environment: $(ref.environment.value)
+            managed-by: infrastructure-manager
+          serviceAccount: $(ref.discovery_service_account.email)
+          sourceContents: |
+            main:
+              params: [input]
+              steps:
+                - initialize:
+                    assign:
+                      - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+                      - location: "$(ref.region.value)"
+                      - function_name: "metadata-extractor-$(ref.environment.value)"
+                      - discovery_results: {}
+                      
+                - get_function_url:
+                    call: googleapis.cloudfunctions.v1.projects.locations.functions.get
+                    args:
+                      name: ${"projects/" + project_id + "/locations/" + location + "/functions/" + function_name}
+                    result: function_info
+                    
+                - extract_function_url:
+                    assign:
+                      - function_url: ${function_info.httpsTrigger.url}
+                      
+                - log_start:
+                    call: sys.log
+                    args:
+                      text: ${"Starting data discovery for project: " + project_id}
+                      severity: INFO
+                      
+                - parallel_discovery:
+                    parallel:
+                      shared: [discovery_results]
+                      branches:
+                        - bigquery_discovery:
+                            steps:
+                              - discover_bigquery:
+                                  try:
+                                    call: http.post
+                                    args:
+                                      url: ${function_url}
+                                      headers:
+                                        Content-Type: "application/json"
+                                      body:
+                                        project_id: ${project_id}
+                                        location: ${location}
+                                        source_type: "bigquery"
+                                    result: bq_result
+                                  retry:
+                                    predicate: ${http.default_retry_predicate}
+                                    max_retries: 3
+                                    backoff:
+                                      initial_delay: 2
+                                      max_delay: 60
+                                      multiplier: 2
+                                  except:
+                                    as: e
+                                    steps:
+                                      - log_bq_error:
+                                          call: sys.log
+                                          args:
+                                            text: ${"BigQuery discovery failed: " + e.message}
+                                            severity: ERROR
+                                      - set_bq_error:
+                                          assign:
+                                            - bq_result: {"error": e.message}
+                                            
+                              - store_bq_results:
+                                  assign:
+                                    - discovery_results.bigquery: ${bq_result}
+                                    
+                        - storage_discovery:
+                            steps:
+                              - discover_storage:
+                                  try:
+                                    call: http.post
+                                    args:
+                                      url: ${function_url}
+                                      headers:
+                                        Content-Type: "application/json"
+                                      body:
+                                        project_id: ${project_id}
+                                        location: ${location}
+                                        source_type: "storage"
+                                    result: storage_result
+                                  retry:
+                                    predicate: ${http.default_retry_predicate}
+                                    max_retries: 3
+                                    backoff:
+                                      initial_delay: 2
+                                      max_delay: 60
+                                      multiplier: 2
+                                  except:
+                                    as: e
+                                    steps:
+                                      - log_storage_error:
+                                          call: sys.log
+                                          args:
+                                            text: ${"Storage discovery failed: " + e.message}
+                                            severity: ERROR
+                                      - set_storage_error:
+                                          assign:
+                                            - storage_result: {"error": e.message}
+                                            
+                              - store_storage_results:
+                                  assign:
+                                    - discovery_results.storage: ${storage_result}
+                                    
+                - generate_summary:
+                    assign:
+                      - total_assets: 0
+                      - successful_sources: 0
+                      - failed_sources: 0
+                      
+                - count_bigquery_assets:
+                    switch:
+                      - condition: ${"error" in discovery_results.bigquery}
+                        assign:
+                          - failed_sources: ${failed_sources + 1}
+                      - condition: true
+                        assign:
+                          - total_assets: ${total_assets + len(discovery_results.bigquery.get("bigquery_datasets", []))}
+                          - successful_sources: ${successful_sources + 1}
+                          
+                - count_storage_assets:
+                    switch:
+                      - condition: ${"error" in discovery_results.storage}
+                        assign:
+                          - failed_sources: ${failed_sources + 1}
+                      - condition: true
+                        assign:
+                          - total_assets: ${total_assets + len(discovery_results.storage.get("storage_buckets", []))}
+                          - successful_sources: ${successful_sources + 1}
+                          
+                - log_completion:
+                    call: sys.log
+                    args:
+                      text: ${"Discovery completed. Assets cataloged: " + string(total_assets) + ", Successful sources: " + string(successful_sources) + ", Failed sources: " + string(failed_sources)}
+                      severity: INFO
+                      
+                - return_results:
+                    return:
+                      summary:
+                        total_assets_cataloged: ${total_assets}
+                        successful_sources: ${successful_sources}
+                        failed_sources: ${failed_sources}
+                        timestamp: ${time.format(sys.now())}
+                      details: ${discovery_results}
+      metadata:
+        dependsOn:
+          - metadata_extractor_function
+          - discovery_service_account
+
+    # Cloud Scheduler job for daily discovery (conditional)
+    - name: daily_discovery_scheduler
+      type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+      properties:
+        parent: projects/$(ref.project_id.projectId)/locations/$(ref.region.value)
+        job:
+          name: projects/$(ref.project_id.projectId)/locations/$(ref.region.value)/jobs/discovery-scheduler-daily-$(ref.environment.value)
+          description: "Daily automated data discovery execution"
+          schedule: $(ref.discovery_schedule_daily.value)
+          timeZone: "America/New_York"
+          httpTarget:
+            uri: https://workflowexecutions.googleapis.com/v1/projects/$(ref.project_id.projectId)/locations/$(ref.region.value)/workflows/$(ref.discovery_workflow.name)/executions
+            httpMethod: POST
+            headers:
+              Content-Type: "application/json"
+            body: |
+              {
+                "argument": "{\"environment\": \"$(ref.environment.value)\", \"comprehensive\": false}"
+              }
+            oauthToken:
+              serviceAccountEmail: $(ref.discovery_service_account.email)
+              scope: "https://www.googleapis.com/auth/cloud-platform"
+          retryConfig:
+            retryCount: 3
+            maxRetryDuration: "600s"
+            minBackoffDuration: "5s"
+            maxBackoffDuration: "60s"
+            maxDoublings: 3
+      metadata:
+        dependsOn:
+          - discovery_workflow
+          - discovery_service_account
+        condition: $(ref.enable_scheduler.value)
+
+    # Cloud Scheduler job for weekly comprehensive discovery (conditional)
+    - name: weekly_discovery_scheduler
+      type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+      properties:
+        parent: projects/$(ref.project_id.projectId)/locations/$(ref.region.value)
+        job:
+          name: projects/$(ref.project_id.projectId)/locations/$(ref.region.value)/jobs/discovery-scheduler-weekly-$(ref.environment.value)
+          description: "Weekly comprehensive data discovery execution"
+          schedule: $(ref.discovery_schedule_weekly.value)
+          timeZone: "America/New_York"
+          httpTarget:
+            uri: https://workflowexecutions.googleapis.com/v1/projects/$(ref.project_id.projectId)/locations/$(ref.region.value)/workflows/$(ref.discovery_workflow.name)/executions
+            httpMethod: POST
+            headers:
+              Content-Type: "application/json"
+            body: |
+              {
+                "argument": "{\"environment\": \"$(ref.environment.value)\", \"comprehensive\": true}"
+              }
+            oauthToken:
+              serviceAccountEmail: $(ref.discovery_service_account.email)
+              scope: "https://www.googleapis.com/auth/cloud-platform"
+          retryConfig:
+            retryCount: 3
+            maxRetryDuration: "600s"
+            minBackoffDuration: "5s"
+            maxBackoffDuration: "60s"
+            maxDoublings: 3
+      metadata:
+        dependsOn:
+          - discovery_workflow
+          - discovery_service_account
+        condition: $(ref.enable_scheduler.value)
+
+    # Sample BigQuery datasets for testing
+    - name: customer_analytics_dataset
+      type: gcp-types/bigquery-v2:datasets
+      properties:
+        datasetId: customer_analytics_$(ref.environment.value)
+        projectId: $(ref.project_id.projectId)
+        location: $(ref.region.value)
+        description: "Sample customer data for discovery testing"
+        labels:
+          purpose: testing
+          environment: $(ref.environment.value)
+          managed-by: infrastructure-manager
+        access:
+          - role: OWNER
+            userByEmail: $(ref.discovery_service_account.email)
+          - role: READER
+            specialGroup: projectReaders
+      metadata:
+        dependsOn:
+          - enable_apis
+          - discovery_service_account
+
+    - name: hr_internal_dataset
+      type: gcp-types/bigquery-v2:datasets
+      properties:
+        datasetId: hr_internal_$(ref.environment.value)
+        projectId: $(ref.project_id.projectId)
+        location: $(ref.region.value)
+        description: "Internal employee data for testing"
+        labels:
+          purpose: testing
+          environment: $(ref.environment.value)
+          managed-by: infrastructure-manager
+          sensitivity: confidential
+        access:
+          - role: OWNER
+            userByEmail: $(ref.discovery_service_account.email)
+      metadata:
+        dependsOn:
+          - enable_apis
+          - discovery_service_account
+
+    # Sample BigQuery tables
+    - name: transactions_table
+      type: gcp-types/bigquery-v2:tables
+      properties:
+        projectId: $(ref.project_id.projectId)
+        datasetId: $(ref.customer_analytics_dataset.datasetId)
+        tableId: transactions
+        table:
+          description: "Customer transaction history"
+          schema:
+            fields:
+              - name: customer_id
+                type: STRING
+                mode: REQUIRED
+                description: "Unique customer identifier"
+              - name: transaction_date
+                type: TIMESTAMP
+                mode: REQUIRED
+                description: "Transaction timestamp"
+              - name: amount
+                type: FLOAT
+                mode: REQUIRED
+                description: "Transaction amount"
+              - name: product_category
+                type: STRING
+                mode: NULLABLE
+                description: "Product category"
+              - name: payment_method
+                type: STRING
+                mode: NULLABLE
+                description: "Payment method used"
+          labels:
+            purpose: testing
+            environment: $(ref.environment.value)
+            data-type: transactional
+      metadata:
+        dependsOn:
+          - customer_analytics_dataset
+
+    - name: employees_table
+      type: gcp-types/bigquery-v2:tables
+      properties:
+        projectId: $(ref.project_id.projectId)
+        datasetId: $(ref.hr_internal_dataset.datasetId)
+        tableId: employees
+        table:
+          description: "Employee personal information"
+          schema:
+            fields:
+              - name: employee_id
+                type: STRING
+                mode: REQUIRED
+                description: "Unique employee identifier"
+              - name: first_name
+                type: STRING
+                mode: REQUIRED
+                description: "Employee first name"
+              - name: last_name
+                type: STRING
+                mode: REQUIRED
+                description: "Employee last name"
+              - name: email
+                type: STRING
+                mode: REQUIRED
+                description: "Employee email address"
+              - name: department
+                type: STRING
+                mode: NULLABLE
+                description: "Employee department"
+              - name: salary
+                type: INTEGER
+                mode: NULLABLE
+                description: "Employee salary"
+              - name: hire_date
+                type: DATE
+                mode: NULLABLE
+                description: "Employee hire date"
+          labels:
+            purpose: testing
+            environment: $(ref.environment.value)
+            data-type: personal
+            sensitivity: confidential
+      metadata:
+        dependsOn:
+          - hr_internal_dataset
+
+    # Additional Cloud Storage buckets for testing
+    - name: public_datasets_bucket
+      type: gcp-types/storage-v1:buckets
+      properties:
+        name: $(ref.project_id.projectId)-public-datasets-$(ref.environment.value)
+        location: $(ref.region.value)
+        storageClass: STANDARD
+        uniformBucketLevelAccess:
+          enabled: true
+        labels:
+          purpose: testing
+          environment: $(ref.environment.value)
+          sensitivity: public
+          managed-by: infrastructure-manager
+      metadata:
+        dependsOn:
+          - enable_apis
+
+    - name: confidential_reports_bucket
+      type: gcp-types/storage-v1:buckets
+      properties:
+        name: $(ref.project_id.projectId)-confidential-reports-$(ref.environment.value)
+        location: $(ref.region.value)
+        storageClass: STANDARD
+        uniformBucketLevelAccess:
+          enabled: true
+        encryption:
+          defaultKmsKeyName: ""  # Use Google-managed encryption
+        labels:
+          purpose: testing
+          environment: $(ref.environment.value)
+          sensitivity: confidential
+          managed-by: infrastructure-manager
+      metadata:
+        dependsOn:
+          - enable_apis
+
+  # Output values for reference and integration
+  outputs:
+    - name: project_id
+      description: "Google Cloud Project ID"
+      value: $(ref.project_id.projectId)
+      
+    - name: discovery_service_account_email
+      description: "Email of the service account for data discovery"
+      value: $(ref.discovery_service_account.email)
+      
+    - name: workflow_name
+      description: "Name of the data discovery workflow"
+      value: $(ref.discovery_workflow.name)
+      
+    - name: function_name
+      description: "Name of the metadata extraction function"
+      value: $(ref.metadata_extractor_function.name)
+      
+    - name: function_url
+      description: "HTTPS trigger URL for the metadata extraction function"
+      value: $(ref.metadata_extractor_function.httpsTrigger.url)
+      
+    - name: staging_bucket_name
+      description: "Name of the staging bucket for discovery operations"
+      value: $(ref.discovery_staging_bucket.name)
+      
+    - name: data_classification_template
+      description: "Resource name of the data classification tag template"
+      value: $(ref.data_classification_tag_template.name)
+      
+    - name: data_quality_template
+      description: "Resource name of the data quality tag template"
+      value: $(ref.data_quality_tag_template.name)
+      
+    - name: customer_analytics_dataset
+      description: "BigQuery dataset for customer analytics testing"
+      value: $(ref.customer_analytics_dataset.id)
+      
+    - name: hr_internal_dataset
+      description: "BigQuery dataset for HR testing"
+      value: $(ref.hr_internal_dataset.id)
+      
+    - name: data_catalog_console_url
+      description: "URL to access the Data Catalog in Google Cloud Console"
+      value: "https://console.cloud.google.com/datacatalog?project=$(ref.project_id.projectId)"
+      
+    - name: workflows_console_url
+      description: "URL to access Cloud Workflows in Google Cloud Console"
+      value: "https://console.cloud.google.com/workflows?project=$(ref.project_id.projectId)"

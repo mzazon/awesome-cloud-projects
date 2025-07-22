@@ -1,0 +1,437 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Automated S3 backup solution with EventBridge scheduling and Lambda processing'
+
+Parameters:
+  PrimaryBucketName:
+    Type: String
+    Description: 'Name for the primary S3 bucket (will have random suffix appended)'
+    Default: 'primary-data'
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be a valid S3 bucket name prefix'
+    
+  BackupBucketName:
+    Type: String
+    Description: 'Name for the backup S3 bucket (will have random suffix appended)'
+    Default: 'backup-data'
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be a valid S3 bucket name prefix'
+    
+  BackupSchedule:
+    Type: String
+    Description: 'Cron expression for backup schedule (UTC time)'
+    Default: 'cron(0 1 * * ? *)'
+    ConstraintDescription: 'Must be a valid EventBridge cron expression'
+    
+  LambdaTimeout:
+    Type: Number
+    Description: 'Lambda function timeout in seconds'
+    Default: 60
+    MinValue: 30
+    MaxValue: 900
+    
+  LambdaMemorySize:
+    Type: Number
+    Description: 'Lambda function memory size in MB'
+    Default: 128
+    MinValue: 128
+    MaxValue: 10240
+    
+  StandardIATransitionDays:
+    Type: Number
+    Description: 'Days after which to transition backups to Standard-IA'
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    
+  GlacierTransitionDays:
+    Type: Number
+    Description: 'Days after which to transition backups to Glacier'
+    Default: 90
+    MinValue: 1
+    MaxValue: 365
+    
+  ExpirationDays:
+    Type: Number
+    Description: 'Days after which to delete backups'
+    Default: 365
+    MinValue: 1
+    MaxValue: 3650
+
+Conditions:
+  HasCustomPrimaryBucket: !Not [!Equals [!Ref PrimaryBucketName, 'primary-data']]
+  HasCustomBackupBucket: !Not [!Equals [!Ref BackupBucketName, 'backup-data']]
+
+Resources:
+  # Random suffix for unique bucket names
+  RandomSuffixFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-random-suffix-generator'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt RandomSuffixFunctionRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          import random
+          import string
+          import cfnresponse
+          
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Create':
+                      # Generate 6-character random suffix
+                      suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Suffix': suffix})
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  RandomSuffixFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  RandomSuffixCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt RandomSuffixFunction.Arn
+
+  # Primary S3 Bucket - stores working data
+  PrimaryBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${PrimaryBucketName}-${RandomSuffixCustomResource.Suffix}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt BackupFunction.Arn
+      Tags:
+        - Key: Purpose
+          Value: Primary data storage
+        - Key: Environment
+          Value: !Ref AWS::StackName
+
+  # Backup S3 Bucket - stores backup copies with versioning
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${BackupBucketName}-${RandomSuffixCustomResource.Suffix}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: BackupRetentionRule
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: !Ref StandardIATransitionDays
+              - StorageClass: GLACIER
+                TransitionInDays: !Ref GlacierTransitionDays
+            ExpirationInDays: !Ref ExpirationDays
+      Tags:
+        - Key: Purpose
+          Value: Backup data storage
+        - Key: Environment
+          Value: !Ref AWS::StackName
+
+  # IAM Role for Lambda backup function
+  BackupFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-backup-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3BackupPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${PrimaryBucket}'
+                  - !Sub '${PrimaryBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${BackupBucket}'
+                  - !Sub '${BackupBucket}/*'
+
+  # Lambda function for backup processing
+  BackupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-backup-function'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt BackupFunctionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref PrimaryBucket
+          DESTINATION_BUCKET: !Ref BackupBucket
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import time
+          import json
+          
+          def lambda_handler(event, context):
+              """
+              Lambda function to backup objects from primary bucket to backup bucket
+              """
+              # Get bucket names from environment variables
+              source_bucket = os.environ['SOURCE_BUCKET']
+              destination_bucket = os.environ['DESTINATION_BUCKET']
+              
+              # Initialize S3 client
+              s3 = boto3.client('s3')
+              
+              # Get current timestamp for logging
+              timestamp = time.strftime("%Y-%m-%d-%H-%M-%S")
+              print(f"Starting backup process at {timestamp}")
+              print(f"Source bucket: {source_bucket}")
+              print(f"Destination bucket: {destination_bucket}")
+              
+              try:
+                  # List objects in source bucket
+                  objects = []
+                  paginator = s3.get_paginator('list_objects_v2')
+                  
+                  for page in paginator.paginate(Bucket=source_bucket):
+                      if 'Contents' in page:
+                          objects.extend(page['Contents'])
+                  
+                  print(f"Found {len(objects)} objects to backup")
+                  
+                  # Copy each object to the destination bucket
+                  copied_count = 0
+                  errors = []
+                  
+                  for obj in objects:
+                      key = obj['Key']
+                      copy_source = {'Bucket': source_bucket, 'Key': key}
+                      
+                      try:
+                          print(f"Copying {key} to backup bucket")
+                          s3.copy_object(
+                              CopySource=copy_source,
+                              Bucket=destination_bucket,
+                              Key=key,
+                              MetadataDirective='COPY'
+                          )
+                          copied_count += 1
+                      except Exception as e:
+                          error_msg = f"Failed to copy {key}: {str(e)}"
+                          print(error_msg)
+                          errors.append(error_msg)
+                  
+                  # Log results
+                  success_rate = (copied_count / len(objects)) * 100 if objects else 100
+                  print(f"Backup completed. Copied {copied_count} objects ({success_rate:.1f}% success rate)")
+                  
+                  if errors:
+                      print(f"Errors encountered: {len(errors)}")
+                      for error in errors:
+                          print(f"  - {error}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Successfully backed up {copied_count} objects',
+                          'total_objects': len(objects),
+                          'copied_objects': copied_count,
+                          'errors': len(errors),
+                          'success_rate': success_rate
+                      })
+                  }
+              
+              except Exception as e:
+                  error_msg = f"Backup process failed: {str(e)}"
+                  print(error_msg)
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': error_msg
+                      })
+                  }
+      Tags:
+        - Key: Purpose
+          Value: S3 backup processing
+        - Key: Environment
+          Value: !Ref AWS::StackName
+
+  # EventBridge rule for scheduled backups
+  BackupScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-backup-schedule'
+      Description: 'Schedule rule for automated S3 backups'
+      ScheduleExpression: !Ref BackupSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt BackupFunction.Arn
+          Id: BackupFunctionTarget
+
+  # Permission for EventBridge to invoke Lambda function
+  BackupFunctionEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BackupFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BackupScheduleRule.Arn
+
+  # CloudWatch Log Group for Lambda function
+  BackupFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${BackupFunction}'
+      RetentionInDays: 30
+
+  # SNS Topic for backup notifications (optional)
+  BackupNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-backup-notifications'
+      DisplayName: 'S3 Backup Notifications'
+
+  # CloudWatch Alarm for backup function errors
+  BackupFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-backup-function-errors'
+      AlarmDescription: 'Alarm for backup function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref BackupFunction
+      AlarmActions:
+        - !Ref BackupNotificationTopic
+
+  # CloudWatch Alarm for backup function duration
+  BackupFunctionDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-backup-function-duration'
+      AlarmDescription: 'Alarm for backup function duration'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Sub '${LambdaTimeout}000'
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref BackupFunction
+      AlarmActions:
+        - !Ref BackupNotificationTopic
+
+Outputs:
+  PrimaryBucketName:
+    Description: 'Name of the primary S3 bucket'
+    Value: !Ref PrimaryBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryBucket'
+
+  BackupBucketName:
+    Description: 'Name of the backup S3 bucket'
+    Value: !Ref BackupBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupBucket'
+
+  BackupFunctionName:
+    Description: 'Name of the backup Lambda function'
+    Value: !Ref BackupFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupFunction'
+
+  BackupFunctionArn:
+    Description: 'ARN of the backup Lambda function'
+    Value: !GetAtt BackupFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupFunctionArn'
+
+  BackupScheduleRuleName:
+    Description: 'Name of the EventBridge backup schedule rule'
+    Value: !Ref BackupScheduleRule
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupScheduleRule'
+
+  BackupScheduleExpression:
+    Description: 'Schedule expression for backups'
+    Value: !Ref BackupSchedule
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupSchedule'
+
+  BackupNotificationTopicArn:
+    Description: 'ARN of the backup notification SNS topic'
+    Value: !Ref BackupNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupNotificationTopic'
+
+  PrimaryBucketConsoleUrl:
+    Description: 'AWS Console URL for the primary S3 bucket'
+    Value: !Sub 'https://console.aws.amazon.com/s3/buckets/${PrimaryBucket}'
+
+  BackupBucketConsoleUrl:
+    Description: 'AWS Console URL for the backup S3 bucket'
+    Value: !Sub 'https://console.aws.amazon.com/s3/buckets/${BackupBucket}'
+
+  BackupFunctionConsoleUrl:
+    Description: 'AWS Console URL for the backup Lambda function'
+    Value: !Sub 'https://console.aws.amazon.com/lambda/home?region=${AWS::Region}#/functions/${BackupFunction}'
+
+  CostEstimate:
+    Description: 'Estimated monthly cost for small workloads'
+    Value: 'Less than $5/month for small datasets (varies by storage and usage)'

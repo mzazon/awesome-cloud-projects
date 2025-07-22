@@ -1,0 +1,419 @@
+# Infrastructure Manager Configuration for Patient Sentiment Analysis
+# Recipe: Patient Sentiment Analysis with Cloud Healthcare API and Natural Language AI
+# 
+# This configuration deploys a complete healthcare analytics pipeline that:
+# - Creates a HIPAA-compliant FHIR store for patient data
+# - Processes patient feedback using Natural Language AI sentiment analysis
+# - Stores results in BigQuery for healthcare analytics
+# - Uses event-driven architecture with Pub/Sub for real-time processing
+
+metadata:
+  name: patient-sentiment-analysis
+  description: Healthcare sentiment analysis pipeline using Cloud Healthcare API and Natural Language AI
+  version: "1.0"
+
+# Input variables for customization
+variables:
+  # Project configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    validation:
+      pattern: "^[a-z][a-z0-9-]*[a-z0-9]$"
+  
+  region:
+    type: string
+    description: "Primary deployment region"
+    default: "us-central1"
+    validation:
+      pattern: "^[a-z0-9-]+$"
+  
+  # Healthcare dataset configuration
+  healthcare_dataset_id:
+    type: string
+    description: "Healthcare dataset identifier"
+    default: "patient-records"
+    validation:
+      pattern: "^[a-zA-Z][a-zA-Z0-9_]*$"
+  
+  fhir_store_id:
+    type: string
+    description: "FHIR store identifier"
+    default: "patient-fhir"
+    validation:
+      pattern: "^[a-zA-Z][a-zA-Z0-9_]*$"
+  
+  # BigQuery configuration
+  bigquery_dataset_id:
+    type: string
+    description: "BigQuery dataset for sentiment analysis results"
+    default: "patient_sentiment"
+    validation:
+      pattern: "^[a-zA-Z][a-zA-Z0-9_]*$"
+  
+  # Function configuration
+  function_name:
+    type: string
+    description: "Cloud Function name for sentiment processing"
+    default: "sentiment-processor"
+    validation:
+      pattern: "^[a-zA-Z][a-zA-Z0-9-]*$"
+  
+  # Pub/Sub configuration
+  pubsub_topic_name:
+    type: string
+    description: "Pub/Sub topic for FHIR notifications"
+    default: "fhir-notifications"
+    validation:
+      pattern: "^[a-zA-Z][a-zA-Z0-9-]*$"
+  
+  # Environment labels
+  environment:
+    type: string
+    description: "Environment label (dev, staging, prod)"
+    default: "dev"
+    validation:
+      enum: ["dev", "staging", "prod"]
+
+# Required APIs for the healthcare sentiment analysis solution
+resources:
+  # Enable required Google Cloud APIs
+  - name: healthcare-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/healthcare.googleapis.com
+      
+  - name: language-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/language.googleapis.com
+      
+  - name: cloudfunctions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/cloudfunctions.googleapis.com
+      
+  - name: bigquery-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/bigquery.googleapis.com
+      
+  - name: pubsub-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/pubsub.googleapis.com
+      
+  - name: cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/cloudbuild.googleapis.com
+
+  # Healthcare Dataset - HIPAA-compliant data store
+  - name: healthcare-dataset
+    type: gcp-types/healthcare-v1:projects.locations.datasets
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      datasetId: ${var.healthcare_dataset_id}
+      dataset:
+        name: projects/${var.project_id}/locations/${var.region}/datasets/${var.healthcare_dataset_id}
+        timeZone: "UTC"
+        # Healthcare data requires special handling for compliance
+        metadata:
+          labels:
+            environment: ${var.environment}
+            purpose: "patient-sentiment-analysis"
+            compliance: "hipaa-eligible"
+    depends_on:
+      - healthcare-api
+
+  # Pub/Sub Topic for FHIR store notifications
+  # This enables event-driven processing of patient data updates
+  - name: fhir-notification-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/${var.project_id}/topics/${var.pubsub_topic_name}
+      topic:
+        messageRetentionDuration: "604800s"  # 7 days
+        labels:
+          environment: ${var.environment}
+          purpose: "fhir-notifications"
+    depends_on:
+      - pubsub-api
+
+  # FHIR Store with Pub/Sub notifications
+  # Stores patient data in industry-standard FHIR R4 format
+  - name: fhir-store
+    type: gcp-types/healthcare-v1:projects.locations.datasets.fhirStores
+    properties:
+      parent: $(ref.healthcare-dataset.name)
+      fhirStoreId: ${var.fhir_store_id}
+      fhirStore:
+        version: "R4"
+        enableUpdateCreate: true
+        disableReferentialIntegrity: false
+        # Configure Pub/Sub notifications for real-time processing
+        notificationConfig:
+          pubsubTopic: $(ref.fhir-notification-topic.name)
+        # Security configuration for healthcare data
+        labels:
+          environment: ${var.environment}
+          data-classification: "sensitive"
+          compliance: "hipaa-eligible"
+    depends_on:
+      - healthcare-dataset
+      - fhir-notification-topic
+
+  # BigQuery Dataset for sentiment analysis results
+  # Provides scalable analytics warehouse for healthcare insights
+  - name: bigquery-dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      projectId: ${var.project_id}
+      datasetId: ${var.bigquery_dataset_id}
+      location: ${var.region}
+      description: "Patient sentiment analysis results and healthcare analytics"
+      # Healthcare data retention and security policies
+      defaultTableExpirationMs: "31536000000"  # 1 year default expiration
+      access:
+        # Grant access to Cloud Function service account (will be created later)
+        - role: "WRITER"
+          userByEmail: $(ref.function-service-account.email)
+        # Project owner access
+        - role: "OWNER"
+          specialGroup: "projectOwners"
+      labels:
+        environment: ${var.environment}
+        purpose: "sentiment-analysis"
+        data-type: "healthcare-analytics"
+    depends_on:
+      - bigquery-api
+
+  # BigQuery Table for sentiment analysis results
+  # Structured schema for storing patient sentiment insights
+  - name: sentiment-analysis-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: ${var.project_id}
+      datasetId: $(ref.bigquery-dataset.datasetReference.datasetId)
+      tableId: "sentiment_analysis"
+      # Define schema for patient sentiment data
+      table:
+        description: "Patient sentiment analysis results from FHIR observations"
+        schema:
+          fields:
+            - name: "patient_id"
+              type: "STRING"
+              mode: "REQUIRED"
+              description: "FHIR Patient resource identifier"
+            - name: "observation_id"
+              type: "STRING"
+              mode: "REQUIRED"
+              description: "FHIR Observation resource identifier"
+            - name: "text_content"
+              type: "STRING"
+              mode: "REQUIRED"
+              description: "Original text content analyzed for sentiment"
+            - name: "sentiment_score"
+              type: "FLOAT"
+              mode: "REQUIRED"
+              description: "Sentiment score from -1.0 (negative) to 1.0 (positive)"
+            - name: "magnitude"
+              type: "FLOAT"
+              mode: "REQUIRED"
+              description: "Magnitude of sentiment (emotional intensity)"
+            - name: "overall_sentiment"
+              type: "STRING"
+              mode: "REQUIRED"
+              description: "Categorical sentiment classification (POSITIVE, NEGATIVE, NEUTRAL)"
+            - name: "processing_timestamp"
+              type: "TIMESTAMP"
+              mode: "REQUIRED"
+              description: "When the sentiment analysis was performed"
+            - name: "fhir_resource_type"
+              type: "STRING"
+              mode: "REQUIRED"
+              description: "Type of FHIR resource processed"
+        labels:
+          environment: ${var.environment}
+          table-type: "analytics"
+    depends_on:
+      - bigquery-dataset
+
+  # Service Account for Cloud Function
+  # Follows principle of least privilege for healthcare data access
+  - name: function-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      name: projects/${var.project_id}
+      accountId: sentiment-processor-sa
+      serviceAccount:
+        displayName: "Patient Sentiment Analysis Function Service Account"
+        description: "Service account for processing FHIR data and performing sentiment analysis"
+
+  # IAM binding for Healthcare API access
+  # Allows function to read FHIR resources securely
+  - name: healthcare-reader-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/healthcare.fhirResourceReader
+      member: serviceAccount:$(ref.function-service-account.email)
+
+  # IAM binding for Natural Language API access
+  # Enables sentiment analysis capabilities
+  - name: ml-developer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/ml.developer
+      member: serviceAccount:$(ref.function-service-account.email)
+
+  # IAM binding for BigQuery data editing
+  # Allows function to store sentiment analysis results
+  - name: bigquery-data-editor-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/bigquery.dataEditor
+      member: serviceAccount:$(ref.function-service-account.email)
+
+  # Pub/Sub Subscription for Cloud Function trigger
+  # Ensures reliable delivery of FHIR notification events
+  - name: fhir-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/${var.project_id}/subscriptions/${var.pubsub_topic_name}-sub
+      subscription:
+        topic: $(ref.fhir-notification-topic.name)
+        # Configure for Cloud Function push delivery
+        pushConfig:
+          pushEndpoint: $(ref.sentiment-processor-function.httpsTrigger.url)
+        # Message retention and delivery settings
+        messageRetentionDuration: "604800s"  # 7 days
+        ackDeadlineSeconds: 60
+        labels:
+          environment: ${var.environment}
+          purpose: "function-trigger"
+    depends_on:
+      - fhir-notification-topic
+      - sentiment-processor-function
+
+  # Cloud Function for sentiment analysis processing
+  # Serverless compute for processing FHIR events and analyzing sentiment
+  - name: sentiment-processor-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/${var.project_id}/locations/${var.region}
+      function:
+        name: projects/${var.project_id}/locations/${var.region}/functions/${var.function_name}
+        description: "Processes FHIR events and performs patient sentiment analysis"
+        # Function source code (inline for Infrastructure Manager)
+        sourceArchiveUrl: "gs://gcf-sources-${var.project_id}/sentiment-processor.zip"
+        entryPoint: "process_fhir_sentiment"
+        runtime: "python39"
+        # Function configuration
+        timeout: "540s"
+        availableMemoryMb: 512
+        maxInstances: 100
+        # Service account for secure healthcare data access
+        serviceAccountEmail: $(ref.function-service-account.email)
+        # Environment variables for function configuration
+        environmentVariables:
+          GCP_PROJECT: ${var.project_id}
+          BQ_DATASET: ${var.bigquery_dataset_id}
+          HEALTHCARE_DATASET: ${var.healthcare_dataset_id}
+          FHIR_STORE: ${var.fhir_store_id}
+          REGION: ${var.region}
+        # Event trigger configuration
+        eventTrigger:
+          eventType: "google.pubsub.topic.publish"
+          resource: $(ref.fhir-notification-topic.name)
+        labels:
+          environment: ${var.environment}
+          function-type: "healthcare-processor"
+          compliance: "hipaa-eligible"
+    depends_on:
+      - cloudfunctions-api
+      - function-service-account
+      - healthcare-reader-binding
+      - ml-developer-binding
+      - bigquery-data-editor-binding
+
+# Output values for integration and verification
+outputs:
+  # Healthcare API resources
+  healthcare_dataset_name:
+    description: "Full name of the healthcare dataset"
+    value: $(ref.healthcare-dataset.name)
+    
+  fhir_store_name:
+    description: "Full name of the FHIR store"
+    value: $(ref.fhir-store.name)
+    
+  # BigQuery resources for analytics
+  bigquery_dataset_id:
+    description: "BigQuery dataset ID for sentiment analysis"
+    value: $(ref.bigquery-dataset.datasetReference.datasetId)
+    
+  sentiment_table_name:
+    description: "BigQuery table for sentiment analysis results"
+    value: $(ref.sentiment-analysis-table.tableReference.tableId)
+    
+  # Pub/Sub messaging resources
+  pubsub_topic_name:
+    description: "Pub/Sub topic for FHIR notifications"
+    value: $(ref.fhir-notification-topic.name)
+    
+  pubsub_subscription_name:
+    description: "Pub/Sub subscription for function trigger"
+    value: $(ref.fhir-subscription.name)
+    
+  # Cloud Function for processing
+  function_name:
+    description: "Cloud Function name for sentiment processing"
+    value: $(ref.sentiment-processor-function.name)
+    
+  function_trigger_url:
+    description: "Cloud Function HTTPS trigger URL"
+    value: $(ref.sentiment-processor-function.httpsTrigger.url)
+    
+  # Service account for security
+  service_account_email:
+    description: "Service account email for function authentication"
+    value: $(ref.function-service-account.email)
+    
+  # Healthcare API endpoints for client access
+  fhir_store_endpoint:
+    description: "FHIR store REST API endpoint"
+    value: "https://healthcare.googleapis.com/v1/$(ref.fhir-store.name)/fhir"
+    
+  # BigQuery connection information
+  bigquery_connection_string:
+    description: "BigQuery dataset connection string"
+    value: "${var.project_id}.${var.bigquery_dataset_id}"
+
+# Deployment notes and recommendations
+# 
+# Security Considerations:
+# - All healthcare data is stored in HIPAA-eligible services
+# - Service accounts follow principle of least privilege
+# - Data encryption is enabled by default for all services
+# - Access logging is automatically enabled for audit compliance
+#
+# Scaling Considerations:
+# - Cloud Function automatically scales with FHIR event volume
+# - BigQuery provides unlimited analytical scale
+# - Pub/Sub handles high-throughput message delivery
+# - FHIR store supports enterprise-scale healthcare workloads
+#
+# Cost Optimization:
+# - Functions scale to zero when not processing events
+# - BigQuery charges only for queries and storage used
+# - Pub/Sub charges based on message volume
+# - Healthcare API charges per operation and storage
+#
+# Monitoring and Alerting:
+# - Enable Cloud Monitoring for all resources
+# - Set up alerts for failed sentiment analysis processing
+# - Monitor BigQuery query costs and performance
+# - Track FHIR store operation metrics for compliance

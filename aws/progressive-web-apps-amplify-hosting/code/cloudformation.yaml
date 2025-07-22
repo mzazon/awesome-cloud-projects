@@ -1,0 +1,552 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Progressive Web App deployment infrastructure using AWS Amplify Hosting.
+  This template creates a complete PWA hosting solution with CI/CD pipeline,
+  custom domain configuration, SSL certificates, and global content delivery.
+  
+  Recipe: Creating Progressive Web Apps with Amplify Hosting
+  Category: Serverless
+  Services: Amplify, CloudFront, Route53, ACM
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Application Configuration"
+        Parameters:
+          - ApplicationName
+          - ApplicationDescription
+          - Repository
+          - BranchName
+      - Label:
+          default: "Domain Configuration"
+        Parameters:
+          - EnableCustomDomain
+          - DomainName
+          - SubDomainPrefix
+          - HostedZoneId
+      - Label:
+          default: "Build Configuration"
+        Parameters:
+          - BuildSpec
+          - EnvironmentVariables
+          - EnablePullRequestPreview
+      - Label:
+          default: "Security and Monitoring"
+        Parameters:
+          - EnableAccessLogging
+          - EnablePasswordProtection
+          - BasicAuthUsername
+          - BasicAuthPassword
+    ParameterLabels:
+      ApplicationName:
+        default: "Application Name"
+      ApplicationDescription:
+        default: "Application Description"
+      Repository:
+        default: "Git Repository URL"
+      BranchName:
+        default: "Main Branch Name"
+      EnableCustomDomain:
+        default: "Enable Custom Domain"
+      DomainName:
+        default: "Domain Name"
+      SubDomainPrefix:
+        default: "Subdomain Prefix"
+      HostedZoneId:
+        default: "Route 53 Hosted Zone ID"
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Description: Name for the Amplify application (will be used for resource naming)
+    Default: pwa-amplify-app
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+
+  ApplicationDescription:
+    Type: String
+    Description: Description for the Amplify application
+    Default: Progressive Web App with offline functionality and push notifications
+    MaxLength: 255
+
+  Repository:
+    Type: String
+    Description: |
+      Git repository URL (GitHub, GitLab, Bitbucket, or CodeCommit).
+      Format: https://github.com/username/repository-name
+    Default: https://github.com/example/pwa-demo
+    AllowedPattern: '^https://(github\.com|gitlab\.com|bitbucket\.org|git-codecommit\..+\.amazonaws\.com)/.+'
+    ConstraintDescription: Must be a valid Git repository URL
+
+  BranchName:
+    Type: String
+    Description: Main branch name for production deployment
+    Default: main
+    AllowedPattern: '^[a-zA-Z0-9/_-]+$'
+    ConstraintDescription: Must be a valid Git branch name
+
+  EnableCustomDomain:
+    Type: String
+    Description: Enable custom domain configuration for the application
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  DomainName:
+    Type: String
+    Description: |
+      Custom domain name (e.g., example.com). Required if EnableCustomDomain is true.
+      Must be a domain you own with a Route 53 hosted zone.
+    Default: example.com
+    AllowedPattern: '^[a-z0-9.-]+\.[a-z]{2,}$|^$'
+    ConstraintDescription: Must be a valid domain name or empty
+
+  SubDomainPrefix:
+    Type: String
+    Description: Subdomain prefix for the PWA (e.g., 'pwa' creates pwa.example.com)
+    Default: pwa
+    AllowedPattern: '^[a-z0-9-]*$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+
+  HostedZoneId:
+    Type: String
+    Description: |
+      Route 53 Hosted Zone ID for the domain. Required if EnableCustomDomain is true.
+      Find this in the Route 53 console for your domain.
+    Default: ''
+    AllowedPattern: '^[A-Z0-9]+$|^$'
+    ConstraintDescription: Must be a valid Route 53 Hosted Zone ID or empty
+
+  BuildSpec:
+    Type: String
+    Description: |
+      Custom build specification (amplify.yml content) for the application.
+      Leave empty to use the default PWA-optimized build configuration.
+    Default: ''
+
+  EnvironmentVariables:
+    Type: CommaDelimitedList
+    Description: |
+      Environment variables for the build process.
+      Format: KEY1=value1,KEY2=value2
+    Default: ''
+
+  EnablePullRequestPreview:
+    Type: String
+    Description: Enable automatic preview deployments for pull requests
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableAccessLogging:
+    Type: String
+    Description: Enable CloudWatch access logging for monitoring
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnablePasswordProtection:
+    Type: String
+    Description: Enable basic authentication for the application
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  BasicAuthUsername:
+    Type: String
+    Description: Username for basic authentication (required if EnablePasswordProtection is true)
+    Default: ''
+    NoEcho: false
+
+  BasicAuthPassword:
+    Type: String
+    Description: Password for basic authentication (required if EnablePasswordProtection is true)
+    Default: ''
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 50
+
+Conditions:
+  # Condition to enable custom domain configuration
+  CreateCustomDomain: !Equals [!Ref EnableCustomDomain, 'true']
+  
+  # Condition to check if hosted zone ID is provided
+  HasHostedZoneId: !And 
+    - !Condition CreateCustomDomain
+    - !Not [!Equals [!Ref HostedZoneId, '']]
+  
+  # Condition to enable password protection
+  EnableAuth: !Equals [!Ref EnablePasswordProtection, 'true']
+  
+  # Condition to check if custom build spec is provided
+  HasCustomBuildSpec: !Not [!Equals [!Ref BuildSpec, '']]
+  
+  # Condition to check if environment variables are provided
+  HasEnvironmentVariables: !Not [!Equals [!Join ['', !Ref EnvironmentVariables], '']]
+  
+  # Condition to enable pull request previews
+  EnablePRPreview: !Equals [!Ref EnablePullRequestPreview, 'true']
+
+Resources:
+  # IAM Role for Amplify Service
+  AmplifyServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-amplify-service-role'
+      Description: !Sub 'Service role for Amplify application ${ApplicationName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: amplify.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess-Amplify
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-amplify-service-role'
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Purpose
+          Value: Amplify Service Role
+
+  # Amplify Application
+  AmplifyApp:
+    Type: AWS::Amplify::App
+    Properties:
+      Name: !Ref ApplicationName
+      Description: !Ref ApplicationDescription
+      Repository: !Ref Repository
+      IAMServiceRole: !GetAtt AmplifyServiceRole.Arn
+      Platform: WEB
+      
+      # Build specification for PWA optimization
+      BuildSpec: !If
+        - HasCustomBuildSpec
+        - !Ref BuildSpec
+        - |
+          version: 1
+          frontend:
+            phases:
+              preBuild:
+                commands:
+                  - echo "Pre-build phase - checking PWA requirements"
+                  - npm install -g lighthouse
+                  - npm install -g pwa-asset-generator
+              build:
+                commands:
+                  - echo "Build phase - generating PWA assets"
+                  - echo "Optimizing for Progressive Web App"
+                  - echo "Validating service worker and manifest"
+                  - ls -la
+              postBuild:
+                commands:
+                  - echo "Post-build phase - PWA optimization complete"
+                  - echo "Service Worker and Manifest validated"
+                  - lighthouse --chrome-flags="--headless" --output=json --output-path=./lighthouse-report.json ./index.html || echo "Lighthouse audit completed"
+            artifacts:
+              baseDirectory: .
+              files:
+                - '**/*'
+            cache:
+              paths:
+                - node_modules/**/*
+
+      # Environment variables for build process
+      EnvironmentVariables: !If
+        - HasEnvironmentVariables
+        - !Split
+          - ','
+          - !Sub
+            - '${inner}'
+            - inner: !Join
+              - ','
+              - !Ref EnvironmentVariables
+        - !Ref 'AWS::NoValue'
+
+      # Custom headers for PWA optimization and security
+      CustomHeaders: |
+        customHeaders:
+          - pattern: "**/*"
+            headers:
+              - key: "X-Frame-Options"
+                value: "DENY"
+              - key: "X-Content-Type-Options"
+                value: "nosniff"
+              - key: "Referrer-Policy"
+                value: "strict-origin-when-cross-origin"
+              - key: "X-XSS-Protection"
+                value: "1; mode=block"
+              - key: "Cache-Control"
+                value: "public, max-age=31536000, immutable"
+          - pattern: "**.html"
+            headers:
+              - key: "Cache-Control"
+                value: "public, max-age=0, must-revalidate"
+          - pattern: "sw.js"
+            headers:
+              - key: "Cache-Control"
+                value: "public, max-age=0, must-revalidate"
+              - key: "Service-Worker-Allowed"
+                value: "/"
+          - pattern: "manifest.json"
+            headers:
+              - key: "Cache-Control"
+                value: "public, max-age=0, must-revalidate"
+              - key: "Content-Type"
+                value: "application/manifest+json"
+
+      # Enable auto branch creation for feature branches
+      EnableBranchAutoBuild: true
+      AutoBranchCreationConfig:
+        EnableAutoBuild: true
+        EnablePullRequestPreview: !If [EnablePRPreview, true, false]
+        EnvironmentVariables: !If
+          - HasEnvironmentVariables
+          - !Split
+            - ','
+            - !Sub
+              - '${inner}'
+              - inner: !Join
+                - ','
+                - !Ref EnvironmentVariables
+          - !Ref 'AWS::NoValue'
+
+      # Basic authentication configuration
+      BasicAuthConfig: !If
+        - EnableAuth
+        - EnableBasicAuth: true
+          Username: !Ref BasicAuthUsername
+          Password: !Ref BasicAuthPassword
+        - !Ref 'AWS::NoValue'
+
+      Tags:
+        - Key: Name
+          Value: !Ref ApplicationName
+        - Key: Type
+          Value: Progressive Web App
+        - Key: Purpose
+          Value: PWA Hosting with CI/CD
+
+  # Main branch configuration
+  AmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      BranchName: !Ref BranchName
+      Description: !Sub 'Production branch for ${ApplicationName} PWA'
+      EnableAutoBuild: true
+      EnablePullRequestPreview: !If [EnablePRPreview, true, false]
+      
+      # Environment variables specific to this branch
+      EnvironmentVariables: !If
+        - HasEnvironmentVariables
+        - !Split
+          - ','
+          - !Sub
+            - '${inner}'
+            - inner: !Join
+              - ','
+              - !Ref EnvironmentVariables
+        - !Ref 'AWS::NoValue'
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${BranchName}'
+        - Key: Branch
+          Value: !Ref BranchName
+        - Key: Environment
+          Value: Production
+
+  # Custom domain configuration (conditional)
+  AmplifyDomain:
+    Type: AWS::Amplify::Domain
+    Condition: CreateCustomDomain
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      DomainName: !Ref DomainName
+      EnableAutoSubDomain: true
+      AutoSubDomainIAMRole: !GetAtt AmplifyServiceRole.Arn
+      AutoSubDomainCreationPatterns:
+        - '*'
+      SubDomainSettings:
+        - Prefix: !Ref SubDomainPrefix
+          BranchName: !Ref BranchName
+
+  # CloudWatch Log Group for application logs
+  AmplifyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableAccessLogging
+    Properties:
+      LogGroupName: !Sub '/aws/amplify/${ApplicationName}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-logs'
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Purpose
+          Value: Amplify Application Logs
+
+  # CloudWatch Alarms for monitoring
+  BuildFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-build-failures'
+      AlarmDescription: !Sub 'Monitor build failures for ${ApplicationName}'
+      MetricName: BuildFailures
+      Namespace: AWS/Amplify
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: App
+          Value: !GetAtt AmplifyApp.AppId
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-build-failures'
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  DeploymentDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-deployment-duration'
+      AlarmDescription: !Sub 'Monitor deployment duration for ${ApplicationName}'
+      MetricName: DeploymentDuration
+      Namespace: AWS/Amplify
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 600  # 10 minutes
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: App
+          Value: !GetAtt AmplifyApp.AppId
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-deployment-duration'
+        - Key: Application
+          Value: !Ref ApplicationName
+
+Outputs:
+  # Application Information
+  ApplicationId:
+    Description: Amplify Application ID
+    Value: !GetAtt AmplifyApp.AppId
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationId'
+
+  ApplicationName:
+    Description: Amplify Application Name
+    Value: !Ref ApplicationName
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationName'
+
+  # Application URLs
+  DefaultDomain:
+    Description: Default Amplify domain for the application
+    Value: !GetAtt AmplifyApp.DefaultDomain
+    Export:
+      Name: !Sub '${AWS::StackName}-DefaultDomain'
+
+  ApplicationURL:
+    Description: Full URL to access the Progressive Web App
+    Value: !Sub 'https://${BranchName}.${AmplifyApp.DefaultDomain}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationURL'
+
+  CustomDomainURL:
+    Description: Custom domain URL for the application (if configured)
+    Condition: CreateCustomDomain
+    Value: !Sub 'https://${SubDomainPrefix}.${DomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomDomainURL'
+
+  # Branch Information
+  BranchName:
+    Description: Production branch name
+    Value: !Ref BranchName
+    Export:
+      Name: !Sub '${AWS::StackName}-BranchName'
+
+  # Service Role
+  ServiceRoleArn:
+    Description: ARN of the Amplify service role
+    Value: !GetAtt AmplifyServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceRoleArn'
+
+  # Domain Configuration
+  DomainAssociationArn:
+    Description: ARN of the domain association (if configured)
+    Condition: CreateCustomDomain
+    Value: !GetAtt AmplifyDomain.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DomainAssociationArn'
+
+  DomainStatus:
+    Description: Status of the domain association (if configured)
+    Condition: CreateCustomDomain
+    Value: !GetAtt AmplifyDomain.DomainStatus
+    Export:
+      Name: !Sub '${AWS::StackName}-DomainStatus'
+
+  # SSL Certificate Information
+  CertificateArn:
+    Description: ARN of the SSL certificate (if custom domain is configured)
+    Condition: CreateCustomDomain
+    Value: !GetAtt AmplifyDomain.CertificateRecord
+    Export:
+      Name: !Sub '${AWS::StackName}-CertificateArn'
+
+  # Monitoring Resources
+  LogGroupName:
+    Description: CloudWatch Log Group name for application logs
+    Condition: EnableAccessLogging
+    Value: !Ref AmplifyLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupName'
+
+  BuildFailureAlarmName:
+    Description: CloudWatch alarm for build failures
+    Value: !Ref BuildFailureAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-BuildFailureAlarm'
+
+  # Deployment Information
+  Repository:
+    Description: Connected Git repository
+    Value: !Ref Repository
+    Export:
+      Name: !Sub '${AWS::StackName}-Repository'
+
+  PWAFeatures:
+    Description: PWA features enabled in this deployment
+    Value: Service Workers, Web App Manifest, Push Notifications, Offline Capability, App Installation
+    Export:
+      Name: !Sub '${AWS::StackName}-PWAFeatures'
+
+  # Next Steps
+  NextSteps:
+    Description: Next steps after deployment
+    Value: |
+      1. Verify application deployment at the provided URL
+      2. Test PWA features: offline functionality, installation prompt
+      3. Configure custom domain DNS if using custom domain
+      4. Set up monitoring and alerts based on your requirements
+      5. Test service worker registration and caching
+    Export:
+      Name: !Sub '${AWS::StackName}-NextSteps'

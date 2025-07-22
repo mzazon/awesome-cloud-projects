@@ -1,0 +1,897 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Advanced API Gateway Deployment Strategies with Blue-Green and Canary Patterns - Infrastructure as Code for enterprise-grade API deployments with automated traffic shifting and monitoring'
+
+Parameters:
+  # Environment Configuration
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - dev
+      - staging
+      - production
+    Description: 'Environment for deployment (dev, staging, production)'
+  
+  # API Configuration
+  ApiName:
+    Type: String
+    Default: 'advanced-deployment-api'
+    Description: 'Name for the API Gateway REST API'
+    MinLength: 1
+    MaxLength: 255
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must begin with a letter and contain only alphanumeric characters and hyphens'
+  
+  # Lambda Configuration
+  BlueLambdaVersion:
+    Type: String
+    Default: 'v1.0.0'
+    Description: 'Version identifier for the Blue Lambda function'
+  
+  GreenLambdaVersion:
+    Type: String
+    Default: 'v2.0.0'
+    Description: 'Version identifier for the Green Lambda function'
+  
+  # Deployment Configuration
+  InitialCanaryTrafficPercent:
+    Type: Number
+    Default: 10
+    MinValue: 0
+    MaxValue: 100
+    Description: 'Initial percentage of traffic to route to canary deployment (0-100)'
+  
+  # Monitoring Configuration
+  ErrorThreshold4XX:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 1000
+    Description: 'Threshold for 4XX error alarm (number of errors in evaluation period)'
+  
+  ErrorThreshold5XX:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 1000
+    Description: 'Threshold for 5XX error alarm (number of errors in evaluation period)'
+  
+  LatencyThreshold:
+    Type: Number
+    Default: 5000
+    MinValue: 100
+    MaxValue: 30000
+    Description: 'Threshold for latency alarm in milliseconds'
+  
+  # Throttling Configuration
+  ThrottleRateLimit:
+    Type: Number
+    Default: 1000
+    MinValue: 1
+    MaxValue: 10000
+    Description: 'API Gateway throttling rate limit (requests per second)'
+  
+  ThrottleBurstLimit:
+    Type: Number
+    Default: 2000
+    MinValue: 1
+    MaxValue: 10000
+    Description: 'API Gateway throttling burst limit (requests)'
+  
+  # Notification Configuration
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for alarm notifications (optional)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+Conditions:
+  # Condition to determine if we should create SNS notifications
+  CreateNotifications: !Not [!Equals [!Ref NotificationEmail, '']]
+  
+  # Condition for production environment specific configurations
+  IsProduction: !Equals [!Ref Environment, 'production']
+  
+  # Condition for enabling canary deployment
+  EnableCanary: !Not [!Equals [!Ref InitialCanaryTrafficPercent, 0]]
+
+Resources:
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApiName}-lambda-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudWatchMetricsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApiName}-lambda-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Lambda execution role for API Gateway deployment patterns'
+
+  # Blue Lambda Function (Current Production Version)
+  BlueLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ApiName}-blue-function-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Description: !Sub 'Blue environment Lambda function - ${BlueLambdaVersion}'
+      Environment:
+        Variables:
+          ENVIRONMENT: 'blue'
+          VERSION: !Ref BlueLambdaVersion
+          API_NAME: !Ref ApiName
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import datetime
+          
+          def lambda_handler(event, context):
+              """
+              Blue environment Lambda function handler
+              Returns stable production response
+              """
+              try:
+                  # Extract request information
+                  http_method = event.get('httpMethod', 'GET')
+                  path = event.get('path', '/')
+                  headers = event.get('headers', {})
+                  
+                  # Prepare response
+                  response_body = {
+                      'message': 'Hello from Blue environment!',
+                      'version': os.environ.get('VERSION', 'v1.0.0'),
+                      'environment': os.environ.get('ENVIRONMENT', 'blue'),
+                      'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
+                      'request_id': context.aws_request_id,
+                      'function_name': context.function_name,
+                      'method': http_method,
+                      'path': path,
+                      'status': 'stable'
+                  }
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+                          'Cache-Control': 'no-cache'
+                      },
+                      'body': json.dumps(response_body, indent=2)
+                  }
+                  
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'error': 'Internal server error',
+                          'message': str(e),
+                          'environment': 'blue'
+                      })
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApiName}-blue-function'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Version
+          Value: !Ref BlueLambdaVersion
+        - Key: DeploymentType
+          Value: 'blue-green'
+
+  # Green Lambda Function (New Version for Testing)
+  GreenLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ApiName}-green-function-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Description: !Sub 'Green environment Lambda function - ${GreenLambdaVersion}'
+      Environment:
+        Variables:
+          ENVIRONMENT: 'green'
+          VERSION: !Ref GreenLambdaVersion
+          API_NAME: !Ref ApiName
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import datetime
+          
+          def lambda_handler(event, context):
+              """
+              Green environment Lambda function handler
+              Returns enhanced response with new features
+              """
+              try:
+                  # Extract request information
+                  http_method = event.get('httpMethod', 'GET')
+                  path = event.get('path', '/')
+                  headers = event.get('headers', {})
+                  query_params = event.get('queryStringParameters') or {}
+                  
+                  # Prepare enhanced response
+                  response_body = {
+                      'message': 'Hello from Green environment!',
+                      'version': os.environ.get('VERSION', 'v2.0.0'),
+                      'environment': os.environ.get('ENVIRONMENT', 'green'),
+                      'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
+                      'request_id': context.aws_request_id,
+                      'function_name': context.function_name,
+                      'method': http_method,
+                      'path': path,
+                      'status': 'enhanced',
+                      'new_features': {
+                          'enhanced_response_format': True,
+                          'detailed_request_info': True,
+                          'improved_error_handling': True,
+                          'query_parameter_support': True
+                      },
+                      'query_parameters': query_params,
+                      'performance_metrics': {
+                          'response_time_ms': 45,
+                          'memory_usage_mb': 64
+                      }
+                  }
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+                          'Cache-Control': 'no-cache',
+                          'X-Version': os.environ.get('VERSION', 'v2.0.0'),
+                          'X-Environment': 'green'
+                      },
+                      'body': json.dumps(response_body, indent=2)
+                  }
+                  
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'error': 'Internal server error',
+                          'message': str(e),
+                          'environment': 'green',
+                          'version': os.environ.get('VERSION', 'v2.0.0')
+                      })
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApiName}-green-function'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Version
+          Value: !Ref GreenLambdaVersion
+        - Key: DeploymentType
+          Value: 'blue-green'
+
+  # API Gateway REST API
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ApiName}-${Environment}'
+      Description: !Sub 'Advanced API Gateway deployment patterns demo - ${Environment}'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: execute-api:Invoke
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApiName}-api-gateway'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Advanced deployment patterns demonstration'
+
+  # API Gateway Resource for /hello endpoint
+  HelloResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: hello
+
+  # API Gateway Method for GET /hello
+  HelloMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref HelloResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.querystring.version: false
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BlueLambdaFunction.Arn}/invocations'
+        PassthroughBehavior: WHEN_NO_MATCH
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # OPTIONS Method for CORS support
+  HelloOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref HelloResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationHttpMethod: POST
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Lambda Permissions for API Gateway
+  BlueLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BlueLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*'
+
+  GreenLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GreenLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*'
+
+  # Production Stage (Blue Environment)
+  ProductionStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: production
+      DeploymentId: !Ref ProductionDeployment
+      Description: 'Production stage with Blue environment'
+      CacheClusterEnabled: !If [IsProduction, true, false]
+      CacheClusterSize: !If [IsProduction, '0.5', !Ref 'AWS::NoValue']
+      TracingEnabled: true
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: INFO
+          DataTraceEnabled: true
+          MetricsEnabled: true
+          ThrottlingRateLimit: !Ref ThrottleRateLimit
+          ThrottlingBurstLimit: !Ref ThrottleBurstLimit
+          CachingEnabled: !If [IsProduction, true, false]
+          CacheTtlInSeconds: !If [IsProduction, 300, !Ref 'AWS::NoValue']
+      Variables:
+        environment: production
+        version: !Ref BlueLambdaVersion
+        deployment_type: blue-green
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApiName}-production-stage'
+        - Key: Environment
+          Value: production
+        - Key: Version
+          Value: !Ref BlueLambdaVersion
+
+  # Staging Stage (Green Environment)
+  StagingStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: staging
+      DeploymentId: !Ref StagingDeployment
+      Description: 'Staging stage with Green environment'
+      CacheClusterEnabled: false
+      TracingEnabled: true
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: INFO
+          DataTraceEnabled: true
+          MetricsEnabled: true
+          ThrottlingRateLimit: !Ref ThrottleRateLimit
+          ThrottlingBurstLimit: !Ref ThrottleBurstLimit
+      Variables:
+        environment: staging
+        version: !Ref GreenLambdaVersion
+        deployment_type: blue-green
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApiName}-staging-stage'
+        - Key: Environment
+          Value: staging
+        - Key: Version
+          Value: !Ref GreenLambdaVersion
+
+  # Production Deployment (Blue)
+  ProductionDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - HelloMethod
+      - HelloOptionsMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      Description: !Sub 'Blue environment deployment - ${BlueLambdaVersion}'
+
+  # Staging Deployment (Green)
+  StagingDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - HelloMethod
+      - HelloOptionsMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      Description: !Sub 'Green environment deployment - ${GreenLambdaVersion}'
+
+  # CloudWatch Log Group for API Gateway
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ApiName}-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApiName}-api-gateway-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Topic for Notifications (Optional)
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateNotifications
+    Properties:
+      TopicName: !Sub '${ApiName}-deployment-notifications-${Environment}'
+      DisplayName: !Sub '${ApiName} Deployment Notifications'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApiName}-notifications'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Subscription for Email Notifications
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateNotifications
+    Properties:
+      Protocol: email
+      TopicArn: !Ref NotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Alarms for Monitoring
+  # 4XX Error Alarm
+  FourXXErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApiName}-4xx-errors-${Environment}'
+      AlarmDescription: !Sub '4XX errors for ${ApiName} API Gateway'
+      MetricName: 4XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref ErrorThreshold4XX
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub '${ApiName}-${Environment}'
+        - Name: Stage
+          Value: production
+      AlarmActions:
+        - !If [CreateNotifications, !Ref NotificationTopic, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApiName}-4xx-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: AlarmType
+          Value: 'client-error'
+
+  # 5XX Error Alarm
+  FiveXXErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApiName}-5xx-errors-${Environment}'
+      AlarmDescription: !Sub '5XX errors for ${ApiName} API Gateway'
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref ErrorThreshold5XX
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub '${ApiName}-${Environment}'
+        - Name: Stage
+          Value: production
+      AlarmActions:
+        - !If [CreateNotifications, !Ref NotificationTopic, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApiName}-5xx-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: AlarmType
+          Value: 'server-error'
+
+  # High Latency Alarm
+  HighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApiName}-high-latency-${Environment}'
+      AlarmDescription: !Sub 'High latency for ${ApiName} API Gateway'
+      MetricName: Latency
+      Namespace: AWS/ApiGateway
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref LatencyThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub '${ApiName}-${Environment}'
+        - Name: Stage
+          Value: production
+      AlarmActions:
+        - !If [CreateNotifications, !Ref NotificationTopic, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApiName}-latency-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: AlarmType
+          Value: 'performance'
+
+  # Lambda Function Error Alarms
+  BlueLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApiName}-blue-lambda-errors-${Environment}'
+      AlarmDescription: !Sub 'Errors in Blue Lambda function for ${ApiName}'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref BlueLambdaFunction
+      AlarmActions:
+        - !If [CreateNotifications, !Ref NotificationTopic, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApiName}-blue-lambda-error-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: AlarmType
+          Value: 'lambda-error'
+
+  GreenLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApiName}-green-lambda-errors-${Environment}'
+      AlarmDescription: !Sub 'Errors in Green Lambda function for ${ApiName}'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref GreenLambdaFunction
+      AlarmActions:
+        - !If [CreateNotifications, !Ref NotificationTopic, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApiName}-green-lambda-error-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: AlarmType
+          Value: 'lambda-error'
+
+  # CloudWatch Dashboard for Monitoring
+  ApiGatewayDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ApiName}-deployment-dashboard-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApiGateway", "Count", "ApiName", "${ApiName}-${Environment}", "Stage", "production" ],
+                  [ ".", "4XXError", ".", ".", ".", "." ],
+                  [ ".", "5XXError", ".", ".", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "API Gateway Requests and Errors",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApiGateway", "Latency", "ApiName", "${ApiName}-${Environment}", "Stage", "production" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "API Gateway Latency",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${BlueLambdaFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Blue Lambda Function Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${GreenLambdaFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Green Lambda Function Metrics",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+Outputs:
+  # API Gateway Information
+  ApiGatewayId:
+    Description: 'ID of the API Gateway REST API'
+    Value: !Ref ApiGateway
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiGatewayId'
+
+  ApiGatewayEndpoint:
+    Description: 'Base URL of the API Gateway REST API'
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiGatewayEndpoint'
+
+  ProductionEndpoint:
+    Description: 'Production stage endpoint URL'
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/production'
+    Export:
+      Name: !Sub '${AWS::StackName}-ProductionEndpoint'
+
+  StagingEndpoint:
+    Description: 'Staging stage endpoint URL'
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/staging'
+    Export:
+      Name: !Sub '${AWS::StackName}-StagingEndpoint'
+
+  HelloEndpoint:
+    Description: 'Hello resource endpoint URL'
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/production/hello'
+    Export:
+      Name: !Sub '${AWS::StackName}-HelloEndpoint'
+
+  # Lambda Function Information
+  BlueLambdaFunctionArn:
+    Description: 'ARN of the Blue Lambda function'
+    Value: !GetAtt BlueLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BlueLambdaFunctionArn'
+
+  GreenLambdaFunctionArn:
+    Description: 'ARN of the Green Lambda function'
+    Value: !GetAtt GreenLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GreenLambdaFunctionArn'
+
+  BlueLambdaFunctionName:
+    Description: 'Name of the Blue Lambda function'
+    Value: !Ref BlueLambdaFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-BlueLambdaFunctionName'
+
+  GreenLambdaFunctionName:
+    Description: 'Name of the Green Lambda function'
+    Value: !Ref GreenLambdaFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-GreenLambdaFunctionName'
+
+  # IAM Role Information
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  # Monitoring Information
+  CloudWatchDashboardURL:
+    Description: 'URL to the CloudWatch dashboard'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ApiName}-deployment-dashboard-${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchDashboardURL'
+
+  NotificationTopicArn:
+    Description: 'ARN of the SNS notification topic'
+    Value: !If [CreateNotifications, !Ref NotificationTopic, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopicArn'
+
+  # Configuration Information
+  CanaryTrafficPercent:
+    Description: 'Initial canary traffic percentage'
+    Value: !Ref InitialCanaryTrafficPercent
+    Export:
+      Name: !Sub '${AWS::StackName}-CanaryTrafficPercent'
+
+  BlueLambdaVersion:
+    Description: 'Blue Lambda function version'
+    Value: !Ref BlueLambdaVersion
+    Export:
+      Name: !Sub '${AWS::StackName}-BlueLambdaVersion'
+
+  GreenLambdaVersion:
+    Description: 'Green Lambda function version'
+    Value: !Ref GreenLambdaVersion
+    Export:
+      Name: !Sub '${AWS::StackName}-GreenLambdaVersion'
+
+  # CLI Commands for Canary Deployment
+  CanaryDeploymentCommand:
+    Description: 'CLI command to create canary deployment'
+    Value: !Sub |
+      aws apigateway create-deployment \
+        --rest-api-id ${ApiGateway} \
+        --stage-name production \
+        --description "Canary deployment" \
+        --canary-settings '{"percentTraffic": ${InitialCanaryTrafficPercent}, "useStageCache": false}'
+
+  TrafficShiftCommand:
+    Description: 'CLI command to shift traffic percentage'
+    Value: !Sub |
+      aws apigateway update-stage \
+        --rest-api-id ${ApiGateway} \
+        --stage-name production \
+        --patch-operations "op=replace,path=/canarySettings/percentTraffic,value=50"
+
+  RollbackCommand:
+    Description: 'CLI command to rollback canary deployment'
+    Value: !Sub |
+      aws apigateway update-stage \
+        --rest-api-id ${ApiGateway} \
+        --stage-name production \
+        --patch-operations "op=remove,path=/canarySettings"
+
+  # Testing Commands
+  TestBlueCommand:
+    Description: 'Command to test Blue environment'
+    Value: !Sub 'curl -s https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/production/hello'
+
+  TestGreenCommand:
+    Description: 'Command to test Green environment'
+    Value: !Sub 'curl -s https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/staging/hello'
+
+  # Monitoring Commands
+  GetMetricsCommand:
+    Description: 'Command to get API Gateway metrics'
+    Value: !Sub |
+      aws cloudwatch get-metric-statistics \
+        --namespace AWS/ApiGateway \
+        --metric-name Count \
+        --dimensions Name=ApiName,Value=${ApiName}-${Environment} Name=Stage,Value=production \
+        --start-time $(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%S) \
+        --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+        --period 300 \
+        --statistics Sum

@@ -1,0 +1,1125 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS CloudFormation template for Container Health Checks and Self-Healing Applications with ECS, EKS, ALB, and CloudWatch monitoring'
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+
+Parameters:
+  # Basic Configuration
+  ProjectName:
+    Type: String
+    Default: 'health-check-app'
+    Description: 'Base name for all resources'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+  
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: [dev, staging, prod]
+    Description: 'Environment name'
+  
+  # VPC Configuration
+  VpcCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: 'CIDR block for VPC'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(/([0-9]|[1-2][0-9]|3[0-2]))$'
+  
+  PublicSubnet1Cidr:
+    Type: String
+    Default: '10.0.1.0/24'
+    Description: 'CIDR block for public subnet 1'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(/([0-9]|[1-2][0-9]|3[0-2]))$'
+  
+  PublicSubnet2Cidr:
+    Type: String
+    Default: '10.0.2.0/24'
+    Description: 'CIDR block for public subnet 2'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(/([0-9]|[1-2][0-9]|3[0-2]))$'
+  
+  # ECS Configuration
+  EcsDesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: 'Desired number of ECS tasks'
+  
+  EcsTaskCpu:
+    Type: Number
+    Default: 256
+    AllowedValues: [256, 512, 1024, 2048, 4096]
+    Description: 'CPU units for ECS task (1 vCPU = 1024 CPU units)'
+  
+  EcsTaskMemory:
+    Type: Number
+    Default: 512
+    AllowedValues: [512, 1024, 2048, 4096, 8192]
+    Description: 'Memory in MiB for ECS task'
+  
+  # Health Check Configuration
+  HealthCheckPath:
+    Type: String
+    Default: '/health'
+    Description: 'Path for health check endpoint'
+  
+  HealthCheckIntervalSeconds:
+    Type: Number
+    Default: 30
+    MinValue: 5
+    MaxValue: 300
+    Description: 'Interval between health checks in seconds'
+  
+  HealthCheckTimeoutSeconds:
+    Type: Number
+    Default: 5
+    MinValue: 2
+    MaxValue: 120
+    Description: 'Timeout for health check in seconds'
+  
+  HealthyThresholdCount:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    MaxValue: 10
+    Description: 'Number of consecutive successful health checks required'
+  
+  UnhealthyThresholdCount:
+    Type: Number
+    Default: 3
+    MinValue: 2
+    MaxValue: 10
+    Description: 'Number of consecutive failed health checks required'
+  
+  # Container Configuration
+  ContainerImage:
+    Type: String
+    Default: 'nginx:latest'
+    Description: 'Container image to deploy'
+  
+  ContainerPort:
+    Type: Number
+    Default: 80
+    MinValue: 1
+    MaxValue: 65535
+    Description: 'Port number for container'
+  
+  # Auto Scaling Configuration
+  MinCapacity:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: 'Minimum capacity for auto scaling'
+  
+  MaxCapacity:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+    Description: 'Maximum capacity for auto scaling'
+  
+  TargetCpuUtilization:
+    Type: Number
+    Default: 70
+    MinValue: 1
+    MaxValue: 100
+    Description: 'Target CPU utilization percentage for auto scaling'
+  
+  # CloudWatch Configuration
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable detailed CloudWatch monitoring'
+  
+  # SNS Configuration
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for health check notifications (optional)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+
+Conditions:
+  # Environment-based conditions
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  IsDetailedMonitoring: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  
+  # Feature flags
+  EnableAutoScaling: !Not [!Equals [!Ref MinCapacity, !Ref MaxCapacity]]
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+
+Resources:
+  # ==============================================================================
+  # VPC AND NETWORKING
+  # ==============================================================================
+  
+  # VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-igw'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+  
+  # Public Subnets
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet1Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-public-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet2Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-public-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # Public Route Table
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-public-rt'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+  
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+  
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+  
+  # ==============================================================================
+  # SECURITY GROUPS
+  # ==============================================================================
+  
+  # ALB Security Group
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group for Application Load Balancer'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: '0.0.0.0/0'
+          Description: 'HTTP traffic from internet'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+          Description: 'HTTPS traffic from internet'
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-alb-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # ECS Security Group
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group for ECS tasks'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: 'HTTP traffic from ALB'
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-ecs-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # ==============================================================================
+  # APPLICATION LOAD BALANCER
+  # ==============================================================================
+  
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-alb'
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-alb'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # Target Group
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-tg'
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: 'traffic-port'
+      HealthCheckIntervalSeconds: !Ref HealthCheckIntervalSeconds
+      HealthCheckTimeoutSeconds: !Ref HealthCheckTimeoutSeconds
+      HealthyThresholdCount: !Ref HealthyThresholdCount
+      UnhealthyThresholdCount: !Ref UnhealthyThresholdCount
+      Matcher:
+        HttpCode: '200'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-tg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # ALB Listener
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+  
+  # ==============================================================================
+  # ECS CLUSTER AND SERVICES
+  # ==============================================================================
+  
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-${Environment}-cluster'
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+        - CapacityProvider: FARGATE_SPOT
+          Weight: !If [IsProduction, 0, 1]
+      ClusterSettings:
+        - Name: containerInsights
+          Value: !If [IsDetailedMonitoring, 'enabled', 'disabled']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-cluster'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # ECS Task Execution Role
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-task-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-task-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # ECS Task Role
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-task-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # CloudWatch Log Group
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-log-group'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # ECS Task Definition
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}-task'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref EcsTaskCpu
+      Memory: !Ref EcsTaskMemory
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: !Sub '${ProjectName}-container'
+          Image: !Ref ContainerImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - !Sub 'curl -f http://localhost:${ContainerPort}${HealthCheckPath} || exit 1'
+            Interval: !Ref HealthCheckIntervalSeconds
+            Timeout: !Ref HealthCheckTimeoutSeconds
+            Retries: 3
+            StartPeriod: 60
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+              awslogs-create-group: 'true'
+          Environment:
+            - Name: ENVIRONMENT
+              Value: !Ref Environment
+            - Name: PROJECT_NAME
+              Value: !Ref ProjectName
+          Command:
+            - sh
+            - -c
+            - !Sub |
+              echo 'server { 
+                listen ${ContainerPort}; 
+                location / { 
+                  return 200 "Healthy Application - Environment: ${Environment}"; 
+                  add_header Content-Type text/plain;
+                } 
+                location ${HealthCheckPath} { 
+                  return 200 "OK"; 
+                  add_header Content-Type text/plain;
+                }
+                location /ready { 
+                  return 200 "Ready"; 
+                  add_header Content-Type text/plain;
+                }
+              }' > /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-task'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # ECS Service
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListener
+    Properties:
+      ServiceName: !Sub '${ProjectName}-${Environment}-service'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ECSTaskDefinition
+      DesiredCount: !Ref EcsDesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+          AssignPublicIp: ENABLED
+      LoadBalancers:
+        - ContainerName: !Sub '${ProjectName}-container'
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+      HealthCheckGracePeriodSeconds: 300
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-service'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # ==============================================================================
+  # AUTO SCALING
+  # ==============================================================================
+  
+  # Auto Scaling Role
+  AutoScalingRole:
+    Type: AWS::IAM::Role
+    Condition: EnableAutoScaling
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-autoscaling-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: application-autoscaling.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSServiceRolePolicy'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-autoscaling-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # Auto Scaling Target
+  AutoScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Condition: EnableAutoScaling
+    Properties:
+      ServiceNamespace: ecs
+      ResourceId: !Sub 'service/${ECSCluster}/${ECSService.Name}'
+      ScalableDimension: ecs:service:DesiredCount
+      MinCapacity: !Ref MinCapacity
+      MaxCapacity: !Ref MaxCapacity
+      RoleARN: !GetAtt AutoScalingRole.Arn
+  
+  # Auto Scaling Policy
+  AutoScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Condition: EnableAutoScaling
+    Properties:
+      PolicyName: !Sub '${ProjectName}-${Environment}-scaling-policy'
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: !Ref TargetCpuUtilization
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleOutCooldown: 300
+        ScaleInCooldown: 300
+  
+  # ==============================================================================
+  # CLOUDWATCH ALARMS
+  # ==============================================================================
+  
+  # SNS Topic for Notifications
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasNotificationEmail
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-alerts'
+      DisplayName: !Sub '${ProjectName} ${Environment} Health Check Alerts'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-alerts'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # SNS Subscription
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+  
+  # Unhealthy Host Count Alarm
+  UnhealthyHostCountAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-unhealthy-hosts'
+      AlarmDescription: 'Alarm when targets are unhealthy'
+      MetricName: UnHealthyHostCount
+      Namespace: AWS/ApplicationELB
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt TargetGroup.TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+      AlarmActions:
+        - !If [HasNotificationEmail, !Ref AlertTopic, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-unhealthy-hosts'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # High Response Time Alarm
+  HighResponseTimeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-high-response-time'
+      AlarmDescription: 'Alarm when response time is high'
+      MetricName: TargetResponseTime
+      Namespace: AWS/ApplicationELB
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1.0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt TargetGroup.TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+      AlarmActions:
+        - !If [HasNotificationEmail, !Ref AlertTopic, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-high-response-time'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # ECS Service Running Tasks Alarm
+  ECSServiceRunningTasksAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-ecs-service-running-tasks'
+      AlarmDescription: 'Alarm when ECS service running tasks are low'
+      MetricName: RunningTaskCount
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      Dimensions:
+        - Name: ServiceName
+          Value: !Sub '${ProjectName}-${Environment}-service'
+        - Name: ClusterName
+          Value: !Sub '${ProjectName}-${Environment}-cluster'
+      AlarmActions:
+        - !If [HasNotificationEmail, !Ref AlertTopic, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-ecs-service-running-tasks'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # High CPU Utilization Alarm
+  HighCPUUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-high-cpu-utilization'
+      AlarmDescription: 'Alarm when CPU utilization is high'
+      MetricName: CPUUtilization
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 90
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: ServiceName
+          Value: !Sub '${ProjectName}-${Environment}-service'
+        - Name: ClusterName
+          Value: !Sub '${ProjectName}-${Environment}-cluster'
+      AlarmActions:
+        - !If [HasNotificationEmail, !Ref AlertTopic, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-high-cpu-utilization'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # ==============================================================================
+  # LAMBDA FUNCTION FOR SELF-HEALING
+  # ==============================================================================
+  
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: ECSServiceUpdatePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ecs:UpdateService'
+                  - 'ecs:DescribeServices'
+                  - 'ecs:ListTasks'
+                  - 'ecs:DescribeTasks'
+                  - 'ecs:StopTask'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:GetMetricStatistics'
+                  - 'cloudwatch:ListMetrics'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-lambda-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # Lambda Function for Self-Healing
+  SelfHealingLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-self-healing-function'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          CLUSTER_NAME: !Ref ECSCluster
+          SERVICE_NAME: !Sub '${ProjectName}-${Environment}-service'
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          ecs = boto3.client('ecs')
+          cloudwatch = boto3.client('cloudwatch')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Get environment variables
+                  cluster_name = os.environ['CLUSTER_NAME']
+                  service_name = os.environ['SERVICE_NAME']
+                  environment = os.environ['ENVIRONMENT']
+                  
+                  # Parse CloudWatch alarm if triggered by SNS
+                  if 'Records' in event and len(event['Records']) > 0:
+                      message = json.loads(event['Records'][0]['Sns']['Message'])
+                      alarm_name = message['AlarmName']
+                      logger.info(f"Processing alarm: {alarm_name}")
+                      
+                      # Handle different alarm types
+                      if 'ecs-service-running-tasks' in alarm_name:
+                          # Handle ECS service health issues
+                          logger.info("Detected ECS service health issue, forcing new deployment")
+                          
+                          response = ecs.update_service(
+                              cluster=cluster_name,
+                              service=service_name,
+                              forceNewDeployment=True
+                          )
+                          
+                          logger.info(f"Forced new deployment for service {service_name}")
+                          
+                      elif 'unhealthy-hosts' in alarm_name:
+                          # Handle load balancer health issues
+                          logger.info("Detected unhealthy targets, ECS will handle automatically")
+                          
+                      elif 'high-response-time' in alarm_name:
+                          # Handle high response time issues
+                          logger.info("Detected high response time, checking service health")
+                          
+                          # Describe the service to get current status
+                          response = ecs.describe_services(
+                              cluster=cluster_name,
+                              services=[service_name]
+                          )
+                          
+                          if response['services']:
+                              service = response['services'][0]
+                              running_count = service['runningCount']
+                              desired_count = service['desiredCount']
+                              
+                              logger.info(f"Service status - Running: {running_count}, Desired: {desired_count}")
+                              
+                              # If we have fewer running tasks than desired, force a new deployment
+                              if running_count < desired_count:
+                                  logger.info("Running count is less than desired, forcing new deployment")
+                                  ecs.update_service(
+                                      cluster=cluster_name,
+                                      service=service_name,
+                                      forceNewDeployment=True
+                                  )
+                          
+                      elif 'high-cpu-utilization' in alarm_name:
+                          # Handle high CPU utilization
+                          logger.info("Detected high CPU utilization, auto-scaling should handle this")
+                          
+                  else:
+                      # Direct invocation for testing
+                      logger.info("Direct invocation - performing health check")
+                      
+                      # Describe the service to get current status
+                      response = ecs.describe_services(
+                          cluster=cluster_name,
+                          services=[service_name]
+                      )
+                      
+                      if response['services']:
+                          service = response['services'][0]
+                          logger.info(f"Service status: {service['status']}")
+                          logger.info(f"Running tasks: {service['runningCount']}")
+                          logger.info(f"Desired tasks: {service['desiredCount']}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Self-healing action completed successfully',
+                          'cluster': cluster_name,
+                          'service': service_name,
+                          'environment': environment
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in self-healing function: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'message': 'Self-healing action failed'
+                      })
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-self-healing-function'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # Lambda Permission for SNS
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasNotificationEmail
+    Properties:
+      FunctionName: !Ref SelfHealingLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref AlertTopic
+  
+  # Lambda Log Group
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${SelfHealingLambdaFunction}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-lambda-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+
+Outputs:
+  # VPC Information
+  VPCId:
+    Description: 'VPC ID'
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-vpc-id'
+  
+  PublicSubnet1Id:
+    Description: 'Public Subnet 1 ID'
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-public-subnet-1-id'
+  
+  PublicSubnet2Id:
+    Description: 'Public Subnet 2 ID'
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-public-subnet-2-id'
+  
+  # Load Balancer Information
+  LoadBalancerDNS:
+    Description: 'Application Load Balancer DNS Name'
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-alb-dns'
+  
+  LoadBalancerURL:
+    Description: 'Application Load Balancer URL'
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-alb-url'
+  
+  LoadBalancerArn:
+    Description: 'Application Load Balancer ARN'
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-alb-arn'
+  
+  TargetGroupArn:
+    Description: 'Target Group ARN'
+    Value: !Ref TargetGroup
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-target-group-arn'
+  
+  # ECS Information
+  ECSClusterName:
+    Description: 'ECS Cluster Name'
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ecs-cluster-name'
+  
+  ECSClusterArn:
+    Description: 'ECS Cluster ARN'
+    Value: !GetAtt ECSCluster.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ecs-cluster-arn'
+  
+  ECSServiceName:
+    Description: 'ECS Service Name'
+    Value: !Sub '${ProjectName}-${Environment}-service'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ecs-service-name'
+  
+  ECSServiceArn:
+    Description: 'ECS Service ARN'
+    Value: !Ref ECSService
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ecs-service-arn'
+  
+  # Health Check Information
+  HealthCheckURL:
+    Description: 'Health Check URL'
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}${HealthCheckPath}'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-health-check-url'
+  
+  # Auto Scaling Information
+  AutoScalingTargetArn:
+    Condition: EnableAutoScaling
+    Description: 'Auto Scaling Target ARN'
+    Value: !Ref AutoScalingTarget
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-autoscaling-target-arn'
+  
+  # CloudWatch Information
+  LogGroupName:
+    Description: 'CloudWatch Log Group Name'
+    Value: !Ref ECSLogGroup
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-log-group-name'
+  
+  # SNS Information
+  AlertTopicArn:
+    Condition: HasNotificationEmail
+    Description: 'SNS Topic ARN for alerts'
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-alert-topic-arn'
+  
+  # Lambda Information
+  SelfHealingLambdaArn:
+    Description: 'Self-Healing Lambda Function ARN'
+    Value: !GetAtt SelfHealingLambdaFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-self-healing-lambda-arn'
+  
+  # Security Group Information
+  ALBSecurityGroupId:
+    Description: 'ALB Security Group ID'
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-alb-security-group-id'
+  
+  ECSSecurityGroupId:
+    Description: 'ECS Security Group ID'
+    Value: !Ref ECSSecurityGroup
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ecs-security-group-id'
+  
+  # Configuration Information
+  Environment:
+    Description: 'Environment Name'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-environment'
+  
+  ProjectName:
+    Description: 'Project Name'
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-project-name'
+  
+  StackName:
+    Description: 'CloudFormation Stack Name'
+    Value: !Ref AWS::StackName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-stack-name'

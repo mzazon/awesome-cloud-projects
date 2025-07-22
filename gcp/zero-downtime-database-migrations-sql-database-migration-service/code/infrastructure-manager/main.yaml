@@ -1,0 +1,604 @@
+# Infrastructure Manager Configuration for Zero-Downtime Database Migrations
+# This configuration deploys Database Migration Service, Cloud SQL, and monitoring resources
+# for implementing zero-downtime MySQL database migrations from on-premises to Google Cloud
+
+# Copyright 2025 Google Cloud. This software is provided as-is, without warranty or representation
+# for any use or purpose. Your use of it is subject to your agreement with Google.
+
+terraform:
+  required_version: ">= 1.0"
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 6.0"
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 6.0"
+    random:
+      source: "hashicorp/random"
+      version: "~> 3.1"
+
+variables:
+  project_id:
+    description: "Google Cloud Project ID where resources will be created"
+    type: string
+    
+  region:
+    description: "Google Cloud region for regional resources"
+    type: string
+    default: "us-central1"
+    
+  zone:
+    description: "Google Cloud zone for zonal resources"
+    type: string
+    default: "us-central1-a"
+    
+  source_mysql_host:
+    description: "IP address or hostname of the source MySQL database"
+    type: string
+    
+  source_mysql_port:
+    description: "Port number for the source MySQL database"
+    type: number
+    default: 3306
+    
+  db_name:
+    description: "Name of the database to migrate"
+    type: string
+    default: "production_db"
+    
+  db_user:
+    description: "Username for database connections"
+    type: string
+    default: "migration_user"
+    
+  db_password:
+    description: "Password for database connections (consider using Secret Manager)"
+    type: string
+    sensitive: true
+    
+  cloudsql_tier:
+    description: "Cloud SQL instance tier/machine type"
+    type: string
+    default: "db-n1-standard-2"
+    
+  storage_size_gb:
+    description: "Initial storage size for Cloud SQL instance in GB"
+    type: number
+    default: 100
+    
+  backup_start_time:
+    description: "Time to start daily backups (HH:MM format in UTC)"
+    type: string
+    default: "03:00"
+    
+  maintenance_window_day:
+    description: "Day of week for maintenance window (1=Monday, 7=Sunday)"
+    type: number
+    default: 1
+    
+  maintenance_window_hour:
+    description: "Hour of day for maintenance window (0-23)"
+    type: number
+    default: 4
+    
+  enable_monitoring:
+    description: "Enable Cloud Monitoring and alerting"
+    type: bool
+    default: true
+    
+  notification_email:
+    description: "Email address for monitoring notifications"
+    type: string
+    default: ""
+
+# Generate random suffix for resource names to ensure uniqueness
+resources:
+  random_suffix:
+    type: random_id
+    properties:
+      byte_length: 3
+
+# Enable required Google Cloud APIs for Database Migration Service
+  enable_apis:
+    type: google_project_service
+    properties:
+      for_each:
+        - "datamigration.googleapis.com"
+        - "sqladmin.googleapis.com"
+        - "monitoring.googleapis.com"
+        - "logging.googleapis.com"
+        - "compute.googleapis.com"
+      project: ${var.project_id}
+      service: ${each.value}
+      disable_on_destroy: false
+
+# Create Google Cloud Storage bucket for migration dump files
+  migration_bucket:
+    type: google_storage_bucket
+    properties:
+      name: "${var.project_id}-migration-dump-${random_suffix.hex}"
+      project: ${var.project_id}
+      location: ${var.region}
+      
+      # Configure bucket for secure migration data storage
+      uniform_bucket_level_access: true
+      public_access_prevention: "enforced"
+      
+      # Enable versioning for data protection
+      versioning:
+        enabled: true
+      
+      # Configure lifecycle management for cost optimization
+      lifecycle_rule:
+        - condition:
+            age: 30
+          action:
+            type: "Delete"
+        - condition:
+            age: 7
+          action:
+            type: "SetStorageClass"
+            storage_class: "COLDLINE"
+      
+      # Enable logging for audit compliance
+      logging:
+        log_bucket: "${var.project_id}-audit-logs"
+        log_object_prefix: "migration-access-logs/"
+    
+    depends_on:
+      - enable_apis
+
+# Create IAM service account for Database Migration Service
+  migration_service_account:
+    type: google_service_account
+    properties:
+      account_id: "db-migration-sa-${random_suffix.hex}"
+      project: ${var.project_id}
+      display_name: "Database Migration Service Account"
+      description: "Service account for Database Migration Service operations"
+
+# Grant necessary IAM roles to the migration service account
+  migration_sa_roles:
+    type: google_project_iam_member
+    properties:
+      for_each:
+        - "roles/cloudsql.admin"
+        - "roles/datamigration.admin"
+        - "roles/storage.objectAdmin"
+        - "roles/monitoring.metricWriter"
+        - "roles/logging.logWriter"
+      project: ${var.project_id}
+      role: ${each.value}
+      member: "serviceAccount:${migration_service_account.email}"
+
+# Create VPC network for secure database connectivity
+  migration_network:
+    type: google_compute_network
+    properties:
+      name: "db-migration-network-${random_suffix.hex}"
+      project: ${var.project_id}
+      auto_create_subnetworks: false
+      description: "VPC network for database migration resources"
+
+# Create subnet for migration resources
+  migration_subnet:
+    type: google_compute_subnetwork
+    properties:
+      name: "db-migration-subnet-${random_suffix.hex}"
+      project: ${var.project_id}
+      region: ${var.region}
+      network: ${migration_network.id}
+      ip_cidr_range: "10.0.0.0/24"
+      description: "Subnet for database migration resources"
+      
+      # Enable private Google Access for Cloud SQL connectivity
+      private_ip_google_access: true
+
+# Create firewall rule for MySQL database access
+  mysql_firewall_rule:
+    type: google_compute_firewall
+    properties:
+      name: "allow-mysql-${random_suffix.hex}"
+      project: ${var.project_id}
+      network: ${migration_network.name}
+      description: "Allow MySQL traffic for database migration"
+      
+      allow:
+        - protocol: "tcp"
+          ports: ["3306"]
+      
+      # Restrict source ranges to migration subnet
+      source_ranges: ["10.0.0.0/24"]
+      target_tags: ["mysql-server"]
+
+# Create Cloud SQL for MySQL instance as migration target
+  target_cloudsql_instance:
+    type: google_sql_database_instance
+    properties:
+      name: "target-mysql-${random_suffix.hex}"
+      project: ${var.project_id}
+      region: ${var.region}
+      database_version: "MYSQL_8_0"
+      deletion_protection: false
+      
+      settings:
+        tier: ${var.cloudsql_tier}
+        disk_type: "PD_SSD"
+        disk_size: ${var.storage_size_gb}
+        disk_autoresize: true
+        disk_autoresize_limit: 500
+        
+        # Configure high availability for production workloads
+        availability_type: "REGIONAL"
+        
+        # Enable binary logging for replication
+        database_flags:
+          - name: "log_bin"
+            value: "on"
+          - name: "binlog_format"
+            value: "ROW"
+          - name: "binlog_row_image"
+            value: "FULL"
+        
+        # Configure automated backups
+        backup_configuration:
+          enabled: true
+          start_time: ${var.backup_start_time}
+          point_in_time_recovery_enabled: true
+          backup_retention_settings:
+            retained_backups: 7
+            retention_unit: "COUNT"
+          
+          # Enable binary log retention for point-in-time recovery
+          binary_log_enabled: true
+          transaction_log_retention_days: 7
+        
+        # Configure maintenance window
+        maintenance_window:
+          day: ${var.maintenance_window_day}
+          hour: ${var.maintenance_window_hour}
+          update_track: "stable"
+        
+        # Network configuration for security
+        ip_configuration:
+          ipv4_enabled: true
+          private_network: ${migration_network.id}
+          require_ssl: true
+          
+          # Allow access from migration subnet
+          authorized_networks:
+            - name: "migration-subnet"
+              value: "10.0.0.0/24"
+        
+        # Enable insights for performance monitoring
+        insights_config:
+          query_insights_enabled: true
+          query_string_length: 1024
+          record_application_tags: true
+          record_client_address: true
+    
+    depends_on:
+      - enable_apis
+      - migration_subnet
+
+# Create root user for Cloud SQL instance
+  cloudsql_root_user:
+    type: google_sql_user
+    properties:
+      name: "root"
+      instance: ${target_cloudsql_instance.name}
+      project: ${var.project_id}
+      host: "%"
+      password: ${var.db_password}
+
+# Create migration user for Cloud SQL instance
+  cloudsql_migration_user:
+    type: google_sql_user
+    properties:
+      name: ${var.db_user}
+      instance: ${target_cloudsql_instance.name}
+      project: ${var.project_id}
+      host: "%"
+      password: ${var.db_password}
+
+# Create application database in Cloud SQL
+  target_database:
+    type: google_sql_database
+    properties:
+      name: ${var.db_name}
+      instance: ${target_cloudsql_instance.name}
+      project: ${var.project_id}
+      charset: "utf8mb4"
+      collation: "utf8mb4_unicode_ci"
+
+# Create connection profile for source MySQL database
+  source_connection_profile:
+    type: google_database_migration_service_connection_profile
+    properties:
+      connection_profile_id: "source-mysql-${random_suffix.hex}"
+      location: ${var.region}
+      project: ${var.project_id}
+      display_name: "Source MySQL Database Connection"
+      
+      mysql:
+        host: ${var.source_mysql_host}
+        port: ${var.source_mysql_port}
+        username: ${var.db_user}
+        password: ${var.db_password}
+        ssl:
+          type: "SERVER_ONLY"
+    
+    depends_on:
+      - enable_apis
+
+# Create connection profile for target Cloud SQL instance
+  destination_connection_profile:
+    type: google_database_migration_service_connection_profile
+    properties:
+      connection_profile_id: "target-cloudsql-${random_suffix.hex}"
+      location: ${var.region}
+      project: ${var.project_id}
+      display_name: "Target Cloud SQL Connection"
+      
+      cloudsql:
+        cloud_sql_id: ${target_cloudsql_instance.connection_name}
+    
+    depends_on:
+      - target_cloudsql_instance
+
+# Create Database Migration Service job for continuous replication
+  database_migration_job:
+    type: google_database_migration_service_migration_job
+    properties:
+      migration_job_id: "mysql-migration-${random_suffix.hex}"
+      location: ${var.region}
+      project: ${var.project_id}
+      display_name: "Production MySQL Migration Job"
+      
+      type: "CONTINUOUS"
+      
+      source: ${source_connection_profile.name}
+      destination: ${destination_connection_profile.name}
+      
+      # Configure dump path in Cloud Storage
+      dump_path: "gs://${migration_bucket.name}/dump"
+      
+      # Configure VPC peering for secure connectivity
+      vpc_peering_connectivity: {}
+      
+      # Configure performance and reliability settings
+      performance_config:
+        dump_parallel_level: "MAX"
+    
+    depends_on:
+      - source_connection_profile
+      - destination_connection_profile
+      - migration_bucket
+
+# Create read replica for testing and validation
+  cloudsql_read_replica:
+    type: google_sql_database_instance
+    properties:
+      name: "target-mysql-replica-${random_suffix.hex}"
+      project: ${var.project_id}
+      region: ${var.region}
+      database_version: "MYSQL_8_0"
+      
+      # Configure as read replica
+      master_instance_name: ${target_cloudsql_instance.name}
+      
+      settings:
+        tier: "db-n1-standard-1"
+        disk_type: "PD_SSD"
+        disk_size: 50
+        disk_autoresize: true
+        
+        # Configure replica-specific settings
+        availability_type: "ZONAL"
+        replica_configuration:
+          failover_target: false
+        
+        # Network configuration matches master
+        ip_configuration:
+          ipv4_enabled: true
+          private_network: ${migration_network.id}
+          require_ssl: true
+    
+    depends_on:
+      - target_cloudsql_instance
+
+# Conditional monitoring resources (created only if monitoring is enabled)
+  monitoring_notification_channel:
+    type: google_monitoring_notification_channel
+    count: ${var.enable_monitoring && var.notification_email != "" ? 1 : 0}
+    properties:
+      display_name: "Database Migration Email Alerts"
+      project: ${var.project_id}
+      type: "email"
+      
+      labels:
+        email_address: ${var.notification_email}
+      
+      description: "Email notifications for database migration monitoring"
+
+# Create log-based metric for migration error tracking
+  migration_error_metric:
+    type: google_logging_metric
+    count: ${var.enable_monitoring ? 1 : 0}
+    properties:
+      name: "migration_errors_${replace(random_suffix.hex, "-", "_")}"
+      project: ${var.project_id}
+      
+      filter: |
+        resource.type="datamigration.googleapis.com/MigrationJob"
+        severity="ERROR"
+      
+      description: "Count of database migration errors"
+      
+      metric_descriptor:
+        metric_kind: "GAUGE"
+        value_type: "INT64"
+        display_name: "Migration Error Count"
+
+# Create alert policy for migration job monitoring
+  migration_alert_policy:
+    type: google_monitoring_alert_policy
+    count: ${var.enable_monitoring ? 1 : 0}
+    properties:
+      display_name: "Database Migration Job Alert"
+      project: ${var.project_id}
+      
+      conditions:
+        - display_name: "Migration job failure"
+          condition_threshold:
+            filter: 'resource.type="datamigration.googleapis.com/MigrationJob"'
+            comparison: "COMPARISON_GREATER_THAN"
+            threshold_value: 0
+            duration: "60s"
+            
+            aggregations:
+              - alignment_period: "60s"
+                per_series_aligner: "ALIGN_RATE"
+                cross_series_reducer: "REDUCE_SUM"
+      
+      # Configure notification channels if email is provided
+      notification_channels: ${var.enable_monitoring && var.notification_email != "" ? [monitoring_notification_channel[0].name] : []}
+      
+      alert_strategy:
+        auto_close: "1800s"
+      
+      documentation:
+        content: |
+          This alert fires when the database migration job encounters errors.
+          
+          Troubleshooting steps:
+          1. Check the migration job logs in Cloud Logging
+          2. Verify source database connectivity
+          3. Check Cloud SQL instance status
+          4. Review migration job configuration
+        mime_type: "text/markdown"
+    
+    depends_on:
+      - database_migration_job
+
+# Create Cloud SQL alert policy for instance health
+  cloudsql_alert_policy:
+    type: google_monitoring_alert_policy
+    count: ${var.enable_monitoring ? 1 : 0}
+    properties:
+      display_name: "Cloud SQL Instance Health Alert"
+      project: ${var.project_id}
+      
+      conditions:
+        - display_name: "Cloud SQL instance down"
+          condition_threshold:
+            filter: |
+              resource.type="cloudsql_database"
+              resource.labels.database_id="${var.project_id}:${target_cloudsql_instance.name}"
+              metric.type="cloudsql.googleapis.com/database/up"
+            comparison: "COMPARISON_EQUAL"
+            threshold_value: 0
+            duration: "300s"
+            
+            aggregations:
+              - alignment_period: "60s"
+                per_series_aligner: "ALIGN_MEAN"
+      
+      notification_channels: ${var.enable_monitoring && var.notification_email != "" ? [monitoring_notification_channel[0].name] : []}
+      
+      alert_strategy:
+        auto_close: "1800s"
+      
+      documentation:
+        content: |
+          This alert fires when the Cloud SQL instance becomes unavailable.
+          
+          Immediate actions:
+          1. Check Cloud SQL instance status in console
+          2. Review recent maintenance activities
+          3. Check for any ongoing incidents
+          4. Consider failing over to read replica if configured
+        mime_type: "text/markdown"
+
+# Define outputs for verification and integration
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${var.project_id}
+  
+  region:
+    description: "Google Cloud region used for resources"
+    value: ${var.region}
+  
+  migration_job_id:
+    description: "Database Migration Service job ID"
+    value: ${database_migration_job.migration_job_id}
+  
+  migration_job_name:
+    description: "Full resource name of the migration job"
+    value: ${database_migration_job.name}
+  
+  source_connection_profile_id:
+    description: "Source connection profile ID"
+    value: ${source_connection_profile.connection_profile_id}
+  
+  destination_connection_profile_id:
+    description: "Destination connection profile ID"
+    value: ${destination_connection_profile.connection_profile_id}
+  
+  cloudsql_instance_name:
+    description: "Cloud SQL instance name"
+    value: ${target_cloudsql_instance.name}
+  
+  cloudsql_connection_name:
+    description: "Cloud SQL instance connection name"
+    value: ${target_cloudsql_instance.connection_name}
+  
+  cloudsql_public_ip:
+    description: "Cloud SQL instance public IP address"
+    value: ${target_cloudsql_instance.public_ip_address}
+  
+  cloudsql_private_ip:
+    description: "Cloud SQL instance private IP address"
+    value: ${target_cloudsql_instance.private_ip_address}
+  
+  read_replica_name:
+    description: "Read replica instance name"
+    value: ${cloudsql_read_replica.name}
+  
+  migration_bucket_name:
+    description: "Cloud Storage bucket for migration dumps"
+    value: ${migration_bucket.name}
+  
+  migration_bucket_url:
+    description: "Cloud Storage bucket URL"
+    value: ${migration_bucket.url}
+  
+  network_name:
+    description: "VPC network name for migration resources"
+    value: ${migration_network.name}
+  
+  subnet_name:
+    description: "Subnet name for migration resources"
+    value: ${migration_subnet.name}
+  
+  service_account_email:
+    description: "Migration service account email"
+    value: ${migration_service_account.email}
+  
+  database_name:
+    description: "Target database name"
+    value: ${target_database.name}
+  
+  monitoring_enabled:
+    description: "Whether monitoring and alerting are enabled"
+    value: ${var.enable_monitoring}
+  
+  gcloud_connect_command:
+    description: "Command to connect to Cloud SQL instance"
+    value: "gcloud sql connect ${target_cloudsql_instance.name} --user=root --database=${var.db_name}"
+  
+  migration_status_command:
+    description: "Command to check migration job status"
+    value: "gcloud datamigration migration-jobs describe ${database_migration_job.migration_job_id} --region=${var.region}"

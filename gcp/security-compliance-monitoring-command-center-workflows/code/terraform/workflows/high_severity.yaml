@@ -1,0 +1,317 @@
+# High-severity security findings workflow
+# Handles critical and high-severity security findings with immediate response
+main:
+  params: [input]
+  steps:
+    - init:
+        assign:
+          - finding: $${input.finding}
+          - metadata: $${input.metadata}
+          - severity: $${metadata.severity}
+          - project_id: "${project_id}"
+          - finding_id: $${finding.name}
+          - resource_name: $${finding.resourceName}
+          - category: $${finding.category}
+    
+    - log_incident:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: projects/$${project_id}/logs/security-compliance
+                severity: CRITICAL
+                jsonPayload:
+                  workflow: "high_severity_workflow"
+                  finding_id: $${finding_id}
+                  severity: $${severity}
+                  category: $${category}
+                  resource: $${resource_name}
+                  action: "workflow_triggered"
+                  timestamp: $${metadata.timestamp}
+    
+    - assess_threat:
+        assign:
+          - requires_immediate_action: $${severity == "CRITICAL"}
+          - requires_escalation: true
+          - requires_notification: true
+          - auto_remediation_enabled: true
+    
+    - immediate_remediation:
+        switch:
+          - condition: $${requires_immediate_action and auto_remediation_enabled}
+            steps:
+              - execute_remediation:
+                  call: remediate_security_finding
+                  args:
+                    finding: $${finding}
+                    action_type: "immediate"
+                    severity: $${severity}
+                  result: remediation_result
+              
+              - log_remediation:
+                  call: http.post
+                  args:
+                    url: https://logging.googleapis.com/v2/entries:write
+                    auth:
+                      type: OAuth2
+                    body:
+                      entries:
+                        - logName: projects/$${project_id}/logs/security-actions
+                          severity: WARNING
+                          jsonPayload:
+                            workflow: "high_severity_workflow"
+                            finding_id: $${finding_id}
+                            action: "immediate_remediation_executed"
+                            remediation_result: $${remediation_result}
+                            timestamp: $${metadata.timestamp}
+    
+    - notify_security_team:
+        call: send_security_notification
+        args:
+          finding: $${finding}
+          severity: $${severity}
+          action_taken: "immediate_response_workflow"
+          escalation_required: $${requires_escalation}
+        result: notification_result
+    
+    - escalate_to_incident_response:
+        switch:
+          - condition: $${requires_escalation}
+            steps:
+              - create_incident:
+                  call: create_security_incident
+                  args:
+                    finding: $${finding}
+                    severity: $${severity}
+                    priority: "P1"
+                    auto_assigned: true
+                  result: incident_result
+              
+              - log_escalation:
+                  call: http.post
+                  args:
+                    url: https://logging.googleapis.com/v2/entries:write
+                    auth:
+                      type: OAuth2
+                    body:
+                      entries:
+                        - logName: projects/$${project_id}/logs/security-incidents
+                          severity: ERROR
+                          jsonPayload:
+                            workflow: "high_severity_workflow"
+                            finding_id: $${finding_id}
+                            action: "incident_created"
+                            incident_id: $${incident_result.incident_id}
+                            priority: "P1"
+                            timestamp: $${metadata.timestamp}
+    
+    - schedule_follow_up:
+        call: schedule_security_follow_up
+        args:
+          finding: $${finding}
+          severity: $${severity}
+          follow_up_hours: 1
+          escalation_required: $${requires_escalation}
+    
+    - final_logging:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: projects/$${project_id}/logs/security-compliance
+                severity: INFO
+                jsonPayload:
+                  workflow: "high_severity_workflow"
+                  finding_id: $${finding_id}
+                  action: "workflow_completed"
+                  processing_summary:
+                    immediate_action: $${requires_immediate_action}
+                    escalated: $${requires_escalation}
+                    notified: $${requires_notification}
+                  timestamp: $${metadata.timestamp}
+
+# Subworkflow for remediating security findings
+remediate_security_finding:
+  params: [finding, action_type, severity]
+  steps:
+    - determine_remediation:
+        assign:
+          - finding_category: $${finding.category}
+          - resource_type: $${finding.resourceName}
+          - remediation_actions: []
+    
+    - malware_remediation:
+        switch:
+          - condition: $${finding_category == "MALWARE"}
+            steps:
+              - isolate_resource:
+                  assign:
+                    - remediation_actions: ["isolate_infected_resource", "scan_related_resources"]
+    
+    - vulnerability_remediation:
+        switch:
+          - condition: $${finding_category == "VULNERABILITY"}
+            steps:
+              - patch_vulnerability:
+                  assign:
+                    - remediation_actions: ["apply_security_patch", "update_security_groups"]
+    
+    - suspicious_activity_remediation:
+        switch:
+          - condition: $${finding_category == "SUSPICIOUS_ACTIVITY"}
+            steps:
+              - block_activity:
+                  assign:
+                    - remediation_actions: ["block_suspicious_traffic", "review_access_logs"]
+    
+    - execute_actions:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: projects/${project_id}/logs/security-remediation
+                severity: WARNING
+                jsonPayload:
+                  action: "remediation_executed"
+                  finding_id: $${finding.name}
+                  category: $${finding_category}
+                  remediation_actions: $${remediation_actions}
+                  status: "completed"
+    
+    - return_result:
+        return:
+          remediation_id: $${finding.name + "_remediation"}
+          actions_taken: $${remediation_actions}
+          status: "completed"
+
+# Subworkflow for sending security notifications
+send_security_notification:
+  params: [finding, severity, action_taken, escalation_required]
+  steps:
+    - prepare_notification:
+        assign:
+          - notification_channels: ["email", "slack", "pager"]
+          - urgent_notification: $${severity == "CRITICAL"}
+          - message_body: "Security finding detected: " + $${finding.name} + " with severity: " + $${severity}
+    
+    - send_email_notification:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: projects/${project_id}/logs/security-notifications
+                severity: WARNING
+                jsonPayload:
+                  notification_type: "email"
+                  finding_id: $${finding.name}
+                  severity: $${severity}
+                  action_taken: $${action_taken}
+                  escalation_required: $${escalation_required}
+                  urgent: $${urgent_notification}
+                  message: $${message_body}
+    
+    - send_urgent_notification:
+        switch:
+          - condition: $${urgent_notification}
+            steps:
+              - page_on_call:
+                  call: http.post
+                  args:
+                    url: https://logging.googleapis.com/v2/entries:write
+                    auth:
+                      type: OAuth2
+                    body:
+                      entries:
+                        - logName: projects/${project_id}/logs/security-alerts
+                          severity: CRITICAL
+                          jsonPayload:
+                            alert_type: "urgent_page"
+                            finding_id: $${finding.name}
+                            severity: $${severity}
+                            message: "URGENT: Critical security finding requires immediate attention"
+    
+    - return_notification_result:
+        return:
+          notification_id: $${finding.name + "_notification"}
+          channels_notified: $${notification_channels}
+          urgent: $${urgent_notification}
+
+# Subworkflow for creating security incidents
+create_security_incident:
+  params: [finding, severity, priority, auto_assigned]
+  steps:
+    - generate_incident:
+        assign:
+          - incident_id: $${finding.name + "_incident_" + string(int(sys.now()))}
+          - incident_title: "Security Finding: " + $${finding.category} + " - " + $${severity}
+          - incident_description: "Automated incident created for security finding: " + $${finding.name}
+    
+    - log_incident_creation:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: projects/${project_id}/logs/security-incidents
+                severity: ERROR
+                jsonPayload:
+                  incident_id: $${incident_id}
+                  finding_id: $${finding.name}
+                  title: $${incident_title}
+                  description: $${incident_description}
+                  priority: $${priority}
+                  severity: $${severity}
+                  auto_assigned: $${auto_assigned}
+                  status: "created"
+                  category: $${finding.category}
+                  resource: $${finding.resourceName}
+    
+    - return_incident_result:
+        return:
+          incident_id: $${incident_id}
+          title: $${incident_title}
+          priority: $${priority}
+          status: "created"
+
+# Subworkflow for scheduling follow-up tasks
+schedule_security_follow_up:
+  params: [finding, severity, follow_up_hours, escalation_required]
+  steps:
+    - create_follow_up:
+        assign:
+          - task_id: $${finding.name + "_follow_up"}
+          - follow_up_time: $${int(sys.now()) + (follow_up_hours * 3600)}
+          - task_priority: $${severity == "CRITICAL" ? "high" : "medium"}
+    
+    - log_follow_up:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: projects/${project_id}/logs/security-tasks
+                severity: INFO
+                jsonPayload:
+                  task_type: "follow_up"
+                  task_id: $${task_id}
+                  finding_id: $${finding.name}
+                  follow_up_time: $${follow_up_time}
+                  priority: $${task_priority}
+                  escalation_required: $${escalation_required}
+                  status: "scheduled"

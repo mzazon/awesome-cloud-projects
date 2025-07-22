@@ -1,0 +1,1090 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Real-time Data Quality Monitoring with Amazon Deequ on EMR
+  This template deploys a comprehensive data quality monitoring solution using Amazon EMR with Deequ,
+  including S3 storage, CloudWatch monitoring, SNS alerting, and IAM roles for secure operations.
+
+Parameters:
+  # Naming and Environment Parameters
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, staging, prod]
+    Description: Environment name for resource tagging and naming
+    
+  ProjectName:
+    Type: String
+    Default: deequ-quality-monitor
+    Description: Project name used in resource naming
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    
+  # EMR Cluster Configuration
+  EMRReleaseLabel:
+    Type: String
+    Default: emr-6.15.0
+    Description: EMR release version with Spark 3.4.1 support
+    AllowedValues: [emr-6.15.0, emr-6.14.0, emr-6.13.0]
+    
+  EMRInstanceType:
+    Type: String
+    Default: m5.xlarge
+    Description: EC2 instance type for EMR cluster nodes
+    AllowedValues: [m5.large, m5.xlarge, m5.2xlarge, m5.4xlarge, c5.xlarge, c5.2xlarge]
+    
+  EMRInstanceCount:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 20
+    Description: Number of EC2 instances in the EMR cluster (1 master + n-1 workers)
+    
+  # Monitoring Configuration
+  AlertEmailAddress:
+    Type: String
+    Description: Email address to receive data quality alerts
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+    
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable detailed CloudWatch monitoring for EMR cluster
+    
+  # Data Configuration
+  DataRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: Number of days to retain data quality reports in S3
+    
+  EnableDataEncryption:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable S3 bucket encryption for data security
+
+Conditions:
+  EnableDetailedMonitoringCondition: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  EnableDataEncryptionCondition: !Equals [!Ref EnableDataEncryption, 'true']
+  IsProdEnvironment: !Equals [!Ref Environment, 'prod']
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Environment Configuration
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: EMR Cluster Configuration
+        Parameters:
+          - EMRReleaseLabel
+          - EMRInstanceType
+          - EMRInstanceCount
+      - Label:
+          default: Monitoring and Alerting
+        Parameters:
+          - AlertEmailAddress
+          - EnableDetailedMonitoring
+      - Label:
+          default: Data Management
+        Parameters:
+          - DataRetentionDays
+          - EnableDataEncryption
+    ParameterLabels:
+      Environment:
+        default: Deployment Environment
+      ProjectName:
+        default: Project Name
+      EMRReleaseLabel:
+        default: EMR Release Version
+      EMRInstanceType:
+        default: EC2 Instance Type
+      EMRInstanceCount:
+        default: Number of Instances
+      AlertEmailAddress:
+        default: Alert Email Address
+      EnableDetailedMonitoring:
+        default: Detailed Monitoring
+      DataRetentionDays:
+        default: Data Retention (Days)
+      EnableDataEncryption:
+        default: Enable Encryption
+
+Resources:
+  # ================================
+  # S3 Storage Resources
+  # ================================
+  
+  # Main data bucket for raw data, quality reports, and scripts
+  DataQualityS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [EnableDataEncryptionCondition, 'AES256', !Ref 'AWS::NoValue']
+            BucketKeyEnabled: !If [EnableDataEncryptionCondition, true, !Ref 'AWS::NoValue']
+      VersioningConfiguration:
+        Status: !If [IsProdEnvironment, 'Enabled', 'Suspended']
+      LifecycleConfiguration:
+        Rules:
+          - Id: DataRetentionRule
+            Status: Enabled
+            ExpirationInDays: !Ref DataRetentionDays
+            NoncurrentVersionExpirationInDays: 7
+          - Id: IncompleteMultipartUploadDeletion
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref DataQualityLogGroup
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DataQualityMonitoring
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # S3 bucket policy for secure access
+  DataQualityS3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataQualityS3Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${DataQualityS3Bucket}/*'
+              - !Ref DataQualityS3Bucket
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+          - Sid: AllowEMRAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt EMRInstanceProfile.Arn
+            Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+              - 's3:DeleteObject'
+              - 's3:ListBucket'
+            Resource:
+              - !Sub '${DataQualityS3Bucket}/*'
+              - !Ref DataQualityS3Bucket
+
+  # ================================
+  # IAM Roles and Policies
+  # ================================
+  
+  # EMR Service Role - Allows EMR to manage cluster resources
+  EMRServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-EMRServiceRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: elasticmapreduce.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonElasticMapReduceRole
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # EMR EC2 Instance Role - Provides permissions for EMR EC2 instances
+  EMRInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-EMRInstanceRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonElasticMapReduceforEC2Role
+      Policies:
+        - PolicyName: DataQualityS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub '${DataQualityS3Bucket}/*'
+                  - !Ref DataQualityS3Bucket
+        - PolicyName: CloudWatchMetricsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                  - 'cloudwatch:ListMetrics'
+                  - 'cloudwatch:GetMetricStatistics'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': 'DataQuality/Deequ'
+        - PolicyName: SNSPublishAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref DataQualityAlertsTopic
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/emr/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # EMR Instance Profile - Links the instance role to EC2 instances
+  EMRInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ProjectName}-${Environment}-EMRInstanceProfile'
+      Roles:
+        - !Ref EMRInstanceRole
+
+  # ================================
+  # SNS Topic for Alerts
+  # ================================
+  
+  # SNS Topic for data quality alerts
+  DataQualityAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-data-quality-alerts'
+      DisplayName: Data Quality Monitoring Alerts
+      FifoTopic: false
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DataQualityAlerting
+
+  # SNS Subscription for email alerts
+  DataQualityAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref DataQualityAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmailAddress
+      FilterPolicy:
+        alert_type: ['DATA_QUALITY_FAILURE', 'SYSTEM_ERROR']
+
+  # SNS Topic Policy for secure access
+  DataQualityAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref DataQualityAlertsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEMRPublish
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt EMRInstanceRole.Arn
+            Action:
+              - 'sns:Publish'
+            Resource: !Ref DataQualityAlertsTopic
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 'sns:*'
+            Resource: !Ref DataQualityAlertsTopic
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+  # ================================
+  # CloudWatch Resources
+  # ================================
+  
+  # CloudWatch Log Group for EMR cluster logs
+  DataQualityLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/emr/${ProjectName}-${Environment}'
+      RetentionInDays: !If [IsProdEnvironment, 90, 30]
+      KmsKeyId: !If [EnableDataEncryptionCondition, !Ref DataQualityLogGroupKey, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # KMS Key for CloudWatch Logs encryption
+  DataQualityLogGroupKey:
+    Type: AWS::KMS::Key
+    Condition: EnableDataEncryptionCondition
+    Properties:
+      Description: KMS key for Data Quality monitoring CloudWatch logs encryption
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:DescribeKey'
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/emr/${ProjectName}-${Environment}'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # KMS Key Alias for easier reference
+  DataQualityLogGroupKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: EnableDataEncryptionCondition
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-${Environment}-logs'
+      TargetKeyId: !Ref DataQualityLogGroupKey
+
+  # CloudWatch Dashboard for data quality metrics visualization
+  DataQualityDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}-DataQuality'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "DataQuality/Deequ", "Size", "DataSource", "${DataQualityS3Bucket}" ],
+                  [ ".", "Completeness_customer_id_", ".", "." ],
+                  [ ".", "Completeness_email_", ".", "." ],
+                  [ ".", "Completeness_income_", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Data Completeness Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 1
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "DataQuality/Deequ", "Uniqueness_customer_id_", "DataSource", "${DataQualityS3Bucket}" ],
+                  [ ".", "Mean_age_", ".", "." ],
+                  [ ".", "StandardDeviation_age_", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Data Distribution Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ElasticMapReduce", "CoreNodesRunning", "ClusterId", "${EMRCluster}" ],
+                  [ ".", "AppsCompleted", ".", "." ],
+                  [ ".", "AppsFailed", ".", "." ],
+                  [ ".", "AppsRunning", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "EMR Cluster Performance"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms for monitoring system health
+  EMRClusterHealthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-EMRClusterHealth'
+      AlarmDescription: Monitor EMR cluster health and running applications
+      MetricName: CoreNodesRunning
+      Namespace: AWS/ElasticMapReduce
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: ClusterId
+          Value: !Ref EMRCluster
+      AlarmActions:
+        - !Ref DataQualityAlertsTopic
+      TreatMissingData: breaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
+  # EMR Cluster Configuration
+  # ================================
+  
+  # Security Configuration for EMR cluster
+  EMRSecurityConfiguration:
+    Type: AWS::EMR::SecurityConfiguration
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-security-config'
+      SecurityConfiguration:
+        EncryptionConfiguration:
+          EnableInTransitEncryption: !Ref EnableDataEncryption
+          EnableAtRestEncryption: !Ref EnableDataEncryption
+          InTransitEncryptionConfiguration:
+            TLSCertificateConfiguration:
+              CertificateProviderType: PEM
+          AtRestEncryptionConfiguration:
+            S3EncryptionConfiguration:
+              EncryptionMode: SSE-S3
+            LocalDiskEncryptionConfiguration:
+              EncryptionKeyProviderType: AwsKms
+              AwsKmsKey: alias/aws/elasticmapreduce
+
+  # EMR Cluster with Deequ and Spark configuration
+  EMRCluster:
+    Type: AWS::EMR::Cluster
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-cluster'
+      ReleaseLabel: !Ref EMRReleaseLabel
+      Applications:
+        - Name: Spark
+        - Name: Hadoop
+        - Name: Ganglia
+      Configurations:
+        - Classification: spark-defaults
+          ConfigurationProperties:
+            spark.sql.adaptive.enabled: 'true'
+            spark.sql.adaptive.coalescePartitions.enabled: 'true'
+            spark.serializer: org.apache.spark.serializer.KryoSerializer
+            spark.sql.execution.arrow.pyspark.enabled: 'true'
+            spark.dynamicAllocation.enabled: 'true'
+            spark.dynamicAllocation.minExecutors: '1'
+            spark.dynamicAllocation.maxExecutors: '10'
+        - Classification: spark-env
+          ConfigurationProperties:
+            PYSPARK_PYTHON: /usr/bin/python3
+        - Classification: hadoop-env
+          ConfigurationProperties:
+            HADOOP_DATANODE_HEAPSIZE: '2048'
+            HADOOP_NAMENODE_HEAPSIZE: '2048'
+        - Classification: yarn-site
+          ConfigurationProperties:
+            yarn.resourcemanager.scheduler.class: org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacityScheduler
+            yarn.scheduler.capacity.resource-calculator: org.apache.hadoop.yarn.util.resource.DominantResourceCalculator
+      Instances:
+        MasterInstanceGroup:
+          InstanceCount: 1
+          InstanceType: !Ref EMRInstanceType
+          Market: ON_DEMAND
+          Name: Master
+        CoreInstanceGroup:
+          InstanceCount: !If [IsProdEnvironment, !Ref EMRInstanceCount, 2]
+          InstanceType: !Ref EMRInstanceType
+          Market: !If [IsProdEnvironment, 'ON_DEMAND', 'SPOT']
+          Name: Core
+          BidPrice: !If [IsProdEnvironment, !Ref 'AWS::NoValue', '0.05']
+        Ec2KeyName: !If [IsProdEnvironment, !Ref EMRKeyPair, !Ref 'AWS::NoValue']
+        Ec2SubnetId: !Ref EMRSubnet
+        EmrManagedMasterSecurityGroup: !Ref EMRMasterSecurityGroup
+        EmrManagedSlaveSecurityGroup: !Ref EMRSlaveSecurityGroup
+        ServiceAccessSecurityGroup: !Ref EMRServiceSecurityGroup
+        AdditionalMasterSecurityGroups:
+          - !Ref EMRAdditionalSecurityGroup
+        AdditionalSlaveSecurityGroups:
+          - !Ref EMRAdditionalSecurityGroup
+      ServiceRole: !Ref EMRServiceRole
+      JobFlowRole: !Ref EMRInstanceProfile
+      SecurityConfiguration: !Ref EMRSecurityConfiguration
+      LogUri: !Sub 's3://${DataQualityS3Bucket}/logs/'
+      BootstrapActions:
+        - Name: InstallDeequ
+          ScriptBootstrapAction:
+            Path: !Sub 's3://${DataQualityS3Bucket}/scripts/install-deequ.sh'
+            Args: []
+      Steps:
+        - Name: SetupDeequEnvironment
+          ActionOnFailure: CONTINUE
+          HadoopJarStep:
+            Jar: command-runner.jar
+            Args:
+              - bash
+              - '-c'
+              - !Sub |
+                # Create Deequ bootstrap script
+                cat > /tmp/install-deequ.sh << 'EOF'
+                #!/bin/bash
+                set -e
+                
+                # Download and install Deequ JAR
+                sudo mkdir -p /usr/lib/spark/jars
+                sudo wget -O /usr/lib/spark/jars/deequ-2.0.4-spark-3.4.jar \
+                    https://repo1.maven.org/maven2/com/amazon/deequ/deequ/2.0.4-spark-3.4/deequ-2.0.4-spark-3.4.jar
+                
+                # Install required Python packages
+                sudo pip3 install boto3 pyarrow pandas numpy pydeequ
+                
+                # Create directories for custom scripts
+                sudo mkdir -p /opt/deequ-scripts
+                sudo chmod 755 /opt/deequ-scripts
+                
+                # Create sample monitoring script
+                sudo tee /opt/deequ-scripts/sample-monitor.py > /dev/null << 'PYEOF'
+                #!/usr/bin/env python3
+                import sys
+                from pyspark.sql import SparkSession
+                
+                # Initialize Spark session with Deequ
+                spark = SparkSession.builder \
+                    .appName("DeeQuDataQualityMonitor") \
+                    .config("spark.jars", "/usr/lib/spark/jars/deequ-2.0.4-spark-3.4.jar") \
+                    .getOrCreate()
+                
+                print("✅ Deequ environment setup completed successfully")
+                spark.stop()
+                PYEOF
+                
+                sudo chmod +x /opt/deequ-scripts/sample-monitor.py
+                
+                echo "Deequ installation completed successfully"
+                EOF
+                
+                chmod +x /tmp/install-deequ.sh
+                aws s3 cp /tmp/install-deequ.sh s3://${DataQualityS3Bucket}/scripts/
+                /tmp/install-deequ.sh
+      VisibleToAllUsers: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DataQualityMonitoring
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ================================
+  # Networking Resources
+  # ================================
+  
+  # VPC for EMR cluster (if not using default VPC)
+  EMRVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Internet Gateway for VPC
+  EMRInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-igw'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Attach Internet Gateway to VPC
+  EMRVPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref EMRVPC
+      InternetGatewayId: !Ref EMRInternetGateway
+
+  # Public Subnet for EMR cluster
+  EMRSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref EMRVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-subnet'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Route Table for public subnet
+  EMRRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref EMRVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-route-table'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Route to Internet Gateway
+  EMRPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: EMRVPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref EMRRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref EMRInternetGateway
+
+  # Associate Route Table with Subnet
+  EMRSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref EMRSubnet
+      RouteTableId: !Ref EMRRouteTable
+
+  # ================================
+  # Security Groups
+  # ================================
+  
+  # Master node security group
+  EMRMasterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-${Environment}-master-sg'
+      GroupDescription: Security group for EMR master node
+      VpcId: !Ref EMRVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref EMRAdditionalSecurityGroup
+          Description: SSH access from additional security group
+        - IpProtocol: tcp
+          FromPort: 8443
+          ToPort: 8443
+          SourceSecurityGroupId: !Ref EMRServiceSecurityGroup
+          Description: HTTPS access from service security group
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-master-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Slave/Core node security group
+  EMRSlaveSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-${Environment}-slave-sg'
+      GroupDescription: Security group for EMR slave/core nodes
+      VpcId: !Ref EMRVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref EMRAdditionalSecurityGroup
+          Description: SSH access from additional security group
+        - IpProtocol: tcp
+          FromPort: 8443
+          ToPort: 8443
+          SourceSecurityGroupId: !Ref EMRServiceSecurityGroup
+          Description: HTTPS access from service security group
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-slave-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Service access security group
+  EMRServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-${Environment}-service-sg'
+      GroupDescription: Security group for EMR service access
+      VpcId: !Ref EMRVPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 8443
+          ToPort: 8443
+          DestinationSecurityGroupId: !Ref EMRMasterSecurityGroup
+          Description: HTTPS to master security group
+        - IpProtocol: tcp
+          FromPort: 8443
+          ToPort: 8443
+          DestinationSecurityGroupId: !Ref EMRSlaveSecurityGroup
+          Description: HTTPS to slave security group
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-service-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Additional security group for administrative access
+  EMRAdditionalSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-${Environment}-additional-sg'
+      GroupDescription: Additional security group for EMR cluster administrative access
+      VpcId: !Ref EMRVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 10.0.0.0/16
+          Description: SSH access from VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-additional-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
+  # EC2 Key Pair (for production environments)
+  # ================================
+  
+  # EC2 Key Pair for EMR cluster access (production only)
+  EMRKeyPair:
+    Type: AWS::EC2::KeyPair
+    Condition: IsProdEnvironment
+    Properties:
+      KeyName: !Sub '${ProjectName}-${Environment}-keypair'
+      KeyType: rsa
+      KeyFormat: pem
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
+  # Lambda Function for Automation
+  # ================================
+  
+  # Lambda execution role
+  DataQualityLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EMRStepSubmission
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'emr:AddJobFlowSteps'
+                  - 'emr:DescribeStep'
+                  - 'emr:ListSteps'
+                  - 'emr:CancelSteps'
+                Resource: !Sub 'arn:aws:elasticmapreduce:${AWS::Region}:${AWS::AccountId}:cluster/${EMRCluster}'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda function for automated monitoring job submission
+  DataQualityAutomationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-automation'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt DataQualityLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          EMR_CLUSTER_ID: !Ref EMRCluster
+          S3_BUCKET_NAME: !Ref DataQualityS3Bucket
+          SNS_TOPIC_ARN: !Ref DataQualityAlertsTopic
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          import os
+          import time
+          
+          def lambda_handler(event, context):
+              """Lambda function to trigger automated data quality monitoring"""
+              emr = boto3.client('emr')
+              
+              cluster_id = os.environ['EMR_CLUSTER_ID']
+              s3_bucket = os.environ['S3_BUCKET_NAME']
+              sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+              
+              # Extract data path from event or use default
+              data_path = event.get('data_path', f's3://{s3_bucket}/raw-data/')
+              
+              step_config = {
+                  "Name": f"AutomatedDataQualityMonitoring_{int(time.time())}",
+                  "ActionOnFailure": "CONTINUE",
+                  "HadoopJarStep": {
+                      "Jar": "command-runner.jar",
+                      "Args": [
+                          "spark-submit",
+                          "--deploy-mode", "cluster",
+                          "--master", "yarn",
+                          "--conf", "spark.sql.adaptive.enabled=true",
+                          f"s3://{s3_bucket}/scripts/deequ-quality-monitor.py",
+                          s3_bucket,
+                          data_path,
+                          sns_topic_arn
+                      ]
+                  }
+              }
+              
+              try:
+                  response = emr.add_steps(
+                      ClusterId=cluster_id,
+                      Steps=[step_config]
+                  )
+                  
+                  step_id = response['StepIds'][0]
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Data quality monitoring job submitted successfully',
+                          'step_id': step_id,
+                          'cluster_id': cluster_id
+                      })
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'message': 'Failed to submit data quality monitoring job'
+                      })
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  # ================================
+  # Infrastructure Outputs
+  # ================================
+  
+  # S3 Bucket Information
+  DataQualityS3BucketName:
+    Description: Name of the S3 bucket for data quality monitoring
+    Value: !Ref DataQualityS3Bucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3Bucket'
+
+  DataQualityS3BucketArn:
+    Description: ARN of the S3 bucket for data quality monitoring
+    Value: !GetAtt DataQualityS3Bucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketArn'
+
+  # EMR Cluster Information
+  EMRClusterId:
+    Description: ID of the EMR cluster for data quality monitoring
+    Value: !Ref EMRCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-EMRCluster'
+
+  EMRClusterMasterPublicDNS:
+    Description: Master node public DNS name of the EMR cluster
+    Value: !GetAtt EMRCluster.MasterPublicDNS
+    Export:
+      Name: !Sub '${AWS::StackName}-EMRMasterDNS'
+
+  # SNS Topic Information
+  DataQualityAlertsTopicArn:
+    Description: ARN of the SNS topic for data quality alerts
+    Value: !Ref DataQualityAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopic'
+
+  # CloudWatch Resources
+  DataQualityDashboardURL:
+    Description: URL to the CloudWatch dashboard for data quality metrics
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-DataQuality'
+    Export:
+      Name: !Sub '${AWS::StackName}-Dashboard'
+
+  DataQualityLogGroupName:
+    Description: Name of the CloudWatch log group for EMR cluster logs
+    Value: !Ref DataQualityLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  # IAM Roles
+  EMRServiceRoleArn:
+    Description: ARN of the EMR service role
+    Value: !GetAtt EMRServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EMRServiceRole'
+
+  EMRInstanceRoleArn:
+    Description: ARN of the EMR instance role
+    Value: !GetAtt EMRInstanceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EMRInstanceRole'
+
+  # Lambda Function
+  DataQualityAutomationFunctionArn:
+    Description: ARN of the Lambda function for automated monitoring
+    Value: !GetAtt DataQualityAutomationFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
+
+  # Network Information
+  VPCId:
+    Description: ID of the VPC created for the EMR cluster
+    Value: !Ref EMRVPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPC'
+
+  SubnetId:
+    Description: ID of the subnet created for the EMR cluster
+    Value: !Ref EMRSubnet
+    Export:
+      Name: !Sub '${AWS::StackName}-Subnet'
+
+  # ================================
+  # Usage Instructions
+  # ================================
+  
+  UsageInstructions:
+    Description: Instructions for using the deployed data quality monitoring system
+    Value: !Sub |
+      Data Quality Monitoring System Deployed Successfully!
+      
+      Quick Start Guide:
+      1. Upload data files to: s3://${DataQualityS3Bucket}/raw-data/
+      2. Upload monitoring scripts to: s3://${DataQualityS3Bucket}/scripts/
+      3. View metrics at: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-DataQuality
+      4. Trigger monitoring via Lambda: ${DataQualityAutomationFunction}
+      5. Check EMR cluster status: ${EMRCluster}
+      
+      Important Resources:
+      - S3 Bucket: ${DataQualityS3Bucket}
+      - SNS Topic: ${DataQualityAlertsTopic}
+      - EMR Cluster: ${EMRCluster}
+      - CloudWatch Logs: ${DataQualityLogGroup}

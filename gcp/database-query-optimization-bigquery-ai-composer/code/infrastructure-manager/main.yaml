@@ -1,0 +1,695 @@
+# Infrastructure Manager configuration for BigQuery Query Optimization with AI and Cloud Composer
+# This configuration deploys an intelligent automation pipeline that monitors BigQuery performance,
+# applies AI-driven optimization recommendations, and automatically implements improvements
+
+metadata:
+  name: bigquery-query-optimization
+  description: "Automated BigQuery query optimization system with AI and orchestration"
+  labels:
+    solution: query-optimization
+    provider: gcp
+    category: analytics
+
+imports:
+  # Import Google Cloud resource schemas
+  - path: "https://www.googleapis.com/compute/v1/zones"
+    name: compute_zones
+
+# Template variables for customization
+variables:
+  # Project configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+  
+  # Regional configuration
+  region:
+    type: string
+    description: "Google Cloud region for resource deployment"
+    default: "us-central1"
+    allowedValues:
+      - "us-central1"
+      - "us-east1"
+      - "us-west1"
+      - "europe-west1"
+      - "asia-southeast1"
+  
+  zone:
+    type: string
+    description: "Google Cloud zone for Compute Engine resources"
+    default: "us-central1-a"
+  
+  # Naming configuration
+  environment:
+    type: string
+    description: "Environment name for resource naming"
+    default: "dev"
+    allowedValues:
+      - "dev"
+      - "staging"
+      - "prod"
+  
+  # BigQuery configuration
+  dataset_location:
+    type: string
+    description: "BigQuery dataset location"
+    default: "US"
+    allowedValues:
+      - "US"
+      - "EU"
+      - "asia-southeast1"
+  
+  # Cloud Composer configuration
+  composer_node_count:
+    type: integer
+    description: "Number of nodes in Cloud Composer environment"
+    default: 3
+    minimum: 3
+    maximum: 10
+  
+  composer_machine_type:
+    type: string
+    description: "Machine type for Cloud Composer nodes"
+    default: "n1-standard-2"
+    allowedValues:
+      - "n1-standard-1"
+      - "n1-standard-2"
+      - "n1-standard-4"
+  
+  composer_disk_size:
+    type: integer
+    description: "Disk size in GB for Cloud Composer nodes"
+    default: 100
+    minimum: 30
+    maximum: 500
+
+resources:
+  # Enable required Google Cloud APIs
+  - name: bigquery-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_id.name)/services/bigquery.googleapis.com
+      project: $(ref.project_id.name)
+    metadata:
+      dependsOn:
+        - project_id
+
+  - name: composer-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_id.name)/services/composer.googleapis.com
+      project: $(ref.project_id.name)
+    metadata:
+      dependsOn:
+        - project_id
+
+  - name: aiplatform-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_id.name)/services/aiplatform.googleapis.com
+      project: $(ref.project_id.name)
+    metadata:
+      dependsOn:
+        - project_id
+
+  - name: monitoring-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_id.name)/services/monitoring.googleapis.com
+      project: $(ref.project_id.name)
+    metadata:
+      dependsOn:
+        - project_id
+
+  - name: storage-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_id.name)/services/storage.googleapis.com
+      project: $(ref.project_id.name)
+    metadata:
+      dependsOn:
+        - project_id
+
+  # Cloud Storage bucket for Composer and ML artifacts
+  - name: optimization-storage-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: query-optimization-$(vars.project_id)-$(vars.environment)
+      project: $(vars.project_id)
+      location: $(vars.region)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              isLive: false
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      labels:
+        purpose: query-optimization
+        environment: $(vars.environment)
+    metadata:
+      dependsOn:
+        - storage-api
+
+  # BigQuery dataset for optimization analytics
+  - name: optimization-dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      datasetId: optimization_analytics_$(vars.environment)
+      projectId: $(vars.project_id)
+      location: $(vars.dataset_location)
+      description: "Dataset for query optimization analytics and monitoring"
+      defaultTableExpirationMs: 2592000000  # 30 days
+      labels:
+        purpose: query-optimization
+        environment: $(vars.environment)
+      access:
+        - role: OWNER
+          userByEmail: $(ref.composer-service-account.email)
+        - role: READER
+          specialGroup: projectReaders
+        - role: WRITER
+          specialGroup: projectWriters
+    metadata:
+      dependsOn:
+        - bigquery-api
+        - composer-service-account
+
+  # Sample sales transactions table for testing optimization
+  - name: sales-transactions-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      tableId: sales_transactions
+      datasetId: $(ref.optimization-dataset.datasetId)
+      projectId: $(vars.project_id)
+      description: "Sample sales transaction data for query optimization testing"
+      schema:
+        fields:
+          - name: transaction_id
+            type: STRING
+            mode: REQUIRED
+            description: "Unique transaction identifier"
+          - name: customer_id
+            type: INTEGER
+            mode: REQUIRED
+            description: "Customer identifier"
+          - name: product_id
+            type: INTEGER
+            mode: REQUIRED
+            description: "Product identifier"
+          - name: amount
+            type: FLOAT
+            mode: REQUIRED
+            description: "Transaction amount"
+          - name: transaction_date
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "Transaction timestamp"
+          - name: channel
+            type: STRING
+            mode: REQUIRED
+            description: "Sales channel (online, retail, mobile)"
+      timePartitioning:
+        type: DAY
+        field: transaction_date
+        requirePartitionFilter: true
+      clustering:
+        fields:
+          - channel
+          - customer_id
+      labels:
+        purpose: sample-data
+        environment: $(vars.environment)
+    metadata:
+      dependsOn:
+        - optimization-dataset
+
+  # Query performance metrics view
+  - name: query-performance-view
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      tableId: query_performance_metrics
+      datasetId: $(ref.optimization-dataset.datasetId)
+      projectId: $(vars.project_id)
+      description: "View for monitoring BigQuery query performance metrics"
+      view:
+        query: |
+          SELECT 
+            job_id,
+            query,
+            creation_time,
+            start_time,
+            end_time,
+            TIMESTAMP_DIFF(end_time, start_time, MILLISECOND) as duration_ms,
+            total_bytes_processed,
+            total_bytes_billed,
+            total_slot_ms,
+            ARRAY_LENGTH(referenced_tables) as table_count,
+            statement_type,
+            cache_hit,
+            error_result
+          FROM `$(vars.project_id).region-$(vars.region).INFORMATION_SCHEMA.JOBS_BY_PROJECT`
+          WHERE 
+            creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+            AND job_type = 'QUERY'
+            AND statement_type IS NOT NULL
+        useLegacySql: false
+      labels:
+        purpose: monitoring
+        environment: $(vars.environment)
+    metadata:
+      dependsOn:
+        - optimization-dataset
+
+  # Optimization recommendations table
+  - name: optimization-recommendations-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      tableId: optimization_recommendations
+      datasetId: $(ref.optimization-dataset.datasetId)
+      projectId: $(vars.project_id)
+      description: "Table for storing AI-generated query optimization recommendations"
+      schema:
+        fields:
+          - name: recommendation_id
+            type: STRING
+            mode: REQUIRED
+            description: "Unique recommendation identifier"
+          - name: query_hash
+            type: STRING
+            mode: REQUIRED
+            description: "Hash of the original query"
+          - name: original_query
+            type: STRING
+            mode: REQUIRED
+            description: "Original query text"
+          - name: optimized_query
+            type: STRING
+            mode: NULLABLE
+            description: "AI-optimized query text"
+          - name: optimization_type
+            type: STRING
+            mode: REQUIRED
+            description: "Type of optimization applied"
+          - name: estimated_improvement_percent
+            type: FLOAT
+            mode: NULLABLE
+            description: "Estimated performance improvement percentage"
+          - name: implementation_status
+            type: STRING
+            mode: REQUIRED
+            description: "Status of optimization implementation"
+          - name: created_timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "Timestamp when recommendation was created"
+          - name: applied_timestamp
+            type: TIMESTAMP
+            mode: NULLABLE
+            description: "Timestamp when optimization was applied"
+      timePartitioning:
+        type: DAY
+        field: created_timestamp
+        requirePartitionFilter: false
+      clustering:
+        fields:
+          - optimization_type
+          - implementation_status
+      labels:
+        purpose: optimization-tracking
+        environment: $(vars.environment)
+    metadata:
+      dependsOn:
+        - optimization-dataset
+
+  # Sales summary materialized view for performance testing
+  - name: sales-summary-materialized-view
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      tableId: sales_summary_mv
+      datasetId: $(ref.optimization-dataset.datasetId)
+      projectId: $(vars.project_id)
+      description: "Materialized view for optimized sales analytics queries"
+      materializedView:
+        query: |
+          SELECT 
+            DATE(transaction_date) as transaction_date,
+            channel,
+            COUNT(*) as transaction_count,
+            SUM(amount) as total_amount,
+            AVG(amount) as avg_amount
+          FROM `$(vars.project_id).$(ref.optimization-dataset.datasetId).sales_transactions`
+          WHERE transaction_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+          GROUP BY DATE(transaction_date), channel
+        enableRefresh: true
+        refreshIntervalMs: 3600000  # Refresh every hour
+      timePartitioning:
+        type: DAY
+        field: transaction_date
+        requirePartitionFilter: false
+      clustering:
+        fields:
+          - channel
+      labels:
+        purpose: optimization
+        environment: $(vars.environment)
+    metadata:
+      dependsOn:
+        - sales-transactions-table
+
+  # Service Account for Cloud Composer
+  - name: composer-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: composer-optimization-sa-$(vars.environment)
+      projectId: $(vars.project_id)
+      serviceAccount:
+        displayName: "Cloud Composer Query Optimization Service Account"
+        description: "Service account for Cloud Composer environment in query optimization pipeline"
+    metadata:
+      dependsOn:
+        - composer-api
+
+  # IAM roles for Composer service account
+  - name: composer-sa-bigquery-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      projectId: $(vars.project_id)
+      policy:
+        bindings:
+          - role: roles/bigquery.admin
+            members:
+              - serviceAccount:$(ref.composer-service-account.email)
+    metadata:
+      dependsOn:
+        - composer-service-account
+
+  - name: composer-sa-storage-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      projectId: $(vars.project_id)
+      policy:
+        bindings:
+          - role: roles/storage.admin
+            members:
+              - serviceAccount:$(ref.composer-service-account.email)
+    metadata:
+      dependsOn:
+        - composer-service-account
+
+  - name: composer-sa-aiplatform-user-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      projectId: $(vars.project_id)
+      policy:
+        bindings:
+          - role: roles/aiplatform.user
+            members:
+              - serviceAccount:$(ref.composer-service-account.email)
+    metadata:
+      dependsOn:
+        - composer-service-account
+
+  - name: composer-sa-monitoring-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      projectId: $(vars.project_id)
+      policy:
+        bindings:
+          - role: roles/monitoring.metricWriter
+            members:
+              - serviceAccount:$(ref.composer-service-account.email)
+    metadata:
+      dependsOn:
+        - composer-service-account
+
+  # Cloud Composer Environment for orchestrating optimization workflows
+  - name: query-optimization-composer-env
+    type: gcp-types/composer-v1:projects.locations.environments
+    properties:
+      parent: projects/$(vars.project_id)/locations/$(vars.region)
+      environmentId: query-optimizer-$(vars.environment)
+      environment:
+        config:
+          nodeConfig:
+            location: projects/$(vars.project_id)/zones/$(vars.zone)
+            machineType: $(vars.composer_machine_type)
+            diskSizeGb: $(vars.composer_disk_size)
+            serviceAccount: $(ref.composer-service-account.email)
+            oauthScopes:
+              - https://www.googleapis.com/auth/cloud-platform
+            tags:
+              - composer-environment
+              - query-optimization
+          nodeCount: $(vars.composer_node_count)
+          softwareConfig:
+            pythonVersion: "3"
+            airflowConfigOverrides:
+              core-dags_are_paused_at_creation: "True"
+              core-max_active_runs_per_dag: "1"
+              scheduler-catchup_by_default: "False"
+            envVariables:
+              PROJECT_ID: $(vars.project_id)
+              DATASET_NAME: $(ref.optimization-dataset.datasetId)
+              BUCKET_NAME: $(ref.optimization-storage-bucket.name)
+              REGION: $(vars.region)
+              ENVIRONMENT: $(vars.environment)
+            pypiPackages:
+              google-cloud-bigquery: ">=3.0.0"
+              google-cloud-aiplatform: ">=1.0.0"
+              google-cloud-monitoring: ">=2.0.0"
+              pandas: ">=1.5.0"
+              scikit-learn: ">=1.1.0"
+          webServerConfig:
+            machineType: composer-n1-webserver-2
+        labels:
+          purpose: query-optimization
+          environment: $(vars.environment)
+    metadata:
+      dependsOn:
+        - composer-api
+        - composer-service-account
+        - optimization-storage-bucket
+        - optimization-dataset
+
+  # Vertex AI Dataset for training optimization models
+  - name: vertex-ai-dataset
+    type: gcp-types/aiplatform-v1:projects.locations.datasets
+    properties:
+      parent: projects/$(vars.project_id)/locations/$(vars.region)
+      dataset:
+        displayName: query-optimization-dataset-$(vars.environment)
+        description: "Dataset for training query optimization ML models"
+        metadataSchemaUri: "gs://google-cloud-aiplatform/schema/dataset/metadata/tabular_1.0.0.yaml"
+        labels:
+          purpose: query-optimization
+          environment: $(vars.environment)
+    metadata:
+      dependsOn:
+        - aiplatform-api
+
+  # Cloud Monitoring Dashboard for query optimization metrics
+  - name: optimization-monitoring-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      parent: projects/$(vars.project_id)
+      dashboard:
+        displayName: "BigQuery Query Optimization Dashboard - $(vars.environment)"
+        mosaicLayout:
+          tiles:
+            - width: 6
+              height: 4
+              widget:
+                title: "Query Performance Trends"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="bigquery_project"'
+                          aggregation:
+                            alignmentPeriod: "300s"
+                            perSeriesAligner: "ALIGN_RATE"
+                            crossSeriesReducer: "REDUCE_SUM"
+                  yAxis:
+                    label: "Query Duration (ms)"
+                    scale: "LINEAR"
+            - width: 6
+              height: 4
+              xPos: 6
+              widget:
+                title: "Optimization Recommendations"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="global"'
+                          aggregation:
+                            alignmentPeriod: "300s"
+                            perSeriesAligner: "ALIGN_RATE"
+            - width: 12
+              height: 4
+              yPos: 4
+              widget:
+                title: "BigQuery Slot Utilization"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="bigquery_project"'
+                          aggregation:
+                            alignmentPeriod: "300s"
+                            perSeriesAligner: "ALIGN_MEAN"
+        labels:
+          purpose: query-optimization
+          environment: $(vars.environment)
+    metadata:
+      dependsOn:
+        - monitoring-api
+
+  # Alert policy for optimization pipeline failures
+  - name: optimization-failure-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(vars.project_id)
+      alertPolicy:
+        displayName: "Query Optimization Pipeline Failures - $(vars.environment)"
+        documentation:
+          content: "Alert when query optimization pipeline experiences failures"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "High failure rate"
+            conditionThreshold:
+              filter: 'resource.type="gce_instance"'
+              comparison: "COMPARISON_GT"
+              thresholdValue: 5
+              duration: "300s"
+              aggregations:
+                - alignmentPeriod: "300s"
+                  perSeriesAligner: "ALIGN_RATE"
+                  crossSeriesReducer: "REDUCE_SUM"
+        combiner: "OR"
+        enabled: true
+        labels:
+          purpose: query-optimization
+          environment: $(vars.environment)
+    metadata:
+      dependsOn:
+        - monitoring-api
+
+# Output values for verification and integration
+outputs:
+  # Project and environment information
+  project_id:
+    description: "Google Cloud Project ID"
+    value: $(vars.project_id)
+  
+  region:
+    description: "Deployment region"
+    value: $(vars.region)
+  
+  environment:
+    description: "Environment name"
+    value: $(vars.environment)
+  
+  # Storage resources
+  storage_bucket_name:
+    description: "Cloud Storage bucket for Composer and ML artifacts"
+    value: $(ref.optimization-storage-bucket.name)
+  
+  storage_bucket_url:
+    description: "Cloud Storage bucket URL"
+    value: "gs://$(ref.optimization-storage-bucket.name)"
+  
+  # BigQuery resources
+  dataset_id:
+    description: "BigQuery dataset ID for optimization analytics"
+    value: $(ref.optimization-dataset.datasetId)
+  
+  dataset_location:
+    description: "BigQuery dataset location"
+    value: $(vars.dataset_location)
+  
+  sales_transactions_table:
+    description: "Sample sales transactions table"
+    value: "$(vars.project_id).$(ref.optimization-dataset.datasetId).sales_transactions"
+  
+  query_performance_view:
+    description: "Query performance monitoring view"
+    value: "$(vars.project_id).$(ref.optimization-dataset.datasetId).query_performance_metrics"
+  
+  optimization_recommendations_table:
+    description: "Optimization recommendations table"
+    value: "$(vars.project_id).$(ref.optimization-dataset.datasetId).optimization_recommendations"
+  
+  sales_summary_materialized_view:
+    description: "Sales summary materialized view"
+    value: "$(vars.project_id).$(ref.optimization-dataset.datasetId).sales_summary_mv"
+  
+  # Cloud Composer resources
+  composer_environment_name:
+    description: "Cloud Composer environment name"
+    value: "query-optimizer-$(vars.environment)"
+  
+  composer_environment_uri:
+    description: "Cloud Composer Airflow web server URI"
+    value: $(ref.query-optimization-composer-env.config.airflowUri)
+  
+  composer_service_account:
+    description: "Cloud Composer service account email"
+    value: $(ref.composer-service-account.email)
+  
+  # Vertex AI resources
+  vertex_ai_dataset:
+    description: "Vertex AI dataset for ML model training"
+    value: $(ref.vertex-ai-dataset.name)
+  
+  # Monitoring resources
+  monitoring_dashboard_name:
+    description: "Cloud Monitoring dashboard name"
+    value: $(ref.optimization-monitoring-dashboard.name)
+  
+  alert_policy_name:
+    description: "Alert policy for optimization failures"
+    value: $(ref.optimization-failure-alert-policy.name)
+  
+  # Access URLs
+  bigquery_console_url:
+    description: "BigQuery console URL for the dataset"
+    value: "https://console.cloud.google.com/bigquery?project=$(vars.project_id)&ws=!1m4!1m3!3m2!1s$(vars.project_id)!2s$(ref.optimization-dataset.datasetId)"
+  
+  composer_console_url:
+    description: "Cloud Composer console URL"
+    value: "https://console.cloud.google.com/composer/environments/detail/$(vars.region)/query-optimizer-$(vars.environment)?project=$(vars.project_id)"
+  
+  monitoring_dashboard_url:
+    description: "Cloud Monitoring dashboard URL"
+    value: "https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.optimization-monitoring-dashboard.name)?project=$(vars.project_id)"
+  
+  # Sample queries for testing
+  sample_test_query:
+    description: "Sample query for testing optimization detection"
+    value: |
+      SELECT *
+      FROM `$(vars.project_id).$(ref.optimization-dataset.datasetId).sales_transactions`
+      WHERE transaction_date >= '2024-01-01'
+      ORDER BY amount DESC
+      LIMIT 100
+  
+  sample_materialized_view_query:
+    description: "Sample query using materialized view"
+    value: |
+      SELECT 
+        transaction_date,
+        channel,
+        transaction_count,
+        total_amount
+      FROM `$(vars.project_id).$(ref.optimization-dataset.datasetId).sales_summary_mv`
+      WHERE transaction_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+      ORDER BY transaction_date DESC

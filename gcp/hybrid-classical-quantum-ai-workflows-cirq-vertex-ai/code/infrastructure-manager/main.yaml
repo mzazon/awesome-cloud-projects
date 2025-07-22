@@ -1,0 +1,593 @@
+# Infrastructure Manager Configuration for Hybrid Classical-Quantum AI Workflows
+# This configuration deploys a complete hybrid quantum-classical portfolio optimization system
+# combining Google's quantum processors with Vertex AI for financial optimization
+terraform:
+  required_version: ">= 1.8.0"
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 6.0"
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 6.0"
+    random:
+      source: "hashicorp/random"
+      version: "~> 3.6"
+
+# Input variables for customization
+variables:
+  project_id:
+    description: "Google Cloud Project ID"
+    type: "string"
+    validation:
+      condition: length(var.project_id) > 6
+      error_message: "Project ID must be at least 6 characters long."
+  
+  region:
+    description: "Primary region for resources deployment"
+    type: "string"
+    default: "us-central1"
+    validation:
+      condition: contains(["us-central1", "us-east1", "us-west1", "europe-west1", "asia-east1"], var.region)
+      error_message: "Region must be one of: us-central1, us-east1, us-west1, europe-west1, asia-east1."
+  
+  zone:
+    description: "Primary zone for compute resources"
+    type: "string"
+    default: "us-central1-a"
+  
+  environment:
+    description: "Environment name (dev, staging, prod)"
+    type: "string"
+    default: "dev"
+    validation:
+      condition: contains(["dev", "staging", "prod"], var.environment)
+      error_message: "Environment must be one of: dev, staging, prod."
+  
+  quantum_processor_access:
+    description: "Enable quantum processor access (requires special approval)"
+    type: "bool"
+    default: false
+  
+  enable_monitoring:
+    description: "Enable Cloud Monitoring and alerting"
+    type: "bool"
+    default: true
+  
+  vertex_ai_machine_type:
+    description: "Machine type for Vertex AI Workbench"
+    type: "string"
+    default: "n1-standard-4"
+  
+  storage_location:
+    description: "Location for Cloud Storage bucket"
+    type: "string"
+    default: "US"
+
+# Local values for resource naming and configuration
+locals:
+  name_prefix = "quantum-portfolio"
+  environment_suffix = var.environment
+  
+  # Resource naming convention
+  bucket_name = "${local.name_prefix}-${random_id.suffix.hex}-${local.environment_suffix}"
+  workbench_name = "${local.name_prefix}-workbench-${random_id.suffix.hex}"
+  function_name = "${local.name_prefix}-optimizer-${random_id.suffix.hex}"
+  service_account_name = "${local.name_prefix}-sa-${random_id.suffix.hex}"
+  
+  # Required APIs for the solution
+  required_apis = [
+    "compute.googleapis.com",
+    "storage.googleapis.com",
+    "cloudfunctions.googleapis.com",
+    "aiplatform.googleapis.com",
+    "notebooks.googleapis.com",
+    "cloudbuild.googleapis.com",
+    "monitoring.googleapis.com",
+    "logging.googleapis.com",
+    "secretmanager.googleapis.com",
+    "eventarc.googleapis.com"
+  ]
+  
+  # IAM roles for the service account
+  iam_roles = [
+    "roles/storage.admin",
+    "roles/aiplatform.user",
+    "roles/notebooks.admin",
+    "roles/cloudfunctions.admin",
+    "roles/monitoring.metricWriter",
+    "roles/logging.logWriter",
+    "roles/secretmanager.secretAccessor",
+    "roles/eventarc.eventReceiver"
+  ]
+  
+  # Labels for resource organization
+  common_labels = {
+    project = "quantum-portfolio-optimization"
+    environment = var.environment
+    component = "hybrid-ai-system"
+    managed_by = "infrastructure-manager"
+  }
+}
+
+# Generate random suffix for unique resource names
+resource "random_id" "suffix":
+  byte_length: 3
+
+# Enable required Google Cloud APIs
+resource "google_project_service" "required_apis":
+  for_each = toset(local.required_apis)
+  project = var.project_id
+  service = each.value
+  
+  disable_dependent_services = false
+  disable_on_destroy = false
+
+# Service account for quantum computing and AI operations
+resource "google_service_account" "quantum_ai_sa":
+  account_id   = local.service_account_name
+  display_name = "Quantum AI Portfolio Optimizer Service Account"
+  description  = "Service account for hybrid quantum-classical portfolio optimization operations"
+  project      = var.project_id
+  
+  depends_on = [google_project_service.required_apis]
+
+# IAM bindings for the service account
+resource "google_project_iam_member" "quantum_ai_permissions":
+  for_each = toset(local.iam_roles)
+  project  = var.project_id
+  role     = each.value
+  member   = "serviceAccount:${google_service_account.quantum_ai_sa.email}"
+  
+  depends_on = [google_service_account.quantum_ai_sa]
+
+# Cloud Storage bucket for data, models, and results
+resource "google_storage_bucket" "quantum_portfolio_bucket":
+  name          = local.bucket_name
+  location      = var.storage_location
+  project       = var.project_id
+  force_destroy = true
+  
+  # Enable versioning for data protection
+  versioning:
+    enabled: true
+  
+  # Lifecycle management for cost optimization
+  lifecycle_rule:
+    - condition:
+        age: 90
+      action:
+        type: "SetStorageClass"
+        storage_class: "NEARLINE"
+    - condition:
+        age: 365
+      action:
+        type: "SetStorageClass"
+        storage_class: "COLDLINE"
+    - condition:
+        age: 2555  # 7 years
+      action:
+        type: "Delete"
+  
+  # Enable uniform bucket-level access
+  uniform_bucket_level_access: true
+  
+  labels = local.common_labels
+  
+  depends_on = [google_project_service.required_apis]
+
+# Storage bucket folders for organization
+resource "google_storage_bucket_object" "bucket_folders":
+  for_each = toset([
+    "scripts/",
+    "models/",
+    "results/",
+    "events/",
+    "visualizations/",
+    "reports/",
+    "portfolio/"
+  ])
+  
+  name    = each.value
+  content = " "  # Empty content for folder markers
+  bucket  = google_storage_bucket.quantum_portfolio_bucket.name
+}
+
+# Vertex AI Workbench instance for quantum development
+resource "google_notebooks_instance" "quantum_workbench":
+  name         = local.workbench_name
+  location     = var.zone
+  project      = var.project_id
+  machine_type = var.vertex_ai_machine_type
+  
+  # Use deep learning container with TensorFlow
+  container_image:
+    repository: "gcr.io/deeplearning-platform-release/tf2-cpu.2-11"
+    tag: "latest"
+  
+  # Attach persistent disk for storage
+  disk_encryption = "CMEK"
+  boot_disk_type  = "PD_SSD"
+  boot_disk_size_gb = 100
+  data_disk_type    = "PD_SSD"
+  data_disk_size_gb = 500
+  
+  # Network configuration
+  no_public_ip    = false
+  no_proxy_access = false
+  network         = "projects/${var.project_id}/global/networks/default"
+  subnet          = "projects/${var.project_id}/regions/${var.region}/subnetworks/default"
+  
+  # Security and access configuration
+  service_account = google_service_account.quantum_ai_sa.email
+  
+  # Enable Shielded VM features
+  shielded_instance_config:
+    enable_integrity_monitoring: true
+    enable_secure_boot: true
+    enable_vtpm: true
+  
+  # Installation script for quantum libraries
+  install_gpu_driver = false
+  custom_gpu_driver_path = ""
+  
+  # Post startup script for quantum environment setup
+  post_startup_script = "gs://${google_storage_bucket.quantum_portfolio_bucket.name}/scripts/setup_quantum_env.py"
+  
+  labels = merge(local.common_labels, {
+    component = "quantum-workbench"
+  })
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_service_account.quantum_ai_sa,
+    google_storage_bucket.quantum_portfolio_bucket
+  ]
+
+# Cloud Function for hybrid workflow orchestration
+resource "google_cloudfunctions2_function" "quantum_optimizer":
+  name        = local.function_name
+  location    = var.region
+  project     = var.project_id
+  description = "Orchestrates hybrid quantum-classical portfolio optimization workflows"
+  
+  build_config:
+    runtime     = "python311"
+    entry_point = "orchestrate_hybrid_workflow"
+    
+    source:
+      storage_source:
+        bucket = google_storage_bucket.quantum_portfolio_bucket.name
+        object = "functions/quantum_orchestrator.zip"
+  
+  service_config:
+    max_instance_count    = 10
+    min_instance_count    = 0
+    available_memory      = "1Gi"
+    timeout_seconds       = 540
+    max_instance_request_concurrency = 1
+    available_cpu         = "1"
+    
+    # Environment variables
+    environment_variables = {
+      PROJECT_ID = var.project_id
+      BUCKET_NAME = google_storage_bucket.quantum_portfolio_bucket.name
+      REGION = var.region
+      QUANTUM_PROCESSOR_ACCESS = tostring(var.quantum_processor_access)
+    }
+    
+    # Service account
+    service_account_email = google_service_account.quantum_ai_sa.email
+    
+    # VPC configuration
+    vpc_connector = null
+    vpc_connector_egress_settings = "PRIVATE_RANGES_ONLY"
+    
+    # Security settings
+    ingress_settings = "ALLOW_ALL"
+    all_traffic_on_latest_revision = true
+  
+  # Event trigger configuration
+  event_trigger:
+    trigger_region = var.region
+    event_type = "google.cloud.storage.object.v1.finalized"
+    retry_policy = "RETRY_POLICY_RETRY"
+    
+    event_filters:
+      - attribute = "bucket"
+        value = google_storage_bucket.quantum_portfolio_bucket.name
+      - attribute = "eventType"
+        value = "google.storage.object.finalize"
+  
+  labels = merge(local.common_labels, {
+    component = "quantum-orchestrator"
+  })
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_service_account.quantum_ai_sa,
+    google_storage_bucket.quantum_portfolio_bucket
+  ]
+
+# Secret Manager secret for quantum processor credentials
+resource "google_secret_manager_secret" "quantum_credentials":
+  count     = var.quantum_processor_access ? 1 : 0
+  secret_id = "${local.name_prefix}-quantum-creds-${random_id.suffix.hex}"
+  project   = var.project_id
+  
+  replication:
+    auto: {}
+  
+  labels = merge(local.common_labels, {
+    component = "quantum-security"
+  })
+  
+  depends_on = [google_project_service.required_apis]
+
+# Secret version for quantum processor credentials
+resource "google_secret_manager_secret_version" "quantum_credentials_version":
+  count   = var.quantum_processor_access ? 1 : 0
+  secret  = google_secret_manager_secret.quantum_credentials[0].id
+  
+  secret_data = jsonencode({
+    processor_id = "rainbow"  # Example quantum processor ID
+    project_id = var.project_id
+    # Note: Actual credentials should be added manually after deployment
+  })
+}
+
+# Cloud Monitoring alert policy for quantum optimization failures
+resource "google_monitoring_alert_policy" "quantum_optimization_failures":
+  count               = var.enable_monitoring ? 1 : 0
+  display_name        = "Quantum Optimization Failures"
+  project             = var.project_id
+  combiner            = "OR"
+  enabled             = true
+  notification_channels = []
+  
+  documentation:
+    content = "Alert triggered when quantum optimization function fails repeatedly"
+    mime_type = "text/markdown"
+  
+  conditions:
+    - display_name = "Function execution failures"
+      condition_threshold:
+        filter = "resource.type=\"cloud_function\" AND resource.labels.function_name=\"${local.function_name}\" AND metric.type=\"cloudfunctions.googleapis.com/function/execution_count\" AND metric.labels.status!=\"ok\""
+        duration = "300s"
+        comparison = "COMPARISON_GREATER_THAN"
+        threshold_value = 5
+        
+        aggregations:
+          - alignment_period = "300s"
+            per_series_aligner = "ALIGN_RATE"
+            cross_series_reducer = "REDUCE_SUM"
+            group_by_fields = ["resource.label.function_name"]
+  
+  alert_strategy:
+    auto_close = "86400s"  # 24 hours
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_cloudfunctions2_function.quantum_optimizer
+  ]
+
+# Cloud Monitoring dashboard for quantum AI metrics
+resource "google_monitoring_dashboard" "quantum_ai_dashboard":
+  count          = var.enable_monitoring ? 1 : 0
+  project        = var.project_id
+  dashboard_json = jsonencode({
+    displayName = "Quantum AI Portfolio Optimization Dashboard"
+    mosaicLayout = {
+      tiles = [
+        {
+          width = 6
+          height = 4
+          widget = {
+            title = "Function Execution Count"
+            xyChart = {
+              dataSets = [{
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "resource.type=\"cloud_function\" AND resource.labels.function_name=\"${local.function_name}\" AND metric.type=\"cloudfunctions.googleapis.com/function/execution_count\""
+                    aggregation = {
+                      alignmentPeriod = "300s"
+                      perSeriesAligner = "ALIGN_RATE"
+                      crossSeriesReducer = "REDUCE_SUM"
+                    }
+                  }
+                }
+                plotType = "LINE"
+              }]
+              yAxis = {
+                label = "Executions/sec"
+                scale = "LINEAR"
+              }
+            }
+          }
+        },
+        {
+          width = 6
+          height = 4
+          xPos = 6
+          widget = {
+            title = "Storage Bucket Usage"
+            xyChart = {
+              dataSets = [{
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "resource.type=\"gcs_bucket\" AND resource.labels.bucket_name=\"${local.bucket_name}\" AND metric.type=\"storage.googleapis.com/storage/total_bytes\""
+                    aggregation = {
+                      alignmentPeriod = "3600s"
+                      perSeriesAligner = "ALIGN_MEAN"
+                    }
+                  }
+                }
+                plotType = "LINE"
+              }]
+              yAxis = {
+                label = "Bytes"
+                scale = "LINEAR"
+              }
+            }
+          }
+        },
+        {
+          width = 12
+          height = 4
+          yPos = 4
+          widget = {
+            title = "Vertex AI Workbench CPU Usage"
+            xyChart = {
+              dataSets = [{
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "resource.type=\"gce_instance\" AND resource.labels.instance_name=\"${local.workbench_name}\" AND metric.type=\"compute.googleapis.com/instance/cpu/utilization\""
+                    aggregation = {
+                      alignmentPeriod = "300s"
+                      perSeriesAligner = "ALIGN_MEAN"
+                    }
+                  }
+                }
+                plotType = "LINE"
+              }]
+              yAxis = {
+                label = "CPU Utilization"
+                scale = "LINEAR"
+              }
+            }
+          }
+        }
+      ]
+    }
+  })
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_notebooks_instance.quantum_workbench,
+    google_storage_bucket.quantum_portfolio_bucket
+  ]
+
+# IAM binding for Cloud Function to access storage
+resource "google_storage_bucket_iam_member" "function_storage_access":
+  bucket = google_storage_bucket.quantum_portfolio_bucket.name
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${google_service_account.quantum_ai_sa.email}"
+  
+  depends_on = [
+    google_storage_bucket.quantum_portfolio_bucket,
+    google_service_account.quantum_ai_sa
+  ]
+
+# Network firewall rule for Vertex AI Workbench access
+resource "google_compute_firewall" "workbench_access":
+  name    = "${local.name_prefix}-workbench-access-${random_id.suffix.hex}"
+  network = "default"
+  project = var.project_id
+  
+  description = "Allow access to Vertex AI Workbench for quantum development"
+  
+  allow:
+    - protocol = "tcp"
+      ports    = ["8080", "8888", "9090"]
+  
+  source_ranges = ["0.0.0.0/0"]  # Restrict this in production
+  target_tags   = ["notebook-instance"]
+  
+  depends_on = [google_project_service.required_apis]
+
+# Output values for integration and verification
+outputs:
+  project_id:
+    description: "The project ID where resources are deployed"
+    value: var.project_id
+  
+  bucket_name:
+    description: "Name of the Cloud Storage bucket for quantum portfolio data"
+    value: google_storage_bucket.quantum_portfolio_bucket.name
+  
+  bucket_url:
+    description: "URL of the Cloud Storage bucket"
+    value: google_storage_bucket.quantum_portfolio_bucket.url
+  
+  workbench_name:
+    description: "Name of the Vertex AI Workbench instance"
+    value: google_notebooks_instance.quantum_workbench.name
+  
+  workbench_proxy_uri:
+    description: "Proxy URI for accessing the Vertex AI Workbench"
+    value: google_notebooks_instance.quantum_workbench.proxy_uri
+  
+  function_name:
+    description: "Name of the quantum optimization Cloud Function"
+    value: google_cloudfunctions2_function.quantum_optimizer.name
+  
+  function_uri:
+    description: "URI of the quantum optimization Cloud Function"
+    value: google_cloudfunctions2_function.quantum_optimizer.service_config[0].uri
+  
+  service_account_email:
+    description: "Email of the service account for quantum AI operations"
+    value: google_service_account.quantum_ai_sa.email
+  
+  quantum_credentials_secret:
+    description: "Secret Manager secret for quantum processor credentials"
+    value: var.quantum_processor_access ? google_secret_manager_secret.quantum_credentials[0].secret_id : "Not created - quantum processor access disabled"
+  
+  monitoring_dashboard:
+    description: "Cloud Monitoring dashboard for quantum AI metrics"
+    value: var.enable_monitoring ? "https://console.cloud.google.com/monitoring/dashboards/custom/${google_monitoring_dashboard.quantum_ai_dashboard[0].id}?project=${var.project_id}" : "Not created - monitoring disabled"
+  
+  setup_instructions:
+    description: "Next steps for completing the quantum AI setup"
+    value: <<-EOT
+      1. Access Vertex AI Workbench: ${google_notebooks_instance.quantum_workbench.proxy_uri}
+      2. Upload quantum computing scripts to: gs://${google_storage_bucket.quantum_portfolio_bucket.name}/scripts/
+      3. Configure quantum processor credentials in Secret Manager (if enabled)
+      4. Test the system by triggering the Cloud Function
+      5. Monitor performance through the Cloud Monitoring dashboard
+    EOT
+  
+  cost_estimation:
+    description: "Estimated monthly costs for the infrastructure"
+    value: <<-EOT
+      Estimated monthly costs (USD):
+      - Vertex AI Workbench (n1-standard-4, running 24/7): ~$100-150
+      - Cloud Storage (100GB): ~$2-5
+      - Cloud Functions (1000 executions): ~$0.40
+      - Quantum processor access (if enabled): Variable, contact Google Cloud
+      - Total estimated: $102-155 (excluding quantum processor costs)
+      
+      Note: Costs vary based on usage patterns and current pricing.
+      Consider using preemptible instances and storage lifecycle policies to optimize costs.
+    EOT
+
+# Deployment metadata
+metadata:
+  version: "1.0"
+  description: "Infrastructure Manager configuration for hybrid quantum-classical AI portfolio optimization"
+  author: "Generated by Infrastructure Manager for GCP recipes"
+  last_updated: "2025-01-12"
+  
+  # Architecture components
+  components:
+    - "Google Quantum Computing Service integration"
+    - "Vertex AI Workbench for quantum development"
+    - "Cloud Functions for workflow orchestration"
+    - "Cloud Storage for data and model persistence"
+    - "Secret Manager for secure credential storage"
+    - "Cloud Monitoring for observability"
+  
+  # Security considerations
+  security_features:
+    - "Service account with least privilege access"
+    - "Uniform bucket-level access for Cloud Storage"
+    - "Shielded VM for Vertex AI Workbench"
+    - "Secret Manager for credential protection"
+    - "VPC-based network isolation"
+  
+  # Compliance and governance
+  compliance:
+    - "Resource labeling for cost allocation"
+    - "Monitoring and alerting for operational oversight"
+    - "Data lifecycle management for cost optimization"
+    - "Audit logging for security compliance"

@@ -1,0 +1,717 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for Chatbot Development with Amazon Lex V2, Lambda, and DynamoDB'
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'customer-service-bot'
+    Description: 'Name prefix for all resources'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+    MinLength: 3
+    MaxLength: 50
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'test', 'staging', 'prod']
+    Description: 'Environment name for resource tagging and naming'
+
+  LexIdleSessionTTL:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 86400
+    Description: 'Idle session timeout in seconds (1 minute to 24 hours)'
+
+  LexConfidenceThreshold:
+    Type: Number
+    Default: 0.7
+    MinValue: 0.1
+    MaxValue: 1.0
+    Description: 'NLU intent confidence threshold (0.1 to 1.0)'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    Description: 'Lambda function timeout in seconds'
+
+  DynamoDBBillingMode:
+    Type: String
+    Default: 'PAY_PER_REQUEST'
+    AllowedValues: ['PAY_PER_REQUEST', 'PROVISIONED']
+    Description: 'DynamoDB billing mode'
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for notifications (optional)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+Conditions:
+  CreateNotifications: !Not [!Equals [!Ref NotificationEmail, '']]
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+
+  # ------------------------------------------------------------------------------
+  # IAM Roles and Policies
+  # ------------------------------------------------------------------------------
+  
+  # IAM Role for Amazon Lex Service
+  LexServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-lex-service-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lexv2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonLexFullAccess'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lex-service-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Lex service execution role'
+
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                Resource: !GetAtt OrdersTable.Arn
+        - PolicyName: S3ReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !GetAtt ProductCatalogBucket.Arn
+                  - !Sub '${ProductCatalogBucket}/*'
+        - PolicyName: SNSPublishAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !If
+                  - CreateNotifications
+                  - !Ref NotificationTopic
+                  - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Lambda function execution role'
+
+  # ------------------------------------------------------------------------------
+  # DynamoDB Table
+  # ------------------------------------------------------------------------------
+  
+  # DynamoDB table for storing customer order information
+  OrdersTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: !Sub '${ProjectName}-orders-${Environment}'
+      BillingMode: !Ref DynamoDBBillingMode
+      AttributeDefinitions:
+        - AttributeName: OrderId
+          AttributeType: S
+        - AttributeName: CustomerEmail
+          AttributeType: S
+      KeySchema:
+        - AttributeName: OrderId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: CustomerEmailIndex
+          KeySchema:
+            - AttributeName: CustomerEmail
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-orders-table'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Store customer order information for chatbot queries'
+
+  # ------------------------------------------------------------------------------
+  # S3 Bucket
+  # ------------------------------------------------------------------------------
+  
+  # S3 bucket for product catalog data
+  ProductCatalogBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${ProjectName}-product-catalog-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: !If [IsProduction, 'Enabled', 'Suspended']
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-product-catalog'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Store product catalog data for chatbot queries'
+
+  # ------------------------------------------------------------------------------
+  # SNS Topic (Conditional)
+  # ------------------------------------------------------------------------------
+  
+  # SNS topic for notifications
+  NotificationTopic:
+    Type: 'AWS::SNS::Topic'
+    Condition: CreateNotifications
+    Properties:
+      TopicName: !Sub '${ProjectName}-notifications-${Environment}'
+      DisplayName: 'Customer Service Bot Notifications'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-notifications'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Send notifications for chatbot events'
+
+  # SNS subscription for email notifications
+  NotificationSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Condition: CreateNotifications
+    Properties:
+      Protocol: email
+      TopicArn: !Ref NotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # ------------------------------------------------------------------------------
+  # Lambda Function
+  # ------------------------------------------------------------------------------
+  
+  # Lambda function for Lex fulfillment
+  LexFulfillmentFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-lex-fulfillment-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          ORDERS_TABLE_NAME: !Ref OrdersTable
+          PRODUCTS_BUCKET_NAME: !Ref ProductCatalogBucket
+          NOTIFICATION_TOPIC_ARN: !If
+            - CreateNotifications
+            - !Ref NotificationTopic
+            - ''
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from typing import Dict, Any, Optional
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize AWS clients
+          dynamodb = boto3.resource('dynamodb')
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+
+          # Environment variables
+          ORDERS_TABLE_NAME = os.environ['ORDERS_TABLE_NAME']
+          PRODUCTS_BUCKET_NAME = os.environ['PRODUCTS_BUCKET_NAME']
+          NOTIFICATION_TOPIC_ARN = os.environ.get('NOTIFICATION_TOPIC_ARN', '')
+          ENVIRONMENT = os.environ.get('ENVIRONMENT', 'dev')
+
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              Main Lambda handler for Amazon Lex fulfillment.
+              
+              Args:
+                  event: Lex event data containing intent and slot information
+                  context: Lambda context object
+                  
+              Returns:
+                  Lex response format with session state and messages
+              """
+              logger.info(f"Received event: {json.dumps(event, default=str)}")
+              
+              try:
+                  intent_name = event['sessionState']['intent']['name']
+                  
+                  # Route to appropriate intent handler
+                  if intent_name == 'ProductInformation':
+                      return handle_product_information(event)
+                  elif intent_name == 'OrderStatus':
+                      return handle_order_status(event)
+                  elif intent_name == 'SupportRequest':
+                      return handle_support_request(event)
+                  else:
+                      return close_intent(event, "I'm sorry, I don't understand that request. Please try asking about our products, checking an order status, or requesting support.")
+                      
+              except Exception as e:
+                  logger.error(f"Error processing request: {str(e)}")
+                  return close_intent(event, "I'm experiencing technical difficulties. Please try again in a moment or contact our support team directly.")
+
+          def handle_product_information(event: Dict[str, Any]) -> Dict[str, Any]:
+              """Handle product information requests."""
+              slots = event['sessionState']['intent']['slots']
+              product_type = get_slot_value(slots, 'ProductType')
+              
+              if not product_type:
+                  return elicit_slot(event, 'ProductType', 
+                                   "What type of product are you interested in? We have electronics, clothing, and books available.")
+              
+              # Product information database
+              product_info = {
+                  'electronics': "Our electronics collection includes the latest smartphones, laptops, tablets, and smart home devices. Prices range from $50 to $2,000 with free shipping on orders over $100.",
+                  'clothing': "Our clothing line features casual wear, business attire, and seasonal collections. We offer sizes from XS to XXL with a satisfaction guarantee.",
+                  'books': "Our book selection spans fiction, non-fiction, educational materials, and e-books. Most titles are priced between $10-$30 with digital options available."
+              }
+              
+              response_text = product_info.get(product_type.lower())
+              if not response_text:
+                  response_text = f"I don't have specific information about {product_type}. Our main categories are electronics, clothing, and books. Would you like to know about any of these?"
+              
+              return close_intent(event, response_text)
+
+          def handle_order_status(event: Dict[str, Any]) -> Dict[str, Any]:
+              """Handle order status inquiries."""
+              slots = event['sessionState']['intent']['slots']
+              order_id = get_slot_value(slots, 'OrderNumber')
+              
+              if not order_id:
+                  return elicit_slot(event, 'OrderNumber', 
+                                   "Please provide your order number so I can check the status for you.")
+              
+              try:
+                  # Query DynamoDB for order information
+                  table = dynamodb.Table(ORDERS_TABLE_NAME)
+                  response = table.get_item(Key={'OrderId': order_id})
+                  
+                  if 'Item' in response:
+                      order = response['Item']
+                      status = order.get('Status', 'Unknown')
+                      
+                      status_text = f"Order {order_id} is currently {status}."
+                      
+                      if 'EstimatedDelivery' in order:
+                          status_text += f" Estimated delivery date: {order['EstimatedDelivery']}."
+                      
+                      if status.lower() == 'shipped' and 'TrackingNumber' in order:
+                          status_text += f" Tracking number: {order['TrackingNumber']}."
+                      
+                      # Send notification if configured
+                      if NOTIFICATION_TOPIC_ARN:
+                          send_notification(f"Order status check for {order_id}: {status}")
+                      
+                  else:
+                      status_text = f"I couldn't find an order with number {order_id}. Please double-check the order number and try again, or contact customer support if you continue to have issues."
+                      
+              except Exception as e:
+                  logger.error(f"Error querying order status: {str(e)}")
+                  status_text = "I'm having trouble accessing order information right now. Please try again in a moment or contact our customer support team directly."
+              
+              return close_intent(event, status_text)
+
+          def handle_support_request(event: Dict[str, Any]) -> Dict[str, Any]:
+              """Handle support escalation requests."""
+              response_text = (
+                  "I'll help you get connected with our support team. "
+                  "You can reach us by:\n"
+                  "• Email: support@company.com\n"
+                  "• Phone: 1-800-SUPPORT (available 24/7)\n"
+                  "• Live chat on our website\n\n"
+                  "For urgent issues, please call our support line. A representative will assist you promptly."
+              )
+              
+              # Send notification about support request
+              if NOTIFICATION_TOPIC_ARN:
+                  send_notification("Customer requested human support assistance")
+              
+              return close_intent(event, response_text)
+
+          def get_slot_value(slots: Dict[str, Any], slot_name: str) -> Optional[str]:
+              """Extract slot value from Lex slots structure."""
+              slot = slots.get(slot_name, {})
+              if slot and 'value' in slot:
+                  return slot['value'].get('interpretedValue')
+              return None
+
+          def elicit_slot(event: Dict[str, Any], slot_name: str, message: str) -> Dict[str, Any]:
+              """Return response to elicit a specific slot value."""
+              return {
+                  'sessionState': {
+                      'dialogAction': {
+                          'type': 'ElicitSlot',
+                          'slotToElicit': slot_name
+                      },
+                      'intent': event['sessionState']['intent'],
+                      'originatingRequestId': event.get('requestAttributes', {}).get('x-amz-lex:request-id')
+                  },
+                  'messages': [
+                      {
+                          'contentType': 'PlainText',
+                          'content': message
+                      }
+                  ]
+              }
+
+          def close_intent(event: Dict[str, Any], message: str) -> Dict[str, Any]:
+              """Return response to close the intent with a message."""
+              return {
+                  'sessionState': {
+                      'dialogAction': {
+                          'type': 'Close'
+                      },
+                      'intent': {
+                          'name': event['sessionState']['intent']['name'],
+                          'state': 'Fulfilled'
+                      },
+                      'originatingRequestId': event.get('requestAttributes', {}).get('x-amz-lex:request-id')
+                  },
+                  'messages': [
+                      {
+                          'contentType': 'PlainText',
+                          'content': message
+                      }
+                  ]
+              }
+
+          def send_notification(message: str) -> None:
+              """Send notification via SNS if configured."""
+              if NOTIFICATION_TOPIC_ARN:
+                  try:
+                      sns.publish(
+                          TopicArn=NOTIFICATION_TOPIC_ARN,
+                          Message=message,
+                          Subject=f'Customer Service Bot Notification - {ENVIRONMENT}'
+                      )
+                  except Exception as e:
+                      logger.error(f"Failed to send notification: {str(e)}")
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lex-fulfillment'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Process Lex intent fulfillment and business logic'
+
+  # Lambda permission for Lex to invoke the function
+  LexInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref LexFulfillmentFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: lexv2.amazonaws.com
+      SourceArn: !Sub 'arn:aws:lex:${AWS::Region}:${AWS::AccountId}:bot-alias/*'
+
+  # ------------------------------------------------------------------------------
+  # CloudWatch Log Groups
+  # ------------------------------------------------------------------------------
+  
+  # CloudWatch Log Group for Lambda function
+  LambdaLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LexFulfillmentFunction}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Lambda function execution logs'
+
+  # ------------------------------------------------------------------------------
+  # Sample Data Creation (Custom Resource)
+  # ------------------------------------------------------------------------------
+  
+  # Custom resource to populate sample data
+  SampleDataFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-sample-data-${Environment}'
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          from datetime import datetime, timedelta
+
+          def handler(event, context):
+              dynamodb = boto3.resource('dynamodb')
+              
+              try:
+                  if event['RequestType'] == 'Create':
+                      table_name = event['ResourceProperties']['TableName']
+                      table = dynamodb.Table(table_name)
+                      
+                      # Sample order data
+                      sample_orders = [
+                          {
+                              'OrderId': 'ORD123456',
+                              'Status': 'Shipped',
+                              'EstimatedDelivery': (datetime.now() + timedelta(days=2)).strftime('%Y-%m-%d'),
+                              'CustomerEmail': 'customer1@example.com',
+                              'TrackingNumber': 'TRK789012345',
+                              'OrderTotal': '299.99'
+                          },
+                          {
+                              'OrderId': 'ORD789012',
+                              'Status': 'Processing',
+                              'EstimatedDelivery': (datetime.now() + timedelta(days=5)).strftime('%Y-%m-%d'),
+                              'CustomerEmail': 'customer2@example.com',
+                              'OrderTotal': '149.99'
+                          },
+                          {
+                              'OrderId': 'ORD345678',
+                              'Status': 'Delivered',
+                              'EstimatedDelivery': (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d'),
+                              'CustomerEmail': 'customer3@example.com',
+                              'OrderTotal': '79.99'
+                          }
+                      ]
+                      
+                      # Insert sample data
+                      for order in sample_orders:
+                          table.put_item(Item=order)
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  SampleDataResource:
+    Type: 'Custom::SampleData'
+    Properties:
+      ServiceToken: !GetAtt SampleDataFunction.Arn
+      TableName: !Ref OrdersTable
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+Outputs:
+  
+  # Project Information
+  ProjectName:
+    Description: 'Project name used for resource naming'
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectName'
+
+  Environment:
+    Description: 'Environment name'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+  # DynamoDB Table
+  OrdersTableName:
+    Description: 'Name of the DynamoDB table for customer orders'
+    Value: !Ref OrdersTable
+    Export:
+      Name: !Sub '${AWS::StackName}-OrdersTableName'
+
+  OrdersTableArn:
+    Description: 'ARN of the DynamoDB table for customer orders'
+    Value: !GetAtt OrdersTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OrdersTableArn'
+
+  # S3 Bucket
+  ProductCatalogBucketName:
+    Description: 'Name of the S3 bucket for product catalog'
+    Value: !Ref ProductCatalogBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ProductCatalogBucketName'
+
+  ProductCatalogBucketArn:
+    Description: 'ARN of the S3 bucket for product catalog'
+    Value: !GetAtt ProductCatalogBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ProductCatalogBucketArn'
+
+  # Lambda Function
+  LexFulfillmentFunctionName:
+    Description: 'Name of the Lambda function for Lex fulfillment'
+    Value: !Ref LexFulfillmentFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LexFulfillmentFunctionName'
+
+  LexFulfillmentFunctionArn:
+    Description: 'ARN of the Lambda function for Lex fulfillment'
+    Value: !GetAtt LexFulfillmentFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LexFulfillmentFunctionArn'
+
+  # IAM Roles
+  LexServiceRoleArn:
+    Description: 'ARN of the IAM role for Lex service'
+    Value: !GetAtt LexServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LexServiceRoleArn'
+
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the IAM role for Lambda execution'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  # SNS Topic (Conditional)
+  NotificationTopicArn:
+    Condition: CreateNotifications
+    Description: 'ARN of the SNS topic for notifications'
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopicArn'
+
+  # Next Steps
+  NextSteps:
+    Description: 'Next steps to complete the Lex bot setup'
+    Value: !Sub |
+      1. Create Amazon Lex V2 bot using the provided service role: ${LexServiceRole}
+      2. Configure bot intents and slot types as described in the recipe
+      3. Set up fulfillment using Lambda function: ${LexFulfillmentFunction}
+      4. Test the bot using the sample data in DynamoDB table: ${OrdersTable}
+      5. Deploy to production and integrate with your preferred channels
+
+  # Configuration Information
+  LexBotConfiguration:
+    Description: 'Configuration information for creating the Lex bot'
+    Value: !Sub |
+      Bot Name: ${ProjectName}-${Environment}
+      Service Role ARN: ${LexServiceRole}
+      Lambda Function ARN: ${LexFulfillmentFunction}
+      Confidence Threshold: ${LexConfidenceThreshold}
+      Session TTL: ${LexIdleSessionTTL} seconds
+      
+  SampleOrderIds:
+    Description: 'Sample order IDs for testing'
+    Value: 'ORD123456 (Shipped), ORD789012 (Processing), ORD345678 (Delivered)'
+
+# ==============================================================================
+# METADATA
+# ==============================================================================
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: 'Project Configuration'
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: 'Lex Bot Configuration'
+        Parameters:
+          - LexIdleSessionTTL
+          - LexConfidenceThreshold
+      - Label:
+          default: 'Lambda Configuration'
+        Parameters:
+          - LambdaTimeout
+      - Label:
+          default: 'DynamoDB Configuration'
+        Parameters:
+          - DynamoDBBillingMode
+      - Label:
+          default: 'Notifications (Optional)'
+        Parameters:
+          - NotificationEmail
+    ParameterLabels:
+      ProjectName:
+        default: 'Project Name'
+      Environment:
+        default: 'Environment'
+      LexIdleSessionTTL:
+        default: 'Lex Session Timeout (seconds)'
+      LexConfidenceThreshold:
+        default: 'NLU Confidence Threshold'
+      LambdaTimeout:
+        default: 'Lambda Timeout (seconds)'
+      DynamoDBBillingMode:
+        default: 'DynamoDB Billing Mode'
+      NotificationEmail:
+        default: 'Notification Email'
+
+  'AWS::CloudFormation::Designer':
+    Description: 'CloudFormation template for Amazon Lex chatbot with Lambda fulfillment and DynamoDB integration'

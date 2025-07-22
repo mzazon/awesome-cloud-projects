@@ -1,0 +1,1189 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Automated Data Quality Pipeline with AWS Glue DataBrew and EventBridge - Complete infrastructure for data quality monitoring and automated remediation workflows'
+
+# ==========================================================================
+# METADATA
+# ==========================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+          - ResourceNamingPrefix
+      - Label:
+          default: "Data Configuration"
+        Parameters:
+          - DataBucketName
+          - DataSourcePrefix
+          - QualityReportsPrefix
+          - QuarantinePrefix
+      - Label:
+          default: "DataBrew Configuration"
+        Parameters:
+          - DataBrewJobMaxCapacity
+          - DataBrewJobTimeout
+          - DatasetFormat
+      - Label:
+          default: "Quality Rules Configuration"
+        Parameters:
+          - EmailValidationThreshold
+          - AgeValidationThreshold
+          - CompletenessThreshold
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+          - EnableSNSNotifications
+    ParameterLabels:
+      Environment:
+        default: "Deployment Environment"
+      ProjectName:
+        default: "Project Name"
+      ResourceNamingPrefix:
+        default: "Resource Naming Prefix"
+      DataBucketName:
+        default: "Data Storage Bucket Name"
+      DataSourcePrefix:
+        default: "Raw Data S3 Prefix"
+      QualityReportsPrefix:
+        default: "Quality Reports S3 Prefix"
+      QuarantinePrefix:
+        default: "Quarantine Data S3 Prefix"
+      DataBrewJobMaxCapacity:
+        default: "DataBrew Job Max Capacity"
+      DataBrewJobTimeout:
+        default: "DataBrew Job Timeout (minutes)"
+      DatasetFormat:
+        default: "Dataset Format"
+      EmailValidationThreshold:
+        default: "Email Validation Threshold (%)"
+      AgeValidationThreshold:
+        default: "Age Validation Threshold (%)"
+      CompletenessThreshold:
+        default: "Completeness Threshold (%)"
+      NotificationEmail:
+        default: "Notification Email Address"
+      EnableSNSNotifications:
+        default: "Enable SNS Notifications"
+
+# ==========================================================================
+# PARAMETERS
+# ==========================================================================
+Parameters:
+  Environment:
+    Type: String
+    Default: 'development'
+    AllowedValues: ['development', 'staging', 'production']
+    Description: 'Environment for deployment (development, staging, production)'
+    ConstraintDescription: 'Must be one of development, staging, or production'
+
+  ProjectName:
+    Type: String
+    Default: 'DataQualityPipeline'
+    Description: 'Name of the project for resource tagging and naming'
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '[A-Za-z][A-Za-z0-9]*'
+    ConstraintDescription: 'Must begin with a letter and contain only alphanumeric characters'
+
+  ResourceNamingPrefix:
+    Type: String
+    Default: 'dq-pipeline'
+    Description: 'Prefix for resource naming (lowercase, hyphens allowed)'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '[a-z][a-z0-9-]*'
+    ConstraintDescription: 'Must begin with lowercase letter and contain only lowercase letters, numbers, and hyphens'
+
+  DataBucketName:
+    Type: String
+    Description: 'Name of the S3 bucket for data storage (leave empty for auto-generated name)'
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be a valid S3 bucket name or empty for auto-generation'
+
+  DataSourcePrefix:
+    Type: String
+    Default: 'raw-data'
+    Description: 'S3 prefix for raw data files'
+    AllowedPattern: '^[a-zA-Z0-9][a-zA-Z0-9-/]*[a-zA-Z0-9]$'
+    ConstraintDescription: 'Must be a valid S3 prefix'
+
+  QualityReportsPrefix:
+    Type: String
+    Default: 'quality-reports'
+    Description: 'S3 prefix for quality assessment reports'
+    AllowedPattern: '^[a-zA-Z0-9][a-zA-Z0-9-/]*[a-zA-Z0-9]$'
+    ConstraintDescription: 'Must be a valid S3 prefix'
+
+  QuarantinePrefix:
+    Type: String
+    Default: 'quarantine'
+    Description: 'S3 prefix for quarantined data files'
+    AllowedPattern: '^[a-zA-Z0-9][a-zA-Z0-9-/]*[a-zA-Z0-9]$'
+    ConstraintDescription: 'Must be a valid S3 prefix'
+
+  DataBrewJobMaxCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 100
+    Description: 'Maximum number of nodes for DataBrew profile jobs'
+    ConstraintDescription: 'Must be between 1 and 100'
+
+  DataBrewJobTimeout:
+    Type: Number
+    Default: 120
+    MinValue: 30
+    MaxValue: 2880
+    Description: 'Timeout for DataBrew profile jobs in minutes'
+    ConstraintDescription: 'Must be between 30 and 2880 minutes'
+
+  DatasetFormat:
+    Type: String
+    Default: 'CSV'
+    AllowedValues: ['CSV', 'JSON', 'PARQUET']
+    Description: 'Format of the dataset files'
+    ConstraintDescription: 'Must be one of CSV, JSON, or PARQUET'
+
+  EmailValidationThreshold:
+    Type: Number
+    Default: 90.0
+    MinValue: 0.0
+    MaxValue: 100.0
+    Description: 'Minimum percentage of valid emails required'
+    ConstraintDescription: 'Must be between 0.0 and 100.0'
+
+  AgeValidationThreshold:
+    Type: Number
+    Default: 95.0
+    MinValue: 0.0
+    MaxValue: 100.0
+    Description: 'Minimum percentage of valid ages required'
+    ConstraintDescription: 'Must be between 0.0 and 100.0'
+
+  CompletenessThreshold:
+    Type: Number
+    Default: 90.0
+    MinValue: 0.0
+    MaxValue: 100.0
+    Description: 'Minimum percentage of complete records required'
+    ConstraintDescription: 'Must be between 0.0 and 100.0'
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for data quality alerts (leave empty to disable notifications)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+  EnableSNSNotifications:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable SNS notifications for data quality alerts'
+    ConstraintDescription: 'Must be true or false'
+
+# ==========================================================================
+# CONDITIONS
+# ==========================================================================
+Conditions:
+  # Bucket naming condition
+  CreateBucketName: !Equals [!Ref DataBucketName, '']
+  
+  # Environment-specific conditions
+  IsProduction: !Equals [!Ref Environment, 'production']
+  IsStaging: !Equals [!Ref Environment, 'staging']
+  IsDevelopment: !Equals [!Ref Environment, 'development']
+  
+  # Feature flags
+  EnableNotifications: !And 
+    - !Equals [!Ref EnableSNSNotifications, 'true']
+    - !Not [!Equals [!Ref NotificationEmail, '']]
+  
+  # Data format conditions
+  IsCSVFormat: !Equals [!Ref DatasetFormat, 'CSV']
+  IsJSONFormat: !Equals [!Ref DatasetFormat, 'JSON']
+  IsParquetFormat: !Equals [!Ref DatasetFormat, 'PARQUET']
+
+# ==========================================================================
+# RESOURCES
+# ==========================================================================
+Resources:
+  # --------------------------------------------------------------------------
+  # S3 BUCKET FOR DATA STORAGE
+  # --------------------------------------------------------------------------
+  DataQualityBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - CreateBucketName
+        - !Sub '${ResourceNamingPrefix}-${AWS::AccountId}-${AWS::Region}'
+        - !Ref DataBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: 'QualityReportsLifecycle'
+            Status: Enabled
+            Filter:
+              Prefix: !Sub '${QualityReportsPrefix}/'
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+          - Id: 'QuarantineLifecycle'
+            Status: Enabled
+            Filter:
+              Prefix: !Sub '${QuarantinePrefix}/'
+            Transitions:
+              - TransitionInDays: 7
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 30
+                StorageClass: GLACIER
+            ExpirationInDays: 365
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: !Sub '${DataSourcePrefix}/'
+            Function: !GetAtt DataIngestionTriggerFunction.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DataQuality-Bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Data Quality Pipeline Storage'
+
+  # --------------------------------------------------------------------------
+  # IAM ROLES AND POLICIES
+  # --------------------------------------------------------------------------
+  DataBrewServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourceNamingPrefix}-DataBrew-ServiceRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: databrew.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueDataBrewServiceRole
+      Policies:
+        - PolicyName: DataBrewS3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${DataQualityBucket}/*'
+                  - !GetAtt DataQualityBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${DataQualityBucket}/${QualityReportsPrefix}/*'
+        - PolicyName: DataBrewEventBridgePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource:
+                  - !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DataBrew-ServiceRole'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourceNamingPrefix}-Lambda-ExecutionRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DataQualityLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${DataQualityBucket}/*'
+                  - !GetAtt DataQualityBucket.Arn
+              - Effect: Allow
+                Action:
+                  - databrew:StartJobRun
+                  - databrew:DescribeJobRun
+                  - databrew:ListJobRuns
+                Resource:
+                  - !Sub 'arn:aws:databrew:${AWS::Region}:${AWS::AccountId}:job/*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !If
+                  - EnableNotifications
+                  - !Ref DataQualityNotificationTopic
+                  - !Ref AWS::NoValue
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-Lambda-ExecutionRole'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # --------------------------------------------------------------------------
+  # DATABREW DATASET
+  # --------------------------------------------------------------------------
+  DataQualityDataset:
+    Type: AWS::DataBrew::Dataset
+    Properties:
+      Name: !Sub '${ResourceNamingPrefix}-customer-dataset'
+      Format: !Ref DatasetFormat
+      FormatOptions: !If
+        - IsCSVFormat
+        - Csv:
+            Delimiter: ','
+            HeaderRow: true
+        - !If
+          - IsJSONFormat
+          - Json:
+              MultiLine: false
+          - !Ref AWS::NoValue
+      Input:
+        S3InputDefinition:
+          Bucket: !Ref DataQualityBucket
+          Key: !Sub '${DataSourcePrefix}/'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DataQuality-Dataset'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Data Quality Assessment'
+
+  # --------------------------------------------------------------------------
+  # DATABREW RULESET
+  # --------------------------------------------------------------------------
+  DataQualityRuleset:
+    Type: AWS::DataBrew::Ruleset
+    Properties:
+      Name: !Sub '${ResourceNamingPrefix}-quality-rules'
+      Description: 'Comprehensive data quality validation rules for customer data'
+      TargetArn: !GetAtt DataQualityDataset.ResourceArn
+      Rules:
+        - Name: 'EmailFormatValidation'
+          CheckExpression: ':col1 matches "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"'
+          SubstitutionMap:
+            ':col1': '`email`'
+          Threshold:
+            Value: !Ref EmailValidationThreshold
+            Type: 'GREATER_THAN_OR_EQUAL'
+            Unit: 'PERCENTAGE'
+        - Name: 'AgeRangeValidation'
+          CheckExpression: ':col1 between :val1 and :val2'
+          SubstitutionMap:
+            ':col1': '`age`'
+            ':val1': '0'
+            ':val2': '120'
+          Threshold:
+            Value: !Ref AgeValidationThreshold
+            Type: 'GREATER_THAN_OR_EQUAL'
+            Unit: 'PERCENTAGE'
+        - Name: 'PurchaseAmountCompleteness'
+          CheckExpression: ':col1 is not null'
+          SubstitutionMap:
+            ':col1': '`purchase_amount`'
+          Threshold:
+            Value: !Ref CompletenessThreshold
+            Type: 'GREATER_THAN_OR_EQUAL'
+            Unit: 'PERCENTAGE'
+        - Name: 'CustomerNameCompleteness'
+          CheckExpression: ':col1 is not null and length(:col1) > 0'
+          SubstitutionMap:
+            ':col1': '`name`'
+          Threshold:
+            Value: !Ref CompletenessThreshold
+            Type: 'GREATER_THAN_OR_EQUAL'
+            Unit: 'PERCENTAGE'
+        - Name: 'CustomerIdUniqueness'
+          CheckExpression: ':col1 is unique'
+          SubstitutionMap:
+            ':col1': '`customer_id`'
+          Threshold:
+            Value: 100.0
+            Type: 'GREATER_THAN_OR_EQUAL'
+            Unit: 'PERCENTAGE'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DataQuality-Ruleset'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Data Quality Validation Rules'
+
+  # --------------------------------------------------------------------------
+  # DATABREW PROFILE JOB
+  # --------------------------------------------------------------------------
+  DataQualityProfileJob:
+    Type: AWS::DataBrew::Job
+    Properties:
+      Name: !Sub '${ResourceNamingPrefix}-quality-assessment-job'
+      Type: 'PROFILE'
+      DatasetName: !Ref DataQualityDataset
+      RoleArn: !GetAtt DataBrewServiceRole.Arn
+      MaxCapacity: !Ref DataBrewJobMaxCapacity
+      Timeout: !Ref DataBrewJobTimeout
+      OutputLocation:
+        Bucket: !Ref DataQualityBucket
+        Key: !Sub '${QualityReportsPrefix}/'
+        BucketOwner: !Ref AWS::AccountId
+      ValidationConfigurations:
+        - RulesetArn: !GetAtt DataQualityRuleset.Arn
+          ValidationMode: 'CHECK_ALL'
+      ProfileConfiguration:
+        DatasetStatisticsConfiguration:
+          IncludedStatistics:
+            - 'COMPLETENESS'
+            - 'VALIDITY'
+            - 'UNIQUENESS'
+            - 'CORRELATION'
+            - 'DESCRIPTIVE_STATISTICS'
+        ProfileColumns:
+          - Name: 'customer_id'
+            Regex: 'customer_id'
+          - Name: 'name'
+            Regex: 'name'
+          - Name: 'email'
+            Regex: 'email'
+          - Name: 'age'
+            Regex: 'age'
+          - Name: 'purchase_amount'
+            Regex: 'purchase_amount'
+        ColumnStatisticsConfigurations:
+          - Selectors:
+              - Regex: 'email'
+            Statistics:
+              IncludedStatistics:
+                - 'COMPLETENESS'
+                - 'VALIDITY'
+                - 'UNIQUENESS'
+          - Selectors:
+              - Regex: 'age'
+            Statistics:
+              IncludedStatistics:
+                - 'COMPLETENESS'
+                - 'VALIDITY'
+                - 'DESCRIPTIVE_STATISTICS'
+          - Selectors:
+              - Regex: 'purchase_amount'
+            Statistics:
+              IncludedStatistics:
+                - 'COMPLETENESS'
+                - 'VALIDITY'
+                - 'DESCRIPTIVE_STATISTICS'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DataQuality-ProfileJob'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Data Quality Assessment'
+
+  # --------------------------------------------------------------------------
+  # SNS TOPIC FOR NOTIFICATIONS
+  # --------------------------------------------------------------------------
+  DataQualityNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnableNotifications
+    Properties:
+      TopicName: !Sub '${ResourceNamingPrefix}-data-quality-alerts'
+      DisplayName: !Sub '${ProjectName} Data Quality Alerts'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DataQuality-NotificationTopic'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Data Quality Notifications'
+
+  DataQualityNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: EnableNotifications
+    Properties:
+      Protocol: email
+      TopicArn: !Ref DataQualityNotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # --------------------------------------------------------------------------
+  # LAMBDA FUNCTIONS
+  # --------------------------------------------------------------------------
+  DataQualityProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourceNamingPrefix}-quality-processor'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !If
+            - EnableNotifications
+            - !Ref DataQualityNotificationTopic
+            - ''
+          DATA_BUCKET: !Ref DataQualityBucket
+          QUARANTINE_PREFIX: !Ref QuarantinePrefix
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from datetime import datetime
+          from botocore.exceptions import ClientError
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Process DataBrew validation results and trigger appropriate responses
+              """
+              try:
+                  logger.info(f"Received event: {json.dumps(event, default=str)}")
+                  
+                  # Extract event details
+                  detail = event.get('detail', {})
+                  validation_state = detail.get('validationState', 'UNKNOWN')
+                  dataset_name = detail.get('datasetName', 'Unknown')
+                  job_name = detail.get('jobName', 'Unknown')
+                  ruleset_name = detail.get('rulesetName', 'Unknown')
+                  job_run_id = detail.get('jobRunId', 'Unknown')
+                  
+                  # Initialize AWS clients
+                  sns_client = boto3.client('sns')
+                  s3_client = boto3.client('s3')
+                  
+                  # Process based on validation state
+                  if validation_state == 'FAILED':
+                      logger.warning(f"Data quality validation failed for dataset: {dataset_name}")
+                      
+                      # Send SNS notification if configured
+                      sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
+                      if sns_topic_arn:
+                          send_failure_notification(
+                              sns_client, sns_topic_arn, dataset_name, 
+                              job_name, ruleset_name, job_run_id
+                          )
+                      
+                      # Implement quarantine logic (placeholder)
+                      quarantine_data_if_needed(s3_client, dataset_name, job_run_id)
+                      
+                  elif validation_state == 'SUCCEEDED':
+                      logger.info(f"Data quality validation passed for dataset: {dataset_name}")
+                      
+                      # Send success notification if configured
+                      sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
+                      if sns_topic_arn:
+                          send_success_notification(
+                              sns_client, sns_topic_arn, dataset_name, 
+                              job_name, ruleset_name, job_run_id
+                          )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Processed validation result: {validation_state}',
+                          'dataset': dataset_name,
+                          'job': job_name,
+                          'timestamp': datetime.now().isoformat()
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing data quality event: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'timestamp': datetime.now().isoformat()
+                      })
+                  }
+          
+          def send_failure_notification(sns_client, topic_arn, dataset_name, job_name, ruleset_name, job_run_id):
+              """Send failure notification via SNS"""
+              try:
+                  message = f"""
+          DATA QUALITY ALERT - VALIDATION FAILED
+          
+          Dataset: {dataset_name}
+          Job: {job_name}
+          Ruleset: {ruleset_name}
+          Job Run ID: {job_run_id}
+          Environment: {os.environ.get('ENVIRONMENT', 'Unknown')}
+          Project: {os.environ.get('PROJECT_NAME', 'Unknown')}
+          Timestamp: {datetime.now().isoformat()}
+          
+          ACTION REQUIRED:
+          1. Review the data quality report in the quality-reports S3 prefix
+          2. Investigate source data issues
+          3. Implement data remediation if necessary
+          4. Re-run the quality assessment after fixes
+          
+          This is an automated alert from the Data Quality Pipeline.
+          """
+                  
+                  sns_client.publish(
+                      TopicArn=topic_arn,
+                      Subject=f'🚨 Data Quality Validation Failed - {dataset_name}',
+                      Message=message
+                  )
+                  logger.info(f"Failure notification sent for dataset: {dataset_name}")
+                  
+              except ClientError as e:
+                  logger.error(f"Failed to send failure notification: {str(e)}")
+          
+          def send_success_notification(sns_client, topic_arn, dataset_name, job_name, ruleset_name, job_run_id):
+              """Send success notification via SNS"""
+              try:
+                  message = f"""
+          DATA QUALITY STATUS - VALIDATION SUCCEEDED
+          
+          Dataset: {dataset_name}
+          Job: {job_name}
+          Ruleset: {ruleset_name}
+          Job Run ID: {job_run_id}
+          Environment: {os.environ.get('ENVIRONMENT', 'Unknown')}
+          Project: {os.environ.get('PROJECT_NAME', 'Unknown')}
+          Timestamp: {datetime.now().isoformat()}
+          
+          All data quality rules passed successfully. The dataset is ready for downstream processing.
+          
+          This is an automated notification from the Data Quality Pipeline.
+          """
+                  
+                  sns_client.publish(
+                      TopicArn=topic_arn,
+                      Subject=f'✅ Data Quality Validation Passed - {dataset_name}',
+                      Message=message
+                  )
+                  logger.info(f"Success notification sent for dataset: {dataset_name}")
+                  
+              except ClientError as e:
+                  logger.error(f"Failed to send success notification: {str(e)}")
+          
+          def quarantine_data_if_needed(s3_client, dataset_name, job_run_id):
+              """Implement data quarantine logic (placeholder)"""
+              try:
+                  # This is a placeholder for quarantine logic
+                  # In a real implementation, you might:
+                  # 1. Copy failed data to quarantine prefix
+                  # 2. Add metadata about the failure
+                  # 3. Remove from processing queue
+                  logger.info(f"Quarantine logic placeholder executed for dataset: {dataset_name}")
+                  
+              except Exception as e:
+                  logger.error(f"Error in quarantine logic: {str(e)}")
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DataQuality-ProcessorFunction'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Data Quality Event Processing'
+
+  DataIngestionTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourceNamingPrefix}-ingestion-trigger'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          DATABREW_JOB_NAME: !Ref DataQualityProfileJob
+          DATA_BUCKET: !Ref DataQualityBucket
+          DATASET_NAME: !Ref DataQualityDataset
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from urllib.parse import unquote_plus
+          from botocore.exceptions import ClientError
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Trigger DataBrew job when new data arrives in S3
+              """
+              try:
+                  logger.info(f"Received S3 event: {json.dumps(event, default=str)}")
+                  
+                  # Process S3 event records
+                  for record in event.get('Records', []):
+                      # Extract S3 event details
+                      s3_info = record.get('s3', {})
+                      bucket_name = s3_info.get('bucket', {}).get('name')
+                      object_key = unquote_plus(s3_info.get('object', {}).get('key', ''))
+                      
+                      logger.info(f"Processing new file: s3://{bucket_name}/{object_key}")
+                      
+                      # Update dataset to point to new file
+                      update_dataset_source(object_key)
+                      
+                      # Trigger DataBrew job
+                      trigger_quality_assessment()
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Successfully processed S3 event and triggered quality assessment',
+                          'processed_records': len(event.get('Records', [])),
+                          'timestamp': datetime.now().isoformat()
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing S3 event: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'timestamp': datetime.now().isoformat()
+                      })
+                  }
+          
+          def update_dataset_source(object_key):
+              """Update DataBrew dataset to point to new data file"""
+              try:
+                  databrew_client = boto3.client('databrew')
+                  dataset_name = os.environ.get('DATASET_NAME')
+                  bucket_name = os.environ.get('DATA_BUCKET')
+                  
+                  # Update dataset input source
+                  databrew_client.update_dataset(
+                      Name=dataset_name,
+                      Input={
+                          'S3InputDefinition': {
+                              'Bucket': bucket_name,
+                              'Key': object_key
+                          }
+                      }
+                  )
+                  
+                  logger.info(f"Updated dataset {dataset_name} to use file: {object_key}")
+                  
+              except ClientError as e:
+                  logger.error(f"Failed to update dataset: {str(e)}")
+                  raise
+          
+          def trigger_quality_assessment():
+              """Trigger DataBrew profile job for quality assessment"""
+              try:
+                  databrew_client = boto3.client('databrew')
+                  job_name = os.environ.get('DATABREW_JOB_NAME')
+                  
+                  # Start job run
+                  response = databrew_client.start_job_run(Name=job_name)
+                  job_run_id = response.get('RunId')
+                  
+                  logger.info(f"Started DataBrew job {job_name} with run ID: {job_run_id}")
+                  
+                  return job_run_id
+                  
+              except ClientError as e:
+                  logger.error(f"Failed to start DataBrew job: {str(e)}")
+                  raise
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DataIngestion-TriggerFunction'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Data Ingestion Trigger'
+
+  # --------------------------------------------------------------------------
+  # LAMBDA PERMISSIONS
+  # --------------------------------------------------------------------------
+  DataIngestionTriggerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt DataIngestionTriggerFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt DataQualityBucket.Arn
+
+  # --------------------------------------------------------------------------
+  # EVENTBRIDGE RULE
+  # --------------------------------------------------------------------------
+  DataBrewValidationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ResourceNamingPrefix}-databrew-validation-rule'
+      Description: 'Route DataBrew validation events to Lambda processor'
+      EventPattern:
+        source:
+          - 'aws.databrew'
+        detail-type:
+          - 'DataBrew Ruleset Validation Result'
+        detail:
+          validationState:
+            - 'FAILED'
+            - 'SUCCEEDED'
+      State: 'ENABLED'
+      Targets:
+        - Arn: !GetAtt DataQualityProcessorFunction.Arn
+          Id: 'DataQualityProcessorTarget'
+          RetryPolicy:
+            MaximumRetryAttempts: 3
+            MaximumEventAge: 3600
+          DeadLetterConfig:
+            Arn: !GetAtt EventProcessingDeadLetterQueue.Arn
+
+  DataBrewValidationRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt DataQualityProcessorFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DataBrewValidationRule.Arn
+
+  # --------------------------------------------------------------------------
+  # DEAD LETTER QUEUE FOR FAILED EVENTS
+  # --------------------------------------------------------------------------
+  EventProcessingDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ResourceNamingPrefix}-event-processing-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-EventProcessing-DeadLetterQueue'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Failed Event Processing'
+
+  # --------------------------------------------------------------------------
+  # CLOUDWATCH LOG GROUPS
+  # --------------------------------------------------------------------------
+  DataQualityProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DataQualityProcessorFunction}'
+      RetentionInDays: !If
+        - IsProduction
+        - 30
+        - 7
+      KmsKeyId: !GetAtt LogGroupKMSKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DataQualityProcessor-LogGroup'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DataIngestionTriggerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DataIngestionTriggerFunction}'
+      RetentionInDays: !If
+        - IsProduction
+        - 30
+        - 7
+      KmsKeyId: !GetAtt LogGroupKMSKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DataIngestionTrigger-LogGroup'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # --------------------------------------------------------------------------
+  # KMS KEY FOR LOG ENCRYPTION
+  # --------------------------------------------------------------------------
+  LogGroupKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'KMS key for encrypting CloudWatch Log Groups'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:DescribeKey'
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ResourceNamingPrefix}*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-LogGroup-KMSKey'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  LogGroupKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ResourceNamingPrefix}-logs-key'
+      TargetKeyId: !Ref LogGroupKMSKey
+
+# ==========================================================================
+# OUTPUTS
+# ==========================================================================
+Outputs:
+  # --------------------------------------------------------------------------
+  # INFRASTRUCTURE OUTPUTS
+  # --------------------------------------------------------------------------
+  DataQualityBucketName:
+    Description: 'Name of the S3 bucket for data quality pipeline storage'
+    Value: !Ref DataQualityBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataQualityBucket'
+
+  DataQualityBucketArn:
+    Description: 'ARN of the S3 bucket for data quality pipeline storage'
+    Value: !GetAtt DataQualityBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataQualityBucketArn'
+
+  DataBrewServiceRoleArn:
+    Description: 'ARN of the DataBrew service role'
+    Value: !GetAtt DataBrewServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBrewServiceRoleArn'
+
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  # --------------------------------------------------------------------------
+  # DATABREW OUTPUTS
+  # --------------------------------------------------------------------------
+  DataQualityDatasetName:
+    Description: 'Name of the DataBrew dataset'
+    Value: !Ref DataQualityDataset
+    Export:
+      Name: !Sub '${AWS::StackName}-DataQualityDataset'
+
+  DataQualityRulesetName:
+    Description: 'Name of the DataBrew ruleset'
+    Value: !Ref DataQualityRuleset
+    Export:
+      Name: !Sub '${AWS::StackName}-DataQualityRuleset'
+
+  DataQualityProfileJobName:
+    Description: 'Name of the DataBrew profile job'
+    Value: !Ref DataQualityProfileJob
+    Export:
+      Name: !Sub '${AWS::StackName}-DataQualityProfileJob'
+
+  # --------------------------------------------------------------------------
+  # LAMBDA OUTPUTS
+  # --------------------------------------------------------------------------
+  DataQualityProcessorFunctionName:
+    Description: 'Name of the data quality processor Lambda function'
+    Value: !Ref DataQualityProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-DataQualityProcessorFunction'
+
+  DataQualityProcessorFunctionArn:
+    Description: 'ARN of the data quality processor Lambda function'
+    Value: !GetAtt DataQualityProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataQualityProcessorFunctionArn'
+
+  DataIngestionTriggerFunctionName:
+    Description: 'Name of the data ingestion trigger Lambda function'
+    Value: !Ref DataIngestionTriggerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-DataIngestionTriggerFunction'
+
+  DataIngestionTriggerFunctionArn:
+    Description: 'ARN of the data ingestion trigger Lambda function'
+    Value: !GetAtt DataIngestionTriggerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataIngestionTriggerFunctionArn'
+
+  # --------------------------------------------------------------------------
+  # EVENTBRIDGE OUTPUTS
+  # --------------------------------------------------------------------------
+  DataBrewValidationRuleName:
+    Description: 'Name of the EventBridge rule for DataBrew validation events'
+    Value: !Ref DataBrewValidationRule
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBrewValidationRule'
+
+  DataBrewValidationRuleArn:
+    Description: 'ARN of the EventBridge rule for DataBrew validation events'
+    Value: !GetAtt DataBrewValidationRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBrewValidationRuleArn'
+
+  # --------------------------------------------------------------------------
+  # NOTIFICATION OUTPUTS
+  # --------------------------------------------------------------------------
+  DataQualityNotificationTopicArn:
+    Description: 'ARN of the SNS topic for data quality notifications'
+    Value: !If
+      - EnableNotifications
+      - !Ref DataQualityNotificationTopic
+      - 'Not Created - Notifications Disabled'
+    Export:
+      Name: !Sub '${AWS::StackName}-DataQualityNotificationTopic'
+
+  # --------------------------------------------------------------------------
+  # CONFIGURATION OUTPUTS
+  # --------------------------------------------------------------------------
+  DataSourceS3Path:
+    Description: 'S3 path for uploading raw data files'
+    Value: !Sub 's3://${DataQualityBucket}/${DataSourcePrefix}/'
+    Export:
+      Name: !Sub '${AWS::StackName}-DataSourceS3Path'
+
+  QualityReportsS3Path:
+    Description: 'S3 path where quality reports are stored'
+    Value: !Sub 's3://${DataQualityBucket}/${QualityReportsPrefix}/'
+    Export:
+      Name: !Sub '${AWS::StackName}-QualityReportsS3Path'
+
+  QuarantineS3Path:
+    Description: 'S3 path for quarantined data files'
+    Value: !Sub 's3://${DataQualityBucket}/${QuarantinePrefix}/'
+    Export:
+      Name: !Sub '${AWS::StackName}-QuarantineS3Path'
+
+  # --------------------------------------------------------------------------
+  # USAGE INSTRUCTIONS
+  # --------------------------------------------------------------------------
+  UsageInstructions:
+    Description: 'Instructions for using the data quality pipeline'
+    Value: !Sub |
+      To use this data quality pipeline:
+      1. Upload CSV files to: s3://${DataQualityBucket}/${DataSourcePrefix}/
+      2. The pipeline will automatically trigger quality assessment
+      3. View results in: s3://${DataQualityBucket}/${QualityReportsPrefix}/
+      4. Monitor CloudWatch logs for detailed processing information
+      5. Check SNS notifications for quality alerts (if enabled)
+
+  # --------------------------------------------------------------------------
+  # MONITORING OUTPUTS
+  # --------------------------------------------------------------------------
+  EventProcessingDeadLetterQueueUrl:
+    Description: 'URL of the dead letter queue for failed event processing'
+    Value: !Ref EventProcessingDeadLetterQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-EventProcessingDeadLetterQueue'
+
+  DataQualityProcessorLogGroupName:
+    Description: 'Name of the CloudWatch log group for the data quality processor'
+    Value: !Ref DataQualityProcessorLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-DataQualityProcessorLogGroup'
+
+  DataIngestionTriggerLogGroupName:
+    Description: 'Name of the CloudWatch log group for the data ingestion trigger'
+    Value: !Ref DataIngestionTriggerLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-DataIngestionTriggerLogGroup'

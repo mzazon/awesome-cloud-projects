@@ -1,0 +1,638 @@
+# Infrastructure Manager Configuration for Centralized Data Lake Governance
+# This configuration deploys a complete data governance solution using BigLake Metastore,
+# BigQuery, Cloud Storage, and Dataproc for unified metadata management
+
+# Template metadata
+apiVersion: krm.kcl.dev/v1alpha1
+kind: KrmFile
+metadata:
+  name: data-lake-governance-infrastructure
+  annotations:
+    config.kubernetes.io/local-config: "true"
+    cnrm.cloud.google.com/project-id: ${project_id}
+
+# Resource configurations
+resources:
+  # Enable required APIs for the data governance solution
+  - apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+    kind: Service
+    metadata:
+      name: bigquery-api
+      annotations:
+        cnrm.cloud.google.com/project-id: ${project_id}
+    spec:
+      resourceID: bigquery.googleapis.com
+      projectRef:
+        external: ${project_id}
+
+  - apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+    kind: Service
+    metadata:
+      name: dataproc-api
+      annotations:
+        cnrm.cloud.google.com/project-id: ${project_id}
+    spec:
+      resourceID: dataproc.googleapis.com
+      projectRef:
+        external: ${project_id}
+
+  - apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+    kind: Service
+    metadata:
+      name: storage-api
+      annotations:
+        cnrm.cloud.google.com/project-id: ${project_id}
+    spec:
+      resourceID: storage.googleapis.com
+      projectRef:
+        external: ${project_id}
+
+  - apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+    kind: Service
+    metadata:
+      name: metastore-api
+      annotations:
+        cnrm.cloud.google.com/project-id: ${project_id}
+    spec:
+      resourceID: metastore.googleapis.com
+      projectRef:
+        external: ${project_id}
+
+  - apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+    kind: Service
+    metadata:
+      name: compute-api
+      annotations:
+        cnrm.cloud.google.com/project-id: ${project_id}
+    spec:
+      resourceID: compute.googleapis.com
+      projectRef:
+        external: ${project_id}
+
+  - apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+    kind: Service
+    metadata:
+      name: datacatalog-api
+      annotations:
+        cnrm.cloud.google.com/project-id: ${project_id}
+    spec:
+      resourceID: datacatalog.googleapis.com
+      projectRef:
+        external: ${project_id}
+
+  # Cloud Storage bucket for data lake foundation
+  - apiVersion: storage.cnrm.cloud.google.com/v1beta1
+    kind: StorageBucket
+    metadata:
+      name: data-lake-bucket
+      annotations:
+        cnrm.cloud.google.com/project-id: ${project_id}
+    spec:
+      resourceID: ${bucket_name}
+      location: ${region}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      uniformBucketLevelAccess: true
+      # Enable lifecycle management for cost optimization
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90
+          - action:
+              type: SetStorageClass
+              storageClass: ARCHIVE
+            condition:
+              age: 365
+      # Enable audit logging for governance
+      logging:
+        logBucket: ${audit_bucket_name}
+        logObjectPrefix: data-lake-access-logs/
+
+  # BigLake Metastore for unified metadata management
+  - apiVersion: metastore.cnrm.cloud.google.com/v1beta1
+    kind: DataprocMetastoreService
+    metadata:
+      name: governance-metastore
+      annotations:
+        cnrm.cloud.google.com/project-id: ${project_id}
+    spec:
+      resourceID: ${metastore_name}
+      location: ${region}
+      tier: DEVELOPER
+      # Production deployments should use ENTERPRISE tier for HA
+      # tier: ENTERPRISE
+      hiveMetastoreConfig:
+        version: "3.1.2"
+        # Configure Kerberos for enterprise security
+        kerberosConfig:
+          keytab:
+            cloudSecret: ${kerberos_keytab_secret}
+          principal: ${kerberos_principal}
+          krb5ConfigGcsUri: ${krb5_config_uri}
+      # Network configuration for secure access
+      networkConfig:
+        consumers:
+          - subnetwork: projects/${project_id}/regions/${region}/subnetworks/${subnet_name}
+      # Maintenance window for managed updates
+      maintenanceWindow:
+        hourOfDay: 2
+        dayOfWeek: SUNDAY
+      # Backup configuration for disaster recovery
+      databaseType: MYSQL
+      encryptionConfig:
+        kmsKey: projects/${project_id}/locations/${region}/keyRings/${key_ring_name}/cryptoKeys/${crypto_key_name}
+      # Enable logging for audit and monitoring
+      metadataIntegration:
+        dataCatalogConfig:
+          enabled: true
+
+  # BigQuery dataset with metastore integration
+  - apiVersion: bigquery.cnrm.cloud.google.com/v1beta1
+    kind: BigQueryDataset
+    metadata:
+      name: governance-dataset
+      annotations:
+        cnrm.cloud.google.com/project-id: ${project_id}
+    spec:
+      resourceID: ${bigquery_dataset}
+      location: ${region}
+      description: "Governance dataset with BigLake Metastore integration for unified metadata management"
+      # Configure access controls for data governance
+      access:
+        - role: OWNER
+          userByEmail: ${data_owner_email}
+        - role: READER
+          userByEmail: ${data_analyst_email}
+        - role: WRITER
+          serviceAccountRef:
+            name: dataproc-service-account
+      # Set default table expiration for lifecycle management
+      defaultTableExpirationMs: 2592000000  # 30 days
+      # Enable encryption for data at rest
+      defaultEncryptionConfiguration:
+        kmsKeyRef:
+          name: bigquery-encryption-key
+
+  # BigQuery external table for data lake integration
+  - apiVersion: bigquery.cnrm.cloud.google.com/v1beta1
+    kind: BigQueryTable
+    metadata:
+      name: retail-data-external-table
+      annotations:
+        cnrm.cloud.google.com/project-id: ${project_id}
+    spec:
+      resourceID: retail_data
+      datasetRef:
+        name: governance-dataset
+      description: "External table pointing to data lake assets with unified metadata"
+      externalDataConfiguration:
+        sourceFormat: CSV
+        csvOptions:
+          skipLeadingRows: 1
+          allowJaggedRows: false
+          allowQuotedNewlines: false
+        sourceUris:
+          - "gs://${bucket_name}/raw-data/*.csv"
+        autodetect: false
+        schema:
+          fields:
+            - name: customer_id
+              type: STRING
+              mode: REQUIRED
+              description: "Unique customer identifier"
+            - name: product_id
+              type: STRING
+              mode: REQUIRED
+              description: "Product SKU identifier"
+            - name: quantity
+              type: INTEGER
+              mode: REQUIRED
+              description: "Quantity purchased"
+            - name: price
+              type: FLOAT
+              mode: REQUIRED
+              description: "Unit price of the product"
+            - name: transaction_date
+              type: DATE
+              mode: REQUIRED
+              description: "Date of transaction"
+
+  # Service account for Dataproc cluster with least privilege access
+  - apiVersion: iam.cnrm.cloud.google.com/v1beta1
+    kind: IAMServiceAccount
+    metadata:
+      name: dataproc-service-account
+      annotations:
+        cnrm.cloud.google.com/project-id: ${project_id}
+    spec:
+      resourceID: dataproc-governance-sa
+      displayName: "Dataproc Service Account for Data Governance"
+      description: "Service account for Dataproc cluster with metastore access"
+
+  # IAM bindings for service account with least privilege principle
+  - apiVersion: iam.cnrm.cloud.google.com/v1beta1
+    kind: IAMPolicyMember
+    metadata:
+      name: dataproc-metastore-access
+      annotations:
+        cnrm.cloud.google.com/project-id: ${project_id}
+    spec:
+      member: serviceAccount:dataproc-governance-sa@${project_id}.iam.gserviceaccount.com
+      role: roles/metastore.metadataEditor
+      resourceRef:
+        apiVersion: resourcemanager.cnrm.cloud.google.com/v1beta1
+        kind: Project
+        external: ${project_id}
+
+  - apiVersion: iam.cnrm.cloud.google.com/v1beta1
+    kind: IAMPolicyMember
+    metadata:
+      name: dataproc-storage-access
+      annotations:
+        cnrm.cloud.google.com/project-id: ${project_id}
+    spec:
+      member: serviceAccount:dataproc-governance-sa@${project_id}.iam.gserviceaccount.com
+      role: roles/storage.objectAdmin
+      resourceRef:
+        apiVersion: storage.cnrm.cloud.google.com/v1beta1
+        kind: StorageBucket
+        name: data-lake-bucket
+
+  - apiVersion: iam.cnrm.cloud.google.com/v1beta1
+    kind: IAMPolicyMember
+    metadata:
+      name: dataproc-bigquery-access
+      annotations:
+        cnrm.cloud.google.com/project-id: ${project_id}
+    spec:
+      member: serviceAccount:dataproc-governance-sa@${project_id}.iam.gserviceaccount.com
+      role: roles/bigquery.dataEditor
+      resourceRef:
+        apiVersion: resourcemanager.cnrm.cloud.google.com/v1beta1
+        kind: Project
+        external: ${project_id}
+
+  # VPC network for secure Dataproc deployment
+  - apiVersion: compute.cnrm.cloud.google.com/v1beta1
+    kind: ComputeNetwork
+    metadata:
+      name: governance-vpc
+      annotations:
+        cnrm.cloud.google.com/project-id: ${project_id}
+    spec:
+      resourceID: governance-vpc
+      description: "VPC network for data governance infrastructure"
+      autoCreateSubnetworks: false
+      routingMode: REGIONAL
+
+  # Subnet for Dataproc cluster with private IP ranges
+  - apiVersion: compute.cnrm.cloud.google.com/v1beta1
+    kind: ComputeSubnetwork
+    metadata:
+      name: governance-subnet
+      annotations:
+        cnrm.cloud.google.com/project-id: ${project_id}
+    spec:
+      resourceID: ${subnet_name}
+      region: ${region}
+      ipCidrRange: "10.0.0.0/24"
+      networkRef:
+        name: governance-vpc
+      description: "Subnet for data governance Dataproc cluster"
+      privateIpGoogleAccess: true
+      # Enable flow logs for network monitoring
+      logConfig:
+        enable: true
+        flowSampling: 0.1
+        aggregationInterval: INTERVAL_1_MIN
+
+  # Firewall rule for Dataproc internal communication
+  - apiVersion: compute.cnrm.cloud.google.com/v1beta1
+    kind: ComputeFirewall
+    metadata:
+      name: dataproc-internal-firewall
+      annotations:
+        cnrm.cloud.google.com/project-id: ${project_id}
+    spec:
+      resourceID: allow-dataproc-internal
+      networkRef:
+        name: governance-vpc
+      description: "Allow internal communication for Dataproc cluster"
+      direction: INGRESS
+      sourceRanges:
+        - "10.0.0.0/24"
+      allowed:
+        - protocol: tcp
+          ports:
+            - "0-65535"
+        - protocol: udp
+          ports:
+            - "0-65535"
+        - protocol: icmp
+      targetTags:
+        - dataproc-cluster
+
+  # Dataproc cluster with metastore integration and autoscaling
+  - apiVersion: dataproc.cnrm.cloud.google.com/v1beta1
+    kind: DataprocCluster
+    metadata:
+      name: analytics-cluster
+      annotations:
+        cnrm.cloud.google.com/project-id: ${project_id}
+    spec:
+      resourceID: ${dataproc_cluster}
+      location: ${region}
+      # Configure cluster software with metastore integration
+      clusterConfig:
+        softwareConfig:
+          imageVersion: "2.0-debian10"
+          properties:
+            # Enable metastore integration
+            "hive:javax.jdo.option.ConnectionURL": "jdbc:mysql://google/${metastore_name}?cloudSqlInstance=${project_id}:${region}:${metastore_name}&useSSL=false"
+            # Optimize Spark for data governance workloads
+            "spark:spark.sql.adaptive.enabled": "true"
+            "spark:spark.sql.adaptive.coalescePartitions.enabled": "true"
+            "spark:spark.sql.catalogImplementation": "hive"
+            "spark:spark.sql.warehouse.dir": "gs://${bucket_name}/warehouse/"
+        # Master node configuration
+        masterConfig:
+          numInstances: 1
+          machineTypeUri: "n1-standard-4"
+          diskConfig:
+            bootDiskType: "pd-ssd"
+            bootDiskSizeGb: 100
+          # Enable preemptible instances for cost optimization (non-production)
+          isPreemptible: false
+        # Worker node configuration with autoscaling
+        workerConfig:
+          numInstances: 2
+          machineTypeUri: "n1-standard-4"
+          diskConfig:
+            bootDiskType: "pd-standard"
+            bootDiskSizeGb: 100
+            numLocalSsds: 1
+          isPreemptible: false
+        # Secondary worker configuration for cost optimization
+        secondaryWorkerConfig:
+          numInstances: 0
+          machineTypeUri: "n1-standard-2"
+          diskConfig:
+            bootDiskType: "pd-standard"
+            bootDiskSizeGb: 100
+          isPreemptible: true
+        # Network configuration for security
+        gceClusterConfig:
+          subnetworkUri: "projects/${project_id}/regions/${region}/subnetworks/${subnet_name}"
+          internalIpOnly: true
+          serviceAccountRef:
+            name: dataproc-service-account
+          serviceAccountScopes:
+            - "https://www.googleapis.com/auth/cloud-platform"
+          tags:
+            - dataproc-cluster
+        # Security configuration
+        securityConfig:
+          kerberosConfig:
+            enableKerberos: true
+            rootPrincipalPasswordUri: ${kerberos_password_uri}
+            kmsKeyUri: projects/${project_id}/locations/${region}/keyRings/${key_ring_name}/cryptoKeys/${crypto_key_name}
+        # Metastore configuration
+        metastoreConfig:
+          dataprocMetastoreServiceRef:
+            name: governance-metastore
+        # Enable autoscaling for cost optimization
+        autoscalingConfig:
+          policyUri: projects/${project_id}/regions/${region}/autoscalingPolicies/${autoscaling_policy_name}
+        # Lifecycle configuration for ephemeral clusters
+        lifecycleConfig:
+          idleDeleteTtl: "3600s"  # Delete after 1 hour of inactivity
+          autoDeleteTime: "2025-12-31T23:59:59Z"  # Maximum cluster lifetime
+        # Initialization actions for additional software
+        initializationActions:
+          - executableFile: "gs://${bucket_name}/scripts/install-governance-tools.sh"
+            executionTimeout: "300s"
+
+  # Cloud KMS key ring for encryption
+  - apiVersion: kms.cnrm.cloud.google.com/v1beta1
+    kind: KMSKeyRing
+    metadata:
+      name: governance-key-ring
+      annotations:
+        cnrm.cloud.google.com/project-id: ${project_id}
+    spec:
+      resourceID: ${key_ring_name}
+      location: ${region}
+
+  # Cloud KMS crypto key for data encryption
+  - apiVersion: kms.cnrm.cloud.google.com/v1beta1
+    kind: KMSCryptoKey
+    metadata:
+      name: governance-crypto-key
+      annotations:
+        cnrm.cloud.google.com/project-id: ${project_id}
+    spec:
+      resourceID: ${crypto_key_name}
+      keyRingRef:
+        name: governance-key-ring
+      purpose: ENCRYPT_DECRYPT
+      rotationPeriod: "7776000s"  # 90 days
+      versionTemplate:
+        algorithm: GOOGLE_SYMMETRIC_ENCRYPTION
+        protectionLevel: SOFTWARE
+
+  # Data Catalog entry group for metadata organization
+  - apiVersion: datacatalog.cnrm.cloud.google.com/v1beta1
+    kind: DataCatalogEntryGroup
+    metadata:
+      name: governance-catalog
+      annotations:
+        cnrm.cloud.google.com/project-id: ${project_id}
+    spec:
+      resourceID: governance-catalog
+      location: ${region}
+      displayName: "Data Governance Catalog"
+      description: "Centralized catalog for data governance and lineage tracking"
+
+  # Data Catalog entry for BigQuery dataset
+  - apiVersion: datacatalog.cnrm.cloud.google.com/v1beta1
+    kind: DataCatalogEntry
+    metadata:
+      name: customer-analytics-entry
+      annotations:
+        cnrm.cloud.google.com/project-id: ${project_id}
+    spec:
+      resourceID: customer-analytics
+      entryGroupRef:
+        name: governance-catalog
+      entryId: customer-analytics
+      displayName: "Customer Analytics Dataset"
+      description: "Governed customer analytics dataset with unified metadata and lineage tracking"
+      type: TABLE
+      linkedResource: "//bigquery.googleapis.com/projects/${project_id}/datasets/${bigquery_dataset}/tables/retail_data"
+      # Add custom metadata for governance
+      userSpecifiedType: "GOVERNED_TABLE"
+      userSpecifiedSystem: "BigLake Metastore"
+
+  # Cloud Monitoring alert policy for governance monitoring
+  - apiVersion: monitoring.cnrm.cloud.google.com/v1beta1
+    kind: MonitoringAlertPolicy
+    metadata:
+      name: metastore-health-alert
+      annotations:
+        cnrm.cloud.google.com/project-id: ${project_id}
+    spec:
+      resourceID: metastore-health-alert
+      displayName: "BigLake Metastore Health Alert"
+      documentation:
+        content: "Alert when BigLake Metastore service is unhealthy"
+        mimeType: "text/markdown"
+      conditions:
+        - displayName: "Metastore Service Down"
+          conditionThreshold:
+            filter: 'resource.type="metastore_service" AND metric.type="metastore.googleapis.com/service/up"'
+            comparison: COMPARISON_LESS_THAN
+            thresholdValue: 1.0
+            duration: "300s"
+            aggregations:
+              - alignmentPeriod: "60s"
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_MEAN
+                groupByFields:
+                  - "resource.service_id"
+      enabled: true
+      combiner: OR
+
+# Variables for customization
+variables:
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    required: true
+
+  region:
+    description: "Google Cloud region for resource deployment"
+    type: string
+    default: "us-central1"
+
+  zone:
+    description: "Google Cloud zone for compute resources"
+    type: string
+    default: "us-central1-a"
+
+  bucket_name:
+    description: "Name for the Cloud Storage data lake bucket"
+    type: string
+    required: true
+
+  metastore_name:
+    description: "Name for the BigLake Metastore service"
+    type: string
+    required: true
+
+  dataproc_cluster:
+    description: "Name for the Dataproc cluster"
+    type: string
+    required: true
+
+  bigquery_dataset:
+    description: "Name for the BigQuery dataset"
+    type: string
+    required: true
+
+  subnet_name:
+    description: "Name for the VPC subnet"
+    type: string
+    default: "governance-subnet"
+
+  key_ring_name:
+    description: "Name for the KMS key ring"
+    type: string
+    default: "governance-keys"
+
+  crypto_key_name:
+    description: "Name for the KMS crypto key"
+    type: string
+    default: "governance-encryption-key"
+
+  audit_bucket_name:
+    description: "Name for the audit logging bucket"
+    type: string
+    required: true
+
+  data_owner_email:
+    description: "Email address of the data owner"
+    type: string
+    required: true
+
+  data_analyst_email:
+    description: "Email address of the data analyst"
+    type: string
+    required: true
+
+  kerberos_keytab_secret:
+    description: "Secret Manager secret containing Kerberos keytab"
+    type: string
+    default: "kerberos-keytab"
+
+  kerberos_principal:
+    description: "Kerberos principal for authentication"
+    type: string
+    default: "dataproc@EXAMPLE.COM"
+
+  krb5_config_uri:
+    description: "GCS URI for krb5.conf configuration file"
+    type: string
+    default: "gs://governance-config/krb5.conf"
+
+  kerberos_password_uri:
+    description: "Secret Manager URI for Kerberos password"
+    type: string
+    default: "projects/PROJECT_ID/secrets/kerberos-password/versions/latest"
+
+  autoscaling_policy_name:
+    description: "Name of the Dataproc autoscaling policy"
+    type: string
+    default: "governance-autoscaling-policy"
+
+# Outputs for integration and verification
+outputs:
+  metastore_endpoint:
+    description: "BigLake Metastore endpoint URI"
+    value: "${resources.governance-metastore.status.endpointUri}"
+
+  data_lake_bucket_url:
+    description: "Cloud Storage data lake bucket URL"
+    value: "gs://${variables.bucket_name}"
+
+  bigquery_dataset_id:
+    description: "BigQuery dataset fully qualified ID"
+    value: "${variables.project_id}.${variables.bigquery_dataset}"
+
+  dataproc_cluster_name:
+    description: "Dataproc cluster resource name"
+    value: "${resources.analytics-cluster.status.clusterName}"
+
+  vpc_network_name:
+    description: "VPC network self-link"
+    value: "${resources.governance-vpc.status.selfLink}"
+
+  encryption_key_name:
+    description: "KMS encryption key resource name"
+    value: "${resources.governance-crypto-key.status.name}"
+
+  service_account_email:
+    description: "Dataproc service account email"
+    value: "${resources.dataproc-service-account.status.email}"
+
+  data_catalog_entry_group:
+    description: "Data Catalog entry group name"
+    value: "${resources.governance-catalog.status.name}"

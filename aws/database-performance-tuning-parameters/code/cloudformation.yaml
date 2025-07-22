@@ -1,0 +1,660 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure as Code for Database Performance Tuning with Parameter Groups - Creates optimized PostgreSQL RDS instance with custom parameter groups, monitoring, and read replica'
+
+Parameters:
+  # Database Configuration Parameters
+  DBInstanceIdentifier:
+    Type: String
+    Default: perf-tuning-db
+    Description: Unique identifier for the RDS instance
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters and hyphens
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.medium
+    Description: RDS instance class (4 vCPUs, 4 GB RAM optimal for parameter tuning)
+    AllowedValues:
+      - db.t3.medium
+      - db.t3.large
+      - db.m5.large
+      - db.m5.xlarge
+      - db.r5.large
+      - db.r5.xlarge
+    ConstraintDescription: Choose an appropriate instance class for your workload
+
+  DBEngineVersion:
+    Type: String
+    Default: '15.4'
+    Description: PostgreSQL engine version
+    AllowedValues:
+      - '15.4'
+      - '15.5'
+      - '15.6'
+      - '14.9'
+      - '14.10'
+      - '14.11'
+
+  AllocatedStorage:
+    Type: Number
+    Default: 100
+    MinValue: 20
+    MaxValue: 65536
+    Description: Storage size in GB (minimum 20 GB, maximum 65536 GB)
+
+  StorageType:
+    Type: String
+    Default: gp3
+    Description: Storage type for optimal performance
+    AllowedValues:
+      - gp2
+      - gp3
+      - io1
+      - io2
+
+  MasterUsername:
+    Type: String
+    Default: dbadmin
+    Description: Master username for database access
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9]*$'
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters
+
+  MasterUserPassword:
+    Type: String
+    NoEcho: true
+    Description: Master password for database access (8-128 characters)
+    MinLength: 8
+    MaxLength: 128
+    AllowedPattern: '^[a-zA-Z0-9!@#$%^&*()_+-=]*$'
+    ConstraintDescription: Must contain 8-128 characters with alphanumeric and special characters
+
+  # Network Configuration Parameters
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for VPC
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR block for private subnet 1
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR block for private subnet 2
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+  # Monitoring Configuration Parameters
+  MonitoringInterval:
+    Type: Number
+    Default: 60
+    Description: Enhanced monitoring interval in seconds
+    AllowedValues: [0, 1, 5, 10, 15, 30, 60]
+
+  PerformanceInsightsRetentionPeriod:
+    Type: Number
+    Default: 7
+    Description: Performance Insights retention period in days
+    AllowedValues: [7, 31, 93, 186, 372, 731]
+
+  BackupRetentionPeriod:
+    Type: Number
+    Default: 7
+    MinValue: 0
+    MaxValue: 35
+    Description: Backup retention period in days
+
+  # Feature Flags
+  CreateReadReplica:
+    Type: String
+    Default: 'true'
+    Description: Create read replica for scaling read operations
+    AllowedValues: ['true', 'false']
+
+  EnablePerformanceInsights:
+    Type: String
+    Default: 'true'
+    Description: Enable Performance Insights for query analysis
+    AllowedValues: ['true', 'false']
+
+  EnableEnhancedMonitoring:
+    Type: String
+    Default: 'true'
+    Description: Enable enhanced monitoring via CloudWatch
+    AllowedValues: ['true', 'false']
+
+Conditions:
+  # Conditional resource creation based on parameters
+  ShouldCreateReadReplica: !Equals [!Ref CreateReadReplica, 'true']
+  ShouldEnablePerformanceInsights: !Equals [!Ref EnablePerformanceInsights, 'true']
+  ShouldEnableEnhancedMonitoring: !Equals [!Ref EnableEnhancedMonitoring, 'true']
+  ShouldCreateMonitoringRole: !Equals [!Ref EnableEnhancedMonitoring, 'true']
+
+Resources:
+  # VPC and Networking Infrastructure
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+        - Key: Purpose
+          Value: DatabasePerformanceTuning
+
+  # Internet Gateway for public connectivity (if needed)
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-igw'
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Private Subnets for Database Instances
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-subnet-1'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-subnet-2'
+
+  # Route Tables for Private Subnets
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-rt'
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # Security Group for Database Access
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-db-sg'
+      GroupDescription: Security group for PostgreSQL database access
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: !Ref VpcCidr
+          Description: PostgreSQL access from VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-db-sg'
+
+  # Enhanced Monitoring Role (conditional)
+  EnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Condition: ShouldCreateMonitoringRole
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-rds-monitoring-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole'
+      Path: /
+
+  # DB Subnet Group
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${AWS::StackName}-subnet-group'
+      DBSubnetGroupDescription: Subnet group for performance tuning database
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-subnet-group'
+
+  # Custom Parameter Group with Performance Optimizations
+  CustomParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      DBParameterGroupName: !Sub '${AWS::StackName}-param-group'
+      Description: Performance tuning parameter group for PostgreSQL
+      Family: postgres15
+      Parameters:
+        # Memory Configuration Parameters
+        shared_buffers: '1024MB'        # 25% of instance memory for db.t3.medium
+        work_mem: '16MB'                # Increased for complex sorts and hashes
+        maintenance_work_mem: '256MB'   # For maintenance operations like VACUUM
+        effective_cache_size: '3GB'     # 75% of instance memory for query planner
+
+        # Connection Parameters
+        max_connections: '200'          # Optimized for concurrent workloads
+
+        # Query Planner Cost Parameters
+        random_page_cost: '1.1'         # Optimized for SSD storage
+        seq_page_cost: '1.0'            # Base cost for sequential access
+        effective_io_concurrency: '200' # For SSD storage systems
+        cpu_tuple_cost: '0.01'          # CPU cost per tuple processed
+        cpu_index_tuple_cost: '0.005'   # CPU cost per index entry
+
+        # Statistics and Query Optimization
+        default_statistics_target: '500'     # Higher stats for better query plans
+        constraint_exclusion: 'partition'    # Enable for partitioned tables
+        from_collapse_limit: '20'            # Larger joins optimization
+        join_collapse_limit: '20'            # Complex join optimization
+        geqo_threshold: '15'                  # Genetic query optimization threshold
+        geqo_effort: '8'                      # Effort level for complex queries
+
+        # Parallel Query Parameters
+        max_parallel_workers_per_gather: '2' # Parallel workers per query
+        max_parallel_workers: '4'            # Total parallel workers
+        parallel_tuple_cost: '0.1'           # Cost of processing tuple in parallel
+        parallel_setup_cost: '1000'          # Setup cost for parallel query
+
+        # Autovacuum Optimization
+        autovacuum_vacuum_scale_factor: '0.1'   # More frequent vacuuming
+        autovacuum_analyze_scale_factor: '0.05' # More frequent analyze
+        autovacuum_work_mem: '256MB'            # Memory for autovacuum operations
+
+        # Checkpoint and WAL Configuration
+        checkpoint_completion_target: '0.9'  # Spread checkpoint I/O
+        wal_buffers: '16MB'                  # WAL buffer size
+        checkpoint_timeout: '15min'          # Checkpoint frequency
+
+        # Logging Configuration for Performance Analysis
+        log_min_duration_statement: '1000'  # Log queries taking > 1 second
+        log_checkpoints: '1'                # Log checkpoint activity
+        log_connections: '1'                # Log new connections
+        log_disconnections: '1'             # Log disconnections
+        log_statement: 'none'               # Don't log all statements (performance)
+        log_line_prefix: '%t [%p-%l] %q%u@%d ' # Useful log format
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-param-group'
+        - Key: Purpose
+          Value: PerformanceOptimization
+
+  # Primary RDS Instance with Performance Optimizations
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Ref DBInstanceIdentifier
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: postgres
+      EngineVersion: !Ref DBEngineVersion
+      MasterUsername: !Ref MasterUsername
+      MasterUserPassword: !Ref MasterUserPassword
+      AllocatedStorage: !Ref AllocatedStorage
+      StorageType: !Ref StorageType
+      StorageEncrypted: true
+      
+      # Network Configuration
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      
+      # Parameter Group Association
+      DBParameterGroupName: !Ref CustomParameterGroup
+      
+      # Backup Configuration
+      BackupRetentionPeriod: !Ref BackupRetentionPeriod
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'sun:04:00-sun:05:00'
+      CopyTagsToSnapshot: true
+      
+      # Monitoring Configuration
+      MonitoringInterval: !If [ShouldEnableEnhancedMonitoring, !Ref MonitoringInterval, 0]
+      MonitoringRoleArn: !If [ShouldEnableEnhancedMonitoring, !GetAtt EnhancedMonitoringRole.Arn, !Ref 'AWS::NoValue']
+      EnablePerformanceInsights: !If [ShouldEnablePerformanceInsights, true, false]
+      PerformanceInsightsRetentionPeriod: !If [ShouldEnablePerformanceInsights, !Ref PerformanceInsightsRetentionPeriod, !Ref 'AWS::NoValue']
+      
+      # CloudWatch Logs Exports
+      EnableCloudwatchLogsExports:
+        - postgresql
+      
+      # Multi-AZ for production workloads
+      MultiAZ: false  # Set to true for production
+      
+      # Auto minor version upgrade
+      AutoMinorVersionUpgrade: true
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-primary-db'
+        - Key: Purpose
+          Value: PerformanceTuning
+        - Key: Environment
+          Value: Testing
+
+  # Read Replica for Scaling Read Operations (conditional)
+  DatabaseReadReplica:
+    Type: AWS::RDS::DBInstance
+    Condition: ShouldCreateReadReplica
+    Properties:
+      DBInstanceIdentifier: !Sub '${DBInstanceIdentifier}-replica'
+      DBInstanceClass: !Ref DBInstanceClass
+      SourceDBInstanceIdentifier: !Ref DatabaseInstance
+      
+      # Use same parameter group for consistent performance
+      DBParameterGroupName: !Ref CustomParameterGroup
+      
+      # Monitoring Configuration
+      MonitoringInterval: !If [ShouldEnableEnhancedMonitoring, !Ref MonitoringInterval, 0]
+      MonitoringRoleArn: !If [ShouldEnableEnhancedMonitoring, !GetAtt EnhancedMonitoringRole.Arn, !Ref 'AWS::NoValue']
+      EnablePerformanceInsights: !If [ShouldEnablePerformanceInsights, true, false]
+      PerformanceInsightsRetentionPeriod: !If [ShouldEnablePerformanceInsights, !Ref PerformanceInsightsRetentionPeriod, !Ref 'AWS::NoValue']
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-replica-db'
+        - Key: Purpose
+          Value: ReadScaling
+
+  # CloudWatch Dashboard for Performance Monitoring
+  PerformanceDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-performance-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/RDS", "DatabaseConnections", "DBInstanceIdentifier", "${DatabaseInstance}"],
+                  [".", "CPUUtilization", ".", "."],
+                  [".", "FreeableMemory", ".", "."],
+                  [".", "ReadLatency", ".", "."],
+                  [".", "WriteLatency", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Database Performance Overview",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/RDS", "ReadIOPS", "DBInstanceIdentifier", "${DatabaseInstance}"],
+                  [".", "WriteIOPS", ".", "."],
+                  [".", "ReadThroughput", ".", "."],
+                  [".", "WriteThroughput", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Database I/O Performance",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/RDS", "BufferCacheHitRatio", "DBInstanceIdentifier", "${DatabaseInstance}"],
+                  [".", "CommitLatency", ".", "."],
+                  [".", "CommitThroughput", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Advanced Database Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms for Performance Monitoring
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-high-cpu'
+      AlarmDescription: High CPU utilization on tuned database
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DatabaseInstance
+      TreatMissingData: notBreaching
+
+  HighConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-high-connections'
+      AlarmDescription: High connection count on tuned database
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 150
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DatabaseInstance
+      TreatMissingData: notBreaching
+
+  HighReadLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-high-read-latency'
+      AlarmDescription: High read latency on tuned database
+      MetricName: ReadLatency
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 0.1
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DatabaseInstance
+      TreatMissingData: notBreaching
+
+  LowBufferCacheHitRatioAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-low-buffer-cache-hit-ratio'
+      AlarmDescription: Low buffer cache hit ratio indicating potential memory issues
+      MetricName: BufferCacheHitRatio
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 95
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DatabaseInstance
+      TreatMissingData: notBreaching
+
+Outputs:
+  # VPC and Network Information
+  VPCId:
+    Description: VPC ID for the database infrastructure
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-vpc-id'
+
+  PrivateSubnet1Id:
+    Description: Private Subnet 1 ID
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-private-subnet-1-id'
+
+  PrivateSubnet2Id:
+    Description: Private Subnet 2 ID
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-private-subnet-2-id'
+
+  DatabaseSecurityGroupId:
+    Description: Security Group ID for database access
+    Value: !Ref DatabaseSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-db-sg-id'
+
+  # Database Information
+  DatabaseInstanceIdentifier:
+    Description: RDS instance identifier
+    Value: !Ref DatabaseInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-db-instance-id'
+
+  DatabaseEndpoint:
+    Description: RDS instance endpoint for application connections
+    Value: !GetAtt DatabaseInstance.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-db-endpoint'
+
+  DatabasePort:
+    Description: RDS instance port
+    Value: !GetAtt DatabaseInstance.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-db-port'
+
+  ReadReplicaEndpoint:
+    Condition: ShouldCreateReadReplica
+    Description: Read replica endpoint for read-only operations
+    Value: !GetAtt DatabaseReadReplica.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-replica-endpoint'
+
+  # Parameter Group Information
+  ParameterGroupName:
+    Description: Custom parameter group name
+    Value: !Ref CustomParameterGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-param-group-name'
+
+  # Monitoring Information
+  PerformanceDashboardURL:
+    Description: CloudWatch dashboard URL for performance monitoring
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-performance-dashboard'
+
+  PerformanceInsightsURL:
+    Condition: ShouldEnablePerformanceInsights
+    Description: Performance Insights URL for detailed query analysis
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/rds/home?region=${AWS::Region}#performance-insights-v20206:/resourceId/${DatabaseInstance.DbiResourceId}'
+
+  # Connection Information
+  DatabaseConnectionString:
+    Description: Sample connection string for applications
+    Value: !Sub 'postgresql://${MasterUsername}@${DatabaseInstance.Endpoint.Address}:${DatabaseInstance.Endpoint.Port}/postgres'
+
+  # Performance Tuning Information
+  OptimizedParameters:
+    Description: Key optimized parameters in the custom parameter group
+    Value: !Sub |
+      shared_buffers: 1024MB
+      work_mem: 16MB
+      maintenance_work_mem: 256MB
+      effective_cache_size: 3GB
+      max_connections: 200
+      random_page_cost: 1.1
+      default_statistics_target: 500
+
+  # Cost Information
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for the database infrastructure (USD)
+    Value: !Sub |
+      Primary Instance (${DBInstanceClass}): ~$50-80/month
+      Read Replica (if enabled): ~$50-80/month
+      Storage (${AllocatedStorage}GB ${StorageType}): ~$10-15/month
+      Performance Insights: Free for 7 days retention
+      Enhanced Monitoring: ~$2-5/month
+      Total Estimated: ~$110-180/month
+
+  # Next Steps
+  NextSteps:
+    Description: Recommended next steps after deployment
+    Value: |
+      1. Connect to database using provided endpoint
+      2. Create test schema and load sample data
+      3. Run baseline performance tests
+      4. Monitor Performance Insights dashboard
+      5. Review CloudWatch alarms and dashboard
+      6. Adjust parameters based on workload patterns
+      7. Consider scaling read operations to read replica

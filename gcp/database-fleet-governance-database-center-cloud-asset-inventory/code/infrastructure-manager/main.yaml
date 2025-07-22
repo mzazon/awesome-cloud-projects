@@ -1,0 +1,621 @@
+# Google Cloud Infrastructure Manager Configuration
+# Recipe: Architecting Centralized Database Fleet Governance with Database Center and Cloud Asset Inventory
+# This configuration deploys the complete infrastructure for database governance automation
+
+apiVersion: infrastructure-manager.googleapis.com/v1
+kind: Blueprint
+metadata:
+  name: database-fleet-governance
+  description: "Centralized database fleet governance with Database Center and Cloud Asset Inventory"
+  annotations:
+    recipe-id: "db7f3a9c"
+    recipe-version: "1.2"
+    infrastructure-manager-version: "1.0"
+
+spec:
+  # Input variables for customization
+  inputs:
+    - name: project_id
+      description: "Google Cloud project ID for deployment"
+      type: string
+      required: true
+    - name: region
+      description: "Default region for regional resources"
+      type: string
+      default: "us-central1"
+    - name: zone
+      description: "Default zone for zonal resources"
+      type: string
+      default: "us-central1-a"
+    - name: environment
+      description: "Environment name (dev, test, prod)"
+      type: string
+      default: "dev"
+    - name: random_suffix
+      description: "Random suffix for unique resource names"
+      type: string
+      default: "a1b2c3"
+
+  # Resource definitions
+  resources:
+    # ================================================
+    # IAM & Service Accounts
+    # ================================================
+    
+    # Service account for database governance automation
+    - name: governance-service-account
+      type: gcp-types/iam-v1:projects.serviceAccounts
+      properties:
+        parent: projects/$(ref.project_id.value)
+        accountId: db-governance-sa
+        serviceAccount:
+          displayName: "Database Governance Service Account"
+          description: "Service account for automated database governance workflows"
+      metadata:
+        dependsOn: []
+
+    # IAM bindings for the service account
+    - name: governance-sa-asset-viewer
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: $(ref.project_id.value)
+        role: roles/cloudasset.viewer
+        member: serviceAccount:$(ref.governance-service-account.email)
+
+    - name: governance-sa-workflows-invoker
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: $(ref.project_id.value)
+        role: roles/workflows.invoker
+        member: serviceAccount:$(ref.governance-service-account.email)
+
+    - name: governance-sa-monitoring-writer
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: $(ref.project_id.value)
+        role: roles/monitoring.metricWriter
+        member: serviceAccount:$(ref.governance-service-account.email)
+
+    - name: governance-sa-aiplatform-user
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: $(ref.project_id.value)
+        role: roles/aiplatform.user
+        member: serviceAccount:$(ref.governance-service-account.email)
+
+    # ================================================
+    # Sample Database Fleet for Testing
+    # ================================================
+    
+    # Cloud SQL instance for fleet testing
+    - name: fleet-cloudsql-instance
+      type: gcp-types/sqladmin-v1beta4:instances
+      properties:
+        name: fleet-sql-$(ref.random_suffix.value)
+        project: $(ref.project_id.value)
+        region: $(ref.region.value)
+        databaseVersion: POSTGRES_15
+        settings:
+          tier: db-f1-micro
+          backupConfiguration:
+            enabled: true
+            startTime: "02:00"
+            binaryLogEnabled: true
+          storageAutoResize: true
+          deletionProtectionEnabled: true
+          ipConfiguration:
+            ipv4Enabled: false
+            privateNetwork: $(ref.vpc-network.selfLink)
+            requireSsl: true
+        rootPassword: "TempPassword123!"
+      metadata:
+        dependsOn: 
+          - vpc-network
+          - private-ip-allocation
+
+    # Spanner instance for distributed database governance
+    - name: fleet-spanner-instance
+      type: gcp-types/spanner-v1:projects.instances
+      properties:
+        parent: projects/$(ref.project_id.value)
+        instanceId: fleet-spanner-$(ref.random_suffix.value)
+        instance:
+          displayName: "Fleet Governance Spanner Instance"
+          config: projects/$(ref.project_id.value)/instanceConfigs/regional-$(ref.region.value)
+          nodeCount: 1
+          labels:
+            environment: $(ref.environment.value)
+            purpose: fleet-governance
+
+    # Bigtable instance for NoSQL governance testing
+    - name: fleet-bigtable-instance
+      type: gcp-types/bigtableadmin-v2:projects.instances
+      properties:
+        parent: projects/$(ref.project_id.value)
+        instanceId: fleet-bigtable-$(ref.random_suffix.value)
+        instance:
+          displayName: "Fleet Governance Bigtable Instance"
+          type: DEVELOPMENT
+          labels:
+            environment: $(ref.environment.value)
+            purpose: fleet-governance
+        clusters:
+          fleet-cluster:
+            location: projects/$(ref.project_id.value)/locations/$(ref.zone.value)
+            serveNodes: 1
+            defaultStorageType: SSD
+
+    # ================================================
+    # Networking Infrastructure
+    # ================================================
+    
+    # VPC network for secure database connectivity
+    - name: vpc-network
+      type: gcp-types/compute-v1:networks
+      properties:
+        name: db-governance-vpc-$(ref.random_suffix.value)
+        project: $(ref.project_id.value)
+        routingConfig:
+          routingMode: REGIONAL
+        autoCreateSubnetworks: false
+
+    # Subnet for database resources
+    - name: database-subnet
+      type: gcp-types/compute-v1:subnetworks
+      properties:
+        name: db-governance-subnet-$(ref.random_suffix.value)
+        project: $(ref.project_id.value)
+        region: $(ref.region.value)
+        network: $(ref.vpc-network.selfLink)
+        ipCidrRange: "10.0.0.0/24"
+        privateIpGoogleAccess: true
+      metadata:
+        dependsOn:
+          - vpc-network
+
+    # Private IP allocation for Cloud SQL
+    - name: private-ip-allocation
+      type: gcp-types/servicenetworking-v1:services.connections
+      properties:
+        parent: services/servicenetworking.googleapis.com
+        network: $(ref.vpc-network.selfLink)
+        reservedPeeringRanges:
+          - google-managed-services-default
+      metadata:
+        dependsOn:
+          - vpc-network
+          - private-ip-range
+
+    # Private IP range for managed services
+    - name: private-ip-range
+      type: gcp-types/compute-v1:globalAddresses
+      properties:
+        name: google-managed-services-default
+        project: $(ref.project_id.value)
+        purpose: VPC_PEERING
+        addressType: INTERNAL
+        prefixLength: 16
+        network: $(ref.vpc-network.selfLink)
+      metadata:
+        dependsOn:
+          - vpc-network
+
+    # ================================================
+    # Data Storage and Analytics
+    # ================================================
+    
+    # BigQuery dataset for asset inventory exports
+    - name: database-governance-dataset
+      type: gcp-types/bigquery-v2:datasets
+      properties:
+        projectId: $(ref.project_id.value)
+        datasetId: database_governance
+        location: $(ref.region.value)
+        description: "Database fleet asset inventory and governance data"
+        labels:
+          environment: $(ref.environment.value)
+          purpose: governance
+        access:
+          - role: OWNER
+            userByEmail: $(ref.governance-service-account.email)
+
+    # BigQuery table for asset inventory
+    - name: asset-inventory-table
+      type: gcp-types/bigquery-v2:tables
+      properties:
+        projectId: $(ref.project_id.value)
+        datasetId: $(ref.database-governance-dataset.datasetId)
+        tableId: asset_inventory
+        description: "Cloud Asset Inventory exports for database resources"
+        schema:
+          fields:
+            - name: name
+              type: STRING
+              mode: REQUIRED
+            - name: asset_type
+              type: STRING
+              mode: REQUIRED
+            - name: resource
+              type: RECORD
+              mode: NULLABLE
+              fields:
+                - name: data
+                  type: JSON
+                  mode: NULLABLE
+        labels:
+          environment: $(ref.environment.value)
+      metadata:
+        dependsOn:
+          - database-governance-dataset
+
+    # Cloud Storage bucket for compliance reports and exports
+    - name: governance-storage-bucket
+      type: gcp-types/storage-v1:buckets
+      properties:
+        name: db-governance-assets-$(ref.random_suffix.value)
+        project: $(ref.project_id.value)
+        location: $(ref.region.value)
+        storageClass: STANDARD
+        versioning:
+          enabled: true
+        encryption:
+          defaultKmsKeyName: $(ref.governance-kms-key.name)
+        labels:
+          environment: $(ref.environment.value)
+          purpose: governance
+        lifecycle:
+          rule:
+            - action:
+                type: Delete
+              condition:
+                age: 90  # Delete objects older than 90 days
+      metadata:
+        dependsOn:
+          - governance-kms-key
+
+    # ================================================
+    # Security and Encryption
+    # ================================================
+    
+    # KMS key ring for encryption
+    - name: governance-key-ring
+      type: gcp-types/cloudkms-v1:projects.locations.keyRings
+      properties:
+        parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+        keyRingId: db-governance-keys-$(ref.random_suffix.value)
+
+    # KMS key for data encryption
+    - name: governance-kms-key
+      type: gcp-types/cloudkms-v1:projects.locations.keyRings.cryptoKeys
+      properties:
+        parent: $(ref.governance-key-ring.name)
+        cryptoKeyId: governance-data-key
+        cryptoKey:
+          purpose: ENCRYPT_DECRYPT
+          versionTemplate:
+            algorithm: GOOGLE_SYMMETRIC_ENCRYPTION
+            protectionLevel: SOFTWARE
+          labels:
+            environment: $(ref.environment.value)
+      metadata:
+        dependsOn:
+          - governance-key-ring
+
+    # ================================================
+    # Pub/Sub for Event Processing
+    # ================================================
+    
+    # Pub/Sub topic for database asset change notifications
+    - name: asset-change-topic
+      type: gcp-types/pubsub-v1:projects.topics
+      properties:
+        name: projects/$(ref.project_id.value)/topics/database-asset-changes
+        labels:
+          environment: $(ref.environment.value)
+          purpose: governance
+
+    # Pub/Sub subscription for governance automation
+    - name: governance-subscription
+      type: gcp-types/pubsub-v1:projects.subscriptions
+      properties:
+        name: projects/$(ref.project_id.value)/subscriptions/governance-automation
+        topic: $(ref.asset-change-topic.name)
+        pushConfig:
+          pushEndpoint: https://workflows.googleapis.com/v1/projects/$(ref.project_id.value)/locations/$(ref.region.value)/workflows/database-governance-workflow/executions
+          oidcToken:
+            serviceAccountEmail: $(ref.governance-service-account.email)
+        ackDeadlineSeconds: 600
+        messageRetentionDuration: 604800s  # 7 days
+        labels:
+          environment: $(ref.environment.value)
+      metadata:
+        dependsOn:
+          - asset-change-topic
+          - governance-service-account
+
+    # ================================================
+    # Cloud Functions for Compliance Reporting
+    # ================================================
+    
+    # Cloud Function source code in Cloud Storage
+    - name: function-source-bucket
+      type: gcp-types/storage-v1:buckets
+      properties:
+        name: governance-function-source-$(ref.random_suffix.value)
+        project: $(ref.project_id.value)
+        location: $(ref.region.value)
+        storageClass: STANDARD
+        labels:
+          environment: $(ref.environment.value)
+          purpose: function-source
+
+    # Cloud Function for compliance reporting
+    - name: compliance-reporter-function
+      type: gcp-types/cloudfunctions-v1:projects.locations.functions
+      properties:
+        parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+        functionId: compliance-reporter
+        function:
+          name: projects/$(ref.project_id.value)/locations/$(ref.region.value)/functions/compliance-reporter
+          description: "Automated compliance reporting for database governance"
+          sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/compliance-reporter.zip
+          httpsTrigger: {}
+          runtime: python39
+          entryPoint: generate_compliance_report
+          timeout: 540s
+          availableMemoryMb: 256
+          serviceAccountEmail: $(ref.governance-service-account.email)
+          environmentVariables:
+            PROJECT_ID: $(ref.project_id.value)
+            RANDOM_SUFFIX: $(ref.random_suffix.value)
+          labels:
+            environment: $(ref.environment.value)
+            purpose: governance
+      metadata:
+        dependsOn:
+          - function-source-bucket
+          - governance-service-account
+
+    # ================================================
+    # Cloud Workflows for Governance Automation
+    # ================================================
+    
+    # Cloud Workflow for database governance
+    - name: governance-workflow
+      type: gcp-types/workflows-v1:projects.locations.workflows
+      properties:
+        parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+        workflowId: database-governance-workflow
+        workflow:
+          description: "Automated database governance and compliance checking"
+          serviceAccount: $(ref.governance-service-account.email)
+          sourceContents: |
+            main:
+              params: [input]
+              steps:
+                - checkAssetChange:
+                    call: http.get
+                    args:
+                      url: ${"https://cloudasset.googleapis.com/v1/projects/" + sys.get_env("PROJECT_ID") + "/assets"}
+                      auth:
+                        type: OAuth2
+                    result: assets
+                - evaluateCompliance:
+                    for:
+                      value: asset
+                      in: ${default(assets.body.assets, [])}
+                      steps:
+                        - checkDatabaseSecurity:
+                            switch:
+                              - condition: ${asset.assetType == "sqladmin.googleapis.com/Instance"}
+                                steps:
+                                  - validateCloudSQL:
+                                      call: validateSQLSecurity
+                                      args:
+                                        instance: ${asset}
+                              - condition: ${asset.assetType == "spanner.googleapis.com/Instance"}
+                                steps:
+                                  - validateSpanner:
+                                      call: validateSpannerSecurity
+                                      args:
+                                        instance: ${asset}
+                - generateReport:
+                    call: http.post
+                    args:
+                      url: ${"https://monitoring.googleapis.com/v3/projects/" + sys.get_env("PROJECT_ID") + "/timeSeries"}
+                      auth:
+                        type: OAuth2
+                      body:
+                        timeSeries:
+                          - metric:
+                              type: "custom.googleapis.com/database/governance_score"
+                            points:
+                              - value:
+                                  doubleValue: 0.95
+                                interval:
+                                  endTime: ${time.now()}
+            
+            validateSQLSecurity:
+              params: [instance]
+              steps:
+                - checkBackupConfig:
+                    return: ${default(instance.resource.data.settings.backupConfiguration.enabled, false)}
+            
+            validateSpannerSecurity:
+              params: [instance]
+              steps:
+                - checkEncryption:
+                    return: ${instance.resource.data.encryptionConfig != null}
+          labels:
+            environment: $(ref.environment.value)
+            purpose: governance
+      metadata:
+        dependsOn:
+          - governance-service-account
+
+    # ================================================
+    # Cloud Scheduler for Continuous Governance
+    # ================================================
+    
+    # Cloud Scheduler job for periodic governance checks
+    - name: governance-scheduler
+      type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+      properties:
+        parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+        name: projects/$(ref.project_id.value)/locations/$(ref.region.value)/jobs/governance-scheduler
+        description: "Periodic database governance compliance checks"
+        schedule: "0 */6 * * *"  # Every 6 hours
+        timeZone: "America/New_York"
+        httpTarget:
+          uri: https://$(ref.region.value)-$(ref.project_id.value).cloudfunctions.net/compliance-reporter
+          httpMethod: GET
+          oidcToken:
+            serviceAccountEmail: $(ref.governance-service-account.email)
+        labels:
+          environment: $(ref.environment.value)
+          purpose: governance
+      metadata:
+        dependsOn:
+          - compliance-reporter-function
+          - governance-service-account
+
+    # ================================================
+    # Monitoring and Logging
+    # ================================================
+    
+    # Log-based metric for governance monitoring
+    - name: governance-score-metric
+      type: gcp-types/logging-v2:projects.metrics
+      properties:
+        parent: projects/$(ref.project_id.value)
+        metricId: database_compliance_score
+        metric:
+          description: "Database fleet compliance score metric"
+          filter: 'resource.type="cloud_function" AND "compliance"'
+          labelExtractors:
+            project_id: 'EXTRACT(jsonPayload.project_id)'
+            compliance_score: 'EXTRACT(jsonPayload.compliance_percentage)'
+          valueExtractor: 'EXTRACT(jsonPayload.compliance_percentage)'
+          metricDescriptor:
+            metricKind: GAUGE
+            valueType: DOUBLE
+            displayName: "Database Compliance Score"
+
+    # Log-based metric for governance events
+    - name: governance-events-metric
+      type: gcp-types/logging-v2:projects.metrics
+      properties:
+        parent: projects/$(ref.project_id.value)
+        metricId: governance_events
+        metric:
+          description: "Database governance events counter"
+          filter: 'resource.type="cloud_function" AND resource.labels.function_name="compliance-reporter"'
+          metricDescriptor:
+            metricKind: CUMULATIVE
+            valueType: INT64
+            displayName: "Governance Events"
+
+    # Notification channel for governance alerts
+    - name: governance-notification-channel
+      type: gcp-types/monitoring-v1:projects.notificationChannels
+      properties:
+        parent: projects/$(ref.project_id.value)
+        notificationChannel:
+          type: email
+          displayName: "Database Governance Alerts"
+          description: "Email notifications for database governance violations"
+          labels:
+            email_address: admin@example.com  # Replace with actual email
+          enabled: true
+
+    # Alert policy for governance violations
+    - name: governance-alert-policy
+      type: gcp-types/monitoring-v1:projects.alertPolicies
+      properties:
+        parent: projects/$(ref.project_id.value)
+        alertPolicy:
+          displayName: "Database Governance Violations"
+          documentation:
+            content: "Alert triggered when database compliance score indicates violations"
+            mimeType: text/markdown
+          conditions:
+            - displayName: "Low compliance score"
+              conditionThreshold:
+                filter: 'metric.type="logging.googleapis.com/user/database_compliance_score"'
+                comparison: COMPARISON_GREATER_THAN
+                thresholdValue: 5.0
+                duration: 300s
+                aggregations:
+                  - alignmentPeriod: 300s
+                    perSeriesAligner: ALIGN_MEAN
+                    crossSeriesReducer: REDUCE_MEAN
+          notificationChannels:
+            - $(ref.governance-notification-channel.name)
+          alertStrategy:
+            autoClose: 1800s
+          enabled: true
+      metadata:
+        dependsOn:
+          - governance-notification-channel
+          - governance-score-metric
+
+  # ================================================
+  # Output Values
+  # ================================================
+  
+  outputs:
+    - name: project_id
+      description: "Google Cloud project ID"
+      value: $(ref.project_id.value)
+    
+    - name: region
+      description: "Deployment region"
+      value: $(ref.region.value)
+    
+    - name: governance_service_account
+      description: "Service account email for governance automation"
+      value: $(ref.governance-service-account.email)
+    
+    - name: cloudsql_instance_name
+      description: "Cloud SQL instance name for testing"
+      value: $(ref.fleet-cloudsql-instance.name)
+    
+    - name: spanner_instance_name
+      description: "Spanner instance name for testing"
+      value: $(ref.fleet-spanner-instance.name)
+    
+    - name: bigtable_instance_name
+      description: "Bigtable instance name for testing"
+      value: $(ref.fleet-bigtable-instance.name)
+    
+    - name: bigquery_dataset
+      description: "BigQuery dataset for asset inventory"
+      value: $(ref.database-governance-dataset.datasetId)
+    
+    - name: storage_bucket
+      description: "Cloud Storage bucket for compliance reports"
+      value: $(ref.governance-storage-bucket.name)
+    
+    - name: pubsub_topic
+      description: "Pub/Sub topic for asset change notifications"
+      value: $(ref.asset-change-topic.name)
+    
+    - name: compliance_function_url
+      description: "Cloud Function URL for compliance reporting"
+      value: https://$(ref.region.value)-$(ref.project_id.value).cloudfunctions.net/compliance-reporter
+    
+    - name: workflow_name
+      description: "Cloud Workflow for governance automation"
+      value: $(ref.governance-workflow.name)
+    
+    - name: database_center_url
+      description: "Database Center console URL"
+      value: https://console.cloud.google.com/database-center?project=$(ref.project_id.value)
+    
+    - name: vpc_network
+      description: "VPC network for secure database connectivity"
+      value: $(ref.vpc-network.name)
+    
+    - name: kms_key
+      description: "KMS key for data encryption"
+      value: $(ref.governance-kms-key.name)

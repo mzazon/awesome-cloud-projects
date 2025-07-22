@@ -1,0 +1,757 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure for Creating No-Code AI Applications with PartyRock and S3 static website hosting with CloudFront CDN'
+
+# Parameters for customization
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'partyrock-ai-app'
+    Description: 'Name prefix for all resources created by this template'
+    AllowedPattern: '^[a-z0-9-]{3,30}$'
+    ConstraintDescription: 'Must be 3-30 characters, lowercase letters, numbers, and hyphens only'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment for deployment (affects resource configurations)'
+
+  PartyRockAppTitle:
+    Type: String
+    Default: 'AI Business Name Generator'
+    Description: 'Title for your PartyRock AI application to be displayed on the website'
+    MaxLength: 100
+
+  PartyRockAppURL:
+    Type: String
+    Default: 'https://partyrock.aws/'
+    Description: 'URL of your published PartyRock application (update after creating your app)'
+    AllowedPattern: '^https://.*'
+    ConstraintDescription: 'Must be a valid HTTPS URL'
+
+  EnableCloudFrontLogging:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable CloudFront access logging (additional S3 storage costs apply)'
+
+  CloudFrontPriceClass:
+    Type: String
+    Default: 'PriceClass_100'
+    AllowedValues: ['PriceClass_All', 'PriceClass_200', 'PriceClass_100']
+    Description: 'CloudFront price class (PriceClass_100 = US/EU only, PriceClass_200 = US/EU/Asia, PriceClass_All = Global)'
+
+# Conditions for conditional resource creation
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  EnableLogging: !Equals [!Ref EnableCloudFrontLogging, 'true']
+  CreateLogsBucket: !And [!Condition EnableLogging, !Condition IsProduction]
+
+# Resources section
+Resources:
+  # S3 Bucket for static website hosting
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-website-${AWS::AccountId}-${AWS::Region}'
+      # Enable versioning for production environments
+      VersioningConfiguration:
+        Status: !If [IsProduction, 'Enabled', 'Suspended']
+      # Server-side encryption configuration
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      # Website configuration
+      WebsiteConfiguration:
+        IndexDocument: 'index.html'
+        ErrorDocument: 'error.html'
+      # Public access configuration (required for static website hosting)
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      # Lifecycle configuration for cost optimization
+      LifecycleConfiguration:
+        Rules:
+          - Id: 'DeleteOldVersions'
+            Status: 'Enabled'
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+          - Id: 'AbortIncompleteMultipartUploads'
+            Status: 'Enabled'
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      # CORS configuration for PartyRock integration
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: ['GET', 'HEAD']
+            AllowedOrigins: ['*']
+            MaxAge: 3600
+      # Tagging
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'PartyRock AI Application Hosting'
+
+  # Bucket policy for public read access
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: 'PublicReadGetObject'
+            Effect: 'Allow'
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub '${WebsiteBucket}/*'
+          # Additional security headers for production
+          - !If
+            - IsProduction
+            - Sid: 'DenyInsecureConnections'
+              Effect: 'Deny'
+              Principal: '*'
+              Action: 's3:*'
+              Resource: 
+                - !Sub '${WebsiteBucket}/*'
+                - !Ref WebsiteBucket
+              Condition:
+                Bool:
+                  'aws:SecureTransport': 'false'
+            - !Ref 'AWS::NoValue'
+
+  # S3 Bucket for CloudFront access logs (conditional)
+  CloudFrontLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateLogsBucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-cf-logs-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # Lifecycle configuration for log retention
+      LifecycleConfiguration:
+        Rules:
+          - Id: 'DeleteOldLogs'
+            Status: 'Enabled'
+            ExpirationInDays: 90
+            Transitions:
+              - StorageClass: 'STANDARD_IA'
+                TransitionInDays: 30
+              - StorageClass: 'GLACIER'
+                TransitionInDays: 60
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'CloudFront Access Logs'
+
+  # CloudFront Origin Access Identity for secure S3 access
+  CloudFrontOriginAccessIdentity:
+    Type: AWS::CloudFront::OriginAccessIdentity
+    Properties:
+      OriginAccessIdentityConfig:
+        Comment: !Sub 'OAI for ${ProjectName} PartyRock application'
+
+  # CloudFront Distribution for global content delivery
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub 'CDN for ${ProjectName} PartyRock AI Application'
+        # Enable distribution
+        Enabled: true
+        # Default root object
+        DefaultRootObject: 'index.html'
+        # Price class configuration
+        PriceClass: !Ref CloudFrontPriceClass
+        # Origins configuration
+        Origins:
+          - Id: !Sub 'S3-${WebsiteBucket}'
+            DomainName: !GetAtt WebsiteBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${CloudFrontOriginAccessIdentity}'
+        # Default cache behavior
+        DefaultCacheBehavior:
+          TargetOriginId: !Sub 'S3-${WebsiteBucket}'
+          ViewerProtocolPolicy: 'redirect-to-https'
+          AllowedMethods: ['GET', 'HEAD', 'OPTIONS']
+          CachedMethods: ['GET', 'HEAD']
+          Compress: true
+          # Cache policy for static websites
+          CachePolicyId: '658327ea-f89d-4fab-a63d-7e88639e58f6' # Managed-CachingOptimized
+          OriginRequestPolicyId: '88a5eaf4-2fd4-4709-b370-b4c650ea3fcf' # Managed-CORS-S3Origin
+          # Security headers
+          ResponseHeadersPolicyId: !If
+            - IsProduction
+            - '67f7725c-6f97-4210-82d7-5512b31e9d03' # Managed-SecurityHeadersPolicy
+            - !Ref 'AWS::NoValue'
+        # Custom error pages
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: '/index.html'
+            ErrorCachingMinTTL: 300
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: '/index.html'
+            ErrorCachingMinTTL: 300
+        # HTTP version
+        HttpVersion: 'http2'
+        # IPv6 support
+        IPV6Enabled: true
+        # Logging configuration (conditional)
+        Logging: !If
+          - EnableLogging
+          - Bucket: !GetAtt CloudFrontLogsBucket.DomainName
+            IncludeCookies: false
+            Prefix: !Sub '${ProjectName}-cf-logs/'
+          - !Ref 'AWS::NoValue'
+        # Web ACL for security (production only)
+        WebACLId: !If [IsProduction, !Ref WebApplicationFirewall, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'PartyRock AI Application CDN'
+
+  # WAF Web ACL for production security
+  WebApplicationFirewall:
+    Type: AWS::WAFv2::WebACL
+    Condition: IsProduction
+    Properties:
+      Name: !Sub '${ProjectName}-waf-${Environment}'
+      Scope: 'CLOUDFRONT'
+      DefaultAction:
+        Allow: {}
+      Description: 'Web ACL for PartyRock AI application security'
+      Rules:
+        # Rate limiting rule
+        - Name: 'RateLimitRule'
+          Priority: 1
+          Statement:
+            RateBasedStatement:
+              Limit: 2000
+              AggregateKeyType: 'IP'
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: 'RateLimitRule'
+        # AWS Managed Rule - Core Rule Set
+        - Name: 'AWSManagedRulesCommonRuleSet'
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: 'AWS'
+              Name: 'AWSManagedRulesCommonRuleSet'
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: 'CommonRuleSetMetric'
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${ProjectName}WebACL'
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+
+  # Lambda function for website content deployment
+  WebsiteContentDeploymentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-content-deployment'
+      Runtime: 'python3.11'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref WebsiteBucket
+          PARTYROCK_APP_TITLE: !Ref PartyRockAppTitle
+          PARTYROCK_APP_URL: !Ref PartyRockAppURL
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+          import os
+          
+          def lambda_handler(event, context):
+              try:
+                  s3 = boto3.client('s3')
+                  bucket_name = os.environ['BUCKET_NAME']
+                  app_title = os.environ['PARTYROCK_APP_TITLE']
+                  app_url = os.environ['PARTYROCK_APP_URL']
+                  project_name = os.environ['PROJECT_NAME']
+                  
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      # Generate HTML content
+                      html_content = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="AI-powered business applications built with Amazon PartyRock">
+    <title>{app_title} - Powered by Amazon PartyRock</title>
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+        
+        body {{
+            font-family: 'Amazon Ember', 'Helvetica Neue', Arial, sans-serif;
+            line-height: 1.6;
+            color: #232f3e;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+        }}
+        
+        .container {{
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }}
+        
+        .header {{
+            text-align: center;
+            margin-bottom: 40px;
+            color: white;
+        }}
+        
+        .header h1 {{
+            font-size: 3rem;
+            margin-bottom: 10px;
+            font-weight: 300;
+        }}
+        
+        .header p {{
+            font-size: 1.2rem;
+            opacity: 0.9;
+        }}
+        
+        .main-content {{
+            background: white;
+            border-radius: 12px;
+            padding: 40px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            margin-bottom: 30px;
+        }}
+        
+        .partyrock-section {{
+            text-align: center;
+            margin: 40px 0;
+        }}
+        
+        .app-showcase {{
+            background: linear-gradient(135deg, #ff9900 0%, #ff6b35 100%);
+            padding: 30px;
+            border-radius: 8px;
+            margin: 30px 0;
+            color: white;
+        }}
+        
+        .btn {{
+            display: inline-block;
+            background: #232f3e;
+            color: white;
+            padding: 15px 30px;
+            text-decoration: none;
+            border-radius: 6px;
+            font-weight: bold;
+            transition: all 0.3s ease;
+            border: none;
+            cursor: pointer;
+            font-size: 1.1rem;
+        }}
+        
+        .btn:hover {{
+            background: #37475a;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }}
+        
+        .btn-primary {{
+            background: #ff9900;
+        }}
+        
+        .btn-primary:hover {{
+            background: #e88b00;
+        }}
+        
+        .features {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin: 40px 0;
+        }}
+        
+        .feature {{
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border-left: 4px solid #ff9900;
+        }}
+        
+        .feature h3 {{
+            color: #232f3e;
+            margin-bottom: 10px;
+        }}
+        
+        .architecture {{
+            margin: 40px 0;
+            padding: 30px;
+            background: #f8f9fa;
+            border-radius: 8px;
+        }}
+        
+        .tech-stack {{
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            margin: 30px 0;
+            flex-wrap: wrap;
+        }}
+        
+        .tech-badge {{
+            background: #232f3e;
+            color: white;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 0.9rem;
+        }}
+        
+        .footer {{
+            text-align: center;
+            color: white;
+            margin-top: 40px;
+            opacity: 0.8;
+        }}
+        
+        @media (max-width: 768px) {{
+            .header h1 {{
+                font-size: 2rem;
+            }}
+            
+            .main-content {{
+                padding: 20px;
+            }}
+            
+            .container {{
+                padding: 10px;
+            }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <h1>{app_title}</h1>
+            <p>Experience the power of generative AI with no-code development</p>
+        </header>
+        
+        <main class="main-content">
+            <div class="partyrock-section">
+                <h2>🎉 Powered by Amazon PartyRock</h2>
+                <p>This application demonstrates the ease of building AI-powered solutions using Amazon's no-code platform.</p>
+            </div>
+            
+            <div class="app-showcase">
+                <h2>🚀 Try the AI Application</h2>
+                <p>Experience our intelligent business name generator powered by Amazon Bedrock's advanced language models.</p>
+                <br>
+                <a href="{app_url}" class="btn btn-primary" target="_blank" rel="noopener">
+                    Launch AI Application →
+                </a>
+            </div>
+            
+            <div class="features">
+                <div class="feature">
+                    <h3>🤖 AI-Powered Generation</h3>
+                    <p>Leverages Amazon Bedrock's foundation models for intelligent content creation</p>
+                </div>
+                
+                <div class="feature">
+                    <h3>🎯 Industry-Specific</h3>
+                    <p>Tailored suggestions based on industry type and target audience analysis</p>
+                </div>
+                
+                <div class="feature">
+                    <h3>⚡ Real-Time Processing</h3>
+                    <p>Instant AI responses powered by serverless infrastructure</p>
+                </div>
+                
+                <div class="feature">
+                    <h3>🎨 Visual Concepts</h3>
+                    <p>AI-generated logo concepts and branding suggestions</p>
+                </div>
+            </div>
+            
+            <div class="architecture">
+                <h2>🏗️ Solution Architecture</h2>
+                <p>This application is built using a modern serverless architecture:</p>
+                
+                <div class="tech-stack">
+                    <span class="tech-badge">Amazon PartyRock</span>
+                    <span class="tech-badge">Amazon Bedrock</span>
+                    <span class="tech-badge">Amazon S3</span>
+                    <span class="tech-badge">Amazon CloudFront</span>
+                    <span class="tech-badge">AWS Lambda</span>
+                </div>
+                
+                <ul style="margin-top: 20px; text-align: left;">
+                    <li><strong>PartyRock</strong>: No-code AI application development platform</li>
+                    <li><strong>Bedrock</strong>: Managed foundation models for AI capabilities</li>
+                    <li><strong>S3</strong>: Scalable static website hosting with 99.999999999% durability</li>
+                    <li><strong>CloudFront</strong>: Global content delivery network with SSL/TLS</li>
+                    <li><strong>Lambda</strong>: Serverless content deployment and management</li>
+                </ul>
+            </div>
+            
+            <div style="text-align: center; margin-top: 40px;">
+                <h2>📚 Learn More</h2>
+                <p>Explore the power of no-code AI development with Amazon PartyRock</p>
+                <br>
+                <a href="https://partyrock.aws/" class="btn" target="_blank" rel="noopener">
+                    Visit PartyRock Platform
+                </a>
+            </div>
+        </main>
+        
+        <footer class="footer">
+            <p>Built with ❤️ using Amazon Web Services | Project: {project_name}</p>
+            <p>Deployed via AWS CloudFormation</p>
+        </footer>
+    </div>
+</body>
+</html>'''
+                      
+                      # Error page content
+                      error_content = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Page Not Found - PartyRock AI App</title>
+    <style>
+        body { 
+            font-family: Arial, sans-serif; 
+            text-align: center; 
+            padding: 50px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-direction: column;
+        }
+        .error-container {
+            background: white;
+            color: #232f3e;
+            padding: 40px;
+            border-radius: 12px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+        .btn {
+            display: inline-block;
+            background: #ff9900;
+            color: white;
+            padding: 15px 30px;
+            text-decoration: none;
+            border-radius: 6px;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="error-container">
+        <h1>🤖 Oops! Page Not Found</h1>
+        <p>The page you're looking for doesn't exist, but our AI application is still here!</p>
+        <a href="/" class="btn">← Back to Home</a>
+    </div>
+</body>
+</html>'''
+                      
+                      # Upload files to S3
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key='index.html',
+                          Body=html_content,
+                          ContentType='text/html',
+                          CacheControl='max-age=300'
+                      )
+                      
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key='error.html',
+                          Body=error_content,
+                          ContentType='text/html',
+                          CacheControl='max-age=300'
+                      )
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'Message': 'Website content deployed successfully'
+                      })
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'Message': 'Resource deleted'
+                      })
+                      
+              except Exception as e:
+                  print(f'Error: {str(e)}')
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      'Message': f'Error deploying content: {str(e)}'
+                  })
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+
+  # IAM role for Lambda execution
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: 'S3AccessPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 's3:PutObject'
+                  - 's3:PutObjectAcl'
+                  - 's3:GetObject'
+                  - 's3:DeleteObject'
+                Resource: !Sub '${WebsiteBucket}/*'
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+
+  # Custom resource to trigger content deployment
+  WebsiteContentDeployment:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt WebsiteContentDeploymentFunction.Arn
+      BucketName: !Ref WebsiteBucket
+      PartyRockAppTitle: !Ref PartyRockAppTitle
+      PartyRockAppURL: !Ref PartyRockAppURL
+      ProjectName: !Ref ProjectName
+    DependsOn:
+      - WebsiteBucket
+      - WebsiteBucketPolicy
+
+# Outputs section
+Outputs:
+  WebsiteBucketName:
+    Description: 'Name of the S3 bucket hosting the website'
+    Value: !Ref WebsiteBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-WebsiteBucket'
+
+  WebsiteBucketURL:
+    Description: 'S3 static website URL'
+    Value: !GetAtt WebsiteBucket.WebsiteURL
+    Export:
+      Name: !Sub '${AWS::StackName}-WebsiteURL'
+
+  CloudFrontDistributionId:
+    Description: 'CloudFront Distribution ID'
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub '${AWS::StackName}-DistributionId'
+
+  CloudFrontDomainName:
+    Description: 'CloudFront Distribution Domain Name'
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-DistributionDomain'
+
+  CloudFrontURL:
+    Description: 'CloudFront Distribution HTTPS URL'
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFrontURL'
+
+  PartyRockInstructions:
+    Description: 'Instructions for setting up your PartyRock application'
+    Value: !Sub |
+      1. Visit https://partyrock.aws/ and sign in
+      2. Create your AI application with widgets and prompts
+      3. Make your application public and copy the URL
+      4. Update the CloudFormation stack with your PartyRock URL parameter
+      5. Your application will be accessible at: https://${CloudFrontDistribution.DomainName}
+
+  WebACLId:
+    Condition: IsProduction
+    Description: 'WAF Web ACL ID for security monitoring'
+    Value: !Ref WebApplicationFirewall
+    Export:
+      Name: !Sub '${AWS::StackName}-WebACL'
+
+  LogsBucketName:
+    Condition: CreateLogsBucket
+    Description: 'CloudFront access logs bucket name'
+    Value: !Ref CloudFrontLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-LogsBucket'
+
+  ProjectTags:
+    Description: 'Project tags for resource management'
+    Value: !Sub 'Project=${ProjectName}, Environment=${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-Tags'
+
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost breakdown (USD)'
+    Value: !Sub |
+      S3 Storage (5GB): $0.12
+      CloudFront (100GB transfer): $8.50
+      Lambda (1000 executions): $0.20
+      WAF (if enabled): $5.00
+      Total: ~$8.82-$13.82/month
+      
+  NextSteps:
+    Description: 'Next steps after deployment'
+    Value: !Sub |
+      1. Create your PartyRock AI application at https://partyrock.aws/
+      2. Configure widgets for your business use case
+      3. Test your application and make it public
+      4. Update this CloudFormation stack with your PartyRock app URL
+      5. Access your deployed application at: https://${CloudFrontDistribution.DomainName}
+      6. Monitor costs and usage in AWS Cost Explorer

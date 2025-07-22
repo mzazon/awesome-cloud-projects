@@ -1,0 +1,38 @@
+# Terraform and Provider Version Requirements
+# This file defines the minimum required versions for Terraform and Azure providers
+
+terraform {
+  required_version = ">= 1.0"
+  
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 3.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.1"
+    }
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.9"
+    }
+  }
+}
+
+# Configure the Azure Provider
+provider "azurerm" {
+  features {
+    resource_group {
+      prevent_deletion_if_contains_resources = false
+    }
+    
+    virtual_machine_scale_set {
+      roll_instances_when_required = true
+    }
+    
+    log_analytics_workspace {
+      permanently_delete_on_destroy = true
+    }
+  }
+}

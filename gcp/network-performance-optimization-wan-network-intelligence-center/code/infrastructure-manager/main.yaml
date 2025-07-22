@@ -1,0 +1,643 @@
+# Infrastructure Manager Configuration for Network Performance Optimization
+# This configuration deploys a comprehensive network performance optimization solution
+# combining Cloud WAN, Network Intelligence Center, and automated remediation workflows
+
+# Configuration metadata
+metadata:
+  name: network-performance-optimization
+  labels:
+    solution: network-optimization
+    service: cloud-wan-network-intelligence
+    environment: production
+    managed-by: infrastructure-manager
+
+# Input variables for customization
+inputs:
+  - name: project_id
+    description: "Google Cloud Project ID where resources will be deployed"
+    type: string
+    required: true
+    
+  - name: region
+    description: "Primary region for resource deployment"
+    type: string
+    default: "us-central1"
+    
+  - name: zone
+    description: "Primary zone for compute resources"
+    type: string
+    default: "us-central1-a"
+    
+  - name: network_name
+    description: "Name of the VPC network for monitoring"
+    type: string
+    default: "default"
+    
+  - name: random_suffix
+    description: "Random suffix for unique resource naming"
+    type: string
+    default: ""
+    
+  - name: enable_flow_logs
+    description: "Enable VPC Flow Logs for traffic analysis"
+    type: bool
+    default: true
+    
+  - name: monitoring_interval
+    description: "Monitoring interval for scheduled optimization jobs (cron format)"
+    type: string
+    default: "*/15 * * * *"
+    
+  - name: notification_email
+    description: "Email address for alerting notifications"
+    type: string
+    default: ""
+
+# Global configuration
+config:
+  project: ${inputs.project_id}
+  region: ${inputs.region}
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    metadata:
+      dependsOn: []
+    properties:
+      name: projects/${inputs.project_id}/services/networkmanagement.googleapis.com
+      
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${inputs.project_id}/services/monitoring.googleapis.com
+      
+  - name: enable-functions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${inputs.project_id}/services/cloudfunctions.googleapis.com
+      
+  - name: enable-pubsub-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${inputs.project_id}/services/pubsub.googleapis.com
+      
+  - name: enable-scheduler-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${inputs.project_id}/services/cloudscheduler.googleapis.com
+      
+  - name: enable-logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${inputs.project_id}/services/logging.googleapis.com
+      
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${inputs.project_id}/services/storage.googleapis.com
+
+  # Cloud Storage bucket for function code and data storage
+  - name: network-optimization-storage
+    type: gcp-types/storage-v1:buckets
+    metadata:
+      dependsOn:
+        - enable-storage-api
+    properties:
+      name: network-ops-data-${inputs.project_id}-${inputs.random_suffix}
+      location: ${inputs.region}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              matchesStorageClass: [STANDARD]
+      uniformBucketLevelAccess:
+        enabled: true
+      labels:
+        purpose: network-optimization
+        component: data-storage
+
+  # Pub/Sub topic for network alert notifications
+  - name: network-alerts-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    metadata:
+      dependsOn:
+        - enable-pubsub-api
+    properties:
+      name: projects/${inputs.project_id}/topics/network-alerts-${inputs.random_suffix}
+      labels:
+        purpose: network-optimization
+        component: messaging
+
+  # Pub/Sub subscription for Cloud Function consumption
+  - name: network-alerts-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    metadata:
+      dependsOn:
+        - network-alerts-topic
+    properties:
+      name: projects/${inputs.project_id}/subscriptions/network-alerts-${inputs.random_suffix}-sub
+      topic: $(ref.network-alerts-topic.name)
+      ackDeadlineSeconds: 300
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+      deadLetterPolicy:
+        maxDeliveryAttempts: 5
+      labels:
+        purpose: network-optimization
+        component: messaging
+
+  # Network Intelligence Center Connectivity Tests
+  - name: regional-connectivity-test
+    type: gcp-types/networkmanagement-v1:projects.locations.global.connectivityTests
+    metadata:
+      dependsOn:
+        - enable-apis
+    properties:
+      parent: projects/${inputs.project_id}/locations/global
+      testId: regional-connectivity-test-${inputs.random_suffix}
+      resource:
+        displayName: "Regional Connectivity Monitoring"
+        description: "Monitors connectivity between regions for performance optimization"
+        source:
+          projectId: ${inputs.project_id}
+          networkType: GCP_NETWORK
+          network: projects/${inputs.project_id}/global/networks/${inputs.network_name}
+          region: ${inputs.region}
+        destination:
+          projectId: ${inputs.project_id}
+          networkType: GCP_NETWORK
+          network: projects/${inputs.project_id}/global/networks/${inputs.network_name}
+          region: us-west1
+        protocol: TCP
+        relatedProjects: [${inputs.project_id}]
+        labels:
+          purpose: network-optimization
+          test-type: regional-connectivity
+
+  - name: external-connectivity-test
+    type: gcp-types/networkmanagement-v1:projects.locations.global.connectivityTests
+    metadata:
+      dependsOn:
+        - enable-apis
+    properties:
+      parent: projects/${inputs.project_id}/locations/global
+      testId: external-connectivity-test-${inputs.random_suffix}
+      resource:
+        displayName: "External Connectivity Monitoring"
+        description: "Monitors external connectivity for internet-facing services"
+        source:
+          projectId: ${inputs.project_id}
+          networkType: GCP_NETWORK
+          network: projects/${inputs.project_id}/global/networks/${inputs.network_name}
+          region: ${inputs.region}
+        destination:
+          ipAddress: 8.8.8.8
+        protocol: ICMP
+        relatedProjects: [${inputs.project_id}]
+        labels:
+          purpose: network-optimization
+          test-type: external-connectivity
+
+  # Cloud Monitoring Alert Policy for Network Performance
+  - name: high-latency-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+    properties:
+      parent: projects/${inputs.project_id}
+      resource:
+        displayName: "High Network Latency Alert"
+        documentation:
+          content: "Alert triggered when network latency exceeds threshold"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "Network Latency Threshold"
+            conditionThreshold:
+              filter: 'resource.type="gce_instance" AND metric.type="compute.googleapis.com/instance/network/received_bytes_count"'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 100000000  # 100MB
+              duration: 300s  # 5 minutes
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+                  groupByFields: ["project", "zone"]
+        combiner: OR
+        enabled: true
+        notificationChannels: []
+        alertStrategy:
+          autoClose: 1800s  # 30 minutes
+        severity: ERROR
+
+  # IAM Service Account for Cloud Functions
+  - name: network-optimizer-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: network-optimizer-${inputs.random_suffix}
+      serviceAccount:
+        displayName: "Network Optimization Service Account"
+        description: "Service account for automated network optimization functions"
+
+  # IAM bindings for service account permissions
+  - name: network-optimizer-monitoring-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    metadata:
+      dependsOn:
+        - network-optimizer-service-account
+    properties:
+      resource: projects/${inputs.project_id}
+      role: roles/monitoring.metricWriter
+      member: serviceAccount:$(ref.network-optimizer-service-account.email)
+
+  - name: network-optimizer-network-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    metadata:
+      dependsOn:
+        - network-optimizer-service-account
+    properties:
+      resource: projects/${inputs.project_id}
+      role: roles/networkmanagement.admin
+      member: serviceAccount:$(ref.network-optimizer-service-account.email)
+
+  - name: network-optimizer-pubsub-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    metadata:
+      dependsOn:
+        - network-optimizer-service-account
+    properties:
+      resource: projects/${inputs.project_id}
+      role: roles/pubsub.publisher
+      member: serviceAccount:$(ref.network-optimizer-service-account.email)
+
+  - name: network-optimizer-compute-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    metadata:
+      dependsOn:
+        - network-optimizer-service-account
+    properties:
+      resource: projects/${inputs.project_id}
+      role: roles/compute.networkAdmin
+      member: serviceAccount:$(ref.network-optimizer-service-account.email)
+
+  # Cloud Function for Network Optimization (Gen 2)
+  - name: network-optimization-function
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    metadata:
+      dependsOn:
+        - enable-functions-api
+        - network-optimizer-service-account
+        - network-optimization-storage
+        - network-alerts-topic
+    properties:
+      parent: projects/${inputs.project_id}/locations/${inputs.region}
+      functionId: network-optimizer-${inputs.random_suffix}
+      function:
+        displayName: "Network Performance Optimizer"
+        description: "Automated network optimization based on performance metrics"
+        buildConfig:
+          runtime: python39
+          entryPoint: optimize_network
+          source:
+            storageSource:
+              bucket: $(ref.network-optimization-storage.name)
+              object: function-source.zip
+          environmentVariables:
+            GCP_PROJECT: ${inputs.project_id}
+            TOPIC_NAME: network-alerts-${inputs.random_suffix}
+        serviceConfig:
+          maxInstanceCount: 10
+          minInstanceCount: 0
+          availableMemory: 512Mi
+          timeoutSeconds: 540
+          environmentVariables:
+            GCP_PROJECT: ${inputs.project_id}
+            TOPIC_NAME: network-alerts-${inputs.random_suffix}
+          serviceAccountEmail: $(ref.network-optimizer-service-account.email)
+          ingressSettings: ALLOW_INTERNAL_ONLY
+        eventTrigger:
+          eventType: google.cloud.pubsub.topic.v1.messagePublished
+          pubsubTopic: $(ref.network-alerts-topic.name)
+          retryPolicy: RETRY_POLICY_RETRY
+        labels:
+          purpose: network-optimization
+          component: automation
+
+  # Flow Analyzer Function for Traffic Pattern Analysis
+  - name: flow-analyzer-function
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    metadata:
+      dependsOn:
+        - enable-functions-api
+        - network-optimizer-service-account
+        - network-optimization-storage
+    properties:
+      parent: projects/${inputs.project_id}/locations/${inputs.region}
+      functionId: flow-analyzer-${inputs.random_suffix}
+      function:
+        displayName: "Network Flow Analyzer"
+        description: "Analyzes VPC Flow Logs for traffic optimization opportunities"
+        buildConfig:
+          runtime: python39
+          entryPoint: analyze_traffic_flows
+          source:
+            storageSource:
+              bucket: $(ref.network-optimization-storage.name)
+              object: flow-analyzer-source.zip
+          environmentVariables:
+            GCP_PROJECT: ${inputs.project_id}
+            TOPIC_NAME: network-alerts-${inputs.random_suffix}
+        serviceConfig:
+          maxInstanceCount: 5
+          minInstanceCount: 0
+          availableMemory: 1Gi
+          timeoutSeconds: 900
+          environmentVariables:
+            GCP_PROJECT: ${inputs.project_id}
+            TOPIC_NAME: network-alerts-${inputs.random_suffix}
+          serviceAccountEmail: $(ref.network-optimizer-service-account.email)
+          ingressSettings: ALLOW_INTERNAL_ONLY
+        labels:
+          purpose: network-optimization
+          component: analysis
+
+  # Firewall Optimization Function
+  - name: firewall-optimizer-function
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    metadata:
+      dependsOn:
+        - enable-functions-api
+        - network-optimizer-service-account
+        - network-optimization-storage
+    properties:
+      parent: projects/${inputs.project_id}/locations/${inputs.region}
+      functionId: firewall-optimizer-${inputs.random_suffix}
+      function:
+        displayName: "Firewall Rule Optimizer"
+        description: "Optimizes firewall rules for security and performance"
+        buildConfig:
+          runtime: python39
+          entryPoint: optimize_firewall_rules
+          source:
+            storageSource:
+              bucket: $(ref.network-optimization-storage.name)
+              object: firewall-optimizer-source.zip
+          environmentVariables:
+            GCP_PROJECT: ${inputs.project_id}
+            TOPIC_NAME: network-alerts-${inputs.random_suffix}
+        serviceConfig:
+          maxInstanceCount: 3
+          minInstanceCount: 0
+          availableMemory: 512Mi
+          timeoutSeconds: 300
+          environmentVariables:
+            GCP_PROJECT: ${inputs.project_id}
+            TOPIC_NAME: network-alerts-${inputs.random_suffix}
+          serviceAccountEmail: $(ref.network-optimizer-service-account.email)
+          ingressSettings: ALLOW_INTERNAL_ONLY
+        labels:
+          purpose: network-optimization
+          component: security
+
+  # Cloud Scheduler for Periodic Network Optimization
+  - name: periodic-optimization-job
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    metadata:
+      dependsOn:
+        - enable-scheduler-api
+        - flow-analyzer-function
+    properties:
+      parent: projects/${inputs.project_id}/locations/${inputs.region}
+      job:
+        name: projects/${inputs.project_id}/locations/${inputs.region}/jobs/periodic-network-optimization
+        description: "Periodic network traffic analysis and optimization"
+        schedule: ${inputs.monitoring_interval}
+        timeZone: "UTC"
+        httpTarget:
+          uri: $(ref.flow-analyzer-function.serviceConfig.uri)
+          httpMethod: GET
+          oidcToken:
+            serviceAccountEmail: $(ref.network-optimizer-service-account.email)
+        retryConfig:
+          retryCount: 3
+          maxRetryDuration: 300s
+          minBackoffDuration: 5s
+          maxBackoffDuration: 60s
+
+  # Daily Network Health Report Scheduler
+  - name: daily-report-job
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    metadata:
+      dependsOn:
+        - enable-scheduler-api
+        - network-alerts-topic
+    properties:
+      parent: projects/${inputs.project_id}/locations/${inputs.region}
+      job:
+        name: projects/${inputs.project_id}/locations/${inputs.region}/jobs/daily-network-report
+        description: "Daily network health and performance report generation"
+        schedule: "0 9 * * *"  # Daily at 9 AM UTC
+        timeZone: "UTC"
+        pubsubTarget:
+          topicName: $(ref.network-alerts-topic.name)
+          data: eyJ0eXBlIjoiZGFpbHlfcmVwb3J0IiwiYWN0aW9uIjoiZ2VuZXJhdGVfbmV0d29ya19oZWFsdGhfcmVwb3J0In0=  # Base64 encoded JSON
+        retryConfig:
+          retryCount: 2
+          maxRetryDuration: 120s
+
+  # VPC Flow Logs Configuration (conditional based on input)
+  - name: vpc-flow-logs-config
+    type: gcp-types/compute-v1:subnetworks
+    metadata:
+      dependsOn:
+        - enable-apis
+    condition: ${inputs.enable_flow_logs}
+    properties:
+      project: ${inputs.project_id}
+      region: ${inputs.region}
+      name: ${inputs.network_name}-subnet-flow-logs
+      network: projects/${inputs.project_id}/global/networks/${inputs.network_name}
+      ipCidrRange: "10.0.1.0/24"
+      enableFlowLogs: true
+      logConfig:
+        enable: true
+        flowSampling: 0.1
+        aggregationInterval: INTERVAL_5_SEC
+        metadata: INCLUDE_ALL_METADATA
+        metadataFields:
+          - src_ip
+          - dest_ip
+          - src_port
+          - dest_port
+          - protocol
+          - tcp_flags
+          - bytes_sent
+          - packets_sent
+          - rtt_msec
+
+  # Network Intelligence Center Performance Dashboard Configuration
+  - name: performance-dashboard-config
+    type: gcp-types/monitoring-v1:projects.dashboards
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+    properties:
+      parent: projects/${inputs.project_id}
+      dashboard:
+        displayName: "Network Performance Optimization Dashboard"
+        mosaicLayout:
+          tiles:
+            - width: 6
+              height: 4
+              widget:
+                title: "Network Latency Trends"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="gce_instance" AND metric.type="compute.googleapis.com/instance/network/received_bytes_count"'
+                          aggregation:
+                            alignmentPeriod: 60s
+                            perSeriesAligner: ALIGN_RATE
+                            crossSeriesReducer: REDUCE_MEAN
+                  timeshiftDuration: 0s
+                  yAxis:
+                    label: "Bytes/sec"
+                    scale: LINEAR
+            - width: 6
+              height: 4
+              xPos: 6
+              widget:
+                title: "Connectivity Test Results"
+                scorecard:
+                  timeSeriesQuery:
+                    timeSeriesFilter:
+                      filter: 'resource.type="network_test" AND metric.type="networkmanagement.googleapis.com/connectivity_test/reachability"'
+                      aggregation:
+                        alignmentPeriod: 300s
+                        perSeriesAligner: ALIGN_MEAN
+                  gaugeView:
+                    lowerBound: 0.0
+                    upperBound: 1.0
+            - width: 12
+              height: 4
+              yPos: 4
+              widget:
+                title: "Network Optimization Events"
+                logPanel:
+                  filter: 'resource.type="cloud_function" AND resource.labels.function_name="network-optimizer-${inputs.random_suffix}"'
+
+# Output values for reference and integration
+outputs:
+  - name: storage_bucket_name
+    description: "Name of the Cloud Storage bucket for network optimization data"
+    value: $(ref.network-optimization-storage.name)
+    
+  - name: pubsub_topic_name
+    description: "Name of the Pub/Sub topic for network alerts"
+    value: $(ref.network-alerts-topic.name)
+    
+  - name: optimization_function_name
+    description: "Name of the main network optimization Cloud Function"
+    value: $(ref.network-optimization-function.name)
+    
+  - name: flow_analyzer_function_name
+    description: "Name of the flow analyzer Cloud Function"
+    value: $(ref.flow-analyzer-function.name)
+    
+  - name: firewall_optimizer_function_name
+    description: "Name of the firewall optimizer Cloud Function"
+    value: $(ref.firewall-optimizer-function.name)
+    
+  - name: service_account_email
+    description: "Email of the service account used by optimization functions"
+    value: $(ref.network-optimizer-service-account.email)
+    
+  - name: regional_connectivity_test_id
+    description: "ID of the regional connectivity test"
+    value: regional-connectivity-test-${inputs.random_suffix}
+    
+  - name: external_connectivity_test_id
+    description: "ID of the external connectivity test"
+    value: external-connectivity-test-${inputs.random_suffix}
+    
+  - name: monitoring_dashboard_url
+    description: "URL to the network performance monitoring dashboard"
+    value: "https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.performance-dashboard-config.name)?project=${inputs.project_id}"
+    
+  - name: scheduler_job_names
+    description: "Names of the Cloud Scheduler jobs for automation"
+    value:
+      - periodic-network-optimization
+      - daily-network-report
+
+# Documentation and usage notes
+documentation: |
+  # Network Performance Optimization Infrastructure
+  
+  This Infrastructure Manager configuration deploys a comprehensive network performance 
+  optimization solution that combines Google Cloud WAN with Network Intelligence Center 
+  for intelligent, automated network operations.
+  
+  ## Components Deployed:
+  
+  1. **Network Intelligence Center Integration:**
+     - Regional and external connectivity tests
+     - Automated network configuration monitoring
+     - Performance dashboard with real-time metrics
+  
+  2. **Automated Optimization Functions:**
+     - Main network optimizer for performance tuning
+     - Flow analyzer for traffic pattern analysis
+     - Firewall optimizer for security and performance
+  
+  3. **Monitoring and Alerting:**
+     - Cloud Monitoring alert policies
+     - Pub/Sub messaging for event-driven automation
+     - Scheduled jobs for periodic optimization
+  
+  4. **Data Storage and Analytics:**
+     - Cloud Storage for function code and data
+     - VPC Flow Logs for detailed traffic analysis
+     - Performance dashboard for visualization
+  
+  ## Usage:
+  
+  Deploy this configuration by providing the required inputs:
+  - project_id: Your Google Cloud project ID
+  - region: Primary deployment region
+  - random_suffix: Unique suffix for resource naming
+  
+  Optional inputs allow customization of monitoring intervals, 
+  flow logs enablement, and notification settings.
+  
+  ## Post-Deployment:
+  
+  After deployment, the system will automatically:
+  - Monitor network connectivity and performance
+  - Analyze traffic patterns and identify optimization opportunities
+  - Execute remediation actions based on intelligent algorithms
+  - Generate daily health reports and alerts
+  
+  Access the monitoring dashboard through the provided URL to visualize
+  network performance metrics and optimization activities.
+  
+  ## Cost Considerations:
+  
+  This solution includes Cloud Functions, Pub/Sub, Cloud Storage, and Network
+  Intelligence Center services. Costs will vary based on:
+  - Function execution frequency and duration
+  - Pub/Sub message volume
+  - Storage usage for logs and data
+  - Connectivity test frequency
+  - VPC Flow Logs volume (if enabled)
+  
+  Monitor usage through Cloud Billing and adjust configurations as needed.

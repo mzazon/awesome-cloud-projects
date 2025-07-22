@@ -1,0 +1,618 @@
+# Infrastructure Manager Configuration for Global Financial Compliance Monitoring
+# This configuration deploys a comprehensive financial compliance monitoring system
+# using Cloud Spanner for global consistency and Cloud Tasks for reliable processing
+
+# Import required Terraform modules for Google Cloud resources
+imports:
+- path: main.tf
+
+resources:
+# Main Terraform configuration resource
+- name: financial-compliance-infrastructure
+  type: terraform
+  properties:
+    # Terraform configuration for the complete infrastructure stack
+    source: |
+      # Configure the Google Cloud provider
+      terraform {
+        required_version = ">= 1.5.0"
+        required_providers {
+          google = {
+            source  = "hashicorp/google"
+            version = "~> 5.0"
+          }
+          google-beta = {
+            source  = "hashicorp/google-beta"
+            version = "~> 5.0"
+          }
+        }
+      }
+
+      # Provider configuration
+      provider "google" {
+        project = var.project_id
+        region  = var.region
+      }
+
+      provider "google-beta" {
+        project = var.project_id
+        region  = var.region
+      }
+
+      # Input variables
+      variable "project_id" {
+        description = "The GCP project ID for the financial compliance system"
+        type        = string
+      }
+
+      variable "region" {
+        description = "The GCP region for deploying resources"
+        type        = string
+        default     = "us-central1"
+      }
+
+      variable "spanner_instance_name" {
+        description = "Name of the Cloud Spanner instance"
+        type        = string
+        default     = "compliance-monitor"
+      }
+
+      variable "spanner_database_name" {
+        description = "Name of the Cloud Spanner database"
+        type        = string
+        default     = "financial-compliance"
+      }
+
+      variable "task_queue_name" {
+        description = "Name of the Cloud Tasks queue"
+        type        = string
+        default     = "compliance-checks"
+      }
+
+      variable "environment" {
+        description = "Environment label (dev, staging, prod)"
+        type        = string
+        default     = "dev"
+      }
+
+      # Local values for consistent naming and tagging
+      locals {
+        common_labels = {
+          environment = var.environment
+          project     = "financial-compliance"
+          managed_by  = "infrastructure-manager"
+        }
+        
+        service_account_name = "compliance-monitor-sa"
+        pubsub_topic_name   = "compliance-events"
+        storage_bucket_name = "${var.project_id}-compliance-reports"
+      }
+
+      # Enable required Google Cloud APIs
+      resource "google_project_service" "required_apis" {
+        for_each = toset([
+          "spanner.googleapis.com",
+          "cloudtasks.googleapis.com",
+          "cloudfunctions.googleapis.com",
+          "pubsub.googleapis.com",
+          "storage.googleapis.com",
+          "logging.googleapis.com",
+          "monitoring.googleapis.com",
+          "bigquery.googleapis.com"
+        ])
+        
+        service = each.value
+        project = var.project_id
+
+        disable_dependent_services = false
+        disable_on_destroy         = false
+      }
+
+      # Service Account for compliance monitoring operations
+      resource "google_service_account" "compliance_monitor" {
+        account_id   = local.service_account_name
+        display_name = "Financial Compliance Monitor Service Account"
+        description  = "Service account for automated financial compliance monitoring operations"
+
+        depends_on = [google_project_service.required_apis]
+      }
+
+      # IAM roles for the service account
+      resource "google_project_iam_member" "compliance_monitor_roles" {
+        for_each = toset([
+          "roles/spanner.databaseUser",
+          "roles/cloudtasks.enqueuer",
+          "roles/cloudtasks.taskRunner",
+          "roles/logging.logWriter",
+          "roles/monitoring.metricWriter",
+          "roles/pubsub.publisher",
+          "roles/pubsub.subscriber",
+          "roles/storage.objectCreator",
+          "roles/cloudfunctions.invoker"
+        ])
+
+        project = var.project_id
+        role    = each.value
+        member  = "serviceAccount:${google_service_account.compliance_monitor.email}"
+
+        depends_on = [google_service_account.compliance_monitor]
+      }
+
+      # Cloud Spanner Instance for global financial data consistency
+      resource "google_spanner_instance" "compliance_monitor" {
+        config           = "regional-${var.region}"
+        display_name     = "Financial Compliance Monitor Instance"
+        name             = var.spanner_instance_name
+        num_nodes        = 2
+        processing_units = null
+
+        labels = local.common_labels
+
+        depends_on = [google_project_service.required_apis]
+      }
+
+      # Cloud Spanner Database with compliance schema
+      resource "google_spanner_database" "financial_compliance" {
+        instance = google_spanner_instance.compliance_monitor.name
+        name     = var.spanner_database_name
+
+        # Database schema for financial compliance monitoring
+        ddl = [
+          # Main transactions table with comprehensive compliance fields
+          <<-EOT
+          CREATE TABLE transactions (
+            transaction_id STRING(36) NOT NULL,
+            account_id STRING(36) NOT NULL,
+            amount NUMERIC NOT NULL,
+            currency STRING(3) NOT NULL,
+            source_country STRING(2) NOT NULL,
+            destination_country STRING(2) NOT NULL,
+            transaction_type STRING(50) NOT NULL,
+            timestamp TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+            compliance_status STRING(20) NOT NULL DEFAULT 'PENDING',
+            risk_score NUMERIC,
+            kyc_verified BOOL DEFAULT false,
+            aml_checked BOOL DEFAULT false,
+            regulatory_flags ARRAY<STRING(MAX)>,
+            created_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+            updated_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true)
+          ) PRIMARY KEY (transaction_id)
+          EOT
+          ,
+          # Compliance checks table for detailed audit trail
+          <<-EOT
+          CREATE TABLE compliance_checks (
+            check_id STRING(36) NOT NULL,
+            transaction_id STRING(36) NOT NULL,
+            check_type STRING(50) NOT NULL,
+            check_status STRING(20) NOT NULL,
+            check_result JSON,
+            checked_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+            checked_by STRING(100) NOT NULL,
+            regulatory_requirement STRING(100),
+            FOREIGN KEY (transaction_id) REFERENCES transactions (transaction_id)
+          ) PRIMARY KEY (check_id),
+          INTERLEAVE IN PARENT transactions ON DELETE CASCADE
+          EOT
+          ,
+          # Regulatory reporting table for compliance reports
+          <<-EOT
+          CREATE TABLE regulatory_reports (
+            report_id STRING(36) NOT NULL,
+            jurisdiction STRING(10) NOT NULL,
+            report_type STRING(50) NOT NULL,
+            report_period_start TIMESTAMP NOT NULL,
+            report_period_end TIMESTAMP NOT NULL,
+            report_data JSON,
+            generated_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+            submitted_at TIMESTAMP,
+            submission_status STRING(20) DEFAULT 'PENDING'
+          ) PRIMARY KEY (report_id)
+          EOT
+        ]
+
+        depends_on = [google_spanner_instance.compliance_monitor]
+      }
+
+      # Pub/Sub topic for compliance event processing
+      resource "google_pubsub_topic" "compliance_events" {
+        name = local.pubsub_topic_name
+
+        labels = local.common_labels
+
+        # Message retention duration for compliance events
+        message_retention_duration = "604800s" # 7 days
+
+        depends_on = [google_project_service.required_apis]
+      }
+
+      # Cloud Tasks queue for reliable compliance processing
+      resource "google_cloud_tasks_queue" "compliance_checks" {
+        name     = var.task_queue_name
+        location = var.region
+
+        # Rate limits for compliance processing
+        rate_limits {
+          max_concurrent_dispatches = 10
+          max_dispatches_per_second = 5
+        }
+
+        # Retry configuration for failed compliance checks
+        retry_config {
+          max_attempts       = 5
+          max_retry_duration = "3600s"
+          max_backoff        = "300s"
+          min_backoff        = "10s"
+          max_doublings      = 3
+        }
+
+        depends_on = [google_project_service.required_apis]
+      }
+
+      # Dead letter queue for failed compliance checks
+      resource "google_cloud_tasks_queue" "compliance_checks_dlq" {
+        name     = "${var.task_queue_name}-dlq"
+        location = var.region
+
+        rate_limits {
+          max_concurrent_dispatches = 5
+          max_dispatches_per_second = 1
+        }
+
+        retry_config {
+          max_attempts       = 3
+          max_retry_duration = "86400s"
+          max_backoff        = "600s"
+          min_backoff        = "60s"
+        }
+
+        depends_on = [google_project_service.required_apis]
+      }
+
+      # Cloud Storage bucket for compliance reports
+      resource "google_storage_bucket" "compliance_reports" {
+        name     = local.storage_bucket_name
+        location = var.region
+
+        # Versioning for audit trail
+        versioning {
+          enabled = true
+        }
+
+        # Lifecycle management for compliance data retention
+        lifecycle_rule {
+          condition {
+            age = 2555 # 7 years retention for financial compliance
+          }
+          action {
+            type = "Delete"
+          }
+        }
+
+        # Encryption configuration
+        encryption {
+          default_kms_key_name = google_kms_crypto_key.compliance_encryption.id
+        }
+
+        labels = local.common_labels
+
+        depends_on = [
+          google_project_service.required_apis,
+          google_kms_crypto_key.compliance_encryption
+        ]
+      }
+
+      # KMS keyring for compliance data encryption
+      resource "google_kms_key_ring" "compliance_keyring" {
+        name     = "compliance-keyring"
+        location = var.region
+
+        depends_on = [google_project_service.required_apis]
+      }
+
+      # KMS encryption key for compliance data
+      resource "google_kms_crypto_key" "compliance_encryption" {
+        name     = "compliance-encryption-key"
+        key_ring = google_kms_key_ring.compliance_keyring.id
+
+        purpose = "ENCRYPT_DECRYPT"
+
+        # Automatic rotation for security compliance
+        rotation_period = "7776000s" # 90 days
+
+        depends_on = [google_kms_key_ring.compliance_keyring]
+      }
+
+      # BigQuery dataset for compliance analytics and audit logs
+      resource "google_bigquery_dataset" "compliance_audit" {
+        dataset_id  = "compliance_audit"
+        description = "Dataset for financial compliance audit logs and analytics"
+        location    = var.region
+
+        # Access control for compliance data
+        access {
+          role   = "OWNER"
+          user_by_email = google_service_account.compliance_monitor.email
+        }
+
+        # Data retention for compliance requirements
+        default_table_expiration_ms = 220752000000 # 7 years
+
+        labels = local.common_labels
+
+        depends_on = [google_project_service.required_apis]
+      }
+
+      # Log sink for compliance audit trail
+      resource "google_logging_project_sink" "compliance_audit_sink" {
+        name        = "compliance-audit-sink"
+        destination = "bigquery.googleapis.com/projects/${var.project_id}/datasets/${google_bigquery_dataset.compliance_audit.dataset_id}"
+
+        # Filter for compliance-related logs
+        filter = <<-EOT
+          resource.type="cloud_function" AND 
+          (resource.labels.function_name="compliance-processor" OR 
+           resource.labels.function_name="transaction-processor" OR
+           resource.labels.function_name="compliance-reporter")
+        EOT
+
+        # Ensure proper IAM binding for BigQuery writing
+        unique_writer_identity = true
+
+        depends_on = [google_bigquery_dataset.compliance_audit]
+      }
+
+      # IAM binding for log sink to write to BigQuery
+      resource "google_bigquery_dataset_iam_member" "log_sink_writer" {
+        dataset_id = google_bigquery_dataset.compliance_audit.dataset_id
+        role       = "roles/bigquery.dataEditor"
+        member     = google_logging_project_sink.compliance_audit_sink.writer_identity
+
+        depends_on = [google_logging_project_sink.compliance_audit_sink]
+      }
+
+      # Cloud Monitoring dashboard for compliance metrics
+      resource "google_monitoring_dashboard" "compliance_monitor" {
+        dashboard_json = jsonencode({
+          displayName = "Financial Compliance Monitor"
+          mosaicLayout = {
+            tiles = [
+              {
+                width  = 6
+                height = 4
+                widget = {
+                  title = "Transaction Volume"
+                  xyChart = {
+                    dataSets = [{
+                      timeSeriesQuery = {
+                        timeSeriesFilter = {
+                          filter = "resource.type=\"spanner_database\" AND resource.labels.database_id=\"${var.spanner_database_name}\""
+                          aggregation = {
+                            alignmentPeriod  = "300s"
+                            perSeriesAligner = "ALIGN_RATE"
+                          }
+                        }
+                      }
+                    }]
+                  }
+                }
+              },
+              {
+                width  = 6
+                height = 4
+                xPos   = 6
+                widget = {
+                  title = "Compliance Check Success Rate"
+                  scorecard = {
+                    timeSeriesQuery = {
+                      timeSeriesFilter = {
+                        filter = "resource.type=\"cloud_function\" AND resource.labels.function_name=\"compliance-processor\""
+                        aggregation = {
+                          alignmentPeriod  = "300s"
+                          perSeriesAligner = "ALIGN_RATE"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                width  = 12
+                height = 4
+                yPos   = 4
+                widget = {
+                  title = "High-Risk Transaction Alerts"
+                  xyChart = {
+                    dataSets = [{
+                      timeSeriesQuery = {
+                        timeSeriesFilter = {
+                          filter = "resource.type=\"cloud_function\" AND jsonPayload.risk_score>75"
+                          aggregation = {
+                            alignmentPeriod  = "300s"
+                            perSeriesAligner = "ALIGN_COUNT"
+                          }
+                        }
+                      }
+                    }]
+                  }
+                }
+              }
+            ]
+          }
+        })
+
+        depends_on = [google_project_service.required_apis]
+      }
+
+      # Alerting policy for high-risk transactions
+      resource "google_monitoring_alert_policy" "high_risk_transactions" {
+        display_name = "High Risk Transaction Alert"
+        combiner     = "OR"
+
+        conditions {
+          display_name = "High risk transaction detected"
+          
+          condition_threshold {
+            filter         = "resource.type=\"cloud_function\" AND jsonPayload.risk_score>90"
+            duration       = "60s"
+            comparison     = "COMPARISON_GREATER_THAN"
+            threshold_value = 0
+            
+            aggregations {
+              alignment_period   = "60s"
+              per_series_aligner = "ALIGN_COUNT"
+            }
+          }
+        }
+
+        notification_channels = []
+
+        alert_strategy {
+          auto_close = "1800s" # 30 minutes
+        }
+
+        depends_on = [google_project_service.required_apis]
+      }
+
+      # Output values for integration and verification
+      output "spanner_instance_id" {
+        description = "The ID of the Cloud Spanner instance"
+        value       = google_spanner_instance.compliance_monitor.id
+      }
+
+      output "spanner_database_id" {
+        description = "The ID of the Cloud Spanner database"
+        value       = google_spanner_database.financial_compliance.id
+      }
+
+      output "service_account_email" {
+        description = "Email address of the compliance monitoring service account"
+        value       = google_service_account.compliance_monitor.email
+      }
+
+      output "task_queue_id" {
+        description = "The ID of the Cloud Tasks queue for compliance checks"
+        value       = google_cloud_tasks_queue.compliance_checks.id
+      }
+
+      output "pubsub_topic_id" {
+        description = "The ID of the Pub/Sub topic for compliance events"
+        value       = google_pubsub_topic.compliance_events.id
+      }
+
+      output "storage_bucket_name" {
+        description = "Name of the Cloud Storage bucket for compliance reports"
+        value       = google_storage_bucket.compliance_reports.name
+      }
+
+      output "bigquery_dataset_id" {
+        description = "The ID of the BigQuery dataset for compliance audit logs"
+        value       = google_bigquery_dataset.compliance_audit.dataset_id
+      }
+
+      output "monitoring_dashboard_id" {
+        description = "The ID of the Cloud Monitoring dashboard"
+        value       = google_monitoring_dashboard.compliance_monitor.id
+      }
+
+      output "kms_key_id" {
+        description = "The ID of the KMS encryption key for compliance data"
+        value       = google_kms_crypto_key.compliance_encryption.id
+      }
+
+    # Input variables for Infrastructure Manager
+    inputValues:
+      project_id: $(ref.project_id)
+      region: $(ref.region)
+      spanner_instance_name: $(ref.spanner_instance_name)
+      spanner_database_name: $(ref.spanner_database_name)
+      task_queue_name: $(ref.task_queue_name)
+      environment: $(ref.environment)
+
+# Configuration parameters that can be customized during deployment
+properties:
+  # Project configuration
+  project_id:
+    type: string
+    description: "The GCP project ID where resources will be created"
+    
+  region:
+    type: string
+    description: "The GCP region for resource deployment"
+    default: "us-central1"
+    
+  # Spanner configuration
+  spanner_instance_name:
+    type: string
+    description: "Name for the Cloud Spanner instance"
+    default: "compliance-monitor"
+    
+  spanner_database_name:
+    type: string
+    description: "Name for the Cloud Spanner database"
+    default: "financial-compliance"
+    
+  # Cloud Tasks configuration
+  task_queue_name:
+    type: string
+    description: "Name for the Cloud Tasks queue"
+    default: "compliance-checks"
+    
+  # Environment configuration
+  environment:
+    type: string
+    description: "Environment label (dev, staging, prod)"
+    default: "dev"
+    enum:
+      - "dev"
+      - "staging"
+      - "prod"
+
+# Output definitions
+outputs:
+  spanner_instance_id:
+    description: "The Cloud Spanner instance identifier"
+    value: $(ref.financial-compliance-infrastructure.spanner_instance_id)
+    
+  spanner_database_id:
+    description: "The Cloud Spanner database identifier"
+    value: $(ref.financial-compliance-infrastructure.spanner_database_id)
+    
+  service_account_email:
+    description: "Email of the compliance monitoring service account"
+    value: $(ref.financial-compliance-infrastructure.service_account_email)
+    
+  task_queue_id:
+    description: "The Cloud Tasks queue identifier"
+    value: $(ref.financial-compliance-infrastructure.task_queue_id)
+    
+  pubsub_topic_id:
+    description: "The Pub/Sub topic identifier for compliance events"
+    value: $(ref.financial-compliance-infrastructure.pubsub_topic_id)
+    
+  storage_bucket_name:
+    description: "Name of the compliance reports storage bucket"
+    value: $(ref.financial-compliance-infrastructure.storage_bucket_name)
+    
+  bigquery_dataset_id:
+    description: "BigQuery dataset for compliance audit logs"
+    value: $(ref.financial-compliance-infrastructure.bigquery_dataset_id)
+    
+  monitoring_dashboard_id:
+    description: "Cloud Monitoring dashboard for compliance metrics"
+    value: $(ref.financial-compliance-infrastructure.monitoring_dashboard_id)
+    
+  kms_key_id:
+    description: "KMS encryption key for compliance data protection"
+    value: $(ref.financial-compliance-infrastructure.kms_key_id)
+
+# Metadata for the Infrastructure Manager deployment
+metadata:
+  name: "global-financial-compliance-monitoring"
+  description: "Infrastructure for global financial compliance monitoring with Cloud Spanner and Cloud Tasks"
+  version: "1.0"
+  labels:
+    solution: "financial-compliance"
+    provider: "gcp"
+    complexity: "advanced"
+    compliance: "financial-regulatory"

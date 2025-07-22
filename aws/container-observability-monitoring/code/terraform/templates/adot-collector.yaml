@@ -1,0 +1,155 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: adot-collector
+  namespace: ${namespace}
+  annotations:
+    eks.amazonaws.com/role-arn: ${role_arn}
+---
+apiVersion: opentelemetry.io/v1alpha1
+kind: OpenTelemetryCollector
+metadata:
+  name: adot-container-collector
+  namespace: ${namespace}
+spec:
+  mode: daemonset
+  serviceAccount: adot-collector
+  
+  resources:
+    limits:
+      cpu: 200m
+      memory: 200Mi
+    requests:
+      cpu: 200m
+      memory: 200Mi
+  
+  config: |
+    receivers:
+      awscontainerinsightreceiver:
+        collection_interval: ${collection_interval}s
+        container_orchestrator: eks
+        add_service_as_attribute: true
+        prefer_full_pod_name: false
+        add_full_pod_name_metric_label: false
+      
+      awsecscontainermetrics:
+        collection_interval: 20s
+      
+      prometheus:
+        config:
+          scrape_configs:
+            - job_name: 'kubernetes-pods'
+              kubernetes_sd_configs:
+                - role: pod
+              relabel_configs:
+                - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+                  action: keep
+                  regex: true
+                - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+                  action: replace
+                  target_label: __metrics_path__
+                  regex: (.+)
+                - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+                  action: replace
+                  regex: ([^:]+)(?::\d+)?;(\d+)
+                  replacement: $1:$2
+                  target_label: __address__
+                - action: labelmap
+                  regex: __meta_kubernetes_pod_label_(.+)
+                - source_labels: [__meta_kubernetes_namespace]
+                  action: replace
+                  target_label: kubernetes_namespace
+                - source_labels: [__meta_kubernetes_pod_name]
+                  action: replace
+                  target_label: kubernetes_pod_name
+    
+    processors:
+      batch:
+        timeout: 60s
+        send_batch_size: 8192
+        send_batch_max_size: 16384
+      
+      resourcedetection:
+        detectors: [env, eks]
+        timeout: 2s
+        override: false
+      
+      metricstransform:
+        transforms:
+          - include: .*
+            match_type: regexp
+            action: update
+            operations:
+              - action: add_label
+                new_label: cluster_name
+                new_value: ${cluster_name}
+              - action: add_label
+                new_label: region
+                new_value: ${region}
+      
+      memory_limiter:
+        limit_mib: 150
+        spike_limit_mib: 30
+        check_interval: 5s
+    
+    exporters:
+      awscloudwatchmetrics:
+        region: ${region}
+        namespace: AWS/ContainerInsights/Enhanced
+        dimension_rollup_option: NoDimensionRollup
+        metric_declarations:
+          - dimensions: [[ClusterName], [ClusterName, Namespace], [ClusterName, Namespace, PodName]]
+            metric_name_selectors: 
+              - pod_cpu_utilization
+              - pod_memory_utilization
+              - pod_network_rx_bytes
+              - pod_network_tx_bytes
+              - pod_cpu_usage_total
+              - pod_memory_working_set
+              - pod_cpu_reserved_capacity
+              - pod_memory_reserved_capacity
+              - pod_number_of_container_restarts
+          - dimensions: [[ClusterName], [ClusterName, Namespace], [ClusterName, Namespace, Service]]
+            metric_name_selectors:
+              - service_cpu_utilization
+              - service_memory_utilization
+              - service_number_of_running_pods
+          - dimensions: [[ClusterName], [ClusterName, NodeName], [ClusterName, InstanceId, NodeName]]
+            metric_name_selectors:
+              - node_cpu_utilization
+              - node_memory_utilization
+              - node_network_total_bytes
+              - node_cpu_reserved_capacity
+              - node_memory_reserved_capacity
+              - node_number_of_running_pods
+              - node_number_of_running_containers
+      
+      awsxray:
+        region: ${region}
+        no_verify_ssl: false
+        local_mode: false
+      
+      logging:
+        loglevel: info
+    
+    service:
+      pipelines:
+        metrics:
+          receivers: [awscontainerinsightreceiver, prometheus]
+          processors: [memory_limiter, resourcedetection, metricstransform, batch]
+          exporters: [awscloudwatchmetrics, logging]
+        
+        traces:
+          receivers: [awsxray]
+          processors: [memory_limiter, resourcedetection, batch]
+          exporters: [awsxray, logging]
+      
+      extensions: [health_check, pprof, zpages]
+    
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+      pprof:
+        endpoint: 0.0.0.0:1777
+      zpages:
+        endpoint: 0.0.0.0:55679

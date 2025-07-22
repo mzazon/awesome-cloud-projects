@@ -1,0 +1,554 @@
+# Infrastructure Manager Configuration
+# Quality Assurance Workflows with Firebase Extensions and Cloud Tasks
+# This configuration deploys a complete automated QA pipeline using Firebase Extensions,
+# Cloud Tasks, Cloud Storage, and Vertex AI for intelligent quality analysis
+
+# Template metadata
+metadata:
+  displayName: "QA Workflows with Firebase Extensions and Cloud Tasks"
+  description: "Automated quality assurance pipeline with AI-powered analysis"
+  documentation: "https://cloud.google.com/infrastructure-manager/docs"
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    validation:
+      minLength: 6
+      maxLength: 30
+      pattern: "^[a-z][a-z0-9-]*[a-z0-9]$"
+  
+  region:
+    type: string
+    description: "Google Cloud region for resource deployment"
+    default: "us-central1"
+    allowedValues:
+      - "us-central1"
+      - "us-east1"
+      - "us-west1"
+      - "europe-west1"
+      - "asia-east1"
+  
+  qa_bucket_suffix:
+    type: string
+    description: "Unique suffix for QA artifacts bucket"
+    default: "qa-artifacts"
+    validation:
+      minLength: 3
+      maxLength: 20
+      pattern: "^[a-z0-9-]*$"
+  
+  task_queue_suffix:
+    type: string
+    description: "Unique suffix for Cloud Tasks queue"
+    default: "qa-orchestration"
+    validation:
+      minLength: 3
+      maxLength: 30
+      pattern: "^[a-z0-9-]*$"
+  
+  enable_vertex_ai:
+    type: boolean
+    description: "Enable Vertex AI for intelligent analysis"
+    default: true
+  
+  max_concurrent_tasks:
+    type: integer
+    description: "Maximum concurrent tasks for queue processing"
+    default: 10
+    validation:
+      minimum: 1
+      maximum: 100
+  
+  retention_days:
+    type: integer
+    description: "Retention period for QA artifacts in days"
+    default: 365
+    validation:
+      minimum: 30
+      maximum: 2555  # 7 years
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: firebase-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/firebase.googleapis.com
+      consumerId: project:${project_id}
+    metadata:
+      dependsOn: []
+
+  - name: cloud-tasks-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/cloudtasks.googleapis.com
+      consumerId: project:${project_id}
+    metadata:
+      dependsOn: []
+
+  - name: cloud-storage-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/storage.googleapis.com
+      consumerId: project:${project_id}
+    metadata:
+      dependsOn: []
+
+  - name: vertex-ai-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/aiplatform.googleapis.com
+      consumerId: project:${project_id}
+    metadata:
+      dependsOn: []
+    condition: ${enable_vertex_ai}
+
+  - name: cloud-functions-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/cloudfunctions.googleapis.com
+      consumerId: project:${project_id}
+    metadata:
+      dependsOn: []
+
+  - name: firestore-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/firestore.googleapis.com
+      consumerId: project:${project_id}
+    metadata:
+      dependsOn: []
+
+  - name: cloud-run-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/run.googleapis.com
+      consumerId: project:${project_id}
+    metadata:
+      dependsOn: []
+
+  # Initialize Firebase project
+  - name: firebase-project
+    type: gcp-types/firebase-v1beta1:projects
+    properties:
+      projectId: ${project_id}
+      displayName: "QA Workflows Firebase Project"
+    metadata:
+      dependsOn:
+        - firebase-api
+
+  # Create Firestore database
+  - name: firestore-database
+    type: gcp-types/firestore-v1:projects.databases
+    properties:
+      parent: projects/${project_id}
+      databaseId: "(default)"
+      type: FIRESTORE_NATIVE
+      locationId: ${region}
+      concurrencyMode: OPTIMISTIC
+      appEngineIntegrationMode: DISABLED
+    metadata:
+      dependsOn:
+        - firestore-api
+        - firebase-project
+
+  # Cloud Storage bucket for QA artifacts
+  - name: qa-artifacts-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${project_id}-${qa_bucket_suffix}
+      project: ${project_id}
+      location: ${region}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90
+          - action:
+              type: Delete
+            condition:
+              age: ${retention_days}
+      uniformBucketLevelAccess:
+        enabled: true
+      publicAccessPrevention: enforced
+      labels:
+        purpose: qa-workflows
+        environment: production
+        component: storage
+    metadata:
+      dependsOn:
+        - cloud-storage-api
+
+  # IAM binding for bucket access
+  - name: bucket-iam-binding
+    type: gcp-types/storage-v1:buckets.setIamPolicy
+    properties:
+      bucket: ${project_id}-${qa_bucket_suffix}
+      project: ${project_id}
+      policy:
+        bindings:
+          - role: roles/storage.objectAdmin
+            members:
+              - serviceAccount:${project_id}@appspot.gserviceaccount.com
+          - role: roles/storage.legacyBucketReader
+            members:
+              - serviceAccount:${project_id}@appspot.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - qa-artifacts-bucket
+
+  # Cloud Tasks queues for orchestration
+  - name: qa-orchestration-queue
+    type: gcp-types/cloudtasks-v2:projects.locations.queues
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      name: projects/${project_id}/locations/${region}/queues/${task_queue_suffix}
+      rateLimits:
+        maxDispatchesPerSecond: 10.0
+        maxBurstSize: 100
+        maxConcurrentDispatches: ${max_concurrent_tasks}
+      retryConfig:
+        maxAttempts: 5
+        maxRetryDuration: 3600s
+        minBackoff: 1s
+        maxBackoff: 300s
+        maxDoublings: 5
+      state: RUNNING
+    metadata:
+      dependsOn:
+        - cloud-tasks-api
+
+  # Priority queue for critical tests
+  - name: qa-priority-queue
+    type: gcp-types/cloudtasks-v2:projects.locations.queues
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      name: projects/${project_id}/locations/${region}/queues/${task_queue_suffix}-priority
+      rateLimits:
+        maxDispatchesPerSecond: 5.0
+        maxBurstSize: 50
+        maxConcurrentDispatches: 5
+      retryConfig:
+        maxAttempts: 3
+        maxRetryDuration: 1800s
+        minBackoff: 1s
+        maxBackoff: 60s
+        maxDoublings: 3
+      state: RUNNING
+    metadata:
+      dependsOn:
+        - cloud-tasks-api
+
+  # Analysis queue for AI processing
+  - name: qa-analysis-queue
+    type: gcp-types/cloudtasks-v2:projects.locations.queues
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      name: projects/${project_id}/locations/${region}/queues/${task_queue_suffix}-analysis
+      rateLimits:
+        maxDispatchesPerSecond: 3.0
+        maxBurstSize: 10
+        maxConcurrentDispatches: 3
+      retryConfig:
+        maxAttempts: 3
+        maxRetryDuration: 7200s
+        minBackoff: 5s
+        maxBackoff: 300s
+        maxDoublings: 4
+      state: RUNNING
+    metadata:
+      dependsOn:
+        - cloud-tasks-api
+
+  # Service account for Cloud Functions
+  - name: qa-functions-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: qa-functions-sa
+      displayName: "QA Workflows Cloud Functions Service Account"
+      description: "Service account for QA workflow Cloud Functions"
+      project: ${project_id}
+    metadata:
+      dependsOn: []
+
+  # IAM roles for the service account
+  - name: functions-sa-tasks-admin
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: ${project_id}
+      policy:
+        bindings:
+          - role: roles/cloudtasks.enqueuer
+            members:
+              - serviceAccount:qa-functions-sa@${project_id}.iam.gserviceaccount.com
+          - role: roles/cloudtasks.taskRunner
+            members:
+              - serviceAccount:qa-functions-sa@${project_id}.iam.gserviceaccount.com
+          - role: roles/datastore.user
+            members:
+              - serviceAccount:qa-functions-sa@${project_id}.iam.gserviceaccount.com
+          - role: roles/storage.objectAdmin
+            members:
+              - serviceAccount:qa-functions-sa@${project_id}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - qa-functions-service-account
+        - firestore-database
+        - qa-artifacts-bucket
+
+  # Cloud Function for QA phase execution
+  - name: qa-phase-executor-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/${project_id}/locations/${region}
+      name: projects/${project_id}/locations/${region}/functions/qa-phase-executor
+      description: "Executes QA workflow phases with intelligent analysis"
+      sourceArchiveUrl: gs://gcf-sources-${project_id}/qa-phase-executor.zip
+      entryPoint: qa_phase_executor
+      runtime: python311
+      timeout: 540s
+      availableMemoryMb: 512
+      maxInstances: 100
+      serviceAccountEmail: qa-functions-sa@${project_id}.iam.gserviceaccount.com
+      httpsTrigger: {}
+      environmentVariables:
+        QA_BUCKET_NAME: ${project_id}-${qa_bucket_suffix}
+        PROJECT_ID: ${project_id}
+        REGION: ${region}
+        TASK_QUEUE_NAME: ${task_queue_suffix}
+      labels:
+        component: qa-executor
+        environment: production
+    metadata:
+      dependsOn:
+        - cloud-functions-api
+        - qa-functions-service-account
+        - qa-artifacts-bucket
+        - qa-orchestration-queue
+
+  # Vertex AI model for quality analysis (conditional)
+  - name: qa-analysis-model
+    type: gcp-types/aiplatform-v1:projects.locations.models
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      displayName: "QA Analysis Model"
+      description: "Machine learning model for intelligent quality analysis"
+      metadataSchemaUri: gs://google-cloud-aiplatform/schema/model/metadata/automl_tabular_1.0.0.yaml
+      labels:
+        purpose: qa-analysis
+        component: vertex-ai
+    metadata:
+      dependsOn:
+        - vertex-ai-api
+    condition: ${enable_vertex_ai}
+
+  # Vertex AI dataset for training
+  - name: qa-metrics-dataset
+    type: gcp-types/aiplatform-v1:projects.locations.datasets
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      displayName: "QA Metrics Dataset"
+      description: "Dataset containing QA metrics for model training"
+      metadataSchemaUri: gs://google-cloud-aiplatform/schema/dataset/metadata/tabular_1.0.0.yaml
+      labels:
+        purpose: qa-training
+        component: vertex-ai
+    metadata:
+      dependsOn:
+        - vertex-ai-api
+    condition: ${enable_vertex_ai}
+
+  # Service account for Cloud Run dashboard
+  - name: qa-dashboard-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: qa-dashboard-sa
+      displayName: "QA Dashboard Cloud Run Service Account"
+      description: "Service account for QA dashboard Cloud Run service"
+      project: ${project_id}
+    metadata:
+      dependsOn: []
+
+  # IAM roles for dashboard service account
+  - name: dashboard-sa-permissions
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: ${project_id}
+      policy:
+        bindings:
+          - role: roles/datastore.viewer
+            members:
+              - serviceAccount:qa-dashboard-sa@${project_id}.iam.gserviceaccount.com
+          - role: roles/storage.objectViewer
+            members:
+              - serviceAccount:qa-dashboard-sa@${project_id}.iam.gserviceaccount.com
+          - role: roles/cloudtasks.viewer
+            members:
+              - serviceAccount:qa-dashboard-sa@${project_id}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - qa-dashboard-service-account
+        - firestore-database
+        - qa-artifacts-bucket
+
+  # Cloud Run service for QA dashboard
+  - name: qa-dashboard-service
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      location: ${region}
+      parent: namespaces/${project_id}
+      apiVersion: serving.knative.dev/v1
+      kind: Service
+      metadata:
+        name: qa-dashboard
+        namespace: ${project_id}
+        labels:
+          component: qa-dashboard
+          environment: production
+        annotations:
+          run.googleapis.com/ingress: all
+          run.googleapis.com/execution-environment: gen2
+      spec:
+        template:
+          metadata:
+            annotations:
+              run.googleapis.com/service-account: qa-dashboard-sa@${project_id}.iam.gserviceaccount.com
+              run.googleapis.com/cpu-throttling: "false"
+              autoscaling.knative.dev/maxScale: "10"
+              run.googleapis.com/memory: "512Mi"
+              run.googleapis.com/cpu: "1000m"
+          spec:
+            containerConcurrency: 100
+            timeoutSeconds: 300
+            containers:
+              - name: qa-dashboard
+                image: gcr.io/${project_id}/qa-dashboard:latest
+                ports:
+                  - name: http1
+                    containerPort: 8080
+                    protocol: TCP
+                env:
+                  - name: GOOGLE_CLOUD_PROJECT
+                    value: ${project_id}
+                  - name: QA_BUCKET_NAME
+                    value: ${project_id}-${qa_bucket_suffix}
+                  - name: REGION
+                    value: ${region}
+                resources:
+                  limits:
+                    cpu: "1000m"
+                    memory: "512Mi"
+                  requests:
+                    cpu: "100m"
+                    memory: "128Mi"
+    metadata:
+      dependsOn:
+        - cloud-run-api
+        - qa-dashboard-service-account
+        - firestore-database
+
+  # IAM policy for public access to dashboard (optional)
+  - name: dashboard-public-access
+    type: gcp-types/run-v1:projects.locations.services.setIamPolicy
+    properties:
+      resource: projects/${project_id}/locations/${region}/services/qa-dashboard
+      policy:
+        bindings:
+          - role: roles/run.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - qa-dashboard-service
+
+  # Cloud Monitoring alert policy for QA failures
+  - name: qa-failure-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      name: projects/${project_id}/alertPolicies/qa-workflow-failures
+      displayName: "QA Workflow Failures"
+      documentation:
+        content: "Alert triggered when QA workflow failures exceed threshold"
+        mimeType: text/markdown
+      conditions:
+        - displayName: "High failure rate"
+          conditionThreshold:
+            filter: resource.type="cloud_function" resource.label.function_name="qa-phase-executor"
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue:
+              doubleValue: 5.0
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_SUM
+                groupByFields:
+                  - resource.label.function_name
+      alertStrategy:
+        autoClose: 86400s
+      enabled: true
+      severity: ERROR
+    metadata:
+      dependsOn:
+        - qa-phase-executor-function
+
+# Output values for verification and integration
+outputs:
+  firebase_project_id:
+    description: "Firebase project identifier"
+    value: ${project_id}
+  
+  firestore_database_name:
+    description: "Firestore database name"
+    value: "(default)"
+  
+  qa_artifacts_bucket:
+    description: "Cloud Storage bucket for QA artifacts"
+    value: ${project_id}-${qa_bucket_suffix}
+  
+  task_queue_names:
+    description: "Cloud Tasks queue names"
+    value:
+      main: projects/${project_id}/locations/${region}/queues/${task_queue_suffix}
+      priority: projects/${project_id}/locations/${region}/queues/${task_queue_suffix}-priority
+      analysis: projects/${project_id}/locations/${region}/queues/${task_queue_suffix}-analysis
+  
+  qa_function_url:
+    description: "QA phase executor Cloud Function trigger URL"
+    value: $(ref.qa-phase-executor-function.httpsTrigger.url)
+  
+  dashboard_url:
+    description: "QA dashboard Cloud Run service URL"
+    value: $(ref.qa-dashboard-service.status.url)
+  
+  vertex_ai_model:
+    description: "Vertex AI model for quality analysis"
+    value: $(ref.qa-analysis-model.name)
+    condition: ${enable_vertex_ai}
+  
+  service_accounts:
+    description: "Service accounts created for the QA workflow"
+    value:
+      functions: qa-functions-sa@${project_id}.iam.gserviceaccount.com
+      dashboard: qa-dashboard-sa@${project_id}.iam.gserviceaccount.com
+  
+  monitoring_resources:
+    description: "Monitoring and alerting resources"
+    value:
+      alert_policy: $(ref.qa-failure-alert-policy.name)
+  
+  deployment_region:
+    description: "Google Cloud region where resources are deployed"
+    value: ${region}

@@ -1,0 +1,943 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Comprehensive IoT Device Fleet Monitoring with CloudWatch and Device Defender - Creates security monitoring, automated remediation, and operational dashboards for IoT device fleets'
+
+Parameters:
+  # Fleet Configuration
+  FleetName:
+    Type: String
+    Description: Name for the IoT device fleet
+    Default: 'iot-monitoring-fleet'
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: 'Fleet name must contain only alphanumeric characters and hyphens'
+
+  # Notification Configuration
+  NotificationEmail:
+    Type: String
+    Description: Email address for security alerts and monitoring notifications
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  # Security Profile Configuration
+  SecurityProfileName:
+    Type: String
+    Description: Name for the Device Defender security profile
+    Default: 'comprehensive-fleet-security-profile'
+    MinLength: 3
+    MaxLength: 50
+
+  # Monitoring Configuration
+  DashboardName:
+    Type: String
+    Description: Name for the CloudWatch dashboard
+    Default: 'IoT-Fleet-Monitoring-Dashboard'
+    MinLength: 3
+    MaxLength: 50
+
+  # Threshold Configuration
+  MaxAuthorizationFailures:
+    Type: Number
+    Description: Maximum authorization failures before alarm (per 5 minutes)
+    Default: 5
+    MinValue: 1
+    MaxValue: 100
+
+  MaxMessageByteSize:
+    Type: Number
+    Description: Maximum message byte size threshold
+    Default: 1024
+    MinValue: 128
+    MaxValue: 10240
+
+  MaxMessagesPerPeriod:
+    Type: Number
+    Description: Maximum messages per 5-minute period
+    Default: 100
+    MinValue: 10
+    MaxValue: 1000
+
+  MaxConnectionAttempts:
+    Type: Number
+    Description: Maximum connection attempts per 5-minute period
+    Default: 10
+    MinValue: 1
+    MaxValue: 50
+
+  # Alarm Configuration
+  SecurityViolationThreshold:
+    Type: Number
+    Description: Number of security violations to trigger alarm
+    Default: 5
+    MinValue: 1
+    MaxValue: 20
+
+  MinConnectedDevices:
+    Type: Number
+    Description: Minimum connected devices before triggering low connectivity alarm
+    Default: 3
+    MinValue: 1
+    MaxValue: 100
+
+  MessageProcessingErrorThreshold:
+    Type: Number
+    Description: Number of message processing errors to trigger alarm
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+
+  # Test Device Configuration
+  CreateTestDevices:
+    Type: String
+    Description: Whether to create test IoT devices for demonstration
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  TestDeviceCount:
+    Type: Number
+    Description: Number of test devices to create (only if CreateTestDevices is true)
+    Default: 5
+    MinValue: 1
+    MaxValue: 10
+
+Conditions:
+  CreateTestDevicesCondition: !Equals [!Ref CreateTestDevices, 'true']
+
+Resources:
+  # ============================================================================
+  # IAM ROLES AND POLICIES
+  # ============================================================================
+
+  # Device Defender Service Role
+  DeviceDefenderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-DeviceDefenderRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSIoTDeviceDefenderAudit
+      Policies:
+        - PolicyName: DeviceDefenderCustomPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SecurityAlertsTopic
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/iot/fleet-monitoring*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+
+  # Lambda Execution Role for Automated Remediation
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-LambdaExecutionRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: IoTFleetRemediationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iot:UpdateCertificate
+                  - iot:DetachThingPrincipal
+                  - iot:ListThingPrincipals
+                  - iot:DescribeThing
+                  - iot:UpdateThing
+                  - iot:ListThingGroupsForThing
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+
+  # ============================================================================
+  # NOTIFICATION INFRASTRUCTURE
+  # ============================================================================
+
+  # SNS Topic for Security Alerts
+  SecurityAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-SecurityAlerts'
+      DisplayName: 'IoT Fleet Security Alerts'
+      Subscription:
+        - Endpoint: !Ref NotificationEmail
+          Protocol: email
+
+  # SNS Topic Policy
+  SecurityAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref SecurityAlertsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowIoTServiceToPublish
+            Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: SNS:Publish
+            Resource: !Ref SecurityAlertsTopic
+          - Sid: AllowCloudWatchToPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: SNS:Publish
+            Resource: !Ref SecurityAlertsTopic
+
+  # ============================================================================
+  # AUTOMATED REMEDIATION INFRASTRUCTURE
+  # ============================================================================
+
+  # Lambda Function for Automated Remediation
+  RemediationLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-RemediationFunction'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      Description: 'Automated remediation for IoT fleet security violations'
+      Environment:
+        Variables:
+          FLEET_NAME: !Ref FleetName
+          SECURITY_PROFILE_NAME: !Ref SecurityProfileName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          iot_client = boto3.client('iot')
+          cloudwatch = boto3.client('cloudwatch')
+
+          def lambda_handler(event, context):
+              try:
+                  # Parse SNS message
+                  if 'Records' in event:
+                      for record in event['Records']:
+                          if record['EventSource'] == 'aws:sns':
+                              message = json.loads(record['Sns']['Message'])
+                              process_security_violation(message)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Successfully processed security violation')
+                  }
+              
+              except Exception as e:
+                  logger.error(f"Error processing event: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+
+          def process_security_violation(message):
+              """Process Device Defender security violation"""
+              
+              violation_type = message.get('violationEventType', 'unknown')
+              thing_name = message.get('thingName', 'unknown')
+              behavior_name = message.get('behavior', {}).get('name', 'unknown')
+              
+              logger.info(f"Processing violation: {violation_type} for {thing_name}, behavior: {behavior_name}")
+              
+              # Send custom metric to CloudWatch
+              cloudwatch.put_metric_data(
+                  Namespace='AWS/IoT/FleetMonitoring',
+                  MetricData=[
+                      {
+                          'MetricName': 'SecurityViolations',
+                          'Value': 1,
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {
+                                  'Name': 'ViolationType',
+                                  'Value': violation_type
+                              },
+                              {
+                                  'Name': 'BehaviorName',
+                                  'Value': behavior_name
+                              },
+                              {
+                                  'Name': 'FleetName',
+                                  'Value': os.environ.get('FLEET_NAME', 'unknown')
+                              }
+                          ]
+                      }
+                  ]
+              )
+              
+              # Implement remediation logic based on violation type
+              if violation_type == 'in-alarm':
+                  handle_security_alarm(thing_name, behavior_name)
+              elif violation_type == 'alarm-cleared':
+                  handle_alarm_cleared(thing_name, behavior_name)
+
+          def handle_security_alarm(thing_name, behavior_name):
+              """Handle security alarm with appropriate remediation"""
+              
+              if behavior_name == 'AuthorizationFailures':
+                  # For repeated authorization failures, log warning
+                  logger.warning(f"Authorization failures detected for {thing_name}")
+                  # In production, you might disable the certificate temporarily
+                  
+              elif behavior_name == 'MessageByteSize':
+                  # Large message size might indicate data exfiltration
+                  logger.warning(f"Unusual message size detected for {thing_name}")
+                  
+              elif behavior_name in ['MessagesReceived', 'MessagesSent']:
+                  # Unusual message volume might indicate compromised device
+                  logger.warning(f"Unusual message volume detected for {thing_name}")
+                  
+              elif behavior_name == 'ConnectionAttempts':
+                  # Multiple connection attempts might indicate brute force attack
+                  logger.warning(f"Multiple connection attempts detected for {thing_name}")
+                  
+              # Add device to remediation metrics
+              cloudwatch.put_metric_data(
+                  Namespace='AWS/IoT/FleetMonitoring',
+                  MetricData=[
+                      {
+                          'MetricName': 'DevicesUnderRemediation',
+                          'Value': 1,
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {
+                                  'Name': 'ThingName',
+                                  'Value': thing_name
+                              },
+                              {
+                                  'Name': 'FleetName',
+                                  'Value': os.environ.get('FLEET_NAME', 'unknown')
+                              }
+                          ]
+                      }
+                  ]
+              )
+
+          def handle_alarm_cleared(thing_name, behavior_name):
+              """Handle alarm cleared event"""
+              logger.info(f"Alarm cleared for {thing_name}, behavior: {behavior_name}")
+              
+              # Send metric indicating alarm cleared
+              cloudwatch.put_metric_data(
+                  Namespace='AWS/IoT/FleetMonitoring',
+                  MetricData=[
+                      {
+                          'MetricName': 'SecurityAlarmsCleared',
+                          'Value': 1,
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {
+                                  'Name': 'BehaviorName',
+                                  'Value': behavior_name
+                              },
+                              {
+                                  'Name': 'FleetName',
+                                  'Value': os.environ.get('FLEET_NAME', 'unknown')
+                              }
+                          ]
+                      }
+                  ]
+              )
+
+  # Lambda Permission for SNS
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RemediationLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref SecurityAlertsTopic
+
+  # SNS Subscription for Lambda
+  LambdaSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref SecurityAlertsTopic
+      Endpoint: !GetAtt RemediationLambdaFunction.Arn
+
+  # ============================================================================
+  # IoT CORE INFRASTRUCTURE
+  # ============================================================================
+
+  # IoT Thing Group for Fleet Management
+  IoTFleetThingGroup:
+    Type: AWS::IoT::ThingGroup
+    Properties:
+      ThingGroupName: !Ref FleetName
+      ThingGroupProperties:
+        ThingGroupDescription: !Sub 'IoT device fleet for monitoring - ${AWS::StackName}'
+        AttributePayload:
+          Attributes:
+            StackName: !Ref AWS::StackName
+            CreatedBy: CloudFormation
+            Purpose: FleetMonitoring
+
+  # Device Defender Security Profile
+  SecurityProfile:
+    Type: AWS::IoT::SecurityProfile
+    Properties:
+      SecurityProfileName: !Ref SecurityProfileName
+      SecurityProfileDescription: 'Comprehensive security monitoring for IoT device fleet'
+      Behaviors:
+        - Name: AuthorizationFailures
+          Metric: aws:num-authorization-failures
+          Criteria:
+            ComparisonOperator: greater-than
+            Value:
+              Count: !Ref MaxAuthorizationFailures
+            DurationSeconds: 300
+            ConsecutiveDatapointsToAlarm: 2
+            ConsecutiveDatapointsToClear: 2
+        - Name: MessageByteSize
+          Metric: aws:message-byte-size
+          Criteria:
+            ComparisonOperator: greater-than
+            Value:
+              Count: !Ref MaxMessageByteSize
+            ConsecutiveDatapointsToAlarm: 3
+            ConsecutiveDatapointsToClear: 1
+        - Name: MessagesReceived
+          Metric: aws:num-messages-received
+          Criteria:
+            ComparisonOperator: greater-than
+            Value:
+              Count: !Ref MaxMessagesPerPeriod
+            DurationSeconds: 300
+            ConsecutiveDatapointsToAlarm: 2
+            ConsecutiveDatapointsToClear: 2
+        - Name: MessagesSent
+          Metric: aws:num-messages-sent
+          Criteria:
+            ComparisonOperator: greater-than
+            Value:
+              Count: !Ref MaxMessagesPerPeriod
+            DurationSeconds: 300
+            ConsecutiveDatapointsToAlarm: 2
+            ConsecutiveDatapointsToClear: 2
+        - Name: ConnectionAttempts
+          Metric: aws:num-connection-attempts
+          Criteria:
+            ComparisonOperator: greater-than
+            Value:
+              Count: !Ref MaxConnectionAttempts
+            DurationSeconds: 300
+            ConsecutiveDatapointsToAlarm: 2
+            ConsecutiveDatapointsToClear: 2
+      AlertTargets:
+        SNS:
+          AlertTargetArn: !Ref SecurityAlertsTopic
+          RoleArn: !GetAtt DeviceDefenderRole.Arn
+      TargetArns:
+        - !GetAtt IoTFleetThingGroup.Arn
+
+  # ============================================================================
+  # MONITORING INFRASTRUCTURE
+  # ============================================================================
+
+  # CloudWatch Log Group for IoT Fleet Monitoring
+  IoTFleetLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: '/aws/iot/fleet-monitoring'
+      RetentionInDays: 30
+
+  # IoT Rule for Device Connection Monitoring
+  DeviceConnectionRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub '${AWS::StackName}DeviceConnectionMonitoring'
+      TopicRulePayload:
+        RuleDisabled: false
+        Sql: 'SELECT * FROM "$aws/events/presence/connected/+" WHERE eventType = "connected" OR eventType = "disconnected"'
+        Description: 'Monitor device connection events'
+        Actions:
+          - CloudwatchMetric:
+              RoleArn: !GetAtt DeviceDefenderRole.Arn
+              MetricNamespace: 'AWS/IoT/FleetMonitoring'
+              MetricName: 'DeviceConnectionEvents'
+              MetricValue: '1'
+              MetricUnit: 'Count'
+              MetricTimestamp: '${timestamp()}'
+          - CloudwatchLogs:
+              RoleArn: !GetAtt DeviceDefenderRole.Arn
+              LogGroupName: !Ref IoTFleetLogGroup
+
+  # IoT Rule for Message Volume Monitoring
+  MessageVolumeRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub '${AWS::StackName}MessageVolumeMonitoring'
+      TopicRulePayload:
+        RuleDisabled: false
+        Sql: 'SELECT clientId, timestamp, topic FROM "device/+/data"'
+        Description: 'Monitor message volume from devices'
+        Actions:
+          - CloudwatchMetric:
+              RoleArn: !GetAtt DeviceDefenderRole.Arn
+              MetricNamespace: 'AWS/IoT/FleetMonitoring'
+              MetricName: 'MessageVolume'
+              MetricValue: '1'
+              MetricUnit: 'Count'
+              MetricTimestamp: '${timestamp()}'
+
+  # ============================================================================
+  # CLOUDWATCH ALARMS
+  # ============================================================================
+
+  # High Security Violations Alarm
+  HighSecurityViolationsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-High-Security-Violations'
+      AlarmDescription: 'High number of security violations detected'
+      MetricName: SecurityViolations
+      Namespace: AWS/IoT/FleetMonitoring
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref SecurityViolationThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref SecurityAlertsTopic
+      OKActions:
+        - !Ref SecurityAlertsTopic
+      Dimensions:
+        - Name: FleetName
+          Value: !Ref FleetName
+
+  # Low Device Connectivity Alarm
+  LowConnectivityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-Low-Connectivity'
+      AlarmDescription: 'Low device connectivity detected'
+      MetricName: ConnectedDevices
+      Namespace: AWS/IoT
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref MinConnectedDevices
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref SecurityAlertsTopic
+      TreatMissingData: notBreaching
+
+  # Message Processing Errors Alarm
+  MessageProcessingErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-Message-Processing-Errors'
+      AlarmDescription: 'High message processing error rate'
+      MetricName: RuleMessageProcessingErrors
+      Namespace: AWS/IoT
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref MessageProcessingErrorThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref SecurityAlertsTopic
+
+  # ============================================================================
+  # CLOUDWATCH DASHBOARD
+  # ============================================================================
+
+  # Comprehensive Fleet Monitoring Dashboard
+  FleetMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Ref DashboardName
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/IoT", "ConnectedDevices", {"stat": "Average"}],
+                  [".", "MessagesSent", {"stat": "Sum"}],
+                  [".", "MessagesReceived", {"stat": "Sum"}]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "IoT Fleet Overview",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/IoT/FleetMonitoring", "SecurityViolations", "FleetName", "${FleetName}"],
+                  [".", "SecurityAlarmsCleared", ".", "."],
+                  [".", "DevicesUnderRemediation", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Security Violations & Remediation",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/IoT", "RuleMessageProcessingErrors", {"stat": "Sum"}],
+                  [".", "RuleMessageProcessingSuccess", {"stat": "Sum"}]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Message Processing",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/IoT/FleetMonitoring", "DeviceConnectionEvents", {"stat": "Sum"}],
+                  [".", "MessageVolume", {"stat": "Sum"}]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Device Activity",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${AWS::StackName}-RemediationFunction' | fields @timestamp, @message\\n| filter @message like /violation/\\n| sort @timestamp desc\\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Security Violation Logs",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # ============================================================================
+  # TEST DEVICES (CONDITIONAL)
+  # ============================================================================
+
+  # Test Device 1
+  TestDevice1:
+    Type: AWS::IoT::Thing
+    Condition: CreateTestDevicesCondition
+    Properties:
+      ThingName: !Sub '${FleetName}-test-device-1'
+      AttributePayload:
+        Attributes:
+          deviceType: 'sensor'
+          location: 'facility-1'
+          firmware: 'v1.2.3'
+          StackName: !Ref AWS::StackName
+
+  # Test Device 2
+  TestDevice2:
+    Type: AWS::IoT::Thing
+    Condition: CreateTestDevicesCondition
+    Properties:
+      ThingName: !Sub '${FleetName}-test-device-2'
+      AttributePayload:
+        Attributes:
+          deviceType: 'sensor'
+          location: 'facility-2'
+          firmware: 'v1.2.3'
+          StackName: !Ref AWS::StackName
+
+  # Test Device 3
+  TestDevice3:
+    Type: AWS::IoT::Thing
+    Condition: CreateTestDevicesCondition
+    Properties:
+      ThingName: !Sub '${FleetName}-test-device-3'
+      AttributePayload:
+        Attributes:
+          deviceType: 'sensor'
+          location: 'facility-3'
+          firmware: 'v1.2.3'
+          StackName: !Ref AWS::StackName
+
+  # Test Device 4
+  TestDevice4:
+    Type: AWS::IoT::Thing
+    Condition: CreateTestDevicesCondition
+    Properties:
+      ThingName: !Sub '${FleetName}-test-device-4'
+      AttributePayload:
+        Attributes:
+          deviceType: 'sensor'
+          location: 'facility-4'
+          firmware: 'v1.2.3'
+          StackName: !Ref AWS::StackName
+
+  # Test Device 5
+  TestDevice5:
+    Type: AWS::IoT::Thing
+    Condition: CreateTestDevicesCondition
+    Properties:
+      ThingName: !Sub '${FleetName}-test-device-5'
+      AttributePayload:
+        Attributes:
+          deviceType: 'sensor'
+          location: 'facility-5'
+          firmware: 'v1.2.3'
+          StackName: !Ref AWS::StackName
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+
+Outputs:
+  # Stack Information
+  StackName:
+    Description: 'Name of the CloudFormation stack'
+    Value: !Ref AWS::StackName
+    Export:
+      Name: !Sub '${AWS::StackName}-StackName'
+
+  # Fleet Information
+  FleetName:
+    Description: 'Name of the IoT device fleet'
+    Value: !Ref FleetName
+    Export:
+      Name: !Sub '${AWS::StackName}-FleetName'
+
+  FleetThingGroupArn:
+    Description: 'ARN of the IoT Thing Group for the fleet'
+    Value: !GetAtt IoTFleetThingGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FleetThingGroupArn'
+
+  # Security Profile Information
+  SecurityProfileName:
+    Description: 'Name of the Device Defender security profile'
+    Value: !Ref SecurityProfileName
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityProfileName'
+
+  SecurityProfileArn:
+    Description: 'ARN of the Device Defender security profile'
+    Value: !GetAtt SecurityProfile.SecurityProfileArn
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityProfileArn'
+
+  # Notification Information
+  SecurityAlertsTopicArn:
+    Description: 'ARN of the SNS topic for security alerts'
+    Value: !Ref SecurityAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityAlertsTopicArn'
+
+  SecurityAlertsTopicName:
+    Description: 'Name of the SNS topic for security alerts'
+    Value: !GetAtt SecurityAlertsTopic.TopicName
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityAlertsTopicName'
+
+  # Lambda Function Information
+  RemediationLambdaFunctionArn:
+    Description: 'ARN of the Lambda function for automated remediation'
+    Value: !GetAtt RemediationLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RemediationLambdaFunctionArn'
+
+  RemediationLambdaFunctionName:
+    Description: 'Name of the Lambda function for automated remediation'
+    Value: !Ref RemediationLambdaFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-RemediationLambdaFunctionName'
+
+  # IAM Role Information
+  DeviceDefenderRoleArn:
+    Description: 'ARN of the Device Defender service role'
+    Value: !GetAtt DeviceDefenderRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DeviceDefenderRoleArn'
+
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  # Monitoring Information
+  DashboardName:
+    Description: 'Name of the CloudWatch dashboard'
+    Value: !Ref DashboardName
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardName'
+
+  DashboardURL:
+    Description: 'URL to access the CloudWatch dashboard'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${DashboardName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  # Log Group Information
+  IoTFleetLogGroupArn:
+    Description: 'ARN of the CloudWatch log group for IoT fleet monitoring'
+    Value: !GetAtt IoTFleetLogGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTFleetLogGroupArn'
+
+  IoTFleetLogGroupName:
+    Description: 'Name of the CloudWatch log group for IoT fleet monitoring'
+    Value: !Ref IoTFleetLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTFleetLogGroupName'
+
+  # Alarm Information
+  HighSecurityViolationsAlarmArn:
+    Description: 'ARN of the high security violations alarm'
+    Value: !GetAtt HighSecurityViolationsAlarm.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-HighSecurityViolationsAlarmArn'
+
+  LowConnectivityAlarmArn:
+    Description: 'ARN of the low connectivity alarm'
+    Value: !GetAtt LowConnectivityAlarm.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LowConnectivityAlarmArn'
+
+  MessageProcessingErrorsAlarmArn:
+    Description: 'ARN of the message processing errors alarm'
+    Value: !GetAtt MessageProcessingErrorsAlarm.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-MessageProcessingErrorsAlarmArn'
+
+  # IoT Rules Information
+  DeviceConnectionRuleArn:
+    Description: 'ARN of the device connection monitoring rule'
+    Value: !GetAtt DeviceConnectionRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DeviceConnectionRuleArn'
+
+  MessageVolumeRuleArn:
+    Description: 'ARN of the message volume monitoring rule'
+    Value: !GetAtt MessageVolumeRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-MessageVolumeRuleArn'
+
+  # Test Device Information (Conditional)
+  TestDevice1Name:
+    Condition: CreateTestDevicesCondition
+    Description: 'Name of test device 1'
+    Value: !Ref TestDevice1
+    Export:
+      Name: !Sub '${AWS::StackName}-TestDevice1Name'
+
+  TestDevice2Name:
+    Condition: CreateTestDevicesCondition
+    Description: 'Name of test device 2'
+    Value: !Ref TestDevice2
+    Export:
+      Name: !Sub '${AWS::StackName}-TestDevice2Name'
+
+  TestDevice3Name:
+    Condition: CreateTestDevicesCondition
+    Description: 'Name of test device 3'
+    Value: !Ref TestDevice3
+    Export:
+      Name: !Sub '${AWS::StackName}-TestDevice3Name'
+
+  TestDevice4Name:
+    Condition: CreateTestDevicesCondition
+    Description: 'Name of test device 4'
+    Value: !Ref TestDevice4
+    Export:
+      Name: !Sub '${AWS::StackName}-TestDevice4Name'
+
+  TestDevice5Name:
+    Condition: CreateTestDevicesCondition
+    Description: 'Name of test device 5'
+    Value: !Ref TestDevice5
+    Export:
+      Name: !Sub '${AWS::StackName}-TestDevice5Name'
+
+  # Next Steps
+  NextSteps:
+    Description: 'Next steps to complete the setup'
+    Value: 'After deployment: 1) Confirm email subscription in SNS, 2) Configure devices to connect to IoT Core, 3) Monitor dashboard for fleet health'

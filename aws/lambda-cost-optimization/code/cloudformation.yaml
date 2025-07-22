@@ -1,0 +1,594 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure for Lambda Cost Optimization with Compute Optimizer - Creates monitoring dashboard, alerts, and optimization automation'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Basic Configuration"
+        Parameters:
+          - EnvironmentName
+          - NotificationEmail
+      - Label:
+          default: "Optimization Settings"
+        Parameters:
+          - SavingsThreshold
+          - AutoOptimizationEnabled
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - MonitoringRetentionDays
+          - DashboardEnabled
+    ParameterLabels:
+      EnvironmentName:
+        default: "Environment Name"
+      NotificationEmail:
+        default: "Notification Email"
+      SavingsThreshold:
+        default: "Minimum Savings Threshold ($)"
+      AutoOptimizationEnabled:
+        default: "Enable Automatic Optimization"
+      MonitoringRetentionDays:
+        default: "CloudWatch Logs Retention (Days)"
+      DashboardEnabled:
+        default: "Create CloudWatch Dashboard"
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: 'lambda-optimizer'
+    Description: 'Name for this optimization environment (used in resource naming)'
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+    MinLength: 3
+    MaxLength: 20
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for optimization notifications and alerts'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  SavingsThreshold:
+    Type: Number
+    Default: 1.00
+    Description: 'Minimum monthly savings ($) required to trigger optimization'
+    MinValue: 0.01
+    MaxValue: 1000.00
+
+  AutoOptimizationEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: 'Whether to automatically apply optimization recommendations'
+
+  MonitoringRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: 'Number of days to retain CloudWatch logs'
+
+  DashboardEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Whether to create a CloudWatch dashboard for monitoring'
+
+Conditions:
+  CreateDashboard: !Equals [!Ref DashboardEnabled, 'true']
+  AutoOptimizationEnabled: !Equals [!Ref AutoOptimizationEnabled, 'true']
+
+Resources:
+  # SNS Topic for notifications
+  OptimizationNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${EnvironmentName}-lambda-optimization-alerts'
+      DisplayName: 'Lambda Cost Optimization Notifications'
+      KmsMasterKeyId: alias/aws/sns
+
+  # SNS Subscription for email notifications
+  EmailNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref OptimizationNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # IAM Role for Lambda optimization function
+  LambdaOptimizationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-lambda-optimization-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ComputeOptimizerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - compute-optimizer:GetLambdaFunctionRecommendations
+                  - compute-optimizer:GetEnrollmentStatus
+                  - compute-optimizer:PutEnrollmentStatus
+                Resource: '*'
+        - PolicyName: LambdaManagement
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:ListFunctions
+                  - lambda:GetFunctionConfiguration
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:GetFunction
+                Resource: '*'
+        - PolicyName: CloudWatchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                  - cloudwatch:PutMetricData
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+        - PolicyName: SNSPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref OptimizationNotificationTopic
+
+  # CloudWatch Log Group for optimization function
+  OptimizationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${EnvironmentName}-lambda-optimizer'
+      RetentionInDays: !Ref MonitoringRetentionDays
+
+  # Lambda function for optimization analysis and recommendations
+  LambdaOptimizationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-lambda-optimizer'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaOptimizationRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          SAVINGS_THRESHOLD: !Ref SavingsThreshold
+          AUTO_OPTIMIZATION_ENABLED: !Ref AutoOptimizationEnabled
+          SNS_TOPIC_ARN: !Ref OptimizationNotificationTopic
+          ENVIRONMENT_NAME: !Ref EnvironmentName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          from typing import Dict, List, Any
+
+          def lambda_handler(event, context):
+              """
+              Lambda function to analyze and optimize Lambda function costs using Compute Optimizer
+              """
+              
+              # Initialize AWS clients
+              compute_optimizer = boto3.client('compute-optimizer')
+              lambda_client = boto3.client('lambda')
+              cloudwatch = boto3.client('cloudwatch')
+              sns = boto3.client('sns')
+              
+              # Get environment variables
+              savings_threshold = float(os.environ.get('SAVINGS_THRESHOLD', '1.00'))
+              auto_optimization = os.environ.get('AUTO_OPTIMIZATION_ENABLED', 'false').lower() == 'true'
+              sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
+              environment_name = os.environ.get('ENVIRONMENT_NAME', 'lambda-optimizer')
+              
+              try:
+                  # Check if Compute Optimizer is enabled
+                  enrollment_status = compute_optimizer.get_enrollment_status()
+                  if enrollment_status['status'] != 'Active':
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps('Compute Optimizer is not active. Please enable it first.')
+                      }
+                  
+                  # Get Lambda function recommendations
+                  recommendations = compute_optimizer.get_lambda_function_recommendations()
+                  
+                  optimization_results = []
+                  total_potential_savings = 0
+                  functions_optimized = 0
+                  
+                  for rec in recommendations.get('lambdaFunctionRecommendations', []):
+                      function_name = rec['functionName']
+                      finding = rec['finding']
+                      current_memory = rec['currentMemorySize']
+                      
+                      if finding == 'Optimized':
+                          optimization_results.append({
+                              'function': function_name,
+                              'status': 'Already optimized',
+                              'current_memory': current_memory,
+                              'action': 'None'
+                          })
+                          continue
+                      
+                      if 'memorySizeRecommendationOptions' not in rec:
+                          continue
+                      
+                      best_option = rec['memorySizeRecommendationOptions'][0]
+                      recommended_memory = best_option['memorySize']
+                      estimated_savings = best_option.get('estimatedMonthlySavings', {}).get('value', 0)
+                      
+                      total_potential_savings += estimated_savings
+                      
+                      result = {
+                          'function': function_name,
+                          'status': finding,
+                          'current_memory': current_memory,
+                          'recommended_memory': recommended_memory,
+                          'estimated_savings': estimated_savings,
+                          'action': 'Analyzed'
+                      }
+                      
+                      # Apply optimization if enabled and savings exceed threshold
+                      if auto_optimization and estimated_savings >= savings_threshold:
+                          try:
+                              lambda_client.update_function_configuration(
+                                  FunctionName=function_name,
+                                  MemorySize=recommended_memory
+                              )
+                              result['action'] = 'Optimized'
+                              functions_optimized += 1
+                              
+                              # Put custom metric for optimization
+                              cloudwatch.put_metric_data(
+                                  Namespace='LambdaOptimization',
+                                  MetricData=[
+                                      {
+                                          'MetricName': 'FunctionOptimized',
+                                          'Value': 1,
+                                          'Unit': 'Count',
+                                          'Dimensions': [
+                                              {
+                                                  'Name': 'Environment',
+                                                  'Value': environment_name
+                                              }
+                                          ]
+                                      },
+                                      {
+                                          'MetricName': 'EstimatedSavings',
+                                          'Value': estimated_savings,
+                                          'Unit': 'None',
+                                          'Dimensions': [
+                                              {
+                                                  'Name': 'Environment',
+                                                  'Value': environment_name
+                                              }
+                                          ]
+                                      }
+                                  ]
+                              )
+                              
+                          except Exception as e:
+                              result['action'] = f'Failed: {str(e)}'
+                      
+                      optimization_results.append(result)
+                  
+                  # Send notification if there are results
+                  if optimization_results and sns_topic_arn:
+                      message = create_notification_message(
+                          optimization_results, 
+                          total_potential_savings, 
+                          functions_optimized,
+                          auto_optimization
+                      )
+                      
+                      sns.publish(
+                          TopicArn=sns_topic_arn,
+                          Subject=f'Lambda Optimization Report - {environment_name}',
+                          Message=message
+                      )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'total_functions_analyzed': len(optimization_results),
+                          'functions_optimized': functions_optimized,
+                          'total_potential_savings': round(total_potential_savings, 2),
+                          'recommendations': optimization_results
+                      })
+                  }
+                  
+              except Exception as e:
+                  error_message = f'Error in Lambda optimization: {str(e)}'
+                  print(error_message)
+                  
+                  if sns_topic_arn:
+                      sns.publish(
+                          TopicArn=sns_topic_arn,
+                          Subject=f'Lambda Optimization Error - {environment_name}',
+                          Message=error_message
+                      )
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': error_message})
+                  }
+
+          def create_notification_message(results: List[Dict], total_savings: float, optimized_count: int, auto_mode: bool) -> str:
+              """Create formatted notification message"""
+              
+              mode = "Automatic" if auto_mode else "Analysis"
+              
+              message = f"""
+          Lambda Cost Optimization Report
+          ================================
+          
+          Mode: {mode}
+          Total Functions Analyzed: {len(results)}
+          Functions Optimized: {optimized_count}
+          Total Potential Monthly Savings: ${total_savings:.2f}
+          Potential Annual Savings: ${total_savings * 12:.2f}
+          
+          Function Details:
+          ----------------
+          """
+              
+              for result in results:
+                  message += f"""
+          Function: {result['function']}
+          Status: {result['status']}
+          Current Memory: {result['current_memory']} MB
+          """
+                  if 'recommended_memory' in result:
+                      message += f"Recommended Memory: {result['recommended_memory']} MB\n"
+                      message += f"Estimated Savings: ${result['estimated_savings']:.2f}/month\n"
+                  
+                  message += f"Action: {result['action']}\n"
+                  message += "---\n"
+              
+              return message
+
+  # EventBridge rule for scheduled optimization (weekly)
+  OptimizationScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${EnvironmentName}-lambda-optimization-schedule'
+      Description: 'Weekly Lambda cost optimization analysis'
+      ScheduleExpression: 'rate(7 days)'  # Run weekly
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LambdaOptimizationFunction.Arn
+          Id: 'LambdaOptimizationTarget'
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaOptimizationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt OptimizationScheduleRule.Arn
+
+  # CloudWatch Alarms for monitoring
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-lambda-optimization-errors'
+      AlarmDescription: 'Alarm for Lambda optimization function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LambdaOptimizationFunction
+      AlarmActions:
+        - !Ref OptimizationNotificationTopic
+      TreatMissingData: notBreaching
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-lambda-optimization-duration'
+      AlarmDescription: 'Alarm for Lambda optimization function duration'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 240000  # 4 minutes (function timeout is 5 minutes)
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LambdaOptimizationFunction
+      AlarmActions:
+        - !Ref OptimizationNotificationTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch Dashboard for monitoring optimization metrics
+  OptimizationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateDashboard
+    Properties:
+      DashboardName: !Sub '${EnvironmentName}-lambda-cost-optimization'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "LambdaOptimization", "FunctionOptimized", "Environment", "${EnvironmentName}" ],
+                  [ ".", "EstimatedSavings", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Optimization Metrics",
+                "period": 86400,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${LambdaOptimizationFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Invocations", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Optimization Function Performance",
+                "period": 300
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${EnvironmentName}-lambda-optimizer'\n| fields @timestamp, @message\n| filter @message like /optimization/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Optimization Logs",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # Custom resource to enable Compute Optimizer (if not already enabled)
+  ComputeOptimizerEnabler:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt ComputeOptimizerEnablerFunction.Arn
+
+  ComputeOptimizerEnablerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ComputeOptimizerEnrollment
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - compute-optimizer:GetEnrollmentStatus
+                  - compute-optimizer:PutEnrollmentStatus
+                Resource: '*'
+
+  ComputeOptimizerEnablerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-compute-optimizer-enabler'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ComputeOptimizerEnablerRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          def lambda_handler(event, context):
+              try:
+                  compute_optimizer = boto3.client('compute-optimizer')
+                  
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      # Check current enrollment status
+                      status = compute_optimizer.get_enrollment_status()
+                      
+                      if status['status'] != 'Active':
+                          # Enable Compute Optimizer
+                          compute_optimizer.put_enrollment_status(status='Active')
+                          print('Compute Optimizer has been enabled')
+                      else:
+                          print('Compute Optimizer is already enabled')
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  
+              except Exception as e:
+                  print(f'Error: {str(e)}')
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+Outputs:
+  OptimizationFunctionArn:
+    Description: 'ARN of the Lambda optimization function'
+    Value: !GetAtt LambdaOptimizationFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-optimization-function-arn'
+
+  NotificationTopicArn:
+    Description: 'ARN of the SNS topic for optimization notifications'
+    Value: !Ref OptimizationNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-notification-topic-arn'
+
+  DashboardURL:
+    Condition: CreateDashboard
+    Description: 'URL to the CloudWatch dashboard for monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${EnvironmentName}-lambda-cost-optimization'
+
+  OptimizationSchedule:
+    Description: 'EventBridge rule for scheduled optimization'
+    Value: !Ref OptimizationScheduleRule
+
+  SavingsThreshold:
+    Description: 'Configured savings threshold for automatic optimization'
+    Value: !Sub '$${SavingsThreshold} per month'
+
+  AutoOptimizationStatus:
+    Description: 'Whether automatic optimization is enabled'
+    Value: !Ref AutoOptimizationEnabled
+
+  NextSteps:
+    Description: 'Instructions for using the optimization infrastructure'
+    Value: !Sub |
+      1. Wait 24 hours for Compute Optimizer to analyze your Lambda functions
+      2. Manually invoke the optimization function: aws lambda invoke --function-name ${LambdaOptimizationFunction} response.json
+      3. Check your email for optimization reports
+      4. Monitor the dashboard at: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${EnvironmentName}-lambda-cost-optimization
+      5. Review CloudWatch logs in log group: /aws/lambda/${EnvironmentName}-lambda-optimizer

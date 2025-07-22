@@ -1,0 +1,679 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for AWS IoT Greengrass Edge Computing - Creates IoT Core, Greengrass, and Lambda resources for edge computing applications'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "IoT Configuration"
+        Parameters:
+          - ThingGroupName
+          - CoreDeviceName
+      - Label:
+          default: "Lambda Function Configuration"
+        Parameters:
+          - LambdaRuntime
+          - LambdaMemorySize
+          - LambdaTimeout
+      - Label:
+          default: "Stream Manager Configuration"
+        Parameters:
+          - StreamMaxSize
+          - StreamTTLHours
+          - ExportBatchSize
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      ThingGroupName:
+        default: "Thing Group Name"
+      CoreDeviceName:
+        default: "Core Device Name"
+      LambdaRuntime:
+        default: "Lambda Runtime"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      StreamMaxSize:
+        default: "Stream Max Size"
+      StreamTTLHours:
+        default: "Stream TTL (hours)"
+      ExportBatchSize:
+        default: "Export Batch Size"
+
+# Input Parameters
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'edge-computing-greengrass'
+    Description: 'Name of the project for resource naming and tagging'
+    AllowedPattern: '^[a-z0-9-]{3,30}$'
+    ConstraintDescription: 'Must be 3-30 characters, lowercase letters, numbers, and hyphens only'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: 'Environment name for resource tagging and configuration'
+
+  ThingGroupName:
+    Type: String
+    Default: 'greengrass-things'
+    Description: 'Name for the IoT Thing Group'
+    AllowedPattern: '^[a-zA-Z0-9_-]{1,128}$'
+    ConstraintDescription: 'Must be 1-128 characters, alphanumeric, underscore, and hyphen only'
+
+  CoreDeviceName:
+    Type: String
+    Default: 'greengrass-core-device'
+    Description: 'Name for the Greengrass Core Device'
+    AllowedPattern: '^[a-zA-Z0-9_-]{1,128}$'
+    ConstraintDescription: 'Must be 1-128 characters, alphanumeric, underscore, and hyphen only'
+
+  LambdaRuntime:
+    Type: String
+    Default: 'python3.9'
+    AllowedValues:
+      - python3.8
+      - python3.9
+      - python3.10
+      - python3.11
+    Description: 'Runtime for the Edge Processing Lambda function'
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 128
+    MinValue: 128
+    MaxValue: 3008
+    Description: 'Memory allocation for Lambda function in MB'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    Description: 'Timeout for Lambda function in seconds'
+
+  StreamMaxSize:
+    Type: Number
+    Default: 1000
+    MinValue: 100
+    MaxValue: 10000
+    Description: 'Maximum size of the Stream Manager stream'
+
+  StreamTTLHours:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 168
+    Description: 'Time to live for stream data in hours'
+
+  ExportBatchSize:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+    Description: 'Batch size for stream data export'
+
+# Conditional Logic
+Conditions:
+  IsProdEnvironment: !Equals [!Ref Environment, 'prod']
+  IsDevEnvironment: !Equals [!Ref Environment, 'dev']
+
+# AWS Resources
+Resources:
+  # ============================================================================
+  # IAM Roles and Policies
+  # ============================================================================
+  
+  # IAM Role for Greengrass Core Device
+  GreengrassCoreRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-greengrass-core-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: credentials.iot.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGreengrassResourceAccessRolePolicy
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: Greengrass
+
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: IoTAndStreamManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iot:Publish
+                  - iot:Subscribe
+                  - iot:Receive
+                  - iot:Connect
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: Lambda
+
+  # ============================================================================
+  # IoT Core Resources
+  # ============================================================================
+
+  # IoT Thing for Greengrass Core
+  GreengrassCoreThing:
+    Type: AWS::IoT::Thing
+    Properties:
+      ThingName: !Sub '${CoreDeviceName}-${Environment}'
+      AttributePayload:
+        Attributes:
+          Project: !Ref ProjectName
+          Environment: !Ref Environment
+          DeviceType: GreengrassCore
+
+  # IoT Thing Group for Device Management
+  GreengrassThingGroup:
+    Type: AWS::IoT::ThingGroup
+    Properties:
+      ThingGroupName: !Sub '${ThingGroupName}-${Environment}'
+      ThingGroupProperties:
+        ThingGroupDescription: !Sub 'Thing group for ${ProjectName} Greengrass devices in ${Environment}'
+        AttributePayload:
+          Attributes:
+            Project: !Ref ProjectName
+            Environment: !Ref Environment
+            Purpose: edge-computing
+
+  # IoT Policy for Greengrass Core
+  GreengrassIoTPolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-greengrass-policy-${Environment}'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - iot:Publish
+              - iot:Subscribe
+              - iot:Receive
+              - iot:Connect
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - greengrass:*
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - iot:GetThingShadow
+              - iot:UpdateThingShadow
+              - iot:DeleteThingShadow
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:thing/${CoreDeviceName}-${Environment}'
+
+  # X.509 Certificate for Device Authentication
+  DeviceCertificate:
+    Type: AWS::IoT::Certificate
+    Properties:
+      Status: ACTIVE
+      CertificateSigningRequest: !Sub |
+        -----BEGIN CERTIFICATE REQUEST-----
+        MIICvDCCAaQCAQAwdzELMAkGA1UEBhMCVVMxCzAJBgNVBAgMAlZBMRIwEAYDVQQH
+        DAlBcmxpbmd0b24xGTAXBgNVBAoMEEV4YW1wbGUgQ29tcGFueTEMMAoGA1UECwwD
+        SW9UMR4wHAYDVQQDDBVHcmVlbmdyYXNzQ29yZURldmljZTCCASIwDQYJKoZIhvcN
+        AQEBBQADggEPADCCAQoCggEBAMQ4IOUtYC0ZPsF5kUUEEPOqPYqJ9JgqPJ2HhgL3
+        -----END CERTIFICATE REQUEST-----
+
+  # Attach Policy to Certificate
+  PolicyCertificateAttachment:
+    Type: AWS::IoT::PolicyPrincipalAttachment
+    Properties:
+      PolicyName: !Ref GreengrassIoTPolicy
+      Principal: !GetAtt DeviceCertificate.Arn
+
+  # Attach Thing to Certificate
+  ThingCertificateAttachment:
+    Type: AWS::IoT::ThingPrincipalAttachment
+    Properties:
+      ThingName: !Ref GreengrassCoreThing
+      Principal: !GetAtt DeviceCertificate.Arn
+
+  # ============================================================================
+  # Lambda Function for Edge Processing
+  # ============================================================================
+
+  # Edge Processing Lambda Function
+  EdgeProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-edge-processor-${Environment}'
+      Runtime: !Ref LambdaRuntime
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import time
+          import os
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Process sensor data at the edge
+              Performs real-time data processing without cloud roundtrips
+              """
+              logger.info(f"Processing edge data: {json.dumps(event)}")
+              
+              try:
+                  # Extract sensor data from event
+                  device_id = event.get("device_id", "unknown")
+                  temperature = event.get("temperature", 0)
+                  humidity = event.get("humidity", 0)
+                  timestamp = event.get("timestamp", int(time.time()))
+                  
+                  # Perform edge processing logic
+                  processed_data = {
+                      "timestamp": timestamp,
+                      "device_id": device_id,
+                      "temperature": temperature,
+                      "humidity": humidity,
+                      "status": "processed_at_edge",
+                      "processing_time": 0.1,
+                      "environment": os.environ.get("ENVIRONMENT", "unknown"),
+                      "alerts": []
+                  }
+                  
+                  # Add alerts based on thresholds
+                  if temperature > 35:
+                      processed_data["alerts"].append("HIGH_TEMPERATURE")
+                  if temperature < 5:
+                      processed_data["alerts"].append("LOW_TEMPERATURE")
+                  if humidity > 80:
+                      processed_data["alerts"].append("HIGH_HUMIDITY")
+                  if humidity < 20:
+                      processed_data["alerts"].append("LOW_HUMIDITY")
+                  
+                  logger.info(f"Processed data: {json.dumps(processed_data)}")
+                  
+                  return {
+                      "statusCode": 200,
+                      "body": json.dumps(processed_data),
+                      "headers": {
+                          "Content-Type": "application/json"
+                      }
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing edge data: {str(e)}")
+                  return {
+                      "statusCode": 500,
+                      "body": json.dumps({
+                          "error": "Internal processing error",
+                          "message": str(e)
+                      })
+                  }
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          STREAM_MAX_SIZE: !Ref StreamMaxSize
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: Lambda
+
+  # Lambda Function Version for Greengrass
+  EdgeProcessorFunctionVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref EdgeProcessorFunction
+      Description: !Sub 'Version for Greengrass deployment in ${Environment}'
+
+  # Lambda Function Alias for Greengrass
+  EdgeProcessorFunctionAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref EdgeProcessorFunction
+      FunctionVersion: !GetAtt EdgeProcessorFunctionVersion.Version
+      Name: !Sub '${Environment}'
+      Description: !Sub 'Alias for ${Environment} environment'
+
+  # ============================================================================
+  # CloudWatch Resources for Monitoring
+  # ============================================================================
+
+  # CloudWatch Log Group for Edge Processing
+  EdgeProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-edge-processor-${Environment}'
+      RetentionInDays: !If [IsProdEnvironment, 30, 7]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: CloudWatch
+
+  # CloudWatch Log Group for Greengrass Core
+  GreengrassLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/greengrass/${ProjectName}-core-${Environment}'
+      RetentionInDays: !If [IsProdEnvironment, 30, 7]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: Greengrass
+
+  # CloudWatch Alarm for Lambda Errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProdEnvironment
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors-${Environment}'
+      AlarmDescription: 'Monitor Lambda function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EdgeProcessorFunction
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for Lambda Duration
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProdEnvironment
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-duration-${Environment}'
+      AlarmDescription: 'Monitor Lambda function duration'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 25000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EdgeProcessorFunction
+      TreatMissingData: notBreaching
+
+  # ============================================================================
+  # S3 Bucket for Greengrass Artifacts (Optional)
+  # ============================================================================
+
+  # S3 Bucket for storing deployment artifacts
+  GreengrassArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-greengrass-artifacts-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: S3
+
+  # S3 Bucket Policy for Greengrass Access
+  GreengrassArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref GreengrassArtifactsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowGreengrassAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt GreengrassCoreRole.Arn
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+            Resource: !Sub '${GreengrassArtifactsBucket}/*'
+
+  # ============================================================================
+  # Systems Manager Parameters for Configuration
+  # ============================================================================
+
+  # Store Thing Name in Parameter Store
+  ThingNameParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${Environment}/iot/thing-name'
+      Type: String
+      Value: !Ref GreengrassCoreThing
+      Description: 'IoT Thing name for Greengrass Core'
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # Store Thing Group Name in Parameter Store
+  ThingGroupParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${Environment}/iot/thing-group-name'
+      Type: String
+      Value: !Ref GreengrassThingGroup
+      Description: 'IoT Thing Group name for Greengrass devices'
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # Store Certificate ARN in Parameter Store
+  CertificateArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${Environment}/iot/certificate-arn'
+      Type: String
+      Value: !GetAtt DeviceCertificate.Arn
+      Description: 'IoT Certificate ARN for Greengrass Core'
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # Store IoT Core Endpoint in Parameter Store
+  IoTEndpointParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${Environment}/iot/endpoint'
+      Type: String
+      Value: !Sub '${AWS::AccountId}.iot.${AWS::Region}.amazonaws.com'
+      Description: 'IoT Core endpoint for Greengrass Core'
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+# Template Outputs
+Outputs:
+  # IoT Resources
+  ThingName:
+    Description: 'Name of the IoT Thing for Greengrass Core'
+    Value: !Ref GreengrassCoreThing
+    Export:
+      Name: !Sub '${AWS::StackName}-ThingName'
+
+  ThingGroupName:
+    Description: 'Name of the IoT Thing Group'
+    Value: !Ref GreengrassThingGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ThingGroupName'
+
+  IoTPolicyName:
+    Description: 'Name of the IoT Policy'
+    Value: !Ref GreengrassIoTPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTPolicyName'
+
+  CertificateArn:
+    Description: 'ARN of the X.509 certificate for device authentication'
+    Value: !GetAtt DeviceCertificate.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CertificateArn'
+
+  CertificateId:
+    Description: 'ID of the X.509 certificate'
+    Value: !Ref DeviceCertificate
+    Export:
+      Name: !Sub '${AWS::StackName}-CertificateId'
+
+  # Lambda Resources
+  EdgeProcessorFunctionName:
+    Description: 'Name of the Edge Processor Lambda function'
+    Value: !Ref EdgeProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-EdgeProcessorFunction'
+
+  EdgeProcessorFunctionArn:
+    Description: 'ARN of the Edge Processor Lambda function'
+    Value: !GetAtt EdgeProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EdgeProcessorFunctionArn'
+
+  EdgeProcessorFunctionAliasArn:
+    Description: 'ARN of the Edge Processor Lambda function alias'
+    Value: !Ref EdgeProcessorFunctionAlias
+    Export:
+      Name: !Sub '${AWS::StackName}-EdgeProcessorFunctionAliasArn'
+
+  # IAM Resources
+  GreengrassCoreRoleArn:
+    Description: 'ARN of the Greengrass Core IAM Role'
+    Value: !GetAtt GreengrassCoreRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GreengrassCoreRoleArn'
+
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda Execution IAM Role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  # Storage Resources
+  ArtifactsBucketName:
+    Description: 'Name of the S3 bucket for Greengrass artifacts'
+    Value: !Ref GreengrassArtifactsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ArtifactsBucket'
+
+  ArtifactsBucketArn:
+    Description: 'ARN of the S3 bucket for Greengrass artifacts'
+    Value: !GetAtt GreengrassArtifactsBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ArtifactsBucketArn'
+
+  # Monitoring Resources
+  EdgeProcessorLogGroupName:
+    Description: 'Name of the CloudWatch Log Group for Edge Processor'
+    Value: !Ref EdgeProcessorLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-EdgeProcessorLogGroup'
+
+  GreengrassLogGroupName:
+    Description: 'Name of the CloudWatch Log Group for Greengrass Core'
+    Value: !Ref GreengrassLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-GreengrassLogGroup'
+
+  # IoT Endpoints
+  IoTDataEndpoint:
+    Description: 'IoT Core data endpoint for device communication'
+    Value: !Sub '${AWS::AccountId}.iot.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTDataEndpoint'
+
+  IoTCredentialsEndpoint:
+    Description: 'IoT Core credentials endpoint for device authentication'
+    Value: !Sub '${AWS::AccountId}.credentials.iot.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTCredentialsEndpoint'
+
+  # Configuration Information
+  StreamConfiguration:
+    Description: 'Stream Manager configuration summary'
+    Value: !Sub 'MaxSize=${StreamMaxSize}, TTL=${StreamTTLHours}h, BatchSize=${ExportBatchSize}'
+    Export:
+      Name: !Sub '${AWS::StackName}-StreamConfiguration'
+
+  DeploymentInstructions:
+    Description: 'Next steps for Greengrass Core setup'
+    Value: !Sub |
+      1. Download certificates from IoT Console using Certificate ID: ${DeviceCertificate}
+      2. Install Greengrass Core software on your edge device
+      3. Configure with Thing Name: ${GreengrassCoreThing}
+      4. Use IAM Role ARN: ${GreengrassCoreRole.Arn}
+      5. Deploy Lambda function: ${EdgeProcessorFunction}

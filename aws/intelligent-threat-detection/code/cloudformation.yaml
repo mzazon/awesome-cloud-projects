@@ -1,0 +1,488 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Infrastructure as Code for GuardDuty Threat Detection Recipe.
+  Deploys Amazon GuardDuty with automated threat detection, SNS notifications,
+  CloudWatch monitoring, and S3 findings export for comprehensive security monitoring.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+          - SNSTopicName
+      - Label:
+          default: "GuardDuty Configuration"
+        Parameters:
+          - FindingPublishingFrequency
+          - EnableS3Export
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - CreateDashboard
+      - Label:
+          default: "Tagging"
+        Parameters:
+          - Environment
+          - Project
+    ParameterLabels:
+      NotificationEmail:
+        default: "Email Address for Security Alerts"
+      SNSTopicName:
+        default: "SNS Topic Name"
+      FindingPublishingFrequency:
+        default: "Finding Publishing Frequency"
+      EnableS3Export:
+        default: "Enable S3 Findings Export"
+      CreateDashboard:
+        default: "Create CloudWatch Dashboard"
+      Environment:
+        default: "Environment"
+      Project:
+        default: "Project Name"
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive GuardDuty security alerts
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address
+
+  SNSTopicName:
+    Type: String
+    Description: Name for the SNS topic that will receive GuardDuty alerts
+    Default: guardduty-security-alerts
+    MinLength: 1
+    MaxLength: 256
+    AllowedPattern: ^[a-zA-Z0-9_-]+$
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, and underscores
+
+  FindingPublishingFrequency:
+    Type: String
+    Description: How often GuardDuty publishes findings to CloudWatch Events
+    Default: FIFTEEN_MINUTES
+    AllowedValues:
+      - FIFTEEN_MINUTES
+      - ONE_HOUR
+      - SIX_HOURS
+    ConstraintDescription: Must be FIFTEEN_MINUTES, ONE_HOUR, or SIX_HOURS
+
+  EnableS3Export:
+    Type: String
+    Description: Create S3 bucket and enable GuardDuty findings export
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  CreateDashboard:
+    Type: String
+    Description: Create CloudWatch dashboard for security monitoring
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  Environment:
+    Type: String
+    Description: Environment name (e.g., dev, staging, prod)
+    Default: prod
+    AllowedPattern: ^[a-z0-9-]+$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+
+  Project:
+    Type: String
+    Description: Project or application name for resource tagging
+    Default: security-monitoring
+    AllowedPattern: ^[a-z0-9-]+$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+
+Conditions:
+  EnableS3ExportCondition: !Equals [!Ref EnableS3Export, 'true']
+  CreateDashboardCondition: !Equals [!Ref CreateDashboard, 'true']
+
+Resources:
+  # Amazon GuardDuty Detector
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector
+    Properties:
+      Enable: true
+      FindingPublishingFrequency: !Ref FindingPublishingFrequency
+      DataSources:
+        S3Logs:
+          Enable: true
+        KubernetesConfiguration:
+          AuditLogs:
+            Enable: true
+        MalwareProtection:
+          ScanEc2InstanceWithFindings:
+            EbsVolumes: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Project}-guardduty-detector'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # SNS Topic for GuardDuty Alerts
+  GuardDutyAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Ref SNSTopicName
+      DisplayName: GuardDuty Security Alerts
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${Project}-guardduty-alerts'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # SNS Topic Policy to Allow EventBridge
+  GuardDutyAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref GuardDutyAlertsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgeToPublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref GuardDutyAlertsTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # Email Subscription to SNS Topic
+  GuardDutyEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref GuardDutyAlertsTopic
+      Endpoint: !Ref NotificationEmail
+
+  # EventBridge Rule for GuardDuty Findings
+  GuardDutyFindingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${Project}-guardduty-findings'
+      Description: Route GuardDuty findings to SNS for alerting
+      EventPattern:
+        source:
+          - aws.guardduty
+        detail-type:
+          - GuardDuty Finding
+      State: ENABLED
+      Targets:
+        - Arn: !Ref GuardDutyAlertsTopic
+          Id: GuardDutyAlertsTarget
+          InputTransformer:
+            InputPathsMap:
+              severity: $.detail.severity
+              type: $.detail.type
+              region: $.detail.region
+              accountId: $.detail.accountId
+              description: $.detail.description
+              title: $.detail.title
+            InputTemplate: |
+              {
+                "GuardDuty Alert": {
+                  "Severity": "<severity>",
+                  "Finding Type": "<type>",
+                  "Region": "<region>",
+                  "Account": "<accountId>",
+                  "Title": "<title>",
+                  "Description": "<description>",
+                  "Console URL": "https://console.aws.amazon.com/guardduty/home?region=<region>#/findings"
+                }
+              }
+
+  # S3 Bucket for GuardDuty Findings Export (Conditional)
+  GuardDutyFindingsBucket:
+    Type: AWS::S3::Bucket
+    Condition: EnableS3ExportCondition
+    Properties:
+      BucketName: !Sub '${Project}-guardduty-findings-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldFindings
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${Project}-guardduty-findings'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # S3 Bucket Policy for GuardDuty
+  GuardDutyFindingsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: EnableS3ExportCondition
+    Properties:
+      Bucket: !Ref GuardDutyFindingsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowGuardDutyToWriteFindings
+            Effect: Allow
+            Principal:
+              Service: guardduty.amazonaws.com
+            Action:
+              - s3:PutObject
+              - s3:GetBucketLocation
+            Resource:
+              - !Sub '${GuardDutyFindingsBucket}/*'
+              - !Ref GuardDutyFindingsBucket
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # GuardDuty Publishing Destination for S3 Export
+  GuardDutyS3PublishingDestination:
+    Type: AWS::GuardDuty::PublishingDestination
+    Condition: EnableS3ExportCondition
+    Properties:
+      DetectorId: !Ref GuardDutyDetector
+      DestinationType: S3
+      DestinationProperties:
+        DestinationArn: !GetAtt GuardDutyFindingsBucket.Arn
+        KmsKeyArn: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3'
+
+  # CloudWatch Dashboard for Security Monitoring
+  GuardDutySecurityDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateDashboardCondition
+    Properties:
+      DashboardName: !Sub '${Project}-GuardDuty-Security-Monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/GuardDuty", "FindingCount", { "stat": "Sum" } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "GuardDuty Findings Count",
+                "period": 300,
+                "annotations": {
+                  "horizontal": [
+                    {
+                      "label": "High Alert Threshold",
+                      "value": 10,
+                      "fill": "above"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/SNS", "NumberOfMessagesPublished", "TopicName", "${SNSTopicName}", { "stat": "Sum" } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Security Alert Notifications Sent",
+                "period": 300
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/events/rule/${Project}-guardduty-findings'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent GuardDuty Events",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Log Group for EventBridge Rule
+  GuardDutyEventBridgeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/events/rule/${Project}-guardduty-findings'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${Project}-guardduty-events'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Custom Resource to Generate Sample Findings (Optional for Testing)
+  GenerateSampleFindingsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Project}-generate-sample-findings'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt GenerateSampleFindingsRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+          
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Create':
+                      guardduty = boto3.client('guardduty')
+                      detector_id = event['ResourceProperties']['DetectorId']
+                      
+                      # Generate sample findings for testing
+                      response = guardduty.create_sample_findings(
+                          DetectorId=detector_id,
+                          FindingTypes=[
+                              'Recon:EC2/PortProbeUnprotectedPort',
+                              'Trojan:EC2/BlackholeTraffic',
+                              'Backdoor:EC2/XORDDOS'
+                          ]
+                      )
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                     {'Message': 'Sample findings generated successfully'})
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, 
+                                 {'Error': str(e)})
+      Tags:
+        - Key: Name
+          Value: !Sub '${Project}-generate-sample-findings'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # IAM Role for Sample Findings Lambda
+  GenerateSampleFindingsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Project}-generate-sample-findings-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GuardDutySampleFindingsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - guardduty:CreateSampleFindings
+                  - guardduty:GetDetector
+                Resource: !Sub 'arn:aws:guardduty:${AWS::Region}:${AWS::AccountId}:detector/${GuardDutyDetector}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${Project}-generate-sample-findings-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Outputs:
+  GuardDutyDetectorId:
+    Description: The unique ID of the GuardDuty detector
+    Value: !Ref GuardDutyDetector
+    Export:
+      Name: !Sub '${AWS::StackName}-GuardDutyDetectorId'
+
+  SNSTopicArn:
+    Description: ARN of the SNS topic for GuardDuty alerts
+    Value: !Ref GuardDutyAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  EventBridgeRuleArn:
+    Description: ARN of the EventBridge rule for GuardDuty findings
+    Value: !GetAtt GuardDutyFindingRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeRuleArn'
+
+  S3BucketName:
+    Condition: EnableS3ExportCondition
+    Description: Name of the S3 bucket for GuardDuty findings export
+    Value: !Ref GuardDutyFindingsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketName'
+
+  CloudWatchDashboardURL:
+    Condition: CreateDashboardCondition
+    Description: URL to access the CloudWatch security monitoring dashboard
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${Project}-GuardDuty-Security-Monitoring'
+
+  GuardDutyConsoleURL:
+    Description: URL to access the GuardDuty console
+    Value: !Sub 'https://console.aws.amazon.com/guardduty/home?region=${AWS::Region}#/findings'
+
+  SecurityAlertEmail:
+    Description: Email address configured to receive security alerts
+    Value: !Ref NotificationEmail
+
+  DeploymentInstructions:
+    Description: Next steps after deployment
+    Value: 'Check your email to confirm the SNS subscription, then access the GuardDuty console to monitor findings. Use the CloudWatch dashboard for metrics overview.'

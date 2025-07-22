@@ -1,0 +1,214 @@
+<!--
+  Multi-Tenant Isolation Policy for Azure API Management
+  This policy enforces tenant identification, validation, and secure routing
+  to ensure complete isolation between customer tenants
+-->
+<policies>
+    <inbound>
+        <base />
+        
+        <!-- Extract tenant ID from request header for tenant identification -->
+        <choose>
+            <when condition="@(context.Request.Headers.ContainsKey("X-Tenant-ID"))">
+                <set-variable name="tenantId" value="@(context.Request.Headers["X-Tenant-ID"].First())" />
+            </when>
+            <otherwise>
+                <!-- Return error if tenant identification is missing -->
+                <return-response>
+                    <set-status code="400" reason="Bad Request" />
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-body>@{
+                        return new JObject(
+                            new JProperty("error", "missing_tenant_id"),
+                            new JProperty("message", "X-Tenant-ID header is required for tenant isolation"),
+                            new JProperty("required_tenants", ${tenant_list})
+                        ).ToString();
+                    }</set-body>
+                </return-response>
+            </otherwise>
+        </choose>
+        
+        <!-- Validate tenant ID against configured tenant list -->
+        <choose>
+            <when condition="@(${tenant_list}.Contains(context.Variables["tenantId"].ToString()))">
+                
+                <!-- Retrieve tenant-specific API key from Key Vault for secure authentication -->
+                <send-request mode="new" response-variable-name="keyVaultResponse" timeout="20" ignore-error="false">
+                    <set-url>@($"https://${key_vault_name}.vault.azure.net/secrets/{context.Variables["tenantId"]}-api-key?api-version=7.4")</set-url>
+                    <set-method>GET</set-method>
+                    <authentication-managed-identity resource="https://vault.azure.net" />
+                </send-request>
+                
+                <!-- Validate Key Vault response and extract secret value -->
+                <choose>
+                    <when condition="@(((IResponse)context.Variables["keyVaultResponse"]).StatusCode == 200)">
+                        <set-variable name="tenantApiKey" value="@{
+                            var response = (IResponse)context.Variables["keyVaultResponse"];
+                            var json = JObject.Parse(response.Body.As<string>());
+                            return json["value"].ToString();
+                        }" />
+                        
+                        <!-- Log successful tenant authentication for audit -->
+                        <trace source="tenant-isolation-policy" severity="information">
+                            <message>@($"Tenant {context.Variables["tenantId"]} successfully authenticated")</message>
+                            <metadata name="tenant-id" value="@(context.Variables["tenantId"].ToString())" />
+                            <metadata name="client-ip" value="@(context.Request.IpAddress)" />
+                            <metadata name="request-id" value="@(context.RequestId)" />
+                        </trace>
+                    </when>
+                    <otherwise>
+                        <!-- Handle Key Vault access failure -->
+                        <return-response>
+                            <set-status code="500" reason="Internal Server Error" />
+                            <set-header name="Content-Type" exists-action="override">
+                                <value>application/json</value>
+                            </set-header>
+                            <set-body>@{
+                                return new JObject(
+                                    new JProperty("error", "tenant_authentication_failed"),
+                                    new JProperty("message", "Unable to authenticate tenant credentials"),
+                                    new JProperty("tenant_id", context.Variables["tenantId"].ToString())
+                                ).ToString();
+                            }</set-body>
+                        </return-response>
+                    </otherwise>
+                </choose>
+                
+                <!-- Set tenant-specific backend URL for isolated routing -->
+                <set-backend-service base-url="@($"https://api-{context.Variables["tenantId"]}.internal.com")" />
+                
+                <!-- Add tenant isolation headers for downstream services -->
+                <set-header name="X-Isolated-Tenant" exists-action="override">
+                    <value>@(context.Variables["tenantId"].ToString())</value>
+                </set-header>
+                
+                <set-header name="X-Tenant-API-Key" exists-action="override">
+                    <value>@(context.Variables["tenantApiKey"].ToString())</value>
+                </set-header>
+                
+                <!-- Add security headers for tenant context -->
+                <set-header name="X-Request-Isolation-Level" exists-action="override">
+                    <value>tenant-isolated</value>
+                </set-header>
+                
+                <set-header name="X-Request-ID" exists-action="override">
+                    <value>@(context.RequestId)</value>
+                </set-header>
+                
+            </when>
+            <otherwise>
+                <!-- Log and reject invalid tenant access attempts -->
+                <trace source="tenant-isolation-policy" severity="error">
+                    <message>@($"Invalid tenant access attempt: {context.Variables["tenantId"]}")</message>
+                    <metadata name="invalid-tenant-id" value="@(context.Variables["tenantId"].ToString())" />
+                    <metadata name="client-ip" value="@(context.Request.IpAddress)" />
+                    <metadata name="request-id" value="@(context.RequestId)" />
+                    <metadata name="user-agent" value="@(context.Request.Headers.GetValueOrDefault("User-Agent", "unknown"))" />
+                </trace>
+                
+                <return-response>
+                    <set-status code="403" reason="Forbidden" />
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-body>@{
+                        return new JObject(
+                            new JProperty("error", "invalid_tenant"),
+                            new JProperty("message", "The specified tenant identifier is not valid"),
+                            new JProperty("provided_tenant", context.Variables["tenantId"].ToString()),
+                            new JProperty("valid_tenants", ${tenant_list})
+                        ).ToString();
+                    }</set-body>
+                </return-response>
+            </otherwise>
+        </choose>
+        
+        <!-- Rate limiting per tenant to prevent abuse -->
+        <rate-limit-by-key calls="100" renewal-period="60" counter-key="@($"tenant:{context.Variables["tenantId"]}")" />
+        
+        <!-- Quota enforcement per tenant -->
+        <quota-by-key calls="1000" renewal-period="3600" counter-key="@($"tenant:{context.Variables["tenantId"]}")" />
+        
+    </inbound>
+    
+    <backend>
+        <base />
+        
+        <!-- Add timeout and retry policies for backend calls -->
+        <retry condition="@(context.Response.StatusCode >= 500)" count="3" interval="2" />
+        
+    </backend>
+    
+    <outbound>
+        <base />
+        
+        <!-- Remove sensitive tenant information from response headers -->
+        <set-header name="X-Tenant-ID" exists-action="delete" />
+        <set-header name="X-Tenant-API-Key" exists-action="delete" />
+        
+        <!-- Add response headers for tenant context (safe information only) -->
+        <set-header name="X-Tenant-Isolated" exists-action="override">
+            <value>true</value>
+        </set-header>
+        
+        <set-header name="X-Response-Timestamp" exists-action="override">
+            <value>@(DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"))</value>
+        </set-header>
+        
+        <!-- Log successful request completion -->
+        <trace source="tenant-isolation-policy" severity="information">
+            <message>@($"Request completed for tenant {context.Variables["tenantId"]}")</message>
+            <metadata name="tenant-id" value="@(context.Variables["tenantId"].ToString())" />
+            <metadata name="response-code" value="@(context.Response.StatusCode.ToString())" />
+            <metadata name="request-id" value="@(context.RequestId)" />
+            <metadata name="response-time-ms" value="@((DateTime.UtcNow - context.Timestamp).TotalMilliseconds.ToString())" />
+        </trace>
+        
+    </outbound>
+    
+    <on-error>
+        <base />
+        
+        <!-- Enhanced error handling with tenant context -->
+        <set-header name="X-Error-Source" exists-action="override">
+            <value>Tenant-Isolation-Policy</value>
+        </set-header>
+        
+        <set-header name="X-Error-Tenant" exists-action="override">
+            <value>@(context.Variables.ContainsKey("tenantId") ? context.Variables["tenantId"].ToString() : "unknown")</value>
+        </set-header>
+        
+        <set-header name="X-Error-Request-ID" exists-action="override">
+            <value>@(context.RequestId)</value>
+        </set-header>
+        
+        <!-- Log detailed error information for debugging -->
+        <trace source="tenant-isolation-policy" severity="error">
+            <message>@($"Policy error for tenant {(context.Variables.ContainsKey("tenantId") ? context.Variables["tenantId"].ToString() : "unknown")}: {context.LastError.Message}")</message>
+            <metadata name="tenant-id" value="@(context.Variables.ContainsKey("tenantId") ? context.Variables["tenantId"].ToString() : "unknown")" />
+            <metadata name="error-message" value="@(context.LastError.Message)" />
+            <metadata name="error-source" value="@(context.LastError.Source)" />
+            <metadata name="request-id" value="@(context.RequestId)" />
+            <metadata name="client-ip" value="@(context.Request.IpAddress)" />
+        </trace>
+        
+        <!-- Return structured error response -->
+        <return-response>
+            <set-status code="500" reason="Internal Server Error" />
+            <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+            </set-header>
+            <set-body>@{
+                return new JObject(
+                    new JProperty("error", "policy_execution_failed"),
+                    new JProperty("message", "An error occurred while processing the tenant isolation policy"),
+                    new JProperty("request_id", context.RequestId),
+                    new JProperty("timestamp", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"))
+                ).ToString();
+            }</set-body>
+        </return-response>
+        
+    </on-error>
+</policies>

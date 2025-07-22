@@ -1,0 +1,995 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  End-to-End MLOps Infrastructure with Amazon SageMaker Pipelines
+  This template creates a complete MLOps environment including S3 bucket for data storage,
+  CodeCommit repository for version control, IAM execution role for SageMaker,
+  and SageMaker Pipeline for automated ML workflows.
+
+# ================================
+# METADATA SECTION
+# ================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "SageMaker Configuration"
+        Parameters:
+          - SageMakerInstanceType
+          - PipelineName
+      - Label:
+          default: "Data Configuration"
+        Parameters:
+          - DataBucketPrefix
+          - EnableVersioning
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - KMSKeyId
+          - CreateKMSKey
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      SageMakerInstanceType:
+        default: "SageMaker Instance Type"
+      PipelineName:
+        default: "Pipeline Name"
+      DataBucketPrefix:
+        default: "Data Bucket Prefix"
+      EnableVersioning:
+        default: "Enable S3 Versioning"
+      KMSKeyId:
+        default: "KMS Key ID"
+      CreateKMSKey:
+        default: "Create New KMS Key"
+
+# ================================
+# PARAMETERS SECTION
+# ================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: mlops-sagemaker
+    Description: Name for the MLOps project (used in resource naming)
+    AllowedPattern: ^[a-z0-9-]+$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    MinLength: 3
+    MaxLength: 32
+
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment name (dev, staging, prod)
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  SageMakerInstanceType:
+    Type: String
+    Default: ml.m5.large
+    Description: Instance type for SageMaker training and processing jobs
+    AllowedValues:
+      - ml.t3.medium
+      - ml.t3.large
+      - ml.m5.large
+      - ml.m5.xlarge
+      - ml.m5.2xlarge
+      - ml.c5.large
+      - ml.c5.xlarge
+      - ml.c5.2xlarge
+
+  PipelineName:
+    Type: String
+    Default: mlops-pipeline
+    Description: Name for the SageMaker Pipeline
+    AllowedPattern: ^[a-zA-Z0-9\-]+$
+    ConstraintDescription: Must contain only alphanumeric characters and hyphens
+    MinLength: 1
+    MaxLength: 256
+
+  DataBucketPrefix:
+    Type: String
+    Default: sagemaker-mlops-data
+    Description: Prefix for the S3 bucket name (will be made unique with random suffix)
+    AllowedPattern: ^[a-z0-9-]+$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    MinLength: 3
+    MaxLength: 32
+
+  EnableVersioning:
+    Type: String
+    Default: Enabled
+    Description: Enable S3 bucket versioning for data lineage
+    AllowedValues:
+      - Enabled
+      - Suspended
+
+  CreateKMSKey:
+    Type: String
+    Default: true
+    Description: Create a new KMS key for encryption
+    AllowedValues:
+      - true
+      - false
+
+  KMSKeyId:
+    Type: String
+    Default: ""
+    Description: Existing KMS Key ID (leave empty if creating new key)
+
+# ================================
+# CONDITIONS SECTION
+# ================================
+Conditions:
+  CreateNewKMSKey: !Equals [!Ref CreateKMSKey, "true"]
+  UseExistingKMSKey: !And
+    - !Equals [!Ref CreateKMSKey, "false"]
+    - !Not [!Equals [!Ref KMSKeyId, ""]]
+  UseDefaultEncryption: !And
+    - !Equals [!Ref CreateKMSKey, "false"]
+    - !Equals [!Ref KMSKeyId, ""]
+
+# ================================
+# RESOURCES SECTION
+# ================================
+Resources:
+  
+  # ================================
+  # KMS KEY FOR ENCRYPTION
+  # ================================
+  MLOpsKMSKey:
+    Type: AWS::KMS::Key
+    Condition: CreateNewKMSKey
+    Properties:
+      Description: !Sub "KMS key for ${ProjectName} MLOps encryption"
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: Allow SageMaker Service
+            Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:Encrypt
+              - kms:GenerateDataKey
+              - kms:ReEncrypt*
+            Resource: "*"
+          - Sid: Allow S3 Service
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:Encrypt
+              - kms:GenerateDataKey
+              - kms:ReEncrypt*
+            Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-kms-key"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  MLOpsKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: CreateNewKMSKey
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}-${Environment}-mlops"
+      TargetKeyId: !Ref MLOpsKMSKey
+
+  # ================================
+  # S3 BUCKET FOR DATA STORAGE
+  # ================================
+  MLOpsDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${DataBucketPrefix}-${Environment}-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: !Ref EnableVersioning
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If
+                - CreateNewKMSKey
+                - aws:kms
+                - !If
+                  - UseExistingKMSKey
+                  - aws:kms
+                  - AES256
+              KMSMasterKeyID: !If
+                - CreateNewKMSKey
+                - !Ref MLOpsKMSKey
+                - !If
+                  - UseExistingKMSKey
+                  - !Ref KMSKeyId
+                  - !Ref AWS::NoValue
+            BucketKeyEnabled: !If
+              - UseDefaultEncryption
+              - !Ref AWS::NoValue
+              - true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DataLifecycleRule
+            Status: Enabled
+            Prefix: data/
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+          - Id: ModelArtifactsLifecycleRule
+            Status: Enabled
+            Prefix: model-artifacts/
+            Transitions:
+              - TransitionInDays: 60
+                StorageClass: STANDARD_IA
+          - Id: LogsLifecycleRule
+            Status: Enabled
+            Prefix: logs/
+            ExpirationInDays: 90
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref MLOpsCloudWatchLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-data-bucket"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
+  # S3 BUCKET POLICY
+  # ================================
+  MLOpsDataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MLOpsDataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "${MLOpsDataBucket}/*"
+              - !Ref MLOpsDataBucket
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+          - Sid: AllowSageMakerAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt SageMakerExecutionRole.Arn
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:ListBucket
+            Resource:
+              - !Sub "${MLOpsDataBucket}/*"
+              - !Ref MLOpsDataBucket
+
+  # ================================
+  # CODECOMMIT REPOSITORY
+  # ================================
+  MLOpsCodeRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Sub "${ProjectName}-${Environment}-mlops"
+      RepositoryDescription: !Sub "MLOps code repository for ${ProjectName} project"
+      Code:
+        S3:
+          Bucket: !Ref MLOpsDataBucket
+          Key: initial-code/
+        BranchName: main
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-codecommit"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
+  # CLOUDWATCH LOG GROUP
+  # ================================
+  MLOpsCloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/sagemaker/${ProjectName}-${Environment}"
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-logs"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
+  # IAM EXECUTION ROLE FOR SAGEMAKER
+  # ================================
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-SageMakerExecutionRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      Policies:
+        - PolicyName: MLOpsS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:ListAllMyBuckets
+                Resource:
+                  - !Sub "${MLOpsDataBucket}/*"
+                  - !Ref MLOpsDataBucket
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::sagemaker-*"
+        - PolicyName: MLOpsCloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/sagemaker/*"
+        - PolicyName: MLOpsECRAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: "*"
+        - PolicyName: MLOpsKMSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                  - kms:ReEncrypt*
+                Resource: !If
+                  - CreateNewKMSKey
+                  - !GetAtt MLOpsKMSKey.Arn
+                  - !If
+                    - UseExistingKMSKey
+                    - !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/${KMSKeyId}"
+                    - "*"
+        - PolicyName: MLOpsPipelineAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sagemaker:CreatePipeline
+                  - sagemaker:UpdatePipeline
+                  - sagemaker:DeletePipeline
+                  - sagemaker:DescribePipeline
+                  - sagemaker:ListPipelines
+                  - sagemaker:StartPipelineExecution
+                  - sagemaker:StopPipelineExecution
+                  - sagemaker:DescribePipelineExecution
+                  - sagemaker:ListPipelineExecutions
+                  - sagemaker:ListPipelineExecutionSteps
+                Resource: !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:pipeline/*"
+        - PolicyName: MLOpsCodeCommitAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codecommit:GetRepository
+                  - codecommit:ListRepositories
+                  - codecommit:GitPull
+                  - codecommit:GitPush
+                  - codecommit:ListBranches
+                  - codecommit:ListTagsForResource
+                Resource: !GetAtt MLOpsCodeRepository.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-sagemaker-role"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
+  # SAGEMAKER MODEL PACKAGE GROUP
+  # ================================
+  MLOpsModelPackageGroup:
+    Type: AWS::SageMaker::ModelPackageGroup
+    Properties:
+      ModelPackageGroupName: !Sub "${ProjectName}-${Environment}-model-group"
+      ModelPackageGroupDescription: !Sub "Model package group for ${ProjectName} MLOps pipeline"
+      ModelPackageGroupPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSageMakerAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt SageMakerExecutionRole.Arn
+            Action:
+              - sagemaker:DescribeModelPackage
+              - sagemaker:DescribeModelPackageGroup
+              - sagemaker:ListModelPackages
+            Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-model-group"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
+  # SAGEMAKER DOMAIN (FOR STUDIO)
+  # ================================
+  MLOpsSageMakerDomain:
+    Type: AWS::SageMaker::Domain
+    Properties:
+      DomainName: !Sub "${ProjectName}-${Environment}-domain"
+      AuthMode: IAM
+      DefaultUserSettings:
+        ExecutionRole: !GetAtt SageMakerExecutionRole.Arn
+        SecurityGroups:
+          - !Ref MLOpsSageMakerSecurityGroup
+        SharingSettings:
+          NotebookOutputOption: Allowed
+          S3OutputPath: !Sub "s3://${MLOpsDataBucket}/studio-notebooks/"
+      VpcId: !Ref MLOpsVPC
+      SubnetIds:
+        - !Ref MLOpsPrivateSubnet1
+        - !Ref MLOpsPrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-sagemaker-domain"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
+  # VPC INFRASTRUCTURE
+  # ================================
+  MLOpsVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-vpc"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  MLOpsInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-igw"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  MLOpsInternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref MLOpsInternetGateway
+      VpcId: !Ref MLOpsVPC
+
+  # Public Subnets
+  MLOpsPublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MLOpsVPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-public-subnet-1"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  MLOpsPublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MLOpsVPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-public-subnet-2"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Private Subnets
+  MLOpsPrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MLOpsVPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.11.0/24
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-private-subnet-1"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  MLOpsPrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MLOpsVPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.0.12.0/24
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-private-subnet-2"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # NAT Gateways
+  MLOpsNatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: MLOpsInternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-nat-eip-1"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  MLOpsNatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: MLOpsInternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-nat-eip-2"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  MLOpsNatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt MLOpsNatGateway1EIP.AllocationId
+      SubnetId: !Ref MLOpsPublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-nat-1"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  MLOpsNatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt MLOpsNatGateway2EIP.AllocationId
+      SubnetId: !Ref MLOpsPublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-nat-2"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Route Tables
+  MLOpsPublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MLOpsVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-public-routes"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  MLOpsDefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: MLOpsInternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref MLOpsPublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref MLOpsInternetGateway
+
+  MLOpsPublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref MLOpsPublicRouteTable
+      SubnetId: !Ref MLOpsPublicSubnet1
+
+  MLOpsPublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref MLOpsPublicRouteTable
+      SubnetId: !Ref MLOpsPublicSubnet2
+
+  MLOpsPrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MLOpsVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-private-routes-1"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  MLOpsDefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref MLOpsPrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref MLOpsNatGateway1
+
+  MLOpsPrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref MLOpsPrivateRouteTable1
+      SubnetId: !Ref MLOpsPrivateSubnet1
+
+  MLOpsPrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MLOpsVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-private-routes-2"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  MLOpsDefaultPrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref MLOpsPrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref MLOpsNatGateway2
+
+  MLOpsPrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref MLOpsPrivateRouteTable2
+      SubnetId: !Ref MLOpsPrivateSubnet2
+
+  # ================================
+  # SECURITY GROUP
+  # ================================
+  MLOpsSageMakerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-${Environment}-sagemaker-sg"
+      GroupDescription: Security group for SageMaker resources
+      VpcId: !Ref MLOpsVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref MLOpsSageMakerSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref MLOpsSageMakerSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-sagemaker-sg"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
+  # VPC ENDPOINTS
+  # ================================
+  MLOpsSageMakerAPIVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref MLOpsVPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.sagemaker.api"
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref MLOpsPrivateSubnet1
+        - !Ref MLOpsPrivateSubnet2
+      SecurityGroupIds:
+        - !Ref MLOpsSageMakerSecurityGroup
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - sagemaker:*
+            Resource: "*"
+
+  MLOpsSageMakerRuntimeVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref MLOpsVPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.sagemaker.runtime"
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref MLOpsPrivateSubnet1
+        - !Ref MLOpsPrivateSubnet2
+      SecurityGroupIds:
+        - !Ref MLOpsSageMakerSecurityGroup
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - sagemaker:InvokeEndpoint
+            Resource: "*"
+
+  MLOpsS3VPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref MLOpsVPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref MLOpsPrivateRouteTable1
+        - !Ref MLOpsPrivateRouteTable2
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:ListBucket
+            Resource:
+              - !Sub "${MLOpsDataBucket}/*"
+              - !Ref MLOpsDataBucket
+              - "arn:aws:s3:::sagemaker-*"
+
+# ================================
+# OUTPUTS SECTION
+# ================================
+Outputs:
+  # Project Information
+  ProjectName:
+    Description: Name of the MLOps project
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub "${AWS::StackName}-ProjectName"
+
+  Environment:
+    Description: Environment name
+    Value: !Ref Environment
+    Export:
+      Name: !Sub "${AWS::StackName}-Environment"
+
+  # S3 Resources
+  DataBucketName:
+    Description: Name of the S3 bucket for ML data storage
+    Value: !Ref MLOpsDataBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-DataBucket"
+
+  DataBucketArn:
+    Description: ARN of the S3 bucket for ML data storage
+    Value: !GetAtt MLOpsDataBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-DataBucketArn"
+
+  # CodeCommit Resources
+  CodeRepositoryName:
+    Description: Name of the CodeCommit repository
+    Value: !Ref MLOpsCodeRepository
+    Export:
+      Name: !Sub "${AWS::StackName}-CodeRepository"
+
+  CodeRepositoryArn:
+    Description: ARN of the CodeCommit repository
+    Value: !GetAtt MLOpsCodeRepository.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CodeRepositoryArn"
+
+  CodeRepositoryCloneUrlHttp:
+    Description: HTTP clone URL for the CodeCommit repository
+    Value: !GetAtt MLOpsCodeRepository.CloneUrlHttp
+    Export:
+      Name: !Sub "${AWS::StackName}-CodeRepositoryCloneUrlHttp"
+
+  CodeRepositoryCloneUrlSsh:
+    Description: SSH clone URL for the CodeCommit repository
+    Value: !GetAtt MLOpsCodeRepository.CloneUrlSsh
+    Export:
+      Name: !Sub "${AWS::StackName}-CodeRepositoryCloneUrlSsh"
+
+  # IAM Resources
+  SageMakerExecutionRoleArn:
+    Description: ARN of the SageMaker execution role
+    Value: !GetAtt SageMakerExecutionRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-SageMakerExecutionRole"
+
+  # SageMaker Resources
+  SageMakerDomainId:
+    Description: ID of the SageMaker domain
+    Value: !Ref MLOpsSageMakerDomain
+    Export:
+      Name: !Sub "${AWS::StackName}-SageMakerDomain"
+
+  ModelPackageGroupName:
+    Description: Name of the SageMaker model package group
+    Value: !Ref MLOpsModelPackageGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-ModelPackageGroup"
+
+  ModelPackageGroupArn:
+    Description: ARN of the SageMaker model package group
+    Value: !GetAtt MLOpsModelPackageGroup.ModelPackageGroupArn
+    Export:
+      Name: !Sub "${AWS::StackName}-ModelPackageGroupArn"
+
+  # KMS Resources
+  KMSKeyId:
+    Condition: CreateNewKMSKey
+    Description: ID of the KMS key for encryption
+    Value: !Ref MLOpsKMSKey
+    Export:
+      Name: !Sub "${AWS::StackName}-KMSKey"
+
+  KMSKeyArn:
+    Condition: CreateNewKMSKey
+    Description: ARN of the KMS key for encryption
+    Value: !GetAtt MLOpsKMSKey.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-KMSKeyArn"
+
+  # CloudWatch Resources
+  CloudWatchLogGroupName:
+    Description: Name of the CloudWatch log group
+    Value: !Ref MLOpsCloudWatchLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudWatchLogGroup"
+
+  CloudWatchLogGroupArn:
+    Description: ARN of the CloudWatch log group
+    Value: !GetAtt MLOpsCloudWatchLogGroup.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudWatchLogGroupArn"
+
+  # VPC Resources
+  VPCId:
+    Description: ID of the VPC
+    Value: !Ref MLOpsVPC
+    Export:
+      Name: !Sub "${AWS::StackName}-VPC"
+
+  PrivateSubnet1Id:
+    Description: ID of private subnet 1
+    Value: !Ref MLOpsPrivateSubnet1
+    Export:
+      Name: !Sub "${AWS::StackName}-PrivateSubnet1"
+
+  PrivateSubnet2Id:
+    Description: ID of private subnet 2
+    Value: !Ref MLOpsPrivateSubnet2
+    Export:
+      Name: !Sub "${AWS::StackName}-PrivateSubnet2"
+
+  SecurityGroupId:
+    Description: ID of the SageMaker security group
+    Value: !Ref MLOpsSageMakerSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-SecurityGroup"
+
+  # Configuration Values
+  SageMakerInstanceType:
+    Description: Instance type used for SageMaker jobs
+    Value: !Ref SageMakerInstanceType
+    Export:
+      Name: !Sub "${AWS::StackName}-InstanceType"
+
+  PipelineName:
+    Description: Name of the SageMaker pipeline
+    Value: !Ref PipelineName
+    Export:
+      Name: !Sub "${AWS::StackName}-PipelineName"
+
+  # Next Steps
+  NextSteps:
+    Description: Commands to deploy the SageMaker pipeline
+    Value: !Sub |
+      1. Set environment variables:
+         export ROLE_ARN="${SageMakerExecutionRole.Arn}"
+         export BUCKET_NAME="${MLOpsDataBucket}"
+         export PIPELINE_NAME="${PipelineName}"
+      
+      2. Upload training data to: s3://${MLOpsDataBucket}/data/
+      
+      3. Clone repository:
+         git clone ${MLOpsCodeRepository.CloneUrlHttp}
+      
+      4. Create and execute SageMaker pipeline using the provided role and bucket

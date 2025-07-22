@@ -1,0 +1,556 @@
+# Infrastructure Manager Configuration for Domain and Certificate Lifecycle Management
+# This configuration deploys automated certificate and domain management using
+# Cloud DNS, Certificate Manager, Cloud Functions, and Cloud Scheduler
+
+metadata:
+  name: domain-certificate-lifecycle
+  description: "Automated certificate and domain management infrastructure with Cloud DNS and Certificate Manager"
+  labels:
+    category: security
+    solution: certificate-lifecycle
+    automation: enabled
+
+# Input parameters for customization
+parameters:
+  # Project configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    validation:
+      pattern: "^[a-z0-9-]+$"
+      minLength: 6
+      maxLength: 30
+
+  # Regional configuration
+  region:
+    type: string
+    description: "Google Cloud region for resources"
+    default: "us-central1"
+    allowedValues:
+      - "us-central1"
+      - "us-east1"
+      - "us-west1"
+      - "europe-west1"
+      - "asia-east1"
+
+  # Domain and certificate configuration
+  domain_name:
+    type: string
+    description: "Primary domain name for certificate management"
+    validation:
+      pattern: "^[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
+
+  dns_zone_name:
+    type: string
+    description: "Cloud DNS zone name"
+    default: "automation-zone"
+    validation:
+      pattern: "^[a-z0-9-]+$"
+
+  certificate_name:
+    type: string
+    description: "Certificate Manager certificate name"
+    default: "ssl-certificate"
+    validation:
+      pattern: "^[a-z0-9-]+$"
+
+  # Function configuration
+  function_memory:
+    type: string
+    description: "Memory allocation for Cloud Functions"
+    default: "256MB"
+    allowedValues:
+      - "128MB"
+      - "256MB"
+      - "512MB"
+      - "1024MB"
+
+  function_timeout:
+    type: string
+    description: "Timeout for Cloud Functions"
+    default: "60s"
+
+  # Scheduler configuration
+  monitoring_schedule:
+    type: string
+    description: "Cron schedule for certificate monitoring"
+    default: "0 */6 * * *"
+
+  audit_schedule:
+    type: string
+    description: "Cron schedule for daily certificate audit"
+    default: "0 2 * * *"
+
+# Resource definitions
+resources:
+  # Enable required APIs for the project
+  - name: enable-dns-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ .project_id }}/services/dns.googleapis.com
+      
+  - name: enable-certificatemanager-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ .project_id }}/services/certificatemanager.googleapis.com
+      
+  - name: enable-cloudfunctions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ .project_id }}/services/cloudfunctions.googleapis.com
+      
+  - name: enable-cloudscheduler-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ .project_id }}/services/cloudscheduler.googleapis.com
+      
+  - name: enable-secretmanager-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ .project_id }}/services/secretmanager.googleapis.com
+      
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ .project_id }}/services/monitoring.googleapis.com
+
+  # Service Account for Certificate Automation
+  - name: cert-automation-sa
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: cert-automation
+      displayName: "Certificate Automation Service Account"
+      description: "Service account for DNS and certificate automation functions"
+      project: {{ .project_id }}
+    depends_on:
+      - enable-dns-api
+      - enable-certificatemanager-api
+
+  # IAM Bindings for Service Account
+  - name: cert-automation-dns-admin
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: {{ .project_id }}
+      policy:
+        bindings:
+          - role: roles/dns.admin
+            members:
+              - serviceAccount:cert-automation@{{ .project_id }}.iam.gserviceaccount.com
+    depends_on:
+      - cert-automation-sa
+
+  - name: cert-automation-cert-editor
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: {{ .project_id }}
+      policy:
+        bindings:
+          - role: roles/certificatemanager.editor
+            members:
+              - serviceAccount:cert-automation@{{ .project_id }}.iam.gserviceaccount.com
+    depends_on:
+      - cert-automation-sa
+
+  - name: cert-automation-monitoring-writer
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: {{ .project_id }}
+      policy:
+        bindings:
+          - role: roles/monitoring.metricWriter
+            members:
+              - serviceAccount:cert-automation@{{ .project_id }}.iam.gserviceaccount.com
+    depends_on:
+      - cert-automation-sa
+
+  # Cloud DNS Managed Zone
+  - name: dns-zone
+    type: gcp-types/dns-v1:managedZones
+    properties:
+      name: {{ .dns_zone_name }}
+      dnsName: {{ .domain_name }}.
+      description: "Automated DNS zone for certificate management"
+      visibility: public
+      project: {{ .project_id }}
+    depends_on:
+      - enable-dns-api
+
+  # Certificate Manager Certificate
+  - name: ssl-certificate
+    type: gcp-types/certificatemanager-v1:projects.locations.certificates
+    properties:
+      name: {{ .certificate_name }}
+      parent: projects/{{ .project_id }}/locations/global
+      managed:
+        domains:
+          - {{ .domain_name }}
+        dnsAuthorizations: []
+        issuanceConfig: ""
+      labels:
+        environment: production
+        managed-by: infrastructure-manager
+    depends_on:
+      - enable-certificatemanager-api
+      - dns-zone
+
+  # Certificate Map for Load Balancer Integration
+  - name: certificate-map
+    type: gcp-types/certificatemanager-v1:projects.locations.certificateMaps
+    properties:
+      name: cert-map
+      parent: projects/{{ .project_id }}/locations/global
+      description: "Certificate map for load balancer integration"
+      labels:
+        environment: production
+        managed-by: infrastructure-manager
+    depends_on:
+      - ssl-certificate
+
+  # Certificate Map Entry
+  - name: certificate-map-entry
+    type: gcp-types/certificatemanager-v1:projects.locations.certificateMaps.certificateMapEntries
+    properties:
+      name: {{ .domain_name | replace "." "-" }}
+      parent: projects/{{ .project_id }}/locations/global/certificateMaps/cert-map
+      hostname: {{ .domain_name }}
+      certificates:
+        - projects/{{ .project_id }}/locations/global/certificates/{{ .certificate_name }}
+    depends_on:
+      - certificate-map
+
+  # Cloud Storage Bucket for Function Source Code
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: {{ .project_id }}-cert-automation-source
+      project: {{ .project_id }}
+      location: {{ .region }}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              isLive: false
+      labels:
+        purpose: function-source
+        managed-by: infrastructure-manager
+
+  # Cloud Storage Object for Function Source
+  - name: function-source-object
+    type: gcp-types/storage-v1:objects
+    properties:
+      name: cert-automation-source.zip
+      bucket: {{ .project_id }}-cert-automation-source
+      # Base64 encoded ZIP file containing the Python function source
+      # In a real deployment, this would be uploaded separately
+      contentType: application/zip
+    depends_on:
+      - function-source-bucket
+
+  # Certificate Monitoring Cloud Function
+  - name: cert-monitoring-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      name: cert-monitoring
+      parent: projects/{{ .project_id }}/locations/{{ .region }}
+      description: "Certificate health monitoring and lifecycle management"
+      sourceArchiveUrl: gs://{{ .project_id }}-cert-automation-source/cert-automation-source.zip
+      entryPoint: check_certificates
+      runtime: python311
+      availableMemoryMb: {{ .function_memory | replace "MB" "" }}
+      timeout: {{ .function_timeout }}
+      serviceAccountEmail: cert-automation@{{ .project_id }}.iam.gserviceaccount.com
+      environmentVariables:
+        GCP_PROJECT: {{ .project_id }}
+        DNS_ZONE_NAME: {{ .dns_zone_name }}
+        CERTIFICATE_NAME: {{ .certificate_name }}
+      httpsTrigger:
+        securityLevel: SECURE_ALWAYS
+      labels:
+        function-type: monitoring
+        managed-by: infrastructure-manager
+    depends_on:
+      - enable-cloudfunctions-api
+      - cert-automation-sa
+      - function-source-object
+
+  # DNS Update Cloud Function
+  - name: dns-update-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      name: dns-update
+      parent: projects/{{ .project_id }}/locations/{{ .region }}
+      description: "DNS record management and automation"
+      sourceArchiveUrl: gs://{{ .project_id }}-cert-automation-source/cert-automation-source.zip
+      entryPoint: update_dns_record
+      runtime: python311
+      availableMemoryMb: {{ .function_memory | replace "MB" "" }}
+      timeout: {{ .function_timeout }}
+      serviceAccountEmail: cert-automation@{{ .project_id }}.iam.gserviceaccount.com
+      environmentVariables:
+        GCP_PROJECT: {{ .project_id }}
+        DNS_ZONE_NAME: {{ .dns_zone_name }}
+      httpsTrigger:
+        securityLevel: SECURE_ALWAYS
+      labels:
+        function-type: dns-management
+        managed-by: infrastructure-manager
+    depends_on:
+      - enable-cloudfunctions-api
+      - cert-automation-sa
+      - function-source-object
+
+  # Cloud Scheduler Job for Certificate Monitoring
+  - name: cert-monitoring-scheduler
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      name: cert-monitoring-job
+      parent: projects/{{ .project_id }}/locations/{{ .region }}
+      description: "Automated certificate health monitoring every 6 hours"
+      schedule: {{ .monitoring_schedule }}
+      timeZone: UTC
+      httpTarget:
+        uri: https://{{ .region }}-{{ .project_id }}.cloudfunctions.net/cert-monitoring
+        httpMethod: GET
+        oidcToken:
+          serviceAccountEmail: cert-automation@{{ .project_id }}.iam.gserviceaccount.com
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 300s
+        minBackoffDuration: 5s
+        maxBackoffDuration: 60s
+        maxDoublings: 5
+    depends_on:
+      - enable-cloudscheduler-api
+      - cert-monitoring-function
+
+  # Cloud Scheduler Job for Daily Certificate Audit
+  - name: cert-audit-scheduler
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      name: cert-audit-job
+      parent: projects/{{ .project_id }}/locations/{{ .region }}
+      description: "Daily comprehensive certificate audit at 2:00 AM UTC"
+      schedule: {{ .audit_schedule }}
+      timeZone: UTC
+      httpTarget:
+        uri: https://{{ .region }}-{{ .project_id }}.cloudfunctions.net/cert-monitoring
+        httpMethod: GET
+        oidcToken:
+          serviceAccountEmail: cert-automation@{{ .project_id }}.iam.gserviceaccount.com
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 300s
+        minBackoffDuration: 5s
+        maxBackoffDuration: 60s
+        maxDoublings: 5
+    depends_on:
+      - enable-cloudscheduler-api
+      - cert-monitoring-function
+
+  # Load Balancer Components for Production Traffic
+  # Backend Service (placeholder - would connect to actual applications)
+  - name: demo-backend-service
+    type: gcp-types/compute-v1:backendServices
+    properties:
+      name: demo-backend
+      description: "Demo backend service for certificate integration"
+      protocol: HTTP
+      portName: http
+      timeoutSec: 30
+      healthChecks:
+        - projects/{{ .project_id }}/global/healthChecks/demo-health-check
+      project: {{ .project_id }}
+    depends_on:
+      - demo-health-check
+
+  # Health Check for Backend Service
+  - name: demo-health-check
+    type: gcp-types/compute-v1:healthChecks
+    properties:
+      name: demo-health-check
+      description: "Health check for demo backend service"
+      checkIntervalSec: 10
+      timeoutSec: 5
+      healthyThreshold: 2
+      unhealthyThreshold: 3
+      httpHealthCheck:
+        port: 80
+        requestPath: /health
+      project: {{ .project_id }}
+
+  # URL Map for Load Balancer
+  - name: demo-url-map
+    type: gcp-types/compute-v1:urlMaps
+    properties:
+      name: demo-url-map
+      description: "URL map for demo application with certificate integration"
+      defaultService: projects/{{ .project_id }}/global/backendServices/demo-backend
+      project: {{ .project_id }}
+    depends_on:
+      - demo-backend-service
+
+  # HTTPS Proxy with Certificate Map Integration
+  - name: demo-https-proxy
+    type: gcp-types/compute-v1:targetHttpsProxies
+    properties:
+      name: demo-https-proxy
+      description: "HTTPS proxy with automated certificate management"
+      urlMap: projects/{{ .project_id }}/global/urlMaps/demo-url-map
+      certificateMap: projects/{{ .project_id }}/locations/global/certificateMaps/cert-map
+      project: {{ .project_id }}
+    depends_on:
+      - demo-url-map
+      - certificate-map
+
+  # Global Forwarding Rule for HTTPS Traffic
+  - name: demo-https-forwarding-rule
+    type: gcp-types/compute-v1:globalForwardingRules
+    properties:
+      name: demo-https-rule
+      description: "Global forwarding rule for HTTPS traffic"
+      target: projects/{{ .project_id }}/global/targetHttpsProxies/demo-https-proxy
+      portRange: "443"
+      IPProtocol: TCP
+      loadBalancingScheme: EXTERNAL_MANAGED
+      project: {{ .project_id }}
+    depends_on:
+      - demo-https-proxy
+
+  # Monitoring Dashboard for Certificate Health
+  - name: cert-monitoring-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      displayName: "Certificate Lifecycle Management Dashboard"
+      project: projects/{{ .project_id }}
+      gridLayout:
+        columns: 12
+        widgets:
+          - title: "Certificate Status"
+            xPos: 0
+            yPos: 0
+            width: 6
+            height: 4
+            scorecard:
+              timeSeriesQuery:
+                timeSeriesFilter:
+                  filter: 'metric.type="custom.googleapis.com/certificate_status"'
+                  aggregation:
+                    alignmentPeriod: 300s
+                    perSeriesAligner: ALIGN_MEAN
+                    crossSeriesReducer: REDUCE_MEAN
+              sparkChartView:
+                sparkChartType: SPARK_LINE
+          - title: "Function Execution Count"
+            xPos: 6
+            yPos: 0
+            width: 6
+            height: 4
+            xyChart:
+              dataSets:
+                - timeSeriesQuery:
+                    timeSeriesFilter:
+                      filter: 'resource.type="cloud_function" AND metric.type="cloudfunctions.googleapis.com/function/executions"'
+                      aggregation:
+                        alignmentPeriod: 300s
+                        perSeriesAligner: ALIGN_RATE
+                        crossSeriesReducer: REDUCE_SUM
+    depends_on:
+      - enable-monitoring-api
+
+  # Log Sink for Certificate Events
+  - name: cert-log-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      name: cert-automation-logs
+      description: "Log sink for certificate automation events"
+      destination: bigquery.googleapis.com/projects/{{ .project_id }}/datasets/cert_automation_logs
+      filter: |
+        resource.type="cloud_function" AND
+        (resource.labels.function_name="cert-monitoring" OR resource.labels.function_name="dns-update") AND
+        severity>=INFO
+      uniqueWriterIdentity: true
+      parent: projects/{{ .project_id }}
+
+  # BigQuery Dataset for Log Storage
+  - name: cert-logs-dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      datasetId: cert_automation_logs
+      projectId: {{ .project_id }}
+      description: "Dataset for certificate automation logs and analytics"
+      location: {{ .region }}
+      defaultTableExpirationMs: 2592000000  # 30 days
+      labels:
+        purpose: logging
+        managed-by: infrastructure-manager
+
+# Output values for reference
+outputs:
+  dns_zone_name:
+    description: "Name of the created DNS zone"
+    value: {{ .dns_zone_name }}
+
+  dns_nameservers:
+    description: "DNS nameservers for domain configuration"
+    value: $(ref.dns-zone.nameServers)
+
+  certificate_name:
+    description: "Name of the managed certificate"
+    value: {{ .certificate_name }}
+
+  certificate_status:
+    description: "Certificate provisioning status"
+    value: $(ref.ssl-certificate.managed.state)
+
+  load_balancer_ip:
+    description: "IP address of the load balancer"
+    value: $(ref.demo-https-forwarding-rule.IPAddress)
+
+  cert_monitoring_function_url:
+    description: "URL for certificate monitoring function"
+    value: https://{{ .region }}-{{ .project_id }}.cloudfunctions.net/cert-monitoring
+
+  dns_update_function_url:
+    description: "URL for DNS update function"
+    value: https://{{ .region }}-{{ .project_id }}.cloudfunctions.net/dns-update
+
+  service_account_email:
+    description: "Service account email for automation"
+    value: cert-automation@{{ .project_id }}.iam.gserviceaccount.com
+
+  monitoring_dashboard_url:
+    description: "URL for certificate monitoring dashboard"
+    value: https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.cert-monitoring-dashboard.name)?project={{ .project_id }}
+
+# Resource dependencies and deployment order
+# 1. API enablement
+# 2. Service account creation and IAM bindings
+# 3. DNS zone and certificate creation
+# 4. Function deployment and source storage
+# 5. Scheduler job configuration
+# 6. Load balancer setup with certificate integration
+# 7. Monitoring and logging configuration
+
+# Security considerations:
+# - Service account uses least privilege principles
+# - Functions use dedicated service account
+# - HTTPS enforced for all external traffic
+# - Certificate validation through DNS challenges
+# - Log retention and monitoring for audit purposes
+
+# Cost optimization:
+# - Functions scale to zero when not in use
+# - Scheduler jobs run only as needed
+# - Log retention policies prevent unlimited storage growth
+# - Regional deployment reduces data transfer costs
+
+# High availability:
+# - Global load balancer with automatic failover
+# - Certificate Manager handles renewal automatically
+# - Multiple monitoring schedules for redundancy
+# - Function retry policies for transient failures

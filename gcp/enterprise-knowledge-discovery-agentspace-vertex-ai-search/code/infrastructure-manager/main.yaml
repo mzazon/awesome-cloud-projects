@@ -1,0 +1,636 @@
+# Infrastructure Manager Configuration for Enterprise Knowledge Discovery with Agentspace and Vertex AI Search
+# This configuration deploys a complete enterprise knowledge discovery system using:
+# - Google Cloud Storage for document repository
+# - Vertex AI Search for semantic search capabilities  
+# - BigQuery for analytics and insights
+# - Google Agentspace for intelligent agent orchestration
+# - IAM for security and access control
+
+apiVersion: gke-deploy.v1alpha1
+kind: InfrastructureManagerConfig
+metadata:
+  name: enterprise-knowledge-discovery
+  description: "Enterprise knowledge discovery system with Agentspace and Vertex AI Search"
+
+# Input parameters for customization
+inputs:
+  # Project and location configuration
+  project_id:
+    type: string
+    description: "Google Cloud project ID for resource deployment"
+    required: true
+  
+  region:
+    type: string
+    description: "Google Cloud region for resource deployment"
+    default: "us-central1"
+    required: false
+  
+  zone:
+    type: string
+    description: "Google Cloud zone for zonal resources"
+    default: "us-central1-a"
+    required: false
+  
+  # Resource naming configuration
+  resource_prefix:
+    type: string
+    description: "Prefix for resource names to ensure uniqueness"
+    default: "enterprise-knowledge"
+    required: false
+  
+  # Storage configuration
+  storage_class:
+    type: string
+    description: "Cloud Storage bucket storage class"
+    default: "STANDARD"
+    allowed_values: ["STANDARD", "NEARLINE", "COLDLINE", "ARCHIVE"]
+    required: false
+  
+  enable_versioning:
+    type: boolean
+    description: "Enable versioning on Cloud Storage bucket"
+    default: true
+    required: false
+  
+  # Search configuration
+  search_tier:
+    type: string
+    description: "Vertex AI Search tier configuration"
+    default: "SEARCH_TIER_STANDARD"
+    allowed_values: ["SEARCH_TIER_STANDARD", "SEARCH_TIER_ENTERPRISE"]
+    required: false
+  
+  # Analytics configuration
+  dataset_location:
+    type: string
+    description: "BigQuery dataset location"
+    default: "US"
+    required: false
+  
+  # IAM configuration
+  create_service_account:
+    type: boolean
+    description: "Create dedicated service account for knowledge discovery"
+    default: true
+    required: false
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/discoveryengine.googleapis.com
+      action: ENABLE
+    metadata:
+      dependsOn: []
+  
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/storage.googleapis.com
+      action: ENABLE
+    metadata:
+      dependsOn: []
+  
+  - name: enable-bigquery-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/bigquery.googleapis.com
+      action: ENABLE
+    metadata:
+      dependsOn: []
+  
+  - name: enable-aiplatform-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/aiplatform.googleapis.com
+      action: ENABLE
+    metadata:
+      dependsOn: []
+  
+  - name: enable-agentspace-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/agentspace.googleapis.com
+      action: ENABLE
+    metadata:
+      dependsOn: []
+
+  # Cloud Storage bucket for enterprise documents
+  - name: document-repository-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(ref.resource_prefix.value)-docs-$(ref.deployment.value)
+      location: $(ref.region.value)
+      storageClass: $(ref.storage_class.value)
+      versioning:
+        enabled: $(ref.enable_versioning.value)
+      # Lifecycle management for cost optimization
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90
+          - action:
+              type: SetStorageClass
+              storageClass: ARCHIVE
+            condition:
+              age: 365
+      # Enable uniform bucket-level access for security
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      # Enable logging for audit trails
+      logging:
+        logBucket: $(ref.resource_prefix.value)-access-logs-$(ref.deployment.value)
+        logObjectPrefix: document-access/
+      # CORS configuration for web access
+      cors:
+        - origin: ["*"]
+          method: ["GET", "HEAD"]
+          responseHeader: ["Content-Type"]
+          maxAgeSeconds: 3600
+    metadata:
+      dependsOn: 
+        - enable-storage-api
+
+  # Access logs bucket for document repository
+  - name: access-logs-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(ref.resource_prefix.value)-access-logs-$(ref.deployment.value)
+      location: $(ref.region.value)
+      storageClass: NEARLINE
+      # Lifecycle management for log retention
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90
+    metadata:
+      dependsOn: 
+        - enable-storage-api
+
+  # BigQuery dataset for search analytics
+  - name: knowledge-analytics-dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      datasetId: $(ref.resource_prefix.value)_analytics_$(ref.deployment.value)
+      projectId: $(ref.project_id.value)
+      location: $(ref.dataset_location.value)
+      description: "Enterprise knowledge discovery analytics data"
+      # Data retention and access controls
+      defaultTableExpirationMs: 31536000000  # 1 year
+      access:
+        - role: OWNER
+          userByEmail: $(ref.service-account.email)
+        - role: READER
+          specialGroup: projectReaders
+      # Labels for resource management
+      labels:
+        environment: production
+        component: analytics
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn: 
+        - enable-bigquery-api
+
+  # Search queries table for analytics
+  - name: search-queries-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: $(ref.project_id.value)
+      datasetId: $(ref.knowledge-analytics-dataset.datasetId)
+      tableId: search_queries
+      description: "Search query analytics and performance metrics"
+      schema:
+        fields:
+          - name: query_id
+            type: STRING
+            mode: REQUIRED
+            description: "Unique identifier for the search query"
+          - name: user_id
+            type: STRING
+            mode: REQUIRED
+            description: "Identifier for the user performing the search"
+          - name: query_text
+            type: STRING
+            mode: REQUIRED
+            description: "The actual search query text"
+          - name: timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "When the search was performed"
+          - name: results_count
+            type: INTEGER
+            mode: NULLABLE
+            description: "Number of results returned"
+          - name: click_through_rate
+            type: FLOAT
+            mode: NULLABLE
+            description: "Click-through rate for the search results"
+          - name: search_latency_ms
+            type: INTEGER
+            mode: NULLABLE
+            description: "Search response latency in milliseconds"
+          - name: user_satisfaction_score
+            type: FLOAT
+            mode: NULLABLE
+            description: "User satisfaction score for search results"
+      # Partitioning for performance
+      timePartitioning:
+        type: DAY
+        field: timestamp
+      # Clustering for query optimization
+      clustering:
+        fields: ["user_id", "query_text"]
+    metadata:
+      dependsOn: 
+        - knowledge-analytics-dataset
+
+  # Document analytics table
+  - name: document-analytics-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: $(ref.project_id.value)
+      datasetId: $(ref.knowledge-analytics-dataset.datasetId)
+      tableId: document_analytics
+      description: "Document usage and performance analytics"
+      schema:
+        fields:
+          - name: document_id
+            type: STRING
+            mode: REQUIRED
+            description: "Unique identifier for the document"
+          - name: document_name
+            type: STRING
+            mode: REQUIRED
+            description: "Name of the document"
+          - name: document_path
+            type: STRING
+            mode: NULLABLE
+            description: "Storage path of the document"
+          - name: view_count
+            type: INTEGER
+            mode: NULLABLE
+            description: "Number of times document was viewed"
+          - name: last_accessed
+            type: TIMESTAMP
+            mode: NULLABLE
+            description: "Last time document was accessed"
+          - name: relevance_score
+            type: FLOAT
+            mode: NULLABLE
+            description: "Average relevance score across searches"
+          - name: content_type
+            type: STRING
+            mode: NULLABLE
+            description: "MIME type of the document"
+          - name: file_size_bytes
+            type: INTEGER
+            mode: NULLABLE
+            description: "Size of the document in bytes"
+      # Clustering for performance
+      clustering:
+        fields: ["document_name", "content_type"]
+    metadata:
+      dependsOn: 
+        - knowledge-analytics-dataset
+
+  # Vertex AI Search data store
+  - name: enterprise-search-datastore
+    type: gcp-types/discoveryengine-v1:projects.locations.dataStores
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/global
+      dataStoreId: $(ref.resource_prefix.value)-search-$(ref.deployment.value)
+      dataStore:
+        displayName: "Enterprise Knowledge Search Data Store"
+        industryVertical: GENERIC
+        solutionTypes: 
+          - SOLUTION_TYPE_SEARCH
+        contentConfig: CONTENT_REQUIRED
+        # Document processing configuration
+        documentProcessingConfig:
+          defaultParsingConfig:
+            digitalParsingConfig:
+              enabled: true
+          parsingConfigOverrides:
+            "application/pdf":
+              digitalParsingConfig:
+                enabled: true
+            "text/plain":
+              digitalParsingConfig:
+                enabled: true
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+              digitalParsingConfig:
+                enabled: true
+    metadata:
+      dependsOn: 
+        - enable-apis
+
+  # Vertex AI Search engine
+  - name: enterprise-search-engine
+    type: gcp-types/discoveryengine-v1:projects.locations.engines
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/global
+      engineId: $(ref.resource_prefix.value)-engine-$(ref.deployment.value)
+      engine:
+        displayName: "Enterprise Knowledge Search Engine"
+        industryVertical: GENERIC
+        solutionType: SOLUTION_TYPE_SEARCH
+        dataStoreIds: 
+          - $(ref.enterprise-search-datastore.name)
+        # Search engine configuration
+        searchEngineConfig:
+          searchTier: $(ref.search_tier.value)
+          searchAddOns: 
+            - SEARCH_ADD_ON_LLM
+          # Enhanced search features
+          features:
+            enableAutoLanguageDetection: true
+            enablePersonalization: true
+            enableSearchResultsOrdering: true
+            enableSynonyms: true
+            enableAutoComplete: true
+    metadata:
+      dependsOn: 
+        - enterprise-search-datastore
+
+  # Service account for knowledge discovery system
+  - name: service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: $(ref.resource_prefix.value)-sa-$(ref.deployment.value)
+      displayName: "Enterprise Knowledge Discovery Service Account"
+      description: "Service account for enterprise knowledge discovery system operations"
+      serviceAccount:
+        description: "Manages access to knowledge discovery resources including search, storage, and analytics"
+    metadata:
+      dependsOn: []
+      runtimePolicy:
+        CREATE: $(ref.create_service_account.value)
+
+  # Custom IAM role for knowledge discovery readers
+  - name: knowledge-reader-role
+    type: gcp-types/iam-v1:projects.roles
+    properties:
+      roleId: $(ref.resource_prefix.value)Reader$(ref.deployment.value)
+      title: "Enterprise Knowledge Discovery Reader"
+      description: "Provides read access to enterprise knowledge discovery resources"
+      stage: GA
+      includedPermissions:
+        # Discovery Engine permissions
+        - discoveryengine.engines.search
+        - discoveryengine.dataStores.get
+        - discoveryengine.documents.get
+        # Storage permissions
+        - storage.objects.get
+        - storage.objects.list
+        # BigQuery permissions  
+        - bigquery.tables.get
+        - bigquery.tables.getData
+        - bigquery.datasets.get
+        # AI Platform permissions
+        - aiplatform.endpoints.predict
+        - aiplatform.models.predict
+    metadata:
+      dependsOn: []
+
+  # Custom IAM role for knowledge discovery administrators
+  - name: knowledge-admin-role
+    type: gcp-types/iam-v1:projects.roles
+    properties:
+      roleId: $(ref.resource_prefix.value)Admin$(ref.deployment.value)
+      title: "Enterprise Knowledge Discovery Administrator"
+      description: "Provides administrative access to enterprise knowledge discovery resources"
+      stage: GA
+      includedPermissions:
+        # Discovery Engine permissions
+        - discoveryengine.*
+        # Storage permissions
+        - storage.objects.*
+        - storage.buckets.get
+        - storage.buckets.list
+        # BigQuery permissions
+        - bigquery.datasets.*
+        - bigquery.tables.*
+        - bigquery.jobs.create
+        # AI Platform permissions
+        - aiplatform.*
+        # Agentspace permissions
+        - agentspace.*
+        # IAM permissions for service account management
+        - iam.serviceAccounts.actAs
+    metadata:
+      dependsOn: []
+
+  # IAM binding for service account - Knowledge Reader role
+  - name: service-account-reader-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id.value)
+      role: projects/$(ref.project_id.value)/roles/$(ref.knowledge-reader-role.roleId)
+      member: serviceAccount:$(ref.service-account.email)
+    metadata:
+      dependsOn: 
+        - service-account
+        - knowledge-reader-role
+      runtimePolicy:
+        CREATE: $(ref.create_service_account.value)
+
+  # IAM binding for storage bucket access
+  - name: storage-bucket-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id.value)
+      role: roles/storage.objectViewer
+      member: serviceAccount:$(ref.service-account.email)
+    metadata:
+      dependsOn: 
+        - service-account
+        - document-repository-bucket
+      runtimePolicy:
+        CREATE: $(ref.create_service_account.value)
+
+  # Cloud Monitoring dashboard for knowledge discovery analytics
+  - name: monitoring-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      displayName: "Enterprise Knowledge Discovery Dashboard"
+      mosaicLayout:
+        tiles:
+          # Search query volume chart
+          - width: 6
+            height: 4
+            widget:
+              title: "Search Query Volume"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="gce_instance"'
+                        aggregation:
+                          alignmentPeriod: 300s
+                          perSeriesAligner: ALIGN_RATE
+                          crossSeriesReducer: REDUCE_SUM
+                    plotType: LINE
+                timeshiftDuration: 0s
+                yAxis:
+                  label: "Queries per second"
+                  scale: LINEAR
+          # Document access patterns chart  
+          - width: 6
+            height: 4
+            widget:
+              title: "Document Access Patterns"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="gcs_bucket"'
+                        aggregation:
+                          alignmentPeriod: 300s
+                          perSeriesAligner: ALIGN_RATE
+                          crossSeriesReducer: REDUCE_SUM
+                    plotType: STACKED_AREA
+                timeshiftDuration: 0s
+                yAxis:
+                  label: "Document views"
+                  scale: LINEAR
+          # Search latency chart
+          - width: 6
+            height: 4
+            widget:
+              title: "Search Latency Distribution"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'metric.type="discoveryengine.googleapis.com/search_latency"'
+                        aggregation:
+                          alignmentPeriod: 300s
+                          perSeriesAligner: ALIGN_DELTA
+                          crossSeriesReducer: REDUCE_PERCENTILE_95
+                    plotType: LINE
+                timeshiftDuration: 0s
+                yAxis:
+                  label: "Latency (ms)"
+                  scale: LINEAR
+          # User satisfaction scores
+          - width: 6
+            height: 4
+            widget:
+              title: "User Satisfaction Trends"
+              scorecard:
+                timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'metric.type="custom.googleapis.com/knowledge_discovery/satisfaction_score"'
+                    aggregation:
+                      alignmentPeriod: 3600s
+                      perSeriesAligner: ALIGN_MEAN
+                      crossSeriesReducer: REDUCE_MEAN
+                sparkChartView:
+                  sparkChartType: SPARK_LINE
+                thresholds:
+                  - value: 0.8
+                    color: GREEN
+                  - value: 0.6
+                    color: YELLOW
+                  - value: 0.4
+                    color: RED
+    metadata:
+      dependsOn: 
+        - enable-apis
+
+# Output values for integration and verification
+outputs:
+  # Project and location information
+  project_id:
+    description: "Google Cloud project ID where resources were deployed"
+    value: $(ref.project_id.value)
+  
+  region:
+    description: "Google Cloud region for deployed resources"
+    value: $(ref.region.value)
+  
+  # Storage outputs
+  document_bucket_name:
+    description: "Name of the Cloud Storage bucket for enterprise documents"
+    value: $(ref.document-repository-bucket.name)
+  
+  document_bucket_url:
+    description: "URL of the document repository bucket"
+    value: gs://$(ref.document-repository-bucket.name)
+  
+  # BigQuery outputs
+  analytics_dataset_id:
+    description: "BigQuery dataset ID for knowledge discovery analytics"
+    value: $(ref.knowledge-analytics-dataset.datasetId)
+  
+  search_queries_table:
+    description: "BigQuery table for search query analytics"
+    value: $(ref.project_id.value):$(ref.knowledge-analytics-dataset.datasetId).$(ref.search-queries-table.tableId)
+  
+  document_analytics_table:
+    description: "BigQuery table for document analytics"
+    value: $(ref.project_id.value):$(ref.knowledge-analytics-dataset.datasetId).$(ref.document-analytics-table.tableId)
+  
+  # Vertex AI Search outputs
+  search_datastore_id:
+    description: "Vertex AI Search data store ID"
+    value: $(ref.enterprise-search-datastore.dataStoreId)
+  
+  search_engine_id:
+    description: "Vertex AI Search engine ID"
+    value: $(ref.enterprise-search-engine.engineId)
+  
+  search_engine_url:
+    description: "Vertex AI Search engine resource URL"
+    value: projects/$(ref.project_id.value)/locations/global/engines/$(ref.enterprise-search-engine.engineId)
+  
+  # IAM outputs
+  service_account_email:
+    description: "Email address of the knowledge discovery service account"
+    value: $(ref.service-account.email)
+    condition: $(ref.create_service_account.value)
+  
+  knowledge_reader_role:
+    description: "Custom IAM role for knowledge discovery readers"
+    value: projects/$(ref.project_id.value)/roles/$(ref.knowledge-reader-role.roleId)
+  
+  knowledge_admin_role:
+    description: "Custom IAM role for knowledge discovery administrators" 
+    value: projects/$(ref.project_id.value)/roles/$(ref.knowledge-admin-role.roleId)
+  
+  # Monitoring outputs
+  dashboard_url:
+    description: "URL to access the Cloud Monitoring dashboard"
+    value: https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.monitoring-dashboard.name)?project=$(ref.project_id.value)
+
+# Deployment metadata and configuration
+metadata:
+  # Deployment labels for resource management
+  labels:
+    solution: enterprise-knowledge-discovery
+    component: infrastructure-manager
+    managed-by: infrastructure-manager
+    version: "1.0"
+  
+  # Dependencies and constraints
+  dependsOn: []
+  
+  # Runtime policies for conditional resource creation
+  runtimePolicy:
+    CREATE: true
+    UPDATE: true
+    DELETE: true

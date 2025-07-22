@@ -1,0 +1,520 @@
+# Infrastructure Manager Configuration for Database Migration Health and Performance Monitoring
+# This configuration deploys a comprehensive monitoring solution for database migrations using
+# Cloud Workload Manager, Cloud Functions, and Cloud Monitoring services.
+
+resources:
+  # Enable required APIs for the migration monitoring solution
+  - name: enable-workload-manager-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{env["project_id"]}}/services/workloadmanager.googleapis.com
+      
+  - name: enable-cloud-functions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{env["project_id"]}}/services/cloudfunctions.googleapis.com
+      
+  - name: enable-pubsub-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{env["project_id"]}}/services/pubsub.googleapis.com
+      
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{env["project_id"]}}/services/monitoring.googleapis.com
+      
+  - name: enable-logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{env["project_id"]}}/services/logging.googleapis.com
+      
+  - name: enable-datamigration-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{env["project_id"]}}/services/datamigration.googleapis.com
+      
+  - name: enable-sqladmin-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{env["project_id"]}}/services/sqladmin.googleapis.com
+      
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{env["project_id"]}}/services/storage.googleapis.com
+
+  # Cloud Storage bucket for function code and monitoring artifacts
+  - name: migration-monitoring-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: {{env["project_id"]}}-migration-monitoring-{{env["random_suffix"]}}
+      location: {{env["region"]}}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      labels:
+        purpose: migration-monitoring
+        environment: production
+        managed-by: infrastructure-manager
+    depends_on:
+      - enable-storage-api
+
+  # Pub/Sub topics for event-driven monitoring communication
+  - name: migration-events-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/{{env["project_id"]}}/topics/migration-events
+      labels:
+        purpose: migration-monitoring
+        component: event-streaming
+    depends_on:
+      - enable-pubsub-api
+
+  - name: validation-results-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/{{env["project_id"]}}/topics/validation-results
+      labels:
+        purpose: migration-validation
+        component: event-streaming
+    depends_on:
+      - enable-pubsub-api
+
+  - name: alert-notifications-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/{{env["project_id"]}}/topics/alert-notifications
+      labels:
+        purpose: alert-management
+        component: event-streaming
+    depends_on:
+      - enable-pubsub-api
+
+  # Pub/Sub subscriptions for Cloud Functions triggers
+  - name: migration-monitor-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/{{env["project_id"]}}/subscriptions/migration-monitor-sub
+      topic: $(ref.migration-events-topic.name)
+      ackDeadlineSeconds: 60
+      messageRetentionDuration: 604800s  # 7 days
+      labels:
+        purpose: migration-monitoring
+        component: event-processing
+    depends_on:
+      - migration-events-topic
+
+  - name: validation-processor-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/{{env["project_id"]}}/subscriptions/validation-processor-sub
+      topic: $(ref.validation-results-topic.name)
+      ackDeadlineSeconds: 300
+      messageRetentionDuration: 604800s  # 7 days
+      labels:
+        purpose: data-validation
+        component: event-processing
+    depends_on:
+      - validation-results-topic
+
+  - name: alert-manager-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/{{env["project_id"]}}/subscriptions/alert-manager-sub
+      topic: $(ref.alert-notifications-topic.name)
+      ackDeadlineSeconds: 60
+      messageRetentionDuration: 604800s  # 7 days
+      labels:
+        purpose: alert-management
+        component: event-processing
+    depends_on:
+      - alert-notifications-topic
+
+  # Cloud SQL instance for migration target database
+  - name: migration-target-database
+    type: gcp-types/sqladmin-v1beta4:instances
+    properties:
+      name: migration-target-{{env["random_suffix"]}}
+      region: {{env["region"]}}
+      databaseVersion: MYSQL_8_0
+      settings:
+        tier: db-g1-small
+        dataDiskSizeGb: 20
+        dataDiskType: PD_SSD
+        backupConfiguration:
+          enabled: true
+          startTime: "03:00"
+          binaryLogEnabled: true
+        ipConfiguration:
+          ipv4Enabled: true
+          authorizedNetworks: []
+        storageAutoResize: true
+        storageAutoResizeLimit: 100
+        labels:
+          purpose: migration-target
+          environment: monitoring
+          managed-by: infrastructure-manager
+    depends_on:
+      - enable-sqladmin-api
+
+  # Database user for migration target
+  - name: migration-database-user
+    type: gcp-types/sqladmin-v1beta4:users
+    properties:
+      name: migration-user
+      instance: $(ref.migration-target-database.name)
+      password: SecurePassword123!
+      host: "%"
+    depends_on:
+      - migration-target-database
+
+  # Sample database for migration target
+  - name: migration-sample-database
+    type: gcp-types/sqladmin-v1beta4:databases
+    properties:
+      name: sample_db
+      instance: $(ref.migration-target-database.name)
+      charset: utf8mb4
+      collation: utf8mb4_unicode_ci
+    depends_on:
+      - migration-target-database
+
+  # Service account for Cloud Functions with appropriate permissions
+  - name: migration-functions-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: migration-functions-sa-{{env["random_suffix"]}}
+      displayName: Migration Functions Service Account
+      description: Service account for migration monitoring Cloud Functions
+
+  # IAM policy bindings for the service account
+  - name: migration-functions-sa-monitoring-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: {{env["project_id"]}}
+      policy:
+        bindings:
+          - role: roles/monitoring.metricWriter
+            members:
+              - serviceAccount:$(ref.migration-functions-service-account.email)
+          - role: roles/logging.logWriter
+            members:
+              - serviceAccount:$(ref.migration-functions-service-account.email)
+          - role: roles/pubsub.publisher
+            members:
+              - serviceAccount:$(ref.migration-functions-service-account.email)
+          - role: roles/pubsub.subscriber
+            members:
+              - serviceAccount:$(ref.migration-functions-service-account.email)
+          - role: roles/cloudsql.client
+            members:
+              - serviceAccount:$(ref.migration-functions-service-account.email)
+          - role: roles/datamigration.viewer
+            members:
+              - serviceAccount:$(ref.migration-functions-service-account.email)
+          - role: roles/storage.objectViewer
+            members:
+              - serviceAccount:$(ref.migration-functions-service-account.email)
+    depends_on:
+      - migration-functions-service-account
+
+  # Cloud Functions for migration monitoring
+  - name: migration-monitor-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      name: projects/{{env["project_id"]}}/locations/{{env["region"]}}/functions/migration-monitor
+      sourceArchiveUrl: gs://$(ref.migration-monitoring-bucket.name)/migration-monitor.zip
+      entryPoint: monitor_migration
+      runtime: python311
+      timeout: 60s
+      availableMemoryMb: 256
+      serviceAccountEmail: $(ref.migration-functions-service-account.email)
+      httpsTrigger: {}
+      environmentVariables:
+        PROJECT_ID: {{env["project_id"]}}
+        REGION: {{env["region"]}}
+      labels:
+        purpose: migration-monitoring
+        component: serverless-function
+        managed-by: infrastructure-manager
+    depends_on:
+      - enable-cloud-functions-api
+      - migration-monitoring-bucket
+      - migration-functions-service-account
+      - migration-functions-sa-monitoring-binding
+
+  # Cloud Function for data validation
+  - name: data-validator-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      name: projects/{{env["project_id"]}}/locations/{{env["region"]}}/functions/data-validator
+      sourceArchiveUrl: gs://$(ref.migration-monitoring-bucket.name)/data-validator.zip
+      entryPoint: validate_migration_data
+      runtime: python311
+      timeout: 300s
+      availableMemoryMb: 512
+      serviceAccountEmail: $(ref.migration-functions-service-account.email)
+      eventTrigger:
+        eventType: google.pubsub.topic.publish
+        resource: $(ref.validation-results-topic.name)
+        failurePolicy:
+          retry: {}
+      environmentVariables:
+        PROJECT_ID: {{env["project_id"]}}
+        REGION: {{env["region"]}}
+      labels:
+        purpose: data-validation
+        component: serverless-function
+        managed-by: infrastructure-manager
+    depends_on:
+      - enable-cloud-functions-api
+      - migration-monitoring-bucket
+      - migration-functions-service-account
+      - migration-functions-sa-monitoring-binding
+      - validation-results-topic
+
+  # Cloud Function for alert management
+  - name: alert-manager-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      name: projects/{{env["project_id"]}}/locations/{{env["region"]}}/functions/alert-manager
+      sourceArchiveUrl: gs://$(ref.migration-monitoring-bucket.name)/alert-manager.zip
+      entryPoint: manage_alerts
+      runtime: python311
+      timeout: 60s
+      availableMemoryMb: 256
+      serviceAccountEmail: $(ref.migration-functions-service-account.email)
+      eventTrigger:
+        eventType: google.pubsub.topic.publish
+        resource: $(ref.alert-notifications-topic.name)
+        failurePolicy:
+          retry: {}
+      environmentVariables:
+        PROJECT_ID: {{env["project_id"]}}
+        REGION: {{env["region"]}}
+      labels:
+        purpose: alert-management
+        component: serverless-function
+        managed-by: infrastructure-manager
+    depends_on:
+      - enable-cloud-functions-api
+      - migration-monitoring-bucket
+      - migration-functions-service-account
+      - migration-functions-sa-monitoring-binding
+      - alert-notifications-topic
+
+  # Cloud Workload Manager evaluation for database health monitoring
+  - name: database-migration-workload-evaluation
+    type: gcp-types/workloadmanager-v1:projects.locations.evaluations
+    properties:
+      name: projects/{{env["project_id"]}}/locations/{{env["region"]}}/evaluations/database-migration-health-{{env["random_suffix"]}}
+      description: Health monitoring evaluation for database migration workload
+      workload:
+        discoveredWorkload:
+          workloadUri: projects/{{env["project_id"]}}/locations/{{env["region"]}}/instances/$(ref.migration-target-database.name)
+          workloadType: DATABASE
+      rules:
+        - description: Database connection health check
+          displayName: Connection Health
+          errorMessage: Database connection failed or is unstable
+          primaryCategory: OPERATIONAL_EFFICIENCY
+          severity: HIGH
+          uri: https://cloud.google.com/sql/docs/mysql/diagnose-issues
+        - description: Replication lag monitoring for migration consistency
+          displayName: Replication Performance
+          errorMessage: High replication lag detected during migration
+          primaryCategory: PERFORMANCE
+          severity: MEDIUM
+          uri: https://cloud.google.com/sql/docs/mysql/replication
+        - description: Storage utilization monitoring for migration capacity
+          displayName: Storage Health
+          errorMessage: Storage utilization above recommended threshold
+          primaryCategory: COST_OPTIMIZATION
+          severity: LOW
+          uri: https://cloud.google.com/sql/docs/mysql/storage
+        - description: Database security configuration validation
+          displayName: Security Compliance
+          errorMessage: Database security configuration requires attention
+          primaryCategory: SECURITY
+          severity: HIGH
+          uri: https://cloud.google.com/sql/docs/mysql/security
+      labels:
+        purpose: migration-monitoring
+        component: workload-evaluation
+        managed-by: infrastructure-manager
+    depends_on:
+      - enable-workload-manager-api
+      - migration-target-database
+
+  # Cloud Monitoring dashboard for migration observability
+  - name: migration-monitoring-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      displayName: Database Migration Monitoring Dashboard
+      mosaicLayout:
+        tiles:
+          - width: 6
+            height: 4
+            widget:
+              title: Migration Progress Duration
+              scorecard:
+                timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'metric.type="custom.googleapis.com/migration/duration_seconds"'
+                    aggregation:
+                      alignmentPeriod: 60s
+                      perSeriesAligner: ALIGN_MEAN
+                sparkChartView:
+                  sparkChartType: SPARK_LINE
+          - width: 6
+            height: 4
+            xPos: 6
+            widget:
+              title: Data Validation Score
+              scorecard:
+                timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'metric.type="custom.googleapis.com/migration/validation_score"'
+                    aggregation:
+                      alignmentPeriod: 60s
+                      perSeriesAligner: ALIGN_MEAN
+                sparkChartView:
+                  sparkChartType: SPARK_BAR
+          - width: 12
+            height: 4
+            yPos: 4
+            widget:
+              title: Cloud SQL Database Performance
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="cloudsql_database" AND metric.type="cloudsql.googleapis.com/database/cpu/utilization"'
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_MEAN
+                    plotType: LINE
+                timeshiftDuration: 0s
+                yAxis:
+                  label: CPU Utilization
+                  scale: LINEAR
+          - width: 6
+            height: 4
+            yPos: 8
+            widget:
+              title: Migration Function Executions
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="cloud_function" AND metric.type="cloudfunctions.googleapis.com/function/executions"'
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_RATE
+                    plotType: STACKED_BAR
+                timeshiftDuration: 0s
+                yAxis:
+                  label: Executions per Second
+                  scale: LINEAR
+          - width: 6
+            height: 4
+            xPos: 6
+            yPos: 8
+            widget:
+              title: Pub/Sub Message Processing
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="pubsub_topic" AND metric.type="pubsub.googleapis.com/topic/send_request_count"'
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_RATE
+                    plotType: LINE
+                timeshiftDuration: 0s
+                yAxis:
+                  label: Messages per Second
+                  scale: LINEAR
+      labels:
+        purpose: migration-monitoring
+        component: observability-dashboard
+        managed-by: infrastructure-manager
+    depends_on:
+      - enable-monitoring-api
+
+  # Cloud Logging sink for migration events
+  - name: migration-events-log-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      name: migration-events-sink
+      description: Log sink for migration monitoring events
+      destination: pubsub.googleapis.com/$(ref.migration-events-topic.name)
+      filter: >
+        resource.type="cloud_function" AND
+        (resource.labels.function_name="migration-monitor" OR
+         resource.labels.function_name="data-validator" OR
+         resource.labels.function_name="alert-manager") AND
+        severity >= INFO
+      uniqueWriterIdentity: true
+    depends_on:
+      - enable-logging-api
+      - migration-events-topic
+      - migration-monitor-function
+      - data-validator-function
+      - alert-manager-function
+
+# Environment variables and configuration
+env:
+  - name: project_id
+    value: ${PROJECT_ID}
+  - name: region
+    value: ${REGION:-us-central1}
+  - name: random_suffix
+    value: ${RANDOM_SUFFIX:-$(openssl rand -hex 3)}
+
+# Outputs for verification and integration
+outputs:
+  - name: migration-monitoring-bucket
+    value: $(ref.migration-monitoring-bucket.name)
+    
+  - name: cloud-sql-instance
+    value: $(ref.migration-target-database.name)
+    
+  - name: cloud-sql-connection-name
+    value: $(ref.migration-target-database.connectionName)
+    
+  - name: migration-monitor-function-url
+    value: $(ref.migration-monitor-function.httpsTrigger.url)
+    
+  - name: workload-evaluation-name
+    value: $(ref.database-migration-workload-evaluation.name)
+    
+  - name: pubsub-topics
+    value:
+      - $(ref.migration-events-topic.name)
+      - $(ref.validation-results-topic.name)
+      - $(ref.alert-notifications-topic.name)
+      
+  - name: service-account-email
+    value: $(ref.migration-functions-service-account.email)
+    
+  - name: dashboard-url
+    value: https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.migration-monitoring-dashboard.name)
+
+# Metadata for Infrastructure Manager
+metadata:
+  version: 1.0
+  description: Infrastructure Manager configuration for database migration health and performance monitoring
+  author: Google Cloud Infrastructure Manager
+  tags:
+    - database-migration
+    - monitoring
+    - automation
+    - workload-manager
+    - cloud-functions
+  dependencies:
+    - google-cloud-sdk
+    - infrastructure-manager
+  estimated_cost: $50-100 USD for testing resources over 2 hours
+  deployment_time: 15-20 minutes

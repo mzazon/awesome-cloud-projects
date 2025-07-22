@@ -1,0 +1,477 @@
+# Infrastructure Manager Configuration for Multi-Tenant Resource Scheduling
+# This configuration deploys a complete multi-tenant resource scheduling system
+# using Cloud Scheduler, Cloud Filestore, Cloud Functions, and Cloud Monitoring
+
+# Import the deployment resource types
+imports:
+  - path: templates
+
+# Configuration parameters that can be customized
+properties:
+  # Project and location settings
+  project: ${PROJECT_ID}
+  region: us-central1
+  zone: us-central1-a
+  
+  # Resource naming configuration
+  resourceSuffix: mt-scheduler
+  
+  # Filestore configuration
+  filestoreTier: BASIC_HDD
+  filestoreCapacity: 1024  # 1TB in GB
+  filestoreNetwork: default
+  
+  # Cloud Function configuration
+  functionRuntime: python311
+  functionMemory: 512
+  functionTimeout: 300
+  
+  # Monitoring configuration
+  alertNotificationChannels: []  # Add notification channels as needed
+  
+  # Scheduler timezone
+  schedulerTimeZone: America/New_York
+
+# Infrastructure resources
+resources:
+  # Enable required Google Cloud APIs
+  - name: cloudfunctions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-info.projectId)/services/cloudfunctions.googleapis.com
+      
+  - name: cloudscheduler-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-info.projectId)/services/cloudscheduler.googleapis.com
+      
+  - name: file-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-info.projectId)/services/file.googleapis.com
+      
+  - name: monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-info.projectId)/services/monitoring.googleapis.com
+      
+  - name: cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-info.projectId)/services/cloudbuild.googleapis.com
+
+  # Get project information for dynamic references
+  - name: project-info
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: $(ref.project)
+
+  # Cloud Filestore instance for shared tenant storage
+  - name: tenant-filestore
+    type: gcp-types/file-v1:projects.locations.instances
+    properties:
+      parent: projects/$(ref.project-info.projectId)/locations/$(ref.zone)
+      instanceId: tenant-data-$(ref.resourceSuffix)
+      instance:
+        description: "Shared storage for multi-tenant resource scheduling system"
+        tier: $(ref.filestoreTier)
+        fileShares:
+          - name: tenant_storage
+            capacityGb: $(ref.filestoreCapacity)
+            # Enable backup for production use
+            sourceBackup: ""
+        networks:
+          - network: projects/$(ref.project-info.projectId)/global/networks/$(ref.filestoreNetwork)
+            modes:
+              - MODE_IPV4
+            reservedIpRange: ""
+        labels:
+          purpose: multi-tenant-scheduling
+          environment: production
+          component: shared-storage
+    metadata:
+      dependsOn:
+        - file-api
+
+  # Cloud Storage bucket for Cloud Function source code
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(ref.project-info.projectId)-function-source-$(ref.resourceSuffix)
+      location: $(ref.region)
+      storageClass: REGIONAL
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - condition:
+              age: 30
+            action:
+              type: Delete
+      labels:
+        purpose: function-source
+        component: serverless
+
+  # Cloud Function source code as a zip archive
+  - name: function-source-archive
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: $(ref.function-source-bucket.name)
+      name: source.zip
+      # Source code will be uploaded separately or via deployment
+    metadata:
+      dependsOn:
+        - function-source-bucket
+
+  # IAM Service Account for Cloud Function
+  - name: scheduler-function-sa
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: scheduler-function-$(ref.resourceSuffix)
+      serviceAccount:
+        displayName: "Multi-Tenant Scheduler Function Service Account"
+        description: "Service account for resource scheduling Cloud Function"
+    metadata:
+      dependsOn:
+        - project-info
+
+  # IAM binding for Cloud Function service account (Monitoring Editor)
+  - name: function-monitoring-role
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicies
+    properties:
+      resource: $(ref.project-info.projectId)
+      policy:
+        bindings:
+          - role: roles/monitoring.editor
+            members:
+              - serviceAccount:$(ref.scheduler-function-sa.email)
+    metadata:
+      dependsOn:
+        - scheduler-function-sa
+
+  # IAM binding for Cloud Function service account (Logging Writer)
+  - name: function-logging-role
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicies
+    properties:
+      resource: $(ref.project-info.projectId)
+      policy:
+        bindings:
+          - role: roles/logging.logWriter
+            members:
+              - serviceAccount:$(ref.scheduler-function-sa.email)
+    metadata:
+      dependsOn:
+        - scheduler-function-sa
+
+  # Cloud Function for resource orchestration
+  - name: resource-scheduler-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/$(ref.project-info.projectId)/locations/$(ref.region)
+      functionId: resource-scheduler-$(ref.resourceSuffix)
+      function:
+        name: projects/$(ref.project-info.projectId)/locations/$(ref.region)/functions/resource-scheduler-$(ref.resourceSuffix)
+        description: "Multi-tenant resource scheduling and orchestration function"
+        sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/source.zip
+        entryPoint: schedule_tenant_resources
+        runtime: $(ref.functionRuntime)
+        timeout: $(ref.functionTimeout)s
+        availableMemoryMb: $(ref.functionMemory)
+        serviceAccountEmail: $(ref.scheduler-function-sa.email)
+        environmentVariables:
+          FILESTORE_IP: $(ref.tenant-filestore.networks[0].ipAddresses[0])
+          GCP_PROJECT: $(ref.project-info.projectId)
+          RESOURCE_SUFFIX: $(ref.resourceSuffix)
+        httpsTrigger:
+          securityLevel: SECURE_ALWAYS
+        labels:
+          purpose: multi-tenant-scheduling
+          component: orchestration
+    metadata:
+      dependsOn:
+        - tenant-filestore
+        - scheduler-function-sa
+        - function-source-archive
+        - cloudfunctions-api
+
+  # Cloud Scheduler job for tenant resource cleanup (daily at 2 AM)
+  - name: tenant-cleanup-job
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/$(ref.project-info.projectId)/locations/$(ref.region)
+      jobId: tenant-cleanup-$(ref.resourceSuffix)
+      job:
+        name: projects/$(ref.project-info.projectId)/locations/$(ref.region)/jobs/tenant-cleanup-$(ref.resourceSuffix)
+        description: "Daily cleanup of expired tenant resources"
+        schedule: "0 2 * * *"
+        timeZone: $(ref.schedulerTimeZone)
+        httpTarget:
+          uri: $(ref.resource-scheduler-function.httpsTrigger.url)
+          httpMethod: POST
+          headers:
+            Content-Type: application/json
+          body: |
+            {
+              "action": "cleanup",
+              "tenant_id": "all"
+            }
+          oidcToken:
+            serviceAccountEmail: $(ref.scheduler-function-sa.email)
+            audience: $(ref.resource-scheduler-function.httpsTrigger.url)
+        retryConfig:
+          retryCount: 3
+          maxRetryDuration: 3600s
+          minBackoffDuration: 5s
+          maxBackoffDuration: 300s
+          maxDoublings: 5
+    metadata:
+      dependsOn:
+        - resource-scheduler-function
+        - cloudscheduler-api
+
+  # Cloud Scheduler job for quota monitoring (every 6 hours)
+  - name: quota-monitor-job
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/$(ref.project-info.projectId)/locations/$(ref.region)
+      jobId: quota-monitor-$(ref.resourceSuffix)
+      job:
+        name: projects/$(ref.project-info.projectId)/locations/$(ref.region)/jobs/quota-monitor-$(ref.resourceSuffix)
+        description: "Monitor tenant quota usage every 6 hours"
+        schedule: "0 */6 * * *"
+        timeZone: $(ref.schedulerTimeZone)
+        httpTarget:
+          uri: $(ref.resource-scheduler-function.httpsTrigger.url)
+          httpMethod: POST
+          headers:
+            Content-Type: application/json
+          body: |
+            {
+              "action": "monitor_quotas",
+              "tenant_id": "all"
+            }
+          oidcToken:
+            serviceAccountEmail: $(ref.scheduler-function-sa.email)
+            audience: $(ref.resource-scheduler-function.httpsTrigger.url)
+        retryConfig:
+          retryCount: 3
+          maxRetryDuration: 1800s
+          minBackoffDuration: 5s
+          maxBackoffDuration: 300s
+          maxDoublings: 3
+    metadata:
+      dependsOn:
+        - resource-scheduler-function
+        - cloudscheduler-api
+
+  # Cloud Scheduler job for Tenant A processing (weekdays at 9 AM)
+  - name: tenant-a-processing-job
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/$(ref.project-info.projectId)/locations/$(ref.region)
+      jobId: tenant-a-processing-$(ref.resourceSuffix)
+      job:
+        name: projects/$(ref.project-info.projectId)/locations/$(ref.region)/jobs/tenant-a-processing-$(ref.resourceSuffix)
+        description: "Weekday resource allocation for Tenant A"
+        schedule: "0 9 * * 1-5"
+        timeZone: $(ref.schedulerTimeZone)
+        httpTarget:
+          uri: $(ref.resource-scheduler-function.httpsTrigger.url)
+          httpMethod: POST
+          headers:
+            Content-Type: application/json
+          body: |
+            {
+              "tenant_id": "tenant_a",
+              "resource_type": "compute",
+              "capacity": 5,
+              "duration": 8
+            }
+          oidcToken:
+            serviceAccountEmail: $(ref.scheduler-function-sa.email)
+            audience: $(ref.resource-scheduler-function.httpsTrigger.url)
+        retryConfig:
+          retryCount: 5
+          maxRetryDuration: 1800s
+          minBackoffDuration: 10s
+          maxBackoffDuration: 300s
+          maxDoublings: 4
+    metadata:
+      dependsOn:
+        - resource-scheduler-function
+        - cloudscheduler-api
+
+  # Cloud Monitoring Alert Policy for tenant quota violations
+  - name: quota-violation-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(ref.project-info.projectId)
+      alertPolicy:
+        displayName: "Tenant Quota Violation Alert"
+        documentation:
+          content: "Alert when tenant exceeds 80% of allocated quota"
+          mimeType: text/markdown
+        conditions:
+          - displayName: "Quota usage high"
+            conditionThreshold:
+              filter: 'metric.type="custom.googleapis.com/tenant/resource_allocations"'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 8
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_MEAN
+                  crossSeriesReducer: REDUCE_SUM
+                  groupByFields:
+                    - "metric.label.tenant_id"
+        alertStrategy:
+          autoClose: 1800s
+        enabled: true
+        # Add notification channels if specified
+        # notificationChannels: $(ref.alertNotificationChannels)
+    metadata:
+      dependsOn:
+        - resource-scheduler-function
+        - monitoring-api
+
+  # Cloud Monitoring Dashboard for multi-tenant visibility
+  - name: tenant-monitoring-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      parent: projects/$(ref.project-info.projectId)
+      dashboard:
+        displayName: "Multi-Tenant Resource Dashboard"
+        mosaicLayout:
+          tiles:
+            - width: 6
+              height: 4
+              widget:
+                title: "Tenant Resource Allocations"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'metric.type="custom.googleapis.com/tenant/resource_allocations"'
+                          aggregation:
+                            alignmentPeriod: 300s
+                            perSeriesAligner: ALIGN_MEAN
+                            crossSeriesReducer: REDUCE_SUM
+                            groupByFields:
+                              - "metric.label.tenant_id"
+                      plotType: LINE
+                  timeshiftDuration: 0s
+                  yAxis:
+                    label: "Resource Units"
+                    scale: LINEAR
+            - width: 6
+              height: 4
+              yCoordinate: 0
+              xCoordinate: 6
+              widget:
+                title: "Function Execution Count"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'metric.type="cloudfunctions.googleapis.com/function/executions" AND resource.label.function_name="resource-scheduler-$(ref.resourceSuffix)"'
+                          aggregation:
+                            alignmentPeriod: 300s
+                            perSeriesAligner: ALIGN_RATE
+                            crossSeriesReducer: REDUCE_SUM
+                      plotType: LINE
+                  yAxis:
+                    label: "Executions/sec"
+                    scale: LINEAR
+            - width: 12
+              height: 4
+              yCoordinate: 4
+              widget:
+                title: "Filestore Performance"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'metric.type="file.googleapis.com/nfs/server/used_bytes_percent" AND resource.label.instance_name="tenant-data-$(ref.resourceSuffix)"'
+                          aggregation:
+                            alignmentPeriod: 300s
+                            perSeriesAligner: ALIGN_MEAN
+                      plotType: LINE
+                  yAxis:
+                    label: "Storage Usage %"
+                    scale: LINEAR
+    metadata:
+      dependsOn:
+        - tenant-filestore
+        - resource-scheduler-function
+        - monitoring-api
+
+# Infrastructure outputs for integration and validation
+outputs:
+  # Filestore connection information
+  - name: filestore_ip_address
+    value: $(ref.tenant-filestore.networks[0].ipAddresses[0])
+    description: "IP address of the Cloud Filestore instance for NFS mounting"
+
+  - name: filestore_file_share
+    value: $(ref.tenant-filestore.fileShares[0].name)
+    description: "Name of the NFS file share for tenant data"
+
+  # Cloud Function information
+  - name: scheduler_function_url
+    value: $(ref.resource-scheduler-function.httpsTrigger.url)
+    description: "HTTPS trigger URL for the resource scheduler function"
+
+  - name: scheduler_function_name
+    value: $(ref.resource-scheduler-function.name)
+    description: "Full resource name of the scheduler function"
+
+  # Service account for integrations
+  - name: function_service_account
+    value: $(ref.scheduler-function-sa.email)
+    description: "Email of the service account used by the scheduler function"
+
+  # Scheduler job information
+  - name: cleanup_job_name
+    value: $(ref.tenant-cleanup-job.name)
+    description: "Name of the daily cleanup scheduler job"
+
+  - name: quota_monitor_job_name
+    value: $(ref.quota-monitor-job.name)
+    description: "Name of the quota monitoring scheduler job"
+
+  - name: tenant_a_job_name
+    value: $(ref.tenant-a-processing-job.name)
+    description: "Name of the Tenant A processing scheduler job"
+
+  # Monitoring resources
+  - name: alert_policy_name
+    value: $(ref.quota-violation-alert.name)
+    description: "Name of the quota violation alert policy"
+
+  - name: dashboard_name
+    value: $(ref.tenant-monitoring-dashboard.name)
+    description: "Name of the multi-tenant monitoring dashboard"
+
+  # Project and location information
+  - name: project_id
+    value: $(ref.project-info.projectId)
+    description: "Google Cloud project ID where resources are deployed"
+
+  - name: deployment_region
+    value: $(ref.region)
+    description: "Google Cloud region where resources are deployed"
+
+  # Storage bucket information
+  - name: function_source_bucket
+    value: $(ref.function-source-bucket.name)
+    description: "Cloud Storage bucket containing function source code"
+
+# Metadata and labels for resource management
+metadata:
+  version: "1.0"
+  description: "Multi-tenant resource scheduling system with Cloud Scheduler and Filestore"
+  labels:
+    solution: multi-tenant-scheduling
+    components: scheduler,filestore,functions,monitoring
+    difficulty: intermediate
+    estimated-cost: medium

@@ -1,0 +1,1522 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Advanced Multi-Service Monitoring Dashboards with Custom Metrics and Anomaly Detection - Production-ready CloudFormation template for comprehensive monitoring infrastructure'
+
+# ==================================================
+# PARAMETERS
+# ==================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'advanced-monitoring'
+    Description: 'Name prefix for all resources created by this template'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9-]*'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+
+  Environment:
+    Type: String
+    Default: 'production'
+    Description: 'Environment name for resource tagging and organization'
+    AllowedValues:
+      - 'development'
+      - 'staging'
+      - 'production'
+    ConstraintDescription: 'Must be development, staging, or production'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for critical alerts and notifications'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  BusinessMetricsCollectionRate:
+    Type: String
+    Default: 'rate(5 minutes)'
+    Description: 'Schedule expression for business metrics collection'
+    AllowedValues:
+      - 'rate(1 minute)'
+      - 'rate(5 minutes)'
+      - 'rate(10 minutes)'
+      - 'rate(15 minutes)'
+    ConstraintDescription: 'Must be a valid EventBridge rate expression'
+
+  InfrastructureHealthCheckRate:
+    Type: String
+    Default: 'rate(10 minutes)'
+    Description: 'Schedule expression for infrastructure health checks'
+    AllowedValues:
+      - 'rate(5 minutes)'
+      - 'rate(10 minutes)'
+      - 'rate(15 minutes)'
+      - 'rate(30 minutes)'
+    ConstraintDescription: 'Must be a valid EventBridge rate expression'
+
+  CostMonitoringRate:
+    Type: String
+    Default: 'rate(1 day)'
+    Description: 'Schedule expression for cost monitoring'
+    AllowedValues:
+      - 'rate(1 day)'
+      - 'rate(12 hours)'
+      - 'rate(6 hours)'
+    ConstraintDescription: 'Must be a valid EventBridge rate expression'
+
+  EnableAnomalyDetection:
+    Type: String
+    Default: 'true'
+    Description: 'Enable CloudWatch anomaly detection for key metrics'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  MetricRetentionPeriod:
+    Type: Number
+    Default: 30
+    Description: 'Retention period for custom metrics in days'
+    MinValue: 1
+    MaxValue: 2557
+    ConstraintDescription: 'Must be between 1 and 2557 days'
+
+# ==================================================
+# CONDITIONS
+# ==================================================
+Conditions:
+  EnableAnomalyDetectionCondition: !Equals [!Ref EnableAnomalyDetection, 'true']
+  IsProductionEnvironment: !Equals [!Ref Environment, 'production']
+
+# ==================================================
+# RESOURCES
+# ==================================================
+Resources:
+  # ==================================================
+  # IAM ROLES AND POLICIES
+  # ==================================================
+  
+  # Lambda execution role with comprehensive permissions
+  MonitoringLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-monitoring-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: MonitoringPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CloudWatch metrics and logs permissions
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                  - 'cloudwatch:GetMetricStatistics'
+                  - 'cloudwatch:ListMetrics'
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+              # AWS service monitoring permissions
+              - Effect: Allow
+                Action:
+                  - 'rds:DescribeDBInstances'
+                  - 'rds:DescribeDBClusters'
+                  - 'elasticache:DescribeCacheClusters'
+                  - 'elasticache:DescribeReplicationGroups'
+                  - 'ec2:DescribeInstances'
+                  - 'ecs:DescribeServices'
+                  - 'ecs:DescribeTasks'
+                  - 'ecs:ListTasks'
+                Resource: '*'
+              # Cost Explorer permissions
+              - Effect: Allow
+                Action:
+                  - 'ce:GetCostAndUsage'
+                  - 'ce:GetUsageReport'
+                  - 'ce:GetCostCategories'
+                Resource: '*'
+              # SNS publish permissions
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: 
+                  - !Ref CriticalAlertsTopic
+                  - !Ref WarningAlertsTopic
+                  - !Ref InfoAlertsTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Monitoring Infrastructure'
+
+  # ==================================================
+  # SNS TOPICS FOR TIERED ALERTING
+  # ==================================================
+  
+  # Critical alerts topic for immediate attention
+  CriticalAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-critical-alerts'
+      DisplayName: 'Critical System Alerts'
+      KmsMasterKeyId: 'alias/aws/sns'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: AlertLevel
+          Value: 'Critical'
+
+  # Warning alerts topic for operational notifications
+  WarningAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-warning-alerts'
+      DisplayName: 'Warning System Alerts'
+      KmsMasterKeyId: 'alias/aws/sns'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: AlertLevel
+          Value: 'Warning'
+
+  # Info alerts topic for informational notifications
+  InfoAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-info-alerts'
+      DisplayName: 'Info System Alerts'
+      KmsMasterKeyId: 'alias/aws/sns'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: AlertLevel
+          Value: 'Info'
+
+  # Email subscription for critical alerts
+  CriticalAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref CriticalAlertsTopic
+      Endpoint: !Ref NotificationEmail
+
+  # ==================================================
+  # LAMBDA FUNCTIONS
+  # ==================================================
+  
+  # Business metrics collection Lambda function
+  BusinessMetricsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-business-metrics'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt MonitoringLambdaExecutionRole.Arn
+      Timeout: 60
+      ReservedConcurrencyLimit: 5
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import random
+          import os
+          from datetime import datetime
+          
+          cloudwatch = boto3.client('cloudwatch')
+          
+          def lambda_handler(event, context):
+              try:
+                  project_name = os.environ.get('PROJECT_NAME', 'monitoring')
+                  environment = os.environ.get('ENVIRONMENT', 'production')
+                  
+                  # Simulate business metrics (replace with real business logic)
+                  
+                  # Revenue metrics
+                  hourly_revenue = random.uniform(10000, 50000)
+                  transaction_count = random.randint(100, 1000)
+                  average_order_value = hourly_revenue / transaction_count
+                  
+                  # User engagement metrics
+                  active_users = random.randint(500, 5000)
+                  page_views = random.randint(10000, 50000)
+                  bounce_rate = random.uniform(0.2, 0.8)
+                  
+                  # Performance metrics
+                  api_response_time = random.uniform(100, 2000)
+                  error_rate = random.uniform(0.001, 0.05)
+                  throughput = random.randint(100, 1000)
+                  
+                  # Customer satisfaction
+                  nps_score = random.uniform(6.0, 9.5)
+                  support_ticket_volume = random.randint(5, 50)
+                  
+                  # Send custom metrics to CloudWatch
+                  metrics = [
+                      {
+                          'MetricName': 'HourlyRevenue',
+                          'Value': hourly_revenue,
+                          'Unit': 'None',
+                          'Dimensions': [
+                              {'Name': 'Environment', 'Value': environment},
+                              {'Name': 'BusinessUnit', 'Value': 'ecommerce'}
+                          ]
+                      },
+                      {
+                          'MetricName': 'TransactionCount',
+                          'Value': transaction_count,
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {'Name': 'Environment', 'Value': environment},
+                              {'Name': 'BusinessUnit', 'Value': 'ecommerce'}
+                          ]
+                      },
+                      {
+                          'MetricName': 'AverageOrderValue',
+                          'Value': average_order_value,
+                          'Unit': 'None',
+                          'Dimensions': [
+                              {'Name': 'Environment', 'Value': environment},
+                              {'Name': 'BusinessUnit', 'Value': 'ecommerce'}
+                          ]
+                      },
+                      {
+                          'MetricName': 'ActiveUsers',
+                          'Value': active_users,
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {'Name': 'Environment', 'Value': environment}
+                          ]
+                      },
+                      {
+                          'MetricName': 'APIResponseTime',
+                          'Value': api_response_time,
+                          'Unit': 'Milliseconds',
+                          'Dimensions': [
+                              {'Name': 'Environment', 'Value': environment},
+                              {'Name': 'Service', 'Value': 'api-gateway'}
+                          ]
+                      },
+                      {
+                          'MetricName': 'ErrorRate',
+                          'Value': error_rate,
+                          'Unit': 'Percent',
+                          'Dimensions': [
+                              {'Name': 'Environment', 'Value': environment},
+                              {'Name': 'Service', 'Value': 'api-gateway'}
+                          ]
+                      },
+                      {
+                          'MetricName': 'NPSScore',
+                          'Value': nps_score,
+                          'Unit': 'None',
+                          'Dimensions': [
+                              {'Name': 'Environment', 'Value': environment}
+                          ]
+                      },
+                      {
+                          'MetricName': 'SupportTicketVolume',
+                          'Value': support_ticket_volume,
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {'Name': 'Environment', 'Value': environment}
+                          ]
+                      }
+                  ]
+                  
+                  # Submit metrics in batches
+                  for i in range(0, len(metrics), 20):
+                      batch = metrics[i:i+20]
+                      cloudwatch.put_metric_data(
+                          Namespace='Business/Metrics',
+                          MetricData=batch
+                      )
+                  
+                  # Calculate and submit composite health score
+                  health_score = calculate_health_score(
+                      api_response_time, error_rate, nps_score, 
+                      support_ticket_volume, active_users
+                  )
+                  
+                  cloudwatch.put_metric_data(
+                      Namespace='Business/Health',
+                      MetricData=[
+                          {
+                              'MetricName': 'CompositeHealthScore',
+                              'Value': health_score,
+                              'Unit': 'Percent',
+                              'Dimensions': [
+                                  {'Name': 'Environment', 'Value': environment}
+                              ]
+                          }
+                      ]
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Business metrics published successfully',
+                          'health_score': health_score,
+                          'metrics_count': len(metrics)
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def calculate_health_score(response_time, error_rate, nps, tickets, users):
+              # Normalize metrics to 0-100 scale and weight them
+              response_score = max(0, 100 - (response_time / 20))  # Lower is better
+              error_score = max(0, 100 - (error_rate * 2000))      # Lower is better
+              nps_score = (nps / 10) * 100                         # Higher is better
+              ticket_score = max(0, 100 - (tickets * 2))          # Lower is better
+              user_score = min(100, (users / 50))                 # Higher is better
+              
+              # Weighted average
+              weights = [0.25, 0.30, 0.20, 0.15, 0.10]
+              scores = [response_score, error_score, nps_score, ticket_score, user_score]
+              
+              return sum(w * s for w, s in zip(weights, scores))
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Business Metrics Collection'
+
+  # Infrastructure health monitoring Lambda function
+  InfrastructureHealthFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-infrastructure-health'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt MonitoringLambdaExecutionRole.Arn
+      Timeout: 120
+      ReservedConcurrencyLimit: 5
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          
+          cloudwatch = boto3.client('cloudwatch')
+          rds = boto3.client('rds')
+          elasticache = boto3.client('elasticache')
+          ec2 = boto3.client('ec2')
+          ecs = boto3.client('ecs')
+          
+          def lambda_handler(event, context):
+              try:
+                  project_name = os.environ.get('PROJECT_NAME', 'monitoring')
+                  environment = os.environ.get('ENVIRONMENT', 'production')
+                  
+                  health_scores = {}
+                  
+                  # Check RDS health
+                  rds_health = check_rds_health()
+                  health_scores['RDS'] = rds_health
+                  
+                  # Check ElastiCache health
+                  cache_health = check_elasticache_health()
+                  health_scores['ElastiCache'] = cache_health
+                  
+                  # Check EC2/ECS health
+                  compute_health = check_compute_health()
+                  health_scores['Compute'] = compute_health
+                  
+                  # Calculate overall infrastructure health
+                  overall_health = sum(health_scores.values()) / len(health_scores)
+                  
+                  # Publish infrastructure health metrics
+                  metrics = []
+                  for service, score in health_scores.items():
+                      metrics.append({
+                          'MetricName': f'{service}HealthScore',
+                          'Value': score,
+                          'Unit': 'Percent',
+                          'Dimensions': [
+                              {'Name': 'Service', 'Value': service},
+                              {'Name': 'Environment', 'Value': environment}
+                          ]
+                      })
+                  
+                  # Add overall health score
+                  metrics.append({
+                      'MetricName': 'OverallInfrastructureHealth',
+                      'Value': overall_health,
+                      'Unit': 'Percent',
+                      'Dimensions': [
+                          {'Name': 'Environment', 'Value': environment}
+                      ]
+                  })
+                  
+                  cloudwatch.put_metric_data(
+                      Namespace='Infrastructure/Health',
+                      MetricData=metrics
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'health_scores': health_scores,
+                          'overall_health': overall_health
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def check_rds_health():
+              try:
+                  instances = rds.describe_db_instances()
+                  if not instances['DBInstances']:
+                      return 100  # No instances to monitor
+                  
+                  healthy_count = 0
+                  total_count = len(instances['DBInstances'])
+                  
+                  for instance in instances['DBInstances']:
+                      if instance['DBInstanceStatus'] == 'available':
+                          healthy_count += 1
+                  
+                  return (healthy_count / total_count) * 100
+              except Exception as e:
+                  print(f"RDS health check error: {str(e)}")
+                  return 50  # Assume degraded if can't check
+          
+          def check_elasticache_health():
+              try:
+                  clusters = elasticache.describe_cache_clusters()
+                  if not clusters['CacheClusters']:
+                      return 100  # No clusters to monitor
+                  
+                  healthy_count = 0
+                  total_count = len(clusters['CacheClusters'])
+                  
+                  for cluster in clusters['CacheClusters']:
+                      if cluster['CacheClusterStatus'] == 'available':
+                          healthy_count += 1
+                  
+                  return (healthy_count / total_count) * 100
+              except Exception as e:
+                  print(f"ElastiCache health check error: {str(e)}")
+                  return 50  # Assume degraded if can't check
+          
+          def check_compute_health():
+              try:
+                  # Check EC2 instances
+                  instances = ec2.describe_instances(
+                      Filters=[
+                          {'Name': 'instance-state-name', 'Values': ['running']}
+                      ]
+                  )
+                  
+                  total_instances = 0
+                  for reservation in instances['Reservations']:
+                      total_instances += len(reservation['Instances'])
+                  
+                  # Check ECS services
+                  try:
+                      clusters = ecs.list_clusters()
+                      healthy_services = 0
+                      total_services = 0
+                      
+                      for cluster_arn in clusters['clusterArns']:
+                          services = ecs.list_services(cluster=cluster_arn)
+                          total_services += len(services['serviceArns'])
+                          
+                          if services['serviceArns']:
+                              service_details = ecs.describe_services(
+                                  cluster=cluster_arn,
+                                  services=services['serviceArns']
+                              )
+                              
+                              for service in service_details['services']:
+                                  if service['status'] == 'ACTIVE' and service['runningCount'] > 0:
+                                      healthy_services += 1
+                      
+                      if total_services > 0:
+                          ecs_health = (healthy_services / total_services) * 100
+                      else:
+                          ecs_health = 100  # No services to monitor
+                      
+                  except Exception as e:
+                      print(f"ECS health check error: {str(e)}")
+                      ecs_health = 100  # Assume healthy if can't check
+                  
+                  # Simple compute health heuristic
+                  if total_instances == 0:
+                      ec2_health = 100  # No instances to monitor
+                  elif total_instances >= 3:
+                      ec2_health = 95   # Good redundancy
+                  elif total_instances >= 2:
+                      ec2_health = 80   # Acceptable redundancy
+                  else:
+                      ec2_health = 60   # Limited redundancy
+                  
+                  # Return weighted average of EC2 and ECS health
+                  return (ec2_health * 0.6 + ecs_health * 0.4)
+                  
+              except Exception as e:
+                  print(f"Compute health check error: {str(e)}")
+                  return 50  # Assume degraded if can't check
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Infrastructure Health Monitoring'
+
+  # Cost monitoring Lambda function
+  CostMonitoringFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-cost-monitoring'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt MonitoringLambdaExecutionRole.Arn
+      Timeout: 120
+      ReservedConcurrencyLimit: 2
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          
+          cloudwatch = boto3.client('cloudwatch')
+          ce = boto3.client('ce')
+          
+          def lambda_handler(event, context):
+              try:
+                  project_name = os.environ.get('PROJECT_NAME', 'monitoring')
+                  environment = os.environ.get('ENVIRONMENT', 'production')
+                  
+                  # Get cost data for the last 7 days
+                  end_date = datetime.now().date()
+                  start_date = end_date - timedelta(days=7)
+                  
+                  response = ce.get_cost_and_usage(
+                      TimePeriod={
+                          'Start': start_date.strftime('%Y-%m-%d'),
+                          'End': end_date.strftime('%Y-%m-%d')
+                      },
+                      Granularity='DAILY',
+                      Metrics=['BlendedCost'],
+                      GroupBy=[
+                          {
+                              'Type': 'DIMENSION',
+                              'Key': 'SERVICE'
+                          }
+                      ]
+                  )
+                  
+                  # Calculate daily cost trend
+                  daily_costs = []
+                  for result in response['ResultsByTime']:
+                      daily_cost = float(result['Total']['BlendedCost']['Amount'])
+                      daily_costs.append(daily_cost)
+                  
+                  # Calculate cost metrics
+                  if daily_costs:
+                      avg_daily_cost = sum(daily_costs) / len(daily_costs)
+                      latest_cost = daily_costs[-1]
+                      cost_trend = ((latest_cost - avg_daily_cost) / avg_daily_cost) * 100 if avg_daily_cost > 0 else 0
+                  else:
+                      avg_daily_cost = 0
+                      latest_cost = 0
+                      cost_trend = 0
+                  
+                  # Publish cost metrics
+                  cloudwatch.put_metric_data(
+                      Namespace='Cost/Management',
+                      MetricData=[
+                          {
+                              'MetricName': 'DailyCost',
+                              'Value': latest_cost,
+                              'Unit': 'None',
+                              'Dimensions': [
+                                  {'Name': 'Environment', 'Value': environment}
+                              ]
+                          },
+                          {
+                              'MetricName': 'CostTrend',
+                              'Value': cost_trend,
+                              'Unit': 'Percent',
+                              'Dimensions': [
+                                  {'Name': 'Environment', 'Value': environment}
+                              ]
+                          },
+                          {
+                              'MetricName': 'WeeklyAverageCost',
+                              'Value': avg_daily_cost,
+                              'Unit': 'None',
+                              'Dimensions': [
+                                  {'Name': 'Environment', 'Value': environment}
+                              ]
+                          }
+                      ]
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'daily_cost': latest_cost,
+                          'cost_trend': cost_trend,
+                          'weekly_average': avg_daily_cost
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Cost Monitoring'
+
+  # ==================================================
+  # EVENTBRIDGE RULES FOR SCHEDULING
+  # ==================================================
+  
+  # Business metrics collection schedule
+  BusinessMetricsScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-business-metrics-schedule'
+      Description: 'Scheduled collection of business metrics'
+      ScheduleExpression: !Ref BusinessMetricsCollectionRate
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt BusinessMetricsFunction.Arn
+          Id: 'BusinessMetricsTarget'
+
+  # Infrastructure health check schedule
+  InfrastructureHealthScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-infrastructure-health-schedule'
+      Description: 'Scheduled infrastructure health checks'
+      ScheduleExpression: !Ref InfrastructureHealthCheckRate
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt InfrastructureHealthFunction.Arn
+          Id: 'InfrastructureHealthTarget'
+
+  # Cost monitoring schedule
+  CostMonitoringScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-cost-monitoring-schedule'
+      Description: 'Scheduled cost monitoring'
+      ScheduleExpression: !Ref CostMonitoringRate
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CostMonitoringFunction.Arn
+          Id: 'CostMonitoringTarget'
+
+  # ==================================================
+  # LAMBDA PERMISSIONS FOR EVENTBRIDGE
+  # ==================================================
+  
+  BusinessMetricsInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BusinessMetricsFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BusinessMetricsScheduleRule.Arn
+
+  InfrastructureHealthInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref InfrastructureHealthFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt InfrastructureHealthScheduleRule.Arn
+
+  CostMonitoringInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CostMonitoringFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CostMonitoringScheduleRule.Arn
+
+  # ==================================================
+  # CLOUDWATCH ANOMALY DETECTORS
+  # ==================================================
+  
+  # Revenue anomaly detector
+  RevenueAnomalyDetector:
+    Type: AWS::CloudWatch::AnomalyDetector
+    Condition: EnableAnomalyDetectionCondition
+    Properties:
+      MetricName: 'HourlyRevenue'
+      Namespace: 'Business/Metrics'
+      Stat: 'Average'
+      Dimensions:
+        - Name: 'Environment'
+          Value: !Ref Environment
+        - Name: 'BusinessUnit'
+          Value: 'ecommerce'
+
+  # API response time anomaly detector
+  APIResponseTimeAnomalyDetector:
+    Type: AWS::CloudWatch::AnomalyDetector
+    Condition: EnableAnomalyDetectionCondition
+    Properties:
+      MetricName: 'APIResponseTime'
+      Namespace: 'Business/Metrics'
+      Stat: 'Average'
+      Dimensions:
+        - Name: 'Environment'
+          Value: !Ref Environment
+        - Name: 'Service'
+          Value: 'api-gateway'
+
+  # Error rate anomaly detector
+  ErrorRateAnomalyDetector:
+    Type: AWS::CloudWatch::AnomalyDetector
+    Condition: EnableAnomalyDetectionCondition
+    Properties:
+      MetricName: 'ErrorRate'
+      Namespace: 'Business/Metrics'
+      Stat: 'Average'
+      Dimensions:
+        - Name: 'Environment'
+          Value: !Ref Environment
+        - Name: 'Service'
+          Value: 'api-gateway'
+
+  # Infrastructure health anomaly detector
+  InfrastructureHealthAnomalyDetector:
+    Type: AWS::CloudWatch::AnomalyDetector
+    Condition: EnableAnomalyDetectionCondition
+    Properties:
+      MetricName: 'OverallInfrastructureHealth'
+      Namespace: 'Infrastructure/Health'
+      Stat: 'Average'
+      Dimensions:
+        - Name: 'Environment'
+          Value: !Ref Environment
+
+  # ==================================================
+  # CLOUDWATCH ALARMS
+  # ==================================================
+  
+  # Revenue anomaly alarm
+  RevenueAnomalyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAnomalyDetectionCondition
+    Properties:
+      AlarmName: !Sub '${ProjectName}-revenue-anomaly'
+      AlarmDescription: 'Revenue anomaly detected - potential business impact'
+      MetricName: 'HourlyRevenue'
+      Namespace: 'Business/Metrics'
+      Statistic: 'Average'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanLowerThreshold
+      TreatMissingData: breaching
+      Dimensions:
+        - Name: 'Environment'
+          Value: !Ref Environment
+        - Name: 'BusinessUnit'
+          Value: 'ecommerce'
+      AlarmActions:
+        - !Ref CriticalAlertsTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Severity
+          Value: 'Critical'
+
+  # API response time anomaly alarm
+  APIResponseTimeAnomalyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAnomalyDetectionCondition
+    Properties:
+      AlarmName: !Sub '${ProjectName}-api-response-time-anomaly'
+      AlarmDescription: 'API response time anomaly detected'
+      MetricName: 'APIResponseTime'
+      Namespace: 'Business/Metrics'
+      Statistic: 'Average'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanUpperThreshold
+      TreatMissingData: breaching
+      Dimensions:
+        - Name: 'Environment'
+          Value: !Ref Environment
+        - Name: 'Service'
+          Value: 'api-gateway'
+      AlarmActions:
+        - !Ref WarningAlertsTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Severity
+          Value: 'Warning'
+
+  # Infrastructure health low alarm
+  InfrastructureHealthLowAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-infrastructure-health-low'
+      AlarmDescription: 'Infrastructure health score below acceptable threshold'
+      MetricName: 'OverallInfrastructureHealth'
+      Namespace: 'Infrastructure/Health'
+      Statistic: 'Average'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      Dimensions:
+        - Name: 'Environment'
+          Value: !Ref Environment
+      AlarmActions:
+        - !Ref CriticalAlertsTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Severity
+          Value: 'Critical'
+
+  # Lambda function error rate alarm
+  LambdaErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-error-rate'
+      AlarmDescription: 'High error rate in monitoring Lambda functions'
+      MetricName: 'Errors'
+      Namespace: 'AWS/Lambda'
+      Statistic: 'Sum'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref WarningAlertsTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Severity
+          Value: 'Warning'
+
+  # ==================================================
+  # CLOUDWATCH DASHBOARDS
+  # ==================================================
+  
+  # Infrastructure monitoring dashboard
+  InfrastructureDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-Infrastructure'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["Infrastructure/Health", "OverallInfrastructureHealth", "Environment", "${Environment}"],
+                  ["Business/Health", "CompositeHealthScore", "Environment", "${Environment}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Overall System Health",
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 100
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 0,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ECS", "CPUUtilization", "ServiceName", "web-service"],
+                  ["AWS/ECS", "MemoryUtilization", "ServiceName", "web-service"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "ECS Service Utilization"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 0,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", "production-db"],
+                  ["AWS/RDS", "DatabaseConnections", "DBInstanceIdentifier", "production-db"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "RDS Performance Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["Infrastructure/Health", "RDSHealthScore", "Service", "RDS", "Environment", "${Environment}"],
+                  ["Infrastructure/Health", "ElastiCacheHealthScore", "Service", "ElastiCache", "Environment", "${Environment}"],
+                  ["Infrastructure/Health", "ComputeHealthScore", "Service", "Compute", "Environment", "${Environment}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Service Health Scores",
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 100
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${ProjectName}-business-metrics"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ProjectName}-business-metrics"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${ProjectName}-business-metrics"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Monitoring Function Health"
+              }
+            }
+          ]
+        }
+
+  # Business metrics dashboard
+  BusinessDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-Business'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["Business/Metrics", "HourlyRevenue", "Environment", "${Environment}", "BusinessUnit", "ecommerce"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Hourly Revenue"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 0,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["Business/Metrics", "TransactionCount", "Environment", "${Environment}", "BusinessUnit", "ecommerce"],
+                  ["Business/Metrics", "ActiveUsers", "Environment", "${Environment}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Transaction Volume & Active Users"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 0,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["Business/Metrics", "AverageOrderValue", "Environment", "${Environment}", "BusinessUnit", "ecommerce"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Average Order Value"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["Business/Metrics", "APIResponseTime", "Environment", "${Environment}", "Service", "api-gateway"],
+                  ["Business/Metrics", "ErrorRate", "Environment", "${Environment}", "Service", "api-gateway"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "API Performance Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["Business/Metrics", "NPSScore", "Environment", "${Environment}"],
+                  ["Business/Metrics", "SupportTicketVolume", "Environment", "${Environment}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Customer Satisfaction Metrics"
+              }
+            }
+          ]
+        }
+
+  # Executive summary dashboard
+  ExecutiveDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-Executive'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["Business/Health", "CompositeHealthScore", "Environment", "${Environment}"],
+                  ["Infrastructure/Health", "OverallInfrastructureHealth", "Environment", "${Environment}"]
+                ],
+                "period": 3600,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "System Health Overview (Last 24 Hours)",
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 100
+                  }
+                },
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["Business/Metrics", "HourlyRevenue", "Environment", "${Environment}", "BusinessUnit", "ecommerce"]
+                ],
+                "period": 3600,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Revenue Trend (24H)",
+                "view": "singleValue"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["Business/Metrics", "ActiveUsers", "Environment", "${Environment}"]
+                ],
+                "period": 3600,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Active Users (24H Avg)",
+                "view": "singleValue"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["Business/Metrics", "NPSScore", "Environment", "${Environment}"]
+                ],
+                "period": 3600,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Customer Satisfaction (NPS)",
+                "view": "singleValue"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["Business/Metrics", "ErrorRate", "Environment", "${Environment}", "Service", "api-gateway"]
+                ],
+                "period": 3600,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Error Rate Trend"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["Cost/Management", "DailyCost", "Environment", "${Environment}"],
+                  ["Cost/Management", "CostTrend", "Environment", "${Environment}"]
+                ],
+                "period": 86400,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Cost Management"
+              }
+            }
+          ]
+        }
+
+  # Operational runbook dashboard
+  OperationalDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-Operations'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "log",
+              "x": 0,
+              "y": 0,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${ProjectName}-business-metrics'\n| fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Monitoring Errors",
+                "view": "table"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${ProjectName}-business-metrics"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ProjectName}-business-metrics"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${ProjectName}-business-metrics"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Business Metrics Function Health"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${ProjectName}-infrastructure-health"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ProjectName}-infrastructure-health"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${ProjectName}-infrastructure-health"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Infrastructure Health Function"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/SNS", "NumberOfMessagesSent", "TopicName", "${ProjectName}-critical-alerts"],
+                  ["AWS/SNS", "NumberOfNotificationsFailed", "TopicName", "${ProjectName}-critical-alerts"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Critical Alert Delivery Status"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["Cost/Management", "DailyCost", "Environment", "${Environment}"],
+                  ["Cost/Management", "CostTrend", "Environment", "${Environment}"],
+                  ["Cost/Management", "WeeklyAverageCost", "Environment", "${Environment}"]
+                ],
+                "period": 86400,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Cost Monitoring and Trends"
+              }
+            }
+          ]
+        }
+
+# ==================================================
+# OUTPUTS
+# ==================================================
+Outputs:
+  # Project Information
+  ProjectName:
+    Description: 'Name of the monitoring project'
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectName'
+
+  Environment:
+    Description: 'Environment name'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+  # Lambda Functions
+  BusinessMetricsFunctionArn:
+    Description: 'ARN of the business metrics Lambda function'
+    Value: !GetAtt BusinessMetricsFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BusinessMetricsFunction'
+
+  InfrastructureHealthFunctionArn:
+    Description: 'ARN of the infrastructure health Lambda function'
+    Value: !GetAtt InfrastructureHealthFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-InfrastructureHealthFunction'
+
+  CostMonitoringFunctionArn:
+    Description: 'ARN of the cost monitoring Lambda function'
+    Value: !GetAtt CostMonitoringFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CostMonitoringFunction'
+
+  # SNS Topics
+  CriticalAlertsTopicArn:
+    Description: 'ARN of the critical alerts SNS topic'
+    Value: !Ref CriticalAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-CriticalAlertsTopic'
+
+  WarningAlertsTopicArn:
+    Description: 'ARN of the warning alerts SNS topic'
+    Value: !Ref WarningAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-WarningAlertsTopic'
+
+  InfoAlertsTopicArn:
+    Description: 'ARN of the info alerts SNS topic'
+    Value: !Ref InfoAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-InfoAlertsTopic'
+
+  # Dashboard URLs
+  InfrastructureDashboardURL:
+    Description: 'URL to the infrastructure monitoring dashboard'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-Infrastructure'
+    Export:
+      Name: !Sub '${AWS::StackName}-InfrastructureDashboardURL'
+
+  BusinessDashboardURL:
+    Description: 'URL to the business metrics dashboard'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-Business'
+    Export:
+      Name: !Sub '${AWS::StackName}-BusinessDashboardURL'
+
+  ExecutiveDashboardURL:
+    Description: 'URL to the executive summary dashboard'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-Executive'
+    Export:
+      Name: !Sub '${AWS::StackName}-ExecutiveDashboardURL'
+
+  OperationalDashboardURL:
+    Description: 'URL to the operational runbook dashboard'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-Operations'
+    Export:
+      Name: !Sub '${AWS::StackName}-OperationalDashboardURL'
+
+  # Monitoring Configuration
+  BusinessMetricsSchedule:
+    Description: 'Schedule for business metrics collection'
+    Value: !Ref BusinessMetricsCollectionRate
+    Export:
+      Name: !Sub '${AWS::StackName}-BusinessMetricsSchedule'
+
+  InfrastructureHealthSchedule:
+    Description: 'Schedule for infrastructure health checks'
+    Value: !Ref InfrastructureHealthCheckRate
+    Export:
+      Name: !Sub '${AWS::StackName}-InfrastructureHealthSchedule'
+
+  CostMonitoringSchedule:
+    Description: 'Schedule for cost monitoring'
+    Value: !Ref CostMonitoringRate
+    Export:
+      Name: !Sub '${AWS::StackName}-CostMonitoringSchedule'
+
+  # Deployment Information
+  StackName:
+    Description: 'Name of the CloudFormation stack'
+    Value: !Ref AWS::StackName
+    Export:
+      Name: !Sub '${AWS::StackName}-StackName'
+
+  Region:
+    Description: 'AWS region where the stack is deployed'
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub '${AWS::StackName}-Region'
+
+  # Anomaly Detection Status
+  AnomalyDetectionEnabled:
+    Description: 'Whether anomaly detection is enabled'
+    Value: !Ref EnableAnomalyDetection
+    Export:
+      Name: !Sub '${AWS::StackName}-AnomalyDetectionEnabled'
+
+  # Additional Monitoring Resources
+  IAMRoleArn:
+    Description: 'ARN of the monitoring Lambda execution role'
+    Value: !GetAtt MonitoringLambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IAMRoleArn'
+
+  # Next Steps
+  NextSteps:
+    Description: 'Next steps to complete the monitoring setup'
+    Value: !Sub |
+      1. Confirm SNS email subscription for critical alerts
+      2. Customize Lambda functions with your actual business logic
+      3. Update dashboard widgets to reflect your specific services
+      4. Configure additional alarm thresholds as needed
+      5. Set up integration with your incident management system
+      6. Review and adjust metric collection schedules based on your needs
+      7. Consider implementing custom metrics for your specific use cases
+    Export:
+      Name: !Sub '${AWS::StackName}-NextSteps'

@@ -1,0 +1,1084 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure for Offline-First Mobile Applications with Amplify DataStore - Recipe: 9fd6d7fd'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Application Configuration'
+        Parameters:
+          - AppName
+          - Environment
+          - EnableAnalytics
+      - Label:
+          default: 'DynamoDB Configuration'
+        Parameters:
+          - DynamoDBBillingMode
+          - DynamoDBReadCapacity
+          - DynamoDBWriteCapacity
+          - EnableBackups
+      - Label:
+          default: 'Authentication Configuration'
+        Parameters:
+          - UserPoolPasswordPolicy
+          - MFAConfiguration
+          - EnableAdvancedSecurity
+      - Label:
+          default: 'AppSync Configuration'
+        Parameters:
+          - AppSyncLogLevel
+          - EnableDataStoreConflictResolution
+          - ConflictResolutionStrategy
+    ParameterLabels:
+      AppName:
+        default: 'Application Name'
+      Environment:
+        default: 'Environment'
+      EnableAnalytics:
+        default: 'Enable Analytics'
+      DynamoDBBillingMode:
+        default: 'DynamoDB Billing Mode'
+      UserPoolPasswordPolicy:
+        default: 'Password Policy Complexity'
+      AppSyncLogLevel:
+        default: 'AppSync Log Level'
+
+# Template Parameters
+Parameters:
+  AppName:
+    Type: String
+    Default: 'offline-tasks-app'
+    Description: 'Name of the application (used for resource naming)'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+    MaxLength: 50
+  
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - 'dev'
+      - 'staging'
+      - 'prod'
+    Description: 'Environment for the application'
+  
+  EnableAnalytics:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable Pinpoint analytics for the application'
+  
+  DynamoDBBillingMode:
+    Type: String
+    Default: 'PAY_PER_REQUEST'
+    AllowedValues:
+      - 'PAY_PER_REQUEST'
+      - 'PROVISIONED'
+    Description: 'DynamoDB billing mode'
+  
+  DynamoDBReadCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+    Description: 'DynamoDB read capacity units (only used if billing mode is PROVISIONED)'
+  
+  DynamoDBWriteCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+    Description: 'DynamoDB write capacity units (only used if billing mode is PROVISIONED)'
+  
+  EnableBackups:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable point-in-time recovery for DynamoDB tables'
+  
+  UserPoolPasswordPolicy:
+    Type: String
+    Default: 'strong'
+    AllowedValues:
+      - 'basic'
+      - 'strong'
+    Description: 'Password policy complexity for Cognito User Pool'
+  
+  MFAConfiguration:
+    Type: String
+    Default: 'OPTIONAL'
+    AllowedValues:
+      - 'OFF'
+      - 'OPTIONAL'
+      - 'ON'
+    Description: 'Multi-factor authentication configuration'
+  
+  EnableAdvancedSecurity:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable advanced security features for Cognito User Pool'
+  
+  AppSyncLogLevel:
+    Type: String
+    Default: 'ERROR'
+    AllowedValues:
+      - 'NONE'
+      - 'ERROR'
+      - 'ALL'
+    Description: 'AppSync CloudWatch logging level'
+  
+  EnableDataStoreConflictResolution:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable conflict resolution for DataStore'
+  
+  ConflictResolutionStrategy:
+    Type: String
+    Default: 'AUTOMERGE'
+    AllowedValues:
+      - 'OPTIMISTIC_CONCURRENCY'
+      - 'AUTOMERGE'
+      - 'LAMBDA'
+    Description: 'Conflict resolution strategy for DataStore'
+
+# Template Conditions
+Conditions:
+  IsProd: !Equals [!Ref Environment, 'prod']
+  IsProvisioned: !Equals [!Ref DynamoDBBillingMode, 'PROVISIONED']
+  EnableAnalyticsCondition: !Equals [!Ref EnableAnalytics, 'true']
+  EnableBackupsCondition: !Equals [!Ref EnableBackups, 'true']
+  EnableAdvancedSecurityCondition: !Equals [!Ref EnableAdvancedSecurity, 'true']
+  StrongPasswordPolicy: !Equals [!Ref UserPoolPasswordPolicy, 'strong']
+  EnableConflictResolution: !Equals [!Ref EnableDataStoreConflictResolution, 'true']
+  UseLambdaConflictResolution: !Equals [!Ref ConflictResolutionStrategy, 'LAMBDA']
+
+# Template Resources
+Resources:
+  # Cognito User Pool for Authentication
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${AppName}-${Environment}-user-pool'
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      EmailVerificationSubject: !Sub 'Verify your email for ${AppName}'
+      EmailVerificationMessage: 'Your verification code is {####}'
+      MfaConfiguration: !Ref MFAConfiguration
+      UserPoolAddOns:
+        AdvancedSecurityMode: !If
+          - EnableAdvancedSecurityCondition
+          - ENFORCED
+          - 'OFF'
+      Policies:
+        PasswordPolicy:
+          MinimumLength: !If [StrongPasswordPolicy, 12, 8]
+          RequireUppercase: !If [StrongPasswordPolicy, true, false]
+          RequireLowercase: !If [StrongPasswordPolicy, true, false]
+          RequireNumbers: !If [StrongPasswordPolicy, true, false]
+          RequireSymbols: !If [StrongPasswordPolicy, true, false]
+          TemporaryPasswordValidityDays: 7
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: name
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+      UserPoolTags:
+        Application: !Ref AppName
+        Environment: !Ref Environment
+        Purpose: 'DataStore Authentication'
+  
+  # Cognito User Pool Client for Mobile App
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${AppName}-${Environment}-client'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+      ReadAttributes:
+        - email
+        - name
+        - email_verified
+      WriteAttributes:
+        - email
+        - name
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      AccessTokenValidity: 24
+      IdTokenValidity: 24
+      RefreshTokenValidity: 30
+      PreventUserExistenceErrors: ENABLED
+  
+  # Cognito Identity Pool for AWS Service Access
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub '${AppName}-${Environment}-identity-pool'
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref UserPoolClient
+          ProviderName: !GetAtt UserPool.ProviderName
+  
+  # IAM Role for Authenticated Users
+  AuthenticatedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AppName}-${Environment}-authenticated-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref IdentityPool
+              'ForAnyValue:StringLike':
+                'cognito-identity.amazonaws.com:amr': authenticated
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSAppSyncInvokeFullAccess
+      Policies:
+        - PolicyName: DataStorePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - appsync:GraphQL
+                Resource: !Sub '${AppSyncAPI}/types/*/fields/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt TaskTable.Arn
+                  - !GetAtt ProjectTable.Arn
+                  - !Sub '${TaskTable.Arn}/index/*'
+                  - !Sub '${ProjectTable.Arn}/index/*'
+      Tags:
+        - Key: Application
+          Value: !Ref AppName
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # Cognito Identity Pool Role Attachment
+  IdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        authenticated: !GetAtt AuthenticatedRole.Arn
+  
+  # DynamoDB Table for Tasks
+  TaskTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AppName}-${Environment}-Task'
+      BillingMode: !Ref DynamoDBBillingMode
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: owner
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+        - AttributeName: projectId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: byOwner
+          KeySchema:
+            - AttributeName: owner
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - IsProvisioned
+            - ReadCapacityUnits: !Ref DynamoDBReadCapacity
+              WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+            - !Ref 'AWS::NoValue'
+        - IndexName: byProject
+          KeySchema:
+            - AttributeName: projectId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - IsProvisioned
+            - ReadCapacityUnits: !Ref DynamoDBReadCapacity
+              WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+            - !Ref 'AWS::NoValue'
+      ProvisionedThroughput: !If
+        - IsProvisioned
+        - ReadCapacityUnits: !Ref DynamoDBReadCapacity
+          WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+        - !Ref 'AWS::NoValue'
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnableBackupsCondition, true, false]
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Application
+          Value: !Ref AppName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'DataStore Task Storage'
+  
+  # DynamoDB Table for Projects
+  ProjectTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AppName}-${Environment}-Project'
+      BillingMode: !Ref DynamoDBBillingMode
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: owner
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: byOwner
+          KeySchema:
+            - AttributeName: owner
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - IsProvisioned
+            - ReadCapacityUnits: !Ref DynamoDBReadCapacity
+              WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+            - !Ref 'AWS::NoValue'
+      ProvisionedThroughput: !If
+        - IsProvisioned
+        - ReadCapacityUnits: !Ref DynamoDBReadCapacity
+          WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+        - !Ref 'AWS::NoValue'
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnableBackupsCondition, true, false]
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Application
+          Value: !Ref AppName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'DataStore Project Storage'
+  
+  # IAM Role for AppSync Service
+  AppSyncServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AppName}-${Environment}-appsync-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: appsync.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSAppSyncPushToCloudWatchLogs
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:DeleteItem
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt TaskTable.Arn
+                  - !GetAtt ProjectTable.Arn
+                  - !Sub '${TaskTable.Arn}/index/*'
+                  - !Sub '${ProjectTable.Arn}/index/*'
+      Tags:
+        - Key: Application
+          Value: !Ref AppName
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # AppSync GraphQL API
+  AppSyncAPI:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      Name: !Sub '${AppName}-${Environment}-api'
+      AuthenticationType: AMAZON_COGNITO_USER_POOLS
+      UserPoolConfig:
+        UserPoolId: !Ref UserPool
+        DefaultAction: ALLOW
+        AwsRegion: !Ref 'AWS::Region'
+      AdditionalAuthenticationProviders:
+        - AuthenticationType: AWS_IAM
+      LogConfig:
+        CloudWatchLogsRoleArn: !GetAtt AppSyncServiceRole.Arn
+        FieldLogLevel: !Ref AppSyncLogLevel
+      XrayEnabled: !If [IsProd, true, false]
+      Tags:
+        Application: !Ref AppName
+        Environment: !Ref Environment
+        Purpose: 'DataStore GraphQL API'
+  
+  # AppSync GraphQL Schema
+  AppSyncSchema:
+    Type: AWS::AppSync::GraphQLSchema
+    Properties:
+      ApiId: !GetAtt AppSyncAPI.ApiId
+      Definition: |
+        type Task @model @auth(rules: [{ allow: owner }]) {
+          id: ID!
+          title: String!
+          description: String
+          priority: Priority!
+          status: Status!
+          dueDate: AWSDateTime
+          tags: [String]
+          projectId: ID @index(name: "byProject")
+          createdAt: AWSDateTime
+          updatedAt: AWSDateTime
+          owner: String @auth(rules: [{ allow: owner, operations: [read] }])
+        }
+        
+        type Project @model @auth(rules: [{ allow: owner }]) {
+          id: ID!
+          name: String!
+          description: String
+          color: String
+          tasks: [Task] @hasMany(indexName: "byProject", fields: ["id"])
+          createdAt: AWSDateTime
+          updatedAt: AWSDateTime
+          owner: String @auth(rules: [{ allow: owner, operations: [read] }])
+        }
+        
+        enum Priority {
+          LOW
+          MEDIUM
+          HIGH
+          URGENT
+        }
+        
+        enum Status {
+          PENDING
+          IN_PROGRESS
+          COMPLETED
+          CANCELLED
+        }
+        
+        type Mutation {
+          createTask(input: CreateTaskInput!): Task @aws_auth(cognito_groups: ["users"])
+          updateTask(input: UpdateTaskInput!): Task @aws_auth(cognito_groups: ["users"])
+          deleteTask(input: DeleteTaskInput!): Task @aws_auth(cognito_groups: ["users"])
+          createProject(input: CreateProjectInput!): Project @aws_auth(cognito_groups: ["users"])
+          updateProject(input: UpdateProjectInput!): Project @aws_auth(cognito_groups: ["users"])
+          deleteProject(input: DeleteProjectInput!): Project @aws_auth(cognito_groups: ["users"])
+        }
+        
+        type Query {
+          getTask(id: ID!): Task @aws_auth(cognito_groups: ["users"])
+          listTasks(filter: ModelTaskFilterInput, limit: Int, nextToken: String): ModelTaskConnection @aws_auth(cognito_groups: ["users"])
+          getProject(id: ID!): Project @aws_auth(cognito_groups: ["users"])
+          listProjects(filter: ModelProjectFilterInput, limit: Int, nextToken: String): ModelProjectConnection @aws_auth(cognito_groups: ["users"])
+        }
+        
+        type Subscription {
+          onCreateTask(owner: String!): Task @aws_subscribe(mutations: ["createTask"]) @aws_auth(cognito_groups: ["users"])
+          onUpdateTask(owner: String!): Task @aws_subscribe(mutations: ["updateTask"]) @aws_auth(cognito_groups: ["users"])
+          onDeleteTask(owner: String!): Task @aws_subscribe(mutations: ["deleteTask"]) @aws_auth(cognito_groups: ["users"])
+          onCreateProject(owner: String!): Project @aws_subscribe(mutations: ["createProject"]) @aws_auth(cognito_groups: ["users"])
+          onUpdateProject(owner: String!): Project @aws_subscribe(mutations: ["updateProject"]) @aws_auth(cognito_groups: ["users"])
+          onDeleteProject(owner: String!): Project @aws_subscribe(mutations: ["deleteProject"]) @aws_auth(cognito_groups: ["users"])
+        }
+        
+        input CreateTaskInput {
+          id: ID
+          title: String!
+          description: String
+          priority: Priority!
+          status: Status!
+          dueDate: AWSDateTime
+          tags: [String]
+          projectId: ID
+        }
+        
+        input UpdateTaskInput {
+          id: ID!
+          title: String
+          description: String
+          priority: Priority
+          status: Status
+          dueDate: AWSDateTime
+          tags: [String]
+          projectId: ID
+        }
+        
+        input DeleteTaskInput {
+          id: ID!
+        }
+        
+        input CreateProjectInput {
+          id: ID
+          name: String!
+          description: String
+          color: String
+        }
+        
+        input UpdateProjectInput {
+          id: ID!
+          name: String
+          description: String
+          color: String
+        }
+        
+        input DeleteProjectInput {
+          id: ID!
+        }
+        
+        input ModelTaskFilterInput {
+          id: ModelIDInput
+          title: ModelStringInput
+          description: ModelStringInput
+          priority: ModelPriorityInput
+          status: ModelStatusInput
+          dueDate: ModelStringInput
+          tags: ModelStringInput
+          projectId: ModelIDInput
+          createdAt: ModelStringInput
+          updatedAt: ModelStringInput
+          owner: ModelStringInput
+          and: [ModelTaskFilterInput]
+          or: [ModelTaskFilterInput]
+          not: ModelTaskFilterInput
+        }
+        
+        input ModelProjectFilterInput {
+          id: ModelIDInput
+          name: ModelStringInput
+          description: ModelStringInput
+          color: ModelStringInput
+          createdAt: ModelStringInput
+          updatedAt: ModelStringInput
+          owner: ModelStringInput
+          and: [ModelProjectFilterInput]
+          or: [ModelProjectFilterInput]
+          not: ModelProjectFilterInput
+        }
+        
+        input ModelIDInput {
+          ne: ID
+          eq: ID
+          le: ID
+          lt: ID
+          ge: ID
+          gt: ID
+          contains: ID
+          notContains: ID
+          between: [ID]
+          beginsWith: ID
+          attributeExists: Boolean
+          attributeType: ModelAttributeTypes
+          size: ModelSizeInput
+        }
+        
+        input ModelStringInput {
+          ne: String
+          eq: String
+          le: String
+          lt: String
+          ge: String
+          gt: String
+          contains: String
+          notContains: String
+          between: [String]
+          beginsWith: String
+          attributeExists: Boolean
+          attributeType: ModelAttributeTypes
+          size: ModelSizeInput
+        }
+        
+        input ModelPriorityInput {
+          eq: Priority
+          ne: Priority
+        }
+        
+        input ModelStatusInput {
+          eq: Status
+          ne: Status
+        }
+        
+        input ModelSizeInput {
+          ne: Int
+          eq: Int
+          le: Int
+          lt: Int
+          ge: Int
+          gt: Int
+          between: [Int]
+        }
+        
+        enum ModelAttributeTypes {
+          binary
+          binarySet
+          bool
+          list
+          map
+          number
+          numberSet
+          string
+          stringSet
+          _null
+        }
+        
+        type ModelTaskConnection {
+          items: [Task]
+          nextToken: String
+        }
+        
+        type ModelProjectConnection {
+          items: [Project]
+          nextToken: String
+        }
+  
+  # AppSync Data Source for Task Table
+  TaskDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt AppSyncAPI.ApiId
+      Name: TaskDataSource
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      DynamoDBConfig:
+        TableName: !Ref TaskTable
+        AwsRegion: !Ref 'AWS::Region'
+        UseCallerCredentials: false
+        Versioned: true
+        DeltaSyncConfig:
+          BaseTableTTL: 43200
+          DeltaSyncTableName: !Sub '${AppName}-${Environment}-Task-DeltaSync'
+          DeltaSyncTableTTL: 1440
+  
+  # AppSync Data Source for Project Table
+  ProjectDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt AppSyncAPI.ApiId
+      Name: ProjectDataSource
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      DynamoDBConfig:
+        TableName: !Ref ProjectTable
+        AwsRegion: !Ref 'AWS::Region'
+        UseCallerCredentials: false
+        Versioned: true
+        DeltaSyncConfig:
+          BaseTableTTL: 43200
+          DeltaSyncTableName: !Sub '${AppName}-${Environment}-Project-DeltaSync'
+          DeltaSyncTableTTL: 1440
+  
+  # Lambda Function for Custom Conflict Resolution (Optional)
+  ConflictResolutionFunction:
+    Type: AWS::Lambda::Function
+    Condition: UseLambdaConflictResolution
+    Properties:
+      FunctionName: !Sub '${AppName}-${Environment}-conflict-resolver'
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt ConflictResolutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          APP_NAME: !Ref AppName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def handler(event, context):
+              """
+              Custom conflict resolution handler for DataStore
+              Implements priority-based conflict resolution
+              """
+              try:
+                  logger.info(f"Conflict resolution event: {json.dumps(event)}")
+                  
+                  # Extract conflict data
+                  arguments = event.get('arguments', {})
+                  local_item = arguments.get('local')
+                  remote_item = arguments.get('remote')
+                  
+                  if not local_item or not remote_item:
+                      logger.error("Missing local or remote item in conflict")
+                      return remote_item
+                  
+                  # Get model name from type
+                  model_name = event.get('info', {}).get('parentTypeName', '')
+                  
+                  # Apply custom resolution logic
+                  if model_name == 'Task':
+                      resolved_item = resolve_task_conflict(local_item, remote_item)
+                  elif model_name == 'Project':
+                      resolved_item = resolve_project_conflict(local_item, remote_item)
+                  else:
+                      # Default to remote wins
+                      resolved_item = remote_item
+                  
+                  logger.info(f"Resolved conflict: {json.dumps(resolved_item)}")
+                  return resolved_item
+                  
+              except Exception as e:
+                  logger.error(f"Error in conflict resolution: {str(e)}")
+                  # Return remote item as fallback
+                  return remote_item
+          
+          def resolve_task_conflict(local_item, remote_item):
+              """
+              Resolve Task conflicts with priority-based logic
+              """
+              # Priority weights
+              priority_weights = {
+                  'LOW': 1,
+                  'MEDIUM': 2,
+                  'HIGH': 3,
+                  'URGENT': 4
+              }
+              
+              # If local task is completed and remote is not, local wins
+              if (local_item.get('status') == 'COMPLETED' and 
+                  remote_item.get('status') != 'COMPLETED'):
+                  return local_item
+              
+              # If remote task is completed and local is not, remote wins
+              if (remote_item.get('status') == 'COMPLETED' and 
+                  local_item.get('status') != 'COMPLETED'):
+                  return remote_item
+              
+              # Compare priorities
+              local_priority = priority_weights.get(local_item.get('priority', 'LOW'), 1)
+              remote_priority = priority_weights.get(remote_item.get('priority', 'LOW'), 1)
+              
+              if local_priority > remote_priority:
+                  return local_item
+              elif remote_priority > local_priority:
+                  return remote_item
+              
+              # If same priority, most recent update wins
+              local_updated = local_item.get('updatedAt', '1970-01-01T00:00:00Z')
+              remote_updated = remote_item.get('updatedAt', '1970-01-01T00:00:00Z')
+              
+              return local_item if local_updated > remote_updated else remote_item
+          
+          def resolve_project_conflict(local_item, remote_item):
+              """
+              Resolve Project conflicts with most recent update wins
+              """
+              local_updated = local_item.get('updatedAt', '1970-01-01T00:00:00Z')
+              remote_updated = remote_item.get('updatedAt', '1970-01-01T00:00:00Z')
+              
+              return local_item if local_updated > remote_updated else remote_item
+      Tags:
+        - Key: Application
+          Value: !Ref AppName
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # IAM Role for Conflict Resolution Lambda
+  ConflictResolutionRole:
+    Type: AWS::IAM::Role
+    Condition: UseLambdaConflictResolution
+    Properties:
+      RoleName: !Sub '${AppName}-${Environment}-conflict-resolution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AppSyncAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AppName}-${Environment}-conflict-resolver*'
+      Tags:
+        - Key: Application
+          Value: !Ref AppName
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # Pinpoint Application for Analytics (Optional)
+  PinpointApp:
+    Type: AWS::Pinpoint::App
+    Condition: EnableAnalyticsCondition
+    Properties:
+      Name: !Sub '${AppName}-${Environment}-analytics'
+      Tags:
+        Application: !Ref AppName
+        Environment: !Ref Environment
+        Purpose: 'Mobile Analytics'
+  
+  # CloudWatch Dashboard for Monitoring
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AppName}-${Environment}-monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${TaskTable}" ],
+                  [ ".", "ConsumedWriteCapacityUnits", ".", "." ],
+                  [ ".", "ConsumedReadCapacityUnits", "TableName", "${ProjectTable}" ],
+                  [ ".", "ConsumedWriteCapacityUnits", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "DynamoDB Capacity Usage"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/AppSync", "4XXError", "GraphQLAPIId", "${AppSyncAPI}" ],
+                  [ ".", "5XXError", ".", "." ],
+                  [ ".", "Latency", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "AppSync API Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Cognito", "SignInSuccesses", "UserPool", "${UserPool}", "UserPoolClient", "${UserPoolClient}" ],
+                  [ ".", "SignInThrottles", ".", ".", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Cognito Authentication Metrics"
+              }
+            }
+          ]
+        }
+
+# Template Outputs
+Outputs:
+  # Authentication Outputs
+  UserPoolId:
+    Description: 'Cognito User Pool ID'
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub '${AppName}-${Environment}-UserPoolId'
+  
+  UserPoolClientId:
+    Description: 'Cognito User Pool Client ID'
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub '${AppName}-${Environment}-UserPoolClientId'
+  
+  IdentityPoolId:
+    Description: 'Cognito Identity Pool ID'
+    Value: !Ref IdentityPool
+    Export:
+      Name: !Sub '${AppName}-${Environment}-IdentityPoolId'
+  
+  # API Outputs
+  AppSyncAPIId:
+    Description: 'AppSync GraphQL API ID'
+    Value: !GetAtt AppSyncAPI.ApiId
+    Export:
+      Name: !Sub '${AppName}-${Environment}-AppSyncAPIId'
+  
+  AppSyncAPIURL:
+    Description: 'AppSync GraphQL API URL'
+    Value: !GetAtt AppSyncAPI.GraphQLUrl
+    Export:
+      Name: !Sub '${AppName}-${Environment}-AppSyncAPIURL'
+  
+  AppSyncAPIKey:
+    Description: 'AppSync GraphQL API Key (if API key auth is enabled)'
+    Value: 'Not applicable - using Cognito authentication'
+    Export:
+      Name: !Sub '${AppName}-${Environment}-AppSyncAPIKey'
+  
+  # Database Outputs
+  TaskTableName:
+    Description: 'DynamoDB Task Table Name'
+    Value: !Ref TaskTable
+    Export:
+      Name: !Sub '${AppName}-${Environment}-TaskTableName'
+  
+  ProjectTableName:
+    Description: 'DynamoDB Project Table Name'
+    Value: !Ref ProjectTable
+    Export:
+      Name: !Sub '${AppName}-${Environment}-ProjectTableName'
+  
+  # Analytics Outputs
+  PinpointAppId:
+    Condition: EnableAnalyticsCondition
+    Description: 'Pinpoint Application ID'
+    Value: !Ref PinpointApp
+    Export:
+      Name: !Sub '${AppName}-${Environment}-PinpointAppId'
+  
+  # Conflict Resolution Outputs
+  ConflictResolutionFunctionArn:
+    Condition: UseLambdaConflictResolution
+    Description: 'Lambda Function ARN for conflict resolution'
+    Value: !GetAtt ConflictResolutionFunction.Arn
+    Export:
+      Name: !Sub '${AppName}-${Environment}-ConflictResolutionFunctionArn'
+  
+  # Monitoring Outputs
+  DashboardURL:
+    Description: 'CloudWatch Dashboard URL'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AppName}-${Environment}-monitoring'
+    Export:
+      Name: !Sub '${AppName}-${Environment}-DashboardURL'
+  
+  # Configuration Outputs for Mobile App
+  AmplifyConfiguration:
+    Description: 'Amplify configuration for mobile app (JSON format)'
+    Value: !Sub |
+      {
+        "aws_project_region": "${AWS::Region}",
+        "aws_cognito_identity_pool_id": "${IdentityPool}",
+        "aws_cognito_region": "${AWS::Region}",
+        "aws_user_pools_id": "${UserPool}",
+        "aws_user_pools_web_client_id": "${UserPoolClient}",
+        "oauth": {},
+        "aws_appsync_graphqlEndpoint": "${AppSyncAPI.GraphQLUrl}",
+        "aws_appsync_region": "${AWS::Region}",
+        "aws_appsync_authenticationType": "AMAZON_COGNITO_USER_POOLS",
+        "aws_appsync_apiKey": "null",
+        "aws_mobile_analytics_app_id": "${PinpointApp}",
+        "aws_mobile_analytics_app_region": "${AWS::Region}",
+        "aws_cognito_username_attributes": ["EMAIL"],
+        "aws_cognito_social_providers": [],
+        "aws_cognito_signup_attributes": ["EMAIL"],
+        "aws_cognito_mfa_configuration": "${MFAConfiguration}",
+        "aws_cognito_mfa_types": ["SMS"],
+        "aws_cognito_password_protection_settings": {
+          "passwordPolicyMinLength": 8,
+          "passwordPolicyCharacters": []
+        },
+        "aws_cognito_verification_mechanisms": ["EMAIL"]
+      }
+    Export:
+      Name: !Sub '${AppName}-${Environment}-AmplifyConfiguration'
+  
+  # Region Output
+  AWSRegion:
+    Description: 'AWS Region where resources are deployed'
+    Value: !Ref 'AWS::Region'
+    Export:
+      Name: !Sub '${AppName}-${Environment}-AWSRegion'
+  
+  # Environment Output
+  Environment:
+    Description: 'Environment name'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AppName}-${Environment}-Environment'
+  
+  # Stack Information
+  StackName:
+    Description: 'CloudFormation Stack Name'
+    Value: !Ref 'AWS::StackName'
+    Export:
+      Name: !Sub '${AppName}-${Environment}-StackName'
+  
+  # Cost Optimization Tips
+  CostOptimizationTips:
+    Description: 'Cost optimization recommendations'
+    Value: !Sub |
+      1. Use PAY_PER_REQUEST billing for DynamoDB if traffic is unpredictable
+      2. Enable point-in-time recovery only for production environments
+      3. Consider using AppSync caching for frequently accessed data
+      4. Monitor CloudWatch metrics to optimize capacity settings
+      5. Review and adjust sync expressions to minimize data transfer
+      6. Use Cognito advanced security features only when necessary
+    Export:
+      Name: !Sub '${AppName}-${Environment}-CostOptimizationTips'

@@ -1,0 +1,1526 @@
+# Infrastructure Manager Configuration for Event-Driven Data Synchronization
+# This configuration deploys a complete event-driven data synchronization system
+# using Cloud Datastore, Cloud Pub/Sub, and Cloud Functions
+
+# Import required modules and define the configuration
+apiVersion: blueprints.cloud.google.com/v1alpha1
+kind: BlueprintMetadata
+metadata:
+  name: event-driven-data-synchronization
+  annotations:
+    config.kubernetes.io/local-config: 'true'
+spec:
+  info:
+    title: Event-Driven Data Synchronization with Cloud Datastore and Cloud Pub/Sub
+    source:
+      repo: https://github.com/GoogleCloudPlatform/cloud-foundation-toolkit
+      sourceType: git
+    version: 1.0.0
+    actuationTool:
+      flavor: Terraform
+      version: '>= 1.3'
+    description:
+      tagline: Build scalable event-driven data synchronization systems
+      detailed: |
+        This blueprint deploys a complete event-driven data synchronization system using:
+        - Cloud Datastore for primary data storage with strong consistency
+        - Cloud Pub/Sub for reliable asynchronous messaging
+        - Cloud Functions for automated event processing and conflict resolution
+        - Cloud Logging for comprehensive audit trails
+        - Cloud Monitoring for observability and alerting
+        
+        The architecture enables real-time data synchronization across distributed systems
+        with automatic conflict resolution and comprehensive audit logging.
+
+---
+
+# Main Infrastructure Manager Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: infra-manager-config
+  namespace: default
+data:
+  main.tf: |
+    # Google Cloud Infrastructure Manager Configuration
+    # Event-Driven Data Synchronization System
+    
+    # Configure the Google Cloud Provider
+    terraform {
+      required_version = ">= 1.3"
+      required_providers {
+        google = {
+          source  = "hashicorp/google"
+          version = "~> 5.0"
+        }
+        google-beta = {
+          source  = "hashicorp/google-beta"
+          version = "~> 5.0"
+        }
+        archive = {
+          source  = "hashicorp/archive"
+          version = "~> 2.4"
+        }
+      }
+    }
+    
+    # Configure Google Cloud Provider
+    provider "google" {
+      project = var.project_id
+      region  = var.region
+      zone    = var.zone
+    }
+    
+    provider "google-beta" {
+      project = var.project_id
+      region  = var.region
+      zone    = var.zone
+    }
+    
+    # Generate random suffix for resource names
+    resource "random_string" "suffix" {
+      length  = 6
+      special = false
+      upper   = false
+    }
+    
+    # Local variables for resource naming
+    locals {
+      resource_suffix = random_string.suffix.result
+      
+      # Resource names with unique suffix
+      topic_name             = "data-sync-events-${local.resource_suffix}"
+      sync_subscription      = "sync-processor-${local.resource_suffix}"
+      audit_subscription     = "audit-logger-${local.resource_suffix}"
+      dlq_topic             = "sync-dead-letters-${local.resource_suffix}"
+      dlq_subscription      = "dlq-processor-${local.resource_suffix}"
+      
+      # Function names
+      sync_function_name     = "data-sync-processor-${local.resource_suffix}"
+      audit_function_name    = "audit-logger-${local.resource_suffix}"
+      
+      # Storage buckets
+      source_bucket         = "sync-function-source-${local.resource_suffix}"
+      
+      # Labels for all resources
+      common_labels = {
+        environment = var.environment
+        project     = "datastore-sync"
+        component   = "event-driven-sync"
+        managed_by  = "infrastructure-manager"
+      }
+    }
+    
+    # Enable required APIs
+    resource "google_project_service" "required_apis" {
+      for_each = toset([
+        "datastore.googleapis.com",
+        "pubsub.googleapis.com",
+        "cloudfunctions.googleapis.com",
+        "logging.googleapis.com",
+        "monitoring.googleapis.com",
+        "storage.googleapis.com",
+        "cloudbuild.googleapis.com",
+        "cloudresourcemanager.googleapis.com"
+      ])
+      
+      service = each.value
+      project = var.project_id
+      
+      disable_dependent_services = false
+      disable_on_destroy         = false
+      
+      timeouts {
+        create = "10m"
+        update = "10m"
+      }
+    }
+    
+    # Create storage bucket for Cloud Function source code
+    resource "google_storage_bucket" "function_source" {
+      name     = local.source_bucket
+      location = var.region
+      project  = var.project_id
+      
+      # Enable versioning for source code management
+      versioning {
+        enabled = true
+      }
+      
+      # Lifecycle management for cost optimization
+      lifecycle_rule {
+        condition {
+          age = 30
+        }
+        action {
+          type = "Delete"
+        }
+      }
+      
+      # Security configuration
+      uniform_bucket_level_access = true
+      
+      labels = local.common_labels
+      
+      depends_on = [google_project_service.required_apis]
+    }
+    
+    # Create main Pub/Sub topic for data synchronization events
+    resource "google_pubsub_topic" "data_sync_events" {
+      name    = local.topic_name
+      project = var.project_id
+      
+      # Enable message ordering for consistency
+      message_retention_duration = "604800s" # 7 days
+      
+      labels = local.common_labels
+      
+      depends_on = [google_project_service.required_apis]
+    }
+    
+    # Create dead letter topic for error handling
+    resource "google_pubsub_topic" "dead_letter_topic" {
+      name    = local.dlq_topic
+      project = var.project_id
+      
+      # Longer retention for failed messages
+      message_retention_duration = "2592000s" # 30 days
+      
+      labels = merge(local.common_labels, {
+        component = "dead-letter-queue"
+      })
+      
+      depends_on = [google_project_service.required_apis]
+    }
+    
+    # Create subscription for data synchronization processing
+    resource "google_pubsub_subscription" "sync_processor" {
+      name    = local.sync_subscription
+      topic   = google_pubsub_topic.data_sync_events.name
+      project = var.project_id
+      
+      # Acknowledgment deadline for processing
+      ack_deadline_seconds = 60
+      
+      # Message retention for reliability
+      message_retention_duration = "604800s" # 7 days
+      
+      # Retry policy for failed messages
+      retry_policy {
+        minimum_backoff = "10s"
+        maximum_backoff = "600s"
+      }
+      
+      # Dead letter policy
+      dead_letter_policy {
+        dead_letter_topic     = google_pubsub_topic.dead_letter_topic.id
+        max_delivery_attempts = 5
+      }
+      
+      # Exponential backoff for retries
+      exponential_backoff_settings {
+        max_backoff = "600s"
+        min_backoff = "10s"
+      }
+      
+      labels = merge(local.common_labels, {
+        subscription_type = "sync-processor"
+      })
+      
+      depends_on = [google_project_service.required_apis]
+    }
+    
+    # Create subscription for audit logging
+    resource "google_pubsub_subscription" "audit_logger" {
+      name    = local.audit_subscription
+      topic   = google_pubsub_topic.data_sync_events.name
+      project = var.project_id
+      
+      # Shorter deadline for audit logging
+      ack_deadline_seconds = 30
+      
+      # Longer retention for audit compliance
+      message_retention_duration = "1209600s" # 14 days
+      
+      # Retry policy for audit messages
+      retry_policy {
+        minimum_backoff = "5s"
+        maximum_backoff = "300s"
+      }
+      
+      # Dead letter policy
+      dead_letter_policy {
+        dead_letter_topic     = google_pubsub_topic.dead_letter_topic.id
+        max_delivery_attempts = 3
+      }
+      
+      labels = merge(local.common_labels, {
+        subscription_type = "audit-logger"
+      })
+      
+      depends_on = [google_project_service.required_apis]
+    }
+    
+    # Create dead letter subscription for failed message processing
+    resource "google_pubsub_subscription" "dead_letter_processor" {
+      name    = local.dlq_subscription
+      topic   = google_pubsub_topic.dead_letter_topic.name
+      project = var.project_id
+      
+      # Longer deadline for manual processing
+      ack_deadline_seconds = 300
+      
+      # Extended retention for failed messages
+      message_retention_duration = "2592000s" # 30 days
+      
+      labels = merge(local.common_labels, {
+        subscription_type = "dead-letter-processor"
+      })
+      
+      depends_on = [google_project_service.required_apis]
+    }
+    
+    # Create ZIP archive for sync function source code
+    data "archive_file" "sync_function_source" {
+      type        = "zip"
+      output_path = "${path.module}/sync-function-source.zip"
+      
+      source {
+        content = templatefile("${path.module}/sync_function.py.tpl", {
+          project_id = var.project_id
+          topic_name = local.topic_name
+        })
+        filename = "main.py"
+      }
+      
+      source {
+        content = file("${path.module}/sync_requirements.txt")
+        filename = "requirements.txt"
+      }
+    }
+    
+    # Create ZIP archive for audit function source code
+    data "archive_file" "audit_function_source" {
+      type        = "zip"
+      output_path = "${path.module}/audit-function-source.zip"
+      
+      source {
+        content = file("${path.module}/audit_function.py")
+        filename = "main.py"
+      }
+      
+      source {
+        content = file("${path.module}/audit_requirements.txt")
+        filename = "requirements.txt"
+      }
+    }
+    
+    # Upload sync function source to Cloud Storage
+    resource "google_storage_bucket_object" "sync_function_source" {
+      name   = "sync-function-source-${local.resource_suffix}.zip"
+      bucket = google_storage_bucket.function_source.name
+      source = data.archive_file.sync_function_source.output_path
+      
+      # Content-based versioning
+      detect_md5hash = true
+      
+      depends_on = [google_storage_bucket.function_source]
+    }
+    
+    # Upload audit function source to Cloud Storage
+    resource "google_storage_bucket_object" "audit_function_source" {
+      name   = "audit-function-source-${local.resource_suffix}.zip"
+      bucket = google_storage_bucket.function_source.name
+      source = data.archive_file.audit_function_source.output_path
+      
+      # Content-based versioning
+      detect_md5hash = true
+      
+      depends_on = [google_storage_bucket.function_source]
+    }
+    
+    # Create service account for Cloud Functions
+    resource "google_service_account" "sync_functions_sa" {
+      account_id   = "sync-functions-sa-${local.resource_suffix}"
+      display_name = "Data Sync Functions Service Account"
+      description  = "Service account for event-driven data synchronization functions"
+      project      = var.project_id
+      
+      depends_on = [google_project_service.required_apis]
+    }
+    
+    # Grant necessary permissions to service account
+    resource "google_project_iam_member" "sync_functions_permissions" {
+      for_each = toset([
+        "roles/datastore.user",
+        "roles/pubsub.publisher",
+        "roles/pubsub.subscriber",
+        "roles/logging.logWriter",
+        "roles/monitoring.metricWriter",
+        "roles/cloudtrace.agent"
+      ])
+      
+      project = var.project_id
+      role    = each.value
+      member  = "serviceAccount:${google_service_account.sync_functions_sa.email}"
+      
+      depends_on = [google_service_account.sync_functions_sa]
+    }
+    
+    # Deploy data synchronization Cloud Function
+    resource "google_cloudfunctions_function" "sync_processor" {
+      name    = local.sync_function_name
+      project = var.project_id
+      region  = var.region
+      
+      # Function configuration
+      runtime          = "python39"
+      entry_point      = "sync_processor"
+      timeout          = 60
+      available_memory_mb = 256
+      max_instances    = 10
+      min_instances    = 0
+      
+      # Source code configuration
+      source_archive_bucket = google_storage_bucket.function_source.name
+      source_archive_object = google_storage_bucket_object.sync_function_source.name
+      
+      # Pub/Sub trigger configuration
+      event_trigger {
+        event_type = "google.pubsub.topic.publish"
+        resource   = google_pubsub_topic.data_sync_events.name
+        
+        failure_policy {
+          retry = true
+        }
+      }
+      
+      # Service account configuration
+      service_account_email = google_service_account.sync_functions_sa.email
+      
+      # Environment variables
+      environment_variables = {
+        PROJECT_ID            = var.project_id
+        TOPIC_NAME           = local.topic_name
+        DEAD_LETTER_TOPIC    = local.dlq_topic
+        FUNCTION_NAME        = local.sync_function_name
+        ENVIRONMENT          = var.environment
+        LOG_LEVEL            = var.log_level
+      }
+      
+      labels = merge(local.common_labels, {
+        function_type = "sync-processor"
+      })
+      
+      depends_on = [
+        google_project_service.required_apis,
+        google_storage_bucket_object.sync_function_source,
+        google_project_iam_member.sync_functions_permissions
+      ]
+    }
+    
+    # Deploy audit logging Cloud Function
+    resource "google_cloudfunctions_function" "audit_logger" {
+      name    = local.audit_function_name
+      project = var.project_id
+      region  = var.region
+      
+      # Function configuration
+      runtime          = "python39"
+      entry_point      = "audit_logger_func"
+      timeout          = 30
+      available_memory_mb = 128
+      max_instances    = 5
+      min_instances    = 0
+      
+      # Source code configuration
+      source_archive_bucket = google_storage_bucket.function_source.name
+      source_archive_object = google_storage_bucket_object.audit_function_source.name
+      
+      # Pub/Sub trigger configuration
+      event_trigger {
+        event_type = "google.pubsub.topic.publish"
+        resource   = google_pubsub_topic.data_sync_events.name
+        
+        failure_policy {
+          retry = true
+        }
+      }
+      
+      # Service account configuration
+      service_account_email = google_service_account.sync_functions_sa.email
+      
+      # Environment variables
+      environment_variables = {
+        PROJECT_ID     = var.project_id
+        FUNCTION_NAME  = local.audit_function_name
+        ENVIRONMENT    = var.environment
+        LOG_LEVEL      = var.log_level
+      }
+      
+      labels = merge(local.common_labels, {
+        function_type = "audit-logger"
+      })
+      
+      depends_on = [
+        google_project_service.required_apis,
+        google_storage_bucket_object.audit_function_source,
+        google_project_iam_member.sync_functions_permissions
+      ]
+    }
+    
+    # Create Cloud Monitoring dashboard
+    resource "google_monitoring_dashboard" "sync_system_dashboard" {
+      project        = var.project_id
+      dashboard_json = jsonencode({
+        displayName = "Datastore Sync System Monitoring"
+        mosaicLayout = {
+          tiles = [
+            {
+              width = 6
+              height = 4
+              widget = {
+                title = "Pub/Sub Message Rate"
+                xyChart = {
+                  dataSets = [
+                    {
+                      timeSeriesQuery = {
+                        timeSeriesFilter = {
+                          filter = "resource.type=\"pubsub_topic\" AND resource.labels.topic_id=\"${local.topic_name}\""
+                          aggregation = {
+                            alignmentPeriod = "60s"
+                            perSeriesAligner = "ALIGN_RATE"
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              width = 6
+              height = 4
+              xPos = 6
+              widget = {
+                title = "Function Execution Count"
+                xyChart = {
+                  dataSets = [
+                    {
+                      timeSeriesQuery = {
+                        timeSeriesFilter = {
+                          filter = "resource.type=\"cloud_function\" AND (resource.labels.function_name=\"${local.sync_function_name}\" OR resource.labels.function_name=\"${local.audit_function_name}\")"
+                          aggregation = {
+                            alignmentPeriod = "60s"
+                            perSeriesAligner = "ALIGN_RATE"
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              width = 6
+              height = 4
+              yPos = 4
+              widget = {
+                title = "Function Execution Duration"
+                xyChart = {
+                  dataSets = [
+                    {
+                      timeSeriesQuery = {
+                        timeSeriesFilter = {
+                          filter = "resource.type=\"cloud_function\" AND metric.type=\"cloudfunctions.googleapis.com/function/execution_time\""
+                          aggregation = {
+                            alignmentPeriod = "60s"
+                            perSeriesAligner = "ALIGN_MEAN"
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              width = 6
+              height = 4
+              xPos = 6
+              yPos = 4
+              widget = {
+                title = "Dead Letter Queue Messages"
+                xyChart = {
+                  dataSets = [
+                    {
+                      timeSeriesQuery = {
+                        timeSeriesFilter = {
+                          filter = "resource.type=\"pubsub_subscription\" AND resource.labels.subscription_id=\"${local.dlq_subscription}\""
+                          aggregation = {
+                            alignmentPeriod = "60s"
+                            perSeriesAligner = "ALIGN_MEAN"
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      })
+      
+      depends_on = [
+        google_project_service.required_apis,
+        google_cloudfunctions_function.sync_processor,
+        google_cloudfunctions_function.audit_logger
+      ]
+    }
+    
+    # Create alerting policies for system monitoring
+    resource "google_monitoring_alert_policy" "high_error_rate" {
+      display_name = "High Error Rate - Data Sync Functions"
+      project      = var.project_id
+      
+      conditions {
+        display_name = "High error rate in sync functions"
+        
+        condition_threshold {
+          filter         = "resource.type=\"cloud_function\" AND metric.type=\"cloudfunctions.googleapis.com/function/execution_count\" AND metric.labels.status!=\"ok\""
+          duration       = "300s"
+          comparison     = "COMPARISON_GT"
+          threshold_value = 5
+          
+          aggregations {
+            alignment_period   = "60s"
+            per_series_aligner = "ALIGN_RATE"
+          }
+        }
+      }
+      
+      notification_channels = var.notification_channels
+      
+      alert_strategy {
+        notification_rate_limit {
+          period = "300s"
+        }
+        
+        auto_close = "1800s"
+      }
+      
+      depends_on = [google_project_service.required_apis]
+    }
+    
+    # Create alerting policy for dead letter queue
+    resource "google_monitoring_alert_policy" "dead_letter_queue_messages" {
+      display_name = "Dead Letter Queue Has Messages"
+      project      = var.project_id
+      
+      conditions {
+        display_name = "Messages in dead letter queue"
+        
+        condition_threshold {
+          filter         = "resource.type=\"pubsub_subscription\" AND resource.labels.subscription_id=\"${local.dlq_subscription}\""
+          duration       = "300s"
+          comparison     = "COMPARISON_GT"
+          threshold_value = 0
+          
+          aggregations {
+            alignment_period   = "60s"
+            per_series_aligner = "ALIGN_MEAN"
+          }
+        }
+      }
+      
+      notification_channels = var.notification_channels
+      
+      alert_strategy {
+        notification_rate_limit {
+          period = "300s"
+        }
+        
+        auto_close = "1800s"
+      }
+      
+      depends_on = [google_project_service.required_apis]
+    }
+    
+    # Create Cloud Logging sink for audit logs
+    resource "google_logging_project_sink" "audit_logs_sink" {
+      name = "datastore-sync-audit-logs-${local.resource_suffix}"
+      
+      # Export to Cloud Storage for long-term retention
+      destination = "storage.googleapis.com/${google_storage_bucket.audit_logs.name}"
+      
+      # Filter for audit logs from our functions
+      filter = "resource.type=\"cloud_function\" AND (resource.labels.function_name=\"${local.sync_function_name}\" OR resource.labels.function_name=\"${local.audit_function_name}\") AND severity>=INFO"
+      
+      # Use a unique writer identity
+      unique_writer_identity = true
+      
+      depends_on = [google_project_service.required_apis]
+    }
+    
+    # Create storage bucket for audit logs
+    resource "google_storage_bucket" "audit_logs" {
+      name     = "datastore-sync-audit-logs-${local.resource_suffix}"
+      location = var.region
+      project  = var.project_id
+      
+      # Configure lifecycle for compliance
+      lifecycle_rule {
+        condition {
+          age = 2555 # 7 years for compliance
+        }
+        action {
+          type = "Delete"
+        }
+      }
+      
+      lifecycle_rule {
+        condition {
+          age = 30
+        }
+        action {
+          type          = "SetStorageClass"
+          storage_class = "NEARLINE"
+        }
+      }
+      
+      lifecycle_rule {
+        condition {
+          age = 365
+        }
+        action {
+          type          = "SetStorageClass"
+          storage_class = "COLDLINE"
+        }
+      }
+      
+      # Security configuration
+      uniform_bucket_level_access = true
+      
+      labels = merge(local.common_labels, {
+        component = "audit-logs"
+      })
+      
+      depends_on = [google_project_service.required_apis]
+    }
+    
+    # Grant logging sink permissions to write to audit logs bucket
+    resource "google_storage_bucket_iam_member" "audit_logs_sink_writer" {
+      bucket = google_storage_bucket.audit_logs.name
+      role   = "roles/storage.objectCreator"
+      member = google_logging_project_sink.audit_logs_sink.writer_identity
+      
+      depends_on = [google_logging_project_sink.audit_logs_sink]
+    }
+
+  variables.tf: |
+    # Infrastructure Manager Variables
+    # Event-Driven Data Synchronization System
+    
+    variable "project_id" {
+      description = "The Google Cloud project ID"
+      type        = string
+      
+      validation {
+        condition     = can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", var.project_id))
+        error_message = "Project ID must be 6-30 characters, start with a letter, and contain only lowercase letters, numbers, and hyphens."
+      }
+    }
+    
+    variable "region" {
+      description = "The Google Cloud region for resources"
+      type        = string
+      default     = "us-central1"
+      
+      validation {
+        condition = contains([
+          "us-central1", "us-east1", "us-east4", "us-west1", "us-west2", "us-west3", "us-west4",
+          "europe-west1", "europe-west2", "europe-west3", "europe-west4", "europe-west6",
+          "europe-north1", "europe-central2", "asia-east1", "asia-east2", "asia-northeast1",
+          "asia-northeast2", "asia-northeast3", "asia-south1", "asia-southeast1", "asia-southeast2"
+        ], var.region)
+        error_message = "Region must be a valid Google Cloud region."
+      }
+    }
+    
+    variable "zone" {
+      description = "The Google Cloud zone for resources"
+      type        = string
+      default     = "us-central1-a"
+      
+      validation {
+        condition     = can(regex("^[a-z]+-[a-z]+[0-9]+-[a-z]$", var.zone))
+        error_message = "Zone must be a valid Google Cloud zone."
+      }
+    }
+    
+    variable "environment" {
+      description = "Environment name (e.g., dev, staging, production)"
+      type        = string
+      default     = "dev"
+      
+      validation {
+        condition     = contains(["dev", "staging", "production", "test"], var.environment)
+        error_message = "Environment must be one of: dev, staging, production, test."
+      }
+    }
+    
+    variable "log_level" {
+      description = "Log level for Cloud Functions"
+      type        = string
+      default     = "INFO"
+      
+      validation {
+        condition     = contains(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], var.log_level)
+        error_message = "Log level must be one of: DEBUG, INFO, WARNING, ERROR, CRITICAL."
+      }
+    }
+    
+    variable "notification_channels" {
+      description = "List of notification channels for alerting"
+      type        = list(string)
+      default     = []
+      
+      validation {
+        condition     = length(var.notification_channels) <= 10
+        error_message = "Maximum of 10 notification channels allowed."
+      }
+    }
+    
+    variable "enable_apis" {
+      description = "Whether to enable required APIs"
+      type        = bool
+      default     = true
+    }
+    
+    variable "function_timeout" {
+      description = "Timeout for Cloud Functions in seconds"
+      type        = number
+      default     = 60
+      
+      validation {
+        condition     = var.function_timeout >= 1 && var.function_timeout <= 540
+        error_message = "Function timeout must be between 1 and 540 seconds."
+      }
+    }
+    
+    variable "sync_function_memory" {
+      description = "Memory allocation for sync function in MB"
+      type        = number
+      default     = 256
+      
+      validation {
+        condition     = contains([128, 256, 512, 1024, 2048, 4096, 8192], var.sync_function_memory)
+        error_message = "Memory must be one of: 128, 256, 512, 1024, 2048, 4096, 8192."
+      }
+    }
+    
+    variable "audit_function_memory" {
+      description = "Memory allocation for audit function in MB"
+      type        = number
+      default     = 128
+      
+      validation {
+        condition     = contains([128, 256, 512, 1024, 2048, 4096, 8192], var.audit_function_memory)
+        error_message = "Memory must be one of: 128, 256, 512, 1024, 2048, 4096, 8192."
+      }
+    }
+    
+    variable "max_instances" {
+      description = "Maximum number of function instances"
+      type        = number
+      default     = 10
+      
+      validation {
+        condition     = var.max_instances >= 1 && var.max_instances <= 1000
+        error_message = "Max instances must be between 1 and 1000."
+      }
+    }
+    
+    variable "message_retention_days" {
+      description = "Message retention period in days"
+      type        = number
+      default     = 7
+      
+      validation {
+        condition     = var.message_retention_days >= 1 && var.message_retention_days <= 30
+        error_message = "Message retention must be between 1 and 30 days."
+      }
+    }
+    
+    variable "dead_letter_retention_days" {
+      description = "Dead letter queue retention period in days"
+      type        = number
+      default     = 30
+      
+      validation {
+        condition     = var.dead_letter_retention_days >= 1 && var.dead_letter_retention_days <= 365
+        error_message = "Dead letter retention must be between 1 and 365 days."
+      }
+    }
+    
+    variable "max_delivery_attempts" {
+      description = "Maximum delivery attempts before sending to dead letter queue"
+      type        = number
+      default     = 5
+      
+      validation {
+        condition     = var.max_delivery_attempts >= 1 && var.max_delivery_attempts <= 100
+        error_message = "Max delivery attempts must be between 1 and 100."
+      }
+    }
+    
+    variable "enable_monitoring" {
+      description = "Whether to enable Cloud Monitoring dashboard and alerts"
+      type        = bool
+      default     = true
+    }
+    
+    variable "enable_audit_logging" {
+      description = "Whether to enable audit logging to Cloud Storage"
+      type        = bool
+      default     = true
+    }
+    
+    variable "audit_log_retention_years" {
+      description = "Audit log retention period in years"
+      type        = number
+      default     = 7
+      
+      validation {
+        condition     = var.audit_log_retention_years >= 1 && var.audit_log_retention_years <= 10
+        error_message = "Audit log retention must be between 1 and 10 years."
+      }
+    }
+    
+    variable "additional_labels" {
+      description = "Additional labels to apply to all resources"
+      type        = map(string)
+      default     = {}
+      
+      validation {
+        condition     = length(var.additional_labels) <= 10
+        error_message = "Maximum of 10 additional labels allowed."
+      }
+    }
+
+  outputs.tf: |
+    # Infrastructure Manager Outputs
+    # Event-Driven Data Synchronization System
+    
+    output "project_id" {
+      description = "The Google Cloud project ID"
+      value       = var.project_id
+    }
+    
+    output "region" {
+      description = "The Google Cloud region"
+      value       = var.region
+    }
+    
+    output "resource_suffix" {
+      description = "The random suffix used for resource names"
+      value       = local.resource_suffix
+    }
+    
+    # Pub/Sub Resources
+    output "pubsub_topic_name" {
+      description = "Name of the main Pub/Sub topic"
+      value       = google_pubsub_topic.data_sync_events.name
+    }
+    
+    output "pubsub_topic_id" {
+      description = "ID of the main Pub/Sub topic"
+      value       = google_pubsub_topic.data_sync_events.id
+    }
+    
+    output "sync_subscription_name" {
+      description = "Name of the sync processor subscription"
+      value       = google_pubsub_subscription.sync_processor.name
+    }
+    
+    output "audit_subscription_name" {
+      description = "Name of the audit logger subscription"
+      value       = google_pubsub_subscription.audit_logger.name
+    }
+    
+    output "dead_letter_topic_name" {
+      description = "Name of the dead letter topic"
+      value       = google_pubsub_topic.dead_letter_topic.name
+    }
+    
+    output "dead_letter_subscription_name" {
+      description = "Name of the dead letter subscription"
+      value       = google_pubsub_subscription.dead_letter_processor.name
+    }
+    
+    # Cloud Functions
+    output "sync_function_name" {
+      description = "Name of the sync processor function"
+      value       = google_cloudfunctions_function.sync_processor.name
+    }
+    
+    output "sync_function_url" {
+      description = "URL of the sync processor function"
+      value       = google_cloudfunctions_function.sync_processor.https_trigger_url
+    }
+    
+    output "audit_function_name" {
+      description = "Name of the audit logger function"
+      value       = google_cloudfunctions_function.audit_logger.name
+    }
+    
+    output "audit_function_url" {
+      description = "URL of the audit logger function"
+      value       = google_cloudfunctions_function.audit_logger.https_trigger_url
+    }
+    
+    # Service Account
+    output "service_account_email" {
+      description = "Email of the service account used by Cloud Functions"
+      value       = google_service_account.sync_functions_sa.email
+    }
+    
+    output "service_account_name" {
+      description = "Name of the service account used by Cloud Functions"
+      value       = google_service_account.sync_functions_sa.name
+    }
+    
+    # Storage
+    output "function_source_bucket" {
+      description = "Name of the bucket containing function source code"
+      value       = google_storage_bucket.function_source.name
+    }
+    
+    output "audit_logs_bucket" {
+      description = "Name of the bucket for audit logs"
+      value       = google_storage_bucket.audit_logs.name
+    }
+    
+    # Monitoring
+    output "monitoring_dashboard_url" {
+      description = "URL of the Cloud Monitoring dashboard"
+      value       = "https://console.cloud.google.com/monitoring/dashboards/custom/${google_monitoring_dashboard.sync_system_dashboard.id}?project=${var.project_id}"
+    }
+    
+    output "high_error_rate_alert_policy" {
+      description = "Name of the high error rate alert policy"
+      value       = google_monitoring_alert_policy.high_error_rate.name
+    }
+    
+    output "dead_letter_alert_policy" {
+      description = "Name of the dead letter queue alert policy"
+      value       = google_monitoring_alert_policy.dead_letter_queue_messages.name
+    }
+    
+    # Logging
+    output "audit_logs_sink_name" {
+      description = "Name of the audit logs sink"
+      value       = google_logging_project_sink.audit_logs_sink.name
+    }
+    
+    output "audit_logs_sink_writer_identity" {
+      description = "Writer identity of the audit logs sink"
+      value       = google_logging_project_sink.audit_logs_sink.writer_identity
+    }
+    
+    # Configuration
+    output "environment" {
+      description = "Environment name"
+      value       = var.environment
+    }
+    
+    output "common_labels" {
+      description = "Common labels applied to all resources"
+      value       = local.common_labels
+    }
+    
+    # Testing and Validation
+    output "test_commands" {
+      description = "Commands to test the deployed infrastructure"
+      value = {
+        "publish_test_event" = "gcloud pubsub topics publish ${google_pubsub_topic.data_sync_events.name} --message='{\"entity_id\":\"test-001\",\"operation\":\"create\",\"data\":{\"name\":\"Test Entity\",\"status\":\"active\"}}'"
+        "check_functions" = "gcloud functions list --region=${var.region} --filter='name:(${google_cloudfunctions_function.sync_processor.name} OR ${google_cloudfunctions_function.audit_logger.name})'"
+        "view_logs" = "gcloud logging read 'resource.type=\"cloud_function\" AND (resource.labels.function_name=\"${google_cloudfunctions_function.sync_processor.name}\" OR resource.labels.function_name=\"${google_cloudfunctions_function.audit_logger.name}\")' --limit=50"
+        "check_subscriptions" = "gcloud pubsub subscriptions list --filter='name:(${google_pubsub_subscription.sync_processor.name} OR ${google_pubsub_subscription.audit_logger.name})'"
+      }
+    }
+    
+    # Cleanup Commands
+    output "cleanup_commands" {
+      description = "Commands to clean up the deployed infrastructure"
+      value = {
+        "delete_functions" = "gcloud functions delete ${google_cloudfunctions_function.sync_processor.name} --region=${var.region} --quiet && gcloud functions delete ${google_cloudfunctions_function.audit_logger.name} --region=${var.region} --quiet"
+        "delete_subscriptions" = "gcloud pubsub subscriptions delete ${google_pubsub_subscription.sync_processor.name} --quiet && gcloud pubsub subscriptions delete ${google_pubsub_subscription.audit_logger.name} --quiet && gcloud pubsub subscriptions delete ${google_pubsub_subscription.dead_letter_processor.name} --quiet"
+        "delete_topics" = "gcloud pubsub topics delete ${google_pubsub_topic.data_sync_events.name} --quiet && gcloud pubsub topics delete ${google_pubsub_topic.dead_letter_topic.name} --quiet"
+        "delete_buckets" = "gsutil -m rm -r gs://${google_storage_bucket.function_source.name} && gsutil -m rm -r gs://${google_storage_bucket.audit_logs.name}"
+      }
+    }
+    
+    # Documentation
+    output "documentation" {
+      description = "Links to relevant documentation"
+      value = {
+        "cloud_functions" = "https://cloud.google.com/functions/docs"
+        "pubsub" = "https://cloud.google.com/pubsub/docs"
+        "datastore" = "https://cloud.google.com/datastore/docs"
+        "monitoring" = "https://cloud.google.com/monitoring/docs"
+        "logging" = "https://cloud.google.com/logging/docs"
+        "infrastructure_manager" = "https://cloud.google.com/infrastructure-manager/docs"
+      }
+    }
+
+  sync_function.py.tpl: |
+    # Cloud Function for Data Synchronization Processing
+    # This function handles data synchronization events with conflict resolution
+    
+    import base64
+    import json
+    import logging
+    import os
+    from datetime import datetime
+    from google.cloud import datastore
+    from google.cloud import pubsub_v1
+    import functions_framework
+    
+    # Initialize clients
+    project_id = os.environ.get('PROJECT_ID')
+    datastore_client = datastore.Client(project=project_id)
+    publisher = pubsub_v1.PublisherClient()
+    
+    # Configure logging
+    logging.basicConfig(level=os.environ.get('LOG_LEVEL', 'INFO'))
+    logger = logging.getLogger(__name__)
+    
+    @functions_framework.cloud_event
+    def sync_processor(cloud_event):
+        """Process data synchronization events with conflict resolution."""
+        
+        try:
+            # Decode Pub/Sub message
+            message_data = base64.b64decode(cloud_event.data["message"]["data"])
+            event_data = json.loads(message_data.decode('utf-8'))
+            
+            logger.info(f"Processing sync event: {event_data}")
+            
+            # Extract event information
+            entity_id = event_data.get('entity_id')
+            operation = event_data.get('operation')  # create, update, delete
+            data = event_data.get('data', {})
+            timestamp = event_data.get('timestamp')
+            correlation_id = event_data.get('correlation_id')
+            
+            # Validate required fields
+            if not entity_id or not operation:
+                logger.error(f"Missing required fields: entity_id={entity_id}, operation={operation}")
+                raise ValueError("Missing required fields in event data")
+            
+            # Process based on operation type
+            if operation in ['create', 'update']:
+                result = handle_data_operation(entity_id, operation, data, timestamp, correlation_id)
+                
+                # Publish success event for external systems
+                if result['success']:
+                    publish_external_sync_event(entity_id, operation, result['data'], correlation_id)
+                    
+            elif operation == 'delete':
+                result = handle_delete_operation(entity_id, timestamp, correlation_id)
+                
+                # Publish deletion event for external systems
+                if result['success']:
+                    publish_external_sync_event(entity_id, operation, {}, correlation_id)
+            else:
+                logger.error(f"Unknown operation: {operation}")
+                raise ValueError(f"Unknown operation: {operation}")
+            
+            logger.info(f"Sync operation completed successfully: {result}")
+            
+        except Exception as e:
+            logger.error(f"Sync processing failed: {str(e)}", exc_info=True)
+            
+            # Publish failure event for monitoring
+            publish_failure_event(cloud_event.data, str(e))
+            
+            # Re-raise to trigger retry mechanism
+            raise
+    
+    def handle_data_operation(entity_id, operation, data, timestamp, correlation_id):
+        """Handle create/update operations with conflict resolution."""
+        
+        key = datastore_client.key('SyncEntity', entity_id)
+        
+        with datastore_client.transaction():
+            # Get existing entity for conflict detection
+            existing_entity = datastore_client.get(key)
+            
+            if existing_entity and operation == 'update':
+                # Check for conflicts using timestamp
+                existing_timestamp = existing_entity.get('last_modified')
+                if existing_timestamp and existing_timestamp > timestamp:
+                    # Conflict detected - apply resolution strategy
+                    logger.warning(f"Conflict detected for entity {entity_id}")
+                    return resolve_conflict(existing_entity, data, timestamp, correlation_id)
+            
+            # Create or update entity
+            entity = existing_entity or datastore.Entity(key=key)
+            entity.update(data)
+            entity['last_modified'] = timestamp
+            entity['sync_status'] = 'synced'
+            entity['version'] = entity.get('version', 0) + 1
+            entity['correlation_id'] = correlation_id
+            entity['processed_at'] = datetime.utcnow().isoformat()
+            
+            datastore_client.put(entity)
+            
+            logger.info(f"Entity {operation} successful: {entity_id}")
+            
+            return {
+                'success': True,
+                'data': dict(entity),
+                'conflict_resolved': False,
+                'operation': operation
+            }
+    
+    def resolve_conflict(existing_entity, new_data, timestamp, correlation_id):
+        """Implement conflict resolution strategy."""
+        
+        # Strategy: Merge non-conflicting fields, keep latest for conflicts
+        resolved_data = dict(existing_entity)
+        
+        # Merge new data with conflict resolution rules
+        for key, value in new_data.items():
+            if key not in resolved_data or key in ['description', 'metadata', 'tags']:
+                # Non-conflicting fields or fields that can be safely merged
+                resolved_data[key] = value
+            elif key in ['status', 'priority']:
+                # Fields where latest wins
+                resolved_data[key] = value
+        
+        # Update metadata fields
+        resolved_data['last_modified'] = max(existing_entity.get('last_modified', timestamp), timestamp)
+        resolved_data['conflict_resolved'] = True
+        resolved_data['conflict_timestamp'] = datetime.utcnow().isoformat()
+        resolved_data['version'] = existing_entity.get('version', 0) + 1
+        resolved_data['correlation_id'] = correlation_id
+        
+        # Save resolved entity
+        entity = datastore.Entity(existing_entity.key, **resolved_data)
+        datastore_client.put(entity)
+        
+        logger.info(f"Conflict resolved for entity {existing_entity.key.name}")
+        
+        return {
+            'success': True,
+            'data': resolved_data,
+            'conflict_resolved': True,
+            'operation': 'update'
+        }
+    
+    def handle_delete_operation(entity_id, timestamp, correlation_id):
+        """Handle delete operations with soft delete option."""
+        
+        key = datastore_client.key('SyncEntity', entity_id)
+        
+        with datastore_client.transaction():
+            entity = datastore_client.get(key)
+            
+            if entity:
+                # Implement soft delete by marking as deleted
+                entity['deleted'] = True
+                entity['deleted_at'] = timestamp
+                entity['sync_status'] = 'deleted'
+                entity['version'] = entity.get('version', 0) + 1
+                entity['correlation_id'] = correlation_id
+                entity['processed_at'] = datetime.utcnow().isoformat()
+                
+                datastore_client.put(entity)
+                
+                logger.info(f"Entity soft deleted: {entity_id}")
+            else:
+                logger.warning(f"Entity not found for deletion: {entity_id}")
+        
+        return {
+            'success': True,
+            'operation': 'delete',
+            'entity_id': entity_id
+        }
+    
+    def publish_external_sync_event(entity_id, operation, data, correlation_id):
+        """Publish events for external system synchronization."""
+        
+        try:
+            # Create external sync topic name
+            external_topic = f"external-sync-{operation}"
+            topic_path = publisher.topic_path(project_id, external_topic)
+            
+            message_data = json.dumps({
+                'entity_id': entity_id,
+                'operation': operation,
+                'data': data,
+                'source': 'datastore-sync',
+                'timestamp': datetime.utcnow().isoformat(),
+                'correlation_id': correlation_id
+            }).encode('utf-8')
+            
+            # Publish with retry
+            future = publisher.publish(topic_path, message_data)
+            message_id = future.result(timeout=30)
+            
+            logger.info(f"Published external sync event: {message_id}")
+            
+        except Exception as e:
+            logger.warning(f"Failed to publish external sync event: {str(e)}")
+            # Don't fail the main operation for external sync failures
+    
+    def publish_failure_event(original_message, error_message):
+        """Publish failure events for monitoring and alerting."""
+        
+        try:
+            failure_topic = "${topic_name}-failures"
+            topic_path = publisher.topic_path(project_id, failure_topic)
+            
+            failure_data = {
+                'original_message': original_message,
+                'error_message': error_message,
+                'timestamp': datetime.utcnow().isoformat(),
+                'function_name': os.environ.get('FUNCTION_NAME'),
+                'severity': 'ERROR'
+            }
+            
+            message_data = json.dumps(failure_data).encode('utf-8')
+            
+            # Publish failure event
+            future = publisher.publish(topic_path, message_data)
+            message_id = future.result(timeout=30)
+            
+            logger.info(f"Published failure event: {message_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to publish failure event: {str(e)}")
+
+  sync_requirements.txt: |
+    google-cloud-datastore==2.19.0
+    google-cloud-pubsub==2.18.4
+    functions-framework==3.5.0
+
+  audit_function.py: |
+    # Cloud Function for Audit Logging
+    # This function logs all synchronization events for audit and compliance
+    
+    import base64
+    import json
+    import logging
+    import os
+    from datetime import datetime
+    from google.cloud import logging as cloud_logging
+    import functions_framework
+    
+    # Initialize Cloud Logging client
+    project_id = os.environ.get('PROJECT_ID')
+    logging_client = cloud_logging.Client(project=project_id)
+    audit_logger = logging_client.logger('datastore-sync-audit')
+    
+    # Configure standard logging
+    logging.basicConfig(level=os.environ.get('LOG_LEVEL', 'INFO'))
+    logger = logging.getLogger(__name__)
+    
+    @functions_framework.cloud_event
+    def audit_logger_func(cloud_event):
+        """Log all synchronization events for audit and compliance."""
+        
+        try:
+            # Decode Pub/Sub message
+            message_data = base64.b64decode(cloud_event.data["message"]["data"])
+            event_data = json.loads(message_data.decode('utf-8'))
+            
+            logger.info(f"Processing audit event: {event_data.get('entity_id', 'unknown')}")
+            
+            # Create comprehensive audit log entry
+            audit_entry = {
+                'timestamp': datetime.utcnow().isoformat(),
+                'event_type': 'data_synchronization',
+                'entity_id': event_data.get('entity_id'),
+                'operation': event_data.get('operation'),
+                'source_system': event_data.get('source', 'unknown'),
+                'correlation_id': event_data.get('correlation_id'),
+                'message_id': cloud_event.data["message"]["messageId"],
+                'data_snapshot': event_data.get('data', {}),
+                'processing_metadata': {
+                    'function_name': os.environ.get('FUNCTION_NAME'),
+                    'subscription': cloud_event.source,
+                    'delivery_attempt': cloud_event.data["message"].get("deliveryAttempt", 1),
+                    'publish_time': cloud_event.data["message"].get("publishTime"),
+                    'environment': os.environ.get('ENVIRONMENT', 'unknown')
+                }
+            }
+            
+            # Log to Cloud Logging with structured data
+            audit_logger.log_struct(
+                audit_entry,
+                severity='INFO',
+                labels={
+                    'component': 'datastore-sync',
+                    'operation': event_data.get('operation', 'unknown'),
+                    'entity_type': 'sync_entity',
+                    'environment': os.environ.get('ENVIRONMENT', 'unknown')
+                }
+            )
+            
+            logger.info(f"Audit log created for entity: {event_data.get('entity_id')}")
+            
+            # Additional compliance logging for sensitive operations
+            if event_data.get('operation') == 'delete':
+                create_compliance_log(event_data, audit_entry)
+            
+            # Log data access for compliance
+            if event_data.get('operation') in ['create', 'update']:
+                log_data_access(event_data, audit_entry)
+            
+        except Exception as e:
+            logger.error(f"Audit logging failed: {str(e)}", exc_info=True)
+            
+            # Create error audit log
+            create_error_audit_log(cloud_event.data, str(e))
+            
+            # Don't re-raise to avoid infinite retry loops
+    
+    def create_compliance_log(event_data, audit_entry):
+        """Create specialized compliance logs for data deletion."""
+        
+        compliance_entry = {
+            'compliance_event': 'data_deletion',
+            'entity_id': event_data.get('entity_id'),
+            'deletion_timestamp': datetime.utcnow().isoformat(),
+            'retention_policy': 'applied',
+            'regulatory_context': 'gdpr_compliance',
+            'data_classification': event_data.get('data', {}).get('classification', 'standard'),
+            'deletion_reason': event_data.get('data', {}).get('deletion_reason', 'user_request'),
+            'correlation_id': event_data.get('correlation_id')
+        }
+        
+        audit_logger.log_struct(
+            compliance_entry,
+            severity='NOTICE',
+            labels={
+                'compliance': 'data_deletion',
+                'regulation': 'gdpr',
+                'component': 'datastore-sync'
+            }
+        )
+        
+        logger.info(f"Compliance log created for deletion: {event_data.get('entity_id')}")
+    
+    def log_data_access(event_data, audit_entry):
+        """Log data access patterns for compliance monitoring."""
+        
+        access_entry = {
+            'access_event': 'data_modification',
+            'entity_id': event_data.get('entity_id'),
+            'access_timestamp': datetime.utcnow().isoformat(),
+            'operation_type': event_data.get('operation'),
+            'data_fields_accessed': list(event_data.get('data', {}).keys()),
+            'source_system': event_data.get('source', 'unknown'),
+            'correlation_id': event_data.get('correlation_id'),
+            'access_pattern': determine_access_pattern(event_data)
+        }
+        
+        audit_logger.log_struct(
+            access_entry,
+            severity='INFO',
+            labels={
+                'access_type': 'data_modification',
+                'component': 'datastore-sync',
+                'operation': event_data.get('operation', 'unknown')
+            }
+        )
+    
+    def determine_access_pattern(event_data):
+        """Determine the type of data access pattern."""
+        
+        data = event_data.get('data', {})
+        
+        if 'sensitive' in str(data).lower():
+            return 'sensitive_data_access'
+        elif event_data.get('operation') == 'create':
+            return 'new_data_creation'
+        elif event_data.get('operation') == 'update':
+            return 'existing_data_modification'
+        else:
+            return 'standard_access'
+    
+    def create_error_audit_log(original_message, error_message):
+        """Create audit log for processing errors."""
+        
+        error_entry = {
+            'error_event': 'audit_processing_failed',
+            'timestamp': datetime.utcnow().isoformat(),
+            'error_message': error_message,
+            'original_message': original_message,
+            'function_name': os.environ.get('FUNCTION_NAME'),
+            'severity': 'ERROR'
+        }
+        
+        try:
+            audit_logger.log_struct(
+                error_entry,
+                severity='ERROR',
+                labels={
+                    'error_type': 'audit_processing_failure',
+                    'component': 'datastore-sync'
+                }
+            )
+        except Exception as e:
+            logger.error(f"Failed to create error audit log: {str(e)}")
+
+  audit_requirements.txt: |
+    google-cloud-logging==3.8.0
+    functions-framework==3.5.0
+
+  terraform.tfvars.example: |
+    # Example Terraform Variables File
+    # Copy this file to terraform.tfvars and customize for your environment
+    
+    # Required Variables
+    project_id = "your-project-id"
+    region     = "us-central1"
+    zone       = "us-central1-a"
+    
+    # Environment Configuration
+    environment = "dev"
+    log_level   = "INFO"
+    
+    # Notification Channels (optional)
+    # Get these from: gcloud alpha monitoring channels list
+    notification_channels = [
+      # "projects/your-project-id/notificationChannels/123456789"
+    ]
+    
+    # Function Configuration
+    function_timeout      = 60
+    sync_function_memory  = 256
+    audit_function_memory = 128
+    max_instances        = 10
+    
+    # Message Retention
+    message_retention_days      = 7
+    dead_letter_retention_days = 30
+    max_delivery_attempts      = 5
+    
+    # Feature Flags
+    enable_apis           = true
+    enable_monitoring     = true
+    enable_audit_logging  = true
+    
+    # Audit Configuration
+    audit_log_retention_years = 7
+    
+    # Additional Labels
+    additional_labels = {
+      "cost_center" = "engineering"
+      "team"        = "platform"
+    }

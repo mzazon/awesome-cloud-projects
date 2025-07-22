@@ -1,0 +1,669 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Real-time Anomaly Detection with Kinesis Data Analytics - Complete infrastructure for detecting anomalies in streaming transaction data using Managed Service for Apache Flink'
+
+# Template Parameters for customization
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'anomaly-detection'
+    Description: 'Name prefix for all resources'
+    AllowedPattern: '[a-z0-9-]+'
+    MinLength: 3
+    MaxLength: 20
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    Description: 'Environment name (dev, test, prod)'
+    AllowedValues: ['dev', 'test', 'prod']
+
+  KinesisShardCount:
+    Type: Number
+    Default: 2
+    Description: 'Number of shards for Kinesis Data Stream'
+    MinValue: 1
+    MaxValue: 10
+
+  FlinkParallelism:
+    Type: Number
+    Default: 2
+    Description: 'Parallelism level for Flink application'
+    MinValue: 1
+    MaxValue: 8
+
+  ApplicationCodeS3Key:
+    Type: String
+    Default: 'applications/anomaly-detection-1.0-SNAPSHOT.jar'
+    Description: 'S3 key for Flink application JAR file'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for anomaly alerts'
+    AllowedPattern: '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+
+  RetentionPeriodHours:
+    Type: Number
+    Default: 24
+    Description: 'Data retention period in hours for Kinesis stream'
+    MinValue: 24
+    MaxValue: 8760
+
+# Conditions for conditional resource creation
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  EnableExtendedMonitoring: !Or [!Equals [!Ref Environment, 'prod'], !Equals [!Ref Environment, 'test']]
+
+# Resources section - all infrastructure components
+Resources:
+  # S3 Bucket for application artifacts and data storage
+  DataStorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-data-${Environment}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: ArchiveOldData
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-data-bucket-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Data storage and application artifacts'
+
+  # Kinesis Data Stream for transaction ingestion
+  TransactionStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${ProjectName}-transaction-stream-${Environment}'
+      ShardCount: !Ref KinesisShardCount
+      RetentionPeriodHours: !Ref RetentionPeriodHours
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-transaction-stream-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Transaction data ingestion'
+
+  # IAM Role for Managed Service for Apache Flink
+  FlinkExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-flink-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: kinesisanalytics.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: FlinkKinesisPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Kinesis Data Stream permissions
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                  - kinesis:DescribeStreamSummary
+                Resource: !GetAtt TransactionStream.Arn
+              # CloudWatch metrics permissions
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              # S3 permissions for application code and checkpoints
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${DataStorageBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt DataStorageBucket.Arn
+              # CloudWatch Logs permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-flink-execution-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Managed Service for Apache Flink Application
+  FlinkApplication:
+    Type: AWS::KinesisAnalyticsV2::Application
+    Properties:
+      ApplicationName: !Sub '${ProjectName}-anomaly-detector-${Environment}'
+      ApplicationDescription: 'Real-time anomaly detection for transaction data using Apache Flink'
+      RuntimeEnvironment: FLINK-1_17
+      ServiceExecutionRole: !GetAtt FlinkExecutionRole.Arn
+      ApplicationConfiguration:
+        ApplicationCodeConfiguration:
+          CodeContent:
+            S3ContentLocation:
+              BucketARN: !GetAtt DataStorageBucket.Arn
+              FileKey: !Ref ApplicationCodeS3Key
+          CodeContentType: ZIPFILE
+        EnvironmentProperties:
+          PropertyGroups:
+            - PropertyGroupId: 'kinesis.analytics.flink.run.options'
+              PropertyMap:
+                'python.fn-execution.bundle.size': '1000'
+                'python.fn-execution.bundle.time': '1000'
+        FlinkApplicationConfiguration:
+          CheckpointConfiguration:
+            ConfigurationType: CUSTOM
+            CheckpointingEnabled: true
+            CheckpointInterval: 60000
+            MinPauseBetweenCheckpoints: 5000
+          MonitoringConfiguration:
+            ConfigurationType: CUSTOM
+            LogLevel: !If [EnableExtendedMonitoring, 'DEBUG', 'INFO']
+            MetricsLevel: APPLICATION
+          ParallelismConfiguration:
+            ConfigurationType: CUSTOM
+            Parallelism: !Ref FlinkParallelism
+            ParallelismPerKPU: 1
+            AutoScalingEnabled: !If [IsProduction, true, false]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-anomaly-detector-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Real-time anomaly detection'
+
+  # SNS Topic for anomaly alerts
+  AnomalyAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-anomaly-alerts-${Environment}'
+      DisplayName: 'Transaction Anomaly Alerts'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-anomaly-alerts-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Anomaly alert notifications'
+
+  # SNS Topic Policy for secure access
+  AnomalyAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref AnomalyAlertsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudWatchAlarmsToPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AnomalyAlertsTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+
+  # Email subscription for alerts
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AnomalyAlertsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # IAM Role for Lambda anomaly processor
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AnomalyProcessorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CloudWatch metrics permissions
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              # SNS publishing permissions
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AnomalyAlertsTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda function for anomaly processing
+  AnomalyProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-anomaly-processor-${Environment}'
+      Description: 'Processes anomaly notifications and sends alerts'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref AnomalyAlertsTopic
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          import logging
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """Process anomaly notifications and send alerts"""
+              try:
+                  # Initialize AWS clients
+                  cloudwatch = boto3.client('cloudwatch')
+                  sns = boto3.client('sns')
+                  
+                  # Get environment variables
+                  sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+                  environment = os.environ.get('ENVIRONMENT', 'dev')
+                  project_name = os.environ.get('PROJECT_NAME', 'anomaly-detection')
+                  
+                  # Process each record in the event
+                  for record in event.get('Records', []):
+                      # Handle different event sources
+                      if 'body' in record:
+                          message = record['body']
+                      elif 'Sns' in record:
+                          message = record['Sns']['Message']
+                      else:
+                          message = json.dumps(record)
+                      
+                      # Check if this is an anomaly notification
+                      if 'ANOMALY DETECTED' in message or 'anomaly' in message.lower():
+                          # Send custom metric to CloudWatch
+                          cloudwatch.put_metric_data(
+                              Namespace=f'{project_name}/AnomalyDetection',
+                              MetricData=[
+                                  {
+                                      'MetricName': 'AnomalyCount',
+                                      'Value': 1,
+                                      'Unit': 'Count',
+                                      'Timestamp': datetime.utcnow(),
+                                      'Dimensions': [
+                                          {
+                                              'Name': 'Environment',
+                                              'Value': environment
+                                          }
+                                      ]
+                                  }
+                              ]
+                          )
+                          
+                          # Enrich the alert message
+                          enriched_message = f"""
+          TRANSACTION ANOMALY ALERT
+          
+          Environment: {environment}
+          Timestamp: {datetime.utcnow().isoformat()}
+          
+          Details:
+          {message}
+          
+          Please investigate this anomaly immediately.
+          """
+                          
+                          # Send notification via SNS
+                          sns.publish(
+                              TopicArn=sns_topic_arn,
+                              Message=enriched_message,
+                              Subject=f'[{environment.upper()}] Transaction Anomaly Alert - {project_name}'
+                          )
+                          
+                          logger.info(f"Anomaly processed and alert sent: {message}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Anomalies processed successfully')
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing anomaly: {str(e)}")
+                  raise e
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-anomaly-processor-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Anomaly alert processing'
+
+  # CloudWatch Log Group for S3 access logs
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-access-logs-${Environment}'
+      RetentionInDays: !If [IsProduction, 90, 30]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-s3-access-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group for Flink application
+  FlinkLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/kinesis-analytics/${ProjectName}-anomaly-detector-${Environment}'
+      RetentionInDays: !If [IsProduction, 90, 30]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-flink-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Anomaly Detector for monitoring
+  AnomalyCountDetector:
+    Type: AWS::CloudWatch::AnomalyDetector
+    Properties:
+      MetricName: AnomalyCount
+      Namespace: !Sub '${ProjectName}/AnomalyDetection'
+      Stat: Sum
+      Dimensions:
+        - Name: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarm for anomaly detection
+  AnomalyDetectionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-anomaly-detection-alarm-${Environment}'
+      AlarmDescription: 'Alarm triggered when anomalies are detected in transaction data'
+      MetricName: AnomalyCount
+      Namespace: !Sub '${ProjectName}/AnomalyDetection'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AnomalyAlertsTopic
+      OKActions:
+        - !Ref AnomalyAlertsTopic
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: Environment
+          Value: !Ref Environment
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-anomaly-detection-alarm-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Additional CloudWatch Alarms for system monitoring
+  KinesisStreamAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableExtendedMonitoring
+    Properties:
+      AlarmName: !Sub '${ProjectName}-kinesis-stream-errors-${Environment}'
+      AlarmDescription: 'Alarm for Kinesis stream errors'
+      MetricName: UserRecordsPending
+      Namespace: AWS/Kinesis
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AnomalyAlertsTopic
+      Dimensions:
+        - Name: StreamName
+          Value: !Ref TransactionStream
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-kinesis-stream-errors-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Kinesis Data Firehose for data archival (optional)
+  DataArchiveDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Condition: IsProduction
+    Properties:
+      DeliveryStreamName: !Sub '${ProjectName}-data-archive-${Environment}'
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt TransactionStream.Arn
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+      S3DestinationConfiguration:
+        BucketARN: !GetAtt DataStorageBucket.Arn
+        Prefix: 'transaction-data/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/'
+        ErrorOutputPrefix: 'errors/'
+        BufferingHints:
+          SizeInMBs: 64
+          IntervalInSeconds: 300
+        CompressionFormat: GZIP
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref FirehoseLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-data-archive-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for Kinesis Data Firehose
+  FirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Condition: IsProduction
+    Properties:
+      RoleName: !Sub '${ProjectName}-firehose-delivery-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehoseDeliveryPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Kinesis stream permissions
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                Resource: !GetAtt TransactionStream.Arn
+              # S3 permissions
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt DataStorageBucket.Arn
+                  - !Sub '${DataStorageBucket.Arn}/*'
+              # CloudWatch Logs permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-firehose-delivery-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group for Firehose
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: IsProduction
+    Properties:
+      LogGroupName: !Sub '/aws/kinesisfirehose/${ProjectName}-data-archive-${Environment}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-firehose-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+# Outputs section - important values for integration and verification
+Outputs:
+  KinesisStreamName:
+    Description: 'Name of the Kinesis Data Stream for transaction ingestion'
+    Value: !Ref TransactionStream
+    Export:
+      Name: !Sub '${AWS::StackName}-kinesis-stream-name'
+
+  KinesisStreamArn:
+    Description: 'ARN of the Kinesis Data Stream'
+    Value: !GetAtt TransactionStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-kinesis-stream-arn'
+
+  FlinkApplicationName:
+    Description: 'Name of the Managed Service for Apache Flink application'
+    Value: !Ref FlinkApplication
+    Export:
+      Name: !Sub '${AWS::StackName}-flink-application-name'
+
+  FlinkApplicationArn:
+    Description: 'ARN of the Flink application'
+    Value: !Sub 'arn:aws:kinesisanalytics:${AWS::Region}:${AWS::AccountId}:application/${FlinkApplication}'
+    Export:
+      Name: !Sub '${AWS::StackName}-flink-application-arn'
+
+  S3BucketName:
+    Description: 'Name of the S3 bucket for data storage'
+    Value: !Ref DataStorageBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-s3-bucket-name'
+
+  S3BucketArn:
+    Description: 'ARN of the S3 bucket'
+    Value: !GetAtt DataStorageBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-s3-bucket-arn'
+
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for anomaly alerts'
+    Value: !Ref AnomalyAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-sns-topic-arn'
+
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function for anomaly processing'
+    Value: !Ref AnomalyProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-lambda-function-name'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function'
+    Value: !GetAtt AnomalyProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-lambda-function-arn'
+
+  CloudWatchDashboardUrl:
+    Description: 'URL to view CloudWatch metrics dashboard'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}'
+
+  FlinkApplicationConsoleUrl:
+    Description: 'URL to view the Flink application in AWS Console'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/kinesisanalytics/home?region=${AWS::Region}#/wizard/editor?applicationName=${FlinkApplication}'
+
+  KinesisStreamConsoleUrl:
+    Description: 'URL to view the Kinesis stream in AWS Console'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/kinesis/home?region=${AWS::Region}#/streams/details/${TransactionStream}/details'
+
+  DataArchiveStreamName:
+    Condition: IsProduction
+    Description: 'Name of the Kinesis Data Firehose delivery stream (Production only)'
+    Value: !Ref DataArchiveDeliveryStream
+    Export:
+      Name: !Sub '${AWS::StackName}-firehose-stream-name'
+
+  StackInfo:
+    Description: 'Information about this CloudFormation stack'
+    Value: !Sub |
+      Stack Name: ${AWS::StackName}
+      Region: ${AWS::Region}
+      Environment: ${Environment}
+      Created: ${AWS::StackCreationTime}

@@ -1,0 +1,557 @@
+# Infrastructure Manager Configuration for Immersive XR Content Delivery
+# This configuration deploys a complete XR content delivery platform using:
+# - Cloud Storage for XR asset storage
+# - Cloud CDN for global content distribution
+# - Immersive Stream for XR for cloud-based rendering
+# - Load Balancer for unified traffic management
+# - IAM and monitoring for security and observability
+
+imports:
+  - path: templates/storage.jinja
+  - path: templates/cdn.jinja
+  - path: templates/xr_service.jinja
+  - path: templates/monitoring.jinja
+
+resources:
+  # Generate unique suffix for resource naming
+  - name: resource-suffix
+    type: compute.v1.globalOperations
+    properties:
+      # Use deployment timestamp for unique naming
+      metadata:
+        suffix: "{{ env.deployment }}-{{ env.name[:8] }}"
+
+  # Cloud Storage bucket for XR assets
+  - name: xr-assets-bucket
+    type: storage.v1.bucket
+    properties:
+      name: "xr-assets-{{ deployment }}-{{ env.name[:8] }}"
+      location: "{{ properties.region }}"
+      storageClass: STANDARD
+      # Enable uniform bucket-level access for simplified IAM
+      uniformBucketLevelAccess:
+        enabled: true
+      # Public read access for CDN integration
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      # Lifecycle management for cost optimization
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90
+      # CORS configuration for web access
+      cors:
+        - origin:
+            - "*"
+          method:
+            - GET
+            - HEAD
+          responseHeader:
+            - Content-Type
+            - Cache-Control
+          maxAgeSeconds: 3600
+      # Versioning for asset management
+      versioning:
+        enabled: true
+    metadata:
+      dependsOn:
+        - resource-suffix
+
+  # IAM binding for public read access to storage bucket
+  - name: bucket-public-access
+    type: gcp-types/storage-v1:buckets.setIamPolicy
+    properties:
+      bucket: "$(ref.xr-assets-bucket.name)"
+      policy:
+        bindings:
+          - role: roles/storage.objectViewer
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - xr-assets-bucket
+
+  # Cloud CDN backend bucket configuration
+  - name: xr-cdn-backend-bucket
+    type: compute.v1.backendBucket
+    properties:
+      name: "xr-cdn-backend-{{ env.name[:8] }}"
+      description: "Backend bucket for XR asset delivery via CDN"
+      bucketName: "$(ref.xr-assets-bucket.name)"
+      enableCdn: true
+      # CDN cache configuration for optimal XR asset delivery
+      cdnPolicy:
+        cacheMode: CACHE_ALL_STATIC
+        defaultTtl: 3600
+        maxTtl: 86400
+        clientTtl: 1800
+        # Cache key policy for efficient caching
+        cacheKeyPolicy:
+          includeQueryString: false
+          includeHost: true
+          includeProtocol: false
+        # Negative caching for missing assets
+        negativeCaching: true
+        negativeCachingPolicy:
+          - code: 404
+            ttl: 300
+          - code: 410
+            ttl: 300
+    metadata:
+      dependsOn:
+        - xr-assets-bucket
+
+  # Backend service for XR streaming endpoints
+  - name: xr-streaming-backend-service
+    type: compute.v1.backendService
+    properties:
+      name: "xr-streaming-backend-{{ env.name[:8] }}"
+      description: "Backend service for Immersive Stream for XR"
+      protocol: HTTP
+      portName: http
+      timeoutSec: 30
+      # Health check configuration
+      healthChecks:
+        - "$(ref.xr-service-health-check.selfLink)"
+      # Session affinity for XR streaming sessions
+      sessionAffinity: CLIENT_IP
+      # Connection draining for graceful shutdowns
+      connectionDraining:
+        drainingTimeoutSec: 300
+      # Load balancing configuration
+      loadBalancingScheme: EXTERNAL_MANAGED
+    metadata:
+      dependsOn:
+        - xr-service-health-check
+
+  # Health check for XR streaming service
+  - name: xr-service-health-check
+    type: compute.v1.httpHealthCheck
+    properties:
+      name: "xr-service-health-{{ env.name[:8] }}"
+      description: "Health check for XR streaming service"
+      host: ""
+      requestPath: "/health"
+      port: 80
+      checkIntervalSec: 10
+      timeoutSec: 5
+      unhealthyThreshold: 3
+      healthyThreshold: 2
+
+  # URL map with path-based routing for unified content delivery
+  - name: xr-unified-urlmap
+    type: compute.v1.urlMap
+    properties:
+      name: "xr-unified-urlmap-{{ env.name[:8] }}"
+      description: "Unified URL map for XR content and streaming"
+      # Default to CDN backend for static assets
+      defaultService: "$(ref.xr-cdn-backend-bucket.selfLink)"
+      # Path matchers for different content types
+      pathMatchers:
+        - name: xr-streaming-matcher
+          description: "Route streaming requests to XR service"
+          defaultService: "$(ref.xr-cdn-backend-bucket.selfLink)"
+          pathRules:
+            # Route streaming endpoints to XR service backend
+            - paths:
+                - "/stream/*"
+                - "/api/xr/*"
+              service: "$(ref.xr-streaming-backend-service.selfLink)"
+            # Route static XR assets to CDN
+            - paths:
+                - "/assets/*"
+                - "/models/*"
+                - "/textures/*"
+                - "/configs/*"
+              service: "$(ref.xr-cdn-backend-bucket.selfLink)"
+      # Host rules for domain-based routing
+      hostRules:
+        - hosts:
+            - "*"
+          pathMatcher: xr-streaming-matcher
+    metadata:
+      dependsOn:
+        - xr-cdn-backend-bucket
+        - xr-streaming-backend-service
+
+  # HTTPS target proxy for secure content delivery
+  - name: xr-https-proxy
+    type: compute.v1.targetHttpsProxy
+    properties:
+      name: "xr-https-proxy-{{ env.name[:8] }}"
+      description: "HTTPS proxy for secure XR content delivery"
+      urlMap: "$(ref.xr-unified-urlmap.selfLink)"
+      # SSL certificate (managed certificate for production)
+      sslCertificates:
+        - "$(ref.xr-ssl-certificate.selfLink)"
+      # Security policy for enhanced protection
+      # sslPolicy: "$(ref.xr-ssl-policy.selfLink)"
+    metadata:
+      dependsOn:
+        - xr-unified-urlmap
+        - xr-ssl-certificate
+
+  # HTTP target proxy for HTTP to HTTPS redirect
+  - name: xr-http-proxy
+    type: compute.v1.targetHttpProxy
+    properties:
+      name: "xr-http-proxy-{{ env.name[:8] }}"
+      description: "HTTP proxy for XR content delivery with HTTPS redirect"
+      urlMap: "$(ref.xr-redirect-urlmap.selfLink)"
+    metadata:
+      dependsOn:
+        - xr-redirect-urlmap
+
+  # URL map for HTTP to HTTPS redirect
+  - name: xr-redirect-urlmap
+    type: compute.v1.urlMap
+    properties:
+      name: "xr-redirect-urlmap-{{ env.name[:8] }}"
+      description: "URL map for HTTP to HTTPS redirect"
+      defaultUrlRedirect:
+        redirectResponseCode: MOVED_PERMANENTLY_DEFAULT
+        httpsRedirect: true
+        stripQuery: false
+
+  # Managed SSL certificate for secure content delivery
+  - name: xr-ssl-certificate
+    type: compute.v1.sslCertificate
+    properties:
+      name: "xr-ssl-cert-{{ env.name[:8] }}"
+      description: "Managed SSL certificate for XR content delivery"
+      type: MANAGED
+      managed:
+        domains:
+          - "{{ properties.domain | default('xr-demo.example.com') }}"
+
+  # Global HTTPS forwarding rule
+  - name: xr-https-forwarding-rule
+    type: compute.v1.globalForwardingRule
+    properties:
+      name: "xr-https-rule-{{ env.name[:8] }}"
+      description: "Global HTTPS forwarding rule for XR content"
+      target: "$(ref.xr-https-proxy.selfLink)"
+      portRange: "443"
+      IPProtocol: TCP
+      loadBalancingScheme: EXTERNAL_MANAGED
+    metadata:
+      dependsOn:
+        - xr-https-proxy
+
+  # Global HTTP forwarding rule for redirect
+  - name: xr-http-forwarding-rule
+    type: compute.v1.globalForwardingRule
+    properties:
+      name: "xr-http-rule-{{ env.name[:8] }}"
+      description: "Global HTTP forwarding rule for HTTPS redirect"
+      target: "$(ref.xr-http-proxy.selfLink)"
+      portRange: "80"
+      IPProtocol: TCP
+      loadBalancingScheme: EXTERNAL_MANAGED
+    metadata:
+      dependsOn:
+        - xr-http-proxy
+
+  # Service account for XR streaming operations
+  - name: xr-streaming-service-account
+    type: iam.v1.serviceAccount
+    properties:
+      accountId: "xr-streaming-sa-{{ env.name[:8] }}"
+      displayName: "XR Streaming Service Account"
+      description: "Service account for Immersive Stream for XR operations"
+      projectId: "{{ env.project }}"
+
+  # IAM binding for XR service account - Storage Object Viewer
+  - name: xr-sa-storage-viewer-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: "{{ env.project }}"
+      policy:
+        bindings:
+          - role: roles/storage.objectViewer
+            members:
+              - "serviceAccount:$(ref.xr-streaming-service-account.email)"
+    metadata:
+      dependsOn:
+        - xr-streaming-service-account
+
+  # IAM binding for XR service account - Immersive Stream Service Agent
+  - name: xr-sa-stream-agent-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: "{{ env.project }}"
+      policy:
+        bindings:
+          - role: roles/immersivestream.serviceAgent
+            members:
+              - "serviceAccount:$(ref.xr-streaming-service-account.email)"
+    metadata:
+      dependsOn:
+        - xr-streaming-service-account
+
+  # Immersive Stream for XR service instance
+  - name: xr-streaming-service
+    type: gcp-types/immersivestream-v1:projects.locations.streamInstances
+    properties:
+      parent: "projects/{{ env.project }}/locations/{{ properties.region }}"
+      streamInstanceId: "xr-stream-{{ env.name[:8] }}"
+      # XR service configuration
+      displayName: "XR Content Streaming Service"
+      description: "Immersive Stream for XR instance for content delivery"
+      # GPU configuration for rendering
+      config:
+        # GPU specifications
+        machineSpec:
+          machineType: "n1-standard-4"
+          # GPU configuration
+          accelerators:
+            - type: "nvidia-tesla-t4"
+              acceleratorCount: 1
+        # Content source configuration
+        contentSource:
+          gcsSource:
+            bucket: "$(ref.xr-assets-bucket.name)"
+            path: "models/"
+        # Session configuration
+        sessionConfig:
+          sessionTimeoutDuration: "1800s"
+          maxConcurrentSessions: 10
+        # Autoscaling configuration
+        autoscaling:
+          enabled: true
+          minCapacity: 1
+          maxCapacity: 5
+          targetUtilization: 70
+        # Network configuration
+        networkConfig:
+          # Use default network for simplicity
+          # In production, use custom VPC with appropriate firewall rules
+          enableExternalAccess: true
+    metadata:
+      dependsOn:
+        - xr-assets-bucket
+        - xr-streaming-service-account
+
+  # Cloud Monitoring alert policy for high GPU utilization
+  - name: xr-gpu-utilization-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: "projects/{{ env.project }}"
+      # Alert policy configuration
+      displayName: "XR Service High GPU Utilization"
+      documentation:
+        content: "Alert when XR service GPU utilization exceeds 85% for 5 minutes"
+        mimeType: "text/markdown"
+      # Conditions for triggering alert
+      conditions:
+        - displayName: "GPU utilization above 85%"
+          conditionThreshold:
+            filter: 'resource.type="immersive_stream_xr_service" AND metric.type="compute.googleapis.com/instance/gpu/utilization"'
+            comparison: COMPARISON_GT
+            thresholdValue: 0.85
+            duration: "300s"
+            # Aggregation settings
+            aggregations:
+              - alignmentPeriod: "300s"
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_MEAN
+                groupByFields:
+                  - "resource.instance_id"
+      # Enable the alert policy
+      enabled: true
+      # Notification channels (to be configured separately)
+      # notificationChannels: []
+    metadata:
+      dependsOn:
+        - xr-streaming-service
+
+  # Log-based metric for XR session analytics
+  - name: xr-session-starts-metric
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      parent: "projects/{{ env.project }}"
+      metricId: "xr_session_starts"
+      # Metric configuration
+      displayName: "XR Session Starts"
+      description: "Number of XR streaming sessions started"
+      # Log filter for session start events
+      filter: 'resource.type="immersive_stream_xr_service" AND jsonPayload.event_type="session_start"'
+      # Metric descriptor
+      metricDescriptor:
+        metricKind: COUNTER
+        valueType: INT64
+        unit: "1"
+        displayName: "XR Session Starts"
+        description: "Count of XR streaming sessions started"
+
+  # Log-based metric for XR session duration
+  - name: xr-session-duration-metric
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      parent: "projects/{{ env.project }}"
+      metricId: "xr_session_duration"
+      # Metric configuration
+      displayName: "XR Session Duration"
+      description: "Duration of XR streaming sessions in seconds"
+      # Log filter for session end events
+      filter: 'resource.type="immersive_stream_xr_service" AND jsonPayload.event_type="session_end"'
+      # Value extractor for session duration
+      valueExtractor: "jsonPayload.session_duration"
+      # Metric descriptor
+      metricDescriptor:
+        metricKind: GAUGE
+        valueType: DOUBLE
+        unit: "s"
+        displayName: "XR Session Duration"
+        description: "Duration of XR streaming sessions"
+
+# Template variables for customization
+properties:
+  # GCP region for resource deployment
+  region:
+    type: string
+    default: "us-central1"
+    description: "GCP region for deploying XR content delivery resources"
+    
+  # Domain name for SSL certificate (optional)
+  domain:
+    type: string
+    default: "xr-demo.example.com"
+    description: "Domain name for SSL certificate and content delivery"
+    
+  # XR service configuration
+  maxConcurrentSessions:
+    type: integer
+    default: 10
+    minimum: 1
+    maximum: 100
+    description: "Maximum number of concurrent XR streaming sessions"
+    
+  sessionTimeoutMinutes:
+    type: integer
+    default: 30
+    minimum: 5
+    maximum: 120
+    description: "XR session timeout in minutes"
+    
+  # Autoscaling configuration
+  minInstances:
+    type: integer
+    default: 1
+    minimum: 0
+    maximum: 10
+    description: "Minimum number of XR service instances"
+    
+  maxInstances:
+    type: integer
+    default: 5
+    minimum: 1
+    maximum: 50
+    description: "Maximum number of XR service instances"
+    
+  targetUtilization:
+    type: integer
+    default: 70
+    minimum: 30
+    maximum: 90
+    description: "Target GPU utilization percentage for autoscaling"
+    
+  # CDN configuration
+  defaultCacheTtlSeconds:
+    type: integer
+    default: 3600
+    minimum: 300
+    maximum: 86400
+    description: "Default TTL for CDN cache in seconds"
+    
+  maxCacheTtlSeconds:
+    type: integer
+    default: 86400
+    minimum: 3600
+    maximum: 604800
+    description: "Maximum TTL for CDN cache in seconds"
+
+# Outputs for integration and verification
+outputs:
+  # Storage bucket information
+  bucket_name:
+    description: "Name of the Cloud Storage bucket for XR assets"
+    value: "$(ref.xr-assets-bucket.name)"
+    
+  bucket_url:
+    description: "URL of the Cloud Storage bucket"
+    value: "gs://$(ref.xr-assets-bucket.name)"
+    
+  # CDN and load balancer information
+  global_ip_address:
+    description: "Global IP address for XR content delivery"
+    value: "$(ref.xr-https-forwarding-rule.IPAddress)"
+    
+  cdn_url:
+    description: "CDN URL for XR content delivery"
+    value: "https://$(ref.xr-https-forwarding-rule.IPAddress)"
+    
+  # XR streaming service information
+  xr_service_name:
+    description: "Name of the Immersive Stream for XR service instance"
+    value: "$(ref.xr-streaming-service.name)"
+    
+  xr_service_endpoint:
+    description: "Endpoint URL for XR streaming service"
+    value: "$(ref.xr-streaming-service.status.endpoint)"
+    
+  # Service account information
+  service_account_email:
+    description: "Email of the XR streaming service account"
+    value: "$(ref.xr-streaming-service-account.email)"
+    
+  # Monitoring information
+  session_starts_metric:
+    description: "Log-based metric for tracking XR session starts"
+    value: "projects/{{ env.project }}/metrics/xr_session_starts"
+    
+  session_duration_metric:
+    description: "Log-based metric for tracking XR session duration"
+    value: "projects/{{ env.project }}/metrics/xr_session_duration"
+    
+  # Configuration summary
+  deployment_region:
+    description: "GCP region where resources are deployed"
+    value: "{{ properties.region }}"
+    
+  max_concurrent_sessions:
+    description: "Maximum number of concurrent XR sessions configured"
+    value: "{{ properties.maxConcurrentSessions }}"
+    
+  autoscaling_config:
+    description: "Autoscaling configuration summary"
+    value: "Min: {{ properties.minInstances }}, Max: {{ properties.maxInstances }}, Target: {{ properties.targetUtilization }}%"
+
+# Metadata for Infrastructure Manager
+metadata:
+  version: "1.0"
+  description: "Infrastructure Manager configuration for Immersive XR Content Delivery platform"
+  author: "Generated by recipe iac-generator v1.3"
+  created: "2025-07-12"
+  # Dependencies and requirements
+  requirements:
+    - "Google Cloud Immersive Stream for XR API enabled"
+    - "Compute Engine API enabled"
+    - "Cloud Storage API enabled"
+    - "Cloud CDN API enabled"
+    - "Cloud Monitoring API enabled"
+    - "Cloud Logging API enabled"
+    - "Certificate Manager API enabled"
+  # Estimated deployment time
+  deployment_time: "15-20 minutes"
+  # Cost considerations
+  cost_notes: "Costs depend on XR streaming usage, CDN traffic, and storage. GPU instances incur higher costs during active streaming sessions."

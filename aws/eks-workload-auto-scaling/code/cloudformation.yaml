@@ -1,0 +1,766 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'EKS Cluster with Auto Scaling - Horizontal Pod Autoscaler and Cluster Autoscaler'
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: 'eks-autoscaling-demo'
+    Description: 'Name of the EKS cluster'
+    MaxLength: 100
+    MinLength: 1
+    AllowedPattern: ^[a-zA-Z0-9\-]*$
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+
+  KubernetesVersion:
+    Type: String
+    Default: '1.28'
+    Description: 'Kubernetes version for EKS cluster'
+    AllowedValues: ['1.27', '1.28', '1.29']
+
+  GeneralPurposeNodeMinSize:
+    Type: Number
+    Default: 1
+    Description: 'Minimum number of nodes in general purpose node group'
+    MinValue: 0
+    MaxValue: 20
+
+  GeneralPurposeNodeMaxSize:
+    Type: Number
+    Default: 10
+    Description: 'Maximum number of nodes in general purpose node group'
+    MinValue: 1
+    MaxValue: 100
+
+  GeneralPurposeNodeDesiredSize:
+    Type: Number
+    Default: 2
+    Description: 'Desired number of nodes in general purpose node group'
+    MinValue: 1
+    MaxValue: 20
+
+  ComputeOptimizedNodeMinSize:
+    Type: Number
+    Default: 0
+    Description: 'Minimum number of nodes in compute optimized node group'
+    MinValue: 0
+    MaxValue: 20
+
+  ComputeOptimizedNodeMaxSize:
+    Type: Number
+    Default: 5
+    Description: 'Maximum number of nodes in compute optimized node group'
+    MinValue: 1
+    MaxValue: 100
+
+  ComputeOptimizedNodeDesiredSize:
+    Type: Number
+    Default: 1
+    Description: 'Desired number of nodes in compute optimized node group'
+    MinValue: 0
+    MaxValue: 20
+
+  NodeVolumeSize:
+    Type: Number
+    Default: 20
+    Description: 'EBS volume size for worker nodes (GB)'
+    MinValue: 20
+    MaxValue: 100
+
+  EnableLogging:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable CloudWatch logging for EKS cluster'
+
+  VpcCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: 'CIDR block for VPC'
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: '10.0.1.0/24'
+    Description: 'CIDR block for private subnet 1'
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: '10.0.2.0/24'
+    Description: 'CIDR block for private subnet 2'
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: '10.0.101.0/24'
+    Description: 'CIDR block for public subnet 1'
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+
+  PublicSubnet2Cidr:
+    Type: String
+    Default: '10.0.102.0/24'
+    Description: 'CIDR block for public subnet 2'
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+
+Conditions:
+  EnableCloudWatchLogging: !Equals [!Ref EnableLogging, 'true']
+  CreateComputeOptimizedNodes: !Not [!Equals [!Ref ComputeOptimizedNodeDesiredSize, 0]]
+
+Mappings:
+  GeneralPurposeInstanceTypes:
+    us-east-1:
+      primary: m5.large
+      secondary: m5.xlarge
+    us-west-2:
+      primary: m5.large
+      secondary: m5.xlarge
+    eu-west-1:
+      primary: m5.large
+      secondary: m5.xlarge
+    ap-southeast-1:
+      primary: m5.large
+      secondary: m5.xlarge
+    default:
+      primary: m5.large
+      secondary: m5.xlarge
+
+  ComputeOptimizedInstanceTypes:
+    us-east-1:
+      primary: c5.large
+      secondary: c5.xlarge
+    us-west-2:
+      primary: c5.large
+      secondary: c5.xlarge
+    eu-west-1:
+      primary: c5.large
+      secondary: c5.xlarge
+    ap-southeast-1:
+      primary: c5.large
+      secondary: c5.xlarge
+    default:
+      primary: c5.large
+      secondary: c5.xlarge
+
+Resources:
+  # VPC and Networking Resources
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-vpc'
+        - Key: kubernetes.io/cluster/eks-autoscaling
+          Value: shared
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-igw'
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet1Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-subnet-1'
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+        - Key: kubernetes.io/cluster/eks-autoscaling
+          Value: shared
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet2Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-subnet-2'
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+        - Key: kubernetes.io/cluster/eks-autoscaling
+          Value: shared
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-subnet-1'
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+        - Key: kubernetes.io/cluster/eks-autoscaling
+          Value: owned
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-subnet-2'
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+        - Key: kubernetes.io/cluster/eks-autoscaling
+          Value: owned
+
+  # NAT Gateway for private subnets
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat-gw-1-eip'
+
+  NatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat-gw-2-eip'
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat-gw-1'
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat-gw-2'
+
+  # Route Tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-routes'
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-routes-1'
+
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-routes-2'
+
+  DefaultPrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet2
+
+  # Security Group for EKS Control Plane
+  ControlPlaneSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group for EKS control plane'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: 'HTTPS access from VPC'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-control-plane-sg'
+
+  # IAM Role for EKS Cluster
+  EKSClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-cluster-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-cluster-role'
+
+  # IAM Role for EKS Node Groups
+  EKSNodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-node-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-node-role'
+
+  # IAM Role for Cluster Autoscaler
+  ClusterAutoscalerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-cluster-autoscaler-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/${EKSCluster.OpenIdConnectIssuerUrl}'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                !Sub '${EKSCluster.OpenIdConnectIssuerUrl}:sub': 'system:serviceaccount:kube-system:cluster-autoscaler'
+                !Sub '${EKSCluster.OpenIdConnectIssuerUrl}:aud': 'sts.amazonaws.com'
+      Policies:
+        - PolicyName: ClusterAutoscalerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:DescribeAutoScalingInstances
+                  - autoscaling:DescribeLaunchConfigurations
+                  - autoscaling:DescribeScalingActivities
+                  - autoscaling:DescribeTags
+                  - autoscaling:SetDesiredCapacity
+                  - autoscaling:TerminateInstanceInAutoScalingGroup
+                  - ec2:DescribeInstanceTypes
+                  - ec2:DescribeLaunchTemplateVersions
+                  - ec2:DescribeImages
+                  - ec2:GetInstanceTypesFromInstanceRequirements
+                  - eks:DescribeNodegroup
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - autoscaling:SetDesiredCapacity
+                  - autoscaling:TerminateInstanceInAutoScalingGroup
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    autoscaling:ResourceTag/k8s.io/cluster-autoscaler/enabled: 'true'
+                    !Sub 'autoscaling:ResourceTag/k8s.io/cluster-autoscaler/${ClusterName}': 'owned'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-cluster-autoscaler-role'
+
+  # EKS Cluster
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt EKSClusterRole.Arn
+      ResourcesVpcConfig:
+        SecurityGroupIds:
+          - !Ref ControlPlaneSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+          - !Ref PublicSubnet1
+          - !Ref PublicSubnet2
+        EndpointConfigPrivate: true
+        EndpointConfigPublic: true
+        PublicAccessCidrs:
+          - 0.0.0.0/0
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+            - Type: controllerManager
+            - Type: scheduler
+      Tags:
+        - Key: Name
+          Value: !Ref ClusterName
+
+  # OIDC Identity Provider
+  EKSClusterOIDCProvider:
+    Type: AWS::IAM::OIDCIdentityProvider
+    Properties:
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 9e99a48a9960b14926bb7f3b02e22da2b0ab7280
+      Url: !GetAtt EKSCluster.OpenIdConnectIssuerUrl
+
+  # EKS Add-ons
+  EKSAddonVPCCNI:
+    Type: AWS::EKS::Addon
+    Properties:
+      AddonName: vpc-cni
+      ClusterName: !Ref EKSCluster
+      AddonVersion: latest
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-vpc-cni-addon'
+
+  EKSAddonCoreDNS:
+    Type: AWS::EKS::Addon
+    Properties:
+      AddonName: coredns
+      ClusterName: !Ref EKSCluster
+      AddonVersion: latest
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-coredns-addon'
+
+  EKSAddonKubeProxy:
+    Type: AWS::EKS::Addon
+    Properties:
+      AddonName: kube-proxy
+      ClusterName: !Ref EKSCluster
+      AddonVersion: latest
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-kube-proxy-addon'
+
+  EKSAddonEBSCSI:
+    Type: AWS::EKS::Addon
+    Properties:
+      AddonName: aws-ebs-csi-driver
+      ClusterName: !Ref EKSCluster
+      AddonVersion: latest
+      ResolveConflicts: OVERWRITE
+      ServiceAccountRoleArn: !Sub 'arn:aws:iam::${AWS::AccountId}:role/AmazonEKS_EBS_CSI_DriverRole'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-ebs-csi-addon'
+
+  # Launch Template for General Purpose Nodes
+  GeneralPurposeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ClusterName}-general-purpose-lt'
+      LaunchTemplateData:
+        ImageId: !Sub '{{resolve:ssm:/aws/service/eks/optimized-ami/${KubernetesVersion}/amazon-linux-2/recommended/image_id}}'
+        InstanceType: !FindInMap [GeneralPurposeInstanceTypes, !Ref 'AWS::Region', primary]
+        KeyName: !Ref AWS::NoValue
+        SecurityGroupIds:
+          - !Ref ControlPlaneSecurityGroup
+        IamInstanceProfile:
+          Arn: !GetAtt EKSNodeInstanceProfile.Arn
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            /etc/eks/bootstrap.sh ${ClusterName}
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref NodeVolumeSize
+              VolumeType: gp3
+              DeleteOnTermination: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${ClusterName}-general-purpose-node'
+              - Key: kubernetes.io/cluster/eks-autoscaling
+                Value: owned
+              - Key: k8s.io/cluster-autoscaler/enabled
+                Value: 'true'
+              - Key: !Sub 'k8s.io/cluster-autoscaler/${ClusterName}'
+                Value: owned
+              - Key: workload-type
+                Value: general
+
+  # Launch Template for Compute Optimized Nodes
+  ComputeOptimizedLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: CreateComputeOptimizedNodes
+    Properties:
+      LaunchTemplateName: !Sub '${ClusterName}-compute-optimized-lt'
+      LaunchTemplateData:
+        ImageId: !Sub '{{resolve:ssm:/aws/service/eks/optimized-ami/${KubernetesVersion}/amazon-linux-2/recommended/image_id}}'
+        InstanceType: !FindInMap [ComputeOptimizedInstanceTypes, !Ref 'AWS::Region', primary]
+        KeyName: !Ref AWS::NoValue
+        SecurityGroupIds:
+          - !Ref ControlPlaneSecurityGroup
+        IamInstanceProfile:
+          Arn: !GetAtt EKSNodeInstanceProfile.Arn
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            /etc/eks/bootstrap.sh ${ClusterName}
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref NodeVolumeSize
+              VolumeType: gp3
+              DeleteOnTermination: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${ClusterName}-compute-optimized-node'
+              - Key: kubernetes.io/cluster/eks-autoscaling
+                Value: owned
+              - Key: k8s.io/cluster-autoscaler/enabled
+                Value: 'true'
+              - Key: !Sub 'k8s.io/cluster-autoscaler/${ClusterName}'
+                Value: owned
+              - Key: workload-type
+                Value: compute
+
+  # IAM Instance Profile for Node Groups
+  EKSNodeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ClusterName}-node-instance-profile'
+      Roles:
+        - !Ref EKSNodeRole
+
+  # General Purpose Node Group
+  GeneralPurposeNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref EKSCluster
+      NodegroupName: general-purpose
+      NodeRole: !GetAtt EKSNodeRole.Arn
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      InstanceTypes:
+        - !FindInMap [GeneralPurposeInstanceTypes, !Ref 'AWS::Region', primary]
+        - !FindInMap [GeneralPurposeInstanceTypes, !Ref 'AWS::Region', secondary]
+      AmiType: AL2_x86_64
+      CapacityType: ON_DEMAND
+      DiskSize: !Ref NodeVolumeSize
+      ScalingConfig:
+        MinSize: !Ref GeneralPurposeNodeMinSize
+        MaxSize: !Ref GeneralPurposeNodeMaxSize
+        DesiredSize: !Ref GeneralPurposeNodeDesiredSize
+      UpdateConfig:
+        MaxUnavailable: 1
+      Labels:
+        workload-type: general
+      Tags:
+        Name: !Sub '${ClusterName}-general-purpose-nodegroup'
+        k8s.io/cluster-autoscaler/enabled: 'true'
+        !Sub 'k8s.io/cluster-autoscaler/${ClusterName}': 'owned'
+
+  # Compute Optimized Node Group
+  ComputeOptimizedNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Condition: CreateComputeOptimizedNodes
+    Properties:
+      ClusterName: !Ref EKSCluster
+      NodegroupName: compute-optimized
+      NodeRole: !GetAtt EKSNodeRole.Arn
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      InstanceTypes:
+        - !FindInMap [ComputeOptimizedInstanceTypes, !Ref 'AWS::Region', primary]
+        - !FindInMap [ComputeOptimizedInstanceTypes, !Ref 'AWS::Region', secondary]
+      AmiType: AL2_x86_64
+      CapacityType: ON_DEMAND
+      DiskSize: !Ref NodeVolumeSize
+      ScalingConfig:
+        MinSize: !Ref ComputeOptimizedNodeMinSize
+        MaxSize: !Ref ComputeOptimizedNodeMaxSize
+        DesiredSize: !Ref ComputeOptimizedNodeDesiredSize
+      UpdateConfig:
+        MaxUnavailable: 1
+      Labels:
+        workload-type: compute
+      Tags:
+        Name: !Sub '${ClusterName}-compute-optimized-nodegroup'
+        k8s.io/cluster-autoscaler/enabled: 'true'
+        !Sub 'k8s.io/cluster-autoscaler/${ClusterName}': 'owned'
+
+  # CloudWatch Log Group for EKS
+  EKSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableCloudWatchLogging
+    Properties:
+      LogGroupName: !Sub '/aws/eks/${ClusterName}/cluster'
+      RetentionInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-log-group'
+
+Outputs:
+  ClusterName:
+    Description: 'EKS Cluster Name'
+    Value: !Ref EKSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterName'
+
+  ClusterEndpoint:
+    Description: 'EKS Cluster Endpoint'
+    Value: !GetAtt EKSCluster.Endpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterEndpoint'
+
+  ClusterArn:
+    Description: 'EKS Cluster ARN'
+    Value: !GetAtt EKSCluster.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterArn'
+
+  ClusterSecurityGroupId:
+    Description: 'Security Group ID for EKS Cluster'
+    Value: !GetAtt EKSCluster.ClusterSecurityGroupId
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterSecurityGroupId'
+
+  ClusterAutoscalerRoleArn:
+    Description: 'IAM Role ARN for Cluster Autoscaler'
+    Value: !GetAtt ClusterAutoscalerRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterAutoscalerRoleArn'
+
+  OIDCIssuerURL:
+    Description: 'OIDC Issuer URL'
+    Value: !GetAtt EKSCluster.OpenIdConnectIssuerUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-OIDCIssuerURL'
+
+  VpcId:
+    Description: 'VPC ID'
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+
+  PrivateSubnet1:
+    Description: 'Private Subnet 1 ID'
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet1'
+
+  PrivateSubnet2:
+    Description: 'Private Subnet 2 ID'
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet2'
+
+  GeneralPurposeNodeGroupName:
+    Description: 'General Purpose Node Group Name'
+    Value: !Ref GeneralPurposeNodeGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-GeneralPurposeNodeGroupName'
+
+  ComputeOptimizedNodeGroupName:
+    Description: 'Compute Optimized Node Group Name'
+    Value: !If [CreateComputeOptimizedNodes, !Ref ComputeOptimizedNodeGroup, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-ComputeOptimizedNodeGroupName'
+
+  KubeconfigCommand:
+    Description: 'Command to update kubeconfig'
+    Value: !Sub 'aws eks update-kubeconfig --region ${AWS::Region} --name ${ClusterName}'
+
+  ClusterAutoscalerServiceAccountAnnotation:
+    Description: 'Annotation for Cluster Autoscaler Service Account'
+    Value: !Sub 'eks.amazonaws.com/role-arn=${ClusterAutoscalerRole.Arn}'
+
+  PostDeploymentSteps:
+    Description: 'Next steps after deployment'
+    Value: !Sub |
+      1. Update kubeconfig: aws eks update-kubeconfig --region ${AWS::Region} --name ${ClusterName}
+      2. Install Metrics Server: kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+      3. Deploy Cluster Autoscaler with role annotation: ${ClusterAutoscalerRole.Arn}
+      4. Install KEDA: helm repo add kedacore https://kedacore.github.io/charts && helm install keda kedacore/keda --namespace keda-system --create-namespace
+      5. Deploy your applications with HPA configurations

@@ -1,0 +1,699 @@
+# Infrastructure Manager configuration for Real-Time Data Science Model Training
+# This template creates a complete ML training environment with:
+# - Vertex AI Workbench instance with GPU acceleration
+# - Memorystore Redis for feature caching
+# - Cloud Storage bucket for datasets and models
+# - Cloud Batch job configuration for distributed training
+# - Cloud Monitoring dashboard for pipeline visibility
+# - Network configuration for secure connectivity
+
+apiVersion: v1
+kind: Template
+metadata:
+  name: ml-training-pipeline
+  description: "Real-time ML training pipeline with Vertex AI Workbench and Redis caching"
+  version: "1.0.0"
+  labels:
+    category: analytics
+    use-case: machine-learning
+    difficulty: intermediate
+
+# Template parameters for customization
+parameters:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    required: true
+  
+  region:
+    type: string
+    description: "Primary region for resources"
+    default: "us-central1"
+    
+  zone:
+    type: string
+    description: "Zone for compute resources"
+    default: "us-central1-a"
+    
+  environment:
+    type: string
+    description: "Environment tag (dev/staging/prod)"
+    default: "dev"
+    
+  redis_memory_size:
+    type: integer
+    description: "Redis memory size in GB"
+    default: 5
+    minimum: 1
+    maximum: 300
+    
+  workbench_machine_type:
+    type: string
+    description: "Workbench instance machine type"
+    default: "n1-standard-4"
+    
+  enable_gpu:
+    type: boolean
+    description: "Enable GPU acceleration for Workbench"
+    default: true
+    
+  gpu_type:
+    type: string
+    description: "GPU accelerator type"
+    default: "NVIDIA_TESLA_T4"
+    
+  gpu_count:
+    type: integer
+    description: "Number of GPUs"
+    default: 1
+    minimum: 1
+    maximum: 4
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ project_id }}/services/aiplatform.googleapis.com
+      
+  - name: enable-redis-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ project_id }}/services/redis.googleapis.com
+      
+  - name: enable-batch-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ project_id }}/services/batch.googleapis.com
+      
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ project_id }}/services/monitoring.googleapis.com
+      
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ project_id }}/services/storage.googleapis.com
+      
+  - name: enable-compute-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ project_id }}/services/compute.googleapis.com
+
+  # Cloud Storage bucket for datasets and models
+  - name: ml-training-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ml-training-bucket-{{ project_id }}-{{ environment }}
+      location: {{ region }}
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: true
+      encryption:
+        defaultKmsKeyName: projects/{{ project_id }}/locations/{{ region }}/keyRings/ml-training-keyring/cryptoKeys/ml-training-key
+      labels:
+        environment: {{ environment }}
+        use-case: ml-training
+        managed-by: infrastructure-manager
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90
+              isLive: false
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+              isLive: true
+    depends_on:
+      - enable-storage-api
+
+  # Service account for ML training resources
+  - name: ml-training-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: ml-training-sa-{{ environment }}
+      displayName: "ML Training Service Account"
+      description: "Service account for ML training pipeline resources"
+      project: {{ project_id }}
+    depends_on:
+      - enable-apis
+
+  # IAM bindings for service account
+  - name: ml-training-sa-storage-admin
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: {{ project_id }}
+      policy:
+        bindings:
+          - role: roles/storage.admin
+            members:
+              - serviceAccount:$(ref.ml-training-service-account.email)
+          - role: roles/aiplatform.user
+            members:
+              - serviceAccount:$(ref.ml-training-service-account.email)
+          - role: roles/redis.editor
+            members:
+              - serviceAccount:$(ref.ml-training-service-account.email)
+          - role: roles/batch.agentReporter
+            members:
+              - serviceAccount:$(ref.ml-training-service-account.email)
+          - role: roles/monitoring.editor
+            members:
+              - serviceAccount:$(ref.ml-training-service-account.email)
+    depends_on:
+      - ml-training-service-account
+
+  # VPC network for secure connectivity
+  - name: ml-training-network
+    type: gcp-types/compute-v1:networks
+    properties:
+      name: ml-training-network-{{ environment }}
+      description: "VPC network for ML training pipeline"
+      autoCreateSubnetworks: false
+      routingConfig:
+        routingMode: REGIONAL
+    depends_on:
+      - enable-compute-api
+
+  # Subnet for ML training resources
+  - name: ml-training-subnet
+    type: gcp-types/compute-v1:subnetworks
+    properties:
+      name: ml-training-subnet-{{ environment }}
+      description: "Subnet for ML training resources"
+      network: $(ref.ml-training-network.selfLink)
+      region: {{ region }}
+      ipCidrRange: "10.0.0.0/24"
+      privateIpGoogleAccess: true
+      secondaryIpRanges:
+        - rangeName: pods
+          ipCidrRange: "10.1.0.0/16"
+        - rangeName: services
+          ipCidrRange: "10.2.0.0/16"
+      logConfig:
+        enable: true
+        aggregationInterval: INTERVAL_5_SEC
+        flowSampling: 0.5
+        metadata: INCLUDE_ALL_METADATA
+    depends_on:
+      - ml-training-network
+
+  # Firewall rule for Redis access
+  - name: allow-redis-access
+    type: gcp-types/compute-v1:firewalls
+    properties:
+      name: allow-redis-access-{{ environment }}
+      description: "Allow Redis access from Workbench instances"
+      network: $(ref.ml-training-network.selfLink)
+      direction: INGRESS
+      priority: 1000
+      sourceRanges:
+        - "10.0.0.0/8"
+      targetTags:
+        - redis-client
+      allowed:
+        - IPProtocol: tcp
+          ports:
+            - "6379"
+      logConfig:
+        enable: true
+    depends_on:
+      - ml-training-network
+
+  # Firewall rule for internal communication
+  - name: allow-internal-communication
+    type: gcp-types/compute-v1:firewalls
+    properties:
+      name: allow-internal-communication-{{ environment }}
+      description: "Allow internal communication between ML training resources"
+      network: $(ref.ml-training-network.selfLink)
+      direction: INGRESS
+      priority: 1000
+      sourceRanges:
+        - "10.0.0.0/24"
+      targetTags:
+        - ml-training
+      allowed:
+        - IPProtocol: tcp
+          ports:
+            - "8080"
+            - "8888"
+            - "22"
+        - IPProtocol: icmp
+      logConfig:
+        enable: true
+    depends_on:
+      - ml-training-network
+
+  # Memorystore Redis instance for feature caching
+  - name: ml-feature-cache-redis
+    type: gcp-types/redis-v1:projects.locations.instances
+    properties:
+      name: ml-feature-cache-{{ environment }}
+      parent: projects/{{ project_id }}/locations/{{ region }}
+      tier: STANDARD_HA
+      memorySizeGb: {{ redis_memory_size }}
+      redisVersion: REDIS_7_0
+      displayName: "ML Feature Cache Redis"
+      authorizedNetwork: $(ref.ml-training-network.selfLink)
+      connectMode: PRIVATE_SERVICE_ACCESS
+      authEnabled: true
+      transitEncryptionMode: SERVER_AUTHENTICATION
+      redisConfigs:
+        maxmemory-policy: "allkeys-lru"
+        timeout: "0"
+        tcp-keepalive: "300"
+        notify-keyspace-events: "Ex"
+      labels:
+        environment: {{ environment }}
+        use-case: ml-feature-cache
+        managed-by: infrastructure-manager
+      locationId: {{ zone }}
+      alternativeLocationId: {{ zone | replace('a', 'b') }}
+      replicaCount: 1
+      readReplicasMode: READ_REPLICAS_ENABLED
+      maintenancePolicy:
+        weeklyMaintenanceWindow:
+          - day: SUNDAY
+            startTime:
+              hours: 2
+              minutes: 0
+    depends_on:
+      - enable-redis-api
+      - ml-training-network
+
+  # Vertex AI Workbench instance
+  - name: ml-workbench-instance
+    type: gcp-types/notebooks-v1:projects.locations.instances
+    properties:
+      name: ml-workbench-{{ environment }}
+      parent: projects/{{ project_id }}/locations/{{ zone }}
+      machineType: {{ workbench_machine_type }}
+      # Conditional GPU configuration
+      {% if enable_gpu %}
+      acceleratorConfig:
+        type: {{ gpu_type }}
+        coreCount: {{ gpu_count }}
+      {% endif %}
+      bootDiskType: PD_SSD
+      bootDiskSizeGb: 100
+      dataDiskType: PD_SSD
+      dataDiskSizeGb: 200
+      noRemoveDataDisk: true
+      diskEncryption: GMEK
+      kmsKey: projects/{{ project_id }}/locations/{{ region }}/keyRings/ml-training-keyring/cryptoKeys/ml-training-key
+      noPublicIp: false
+      noProxyAccess: false
+      network: $(ref.ml-training-network.selfLink)
+      subnet: $(ref.ml-training-subnet.selfLink)
+      serviceAccount: $(ref.ml-training-service-account.email)
+      serviceAccountScopes:
+        - "https://www.googleapis.com/auth/cloud-platform"
+      tags:
+        - ml-training
+        - redis-client
+        - jupyter-notebook
+      labels:
+        environment: {{ environment }}
+        use-case: ml-workbench
+        managed-by: infrastructure-manager
+      metadata:
+        enable-oslogin: "true"
+        notebook-disable-downloads: "false"
+        notebook-disable-terminal: "false"
+        notebook-disable-nbconvert: "false"
+        install-nvidia-driver: "true"
+        # Custom startup script for Redis connectivity
+        startup-script: |
+          #!/bin/bash
+          set -e
+          
+          # Install Redis client
+          apt-get update
+          apt-get install -y redis-tools python3-redis
+          
+          # Install additional ML packages
+          pip3 install --upgrade pip
+          pip3 install redis pandas scikit-learn google-cloud-storage google-cloud-monitoring
+          pip3 install jupyterlab-git jupyterlab-lsp
+          
+          # Configure environment variables
+          echo "export REDIS_HOST=$(ref.ml-feature-cache-redis.host)" >> /etc/environment
+          echo "export REDIS_PORT=$(ref.ml-feature-cache-redis.port)" >> /etc/environment
+          echo "export BUCKET_NAME=$(ref.ml-training-bucket.name)" >> /etc/environment
+          echo "export PROJECT_ID={{ project_id }}" >> /etc/environment
+          echo "export REGION={{ region }}" >> /etc/environment
+          
+          # Create Jupyter extensions directory
+          mkdir -p /opt/deeplearning/jupyter/extensions
+          
+          # Install JupyterLab extensions
+          jupyter labextension install @jupyter-widgets/jupyterlab-manager
+          jupyter labextension install jupyterlab-plotly
+          
+          # Configure JupyterLab settings
+          mkdir -p /home/jupyter/.jupyter/lab/user-settings/@jupyterlab/notebook-extension/
+          cat > /home/jupyter/.jupyter/lab/user-settings/@jupyterlab/notebook-extension/tracker.jupyterlab-settings << 'EOF'
+          {
+            "codeCellConfig": {
+              "lineNumbers": true
+            }
+          }
+          EOF
+          
+          # Set proper ownership
+          chown -R jupyter:jupyter /home/jupyter/.jupyter
+          
+          # Restart Jupyter service
+          systemctl restart jupyter
+          
+          echo "Workbench setup completed successfully"
+    depends_on:
+      - enable-apis
+      - ml-training-service-account
+      - ml-training-subnet
+      - ml-feature-cache-redis
+
+  # Cloud Batch job template for distributed training
+  - name: ml-training-batch-job-template
+    type: gcp-types/batch-v1:projects.locations.jobTemplates
+    properties:
+      name: ml-training-job-template-{{ environment }}
+      parent: projects/{{ project_id }}/locations/{{ region }}
+      displayName: "ML Training Batch Job Template"
+      description: "Template for distributed ML training jobs with Redis caching"
+      labels:
+        environment: {{ environment }}
+        use-case: ml-training
+        managed-by: infrastructure-manager
+      spec:
+        taskGroups:
+          - name: training-tasks
+            taskSpec:
+              runnables:
+                - script:
+                    text: |
+                      #!/bin/bash
+                      set -e
+                      
+                      # Install dependencies
+                      apt-get update
+                      apt-get install -y python3-pip redis-tools
+                      pip3 install redis pandas scikit-learn google-cloud-storage
+                      
+                      # Set environment variables
+                      export REDIS_HOST=$(ref.ml-feature-cache-redis.host)
+                      export REDIS_PORT=$(ref.ml-feature-cache-redis.port)
+                      export BUCKET_NAME=$(ref.ml-training-bucket.name)
+                      export PROJECT_ID={{ project_id }}
+                      
+                      # Download and execute training script
+                      gsutil cp gs://${BUCKET_NAME}/scripts/training_script.py ./
+                      python3 training_script.py
+                      
+                      echo "Training job completed successfully"
+              computeResource:
+                cpuMilli: 4000
+                memoryMib: 8192
+                bootDiskMib: 10240
+              maxRetryCount: 3
+              maxRunDuration: 3600s
+              environment:
+                variables:
+                  REDIS_HOST: $(ref.ml-feature-cache-redis.host)
+                  REDIS_PORT: $(ref.ml-feature-cache-redis.port)
+                  BUCKET_NAME: $(ref.ml-training-bucket.name)
+                  PROJECT_ID: {{ project_id }}
+                  REGION: {{ region }}
+            taskCount: 1
+            parallelism: 1
+        allocationPolicy:
+          instances:
+            - policy:
+                machineType: e2-standard-4
+                minCpuPlatform: "Intel Skylake"
+          network:
+            networkInterfaces:
+              - network: $(ref.ml-training-network.selfLink)
+                subnetwork: $(ref.ml-training-subnet.selfLink)
+                noExternalIpAddress: false
+          serviceAccount:
+            email: $(ref.ml-training-service-account.email)
+            scopes:
+              - "https://www.googleapis.com/auth/cloud-platform"
+          tags:
+            - ml-training
+            - batch-job
+        logsPolicy:
+          destination: CLOUD_LOGGING
+    depends_on:
+      - enable-batch-api
+      - ml-training-service-account
+      - ml-training-subnet
+      - ml-feature-cache-redis
+      - ml-training-bucket
+
+  # Cloud Monitoring workspace configuration
+  - name: ml-monitoring-workspace
+    type: gcp-types/monitoring-v1:projects.monitoringWorkspaces
+    properties:
+      name: projects/{{ project_id }}/monitoringWorkspaces/ml-training-workspace
+      displayName: "ML Training Pipeline Monitoring"
+      description: "Monitoring workspace for ML training pipeline metrics"
+    depends_on:
+      - enable-monitoring-api
+
+  # Monitoring notification channel
+  - name: ml-monitoring-notification-channel
+    type: gcp-types/monitoring-v3:projects.notificationChannels
+    properties:
+      name: projects/{{ project_id }}/notificationChannels/ml-training-alerts
+      displayName: "ML Training Alerts"
+      description: "Notification channel for ML training pipeline alerts"
+      type: email
+      labels:
+        email_address: "ml-training-alerts@{{ project_id }}.iam.gserviceaccount.com"
+      userLabels:
+        environment: {{ environment }}
+        use-case: ml-training
+    depends_on:
+      - ml-monitoring-workspace
+
+  # Redis performance alerting policy
+  - name: redis-performance-alert-policy
+    type: gcp-types/monitoring-v3:projects.alertPolicies
+    properties:
+      name: projects/{{ project_id }}/alertPolicies/redis-performance-alert
+      displayName: "Redis Performance Alert"
+      documentation:
+        content: "Alert when Redis cache hit ratio drops below 85%"
+        mimeType: "text/markdown"
+      enabled: true
+      conditions:
+        - displayName: "Redis cache hit ratio low"
+          conditionThreshold:
+            filter: 'resource.type="redis_instance" AND resource.label.instance_id="$(ref.ml-feature-cache-redis.name)"'
+            comparison: COMPARISON_LESS_THAN
+            thresholdValue: 0.85
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_MEAN
+                groupByFields:
+                  - resource.label.instance_id
+      combiner: OR
+      notificationChannels:
+        - $(ref.ml-monitoring-notification-channel.name)
+      alertStrategy:
+        autoClose: 86400s
+    depends_on:
+      - ml-feature-cache-redis
+      - ml-monitoring-notification-channel
+
+  # Workbench resource utilization alert
+  - name: workbench-resource-alert-policy
+    type: gcp-types/monitoring-v3:projects.alertPolicies
+    properties:
+      name: projects/{{ project_id }}/alertPolicies/workbench-resource-alert
+      displayName: "Workbench Resource Utilization Alert"
+      documentation:
+        content: "Alert when Workbench CPU usage exceeds 90% for 5 minutes"
+        mimeType: "text/markdown"
+      enabled: true
+      conditions:
+        - displayName: "High CPU usage"
+          conditionThreshold:
+            filter: 'resource.type="compute_instance" AND resource.label.instance_name="$(ref.ml-workbench-instance.name)"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 0.9
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_MEAN
+                groupByFields:
+                  - resource.label.instance_name
+      combiner: OR
+      notificationChannels:
+        - $(ref.ml-monitoring-notification-channel.name)
+      alertStrategy:
+        autoClose: 86400s
+    depends_on:
+      - ml-workbench-instance
+      - ml-monitoring-notification-channel
+
+  # Log sink for ML training pipeline
+  - name: ml-training-log-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      name: ml-training-pipeline-logs
+      parent: projects/{{ project_id }}
+      destination: storage.googleapis.com/$(ref.ml-training-bucket.name)/logs
+      filter: |
+        resource.type="notebooks_instance" AND
+        resource.labels.instance_name="$(ref.ml-workbench-instance.name)"
+        OR
+        resource.type="redis_instance" AND
+        resource.labels.instance_id="$(ref.ml-feature-cache-redis.name)"
+        OR
+        resource.type="batch_task" AND
+        protoPayload.serviceName="batch.googleapis.com"
+      description: "Log sink for ML training pipeline components"
+      includeChildren: true
+      exclusions:
+        - name: exclude-debug-logs
+          filter: 'severity="DEBUG"'
+          description: "Exclude debug level logs to reduce volume"
+    depends_on:
+      - ml-training-bucket
+      - ml-workbench-instance
+      - ml-feature-cache-redis
+
+# Output values for verification and integration
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: "{{ project_id }}"
+    
+  region:
+    description: "Primary deployment region"
+    value: "{{ region }}"
+    
+  zone:
+    description: "Primary deployment zone"
+    value: "{{ zone }}"
+    
+  bucket_name:
+    description: "Cloud Storage bucket name for datasets and models"
+    value: "$(ref.ml-training-bucket.name)"
+    
+  bucket_url:
+    description: "Cloud Storage bucket URL"
+    value: "gs://$(ref.ml-training-bucket.name)"
+    
+  redis_instance_name:
+    description: "Redis instance name"
+    value: "$(ref.ml-feature-cache-redis.name)"
+    
+  redis_host:
+    description: "Redis instance host IP"
+    value: "$(ref.ml-feature-cache-redis.host)"
+    
+  redis_port:
+    description: "Redis instance port"
+    value: "$(ref.ml-feature-cache-redis.port)"
+    
+  redis_connection_string:
+    description: "Redis connection string"
+    value: "redis://$(ref.ml-feature-cache-redis.host):$(ref.ml-feature-cache-redis.port)"
+    
+  workbench_instance_name:
+    description: "Vertex AI Workbench instance name"
+    value: "$(ref.ml-workbench-instance.name)"
+    
+  workbench_proxy_uri:
+    description: "Workbench proxy URI for accessing Jupyter"
+    value: "$(ref.ml-workbench-instance.proxyUri)"
+    
+  service_account_email:
+    description: "Service account email for ML training resources"
+    value: "$(ref.ml-training-service-account.email)"
+    
+  network_name:
+    description: "VPC network name"
+    value: "$(ref.ml-training-network.name)"
+    
+  subnet_name:
+    description: "Subnet name"
+    value: "$(ref.ml-training-subnet.name)"
+    
+  batch_job_template_name:
+    description: "Cloud Batch job template name"
+    value: "$(ref.ml-training-batch-job-template.name)"
+    
+  monitoring_workspace_name:
+    description: "Cloud Monitoring workspace name"
+    value: "$(ref.ml-monitoring-workspace.name)"
+    
+  log_sink_name:
+    description: "Log sink name for pipeline logs"
+    value: "$(ref.ml-training-log-sink.name)"
+    
+  # Connection information for applications
+  environment_variables:
+    description: "Environment variables for ML training applications"
+    value: |
+      REDIS_HOST=$(ref.ml-feature-cache-redis.host)
+      REDIS_PORT=$(ref.ml-feature-cache-redis.port)
+      BUCKET_NAME=$(ref.ml-training-bucket.name)
+      PROJECT_ID={{ project_id }}
+      REGION={{ region }}
+      ZONE={{ zone }}
+      SERVICE_ACCOUNT_EMAIL=$(ref.ml-training-service-account.email)
+      WORKBENCH_PROXY_URI=$(ref.ml-workbench-instance.proxyUri)
+      
+  # Deployment instructions
+  deployment_instructions:
+    description: "Instructions for deploying this infrastructure"
+    value: |
+      1. Save this configuration as main.yaml
+      2. Set required parameters in a parameters.yaml file
+      3. Deploy using: gcloud infra-manager deployments create ml-training-pipeline --location={{ region }} --template=main.yaml --parameters-file=parameters.yaml
+      4. Access Workbench at: $(ref.ml-workbench-instance.proxyUri)
+      5. Connect to Redis at: $(ref.ml-feature-cache-redis.host):$(ref.ml-feature-cache-redis.port)
+      6. Upload datasets to: gs://$(ref.ml-training-bucket.name)/datasets/
+      7. Monitor pipeline at: https://console.cloud.google.com/monitoring/workspaces/$(ref.ml-monitoring-workspace.name)
+      
+  # Cost optimization recommendations
+  cost_optimization_notes:
+    description: "Cost optimization recommendations"
+    value: |
+      - Stop Workbench instances when not in use to save compute costs
+      - Use Redis BASIC tier for development/testing environments
+      - Implement lifecycle policies on Cloud Storage bucket
+      - Consider using Spot VMs for batch training jobs
+      - Monitor and optimize Redis memory usage
+      - Use appropriate machine types based on workload requirements
+
+# Metadata for Infrastructure Manager
+metadata:
+  annotations:
+    config.kubernetes.io/managed-by: "infrastructure-manager"
+    deployment.cloud.google.com/version: "1.0.0"
+    deployment.cloud.google.com/recipe: "real-time-data-science-model-training-vertex-ai-workbench-memorystore-redis"
+  labels:
+    environment: "{{ environment }}"
+    use-case: "ml-training"
+    provider: "gcp"
+    managed-by: "infrastructure-manager"
+    recipe-category: "analytics"
+    recipe-difficulty: "intermediate"

@@ -1,0 +1,745 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'EKS Multi-Tenant Cluster Security with Namespace Isolation - Complete infrastructure for secure multi-tenant EKS environment'
+
+# ============================================================================
+# PARAMETERS
+# ============================================================================
+Parameters:
+  ClusterName:
+    Type: String
+    Default: 'multi-tenant-eks-cluster'
+    Description: 'Name of the EKS cluster'
+    MinLength: 1
+    MaxLength: 100
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: 'Must be a valid EKS cluster name (alphanumeric and hyphens only)'
+
+  KubernetesVersion:
+    Type: String
+    Default: '1.28'
+    Description: 'Kubernetes version for EKS cluster'
+    AllowedValues:
+      - '1.28'
+      - '1.29'
+      - '1.30'
+
+  NodeInstanceType:
+    Type: String
+    Default: 'm5.large'
+    Description: 'EC2 instance type for worker nodes'
+    AllowedValues:
+      - 't3.medium'
+      - 't3.large'
+      - 'm5.large'
+      - 'm5.xlarge'
+      - 'm5.2xlarge'
+      - 'c5.large'
+      - 'c5.xlarge'
+
+  NodeGroupMinSize:
+    Type: Number
+    Default: 2
+    Description: 'Minimum number of worker nodes'
+    MinValue: 1
+    MaxValue: 10
+
+  NodeGroupMaxSize:
+    Type: Number
+    Default: 6
+    Description: 'Maximum number of worker nodes'
+    MinValue: 1
+    MaxValue: 100
+
+  NodeGroupDesiredSize:
+    Type: Number
+    Default: 3
+    Description: 'Desired number of worker nodes'
+    MinValue: 1
+    MaxValue: 10
+
+  VpcCIDR:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: 'CIDR block for VPC'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(/([0-9]|[1-2][0-9]|3[0-2]))$'
+    ConstraintDescription: 'Must be a valid CIDR range'
+
+  PrivateSubnet1CIDR:
+    Type: String
+    Default: '10.0.1.0/24'
+    Description: 'CIDR block for private subnet 1'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(/([0-9]|[1-2][0-9]|3[0-2]))$'
+
+  PrivateSubnet2CIDR:
+    Type: String
+    Default: '10.0.2.0/24'
+    Description: 'CIDR block for private subnet 2'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(/([0-9]|[1-2][0-9]|3[0-2]))$'
+
+  PublicSubnet1CIDR:
+    Type: String
+    Default: '10.0.101.0/24'
+    Description: 'CIDR block for public subnet 1'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(/([0-9]|[1-2][0-9]|3[0-2]))$'
+
+  PublicSubnet2CIDR:
+    Type: String
+    Default: '10.0.102.0/24'
+    Description: 'CIDR block for public subnet 2'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(/([0-9]|[1-2][0-9]|3[0-2]))$'
+
+  TenantAlphaName:
+    Type: String
+    Default: 'tenant-alpha'
+    Description: 'Name for the first tenant'
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must be lowercase alphanumeric with hyphens'
+
+  TenantBetaName:
+    Type: String
+    Default: 'tenant-beta'
+    Description: 'Name for the second tenant'
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must be lowercase alphanumeric with hyphens'
+
+  EnableClusterLogging:
+    Type: String
+    Default: 'true'
+    Description: 'Enable EKS control plane logging'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableNetworkPolicySupport:
+    Type: String
+    Default: 'true'
+    Description: 'Enable network policy support in VPC CNI'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  Environment:
+    Type: String
+    Default: 'production'
+    Description: 'Environment tag for resources'
+    AllowedValues:
+      - 'development'
+      - 'staging'
+      - 'production'
+
+# ============================================================================
+# CONDITIONS
+# ============================================================================
+Conditions:
+  EnableLogging: !Equals [!Ref EnableClusterLogging, 'true']
+  EnableNetworkPolicies: !Equals [!Ref EnableNetworkPolicySupport, 'true']
+
+# ============================================================================
+# RESOURCES
+# ============================================================================
+Resources:
+  # VPC and Networking Infrastructure
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'EKS Multi-Tenant Cluster'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-igw'
+        - Key: Environment
+          Value: !Ref Environment
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # Public Subnets
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet1CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet2CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+
+  # Private Subnets
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet2CIDR
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+
+  # NAT Gateways
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-natgw-1-eip'
+        - Key: Environment
+          Value: !Ref Environment
+
+  NatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-natgw-2-eip'
+        - Key: Environment
+          Value: !Ref Environment
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-natgw-1'
+        - Key: Environment
+          Value: !Ref Environment
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-natgw-2'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Route Tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-rt'
+        - Key: Environment
+          Value: !Ref Environment
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-rt-1'
+        - Key: Environment
+          Value: !Ref Environment
+
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-rt-2'
+        - Key: Environment
+          Value: !Ref Environment
+
+  DefaultPrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet2
+
+  # Security Groups
+  ControlPlaneSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group for EKS control plane'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref NodeSecurityGroup
+          Description: 'HTTPS access from worker nodes'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-control-plane-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  NodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group for EKS worker nodes'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 1025
+          ToPort: 65535
+          SourceSecurityGroupId: !Ref ControlPlaneSecurityGroup
+          Description: 'Control plane to node communication'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ControlPlaneSecurityGroup
+          Description: 'Control plane to node HTTPS'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-node-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Allow nodes to communicate with each other
+  NodeSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+      Description: 'Node to node communication'
+
+  # IAM Roles for EKS
+  EKSClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-cluster-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-cluster-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  EKSNodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-node-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-node-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Tenant IAM Roles
+  TenantAlphaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${TenantAlphaName}-eks-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Sub '${TenantAlphaName}-external-id'
+      Tags:
+        - Key: Name
+          Value: !Sub '${TenantAlphaName}-eks-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Tenant
+          Value: !Ref TenantAlphaName
+
+  TenantBetaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${TenantBetaName}-eks-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Sub '${TenantBetaName}-external-id'
+      Tags:
+        - Key: Name
+          Value: !Sub '${TenantBetaName}-eks-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Tenant
+          Value: !Ref TenantBetaName
+
+  # EKS Cluster
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt EKSClusterRole.Arn
+      ResourcesVpcConfig:
+        SecurityGroupIds:
+          - !Ref ControlPlaneSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+          - !Ref PublicSubnet1
+          - !Ref PublicSubnet2
+        EndpointConfigPrivate: true
+        EndpointConfigPublic: true
+        PublicAccessCidrs:
+          - 0.0.0.0/0
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - !If
+              - EnableLogging
+              - Type: api
+              - !Ref AWS::NoValue
+            - !If
+              - EnableLogging
+              - Type: audit
+              - !Ref AWS::NoValue
+            - !If
+              - EnableLogging
+              - Type: authenticator
+              - !Ref AWS::NoValue
+            - !If
+              - EnableLogging
+              - Type: controllerManager
+              - !Ref AWS::NoValue
+            - !If
+              - EnableLogging
+              - Type: scheduler
+              - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Ref ClusterName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Multi-Tenant Security'
+
+  # EKS Node Group
+  EKSNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref EKSCluster
+      NodegroupName: !Sub '${ClusterName}-node-group'
+      NodeRole: !GetAtt EKSNodeRole.Arn
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      InstanceTypes:
+        - !Ref NodeInstanceType
+      ScalingConfig:
+        MinSize: !Ref NodeGroupMinSize
+        MaxSize: !Ref NodeGroupMaxSize
+        DesiredSize: !Ref NodeGroupDesiredSize
+      RemoteAccess:
+        Ec2SshKey: !Ref AWS::NoValue
+      Labels:
+        Environment: !Ref Environment
+        NodeGroup: !Sub '${ClusterName}-node-group'
+      Tags:
+        Name: !Sub '${ClusterName}-node-group'
+        Environment: !Ref Environment
+        Purpose: 'Multi-Tenant Workloads'
+
+  # EKS Add-ons
+  CoreDNSAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: coredns
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-coredns'
+        - Key: Environment
+          Value: !Ref Environment
+
+  KubeProxyAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: kube-proxy
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-kube-proxy'
+        - Key: Environment
+          Value: !Ref Environment
+
+  VPCCNIAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: vpc-cni
+      ResolveConflicts: OVERWRITE
+      ConfigurationValues: !If
+        - EnableNetworkPolicies
+        - !Sub |
+          {
+            "networkPolicy": {
+              "enabled": true
+            }
+          }
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-vpc-cni'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # EKS Access Entries for Tenant Roles
+  TenantAlphaAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref EKSCluster
+      PrincipalArn: !GetAtt TenantAlphaRole.Arn
+      Type: STANDARD
+      Username: !Sub '${TenantAlphaName}-user'
+      Tags:
+        - Key: Name
+          Value: !Sub '${TenantAlphaName}-access-entry'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Tenant
+          Value: !Ref TenantAlphaName
+
+  TenantBetaAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref EKSCluster
+      PrincipalArn: !GetAtt TenantBetaRole.Arn
+      Type: STANDARD
+      Username: !Sub '${TenantBetaName}-user'
+      Tags:
+        - Key: Name
+          Value: !Sub '${TenantBetaName}-access-entry'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Tenant
+          Value: !Ref TenantBetaName
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+Outputs:
+  ClusterName:
+    Description: 'Name of the EKS cluster'
+    Value: !Ref EKSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterName'
+
+  ClusterArn:
+    Description: 'ARN of the EKS cluster'
+    Value: !GetAtt EKSCluster.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterArn'
+
+  ClusterEndpoint:
+    Description: 'Endpoint URL of the EKS cluster'
+    Value: !GetAtt EKSCluster.Endpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterEndpoint'
+
+  ClusterSecurityGroupId:
+    Description: 'Security group ID of the EKS cluster'
+    Value: !GetAtt EKSCluster.ClusterSecurityGroupId
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterSecurityGroupId'
+
+  VpcId:
+    Description: 'VPC ID where the cluster is deployed'
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+
+  PrivateSubnetIds:
+    Description: 'List of private subnet IDs'
+    Value: !Join
+      - ','
+      - - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnetIds'
+
+  PublicSubnetIds:
+    Description: 'List of public subnet IDs'
+    Value: !Join
+      - ','
+      - - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnetIds'
+
+  NodeSecurityGroupId:
+    Description: 'Security group ID for worker nodes'
+    Value: !Ref NodeSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-NodeSecurityGroupId'
+
+  TenantAlphaRoleArn:
+    Description: 'ARN of the tenant alpha IAM role'
+    Value: !GetAtt TenantAlphaRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TenantAlphaRoleArn'
+
+  TenantBetaRoleArn:
+    Description: 'ARN of the tenant beta IAM role'
+    Value: !GetAtt TenantBetaRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TenantBetaRoleArn'
+
+  KubeconfigCommand:
+    Description: 'Command to update kubeconfig for cluster access'
+    Value: !Sub 'aws eks update-kubeconfig --region ${AWS::Region} --name ${EKSCluster}'
+
+  PostDeploymentInstructions:
+    Description: 'Instructions for completing the multi-tenant setup'
+    Value: !Sub |
+      After the CloudFormation stack is deployed, complete the setup by:
+      1. Update kubeconfig: aws eks update-kubeconfig --region ${AWS::Region} --name ${EKSCluster}
+      2. Create tenant namespaces: kubectl create namespace ${TenantAlphaName} && kubectl create namespace ${TenantBetaName}
+      3. Apply RBAC configurations, network policies, and resource quotas as shown in the recipe
+      4. Deploy sample applications to test the multi-tenant isolation
+      
+      Tenant Role ARNs:
+      - Alpha: ${TenantAlphaRole.Arn}
+      - Beta: ${TenantBetaRole.Arn}
+
+  NetworkPolicySupport:
+    Description: 'Network policy support status'
+    Value: !If
+      - EnableNetworkPolicies
+      - 'Enabled - Network policies can be applied'
+      - 'Disabled - Network policies will not be enforced'

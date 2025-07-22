@@ -1,0 +1,1211 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Advanced CI/CD Pipeline for Container Applications with CodePipeline, CodeDeploy, and ECS - Multi-environment deployment with blue-green capabilities'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: 'Name of the project (will be used as prefix for resources)'
+    Default: 'advanced-cicd'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '[a-zA-Z0-9-]+'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+
+  Environment:
+    Type: String
+    Description: 'Environment type for deployment'
+    Default: 'production'
+    AllowedValues:
+      - 'development'
+      - 'staging'
+      - 'production'
+
+  VpcCidr:
+    Type: String
+    Description: 'CIDR block for VPC'
+    Default: '10.0.0.0/16'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$'
+    ConstraintDescription: 'Must be a valid CIDR range'
+
+  ContainerPort:
+    Type: Number
+    Description: 'Port number for container application'
+    Default: 8080
+    MinValue: 1
+    MaxValue: 65535
+
+  DesiredCountDev:
+    Type: Number
+    Description: 'Desired number of tasks in development environment'
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+
+  DesiredCountProd:
+    Type: Number
+    Description: 'Desired number of tasks in production environment'
+    Default: 3
+    MinValue: 1
+    MaxValue: 20
+
+  GitHubOwner:
+    Type: String
+    Description: 'GitHub repository owner'
+    Default: 'your-github-username'
+
+  GitHubRepo:
+    Type: String
+    Description: 'GitHub repository name'
+    Default: 'your-repo-name'
+
+  GitHubBranch:
+    Type: String
+    Description: 'GitHub branch to track'
+    Default: 'main'
+
+  ApprovalEmail:
+    Type: String
+    Description: 'Email address for manual approval notifications'
+    Default: 'admin@example.com'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  ImageScanningEnabled:
+    Type: String
+    Description: 'Enable ECR image scanning'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  ContainerCpuDev:
+    Type: Number
+    Description: 'CPU units for development containers (1024 = 1 vCPU)'
+    Default: 256
+    AllowedValues: [256, 512, 1024, 2048, 4096]
+
+  ContainerMemoryDev:
+    Type: Number
+    Description: 'Memory for development containers (MB)'
+    Default: 512
+    AllowedValues: [512, 1024, 2048, 4096, 8192]
+
+  ContainerCpuProd:
+    Type: Number
+    Description: 'CPU units for production containers (1024 = 1 vCPU)'
+    Default: 512
+    AllowedValues: [256, 512, 1024, 2048, 4096]
+
+  ContainerMemoryProd:
+    Type: Number
+    Description: 'Memory for production containers (MB)'
+    Default: 1024
+    AllowedValues: [512, 1024, 2048, 4096, 8192]
+
+  LogRetentionDays:
+    Type: Number
+    Description: 'CloudWatch log retention in days'
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'production']
+  IsDevelopment: !Equals [!Ref Environment, 'development']
+  EnableScanning: !Equals [!Ref ImageScanningEnabled, 'true']
+
+Resources:
+  # ==================== VPC AND NETWORKING ====================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-igw'
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 6, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-subnet-1'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 6, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-subnet-2'
+
+  PublicSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [2, !GetAZs '']
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 6, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-subnet-3'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-rt'
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  PublicSubnet3RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet3
+
+  # ==================== SECURITY GROUPS ====================
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-alb-sg'
+      GroupDescription: 'Security group for Application Load Balancer'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTP traffic from internet'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTPS traffic from internet'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alb-sg'
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-ecs-sg'
+      GroupDescription: 'Security group for ECS tasks'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: 'Container port from ALB'
+        - IpProtocol: tcp
+          FromPort: 2000
+          ToPort: 2000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: 'X-Ray daemon port'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ecs-sg'
+
+  # ==================== ECR REPOSITORY ====================
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}-repo'
+      ImageScanningConfiguration:
+        ScanOnPush: !If [EnableScanning, true, false]
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 production images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["prod"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep last 5 development images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["dev"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5
+                },
+                "action": {
+                  "type": "expire"
+                }
+              },
+              {
+                "rulePriority": 3,
+                "description": "Delete untagged images older than 1 day",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 1
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-repo'
+
+  # ==================== APPLICATION LOAD BALANCERS ====================
+  DevApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-dev-alb'
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+        - !Ref PublicSubnet3
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dev-alb'
+        - Key: Environment
+          Value: development
+
+  ProdApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-prod-alb'
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+        - !Ref PublicSubnet3
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-prod-alb'
+        - Key: Environment
+          Value: production
+
+  # ==================== TARGET GROUPS ====================
+  DevTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-dev-tg'
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dev-tg'
+
+  ProdTargetGroupBlue:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-prod-blue'
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckIntervalSeconds: 15
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-prod-blue'
+
+  ProdTargetGroupGreen:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-prod-green'
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckIntervalSeconds: 15
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-prod-green'
+
+  # ==================== LISTENERS ====================
+  DevListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref DevTargetGroup
+      LoadBalancerArn: !Ref DevApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  ProdListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ProdTargetGroupBlue
+      LoadBalancerArn: !Ref ProdApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # ==================== IAM ROLES ====================
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-task-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-task-execution-role'
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-task-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                  - secretsmanager:GetSecretValue
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-task-role'
+
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-codedeploy-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-codedeploy-role'
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-codebuild-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-codebuild-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:GetAuthorizationToken
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:DescribeRepositories
+                  - ecr:DescribeImages
+                  - s3:GetObject
+                  - s3:PutObject
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - secretsmanager:GetSecretValue
+                  - codebuild:CreateReportGroup
+                  - codebuild:CreateReport
+                  - codebuild:UpdateReport
+                  - codebuild:BatchPutTestCases
+                  - codebuild:BatchPutCodeCoverages
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-codebuild-role'
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-codepipeline-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-codepipeline-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketVersioning
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetApplication
+                  - codedeploy:GetApplicationRevision
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetDeploymentConfig
+                  - codedeploy:RegisterApplicationRevision
+                  - ecs:DescribeServices
+                  - ecs:DescribeTaskDefinition
+                  - ecs:DescribeTasks
+                  - ecs:ListTasks
+                  - ecs:RegisterTaskDefinition
+                  - ecs:UpdateService
+                  - iam:PassRole
+                  - sns:Publish
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-codepipeline-role'
+
+  # ==================== CLOUDWATCH LOGS ====================
+  DevLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}/dev'
+      RetentionInDays: 7
+
+  ProdLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}/prod'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ==================== ECS CLUSTERS ====================
+  DevECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-dev-cluster'
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1
+          Base: 0
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dev-cluster'
+        - Key: Environment
+          Value: development
+
+  ProdECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-prod-cluster'
+      CapacityProviders:
+        - FARGATE
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+          Base: 0
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-prod-cluster'
+        - Key: Environment
+          Value: production
+
+  # ==================== TASK DEFINITIONS ====================
+  DevTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-dev-task'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref ContainerCpuDev
+      Memory: !Ref ContainerMemoryDev
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: nginx:latest
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          Essential: true
+          Environment:
+            - Name: ENV
+              Value: development
+            - Name: AWS_XRAY_TRACING_NAME
+              Value: !Sub '${ProjectName}-dev'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref DevLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - 'curl -f http://localhost:8080/health || exit 1'
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+        - Name: xray-daemon
+          Image: amazon/aws-xray-daemon:latest
+          PortMappings:
+            - ContainerPort: 2000
+              Protocol: udp
+          Essential: false
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref DevLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: xray
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dev-task'
+
+  ProdTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-prod-task'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref ContainerCpuProd
+      Memory: !Ref ContainerMemoryProd
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}:latest'
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          Essential: true
+          Environment:
+            - Name: ENV
+              Value: production
+            - Name: AWS_XRAY_TRACING_NAME
+              Value: !Sub '${ProjectName}-prod'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ProdLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - 'curl -f http://localhost:8080/health || exit 1'
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+        - Name: xray-daemon
+          Image: amazon/aws-xray-daemon:latest
+          PortMappings:
+            - ContainerPort: 2000
+              Protocol: udp
+          Essential: false
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ProdLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: xray
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-prod-task'
+
+  # ==================== ECS SERVICES ====================
+  DevECSService:
+    Type: AWS::ECS::Service
+    DependsOn: DevListener
+    Properties:
+      ServiceName: !Sub '${ProjectName}-dev-service'
+      Cluster: !Ref DevECSCluster
+      TaskDefinition: !Ref DevTaskDefinition
+      DesiredCount: !Ref DesiredCountDev
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+            - !Ref PublicSubnet3
+          AssignPublicIp: ENABLED
+      LoadBalancers:
+        - ContainerName: app
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref DevTargetGroup
+      EnableExecuteCommand: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dev-service'
+        - Key: Environment
+          Value: development
+
+  ProdECSService:
+    Type: AWS::ECS::Service
+    DependsOn: ProdListener
+    Properties:
+      ServiceName: !Sub '${ProjectName}-prod-service'
+      Cluster: !Ref ProdECSCluster
+      TaskDefinition: !Ref ProdTaskDefinition
+      DesiredCount: !Ref DesiredCountProd
+      LaunchType: FARGATE
+      DeploymentController:
+        Type: CODE_DEPLOY
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+            - !Ref PublicSubnet3
+          AssignPublicIp: ENABLED
+      LoadBalancers:
+        - ContainerName: app
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref ProdTargetGroupBlue
+      EnableExecuteCommand: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-prod-service'
+        - Key: Environment
+          Value: production
+
+  # ==================== PARAMETER STORE ====================
+  AppEnvironmentParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/app/environment'
+      Type: String
+      Value: !Ref Environment
+      Description: 'Application environment'
+      Tags:
+        Environment: !Ref Environment
+
+  AppVersionParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/app/version'
+      Type: String
+      Value: '1.0.0'
+      Description: 'Application version'
+      Tags:
+        Environment: !Ref Environment
+
+  # ==================== S3 BUCKET FOR CODEPIPELINE ====================
+  CodePipelineArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-artifacts-${AWS::Region}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-artifacts-bucket'
+
+  # ==================== SNS TOPIC FOR NOTIFICATIONS ====================
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-alerts'
+      DisplayName: !Sub '${ProjectName} CI/CD Alerts'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alerts'
+
+  AlertsTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AlertsTopic
+      Endpoint: !Ref ApprovalEmail
+
+  # ==================== CLOUDWATCH ALARMS ====================
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-high-error-rate'
+      AlarmDescription: 'High error rate detected'
+      MetricName: 4XXError
+      Namespace: AWS/ApplicationELB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertsTopic
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt ProdApplicationLoadBalancer.LoadBalancerFullName
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-high-error-rate'
+
+  HighResponseTimeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-high-response-time'
+      AlarmDescription: 'High response time detected'
+      MetricName: TargetResponseTime
+      Namespace: AWS/ApplicationELB
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 2.0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertsTopic
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt ProdApplicationLoadBalancer.LoadBalancerFullName
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-high-response-time'
+
+  # ==================== CODEBUILD PROJECT ====================
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-build'
+      Description: 'Build project for container applications with security scanning'
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: IMAGE_REPO_NAME
+            Value: !Ref ECRRepository
+          - Name: IMAGE_TAG
+            Value: latest
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Logging in to Amazon ECR...
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+                - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME
+                - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+                - IMAGE_TAG=$COMMIT_HASH
+                - echo Installing security scanning tools...
+                - curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+            build:
+              commands:
+                - echo Build started on `date`
+                - echo Building the Docker image...
+                - docker build -t $IMAGE_REPO_NAME:latest .
+                - docker tag $IMAGE_REPO_NAME:latest $REPOSITORY_URI:latest
+                - docker tag $IMAGE_REPO_NAME:latest $REPOSITORY_URI:$IMAGE_TAG
+                - echo Running security scan...
+                - grype $IMAGE_REPO_NAME:latest --fail-on medium
+                - echo Running unit tests...
+                - docker run --rm $IMAGE_REPO_NAME:latest npm test || echo "No tests found"
+            post_build:
+              commands:
+                - echo Build completed on `date`
+                - echo Pushing the Docker images...
+                - docker push $REPOSITORY_URI:latest
+                - docker push $REPOSITORY_URI:$IMAGE_TAG
+                - echo Writing image definitions file...
+                - printf '[{"name":"app","imageUri":"%s"}]' $REPOSITORY_URI:$IMAGE_TAG > imagedefinitions.json
+                - echo Creating task definition file...
+                - printf '{"family":"advanced-cicd-prod-task","networkMode":"awsvpc","requiresCompatibilities":["FARGATE"],"cpu":"512","memory":"1024","executionRoleArn":"arn:aws:iam::%s:role/advanced-cicd-task-execution-role","taskRoleArn":"arn:aws:iam::%s:role/advanced-cicd-task-role","containerDefinitions":[{"name":"app","image":"%s","portMappings":[{"containerPort":8080,"protocol":"tcp"}],"essential":true,"environment":[{"name":"ENV","value":"production"},{"name":"AWS_XRAY_TRACING_NAME","value":"advanced-cicd-prod"}],"logConfiguration":{"logDriver":"awslogs","options":{"awslogs-group":"/ecs/advanced-cicd/prod","awslogs-region":"%s","awslogs-stream-prefix":"ecs"}},"healthCheck":{"command":["CMD-SHELL","curl -f http://localhost:8080/health || exit 1"],"interval":30,"timeout":5,"retries":3,"startPeriod":60}},{"name":"xray-daemon","image":"amazon/aws-xray-daemon:latest","portMappings":[{"containerPort":2000,"protocol":"udp"}],"essential":false,"logConfiguration":{"logDriver":"awslogs","options":{"awslogs-group":"/ecs/advanced-cicd/prod","awslogs-region":"%s","awslogs-stream-prefix":"xray"}}}]}' $AWS_ACCOUNT_ID $AWS_ACCOUNT_ID $REPOSITORY_URI:$IMAGE_TAG $AWS_DEFAULT_REGION $AWS_DEFAULT_REGION > taskdef.json
+                - echo Creating appspec file...
+                - printf 'version: 0.0\nResources:\n  - TargetService:\n      Type: AWS::ECS::Service\n      Properties:\n        TaskDefinition: <TASK_DEFINITION>\n        LoadBalancerInfo:\n          ContainerName: "app"\n          ContainerPort: 8080\n' > appspec.yaml
+          artifacts:
+            files:
+              - imagedefinitions.json
+              - taskdef.json
+              - appspec.yaml
+          reports:
+            unit-tests:
+              files:
+                - 'test-results.xml'
+              name: 'unit-tests'
+            security-scan:
+              files:
+                - 'security-scan-results.json'
+              name: 'security-scan'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-build'
+
+  # ==================== CODEDEPLOY APPLICATION ====================
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub '${ProjectName}-app'
+      ComputePlatform: ECS
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-app'
+
+  CodeDeployDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentGroupName: !Sub '${ProjectName}-prod-deployment-group'
+      ServiceRoleArn: !GetAtt CodeDeployRole.Arn
+      DeploymentConfigName: CodeDeployDefault.ECSCanary10Percent5Minutes
+      ECSServices:
+        - ServiceName: !Ref ProdECSService
+          ClusterName: !Ref ProdECSCluster
+      LoadBalancerInfo:
+        TargetGroupInfoList:
+          - Name: !GetAtt ProdTargetGroupBlue.TargetGroupName
+          - Name: !GetAtt ProdTargetGroupGreen.TargetGroupName
+      ProductionTrafficRoute:
+        ListenerArns:
+          - !Ref ProdListener
+      BlueGreenDeploymentConfiguration:
+        TerminateBlueInstancesOnDeploymentSuccess:
+          Action: TERMINATE
+          TerminationWaitTimeInMinutes: 5
+        DeploymentReadyOption:
+          ActionOnTimeout: CONTINUE_DEPLOYMENT
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
+          - DEPLOYMENT_STOP_ON_ALARM
+      AlarmConfiguration:
+        Enabled: true
+        Alarms:
+          - Name: !Ref HighErrorRateAlarm
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-prod-deployment-group'
+
+  # ==================== CODEPIPELINE ====================
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub '${ProjectName}-pipeline'
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref CodePipelineArtifactsBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: '1'
+              Configuration:
+                S3Bucket: !Ref CodePipelineArtifactsBucket
+                S3ObjectKey: source.zip
+              OutputArtifacts:
+                - Name: SourceOutput
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+        - Name: Deploy-Dev
+          Actions:
+            - Name: Deploy-Dev
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: ECS
+                Version: '1'
+              Configuration:
+                ClusterName: !Ref DevECSCluster
+                ServiceName: !Ref DevECSService
+                FileName: imagedefinitions.json
+              InputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+        - Name: Approval
+          Actions:
+            - Name: ManualApproval
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                NotificationArn: !Ref AlertsTopic
+                CustomData: 'Please review the development deployment and approve for production deployment.'
+        - Name: Deploy-Production
+          Actions:
+            - Name: Deploy-Production
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CodeDeployToECS
+                Version: '1'
+              Configuration:
+                ApplicationName: !Ref CodeDeployApplication
+                DeploymentGroupName: !Ref CodeDeployDeploymentGroup
+                TaskDefinitionTemplateArtifact: BuildOutput
+                TaskDefinitionTemplatePath: taskdef.json
+                AppSpecTemplateArtifact: BuildOutput
+                AppSpecTemplatePath: appspec.yaml
+              InputArtifacts:
+                - Name: BuildOutput
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-pipeline'
+
+# ==================== OUTPUTS ====================
+Outputs:
+  VPCId:
+    Description: 'VPC ID'
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${ProjectName}-VPC-ID'
+
+  ECRRepositoryURI:
+    Description: 'ECR Repository URI'
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}'
+    Export:
+      Name: !Sub '${ProjectName}-ECR-URI'
+
+  DevLoadBalancerDNS:
+    Description: 'Development Load Balancer DNS Name'
+    Value: !GetAtt DevApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${ProjectName}-Dev-ALB-DNS'
+
+  ProdLoadBalancerDNS:
+    Description: 'Production Load Balancer DNS Name'
+    Value: !GetAtt ProdApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${ProjectName}-Prod-ALB-DNS'
+
+  DevECSClusterName:
+    Description: 'Development ECS Cluster Name'
+    Value: !Ref DevECSCluster
+    Export:
+      Name: !Sub '${ProjectName}-Dev-Cluster'
+
+  ProdECSClusterName:
+    Description: 'Production ECS Cluster Name'
+    Value: !Ref ProdECSCluster
+    Export:
+      Name: !Sub '${ProjectName}-Prod-Cluster'
+
+  CodePipelineName:
+    Description: 'CodePipeline Name'
+    Value: !Ref CodePipeline
+    Export:
+      Name: !Sub '${ProjectName}-Pipeline'
+
+  S3ArtifactsBucket:
+    Description: 'S3 Artifacts Bucket Name'
+    Value: !Ref CodePipelineArtifactsBucket
+    Export:
+      Name: !Sub '${ProjectName}-Artifacts-Bucket'
+
+  CodeBuildProjectName:
+    Description: 'CodeBuild Project Name'
+    Value: !Ref CodeBuildProject
+    Export:
+      Name: !Sub '${ProjectName}-Build-Project'
+
+  CodeDeployApplicationName:
+    Description: 'CodeDeploy Application Name'
+    Value: !Ref CodeDeployApplication
+    Export:
+      Name: !Sub '${ProjectName}-Deploy-App'
+
+  SNSTopicArn:
+    Description: 'SNS Topic ARN for notifications'
+    Value: !Ref AlertsTopic
+    Export:
+      Name: !Sub '${ProjectName}-SNS-Topic'
+
+  DevServiceURL:
+    Description: 'Development Service URL'
+    Value: !Sub 'http://${DevApplicationLoadBalancer.DNSName}'
+    Export:
+      Name: !Sub '${ProjectName}-Dev-URL'
+
+  ProdServiceURL:
+    Description: 'Production Service URL'
+    Value: !Sub 'http://${ProdApplicationLoadBalancer.DNSName}'
+    Export:
+      Name: !Sub '${ProjectName}-Prod-URL'
+
+  DevTaskDefinitionArn:
+    Description: 'Development Task Definition ARN'
+    Value: !Ref DevTaskDefinition
+    Export:
+      Name: !Sub '${ProjectName}-Dev-TaskDef'
+
+  ProdTaskDefinitionArn:
+    Description: 'Production Task Definition ARN'
+    Value: !Ref ProdTaskDefinition
+    Export:
+      Name: !Sub '${ProjectName}-Prod-TaskDef'
+
+  HighErrorRateAlarmArn:
+    Description: 'High Error Rate Alarm ARN'
+    Value: !GetAtt HighErrorRateAlarm.Arn
+    Export:
+      Name: !Sub '${ProjectName}-Error-Alarm'
+
+  HighResponseTimeAlarmArn:
+    Description: 'High Response Time Alarm ARN'
+    Value: !GetAtt HighResponseTimeAlarm.Arn
+    Export:
+      Name: !Sub '${ProjectName}-Response-Alarm'

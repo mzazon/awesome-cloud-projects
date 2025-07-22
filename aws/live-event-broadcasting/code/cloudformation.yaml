@@ -1,0 +1,688 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Live Event Broadcasting with AWS Elemental MediaConnect, MediaLive, and MediaPackage - Production-ready template with redundancy and monitoring'
+
+Parameters:
+  # General Parameters
+  ProjectName:
+    Type: String
+    Default: 'live-event-broadcast'
+    Description: 'Name prefix for all resources'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must begin with a letter and contain only alphanumeric characters and hyphens'
+    MaxLength: 32
+    MinLength: 3
+
+  Environment:
+    Type: String
+    Default: 'production'
+    Description: 'Environment name for resource tagging'
+    AllowedValues:
+      - 'development'
+      - 'staging'
+      - 'production'
+
+  # MediaConnect Parameters
+  PrimaryAvailabilityZone:
+    Type: String
+    Default: 'a'
+    Description: 'Availability zone suffix for primary MediaConnect flow (e.g., a for us-east-1a)'
+    AllowedValues:
+      - 'a'
+      - 'b'
+      - 'c'
+      - 'd'
+      - 'e'
+      - 'f'
+
+  BackupAvailabilityZone:
+    Type: String
+    Default: 'b'
+    Description: 'Availability zone suffix for backup MediaConnect flow (e.g., b for us-east-1b)'
+    AllowedValues:
+      - 'a'
+      - 'b'
+      - 'c'
+      - 'd'
+      - 'e'
+      - 'f'
+
+  PrimaryIngestPort:
+    Type: Number
+    Default: 5000
+    Description: 'Port for primary MediaConnect flow ingest'
+    MinValue: 1024
+    MaxValue: 65535
+
+  BackupIngestPort:
+    Type: Number
+    Default: 5001
+    Description: 'Port for backup MediaConnect flow ingest'
+    MinValue: 1024
+    MaxValue: 65535
+
+  IngestWhitelistCIDR:
+    Type: String
+    Default: '0.0.0.0/0'
+    Description: 'CIDR block for encoder IP whitelist (use specific IP ranges in production)'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(/([0-9]|[1-2][0-9]|3[0-2]))?$'
+    ConstraintDescription: 'Must be a valid CIDR block'
+
+  # MediaLive Parameters
+  VideoResolution:
+    Type: String
+    Default: 'HD'
+    Description: 'Video resolution for MediaLive input specification'
+    AllowedValues:
+      - 'SD'
+      - 'HD'
+      - 'UHD'
+
+  MaxBitrate:
+    Type: String
+    Default: 'MAX_10_MBPS'
+    Description: 'Maximum bitrate for MediaLive input specification'
+    AllowedValues:
+      - 'MAX_10_MBPS'
+      - 'MAX_20_MBPS'
+      - 'MAX_50_MBPS'
+
+  VideoBitrate:
+    Type: Number
+    Default: 2000000
+    Description: 'Video bitrate in bits per second'
+    MinValue: 100000
+    MaxValue: 50000000
+
+  AudioBitrate:
+    Type: Number
+    Default: 128000
+    Description: 'Audio bitrate in bits per second'
+    MinValue: 64000
+    MaxValue: 320000
+
+  # MediaPackage Parameters
+  HLSSegmentDuration:
+    Type: Number
+    Default: 6
+    Description: 'HLS segment duration in seconds'
+    MinValue: 1
+    MaxValue: 30
+
+  HLSPlaylistWindow:
+    Type: Number
+    Default: 60
+    Description: 'HLS playlist window in seconds'
+    MinValue: 30
+    MaxValue: 3600
+
+  # Monitoring Parameters
+  AlertingEmail:
+    Type: String
+    Description: 'Email address for CloudWatch alarms (optional)'
+    Default: ''
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    Description: 'Enable detailed CloudWatch monitoring'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Conditions:
+  # Condition to create SNS topic and subscription only if email is provided
+  CreateAlerting: !Not [!Equals [!Ref AlertingEmail, '']]
+  # Condition to enable detailed monitoring
+  DetailedMonitoring: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  # Condition to check if AZs are different
+  DifferentAZs: !Not [!Equals [!Ref PrimaryAvailabilityZone, !Ref BackupAvailabilityZone]]
+
+Resources:
+  # IAM Role for MediaLive
+  MediaLiveRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-MediaLiveRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: medialive.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/MediaLiveFullAccess'
+        - 'arn:aws:iam::aws:policy/MediaConnectFullAccess'
+        - 'arn:aws:iam::aws:policy/MediaPackageFullAccess'
+      Path: /
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-MediaLiveRole'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: 'LiveBroadcast'
+
+  # Primary MediaConnect Flow
+  PrimaryMediaConnectFlow:
+    Type: 'AWS::MediaConnect::Flow'
+    Properties:
+      Name: !Sub '${ProjectName}-primary-flow'
+      AvailabilityZone: !Sub '${AWS::Region}${PrimaryAvailabilityZone}'
+      Source:
+        Name: 'PrimarySource'
+        Protocol: 'rtp'
+        IngestPort: !Ref PrimaryIngestPort
+        WhitelistCidr: !Ref IngestWhitelistCIDR
+        Description: 'Primary encoder input for live event broadcasting'
+
+  # Backup MediaConnect Flow
+  BackupMediaConnectFlow:
+    Type: 'AWS::MediaConnect::Flow'
+    Properties:
+      Name: !Sub '${ProjectName}-backup-flow'
+      AvailabilityZone: !Sub '${AWS::Region}${BackupAvailabilityZone}'
+      Source:
+        Name: 'BackupSource'
+        Protocol: 'rtp'
+        IngestPort: !Ref BackupIngestPort
+        WhitelistCidr: !Ref IngestWhitelistCIDR
+        Description: 'Backup encoder input for live event broadcasting'
+
+  # Primary Flow Output to MediaLive
+  PrimaryFlowOutput:
+    Type: 'AWS::MediaConnect::FlowOutput'
+    Properties:
+      FlowArn: !GetAtt PrimaryMediaConnectFlow.FlowArn
+      Name: 'MediaLiveOutput'
+      Protocol: 'rtp-fec'
+      Destination: '0.0.0.0'
+      Port: 5002
+      Description: 'Output to MediaLive primary input'
+
+  # Backup Flow Output to MediaLive
+  BackupFlowOutput:
+    Type: 'AWS::MediaConnect::FlowOutput'
+    Properties:
+      FlowArn: !GetAtt BackupMediaConnectFlow.FlowArn
+      Name: 'MediaLiveOutput'
+      Protocol: 'rtp-fec'
+      Destination: '0.0.0.0'
+      Port: 5003
+      Description: 'Output to MediaLive backup input'
+
+  # MediaPackage Channel
+  MediaPackageChannel:
+    Type: 'AWS::MediaPackage::Channel'
+    Properties:
+      Id: !Sub '${ProjectName}-package-channel'
+      Description: 'MediaPackage channel for live event broadcasting'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-package-channel'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: 'LiveBroadcast'
+
+  # MediaPackage HLS Origin Endpoint
+  MediaPackageHLSEndpoint:
+    Type: 'AWS::MediaPackage::OriginEndpoint'
+    Properties:
+      Id: !Sub '${ProjectName}-hls-endpoint'
+      ChannelId: !Ref MediaPackageChannel
+      Description: 'HLS origin endpoint for live event broadcasting'
+      HlsPackage:
+        AdMarkers: 'NONE'
+        IncludeIframeOnlyStream: false
+        PlaylistType: 'EVENT'
+        PlaylistWindowSeconds: !Ref HLSPlaylistWindow
+        ProgramDateTimeIntervalSeconds: 0
+        SegmentDurationSeconds: !Ref HLSSegmentDuration
+        StreamSelection:
+          MaxVideoBitsPerSecond: 2147483647
+          MinVideoBitsPerSecond: 0
+          StreamOrder: 'ORIGINAL'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-hls-endpoint'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: 'LiveBroadcast'
+
+  # Primary MediaLive Input
+  PrimaryMediaLiveInput:
+    Type: 'AWS::MediaLive::Input'
+    Properties:
+      Name: !Sub '${ProjectName}-primary-input'
+      Type: 'MEDIACONNECT'
+      MediaConnectFlows:
+        - FlowArn: !GetAtt PrimaryMediaConnectFlow.FlowArn
+      RoleArn: !GetAtt MediaLiveRole.Arn
+      Tags:
+        Name: !Sub '${ProjectName}-primary-input'
+        Environment: !Ref Environment
+        Application: 'LiveBroadcast'
+
+  # Backup MediaLive Input
+  BackupMediaLiveInput:
+    Type: 'AWS::MediaLive::Input'
+    Properties:
+      Name: !Sub '${ProjectName}-backup-input'
+      Type: 'MEDIACONNECT'
+      MediaConnectFlows:
+        - FlowArn: !GetAtt BackupMediaConnectFlow.FlowArn
+      RoleArn: !GetAtt MediaLiveRole.Arn
+      Tags:
+        Name: !Sub '${ProjectName}-backup-input'
+        Environment: !Ref Environment
+        Application: 'LiveBroadcast'
+
+  # MediaLive Channel
+  MediaLiveChannel:
+    Type: 'AWS::MediaLive::Channel'
+    Properties:
+      Name: !Sub '${ProjectName}-live-channel'
+      RoleArn: !GetAtt MediaLiveRole.Arn
+      InputAttachments:
+        - InputAttachmentName: 'primary-input'
+          InputId: !Ref PrimaryMediaLiveInput
+          InputSettings:
+            AudioSelectors:
+              - Name: 'default'
+                SelectorSettings:
+                  AudioPidSelection:
+                    Pid: 256
+            VideoSelector:
+              ProgramId: 1
+        - InputAttachmentName: 'backup-input'
+          InputId: !Ref BackupMediaLiveInput
+          InputSettings:
+            AudioSelectors:
+              - Name: 'default'
+                SelectorSettings:
+                  AudioPidSelection:
+                    Pid: 256
+            VideoSelector:
+              ProgramId: 1
+      Destinations:
+        - Id: 'mediapackage-destination'
+          MediaPackageSettings:
+            - ChannelId: !Ref MediaPackageChannel
+      EncoderSettings:
+        AudioDescriptions:
+          - AudioSelectorName: 'default'
+            CodecSettings:
+              AacSettings:
+                Bitrate: !Ref AudioBitrate
+                CodingMode: 'CODING_MODE_2_0'
+                InputType: 'BROADCASTER_MIXED_AD'
+                Profile: 'LC'
+                SampleRate: 48000
+            Name: 'audio_1'
+        VideoDescriptions:
+          - CodecSettings:
+              H264Settings:
+                Bitrate: !Ref VideoBitrate
+                FramerateControl: 'SPECIFIED'
+                FramerateDenominator: 1
+                FramerateNumerator: 30
+                GopBReference: 'DISABLED'
+                GopClosedCadence: 1
+                GopNumBFrames: 2
+                GopSize: 90
+                GopSizeUnits: 'FRAMES'
+                Level: 'H264_LEVEL_4_1'
+                LookAheadRateControl: 'MEDIUM'
+                MaxBitrate: !Ref VideoBitrate
+                NumRefFrames: 3
+                ParControl: 'INITIALIZE_FROM_SOURCE'
+                Profile: 'MAIN'
+                RateControlMode: 'CBR'
+                Syntax: 'DEFAULT'
+            Height: 720
+            Name: 'video_720p30'
+            RespondToAfd: 'NONE'
+            Sharpness: 50
+            Width: 1280
+        OutputGroups:
+          - Name: 'mediapackage-output-group'
+            OutputGroupSettings:
+              MediaPackageGroupSettings:
+                Destination:
+                  DestinationRefId: 'mediapackage-destination'
+            Outputs:
+              - AudioDescriptionNames:
+                  - 'audio_1'
+                OutputName: '720p30'
+                OutputSettings:
+                  MediaPackageOutputSettings: {}
+                VideoDescriptionName: 'video_720p30'
+      InputSpecification:
+        Codec: 'AVC'
+        Resolution: !Ref VideoResolution
+        MaximumBitrate: !Ref MaxBitrate
+      Tags:
+        Name: !Sub '${ProjectName}-live-channel'
+        Environment: !Ref Environment
+        Application: 'LiveBroadcast'
+
+  # CloudWatch Log Groups
+  MediaConnectPrimaryLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Condition: DetailedMonitoring
+    Properties:
+      LogGroupName: !Sub '/aws/mediaconnect/${ProjectName}-primary-flow'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-primary-flow-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: 'LiveBroadcast'
+
+  MediaConnectBackupLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Condition: DetailedMonitoring
+    Properties:
+      LogGroupName: !Sub '/aws/mediaconnect/${ProjectName}-backup-flow'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-backup-flow-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: 'LiveBroadcast'
+
+  MediaLiveLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Condition: DetailedMonitoring
+    Properties:
+      LogGroupName: !Sub '/aws/medialive/${ProjectName}-live-channel'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-live-channel-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: 'LiveBroadcast'
+
+  # SNS Topic for Alerts (conditional)
+  AlertingTopic:
+    Type: 'AWS::SNS::Topic'
+    Condition: CreateAlerting
+    Properties:
+      TopicName: !Sub '${ProjectName}-alerts'
+      DisplayName: 'Live Event Broadcasting Alerts'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alerts'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: 'LiveBroadcast'
+
+  # SNS Subscription for Email Alerts (conditional)
+  AlertingSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Condition: CreateAlerting
+    Properties:
+      Protocol: 'email'
+      TopicArn: !Ref AlertingTopic
+      Endpoint: !Ref AlertingEmail
+
+  # CloudWatch Alarms
+  PrimaryFlowSourceErrorsAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${ProjectName}-primary-flow-source-errors'
+      AlarmDescription: 'Alert on MediaConnect primary flow source errors'
+      MetricName: 'SourceConnectionErrors'
+      Namespace: 'AWS/MediaConnect'
+      Statistic: 'Sum'
+      Period: 300
+      Threshold: 1
+      ComparisonOperator: 'GreaterThanOrEqualToThreshold'
+      EvaluationPeriods: 1
+      Dimensions:
+        - Name: 'FlowName'
+          Value: !Sub '${ProjectName}-primary-flow'
+      AlarmActions:
+        - !If [CreateAlerting, !Ref AlertingTopic, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-primary-flow-source-errors'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: 'LiveBroadcast'
+
+  BackupFlowSourceErrorsAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${ProjectName}-backup-flow-source-errors'
+      AlarmDescription: 'Alert on MediaConnect backup flow source errors'
+      MetricName: 'SourceConnectionErrors'
+      Namespace: 'AWS/MediaConnect'
+      Statistic: 'Sum'
+      Period: 300
+      Threshold: 1
+      ComparisonOperator: 'GreaterThanOrEqualToThreshold'
+      EvaluationPeriods: 1
+      Dimensions:
+        - Name: 'FlowName'
+          Value: !Sub '${ProjectName}-backup-flow'
+      AlarmActions:
+        - !If [CreateAlerting, !Ref AlertingTopic, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-backup-flow-source-errors'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: 'LiveBroadcast'
+
+  MediaLiveInputErrorsAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${ProjectName}-medialive-input-errors'
+      AlarmDescription: 'Alert on MediaLive channel input errors'
+      MetricName: 'InputVideoFrameRate'
+      Namespace: 'AWS/MediaLive'
+      Statistic: 'Average'
+      Period: 300
+      Threshold: 1
+      ComparisonOperator: 'LessThanThreshold'
+      EvaluationPeriods: 2
+      Dimensions:
+        - Name: 'ChannelId'
+          Value: !Ref MediaLiveChannel
+      AlarmActions:
+        - !If [CreateAlerting, !Ref AlertingTopic, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-medialive-input-errors'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: 'LiveBroadcast'
+
+  # Dashboard for Monitoring (conditional)
+  MonitoringDashboard:
+    Type: 'AWS::CloudWatch::Dashboard'
+    Condition: DetailedMonitoring
+    Properties:
+      DashboardName: !Sub '${ProjectName}-live-broadcasting-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/MediaConnect", "SourceBitRate", "FlowName", "${ProjectName}-primary-flow" ],
+                  [ "...", "${ProjectName}-backup-flow" ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "MediaConnect Flow Bitrates"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/MediaConnect", "SourceConnectionErrors", "FlowName", "${ProjectName}-primary-flow" ],
+                  [ "...", "${ProjectName}-backup-flow" ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "MediaConnect Connection Errors"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/MediaLive", "InputVideoFrameRate", "ChannelId", "${MediaLiveChannel}" ],
+                  [ ".", "OutputVideoFrameRate", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "MediaLive Frame Rates"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/MediaPackage", "OriginRequestCount", "Channel", "${MediaPackageChannel}" ],
+                  [ ".", "EgressBytes", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "MediaPackage Metrics"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  # MediaConnect Flow Information
+  PrimaryFlowArn:
+    Description: 'ARN of the primary MediaConnect flow'
+    Value: !GetAtt PrimaryMediaConnectFlow.FlowArn
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryFlowArn'
+
+  BackupFlowArn:
+    Description: 'ARN of the backup MediaConnect flow'
+    Value: !GetAtt BackupMediaConnectFlow.FlowArn
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupFlowArn'
+
+  PrimaryFlowIngestEndpoint:
+    Description: 'Primary flow ingest endpoint (IP:Port)'
+    Value: !Sub '${PrimaryMediaConnectFlow.Source.IngestIp}:${PrimaryIngestPort}'
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryIngestEndpoint'
+
+  BackupFlowIngestEndpoint:
+    Description: 'Backup flow ingest endpoint (IP:Port)'
+    Value: !Sub '${BackupMediaConnectFlow.Source.IngestIp}:${BackupIngestPort}'
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupIngestEndpoint'
+
+  # MediaLive Information
+  MediaLiveChannelId:
+    Description: 'MediaLive channel ID'
+    Value: !Ref MediaLiveChannel
+    Export:
+      Name: !Sub '${AWS::StackName}-MediaLiveChannelId'
+
+  MediaLiveChannelArn:
+    Description: 'MediaLive channel ARN'
+    Value: !Sub 'arn:aws:medialive:${AWS::Region}:${AWS::AccountId}:channel:${MediaLiveChannel}'
+    Export:
+      Name: !Sub '${AWS::StackName}-MediaLiveChannelArn'
+
+  # MediaPackage Information
+  MediaPackageChannelId:
+    Description: 'MediaPackage channel ID'
+    Value: !Ref MediaPackageChannel
+    Export:
+      Name: !Sub '${AWS::StackName}-MediaPackageChannelId'
+
+  MediaPackageChannelArn:
+    Description: 'MediaPackage channel ARN'
+    Value: !GetAtt MediaPackageChannel.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-MediaPackageChannelArn'
+
+  # HLS Endpoint
+  HLSEndpointURL:
+    Description: 'HLS playback URL for viewers'
+    Value: !GetAtt MediaPackageHLSEndpoint.Url
+    Export:
+      Name: !Sub '${AWS::StackName}-HLSEndpointURL'
+
+  # Monitoring
+  DashboardURL:
+    Condition: DetailedMonitoring
+    Description: 'CloudWatch Dashboard URL'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-live-broadcasting-dashboard'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  AlertingTopicArn:
+    Condition: CreateAlerting
+    Description: 'SNS Topic ARN for alerts'
+    Value: !Ref AlertingTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertingTopicArn'
+
+  # IAM Role
+  MediaLiveRoleArn:
+    Description: 'MediaLive service role ARN'
+    Value: !GetAtt MediaLiveRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-MediaLiveRoleArn'
+
+  # Configuration Summary
+  ConfigurationSummary:
+    Description: 'Summary of the deployed configuration'
+    Value: !Sub |
+      Live Event Broadcasting Stack deployed successfully:
+      - Primary Flow: ${PrimaryMediaConnectFlow.Source.IngestIp}:${PrimaryIngestPort}
+      - Backup Flow: ${BackupMediaConnectFlow.Source.IngestIp}:${BackupIngestPort}
+      - HLS Endpoint: ${MediaPackageHLSEndpoint.Url}
+      - Environment: ${Environment}
+      - Video Resolution: ${VideoResolution}
+      - Video Bitrate: ${VideoBitrate} bps
+      - Audio Bitrate: ${AudioBitrate} bps

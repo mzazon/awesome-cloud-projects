@@ -1,0 +1,284 @@
+# Security Remediation Template for Infrastructure Health Assessment
+# This template applies security best practices and fixes common security vulnerabilities
+# identified during infrastructure health assessments.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: security-policy-enforcer
+  labels:
+    app: security-enforcer
+    component: remediation
+    security-level: high
+    managed-by: infrastructure-health-assessment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: security-enforcer
+  template:
+    metadata:
+      labels:
+        app: security-enforcer
+        security-level: high
+      annotations:
+        # Security annotations for monitoring and compliance
+        security.alpha.kubernetes.io/sysctls: "net.core.somaxconn=65535"
+        security.alpha.kubernetes.io/seccomp: "runtime/default"
+    spec:
+      # Security context for the entire pod
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 2000
+        fsGroup: 2000
+        seccompProfile:
+          type: RuntimeDefault
+        supplementalGroups: [2000]
+      
+      # Service account with minimal permissions
+      serviceAccountName: security-enforcer-sa
+      automountServiceAccountToken: false
+      
+      containers:
+      - name: policy-enforcer
+        image: gcr.io/distroless/static:nonroot
+        imagePullPolicy: Always
+        
+        # Container security context
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 2000
+          capabilities:
+            drop:
+            - ALL
+            add: []
+          seccompProfile:
+            type: RuntimeDefault
+        
+        # Resource limits for security and stability
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+            ephemeral-storage: "1Gi"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+            ephemeral-storage: "2Gi"
+        
+        # Environment variables for security configuration
+        env:
+        - name: SECURITY_SCAN_ENABLED
+          value: "true"
+        - name: COMPLIANCE_MODE
+          value: "strict"
+        - name: LOG_LEVEL
+          value: "INFO"
+        
+        # Liveness and readiness probes
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        
+        # Volume mounts for read-only configuration
+        volumeMounts:
+        - name: config-volume
+          mountPath: /etc/config
+          readOnly: true
+        - name: tmp-volume
+          mountPath: /tmp
+        - name: var-run-volume
+          mountPath: /var/run
+      
+      # Volumes with security best practices
+      volumes:
+      - name: config-volume
+        configMap:
+          name: security-config
+          defaultMode: 0444
+      - name: tmp-volume
+        emptyDir:
+          sizeLimit: "100Mi"
+      - name: var-run-volume
+        emptyDir:
+          sizeLimit: "100Mi"
+      
+      # Node selection and anti-affinity for security
+      nodeSelector:
+        security-tier: "high"
+      
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values: ["security-enforcer"]
+              topologyKey: kubernetes.io/hostname
+      
+      # Tolerations for dedicated security nodes
+      tolerations:
+      - key: "security-dedicated"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+
+---
+# ConfigMap for security policy configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: security-config
+  labels:
+    app: security-enforcer
+    component: configuration
+data:
+  security-policies.yaml: |
+    policies:
+      network:
+        - name: "deny-all-ingress"
+          action: "deny"
+          protocol: "tcp"
+        - name: "allow-specific-egress"
+          action: "allow"
+          protocol: "tcp"
+          ports: [80, 443]
+      
+      containers:
+        - name: "no-privileged-containers"
+          rule: "securityContext.privileged == false"
+        - name: "read-only-root-filesystem"
+          rule: "securityContext.readOnlyRootFilesystem == true"
+        - name: "non-root-user"
+          rule: "securityContext.runAsNonRoot == true"
+      
+      images:
+        - name: "approved-registries-only"
+          allowed_registries:
+            - "gcr.io"
+            - "us-docker.pkg.dev"
+            - "marketplace.gcr.io"
+        - name: "no-latest-tags"
+          rule: "image tag != 'latest'"
+
+---
+# ServiceAccount with minimal permissions
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: security-enforcer-sa
+  labels:
+    app: security-enforcer
+    component: service-account
+automountServiceAccountToken: false
+
+---
+# Network Policy for security isolation
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: security-enforcer-netpol
+  labels:
+    app: security-enforcer
+    component: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: security-enforcer
+  policyTypes:
+  - Ingress
+  - Egress
+  
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+    ports:
+    - protocol: TCP
+      port: 8080
+  
+  egress:
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 53
+    - protocol: UDP
+      port: 53
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+    ports:
+    - protocol: TCP
+      port: 443
+
+---
+# PodSecurityPolicy (for clusters that support it)
+apiVersion: policy/v1beta1
+kind: PodSecurityPolicy
+metadata:
+  name: security-enforcer-psp
+  labels:
+    app: security-enforcer
+    component: pod-security-policy
+spec:
+  privileged: false
+  allowPrivilegeEscalation: false
+  requiredDropCapabilities:
+    - ALL
+  volumes:
+    - 'configMap'
+    - 'emptyDir'
+    - 'projected'
+    - 'secret'
+    - 'downwardAPI'
+    - 'persistentVolumeClaim'
+  runAsUser:
+    rule: 'MustRunAsNonRoot'
+  seLinux:
+    rule: 'RunAsAny'
+  fsGroup:
+    rule: 'RunAsAny'
+  readOnlyRootFilesystem: true
+
+---
+# PodDisruptionBudget for availability
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: security-enforcer-pdb
+  labels:
+    app: security-enforcer
+    component: pod-disruption-budget
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: security-enforcer

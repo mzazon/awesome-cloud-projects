@@ -1,0 +1,828 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Cost-Effective ECS Clusters with EC2 Spot Instances - Deploy ECS cluster with mixed Spot and On-Demand instances using capacity providers for 50-70% cost savings'
+
+Parameters:
+  # Cluster Configuration
+  ClusterName:
+    Type: String
+    Default: cost-optimized-cluster
+    Description: Name for the ECS cluster
+    MaxLength: 255
+    MinLength: 1
+    AllowedPattern: '[a-zA-Z0-9-_]*'
+    ConstraintDescription: Cluster name must contain only alphanumeric characters, hyphens, and underscores
+
+  # Network Configuration
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where the ECS cluster will be deployed
+    ConstraintDescription: Must be a valid VPC ID
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of subnet IDs for the ECS cluster (minimum 2, maximum 3 subnets)
+    ConstraintDescription: Must provide at least 2 subnet IDs in different Availability Zones
+
+  # Instance Configuration
+  InstanceTypes:
+    Type: CommaDelimitedList
+    Default: 'm5.large,m4.large,c5.large,c4.large,r5.large'
+    Description: List of instance types to use in the mixed instances policy
+    ConstraintDescription: Must be valid EC2 instance types
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access to instances
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair
+
+  # Scaling Configuration
+  MinCapacity:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 100
+    Description: Minimum number of instances in the Auto Scaling Group
+    ConstraintDescription: Must be between 1 and 100
+
+  MaxCapacity:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+    Description: Maximum number of instances in the Auto Scaling Group
+    ConstraintDescription: Must be between 1 and 100
+
+  DesiredCapacity:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 100
+    Description: Desired number of instances in the Auto Scaling Group
+    ConstraintDescription: Must be between 1 and 100
+
+  # Spot Configuration
+  OnDemandBaseCapacity:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 100
+    Description: Minimum number of On-Demand instances to maintain
+    ConstraintDescription: Must be between 0 and 100
+
+  OnDemandPercentage:
+    Type: Number
+    Default: 20
+    MinValue: 0
+    MaxValue: 100
+    Description: Percentage of On-Demand instances above base capacity
+    ConstraintDescription: Must be between 0 and 100
+
+  SpotMaxPrice:
+    Type: String
+    Default: '0.10'
+    Description: Maximum price per hour for Spot instances (USD)
+    AllowedPattern: '^[0-9]+\.?[0-9]*$'
+    ConstraintDescription: Must be a valid price in USD format
+
+  # Service Configuration
+  ServiceDesiredCount:
+    Type: Number
+    Default: 6
+    MinValue: 1
+    MaxValue: 100
+    Description: Desired number of tasks for the ECS service
+    ConstraintDescription: Must be between 1 and 100
+
+  ServiceMinHealthyPercent:
+    Type: Number
+    Default: 50
+    MinValue: 0
+    MaxValue: 100
+    Description: Minimum percentage of healthy tasks during deployments
+    ConstraintDescription: Must be between 0 and 100
+
+  ServiceMaxPercent:
+    Type: Number
+    Default: 200
+    MinValue: 100
+    MaxValue: 400
+    Description: Maximum percentage of tasks during deployments
+    ConstraintDescription: Must be between 100 and 400
+
+  # Application Configuration
+  TaskCpu:
+    Type: Number
+    Default: 256
+    AllowedValues: [256, 512, 1024, 2048, 4096]
+    Description: CPU units for the task definition (1024 = 1 vCPU)
+    ConstraintDescription: Must be a valid CPU value
+
+  TaskMemory:
+    Type: Number
+    Default: 512
+    AllowedValues: [512, 1024, 2048, 4096, 8192]
+    Description: Memory in MB for the task definition
+    ConstraintDescription: Must be a valid memory value
+
+  ContainerImage:
+    Type: String
+    Default: 'public.ecr.aws/docker/library/nginx:latest'
+    Description: Container image to deploy
+    ConstraintDescription: Must be a valid container image URI
+
+  # Monitoring Configuration
+  EnableContainerInsights:
+    Type: String
+    Default: 'enabled'
+    AllowedValues: ['enabled', 'disabled']
+    Description: Enable CloudWatch Container Insights for the cluster
+    ConstraintDescription: Must be either 'enabled' or 'disabled'
+
+Conditions:
+  # Enable Container Insights if specified
+  EnableInsights: !Equals [!Ref EnableContainerInsights, 'enabled']
+
+  # Use three subnets if provided, otherwise use two
+  UseThreeSubnets: !Equals [!Select [2, !Ref SubnetIds], !Select [2, !Ref SubnetIds]]
+
+Mappings:
+  # Latest ECS-optimized AMI IDs by region
+  AWSRegionToAMI:
+    us-east-1:
+      AMIID: ami-0c02fb55956c7d316
+    us-east-2:
+      AMIID: ami-0f924dc71d44d23e2
+    us-west-1:
+      AMIID: ami-0d53d72369335a9d6
+    us-west-2:
+      AMIID: ami-0c2d3e23f757b5d84
+    eu-west-1:
+      AMIID: ami-0c9c942bd7bf113a2
+    eu-west-2:
+      AMIID: ami-0016d0de7dc8da3dc
+    eu-central-1:
+      AMIID: ami-0c115dbd34c69a004
+    ap-northeast-1:
+      AMIID: ami-0d0e87c6cf12b9a82
+    ap-northeast-2:
+      AMIID: ami-0d2eba32b1f6a3b2e
+    ap-southeast-1:
+      AMIID: ami-0c8b886bb1ae60b18
+    ap-southeast-2:
+      AMIID: ami-0d9ef5bf5e55e59b1
+    ap-south-1:
+      AMIID: ami-0cbc2a4dd5a6b11b8
+
+Resources:
+  # CloudWatch Log Group for ECS tasks
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ClusterName}-tasks'
+      RetentionInDays: 14
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-log-group'
+        - Key: Environment
+          Value: production
+        - Key: CostOptimized
+          Value: 'true'
+
+  # ECS Cluster with Container Insights
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ClusterName
+      ClusterSettings:
+        - Name: containerInsights
+          Value: !Ref EnableContainerInsights
+      Tags:
+        - Key: Name
+          Value: !Ref ClusterName
+        - Key: Environment
+          Value: production
+        - Key: CostOptimized
+          Value: 'true'
+
+  # Security Group for ECS instances
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ClusterName}-sg'
+      GroupDescription: Security group for ECS Spot cluster instances
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP access
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS access
+        - IpProtocol: tcp
+          FromPort: 32768
+          ToPort: 65535
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Dynamic port range for ALB
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-sg'
+        - Key: Environment
+          Value: production
+
+  # Security Group for Application Load Balancer
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ClusterName}-alb-sg'
+      GroupDescription: Security group for Application Load Balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP access
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS access
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-alb-sg'
+        - Key: Environment
+          Value: production
+
+  # IAM Role for ECS Task Execution
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-task-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${ECSLogGroup}*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-task-execution-role'
+        - Key: Environment
+          Value: production
+
+  # IAM Role for EC2 instances
+  ECSInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-instance-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-instance-role'
+        - Key: Environment
+          Value: production
+
+  # Instance Profile for EC2 instances
+  ECSInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ClusterName}-instance-profile'
+      Roles:
+        - !Ref ECSInstanceRole
+
+  # Launch Template for EC2 instances
+  ECSLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ClusterName}-launch-template'
+      LaunchTemplateData:
+        ImageId: !FindInMap [AWSRegionToAMI, !Ref 'AWS::Region', AMIID]
+        SecurityGroupIds:
+          - !Ref ECSSecurityGroup
+        IamInstanceProfile:
+          Arn: !GetAtt ECSInstanceProfile.Arn
+        KeyName: !Ref KeyPairName
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            echo ECS_CLUSTER=${ClusterName} >> /etc/ecs/ecs.config
+            echo ECS_ENABLE_SPOT_INSTANCE_DRAINING=true >> /etc/ecs/ecs.config
+            echo ECS_CONTAINER_STOP_TIMEOUT=90s >> /etc/ecs/ecs.config
+            echo ECS_CONTAINER_START_TIMEOUT=10m >> /etc/ecs/ecs.config
+            echo ECS_ENABLE_CONTAINER_METADATA=true >> /etc/ecs/ecs.config
+            
+            # Install CloudWatch agent
+            yum update -y
+            yum install -y amazon-cloudwatch-agent
+            
+            # Configure CloudWatch agent
+            cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'EOF'
+            {
+              "metrics": {
+                "namespace": "CWAgent",
+                "metrics_collected": {
+                  "cpu": {
+                    "measurement": [
+                      "cpu_usage_idle",
+                      "cpu_usage_iowait",
+                      "cpu_usage_user",
+                      "cpu_usage_system"
+                    ],
+                    "metrics_collection_interval": 60
+                  },
+                  "disk": {
+                    "measurement": [
+                      "used_percent"
+                    ],
+                    "metrics_collection_interval": 60,
+                    "resources": [
+                      "*"
+                    ]
+                  },
+                  "mem": {
+                    "measurement": [
+                      "mem_used_percent"
+                    ],
+                    "metrics_collection_interval": 60
+                  }
+                }
+              }
+            }
+            EOF
+            
+            # Start CloudWatch agent
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+              -a fetch-config \
+              -m ec2 \
+              -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json \
+              -s
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${ClusterName}-spot-instance'
+              - Key: Environment
+                Value: production
+              - Key: CostOptimized
+                Value: 'true'
+              - Key: Cluster
+                Value: !Ref ClusterName
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 30
+              VolumeType: gp3
+              DeleteOnTermination: true
+              Encrypted: true
+
+  # Auto Scaling Group with mixed instances policy
+  ECSAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${ClusterName}-asg'
+      MinSize: !Ref MinCapacity
+      MaxSize: !Ref MaxCapacity
+      DesiredCapacity: !Ref DesiredCapacity
+      VPCZoneIdentifier: !Ref SubnetIds
+      HealthCheckType: ECS
+      HealthCheckGracePeriod: 300
+      DefaultCooldown: 300
+      TerminationPolicies:
+        - OldestInstance
+      MixedInstancesPolicy:
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref ECSLaunchTemplate
+            Version: !GetAtt ECSLaunchTemplate.LatestVersionNumber
+          Overrides:
+            - InstanceType: !Select [0, !Ref InstanceTypes]
+            - InstanceType: !Select [1, !Ref InstanceTypes]
+            - InstanceType: !Select [2, !Ref InstanceTypes]
+            - InstanceType: !Select [3, !Ref InstanceTypes]
+            - InstanceType: !Select [4, !Ref InstanceTypes]
+        InstancesDistribution:
+          OnDemandAllocationStrategy: prioritized
+          OnDemandBaseCapacity: !Ref OnDemandBaseCapacity
+          OnDemandPercentageAboveBaseCapacity: !Ref OnDemandPercentage
+          SpotAllocationStrategy: diversified
+          SpotInstancePools: 4
+          SpotMaxPrice: !Ref SpotMaxPrice
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-asg'
+          PropagateAtLaunch: false
+        - Key: Environment
+          Value: production
+          PropagateAtLaunch: true
+        - Key: CostOptimized
+          Value: 'true'
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref DesiredCapacity
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 2
+        PauseTime: PT15M
+        SuspendProcesses:
+          - HealthCheck
+          - ReplaceUnhealthy
+          - AZRebalance
+          - AlarmNotification
+          - ScheduledActions
+        WaitOnResourceSignals: true
+
+  # ECS Capacity Provider
+  ECSCapacityProvider:
+    Type: AWS::ECS::CapacityProvider
+    Properties:
+      Name: !Sub '${ClusterName}-capacity-provider'
+      AutoScalingGroupProvider:
+        AutoScalingGroupArn: !Ref ECSAutoScalingGroup
+        ManagedScaling:
+          Status: ENABLED
+          TargetCapacity: 80
+          MinimumScalingStepSize: 1
+          MaximumScalingStepSize: 3
+          InstanceWarmupPeriod: 300
+        ManagedTerminationProtection: ENABLED
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-capacity-provider'
+        - Key: Environment
+          Value: production
+        - Key: CostOptimized
+          Value: 'true'
+
+  # Associate Capacity Provider with Cluster
+  ECSCapacityProviderAssociation:
+    Type: AWS::ECS::ClusterCapacityProviderAssociations
+    Properties:
+      Cluster: !Ref ECSCluster
+      CapacityProviders:
+        - !Ref ECSCapacityProvider
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: !Ref ECSCapacityProvider
+          Weight: 1
+          Base: 0
+
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ClusterName}-alb'
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets: !Ref SubnetIds
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-alb'
+        - Key: Environment
+          Value: production
+        - Key: CostOptimized
+          Value: 'true'
+
+  # ALB Target Group
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ClusterName}-tg'
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: instance
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-tg'
+        - Key: Environment
+          Value: production
+
+  # ALB Listener
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # ECS Task Definition
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ClusterName}-task'
+      RequiresCompatibilities:
+        - EC2
+      NetworkMode: bridge
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ContainerDefinitions:
+        - Name: web-server
+          Image: !Ref ContainerImage
+          Cpu: !Ref TaskCpu
+          Memory: !Ref TaskMemory
+          Essential: true
+          PortMappings:
+            - ContainerPort: 80
+              HostPort: 0
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - 'curl -f http://localhost/ || exit 1'
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+          Environment:
+            - Name: CLUSTER_NAME
+              Value: !Ref ClusterName
+            - Name: AWS_REGION
+              Value: !Ref 'AWS::Region'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-task'
+        - Key: Environment
+          Value: production
+        - Key: CostOptimized
+          Value: 'true'
+
+  # ECS Service
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListener
+    Properties:
+      ServiceName: !Sub '${ClusterName}-service'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ECSTaskDefinition
+      DesiredCount: !Ref ServiceDesiredCount
+      LaunchType: EC2
+      CapacityProviderStrategy:
+        - CapacityProvider: !Ref ECSCapacityProvider
+          Weight: 1
+          Base: 2
+      LoadBalancers:
+        - ContainerName: web-server
+          ContainerPort: 80
+          TargetGroupArn: !Ref ALBTargetGroup
+      DeploymentConfiguration:
+        MaximumPercent: !Ref ServiceMaxPercent
+        MinimumHealthyPercent: !Ref ServiceMinHealthyPercent
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      ServiceTags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-service'
+        - Key: Environment
+          Value: production
+        - Key: CostOptimized
+          Value: 'true'
+      EnableExecuteCommand: true
+
+  # Application Auto Scaling Target
+  ServiceScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ResourceId: !Sub 'service/${ECSCluster}/${ECSService.Name}'
+      ScalableDimension: ecs:service:DesiredCount
+      MinCapacity: 2
+      MaxCapacity: 20
+      RoleARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService'
+
+  # Application Auto Scaling Policy - CPU Utilization
+  ServiceScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${ClusterName}-cpu-scaling-policy'
+      PolicyType: TargetTrackingScaling
+      ServiceNamespace: ecs
+      ResourceId: !Sub 'service/${ECSCluster}/${ECSService.Name}'
+      ScalableDimension: ecs:service:DesiredCount
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 60.0
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleOutCooldown: 300
+        ScaleInCooldown: 300
+
+  # CloudWatch Alarms
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ClusterName}-high-cpu'
+      AlarmDescription: High CPU utilization in ECS service
+      MetricName: CPUUtilization
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ServiceName
+          Value: !Ref ECSService
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+      AlarmActions:
+        - !Ref SNSTopic
+
+  # SNS Topic for Alarms
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ClusterName}-alerts'
+      DisplayName: !Sub '${ClusterName} Alerts'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-alerts'
+        - Key: Environment
+          Value: production
+
+Outputs:
+  # Cluster Information
+  ClusterName:
+    Description: Name of the ECS cluster
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterName'
+
+  ClusterArn:
+    Description: ARN of the ECS cluster
+    Value: !GetAtt ECSCluster.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterArn'
+
+  # Capacity Provider Information
+  CapacityProviderName:
+    Description: Name of the ECS capacity provider
+    Value: !Ref ECSCapacityProvider
+    Export:
+      Name: !Sub '${AWS::StackName}-CapacityProviderName'
+
+  # Auto Scaling Group Information
+  AutoScalingGroupName:
+    Description: Name of the Auto Scaling Group
+    Value: !Ref ECSAutoScalingGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AutoScalingGroupName'
+
+  # Load Balancer Information
+  LoadBalancerDNS:
+    Description: DNS name of the Application Load Balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-LoadBalancerDNS'
+
+  LoadBalancerArn:
+    Description: ARN of the Application Load Balancer
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: !Sub '${AWS::StackName}-LoadBalancerArn'
+
+  # Service Information
+  ServiceName:
+    Description: Name of the ECS service
+    Value: !Ref ECSService
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceName'
+
+  ServiceArn:
+    Description: ARN of the ECS service
+    Value: !Ref ECSService
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceArn'
+
+  # Task Definition Information
+  TaskDefinitionArn:
+    Description: ARN of the ECS task definition
+    Value: !Ref ECSTaskDefinition
+    Export:
+      Name: !Sub '${AWS::StackName}-TaskDefinitionArn'
+
+  # Security Group Information
+  ECSSecurityGroupId:
+    Description: ID of the ECS security group
+    Value: !Ref ECSSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSSecurityGroupId'
+
+  ALBSecurityGroupId:
+    Description: ID of the ALB security group
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ALBSecurityGroupId'
+
+  # IAM Role Information
+  TaskExecutionRoleArn:
+    Description: ARN of the ECS task execution role
+    Value: !GetAtt ECSTaskExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TaskExecutionRoleArn'
+
+  InstanceRoleArn:
+    Description: ARN of the ECS instance role
+    Value: !GetAtt ECSInstanceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceRoleArn'
+
+  # Log Group Information
+  LogGroupName:
+    Description: Name of the CloudWatch log group
+    Value: !Ref ECSLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupName'
+
+  # SNS Topic Information
+  SNSTopicArn:
+    Description: ARN of the SNS topic for alerts
+    Value: !Ref SNSTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  # Cost Optimization Information
+  CostSavingsEstimate:
+    Description: Estimated cost savings with Spot Instances
+    Value: '50-70% cost reduction compared to On-Demand instances'
+
+  SpotInstanceConfiguration:
+    Description: Spot instance configuration details
+    Value: !Sub |
+      On-Demand Base: ${OnDemandBaseCapacity} instances
+      On-Demand Percentage: ${OnDemandPercentage}%
+      Spot Max Price: $${SpotMaxPrice}/hour
+      Instance Types: ${InstanceTypes}
+
+  # Application URL
+  ApplicationURL:
+    Description: URL of the deployed application
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationURL'
+
+  # Monitoring Information
+  ContainerInsightsStatus:
+    Description: Status of CloudWatch Container Insights
+    Value: !Ref EnableContainerInsights
+    Export:
+      Name: !Sub '${AWS::StackName}-ContainerInsightsStatus'
+
+  CloudWatchDashboard:
+    Description: CloudWatch Console URL for ECS monitoring
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ClusterName}'

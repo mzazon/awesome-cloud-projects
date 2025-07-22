@@ -1,0 +1,1143 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Event-driven microservices architecture using Amazon EventBridge and AWS Step Functions for order processing workflows'
+
+# ======================================
+# PARAMETERS
+# ======================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: microservices-demo
+    Description: Name prefix for all resources
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9-]*$
+    ConstraintDescription: Must start with a letter and contain only letters, numbers, and hyphens
+    
+  Environment:
+    Type: String
+    Default: development
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: Environment name for resource tagging
+    
+  DynamoDBReadCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 1000
+    Description: DynamoDB read capacity units
+    
+  DynamoDBWriteCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 1000
+    Description: DynamoDB write capacity units
+    
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024, 1536, 2048, 3008]
+    Description: Memory size for Lambda functions in MB
+    
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    Description: Timeout for Lambda functions in seconds
+    
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: CloudWatch log retention period in days
+
+# ======================================
+# CONDITIONS
+# ======================================
+Conditions:
+  IsProduction: !Equals [!Ref Environment, production]
+  EnableDetailedMonitoring: !Or
+    - !Equals [!Ref Environment, production]
+    - !Equals [!Ref Environment, staging]
+
+# ======================================
+# RESOURCES
+# ======================================
+Resources:
+  
+  # ======================================
+  # IAM ROLES AND POLICIES
+  # ======================================
+  
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: 
+                  - !GetAtt OrdersTable.Arn
+                  - !Sub '${OrdersTable.Arn}/index/*'
+        - PolicyName: EventBridgeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !GetAtt CustomEventBus.Arn
+        - PolicyName: CloudWatchXRayAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+          
+  # Step Functions Execution Role
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-stepfunctions-role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaInvokeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt OrderServiceFunction.Arn
+                  - !GetAtt PaymentServiceFunction.Arn
+                  - !GetAtt InventoryServiceFunction.Arn
+                  - !GetAtt NotificationServiceFunction.Arn
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/stepfunctions/*'
+        - PolicyName: XRayAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # EventBridge Service Role
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-eventbridge-role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsExecuteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref OrderProcessingStateMachine
+        - PolicyName: LambdaInvokeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt NotificationServiceFunction.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ======================================
+  # DYNAMODB
+  # ======================================
+  
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-orders-${AWS::StackName}'
+      BillingMode: PROVISIONED
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: customerId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+        - AttributeName: customerId
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref DynamoDBReadCapacity
+        WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      GlobalSecondaryIndexes:
+        - IndexName: CustomerId-Index
+          KeySchema:
+            - AttributeName: customerId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !Ref DynamoDBReadCapacity
+            WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+        KMSMasterKeyId: alias/aws/dynamodb
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Name
+          Value: !Sub '${ProjectName}-orders-${AWS::StackName}'
+
+  # ======================================
+  # EVENTBRIDGE
+  # ======================================
+  
+  # Custom EventBridge Bus
+  CustomEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${ProjectName}-eventbus-${AWS::StackName}'
+      Description: Custom event bus for microservices communication
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # EventBridge Rule for Order Created Events
+  OrderCreatedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-order-created-rule-${AWS::StackName}'
+      Description: Route order created events to Step Functions
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        source:
+          - order.service
+        detail-type:
+          - Order Created
+      State: ENABLED
+      Targets:
+        - Arn: !Ref OrderProcessingStateMachine
+          Id: StepFunctionsTarget
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+  # EventBridge Rule for Payment Events
+  PaymentEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-payment-events-rule-${AWS::StackName}'
+      Description: Route payment events to notification service
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        source:
+          - payment.service
+        detail-type:
+          - Payment Processed
+          - Payment Failed
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt NotificationServiceFunction.Arn
+          Id: NotificationTarget
+
+  # ======================================
+  # LAMBDA FUNCTIONS
+  # ======================================
+  
+  # Order Service Lambda Function
+  OrderServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-order-service-${AWS::StackName}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME: !Ref OrdersTable
+          EVENTBUS_NAME: !Ref CustomEventBus
+          AWS_REGION: !Ref AWS::Region
+      TracingConfig:
+        Mode: !If [EnableDetailedMonitoring, Active, PassThrough]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          from datetime import datetime
+          
+          dynamodb = boto3.resource('dynamodb')
+          eventbridge = boto3.client('events')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Parse order data
+                  order_data = json.loads(event['body']) if 'body' in event else event
+                  
+                  # Create order record
+                  order_id = str(uuid.uuid4())
+                  order_item = {
+                      'orderId': order_id,
+                      'customerId': order_data['customerId'],
+                      'items': order_data['items'],
+                      'totalAmount': order_data['totalAmount'],
+                      'status': 'PENDING',
+                      'createdAt': datetime.utcnow().isoformat()
+                  }
+                  
+                  # Store in DynamoDB
+                  table = dynamodb.Table(os.environ['DYNAMODB_TABLE_NAME'])
+                  table.put_item(Item=order_item)
+                  
+                  # Publish event to EventBridge
+                  eventbridge.put_events(
+                      Entries=[
+                          {
+                              'Source': 'order.service',
+                              'DetailType': 'Order Created',
+                              'Detail': json.dumps(order_item),
+                              'EventBusName': os.environ['EVENTBUS_NAME']
+                          }
+                      ]
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'orderId': order_id,
+                          'status': 'PENDING'
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error processing order: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Payment Service Lambda Function
+  PaymentServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-payment-service-${AWS::StackName}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME: !Ref OrdersTable
+          EVENTBUS_NAME: !Ref CustomEventBus
+          AWS_REGION: !Ref AWS::Region
+      TracingConfig:
+        Mode: !If [EnableDetailedMonitoring, Active, PassThrough]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import random
+          import time
+          import os
+          from datetime import datetime
+          
+          dynamodb = boto3.resource('dynamodb')
+          eventbridge = boto3.client('events')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Parse payment data
+                  payment_data = event['detail'] if 'detail' in event else event
+                  order_id = payment_data['orderId']
+                  amount = payment_data['totalAmount']
+                  
+                  # Simulate payment processing delay
+                  time.sleep(2)
+                  
+                  # Simulate payment success/failure (90% success rate)
+                  payment_successful = random.random() < 0.9
+                  
+                  # Update order status
+                  table = dynamodb.Table(os.environ['DYNAMODB_TABLE_NAME'])
+                  
+                  if payment_successful:
+                      table.update_item(
+                          Key={'orderId': order_id, 'customerId': payment_data['customerId']},
+                          UpdateExpression='SET #status = :status, paymentId = :paymentId, updatedAt = :updatedAt',
+                          ExpressionAttributeNames={'#status': 'status'},
+                          ExpressionAttributeValues={
+                              ':status': 'PAID',
+                              ':paymentId': f'pay_{order_id[:8]}',
+                              ':updatedAt': datetime.utcnow().isoformat()
+                          }
+                      )
+                      
+                      # Publish payment success event
+                      eventbridge.put_events(
+                          Entries=[
+                              {
+                                  'Source': 'payment.service',
+                                  'DetailType': 'Payment Processed',
+                                  'Detail': json.dumps({
+                                      'orderId': order_id,
+                                      'paymentId': f'pay_{order_id[:8]}',
+                                      'amount': amount,
+                                      'status': 'SUCCESS'
+                                  }),
+                                  'EventBusName': os.environ['EVENTBUS_NAME']
+                              }
+                          ]
+                      )
+                  else:
+                      table.update_item(
+                          Key={'orderId': order_id, 'customerId': payment_data['customerId']},
+                          UpdateExpression='SET #status = :status, updatedAt = :updatedAt',
+                          ExpressionAttributeNames={'#status': 'status'},
+                          ExpressionAttributeValues={
+                              ':status': 'PAYMENT_FAILED',
+                              ':updatedAt': datetime.utcnow().isoformat()
+                          }
+                      )
+                      
+                      # Publish payment failure event
+                      eventbridge.put_events(
+                          Entries=[
+                              {
+                                  'Source': 'payment.service',
+                                  'DetailType': 'Payment Failed',
+                                  'Detail': json.dumps({
+                                      'orderId': order_id,
+                                      'amount': amount,
+                                      'status': 'FAILED'
+                                  }),
+                                  'EventBusName': os.environ['EVENTBUS_NAME']
+                              }
+                          ]
+                      )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'orderId': order_id,
+                          'paymentStatus': 'SUCCESS' if payment_successful else 'FAILED'
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error processing payment: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Inventory Service Lambda Function
+  InventoryServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-inventory-service-${AWS::StackName}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME: !Ref OrdersTable
+          EVENTBUS_NAME: !Ref CustomEventBus
+          AWS_REGION: !Ref AWS::Region
+      TracingConfig:
+        Mode: !If [EnableDetailedMonitoring, Active, PassThrough]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import random
+          import os
+          from datetime import datetime
+          
+          dynamodb = boto3.resource('dynamodb')
+          eventbridge = boto3.client('events')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Parse inventory data
+                  inventory_data = event['detail'] if 'detail' in event else event
+                  order_id = inventory_data['orderId']
+                  items = inventory_data['items']
+                  
+                  # Simulate inventory check (95% success rate)
+                  inventory_available = random.random() < 0.95
+                  
+                  # Update order status
+                  table = dynamodb.Table(os.environ['DYNAMODB_TABLE_NAME'])
+                  
+                  if inventory_available:
+                      table.update_item(
+                          Key={'orderId': order_id, 'customerId': inventory_data['customerId']},
+                          UpdateExpression='SET #status = :status, updatedAt = :updatedAt',
+                          ExpressionAttributeNames={'#status': 'status'},
+                          ExpressionAttributeValues={
+                              ':status': 'INVENTORY_RESERVED',
+                              ':updatedAt': datetime.utcnow().isoformat()
+                          }
+                      )
+                      
+                      # Publish inventory reserved event
+                      eventbridge.put_events(
+                          Entries=[
+                              {
+                                  'Source': 'inventory.service',
+                                  'DetailType': 'Inventory Reserved',
+                                  'Detail': json.dumps({
+                                      'orderId': order_id,
+                                      'items': items,
+                                      'status': 'RESERVED'
+                                  }),
+                                  'EventBusName': os.environ['EVENTBUS_NAME']
+                              }
+                          ]
+                      )
+                  else:
+                      table.update_item(
+                          Key={'orderId': order_id, 'customerId': inventory_data['customerId']},
+                          UpdateExpression='SET #status = :status, updatedAt = :updatedAt',
+                          ExpressionAttributeNames={'#status': 'status'},
+                          ExpressionAttributeValues={
+                              ':status': 'INVENTORY_UNAVAILABLE',
+                              ':updatedAt': datetime.utcnow().isoformat()
+                          }
+                      )
+                      
+                      # Publish inventory unavailable event
+                      eventbridge.put_events(
+                          Entries=[
+                              {
+                                  'Source': 'inventory.service',
+                                  'DetailType': 'Inventory Unavailable',
+                                  'Detail': json.dumps({
+                                      'orderId': order_id,
+                                      'items': items,
+                                      'status': 'UNAVAILABLE'
+                                  }),
+                                  'EventBusName': os.environ['EVENTBUS_NAME']
+                              }
+                          ]
+                      )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'orderId': order_id,
+                          'inventoryStatus': 'RESERVED' if inventory_available else 'UNAVAILABLE'
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error processing inventory: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Notification Service Lambda Function
+  NotificationServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-notification-service-${AWS::StackName}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          AWS_REGION: !Ref AWS::Region
+      TracingConfig:
+        Mode: !If [EnableDetailedMonitoring, Active, PassThrough]
+      Code:
+        ZipFile: |
+          import json
+          import os
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              try:
+                  # Parse notification data
+                  notification_data = event['detail'] if 'detail' in event else event
+                  
+                  # Log notification (in real scenario, send email/SMS)
+                  print(f"NOTIFICATION: {json.dumps(notification_data, indent=2)}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Notification sent successfully',
+                          'timestamp': datetime.utcnow().isoformat()
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error sending notification: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ======================================
+  # LAMBDA PERMISSIONS
+  # ======================================
+  
+  # Permission for EventBridge to invoke Notification Service
+  NotificationServiceEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotificationServiceFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PaymentEventsRule.Arn
+
+  # ======================================
+  # STEP FUNCTIONS
+  # ======================================
+  
+  # CloudWatch Log Group for Step Functions
+  StepFunctionsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/stepfunctions/${ProjectName}-order-processing-${AWS::StackName}'
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !If
+        - IsProduction
+        - !GetAtt CloudWatchKMSKey.Arn
+        - !Ref AWS::NoValue
+
+  # KMS Key for CloudWatch Logs (Production only)
+  CloudWatchKMSKey:
+    Type: AWS::KMS::Key
+    Condition: IsProduction
+    Properties:
+      Description: KMS key for CloudWatch logs encryption
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # KMS Key Alias
+  CloudWatchKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: IsProduction
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-cloudwatch-${AWS::StackName}'
+      TargetKeyId: !Ref CloudWatchKMSKey
+
+  # Order Processing State Machine
+  OrderProcessingStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-order-processing-${AWS::StackName}'
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      TracingConfiguration:
+        Enabled: !If [EnableDetailedMonitoring, true, false]
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StepFunctionsLogGroup.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Order Processing Workflow",
+          "StartAt": "ProcessPayment",
+          "States": {
+            "ProcessPayment": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${PaymentServiceFunction}",
+                "Payload.$": "$"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 6,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "PaymentFailed",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "Next": "CheckPaymentStatus"
+            },
+            "CheckPaymentStatus": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.Payload.body",
+                  "StringMatches": "*SUCCESS*",
+                  "Next": "ReserveInventory"
+                }
+              ],
+              "Default": "PaymentFailed"
+            },
+            "ReserveInventory": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${InventoryServiceFunction}",
+                "Payload.$": "$"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "InventoryFailed",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "Next": "CheckInventoryStatus"
+            },
+            "CheckInventoryStatus": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.Payload.body",
+                  "StringMatches": "*RESERVED*",
+                  "Next": "SendSuccessNotification"
+                }
+              ],
+              "Default": "InventoryFailed"
+            },
+            "SendSuccessNotification": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${NotificationServiceFunction}",
+                "Payload": {
+                  "message": "Order processed successfully",
+                  "orderId.$": "$.detail.orderId",
+                  "status": "COMPLETED"
+                }
+              },
+              "End": true
+            },
+            "PaymentFailed": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${NotificationServiceFunction}",
+                "Payload": {
+                  "message": "Payment failed",
+                  "orderId.$": "$.detail.orderId",
+                  "status": "PAYMENT_FAILED"
+                }
+              },
+              "End": true
+            },
+            "InventoryFailed": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${NotificationServiceFunction}",
+                "Payload": {
+                  "message": "Inventory unavailable",
+                  "orderId.$": "$.detail.orderId",
+                  "status": "INVENTORY_FAILED"
+                }
+              },
+              "End": true
+            }
+          }
+        }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ======================================
+  # CLOUDWATCH MONITORING
+  # ======================================
+  
+  # CloudWatch Dashboard
+  MicroservicesDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-microservices-dashboard-${AWS::StackName}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${OrderServiceFunction}"],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${PaymentServiceFunction}"],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${InventoryServiceFunction}"],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${NotificationServiceFunction}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Lambda Invocations",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Errors", "FunctionName", "${OrderServiceFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${PaymentServiceFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${InventoryServiceFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${NotificationServiceFunction}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Lambda Errors",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/States", "ExecutionsSucceeded", "StateMachineArn", "${OrderProcessingStateMachine}"],
+                  ["AWS/States", "ExecutionsFailed", "StateMachineArn", "${OrderProcessingStateMachine}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Step Functions Executions",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${OrdersTable}"],
+                  ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "${OrdersTable}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "DynamoDB Capacity Consumption",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            }
+          ]
+        }
+
+  # ======================================
+  # CLOUDWATCH ALARMS
+  # ======================================
+  
+  # Lambda Error Rate Alarms
+  OrderServiceErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoring
+    Properties:
+      AlarmName: !Sub '${ProjectName}-order-service-errors-${AWS::StackName}'
+      AlarmDescription: Order Service Lambda function error rate too high
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref OrderServiceFunction
+      TreatMissingData: notBreaching
+
+  # Step Functions Failed Executions Alarm
+  StepFunctionsFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoring
+    Properties:
+      AlarmName: !Sub '${ProjectName}-stepfunctions-failures-${AWS::StackName}'
+      AlarmDescription: Step Functions execution failure rate too high
+      MetricName: ExecutionsFailed
+      Namespace: AWS/States
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref OrderProcessingStateMachine
+      TreatMissingData: notBreaching
+
+  # DynamoDB Throttling Alarm
+  DynamoDBThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoring
+    Properties:
+      AlarmName: !Sub '${ProjectName}-dynamodb-throttling-${AWS::StackName}'
+      AlarmDescription: DynamoDB table experiencing throttling
+      MetricName: ThrottledRequests
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref OrdersTable
+      TreatMissingData: notBreaching
+
+# ======================================
+# OUTPUTS
+# ======================================
+Outputs:
+  
+  # EventBridge Outputs
+  CustomEventBusName:
+    Description: Name of the custom EventBridge bus
+    Value: !Ref CustomEventBus
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBusName'
+      
+  CustomEventBusArn:
+    Description: ARN of the custom EventBridge bus
+    Value: !GetAtt CustomEventBus.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBusArn'
+  
+  # DynamoDB Outputs
+  OrdersTableName:
+    Description: Name of the DynamoDB orders table
+    Value: !Ref OrdersTable
+    Export:
+      Name: !Sub '${AWS::StackName}-OrdersTableName'
+      
+  OrdersTableArn:
+    Description: ARN of the DynamoDB orders table
+    Value: !GetAtt OrdersTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OrdersTableArn'
+  
+  # Lambda Function Outputs
+  OrderServiceFunctionArn:
+    Description: ARN of the Order Service Lambda function
+    Value: !GetAtt OrderServiceFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OrderServiceArn'
+      
+  PaymentServiceFunctionArn:
+    Description: ARN of the Payment Service Lambda function
+    Value: !GetAtt PaymentServiceFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PaymentServiceArn'
+      
+  InventoryServiceFunctionArn:
+    Description: ARN of the Inventory Service Lambda function
+    Value: !GetAtt InventoryServiceFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-InventoryServiceArn'
+      
+  NotificationServiceFunctionArn:
+    Description: ARN of the Notification Service Lambda function
+    Value: !GetAtt NotificationServiceFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationServiceArn'
+  
+  # Step Functions Outputs
+  OrderProcessingStateMachineArn:
+    Description: ARN of the Order Processing Step Functions state machine
+    Value: !Ref OrderProcessingStateMachine
+    Export:
+      Name: !Sub '${AWS::StackName}-StateMachineArn'
+      
+  OrderProcessingStateMachineName:
+    Description: Name of the Order Processing Step Functions state machine
+    Value: !Sub '${ProjectName}-order-processing-${AWS::StackName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-StateMachineName'
+  
+  # Monitoring Outputs
+  DashboardURL:
+    Description: URL for the CloudWatch dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-microservices-dashboard-${AWS::StackName}'
+    
+  StepFunctionsConsoleURL:
+    Description: URL for the Step Functions console
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/states/home?region=${AWS::Region}#/statemachines/view/${OrderProcessingStateMachine}'
+  
+  # IAM Role Outputs
+  LambdaExecutionRoleArn:
+    Description: ARN of the Lambda execution role
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaRoleArn'
+      
+  StepFunctionsExecutionRoleArn:
+    Description: ARN of the Step Functions execution role
+    Value: !GetAtt StepFunctionsExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-StepFunctionsRoleArn'
+
+  # Testing Information
+  TestInstructions:
+    Description: Instructions for testing the deployed infrastructure
+    Value: !Sub |
+      To test the event-driven microservices architecture:
+      1. Invoke the Order Service: aws lambda invoke --function-name ${OrderServiceFunction} --payload '{"customerId":"customer-123","items":[{"productId":"prod-001","quantity":2,"price":29.99}],"totalAmount":59.98}' response.json
+      2. Monitor the Step Functions execution in the console: ${OrderProcessingStateMachine}
+      3. Check the CloudWatch dashboard: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-microservices-dashboard-${AWS::StackName}
+      4. View DynamoDB records: aws dynamodb scan --table-name ${OrdersTable}

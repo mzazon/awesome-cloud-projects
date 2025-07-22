@@ -1,0 +1,694 @@
+# Infrastructure Manager Configuration for Database Performance Monitoring
+# Recipe: Database Performance Monitoring with Cloud SQL Insights and Cloud Monitoring
+# Version: 1.0
+# Provider: Google Cloud Platform
+
+# This configuration deploys a comprehensive database observability platform
+# combining Cloud SQL Insights, Cloud Monitoring, and Cloud Functions for
+# intelligent performance monitoring and automated alert processing.
+
+# Terraform configuration block
+terraform:
+  required_version: ">= 1.0"
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 5.0"
+    random:
+      source: "hashicorp/random"
+      version: "~> 3.4"
+
+# Input variables for customization
+variables:
+  project_id:
+    description: "GCP Project ID for deployment"
+    type: string
+    validation:
+      condition: length(var.project_id) > 0
+      error_message: "Project ID must not be empty."
+
+  region:
+    description: "GCP region for resource deployment"
+    type: string
+    default: "us-central1"
+    validation:
+      condition: can(regex("^[a-z]+-[a-z0-9]+-[0-9]+$", var.region))
+      error_message: "Region must be a valid GCP region format."
+
+  zone:
+    description: "GCP zone for zonal resources"
+    type: string
+    default: "us-central1-a"
+
+  db_instance_tier:
+    description: "Cloud SQL instance machine type"
+    type: string
+    default: "db-perf-optimized-N-2"
+
+  db_storage_size:
+    description: "Initial storage size in GB for Cloud SQL instance"
+    type: number
+    default: 100
+    validation:
+      condition: var.db_storage_size >= 10 && var.db_storage_size <= 65536
+      error_message: "Storage size must be between 10 and 65536 GB."
+
+  environment:
+    description: "Environment name for resource naming"
+    type: string
+    default: "monitoring"
+    validation:
+      condition: can(regex("^[a-z0-9-]+$", var.environment))
+      error_message: "Environment must contain only lowercase letters, numbers, and hyphens."
+
+# Local values for computed configurations
+locals:
+  # Generate unique suffix for resource names
+  random_suffix = random_id.suffix.hex
+  
+  # Resource naming
+  db_instance_name = "performance-db-${local.random_suffix}"
+  function_name = "db-alert-handler-${local.random_suffix}"
+  topic_name = "db-alerts-${local.random_suffix}"
+  bucket_name = "db-reports-${var.project_id}-${local.random_suffix}"
+  
+  # Common labels for all resources
+  common_labels = {
+    environment = var.environment
+    recipe = "database-performance-monitoring"
+    managed-by = "infrastructure-manager"
+    created-by = "gcp-recipes"
+  }
+}
+
+# Generate random suffix for unique resource naming
+resource "random_id" "suffix" {
+  byte_length = 3
+}
+
+# Enable required Google Cloud APIs
+resource "google_project_service" "apis" {
+  for_each = toset([
+    "sqladmin.googleapis.com",
+    "monitoring.googleapis.com",
+    "cloudfunctions.googleapis.com",
+    "pubsub.googleapis.com",
+    "storage.googleapis.com",
+    "logging.googleapis.com",
+    "cloudbuild.googleapis.com"
+  ])
+  
+  project = var.project_id
+  service = each.value
+  
+  disable_on_destroy = false
+  
+  timeouts {
+    create = "10m"
+  }
+}
+
+# Cloud Storage bucket for performance reports
+resource "google_storage_bucket" "reports_bucket" {
+  name     = local.bucket_name
+  location = var.region
+  project  = var.project_id
+  
+  # Security and lifecycle configuration
+  uniform_bucket_level_access = true
+  force_destroy              = true
+  
+  lifecycle_rule {
+    condition {
+      age = 30
+    }
+    action {
+      type = "Delete"
+    }
+  }
+  
+  versioning {
+    enabled = true
+  }
+  
+  labels = local.common_labels
+  
+  depends_on = [google_project_service.apis]
+}
+
+# Pub/Sub topic for alert notifications
+resource "google_pubsub_topic" "alert_topic" {
+  name    = local.topic_name
+  project = var.project_id
+  
+  labels = local.common_labels
+  
+  depends_on = [google_project_service.apis]
+}
+
+# Cloud SQL PostgreSQL instance with Enterprise Plus edition
+resource "google_sql_database_instance" "performance_db" {
+  name             = local.db_instance_name
+  project          = var.project_id
+  region           = var.region
+  database_version = "POSTGRES_15"
+  
+  # Enterprise Plus edition for advanced Query Insights
+  edition = "ENTERPRISE_PLUS"
+  
+  settings {
+    tier              = var.db_instance_tier
+    availability_type = "ZONAL"
+    disk_type         = "PD_SSD"
+    disk_size         = var.db_storage_size
+    disk_autoresize   = true
+    
+    # Backup configuration
+    backup_configuration {
+      enabled                        = true
+      start_time                     = "02:00"
+      location                       = var.region
+      binary_log_enabled            = true
+      transaction_log_retention_days = 7
+      backup_retention_settings {
+        retained_backups = 7
+        retention_unit   = "COUNT"
+      }
+    }
+    
+    # Maintenance window configuration
+    maintenance_window {
+      day          = 7  # Sunday
+      hour         = 4  # 4 AM
+      update_track = "stable"
+    }
+    
+    # Enhanced monitoring and Query Insights configuration
+    insights_config {
+      query_insights_enabled  = true
+      query_string_length     = 1024
+      record_application_tags = true
+      record_client_address   = true
+    }
+    
+    # IP configuration for secure access
+    ip_configuration {
+      ipv4_enabled                                  = true
+      private_network                               = null
+      enable_private_path_for_google_cloud_services = false
+      authorized_networks {
+        name  = "allow-all-temporary"
+        value = "0.0.0.0/0"
+      }
+    }
+    
+    # Database flags for performance optimization
+    database_flags {
+      name  = "shared_preload_libraries"
+      value = "pg_stat_statements"
+    }
+    
+    database_flags {
+      name  = "track_activity_query_size"
+      value = "2048"
+    }
+    
+    user_labels = local.common_labels
+  }
+  
+  deletion_protection = false
+  
+  depends_on = [google_project_service.apis]
+  
+  timeouts {
+    create = "20m"
+    update = "20m"
+    delete = "20m"
+  }
+}
+
+# Set password for the default postgres user
+resource "google_sql_user" "postgres_user" {
+  name     = "postgres"
+  instance = google_sql_database_instance.performance_db.name
+  project  = var.project_id
+  password = "SecurePass123!"
+  
+  depends_on = [google_sql_database_instance.performance_db]
+}
+
+# Create test database for performance monitoring
+resource "google_sql_database" "performance_test" {
+  name     = "performance_test"
+  instance = google_sql_database_instance.performance_db.name
+  project  = var.project_id
+  
+  depends_on = [google_sql_database_instance.performance_db]
+}
+
+# Service account for Cloud Function
+resource "google_service_account" "function_sa" {
+  account_id   = "db-alert-function-${local.random_suffix}"
+  display_name = "Database Alert Processing Function Service Account"
+  description  = "Service account for database performance alert processing"
+  project      = var.project_id
+  
+  depends_on = [google_project_service.apis]
+}
+
+# IAM bindings for Cloud Function service account
+resource "google_project_iam_member" "function_storage_admin" {
+  project = var.project_id
+  role    = "roles/storage.objectAdmin"
+  member  = "serviceAccount:${google_service_account.function_sa.email}"
+}
+
+resource "google_project_iam_member" "function_monitoring_viewer" {
+  project = var.project_id
+  role    = "roles/monitoring.viewer"
+  member  = "serviceAccount:${google_service_account.function_sa.email}"
+}
+
+resource "google_project_iam_member" "function_logging_writer" {
+  project = var.project_id
+  role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.function_sa.email}"
+}
+
+# Cloud Function source code archive
+data "archive_file" "function_source" {
+  type        = "zip"
+  output_path = "/tmp/db-alert-function.zip"
+  
+  source {
+    content = <<-EOT
+import json
+import base64
+import os
+from google.cloud import storage
+from google.cloud import monitoring_v3
+from datetime import datetime, timezone
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def process_db_alert(event, context):
+    """Process database performance alerts and generate actionable insights."""
+    try:
+        # Decode Pub/Sub message
+        if 'data' in event:
+            message = base64.b64decode(event['data']).decode('utf-8')
+            alert_data = json.loads(message)
+        else:
+            alert_data = event
+        
+        logger.info(f"Processing alert: {alert_data}")
+        
+        # Extract alert information
+        alert_type = alert_data.get('incident', {}).get('condition_name', 'Unknown')
+        resource_name = alert_data.get('incident', {}).get('resource_display_name', 'Unknown')
+        state = alert_data.get('incident', {}).get('state', 'UNKNOWN')
+        
+        # Generate performance report
+        report = generate_performance_report(alert_type, resource_name, state)
+        
+        # Store report in Cloud Storage
+        store_report(report)
+        
+        # Log processed alert
+        logger.info(f"Successfully processed {alert_type} alert for {resource_name}")
+        
+        return {"status": "success", "alert_type": alert_type}
+        
+    except Exception as e:
+        logger.error(f"Error processing alert: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
+def generate_performance_report(alert_type, resource_name, state):
+    """Generate detailed performance analysis report."""
+    timestamp = datetime.now(timezone.utc).isoformat()
+    
+    report = {
+        "timestamp": timestamp,
+        "alert_type": alert_type,
+        "resource_name": resource_name,
+        "state": state,
+        "recommendations": get_performance_recommendations(alert_type),
+        "analysis": f"Performance alert triggered for {resource_name} at {timestamp}"
+    }
+    
+    return report
+
+def get_performance_recommendations(alert_type):
+    """Provide intelligent recommendations based on alert type."""
+    recommendations = {
+        "CPU utilization is high": [
+            "Consider upgrading to a higher CPU tier",
+            "Review Query Insights for expensive queries",
+            "Implement query optimization strategies",
+            "Consider read replicas for read-heavy workloads"
+        ],
+        "Query execution time is high": [
+            "Analyze query execution plans in Query Insights",
+            "Review and optimize table indexes",
+            "Consider query rewriting for better performance",
+            "Check for table lock contention"
+        ]
+    }
+    
+    return recommendations.get(alert_type, ["Review database performance metrics"])
+
+def store_report(report):
+    """Store performance report in Cloud Storage."""
+    try:
+        client = storage.Client()
+        bucket_name = os.environ.get('BUCKET_NAME', 'default-bucket')
+        bucket = client.bucket(bucket_name)
+        
+        filename = f"performance-reports/{report['timestamp']}-{report['alert_type'].replace(' ', '-')}.json"
+        blob = bucket.blob(filename)
+        blob.upload_from_string(json.dumps(report, indent=2))
+        
+        logger.info(f"Report stored: gs://{bucket_name}/{filename}")
+        
+    except Exception as e:
+        logger.warning(f"Failed to store report: {str(e)}")
+EOT
+    filename = "main.py"
+  }
+  
+  source {
+    content = <<-EOT
+google-cloud-storage==2.10.0
+google-cloud-monitoring==2.15.1
+functions-framework==3.4.0
+EOT
+    filename = "requirements.txt"
+  }
+}
+
+# Cloud Storage bucket for function source code
+resource "google_storage_bucket" "function_source" {
+  name     = "${local.bucket_name}-function-source"
+  location = var.region
+  project  = var.project_id
+  
+  uniform_bucket_level_access = true
+  force_destroy              = true
+  
+  labels = local.common_labels
+  
+  depends_on = [google_project_service.apis]
+}
+
+# Upload function source code to Cloud Storage
+resource "google_storage_bucket_object" "function_source" {
+  name   = "db-alert-function-${random_id.suffix.hex}.zip"
+  bucket = google_storage_bucket.function_source.name
+  source = data.archive_file.function_source.output_path
+  
+  depends_on = [google_storage_bucket.function_source]
+}
+
+# Cloud Function for alert processing
+resource "google_cloudfunctions2_function" "alert_processor" {
+  name     = local.function_name
+  location = var.region
+  project  = var.project_id
+  
+  build_config {
+    runtime     = "python39"
+    entry_point = "process_db_alert"
+    
+    source {
+      storage_source {
+        bucket = google_storage_bucket.function_source.name
+        object = google_storage_bucket_object.function_source.name
+      }
+    }
+  }
+  
+  service_config {
+    max_instance_count = 10
+    min_instance_count = 0
+    available_memory   = "256M"
+    timeout_seconds    = 60
+    
+    environment_variables = {
+      BUCKET_NAME = google_storage_bucket.reports_bucket.name
+    }
+    
+    service_account_email = google_service_account.function_sa.email
+  }
+  
+  event_trigger {
+    trigger_region = var.region
+    event_type     = "google.cloud.pubsub.topic.v1.messagePublished"
+    pubsub_topic   = google_pubsub_topic.alert_topic.id
+    retry_policy   = "RETRY_POLICY_RETRY"
+  }
+  
+  labels = local.common_labels
+  
+  depends_on = [
+    google_project_service.apis,
+    google_storage_bucket_object.function_source,
+    google_service_account.function_sa
+  ]
+  
+  timeouts {
+    create = "10m"
+    update = "10m"
+  }
+}
+
+# Monitoring notification channel for Pub/Sub
+resource "google_monitoring_notification_channel" "pubsub_channel" {
+  display_name = "Database Alert Processing Channel"
+  type         = "pubsub"
+  project      = var.project_id
+  
+  labels = {
+    topic = google_pubsub_topic.alert_topic.id
+  }
+  
+  depends_on = [google_project_service.apis]
+}
+
+# Alerting policy for high CPU usage
+resource "google_monitoring_alert_policy" "cpu_alert" {
+  display_name = "Cloud SQL High CPU Usage"
+  project      = var.project_id
+  combiner     = "OR"
+  enabled      = true
+  
+  conditions {
+    display_name = "CPU utilization is high"
+    
+    condition_threshold {
+      filter          = "resource.type=\"cloudsql_database\" AND resource.label.database_id=\"${var.project_id}:${google_sql_database_instance.performance_db.name}\" AND metric.type=\"cloudsql.googleapis.com/database/cpu/utilization\""
+      duration        = "300s"
+      comparison      = "COMPARISON_GREATER_THAN"
+      threshold_value = 0.8
+      
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_MEAN"
+      }
+      
+      trigger {
+        count = 1
+      }
+    }
+  }
+  
+  notification_channels = [google_monitoring_notification_channel.pubsub_channel.id]
+  
+  alert_strategy {
+    auto_close = "1800s"
+  }
+  
+  depends_on = [
+    google_project_service.apis,
+    google_sql_database_instance.performance_db
+  ]
+}
+
+# Alerting policy for slow queries
+resource "google_monitoring_alert_policy" "slow_query_alert" {
+  display_name = "Cloud SQL Slow Query Detection"
+  project      = var.project_id
+  combiner     = "OR"
+  enabled      = true
+  
+  conditions {
+    display_name = "Query execution time is high"
+    
+    condition_threshold {
+      filter          = "resource.type=\"cloudsql_database\" AND resource.label.database_id=\"${var.project_id}:${google_sql_database_instance.performance_db.name}\" AND metric.type=\"cloudsql.googleapis.com/insights/aggregate/execution_time\""
+      duration        = "180s"
+      comparison      = "COMPARISON_GREATER_THAN"
+      threshold_value = 5000
+      
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_MEAN"
+      }
+      
+      trigger {
+        count = 1
+      }
+    }
+  }
+  
+  notification_channels = [google_monitoring_notification_channel.pubsub_channel.id]
+  
+  alert_strategy {
+    auto_close = "1800s"
+  }
+  
+  depends_on = [
+    google_project_service.apis,
+    google_sql_database_instance.performance_db
+  ]
+}
+
+# Custom monitoring dashboard
+resource "google_monitoring_dashboard" "performance_dashboard" {
+  dashboard_json = jsonencode({
+    displayName = "Cloud SQL Performance Monitoring Dashboard"
+    mosaicLayout = {
+      tiles = [
+        {
+          width  = 6
+          height = 4
+          widget = {
+            title = "Database Connections"
+            xyChart = {
+              dataSets = [
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "resource.type=\"cloudsql_database\" AND resource.label.database_id=\"${var.project_id}:${google_sql_database_instance.performance_db.name}\" AND metric.type=\"cloudsql.googleapis.com/database/network/connections\""
+                      aggregation = {
+                        alignmentPeriod  = "60s"
+                        perSeriesAligner = "ALIGN_MEAN"
+                      }
+                    }
+                  }
+                }
+              ]
+              yAxis = {
+                label = "Connections"
+                scale = "LINEAR"
+              }
+            }
+          }
+        },
+        {
+          width  = 6
+          height = 4
+          widget = {
+            title = "CPU Utilization"
+            xyChart = {
+              dataSets = [
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "resource.type=\"cloudsql_database\" AND resource.label.database_id=\"${var.project_id}:${google_sql_database_instance.performance_db.name}\" AND metric.type=\"cloudsql.googleapis.com/database/cpu/utilization\""
+                      aggregation = {
+                        alignmentPeriod  = "60s"
+                        perSeriesAligner = "ALIGN_MEAN"
+                      }
+                    }
+                  }
+                }
+              ]
+              yAxis = {
+                label = "CPU Utilization"
+                scale = "LINEAR"
+              }
+            }
+          }
+        },
+        {
+          width  = 12
+          height = 4
+          widget = {
+            title = "Query Insights - Top Queries by Execution Time"
+            xyChart = {
+              dataSets = [
+                {
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "resource.type=\"cloudsql_database\" AND resource.label.database_id=\"${var.project_id}:${google_sql_database_instance.performance_db.name}\" AND metric.type=\"cloudsql.googleapis.com/insights/aggregate/execution_time\""
+                      aggregation = {
+                        alignmentPeriod  = "300s"
+                        perSeriesAligner = "ALIGN_MEAN"
+                      }
+                    }
+                  }
+                }
+              ]
+              yAxis = {
+                label = "Execution Time (ms)"
+                scale = "LINEAR"
+              }
+            }
+          }
+        }
+      ]
+    }
+  })
+  
+  project = var.project_id
+  
+  depends_on = [
+    google_project_service.apis,
+    google_sql_database_instance.performance_db
+  ]
+}
+
+# Output values for verification and integration
+outputs:
+  db_instance_name:
+    description = "Name of the Cloud SQL instance"
+    value       = google_sql_database_instance.performance_db.name
+
+  db_instance_connection_name:
+    description = "Connection name for the Cloud SQL instance"
+    value       = google_sql_database_instance.performance_db.connection_name
+
+  db_instance_ip_address:
+    description = "IP address of the Cloud SQL instance"
+    value       = google_sql_database_instance.performance_db.ip_address.0.ip_address
+
+  function_name:
+    description = "Name of the Cloud Function for alert processing"
+    value       = google_cloudfunctions2_function.alert_processor.name
+
+  pubsub_topic:
+    description = "Name of the Pub/Sub topic for alerts"
+    value       = google_pubsub_topic.alert_topic.name
+
+  storage_bucket:
+    description = "Name of the Cloud Storage bucket for reports"
+    value       = google_storage_bucket.reports_bucket.name
+
+  dashboard_url:
+    description = "URL to the monitoring dashboard"
+    value       = "https://console.cloud.google.com/monitoring/dashboards/custom/${google_monitoring_dashboard.performance_dashboard.id}?project=${var.project_id}"
+
+  query_insights_url:
+    description = "URL to Query Insights for the database instance"
+    value       = "https://console.cloud.google.com/sql/instances/${google_sql_database_instance.performance_db.name}/insights?project=${var.project_id}"
+
+  connect_command:
+    description = "Command to connect to the database instance"
+    value       = "gcloud sql connect ${google_sql_database_instance.performance_db.name} --user=postgres --database=performance_test"
+    sensitive   = false

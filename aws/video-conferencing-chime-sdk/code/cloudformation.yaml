@@ -1,0 +1,1243 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Amazon Chime SDK Video Conferencing Solution - Complete infrastructure for building custom video conferencing applications'
+
+# Parameters for customization
+Parameters:
+  ProjectName:
+    Type: String
+    Description: 'Name of the project, used as a prefix for all resources'
+    Default: 'video-conferencing'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must begin with a letter and contain only alphanumeric characters and hyphens'
+
+  Environment:
+    Type: String
+    Description: 'Environment name (dev, staging, prod)'
+    Default: 'dev'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  DynamoDBReadCapacity:
+    Type: Number
+    Description: 'Read capacity units for DynamoDB table'
+    Default: 5
+    MinValue: 1
+    MaxValue: 100
+
+  DynamoDBWriteCapacity:
+    Type: Number
+    Description: 'Write capacity units for DynamoDB table'
+    Default: 5
+    MinValue: 1
+    MaxValue: 100
+
+  LambdaTimeout:
+    Type: Number
+    Description: 'Lambda function timeout in seconds'
+    Default: 30
+    MinValue: 10
+    MaxValue: 300
+
+  ApiGatewayThrottlingBurstLimit:
+    Type: Number
+    Description: 'API Gateway throttling burst limit'
+    Default: 2000
+    MinValue: 1
+    MaxValue: 10000
+
+  ApiGatewayThrottlingRateLimit:
+    Type: Number
+    Description: 'API Gateway throttling rate limit'
+    Default: 1000
+    MinValue: 1
+    MaxValue: 5000
+
+  EnableCloudWatchLogs:
+    Type: String
+    Description: 'Enable CloudWatch Logs for Lambda functions'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for SNS notifications (optional)'
+    Default: ''
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+# Conditions for optional resources
+Conditions:
+  EnableLogs: !Equals [!Ref EnableCloudWatchLogs, 'true']
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+# Resources
+Resources:
+  # S3 Bucket for meeting recordings and artifacts
+  RecordingsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-recordings-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: DeleteOldRecordings
+            Status: Enabled
+            ExpirationInDays: !If [IsProduction, 2555, 90]  # 7 years for prod, 90 days for dev
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref RecordingsBucketLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-recordings'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Group for S3 bucket notifications
+  RecordingsBucketLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogs
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-${Environment}-recordings'
+      RetentionInDays: !If [IsProduction, 365, 14]
+
+  # DynamoDB Table for meeting metadata
+  MeetingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-meetings'
+      AttributeDefinitions:
+        - AttributeName: MeetingId
+          AttributeType: S
+        - AttributeName: CreatedAt
+          AttributeType: S
+        - AttributeName: Status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: MeetingId
+          KeyType: HASH
+        - AttributeName: CreatedAt
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: Status
+              KeyType: HASH
+            - AttributeName: CreatedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !Ref DynamoDBReadCapacity
+            WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref DynamoDBReadCapacity
+        WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-meetings'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SNS Topic for meeting events
+  MeetingEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-events'
+      DisplayName: 'Chime SDK Meeting Events'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-events'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SNS Topic Policy for Chime SDK
+  MeetingEventsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref MeetingEventsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowChimeSDKPublish
+            Effect: Allow
+            Principal:
+              Service: chime.amazonaws.com
+            Action:
+              - sns:Publish
+            Resource: !Ref MeetingEventsTopic
+          - Sid: AllowAccountAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - sns:Subscribe
+              - sns:SetTopicAttributes
+              - sns:RemovePermission
+              - sns:Receive
+              - sns:Publish
+              - sns:ListSubscriptionsByTopic
+              - sns:GetTopicAttributes
+              - sns:DeleteTopic
+              - sns:AddPermission
+            Resource: !Ref MeetingEventsTopic
+
+  # Email subscription for notifications (optional)
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      Protocol: email
+      TopicArn: !Ref MeetingEventsTopic
+      Endpoint: !Ref NotificationEmail
+
+  # SQS Queue for event processing
+  EventProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-event-processing'
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeoutSeconds: 180
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EventProcessingDeadLetterQueue.Arn
+        maxReceiveCount: 3
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-event-processing'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Dead Letter Queue for failed events
+  EventProcessingDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-event-processing-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-event-processing-dlq'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SQS Queue Policy
+  EventProcessingQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref EventProcessingQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt EventProcessingQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref MeetingEventsTopic
+
+  # Subscribe SQS to SNS
+  QueueSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sqs
+      TopicArn: !Ref MeetingEventsTopic
+      Endpoint: !GetAtt EventProcessingQueue.Arn
+      RawMessageDelivery: true
+
+  # IAM Role for Lambda functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ChimeSDKPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - chime:CreateMeeting
+                  - chime:DeleteMeeting
+                  - chime:GetMeeting
+                  - chime:ListMeetings
+                  - chime:CreateAttendee
+                  - chime:DeleteAttendee
+                  - chime:GetAttendee
+                  - chime:ListAttendees
+                  - chime:BatchCreateAttendee
+                  - chime:BatchDeleteAttendee
+                  - chime:StartMeetingTranscription
+                  - chime:StopMeetingTranscription
+                Resource: '*'
+        - PolicyName: DynamoDBPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: 
+                  - !GetAtt MeetingsTable.Arn
+                  - !Sub '${MeetingsTable.Arn}/index/*'
+        - PolicyName: S3Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: !Sub '${RecordingsBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt RecordingsBucket.Arn
+        - PolicyName: SQSPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt EventProcessingQueue.Arn
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-${Environment}-*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-lambda-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda function for meeting management
+  MeetingHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-meeting-handler'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref MeetingsTable
+          SNS_TOPIC_ARN: !Ref MeetingEventsTopic
+          BUCKET_NAME: !Ref RecordingsBucket
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const { v4: uuidv4 } = require('uuid');
+          
+          const chime = new AWS.ChimeSDKMeetings({
+              region: process.env.AWS_REGION,
+              endpoint: `https://meetings-chime.${process.env.AWS_REGION}.amazonaws.com`
+          });
+          
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          
+          exports.handler = async (event) => {
+              console.log('Event:', JSON.stringify(event, null, 2));
+              
+              const { httpMethod, path, body } = event;
+              
+              try {
+                  switch (httpMethod) {
+                      case 'POST':
+                          if (path === '/meetings') {
+                              return await createMeeting(JSON.parse(body || '{}'));
+                          }
+                          break;
+                      case 'GET':
+                          if (path.startsWith('/meetings/')) {
+                              const meetingId = path.split('/')[2];
+                              return await getMeeting(meetingId);
+                          }
+                          break;
+                      case 'DELETE':
+                          if (path.startsWith('/meetings/')) {
+                              const meetingId = path.split('/')[2];
+                              return await deleteMeeting(meetingId);
+                          }
+                          break;
+                  }
+                  
+                  return {
+                      statusCode: 404,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      body: JSON.stringify({ error: 'Not found' })
+                  };
+              } catch (error) {
+                  console.error('Error:', error);
+                  return {
+                      statusCode: 500,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      body: JSON.stringify({ error: 'Internal server error' })
+                  };
+              }
+          };
+          
+          async function createMeeting(requestBody) {
+              const { externalMeetingId, mediaRegion, meetingHostId } = requestBody;
+              
+              const meetingRequest = {
+                  ClientRequestToken: uuidv4(),
+                  ExternalMeetingId: externalMeetingId || uuidv4(),
+                  MediaRegion: mediaRegion || process.env.AWS_REGION,
+                  MeetingHostId: meetingHostId,
+                  NotificationsConfiguration: {
+                      SnsTopicArn: process.env.SNS_TOPIC_ARN
+                  },
+                  MeetingFeatures: {
+                      Audio: {
+                          EchoReduction: 'AVAILABLE'
+                      },
+                      Video: {
+                          MaxResolution: 'HD'
+                      },
+                      Content: {
+                          MaxResolution: 'FHD'
+                      }
+                  }
+              };
+              
+              const meeting = await chime.createMeeting(meetingRequest).promise();
+              
+              await dynamodb.put({
+                  TableName: process.env.TABLE_NAME,
+                  Item: {
+                      MeetingId: meeting.Meeting.MeetingId,
+                      CreatedAt: new Date().toISOString(),
+                      ExternalMeetingId: meeting.Meeting.ExternalMeetingId,
+                      MediaRegion: meeting.Meeting.MediaRegion,
+                      Status: 'ACTIVE',
+                      TTL: Math.floor(Date.now() / 1000) + (24 * 60 * 60) // 24 hours
+                  }
+              }).promise();
+              
+              return {
+                  statusCode: 201,
+                  headers: {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  body: JSON.stringify({
+                      Meeting: meeting.Meeting
+                  })
+              };
+          }
+          
+          async function getMeeting(meetingId) {
+              const meeting = await chime.getMeeting({ MeetingId: meetingId }).promise();
+              
+              return {
+                  statusCode: 200,
+                  headers: {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  body: JSON.stringify({
+                      Meeting: meeting.Meeting
+                  })
+              };
+          }
+          
+          async function deleteMeeting(meetingId) {
+              await chime.deleteMeeting({ MeetingId: meetingId }).promise();
+              
+              await dynamodb.update({
+                  TableName: process.env.TABLE_NAME,
+                  Key: { MeetingId: meetingId },
+                  UpdateExpression: 'SET #status = :status, UpdatedAt = :updatedAt',
+                  ExpressionAttributeNames: {
+                      '#status': 'Status'
+                  },
+                  ExpressionAttributeValues: {
+                      ':status': 'DELETED',
+                      ':updatedAt': new Date().toISOString()
+                  }
+              }).promise();
+              
+              return {
+                  statusCode: 204,
+                  headers: {
+                      'Access-Control-Allow-Origin': '*'
+                  }
+              };
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-meeting-handler'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda function for attendee management
+  AttendeeHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-attendee-handler'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref MeetingsTable
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const { v4: uuidv4 } = require('uuid');
+          
+          const chime = new AWS.ChimeSDKMeetings({
+              region: process.env.AWS_REGION,
+              endpoint: `https://meetings-chime.${process.env.AWS_REGION}.amazonaws.com`
+          });
+          
+          exports.handler = async (event) => {
+              console.log('Event:', JSON.stringify(event, null, 2));
+              
+              const { httpMethod, path, body } = event;
+              
+              try {
+                  switch (httpMethod) {
+                      case 'POST':
+                          if (path.startsWith('/meetings/') && path.endsWith('/attendees')) {
+                              const meetingId = path.split('/')[2];
+                              return await createAttendee(meetingId, JSON.parse(body || '{}'));
+                          }
+                          break;
+                      case 'GET':
+                          if (path.includes('/attendees/')) {
+                              const pathParts = path.split('/');
+                              const meetingId = pathParts[2];
+                              const attendeeId = pathParts[4];
+                              return await getAttendee(meetingId, attendeeId);
+                          }
+                          break;
+                      case 'DELETE':
+                          if (path.includes('/attendees/')) {
+                              const pathParts = path.split('/');
+                              const meetingId = pathParts[2];
+                              const attendeeId = pathParts[4];
+                              return await deleteAttendee(meetingId, attendeeId);
+                          }
+                          break;
+                  }
+                  
+                  return {
+                      statusCode: 404,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      body: JSON.stringify({ error: 'Not found' })
+                  };
+              } catch (error) {
+                  console.error('Error:', error);
+                  return {
+                      statusCode: 500,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      body: JSON.stringify({ error: 'Internal server error' })
+                  };
+              }
+          };
+          
+          async function createAttendee(meetingId, requestBody) {
+              const { externalUserId, capabilities } = requestBody;
+              
+              const attendeeRequest = {
+                  MeetingId: meetingId,
+                  ExternalUserId: externalUserId || uuidv4(),
+                  Capabilities: capabilities || {
+                      Audio: 'SendReceive',
+                      Video: 'SendReceive',
+                      Content: 'SendReceive'
+                  }
+              };
+              
+              const attendee = await chime.createAttendee(attendeeRequest).promise();
+              
+              return {
+                  statusCode: 201,
+                  headers: {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  body: JSON.stringify({
+                      Attendee: attendee.Attendee
+                  })
+              };
+          }
+          
+          async function getAttendee(meetingId, attendeeId) {
+              const attendee = await chime.getAttendee({
+                  MeetingId: meetingId,
+                  AttendeeId: attendeeId
+              }).promise();
+              
+              return {
+                  statusCode: 200,
+                  headers: {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  body: JSON.stringify({
+                      Attendee: attendee.Attendee
+                  })
+              };
+          }
+          
+          async function deleteAttendee(meetingId, attendeeId) {
+              await chime.deleteAttendee({
+                  MeetingId: meetingId,
+                  AttendeeId: attendeeId
+              }).promise();
+              
+              return {
+                  statusCode: 204,
+                  headers: {
+                      'Access-Control-Allow-Origin': '*'
+                  }
+              };
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-attendee-handler'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda function for event processing
+  EventProcessingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-event-processor'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref MeetingsTable
+          BUCKET_NAME: !Ref RecordingsBucket
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          const s3 = new AWS.S3();
+          
+          exports.handler = async (event) => {
+              console.log('Event:', JSON.stringify(event, null, 2));
+              
+              for (const record of event.Records) {
+                  try {
+                      const message = JSON.parse(record.body);
+                      const eventType = message.eventType;
+                      
+                      switch (eventType) {
+                          case 'chime:MeetingEnded':
+                              await handleMeetingEnded(message);
+                              break;
+                          case 'chime:AttendeeJoined':
+                              await handleAttendeeJoined(message);
+                              break;
+                          case 'chime:AttendeeLeft':
+                              await handleAttendeeLeft(message);
+                              break;
+                          default:
+                              console.log('Unhandled event type:', eventType);
+                      }
+                  } catch (error) {
+                      console.error('Error processing record:', error);
+                      throw error; // Re-throw to trigger retry
+                  }
+              }
+          };
+          
+          async function handleMeetingEnded(message) {
+              const { meetingId } = message;
+              
+              // Update meeting status in DynamoDB
+              await dynamodb.update({
+                  TableName: process.env.TABLE_NAME,
+                  Key: { MeetingId: meetingId },
+                  UpdateExpression: 'SET #status = :status, EndedAt = :endedAt',
+                  ExpressionAttributeNames: {
+                      '#status': 'Status'
+                  },
+                  ExpressionAttributeValues: {
+                      ':status': 'ENDED',
+                      ':endedAt': new Date().toISOString()
+                  }
+              }).promise();
+              
+              console.log('Meeting ended:', meetingId);
+          }
+          
+          async function handleAttendeeJoined(message) {
+              const { meetingId, attendeeId } = message;
+              
+              console.log('Attendee joined:', { meetingId, attendeeId });
+              
+              // Could add analytics or notification logic here
+          }
+          
+          async function handleAttendeeLeft(message) {
+              const { meetingId, attendeeId } = message;
+              
+              console.log('Attendee left:', { meetingId, attendeeId });
+              
+              // Could add analytics or notification logic here
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-event-processor'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Event source mapping for SQS to Lambda
+  EventProcessingTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt EventProcessingQueue.Arn
+      FunctionName: !Ref EventProcessingFunction
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+
+  # CloudWatch Log Groups for Lambda functions
+  MeetingHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogs
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-meeting-handler'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  AttendeeHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogs
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-attendee-handler'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  EventProcessingLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogs
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-event-processor'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  # API Gateway REST API
+  VideoConferencingAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-api'
+      Description: 'Video Conferencing API using Amazon Chime SDK'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 'execute-api:Invoke'
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-api'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # API Gateway Resources
+  MeetingsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref VideoConferencingAPI
+      ParentId: !GetAtt VideoConferencingAPI.RootResourceId
+      PathPart: meetings
+
+  MeetingIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref VideoConferencingAPI
+      ParentId: !Ref MeetingsResource
+      PathPart: '{meetingId}'
+
+  AttendeesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref VideoConferencingAPI
+      ParentId: !Ref MeetingIdResource
+      PathPart: attendees
+
+  AttendeeIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref VideoConferencingAPI
+      ParentId: !Ref AttendeesResource
+      PathPart: '{attendeeId}'
+
+  # API Gateway Methods for Meetings
+  CreateMeetingMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref VideoConferencingAPI
+      ResourceId: !Ref MeetingsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MeetingHandlerFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 201
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+        - StatusCode: 500
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+
+  GetMeetingMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref VideoConferencingAPI
+      ResourceId: !Ref MeetingIdResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MeetingHandlerFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+        - StatusCode: 404
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+
+  DeleteMeetingMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref VideoConferencingAPI
+      ResourceId: !Ref MeetingIdResource
+      HttpMethod: DELETE
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MeetingHandlerFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 204
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+        - StatusCode: 404
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+
+  # API Gateway Methods for Attendees
+  CreateAttendeeMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref VideoConferencingAPI
+      ResourceId: !Ref AttendeesResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AttendeeHandlerFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 201
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+        - StatusCode: 500
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+
+  GetAttendeeMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref VideoConferencingAPI
+      ResourceId: !Ref AttendeeIdResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AttendeeHandlerFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+        - StatusCode: 404
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+
+  DeleteAttendeeMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref VideoConferencingAPI
+      ResourceId: !Ref AttendeeIdResource
+      HttpMethod: DELETE
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AttendeeHandlerFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 204
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+        - StatusCode: 404
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+
+  # CORS Options Methods
+  MeetingsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref VideoConferencingAPI
+      ResourceId: !Ref MeetingsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AttendeesOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref VideoConferencingAPI
+      ResourceId: !Ref AttendeesResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Lambda Permissions for API Gateway
+  MeetingHandlerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MeetingHandlerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${VideoConferencingAPI}/*/*'
+
+  AttendeeHandlerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AttendeeHandlerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${VideoConferencingAPI}/*/*'
+
+  # API Gateway Deployment
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - CreateMeetingMethod
+      - GetMeetingMethod
+      - DeleteMeetingMethod
+      - CreateAttendeeMethod
+      - GetAttendeeMethod
+      - DeleteAttendeeMethod
+      - MeetingsOptionsMethod
+      - AttendeesOptionsMethod
+    Properties:
+      RestApiId: !Ref VideoConferencingAPI
+      Description: 'Initial deployment of Video Conferencing API'
+
+  # API Gateway Stage
+  APIStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref VideoConferencingAPI
+      DeploymentId: !Ref APIDeployment
+      StageName: !Ref Environment
+      ThrottleSettings:
+        BurstLimit: !Ref ApiGatewayThrottlingBurstLimit
+        RateLimit: !Ref ApiGatewayThrottlingRateLimit
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: INFO
+          DataTraceEnabled: true
+          MetricsEnabled: true
+      Variables:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-stage'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarms for monitoring
+  MeetingHandlerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-meeting-handler-errors'
+      AlarmDescription: 'High error rate in Meeting Handler Lambda'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref MeetingHandlerFunction
+      AlarmActions:
+        - !Ref MeetingEventsTopic
+
+  AttendeeHandlerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-attendee-handler-errors'
+      AlarmDescription: 'High error rate in Attendee Handler Lambda'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AttendeeHandlerFunction
+      AlarmActions:
+        - !Ref MeetingEventsTopic
+
+  APIGatewayErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-api-gateway-errors'
+      AlarmDescription: 'High error rate in API Gateway'
+      MetricName: 4XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref VideoConferencingAPI
+        - Name: Stage
+          Value: !Ref APIStage
+      AlarmActions:
+        - !Ref MeetingEventsTopic
+
+# Outputs
+Outputs:
+  ApiEndpoint:
+    Description: 'API Gateway endpoint URL'
+    Value: !Sub 'https://${VideoConferencingAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-api-endpoint'
+
+  MeetingsTableName:
+    Description: 'DynamoDB table name for meetings'
+    Value: !Ref MeetingsTable
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-meetings-table'
+
+  RecordingsBucketName:
+    Description: 'S3 bucket name for recordings'
+    Value: !Ref RecordingsBucket
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-recordings-bucket'
+
+  SNSTopicArn:
+    Description: 'SNS topic ARN for meeting events'
+    Value: !Ref MeetingEventsTopic
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-sns-topic'
+
+  MeetingHandlerFunctionName:
+    Description: 'Meeting handler Lambda function name'
+    Value: !Ref MeetingHandlerFunction
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-meeting-handler'
+
+  AttendeeHandlerFunctionName:
+    Description: 'Attendee handler Lambda function name'
+    Value: !Ref AttendeeHandlerFunction
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-attendee-handler'
+
+  EventProcessingFunctionName:
+    Description: 'Event processing Lambda function name'
+    Value: !Ref EventProcessingFunction
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-event-processor'
+
+  LambdaExecutionRoleArn:
+    Description: 'Lambda execution role ARN'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-lambda-role'
+
+  # API endpoints for easy reference
+  CreateMeetingEndpoint:
+    Description: 'POST endpoint to create meetings'
+    Value: !Sub 'https://${VideoConferencingAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/meetings'
+
+  GetMeetingEndpoint:
+    Description: 'GET endpoint to retrieve meeting details'
+    Value: !Sub 'https://${VideoConferencingAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/meetings/{meetingId}'
+
+  CreateAttendeeEndpoint:
+    Description: 'POST endpoint to create attendees'
+    Value: !Sub 'https://${VideoConferencingAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/meetings/{meetingId}/attendees'
+
+  # CloudWatch Dashboard URL
+  CloudWatchDashboardUrl:
+    Description: 'CloudWatch dashboard URL for monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}'
+
+  # DynamoDB Console URL
+  DynamoDBConsoleUrl:
+    Description: 'DynamoDB console URL for meetings table'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/dynamodb/home?region=${AWS::Region}#tables:selected=${MeetingsTable}'
+
+  # S3 Console URL
+  S3ConsoleUrl:
+    Description: 'S3 console URL for recordings bucket'
+    Value: !Sub 'https://s3.console.aws.amazon.com/s3/buckets/${RecordingsBucket}?region=${AWS::Region}'

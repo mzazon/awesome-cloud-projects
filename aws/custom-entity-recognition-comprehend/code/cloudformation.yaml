@@ -1,0 +1,1149 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure for implementing custom entity recognition and classification with Amazon Comprehend'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'comprehend-custom'
+    Description: 'Project name used for resource naming and tagging'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+    MinLength: 3
+    MaxLength: 32
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    Description: 'Environment designation for resource tagging'
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+
+  TrainingDataBucketName:
+    Type: String
+    Description: 'S3 bucket name for storing training data and models (leave blank for auto-generation)'
+    Default: ''
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be a valid S3 bucket name or empty for auto-generation'
+
+  EnableModelEndpoints:
+    Type: String
+    Default: 'false'
+    Description: 'Whether to create real-time inference endpoints (incurs additional costs)'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for training completion notifications'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  RetentionInDays:
+    Type: Number
+    Default: 30
+    Description: 'CloudWatch logs retention period in days'
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+Conditions:
+  AutoGenerateBucketName: !Equals [!Ref TrainingDataBucketName, '']
+  CreateModelEndpoints: !Equals [!Ref EnableModelEndpoints, 'true']
+
+Resources:
+  # =============================================================================
+  # S3 Resources for Training Data and Model Storage
+  # =============================================================================
+  
+  TrainingDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - AutoGenerateBucketName
+        - !Sub '${ProjectName}-models-${AWS::AccountId}-${AWS::Region}'
+        - !Ref TrainingDataBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transition:
+              StorageClass: GLACIER
+              TransitionInDays: 90
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Comprehend Training Data'
+
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-bucket-access'
+      RetentionInDays: !Ref RetentionInDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # =============================================================================
+  # IAM Roles and Policies
+  # =============================================================================
+
+  ComprehendServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ComprehendServiceRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - comprehend.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ComprehendCustomModelPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - comprehend:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${TrainingDataBucket}'
+                  - !Sub '${TrainingDataBucket}/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt ResultsTable.Arn
+                  - !Sub '${ResultsTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref TrainingNotificationTopic
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                  - states:DescribeExecution
+                  - states:DescribeStateMachine
+                Resource:
+                  - !Ref TrainingPipelineStateMachine
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt DataPreprocessorFunction.Arn
+                  - !GetAtt ModelTrainerFunction.Arn
+                  - !GetAtt StatusCheckerFunction.Arn
+                  - !GetAtt InferenceAPIFunction.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # =============================================================================
+  # DynamoDB Table for Results Storage
+  # =============================================================================
+
+  ResultsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-inference-results'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+        - AttributeName: model_type
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: TimestampIndex
+          KeySchema:
+            - AttributeName: timestamp
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: ModelTypeIndex
+          KeySchema:
+            - AttributeName: model_type
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Inference Results Storage'
+
+  # =============================================================================
+  # SNS Topic for Notifications
+  # =============================================================================
+
+  TrainingNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-training-notifications'
+      DisplayName: 'Comprehend Model Training Notifications'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  TrainingNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref TrainingNotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # =============================================================================
+  # CloudWatch Log Groups for Lambda Functions
+  # =============================================================================
+
+  DataPreprocessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-data-preprocessor'
+      RetentionInDays: !Ref RetentionInDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  ModelTrainerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-model-trainer'
+      RetentionInDays: !Ref RetentionInDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  StatusCheckerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-status-checker'
+      RetentionInDays: !Ref RetentionInDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  InferenceAPILogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-inference-api'
+      RetentionInDays: !Ref RetentionInDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # =============================================================================
+  # Lambda Functions
+  # =============================================================================
+
+  DataPreprocessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-data-preprocessor'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ComprehendServiceRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref TrainingDataBucket
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import csv
+          from io import StringIO
+          import re
+          import os
+          
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              bucket = event.get('bucket') or os.environ['BUCKET_NAME']
+              entity_key = event['entity_training_data']
+              classification_key = event['classification_training_data']
+              
+              try:
+                  # Process entity training data
+                  entity_result = process_entity_data(bucket, entity_key)
+                  
+                  # Process classification training data
+                  classification_result = process_classification_data(bucket, classification_key)
+                  
+                  return {
+                      'statusCode': 200,
+                      'entity_training_ready': entity_result,
+                      'classification_training_ready': classification_result,
+                      'bucket': bucket
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in data preprocessing: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'error': str(e)
+                  }
+          
+          def process_entity_data(bucket, key):
+              # Download and validate entity training data
+              response = s3.get_object(Bucket=bucket, Key=key)
+              content = response['Body'].read().decode('utf-8')
+              
+              # Parse CSV and validate format
+              csv_reader = csv.DictReader(StringIO(content))
+              rows = list(csv_reader)
+              
+              # Validate required columns
+              required_columns = ['Text', 'File', 'Line', 'BeginOffset', 'EndOffset', 'Type']
+              if not all(col in csv_reader.fieldnames for col in required_columns):
+                  raise ValueError(f"Missing required columns. Expected: {required_columns}")
+              
+              # Validate entity types and counts
+              entity_types = {}
+              for row in rows:
+                  entity_type = row['Type']
+                  entity_types[entity_type] = entity_types.get(entity_type, 0) + 1
+              
+              # Check minimum examples per entity type
+              min_examples = 10
+              insufficient_types = [et for et, count in entity_types.items() if count < min_examples]
+              
+              if insufficient_types:
+                  print(f"Warning: Entity types with fewer than {min_examples} examples: {insufficient_types}")
+              
+              # Save processed data
+              processed_key = key.replace('.csv', '_processed.csv')
+              s3.put_object(
+                  Bucket=bucket,
+                  Key=processed_key,
+                  Body=content,
+                  ContentType='text/csv'
+              )
+              
+              return {
+                  'processed_file': processed_key,
+                  'entity_types': list(entity_types.keys()),
+                  'total_examples': len(rows),
+                  'entity_counts': entity_types
+              }
+          
+          def process_classification_data(bucket, key):
+              # Download and validate classification training data
+              response = s3.get_object(Bucket=bucket, Key=key)
+              content = response['Body'].read().decode('utf-8')
+              
+              # Parse CSV and validate format
+              csv_reader = csv.DictReader(StringIO(content))
+              rows = list(csv_reader)
+              
+              # Validate required columns
+              required_columns = ['Text', 'Label']
+              if not all(col in csv_reader.fieldnames for col in required_columns):
+                  raise ValueError(f"Missing required columns. Expected: {required_columns}")
+              
+              # Validate labels and counts
+              label_counts = {}
+              for row in rows:
+                  label = row['Label']
+                  label_counts[label] = label_counts.get(label, 0) + 1
+              
+              # Check minimum examples per label
+              min_examples = 10
+              insufficient_labels = [label for label, count in label_counts.items() if count < min_examples]
+              
+              if insufficient_labels:
+                  print(f"Warning: Labels with fewer than {min_examples} examples: {insufficient_labels}")
+              
+              # Save processed data
+              processed_key = key.replace('.csv', '_processed.csv')
+              s3.put_object(
+                  Bucket=bucket,
+                  Key=processed_key,
+                  Body=content,
+                  ContentType='text/csv'
+              )
+              
+              return {
+                  'processed_file': processed_key,
+                  'labels': list(label_counts.keys()),
+                  'total_examples': len(rows),
+                  'label_counts': label_counts
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  ModelTrainerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-model-trainer'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ComprehendServiceRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime
+          import uuid
+          import os
+          
+          comprehend = boto3.client('comprehend')
+          
+          def lambda_handler(event, context):
+              bucket = event['bucket']
+              model_type = event['model_type']  # 'entity' or 'classification'
+              
+              try:
+                  if model_type == 'entity':
+                      result = train_entity_model(event)
+                  elif model_type == 'classification':
+                      result = train_classification_model(event)
+                  else:
+                      raise ValueError(f"Invalid model type: {model_type}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'model_type': model_type,
+                      'training_job_arn': result['EntityRecognizerArn'] if model_type == 'entity' else result['DocumentClassifierArn'],
+                      'training_status': 'SUBMITTED'
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in model training: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'error': str(e),
+                      'model_type': model_type
+                  }
+          
+          def train_entity_model(event):
+              bucket = event['bucket']
+              training_data = event['entity_training_ready']['processed_file']
+              
+              timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+              recognizer_name = f"{event.get('project_name', os.environ['PROJECT_NAME'])}-entity-{timestamp}"
+              
+              # Configure training job
+              training_config = {
+                  'RecognizerName': recognizer_name,
+                  'DataAccessRoleArn': event['role_arn'],
+                  'InputDataConfig': {
+                      'EntityTypes': [
+                          {'Type': entity_type} 
+                          for entity_type in event['entity_training_ready']['entity_types']
+                      ],
+                      'Documents': {
+                          'S3Uri': f"s3://{bucket}/training-data/entities_sample.txt"
+                      },
+                      'Annotations': {
+                          'S3Uri': f"s3://{bucket}/training-data/{training_data}"
+                      }
+                  },
+                  'LanguageCode': 'en'
+              }
+              
+              # Start training job
+              response = comprehend.create_entity_recognizer(**training_config)
+              
+              return response
+          
+          def train_classification_model(event):
+              bucket = event['bucket']
+              training_data = event['classification_training_ready']['processed_file']
+              
+              timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+              classifier_name = f"{event.get('project_name', os.environ['PROJECT_NAME'])}-classifier-{timestamp}"
+              
+              # Configure training job
+              training_config = {
+                  'DocumentClassifierName': classifier_name,
+                  'DataAccessRoleArn': event['role_arn'],
+                  'InputDataConfig': {
+                      'S3Uri': f"s3://{bucket}/training-data/{training_data}"
+                  },
+                  'LanguageCode': 'en'
+              }
+              
+              # Start training job
+              response = comprehend.create_document_classifier(**training_config)
+              
+              return response
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  StatusCheckerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-status-checker'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ComprehendServiceRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          
+          comprehend = boto3.client('comprehend')
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              model_type = event['model_type']
+              job_arn = event['training_job_arn']
+              
+              try:
+                  if model_type == 'entity':
+                      response = comprehend.describe_entity_recognizer(
+                          EntityRecognizerArn=job_arn
+                      )
+                      status = response['EntityRecognizerProperties']['Status']
+                      
+                  elif model_type == 'classification':
+                      response = comprehend.describe_document_classifier(
+                          DocumentClassifierArn=job_arn
+                      )
+                      status = response['DocumentClassifierProperties']['Status']
+                  
+                  else:
+                      raise ValueError(f"Invalid model type: {model_type}")
+                  
+                  # Determine if training is complete
+                  is_complete = status in ['TRAINED', 'TRAINING_FAILED', 'STOPPED']
+                  
+                  # Send notification if training completed
+                  if is_complete and 'notification_topic' in event:
+                      message = f"Model training completed: {model_type} - Status: {status}"
+                      sns.publish(
+                          TopicArn=event['notification_topic'],
+                          Message=message,
+                          Subject=f"Comprehend Training Update - {model_type}"
+                      )
+                  
+                  return {
+                      'statusCode': 200,
+                      'model_type': model_type,
+                      'training_job_arn': job_arn,
+                      'training_status': status,
+                      'is_complete': is_complete,
+                      'model_details': response
+                  }
+                  
+              except Exception as e:
+                  print(f"Error checking model status: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'error': str(e),
+                      'model_type': model_type,
+                      'training_job_arn': job_arn
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  InferenceAPIFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-inference-api'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ComprehendServiceRole.Arn
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          RESULTS_TABLE: !Ref ResultsTable
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime
+          import uuid
+          import os
+          
+          comprehend = boto3.client('comprehend')
+          dynamodb = boto3.resource('dynamodb')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Parse request
+                  body = json.loads(event.get('body', '{}'))
+                  text = body.get('text', '')
+                  entity_model_arn = body.get('entity_model_arn')
+                  classifier_model_arn = body.get('classifier_model_arn')
+                  
+                  if not text:
+                      return {
+                          'statusCode': 400,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({'error': 'Text is required'})
+                      }
+                  
+                  results = {}
+                  
+                  # Perform entity recognition if model is provided
+                  if entity_model_arn:
+                      try:
+                          entity_results = comprehend.detect_entities(
+                              Text=text,
+                              EndpointArn=entity_model_arn
+                          )
+                          results['entities'] = entity_results['Entities']
+                      except Exception as e:
+                          print(f"Entity recognition error: {str(e)}")
+                          results['entities'] = {'error': str(e)}
+                  
+                  # Perform classification if model is provided
+                  if classifier_model_arn:
+                      try:
+                          classification_results = comprehend.classify_document(
+                              Text=text,
+                              EndpointArn=classifier_model_arn
+                          )
+                          results['classification'] = classification_results['Classes']
+                      except Exception as e:
+                          print(f"Classification error: {str(e)}")
+                          results['classification'] = {'error': str(e)}
+                  
+                  # Store results
+                  if os.environ.get('RESULTS_TABLE'):
+                      store_results(text, results)
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'text': text,
+                          'results': results,
+                          'timestamp': datetime.now().isoformat()
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in inference API: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def store_results(text, results):
+              table_name = os.environ['RESULTS_TABLE']
+              table = dynamodb.Table(table_name)
+              
+              item = {
+                  'id': str(uuid.uuid4()),
+                  'text': text,
+                  'results': json.dumps(results),
+                  'timestamp': int(datetime.now().timestamp()),
+                  'model_type': 'mixed'
+              }
+              
+              table.put_item(Item=item)
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # =============================================================================
+  # Step Functions State Machine
+  # =============================================================================
+
+  TrainingPipelineStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-training-pipeline'
+      RoleArn: !GetAtt ComprehendServiceRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Comprehend Custom Model Training Pipeline",
+          "StartAt": "PreprocessData",
+          "States": {
+            "PreprocessData": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${DataPreprocessorFunction}",
+                "Payload": {
+                  "bucket": "${TrainingDataBucket}",
+                  "entity_training_data": "training-data/entities.csv",
+                  "classification_training_data": "training-data/classification.csv"
+                }
+              },
+              "ResultPath": "$.preprocessing_result",
+              "Next": "TrainEntityModel",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ]
+            },
+            "TrainEntityModel": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ModelTrainerFunction}",
+                "Payload": {
+                  "bucket": "${TrainingDataBucket}",
+                  "model_type": "entity",
+                  "project_name": "${ProjectName}",
+                  "role_arn": "${ComprehendServiceRole.Arn}",
+                  "entity_training_ready.$": "$.preprocessing_result.Payload.entity_training_ready"
+                }
+              },
+              "ResultPath": "$.entity_training_result",
+              "Next": "TrainClassificationModel",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ]
+            },
+            "TrainClassificationModel": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ModelTrainerFunction}",
+                "Payload": {
+                  "bucket": "${TrainingDataBucket}",
+                  "model_type": "classification",
+                  "project_name": "${ProjectName}",
+                  "role_arn": "${ComprehendServiceRole.Arn}",
+                  "classification_training_ready.$": "$.preprocessing_result.Payload.classification_training_ready"
+                }
+              },
+              "ResultPath": "$.classification_training_result",
+              "Next": "WaitForTraining",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ]
+            },
+            "WaitForTraining": {
+              "Type": "Wait",
+              "Seconds": 300,
+              "Next": "CheckEntityModelStatus"
+            },
+            "CheckEntityModelStatus": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${StatusCheckerFunction}",
+                "Payload": {
+                  "model_type": "entity",
+                  "training_job_arn.$": "$.entity_training_result.Payload.training_job_arn",
+                  "notification_topic": "${TrainingNotificationTopic}"
+                }
+              },
+              "ResultPath": "$.entity_status_result",
+              "Next": "CheckClassificationModelStatus"
+            },
+            "CheckClassificationModelStatus": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${StatusCheckerFunction}",
+                "Payload": {
+                  "model_type": "classification",
+                  "training_job_arn.$": "$.classification_training_result.Payload.training_job_arn",
+                  "notification_topic": "${TrainingNotificationTopic}"
+                }
+              },
+              "ResultPath": "$.classification_status_result",
+              "Next": "CheckAllModelsComplete"
+            },
+            "CheckAllModelsComplete": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.entity_status_result.Payload.is_complete",
+                      "BooleanEquals": true
+                    },
+                    {
+                      "Variable": "$.classification_status_result.Payload.is_complete",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "TrainingComplete"
+                }
+              ],
+              "Default": "WaitForTraining"
+            },
+            "TrainingComplete": {
+              "Type": "Pass",
+              "Result": "Training pipeline completed successfully",
+              "End": true
+            }
+          }
+        }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # =============================================================================
+  # API Gateway (Conditional)
+  # =============================================================================
+
+  InferenceAPI:
+    Type: AWS::ApiGatewayV2::Api
+    Condition: CreateModelEndpoints
+    Properties:
+      Name: !Sub '${ProjectName}-inference-api'
+      Description: 'REST API for Comprehend custom model inference'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  InferenceAPIIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Condition: CreateModelEndpoints
+    Properties:
+      ApiId: !Ref InferenceAPI
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${InferenceAPIFunction.Arn}/invocations'
+      PayloadFormatVersion: '2.0'
+
+  InferenceAPIRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: CreateModelEndpoints
+    Properties:
+      ApiId: !Ref InferenceAPI
+      RouteKey: 'POST /inference'
+      Target: !Sub 'integrations/${InferenceAPIIntegration}'
+
+  InferenceAPIStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Condition: CreateModelEndpoints
+    Properties:
+      ApiId: !Ref InferenceAPI
+      StageName: 'prod'
+      AutoDeploy: true
+      AccessLogSettings:
+        DestinationArn: !GetAtt APIAccessLogGroup.Arn
+        Format: '$requestId $requestTime $httpMethod $routeKey $status $responseLength $requestTime'
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 100
+        ThrottlingRateLimit: 50
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  APIAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateModelEndpoints
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}-inference-api'
+      RetentionInDays: !Ref RetentionInDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  APIGatewayInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: CreateModelEndpoints
+    Properties:
+      FunctionName: !Ref InferenceAPIFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${InferenceAPI}/*/*'
+
+  # =============================================================================
+  # CloudWatch Alarms and Monitoring
+  # =============================================================================
+
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-high-error-rate'
+      AlarmDescription: 'High error rate in Lambda functions'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref InferenceAPIFunction
+      AlarmActions:
+        - !Ref TrainingNotificationTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-duration'
+      AlarmDescription: 'Lambda function duration is too high'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 25000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref InferenceAPIFunction
+      AlarmActions:
+        - !Ref TrainingNotificationTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  # S3 Resources
+  TrainingDataBucketName:
+    Description: 'S3 bucket for training data and models'
+    Value: !Ref TrainingDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-TrainingDataBucket'
+
+  TrainingDataBucketArn:
+    Description: 'ARN of the training data S3 bucket'
+    Value: !GetAtt TrainingDataBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TrainingDataBucketArn'
+
+  # IAM Resources
+  ComprehendServiceRoleArn:
+    Description: 'ARN of the Comprehend service role'
+    Value: !GetAtt ComprehendServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ComprehendServiceRoleArn'
+
+  # Lambda Functions
+  DataPreprocessorFunctionArn:
+    Description: 'ARN of the data preprocessor Lambda function'
+    Value: !GetAtt DataPreprocessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataPreprocessorFunctionArn'
+
+  ModelTrainerFunctionArn:
+    Description: 'ARN of the model trainer Lambda function'
+    Value: !GetAtt ModelTrainerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ModelTrainerFunctionArn'
+
+  StatusCheckerFunctionArn:
+    Description: 'ARN of the status checker Lambda function'
+    Value: !GetAtt StatusCheckerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-StatusCheckerFunctionArn'
+
+  InferenceAPIFunctionArn:
+    Description: 'ARN of the inference API Lambda function'
+    Value: !GetAtt InferenceAPIFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-InferenceAPIFunctionArn'
+
+  # Step Functions
+  TrainingPipelineStateMachineArn:
+    Description: 'ARN of the training pipeline state machine'
+    Value: !Ref TrainingPipelineStateMachine
+    Export:
+      Name: !Sub '${AWS::StackName}-TrainingPipelineStateMachineArn'
+
+  # DynamoDB
+  ResultsTableName:
+    Description: 'Name of the DynamoDB results table'
+    Value: !Ref ResultsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ResultsTableName'
+
+  ResultsTableArn:
+    Description: 'ARN of the DynamoDB results table'
+    Value: !GetAtt ResultsTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ResultsTableArn'
+
+  # SNS
+  TrainingNotificationTopicArn:
+    Description: 'ARN of the training notification SNS topic'
+    Value: !Ref TrainingNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-TrainingNotificationTopicArn'
+
+  # API Gateway (Conditional)
+  InferenceAPIEndpoint:
+    Condition: CreateModelEndpoints
+    Description: 'API Gateway endpoint for inference API'
+    Value: !Sub 'https://${InferenceAPI}.execute-api.${AWS::Region}.amazonaws.com/prod'
+    Export:
+      Name: !Sub '${AWS::StackName}-InferenceAPIEndpoint'
+
+  InferenceAPIId:
+    Condition: CreateModelEndpoints
+    Description: 'API Gateway ID for inference API'
+    Value: !Ref InferenceAPI
+    Export:
+      Name: !Sub '${AWS::StackName}-InferenceAPIId'
+
+  # Sample Commands
+  StartTrainingCommand:
+    Description: 'AWS CLI command to start the training pipeline'
+    Value: !Sub |
+      aws stepfunctions start-execution \
+        --state-machine-arn ${TrainingPipelineStateMachine} \
+        --name training-$(date +%Y%m%d-%H%M%S) \
+        --region ${AWS::Region}
+
+  SampleInferenceCommand:
+    Condition: CreateModelEndpoints
+    Description: 'Sample curl command for inference API'
+    Value: !Sub |
+      curl -X POST https://${InferenceAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/inference \
+        -H "Content-Type: application/json" \
+        -d '{"text": "Your text here", "entity_model_arn": "YOUR_ENTITY_MODEL_ARN", "classifier_model_arn": "YOUR_CLASSIFIER_MODEL_ARN"}'
+
+  ProjectDashboardURL:
+    Description: 'CloudWatch dashboard URL for monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-monitoring'

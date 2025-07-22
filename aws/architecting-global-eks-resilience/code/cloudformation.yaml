@@ -1,0 +1,730 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Multi-Cluster EKS Deployments with Cross-Region Networking using Transit Gateway and VPC Lattice'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Cluster Configuration"
+        Parameters:
+          - ClusterName
+          - KubernetesVersion
+          - NodeInstanceType
+          - MinNodes
+          - MaxNodes
+          - DesiredNodes
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - PrimaryRegionCIDR
+          - SecondaryRegionCIDR
+          - SecondaryRegion
+          - CreateCrossRegionResources
+      - Label:
+          default: "VPC Lattice Configuration"
+        Parameters:
+          - ServiceNetworkName
+          - EnableVPCLattice
+      - Label:
+          default: "Advanced Configuration"
+        Parameters:
+          - EnableClusterLogging
+          - EnableNodeGroupLogging
+          - Environment
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: 'multi-cluster-eks'
+    Description: Base name for EKS clusters (will have region suffix)
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+
+  KubernetesVersion:
+    Type: String
+    Default: '1.28'
+    Description: Kubernetes version for EKS clusters
+    AllowedValues:
+      - '1.28'
+      - '1.29'
+      - '1.30'
+
+  NodeInstanceType:
+    Type: String
+    Default: 'm5.large'
+    Description: EC2 instance type for worker nodes
+    AllowedValues:
+      - 'm5.large'
+      - 'm5.xlarge'
+      - 'm5.2xlarge'
+      - 'm5.4xlarge'
+      - 'm6i.large'
+      - 'm6i.xlarge'
+      - 'm6i.2xlarge'
+      - 'c5.large'
+      - 'c5.xlarge'
+      - 'c5.2xlarge'
+
+  MinNodes:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Minimum number of nodes in each node group
+
+  MaxNodes:
+    Type: Number
+    Default: 6
+    MinValue: 1
+    MaxValue: 20
+    Description: Maximum number of nodes in each node group
+
+  DesiredNodes:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+    Description: Desired number of nodes in each node group
+
+  PrimaryRegionCIDR:
+    Type: String
+    Default: '10.1.0.0/16'
+    Description: CIDR block for primary region VPC
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+
+  SecondaryRegionCIDR:
+    Type: String
+    Default: '10.2.0.0/16'
+    Description: CIDR block for secondary region VPC (used for cross-region routing)
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+
+  SecondaryRegion:
+    Type: String
+    Default: 'us-west-2'
+    Description: Secondary AWS region for cross-region deployment
+    AllowedValues:
+      - 'us-east-1'
+      - 'us-east-2'
+      - 'us-west-1'
+      - 'us-west-2'
+      - 'eu-west-1'
+      - 'eu-west-2'
+      - 'eu-central-1'
+      - 'ap-southeast-1'
+      - 'ap-southeast-2'
+      - 'ap-northeast-1'
+
+  CreateCrossRegionResources:
+    Type: String
+    Default: 'true'
+    Description: Whether to create cross-region networking resources (Transit Gateway peering)
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  ServiceNetworkName:
+    Type: String
+    Default: 'multi-cluster-service-network'
+    Description: Name for VPC Lattice Service Network
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+
+  EnableVPCLattice:
+    Type: String
+    Default: 'true'
+    Description: Whether to create VPC Lattice Service Network
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableClusterLogging:
+    Type: String
+    Default: 'true'
+    Description: Enable EKS cluster logging
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableNodeGroupLogging:
+    Type: String
+    Default: 'false'
+    Description: Enable detailed CloudWatch logging for node groups
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    Description: Environment name for resource tagging
+    AllowedValues:
+      - 'dev'
+      - 'staging'
+      - 'prod'
+
+Conditions:
+  CreateCrossRegion: !Equals [!Ref CreateCrossRegionResources, 'true']
+  CreateVPCLattice: !Equals [!Ref EnableVPCLattice, 'true']
+  EnableLogging: !Equals [!Ref EnableClusterLogging, 'true']
+  EnableNodeLogging: !Equals [!Ref EnableNodeGroupLogging, 'true']
+
+Resources:
+  # IAM Roles for EKS
+  EKSClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-eks-cluster-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-eks-cluster-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'EKS Cluster Service Role'
+
+  EKSNodeGroupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-eks-nodegroup-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-eks-nodegroup-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'EKS Node Group Service Role'
+
+  # VPC for Primary Region
+  PrimaryVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref PrimaryRegionCIDR
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-vpc-primary'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: kubernetes.io/cluster/eks-primary
+          Value: 'shared'
+
+  # Internet Gateway for Primary VPC
+  PrimaryInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-igw-primary'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrimaryVPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref PrimaryVPC
+      InternetGatewayId: !Ref PrimaryInternetGateway
+
+  # Public Subnets for Primary Region
+  PrimaryPublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PrimaryVPC
+      CidrBlock: !Select [0, !Cidr [!Ref PrimaryRegionCIDR, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-primary-public-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+        - Key: kubernetes.io/cluster/eks-primary
+          Value: 'shared'
+
+  PrimaryPublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PrimaryVPC
+      CidrBlock: !Select [1, !Cidr [!Ref PrimaryRegionCIDR, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-primary-public-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+        - Key: kubernetes.io/cluster/eks-primary
+          Value: 'shared'
+
+  # Private Subnets for Primary Region
+  PrimaryPrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PrimaryVPC
+      CidrBlock: !Select [2, !Cidr [!Ref PrimaryRegionCIDR, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-primary-private-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+        - Key: kubernetes.io/cluster/eks-primary
+          Value: 'shared'
+
+  PrimaryPrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PrimaryVPC
+      CidrBlock: !Select [3, !Cidr [!Ref PrimaryRegionCIDR, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-primary-private-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+        - Key: kubernetes.io/cluster/eks-primary
+          Value: 'shared'
+
+  # NAT Gateways for Private Subnet Internet Access
+  PrimaryNATGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: PrimaryVPCGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-primary-nat-eip-1'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrimaryNATGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: PrimaryVPCGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-primary-nat-eip-2'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrimaryNATGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt PrimaryNATGateway1EIP.AllocationId
+      SubnetId: !Ref PrimaryPublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-primary-nat-1'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrimaryNATGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt PrimaryNATGateway2EIP.AllocationId
+      SubnetId: !Ref PrimaryPublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-primary-nat-2'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Route Tables for Primary Region
+  PrimaryPublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref PrimaryVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-primary-public-rt'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrimaryPrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref PrimaryVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-primary-private-rt-1'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrimaryPrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref PrimaryVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-primary-private-rt-2'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Routes for Primary Region
+  PrimaryPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: PrimaryVPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PrimaryPublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref PrimaryInternetGateway
+
+  PrimaryPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrimaryPrivateRouteTable1
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref PrimaryNATGateway1
+
+  PrimaryPrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrimaryPrivateRouteTable2
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref PrimaryNATGateway2
+
+  # Subnet Route Table Associations for Primary Region
+  PrimaryPublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrimaryPublicSubnet1
+      RouteTableId: !Ref PrimaryPublicRouteTable
+
+  PrimaryPublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrimaryPublicSubnet2
+      RouteTableId: !Ref PrimaryPublicRouteTable
+
+  PrimaryPrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrimaryPrivateSubnet1
+      RouteTableId: !Ref PrimaryPrivateRouteTable1
+
+  PrimaryPrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrimaryPrivateSubnet2
+      RouteTableId: !Ref PrimaryPrivateRouteTable2
+
+  # Transit Gateway for Cross-Region Networking
+  PrimaryTransitGateway:
+    Type: AWS::EC2::TransitGateway
+    Condition: CreateCrossRegion
+    Properties:
+      AmazonSideAsn: 64512
+      Description: 'Primary region Transit Gateway for multi-cluster connectivity'
+      DefaultRouteTableAssociation: enable
+      DefaultRouteTablePropagation: enable
+      DnsSupport: enable
+      VpnEcmpSupport: enable
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-tgw-primary'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Cross-region connectivity'
+
+  # Transit Gateway VPC Attachment
+  PrimaryTransitGatewayVPCAttachment:
+    Type: AWS::EC2::TransitGatewayVpcAttachment
+    Condition: CreateCrossRegion
+    Properties:
+      TransitGatewayId: !Ref PrimaryTransitGateway
+      VpcId: !Ref PrimaryVPC
+      SubnetIds:
+        - !Ref PrimaryPrivateSubnet1
+        - !Ref PrimaryPrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-tgw-vpc-attachment-primary'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Security Group for EKS Cluster
+  EKSClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group for EKS cluster control plane'
+      VpcId: !Ref PrimaryVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref EKSNodeSecurityGroup
+          Description: 'Allow nodes to communicate with cluster API'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: '0.0.0.0/0'
+          Description: 'Allow all outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-cluster-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Security Group for EKS Nodes
+  EKSNodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group for EKS worker nodes'
+      VpcId: !Ref PrimaryVPC
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          SourceSecurityGroupId: !Ref EKSClusterSecurityGroup
+          Description: 'Allow cluster control plane to communicate with nodes'
+        - IpProtocol: -1
+          SourceSecurityGroupId: !Ref EKSNodeSecurityGroup
+          Description: 'Allow nodes to communicate with each other'
+        - IpProtocol: tcp
+          FromPort: 1025
+          ToPort: 65535
+          SourceSecurityGroupId: !Ref EKSClusterSecurityGroup
+          Description: 'Allow cluster control plane to communicate with node kubelet and kube-proxy'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: '0.0.0.0/0'
+          Description: 'Allow all outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-node-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # EKS Cluster
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Sub '${ClusterName}-primary'
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt EKSClusterRole.Arn
+      ResourcesVpcConfig:
+        SecurityGroupIds:
+          - !Ref EKSClusterSecurityGroup
+        SubnetIds:
+          - !Ref PrimaryPublicSubnet1
+          - !Ref PrimaryPublicSubnet2
+          - !Ref PrimaryPrivateSubnet1
+          - !Ref PrimaryPrivateSubnet2
+        EndpointConfigPrivate: true
+        EndpointConfigPublic: true
+        PublicAccessCidrs:
+          - '0.0.0.0/0'
+      Logging: !If
+        - EnableLogging
+        - ClusterLogging:
+            EnabledTypes:
+              - Type: api
+              - Type: audit
+              - Type: authenticator
+              - Type: controllerManager
+              - Type: scheduler
+        - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-primary'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Region
+          Value: !Ref 'AWS::Region'
+
+  # EKS Node Group
+  EKSNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref EKSCluster
+      NodegroupName: 'primary-nodes'
+      NodeRole: !GetAtt EKSNodeGroupRole.Arn
+      Subnets:
+        - !Ref PrimaryPrivateSubnet1
+        - !Ref PrimaryPrivateSubnet2
+      ScalingConfig:
+        MinSize: !Ref MinNodes
+        MaxSize: !Ref MaxNodes
+        DesiredSize: !Ref DesiredNodes
+      InstanceTypes:
+        - !Ref NodeInstanceType
+      AmiType: 'AL2_x86_64'
+      CapacityType: 'ON_DEMAND'
+      RemoteAccess:
+        Ec2SshKey: !Ref 'AWS::NoValue'
+      UpdateConfig:
+        MaxUnavailable: 1
+      Tags:
+        Name: !Sub '${ClusterName}-primary-nodes'
+        Environment: !Ref Environment
+        NodeGroup: 'primary'
+
+  # VPC Lattice Service Network
+  VPCLatticeServiceNetwork:
+    Type: AWS::VpcLattice::ServiceNetwork
+    Condition: CreateVPCLattice
+    Properties:
+      Name: !Sub '${ServiceNetworkName}-${AWS::Region}'
+      AuthType: 'AWS_IAM'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ServiceNetworkName}-${AWS::Region}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Multi-cluster service mesh'
+
+  # VPC Lattice Service Network VPC Association
+  VPCLatticeServiceNetworkVPCAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkVpcAssociation
+    Condition: CreateVPCLattice
+    Properties:
+      ServiceNetworkIdentifier: !Ref VPCLatticeServiceNetwork
+      VpcIdentifier: !Ref PrimaryVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ServiceNetworkName}-vpc-association'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group for Container Insights (optional)
+  EKSClusterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableNodeLogging
+    Properties:
+      LogGroupName: !Sub '/aws/eks/${ClusterName}-primary/cluster'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-primary-log-group'
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  EKSClusterName:
+    Description: 'Name of the EKS cluster'
+    Value: !Ref EKSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-EKSClusterName'
+
+  EKSClusterEndpoint:
+    Description: 'EKS cluster endpoint URL'
+    Value: !GetAtt EKSCluster.Endpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-EKSClusterEndpoint'
+
+  EKSClusterArn:
+    Description: 'EKS cluster ARN'
+    Value: !GetAtt EKSCluster.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EKSClusterArn'
+
+  VPCId:
+    Description: 'VPC ID for primary region'
+    Value: !Ref PrimaryVPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCId'
+
+  PrivateSubnet1Id:
+    Description: 'Private subnet 1 ID'
+    Value: !Ref PrimaryPrivateSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet1Id'
+
+  PrivateSubnet2Id:
+    Description: 'Private subnet 2 ID'
+    Value: !Ref PrimaryPrivateSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet2Id'
+
+  PublicSubnet1Id:
+    Description: 'Public subnet 1 ID'
+    Value: !Ref PrimaryPublicSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet1Id'
+
+  PublicSubnet2Id:
+    Description: 'Public subnet 2 ID'
+    Value: !Ref PrimaryPublicSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet2Id'
+
+  TransitGatewayId:
+    Condition: CreateCrossRegion
+    Description: 'Transit Gateway ID for cross-region networking'
+    Value: !Ref PrimaryTransitGateway
+    Export:
+      Name: !Sub '${AWS::StackName}-TransitGatewayId'
+
+  VPCLatticeServiceNetworkId:
+    Condition: CreateVPCLattice
+    Description: 'VPC Lattice Service Network ID'
+    Value: !Ref VPCLatticeServiceNetwork
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCLatticeServiceNetworkId'
+
+  VPCLatticeServiceNetworkArn:
+    Condition: CreateVPCLattice
+    Description: 'VPC Lattice Service Network ARN'
+    Value: !GetAtt VPCLatticeServiceNetwork.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCLatticeServiceNetworkArn'
+
+  EKSClusterSecurityGroupId:
+    Description: 'Security group ID for EKS cluster'
+    Value: !Ref EKSClusterSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-EKSClusterSecurityGroupId'
+
+  EKSNodeSecurityGroupId:
+    Description: 'Security group ID for EKS nodes'
+    Value: !Ref EKSNodeSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-EKSNodeSecurityGroupId'
+
+  NodeGroupArn:
+    Description: 'ARN of the EKS node group'
+    Value: !GetAtt EKSNodeGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-NodeGroupArn'
+
+  KubectlCommand:
+    Description: 'Command to configure kubectl for this cluster'
+    Value: !Sub 'aws eks update-kubeconfig --region ${AWS::Region} --name ${EKSCluster} --alias primary-cluster'
+
+  DeploymentNotes:
+    Description: 'Important notes for multi-cluster deployment'
+    Value: |
+      This template creates the primary region infrastructure. To complete the multi-cluster setup:
+      1. Deploy this stack in the secondary region with appropriate parameter modifications
+      2. Create Transit Gateway peering between regions manually or via additional CloudFormation
+      3. Install VPC Lattice Gateway API Controller: kubectl apply -f https://raw.githubusercontent.com/aws/aws-application-networking-k8s/main/deploy/deploy-v1.0.0.yaml
+      4. Configure cross-region routing in Transit Gateway route tables
+      5. Associate secondary region VPC with VPC Lattice Service Network

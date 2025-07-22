@@ -1,0 +1,1213 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Infrastructure for Aurora Migration with Minimal Downtime.
+  This template creates Aurora cluster, DMS replication infrastructure, Route 53 configuration,
+  and supporting network resources for a near-zero downtime database migration.
+
+# =============================================================================
+# METADATA SECTION
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcCidr
+          - PrivateSubnet1Cidr
+          - PrivateSubnet2Cidr
+          - PublicSubnet1Cidr
+          - PublicSubnet2Cidr
+      - Label:
+          default: "Aurora Database Configuration"
+        Parameters:
+          - DatabaseEngine
+          - DatabaseEngineVersion
+          - DatabaseInstanceClass
+          - DatabaseMasterUsername
+          - DatabaseMasterPassword
+          - DatabaseName
+          - BackupRetentionPeriod
+      - Label:
+          default: "DMS Replication Configuration"
+        Parameters:
+          - ReplicationInstanceClass
+          - ReplicationInstanceStorage
+          - SourceDatabaseEngine
+          - SourceDatabaseHostname
+          - SourceDatabasePort
+          - SourceDatabaseUsername
+          - SourceDatabasePassword
+          - SourceDatabaseName
+      - Label:
+          default: "DNS Configuration"
+        Parameters:
+          - DomainName
+          - ApplicationDatabaseHostname
+      - Label:
+          default: "Environment and Tagging"
+        Parameters:
+          - Environment
+          - ProjectName
+          - CostCenter
+    ParameterLabels:
+      VpcCidr:
+        default: "VPC CIDR Block"
+      DatabaseEngine:
+        default: "Aurora Database Engine"
+      DatabaseInstanceClass:
+        default: "Aurora Instance Class"
+      ReplicationInstanceClass:
+        default: "DMS Replication Instance Class"
+      SourceDatabaseEngine:
+        default: "Source Database Engine Type"
+
+# =============================================================================
+# PARAMETERS SECTION
+# =============================================================================
+Parameters:
+  # Network Configuration
+  VpcCidr:
+    Type: String
+    Default: "10.0.0.0/16"
+    Description: "CIDR block for the VPC (10.0.0.0/16 recommended)"
+    AllowedPattern: "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/(1[6-9]|2[0-8]))$"
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: "10.0.1.0/24"
+    Description: "CIDR block for private subnet in first AZ"
+    AllowedPattern: "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/(1[6-9]|2[0-8]))$"
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: "10.0.2.0/24"
+    Description: "CIDR block for private subnet in second AZ"
+    AllowedPattern: "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/(1[6-9]|2[0-8]))$"
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: "10.0.10.0/24"
+    Description: "CIDR block for public subnet in first AZ (for DMS replication instance)"
+    AllowedPattern: "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/(1[6-9]|2[0-8]))$"
+
+  PublicSubnet2Cidr:
+    Type: String
+    Default: "10.0.11.0/24"
+    Description: "CIDR block for public subnet in second AZ (for DMS replication instance)"
+    AllowedPattern: "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/(1[6-9]|2[0-8]))$"
+
+  # Aurora Database Configuration
+  DatabaseEngine:
+    Type: String
+    Default: "aurora-mysql"
+    AllowedValues:
+      - "aurora-mysql"
+      - "aurora-postgresql"
+    Description: "Aurora database engine type"
+
+  DatabaseEngineVersion:
+    Type: String
+    Default: "8.0.mysql_aurora.3.07.1"
+    Description: "Aurora database engine version (use latest available for your engine)"
+
+  DatabaseInstanceClass:
+    Type: String
+    Default: "db.r6g.large"
+    AllowedValues:
+      - "db.r6g.large"
+      - "db.r6g.xlarge"
+      - "db.r6g.2xlarge"
+      - "db.r6g.4xlarge"
+      - "db.r6g.8xlarge"
+      - "db.r6g.12xlarge"
+      - "db.r6g.16xlarge"
+      - "db.r6i.large"
+      - "db.r6i.xlarge"
+      - "db.r6i.2xlarge"
+      - "db.r6i.4xlarge"
+      - "db.r6i.8xlarge"
+      - "db.r6i.12xlarge"
+      - "db.r6i.16xlarge"
+    Description: "Aurora database instance class (Graviton2 instances recommended for cost and performance)"
+
+  DatabaseMasterUsername:
+    Type: String
+    Default: "admin"
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9]*"
+    ConstraintDescription: "Must begin with a letter and contain only alphanumeric characters"
+    Description: "Master username for Aurora database"
+
+  DatabaseMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 128
+    AllowedPattern: "^[a-zA-Z0-9!@#$%^&*()_+={}[]|:;<>,.?/~`-]*$"
+    ConstraintDescription: "Must be 8-128 characters with alphanumeric and special characters (excluding quotes)"
+    Description: "Master password for Aurora database (8-128 characters)"
+
+  DatabaseName:
+    Type: String
+    Default: "migrationdb"
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9]*"
+    ConstraintDescription: "Must begin with a letter and contain only alphanumeric characters"
+    Description: "Initial database name to create in Aurora cluster"
+
+  BackupRetentionPeriod:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 35
+    Description: "Number of days to retain automated backups (1-35 days)"
+
+  # DMS Replication Configuration
+  ReplicationInstanceClass:
+    Type: String
+    Default: "dms.t3.medium"
+    AllowedValues:
+      - "dms.t3.micro"
+      - "dms.t3.small"
+      - "dms.t3.medium"
+      - "dms.t3.large"
+      - "dms.c5.large"
+      - "dms.c5.xlarge"
+      - "dms.c5.2xlarge"
+      - "dms.c5.4xlarge"
+      - "dms.r5.large"
+      - "dms.r5.xlarge"
+      - "dms.r5.2xlarge"
+      - "dms.r5.4xlarge"
+    Description: "DMS replication instance class (size based on source database size and migration complexity)"
+
+  ReplicationInstanceStorage:
+    Type: Number
+    Default: 100
+    MinValue: 20
+    MaxValue: 6144
+    Description: "DMS replication instance storage in GB (20-6144 GB)"
+
+  SourceDatabaseEngine:
+    Type: String
+    Default: "mysql"
+    AllowedValues:
+      - "mysql"
+      - "oracle"
+      - "postgres"
+      - "mariadb"
+      - "aurora"
+      - "aurora-postgresql"
+      - "redshift"
+      - "s3"
+      - "db2"
+      - "azuredb"
+      - "sybase"
+      - "dynamodb"
+      - "mongodb"
+      - "kinesis"
+      - "kafka"
+      - "elasticsearch"
+      - "documentdb"
+      - "sqlserver"
+      - "neptune"
+    Description: "Source database engine type for DMS migration"
+
+  SourceDatabaseHostname:
+    Type: String
+    Default: "source-database.example.com"
+    Description: "Hostname or IP address of source database server"
+
+  SourceDatabasePort:
+    Type: Number
+    Default: 3306
+    MinValue: 1
+    MaxValue: 65535
+    Description: "Port number for source database connection"
+
+  SourceDatabaseUsername:
+    Type: String
+    Default: "sourceuser"
+    MinLength: 1
+    MaxLength: 64
+    Description: "Username for source database connection"
+
+  SourceDatabasePassword:
+    Type: String
+    NoEcho: true
+    MinLength: 1
+    MaxLength: 256
+    Description: "Password for source database connection"
+
+  SourceDatabaseName:
+    Type: String
+    Default: "sourcedb"
+    MinLength: 1
+    MaxLength: 64
+    Description: "Source database name to migrate"
+
+  # DNS Configuration
+  DomainName:
+    Type: String
+    Default: "db.example.com"
+    Description: "Domain name for Route 53 hosted zone (used for DNS cutover)"
+    AllowedPattern: "^[a-zA-Z0-9][a-zA-Z0-9\\-]{0,61}[a-zA-Z0-9]\\.[a-zA-Z]{2,}$"
+
+  ApplicationDatabaseHostname:
+    Type: String
+    Default: "app-db"
+    Description: "Hostname for application database connection (will be prefixed to domain name)"
+    AllowedPattern: "^[a-zA-Z0-9][a-zA-Z0-9\\-]{0,61}[a-zA-Z0-9]$"
+
+  # Environment and Tagging
+  Environment:
+    Type: String
+    Default: "development"
+    AllowedValues:
+      - "development"
+      - "staging"
+      - "production"
+    Description: "Environment designation for resource tagging and configuration"
+
+  ProjectName:
+    Type: String
+    Default: "aurora-migration"
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9\\-]*"
+    Description: "Project name for resource tagging"
+
+  CostCenter:
+    Type: String
+    Default: "IT-Database"
+    Description: "Cost center for billing and resource allocation"
+
+# =============================================================================
+# CONDITIONS SECTION
+# =============================================================================
+Conditions:
+  # Condition to determine if we should create MySQL-specific resources
+  IsMySQLEngine: !Equals [!Ref DatabaseEngine, "aurora-mysql"]
+  
+  # Condition to determine if we should create PostgreSQL-specific resources
+  IsPostgreSQLEngine: !Equals [!Ref DatabaseEngine, "aurora-postgresql"]
+  
+  # Condition for production environment (enables enhanced monitoring and backup)
+  IsProduction: !Equals [!Ref Environment, "production"]
+  
+  # Condition for development environment (reduces costs)
+  IsDevelopment: !Equals [!Ref Environment, "development"]
+
+# =============================================================================
+# MAPPINGS SECTION
+# =============================================================================
+Mappings:
+  # Regional mappings for Availability Zones
+  RegionMap:
+    us-east-1:
+      AZ1: "us-east-1a"
+      AZ2: "us-east-1b"
+    us-east-2:
+      AZ1: "us-east-2a"
+      AZ2: "us-east-2b"
+    us-west-1:
+      AZ1: "us-west-1a"
+      AZ2: "us-west-1c"
+    us-west-2:
+      AZ1: "us-west-2a"
+      AZ2: "us-west-2b"
+    eu-west-1:
+      AZ1: "eu-west-1a"
+      AZ2: "eu-west-1b"
+    eu-central-1:
+      AZ1: "eu-central-1a"
+      AZ2: "eu-central-1b"
+    ap-southeast-1:
+      AZ1: "ap-southeast-1a"
+      AZ2: "ap-southeast-1b"
+    ap-northeast-1:
+      AZ1: "ap-northeast-1a"
+      AZ2: "ap-northeast-1c"
+
+  # Database port mappings by engine
+  DatabasePortMap:
+    aurora-mysql:
+      Port: 3306
+    aurora-postgresql:
+      Port: 5432
+
+# =============================================================================
+# RESOURCES SECTION
+# =============================================================================
+Resources:
+  # ---------------------------------------------------------------------------
+  # VPC AND NETWORKING RESOURCES
+  # ---------------------------------------------------------------------------
+  
+  # Virtual Private Cloud for secure database infrastructure
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-vpc"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Internet Gateway for public subnet connectivity
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-igw"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # Private Subnets for Aurora Database (Multi-AZ)
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !FindInMap [RegionMap, !Ref "AWS::Region", AZ1]
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-subnet-1"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Type
+          Value: "Private"
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !FindInMap [RegionMap, !Ref "AWS::Region", AZ2]
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-subnet-2"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Type
+          Value: "Private"
+
+  # Public Subnets for DMS Replication Instance (Multi-AZ)
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !FindInMap [RegionMap, !Ref "AWS::Region", AZ1]
+      CidrBlock: !Ref PublicSubnet1Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-public-subnet-1"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Type
+          Value: "Public"
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !FindInMap [RegionMap, !Ref "AWS::Region", AZ2]
+      CidrBlock: !Ref PublicSubnet2Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-public-subnet-2"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Type
+          Value: "Public"
+
+  # Route Tables for Public Subnets
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-public-rt"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  # ---------------------------------------------------------------------------
+  # SECURITY GROUPS
+  # ---------------------------------------------------------------------------
+  
+  # Security Group for Aurora Database Cluster
+  AuroraSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-aurora-sg"
+      GroupDescription: "Security group for Aurora database cluster"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !FindInMap [DatabasePortMap, !Ref DatabaseEngine, Port]
+          ToPort: !FindInMap [DatabasePortMap, !Ref DatabaseEngine, Port]
+          SourceSecurityGroupId: !Ref DMSSecurityGroup
+          Description: "Allow DMS replication instance access to Aurora"
+        - IpProtocol: tcp
+          FromPort: !FindInMap [DatabasePortMap, !Ref DatabaseEngine, Port]
+          ToPort: !FindInMap [DatabasePortMap, !Ref DatabaseEngine, Port]
+          CidrIp: !Ref VpcCidr
+          Description: "Allow VPC internal access to Aurora database"
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: "Allow all outbound traffic"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-aurora-sg"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Security Group for DMS Replication Instance
+  DMSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-dms-sg"
+      GroupDescription: "Security group for DMS replication instance"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: "Allow HTTPS for DMS API calls"
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: !Ref SourceDatabasePort
+          ToPort: !Ref SourceDatabasePort
+          CidrIp: 0.0.0.0/0
+          Description: "Allow outbound connection to source database"
+        - IpProtocol: tcp
+          FromPort: !FindInMap [DatabasePortMap, !Ref DatabaseEngine, Port]
+          ToPort: !FindInMap [DatabasePortMap, !Ref DatabaseEngine, Port]
+          DestinationSecurityGroupId: !Ref AuroraSecurityGroup
+          Description: "Allow outbound connection to Aurora target"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: "Allow HTTPS for DMS API calls"
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: "Allow HTTP for software updates"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-dms-sg"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # AURORA CLUSTER CONFIGURATION
+  # ---------------------------------------------------------------------------
+  
+  # Aurora DB Subnet Group for Multi-AZ deployment
+  AuroraDBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub "${ProjectName}-aurora-subnet-group"
+      DBSubnetGroupDescription: "Subnet group for Aurora cluster"
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-aurora-subnet-group"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Aurora Cluster Parameter Group for performance optimization
+  AuroraClusterParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      Description: "Custom parameter group for Aurora cluster migration optimization"
+      Family: !If
+        - IsMySQLEngine
+        - "aurora-mysql8.0"
+        - "aurora-postgresql15"
+      Parameters: !If
+        - IsMySQLEngine
+        - innodb_buffer_pool_size: "{DBInstanceClassMemory*3/4}"
+          max_connections: "1000"
+          innodb_flush_log_at_trx_commit: "2"
+          sync_binlog: "0"
+        - shared_preload_libraries: "pg_stat_statements"
+          log_statement: "all"
+          log_min_duration_statement: "1000"
+          max_connections: "1000"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-aurora-cluster-pg"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Aurora DB Parameter Group for instance-level optimization
+  AuroraDBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: "Custom parameter group for Aurora instances"
+      Family: !If
+        - IsMySQLEngine
+        - "aurora-mysql8.0"
+        - "aurora-postgresql15"
+      Parameters: !If
+        - IsMySQLEngine
+        - performance_schema: "1"
+          slow_query_log: "1"
+          long_query_time: "2"
+        - log_statement: "all"
+          log_min_duration_statement: "1000"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-aurora-db-pg"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Aurora Database Cluster
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    Properties:
+      DBClusterIdentifier: !Sub "${ProjectName}-aurora-cluster"
+      Engine: !Ref DatabaseEngine
+      EngineVersion: !Ref DatabaseEngineVersion
+      MasterUsername: !Ref DatabaseMasterUsername
+      MasterUserPassword: !Ref DatabaseMasterPassword
+      DatabaseName: !Ref DatabaseName
+      DBSubnetGroupName: !Ref AuroraDBSubnetGroup
+      DBClusterParameterGroupName: !Ref AuroraClusterParameterGroup
+      VpcSecurityGroupIds:
+        - !Ref AuroraSecurityGroup
+      BackupRetentionPeriod: !Ref BackupRetentionPeriod
+      PreferredBackupWindow: "03:00-04:00"
+      PreferredMaintenanceWindow: "sun:04:00-sun:05:00"
+      EnableCloudwatchLogsExports:
+        - !If [IsMySQLEngine, "error", "postgresql"]
+        - !If [IsMySQLEngine, "general", "postgresql"]
+        - !If [IsMySQLEngine, "slowquery", "postgresql"]
+      StorageEncrypted: true
+      KmsKeyId: !Ref AuroraKMSKey
+      DeletionProtection: !If [IsProduction, true, false]
+      EnableIAMDatabaseAuthentication: true
+      AssociatedRoles:
+        - RoleArn: !GetAtt AuroraMonitoringRole.Arn
+          FeatureName: "s3Import"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-aurora-cluster"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: "migration-target"
+
+  # Aurora Primary Instance (Writer)
+  AuroraPrimaryInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-aurora-primary"
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: !Ref DatabaseInstanceClass
+      Engine: !Ref DatabaseEngine
+      DBParameterGroupName: !Ref AuroraDBParameterGroup
+      PubliclyAccessible: false
+      MonitoringInterval: !If [IsProduction, 60, 0]
+      MonitoringRoleArn: !If [IsProduction, !GetAtt AuroraMonitoringRole.Arn, !Ref "AWS::NoValue"]
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: !If [IsProduction, 731, 7]
+      PerformanceInsightsKMSKeyId: !Ref AuroraKMSKey
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-aurora-primary"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Role
+          Value: "primary"
+
+  # Aurora Read Replica Instance (Reader)
+  AuroraReaderInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-aurora-reader"
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: !Ref DatabaseInstanceClass
+      Engine: !Ref DatabaseEngine
+      DBParameterGroupName: !Ref AuroraDBParameterGroup
+      PubliclyAccessible: false
+      MonitoringInterval: !If [IsProduction, 60, 0]
+      MonitoringRoleArn: !If [IsProduction, !GetAtt AuroraMonitoringRole.Arn, !Ref "AWS::NoValue"]
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: !If [IsProduction, 731, 7]
+      PerformanceInsightsKMSKeyId: !Ref AuroraKMSKey
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-aurora-reader"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Role
+          Value: "reader"
+
+  # ---------------------------------------------------------------------------
+  # DMS INFRASTRUCTURE
+  # ---------------------------------------------------------------------------
+  
+  # DMS VPC Role (Required for DMS to operate in VPC)
+  DMSVPCRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: dms-vpc-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: dms.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonDMSVPCManagementRole
+      Tags:
+        - Key: Name
+          Value: dms-vpc-role
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # DMS Replication Subnet Group
+  DMSSubnetGroup:
+    Type: AWS::DMS::ReplicationSubnetGroup
+    Properties:
+      ReplicationSubnetGroupIdentifier: !Sub "${ProjectName}-dms-subnet-group"
+      ReplicationSubnetGroupDescription: "Subnet group for DMS replication instance"
+      SubnetIds:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-dms-subnet-group"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # DMS Replication Instance
+  DMSReplicationInstance:
+    Type: AWS::DMS::ReplicationInstance
+    DependsOn: DMSVPCRole
+    Properties:
+      ReplicationInstanceIdentifier: !Sub "${ProjectName}-dms-instance"
+      ReplicationInstanceClass: !Ref ReplicationInstanceClass
+      AllocatedStorage: !Ref ReplicationInstanceStorage
+      MultiAZ: !If [IsProduction, true, false]
+      PubliclyAccessible: true
+      ReplicationSubnetGroupIdentifier: !Ref DMSSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DMSSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-dms-instance"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: "database-migration"
+
+  # DMS Source Endpoint
+  DMSSourceEndpoint:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointIdentifier: !Sub "${ProjectName}-source-endpoint"
+      EndpointType: source
+      EngineName: !Ref SourceDatabaseEngine
+      ServerName: !Ref SourceDatabaseHostname
+      Port: !Ref SourceDatabasePort
+      Username: !Ref SourceDatabaseUsername
+      Password: !Ref SourceDatabasePassword
+      DatabaseName: !Ref SourceDatabaseName
+      ExtraConnectionAttributes: "heartbeatEnable=true;heartbeatFrequency=1"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-source-endpoint"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Type
+          Value: "source"
+
+  # DMS Target Endpoint (Aurora)
+  DMSTargetEndpoint:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointIdentifier: !Sub "${ProjectName}-target-endpoint"
+      EndpointType: target
+      EngineName: !Ref DatabaseEngine
+      ServerName: !GetAtt AuroraCluster.Endpoint.Address
+      Port: !GetAtt AuroraCluster.Endpoint.Port
+      Username: !Ref DatabaseMasterUsername
+      Password: !Ref DatabaseMasterPassword
+      DatabaseName: !Ref DatabaseName
+      ExtraConnectionAttributes: "parallelLoadThreads=8;maxFileSize=512000"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-target-endpoint"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Type
+          Value: "target"
+
+  # ---------------------------------------------------------------------------
+  # ROUTE 53 DNS CONFIGURATION
+  # ---------------------------------------------------------------------------
+  
+  # Route 53 Private Hosted Zone for DNS-based cutover
+  Route53HostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Ref DomainName
+      VPCs:
+        - VPCId: !Ref VPC
+          VPCRegion: !Ref "AWS::Region"
+      HostedZoneConfig:
+        Comment: !Sub "Private hosted zone for ${ProjectName} database migration cutover"
+      HostedZoneTags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-hosted-zone"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: "dns-cutover"
+
+  # Initial DNS Record pointing to source database (to be updated during cutover)
+  Route53RecordSet:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref Route53HostedZone
+      Name: !Sub "${ApplicationDatabaseHostname}.${DomainName}"
+      Type: CNAME
+      TTL: 60
+      ResourceRecords:
+        - !Ref SourceDatabaseHostname
+      Comment: "Initial DNS record pointing to source database - update during cutover"
+
+  # ---------------------------------------------------------------------------
+  # KMS AND SECURITY
+  # ---------------------------------------------------------------------------
+  
+  # KMS Key for Aurora encryption
+  AuroraKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "KMS key for ${ProjectName} Aurora database encryption"
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:Encrypt
+              - kms:GenerateDataKey*
+              - kms:ReEncrypt*
+            Resource: "*"
+      EnableKeyRotation: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-aurora-kms-key"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  AuroraKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}-aurora-key"
+      TargetKeyId: !Ref AuroraKMSKey
+
+  # IAM Role for Aurora Enhanced Monitoring
+  AuroraMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-aurora-monitoring-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-aurora-monitoring-role"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # S3 BUCKET FOR DMS LOGS AND MIGRATION ARTIFACTS
+  # ---------------------------------------------------------------------------
+  
+  # S3 Bucket for DMS task logs and migration artifacts
+  MigrationArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-migration-artifacts-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: MoveToIA
+            Status: Enabled
+            TransitionInDays: 30
+            StorageClass: STANDARD_IA
+          - Id: MoveToGlacier
+            Status: Enabled
+            TransitionInDays: 365
+            StorageClass: GLACIER
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref MigrationLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-migration-artifacts"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: "migration-artifacts"
+
+  # ---------------------------------------------------------------------------
+  # CLOUDWATCH MONITORING AND ALARMS
+  # ---------------------------------------------------------------------------
+  
+  # CloudWatch Log Group for migration logs
+  MigrationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/dms/${ProjectName}-migration"
+      RetentionInDays: !If [IsProduction, 365, 14]
+
+  # CloudWatch Alarm for Aurora CPU Utilization
+  AuroraCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-aurora-high-cpu"
+      AlarmDescription: "Aurora cluster CPU utilization is high"
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref AuroraCluster
+      AlarmActions:
+        - !Ref MigrationSNSTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for Aurora Connection Count
+  AuroraConnectionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-aurora-high-connections"
+      AlarmDescription: "Aurora cluster connection count is high"
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 800
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref AuroraCluster
+      AlarmActions:
+        - !Ref MigrationSNSTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for DMS Replication Lag
+  DMSReplicationLagAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-dms-high-lag"
+      AlarmDescription: "DMS replication lag is high"
+      MetricName: CDCLatencyTarget
+      Namespace: AWS/DMS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 300
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ReplicationInstanceIdentifier
+          Value: !Ref DMSReplicationInstance
+      AlarmActions:
+        - !Ref MigrationSNSTopic
+      TreatMissingData: notBreaching
+
+  # SNS Topic for migration alerts
+  MigrationSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-migration-alerts"
+      DisplayName: "Aurora Migration Alerts"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-migration-alerts"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+# =============================================================================
+# OUTPUTS SECTION
+# =============================================================================
+Outputs:
+  # VPC and Network Information
+  VPCId:
+    Description: "VPC ID for the migration infrastructure"
+    Value: !Ref VPC
+    Export:
+      Name: !Sub "${AWS::StackName}-VPC-ID"
+
+  PrivateSubnetIds:
+    Description: "Private subnet IDs for Aurora database"
+    Value: !Join [",", [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+    Export:
+      Name: !Sub "${AWS::StackName}-Private-Subnet-IDs"
+
+  PublicSubnetIds:
+    Description: "Public subnet IDs for DMS replication instance"
+    Value: !Join [",", [!Ref PublicSubnet1, !Ref PublicSubnet2]]
+    Export:
+      Name: !Sub "${AWS::StackName}-Public-Subnet-IDs"
+
+  # Aurora Database Information
+  AuroraClusterIdentifier:
+    Description: "Aurora cluster identifier"
+    Value: !Ref AuroraCluster
+    Export:
+      Name: !Sub "${AWS::StackName}-Aurora-Cluster-ID"
+
+  AuroraClusterEndpoint:
+    Description: "Aurora cluster writer endpoint"
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+    Export:
+      Name: !Sub "${AWS::StackName}-Aurora-Writer-Endpoint"
+
+  AuroraClusterReaderEndpoint:
+    Description: "Aurora cluster reader endpoint"
+    Value: !GetAtt AuroraCluster.ReadEndpoint.Address
+    Export:
+      Name: !Sub "${AWS::StackName}-Aurora-Reader-Endpoint"
+
+  AuroraClusterPort:
+    Description: "Aurora cluster port"
+    Value: !GetAtt AuroraCluster.Endpoint.Port
+    Export:
+      Name: !Sub "${AWS::StackName}-Aurora-Port"
+
+  AuroraDatabaseName:
+    Description: "Aurora database name"
+    Value: !Ref DatabaseName
+    Export:
+      Name: !Sub "${AWS::StackName}-Aurora-Database-Name"
+
+  # DMS Information
+  DMSReplicationInstanceIdentifier:
+    Description: "DMS replication instance identifier"
+    Value: !Ref DMSReplicationInstance
+    Export:
+      Name: !Sub "${AWS::StackName}-DMS-Instance-ID"
+
+  DMSSourceEndpointArn:
+    Description: "DMS source endpoint ARN"
+    Value: !Ref DMSSourceEndpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-DMS-Source-Endpoint-ARN"
+
+  DMSTargetEndpointArn:
+    Description: "DMS target endpoint ARN"
+    Value: !Ref DMSTargetEndpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-DMS-Target-Endpoint-ARN"
+
+  # DNS Information
+  Route53HostedZoneId:
+    Description: "Route 53 hosted zone ID for DNS cutover"
+    Value: !Ref Route53HostedZone
+    Export:
+      Name: !Sub "${AWS::StackName}-Route53-Zone-ID"
+
+  ApplicationDatabaseFQDN:
+    Description: "Fully qualified domain name for application database connection"
+    Value: !Sub "${ApplicationDatabaseHostname}.${DomainName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-App-Database-FQDN"
+
+  # Security Information
+  AuroraSecurityGroupId:
+    Description: "Security group ID for Aurora database"
+    Value: !Ref AuroraSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-Aurora-Security-Group-ID"
+
+  DMSSecurityGroupId:
+    Description: "Security group ID for DMS replication instance"
+    Value: !Ref DMSSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-DMS-Security-Group-ID"
+
+  # Storage and Monitoring
+  MigrationArtifactsBucketName:
+    Description: "S3 bucket name for migration artifacts and logs"
+    Value: !Ref MigrationArtifactsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-Migration-Artifacts-Bucket"
+
+  MigrationLogGroupName:
+    Description: "CloudWatch log group for migration logs"
+    Value: !Ref MigrationLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-Migration-Log-Group"
+
+  MigrationSNSTopicArn:
+    Description: "SNS topic ARN for migration alerts"
+    Value: !Ref MigrationSNSTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-Migration-SNS-Topic-ARN"
+
+  # Connection Information for Testing
+  ConnectionTestCommand:
+    Description: "Sample command to test Aurora connectivity"
+    Value: !Sub |
+      mysql -h ${AuroraCluster.Endpoint.Address} -P ${AuroraCluster.Endpoint.Port} -u ${DatabaseMasterUsername} -p${DatabaseMasterPassword} ${DatabaseName}
+
+  # Next Steps
+  PostDeploymentInstructions:
+    Description: "Next steps after CloudFormation deployment"
+    Value: |
+      1. Test Aurora connectivity using the connection test command
+      2. Create DMS replication task using the provided endpoints
+      3. Configure application to use the Application Database FQDN
+      4. Monitor migration progress through CloudWatch and DMS console
+      5. Update Route 53 DNS record during cutover to point to Aurora endpoint
+
+  # Cost Estimation
+  EstimatedMonthlyCost:
+    Description: "Estimated monthly cost for this infrastructure (USD)"
+    Value: !Sub |
+      Aurora Cluster (${DatabaseInstanceClass} x2): ~$400-800/month
+      DMS Replication Instance (${ReplicationInstanceClass}): ~$50-200/month  
+      Storage and Data Transfer: ~$50-100/month
+      Total Estimated Cost: ~$500-1100/month (varies by usage and region)

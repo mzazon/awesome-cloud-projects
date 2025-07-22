@@ -1,0 +1,564 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'API Security with WAF and Gateway - Complete infrastructure deployment with rate limiting, geographic blocking, and comprehensive monitoring'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "API Configuration"
+        Parameters:
+          - ApiName
+          - ApiStageName
+          - ApiDescription
+      - Label:
+          default: "WAF Configuration"
+        Parameters:
+          - WebAclName
+          - RateLimitThreshold
+          - BlockedCountryCodes
+          - EnableGeoBlocking
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableWafLogging
+          - LogRetentionDays
+          - EnableCloudWatchAlarms
+          - NotificationEmail
+      - Label:
+          default: "Resource Naming"
+        Parameters:
+          - ResourcePrefix
+          - Environment
+
+Parameters:
+  # API Configuration Parameters
+  ApiName:
+    Type: String
+    Default: "protected-api"
+    Description: "Name for the API Gateway REST API"
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$"
+    ConstraintDescription: "Must start with a letter, contain only alphanumeric characters and hyphens, and end with an alphanumeric character"
+
+  ApiStageName:
+    Type: String
+    Default: "prod"
+    Description: "API Gateway deployment stage name"
+    AllowedValues:
+      - "dev"
+      - "test"
+      - "staging"
+      - "prod"
+
+  ApiDescription:
+    Type: String
+    Default: "REST API protected by AWS WAF with comprehensive security rules"
+    Description: "Description for the API Gateway REST API"
+    MaxLength: 200
+
+  # WAF Configuration Parameters
+  WebAclName:
+    Type: String
+    Default: "api-security-acl"
+    Description: "Name for the AWS WAF Web ACL"
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$"
+
+  RateLimitThreshold:
+    Type: Number
+    Default: 1000
+    Description: "Maximum requests per IP address per 5-minute window"
+    MinValue: 100
+    MaxValue: 20000
+    ConstraintDescription: "Must be between 100 and 20,000 requests"
+
+  BlockedCountryCodes:
+    Type: CommaDelimitedList
+    Default: "CN,RU,KP"
+    Description: "List of ISO 3166-1 alpha-2 country codes to block (comma-separated)"
+    ConstraintDescription: "Use ISO 3166-1 alpha-2 country codes (e.g., CN,RU,KP)"
+
+  EnableGeoBlocking:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Enable geographic blocking based on country codes"
+
+  # Monitoring Configuration Parameters
+  EnableWafLogging:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Enable WAF request logging to CloudWatch"
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: "Number of days to retain WAF logs in CloudWatch"
+
+  EnableCloudWatchAlarms:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Create CloudWatch alarms for security monitoring"
+
+  NotificationEmail:
+    Type: String
+    Default: ""
+    Description: "Email address for security alert notifications (optional)"
+    AllowedPattern: "^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
+    ConstraintDescription: "Must be a valid email address or empty"
+
+  # Resource Naming Parameters
+  ResourcePrefix:
+    Type: String
+    Default: "api-security"
+    Description: "Prefix for all resource names"
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$"
+
+  Environment:
+    Type: String
+    Default: "prod"
+    AllowedValues:
+      - "dev"
+      - "test"
+      - "staging"
+      - "prod"
+    Description: "Environment designation for resource tagging"
+
+Conditions:
+  # Condition to enable geographic blocking
+  CreateGeoBlockingRule: !Equals [!Ref EnableGeoBlocking, "true"]
+  
+  # Condition to enable WAF logging
+  CreateWafLogging: !Equals [!Ref EnableWafLogging, "true"]
+  
+  # Condition to create CloudWatch alarms
+  CreateAlarms: !Equals [!Ref EnableCloudWatchAlarms, "true"]
+  
+  # Condition to create SNS topic for notifications
+  CreateNotifications: !And
+    - !Condition CreateAlarms
+    - !Not [!Equals [!Ref NotificationEmail, ""]]
+
+Resources:
+  # CloudWatch Log Group for WAF Logging
+  WafLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateWafLogging
+    Properties:
+      LogGroupName: !Sub "/aws/waf/${ResourcePrefix}-${WebAclName}-${Environment}"
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-waf-logs-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "WAF Request Logging"
+
+  # AWS WAF Web ACL
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "${ResourcePrefix}-${WebAclName}-${Environment}"
+      Description: !Sub "Web ACL for ${ApiName} API Gateway protection in ${Environment}"
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      Rules:
+        # Rate Limiting Rule - Priority 1
+        - Name: "RateLimitRule"
+          Priority: 1
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref RateLimitThreshold
+              AggregateKeyType: IP
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: "RateLimitRule"
+        # Geographic Blocking Rule - Priority 2 (conditional)
+        - !If
+          - CreateGeoBlockingRule
+          - Name: "GeoBlockRule"
+            Priority: 2
+            Statement:
+              GeoMatchStatement:
+                CountryCodes: !Ref BlockedCountryCodes
+            Action:
+              Block: {}
+            VisibilityConfig:
+              SampledRequestsEnabled: true
+              CloudWatchMetricsEnabled: true
+              MetricName: "GeoBlockRule"
+          - !Ref "AWS::NoValue"
+        # AWS Managed Rules - Core Rule Set - Priority 3
+        - Name: "AWSManagedRulesCommonRuleSet"
+          Priority: 3
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: "AWSManagedRulesCommonRuleSet"
+        # AWS Managed Rules - Known Bad Inputs - Priority 4
+        - Name: "AWSManagedRulesKnownBadInputsRuleSet"
+          Priority: 4
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: "AWSManagedRulesKnownBadInputsRuleSet"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-web-acl-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "API Gateway Protection"
+
+  # WAF Logging Configuration
+  WafLoggingConfiguration:
+    Type: AWS::WAFv2::LoggingConfiguration
+    Condition: CreateWafLogging
+    Properties:
+      ResourceArn: !GetAtt WebAcl.Arn
+      LogDestinationConfigs:
+        - !GetAtt WafLogGroup.Arn
+      LoggingFilter:
+        DefaultBehavior: KEEP
+        Filters:
+          - Behavior: KEEP
+            Conditions:
+              - ActionCondition:
+                  Action: BLOCK
+            Requirement: MEETS_ANY
+
+  # API Gateway REST API
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${ResourcePrefix}-${ApiName}-${Environment}"
+      Description: !Ref ApiDescription
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-api-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Protected REST API"
+
+  # API Gateway Resource (/test)
+  TestResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: "test"
+
+  # API Gateway Method (GET /test)
+  TestMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref TestResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationHttpMethod: GET
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: !Sub |
+                {
+                  "message": "Hello from protected API!",
+                  "timestamp": "$context.requestTime",
+                  "requestId": "$context.requestId",
+                  "sourceIp": "$context.identity.sourceIp",
+                  "environment": "${Environment}",
+                  "api": "${ApiName}"
+                }
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - TestMethod
+    Properties:
+      RestApiId: !Ref RestApi
+      Description: !Sub "Deployment for ${ApiName} API in ${Environment}"
+
+  # API Gateway Stage
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref ApiStageName
+      Description: !Sub "${ApiStageName} stage with WAF protection"
+      TracingConfig:
+        TracingEnabled: true
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          LoggingLevel: INFO
+          DataTraceEnabled: true
+          MetricsEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-api-stage-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Stage
+          Value: !Ref ApiStageName
+
+  # Associate WAF Web ACL with API Gateway Stage
+  WebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Sub "arn:aws:apigateway:${AWS::Region}::/restapis/${RestApi}/stages/${ApiStageName}"
+      WebACLArn: !GetAtt WebAcl.Arn
+
+  # SNS Topic for Security Notifications
+  SecurityNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateNotifications
+    Properties:
+      TopicName: !Sub "${ResourcePrefix}-security-alerts-${Environment}"
+      DisplayName: !Sub "Security Alerts for ${ApiName} API"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-security-topic-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Security Alert Notifications"
+
+  # SNS Subscription for Email Notifications
+  SecurityNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateNotifications
+    Properties:
+      TopicArn: !Ref SecurityNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Alarm for High Rate Limit Violations
+  RateLimitAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlarms
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-high-rate-limit-violations-${Environment}"
+      AlarmDescription: "Alarm when rate limit violations exceed threshold"
+      MetricName: BlockedRequests
+      Namespace: AWS/WAFV2
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: WebACL
+          Value: !Sub "${ResourcePrefix}-${WebAclName}-${Environment}"
+        - Name: Rule
+          Value: "RateLimitRule"
+        - Name: Region
+          Value: !Ref "AWS::Region"
+      AlarmActions:
+        - !If [CreateNotifications, !Ref SecurityNotificationTopic, !Ref "AWS::NoValue"]
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-rate-limit-alarm-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarm for Geographic Blocking
+  GeoBlockAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlarms
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-geo-block-violations-${Environment}"
+      AlarmDescription: "Alarm when geographic blocking violations are detected"
+      MetricName: BlockedRequests
+      Namespace: AWS/WAFV2
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: WebACL
+          Value: !Sub "${ResourcePrefix}-${WebAclName}-${Environment}"
+        - Name: Rule
+          Value: "GeoBlockRule"
+        - Name: Region
+          Value: !Ref "AWS::Region"
+      AlarmActions:
+        - !If [CreateNotifications, !Ref SecurityNotificationTopic, !Ref "AWS::NoValue"]
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-geo-block-alarm-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarm for API Gateway Errors
+  ApiGatewayErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlarms
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-api-gateway-errors-${Environment}"
+      AlarmDescription: "Alarm when API Gateway 4XX/5XX errors exceed threshold"
+      MetricName: 4XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub "${ResourcePrefix}-${ApiName}-${Environment}"
+        - Name: Stage
+          Value: !Ref ApiStageName
+      AlarmActions:
+        - !If [CreateNotifications, !Ref SecurityNotificationTopic, !Ref "AWS::NoValue"]
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-api-errors-alarm-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  # API Gateway Outputs
+  ApiId:
+    Description: "API Gateway REST API ID"
+    Value: !Ref RestApi
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiId"
+
+  ApiUrl:
+    Description: "API Gateway endpoint URL"
+    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiUrl"
+
+  ApiTestEndpoint:
+    Description: "API test endpoint URL"
+    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/test"
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiTestEndpoint"
+
+  ApiStageName:
+    Description: "API Gateway stage name"
+    Value: !Ref ApiStageName
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiStageName"
+
+  # WAF Outputs
+  WebAclId:
+    Description: "AWS WAF Web ACL ID"
+    Value: !GetAtt WebAcl.Id
+    Export:
+      Name: !Sub "${AWS::StackName}-WebAclId"
+
+  WebAclArn:
+    Description: "AWS WAF Web ACL ARN"
+    Value: !GetAtt WebAcl.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-WebAclArn"
+
+  WebAclName:
+    Description: "AWS WAF Web ACL Name"
+    Value: !Sub "${ResourcePrefix}-${WebAclName}-${Environment}"
+    Export:
+      Name: !Sub "${AWS::StackName}-WebAclName"
+
+  # Monitoring Outputs
+  WafLogGroupName:
+    Condition: CreateWafLogging
+    Description: "CloudWatch log group name for WAF logs"
+    Value: !Ref WafLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-WafLogGroupName"
+
+  WafLogGroupArn:
+    Condition: CreateWafLogging
+    Description: "CloudWatch log group ARN for WAF logs"
+    Value: !GetAtt WafLogGroup.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-WafLogGroupArn"
+
+  SecurityNotificationTopicArn:
+    Condition: CreateNotifications
+    Description: "SNS topic ARN for security notifications"
+    Value: !Ref SecurityNotificationTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-SecurityNotificationTopicArn"
+
+  # Security Configuration Outputs
+  RateLimitThreshold:
+    Description: "Configured rate limit threshold (requests per 5 minutes)"
+    Value: !Ref RateLimitThreshold
+    Export:
+      Name: !Sub "${AWS::StackName}-RateLimitThreshold"
+
+  BlockedCountries:
+    Condition: CreateGeoBlockingRule
+    Description: "List of blocked country codes"
+    Value: !Join [",", !Ref BlockedCountryCodes]
+    Export:
+      Name: !Sub "${AWS::StackName}-BlockedCountries"
+
+  # CloudWatch Dashboard URL
+  CloudWatchDashboardUrl:
+    Description: "CloudWatch console URL for WAF metrics"
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#metricsV2:graph=~();query=AWS%2FWAFv2%20WebACL%3D%22${ResourcePrefix}-${WebAclName}-${Environment}%22"
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudWatchDashboardUrl"
+
+  # Cost Estimate Information
+  EstimatedMonthlyCost:
+    Description: "Estimated monthly cost breakdown (USD)"
+    Value: !Sub |
+      WAF Web ACL: $1.00
+      WAF Rules (4): $4.00
+      Request evaluations (per million): $0.60
+      CloudWatch Logs (${LogRetentionDays} days retention): $0.50-$5.00
+      API Gateway requests (per million): $3.50
+      Total base cost: ~$9.00-$14.00/month (excludes request volume charges)

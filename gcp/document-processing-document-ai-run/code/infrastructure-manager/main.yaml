@@ -1,0 +1,502 @@
+# Google Cloud Infrastructure Manager Configuration
+# Document Processing Workflows with Document AI and Cloud Run
+# Generated for recipe: document-processing-document-ai-run
+
+# Import required modules and define project configuration
+imports:
+  - path: modules/document_ai.yaml
+  - path: modules/cloud_run.yaml
+  - path: modules/pubsub.yaml
+  - path: modules/storage.yaml
+  - path: modules/iam.yaml
+
+# Template metadata and description
+info:
+  title: Document Processing Pipeline Infrastructure
+  author: Cloud Recipe Generator
+  description: |
+    Deploys a complete document processing pipeline using Google Cloud Document AI,
+    Cloud Run, Pub/Sub, and Cloud Storage. This architecture automatically processes
+    uploaded documents and extracts structured data using AI/ML capabilities.
+  version: 1.0
+
+# Required configuration properties
+properties:
+  project_id:
+    type: string
+    description: Google Cloud Project ID
+    pattern: "^[a-z][-a-z0-9]{4,28}[a-z0-9]$"
+  
+  region:
+    type: string
+    description: Google Cloud region for resource deployment
+    default: us-central1
+    enum:
+      - us-central1
+      - us-east1
+      - us-west1
+      - europe-west1
+      - asia-southeast1
+  
+  bucket_name:
+    type: string
+    description: Cloud Storage bucket name for document uploads
+    pattern: "^[a-z0-9][-_.a-z0-9]*[a-z0-9]$"
+  
+  environment:
+    type: string
+    description: Environment name (dev, staging, prod)
+    default: dev
+    enum: [dev, staging, prod]
+  
+  # Optional processor configuration
+  processor_display_name:
+    type: string
+    description: Display name for Document AI processor
+    default: form-parser-processor
+  
+  # Optional Cloud Run configuration
+  cloud_run_cpu:
+    type: string
+    description: CPU allocation for Cloud Run service
+    default: "1"
+    enum: ["0.5", "1", "2", "4"]
+  
+  cloud_run_memory:
+    type: string
+    description: Memory allocation for Cloud Run service
+    default: 1Gi
+    enum: ["512Mi", "1Gi", "2Gi", "4Gi", "8Gi"]
+  
+  cloud_run_max_instances:
+    type: integer
+    description: Maximum number of Cloud Run instances
+    default: 10
+    minimum: 1
+    maximum: 100
+
+# Required resources with proper dependencies
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      serviceName: documentai.googleapis.com
+      project: $(ref.project_id.value)
+    metadata:
+      dependsOn: []
+  
+  - name: enable-run-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      serviceName: run.googleapis.com
+      project: $(ref.project_id.value)
+    metadata:
+      dependsOn: []
+  
+  - name: enable-pubsub-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      serviceName: pubsub.googleapis.com
+      project: $(ref.project_id.value)
+    metadata:
+      dependsOn: []
+  
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      serviceName: storage.googleapis.com
+      project: $(ref.project_id.value)
+    metadata:
+      dependsOn: []
+  
+  - name: enable-cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      serviceName: cloudbuild.googleapis.com
+      project: $(ref.project_id.value)
+    metadata:
+      dependsOn: []
+
+  # IAM Service Account for Cloud Run with least privilege permissions
+  - name: document-processor-sa
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      project: $(ref.project_id.value)
+      accountId: document-processor-sa
+      serviceAccount:
+        displayName: Document Processor Service Account
+        description: Service account for document processing Cloud Run service
+    metadata:
+      dependsOn: []
+
+  # Grant Document AI API User role to service account
+  - name: document-ai-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      project: $(ref.project_id.value)
+      role: roles/documentai.apiUser
+      member: serviceAccount:$(ref.document-processor-sa.email)
+    metadata:
+      dependsOn: 
+        - document-processor-sa
+
+  # Grant Storage Object Admin role to service account
+  - name: storage-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      project: $(ref.project_id.value)
+      role: roles/storage.objectAdmin
+      member: serviceAccount:$(ref.document-processor-sa.email)
+    metadata:
+      dependsOn: 
+        - document-processor-sa
+
+  # Grant Cloud Run Invoker role to service account for Pub/Sub integration
+  - name: run-invoker-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      project: $(ref.project_id.value)
+      role: roles/run.invoker
+      member: serviceAccount:$(ref.document-processor-sa.email)
+    metadata:
+      dependsOn: 
+        - document-processor-sa
+
+  # Document AI Form Parser Processor
+  - name: document-ai-processor
+    type: gcp-types/documentai-v1:projects.locations.processors
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      processor:
+        displayName: $(ref.processor_display_name.value)
+        type: FORM_PARSER_PROCESSOR
+        description: Form parser processor for document processing pipeline
+    metadata:
+      dependsOn: 
+        - enable-apis
+
+  # Cloud Storage bucket for document uploads with versioning
+  - name: document-upload-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      project: $(ref.project_id.value)
+      name: $(ref.bucket_name.value)
+      location: $(ref.region.value)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 365  # Delete objects older than 1 year
+              isLive: false  # Apply only to non-current versions
+      labels:
+        environment: $(ref.environment.value)
+        purpose: document-processing
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn: 
+        - enable-storage-api
+
+  # Pub/Sub topic for document processing events
+  - name: document-processing-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      project: $(ref.project_id.value)
+      name: projects/$(ref.project_id.value)/topics/document-processing
+      labels:
+        environment: $(ref.environment.value)
+        purpose: document-processing
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn: 
+        - enable-pubsub-api
+
+  # Pub/Sub subscription for Cloud Run service
+  - name: document-processing-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      project: $(ref.project_id.value)
+      name: projects/$(ref.project_id.value)/subscriptions/document-worker
+      topic: $(ref.document-processing-topic.name)
+      ackDeadlineSeconds: 600  # 10 minutes for document processing
+      messageRetentionDuration: 604800s  # 7 days
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+      deadLetterPolicy:
+        deadLetterTopic: $(ref.document-processing-dlq-topic.name)
+        maxDeliveryAttempts: 5
+      labels:
+        environment: $(ref.environment.value)
+        purpose: document-processing
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn: 
+        - document-processing-topic
+        - document-processing-dlq-topic
+
+  # Dead letter queue topic for failed processing attempts
+  - name: document-processing-dlq-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      project: $(ref.project_id.value)
+      name: projects/$(ref.project_id.value)/topics/document-processing-dlq
+      labels:
+        environment: $(ref.environment.value)
+        purpose: document-processing-dlq
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn: 
+        - enable-pubsub-api
+
+  # Cloud Storage bucket notification to Pub/Sub
+  - name: bucket-notification
+    type: gcp-types/storage-v1:notifications
+    properties:
+      bucket: $(ref.document-upload-bucket.name)
+      topic: $(ref.document-processing-topic.name)
+      eventTypes:
+        - OBJECT_FINALIZE
+      payloadFormat: JSON_API_V1
+    metadata:
+      dependsOn: 
+        - document-upload-bucket
+        - document-processing-topic
+
+  # Cloud Run service for document processing
+  - name: document-processor-service
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/$(ref.project_id.value)
+      location: $(ref.region.value)
+      body:
+        apiVersion: serving.knative.dev/v1
+        kind: Service
+        metadata:
+          name: document-processor
+          labels:
+            environment: $(ref.environment.value)
+            purpose: document-processing
+            managed-by: infrastructure-manager
+          annotations:
+            run.googleapis.com/ingress: all
+        spec:
+          template:
+            metadata:
+              annotations:
+                autoscaling.knative.dev/maxScale: "$(ref.cloud_run_max_instances.value)"
+                autoscaling.knative.dev/minScale: "0"
+                run.googleapis.com/cpu-throttling: "false"
+                run.googleapis.com/execution-environment: gen2
+            spec:
+              serviceAccountName: $(ref.document-processor-sa.email)
+              timeoutSeconds: 600  # 10 minutes timeout
+              containerConcurrency: 10
+              containers:
+                - image: gcr.io/cloudrun/placeholder  # Placeholder - will be updated during deployment
+                  ports:
+                    - containerPort: 8080
+                  resources:
+                    limits:
+                      cpu: $(ref.cloud_run_cpu.value)
+                      memory: $(ref.cloud_run_memory.value)
+                  env:
+                    - name: PROJECT_ID
+                      value: $(ref.project_id.value)
+                    - name: REGION
+                      value: $(ref.region.value)
+                    - name: PROCESSOR_ID
+                      value: $(ref.document-ai-processor.name)
+                    - name: BUCKET_NAME
+                      value: $(ref.document-upload-bucket.name)
+                    - name: ENVIRONMENT
+                      value: $(ref.environment.value)
+          traffic:
+            - percent: 100
+              latestRevision: true
+    metadata:
+      dependsOn: 
+        - enable-run-api
+        - document-processor-sa
+        - document-ai-processor
+        - document-upload-bucket
+
+  # Cloud Run service IAM policy to allow unauthenticated access
+  - name: cloud-run-iam-policy
+    type: gcp-types/run-v1:namespaces.services.setIamPolicy
+    properties:
+      resource: namespaces/$(ref.project_id.value)/services/document-processor
+      location: $(ref.region.value)
+      policy:
+        bindings:
+          - role: roles/run.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn: 
+        - document-processor-service
+
+  # Update Pub/Sub subscription to push to Cloud Run
+  - name: update-subscription-push-config
+    type: gcp-types/pubsub-v1:projects.subscriptions:modifyPushConfig
+    properties:
+      subscription: $(ref.document-processing-subscription.name)
+      pushConfig:
+        pushEndpoint: $(ref.document-processor-service.status.url)
+        oidcToken:
+          serviceAccountEmail: $(ref.document-processor-sa.email)
+    metadata:
+      dependsOn: 
+        - document-processing-subscription
+        - document-processor-service
+        - cloud-run-iam-policy
+
+# Cloud Monitoring alerts for operational visibility
+  - name: processing-error-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(ref.project_id.value)
+      alertPolicy:
+        displayName: Document Processing Errors
+        documentation:
+          content: Alert when document processing service encounters errors
+        conditions:
+          - displayName: High error rate
+            conditionThreshold:
+              filter: resource.type="cloud_run_revision" AND resource.labels.service_name="document-processor"
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 5
+              duration: 300s
+        enabled: true
+        notificationChannels: []
+        severity: ERROR
+    metadata:
+      dependsOn: 
+        - document-processor-service
+
+# Outputs for verification and integration
+outputs:
+  - name: project_id
+    value: $(ref.project_id.value)
+    description: Google Cloud Project ID
+  
+  - name: region
+    value: $(ref.region.value)
+    description: Deployment region
+  
+  - name: bucket_name
+    value: $(ref.document-upload-bucket.name)
+    description: Cloud Storage bucket for document uploads
+  
+  - name: bucket_url
+    value: gs://$(ref.document-upload-bucket.name)
+    description: Cloud Storage bucket URL
+  
+  - name: processor_id
+    value: $(ref.document-ai-processor.name)
+    description: Document AI processor resource name
+  
+  - name: cloud_run_service_url
+    value: $(ref.document-processor-service.status.url)
+    description: Cloud Run service URL
+  
+  - name: pubsub_topic
+    value: $(ref.document-processing-topic.name)
+    description: Pub/Sub topic for document processing
+  
+  - name: pubsub_subscription
+    value: $(ref.document-processing-subscription.name)
+    description: Pub/Sub subscription for document processing
+  
+  - name: service_account_email
+    value: $(ref.document-processor-sa.email)
+    description: Service account email for the document processor
+  
+  - name: deployment_summary
+    value: |
+      Document Processing Pipeline Deployed Successfully
+      
+      Resources Created:
+      - Document AI Form Parser Processor: $(ref.document-ai-processor.name)
+      - Cloud Storage Bucket: $(ref.document-upload-bucket.name)
+      - Cloud Run Service: $(ref.document-processor-service.status.url)
+      - Pub/Sub Topic: $(ref.document-processing-topic.name)
+      - Service Account: $(ref.document-processor-sa.email)
+      
+      To test the pipeline:
+      1. Upload a document to: gs://$(ref.document-upload-bucket.name)
+      2. Monitor processing in Cloud Run logs
+      3. Check processed results in: gs://$(ref.document-upload-bucket.name)/processed/
+    description: Summary of deployed infrastructure
+
+# Deployment validation and health checks
+validation:
+  # Validate required APIs are enabled
+  - name: validate-apis
+    type: shell
+    command: |
+      gcloud services list --enabled --filter="name:(documentai.googleapis.com OR run.googleapis.com OR pubsub.googleapis.com OR storage.googleapis.com)" --format="value(name)" | wc -l
+    expected_result: "4"
+    description: Verify all required APIs are enabled
+  
+  # Validate Document AI processor is active
+  - name: validate-processor
+    type: shell
+    command: |
+      gcloud documentai processors describe $(ref.document-ai-processor.name) --location=$(ref.region.value) --format="value(state)"
+    expected_result: "ENABLED"
+    description: Verify Document AI processor is enabled
+  
+  # Validate Cloud Run service is ready
+  - name: validate-cloud-run
+    type: shell
+    command: |
+      gcloud run services describe document-processor --region=$(ref.region.value) --format="value(status.conditions[0].status)"
+    expected_result: "True"
+    description: Verify Cloud Run service is ready
+
+# Resource cleanup order for proper dependency handling
+cleanup_order:
+  1: 
+    - update-subscription-push-config
+    - bucket-notification
+  2:
+    - document-processing-subscription
+    - cloud-run-iam-policy
+  3:
+    - document-processor-service
+    - processing-error-alert
+  4:
+    - document-processing-topic
+    - document-processing-dlq-topic
+  5:
+    - document-upload-bucket
+    - document-ai-processor
+  6:
+    - storage-binding
+    - document-ai-binding
+    - run-invoker-binding
+  7:
+    - document-processor-sa
+
+# Metadata for Infrastructure Manager
+metadata:
+  created_by: Cloud Recipe Generator
+  recipe_name: document-processing-document-ai-run
+  recipe_version: 1.0
+  infrastructure_version: 1.0
+  last_updated: 2025-07-12
+  compliance:
+    - google-cloud-security-best-practices
+    - least-privilege-access
+    - data-encryption-at-rest
+    - audit-logging-enabled
+  cost_optimization:
+    - automatic-scaling
+    - storage-lifecycle-policies
+    - regional-deployment
+    - serverless-architecture

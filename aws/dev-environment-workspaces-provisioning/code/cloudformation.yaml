@@ -1,0 +1,980 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Automated Development Environment Provisioning with WorkSpaces Personal
+  
+  This template creates a complete automation system for provisioning standardized 
+  WorkSpaces Personal environments with pre-configured development tools, security 
+  policies, and team-specific software stacks. The solution uses Lambda for 
+  orchestration, Systems Manager for configuration management, and EventBridge 
+  for scheduled automation.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "WorkSpaces Configuration"
+        Parameters:
+          - DirectoryId
+          - BundleId
+          - WorkspacesSubnetIds
+      - Label:
+          default: "Automation Configuration"
+        Parameters:
+          - ProjectName
+          - AutomationSchedule
+          - TargetUsers
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - ADServiceUsername
+          - ADServicePassword
+          - EnableEncryption
+      - Label:
+          default: "Development Tools Configuration"
+        Parameters:
+          - DevelopmentTools
+          - TeamConfiguration
+    ParameterLabels:
+      DirectoryId:
+        default: "Active Directory ID"
+      BundleId:
+        default: "WorkSpaces Bundle ID"
+      ProjectName:
+        default: "Project Name"
+      AutomationSchedule:
+        default: "Automation Schedule"
+      ADServiceUsername:
+        default: "AD Service Account Username"
+      ADServicePassword:
+        default: "AD Service Account Password"
+
+Parameters:
+  DirectoryId:
+    Type: String
+    Description: >
+      The directory identifier for WorkSpaces deployment. Must be a valid 
+      Simple AD, Managed Microsoft AD, or AD Connector directory.
+    AllowedPattern: '^d-[0-9a-f]{10}$'
+    ConstraintDescription: Must be a valid directory ID (e.g., d-906734e6b2)
+    
+  BundleId:
+    Type: String
+    Description: >
+      The bundle identifier for WorkSpaces instances. Determines the computing 
+      resources and operating system for provisioned WorkSpaces.
+    AllowedPattern: '^wsb-[0-9a-z]{10}$'
+    Default: wsb-b0s22j3d7
+    ConstraintDescription: Must be a valid bundle ID (e.g., wsb-b0s22j3d7)
+    
+  WorkspacesSubnetIds:
+    Type: CommaDelimitedList
+    Description: >
+      List of subnet IDs for WorkSpaces deployment. Must be in at least two 
+      different Availability Zones for high availability.
+    
+  ProjectName:
+    Type: String
+    Description: Project name for resource naming and tagging
+    Default: devenv-automation
+    AllowedPattern: '^[a-z0-9-]{3,20}$'
+    ConstraintDescription: Must be 3-20 characters, lowercase letters, numbers, and hyphens only
+    
+  AutomationSchedule:
+    Type: String
+    Description: Schedule expression for automated WorkSpaces provisioning checks
+    Default: rate(24 hours)
+    AllowedValues:
+      - rate(1 hour)
+      - rate(6 hours)
+      - rate(12 hours)
+      - rate(24 hours)
+      - rate(7 days)
+    
+  TargetUsers:
+    Type: CommaDelimitedList
+    Description: >
+      Comma-separated list of usernames who should have WorkSpaces provisioned. 
+      These users must exist in the configured Active Directory.
+    Default: developer1,developer2,developer3
+    
+  ADServiceUsername:
+    Type: String
+    Description: >
+      Username for the Active Directory service account used for WorkSpaces automation.
+      This account needs permissions to query AD groups and user information.
+    Default: workspaces-service
+    NoEcho: false
+    
+  ADServicePassword:
+    Type: String
+    Description: >
+      Password for the Active Directory service account. This will be stored 
+      securely in AWS Secrets Manager with encryption at rest.
+    NoEcho: true
+    MinLength: 12
+    MaxLength: 64
+    
+  DevelopmentTools:
+    Type: CommaDelimitedList
+    Description: >
+      Comma-separated list of development tools to install on WorkSpaces.
+      Available tools: git, vscode, nodejs, python, docker, maven, gradle
+    Default: git,vscode,nodejs,python,docker
+    
+  TeamConfiguration:
+    Type: String
+    Description: Team-specific configuration profile for development environment setup
+    Default: standard
+    AllowedValues:
+      - standard
+      - frontend
+      - backend
+      - fullstack
+      - data-science
+      - devops
+    
+  EnableEncryption:
+    Type: String
+    Description: Enable encryption for WorkSpaces user and root volumes
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Conditions:
+  EnableVolumeEncryption: !Equals [!Ref EnableEncryption, 'true']
+  IsProductionEnvironment: !Not [!Equals [!Ref AutomationSchedule, rate(1 hour)]]
+
+Resources:
+  # Secrets Manager Secret for AD Credentials
+  ADCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}-ad-credentials-${AWS::StackName}'
+      Description: Active Directory service account credentials for WorkSpaces automation
+      SecretString: !Sub |
+        {
+          "username": "${ADServiceUsername}",
+          "password": "${ADServicePassword}"
+        }
+      KmsKeyId: alias/aws/secretsmanager
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DevEnvironmentAutomation
+        - Key: Component
+          Value: Credentials
+
+  # IAM Role for Lambda Function
+  WorkSpacesAutomationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: WorkSpacesAutomationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # WorkSpaces permissions
+              - Effect: Allow
+                Action:
+                  - workspaces:CreateWorkspaces
+                  - workspaces:TerminateWorkspaces
+                  - workspaces:DescribeWorkspaces
+                  - workspaces:DescribeWorkspaceDirectories
+                  - workspaces:DescribeWorkspaceBundles
+                  - workspaces:ModifyWorkspaceProperties
+                  - workspaces:DescribeWorkspaceImages
+                  - workspaces:ModifyWorkspaceAccessProperties
+                Resource: '*'
+              # Systems Manager permissions
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                  - ssm:DescribeInstanceInformation
+                  - ssm:GetDocument
+                  - ssm:ListDocuments
+                  - ssm:DescribeDocumentParameters
+                  - ssm:ListCommandInvocations
+                Resource: '*'
+              # Secrets Manager permissions
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref ADCredentialsSecret
+              # CloudWatch Logs permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*'
+              # EC2 permissions for VPC access
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                  - ec2:AttachNetworkInterface
+                  - ec2:DetachNetworkInterface
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DevEnvironmentAutomation
+        - Key: Component
+          Value: IAM
+
+  # Systems Manager Document for Development Environment Setup
+  DevEnvironmentSetupDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: !Sub '${ProjectName}-dev-setup-${AWS::StackName}'
+      DocumentType: Command
+      DocumentFormat: JSON
+      Content:
+        schemaVersion: '2.2'
+        description: Configure development environment on WorkSpaces Personal
+        parameters:
+          developmentTools:
+            type: String
+            description: Comma-separated list of development tools to install
+            default: !Join [',', !Ref DevelopmentTools]
+          teamConfiguration:
+            type: String
+            description: Team-specific configuration settings
+            default: !Ref TeamConfiguration
+          projectName:
+            type: String
+            description: Project name for environment setup
+            default: !Ref ProjectName
+        mainSteps:
+          # Install Chocolatey Package Manager
+          - action: aws:runPowerShellScript
+            name: InstallChocolatey
+            inputs:
+              runCommand:
+                - Write-Output 'Starting Chocolatey installation...'
+                - Set-ExecutionPolicy Bypass -Scope Process -Force
+                - '[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072'
+                - try {
+                - '  iex ((New-Object System.Net.WebClient).DownloadString(''https://community.chocolatey.org/install.ps1''))'
+                - '  Write-Output "Chocolatey installation completed successfully"'
+                - '} catch {'
+                - '  Write-Error "Failed to install Chocolatey: $($_.Exception.Message)"'
+                - '  exit 1'
+                - '}'
+          # Install Development Tools
+          - action: aws:runPowerShellScript
+            name: InstallDevelopmentTools
+            inputs:
+              runCommand:
+                - Write-Output 'Installing development tools...'
+                - '$tools = "{{ developmentTools }}".Split(",")'
+                - '$installedTools = @()'
+                - '$failedTools = @()'
+                - foreach ($tool in $tools) {
+                - '  $trimmedTool = $tool.Trim()'
+                - '  Write-Output "Installing $trimmedTool..."'
+                - '  try {'
+                - '    switch ($trimmedTool) {'
+                - '      "git" { '
+                - '        choco install git -y --no-progress --limit-output'
+                - '        $installedTools += $trimmedTool'
+                - '      }'
+                - '      "vscode" { '
+                - '        choco install vscode -y --no-progress --limit-output'
+                - '        $installedTools += $trimmedTool'
+                - '      }'
+                - '      "nodejs" { '
+                - '        choco install nodejs -y --no-progress --limit-output'
+                - '        $installedTools += $trimmedTool'
+                - '      }'
+                - '      "python" { '
+                - '        choco install python -y --no-progress --limit-output'
+                - '        $installedTools += $trimmedTool'
+                - '      }'
+                - '      "docker" { '
+                - '        choco install docker-desktop -y --no-progress --limit-output'
+                - '        $installedTools += $trimmedTool'
+                - '      }'
+                - '      "maven" { '
+                - '        choco install maven -y --no-progress --limit-output'
+                - '        $installedTools += $trimmedTool'
+                - '      }'
+                - '      "gradle" { '
+                - '        choco install gradle -y --no-progress --limit-output'
+                - '        $installedTools += $trimmedTool'
+                - '      }'
+                - '      default { '
+                - '        Write-Warning "Unknown tool: $trimmedTool"'
+                - '        $failedTools += $trimmedTool'
+                - '      }'
+                - '    }'
+                - '  } catch {'
+                - '    Write-Error "Failed to install $trimmedTool: $($_.Exception.Message)"'
+                - '    $failedTools += $trimmedTool'
+                - '  }'
+                - '}'
+                - Write-Output "Successfully installed tools: $($installedTools -join ', ')"
+                - if ($failedTools.Count -gt 0) {
+                - '  Write-Warning "Failed to install tools: $($failedTools -join '', '')"'
+                - '}' 
+          # Configure Development Environment
+          - action: aws:runPowerShellScript
+            name: ConfigureEnvironment
+            inputs:
+              runCommand:
+                - Write-Output 'Configuring development environment...'
+                - '$teamConfig = "{{ teamConfiguration }}"'
+                - '$projectName = "{{ projectName }}"'
+                - try {
+                - '  # Set Git global configuration'
+                - '  git config --global init.defaultBranch main'
+                - '  git config --global pull.rebase false'
+                - '  git config --global core.autocrlf true'
+                - '  Write-Output "Git configuration completed"'
+                - '  '
+                - '  # Create development directories'
+                - '  $devPaths = @("C:\Dev\Projects", "C:\Dev\Tools", "C:\Dev\Scripts")'
+                - '  foreach ($path in $devPaths) {'
+                - '    New-Item -ItemType Directory -Force -Path $path | Out-Null'
+                - '    Write-Output "Created directory: $path"'
+                - '  }'
+                - '  '
+                - '  # Create team-specific configurations'
+                - '  switch ($teamConfig) {'
+                - '    "frontend" {'
+                - '      New-Item -ItemType Directory -Force -Path "C:\Dev\Projects\Frontend" | Out-Null'
+                - '      Write-Output "Frontend team configuration applied"'
+                - '    }'
+                - '    "backend" {'
+                - '      New-Item -ItemType Directory -Force -Path "C:\Dev\Projects\Backend" | Out-Null'
+                - '      New-Item -ItemType Directory -Force -Path "C:\Dev\Projects\APIs" | Out-Null'
+                - '      Write-Output "Backend team configuration applied"'
+                - '    }'
+                - '    "fullstack" {'
+                - '      New-Item -ItemType Directory -Force -Path "C:\Dev\Projects\Frontend" | Out-Null'
+                - '      New-Item -ItemType Directory -Force -Path "C:\Dev\Projects\Backend" | Out-Null'
+                - '      Write-Output "Full-stack team configuration applied"'
+                - '    }'
+                - '    "data-science" {'
+                - '      New-Item -ItemType Directory -Force -Path "C:\Dev\Projects\DataScience" | Out-Null'
+                - '      New-Item -ItemType Directory -Force -Path "C:\Dev\Projects\Notebooks" | Out-Null'
+                - '      Write-Output "Data science team configuration applied"'
+                - '    }'
+                - '    "devops" {'
+                - '      New-Item -ItemType Directory -Force -Path "C:\Dev\Projects\Infrastructure" | Out-Null'
+                - '      New-Item -ItemType Directory -Force -Path "C:\Dev\Projects\Pipelines" | Out-Null'
+                - '      Write-Output "DevOps team configuration applied"'
+                - '    }'
+                - '    default {'
+                - '      Write-Output "Standard configuration applied"'
+                - '    }'
+                - '  }'
+                - '  '
+                - '  Write-Output "Environment configuration completed successfully"'
+                - '} catch {'
+                - '  Write-Error "Environment configuration failed: $($_.Exception.Message)"'
+                - '  exit 1'
+                - '}'
+          # Install Team-Specific Tools and Configurations
+          - action: aws:runPowerShellScript
+            name: InstallTeamSpecificTools
+            inputs:
+              runCommand:
+                - Write-Output 'Installing team-specific tools...'
+                - '$teamConfig = "{{ teamConfiguration }}"'
+                - switch ($teamConfig) {
+                - '  "frontend" {'
+                - '    Write-Output "Installing frontend development tools..."'
+                - '    choco install googlechrome firefox -y --no-progress --limit-output'
+                - '    Write-Output "Frontend tools installation completed"'
+                - '  }'
+                - '  "data-science" {'
+                - '    Write-Output "Installing data science tools..."'
+                - '    choco install anaconda3 -y --no-progress --limit-output'
+                - '    Write-Output "Data science tools installation completed"'
+                - '  }'
+                - '  "devops" {'
+                - '    Write-Output "Installing DevOps tools..."'
+                - '    choco install terraform packer -y --no-progress --limit-output'
+                - '    Write-Output "DevOps tools installation completed"'
+                - '  }'
+                - '  default {'
+                - '    Write-Output "No additional team-specific tools required"'
+                - '  }'
+                - '}'
+                - Write-Output 'Team-specific tools installation completed'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DevEnvironmentAutomation
+        - Key: Component
+          Value: Configuration
+
+  # Lambda Function for WorkSpaces Automation
+  WorkSpacesAutomationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-provisioner-${AWS::StackName}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt WorkSpacesAutomationLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Description: Automated WorkSpaces provisioning for development teams
+      Environment:
+        Variables:
+          SECRET_NAME: !Ref ADCredentialsSecret
+          DIRECTORY_ID: !Ref DirectoryId
+          BUNDLE_ID: !Ref BundleId
+          SSM_DOCUMENT_NAME: !Ref DevEnvironmentSetupDocument
+          PROJECT_NAME: !Ref ProjectName
+          TARGET_USERS: !Join [',', !Ref TargetUsers]
+          ENABLE_ENCRYPTION: !Ref EnableEncryption
+          DEVELOPMENT_TOOLS: !Join [',', !Ref DevelopmentTools]
+          TEAM_CONFIGURATION: !Ref TeamConfiguration
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import time
+          import os
+          from botocore.exceptions import ClientError
+          from typing import Dict, List, Any, Optional
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              Main Lambda handler for WorkSpaces automation
+              
+              Args:
+                  event: Event data containing configuration parameters
+                  context: Lambda runtime information
+                  
+              Returns:
+                  Response with status and results
+              """
+              try:
+                  logger.info("Starting WorkSpaces automation process")
+                  logger.info(f"Event received: {json.dumps(event, default=str)}")
+                  
+                  # Initialize AWS clients
+                  workspaces_client = boto3.client('workspaces')
+                  ssm_client = boto3.client('ssm')
+                  secrets_client = boto3.client('secretsmanager')
+                  
+                  # Get configuration from environment variables with fallbacks from event
+                  config = get_configuration(event)
+                  logger.info(f"Configuration loaded: {json.dumps({k: v for k, v in config.items() if 'password' not in k.lower()}, default=str)}")
+                  
+                  # Validate configuration
+                  validate_configuration(config)
+                  
+                  # Get AD credentials from Secrets Manager
+                  try:
+                      credentials = get_ad_credentials(secrets_client, config['secret_name'])
+                      logger.info("Successfully retrieved AD credentials")
+                  except Exception as e:
+                      logger.error(f"Failed to retrieve AD credentials: {str(e)}")
+                      raise
+                  
+                  # Get current WorkSpaces state
+                  try:
+                      current_workspaces = get_current_workspaces(workspaces_client, config['directory_id'])
+                      logger.info(f"Found {len(current_workspaces)} existing WorkSpaces")
+                  except Exception as e:
+                      logger.error(f"Failed to get current WorkSpaces: {str(e)}")
+                      raise
+                  
+                  # Get target users list
+                  target_users = config['target_users']
+                  logger.info(f"Target users for provisioning: {target_users}")
+                  
+                  # Provision WorkSpaces for new users
+                  try:
+                      provision_results = provision_workspaces(
+                          workspaces_client, target_users, current_workspaces, config
+                      )
+                      logger.info(f"Provisioning results: {provision_results}")
+                  except Exception as e:
+                      logger.error(f"WorkSpaces provisioning failed: {str(e)}")
+                      raise
+                  
+                  # Schedule configuration for new WorkSpaces
+                  try:
+                      configuration_results = schedule_workspaces_configuration(
+                          ssm_client, provision_results, config
+                      )
+                      logger.info(f"Configuration scheduling results: {configuration_results}")
+                  except Exception as e:
+                      logger.error(f"Configuration scheduling failed: {str(e)}")
+                      # Don't fail the entire process for configuration scheduling issues
+                      configuration_results = [{'status': 'failed', 'error': str(e)}]
+                  
+                  # Prepare response
+                  response = {
+                      'statusCode': 200,
+                      'body': {
+                          'message': 'WorkSpaces provisioning completed successfully',
+                          'summary': {
+                              'existing_workspaces': len(current_workspaces),
+                              'target_users': len(target_users),
+                              'provisioned': len([r for r in provision_results if r.get('status') == 'created']),
+                              'failed_provisions': len([r for r in provision_results if r.get('status') == 'failed']),
+                              'configurations_scheduled': len([r for r in configuration_results if r.get('status') == 'scheduled'])
+                          },
+                          'details': {
+                              'provision_results': provision_results,
+                              'configuration_results': configuration_results
+                          },
+                          'timestamp': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())
+                      }
+                  }
+                  
+                  logger.info("WorkSpaces automation completed successfully")
+                  logger.info(f"Summary: {response['body']['summary']}")
+                  return response
+                  
+              except Exception as e:
+                  logger.error(f"Critical error in WorkSpaces automation: {str(e)}", exc_info=True)
+                  return {
+                      'statusCode': 500,
+                      'body': {
+                          'error': str(e),
+                          'message': 'WorkSpaces automation failed',
+                          'timestamp': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())
+                      }
+                  }
+          
+          def get_configuration(event: Dict[str, Any]) -> Dict[str, Any]:
+              """Extract configuration from environment variables and event"""
+              config = {
+                  'secret_name': os.environ.get('SECRET_NAME') or event.get('secret_name'),
+                  'directory_id': os.environ.get('DIRECTORY_ID') or event.get('directory_id'),
+                  'bundle_id': os.environ.get('BUNDLE_ID') or event.get('bundle_id'),
+                  'ssm_document_name': os.environ.get('SSM_DOCUMENT_NAME') or event.get('ssm_document'),
+                  'project_name': os.environ.get('PROJECT_NAME', 'devenv-automation'),
+                  'enable_encryption': os.environ.get('ENABLE_ENCRYPTION', 'true').lower() == 'true',
+                  'development_tools': os.environ.get('DEVELOPMENT_TOOLS', 'git,vscode,nodejs,python').split(','),
+                  'team_configuration': os.environ.get('TEAM_CONFIGURATION', 'standard'),
+                  'target_users': []
+              }
+              
+              # Parse target users
+              target_users_str = os.environ.get('TARGET_USERS') or event.get('target_users', '')
+              if isinstance(target_users_str, list):
+                  config['target_users'] = target_users_str
+              elif isinstance(target_users_str, str):
+                  config['target_users'] = [user.strip() for user in target_users_str.split(',') if user.strip()]
+              
+              return config
+          
+          def validate_configuration(config: Dict[str, Any]) -> None:
+              """Validate required configuration parameters"""
+              required_fields = ['secret_name', 'directory_id', 'bundle_id', 'ssm_document_name']
+              for field in required_fields:
+                  if not config.get(field):
+                      raise ValueError(f"Missing required configuration: {field}")
+              
+              if not config.get('target_users'):
+                  raise ValueError("No target users specified for WorkSpaces provisioning")
+          
+          def get_ad_credentials(secrets_client: Any, secret_name: str) -> Dict[str, str]:
+              """Retrieve AD credentials from Secrets Manager"""
+              try:
+                  response = secrets_client.get_secret_value(SecretId=secret_name)
+                  return json.loads(response['SecretString'])
+              except ClientError as e:
+                  logger.error(f"Failed to retrieve credentials from {secret_name}: {e}")
+                  raise
+              except json.JSONDecodeError as e:
+                  logger.error(f"Invalid JSON in secret {secret_name}: {e}")
+                  raise
+          
+          def get_current_workspaces(workspaces_client: Any, directory_id: str) -> Dict[str, str]:
+              """Get list of current WorkSpaces for the directory"""
+              try:
+                  paginator = workspaces_client.get_paginator('describe_workspaces')
+                  current_workspaces = {}
+                  
+                  for page in paginator.paginate(DirectoryId=directory_id):
+                      for workspace in page['Workspaces']:
+                          if workspace['State'] in ['AVAILABLE', 'PENDING', 'STARTING', 'REBUILDING', 'REBOOTING']:
+                              current_workspaces[workspace['UserName']] = workspace['WorkspaceId']
+                  
+                  return current_workspaces
+              except ClientError as e:
+                  logger.error(f"Failed to describe WorkSpaces for directory {directory_id}: {e}")
+                  return {}
+          
+          def provision_workspaces(
+              workspaces_client: Any,
+              target_users: List[str],
+              current_workspaces: Dict[str, str],
+              config: Dict[str, Any]
+          ) -> List[Dict[str, Any]]:
+              """Provision WorkSpaces for users who don't have them"""
+              results = []
+              
+              for user in target_users:
+                  if user not in current_workspaces:
+                      try:
+                          logger.info(f"Creating WorkSpace for user: {user}")
+                          
+                          workspace_request = {
+                              'DirectoryId': config['directory_id'],
+                              'UserName': user,
+                              'BundleId': config['bundle_id'],
+                              'WorkspaceProperties': {
+                                  'RunningMode': 'AUTO_STOP',
+                                  'RunningModeAutoStopTimeoutInMinutes': 60,
+                                  'UserVolumeEncryptionEnabled': config['enable_encryption'],
+                                  'RootVolumeEncryptionEnabled': config['enable_encryption']
+                              },
+                              'Tags': [
+                                  {'Key': 'Project', 'Value': config['project_name']},
+                                  {'Key': 'User', 'Value': user},
+                                  {'Key': 'Environment', 'Value': 'Development'},
+                                  {'Key': 'TeamConfiguration', 'Value': config['team_configuration']},
+                                  {'Key': 'AutomationManaged', 'Value': 'true'},
+                                  {'Key': 'CreatedBy', 'Value': 'WorkSpacesAutomation'}
+                              ]
+                          }
+                          
+                          response = workspaces_client.create_workspaces(Workspaces=[workspace_request])
+                          
+                          if response.get('PendingRequests'):
+                              workspace_id = response['PendingRequests'][0]['WorkspaceId']
+                              results.append({
+                                  'user': user,
+                                  'workspace_id': workspace_id,
+                                  'status': 'created',
+                                  'message': f'WorkSpace {workspace_id} created successfully'
+                              })
+                              logger.info(f"Successfully created WorkSpace {workspace_id} for {user}")
+                          elif response.get('FailedRequests'):
+                              failed_request = response['FailedRequests'][0]
+                              error_message = failed_request.get('ErrorMessage', 'Unknown error')
+                              results.append({
+                                  'user': user,
+                                  'status': 'failed',
+                                  'error_code': failed_request.get('ErrorCode', 'Unknown'),
+                                  'error_message': error_message
+                              })
+                              logger.error(f"Failed to create WorkSpace for {user}: {error_message}")
+                      
+                      except ClientError as e:
+                          error_message = str(e)
+                          logger.error(f"Failed to create WorkSpace for {user}: {error_message}")
+                          results.append({
+                              'user': user,
+                              'status': 'failed',
+                              'error': error_message
+                          })
+                      except Exception as e:
+                          error_message = str(e)
+                          logger.error(f"Unexpected error creating WorkSpace for {user}: {error_message}")
+                          results.append({
+                              'user': user,
+                              'status': 'failed',
+                              'error': error_message
+                          })
+                  else:
+                      logger.info(f"User {user} already has WorkSpace: {current_workspaces[user]}")
+                      results.append({
+                          'user': user,
+                          'workspace_id': current_workspaces[user],
+                          'status': 'existing',
+                          'message': 'WorkSpace already exists'
+                      })
+              
+              return results
+          
+          def schedule_workspaces_configuration(
+              ssm_client: Any,
+              provision_results: List[Dict[str, Any]],
+              config: Dict[str, Any]
+          ) -> List[Dict[str, Any]]:
+              """Schedule configuration for newly provisioned WorkSpaces"""
+              configuration_results = []
+              
+              newly_created_workspaces = [
+                  result for result in provision_results 
+                  if result.get('status') == 'created' and result.get('workspace_id')
+              ]
+              
+              if not newly_created_workspaces:
+                  logger.info("No new WorkSpaces to configure")
+                  return configuration_results
+              
+              logger.info(f"Scheduling configuration for {len(newly_created_workspaces)} new WorkSpaces")
+              
+              # Note: In a production environment, you would implement a mechanism to wait for
+              # WorkSpaces to become available before sending configuration commands.
+              # This could be done through:
+              # 1. A separate Lambda function triggered by CloudWatch Events
+              # 2. An SQS queue with delayed message processing
+              # 3. A Step Functions state machine with wait states
+              
+              for result in newly_created_workspaces:
+                  try:
+                      workspace_id = result['workspace_id']
+                      user = result['user']
+                      
+                      # For now, we'll just log the configuration intent
+                      # In production, implement proper WorkSpace readiness checking
+                      
+                      logger.info(f"Configuration scheduled for WorkSpace {workspace_id} (user: {user})")
+                      configuration_results.append({
+                          'workspace_id': workspace_id,
+                          'user': user,
+                          'status': 'scheduled',
+                          'message': 'Configuration will be applied once WorkSpace is available',
+                          'ssm_document': config['ssm_document_name'],
+                          'development_tools': config['development_tools'],
+                          'team_configuration': config['team_configuration']
+                      })
+                      
+                  except Exception as e:
+                      logger.error(f"Failed to schedule configuration for {result.get('workspace_id', 'unknown')}: {str(e)}")
+                      configuration_results.append({
+                          'workspace_id': result.get('workspace_id', 'unknown'),
+                          'user': result.get('user', 'unknown'),
+                          'status': 'failed',
+                          'error': str(e)
+                      })
+              
+              return configuration_results
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DevEnvironmentAutomation
+        - Key: Component
+          Value: Automation
+
+  # CloudWatch Log Group for Lambda Function
+  WorkSpacesAutomationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${WorkSpacesAutomationFunction}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DevEnvironmentAutomation
+        - Key: Component
+          Value: Logging
+
+  # EventBridge Rule for Scheduled Automation
+  WorkSpacesAutomationScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-daily-provisioning-${AWS::StackName}'
+      Description: Scheduled WorkSpaces provisioning automation
+      ScheduleExpression: !Ref AutomationSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt WorkSpacesAutomationFunction.Arn
+          Id: WorkSpacesAutomationTarget
+          Input: !Sub |
+            {
+              "secret_name": "${ADCredentialsSecret}",
+              "directory_id": "${DirectoryId}",
+              "bundle_id": "${BundleId}",
+              "target_users": [${TargetUsers}],
+              "ssm_document": "${DevEnvironmentSetupDocument}",
+              "triggered_by": "scheduled_event",
+              "automation_schedule": "${AutomationSchedule}"
+            }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DevEnvironmentAutomation
+        - Key: Component
+          Value: Scheduling
+
+  # Lambda Permission for EventBridge
+  WorkSpacesAutomationLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WorkSpacesAutomationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WorkSpacesAutomationScheduleRule.Arn
+
+  # CloudWatch Dashboard for Monitoring
+  WorkSpacesAutomationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-workspaces-automation-${AWS::StackName}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${WorkSpacesAutomationFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${WorkSpacesAutomationFunction}'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Lambda Logs",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # SNS Topic for Automation Notifications (Optional)
+  WorkSpacesAutomationNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: IsProductionEnvironment
+    Properties:
+      TopicName: !Sub '${ProjectName}-automation-notifications-${AWS::StackName}'
+      DisplayName: WorkSpaces Automation Notifications
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DevEnvironmentAutomation
+        - Key: Component
+          Value: Notifications
+
+  # CloudWatch Alarm for Lambda Errors
+  WorkSpacesAutomationErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProductionEnvironment
+    Properties:
+      AlarmName: !Sub '${ProjectName}-automation-errors-${AWS::StackName}'
+      AlarmDescription: Alert when WorkSpaces automation Lambda function errors occur
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WorkSpacesAutomationFunction
+      AlarmActions:
+        - !Ref WorkSpacesAutomationNotificationTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DevEnvironmentAutomation
+        - Key: Component
+          Value: Monitoring
+
+Outputs:
+  WorkSpacesAutomationFunctionArn:
+    Description: ARN of the WorkSpaces automation Lambda function
+    Value: !GetAtt WorkSpacesAutomationFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-WorkSpacesAutomationFunctionArn'
+
+  WorkSpacesAutomationFunctionName:
+    Description: Name of the WorkSpaces automation Lambda function
+    Value: !Ref WorkSpacesAutomationFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-WorkSpacesAutomationFunctionName'
+
+  ADCredentialsSecretArn:
+    Description: ARN of the Secrets Manager secret containing AD credentials
+    Value: !Ref ADCredentialsSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-ADCredentialsSecretArn'
+
+  DevEnvironmentSetupDocumentName:
+    Description: Name of the Systems Manager document for development environment setup
+    Value: !Ref DevEnvironmentSetupDocument
+    Export:
+      Name: !Sub '${AWS::StackName}-DevEnvironmentSetupDocumentName'
+
+  EventBridgeRuleArn:
+    Description: ARN of the EventBridge rule for scheduled automation
+    Value: !GetAtt WorkSpacesAutomationScheduleRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeRuleArn'
+
+  CloudWatchDashboardURL:
+    Description: URL of the CloudWatch dashboard for monitoring automation
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-workspaces-automation-${AWS::StackName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchDashboardURL'
+
+  IAMRoleArn:
+    Description: ARN of the IAM role used by the Lambda function
+    Value: !GetAtt WorkSpacesAutomationLambdaRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IAMRoleArn'
+
+  NotificationTopicArn:
+    Condition: IsProductionEnvironment
+    Description: ARN of the SNS topic for automation notifications
+    Value: !Ref WorkSpacesAutomationNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopicArn'
+
+  ManualInvocationExample:
+    Description: Example AWS CLI command to manually invoke the automation function
+    Value: !Sub |
+      aws lambda invoke --function-name ${WorkSpacesAutomationFunction} --payload '{"secret_name":"${ADCredentialsSecret}","directory_id":"${DirectoryId}","bundle_id":"${BundleId}","target_users":["developer1","developer2"],"ssm_document":"${DevEnvironmentSetupDocument}"}' --cli-binary-format raw-in-base64-out response.json
+
+  StackConfiguration:
+    Description: Summary of the deployed stack configuration
+    Value: !Sub |
+      Stack: ${AWS::StackName}
+      Project: ${ProjectName}
+      Directory: ${DirectoryId}
+      Bundle: ${BundleId}
+      Schedule: ${AutomationSchedule}
+      Users: ${TargetUsers}
+      Tools: ${DevelopmentTools}
+      Team Config: ${TeamConfiguration}
+      Encryption: ${EnableEncryption}

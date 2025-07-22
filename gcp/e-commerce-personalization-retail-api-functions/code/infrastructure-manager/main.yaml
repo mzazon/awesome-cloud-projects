@@ -1,0 +1,466 @@
+# Infrastructure Manager Configuration for E-commerce Personalization
+# This configuration deploys a complete e-commerce personalization solution
+# using Google Cloud Vertex AI Search for Commerce (Retail API), Cloud Functions,
+# Cloud Firestore, and Cloud Storage.
+
+# Template metadata
+metadata:
+  name: ecommerce-personalization-infrastructure
+  description: "Complete e-commerce personalization infrastructure using Retail API and Cloud Functions"
+  version: "1.0.0"
+  labels:
+    recipe-id: "f8e2d1c3"
+    category: "machine-learning"
+    difficulty: "200"
+
+# Input parameters for customization
+parameters:
+  project_id:
+    type: string
+    description: "Google Cloud project ID"
+    required: true
+  
+  region:
+    type: string
+    description: "Google Cloud region for resource deployment"
+    default: "us-central1"
+    
+  bucket_name_suffix:
+    type: string
+    description: "Suffix for Cloud Storage bucket name (must be globally unique)"
+    default: "personalization"
+    
+  environment:
+    type: string
+    description: "Environment name (dev, staging, prod)"
+    default: "dev"
+    
+  enable_cors:
+    type: boolean
+    description: "Enable CORS for Cloud Functions"
+    default: true
+
+# Resource definitions
+resources:
+  # Enable required APIs
+  - name: retail-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/{{ parameters.project_id }}/services/retail.googleapis.com
+      
+  - name: functions-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/{{ parameters.project_id }}/services/cloudfunctions.googleapis.com
+      
+  - name: firestore-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/{{ parameters.project_id }}/services/firestore.googleapis.com
+      
+  - name: storage-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/{{ parameters.project_id }}/services/storage.googleapis.com
+      
+  - name: cloudbuild-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/{{ parameters.project_id }}/services/cloudbuild.googleapis.com
+      
+  - name: run-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/{{ parameters.project_id }}/services/run.googleapis.com
+
+  # Cloud Storage bucket for product catalog data
+  - name: product-catalog-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: "{{ parameters.project_id }}-product-catalog-{{ parameters.bucket_name_suffix }}"
+      location: "{{ parameters.region | upper }}"
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30  # Delete objects older than 30 days
+              isLive: false
+      labels:
+        purpose: "product-catalog"
+        environment: "{{ parameters.environment }}"
+        recipe-id: "f8e2d1c3"
+    depends_on:
+      - storage-api
+
+  # Cloud Storage bucket for Cloud Functions source code
+  - name: functions-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: "{{ parameters.project_id }}-functions-source-{{ parameters.bucket_name_suffix }}"
+      location: "{{ parameters.region | upper }}"
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      labels:
+        purpose: "functions-source"
+        environment: "{{ parameters.environment }}"
+        recipe-id: "f8e2d1c3"
+    depends_on:
+      - storage-api
+
+  # Initialize Firestore database in native mode
+  - name: firestore-database
+    type: gcp-types/firestore-v1:projects.databases
+    properties:
+      parent: "projects/{{ parameters.project_id }}"
+      databaseId: "(default)"
+      type: FIRESTORE_NATIVE
+      locationId: "{{ parameters.region }}"
+      appEngineIntegrationMode: DISABLED
+      concurrencyMode: OPTIMISTIC
+      pointInTimeRecoveryEnablement: POINT_IN_TIME_RECOVERY_ENABLED
+    depends_on:
+      - firestore-api
+
+  # IAM Service Account for Cloud Functions
+  - name: functions-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: "ecommerce-functions-sa"
+      displayName: "E-commerce Personalization Functions Service Account"
+      description: "Service account for Cloud Functions in e-commerce personalization solution"
+      parent: "projects/{{ parameters.project_id }}"
+    depends_on:
+      - functions-api
+
+  # IAM bindings for the service account
+  - name: functions-sa-retail-user
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMember
+    properties:
+      resource: "{{ parameters.project_id }}"
+      member: "serviceAccount:{{ functions-service-account.email }}"
+      role: "roles/retail.user"
+    depends_on:
+      - functions-service-account
+      - retail-api
+
+  - name: functions-sa-firestore-user
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMember
+    properties:
+      resource: "{{ parameters.project_id }}"
+      member: "serviceAccount:{{ functions-service-account.email }}"
+      role: "roles/datastore.user"
+    depends_on:
+      - functions-service-account
+      - firestore-database
+
+  - name: functions-sa-storage-objectviewer
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMember
+    properties:
+      resource: "{{ parameters.project_id }}"
+      member: "serviceAccount:{{ functions-service-account.email }}"
+      role: "roles/storage.objectViewer"
+    depends_on:
+      - functions-service-account
+      - product-catalog-bucket
+
+  # Cloud Function for Catalog Sync
+  - name: catalog-sync-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: "projects/{{ parameters.project_id }}/locations/{{ parameters.region }}"
+      name: "catalog-sync"
+      description: "Function to synchronize product catalog with Retail API"
+      sourceArchiveUrl: "gs://{{ functions-source-bucket.name }}/catalog-sync.zip"
+      entryPoint: "syncCatalog"
+      runtime: "nodejs20"
+      timeout: "540s"
+      availableMemoryMb: 512
+      serviceAccountEmail: "{{ functions-service-account.email }}"
+      environmentVariables:
+        PROJECT_ID: "{{ parameters.project_id }}"
+        CATALOG_NAME: "projects/{{ parameters.project_id }}/locations/global/catalogs/default_catalog"
+        BRANCH_NAME: "projects/{{ parameters.project_id }}/locations/global/catalogs/default_catalog/branches/default_branch"
+      httpsTrigger:
+        securityLevel: SECURE_ALWAYS
+      labels:
+        purpose: "catalog-sync"
+        environment: "{{ parameters.environment }}"
+        recipe-id: "f8e2d1c3"
+    depends_on:
+      - functions-api
+      - functions-service-account
+      - functions-sa-retail-user
+      - functions-source-bucket
+
+  # Cloud Function for User Event Tracking
+  - name: user-events-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: "projects/{{ parameters.project_id }}/locations/{{ parameters.region }}"
+      name: "track-user-events"
+      description: "Function to track user events and update user profiles"
+      sourceArchiveUrl: "gs://{{ functions-source-bucket.name }}/user-events.zip"
+      entryPoint: "trackEvent"
+      runtime: "nodejs20"
+      timeout: "540s"
+      availableMemoryMb: 512
+      serviceAccountEmail: "{{ functions-service-account.email }}"
+      environmentVariables:
+        PROJECT_ID: "{{ parameters.project_id }}"
+        CATALOG_NAME: "projects/{{ parameters.project_id }}/locations/global/catalogs/default_catalog"
+        FIRESTORE_DATABASE: "(default)"
+      httpsTrigger:
+        securityLevel: SECURE_ALWAYS
+      labels:
+        purpose: "user-events"
+        environment: "{{ parameters.environment }}"
+        recipe-id: "f8e2d1c3"
+    depends_on:
+      - functions-api
+      - functions-service-account
+      - functions-sa-retail-user
+      - functions-sa-firestore-user
+      - functions-source-bucket
+
+  # Cloud Function for Recommendations
+  - name: recommendations-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: "projects/{{ parameters.project_id }}/locations/{{ parameters.region }}"
+      name: "get-recommendations"
+      description: "Function to generate personalized product recommendations"
+      sourceArchiveUrl: "gs://{{ functions-source-bucket.name }}/recommendations.zip"
+      entryPoint: "getRecommendations"
+      runtime: "nodejs20"
+      timeout: "540s"
+      availableMemoryMb: 1024  # Higher memory for ML inference
+      serviceAccountEmail: "{{ functions-service-account.email }}"
+      environmentVariables:
+        PROJECT_ID: "{{ parameters.project_id }}"
+        CATALOG_NAME: "projects/{{ parameters.project_id }}/locations/global/catalogs/default_catalog"
+        FIRESTORE_DATABASE: "(default)"
+      httpsTrigger:
+        securityLevel: SECURE_ALWAYS
+      labels:
+        purpose: "recommendations"
+        environment: "{{ parameters.environment }}"
+        recipe-id: "f8e2d1c3"
+    depends_on:
+      - functions-api
+      - functions-service-account
+      - functions-sa-retail-user
+      - functions-sa-firestore-user
+      - functions-source-bucket
+
+  # IAM policy to allow unauthenticated access to Cloud Functions (for demo purposes)
+  # Note: In production, you should implement proper authentication
+  - name: catalog-sync-invoker
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions.iamMember
+    properties:
+      resource: "{{ catalog-sync-function.name }}"
+      member: "allUsers"
+      role: "roles/cloudfunctions.invoker"
+    depends_on:
+      - catalog-sync-function
+
+  - name: user-events-invoker
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions.iamMember
+    properties:
+      resource: "{{ user-events-function.name }}"
+      member: "allUsers"
+      role: "roles/cloudfunctions.invoker"
+    depends_on:
+      - user-events-function
+
+  - name: recommendations-invoker
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions.iamMember
+    properties:
+      resource: "{{ recommendations-function.name }}"
+      member: "allUsers"
+      role: "roles/cloudfunctions.invoker"
+    depends_on:
+      - recommendations-function
+
+  # Cloud Storage bucket for storing user event logs (optional)
+  - name: event-logs-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: "{{ parameters.project_id }}-event-logs-{{ parameters.bucket_name_suffix }}"
+      location: "{{ parameters.region | upper }}"
+      storageClass: NEARLINE  # Cost-effective for archival
+      uniformBucketLevelAccess:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 30  # Move to COLDLINE after 30 days
+          - action:
+              type: Delete
+            condition:
+              age: 365  # Delete after 1 year
+      labels:
+        purpose: "event-logs"
+        environment: "{{ parameters.environment }}"
+        recipe-id: "f8e2d1c3"
+    depends_on:
+      - storage-api
+
+  # Cloud Monitoring notification channel for alerts (optional)
+  - name: email-notification-channel
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      parent: "projects/{{ parameters.project_id }}"
+      type: "email"
+      displayName: "E-commerce Personalization Alerts"
+      description: "Email notifications for e-commerce personalization system"
+      labels:
+        email_address: "admin@example.com"  # Replace with actual email
+      enabled: true
+    depends_on:
+      - functions-api
+
+  # Cloud Monitoring alert policy for function errors
+  - name: function-error-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: "projects/{{ parameters.project_id }}"
+      displayName: "Cloud Function Error Rate Alert"
+      documentation:
+        content: "Alert when Cloud Functions error rate exceeds threshold"
+        mimeType: "text/markdown"
+      combiner: OR
+      conditions:
+        - displayName: "High error rate"
+          conditionThreshold:
+            filter: 'resource.type="cloud_function" AND metric.type="cloudfunctions.googleapis.com/function/execution_count"'
+            aggregations:
+              - alignmentPeriod: "300s"
+                perSeriesAligner: "ALIGN_RATE"
+                crossSeriesReducer: "REDUCE_SUM"
+                groupByFields:
+                  - "resource.label.function_name"
+            comparison: "COMPARISON_GREATER_THAN"
+            thresholdValue: 0.1  # 10% error rate
+            duration: "300s"
+      notificationChannels:
+        - "{{ email-notification-channel.name }}"
+      alertStrategy:
+        autoClose: "86400s"  # 24 hours
+    depends_on:
+      - email-notification-channel
+      - catalog-sync-function
+      - user-events-function
+      - recommendations-function
+
+# Output values for reference and integration
+outputs:
+  project_id:
+    description: "Google Cloud project ID"
+    value: "{{ parameters.project_id }}"
+    
+  region:
+    description: "Deployment region"
+    value: "{{ parameters.region }}"
+    
+  product_catalog_bucket:
+    description: "Cloud Storage bucket for product catalog"
+    value: "{{ product-catalog-bucket.name }}"
+    
+  functions_source_bucket:
+    description: "Cloud Storage bucket for function source code"
+    value: "{{ functions-source-bucket.name }}"
+    
+  event_logs_bucket:
+    description: "Cloud Storage bucket for event logs"
+    value: "{{ event-logs-bucket.name }}"
+    
+  firestore_database:
+    description: "Firestore database ID"
+    value: "{{ firestore-database.name }}"
+    
+  catalog_sync_function_url:
+    description: "URL for the catalog sync Cloud Function"
+    value: "{{ catalog-sync-function.httpsTrigger.url }}"
+    
+  user_events_function_url:
+    description: "URL for the user events tracking Cloud Function"
+    value: "{{ user-events-function.httpsTrigger.url }}"
+    
+  recommendations_function_url:
+    description: "URL for the recommendations Cloud Function"
+    value: "{{ recommendations-function.httpsTrigger.url }}"
+    
+  service_account_email:
+    description: "Service account email for Cloud Functions"
+    value: "{{ functions-service-account.email }}"
+    
+  retail_catalog_name:
+    description: "Full name of the Retail API catalog"
+    value: "projects/{{ parameters.project_id }}/locations/global/catalogs/default_catalog"
+    
+  retail_branch_name:
+    description: "Full name of the Retail API branch"
+    value: "projects/{{ parameters.project_id }}/locations/global/catalogs/default_catalog/branches/default_branch"
+
+# Deployment configuration
+deployment:
+  # Preview mode for testing
+  preview: false
+  
+  # Automatic rollback on failure
+  rollback_on_failure: true
+  
+  # Timeout for deployment operations
+  timeout: "30m"
+  
+  # Labels for deployment tracking
+  labels:
+    recipe-id: "f8e2d1c3"
+    category: "machine-learning"
+    environment: "{{ parameters.environment }}"
+    
+# Resource quotas and limits
+quotas:
+  # Maximum number of Cloud Functions
+  max_functions: 10
+  
+  # Maximum memory per function
+  max_memory_mb: 2048
+  
+  # Maximum timeout per function
+  max_timeout_seconds: 540
+  
+  # Maximum storage buckets
+  max_buckets: 5
+
+# Security and compliance settings
+security:
+  # Require HTTPS for all functions
+  require_https: true
+  
+  # Enable uniform bucket-level access
+  uniform_bucket_access: true
+  
+  # Enable audit logging
+  audit_logging: true
+  
+  # Encryption at rest (Google-managed keys)
+  encryption: "google_managed"
+  
+  # Network security
+  network_policy:
+    # Allow only HTTPS traffic
+    ingress: "https_only"
+    
+    # Restrict egress to Google APIs
+    egress: "google_apis_only"

@@ -1,0 +1,612 @@
+# Infrastructure Manager Configuration for Cost Optimization with Cloud Billing API and Cloud Functions
+# This configuration deploys a complete FinOps solution for automated cost monitoring and optimization
+
+# Metadata and configuration
+metadata:
+  name: infrastructure-cost-optimization
+  description: "Automated cost optimization system using Cloud Billing API, Cloud Functions, and BigQuery"
+  labels:
+    environment: production
+    solution: finops
+    cost-center: infrastructure
+    managed-by: infrastructure-manager
+
+# Input parameters for customization
+imports:
+  - name: project_id
+    description: "Google Cloud Project ID"
+    type: string
+    required: true
+  
+  - name: billing_account_id
+    description: "Cloud Billing Account ID"
+    type: string
+    required: true
+  
+  - name: region
+    description: "Primary deployment region"
+    type: string
+    default: "us-central1"
+  
+  - name: dataset_location
+    description: "BigQuery dataset location"
+    type: string
+    default: "US"
+  
+  - name: budget_amount
+    description: "Monthly budget amount in USD"
+    type: integer
+    default: 1000
+  
+  - name: function_memory
+    description: "Memory allocation for Cloud Functions (MB)"
+    type: integer
+    default: 512
+  
+  - name: function_timeout
+    description: "Timeout for Cloud Functions (seconds)"
+    type: integer
+    default: 540
+  
+  - name: environment_suffix
+    description: "Suffix for resource naming to ensure uniqueness"
+    type: string
+    default: "prod"
+
+# Required Google Cloud APIs
+resources:
+  # Enable required APIs for the cost optimization solution
+  - name: enable-billing-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/cloudbilling.googleapis.com
+      
+  - name: enable-functions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/cloudfunctions.googleapis.com
+      
+  - name: enable-bigquery-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/bigquery.googleapis.com
+      
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/monitoring.googleapis.com
+      
+  - name: enable-pubsub-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/pubsub.googleapis.com
+      
+  - name: enable-scheduler-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/cloudscheduler.googleapis.com
+
+  # BigQuery dataset for cost analytics and optimization data
+  - name: cost-optimization-dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      datasetId: cost_optimization_$(ref.environment_suffix)
+      projectId: $(ref.project_id)
+      location: $(ref.dataset_location)
+      description: "Dataset for cost optimization analytics, billing data, and anomaly tracking"
+      labels:
+        environment: $(ref.environment_suffix)
+        purpose: cost-optimization
+        data-classification: financial
+      access:
+        - role: OWNER
+          userByEmail: $(ref.project_id.projectId)@$(ref.project_id.projectId).iam.gserviceaccount.com
+        - role: READER
+          specialGroup: projectReaders
+        - role: WRITER
+          specialGroup: projectWriters
+      defaultTableExpirationMs: 2592000000  # 30 days
+    depends-on:
+      - enable-bigquery-api
+
+  # Cost anomalies tracking table
+  - name: cost-anomalies-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: $(ref.project_id)
+      datasetId: $(ref.cost-optimization-dataset.datasetId)
+      tableId: cost_anomalies
+      description: "Table for tracking detected cost anomalies and deviations"
+      schema:
+        fields:
+          - name: detection_date
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "Timestamp when anomaly was detected"
+          - name: project_id
+            type: STRING
+            mode: REQUIRED
+            description: "Google Cloud Project ID where anomaly occurred"
+          - name: service
+            type: STRING
+            mode: REQUIRED
+            description: "Google Cloud service name"
+          - name: expected_cost
+            type: FLOAT
+            mode: REQUIRED
+            description: "Expected cost based on historical patterns"
+          - name: actual_cost
+            type: FLOAT
+            mode: REQUIRED
+            description: "Actual observed cost"
+          - name: deviation_percent
+            type: FLOAT
+            mode: REQUIRED
+            description: "Percentage deviation from expected cost"
+          - name: anomaly_type
+            type: STRING
+            mode: REQUIRED
+            description: "Type of anomaly detected (statistical, threshold, etc.)"
+      labels:
+        environment: $(ref.environment_suffix)
+        table-type: anomaly-tracking
+    depends-on:
+      - cost-optimization-dataset
+
+  # Optimization recommendations table
+  - name: optimization-recommendations-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: $(ref.project_id)
+      datasetId: $(ref.cost-optimization-dataset.datasetId)
+      tableId: optimization_recommendations
+      description: "Table for storing resource optimization recommendations"
+      schema:
+        fields:
+          - name: recommendation_date
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "Timestamp when recommendation was generated"
+          - name: resource_type
+            type: STRING
+            mode: REQUIRED
+            description: "Type of resource (compute, storage, network)"
+          - name: resource_id
+            type: STRING
+            mode: REQUIRED
+            description: "Unique identifier for the resource"
+          - name: current_cost
+            type: FLOAT
+            mode: REQUIRED
+            description: "Current monthly cost of the resource"
+          - name: recommended_action
+            type: STRING
+            mode: REQUIRED
+            description: "Recommended optimization action"
+          - name: potential_savings
+            type: FLOAT
+            mode: REQUIRED
+            description: "Estimated monthly savings if implemented"
+          - name: implementation_effort
+            type: STRING
+            mode: REQUIRED
+            description: "Effort level required (low, medium, high)"
+          - name: status
+            type: STRING
+            mode: REQUIRED
+            description: "Implementation status (pending, implemented, rejected)"
+      labels:
+        environment: $(ref.environment_suffix)
+        table-type: recommendations
+    depends-on:
+      - cost-optimization-dataset
+
+  # Pub/Sub topic for cost optimization alerts and events
+  - name: cost-optimization-alerts-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project_id)/topics/cost-optimization-alerts-$(ref.environment_suffix)
+      labels:
+        environment: $(ref.environment_suffix)
+        purpose: cost-alerts
+      messageStoragePolicy:
+        allowedPersistenceRegions:
+          - $(ref.region)
+    depends-on:
+      - enable-pubsub-api
+
+  # Pub/Sub subscription for budget alerts
+  - name: budget-alerts-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(ref.project_id)/subscriptions/budget-alerts-sub-$(ref.environment_suffix)
+      topic: $(ref.cost-optimization-alerts-topic.name)
+      labels:
+        environment: $(ref.environment_suffix)
+        subscription-type: budget-alerts
+      ackDeadlineSeconds: 600
+      messageRetentionDuration: 604800s  # 7 days
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+    depends-on:
+      - cost-optimization-alerts-topic
+
+  # Pub/Sub subscription for anomaly detection
+  - name: anomaly-detection-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(ref.project_id)/subscriptions/anomaly-detection-sub-$(ref.environment_suffix)
+      topic: $(ref.cost-optimization-alerts-topic.name)
+      labels:
+        environment: $(ref.environment_suffix)
+        subscription-type: anomaly-detection
+      ackDeadlineSeconds: 600
+      messageRetentionDuration: 604800s  # 7 days
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+    depends-on:
+      - cost-optimization-alerts-topic
+
+  # Cloud Storage bucket for function source code
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: cost-optimization-functions-$(ref.project_id)-$(ref.environment_suffix)
+      location: $(ref.region)
+      storageClass: REGIONAL
+      labels:
+        environment: $(ref.environment_suffix)
+        purpose: function-source
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90  # Delete objects after 90 days
+              numNewerVersions: 5
+      uniformBucketLevelAccess:
+        enabled: true
+
+  # Service account for Cloud Functions with least privilege access
+  - name: cost-optimization-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: cost-optimization-sa-$(ref.environment_suffix)
+      displayName: "Cost Optimization Service Account"
+      description: "Service account for cost optimization Cloud Functions with minimal required permissions"
+      projectId: $(ref.project_id)
+
+  # IAM bindings for service account with least privilege principle
+  - name: bigquery-data-editor-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/bigquery.dataEditor
+      member: serviceAccount:$(ref.cost-optimization-service-account.email)
+
+  - name: bigquery-job-user-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/bigquery.jobUser
+      member: serviceAccount:$(ref.cost-optimization-service-account.email)
+
+  - name: billing-viewer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/billing.viewer
+      member: serviceAccount:$(ref.cost-optimization-service-account.email)
+
+  - name: pubsub-publisher-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/pubsub.publisher
+      member: serviceAccount:$(ref.cost-optimization-service-account.email)
+
+  - name: monitoring-metric-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/monitoring.metricWriter
+      member: serviceAccount:$(ref.cost-optimization-service-account.email)
+
+  # Cost Analysis Cloud Function
+  - name: cost-analysis-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project_id)/locations/$(ref.region)
+      functionId: cost-analysis-$(ref.environment_suffix)
+      description: "Analyzes cost trends and generates optimization recommendations"
+      sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/cost-analysis-source.zip
+      entryPoint: analyze_costs
+      runtime: python311
+      timeout: $(ref.function_timeout)s
+      availableMemoryMb: $(ref.function_memory)
+      serviceAccountEmail: $(ref.cost-optimization-service-account.email)
+      httpsTrigger: {}
+      environmentVariables:
+        DATASET_NAME: $(ref.cost-optimization-dataset.datasetId)
+        PROJECT_ID: $(ref.project_id)
+        ENVIRONMENT: $(ref.environment_suffix)
+      labels:
+        environment: $(ref.environment_suffix)
+        function-type: cost-analysis
+        deployment-tool: infrastructure-manager
+    depends-on:
+      - enable-functions-api
+      - function-source-bucket
+      - cost-optimization-service-account
+      - cost-optimization-dataset
+
+  # Anomaly Detection Cloud Function
+  - name: anomaly-detection-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project_id)/locations/$(ref.region)
+      functionId: anomaly-detection-$(ref.environment_suffix)
+      description: "Detects cost anomalies using statistical analysis and machine learning"
+      sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/anomaly-detection-source.zip
+      entryPoint: detect_anomalies
+      runtime: python311
+      timeout: $(ref.function_timeout)s
+      availableMemoryMb: $(ref.function_memory)
+      serviceAccountEmail: $(ref.cost-optimization-service-account.email)
+      eventTrigger:
+        eventType: providers/cloud.pubsub/eventTypes/topic.publish
+        resource: $(ref.cost-optimization-alerts-topic.name)
+      environmentVariables:
+        DATASET_NAME: $(ref.cost-optimization-dataset.datasetId)
+        PROJECT_ID: $(ref.project_id)
+        ENVIRONMENT: $(ref.environment_suffix)
+        TOPIC_NAME: cost-optimization-alerts-$(ref.environment_suffix)
+      labels:
+        environment: $(ref.environment_suffix)
+        function-type: anomaly-detection
+        deployment-tool: infrastructure-manager
+    depends-on:
+      - enable-functions-api
+      - function-source-bucket
+      - cost-optimization-service-account
+      - cost-optimization-alerts-topic
+      - cost-anomalies-table
+
+  # Resource Optimization Cloud Function
+  - name: resource-optimization-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project_id)/locations/$(ref.region)
+      functionId: resource-optimization-$(ref.environment_suffix)
+      description: "Generates intelligent resource optimization recommendations"
+      sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/resource-optimization-source.zip
+      entryPoint: optimize_resources
+      runtime: python311
+      timeout: $(ref.function_timeout)s
+      availableMemoryMb: $(ref.function_memory)
+      serviceAccountEmail: $(ref.cost-optimization-service-account.email)
+      httpsTrigger: {}
+      environmentVariables:
+        DATASET_NAME: $(ref.cost-optimization-dataset.datasetId)
+        PROJECT_ID: $(ref.project_id)
+        ENVIRONMENT: $(ref.environment_suffix)
+      labels:
+        environment: $(ref.environment_suffix)
+        function-type: resource-optimization
+        deployment-tool: infrastructure-manager
+    depends-on:
+      - enable-functions-api
+      - function-source-bucket
+      - cost-optimization-service-account
+      - optimization-recommendations-table
+
+  # Cloud Scheduler job for automated cost analysis
+  - name: cost-analysis-scheduler
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      name: projects/$(ref.project_id)/locations/$(ref.region)/jobs/cost-analysis-daily-$(ref.environment_suffix)
+      description: "Daily automated cost analysis and trend monitoring"
+      schedule: "0 9 * * *"  # Daily at 9 AM UTC
+      timeZone: "UTC"
+      httpTarget:
+        uri: $(ref.cost-analysis-function.httpsTrigger.url)
+        httpMethod: GET
+        headers:
+          Content-Type: application/json
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 300s
+        minBackoffDuration: 5s
+        maxBackoffDuration: 30s
+    depends-on:
+      - enable-scheduler-api
+      - cost-analysis-function
+
+  # Cloud Scheduler job for weekly optimization analysis
+  - name: optimization-scheduler
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      name: projects/$(ref.project_id)/locations/$(ref.region)/jobs/optimization-weekly-$(ref.environment_suffix)
+      description: "Weekly resource optimization analysis and recommendations"
+      schedule: "0 9 * * 1"  # Weekly on Monday at 9 AM UTC
+      timeZone: "UTC"
+      httpTarget:
+        uri: $(ref.resource-optimization-function.httpsTrigger.url)
+        httpMethod: GET
+        headers:
+          Content-Type: application/json
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 300s
+        minBackoffDuration: 5s
+        maxBackoffDuration: 30s
+    depends-on:
+      - enable-scheduler-api
+      - resource-optimization-function
+
+  # Cloud Monitoring alert policy for high cost anomalies
+  - name: high-cost-anomaly-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: "High Cost Anomaly Detection - $(ref.environment_suffix)"
+      documentation:
+        content: "Alert triggered when cost anomalies exceed critical thresholds. This indicates potential security issues, misconfigurations, or unexpected usage spikes that require immediate attention."
+        mimeType: text/markdown
+      conditions:
+        - displayName: "Cost Anomaly Threshold Exceeded"
+          conditionThreshold:
+            filter: 'resource.type="gce_instance" metric.type="compute.googleapis.com/instance/cpu/utilization"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 0.8
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_MEAN
+                groupByFields:
+                  - project
+                  - resource.label.instance_id
+      combiner: OR
+      enabled: true
+      notificationChannels: []
+      alertStrategy:
+        autoClose: 86400s  # 24 hours
+    depends-on:
+      - enable-monitoring-api
+
+  # Cloud Monitoring dashboard for cost optimization metrics
+  - name: cost-optimization-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      displayName: "Cost Optimization Dashboard - $(ref.environment_suffix)"
+      mosaicLayout:
+        tiles:
+          - width: 6
+            height: 4
+            widget:
+              title: "Daily Cost Trends"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'metric.type="billing.googleapis.com/billing/total_cost"'
+                        aggregation:
+                          alignmentPeriod: 86400s
+                          perSeriesAligner: ALIGN_SUM
+                          crossSeriesReducer: REDUCE_SUM
+                    plotType: LINE
+                timeshiftDuration: 0s
+                yAxis:
+                  label: "Cost (USD)"
+                  scale: LINEAR
+          - width: 6
+            height: 4
+            xPos: 6
+            widget:
+              title: "Cost Anomalies Detected"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="bigquery_table" metric.type="bigquery.googleapis.com/table/uploaded_bytes"'
+                        aggregation:
+                          alignmentPeriod: 3600s
+                          perSeriesAligner: ALIGN_RATE
+                          crossSeriesReducer: REDUCE_SUM
+                    plotType: STACKED_BAR
+          - width: 12
+            height: 4
+            yPos: 4
+            widget:
+              title: "Optimization Savings Potential"
+              scorecard:
+                timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'metric.type="custom.googleapis.com/cost_optimization/potential_savings"'
+                    aggregation:
+                      alignmentPeriod: 86400s
+                      perSeriesAligner: ALIGN_MEAN
+                sparkChartView:
+                  sparkChartType: SPARK_LINE
+                thresholds:
+                  - value: 1000.0
+                    color: GREEN
+                    direction: DIRECTION_ABOVE
+                  - value: 5000.0
+                    color: YELLOW
+                    direction: DIRECTION_ABOVE
+                  - value: 10000.0
+                    color: RED
+                    direction: DIRECTION_ABOVE
+      labels:
+        environment: $(ref.environment_suffix)
+        dashboard-type: cost-optimization
+    depends-on:
+      - enable-monitoring-api
+
+# Outputs for integration and verification
+outputs:
+  - name: dataset_id
+    description: "BigQuery dataset ID for cost optimization data"
+    value: $(ref.cost-optimization-dataset.datasetId)
+    
+  - name: pubsub_topic_name
+    description: "Pub/Sub topic name for cost optimization alerts"
+    value: $(ref.cost-optimization-alerts-topic.name)
+    
+  - name: cost_analysis_function_url
+    description: "HTTP trigger URL for cost analysis function"
+    value: $(ref.cost-analysis-function.httpsTrigger.url)
+    
+  - name: resource_optimization_function_url
+    description: "HTTP trigger URL for resource optimization function"
+    value: $(ref.resource-optimization-function.httpsTrigger.url)
+    
+  - name: service_account_email
+    description: "Service account email for cost optimization functions"
+    value: $(ref.cost-optimization-service-account.email)
+    
+  - name: storage_bucket_name
+    description: "Cloud Storage bucket name for function source code"
+    value: $(ref.function-source-bucket.name)
+    
+  - name: dashboard_url
+    description: "Cloud Monitoring dashboard URL for cost optimization metrics"
+    value: https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.cost-optimization-dashboard.name)
+    
+  - name: bigquery_tables
+    description: "BigQuery tables created for cost optimization tracking"
+    value:
+      - $(ref.cost-optimization-dataset.datasetId).cost_anomalies
+      - $(ref.cost-optimization-dataset.datasetId).optimization_recommendations
+      
+  - name: scheduler_jobs
+    description: "Cloud Scheduler jobs for automated cost optimization"
+    value:
+      - cost-analysis-daily-$(ref.environment_suffix)
+      - optimization-weekly-$(ref.environment_suffix)
+      
+  - name: deployment_summary
+    description: "Summary of deployed cost optimization infrastructure"
+    value:
+      functions_deployed: 3
+      bigquery_tables: 2
+      pubsub_topics: 1
+      pubsub_subscriptions: 2
+      scheduler_jobs: 2
+      monitoring_alerts: 1
+      monitoring_dashboards: 1
+      service_accounts: 1
+      
+  - name: next_steps
+    description: "Post-deployment configuration steps"
+    value:
+      - "Upload function source code to Cloud Storage bucket"
+      - "Configure billing export to BigQuery dataset"
+      - "Set up budget alerts with Pub/Sub notifications"
+      - "Customize monitoring thresholds based on usage patterns"
+      - "Review and adjust optimization recommendation parameters"

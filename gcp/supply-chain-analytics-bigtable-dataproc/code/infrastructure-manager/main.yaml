@@ -1,0 +1,591 @@
+# Infrastructure Manager Configuration for Supply Chain Analytics
+# This configuration deploys Cloud Bigtable, Cloud Dataproc, and supporting services
+# for real-time supply chain analytics with batch processing capabilities
+
+metadata:
+  # Version and compatibility information
+  version: "1.0"
+  description: "Supply Chain Analytics Platform with Cloud Bigtable and Cloud Dataproc"
+  author: "Generated from Recipe ID: d7e4f2a8"
+  created: "2025-07-12"
+
+# Import required templates and modules
+imports:
+  - path: "https://www.googleapis.com/deploymentmanager/v2/types/bigtable.v2.instance"
+    name: bigtable-instance.jinja
+  - path: "https://www.googleapis.com/deploymentmanager/v2/types/dataproc.v1.cluster"
+    name: dataproc-cluster.jinja
+  - path: "https://www.googleapis.com/deploymentmanager/v2/types/storage.v1.bucket"
+    name: storage-bucket.jinja
+  - path: "https://www.googleapis.com/deploymentmanager/v2/types/pubsub.v1.topic"
+    name: pubsub-topic.jinja
+  - path: "https://www.googleapis.com/deploymentmanager/v2/types/cloudfunctions.v1.function"
+    name: cloud-function.jinja
+
+resources:
+  # ============================================================================
+  # PROJECT SERVICES - Enable required APIs
+  # ============================================================================
+  
+  - name: enable-bigtable-api
+    type: deploymentmanager.v2.virtual.enableService
+    properties:
+      consumerId: projects/{{ env["project"] }}
+      serviceName: bigtable.googleapis.com
+
+  - name: enable-dataproc-api
+    type: deploymentmanager.v2.virtual.enableService
+    properties:
+      consumerId: projects/{{ env["project"] }}
+      serviceName: dataproc.googleapis.com
+
+  - name: enable-pubsub-api
+    type: deploymentmanager.v2.virtual.enableService
+    properties:
+      consumerId: projects/{{ env["project"] }}
+      serviceName: pubsub.googleapis.com
+
+  - name: enable-functions-api
+    type: deploymentmanager.v2.virtual.enableService
+    properties:
+      consumerId: projects/{{ env["project"] }}
+      serviceName: cloudfunctions.googleapis.com
+
+  - name: enable-monitoring-api
+    type: deploymentmanager.v2.virtual.enableService
+    properties:
+      consumerId: projects/{{ env["project"] }}
+      serviceName: monitoring.googleapis.com
+
+  - name: enable-storage-api
+    type: deploymentmanager.v2.virtual.enableService
+    properties:
+      consumerId: projects/{{ env["project"] }}
+      serviceName: storage.googleapis.com
+
+  - name: enable-scheduler-api
+    type: deploymentmanager.v2.virtual.enableService
+    properties:
+      consumerId: projects/{{ env["project"] }}
+      serviceName: cloudscheduler.googleapis.com
+
+  # ============================================================================
+  # CLOUD STORAGE - Data processing and job storage
+  # ============================================================================
+  
+  - name: supply-chain-data-bucket
+    type: storage.v1.bucket
+    properties:
+      # Generate unique bucket name using deployment suffix
+      name: supply-chain-data-{{ env["deployment"] }}-{{ env["project_number"] }}
+      location: US-CENTRAL1
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 365  # Delete objects older than 1 year
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30   # Move to nearline after 30 days
+      uniformBucketLevelAccess:
+        enabled: true
+      labels:
+        environment: production
+        purpose: supply-chain-analytics
+        component: data-storage
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # ============================================================================
+  # PUB/SUB TOPIC - IoT sensor data ingestion
+  # ============================================================================
+  
+  - name: sensor-data-topic
+    type: pubsub.v1.topic
+    properties:
+      topic: sensor-data-topic-{{ env["deployment"] }}
+      labels:
+        environment: production
+        purpose: sensor-data-ingestion
+        component: messaging
+      messageRetentionDuration: 604800s  # 7 days
+      messageStoragePolicy:
+        allowedPersistenceRegions:
+          - us-central1
+    metadata:
+      dependsOn:
+        - enable-pubsub-api
+
+  # ============================================================================
+  # CLOUD BIGTABLE - Real-time data storage
+  # ============================================================================
+  
+  - name: supply-chain-bigtable-instance
+    type: bigtable.v2.instance
+    properties:
+      instanceId: supply-chain-bt-{{ env["deployment"] }}
+      displayName: "Supply Chain Analytics Instance"
+      type: PRODUCTION
+      labels:
+        environment: production
+        purpose: real-time-storage
+        component: bigtable
+      clusters:
+        - clusterId: supply-chain-cluster
+          location: projects/{{ env["project"] }}/locations/us-central1-a
+          defaultStorageType: SSD
+          serveNodes: 3
+          encryptionConfig:
+            kmsKeyName: ""  # Use Google-managed encryption
+    metadata:
+      dependsOn:
+        - enable-bigtable-api
+
+  # Bigtable table creation (requires custom resource type)
+  - name: bigtable-table-creation
+    type: deploymentmanager.v2.virtual.function
+    properties:
+      sourceArchiveUrl: gs://{{ ref('supply-chain-data-bucket') }}/functions/table-creator.zip
+      entryPoint: create_bigtable_table
+      runtime: python39
+      environmentVariables:
+        BIGTABLE_INSTANCE: $(ref.supply-chain-bigtable-instance.name)
+        PROJECT_ID: {{ env["project"] }}
+      timeout: 60s
+    metadata:
+      dependsOn:
+        - supply-chain-bigtable-instance
+        - supply-chain-data-bucket
+
+  # ============================================================================
+  # CLOUD DATAPROC - Batch analytics processing
+  # ============================================================================
+  
+  - name: supply-chain-dataproc-cluster
+    type: dataproc.v1.cluster
+    properties:
+      clusterName: supply-analytics-cluster-{{ env["deployment"] }}
+      region: us-central1
+      config:
+        # Master node configuration
+        masterConfig:
+          numInstances: 1
+          machineTypeUri: projects/{{ env["project"] }}/zones/us-central1-a/machineTypes/n1-standard-4
+          diskConfig:
+            bootDiskType: pd-standard
+            bootDiskSizeGb: 50
+          
+        # Worker node configuration
+        workerConfig:
+          numInstances: 3
+          machineTypeUri: projects/{{ env["project"] }}/zones/us-central1-a/machineTypes/n1-standard-2
+          diskConfig:
+            bootDiskType: pd-standard
+            bootDiskSizeGb: 50
+          
+        # Preemptible worker configuration for cost optimization
+        secondaryWorkerConfig:
+          numInstances: 3
+          machineTypeUri: projects/{{ env["project"] }}/zones/us-central1-a/machineTypes/n1-standard-2
+          diskConfig:
+            bootDiskType: pd-standard
+            bootDiskSizeGb: 50
+          isPreemptible: true
+          
+        # Software configuration
+        softwareConfig:
+          imageVersion: 2.0-debian10
+          optionalComponents:
+            - JUPYTER
+            - ANACONDA
+          properties:
+            # Enable Bigtable connector
+            "dataproc:dataproc.enable.cloud.sql.hbase.connector": "true"
+            # Optimize for analytics workloads
+            "spark:spark.sql.adaptive.enabled": "true"
+            "spark:spark.sql.adaptive.coalescePartitions.enabled": "true"
+            
+        # Autoscaling configuration
+        autoscalingConfig:
+          policyUri: projects/{{ env["project"] }}/regions/us-central1/autoscalingPolicies/supply-chain-autoscaling-policy
+          
+        # Security and network configuration
+        securityConfig:
+          kerberosConfig:
+            enableKerberos: false
+        gceClusterConfig:
+          zoneUri: projects/{{ env["project"] }}/zones/us-central1-a
+          networkUri: projects/{{ env["project"] }}/global/networks/default
+          subnetworkUri: projects/{{ env["project"] }}/regions/us-central1/subnetworks/default
+          internalIpOnly: false
+          serviceAccount: {{ env["project_number"] }}-compute@developer.gserviceaccount.com
+          serviceAccountScopes:
+            - https://www.googleapis.com/auth/cloud-platform
+          tags:
+            - dataproc-cluster
+            - supply-chain-analytics
+          metadata:
+            enable-cloud-sql-hbase-connector: "true"
+            
+        # Initialization actions for additional setup
+        initializationActions:
+          - executableFile: gs://goog-dataproc-initialization-actions-us-central1/cloud-sql-proxy/cloud-sql-proxy.sh
+            executionTimeout: 300s
+            
+      labels:
+        environment: production
+        purpose: batch-analytics
+        component: dataproc
+    metadata:
+      dependsOn:
+        - enable-dataproc-api
+        - supply-chain-data-bucket
+
+  # Autoscaling policy for Dataproc cluster
+  - name: dataproc-autoscaling-policy
+    type: dataproc.v1.autoscalingPolicy
+    properties:
+      policyId: supply-chain-autoscaling-policy
+      region: us-central1
+      basicAlgorithm:
+        yarnConfig:
+          scaleUpFactor: 0.05
+          scaleDownFactor: 1.0
+          gracefulDecommissionTimeout: 1800s
+        cooldownPeriod: 2m
+      secondaryWorkerConfig:
+        minInstances: 0
+        maxInstances: 8
+        weight: 1
+      labels:
+        environment: production
+        purpose: autoscaling
+        component: dataproc
+    metadata:
+      dependsOn:
+        - enable-dataproc-api
+
+  # ============================================================================
+  # CLOUD FUNCTIONS - Real-time data processing
+  # ============================================================================
+  
+  - name: sensor-data-processor-function
+    type: cloudfunctions.v1.function
+    properties:
+      location: projects/{{ env["project"] }}/locations/us-central1
+      function: process-sensor-data-{{ env["deployment"] }}
+      sourceArchiveUrl: gs://{{ ref('supply-chain-data-bucket') }}/functions/sensor-processor.zip
+      entryPoint: process_sensor_data
+      runtime: python39
+      timeout: 60s
+      availableMemoryMb: 256
+      environmentVariables:
+        BIGTABLE_INSTANCE_ID: $(ref.supply-chain-bigtable-instance.name)
+        PROJECT_ID: {{ env["project"] }}
+      eventTrigger:
+        eventType: providers/cloud.pubsub/eventTypes/topic.publish
+        resource: $(ref.sensor-data-topic.name)
+        failurePolicy:
+          retry: {}
+      labels:
+        environment: production
+        purpose: data-processing
+        component: cloud-functions
+    metadata:
+      dependsOn:
+        - enable-functions-api
+        - sensor-data-topic
+        - supply-chain-bigtable-instance
+        - supply-chain-data-bucket
+
+  # ============================================================================
+  # CLOUD SCHEDULER - Automated analytics execution
+  # ============================================================================
+  
+  - name: supply-chain-analytics-scheduler
+    type: cloudscheduler.v1.job
+    properties:
+      name: projects/{{ env["project"] }}/locations/us-central1/jobs/supply-chain-analytics-{{ env["deployment"] }}
+      description: "Automated supply chain analytics execution every 6 hours"
+      schedule: "0 */6 * * *"
+      timeZone: "UTC"
+      httpTarget:
+        uri: https://dataproc.googleapis.com/v1/projects/{{ env["project"] }}/regions/us-central1/jobs:submit
+        httpMethod: POST
+        headers:
+          Content-Type: application/json
+        oauthToken:
+          serviceAccountEmail: {{ env["project_number"] }}-compute@developer.gserviceaccount.com
+          scope: https://www.googleapis.com/auth/cloud-platform
+        body: |
+          {
+            "job": {
+              "placement": {
+                "clusterName": "$(ref.supply-chain-dataproc-cluster.clusterName)"
+              },
+              "pysparkJob": {
+                "mainPythonFileUri": "gs://$(ref.supply-chain-data-bucket.name)/jobs/supply_chain_analytics.py",
+                "args": ["{{ env["project"] }}", "$(ref.supply-chain-bigtable-instance.name)"],
+                "properties": {
+                  "spark.sql.adaptive.enabled": "true",
+                  "spark.sql.adaptive.coalescePartitions.enabled": "true"
+                }
+              }
+            }
+          }
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 3600s
+        minBackoffDuration: 60s
+        maxBackoffDuration: 600s
+        maxDoublings: 3
+    metadata:
+      dependsOn:
+        - enable-scheduler-api
+        - supply-chain-dataproc-cluster
+        - supply-chain-data-bucket
+
+  # ============================================================================
+  # MONITORING - Dashboard and alerting
+  # ============================================================================
+  
+  - name: supply-chain-monitoring-dashboard
+    type: monitoring.v1.dashboard
+    properties:
+      displayName: "Supply Chain Analytics Dashboard"
+      mosaicLayout:
+        tiles:
+          # Bigtable operations monitoring
+          - width: 6
+            height: 4
+            widget:
+              title: "Bigtable Read Operations"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="bigtable_table" AND resource.labels.instance_id="$(ref.supply-chain-bigtable-instance.name)"'
+                        aggregation:
+                          alignmentPeriod: 60s
+                          crossSeriesReducer: REDUCE_SUM
+                          groupByFields: ["resource.label.table_id"]
+                        
+          # Dataproc job monitoring
+          - width: 6
+            height: 4
+            widget:
+              title: "Dataproc Job Status"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="dataproc_cluster" AND resource.labels.cluster_name="$(ref.supply-chain-dataproc-cluster.clusterName)"'
+                        aggregation:
+                          alignmentPeriod: 300s
+                          crossSeriesReducer: REDUCE_MEAN
+                          
+          # Pub/Sub message monitoring
+          - width: 6
+            height: 4
+            widget:
+              title: "Sensor Data Ingestion Rate"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="pubsub_topic" AND resource.labels.topic_id="$(ref.sensor-data-topic.name)"'
+                        aggregation:
+                          alignmentPeriod: 60s
+                          crossSeriesReducer: REDUCE_RATE
+                          
+          # Cloud Function performance
+          - width: 6
+            height: 4
+            widget:
+              title: "Data Processing Function Performance"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="cloud_function" AND resource.labels.function_name="$(ref.sensor-data-processor-function.name)"'
+                        aggregation:
+                          alignmentPeriod: 60s
+                          crossSeriesReducer: REDUCE_MEAN
+      labels:
+        environment: production
+        purpose: monitoring
+        component: dashboard
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+        - supply-chain-bigtable-instance
+        - supply-chain-dataproc-cluster
+        - sensor-data-topic
+        - sensor-data-processor-function
+
+  # Alert policy for low inventory levels
+  - name: low-inventory-alert-policy
+    type: monitoring.v1.alertPolicy
+    properties:
+      displayName: "Supply Chain Low Inventory Alert"
+      documentation:
+        content: "Alert triggered when inventory levels fall below critical thresholds"
+        mimeType: text/markdown
+      conditions:
+        - displayName: "Inventory Level Check"
+          conditionThreshold:
+            filter: 'resource.type="bigtable_table"'
+            comparison: COMPARISON_LESS_THAN
+            thresholdValue: 10
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 60s
+                crossSeriesReducer: REDUCE_MEAN
+                groupByFields: ["resource.label.table_id"]
+      enabled: true
+      alertStrategy:
+        autoClose: 86400s  # 24 hours
+      labels:
+        environment: production
+        purpose: alerting
+        component: inventory-monitoring
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+        - supply-chain-bigtable-instance
+
+  # ============================================================================
+  # IAM ROLES AND PERMISSIONS
+  # ============================================================================
+  
+  # Service account for enhanced security (optional)
+  - name: supply-chain-service-account
+    type: iam.v1.serviceAccount
+    properties:
+      accountId: supply-chain-sa-{{ env["deployment"] }}
+      displayName: "Supply Chain Analytics Service Account"
+      description: "Service account for supply chain analytics operations"
+    metadata:
+      dependsOn: []
+
+  # IAM bindings for service account
+  - name: supply-chain-sa-bigtable-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ env["project"] }}
+      role: roles/bigtable.user
+      member: serviceAccount:$(ref.supply-chain-service-account.email)
+    metadata:
+      dependsOn:
+        - supply-chain-service-account
+
+  - name: supply-chain-sa-dataproc-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ env["project"] }}
+      role: roles/dataproc.worker
+      member: serviceAccount:$(ref.supply-chain-service-account.email)
+    metadata:
+      dependsOn:
+        - supply-chain-service-account
+
+  - name: supply-chain-sa-storage-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ env["project"] }}
+      role: roles/storage.objectAdmin
+      member: serviceAccount:$(ref.supply-chain-service-account.email)
+    metadata:
+      dependsOn:
+        - supply-chain-service-account
+
+# ============================================================================
+# OUTPUTS - Important resource information
+# ============================================================================
+
+outputs:
+  - name: project-id
+    description: "Google Cloud Project ID"
+    value: {{ env["project"] }}
+    
+  - name: bigtable-instance-id
+    description: "Cloud Bigtable instance identifier for data storage"
+    value: $(ref.supply-chain-bigtable-instance.name)
+    
+  - name: dataproc-cluster-name
+    description: "Cloud Dataproc cluster name for batch analytics"
+    value: $(ref.supply-chain-dataproc-cluster.clusterName)
+    
+  - name: storage-bucket-name
+    description: "Cloud Storage bucket for data processing and job storage"
+    value: $(ref.supply-chain-data-bucket.name)
+    
+  - name: pubsub-topic-name
+    description: "Pub/Sub topic for sensor data ingestion"
+    value: $(ref.sensor-data-topic.name)
+    
+  - name: cloud-function-name
+    description: "Cloud Function for real-time sensor data processing"
+    value: $(ref.sensor-data-processor-function.name)
+    
+  - name: scheduler-job-name
+    description: "Cloud Scheduler job for automated analytics execution"
+    value: $(ref.supply-chain-analytics-scheduler.name)
+    
+  - name: monitoring-dashboard-name
+    description: "Cloud Monitoring dashboard for supply chain analytics"
+    value: $(ref.supply-chain-monitoring-dashboard.name)
+    
+  - name: service-account-email
+    description: "Service account email for enhanced security operations"
+    value: $(ref.supply-chain-service-account.email)
+    
+  - name: deployment-region
+    description: "Primary deployment region for all resources"
+    value: "us-central1"
+    
+  - name: bigtable-cluster-zone
+    description: "Bigtable cluster zone for high availability"
+    value: "us-central1-a"
+
+# ============================================================================
+# DEPLOYMENT CONFIGURATION
+# ============================================================================
+
+# Deployment labels for resource organization and cost tracking
+labels:
+  - key: environment
+    value: production
+  - key: project
+    value: supply-chain-analytics
+  - key: owner
+    value: data-engineering-team
+  - key: cost-center
+    value: analytics-division
+  - key: created-by
+    value: infrastructure-manager
+  - key: recipe-id
+    value: d7e4f2a8
+  - key: last-updated
+    value: "2025-07-12"
+
+# Schema validation and deployment options
+options:
+  # Enable parallel resource creation where possible
+  async: false
+  
+  # Validate all resources before deployment
+  preview: false
+  
+  # Create all resources or none (atomic deployment)
+  createPolicy: CREATE_OR_ACQUIRE
+  
+  # Delete policy for cleanup operations
+  deletePolicy: DELETE

@@ -1,0 +1,690 @@
+# Infrastructure Manager Configuration for Application Debugging Workflows
+# This configuration deploys Cloud Workstations, Artifact Registry, and Cloud Run
+# for implementing secure debugging workflows with custom container images
+
+apiVersion: blueprints.cloud.google.com/v1alpha1
+kind: BlueprintMetadata
+metadata:
+  name: application-debugging-workflows
+  annotations:
+    config.kubernetes.io/local-config: "true"
+spec:
+  title: Application Debugging Workflows with Cloud Debugger and Cloud Workstations
+  description: |
+    Creates secure, cloud-based debugging environments using Cloud Workstations 
+    for containerized development environments and Artifact Registry for automated 
+    artifact management. Includes a sample Cloud Run application for testing.
+  supportedDeploymentModes:
+    - APPLY
+    - DELETE
+    - PREVIEW
+  content:
+    documentation:
+      - title: Cloud Workstations Documentation
+        url: https://cloud.google.com/workstations/docs
+      - title: Artifact Registry Best Practices
+        url: https://cloud.google.com/artifact-registry/docs/best-practices
+    examples:
+      - name: basic-debugging-workflow
+        location: examples/basic-debugging-workflow
+  interfaces:
+    variables:
+      - name: project_id
+        description: Google Cloud project ID
+        varType: string
+        required: true
+      - name: region
+        description: Google Cloud region for resources
+        varType: string
+        defaultValue: us-central1
+      - name: zone
+        description: Google Cloud zone for compute resources
+        varType: string
+        defaultValue: us-central1-a
+      - name: workstation_cluster_name
+        description: Name for the Cloud Workstations cluster
+        varType: string
+        defaultValue: debug-cluster
+      - name: workstation_config_name
+        description: Name for the workstation configuration
+        varType: string
+        defaultValue: debug-config
+      - name: repository_name
+        description: Name for the Artifact Registry repository
+        varType: string
+        defaultValue: debug-tools
+      - name: service_name
+        description: Name for the sample Cloud Run service
+        varType: string
+        defaultValue: sample-debug-app
+      - name: machine_type
+        description: Machine type for workstation instances
+        varType: string
+        defaultValue: e2-standard-4
+      - name: disk_size_gb
+        description: Disk size for workstation instances in GB
+        varType: int
+        defaultValue: 200
+      - name: idle_timeout_seconds
+        description: Idle timeout for workstations in seconds
+        varType: int
+        defaultValue: 7200
+      - name: running_timeout_seconds
+        description: Running timeout for workstations in seconds
+        varType: int
+        defaultValue: 28800
+    outputs:
+      - name: workstation_cluster_name
+        description: Name of the created workstation cluster
+      - name: workstation_config_name
+        description: Name of the created workstation configuration
+      - name: artifact_registry_url
+        description: URL of the Artifact Registry repository
+      - name: sample_app_url
+        description: URL of the deployed sample application
+      - name: custom_image_uri
+        description: URI of the custom workstation image
+
+---
+# Enable required APIs
+resource "google_project_service" "required_apis" {
+  for_each = toset([
+    "workstations.googleapis.com",
+    "artifactregistry.googleapis.com",
+    "run.googleapis.com",
+    "cloudbuild.googleapis.com",
+    "logging.googleapis.com",
+    "monitoring.googleapis.com",
+    "compute.googleapis.com",
+    "iam.googleapis.com"
+  ])
+  
+  project = var.project_id
+  service = each.value
+  
+  # Prevent accidental deletion of essential services
+  disable_dependent_services = false
+  disable_on_destroy = false
+}
+
+# Create Artifact Registry repository for custom debug images
+resource "google_artifact_registry_repository" "debug_tools" {
+  location      = var.region
+  repository_id = var.repository_name
+  description   = "Repository for debugging workflow container images"
+  format        = "DOCKER"
+  
+  # Enable vulnerability scanning
+  docker_config {
+    immutable_tags = false
+  }
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Create Cloud Build trigger for custom workstation image
+resource "google_cloudbuild_trigger" "workstation_image_build" {
+  name        = "build-${var.repository_name}-workstation-image"
+  description = "Build custom workstation image with debugging tools"
+  
+  # Manual trigger for initial build
+  disabled = false
+  
+  github {
+    owner = "GoogleCloudPlatform"
+    name  = "cloud-workstations-images"
+    push {
+      branch = "main"
+    }
+  }
+  
+  build {
+    step {
+      name = "gcr.io/cloud-builders/docker"
+      args = [
+        "build",
+        "-t", "${var.region}-docker.pkg.dev/${var.project_id}/${var.repository_name}/debug-workstation:latest",
+        "-f", "predefined/code-oss/Dockerfile",
+        "."
+      ]
+      
+      # Custom build steps for debugging tools
+      script = <<-EOF
+        #!/bin/bash
+        set -e
+        
+        # Create enhanced Dockerfile with debugging tools
+        cat > Dockerfile.debug << 'DOCKERFILE'
+        FROM us-central1-docker.pkg.dev/cloud-workstations-images/predefined/code-oss:latest
+        
+        # Install debugging tools as root
+        USER root
+        RUN apt-get update && apt-get install -y \
+            gdb \
+            strace \
+            tcpdump \
+            htop \
+            curl \
+            jq \
+            python3-pip \
+            nodejs \
+            npm \
+            net-tools \
+            lsof \
+            vim \
+            && rm -rf /var/lib/apt/lists/*
+        
+        # Install Python debugging tools
+        RUN pip3 install debugpy pdb++ ipdb pylint flake8 black
+        
+        # Install Node.js debugging tools
+        RUN npm install -g node-inspect eslint prettier
+        
+        # Install Go debugging tools
+        RUN wget https://go.dev/dl/go1.21.0.linux-amd64.tar.gz && \
+            tar -C /usr/local -xzf go1.21.0.linux-amd64.tar.gz && \
+            rm go1.21.0.linux-amd64.tar.gz
+        ENV PATH="/usr/local/go/bin:${PATH}"
+        RUN go install github.com/go-delve/delve/cmd/dlv@latest
+        
+        # Switch back to codeoss user
+        USER codeoss
+        
+        # Install VS Code extensions for debugging
+        RUN code-server --install-extension ms-python.python && \
+            code-server --install-extension ms-vscode.js-debug && \
+            code-server --install-extension golang.Go && \
+            code-server --install-extension ms-vscode.vscode-json
+        
+        # Create debugging configuration templates
+        RUN mkdir -p /home/codeoss/.local/share/code-server/User && \
+            echo '{"python.defaultInterpreterPath": "/usr/bin/python3", "python.linting.enabled": true}' > \
+            /home/codeoss/.local/share/code-server/User/settings.json
+        
+        EXPOSE 8080 9229 2345
+        DOCKERFILE
+        
+        # Build the enhanced image
+        docker build -f Dockerfile.debug -t ${var.region}-docker.pkg.dev/${var.project_id}/${var.repository_name}/debug-workstation:latest .
+      EOF
+    }
+    
+    step {
+      name = "gcr.io/cloud-builders/docker"
+      args = [
+        "push",
+        "${var.region}-docker.pkg.dev/${var.project_id}/${var.repository_name}/debug-workstation:latest"
+      ]
+    }
+    
+    # Set build timeout
+    timeout = "1200s"
+  }
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_artifact_registry_repository.debug_tools
+  ]
+}
+
+# Create Cloud Workstations cluster
+resource "google_workstations_workstation_cluster" "debug_cluster" {
+  workstation_cluster_id = var.workstation_cluster_name
+  location              = var.region
+  
+  network    = "projects/${var.project_id}/global/networks/default"
+  subnetwork = "projects/${var.project_id}/regions/${var.region}/subnetworks/default"
+  
+  # Private cluster configuration for enhanced security
+  private_cluster_config {
+    enable_private_endpoint = false  # Allow public access for demo
+    cluster_hostname        = "${var.workstation_cluster_name}.${var.region}.workstations.googleusercontent.com"
+  }
+  
+  # Enable logging and monitoring
+  labels = {
+    environment = "debugging"
+    purpose     = "development"
+    created_by  = "infrastructure-manager"
+  }
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Create workstation configuration with custom image
+resource "google_workstations_workstation_config" "debug_config" {
+  workstation_config_id = var.workstation_config_name
+  location             = var.region
+  workstation_cluster_id = google_workstations_workstation_cluster.debug_cluster.workstation_cluster_id
+  
+  # VM configuration
+  host {
+    gce_instance {
+      machine_type                = var.machine_type
+      boot_disk_size_gb          = var.disk_size_gb
+      disable_public_ip_addresses = false  # Enable public IP for demo
+      
+      # Use custom debug image
+      service_account = google_service_account.workstation_sa.email
+      service_account_scopes = [
+        "https://www.googleapis.com/auth/cloud-platform"
+      ]
+      
+      # Enhanced security configuration
+      shielded_instance_config {
+        enable_secure_boot          = true
+        enable_vtpm                = true
+        enable_integrity_monitoring = true
+      }
+      
+      # Network tags for firewall rules
+      tags = ["workstation-debug"]
+    }
+  }
+  
+  # Container configuration
+  container {
+    image = "${var.region}-docker.pkg.dev/${var.project_id}/${var.repository_name}/debug-workstation:latest"
+    
+    # Environment variables for debugging
+    env = {
+      DEBUG_MODE = "enabled"
+      LOG_LEVEL  = "debug"
+      NODE_ENV   = "development"
+      PYTHONPATH = "/workspace"
+    }
+    
+    # Resource limits
+    run_as_user = 1000  # codeoss user
+  }
+  
+  # Timeout configuration
+  idle_timeout    = "${var.idle_timeout_seconds}s"
+  running_timeout = "${var.running_timeout_seconds}s"
+  
+  # Annotation for identification
+  annotations = {
+    "workstation-type" = "debugging"
+    "image-type"      = "custom-debug-tools"
+  }
+  
+  depends_on = [
+    google_workstations_workstation_cluster.debug_cluster,
+    google_cloudbuild_trigger.workstation_image_build
+  ]
+}
+
+# Create service account for workstation instances
+resource "google_service_account" "workstation_sa" {
+  account_id   = "workstation-debug-sa"
+  display_name = "Workstation Debugging Service Account"
+  description  = "Service account for Cloud Workstations debugging environments"
+}
+
+# Grant necessary permissions to workstation service account
+resource "google_project_iam_member" "workstation_permissions" {
+  for_each = toset([
+    "roles/logging.logWriter",
+    "roles/monitoring.metricWriter",
+    "roles/artifactregistry.reader",
+    "roles/run.viewer",
+    "roles/clouddebugger.agent",
+    "roles/cloudtrace.agent"
+  ])
+  
+  project = var.project_id
+  role    = each.value
+  member  = "serviceAccount:${google_service_account.workstation_sa.email}"
+}
+
+# Create sample application for debugging
+resource "google_cloud_run_service" "sample_app" {
+  name     = var.service_name
+  location = var.region
+  
+  template {
+    spec {
+      service_account_name = google_service_account.sample_app_sa.email
+      
+      containers {
+        image = "gcr.io/cloudrun/hello"  # Placeholder image, will be replaced
+        
+        # Resource configuration
+        resources {
+          limits = {
+            cpu    = "1000m"
+            memory = "512Mi"
+          }
+        }
+        
+        # Environment variables
+        env {
+          name  = "NODE_ENV"
+          value = "development"
+        }
+        
+        env {
+          name  = "DEBUG_PORT"
+          value = "9229"
+        }
+        
+        # Debugging ports
+        ports {
+          container_port = 8080
+          name          = "http1"
+        }
+        
+        ports {
+          container_port = 9229
+          name          = "debug"
+        }
+      }
+      
+      # Timeout configuration
+      timeout_seconds = 300
+      
+      # Concurrency settings
+      container_concurrency = 100
+    }
+    
+    metadata {
+      annotations = {
+        "autoscaling.knative.dev/minScale" = "0"
+        "autoscaling.knative.dev/maxScale" = "10"
+        "run.googleapis.com/execution-environment" = "gen2"
+      }
+    }
+  }
+  
+  traffic {
+    percent         = 100
+    latest_revision = true
+  }
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Create service account for sample application
+resource "google_service_account" "sample_app_sa" {
+  account_id   = "sample-debug-app-sa"
+  display_name = "Sample Debug Application Service Account"
+  description  = "Service account for the sample debugging application"
+}
+
+# Grant permissions to sample application service account
+resource "google_project_iam_member" "sample_app_permissions" {
+  for_each = toset([
+    "roles/logging.logWriter",
+    "roles/monitoring.metricWriter",
+    "roles/clouddebugger.agent",
+    "roles/cloudtrace.agent"
+  ])
+  
+  project = var.project_id
+  role    = each.value
+  member  = "serviceAccount:${google_service_account.sample_app_sa.email}"
+}
+
+# Make Cloud Run service publicly accessible
+resource "google_cloud_run_service_iam_binding" "public_access" {
+  service  = google_cloud_run_service.sample_app.name
+  location = google_cloud_run_service.sample_app.location
+  role     = "roles/run.invoker"
+  
+  members = [
+    "allUsers"
+  ]
+}
+
+# Create Cloud Logging sink for workstation activities
+resource "google_logging_project_sink" "workstation_debug_sink" {
+  name        = "workstation-debug-activities"
+  description = "Logs from debugging workstation activities"
+  
+  # Destination: Cloud Logging bucket
+  destination = "logging.googleapis.com/projects/${var.project_id}/logs/workstation-debug"
+  
+  # Filter for workstation-related logs
+  filter = <<-EOF
+    resource.type="gce_instance"
+    resource.labels.instance_name:workstation
+    OR
+    resource.type="cloud_run_revision"
+    resource.labels.service_name="${var.service_name}"
+  EOF
+  
+  # Use a unique writer identity
+  unique_writer_identity = true
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Create monitoring dashboard for debugging workflow
+resource "google_monitoring_dashboard" "debug_dashboard" {
+  dashboard_json = jsonencode({
+    displayName = "Debugging Workflow Dashboard"
+    
+    mosaicLayout = {
+      tiles = [
+        {
+          width  = 6
+          height = 4
+          widget = {
+            title = "Workstation CPU Usage"
+            xyChart = {
+              dataSets = [{
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "resource.type=\"gce_instance\" AND resource.label.instance_name:workstation"
+                    aggregation = {
+                      alignmentPeriod    = "60s"
+                      perSeriesAligner   = "ALIGN_MEAN"
+                      crossSeriesReducer = "REDUCE_MEAN"
+                    }
+                  }
+                  unitOverride = "1"
+                }
+                plotType = "LINE"
+              }]
+              yAxis = {
+                label = "CPU Usage"
+                scale = "LINEAR"
+              }
+            }
+          }
+        },
+        {
+          width  = 6
+          height = 4
+          widget = {
+            title = "Cloud Run Request Count"
+            xyChart = {
+              dataSets = [{
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "resource.type=\"cloud_run_revision\" AND resource.label.service_name=\"${var.service_name}\""
+                    aggregation = {
+                      alignmentPeriod    = "60s"
+                      perSeriesAligner   = "ALIGN_RATE"
+                      crossSeriesReducer = "REDUCE_SUM"
+                    }
+                  }
+                  unitOverride = "1/s"
+                }
+                plotType = "LINE"
+              }]
+              yAxis = {
+                label = "Requests per Second"
+                scale = "LINEAR"
+              }
+            }
+          }
+        }
+      ]
+    }
+  })
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Create firewall rules for debugging access
+resource "google_compute_firewall" "workstation_debug_access" {
+  name        = "allow-workstation-debug"
+  network     = "default"
+  description = "Allow debugging ports for workstation instances"
+  
+  # Allow inbound debugging traffic
+  allow {
+    protocol = "tcp"
+    ports    = ["9229", "2345", "8080"]
+  }
+  
+  # Apply to workstation instances
+  target_tags = ["workstation-debug"]
+  
+  # Allow from internal network and specific external ranges
+  source_ranges = [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16"
+  ]
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Variable definitions
+variable "project_id" {
+  description = "Google Cloud project ID"
+  type        = string
+}
+
+variable "region" {
+  description = "Google Cloud region for resources"
+  type        = string
+  default     = "us-central1"
+}
+
+variable "zone" {
+  description = "Google Cloud zone for compute resources"
+  type        = string
+  default     = "us-central1-a"
+}
+
+variable "workstation_cluster_name" {
+  description = "Name for the Cloud Workstations cluster"
+  type        = string
+  default     = "debug-cluster"
+}
+
+variable "workstation_config_name" {
+  description = "Name for the workstation configuration"
+  type        = string
+  default     = "debug-config"
+}
+
+variable "repository_name" {
+  description = "Name for the Artifact Registry repository"
+  type        = string
+  default     = "debug-tools"
+}
+
+variable "service_name" {
+  description = "Name for the sample Cloud Run service"
+  type        = string
+  default     = "sample-debug-app"
+}
+
+variable "machine_type" {
+  description = "Machine type for workstation instances"
+  type        = string
+  default     = "e2-standard-4"
+  
+  validation {
+    condition = can(regex("^[a-z][a-z0-9-]*[a-z0-9]$", var.machine_type))
+    error_message = "Machine type must be a valid Google Cloud machine type."
+  }
+}
+
+variable "disk_size_gb" {
+  description = "Disk size for workstation instances in GB"
+  type        = number
+  default     = 200
+  
+  validation {
+    condition     = var.disk_size_gb >= 100 && var.disk_size_gb <= 1000
+    error_message = "Disk size must be between 100GB and 1000GB."
+  }
+}
+
+variable "idle_timeout_seconds" {
+  description = "Idle timeout for workstations in seconds"
+  type        = number
+  default     = 7200
+  
+  validation {
+    condition     = var.idle_timeout_seconds >= 300 && var.idle_timeout_seconds <= 86400
+    error_message = "Idle timeout must be between 5 minutes and 24 hours."
+  }
+}
+
+variable "running_timeout_seconds" {
+  description = "Running timeout for workstations in seconds"
+  type        = number
+  default     = 28800
+  
+  validation {
+    condition     = var.running_timeout_seconds >= 3600 && var.running_timeout_seconds <= 86400
+    error_message = "Running timeout must be between 1 hour and 24 hours."
+  }
+}
+
+# Output definitions
+output "workstation_cluster_name" {
+  description = "Name of the created workstation cluster"
+  value       = google_workstations_workstation_cluster.debug_cluster.workstation_cluster_id
+}
+
+output "workstation_config_name" {
+  description = "Name of the created workstation configuration"
+  value       = google_workstations_workstation_config.debug_config.workstation_config_id
+}
+
+output "artifact_registry_url" {
+  description = "URL of the Artifact Registry repository"
+  value       = "https://console.cloud.google.com/artifacts/docker/${var.project_id}/${var.region}/${var.repository_name}"
+}
+
+output "sample_app_url" {
+  description = "URL of the deployed sample application"
+  value       = google_cloud_run_service.sample_app.status[0].url
+}
+
+output "custom_image_uri" {
+  description = "URI of the custom workstation image"
+  value       = "${var.region}-docker.pkg.dev/${var.project_id}/${var.repository_name}/debug-workstation:latest"
+}
+
+output "workstation_cluster_url" {
+  description = "URL to access the workstation cluster in Google Cloud Console"
+  value       = "https://console.cloud.google.com/workstations/clusters/${var.workstation_cluster_name}?project=${var.project_id}"
+}
+
+output "monitoring_dashboard_url" {
+  description = "URL to access the monitoring dashboard"
+  value       = "https://console.cloud.google.com/monitoring/dashboards/custom/${google_monitoring_dashboard.debug_dashboard.id}?project=${var.project_id}"
+}
+
+output "deployment_instructions" {
+  description = "Instructions for deploying and using the debugging workflow"
+  value = <<-EOT
+    Deployment completed successfully! 
+    
+    Next steps:
+    1. Wait for the custom workstation image to build (check Cloud Build console)
+    2. Create a workstation instance using the configuration: ${google_workstations_workstation_config.debug_config.workstation_config_id}
+    3. Access your workstation through the Google Cloud Console
+    4. Test debugging with the sample application at: ${google_cloud_run_service.sample_app.status[0].url}
+    
+    Monitoring dashboard: https://console.cloud.google.com/monitoring/dashboards/custom/${google_monitoring_dashboard.debug_dashboard.id}?project=${var.project_id}
+  EOT
+}

@@ -1,0 +1,865 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Comprehensive data encryption at rest and in transit solution using AWS KMS, S3, RDS, and Certificate Manager'
+
+Parameters:
+  # Environment Configuration
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name for resource naming and tagging
+  
+  # Network Configuration
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    Description: CIDR block for VPC (must be /16 to /28)
+  
+  Subnet1Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    Description: CIDR block for first subnet
+  
+  Subnet2Cidr:
+    Type: String
+    Default: 10.0.2.0/24
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    Description: CIDR block for second subnet
+  
+  # Database Configuration
+  DatabaseEngine:
+    Type: String
+    Default: mysql
+    AllowedValues: [mysql, postgres, mariadb]
+    Description: Database engine type
+  
+  DatabaseInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: 
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+      - db.t3.large
+      - db.m5.large
+      - db.m5.xlarge
+      - db.m5.2xlarge
+    Description: RDS instance class
+  
+  DatabaseUsername:
+    Type: String
+    Default: admin
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9]*$
+    Description: Database master username
+  
+  DatabaseAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 65536
+    Description: Database allocated storage in GB
+  
+  # EC2 Configuration
+  EC2InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: 
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - t3.2xlarge
+    Description: EC2 instance type
+  
+  EC2VolumeSize:
+    Type: Number
+    Default: 8
+    MinValue: 8
+    MaxValue: 1024
+    Description: EC2 EBS root volume size in GB
+  
+  # Security Configuration
+  AllowedSSHCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(0|[1-9]|[1-2][0-9]|3[0-2]))$
+    Description: CIDR block allowed for SSH access (restrict in production)
+  
+  # Optional Domain for Certificate
+  DomainName:
+    Type: String
+    Default: ''
+    Description: Domain name for ACM certificate (optional)
+  
+  # CloudTrail Configuration
+  EnableCloudTrail:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable CloudTrail for encryption event logging
+  
+  # KMS Key Rotation
+  EnableKeyRotation:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable automatic KMS key rotation
+
+Conditions:
+  # Check if domain name is provided for ACM certificate
+  HasDomainName: !Not [!Equals [!Ref DomainName, '']]
+  
+  # Check if CloudTrail should be enabled
+  CreateCloudTrail: !Equals [!Ref EnableCloudTrail, 'true']
+  
+  # Check if key rotation should be enabled
+  RotateKey: !Equals [!Ref EnableKeyRotation, 'true']
+
+Mappings:
+  # Regional configuration for different AWS regions
+  RegionMap:
+    us-east-1:
+      LocationConstraint: ''
+    us-west-2:
+      LocationConstraint: us-west-2
+    eu-west-1:
+      LocationConstraint: eu-west-1
+    ap-southeast-1:
+      LocationConstraint: ap-southeast-1
+
+Resources:
+  # ========================================
+  # KMS Key Management
+  # ========================================
+  
+  # Customer-managed KMS key for encryption across all services
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'Customer managed key for ${Environment} encryption demo'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow use of the key for encryption services
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:GenerateDataKeyWithoutPlaintext
+              - kms:CreateGrant
+              - kms:DescribeKey
+            Resource: '*'
+          - Sid: Allow attachment of persistent resources
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - kms:CreateGrant
+              - kms:ListGrants
+              - kms:RevokeGrant
+            Resource: '*'
+            Condition:
+              Bool:
+                'kms:GrantIsForAWSResource': 'true'
+      EnableKeyRotation: !Ref EnableKeyRotation
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyUsage: ENCRYPT_DECRYPT
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-encryption-key'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: DataEncryption
+  
+  # KMS Key Alias for easier reference
+  EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${Environment}-encryption-demo'
+      TargetKeyId: !Ref EncryptionKey
+
+  # ========================================
+  # Network Infrastructure
+  # ========================================
+  
+  # VPC for secure networking
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-encryption-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # Internet Gateway for public access
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-encryption-igw'
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # Attach Internet Gateway to VPC
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+  
+  # First subnet in first availability zone
+  Subnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref Subnet1Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-encryption-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # Second subnet in second availability zone for RDS
+  Subnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref Subnet2Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-encryption-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # Route table for public subnets
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-encryption-public-rt'
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # Route to Internet Gateway
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  
+  # Associate subnet 1 with route table
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref Subnet1
+  
+  # Associate subnet 2 with route table
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref Subnet2
+
+  # ========================================
+  # S3 Storage with Encryption
+  # ========================================
+  
+  # S3 bucket for encrypted data storage
+  EncryptedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${Environment}-encrypted-data-bucket-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref EncryptionKey
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-encrypted-data-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Encryption
+          Value: KMS
+  
+  # S3 bucket for CloudTrail logs (if enabled)
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateCloudTrail
+    Properties:
+      BucketName: !Sub '${Environment}-cloudtrail-logs-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref EncryptionKey
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-cloudtrail-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: CloudTrail
+  
+  # CloudTrail bucket policy
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateCloudTrail
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub '${CloudTrailBucket}'
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CloudTrailBucket}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+
+  # ========================================
+  # Database with Encryption
+  # ========================================
+  
+  # DB subnet group for RDS
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for encrypted RDS database
+      SubnetIds:
+        - !Ref Subnet1
+        - !Ref Subnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-db-subnet-group'
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # Security group for RDS database
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for encrypted RDS database
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+          Description: MySQL/Aurora access from EC2 instances
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-db-sg'
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # Generate random password for database
+  DatabasePassword:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${Environment}-database-credentials'
+      Description: Database credentials for encryption demo
+      KmsKeyId: !Ref EncryptionKey
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "${DatabaseUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 16
+        ExcludeCharacters: '"@/\'
+        RequireEachIncludedType: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-database-secret'
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # RDS database instance with encryption
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub '${Environment}-encrypted-db'
+      DBInstanceClass: !Ref DatabaseInstanceClass
+      Engine: !Ref DatabaseEngine
+      MasterUsername: !Ref DatabaseUsername
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DatabasePassword}:SecretString:password}}'
+      AllocatedStorage: !Ref DatabaseAllocatedStorage
+      StorageType: gp2
+      StorageEncrypted: true
+      KmsKeyId: !Ref EncryptionKey
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      BackupRetentionPeriod: 7
+      CopyTagsToSnapshot: true
+      DeletionProtection: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-encrypted-database'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Encryption
+          Value: KMS
+
+  # ========================================
+  # EC2 with Encrypted Storage
+  # ========================================
+  
+  # Security group for EC2 instances
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for encrypted EC2 instances
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedSSHCidr
+          Description: SSH access
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS access
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP access
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-ec2-sg'
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # IAM role for EC2 instances
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub '${EncryptedDataBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Ref EncryptedDataBucket
+        - PolicyName: KMSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !GetAtt EncryptionKey.Arn
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref DatabasePassword
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-ec2-role'
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # IAM instance profile for EC2
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+  
+  # Key pair for EC2 SSH access
+  EC2KeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Sub '${Environment}-encryption-demo-key'
+      KeyType: rsa
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-encryption-key-pair'
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # EC2 instance with encrypted EBS volume
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
+      InstanceType: !Ref EC2InstanceType
+      KeyName: !Ref EC2KeyPair
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      SubnetId: !Ref Subnet1
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref EC2VolumeSize
+            VolumeType: gp2
+            DeleteOnTermination: true
+            Encrypted: true
+            KmsKeyId: !Ref EncryptionKey
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y awscli
+          
+          # Install CloudWatch agent
+          yum install -y amazon-cloudwatch-agent
+          
+          # Create test file to verify encryption
+          echo "Encryption test successful - ${Environment}" > /tmp/encryption-test.txt
+          
+          # Test S3 upload with encryption
+          aws s3 cp /tmp/encryption-test.txt s3://${EncryptedDataBucket}/test-file.txt --region ${AWS::Region}
+          
+          # Signal completion
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource EC2Instance --region ${AWS::Region}
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-encrypted-ec2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Encryption
+          Value: KMS
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+
+  # ========================================
+  # Certificate Manager (Optional)
+  # ========================================
+  
+  # SSL/TLS certificate for domain (if provided)
+  SSLCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: HasDomainName
+    Properties:
+      DomainName: !Ref DomainName
+      SubjectAlternativeNames:
+        - !Sub 'www.${DomainName}'
+      ValidationMethod: DNS
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-ssl-certificate'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ========================================
+  # CloudTrail for Audit Logging
+  # ========================================
+  
+  # CloudTrail for encryption event logging
+  EncryptionCloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Condition: CreateCloudTrail
+    Properties:
+      TrailName: !Sub '${Environment}-encryption-trail'
+      S3BucketName: !Ref CloudTrailBucket
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: AWS::KMS::Key
+              Values:
+                - 'arn:aws:kms:*:*:key/*'
+            - Type: AWS::S3::Object
+              Values:
+                - !Sub '${EncryptedDataBucket}/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-encryption-cloudtrail'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: EncryptionAudit
+
+  # ========================================
+  # DynamoDB with Encryption (Additional Service)
+  # ========================================
+  
+  # DynamoDB table with encryption at rest
+  EncryptedDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${Environment}-encrypted-table'
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        KMSMasterKeyId: !Ref EncryptionKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-encrypted-dynamodb'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Encryption
+          Value: KMS
+
+Outputs:
+  # KMS Key Information
+  KMSKeyId:
+    Description: KMS Key ID for encryption
+    Value: !Ref EncryptionKey
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyId'
+  
+  KMSKeyAlias:
+    Description: KMS Key Alias
+    Value: !Ref EncryptionKeyAlias
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyAlias'
+  
+  KMSKeyArn:
+    Description: KMS Key ARN
+    Value: !GetAtt EncryptionKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyArn'
+  
+  # Network Information
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCId'
+  
+  Subnet1Id:
+    Description: First subnet ID
+    Value: !Ref Subnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-Subnet1Id'
+  
+  Subnet2Id:
+    Description: Second subnet ID
+    Value: !Ref Subnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-Subnet2Id'
+  
+  # S3 Bucket Information
+  EncryptedDataBucketName:
+    Description: Name of the encrypted S3 bucket
+    Value: !Ref EncryptedDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-EncryptedDataBucketName'
+  
+  EncryptedDataBucketArn:
+    Description: ARN of the encrypted S3 bucket
+    Value: !GetAtt EncryptedDataBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EncryptedDataBucketArn'
+  
+  # Database Information
+  DatabaseEndpoint:
+    Description: RDS database endpoint
+    Value: !GetAtt DatabaseInstance.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseEndpoint'
+  
+  DatabasePort:
+    Description: RDS database port
+    Value: !GetAtt DatabaseInstance.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabasePort'
+  
+  DatabaseSecretArn:
+    Description: ARN of the database credentials secret
+    Value: !Ref DatabasePassword
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseSecretArn'
+  
+  # EC2 Information
+  EC2InstanceId:
+    Description: EC2 instance ID
+    Value: !Ref EC2Instance
+    Export:
+      Name: !Sub '${AWS::StackName}-EC2InstanceId'
+  
+  EC2PublicIP:
+    Description: EC2 instance public IP
+    Value: !GetAtt EC2Instance.PublicIp
+    Export:
+      Name: !Sub '${AWS::StackName}-EC2PublicIP'
+  
+  EC2PrivateIP:
+    Description: EC2 instance private IP
+    Value: !GetAtt EC2Instance.PrivateIp
+    Export:
+      Name: !Sub '${AWS::StackName}-EC2PrivateIP'
+  
+  # DynamoDB Information
+  DynamoDBTableName:
+    Description: DynamoDB table name
+    Value: !Ref EncryptedDynamoDBTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableName'
+  
+  DynamoDBTableArn:
+    Description: DynamoDB table ARN
+    Value: !GetAtt EncryptedDynamoDBTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableArn'
+  
+  # Certificate Information (if created)
+  SSLCertificateArn:
+    Condition: HasDomainName
+    Description: SSL certificate ARN
+    Value: !Ref SSLCertificate
+    Export:
+      Name: !Sub '${AWS::StackName}-SSLCertificateArn'
+  
+  # CloudTrail Information (if created)
+  CloudTrailArn:
+    Condition: CreateCloudTrail
+    Description: CloudTrail ARN
+    Value: !GetAtt EncryptionCloudTrail.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrailArn'
+  
+  # Security Group Information
+  EC2SecurityGroupId:
+    Description: EC2 security group ID
+    Value: !Ref EC2SecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-EC2SecurityGroupId'
+  
+  DatabaseSecurityGroupId:
+    Description: Database security group ID
+    Value: !Ref DatabaseSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseSecurityGroupId'
+  
+  # SSH Key Information
+  KeyPairName:
+    Description: EC2 Key Pair name
+    Value: !Ref EC2KeyPair
+    Export:
+      Name: !Sub '${AWS::StackName}-KeyPairName'
+  
+  # Deployment Information
+  StackName:
+    Description: CloudFormation stack name
+    Value: !Ref AWS::StackName
+    Export:
+      Name: !Sub '${AWS::StackName}-StackName'
+  
+  Environment:
+    Description: Environment name
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+  
+  # Connection Information
+  DatabaseConnectionString:
+    Description: Database connection information
+    Value: !Sub |
+      Host: ${DatabaseInstance.Endpoint.Address}
+      Port: ${DatabaseInstance.Endpoint.Port}
+      Database: ${DatabaseEngine}
+      Username: ${DatabaseUsername}
+      Password: Available in Secrets Manager (${DatabasePassword})
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseConnectionString'
+  
+  # Validation Commands
+  ValidationCommands:
+    Description: Commands to validate the encryption implementation
+    Value: !Sub |
+      # Verify KMS key
+      aws kms describe-key --key-id ${EncryptionKey}
+      
+      # Verify S3 encryption
+      aws s3api get-bucket-encryption --bucket ${EncryptedDataBucket}
+      
+      # Verify RDS encryption
+      aws rds describe-db-instances --db-instance-identifier ${DatabaseInstance}
+      
+      # Verify EC2 EBS encryption
+      aws ec2 describe-instances --instance-ids ${EC2Instance}
+      
+      # Verify DynamoDB encryption
+      aws dynamodb describe-table --table-name ${EncryptedDynamoDBTable}

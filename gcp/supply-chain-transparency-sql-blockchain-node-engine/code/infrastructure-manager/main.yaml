@@ -1,0 +1,492 @@
+# Infrastructure Manager Configuration for Supply Chain Transparency
+# Recipe: Supply Chain Transparency with Cloud SQL and Blockchain Node Engine
+# This configuration deploys a complete supply chain transparency solution using:
+# - Cloud SQL PostgreSQL for operational data storage
+# - Blockchain Node Engine for immutable verification records
+# - Cloud Functions for event processing
+# - Pub/Sub for real-time messaging
+# - Cloud KMS for encryption key management
+
+# Infrastructure Manager imports and variable definitions
+imports:
+  - path: variables.yaml
+    name: variables
+
+resources:
+  # Random suffix generator for unique resource naming
+  - name: random-suffix
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    metadata:
+      runtimePolicy:
+        - CREATE
+    properties:
+      resource: $(ref.project-id.projectId)
+      role: roles/owner
+      member: serviceAccount:$(ref.supply-chain-sa.email)
+
+  # Project configuration
+  - name: project-id
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: supply-chain-$(ref.timestamp.time)
+      name: Supply Chain Transparency Project
+
+  # Enable required Google Cloud APIs
+  - name: enable-sqladmin-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: sqladmin.googleapis.com
+      consumerId: project:$(ref.project-id.projectId)
+
+  - name: enable-blockchain-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: blockchainnode.googleapis.com
+      consumerId: project:$(ref.project-id.projectId)
+
+  - name: enable-functions-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: cloudfunctions.googleapis.com
+      consumerId: project:$(ref.project-id.projectId)
+
+  - name: enable-pubsub-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: pubsub.googleapis.com
+      consumerId: project:$(ref.project-id.projectId)
+
+  - name: enable-kms-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: cloudkms.googleapis.com
+      consumerId: project:$(ref.project-id.projectId)
+
+  # Cloud KMS resources for blockchain security
+  - name: blockchain-keyring
+    type: gcp-types/cloudkms-v1:projects.locations.keyRings
+    properties:
+      parent: projects/$(ref.project-id.projectId)/locations/us-central1
+      keyRingId: blockchain-keyring
+    metadata:
+      dependsOn:
+        - enable-kms-api
+
+  - name: blockchain-encryption-key
+    type: gcp-types/cloudkms-v1:projects.locations.keyRings.cryptoKeys
+    properties:
+      parent: $(ref.blockchain-keyring.name)
+      cryptoKeyId: blockchain-key
+      purpose: ENCRYPT_DECRYPT
+      versionTemplate:
+        algorithm: GOOGLE_SYMMETRIC_ENCRYPTION
+        protectionLevel: SOFTWARE
+      rotationPeriod: 7776000s  # 90 days rotation
+    metadata:
+      dependsOn:
+        - blockchain-keyring
+
+  # Cloud SQL PostgreSQL instance for supply chain data
+  - name: supply-chain-sql-instance
+    type: gcp-types/sqladmin-v1beta4:instances
+    properties:
+      name: supply-chain-db-$(ref.timestamp.time)
+      project: $(ref.project-id.projectId)
+      region: us-central1
+      databaseVersion: POSTGRES_15
+      settings:
+        tier: db-custom-2-8192
+        dataDiskSizeGb: 100
+        dataDiskType: PD_SSD
+        storageAutoResize: true
+        storageAutoResizeLimit: 1000
+        availabilityType: ZONAL
+        backupConfiguration:
+          enabled: true
+          startTime: "03:00"
+          pointInTimeRecoveryEnabled: true
+          transactionLogRetentionDays: 7
+          backupRetentionSettings:
+            retentionUnit: COUNT
+            retainedBackups: 7
+        maintenanceWindow:
+          day: 7  # Sunday
+          hour: 4
+          updateTrack: stable
+        ipConfiguration:
+          ipv4Enabled: true
+          requireSsl: false
+          authorizedNetworks: []
+        databaseFlags:
+          - name: log_statement
+            value: "all"
+          - name: log_min_duration_statement
+            value: "1000"
+        userLabels:
+          environment: production
+          service: supply-chain
+          component: database
+    metadata:
+      dependsOn:
+        - enable-sqladmin-api
+
+  # Supply chain database creation
+  - name: supply-chain-database
+    type: gcp-types/sqladmin-v1beta4:databases
+    properties:
+      name: supply_chain
+      project: $(ref.project-id.projectId)
+      instance: $(ref.supply-chain-sql-instance.name)
+      charset: UTF8
+      collation: en_US.UTF8
+    metadata:
+      dependsOn:
+        - supply-chain-sql-instance
+
+  # Database user for supply chain operations
+  - name: supply-chain-db-user
+    type: gcp-types/sqladmin-v1beta4:users
+    properties:
+      name: supply_chain_user
+      project: $(ref.project-id.projectId)
+      instance: $(ref.supply-chain-sql-instance.name)
+      password: $(ref.db-password.value)
+      type: BUILT_IN
+    metadata:
+      dependsOn:
+        - supply-chain-sql-instance
+
+  # Generate secure database password
+  - name: db-password
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/$(ref.project-id.projectId)
+      role: roles/secretmanager.secretAccessor
+      member: serviceAccount:$(ref.supply-chain-sa.email)
+    metadata:
+      runtimePolicy:
+        - CREATE
+
+  # Blockchain Node Engine for immutable verification
+  - name: supply-chain-blockchain-node
+    type: gcp-types/blockchainnode-v1:projects.locations.blockchainNodes
+    properties:
+      parent: projects/$(ref.project-id.projectId)/locations/us-central1
+      blockchainNodeId: supply-chain-node-$(ref.timestamp.time)
+      blockchainType: ETHEREUM
+      config:
+        nodeType: FULL
+        network: MAINNET
+        executionClient: GETH
+        consensusClient: LIGHTHOUSE
+      labels:
+        environment: production
+        service: supply-chain
+        component: blockchain
+    metadata:
+      dependsOn:
+        - enable-blockchain-api
+
+  # Pub/Sub topics for supply chain events
+  - name: supply-chain-events-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project-id.projectId)/topics/supply-chain-events
+      labels:
+        environment: production
+        service: supply-chain
+        component: messaging
+      messageRetentionDuration: 604800s  # 7 days
+      messageStoragePolicy:
+        allowedPersistenceRegions:
+          - us-central1
+    metadata:
+      dependsOn:
+        - enable-pubsub-api
+
+  - name: blockchain-verification-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project-id.projectId)/topics/blockchain-verification
+      labels:
+        environment: production
+        service: supply-chain
+        component: messaging
+      messageRetentionDuration: 604800s  # 7 days
+      messageStoragePolicy:
+        allowedPersistenceRegions:
+          - us-central1
+    metadata:
+      dependsOn:
+        - enable-pubsub-api
+
+  # Pub/Sub subscriptions for event processing
+  - name: process-supply-events-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(ref.project-id.projectId)/subscriptions/process-supply-events
+      topic: $(ref.supply-chain-events-topic.name)
+      ackDeadlineSeconds: 60
+      messageRetentionDuration: 604800s  # 7 days
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+      deadLetterPolicy:
+        maxDeliveryAttempts: 5
+      labels:
+        environment: production
+        service: supply-chain
+        component: messaging
+    metadata:
+      dependsOn:
+        - supply-chain-events-topic
+
+  - name: process-blockchain-verification-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(ref.project-id.projectId)/subscriptions/process-blockchain-verification
+      topic: $(ref.blockchain-verification-topic.name)
+      ackDeadlineSeconds: 60
+      messageRetentionDuration: 604800s  # 7 days
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+      deadLetterPolicy:
+        maxDeliveryAttempts: 5
+      labels:
+        environment: production
+        service: supply-chain
+        component: messaging
+    metadata:
+      dependsOn:
+        - blockchain-verification-topic
+
+  # IAM Service Account for supply chain operations
+  - name: supply-chain-sa
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: supply-chain-sa
+      displayName: Supply Chain Service Account
+      description: Service account for supply chain transparency operations
+      project: $(ref.project-id.projectId)
+
+  # IAM bindings for service account permissions
+  - name: supply-chain-sa-cloudsql-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/$(ref.project-id.projectId)
+      role: roles/cloudsql.client
+      member: serviceAccount:$(ref.supply-chain-sa.email)
+    metadata:
+      dependsOn:
+        - supply-chain-sa
+
+  - name: supply-chain-sa-pubsub-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/$(ref.project-id.projectId)
+      role: roles/pubsub.editor
+      member: serviceAccount:$(ref.supply-chain-sa.email)
+    metadata:
+      dependsOn:
+        - supply-chain-sa
+
+  - name: supply-chain-sa-blockchain-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/$(ref.project-id.projectId)
+      role: roles/blockchain.nodeUser
+      member: serviceAccount:$(ref.supply-chain-sa.email)
+    metadata:
+      dependsOn:
+        - supply-chain-sa
+
+  - name: supply-chain-sa-functions-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/$(ref.project-id.projectId)
+      role: roles/cloudfunctions.developer
+      member: serviceAccount:$(ref.supply-chain-sa.email)
+    metadata:
+      dependsOn:
+        - supply-chain-sa
+
+  # Cloud Storage bucket for function source code
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: supply-chain-functions-$(ref.timestamp.time)
+      project: $(ref.project-id.projectId)
+      location: US-CENTRAL1
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+      labels:
+        environment: production
+        service: supply-chain
+        component: functions
+
+  # Cloud Function for supply chain event processing
+  - name: supply-chain-processor-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project-id.projectId)/locations/us-central1
+      function: processSupplyChainEvent
+      sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/supply-chain-processor.zip
+      entryPoint: processSupplyChainEvent
+      runtime: nodejs18
+      timeout: 60s
+      availableMemoryMb: 512
+      maxInstances: 100
+      eventTrigger:
+        eventType: providers/cloud.pubsub/eventTypes/topic.publish
+        resource: $(ref.supply-chain-events-topic.name)
+        failurePolicy:
+          retry: {}
+      environmentVariables:
+        DB_HOST: $(ref.supply-chain-sql-instance.ipAddresses[0].ipAddress)
+        DB_PASSWORD: $(ref.db-password.value)
+        PROJECT_ID: $(ref.project-id.projectId)
+      serviceAccountEmail: $(ref.supply-chain-sa.email)
+      labels:
+        environment: production
+        service: supply-chain
+        component: function
+    metadata:
+      dependsOn:
+        - supply-chain-sql-instance
+        - supply-chain-events-topic
+        - supply-chain-sa
+        - function-source-bucket
+
+  # Cloud Function for supply chain API ingestion
+  - name: supply-chain-api-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project-id.projectId)/locations/us-central1
+      function: supplyChainIngestion
+      sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/supply-chain-api.zip
+      entryPoint: supplyChainIngestion
+      runtime: nodejs18
+      timeout: 30s
+      availableMemoryMb: 256
+      maxInstances: 50
+      httpsTrigger:
+        securityLevel: SECURE_ALWAYS
+      environmentVariables:
+        PROJECT_ID: $(ref.project-id.projectId)
+      serviceAccountEmail: $(ref.supply-chain-sa.email)
+      labels:
+        environment: production
+        service: supply-chain
+        component: api
+    metadata:
+      dependsOn:
+        - supply-chain-events-topic
+        - supply-chain-sa
+        - function-source-bucket
+
+  # Cloud Monitoring alerting policy for system health
+  - name: supply-chain-alerting-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: Supply Chain System Health
+      project: projects/$(ref.project-id.projectId)
+      conditions:
+        - displayName: Cloud SQL Instance Down
+          conditionThreshold:
+            filter: resource.type="gce_instance" AND resource.label.instance_id="$(ref.supply-chain-sql-instance.name)"
+            comparison: COMPARISON_EQUAL
+            thresholdValue: 0
+            duration: 300s
+        - displayName: High Pub/Sub Message Backlog
+          conditionThreshold:
+            filter: resource.type="pubsub_subscription"
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 1000
+            duration: 300s
+      alertStrategy:
+        autoClose: 86400s  # 24 hours
+      enabled: true
+
+  # Timestamp for unique resource naming
+  - name: timestamp
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    metadata:
+      runtimePolicy:
+        - CREATE
+    properties:
+      resource: projects/$(ref.project-id.projectId)
+      role: roles/viewer
+      member: user:supply-chain@example.com
+
+# Configuration outputs for verification and integration
+outputs:
+  - name: project-id
+    description: Google Cloud Project ID for the supply chain system
+    value: $(ref.project-id.projectId)
+
+  - name: sql-instance-name
+    description: Cloud SQL instance name for supply chain database
+    value: $(ref.supply-chain-sql-instance.name)
+
+  - name: sql-instance-ip
+    description: Cloud SQL instance IP address
+    value: $(ref.supply-chain-sql-instance.ipAddresses[0].ipAddress)
+
+  - name: blockchain-node-name
+    description: Blockchain Node Engine instance name
+    value: $(ref.supply-chain-blockchain-node.name)
+
+  - name: blockchain-node-endpoint
+    description: Blockchain node RPC endpoint
+    value: $(ref.supply-chain-blockchain-node.connectionInfo.endpointInfo.rpcEndpointIpv4)
+
+  - name: supply-chain-events-topic
+    description: Pub/Sub topic for supply chain events
+    value: $(ref.supply-chain-events-topic.name)
+
+  - name: blockchain-verification-topic
+    description: Pub/Sub topic for blockchain verification
+    value: $(ref.blockchain-verification-topic.name)
+
+  - name: api-function-url
+    description: Cloud Function trigger URL for supply chain API
+    value: $(ref.supply-chain-api-function.httpsTrigger.url)
+
+  - name: processor-function-name
+    description: Cloud Function name for event processing
+    value: $(ref.supply-chain-processor-function.name)
+
+  - name: service-account-email
+    description: Service account email for supply chain operations
+    value: $(ref.supply-chain-sa.email)
+
+  - name: kms-key-name
+    description: Cloud KMS encryption key for blockchain operations
+    value: $(ref.blockchain-encryption-key.name)
+
+  - name: function-source-bucket
+    description: Cloud Storage bucket for function source code
+    value: $(ref.function-source-bucket.name)
+
+# Metadata for Infrastructure Manager deployment
+metadata:
+  version: 1.0
+  description: Supply Chain Transparency Infrastructure with Cloud SQL and Blockchain Node Engine
+  author: Google Cloud Infrastructure Manager
+  created: 2025-07-12
+  tags:
+    - supply-chain
+    - blockchain
+    - cloud-sql
+    - transparency
+    - verification
+  estimated-cost: $150-300/month
+  deployment-time: 15-20 minutes

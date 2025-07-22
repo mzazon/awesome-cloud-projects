@@ -1,0 +1,1014 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Multi-Agent AI Workflows with Amazon Bedrock AgentCore
+  
+  This template creates a comprehensive multi-agent AI system using Amazon Bedrock Agents,
+  EventBridge for coordination, Lambda for orchestration, and DynamoDB for shared memory.
+  The solution implements a supervisor-collaborator pattern with specialized agents
+  for financial analysis, customer support, and data analytics.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Agent Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+          - SupervisorAgentName
+          - FoundationModel
+          - IdleSessionTTL
+      - Label:
+          default: "Infrastructure Configuration"
+        Parameters:
+          - MemoryTableReadCapacity
+          - MemoryTableWriteCapacity
+          - LogRetentionDays
+          - EnableXRayTracing
+      - Label:
+          default: "Specialized Agent Names"
+        Parameters:
+          - FinanceAgentName
+          - SupportAgentName
+          - AnalyticsAgentName
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      SupervisorAgentName:
+        default: "Supervisor Agent Name"
+      FoundationModel:
+        default: "Foundation Model"
+      MemoryTableReadCapacity:
+        default: "Memory Table Read Capacity"
+      MemoryTableWriteCapacity:
+        default: "Memory Table Write Capacity"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: multi-agent-workflow
+    Description: Name of the project for resource naming
+    AllowedPattern: ^[a-z][a-z0-9-]*[a-z0-9]$
+    ConstraintDescription: Must start with a letter, contain only lowercase letters, numbers, and hyphens
+    
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    Description: Environment for deployment
+    
+  SupervisorAgentName:
+    Type: String
+    Default: supervisor-agent
+    Description: Name for the supervisor agent
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$
+    MaxLength: 50
+    
+  FinanceAgentName:
+    Type: String
+    Default: finance-agent
+    Description: Name for the financial analysis agent
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$
+    MaxLength: 50
+    
+  SupportAgentName:
+    Type: String
+    Default: support-agent
+    Description: Name for the customer support agent
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$
+    MaxLength: 50
+    
+  AnalyticsAgentName:
+    Type: String
+    Default: analytics-agent
+    Description: Name for the data analytics agent
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$
+    MaxLength: 50
+    
+  FoundationModel:
+    Type: String
+    Default: anthropic.claude-3-sonnet-20240229-v1:0
+    AllowedValues:
+      - anthropic.claude-3-sonnet-20240229-v1:0
+      - anthropic.claude-3-haiku-20240307-v1:0
+      - anthropic.claude-3-5-sonnet-20240620-v1:0
+    Description: Foundation model for Bedrock agents
+    
+  IdleSessionTTL:
+    Type: Number
+    Default: 1800
+    MinValue: 60
+    MaxValue: 3600
+    Description: Idle session timeout in seconds for agents
+    
+  MemoryTableReadCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+    Description: Read capacity units for the memory DynamoDB table
+    
+  MemoryTableWriteCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+    Description: Write capacity units for the memory DynamoDB table
+    
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: Number of days to retain CloudWatch logs
+    
+  EnableXRayTracing:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable AWS X-Ray tracing for Lambda functions
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+  EnableXRay: !Equals [!Ref EnableXRayTracing, "true"]
+
+Resources:
+  # =============================================================================
+  # IAM ROLES AND POLICIES
+  # =============================================================================
+  
+  # IAM Role for Bedrock Agents
+  BedrockAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-bedrock-agent-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonBedrockFullAccess
+      Policies:
+        - PolicyName: BedrockAgentMemoryAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt AgentMemoryTable.Arn
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !GetAtt MultiAgentEventBus.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: bedrock-agent
+          
+  # IAM Role for Lambda Coordinator
+  LambdaCoordinatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-lambda-coordinator-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !If
+          - EnableXRay
+          - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+          - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: CoordinatorAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: 
+                  - !GetAtt MultiAgentEventBus.Arn
+                  - !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default"
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeAgent
+                  - bedrock-agent-runtime:InvokeAgent
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt AgentMemoryTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: lambda-coordinator
+
+  # =============================================================================
+  # DYNAMODB TABLE FOR AGENT MEMORY
+  # =============================================================================
+  
+  AgentMemoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-agent-memory-${Environment}"
+      AttributeDefinitions:
+        - AttributeName: SessionId
+          AttributeType: S
+        - AttributeName: Timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: SessionId
+          KeyType: HASH
+        - AttributeName: Timestamp
+          KeyType: RANGE
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref MemoryTableReadCapacity
+        WriteCapacityUnits: !Ref MemoryTableWriteCapacity
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: agent-memory
+        - Key: BackupRequired
+          Value: !If [IsProduction, "true", "false"]
+
+  # =============================================================================
+  # EVENTBRIDGE INFRASTRUCTURE
+  # =============================================================================
+  
+  # Custom Event Bus for Multi-Agent Communication
+  MultiAgentEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub "${ProjectName}-multi-agent-bus-${Environment}"
+      Description: Custom event bus for multi-agent AI workflow coordination
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: event-coordination
+
+  # Event Rule for Agent Task Routing
+  AgentTaskRouter:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-agent-task-router-${Environment}"
+      Description: Routes tasks to specialized agents based on event patterns
+      EventBusName: !Ref MultiAgentEventBus
+      EventPattern:
+        source: ["multi-agent.system"]
+        detail-type: ["Agent Task Request"]
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AgentCoordinatorFunction.Arn
+          Id: LambdaCoordinatorTarget
+          RetryPolicy:
+            MaximumRetryAttempts: 3
+            MaximumEventAge: 3600
+          DeadLetterConfig:
+            Arn: !GetAtt MultiAgentDLQ.Arn
+
+  # Dead Letter Queue for Failed Events
+  MultiAgentDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-multi-agent-dlq-${Environment}"
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeoutSeconds: 60
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: dead-letter-queue
+
+  # =============================================================================
+  # LAMBDA FUNCTIONS
+  # =============================================================================
+  
+  # Lambda Function for Workflow Coordination
+  AgentCoordinatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-agent-coordinator-${Environment}"
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaCoordinatorRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      ReservedConcurrencyLimit: !If [IsProduction, 100, 10]
+      TracingConfig:
+        Mode: !If [EnableXRay, Active, PassThrough]
+      Environment:
+        Variables:
+          EVENT_BUS_NAME: !Ref MultiAgentEventBus
+          MEMORY_TABLE_NAME: !Ref AgentMemoryTable
+          SUPERVISOR_AGENT_ID: !Ref SupervisorAgent
+          FINANCE_AGENT_ID: !Ref FinanceAgent
+          SUPPORT_AGENT_ID: !Ref SupportAgent
+          ANALYTICS_AGENT_ID: !Ref AnalyticsAgent
+          LOG_LEVEL: !If [IsProduction, INFO, DEBUG]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          from typing import Dict, Any, Optional
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger = logging.getLogger()
+          logger.setLevel(getattr(logging, log_level))
+
+          # Initialize AWS clients
+          eventbridge = boto3.client('events')
+          bedrock_agent = boto3.client('bedrock-agent-runtime')
+          dynamodb = boto3.resource('dynamodb')
+
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              Coordinate multi-agent workflows based on EventBridge events.
+              
+              This function serves as the central orchestrator for multi-agent AI workflows,
+              processing EventBridge events and routing tasks to appropriate specialized agents.
+              """
+              
+              try:
+                  correlation_id = None
+                  
+                  # Parse EventBridge event
+                  detail = event.get('detail', {})
+                  task_type = detail.get('taskType')
+                  request_data = detail.get('requestData')
+                  correlation_id = detail.get('correlationId')
+                  session_id = detail.get('sessionId', correlation_id)
+                  
+                  logger.info(f"Processing task: {task_type} with correlation: {correlation_id}")
+                  
+                  if not all([task_type, request_data, correlation_id]):
+                      raise ValueError("Missing required fields in event detail")
+                  
+                  # Store task in memory table
+                  memory_table = dynamodb.Table(os.environ['MEMORY_TABLE_NAME'])
+                  
+                  memory_table.put_item(
+                      Item={
+                          'SessionId': session_id,
+                          'Timestamp': int(datetime.now().timestamp() * 1000),  # milliseconds
+                          'TaskType': task_type,
+                          'RequestData': json.dumps(request_data) if isinstance(request_data, dict) else str(request_data),
+                          'Status': 'processing',
+                          'CorrelationId': correlation_id
+                      }
+                  )
+                  
+                  # Route to appropriate agent based on task type
+                  agent_response = route_to_agent(task_type, request_data, session_id)
+                  
+                  # Update memory with result
+                  memory_table.put_item(
+                      Item={
+                          'SessionId': session_id,
+                          'Timestamp': int(datetime.now().timestamp() * 1000),
+                          'TaskType': task_type,
+                          'Response': json.dumps(agent_response) if isinstance(agent_response, dict) else str(agent_response),
+                          'Status': 'completed',
+                          'CorrelationId': correlation_id
+                      }
+                  )
+                  
+                  # Publish completion event
+                  eventbridge.put_events(
+                      Entries=[{
+                          'Source': 'multi-agent.coordinator',
+                          'DetailType': 'Agent Task Completed',
+                          'Detail': json.dumps({
+                              'correlationId': correlation_id,
+                              'taskType': task_type,
+                              'result': agent_response,
+                              'status': 'completed',
+                              'timestamp': datetime.now().isoformat()
+                          }),
+                          'EventBusName': os.environ['EVENT_BUS_NAME']
+                      }]
+                  )
+                  
+                  logger.info(f"Successfully completed task {correlation_id}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Task coordinated successfully',
+                          'correlationId': correlation_id,
+                          'result': agent_response
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Coordination error: {str(e)}", exc_info=True)
+                  
+                  # Publish error event if we have correlation_id
+                  if correlation_id:
+                      try:
+                          eventbridge.put_events(
+                              Entries=[{
+                                  'Source': 'multi-agent.coordinator',
+                                  'DetailType': 'Agent Task Failed',
+                                  'Detail': json.dumps({
+                                      'correlationId': correlation_id,
+                                      'error': str(e),
+                                      'status': 'failed',
+                                      'timestamp': datetime.now().isoformat()
+                                  }),
+                                  'EventBusName': os.environ.get('EVENT_BUS_NAME', 'default')
+                              }]
+                          )
+                      except Exception as event_error:
+                          logger.error(f"Failed to publish error event: {str(event_error)}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'correlationId': correlation_id
+                      })
+                  }
+
+          def route_to_agent(task_type: str, request_data: Any, session_id: str) -> Dict[str, Any]:
+              """
+              Route task to appropriate specialized agent based on task type.
+              
+              Args:
+                  task_type: Type of task to process
+                  request_data: Task-specific data
+                  session_id: Session identifier for context
+                  
+              Returns:
+                  Agent response dictionary
+              """
+              
+              # Agent routing logic based on task type
+              agent_mapping = {
+                  'financial_analysis': os.environ.get('FINANCE_AGENT_ID'),
+                  'customer_support': os.environ.get('SUPPORT_AGENT_ID'),
+                  'data_analytics': os.environ.get('ANALYTICS_AGENT_ID'),
+                  'general': os.environ.get('SUPERVISOR_AGENT_ID')
+              }
+              
+              agent_id = agent_mapping.get(task_type, os.environ.get('SUPERVISOR_AGENT_ID'))
+              
+              if not agent_id:
+                  logger.warning(f"No agent configured for task type: {task_type}")
+                  return {
+                      'agent_type': 'fallback',
+                      'response': f"Task {task_type} processed by coordinator fallback",
+                      'data': request_data
+                  }
+              
+              try:
+                  # This would invoke the actual Bedrock agent in production
+                  # For now, return a structured response
+                  logger.info(f"Routing {task_type} to agent {agent_id}")
+                  
+                  return {
+                      'agent_type': task_type,
+                      'agent_id': agent_id,
+                      'response': f"Processed {task_type} request: {request_data}",
+                      'session_id': session_id,
+                      'processed_at': datetime.now().isoformat()
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Agent routing error for {task_type}: {str(e)}")
+                  return {
+                      'agent_type': 'error',
+                      'error': str(e),
+                      'fallback_response': f"Error processing {task_type}: {request_data}"
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: lambda-coordinator
+
+  # Lambda Permission for EventBridge
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AgentCoordinatorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AgentTaskRouter.Arn
+
+  # =============================================================================
+  # BEDROCK AGENTS
+  # =============================================================================
+  
+  # Supervisor Agent for Multi-Agent Coordination
+  SupervisorAgent:
+    Type: AWS::Bedrock::Agent
+    Properties:
+      AgentName: !Sub "${ProjectName}-${SupervisorAgentName}-${Environment}"
+      AgentResourceRoleArn: !GetAtt BedrockAgentRole.Arn
+      Description: "Supervisor agent responsible for coordinating complex business tasks across specialized agent teams"
+      FoundationModel: !Ref FoundationModel
+      Instruction: |
+        You are a supervisor agent responsible for coordinating complex business tasks across specialized agent teams. 
+        
+        Your responsibilities include:
+        1. Analyzing incoming requests and breaking them into sub-tasks
+        2. Routing tasks to appropriate specialist agents: Financial Agent for financial analysis, Support Agent for customer service, Analytics Agent for data analysis
+        3. Coordinating parallel work streams and managing dependencies
+        4. Synthesizing results from multiple agents into cohesive responses
+        5. Ensuring quality control and consistency across agent outputs
+        
+        Always provide clear task delegation and maintain oversight of the overall workflow progress. 
+        When coordinating with specialist agents, clearly explain the context and expected deliverables.
+        Focus on delivering comprehensive, business-ready solutions that leverage each agent's expertise effectively.
+      IdleSessionTTLInSeconds: 3600
+      AutoPrepare: true
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Component: supervisor-agent
+        AgentType: coordinator
+
+  # Financial Analysis Specialist Agent
+  FinanceAgent:
+    Type: AWS::Bedrock::Agent
+    Properties:
+      AgentName: !Sub "${ProjectName}-${FinanceAgentName}-${Environment}"
+      AgentResourceRoleArn: !GetAtt BedrockAgentRole.Arn
+      Description: "Specialized agent for financial analysis, reporting, and business metrics calculation"
+      FoundationModel: !Ref FoundationModel
+      Instruction: |
+        You are a financial analysis specialist with expertise in business finance, accounting, and financial reporting.
+        
+        Your role includes:
+        1. Analyzing financial data and creating comprehensive reports
+        2. Calculating key financial metrics and ratios
+        3. Providing insights on financial performance and trends
+        4. Identifying financial risks and opportunities
+        5. Ensuring compliance with financial reporting standards
+        
+        Always provide detailed explanations of your analysis methodology and cite relevant financial principles. 
+        Focus on accuracy and precision in all calculations. When presenting results, include context about 
+        industry benchmarks and historical performance where relevant.
+        
+        For complex analysis, break down your approach into clear steps and validate your calculations.
+      IdleSessionTTLInSeconds: !Ref IdleSessionTTL
+      AutoPrepare: true
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Component: finance-agent
+        AgentType: specialist
+
+  # Customer Support Specialist Agent
+  SupportAgent:
+    Type: AWS::Bedrock::Agent
+    Properties:
+      AgentName: !Sub "${ProjectName}-${SupportAgentName}-${Environment}"
+      AgentResourceRoleArn: !GetAtt BedrockAgentRole.Arn
+      Description: "Specialized agent for customer support, service excellence, and issue resolution"
+      FoundationModel: !Ref FoundationModel
+      Instruction: |
+        You are a customer support specialist focused on delivering exceptional customer service experiences.
+        
+        Your responsibilities include:
+        1. Helping customers resolve issues efficiently and effectively
+        2. Answering questions with empathy and professionalism
+        3. Providing clear, actionable solutions and guidance
+        4. Escalating complex technical issues when appropriate
+        5. Following company policies and service standards
+        
+        Always maintain a helpful, empathetic tone and focus on resolving customer concerns quickly. 
+        When you cannot fully resolve an issue, clearly explain next steps and set appropriate expectations.
+        
+        Prioritize customer satisfaction while ensuring all interactions align with business policies and procedures.
+        Document important details for follow-up and continuous service improvement.
+      IdleSessionTTLInSeconds: !Ref IdleSessionTTL
+      AutoPrepare: true
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Component: support-agent
+        AgentType: specialist
+
+  # Data Analytics Specialist Agent
+  AnalyticsAgent:
+    Type: AWS::Bedrock::Agent
+    Properties:
+      AgentName: !Sub "${ProjectName}-${AnalyticsAgentName}-${Environment}"
+      AgentResourceRoleArn: !GetAtt BedrockAgentRole.Arn
+      Description: "Specialized agent for data analysis, pattern recognition, and business intelligence"
+      FoundationModel: !Ref FoundationModel
+      Instruction: |
+        You are a data analytics specialist with expertise in statistical analysis, data interpretation, and business intelligence.
+        
+        Your core functions include:
+        1. Analyzing datasets to identify patterns, trends, and insights
+        2. Creating clear data visualizations and summaries
+        3. Providing actionable business recommendations based on data
+        4. Validating data quality and statistical significance
+        5. Explaining analytical methodology and assumptions
+        
+        Focus on statistical accuracy and clear data interpretation. Always validate your findings and 
+        explain the confidence level of your analysis. When presenting insights, include practical 
+        business recommendations that stakeholders can act upon.
+        
+        For complex analysis, break down your methodology step-by-step and highlight key assumptions 
+        or limitations in the data or analysis approach.
+      IdleSessionTTLInSeconds: !Ref IdleSessionTTL
+      AutoPrepare: true
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Component: analytics-agent
+        AgentType: specialist
+
+  # =============================================================================
+  # BEDROCK AGENT ALIASES
+  # =============================================================================
+  
+  SupervisorAgentAlias:
+    Type: AWS::Bedrock::AgentAlias
+    Properties:
+      AgentId: !Ref SupervisorAgent
+      AgentAliasName: production
+      Description: Production alias for supervisor agent providing stable endpoint
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: supervisor-alias
+
+  FinanceAgentAlias:
+    Type: AWS::Bedrock::AgentAlias
+    Properties:
+      AgentId: !Ref FinanceAgent
+      AgentAliasName: production
+      Description: Production alias for finance agent providing stable endpoint
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: finance-alias
+
+  SupportAgentAlias:
+    Type: AWS::Bedrock::AgentAlias
+    Properties:
+      AgentId: !Ref SupportAgent
+      AgentAliasName: production
+      Description: Production alias for support agent providing stable endpoint
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: support-alias
+
+  AnalyticsAgentAlias:
+    Type: AWS::Bedrock::AgentAlias
+    Properties:
+      AgentId: !Ref AnalyticsAgent
+      AgentAliasName: production
+      Description: Production alias for analytics agent providing stable endpoint
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: analytics-alias
+
+  # =============================================================================
+  # CLOUDWATCH MONITORING AND LOGGING
+  # =============================================================================
+  
+  # CloudWatch Log Groups
+  SupervisorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/bedrock/agents/${ProjectName}-supervisor-${Environment}"
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: supervisor-logs
+
+  SpecializedAgentsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/bedrock/agents/${ProjectName}-specialized-${Environment}"
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: specialized-logs
+
+  LambdaCoordinatorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-agent-coordinator-${Environment}"
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: coordinator-logs
+
+  # CloudWatch Dashboard
+  MultiAgentDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${ProjectName}-MultiAgent-${Environment}"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Bedrock", "InvocationLatency", "AgentId", "${SupervisorAgent}" ],
+                  [ "AWS/Bedrock", "InvocationCount", "AgentId", "${SupervisorAgent}" ],
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${AgentCoordinatorFunction}" ],
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${AgentCoordinatorFunction}" ],
+                  [ "AWS/Lambda", "Errors", "FunctionName", "${AgentCoordinatorFunction}" ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Multi-Agent Performance Overview",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Events", "MatchedEvents", "EventBusName", "${MultiAgentEventBus}" ],
+                  [ "AWS/Events", "InvocationAttempts", "EventBusName", "${MultiAgentEventBus}" ],
+                  [ "AWS/Events", "FailedInvocations", "EventBusName", "${MultiAgentEventBus}" ],
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${AgentMemoryTable}" ],
+                  [ "AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "${AgentMemoryTable}" ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Event Processing & Memory Usage",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Bedrock", "InvocationLatency", "AgentId", "${FinanceAgent}" ],
+                  [ ".", ".", ".", "${SupportAgent}" ],
+                  [ ".", ".", ".", "${AnalyticsAgent}" ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Specialized Agent Performance",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub "${ProjectName}-Lambda-Errors-${Environment}"
+      AlarmDescription: "Alert when Lambda coordinator function has errors"
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AgentCoordinatorFunction
+      TreatMissingData: notBreaching
+
+  DynamoDBThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub "${ProjectName}-DynamoDB-Throttles-${Environment}"
+      AlarmDescription: "Alert when DynamoDB memory table is throttled"
+      MetricName: ThrottledRequests
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref AgentMemoryTable
+      TreatMissingData: notBreaching
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+
+Outputs:
+  SupervisorAgentId:
+    Description: ID of the supervisor agent for multi-agent coordination
+    Value: !Ref SupervisorAgent
+    Export:
+      Name: !Sub "${ProjectName}-supervisor-agent-id-${Environment}"
+
+  SupervisorAgentAliasId:
+    Description: Production alias ID for the supervisor agent
+    Value: !Ref SupervisorAgentAlias
+    Export:
+      Name: !Sub "${ProjectName}-supervisor-alias-id-${Environment}"
+
+  FinanceAgentId:
+    Description: ID of the financial analysis specialist agent
+    Value: !Ref FinanceAgent
+    Export:
+      Name: !Sub "${ProjectName}-finance-agent-id-${Environment}"
+
+  SupportAgentId:
+    Description: ID of the customer support specialist agent
+    Value: !Ref SupportAgent
+    Export:
+      Name: !Sub "${ProjectName}-support-agent-id-${Environment}"
+
+  AnalyticsAgentId:
+    Description: ID of the data analytics specialist agent
+    Value: !Ref AnalyticsAgent
+    Export:
+      Name: !Sub "${ProjectName}-analytics-agent-id-${Environment}"
+
+  EventBusName:
+    Description: Name of the custom EventBridge bus for agent communication
+    Value: !Ref MultiAgentEventBus
+    Export:
+      Name: !Sub "${ProjectName}-event-bus-name-${Environment}"
+
+  EventBusArn:
+    Description: ARN of the custom EventBridge bus
+    Value: !GetAtt MultiAgentEventBus.Arn
+    Export:
+      Name: !Sub "${ProjectName}-event-bus-arn-${Environment}"
+
+  CoordinatorFunctionName:
+    Description: Name of the Lambda coordinator function
+    Value: !Ref AgentCoordinatorFunction
+    Export:
+      Name: !Sub "${ProjectName}-coordinator-function-name-${Environment}"
+
+  CoordinatorFunctionArn:
+    Description: ARN of the Lambda coordinator function
+    Value: !GetAtt AgentCoordinatorFunction.Arn
+    Export:
+      Name: !Sub "${ProjectName}-coordinator-function-arn-${Environment}"
+
+  MemoryTableName:
+    Description: Name of the DynamoDB table for agent memory storage
+    Value: !Ref AgentMemoryTable
+    Export:
+      Name: !Sub "${ProjectName}-memory-table-name-${Environment}"
+
+  MemoryTableArn:
+    Description: ARN of the DynamoDB memory table
+    Value: !GetAtt AgentMemoryTable.Arn
+    Export:
+      Name: !Sub "${ProjectName}-memory-table-arn-${Environment}"
+
+  DeadLetterQueueUrl:
+    Description: URL of the dead letter queue for failed events
+    Value: !Ref MultiAgentDLQ
+    Export:
+      Name: !Sub "${ProjectName}-dlq-url-${Environment}"
+
+  DashboardUrl:
+    Description: CloudWatch Dashboard URL for monitoring multi-agent workflows
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-MultiAgent-${Environment}"
+
+  BedrockAgentRoleArn:
+    Description: ARN of the IAM role used by Bedrock agents
+    Value: !GetAtt BedrockAgentRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-bedrock-role-arn-${Environment}"
+
+  SampleEventPayload:
+    Description: Sample EventBridge event payload for testing multi-agent workflows
+    Value: !Sub |
+      {
+        "Source": "multi-agent.system",
+        "DetailType": "Agent Task Request",
+        "Detail": "{\"taskType\":\"financial_analysis\",\"requestData\":\"Q4 revenue analysis with profit margins\",\"correlationId\":\"test-${AWS::AccountId}\",\"sessionId\":\"session-${AWS::AccountId}\"}",
+        "EventBusName": "${MultiAgentEventBus}"
+      }
+
+  TestCommand:
+    Description: AWS CLI command to test the multi-agent workflow
+    Value: !Sub |
+      aws events put-events --entries '[{
+        "Source": "multi-agent.system",
+        "DetailType": "Agent Task Request", 
+        "Detail": "{\"taskType\":\"financial_analysis\",\"requestData\":\"Q4 revenue analysis\",\"correlationId\":\"test-$(date +%s)\",\"sessionId\":\"session-$(date +%s)\"}",
+        "EventBusName": "${MultiAgentEventBus}"
+      }]'

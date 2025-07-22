@@ -1,0 +1,950 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Asynchronous API Patterns with API Gateway and SQS - Production-ready infrastructure for decoupled job processing'
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: async-api
+    Description: Name prefix for all resources
+    AllowedPattern: ^[a-z][a-z0-9-]*$
+    ConstraintDescription: Must start with lowercase letter and contain only lowercase letters, numbers, and hyphens
+    MaxLength: 20
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, prod]
+    Description: Environment designation for resource tagging and configuration
+
+  MessageRetentionPeriod:
+    Type: Number
+    Default: 1209600
+    MinValue: 60
+    MaxValue: 1209600
+    Description: Message retention period in seconds (default 14 days)
+
+  VisibilityTimeoutSeconds:
+    Type: Number
+    Default: 300
+    MinValue: 0
+    MaxValue: 43200
+    Description: SQS visibility timeout in seconds
+
+  MaxReceiveCount:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 1000
+    Description: Maximum receive count before moving to DLQ
+
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 30
+    MaxValue: 900
+    Description: Lambda function timeout in seconds
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+    Description: Lambda function memory allocation in MB
+
+  EnableApiGatewayLogging:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable CloudWatch logging for API Gateway
+
+  ApiGatewayLogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [OFF, ERROR, INFO]
+    Description: API Gateway CloudWatch log level
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+  EnableLogging: !Equals [!Ref EnableApiGatewayLogging, 'true']
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+  # --------------------------------------------------------------------------
+  # S3 BUCKET FOR RESULTS STORAGE
+  # --------------------------------------------------------------------------
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-results-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: !If [IsProduction, Enabled, Suspended]
+      LifecycleConfiguration:
+        Rules:
+          - Id: ResultsCleanup
+            Status: Enabled
+            ExpirationInDays: !If [IsProduction, 90, 30]
+            NoncurrentVersionExpirationInDays: 7
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3LogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-results-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Job processing results storage
+
+  # CloudWatch Log Group for S3 Events
+  S3LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-results'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  # --------------------------------------------------------------------------
+  # SQS DEAD LETTER QUEUE
+  # --------------------------------------------------------------------------
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-dlq-${Environment}'
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      VisibilityTimeoutSeconds: !Ref VisibilityTimeoutSeconds
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dead-letter-queue'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Failed message handling
+
+  # --------------------------------------------------------------------------
+  # SQS MAIN PROCESSING QUEUE
+  # --------------------------------------------------------------------------
+  MainProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-main-queue-${Environment}'
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      VisibilityTimeoutSeconds: !Ref VisibilityTimeoutSeconds
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-main-processing-queue'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Job processing queue
+
+  # --------------------------------------------------------------------------
+  # DYNAMODB TABLE FOR JOB TRACKING
+  # --------------------------------------------------------------------------
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-jobs-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: jobId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: jobId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-jobs-table'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Job status tracking
+
+  # --------------------------------------------------------------------------
+  # IAM ROLE FOR API GATEWAY
+  # --------------------------------------------------------------------------
+  ApiGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-api-gateway-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SQSAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt MainProcessingQueue.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-api-gateway-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # --------------------------------------------------------------------------
+  # IAM ROLE FOR LAMBDA FUNCTIONS
+  # --------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ServiceAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: 
+                  - !GetAtt JobsTable.Arn
+                  - !Sub '${JobsTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: !Sub '${ResultsBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt MainProcessingQueue.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/sqs'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # --------------------------------------------------------------------------
+  # LAMBDA FUNCTION: JOB PROCESSOR
+  # --------------------------------------------------------------------------
+  JobProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-job-processor-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          JOBS_TABLE_NAME: !Ref JobsTable
+          RESULTS_BUCKET_NAME: !Ref ResultsBucket
+          ENVIRONMENT: !Ref Environment
+      ReservedConcurrencyLimit: !If [IsProduction, 100, 10]
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import time
+          import os
+          from datetime import datetime, timezone
+          
+          dynamodb = boto3.resource('dynamodb')
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              table_name = os.environ['JOBS_TABLE_NAME']
+              results_bucket = os.environ['RESULTS_BUCKET_NAME']
+              
+              table = dynamodb.Table(table_name)
+              
+              for record in event['Records']:
+                  try:
+                      # Parse message from SQS
+                      message_body = json.loads(record['body'])
+                      job_id = message_body['jobId']
+                      job_data = message_body['data']
+                      
+                      # Update job status to processing
+                      table.update_item(
+                          Key={'jobId': job_id},
+                          UpdateExpression='SET #status = :status, #updatedAt = :timestamp',
+                          ExpressionAttributeNames={
+                              '#status': 'status',
+                              '#updatedAt': 'updatedAt'
+                          },
+                          ExpressionAttributeValues={
+                              ':status': 'processing',
+                              ':timestamp': datetime.now(timezone.utc).isoformat()
+                          }
+                      )
+                      
+                      # Simulate processing work (replace with actual processing logic)
+                      time.sleep(10)  # Simulate work
+                      
+                      # Generate result
+                      result = {
+                          'jobId': job_id,
+                          'result': f'Processed data: {job_data}',
+                          'processedAt': datetime.now(timezone.utc).isoformat(),
+                          'environment': os.environ.get('ENVIRONMENT', 'unknown')
+                      }
+                      
+                      # Store result in S3
+                      s3.put_object(
+                          Bucket=results_bucket,
+                          Key=f'results/{job_id}.json',
+                          Body=json.dumps(result, indent=2),
+                          ContentType='application/json',
+                          ServerSideEncryption='AES256'
+                      )
+                      
+                      # Update job status to completed
+                      table.update_item(
+                          Key={'jobId': job_id},
+                          UpdateExpression='SET #status = :status, #result = :result, #updatedAt = :timestamp',
+                          ExpressionAttributeNames={
+                              '#status': 'status',
+                              '#result': 'result',
+                              '#updatedAt': 'updatedAt'
+                          },
+                          ExpressionAttributeValues={
+                              ':status': 'completed',
+                              ':result': f's3://{results_bucket}/results/{job_id}.json',
+                              ':timestamp': datetime.now(timezone.utc).isoformat()
+                          }
+                      )
+                      
+                      print(f"Successfully processed job {job_id}")
+                      
+                  except Exception as e:
+                      print(f"Error processing job: {str(e)}")
+                      # Update job status to failed
+                      table.update_item(
+                          Key={'jobId': job_id},
+                          UpdateExpression='SET #status = :status, #error = :error, #updatedAt = :timestamp',
+                          ExpressionAttributeNames={
+                              '#status': 'status',
+                              '#error': 'error',
+                              '#updatedAt': 'updatedAt'
+                          },
+                          ExpressionAttributeValues={
+                              ':status': 'failed',
+                              ':error': str(e),
+                              ':timestamp': datetime.now(timezone.utc).isoformat()
+                          }
+                      )
+                      raise
+              
+              return {'statusCode': 200, 'body': 'Processing complete'}
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-job-processor'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Asynchronous job processing
+
+  # --------------------------------------------------------------------------
+  # LAMBDA FUNCTION: STATUS CHECKER
+  # --------------------------------------------------------------------------
+  StatusCheckerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-status-checker-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          JOBS_TABLE_NAME: !Ref JobsTable
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          
+          dynamodb = boto3.resource('dynamodb')
+          
+          def lambda_handler(event, context):
+              table_name = os.environ['JOBS_TABLE_NAME']
+              table = dynamodb.Table(table_name)
+              
+              # Extract job ID from path parameters
+              job_id = event.get('pathParameters', {}).get('jobId')
+              
+              if not job_id:
+                  return {
+                      'statusCode': 400,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Headers': 'Content-Type',
+                          'Access-Control-Allow-Methods': 'GET, OPTIONS'
+                      },
+                      'body': json.dumps({'error': 'Missing jobId parameter'})
+                  }
+              
+              try:
+                  response = table.get_item(Key={'jobId': job_id})
+                  
+                  if 'Item' not in response:
+                      return {
+                          'statusCode': 404,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Headers': 'Content-Type',
+                              'Access-Control-Allow-Methods': 'GET, OPTIONS'
+                          },
+                          'body': json.dumps({'error': 'Job not found'})
+                      }
+                  
+                  job = response['Item']
+                  
+                  # Format response
+                  response_body = {
+                      'jobId': job['jobId'],
+                      'status': job['status'],
+                      'createdAt': job['createdAt'],
+                      'updatedAt': job.get('updatedAt', job['createdAt']),
+                      'environment': os.environ.get('ENVIRONMENT', 'unknown')
+                  }
+                  
+                  # Include result or error if available
+                  if 'result' in job:
+                      response_body['result'] = job['result']
+                  if 'error' in job:
+                      response_body['error'] = job['error']
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Headers': 'Content-Type',
+                          'Access-Control-Allow-Methods': 'GET, OPTIONS'
+                      },
+                      'body': json.dumps(response_body)
+                  }
+                  
+              except Exception as e:
+                  print(f"Error checking job status: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Headers': 'Content-Type',
+                          'Access-Control-Allow-Methods': 'GET, OPTIONS'
+                      },
+                      'body': json.dumps({'error': 'Internal server error'})
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-status-checker'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Job status checking
+
+  # --------------------------------------------------------------------------
+  # SQS EVENT SOURCE MAPPING
+  # --------------------------------------------------------------------------
+  SQSEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt MainProcessingQueue.Arn
+      FunctionName: !GetAtt JobProcessorFunction.Arn
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      Enabled: true
+
+  # --------------------------------------------------------------------------
+  # API GATEWAY CLOUDWATCH LOG GROUP
+  # --------------------------------------------------------------------------
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  # --------------------------------------------------------------------------
+  # API GATEWAY ACCOUNT CONFIGURATION
+  # --------------------------------------------------------------------------
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Condition: EnableLogging
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Condition: EnableLogging
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  # --------------------------------------------------------------------------
+  # API GATEWAY REST API
+  # --------------------------------------------------------------------------
+  AsyncProcessingApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-api-${Environment}'
+      Description: Asynchronous job processing API
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      BinaryMediaTypes:
+        - application/octet-stream
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-api'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Asynchronous job processing
+
+  # --------------------------------------------------------------------------
+  # API GATEWAY RESOURCES
+  # --------------------------------------------------------------------------
+  # /submit resource
+  SubmitResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref AsyncProcessingApi
+      ParentId: !GetAtt AsyncProcessingApi.RootResourceId
+      PathPart: submit
+
+  # /status resource
+  StatusResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref AsyncProcessingApi
+      ParentId: !GetAtt AsyncProcessingApi.RootResourceId
+      PathPart: status
+
+  # /status/{jobId} resource
+  StatusJobResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref AsyncProcessingApi
+      ParentId: !Ref StatusResource
+      PathPart: '{jobId}'
+
+  # --------------------------------------------------------------------------
+  # API GATEWAY METHODS: /submit POST
+  # --------------------------------------------------------------------------
+  SubmitMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AsyncProcessingApi
+      ResourceId: !Ref SubmitResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/${MainProcessingQueue.QueueName}'
+        Credentials: !GetAtt ApiGatewayRole.Arn
+        RequestParameters:
+          integration.request.header.Content-Type: "'application/x-amz-json-1.0'"
+          integration.request.querystring.Action: "'SendMessage'"
+        RequestTemplates:
+          application/json: !Sub |
+            {
+              "MessageBody": "{\"jobId\": \"$context.requestId\", \"data\": $input.json('$'), \"timestamp\": \"$context.requestTime\", \"sourceIp\": \"$context.identity.sourceIp\"}",
+              "MessageAttributes": {
+                "environment": {
+                  "StringValue": "${Environment}",
+                  "DataType": "String"
+                },
+                "requestId": {
+                  "StringValue": "$context.requestId",
+                  "DataType": "String"
+                }
+              }
+            }
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseTemplates:
+              application/json: !Sub |
+                {
+                  "jobId": "$context.requestId",
+                  "status": "queued",
+                  "message": "Job submitted successfully",
+                  "timestamp": "$context.requestTime",
+                  "environment": "${Environment}"
+                }
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # OPTIONS method for CORS on /submit
+  SubmitOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AsyncProcessingApi
+      ResourceId: !Ref SubmitResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # --------------------------------------------------------------------------
+  # API GATEWAY METHODS: /status/{jobId} GET
+  # --------------------------------------------------------------------------
+  StatusMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AsyncProcessingApi
+      ResourceId: !Ref StatusJobResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.jobId: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${StatusCheckerFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # OPTIONS method for CORS on /status/{jobId}
+  StatusOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AsyncProcessingApi
+      ResourceId: !Ref StatusJobResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # --------------------------------------------------------------------------
+  # LAMBDA PERMISSIONS FOR API GATEWAY
+  # --------------------------------------------------------------------------
+  StatusCheckerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt StatusCheckerFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${AsyncProcessingApi}/*/*'
+
+  # --------------------------------------------------------------------------
+  # API GATEWAY DEPLOYMENT
+  # --------------------------------------------------------------------------
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - SubmitMethod
+      - SubmitOptionsMethod
+      - StatusMethod
+      - StatusOptionsMethod
+    Properties:
+      RestApiId: !Ref AsyncProcessingApi
+      Description: !Sub 'Deployment for ${Environment} environment'
+
+  # --------------------------------------------------------------------------
+  # API GATEWAY STAGE
+  # --------------------------------------------------------------------------
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref AsyncProcessingApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref Environment
+      Description: !Sub '${Environment} stage for asynchronous processing API'
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: !If [EnableLogging, !Ref ApiGatewayLogLevel, 'OFF']
+          DataTraceEnabled: !If [EnableLogging, true, false]
+          MetricsEnabled: true
+          ThrottlingBurstLimit: !If [IsProduction, 5000, 200]
+          ThrottlingRateLimit: !If [IsProduction, 2000, 100]
+      AccessLogSetting: !If
+        - EnableLogging
+        - DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+          Format: '$context.requestId $context.requestTime $context.httpMethod $context.resourcePath $context.status $context.error.message $context.error.messageString'
+        - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-api-stage'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # --------------------------------------------------------------------------
+  # CLOUDWATCH ALARMS
+  # --------------------------------------------------------------------------
+  # API Gateway 4XX Errors
+  ApiGateway4XXErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-api-4xx-errors-${Environment}'
+      AlarmDescription: 'API Gateway 4XX error rate is too high'
+      MetricName: 4XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !If [IsProduction, 10, 50]
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref AsyncProcessingApi
+        - Name: Stage
+          Value: !Ref Environment
+      TreatMissingData: notBreaching
+
+  # API Gateway 5XX Errors
+  ApiGateway5XXErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-api-5xx-errors-${Environment}'
+      AlarmDescription: 'API Gateway 5XX error rate is too high'
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref AsyncProcessingApi
+        - Name: Stage
+          Value: !Ref Environment
+      TreatMissingData: notBreaching
+
+  # Lambda Function Errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors-${Environment}'
+      AlarmDescription: 'Lambda function error rate is too high'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref JobProcessorFunction
+      TreatMissingData: notBreaching
+
+  # SQS DLQ Message Count
+  DLQMessageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-dlq-messages-${Environment}'
+      AlarmDescription: 'Messages detected in dead letter queue'
+      MetricName: ApproximateNumberOfVisibleMessages
+      Namespace: AWS/SQS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+      TreatMissingData: notBreaching
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+Outputs:
+  ApiEndpoint:
+    Description: 'API Gateway endpoint URL'
+    Value: !Sub 'https://${AsyncProcessingApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${ProjectName}-api-endpoint-${Environment}'
+
+  SubmitJobEndpoint:
+    Description: 'Endpoint for submitting jobs'
+    Value: !Sub 'https://${AsyncProcessingApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/submit'
+    Export:
+      Name: !Sub '${ProjectName}-submit-endpoint-${Environment}'
+
+  StatusCheckEndpoint:
+    Description: 'Endpoint for checking job status (append /{jobId})'
+    Value: !Sub 'https://${AsyncProcessingApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/status'
+    Export:
+      Name: !Sub '${ProjectName}-status-endpoint-${Environment}'
+
+  MainQueueUrl:
+    Description: 'Main processing queue URL'
+    Value: !Ref MainProcessingQueue
+    Export:
+      Name: !Sub '${ProjectName}-main-queue-url-${Environment}'
+
+  MainQueueArn:
+    Description: 'Main processing queue ARN'
+    Value: !GetAtt MainProcessingQueue.Arn
+    Export:
+      Name: !Sub '${ProjectName}-main-queue-arn-${Environment}'
+
+  DeadLetterQueueUrl:
+    Description: 'Dead letter queue URL'
+    Value: !Ref DeadLetterQueue
+    Export:
+      Name: !Sub '${ProjectName}-dlq-url-${Environment}'
+
+  JobsTableName:
+    Description: 'DynamoDB jobs table name'
+    Value: !Ref JobsTable
+    Export:
+      Name: !Sub '${ProjectName}-jobs-table-${Environment}'
+
+  ResultsBucketName:
+    Description: 'S3 results bucket name'
+    Value: !Ref ResultsBucket
+    Export:
+      Name: !Sub '${ProjectName}-results-bucket-${Environment}'
+
+  JobProcessorFunctionArn:
+    Description: 'Job processor Lambda function ARN'
+    Value: !GetAtt JobProcessorFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-job-processor-arn-${Environment}'
+
+  StatusCheckerFunctionArn:
+    Description: 'Status checker Lambda function ARN'
+    Value: !GetAtt StatusCheckerFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-status-checker-arn-${Environment}'
+
+  # Usage Examples
+  ExampleCurlSubmit:
+    Description: 'Example curl command to submit a job'
+    Value: !Sub |
+      curl -X POST \
+        -H "Content-Type: application/json" \
+        -d '{"task": "process_data", "data": {"input": "test data"}}' \
+        https://${AsyncProcessingApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/submit
+
+  ExampleCurlStatus:
+    Description: 'Example curl command to check job status (replace JOB_ID)'
+    Value: !Sub |
+      curl https://${AsyncProcessingApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/status/JOB_ID

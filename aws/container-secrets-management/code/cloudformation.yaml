@@ -1,0 +1,892 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Container Secrets Management with AWS Secrets Manager - Complete infrastructure for ECS and EKS secrets integration'
+
+Parameters:
+  # General Parameters
+  ProjectName:
+    Type: String
+    Default: 'secrets-demo'
+    Description: 'Name prefix for all resources'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must begin with a letter and contain only alphanumeric characters and hyphens'
+  
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment for deployment'
+  
+  # ECS Parameters
+  CreateECSResources:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Whether to create ECS-related resources'
+  
+  ECSTaskCPU:
+    Type: Number
+    Default: 256
+    AllowedValues: [256, 512, 1024, 2048, 4096]
+    Description: 'CPU units for ECS task (1024 = 1 vCPU)'
+  
+  ECSTaskMemory:
+    Type: Number
+    Default: 512
+    AllowedValues: [512, 1024, 2048, 4096, 8192, 16384, 30720]
+    Description: 'Memory (MB) for ECS task'
+  
+  # EKS Parameters
+  CreateEKSResources:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Whether to create EKS-related resources'
+  
+  EKSVersion:
+    Type: String
+    Default: '1.28'
+    AllowedValues: ['1.26', '1.27', '1.28', '1.29']
+    Description: 'EKS cluster version'
+  
+  EKSNodeGroupInstanceType:
+    Type: String
+    Default: 't3.medium'
+    AllowedValues: ['t3.small', 't3.medium', 't3.large', 'm5.large', 'm5.xlarge']
+    Description: 'Instance type for EKS node group'
+  
+  EKSNodeGroupMinSize:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: 'Minimum number of nodes in EKS node group'
+  
+  EKSNodeGroupMaxSize:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 20
+    Description: 'Maximum number of nodes in EKS node group'
+  
+  EKSNodeGroupDesiredSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: 'Desired number of nodes in EKS node group'
+  
+  # Secret Parameters
+  RotationSchedule:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: 'Number of days between automatic secret rotations'
+  
+  # Networking Parameters
+  VPCId:
+    Type: 'AWS::EC2::VPC::Id'
+    Description: 'VPC ID for EKS cluster (leave empty to use default VPC)'
+    Default: ''
+  
+  SubnetIds:
+    Type: 'List<AWS::EC2::Subnet::Id>'
+    Description: 'Subnet IDs for EKS cluster (leave empty to use default subnets)'
+    Default: ''
+
+Conditions:
+  CreateECS: !Equals [!Ref CreateECSResources, 'true']
+  CreateEKS: !Equals [!Ref CreateEKSResources, 'true']
+  CreateRotation: !Not [!Equals [!Ref RotationSchedule, 0]]
+  UseDefaultVPC: !Equals [!Ref VPCId, '']
+  UseDefaultSubnets: !Equals [!Join [',', !Ref SubnetIds], '']
+
+Resources:
+  # ============================================================================
+  # KMS Key for Secrets Encryption
+  # ============================================================================
+  SecretsKMSKey:
+    Type: 'AWS::KMS::Key'
+    Properties:
+      Description: !Sub 'KMS Key for ${ProjectName} secrets encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow Secrets Manager to use the key
+            Effect: Allow
+            Principal:
+              Service: secretsmanager.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+              - 'kms:CreateGrant'
+            Resource: '*'
+          - Sid: Allow Lambda to use the key
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-secrets-kms-key'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  SecretsKMSKeyAlias:
+    Type: 'AWS::KMS::Alias'
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-secrets-manager'
+      TargetKeyId: !Ref SecretsKMSKey
+
+  # ============================================================================
+  # Application Secrets
+  # ============================================================================
+  DatabaseSecret:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: !Sub '${ProjectName}-db-credentials'
+      Description: 'Database credentials for containerized applications'
+      KmsKeyId: !Ref SecretsKMSKey
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "appuser", "host": "demo-db.cluster-xyz.us-west-2.rds.amazonaws.com", "port": "5432", "database": "appdb"}'
+        GenerateStringKey: 'password'
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db-credentials'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: SecretType
+          Value: 'Database'
+
+  APIKeysSecret:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: !Sub '${ProjectName}-api-keys'
+      Description: 'API keys for external services'
+      KmsKeyId: !Ref SecretsKMSKey
+      SecretString: !Sub |
+        {
+          "github_token": "ghp_example_token_${AWS::AccountId}",
+          "stripe_key": "sk_test_example_key_${AWS::AccountId}",
+          "twilio_sid": "AC_example_sid_${AWS::AccountId}"
+        }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-api-keys'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: SecretType
+          Value: 'APIKeys'
+
+  # ============================================================================
+  # ECS Resources
+  # ============================================================================
+  ECSCluster:
+    Type: 'AWS::ECS::Cluster'
+    Condition: CreateECS
+    Properties:
+      ClusterName: !Sub '${ProjectName}-cluster'
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cluster'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ECSTaskExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Condition: CreateECS
+    Properties:
+      RoleName: !Sub '${ProjectName}-ecs-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ecs-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ECSTaskRole:
+    Type: 'AWS::IAM::Role'
+    Condition: CreateECS
+    Properties:
+      RoleName: !Sub '${ProjectName}-ecs-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                  - 'secretsmanager:DescribeSecret'
+                Resource:
+                  - !Ref DatabaseSecret
+                  - !Ref APIKeysSecret
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                Resource: !GetAtt SecretsKMSKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ecs-task-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ECSLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Condition: CreateECS
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}'
+      RetentionInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ecs-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ECSTaskDefinition:
+    Type: 'AWS::ECS::TaskDefinition'
+    Condition: CreateECS
+    Properties:
+      Family: !Sub '${ProjectName}-task'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref ECSTaskCPU
+      Memory: !Ref ECSTaskMemory
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: demo-app
+          Image: 'nginx:latest'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 80
+              Protocol: tcp
+          Secrets:
+            - Name: DB_USERNAME
+              ValueFrom: !Sub '${DatabaseSecret}:username::'
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub '${DatabaseSecret}:password::'
+            - Name: DB_HOST
+              ValueFrom: !Sub '${DatabaseSecret}:host::'
+            - Name: DB_PORT
+              ValueFrom: !Sub '${DatabaseSecret}:port::'
+            - Name: DB_NAME
+              ValueFrom: !Sub '${DatabaseSecret}:database::'
+            - Name: GITHUB_TOKEN
+              ValueFrom: !Sub '${APIKeysSecret}:github_token::'
+            - Name: STRIPE_KEY
+              ValueFrom: !Sub '${APIKeysSecret}:stripe_key::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: ecs
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-task-definition'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # EKS Resources
+  # ============================================================================
+  EKSServiceRole:
+    Type: 'AWS::IAM::Role'
+    Condition: CreateEKS
+    Properties:
+      RoleName: !Sub '${ProjectName}-eks-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonEKSClusterPolicy'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-eks-service-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  EKSNodeGroupRole:
+    Type: 'AWS::IAM::Role'
+    Condition: CreateEKS
+    Properties:
+      RoleName: !Sub '${ProjectName}-eks-nodegroup-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy'
+        - 'arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy'
+        - 'arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-eks-nodegroup-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  EKSPodRole:
+    Type: 'AWS::IAM::Role'
+    Condition: CreateEKS
+    Properties:
+      RoleName: !Sub '${ProjectName}-eks-pod-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/${EKSCluster.OpenIdConnectIssuerUrl}'
+            Action: 'sts:AssumeRoleWithWebIdentity'
+            Condition:
+              StringEquals:
+                !Sub '${EKSCluster.OpenIdConnectIssuerUrl}:sub': 'system:serviceaccount:default:secrets-demo-sa'
+                !Sub '${EKSCluster.OpenIdConnectIssuerUrl}:aud': 'sts.amazonaws.com'
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                  - 'secretsmanager:DescribeSecret'
+                Resource:
+                  - !Ref DatabaseSecret
+                  - !Ref APIKeysSecret
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                Resource: !GetAtt SecretsKMSKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-eks-pod-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Get Default VPC and Subnets when not provided
+  DefaultVPC:
+    Type: 'AWS::EC2::VPC'
+    Condition: UseDefaultVPC
+    Properties:
+      CidrBlock: '10.0.0.0/16'
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DefaultSubnet1:
+    Type: 'AWS::EC2::Subnet'
+    Condition: UseDefaultVPC
+    Properties:
+      VpcId: !Ref DefaultVPC
+      CidrBlock: '10.0.1.0/24'
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DefaultSubnet2:
+    Type: 'AWS::EC2::Subnet'
+    Condition: UseDefaultVPC
+    Properties:
+      VpcId: !Ref DefaultVPC
+      CidrBlock: '10.0.2.0/24'
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DefaultInternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+    Condition: UseDefaultVPC
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-igw'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DefaultVPCGatewayAttachment:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Condition: UseDefaultVPC
+    Properties:
+      VpcId: !Ref DefaultVPC
+      InternetGatewayId: !Ref DefaultInternetGateway
+
+  DefaultRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Condition: UseDefaultVPC
+    Properties:
+      VpcId: !Ref DefaultVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rt'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DefaultRoute:
+    Type: 'AWS::EC2::Route'
+    Condition: UseDefaultVPC
+    DependsOn: DefaultVPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref DefaultRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref DefaultInternetGateway
+
+  DefaultSubnet1RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: UseDefaultVPC
+    Properties:
+      SubnetId: !Ref DefaultSubnet1
+      RouteTableId: !Ref DefaultRouteTable
+
+  DefaultSubnet2RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: UseDefaultVPC
+    Properties:
+      SubnetId: !Ref DefaultSubnet2
+      RouteTableId: !Ref DefaultRouteTable
+
+  EKSCluster:
+    Type: 'AWS::EKS::Cluster'
+    Condition: CreateEKS
+    Properties:
+      Name: !Sub '${ProjectName}-cluster'
+      Version: !Ref EKSVersion
+      RoleArn: !GetAtt EKSServiceRole.Arn
+      ResourcesVpcConfig:
+        SubnetIds: !If
+          - UseDefaultVPC
+          - [!Ref DefaultSubnet1, !Ref DefaultSubnet2]
+          - !Ref SubnetIds
+        SecurityGroupIds: []
+        EndpointConfigPrivate: false
+        EndpointConfigPublic: true
+        PublicAccessCidrs: ['0.0.0.0/0']
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+            - Type: controllerManager
+            - Type: scheduler
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cluster'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  EKSNodeGroup:
+    Type: 'AWS::EKS::Nodegroup'
+    Condition: CreateEKS
+    Properties:
+      ClusterName: !Ref EKSCluster
+      NodegroupName: !Sub '${ProjectName}-nodes'
+      NodeRole: !GetAtt EKSNodeGroupRole.Arn
+      Subnets: !If
+        - UseDefaultVPC
+        - [!Ref DefaultSubnet1, !Ref DefaultSubnet2]
+        - !Ref SubnetIds
+      InstanceTypes:
+        - !Ref EKSNodeGroupInstanceType
+      AmiType: AL2_x86_64
+      CapacityType: ON_DEMAND
+      DiskSize: 20
+      ScalingConfig:
+        MinSize: !Ref EKSNodeGroupMinSize
+        MaxSize: !Ref EKSNodeGroupMaxSize
+        DesiredSize: !Ref EKSNodeGroupDesiredSize
+      UpdateConfig:
+        MaxUnavailable: 1
+      Tags:
+        Name: !Sub '${ProjectName}-nodes'
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  # ============================================================================
+  # Secret Rotation Lambda Function
+  # ============================================================================
+  RotationLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Condition: CreateRotation
+    Properties:
+      RoleName: !Sub '${ProjectName}-rotation-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: SecretsManagerRotation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                  - 'secretsmanager:DescribeSecret'
+                  - 'secretsmanager:UpdateSecret'
+                  - 'secretsmanager:GetRandomPassword'
+                Resource:
+                  - !Ref DatabaseSecret
+                  - !Ref APIKeysSecret
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:GenerateDataKey'
+                Resource: !GetAtt SecretsKMSKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rotation-lambda-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  RotationLambdaLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Condition: CreateRotation
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-rotation'
+      RetentionInDays: 14
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rotation-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  RotationLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Condition: CreateRotation
+    Properties:
+      FunctionName: !Sub '${ProjectName}-rotation'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt RotationLambdaRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          from datetime import datetime, timedelta
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              client = boto3.client('secretsmanager')
+              
+              # Get the secret ARN from the event
+              secret_arn = event['Step']
+              
+              try:
+                  # Generate new random password
+                  new_password = boto3.client('secretsmanager').get_random_password(
+                      PasswordLength=32,
+                      ExcludeCharacters='"@/\\'
+                  )['RandomPassword']
+                  
+                  # Get current secret
+                  current_secret = client.get_secret_value(SecretId=secret_arn)
+                  secret_dict = json.loads(current_secret['SecretString'])
+                  
+                  # Update password
+                  secret_dict['password'] = new_password
+                  
+                  # Update secret
+                  client.update_secret(
+                      SecretId=secret_arn,
+                      SecretString=json.dumps(secret_dict)
+                  )
+                  
+                  logger.info(f"Successfully rotated secret: {secret_arn}")
+                  return {'statusCode': 200, 'body': 'Secret rotated successfully'}
+                  
+              except Exception as e:
+                  logger.error(f"Error rotating secret: {str(e)}")
+                  raise e
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rotation'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Secret Rotation Configuration
+  DatabaseSecretRotation:
+    Type: 'AWS::SecretsManager::RotationSchedule'
+    Condition: CreateRotation
+    Properties:
+      SecretId: !Ref DatabaseSecret
+      RotationLambdaArn: !GetAtt RotationLambdaFunction.Arn
+      RotationInterval: !Ref RotationSchedule
+
+  # ============================================================================
+  # Monitoring and Alerting
+  # ============================================================================
+  UnauthorizedAccessAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${ProjectName}-unauthorized-access'
+      AlarmDescription: 'Alert on unauthorized secret access attempts'
+      MetricName: UnauthorizedAPICallsCount
+      Namespace: AWS/Secrets
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-unauthorized-access-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  SecretsManagerLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/secretsmanager/${ProjectName}'
+      RetentionInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-secrets-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  # General Outputs
+  ProjectName:
+    Description: 'Project name for resource identification'
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectName'
+
+  Environment:
+    Description: 'Deployment environment'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+  # KMS and Secrets Outputs
+  KMSKeyId:
+    Description: 'KMS Key ID for secrets encryption'
+    Value: !Ref SecretsKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyId'
+
+  KMSKeyArn:
+    Description: 'KMS Key ARN for secrets encryption'
+    Value: !GetAtt SecretsKMSKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyArn'
+
+  DatabaseSecretArn:
+    Description: 'Database secret ARN'
+    Value: !Ref DatabaseSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseSecretArn'
+
+  APIKeysSecretArn:
+    Description: 'API keys secret ARN'
+    Value: !Ref APIKeysSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-APIKeysSecretArn'
+
+  # ECS Outputs
+  ECSClusterArn:
+    Condition: CreateECS
+    Description: 'ECS Cluster ARN'
+    Value: !GetAtt ECSCluster.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSClusterArn'
+
+  ECSClusterName:
+    Condition: CreateECS
+    Description: 'ECS Cluster Name'
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSClusterName'
+
+  ECSTaskDefinitionArn:
+    Condition: CreateECS
+    Description: 'ECS Task Definition ARN'
+    Value: !Ref ECSTaskDefinition
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSTaskDefinitionArn'
+
+  ECSTaskRoleArn:
+    Condition: CreateECS
+    Description: 'ECS Task Role ARN'
+    Value: !GetAtt ECSTaskRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSTaskRoleArn'
+
+  # EKS Outputs
+  EKSClusterArn:
+    Condition: CreateEKS
+    Description: 'EKS Cluster ARN'
+    Value: !GetAtt EKSCluster.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EKSClusterArn'
+
+  EKSClusterName:
+    Condition: CreateEKS
+    Description: 'EKS Cluster Name'
+    Value: !Ref EKSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-EKSClusterName'
+
+  EKSClusterEndpoint:
+    Condition: CreateEKS
+    Description: 'EKS Cluster Endpoint'
+    Value: !GetAtt EKSCluster.Endpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-EKSClusterEndpoint'
+
+  EKSPodRoleArn:
+    Condition: CreateEKS
+    Description: 'EKS Pod Role ARN for IRSA'
+    Value: !GetAtt EKSPodRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EKSPodRoleArn'
+
+  EKSNodeGroupArn:
+    Condition: CreateEKS
+    Description: 'EKS Node Group ARN'
+    Value: !GetAtt EKSNodeGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EKSNodeGroupArn'
+
+  # Lambda Outputs
+  RotationLambdaArn:
+    Condition: CreateRotation
+    Description: 'Rotation Lambda Function ARN'
+    Value: !GetAtt RotationLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RotationLambdaArn'
+
+  # Monitoring Outputs
+  UnauthorizedAccessAlarmArn:
+    Description: 'Unauthorized access alarm ARN'
+    Value: !GetAtt UnauthorizedAccessAlarm.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-UnauthorizedAccessAlarmArn'
+
+  SecretsManagerLogGroupArn:
+    Description: 'Secrets Manager log group ARN'
+    Value: !GetAtt SecretsManagerLogGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SecretsManagerLogGroupArn'
+
+  # Usage Instructions
+  DeploymentInstructions:
+    Description: 'Next steps for deployment'
+    Value: !Sub |
+      1. Deploy this CloudFormation template
+      2. Update your kubeconfig: aws eks update-kubeconfig --name ${ProjectName}-cluster
+      3. Install Secrets Store CSI Driver: helm install csi-secrets-store secrets-store-csi-driver/secrets-store-csi-driver --namespace kube-system
+      4. Install AWS Secrets Provider: helm install secrets-provider-aws aws-secrets-manager/secrets-store-csi-driver-provider-aws --namespace kube-system
+      5. Create Kubernetes service account: kubectl create serviceaccount secrets-demo-sa
+      6. Annotate service account: kubectl annotate serviceaccount secrets-demo-sa eks.amazonaws.com/role-arn=${EKSPodRoleArn}
+      7. Deploy SecretProviderClass and application pods as shown in the recipe

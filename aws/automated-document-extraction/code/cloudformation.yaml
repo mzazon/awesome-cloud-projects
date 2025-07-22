@@ -1,0 +1,558 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Intelligent Document Processing with Amazon Textract
+  This template creates a serverless document processing pipeline using Amazon Textract,
+  S3, and Lambda to automatically extract text and structured data from uploaded documents.
+
+# Template parameters for customization
+Parameters:
+  ProjectName:
+    Type: String
+    Default: textract-processor
+    Description: Name prefix for all resources
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    MinLength: 3
+    MaxLength: 20
+    ConstraintDescription: Must be lowercase letters, numbers, and hyphens only
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    Description: Environment name for resource tagging and naming
+
+  DocumentPrefix:
+    Type: String
+    Default: documents/
+    Description: S3 prefix for uploaded documents that trigger processing
+    AllowedPattern: '^[a-zA-Z0-9/_-]*/$'
+    ConstraintDescription: Must end with / and contain only alphanumeric, underscore, hyphen, and forward slash
+
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 30
+    MaxValue: 900
+    Description: Lambda function timeout in seconds
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+    Description: Lambda function memory allocation in MB
+
+  S3VersioningEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable S3 bucket versioning for document history
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: Optional email address for processing notifications
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address or empty
+
+# Conditions for optional resources
+Conditions:
+  EnableVersioning: !Equals [!Ref S3VersioningEnabled, 'true']
+  EnableNotifications: !Not [!Equals [!Ref NotificationEmail, '']]
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+# CloudFormation resources
+Resources:
+
+  # S3 Bucket for document storage
+  DocumentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-documents-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [EnableVersioning, Enabled, Suspended]
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: TransitionToGlacier
+            Status: !If [IsProduction, Enabled, Disabled]
+            Transition:
+              StorageClass: GLACIER
+              TransitionInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt TextractProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: !Ref DocumentPrefix
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DocumentProcessing
+
+  # IAM Role for Lambda function
+  TextractProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-textract-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: TextractProcessorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3 permissions for document bucket
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub '${DocumentBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Ref DocumentBucket
+              # Textract permissions
+              - Effect: Allow
+                Action:
+                  - textract:DetectDocumentText
+                  - textract:AnalyzeDocument
+                  - textract:StartDocumentTextDetection
+                  - textract:StartDocumentAnalysis
+                  - textract:GetDocumentTextDetection
+                  - textract:GetDocumentAnalysis
+                Resource: '*'
+              # CloudWatch Logs permissions (additional to basic execution role)
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda function for document processing
+  TextractProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-processor-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt TextractProcessorRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref DocumentBucket
+          RESULTS_PREFIX: results/
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib.parse
+          import os
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              """
+              Process documents uploaded to S3 using Amazon Textract
+              Supports both synchronous and asynchronous processing based on document size
+              """
+              
+              # Initialize AWS clients
+              s3_client = boto3.client('s3')
+              textract_client = boto3.client('textract')
+              
+              # Environment variables
+              bucket_name = os.environ.get('BUCKET_NAME')
+              results_prefix = os.environ.get('RESULTS_PREFIX', 'results/')
+              environment = os.environ.get('ENVIRONMENT', 'dev')
+              
+              try:
+                  # Parse S3 event
+                  for record in event['Records']:
+                      bucket = record['s3']['bucket']['name']
+                      key = urllib.parse.unquote_plus(
+                          record['s3']['object']['key'], 
+                          encoding='utf-8'
+                      )
+                      
+                      print(f"Processing document: {key} from bucket: {bucket}")
+                      
+                      # Get object metadata to determine processing approach
+                      try:
+                          obj_metadata = s3_client.head_object(Bucket=bucket, Key=key)
+                          file_size = obj_metadata['ContentLength']
+                          print(f"Document size: {file_size} bytes")
+                      except Exception as e:
+                          print(f"Error getting object metadata: {str(e)}")
+                          continue
+                      
+                      # Process document with Textract
+                      results = process_document(textract_client, bucket, key, file_size)
+                      
+                      if results:
+                          # Save results to S3
+                          save_results(s3_client, bucket, key, results, results_prefix)
+                          print(f"Successfully processed: {key}")
+                      else:
+                          print(f"Failed to process: {key}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Documents processed successfully',
+                          'processed_count': len(event['Records'])
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in lambda_handler: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'message': 'Document processing failed'
+                      })
+                  }
+          
+          def process_document(textract_client, bucket, key, file_size):
+              """
+              Process document using appropriate Textract API based on size and type
+              """
+              
+              try:
+                  # Use synchronous processing for smaller documents
+                  if file_size < 5 * 1024 * 1024:  # 5MB threshold
+                      response = textract_client.detect_document_text(
+                          Document={
+                              'S3Object': {
+                                  'Bucket': bucket,
+                                  'Name': key
+                              }
+                          }
+                      )
+                      
+                      # Process synchronous response
+                      return parse_textract_response(response, key)
+                  
+                  else:
+                      # For larger documents, you would use asynchronous processing
+                      # This is a simplified version for the demo
+                      print(f"Document {key} is large ({file_size} bytes). Consider async processing.")
+                      return None
+                      
+              except Exception as e:
+                  print(f"Error processing document {key}: {str(e)}")
+                  return None
+          
+          def parse_textract_response(response, document_key):
+              """
+              Parse Textract response and extract meaningful data
+              """
+              
+              extracted_text = ""
+              confidence_scores = []
+              line_count = 0
+              word_count = 0
+              
+              for block in response.get('Blocks', []):
+                  if block['BlockType'] == 'LINE':
+                      extracted_text += block['Text'] + '\n'
+                      confidence_scores.append(block['Confidence'])
+                      line_count += 1
+                  elif block['BlockType'] == 'WORD':
+                      word_count += 1
+              
+              # Calculate statistics
+              avg_confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0
+              min_confidence = min(confidence_scores) if confidence_scores else 0
+              max_confidence = max(confidence_scores) if confidence_scores else 0
+              
+              return {
+                  'document': document_key,
+                  'extracted_text': extracted_text.strip(),
+                  'statistics': {
+                      'total_blocks': len(response.get('Blocks', [])),
+                      'line_count': line_count,
+                      'word_count': word_count,
+                      'confidence': {
+                          'average': round(avg_confidence, 2),
+                          'minimum': round(min_confidence, 2),
+                          'maximum': round(max_confidence, 2)
+                      }
+                  },
+                  'processing_info': {
+                      'processed_at': datetime.utcnow().isoformat(),
+                      'status': 'completed',
+                      'processor': 'textract-sync'
+                  },
+                  'metadata': {
+                      'textract_response_metadata': response.get('ResponseMetadata', {})
+                  }
+              }
+          
+          def save_results(s3_client, bucket, original_key, results, results_prefix):
+              """
+              Save processing results back to S3
+              """
+              
+              try:
+                  # Generate results key
+                  filename = original_key.split('/')[-1]
+                  results_key = f"{results_prefix}{filename}_results.json"
+                  
+                  # Upload results
+                  s3_client.put_object(
+                      Bucket=bucket,
+                      Key=results_key,
+                      Body=json.dumps(results, indent=2, ensure_ascii=False),
+                      ContentType='application/json',
+                      Metadata={
+                          'original-document': original_key,
+                          'processor': 'textract-lambda'
+                      }
+                  )
+                  
+                  print(f"Results saved to: s3://{bucket}/{results_key}")
+                  return results_key
+                  
+              except Exception as e:
+                  print(f"Error saving results: {str(e)}")
+                  return None
+      Description: !Sub 'Processes documents using Amazon Textract for ${ProjectName}'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda permission for S3 to invoke function
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TextractProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt DocumentBucket.Arn
+
+  # CloudWatch Log Group for Lambda function
+  TextractProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${TextractProcessorFunction}'
+      RetentionInDays: !If [IsProduction, 30, 14]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SNS Topic for notifications (conditional)
+  ProcessingNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnableNotifications
+    Properties:
+      TopicName: !Sub '${ProjectName}-processing-notifications-${Environment}'
+      DisplayName: Document Processing Notifications
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SNS Subscription for email notifications (conditional)
+  EmailNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: EnableNotifications
+    Properties:
+      Protocol: email
+      TopicArn: !Ref ProcessingNotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Alarms for monitoring
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors-${Environment}'
+      AlarmDescription: Lambda function error rate alarm
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TextractProcessorFunction
+      AlarmActions: !If
+        - EnableNotifications
+        - [!Ref ProcessingNotificationTopic]
+        - []
+      TreatMissingData: notBreaching
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-duration-${Environment}'
+      AlarmDescription: Lambda function duration alarm
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref LambdaTimeout
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TextractProcessorFunction
+      AlarmActions: !If
+        - EnableNotifications
+        - [!Ref ProcessingNotificationTopic]
+        - []
+      TreatMissingData: notBreaching
+
+# CloudFormation outputs
+Outputs:
+  DocumentBucketName:
+    Description: Name of the S3 bucket for document uploads
+    Value: !Ref DocumentBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DocumentBucket'
+
+  DocumentBucketArn:
+    Description: ARN of the S3 bucket for document uploads
+    Value: !GetAtt DocumentBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DocumentBucketArn'
+
+  LambdaFunctionName:
+    Description: Name of the Lambda function processing documents
+    Value: !Ref TextractProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
+
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function processing documents
+    Value: !GetAtt TextractProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  DocumentUploadUrl:
+    Description: S3 URL for document uploads
+    Value: !Sub 'https://${DocumentBucket}.s3.${AWS::Region}.amazonaws.com/${DocumentPrefix}'
+
+  ProcessingResultsUrl:
+    Description: S3 URL for processing results
+    Value: !Sub 'https://${DocumentBucket}.s3.${AWS::Region}.amazonaws.com/results/'
+
+  IAMRoleArn:
+    Description: ARN of the IAM role used by Lambda
+    Value: !GetAtt TextractProcessorRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IAMRole'
+
+  NotificationTopicArn:
+    Condition: EnableNotifications
+    Description: ARN of the SNS topic for notifications
+    Value: !Ref ProcessingNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopic'
+
+  CloudWatchLogGroup:
+    Description: CloudWatch Log Group for Lambda function
+    Value: !Ref TextractProcessorLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  DeploymentInfo:
+    Description: Deployment information and next steps
+    Value: !Sub |
+      Stack deployed successfully! 
+      
+      Upload documents to: s3://${DocumentBucket}/${DocumentPrefix}
+      View results at: s3://${DocumentBucket}/results/
+      Monitor logs: https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/$252Faws$252Flambda$252F${TextractProcessorFunction}
+      
+      Example upload command:
+      aws s3 cp your-document.pdf s3://${DocumentBucket}/${DocumentPrefix}
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Document Processing Settings"
+        Parameters:
+          - DocumentPrefix
+          - LambdaTimeout
+          - LambdaMemorySize
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - S3VersioningEnabled
+      - Label:
+          default: "Notification Settings"
+        Parameters:
+          - NotificationEmail
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      DocumentPrefix:
+        default: "Document S3 Prefix"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Memory (MB)"
+      S3VersioningEnabled:
+        default: "Enable S3 Versioning"
+      NotificationEmail:
+        default: "Notification Email"

@@ -1,0 +1,751 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Containerized Web Application deployment using AWS App Runner and RDS.
+  This template creates a complete infrastructure including VPC, RDS database,
+  Secrets Manager, IAM roles, and App Runner service with CloudWatch monitoring.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Application Configuration"
+        Parameters:
+          - ApplicationName
+          - Environment
+          - ContainerImageUri
+      - Label:
+          default: "Database Configuration"
+        Parameters:
+          - DatabaseInstanceClass
+          - DatabaseAllocatedStorage
+          - DatabaseEngine
+          - DatabaseEngineVersion
+          - MasterUsername
+          - MasterPassword
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcCidr
+          - PrivateSubnet1Cidr
+          - PrivateSubnet2Cidr
+          - AvailabilityZone1
+          - AvailabilityZone2
+      - Label:
+          default: "App Runner Configuration"
+        Parameters:
+          - AppRunnerCpu
+          - AppRunnerMemory
+          - HealthCheckPath
+          - AutoDeploymentsEnabled
+    ParameterLabels:
+      ApplicationName:
+        default: "Application Name"
+      Environment:
+        default: "Environment"
+      ContainerImageUri:
+        default: "Container Image URI"
+      DatabaseInstanceClass:
+        default: "Database Instance Class"
+      DatabaseAllocatedStorage:
+        default: "Database Storage (GB)"
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Description: Name of the application (used for resource naming)
+    Default: webapp
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9-]*$
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+    MinLength: 3
+    MaxLength: 32
+
+  Environment:
+    Type: String
+    Description: Environment name (dev, staging, prod)
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  ContainerImageUri:
+    Type: String
+    Description: ECR URI for the container image (format: account.dkr.ecr.region.amazonaws.com/repo:tag)
+    AllowedPattern: ^\d{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com\/[a-z0-9-_]+:[a-zA-Z0-9-_\.]+$
+    ConstraintDescription: Must be a valid ECR image URI
+
+  DatabaseInstanceClass:
+    Type: String
+    Description: RDS instance class
+    Default: db.t3.micro
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+      - db.t3.large
+      - db.t3.xlarge
+      - db.t3.2xlarge
+
+  DatabaseAllocatedStorage:
+    Type: Number
+    Description: Database storage size in GB
+    Default: 20
+    MinValue: 20
+    MaxValue: 1000
+    ConstraintDescription: Must be between 20 and 1000 GB
+
+  DatabaseEngine:
+    Type: String
+    Description: Database engine
+    Default: postgres
+    AllowedValues:
+      - postgres
+      - mysql
+
+  DatabaseEngineVersion:
+    Type: String
+    Description: Database engine version
+    Default: '14.9'
+
+  MasterUsername:
+    Type: String
+    Description: Database master username
+    Default: postgres
+    MinLength: 4
+    MaxLength: 16
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9]*$
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters
+
+  MasterPassword:
+    Type: String
+    Description: Database master password (stored securely in Secrets Manager)
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    AllowedPattern: ^[a-zA-Z0-9!@#$%^&*()_+=-]*$
+    ConstraintDescription: Must be 8-41 characters with letters, numbers, and special characters
+
+  VpcCidr:
+    Type: String
+    Description: CIDR block for VPC
+    Default: 10.0.0.0/16
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Description: CIDR block for private subnet 1
+    Default: 10.0.1.0/24
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Description: CIDR block for private subnet 2
+    Default: 10.0.2.0/24
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+
+  AvailabilityZone1:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: First availability zone
+
+  AvailabilityZone2:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Second availability zone
+
+  AppRunnerCpu:
+    Type: String
+    Description: CPU allocation for App Runner service
+    Default: '0.25 vCPU'
+    AllowedValues:
+      - '0.25 vCPU'
+      - '0.5 vCPU'
+      - '1 vCPU'
+      - '2 vCPU'
+      - '4 vCPU'
+
+  AppRunnerMemory:
+    Type: String
+    Description: Memory allocation for App Runner service
+    Default: '0.5 GB'
+    AllowedValues:
+      - '0.5 GB'
+      - '1 GB'
+      - '2 GB'
+      - '3 GB'
+      - '4 GB'
+      - '6 GB'
+      - '8 GB'
+      - '10 GB'
+      - '12 GB'
+
+  HealthCheckPath:
+    Type: String
+    Description: Health check path for App Runner service
+    Default: /health
+
+  AutoDeploymentsEnabled:
+    Type: String
+    Description: Enable automatic deployments when new image is pushed
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Conditions:
+  # Condition to check if auto deployments should be enabled
+  EnableAutoDeployments: !Equals [!Ref AutoDeploymentsEnabled, 'true']
+
+  # Condition for production environment optimizations
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+  # Condition for PostgreSQL engine
+  IsPostgreSQL: !Equals [!Ref DatabaseEngine, 'postgres']
+
+Resources:
+  # VPC and Networking Resources
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # Internet Gateway for VPC
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-igw'
+        - Key: Environment
+          Value: !Ref Environment
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # Private Subnets for RDS
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AvailabilityZone1
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-private-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Type
+          Value: Private
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AvailabilityZone2
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-private-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Type
+          Value: Private
+
+  # Route Tables
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-private-rt'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet2
+
+  # Security Group for RDS
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for RDS database
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !If [IsPostgreSQL, 5432, 3306]
+          ToPort: !If [IsPostgreSQL, 5432, 3306]
+          CidrIp: !Ref VpcCidr
+          Description: !Sub 'Allow ${DatabaseEngine} access from VPC'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-db-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # RDS Subnet Group
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${ApplicationName}-${Environment}-db-subnet-group'
+      DBSubnetGroupDescription: Subnet group for RDS database
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-db-subnet-group'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # RDS Database Instance
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${ApplicationName}-${Environment}-db'
+      DBInstanceClass: !Ref DatabaseInstanceClass
+      Engine: !Ref DatabaseEngine
+      EngineVersion: !Ref DatabaseEngineVersion
+      MasterUsername: !Ref MasterUsername
+      MasterUserPassword: !Ref MasterPassword
+      AllocatedStorage: !Ref DatabaseAllocatedStorage
+      StorageType: gp2
+      StorageEncrypted: true
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      BackupRetentionPeriod: !If [IsProduction, 30, 7]
+      MultiAZ: !If [IsProduction, true, false]
+      PubliclyAccessible: false
+      DeletionProtection: !If [IsProduction, true, false]
+      EnablePerformanceInsights: !If [IsProduction, true, false]
+      MonitoringInterval: !If [IsProduction, 60, 0]
+      MonitoringRoleArn: !If [IsProduction, !GetAtt EnhancedMonitoringRole.Arn, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-database'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # Enhanced Monitoring Role for RDS (Production only)
+  EnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Condition: IsProduction
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole'
+      Path: /
+      RoleName: !Sub '${ApplicationName}-${Environment}-rds-monitoring-role'
+
+  # Secrets Manager Secret for Database Credentials
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ApplicationName}-${Environment}-db-credentials'
+      Description: Database credentials for the web application
+      SecretString: !Sub |
+        {
+          "username": "${MasterUsername}",
+          "password": "${MasterPassword}",
+          "host": "${Database.Endpoint.Address}",
+          "port": ${Database.Endpoint.Port},
+          "dbname": "${Database.DBName}"
+        }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-db-secret'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # IAM Role for App Runner Service (ECR Access)
+  AppRunnerServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-${Environment}-apprunner-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: build.apprunner.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-apprunner-service-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for App Runner Instance (Runtime Permissions)
+  AppRunnerInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-${Environment}-apprunner-instance-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: tasks.apprunner.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref DatabaseSecret
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/apprunner/${ApplicationName}-${Environment}*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-apprunner-instance-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # App Runner Service
+  AppRunnerService:
+    Type: AWS::AppRunner::Service
+    DependsOn:
+      - Database
+      - DatabaseSecret
+    Properties:
+      ServiceName: !Sub '${ApplicationName}-${Environment}'
+      SourceConfiguration:
+        ImageRepository:
+          ImageIdentifier: !Ref ContainerImageUri
+          ImageConfiguration:
+            Port: '8080'
+            RuntimeEnvironmentVariables:
+              NODE_ENV: !Ref Environment
+              AWS_REGION: !Ref AWS::Region
+              DB_SECRET_NAME: !Ref DatabaseSecret
+          ImageRepositoryType: ECR
+        AutoDeploymentsEnabled: !If [EnableAutoDeployments, true, false]
+      InstanceConfiguration:
+        Cpu: !Ref AppRunnerCpu
+        Memory: !Ref AppRunnerMemory
+        InstanceRoleArn: !GetAtt AppRunnerInstanceRole.Arn
+      HealthCheckConfiguration:
+        Protocol: HTTP
+        Path: !Ref HealthCheckPath
+        Interval: 10
+        Timeout: 5
+        HealthyThreshold: 1
+        UnhealthyThreshold: 5
+      NetworkConfiguration:
+        EgressConfiguration:
+          EgressType: DEFAULT
+      ObservabilityConfiguration:
+        ObservabilityEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-apprunner'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # CloudWatch Log Groups
+  AppRunnerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apprunner/${ApplicationName}-${Environment}/application'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-apprunner-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarms
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-high-cpu'
+      AlarmDescription: Alert when CPU exceeds 80%
+      MetricName: CPUUtilization
+      Namespace: AWS/AppRunner
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ServiceName
+          Value: !Sub '${ApplicationName}-${Environment}'
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-high-cpu-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+  HighMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-high-memory'
+      AlarmDescription: Alert when memory exceeds 80%
+      MetricName: MemoryUtilization
+      Namespace: AWS/AppRunner
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ServiceName
+          Value: !Sub '${ApplicationName}-${Environment}'
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-high-memory-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+  HighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-high-latency'
+      AlarmDescription: Alert when response time exceeds 2 seconds
+      MetricName: RequestLatency
+      Namespace: AWS/AppRunner
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 2000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ServiceName
+          Value: !Sub '${ApplicationName}-${Environment}'
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-high-latency-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Dashboard
+  ApplicationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ApplicationName}-${Environment}-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/AppRunner", "CPUUtilization", "ServiceName", "${ApplicationName}-${Environment}" ],
+                  [ ".", "MemoryUtilization", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "App Runner Resource Utilization",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/AppRunner", "RequestLatency", "ServiceName", "${ApplicationName}-${Environment}" ],
+                  [ ".", "2xxStatusResponses", ".", "." ],
+                  [ ".", "4xxStatusResponses", ".", "." ],
+                  [ ".", "5xxStatusResponses", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "App Runner Performance Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", "${ApplicationName}-${Environment}-db" ],
+                  [ ".", "DatabaseConnections", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "RDS Database Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "log",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/apprunner/${ApplicationName}-${Environment}/application'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Application Logs",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  # Network Outputs
+  VPCId:
+    Description: ID of the VPC
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-VPC-ID'
+
+  PrivateSubnet1Id:
+    Description: ID of private subnet 1
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-PrivateSubnet1-ID'
+
+  PrivateSubnet2Id:
+    Description: ID of private subnet 2
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-PrivateSubnet2-ID'
+
+  # Database Outputs
+  DatabaseEndpoint:
+    Description: RDS database endpoint
+    Value: !GetAtt Database.Endpoint.Address
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-Database-Endpoint'
+
+  DatabasePort:
+    Description: RDS database port
+    Value: !GetAtt Database.Endpoint.Port
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-Database-Port'
+
+  DatabaseSecretArn:
+    Description: ARN of the database credentials secret
+    Value: !Ref DatabaseSecret
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-Database-Secret-ARN'
+
+  # App Runner Outputs
+  AppRunnerServiceUrl:
+    Description: URL of the App Runner service
+    Value: !Sub 'https://${AppRunnerService.ServiceUrl}'
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-AppRunner-URL'
+
+  AppRunnerServiceArn:
+    Description: ARN of the App Runner service
+    Value: !GetAtt AppRunnerService.ServiceArn
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-AppRunner-ARN'
+
+  # IAM Role Outputs
+  AppRunnerServiceRoleArn:
+    Description: ARN of the App Runner service role
+    Value: !GetAtt AppRunnerServiceRole.Arn
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-AppRunner-Service-Role-ARN'
+
+  AppRunnerInstanceRoleArn:
+    Description: ARN of the App Runner instance role
+    Value: !GetAtt AppRunnerInstanceRole.Arn
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-AppRunner-Instance-Role-ARN'
+
+  # Monitoring Outputs
+  CloudWatchDashboardURL:
+    Description: URL to the CloudWatch dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ApplicationName}-${Environment}-dashboard'
+
+  ApplicationLogGroupName:
+    Description: Name of the application log group
+    Value: !Ref AppRunnerLogGroup
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-LogGroup-Name'
+
+  # Security Outputs
+  DatabaseSecurityGroupId:
+    Description: ID of the database security group
+    Value: !Ref DatabaseSecurityGroup
+    Export:
+      Name: !Sub '${ApplicationName}-${Environment}-Database-SecurityGroup-ID'
+
+  # Additional Information
+  StackName:
+    Description: Name of this CloudFormation stack
+    Value: !Ref AWS::StackName
+
+  Region:
+    Description: AWS Region where resources are deployed
+    Value: !Ref AWS::Region
+
+  Environment:
+    Description: Environment name
+    Value: !Ref Environment
+
+  ApplicationName:
+    Description: Application name
+    Value: !Ref ApplicationName

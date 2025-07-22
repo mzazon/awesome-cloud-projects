@@ -1,0 +1,1025 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Advanced Blue-Green Deployments with ECS, Lambda, and CodeDeploy - Production-ready infrastructure for zero-downtime deployments'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'advanced-deployment'
+    Description: 'Base name for all resources'
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must start with lowercase letter, contain only lowercase letters, numbers, and hyphens'
+    MinLength: 3
+    MaxLength: 32
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name for resource tagging and configuration'
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC ID where resources will be deployed'
+
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: 'List of private subnet IDs for ECS tasks (minimum 2 required)'
+
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: 'List of public subnet IDs for Application Load Balancer (minimum 2 required)'
+
+  ContainerImageUri:
+    Type: String
+    Description: 'Initial container image URI from ECR'
+    Default: 'nginx:latest'
+
+  ContainerPort:
+    Type: Number
+    Default: 8080
+    MinValue: 1
+    MaxValue: 65535
+    Description: 'Port number on which the container listens'
+
+  HealthCheckPath:
+    Type: String
+    Default: '/health'
+    Description: 'Health check endpoint path'
+
+  DesiredTaskCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: 'Number of desired ECS tasks'
+
+  TaskCpu:
+    Type: Number
+    Default: 256
+    AllowedValues: [256, 512, 1024, 2048, 4096]
+    Description: 'CPU units for ECS task (1 vCPU = 1024 units)'
+
+  TaskMemory:
+    Type: Number
+    Default: 512
+    AllowedValues: [512, 1024, 2048, 4096, 8192, 16384, 30720]
+    Description: 'Memory (MB) for ECS task'
+
+  LambdaRuntime:
+    Type: String
+    Default: 'python3.9'
+    AllowedValues: ['python3.8', 'python3.9', 'python3.10', 'python3.11']
+    Description: 'Lambda function runtime version'
+
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable detailed CloudWatch monitoring and alarms'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for deployment notifications (optional)'
+    Default: ''
+
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  EnableMonitoring: !Equals [!Ref EnableDetailedMonitoring, 'true']
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Project Configuration'
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: 'Network Configuration'
+        Parameters:
+          - VpcId
+          - PrivateSubnetIds
+          - PublicSubnetIds
+      - Label:
+          default: 'ECS Configuration'
+        Parameters:
+          - ContainerImageUri
+          - ContainerPort
+          - HealthCheckPath
+          - DesiredTaskCount
+          - TaskCpu
+          - TaskMemory
+      - Label:
+          default: 'Lambda Configuration'
+        Parameters:
+          - LambdaRuntime
+      - Label:
+          default: 'Monitoring & Notifications'
+        Parameters:
+          - EnableDetailedMonitoring
+          - NotificationEmail
+
+Resources:
+  # ========================================
+  # IAM Roles and Policies
+  # ========================================
+  
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-ecs-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-ecs-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-ecs-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchMetricsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-ecs-task-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-codedeploy-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRoleForLambda
+      Policies:
+        - PolicyName: CodeDeployAdditionalPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: 
+                  - !GetAtt ECSTaskRole.Arn
+                  - !GetAtt ECSTaskExecutionRole.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !If [HasNotificationEmail, !Ref NotificationTopic, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-codedeploy-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CodeDeployHookPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codedeploy:PutLifecycleEventHookExecutionStatus
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:DescribeTasks
+                  - ecs:DescribeTaskDefinition
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:GetFunction
+                  - lambda:GetAlias
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-lambda-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # Security Groups
+  # ========================================
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-${Environment}-alb-sg'
+      GroupDescription: 'Security group for Application Load Balancer'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTP traffic from internet'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTPS traffic from internet'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-alb-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ECSTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-${Environment}-ecs-sg'
+      GroupDescription: 'Security group for ECS tasks'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: 'Traffic from ALB'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-ecs-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # Application Load Balancer
+  # ========================================
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-alb'
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+        - Key: routing.http2.enabled
+          Value: 'true'
+        - Key: access_logs.s3.enabled
+          Value: 'false'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-alb'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Target Groups for Blue-Green Deployment
+  TargetGroupBlue:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-blue'
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VpcId
+      HealthCheckEnabled: true
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+        - Key: stickiness.enabled
+          Value: 'false'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-blue'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  TargetGroupGreen:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-green'
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VpcId
+      HealthCheckEnabled: true
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+        - Key: stickiness.enabled
+          Value: 'false'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-green'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ALB Listener
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroupBlue
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # ========================================
+  # ECS Cluster and Service
+  # ========================================
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-${Environment}-cluster'
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+      ClusterSettings:
+        - Name: containerInsights
+          Value: !If [EnableMonitoring, 'enabled', 'disabled']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-cluster'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Group for ECS
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}-${Environment}'
+      RetentionInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-ecs-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ECS Task Definition
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}-web'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: web-app
+          Image: !Ref ContainerImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          Environment:
+            - Name: APP_VERSION
+              Value: '1.0.0'
+            - Name: ENVIRONMENT
+              Value: 'blue'
+            - Name: PORT
+              Value: !Ref ContainerPort
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - !Sub 'curl -f http://localhost:${ContainerPort}${HealthCheckPath} || exit 1'
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-task-def'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ECS Service
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListener
+    Properties:
+      ServiceName: !Sub '${ProjectName}-${Environment}-service'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ECSTaskDefinition
+      DesiredCount: !Ref DesiredTaskCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref ECSTaskSecurityGroup
+          Subnets: !Ref PrivateSubnetIds
+      LoadBalancers:
+        - ContainerName: web-app
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroupBlue
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      EnableExecuteCommand: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-service'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # Lambda Function
+  # ========================================
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-api'
+      RetentionInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-lambda-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-api'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          VERSION: '1.0.0'
+          ENVIRONMENT: 'blue'
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import time
+          import random
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              """
+              Lambda function for blue-green deployment demo
+              """
+              
+              version = os.environ.get('VERSION', '1.0.0')
+              environment = os.environ.get('ENVIRONMENT', 'blue')
+              
+              # Extract HTTP method and path
+              http_method = event.get('httpMethod', 'GET')
+              path = event.get('path', '/')
+              
+              # Route requests
+              if path == '/health':
+                  return health_check(version, environment)
+              elif path == '/api/lambda-data':
+                  return get_lambda_data(version, environment)
+              elif path == '/':
+                  return home_response(version, environment)
+              else:
+                  return {
+                      'statusCode': 404,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({'error': 'Not found'})
+                  }
+          
+          def health_check(version, environment):
+              """Health check endpoint"""
+              return {
+                  'statusCode': 200,
+                  'headers': {'Content-Type': 'application/json'},
+                  'body': json.dumps({
+                      'status': 'healthy',
+                      'version': version,
+                      'environment': environment,
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'requestId': os.environ.get('AWS_REQUEST_ID', 'unknown')
+                  })
+              }
+          
+          def get_lambda_data(version, environment):
+              """API endpoint returning data"""
+              
+              data = {
+                  'version': version,
+                  'environment': environment,
+                  'lambda_data': [
+                      {'id': 1, 'type': 'lambda', 'value': random.random()},
+                      {'id': 2, 'type': 'lambda', 'value': random.random()},
+                      {'id': 3, 'type': 'lambda', 'value': random.random()}
+                  ],
+                  'timestamp': datetime.utcnow().isoformat(),
+                  'execution_time_ms': random.randint(50, 200)
+              }
+              
+              return {
+                  'statusCode': 200,
+                  'headers': {'Content-Type': 'application/json'},
+                  'body': json.dumps(data)
+              }
+          
+          def home_response(version, environment):
+              """Home endpoint response"""
+              return {
+                  'statusCode': 200,
+                  'headers': {'Content-Type': 'application/json'},
+                  'body': json.dumps({
+                      'message': 'Lambda Blue-Green Deployment Demo',
+                      'version': version,
+                      'environment': environment,
+                      'timestamp': datetime.utcnow().isoformat()
+                  })
+              }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-api'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda Alias for Production Traffic
+  LambdaAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Name: PROD
+      FunctionVersion: $LATEST
+      Description: 'Production alias for blue-green deployments'
+
+  # ========================================
+  # CodeDeploy Applications and Deployment Groups
+  # ========================================
+
+  CodeDeployECSApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub '${ProjectName}-${Environment}-ecs-app'
+      ComputePlatform: ECS
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-ecs-app'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  CodeDeployECSDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployECSApplication
+      DeploymentGroupName: !Sub '${ProjectName}-${Environment}-ecs-dg'
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      DeploymentConfigName: CodeDeployDefault.ECSLinear10PercentEvery1Minutes
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
+          - DEPLOYMENT_STOP_ON_ALARM
+          - DEPLOYMENT_STOP_ON_INSTANCE_FAILURE
+      BlueGreenDeploymentConfiguration:
+        DeploymentReadyOption:
+          ActionOnTimeout: CONTINUE_DEPLOYMENT
+        TerminateBlueInstancesOnDeploymentSuccess:
+          Action: TERMINATE
+          TerminationWaitTimeInMinutes: 5
+        GreenFleetProvisioningOption:
+          Action: COPY_AUTO_SCALING_GROUP
+      ECSServices:
+        - ClusterName: !Ref ECSCluster
+          ServiceName: !GetAtt ECSService.Name
+      LoadBalancerInfo:
+        TargetGroupInfoList:
+          - Name: !GetAtt TargetGroupBlue.TargetGroupName
+          - Name: !GetAtt TargetGroupGreen.TargetGroupName
+      AlarmConfiguration:
+        Enabled: !If [EnableMonitoring, true, false]
+        Alarms: !If
+          - EnableMonitoring
+          - - Name: !Ref ECSHighErrorRateAlarm
+            - Name: !Ref ECSHighResponseTimeAlarm
+          - !Ref AWS::NoValue
+
+  CodeDeployLambdaApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub '${ProjectName}-${Environment}-lambda-app'
+      ComputePlatform: Lambda
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-lambda-app'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  CodeDeployLambdaDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployLambdaApplication
+      DeploymentGroupName: !Sub '${ProjectName}-${Environment}-lambda-dg'
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      DeploymentConfigName: CodeDeployDefault.LambdaLinear10PercentEvery1Minute
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
+          - DEPLOYMENT_STOP_ON_ALARM
+      AlarmConfiguration:
+        Enabled: !If [EnableMonitoring, true, false]
+        Alarms: !If
+          - EnableMonitoring
+          - - Name: !Ref LambdaHighErrorRateAlarm
+            - Name: !Ref LambdaHighDurationAlarm
+          - !Ref AWS::NoValue
+
+  # ========================================
+  # CloudWatch Monitoring and Alarms
+  # ========================================
+
+  # SNS Topic for Notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasNotificationEmail
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-notifications'
+      DisplayName: 'Deployment Notifications'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-notifications'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarms for ECS
+  ECSHighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-ecs-high-error-rate'
+      AlarmDescription: 'High error rate in ECS service'
+      MetricName: HTTPCode_Target_5XX_Count
+      Namespace: AWS/ApplicationELB
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+        - Name: TargetGroup
+          Value: !GetAtt TargetGroupGreen.TargetGroupFullName
+      AlarmActions: !If
+        - HasNotificationEmail
+        - - !Ref NotificationTopic
+        - !Ref AWS::NoValue
+
+  ECSHighResponseTimeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-ecs-high-response-time'
+      AlarmDescription: 'High response time in ECS service'
+      MetricName: TargetResponseTime
+      Namespace: AWS/ApplicationELB
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 2.0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+        - Name: TargetGroup
+          Value: !GetAtt TargetGroupGreen.TargetGroupFullName
+      AlarmActions: !If
+        - HasNotificationEmail
+        - - !Ref NotificationTopic
+        - !Ref AWS::NoValue
+
+  # CloudWatch Alarms for Lambda
+  LambdaHighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-lambda-high-error-rate'
+      AlarmDescription: 'High error rate in Lambda function'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LambdaFunction
+      AlarmActions: !If
+        - HasNotificationEmail
+        - - !Ref NotificationTopic
+        - !Ref AWS::NoValue
+
+  LambdaHighDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-lambda-high-duration'
+      AlarmDescription: 'High duration in Lambda function'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 5000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LambdaFunction
+      AlarmActions: !If
+        - HasNotificationEmail
+        - - !Ref NotificationTopic
+        - !Ref AWS::NoValue
+
+Outputs:
+  # Network Infrastructure
+  LoadBalancerDNS:
+    Description: 'DNS name of the Application Load Balancer'
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-alb-dns'
+
+  LoadBalancerArn:
+    Description: 'ARN of the Application Load Balancer'
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-alb-arn'
+
+  TargetGroupBlueArn:
+    Description: 'ARN of the Blue Target Group'
+    Value: !Ref TargetGroupBlue
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-tg-blue-arn'
+
+  TargetGroupGreenArn:
+    Description: 'ARN of the Green Target Group'
+    Value: !Ref TargetGroupGreen
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-tg-green-arn'
+
+  # ECS Infrastructure
+  ECSClusterName:
+    Description: 'Name of the ECS Cluster'
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ecs-cluster'
+
+  ECSServiceName:
+    Description: 'Name of the ECS Service'
+    Value: !GetAtt ECSService.Name
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ecs-service'
+
+  ECSTaskDefinitionArn:
+    Description: 'ARN of the ECS Task Definition'
+    Value: !Ref ECSTaskDefinition
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-task-def-arn'
+
+  # Lambda Infrastructure
+  LambdaFunctionName:
+    Description: 'Name of the Lambda Function'
+    Value: !Ref LambdaFunction
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-lambda-function'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda Function'
+    Value: !GetAtt LambdaFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-lambda-arn'
+
+  LambdaAliasArn:
+    Description: 'ARN of the Lambda Alias'
+    Value: !Ref LambdaAlias
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-lambda-alias-arn'
+
+  # CodeDeploy Infrastructure
+  CodeDeployECSApplicationName:
+    Description: 'Name of the CodeDeploy ECS Application'
+    Value: !Ref CodeDeployECSApplication
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-codedeploy-ecs-app'
+
+  CodeDeployLambdaApplicationName:
+    Description: 'Name of the CodeDeploy Lambda Application'
+    Value: !Ref CodeDeployLambdaApplication
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-codedeploy-lambda-app'
+
+  CodeDeployECSDeploymentGroupName:
+    Description: 'Name of the CodeDeploy ECS Deployment Group'
+    Value: !Ref CodeDeployECSDeploymentGroup
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-codedeploy-ecs-dg'
+
+  CodeDeployLambdaDeploymentGroupName:
+    Description: 'Name of the CodeDeploy Lambda Deployment Group'
+    Value: !Ref CodeDeployLambdaDeploymentGroup
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-codedeploy-lambda-dg'
+
+  # IAM Roles
+  CodeDeployRoleArn:
+    Description: 'ARN of the CodeDeploy Service Role'
+    Value: !GetAtt CodeDeployServiceRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-codedeploy-role-arn'
+
+  ECSTaskRoleArn:
+    Description: 'ARN of the ECS Task Role'
+    Value: !GetAtt ECSTaskRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ecs-task-role-arn'
+
+  ECSExecutionRoleArn:
+    Description: 'ARN of the ECS Execution Role'
+    Value: !GetAtt ECSTaskExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ecs-execution-role-arn'
+
+  # Monitoring
+  NotificationTopicArn:
+    Condition: HasNotificationEmail
+    Description: 'ARN of the SNS Notification Topic'
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-notification-topic'
+
+  # Testing Endpoints
+  ApplicationHealthEndpoint:
+    Description: 'Application health check endpoint URL'
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}${HealthCheckPath}'
+
+  ApplicationMainEndpoint:
+    Description: 'Application main endpoint URL'
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}/'
+
+  # Deployment Commands
+  ECSDeploymentCommand:
+    Description: 'Sample AWS CLI command to trigger ECS deployment'
+    Value: !Sub |
+      aws deploy create-deployment \
+        --application-name ${CodeDeployECSApplication} \
+        --deployment-group-name ${CodeDeployECSDeploymentGroup} \
+        --deployment-config-name CodeDeployDefault.ECSLinear10PercentEvery1Minutes
+
+  LambdaDeploymentCommand:
+    Description: 'Sample AWS CLI command to trigger Lambda deployment'
+    Value: !Sub |
+      aws deploy create-deployment \
+        --application-name ${CodeDeployLambdaApplication} \
+        --deployment-group-name ${CodeDeployLambdaDeploymentGroup} \
+        --deployment-config-name CodeDeployDefault.LambdaLinear10PercentEvery1Minute

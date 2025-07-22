@@ -1,0 +1,824 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Serverless Analytics with Athena Federated Query - Complete infrastructure for cross-platform analytics using Amazon Athena, Lambda connectors, RDS MySQL, and DynamoDB'
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'athena-federated-analytics'
+    Description: 'Name prefix for all resources'
+    AllowedPattern: '[a-z0-9-]+'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+  
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name for resource tagging and configuration'
+  
+  DatabaseName:
+    Type: String
+    Default: 'analytics_db'
+    Description: 'Name for the RDS MySQL database'
+    AllowedPattern: '[a-zA-Z0-9_]+'
+    ConstraintDescription: 'Must contain only alphanumeric characters and underscores'
+  
+  DatabaseUsername:
+    Type: String
+    Default: 'admin'
+    Description: 'Master username for RDS MySQL database'
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    ConstraintDescription: 'Must begin with a letter and contain only alphanumeric characters'
+  
+  DatabasePassword:
+    Type: String
+    Default: 'TempPassword123!'
+    Description: 'Master password for RDS MySQL database'
+    MinLength: 8
+    MaxLength: 32
+    NoEcho: true
+    AllowedPattern: '[a-zA-Z0-9!@#$%^&*()_+-=]*'
+    ConstraintDescription: 'Must be 8-32 characters with letters, numbers, and special characters'
+  
+  VpcCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: 'CIDR block for the VPC'
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: 'Must be a valid CIDR range'
+  
+  SubnetCidr1:
+    Type: String
+    Default: '10.0.1.0/24'
+    Description: 'CIDR block for first private subnet'
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: 'Must be a valid CIDR range'
+  
+  SubnetCidr2:
+    Type: String
+    Default: '10.0.2.0/24'
+    Description: 'CIDR block for second private subnet'
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: 'Must be a valid CIDR range'
+  
+  LambdaMemorySize:
+    Type: Number
+    Default: 3008
+    MinValue: 512
+    MaxValue: 10240
+    Description: 'Memory allocation for Lambda connector functions (MB)'
+  
+  LambdaTimeout:
+    Type: Number
+    Default: 900
+    MinValue: 60
+    MaxValue: 900
+    Description: 'Timeout for Lambda connector functions (seconds)'
+  
+  DynamoDBReadCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+    Description: 'Read capacity units for DynamoDB table'
+  
+  DynamoDBWriteCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+    Description: 'Write capacity units for DynamoDB table'
+  
+  EnableMultiAZ:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable Multi-AZ deployment for RDS instance'
+  
+  EnableDeletionProtection:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable deletion protection for RDS instance'
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  EnableMultiAZCondition: !Equals [!Ref EnableMultiAZ, 'true']
+  EnableDeletionProtectionCondition: !Equals [!Ref EnableDeletionProtection, 'true']
+
+# =============================================================================
+# MAPPINGS
+# =============================================================================
+
+Mappings:
+  AZRegions:
+    us-east-1:
+      AZ1: us-east-1a
+      AZ2: us-east-1b
+    us-west-2:
+      AZ1: us-west-2a
+      AZ2: us-west-2b
+    eu-west-1:
+      AZ1: eu-west-1a
+      AZ2: eu-west-1b
+  
+  InstanceConfig:
+    dev:
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+    staging:
+      DBInstanceClass: db.t3.small
+      AllocatedStorage: 50
+    prod:
+      DBInstanceClass: db.t3.medium
+      AllocatedStorage: 100
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # S3 BUCKETS
+  # ---------------------------------------------------------------------------
+  
+  # S3 bucket for Lambda connector spill data
+  SpillBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-spill-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteSpillDataAfter1Day
+            Status: Enabled
+            ExpirationInDays: 1
+            NoncurrentVersionExpirationInDays: 1
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-spill-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Lambda connector spill data'
+  
+  # S3 bucket for Athena query results
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-results-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteQueryResultsAfter30Days
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpirationInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-results-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Athena query results'
+  
+  # ---------------------------------------------------------------------------
+  # NETWORKING
+  # ---------------------------------------------------------------------------
+  
+  # VPC for RDS and Lambda connector networking
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # Private subnet in first AZ
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref SubnetCidr1
+      AvailabilityZone: !FindInMap [AZRegions, !Ref 'AWS::Region', AZ1]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # Private subnet in second AZ
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref SubnetCidr2
+      AvailabilityZone: !FindInMap [AZRegions, !Ref 'AWS::Region', AZ2]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # Security group for RDS MySQL instance
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-database-sg'
+      GroupDescription: 'Security group for RDS MySQL instance'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: 'MySQL access from Lambda connectors'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-database-sg'
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # Security group for Lambda connector functions
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-lambda-sg'
+      GroupDescription: 'Security group for Lambda connector functions'
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
+          Description: 'MySQL access to RDS instance'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTPS access for AWS API calls'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-sg'
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # DB subnet group for RDS instance
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${ProjectName}-db-subnet-group'
+      DBSubnetGroupDescription: 'Subnet group for RDS MySQL instance'
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db-subnet-group'
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # ---------------------------------------------------------------------------
+  # RDS MYSQL DATABASE
+  # ---------------------------------------------------------------------------
+  
+  # RDS MySQL instance for federated queries
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: !If [IsProduction, 'Snapshot', 'Delete']
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-mysql-${Environment}'
+      DBInstanceClass: !FindInMap [InstanceConfig, !Ref Environment, DBInstanceClass]
+      Engine: mysql
+      EngineVersion: '8.0.35'
+      MasterUsername: !Ref DatabaseUsername
+      MasterUserPassword: !Ref DatabasePassword
+      AllocatedStorage: !FindInMap [InstanceConfig, !Ref Environment, AllocatedStorage]
+      StorageType: gp2
+      StorageEncrypted: true
+      DBName: !Ref DatabaseName
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      MultiAZ: !If [EnableMultiAZCondition, true, false]
+      PubliclyAccessible: false
+      BackupRetentionPeriod: !If [IsProduction, 30, 7]
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'sun:04:00-sun:05:00'
+      DeletionProtection: !If [EnableDeletionProtectionCondition, true, false]
+      EnablePerformanceInsights: !If [IsProduction, true, false]
+      MonitoringInterval: !If [IsProduction, 60, 0]
+      MonitoringRoleArn: !If 
+        - IsProduction
+        - !GetAtt RDSMonitoringRole.Arn
+        - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-mysql-database'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Federated query data source'
+  
+  # IAM role for RDS monitoring (only in production)
+  RDSMonitoringRole:
+    Type: AWS::IAM::Role
+    Condition: IsProduction
+    Properties:
+      RoleName: !Sub '${ProjectName}-rds-monitoring-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rds-monitoring-role'
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # ---------------------------------------------------------------------------
+  # DYNAMODB TABLE
+  # ---------------------------------------------------------------------------
+  
+  # DynamoDB table for order tracking data
+  OrderTrackingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-orders-${Environment}'
+      AttributeDefinitions:
+        - AttributeName: order_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: order_id
+          KeyType: HASH
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref DynamoDBReadCapacity
+        WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-orders-table'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Order tracking federated data source'
+  
+  # ---------------------------------------------------------------------------
+  # IAM ROLES FOR LAMBDA CONNECTORS
+  # ---------------------------------------------------------------------------
+  
+  # IAM role for MySQL Lambda connector
+  MySQLConnectorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-mysql-connector-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: MySQLConnectorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub '${SpillBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Ref SpillBucket
+              - Effect: Allow
+                Action:
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:StartQueryExecution
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetPartitions
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTables
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-mysql-connector-role'
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # IAM role for DynamoDB Lambda connector
+  DynamoDBConnectorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-dynamodb-connector-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBConnectorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeTable
+                  - dynamodb:ListTables
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:GetItem
+                  - dynamodb:BatchGetItem
+                Resource: !GetAtt OrderTrackingTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub '${SpillBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Ref SpillBucket
+              - Effect: Allow
+                Action:
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:StartQueryExecution
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetPartitions
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTables
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dynamodb-connector-role'
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # ---------------------------------------------------------------------------
+  # LAMBDA FUNCTIONS (ATHENA CONNECTORS)
+  # ---------------------------------------------------------------------------
+  
+  # MySQL Lambda connector function
+  MySQLConnectorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-mysql-connector'
+      Runtime: java11
+      Handler: com.amazonaws.athena.connectors.mysql.MySqlCompositeHandler
+      Code:
+        S3Bucket: !Sub 'athena-federation-${AWS::Region}'
+        S3Key: '2023.47.1/athena-mysql-2023.47.1.jar'
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt MySQLConnectorRole.Arn
+      Environment:
+        Variables:
+          default: !Sub 'mysql://jdbc:mysql://${DatabaseInstance.Endpoint.Address}:${DatabaseInstance.Endpoint.Port}/${DatabaseName}?user=${DatabaseUsername}&password=${DatabasePassword}'
+          spill_bucket: !Ref SpillBucket
+          disable_spill_encryption: 'false'
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-mysql-connector'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Athena MySQL federated query connector'
+  
+  # DynamoDB Lambda connector function
+  DynamoDBConnectorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-dynamodb-connector'
+      Runtime: java11
+      Handler: com.amazonaws.athena.connectors.dynamodb.DynamoDbCompositeHandler
+      Code:
+        S3Bucket: !Sub 'athena-federation-${AWS::Region}'
+        S3Key: '2023.47.1/athena-dynamodb-2023.47.1.jar'
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt DynamoDBConnectorRole.Arn
+      Environment:
+        Variables:
+          spill_bucket: !Ref SpillBucket
+          disable_spill_encryption: 'false'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dynamodb-connector'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Athena DynamoDB federated query connector'
+  
+  # ---------------------------------------------------------------------------
+  # ATHENA RESOURCES
+  # ---------------------------------------------------------------------------
+  
+  # Athena workgroup for federated analytics
+  FederatedWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub '${ProjectName}-federated-workgroup'
+      Description: 'Workgroup for federated query analytics'
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${ResultsBucket}/query-results/'
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetrics: true
+        BytesScannedCutoffPerQuery: 1000000000  # 1GB limit
+        RequesterPaysEnabled: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-federated-workgroup'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Federated query analytics workgroup'
+  
+  # Athena data catalog for MySQL
+  MySQLDataCatalog:
+    Type: AWS::Athena::DataCatalog
+    Properties:
+      Name: !Sub '${ProjectName}-mysql-catalog'
+      Description: 'MySQL data source for federated queries'
+      Type: LAMBDA
+      Parameters:
+        function: !GetAtt MySQLConnectorFunction.Arn
+      Tags:
+        Name: !Sub '${ProjectName}-mysql-catalog'
+        Environment: !Ref Environment
+        Purpose: 'MySQL federated data catalog'
+  
+  # Athena data catalog for DynamoDB
+  DynamoDBDataCatalog:
+    Type: AWS::Athena::DataCatalog
+    Properties:
+      Name: !Sub '${ProjectName}-dynamodb-catalog'
+      Description: 'DynamoDB data source for federated queries'
+      Type: LAMBDA
+      Parameters:
+        function: !GetAtt DynamoDBConnectorFunction.Arn
+      Tags:
+        Name: !Sub '${ProjectName}-dynamodb-catalog'
+        Environment: !Ref Environment
+        Purpose: 'DynamoDB federated data catalog'
+  
+  # ---------------------------------------------------------------------------
+  # LAMBDA PERMISSIONS
+  # ---------------------------------------------------------------------------
+  
+  # Lambda permission for MySQL connector
+  MySQLConnectorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MySQLConnectorFunction
+      Action: lambda:InvokeFunction
+      Principal: athena.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+  
+  # Lambda permission for DynamoDB connector
+  DynamoDBConnectorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DynamoDBConnectorFunction
+      Action: lambda:InvokeFunction
+      Principal: athena.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+  
+  # ---------------------------------------------------------------------------
+  # CLOUDWATCH RESOURCES
+  # ---------------------------------------------------------------------------
+  
+  # CloudWatch log group for MySQL connector
+  MySQLConnectorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${MySQLConnectorFunction}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-mysql-connector-logs'
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # CloudWatch log group for DynamoDB connector
+  DynamoDBConnectorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DynamoDBConnectorFunction}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dynamodb-connector-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+
+Outputs:
+  # Infrastructure Information
+  VPCId:
+    Description: 'ID of the VPC created for the federated analytics infrastructure'
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${ProjectName}-vpc-id'
+  
+  # Database Information
+  DatabaseEndpoint:
+    Description: 'RDS MySQL database endpoint for federated queries'
+    Value: !GetAtt DatabaseInstance.Endpoint.Address
+    Export:
+      Name: !Sub '${ProjectName}-database-endpoint'
+  
+  DatabasePort:
+    Description: 'RDS MySQL database port'
+    Value: !GetAtt DatabaseInstance.Endpoint.Port
+    Export:
+      Name: !Sub '${ProjectName}-database-port'
+  
+  DatabaseName:
+    Description: 'RDS MySQL database name'
+    Value: !Ref DatabaseName
+    Export:
+      Name: !Sub '${ProjectName}-database-name'
+  
+  # DynamoDB Information
+  DynamoDBTableName:
+    Description: 'DynamoDB table name for order tracking data'
+    Value: !Ref OrderTrackingTable
+    Export:
+      Name: !Sub '${ProjectName}-dynamodb-table-name'
+  
+  DynamoDBTableArn:
+    Description: 'DynamoDB table ARN for order tracking data'
+    Value: !GetAtt OrderTrackingTable.Arn
+    Export:
+      Name: !Sub '${ProjectName}-dynamodb-table-arn'
+  
+  # Storage Information
+  SpillBucketName:
+    Description: 'S3 bucket name for Lambda connector spill data'
+    Value: !Ref SpillBucket
+    Export:
+      Name: !Sub '${ProjectName}-spill-bucket'
+  
+  ResultsBucketName:
+    Description: 'S3 bucket name for Athena query results'
+    Value: !Ref ResultsBucket
+    Export:
+      Name: !Sub '${ProjectName}-results-bucket'
+  
+  # Lambda Connector Information
+  MySQLConnectorFunctionArn:
+    Description: 'ARN of the MySQL Lambda connector function'
+    Value: !GetAtt MySQLConnectorFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-mysql-connector-arn'
+  
+  DynamoDBConnectorFunctionArn:
+    Description: 'ARN of the DynamoDB Lambda connector function'
+    Value: !GetAtt DynamoDBConnectorFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-dynamodb-connector-arn'
+  
+  # Athena Information
+  WorkgroupName:
+    Description: 'Athena workgroup name for federated analytics'
+    Value: !Ref FederatedWorkgroup
+    Export:
+      Name: !Sub '${ProjectName}-workgroup-name'
+  
+  MySQLCatalogName:
+    Description: 'Athena data catalog name for MySQL data source'
+    Value: !Ref MySQLDataCatalog
+    Export:
+      Name: !Sub '${ProjectName}-mysql-catalog-name'
+  
+  DynamoDBCatalogName:
+    Description: 'Athena data catalog name for DynamoDB data source'
+    Value: !Ref DynamoDBDataCatalog
+    Export:
+      Name: !Sub '${ProjectName}-dynamodb-catalog-name'
+  
+  # Query Examples
+  SampleFederatedQuery:
+    Description: 'Sample federated query to test the infrastructure'
+    Value: !Sub |
+      SELECT 
+        mysql_orders.order_id,
+        mysql_orders.customer_id,
+        mysql_orders.product_name,
+        mysql_orders.quantity,
+        mysql_orders.price,
+        mysql_orders.order_date,
+        ddb_tracking.status as shipment_status,
+        ddb_tracking.tracking_number,
+        ddb_tracking.carrier
+      FROM "${MySQLDataCatalog}".${DatabaseName}.sample_orders mysql_orders
+      LEFT JOIN "${DynamoDBDataCatalog}".default."${OrderTrackingTable}" ddb_tracking
+      ON CAST(mysql_orders.order_id AS VARCHAR) = ddb_tracking.order_id
+      ORDER BY mysql_orders.order_date DESC
+      LIMIT 10;
+  
+  # Connection Information
+  MySQLConnectionString:
+    Description: 'MySQL connection string for reference'
+    Value: !Sub 'mysql://jdbc:mysql://${DatabaseInstance.Endpoint.Address}:${DatabaseInstance.Endpoint.Port}/${DatabaseName}?user=${DatabaseUsername}'
+    Export:
+      Name: !Sub '${ProjectName}-mysql-connection-string'
+  
+  # Cost Information
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for this infrastructure (excluding data transfer and query execution)'
+    Value: !Sub |
+      RDS MySQL (${Environment}): $15-45/month
+      DynamoDB (${DynamoDBReadCapacity}/${DynamoDBWriteCapacity} RCU/WCU): $3-10/month
+      Lambda Connectors: $0.20 per million requests + $0.0000166667 per GB-second
+      S3 Storage: $0.023 per GB stored
+      Athena: $5 per TB of data scanned
+      Total Base Cost: ~$20-60/month + usage-based charges
+  
+  # Next Steps
+  NextSteps:
+    Description: 'Next steps to complete the setup'
+    Value: |
+      1. Create sample data in RDS MySQL: CREATE TABLE sample_orders (order_id INT, customer_id INT, product_name VARCHAR(255), quantity INT, price DECIMAL(10,2), order_date DATE);
+      2. Add sample data to DynamoDB table using AWS CLI or console
+      3. Test federated queries in Athena console using the provided sample query
+      4. Create federated views for commonly used data combinations
+      5. Configure BI tools to connect to Athena for analytics dashboards

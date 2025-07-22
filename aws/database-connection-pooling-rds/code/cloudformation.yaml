@@ -1,0 +1,704 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Infrastructure as Code for implementing database connection pooling with Amazon RDS Proxy.
+  Creates a MySQL RDS instance, RDS Proxy with connection pooling, Lambda function for testing,
+  and all required networking, security, and IAM resources.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Database Configuration"
+        Parameters:
+          - DatabaseName
+          - DatabaseUsername
+          - DatabasePassword
+          - DatabaseInstanceClass
+          - DatabaseAllocatedStorage
+      - Label:
+          default: "RDS Proxy Configuration"
+        Parameters:
+          - ProxyIdleClientTimeout
+          - ProxyMaxConnectionsPercent
+          - ProxyMaxIdleConnectionsPercent
+          - ProxyDebugLogging
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcCidr
+          - PrivateSubnet1Cidr
+          - PrivateSubnet2Cidr
+          - AvailabilityZone1
+          - AvailabilityZone2
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+    ParameterLabels:
+      DatabaseName:
+        default: "Database Name"
+      DatabaseUsername:
+        default: "Database Master Username"
+      DatabasePassword:
+        default: "Database Master Password"
+      DatabaseInstanceClass:
+        default: "Database Instance Class"
+      DatabaseAllocatedStorage:
+        default: "Database Allocated Storage (GB)"
+      ProxyIdleClientTimeout:
+        default: "Proxy Idle Client Timeout (seconds)"
+      ProxyMaxConnectionsPercent:
+        default: "Proxy Max Connections Percent"
+      ProxyMaxIdleConnectionsPercent:
+        default: "Proxy Max Idle Connections Percent"
+      ProxyDebugLogging:
+        default: "Enable Proxy Debug Logging"
+      VpcCidr:
+        default: "VPC CIDR Block"
+      PrivateSubnet1Cidr:
+        default: "Private Subnet 1 CIDR"
+      PrivateSubnet2Cidr:
+        default: "Private Subnet 2 CIDR"
+      AvailabilityZone1:
+        default: "Availability Zone 1"
+      AvailabilityZone2:
+        default: "Availability Zone 2"
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+
+Parameters:
+  # Database Configuration
+  DatabaseName:
+    Type: String
+    Default: testdb
+    Description: Name of the database to create
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9]*$"
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters
+
+  DatabaseUsername:
+    Type: String
+    Default: admin
+    Description: Master username for the database
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9]*$"
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters
+
+  DatabasePassword:
+    Type: String
+    NoEcho: true
+    Description: Master password for the database (8-128 characters, must contain uppercase, lowercase, number, and symbol)
+    MinLength: 8
+    MaxLength: 128
+    AllowedPattern: "^(?=.*[a-z])(?=.*[A-Z])(?=.*\\d)(?=.*[@$!%*?&])[A-Za-z\\d@$!%*?&]{8,128}$"
+    ConstraintDescription: Must be 8-128 characters with at least one uppercase, lowercase, number, and symbol
+
+  DatabaseInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+      - db.t3.large
+      - db.t3.xlarge
+      - db.t3.2xlarge
+      - db.r5.large
+      - db.r5.xlarge
+      - db.r5.2xlarge
+      - db.r5.4xlarge
+    Description: Database instance class
+
+  DatabaseAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 65536
+    Description: Database allocated storage in GB
+
+  # RDS Proxy Configuration
+  ProxyIdleClientTimeout:
+    Type: Number
+    Default: 1800
+    MinValue: 1
+    MaxValue: 28800
+    Description: The number of seconds that a connection to the proxy can be inactive before the proxy disconnects it
+
+  ProxyMaxConnectionsPercent:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 100
+    Description: The maximum size of the connection pool for each target in a target group
+
+  ProxyMaxIdleConnectionsPercent:
+    Type: Number
+    Default: 50
+    MinValue: 0
+    MaxValue: 100
+    Description: The percentage of the max_connections value that determines how many connections the proxy maintains
+
+  ProxyDebugLogging:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable detailed logging for the proxy
+
+  # Network Configuration
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/(1[6-9]|2[0-8]))$"
+    Description: CIDR block for the VPC
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+    AllowedPattern: "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/(1[6-9]|2[0-8]))$"
+    Description: CIDR block for the first private subnet
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.0.2.0/24
+    AllowedPattern: "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/(1[6-9]|2[0-8]))$"
+    Description: CIDR block for the second private subnet
+
+  AvailabilityZone1:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: First Availability Zone for the subnets
+
+  AvailabilityZone2:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Second Availability Zone for the subnets
+
+  # General Configuration
+  ProjectName:
+    Type: String
+    Default: rds-proxy-demo
+    Description: Name of the project (used for resource naming)
+    MinLength: 1
+    MaxLength: 32
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9-]*$"
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters and hyphens
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, staging, prod]
+    Description: Environment name
+
+Conditions:
+  EnableProxyDebugLogging: !Equals [!Ref ProxyDebugLogging, 'true']
+
+Resources:
+  # ============================================================================
+  # VPC and Networking Resources
+  # ============================================================================
+  
+  # VPC for hosting RDS and RDS Proxy
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-vpc"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Private subnet in first AZ for database resources
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Ref AvailabilityZone1
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-private-subnet-1"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Private subnet in second AZ for database resources (required for RDS subnet group)
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Ref AvailabilityZone2
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-private-subnet-2"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # Security Groups
+  # ============================================================================
+
+  # Security group for RDS instance - only allows connections from RDS Proxy
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-${Environment}-db-sg"
+      GroupDescription: Security group for RDS instance - allows connections from RDS Proxy only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref ProxySecurityGroup
+          Description: Allow MySQL connections from RDS Proxy
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-db-sg"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Security group for RDS Proxy - allows connections from Lambda and other applications
+  ProxySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-${Environment}-proxy-sg"
+      GroupDescription: Security group for RDS Proxy - allows connections from applications
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: !Ref VpcCidr
+          Description: Allow MySQL connections from VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-proxy-sg"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # Secrets Manager
+  # ============================================================================
+
+  # Store database credentials securely in Secrets Manager
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-rds-proxy-secret"
+      Description: Database credentials for RDS Proxy authentication
+      SecretString: !Sub |
+        {
+          "username": "${DatabaseUsername}",
+          "password": "${DatabasePassword}"
+        }
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-rds-proxy-secret"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # IAM Roles and Policies
+  # ============================================================================
+
+  # IAM role for RDS Proxy to access Secrets Manager
+  RDSProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-rds-proxy-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Ref DatabaseSecret
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-rds-proxy-role"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM role for Lambda function execution
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-lambda-execution-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-lambda-execution-role"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # RDS Resources
+  # ============================================================================
+
+  # DB subnet group for RDS instance (requires at least 2 subnets in different AZs)
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub "${ProjectName}-${Environment}-db-subnet-group"
+      DBSubnetGroupDescription: Subnet group for RDS instance
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-db-subnet-group"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # RDS MySQL instance with encryption and backup enabled
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-${Environment}-mysql-db"
+      DBInstanceClass: !Ref DatabaseInstanceClass
+      Engine: mysql
+      EngineVersion: 8.0.39
+      MasterUsername: !Ref DatabaseUsername
+      MasterUserPassword: !Ref DatabasePassword
+      DBName: !Ref DatabaseName
+      AllocatedStorage: !Ref DatabaseAllocatedStorage
+      StorageType: gp2
+      StorageEncrypted: true
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: "03:00-04:00"
+      PreferredMaintenanceWindow: "sun:04:00-sun:05:00"
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      PubliclyAccessible: false
+      MultiAZ: false
+      AutoMinorVersionUpgrade: true
+      DeletionProtection: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      MonitoringInterval: 60
+      MonitoringRoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/rds-monitoring-role"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-mysql-db"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Enhanced monitoring role for RDS
+  RDSEnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-rds-monitoring-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-rds-monitoring-role"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # RDS Proxy Resources
+  # ============================================================================
+
+  # RDS Proxy for connection pooling and improved application scalability
+  DatabaseProxy:
+    Type: AWS::RDS::DBProxy
+    Properties:
+      DBProxyName: !Sub "${ProjectName}-${Environment}-rds-proxy"
+      EngineFamily: MYSQL
+      Auth:
+        - AuthScheme: SECRETS
+          SecretArn: !Ref DatabaseSecret
+          Description: Database authentication using Secrets Manager
+      RoleArn: !GetAtt RDSProxyRole.Arn
+      VpcSubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      VpcSecurityGroupIds:
+        - !Ref ProxySecurityGroup
+      IdleClientTimeout: !Ref ProxyIdleClientTimeout
+      MaxConnectionsPercent: !Ref ProxyMaxConnectionsPercent
+      MaxIdleConnectionsPercent: !Ref ProxyMaxIdleConnectionsPercent
+      DebugLogging: !If [EnableProxyDebugLogging, true, false]
+      RequireTLS: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-rds-proxy"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Register RDS instance as target for the proxy
+  DatabaseProxyTargetGroup:
+    Type: AWS::RDS::DBProxyTargetGroup
+    Properties:
+      DBProxyName: !Ref DatabaseProxy
+      TargetGroupName: default
+      DBInstanceIdentifiers:
+        - !Ref DatabaseInstance
+
+  # ============================================================================
+  # Lambda Function for Testing
+  # ============================================================================
+
+  # Lambda function to test RDS Proxy connection pooling
+  TestLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-rds-proxy-test"
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          PROXY_ENDPOINT: !GetAtt DatabaseProxy.Endpoint
+          DB_USER: !Ref DatabaseUsername
+          DB_PASSWORD: !Ref DatabasePassword
+          DB_NAME: !Ref DatabaseName
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref ProxySecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Code:
+        ZipFile: |
+          import json
+          import pymysql
+          import os
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              try:
+                  # Connect to database through RDS Proxy
+                  connection = pymysql.connect(
+                      host=os.environ['PROXY_ENDPOINT'],
+                      user=os.environ['DB_USER'],
+                      password=os.environ['DB_PASSWORD'],
+                      database=os.environ['DB_NAME'],
+                      port=3306,
+                      cursorclass=pymysql.cursors.DictCursor,
+                      connect_timeout=10
+                  )
+                  
+                  with connection.cursor() as cursor:
+                      # Execute a simple query to test connectivity
+                      cursor.execute("SELECT 1 as connection_test, CONNECTION_ID() as connection_id, NOW() as timestamp")
+                      result = cursor.fetchone()
+                      
+                      # Get connection information
+                      cursor.execute("SHOW STATUS LIKE 'Threads_connected'")
+                      threads = cursor.fetchone()
+                      
+                  connection.close()
+                  
+                  logger.info(f"Successfully connected through RDS Proxy: {result}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Successfully connected through RDS Proxy',
+                          'connection_test': result,
+                          'threads_connected': threads,
+                          'proxy_endpoint': os.environ['PROXY_ENDPOINT']
+                      }, default=str)
+                  }
+              except Exception as e:
+                  logger.error(f"Connection failed: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'message': 'Failed to connect through RDS Proxy'
+                      })
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-rds-proxy-test"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda layer for PyMySQL dependency
+  PyMySQLLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub "${ProjectName}-${Environment}-pymysql-layer"
+      Description: PyMySQL library for Lambda function
+      Content:
+        S3Bucket: !Sub "lambda-layers-${AWS::Region}"
+        S3Key: "pymysql-layer.zip"
+      CompatibleRuntimes:
+        - python3.9
+        - python3.10
+        - python3.11
+
+# ============================================================================
+# Outputs
+# ============================================================================
+
+Outputs:
+  VPCId:
+    Description: ID of the VPC
+    Value: !Ref VPC
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-vpc-id"
+
+  PrivateSubnet1Id:
+    Description: ID of the first private subnet
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-private-subnet-1-id"
+
+  PrivateSubnet2Id:
+    Description: ID of the second private subnet
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-private-subnet-2-id"
+
+  DatabaseInstanceId:
+    Description: RDS Database Instance ID
+    Value: !Ref DatabaseInstance
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-database-instance-id"
+
+  DatabaseEndpoint:
+    Description: RDS Database Endpoint
+    Value: !GetAtt DatabaseInstance.Endpoint.Address
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-database-endpoint"
+
+  DatabasePort:
+    Description: RDS Database Port
+    Value: !GetAtt DatabaseInstance.Endpoint.Port
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-database-port"
+
+  ProxyName:
+    Description: RDS Proxy Name
+    Value: !Ref DatabaseProxy
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-proxy-name"
+
+  ProxyEndpoint:
+    Description: RDS Proxy Endpoint
+    Value: !GetAtt DatabaseProxy.Endpoint
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-proxy-endpoint"
+
+  ProxyTargetEndpoint:
+    Description: RDS Proxy Target Endpoint for applications to connect to
+    Value: !GetAtt DatabaseProxy.Endpoint
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-proxy-target-endpoint"
+
+  SecretArn:
+    Description: ARN of the Secrets Manager secret containing database credentials
+    Value: !Ref DatabaseSecret
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-database-secret-arn"
+
+  DatabaseSecurityGroupId:
+    Description: Security Group ID for the RDS instance
+    Value: !Ref DatabaseSecurityGroup
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-database-sg-id"
+
+  ProxySecurityGroupId:
+    Description: Security Group ID for the RDS Proxy
+    Value: !Ref ProxySecurityGroup
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-proxy-sg-id"
+
+  LambdaFunctionName:
+    Description: Name of the test Lambda function
+    Value: !Ref TestLambdaFunction
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-lambda-function-name"
+
+  LambdaFunctionArn:
+    Description: ARN of the test Lambda function
+    Value: !GetAtt TestLambdaFunction.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-lambda-function-arn"
+
+  ConnectionString:
+    Description: Connection string for applications (use this endpoint instead of direct RDS)
+    Value: !Sub "mysql://${DatabaseUsername}:${DatabasePassword}@${DatabaseProxy.Endpoint}:3306/${DatabaseName}"
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-connection-string"
+
+  MonitoringDashboardURL:
+    Description: CloudWatch Dashboard URL for monitoring RDS Proxy metrics
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-rds-proxy"
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-monitoring-dashboard-url"
+
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for this infrastructure (USD)
+    Value: "$25-50 (RDS t3.micro + RDS Proxy + minimal Lambda costs)"
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-estimated-monthly-cost"

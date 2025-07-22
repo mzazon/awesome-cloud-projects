@@ -1,0 +1,612 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for EFS Performance Optimization and Monitoring - Creates an encrypted EFS file system with provisioned throughput, multi-AZ mount targets, comprehensive CloudWatch monitoring dashboard, and performance alarms'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'efs-performance-optimized'
+    Description: 'Name prefix for all resources'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be 3-20 characters, start with lowercase letter, contain only lowercase letters, numbers, and hyphens'
+
+  Environment:
+    Type: String
+    Default: 'production'
+    AllowedValues:
+      - 'development'
+      - 'staging'
+      - 'production'
+    Description: 'Environment type for resource tagging'
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC ID where EFS mount targets will be created'
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: 'List of subnet IDs for EFS mount targets (minimum 2 subnets in different AZs)'
+
+  PerformanceMode:
+    Type: String
+    Default: 'generalPurpose'
+    AllowedValues:
+      - 'generalPurpose'
+      - 'maxIO'
+    Description: 'EFS performance mode - generalPurpose provides lowest latency, maxIO provides higher aggregate throughput'
+
+  ThroughputMode:
+    Type: String
+    Default: 'provisioned'
+    AllowedValues:
+      - 'bursting'
+      - 'provisioned'
+      - 'elastic'
+    Description: 'EFS throughput mode - provisioned guarantees consistent performance, elastic scales automatically'
+
+  ProvisionedThroughputInMibps:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 4000
+    Description: 'Provisioned throughput in MiB/s (only used when ThroughputMode is provisioned)'
+
+  EnableEncryption:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable encryption at rest for the EFS file system'
+
+  # CloudWatch Alarm Thresholds
+  ThroughputUtilizationThreshold:
+    Type: Number
+    Default: 80
+    MinValue: 1
+    MaxValue: 100
+    Description: 'Threshold percentage for throughput utilization alarm'
+
+  ClientConnectionsThreshold:
+    Type: Number
+    Default: 500
+    MinValue: 1
+    MaxValue: 10000
+    Description: 'Threshold for maximum client connections alarm'
+
+  IOLatencyThreshold:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    MaxValue: 1000
+    Description: 'Threshold in milliseconds for average IO latency alarm'
+
+  # Optional SNS Topic for Alarms
+  AlarmNotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for alarm notifications (optional - leave empty to skip SNS topic creation)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+Conditions:
+  IsProvisionedThroughput: !Equals [!Ref ThroughputMode, 'provisioned']
+  IsEncrypted: !Equals [!Ref EnableEncryption, 'true']
+  CreateSNSTopic: !Not [!Equals [!Ref AlarmNotificationEmail, '']]
+
+Resources:
+  # EFS File System
+  EFSFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      CreationToken: !Sub '${ProjectName}-${Environment}-${AWS::StackName}'
+      PerformanceMode: !Ref PerformanceMode
+      ThroughputMode: !Ref ThroughputMode
+      ProvisionedThroughputInMibps: !If
+        - IsProvisionedThroughput
+        - !Ref ProvisionedThroughputInMibps
+        - !Ref AWS::NoValue
+      Encrypted: !If
+        - IsEncrypted
+        - true
+        - false
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-efs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'performance-optimized'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+        - Key: StackName
+          Value: !Ref AWS::StackName
+
+  # Security Group for EFS Mount Targets
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-${Environment}-efs-sg'
+      GroupDescription: 'Security group for EFS mount targets - allows NFS traffic'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref EFSClientSecurityGroup
+          Description: 'Allow NFS traffic from EFS clients'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'Allow all outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-efs-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'efs-mount-targets'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # Security Group for EFS Clients (EC2 instances that will mount EFS)
+  EFSClientSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-${Environment}-efs-client-sg'
+      GroupDescription: 'Security group for EFS clients - attach to EC2 instances that need EFS access'
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          DestinationSecurityGroupId: !Ref EFSSecurityGroup
+          Description: 'Allow NFS traffic to EFS mount targets'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-efs-client-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'efs-clients'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # EFS Mount Targets (created for each subnet)
+  EFSMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Select [0, !Ref SubnetIds]
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  EFSMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Select [1, !Ref SubnetIds]
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  # Additional mount targets if more than 2 subnets provided
+  EFSMountTarget3:
+    Type: AWS::EFS::MountTarget
+    Condition: HasThirdSubnet
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Select [2, !Ref SubnetIds]
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  # SNS Topic for Alarm Notifications (optional)
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSNSTopic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-efs-alarms'
+      DisplayName: 'EFS Performance Alarms'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-efs-alarms'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'efs-monitoring'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # SNS Subscription for Email Notifications
+  AlarmNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateSNSTopic
+    Properties:
+      TopicArn: !Ref AlarmNotificationTopic
+      Protocol: email
+      Endpoint: !Ref AlarmNotificationEmail
+
+  # CloudWatch Alarms for EFS Performance Monitoring
+  
+  # High Throughput Utilization Alarm
+  HighThroughputUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-EFS-High-Throughput-Utilization'
+      AlarmDescription: !Sub 'EFS throughput utilization exceeds ${ThroughputUtilizationThreshold}% for file system ${EFSFileSystem}'
+      MetricName: PercentIOLimit
+      Namespace: AWS/EFS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref ThroughputUtilizationThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FileSystemId
+          Value: !Ref EFSFileSystem
+      AlarmActions: !If
+        - CreateSNSTopic
+        - [!Ref AlarmNotificationTopic]
+        - []
+      OKActions: !If
+        - CreateSNSTopic
+        - [!Ref AlarmNotificationTopic]
+        - []
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-efs-throughput-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'efs-monitoring'
+
+  # High Client Connections Alarm
+  HighClientConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-EFS-High-Client-Connections'
+      AlarmDescription: !Sub 'EFS client connections exceed ${ClientConnectionsThreshold} for file system ${EFSFileSystem}'
+      MetricName: ClientConnections
+      Namespace: AWS/EFS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref ClientConnectionsThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FileSystemId
+          Value: !Ref EFSFileSystem
+      AlarmActions: !If
+        - CreateSNSTopic
+        - [!Ref AlarmNotificationTopic]
+        - []
+      OKActions: !If
+        - CreateSNSTopic
+        - [!Ref AlarmNotificationTopic]
+        - []
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-efs-connections-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'efs-monitoring'
+
+  # High IO Latency Alarm
+  HighIOLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-EFS-High-IO-Latency'
+      AlarmDescription: !Sub 'EFS average IO time exceeds ${IOLatencyThreshold}ms for file system ${EFSFileSystem}'
+      MetricName: TotalIOTime
+      Namespace: AWS/EFS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref IOLatencyThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FileSystemId
+          Value: !Ref EFSFileSystem
+      AlarmActions: !If
+        - CreateSNSTopic
+        - [!Ref AlarmNotificationTopic]
+        - []
+      OKActions: !If
+        - CreateSNSTopic
+        - [!Ref AlarmNotificationTopic]
+        - []
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-efs-latency-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'efs-monitoring'
+
+  # CloudWatch Dashboard for EFS Performance Monitoring
+  EFSPerformanceDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}-EFS-Performance'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/EFS", "TotalIOBytes", "FileSystemId", "${EFSFileSystem}", { "stat": "Sum" } ],
+                  [ ".", "ReadIOBytes", ".", ".", { "stat": "Sum" } ],
+                  [ ".", "WriteIOBytes", ".", ".", { "stat": "Sum" } ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "EFS IO Throughput (Bytes)",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                },
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/EFS", "TotalIOTime", "FileSystemId", "${EFSFileSystem}", { "stat": "Average" } ],
+                  [ ".", "ReadIOTime", ".", ".", { "stat": "Average" } ],
+                  [ ".", "WriteIOTime", ".", ".", { "stat": "Average" } ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "EFS IO Latency (Milliseconds)",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                },
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/EFS", "ClientConnections", "FileSystemId", "${EFSFileSystem}", { "stat": "Sum" } ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "EFS Client Connections",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                },
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/EFS", "PercentIOLimit", "FileSystemId", "${EFSFileSystem}", { "stat": "Average" } ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "EFS IO Limit Utilization (%)",
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 100
+                  }
+                },
+                "view": "timeSeries",
+                "stacked": false,
+                "annotations": {
+                  "horizontal": [
+                    {
+                      "value": ${ThroughputUtilizationThreshold},
+                      "label": "High Utilization Threshold"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/EFS", "DataReadIOBytes", "FileSystemId", "${EFSFileSystem}", { "stat": "Sum" } ],
+                  [ ".", "DataWriteIOBytes", ".", ".", { "stat": "Sum" } ],
+                  [ ".", "MetadataIOBytes", ".", ".", { "stat": "Sum" } ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "EFS IO Breakdown by Type",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                },
+                "view": "timeSeries",
+                "stacked": true
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/EFS", "TotalIOOperations", "FileSystemId", "${EFSFileSystem}", { "stat": "Sum" } ],
+                  [ ".", "ReadIOOperations", ".", ".", { "stat": "Sum" } ],
+                  [ ".", "WriteIOOperations", ".", ".", { "stat": "Sum" } ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "EFS IO Operations Count",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                },
+                "view": "timeSeries",
+                "stacked": false
+              }
+            }
+          ]
+        }
+
+# Additional Conditions
+Conditions:
+  HasThirdSubnet: !Not [!Equals [!Select [2, !Ref SubnetIds], '']]
+
+Outputs:
+  EFSFileSystemId:
+    Description: 'EFS File System ID'
+    Value: !Ref EFSFileSystem
+    Export:
+      Name: !Sub '${AWS::StackName}-EFS-FileSystemId'
+
+  EFSFileSystemArn:
+    Description: 'EFS File System ARN'
+    Value: !Sub 'arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/${EFSFileSystem}'
+    Export:
+      Name: !Sub '${AWS::StackName}-EFS-FileSystemArn'
+
+  EFSSecurityGroupId:
+    Description: 'Security Group ID for EFS Mount Targets'
+    Value: !Ref EFSSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-EFS-SecurityGroupId'
+
+  EFSClientSecurityGroupId:
+    Description: 'Security Group ID for EFS Clients (attach to EC2 instances)'
+    Value: !Ref EFSClientSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-EFS-ClientSecurityGroupId'
+
+  MountTargetIds:
+    Description: 'EFS Mount Target IDs'
+    Value: !Join
+      - ','
+      - - !Ref EFSMountTarget1
+        - !Ref EFSMountTarget2
+        - !If [HasThirdSubnet, !Ref EFSMountTarget3, !Ref 'AWS::NoValue']
+    Export:
+      Name: !Sub '${AWS::StackName}-EFS-MountTargetIds'
+
+  DNSName:
+    Description: 'EFS DNS Name for mounting'
+    Value: !Sub '${EFSFileSystem}.efs.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-EFS-DNSName'
+
+  DashboardURL:
+    Description: 'CloudWatch Dashboard URL for EFS Performance Monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-EFS-Performance'
+
+  AlarmTopicArn:
+    Condition: CreateSNSTopic
+    Description: 'SNS Topic ARN for EFS Performance Alarms'
+    Value: !Ref AlarmNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-EFS-AlarmTopicArn'
+
+  MountCommand:
+    Description: 'Example mount command for EC2 instances'
+    Value: !Sub 'sudo mount -t efs -o tls ${EFSFileSystem}:/ /mnt/efs'
+
+  FileSystemPerformanceConfiguration:
+    Description: 'EFS Performance Configuration Summary'
+    Value: !Sub 'Performance Mode: ${PerformanceMode}, Throughput Mode: ${ThroughputMode}, Provisioned Throughput: ${ProvisionedThroughputInMibps} MiB/s'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Project Configuration'
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: 'Network Configuration'
+        Parameters:
+          - VpcId
+          - SubnetIds
+      - Label:
+          default: 'EFS Performance Configuration'
+        Parameters:
+          - PerformanceMode
+          - ThroughputMode
+          - ProvisionedThroughputInMibps
+          - EnableEncryption
+      - Label:
+          default: 'Monitoring and Alerting'
+        Parameters:
+          - ThroughputUtilizationThreshold
+          - ClientConnectionsThreshold
+          - IOLatencyThreshold
+          - AlarmNotificationEmail
+    ParameterLabels:
+      ProjectName:
+        default: 'Project Name'
+      Environment:
+        default: 'Environment Type'
+      VpcId:
+        default: 'VPC ID'
+      SubnetIds:
+        default: 'Subnet IDs'
+      PerformanceMode:
+        default: 'Performance Mode'
+      ThroughputMode:
+        default: 'Throughput Mode'
+      ProvisionedThroughputInMibps:
+        default: 'Provisioned Throughput (MiB/s)'
+      EnableEncryption:
+        default: 'Enable Encryption'
+      ThroughputUtilizationThreshold:
+        default: 'Throughput Utilization Threshold (%)'
+      ClientConnectionsThreshold:
+        default: 'Client Connections Threshold'
+      IOLatencyThreshold:
+        default: 'IO Latency Threshold (ms)'
+      AlarmNotificationEmail:
+        default: 'Alarm Notification Email'
+
+  AWS::CloudFormation::Designer:
+    version: 1.0
+    description: 'EFS Performance Optimization and Monitoring CloudFormation Template'

@@ -1,0 +1,619 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Analytics-Ready Data Storage with S3 Tables - A complete infrastructure
+  solution for building high-performance analytics platforms using Amazon S3 Tables,
+  Apache Iceberg format, and integrated AWS analytics services including Athena,
+  Glue Data Catalog, and Lake Formation for optimized query performance and
+  automatic table maintenance.
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Table Bucket Configuration"
+        Parameters:
+          - TableBucketName
+          - NamespaceName
+          - SampleTableName
+      - Label:
+          default: "Athena Configuration"  
+        Parameters:
+          - AthenaWorkgroupName
+          - AthenaResultsBucketName
+      - Label:
+          default: "Tagging and Environment"
+        Parameters:
+          - Environment
+          - ProjectName
+          - CostCenter
+    ParameterLabels:
+      TableBucketName:
+        default: "S3 Table Bucket Name"
+      NamespaceName:
+        default: "Table Namespace"
+      SampleTableName:
+        default: "Sample Table Name"
+      AthenaWorkgroupName:
+        default: "Athena Workgroup Name"
+      AthenaResultsBucketName:
+        default: "Athena Results Bucket"
+      Environment:
+        default: "Environment"
+      ProjectName:
+        default: "Project Name"
+      CostCenter:
+        default: "Cost Center"
+
+# Input Parameters
+Parameters:
+  TableBucketName:
+    Type: String
+    Description: >
+      Name for the S3 Table Bucket that will store Apache Iceberg tables.
+      Must be globally unique across all AWS accounts and regions.
+    Default: !Sub 'analytics-data-${AWS::AccountId}-${AWS::Region}'
+    AllowedPattern: '^[a-z0-9][a-z0-9\-]*[a-z0-9]$'
+    ConstraintDescription: >
+      Must be a valid S3 bucket name: lowercase letters, numbers, and hyphens only.
+      Cannot start or end with hyphen.
+    MinLength: 3
+    MaxLength: 63
+
+  NamespaceName:
+    Type: String
+    Description: >
+      Logical namespace for organizing related tables, similar to a database
+      in traditional data warehouses. Enables access control and organization.
+    Default: 'analytics_data'
+    AllowedPattern: '^[a-zA-Z0-9_]+$'
+    ConstraintDescription: >
+      Must contain only letters, numbers, and underscores.
+    MinLength: 1
+    MaxLength: 255
+
+  SampleTableName:
+    Type: String
+    Description: >
+      Name for the sample customer events table that demonstrates S3 Tables
+      capabilities with Apache Iceberg format and automatic optimization.
+    Default: 'customer_events'
+    AllowedPattern: '^[a-zA-Z0-9_]+$'
+    ConstraintDescription: >
+      Must contain only letters, numbers, and underscores.
+    MinLength: 1
+    MaxLength: 255
+
+  AthenaWorkgroupName:
+    Type: String
+    Description: >
+      Name for the Amazon Athena workgroup that provides query execution
+      settings, result location, and cost controls for analytics workloads.
+    Default: 's3-tables-workgroup'
+    AllowedPattern: '^[a-zA-Z0-9\-_]+$'
+    ConstraintDescription: >
+      Must contain only letters, numbers, hyphens, and underscores.
+    MinLength: 1
+    MaxLength: 128
+
+  AthenaResultsBucketName:
+    Type: String
+    Description: >
+      S3 bucket name for storing Athena query results and metadata.
+      Must be globally unique across all AWS accounts and regions.
+    Default: !Sub 'athena-results-${AWS::AccountId}-${AWS::Region}'
+    AllowedPattern: '^[a-z0-9][a-z0-9\-]*[a-z0-9]$'
+    ConstraintDescription: >
+      Must be a valid S3 bucket name: lowercase letters, numbers, and hyphens only.
+    MinLength: 3
+    MaxLength: 63
+
+  Environment:
+    Type: String
+    Description: >
+      Environment designation for resource tagging and organization.
+      Used for cost allocation and resource management.
+    Default: 'development'
+    AllowedValues:
+      - 'development'
+      - 'staging'
+      - 'production'
+    ConstraintDescription: >
+      Must be one of: development, staging, production
+
+  ProjectName:
+    Type: String
+    Description: >
+      Project name for resource tagging and cost allocation.
+      Helps organize resources across different business initiatives.
+    Default: 'analytics-platform'
+    AllowedPattern: '^[a-zA-Z0-9\-_]+$'
+    ConstraintDescription: >
+      Must contain only letters, numbers, hyphens, and underscores.
+    MinLength: 1
+    MaxLength: 50
+
+  CostCenter:
+    Type: String
+    Description: >
+      Cost center identifier for billing and cost allocation purposes.
+      Used for departmental charge-back and budget management.
+    Default: '1000'
+    AllowedPattern: '^[a-zA-Z0-9\-_]+$'
+    ConstraintDescription: >
+      Must contain only letters, numbers, hyphens, and underscores.
+    MinLength: 1
+    MaxLength: 20
+
+# Conditional Logic
+Conditions:
+  IsProductionEnvironment: !Equals [!Ref Environment, 'production']
+  EnableAdvancedFeatures: !Equals [!Ref Environment, 'production']
+
+# AWS Resources
+Resources:
+  # S3 Bucket for Athena Query Results
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref AthenaResultsBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldQueryResults
+            Status: Enabled
+            ExpirationInDays: !If [IsProductionEnvironment, 90, 30]
+            NoncurrentVersionExpirationInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-athena-results'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: 'Athena query results storage'
+
+  # IAM Role for S3 Tables Service Integration
+  S3TablesServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-s3tables-service-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - s3tables.amazonaws.com
+                - glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/LakeFormationServiceRolePolicy
+      Policies:
+        - PolicyName: S3TablesIntegrationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub '${AthenaResultsBucket}/*'
+                  - !Ref AthenaResultsBucket
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:CreateDatabase
+                  - glue:GetTable
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:DeleteTable
+                  - glue:GetPartitions
+                  - glue:CreatePartition
+                  - glue:UpdatePartition
+                  - glue:DeletePartition
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                  - lakeformation:GrantPermissions
+                  - lakeformation:RevokePermissions
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-s3tables-service-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # IAM Role for Athena Query Execution
+  AthenaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-athena-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              Service: athena.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAthenaFullAccess
+      Policies:
+        - PolicyName: AthenaS3TablesPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:ListBucketMultipartUploads
+                  - s3:ListMultipartUploadParts
+                  - s3:AbortMultipartUpload
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${AthenaResultsBucket}/*'
+                  - !Ref AthenaResultsBucket
+              - Effect: Allow
+                Action:
+                  - s3tables:GetTable
+                  - s3tables:GetTableMetadata
+                  - s3tables:ListTables
+                  - s3tables:ListNamespaces
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartitions
+                  - glue:GetDatabases
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                  - lakeformation:GetTableObjects
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-athena-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Athena Workgroup for S3 Tables Queries
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Ref AthenaWorkgroupName
+      Description: >
+        Amazon Athena workgroup optimized for querying S3 Tables with
+        Apache Iceberg format. Provides query execution settings,
+        result location configuration, and cost controls.
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetrics: true
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${AthenaResultsBucket}/'
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+        EngineVersion:
+          SelectedEngineVersion: 'Athena engine version 3'
+        ExecutionRole: !GetAtt AthenaExecutionRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-athena-workgroup'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: 'S3 Tables analytics queries'
+
+  # Glue Database for Table Catalog Integration
+  AnalyticsGlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref NamespaceName
+        Description: >
+          AWS Glue database for managing S3 Tables metadata and enabling
+          seamless integration with AWS analytics services including Athena,
+          Redshift, and EMR through unified data catalog.
+        Parameters:
+          classification: 'iceberg'
+          table_type: 'ICEBERG'
+          connector_type: 's3tables'
+        CreateTableDefaultPermissions:
+          - Principal:
+              DataLakePrincipalIdentifier: 'IAM_ALLOWED_PRINCIPALS'
+            Permissions:
+              - 'ALL'
+
+  # AWS Lake Formation Database Permissions
+  LakeFormationDatabasePermissions:
+    Type: AWS::LakeFormation::Permissions
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt S3TablesServiceRole.Arn
+      Resource:
+        DatabaseResource:
+          CatalogId: !Ref AWS::AccountId
+          Name: !Ref AnalyticsGlueDatabase
+      Permissions:
+        - 'CREATE_TABLE'
+        - 'ALTER'
+        - 'DROP'
+        - 'DESCRIBE'
+      PermissionsWithGrantOption:
+        - 'CREATE_TABLE'
+        - 'ALTER'
+        - 'DROP'
+        - 'DESCRIBE'
+
+  # CloudWatch Log Group for Monitoring S3 Tables Operations
+  S3TablesLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3tables/${ProjectName}/${Environment}'
+      RetentionInDays: !If [IsProductionEnvironment, 90, 14]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-s3tables-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # CloudWatch Dashboard for Analytics Monitoring
+  AnalyticsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableAdvancedFeatures
+    Properties:
+      DashboardName: !Sub '${ProjectName}-analytics-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Athena", "QueryExecutionTime", "WorkGroup", "${AthenaWorkgroupName}" ],
+                  [ ".", "ProcessedBytes", ".", "." ],
+                  [ ".", "QueryQueueTime", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Athena Query Performance",
+                "period": 300,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "BucketSizeBytes", "BucketName", "${AthenaResultsBucket}", "StorageType", "StandardStorage" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Storage Utilization",
+                "period": 86400,
+                "stat": "Average"
+              }
+            }
+          ]
+        }
+
+  # EventBridge Rule for S3 Tables Events (Production Only)
+  S3TablesEventRule:
+    Type: AWS::Events::Rule
+    Condition: EnableAdvancedFeatures
+    Properties:
+      Name: !Sub '${ProjectName}-s3tables-events-${Environment}'
+      Description: >
+        EventBridge rule to capture S3 Tables events for monitoring
+        table operations, optimization activities, and maintenance tasks.
+      EventPattern:
+        source:
+          - 'aws.s3tables'
+        detail-type:
+          - 'S3 Tables Operation'
+        detail:
+          state:
+            - 'SUCCEEDED'
+            - 'FAILED'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt S3TablesLogGroup.Arn
+          Id: 'S3TablesLogTarget'
+
+# Stack Outputs
+Outputs:
+  TableBucketName:
+    Description: >
+      Name of the S3 Table Bucket created for storing Apache Iceberg tables
+      with automatic optimization and maintenance capabilities.
+    Value: !Ref TableBucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-TableBucketName'
+
+  NamespaceName:
+    Description: >
+      Namespace for logical organization of related tables, providing
+      access control and resource management capabilities.
+    Value: !Ref NamespaceName
+    Export:
+      Name: !Sub '${AWS::StackName}-NamespaceName'
+
+  SampleTableName:
+    Description: >
+      Name of the sample customer events table demonstrating S3 Tables
+      capabilities with Apache Iceberg format and query optimization.
+    Value: !Ref SampleTableName
+    Export:
+      Name: !Sub '${AWS::StackName}-SampleTableName'
+
+  AthenaWorkgroupName:
+    Description: >
+      Amazon Athena workgroup configured for querying S3 Tables with
+      optimized settings for performance and cost management.
+    Value: !Ref AthenaWorkgroupName
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaWorkgroupName'
+
+  AthenaResultsBucketName:
+    Description: >
+      S3 bucket for storing Athena query results with encryption
+      and lifecycle management for cost optimization.
+    Value: !Ref AthenaResultsBucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaResultsBucketName'
+
+  AthenaResultsBucketArn:
+    Description: >
+      ARN of the S3 bucket storing Athena query results, used for
+      IAM policies and cross-service integrations.
+    Value: !GetAtt AthenaResultsBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaResultsBucketArn'
+
+  S3TablesServiceRoleArn:
+    Description: >
+      ARN of the IAM role for S3 Tables service integration with
+      AWS analytics services and Lake Formation permissions.
+    Value: !GetAtt S3TablesServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-S3TablesServiceRoleArn'
+
+  AthenaExecutionRoleArn:
+    Description: >
+      ARN of the IAM role for Athena query execution with permissions
+      to access S3 Tables and Glue Data Catalog resources.
+    Value: !GetAtt AthenaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaExecutionRoleArn'
+
+  GlueDatabaseName:
+    Description: >
+      AWS Glue database name for S3 Tables metadata integration,
+      enabling unified data catalog across analytics services.
+    Value: !Ref AnalyticsGlueDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabaseName'
+
+  AthenaWorkgroupArn:
+    Description: >
+      ARN of the Athena workgroup for S3 Tables queries, used for
+      resource-based policies and access control configurations.
+    Value: !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AthenaWorkgroupName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaWorkgroupArn'
+
+  CloudWatchLogGroupName:
+    Description: >
+      CloudWatch log group for monitoring S3 Tables operations,
+      maintenance activities, and performance metrics.
+    Value: !Ref S3TablesLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupName'
+
+  CloudWatchLogGroupArn:
+    Description: >
+      ARN of the CloudWatch log group for S3 Tables monitoring,
+      used for log streaming and analysis configurations.
+    Value: !GetAtt S3TablesLogGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupArn'
+
+  DashboardUrl:
+    Condition: EnableAdvancedFeatures
+    Description: >
+      URL to the CloudWatch dashboard for monitoring analytics
+      performance, query metrics, and storage utilization.
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-analytics-${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardUrl'
+
+  StackRegion:
+    Description: >
+      AWS Region where the S3 Tables analytics infrastructure
+      is deployed for regional resource management.
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub '${AWS::StackName}-Region'
+
+  StackEnvironment:
+    Description: >
+      Environment designation for the deployed analytics infrastructure
+      used for resource organization and cost allocation.
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+  # CLI Commands for Next Steps
+  NextStepsCommands:
+    Description: >
+      CLI commands to complete the S3 Tables setup and begin using
+      the analytics platform for high-performance data processing.
+    Value: !Sub |
+      # Create S3 Table Bucket:
+      aws s3tables create-table-bucket --name ${TableBucketName} --region ${AWS::Region}
+      
+      # Create Namespace:
+      TABLE_BUCKET_ARN=$(aws s3tables get-table-bucket --name ${TableBucketName} --query 'arn' --output text)
+      aws s3tables create-namespace --table-bucket-arn $TABLE_BUCKET_ARN --namespace ${NamespaceName}
+      
+      # Create Sample Table:
+      aws s3tables create-table --table-bucket-arn $TABLE_BUCKET_ARN --namespace ${NamespaceName} --name ${SampleTableName} --format ICEBERG
+      
+      # Query with Athena:
+      aws athena start-query-execution --query-string "SHOW TABLES" --work-group ${AthenaWorkgroupName}

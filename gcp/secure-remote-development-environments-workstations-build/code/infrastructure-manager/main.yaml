@@ -1,0 +1,529 @@
+# Google Cloud Infrastructure Manager Configuration
+# Secure Remote Development Environments with Cloud Workstations and Cloud Build
+# Recipe ID: f3a7c8e2
+
+# This configuration deploys a complete secure development environment including:
+# - VPC network with private subnets for isolation
+# - Cloud Workstations cluster and configuration for browser-based development
+# - Cloud Source Repository for secure code storage
+# - Artifact Registry for container image storage
+# - Private Cloud Build pool for secure CI/CD operations
+# - IAM roles and service accounts with least privilege access
+
+metadata:
+  description: "Secure Remote Development Environment with Cloud Workstations and Cloud Build"
+  labels:
+    environment: "development"
+    security: "high"
+    recipe-id: "f3a7c8e2"
+    component: "infrastructure-manager"
+
+# Input parameters for customizing the deployment
+variables:
+  # Project and location configuration
+  project_id:
+    type: string
+    description: "Google Cloud project ID where resources will be created"
+    
+  region:
+    type: string
+    description: "Google Cloud region for regional resources"
+    default: "us-central1"
+    
+  zone:
+    type: string
+    description: "Google Cloud zone for zonal resources"
+    default: "us-central1-a"
+    
+  # Resource naming configuration
+  environment_name:
+    type: string
+    description: "Environment name used as prefix for resource names"
+    default: "secure-dev"
+    
+  # Network configuration
+  vpc_cidr:
+    type: string
+    description: "CIDR range for the VPC network"
+    default: "10.0.0.0/16"
+    
+  subnet_cidr:
+    type: string
+    description: "CIDR range for the development subnet"
+    default: "10.0.0.0/24"
+    
+  build_pool_cidr:
+    type: string
+    description: "CIDR range for the private build pool"
+    default: "10.1.0.0/24"
+    
+  # Workstation configuration
+  workstation_machine_type:
+    type: string
+    description: "Machine type for Cloud Workstations"
+    default: "e2-standard-4"
+    
+  workstation_disk_size:
+    type: integer
+    description: "Disk size in GB for workstations"
+    default: 100
+    
+  workstation_idle_timeout:
+    type: string
+    description: "Idle timeout for workstations (e.g., 7200s)"
+    default: "7200s"
+    
+  workstation_running_timeout:
+    type: string
+    description: "Running timeout for workstations (e.g., 43200s)"
+    default: "43200s"
+    
+  # Build pool configuration
+  build_pool_machine_type:
+    type: string
+    description: "Machine type for private build pool workers"
+    default: "e2-medium"
+    
+  build_pool_disk_size:
+    type: integer
+    description: "Disk size in GB for build pool workers"
+    default: 100
+
+# Required Google Cloud APIs
+imports:
+  # Enable required APIs for the secure development environment
+  - path: "modules/project-services"
+    name: "enable_apis"
+
+# Main infrastructure resources
+resources:
+  # Enable Google Cloud APIs required for the development environment
+  project_services:
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/workstations.googleapis.com
+      
+  compute_api:
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/compute.googleapis.com
+      
+  cloudbuild_api:
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/cloudbuild.googleapis.com
+      
+  sourcerepo_api:
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/sourcerepo.googleapis.com
+      
+  artifactregistry_api:
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/artifactregistry.googleapis.com
+      
+  logging_api:
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/logging.googleapis.com
+      
+  monitoring_api:
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/monitoring.googleapis.com
+
+  # VPC Network for secure development environment
+  # This network provides isolation and controlled access to development resources
+  dev_vpc_network:
+    type: gcp-types/compute-v1:networks
+    properties:
+      name: ${environment_name}-vpc
+      description: "Secure development environment VPC network"
+      autoCreateSubnetworks: false
+      routingConfig:
+        routingMode: REGIONAL
+    metadata:
+      dependsOn:
+        - compute_api
+        
+  # Subnet for development workstations and resources
+  # Configured with private Google access for secure connectivity
+  dev_subnet:
+    type: gcp-types/compute-v1:subnetworks
+    properties:
+      name: ${environment_name}-subnet
+      description: "Subnet for Cloud Workstations and development resources"
+      network: $(ref.dev_vpc_network.selfLink)
+      ipCidrRange: ${subnet_cidr}
+      region: ${region}
+      privateIpGoogleAccess: true
+      enableFlowLogs: true
+      logConfig:
+        enable: true
+        flowSampling: 0.5
+        aggregationInterval: INTERVAL_10_MIN
+    metadata:
+      dependsOn:
+        - dev_vpc_network
+
+  # Firewall rules for secure development environment
+  # Allow internal communication and necessary outbound connectivity
+  allow_internal_firewall:
+    type: gcp-types/compute-v1:firewalls
+    properties:
+      name: ${environment_name}-allow-internal
+      description: "Allow internal communication within development VPC"
+      network: $(ref.dev_vpc_network.selfLink)
+      direction: INGRESS
+      priority: 1000
+      sourceRanges:
+        - ${vpc_cidr}
+      allowed:
+        - IPProtocol: tcp
+        - IPProtocol: udp
+        - IPProtocol: icmp
+    metadata:
+      dependsOn:
+        - dev_vpc_network
+
+  # Allow SSH access for workstation connectivity
+  allow_ssh_firewall:
+    type: gcp-types/compute-v1:firewalls
+    properties:
+      name: ${environment_name}-allow-ssh
+      description: "Allow SSH access for Cloud Workstations"
+      network: $(ref.dev_vpc_network.selfLink)
+      direction: INGRESS
+      priority: 1000
+      sourceRanges:
+        - "0.0.0.0/0"
+      allowed:
+        - IPProtocol: tcp
+          ports: ["22"]
+      targetTags:
+        - workstation
+    metadata:
+      dependsOn:
+        - dev_vpc_network
+
+  # Service account for workstation operations
+  # Configured with minimal necessary permissions for development tasks
+  workstation_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: ${environment_name}-workstation-sa
+      displayName: "Cloud Workstations Service Account"
+      description: "Service account for secure development workstations"
+      
+  # IAM binding for source repository access
+  workstation_source_developer_binding:
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: ${project_id}
+      policy:
+        bindings:
+          - role: roles/source.developer
+            members:
+              - serviceAccount:$(ref.workstation_service_account.email)
+    metadata:
+      dependsOn:
+        - workstation_service_account
+
+  # IAM binding for artifact registry read access
+  workstation_artifact_reader_binding:
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: ${project_id}
+      policy:
+        bindings:
+          - role: roles/artifactregistry.reader
+            members:
+              - serviceAccount:$(ref.workstation_service_account.email)
+    metadata:
+      dependsOn:
+        - workstation_service_account
+
+  # IAM binding for Cloud Build viewer access
+  workstation_build_viewer_binding:
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: ${project_id}
+      policy:
+        bindings:
+          - role: roles/cloudbuild.builds.viewer
+            members:
+              - serviceAccount:$(ref.workstation_service_account.email)
+    metadata:
+      dependsOn:
+        - workstation_service_account
+
+  # Cloud Workstations cluster
+  # Provides the compute infrastructure for secure development environments
+  workstations_cluster:
+    type: gcp-types/workstations-v1:projects.locations.workstationClusters
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      workstationClusterId: ${environment_name}-cluster
+      workstationCluster:
+        displayName: "Secure Development Cluster"
+        annotations:
+          environment: "development"
+          security: "high"
+        network: $(ref.dev_vpc_network.selfLink)
+        subnetwork: $(ref.dev_subnet.selfLink)
+        privateClusterConfig:
+          enablePrivateEndpoint: true
+          clusterHostname: ${environment_name}-cluster.${region}.workstations.cloud.google.com
+    metadata:
+      dependsOn:
+        - project_services
+        - dev_subnet
+        - workstation_service_account
+
+  # Cloud Workstations configuration
+  # Defines the development environment specifications and security settings
+  workstation_config:
+    type: gcp-types/workstations-v1:projects.locations.workstationClusters.workstationConfigs
+    properties:
+      parent: $(ref.workstations_cluster.name)
+      workstationConfigId: ${environment_name}-config
+      workstationConfig:
+        displayName: "Secure Development Configuration"
+        annotations:
+          security: "high"
+          team: "development"
+        # Container configuration with development tools
+        container:
+          image: "us-central1-docker.pkg.dev/cloud-workstations-images/predefined/code-oss:latest"
+          workingDir: "/home/user"
+          env:
+            - name: "WORKSPACE_TYPE"
+              value: "secure-development"
+        # Resource allocation for development workloads
+        host:
+          gceInstance:
+            machineType: ${workstation_machine_type}
+            serviceAccount: $(ref.workstation_service_account.email)
+            serviceAccountScopes:
+              - "https://www.googleapis.com/auth/cloud-platform"
+            disks:
+              - sizeGb: ${workstation_disk_size}
+                type: "pd-standard"
+            # Security configuration
+            tags:
+              - "workstation"
+            metadata:
+              - key: "enable-oslogin"
+                value: "TRUE"
+              - key: "block-project-ssh-keys"
+                value: "TRUE"
+        # Timeout and lifecycle configuration
+        idleTimeout: ${workstation_idle_timeout}
+        runningTimeout: ${workstation_running_timeout}
+        # Security features
+        disableTcpConnections: false
+        enableAuditAgent: true
+    metadata:
+      dependsOn:
+        - workstations_cluster
+        - workstation_service_account
+
+  # Cloud Source Repository for secure code storage
+  # Provides private Git hosting integrated with Google Cloud security
+  source_repository:
+    type: gcp-types/sourcerepo-v1:projects.repos
+    properties:
+      name: projects/${project_id}/repos/${environment_name}-app
+      description: "Secure source repository for development applications"
+      url: https://source.developers.google.com/p/${project_id}/r/${environment_name}-app
+    metadata:
+      dependsOn:
+        - sourcerepo_api
+
+  # Artifact Registry repository for container images
+  # Provides secure storage for build artifacts with vulnerability scanning
+  artifact_registry:
+    type: gcp-types/artifactregistry-v1:projects.locations.repositories
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      repositoryId: ${environment_name}-images
+      repository:
+        description: "Secure container registry for development applications"
+        format: DOCKER
+        dockerConfig:
+          immutableTags: false
+        # Enable vulnerability scanning
+        vulnerabilityScanningConfig:
+          enableVulnerabilityScanning: true
+    metadata:
+      dependsOn:
+        - artifactregistry_api
+
+  # Private Cloud Build worker pool
+  # Provides isolated compute resources for CI/CD operations within VPC
+  private_build_pool:
+    type: gcp-types/cloudbuild-v1:projects.locations.workerPools
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      workerPoolId: ${environment_name}-build-pool
+      workerPool:
+        displayName: "Secure Development Build Pool"
+        annotations:
+          environment: "development"
+          security: "high"
+        # Private pool configuration within VPC
+        privatePoolV1Config:
+          workerConfig:
+            machineType: ${build_pool_machine_type}
+            diskSizeGb: ${build_pool_disk_size}
+          networkConfig:
+            peeredNetwork: $(ref.dev_vpc_network.selfLink)
+            peeredNetworkIpRange: ${build_pool_cidr}
+            egressOption: PRIVATE_EGRESS_ONLY
+    metadata:
+      dependsOn:
+        - cloudbuild_api
+        - dev_vpc_network
+
+  # Cloud Build trigger for automated CI/CD
+  # Automatically builds and deploys code changes from the source repository
+  build_trigger:
+    type: gcp-types/cloudbuild-v1:projects.triggers
+    properties:
+      name: ${environment_name}-trigger
+      description: "Automated secure build trigger for development applications"
+      # Trigger configuration for source repository
+      github:
+        name: $(ref.source_repository.name)
+        push:
+          branch: "^main$"
+      # Build configuration
+      build:
+        steps:
+          # Build container image
+          - name: "gcr.io/cloud-builders/docker"
+            args:
+              - "build"
+              - "-t"
+              - "${region}-docker.pkg.dev/${project_id}/${environment_name}-images/app:$BUILD_ID"
+              - "."
+          # Push image to Artifact Registry
+          - name: "gcr.io/cloud-builders/docker"
+            args:
+              - "push"
+              - "${region}-docker.pkg.dev/${project_id}/${environment_name}-images/app:$BUILD_ID"
+          # Run security scan
+          - name: "gcr.io/cloud-builders/gcloud"
+            args:
+              - "artifacts"
+              - "docker"
+              - "images"
+              - "scan"
+              - "${region}-docker.pkg.dev/${project_id}/${environment_name}-images/app:$BUILD_ID"
+              - "--location=${region}"
+        # Build artifacts
+        images:
+          - "${region}-docker.pkg.dev/${project_id}/${environment_name}-images/app:$BUILD_ID"
+        # Use private build pool for security
+        options:
+          pool:
+            name: $(ref.private_build_pool.name)
+          logging: CLOUD_LOGGING_ONLY
+          machineType: "E2_MEDIUM"
+          diskSizeGb: 100
+    metadata:
+      dependsOn:
+        - cloudbuild_api
+        - source_repository
+        - private_build_pool
+        - artifact_registry
+
+# Output values for verification and integration
+outputs:
+  # Network information
+  vpc_network_name:
+    description: "Name of the created VPC network"
+    value: $(ref.dev_vpc_network.name)
+    
+  vpc_network_self_link:
+    description: "Self-link of the created VPC network"
+    value: $(ref.dev_vpc_network.selfLink)
+    
+  subnet_name:
+    description: "Name of the development subnet"
+    value: $(ref.dev_subnet.name)
+    
+  subnet_cidr:
+    description: "CIDR range of the development subnet"
+    value: $(ref.dev_subnet.ipCidrRange)
+
+  # Cloud Workstations information
+  workstation_cluster_name:
+    description: "Name of the Cloud Workstations cluster"
+    value: $(ref.workstations_cluster.name)
+    
+  workstation_config_name:
+    description: "Name of the workstation configuration"
+    value: $(ref.workstation_config.name)
+    
+  workstation_cluster_endpoint:
+    description: "Endpoint URL for accessing the workstation cluster"
+    value: $(ref.workstations_cluster.privateClusterConfig.clusterHostname)
+
+  # Source repository information
+  source_repository_url:
+    description: "URL of the Cloud Source Repository"
+    value: $(ref.source_repository.url)
+    
+  source_repository_name:
+    description: "Name of the source repository"
+    value: $(ref.source_repository.name)
+
+  # Artifact Registry information
+  artifact_registry_name:
+    description: "Name of the Artifact Registry repository"
+    value: $(ref.artifact_registry.name)
+    
+  container_image_url:
+    description: "Base URL for container images in Artifact Registry"
+    value: ${region}-docker.pkg.dev/${project_id}/${environment_name}-images
+
+  # Build infrastructure information
+  build_pool_name:
+    description: "Name of the private Cloud Build pool"
+    value: $(ref.private_build_pool.name)
+    
+  build_trigger_name:
+    description: "Name of the Cloud Build trigger"
+    value: $(ref.build_trigger.name)
+
+  # Service account information
+  workstation_service_account_email:
+    description: "Email of the workstation service account"
+    value: $(ref.workstation_service_account.email)
+
+  # Instructions for accessing the environment
+  access_instructions:
+    description: "Instructions for accessing the development environment"
+    value: |
+      1. Create a workstation instance:
+         gcloud workstations create dev-workstation-01 \
+           --cluster=$(ref.workstations_cluster.name) \
+           --config=$(ref.workstation_config.name) \
+           --region=${region}
+      
+      2. Access the workstation through the Google Cloud Console or CLI:
+         gcloud workstations start-tcp-tunnel dev-workstation-01 \
+           --cluster=$(ref.workstations_cluster.name) \
+           --config=$(ref.workstation_config.name) \
+           --region=${region} \
+           --local-host-port=localhost:8080
+      
+      3. Clone the source repository in your workstation:
+         git clone $(ref.source_repository.url)
+      
+      4. Push code changes to trigger automated builds:
+         git add .
+         git commit -m "Your changes"
+         git push origin main

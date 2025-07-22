@@ -1,0 +1,573 @@
+# Infrastructure Manager Configuration for Real-Time Analytics with Cloud Dataflow and Firestore
+# This configuration deploys a complete real-time analytics platform using:
+# - Cloud Pub/Sub for event ingestion
+# - Cloud Dataflow for stream processing
+# - Firestore for real-time queries
+# - Cloud Storage for data archival
+# - Service Account with appropriate permissions
+
+# Import necessary resource types
+imports:
+  - path: modules/
+
+variables:
+  # Project configuration
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    required: true
+  
+  region:
+    description: "Primary region for resource deployment"
+    type: string
+    default: "us-central1"
+    
+  zone:
+    description: "Primary zone for resource deployment"
+    type: string
+    default: "us-central1-a"
+  
+  # Resource naming
+  deployment_name:
+    description: "Unique name for this deployment"
+    type: string
+    default: "analytics-platform"
+    
+  random_suffix:
+    description: "Random suffix for unique resource names"
+    type: string
+    default: "$(randstr(6))"
+  
+  # Pub/Sub configuration
+  pubsub_topic_name:
+    description: "Name of the Pub/Sub topic for event ingestion"
+    type: string
+    default: "events-topic"
+    
+  pubsub_subscription_name:
+    description: "Name of the Pub/Sub subscription for Dataflow"
+    type: string
+    default: "events-subscription"
+    
+  message_retention_duration:
+    description: "Message retention duration for Pub/Sub"
+    type: string
+    default: "604800s"  # 7 days
+    
+  # Dataflow configuration
+  dataflow_job_name:
+    description: "Name of the Dataflow streaming job"
+    type: string
+    default: "streaming-analytics"
+    
+  max_workers:
+    description: "Maximum number of Dataflow workers"
+    type: integer
+    default: 10
+    
+  machine_type:
+    description: "Machine type for Dataflow workers"
+    type: string
+    default: "n1-standard-2"
+    
+  # Storage configuration
+  storage_bucket_name:
+    description: "Name of the Cloud Storage bucket for data archival"
+    type: string
+    default: "analytics-archive"
+    
+  storage_location:
+    description: "Location for Cloud Storage bucket"
+    type: string
+    default: "US"
+    
+  # Firestore configuration
+  firestore_location:
+    description: "Location for Firestore database"
+    type: string
+    default: "us-central"
+    
+  # Service account configuration
+  service_account_name:
+    description: "Name of the service account for Dataflow"
+    type: string
+    default: "dataflow-analytics"
+
+resources:
+  # Enable required APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      parent: projects/$(ref.project_id.projectId)
+      serviceIds:
+        - dataflow.googleapis.com
+        - pubsub.googleapis.com
+        - firestore.googleapis.com
+        - storage.googleapis.com
+        - appengine.googleapis.com
+        - cloudbuild.googleapis.com
+    metadata:
+      runtimePolicy:
+        - CREATE
+
+  # Create Pub/Sub topic for event ingestion
+  - name: events-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(var.project_id)/topics/$(var.pubsub_topic_name)-$(var.random_suffix)
+      messageRetentionDuration: $(var.message_retention_duration)
+      messageStoragePolicy:
+        allowedPersistenceRegions:
+          - $(var.region)
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # Create Pub/Sub subscription for Dataflow pipeline
+  - name: events-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(var.project_id)/subscriptions/$(var.pubsub_subscription_name)-$(var.random_suffix)
+      topic: $(ref.events-topic.name)
+      ackDeadlineSeconds: 60
+      messageRetentionDuration: $(var.message_retention_duration)
+      enableExactlyOnceDelivery: true
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+      deadLetterPolicy:
+        deadLetterTopic: $(ref.dead-letter-topic.name)
+        maxDeliveryAttempts: 5
+    metadata:
+      dependsOn:
+        - events-topic
+        - dead-letter-topic
+
+  # Create dead letter topic for failed messages
+  - name: dead-letter-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(var.project_id)/topics/$(var.pubsub_topic_name)-dlq-$(var.random_suffix)
+      messageRetentionDuration: $(var.message_retention_duration)
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # Create Cloud Storage bucket for data archival
+  - name: analytics-storage-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(var.storage_bucket_name)-$(var.random_suffix)
+      project: $(var.project_id)
+      location: $(var.storage_location)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90
+          - action:
+              type: SetStorageClass
+              storageClass: ARCHIVE
+            condition:
+              age: 365
+      uniformBucketLevelAccess:
+        enabled: true
+      encryption:
+        defaultKmsKeyName: $(ref.storage-encryption-key.name)
+    metadata:
+      dependsOn:
+        - enable-apis
+        - storage-encryption-key
+
+  # Create KMS key for storage encryption
+  - name: storage-encryption-key
+    type: gcp-types/cloudkms-v1:projects.locations.keyRings.cryptoKeys
+    properties:
+      parent: projects/$(var.project_id)/locations/$(var.region)/keyRings/$(ref.analytics-keyring.name)
+      cryptoKeyId: analytics-storage-key
+      purpose: ENCRYPT_DECRYPT
+      versionTemplate:
+        algorithm: GOOGLE_SYMMETRIC_ENCRYPTION
+        protectionLevel: SOFTWARE
+      rotationPeriod: 7776000s  # 90 days
+    metadata:
+      dependsOn:
+        - analytics-keyring
+
+  # Create KMS key ring
+  - name: analytics-keyring
+    type: gcp-types/cloudkms-v1:projects.locations.keyRings
+    properties:
+      parent: projects/$(var.project_id)/locations/$(var.region)
+      keyRingId: analytics-keyring-$(var.random_suffix)
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # Create App Engine application (required for Firestore)
+  - name: app-engine-app
+    type: gcp-types/appengine-v1:apps
+    properties:
+      id: $(var.project_id)
+      locationId: $(var.region)
+      databaseType: CLOUD_FIRESTORE
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # Create Firestore database
+  - name: firestore-database
+    type: gcp-types/firestore-v1:projects.databases
+    properties:
+      parent: projects/$(var.project_id)
+      databaseId: "(default)"
+      type: FIRESTORE_NATIVE
+      locationId: $(var.firestore_location)
+      concurrencyMode: OPTIMISTIC
+      appEngineIntegrationMode: DISABLED
+      pointInTimeRecoveryEnablement: POINT_IN_TIME_RECOVERY_ENABLED
+      deleteProtectionState: DELETE_PROTECTION_ENABLED
+    metadata:
+      dependsOn:
+        - app-engine-app
+
+  # Create service account for Dataflow pipeline
+  - name: dataflow-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: $(var.service_account_name)-$(var.random_suffix)
+      serviceAccount:
+        displayName: "Dataflow Analytics Pipeline Service Account"
+        description: "Service account for streaming analytics pipeline with minimal required permissions"
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # Grant Dataflow Worker role to service account
+  - name: dataflow-worker-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(var.project_id)
+      role: roles/dataflow.worker
+      member: serviceAccount:$(ref.dataflow-service-account.email)
+    metadata:
+      dependsOn:
+        - dataflow-service-account
+
+  # Grant Pub/Sub Subscriber role to service account
+  - name: pubsub-subscriber-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(var.project_id)
+      role: roles/pubsub.subscriber
+      member: serviceAccount:$(ref.dataflow-service-account.email)
+    metadata:
+      dependsOn:
+        - dataflow-service-account
+
+  # Grant Firestore User role to service account
+  - name: firestore-user-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(var.project_id)
+      role: roles/datastore.user
+      member: serviceAccount:$(ref.dataflow-service-account.email)
+    metadata:
+      dependsOn:
+        - dataflow-service-account
+
+  # Grant Storage Admin role to service account for archival
+  - name: storage-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(var.project_id)
+      role: roles/storage.admin
+      member: serviceAccount:$(ref.dataflow-service-account.email)
+    metadata:
+      dependsOn:
+        - dataflow-service-account
+
+  # Grant Cloud KMS CryptoKey Encrypter/Decrypter role
+  - name: kms-encrypter-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(var.project_id)
+      role: roles/cloudkms.cryptoKeyEncrypterDecrypter
+      member: serviceAccount:$(ref.dataflow-service-account.email)
+    metadata:
+      dependsOn:
+        - dataflow-service-account
+
+  # Create VPC network for Dataflow (optional but recommended for security)
+  - name: dataflow-network
+    type: gcp-types/compute-v1:networks
+    properties:
+      name: dataflow-network-$(var.random_suffix)
+      autoCreateSubnetworks: false
+      description: "VPC network for Dataflow streaming analytics pipeline"
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # Create subnet for Dataflow workers
+  - name: dataflow-subnet
+    type: gcp-types/compute-v1:subnetworks
+    properties:
+      name: dataflow-subnet-$(var.random_suffix)
+      network: $(ref.dataflow-network.selfLink)
+      ipCidrRange: "10.0.0.0/24"
+      region: $(var.region)
+      description: "Subnet for Dataflow workers in analytics pipeline"
+      enableFlowLogs: true
+      privateIpGoogleAccess: true
+    metadata:
+      dependsOn:
+        - dataflow-network
+
+  # Create firewall rule for Dataflow workers
+  - name: dataflow-firewall
+    type: gcp-types/compute-v1:firewalls
+    properties:
+      name: allow-dataflow-$(var.random_suffix)
+      network: $(ref.dataflow-network.selfLink)
+      description: "Allow internal communication for Dataflow workers"
+      allowed:
+        - IPProtocol: tcp
+          ports:
+            - "12345-12346"  # Dataflow worker ports
+        - IPProtocol: udp
+      sourceRanges:
+        - "10.0.0.0/24"
+      targetTags:
+        - dataflow-worker
+    metadata:
+      dependsOn:
+        - dataflow-network
+
+  # Create Cloud NAT for outbound internet access (private workers)
+  - name: dataflow-router
+    type: gcp-types/compute-v1:routers
+    properties:
+      name: dataflow-router-$(var.random_suffix)
+      network: $(ref.dataflow-network.selfLink)
+      region: $(var.region)
+      description: "Router for Cloud NAT to enable private worker internet access"
+    metadata:
+      dependsOn:
+        - dataflow-network
+
+  - name: dataflow-nat
+    type: gcp-types/compute-v1:routers.nats
+    properties:
+      name: dataflow-nat-$(var.random_suffix)
+      router: $(ref.dataflow-router.name)
+      region: $(var.region)
+      natIpAllocateOption: AUTO_ONLY
+      sourceSubnetworkIpRangesToNat: LIST_OF_SUBNETWORKS
+      subnetworks:
+        - name: $(ref.dataflow-subnet.selfLink)
+          sourceIpRangesToNat:
+            - ALL_IP_RANGES
+      logConfig:
+        enable: true
+        filter: ERRORS_ONLY
+    metadata:
+      dependsOn:
+        - dataflow-router
+
+  # Create Firestore composite indexes for analytics queries
+  - name: analytics-metrics-index
+    type: gcp-types/firestore-v1:projects.databases.collectionGroups.indexes
+    properties:
+      parent: projects/$(var.project_id)/databases/(default)/collectionGroups/analytics_metrics
+      index:
+        queryScope: COLLECTION
+        fields:
+          - fieldPath: timestamp
+            order: DESCENDING
+          - fieldPath: metric_type
+            order: ASCENDING
+          - fieldPath: value
+            order: DESCENDING
+        state: READY
+    metadata:
+      dependsOn:
+        - firestore-database
+
+  - name: user-sessions-index
+    type: gcp-types/firestore-v1:projects.databases.collectionGroups.indexes
+    properties:
+      parent: projects/$(var.project_id)/databases/(default)/collectionGroups/user_sessions
+      index:
+        queryScope: COLLECTION
+        fields:
+          - fieldPath: user_id
+            order: ASCENDING
+          - fieldPath: session_start
+            order: DESCENDING
+        state: READY
+    metadata:
+      dependsOn:
+        - firestore-database
+
+  # Create Cloud Monitoring dashboard for analytics platform
+  - name: analytics-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      parent: projects/$(var.project_id)
+      dashboard:
+        displayName: "Real-Time Analytics Platform Dashboard"
+        mosaicLayout:
+          tiles:
+            - width: 6
+              height: 4
+              widget:
+                title: "Pub/Sub Message Rate"
+                scorecard:
+                  timeSeriesQuery:
+                    timeSeriesFilter:
+                      filter: 'resource.type="pubsub_topic" AND resource.labels.topic_id="$(ref.events-topic.name)"'
+                      aggregation:
+                        alignmentPeriod: 60s
+                        perSeriesAligner: ALIGN_RATE
+                        crossSeriesReducer: REDUCE_SUM
+            - width: 6
+              height: 4
+              widget:
+                title: "Dataflow Job Status"
+                scorecard:
+                  timeSeriesQuery:
+                    timeSeriesFilter:
+                      filter: 'resource.type="dataflow_job"'
+                      aggregation:
+                        alignmentPeriod: 60s
+                        perSeriesAligner: ALIGN_MEAN
+            - width: 12
+              height: 4
+              widget:
+                title: "Firestore Operations"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="firestore_database"'
+                          aggregation:
+                            alignmentPeriod: 60s
+                            perSeriesAligner: ALIGN_RATE
+                            crossSeriesReducer: REDUCE_SUM
+                  timeshiftDuration: 0s
+                  yAxis:
+                    label: "Operations/sec"
+                    scale: LINEAR
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # Create alerting policy for high error rates
+  - name: high-error-rate-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(var.project_id)
+      alertPolicy:
+        displayName: "Analytics Pipeline High Error Rate"
+        documentation:
+          content: "Alert when error rate exceeds 5% for the analytics pipeline"
+          mimeType: text/markdown
+        conditions:
+          - displayName: "Dataflow job error rate"
+            conditionThreshold:
+              filter: 'resource.type="dataflow_job"'
+              comparison: COMPARISON_GT
+              thresholdValue: 0.05
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_MEAN
+        enabled: true
+        alertStrategy:
+          autoClose: 86400s
+        severity: ERROR
+    metadata:
+      dependsOn:
+        - enable-apis
+
+# Outputs for reference and integration
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: $(var.project_id)
+    
+  region:
+    description: "Primary deployment region"
+    value: $(var.region)
+    
+  pubsub_topic_name:
+    description: "Full name of the Pub/Sub topic for event ingestion"
+    value: $(ref.events-topic.name)
+    
+  pubsub_subscription_name:
+    description: "Full name of the Pub/Sub subscription for Dataflow"
+    value: $(ref.events-subscription.name)
+    
+  storage_bucket_name:
+    description: "Name of the Cloud Storage bucket for data archival"
+    value: $(ref.analytics-storage-bucket.name)
+    
+  storage_bucket_url:
+    description: "GS URL of the storage bucket"
+    value: "gs://$(ref.analytics-storage-bucket.name)"
+    
+  service_account_email:
+    description: "Email of the Dataflow service account"
+    value: $(ref.dataflow-service-account.email)
+    
+  network_name:
+    description: "Name of the VPC network for Dataflow"
+    value: $(ref.dataflow-network.name)
+    
+  subnet_name:
+    description: "Name of the subnet for Dataflow workers"
+    value: $(ref.dataflow-subnet.name)
+    
+  firestore_database:
+    description: "Firestore database identifier"
+    value: "(default)"
+    
+  kms_key_name:
+    description: "KMS key for storage encryption"
+    value: $(ref.storage-encryption-key.name)
+    
+  dashboard_url:
+    description: "URL to the monitoring dashboard"
+    value: "https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.analytics-dashboard.name)?project=$(var.project_id)"
+
+# Metadata for deployment tracking
+metadata:
+  version: "1.0"
+  description: "Real-time analytics platform with Cloud Dataflow and Firestore"
+  recipe_id: "b4f8a2c9"
+  estimated_cost_per_month: "$50-200"
+  complexity_level: "intermediate"
+  deployment_time_minutes: 15
+  prerequisites:
+    - "Google Cloud SDK installed and authenticated"
+    - "Infrastructure Manager enabled"
+    - "Appropriate IAM permissions for resource creation"
+  tags:
+    - "real-time-analytics"
+    - "dataflow"
+    - "firestore"
+    - "pubsub"
+    - "streaming"
+    - "serverless"

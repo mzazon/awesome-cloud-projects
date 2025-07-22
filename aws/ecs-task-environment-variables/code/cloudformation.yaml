@@ -1,0 +1,855 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ECS Task Definitions with Environment Variable Management - Comprehensive infrastructure for managing environment variables through Systems Manager Parameter Store, Secrets Manager, and S3 environment files'
+
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: "Application Configuration"
+        Parameters:
+          - ApplicationName
+          - Environment
+          - DesiredCount
+      - Label:
+          default: "ECS Configuration"
+        Parameters:
+          - ClusterName
+          - TaskFamily
+          - ServiceName
+          - ContainerImage
+          - ContainerCpuUnits
+          - ContainerMemoryMiB
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - SubnetIds
+          - SecurityGroupId
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - EnvironmentFilesBucketName
+          - CreateS3Bucket
+      - Label:
+          default: "Monitoring and Logging"
+        Parameters:
+          - EnableContainerInsights
+          - LogRetentionInDays
+    ParameterLabels:
+      ApplicationName:
+        default: "Application Name"
+      Environment:
+        default: "Environment (dev/staging/prod)"
+      ClusterName:
+        default: "ECS Cluster Name"
+      TaskFamily:
+        default: "Task Definition Family"
+      ServiceName:
+        default: "ECS Service Name"
+      ContainerImage:
+        default: "Container Image URI"
+      DesiredCount:
+        default: "Desired Task Count"
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: "envvar-demo"
+    Description: "Name of the application for tagging and parameter organization"
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: "Must contain only alphanumeric characters and hyphens"
+
+  Environment:
+    Type: String
+    Default: "dev"
+    AllowedValues:
+      - "dev"
+      - "staging"
+      - "prod"
+    Description: "Environment name for parameter store hierarchy and resource organization"
+
+  ClusterName:
+    Type: String
+    Default: "ecs-envvar-cluster"
+    Description: "Name of the ECS cluster to create"
+    AllowedPattern: '^[a-zA-Z0-9-_]+$'
+    ConstraintDescription: "Must contain only alphanumeric characters, hyphens, and underscores"
+
+  TaskFamily:
+    Type: String
+    Default: "envvar-demo-task"
+    Description: "Task definition family name"
+    AllowedPattern: '^[a-zA-Z0-9-_]+$'
+    ConstraintDescription: "Must contain only alphanumeric characters, hyphens, and underscores"
+
+  ServiceName:
+    Type: String
+    Default: "envvar-demo-service"
+    Description: "ECS service name"
+    AllowedPattern: '^[a-zA-Z0-9-_]+$'
+    ConstraintDescription: "Must contain only alphanumeric characters, hyphens, and underscores"
+
+  ContainerImage:
+    Type: String
+    Default: "nginx:latest"
+    Description: "Container image URI to deploy"
+
+  ContainerCpuUnits:
+    Type: Number
+    Default: 256
+    AllowedValues: [256, 512, 1024, 2048, 4096]
+    Description: "CPU units for the container (Fargate)"
+
+  ContainerMemoryMiB:
+    Type: Number
+    Default: 512
+    AllowedValues: [512, 1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192]
+    Description: "Memory in MiB for the container (Fargate)"
+
+  DesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 10
+    Description: "Desired number of tasks in the service"
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: "VPC ID where ECS service will be deployed"
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: "List of subnet IDs for ECS service (recommend private subnets for production)"
+
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: "Security group ID for ECS tasks"
+
+  EnvironmentFilesBucketName:
+    Type: String
+    Default: ""
+    Description: "S3 bucket name for environment files (leave empty to auto-generate)"
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: "Must be a valid S3 bucket name or empty"
+
+  CreateS3Bucket:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "Whether to create S3 bucket for environment files"
+
+  EnableContainerInsights:
+    Type: String
+    Default: "enabled"
+    AllowedValues: ["enabled", "disabled"]
+    Description: "Enable Container Insights for enhanced monitoring"
+
+  LogRetentionInDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: "CloudWatch log retention period in days"
+
+Conditions:
+  ShouldCreateS3Bucket: !Equals [!Ref CreateS3Bucket, "true"]
+  HasCustomBucketName: !Not [!Equals [!Ref EnvironmentFilesBucketName, ""]]
+
+Resources:
+  # S3 Bucket for Environment Files
+  EnvironmentFilesBucket:
+    Type: AWS::S3::Bucket
+    Condition: ShouldCreateS3Bucket
+    Properties:
+      BucketName: !If
+        - HasCustomBucketName
+        - !Ref EnvironmentFilesBucketName
+        - !Sub "${ApplicationName}-envfiles-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Sub "/aws/s3/${ApplicationName}-envfiles"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-environment-files"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "ECS Environment Configuration"
+
+  # Systems Manager Parameters for Application Configuration
+  DatabaseHostParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ApplicationName}/${Environment}/database/host"
+      Type: String
+      Value: !Sub "${Environment}-database.internal.com"
+      Description: !Sub "${Environment} database host configuration"
+      Tier: Standard
+      Tags:
+        Environment: !Ref Environment
+        Application: !Ref ApplicationName
+        Component: database
+
+  DatabasePortParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ApplicationName}/${Environment}/database/port"
+      Type: String
+      Value: "5432"
+      Description: !Sub "${Environment} database port configuration"
+      Tier: Standard
+      Tags:
+        Environment: !Ref Environment
+        Application: !Ref ApplicationName
+        Component: database
+
+  ApiDebugParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ApplicationName}/${Environment}/api/debug"
+      Type: String
+      Value: !If [!Equals [!Ref Environment, "prod"], "false", "true"]
+      Description: !Sub "${Environment} API debug mode configuration"
+      Tier: Standard
+      Tags:
+        Environment: !Ref Environment
+        Application: !Ref ApplicationName
+        Component: api
+
+  # Secure Parameters (encrypted)
+  DatabasePasswordParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ApplicationName}/${Environment}/database/password"
+      Type: SecureString
+      Value: !Sub "${Environment}-secure-password-${AWS::AccountId}"
+      Description: !Sub "${Environment} database password (encrypted)"
+      Tier: Standard
+      Tags:
+        Environment: !Ref Environment
+        Application: !Ref ApplicationName
+        Component: database
+
+  ApiSecretKeyParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ApplicationName}/${Environment}/api/secret-key"
+      Type: SecureString
+      Value: !Sub "${Environment}-api-secret-${AWS::AccountId}"
+      Description: !Sub "${Environment} API secret key (encrypted)"
+      Tier: Standard
+      Tags:
+        Environment: !Ref Environment
+        Application: !Ref ApplicationName
+        Component: api
+
+  # Shared Parameters
+  RegionParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ApplicationName}/shared/region"
+      Type: String
+      Value: !Ref AWS::Region
+      Description: "Shared AWS region parameter"
+      Tier: Standard
+      Tags:
+        Environment: "shared"
+        Application: !Ref ApplicationName
+        Component: shared
+
+  AccountIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ApplicationName}/shared/account-id"
+      Type: String
+      Value: !Ref AWS::AccountId
+      Description: "Shared AWS account ID parameter"
+      Tier: Standard
+      Tags:
+        Environment: "shared"
+        Application: !Ref ApplicationName
+        Component: shared
+
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ClusterName
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+      ClusterSettings:
+        - Name: containerInsights
+          Value: !Ref EnableContainerInsights
+      Configuration:
+        ExecuteCommandConfiguration:
+          Logging: DEFAULT
+      Tags:
+        - Key: Name
+          Value: !Ref ClusterName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # CloudWatch Log Group for Task Definition
+  TaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${TaskFamily}"
+      RetentionInDays: !Ref LogRetentionInDays
+      Tags:
+        - Key: Name
+          Value: !Sub "${TaskFamily}-logs"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # ECS Task Execution Role
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${TaskFamily}-execution-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ParameterStoreAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameters
+                  - ssm:GetParameter
+                  - ssm:GetParametersByPath
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ApplicationName}/*"
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource:
+                  - !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*"
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub "ssm.${AWS::Region}.amazonaws.com"
+        - PolicyName: S3EnvironmentFilesAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource:
+                  - !If
+                    - ShouldCreateS3Bucket
+                    - !Sub "${EnvironmentFilesBucket}/configs/*"
+                    - !Sub "arn:aws:s3:::${EnvironmentFilesBucketName}/configs/*"
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !If
+                    - ShouldCreateS3Bucket
+                    - !Ref EnvironmentFilesBucket
+                    - !Sub "arn:aws:s3:::${EnvironmentFilesBucketName}"
+                Condition:
+                  StringLike:
+                    's3:prefix': 'configs/*'
+      Tags:
+        - Key: Name
+          Value: !Sub "${TaskFamily}-execution-role"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # ECS Task Role (for runtime permissions)
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${TaskFamily}-task-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RuntimeParameterAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ApplicationName}/${Environment}/*"
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ApplicationName}/shared/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "${TaskLogGroup}:*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${TaskFamily}-task-role"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # ECS Task Definition
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref TaskFamily
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref ContainerCpuUnits
+      Memory: !Ref ContainerMemoryMiB
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: !Sub "${ApplicationName}-container"
+          Image: !Ref ContainerImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 80
+              Protocol: tcp
+              Name: http
+          # Direct environment variables (highest precedence)
+          Environment:
+            - Name: NODE_ENV
+              Value: !Ref Environment
+            - Name: SERVICE_NAME
+              Value: !Ref ServiceName
+            - Name: CLUSTER_NAME
+              Value: !Ref ClusterName
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref AWS::Region
+            - Name: DEPLOYMENT_TYPE
+              Value: "cloudformation"
+          # Systems Manager Parameter Store secrets (medium precedence)
+          Secrets:
+            - Name: DATABASE_HOST
+              ValueFrom: !Ref DatabaseHostParameter
+            - Name: DATABASE_PORT
+              ValueFrom: !Ref DatabasePortParameter
+            - Name: DATABASE_PASSWORD
+              ValueFrom: !Ref DatabasePasswordParameter
+            - Name: API_SECRET_KEY
+              ValueFrom: !Ref ApiSecretKeyParameter
+            - Name: API_DEBUG
+              ValueFrom: !Ref ApiDebugParameter
+            - Name: SHARED_REGION
+              ValueFrom: !Ref RegionParameter
+            - Name: SHARED_ACCOUNT_ID
+              ValueFrom: !Ref AccountIdParameter
+          # Environment files from S3 (lowest precedence)
+          EnvironmentFiles:
+            - Value: !If
+                - ShouldCreateS3Bucket
+                - !Sub "${EnvironmentFilesBucket}/configs/app-config.env"
+                - !Sub "arn:aws:s3:::${EnvironmentFilesBucketName}/configs/app-config.env"
+              Type: s3
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref TaskLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - "curl -f http://localhost:80/ || exit 1"
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+      Tags:
+        - Key: Name
+          Value: !Ref TaskFamily
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # Alternative Task Definition focusing on Environment Files
+  ECSTaskDefinitionEnvFiles:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${TaskFamily}-envfiles"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref ContainerCpuUnits
+      Memory: !Ref ContainerMemoryMiB
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: !Sub "${ApplicationName}-envfiles-container"
+          Image: !Ref ContainerImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 80
+              Protocol: tcp
+              Name: http
+          Environment:
+            - Name: DEPLOYMENT_TYPE
+              Value: "environment-files"
+            - Name: CLOUDFORMATION_STACK
+              Value: !Ref AWS::StackName
+          # Multiple environment files (processed in order)
+          EnvironmentFiles:
+            - Value: !If
+                - ShouldCreateS3Bucket
+                - !Sub "${EnvironmentFilesBucket}/configs/app-config.env"
+                - !Sub "arn:aws:s3:::${EnvironmentFilesBucketName}/configs/app-config.env"
+              Type: s3
+            - Value: !If
+                - ShouldCreateS3Bucket
+                - !Sub "${EnvironmentFilesBucket}/configs/prod-config.env"
+                - !Sub "arn:aws:s3:::${EnvironmentFilesBucketName}/configs/prod-config.env"
+              Type: s3
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub "/ecs/${TaskFamily}-envfiles"
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+              awslogs-create-group: "true"
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - "curl -f http://localhost:80/ || exit 1"
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+      Tags:
+        - Key: Name
+          Value: !Sub "${TaskFamily}-envfiles"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # ECS Service
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Ref ServiceName
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ECSTaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref SecurityGroupId
+          Subnets: !Ref SubnetIds
+          AssignPublicIp: ENABLED
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      HealthCheckGracePeriodSeconds: 60
+      EnableExecuteCommand: true
+      PropagateTags: SERVICE
+      Tags:
+        - Key: Name
+          Value: !Ref ServiceName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # CloudWatch Alarms for Monitoring
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ServiceName}-HighCPUUtilization"
+      AlarmDescription: "Alarm when CPU utilization exceeds 80%"
+      MetricName: CPUUtilization
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ServiceName
+          Value: !Ref ServiceName
+        - Name: ClusterName
+          Value: !Ref ClusterName
+      TreatMissingData: notBreaching
+
+  HighMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ServiceName}-HighMemoryUtilization"
+      AlarmDescription: "Alarm when memory utilization exceeds 85%"
+      MetricName: MemoryUtilization
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ServiceName
+          Value: !Ref ServiceName
+        - Name: ClusterName
+          Value: !Ref ClusterName
+      TreatMissingData: notBreaching
+
+  # Custom Resource for uploading environment files to S3
+  EnvironmentFilesUploader:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: ShouldCreateS3Bucket
+    Properties:
+      ServiceToken: !GetAtt EnvironmentFilesUploaderFunction.Arn
+      BucketName: !Ref EnvironmentFilesBucket
+      Environment: !Ref Environment
+
+  # Lambda function for custom resource
+  EnvironmentFilesUploaderFunction:
+    Type: AWS::Lambda::Function
+    Condition: ShouldCreateS3Bucket
+    Properties:
+      FunctionName: !Sub "${ApplicationName}-envfiles-uploader"
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt EnvironmentFilesUploaderRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+          
+          def handler(event, context):
+              try:
+                  s3 = boto3.client('s3')
+                  bucket_name = event['ResourceProperties']['BucketName']
+                  environment = event['ResourceProperties']['Environment']
+                  
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      # Create app-config.env
+                      app_config = """LOG_LEVEL=info
+          MAX_CONNECTIONS=100
+          TIMEOUT_SECONDS=30
+          FEATURE_FLAGS=auth,logging,metrics
+          APP_VERSION=1.2.3
+          CLOUDFORMATION_MANAGED=true"""
+                      
+                      # Create environment-specific config
+                      env_config = f"""LOG_LEVEL={"warn" if environment == "prod" else "debug"}
+          MAX_CONNECTIONS={"500" if environment == "prod" else "100"}
+          TIMEOUT_SECONDS={"60" if environment == "prod" else "30"}
+          FEATURE_FLAGS=auth,logging,metrics{",cache" if environment == "prod" else ""}
+          APP_VERSION=1.2.3
+          MONITORING_ENABLED={"true" if environment == "prod" else "false"}
+          ENVIRONMENT={environment}"""
+                      
+                      # Upload files
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key='configs/app-config.env',
+                          Body=app_config,
+                          ContentType='text/plain'
+                      )
+                      
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key=f'configs/{environment}-config.env',
+                          Body=env_config,
+                          ContentType='text/plain'
+                      )
+                      
+                      # Create prod-config.env for the envfiles task definition
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key='configs/prod-config.env',
+                          Body=env_config,
+                          ContentType='text/plain'
+                      )
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  EnvironmentFilesUploaderRole:
+    Type: AWS::IAM::Role
+    Condition: ShouldCreateS3Bucket
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource:
+                  - !Sub "${EnvironmentFilesBucket}/configs/*"
+
+Outputs:
+  ClusterName:
+    Description: "Name of the ECS cluster"
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub "${AWS::StackName}-ClusterName"
+
+  ClusterArn:
+    Description: "ARN of the ECS cluster"
+    Value: !GetAtt ECSCluster.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ClusterArn"
+
+  ServiceName:
+    Description: "Name of the ECS service"
+    Value: !Ref ECSService
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceName"
+
+  ServiceArn:
+    Description: "ARN of the ECS service"
+    Value: !Ref ECSService
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceArn"
+
+  TaskDefinitionArn:
+    Description: "ARN of the primary task definition"
+    Value: !Ref ECSTaskDefinition
+    Export:
+      Name: !Sub "${AWS::StackName}-TaskDefinitionArn"
+
+  TaskDefinitionEnvFilesArn:
+    Description: "ARN of the environment files task definition"
+    Value: !Ref ECSTaskDefinitionEnvFiles
+    Export:
+      Name: !Sub "${AWS::StackName}-TaskDefinitionEnvFilesArn"
+
+  TaskExecutionRoleArn:
+    Description: "ARN of the ECS task execution role"
+    Value: !GetAtt ECSTaskExecutionRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-TaskExecutionRoleArn"
+
+  TaskRoleArn:
+    Description: "ARN of the ECS task role"
+    Value: !GetAtt ECSTaskRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-TaskRoleArn"
+
+  EnvironmentFilesBucketName:
+    Condition: ShouldCreateS3Bucket
+    Description: "Name of the S3 bucket for environment files"
+    Value: !Ref EnvironmentFilesBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-EnvironmentFilesBucketName"
+
+  EnvironmentFilesBucketArn:
+    Condition: ShouldCreateS3Bucket
+    Description: "ARN of the S3 bucket for environment files"
+    Value: !GetAtt EnvironmentFilesBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-EnvironmentFilesBucketArn"
+
+  TaskLogGroupName:
+    Description: "CloudWatch log group name for the task"
+    Value: !Ref TaskLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-TaskLogGroupName"
+
+  DatabaseHostParameterName:
+    Description: "Systems Manager parameter name for database host"
+    Value: !Ref DatabaseHostParameter
+    Export:
+      Name: !Sub "${AWS::StackName}-DatabaseHostParameterName"
+
+  ParameterStoreHierarchy:
+    Description: "Base path for Systems Manager parameters"
+    Value: !Sub "/${ApplicationName}/${Environment}/"
+    Export:
+      Name: !Sub "${AWS::StackName}-ParameterStoreHierarchy"
+
+  SharedParameterStoreHierarchy:
+    Description: "Base path for shared Systems Manager parameters"
+    Value: !Sub "/${ApplicationName}/shared/"
+    Export:
+      Name: !Sub "${AWS::StackName}-SharedParameterStoreHierarchy"
+
+  CPUAlarmName:
+    Description: "Name of the CPU utilization alarm"
+    Value: !Ref HighCPUAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-CPUAlarmName"
+
+  MemoryAlarmName:
+    Description: "Name of the memory utilization alarm"
+    Value: !Ref HighMemoryAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-MemoryAlarmName"
+
+  ApplicationName:
+    Description: "Application name used for resource organization"
+    Value: !Ref ApplicationName
+    Export:
+      Name: !Sub "${AWS::StackName}-ApplicationName"
+
+  Environment:
+    Description: "Environment name (dev/staging/prod)"
+    Value: !Ref Environment
+    Export:
+      Name: !Sub "${AWS::StackName}-Environment"

@@ -1,0 +1,625 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Lake Formation Fine-Grained Access Control - Complete infrastructure for implementing table-level, column-level, and row-level security policies with centralized data governance'
+
+# ======================================
+# PARAMETERS
+# ======================================
+Parameters:
+  DataLakeBucketName:
+    Type: String
+    Default: ''
+    Description: 'Name for the S3 data lake bucket. Leave empty to auto-generate with random suffix'
+    AllowedPattern: '^[a-z0-9\-]*$'
+    ConstraintDescription: 'Bucket name must contain only lowercase letters, numbers, and hyphens'
+
+  DatabaseName:
+    Type: String
+    Default: 'sample_database'
+    Description: 'Name for the Glue database that will contain the data catalog'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]*$'
+    ConstraintDescription: 'Database name must start with a letter and contain only alphanumeric characters and underscores'
+
+  TableName:
+    Type: String
+    Default: 'customer_data'
+    Description: 'Name for the Glue table that will catalog the sample data'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]*$'
+    ConstraintDescription: 'Table name must start with a letter and contain only alphanumeric characters and underscores'
+
+  EnableLakeFormationSettings:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable Lake Formation settings with fine-grained access control (recommended: true)'
+
+  CreateSampleData:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Create sample CSV data for testing access controls'
+
+  DataLakeAdminArn:
+    Type: String
+    Default: ''
+    Description: 'ARN of the user/role to be designated as Lake Formation data lake administrator. Leave empty to use current caller identity'
+
+# ======================================
+# CONDITIONS
+# ======================================
+Conditions:
+  AutoGenerateBucketName: !Equals [!Ref DataLakeBucketName, '']
+  EnableLakeFormation: !Equals [!Ref EnableLakeFormationSettings, 'true']
+  CreateSampleDataCondition: !Equals [!Ref CreateSampleData, 'true']
+  UseCurrentCallerAsAdmin: !Equals [!Ref DataLakeAdminArn, '']
+
+# ======================================
+# RESOURCES
+# ======================================
+Resources:
+
+  # ======================================
+  # S3 DATA LAKE BUCKET
+  # ======================================
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If 
+        - AutoGenerateBucketName
+        - !Sub 'data-lake-fgac-${AWS::AccountId}-${AWS::Region}'
+        - !Ref DataLakeBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref DataLakeLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-data-lake-bucket'
+        - Key: Purpose
+          Value: 'Lake Formation Fine-Grained Access Control Demo'
+        - Key: Environment
+          Value: 'Development'
+
+  # ======================================
+  # CLOUDWATCH LOG GROUP
+  # ======================================
+  DataLakeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${AWS::StackName}-data-lake'
+      RetentionInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-data-lake-logs'
+
+  # ======================================
+  # GLUE DATABASE
+  # ======================================
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref DatabaseName
+        Description: 'Sample database for Lake Formation fine-grained access control demonstration'
+        Parameters:
+          classification: 'csv'
+          delimiter: ','
+        TargetDatabase:
+          CatalogId: !Ref AWS::AccountId
+
+  # ======================================
+  # GLUE TABLE
+  # ======================================
+  GlueTable:
+    Type: AWS::Glue::Table
+    DependsOn: GlueDatabase
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref DatabaseName
+      TableInput:
+        Name: !Ref TableName
+        Description: 'Customer data table with sensitive information for access control testing'
+        TableType: 'EXTERNAL_TABLE'
+        Parameters:
+          classification: 'csv'
+          delimiter: ','
+          skip.header.line.count: '1'
+          typeOfData: 'file'
+        StorageDescriptor:
+          Columns:
+            - Name: 'customer_id'
+              Type: 'bigint'
+              Comment: 'Unique customer identifier'
+            - Name: 'name'
+              Type: 'string'
+              Comment: 'Customer full name'
+            - Name: 'email'
+              Type: 'string'
+              Comment: 'Customer email address'
+            - Name: 'department'
+              Type: 'string'
+              Comment: 'Customer department (Engineering, Marketing, Finance, HR)'
+            - Name: 'salary'
+              Type: 'bigint'
+              Comment: 'Customer salary (sensitive financial data)'
+            - Name: 'ssn'
+              Type: 'string'
+              Comment: 'Social Security Number (highly sensitive PII)'
+          Location: !Sub 's3://${DataLakeBucket}/customer_data/'
+          InputFormat: 'org.apache.hadoop.mapred.TextInputFormat'
+          OutputFormat: 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+          SerdeInfo:
+            SerializationLibrary: 'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe'
+            Parameters:
+              field.delim: ','
+              skip.header.line.count: '1'
+          StoredAsSubDirectories: false
+          Compressed: false
+
+  # ======================================
+  # IAM ROLES FOR DIFFERENT USER TYPES
+  # ======================================
+  
+  # Data Analyst Role - Full Access
+  DataAnalystRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-DataAnalystRole'
+      Description: 'Role for data analysts with full table access (for demonstration purposes)'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Sub '${AWS::StackName}-analyst'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: LakeFormationAnalystAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                  - lakeformation:GetWorkUnits
+                  - lakeformation:StartQueryPlanning
+                  - lakeformation:GetWorkUnitResults
+                  - lakeformation:GetQueryState
+                  - lakeformation:GetQueryStatistics
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub '${DataLakeBucket}/*'
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetDatabase
+                  - glue:GetTables
+                  - glue:GetDatabases
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-data-analyst-role'
+        - Key: AccessLevel
+          Value: 'Full'
+
+  # Finance Team Role - Limited Access (No SSN)
+  FinanceTeamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-FinanceTeamRole'
+      Description: 'Role for finance team with column-level access control (no SSN access)'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Sub '${AWS::StackName}-finance'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: LakeFormationFinanceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                  - lakeformation:GetWorkUnits
+                  - lakeformation:StartQueryPlanning
+                  - lakeformation:GetWorkUnitResults
+                  - lakeformation:GetQueryState
+                  - lakeformation:GetQueryStatistics
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub '${DataLakeBucket}/*'
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetDatabase
+                  - glue:GetTables
+                  - glue:GetDatabases
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-finance-team-role'
+        - Key: AccessLevel
+          Value: 'Column-Level-Restricted'
+
+  # HR Role - Very Limited Access (Name and Department Only)
+  HRRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-HRRole'
+      Description: 'Role for HR team with highly restricted column access (name and department only)'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Sub '${AWS::StackName}-hr'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: LakeFormationHRAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                  - lakeformation:GetWorkUnits
+                  - lakeformation:StartQueryPlanning
+                  - lakeformation:GetWorkUnitResults
+                  - lakeformation:GetQueryState
+                  - lakeformation:GetQueryStatistics
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub '${DataLakeBucket}/*'
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetDatabase
+                  - glue:GetTables
+                  - glue:GetDatabases
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-hr-role'
+        - Key: AccessLevel
+          Value: 'Highly-Restricted'
+
+  # ======================================
+  # LAMBDA FUNCTION FOR SAMPLE DATA CREATION
+  # ======================================
+  SampleDataCreatorRole:
+    Type: AWS::IAM::Role
+    Condition: CreateSampleDataCondition
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-SampleDataCreatorRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3WriteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub '${DataLakeBucket}/*'
+
+  SampleDataCreatorFunction:
+    Type: AWS::Lambda::Function
+    Condition: CreateSampleDataCondition
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-sample-data-creator'
+      Description: 'Creates sample CSV data for Lake Formation access control testing'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt SampleDataCreatorRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref DataLakeBucket
+      Code:
+        ZipFile: |
+          import boto3
+          import csv
+          import io
+          import json
+          import cfnresponse
+          import os
+
+          def lambda_handler(event, context):
+              try:
+                  bucket_name = os.environ['BUCKET_NAME']
+                  s3_client = boto3.client('s3')
+                  
+                  # Sample customer data with sensitive information
+                  sample_data = [
+                      ['customer_id', 'name', 'email', 'department', 'salary', 'ssn'],
+                      [1, 'John Doe', 'john@example.com', 'Engineering', 75000, '123-45-6789'],
+                      [2, 'Jane Smith', 'jane@example.com', 'Marketing', 65000, '987-65-4321'],
+                      [3, 'Bob Johnson', 'bob@example.com', 'Finance', 80000, '456-78-9012'],
+                      [4, 'Alice Brown', 'alice@example.com', 'Engineering', 70000, '321-54-9876'],
+                      [5, 'Charlie Wilson', 'charlie@example.com', 'HR', 60000, '654-32-1098'],
+                      [6, 'Diana Martinez', 'diana@example.com', 'Engineering', 85000, '789-01-2345'],
+                      [7, 'Edward Chen', 'edward@example.com', 'Marketing', 62000, '234-56-7890'],
+                      [8, 'Fiona Davis', 'fiona@example.com', 'Finance', 78000, '567-89-0123'],
+                      [9, 'George Kim', 'george@example.com', 'Engineering', 72000, '890-12-3456'],
+                      [10, 'Helen Rodriguez', 'helen@example.com', 'HR', 58000, '012-34-5678']
+                  ]
+                  
+                  # Convert to CSV format
+                  csv_buffer = io.StringIO()
+                  writer = csv.writer(csv_buffer)
+                  writer.writerows(sample_data)
+                  csv_content = csv_buffer.getvalue()
+                  
+                  # Upload to S3
+                  s3_client.put_object(
+                      Bucket=bucket_name,
+                      Key='customer_data/sample_data.csv',
+                      Body=csv_content,
+                      ContentType='text/csv'
+                  )
+                  
+                  print(f"Successfully uploaded sample data to s3://{bucket_name}/customer_data/sample_data.csv")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': 'Sample data created successfully'})
+                  
+              except Exception as e:
+                  print(f"Error creating sample data: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  SampleDataCreator:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: CreateSampleDataCondition
+    Properties:
+      ServiceToken: !GetAtt SampleDataCreatorFunction.Arn
+      BucketName: !Ref DataLakeBucket
+
+  # ======================================
+  # LAKE FORMATION RESOURCE REGISTRATION
+  # ======================================
+  LakeFormationS3Resource:
+    Type: AWS::LakeFormation::Resource
+    Properties:
+      ResourceArn: !Sub '${DataLakeBucket}/'
+      UseServiceLinkedRole: true
+
+  # ======================================
+  # LAKE FORMATION DATA LAKE SETTINGS
+  # ======================================
+  LakeFormationDataLakeSettings:
+    Type: AWS::LakeFormation::DataLakeSettings
+    Condition: EnableLakeFormation
+    Properties:
+      Admins:
+        - DataLakePrincipalIdentifier: !If
+          - UseCurrentCallerAsAdmin
+          - !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+          - !Ref DataLakeAdminArn
+      CreateDatabaseDefaultPermissions: []
+      CreateTableDefaultPermissions: []
+
+  # ======================================
+  # LAKE FORMATION PERMISSIONS
+  # ======================================
+  
+  # Data Analyst - Full Table Access
+  DataAnalystPermissions:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn: 
+      - GlueTable
+      - LakeFormationS3Resource
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt DataAnalystRole.Arn
+      Permissions:
+        - SELECT
+      PermissionsWithGrantOption: []
+      Resource:
+        TableResource:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref DatabaseName
+          Name: !Ref TableName
+
+  # Finance Team - Column-Level Access (No SSN)
+  FinanceTeamPermissions:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn: 
+      - GlueTable
+      - LakeFormationS3Resource
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt FinanceTeamRole.Arn
+      Permissions:
+        - SELECT
+      PermissionsWithGrantOption: []
+      Resource:
+        TableWithColumnsResource:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref DatabaseName
+          Name: !Ref TableName
+          ColumnNames:
+            - customer_id
+            - name
+            - department
+            - salary
+
+  # HR Team - Highly Limited Access (Name and Department Only)
+  HRPermissions:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn: 
+      - GlueTable
+      - LakeFormationS3Resource
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt HRRole.Arn
+      Permissions:
+        - SELECT
+      PermissionsWithGrantOption: []
+      Resource:
+        TableWithColumnsResource:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref DatabaseName
+          Name: !Ref TableName
+          ColumnNames:
+            - customer_id
+            - name
+            - department
+
+  # ======================================
+  # ROW-LEVEL SECURITY DATA FILTER
+  # ======================================
+  EngineeringOnlyDataFilter:
+    Type: AWS::LakeFormation::DataCellsFilter
+    DependsOn: 
+      - GlueTable
+      - FinanceTeamPermissions
+    Properties:
+      TableCatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref DatabaseName
+      TableName: !Ref TableName
+      Name: 'engineering-only-filter'
+      RowFilter:
+        FilterExpression: 'department = "Engineering"'
+      ColumnNames:
+        - customer_id
+        - name
+        - department
+        - salary
+
+# ======================================
+# OUTPUTS
+# ======================================
+Outputs:
+  DataLakeBucketName:
+    Description: 'Name of the S3 bucket used for the data lake'
+    Value: !Ref DataLakeBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataLakeBucket'
+
+  DataLakeBucketArn:
+    Description: 'ARN of the S3 bucket used for the data lake'
+    Value: !GetAtt DataLakeBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataLakeBucketArn'
+
+  GlueDatabaseName:
+    Description: 'Name of the Glue database containing the data catalog'
+    Value: !Ref DatabaseName
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabase'
+
+  GlueTableName:
+    Description: 'Name of the Glue table cataloging the customer data'
+    Value: !Ref TableName
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueTable'
+
+  DataAnalystRoleArn:
+    Description: 'ARN of the Data Analyst role with full table access'
+    Value: !GetAtt DataAnalystRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataAnalystRoleArn'
+
+  FinanceTeamRoleArn:
+    Description: 'ARN of the Finance Team role with column-level restrictions'
+    Value: !GetAtt FinanceTeamRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FinanceTeamRoleArn'
+
+  HRRoleArn:
+    Description: 'ARN of the HR role with highly restricted access'
+    Value: !GetAtt HRRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-HRRoleArn'
+
+  LakeFormationResourceArn:
+    Description: 'ARN of the Lake Formation registered S3 resource'
+    Value: !Sub '${DataLakeBucket}/'
+    Export:
+      Name: !Sub '${AWS::StackName}-LakeFormationResource'
+
+  SampleDataLocation:
+    Description: 'S3 location of the sample customer data'
+    Value: !Sub 's3://${DataLakeBucket}/customer_data/sample_data.csv'
+    Export:
+      Name: !Sub '${AWS::StackName}-SampleDataLocation'
+
+  AthenaDatabaseQuery:
+    Description: 'Sample Athena query to test access controls'
+    Value: !Sub 'SELECT * FROM ${DatabaseName}.${TableName} LIMIT 10;'
+
+  TestAccessControlCommands:
+    Description: 'Commands to test different role access levels'
+    Value: !Sub |
+      # Test Data Analyst Role (Full Access):
+      aws sts assume-role --role-arn ${DataAnalystRole.Arn} --role-session-name analyst-test --external-id ${AWS::StackName}-analyst
+      
+      # Test Finance Team Role (No SSN):
+      aws sts assume-role --role-arn ${FinanceTeamRole.Arn} --role-session-name finance-test --external-id ${AWS::StackName}-finance
+      
+      # Test HR Role (Name and Department Only):
+      aws sts assume-role --role-arn ${HRRole.Arn} --role-session-name hr-test --external-id ${AWS::StackName}-hr
+
+  CleanupInstructions:
+    Description: 'Instructions for cleaning up resources after testing'
+    Value: !Sub |
+      1. Delete CloudFormation stack: aws cloudformation delete-stack --stack-name ${AWS::StackName}
+      2. Wait for stack deletion to complete
+      3. Manually verify S3 bucket ${DataLakeBucket} is deleted
+      4. Check Lake Formation settings if needed: aws lakeformation describe-resource --resource-arn arn:aws:s3:::${DataLakeBucket}/

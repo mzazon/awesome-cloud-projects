@@ -1,0 +1,745 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Multi-Region Event Replication with EventBridge - Infrastructure as Code implementation for building resilient event-driven architectures with cross-region failover capabilities'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'production'
+    AllowedValues: [development, staging, production]
+    Description: 'Environment name for resource tagging and configuration'
+  
+  PrimaryRegion:
+    Type: String
+    Default: 'us-east-1'
+    Description: 'Primary AWS region for event processing'
+  
+  SecondaryRegion:
+    Type: String
+    Default: 'us-west-2'
+    Description: 'Secondary AWS region for failover'
+  
+  TertiaryRegion:
+    Type: String
+    Default: 'eu-west-1'
+    Description: 'Tertiary AWS region for additional redundancy'
+  
+  EventBusName:
+    Type: String
+    Default: 'global-events-bus'
+    Description: 'Name for the custom EventBridge event bus'
+    AllowedPattern: '^[a-zA-Z0-9\-_]+$'
+    ConstraintDescription: 'Event bus name must contain only alphanumeric characters, hyphens, and underscores'
+  
+  LambdaFunctionName:
+    Type: String
+    Default: 'event-processor'
+    Description: 'Name for the Lambda function that processes events'
+    AllowedPattern: '^[a-zA-Z0-9\-_]+$'
+    ConstraintDescription: 'Lambda function name must contain only alphanumeric characters, hyphens, and underscores'
+  
+  GlobalEndpointName:
+    Type: String
+    Default: 'global-endpoint'
+    Description: 'Name for the EventBridge global endpoint'
+    AllowedPattern: '^[a-zA-Z0-9\-_]+$'
+    ConstraintDescription: 'Global endpoint name must contain only alphanumeric characters, hyphens, and underscores'
+  
+  NotificationEmail:
+    Type: String
+    Default: 'admin@example.com'
+    Description: 'Email address for CloudWatch alarm notifications'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+  
+  EnableEncryption:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable KMS encryption for EventBridge event buses'
+  
+  HealthCheckInterval:
+    Type: Number
+    Default: 30
+    MinValue: 10
+    MaxValue: 300
+    Description: 'Health check interval in seconds for Route 53 health checks'
+  
+  HealthCheckFailureThreshold:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+    Description: 'Number of consecutive health check failures before considering endpoint unhealthy'
+  
+  AlarmEvaluationPeriods:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: 'Number of periods to evaluate for CloudWatch alarms'
+  
+  AlarmThreshold:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 100
+    Description: 'Threshold for CloudWatch alarms (number of errors)'
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'production']
+  EnableEncryptionCondition: !Equals [!Ref EnableEncryption, 'true']
+  IsPrimaryRegion: !Equals [!Ref 'AWS::Region', !Ref PrimaryRegion]
+
+Resources:
+  # SNS Topic for CloudWatch Alarms
+  EventBridgeAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-eventbridge-alerts'
+      DisplayName: 'EventBridge Multi-Region Alerts'
+      KmsMasterKeyId: !If
+        - EnableEncryptionCondition
+        - 'alias/aws/sns'
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: MultiRegionReplication
+        - Key: Service
+          Value: EventBridge
+
+  # SNS Topic Subscription for Email Notifications
+  EventBridgeAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref EventBridgeAlertsTopic
+      Endpoint: !Ref NotificationEmail
+
+  # Custom EventBridge Event Bus
+  CustomEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${EventBusName}-${AWS::AccountId}-${AWS::Region}'
+      KmsKeyId: !If
+        - EnableEncryptionCondition
+        - 'alias/aws/events'
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: MultiRegionReplication
+        - Key: Service
+          Value: EventBridge
+
+  # IAM Role for EventBridge Cross-Region Access
+  EventBridgeCrossRegionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-eventbridge-cross-region-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EventBridgeCrossRegionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !Sub 'arn:aws:events:*:${AWS::AccountId}:event-bus/*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: !Sub 'arn:aws:kms:*:${AWS::AccountId}:key/*'
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 'events.${AWS::Region}.amazonaws.com'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: MultiRegionReplication
+
+  # IAM Role for Lambda Function Execution
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EventBridgeLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                  - events:ListRules
+                  - events:DescribeRule
+                Resource: !Sub 'arn:aws:events:*:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 'events.${AWS::Region}.amazonaws.com'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: MultiRegionReplication
+
+  # Lambda Function for Event Processing
+  EventProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${LambdaFunctionName}-${AWS::AccountId}-${AWS::Region}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      ReservedConcurrencyLimit: !If [IsProduction, 100, 10]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              region = os.environ.get('AWS_REGION', 'unknown')
+              
+              # Log the received event
+              print(f"Processing event in region {region}")
+              print(f"Event: {json.dumps(event, indent=2)}")
+              
+              # Extract event details
+              for record in event.get('Records', []):
+                  event_source = record.get('source', 'unknown')
+                  event_detail_type = record.get('detail-type', 'unknown')
+                  event_detail = record.get('detail', {})
+                  
+                  # Process the event (implement your business logic here)
+                  process_business_event(event_source, event_detail_type, event_detail, region)
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': f'Events processed successfully in {region}',
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'region': region
+                  })
+              }
+          
+          def process_business_event(source, detail_type, detail, region):
+              """Process business events with region-specific logic"""
+              
+              # Example: Handle financial transaction events
+              if source == 'finance.transactions' and detail_type == 'Transaction Created':
+                  transaction_id = detail.get('transactionId')
+                  amount = detail.get('amount')
+                  
+                  print(f"Processing transaction {transaction_id} "
+                        f"for amount {amount} in region {region}")
+                  
+                  # Implement your business logic here
+                  # Examples: update databases, send notifications, etc.
+                  
+              # Example: Handle user events
+              elif source == 'user.management' and detail_type == 'User Action':
+                  user_id = detail.get('userId')
+                  action = detail.get('action')
+                  
+                  print(f"Processing user action {action} for user {user_id} "
+                        f"in region {region}")
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          EVENT_BUS_NAME: !Ref CustomEventBus
+          PRIMARY_REGION: !Ref PrimaryRegion
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: EventProcessing
+        - Key: Service
+          Value: Lambda
+
+  # EventBridge Rule for Cross-Region Replication (Primary Region Only)
+  CrossRegionReplicationRule:
+    Type: AWS::Events::Rule
+    Condition: IsPrimaryRegion
+    Properties:
+      Name: !Sub '${AWS::StackName}-cross-region-replication-rule'
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        source:
+          - finance.transactions
+          - user.management
+        detail-type:
+          - Transaction Created
+          - User Action
+        detail:
+          priority:
+            - high
+            - critical
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt EventProcessorFunction.Arn
+          Id: LocalLambdaTarget
+        - Arn: !Sub 'arn:aws:events:${SecondaryRegion}:${AWS::AccountId}:event-bus/${EventBusName}-${AWS::AccountId}-${SecondaryRegion}'
+          Id: SecondaryRegionTarget
+          RoleArn: !GetAtt EventBridgeCrossRegionRole.Arn
+        - Arn: !Sub 'arn:aws:events:${TertiaryRegion}:${AWS::AccountId}:event-bus/${EventBusName}-${AWS::AccountId}-${TertiaryRegion}'
+          Id: TertiaryRegionTarget
+          RoleArn: !GetAtt EventBridgeCrossRegionRole.Arn
+
+  # EventBridge Rule for Local Processing (Non-Primary Regions)
+  LocalProcessingRule:
+    Type: AWS::Events::Rule
+    Condition: !Not [!Condition IsPrimaryRegion]
+    Properties:
+      Name: !Sub '${AWS::StackName}-local-processing-rule'
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        source:
+          - finance.transactions
+          - user.management
+        detail-type:
+          - Transaction Created
+          - User Action
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt EventProcessorFunction.Arn
+          Id: LocalLambdaTarget
+
+  # EventBridge Rule for Financial Events Pattern
+  FinancialEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-financial-events-rule'
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        source:
+          - finance.transactions
+          - finance.payments
+        detail-type:
+          - Transaction Created
+          - Payment Processed
+          - Fraud Detected
+        detail:
+          priority:
+            - high
+            - critical
+          amount:
+            - numeric:
+                - ">="
+                - 1000
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt EventProcessorFunction.Arn
+          Id: FinancialLambdaTarget
+
+  # EventBridge Rule for User Events Pattern
+  UserEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-user-events-rule'
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        source:
+          - user.management
+          - user.authentication
+        detail-type:
+          - User Login
+          - User Logout
+          - Password Reset
+        detail:
+          risk_level:
+            - medium
+            - high
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt EventProcessorFunction.Arn
+          Id: UserLambdaTarget
+
+  # EventBridge Rule for System Events Pattern
+  SystemEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-system-events-rule'
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        source:
+          - system.monitoring
+          - system.alerts
+        detail-type:
+          - System Error
+          - Performance Alert
+          - Security Incident
+        detail:
+          severity:
+            - warning
+            - error
+            - critical
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt EventProcessorFunction.Arn
+          Id: SystemLambdaTarget
+
+  # Lambda Permission for EventBridge to Invoke Function
+  EventBridgeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EventProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CrossRegionReplicationRule.Arn
+
+  # Lambda Permission for Local Processing Rule
+  LocalProcessingLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Condition: !Not [!Condition IsPrimaryRegion]
+    Properties:
+      FunctionName: !Ref EventProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt LocalProcessingRule.Arn
+
+  # Lambda Permission for Financial Events Rule
+  FinancialEventsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EventProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt FinancialEventsRule.Arn
+
+  # Lambda Permission for User Events Rule
+  UserEventsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EventProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt UserEventsRule.Arn
+
+  # Lambda Permission for System Events Rule
+  SystemEventsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EventProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SystemEventsRule.Arn
+
+  # Route 53 Health Check for Global Endpoint
+  EventBridgeHealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Condition: IsPrimaryRegion
+    Properties:
+      Type: HTTPS
+      ResourcePath: /
+      FullyQualifiedDomainName: !Sub 'events.${PrimaryRegion}.amazonaws.com'
+      Port: 443
+      RequestInterval: !Ref HealthCheckInterval
+      FailureThreshold: !Ref HealthCheckFailureThreshold
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-eventbridge-health-check'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: MultiRegionReplication
+
+  # EventBridge Global Endpoint (Primary Region Only)
+  EventBridgeGlobalEndpoint:
+    Type: AWS::Events::Endpoint
+    Condition: IsPrimaryRegion
+    Properties:
+      Name: !Sub '${GlobalEndpointName}-${AWS::AccountId}'
+      RoutingConfig:
+        FailoverConfig:
+          Primary:
+            HealthCheck: !Ref EventBridgeHealthCheck
+          Secondary:
+            Route: !Ref SecondaryRegion
+      ReplicationConfig:
+        State: ENABLED
+      EventBuses:
+        - EventBusArn: !GetAtt CustomEventBus.Arn
+        - EventBusArn: !Sub 'arn:aws:events:${SecondaryRegion}:${AWS::AccountId}:event-bus/${EventBusName}-${AWS::AccountId}-${SecondaryRegion}'
+
+  # CloudWatch Alarm for EventBridge Failed Invocations
+  EventBridgeFailedInvocationsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-EventBridge-FailedInvocations'
+      AlarmDescription: 'Alert when EventBridge rule fails'
+      MetricName: FailedInvocations
+      Namespace: AWS/Events
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: !Ref AlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: RuleName
+          Value: !If
+            - IsPrimaryRegion
+            - !Ref CrossRegionReplicationRule
+            - !Ref LocalProcessingRule
+      AlarmActions:
+        - !Ref EventBridgeAlertsTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for Lambda Function Errors
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-Lambda-Errors'
+      AlarmDescription: 'Alert when Lambda function errors occur'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EventProcessorFunction
+      AlarmActions:
+        - !Ref EventBridgeAlertsTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for Lambda Function Duration
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-Lambda-Duration'
+      AlarmDescription: 'Alert when Lambda function duration is high'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 25000  # 25 seconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EventProcessorFunction
+      AlarmActions:
+        - !Ref EventBridgeAlertsTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch Dashboard for Multi-Region Monitoring
+  EventBridgeMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-EventBridge-MultiRegion'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Events", "SuccessfulInvocations", "RuleName", "${CrossRegionReplicationRule}"],
+                  [".", "FailedInvocations", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "EventBridge Rule Performance",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${EventProcessorFunction}"],
+                  [".", "Errors", ".", "."],
+                  [".", "Duration", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Performance",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Events", "MatchedEvents", "EventBusName", "${CustomEventBus}"],
+                  [".", "SuccessfulInvocations", ".", "."],
+                  [".", "FailedInvocations", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Event Bus Activity",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+Outputs:
+  CustomEventBusArn:
+    Description: 'ARN of the custom EventBridge event bus'
+    Value: !GetAtt CustomEventBus.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomEventBusArn'
+
+  CustomEventBusName:
+    Description: 'Name of the custom EventBridge event bus'
+    Value: !Ref CustomEventBus
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomEventBusName'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function for event processing'
+    Value: !GetAtt EventProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function for event processing'
+    Value: !Ref EventProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  EventBridgeCrossRegionRoleArn:
+    Description: 'ARN of the IAM role for EventBridge cross-region access'
+    Value: !GetAtt EventBridgeCrossRegionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeCrossRegionRoleArn'
+
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the IAM role for Lambda function execution'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  GlobalEndpointArn:
+    Description: 'ARN of the EventBridge global endpoint (Primary Region Only)'
+    Value: !If
+      - IsPrimaryRegion
+      - !GetAtt EventBridgeGlobalEndpoint.Arn
+      - 'N/A - Not Primary Region'
+    Export:
+      Name: !Sub '${AWS::StackName}-GlobalEndpointArn'
+
+  GlobalEndpointName:
+    Description: 'Name of the EventBridge global endpoint (Primary Region Only)'
+    Value: !If
+      - IsPrimaryRegion
+      - !Ref EventBridgeGlobalEndpoint
+      - 'N/A - Not Primary Region'
+    Export:
+      Name: !Sub '${AWS::StackName}-GlobalEndpointName'
+
+  HealthCheckId:
+    Description: 'ID of the Route 53 health check (Primary Region Only)'
+    Value: !If
+      - IsPrimaryRegion
+      - !Ref EventBridgeHealthCheck
+      - 'N/A - Not Primary Region'
+    Export:
+      Name: !Sub '${AWS::StackName}-HealthCheckId'
+
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for CloudWatch alarms'
+    Value: !Ref EventBridgeAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  CloudWatchDashboardURL:
+    Description: 'URL of the CloudWatch dashboard for monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-EventBridge-MultiRegion'
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchDashboardURL'
+
+  CrossRegionReplicationRuleName:
+    Description: 'Name of the cross-region replication rule (Primary Region Only)'
+    Value: !If
+      - IsPrimaryRegion
+      - !Ref CrossRegionReplicationRule
+      - 'N/A - Not Primary Region'
+    Export:
+      Name: !Sub '${AWS::StackName}-CrossRegionReplicationRuleName'
+
+  LocalProcessingRuleName:
+    Description: 'Name of the local processing rule (Non-Primary Regions Only)'
+    Value: !If
+      - IsPrimaryRegion
+      - 'N/A - Primary Region'
+      - !Ref LocalProcessingRule
+    Export:
+      Name: !Sub '${AWS::StackName}-LocalProcessingRuleName'
+
+  DeploymentRegion:
+    Description: 'AWS region where this stack is deployed'
+    Value: !Ref 'AWS::Region'
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentRegion'
+
+  StackEnvironment:
+    Description: 'Environment configuration for this deployment'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'

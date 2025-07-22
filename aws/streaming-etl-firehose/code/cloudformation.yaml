@@ -1,0 +1,887 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for Streaming ETL with Kinesis Data Firehose, including Lambda transformation function, S3 storage, and comprehensive monitoring. Based on recipe: Streaming ETL with Kinesis Data Firehose'
+
+# ================================================================================================
+# METADATA
+# ================================================================================================
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "Firehose Configuration"
+        Parameters:
+          - FirehoseStreamName
+          - BufferSize
+          - BufferInterval
+          - CompressionFormat
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaFunctionName
+          - LambdaTimeout
+          - LambdaMemorySize
+      - Label:
+          default: "S3 Configuration"
+        Parameters:
+          - S3BucketName
+          - S3PrefixPattern
+          - S3ErrorPrefix
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableCloudWatchLogs
+          - LogRetentionDays
+    ParameterLabels:
+      Environment:
+        default: "Environment Name"
+      ProjectName:
+        default: "Project Name"
+      FirehoseStreamName:
+        default: "Firehose Delivery Stream Name"
+      BufferSize:
+        default: "Buffer Size (MB)"
+      BufferInterval:
+        default: "Buffer Interval (seconds)"
+      CompressionFormat:
+        default: "Compression Format"
+      LambdaFunctionName:
+        default: "Lambda Function Name"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      S3BucketName:
+        default: "S3 Bucket Name"
+      S3PrefixPattern:
+        default: "S3 Prefix Pattern"
+      S3ErrorPrefix:
+        default: "S3 Error Prefix"
+      EnableCloudWatchLogs:
+        default: "Enable CloudWatch Logs"
+      LogRetentionDays:
+        default: "Log Retention Days"
+
+# ================================================================================================
+# PARAMETERS
+# ================================================================================================
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: 'Environment name used for resource tagging and naming'
+    ConstraintDescription: 'Must be one of: dev, staging, prod'
+
+  ProjectName:
+    Type: String
+    Default: 'streaming-etl'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z][a-z0-9\-]*[a-z0-9]$'
+    Description: 'Project name used for resource naming (lowercase, alphanumeric and hyphens only)'
+    ConstraintDescription: 'Must be 3-20 characters, start with lowercase letter, contain only lowercase letters, numbers, and hyphens'
+
+  FirehoseStreamName:
+    Type: String
+    Default: ''
+    MaxLength: 64
+    AllowedPattern: '^$|^[a-zA-Z][a-zA-Z0-9\-]*[a-zA-Z0-9]$'
+    Description: 'Name for the Kinesis Data Firehose delivery stream (leave empty for auto-generation)'
+    ConstraintDescription: 'Must be 1-64 characters, start with letter, contain only alphanumeric characters and hyphens'
+
+  BufferSize:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 128
+    Description: 'Size of buffer in MB before data is delivered to S3'
+
+  BufferInterval:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+    Description: 'Time interval in seconds before data is delivered to S3'
+
+  CompressionFormat:
+    Type: String
+    Default: 'GZIP'
+    AllowedValues:
+      - UNCOMPRESSED
+      - GZIP
+      - ZIP
+      - Snappy
+      - HADOOP_SNAPPY
+    Description: 'Compression format for data delivered to S3'
+
+  LambdaFunctionName:
+    Type: String
+    Default: ''
+    MaxLength: 64
+    AllowedPattern: '^$|^[a-zA-Z][a-zA-Z0-9\-_]*[a-zA-Z0-9]$'
+    Description: 'Name for the Lambda transformation function (leave empty for auto-generation)'
+    ConstraintDescription: 'Must be 1-64 characters, start with letter, contain only alphanumeric characters, hyphens, and underscores'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 1
+    MaxValue: 900
+    Description: 'Lambda function timeout in seconds'
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 128
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+    Description: 'Lambda function memory size in MB'
+
+  S3BucketName:
+    Type: String
+    Default: ''
+    MaxLength: 63
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9\-]*[a-z0-9]$'
+    Description: 'Name for the S3 bucket (leave empty for auto-generation, must be globally unique)'
+    ConstraintDescription: 'Must be 3-63 characters, start and end with lowercase letter or number, contain only lowercase letters, numbers, and hyphens'
+
+  S3PrefixPattern:
+    Type: String
+    Default: 'processed-data/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/'
+    Description: 'S3 prefix pattern for organizing processed data using Firehose dynamic partitioning'
+
+  S3ErrorPrefix:
+    Type: String
+    Default: 'error-data/'
+    Description: 'S3 prefix for error data'
+
+  EnableCloudWatchLogs:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable CloudWatch logs for Lambda and Firehose'
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: 'CloudWatch logs retention period in days'
+
+# ================================================================================================
+# CONDITIONS
+# ================================================================================================
+
+Conditions:
+  # Auto-generate resource names if not provided
+  AutoGenerateFirehoseName: !Equals [!Ref FirehoseStreamName, '']
+  AutoGenerateLambdaName: !Equals [!Ref LambdaFunctionName, '']
+  AutoGenerateS3BucketName: !Equals [!Ref S3BucketName, '']
+  
+  # Feature flags
+  CreateCloudWatchLogs: !Equals [!Ref EnableCloudWatchLogs, 'true']
+  
+  # Environment-specific conditions
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  IsStaging: !Equals [!Ref Environment, 'staging']
+  IsDevelopment: !Equals [!Ref Environment, 'dev']
+
+# ================================================================================================
+# RESOURCES
+# ================================================================================================
+
+Resources:
+
+  # ==============================================================================================
+  # S3 BUCKET FOR DATA STORAGE
+  # ==============================================================================================
+
+  S3DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - AutoGenerateS3BucketName
+        - !Sub '${ProjectName}-${Environment}-data-${AWS::AccountId}-${AWS::Region}'
+        - !Ref S3BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: !If [IsProduction, 'Enabled', 'Suspended']
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Prefix: 'processed-data/'
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !If
+                - CreateCloudWatchLogs
+                - !Ref S3AccessLogGroup
+                - !Ref AWS::NoValue
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Streaming ETL Data Storage'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # ==============================================================================================
+  # IAM ROLES AND POLICIES
+  # ==============================================================================================
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Lambda ETL Transformation Execution'
+
+  # Firehose Delivery Role
+  FirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-firehose-delivery-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: FirehoseDeliveryPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3 permissions for data delivery
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource:
+                  - !Sub '${S3DataBucket}'
+                  - !Sub '${S3DataBucket}/*'
+              # Lambda permissions for data transformation
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:GetFunction
+                Resource: !GetAtt LambdaTransformFunction.Arn
+              # CloudWatch permissions for logging
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/*'
+              # Glue permissions for data catalog (for Parquet conversion)
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetTableVersion
+                  - glue:GetTableVersions
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:DeleteTable
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/default'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/default/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Firehose S3 Delivery and Lambda Invocation'
+
+  # ==============================================================================================
+  # LAMBDA TRANSFORMATION FUNCTION
+  # ==============================================================================================
+
+  LambdaTransformFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !If
+        - AutoGenerateLambdaName
+        - !Sub '${ProjectName}-${Environment}-firehose-transform'
+        - !Ref LambdaFunctionName
+      Description: 'Lambda function for transforming streaming data in Kinesis Data Firehose ETL pipeline'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Role: !GetAtt LambdaExecutionRole.Arn
+      ReservedConcurrencyLimit: !If [IsProduction, 100, 20]
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+          LOG_LEVEL: !If [IsDevelopment, 'DEBUG', 'INFO']
+      TracingConfig:
+        Mode: Active
+      Code:
+        ZipFile: |
+          import json
+          import base64
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          from typing import Dict, List, Any
+
+          # Configure logging
+          LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, LOG_LEVEL))
+          logger = logging.getLogger(__name__)
+
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, List[Dict[str, Any]]]:
+              """
+              Transform streaming data records for Kinesis Data Firehose.
+              
+              This function processes incoming data records by:
+              1. Decoding base64-encoded data
+              2. Parsing JSON payloads
+              3. Enriching data with metadata
+              4. Adding processing timestamps
+              5. Handling errors gracefully
+              
+              Args:
+                  event: Kinesis Data Firehose transformation event
+                  context: Lambda context object
+                  
+              Returns:
+                  Dictionary containing transformed records with processing results
+              """
+              logger.info(f"Processing {len(event.get('records', []))} records")
+              
+              output_records = []
+              success_count = 0
+              failure_count = 0
+              
+              for record in event.get('records', []):
+                  try:
+                      # Decode the data from base64
+                      compressed_payload = base64.b64decode(record['data'])
+                      uncompressed_payload = compressed_payload.decode('utf-8')
+                      
+                      logger.debug(f"Processing record ID: {record['recordId']}")
+                      
+                      # Parse JSON data
+                      try:
+                          data = json.loads(uncompressed_payload)
+                      except json.JSONDecodeError as e:
+                          logger.warning(f"Invalid JSON in record {record['recordId']}: {e}")
+                          # Handle non-JSON data by wrapping it
+                          data = {
+                              'raw_data': uncompressed_payload,
+                              'parse_error': str(e),
+                              'is_raw_text': True
+                          }
+                      
+                      # Transform and enrich the data
+                      transformed_data = transform_record(data)
+                      
+                      # Convert back to JSON and encode for Firehose
+                      output_json = json.dumps(transformed_data, separators=(',', ':')) + '\n'
+                      encoded_data = base64.b64encode(output_json.encode('utf-8')).decode('utf-8')
+                      
+                      # Create successful output record
+                      output_record = {
+                          'recordId': record['recordId'],
+                          'result': 'Ok',
+                          'data': encoded_data
+                      }
+                      
+                      success_count += 1
+                      logger.debug(f"Successfully processed record {record['recordId']}")
+                      
+                  except Exception as e:
+                      logger.error(f"Error processing record {record['recordId']}: {str(e)}")
+                      
+                      # Mark record as processing failed
+                      output_record = {
+                          'recordId': record['recordId'],
+                          'result': 'ProcessingFailed'
+                      }
+                      
+                      failure_count += 1
+                  
+                  output_records.append(output_record)
+              
+              logger.info(f"Processing complete. Success: {success_count}, Failures: {failure_count}")
+              
+              # Add custom metrics
+              put_custom_metrics(success_count, failure_count)
+              
+              return {'records': output_records}
+
+          def transform_record(data: Dict[str, Any]) -> Dict[str, Any]:
+              """
+              Transform and enrich a single data record.
+              
+              Args:
+                  data: Original data record
+                  
+              Returns:
+                  Transformed and enriched data record
+              """
+              current_time = datetime.utcnow()
+              
+              # Base transformation - preserve original data and add metadata
+              transformed_data = {
+                  # Original data fields
+                  'event_type': data.get('event_type', 'unknown'),
+                  'user_id': data.get('user_id', 'anonymous'),
+                  'session_id': data.get('session_id', ''),
+                  'page_url': data.get('page_url', ''),
+                  'referrer': data.get('referrer', ''),
+                  'user_agent': data.get('user_agent', ''),
+                  'ip_address': data.get('ip_address', ''),
+                  
+                  # Processing metadata
+                  'processed_timestamp': current_time.isoformat(),
+                  'processed_date': current_time.strftime('%Y-%m-%d'),
+                  'processed_hour': current_time.strftime('%H'),
+                  'processor_version': '1.0',
+                  'environment': os.environ.get('ENVIRONMENT', 'unknown'),
+                  
+                  # Data enrichment
+                  'is_mobile': is_mobile_user_agent(data.get('user_agent', '')),
+                  'domain': extract_domain(data.get('page_url', '')),
+                  'referrer_domain': extract_domain(data.get('referrer', '')),
+                  
+                  # Include raw data for debugging if it was problematic
+                  **(data if not data.get('is_raw_text', False) else {'original_raw_data': data})
+              }
+              
+              return transformed_data
+
+          def is_mobile_user_agent(user_agent: str) -> bool:
+              """Check if user agent indicates mobile device."""
+              mobile_indicators = ['Mobile', 'Android', 'iPhone', 'iPad', 'iPod']
+              return any(indicator in user_agent for indicator in mobile_indicators)
+
+          def extract_domain(url: str) -> str:
+              """Extract domain from URL."""
+              if not url or not url.startswith(('http://', 'https://')):
+                  return ''
+              
+              try:
+                  from urllib.parse import urlparse
+                  parsed = urlparse(url)
+                  return parsed.netloc
+              except Exception:
+                  return ''
+
+          def put_custom_metrics(success_count: int, failure_count: int) -> None:
+              """Put custom CloudWatch metrics."""
+              try:
+                  cloudwatch = boto3.client('cloudwatch')
+                  
+                  metrics = [
+                      {
+                          'MetricName': 'RecordsProcessedSuccessfully',
+                          'Value': success_count,
+                          'Unit': 'Count'
+                      },
+                      {
+                          'MetricName': 'RecordsProcessedWithFailure',
+                          'Value': failure_count,
+                          'Unit': 'Count'
+                      }
+                  ]
+                  
+                  cloudwatch.put_metric_data(
+                      Namespace=f"StreamingETL/{os.environ.get('PROJECT_NAME', 'Unknown')}",
+                      MetricData=metrics
+                  )
+                  
+              except Exception as e:
+                  logger.warning(f"Failed to put custom metrics: {e}")
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Firehose Data Transformation'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # ==============================================================================================
+  # CLOUDWATCH LOG GROUPS
+  # ==============================================================================================
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateCloudWatchLogs
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LambdaTransformFunction}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Lambda Function Logs'
+
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateCloudWatchLogs
+    Properties:
+      LogGroupName: !Sub '/aws/kinesisfirehose/${ProjectName}-${Environment}-delivery-stream'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Firehose Delivery Stream Logs'
+
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateCloudWatchLogs
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-${Environment}-access-logs'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'S3 Access Logs'
+
+  # ==============================================================================================
+  # KINESIS DATA FIREHOSE DELIVERY STREAM
+  # ==============================================================================================
+
+  FirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn:
+      - FirehoseDeliveryRole
+      - LambdaTransformFunction
+      - S3DataBucket
+    Properties:
+      DeliveryStreamName: !If
+        - AutoGenerateFirehoseName
+        - !Sub '${ProjectName}-${Environment}-delivery-stream'
+        - !Ref FirehoseStreamName
+      DeliveryStreamType: DirectPut
+      S3DestinationConfiguration:
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        BucketARN: !Sub '${S3DataBucket}'
+        Prefix: !Ref S3PrefixPattern
+        ErrorOutputPrefix: !Ref S3ErrorPrefix
+        BufferingHints:
+          SizeInMBs: !Ref BufferSize
+          IntervalInSeconds: !Ref BufferInterval
+        CompressionFormat: !Ref CompressionFormat
+        
+        # Lambda Data Transformation Configuration
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt LambdaTransformFunction.Arn
+                - ParameterName: BufferSizeInMBs
+                  ParameterValue: '1'
+                - ParameterName: BufferIntervalInSeconds
+                  ParameterValue: '60'
+        
+        # Data Format Conversion to Parquet
+        DataFormatConversionConfiguration:
+          Enabled: true
+          OutputFormatConfiguration:
+            Serializer:
+              ParquetSerDe: {}
+          SchemaConfiguration:
+            DatabaseName: 'default'
+            TableName: !Sub '${ProjectName}_${Environment}_streaming_etl_data'
+            RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+            VersionId: 'LATEST'
+        
+        # CloudWatch Logging Configuration
+        CloudWatchLoggingOptions:
+          Enabled: !If [CreateCloudWatchLogs, true, false]
+          LogGroupName: !If
+            - CreateCloudWatchLogs
+            - !Ref FirehoseLogGroup
+            - !Ref AWS::NoValue
+          LogStreamName: !If
+            - CreateCloudWatchLogs
+            - 'S3Delivery'
+            - !Ref AWS::NoValue
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Streaming ETL Data Delivery'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # ==============================================================================================
+  # CLOUDWATCH ALARMS AND MONITORING
+  # ==============================================================================================
+
+  # Firehose Delivery Failures Alarm
+  FirehoseDeliveryFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-firehose-delivery-failures'
+      AlarmDescription: 'Monitor Firehose delivery failures'
+      MetricName: DeliveryToS3.Records
+      Namespace: AWS/Kinesis/Firehose
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: DeliveryStreamName
+          Value: !Ref FirehoseDeliveryStream
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda Function Errors Alarm
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-lambda-errors'
+      AlarmDescription: 'Monitor Lambda transformation function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LambdaTransformFunction
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda Function Duration Alarm
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-lambda-duration'
+      AlarmDescription: 'Monitor Lambda transformation function duration'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref LambdaTimeout
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LambdaTransformFunction
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+# ================================================================================================
+# OUTPUTS
+# ================================================================================================
+
+Outputs:
+  # Resource Identifiers
+  S3BucketName:
+    Description: 'Name of the S3 bucket for storing processed data'
+    Value: !Ref S3DataBucket
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-s3-bucket-name'
+
+  S3BucketArn:
+    Description: 'ARN of the S3 bucket for storing processed data'
+    Value: !Sub '${S3DataBucket}'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-s3-bucket-arn'
+
+  LambdaFunctionName:
+    Description: 'Name of the Lambda transformation function'
+    Value: !Ref LambdaTransformFunction
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-lambda-function-name'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda transformation function'
+    Value: !GetAtt LambdaTransformFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-lambda-function-arn'
+
+  FirehoseDeliveryStreamName:
+    Description: 'Name of the Kinesis Data Firehose delivery stream'
+    Value: !Ref FirehoseDeliveryStream
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-firehose-stream-name'
+
+  FirehoseDeliveryStreamArn:
+    Description: 'ARN of the Kinesis Data Firehose delivery stream'
+    Value: !GetAtt FirehoseDeliveryStream.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-firehose-stream-arn'
+
+  # IAM Roles
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-lambda-execution-role-arn'
+
+  FirehoseDeliveryRoleArn:
+    Description: 'ARN of the Firehose delivery role'
+    Value: !GetAtt FirehoseDeliveryRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-firehose-delivery-role-arn'
+
+  # Monitoring Resources
+  LambdaLogGroupName:
+    Condition: CreateCloudWatchLogs
+    Description: 'Name of the Lambda function CloudWatch log group'
+    Value: !Ref LambdaLogGroup
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-lambda-log-group-name'
+
+  FirehoseLogGroupName:
+    Condition: CreateCloudWatchLogs
+    Description: 'Name of the Firehose CloudWatch log group'
+    Value: !Ref FirehoseLogGroup
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-firehose-log-group-name'
+
+  # Configuration Details
+  S3ProcessedDataLocation:
+    Description: 'S3 location for processed data'
+    Value: !Sub 's3://${S3DataBucket}/${S3PrefixPattern}'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-processed-data-location'
+
+  S3ErrorDataLocation:
+    Description: 'S3 location for error data'
+    Value: !Sub 's3://${S3DataBucket}/${S3ErrorPrefix}'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-error-data-location'
+
+  # Useful Commands for Testing
+  TestDataCommand:
+    Description: 'AWS CLI command to send test data to the Firehose stream'
+    Value: !Sub |
+      aws firehose put-record \
+        --delivery-stream-name ${FirehoseDeliveryStream} \
+        --record '{"Data":"$(echo '{"event_type":"test","user_id":"test-user"}' | base64)"}'
+
+  # Dashboard URL
+  CloudWatchDashboardURL:
+    Description: 'URL to view CloudWatch metrics for this stack'
+    Value: !Sub |
+      https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}
+
+  # Stack Information
+  StackVersion:
+    Description: 'Version of this CloudFormation template'
+    Value: '1.0.0'
+
+  CreatedResources:
+    Description: 'Summary of created resources'
+    Value: !Sub |
+      Stack: ${AWS::StackName}
+      S3 Bucket: ${S3DataBucket}
+      Lambda Function: ${LambdaTransformFunction}
+      Firehose Stream: ${FirehoseDeliveryStream}
+      Environment: ${Environment}
+      Project: ${ProjectName}

@@ -1,0 +1,553 @@
+# Google Cloud Infrastructure Manager Configuration
+# Podcast Content Generation with Text-to-Speech and Natural Language
+# 
+# This configuration deploys the complete infrastructure for an automated
+# podcast generation system that combines Natural Language API for content
+# analysis with Text-to-Speech API for high-quality audio synthesis.
+
+apiVersion: config.gcp.crossplane.io/v1beta1
+kind: Configuration
+metadata:
+  name: podcast-content-generation
+  annotations:
+    config.kubernetes.io/function: |
+      container:
+        image: gcr.io/config-management-release/inframanager:latest
+    description: "Infrastructure for intelligent podcast content generation system"
+
+# Import required providers and configure project settings
+imports:
+- path: providers/gcp-beta.yaml
+
+# Global variables for consistent resource naming and configuration
+variables:
+  project_id:
+    description: "Google Cloud Project ID for podcast generation resources"
+    type: string
+    default: "podcast-generator-demo"
+    
+  region:
+    description: "Primary region for deploying resources"
+    type: string
+    default: "us-central1"
+    
+  zone:
+    description: "Primary zone within the region"
+    type: string
+    default: "us-central1-a"
+    
+  bucket_name:
+    description: "Cloud Storage bucket name for content and audio files"
+    type: string
+    default: "podcast-content-bucket"
+    
+  function_name:
+    description: "Cloud Function name for podcast processing"
+    type: string
+    default: "podcast-processor"
+    
+  service_account_name:
+    description: "Service account for podcast generation APIs"
+    type: string
+    default: "podcast-generator"
+
+# Resource definitions for the complete podcast generation infrastructure
+resources:
+  # Enable required Google Cloud APIs for the podcast generation system
+  - name: texttospeech-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/texttospeech.googleapis.com
+      parent: projects/$(ref.project.projectId)
+    metadata:
+      dependsOn:
+        - project
+      
+  - name: language-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/language.googleapis.com
+      parent: projects/$(ref.project.projectId)
+    metadata:
+      dependsOn:
+        - project
+        
+  - name: storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/storage.googleapis.com
+      parent: projects/$(ref.project.projectId)
+    metadata:
+      dependsOn:
+        - project
+        
+  - name: cloudfunctions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/cloudfunctions.googleapis.com
+      parent: projects/$(ref.project.projectId)
+    metadata:
+      dependsOn:
+        - project
+        
+  - name: cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/cloudbuild.googleapis.com
+      parent: projects/$(ref.project.projectId)
+    metadata:
+      dependsOn:
+        - project
+        
+  - name: monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/monitoring.googleapis.com
+      parent: projects/$(ref.project.projectId)
+    metadata:
+      dependsOn:
+        - project
+        
+  - name: logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/logging.googleapis.com
+      parent: projects/$(ref.project.projectId)
+    metadata:
+      dependsOn:
+        - project
+
+  # Cloud Storage bucket for content repository and audio output
+  - name: podcast-content-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(var.bucket_name)-$(ref.random-suffix.hex)
+      project: $(var.project_id)
+      location: $(var.region)
+      storageClass: STANDARD
+      # Enable versioning for content protection and rollback capability
+      versioning:
+        enabled: true
+      # Configure lifecycle management for cost optimization
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90
+              # Delete old versions after 90 days to manage storage costs
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+              # Move to cheaper storage class after 30 days
+      # Enable uniform bucket-level access for simplified IAM
+      uniformBucketLevelAccess:
+        enabled: true
+      # Configure CORS for potential web interface integration
+      cors:
+        - origin: ["*"]
+          method: ["GET", "POST", "PUT"]
+          responseHeader: ["Content-Type", "Access-Control-Allow-Origin"]
+          maxAgeSeconds: 3600
+    metadata:
+      dependsOn:
+        - storage-api
+        - random-suffix
+
+  # Create folder structure within the bucket for organized content management
+  - name: content-input-folder
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: $(ref.podcast-content-bucket.name)
+      name: input/.gitkeep
+      contentType: text/plain
+      # Empty file to create directory structure
+    metadata:
+      dependsOn:
+        - podcast-content-bucket
+        
+  - name: content-processed-folder
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: $(ref.podcast-content-bucket.name)
+      name: processed/.gitkeep
+      contentType: text/plain
+    metadata:
+      dependsOn:
+        - podcast-content-bucket
+        
+  - name: content-audio-folder
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: $(ref.podcast-content-bucket.name)
+      name: audio/.gitkeep
+      contentType: text/plain
+    metadata:
+      dependsOn:
+        - podcast-content-bucket
+
+  # Service account for podcast generation with appropriate permissions
+  - name: podcast-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      projectId: $(var.project_id)
+      accountId: $(var.service_account_name)
+      serviceAccount:
+        displayName: "Podcast Content Generator"
+        description: "Service account for accessing Text-to-Speech and Natural Language APIs"
+    metadata:
+      dependsOn:
+        - texttospeech-api
+        - language-api
+
+  # IAM binding for Storage Admin role (manage bucket contents)
+  - name: storage-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:bindings
+    properties:
+      resource: projects/$(var.project_id)
+      role: roles/storage.admin
+      members:
+        - serviceAccount:$(ref.podcast-service-account.email)
+    metadata:
+      dependsOn:
+        - podcast-service-account
+
+  # IAM binding for ML Developer role (access AI/ML APIs)
+  - name: ml-developer-binding
+    type: gcp-types/cloudresourcemanager-v1:bindings
+    properties:
+      resource: projects/$(var.project_id)
+      role: roles/ml.developer
+      members:
+        - serviceAccount:$(ref.podcast-service-account.email)
+    metadata:
+      dependsOn:
+        - podcast-service-account
+
+  # IAM binding for Cloud Functions Developer role
+  - name: functions-developer-binding
+    type: gcp-types/cloudresourcemanager-v1:bindings
+    properties:
+      resource: projects/$(var.project_id)
+      role: roles/cloudfunctions.developer
+      members:
+        - serviceAccount:$(ref.podcast-service-account.email)
+    metadata:
+      dependsOn:
+        - podcast-service-account
+
+  # Generate random suffix for unique resource naming
+  - name: random-suffix
+    type: gcp-types/random:id
+    properties:
+      byteLength: 3
+      prefix: "podcast"
+
+  # Cloud Function source code archive in Cloud Storage
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(var.function_name)-source-$(ref.random-suffix.hex)
+      project: $(var.project_id)
+      location: $(var.region)
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+    metadata:
+      dependsOn:
+        - storage-api
+        - random-suffix
+
+  # Upload function source code (placeholder - actual deployment would use Cloud Build)
+  - name: function-source-code
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: $(ref.function-source-bucket.name)
+      name: function-source.zip
+      contentType: application/zip
+      # In practice, this would reference actual function code archive
+      metadata:
+        description: "Cloud Function source code for podcast generation"
+    metadata:
+      dependsOn:
+        - function-source-bucket
+
+  # Cloud Function for podcast content analysis and generation
+  - name: podcast-processing-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/$(var.project_id)/locations/$(var.region)
+      function:
+        name: projects/$(var.project_id)/locations/$(var.region)/functions/$(var.function_name)
+        description: "Intelligent podcast generation using Natural Language and Text-to-Speech APIs"
+        # Configure function source and build
+        sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/function-source.zip
+        entryPoint: analyze_and_generate
+        runtime: python311
+        # Configure function execution environment
+        availableMemoryMb: 1024
+        timeout: 540s
+        maxInstances: 10
+        # Set environment variables for function configuration
+        environmentVariables:
+          BUCKET_NAME: $(ref.podcast-content-bucket.name)
+          PROJECT_ID: $(var.project_id)
+          REGION: $(var.region)
+        # Configure HTTP trigger for external access
+        httpsTrigger:
+          securityLevel: SECURE_ALWAYS
+        # Use dedicated service account
+        serviceAccountEmail: $(ref.podcast-service-account.email)
+        # Configure function labels for organization
+        labels:
+          component: podcast-generator
+          environment: production
+          cost-center: media-services
+    metadata:
+      dependsOn:
+        - cloudfunctions-api
+        - cloudbuild-api
+        - function-source-code
+        - podcast-service-account
+        - podcast-content-bucket
+
+  # IAM policy to allow public access to the function (for testing)
+  - name: function-public-access
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions.setIamPolicy
+    properties:
+      resource: projects/$(var.project_id)/locations/$(var.region)/functions/$(var.function_name)
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - podcast-processing-function
+
+  # Cloud Monitoring dashboard for podcast generation metrics
+  - name: podcast-monitoring-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      parent: projects/$(var.project_id)
+      dashboard:
+        displayName: "Podcast Generation Monitoring"
+        mosaicLayout:
+          tiles:
+            # Function execution count widget
+            - width: 6
+              height: 4
+              xPos: 0
+              yPos: 0
+              widget:
+                title: "Function Executions"
+                scorecard:
+                  timeSeriesQuery:
+                    timeSeriesFilter:
+                      filter: 'resource.type="cloud_function" AND resource.labels.function_name="$(var.function_name)"'
+                      aggregation:
+                        alignmentPeriod: "60s"
+                        perSeriesAligner: ALIGN_RATE
+                        crossSeriesReducer: REDUCE_SUM
+                  sparkChartView:
+                    sparkChartType: SPARK_LINE
+            # Function duration widget
+            - width: 6
+              height: 4
+              xPos: 6
+              yPos: 0
+              widget:
+                title: "Processing Duration"
+                scorecard:
+                  timeSeriesQuery:
+                    timeSeriesFilter:
+                      filter: 'resource.type="cloud_function" AND resource.labels.function_name="$(var.function_name)"'
+                      aggregation:
+                        alignmentPeriod: "60s"
+                        perSeriesAligner: ALIGN_MEAN
+            # Error rate widget
+            - width: 6
+              height: 4
+              xPos: 0
+              yPos: 4
+              widget:
+                title: "Error Rate"
+                scorecard:
+                  timeSeriesQuery:
+                    timeSeriesFilter:
+                      filter: 'resource.type="cloud_function" AND resource.labels.function_name="$(var.function_name)" AND metric.labels.status!="ok"'
+                      aggregation:
+                        alignmentPeriod: "60s"
+                        perSeriesAligner: ALIGN_RATE
+                        crossSeriesReducer: REDUCE_SUM
+            # Storage usage widget
+            - width: 6
+              height: 4
+              xPos: 6
+              yPos: 4
+              widget:
+                title: "Storage Usage"
+                scorecard:
+                  timeSeriesQuery:
+                    timeSeriesFilter:
+                      filter: 'resource.type="gcs_bucket" AND resource.labels.bucket_name="$(ref.podcast-content-bucket.name)"'
+                      aggregation:
+                        alignmentPeriod: "300s"
+                        perSeriesAligner: ALIGN_MEAN
+    metadata:
+      dependsOn:
+        - monitoring-api
+        - podcast-processing-function
+
+  # Log-based metric for podcast generation requests
+  - name: podcast-generation-metric
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      parent: projects/$(var.project_id)
+      metric:
+        name: podcast_generation_count
+        description: "Count of podcast generation requests processed"
+        filter: 'resource.type="cloud_function" AND resource.labels.function_name="$(var.function_name)" AND textPayload:"podcast generation"'
+        metricDescriptor:
+          metricKind: CUMULATIVE
+          valueType: INT64
+          displayName: "Podcast Generation Count"
+        labelExtractors:
+          sentiment_score: EXTRACT(textPayload)
+    metadata:
+      dependsOn:
+        - logging-api
+        - podcast-processing-function
+
+  # Alerting policy for function errors
+  - name: podcast-error-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(var.project_id)
+      alertPolicy:
+        displayName: "Podcast Generation Function Errors"
+        documentation:
+          content: "Alert when podcast generation function error rate exceeds threshold"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "Function error rate high"
+            conditionThreshold:
+              filter: 'resource.type="cloud_function" AND resource.labels.function_name="$(var.function_name)"'
+              comparison: COMPARISON_GT
+              thresholdValue: 0.1
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: "60s"
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_MEAN
+                  groupByFields:
+                    - resource.labels.function_name
+        # Configure notification channels (would need to be created separately)
+        alertStrategy:
+          autoClose: 1800s
+        enabled: true
+    metadata:
+      dependsOn:
+        - monitoring-api
+        - podcast-processing-function
+
+# Output values for integration and verification
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: $(var.project_id)
+    
+  bucket_name:
+    description: "Cloud Storage bucket name for podcast content"
+    value: $(ref.podcast-content-bucket.name)
+    
+  bucket_url:
+    description: "Cloud Storage bucket URL"
+    value: "gs://$(ref.podcast-content-bucket.name)"
+    
+  function_name:
+    description: "Cloud Function name for podcast processing"
+    value: $(ref.podcast-processing-function.name)
+    
+  function_url:
+    description: "Cloud Function HTTP trigger URL"
+    value: $(ref.podcast-processing-function.httpsTrigger.url)
+    
+  service_account_email:
+    description: "Service account email for podcast generation"
+    value: $(ref.podcast-service-account.email)
+    
+  dashboard_url:
+    description: "Cloud Monitoring dashboard URL"
+    value: "https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.podcast-monitoring-dashboard.name)?project=$(var.project_id)"
+    
+  storage_input_path:
+    description: "Cloud Storage path for input content"
+    value: "gs://$(ref.podcast-content-bucket.name)/input/"
+    
+  storage_audio_path:
+    description: "Cloud Storage path for generated audio"
+    value: "gs://$(ref.podcast-content-bucket.name)/audio/"
+    
+  storage_processed_path:
+    description: "Cloud Storage path for processed metadata"
+    value: "gs://$(ref.podcast-content-bucket.name)/processed/"
+
+# Deployment configuration and constraints
+options:
+  # Require confirmation for resource deletion
+  deletePolicy: RETAIN
+  
+  # Configure deployment parallelism
+  parallelism: 5
+  
+  # Set deployment timeout
+  timeout: 1800s
+  
+  # Enable detailed logging
+  verbosity: INFO
+
+# Resource constraints and quotas
+constraints:
+  # Ensure adequate quota for function executions
+  - type: quota
+    service: cloudfunctions.googleapis.com
+    metric: functions
+    minimum: 10
+    
+  # Ensure adequate quota for API calls
+  - type: quota
+    service: texttospeech.googleapis.com
+    metric: character_requests_per_minute
+    minimum: 600000
+    
+  - type: quota
+    service: language.googleapis.com
+    metric: requests_per_minute
+    minimum: 600
+
+# Security and compliance configurations
+security:
+  # Enable audit logging for all operations
+  auditConfig:
+    - service: storage.googleapis.com
+      auditLogConfigs:
+        - logType: DATA_READ
+        - logType: DATA_WRITE
+    - service: cloudfunctions.googleapis.com
+      auditLogConfigs:
+        - logType: ADMIN_READ
+        - logType: DATA_READ
+        - logType: DATA_WRITE
+        
+  # Configure encryption settings
+  encryption:
+    defaultKmsKey: projects/$(var.project_id)/locations/$(var.region)/keyRings/podcast-keyring/cryptoKeys/podcast-key
+    
+  # Network security settings
+  network:
+    requireSsl: true
+    allowedRegions:
+      - $(var.region)

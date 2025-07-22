@@ -1,0 +1,627 @@
+# Infrastructure Manager Configuration for Zero-Trust Network Security
+# This configuration deploys a comprehensive zero-trust security architecture
+# using Service Extensions, Cloud Armor, and Identity-Aware Proxy
+
+# Input variables for customization
+inputs:
+  - name: project_id
+    description: "Google Cloud Project ID where resources will be created"
+    type: string
+    required: true
+  
+  - name: region
+    description: "Primary region for regional resources"
+    type: string
+    default: "us-central1"
+  
+  - name: zone
+    description: "Primary zone for zonal resources"
+    type: string
+    default: "us-central1-a"
+  
+  - name: app_name
+    description: "Application name prefix for resource naming"
+    type: string
+    default: "zero-trust-app"
+  
+  - name: domain_name
+    description: "Domain name for SSL certificate (use example.com for testing)"
+    type: string
+    default: "example.com"
+  
+  - name: backend_machine_type
+    description: "Machine type for backend compute instances"
+    type: string
+    default: "e2-medium"
+  
+  - name: enable_geo_blocking
+    description: "Enable geographic blocking in Cloud Armor policy"
+    type: boolean
+    default: true
+  
+  - name: blocked_regions
+    description: "List of country codes to block (ISO 3166-1 alpha-2)"
+    type: list(string)
+    default: ["CN", "RU"]
+
+# Template configuration
+template:
+  # Enable required Google Cloud APIs
+  api_services:
+    - name: compute_api
+      type: gcp-types/serviceusage-v1:projects.services
+      properties:
+        name: projects/${project_id}/services/compute.googleapis.com
+      metadata:
+        dependsOn: []
+    
+    - name: iap_api
+      type: gcp-types/serviceusage-v1:projects.services
+      properties:
+        name: projects/${project_id}/services/iap.googleapis.com
+      metadata:
+        dependsOn: []
+    
+    - name: logging_api
+      type: gcp-types/serviceusage-v1:projects.services
+      properties:
+        name: projects/${project_id}/services/logging.googleapis.com
+      metadata:
+        dependsOn: []
+    
+    - name: monitoring_api
+      type: gcp-types/serviceusage-v1:projects.services
+      properties:
+        name: projects/${project_id}/services/monitoring.googleapis.com
+      metadata:
+        dependsOn: []
+    
+    - name: run_api
+      type: gcp-types/serviceusage-v1:projects.services
+      properties:
+        name: projects/${project_id}/services/run.googleapis.com
+      metadata:
+        dependsOn: []
+
+  # Custom VPC Network for zero-trust architecture
+  vpc_network:
+    - name: zero_trust_vpc
+      type: gcp-types/compute-v1:networks
+      properties:
+        name: zero-trust-vpc
+        description: "Zero-trust network for secure applications"
+        routingConfig:
+          routingMode: GLOBAL
+        autoCreateSubnetworks: false
+      metadata:
+        dependsOn:
+          - compute_api
+
+  # Secure subnet with private Google access
+  subnet:
+    - name: zero_trust_subnet
+      type: gcp-types/compute-v1:subnetworks
+      properties:
+        name: zero-trust-subnet
+        description: "Subnet for zero-trust application backends"
+        network: $(ref.zero_trust_vpc.selfLink)
+        ipCidrRange: "10.0.0.0/24"
+        region: ${region}
+        privateIpGoogleAccess: true
+        logConfig:
+          enable: true
+          aggregationInterval: INTERVAL_10_MIN
+          flowSampling: 0.5
+          metadata: INCLUDE_ALL_METADATA
+      metadata:
+        dependsOn:
+          - zero_trust_vpc
+
+  # Service account for backend instances
+  backend_service_account:
+    - name: backend_service_account
+      type: gcp-types/iam-v1:projects.serviceAccounts
+      properties:
+        accountId: $(app_name)-backend
+        displayName: "Zero Trust Backend Service Account"
+        description: "Service account for backend instances with minimal permissions"
+      metadata:
+        dependsOn:
+          - compute_api
+
+  # IAM binding for service account
+  backend_service_account_binding:
+    - name: backend_sa_binding
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: ${project_id}
+        role: roles/logging.logWriter
+        member: serviceAccount:$(ref.backend_service_account.email)
+      metadata:
+        dependsOn:
+          - backend_service_account
+
+  # Firewall rule for health checks
+  health_check_firewall:
+    - name: allow_health_checks
+      type: gcp-types/compute-v1:firewalls
+      properties:
+        name: allow-health-checks
+        description: "Allow Google Cloud health checks"
+        network: $(ref.zero_trust_vpc.selfLink)
+        sourceRanges:
+          - "130.211.0.0/22"
+          - "35.191.0.0/16"
+        allowed:
+          - IPProtocol: tcp
+            ports: ["80", "443"]
+        targetTags:
+          - "zero-trust-backend"
+      metadata:
+        dependsOn:
+          - zero_trust_vpc
+
+  # Firewall rule for IAP
+  iap_firewall:
+    - name: allow_iap
+      type: gcp-types/compute-v1:firewalls
+      properties:
+        name: allow-iap
+        description: "Allow Identity-Aware Proxy traffic"
+        network: $(ref.zero_trust_vpc.selfLink)
+        sourceRanges:
+          - "35.235.240.0/20"
+        allowed:
+          - IPProtocol: tcp
+            ports: ["80", "443"]
+        targetTags:
+          - "zero-trust-backend"
+      metadata:
+        dependsOn:
+          - zero_trust_vpc
+
+  # Backend compute instance
+  backend_instance:
+    - name: backend_instance
+      type: gcp-types/compute-v1:instances
+      properties:
+        name: $(app_name)-backend
+        description: "Backend instance for zero-trust application"
+        zone: ${zone}
+        machineType: zones/${zone}/machineTypes/${backend_machine_type}
+        serviceAccounts:
+          - email: $(ref.backend_service_account.email)
+            scopes:
+              - https://www.googleapis.com/auth/cloud-platform
+        networkInterfaces:
+          - subnetwork: $(ref.zero_trust_subnet.selfLink)
+            # No external IP - private by default for zero-trust
+        tags:
+          items:
+            - "zero-trust-backend"
+        disks:
+          - boot: true
+            autoDelete: true
+            initializeParams:
+              sourceImage: projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts
+              diskType: zones/${zone}/diskTypes/pd-standard
+              diskSizeGb: 20
+        metadata:
+          items:
+            - key: startup-script
+              value: |
+                #!/bin/bash
+                # Update system and install nginx
+                apt-get update
+                apt-get install -y nginx
+                
+                # Create secure application page
+                cat > /var/www/html/index.html << 'EOF'
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>Zero Trust Protected App</title>
+                    <meta charset="utf-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1">
+                    <style>
+                        body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+                        .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+                        .header { color: #1a73e8; border-bottom: 2px solid #1a73e8; padding-bottom: 10px; }
+                        .info { background: #e8f0fe; padding: 15px; border-radius: 4px; margin: 20px 0; }
+                        .security-badge { background: #137333; color: white; padding: 5px 10px; border-radius: 4px; font-size: 12px; }
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <h1 class="header">🔒 Zero Trust Protected Application</h1>
+                        <div class="info">
+                            <p><span class="security-badge">SECURE</span> This application is protected by comprehensive zero-trust security controls.</p>
+                        </div>
+                        <h2>Security Features Active:</h2>
+                        <ul>
+                            <li>✅ Cloud Armor DDoS Protection</li>
+                            <li>✅ Service Extensions Custom Inspection</li>
+                            <li>✅ Identity-Aware Proxy Authentication</li>
+                            <li>✅ Private Network Isolation</li>
+                            <li>✅ Comprehensive Security Logging</li>
+                        </ul>
+                        <div class="info">
+                            <p><strong>Request processed at:</strong> $(date)</p>
+                            <p><strong>Server hostname:</strong> $(hostname)</p>
+                            <p><strong>Client IP:</strong> ${REMOTE_ADDR:-"Unknown"}</p>
+                        </div>
+                    </div>
+                </body>
+                </html>
+                EOF
+                
+                # Configure nginx for security headers
+                cat > /etc/nginx/sites-available/default << 'EOF'
+                server {
+                    listen 80 default_server;
+                    listen [::]:80 default_server;
+                    
+                    root /var/www/html;
+                    index index.html;
+                    server_name _;
+                    
+                    # Security headers
+                    add_header X-Frame-Options "DENY" always;
+                    add_header X-Content-Type-Options "nosniff" always;
+                    add_header X-XSS-Protection "1; mode=block" always;
+                    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+                    
+                    location / {
+                        try_files $uri $uri/ =404;
+                    }
+                    
+                    # Health check endpoint
+                    location /health {
+                        access_log off;
+                        return 200 "healthy\n";
+                        add_header Content-Type text/plain;
+                    }
+                }
+                EOF
+                
+                # Enable and start nginx
+                systemctl enable nginx
+                systemctl restart nginx
+                
+                # Configure logging
+                mkdir -p /var/log/zero-trust
+                echo "$(date): Zero-trust backend instance initialized" >> /var/log/zero-trust/startup.log
+      metadata:
+        dependsOn:
+          - backend_service_account
+          - zero_trust_subnet
+          - health_check_firewall
+          - iap_firewall
+
+  # Health check for backend service
+  health_check:
+    - name: backend_health_check
+      type: gcp-types/compute-v1:healthChecks
+      properties:
+        name: $(app_name)-health-check
+        description: "Health check for zero-trust backend instances"
+        type: HTTP
+        httpHealthCheck:
+          port: 80
+          requestPath: "/health"
+          proxyHeader: NONE
+        checkIntervalSec: 30
+        timeoutSec: 10
+        healthyThreshold: 2
+        unhealthyThreshold: 3
+      metadata:
+        dependsOn:
+          - compute_api
+
+  # Instance group for backend
+  instance_group:
+    - name: backend_instance_group
+      type: gcp-types/compute-v1:instanceGroups
+      properties:
+        name: $(app_name)-ig
+        description: "Instance group for zero-trust backend"
+        zone: ${zone}
+        network: $(ref.zero_trust_vpc.selfLink)
+      metadata:
+        dependsOn:
+          - zero_trust_vpc
+          - backend_instance
+
+  # Add instance to group
+  instance_group_instances:
+    - name: add_instances_to_group
+      type: gcp-types/compute-v1:instanceGroups.addInstances
+      properties:
+        instanceGroup: $(ref.backend_instance_group.name)
+        zone: ${zone}
+        instances:
+          - instance: $(ref.backend_instance.selfLink)
+      metadata:
+        dependsOn:
+          - instance_group
+          - backend_instance
+
+  # Cloud Armor security policy
+  security_policy:
+    - name: zero_trust_armor_policy
+      type: gcp-types/compute-v1:securityPolicies
+      properties:
+        name: zero-trust-armor-policy
+        description: "Zero-trust security policy with comprehensive protection"
+        type: CLOUD_ARMOR
+        rules:
+          # Rate limiting rule
+          - priority: 1000
+            description: "Rate limiting - 100 requests per minute per IP"
+            match:
+              expr:
+                expression: "true"
+            action: "rate-based-ban"
+            rateLimitOptions:
+              rateLimitThreshold:
+                count: 100
+                intervalSec: 60
+              banDurationSec: 300
+              conformAction: "allow"
+              exceedAction: "deny-429"
+              enforceOnKey: "IP"
+          
+          # Geo-blocking rule (conditional)
+          - priority: 2000
+            description: "Block traffic from high-risk geographic regions"
+            match:
+              expr:
+                expression: |
+                  ${enable_geo_blocking ? 
+                    join(" || ", [for region in blocked_regions : "origin.region_code == '${region}'"]) : 
+                    "false"}
+            action: "deny-403"
+          
+          # XSS protection rule
+          - priority: 3000
+            description: "Block XSS attacks using OWASP rules"
+            match:
+              expr:
+                expression: "evaluatePreconfiguredExpr('xss-stable')"
+            action: "deny-403"
+          
+          # SQL injection protection
+          - priority: 3100
+            description: "Block SQL injection attacks"
+            match:
+              expr:
+                expression: "evaluatePreconfiguredExpr('sqli-stable')"
+            action: "deny-403"
+          
+          # Local file inclusion protection
+          - priority: 3200
+            description: "Block local file inclusion attacks"
+            match:
+              expr:
+                expression: "evaluatePreconfiguredExpr('lfi-stable')"
+            action: "deny-403"
+          
+          # Default allow rule
+          - priority: 2147483647
+            description: "Default allow rule"
+            match:
+              expr:
+                expression: "true"
+            action: "allow"
+        adaptiveProtectionConfig:
+          layer7DdosDefenseConfig:
+            enable: true
+      metadata:
+        dependsOn:
+          - compute_api
+
+  # Service Extension Cloud Run service
+  service_extension:
+    - name: service_extension_service
+      type: gcp-types/run-v1:namespaces.services
+      properties:
+        apiVersion: serving.knative.dev/v1
+        kind: Service
+        metadata:
+          name: $(app_name)-service-extension
+          namespace: ${project_id}
+          annotations:
+            run.googleapis.com/ingress: all
+            run.googleapis.com/launch-stage: BETA
+        spec:
+          template:
+            metadata:
+              annotations:
+                autoscaling.knative.dev/maxScale: "10"
+                run.googleapis.com/memory: "512Mi"
+                run.googleapis.com/cpu: "1"
+            spec:
+              containerConcurrency: 100
+              timeoutSeconds: 300
+              containers:
+                - image: gcr.io/cloudrun/hello # Placeholder - will be replaced with custom image
+                  ports:
+                    - containerPort: 8080
+                  env:
+                    - name: PROJECT_ID
+                      value: ${project_id}
+                  resources:
+                    limits:
+                      cpu: "1"
+                      memory: "512Mi"
+      metadata:
+        dependsOn:
+          - run_api
+
+  # Backend service with IAP enabled
+  backend_service:
+    - name: backend_service
+      type: gcp-types/compute-v1:backendServices
+      properties:
+        name: $(app_name)-backend-service
+        description: "Backend service with IAP and Cloud Armor protection"
+        protocol: HTTP
+        portName: "http"
+        healthChecks:
+          - $(ref.backend_health_check.selfLink)
+        securityPolicy: $(ref.security_policy.selfLink)
+        iap:
+          enabled: true
+          oauth2ClientSecret:
+            # OAuth client secret should be configured separately for production
+            secretName: "iap-secret"
+        backends:
+          - group: $(ref.instance_group.selfLink)
+            balancingMode: "UTILIZATION"
+            maxUtilization: 0.8
+            capacityScaler: 1.0
+        logConfig:
+          enable: true
+          sampleRate: 1.0
+      metadata:
+        dependsOn:
+          - health_check
+          - security_policy
+          - instance_group_instances
+
+  # SSL certificate
+  ssl_certificate:
+    - name: ssl_certificate
+      type: gcp-types/compute-v1:sslCertificates
+      properties:
+        name: $(app_name)-ssl-cert
+        description: "SSL certificate for zero-trust application"
+        managed:
+          domains:
+            - $(app_name).${domain_name}
+      metadata:
+        dependsOn:
+          - compute_api
+
+  # URL map
+  url_map:
+    - name: url_map
+      type: gcp-types/compute-v1:urlMaps
+      properties:
+        name: $(app_name)-url-map
+        description: "URL map for zero-trust application routing"
+        defaultService: $(ref.backend_service.selfLink)
+        hostRules:
+          - hosts:
+              - $(app_name).${domain_name}
+            pathMatcher: "main"
+        pathMatchers:
+          - name: "main"
+            defaultService: $(ref.backend_service.selfLink)
+            pathRules:
+              - paths:
+                  - "/health"
+                service: $(ref.backend_service.selfLink)
+              - paths:
+                  - "/*"
+                service: $(ref.backend_service.selfLink)
+      metadata:
+        dependsOn:
+          - backend_service
+
+  # HTTPS proxy
+  https_proxy:
+    - name: https_proxy
+      type: gcp-types/compute-v1:targetHttpsProxies
+      properties:
+        name: $(app_name)-https-proxy
+        description: "HTTPS proxy with SSL termination"
+        urlMap: $(ref.url_map.selfLink)
+        sslCertificates:
+          - $(ref.ssl_certificate.selfLink)
+        sslPolicy: null
+      metadata:
+        dependsOn:
+          - url_map
+          - ssl_certificate
+
+  # Global forwarding rule
+  forwarding_rule:
+    - name: forwarding_rule
+      type: gcp-types/compute-v1:globalForwardingRules
+      properties:
+        name: $(app_name)-forwarding-rule
+        description: "Global forwarding rule for HTTPS traffic"
+        target: $(ref.https_proxy.selfLink)
+        portRange: "443"
+        IPProtocol: TCP
+      metadata:
+        dependsOn:
+          - https_proxy
+
+  # Log sink for security events
+  security_log_sink:
+    - name: security_log_sink
+      type: gcp-types/logging-v2:projects.sinks
+      properties:
+        name: zero-trust-security-sink
+        description: "Security events from zero-trust infrastructure"
+        destination: storage.googleapis.com/${project_id}-security-logs
+        filter: |
+          protoPayload.serviceName="iap.googleapis.com" OR
+          protoPayload.serviceName="compute.googleapis.com" OR
+          resource.type="gce_instance" OR
+          resource.type="http_load_balancer" OR
+          resource.type="cloud_run_revision"
+        uniqueWriterIdentity: true
+      metadata:
+        dependsOn:
+          - logging_api
+
+# Outputs for verification and integration
+outputs:
+  - name: load_balancer_ip
+    description: "External IP address of the load balancer"
+    value: $(ref.forwarding_rule.IPAddress)
+  
+  - name: application_url
+    description: "HTTPS URL for the zero-trust application"
+    value: https://$(app_name).${domain_name}
+  
+  - name: backend_instance_internal_ip
+    description: "Internal IP address of the backend instance"
+    value: $(ref.backend_instance.networkInterfaces[0].networkIP)
+  
+  - name: security_policy_id
+    description: "Cloud Armor security policy ID"
+    value: $(ref.security_policy.id)
+  
+  - name: service_extension_url
+    description: "URL of the Service Extension Cloud Run service"
+    value: $(ref.service_extension_service.status.url)
+  
+  - name: vpc_network_name
+    description: "Name of the VPC network"
+    value: $(ref.zero_trust_vpc.name)
+  
+  - name: subnet_name
+    description: "Name of the subnet"
+    value: $(ref.zero_trust_subnet.name)
+  
+  - name: backend_service_account_email
+    description: "Email of the backend service account"
+    value: $(ref.backend_service_account.email)
+
+# Metadata for infrastructure management
+metadata:
+  version: "1.0"
+  description: "Zero-Trust Network Security with Service Extensions and Cloud Armor"
+  author: "Google Cloud Infrastructure Manager"
+  tags:
+    - "zero-trust"
+    - "security"
+    - "cloud-armor"
+    - "service-extensions"
+    - "identity-aware-proxy"
+  estimated_cost: "$50-100/month"
+  deployment_time: "15-30 minutes"

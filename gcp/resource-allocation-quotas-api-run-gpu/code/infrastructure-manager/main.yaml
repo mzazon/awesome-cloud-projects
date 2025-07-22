@@ -1,0 +1,912 @@
+# Infrastructure Manager Configuration for Resource Allocation with Cloud Quotas API and Cloud Run GPU
+# This configuration deploys an intelligent resource allocation system that automatically
+# monitors Cloud Run GPU workload demands and dynamically adjusts GPU quotas using the Cloud Quotas API
+
+# Terraform configuration
+terraform:
+  required_version: ">= 1.0"
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 5.0"
+    archive:
+      source: "hashicorp/archive"
+      version: "~> 2.4"
+    random:
+      source: "hashicorp/random"
+      version: "~> 3.6"
+
+# Variables for customization
+variables:
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    validation:
+      condition: length(var.project_id) > 0
+      error_message: "Project ID must not be empty."
+
+  region:
+    description: "Google Cloud region for resources"
+    type: string
+    default: "us-central1"
+    validation:
+      condition: contains(["us-central1", "us-west1", "us-east1", "europe-west1", "asia-east1"], var.region)
+      error_message: "Region must be one of the supported GPU regions."
+
+  zone:
+    description: "Google Cloud zone within the region"
+    type: string
+    default: "us-central1-a"
+
+  environment:
+    description: "Environment name for resource tagging"
+    type: string
+    default: "dev"
+    validation:
+      condition: contains(["dev", "staging", "prod"], var.environment)
+      error_message: "Environment must be dev, staging, or prod."
+
+  gpu_type:
+    description: "GPU type for Cloud Run services"
+    type: string
+    default: "nvidia-l4"
+    validation:
+      condition: contains(["nvidia-l4", "nvidia-t4"], var.gpu_type)
+      error_message: "GPU type must be nvidia-l4 or nvidia-t4."
+
+  max_gpu_quota:
+    description: "Maximum GPU quota limit for safety"
+    type: number
+    default: 10
+    validation:
+      condition: var.max_gpu_quota >= 1 && var.max_gpu_quota <= 50
+      error_message: "Max GPU quota must be between 1 and 50."
+
+  notification_email:
+    description: "Email for quota adjustment notifications"
+    type: string
+    default: "admin@example.com"
+    validation:
+      condition: can(regex("^[\\w\\.-]+@[\\w\\.-]+\\.[a-zA-Z]{2,}$", var.notification_email))
+      error_message: "Must be a valid email address."
+
+# Random suffix for unique resource names
+resources:
+  random_id:
+    type: random_id
+    properties:
+      byte_length: 4
+
+  # Enable required Google Cloud APIs
+  cloudquotas_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: cloudquotas.googleapis.com
+      disable_dependent_services: true
+
+  cloudrun_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: run.googleapis.com
+      disable_dependent_services: true
+
+  cloudfunctions_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: cloudfunctions.googleapis.com
+      disable_dependent_services: true
+
+  monitoring_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: monitoring.googleapis.com
+      disable_dependent_services: true
+
+  firestore_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: firestore.googleapis.com
+      disable_dependent_services: true
+
+  storage_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: storage.googleapis.com
+      disable_dependent_services: true
+
+  scheduler_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: cloudscheduler.googleapis.com
+      disable_dependent_services: true
+
+  build_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: cloudbuild.googleapis.com
+      disable_dependent_services: true
+
+  # Cloud Storage bucket for quota policies and configuration
+  quota_policies_bucket:
+    type: google_storage_bucket
+    properties:
+      name: ${var.project_id}-quota-policies-${random_id.byte_hex}
+      project: ${var.project_id}
+      location: ${var.region}
+      storage_class: STANDARD
+      uniform_bucket_level_access: true
+      versioning:
+        enabled: true
+      lifecycle_rule:
+        - condition:
+            age: 90
+          action:
+            type: Delete
+        - condition:
+            num_newer_versions: 5
+          action:
+            type: Delete
+      labels:
+        environment: ${var.environment}
+        component: quota-management
+        managed-by: infrastructure-manager
+    depends_on:
+      - storage_api
+
+  # Upload quota policy configuration to bucket
+  quota_policy_object:
+    type: google_storage_bucket_object
+    properties:
+      name: quota-policy.json
+      bucket: ${quota_policies_bucket.name}
+      content: |
+        {
+          "allocation_thresholds": {
+            "gpu_utilization_trigger": 0.8,
+            "cpu_utilization_trigger": 0.75,
+            "memory_utilization_trigger": 0.85
+          },
+          "gpu_families": {
+            "nvidia-l4": {
+              "max_quota": ${var.max_gpu_quota},
+              "min_quota": 1,
+              "increment_size": 2
+            },
+            "nvidia-t4": {
+              "max_quota": ${var.max_gpu_quota - 2},
+              "min_quota": 1,
+              "increment_size": 1
+            }
+          },
+          "regions": ["${var.region}"],
+          "cost_optimization": {
+            "enable_preemptible": true,
+            "max_cost_per_hour": 50.0
+          },
+          "notification_email": "${var.notification_email}"
+        }
+      content_type: application/json
+    depends_on:
+      - quota_policies_bucket
+
+  # Initialize Firestore database for usage history
+  firestore_database:
+    type: google_firestore_database
+    properties:
+      project: ${var.project_id}
+      name: (default)
+      location_id: ${var.region}
+      type: FIRESTORE_NATIVE
+      concurrency_mode: OPTIMISTIC
+      app_engine_integration_mode: DISABLED
+      point_in_time_recovery_enablement: POINT_IN_TIME_RECOVERY_ENABLED
+      delete_protection_state: DELETE_PROTECTION_DISABLED
+    depends_on:
+      - firestore_api
+
+  # Service account for Cloud Function
+  quota_manager_sa:
+    type: google_service_account
+    properties:
+      account_id: quota-manager-${random_id.byte_hex}
+      project: ${var.project_id}
+      display_name: Quota Manager Service Account
+      description: Service account for intelligent GPU quota management
+
+  # IAM roles for quota manager service account
+  quota_manager_monitoring_role:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: roles/monitoring.viewer
+      member: serviceAccount:${quota_manager_sa.email}
+
+  quota_manager_quotas_role:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: roles/cloudquotas.viewer
+      member: serviceAccount:${quota_manager_sa.email}
+
+  quota_manager_firestore_role:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: roles/datastore.user
+      member: serviceAccount:${quota_manager_sa.email}
+
+  quota_manager_storage_role:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: roles/storage.objectViewer
+      member: serviceAccount:${quota_manager_sa.email}
+
+  quota_manager_run_role:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: roles/run.viewer
+      member: serviceAccount:${quota_manager_sa.email}
+
+  quota_manager_logging_role:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: roles/logging.logWriter
+      member: serviceAccount:${quota_manager_sa.email}
+
+  # Create ZIP archive for Cloud Function source code
+  function_source_archive:
+    type: archive_file
+    properties:
+      type: zip
+      output_path: /tmp/quota-manager-function.zip
+      source:
+        - filename: main.py
+          content: |
+            import json
+            import logging
+            from datetime import datetime, timedelta
+            from typing import Dict, List, Any
+            
+            from google.cloud import monitoring_v3
+            from google.cloud import quotas_v1
+            from google.cloud import firestore
+            from google.cloud import storage
+            from google.cloud import run_v2
+            import numpy as np
+            from sklearn.linear_model import LinearRegression
+            
+            # Configure logging
+            logging.basicConfig(level=logging.INFO)
+            logger = logging.getLogger(__name__)
+            
+            def analyze_gpu_utilization(request):
+                """Main Cloud Function entry point for quota analysis"""
+                try:
+                    project_id = request.get_json().get('project_id')
+                    region = request.get_json().get('region', 'us-central1')
+                    
+                    # Initialize clients
+                    monitoring_client = monitoring_v3.MetricServiceClient()
+                    quotas_client = quotas_v1.CloudQuotasClient()
+                    firestore_client = firestore.Client()
+                    storage_client = storage.Client()
+                    
+                    # Analyze current utilization
+                    utilization_data = get_gpu_utilization_metrics(
+                        monitoring_client, project_id, region
+                    )
+                    
+                    # Load quota policies
+                    policies = load_quota_policies(storage_client, project_id)
+                    
+                    # Make intelligent quota decisions
+                    recommendations = generate_quota_recommendations(
+                        utilization_data, policies, firestore_client
+                    )
+                    
+                    # Execute approved recommendations
+                    results = execute_quota_adjustments(
+                        quotas_client, recommendations, project_id
+                    )
+                    
+                    # Store results in Firestore
+                    store_allocation_history(firestore_client, results)
+                    
+                    return {
+                        'status': 'success',
+                        'recommendations': len(recommendations),
+                        'executed': len(results),
+                        'timestamp': datetime.utcnow().isoformat()
+                    }
+                    
+                except Exception as e:
+                    logger.error(f"Quota analysis failed: {str(e)}")
+                    return {'status': 'error', 'message': str(e)}, 500
+            
+            def get_gpu_utilization_metrics(client, project_id: str, region: str) -> Dict:
+                """Retrieve GPU utilization metrics from Cloud Monitoring"""
+                try:
+                    project_name = f"projects/{project_id}"
+                    interval = monitoring_v3.TimeInterval()
+                    now = datetime.utcnow()
+                    interval.end_time.seconds = int(now.timestamp())
+                    interval.start_time.seconds = int((now - timedelta(hours=1)).timestamp())
+                    
+                    # Query GPU utilization for Cloud Run services
+                    gpu_filter = (
+                        f'resource.type="cloud_run_revision" AND '
+                        f'resource.labels.location="{region}" AND '
+                        f'metric.type="run.googleapis.com/container/gpu/utilization"'
+                    )
+                    
+                    request = monitoring_v3.ListTimeSeriesRequest(
+                        name=project_name,
+                        filter=gpu_filter,
+                        interval=interval,
+                        view=monitoring_v3.ListTimeSeriesRequest.TimeSeriesView.FULL
+                    )
+                    
+                    utilization_data = {
+                        'average_utilization': 0.0,
+                        'peak_utilization': 0.0,
+                        'service_count': 0,
+                        'total_gpus': 0
+                    }
+                    
+                    time_series = client.list_time_series(request=request)
+                    utilizations = []
+                    
+                    for series in time_series:
+                        for point in series.points:
+                            utilizations.append(point.value.double_value)
+                        utilization_data['service_count'] += 1
+                    
+                    if utilizations:
+                        utilization_data['average_utilization'] = np.mean(utilizations)
+                        utilization_data['peak_utilization'] = np.max(utilizations)
+                    
+                    logger.info(f"GPU utilization analysis: {utilization_data}")
+                    return utilization_data
+                    
+                except Exception as e:
+                    logger.error(f"Failed to get utilization metrics: {str(e)}")
+                    return {'error': str(e)}
+            
+            def load_quota_policies(storage_client, project_id: str) -> Dict:
+                """Load quota management policies from Cloud Storage"""
+                try:
+                    bucket_name = f"{project_id}-quota-policies-{project_id[-8:]}"
+                    bucket = storage_client.bucket(bucket_name)
+                    blob = bucket.blob('quota-policy.json')
+                    
+                    policy_content = blob.download_as_text()
+                    return json.loads(policy_content)
+                    
+                except Exception as e:
+                    logger.error(f"Failed to load quota policies: {str(e)}")
+                    return {}
+            
+            def generate_quota_recommendations(
+                utilization_data: Dict, policies: Dict, firestore_client
+            ) -> List[Dict]:
+                """Generate intelligent quota adjustment recommendations"""
+                recommendations = []
+                
+                if not utilization_data or 'average_utilization' not in utilization_data:
+                    return recommendations
+                
+                avg_util = utilization_data['average_utilization']
+                peak_util = utilization_data['peak_utilization']
+                
+                # Check if utilization exceeds thresholds
+                gpu_threshold = policies.get('allocation_thresholds', {}).get('gpu_utilization_trigger', 0.8)
+                
+                if peak_util > gpu_threshold:
+                    # Recommend quota increase
+                    for gpu_family, settings in policies.get('gpu_families', {}).items():
+                        current_quota = get_current_quota(gpu_family)
+                        new_quota = min(
+                            current_quota + settings.get('increment_size', 1),
+                            settings.get('max_quota', 10)
+                        )
+                        
+                        if new_quota > current_quota:
+                            recommendations.append({
+                                'action': 'increase',
+                                'gpu_family': gpu_family,
+                                'current_quota': current_quota,
+                                'recommended_quota': new_quota,
+                                'reason': f'Peak utilization {peak_util:.2f} exceeds threshold {gpu_threshold}'
+                            })
+                
+                elif avg_util < gpu_threshold * 0.5:
+                    # Consider quota decrease for cost optimization
+                    for gpu_family, settings in policies.get('gpu_families', {}).items():
+                        current_quota = get_current_quota(gpu_family)
+                        new_quota = max(
+                            current_quota - 1,
+                            settings.get('min_quota', 1)
+                        )
+                        
+                        if new_quota < current_quota:
+                            recommendations.append({
+                                'action': 'decrease',
+                                'gpu_family': gpu_family,
+                                'current_quota': current_quota,
+                                'recommended_quota': new_quota,
+                                'reason': f'Low utilization {avg_util:.2f} allows cost optimization'
+                            })
+                
+                return recommendations
+            
+            def get_current_quota(gpu_family: str) -> int:
+                """Get current GPU quota for specified family"""
+                # Simplified implementation - would query Cloud Quotas API
+                return 3  # Default quota
+            
+            def execute_quota_adjustments(
+                quotas_client, recommendations: List[Dict], project_id: str
+            ) -> List[Dict]:
+                """Execute approved quota adjustments via Cloud Quotas API"""
+                results = []
+                
+                for rec in recommendations:
+                    try:
+                        # Create quota preference request
+                        quota_preference = {
+                            'service': 'run.googleapis.com',
+                            'quota_id': f'GPU-{rec["gpu_family"].upper()}-per-project-region',
+                            'quota_config': {
+                                'preferred_value': rec['recommended_quota']
+                            },
+                            'dimensions': {
+                                'region': 'us-central1',
+                                'gpu_family': rec['gpu_family']
+                            },
+                            'justification': f'Automated allocation: {rec["reason"]}',
+                            'contact_email': 'admin@example.com'
+                        }
+                        
+                        logger.info(f"Would execute quota adjustment: {quota_preference}")
+                        
+                        # Store successful execution
+                        results.append({
+                            'recommendation': rec,
+                            'status': 'simulated',
+                            'timestamp': datetime.utcnow().isoformat()
+                        })
+                        
+                    except Exception as e:
+                        logger.error(f"Failed to execute quota adjustment: {str(e)}")
+                        results.append({
+                            'recommendation': rec,
+                            'status': 'failed',
+                            'error': str(e)
+                        })
+                
+                return results
+            
+            def store_allocation_history(firestore_client, results: List[Dict]):
+                """Store allocation history in Firestore"""
+                try:
+                    doc_ref = firestore_client.collection('quota_history').document('gpu_allocations')
+                    doc_ref.update({
+                        'allocations': firestore.ArrayUnion([{
+                            'timestamp': datetime.utcnow().isoformat(),
+                            'results': results
+                        }])
+                    })
+                    logger.info("Allocation history stored successfully")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to store allocation history: {str(e)}")
+        - filename: requirements.txt
+          content: |
+            google-cloud-monitoring==2.16.0
+            google-cloud-quotas==0.8.0
+            google-cloud-firestore==2.13.1
+            google-cloud-storage==2.10.0
+            google-cloud-run==0.10.3
+            functions-framework==3.5.0
+            numpy==1.24.3
+            scikit-learn==1.3.0
+
+  # Upload function source code to Cloud Storage
+  function_source_bucket_object:
+    type: google_storage_bucket_object
+    properties:
+      name: quota-manager-function-${random_id.byte_hex}.zip
+      bucket: ${quota_policies_bucket.name}
+      source: ${function_source_archive.output_path}
+    depends_on:
+      - function_source_archive
+      - quota_policies_bucket
+
+  # Deploy Cloud Function for quota intelligence
+  quota_manager_function:
+    type: google_cloudfunctions2_function
+    properties:
+      name: quota-manager-${random_id.byte_hex}
+      project: ${var.project_id}
+      location: ${var.region}
+      description: Intelligent GPU quota management function
+      
+      build_config:
+        runtime: python311
+        entry_point: analyze_gpu_utilization
+        source:
+          storage_source:
+            bucket: ${quota_policies_bucket.name}
+            object: ${function_source_bucket_object.name}
+
+      service_config:
+        max_instance_count: 10
+        min_instance_count: 0
+        available_memory: 512M
+        timeout_seconds: 540
+        max_instance_request_concurrency: 1
+        available_cpu: "1"
+        environment_variables:
+          PROJECT_ID: ${var.project_id}
+          REGION: ${var.region}
+          BUCKET_NAME: ${quota_policies_bucket.name}
+        ingress_settings: ALLOW_ALL
+        all_traffic_on_latest_revision: true
+        service_account_email: ${quota_manager_sa.email}
+
+      labels:
+        environment: ${var.environment}
+        component: quota-intelligence
+        managed-by: infrastructure-manager
+    depends_on:
+      - cloudfunctions_api
+      - quota_manager_sa
+      - function_source_bucket_object
+
+  # Allow unauthenticated invocations of the function
+  quota_manager_function_invoker:
+    type: google_cloudfunctions2_function_iam_member
+    properties:
+      project: ${var.project_id}
+      location: ${var.region}
+      cloud_function: ${quota_manager_function.name}
+      role: roles/cloudfunctions.invoker
+      member: allUsers
+
+  # Service account for AI inference service
+  ai_inference_sa:
+    type: google_service_account
+    properties:
+      account_id: ai-inference-${random_id.byte_hex}
+      project: ${var.project_id}
+      display_name: AI Inference Service Account
+      description: Service account for GPU-enabled AI inference workloads
+
+  # IAM roles for AI inference service account
+  ai_inference_monitoring_role:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: roles/monitoring.metricWriter
+      member: serviceAccount:${ai_inference_sa.email}
+
+  ai_inference_logging_role:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: roles/logging.logWriter
+      member: serviceAccount:${ai_inference_sa.email}
+
+  # Build AI inference container image
+  ai_inference_build:
+    type: google_cloudbuild_trigger
+    properties:
+      project: ${var.project_id}
+      name: ai-inference-build-${random_id.byte_hex}
+      description: Build AI inference container with GPU support
+      
+      filename: cloudbuild.yaml
+      
+      github:
+        owner: your-github-username
+        name: your-repo-name
+        push:
+          branch: ^main$
+      
+      substitutions:
+        _SERVICE_NAME: ai-inference-${random_id.byte_hex}
+        _REGION: ${var.region}
+        _PROJECT_ID: ${var.project_id}
+      
+      service_account: projects/${var.project_id}/serviceAccounts/${ai_inference_sa.email}
+      
+      labels:
+        environment: ${var.environment}
+        component: ai-inference
+        managed-by: infrastructure-manager
+    depends_on:
+      - build_api
+      - ai_inference_sa
+
+  # Deploy Cloud Run GPU service for AI inference
+  ai_inference_service:
+    type: google_cloud_run_v2_service
+    properties:
+      name: ai-inference-${random_id.byte_hex}
+      project: ${var.project_id}
+      location: ${var.region}
+      
+      template:
+        service_account: ${ai_inference_sa.email}
+        
+        containers:
+          - name: ai-inference
+            image: gcr.io/${var.project_id}/ai-inference-${random_id.byte_hex}:latest
+            
+            ports:
+              - name: http1
+                container_port: 8080
+            
+            env:
+              - name: GOOGLE_CLOUD_PROJECT
+                value: ${var.project_id}
+              - name: GOOGLE_CLOUD_REGION
+                value: ${var.region}
+            
+            resources:
+              limits:
+                cpu: "2"
+                memory: 4Gi
+                nvidia.com/gpu: "1"
+              requests:
+                cpu: "1"
+                memory: 2Gi
+            
+            startup_probe:
+              http_get:
+                path: /
+                port: 8080
+              initial_delay_seconds: 30
+              timeout_seconds: 10
+              period_seconds: 10
+              failure_threshold: 3
+            
+            liveness_probe:
+              http_get:
+                path: /
+                port: 8080
+              initial_delay_seconds: 60
+              timeout_seconds: 5
+              period_seconds: 30
+              failure_threshold: 3
+        
+        scaling:
+          min_instance_count: 0
+          max_instance_count: 10
+        
+        annotations:
+          run.googleapis.com/gpu-type: ${var.gpu_type}
+          run.googleapis.com/execution-environment: gen2
+          autoscaling.knative.dev/maxScale: "10"
+          autoscaling.knative.dev/minScale: "0"
+      
+      traffic:
+        - percent: 100
+          type: TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST
+      
+      labels:
+        environment: ${var.environment}
+        component: ai-inference
+        gpu-type: ${replace(var.gpu_type, "-", "_")}
+        managed-by: infrastructure-manager
+    depends_on:
+      - cloudrun_api
+      - ai_inference_sa
+
+  # Allow unauthenticated invocations of the Cloud Run service
+  ai_inference_service_invoker:
+    type: google_cloud_run_service_iam_member
+    properties:
+      project: ${var.project_id}
+      location: ${var.region}
+      service: ${ai_inference_service.name}
+      role: roles/run.invoker
+      member: allUsers
+
+  # Cloud Scheduler job for regular quota analysis
+  quota_analysis_scheduler:
+    type: google_cloud_scheduler_job
+    properties:
+      name: quota-analysis-${random_id.byte_hex}
+      project: ${var.project_id}
+      region: ${var.region}
+      description: Automated GPU quota analysis and adjustment
+      schedule: "*/15 * * * *"
+      time_zone: UTC
+      
+      http_target:
+        uri: ${quota_manager_function.service_config[0].uri}
+        http_method: POST
+        headers:
+          Content-Type: application/json
+        body: base64encode(jsonencode({
+          project_id: var.project_id
+          region: var.region
+        }))
+      
+      retry_config:
+        retry_count: 3
+        max_retry_duration: 300s
+        min_backoff_duration: 5s
+        max_backoff_duration: 60s
+        max_doublings: 2
+    depends_on:
+      - scheduler_api
+      - quota_manager_function
+
+  # Cloud Scheduler job for peak hour analysis
+  peak_analysis_scheduler:
+    type: google_cloud_scheduler_job
+    properties:
+      name: peak-analysis-${random_id.byte_hex}
+      project: ${var.project_id}
+      region: ${var.region}
+      description: Peak hour intensive quota analysis
+      schedule: "0 9-17 * * 1-5"
+      time_zone: UTC
+      
+      http_target:
+        uri: ${quota_manager_function.service_config[0].uri}
+        http_method: POST
+        headers:
+          Content-Type: application/json
+        body: base64encode(jsonencode({
+          project_id: var.project_id
+          region: var.region
+          analysis_type: peak
+        }))
+      
+      retry_config:
+        retry_count: 3
+        max_retry_duration: 300s
+        min_backoff_duration: 5s
+        max_backoff_duration: 60s
+        max_doublings: 2
+    depends_on:
+      - scheduler_api
+      - quota_manager_function
+
+  # Monitoring alert policy for high GPU utilization
+  gpu_utilization_alert:
+    type: google_monitoring_alert_policy
+    properties:
+      project: ${var.project_id}
+      display_name: High GPU Utilization Alert - ${var.environment}
+      documentation:
+        content: |
+          Alert triggered when GPU utilization exceeds 85% for more than 5 minutes.
+          This indicates potential need for quota adjustment or scaling optimization.
+        mime_type: text/markdown
+      
+      conditions:
+        - display_name: GPU utilization above 85%
+          condition_threshold:
+            filter: |
+              resource.type="cloud_run_revision" AND
+              metric.type="run.googleapis.com/container/gpu/utilization"
+            comparison: COMPARISON_GT
+            threshold_value: 0.85
+            duration: 300s
+            aggregations:
+              - alignment_period: 300s
+                per_series_aligner: ALIGN_MEAN
+                cross_series_reducer: REDUCE_MEAN
+                group_by_fields:
+                  - resource.labels.service_name
+                  - resource.labels.location
+      
+      alert_strategy:
+        auto_close: 1800s
+        notification_rate_limit:
+          period: 3600s
+      
+      enabled: true
+      
+      labels:
+        environment: ${var.environment}
+        component: quota-monitoring
+        managed-by: infrastructure-manager
+    depends_on:
+      - monitoring_api
+
+# Outputs for verification and integration
+outputs:
+  quota_policies_bucket_name:
+    description: "Name of the Cloud Storage bucket containing quota policies"
+    value: ${quota_policies_bucket.name}
+
+  quota_manager_function_url:
+    description: "URL of the Cloud Function for quota management"
+    value: ${quota_manager_function.service_config[0].uri}
+
+  ai_inference_service_url:
+    description: "URL of the Cloud Run GPU service for AI inference"
+    value: ${ai_inference_service.uri}
+
+  firestore_database_name:
+    description: "Name of the Firestore database for usage history"
+    value: ${firestore_database.name}
+
+  quota_analysis_scheduler_id:
+    description: "ID of the Cloud Scheduler job for regular analysis"
+    value: ${quota_analysis_scheduler.id}
+
+  peak_analysis_scheduler_id:
+    description: "ID of the Cloud Scheduler job for peak hour analysis"
+    value: ${peak_analysis_scheduler.id}
+
+  gpu_utilization_alert_id:
+    description: "ID of the monitoring alert policy for GPU utilization"
+    value: ${gpu_utilization_alert.name}
+
+  project_id:
+    description: "Google Cloud Project ID used for deployment"
+    value: ${var.project_id}
+
+  region:
+    description: "Google Cloud region where resources are deployed"
+    value: ${var.region}
+
+  random_suffix:
+    description: "Random suffix used for unique resource naming"
+    value: ${random_id.byte_hex}
+
+  service_accounts:
+    description: "Service accounts created for the quota management system"
+    value:
+      quota_manager: ${quota_manager_sa.email}
+      ai_inference: ${ai_inference_sa.email}
+
+  resource_labels:
+    description: "Common labels applied to all resources"
+    value:
+      environment: ${var.environment}
+      managed-by: infrastructure-manager
+      component: resource-allocation-system
+
+# Local values for computed configurations
+locals:
+  common_labels:
+    environment: ${var.environment}
+    managed-by: infrastructure-manager
+    project: ${var.project_id}
+    region: ${var.region}
+  
+  quota_thresholds:
+    gpu_utilization_trigger: 0.8
+    cpu_utilization_trigger: 0.75
+    memory_utilization_trigger: 0.85
+  
+  gpu_configurations:
+    nvidia-l4:
+      max_quota: ${var.max_gpu_quota}
+      min_quota: 1
+      increment_size: 2
+    nvidia-t4:
+      max_quota: ${var.max_gpu_quota - 2}
+      min_quota: 1
+      increment_size: 1

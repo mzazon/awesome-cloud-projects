@@ -1,0 +1,316 @@
+# CPU-intensive demo application with HPA
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cpu-demo
+  namespace: ${namespace}
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cpu-demo
+  template:
+    metadata:
+      labels:
+        app: cpu-demo
+    spec:
+      containers:
+      - name: cpu-demo
+        image: k8s.gcr.io/hpa-example
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cpu-demo-service
+  namespace: ${namespace}
+spec:
+  selector:
+    app: cpu-demo
+  ports:
+  - port: 80
+    targetPort: 80
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: cpu-demo-hpa
+  namespace: ${namespace}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: cpu-demo
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 50
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 60
+---
+# Memory-intensive demo application with HPA
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memory-demo
+  namespace: ${namespace}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: memory-demo
+  template:
+    metadata:
+      labels:
+        app: memory-demo
+    spec:
+      containers:
+      - name: memory-demo
+        image: nginx:1.21
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            cpu: 50m
+            memory: 256Mi
+          limits:
+            cpu: 200m
+            memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: memory-demo-service
+  namespace: ${namespace}
+spec:
+  selector:
+    app: memory-demo
+  ports:
+  - port: 80
+    targetPort: 80
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: memory-demo-hpa
+  namespace: ${namespace}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: memory-demo
+  minReplicas: 1
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+    scaleUp:
+      stabilizationWindowSeconds: 30
+---
+# Custom metrics demo application with KEDA ScaledObject
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: custom-metrics-demo
+  namespace: ${namespace}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: custom-metrics-demo
+  template:
+    metadata:
+      labels:
+        app: custom-metrics-demo
+    spec:
+      containers:
+      - name: custom-metrics-demo
+        image: nginx:1.21
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 300m
+            memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: custom-metrics-demo-service
+  namespace: ${namespace}
+spec:
+  selector:
+    app: custom-metrics-demo
+  ports:
+  - port: 80
+    targetPort: 80
+  type: ClusterIP
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: custom-metrics-scaler
+  namespace: ${namespace}
+spec:
+  scaleTargetRef:
+    name: custom-metrics-demo
+  minReplicaCount: 1
+  maxReplicaCount: 15
+  triggers:
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus-server.monitoring.svc.cluster.local:80
+      metricName: http_requests_per_second
+      threshold: '30'
+      query: rate(http_requests_total[1m])
+---
+# Load generator for testing autoscaling
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: load-generator
+  namespace: ${namespace}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: load-generator
+  template:
+    metadata:
+      labels:
+        app: load-generator
+    spec:
+      containers:
+      - name: load-generator
+        image: busybox:1.35
+        command:
+        - /bin/sh
+        - -c
+        - |
+          while true; do
+            echo "Starting load test..."
+            for i in $(seq 1 100); do
+              wget -q -O- http://cpu-demo-service.${namespace}.svc.cluster.local/ &
+              wget -q -O- http://memory-demo-service.${namespace}.svc.cluster.local/ &
+              wget -q -O- http://custom-metrics-demo-service.${namespace}.svc.cluster.local/ &
+            done
+            wait
+            echo "Load test completed, sleeping for 30 seconds..."
+            sleep 30
+          done
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+---
+# High resource consuming deployment for node scaling test
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node-scale-test
+  namespace: ${namespace}
+spec:
+  replicas: 0  # Start with 0 replicas, scale up manually to test
+  selector:
+    matchLabels:
+      app: node-scale-test
+  template:
+    metadata:
+      labels:
+        app: node-scale-test
+    spec:
+      containers:
+      - name: node-scale-test
+        image: nginx:1.21
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+---
+# ConfigMap for load testing scripts
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: load-test-scripts
+  namespace: ${namespace}
+data:
+  cpu-load.sh: |
+    #!/bin/bash
+    echo "Starting CPU load test..."
+    while true; do
+      for i in $(seq 1 50); do
+        wget -q -O- http://cpu-demo-service.${namespace}.svc.cluster.local/ &
+      done
+      wait
+      sleep 5
+    done
+  
+  memory-load.sh: |
+    #!/bin/bash
+    echo "Starting memory load test..."
+    while true; do
+      for i in $(seq 1 50); do
+        wget -q -O- http://memory-demo-service.${namespace}.svc.cluster.local/ &
+      done
+      wait
+      sleep 5
+    done
+  
+  custom-metrics-load.sh: |
+    #!/bin/bash
+    echo "Starting custom metrics load test..."
+    while true; do
+      for i in $(seq 1 100); do
+        wget -q -O- http://custom-metrics-demo-service.${namespace}.svc.cluster.local/ &
+      done
+      wait
+      sleep 1
+    done

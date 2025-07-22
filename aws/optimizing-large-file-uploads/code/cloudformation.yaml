@@ -1,0 +1,470 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure for Multi-Part Upload Strategies for Large Files with S3 - Creates S3 bucket with optimized configurations, lifecycle policies, and CloudWatch monitoring for efficient large file uploads'
+
+Parameters:
+  BucketNamePrefix:
+    Type: String
+    Default: 'multipart-upload-demo'
+    Description: 'Prefix for the S3 bucket name (will be suffixed with random string for uniqueness)'
+    AllowedPattern: '^[a-z0-9\-]*$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+    MinLength: 3
+    MaxLength: 50
+
+  IncompleteUploadCleanupDays:
+    Type: Number
+    Default: 7
+    Description: 'Number of days after which incomplete multipart uploads are automatically cleaned up'
+    MinValue: 1
+    MaxValue: 365
+    ConstraintDescription: 'Must be between 1 and 365 days'
+
+  EnableCloudWatchDashboard:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Whether to create CloudWatch dashboard for monitoring S3 metrics'
+
+  StorageClass:
+    Type: String
+    Default: 'STANDARD'
+    AllowedValues: 
+      - 'STANDARD'
+      - 'STANDARD_IA'
+      - 'ONEZONE_IA'
+      - 'REDUCED_REDUNDANCY'
+      - 'GLACIER'
+      - 'DEEP_ARCHIVE'
+      - 'INTELLIGENT_TIERING'
+    Description: 'Default storage class for uploaded objects'
+
+  EnableVersioning:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable versioning on the S3 bucket'
+
+  EnableServerSideEncryption:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable server-side encryption with S3 managed keys (SSE-S3)'
+
+  Environment:
+    Type: String
+    Default: 'demo'
+    AllowedValues: ['demo', 'dev', 'test', 'staging', 'prod']
+    Description: 'Environment designation for resource tagging'
+
+Conditions:
+  EnableDashboard: !Equals [!Ref EnableCloudWatchDashboard, 'true']
+  EnableBucketVersioning: !Equals [!Ref EnableVersioning, 'true']
+  EnableEncryption: !Equals [!Ref EnableServerSideEncryption, 'true']
+
+Resources:
+  # Random string for unique bucket naming
+  RandomStringLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: Purpose
+          Value: MultipartUploadDemo
+        - Key: Environment
+          Value: !Ref Environment
+
+  RandomStringFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-random-string-generator'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt RandomStringLambdaRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import random
+          import string
+          import cfnresponse
+          
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  length = int(event['ResourceProperties'].get('Length', 6))
+                  random_string = ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
+                  
+                  response_data = {'RandomString': random_string}
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+      Tags:
+        - Key: Purpose
+          Value: MultipartUploadDemo
+        - Key: Environment
+          Value: !Ref Environment
+
+  RandomString:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt RandomStringFunction.Arn
+      Length: 6
+
+  # S3 Bucket with multipart upload optimizations
+  MultipartUploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${BucketNamePrefix}-${RandomString.RandomString}'
+      BucketEncryption:
+        !If
+          - EnableEncryption
+          - ServerSideEncryptionConfiguration:
+              - ServerSideEncryptionByDefault:
+                  SSEAlgorithm: AES256
+                BucketKeyEnabled: true
+          - !Ref 'AWS::NoValue'
+      VersioningConfiguration:
+        !If
+          - EnableBucketVersioning
+          - Status: Enabled
+          - !Ref 'AWS::NoValue'
+      LifecycleConfiguration:
+        Rules:
+          # Clean up incomplete multipart uploads
+          - Id: CleanupIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: !Ref IncompleteUploadCleanupDays
+          # Optional: Transition to cheaper storage classes for large files
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              Days: 30
+              StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transition:
+              Days: 90
+              StorageClass: GLACIER
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3LogGroup
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Purpose
+          Value: MultipartUploadDemo
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: MultipartOptimized
+          Value: 'true'
+
+  # CloudWatch Log Group for S3 events
+  S3LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${BucketNamePrefix}-${RandomString.RandomString}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Purpose
+          Value: MultipartUploadDemo
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Dashboard for monitoring
+  MultipartUploadDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableDashboard
+    Properties:
+      DashboardName: !Sub 'S3-MultipartUpload-${AWS::StackName}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/S3", "NumberOfObjects", "BucketName", "${MultipartUploadBucket}", "StorageType", "AllStorageTypes"],
+                  [".", "BucketSizeBytes", ".", ".", ".", "StandardStorage"]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "S3 Bucket Metrics - Object Count and Size",
+                "period": 300,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/S3", "AllRequests", "BucketName", "${MultipartUploadBucket}"],
+                  [".", "GetRequests", ".", "."],
+                  [".", "PutRequests", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "S3 Request Metrics",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/S3", "4xxErrors", "BucketName", "${MultipartUploadBucket}"],
+                  [".", "5xxErrors", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "S3 Error Metrics",
+                "period": 300,
+                "stat": "Sum"
+              }
+            }
+          ]
+        }
+
+  # IAM Role for multipart upload operations
+  MultipartUploadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-multipart-upload-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - ec2.amazonaws.com
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Sub '${AWS::StackName}-external-id'
+      Policies:
+        - PolicyName: S3MultipartUploadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Permissions for multipart upload operations
+              - Effect: Allow
+                Action:
+                  - s3:CreateMultipartUpload
+                  - s3:UploadPart
+                  - s3:UploadPartCopy
+                  - s3:CompleteMultipartUpload
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploads
+                  - s3:ListParts
+                Resource: 
+                  - !Sub '${MultipartUploadBucket}/*'
+              # Permissions for bucket operations
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:GetBucketVersioning
+                  - s3:GetBucketNotification
+                Resource: !GetAtt MultipartUploadBucket.Arn
+              # Permissions for object operations
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:GetObjectAttributes
+                Resource: !Sub '${MultipartUploadBucket}/*'
+              # CloudWatch permissions for monitoring
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                Resource: '*'
+      Tags:
+        - Key: Purpose
+          Value: MultipartUploadDemo
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Instance Profile for EC2 instances
+  MultipartUploadInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-instance-profile'
+      Roles:
+        - !Ref MultipartUploadRole
+
+  # CloudWatch Alarm for failed uploads
+  FailedUploadAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-failed-uploads'
+      AlarmDescription: 'Alarm for high number of S3 4xx/5xx errors indicating failed uploads'
+      MetricName: 4xxErrors
+      Namespace: AWS/S3
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: BucketName
+          Value: !Ref MultipartUploadBucket
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Purpose
+          Value: MultipartUploadDemo
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Topic for notifications (optional)
+  UploadNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-upload-notifications'
+      DisplayName: 'S3 Multipart Upload Notifications'
+      Tags:
+        - Key: Purpose
+          Value: MultipartUploadDemo
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  BucketName:
+    Description: 'Name of the S3 bucket created for multipart uploads'
+    Value: !Ref MultipartUploadBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketName'
+
+  BucketArn:
+    Description: 'ARN of the S3 bucket'
+    Value: !GetAtt MultipartUploadBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketArn'
+
+  BucketDomainName:
+    Description: 'Domain name of the S3 bucket'
+    Value: !GetAtt MultipartUploadBucket.DomainName
+
+  BucketRegionalDomainName:
+    Description: 'Regional domain name of the S3 bucket'
+    Value: !GetAtt MultipartUploadBucket.RegionalDomainName
+
+  IAMRoleArn:
+    Description: 'ARN of the IAM role for multipart upload operations'
+    Value: !GetAtt MultipartUploadRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IAMRoleArn'
+
+  InstanceProfileArn:
+    Description: 'ARN of the instance profile for EC2 instances'
+    Value: !GetAtt MultipartUploadInstanceProfile.Arn
+
+  CloudWatchDashboardURL:
+    Condition: EnableDashboard
+    Description: 'URL to the CloudWatch dashboard for monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${MultipartUploadDashboard}'
+
+  LogGroupName:
+    Description: 'CloudWatch Log Group for S3 events'
+    Value: !Ref S3LogGroup
+
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for upload notifications'
+    Value: !Ref UploadNotificationTopic
+
+  UploadCommandExample:
+    Description: 'Example AWS CLI command for multipart upload with optimal settings'
+    Value: !Sub |
+      aws configure set default.s3.multipart_threshold 100MB &&
+      aws configure set default.s3.multipart_chunksize 100MB &&
+      aws configure set default.s3.max_concurrent_requests 10 &&
+      aws s3 cp large-file.bin s3://${MultipartUploadBucket}/ --storage-class ${StorageClass}
+
+  TestUploadCommand:
+    Description: 'Command to test multipart upload functionality'
+    Value: !Sub |
+      # Create test file: dd if=/dev/urandom of=test-file.bin bs=1048576 count=1024
+      # Upload: aws s3 cp test-file.bin s3://${MultipartUploadBucket}/
+      # Verify: aws s3api head-object --bucket ${MultipartUploadBucket} --key test-file.bin
+
+  CleanupCommand:
+    Description: 'Command to clean up bucket contents before stack deletion'
+    Value: !Sub 'aws s3 rm s3://${MultipartUploadBucket}/ --recursive'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Bucket Configuration"
+        Parameters:
+          - BucketNamePrefix
+          - StorageClass
+          - EnableVersioning
+          - EnableServerSideEncryption
+      - Label:
+          default: "Lifecycle Management"
+        Parameters:
+          - IncompleteUploadCleanupDays
+      - Label:
+          default: "Monitoring"
+        Parameters:
+          - EnableCloudWatchDashboard
+      - Label:
+          default: "Environment"
+        Parameters:
+          - Environment
+    ParameterLabels:
+      BucketNamePrefix:
+        default: "S3 Bucket Name Prefix"
+      IncompleteUploadCleanupDays:
+        default: "Cleanup Days for Incomplete Uploads"
+      EnableCloudWatchDashboard:
+        default: "Enable CloudWatch Dashboard"
+      StorageClass:
+        default: "Default Storage Class"
+      EnableVersioning:
+        default: "Enable Bucket Versioning"
+      EnableServerSideEncryption:
+        default: "Enable Server-Side Encryption"
+      Environment:
+        default: "Environment Tag"

@@ -1,0 +1,629 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Comprehensive AWS Backup solution with automated backup plans, cross-region replication,
+  monitoring, and compliance features. This template creates a centralized backup infrastructure
+  that protects AWS resources using policy-based automation with CloudWatch monitoring and SNS alerting.
+  Based on the "Automated Backup Solutions with AWS Backup" recipe.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Basic Configuration"
+        Parameters:
+          - BackupPlanName
+          - BackupVaultName
+          - Environment
+      - Label:
+          default: "Backup Schedule Configuration"
+        Parameters:
+          - DailyBackupTime
+          - WeeklyBackupDay
+          - DailyRetentionDays
+          - WeeklyRetentionDays
+      - Label:
+          default: "Cross-Region Disaster Recovery"
+        Parameters:
+          - EnableCrossRegionBackup
+          - DisasterRecoveryRegion
+      - Label:
+          default: "Monitoring and Alerting"
+        Parameters:
+          - NotificationEmail
+          - BackupStorageThresholdGB
+          - EnableCloudWatchAlarms
+          - EnableConfigCompliance
+      - Label:
+          default: "Security and Compliance"
+        Parameters:
+          - EnableVaultLock
+          - VaultLockMode
+          - MinRetentionDays
+
+Parameters:
+  BackupPlanName:
+    Type: String
+    Default: enterprise-backup-plan
+    Description: Name for the AWS Backup plan
+    MinLength: 1
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z0-9\-_]+$'
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, and underscores
+
+  BackupVaultName:
+    Type: String
+    Default: enterprise-backup-vault
+    Description: Name for the primary backup vault
+    MinLength: 1
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z0-9\-_]+$'
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, and underscores
+
+  Environment:
+    Type: String
+    Default: Production
+    Description: Environment tag value for resource selection
+    AllowedValues:
+      - Production
+      - Staging
+      - Development
+      - Test
+
+  DailyBackupTime:
+    Type: String
+    Default: '02:00'
+    Description: Daily backup start time in UTC (HH:MM format)
+    AllowedPattern: '^([01]?[0-9]|2[0-3]):[0-5][0-9]$'
+    ConstraintDescription: Must be in HH:MM format (24-hour)
+
+  WeeklyBackupDay:
+    Type: String
+    Default: SUN
+    Description: Day of the week for weekly backups
+    AllowedValues:
+      - SUN
+      - MON
+      - TUE
+      - WED
+      - THU
+      - FRI
+      - SAT
+
+  DailyRetentionDays:
+    Type: Number
+    Default: 30
+    Description: Number of days to retain daily backups
+    MinValue: 1
+    MaxValue: 100
+
+  WeeklyRetentionDays:
+    Type: Number
+    Default: 90
+    Description: Number of days to retain weekly backups
+    MinValue: 7
+    MaxValue: 365
+
+  EnableCrossRegionBackup:
+    Type: String
+    Default: 'true'
+    Description: Enable cross-region backup replication for disaster recovery
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  DisasterRecoveryRegion:
+    Type: String
+    Default: us-east-1
+    Description: AWS region for disaster recovery backup replication
+    AllowedValues:
+      - us-east-1
+      - us-east-2
+      - us-west-1
+      - us-west-2
+      - eu-west-1
+      - eu-west-2
+      - eu-central-1
+      - ap-southeast-1
+      - ap-southeast-2
+      - ap-northeast-1
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for backup notifications and alerts
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+
+  BackupStorageThresholdGB:
+    Type: Number
+    Default: 100
+    Description: Storage threshold in GB for CloudWatch alarm
+    MinValue: 1
+    MaxValue: 10000
+
+  EnableCloudWatchAlarms:
+    Type: String
+    Default: 'true'
+    Description: Enable CloudWatch alarms for backup monitoring
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableConfigCompliance:
+    Type: String
+    Default: 'true'
+    Description: Enable AWS Config rules for backup compliance monitoring
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableVaultLock:
+    Type: String
+    Default: 'false'
+    Description: Enable backup vault lock for compliance and ransomware protection
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  VaultLockMode:
+    Type: String
+    Default: Compliance
+    Description: Vault lock mode for immutable backups
+    AllowedValues:
+      - Compliance
+      - Governance
+
+  MinRetentionDays:
+    Type: Number
+    Default: 7
+    Description: Minimum retention period for vault lock (days)
+    MinValue: 1
+    MaxValue: 36500
+
+Conditions:
+  EnableCrossRegion: !Equals [!Ref EnableCrossRegionBackup, 'true']
+  EnableVaultLockFeature: !Equals [!Ref EnableVaultLock, 'true']
+  CreateCloudWatchAlarms: !Equals [!Ref EnableCloudWatchAlarms, 'true']
+  CreateConfigCompliance: !Equals [!Ref EnableConfigCompliance, 'true']
+  IsNotCurrentRegion: !Not [!Equals [!Ref DisasterRecoveryRegion, !Ref 'AWS::Region']]
+
+Resources:
+  # SNS Topic for Backup Notifications
+  BackupNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${BackupPlanName}-notifications'
+      DisplayName: AWS Backup Notifications
+      KmsMasterKeyId: alias/aws/sns
+
+  BackupNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref BackupNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # IAM Service Role for AWS Backup
+  BackupServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'AWSBackupServiceRole-${BackupPlanName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: backup.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores
+        - arn:aws:iam::aws:policy/AWSBackupServiceRolePolicyForS3Backup
+        - arn:aws:iam::aws:policy/AWSBackupServiceRolePolicyForS3Restore
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: AWS Backup Service Role
+
+  # Primary Backup Vault
+  PrimaryBackupVault:
+    Type: AWS::Backup::BackupVault
+    Properties:
+      BackupVaultName: !Ref BackupVaultName
+      EncryptionKeyArn: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/backup'
+      Notifications:
+        BackupVaultName: !Ref BackupVaultName
+        SNSTopicArn: !Ref BackupNotificationTopic
+        BackupVaultEvents:
+          - BACKUP_JOB_STARTED
+          - BACKUP_JOB_COMPLETED
+          - BACKUP_JOB_FAILED
+          - RESTORE_JOB_STARTED
+          - RESTORE_JOB_COMPLETED
+          - RESTORE_JOB_FAILED
+          - COPY_JOB_STARTED
+          - COPY_JOB_SUCCESSFUL
+          - COPY_JOB_FAILED
+          - RECOVERY_POINT_MODIFIED
+      AccessPolicy: !If
+        - EnableVaultLockFeature
+        - !Sub |
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "DenyDeleteBackupVault",
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": [
+                  "backup:DeleteBackupVault",
+                  "backup:DeleteRecoveryPoint",
+                  "backup:UpdateRecoveryPointLifecycle"
+                ],
+                "Resource": "*",
+                "Condition": {
+                  "StringNotEquals": {
+                    "aws:userid": ["${AWS::AccountId}:root"]
+                  }
+                }
+              }
+            ]
+          }
+        - !Ref 'AWS::NoValue'
+
+  # Backup Vault Lock (if enabled)
+  BackupVaultLock:
+    Type: AWS::Backup::BackupVaultLockConfiguration
+    Condition: EnableVaultLockFeature
+    Properties:
+      BackupVaultName: !Ref PrimaryBackupVault
+      MinRetentionDays: !Ref MinRetentionDays
+      MaxRetentionDays: !Ref WeeklyRetentionDays
+      ChangeableForDays: 3
+
+  # Disaster Recovery Backup Vault (in different region)
+  DRBackupVault:
+    Type: AWS::Backup::BackupVault
+    Condition: EnableCrossRegion
+    Properties:
+      BackupVaultName: !Sub '${BackupVaultName}-dr'
+      EncryptionKeyArn: !Sub 'arn:aws:kms:${DisasterRecoveryRegion}:${AWS::AccountId}:alias/aws/backup'
+
+  # Backup Plan with Daily and Weekly Rules
+  EnterpriseBackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Properties:
+      BackupPlan:
+        BackupPlanName: !Ref BackupPlanName
+        BackupPlanRule:
+          # Daily Backup Rule
+          - RuleName: DailyBackups
+            TargetBackupVault: !Ref PrimaryBackupVault
+            ScheduleExpression: !Sub 'cron(0 ${DailyBackupTime} ? * * *)'
+            StartWindowMinutes: 60
+            CompletionWindowMinutes: 120
+            Lifecycle:
+              DeleteAfterDays: !Ref DailyRetentionDays
+            RecoveryPointTags:
+              BackupType: Daily
+              Environment: !Ref Environment
+              CreatedBy: CloudFormation
+            CopyActions: !If
+              - EnableCrossRegion
+              - - DestinationBackupVaultArn: !Sub 'arn:aws:backup:${DisasterRecoveryRegion}:${AWS::AccountId}:backup-vault:${BackupVaultName}-dr'
+                  Lifecycle:
+                    DeleteAfterDays: !Ref DailyRetentionDays
+              - !Ref 'AWS::NoValue'
+          # Weekly Backup Rule
+          - RuleName: WeeklyBackups
+            TargetBackupVault: !Ref PrimaryBackupVault
+            ScheduleExpression: !Sub 'cron(0 3 ? * ${WeeklyBackupDay} *)'
+            StartWindowMinutes: 60
+            CompletionWindowMinutes: 240
+            Lifecycle:
+              DeleteAfterDays: !Ref WeeklyRetentionDays
+            RecoveryPointTags:
+              BackupType: Weekly
+              Environment: !Ref Environment
+              CreatedBy: CloudFormation
+            CopyActions: !If
+              - EnableCrossRegion
+              - - DestinationBackupVaultArn: !Sub 'arn:aws:backup:${DisasterRecoveryRegion}:${AWS::AccountId}:backup-vault:${BackupVaultName}-dr'
+                  Lifecycle:
+                    DeleteAfterDays: !Ref WeeklyRetentionDays
+              - !Ref 'AWS::NoValue'
+
+  # Backup Selection for Production Resources
+  BackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Properties:
+      BackupPlanId: !Ref EnterpriseBackupPlan
+      BackupSelection:
+        SelectionName: ProductionResources
+        IamRoleArn: !GetAtt BackupServiceRole.Arn
+        Resources:
+          - '*'
+        Conditions:
+          StringEquals:
+            'aws:ResourceTag/Environment':
+              - !Ref Environment
+        NotResources: []
+
+  # CloudWatch Alarms for Monitoring
+  BackupJobFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${BackupPlanName}-Job-Failures'
+      AlarmDescription: Alert when backup jobs fail
+      MetricName: NumberOfBackupJobsFailed
+      Namespace: AWS/Backup
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref BackupNotificationTopic
+      TreatMissingData: notBreaching
+
+  BackupStorageUsageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${BackupPlanName}-Storage-Usage'
+      AlarmDescription: Alert when backup storage exceeds threshold
+      MetricName: BackupVaultSizeBytes
+      Namespace: AWS/Backup
+      Statistic: Average
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: !Ref BackupStorageThresholdGB
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref BackupNotificationTopic
+      Dimensions:
+        - Name: BackupVaultName
+          Value: !Ref PrimaryBackupVault
+
+  BackupJobSuccessRate:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${BackupPlanName}-Success-Rate'
+      AlarmDescription: Alert when backup job success rate drops below 95%
+      MetricName: NumberOfBackupJobsCompleted
+      Namespace: AWS/Backup
+      Statistic: Sum
+      Period: 86400  # 24 hours
+      EvaluationPeriods: 1
+      Threshold: 0.95
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref BackupNotificationTopic
+      TreatMissingData: notBreaching
+
+  # Config Rule for Backup Compliance (if Config is enabled)
+  BackupComplianceConfigRule:
+    Type: AWS::Config::ConfigRule
+    Condition: CreateConfigCompliance
+    Properties:
+      ConfigRuleName: backup-plan-min-frequency-and-min-retention-check
+      Description: Checks whether a backup plan has a backup rule that satisfies the required frequency and retention period
+      Source:
+        Owner: AWS
+        SourceIdentifier: BACKUP_PLAN_MIN_FREQUENCY_AND_MIN_RETENTION_CHECK
+      InputParameters: !Sub |
+        {
+          "requiredFrequencyValue": "1",
+          "requiredRetentionDays": "${DailyRetentionDays}",
+          "requiredFrequencyUnit": "days"
+        }
+      DependsOn: EnterpriseBackupPlan
+
+  # S3 Bucket for Backup Reports
+  BackupReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'aws-backup-reports-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldReports
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 30
+
+  # Backup Reports Plan
+  BackupReportPlan:
+    Type: AWS::Backup::ReportPlan
+    Properties:
+      ReportPlanName: !Sub '${BackupPlanName}-compliance-report'
+      ReportPlanDescription: Monthly backup compliance and job status report
+      ReportDeliveryChannel:
+        S3BucketName: !Ref BackupReportsBucket
+        S3KeyPrefix: backup-reports/
+        Formats:
+          - CSV
+          - JSON
+      ReportSetting:
+        ReportTemplate: BACKUP_JOB_REPORT
+        Accounts:
+          - !Ref 'AWS::AccountId'
+        OrganizationUnits: []
+        Regions:
+          - !Ref 'AWS::Region'
+
+  # Custom CloudWatch Dashboard for Backup Monitoring
+  BackupDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      DashboardName: !Sub '${BackupPlanName}-Dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Backup", "NumberOfBackupJobsCompleted"],
+                  [".", "NumberOfBackupJobsFailed"],
+                  [".", "NumberOfBackupJobsCreated"]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Backup Jobs Status",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Backup", "BackupVaultSizeBytes", "BackupVaultName", "${BackupVaultName}"]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Backup Vault Storage Usage",
+                "period": 3600
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Backup", "NumberOfCopyJobsCompleted"],
+                  [".", "NumberOfCopyJobsFailed"]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Cross-Region Copy Jobs",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Backup", "NumberOfRestoreJobsCompleted"],
+                  [".", "NumberOfRestoreJobsFailed"]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Restore Jobs Status",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+Outputs:
+  BackupPlanId:
+    Description: ID of the created backup plan
+    Value: !Ref EnterpriseBackupPlan
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupPlanId'
+
+  BackupPlanArn:
+    Description: ARN of the created backup plan
+    Value: !GetAtt EnterpriseBackupPlan.BackupPlanArn
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupPlanArn'
+
+  PrimaryBackupVaultName:
+    Description: Name of the primary backup vault
+    Value: !Ref PrimaryBackupVault
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryBackupVaultName'
+
+  PrimaryBackupVaultArn:
+    Description: ARN of the primary backup vault
+    Value: !GetAtt PrimaryBackupVault.BackupVaultArn
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryBackupVaultArn'
+
+  DRBackupVaultName:
+    Condition: EnableCrossRegion
+    Description: Name of the disaster recovery backup vault
+    Value: !Ref DRBackupVault
+    Export:
+      Name: !Sub '${AWS::StackName}-DRBackupVaultName'
+
+  BackupServiceRoleArn:
+    Description: ARN of the backup service role
+    Value: !GetAtt BackupServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupServiceRoleArn'
+
+  SNSTopicArn:
+    Description: ARN of the SNS topic for notifications
+    Value: !Ref BackupNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  BackupReportsBucketName:
+    Description: Name of the S3 bucket for backup reports
+    Value: !Ref BackupReportsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupReportsBucketName'
+
+  DashboardURL:
+    Condition: CreateCloudWatchAlarms
+    Description: URL to the CloudWatch dashboard for backup monitoring
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${BackupPlanName}-Dashboard'
+
+  BackupSelectionId:
+    Description: ID of the backup selection
+    Value: !Ref BackupSelection
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupSelectionId'
+
+  ComplianceConfigRule:
+    Condition: CreateConfigCompliance
+    Description: Name of the Config rule for backup compliance
+    Value: !Ref BackupComplianceConfigRule
+    Export:
+      Name: !Sub '${AWS::StackName}-ComplianceConfigRule'
+
+  CrossRegionReplicationStatus:
+    Description: Status of cross-region backup replication
+    Value: !If [EnableCrossRegion, 'Enabled', 'Disabled']
+
+  VaultLockStatus:
+    Description: Status of backup vault lock feature
+    Value: !If [EnableVaultLockFeature, 'Enabled', 'Disabled']
+
+  ResourceTaggingGuidance:
+    Description: Tag resources to include them in automatic backups
+    Value: !Sub 'Tag your resources with Environment=${Environment} to include them in automatic backups'

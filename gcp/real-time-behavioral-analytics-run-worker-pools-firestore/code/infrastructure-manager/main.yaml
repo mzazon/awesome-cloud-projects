@@ -1,0 +1,455 @@
+# Infrastructure Manager Configuration for Real-Time Behavioral Analytics
+# This template deploys a complete behavioral analytics system using:
+# - Cloud Run Worker Pools for event processing
+# - Cloud Firestore for real-time analytics storage
+# - Pub/Sub for reliable event ingestion
+# - Cloud Monitoring for observability
+
+metadata:
+  version: 1.0
+  description: "Real-time behavioral analytics system with Cloud Run Worker Pools and Firestore"
+  author: "Recipe Generator v1.3"
+
+# Input variables for customization
+variable:
+  project_id:
+    type: string
+    description: "Google Cloud project ID"
+    required: true
+  
+  region:
+    type: string
+    description: "Google Cloud region for resource deployment"
+    default: "us-central1"
+  
+  random_suffix:
+    type: string
+    description: "Random suffix for unique resource naming"
+    default: "${random.hex.value}"
+  
+  container_image:
+    type: string
+    description: "Container image URI for the behavioral analytics processor"
+    required: true
+  
+  min_instances:
+    type: number
+    description: "Minimum number of worker pool instances"
+    default: 1
+  
+  max_instances:
+    type: number
+    description: "Maximum number of worker pool instances"
+    default: 10
+  
+  memory_limit:
+    type: string
+    description: "Memory limit for worker pool containers"
+    default: "1Gi"
+  
+  cpu_limit:
+    type: string
+    description: "CPU limit for worker pool containers"
+    default: "1"
+
+# Random hex generator for unique resource naming
+resource:
+  random_hex:
+    type: random:random_id
+    properties:
+      byte_length: 3
+
+  # Enable required Google Cloud APIs
+  enable_run_api:
+    type: gcp:projects:Service
+    properties:
+      project: ${var.project_id}
+      service: run.googleapis.com
+
+  enable_firestore_api:
+    type: gcp:projects:Service
+    properties:
+      project: ${var.project_id}
+      service: firestore.googleapis.com
+
+  enable_pubsub_api:
+    type: gcp:projects:Service
+    properties:
+      project: ${var.project_id}
+      service: pubsub.googleapis.com
+
+  enable_monitoring_api:
+    type: gcp:projects:Service
+    properties:
+      project: ${var.project_id}
+      service: monitoring.googleapis.com
+
+  enable_cloudbuild_api:
+    type: gcp:projects:Service
+    properties:
+      project: ${var.project_id}
+      service: cloudbuild.googleapis.com
+
+  # Firestore database for behavioral analytics storage
+  behavioral_analytics_database:
+    type: gcp:firestore:Database
+    properties:
+      project: ${var.project_id}
+      name: behavioral-analytics
+      locationId: ${var.region}
+      type: FIRESTORE_NATIVE
+      deleteProtectionState: DELETE_PROTECTION_DISABLED
+    depends_on:
+      - ${resource.enable_firestore_api}
+
+  # Pub/Sub topic for user event ingestion
+  user_events_topic:
+    type: gcp:pubsub:Topic
+    properties:
+      project: ${var.project_id}
+      name: user-events-${var.random_suffix}
+      messageRetentionDuration: 604800s  # 7 days
+      messageStoragePolicy:
+        allowedPersistenceRegions:
+          - ${var.region}
+    depends_on:
+      - ${resource.enable_pubsub_api}
+
+  # Pub/Sub subscription for worker pool consumption
+  analytics_processor_subscription:
+    type: gcp:pubsub:Subscription
+    properties:
+      project: ${var.project_id}
+      name: analytics-processor-${var.random_suffix}
+      topic: ${resource.user_events_topic.name}
+      ackDeadlineSeconds: 60
+      messageRetentionDuration: 604800s  # 7 days
+      enableMessageOrdering: true
+      expirationPolicy:
+        ttl: 2678400s  # 31 days
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 300s
+    depends_on:
+      - ${resource.user_events_topic}
+
+  # Service account for the behavioral analytics processor
+  analytics_processor_service_account:
+    type: gcp:serviceaccount:Account
+    properties:
+      project: ${var.project_id}
+      accountId: analytics-processor-${var.random_suffix}
+      displayName: "Behavioral Analytics Processor"
+      description: "Service account for Cloud Run worker pool processing behavioral events"
+
+  # IAM binding for Pub/Sub subscriber role
+  pubsub_subscriber_binding:
+    type: gcp:projects:IAMMember
+    properties:
+      project: ${var.project_id}
+      role: roles/pubsub.subscriber
+      member: serviceAccount:${resource.analytics_processor_service_account.email}
+    depends_on:
+      - ${resource.analytics_processor_service_account}
+
+  # IAM binding for Firestore user role
+  firestore_user_binding:
+    type: gcp:projects:IAMMember
+    properties:
+      project: ${var.project_id}
+      role: roles/datastore.user
+      member: serviceAccount:${resource.analytics_processor_service_account.email}
+    depends_on:
+      - ${resource.analytics_processor_service_account}
+
+  # IAM binding for Cloud Monitoring metric writer role
+  monitoring_writer_binding:
+    type: gcp:projects:IAMMember
+    properties:
+      project: ${var.project_id}
+      role: roles/monitoring.metricWriter
+      member: serviceAccount:${resource.analytics_processor_service_account.email}
+    depends_on:
+      - ${resource.analytics_processor_service_account}
+
+  # Artifact Registry repository for container images
+  behavioral_analytics_repository:
+    type: gcp:artifactregistry:Repository
+    properties:
+      project: ${var.project_id}
+      location: ${var.region}
+      repositoryId: behavioral-analytics
+      description: "Container images for behavioral analytics system"
+      format: DOCKER
+      dockerConfig:
+        immutableTags: false
+
+  # Cloud Run Worker Pool for background event processing
+  behavioral_processor_worker_pool:
+    type: gcp:cloudrunv2:Job
+    properties:
+      project: ${var.project_id}
+      name: behavioral-processor-${var.random_suffix}
+      location: ${var.region}
+      template:
+        parallelism: 1
+        taskCount: 1
+        template:
+          serviceAccount: ${resource.analytics_processor_service_account.email}
+          maxRetries: 3
+          taskTimeout: 3600s  # 1 hour
+          containers:
+            - name: processor
+              image: ${var.container_image}
+              env:
+                - name: PUBSUB_SUBSCRIPTION
+                  value: projects/${var.project_id}/subscriptions/${resource.analytics_processor_subscription.name}
+                - name: FIRESTORE_DATABASE
+                  value: ${resource.behavioral_analytics_database.name}
+                - name: GOOGLE_CLOUD_PROJECT
+                  value: ${var.project_id}
+                - name: GOOGLE_CLOUD_REGION
+                  value: ${var.region}
+              resources:
+                limits:
+                  memory: ${var.memory_limit}
+                  cpu: ${var.cpu_limit}
+    depends_on:
+      - ${resource.enable_run_api}
+      - ${resource.analytics_processor_service_account}
+      - ${resource.analytics_processor_subscription}
+      - ${resource.behavioral_analytics_database}
+
+  # Firestore composite index for user events by user_id and timestamp
+  user_events_user_timestamp_index:
+    type: gcp:firestore:Index
+    properties:
+      project: ${var.project_id}
+      database: ${resource.behavioral_analytics_database.name}
+      collection: user_events
+      fields:
+        - fieldPath: user_id
+          order: ASCENDING
+        - fieldPath: timestamp
+          order: DESCENDING
+      queryScope: COLLECTION
+    depends_on:
+      - ${resource.behavioral_analytics_database}
+
+  # Firestore composite index for user events by event_type and timestamp
+  user_events_type_timestamp_index:
+    type: gcp:firestore:Index
+    properties:
+      project: ${var.project_id}
+      database: ${resource.behavioral_analytics_database.name}
+      collection: user_events
+      fields:
+        - fieldPath: event_type
+          order: ASCENDING
+        - fieldPath: timestamp
+          order: DESCENDING
+      queryScope: COLLECTION
+    depends_on:
+      - ${resource.behavioral_analytics_database}
+
+  # Firestore composite index for analytics aggregates by period and last_updated
+  analytics_aggregates_period_index:
+    type: gcp:firestore:Index
+    properties:
+      project: ${var.project_id}
+      database: ${resource.behavioral_analytics_database.name}
+      collection: analytics_aggregates
+      fields:
+        - fieldPath: period
+          order: ASCENDING
+        - fieldPath: last_updated
+          order: DESCENDING
+      queryScope: COLLECTION
+    depends_on:
+      - ${resource.behavioral_analytics_database}
+
+  # Cloud Monitoring dashboard for behavioral analytics
+  behavioral_analytics_dashboard:
+    type: gcp:monitoring:Dashboard
+    properties:
+      project: ${var.project_id}
+      displayName: "Behavioral Analytics Dashboard"
+      dashboardJson: |
+        {
+          "displayName": "Behavioral Analytics Dashboard",
+          "mosaicLayout": {
+            "tiles": [
+              {
+                "width": 6,
+                "height": 4,
+                "widget": {
+                  "title": "Events Processed Per Minute",
+                  "xyChart": {
+                    "dataSets": [{
+                      "timeSeriesQuery": {
+                        "timeSeriesFilter": {
+                          "filter": "metric.type=\"custom.googleapis.com/behavioral_analytics/events_processed\"",
+                          "aggregation": {
+                            "alignmentPeriod": "60s",
+                            "perSeriesAligner": "ALIGN_RATE"
+                          }
+                        }
+                      }
+                    }]
+                  }
+                }
+              },
+              {
+                "width": 6,
+                "height": 4,
+                "xPos": 6,
+                "widget": {
+                  "title": "Worker Pool Instance Count",
+                  "xyChart": {
+                    "dataSets": [{
+                      "timeSeriesQuery": {
+                        "timeSeriesFilter": {
+                          "filter": "resource.type=\"cloud_run_revision\" AND metric.type=\"run.googleapis.com/container/instance_count\"",
+                          "aggregation": {
+                            "alignmentPeriod": "60s",
+                            "perSeriesAligner": "ALIGN_MEAN"
+                          }
+                        }
+                      }
+                    }]
+                  }
+                }
+              },
+              {
+                "width": 12,
+                "height": 4,
+                "yPos": 4,
+                "widget": {
+                  "title": "Pub/Sub Message Lag",
+                  "xyChart": {
+                    "dataSets": [{
+                      "timeSeriesQuery": {
+                        "timeSeriesFilter": {
+                          "filter": "resource.type=\"pubsub_subscription\" AND metric.type=\"pubsub.googleapis.com/subscription/num_undelivered_messages\"",
+                          "aggregation": {
+                            "alignmentPeriod": "60s",
+                            "perSeriesAligner": "ALIGN_MEAN"
+                          }
+                        }
+                      }
+                    }]
+                  }
+                }
+              }
+            ]
+          }
+        }
+    depends_on:
+      - ${resource.enable_monitoring_api}
+
+  # Alert policy for high Pub/Sub message lag
+  high_message_lag_alert:
+    type: gcp:monitoring:AlertPolicy
+    properties:
+      project: ${var.project_id}
+      displayName: "High Pub/Sub Message Lag"
+      documentation:
+        content: "Alert when Pub/Sub subscription has high message lag indicating processing bottleneck"
+        mimeType: text/markdown
+      conditions:
+        - displayName: "High undelivered message count"
+          conditionThreshold:
+            filter: >
+              resource.type="pubsub_subscription" AND 
+              resource.labels.subscription_id="${resource.analytics_processor_subscription.name}" AND
+              metric.type="pubsub.googleapis.com/subscription/num_undelivered_messages"
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 100
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_MEAN
+      enabled: true
+      combiner: OR
+    depends_on:
+      - ${resource.analytics_processor_subscription}
+      - ${resource.enable_monitoring_api}
+
+  # Alert policy for worker pool errors
+  worker_pool_error_alert:
+    type: gcp:monitoring:AlertPolicy
+    properties:
+      project: ${var.project_id}
+      displayName: "Worker Pool Processing Errors"
+      documentation:
+        content: "Alert when Cloud Run worker pool encounters processing errors"
+        mimeType: text/markdown
+      conditions:
+        - displayName: "High error rate"
+          conditionThreshold:
+            filter: >
+              resource.type="cloud_run_revision" AND
+              resource.labels.service_name="${resource.behavioral_processor_worker_pool.name}" AND
+              metric.type="logging.googleapis.com/log_entry_count" AND
+              jsonPayload.severity="ERROR"
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 5
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_RATE
+      enabled: true
+      combiner: OR
+    depends_on:
+      - ${resource.behavioral_processor_worker_pool}
+      - ${resource.enable_monitoring_api}
+
+# Output values for verification and integration
+output:
+  project_id:
+    description: "Google Cloud project ID"
+    value: ${var.project_id}
+
+  region:
+    description: "Deployment region"
+    value: ${var.region}
+
+  pubsub_topic_name:
+    description: "Pub/Sub topic name for event ingestion"
+    value: ${resource.user_events_topic.name}
+
+  pubsub_subscription_name:
+    description: "Pub/Sub subscription name for worker pool"
+    value: ${resource.analytics_processor_subscription.name}
+
+  worker_pool_name:
+    description: "Cloud Run worker pool name"
+    value: ${resource.behavioral_processor_worker_pool.name}
+
+  firestore_database_name:
+    description: "Firestore database name"
+    value: ${resource.behavioral_analytics_database.name}
+
+  service_account_email:
+    description: "Service account email for the worker pool"
+    value: ${resource.analytics_processor_service_account.email}
+
+  artifact_registry_repository:
+    description: "Artifact Registry repository for container images"
+    value: ${resource.behavioral_analytics_repository.id}
+
+  monitoring_dashboard_url:
+    description: "Cloud Monitoring dashboard URL"
+    value: "https://console.cloud.google.com/monitoring/dashboards/custom/${resource.behavioral_analytics_dashboard.id}?project=${var.project_id}"
+
+  deployment_command:
+    description: "Command to trigger worker pool job execution"
+    value: "gcloud run jobs execute ${resource.behavioral_processor_worker_pool.name} --region=${var.region} --wait"
+
+  pubsub_publish_command:
+    description: "Example command to publish test events"
+    value: "gcloud pubsub topics publish ${resource.user_events_topic.name} --message='{\"event_type\":\"test\",\"user_id\":\"user_1\",\"timestamp\":$(date +%s)}'"
+
+  firestore_query_command:
+    description: "Command to query Firestore analytics data"
+    value: "gcloud firestore documents list --collection-ids=analytics_aggregates --database=${resource.behavioral_analytics_database.name} --limit=10"

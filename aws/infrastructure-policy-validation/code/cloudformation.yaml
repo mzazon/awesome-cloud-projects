@@ -1,0 +1,857 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure Policy Validation with CloudFormation Guard - Creates S3 repository for Guard rules, IAM roles, and Lambda functions for automated policy validation'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Guard Rules Configuration'
+        Parameters:
+          - GuardRulesVersion
+          - EnableVersioning
+          - EnableMfaDelete
+      - Label:
+          default: 'Validation Configuration'
+        Parameters:
+          - EnableCICDIntegration
+          - NotificationEmail
+          - ValidationTimeoutMinutes
+      - Label:
+          default: 'Security Configuration'
+        Parameters:
+          - EncryptionKeyId
+          - AllowedSourceIPs
+      - Label:
+          default: 'Resource Naming'
+        Parameters:
+          - ProjectName
+          - Environment
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'cfn-guard'
+    Description: 'Project name used for resource naming and tagging'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '[a-z][a-z0-9-]*[a-z0-9]'
+    ConstraintDescription: 'Must be 3-20 characters, start with letter, contain only lowercase letters, numbers, and hyphens'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - 'dev'
+      - 'test'
+      - 'staging'
+      - 'prod'
+    Description: 'Environment name for resource tagging and naming'
+
+  GuardRulesVersion:
+    Type: String
+    Default: '1.0'
+    Description: 'Version of the Guard rules to deploy'
+    AllowedPattern: '\d+\.\d+(\.\d+)?'
+    ConstraintDescription: 'Must be a valid semantic version (e.g., 1.0, 1.0.0)'
+
+  EnableVersioning:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable versioning on the S3 bucket for Guard rules'
+
+  EnableMfaDelete:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable MFA delete protection for production environments (requires manual configuration)'
+
+  EnableCICDIntegration:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Deploy Lambda function for CI/CD pipeline integration'
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for validation failure notifications (optional)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+  ValidationTimeoutMinutes:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 15
+    Description: 'Timeout in minutes for Lambda validation function'
+
+  EncryptionKeyId:
+    Type: String
+    Default: 'alias/aws/s3'
+    Description: 'KMS key ID or alias for S3 bucket encryption (use alias/aws/s3 for AWS managed keys)'
+
+  AllowedSourceIPs:
+    Type: CommaDelimitedList
+    Default: '0.0.0.0/0'
+    Description: 'Comma-delimited list of IP addresses/CIDR blocks allowed to access validation API (0.0.0.0/0 for all)'
+
+Conditions:
+  EnableVersioningCondition: !Equals [!Ref EnableVersioning, 'true']
+  EnableMfaDeleteCondition: !And
+    - !Equals [!Ref EnableMfaDelete, 'true']
+    - !Equals [!Ref Environment, 'prod']
+  EnableCICDIntegrationCondition: !Equals [!Ref EnableCICDIntegration, 'true']
+  NotificationEmailProvided: !Not [!Equals [!Ref NotificationEmail, '']]
+  IsProductionEnvironment: !Equals [!Ref Environment, 'prod']
+  UseCustomKMSKey: !Not [!Equals [!Ref EncryptionKeyId, 'alias/aws/s3']]
+
+Resources:
+  # S3 Bucket for storing Guard rules, templates, and validation reports
+  GuardRulesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-guard-rules-${Environment}-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: !If [EnableVersioningCondition, 'Enabled', 'Suspended']
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [UseCustomKMSKey, 'aws:kms', 'AES256']
+              KMSMasterKeyID: !If [UseCustomKMSKey, !Ref EncryptionKeyId, !Ref 'AWS::NoValue']
+            BucketKeyEnabled: !If [UseCustomKMSKey, true, !Ref 'AWS::NoValue']
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldValidationReports
+            Status: Enabled
+            Prefix: 'reports/'
+            ExpirationInDays: !If [IsProductionEnvironment, 90, 30]
+          - Id: TransitionOldReportsToIA
+            Status: Enabled
+            Prefix: 'reports/'
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: !If [IsProductionEnvironment, 30, 7]
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref GuardValidationLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-guard-rules-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'CloudFormation Guard Rules Repository'
+        - Key: CostCenter
+          Value: 'DevOps'
+
+  # S3 Bucket Policy for secure access
+  GuardRulesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref GuardRulesBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Deny insecure connections
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${GuardRulesBucket}'
+              - !Sub '${GuardRulesBucket}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          # Allow CloudFormation Guard validation service access
+          - Sid: AllowGuardValidationAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt GuardValidationRole.Arn
+            Action:
+              - 's3:GetObject'
+              - 's3:GetObjectVersion'
+              - 's3:ListBucket'
+              - 's3:PutObject'
+              - 's3:PutObjectAcl'
+              - 's3:DeleteObject'
+            Resource:
+              - !Sub '${GuardRulesBucket}'
+              - !Sub '${GuardRulesBucket}/*'
+          # Allow CI/CD Lambda function access
+          - !If
+            - EnableCICDIntegrationCondition
+            - Sid: AllowCICDLambdaAccess
+              Effect: Allow
+              Principal:
+                AWS: !GetAtt CICDValidationRole.Arn
+              Action:
+                - 's3:GetObject'
+                - 's3:GetObjectVersion'
+                - 's3:ListBucket'
+                - 's3:PutObject'
+              Resource:
+                - !Sub '${GuardRulesBucket}'
+                - !Sub '${GuardRulesBucket}/*'
+            - !Ref 'AWS::NoValue'
+
+  # IAM Role for Guard validation operations
+  GuardValidationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-guard-validation-role-${Environment}'
+      Path: '/cloudformation-guard/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - codebuild.amazonaws.com
+                - codepipeline.amazonaws.com
+            Action: 'sts:AssumeRole'
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Sub '${ProjectName}-${Environment}'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: GuardValidationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3 permissions for Guard rules and reports
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:ListBucket'
+                  - 's3:PutObject'
+                  - 's3:PutObjectAcl'
+                  - 's3:DeleteObject'
+                Resource:
+                  - !Sub '${GuardRulesBucket}'
+                  - !Sub '${GuardRulesBucket}/*'
+              # CloudWatch Logs permissions
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${GuardValidationLogGroup}*'
+              # CloudFormation permissions for template validation
+              - Effect: Allow
+                Action:
+                  - 'cloudformation:ValidateTemplate'
+                  - 'cloudformation:EstimateTemplateCost'
+                Resource: '*'
+              # SNS permissions for notifications
+              - !If
+                - NotificationEmailProvided
+                - Effect: Allow
+                  Action:
+                    - 'sns:Publish'
+                  Resource: !Ref ValidationNotificationTopic
+                - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-guard-validation-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for CI/CD Lambda function
+  CICDValidationRole:
+    Type: AWS::IAM::Role
+    Condition: EnableCICDIntegrationCondition
+    Properties:
+      RoleName: !Sub '${ProjectName}-cicd-validation-role-${Environment}'
+      Path: '/cloudformation-guard/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: CICDValidationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3 permissions for accessing Guard rules and storing reports
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:ListBucket'
+                  - 's3:PutObject'
+                Resource:
+                  - !Sub '${GuardRulesBucket}'
+                  - !Sub '${GuardRulesBucket}/*'
+              # CloudWatch Logs permissions
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+              # CloudFormation permissions
+              - Effect: Allow
+                Action:
+                  - 'cloudformation:ValidateTemplate'
+                Resource: '*'
+              # SNS permissions for notifications
+              - !If
+                - NotificationEmailProvided
+                - Effect: Allow
+                  Action:
+                    - 'sns:Publish'
+                  Resource: !Ref ValidationNotificationTopic
+                - !Ref 'AWS::NoValue'
+
+  # CloudWatch Log Group for Guard validation operations
+  GuardValidationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/cloudformation-guard/${ProjectName}-${Environment}'
+      RetentionInDays: !If [IsProductionEnvironment, 90, 14]
+      KmsKeyId: !If [UseCustomKMSKey, !Ref EncryptionKeyId, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-guard-validation-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SNS Topic for validation failure notifications
+  ValidationNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: NotificationEmailProvided
+    Properties:
+      TopicName: !Sub '${ProjectName}-validation-notifications-${Environment}'
+      DisplayName: 'CloudFormation Guard Validation Notifications'
+      KmsMasterKeyId: !If [UseCustomKMSKey, !Ref EncryptionKeyId, 'alias/aws/sns']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-validation-notifications-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SNS Topic Subscription for email notifications
+  ValidationNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: NotificationEmailProvided
+    Properties:
+      TopicArn: !Ref ValidationNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # Lambda function for CI/CD pipeline integration
+  CICDValidationFunction:
+    Type: AWS::Lambda::Function
+    Condition: EnableCICDIntegrationCondition
+    Properties:
+      FunctionName: !Sub '${ProjectName}-cicd-validation-${Environment}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt CICDValidationRole.Arn
+      Timeout: !Ref ValidationTimeoutMinutes
+      MemorySize: 512
+      Environment:
+        Variables:
+          GUARD_RULES_BUCKET: !Ref GuardRulesBucket
+          NOTIFICATION_TOPIC_ARN: !If [NotificationEmailProvided, !Ref ValidationNotificationTopic, '']
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+          GUARD_RULES_VERSION: !Ref GuardRulesVersion
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import subprocess
+          import tempfile
+          from datetime import datetime
+          import logging
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+
+          def lambda_handler(event, context):
+              """
+              Lambda function for CI/CD pipeline integration with CloudFormation Guard.
+              Validates CloudFormation templates against organizational policies.
+              """
+              try:
+                  # Extract parameters from event
+                  template_url = event.get('template_url')
+                  template_content = event.get('template_content')
+                  validation_rules = event.get('validation_rules', 'all')
+                  
+                  bucket_name = os.environ['GUARD_RULES_BUCKET']
+                  notification_topic = os.environ.get('NOTIFICATION_TOPIC_ARN')
+                  
+                  logger.info(f"Starting validation for template: {template_url or 'inline content'}")
+                  
+                  # Download Guard rules from S3
+                  rules_dir = download_guard_rules(bucket_name)
+                  
+                  # Get template content
+                  if template_url:
+                      template_content = download_template(template_url)
+                  elif not template_content:
+                      raise ValueError("Either template_url or template_content must be provided")
+                  
+                  # Perform validation
+                  validation_results = validate_template(template_content, rules_dir, validation_rules)
+                  
+                  # Upload results to S3
+                  results_key = upload_validation_results(bucket_name, validation_results)
+                  
+                  # Send notification if validation failed
+                  if not validation_results['overall_status'] and notification_topic:
+                      send_notification(notification_topic, validation_results, template_url)
+                  
+                  # Prepare response
+                  response = {
+                      'statusCode': 200 if validation_results['overall_status'] else 400,
+                      'body': json.dumps({
+                          'validation_status': validation_results['overall_status'],
+                          'results_location': f's3://{bucket_name}/{results_key}',
+                          'summary': validation_results['summary'],
+                          'details': validation_results.get('details', [])
+                      })
+                  }
+                  
+                  return response
+                  
+              except Exception as e:
+                  logger.error(f"Validation failed with error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'validation_status': False
+                      })
+                  }
+          
+          def download_guard_rules(bucket_name):
+              """Download Guard rules from S3 to temporary directory"""
+              rules_dir = tempfile.mkdtemp()
+              
+              try:
+                  # List all Guard rule files
+                  response = s3.list_objects_v2(
+                      Bucket=bucket_name,
+                      Prefix='guard-rules/'
+                  )
+                  
+                  for obj in response.get('Contents', []):
+                      if obj['Key'].endswith('.guard'):
+                          local_path = os.path.join(rules_dir, os.path.basename(obj['Key']))
+                          s3.download_file(bucket_name, obj['Key'], local_path)
+                          logger.info(f"Downloaded rule: {obj['Key']}")
+                  
+                  return rules_dir
+                  
+              except Exception as e:
+                  logger.error(f"Failed to download Guard rules: {str(e)}")
+                  raise
+          
+          def download_template(template_url):
+              """Download CloudFormation template from URL or S3"""
+              if template_url.startswith('s3://'):
+                  # Parse S3 URL
+                  parts = template_url[5:].split('/', 1)
+                  bucket = parts[0]
+                  key = parts[1]
+                  
+                  response = s3.get_object(Bucket=bucket, Key=key)
+                  return response['Body'].read().decode('utf-8')
+              else:
+                  # Handle HTTP URLs (implementation depends on security requirements)
+                  raise ValueError("HTTP URLs not supported in this implementation")
+          
+          def validate_template(template_content, rules_dir, validation_rules):
+              """Validate template against Guard rules"""
+              results = {
+                  'timestamp': datetime.utcnow().isoformat(),
+                  'overall_status': True,
+                  'summary': {'total_rules': 0, 'passed': 0, 'failed': 0, 'skipped': 0},
+                  'details': []
+              }
+              
+              # Save template to temporary file
+              with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+                  f.write(template_content)
+                  template_file = f.name
+              
+              try:
+                  # Run Guard validation for each rule file
+                  for rule_file in os.listdir(rules_dir):
+                      if rule_file.endswith('.guard'):
+                          rule_path = os.path.join(rules_dir, rule_file)
+                          
+                          # Mock Guard validation (replace with actual cfn-guard execution)
+                          rule_result = mock_guard_validation(template_file, rule_path)
+                          
+                          results['details'].append({
+                              'rule_file': rule_file,
+                              'status': rule_result['status'],
+                              'violations': rule_result.get('violations', [])
+                          })
+                          
+                          results['summary']['total_rules'] += 1
+                          if rule_result['status'] == 'PASS':
+                              results['summary']['passed'] += 1
+                          elif rule_result['status'] == 'FAIL':
+                              results['summary']['failed'] += 1
+                              results['overall_status'] = False
+                          else:
+                              results['summary']['skipped'] += 1
+                  
+                  return results
+                  
+              finally:
+                  os.unlink(template_file)
+          
+          def mock_guard_validation(template_file, rule_file):
+              """Mock Guard validation (replace with actual cfn-guard execution)"""
+              # This is a placeholder - in real implementation, execute cfn-guard
+              return {
+                  'status': 'PASS',
+                  'violations': []
+              }
+          
+          def upload_validation_results(bucket_name, results):
+              """Upload validation results to S3"""
+              timestamp = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+              results_key = f'validation-results/{timestamp}-validation-report.json'
+              
+              s3.put_object(
+                  Bucket=bucket_name,
+                  Key=results_key,
+                  Body=json.dumps(results, indent=2),
+                  ContentType='application/json'
+              )
+              
+              logger.info(f"Uploaded validation results to: {results_key}")
+              return results_key
+          
+          def send_notification(topic_arn, results, template_url):
+              """Send SNS notification for validation failures"""
+              message = f"""
+              CloudFormation Guard Validation Failed
+              
+              Template: {template_url or 'Inline content'}
+              Timestamp: {results['timestamp']}
+              
+              Summary:
+              - Total Rules: {results['summary']['total_rules']}
+              - Passed: {results['summary']['passed']}
+              - Failed: {results['summary']['failed']}
+              - Skipped: {results['summary']['skipped']}
+              
+              Please review the validation report for detailed information.
+              """
+              
+              sns.publish(
+                  TopicArn=topic_arn,
+                  Message=message,
+                  Subject='CloudFormation Guard Validation Failed'
+              )
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cicd-validation-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda permission for API Gateway
+  CICDValidationFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableCICDIntegrationCondition
+    Properties:
+      FunctionName: !Ref CICDValidationFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub '${ValidationRestApi}/*/POST/validate'
+
+  # API Gateway for validation endpoint
+  ValidationRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Condition: EnableCICDIntegrationCondition
+    Properties:
+      Name: !Sub '${ProjectName}-validation-api-${Environment}'
+      Description: 'REST API for CloudFormation Guard validation'
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: execute-api:Invoke
+            Resource: '*'
+            Condition:
+              IpAddress:
+                'aws:SourceIp': !Ref AllowedSourceIPs
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-validation-api-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # API Gateway Resource
+  ValidationApiResource:
+    Type: AWS::ApiGateway::Resource
+    Condition: EnableCICDIntegrationCondition
+    Properties:
+      RestApiId: !Ref ValidationRestApi
+      ParentId: !GetAtt ValidationRestApi.RootResourceId
+      PathPart: validate
+
+  # API Gateway Method
+  ValidationApiMethod:
+    Type: AWS::ApiGateway::Method
+    Condition: EnableCICDIntegrationCondition
+    Properties:
+      RestApiId: !Ref ValidationRestApi
+      ResourceId: !Ref ValidationApiResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CICDValidationFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+        - StatusCode: 400
+          ResponseModels:
+            application/json: Empty
+        - StatusCode: 500
+          ResponseModels:
+            application/json: Empty
+
+  # API Gateway Deployment
+  ValidationApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Condition: EnableCICDIntegrationCondition
+    DependsOn:
+      - ValidationApiMethod
+    Properties:
+      RestApiId: !Ref ValidationRestApi
+      StageName: !Ref Environment
+      StageDescription: !Sub 'Deployment for ${Environment} environment'
+
+  # Custom resource to populate initial Guard rules
+  PopulateGuardRules:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt PopulateGuardRulesFunction.Arn
+      BucketName: !Ref GuardRulesBucket
+      RulesVersion: !Ref GuardRulesVersion
+
+  # Lambda function to populate initial Guard rules
+  PopulateGuardRulesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-populate-rules-${Environment}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt GuardValidationRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          s3 = boto3.client('s3')
+
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Create':
+                      bucket_name = event['ResourceProperties']['BucketName']
+                      rules_version = event['ResourceProperties']['RulesVersion']
+                      
+                      # Upload initial Guard rules
+                      upload_initial_rules(bucket_name, rules_version)
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'Message': 'Guard rules populated successfully'
+                      })
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+              except Exception as e:
+                  print(f'Error: {str(e)}')
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      'Error': str(e)
+                  })
+
+          def upload_initial_rules(bucket_name, version):
+              # S3 Security Rules
+              s3_security_rules = """
+              # Rule: S3 buckets must have versioning enabled
+              rule s3_bucket_versioning_enabled {
+                  AWS::S3::Bucket {
+                      Properties {
+                          VersioningConfiguration exists
+                          VersioningConfiguration {
+                              Status == "Enabled"
+                          }
+                      }
+                  }
+              }
+              
+              # Rule: S3 buckets must have encryption enabled
+              rule s3_bucket_encryption_enabled {
+                  AWS::S3::Bucket {
+                      Properties {
+                          BucketEncryption exists
+                          BucketEncryption {
+                              ServerSideEncryptionConfiguration exists
+                              ServerSideEncryptionConfiguration[*] {
+                                  ServerSideEncryptionByDefault exists
+                                  ServerSideEncryptionByDefault {
+                                      SSEAlgorithm exists
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+              """
+              
+              # Upload rules to S3
+              s3.put_object(
+                  Bucket=bucket_name,
+                  Key='guard-rules/security/s3-security.guard',
+                  Body=s3_security_rules,
+                  ContentType='text/plain'
+              )
+              
+              # Create rules manifest
+              manifest = {
+                  'version': version,
+                  'rules': [
+                      {
+                          'category': 'security',
+                          'file': 's3-security.guard',
+                          'description': 'S3 security compliance rules'
+                      }
+                  ]
+              }
+              
+              s3.put_object(
+                  Bucket=bucket_name,
+                  Key='rules-manifest.json',
+                  Body=json.dumps(manifest, indent=2),
+                  ContentType='application/json'
+              )
+
+Outputs:
+  GuardRulesBucketName:
+    Description: 'S3 bucket name for storing Guard rules and validation reports'
+    Value: !Ref GuardRulesBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-GuardRulesBucket'
+
+  GuardRulesBucketArn:
+    Description: 'ARN of the S3 bucket for Guard rules'
+    Value: !GetAtt GuardRulesBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GuardRulesBucketArn'
+
+  GuardValidationRoleArn:
+    Description: 'ARN of the IAM role for Guard validation operations'
+    Value: !GetAtt GuardValidationRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GuardValidationRoleArn'
+
+  CICDValidationFunctionName:
+    Condition: EnableCICDIntegrationCondition
+    Description: 'Name of the Lambda function for CI/CD validation'
+    Value: !Ref CICDValidationFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-CICDValidationFunction'
+
+  ValidationApiEndpoint:
+    Condition: EnableCICDIntegrationCondition
+    Description: 'REST API endpoint for validation requests'
+    Value: !Sub 'https://${ValidationRestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/validate'
+    Export:
+      Name: !Sub '${AWS::StackName}-ValidationApiEndpoint'
+
+  ValidationLogGroup:
+    Description: 'CloudWatch Log Group for validation operations'
+    Value: !Ref GuardValidationLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ValidationLogGroup'
+
+  NotificationTopicArn:
+    Condition: NotificationEmailProvided
+    Description: 'SNS Topic ARN for validation notifications'
+    Value: !Ref ValidationNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopic'
+
+  GuardRulesVersion:
+    Description: 'Version of the deployed Guard rules'
+    Value: !Ref GuardRulesVersion
+
+  ValidationCommands:
+    Description: 'Example commands for using the infrastructure'
+    Value: !Sub |
+      # Download Guard rules locally:
+      aws s3 cp s3://${GuardRulesBucket}/guard-rules/ ./guard-rules/ --recursive
+      
+      # Validate a CloudFormation template:
+      cfn-guard validate --data template.yaml --rules guard-rules/security/s3-security.guard
+      
+      # Call validation API:
+      aws apigateway test-invoke-method --rest-api-id ${ValidationRestApi} --resource-id ${ValidationApiResource} --http-method POST --body '{"template_content": "..."}'

@@ -1,0 +1,644 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Serverless contact form backend using SES, Lambda, and API Gateway - Recipe: Creating Contact Forms with SES and Lambda'
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'prod'
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    Description: 'Environment name for resource naming and tagging'
+    
+  SenderEmail:
+    Type: String
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    Description: 'Verified SES email address for sending contact form emails'
+    ConstraintDescription: 'Must be a valid email address format'
+    
+  ProjectName:
+    Type: String
+    Default: 'contact-form'
+    MinLength: 3
+    MaxLength: 30
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    Description: 'Project name for resource naming (alphanumeric and hyphens only)'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+    
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    Description: 'Lambda function timeout in seconds'
+    
+  LambdaMemorySize:
+    Type: Number
+    Default: 128
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+    Description: 'Lambda function memory allocation in MB'
+    
+  ApiGatewayThrottleBurstLimit:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 5000
+    Description: 'API Gateway throttling burst limit'
+    
+  ApiGatewayThrottleRateLimit:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    MaxValue: 10000
+    Description: 'API Gateway throttling rate limit (requests per second)'
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  IsDevelopment: !Equals [!Ref Environment, 'dev']
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+
+Resources:
+
+  # IAM Role for Lambda Function
+  ContactFormLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SESEmailPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'ses:FromAddress': !Ref SenderEmail
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'lambda-execution-role'
+
+  # CloudWatch Log Group for Lambda Function
+  ContactFormLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-processor-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'lambda-logs'
+
+  # Lambda Function
+  ContactFormLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ContactFormLambdaLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-processor-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ContactFormLambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          SENDER_EMAIL: !Ref SenderEmail
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from datetime import datetime
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Process contact form submissions and send email notifications via SES
+              """
+              # Initialize SES client
+              ses_client = boto3.client('ses')
+              
+              try:
+                  # Log the incoming event for debugging
+                  logger.info(f"Received event: {json.dumps(event, default=str)}")
+                  
+                  # Parse the incoming request
+                  if 'body' not in event:
+                      raise ValueError("Missing request body")
+                      
+                  body = json.loads(event['body'])
+                  
+                  # Extract and validate form data
+                  name = body.get('name', '').strip()
+                  email = body.get('email', '').strip()
+                  subject = body.get('subject', 'Contact Form Submission').strip()
+                  message = body.get('message', '').strip()
+                  
+                  # Validate required fields
+                  if not name or not email or not message:
+                      logger.warning("Missing required fields in form submission")
+                      return create_response(400, {
+                          'error': 'Name, email, and message are required fields',
+                          'details': 'All form fields must be completed'
+                      })
+                  
+                  # Basic email format validation
+                  if '@' not in email or '.' not in email.split('@')[1]:
+                      logger.warning(f"Invalid email format: {email}")
+                      return create_response(400, {
+                          'error': 'Invalid email address format'
+                      })
+                  
+                  # Validate message length (prevent abuse)
+                  if len(message) > 5000:
+                      logger.warning("Message too long")
+                      return create_response(400, {
+                          'error': 'Message too long (maximum 5000 characters)'
+                      })
+                  
+                  # Prepare email content
+                  sender_email = os.environ['SENDER_EMAIL']
+                  timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
+                  environment = os.environ.get('ENVIRONMENT', 'unknown')
+                  
+                  # Format email body with proper structure
+                  email_body = f"""
+          New Contact Form Submission
+          ============================
+          
+          Submission Details:
+          ------------------
+          Time: {timestamp}
+          Environment: {environment}
+          Name: {name}
+          Email: {email}
+          Subject: {subject}
+          
+          Message:
+          --------
+          {message}
+          
+          --
+          This email was automatically generated by the contact form system.
+          """
+                  
+                  # Prepare HTML version for better presentation
+                  html_body = f"""
+          <html>
+          <head><title>Contact Form Submission</title></head>
+          <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+              <h2 style="color: #333;">New Contact Form Submission</h2>
+              <div style="background-color: #f5f5f5; padding: 15px; border-radius: 5px;">
+                  <p><strong>Time:</strong> {timestamp}</p>
+                  <p><strong>Environment:</strong> {environment}</p>
+                  <p><strong>Name:</strong> {name}</p>
+                  <p><strong>Email:</strong> {email}</p>
+                  <p><strong>Subject:</strong> {subject}</p>
+              </div>
+              <div style="margin-top: 20px;">
+                  <h3 style="color: #333;">Message:</h3>
+                  <div style="background-color: #f9f9f9; padding: 15px; border-left: 4px solid #007bff; white-space: pre-wrap;">{message}</div>
+              </div>
+              <hr style="margin-top: 30px; border: none; border-top: 1px solid #ddd;">
+              <p style="color: #666; font-size: 12px;">This email was automatically generated by the contact form system.</p>
+          </body>
+          </html>
+          """
+                  
+                  # Send email using SES
+                  logger.info(f"Sending email from {sender_email} to {sender_email}")
+                  response = ses_client.send_email(
+                      Source=sender_email,
+                      Destination={
+                          'ToAddresses': [sender_email]
+                      },
+                      Message={
+                          'Subject': {
+                              'Data': f'Contact Form Submission: {subject}',
+                              'Charset': 'UTF-8'
+                          },
+                          'Body': {
+                              'Text': {
+                                  'Data': email_body,
+                                  'Charset': 'UTF-8'
+                              },
+                              'Html': {
+                                  'Data': html_body,
+                                  'Charset': 'UTF-8'
+                              }
+                          }
+                      }
+                  )
+                  
+                  logger.info(f"Email sent successfully. MessageId: {response['MessageId']}")
+                  
+                  # Return success response
+                  return create_response(200, {
+                      'message': 'Contact form submitted successfully',
+                      'messageId': response['MessageId'],
+                      'timestamp': timestamp
+                  })
+                  
+              except json.JSONDecodeError as e:
+                  logger.error(f"JSON decode error: {str(e)}")
+                  return create_response(400, {
+                      'error': 'Invalid JSON in request body'
+                  })
+                  
+              except Exception as e:
+                  logger.error(f"Unexpected error: {str(e)}")
+                  return create_response(500, {
+                      'error': 'Internal server error',
+                      'details': 'Please try again later'
+                  })
+          
+          def create_response(status_code, body):
+              """
+              Create a standardized API response with CORS headers
+              """
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'POST, OPTIONS',
+                      'Access-Control-Allow-Headers': 'Content-Type, X-Amz-Date, Authorization, X-Api-Key, X-Amz-Security-Token',
+                      'Access-Control-Max-Age': '86400'
+                  },
+                  'body': json.dumps(body, ensure_ascii=False)
+              }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'lambda-function'
+
+  # API Gateway REST API
+  ContactFormRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-api-${Environment}'
+      Description: !Sub 'Contact form API for ${ProjectName} (${Environment})'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: execute-api:Invoke
+            Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'api-gateway'
+
+  # API Gateway Resource for /contact endpoint
+  ContactResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ContactFormRestApi
+      ParentId: !GetAtt ContactFormRestApi.RootResourceId
+      PathPart: contact
+
+  # POST Method for contact form submissions
+  ContactPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ContactFormRestApi
+      ResourceId: !Ref ContactResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      RequestValidatorId: !Ref ContactFormRequestValidator
+      RequestModels:
+        application/json: !Ref ContactFormRequestModel
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 
+          - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations'
+          - LambdaArn: !GetAtt ContactFormLambdaFunction.Arn
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'POST, OPTIONS'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type, X-Amz-Date, Authorization, X-Api-Key, X-Amz-Security-Token'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+        - StatusCode: 400
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: 500
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # OPTIONS Method for CORS preflight requests
+  ContactOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ContactFormRestApi
+      ResourceId: !Ref ContactResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'POST, OPTIONS'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type, X-Amz-Date, Authorization, X-Api-Key, X-Amz-Security-Token'"
+              method.response.header.Access-Control-Max-Age: "'86400'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Max-Age: true
+
+  # Request Model for validation
+  ContactFormRequestModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref ContactFormRestApi
+      ContentType: application/json
+      Name: ContactFormRequest
+      Schema:
+        $schema: 'http://json-schema.org/draft-04/schema#'
+        title: Contact Form Request
+        type: object
+        required:
+          - name
+          - email
+          - message
+        properties:
+          name:
+            type: string
+            minLength: 1
+            maxLength: 100
+            description: 'Contact person name'
+          email:
+            type: string
+            pattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+            description: 'Valid email address'
+          subject:
+            type: string
+            maxLength: 200
+            description: 'Optional subject line'
+          message:
+            type: string
+            minLength: 1
+            maxLength: 5000
+            description: 'Contact message content'
+
+  # Request Validator
+  ContactFormRequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      RestApiId: !Ref ContactFormRestApi
+      Name: ContactFormValidator
+      ValidateRequestBody: true
+      ValidateRequestParameters: false
+
+  # Lambda Permission for API Gateway
+  ApiGatewayLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ContactFormLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub '${ContactFormRestApi}/*/POST/contact'
+
+  # API Gateway Deployment
+  ContactFormApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ContactPostMethod
+      - ContactOptionsMethod
+    Properties:
+      RestApiId: !Ref ContactFormRestApi
+      Description: !Sub 'Deployment for ${ProjectName} contact form API (${Environment})'
+
+  # API Gateway Stage
+  ContactFormApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref ContactFormRestApi
+      DeploymentId: !Ref ContactFormApiDeployment
+      StageName: !Ref Environment
+      Description: !Sub '${Environment} stage for contact form API'
+      ThrottleSettings:
+        BurstLimit: !Ref ApiGatewayThrottleBurstLimit
+        RateLimit: !Ref ApiGatewayThrottleRateLimit
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: !If [IsProduction, 'ERROR', 'INFO']
+          DataTraceEnabled: !If [IsDevelopment, true, false]
+          MetricsEnabled: true
+          ThrottlingBurstLimit: !Ref ApiGatewayThrottleBurstLimit
+          ThrottlingRateLimit: !Ref ApiGatewayThrottleRateLimit
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'api-stage'
+
+  # CloudWatch Alarms for monitoring
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors-${Environment}'
+      AlarmDescription: 'Lambda function error rate alarm'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ContactFormLambdaFunction
+      TreatMissingData: notBreaching
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-duration-${Environment}'
+      AlarmDescription: 'Lambda function duration alarm'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ContactFormLambdaFunction
+      TreatMissingData: notBreaching
+
+  ApiGateway4xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-api-4xx-errors-${Environment}'
+      AlarmDescription: 'API Gateway 4xx error rate alarm'
+      MetricName: 4XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref ContactFormRestApi
+      TreatMissingData: notBreaching
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+
+Outputs:
+  ApiEndpoint:
+    Description: 'Contact form API endpoint URL'
+    Value: !Sub 'https://${ContactFormRestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/contact'
+    Export:
+      Name: !Sub '${ProjectName}-api-endpoint-${Environment}'
+
+  ApiGatewayId:
+    Description: 'API Gateway REST API ID'
+    Value: !Ref ContactFormRestApi
+    Export:
+      Name: !Sub '${ProjectName}-api-id-${Environment}'
+
+  LambdaFunctionName:
+    Description: 'Lambda function name'
+    Value: !Ref ContactFormLambdaFunction
+    Export:
+      Name: !Sub '${ProjectName}-lambda-name-${Environment}'
+
+  LambdaFunctionArn:
+    Description: 'Lambda function ARN'
+    Value: !GetAtt ContactFormLambdaFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-lambda-arn-${Environment}'
+
+  IamRoleArn:
+    Description: 'IAM role ARN for Lambda execution'
+    Value: !GetAtt ContactFormLambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-role-arn-${Environment}'
+
+  LogGroupName:
+    Description: 'CloudWatch Log Group name for Lambda'
+    Value: !Ref ContactFormLambdaLogGroup
+    Export:
+      Name: !Sub '${ProjectName}-log-group-${Environment}'
+
+  SenderEmail:
+    Description: 'Configured sender email address'
+    Value: !Ref SenderEmail
+
+  CurlTestCommand:
+    Description: 'Sample curl command to test the API'
+    Value: !Sub |
+      curl -X POST \
+        -H "Content-Type: application/json" \
+        -d '{"name": "Test User", "email": "test@example.com", "subject": "Test Message", "message": "This is a test message from the contact form."}' \
+        https://${ContactFormRestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/contact
+
+  HTMLFormExample:
+    Description: 'Sample HTML form code'
+    Value: !Sub |
+      <form id="contactForm" onsubmit="submitForm(event)">
+        <input type="text" id="name" name="name" placeholder="Your Name" required>
+        <input type="email" id="email" name="email" placeholder="Your Email" required>
+        <input type="text" id="subject" name="subject" placeholder="Subject">
+        <textarea id="message" name="message" placeholder="Your Message" required></textarea>
+        <button type="submit">Send Message</button>
+      </form>
+      <script>
+      async function submitForm(event) {
+        event.preventDefault();
+        const formData = new FormData(event.target);
+        const data = Object.fromEntries(formData);
+        
+        try {
+          const response = await fetch('https://${ContactFormRestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/contact', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data)
+          });
+          
+          const result = await response.json();
+          if (response.ok) {
+            alert('Message sent successfully!');
+            event.target.reset();
+          } else {
+            alert('Error: ' + result.error);
+          }
+        } catch (error) {
+          alert('Network error: ' + error.message);
+        }
+      }
+      </script>

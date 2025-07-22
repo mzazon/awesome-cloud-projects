@@ -1,0 +1,635 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'IoT Analytics Pipelines with AWS IoT Analytics and Modern Alternatives - Complete infrastructure for processing and analyzing IoT sensor data'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'iot-analytics-demo'
+    Description: 'Project name used for resource naming'
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+    MaxLength: 50
+    MinLength: 3
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: 'Environment name for resource tagging'
+
+  DeployLegacyIoTAnalytics:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Deploy legacy IoT Analytics components (note: service ends support Dec 15, 2025)'
+
+  DeployModernAlternative:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Deploy modern alternative using Kinesis and Timestream'
+
+  KinesisShardCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: 'Number of shards for Kinesis Data Stream'
+
+  TimestreamMemoryStoreRetentionHours:
+    Type: Number
+    Default: 24
+    MinValue: 1
+    MaxValue: 8766
+    Description: 'Memory store retention period in hours'
+
+  TimestreamMagneticStoreRetentionDays:
+    Type: Number
+    Default: 365
+    MinValue: 1
+    MaxValue: 73000
+    Description: 'Magnetic store retention period in days'
+
+  IoTTopicPattern:
+    Type: String
+    Default: 'topic/sensor/data'
+    Description: 'IoT topic pattern for sensor data'
+    AllowedPattern: '^[a-zA-Z0-9/_-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, underscores, hyphens, and forward slashes'
+
+Conditions:
+  CreateLegacyIoTAnalytics: !Equals [!Ref DeployLegacyIoTAnalytics, 'true']
+  CreateModernAlternative: !Equals [!Ref DeployModernAlternative, 'true']
+  CreateIoTRule: !Or
+    - !Condition CreateLegacyIoTAnalytics
+    - !Condition CreateModernAlternative
+
+Resources:
+  # IAM Role for IoT Analytics Service
+  IoTAnalyticsServiceRole:
+    Type: AWS::IAM::Role
+    Condition: CreateLegacyIoTAnalytics
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-iot-analytics-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iotanalytics.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSIoTAnalyticsServiceRole
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-iot-analytics-service-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IoT Analytics Channel - Entry point for raw IoT data
+  IoTAnalyticsChannel:
+    Type: AWS::IoTAnalytics::Channel
+    Condition: CreateLegacyIoTAnalytics
+    Properties:
+      ChannelName: !Sub '${ProjectName}-${Environment}-sensor-channel'
+      RetentionPeriod:
+        Unlimited: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-sensor-channel'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IoT Analytics Datastore - Long-term storage for processed data
+  IoTAnalyticsDatastore:
+    Type: AWS::IoTAnalytics::Datastore
+    Condition: CreateLegacyIoTAnalytics
+    Properties:
+      DatastoreName: !Sub '${ProjectName}-${Environment}-sensor-datastore'
+      RetentionPeriod:
+        Unlimited: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-sensor-datastore'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IoT Analytics Pipeline - Data transformation workflow
+  IoTAnalyticsPipeline:
+    Type: AWS::IoTAnalytics::Pipeline
+    Condition: CreateLegacyIoTAnalytics
+    DependsOn:
+      - IoTAnalyticsChannel
+      - IoTAnalyticsDatastore
+    Properties:
+      PipelineName: !Sub '${ProjectName}-${Environment}-sensor-pipeline'
+      PipelineActivities:
+        - Channel:
+            Name: ChannelActivity
+            ChannelName: !Ref IoTAnalyticsChannel
+            Next: FilterActivity
+        - Filter:
+            Name: FilterActivity
+            Filter: 'temperature > 0 AND temperature < 100'
+            Next: MathActivity
+        - Math:
+            Name: MathActivity
+            Math: 'temperature'
+            Attribute: 'temperature_celsius'
+            Next: AddAttributesActivity
+        - AddAttributes:
+            Name: AddAttributesActivity
+            Attributes:
+              location: 'factory_floor_1'
+              device_type: 'temperature_sensor'
+              processed_by: 'iot-analytics-pipeline'
+            Next: DatastoreActivity
+        - Datastore:
+            Name: DatastoreActivity
+            DatastoreName: !Ref IoTAnalyticsDatastore
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-sensor-pipeline'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IoT Analytics Dataset - SQL-based interface for querying data
+  IoTAnalyticsDataset:
+    Type: AWS::IoTAnalytics::Dataset
+    Condition: CreateLegacyIoTAnalytics
+    DependsOn:
+      - IoTAnalyticsDatastore
+    Properties:
+      DatasetName: !Sub '${ProjectName}-${Environment}-sensor-dataset'
+      Actions:
+        - ActionName: SqlAction
+          QueryAction:
+            SqlQuery: !Sub |
+              SELECT * FROM ${IoTAnalyticsDatastore} 
+              WHERE temperature_celsius > 25 
+              ORDER BY timestamp DESC 
+              LIMIT 100
+      Triggers:
+        - Schedule:
+            ScheduleExpression: 'rate(1 hour)'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-sensor-dataset'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Kinesis Data Stream - Modern alternative for real-time data ingestion
+  KinesisDataStream:
+    Type: AWS::Kinesis::Stream
+    Condition: CreateModernAlternative
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-sensor-stream'
+      ShardCount: !Ref KinesisShardCount
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      RetentionPeriodHours: 24
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-sensor-stream'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Timestream Database - Purpose-built for time-series data
+  TimestreamDatabase:
+    Type: AWS::Timestream::Database
+    Condition: CreateModernAlternative
+    Properties:
+      DatabaseName: !Sub '${ProjectName}-${Environment}-sensor-db'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-sensor-db'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Timestream Table - Table for sensor data with retention settings
+  TimestreamTable:
+    Type: AWS::Timestream::Table
+    Condition: CreateModernAlternative
+    DependsOn:
+      - TimestreamDatabase
+    Properties:
+      DatabaseName: !Ref TimestreamDatabase
+      TableName: 'sensor-data'
+      RetentionProperties:
+        MemoryStoreRetentionPeriodInHours: !Ref TimestreamMemoryStoreRetentionHours
+        MagneticStoreRetentionPeriodInDays: !Ref TimestreamMagneticStoreRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-sensor-data-table'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for Lambda function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: CreateModernAlternative
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-timestream-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaKinesisExecutionRole
+      Policies:
+        - PolicyName: TimestreamWritePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - timestream:WriteRecords
+                  - timestream:DescribeEndpoints
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-lambda-timestream-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda function for processing Kinesis records and writing to Timestream
+  ProcessIoTDataFunction:
+    Type: AWS::Lambda::Function
+    Condition: CreateModernAlternative
+    DependsOn:
+      - LambdaExecutionRole
+      - TimestreamTable
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-process-iot-data'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      ReservedConcurrencyLimit: 10
+      Environment:
+        Variables:
+          TIMESTREAM_DATABASE: !Ref TimestreamDatabase
+          TIMESTREAM_TABLE: !Ref TimestreamTable
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import base64
+          import time
+          import os
+          from datetime import datetime
+          
+          # Initialize Timestream client
+          timestream = boto3.client('timestream-write')
+          
+          def lambda_handler(event, context):
+              database_name = os.environ['TIMESTREAM_DATABASE']
+              table_name = os.environ['TIMESTREAM_TABLE']
+              
+              records = []
+              
+              try:
+                  for record in event['Records']:
+                      # Decode Kinesis record
+                      encoded_data = record['kinesis']['data']
+                      decoded_data = base64.b64decode(encoded_data)
+                      payload = json.loads(decoded_data)
+                      
+                      # Validate required fields
+                      if 'temperature' not in payload or 'deviceId' not in payload:
+                          print(f"Skipping record missing required fields: {payload}")
+                          continue
+                      
+                      # Filter invalid temperature readings
+                      temperature = float(payload.get('temperature', 0))
+                      if temperature <= 0 or temperature >= 100:
+                          print(f"Skipping invalid temperature reading: {temperature}")
+                          continue
+                      
+                      # Prepare Timestream record
+                      current_time = str(int(time.time() * 1000))
+                      
+                      # Temperature record
+                      temperature_record = {
+                          'Time': current_time,
+                          'TimeUnit': 'MILLISECONDS',
+                          'Dimensions': [
+                              {
+                                  'Name': 'DeviceId',
+                                  'Value': str(payload.get('deviceId', 'unknown'))
+                              },
+                              {
+                                  'Name': 'Location',
+                                  'Value': 'factory_floor_1'
+                              },
+                              {
+                                  'Name': 'DeviceType',
+                                  'Value': 'temperature_sensor'
+                              }
+                          ],
+                          'MeasureName': 'temperature',
+                          'MeasureValue': str(temperature),
+                          'MeasureValueType': 'DOUBLE'
+                      }
+                      
+                      records.append(temperature_record)
+                      
+                      # Add humidity record if available
+                      if 'humidity' in payload:
+                          humidity = float(payload.get('humidity', 0))
+                          if 0 <= humidity <= 100:
+                              humidity_record = {
+                                  'Time': current_time,
+                                  'TimeUnit': 'MILLISECONDS',
+                                  'Dimensions': [
+                                      {
+                                          'Name': 'DeviceId',
+                                          'Value': str(payload.get('deviceId', 'unknown'))
+                                      },
+                                      {
+                                          'Name': 'Location',
+                                          'Value': 'factory_floor_1'
+                                      },
+                                      {
+                                          'Name': 'DeviceType',
+                                          'Value': 'humidity_sensor'
+                                      }
+                                  ],
+                                  'MeasureName': 'humidity',
+                                  'MeasureValue': str(humidity),
+                                  'MeasureValueType': 'DOUBLE'
+                              }
+                              records.append(humidity_record)
+                  
+                  # Write to Timestream in batches
+                  if records:
+                      batch_size = 100
+                      for i in range(0, len(records), batch_size):
+                          batch = records[i:i + batch_size]
+                          
+                          response = timestream.write_records(
+                              DatabaseName=database_name,
+                              TableName=table_name,
+                              Records=batch
+                          )
+                          
+                          print(f"Successfully wrote {len(batch)} records to Timestream")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(f'Successfully processed {len(records)} records')
+                  }
+                  
+              except Exception as e:
+                  print(f"Error processing records: {str(e)}")
+                  raise e
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-process-iot-data'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Event Source Mapping - Connect Kinesis to Lambda
+  KinesisEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: CreateModernAlternative
+    DependsOn:
+      - ProcessIoTDataFunction
+      - KinesisDataStream
+    Properties:
+      EventSourceArn: !GetAtt KinesisDataStream.Arn
+      FunctionName: !Ref ProcessIoTDataFunction
+      StartingPosition: LATEST
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 5
+      ParallelizationFactor: 1
+
+  # IAM Role for IoT Rules
+  IoTRuleRole:
+    Type: AWS::IAM::Role
+    Condition: CreateIoTRule
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-iot-rule-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: IoTAnalyticsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iotanalytics:BatchPutMessage
+                Resource: !If
+                  - CreateLegacyIoTAnalytics
+                  - !Sub 'arn:aws:iotanalytics:${AWS::Region}:${AWS::AccountId}:channel/${IoTAnalyticsChannel}'
+                  - !Ref AWS::NoValue
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource: !If
+                  - CreateModernAlternative
+                  - !GetAtt KinesisDataStream.Arn
+                  - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-iot-rule-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IoT Rule for Legacy IoT Analytics
+  IoTAnalyticsRule:
+    Type: AWS::IoT::TopicRule
+    Condition: CreateLegacyIoTAnalytics
+    DependsOn:
+      - IoTAnalyticsChannel
+      - IoTRuleRole
+    Properties:
+      RuleName: !Sub '${ProjectName}${Environment}IoTAnalyticsRule'
+      TopicRulePayload:
+        Sql: !Sub "SELECT * FROM '${IoTTopicPattern}'"
+        Description: 'Route sensor data to IoT Analytics Channel'
+        Actions:
+          - IotAnalytics:
+              ChannelName: !Ref IoTAnalyticsChannel
+              RoleArn: !GetAtt IoTRuleRole.Arn
+        RuleDisabled: false
+
+  # IoT Rule for Modern Alternative (Kinesis)
+  KinesisRule:
+    Type: AWS::IoT::TopicRule
+    Condition: CreateModernAlternative
+    DependsOn:
+      - KinesisDataStream
+      - IoTRuleRole
+    Properties:
+      RuleName: !Sub '${ProjectName}${Environment}KinesisRule'
+      TopicRulePayload:
+        Sql: !Sub "SELECT * FROM '${IoTTopicPattern}'"
+        Description: 'Route sensor data to Kinesis Data Stream'
+        Actions:
+          - Kinesis:
+              StreamName: !Ref KinesisDataStream
+              PartitionKey: '${deviceId}'
+              RoleArn: !GetAtt IoTRuleRole.Arn
+        RuleDisabled: false
+
+  # CloudWatch Log Group for Lambda function
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateModernAlternative
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-process-iot-data'
+      RetentionInDays: 30
+
+Outputs:
+  # Legacy IoT Analytics Outputs
+  IoTAnalyticsChannelName:
+    Description: 'IoT Analytics Channel Name'
+    Value: !Ref IoTAnalyticsChannel
+    Condition: CreateLegacyIoTAnalytics
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTAnalyticsChannelName'
+
+  IoTAnalyticsDatastoreName:
+    Description: 'IoT Analytics Datastore Name'
+    Value: !Ref IoTAnalyticsDatastore
+    Condition: CreateLegacyIoTAnalytics
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTAnalyticsDatastoreName'
+
+  IoTAnalyticsPipelineName:
+    Description: 'IoT Analytics Pipeline Name'
+    Value: !Ref IoTAnalyticsPipeline
+    Condition: CreateLegacyIoTAnalytics
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTAnalyticsPipelineName'
+
+  IoTAnalyticsDatasetName:
+    Description: 'IoT Analytics Dataset Name'
+    Value: !Ref IoTAnalyticsDataset
+    Condition: CreateLegacyIoTAnalytics
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTAnalyticsDatasetName'
+
+  # Modern Alternative Outputs
+  KinesisDataStreamName:
+    Description: 'Kinesis Data Stream Name'
+    Value: !Ref KinesisDataStream
+    Condition: CreateModernAlternative
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisDataStreamName'
+
+  KinesisDataStreamArn:
+    Description: 'Kinesis Data Stream ARN'
+    Value: !GetAtt KinesisDataStream.Arn
+    Condition: CreateModernAlternative
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisDataStreamArn'
+
+  TimestreamDatabaseName:
+    Description: 'Timestream Database Name'
+    Value: !Ref TimestreamDatabase
+    Condition: CreateModernAlternative
+    Export:
+      Name: !Sub '${AWS::StackName}-TimestreamDatabaseName'
+
+  TimestreamTableName:
+    Description: 'Timestream Table Name'
+    Value: !Ref TimestreamTable
+    Condition: CreateModernAlternative
+    Export:
+      Name: !Sub '${AWS::StackName}-TimestreamTableName'
+
+  ProcessIoTDataFunctionName:
+    Description: 'Lambda Function Name for Processing IoT Data'
+    Value: !Ref ProcessIoTDataFunction
+    Condition: CreateModernAlternative
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessIoTDataFunctionName'
+
+  ProcessIoTDataFunctionArn:
+    Description: 'Lambda Function ARN for Processing IoT Data'
+    Value: !GetAtt ProcessIoTDataFunction.Arn
+    Condition: CreateModernAlternative
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessIoTDataFunctionArn'
+
+  # Common Outputs
+  IoTTopicPattern:
+    Description: 'IoT Topic Pattern for Sensor Data'
+    Value: !Ref IoTTopicPattern
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTTopicPattern'
+
+  ProjectName:
+    Description: 'Project Name'
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectName'
+
+  Environment:
+    Description: 'Environment'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+  # Sample IoT Device Commands
+  SampleIoTPublishCommand:
+    Description: 'Sample AWS CLI command to publish test IoT data'
+    Value: !Sub |
+      aws iot-data publish --topic "${IoTTopicPattern}" --payload '{"timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)'", "deviceId": "sensor001", "temperature": 25.5, "humidity": 60.2}'
+    Export:
+      Name: !Sub '${AWS::StackName}-SampleIoTPublishCommand'
+
+  TimestreamQueryExample:
+    Description: 'Sample Timestream query to retrieve sensor data'
+    Value: !Sub |
+      SELECT * FROM "${TimestreamDatabase}"."${TimestreamTable}" WHERE time > ago(1h) ORDER BY time DESC LIMIT 10
+    Condition: CreateModernAlternative
+    Export:
+      Name: !Sub '${AWS::StackName}-TimestreamQueryExample'

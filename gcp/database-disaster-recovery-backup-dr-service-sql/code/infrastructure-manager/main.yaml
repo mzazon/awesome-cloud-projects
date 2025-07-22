@@ -1,0 +1,681 @@
+# Infrastructure Manager Configuration for Database Disaster Recovery
+# This configuration deploys a comprehensive disaster recovery solution using
+# Google Cloud's Backup and DR Service alongside Cloud SQL's advanced capabilities
+#
+# Architecture Components:
+# - Cloud SQL Primary Instance with High Availability (Enterprise Plus)
+# - Cross-region Disaster Recovery Replica
+# - Backup and DR Service Vaults (Primary and Secondary regions)
+# - Cloud Functions for DR orchestration and monitoring
+# - Cloud Monitoring alerts and Pub/Sub notifications
+# - Cloud Scheduler for automated backup validation
+
+imports:
+- path: templates/cloud-sql.jinja
+- path: templates/backup-dr.jinja
+- path: templates/cloud-functions.jinja
+- path: templates/monitoring.jinja
+
+resources:
+  # ========================================
+  # PROJECT AND REGION CONFIGURATION
+  # ========================================
+  
+  # Primary Cloud SQL Instance with Enterprise Plus and High Availability
+  primary-sql-instance:
+    type: gcp-types/sqladmin-v1:instances
+    properties:
+      name: $(ref.project-config.primary-instance-name)
+      project: $(ref.project-config.project-id)
+      region: $(ref.project-config.primary-region)
+      databaseVersion: POSTGRES_15
+      settings:
+        tier: db-custom-2-8192
+        availabilityType: REGIONAL
+        dataDiskType: PD_SSD
+        dataDiskSizeGb: 100
+        storageAutoResize: true
+        storageAutoResizeLimit: 1000
+        # Enterprise Plus edition for advanced DR capabilities
+        edition: ENTERPRISE_PLUS
+        # Automated backup configuration
+        backupConfiguration:
+          enabled: true
+          startTime: "03:00"
+          pointInTimeRecoveryEnabled: true
+          transactionLogRetentionDays: 7
+          backupRetentionSettings:
+            retainedBackups: 30
+            retentionUnit: COUNT
+        # High availability configuration
+        locationPreference:
+          zone: $(ref.project-config.primary-zone)
+          secondaryZone: $(ref.project-config.primary-zone-secondary)
+        # Security and access configuration
+        ipConfiguration:
+          ipv4Enabled: true
+          requireSsl: true
+          authorizedNetworks: []
+        # Maintenance and update settings
+        maintenanceWindow:
+          hour: 4
+          day: 7
+          updateTrack: stable
+        # Database flags for optimization
+        databaseFlags:
+        - name: max_connections
+          value: "200"
+        - name: shared_preload_libraries
+          value: "pg_stat_statements"
+        # User labels for resource management
+        userLabels:
+          environment: production
+          purpose: primary-database
+          disaster-recovery: enabled
+      # Deletion protection for production safety
+      settings:
+        deletionProtectionEnabled: true
+    metadata:
+      dependsOn:
+      - project-apis
+
+  # Cross-region Disaster Recovery Replica
+  dr-replica-instance:
+    type: gcp-types/sqladmin-v1:instances
+    properties:
+      name: $(ref.project-config.dr-replica-name)
+      project: $(ref.project-config.project-id)
+      region: $(ref.project-config.secondary-region)
+      # Replica configuration pointing to primary instance
+      masterInstanceName: $(ref.primary-sql-instance.name)
+      replicaConfiguration:
+        failoverTarget: true
+      settings:
+        tier: db-custom-2-8192
+        availabilityType: ZONAL
+        dataDiskType: PD_SSD
+        # Replica-specific configuration
+        replicaConfiguration:
+          kind: sql#replicaConfiguration
+          mysqlReplicaConfiguration:
+            connectRetryInterval: 60
+            masterHeartbeatPeriod: 10000
+        # User labels for resource management
+        userLabels:
+          environment: production
+          purpose: disaster-recovery-replica
+          primary-instance: $(ref.primary-sql-instance.name)
+    metadata:
+      dependsOn:
+      - primary-sql-instance
+
+  # ========================================
+  # BACKUP AND DR SERVICE CONFIGURATION
+  # ========================================
+
+  # Primary Region Backup Vault
+  primary-backup-vault:
+    type: gcp-types/backupdr-v1:projects.locations.backupVaults
+    properties:
+      parent: projects/$(ref.project-config.project-id)/locations/$(ref.project-config.primary-region)
+      backupVaultId: $(ref.project-config.backup-vault-primary)
+      description: "Primary backup vault for disaster recovery with immutable storage"
+      # Immutable backup configuration
+      backupMinimumEnforcedRetentionDuration: 2592000s  # 30 days in seconds
+      effectiveTime: $(ref.project-config.current-time)
+      # Encryption configuration
+      encryptionInfo:
+        encryptionType: GOOGLE_DEFAULT_ENCRYPTION
+      labels:
+        environment: production
+        purpose: primary-backup
+        region: $(ref.project-config.primary-region)
+    metadata:
+      dependsOn:
+      - project-apis
+
+  # Secondary Region Backup Vault
+  secondary-backup-vault:
+    type: gcp-types/backupdr-v1:projects.locations.backupVaults
+    properties:
+      parent: projects/$(ref.project-config.project-id)/locations/$(ref.project-config.secondary-region)
+      backupVaultId: $(ref.project-config.backup-vault-secondary)
+      description: "Secondary backup vault for cross-region disaster recovery"
+      # Immutable backup configuration
+      backupMinimumEnforcedRetentionDuration: 2592000s  # 30 days in seconds
+      effectiveTime: $(ref.project-config.current-time)
+      # Encryption configuration
+      encryptionInfo:
+        encryptionType: GOOGLE_DEFAULT_ENCRYPTION
+      labels:
+        environment: production
+        purpose: secondary-backup
+        region: $(ref.project-config.secondary-region)
+    metadata:
+      dependsOn:
+      - project-apis
+
+  # Primary Backup Plan
+  primary-backup-plan:
+    type: gcp-types/backupdr-v1:projects.locations.backupPlans
+    properties:
+      parent: projects/$(ref.project-config.project-id)/locations/$(ref.project-config.primary-region)
+      backupPlanId: backup-plan-$(ref.project-config.primary-instance-name)
+      description: "Automated backup plan for primary Cloud SQL instance"
+      # Backup vault reference
+      backupVault: $(ref.primary-backup-vault.name)
+      # Resource type configuration
+      resourceType: cloudsql.googleapis.com/Instance
+      # Backup schedule and retention
+      backupRules:
+      - backupRetentionDays: 30
+        # Daily backup at 2 AM
+        backupSchedule: "0 2 * * *"
+      labels:
+        environment: production
+        purpose: automated-backup
+        target-instance: $(ref.project-config.primary-instance-name)
+    metadata:
+      dependsOn:
+      - primary-backup-vault
+      - primary-sql-instance
+
+  # Backup Plan Association for Primary Instance
+  primary-backup-association:
+    type: gcp-types/backupdr-v1:projects.locations.backupPlanAssociations
+    properties:
+      parent: projects/$(ref.project-config.project-id)/locations/$(ref.project-config.primary-region)
+      backupPlanAssociationId: association-$(ref.project-config.primary-instance-name)
+      # Reference to the backup plan
+      backupPlan: $(ref.primary-backup-plan.name)
+      # Target resource configuration
+      resource: projects/$(ref.project-config.project-id)/instances/$(ref.project-config.primary-instance-name)
+      resourceType: cloudsql.googleapis.com/Instance
+    metadata:
+      dependsOn:
+      - primary-backup-plan
+      - primary-sql-instance
+
+  # Secondary Backup Plan for DR Replica
+  secondary-backup-plan:
+    type: gcp-types/backupdr-v1:projects.locations.backupPlans
+    properties:
+      parent: projects/$(ref.project-config.project-id)/locations/$(ref.project-config.secondary-region)
+      backupPlanId: backup-plan-$(ref.project-config.dr-replica-name)
+      description: "Backup plan for disaster recovery replica"
+      # Backup vault reference
+      backupVault: $(ref.secondary-backup-vault.name)
+      # Resource type configuration
+      resourceType: cloudsql.googleapis.com/Instance
+      # Backup schedule and retention
+      backupRules:
+      - backupRetentionDays: 30
+        # Daily backup at 3 AM (offset from primary)
+        backupSchedule: "0 3 * * *"
+      labels:
+        environment: production
+        purpose: dr-replica-backup
+        target-instance: $(ref.project-config.dr-replica-name)
+    metadata:
+      dependsOn:
+      - secondary-backup-vault
+      - dr-replica-instance
+
+  # ========================================
+  # PUB/SUB MESSAGING CONFIGURATION
+  # ========================================
+
+  # Pub/Sub Topic for Disaster Recovery Alerts
+  dr-alerts-topic:
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project-config.project-id)/topics/disaster-recovery-alerts
+      labels:
+        environment: production
+        purpose: disaster-recovery-notifications
+      # Message retention and ordering
+      messageRetentionDuration: 604800s  # 7 days
+      messageStoragePolicy:
+        allowedPersistenceRegions:
+        - $(ref.project-config.primary-region)
+        - $(ref.project-config.secondary-region)
+    metadata:
+      dependsOn:
+      - project-apis
+
+  # Pub/Sub Subscription for DR Function Trigger
+  dr-function-subscription:
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(ref.project-config.project-id)/subscriptions/dr-function-trigger
+      topic: $(ref.dr-alerts-topic.name)
+      # Subscription configuration
+      messageRetentionDuration: 604800s  # 7 days
+      ackDeadlineSeconds: 600  # 10 minutes for function processing
+      # Dead letter queue configuration
+      deadLetterPolicy:
+        maxDeliveryAttempts: 5
+      # Retry policy for reliable delivery
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+      labels:
+        environment: production
+        purpose: dr-orchestration
+    metadata:
+      dependsOn:
+      - dr-alerts-topic
+
+  # ========================================
+  # CLOUD FUNCTIONS CONFIGURATION
+  # ========================================
+
+  # IAM Service Account for Cloud Functions
+  cloud-functions-sa:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: dr-functions-sa-$(ref.project-config.resource-suffix)
+      serviceAccount:
+        displayName: "Disaster Recovery Functions Service Account"
+        description: "Service account for DR orchestration and monitoring functions"
+      parent: projects/$(ref.project-config.project-id)
+    metadata:
+      dependsOn:
+      - project-apis
+
+  # IAM Bindings for Cloud Functions Service Account
+  cloud-functions-sa-bindings:
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: $(ref.project-config.project-id)
+      policy:
+        bindings:
+        # Cloud SQL Admin permissions for failover operations
+        - role: roles/cloudsql.admin
+          members:
+          - serviceAccount:$(ref.cloud-functions-sa.email)
+        # Backup and DR permissions
+        - role: roles/backupdr.admin
+          members:
+          - serviceAccount:$(ref.cloud-functions-sa.email)
+        # Monitoring and alerting permissions
+        - role: roles/monitoring.metricWriter
+          members:
+          - serviceAccount:$(ref.cloud-functions-sa.email)
+        # Pub/Sub permissions for notifications
+        - role: roles/pubsub.publisher
+          members:
+          - serviceAccount:$(ref.cloud-functions-sa.email)
+    metadata:
+      dependsOn:
+      - cloud-functions-sa
+
+  # Cloud Storage Bucket for Function Source Code
+  function-source-bucket:
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: dr-functions-source-$(ref.project-config.project-id)-$(ref.project-config.resource-suffix)
+      location: $(ref.project-config.primary-region)
+      # Security and access configuration
+      uniformBucketLevelAccess:
+        enabled: true
+      # Lifecycle management for source code cleanup
+      lifecycle:
+        rule:
+        - action:
+            type: Delete
+          condition:
+            age: 30
+      labels:
+        environment: production
+        purpose: function-source-code
+    metadata:
+      dependsOn:
+      - project-apis
+
+  # Disaster Recovery Orchestration Function
+  dr-orchestration-function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project-config.project-id)/locations/$(ref.project-config.primary-region)
+      function:
+        name: orchestrate-disaster-recovery
+        description: "Orchestrate disaster recovery operations for Cloud SQL"
+        # Function source configuration
+        sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/dr-orchestration.zip
+        # Runtime and entry point
+        runtime: python311
+        entryPoint: orchestrate_disaster_recovery
+        # Memory and timeout configuration
+        availableMemoryMb: 512
+        timeout: 540s
+        # Environment variables
+        environmentVariables:
+          PROJECT_ID: $(ref.project-config.project-id)
+          PRIMARY_INSTANCE: $(ref.project-config.primary-instance-name)
+          DR_REPLICA: $(ref.project-config.dr-replica-name)
+          PRIMARY_REGION: $(ref.project-config.primary-region)
+          SECONDARY_REGION: $(ref.project-config.secondary-region)
+        # Service account configuration
+        serviceAccountEmail: $(ref.cloud-functions-sa.email)
+        # HTTP trigger configuration
+        httpsTrigger:
+          securityLevel: SECURE_ALWAYS
+        # Ingress and egress settings
+        ingressSettings: ALLOW_INTERNAL_ONLY
+        # Labels for resource management
+        labels:
+          environment: production
+          purpose: disaster-recovery-orchestration
+    metadata:
+      dependsOn:
+      - cloud-functions-sa
+      - function-source-bucket
+      - cloud-functions-sa-bindings
+
+  # Backup Validation Function
+  backup-validation-function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project-config.project-id)/locations/$(ref.project-config.primary-region)
+      function:
+        name: validate-backups
+        description: "Validate backup integrity and DR readiness"
+        # Function source configuration
+        sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/backup-validation.zip
+        # Runtime and entry point
+        runtime: python311
+        entryPoint: validate_backups
+        # Memory and timeout configuration
+        availableMemoryMb: 256
+        timeout: 300s
+        # Environment variables
+        environmentVariables:
+          PROJECT_ID: $(ref.project-config.project-id)
+          PRIMARY_INSTANCE: $(ref.project-config.primary-instance-name)
+          PRIMARY_REGION: $(ref.project-config.primary-region)
+        # Service account configuration
+        serviceAccountEmail: $(ref.cloud-functions-sa.email)
+        # HTTP trigger configuration
+        httpsTrigger:
+          securityLevel: SECURE_ALWAYS
+        # Ingress and egress settings
+        ingressSettings: ALLOW_INTERNAL_ONLY
+        # Labels for resource management
+        labels:
+          environment: production
+          purpose: backup-validation
+    metadata:
+      dependsOn:
+      - cloud-functions-sa
+      - function-source-bucket
+      - cloud-functions-sa-bindings
+
+  # Backup Replication Monitor Function
+  backup-monitor-function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project-config.project-id)/locations/$(ref.project-config.primary-region)
+      function:
+        name: monitor-backup-replication
+        description: "Monitor backup replication across regions"
+        # Function source configuration
+        sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/backup-monitor.zip
+        # Runtime and entry point
+        runtime: python311
+        entryPoint: monitor_backup_replication
+        # Memory and timeout configuration
+        availableMemoryMb: 256
+        timeout: 300s
+        # Environment variables
+        environmentVariables:
+          PROJECT_ID: $(ref.project-config.project-id)
+          PRIMARY_REGION: $(ref.project-config.primary-region)
+          SECONDARY_REGION: $(ref.project-config.secondary-region)
+        # Service account configuration
+        serviceAccountEmail: $(ref.cloud-functions-sa.email)
+        # Event trigger configuration
+        eventTrigger:
+          eventType: providers/cloud.pubsub/eventTypes/topic.publish
+          resource: $(ref.dr-alerts-topic.name)
+        # Labels for resource management
+        labels:
+          environment: production
+          purpose: backup-replication-monitoring
+    metadata:
+      dependsOn:
+      - cloud-functions-sa
+      - function-source-bucket
+      - dr-alerts-topic
+      - cloud-functions-sa-bindings
+
+  # ========================================
+  # CLOUD SCHEDULER CONFIGURATION
+  # ========================================
+
+  # Cloud Scheduler Job for Automated DR Testing
+  dr-validation-scheduler:
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/$(ref.project-config.project-id)/locations/$(ref.project-config.primary-region)
+      job:
+        name: dr-validation-job
+        description: "Weekly disaster recovery validation and testing"
+        # Schedule: Every Monday at 4 AM UTC
+        schedule: "0 4 * * 1"
+        timeZone: "UTC"
+        # HTTP target configuration
+        httpTarget:
+          uri: $(ref.dr-orchestration-function.httpsTrigger.url)
+          httpMethod: POST
+          headers:
+            Content-Type: application/json
+          body: |
+            {
+              "action": "validate_backups",
+              "test_mode": true,
+              "automated": true
+            }
+          # Authentication configuration
+          oidcToken:
+            serviceAccountEmail: $(ref.cloud-functions-sa.email)
+        # Retry configuration
+        retryConfig:
+          retryCount: 3
+          maxRetryDuration: 3600s  # 1 hour
+          minBackoffDuration: 60s
+          maxBackoffDuration: 300s
+    metadata:
+      dependsOn:
+      - dr-orchestration-function
+      - cloud-functions-sa
+
+  # ========================================
+  # CLOUD MONITORING CONFIGURATION
+  # ========================================
+
+  # Cloud Monitoring Alert Policy for Database Health
+  sql-health-alert-policy:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(ref.project-config.project-id)
+      alertPolicy:
+        displayName: "Cloud SQL Primary Instance Health Alert"
+        documentation:
+          content: "Alert triggered when Cloud SQL primary instance becomes unavailable"
+          mimeType: text/markdown
+        # Alert conditions
+        conditions:
+        - displayName: "Cloud SQL instance down"
+          conditionThreshold:
+            filter: 'resource.type="cloudsql_database" AND resource.labels.database_id="$(ref.project-config.project-id):$(ref.project-config.primary-instance-name)"'
+            comparison: COMPARISON_LESS_THAN
+            thresholdValue:
+              doubleValue: 1
+            duration: 300s  # 5 minutes
+            aggregations:
+            - alignmentPeriod: 60s
+              perSeriesAligner: ALIGN_MEAN
+              crossSeriesReducer: REDUCE_MEAN
+              groupByFields:
+              - resource.labels.database_id
+        # Notification channels (to be configured separately)
+        notificationChannels: []
+        # Alert strategy
+        alertStrategy:
+          autoClose: 1800s  # 30 minutes
+        # Enabled state
+        enabled: true
+    metadata:
+      dependsOn:
+      - primary-sql-instance
+      - project-apis
+
+  # Cloud Monitoring Alert Policy for Backup Failures
+  backup-failure-alert-policy:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(ref.project-config.project-id)
+      alertPolicy:
+        displayName: "Backup and DR Service Failure Alert"
+        documentation:
+          content: "Alert triggered when backup operations fail"
+          mimeType: text/markdown
+        # Alert conditions
+        conditions:
+        - displayName: "Backup operation failure"
+          conditionThreshold:
+            filter: 'resource.type="backupdr.googleapis.com/BackupPlan"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue:
+              doubleValue: 0
+            duration: 60s
+            aggregations:
+            - alignmentPeriod: 300s
+              perSeriesAligner: ALIGN_RATE
+              crossSeriesReducer: REDUCE_SUM
+        # Notification channels (to be configured separately)
+        notificationChannels: []
+        # Alert strategy
+        alertStrategy:
+          autoClose: 3600s  # 1 hour
+        # Enabled state
+        enabled: true
+    metadata:
+      dependsOn:
+      - primary-backup-plan
+      - project-apis
+
+  # ========================================
+  # PROJECT CONFIGURATION AND APIS
+  # ========================================
+
+  # Enable required Google Cloud APIs
+  project-apis:
+    type: gcp-types/servicemanagement-v1:projects.services
+    properties:
+      parent: projects/$(ref.project-config.project-id)
+      services:
+      - sqladmin.googleapis.com
+      - backupdr.googleapis.com
+      - cloudfunctions.googleapis.com
+      - cloudscheduler.googleapis.com
+      - monitoring.googleapis.com
+      - pubsub.googleapis.com
+      - storage.googleapis.com
+      - iam.googleapis.com
+      - cloudresourcemanager.googleapis.com
+
+  # Project configuration template
+  project-config:
+    type: config.yaml
+    properties:
+      project-id: ${PROJECT_ID}
+      primary-region: ${PRIMARY_REGION:-us-central1}
+      secondary-region: ${SECONDARY_REGION:-us-east1}
+      primary-zone: ${PRIMARY_ZONE:-us-central1-a}
+      primary-zone-secondary: ${PRIMARY_ZONE_SECONDARY:-us-central1-b}
+      secondary-zone: ${SECONDARY_ZONE:-us-east1-a}
+      resource-suffix: ${RESOURCE_SUFFIX}
+      primary-instance-name: prod-db-${RESOURCE_SUFFIX}
+      dr-replica-name: prod-db-dr-${RESOURCE_SUFFIX}
+      backup-vault-primary: backup-vault-primary-${RESOURCE_SUFFIX}
+      backup-vault-secondary: backup-vault-secondary-${RESOURCE_SUFFIX}
+      current-time: ${CURRENT_TIME}
+
+# ========================================
+# OUTPUTS
+# ========================================
+
+outputs:
+  # Cloud SQL Instance Information
+  primary-sql-instance-name:
+    description: "Name of the primary Cloud SQL instance"
+    value: $(ref.primary-sql-instance.name)
+  
+  primary-sql-instance-connection:
+    description: "Connection name for the primary Cloud SQL instance"
+    value: $(ref.primary-sql-instance.connectionName)
+  
+  dr-replica-instance-name:
+    description: "Name of the disaster recovery replica instance"
+    value: $(ref.dr-replica-instance.name)
+  
+  dr-replica-instance-connection:
+    description: "Connection name for the DR replica instance"
+    value: $(ref.dr-replica-instance.connectionName)
+
+  # Backup and DR Service Information
+  primary-backup-vault-name:
+    description: "Name of the primary backup vault"
+    value: $(ref.primary-backup-vault.name)
+  
+  secondary-backup-vault-name:
+    description: "Name of the secondary backup vault"
+    value: $(ref.secondary-backup-vault.name)
+  
+  primary-backup-plan-name:
+    description: "Name of the primary backup plan"
+    value: $(ref.primary-backup-plan.name)
+
+  # Cloud Functions Information
+  dr-orchestration-function-url:
+    description: "HTTP trigger URL for the DR orchestration function"
+    value: $(ref.dr-orchestration-function.httpsTrigger.url)
+  
+  backup-validation-function-url:
+    description: "HTTP trigger URL for the backup validation function"
+    value: $(ref.backup-validation-function.httpsTrigger.url)
+
+  # Pub/Sub Information
+  dr-alerts-topic-name:
+    description: "Name of the disaster recovery alerts Pub/Sub topic"
+    value: $(ref.dr-alerts-topic.name)
+  
+  dr-function-subscription-name:
+    description: "Name of the DR function Pub/Sub subscription"
+    value: $(ref.dr-function-subscription.name)
+
+  # Monitoring Information
+  sql-health-alert-policy-name:
+    description: "Name of the Cloud SQL health alert policy"
+    value: $(ref.sql-health-alert-policy.name)
+  
+  backup-failure-alert-policy-name:
+    description: "Name of the backup failure alert policy"
+    value: $(ref.backup-failure-alert-policy.name)
+
+  # Scheduler Information
+  dr-validation-scheduler-name:
+    description: "Name of the DR validation scheduler job"
+    value: $(ref.dr-validation-scheduler.name)
+
+  # Service Account Information
+  cloud-functions-service-account:
+    description: "Email of the Cloud Functions service account"
+    value: $(ref.cloud-functions-sa.email)
+
+  # Storage Information
+  function-source-bucket-name:
+    description: "Name of the function source code storage bucket"
+    value: $(ref.function-source-bucket.name)

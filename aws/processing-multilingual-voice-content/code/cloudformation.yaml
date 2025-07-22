@@ -1,0 +1,1262 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Multi-Language Voice Processing Pipeline with Amazon Transcribe, Translate, and Polly'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'voice-pipeline'
+    Description: 'Project name used for resource naming and tagging'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9\-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+    MaxLength: 32
+    MinLength: 3
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - 'dev'
+      - 'staging'
+      - 'prod'
+    Description: 'Environment for deployment'
+
+  TargetLanguages:
+    Type: CommaDelimitedList
+    Default: 'es,fr,de,pt'
+    Description: 'Comma-separated list of target languages for translation (e.g., es,fr,de,pt)'
+
+  DynamoDBReadCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+    Description: 'Read capacity units for DynamoDB table'
+
+  DynamoDBWriteCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+    Description: 'Write capacity units for DynamoDB table'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+    Description: 'Lambda function timeout in seconds'
+
+  EnableCloudWatchLogs:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable CloudWatch Logs for Lambda functions'
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for pipeline notifications (optional)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+Conditions:
+  CreateNotificationTopic: !Not [!Equals [!Ref NotificationEmail, '']]
+  EnableLogging: !Equals [!Ref EnableCloudWatchLogs, 'true']
+
+Resources:
+  # S3 Buckets for Input and Output
+  InputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-input-${AWS::AccountId}-${Environment}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ProcessingTriggerFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .mp3
+                  - Name: suffix
+                    Value: .wav
+                  - Name: suffix
+                    Value: .flac
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteTemporaryFiles
+            Status: Enabled
+            ExpirationInDays: 30
+            Prefix: temp/
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-input-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-output-${AWS::AccountId}-${Environment}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldFiles
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-output-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # DynamoDB Table for Job Tracking
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-jobs-${Environment}'
+      AttributeDefinitions:
+        - AttributeName: JobId
+          AttributeType: S
+        - AttributeName: Status
+          AttributeType: S
+        - AttributeName: Timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: JobId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: Status
+              KeyType: HASH
+            - AttributeName: Timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !Ref DynamoDBReadCapacity
+            WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref DynamoDBReadCapacity
+        WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-jobs-table'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SQS Queue for Processing
+  ProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-processing-queue-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeout: 360  # 6 minutes
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-processing-queue'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-dlq-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dead-letter-queue'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SNS Topic for Notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateNotificationTopic
+    Properties:
+      TopicName: !Sub '${ProjectName}-notifications-${Environment}'
+      DisplayName: !Sub '${ProjectName} Voice Processing Notifications'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-notifications'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateNotificationTopic
+    Properties:
+      Protocol: email
+      TopicArn: !Ref NotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # IAM Role for Lambda Functions
+  VoiceProcessingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-voice-processing-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - states.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: VoiceProcessingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3 Permissions
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${InputBucket}/*'
+                  - !Sub '${OutputBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt InputBucket.Arn
+                  - !GetAtt OutputBucket.Arn
+              # DynamoDB Permissions
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt JobsTable.Arn
+                  - !Sub '${JobsTable.Arn}/index/*'
+              # Transcribe Permissions
+              - Effect: Allow
+                Action:
+                  - transcribe:StartTranscriptionJob
+                  - transcribe:GetTranscriptionJob
+                  - transcribe:ListTranscriptionJobs
+                  - transcribe:DeleteTranscriptionJob
+                  - transcribe:GetVocabulary
+                  - transcribe:ListVocabularies
+                Resource: '*'
+              # Translate Permissions
+              - Effect: Allow
+                Action:
+                  - translate:TranslateText
+                  - translate:GetTerminology
+                  - translate:ListTerminologies
+                Resource: '*'
+              # Polly Permissions
+              - Effect: Allow
+                Action:
+                  - polly:SynthesizeSpeech
+                  - polly:DescribeVoices
+                Resource: '*'
+              # SQS Permissions
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !GetAtt ProcessingQueue.Arn
+                  - !GetAtt DeadLetterQueue.Arn
+              # SNS Permissions
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !If [CreateNotificationTopic, !Ref NotificationTopic, !Ref 'AWS::NoValue']
+              # CloudWatch Logs Permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              # Step Functions Permissions
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                  - states:StopExecution
+                  - states:DescribeExecution
+                  - states:DescribeStateMachine
+                Resource: '*'
+              # Lambda Permissions
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-voice-processing-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda Function for Processing Trigger
+  ProcessingTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-processing-trigger-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt VoiceProcessingRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref VoiceProcessingStateMachine
+          TARGET_LANGUAGES: !Join [',', !Ref TargetLanguages]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          from urllib.parse import unquote_plus
+          
+          stepfunctions = boto3.client('stepfunctions')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Extract S3 event information
+                  for record in event['Records']:
+                      bucket = record['s3']['bucket']['name']
+                      key = unquote_plus(record['s3']['object']['key'])
+                      
+                      # Generate unique job ID
+                      job_id = str(uuid.uuid4())
+                      
+                      # Start Step Functions execution
+                      execution_name = f"voice-processing-{job_id}"
+                      
+                      execution_input = {
+                          'bucket': bucket,
+                          'key': key,
+                          'job_id': job_id,
+                          'target_languages': os.environ['TARGET_LANGUAGES'].split(',')
+                      }
+                      
+                      response = stepfunctions.start_execution(
+                          stateMachineArn=os.environ['STATE_MACHINE_ARN'],
+                          name=execution_name,
+                          input=json.dumps(execution_input)
+                      )
+                      
+                      print(f"Started execution: {response['executionArn']}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Processing started successfully')
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-processing-trigger'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda Permission for S3 Trigger
+  S3InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProcessingTriggerFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt InputBucket.Arn
+
+  # Lambda Function for Language Detection
+  LanguageDetectorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-language-detector-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt VoiceProcessingRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          JOBS_TABLE: !Ref JobsTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          from datetime import datetime
+          
+          transcribe = boto3.client('transcribe')
+          dynamodb = boto3.resource('dynamodb')
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              bucket = event['bucket']
+              key = event['key']
+              job_id = event.get('job_id', str(uuid.uuid4()))
+              
+              table = dynamodb.Table(event['jobs_table'])
+              
+              try:
+                  # Update job status
+                  table.put_item(
+                      Item={
+                          'JobId': job_id,
+                          'Status': 'LANGUAGE_DETECTION',
+                          'InputFile': f"s3://{bucket}/{key}",
+                          'Timestamp': int(datetime.now().timestamp()),
+                          'Stage': 'language_detection'
+                      }
+                  )
+                  
+                  # Start language identification job
+                  job_name = f"lang-detect-{job_id}"
+                  
+                  transcribe.start_transcription_job(
+                      TranscriptionJobName=job_name,
+                      Media={'MediaFileUri': f"s3://{bucket}/{key}"},
+                      IdentifyLanguage=True,
+                      OutputBucketName=bucket,
+                      OutputKey=f"language-detection/{job_id}/"
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'job_id': job_id,
+                      'transcribe_job_name': job_name,
+                      'bucket': bucket,
+                      'key': key,
+                      'stage': 'language_detection'
+                  }
+                  
+              except Exception as e:
+                  table.put_item(
+                      Item={
+                          'JobId': job_id,
+                          'Status': 'FAILED',
+                          'Error': str(e),
+                          'Timestamp': int(datetime.now().timestamp()),
+                          'Stage': 'language_detection'
+                      }
+                  )
+                  
+                  return {
+                      'statusCode': 500,
+                      'error': str(e),
+                      'job_id': job_id
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-language-detector'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda Function for Transcription Processing
+  TranscriptionProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-transcription-processor-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt VoiceProcessingRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          JOBS_TABLE: !Ref JobsTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          from datetime import datetime
+          
+          transcribe = boto3.client('transcribe')
+          dynamodb = boto3.resource('dynamodb')
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              job_id = event['job_id']
+              bucket = event['bucket']
+              key = event['key']
+              detected_language = event.get('detected_language', 'en-US')
+              
+              table = dynamodb.Table(event['jobs_table'])
+              
+              try:
+                  # Update job status
+                  table.update_item(
+                      Key={'JobId': job_id},
+                      UpdateExpression='SET #status = :status, #stage = :stage, DetectedLanguage = :lang',
+                      ExpressionAttributeNames={'#status': 'Status', '#stage': 'Stage'},
+                      ExpressionAttributeValues={
+                          ':status': 'TRANSCRIBING',
+                          ':stage': 'transcription',
+                          ':lang': detected_language
+                      }
+                  )
+                  
+                  # Configure transcription based on language
+                  transcribe_config = {
+                      'TranscriptionJobName': f"transcribe-{job_id}",
+                      'Media': {'MediaFileUri': f"s3://{bucket}/{key}"},
+                      'OutputBucketName': bucket,
+                      'OutputKey': f"transcriptions/{job_id}/",
+                      'LanguageCode': detected_language
+                  }
+                  
+                  # Add language-specific settings
+                  if detected_language.startswith('en'):
+                      transcribe_config['Settings'] = {
+                          'ShowSpeakerLabels': True,
+                          'MaxSpeakerLabels': 10,
+                          'ShowAlternatives': True,
+                          'MaxAlternatives': 3
+                      }
+                  
+                  # Start transcription job
+                  transcribe.start_transcription_job(**transcribe_config)
+                  
+                  return {
+                      'statusCode': 200,
+                      'job_id': job_id,
+                      'transcribe_job_name': f"transcribe-{job_id}",
+                      'detected_language': detected_language,
+                      'bucket': bucket,
+                      'stage': 'transcription'
+                  }
+                  
+              except Exception as e:
+                  table.update_item(
+                      Key={'JobId': job_id},
+                      UpdateExpression='SET #status = :status, #error = :error',
+                      ExpressionAttributeNames={'#status': 'Status'},
+                      ExpressionAttributeValues={
+                          ':status': 'FAILED',
+                          ':error': str(e)
+                      }
+                  )
+                  
+                  return {
+                      'statusCode': 500,
+                      'error': str(e),
+                      'job_id': job_id
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-transcription-processor'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda Function for Translation Processing
+  TranslationProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-translation-processor-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt VoiceProcessingRole.Arn
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          JOBS_TABLE: !Ref JobsTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime
+          
+          translate = boto3.client('translate')
+          dynamodb = boto3.resource('dynamodb')
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              job_id = event['job_id']
+              bucket = event['bucket']
+              source_language = event['source_language']
+              target_languages = event.get('target_languages', ['es', 'fr', 'de', 'pt'])
+              transcription_uri = event['transcription_uri']
+              
+              table = dynamodb.Table(event['jobs_table'])
+              
+              try:
+                  # Update job status
+                  table.update_item(
+                      Key={'JobId': job_id},
+                      UpdateExpression='SET #status = :status, #stage = :stage',
+                      ExpressionAttributeNames={'#status': 'Status', '#stage': 'Stage'},
+                      ExpressionAttributeValues={
+                          ':status': 'TRANSLATING',
+                          ':stage': 'translation'
+                      }
+                  )
+                  
+                  # Download transcription results
+                  transcription_obj = s3.get_object(Bucket=bucket, Key=transcription_uri)
+                  transcription_data = json.loads(transcription_obj['Body'].read().decode('utf-8'))
+                  
+                  # Extract transcript text
+                  transcript = transcription_data['results']['transcripts'][0]['transcript']
+                  
+                  # Map language codes
+                  source_lang_code = map_transcribe_to_translate_language(source_language)
+                  
+                  translations = {}
+                  
+                  # Translate to each target language
+                  for target_lang in target_languages:
+                      if target_lang != source_lang_code:
+                          try:
+                              result = translate.translate_text(
+                                  Text=transcript,
+                                  SourceLanguageCode=source_lang_code,
+                                  TargetLanguageCode=target_lang
+                              )
+                              
+                              translations[target_lang] = {
+                                  'translated_text': result['TranslatedText'],
+                                  'source_language': source_lang_code,
+                                  'target_language': target_lang
+                              }
+                              
+                          except Exception as e:
+                              print(f"Translation failed for {target_lang}: {str(e)}")
+                              translations[target_lang] = {
+                                  'error': str(e),
+                                  'source_language': source_lang_code,
+                                  'target_language': target_lang
+                              }
+                  
+                  # Store translation results
+                  translations_key = f"translations/{job_id}/translations.json"
+                  s3.put_object(
+                      Bucket=bucket,
+                      Key=translations_key,
+                      Body=json.dumps({
+                          'original_text': transcript,
+                          'source_language': source_lang_code,
+                          'translations': translations,
+                          'timestamp': datetime.now().isoformat()
+                      }),
+                      ContentType='application/json'
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'job_id': job_id,
+                      'source_language': source_lang_code,
+                      'translations': translations,
+                      'translations_uri': translations_key,
+                      'stage': 'translation'
+                  }
+                  
+              except Exception as e:
+                  table.update_item(
+                      Key={'JobId': job_id},
+                      UpdateExpression='SET #status = :status, #error = :error',
+                      ExpressionAttributeNames={'#status': 'Status'},
+                      ExpressionAttributeValues={
+                          ':status': 'FAILED',
+                          ':error': str(e)
+                      }
+                  )
+                  
+                  return {
+                      'statusCode': 500,
+                      'error': str(e),
+                      'job_id': job_id
+                  }
+          
+          def map_transcribe_to_translate_language(transcribe_lang):
+              # Map Transcribe language codes to Translate language codes
+              mapping = {
+                  'en-US': 'en', 'en-GB': 'en', 'en-AU': 'en',
+                  'es-US': 'es', 'es-ES': 'es',
+                  'fr-FR': 'fr', 'fr-CA': 'fr',
+                  'de-DE': 'de', 'it-IT': 'it',
+                  'pt-BR': 'pt', 'pt-PT': 'pt',
+                  'ja-JP': 'ja', 'ko-KR': 'ko',
+                  'zh-CN': 'zh', 'zh-TW': 'zh-TW',
+                  'ar-AE': 'ar', 'ar-SA': 'ar',
+                  'hi-IN': 'hi', 'ru-RU': 'ru',
+                  'nl-NL': 'nl', 'sv-SE': 'sv'
+              }
+              return mapping.get(transcribe_lang, transcribe_lang.split('-')[0])
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-translation-processor'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda Function for Speech Synthesis
+  SpeechSynthesizerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-speech-synthesizer-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt VoiceProcessingRole.Arn
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          JOBS_TABLE: !Ref JobsTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime
+          import re
+          
+          polly = boto3.client('polly')
+          dynamodb = boto3.resource('dynamodb')
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              job_id = event['job_id']
+              bucket = event['bucket']
+              translations = event['translations']
+              
+              table = dynamodb.Table(event['jobs_table'])
+              
+              try:
+                  # Update job status
+                  table.update_item(
+                      Key={'JobId': job_id},
+                      UpdateExpression='SET #status = :status, #stage = :stage',
+                      ExpressionAttributeNames={'#status': 'Status', '#stage': 'Stage'},
+                      ExpressionAttributeValues={
+                          ':status': 'SYNTHESIZING',
+                          ':stage': 'speech_synthesis'
+                      }
+                  )
+                  
+                  audio_outputs = {}
+                  
+                  # Process each translation
+                  for target_lang, translation_data in translations.items():
+                      if 'translated_text' in translation_data:
+                          try:
+                              # Select appropriate voice for language
+                              voice_id = select_voice_for_language(target_lang)
+                              
+                              # Prepare text for synthesis
+                              text_to_synthesize = prepare_text_for_synthesis(
+                                  translation_data['translated_text']
+                              )
+                              
+                              # Synthesize speech
+                              synthesis_response = polly.synthesize_speech(
+                                  Text=text_to_synthesize,
+                                  VoiceId=voice_id,
+                                  OutputFormat='mp3',
+                                  Engine='neural' if supports_neural_voice(voice_id) else 'standard',
+                                  TextType='ssml' if text_to_synthesize.startswith('<speak>') else 'text'
+                              )
+                              
+                              # Save audio to S3
+                              audio_key = f"audio-output/{job_id}/{target_lang}.mp3"
+                              s3.put_object(
+                                  Bucket=bucket,
+                                  Key=audio_key,
+                                  Body=synthesis_response['AudioStream'].read(),
+                                  ContentType='audio/mpeg'
+                              )
+                              
+                              audio_outputs[target_lang] = {
+                                  'audio_uri': f"s3://{bucket}/{audio_key}",
+                                  'voice_id': voice_id,
+                                  'text_length': len(translation_data['translated_text']),
+                                  'audio_format': 'mp3'
+                              }
+                              
+                          except Exception as e:
+                              print(f"Speech synthesis failed for {target_lang}: {str(e)}")
+                              audio_outputs[target_lang] = {
+                                  'error': str(e)
+                              }
+                  
+                  # Update job with final results
+                  table.update_item(
+                      Key={'JobId': job_id},
+                      UpdateExpression='SET #status = :status, #stage = :stage, AudioOutputs = :outputs',
+                      ExpressionAttributeNames={'#status': 'Status', '#stage': 'Stage'},
+                      ExpressionAttributeValues={
+                          ':status': 'COMPLETED',
+                          ':stage': 'completed',
+                          ':outputs': audio_outputs
+                      }
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'job_id': job_id,
+                      'audio_outputs': audio_outputs,
+                      'stage': 'completed'
+                  }
+                  
+              except Exception as e:
+                  table.update_item(
+                      Key={'JobId': job_id},
+                      UpdateExpression='SET #status = :status, #error = :error',
+                      ExpressionAttributeNames={'#status': 'Status'},
+                      ExpressionAttributeValues={
+                          ':status': 'FAILED',
+                          ':error': str(e)
+                      }
+                  )
+                  
+                  return {
+                      'statusCode': 500,
+                      'error': str(e),
+                      'job_id': job_id
+                  }
+          
+          def select_voice_for_language(language_code):
+              # Map language codes to appropriate Polly voices
+              voice_mapping = {
+                  'en': 'Joanna',  # English - Neural voice
+                  'es': 'Lupe',    # Spanish - Neural voice
+                  'fr': 'Lea',     # French - Neural voice
+                  'de': 'Vicki',   # German - Neural voice
+                  'it': 'Bianca',  # Italian - Neural voice
+                  'pt': 'Camila',  # Portuguese - Neural voice
+                  'ja': 'Takumi',  # Japanese - Neural voice
+                  'ko': 'Seoyeon', # Korean - Standard voice
+                  'zh': 'Zhiyu',   # Chinese - Neural voice
+                  'ar': 'Zeina',   # Arabic - Standard voice
+                  'hi': 'Aditi',   # Hindi - Standard voice
+                  'ru': 'Tatyana', # Russian - Standard voice
+                  'nl': 'Lotte',   # Dutch - Standard voice
+                  'sv': 'Astrid'   # Swedish - Standard voice
+              }
+              return voice_mapping.get(language_code, 'Joanna')
+          
+          def supports_neural_voice(voice_id):
+              # Neural voices available in Polly
+              neural_voices = [
+                  'Joanna', 'Matthew', 'Ivy', 'Justin', 'Kendra', 'Kimberly', 'Salli',
+                  'Joey', 'Lupe', 'Lucia', 'Lea', 'Vicki', 'Bianca', 'Camila',
+                  'Takumi', 'Zhiyu', 'Ruth', 'Stephen'
+              ]
+              return voice_id in neural_voices
+          
+          def prepare_text_for_synthesis(text):
+              # Add basic SSML for better speech quality
+              if len(text) > 1000:
+                  # For longer texts, add pauses at sentence boundaries
+                  text = re.sub(r'\.(\s+)', r'.<break time="500ms"/>\1', text)
+                  text = re.sub(r'!(\s+)', r'!<break time="500ms"/>\1', text)
+                  text = re.sub(r'\?(\s+)', r'?<break time="500ms"/>\1', text)
+                  text = f'<speak>{text}</speak>'
+              
+              return text
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-speech-synthesizer'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda Function for Job Status Checking
+  JobStatusCheckerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-job-status-checker-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt VoiceProcessingRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          
+          transcribe = boto3.client('transcribe')
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              job_name = event['transcribe_job_name']
+              job_type = event.get('job_type', 'transcription')
+              
+              try:
+                  response = transcribe.get_transcription_job(
+                      TranscriptionJobName=job_name
+                  )
+                  
+                  job_status = response['TranscriptionJob']['TranscriptionJobStatus']
+                  
+                  result = {
+                      'statusCode': 200,
+                      'job_name': job_name,
+                      'job_status': job_status,
+                      'is_complete': job_status in ['COMPLETED', 'FAILED']
+                  }
+                  
+                  if job_status == 'COMPLETED':
+                      if job_type == 'language_detection':
+                          # Extract detected language
+                          language_code = response['TranscriptionJob'].get('LanguageCode')
+                          identified_languages = response['TranscriptionJob'].get('IdentifiedLanguageScore')
+                          
+                          result['detected_language'] = language_code
+                          result['language_confidence'] = identified_languages
+                      else:
+                          # Extract transcription results location
+                          transcript_uri = response['TranscriptionJob']['Transcript']['TranscriptFileUri']
+                          result['transcript_uri'] = transcript_uri
+                          
+                          # Extract detected language for transcription jobs
+                          language_code = response['TranscriptionJob'].get('LanguageCode')
+                          result['source_language'] = language_code
+                  
+                  elif job_status == 'FAILED':
+                      result['failure_reason'] = response['TranscriptionJob'].get('FailureReason', 'Unknown error')
+                  
+                  return result
+                  
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'error': str(e),
+                      'job_name': job_name
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-job-status-checker'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Step Functions State Machine
+  VoiceProcessingStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-voice-processing-${Environment}'
+      RoleArn: !GetAtt VoiceProcessingRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Multi-language voice processing pipeline",
+          "StartAt": "InitializeJob",
+          "States": {
+            "InitializeJob": {
+              "Type": "Pass",
+              "Parameters": {
+                "bucket.$": "$.bucket",
+                "key.$": "$.key",
+                "job_id.$": "$.job_id",
+                "jobs_table": "${JobsTable}",
+                "target_languages.$": "$.target_languages"
+              },
+              "Next": "DetectLanguage"
+            },
+            "DetectLanguage": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${LanguageDetectorFunction}",
+                "Payload.$": "$"
+              },
+              "ResultPath": "$.language_detection_result",
+              "Next": "WaitForLanguageDetection"
+            },
+            "WaitForLanguageDetection": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "CheckLanguageDetectionStatus"
+            },
+            "CheckLanguageDetectionStatus": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${JobStatusCheckerFunction}",
+                "Payload": {
+                  "transcribe_job_name.$": "$.language_detection_result.Payload.transcribe_job_name",
+                  "job_type": "language_detection"
+                }
+              },
+              "ResultPath": "$.language_status",
+              "Next": "IsLanguageDetectionComplete"
+            },
+            "IsLanguageDetectionComplete": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.language_status.Payload.is_complete",
+                  "BooleanEquals": true,
+                  "Next": "ProcessTranscription"
+                }
+              ],
+              "Default": "WaitForLanguageDetection"
+            },
+            "ProcessTranscription": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${TranscriptionProcessorFunction}",
+                "Payload": {
+                  "job_id.$": "$.job_id",
+                  "bucket.$": "$.bucket",
+                  "key.$": "$.key",
+                  "detected_language.$": "$.language_status.Payload.detected_language",
+                  "jobs_table": "${JobsTable}"
+                }
+              },
+              "ResultPath": "$.transcription_result",
+              "Next": "WaitForTranscription"
+            },
+            "WaitForTranscription": {
+              "Type": "Wait",
+              "Seconds": 60,
+              "Next": "CheckTranscriptionStatus"
+            },
+            "CheckTranscriptionStatus": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${JobStatusCheckerFunction}",
+                "Payload": {
+                  "transcribe_job_name.$": "$.transcription_result.Payload.transcribe_job_name",
+                  "job_type": "transcription"
+                }
+              },
+              "ResultPath": "$.transcription_status",
+              "Next": "IsTranscriptionComplete"
+            },
+            "IsTranscriptionComplete": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.transcription_status.Payload.is_complete",
+                  "BooleanEquals": true,
+                  "Next": "ProcessTranslation"
+                }
+              ],
+              "Default": "WaitForTranscription"
+            },
+            "ProcessTranslation": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${TranslationProcessorFunction}",
+                "Payload": {
+                  "job_id.$": "$.job_id",
+                  "bucket.$": "$.bucket",
+                  "source_language.$": "$.transcription_status.Payload.source_language",
+                  "target_languages.$": "$.target_languages",
+                  "transcription_uri.$": "$.transcription_status.Payload.transcript_uri",
+                  "jobs_table": "${JobsTable}"
+                }
+              },
+              "ResultPath": "$.translation_result",
+              "Next": "SynthesizeSpeech"
+            },
+            "SynthesizeSpeech": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${SpeechSynthesizerFunction}",
+                "Payload": {
+                  "job_id.$": "$.job_id",
+                  "bucket.$": "$.bucket",
+                  "translations.$": "$.translation_result.Payload.translations",
+                  "jobs_table": "${JobsTable}"
+                }
+              },
+              "ResultPath": "$.synthesis_result",
+              "End": true
+            }
+          }
+        }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-voice-processing-state-machine'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Groups
+  LanguageDetectorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LanguageDetectorFunction}'
+      RetentionInDays: 14
+
+  TranscriptionProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${TranscriptionProcessorFunction}'
+      RetentionInDays: 14
+
+  TranslationProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${TranslationProcessorFunction}'
+      RetentionInDays: 14
+
+  SpeechSynthesizerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${SpeechSynthesizerFunction}'
+      RetentionInDays: 14
+
+  JobStatusCheckerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${JobStatusCheckerFunction}'
+      RetentionInDays: 14
+
+  ProcessingTriggerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProcessingTriggerFunction}'
+      RetentionInDays: 14
+
+  # CloudWatch Alarms
+  FailedExecutionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-failed-executions-${Environment}'
+      AlarmDescription: 'Alarm for failed Step Functions executions'
+      MetricName: ExecutionsFailed
+      Namespace: AWS/States
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref VoiceProcessingStateMachine
+      AlarmActions:
+        - !If [CreateNotificationTopic, !Ref NotificationTopic, !Ref 'AWS::NoValue']
+
+Outputs:
+  InputBucketName:
+    Description: 'Name of the S3 bucket for input audio files'
+    Value: !Ref InputBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-InputBucket'
+
+  OutputBucketName:
+    Description: 'Name of the S3 bucket for output audio files'
+    Value: !Ref OutputBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-OutputBucket'
+
+  JobsTableName:
+    Description: 'Name of the DynamoDB table for job tracking'
+    Value: !Ref JobsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-JobsTable'
+
+  StateMachineArn:
+    Description: 'ARN of the Step Functions state machine'
+    Value: !Ref VoiceProcessingStateMachine
+    Export:
+      Name: !Sub '${AWS::StackName}-StateMachineArn'
+
+  ProcessingQueueUrl:
+    Description: 'URL of the SQS processing queue'
+    Value: !Ref ProcessingQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessingQueue'
+
+  VoiceProcessingRoleArn:
+    Description: 'ARN of the IAM role for voice processing'
+    Value: !GetAtt VoiceProcessingRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-VoiceProcessingRole'
+
+  NotificationTopicArn:
+    Description: 'ARN of the SNS notification topic'
+    Value: !If [CreateNotificationTopic, !Ref NotificationTopic, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopic'
+
+  TestCommand:
+    Description: 'Command to test the voice processing pipeline'
+    Value: !Sub |
+      # Upload a test audio file
+      aws s3 cp test-audio.mp3 s3://${InputBucket}/test-audio.mp3
+      
+      # Monitor execution
+      aws stepfunctions list-executions --state-machine-arn ${VoiceProcessingStateMachine}
+      
+      # Check job status
+      aws dynamodb scan --table-name ${JobsTable} --projection-expression "JobId, #status, #stage" --expression-attribute-names '{"#status": "Status", "#stage": "Stage"}'

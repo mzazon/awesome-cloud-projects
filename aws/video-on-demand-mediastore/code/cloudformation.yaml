@@ -1,0 +1,666 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for Video-on-Demand Platform with MediaStore'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Platform Configuration"
+        Parameters:
+          - PlatformName
+          - Environment
+      - Label:
+          default: "MediaStore Configuration"
+        Parameters:
+          - MediaStoreContainerName
+          - EnableMetrics
+          - EnableCors
+      - Label:
+          default: "CloudFront Configuration"
+        Parameters:
+          - CloudFrontPriceClass
+          - EnableCloudFrontCompression
+          - DefaultCacheTTL
+          - MaxCacheTTL
+      - Label:
+          default: "Storage and Lifecycle"
+        Parameters:
+          - StagingBucketName
+          - EnableLifecyclePolicy
+          - TempContentExpirationDays
+          - ArchiveContentExpirationDays
+      - Label:
+          default: "Monitoring and Alerts"
+        Parameters:
+          - EnableCloudWatchAlarms
+          - RequestCountThreshold
+          - NotificationEmail
+    ParameterLabels:
+      PlatformName:
+        default: "Platform Name"
+      Environment:
+        default: "Environment"
+      MediaStoreContainerName:
+        default: "MediaStore Container Name"
+      CloudFrontPriceClass:
+        default: "CloudFront Price Class"
+
+Parameters:
+  PlatformName:
+    Type: String
+    Description: Name for the video-on-demand platform
+    Default: "vod-platform"
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: Must be 3-50 characters, lowercase letters, numbers, and hyphens only
+
+  Environment:
+    Type: String
+    Description: Environment for the deployment
+    Default: "dev"
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    ConstraintDescription: Must be dev, staging, or prod
+
+  MediaStoreContainerName:
+    Type: String
+    Description: Name for the MediaStore container (will be prefixed with platform name)
+    Default: "content"
+    MinLength: 3
+    MaxLength: 255
+    AllowedPattern: '^[a-zA-Z0-9._-]+$'
+    ConstraintDescription: Must contain only alphanumeric characters, periods, hyphens, and underscores
+
+  EnableMetrics:
+    Type: String
+    Description: Enable CloudWatch metrics for MediaStore
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  EnableCors:
+    Type: String
+    Description: Enable CORS policy for web access
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  CloudFrontPriceClass:
+    Type: String
+    Description: CloudFront price class for global distribution
+    Default: "PriceClass_All"
+    AllowedValues:
+      - "PriceClass_100"
+      - "PriceClass_200"
+      - "PriceClass_All"
+    ConstraintDescription: Choose appropriate price class for your global reach requirements
+
+  EnableCloudFrontCompression:
+    Type: String
+    Description: Enable compression for CloudFront distribution
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  DefaultCacheTTL:
+    Type: Number
+    Description: Default cache TTL in seconds for CloudFront
+    Default: 86400
+    MinValue: 0
+    MaxValue: 31536000
+
+  MaxCacheTTL:
+    Type: Number
+    Description: Maximum cache TTL in seconds for CloudFront
+    Default: 31536000
+    MinValue: 0
+    MaxValue: 31536000
+
+  StagingBucketName:
+    Type: String
+    Description: Name for the S3 staging bucket (will be prefixed with platform name)
+    Default: "staging"
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: Must be 3-50 characters, lowercase letters, numbers, and hyphens only
+
+  EnableLifecyclePolicy:
+    Type: String
+    Description: Enable lifecycle policy for automatic content management
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  TempContentExpirationDays:
+    Type: Number
+    Description: Days after which temporary content expires
+    Default: 90
+    MinValue: 1
+    MaxValue: 3650
+
+  ArchiveContentExpirationDays:
+    Type: Number
+    Description: Days after which archive content expires
+    Default: 365
+    MinValue: 1
+    MaxValue: 3650
+
+  EnableCloudWatchAlarms:
+    Type: String
+    Description: Enable CloudWatch alarms for monitoring
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  RequestCountThreshold:
+    Type: Number
+    Description: Request count threshold for CloudWatch alarm
+    Default: 1000
+    MinValue: 1
+    MaxValue: 100000
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for CloudWatch alarm notifications (optional)
+    Default: ""
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address or empty
+
+Conditions:
+  CreateMetrics: !Equals [!Ref EnableMetrics, "true"]
+  CreateCors: !Equals [!Ref EnableCors, "true"]
+  CreateLifecyclePolicy: !Equals [!Ref EnableLifecyclePolicy, "true"]
+  CreateCloudWatchAlarms: !Equals [!Ref EnableCloudWatchAlarms, "true"]
+  CreateSNSNotification: !And
+    - !Condition CreateCloudWatchAlarms
+    - !Not [!Equals [!Ref NotificationEmail, ""]]
+
+Resources:
+  # Random suffix for unique resource naming
+  RandomSuffix:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt RandomSuffixFunction.Arn
+
+  # Lambda function to generate random suffix
+  RandomSuffixFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${PlatformName}-${Environment}-random-suffix"
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt RandomSuffixExecutionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import random
+          import string
+          import cfnresponse
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      # Generate 6-character random suffix
+                      suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+                      response_data = {'Suffix': suffix}
+                  else:
+                      response_data = {}
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  # IAM role for the random suffix Lambda function
+  RandomSuffixExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${PlatformName}-${Environment}-random-suffix-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # S3 staging bucket for content upload
+  StagingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${PlatformName}-${StagingBucketName}-${Environment}-${RandomSuffix.Suffix}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Name
+          Value: !Sub "${PlatformName}-${Environment}-staging"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Video content staging"
+
+  # MediaStore container for optimized video storage
+  MediaStoreContainer:
+    Type: AWS::MediaStore::Container
+    Properties:
+      ContainerName: !Sub "${PlatformName}-${MediaStoreContainerName}-${Environment}-${RandomSuffix.Suffix}"
+      Policy: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "MediaStoreFullAccess",
+              "Effect": "Allow",
+              "Principal": "*",
+              "Action": [
+                "mediastore:GetObject",
+                "mediastore:DescribeObject"
+              ],
+              "Resource": "*",
+              "Condition": {
+                "Bool": {
+                  "aws:SecureTransport": "true"
+                }
+              }
+            },
+            {
+              "Sid": "MediaStoreUploadAccess",
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": "arn:aws:iam::${AWS::AccountId}:root"
+              },
+              "Action": [
+                "mediastore:PutObject",
+                "mediastore:DeleteObject"
+              ],
+              "Resource": "*"
+            }
+          ]
+        }
+      CorsPolicy: !If
+        - CreateCors
+        - !Sub |
+          [
+            {
+              "AllowedOrigins": ["*"],
+              "AllowedMethods": ["GET", "HEAD"],
+              "AllowedHeaders": ["*"],
+              "MaxAgeSeconds": 3000,
+              "ExposeHeaders": ["Date", "Server"]
+            }
+          ]
+        - !Ref AWS::NoValue
+      MetricPolicy: !If
+        - CreateMetrics
+        - ContainerLevelMetrics: ENABLED
+          MetricPolicyRules:
+            - ObjectGroup: "/*"
+              ObjectGroupName: "AllObjects"
+        - !Ref AWS::NoValue
+      LifecyclePolicy: !If
+        - CreateLifecyclePolicy
+        - !Sub |
+          {
+            "Rules": [
+              {
+                "ObjectGroup": "/videos/temp/*",
+                "ObjectGroupName": "TempVideos",
+                "Lifecycle": {
+                  "TransitionToIA": "AFTER_30_DAYS",
+                  "ExpirationInDays": ${TempContentExpirationDays}
+                }
+              },
+              {
+                "ObjectGroup": "/videos/archive/*",
+                "ObjectGroupName": "ArchiveVideos",
+                "Lifecycle": {
+                  "TransitionToIA": "AFTER_7_DAYS",
+                  "ExpirationInDays": ${ArchiveContentExpirationDays}
+                }
+              }
+            ]
+          }
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub "${PlatformName}-${Environment}-mediastore"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Video content origin storage"
+
+  # IAM role for MediaStore access
+  MediaStoreAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${PlatformName}-MediaStoreAccessRole-${Environment}-${RandomSuffix.Suffix}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: mediastore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: MediaStoreAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - mediastore:GetObject
+                  - mediastore:PutObject
+                  - mediastore:DeleteObject
+                  - mediastore:DescribeObject
+                  - mediastore:ListItems
+                Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${PlatformName}-${Environment}-mediastore-role"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Origin Access Control for CloudFront
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${PlatformName}-${Environment}-oac"
+        OriginAccessControlOriginType: mediastore
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # CloudFront distribution for global content delivery
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "${PlatformName} ${Environment} VOD Platform Distribution"
+        Enabled: true
+        PriceClass: !Ref CloudFrontPriceClass
+        HttpVersion: http2
+        IPV6Enabled: true
+        Origins:
+          - Id: MediaStoreOrigin
+            DomainName: !Select [1, !Split ["https://", !GetAtt MediaStoreContainer.Endpoint]]
+            CustomOriginConfig:
+              HTTPPort: 443
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+            OriginAccessControlId: !Ref OriginAccessControl
+        DefaultCacheBehavior:
+          TargetOriginId: MediaStoreOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: !Ref EnableCloudFrontCompression
+          ForwardedValues:
+            QueryString: true
+            Cookies:
+              Forward: none
+            Headers:
+              - Origin
+              - Access-Control-Request-Headers
+              - Access-Control-Request-Method
+          MinTTL: 0
+          DefaultTTL: !Ref DefaultCacheTTL
+          MaxTTL: !Ref MaxCacheTTL
+          TrustedSigners:
+            - self
+        CacheBehaviors:
+          - PathPattern: "/videos/*"
+            TargetOriginId: MediaStoreOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: !Ref EnableCloudFrontCompression
+            ForwardedValues:
+              QueryString: false
+              Cookies:
+                Forward: none
+            MinTTL: 0
+            DefaultTTL: !Ref DefaultCacheTTL
+            MaxTTL: !Ref MaxCacheTTL
+            TrustedSigners:
+              - self
+      Tags:
+        - Key: Name
+          Value: !Sub "${PlatformName}-${Environment}-distribution"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "VOD content delivery"
+
+  # SNS topic for CloudWatch alarm notifications
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSNSNotification
+    Properties:
+      TopicName: !Sub "${PlatformName}-${Environment}-alarms"
+      DisplayName: !Sub "${PlatformName} ${Environment} Alarm Notifications"
+      Tags:
+        - Key: Name
+          Value: !Sub "${PlatformName}-${Environment}-alarms"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS topic subscription for email notifications
+  AlarmNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateSNSNotification
+    Properties:
+      TopicArn: !Ref AlarmNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch alarm for high request rate
+  HighRequestRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub "${PlatformName}-${Environment}-MediaStore-HighRequestRate"
+      AlarmDescription: "High request rate on MediaStore container"
+      MetricName: RequestCount
+      Namespace: AWS/MediaStore
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref RequestCountThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ContainerName
+          Value: !Ref MediaStoreContainer
+      AlarmActions: !If
+        - CreateSNSNotification
+        - [!Ref AlarmNotificationTopic]
+        - []
+      Tags:
+        - Key: Name
+          Value: !Sub "${PlatformName}-${Environment}-high-request-rate"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch alarm for MediaStore errors
+  MediaStoreErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub "${PlatformName}-${Environment}-MediaStore-Errors"
+      AlarmDescription: "High error rate on MediaStore container"
+      MetricName: ErrorCount
+      Namespace: AWS/MediaStore
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ContainerName
+          Value: !Ref MediaStoreContainer
+      AlarmActions: !If
+        - CreateSNSNotification
+        - [!Ref AlarmNotificationTopic]
+        - []
+      Tags:
+        - Key: Name
+          Value: !Sub "${PlatformName}-${Environment}-mediastore-errors"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch alarm for CloudFront errors
+  CloudFrontErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub "${PlatformName}-${Environment}-CloudFront-Errors"
+      AlarmDescription: "High error rate on CloudFront distribution"
+      MetricName: ErrorRate
+      Namespace: AWS/CloudFront
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DistributionId
+          Value: !Ref CloudFrontDistribution
+      AlarmActions: !If
+        - CreateSNSNotification
+        - [!Ref AlarmNotificationTopic]
+        - []
+      Tags:
+        - Key: Name
+          Value: !Sub "${PlatformName}-${Environment}-cloudfront-errors"
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  PlatformName:
+    Description: "Name of the video-on-demand platform"
+    Value: !Ref PlatformName
+    Export:
+      Name: !Sub "${AWS::StackName}-PlatformName"
+
+  Environment:
+    Description: "Environment for the deployment"
+    Value: !Ref Environment
+    Export:
+      Name: !Sub "${AWS::StackName}-Environment"
+
+  StagingBucketName:
+    Description: "S3 staging bucket for content upload"
+    Value: !Ref StagingBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-StagingBucket"
+
+  StagingBucketArn:
+    Description: "ARN of the S3 staging bucket"
+    Value: !GetAtt StagingBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-StagingBucketArn"
+
+  MediaStoreContainerName:
+    Description: "MediaStore container name for video storage"
+    Value: !Ref MediaStoreContainer
+    Export:
+      Name: !Sub "${AWS::StackName}-MediaStoreContainer"
+
+  MediaStoreEndpoint:
+    Description: "MediaStore container endpoint for direct access"
+    Value: !GetAtt MediaStoreContainer.Endpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-MediaStoreEndpoint"
+
+  MediaStoreArn:
+    Description: "ARN of the MediaStore container"
+    Value: !Sub "arn:aws:mediastore:${AWS::Region}:${AWS::AccountId}:container/${MediaStoreContainer}"
+    Export:
+      Name: !Sub "${AWS::StackName}-MediaStoreArn"
+
+  CloudFrontDistributionId:
+    Description: "CloudFront distribution ID for global content delivery"
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudFrontDistributionId"
+
+  CloudFrontDistributionDomainName:
+    Description: "CloudFront distribution domain name for content access"
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudFrontDomainName"
+
+  CloudFrontDistributionUrl:
+    Description: "CloudFront distribution URL for content access"
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudFrontUrl"
+
+  MediaStoreAccessRoleArn:
+    Description: "ARN of the IAM role for MediaStore access"
+    Value: !GetAtt MediaStoreAccessRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-MediaStoreAccessRoleArn"
+
+  AlarmNotificationTopicArn:
+    Description: "ARN of the SNS topic for alarm notifications"
+    Value: !If
+      - CreateSNSNotification
+      - !Ref AlarmNotificationTopic
+      - "Not created"
+    Export:
+      Name: !Sub "${AWS::StackName}-AlarmTopicArn"
+    Condition: CreateSNSNotification
+
+  VideoUploadCommand:
+    Description: "Sample AWS CLI command to upload video content"
+    Value: !Sub |
+      aws mediastore-data put-object --endpoint-url ${MediaStoreContainer.Endpoint} --body /path/to/video.mp4 --path /videos/video.mp4 --content-type video/mp4
+
+  VideoAccessUrl:
+    Description: "Sample URL to access video content via CloudFront"
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}/videos/video.mp4"
+
+  DeploymentInstructions:
+    Description: "Instructions for deploying and using the platform"
+    Value: !Sub |
+      1. Upload content to S3 staging bucket: ${StagingBucket}
+      2. Transfer to MediaStore using endpoint: ${MediaStoreContainer.Endpoint}
+      3. Access content globally via CloudFront: https://${CloudFrontDistribution.DomainName}
+      4. Monitor performance using CloudWatch metrics and alarms

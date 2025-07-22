@@ -1,0 +1,95 @@
+version: 0.2
+phases:
+  install:
+    runtime-versions:
+      python: 3.9
+    commands:
+      - pip install boto3 sagemaker pandas numpy scikit-learn
+  build:
+    commands:
+      - echo "Starting model testing..."
+      - |
+        python << 'PYTHON_EOF'
+        import boto3
+        import sagemaker
+        import json
+        import os
+        import time
+        from sagemaker.model_package import ModelPackage
+        
+        # Read model package ARN from previous stage
+        with open('model_package_arn.txt', 'r') as f:
+            model_package_arn = f.read().strip()
+        
+        print(f"Testing model package: {model_package_arn}")
+        
+        # Initialize SageMaker session
+        session = sagemaker.Session()
+        
+        # Create model package object
+        model_package = ModelPackage(
+            model_package_arn=model_package_arn,
+            sagemaker_session=session
+        )
+        
+        # Create test endpoint configuration
+        endpoint_config_name = f"test-config-{int(time.time())}"
+        endpoint_name = f"test-endpoint-{int(time.time())}"
+        
+        # Deploy model to test endpoint
+        predictor = model_package.deploy(
+            initial_instance_count=1,
+            instance_type='ml.t2.medium',
+            endpoint_name=endpoint_name,
+            wait=True
+        )
+        
+        # Perform model testing
+        import numpy as np
+        test_data = np.random.randn(10, 20).tolist()
+        
+        try:
+            # Test predictions
+            predictions = predictor.predict(test_data)
+            print(f"Test predictions successful: {len(predictions)} predictions made")
+            
+            # Basic validation - check if predictions are within expected range
+            if all(isinstance(p, (int, float)) for p in predictions):
+                print("✅ Model test passed - predictions are valid")
+                test_result = "PASSED"
+            else:
+                print("❌ Model test failed - invalid predictions")
+                test_result = "FAILED"
+                
+        except Exception as e:
+            print(f"❌ Model test failed with error: {str(e)}")
+            test_result = "FAILED"
+        
+        finally:
+            # Clean up test endpoint
+            predictor.delete_endpoint()
+            print("✅ Cleaned up test endpoint")
+        
+        # Save test results
+        with open('test_results.json', 'w') as f:
+            json.dump({
+                'test_status': test_result,
+                'model_package_arn': model_package_arn,
+                'timestamp': time.time()
+            }, f)
+        
+        # If tests passed, approve the model
+        if test_result == "PASSED":
+            client = boto3.client('sagemaker')
+            client.update_model_package(
+                ModelPackageArn=model_package_arn,
+                ModelApprovalStatus='Approved'
+            )
+            print("✅ Model approved for deployment")
+        else:
+            raise Exception("Model failed testing - deployment blocked")
+        PYTHON_EOF
+artifacts:
+  files:
+    - test_results.json
+    - model_package_arn.txt

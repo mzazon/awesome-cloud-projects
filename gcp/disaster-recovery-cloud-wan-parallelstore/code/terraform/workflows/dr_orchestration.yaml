@@ -1,0 +1,324 @@
+# Cloud Workflows definition for HPC Disaster Recovery Orchestration
+# This workflow coordinates complex multi-step recovery procedures and handles error conditions gracefully
+
+main:
+  params: [event]
+  steps:
+    - init:
+        assign:
+          - project_id: "${project_id}"
+          - dr_prefix: "${dr_prefix}"
+          - primary_region: "${primary_region}"
+          - secondary_region: "${secondary_region}"
+          - health_function_name: "${health_function_name}"
+          - failover_start_time: $${sys.now}
+          - execution_id: $${sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID")}
+    
+    - log_workflow_start:
+        call: sys.log
+        args:
+          text: $${"Starting disaster recovery workflow execution: " + execution_id}
+          severity: "INFO"
+    
+    - validate_trigger:
+        switch:
+          - condition: $${event.trigger == "automatic_failover"}
+            next: assess_primary_region
+          - condition: $${event.trigger == "manual_failover"}
+            next: assess_primary_region
+          - condition: $${event.trigger == "test_failover"}
+            assign:
+              - test_mode: true
+            next: assess_primary_region
+        next: invalid_trigger
+    
+    - assess_primary_region:
+        try:
+          call: http.get
+          args:
+            url: $${"https://" + primary_region + "-" + project_id + ".cloudfunctions.net/" + health_function_name}
+            auth:
+              type: OAuth2
+          result: primary_health
+        except:
+          as: e
+          steps:
+            - log_health_check_error:
+                call: sys.log
+                args:
+                  text: $${"Failed to assess primary region health: " + string(e)}
+                  severity: "ERROR"
+            - assign_default_health:
+                assign:
+                  - primary_health:
+                      body:
+                        health:
+                          parallelstore_primary:
+                            status: "unknown"
+                          replication_lag:
+                            lag_minutes: 999
+        next: determine_failover_strategy
+    
+    - determine_failover_strategy:
+        switch:
+          - condition: $${primary_health.body.health.parallelstore_primary.status == "unhealthy"}
+            assign:
+              - strategy: "full_regional_failover"
+              - severity: "critical"
+            next: initiate_emergency_sync
+          - condition: $${primary_health.body.health.parallelstore_primary.status == "error"}
+            assign:
+              - strategy: "full_regional_failover"
+              - severity: "critical"
+            next: initiate_emergency_sync
+          - condition: $${primary_health.body.health.replication_lag.lag_minutes > 15}
+            assign:
+              - strategy: "data_resync_required"
+              - severity: "warning"
+            next: force_data_sync
+          - condition: $${get_value(event, "trigger") == "test_failover"}
+            assign:
+              - strategy: "test_failover_simulation"
+              - severity: "info"
+            next: simulate_failover_test
+        next: partial_failover
+    
+    - initiate_emergency_sync:
+        call: sys.log
+        args:
+          text: $${"Initiating emergency data synchronization due to " + strategy}
+          severity: "CRITICAL"
+        next: parallel_emergency_operations
+    
+    - parallel_emergency_operations:
+        parallel:
+          shared: [sync_status, dns_status, notification_status]
+          branches:
+            - emergency_data_sync:
+                steps:
+                  - log_sync_start:
+                      call: sys.log
+                      args:
+                        text: "Starting emergency Parallelstore data synchronization"
+                        severity: "INFO"
+                  - trigger_emergency_replication:
+                      call: http.post
+                      args:
+                        url: $${"https://pubsub.googleapis.com/v1/projects/" + project_id + "/topics/" + dr_prefix + "-replication-status:publish"}
+                        auth:
+                          type: OAuth2
+                        body:
+                          messages:
+                            - data: $${base64.encode(json.encode({"trigger": "emergency_sync", "priority": "critical", "timestamp": sys.now}))}
+                      result: sync_trigger_result
+                  - assign_sync_status:
+                      assign:
+                        - sync_status: "emergency_sync_triggered"
+            - update_dns_records:
+                steps:
+                  - log_dns_update:
+                      call: sys.log
+                      args:
+                        text: "Updating DNS records for failover to secondary region"
+                        severity: "WARNING"
+                  - simulate_dns_update:
+                      assign:
+                        - dns_status: "updated_to_secondary"
+            - notify_stakeholders:
+                steps:
+                  - log_notification:
+                      call: sys.log
+                      args:
+                        text: $${"Notifying stakeholders of " + severity + " failover event"}
+                        severity: "WARNING"
+                  - send_emergency_notification:
+                      call: http.post
+                      args:
+                        url: $${"https://pubsub.googleapis.com/v1/projects/" + project_id + "/topics/" + dr_prefix + "-failover-commands:publish"}
+                        auth:
+                          type: OAuth2
+                        body:
+                          messages:
+                            - data: $${base64.encode(json.encode({"type": "stakeholder_notification", "severity": severity, "strategy": strategy, "timestamp": sys.now}))}
+                      result: notification_result
+                  - assign_notification_status:
+                      assign:
+                        - notification_status: "stakeholders_notified"
+        next: activate_secondary_region
+    
+    - force_data_sync:
+        call: sys.log
+        args:
+          text: "Forcing data synchronization due to replication lag"
+          severity: "WARNING"
+        next: trigger_forced_sync
+    
+    - trigger_forced_sync:
+        call: http.post
+        args:
+          url: $${"https://pubsub.googleapis.com/v1/projects/" + project_id + "/topics/" + dr_prefix + "-replication-status:publish"}
+          auth:
+            type: OAuth2
+          body:
+            messages:
+              - data: $${base64.encode(json.encode({"trigger": "forced_resync", "priority": "high", "timestamp": sys.now}))}
+        result: forced_sync_result
+        next: monitor_sync_progress
+    
+    - monitor_sync_progress:
+        call: sys.sleep
+        args:
+          seconds: 60
+        next: check_sync_completion
+    
+    - check_sync_completion:
+        call: sys.log
+        args:
+          text: "Monitoring forced synchronization progress"
+          severity: "INFO"
+        # In production, this would check actual sync status
+        next: sync_completion_success
+    
+    - sync_completion_success:
+        assign:
+          - sync_result: "completed_successfully"
+        next: notify_completion
+    
+    - simulate_failover_test:
+        steps:
+          - log_test_start:
+              call: sys.log
+              args:
+                text: "Starting test failover simulation (no actual failover)"
+                severity: "INFO"
+          - simulate_test_operations:
+              parallel:
+                branches:
+                  - test_connectivity:
+                      call: sys.log
+                      args:
+                        text: "Testing connectivity to secondary region"
+                        severity: "INFO"
+                  - test_data_integrity:
+                      call: sys.log
+                      args:
+                        text: "Verifying data integrity between regions"
+                        severity: "INFO"
+                  - test_application_readiness:
+                      call: sys.log
+                      args:
+                        text: "Testing application readiness in secondary region"
+                        severity: "INFO"
+          - test_completion:
+              assign:
+                - test_result: "test_completed_successfully"
+        next: notify_completion
+    
+    - activate_secondary_region:
+        parallel:
+          shared: [activation_status]
+          branches:
+            - activate_compute_resources:
+                steps:
+                  - log_compute_activation:
+                      call: sys.log
+                      args:
+                        text: "Activating compute resources in secondary region"
+                        severity: "INFO"
+                  - simulate_compute_activation:
+                      assign:
+                        - compute_status: "activated"
+            - activate_storage_services:
+                steps:
+                  - log_storage_activation:
+                      call: sys.log
+                      args:
+                        text: "Activating storage services in secondary region"
+                        severity: "INFO"
+                  - simulate_storage_activation:
+                      assign:
+                        - storage_status: "activated"
+            - update_load_balancers:
+                steps:
+                  - log_lb_update:
+                      call: sys.log
+                      args:
+                        text: "Updating load balancer configuration for failover"
+                        severity: "INFO"
+                  - simulate_lb_update:
+                      assign:
+                        - lb_status: "updated"
+        next: verify_secondary_activation
+    
+    - verify_secondary_activation:
+        call: sys.log
+        args:
+          text: "Verifying secondary region activation and service health"
+          severity: "INFO"
+        # In production, this would perform actual health checks
+        next: notify_completion
+    
+    - notify_completion:
+        call: http.post
+        args:
+          url: $${"https://pubsub.googleapis.com/v1/projects/" + project_id + "/topics/" + dr_prefix + "-failover-commands:publish"}
+          auth:
+            type: OAuth2
+          body:
+            messages:
+              - data: $${base64.encode(json.encode({
+                  "status": "failover_complete", 
+                  "strategy": strategy, 
+                  "duration_seconds": sys.now - failover_start_time,
+                  "execution_id": execution_id,
+                  "timestamp": sys.now
+                }))}
+        result: completion_notification
+        next: return_success
+    
+    - return_success:
+        return:
+          status: "success"
+          strategy: $${strategy}
+          duration_seconds: $${sys.now - failover_start_time}
+          execution_id: $${execution_id}
+          completion_time: $${sys.now}
+          sync_status: $${get_value(sync_status, "not_applicable")}
+          dns_status: $${get_value(dns_status, "not_applicable")}
+          notification_status: $${get_value(notification_status, "not_applicable")}
+    
+    - invalid_trigger:
+        call: sys.log
+        args:
+          text: $${"Invalid trigger type provided: " + string(event.trigger)}
+          severity: "ERROR"
+        next: return_error
+    
+    - partial_failover:
+        call: sys.log
+        args:
+          text: "Partial failover conditions detected - manual intervention recommended"
+          severity: "WARNING"
+        next: return_partial_failover
+    
+    - return_partial_failover:
+        return:
+          status: "partial_failover_required"
+          recommendation: "Manual intervention needed"
+          health_status: $${primary_health.body.health}
+          duration_seconds: $${sys.now - failover_start_time}
+          execution_id: $${execution_id}
+    
+    - return_error:
+        return:
+          status: "error"
+          error: "Invalid trigger type or workflow execution error"
+          duration_seconds: $${sys.now - failover_start_time}
+          execution_id: $${execution_id}
+
+# Helper function to safely get values with defaults
+get_value:
+  params: [obj, default_value]
+  steps:
+    - return_value:
+        return: $${if(obj != null, obj, default_value)}

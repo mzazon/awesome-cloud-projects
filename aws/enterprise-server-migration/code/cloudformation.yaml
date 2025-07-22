@@ -1,0 +1,634 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Application Migration Service (MGN) infrastructure for large-scale server migration'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'Production'
+    AllowedValues:
+      - 'Development'
+      - 'Staging'
+      - 'Production'
+    Description: 'Environment name for resource tagging'
+  
+  ProjectName:
+    Type: String
+    Default: 'MGN-Migration'
+    Description: 'Project name for resource naming and tagging'
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+  
+  ReplicationServerInstanceType:
+    Type: String
+    Default: 't3.small'
+    AllowedValues:
+      - 't3.micro'
+      - 't3.small'
+      - 't3.medium'
+      - 't3.large'
+      - 'm5.large'
+      - 'm5.xlarge'
+    Description: 'Instance type for MGN replication servers'
+  
+  DefaultLargeStagingDiskType:
+    Type: String
+    Default: 'GP3'
+    AllowedValues:
+      - 'GP2'
+      - 'GP3'
+      - 'IO1'
+      - 'IO2'
+      - 'SC1'
+      - 'ST1'
+    Description: 'EBS volume type for staging area disks'
+  
+  DataPlaneRouting:
+    Type: String
+    Default: 'PRIVATE_IP'
+    AllowedValues:
+      - 'PRIVATE_IP'
+      - 'PUBLIC_IP'
+    Description: 'Routing method for data plane communication'
+  
+  CreatePublicIP:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Whether to create public IP addresses for replication servers'
+  
+  EbsEncryption:
+    Type: String
+    Default: 'DEFAULT'
+    AllowedValues:
+      - 'DEFAULT'
+      - 'CUSTOM'
+    Description: 'EBS encryption configuration'
+  
+  BandwidthThrottling:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 10000
+    Description: 'Bandwidth throttling in Mbps (0 = unlimited)'
+  
+  UseDedicatedReplicationServer:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Whether to use dedicated replication servers'
+  
+  VpcId:
+    Type: 'AWS::EC2::VPC::Id'
+    Description: 'VPC ID where MGN resources will be deployed'
+  
+  SubnetIds:
+    Type: 'List<AWS::EC2::Subnet::Id>'
+    Description: 'List of subnet IDs for MGN staging area (minimum 2 subnets)'
+  
+  AllowedSourceCidr:
+    Type: String
+    Default: '10.0.0.0/8'
+    Description: 'CIDR block allowed to access MGN resources'
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: 'Must be a valid CIDR block'
+
+Conditions:
+  CreatePublicIPCondition: !Equals [!Ref CreatePublicIP, 'true']
+  UseDedicatedReplicationServerCondition: !Equals [!Ref UseDedicatedReplicationServer, 'true']
+  EnableBandwidthThrottling: !Not [!Equals [!Ref BandwidthThrottling, 0]]
+
+Resources:
+  # IAM Role for MGN Service
+  MGNServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-MGNServiceRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: mgn.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AWSApplicationMigrationServiceRolePolicy'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-MGNServiceRole'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'MGN Service Role'
+
+  # IAM Role for MGN Replication Servers
+  MGNReplicationServerRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-MGNReplicationServerRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AWSApplicationMigrationReplicationServerPolicy'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-MGNReplicationServerRole'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'MGN Replication Server Role'
+
+  # Instance Profile for MGN Replication Servers
+  MGNReplicationServerInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      InstanceProfileName: !Sub '${ProjectName}-MGNReplicationServerInstanceProfile-${AWS::Region}'
+      Roles:
+        - !Ref MGNReplicationServerRole
+
+  # Security Group for MGN Replication Servers
+  MGNReplicationServerSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: !Sub '${ProjectName}-MGNReplicationServerSG'
+      GroupDescription: 'Security group for MGN replication servers'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref AllowedSourceCidr
+          Description: 'HTTPS access from source servers'
+        - IpProtocol: tcp
+          FromPort: 1500
+          ToPort: 1500
+          CidrIp: !Ref AllowedSourceCidr
+          Description: 'MGN replication traffic from source servers'
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedSourceCidr
+          Description: 'SSH access for management'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: '0.0.0.0/0'
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-MGNReplicationServerSG'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'MGN Replication Server Security Group'
+
+  # Security Group for MGN Staging Area
+  MGNStagingAreaSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: !Sub '${ProjectName}-MGNStagingAreaSG'
+      GroupDescription: 'Security group for MGN staging area resources'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref MGNReplicationServerSecurityGroup
+          Description: 'HTTPS access from replication servers'
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedSourceCidr
+          Description: 'SSH access for management'
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          CidrIp: !Ref AllowedSourceCidr
+          Description: 'RDP access for Windows instances'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: '0.0.0.0/0'
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-MGNStagingAreaSG'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'MGN Staging Area Security Group'
+
+  # KMS Key for MGN Encryption (if using custom encryption)
+  MGNEncryptionKey:
+    Type: 'AWS::KMS::Key'
+    Condition: !Equals [!Ref EbsEncryption, 'CUSTOM']
+    Properties:
+      Description: 'KMS key for MGN EBS volume encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow MGN Service
+            Effect: Allow
+            Principal:
+              Service: mgn.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+              - 'kms:DescribeKey'
+            Resource: '*'
+          - Sid: Allow EC2 Service
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+              - 'kms:DescribeKey'
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-MGNEncryptionKey'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'MGN EBS Encryption'
+
+  # KMS Key Alias
+  MGNEncryptionKeyAlias:
+    Type: 'AWS::KMS::Alias'
+    Condition: !Equals [!Ref EbsEncryption, 'CUSTOM']
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-mgn-encryption-key'
+      TargetKeyId: !Ref MGNEncryptionKey
+
+  # SNS Topic for MGN Notifications
+  MGNNotificationTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      TopicName: !Sub '${ProjectName}-MGN-Notifications'
+      DisplayName: 'MGN Migration Notifications'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-MGN-Notifications'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'MGN Migration Notifications'
+
+  # CloudWatch Log Group for MGN
+  MGNLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/mgn/${ProjectName}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-MGN-LogGroup'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'MGN Migration Logs'
+
+  # CloudWatch Dashboard for MGN Monitoring
+  MGNDashboard:
+    Type: 'AWS::CloudWatch::Dashboard'
+    Properties:
+      DashboardName: !Sub '${ProjectName}-MGN-Dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/MGN", "ReplicationLag", "SourceServerId", "ALL" ],
+                  [ ".", "ReplicationProgress", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "MGN Replication Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/EC2", "CPUUtilization", "InstanceId", "ALL" ],
+                  [ ".", "NetworkIn", ".", "." ],
+                  [ ".", "NetworkOut", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "EC2 Instance Metrics",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+  # S3 Bucket for MGN Logs and Artifacts
+  MGNArtifactsBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${ProjectName}-mgn-artifacts-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-MGN-Artifacts'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'MGN Logs and Artifacts'
+
+  # S3 Bucket Policy for MGN Access
+  MGNArtifactsBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref MGNArtifactsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowMGNServiceAccess
+            Effect: Allow
+            Principal:
+              Service: mgn.amazonaws.com
+            Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+              - 's3:DeleteObject'
+            Resource: !Sub '${MGNArtifactsBucket}/*'
+          - Sid: AllowMGNServiceListBucket
+            Effect: Allow
+            Principal:
+              Service: mgn.amazonaws.com
+            Action: 's3:ListBucket'
+            Resource: !Ref MGNArtifactsBucket
+
+  # Lambda Function for MGN Automation
+  MGNAutomationFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-MGN-Automation'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt MGNAutomationRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Lambda function for MGN automation tasks
+              """
+              mgn_client = boto3.client('mgn')
+              
+              try:
+                  # Get source servers
+                  response = mgn_client.describe_source_servers()
+                  servers = response.get('items', [])
+                  
+                  logger.info(f"Found {len(servers)} source servers")
+                  
+                  # Process each server
+                  for server in servers:
+                      server_id = server.get('sourceServerID')
+                      replication_state = server.get('dataReplicationInfo', {}).get('dataReplicationState')
+                      
+                      logger.info(f"Server {server_id}: {replication_state}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'MGN automation completed successfully',
+                          'servers_processed': len(servers)
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in MGN automation: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          SNS_TOPIC_ARN: !Ref MGNNotificationTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-MGN-Automation'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'MGN Automation'
+
+  # IAM Role for MGN Automation Lambda
+  MGNAutomationRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-MGNAutomationRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: MGNAutomationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'mgn:DescribeSourceServers'
+                  - 'mgn:StartTest'
+                  - 'mgn:StartCutover'
+                  - 'mgn:FinalizeCutover'
+                  - 'mgn:MarkAsArchived'
+                  - 'mgn:DisconnectFromService'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref MGNNotificationTopic
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-MGN-Automation*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-MGNAutomationRole'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'MGN Automation Lambda Role'
+
+  # EventBridge Rule for MGN Events
+  MGNEventRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: !Sub '${ProjectName}-MGN-Events'
+      Description: 'Capture MGN migration events'
+      EventPattern:
+        source:
+          - 'aws.mgn'
+        detail-type:
+          - 'MGN Source Server Launch Result'
+          - 'MGN Source Server Lifecycle State Change'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt MGNAutomationFunction.Arn
+          Id: 'MGNAutomationTarget'
+        - Arn: !Ref MGNNotificationTopic
+          Id: 'MGNNotificationTarget'
+
+  # Permission for EventBridge to invoke Lambda
+  MGNEventRuleLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref MGNAutomationFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt MGNEventRule.Arn
+
+Outputs:
+  MGNServiceRoleArn:
+    Description: 'ARN of the MGN service role'
+    Value: !GetAtt MGNServiceRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-MGNServiceRoleArn'
+  
+  MGNReplicationServerSecurityGroupId:
+    Description: 'Security Group ID for MGN replication servers'
+    Value: !Ref MGNReplicationServerSecurityGroup
+    Export:
+      Name: !Sub '${ProjectName}-MGNReplicationServerSG'
+  
+  MGNStagingAreaSecurityGroupId:
+    Description: 'Security Group ID for MGN staging area'
+    Value: !Ref MGNStagingAreaSecurityGroup
+    Export:
+      Name: !Sub '${ProjectName}-MGNStagingAreaSG'
+  
+  MGNEncryptionKeyId:
+    Description: 'KMS Key ID for MGN encryption'
+    Value: !If [!Equals [!Ref EbsEncryption, 'CUSTOM'], !Ref MGNEncryptionKey, 'Default AWS managed key']
+    Export:
+      Name: !Sub '${ProjectName}-MGNEncryptionKeyId'
+  
+  MGNNotificationTopicArn:
+    Description: 'ARN of the SNS topic for MGN notifications'
+    Value: !Ref MGNNotificationTopic
+    Export:
+      Name: !Sub '${ProjectName}-MGNNotificationTopicArn'
+  
+  MGNLogGroupName:
+    Description: 'CloudWatch Log Group name for MGN'
+    Value: !Ref MGNLogGroup
+    Export:
+      Name: !Sub '${ProjectName}-MGNLogGroupName'
+  
+  MGNArtifactsBucketName:
+    Description: 'S3 bucket name for MGN artifacts'
+    Value: !Ref MGNArtifactsBucket
+    Export:
+      Name: !Sub '${ProjectName}-MGNArtifactsBucketName'
+  
+  MGNDashboardURL:
+    Description: 'URL to the CloudWatch dashboard for MGN monitoring'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-MGN-Dashboard'
+    Export:
+      Name: !Sub '${ProjectName}-MGNDashboardURL'
+  
+  MGNAutomationFunctionArn:
+    Description: 'ARN of the MGN automation Lambda function'
+    Value: !GetAtt MGNAutomationFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-MGNAutomationFunctionArn'
+  
+  ReplicationConfiguration:
+    Description: 'MGN replication configuration summary'
+    Value: !Sub |
+      Instance Type: ${ReplicationServerInstanceType}
+      Disk Type: ${DefaultLargeStagingDiskType}
+      Data Plane Routing: ${DataPlaneRouting}
+      Encryption: ${EbsEncryption}
+      Bandwidth Throttling: ${BandwidthThrottling} Mbps
+    Export:
+      Name: !Sub '${ProjectName}-ReplicationConfiguration'

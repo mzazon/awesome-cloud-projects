@@ -1,0 +1,1501 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Automated File Lifecycle Management with Amazon FSx Intelligent-Tiering and Lambda
+  Creates an automated file lifecycle management system using FSx for OpenZFS, Lambda functions,
+  EventBridge, CloudWatch, and SNS for intelligent storage optimization and cost management.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "FSx Configuration"
+        Parameters:
+          - StorageCapacity
+          - ThroughputCapacity
+          - ReadCacheSize
+          - FileSystemName
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - SubnetId
+          - AllowedCidrBlock
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - NotificationEmail
+          - MonitoringSchedule
+          - ReportingSchedule
+      - Label:
+          default: "Cost Optimization"
+        Parameters:
+          - CacheHitThreshold
+          - StorageUtilizationThreshold
+          - NetworkUtilizationThreshold
+
+Parameters:
+  # FSx Configuration Parameters
+  StorageCapacity:
+    Type: Number
+    Default: 64
+    MinValue: 64
+    MaxValue: 524288
+    Description: Storage capacity for the FSx file system in GiB (minimum 64 GiB)
+
+  ThroughputCapacity:
+    Type: Number
+    Default: 64
+    AllowedValues: [64, 128, 256, 512, 1024, 2048, 3072, 4096]
+    Description: Throughput capacity in MBps for the FSx file system
+
+  ReadCacheSize:
+    Type: Number
+    Default: 128
+    MinValue: 0
+    MaxValue: 2048
+    Description: SSD read cache size in GiB (0 to disable caching)
+
+  FileSystemName:
+    Type: String
+    Default: fsx-lifecycle-management
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: '^[a-zA-Z0-9\-]+$'
+    Description: Name tag for the FSx file system (alphanumeric and hyphens only)
+
+  # Network Configuration Parameters
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where the FSx file system will be deployed
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet ID for the FSx file system deployment
+
+  AllowedCidrBlock:
+    Type: String
+    Default: 10.0.0.0/8
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: CIDR block allowed to access the FSx file system
+
+  # Monitoring Configuration Parameters
+  NotificationEmail:
+    Type: String
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    Description: Email address for receiving alerts and notifications
+
+  MonitoringSchedule:
+    Type: String
+    Default: rate(1 hour)
+    AllowedValues: 
+      - rate(15 minutes)
+      - rate(30 minutes)
+      - rate(1 hour)
+      - rate(2 hours)
+      - rate(6 hours)
+      - rate(12 hours)
+    Description: Schedule for lifecycle policy monitoring
+
+  ReportingSchedule:
+    Type: String
+    Default: rate(24 hours)
+    AllowedValues: 
+      - rate(6 hours)
+      - rate(12 hours)
+      - rate(24 hours)
+      - cron(0 9 * * ? *)
+      - cron(0 18 * * ? *)
+    Description: Schedule for cost reporting
+
+  # Cost Optimization Thresholds
+  CacheHitThreshold:
+    Type: Number
+    Default: 70
+    MinValue: 0
+    MaxValue: 100
+    Description: Cache hit ratio threshold for alerts (percentage)
+
+  StorageUtilizationThreshold:
+    Type: Number
+    Default: 85
+    MinValue: 0
+    MaxValue: 100
+    Description: Storage utilization threshold for alerts (percentage)
+
+  NetworkUtilizationThreshold:
+    Type: Number
+    Default: 90
+    MinValue: 0
+    MaxValue: 100
+    Description: Network utilization threshold for alerts (percentage)
+
+Conditions:
+  # Condition to enable read cache only if size is greater than 0
+  EnableReadCache: !Not [!Equals [!Ref ReadCacheSize, 0]]
+  
+  # Condition for production-level monitoring (smaller intervals)
+  ProductionMonitoring: !Or 
+    - !Equals [!Ref MonitoringSchedule, 'rate(15 minutes)']
+    - !Equals [!Ref MonitoringSchedule, 'rate(30 minutes)']
+
+Resources:
+  # S3 Bucket for Reports Storage
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-fsx-lifecycle-reports-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ReportsArchiving
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+            ExpirationInDays: 2555  # 7 years retention
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt CostReportingFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: cost-reports/
+      Tags:
+        - Key: Name
+          Value: !Sub '${FileSystemName}-reports-bucket'
+        - Key: Purpose
+          Value: FSx Lifecycle Reports Storage
+
+  # SNS Topic for Notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-fsx-lifecycle-alerts'
+      DisplayName: FSx Lifecycle Management Alerts
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${FileSystemName}-notifications'
+        - Key: Purpose
+          Value: FSx Lifecycle Notifications
+
+  # SNS Subscription for Email Notifications
+  EmailNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref NotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # Security Group for FSx File System
+  FSxSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for FSx file system with NFS access
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          CidrIp: !Ref AllowedCidrBlock
+          Description: NFS access for FSx file system
+        - IpProtocol: tcp
+          FromPort: 111
+          ToPort: 111
+          CidrIp: !Ref AllowedCidrBlock
+          Description: NFS portmapper
+        - IpProtocol: udp
+          FromPort: 111
+          ToPort: 111
+          CidrIp: !Ref AllowedCidrBlock
+          Description: NFS portmapper UDP
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${FileSystemName}-security-group'
+        - Key: Purpose
+          Value: FSx File System Access Control
+
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-FSxLifecycleRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: FSxLifecyclePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # FSx permissions
+              - Effect: Allow
+                Action:
+                  - fsx:DescribeFileSystems
+                  - fsx:DescribeVolumes
+                  - fsx:PutFileSystemPolicy
+                  - fsx:DescribeBackups
+                Resource: '*'
+              # CloudWatch permissions
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:ListMetrics
+                Resource: '*'
+              # SNS permissions
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+              # S3 permissions
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: 
+                  - !Sub '${ReportsBucket}/*'
+                  - !GetAtt ReportsBucket.Arn
+              # Logs permissions for enhanced logging
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${FileSystemName}-lambda-role'
+        - Key: Purpose
+          Value: FSx Lifecycle Lambda Execution Role
+
+  # Amazon FSx for OpenZFS File System
+  FSxFileSystem:
+    Type: AWS::FSx::FileSystem
+    Properties:
+      FileSystemType: OpenZFS
+      StorageCapacity: !Ref StorageCapacity
+      StorageType: SSD
+      SubnetIds: 
+        - !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref FSxSecurityGroup
+      OpenZFSConfiguration:
+        ThroughputCapacity: !Ref ThroughputCapacity
+        ReadCacheConfig: !If
+          - EnableReadCache
+          - SizeGiB: !Ref ReadCacheSize
+          - !Ref AWS::NoValue
+        WeeklyMaintenanceStartTime: '3:02:00'  # Sunday 3:02 AM UTC
+        DailyAutomaticBackupStartTime: '03:00'
+        AutomaticBackupRetentionDays: 7
+        CopyTagsToBackups: true
+        CopyTagsToVolumes: true
+      Tags:
+        - Key: Name
+          Value: !Ref FileSystemName
+        - Key: Purpose
+          Value: Automated Lifecycle Management
+        - Key: Environment
+          Value: !Ref AWS::StackName
+        - Key: BackupRetention
+          Value: '7-days'
+
+  # Lambda Function for Lifecycle Policy Management
+  LifecyclePolicyFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-fsx-lifecycle-policy'
+      Description: Monitors FSx metrics and adjusts lifecycle policies based on access patterns
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+          FSX_FILE_SYSTEM_ID: !Ref FSxFileSystem
+          CACHE_HIT_THRESHOLD: !Ref CacheHitThreshold
+          STORAGE_UTILIZATION_THRESHOLD: !Ref StorageUtilizationThreshold
+          NETWORK_UTILIZATION_THRESHOLD: !Ref NetworkUtilizationThreshold
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import datetime
+          import os
+          from typing import Dict, List
+
+          def lambda_handler(event, context):
+              """
+              Monitor FSx metrics and adjust lifecycle policies based on access patterns
+              """
+              fsx_client = boto3.client('fsx')
+              cloudwatch = boto3.client('cloudwatch')
+              sns = boto3.client('sns')
+              
+              try:
+                  # Get FSx file system information
+                  fs_id = os.environ.get('FSX_FILE_SYSTEM_ID')
+                  if not fs_id:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps('FSX_FILE_SYSTEM_ID environment variable not set')
+                      }
+                  
+                  # Get cache hit ratio metric
+                  cache_metrics = get_cache_metrics(cloudwatch, fs_id)
+                  
+                  # Get storage utilization metrics
+                  storage_metrics = get_storage_metrics(cloudwatch, fs_id)
+                  
+                  # Get network utilization metrics
+                  network_metrics = get_network_metrics(cloudwatch, fs_id)
+                  
+                  # Analyze access patterns
+                  recommendations = analyze_access_patterns(cache_metrics, storage_metrics, network_metrics)
+                  
+                  # Send recommendations via SNS
+                  send_notifications(sns, fs_id, recommendations)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Lifecycle policy analysis completed successfully')
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+          
+          def get_cache_metrics(cloudwatch, file_system_id: str) -> List[Dict]:
+              """Get FSx cache hit ratio metrics"""
+              end_time = datetime.datetime.utcnow()
+              start_time = end_time - datetime.timedelta(hours=1)
+              
+              try:
+                  response = cloudwatch.get_metric_statistics(
+                      Namespace='AWS/FSx',
+                      MetricName='FileServerCacheHitRatio',
+                      Dimensions=[
+                          {
+                              'Name': 'FileSystemId',
+                              'Value': file_system_id
+                          }
+                      ],
+                      StartTime=start_time,
+                      EndTime=end_time,
+                      Period=300,
+                      Statistics=['Average']
+                  )
+                  return response['Datapoints']
+              except Exception as e:
+                  print(f"Error getting cache metrics: {e}")
+                  return []
+          
+          def get_storage_metrics(cloudwatch, file_system_id: str) -> List[Dict]:
+              """Get FSx storage utilization metrics"""
+              end_time = datetime.datetime.utcnow()
+              start_time = end_time - datetime.timedelta(hours=1)
+              
+              try:
+                  response = cloudwatch.get_metric_statistics(
+                      Namespace='AWS/FSx',
+                      MetricName='StorageUtilization',
+                      Dimensions=[
+                          {
+                              'Name': 'FileSystemId',
+                              'Value': file_system_id
+                          }
+                      ],
+                      StartTime=start_time,
+                      EndTime=end_time,
+                      Period=300,
+                      Statistics=['Average']
+                  )
+                  return response['Datapoints']
+              except Exception as e:
+                  print(f"Error getting storage metrics: {e}")
+                  return []
+          
+          def get_network_metrics(cloudwatch, file_system_id: str) -> List[Dict]:
+              """Get FSx network utilization metrics"""
+              end_time = datetime.datetime.utcnow()
+              start_time = end_time - datetime.timedelta(hours=1)
+              
+              try:
+                  response = cloudwatch.get_metric_statistics(
+                      Namespace='AWS/FSx',
+                      MetricName='NetworkThroughputUtilization',
+                      Dimensions=[
+                          {
+                              'Name': 'FileSystemId',
+                              'Value': file_system_id
+                          }
+                      ],
+                      StartTime=start_time,
+                      EndTime=end_time,
+                      Period=300,
+                      Statistics=['Average']
+                  )
+                  return response['Datapoints']
+              except Exception as e:
+                  print(f"Error getting network metrics: {e}")
+                  return []
+          
+          def analyze_access_patterns(cache_metrics: List[Dict], storage_metrics: List[Dict], network_metrics: List[Dict]) -> Dict:
+              """Analyze metrics to generate recommendations"""
+              recommendations = {
+                  'cache_recommendation': 'No data available',
+                  'storage_recommendation': 'No data available',
+                  'network_recommendation': 'No data available',
+                  'actions': []
+              }
+              
+              # Analyze cache hit ratio
+              if cache_metrics:
+                  avg_cache_hit = sum(point['Average'] for point in cache_metrics) / len(cache_metrics)
+                  recommendations['cache_hit_ratio'] = avg_cache_hit
+                  
+                  cache_threshold = float(os.environ.get('CACHE_HIT_THRESHOLD', '70'))
+                  if avg_cache_hit < cache_threshold:
+                      recommendations['cache_recommendation'] = f'Cache hit ratio ({avg_cache_hit:.1f}%) below threshold ({cache_threshold}%) - consider increasing SSD cache size'
+                      recommendations['actions'].append('scale_cache')
+                  elif avg_cache_hit > 95:
+                      recommendations['cache_recommendation'] = 'Cache hit ratio excellent - cache size may be oversized'
+                      recommendations['actions'].append('optimize_cache')
+                  else:
+                      recommendations['cache_recommendation'] = f'Cache performance optimal ({avg_cache_hit:.1f}%)'
+                      recommendations['actions'].append('maintain')
+              
+              # Analyze storage utilization
+              if storage_metrics:
+                  avg_storage = sum(point['Average'] for point in storage_metrics) / len(storage_metrics)
+                  recommendations['storage_utilization'] = avg_storage
+                  
+                  storage_threshold = float(os.environ.get('STORAGE_UTILIZATION_THRESHOLD', '85'))
+                  if avg_storage > storage_threshold:
+                      recommendations['storage_recommendation'] = f'High storage utilization ({avg_storage:.1f}%) detected'
+                      recommendations['actions'].append('monitor_capacity')
+                  elif avg_storage < 30:
+                      recommendations['storage_recommendation'] = f'Low storage utilization ({avg_storage:.1f}%) - consider downsizing'
+                      recommendations['actions'].append('optimize_capacity')
+                  else:
+                      recommendations['storage_recommendation'] = f'Storage utilization optimal ({avg_storage:.1f}%)'
+              
+              # Analyze network utilization
+              if network_metrics:
+                  avg_network = sum(point['Average'] for point in network_metrics) / len(network_metrics)
+                  recommendations['network_utilization'] = avg_network
+                  
+                  network_threshold = float(os.environ.get('NETWORK_UTILIZATION_THRESHOLD', '90'))
+                  if avg_network > network_threshold:
+                      recommendations['network_recommendation'] = f'High network utilization ({avg_network:.1f}%) detected'
+                      recommendations['actions'].append('scale_throughput')
+                  else:
+                      recommendations['network_recommendation'] = f'Network utilization acceptable ({avg_network:.1f}%)'
+              
+              return recommendations
+          
+          def send_notifications(sns, file_system_id: str, recommendations: Dict):
+              """Send recommendations via SNS"""
+              topic_arn = os.environ.get('SNS_TOPIC_ARN')
+              if not topic_arn:
+                  return
+              
+              message = f"""FSx File System Lifecycle Analysis Report
+              
+          File System ID: {file_system_id}
+          Analysis Time: {datetime.datetime.utcnow().isoformat()}Z
+          
+          PERFORMANCE ANALYSIS:
+          • Cache Performance: {recommendations['cache_recommendation']}
+          • Storage Status: {recommendations['storage_recommendation']}
+          • Network Status: {recommendations['network_recommendation']}
+          
+          METRICS:
+          • Cache Hit Ratio: {recommendations.get('cache_hit_ratio', 'N/A')}%
+          • Storage Utilization: {recommendations.get('storage_utilization', 'N/A')}%
+          • Network Utilization: {recommendations.get('network_utilization', 'N/A')}%
+          
+          RECOMMENDED ACTIONS:
+          {chr(10).join(f'• {action.replace("_", " ").title()}' for action in recommendations.get('actions', ['None']))}
+          """
+              
+              try:
+                  sns.publish(
+                      TopicArn=topic_arn,
+                      Message=message,
+                      Subject='FSx Lifecycle Policy Recommendation Report'
+                  )
+                  print("Notification sent successfully")
+              except Exception as e:
+                  print(f"Error sending notification: {e}")
+      Tags:
+        - Key: Name
+          Value: !Sub '${FileSystemName}-lifecycle-function'
+        - Key: Purpose
+          Value: FSx Lifecycle Policy Management
+
+  # Lambda Function for Cost Reporting
+  CostReportingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-fsx-cost-reporting'
+      Description: Generates cost optimization reports for FSx file systems
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 600
+      MemorySize: 512
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref ReportsBucket
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+          FSX_FILE_SYSTEM_ID: !Ref FSxFileSystem
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import datetime
+          import csv
+          import os
+          from io import StringIO
+
+          def lambda_handler(event, context):
+              """
+              Generate cost optimization reports for FSx file systems
+              """
+              fsx_client = boto3.client('fsx')
+              cloudwatch = boto3.client('cloudwatch')
+              s3 = boto3.client('s3')
+              sns = boto3.client('sns')
+              
+              try:
+                  fs_id = os.environ.get('FSX_FILE_SYSTEM_ID')
+                  if not fs_id:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps('FSX_FILE_SYSTEM_ID environment variable not set')
+                      }
+                  
+                  # Get FSx file system details
+                  fs_response = fsx_client.describe_file_systems(FileSystemIds=[fs_id])
+                  fs = fs_response['FileSystems'][0]
+                  
+                  # Collect usage metrics
+                  usage_data = collect_usage_metrics(cloudwatch, fs_id)
+                  
+                  # Generate cost report
+                  report = generate_cost_report(fs, usage_data)
+                  
+                  # Save report to S3
+                  s3_key = save_report_to_s3(s3, fs_id, report)
+                  
+                  # Send notification about report generation
+                  send_report_notification(sns, fs_id, report, s3_key)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(f'Cost report generated successfully: {s3_key}')
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+          
+          def collect_usage_metrics(cloudwatch, file_system_id: str) -> dict:
+              """Collect various usage metrics for cost analysis"""
+              end_time = datetime.datetime.utcnow()
+              start_time = end_time - datetime.timedelta(days=7)
+              
+              metrics = {}
+              
+              # Storage capacity and utilization metrics
+              for metric_name in ['StorageUtilization', 'FileServerCacheHitRatio', 'NetworkThroughputUtilization']:
+                  try:
+                      response = cloudwatch.get_metric_statistics(
+                          Namespace='AWS/FSx',
+                          MetricName=metric_name,
+                          Dimensions=[
+                              {
+                                  'Name': 'FileSystemId',
+                                  'Value': file_system_id
+                              }
+                          ],
+                          StartTime=start_time,
+                          EndTime=end_time,
+                          Period=3600,
+                          Statistics=['Average', 'Maximum']
+                      )
+                      metrics[metric_name] = response['Datapoints']
+                  except Exception as e:
+                      print(f"Error collecting {metric_name}: {e}")
+                      metrics[metric_name] = []
+              
+              return metrics
+          
+          def generate_cost_report(file_system: dict, usage_data: dict) -> dict:
+              """Generate comprehensive cost optimization report"""
+              fs_id = file_system['FileSystemId']
+              storage_capacity = file_system['StorageCapacity']
+              throughput_capacity = file_system['OpenZFSConfiguration']['ThroughputCapacity']
+              
+              # Calculate estimated costs based on current pricing (estimates for us-east-1)
+              # Base throughput cost: approximately $0.30 per MBps/month
+              base_throughput_cost = throughput_capacity * 0.30
+              
+              # Storage cost: approximately $0.15 per GiB/month for SSD
+              storage_cost = storage_capacity * 0.15
+              
+              # Cache cost if enabled
+              cache_config = file_system['OpenZFSConfiguration'].get('ReadCacheConfig', {})
+              cache_size = cache_config.get('SizeGiB', 0)
+              cache_cost = cache_size * 0.02 if cache_size > 0 else 0  # Estimated cache cost
+              
+              monthly_cost = base_throughput_cost + storage_cost + cache_cost
+              
+              # Storage efficiency analysis
+              storage_metrics = usage_data.get('StorageUtilization', [])
+              avg_utilization = 0
+              max_utilization = 0
+              if storage_metrics:
+                  avg_utilization = sum(point['Average'] for point in storage_metrics) / len(storage_metrics)
+                  max_utilization = max(point['Maximum'] for point in storage_metrics)
+              
+              # Cache performance analysis
+              cache_metrics = usage_data.get('FileServerCacheHitRatio', [])
+              avg_cache_hit = 0
+              if cache_metrics:
+                  avg_cache_hit = sum(point['Average'] for point in cache_metrics) / len(cache_metrics)
+              
+              # Network performance analysis
+              network_metrics = usage_data.get('NetworkThroughputUtilization', [])
+              avg_network_util = 0
+              max_network_util = 0
+              if network_metrics:
+                  avg_network_util = sum(point['Average'] for point in network_metrics) / len(network_metrics)
+                  max_network_util = max(point['Maximum'] for point in network_metrics)
+              
+              report = {
+                  'file_system_id': fs_id,
+                  'report_date': datetime.datetime.utcnow().isoformat(),
+                  'configuration': {
+                      'storage_capacity_gb': storage_capacity,
+                      'throughput_capacity_mbps': throughput_capacity,
+                      'cache_size_gb': cache_size
+                  },
+                  'cost_analysis': {
+                      'estimated_monthly_cost': monthly_cost,
+                      'throughput_cost': base_throughput_cost,
+                      'storage_cost': storage_cost,
+                      'cache_cost': cache_cost
+                  },
+                  'performance_metrics': {
+                      'avg_storage_utilization': avg_utilization,
+                      'max_storage_utilization': max_utilization,
+                      'avg_cache_hit_ratio': avg_cache_hit,
+                      'avg_network_utilization': avg_network_util,
+                      'max_network_utilization': max_network_util
+                  },
+                  'recommendations': []
+              }
+              
+              # Generate recommendations
+              if avg_utilization < 50:
+                  potential_savings = storage_capacity * 0.15 * 0.3  # 30% potential savings
+                  report['recommendations'].append({
+                      'type': 'storage_optimization',
+                      'priority': 'medium',
+                      'description': f'Low storage utilization ({avg_utilization:.1f}%) - consider reducing capacity',
+                      'potential_savings_per_month': f"${potential_savings:.2f}"
+                  })
+              
+              if avg_cache_hit < 70 and cache_size > 0:
+                  report['recommendations'].append({
+                      'type': 'cache_optimization',
+                      'priority': 'high',
+                      'description': f'Low cache hit ratio ({avg_cache_hit:.1f}%) - consider increasing cache size',
+                      'impact': 'Improved performance and reduced latency'
+                  })
+              
+              if max_utilization > 90:
+                  report['recommendations'].append({
+                      'type': 'capacity_expansion',
+                      'priority': 'high',
+                      'description': f'High storage utilization detected ({max_utilization:.1f}%)',
+                      'impact': 'Prevent capacity issues and maintain performance'
+                  })
+              
+              if max_network_util > 80:
+                  report['recommendations'].append({
+                      'type': 'throughput_scaling',
+                      'priority': 'medium',
+                      'description': f'High network utilization ({max_network_util:.1f}%)',
+                      'impact': 'Consider increasing throughput capacity'
+                  })
+              
+              if avg_utilization > 70 and avg_cache_hit > 90:
+                  report['recommendations'].append({
+                      'type': 'optimization_complete',
+                      'priority': 'low',
+                      'description': 'File system is well-optimized',
+                      'impact': 'Continue monitoring for changes in usage patterns'
+                  })
+              
+              return report
+          
+          def save_report_to_s3(s3, file_system_id: str, report: dict) -> str:
+              """Save cost report to S3"""
+              bucket_name = os.environ.get('S3_BUCKET_NAME')
+              if not bucket_name:
+                  raise ValueError("S3_BUCKET_NAME environment variable not set")
+              
+              # Create CSV report
+              csv_buffer = StringIO()
+              writer = csv.writer(csv_buffer)
+              
+              # Write header information
+              writer.writerow(['FSx Cost Optimization Report'])
+              writer.writerow([''])
+              writer.writerow(['Generated:', report['report_date']])
+              writer.writerow(['File System ID:', report['file_system_id']])
+              writer.writerow([''])
+              
+              # Configuration section
+              writer.writerow(['CONFIGURATION'])
+              writer.writerow(['Storage Capacity (GB):', report['configuration']['storage_capacity_gb']])
+              writer.writerow(['Throughput Capacity (MBps):', report['configuration']['throughput_capacity_mbps']])
+              writer.writerow(['Cache Size (GB):', report['configuration']['cache_size_gb']])
+              writer.writerow([''])
+              
+              # Cost analysis section
+              writer.writerow(['COST ANALYSIS'])
+              writer.writerow(['Estimated Monthly Cost:', f"${report['cost_analysis']['estimated_monthly_cost']:.2f}"])
+              writer.writerow(['Throughput Cost:', f"${report['cost_analysis']['throughput_cost']:.2f}"])
+              writer.writerow(['Storage Cost:', f"${report['cost_analysis']['storage_cost']:.2f}"])
+              writer.writerow(['Cache Cost:', f"${report['cost_analysis']['cache_cost']:.2f}"])
+              writer.writerow([''])
+              
+              # Performance metrics section
+              writer.writerow(['PERFORMANCE METRICS'])
+              writer.writerow(['Average Storage Utilization (%):', f"{report['performance_metrics']['avg_storage_utilization']:.1f}"])
+              writer.writerow(['Maximum Storage Utilization (%):', f"{report['performance_metrics']['max_storage_utilization']:.1f}"])
+              writer.writerow(['Average Cache Hit Ratio (%):', f"{report['performance_metrics']['avg_cache_hit_ratio']:.1f}"])
+              writer.writerow(['Average Network Utilization (%):', f"{report['performance_metrics']['avg_network_utilization']:.1f}"])
+              writer.writerow(['Maximum Network Utilization (%):', f"{report['performance_metrics']['max_network_utilization']:.1f}"])
+              writer.writerow([''])
+              
+              # Recommendations section
+              writer.writerow(['RECOMMENDATIONS'])
+              writer.writerow(['Priority', 'Type', 'Description', 'Impact/Savings'])
+              for rec in report['recommendations']:
+                  writer.writerow([
+                      rec['priority'].upper(),
+                      rec['type'].replace('_', ' ').title(),
+                      rec['description'],
+                      rec.get('potential_savings_per_month', rec.get('impact', 'N/A'))
+                  ])
+              
+              # Save to S3
+              timestamp = datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+              key = f"cost-reports/{file_system_id}/report_{timestamp}.csv"
+              
+              s3.put_object(
+                  Bucket=bucket_name,
+                  Key=key,
+                  Body=csv_buffer.getvalue(),
+                  ContentType='text/csv',
+                  Metadata={
+                      'file-system-id': file_system_id,
+                      'report-type': 'cost-optimization',
+                      'generated-date': timestamp
+                  }
+              )
+              
+              print(f"Report saved to s3://{bucket_name}/{key}")
+              return key
+          
+          def send_report_notification(sns, file_system_id: str, report: dict, s3_key: str):
+              """Send notification about generated report"""
+              topic_arn = os.environ.get('SNS_TOPIC_ARN')
+              if not topic_arn:
+                  return
+              
+              # Calculate potential savings
+              total_savings = sum(
+                  float(rec.get('potential_savings_per_month', '$0')[1:]) 
+                  for rec in report['recommendations'] 
+                  if 'potential_savings_per_month' in rec
+              )
+              
+              message = f"""FSx Cost Optimization Report Generated
+              
+          File System: {file_system_id}
+          Report Location: {s3_key}
+          Generated: {report['report_date']}
+          
+          COST SUMMARY:
+          • Monthly Cost Estimate: ${report['cost_analysis']['estimated_monthly_cost']:.2f}
+          • Potential Monthly Savings: ${total_savings:.2f}
+          
+          PERFORMANCE SUMMARY:
+          • Storage Utilization: {report['performance_metrics']['avg_storage_utilization']:.1f}% (avg), {report['performance_metrics']['max_storage_utilization']:.1f}% (max)
+          • Cache Hit Ratio: {report['performance_metrics']['avg_cache_hit_ratio']:.1f}%
+          • Network Utilization: {report['performance_metrics']['avg_network_utilization']:.1f}% (avg), {report['performance_metrics']['max_network_utilization']:.1f}% (max)
+          
+          RECOMMENDATIONS: {len(report['recommendations'])}
+          {chr(10).join(f'• {rec["priority"].upper()}: {rec["description"]}' for rec in report['recommendations'][:3])}
+          {"..." if len(report['recommendations']) > 3 else ""}
+          """
+              
+              try:
+                  sns.publish(
+                      TopicArn=topic_arn,
+                      Message=message,
+                      Subject='FSx Cost Optimization Report Available'
+                  )
+                  print("Report notification sent successfully")
+              except Exception as e:
+                  print(f"Error sending report notification: {e}")
+      Tags:
+        - Key: Name
+          Value: !Sub '${FileSystemName}-cost-reporting-function'
+        - Key: Purpose
+          Value: FSx Cost Reporting and Analysis
+
+  # Lambda Function for Alert Handling
+  AlertHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-fsx-alert-handler'
+      Description: Handles CloudWatch alarms with intelligent analysis and recommendations
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 180
+      MemorySize: 256
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+          FSX_FILE_SYSTEM_ID: !Ref FSxFileSystem
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              """
+              Handle CloudWatch alarms and provide intelligent analysis
+              """
+              fsx_client = boto3.client('fsx')
+              sns = boto3.client('sns')
+              
+              try:
+                  # Parse SNS message
+                  sns_message = json.loads(event['Records'][0]['Sns']['Message'])
+                  alarm_name = sns_message['AlarmName']
+                  new_state = sns_message['NewStateValue']
+                  reason = sns_message.get('NewStateReason', '')
+                  
+                  if new_state == 'ALARM':
+                      if 'Low-Cache-Hit-Ratio' in alarm_name:
+                          handle_low_cache_hit_ratio(fsx_client, sns, alarm_name, reason)
+                      elif 'High-Storage-Utilization' in alarm_name:
+                          handle_high_storage_utilization(fsx_client, sns, alarm_name, reason)
+                      elif 'High-Network-Utilization' in alarm_name:
+                          handle_high_network_utilization(fsx_client, sns, alarm_name, reason)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Alert processed successfully')
+                  }
+                  
+              except Exception as e:
+                  print(f"Error processing alert: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+          
+          def handle_low_cache_hit_ratio(fsx_client, sns, alarm_name, reason):
+              """Handle low cache hit ratio alarm"""
+              fs_id = os.environ.get('FSX_FILE_SYSTEM_ID')
+              
+              # Get current file system configuration
+              response = fsx_client.describe_file_systems(FileSystemIds=[fs_id])
+              fs = response['FileSystems'][0]
+              
+              # Get cache configuration
+              cache_config = fs['OpenZFSConfiguration'].get('ReadCacheConfig', {})
+              current_cache = cache_config.get('SizeGiB', 0)
+              
+              message = f"""🚨 PERFORMANCE ALERT: Low Cache Hit Ratio
+              
+          File System: {fs_id}
+          Alert Time: {datetime.utcnow().isoformat()}Z
+          Current Cache Size: {current_cache} GiB
+          
+          ISSUE DETECTED:
+          {reason}
+          
+          IMMEDIATE IMPACT:
+          • Increased read latency from underlying storage
+          • Reduced overall file system performance
+          • Higher IOPS consumption on SSD storage tier
+          
+          RECOMMENDED ACTIONS:
+          1. 🔧 IMMEDIATE: Monitor client access patterns for the next hour
+          2. 📊 SHORT-TERM: Consider increasing SSD read cache size
+          3. 🎯 LONG-TERM: Analyze workload patterns for optimization
+          4. 🔍 INVESTIGATION: Review top file access patterns and sizes
+          
+          COST CONSIDERATIONS:
+          • Increasing cache size: ~$0.02/GiB/month additional cost
+          • Performance benefit often outweighs cost for active workloads
+          
+          NEXT STEPS:
+          1. Review FSx performance metrics in CloudWatch
+          2. Analyze client connection patterns
+          3. Consider cache size optimization based on workload
+          """
+              
+              send_notification(sns, message, '🚨 FSx Cache Performance Alert')
+          
+          def handle_high_storage_utilization(fsx_client, sns, alarm_name, reason):
+              """Handle high storage utilization alarm"""
+              fs_id = os.environ.get('FSX_FILE_SYSTEM_ID')
+              
+              # Get current file system configuration
+              response = fsx_client.describe_file_systems(FileSystemIds=[fs_id])
+              fs = response['FileSystems'][0]
+              
+              storage_capacity = fs['StorageCapacity']
+              
+              message = f"""⚠️  CAPACITY ALERT: High Storage Utilization
+              
+          File System: {fs_id}
+          Alert Time: {datetime.utcnow().isoformat()}Z
+          Storage Capacity: {storage_capacity} GiB
+          
+          ISSUE DETECTED:
+          {reason}
+          
+          IMMEDIATE RISKS:
+          • File creation operations may fail
+          • Application errors due to insufficient space
+          • Performance degradation as utilization approaches 100%
+          
+          RECOMMENDED ACTIONS:
+          1. 🚨 URGENT: Review largest files and directories
+          2. 🗑️  IMMEDIATE: Implement data archiving for old files
+          3. 📈 SHORT-TERM: Consider increasing storage capacity
+          4. 🔄 LONG-TERM: Implement automated lifecycle policies
+          
+          CAPACITY EXPANSION OPTIONS:
+          • Increase storage capacity (dynamic scaling available)
+          • Implement file archiving to S3 for cold data
+          • Enable compression for applicable file types
+          
+          COST IMPACT:
+          • Additional storage: ~$0.15/GiB/month
+          • S3 archiving: ~$0.004-0.0125/GiB/month (depending on class)
+          
+          NEXT STEPS:
+          1. Immediate storage usage analysis
+          2. Plan capacity expansion or data archiving
+          3. Implement monitoring for growth trends
+          """
+              
+              send_notification(sns, message, '⚠️  FSx Storage Capacity Alert')
+          
+          def handle_high_network_utilization(fsx_client, sns, alarm_name, reason):
+              """Handle high network utilization alarm"""
+              fs_id = os.environ.get('FSX_FILE_SYSTEM_ID')
+              
+              # Get current file system configuration
+              response = fsx_client.describe_file_systems(FileSystemIds=[fs_id])
+              fs = response['FileSystems'][0]
+              
+              throughput_capacity = fs['OpenZFSConfiguration']['ThroughputCapacity']
+              
+              message = f"""🌐 PERFORMANCE ALERT: High Network Utilization
+              
+          File System: {fs_id}
+          Alert Time: {datetime.utcnow().isoformat()}Z
+          Throughput Capacity: {throughput_capacity} MBps
+          
+          ISSUE DETECTED:
+          {reason}
+          
+          PERFORMANCE IMPACT:
+          • Client operations experiencing increased latency
+          • Potential throughput bottlenecks
+          • Reduced overall system responsiveness
+          
+          RECOMMENDED ACTIONS:
+          1. 📊 IMMEDIATE: Monitor client connection distribution
+          2. ⚡ SHORT-TERM: Consider increasing throughput capacity
+          3. 🔧 OPTIMIZATION: Implement client-side connection pooling
+          4. 🎯 LONG-TERM: Review workload distribution strategies
+          
+          SCALING OPTIONS:
+          • Increase throughput capacity: {throughput_capacity} → {min(throughput_capacity * 2, 4096)} MBps
+          • Optimize client access patterns
+          • Implement read caching at client level
+          
+          COST CONSIDERATIONS:
+          • Additional throughput: ~$0.30/MBps/month
+          • Performance benefits for high-throughput workloads
+          
+          CLIENT OPTIMIZATION TIPS:
+          1. Use NFS connection pooling
+          2. Implement asynchronous I/O where possible
+          3. Batch small operations together
+          4. Consider regional client distribution
+          """
+              
+              send_notification(sns, message, '🌐 FSx Network Performance Alert')
+          
+          def send_notification(sns, message, subject):
+              """Send notification via SNS"""
+              topic_arn = os.environ.get('SNS_TOPIC_ARN')
+              if topic_arn:
+                  try:
+                      sns.publish(
+                          TopicArn=topic_arn,
+                          Message=message,
+                          Subject=subject
+                      )
+                      print(f"Alert notification sent: {subject}")
+                  except Exception as e:
+                      print(f"Error sending notification: {e}")
+      Tags:
+        - Key: Name
+          Value: !Sub '${FileSystemName}-alert-handler-function'
+        - Key: Purpose
+          Value: FSx Alert Processing and Analysis
+
+  # S3 Bucket Permission for Lambda
+  S3BucketLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CostReportingFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub '${ReportsBucket}/*'
+
+  # SNS Subscription for Alert Handler
+  AlertHandlerSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref NotificationTopic
+      Endpoint: !GetAtt AlertHandlerFunction.Arn
+
+  # SNS Permission for Alert Handler Lambda
+  SNSLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AlertHandlerFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref NotificationTopic
+
+  # EventBridge Rule for Lifecycle Policy Monitoring
+  LifecyclePolicyRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-fsx-lifecycle-policy-schedule'
+      Description: Trigger lifecycle policy analysis on schedule
+      ScheduleExpression: !Ref MonitoringSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LifecyclePolicyFunction.Arn
+          Id: LifecyclePolicyTarget
+
+  # EventBridge Rule for Cost Reporting
+  CostReportingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-fsx-cost-reporting-schedule'
+      Description: Generate cost reports on schedule
+      ScheduleExpression: !Ref ReportingSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CostReportingFunction.Arn
+          Id: CostReportingTarget
+
+  # EventBridge Permissions for Lambda Functions
+  LifecyclePolicyEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LifecyclePolicyFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt LifecyclePolicyRule.Arn
+
+  CostReportingEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CostReportingFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CostReportingRule.Arn
+
+  # CloudWatch Alarm for Low Cache Hit Ratio
+  LowCacheHitRatioAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-FSx-Low-Cache-Hit-Ratio'
+      AlarmDescription: !Sub 'Alert when FSx cache hit ratio falls below ${CacheHitThreshold}%'
+      MetricName: FileServerCacheHitRatio
+      Namespace: AWS/FSx
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref CacheHitThreshold
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref NotificationTopic
+      OKActions:
+        - !Ref NotificationTopic
+      Dimensions:
+        - Name: FileSystemId
+          Value: !Ref FSxFileSystem
+      Tags:
+        - Key: Name
+          Value: !Sub '${FileSystemName}-cache-hit-alarm'
+        - Key: Purpose
+          Value: FSx Cache Performance Monitoring
+
+  # CloudWatch Alarm for High Storage Utilization
+  HighStorageUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-FSx-High-Storage-Utilization'
+      AlarmDescription: !Sub 'Alert when FSx storage utilization exceeds ${StorageUtilizationThreshold}%'
+      MetricName: StorageUtilization
+      Namespace: AWS/FSx
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref StorageUtilizationThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref NotificationTopic
+      OKActions:
+        - !Ref NotificationTopic
+      Dimensions:
+        - Name: FileSystemId
+          Value: !Ref FSxFileSystem
+      Tags:
+        - Key: Name
+          Value: !Sub '${FileSystemName}-storage-utilization-alarm'
+        - Key: Purpose
+          Value: FSx Storage Capacity Monitoring
+
+  # CloudWatch Alarm for High Network Utilization
+  HighNetworkUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-FSx-High-Network-Utilization'
+      AlarmDescription: !Sub 'Alert when FSx network utilization exceeds ${NetworkUtilizationThreshold}%'
+      MetricName: NetworkThroughputUtilization
+      Namespace: AWS/FSx
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref NetworkUtilizationThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref NotificationTopic
+      OKActions:
+        - !Ref NotificationTopic
+      Dimensions:
+        - Name: FileSystemId
+          Value: !Ref FSxFileSystem
+      Tags:
+        - Key: Name
+          Value: !Sub '${FileSystemName}-network-utilization-alarm'
+        - Key: Purpose
+          Value: FSx Network Performance Monitoring
+
+  # CloudWatch Dashboard
+  FSxMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-FSx-Lifecycle-Management'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/FSx", "FileServerCacheHitRatio", "FileSystemId", "${FSxFileSystem}"],
+                  ["AWS/FSx", "StorageUtilization", "FileSystemId", "${FSxFileSystem}"],
+                  ["AWS/FSx", "NetworkThroughputUtilization", "FileSystemId", "${FSxFileSystem}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "FSx Performance Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 100
+                  }
+                },
+                "annotations": {
+                  "horizontal": [
+                    {
+                      "value": ${CacheHitThreshold},
+                      "label": "Cache Hit Threshold"
+                    },
+                    {
+                      "value": ${StorageUtilizationThreshold},
+                      "label": "Storage Threshold"
+                    },
+                    {
+                      "value": ${NetworkUtilizationThreshold},
+                      "label": "Network Threshold"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/FSx", "DataReadBytes", "FileSystemId", "${FSxFileSystem}"],
+                  ["AWS/FSx", "DataWriteBytes", "FileSystemId", "${FSxFileSystem}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "FSx Data Transfer",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/FSx", "TotalReadTime", "FileSystemId", "${FSxFileSystem}"],
+                  ["AWS/FSx", "TotalWriteTime", "FileSystemId", "${FSxFileSystem}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "FSx Latency Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${LifecyclePolicyFunction}"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${CostReportingFunction}"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${AlertHandlerFunction}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Performance",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${LifecyclePolicyFunction}' | SOURCE '/aws/lambda/${CostReportingFunction}' | SOURCE '/aws/lambda/${AlertHandlerFunction}' | fields @timestamp, @message\n| filter @message like /ERROR/ or @message like /WARN/ or @message like /recommendation/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Lambda Function Logs",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  # FSx File System Information
+  FSxFileSystemId:
+    Description: FSx file system ID for lifecycle management
+    Value: !Ref FSxFileSystem
+    Export:
+      Name: !Sub '${AWS::StackName}-FSxFileSystemId'
+
+  FSxFileSystemDNSName:
+    Description: DNS name for mounting the FSx file system
+    Value: !GetAtt FSxFileSystem.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-FSxDNSName'
+
+  FSxMountCommand:
+    Description: Command to mount the FSx file system
+    Value: !Sub 'sudo mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,intr,timeo=600 ${FSxFileSystem.DNSName}:/ /mnt/fsx'
+    Export:
+      Name: !Sub '${AWS::StackName}-FSxMountCommand'
+
+  # Storage Configuration
+  StorageCapacity:
+    Description: Configured storage capacity in GiB
+    Value: !Ref StorageCapacity
+
+  ThroughputCapacity:
+    Description: Configured throughput capacity in MBps  
+    Value: !Ref ThroughputCapacity
+
+  ReadCacheSize:
+    Description: Configured read cache size in GiB
+    Value: !Ref ReadCacheSize
+
+  # Monitoring and Automation Resources
+  NotificationTopicArn:
+    Description: SNS topic ARN for lifecycle management notifications
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopic'
+
+  ReportsBucketName:
+    Description: S3 bucket name for cost optimization reports
+    Value: !Ref ReportsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ReportsBucket'
+
+  DashboardURL:
+    Description: CloudWatch dashboard URL for FSx monitoring
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-FSx-Lifecycle-Management'
+
+  # Lambda Function Information
+  LifecyclePolicyFunctionName:
+    Description: Lambda function name for lifecycle policy management
+    Value: !Ref LifecyclePolicyFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LifecyclePolicyFunction'
+
+  CostReportingFunctionName:
+    Description: Lambda function name for cost reporting
+    Value: !Ref CostReportingFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-CostReportingFunction'
+
+  AlertHandlerFunctionName:
+    Description: Lambda function name for alert handling
+    Value: !Ref AlertHandlerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertHandlerFunction'
+
+  # Cost Estimates
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for the FSx file system (USD)
+    Value: !Sub 
+      - '${TotalCost}'
+      - TotalCost: !If
+        - EnableReadCache
+        - !Sub '${ThroughputCost} (throughput) + ${StorageCost} (storage) + ${CacheCost} (cache) = ${TotalWithCache} USD/month'
+        - !Sub '${ThroughputCost} (throughput) + ${StorageCost} (storage) = ${TotalWithoutCache} USD/month'
+        Values:
+          ThroughputCost: !Sub '${ThroughputCapacity} * 0.30'
+          StorageCost: !Sub '${StorageCapacity} * 0.15'  
+          CacheCost: !Sub '${ReadCacheSize} * 0.02'
+          TotalWithCache: !Sub '${ThroughputCapacity} * 0.30 + ${StorageCapacity} * 0.15 + ${ReadCacheSize} * 0.02'
+          TotalWithoutCache: !Sub '${ThroughputCapacity} * 0.30 + ${StorageCapacity} * 0.15'
+
+  # Security Information
+  SecurityGroupId:
+    Description: Security group ID for FSx file system
+    Value: !Ref FSxSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroup'
+
+  IAMRoleArn:
+    Description: IAM role ARN for Lambda functions
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaRole'
+
+  # Monitoring Thresholds
+  MonitoringThresholds:
+    Description: Configured monitoring thresholds
+    Value: !Sub 'Cache Hit: ${CacheHitThreshold}%, Storage: ${StorageUtilizationThreshold}%, Network: ${NetworkUtilizationThreshold}%'
+
+  # Schedule Information
+  MonitoringSchedule:
+    Description: Lifecycle policy monitoring schedule
+    Value: !Ref MonitoringSchedule
+
+  ReportingSchedule:
+    Description: Cost reporting schedule  
+    Value: !Ref ReportingSchedule

@@ -1,0 +1,730 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for Amazon EFS mounting strategies with multi-AZ deployment, access points, and security configurations'
+
+Parameters:
+  # Environment Configuration
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name for resource tagging and naming'
+  
+  ProjectName:
+    Type: String
+    Default: 'efs-mounting-demo'
+    Description: 'Project name for resource naming and tagging'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must be 3-20 characters, start with letter, contain only letters, numbers, and hyphens'
+
+  # VPC Configuration
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC ID where EFS resources will be created'
+  
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: 'List of subnet IDs in different AZs for EFS mount targets (minimum 2 required)'
+    MinLength: 2
+  
+  # EFS Configuration
+  PerformanceMode:
+    Type: String
+    Default: 'generalPurpose'
+    AllowedValues: ['generalPurpose', 'maxIO']
+    Description: 'EFS performance mode - generalPurpose for low latency, maxIO for higher levels of aggregate throughput'
+  
+  ThroughputMode:
+    Type: String
+    Default: 'provisioned'
+    AllowedValues: ['bursting', 'provisioned']
+    Description: 'EFS throughput mode - bursting for variable workloads, provisioned for consistent performance'
+  
+  ProvisionedThroughput:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 1000
+    Description: 'Provisioned throughput in MiB/s (only used when ThroughputMode is provisioned)'
+  
+  EnableEncryption:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable encryption at rest for EFS file system'
+  
+  EnableBackup:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable automatic backups for EFS file system'
+  
+  # EC2 Configuration
+  InstanceType:
+    Type: String
+    Default: 't3.micro'
+    AllowedValues: ['t3.micro', 't3.small', 't3.medium', 't3.large']
+    Description: 'EC2 instance type for testing EFS mounts'
+  
+  KeyPairName:
+    Type: String
+    Description: 'EC2 Key Pair name for SSH access (leave empty to create instance without key pair)'
+    Default: ''
+  
+  EnableTestInstance:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: 'Create EC2 instance for testing EFS mounts'
+
+  # Access Point Configuration
+  CreateAccessPoints:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Create EFS access points for different use cases'
+
+Conditions:
+  # Conditional resource creation
+  CreateProvisionedThroughput: !Equals [!Ref ThroughputMode, 'provisioned']
+  CreateEncryption: !Equals [!Ref EnableEncryption, 'true']
+  CreateBackups: !Equals [!Ref EnableBackup, 'true']
+  CreateTestInstance: !Equals [!Ref EnableTestInstance, 'true']
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+  CreateAccessPoints: !Equals [!Ref CreateAccessPoints, 'true']
+  CreateInstanceWithKeyPair: !And [!Condition CreateTestInstance, !Condition HasKeyPair]
+  CreateInstanceWithoutKeyPair: !And [!Condition CreateTestInstance, !Not [!Condition HasKeyPair]]
+
+Mappings:
+  # Latest Amazon Linux 2 AMI IDs by region
+  RegionMap:
+    us-east-1:
+      AMI: ami-0c02fb55956c7d316
+    us-east-2:
+      AMI: ami-0f924dc71d44d23e2
+    us-west-1:
+      AMI: ami-0d382e80be7ffdae5
+    us-west-2:
+      AMI: ami-0c2d3e23065a0a6a0
+    eu-west-1:
+      AMI: ami-0a8e758f5e873d1c1
+    eu-west-2:
+      AMI: ami-0194c3e07668a7e36
+    eu-central-1:
+      AMI: ami-0a261c0e5f51090b1
+    ap-southeast-1:
+      AMI: ami-0c802847a7dd848c0
+    ap-southeast-2:
+      AMI: ami-0b76c3b150c6b1423
+    ap-northeast-1:
+      AMI: ami-0f36dcfcc94112ea1
+
+Resources:
+  # EFS File System
+  EFSFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      # Basic Configuration
+      PerformanceMode: !Ref PerformanceMode
+      ThroughputMode: !Ref ThroughputMode
+      ProvisionedThroughputInMibps: !If
+        - CreateProvisionedThroughput
+        - !Ref ProvisionedThroughput
+        - !Ref AWS::NoValue
+      
+      # Encryption Configuration
+      Encrypted: !If
+        - CreateEncryption
+        - true
+        - false
+      
+      # Backup Configuration
+      BackupPolicy:
+        Status: !If
+          - CreateBackups
+          - ENABLED
+          - DISABLED
+      
+      # Lifecycle Management - automatically move files to IA storage class
+      LifecycleConfiguration:
+        - TransitionToIA: AFTER_30_DAYS
+          TransitionToPrimaryStorageClass: AFTER_1_ACCESS
+      
+      # File System Tags
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-efs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Multi-AZ shared storage with mounting strategies'
+
+  # Security Group for EFS Mount Targets
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-${Environment}-efs-sg'
+      GroupDescription: 'Security group for EFS mount targets - allows NFS traffic'
+      VpcId: !Ref VpcId
+      
+      # Inbound Rules
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+          Description: 'NFS traffic from EC2 instances'
+        - IpProtocol: tcp
+          FromPort: 111
+          ToPort: 111
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+          Description: 'RPC portmapper from EC2 instances'
+        - IpProtocol: udp
+          FromPort: 111
+          ToPort: 111
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+          Description: 'RPC portmapper UDP from EC2 instances'
+      
+      # Outbound Rules (default allow all)
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound traffic'
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-efs-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Security Group for EC2 Instances
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-${Environment}-ec2-sg'
+      GroupDescription: 'Security group for EC2 instances accessing EFS'
+      VpcId: !Ref VpcId
+      
+      # Inbound Rules
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: 'SSH access from anywhere'
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTP access from anywhere'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTPS access from anywhere'
+      
+      # Outbound Rules
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound traffic'
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-ec2-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # EFS Mount Targets (Dynamic creation based on provided subnets)
+  EFSMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Select [0, !Ref SubnetIds]
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  EFSMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Select [1, !Ref SubnetIds]
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  # Note: Additional mount targets can be added manually if more than 2 subnets are provided
+  # For this template, we create mount targets for the first 2 subnets only
+
+  # Access Points for Different Use Cases
+  AppDataAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Condition: CreateAccessPoints
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      
+      # POSIX User Configuration
+      PosixUser:
+        Uid: 1000
+        Gid: 1000
+        SecondaryGids: [1000]
+      
+      # Root Directory Configuration
+      RootDirectory:
+        Path: '/app-data'
+        CreationInfo:
+          OwnerUid: 1000
+          OwnerGid: 1000
+          Permissions: '0755'
+      
+      # Access Point Tags
+      AccessPointTags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-app-data-ap'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Application data access point'
+
+  UserDataAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Condition: CreateAccessPoints
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      
+      # POSIX User Configuration
+      PosixUser:
+        Uid: 2000
+        Gid: 2000
+        SecondaryGids: [2000]
+      
+      # Root Directory Configuration
+      RootDirectory:
+        Path: '/user-data'
+        CreationInfo:
+          OwnerUid: 2000
+          OwnerGid: 2000
+          Permissions: '0750'
+      
+      # Access Point Tags
+      AccessPointTags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-user-data-ap'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'User data access point'
+
+  LogsAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Condition: CreateAccessPoints
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      
+      # POSIX User Configuration
+      PosixUser:
+        Uid: 3000
+        Gid: 3000
+        SecondaryGids: [3000]
+      
+      # Root Directory Configuration
+      RootDirectory:
+        Path: '/logs'
+        CreationInfo:
+          OwnerUid: 3000
+          OwnerGid: 3000
+          Permissions: '0755'
+      
+      # Access Point Tags
+      AccessPointTags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-logs-ap'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Logs access point'
+
+  # IAM Role for EC2 Instances
+  EFSAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-efs-ec2-role'
+      
+      # Trust Policy - Allow EC2 to assume this role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      
+      # Managed Policies
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      
+      # Inline Policy for EFS Access
+      Policies:
+        - PolicyName: EFSAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientWrite
+                  - elasticfilesystem:ClientRootAccess
+                Resource: !Sub 'arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/${EFSFileSystem}'
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:DescribeFileSystems
+                  - elasticfilesystem:DescribeMountTargets
+                  - elasticfilesystem:DescribeAccessPoints
+                Resource: '*'
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-efs-ec2-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Instance Profile for EC2 Role
+  EFSInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ProjectName}-${Environment}-efs-ec2-profile'
+      Roles:
+        - !Ref EFSAccessRole
+
+  # Test EC2 Instance (Optional)
+  TestInstanceWithKeyPair:
+    Type: AWS::EC2::Instance
+    Condition: CreateInstanceWithKeyPair
+    DependsOn:
+      - EFSMountTarget1
+      - EFSMountTarget2
+    Properties:
+      ImageId: !FindInMap [RegionMap, !Ref AWS::Region, AMI]
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SubnetId: !Select [0, !Ref SubnetIds]
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      IamInstanceProfile: !Ref EFSInstanceProfile
+      
+      # User Data Script for EFS Utils Installation
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y amazon-efs-utils
+          yum install -y amazon-cloudwatch-agent
+          yum install -y nfs-utils
+          
+          # Create mount points
+          mkdir -p /mnt/efs
+          mkdir -p /mnt/efs-app
+          mkdir -p /mnt/efs-user
+          mkdir -p /mnt/efs-logs
+          
+          # Set up CloudWatch agent
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << EOF
+          {
+            "metrics": {
+              "namespace": "EFS/Performance",
+              "metrics_collected": {
+                "disk": {
+                  "measurement": [
+                    "used_percent"
+                  ],
+                  "metrics_collection_interval": 60,
+                  "resources": [
+                    "*"
+                  ]
+                }
+              }
+            }
+          }
+          EOF
+          
+          # Start CloudWatch agent
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+          
+          # Create mounting script
+          cat > /home/ec2-user/mount-efs.sh << 'SCRIPT_EOF'
+          #!/bin/bash
+          
+          # Mount EFS using different strategies
+          echo "Mounting EFS using standard NFS..."
+          sudo mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,intr,timeo=600,retrans=2 ${EFSFileSystem}.efs.${AWS::Region}.amazonaws.com:/ /mnt/efs
+          
+          echo "Mounting EFS using EFS utils with TLS..."
+          sudo mount -t efs -o tls ${EFSFileSystem}:/ /mnt/efs-app
+          
+          echo "Mounting access points..."
+          sudo mount -t efs -o tls,accesspoint=${AppDataAccessPoint} ${EFSFileSystem}:/ /mnt/efs-app
+          sudo mount -t efs -o tls,accesspoint=${UserDataAccessPoint} ${EFSFileSystem}:/ /mnt/efs-user
+          sudo mount -t efs -o tls,accesspoint=${LogsAccessPoint} ${EFSFileSystem}:/ /mnt/efs-logs
+          
+          echo "Verifying mounts..."
+          df -h | grep efs
+          
+          echo "EFS mounting completed!"
+          SCRIPT_EOF
+          
+          chmod +x /home/ec2-user/mount-efs.sh
+          chown ec2-user:ec2-user /home/ec2-user/mount-efs.sh
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-test-instance'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'EFS mounting test instance'
+
+  TestInstanceWithoutKeyPair:
+    Type: AWS::EC2::Instance
+    Condition: CreateInstanceWithoutKeyPair
+    DependsOn:
+      - EFSMountTarget1
+      - EFSMountTarget2
+    Properties:
+      ImageId: !FindInMap [RegionMap, !Ref AWS::Region, AMI]
+      InstanceType: !Ref InstanceType
+      SubnetId: !Select [0, !Ref SubnetIds]
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      IamInstanceProfile: !Ref EFSInstanceProfile
+      
+      # User Data Script for EFS Utils Installation
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y amazon-efs-utils
+          yum install -y amazon-cloudwatch-agent
+          yum install -y nfs-utils
+          
+          # Create mount points
+          mkdir -p /mnt/efs
+          mkdir -p /mnt/efs-app
+          mkdir -p /mnt/efs-user
+          mkdir -p /mnt/efs-logs
+          
+          # Set up CloudWatch agent
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << EOF
+          {
+            "metrics": {
+              "namespace": "EFS/Performance",
+              "metrics_collected": {
+                "disk": {
+                  "measurement": [
+                    "used_percent"
+                  ],
+                  "metrics_collection_interval": 60,
+                  "resources": [
+                    "*"
+                  ]
+                }
+              }
+            }
+          }
+          EOF
+          
+          # Start CloudWatch agent
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+          
+          # Create mounting script
+          cat > /home/ec2-user/mount-efs.sh << 'SCRIPT_EOF'
+          #!/bin/bash
+          
+          # Mount EFS using different strategies
+          echo "Mounting EFS using standard NFS..."
+          sudo mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,intr,timeo=600,retrans=2 ${EFSFileSystem}.efs.${AWS::Region}.amazonaws.com:/ /mnt/efs
+          
+          echo "Mounting EFS using EFS utils with TLS..."
+          sudo mount -t efs -o tls ${EFSFileSystem}:/ /mnt/efs-app
+          
+          echo "Mounting access points..."
+          sudo mount -t efs -o tls,accesspoint=${AppDataAccessPoint} ${EFSFileSystem}:/ /mnt/efs-app
+          sudo mount -t efs -o tls,accesspoint=${UserDataAccessPoint} ${EFSFileSystem}:/ /mnt/efs-user
+          sudo mount -t efs -o tls,accesspoint=${LogsAccessPoint} ${EFSFileSystem}:/ /mnt/efs-logs
+          
+          echo "Verifying mounts..."
+          df -h | grep efs
+          
+          echo "EFS mounting completed!"
+          SCRIPT_EOF
+          
+          chmod +x /home/ec2-user/mount-efs.sh
+          chown ec2-user:ec2-user /home/ec2-user/mount-efs.sh
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-test-instance'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'EFS mounting test instance'
+
+
+# CloudFormation Outputs
+Outputs:
+  # EFS File System Information
+  EFSFileSystemId:
+    Description: 'EFS File System ID'
+    Value: !Ref EFSFileSystem
+    Export:
+      Name: !Sub '${AWS::StackName}-EFS-FileSystemId'
+
+  EFSFileSystemArn:
+    Description: 'EFS File System ARN'
+    Value: !GetAtt EFSFileSystem.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EFS-FileSystemArn'
+
+  EFSFileSystemDNSName:
+    Description: 'EFS File System DNS Name for mounting'
+    Value: !Sub '${EFSFileSystem}.efs.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-EFS-DNSName'
+
+  # Access Points Information
+  AppDataAccessPointId:
+    Description: 'Application Data Access Point ID'
+    Value: !If [CreateAccessPoints, !Ref AppDataAccessPoint, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-AppData-AccessPointId'
+
+  UserDataAccessPointId:
+    Description: 'User Data Access Point ID'
+    Value: !If [CreateAccessPoints, !Ref UserDataAccessPoint, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-UserData-AccessPointId'
+
+  LogsAccessPointId:
+    Description: 'Logs Access Point ID'
+    Value: !If [CreateAccessPoints, !Ref LogsAccessPoint, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-Logs-AccessPointId'
+
+  # Mount Target Information
+  MountTarget1Id:
+    Description: 'EFS Mount Target 1 ID'
+    Value: !Ref EFSMountTarget1
+    Export:
+      Name: !Sub '${AWS::StackName}-MountTarget1-Id'
+
+  MountTarget2Id:
+    Description: 'EFS Mount Target 2 ID'
+    Value: !Ref EFSMountTarget2
+    Export:
+      Name: !Sub '${AWS::StackName}-MountTarget2-Id'
+
+  # Security Group Information
+  EFSSecurityGroupId:
+    Description: 'EFS Security Group ID'
+    Value: !Ref EFSSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-EFS-SecurityGroupId'
+
+  EC2SecurityGroupId:
+    Description: 'EC2 Security Group ID'
+    Value: !Ref EC2SecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-EC2-SecurityGroupId'
+
+  # IAM Role Information
+  EFSAccessRoleArn:
+    Description: 'EFS Access Role ARN'
+    Value: !GetAtt EFSAccessRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EFS-AccessRoleArn'
+
+  EFSInstanceProfileArn:
+    Description: 'EFS Instance Profile ARN'
+    Value: !GetAtt EFSInstanceProfile.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EFS-InstanceProfileArn'
+
+  # Test Instance Information
+  TestInstanceId:
+    Description: 'Test EC2 Instance ID'
+    Value: !If 
+      - CreateInstanceWithKeyPair
+      - !Ref TestInstanceWithKeyPair
+      - !If 
+        - CreateInstanceWithoutKeyPair
+        - !Ref TestInstanceWithoutKeyPair
+        - 'Not Created'
+    Export:
+      Name: !Sub '${AWS::StackName}-TestInstance-Id'
+
+  TestInstancePublicIp:
+    Description: 'Test EC2 Instance Public IP'
+    Value: !If 
+      - CreateInstanceWithKeyPair
+      - !GetAtt TestInstanceWithKeyPair.PublicIp
+      - !If 
+        - CreateInstanceWithoutKeyPair
+        - !GetAtt TestInstanceWithoutKeyPair.PublicIp
+        - 'Not Created'
+    Export:
+      Name: !Sub '${AWS::StackName}-TestInstance-PublicIp'
+
+  # Mounting Commands
+  StandardNFSMountCommand:
+    Description: 'Standard NFS mount command'
+    Value: !Sub 'sudo mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,intr,timeo=600,retrans=2 ${EFSFileSystem}.efs.${AWS::Region}.amazonaws.com:/ /mnt/efs'
+
+  EFSUtilsMountCommand:
+    Description: 'EFS utils mount command with TLS'
+    Value: !Sub 'sudo mount -t efs -o tls ${EFSFileSystem}:/ /mnt/efs'
+
+  AppDataAccessPointMountCommand:
+    Description: 'App data access point mount command'
+    Value: !If 
+      - CreateAccessPoints
+      - !Sub 'sudo mount -t efs -o tls,accesspoint=${AppDataAccessPoint} ${EFSFileSystem}:/ /mnt/efs-app'
+      - 'Access points not created'
+
+  # Performance and Cost Information
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for EFS (excluding EC2)'
+    Value: !Sub 
+      - 'Standard Storage: $0.30/GB + ${throughput_cost}/month for ${throughput}MB/s throughput'
+      - throughput_cost: !If 
+        - CreateProvisionedThroughput
+        - !Sub 
+          - '$${cost}'
+          - cost: !Ref ProvisionedThroughput
+        - '$0 (bursting mode)'
+        throughput: !If 
+          - CreateProvisionedThroughput
+          - !Ref ProvisionedThroughput
+          - 'Variable'
+
+  # Troubleshooting Information
+  TroubleshootingGuide:
+    Description: 'Common troubleshooting steps'
+    Value: '1. Check security group allows NFS (port 2049), 2. Verify mount targets are available, 3. Check IAM permissions, 4. Ensure EFS utils are installed'

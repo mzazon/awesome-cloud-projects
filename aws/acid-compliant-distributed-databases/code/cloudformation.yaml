@@ -1,0 +1,590 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Infrastructure for building ACID-compliant distributed databases with Amazon QLDB.
+  This template creates a fully managed ledger database with cryptographic verification,
+  journal streaming to Kinesis, and S3 export capabilities for financial applications.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Ledger Configuration"
+        Parameters:
+          - LedgerName
+          - DeletionProtection
+          - Environment
+      - Label:
+          default: "Streaming Configuration"
+        Parameters:
+          - EnableJournalStreaming
+          - KinesisShardCount
+          - StreamAggregationEnabled
+      - Label:
+          default: "Export Configuration"
+        Parameters:
+          - S3BucketName
+          - EnableS3Export
+          - S3EncryptionType
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - QLDBRoleName
+          - EnableCloudTrail
+    ParameterLabels:
+      LedgerName:
+        default: "QLDB Ledger Name"
+      DeletionProtection:
+        default: "Enable Deletion Protection"
+      Environment:
+        default: "Environment Tag"
+      EnableJournalStreaming:
+        default: "Enable Journal Streaming"
+      KinesisShardCount:
+        default: "Kinesis Shard Count"
+      StreamAggregationEnabled:
+        default: "Enable Stream Aggregation"
+      S3BucketName:
+        default: "S3 Bucket Name"
+      EnableS3Export:
+        default: "Enable S3 Export"
+      S3EncryptionType:
+        default: "S3 Encryption Type"
+      QLDBRoleName:
+        default: "QLDB Service Role Name"
+      EnableCloudTrail:
+        default: "Enable CloudTrail Logging"
+
+Parameters:
+  LedgerName:
+    Type: String
+    Default: !Sub 'financial-ledger-${AWS::AccountId}'
+    Description: Name for the QLDB ledger (must be unique within the account)
+    MinLength: 1
+    MaxLength: 32
+    AllowedPattern: '^[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9]$'
+    ConstraintDescription: Must be 1-32 characters, start and end with alphanumeric, hyphens allowed
+
+  DeletionProtection:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable deletion protection for the QLDB ledger
+
+  Environment:
+    Type: String
+    Default: 'Production'
+    AllowedValues: ['Development', 'Testing', 'Staging', 'Production']
+    Description: Environment tag for resource identification
+
+  EnableJournalStreaming:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable real-time journal streaming to Kinesis
+
+  KinesisShardCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: Number of shards for the Kinesis stream (1-10)
+
+  StreamAggregationEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable Kinesis Producer Library aggregation for better throughput
+
+  S3BucketName:
+    Type: String
+    Default: !Sub 'qldb-exports-${AWS::AccountId}-${AWS::Region}'
+    Description: S3 bucket name for journal exports (must be globally unique)
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: '^[a-z0-9][a-z0-9\-]*[a-z0-9]$'
+    ConstraintDescription: Must be 3-63 characters, lowercase, start and end with alphanumeric
+
+  EnableS3Export:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Create S3 bucket for journal exports
+
+  S3EncryptionType:
+    Type: String
+    Default: 'SSE_S3'
+    AllowedValues: ['SSE_S3', 'SSE_KMS']
+    Description: S3 encryption type for journal exports
+
+  QLDBRoleName:
+    Type: String
+    Default: !Sub 'QLDBServiceRole-${AWS::AccountId}'
+    Description: IAM role name for QLDB service operations
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z0-9+=,.@\-_]+$'
+    ConstraintDescription: Must be 1-64 characters, alphanumeric and +=,.@-_ allowed
+
+  EnableCloudTrail:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable CloudTrail logging for QLDB API calls
+
+Conditions:
+  CreateKinesisStream: !Equals [!Ref EnableJournalStreaming, 'true']
+  CreateS3Bucket: !Equals [!Ref EnableS3Export, 'true']
+  UseKMSEncryption: !Equals [!Ref S3EncryptionType, 'SSE_KMS']
+  CreateCloudTrail: !Equals [!Ref EnableCloudTrail, 'true']
+  IsProduction: !Equals [!Ref Environment, 'Production']
+
+Resources:
+  # IAM Role for QLDB Service Operations
+  QLDBServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref QLDBRoleName
+      Description: IAM role for QLDB journal streaming and S3 export operations
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: qldb.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonQLDBConsoleFullAccess
+      Policies:
+        - PolicyName: QLDBStreamingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: KinesisStreamAccess
+                Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                  - kinesis:DescribeStream
+                  - kinesis:ListStreams
+                Resource: !If
+                  - CreateKinesisStream
+                  - !GetAtt QLDBJournalStream.Arn
+                  - !Sub 'arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/*'
+              - Sid: S3ExportAccess
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource: 
+                  - !If
+                    - CreateS3Bucket
+                    - !GetAtt S3ExportBucket.Arn
+                    - !Sub 'arn:aws:s3:::${S3BucketName}'
+                  - !If
+                    - CreateS3Bucket
+                    - !Sub '${S3ExportBucket.Arn}/*'
+                    - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+              - Sid: KMSAccess
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !If
+                  - UseKMSEncryption
+                  - !GetAtt S3ExportKMSKey.Arn
+                  - !Ref AWS::NoValue
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: QLDB-Financial-Ledger
+        - Key: Purpose
+          Value: Service-Role
+
+  # KMS Key for S3 Encryption (if KMS encryption is enabled)
+  S3ExportKMSKey:
+    Type: AWS::KMS::Key
+    Condition: UseKMSEncryption
+    Properties:
+      Description: KMS key for QLDB S3 export encryption
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow QLDB Service
+            Effect: Allow
+            Principal:
+              Service: qldb.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: '*'
+      KeyRotationEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: QLDB-Financial-Ledger
+        - Key: Purpose
+          Value: S3-Export-Encryption
+
+  # KMS Key Alias
+  S3ExportKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: UseKMSEncryption
+    Properties:
+      AliasName: !Sub 'alias/qldb-s3-export-${Environment}'
+      TargetKeyId: !Ref S3ExportKMSKey
+
+  # S3 Bucket for Journal Exports
+  S3ExportBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateS3Bucket
+    DeletionPolicy: !If [IsProduction, Retain, Delete]
+    Properties:
+      BucketName: !Ref S3BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If
+                - UseKMSEncryption
+                - aws:kms
+                - AES256
+              KMSMasterKeyID: !If
+                - UseKMSEncryption
+                - !Ref S3ExportKMSKey
+                - !Ref AWS::NoValue
+            BucketKeyEnabled: !If [UseKMSEncryption, true, !Ref AWS::NoValue]
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: QLDBExportLifecycle
+            Status: Enabled
+            Prefix: journal-exports/
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+            NoncurrentVersionTransitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: journal-exports/
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: QLDB-Financial-Ledger
+        - Key: Purpose
+          Value: Journal-Export
+
+  # S3 Bucket Policy
+  S3ExportBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateS3Bucket
+    Properties:
+      Bucket: !Ref S3ExportBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt S3ExportBucket.Arn
+              - !Sub '${S3ExportBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: QLDBServiceAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt QLDBServiceRole.Arn
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt S3ExportBucket.Arn
+              - !Sub '${S3ExportBucket.Arn}/*'
+
+  # Kinesis Data Stream for Journal Streaming
+  QLDBJournalStream:
+    Type: AWS::Kinesis::Stream
+    Condition: CreateKinesisStream
+    Properties:
+      Name: !Sub '${LedgerName}-journal-stream'
+      ShardCount: !Ref KinesisShardCount
+      RetentionPeriodHours: 168  # 7 days
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: QLDB-Financial-Ledger
+        - Key: Purpose
+          Value: Journal-Streaming
+
+  # QLDB Ledger
+  QLDBLedger:
+    Type: AWS::QLDB::Ledger
+    Properties:
+      Name: !Ref LedgerName
+      PermissionsMode: STANDARD
+      DeletionProtection: !Ref DeletionProtection
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: Financial-Ledger
+        - Key: Purpose
+          Value: ACID-Compliant-Database
+        - Key: Compliance
+          Value: Financial-Services
+        - Key: DataClassification
+          Value: Sensitive
+
+  # CloudWatch Log Group for QLDB (optional)
+  QLDBLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/qldb/${LedgerName}'
+      RetentionInDays: !If [IsProduction, 365, 30]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: QLDB-Financial-Ledger
+        - Key: Purpose
+          Value: Audit-Logging
+
+  # CloudTrail for QLDB API Logging (optional)
+  QLDBCloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Condition: CreateCloudTrail
+    Properties:
+      TrailName: !Sub '${LedgerName}-api-trail'
+      S3BucketName: !If
+        - CreateS3Bucket
+        - !Ref S3ExportBucket
+        - !Ref S3BucketName
+      S3KeyPrefix: 'cloudtrail-logs/'
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: false
+      EnableLogFileValidation: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: 'AWS::QLDB::Ledger'
+              Values:
+                - !Sub '${QLDBLedger}/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: QLDB-Financial-Ledger
+        - Key: Purpose
+          Value: API-Audit-Trail
+
+  # CloudWatch Alarms for Monitoring
+  QLDBReadIOUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${LedgerName}-Read-IO-Utilization-High'
+      AlarmDescription: 'QLDB Read I/O utilization is high'
+      MetricName: ReadIOUtilization
+      Namespace: AWS/QLDB
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: LedgerName
+          Value: !Ref QLDBLedger
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: QLDB-Financial-Ledger
+
+  QLDBWriteIOUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${LedgerName}-Write-IO-Utilization-High'
+      AlarmDescription: 'QLDB Write I/O utilization is high'
+      MetricName: WriteIOUtilization
+      Namespace: AWS/QLDB
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: LedgerName
+          Value: !Ref QLDBLedger
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: QLDB-Financial-Ledger
+
+  # Kinesis Stream Monitoring (if enabled)
+  KinesisIncomingRecordsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateKinesisStream
+    Properties:
+      AlarmName: !Sub '${LedgerName}-Kinesis-Low-Throughput'
+      AlarmDescription: 'QLDB Kinesis stream has low incoming records'
+      MetricName: IncomingRecords
+      Namespace: AWS/Kinesis
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: StreamName
+          Value: !Ref QLDBJournalStream
+      TreatMissingData: breaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: QLDB-Financial-Ledger
+
+Outputs:
+  QLDBLedgerName:
+    Description: Name of the created QLDB ledger
+    Value: !Ref QLDBLedger
+    Export:
+      Name: !Sub '${AWS::StackName}-QLDBLedgerName'
+
+  QLDBLedgerArn:
+    Description: ARN of the created QLDB ledger
+    Value: !Sub 'arn:aws:qldb:${AWS::Region}:${AWS::AccountId}:ledger/${QLDBLedger}'
+    Export:
+      Name: !Sub '${AWS::StackName}-QLDBLedgerArn'
+
+  QLDBServiceRoleArn:
+    Description: ARN of the QLDB service role
+    Value: !GetAtt QLDBServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-QLDBServiceRoleArn'
+
+  KinesisStreamName:
+    Condition: CreateKinesisStream
+    Description: Name of the Kinesis stream for journal data
+    Value: !Ref QLDBJournalStream
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisStreamName'
+
+  KinesisStreamArn:
+    Condition: CreateKinesisStream
+    Description: ARN of the Kinesis stream for journal data
+    Value: !GetAtt QLDBJournalStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisStreamArn'
+
+  S3BucketName:
+    Condition: CreateS3Bucket
+    Description: Name of the S3 bucket for journal exports
+    Value: !Ref S3ExportBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketName'
+
+  S3BucketArn:
+    Condition: CreateS3Bucket
+    Description: ARN of the S3 bucket for journal exports
+    Value: !GetAtt S3ExportBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketArn'
+
+  KMSKeyId:
+    Condition: UseKMSEncryption
+    Description: KMS Key ID for S3 encryption
+    Value: !Ref S3ExportKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyId'
+
+  CloudWatchLogGroup:
+    Description: CloudWatch Log Group for QLDB logs
+    Value: !Ref QLDBLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchLogGroup'
+
+  DeploymentRegion:
+    Description: AWS Region where the resources are deployed
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentRegion'
+
+  StackName:
+    Description: Name of the CloudFormation stack
+    Value: !Ref AWS::StackName
+    Export:
+      Name: !Sub '${AWS::StackName}-StackName'
+
+  # Connection Information for Applications
+  QLDBConnectionInfo:
+    Description: Connection information for QLDB ledger
+    Value: !Sub |
+      Ledger Name: ${QLDBLedger}
+      Region: ${AWS::Region}
+      Service Role ARN: ${QLDBServiceRole.Arn}
+      
+      CLI Commands:
+      aws qldb describe-ledger --name ${QLDBLedger} --region ${AWS::Region}
+      aws qldb get-digest --name ${QLDBLedger} --region ${AWS::Region}
+      
+      PartiQL Query Example:
+      aws qldb execute-statement --name ${QLDBLedger} --statement "SELECT * FROM information_schema.user_tables"
+
+  # Cost Estimation Information
+  EstimatedMonthlyCosts:
+    Description: Estimated monthly costs for the infrastructure
+    Value: !Sub |
+      QLDB Ledger: $0.35 per million I/O requests + $0.07 per GB/month storage
+      Kinesis Stream: $0.014 per shard hour ($${KinesisShardCount} shards) + $0.014 per million records
+      S3 Storage: $0.023 per GB/month + request costs
+      CloudWatch Logs: $0.50 per GB ingested + $0.03 per GB/month storage
+      
+      Note: Actual costs depend on usage patterns. Monitor AWS Cost Explorer for accurate billing.

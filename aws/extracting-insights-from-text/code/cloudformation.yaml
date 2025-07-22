@@ -1,0 +1,977 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure as Code for Extracting Insights from Text with Amazon Comprehend'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - S3BucketPrefix
+          - EnableVersioning
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaTimeout
+          - LambdaMemorySize
+      - Label:
+          default: "Comprehend Configuration"
+        Parameters:
+          - SupportedLanguages
+          - MaxTopicsCount
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      S3BucketPrefix:
+        default: "S3 Bucket Prefix"
+      EnableVersioning:
+        default: "Enable S3 Versioning"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      SupportedLanguages:
+        default: "Supported Languages"
+      MaxTopicsCount:
+        default: "Maximum Topics Count"
+
+# Template Parameters
+Parameters:
+  ProjectName:
+    Type: String
+    Description: 'Name of the project for resource naming and tagging'
+    Default: 'comprehend-nlp'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+
+  Environment:
+    Type: String
+    Description: 'Environment name for resource tagging and naming'
+    Default: 'dev'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    ConstraintDescription: 'Must be dev, staging, or prod'
+
+  S3BucketPrefix:
+    Type: String
+    Description: 'Prefix for S3 bucket names (must be globally unique)'
+    Default: 'comprehend-nlp'
+    MinLength: 3
+    MaxLength: 30
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+
+  EnableVersioning:
+    Type: String
+    Description: 'Enable S3 bucket versioning for data protection'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  LambdaTimeout:
+    Type: Number
+    Description: 'Lambda function timeout in seconds'
+    Default: 300
+    MinValue: 30
+    MaxValue: 900
+    ConstraintDescription: 'Must be between 30 and 900 seconds'
+
+  LambdaMemorySize:
+    Type: Number
+    Description: 'Lambda function memory size in MB'
+    Default: 512
+    AllowedValues:
+      - 128
+      - 256
+      - 512
+      - 1024
+      - 2048
+      - 3008
+    ConstraintDescription: 'Must be a valid Lambda memory size'
+
+  SupportedLanguages:
+    Type: CommaDelimitedList
+    Description: 'List of supported languages for text processing'
+    Default: 'en,es,fr,de,it,pt,ar,hi,ja,ko,zh,zh-TW'
+
+  MaxTopicsCount:
+    Type: Number
+    Description: 'Maximum number of topics for topic modeling'
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+    ConstraintDescription: 'Must be between 1 and 100'
+
+# Template Conditions
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  EnableS3Versioning: !Equals [!Ref EnableVersioning, 'true']
+  IsLargeMemorySize: !Not [!Equals [!Ref LambdaMemorySize, 128]]
+
+# Template Resources
+Resources:
+  # S3 Bucket for Input Data
+  ComprehendInputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${S3BucketPrefix}-input-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [EnableS3Versioning, 'Enabled', 'Suspended']
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: TransitionToGlacier
+            Status: !If [IsProduction, 'Enabled', 'Disabled']
+            Transition:
+              StorageClass: GLACIER
+              TransitionInDays: 90
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ComprehendProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: 'input/'
+                  - Name: suffix
+                    Value: '.txt'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Comprehend Input Storage'
+
+  # S3 Bucket for Output Data
+  ComprehendOutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${S3BucketPrefix}-output-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [EnableS3Versioning, 'Enabled', 'Suspended']
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Comprehend Output Storage'
+
+  # S3 Bucket for Training Data
+  ComprehendTrainingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${S3BucketPrefix}-training-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Comprehend Training Data Storage'
+
+  # IAM Role for Amazon Comprehend Service
+  ComprehendServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-comprehend-service-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: comprehend.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/ComprehendServiceRole
+      Policies:
+        - PolicyName: ComprehendS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${ComprehendInputBucket}/*'
+                  - !GetAtt ComprehendInputBucket.Arn
+                  - !Sub '${ComprehendTrainingBucket}/*'
+                  - !GetAtt ComprehendTrainingBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource:
+                  - !Sub '${ComprehendOutputBucket}/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ComprehendAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - comprehend:DetectSentiment
+                  - comprehend:DetectEntities
+                  - comprehend:DetectKeyPhrases
+                  - comprehend:DetectDominantLanguage
+                  - comprehend:BatchDetectSentiment
+                  - comprehend:BatchDetectEntities
+                  - comprehend:BatchDetectKeyPhrases
+                  - comprehend:BatchDetectDominantLanguage
+                  - comprehend:StartSentimentDetectionJob
+                  - comprehend:StartEntitiesDetectionJob
+                  - comprehend:StartKeyPhrasesDetectionJob
+                  - comprehend:StartTopicsDetectionJob
+                  - comprehend:DescribeSentimentDetectionJob
+                  - comprehend:DescribeEntitiesDetectionJob
+                  - comprehend:DescribeKeyPhrasesDetectionJob
+                  - comprehend:DescribeTopicsDetectionJob
+                  - comprehend:ListSentimentDetectionJobs
+                  - comprehend:ListEntitiesDetectionJobs
+                  - comprehend:ListKeyPhrasesDetectionJobs
+                  - comprehend:ListTopicsDetectionJobs
+                Resource: '*'
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub '${ComprehendInputBucket}/*'
+                  - !Sub '${ComprehendOutputBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ComprehendInputBucket.Arn
+                  - !GetAtt ComprehendOutputBucket.Arn
+        - PolicyName: EventBridgeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !GetAtt ComprehendEventBus.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function for Real-time NLP Processing
+  ComprehendProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-comprehend-processor-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrencyLimit: !If [IsProduction, 100, 10]
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !Ref ComprehendOutputBucket
+          COMPREHEND_ROLE_ARN: !GetAtt ComprehendServiceRole.Arn
+          SUPPORTED_LANGUAGES: !Join [',', !Ref SupportedLanguages]
+          MAX_TOPICS_COUNT: !Ref MaxTopicsCount
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          import logging
+          from datetime import datetime
+          from typing import Dict, List, Any
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          # Initialize AWS clients
+          comprehend = boto3.client('comprehend')
+          s3 = boto3.client('s3')
+          eventbridge = boto3.client('events')
+          
+          # Environment variables
+          OUTPUT_BUCKET = os.environ.get('OUTPUT_BUCKET')
+          COMPREHEND_ROLE_ARN = os.environ.get('COMPREHEND_ROLE_ARN')
+          SUPPORTED_LANGUAGES = os.environ.get('SUPPORTED_LANGUAGES', 'en').split(',')
+          MAX_TOPICS_COUNT = int(os.environ.get('MAX_TOPICS_COUNT', '10'))
+          ENVIRONMENT = os.environ.get('ENVIRONMENT', 'dev')
+          
+          def lambda_handler(event, context):
+              """
+              Main Lambda handler for NLP processing
+              Handles both real-time API calls and S3 event triggers
+              """
+              try:
+                  logger.info(f"Processing event: {json.dumps(event)}")
+                  
+                  # Check if this is an S3 event
+                  if 'Records' in event:
+                      return process_s3_event(event)
+                  
+                  # Check if this is a direct API call
+                  if 'text' in event:
+                      return process_text_direct(event)
+                  
+                  # Check if this is a batch processing request
+                  if 'batch_job_type' in event:
+                      return start_batch_job(event)
+                  
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({
+                          'error': 'Invalid request format',
+                          'supported_formats': [
+                              'Direct text processing: {"text": "your text here"}',
+                              'Batch job: {"batch_job_type": "sentiment", "input_s3_uri": "s3://bucket/path/"}',
+                              'S3 event (automatic)'
+                          ]
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing request: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'request_id': context.aws_request_id
+                      })
+                  }
+          
+          def process_text_direct(event: Dict[str, Any]) -> Dict[str, Any]:
+              """Process text directly through Comprehend APIs"""
+              text = event.get('text', '')
+              language = event.get('language', 'en')
+              
+              if not text:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'No text provided'})
+                  }
+              
+              # Validate language support
+              if language not in SUPPORTED_LANGUAGES:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({
+                          'error': f'Language {language} not supported',
+                          'supported_languages': SUPPORTED_LANGUAGES
+                      })
+                  }
+              
+              # Detect dominant language if not specified
+              if language == 'auto':
+                  language_response = comprehend.detect_dominant_language(Text=text)
+                  detected_languages = language_response['Languages']
+                  if detected_languages:
+                      language = detected_languages[0]['LanguageCode']
+                  else:
+                      language = 'en'  # Default fallback
+              
+              # Perform sentiment analysis
+              sentiment_response = comprehend.detect_sentiment(
+                  Text=text,
+                  LanguageCode=language
+              )
+              
+              # Perform entity detection
+              entities_response = comprehend.detect_entities(
+                  Text=text,
+                  LanguageCode=language
+              )
+              
+              # Perform key phrase extraction
+              key_phrases_response = comprehend.detect_key_phrases(
+                  Text=text,
+                  LanguageCode=language
+              )
+              
+              # Process and structure results
+              result = {
+                  'timestamp': datetime.utcnow().isoformat(),
+                  'language': language,
+                  'text_length': len(text),
+                  'sentiment': {
+                      'sentiment': sentiment_response['Sentiment'],
+                      'confidence_scores': sentiment_response['SentimentScore']
+                  },
+                  'entities': [
+                      {
+                          'text': entity['Text'],
+                          'type': entity['Type'],
+                          'score': entity['Score'],
+                          'begin_offset': entity['BeginOffset'],
+                          'end_offset': entity['EndOffset']
+                      }
+                      for entity in entities_response['Entities']
+                  ],
+                  'key_phrases': [
+                      {
+                          'text': phrase['Text'],
+                          'score': phrase['Score'],
+                          'begin_offset': phrase['BeginOffset'],
+                          'end_offset': phrase['EndOffset']
+                      }
+                      for phrase in key_phrases_response['KeyPhrases']
+                  ]
+              }
+              
+              # Store results in S3 if configured
+              if OUTPUT_BUCKET:
+                  try:
+                      result_key = f"real-time-results/{datetime.utcnow().strftime('%Y/%m/%d')}/{uuid.uuid4()}.json"
+                      s3.put_object(
+                          Bucket=OUTPUT_BUCKET,
+                          Key=result_key,
+                          Body=json.dumps(result, indent=2),
+                          ContentType='application/json'
+                      )
+                      result['output_location'] = f"s3://{OUTPUT_BUCKET}/{result_key}"
+                  except Exception as e:
+                      logger.warning(f"Could not store result in S3: {str(e)}")
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(result)
+              }
+          
+          def process_s3_event(event: Dict[str, Any]) -> Dict[str, Any]:
+              """Process S3 event and trigger appropriate analysis"""
+              processed_files = []
+              
+              for record in event['Records']:
+                  bucket = record['s3']['bucket']['name']
+                  key = record['s3']['object']['key']
+                  
+                  logger.info(f"Processing S3 object: s3://{bucket}/{key}")
+                  
+                  try:
+                      # Download and process file
+                      response = s3.get_object(Bucket=bucket, Key=key)
+                      content = response['Body'].read().decode('utf-8')
+                      
+                      # Process content
+                      processing_result = process_text_direct({'text': content})
+                      
+                      # Send event to EventBridge
+                      eventbridge.put_events(
+                          Entries=[
+                              {
+                                  'Source': 'comprehend.nlp.processor',
+                                  'DetailType': 'NLP Processing Complete',
+                                  'Detail': json.dumps({
+                                      'source_file': f"s3://{bucket}/{key}",
+                                      'processing_result': processing_result,
+                                      'timestamp': datetime.utcnow().isoformat()
+                                  })
+                              }
+                          ]
+                      )
+                      
+                      processed_files.append({
+                          'file': f"s3://{bucket}/{key}",
+                          'status': 'success',
+                          'result': processing_result
+                      })
+                      
+                  except Exception as e:
+                      logger.error(f"Error processing {key}: {str(e)}")
+                      processed_files.append({
+                          'file': f"s3://{bucket}/{key}",
+                          'status': 'error',
+                          'error': str(e)
+                      })
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'processed_files': processed_files,
+                      'total_files': len(event['Records'])
+                  })
+              }
+          
+          def start_batch_job(event: Dict[str, Any]) -> Dict[str, Any]:
+              """Start a batch processing job"""
+              job_type = event['batch_job_type']
+              input_s3_uri = event['input_s3_uri']
+              output_s3_uri = event.get('output_s3_uri', f"s3://{OUTPUT_BUCKET}/batch-results/{job_type}/")
+              
+              job_name = f"{job_type}-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+              
+              try:
+                  if job_type == 'sentiment':
+                      response = comprehend.start_sentiment_detection_job(
+                          JobName=job_name,
+                          LanguageCode='en',
+                          InputDataConfig={'S3Uri': input_s3_uri},
+                          OutputDataConfig={'S3Uri': output_s3_uri},
+                          DataAccessRoleArn=COMPREHEND_ROLE_ARN
+                      )
+                      job_id = response['JobId']
+                      
+                  elif job_type == 'entities':
+                      response = comprehend.start_entities_detection_job(
+                          JobName=job_name,
+                          LanguageCode='en',
+                          InputDataConfig={'S3Uri': input_s3_uri},
+                          OutputDataConfig={'S3Uri': output_s3_uri},
+                          DataAccessRoleArn=COMPREHEND_ROLE_ARN
+                      )
+                      job_id = response['JobId']
+                      
+                  elif job_type == 'key_phrases':
+                      response = comprehend.start_key_phrases_detection_job(
+                          JobName=job_name,
+                          LanguageCode='en',
+                          InputDataConfig={'S3Uri': input_s3_uri},
+                          OutputDataConfig={'S3Uri': output_s3_uri},
+                          DataAccessRoleArn=COMPREHEND_ROLE_ARN
+                      )
+                      job_id = response['JobId']
+                      
+                  elif job_type == 'topics':
+                      response = comprehend.start_topics_detection_job(
+                          JobName=job_name,
+                          InputDataConfig={'S3Uri': input_s3_uri},
+                          OutputDataConfig={'S3Uri': output_s3_uri},
+                          DataAccessRoleArn=COMPREHEND_ROLE_ARN,
+                          NumberOfTopics=MAX_TOPICS_COUNT
+                      )
+                      job_id = response['JobId']
+                      
+                  else:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({
+                              'error': f'Unsupported job type: {job_type}',
+                              'supported_types': ['sentiment', 'entities', 'key_phrases', 'topics']
+                          })
+                      }
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'job_id': job_id,
+                          'job_name': job_name,
+                          'job_type': job_type,
+                          'input_s3_uri': input_s3_uri,
+                          'output_s3_uri': output_s3_uri,
+                          'status': 'SUBMITTED'
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error starting batch job: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': f'Failed to start batch job: {str(e)}',
+                          'job_type': job_type
+                      })
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Permission for S3 to invoke the function
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ComprehendProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt ComprehendInputBucket.Arn
+
+  # EventBridge Custom Bus for NLP Events
+  ComprehendEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${ProjectName}-nlp-events-${Environment}'
+      Description: 'Custom event bus for NLP processing events'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # EventBridge Rule for NLP Processing Events
+  NLPProcessingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-nlp-processing-rule-${Environment}'
+      Description: 'Rule to handle NLP processing completion events'
+      EventBusName: !Ref ComprehendEventBus
+      EventPattern:
+        source:
+          - 'comprehend.nlp.processor'
+        detail-type:
+          - 'NLP Processing Complete'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ComprehendProcessorFunction.Arn
+          Id: 'NLPProcessingTarget'
+
+  # Lambda Permission for EventBridge to invoke the function
+  EventBridgeInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ComprehendProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt NLPProcessingRule.Arn
+
+  # CloudWatch Log Group for Lambda Function
+  ComprehendProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ComprehendProcessorFunction}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarms for Monitoring
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors-${Environment}'
+      AlarmDescription: 'Lambda function error rate is high'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ComprehendProcessorFunction
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-duration-${Environment}'
+      AlarmDescription: 'Lambda function duration is high'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 30000  # 30 seconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ComprehendProcessorFunction
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function for Batch Job Monitoring
+  BatchJobMonitorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-batch-job-monitor-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !Ref ComprehendOutputBucket
+          EVENT_BUS_NAME: !Ref ComprehendEventBus
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          comprehend = boto3.client('comprehend')
+          eventbridge = boto3.client('events')
+          
+          def lambda_handler(event, context):
+              """Monitor batch jobs and send status updates"""
+              try:
+                  # List recent sentiment detection jobs
+                  sentiment_jobs = comprehend.list_sentiment_detection_jobs(
+                      Filter={'JobStatus': 'IN_PROGRESS'}
+                  )
+                  
+                  # List recent entity detection jobs
+                  entity_jobs = comprehend.list_entities_detection_jobs(
+                      Filter={'JobStatus': 'IN_PROGRESS'}
+                  )
+                  
+                  # List recent key phrase detection jobs
+                  key_phrase_jobs = comprehend.list_key_phrases_detection_jobs(
+                      Filter={'JobStatus': 'IN_PROGRESS'}
+                  )
+                  
+                  # List recent topic detection jobs
+                  topic_jobs = comprehend.list_topics_detection_jobs(
+                      Filter={'JobStatus': 'IN_PROGRESS'}
+                  )
+                  
+                  # Combine all jobs
+                  all_jobs = []
+                  all_jobs.extend(sentiment_jobs.get('SentimentDetectionJobPropertiesList', []))
+                  all_jobs.extend(entity_jobs.get('EntitiesDetectionJobPropertiesList', []))
+                  all_jobs.extend(key_phrase_jobs.get('KeyPhrasesDetectionJobPropertiesList', []))
+                  all_jobs.extend(topic_jobs.get('TopicsDetectionJobPropertiesList', []))
+                  
+                  # Send status update event
+                  eventbridge.put_events(
+                      Entries=[
+                          {
+                              'Source': 'comprehend.batch.monitor',
+                              'DetailType': 'Batch Job Status Update',
+                              'Detail': json.dumps({
+                                  'active_jobs_count': len(all_jobs),
+                                  'jobs': all_jobs,
+                                  'timestamp': datetime.utcnow().isoformat()
+                              })
+                          }
+                      ]
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'active_jobs_count': len(all_jobs),
+                          'message': 'Batch job monitoring completed'
+                      })
+                  }
+                  
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Event Rule for Batch Job Monitoring
+  BatchJobMonitorRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-batch-job-monitor-rule-${Environment}'
+      Description: 'Schedule batch job monitoring'
+      ScheduleExpression: 'rate(5 minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt BatchJobMonitorFunction.Arn
+          Id: 'BatchJobMonitorTarget'
+
+  # Lambda Permission for CloudWatch Events to invoke batch monitoring
+  BatchJobMonitorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BatchJobMonitorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BatchJobMonitorRule.Arn
+
+# Template Outputs
+Outputs:
+  ComprehendInputBucket:
+    Description: 'S3 bucket for input text files'
+    Value: !Ref ComprehendInputBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-InputBucket'
+
+  ComprehendOutputBucket:
+    Description: 'S3 bucket for output results'
+    Value: !Ref ComprehendOutputBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-OutputBucket'
+
+  ComprehendTrainingBucket:
+    Description: 'S3 bucket for training data'
+    Value: !Ref ComprehendTrainingBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-TrainingBucket'
+
+  ComprehendProcessorFunction:
+    Description: 'Lambda function for real-time NLP processing'
+    Value: !Ref ComprehendProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessorFunction'
+
+  ComprehendProcessorFunctionArn:
+    Description: 'ARN of the Lambda function for real-time NLP processing'
+    Value: !GetAtt ComprehendProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessorFunctionArn'
+
+  ComprehendServiceRole:
+    Description: 'IAM role for Amazon Comprehend service'
+    Value: !Ref ComprehendServiceRole
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceRole'
+
+  ComprehendServiceRoleArn:
+    Description: 'ARN of the IAM role for Amazon Comprehend service'
+    Value: !GetAtt ComprehendServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceRoleArn'
+
+  ComprehendEventBus:
+    Description: 'Custom EventBridge bus for NLP events'
+    Value: !Ref ComprehendEventBus
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBus'
+
+  ComprehendEventBusArn:
+    Description: 'ARN of the custom EventBridge bus for NLP events'
+    Value: !GetAtt ComprehendEventBus.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBusArn'
+
+  BatchJobMonitorFunction:
+    Description: 'Lambda function for batch job monitoring'
+    Value: !Ref BatchJobMonitorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-BatchJobMonitorFunction'
+
+  SupportedLanguages:
+    Description: 'List of supported languages for text processing'
+    Value: !Join [',', !Ref SupportedLanguages]
+    Export:
+      Name: !Sub '${AWS::StackName}-SupportedLanguages'
+
+  DeploymentInstructions:
+    Description: 'Instructions for using this infrastructure'
+    Value: !Sub |
+      1. Upload text files to s3://${ComprehendInputBucket}/input/ for automatic processing
+      2. Use the Lambda function ${ComprehendProcessorFunction} for real-time text analysis
+      3. Monitor batch jobs using the ${BatchJobMonitorFunction} function
+      4. View results in s3://${ComprehendOutputBucket}/
+      5. For custom entity recognition, upload training data to s3://${ComprehendTrainingBucket}/
+
+  TestingCommands:
+    Description: 'AWS CLI commands for testing the solution'
+    Value: !Sub |
+      # Test real-time processing:
+      aws lambda invoke --function-name ${ComprehendProcessorFunction} --payload '{"text": "This is a test message for sentiment analysis."}' response.json
+      
+      # Start batch sentiment analysis:
+      aws lambda invoke --function-name ${ComprehendProcessorFunction} --payload '{"batch_job_type": "sentiment", "input_s3_uri": "s3://${ComprehendInputBucket}/input/"}' batch-response.json
+      
+      # Upload test file:
+      echo "This product is amazing!" > test.txt && aws s3 cp test.txt s3://${ComprehendInputBucket}/input/

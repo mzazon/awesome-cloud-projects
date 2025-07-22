@@ -1,0 +1,738 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Comprehensive CloudFormation template for establishing hybrid identity management
+  with AWS Directory Service, WorkSpaces, and RDS SQL Server integration.
+  This template creates AWS Managed Microsoft AD, WorkSpaces integration,
+  RDS SQL Server with Windows Authentication, and supporting infrastructure.
+
+Parameters:
+  DirectoryName:
+    Type: String
+    Default: corp-hybrid-ad
+    Description: Name for the AWS Managed Microsoft AD directory
+    MinLength: 3
+    MaxLength: 64
+    AllowedPattern: ^[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9]$
+    ConstraintDescription: Must contain only letters, numbers, and hyphens
+
+  DirectoryPassword:
+    Type: String
+    Description: Password for the directory administrator account
+    MinLength: 8
+    MaxLength: 64
+    NoEcho: true
+    AllowedPattern: ^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]
+    ConstraintDescription: Must contain uppercase, lowercase, number, and special character
+
+  VpcCidrBlock:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    ConstraintDescription: Must be a valid CIDR block
+
+  DirectoryEdition:
+    Type: String
+    Default: Standard
+    AllowedValues:
+      - Standard
+      - Enterprise
+    Description: Edition of AWS Managed Microsoft AD (Standard or Enterprise)
+
+  WorkSpaceBundleId:
+    Type: String
+    Default: wsb-bh8rsxt14
+    Description: WorkSpaces bundle ID for virtual desktops
+    AllowedPattern: ^wsb-[a-z0-9]{10}$
+    ConstraintDescription: Must be a valid WorkSpaces bundle ID
+
+  RdsInstanceClass:
+    Type: String
+    Default: db.t3.medium
+    AllowedValues:
+      - db.t3.small
+      - db.t3.medium
+      - db.t3.large
+      - db.m5.large
+      - db.m5.xlarge
+    Description: RDS instance class for SQL Server
+
+  RdsAllocatedStorage:
+    Type: Number
+    Default: 200
+    MinValue: 200
+    MaxValue: 16384
+    Description: Allocated storage for RDS instance in GB
+
+  EnableWorkspaces:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Whether to enable WorkSpaces integration
+
+  EnableRds:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Whether to create RDS SQL Server instance
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name for resource tagging
+
+Conditions:
+  CreateWorkSpaces: !Equals [!Ref EnableWorkspaces, 'true']
+  CreateRds: !Equals [!Ref EnableRds, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # VPC and Networking Infrastructure
+  HybridIdentityVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidrBlock
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${DirectoryName}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: HybridIdentity
+
+  # Internet Gateway for outbound access
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${DirectoryName}-igw'
+        - Key: Environment
+          Value: !Ref Environment
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref HybridIdentityVpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # Directory Service Subnets (Private)
+  DirectorySubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref HybridIdentityVpc
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidrBlock, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${DirectoryName}-directory-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Type
+          Value: Private
+
+  DirectorySubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref HybridIdentityVpc
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidrBlock, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${DirectoryName}-directory-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Type
+          Value: Private
+
+  # NAT Gateways for outbound internet access from private subnets
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref HybridIdentityVpc
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidrBlock, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${DirectoryName}-public-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Type
+          Value: Public
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref HybridIdentityVpc
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidrBlock, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${DirectoryName}-public-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Type
+          Value: Public
+
+  # Elastic IPs for NAT Gateways
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${DirectoryName}-nat-eip-1'
+
+  NatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${DirectoryName}-nat-eip-2'
+
+  # NAT Gateways
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${DirectoryName}-nat-gateway-1'
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${DirectoryName}-nat-gateway-2'
+
+  # Route Tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref HybridIdentityVpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${DirectoryName}-public-rt'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref HybridIdentityVpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${DirectoryName}-private-rt-1'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref HybridIdentityVpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${DirectoryName}-private-rt-2'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Routes
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  # Subnet Route Table Associations
+  PublicSubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateSubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DirectorySubnet1
+      RouteTableId: !Ref PrivateRouteTable1
+
+  PrivateSubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DirectorySubnet2
+      RouteTableId: !Ref PrivateRouteTable2
+
+  # AWS Managed Microsoft AD Directory
+  ManagedActiveDirectory:
+    Type: AWS::DirectoryService::MicrosoftAD
+    Properties:
+      Name: !Sub '${DirectoryName}.corp.local'
+      Password: !Ref DirectoryPassword
+      Edition: !Ref DirectoryEdition
+      ShortName: !Ref DirectoryName
+      Description: !Sub 'Hybrid Identity Management Directory for ${Environment} environment'
+      VpcSettings:
+        VpcId: !Ref HybridIdentityVpc
+        SubnetIds:
+          - !Ref DirectorySubnet1
+          - !Ref DirectorySubnet2
+
+  # Security Groups
+  DirectorySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for AWS Managed Microsoft AD
+      VpcId: !Ref HybridIdentityVpc
+      SecurityGroupIngress:
+        # Active Directory communication ports
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          SourceSecurityGroupId: !Ref WorkSpacesSecurityGroup
+          Description: DNS TCP from WorkSpaces
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          SourceSecurityGroupId: !Ref WorkSpacesSecurityGroup
+          Description: DNS UDP from WorkSpaces
+        - IpProtocol: tcp
+          FromPort: 88
+          ToPort: 88
+          SourceSecurityGroupId: !Ref WorkSpacesSecurityGroup
+          Description: Kerberos TCP from WorkSpaces
+        - IpProtocol: udp
+          FromPort: 88
+          ToPort: 88
+          SourceSecurityGroupId: !Ref WorkSpacesSecurityGroup
+          Description: Kerberos UDP from WorkSpaces
+        - IpProtocol: tcp
+          FromPort: 135
+          ToPort: 135
+          SourceSecurityGroupId: !Ref WorkSpacesSecurityGroup
+          Description: RPC Endpoint Mapper from WorkSpaces
+        - IpProtocol: tcp
+          FromPort: 389
+          ToPort: 389
+          SourceSecurityGroupId: !Ref WorkSpacesSecurityGroup
+          Description: LDAP from WorkSpaces
+        - IpProtocol: tcp
+          FromPort: 445
+          ToPort: 445
+          SourceSecurityGroupId: !Ref WorkSpacesSecurityGroup
+          Description: SMB from WorkSpaces
+        - IpProtocol: tcp
+          FromPort: 636
+          ToPort: 636
+          SourceSecurityGroupId: !Ref WorkSpacesSecurityGroup
+          Description: LDAPS from WorkSpaces
+        - IpProtocol: tcp
+          FromPort: 3268
+          ToPort: 3269
+          SourceSecurityGroupId: !Ref WorkSpacesSecurityGroup
+          Description: Global Catalog from WorkSpaces
+        # Allow self-communication for domain controllers
+        - IpProtocol: -1
+          SourceSecurityGroupId: !Ref DirectorySecurityGroup
+          Description: All traffic from directory security group
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${DirectoryName}-directory-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  WorkSpacesSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for WorkSpaces instances
+      VpcId: !Ref HybridIdentityVpc
+      SecurityGroupIngress:
+        # WorkSpaces streaming protocol
+        - IpProtocol: tcp
+          FromPort: 4172
+          ToPort: 4172
+          CidrIp: 0.0.0.0/0
+          Description: WorkSpaces streaming protocol
+        - IpProtocol: udp
+          FromPort: 4172
+          ToPort: 4172
+          CidrIp: 0.0.0.0/0
+          Description: WorkSpaces streaming protocol UDP
+        # HTTPS for web-based access
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS for web access
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${DirectoryName}-workspaces-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateRds
+    Properties:
+      GroupDescription: Security group for RDS SQL Server instance
+      VpcId: !Ref HybridIdentityVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 1433
+          ToPort: 1433
+          SourceSecurityGroupId: !Ref WorkSpacesSecurityGroup
+          Description: SQL Server from WorkSpaces
+        - IpProtocol: tcp
+          FromPort: 1433
+          ToPort: 1433
+          SourceSecurityGroupId: !Ref DirectorySecurityGroup
+          Description: SQL Server from Directory
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${DirectoryName}-rds-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for RDS Directory Service Integration
+  RdsDirectoryServiceRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRds
+    Properties:
+      RoleName: !Sub '${DirectoryName}-rds-directory-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSDirectoryServiceAccess
+      Tags:
+        - Key: Name
+          Value: !Sub '${DirectoryName}-rds-directory-service-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # RDS Subnet Group
+  RdsSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Condition: CreateRds
+    Properties:
+      DBSubnetGroupName: !Sub '${DirectoryName}-db-subnet-group'
+      DBSubnetGroupDescription: Subnet group for RDS with Directory Service integration
+      SubnetIds:
+        - !Ref DirectorySubnet1
+        - !Ref DirectorySubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${DirectoryName}-db-subnet-group'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # RDS SQL Server Instance with Directory Service Integration
+  RdsSqlServerInstance:
+    Type: AWS::RDS::DBInstance
+    Condition: CreateRds
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub '${DirectoryName}-sql-server'
+      DBInstanceClass: !Ref RdsInstanceClass
+      Engine: sqlserver-se
+      EngineVersion: '15.00.4073.23.v1'  # SQL Server 2019
+      MasterUsername: sqladmin
+      MasterUserPassword: !Ref DirectoryPassword
+      AllocatedStorage: !Ref RdsAllocatedStorage
+      StorageType: gp2
+      StorageEncrypted: !If [IsProduction, true, false]
+      BackupRetentionPeriod: !If [IsProduction, 7, 1]
+      DeleteAutomatedBackups: true
+      DeletionProtection: !If [IsProduction, true, false]
+      VPCSecurityGroups:
+        - !Ref RdsSecurityGroup
+      DBSubnetGroupName: !Ref RdsSubnetGroup
+      Domain: !Ref ManagedActiveDirectory
+      DomainIAMRoleName: !Ref RdsDirectoryServiceRole
+      MultiAZ: !If [IsProduction, true, false]
+      PubliclyAccessible: false
+      MonitoringInterval: !If [IsProduction, 60, 0]
+      PerformanceInsightsEnabled: !If [IsProduction, true, false]
+      Tags:
+        - Key: Name
+          Value: !Sub '${DirectoryName}-sql-server'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: HybridIdentity
+
+  # WorkSpaces Directory Registration
+  # Note: WorkSpaces directory registration is not directly supported in CloudFormation
+  # This would typically be done via CLI or console after stack creation
+
+  # CloudTrail for Directory Service Auditing
+  DirectoryServiceCloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      TrailName: !Sub '${DirectoryName}-directory-audit-trail'
+      S3BucketName: !Ref CloudTrailBucket
+      IncludeGlobalServiceEvents: true
+      IsLogging: true
+      IsMultiRegionTrail: false
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: AWS::DirectoryService::Directory
+              Values:
+                - !Sub '${ManagedActiveDirectory}/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${DirectoryName}-directory-audit-trail'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # S3 Bucket for CloudTrail Logs
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${DirectoryName}-cloudtrail-logs-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: !If [IsProduction, 2555, 90]  # 7 years for prod, 90 days for dev
+      Tags:
+        - Key: Name
+          Value: !Sub '${DirectoryName}-cloudtrail-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # S3 Bucket Policy for CloudTrail
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CloudTrailBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+
+  # Systems Manager Parameter for Directory DNS IPs
+  DirectoryDnsIpsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${DirectoryName}/directory/dns-ips'
+      Type: StringList
+      Value: !Join
+        - ','
+        - !GetAtt ManagedActiveDirectory.DnsIpAddresses
+      Description: DNS IP addresses for the managed directory
+      Tags:
+        Name: !Sub '${DirectoryName}-directory-dns-ips'
+        Environment: !Ref Environment
+
+  # Systems Manager Parameter for Directory ID
+  DirectoryIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${DirectoryName}/directory/id'
+      Type: String
+      Value: !Ref ManagedActiveDirectory
+      Description: Directory ID for the managed directory
+      Tags:
+        Name: !Sub '${DirectoryName}-directory-id'
+        Environment: !Ref Environment
+
+Outputs:
+  # Directory Information
+  DirectoryId:
+    Description: ID of the AWS Managed Microsoft AD directory
+    Value: !Ref ManagedActiveDirectory
+    Export:
+      Name: !Sub '${AWS::StackName}-DirectoryId'
+
+  DirectoryName:
+    Description: Fully qualified domain name of the directory
+    Value: !Sub '${DirectoryName}.corp.local'
+    Export:
+      Name: !Sub '${AWS::StackName}-DirectoryName'
+
+  DirectoryDnsIpAddresses:
+    Description: DNS IP addresses for the directory
+    Value: !Join
+      - ', '
+      - !GetAtt ManagedActiveDirectory.DnsIpAddresses
+    Export:
+      Name: !Sub '${AWS::StackName}-DirectoryDnsIps'
+
+  # Network Information
+  VpcId:
+    Description: VPC ID for the hybrid identity infrastructure
+    Value: !Ref HybridIdentityVpc
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+
+  DirectorySubnet1:
+    Description: Directory subnet 1 ID
+    Value: !Ref DirectorySubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-DirectorySubnet1'
+
+  DirectorySubnet2:
+    Description: Directory subnet 2 ID
+    Value: !Ref DirectorySubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-DirectorySubnet2'
+
+  # Security Groups
+  DirectorySecurityGroupId:
+    Description: Security group ID for directory services
+    Value: !Ref DirectorySecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-DirectorySecurityGroup'
+
+  WorkSpacesSecurityGroupId:
+    Description: Security group ID for WorkSpaces
+    Value: !Ref WorkSpacesSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-WorkSpacesSecurityGroup'
+
+  RdsSecurityGroupId:
+    Condition: CreateRds
+    Description: Security group ID for RDS instance
+    Value: !Ref RdsSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-RdsSecurityGroup'
+
+  # RDS Information
+  RdsEndpoint:
+    Condition: CreateRds
+    Description: RDS SQL Server endpoint for database connections
+    Value: !GetAtt RdsSqlServerInstance.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-RdsEndpoint'
+
+  RdsInstanceId:
+    Condition: CreateRds
+    Description: RDS instance identifier
+    Value: !Ref RdsSqlServerInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-RdsInstanceId'
+
+  # IAM Roles
+  RdsDirectoryServiceRoleArn:
+    Condition: CreateRds
+    Description: ARN of the IAM role for RDS Directory Service integration
+    Value: !GetAtt RdsDirectoryServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RdsDirectoryServiceRoleArn'
+
+  # Monitoring and Logging
+  CloudTrailArn:
+    Description: ARN of the CloudTrail for directory auditing
+    Value: !GetAtt DirectoryServiceCloudTrail.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrailArn'
+
+  CloudTrailBucketName:
+    Description: S3 bucket name for CloudTrail logs
+    Value: !Ref CloudTrailBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrailBucket'
+
+  # Post-Deployment Instructions
+  PostDeploymentSteps:
+    Description: Next steps after stack deployment
+    Value: |
+      1. Register directory with WorkSpaces: aws workspaces register-workspace-directory
+      2. Create test users in the directory using domain admin instance
+      3. Create WorkSpaces for users: aws workspaces create-workspaces
+      4. Configure trust relationship with on-premises AD if needed
+      5. Test authentication and access to RDS SQL Server
+
+  # Estimated Monthly Cost
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for this infrastructure (USD)
+    Value: !Sub |
+      AWS Managed Microsoft AD (${DirectoryEdition}): $292
+      NAT Gateways (2): $90
+      RDS SQL Server (${RdsInstanceClass}): $180-250
+      WorkSpaces (per user): $35-75
+      Total Base Cost: ~$450 (plus WorkSpaces per user)

@@ -1,0 +1,767 @@
+# Infrastructure Manager Configuration for Security Compliance Monitoring
+# This configuration deploys automated security compliance monitoring using
+# Security Command Center, Cloud Workflows, Cloud Functions, and Pub/Sub
+
+imports:
+  - path: https://www.gstatic.com/clouddm/templates/dm_helpers.py
+    name: helpers.py
+
+resources:
+  # Enable required APIs for the solution
+  - name: enable-apis
+    type: deploymentmanager.v2.virtual.enableService
+    properties:
+      servicesToEnable:
+        - securitycenter.googleapis.com
+        - pubsub.googleapis.com
+        - workflows.googleapis.com
+        - cloudfunctions.googleapis.com
+        - cloudbuild.googleapis.com
+        - eventarc.googleapis.com
+        - logging.googleapis.com
+        - monitoring.googleapis.com
+
+  # Pub/Sub topic for security findings notifications
+  - name: security-findings-topic
+    type: pubsub.v1.topic
+    properties:
+      topic: security-findings-$(ref.random-suffix.value)
+      labels:
+        purpose: security-compliance
+        environment: production
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # Pub/Sub subscription for workflow triggers
+  - name: security-findings-subscription
+    type: pubsub.v1.subscription
+    properties:
+      subscription: security-findings-$(ref.random-suffix.value)-sub
+      topic: $(ref.security-findings-topic.name)
+      ackDeadlineSeconds: 600
+      messageRetentionDuration: 604800s  # 7 days
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+      deadLetterPolicy:
+        deadLetterTopic: $(ref.security-findings-dlq-topic.name)
+        maxDeliveryAttempts: 5
+      labels:
+        purpose: security-compliance
+        environment: production
+    metadata:
+      dependsOn:
+        - security-findings-topic
+        - security-findings-dlq-topic
+
+  # Dead letter queue for failed message processing
+  - name: security-findings-dlq-topic
+    type: pubsub.v1.topic
+    properties:
+      topic: security-findings-dlq-$(ref.random-suffix.value)
+      labels:
+        purpose: security-compliance-dlq
+        environment: production
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # Service account for Cloud Functions
+  - name: security-processor-service-account
+    type: iam.v1.serviceAccount
+    properties:
+      accountId: security-processor-$(ref.random-suffix.value)
+      displayName: Security Findings Processor Service Account
+      description: Service account for processing security findings and triggering workflows
+
+  # IAM bindings for the Cloud Functions service account
+  - name: security-processor-workflows-invoker
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(env.project)
+      role: roles/workflows.invoker
+      member: serviceAccount:$(ref.security-processor-service-account.email)
+    metadata:
+      dependsOn:
+        - security-processor-service-account
+
+  - name: security-processor-logging-writer
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(env.project)
+      role: roles/logging.logWriter
+      member: serviceAccount:$(ref.security-processor-service-account.email)
+    metadata:
+      dependsOn:
+        - security-processor-service-account
+
+  - name: security-processor-monitoring-writer
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(env.project)
+      role: roles/monitoring.metricWriter
+      member: serviceAccount:$(ref.security-processor-service-account.email)
+    metadata:
+      dependsOn:
+        - security-processor-service-account
+
+  # Cloud Storage bucket for function source code
+  - name: function-source-bucket
+    type: storage.v1.bucket
+    properties:
+      name: security-compliance-source-$(ref.random-suffix.value)
+      location: $(properties.region)
+      storageClass: REGIONAL
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              numNewerVersions: 3
+      labels:
+        purpose: function-source
+        environment: production
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # Cloud Function for processing security findings
+  - name: security-processor-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/$(env.project)/locations/$(properties.region)
+      function: security-processor-$(ref.random-suffix.value)
+      sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/security-processor.zip
+      entryPoint: process_security_finding
+      runtime: python311
+      timeout: 300s
+      availableMemoryMb: 512
+      serviceAccountEmail: $(ref.security-processor-service-account.email)
+      environmentVariables:
+        PROJECT_ID: $(env.project)
+        REGION: $(properties.region)
+        HIGH_SEVERITY_WORKFLOW: high-severity-workflow-$(ref.random-suffix.value)
+        MEDIUM_SEVERITY_WORKFLOW: medium-severity-workflow-$(ref.random-suffix.value)
+        LOW_SEVERITY_WORKFLOW: low-severity-workflow-$(ref.random-suffix.value)
+      eventTrigger:
+        eventType: providers/cloud.pubsub/eventTypes/topic.publish
+        resource: $(ref.security-findings-topic.name)
+        failurePolicy:
+          retry: {}
+      labels:
+        purpose: security-compliance
+        environment: production
+    metadata:
+      dependsOn:
+        - security-findings-topic
+        - security-processor-service-account
+        - function-source-bucket
+
+  # Service account for Cloud Workflows
+  - name: workflows-service-account
+    type: iam.v1.serviceAccount
+    properties:
+      accountId: workflows-security-$(ref.random-suffix.value)
+      displayName: Security Workflows Service Account
+      description: Service account for executing security compliance workflows
+
+  # IAM bindings for the Workflows service account
+  - name: workflows-logging-writer
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(env.project)
+      role: roles/logging.logWriter
+      member: serviceAccount:$(ref.workflows-service-account.email)
+    metadata:
+      dependsOn:
+        - workflows-service-account
+
+  - name: workflows-monitoring-writer
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(env.project)
+      role: roles/monitoring.metricWriter
+      member: serviceAccount:$(ref.workflows-service-account.email)
+    metadata:
+      dependsOn:
+        - workflows-service-account
+
+  - name: workflows-security-reviewer
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(env.project)
+      role: roles/securitycenter.findingsViewer
+      member: serviceAccount:$(ref.workflows-service-account.email)
+    metadata:
+      dependsOn:
+        - workflows-service-account
+
+  # High-severity security workflow
+  - name: high-severity-workflow
+    type: gcp-types/workflows-v1:projects.locations.workflows
+    properties:
+      parent: projects/$(env.project)/locations/$(properties.region)
+      workflowId: high-severity-workflow-$(ref.random-suffix.value)
+      workflow:
+        description: Automated workflow for handling high-severity security findings
+        labels:
+          purpose: security-compliance
+          severity: high
+          environment: production
+        serviceAccount: $(ref.workflows-service-account.email)
+        sourceContents: |
+          main:
+            params: [input]
+            steps:
+              - init:
+                  assign:
+                    - finding: ${input.finding}
+                    - severity: ${input.severity}
+                    - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+              
+              - log_incident:
+                  call: http.post
+                  args:
+                    url: https://logging.googleapis.com/v2/entries:write
+                    auth:
+                      type: OAuth2
+                    body:
+                      entries:
+                        - logName: projects/${project_id}/logs/security-compliance
+                          severity: CRITICAL
+                          jsonPayload:
+                            finding_id: ${finding.name}
+                            severity: ${severity}
+                            action: "high_severity_workflow_triggered"
+                            workflow_id: "high-severity-workflow"
+                            timestamp: ${time.now()}
+              
+              - assess_threat:
+                  assign:
+                    - requires_immediate_action: ${severity == "CRITICAL"}
+                    - requires_escalation: true
+                    - risk_score: ${if(severity == "CRITICAL", 10, 8)}
+              
+              - immediate_remediation:
+                  switch:
+                    - condition: ${requires_immediate_action}
+                      steps:
+                        - disable_compromised_resource:
+                            call: execute_remediation
+                            args:
+                              action: "disable_resource"
+                              resource: ${finding.resourceName}
+                              severity: ${severity}
+              
+              - notify_security_team:
+                  call: send_notification
+                  args:
+                    severity: ${severity}
+                    finding: ${finding}
+                    action_taken: "immediate_remediation"
+                    risk_score: ${risk_score}
+              
+              - escalate_to_incident_response:
+                  switch:
+                    - condition: ${requires_escalation}
+                      steps:
+                        - create_incident:
+                            call: create_security_incident
+                            args:
+                              finding: ${finding}
+                              severity: ${severity}
+                              risk_score: ${risk_score}
+          
+          execute_remediation:
+            params: [action, resource, severity]
+            steps:
+              - log_action:
+                  call: http.post
+                  args:
+                    url: https://logging.googleapis.com/v2/entries:write
+                    auth:
+                      type: OAuth2
+                    body:
+                      entries:
+                        - logName: projects/${project_id}/logs/security-actions
+                          severity: INFO
+                          jsonPayload:
+                            action: ${action}
+                            resource: ${resource}
+                            severity: ${severity}
+                            timestamp: ${time.now()}
+                            status: "executed"
+          
+          send_notification:
+            params: [severity, finding, action_taken, risk_score]
+            steps:
+              - send_alert:
+                  call: http.post
+                  args:
+                    url: https://logging.googleapis.com/v2/entries:write
+                    auth:
+                      type: OAuth2
+                    body:
+                      entries:
+                        - logName: projects/${project_id}/logs/security-notifications
+                          severity: WARNING
+                          jsonPayload:
+                            alert_type: "security_finding"
+                            severity: ${severity}
+                            finding_id: ${finding.name}
+                            action_taken: ${action_taken}
+                            risk_score: ${risk_score}
+                            notification_time: ${time.now()}
+          
+          create_security_incident:
+            params: [finding, severity, risk_score]
+            steps:
+              - log_incident:
+                  call: http.post
+                  args:
+                    url: https://logging.googleapis.com/v2/entries:write
+                    auth:
+                      type: OAuth2
+                    body:
+                      entries:
+                        - logName: projects/${project_id}/logs/security-incidents
+                          severity: ERROR
+                          jsonPayload:
+                            incident_type: "security_finding"
+                            severity: ${severity}
+                            finding_id: ${finding.name}
+                            risk_score: ${risk_score}
+                            status: "created"
+                            created_time: ${time.now()}
+    metadata:
+      dependsOn:
+        - workflows-service-account
+        - enable-apis
+
+  # Medium-severity security workflow
+  - name: medium-severity-workflow
+    type: gcp-types/workflows-v1:projects.locations.workflows
+    properties:
+      parent: projects/$(env.project)/locations/$(properties.region)
+      workflowId: medium-severity-workflow-$(ref.random-suffix.value)
+      workflow:
+        description: Automated workflow for handling medium-severity security findings
+        labels:
+          purpose: security-compliance
+          severity: medium
+          environment: production
+        serviceAccount: $(ref.workflows-service-account.email)
+        sourceContents: |
+          main:
+            params: [input]
+            steps:
+              - init:
+                  assign:
+                    - finding: ${input.finding}
+                    - severity: ${input.severity}
+                    - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+              
+              - log_finding:
+                  call: http.post
+                  args:
+                    url: https://logging.googleapis.com/v2/entries:write
+                    auth:
+                      type: OAuth2
+                    body:
+                      entries:
+                        - logName: projects/${project_id}/logs/security-compliance
+                          severity: WARNING
+                          jsonPayload:
+                            finding_id: ${finding.name}
+                            severity: ${severity}
+                            action: "medium_severity_workflow_triggered"
+                            workflow_id: "medium-severity-workflow"
+                            timestamp: ${time.now()}
+              
+              - assess_risk:
+                  assign:
+                    - requires_notification: true
+                    - requires_tracking: true
+                    - follow_up_hours: 24
+                    - risk_score: 5
+              
+              - create_remediation_ticket:
+                  call: create_tracking_entry
+                  args:
+                    finding: ${finding}
+                    priority: "medium"
+                    follow_up_hours: ${follow_up_hours}
+              
+              - notify_security_team:
+                  call: send_notification
+                  args:
+                    severity: ${severity}
+                    finding: ${finding}
+                    action_taken: "ticket_created"
+                    follow_up_hours: ${follow_up_hours}
+              
+              - schedule_follow_up:
+                  call: create_follow_up_task
+                  args:
+                    finding: ${finding}
+                    follow_up_hours: ${follow_up_hours}
+          
+          create_tracking_entry:
+            params: [finding, priority, follow_up_hours]
+            steps:
+              - log_tracking:
+                  call: http.post
+                  args:
+                    url: https://logging.googleapis.com/v2/entries:write
+                    auth:
+                      type: OAuth2
+                    body:
+                      entries:
+                        - logName: projects/${project_id}/logs/security-tracking
+                          severity: INFO
+                          jsonPayload:
+                            tracking_type: "remediation_ticket"
+                            finding_id: ${finding.name}
+                            priority: ${priority}
+                            follow_up_hours: ${follow_up_hours}
+                            status: "created"
+                            created_time: ${time.now()}
+          
+          send_notification:
+            params: [severity, finding, action_taken, follow_up_hours]
+            steps:
+              - send_alert:
+                  call: http.post
+                  args:
+                    url: https://logging.googleapis.com/v2/entries:write
+                    auth:
+                      type: OAuth2
+                    body:
+                      entries:
+                        - logName: projects/${project_id}/logs/security-notifications
+                          severity: INFO
+                          jsonPayload:
+                            alert_type: "security_finding"
+                            severity: ${severity}
+                            finding_id: ${finding.name}
+                            action_taken: ${action_taken}
+                            follow_up_hours: ${follow_up_hours}
+                            notification_time: ${time.now()}
+          
+          create_follow_up_task:
+            params: [finding, follow_up_hours]
+            steps:
+              - schedule_task:
+                  call: http.post
+                  args:
+                    url: https://logging.googleapis.com/v2/entries:write
+                    auth:
+                      type: OAuth2
+                    body:
+                      entries:
+                        - logName: projects/${project_id}/logs/security-tasks
+                          severity: INFO
+                          jsonPayload:
+                            task_type: "follow_up"
+                            finding_id: ${finding.name}
+                            scheduled_hours: ${follow_up_hours}
+                            status: "scheduled"
+                            scheduled_time: ${time.now()}
+    metadata:
+      dependsOn:
+        - workflows-service-account
+        - enable-apis
+
+  # Low-severity security workflow
+  - name: low-severity-workflow
+    type: gcp-types/workflows-v1:projects.locations.workflows
+    properties:
+      parent: projects/$(env.project)/locations/$(properties.region)
+      workflowId: low-severity-workflow-$(ref.random-suffix.value)
+      workflow:
+        description: Automated workflow for handling low-severity security findings
+        labels:
+          purpose: security-compliance
+          severity: low
+          environment: production
+        serviceAccount: $(ref.workflows-service-account.email)
+        sourceContents: |
+          main:
+            params: [input]
+            steps:
+              - init:
+                  assign:
+                    - finding: ${input.finding}
+                    - severity: ${input.severity}
+                    - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+              
+              - log_finding:
+                  call: http.post
+                  args:
+                    url: https://logging.googleapis.com/v2/entries:write
+                    auth:
+                      type: OAuth2
+                    body:
+                      entries:
+                        - logName: projects/${project_id}/logs/security-compliance
+                          severity: INFO
+                          jsonPayload:
+                            finding_id: ${finding.name}
+                            severity: ${severity}
+                            action: "low_severity_workflow_triggered"
+                            workflow_id: "low-severity-workflow"
+                            timestamp: ${time.now()}
+              
+              - assess_finding:
+                  assign:
+                    - requires_aggregation: true
+                    - requires_periodic_review: true
+                    - aggregation_threshold: 100
+                    - review_period_days: 7
+              
+              - aggregate_for_reporting:
+                  call: aggregate_finding
+                  args:
+                    finding: ${finding}
+                    category: "low_severity_findings"
+                    threshold: ${aggregation_threshold}
+              
+              - check_threshold:
+                  call: check_aggregation_threshold
+                  args:
+                    category: "low_severity_findings"
+                    threshold: ${aggregation_threshold}
+              
+              - conditional_notification:
+                  switch:
+                    - condition: ${threshold_exceeded}
+                      steps:
+                        - notify_trend:
+                            call: send_trend_notification
+                            args:
+                              category: "low_severity_findings"
+                              count: ${finding_count}
+                              threshold: ${aggregation_threshold}
+          
+          aggregate_finding:
+            params: [finding, category, threshold]
+            steps:
+              - log_aggregation:
+                  call: http.post
+                  args:
+                    url: https://logging.googleapis.com/v2/entries:write
+                    auth:
+                      type: OAuth2
+                    body:
+                      entries:
+                        - logName: projects/${project_id}/logs/security-aggregation
+                          severity: INFO
+                          jsonPayload:
+                            aggregation_type: ${category}
+                            finding_id: ${finding.name}
+                            threshold: ${threshold}
+                            timestamp: ${time.now()}
+          
+          check_aggregation_threshold:
+            params: [category, threshold]
+            steps:
+              - check_count:
+                  assign:
+                    - threshold_exceeded: false
+                    - finding_count: 0
+          
+          send_trend_notification:
+            params: [category, count, threshold]
+            steps:
+              - send_alert:
+                  call: http.post
+                  args:
+                    url: https://logging.googleapis.com/v2/entries:write
+                    auth:
+                      type: OAuth2
+                    body:
+                      entries:
+                        - logName: projects/${project_id}/logs/security-trends
+                          severity: WARNING
+                          jsonPayload:
+                            alert_type: "trend_notification"
+                            category: ${category}
+                            count: ${count}
+                            threshold: ${threshold}
+                            message: "Low severity findings threshold exceeded"
+                            timestamp: ${time.now()}
+    metadata:
+      dependsOn:
+        - workflows-service-account
+        - enable-apis
+
+  # Log-based metrics for monitoring
+  - name: security-findings-processed-metric
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      parent: projects/$(env.project)
+      metricId: security_findings_processed
+      metric:
+        description: Count of security findings processed by the system
+        filter: 'resource.type="cloud_function" AND textPayload:"Processing finding"'
+        metricDescriptor:
+          metricKind: CUMULATIVE
+          valueType: INT64
+          displayName: Security Findings Processed
+        labelExtractors:
+          severity: 'EXTRACT(jsonPayload.severity)'
+          workflow: 'EXTRACT(jsonPayload.workflow_id)'
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  - name: workflow-executions-metric
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      parent: projects/$(env.project)
+      metricId: workflow_executions
+      metric:
+        description: Count of security workflow executions
+        filter: 'resource.type="workflows.googleapis.com/Workflow"'
+        metricDescriptor:
+          metricKind: CUMULATIVE
+          valueType: INT64
+          displayName: Workflow Executions
+        labelExtractors:
+          workflow_name: 'EXTRACT(resource.labels.workflow_id)'
+          execution_status: 'EXTRACT(jsonPayload.status)'
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # Alert policy for high-severity findings
+  - name: high-severity-findings-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(env.project)
+      alertPolicy:
+        displayName: High Severity Security Findings Alert
+        documentation:
+          content: Alert triggered when high-severity security findings exceed threshold
+          mimeType: text/markdown
+        conditions:
+          - displayName: High severity findings rate
+            conditionThreshold:
+              filter: 'resource.type="cloud_function" AND metric.type="logging.googleapis.com/user/security_findings_processed" AND metric.labels.severity="HIGH"'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 5
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+        alertStrategy:
+          autoClose: 86400s
+        combiner: OR
+        enabled: true
+        severity: CRITICAL
+    metadata:
+      dependsOn:
+        - security-findings-processed-metric
+        - enable-apis
+
+  # Notification channel for security team
+  - name: security-team-notification-channel
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      parent: projects/$(env.project)
+      notificationChannel:
+        type: email
+        displayName: Security Team Email Notification
+        description: Email notifications for security team
+        labels:
+          email_address: security-team@company.com
+        enabled: true
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # Random suffix generator for unique resource names
+  - name: random-suffix
+    type: helpers.py
+    properties:
+      codeLocation: https://www.gstatic.com/clouddm/templates/dm_helpers.py
+      functionName: generate_suffix
+      args:
+        length: 6
+
+# Template properties for customization
+properties:
+  region:
+    type: string
+    default: us-central1
+    description: Google Cloud region for resource deployment
+  
+  notification-email:
+    type: string
+    default: security-team@company.com
+    description: Email address for security notifications
+  
+  high-severity-threshold:
+    type: integer
+    default: 5
+    description: Threshold for high-severity findings alerts
+  
+  enable-scc-notifications:
+    type: boolean
+    default: true
+    description: Enable Security Command Center notifications
+  
+  function-memory:
+    type: integer
+    default: 512
+    description: Memory allocation for Cloud Functions (MB)
+  
+  function-timeout:
+    type: integer
+    default: 300
+    description: Timeout for Cloud Functions (seconds)
+
+# Outputs for verification and integration
+outputs:
+  - name: pubsub-topic-name
+    description: Name of the Pub/Sub topic for security findings
+    value: $(ref.security-findings-topic.name)
+  
+  - name: high-severity-workflow-name
+    description: Name of the high-severity workflow
+    value: $(ref.high-severity-workflow.name)
+  
+  - name: medium-severity-workflow-name
+    description: Name of the medium-severity workflow
+    value: $(ref.medium-severity-workflow.name)
+  
+  - name: low-severity-workflow-name
+    description: Name of the low-severity workflow
+    value: $(ref.low-severity-workflow.name)
+  
+  - name: security-processor-function-name
+    description: Name of the security processor Cloud Function
+    value: $(ref.security-processor-function.name)
+  
+  - name: workflows-service-account-email
+    description: Email of the workflows service account
+    value: $(ref.workflows-service-account.email)
+  
+  - name: function-service-account-email
+    description: Email of the function service account
+    value: $(ref.security-processor-service-account.email)
+  
+  - name: notification-channel-name
+    description: Name of the monitoring notification channel
+    value: $(ref.security-team-notification-channel.name)
+  
+  - name: deployment-region
+    description: Region where resources are deployed
+    value: $(properties.region)

@@ -1,0 +1,1215 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Infrastructure for building ordered message processing with SQS FIFO queues and dead letter queues.
+  This template creates a comprehensive message processing system with failure isolation, automated recovery,
+  and comprehensive monitoring for mission-critical applications.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: fifo-processing
+    Description: Name prefix for all resources
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9-]*$
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters and hyphens
+
+  Environment:
+    Type: String
+    Default: demo
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+      - demo
+    Description: Environment name for resource tagging and configuration
+
+  MessageRetentionPeriod:
+    Type: Number
+    Default: 1209600
+    MinValue: 60
+    MaxValue: 1209600
+    Description: Message retention period in seconds (1-14 days)
+
+  VisibilityTimeoutSeconds:
+    Type: Number
+    Default: 300
+    MinValue: 0
+    MaxValue: 43200
+    Description: Visibility timeout for messages in seconds
+
+  MaxReceiveCount:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+    Description: Maximum number of receive attempts before sending to DLQ
+
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 30
+    MaxValue: 900
+    Description: Lambda function timeout in seconds
+
+  ReservedConcurrency:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+    Description: Reserved concurrency for message processor Lambda
+
+  NotificationEmail:
+    Type: String
+    Default: ""
+    Description: Email address for SNS notifications (optional)
+    AllowedPattern: ^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address or empty
+
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable detailed CloudWatch monitoring and alarms
+
+Conditions:
+  CreateEmailSubscription: !Not [!Equals [!Ref NotificationEmail, ""]]
+  EnableMonitoring: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  CreateHighVolumeConfiguration: !Equals [!Ref Environment, 'prod']
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Project Configuration
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: Queue Configuration
+        Parameters:
+          - MessageRetentionPeriod
+          - VisibilityTimeoutSeconds
+          - MaxReceiveCount
+      - Label:
+          default: Lambda Configuration
+        Parameters:
+          - LambdaTimeout
+          - ReservedConcurrency
+      - Label:
+          default: Monitoring Configuration
+        Parameters:
+          - EnableDetailedMonitoring
+          - NotificationEmail
+
+Resources:
+  # ================================
+  # S3 Bucket for Message Archiving
+  # ================================
+  MessageArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-message-archive-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveTransition
+            Status: Enabled
+            Filter:
+              Prefix: poison-messages/
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-message-archive"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Poison message archival and forensic analysis"
+
+  # S3 Bucket Policy for secure access
+  MessageArchiveBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MessageArchiveBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "${MessageArchiveBucket}/*"
+              - !Ref MessageArchiveBucket
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  # ================================
+  # DynamoDB Table for Order State
+  # ================================
+  OrderTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-orders"
+      BillingMode: !If [CreateHighVolumeConfiguration, "ON_DEMAND", "PROVISIONED"]
+      ProvisionedThroughput: !If
+        - CreateHighVolumeConfiguration
+        - !Ref AWS::NoValue
+        - ReadCapacityUnits: 10
+          WriteCapacityUnits: 10
+      AttributeDefinitions:
+        - AttributeName: OrderId
+          AttributeType: S
+        - AttributeName: MessageGroupId
+          AttributeType: S
+        - AttributeName: ProcessedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: OrderId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: MessageGroup-ProcessedAt-index
+          KeySchema:
+            - AttributeName: MessageGroupId
+              KeyType: HASH
+            - AttributeName: ProcessedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - CreateHighVolumeConfiguration
+            - !Ref AWS::NoValue
+            - ReadCapacityUnits: 5
+              WriteCapacityUnits: 5
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-orders"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Order state management and processing tracking"
+
+  # ================================
+  # SNS Topic for Alerting
+  # ================================
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-alerts"
+      DisplayName: "FIFO Message Processing Alerts"
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-alerts"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Operational alerting for message processing system"
+
+  # SNS Topic Policy for secure access
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref AlertTopic
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudWatchAlarmsToPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+          - Sid: AllowLambdaFunctionsToPublish
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt PoisonHandlerRole.Arn
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+
+  # Email subscription if provided
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateEmailSubscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ================================
+  # SQS Dead Letter Queue (FIFO)
+  # ================================
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-dlq.fifo"
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      VisibilityTimeoutSeconds: !Ref VisibilityTimeoutSeconds
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-dlq"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Dead letter queue for failed message processing"
+
+  # ================================
+  # SQS Main FIFO Queue
+  # ================================
+  MainQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-main-queue.fifo"
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      DeduplicationScope: messageGroup
+      FifoThroughputLimit: perMessageGroupId
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      VisibilityTimeoutSeconds: !Ref VisibilityTimeoutSeconds
+      KmsMasterKeyId: alias/aws/sqs
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-main-queue"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Main FIFO queue for ordered message processing"
+
+  # ================================
+  # IAM Role for Message Processor Lambda
+  # ================================
+  MessageProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-processor-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: MessageProcessingAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt MainQueue.Arn
+                  - !GetAtt DeadLetterQueue.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt OrderTable.Arn
+                  - !Sub "${OrderTable.Arn}/index/*"
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource:
+                  - !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/sqs"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-processor-role"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ================================
+  # IAM Role for Poison Handler Lambda
+  # ================================
+  PoisonHandlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-poison-handler-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PoisonMessageHandlingAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt DeadLetterQueue.Arn
+                  - !GetAtt MainQueue.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub "${MessageArchiveBucket}/*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AlertTopic
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource:
+                  - !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/sqs"
+                  - !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3"
+                  - !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/sns"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-poison-handler-role"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ================================
+  # CloudWatch Log Groups
+  # ================================
+  MessageProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-message-processor"
+      RetentionInDays: !If [CreateHighVolumeConfiguration, 30, 14]
+      KmsKeyId: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/logs"
+
+  PoisonHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-poison-handler"
+      RetentionInDays: !If [CreateHighVolumeConfiguration, 30, 14]
+      KmsKeyId: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/logs"
+
+  MessageReplayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-message-replay"
+      RetentionInDays: !If [CreateHighVolumeConfiguration, 30, 14]
+      KmsKeyId: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/logs"
+
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/s3/${ProjectName}-access-logs"
+      RetentionInDays: 90
+
+  # ================================
+  # Lambda Functions
+  # ================================
+  MessageProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-message-processor"
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt MessageProcessorRole.Arn
+      Timeout: !Ref LambdaTimeout
+      ReservedConcurrencyLimit: !Ref ReservedConcurrency
+      Environment:
+        Variables:
+          ORDER_TABLE_NAME: !Ref OrderTable
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import time
+          import os
+          from datetime import datetime, timedelta
+          from decimal import Decimal
+          import random
+
+          dynamodb = boto3.resource('dynamodb')
+          cloudwatch = boto3.client('cloudwatch')
+
+          def lambda_handler(event, context):
+              """
+              Process messages from SQS FIFO queue with ordering guarantees
+              """
+              processed_count = 0
+              failed_count = 0
+              
+              for record in event['Records']:
+                  try:
+                      # Extract message details
+                      message_body = json.loads(record['body'])
+                      message_group_id = record['attributes']['MessageGroupId']
+                      message_dedup_id = record['attributes']['MessageDeduplicationId']
+                      
+                      print(f"Processing message: {message_dedup_id} in group: {message_group_id}")
+                      
+                      # Process order message
+                      result = process_order_message(message_body, message_group_id, message_dedup_id)
+                      
+                      if result['success']:
+                          processed_count += 1
+                          publish_processing_metrics(message_group_id, 'SUCCESS', result['processing_time'])
+                      else:
+                          failed_count += 1
+                          publish_processing_metrics(message_group_id, 'FAILURE', result['processing_time'])
+                          
+                          # Simulate occasional failures for testing
+                          if should_simulate_failure():
+                              raise Exception(f"Simulated processing failure for message {message_dedup_id}")
+                      
+                  except Exception as e:
+                      failed_count += 1
+                      print(f"Error processing message: {str(e)}")
+                      publish_processing_metrics(
+                          record['attributes'].get('MessageGroupId', 'unknown'), 
+                          'ERROR', 
+                          0
+                      )
+                      raise
+              
+              # Publish batch metrics
+              cloudwatch.put_metric_data(
+                  Namespace='FIFO/MessageProcessing',
+                  MetricData=[
+                      {
+                          'MetricName': 'ProcessedMessages',
+                          'Value': processed_count,
+                          'Unit': 'Count',
+                          'Dimensions': [{'Name': 'Environment', 'Value': os.environ['ENVIRONMENT']}]
+                      },
+                      {
+                          'MetricName': 'FailedMessages', 
+                          'Value': failed_count,
+                          'Unit': 'Count',
+                          'Dimensions': [{'Name': 'Environment', 'Value': os.environ['ENVIRONMENT']}]
+                      }
+                  ]
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'processedCount': processed_count,
+                  'failedCount': failed_count
+              }
+
+          def process_order_message(message_body, message_group_id, message_dedup_id):
+              """Process individual order message with idempotency"""
+              start_time = time.time()
+              
+              try:
+                  # Extract order information
+                  order_id = message_body.get('orderId')
+                  order_type = message_body.get('orderType')
+                  amount = message_body.get('amount')
+                  timestamp = message_body.get('timestamp')
+                  
+                  if not all([order_id, order_type, amount]):
+                      raise ValueError("Missing required order fields")
+                  
+                  table = dynamodb.Table(os.environ['ORDER_TABLE_NAME'])
+                  
+                  # Check for duplicate processing (idempotency)
+                  try:
+                      existing_item = table.get_item(Key={'OrderId': order_id})
+                      if 'Item' in existing_item:
+                          if existing_item['Item'].get('MessageDeduplicationId') == message_dedup_id:
+                              print(f"Message {message_dedup_id} already processed for order {order_id}")
+                              return {'success': True, 'processing_time': time.time() - start_time, 'duplicate': True}
+                  except Exception as e:
+                      print(f"Error checking for duplicates: {str(e)}")
+                  
+                  # Validate order amount
+                  if Decimal(str(amount)) < 0:
+                      raise ValueError(f"Invalid order amount: {amount}")
+                  
+                  # Simulate processing time
+                  time.sleep(random.uniform(0.1, 0.5))
+                  
+                  # Store order state
+                  table.put_item(
+                      Item={
+                          'OrderId': order_id,
+                          'OrderType': order_type,
+                          'Amount': Decimal(str(amount)),
+                          'MessageGroupId': message_group_id,
+                          'MessageDeduplicationId': message_dedup_id,
+                          'Status': 'PROCESSED',
+                          'ProcessedAt': datetime.utcnow().isoformat(),
+                          'ProcessingTimeMs': int((time.time() - start_time) * 1000),
+                          'OriginalTimestamp': timestamp
+                      }
+                  )
+                  
+                  return {'success': True, 'processing_time': time.time() - start_time, 'duplicate': False}
+                  
+              except Exception as e:
+                  print(f"Error processing order {message_body.get('orderId', 'unknown')}: {str(e)}")
+                  return {'success': False, 'processing_time': time.time() - start_time, 'error': str(e)}
+
+          def publish_processing_metrics(message_group_id, status, processing_time):
+              """Publish detailed processing metrics to CloudWatch"""
+              try:
+                  cloudwatch.put_metric_data(
+                      Namespace='FIFO/MessageProcessing',
+                      MetricData=[
+                          {
+                              'MetricName': 'ProcessingTime',
+                              'Value': processing_time * 1000,
+                              'Unit': 'Milliseconds',
+                              'Dimensions': [
+                                  {'Name': 'MessageGroup', 'Value': message_group_id},
+                                  {'Name': 'Status', 'Value': status}
+                              ]
+                          },
+                          {
+                              'MetricName': 'MessageStatus',
+                              'Value': 1,
+                              'Unit': 'Count',
+                              'Dimensions': [
+                                  {'Name': 'MessageGroup', 'Value': message_group_id},
+                                  {'Name': 'Status', 'Value': status}
+                              ]
+                          }
+                      ]
+                  )
+              except Exception as e:
+                  print(f"Error publishing metrics: {str(e)}")
+
+          def should_simulate_failure():
+              """Simulate occasional processing failures for testing"""
+              return random.random() < 0.1
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-message-processor"
+        - Key: Environment
+          Value: !Ref Environment
+
+  PoisonHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-poison-handler"
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt PoisonHandlerRole.Arn
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          ARCHIVE_BUCKET_NAME: !Ref MessageArchiveBucket
+          SNS_TOPIC_ARN: !Ref AlertTopic
+          MAIN_QUEUE_URL: !Ref MainQueue
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import time
+          import os
+          from datetime import datetime
+          import uuid
+
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+          sqs = boto3.client('sqs')
+          cloudwatch = boto3.client('cloudwatch')
+
+          def lambda_handler(event, context):
+              """Handle poison messages from dead letter queue"""
+              processed_count = 0
+              
+              for record in event['Records']:
+                  try:
+                      message_body = json.loads(record['body'])
+                      message_group_id = record['attributes'].get('MessageGroupId', 'unknown')
+                      message_dedup_id = record['attributes'].get('MessageDeduplicationId', str(uuid.uuid4()))
+                      
+                      print(f"Processing poison message: {message_dedup_id} in group: {message_group_id}")
+                      
+                      # Analyze the poison message
+                      analysis_result = analyze_poison_message(message_body, record)
+                      
+                      # Archive the poison message to S3
+                      archive_key = archive_poison_message(message_body, record, analysis_result)
+                      
+                      # Send alert for critical poison messages
+                      if analysis_result['severity'] == 'CRITICAL':
+                          send_poison_message_alert(message_body, analysis_result, archive_key)
+                      
+                      # Attempt automated recovery if possible
+                      if analysis_result['recoverable']:
+                          recovery_result = attempt_message_recovery(message_body, message_group_id)
+                          if recovery_result['success']:
+                              print(f"Successfully recovered message {message_dedup_id}")
+                      
+                      processed_count += 1
+                      publish_poison_metrics(message_group_id, analysis_result)
+                      
+                  except Exception as e:
+                      print(f"Error handling poison message: {str(e)}")
+              
+              return {'statusCode': 200, 'processedCount': processed_count}
+
+          def analyze_poison_message(message_body, record):
+              """Analyze poison message to determine cause and recovery options"""
+              analysis = {
+                  'severity': 'MEDIUM',
+                  'recoverable': False,
+                  'failure_reason': 'unknown',
+                  'analysis_timestamp': datetime.utcnow().isoformat()
+              }
+              
+              try:
+                  # Check for common failure patterns
+                  required_fields = ['orderId', 'orderType', 'amount']
+                  missing_fields = [field for field in required_fields if field not in message_body]
+                  
+                  if missing_fields:
+                      analysis['failure_reason'] = f"missing_fields: {', '.join(missing_fields)}"
+                      analysis['severity'] = 'HIGH'
+                      analysis['recoverable'] = False
+                  elif 'amount' in message_body:
+                      try:
+                          amount = float(message_body['amount'])
+                          if amount < 0:
+                              analysis['failure_reason'] = 'negative_amount'
+                              analysis['severity'] = 'MEDIUM'
+                              analysis['recoverable'] = True
+                      except (ValueError, TypeError):
+                          analysis['failure_reason'] = 'invalid_amount_format'
+                          analysis['severity'] = 'HIGH'
+                          analysis['recoverable'] = False
+                  
+                  # Check for excessive retries
+                  approximate_receive_count = int(record.get('attributes', {}).get('ApproximateReceiveCount', 0))
+                  if approximate_receive_count > 5:
+                      analysis['severity'] = 'CRITICAL'
+                      analysis['failure_reason'] = f'excessive_retries: {approximate_receive_count}'
+                  
+              except Exception as e:
+                  analysis['failure_reason'] = f'analysis_error: {str(e)}'
+                  analysis['severity'] = 'CRITICAL'
+              
+              return analysis
+
+          def archive_poison_message(message_body, record, analysis):
+              """Archive poison message to S3 for investigation"""
+              try:
+                  timestamp = datetime.utcnow()
+                  archive_key = f"poison-messages/{timestamp.strftime('%Y/%m/%d')}/{timestamp.strftime('%H%M%S')}-{uuid.uuid4()}.json"
+                  
+                  archive_data = {
+                      'originalMessage': message_body,
+                      'sqsRecord': {
+                          'messageId': record.get('messageId'),
+                          'receiptHandle': record.get('receiptHandle'),
+                          'messageAttributes': record.get('messageAttributes', {}),
+                          'attributes': record.get('attributes', {})
+                      },
+                      'analysis': analysis,
+                      'archivedAt': timestamp.isoformat()
+                  }
+                  
+                  s3.put_object(
+                      Bucket=os.environ['ARCHIVE_BUCKET_NAME'],
+                      Key=archive_key,
+                      Body=json.dumps(archive_data, indent=2),
+                      ContentType='application/json',
+                      Metadata={
+                          'severity': analysis['severity'],
+                          'failure-reason': analysis['failure_reason'][:256],
+                          'message-group-id': record['attributes'].get('MessageGroupId', 'unknown')
+                      }
+                  )
+                  
+                  print(f"Archived poison message to: s3://{os.environ['ARCHIVE_BUCKET_NAME']}/{archive_key}")
+                  return archive_key
+                  
+              except Exception as e:
+                  print(f"Error archiving poison message: {str(e)}")
+                  return None
+
+          def send_poison_message_alert(message_body, analysis, archive_key):
+              """Send SNS alert for critical poison messages"""
+              try:
+                  alert_message = {
+                      'severity': analysis['severity'],
+                      'failure_reason': analysis['failure_reason'],
+                      'order_id': message_body.get('orderId', 'unknown'),
+                      'archive_location': f"s3://{os.environ['ARCHIVE_BUCKET_NAME']}/{archive_key}" if archive_key else 'failed_to_archive',
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'requires_investigation': True
+                  }
+                  
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=f"CRITICAL: Poison Message Detected - {analysis['failure_reason']}",
+                      Message=json.dumps(alert_message, indent=2)
+                  )
+                  
+              except Exception as e:
+                  print(f"Error sending poison message alert: {str(e)}")
+
+          def attempt_message_recovery(message_body, message_group_id):
+              """Attempt automated recovery for recoverable poison messages"""
+              try:
+                  # Example recovery: fix negative amounts
+                  if 'amount' in message_body and float(message_body['amount']) < 0:
+                      corrected_message = message_body.copy()
+                      corrected_message['amount'] = abs(float(message_body['amount']))
+                      corrected_message['recovery_applied'] = 'negative_amount_correction'
+                      corrected_message['original_amount'] = message_body['amount']
+                      
+                      response = sqs.send_message(
+                          QueueUrl=os.environ['MAIN_QUEUE_URL'],
+                          MessageBody=json.dumps(corrected_message),
+                          MessageGroupId=message_group_id,
+                          MessageDeduplicationId=f"recovered-{uuid.uuid4()}"
+                      )
+                      
+                      return {'success': True, 'recovery_type': 'negative_amount_correction', 'new_message_id': response['MessageId']}
+                  
+                  return {'success': False, 'reason': 'no_recovery_strategy'}
+                  
+              except Exception as e:
+                  print(f"Error attempting message recovery: {str(e)}")
+                  return {'success': False, 'reason': str(e)}
+
+          def publish_poison_metrics(message_group_id, analysis):
+              """Publish poison message metrics to CloudWatch"""
+              try:
+                  cloudwatch.put_metric_data(
+                      Namespace='FIFO/PoisonMessages',
+                      MetricData=[
+                          {
+                              'MetricName': 'PoisonMessageCount',
+                              'Value': 1,
+                              'Unit': 'Count',
+                              'Dimensions': [
+                                  {'Name': 'MessageGroup', 'Value': message_group_id},
+                                  {'Name': 'Severity', 'Value': analysis['severity']},
+                                  {'Name': 'FailureReason', 'Value': analysis['failure_reason'][:255]}
+                              ]
+                          }
+                      ]
+                  )
+              except Exception as e:
+                  print(f"Error publishing poison metrics: {str(e)}")
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-poison-handler"
+        - Key: Environment
+          Value: !Ref Environment
+
+  MessageReplayFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-message-replay"
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt PoisonHandlerRole.Arn
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          ARCHIVE_BUCKET_NAME: !Ref MessageArchiveBucket
+          MAIN_QUEUE_URL: !Ref MainQueue
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          import uuid
+
+          s3 = boto3.client('s3')
+          sqs = boto3.client('sqs')
+
+          def lambda_handler(event, context):
+              """Replay messages from S3 archive back to processing queue"""
+              try:
+                  replay_request = event.get('replay_request', {})
+                  start_time = replay_request.get('start_time')
+                  end_time = replay_request.get('end_time', datetime.utcnow().isoformat())
+                  message_group_filter = replay_request.get('message_group_id')
+                  dry_run = replay_request.get('dry_run', True)
+                  
+                  if not start_time:
+                      start_time = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+                  
+                  print(f"Replaying messages from {start_time} to {end_time}")
+                  print(f"Dry run mode: {dry_run}")
+                  
+                  archived_messages = list_archived_messages(start_time, end_time, message_group_filter)
+                  
+                  replay_results = {
+                      'total_found': len(archived_messages),
+                      'replayed': 0,
+                      'skipped': 0,
+                      'errors': 0,
+                      'dry_run': dry_run
+                  }
+                  
+                  for message_info in archived_messages:
+                      try:
+                          if should_replay_message(message_info):
+                              if not dry_run:
+                                  replay_result = replay_single_message(message_info)
+                                  if replay_result['success']:
+                                      replay_results['replayed'] += 1
+                                  else:
+                                      replay_results['errors'] += 1
+                              else:
+                                  replay_results['replayed'] += 1
+                                  print(f"DRY RUN: Would replay message {message_info['key']}")
+                          else:
+                              replay_results['skipped'] += 1
+                      except Exception as e:
+                          print(f"Error processing archived message {message_info['key']}: {str(e)}")
+                          replay_results['errors'] += 1
+                  
+                  return {'statusCode': 200, 'body': json.dumps(replay_results)}
+                  
+              except Exception as e:
+                  print(f"Error in message replay: {str(e)}")
+                  return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
+
+          def list_archived_messages(start_time, end_time, message_group_filter=None):
+              """List archived messages within time range"""
+              archived_messages = []
+              
+              try:
+                  start_dt = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+                  end_dt = datetime.fromisoformat(end_time.replace('Z', '+00:00'))
+                  
+                  paginator = s3.get_paginator('list_objects_v2')
+                  pages = paginator.paginate(
+                      Bucket=os.environ['ARCHIVE_BUCKET_NAME'],
+                      Prefix='poison-messages/'
+                  )
+                  
+                  for page in pages:
+                      for obj in page.get('Contents', []):
+                          try:
+                              key_parts = obj['Key'].split('/')
+                              if len(key_parts) >= 5:
+                                  date_part = '/'.join(key_parts[1:4])
+                                  filename = key_parts[4]
+                                  time_part = filename.split('-')[0]
+                                  
+                                  timestamp_str = f"{date_part.replace('/', '')}T{time_part[:2]}:{time_part[2:4]}:{time_part[4:6]}"
+                                  msg_dt = datetime.strptime(timestamp_str, '%Y%m%dT%H:%M:%S')
+                                  
+                                  if start_dt <= msg_dt <= end_dt:
+                                      message_info = {
+                                          'key': obj['Key'],
+                                          'timestamp': msg_dt,
+                                          'size': obj['Size'],
+                                          'metadata': obj.get('Metadata', {})
+                                      }
+                                      
+                                      if not message_group_filter or obj.get('Metadata', {}).get('message-group-id') == message_group_filter:
+                                          archived_messages.append(message_info)
+                          
+                          except Exception as e:
+                              print(f"Error parsing object key {obj['Key']}: {str(e)}")
+                              continue
+                  
+                  return archived_messages
+                  
+              except Exception as e:
+                  print(f"Error listing archived messages: {str(e)}")
+                  return []
+
+          def should_replay_message(message_info):
+              """Determine if a message should be replayed"""
+              try:
+                  response = s3.get_object(
+                      Bucket=os.environ['ARCHIVE_BUCKET_NAME'],
+                      Key=message_info['key']
+                  )
+                  
+                  message_data = json.loads(response['Body'].read())
+                  analysis = message_data.get('analysis', {})
+                  
+                  return analysis.get('recoverable', False) or analysis.get('severity') in ['MEDIUM', 'LOW']
+                  
+              except Exception as e:
+                  print(f"Error analyzing message for replay: {str(e)}")
+                  return False
+
+          def replay_single_message(message_info):
+              """Replay a single message back to the processing queue"""
+              try:
+                  response = s3.get_object(
+                      Bucket=os.environ['ARCHIVE_BUCKET_NAME'],
+                      Key=message_info['key']
+                  )
+                  
+                  message_data = json.loads(response['Body'].read())
+                  original_message = message_data['originalMessage']
+                  
+                  replay_message = original_message.copy()
+                  replay_message['replayed'] = True
+                  replay_message['replay_timestamp'] = datetime.utcnow().isoformat()
+                  replay_message['original_archive_key'] = message_info['key']
+                  
+                  message_group_id = message_info.get('metadata', {}).get('message-group-id', 'replay-group')
+                  
+                  response = sqs.send_message(
+                      QueueUrl=os.environ['MAIN_QUEUE_URL'],
+                      MessageBody=json.dumps(replay_message),
+                      MessageGroupId=message_group_id,
+                      MessageDeduplicationId=f"replay-{uuid.uuid4()}"
+                  )
+                  
+                  return {'success': True, 'message_id': response['MessageId']}
+                  
+              except Exception as e:
+                  print(f"Error replaying message {message_info['key']}: {str(e)}")
+                  return {'success': False, 'error': str(e)}
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-message-replay"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ================================
+  # Event Source Mappings
+  # ================================
+  MainQueueEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt MainQueue.Arn
+      FunctionName: !Ref MessageProcessorFunction
+      BatchSize: 1
+      MaximumBatchingWindowInSeconds: 5
+
+  DeadLetterQueueEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt DeadLetterQueue.Arn
+      FunctionName: !Ref PoisonHandlerFunction
+      BatchSize: 5
+      MaximumBatchingWindowInSeconds: 10
+
+  # ================================
+  # CloudWatch Alarms (Conditional)
+  # ================================
+  HighFailureRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub "${ProjectName}-high-failure-rate"
+      AlarmDescription: "High message processing failure rate"
+      MetricName: FailedMessages
+      Namespace: FIFO/MessageProcessing
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-high-failure-rate"
+        - Key: Environment
+          Value: !Ref Environment
+
+  PoisonMessagesDetectedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub "${ProjectName}-poison-messages-detected"
+      AlarmDescription: "Poison messages detected in DLQ"
+      MetricName: PoisonMessageCount
+      Namespace: FIFO/PoisonMessages
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-poison-messages-detected"
+        - Key: Environment
+          Value: !Ref Environment
+
+  HighProcessingLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub "${ProjectName}-high-processing-latency"
+      AlarmDescription: "High message processing latency"
+      MetricName: ProcessingTime
+      Namespace: FIFO/MessageProcessing
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5000
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-high-processing-latency"
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  MainQueueUrl:
+    Description: URL of the main FIFO queue for ordered message processing
+    Value: !Ref MainQueue
+    Export:
+      Name: !Sub "${ProjectName}-main-queue-url"
+
+  MainQueueArn:
+    Description: ARN of the main FIFO queue
+    Value: !GetAtt MainQueue.Arn
+    Export:
+      Name: !Sub "${ProjectName}-main-queue-arn"
+
+  DeadLetterQueueUrl:
+    Description: URL of the dead letter queue for failed messages
+    Value: !Ref DeadLetterQueue
+    Export:
+      Name: !Sub "${ProjectName}-dlq-url"
+
+  DeadLetterQueueArn:
+    Description: ARN of the dead letter queue
+    Value: !GetAtt DeadLetterQueue.Arn
+    Export:
+      Name: !Sub "${ProjectName}-dlq-arn"
+
+  OrderTableName:
+    Description: Name of the DynamoDB table for order state management
+    Value: !Ref OrderTable
+    Export:
+      Name: !Sub "${ProjectName}-order-table-name"
+
+  OrderTableArn:
+    Description: ARN of the DynamoDB table
+    Value: !GetAtt OrderTable.Arn
+    Export:
+      Name: !Sub "${ProjectName}-order-table-arn"
+
+  MessageArchiveBucketName:
+    Description: Name of the S3 bucket for poison message archiving
+    Value: !Ref MessageArchiveBucket
+    Export:
+      Name: !Sub "${ProjectName}-archive-bucket-name"
+
+  AlertTopicArn:
+    Description: ARN of the SNS topic for operational alerts
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub "${ProjectName}-alert-topic-arn"
+
+  MessageProcessorFunctionName:
+    Description: Name of the message processor Lambda function
+    Value: !Ref MessageProcessorFunction
+    Export:
+      Name: !Sub "${ProjectName}-processor-function-name"
+
+  PoisonHandlerFunctionName:
+    Description: Name of the poison message handler Lambda function
+    Value: !Ref PoisonHandlerFunction
+    Export:
+      Name: !Sub "${ProjectName}-poison-handler-function-name"
+
+  MessageReplayFunctionName:
+    Description: Name of the message replay Lambda function
+    Value: !Ref MessageReplayFunction
+    Export:
+      Name: !Sub "${ProjectName}-replay-function-name"
+
+  ProjectName:
+    Description: Project name used for resource naming
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub "${ProjectName}-project-name"
+
+  Environment:
+    Description: Environment name for this deployment
+    Value: !Ref Environment
+    Export:
+      Name: !Sub "${ProjectName}-environment"
+
+  DeploymentInstructions:
+    Description: Instructions for using this infrastructure
+    Value: !Sub |
+      1. Send messages to queue: ${MainQueue}
+      2. Monitor processing in DynamoDB table: ${OrderTable}
+      3. Check poison messages in S3 bucket: ${MessageArchiveBucket}
+      4. Subscribe to alerts via SNS topic: ${AlertTopic}
+      5. Use message replay function: ${MessageReplayFunction}
+
+  TestingCommands:
+    Description: AWS CLI commands for testing the infrastructure
+    Value: !Sub |
+      # Send a test message:
+      aws sqs send-message --queue-url ${MainQueue} --message-body '{"orderId":"test-001","orderType":"BUY","amount":100,"timestamp":"2025-01-11T12:00:00Z"}' --message-group-id 'test-group' --message-deduplication-id 'test-001'
+      
+      # Check processing results:
+      aws dynamodb scan --table-name ${OrderTable} --max-items 10
+      
+      # Test message replay (dry run):
+      aws lambda invoke --function-name ${MessageReplayFunction} --payload '{"replay_request":{"dry_run":true}}' response.json

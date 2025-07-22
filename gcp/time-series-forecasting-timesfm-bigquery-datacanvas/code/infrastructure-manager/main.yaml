@@ -1,0 +1,648 @@
+# Infrastructure Manager Configuration for Time Series Forecasting with TimesFM and BigQuery DataCanvas
+# This configuration deploys a complete forecasting system using Google's TimesFM foundation model
+# integrated with BigQuery DataCanvas for visual analytics and Cloud Functions for real-time processing
+
+# Define deployment metadata
+terraform:
+  required_version: ">= 1.5"
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.10"
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 5.10"
+
+# Input variables for customization
+variables:
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    validation:
+      condition: "length(var.project_id) > 0"
+      error_message: "Project ID must not be empty."
+
+  region:
+    description: "Google Cloud region for resources"
+    type: string
+    default: "us-central1"
+    validation:
+      condition: "contains(['us-central1', 'us-east1', 'us-west1', 'europe-west1', 'asia-southeast1'], var.region)"
+      error_message: "Region must be a supported BigQuery region."
+
+  dataset_name:
+    description: "BigQuery dataset name for financial forecasting"
+    type: string
+    default: "financial_forecasting"
+    validation:
+      condition: "can(regex('^[a-zA-Z0-9_]+$', var.dataset_name))"
+      error_message: "Dataset name must contain only letters, numbers, and underscores."
+
+  environment:
+    description: "Environment name (dev, staging, prod)"
+    type: string
+    default: "dev"
+    validation:
+      condition: "contains(['dev', 'staging', 'prod'], var.environment)"
+      error_message: "Environment must be dev, staging, or prod."
+
+  enable_monitoring:
+    description: "Enable Cloud Monitoring and alerting"
+    type: bool
+    default: true
+
+  forecast_horizon_days:
+    description: "Number of days to forecast ahead"
+    type: number
+    default: 7
+    validation:
+      condition: "var.forecast_horizon_days > 0 && var.forecast_horizon_days <= 30"
+      error_message: "Forecast horizon must be between 1 and 30 days."
+
+  confidence_level:
+    description: "Confidence level for prediction intervals"
+    type: number
+    default: 0.95
+    validation:
+      condition: "var.confidence_level > 0.5 && var.confidence_level < 1.0"
+      error_message: "Confidence level must be between 0.5 and 1.0."
+
+# Local values for resource naming and configuration
+locals:
+  # Generate unique suffix for resource names to avoid conflicts
+  resource_suffix = "${var.environment}-${substr(uuid(), 0, 8)}"
+  
+  # Common resource labels
+  common_labels = {
+    project     = "timesfm-forecasting"
+    environment = var.environment
+    managed_by  = "infrastructure-manager"
+    component   = "financial-analytics"
+  }
+
+  # Function configuration
+  function_name = "forecast-processor-${local.resource_suffix}"
+  scheduler_job_name = "daily-forecast-${local.resource_suffix}"
+  
+  # Storage configuration
+  bucket_name = "timesfm-data-${var.project_id}-${local.resource_suffix}"
+
+# Enable required Google Cloud APIs
+resources:
+  # Enable BigQuery API
+  bigquery_api:
+    type: "google_project_service"
+    properties:
+      project: "${var.project_id}"
+      service: "bigquery.googleapis.com"
+      disable_on_destroy: false
+
+  # Enable Vertex AI API for TimesFM
+  vertex_ai_api:
+    type: "google_project_service"
+    properties:
+      project: "${var.project_id}"
+      service: "aiplatform.googleapis.com"
+      disable_on_destroy: false
+
+  # Enable Cloud Functions API
+  cloud_functions_api:
+    type: "google_project_service"
+    properties:
+      project: "${var.project_id}"
+      service: "cloudfunctions.googleapis.com"
+      disable_on_destroy: false
+
+  # Enable Cloud Scheduler API
+  cloud_scheduler_api:
+    type: "google_project_service"
+    properties:
+      project: "${var.project_id}"
+      service: "cloudscheduler.googleapis.com"
+      disable_on_destroy: false
+
+  # Enable Pub/Sub API for event-driven processing
+  pubsub_api:
+    type: "google_project_service"
+    properties:
+      project: "${var.project_id}"
+      service: "pubsub.googleapis.com"
+      disable_on_destroy: false
+
+  # Enable Cloud Storage API
+  storage_api:
+    type: "google_project_service"
+    properties:
+      project: "${var.project_id}"
+      service: "storage.googleapis.com"
+      disable_on_destroy: false
+
+  # Enable Cloud Monitoring API
+  monitoring_api:
+    type: "google_project_service"
+    properties:
+      project: "${var.project_id}"
+      service: "monitoring.googleapis.com"
+      disable_on_destroy: false
+
+  # BigQuery dataset for financial time series data
+  financial_dataset:
+    type: "google_bigquery_dataset"
+    properties:
+      dataset_id: "${var.dataset_name}"
+      project: "${var.project_id}"
+      location: "${var.region}"
+      description: "Financial time series forecasting dataset with TimesFM integration"
+      
+      # Configure access controls
+      access:
+        - role: "OWNER"
+          user_by_email: "${data.google_client_openid_userinfo.me.email}"
+        - role: "READER"
+          special_group: "projectReaders"
+        - role: "WRITER"
+          special_group: "projectWriters"
+      
+      # Set data retention and encryption
+      default_table_expiration_ms: 7776000000  # 90 days
+      labels: "${local.common_labels}"
+    depends_on:
+      - bigquery_api
+
+  # Stock prices table with partitioning and clustering for optimal performance
+  stock_prices_table:
+    type: "google_bigquery_table"
+    properties:
+      dataset_id: "${google_bigquery_dataset.financial_dataset.dataset_id}"
+      table_id: "stock_prices"
+      project: "${var.project_id}"
+      description: "Historical stock price data partitioned by date and clustered by symbol"
+      
+      # Define table schema optimized for time series analysis
+      schema: |
+        [
+          {
+            "name": "date",
+            "type": "DATE",
+            "mode": "REQUIRED",
+            "description": "Trading date"
+          },
+          {
+            "name": "symbol",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Stock ticker symbol"
+          },
+          {
+            "name": "close_price",
+            "type": "FLOAT64",
+            "mode": "REQUIRED",
+            "description": "Closing price for the trading day"
+          },
+          {
+            "name": "volume",
+            "type": "INT64",
+            "mode": "NULLABLE",
+            "description": "Trading volume"
+          },
+          {
+            "name": "market_cap",
+            "type": "FLOAT64",
+            "mode": "NULLABLE",
+            "description": "Market capitalization"
+          }
+        ]
+      
+      # Configure partitioning for query performance and cost optimization
+      time_partitioning:
+        type: "DAY"
+        field: "date"
+        require_partition_filter: true
+        expiration_ms: 7776000000  # 90 days
+      
+      # Configure clustering for multi-symbol queries
+      clustering:
+        - "symbol"
+      
+      labels: "${local.common_labels}"
+    depends_on:
+      - financial_dataset
+
+  # TimesFM forecasts table to store prediction results
+  timesfm_forecasts_table:
+    type: "google_bigquery_table"
+    properties:
+      dataset_id: "${google_bigquery_dataset.financial_dataset.dataset_id}"
+      table_id: "timesfm_forecasts"
+      project: "${var.project_id}"
+      description: "TimesFM forecast results with prediction intervals"
+      
+      schema: |
+        [
+          {
+            "name": "symbol",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Stock ticker symbol"
+          },
+          {
+            "name": "forecast_timestamp",
+            "type": "TIMESTAMP",
+            "mode": "REQUIRED",
+            "description": "Forecast timestamp"
+          },
+          {
+            "name": "forecast_value",
+            "type": "FLOAT64",
+            "mode": "REQUIRED",
+            "description": "Predicted value"
+          },
+          {
+            "name": "prediction_interval_lower_bound",
+            "type": "FLOAT64",
+            "mode": "NULLABLE",
+            "description": "Lower bound of prediction interval"
+          },
+          {
+            "name": "prediction_interval_upper_bound",
+            "type": "FLOAT64",
+            "mode": "NULLABLE",
+            "description": "Upper bound of prediction interval"
+          },
+          {
+            "name": "forecast_created_at",
+            "type": "TIMESTAMP",
+            "mode": "REQUIRED",
+            "description": "When the forecast was generated"
+          }
+        ]
+      
+      time_partitioning:
+        type: "DAY"
+        field: "forecast_timestamp"
+        require_partition_filter: false
+      
+      clustering:
+        - "symbol"
+        - "forecast_created_at"
+      
+      labels: "${local.common_labels}"
+    depends_on:
+      - financial_dataset
+
+  # Create analytical views for DataCanvas integration
+  forecast_ready_view:
+    type: "google_bigquery_table"
+    properties:
+      dataset_id: "${google_bigquery_dataset.financial_dataset.dataset_id}"
+      table_id: "forecast_ready_data"
+      project: "${var.project_id}"
+      description: "Forecast-ready data view with calculated metrics for DataCanvas"
+      
+      view:
+        query: |
+          SELECT 
+            date,
+            symbol,
+            close_price,
+            LAG(close_price, 1) OVER (PARTITION BY symbol ORDER BY date) as prev_close,
+            (close_price - LAG(close_price, 1) OVER (PARTITION BY symbol ORDER BY date)) / 
+            LAG(close_price, 1) OVER (PARTITION BY symbol ORDER BY date) * 100 as daily_return,
+            volume,
+            market_cap
+          FROM `${var.project_id}.${var.dataset_name}.stock_prices`
+          WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 6 MONTH)
+          ORDER BY symbol, date
+        use_legacy_sql: false
+      
+      labels: "${local.common_labels}"
+    depends_on:
+      - stock_prices_table
+
+  # Forecast analytics view for performance monitoring
+  forecast_analytics_view:
+    type: "google_bigquery_table"
+    properties:
+      dataset_id: "${google_bigquery_dataset.financial_dataset.dataset_id}"
+      table_id: "forecast_analytics"
+      project: "${var.project_id}"
+      description: "Forecast accuracy analytics for monitoring and alerting"
+      
+      view:
+        query: |
+          WITH actual_vs_forecast AS (
+            SELECT 
+              f.symbol,
+              f.forecast_timestamp as date,
+              f.forecast_value,
+              f.prediction_interval_lower_bound,
+              f.prediction_interval_upper_bound,
+              a.close_price as actual_value,
+              ABS(f.forecast_value - a.close_price) as absolute_error,
+              ABS(f.forecast_value - a.close_price) / a.close_price * 100 as percentage_error
+            FROM `${var.project_id}.${var.dataset_name}.timesfm_forecasts` f
+            LEFT JOIN `${var.project_id}.${var.dataset_name}.stock_prices` a
+              ON f.symbol = a.symbol 
+              AND DATE(f.forecast_timestamp) = a.date
+          )
+          SELECT 
+            symbol,
+            date,
+            forecast_value,
+            actual_value,
+            absolute_error,
+            percentage_error,
+            CASE 
+              WHEN actual_value BETWEEN prediction_interval_lower_bound AND prediction_interval_upper_bound 
+              THEN 'Within Confidence Interval' 
+              ELSE 'Outside Confidence Interval' 
+            END as accuracy_status,
+            prediction_interval_lower_bound,
+            prediction_interval_upper_bound
+          FROM actual_vs_forecast
+        use_legacy_sql: false
+      
+      labels: "${local.common_labels}"
+    depends_on:
+      - timesfm_forecasts_table
+
+  # Cloud Storage bucket for function source code and temporary data
+  function_source_bucket:
+    type: "google_storage_bucket"
+    properties:
+      name: "${local.bucket_name}"
+      project: "${var.project_id}"
+      location: "${var.region}"
+      force_destroy: true
+      
+      # Configure lifecycle management
+      lifecycle_rule:
+        - condition:
+            age: 30
+          action:
+            type: "Delete"
+      
+      # Enable versioning for source code management
+      versioning:
+        enabled: true
+      
+      labels: "${local.common_labels}"
+    depends_on:
+      - storage_api
+
+  # Service account for Cloud Functions with minimal required permissions
+  function_service_account:
+    type: "google_service_account"
+    properties:
+      account_id: "forecast-function-sa-${substr(local.resource_suffix, 0, 10)}"
+      project: "${var.project_id}"
+      display_name: "TimesFM Forecast Function Service Account"
+      description: "Service account for TimesFM forecasting Cloud Function"
+
+  # IAM binding for BigQuery data access
+  function_bigquery_binding:
+    type: "google_project_iam_member"
+    properties:
+      project: "${var.project_id}"
+      role: "roles/bigquery.dataEditor"
+      member: "serviceAccount:${google_service_account.function_service_account.email}"
+    depends_on:
+      - function_service_account
+
+  # IAM binding for Vertex AI access
+  function_vertex_binding:
+    type: "google_project_iam_member"
+    properties:
+      project: "${var.project_id}"
+      role: "roles/aiplatform.user"
+      member: "serviceAccount:${google_service_account.function_service_account.email}"
+    depends_on:
+      - function_service_account
+
+  # Pub/Sub topic for event-driven processing
+  forecast_trigger_topic:
+    type: "google_pubsub_topic"
+    properties:
+      name: "forecast-trigger-${local.resource_suffix}"
+      project: "${var.project_id}"
+      
+      # Configure message retention for reliability
+      message_retention_duration: "86400s"  # 24 hours
+      
+      labels: "${local.common_labels}"
+    depends_on:
+      - pubsub_api
+
+  # Cloud Function for data processing and forecast triggering
+  forecast_function:
+    type: "google_cloudfunctions2_function"
+    properties:
+      name: "${local.function_name}"
+      project: "${var.project_id}"
+      location: "${var.region}"
+      description: "Process financial data and trigger TimesFM forecasting"
+      
+      build_config:
+        runtime: "python311"
+        entry_point: "process_financial_data"
+        source:
+          storage_source:
+            bucket: "${google_storage_bucket.function_source_bucket.name}"
+            object: "function-source.zip"
+      
+      service_config:
+        max_instance_count: 10
+        min_instance_count: 0
+        available_memory: "512Mi"
+        timeout_seconds: 300
+        max_instance_request_concurrency: 1
+        available_cpu: "1"
+        
+        # Configure environment variables
+        environment_variables:
+          PROJECT_ID: "${var.project_id}"
+          DATASET_NAME: "${var.dataset_name}"
+          FORECAST_HORIZON: "${var.forecast_horizon_days}"
+          CONFIDENCE_LEVEL: "${var.confidence_level}"
+        
+        # Use dedicated service account
+        service_account_email: "${google_service_account.function_service_account.email}"
+        
+        # Configure VPC connector if needed for private resources
+        ingress_settings: "ALLOW_ALL"
+        all_traffic_on_latest_revision: true
+      
+      labels: "${local.common_labels}"
+    depends_on:
+      - cloud_functions_api
+      - function_service_account
+      - function_source_bucket
+
+  # Cloud Scheduler job for automated daily forecasting
+  daily_forecast_job:
+    type: "google_cloud_scheduler_job"
+    properties:
+      name: "${local.scheduler_job_name}"
+      project: "${var.project_id}"
+      region: "${var.region}"
+      description: "Daily automated financial forecasting with TimesFM"
+      
+      # Run at 6:00 AM EST daily
+      schedule: "0 6 * * *"
+      time_zone: "America/New_York"
+      
+      # Configure HTTP target
+      http_target:
+        uri: "${google_cloudfunctions2_function.forecast_function.service_config[0].uri}"
+        http_method: "POST"
+        headers:
+          Content-Type: "application/json"
+        body: base64encode(jsonencode({
+          action = "daily_forecast"
+          symbols = ["AAPL", "GOOGL", "MSFT", "AMZN"]
+        }))
+        
+        # Configure authentication
+        oidc_token:
+          service_account_email: "${google_service_account.function_service_account.email}"
+      
+      # Configure retry policy
+      retry_config:
+        retry_count: 3
+        max_retry_duration: "300s"
+        min_backoff_duration: "5s"
+        max_backoff_duration: "60s"
+        max_doublings: 3
+    depends_on:
+      - cloud_scheduler_api
+      - forecast_function
+
+  # Cloud Monitoring workspace (if monitoring enabled)
+  monitoring_workspace:
+    type: "google_monitoring_workspace"
+    count: "${var.enable_monitoring ? 1 : 0}"
+    properties:
+      project: "${var.project_id}"
+    depends_on:
+      - monitoring_api
+
+  # Custom metric for forecast accuracy monitoring
+  forecast_accuracy_metric:
+    type: "google_monitoring_metric_descriptor"
+    count: "${var.enable_monitoring ? 1 : 0}"
+    properties:
+      project: "${var.project_id}"
+      type: "custom.googleapis.com/timesfm/forecast_accuracy"
+      metric_kind: "GAUGE"
+      value_type: "DOUBLE"
+      display_name: "TimesFM Forecast Accuracy"
+      description: "Accuracy rate of TimesFM forecasts within confidence intervals"
+      
+      labels:
+        - key: "symbol"
+          value_type: "STRING"
+          description: "Stock ticker symbol"
+        - key: "forecast_horizon"
+          value_type: "STRING"
+          description: "Forecast horizon in days"
+    depends_on:
+      - monitoring_workspace
+
+  # Alerting policy for forecast accuracy degradation
+  forecast_accuracy_alert:
+    type: "google_monitoring_alert_policy"
+    count: "${var.enable_monitoring ? 1 : 0}"
+    properties:
+      project: "${var.project_id}"
+      display_name: "TimesFM Forecast Accuracy Alert"
+      documentation:
+        content: "Alert when TimesFM forecast accuracy drops below acceptable threshold"
+        mime_type: "text/markdown"
+      
+      conditions:
+        - display_name: "Low forecast accuracy"
+          condition_threshold:
+            filter: 'resource.type="global" AND metric.type="custom.googleapis.com/timesfm/forecast_accuracy"'
+            comparison: "COMPARISON_LESS_THAN"
+            threshold_value: 0.7  # Alert when accuracy drops below 70%
+            duration: "300s"
+            aggregations:
+              alignment_period: "300s"
+              per_series_aligner: "ALIGN_MEAN"
+              cross_series_reducer: "REDUCE_MEAN"
+              group_by_fields:
+                - "metric.label.symbol"
+      
+      # Configure notification channels (email, Slack, etc.)
+      combiner: "OR"
+      enabled: true
+    depends_on:
+      - forecast_accuracy_metric
+
+# Data sources for getting current user information
+data:
+  google_client_openid_userinfo:
+    me: {}
+
+# Output important resource information
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: "${var.project_id}"
+
+  region:
+    description: "Deployment region"
+    value: "${var.region}"
+
+  dataset_id:
+    description: "BigQuery dataset ID for financial data"
+    value: "${google_bigquery_dataset.financial_dataset.dataset_id}"
+
+  dataset_location:
+    description: "BigQuery dataset location"
+    value: "${google_bigquery_dataset.financial_dataset.location}"
+
+  function_name:
+    description: "Cloud Function name for data processing"
+    value: "${google_cloudfunctions2_function.forecast_function.name}"
+
+  function_url:
+    description: "Cloud Function trigger URL"
+    value: "${google_cloudfunctions2_function.forecast_function.service_config[0].uri}"
+
+  scheduler_job_name:
+    description: "Cloud Scheduler job name for automated forecasting"
+    value: "${google_cloud_scheduler_job.daily_forecast_job.name}"
+
+  pubsub_topic:
+    description: "Pub/Sub topic for forecast triggers"
+    value: "${google_pubsub_topic.forecast_trigger_topic.name}"
+
+  storage_bucket:
+    description: "Cloud Storage bucket for function source and data"
+    value: "${google_storage_bucket.function_source_bucket.name}"
+
+  bigquery_console_url:
+    description: "BigQuery console URL for the dataset"
+    value: "https://console.cloud.google.com/bigquery?project=${var.project_id}&ws=!1m4!1m3!3m2!1s${var.project_id}!2s${var.dataset_name}"
+
+  datacanvas_url:
+    description: "BigQuery DataCanvas URL for natural language analytics"
+    value: "https://console.cloud.google.com/bigquery/datacanvas?project=${var.project_id}&dataset=${var.dataset_name}"
+
+  monitoring_dashboard_url:
+    description: "Cloud Monitoring dashboard URL"
+    value: "https://console.cloud.google.com/monitoring/dashboards?project=${var.project_id}"
+    condition: "${var.enable_monitoring}"
+
+  service_account_email:
+    description: "Service account email for the Cloud Function"
+    value: "${google_service_account.function_service_account.email}"
+
+  forecast_horizon_days:
+    description: "Configured forecast horizon in days"
+    value: "${var.forecast_horizon_days}"
+
+  confidence_level:
+    description: "Configured confidence level for predictions"
+    value: "${var.confidence_level}"

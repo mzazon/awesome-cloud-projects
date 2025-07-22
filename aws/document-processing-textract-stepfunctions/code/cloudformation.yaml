@@ -1,0 +1,883 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Automated Document Processing Pipeline with Amazon Textract and Step Functions - Complete serverless solution for intelligent document extraction and workflow orchestration'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'textract-pipeline'
+    Description: 'Base name for all resources in this stack'
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+    MinLength: 3
+    MaxLength: 50
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment for resource naming and configuration'
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: 'CloudWatch log retention period in days'
+
+  MonitoringEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable CloudWatch monitoring dashboard'
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for pipeline notifications (optional)'
+    AllowedPattern: '^$|^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+Conditions:
+  CreateMonitoring: !Equals [!Ref MonitoringEnabled, 'true']
+  CreateNotifications: !Not [!Equals [!Ref NotificationEmail, '']]
+
+Resources:
+  # S3 Buckets for document storage
+  InputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-input-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt S3TriggerFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .pdf
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt S3TriggerFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .png
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt S3TriggerFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .jpg
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt S3TriggerFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .jpeg
+
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-output-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  ArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-archive-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            TransitionInDays: 30
+            StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            TransitionInDays: 90
+            StorageClass: GLACIER
+
+  # IAM Role for Step Functions
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-stepfunctions-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSStepFunctionsRole
+      Policies:
+        - PolicyName: StepFunctionsExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt DocumentProcessorFunction.Arn
+                  - !GetAtt ResultsProcessorFunction.Arn
+              - Effect: Allow
+                Action:
+                  - textract:StartDocumentAnalysis
+                  - textract:StartDocumentTextDetection
+                  - textract:GetDocumentAnalysis
+                  - textract:GetDocumentTextDetection
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub '${InputBucket}/*'
+                  - !Sub '${OutputBucket}/*'
+                  - !Sub '${ArchiveBucket}/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - !If
+                - CreateNotifications
+                - Effect: Allow
+                  Action:
+                    - sns:Publish
+                  Resource: !Ref NotificationTopic
+                - !Ref AWS::NoValue
+
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - textract:StartDocumentAnalysis
+                  - textract:StartDocumentTextDetection
+                  - textract:GetDocumentAnalysis
+                  - textract:GetDocumentTextDetection
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:CopyObject
+                Resource:
+                  - !Sub '${InputBucket}/*'
+                  - !Sub '${OutputBucket}/*'
+                  - !Sub '${ArchiveBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Ref InputBucket
+                  - !Ref OutputBucket
+                  - !Ref ArchiveBucket
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref DocumentProcessingStateMachine
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+  # Lambda Function for Document Processing
+  DocumentProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-document-processor'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Description: 'Initiates Textract document processing for uploaded documents'
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from urllib.parse import unquote_plus
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+          
+          textract = boto3.client('textract')
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Extract S3 information from event
+                  bucket = event['bucket']
+                  key = unquote_plus(event['key'])
+                  
+                  logger.info(f"Processing document: s3://{bucket}/{key}")
+                  
+                  # Determine document type and processing method
+                  file_extension = key.lower().split('.')[-1]
+                  
+                  # Configure Textract parameters based on document type
+                  if file_extension in ['pdf', 'png', 'jpg', 'jpeg', 'tiff']:
+                      # Start document analysis for complex documents
+                      response = textract.start_document_analysis(
+                          DocumentLocation={
+                              'S3Object': {
+                                  'Bucket': bucket,
+                                  'Name': key
+                              }
+                          },
+                          FeatureTypes=['TABLES', 'FORMS', 'SIGNATURES']
+                      )
+                      
+                      job_id = response['JobId']
+                      
+                      return {
+                          'statusCode': 200,
+                          'jobId': job_id,
+                          'jobType': 'ANALYSIS',
+                          'bucket': bucket,
+                          'key': key,
+                          'documentType': file_extension
+                      }
+                  else:
+                      raise ValueError(f"Unsupported file type: {file_extension}")
+                      
+              except Exception as e:
+                  logger.error(f"Error processing document: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'error': str(e)
+                  }
+
+  # Lambda Function for Results Processing
+  ResultsProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-results-processor'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Description: 'Processes and formats Textract extraction results'
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+          
+          textract = boto3.client('textract')
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              try:
+                  job_id = event['jobId']
+                  job_type = event['jobType']
+                  bucket = event['bucket']
+                  key = event['key']
+                  
+                  logger.info(f"Processing results for job: {job_id}")
+                  
+                  # Get Textract results based on job type
+                  if job_type == 'ANALYSIS':
+                      response = textract.get_document_analysis(JobId=job_id)
+                  else:
+                      response = textract.get_document_text_detection(JobId=job_id)
+                  
+                  # Check job status
+                  job_status = response['JobStatus']
+                  
+                  if job_status == 'SUCCEEDED':
+                      # Process and structure the results
+                      processed_data = {
+                          'timestamp': datetime.utcnow().isoformat(),
+                          'sourceDocument': f"s3://{bucket}/{key}",
+                          'jobId': job_id,
+                          'jobType': job_type,
+                          'documentMetadata': response.get('DocumentMetadata', {}),
+                          'extractedData': {
+                              'text': [],
+                              'tables': [],
+                              'forms': []
+                          }
+                      }
+                      
+                      # Parse blocks and extract meaningful data
+                      blocks = response.get('Blocks', [])
+                      
+                      for block in blocks:
+                          if block['BlockType'] == 'LINE':
+                              processed_data['extractedData']['text'].append({
+                                  'text': block.get('Text', ''),
+                                  'confidence': block.get('Confidence', 0),
+                                  'geometry': block.get('Geometry', {})
+                              })
+                          elif block['BlockType'] == 'TABLE':
+                              # Process table data with enhanced metadata
+                              table_data = {
+                                  'id': block.get('Id', ''),
+                                  'confidence': block.get('Confidence', 0),
+                                  'geometry': block.get('Geometry', {}),
+                                  'rowCount': block.get('RowCount', 0),
+                                  'columnCount': block.get('ColumnCount', 0)
+                              }
+                              processed_data['extractedData']['tables'].append(table_data)
+                          elif block['BlockType'] == 'KEY_VALUE_SET':
+                              # Process form data
+                              if block.get('EntityTypes') and 'KEY' in block['EntityTypes']:
+                                  form_data = {
+                                      'id': block.get('Id', ''),
+                                      'confidence': block.get('Confidence', 0),
+                                      'geometry': block.get('Geometry', {}),
+                                      'text': block.get('Text', '')
+                                  }
+                                  processed_data['extractedData']['forms'].append(form_data)
+                      
+                      # Save processed results to S3 output bucket
+                      output_key = f"processed/{key.replace('.', '_')}_results.json"
+                      
+                      s3.put_object(
+                          Bucket=event.get('outputBucket', bucket),
+                          Key=output_key,
+                          Body=json.dumps(processed_data, indent=2),
+                          ContentType='application/json',
+                          Metadata={
+                              'source-bucket': bucket,
+                              'source-key': key,
+                              'processing-timestamp': datetime.utcnow().isoformat()
+                          }
+                      )
+                      
+                      # Archive original document with date-based organization
+                      if 'archiveBucket' in event:
+                          archive_key = f"archive/{datetime.utcnow().strftime('%Y/%m/%d')}/{key}"
+                          s3.copy_object(
+                              CopySource={'Bucket': bucket, 'Key': key},
+                              Bucket=event['archiveBucket'],
+                              Key=archive_key
+                          )
+                      
+                      return {
+                          'statusCode': 200,
+                          'status': 'COMPLETED',
+                          'outputLocation': f"s3://{event.get('outputBucket', bucket)}/{output_key}",
+                          'extractedItems': {
+                              'textLines': len(processed_data['extractedData']['text']),
+                              'tables': len(processed_data['extractedData']['tables']),
+                              'forms': len(processed_data['extractedData']['forms'])
+                          }
+                      }
+                      
+                  elif job_status == 'FAILED':
+                      logger.error(f"Textract job failed: {job_id}")
+                      return {
+                          'statusCode': 500,
+                          'status': 'FAILED',
+                          'error': 'Textract job failed'
+                      }
+                  else:
+                      # Job still in progress
+                      return {
+                          'statusCode': 202,
+                          'status': 'IN_PROGRESS',
+                          'message': f"Job status: {job_status}"
+                      }
+                      
+              except Exception as e:
+                  logger.error(f"Error processing results: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'status': 'ERROR',
+                      'error': str(e)
+                  }
+
+  # Lambda Function for S3 Event Handling
+  S3TriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-s3-trigger'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Description: 'Triggers document processing pipeline from S3 events'
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref DocumentProcessingStateMachine
+          LOG_LEVEL: INFO
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from urllib.parse import unquote_plus
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+          
+          stepfunctions = boto3.client('stepfunctions')
+          
+          def lambda_handler(event, context):
+              try:
+                  state_machine_arn = os.environ['STATE_MACHINE_ARN']
+                  
+                  # Process S3 event records
+                  for record in event['Records']:
+                      bucket = record['s3']['bucket']['name']
+                      key = unquote_plus(record['s3']['object']['key'])
+                      
+                      logger.info(f"New document uploaded: s3://{bucket}/{key}")
+                      
+                      # Start Step Functions execution
+                      execution_input = {
+                          'bucket': bucket,
+                          'key': key,
+                          'eventTime': record['eventTime']
+                      }
+                      
+                      execution_name = f"doc-processing-{key.replace('/', '-').replace('.', '-')}-{context.aws_request_id[:8]}"
+                      
+                      response = stepfunctions.start_execution(
+                          stateMachineArn=state_machine_arn,
+                          name=execution_name,
+                          input=json.dumps(execution_input)
+                      )
+                      
+                      logger.info(f"Started execution: {response['executionArn']}")
+                      
+                  return {
+                      'statusCode': 200,
+                      'message': f"Processed {len(event['Records'])} document(s)"
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing S3 event: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'error': str(e)
+                  }
+
+  # Lambda Permission for S3 to invoke the trigger function
+  S3TriggerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref S3TriggerFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt InputBucket.Arn
+
+  # Step Functions State Machine
+  DocumentProcessingStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-${Environment}-document-pipeline'
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Document Processing Pipeline with Amazon Textract",
+          "StartAt": "ProcessDocument",
+          "States": {
+            "ProcessDocument": {
+              "Type": "Task",
+              "Resource": "${DocumentProcessorFunction.Arn}",
+              "Parameters": {
+                "bucket.$": "$.bucket",
+                "key.$": "$.key"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "ProcessingFailed"
+                }
+              ],
+              "Next": "WaitForTextractCompletion"
+            },
+            "WaitForTextractCompletion": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "CheckTextractStatus"
+            },
+            "CheckTextractStatus": {
+              "Type": "Task",
+              "Resource": "${ResultsProcessorFunction.Arn}",
+              "Parameters": {
+                "jobId.$": "$.jobId",
+                "jobType.$": "$.jobType",
+                "bucket.$": "$.bucket",
+                "key.$": "$.key",
+                "outputBucket": "${OutputBucket}",
+                "archiveBucket": "${ArchiveBucket}"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 10,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Next": "EvaluateStatus"
+            },
+            "EvaluateStatus": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.status",
+                  "StringEquals": "COMPLETED",
+                  "Next": "ProcessingCompleted"
+                },
+                {
+                  "Variable": "$.status",
+                  "StringEquals": "IN_PROGRESS",
+                  "Next": "WaitForTextractCompletion"
+                },
+                {
+                  "Variable": "$.status",
+                  "StringEquals": "FAILED",
+                  "Next": "ProcessingFailed"
+                }
+              ],
+              "Default": "ProcessingFailed"
+            },
+            "ProcessingCompleted": {
+              "Type": "Succeed",
+              "Result": {
+                "message": "Document processing completed successfully"
+              }
+            },
+            "ProcessingFailed": {
+              "Type": "Fail",
+              "Cause": "Document processing failed"
+            }
+          }
+        }
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StepFunctionsLogGroup.Arn
+
+  # CloudWatch Log Groups
+  DocumentProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-document-processor'
+      RetentionInDays: !Ref LogRetentionDays
+
+  ResultsProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-results-processor'
+      RetentionInDays: !Ref LogRetentionDays
+
+  S3TriggerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-s3-trigger'
+      RetentionInDays: !Ref LogRetentionDays
+
+  StepFunctionsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/stepfunctions/${ProjectName}-${Environment}-document-pipeline'
+      RetentionInDays: 30
+
+  # SNS Topic for Notifications (optional)
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateNotifications
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-notifications'
+      DisplayName: 'Document Processing Pipeline Notifications'
+
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateNotifications
+    Properties:
+      Protocol: email
+      TopicArn: !Ref NotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Dashboard (optional)
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateMonitoring
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}-pipeline-monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${DocumentProcessorFunction}"],
+                  [".", "Duration", ".", "."],
+                  [".", "Errors", ".", "."],
+                  [".", "Throttles", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Document Processor Lambda Metrics",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${ResultsProcessorFunction}"],
+                  [".", "Duration", ".", "."],
+                  [".", "Errors", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Results Processor Lambda Metrics",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/States", "ExecutionsStarted", "StateMachineArn", "${DocumentProcessingStateMachine}"],
+                  [".", "ExecutionsSucceeded", ".", "."],
+                  [".", "ExecutionsFailed", ".", "."],
+                  [".", "ExecutionTime", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Step Functions Pipeline Metrics",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/S3", "NumberOfObjects", "BucketName", "${InputBucket}", "StorageType", "AllStorageTypes"],
+                  [".", "BucketSizeBytes", ".", ".", ".", "."],
+                  [".", "NumberOfObjects", ".", "${OutputBucket}", ".", "."],
+                  [".", "BucketSizeBytes", ".", ".", ".", "."]
+                ],
+                "period": 86400,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "S3 Storage Metrics",
+                "view": "timeSeries"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms for monitoring
+  DocumentProcessorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-document-processor-errors'
+      AlarmDescription: 'Document processor function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DocumentProcessorFunction
+      AlarmActions:
+        - !If [CreateNotifications, !Ref NotificationTopic, !Ref AWS::NoValue]
+
+  StepFunctionsFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-stepfunctions-failures'
+      AlarmDescription: 'Step Functions execution failures'
+      MetricName: ExecutionsFailed
+      Namespace: AWS/States
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref DocumentProcessingStateMachine
+      AlarmActions:
+        - !If [CreateNotifications, !Ref NotificationTopic, !Ref AWS::NoValue]
+
+Outputs:
+  InputBucketName:
+    Description: 'S3 bucket name for document uploads'
+    Value: !Ref InputBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-InputBucket'
+
+  OutputBucketName:
+    Description: 'S3 bucket name for processed results'
+    Value: !Ref OutputBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-OutputBucket'
+
+  ArchiveBucketName:
+    Description: 'S3 bucket name for document archive'
+    Value: !Ref ArchiveBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ArchiveBucket'
+
+  StateMachineArn:
+    Description: 'ARN of the Step Functions state machine'
+    Value: !Ref DocumentProcessingStateMachine
+    Export:
+      Name: !Sub '${AWS::StackName}-StateMachine'
+
+  DocumentProcessorFunctionArn:
+    Description: 'ARN of the document processor Lambda function'
+    Value: !GetAtt DocumentProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DocumentProcessorFunction'
+
+  ResultsProcessorFunctionArn:
+    Description: 'ARN of the results processor Lambda function'
+    Value: !GetAtt ResultsProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ResultsProcessorFunction'
+
+  S3TriggerFunctionArn:
+    Description: 'ARN of the S3 trigger Lambda function'
+    Value: !GetAtt S3TriggerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-S3TriggerFunction'
+
+  MonitoringDashboardURL:
+    Condition: CreateMonitoring
+    Description: 'URL to the CloudWatch monitoring dashboard'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-pipeline-monitoring'
+
+  NotificationTopicArn:
+    Condition: CreateNotifications
+    Description: 'ARN of the SNS notification topic'
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopic'
+
+  DeploymentInstructions:
+    Description: 'Instructions for using the deployed pipeline'
+    Value: !Sub |
+      1. Upload documents (PDF, PNG, JPG, JPEG) to: s3://${InputBucket}
+      2. Monitor processing in Step Functions console: https://console.aws.amazon.com/states/home?region=${AWS::Region}#/statemachines/view/${DocumentProcessingStateMachine}
+      3. View results in: s3://${OutputBucket}/processed/
+      4. Archived documents in: s3://${ArchiveBucket}/archive/
+      5. Monitor dashboard: https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-pipeline-monitoring
+
+  EstimatedCost:
+    Description: 'Estimated monthly cost for moderate usage (1000 documents)'
+    Value: 'AWS Lambda: $5-10, Step Functions: $5-15, S3: $5-20, Textract: $10-50 (varies by document size), CloudWatch: $2-5. Total: ~$25-100/month'

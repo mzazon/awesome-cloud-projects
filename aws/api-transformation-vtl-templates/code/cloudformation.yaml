@@ -1,0 +1,944 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure as Code for Request/Response Transformation with VTL Templates and Custom Models - Implements comprehensive API Gateway transformation capabilities with Lambda integration, S3 storage, and CloudWatch monitoring'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "API Configuration"
+        Parameters:
+          - ApiName
+          - ApiDescription
+          - StageName
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaFunctionName
+          - LambdaRuntime
+          - LambdaMemorySize
+          - LambdaTimeout
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - S3BucketName
+          - S3BucketRetentionDays
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableDetailedLogging
+          - EnableXRayTracing
+          - LogRetentionDays
+    ParameterLabels:
+      ApiName:
+        default: "API Gateway Name"
+      ApiDescription:
+        default: "API Description"
+      StageName:
+        default: "Deployment Stage"
+      LambdaFunctionName:
+        default: "Lambda Function Name"
+      LambdaRuntime:
+        default: "Lambda Runtime"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      S3BucketName:
+        default: "S3 Bucket Name"
+      S3BucketRetentionDays:
+        default: "S3 Object Retention Days"
+      EnableDetailedLogging:
+        default: "Enable Detailed API Logging"
+      EnableXRayTracing:
+        default: "Enable X-Ray Tracing"
+      LogRetentionDays:
+        default: "CloudWatch Log Retention Days"
+
+# Input Parameters
+Parameters:
+  ApiName:
+    Type: String
+    Default: 'transformation-api'
+    Description: 'Name for the API Gateway REST API'
+    MinLength: 1
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+
+  ApiDescription:
+    Type: String
+    Default: 'API with advanced request/response transformation using VTL templates'
+    Description: 'Description for the API Gateway'
+    MaxLength: 200
+
+  StageName:
+    Type: String
+    Default: 'staging'
+    Description: 'Stage name for API deployment'
+    AllowedValues:
+      - 'dev'
+      - 'staging'
+      - 'prod'
+
+  LambdaFunctionName:
+    Type: String
+    Default: 'data-processor'
+    Description: 'Name for the Lambda function'
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z0-9-_]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, hyphens, and underscores'
+
+  LambdaRuntime:
+    Type: String
+    Default: 'python3.9'
+    Description: 'Lambda runtime environment'
+    AllowedValues:
+      - 'python3.9'
+      - 'python3.10'
+      - 'python3.11'
+      - 'python3.12'
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    Description: 'Lambda function memory size in MB'
+    MinValue: 128
+    MaxValue: 10240
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    Description: 'Lambda function timeout in seconds'
+    MinValue: 3
+    MaxValue: 900
+
+  S3BucketName:
+    Type: String
+    Default: ''
+    Description: 'S3 bucket name for data storage (leave empty for auto-generated name)'
+    AllowedPattern: '^[a-z0-9.-]*$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, periods, and hyphens'
+
+  S3BucketRetentionDays:
+    Type: Number
+    Default: 90
+    Description: 'Number of days to retain S3 objects'
+    MinValue: 1
+    MaxValue: 2555
+
+  EnableDetailedLogging:
+    Type: String
+    Default: 'true'
+    Description: 'Enable detailed API Gateway logging'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableXRayTracing:
+    Type: String
+    Default: 'true'
+    Description: 'Enable X-Ray tracing for API Gateway and Lambda'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    Description: 'CloudWatch log retention period in days'
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+# Conditions
+Conditions:
+  CreateS3Bucket: !Equals [!Ref S3BucketName, '']
+  EnableDetailedLoggingCondition: !Equals [!Ref EnableDetailedLogging, 'true']
+  EnableXRayTracingCondition: !Equals [!Ref EnableXRayTracing, 'true']
+
+# Resources
+Resources:
+  # S3 Bucket for Data Storage
+  DataStorageBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateS3Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-api-data-store-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: !Ref S3BucketRetentionDays
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+
+  # CloudWatch Log Groups
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ApiName}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LambdaFunctionName}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${AWS::StackName}-access-logs'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !If [EnableXRayTracingCondition, 'arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess', !Ref 'AWS::NoValue']
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !If [CreateS3Bucket, !Sub '${DataStorageBucket}', !Sub 'arn:aws:s3:::${S3BucketName}']
+                  - !If [CreateS3Bucket, !Sub '${DataStorageBucket}/*', !Sub 'arn:aws:s3:::${S3BucketName}/*']
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+  # IAM Role for API Gateway
+  ApiGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-apigateway-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+      Policies:
+        - PolicyName: LambdaInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt DataProcessorFunction.Arn
+
+  # Lambda Function for Data Processing
+  DataProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-${LambdaFunctionName}'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Description: 'Data processor function with transformation support'
+      Environment:
+        Variables:
+          S3_BUCKET: !If [CreateS3Bucket, !Ref DataStorageBucket, !Ref S3BucketName]
+          LOG_LEVEL: 'INFO'
+      TracingConfig:
+        Mode: !If [EnableXRayTracingCondition, 'Active', 'PassThrough']
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          from datetime import datetime
+          
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Log the transformed request for debugging
+                  print(f"Received event: {json.dumps(event)}")
+                  
+                  # Simulate processing based on event structure
+                  if 'user_data' in event:
+                      # Process user data from transformed request
+                      response_data = {
+                          'id': str(uuid.uuid4()),
+                          'processed_at': datetime.utcnow().isoformat(),
+                          'user_id': event['user_data'].get('id'),
+                          'full_name': f"{event['user_data'].get('first_name', '')} {event['user_data'].get('last_name', '')}".strip(),
+                          'profile': {
+                              'email': event['user_data'].get('email'),
+                              'phone': event['user_data'].get('phone'),
+                              'preferences': event['user_data'].get('preferences', {})
+                          },
+                          'status': 'processed',
+                          'metadata': {
+                              'source': 'api_gateway_transformation',
+                              'version': '2.0'
+                          }
+                      }
+                  else:
+                      # Handle generic data processing
+                      response_data = {
+                          'id': str(uuid.uuid4()),
+                          'processed_at': datetime.utcnow().isoformat(),
+                          'input_data': event,
+                          'status': 'processed',
+                          'transformation_applied': True
+                      }
+                  
+                  # Store processed data in S3 if configured
+                  if 'S3_BUCKET' in os.environ:
+                      try:
+                          s3.put_object(
+                              Bucket=os.environ['S3_BUCKET'],
+                              Key=f"processed-data/{response_data['id']}.json",
+                              Body=json.dumps(response_data),
+                              ContentType='application/json'
+                          )
+                      except Exception as s3_error:
+                          print(f"S3 storage error: {str(s3_error)}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': response_data
+                  }
+                  
+              except Exception as e:
+                  print(f"Error processing request: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': {
+                          'error': 'Internal processing error',
+                          'message': str(e),
+                          'request_id': context.aws_request_id
+                      }
+                  }
+
+  # API Gateway REST API
+  TransformationApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${AWS::StackName}-${ApiName}'
+      Description: !Ref ApiDescription
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 'execute-api:Invoke'
+            Resource: '*'
+
+  # API Gateway Account Configuration
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayRole.Arn
+
+  # API Gateway Models
+  UserCreateRequestModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref TransformationApi
+      Name: UserCreateRequest
+      ContentType: application/json
+      Description: 'Model for user creation requests with comprehensive validation'
+      Schema:
+        $schema: 'http://json-schema.org/draft-04/schema#'
+        title: 'User Creation Request'
+        type: object
+        required:
+          - firstName
+          - lastName
+          - email
+        properties:
+          firstName:
+            type: string
+            minLength: 1
+            maxLength: 50
+            pattern: '^[a-zA-Z\s]+$'
+          lastName:
+            type: string
+            minLength: 1
+            maxLength: 50
+            pattern: '^[a-zA-Z\s]+$'
+          email:
+            type: string
+            format: email
+            maxLength: 100
+          phoneNumber:
+            type: string
+            pattern: '^\+?[1-9]\d{1,14}$'
+          preferences:
+            type: object
+            properties:
+              notifications:
+                type: boolean
+              theme:
+                type: string
+                enum: [light, dark]
+              language:
+                type: string
+                pattern: '^[a-z]{2}$'
+          metadata:
+            type: object
+            additionalProperties: true
+        additionalProperties: false
+
+  UserResponseModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref TransformationApi
+      Name: UserResponse
+      ContentType: application/json
+      Description: 'Model for standardized user responses'
+      Schema:
+        $schema: 'http://json-schema.org/draft-04/schema#'
+        title: 'User Response'
+        type: object
+        properties:
+          success:
+            type: boolean
+          data:
+            type: object
+            properties:
+              userId:
+                type: string
+              displayName:
+                type: string
+              contactInfo:
+                type: object
+                properties:
+                  email:
+                    type: string
+                  phone:
+                    type: string
+              createdAt:
+                type: string
+              profileComplete:
+                type: boolean
+          links:
+            type: object
+            properties:
+              self:
+                type: string
+              profile:
+                type: string
+
+  ErrorResponseModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref TransformationApi
+      Name: ErrorResponse
+      ContentType: application/json
+      Description: 'Model for standardized error responses'
+      Schema:
+        $schema: 'http://json-schema.org/draft-04/schema#'
+        title: 'Error Response'
+        type: object
+        required:
+          - error
+          - message
+        properties:
+          error:
+            type: string
+          message:
+            type: string
+          details:
+            type: array
+            items:
+              type: object
+              properties:
+                field:
+                  type: string
+                code:
+                  type: string
+                message:
+                  type: string
+          timestamp:
+            type: string
+          path:
+            type: string
+
+  # Request Validator
+  RequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      RestApiId: !Ref TransformationApi
+      Name: comprehensive-validator
+      ValidateRequestBody: true
+      ValidateRequestParameters: true
+
+  # API Gateway Resources
+  UsersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TransformationApi
+      ParentId: !GetAtt TransformationApi.RootResourceId
+      PathPart: users
+
+  # POST Method for User Creation
+  UsersPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TransformationApi
+      ResourceId: !Ref UsersResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      RequestValidatorId: !Ref RequestValidator
+      RequestModels:
+        application/json: !Ref UserCreateRequestModel
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: !Ref UserResponseModel
+        - StatusCode: '400'
+          ResponseModels:
+            application/json: !Ref ErrorResponseModel
+        - StatusCode: '500'
+          ResponseModels:
+            application/json: !Ref ErrorResponseModel
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DataProcessorFunction.Arn}/invocations'
+        PassthroughBehavior: NEVER
+        RequestTemplates:
+          application/json: !Sub |
+            #set($inputRoot = $input.path('$'))
+            #set($context = $context)
+            #set($util = $util)
+            
+            ## Transform incoming request to backend format
+            {
+                "user_data": {
+                    "id": "$util.escapeJavaScript($context.requestId)",
+                    "first_name": "$util.escapeJavaScript($inputRoot.firstName)",
+                    "last_name": "$util.escapeJavaScript($inputRoot.lastName)",
+                    "email": "$util.escapeJavaScript($inputRoot.email.toLowerCase())",
+                    #if($inputRoot.phoneNumber && $inputRoot.phoneNumber != "")
+                    "phone": "$util.escapeJavaScript($inputRoot.phoneNumber)",
+                    #end
+                    #if($inputRoot.preferences)
+                    "preferences": {
+                        #if($inputRoot.preferences.notifications)
+                        "email_notifications": $inputRoot.preferences.notifications,
+                        #end
+                        #if($inputRoot.preferences.theme)
+                        "ui_theme": "$util.escapeJavaScript($inputRoot.preferences.theme)",
+                        #end
+                        #if($inputRoot.preferences.language)
+                        "locale": "$util.escapeJavaScript($inputRoot.preferences.language)",
+                        #end
+                        "auto_save": true
+                    },
+                    #end
+                    "source": "api_gateway",
+                    "created_via": "rest_api"
+                },
+                "request_context": {
+                    "request_id": "$context.requestId",
+                    "api_id": "$context.apiId",
+                    "stage": "$context.stage",
+                    "resource_path": "$context.resourcePath",
+                    "http_method": "$context.httpMethod",
+                    "source_ip": "$context.identity.sourceIp",
+                    "user_agent": "$util.escapeJavaScript($context.identity.userAgent)",
+                    "request_time": "$context.requestTime",
+                    "request_time_epoch": $context.requestTimeEpoch
+                },
+                #if($inputRoot.metadata)
+                "additional_metadata": $input.json('$.metadata'),
+                #end
+                "processing_flags": {
+                    "validate_email": true,
+                    "send_welcome": true,
+                    "create_profile": true
+                }
+            }
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseTemplates:
+              application/json: !Sub |
+                #set($inputRoot = $input.path('$'))
+                #set($context = $context)
+                
+                ## Transform backend response to standardized API format
+                {
+                    "success": true,
+                    "data": {
+                        "userId": "$util.escapeJavaScript($inputRoot.id)",
+                        "displayName": "$util.escapeJavaScript($inputRoot.full_name)",
+                        "contactInfo": {
+                            #if($inputRoot.profile.email)
+                            "email": "$util.escapeJavaScript($inputRoot.profile.email)",
+                            #end
+                            #if($inputRoot.profile.phone)
+                            "phone": "$util.escapeJavaScript($inputRoot.profile.phone)"
+                            #end
+                        },
+                        "createdAt": "$util.escapeJavaScript($inputRoot.processed_at)",
+                        "profileComplete": #if($inputRoot.profile.email && $inputRoot.full_name != "")true#{else}false#end,
+                        "preferences": #if($inputRoot.profile.preferences)$input.json('$.profile.preferences')#{else}{}#end
+                    },
+                    "metadata": {
+                        "processingId": "$util.escapeJavaScript($inputRoot.id)",
+                        "version": #if($inputRoot.metadata.version)"$util.escapeJavaScript($inputRoot.metadata.version)"#{else}"1.0"#end,
+                        "processedAt": "$util.escapeJavaScript($inputRoot.processed_at)"
+                    },
+                    "links": {
+                        "self": "https://$context.domainName/$context.stage/users/$util.escapeJavaScript($inputRoot.id)",
+                        "profile": "https://$context.domainName/$context.stage/users/$util.escapeJavaScript($inputRoot.id)/profile"
+                    }
+                }
+          - StatusCode: '500'
+            SelectionPattern: '.*"statusCode": 500.*'
+            ResponseTemplates:
+              application/json: !Sub |
+                #set($inputRoot = $input.path('$.errorMessage'))
+                #set($context = $context)
+                
+                {
+                    "error": "PROCESSING_ERROR",
+                    "message": #if($inputRoot)"$util.escapeJavaScript($inputRoot)"#{else}"An error occurred while processing your request"#end,
+                    "details": [
+                        {
+                            "field": "request",
+                            "code": "LAMBDA_EXECUTION_ERROR",
+                            "message": "Backend service encountered an error"
+                        }
+                    ],
+                    "timestamp": "$context.requestTime",
+                    "path": "$context.resourcePath",
+                    "requestId": "$context.requestId"
+                }
+
+  # GET Method for User Listing
+  UsersGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TransformationApi
+      ResourceId: !Ref UsersResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.querystring.limit: false
+        method.request.querystring.offset: false
+        method.request.querystring.filter: false
+        method.request.querystring.sort: false
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: !Ref UserResponseModel
+        - StatusCode: '500'
+          ResponseModels:
+            application/json: !Ref ErrorResponseModel
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DataProcessorFunction.Arn}/invocations'
+        RequestTemplates:
+          application/json: !Sub |
+            {
+                "operation": "list_users",
+                "pagination": {
+                    "limit": #if($input.params('limit'))$input.params('limit')#{else}10#end,
+                    "offset": #if($input.params('offset'))$input.params('offset')#{else}0#end
+                },
+                #if($input.params('filter'))
+                "filters": {
+                    #set($filterParam = $input.params('filter'))
+                    #if($filterParam.contains(':'))
+                        #set($filterParts = $filterParam.split(':'))
+                        "$util.escapeJavaScript($filterParts[0])": "$util.escapeJavaScript($filterParts[1])"
+                    #else
+                        "search": "$util.escapeJavaScript($filterParam)"
+                    #end
+                },
+                #end
+                #if($input.params('sort'))
+                "sorting": {
+                    #set($sortParam = $input.params('sort'))
+                    #if($sortParam.startsWith('-'))
+                        "field": "$util.escapeJavaScript($sortParam.substring(1))",
+                        "direction": "desc"
+                    #else
+                        "field": "$util.escapeJavaScript($sortParam)",
+                        "direction": "asc"
+                    #end
+                },
+                #end
+                "request_context": {
+                    "request_id": "$context.requestId",
+                    "source_ip": "$context.identity.sourceIp",
+                    "user_agent": "$util.escapeJavaScript($context.identity.userAgent)"
+                }
+            }
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseTemplates:
+              application/json: !Sub |
+                #set($inputRoot = $input.path('$'))
+                #set($context = $context)
+                
+                {
+                    "success": true,
+                    "data": $input.json('$'),
+                    "metadata": {
+                        "processingId": "$util.escapeJavaScript($inputRoot.id)",
+                        "processedAt": "$util.escapeJavaScript($inputRoot.processed_at)"
+                    },
+                    "links": {
+                        "self": "https://$context.domainName/$context.stage/users"
+                    }
+                }
+
+  # Gateway Responses for Error Handling
+  BadRequestBodyGatewayResponse:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref TransformationApi
+      ResponseType: BAD_REQUEST_BODY
+      StatusCode: '400'
+      ResponseTemplates:
+        application/json: !Sub |
+          {
+              "error": "VALIDATION_ERROR",
+              "message": "Request validation failed",
+              "details": [
+                  #foreach($error in $context.error.validationErrorString.split(','))
+                  {
+                      "field": #if($error.contains('Invalid request body'))"body"#{elseif($error.contains('required'))$error.split("'")[1]#{else}"unknown"#end,
+                      "code": "VALIDATION_FAILED",
+                      "message": "$util.escapeJavaScript($error.trim())"
+                  }#if($foreach.hasNext),#end
+                  #end
+              ],
+              "timestamp": "$context.requestTime",
+              "path": "$context.resourcePath",
+              "requestId": "$context.requestId"
+          }
+
+  UnauthorizedGatewayResponse:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref TransformationApi
+      ResponseType: UNAUTHORIZED
+      StatusCode: '401'
+      ResponseTemplates:
+        application/json: !Sub |
+          {
+              "error": "UNAUTHORIZED",
+              "message": "Authentication required",
+              "timestamp": "$context.requestTime",
+              "path": "$context.resourcePath"
+          }
+
+  # Lambda Permission for API Gateway
+  LambdaApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TransformationApi}/*/*'
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - UsersPostMethod
+      - UsersGetMethod
+      - BadRequestBodyGatewayResponse
+      - UnauthorizedGatewayResponse
+    Properties:
+      RestApiId: !Ref TransformationApi
+      Description: 'Initial deployment with VTL transformations'
+
+  # API Gateway Stage
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref TransformationApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref StageName
+      Description: !Sub '${StageName} environment for transformation testing'
+      MethodSettings:
+        - ResourcePath: '/*/*'
+          HttpMethod: '*'
+          LoggingLevel: !If [EnableDetailedLoggingCondition, 'INFO', 'OFF']
+          DataTraceEnabled: !If [EnableDetailedLoggingCondition, true, false]
+          MetricsEnabled: true
+          ThrottlingBurstLimit: 500
+          ThrottlingRateLimit: 1000
+      TracingEnabled: !If [EnableXRayTracingCondition, true, false]
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+        Format: '$context.requestId $context.status $context.error.message $context.error.messageString'
+
+  # CloudWatch Dashboard
+  TransformationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-transformation-monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApiGateway", "Count", "ApiName", "${AWS::StackName}-${ApiName}" ],
+                  [ ".", "Latency", ".", "." ],
+                  [ ".", "4XXError", ".", "." ],
+                  [ ".", "5XXError", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "API Gateway Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${AWS::StackName}-${LambdaFunctionName}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Invocations", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics"
+              }
+            }
+          ]
+        }
+
+# Outputs
+Outputs:
+  ApiEndpoint:
+    Description: 'URL of the API Gateway endpoint'
+    Value: !Sub 'https://${TransformationApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiEndpoint'
+
+  ApiId:
+    Description: 'API Gateway REST API ID'
+    Value: !Ref TransformationApi
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiId'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function'
+    Value: !GetAtt DataProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function'
+    Value: !Ref DataProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  S3BucketName:
+    Description: 'Name of the S3 bucket for data storage'
+    Value: !If [CreateS3Bucket, !Ref DataStorageBucket, !Ref S3BucketName]
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketName'
+
+  ApiGatewayLogGroup:
+    Description: 'CloudWatch Log Group for API Gateway'
+    Value: !Ref ApiGatewayLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiGatewayLogGroup'
+
+  LambdaLogGroup:
+    Description: 'CloudWatch Log Group for Lambda function'
+    Value: !Ref LambdaLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaLogGroup'
+
+  DashboardUrl:
+    Description: 'URL to the CloudWatch Dashboard'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-transformation-monitoring'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardUrl'
+
+  UsersResourcePath:
+    Description: 'Path to the users resource'
+    Value: '/users'
+    Export:
+      Name: !Sub '${AWS::StackName}-UsersResourcePath'
+
+  TestPostCommand:
+    Description: 'Sample curl command to test POST endpoint'
+    Value: !Sub |
+      curl -X POST "${TransformationApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/users" \
+      -H "Content-Type: application/json" \
+      -d '{"firstName": "John", "lastName": "Doe", "email": "john.doe@example.com", "phoneNumber": "+1234567890", "preferences": {"notifications": true, "theme": "dark", "language": "en"}}'
+
+  TestGetCommand:
+    Description: 'Sample curl command to test GET endpoint'
+    Value: !Sub |
+      curl -G "${TransformationApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/users" \
+      -d "limit=5" -d "offset=0" -d "filter=email:example.com" -d "sort=-createdAt"

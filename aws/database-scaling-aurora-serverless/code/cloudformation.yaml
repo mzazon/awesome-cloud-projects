@@ -1,0 +1,639 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Database Scaling with Aurora Serverless v2.
+  Creates an Aurora MySQL Serverless v2 cluster with automatic scaling,
+  read replica, monitoring, and security best practices.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Database Configuration"
+        Parameters:
+          - DatabaseName
+          - MasterUsername
+          - MasterUserPassword
+          - MinServerlessCapacity
+          - MaxServerlessCapacity
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - SubnetIds
+          - DatabasePort
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnablePerformanceInsights
+          - PerformanceInsightsRetentionPeriod
+          - BackupRetentionPeriod
+      - Label:
+          default: "Scaling and Alerting"
+        Parameters:
+          - HighACUThreshold
+          - LowACUThreshold
+          - NotificationEmail
+    ParameterLabels:
+      DatabaseName:
+        default: "Database Name"
+      MasterUsername:
+        default: "Master Username"
+      MasterUserPassword:
+        default: "Master Password"
+      MinServerlessCapacity:
+        default: "Minimum ACUs"
+      MaxServerlessCapacity:
+        default: "Maximum ACUs"
+      VpcId:
+        default: "VPC ID"
+      SubnetIds:
+        default: "Subnet IDs"
+      DatabasePort:
+        default: "Database Port"
+      EnablePerformanceInsights:
+        default: "Enable Performance Insights"
+      PerformanceInsightsRetentionPeriod:
+        default: "Performance Insights Retention (days)"
+      BackupRetentionPeriod:
+        default: "Backup Retention Period (days)"
+      HighACUThreshold:
+        default: "High ACU Alert Threshold"
+      LowACUThreshold:
+        default: "Low ACU Alert Threshold"
+      NotificationEmail:
+        default: "Notification Email Address"
+
+Parameters:
+  DatabaseName:
+    Type: String
+    Default: ecommerce
+    Description: Name of the default database to create
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9_]*$
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters and underscores
+
+  MasterUsername:
+    Type: String
+    Default: admin
+    Description: Master username for the Aurora cluster
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9_]*$
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters and underscores
+
+  MasterUserPassword:
+    Type: String
+    NoEcho: true
+    Description: Master password for the Aurora cluster
+    MinLength: 8
+    MaxLength: 128
+    AllowedPattern: ^[a-zA-Z0-9!@#$%^&*()_+-=]*$
+    ConstraintDescription: Must be 8-128 characters and contain only alphanumeric and special characters
+
+  MinServerlessCapacity:
+    Type: Number
+    Default: 0.5
+    Description: Minimum Aurora Capacity Units (ACUs) for serverless scaling
+    MinValue: 0.5
+    MaxValue: 128
+    ConstraintDescription: Must be between 0.5 and 128 ACUs
+
+  MaxServerlessCapacity:
+    Type: Number
+    Default: 16
+    Description: Maximum Aurora Capacity Units (ACUs) for serverless scaling
+    MinValue: 0.5
+    MaxValue: 128
+    ConstraintDescription: Must be between 0.5 and 128 ACUs
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where the Aurora cluster will be deployed
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of subnet IDs for the Aurora cluster (minimum 2 in different AZs)
+
+  DatabasePort:
+    Type: Number
+    Default: 3306
+    Description: Port number for the Aurora cluster
+    MinValue: 1150
+    MaxValue: 65535
+
+  EnablePerformanceInsights:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable Performance Insights for database monitoring
+
+  PerformanceInsightsRetentionPeriod:
+    Type: Number
+    Default: 7
+    AllowedValues: [7, 731]
+    Description: Performance Insights data retention period in days (7 for free tier, 731 for long-term retention)
+
+  BackupRetentionPeriod:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 35
+    Description: Number of days to retain automated backups
+
+  HighACUThreshold:
+    Type: Number
+    Default: 12
+    Description: ACU threshold for high utilization alarm
+    MinValue: 1
+    MaxValue: 128
+
+  LowACUThreshold:
+    Type: Number
+    Default: 1
+    Description: ACU threshold for low utilization alarm
+    MinValue: 0.5
+    MaxValue: 128
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for CloudWatch alarm notifications (optional)
+    Default: ''
+    AllowedPattern: ^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address or empty
+
+Conditions:
+  EnableNotifications: !Not [!Equals [!Ref NotificationEmail, '']]
+  EnablePerformanceInsightsCondition: !Equals [!Ref EnablePerformanceInsights, 'true']
+  LongTermPIRetention: !Equals [!Ref PerformanceInsightsRetentionPeriod, 731]
+
+Resources:
+  # SNS Topic for CloudWatch Alarms (Optional)
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnableNotifications
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-aurora-scaling-alerts'
+      DisplayName: Aurora Serverless Scaling Alerts
+      KmsMasterKeyId: alias/aws/sns
+
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: EnableNotifications
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # Security Group for Aurora Cluster
+  AuroraSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-aurora-sg'
+      GroupDescription: Security group for Aurora Serverless v2 cluster
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref DatabasePort
+          ToPort: !Ref DatabasePort
+          CidrIp: 10.0.0.0/8
+          Description: MySQL access from VPC private networks
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-aurora-security-group'
+        - Key: Purpose
+          Value: Aurora Serverless database access
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # DB Subnet Group for Aurora Cluster
+  AuroraSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${AWS::StackName}-aurora-subnet-group'
+      DBSubnetGroupDescription: Subnet group for Aurora Serverless v2 cluster
+      SubnetIds: !Ref SubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-aurora-subnet-group'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Custom DB Cluster Parameter Group
+  AuroraClusterParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      Family: aurora-mysql8.0
+      Description: Custom parameter group for Aurora Serverless v2
+      Parameters:
+        innodb_buffer_pool_size: '{DBInstanceClassMemory*3/4}'
+        max_connections: 16000
+        slow_query_log: 1
+        long_query_time: 2
+        log_queries_not_using_indexes: 1
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-aurora-cluster-params'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Aurora Serverless v2 Cluster
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBClusterIdentifier: !Sub '${AWS::StackName}-aurora-cluster'
+      Engine: aurora-mysql
+      EngineVersion: 8.0.mysql_aurora.3.02.0
+      DatabaseName: !Ref DatabaseName
+      MasterUsername: !Ref MasterUsername
+      MasterUserPassword: !Ref MasterUserPassword
+      Port: !Ref DatabasePort
+      DBSubnetGroupName: !Ref AuroraSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref AuroraSecurityGroup
+      DBClusterParameterGroupName: !Ref AuroraClusterParameterGroup
+      BackupRetentionPeriod: !Ref BackupRetentionPeriod
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'sun:04:00-sun:05:00'
+      EnableCloudwatchLogsExports:
+        - error
+        - general
+        - slowquery
+      DeletionProtection: true
+      StorageEncrypted: true
+      KmsKeyId: alias/aws/rds
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref MinServerlessCapacity
+        MaxCapacity: !Ref MaxServerlessCapacity
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-aurora-cluster'
+        - Key: Environment
+          Value: !Ref AWS::StackName
+        - Key: Engine
+          Value: aurora-mysql
+        - Key: ServerlessVersion
+          Value: v2
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Aurora Writer Instance (Primary)
+  AuroraWriterInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${AWS::StackName}-aurora-writer'
+      DBClusterIdentifier: !Ref AuroraCluster
+      Engine: aurora-mysql
+      DBInstanceClass: db.serverless
+      PromotionTier: 1
+      EnablePerformanceInsights: !Ref EnablePerformanceInsights
+      PerformanceInsightsRetentionPeriod: !If
+        - EnablePerformanceInsightsCondition
+        - !Ref PerformanceInsightsRetentionPeriod
+        - !Ref AWS::NoValue
+      PerformanceInsightsKMSKeyId: !If
+        - LongTermPIRetention
+        - alias/aws/rds
+        - !Ref AWS::NoValue
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt EnhancedMonitoringRole.Arn
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-aurora-writer'
+        - Key: Role
+          Value: Writer
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Aurora Reader Instance (Read Replica)
+  AuroraReaderInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${AWS::StackName}-aurora-reader'
+      DBClusterIdentifier: !Ref AuroraCluster
+      Engine: aurora-mysql
+      DBInstanceClass: db.serverless
+      PromotionTier: 2
+      EnablePerformanceInsights: !Ref EnablePerformanceInsights
+      PerformanceInsightsRetentionPeriod: !If
+        - EnablePerformanceInsightsCondition
+        - !Ref PerformanceInsightsRetentionPeriod
+        - !Ref AWS::NoValue
+      PerformanceInsightsKMSKeyId: !If
+        - LongTermPIRetention
+        - alias/aws/rds
+        - !Ref AWS::NoValue
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt EnhancedMonitoringRole.Arn
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-aurora-reader'
+        - Key: Role
+          Value: Reader
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # IAM Role for Enhanced Monitoring
+  EnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-aurora-monitoring-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+      Path: /
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-aurora-monitoring-role'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudWatch Alarm for High ACU Utilization
+  HighACUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-Aurora-High-ACU'
+      AlarmDescription: Alert when Aurora Serverless ACU usage is high
+      MetricName: ServerlessDatabaseCapacity
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref HighACUThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref AuroraCluster
+      AlarmActions: !If
+        - EnableNotifications
+        - [!Ref NotificationTopic]
+        - !Ref AWS::NoValue
+      OKActions: !If
+        - EnableNotifications
+        - [!Ref NotificationTopic]
+        - !Ref AWS::NoValue
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-high-acu-alarm'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudWatch Alarm for Low ACU Utilization
+  LowACUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-Aurora-Low-ACU'
+      AlarmDescription: Alert when Aurora Serverless ACU usage is consistently low
+      MetricName: ServerlessDatabaseCapacity
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 900
+      EvaluationPeriods: 4
+      Threshold: !Ref LowACUThreshold
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref AuroraCluster
+      AlarmActions: !If
+        - EnableNotifications
+        - [!Ref NotificationTopic]
+        - !Ref AWS::NoValue
+      OKActions: !If
+        - EnableNotifications
+        - [!Ref NotificationTopic]
+        - !Ref AWS::NoValue
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-low-acu-alarm'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudWatch Alarm for Database Connections
+  DatabaseConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-Aurora-High-Connections'
+      AlarmDescription: Alert when database connections are high
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref AuroraCluster
+      AlarmActions: !If
+        - EnableNotifications
+        - [!Ref NotificationTopic]
+        - !Ref AWS::NoValue
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-high-connections-alarm'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudWatch Dashboard for Aurora Monitoring
+  AuroraDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-Aurora-Serverless-Dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/RDS", "ServerlessDatabaseCapacity", "DBClusterIdentifier", "${AuroraCluster}" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Aurora Capacity Units (ACUs)",
+                "period": 300,
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": ${MaxServerlessCapacity}
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/RDS", "DatabaseConnections", "DBClusterIdentifier", "${AuroraCluster}" ],
+                  [ ".", "CPUUtilization", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Database Connections & CPU Utilization",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/RDS", "ReadLatency", "DBClusterIdentifier", "${AuroraCluster}" ],
+                  [ ".", "WriteLatency", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Database Latency",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/RDS", "ReadIOPS", "DBClusterIdentifier", "${AuroraCluster}" ],
+                  [ ".", "WriteIOPS", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Database IOPS",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+Outputs:
+  ClusterIdentifier:
+    Description: Aurora Cluster Identifier
+    Value: !Ref AuroraCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterIdentifier'
+
+  ClusterEndpoint:
+    Description: Aurora Cluster Writer Endpoint
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterEndpoint'
+
+  ClusterReadEndpoint:
+    Description: Aurora Cluster Reader Endpoint
+    Value: !GetAtt AuroraCluster.ReadEndpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterReadEndpoint'
+
+  ClusterPort:
+    Description: Aurora Cluster Port
+    Value: !GetAtt AuroraCluster.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterPort'
+
+  DatabaseName:
+    Description: Name of the created database
+    Value: !Ref DatabaseName
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseName'
+
+  MasterUsername:
+    Description: Master username for the Aurora cluster
+    Value: !Ref MasterUsername
+    Export:
+      Name: !Sub '${AWS::StackName}-MasterUsername'
+
+  SecurityGroupId:
+    Description: Security Group ID for Aurora cluster
+    Value: !Ref AuroraSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroupId'
+
+  SubnetGroupName:
+    Description: DB Subnet Group Name
+    Value: !Ref AuroraSubnetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SubnetGroupName'
+
+  WriterInstanceId:
+    Description: Aurora Writer Instance Identifier
+    Value: !Ref AuroraWriterInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-WriterInstanceId'
+
+  ReaderInstanceId:
+    Description: Aurora Reader Instance Identifier
+    Value: !Ref AuroraReaderInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-ReaderInstanceId'
+
+  MinCapacity:
+    Description: Minimum serverless capacity (ACUs)
+    Value: !Ref MinServerlessCapacity
+    Export:
+      Name: !Sub '${AWS::StackName}-MinCapacity'
+
+  MaxCapacity:
+    Description: Maximum serverless capacity (ACUs)
+    Value: !Ref MaxServerlessCapacity
+    Export:
+      Name: !Sub '${AWS::StackName}-MaxCapacity'
+
+  DashboardURL:
+    Description: CloudWatch Dashboard URL for monitoring
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-Aurora-Serverless-Dashboard'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  PerformanceInsightsURL:
+    Description: Performance Insights URL for the writer instance
+    Value: !Sub 'https://console.aws.amazon.com/rds/home?region=${AWS::Region}#performance-insights-v20206:/resourceId/${AuroraWriterInstance}'
+    Export:
+      Name: !Sub '${AWS::StackName}-PerformanceInsightsURL'
+
+  NotificationTopicArn:
+    Condition: EnableNotifications
+    Description: SNS Topic ARN for scaling alerts
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopicArn'
+
+  ConnectionString:
+    Description: Sample MySQL connection string for applications
+    Value: !Sub 'mysql -h ${AuroraCluster.Endpoint.Address} -P ${AuroraCluster.Endpoint.Port} -u ${MasterUsername} -p ${DatabaseName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ConnectionString'

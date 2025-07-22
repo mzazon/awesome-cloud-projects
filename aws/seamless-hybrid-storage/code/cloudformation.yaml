@@ -1,0 +1,591 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Storage Gateway Hybrid Cloud Storage Solution - Creates File Gateway with NFS/SMB shares backed by S3'
+
+# ================================
+# PARAMETERS
+# ================================
+Parameters:
+  GatewayName:
+    Type: String
+    Default: hybrid-storage-gateway
+    Description: Name for the Storage Gateway
+    MinLength: 2
+    MaxLength: 255
+    AllowedPattern: '^[a-zA-Z0-9\-]+$'
+    ConstraintDescription: Must contain only alphanumeric characters and hyphens
+
+  S3BucketName:
+    Type: String
+    Description: Name for the S3 bucket (leave empty for auto-generated name)
+    Default: ''
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9\-]*[a-z0-9]$'
+    ConstraintDescription: Must be a valid S3 bucket name or empty for auto-generation
+
+  InstanceType:
+    Type: String
+    Default: m5.large
+    AllowedValues:
+      - m5.large
+      - m5.xlarge
+      - m5.2xlarge
+      - m5.4xlarge
+    Description: EC2 instance type for Storage Gateway (minimum m5.large recommended)
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access to Storage Gateway instance
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where Storage Gateway will be deployed
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet ID for Storage Gateway deployment (must be in selected VPC)
+
+  AllowedCIDR:
+    Type: String
+    Default: 10.0.0.0/8
+    Description: CIDR block allowed to access NFS/SMB shares
+    AllowedPattern: '^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\/(?:[0-9]|[12][0-9]|3[0-2])$'
+    ConstraintDescription: Must be a valid CIDR notation (e.g., 10.0.0.0/8)
+
+  CacheVolumeSize:
+    Type: Number
+    Default: 100
+    MinValue: 150
+    MaxValue: 64000
+    Description: Size of cache volume in GB (minimum 150 GB)
+
+  EnableS3Versioning:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable S3 bucket versioning
+
+  DefaultStorageClass:
+    Type: String
+    Default: S3_STANDARD
+    AllowedValues:
+      - S3_STANDARD
+      - S3_STANDARD_IA
+      - S3_ONEZONE_IA
+      - S3_REDUCED_REDUNDANCY
+    Description: Default S3 storage class for uploaded files
+
+  GatewayTimezone:
+    Type: String
+    Default: GMT-5:00
+    Description: Timezone for the Storage Gateway (e.g., GMT-5:00, GMT+0:00)
+
+  EnableCloudWatchLogs:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable CloudWatch logging for Storage Gateway
+
+# ================================
+# CONDITIONS
+# ================================
+Conditions:
+  CreateS3Bucket: !Equals [!Ref S3BucketName, '']
+  EnableVersioning: !Equals [!Ref EnableS3Versioning, 'true']
+  EnableLogging: !Equals [!Ref EnableCloudWatchLogs, 'true']
+
+# ================================
+# MAPPINGS
+# ================================
+Mappings:
+  # Storage Gateway AMI IDs by region
+  StorageGatewayAMI:
+    us-east-1:
+      AMI: ami-0123456789abcdef0  # This would be updated with actual AMI IDs
+    us-west-2:
+      AMI: ami-0123456789abcdef0
+    eu-west-1:
+      AMI: ami-0123456789abcdef0
+    ap-southeast-1:
+      AMI: ami-0123456789abcdef0
+    # Additional regions would be added here
+
+# ================================
+# RESOURCES
+# ================================
+Resources:
+
+  # ================================
+  # KMS Key for S3 Encryption
+  # ================================
+  StorageGatewayKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'KMS key for Storage Gateway ${GatewayName} S3 encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow Storage Gateway Service
+            Effect: Allow
+            Principal:
+              Service: storagegateway.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+
+  StorageGatewayKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/storage-gateway-${GatewayName}'
+      TargetKeyId: !Ref StorageGatewayKMSKey
+
+  # ================================
+  # S3 Bucket
+  # ================================
+  StorageGatewayS3Bucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateS3Bucket
+    Properties:
+      BucketName: !Sub
+        - 'storage-gateway-${RandomId}-${AWS::AccountId}'
+        - RandomId: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref StorageGatewayKMSKey
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [EnableVersioning, 'Enabled', 'Suspended']
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: IntelligentTieringRule
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !If [EnableLogging, !Ref StorageGatewayLogGroup, !Ref 'AWS::NoValue']
+          - Event: 's3:ObjectRemoved:*'
+            CloudWatchConfiguration:
+              LogGroupName: !If [EnableLogging, !Ref StorageGatewayLogGroup, !Ref 'AWS::NoValue']
+
+  # ================================
+  # IAM Role for Storage Gateway
+  # ================================
+  StorageGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'StorageGatewayRole-${GatewayName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: storagegateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/StorageGatewayServiceRole
+      Policies:
+        - PolicyName: S3BucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:GetBucketVersioning
+                  - s3:PutBucketVersioning
+                Resource:
+                  - !Sub 
+                    - '${BucketArn}/*'
+                    - BucketArn: !If
+                      - CreateS3Bucket
+                      - !GetAtt StorageGatewayS3Bucket.Arn
+                      - !Sub 'arn:aws:s3:::${S3BucketName}'
+                  - !If
+                    - CreateS3Bucket
+                    - !GetAtt StorageGatewayS3Bucket.Arn
+                    - !Sub 'arn:aws:s3:::${S3BucketName}'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt StorageGatewayKMSKey.Arn
+
+  # ================================
+  # CloudWatch Log Group
+  # ================================
+  StorageGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: !Sub '/aws/storagegateway/${GatewayName}'
+      RetentionInDays: 30
+
+  # ================================
+  # Security Group for Storage Gateway
+  # ================================
+  StorageGatewaySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub 'storage-gateway-sg-${GatewayName}'
+      GroupDescription: Security group for AWS Storage Gateway
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        # HTTP for activation
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP for Storage Gateway activation
+        # HTTPS for AWS communication
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS for AWS API communication
+        # NFS
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          CidrIp: !Ref AllowedCIDR
+          Description: NFS file share access
+        # SMB
+        - IpProtocol: tcp
+          FromPort: 445
+          ToPort: 445
+          CidrIp: !Ref AllowedCIDR
+          Description: SMB file share access
+        # SSH for management
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedCIDR
+          Description: SSH access for management
+        # Additional Storage Gateway ports
+        - IpProtocol: tcp
+          FromPort: 1026
+          ToPort: 1028
+          CidrIp: 0.0.0.0/0
+          Description: Storage Gateway communication
+        - IpProtocol: tcp
+          FromPort: 1031
+          ToPort: 1031
+          CidrIp: 0.0.0.0/0
+          Description: Storage Gateway communication
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: DNS
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: DNS
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub 'storage-gateway-sg-${GatewayName}'
+
+  # ================================
+  # EBS Volume for Cache Storage
+  # ================================
+  CacheVolume:
+    Type: AWS::EC2::Volume
+    Properties:
+      Size: !Ref CacheVolumeSize
+      VolumeType: gp3
+      AvailabilityZone: !GetAtt StorageGatewayInstance.AvailabilityZone
+      Encrypted: true
+      KmsKeyId: !Ref StorageGatewayKMSKey
+      Tags:
+        - Key: Name
+          Value: !Sub 'storage-gateway-cache-${GatewayName}'
+
+  # ================================
+  # EC2 Instance for Storage Gateway
+  # ================================
+  StorageGatewayInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !FindInMap [StorageGatewayAMI, !Ref 'AWS::Region', AMI]
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref StorageGatewaySecurityGroup
+      IamInstanceProfile: !Ref StorageGatewayInstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Storage Gateway will auto-configure on boot
+          # Additional configuration can be added here if needed
+      Tags:
+        - Key: Name
+          Value: !Sub 'storage-gateway-${GatewayName}'
+        - Key: Application
+          Value: AWS Storage Gateway
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 80
+            VolumeType: gp3
+            Encrypted: true
+            KmsKeyId: !Ref StorageGatewayKMSKey
+
+  # ================================
+  # IAM Instance Profile
+  # ================================
+  StorageGatewayInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref StorageGatewayInstanceRole
+
+  StorageGatewayInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: StorageGatewayInstancePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - storagegateway:*
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # ================================
+  # Volume Attachment
+  # ================================
+  CacheVolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      InstanceId: !Ref StorageGatewayInstance
+      VolumeId: !Ref CacheVolume
+      Device: /dev/sdf
+
+  # ================================
+  # CloudWatch Alarms
+  # ================================
+  StorageGatewayCacheUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${GatewayName}-cache-utilization-high'
+      AlarmDescription: Storage Gateway cache utilization is high
+      MetricName: CachePercentUsed
+      Namespace: AWS/StorageGateway
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: GatewayName
+          Value: !Ref GatewayName
+
+  StorageGatewayHealthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${GatewayName}-health-check'
+      AlarmDescription: Storage Gateway health check alarm
+      MetricName: HealthNotifications
+      Namespace: AWS/StorageGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: GatewayName
+          Value: !Ref GatewayName
+
+# ================================
+# OUTPUTS
+# ================================
+Outputs:
+  StorageGatewayInstanceId:
+    Description: Instance ID of the Storage Gateway
+    Value: !Ref StorageGatewayInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-gateway-instance-id'
+
+  StorageGatewayInstanceIP:
+    Description: Public IP address of the Storage Gateway instance
+    Value: !GetAtt StorageGatewayInstance.PublicIp
+    Export:
+      Name: !Sub '${AWS::StackName}-gateway-public-ip'
+
+  StorageGatewayPrivateIP:
+    Description: Private IP address of the Storage Gateway instance
+    Value: !GetAtt StorageGatewayInstance.PrivateIp
+    Export:
+      Name: !Sub '${AWS::StackName}-gateway-private-ip'
+
+  S3BucketName:
+    Description: Name of the S3 bucket for Storage Gateway
+    Value: !If
+      - CreateS3Bucket
+      - !Ref StorageGatewayS3Bucket
+      - !Ref S3BucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-s3-bucket-name'
+
+  S3BucketArn:
+    Description: ARN of the S3 bucket for Storage Gateway
+    Value: !If
+      - CreateS3Bucket
+      - !GetAtt StorageGatewayS3Bucket.Arn
+      - !Sub 'arn:aws:s3:::${S3BucketName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-s3-bucket-arn'
+
+  StorageGatewayRoleArn:
+    Description: ARN of the Storage Gateway IAM role
+    Value: !GetAtt StorageGatewayRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-gateway-role-arn'
+
+  KMSKeyId:
+    Description: KMS Key ID for Storage Gateway encryption
+    Value: !Ref StorageGatewayKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-kms-key-id'
+
+  KMSKeyAlias:
+    Description: KMS Key alias for Storage Gateway encryption
+    Value: !Ref StorageGatewayKMSKeyAlias
+    Export:
+      Name: !Sub '${AWS::StackName}-kms-key-alias'
+
+  SecurityGroupId:
+    Description: Security Group ID for Storage Gateway
+    Value: !Ref StorageGatewaySecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-security-group-id'
+
+  CloudWatchLogGroup:
+    Description: CloudWatch Log Group for Storage Gateway (if enabled)
+    Value: !If [EnableLogging, !Ref StorageGatewayLogGroup, 'Not enabled']
+    Export:
+      Name: !Sub '${AWS::StackName}-log-group-name'
+
+  ActivationURL:
+    Description: URL to activate the Storage Gateway
+    Value: !Sub 'http://${StorageGatewayInstance.PublicIp}/?activationRegion=${AWS::Region}'
+
+  NFSMountCommand:
+    Description: Example NFS mount command
+    Value: !Sub 'sudo mount -t nfs ${StorageGatewayInstance.PrivateIp}:/bucket-name /local/mount/point'
+
+  SMBMountCommand:
+    Description: Example SMB mount command
+    Value: !Sub 'sudo mount -t cifs //${StorageGatewayInstance.PrivateIp}/bucket-name /local/mount/point'
+
+  NextSteps:
+    Description: Next steps to complete Storage Gateway setup
+    Value: |
+      1. Wait for instance to boot (5-10 minutes)
+      2. Visit the Activation URL to get activation key
+      3. Use AWS CLI or Console to activate gateway with obtained key
+      4. Configure cache storage using attached EBS volume
+      5. Create NFS/SMB file shares pointing to S3 bucket
+      6. Mount file shares on client systems
+
+# ================================
+# METADATA
+# ================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Storage Gateway Configuration
+        Parameters:
+          - GatewayName
+          - InstanceType
+          - GatewayTimezone
+          - CacheVolumeSize
+      - Label:
+          default: S3 Configuration
+        Parameters:
+          - S3BucketName
+          - EnableS3Versioning
+          - DefaultStorageClass
+      - Label:
+          default: Network Configuration
+        Parameters:
+          - VpcId
+          - SubnetId
+          - KeyPairName
+          - AllowedCIDR
+      - Label:
+          default: Monitoring and Logging
+        Parameters:
+          - EnableCloudWatchLogs
+    ParameterLabels:
+      GatewayName:
+        default: Gateway Name
+      InstanceType:
+        default: Instance Type
+      KeyPairName:
+        default: EC2 Key Pair
+      VpcId:
+        default: VPC ID
+      SubnetId:
+        default: Subnet ID
+      AllowedCIDR:
+        default: Allowed CIDR Block
+      S3BucketName:
+        default: S3 Bucket Name
+      EnableS3Versioning:
+        default: Enable S3 Versioning
+      CacheVolumeSize:
+        default: Cache Volume Size (GB)
+      DefaultStorageClass:
+        default: Default Storage Class
+      GatewayTimezone:
+        default: Gateway Timezone
+      EnableCloudWatchLogs:
+        default: Enable CloudWatch Logs
+
+  AWS::CloudFormation::Designer:
+    Description: AWS Storage Gateway Hybrid Cloud Storage Solution

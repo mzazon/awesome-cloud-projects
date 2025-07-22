@@ -1,0 +1,578 @@
+# Infrastructure Manager Configuration for Multi-Container Cloud Run Application
+# This configuration deploys a complete multi-container application with:
+# - Cloud Run service with multiple containers (frontend, backend, proxy, cloud-sql-proxy)
+# - Cloud SQL PostgreSQL instance for persistent storage
+# - Artifact Registry repository for container images
+# - Secret Manager secrets for secure credential storage
+# - Required IAM bindings and service enablement
+
+# Import necessary modules for the deployment
+imports: []
+
+# Global variables for resource naming and configuration
+variables:
+  # Project and location configuration
+  - name: project_id
+    type: string
+    description: "Google Cloud Project ID"
+    default: "multi-container-app"
+  
+  - name: region
+    type: string
+    description: "Google Cloud region for resource deployment"
+    default: "us-central1"
+  
+  - name: zone
+    type: string
+    description: "Google Cloud zone for zonal resources"
+    default: "us-central1-a"
+  
+  # Resource naming with random suffix for uniqueness
+  - name: random_suffix
+    type: string
+    description: "Random suffix for unique resource naming"
+    default: "abc123"
+  
+  - name: service_name
+    type: string
+    description: "Cloud Run service name"
+    default: "multi-app"
+  
+  - name: repository_name
+    type: string
+    description: "Artifact Registry repository name"
+    default: "multiapp-repo"
+  
+  - name: sql_instance_name
+    type: string
+    description: "Cloud SQL instance name"
+    default: "multiapp-db"
+  
+  # Database configuration
+  - name: database_version
+    type: string
+    description: "PostgreSQL database version"
+    default: "POSTGRES_15"
+  
+  - name: database_tier
+    type: string
+    description: "Cloud SQL instance tier"
+    default: "db-f1-micro"
+  
+  - name: database_name
+    type: string
+    description: "Application database name"
+    default: "appdb"
+  
+  - name: database_user
+    type: string
+    description: "Application database user"
+    default: "appuser"
+  
+  # Container image configuration
+  - name: frontend_image
+    type: string
+    description: "Frontend container image"
+    default: "us-central1-docker.pkg.dev/PROJECT_ID/REPO_NAME/frontend:latest"
+  
+  - name: backend_image
+    type: string
+    description: "Backend container image"
+    default: "us-central1-docker.pkg.dev/PROJECT_ID/REPO_NAME/backend:latest"
+  
+  - name: proxy_image
+    type: string
+    description: "Proxy container image"
+    default: "us-central1-docker.pkg.dev/PROJECT_ID/REPO_NAME/proxy:latest"
+  
+  - name: cloud_sql_proxy_image
+    type: string
+    description: "Cloud SQL proxy container image"
+    default: "gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.8.0"
+
+# Main resources definition
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-run-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: run.googleapis.com
+      consumerId: $(ref.project-info.projectId)
+    metadata:
+      dependsOn:
+        - project-info
+
+  - name: enable-sql-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: sqladmin.googleapis.com
+      consumerId: $(ref.project-info.projectId)
+    metadata:
+      dependsOn:
+        - project-info
+
+  - name: enable-secretmanager-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: secretmanager.googleapis.com
+      consumerId: $(ref.project-info.projectId)
+    metadata:
+      dependsOn:
+        - project-info
+
+  - name: enable-artifactregistry-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: artifactregistry.googleapis.com
+      consumerId: $(ref.project-info.projectId)
+    metadata:
+      dependsOn:
+        - project-info
+
+  - name: enable-cloudbuild-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: cloudbuild.googleapis.com
+      consumerId: $(ref.project-info.projectId)
+    metadata:
+      dependsOn:
+        - project-info
+
+  # Get project information
+  - name: project-info
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: $(var.project_id)
+
+  # Create Artifact Registry repository for container images
+  - name: artifact-registry-repository
+    type: gcp-types/artifactregistry-v1:projects.locations.repositories
+    properties:
+      parent: projects/$(var.project_id)/locations/$(var.region)
+      repositoryId: $(var.repository_name)-$(var.random_suffix)
+      repository:
+        format: DOCKER
+        description: "Multi-container application repository for storing Docker images"
+        labels:
+          environment: production
+          application: multi-container-app
+    metadata:
+      dependsOn:
+        - enable-artifactregistry-api
+
+  # Generate secure random password for database user
+  - name: generate-db-password
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/$(var.project_id)/locations/$(var.region)
+      function:
+        name: generate-password
+        sourceArchiveUrl: "gs://gcp-community/generate-password.zip"
+        entryPoint: generatePassword
+        runtime: python39
+        timeout: 60s
+        availableMemoryMb: 128
+    metadata:
+      dependsOn:
+        - enable-cloudbuild-api
+
+  # Create Cloud SQL PostgreSQL instance
+  - name: cloud-sql-instance
+    type: gcp-types/sqladmin-v1beta4:instances
+    properties:
+      name: $(var.sql_instance_name)-$(var.random_suffix)
+      project: $(var.project_id)
+      region: $(var.region)
+      databaseVersion: $(var.database_version)
+      settings:
+        tier: $(var.database_tier)
+        storageType: PD_SSD
+        dataDiskSizeGb: 10
+        dataDiskType: PD_SSD
+        backupConfiguration:
+          enabled: true
+          startTime: "02:00"
+          pointInTimeRecoveryEnabled: true
+          transactionLogRetentionDays: 7
+          backupRetentionSettings:
+            retentionUnit: COUNT
+            retainedBackups: 7
+        ipConfiguration:
+          ipv4Enabled: false
+          requireSsl: true
+          authorizedNetworks: []
+        locationPreference:
+          zone: $(var.zone)
+        activationPolicy: ALWAYS
+        availabilityType: ZONAL
+        pricingPlan: PER_USE
+        replicationType: SYNCHRONOUS
+        storageAutoResize: true
+        storageAutoResizeLimit: 100
+        userLabels:
+          environment: production
+          application: multi-container-app
+          component: database
+    metadata:
+      dependsOn:
+        - enable-sql-api
+
+  # Create application database
+  - name: application-database
+    type: gcp-types/sqladmin-v1beta4:databases
+    properties:
+      name: $(var.database_name)
+      instance: $(ref.cloud-sql-instance.name)
+      project: $(var.project_id)
+      charset: UTF8
+      collation: en_US.UTF8
+    metadata:
+      dependsOn:
+        - cloud-sql-instance
+
+  # Create database user
+  - name: database-user
+    type: gcp-types/sqladmin-v1beta4:users
+    properties:
+      name: $(var.database_user)
+      instance: $(ref.cloud-sql-instance.name)
+      project: $(var.project_id)
+      password: "$(random-password)"  # This would be generated securely
+    metadata:
+      dependsOn:
+        - cloud-sql-instance
+
+  # Store database password in Secret Manager
+  - name: db-password-secret
+    type: gcp-types/secretmanager-v1:projects.secrets
+    properties:
+      parent: projects/$(var.project_id)
+      secretId: db-password
+      secret:
+        replication:
+          automatic: {}
+        labels:
+          environment: production
+          application: multi-container-app
+          component: database-credentials
+    metadata:
+      dependsOn:
+        - enable-secretmanager-api
+
+  # Create initial version of the database password secret
+  - name: db-password-secret-version
+    type: gcp-types/secretmanager-v1:projects.secrets.versions
+    properties:
+      parent: $(ref.db-password-secret.name)
+      secretVersion:
+        payload:
+          data: "$(base64encode(random-password))"  # Secure password would be generated
+    metadata:
+      dependsOn:
+        - db-password-secret
+
+  # Store database connection string in Secret Manager
+  - name: db-connection-string-secret
+    type: gcp-types/secretmanager-v1:projects.secrets
+    properties:
+      parent: projects/$(var.project_id)
+      secretId: db-connection-string
+      secret:
+        replication:
+          automatic: {}
+        labels:
+          environment: production
+          application: multi-container-app
+          component: database-connection
+    metadata:
+      dependsOn:
+        - enable-secretmanager-api
+
+  # Create initial version of the connection string secret
+  - name: db-connection-string-secret-version
+    type: gcp-types/secretmanager-v1:projects.secrets.versions
+    properties:
+      parent: $(ref.db-connection-string-secret.name)
+      secretVersion:
+        payload:
+          data: "$(base64encode(concat('postgresql://', var.database_user, ':', 'GENERATED_PASSWORD', '@localhost:5432/', var.database_name)))"
+    metadata:
+      dependsOn:
+        - db-connection-string-secret
+
+  # Get default compute service account for Cloud Run
+  - name: default-compute-sa
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      name: projects/$(var.project_id)/serviceAccounts/$(var.project_id)-compute@developer.gserviceaccount.com
+
+  # Grant Cloud Run service account access to Secret Manager
+  - name: secret-manager-accessor-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(var.project_id)
+      role: roles/secretmanager.secretAccessor
+      member: serviceAccount:$(var.project_id)-compute@developer.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - default-compute-sa
+
+  # Grant Cloud Run service account access to Cloud SQL
+  - name: cloud-sql-client-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(var.project_id)
+      role: roles/cloudsql.client
+      member: serviceAccount:$(var.project_id)-compute@developer.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - default-compute-sa
+
+  # Deploy multi-container Cloud Run service
+  - name: cloud-run-service
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/$(var.project_id)
+      location: $(var.region)
+      apiVersion: serving.knative.dev/v1
+      kind: Service
+      metadata:
+        name: $(var.service_name)-$(var.random_suffix)
+        namespace: $(var.project_id)
+        labels:
+          environment: production
+          application: multi-container-app
+        annotations:
+          run.googleapis.com/ingress: all
+          run.googleapis.com/execution-environment: gen2
+          run.googleapis.com/cpu-throttling: "false"
+      spec:
+        template:
+          metadata:
+            labels:
+              version: "1.0"
+            annotations:
+              run.googleapis.com/execution-environment: gen2
+              run.googleapis.com/cpu-throttling: "false"
+          spec:
+            serviceAccountName: $(var.project_id)-compute@developer.gserviceaccount.com
+            containerConcurrency: 100
+            timeoutSeconds: 300
+            containers:
+              # Nginx Proxy Container - Main entry point
+              - name: proxy
+                image: $(var.proxy_image)
+                ports:
+                  - name: http1
+                    containerPort: 8000
+                    protocol: TCP
+                resources:
+                  limits:
+                    cpu: 1000m
+                    memory: 512Mi
+                  requests:
+                    cpu: 100m
+                    memory: 128Mi
+                env:
+                  - name: NODE_ENV
+                    value: production
+                livenessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8000
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+                  timeoutSeconds: 5
+                  failureThreshold: 3
+                readinessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8000
+                  initialDelaySeconds: 5
+                  periodSeconds: 5
+                  timeoutSeconds: 3
+                  failureThreshold: 3
+
+              # Frontend Container - React/Vue application
+              - name: frontend
+                image: $(var.frontend_image)
+                ports:
+                  - name: frontend
+                    containerPort: 3000
+                    protocol: TCP
+                resources:
+                  limits:
+                    cpu: 1000m
+                    memory: 512Mi
+                  requests:
+                    cpu: 100m
+                    memory: 128Mi
+                env:
+                  - name: NODE_ENV
+                    value: production
+                  - name: PORT
+                    value: "3000"
+                livenessProbe:
+                  httpGet:
+                    path: /health
+                    port: 3000
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+                  timeoutSeconds: 5
+                  failureThreshold: 3
+
+              # Backend API Container - Node.js/Express
+              - name: backend
+                image: $(var.backend_image)
+                ports:
+                  - name: backend
+                    containerPort: 8080
+                    protocol: TCP
+                resources:
+                  limits:
+                    cpu: 1000m
+                    memory: 512Mi
+                  requests:
+                    cpu: 100m
+                    memory: 128Mi
+                env:
+                  - name: NODE_ENV
+                    value: production
+                  - name: PORT
+                    value: "8080"
+                  - name: DB_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: db-password
+                        key: latest
+                  - name: DB_HOST
+                    value: localhost
+                  - name: DB_PORT
+                    value: "5432"
+                  - name: DB_NAME
+                    value: $(var.database_name)
+                  - name: DB_USER
+                    value: $(var.database_user)
+                livenessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8080
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+                  timeoutSeconds: 5
+                  failureThreshold: 3
+
+              # Cloud SQL Proxy Sidecar Container
+              - name: cloud-sql-proxy
+                image: $(var.cloud_sql_proxy_image)
+                args:
+                  - /cloud-sql-proxy
+                  - --port=5432
+                  - --address=0.0.0.0
+                  - $(var.project_id):$(var.region):$(ref.cloud-sql-instance.name)
+                ports:
+                  - name: sql-proxy
+                    containerPort: 5432
+                    protocol: TCP
+                resources:
+                  limits:
+                    cpu: 500m
+                    memory: 256Mi
+                  requests:
+                    cpu: 50m
+                    memory: 64Mi
+                securityContext:
+                  runAsNonRoot: true
+                  runAsUser: 65532
+                  runAsGroup: 65532
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities:
+                    drop:
+                      - ALL
+    metadata:
+      dependsOn:
+        - enable-run-api
+        - cloud-sql-instance
+        - artifact-registry-repository
+        - db-password-secret-version
+        - secret-manager-accessor-binding
+        - cloud-sql-client-binding
+
+  # Configure Cloud Run service to allow unauthenticated access
+  - name: cloud-run-iam-policy
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(var.project_id)
+      role: roles/run.invoker
+      member: allUsers
+    metadata:
+      dependsOn:
+        - cloud-run-service
+
+# Outputs for verification and integration
+outputs:
+  - name: project_id
+    value: $(var.project_id)
+    description: "Google Cloud Project ID"
+
+  - name: region
+    value: $(var.region)
+    description: "Deployment region"
+
+  - name: artifact_registry_repository
+    value: $(ref.artifact-registry-repository.name)
+    description: "Artifact Registry repository for container images"
+
+  - name: cloud_sql_instance_name
+    value: $(ref.cloud-sql-instance.name)
+    description: "Cloud SQL instance name"
+
+  - name: cloud_sql_connection_name
+    value: $(var.project_id):$(var.region):$(ref.cloud-sql-instance.name)
+    description: "Cloud SQL connection string for applications"
+
+  - name: database_name
+    value: $(var.database_name)
+    description: "Application database name"
+
+  - name: database_user
+    value: $(var.database_user)
+    description: "Application database user"
+
+  - name: cloud_run_service_name
+    value: $(ref.cloud-run-service.metadata.name)
+    description: "Cloud Run service name"
+
+  - name: cloud_run_service_url
+    value: $(ref.cloud-run-service.status.url)
+    description: "Cloud Run service URL for accessing the application"
+
+  - name: secret_manager_db_password
+    value: $(ref.db-password-secret.name)
+    description: "Secret Manager secret name for database password"
+
+  - name: secret_manager_connection_string
+    value: $(ref.db-connection-string-secret.name)
+    description: "Secret Manager secret name for database connection string"
+
+# Additional metadata for Infrastructure Manager
+metadata:
+  version: "1.0"
+  description: "Multi-container Cloud Run application with PostgreSQL backend"
+  author: "Google Cloud Infrastructure Manager"
+  created: "2025-01-12"
+  tags:
+    - cloud-run
+    - multi-container
+    - postgresql
+    - sidecar-pattern
+    - serverless
+    - microservices
+  cost_estimate: "$10-30/month for development usage"
+  dependencies:
+    - Cloud Run API
+    - Cloud SQL Admin API
+    - Secret Manager API
+    - Artifact Registry API
+    - Cloud Build API

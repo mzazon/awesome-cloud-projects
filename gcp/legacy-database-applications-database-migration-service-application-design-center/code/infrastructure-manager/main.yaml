@@ -1,0 +1,476 @@
+# Infrastructure Manager Configuration for Legacy Database Applications Modernization
+# This configuration deploys the complete infrastructure for migrating SQL Server to PostgreSQL
+# using Database Migration Service and modernizing applications with Application Design Center
+
+# Import required modules and configurations
+imports:
+  - path: modules/networking.yaml
+  - path: modules/cloudsql.yaml
+  - path: modules/database-migration.yaml
+  - path: modules/application-design-center.yaml
+  - path: modules/monitoring.yaml
+
+# Global configuration and metadata
+metadata:
+  version: "1.0"
+  title: "Legacy Database Applications Modernization"
+  description: "Complete infrastructure for SQL Server to PostgreSQL migration with AI-assisted application modernization"
+  labels:
+    environment: "modernization"
+    project-type: "database-migration"
+    use-case: "legacy-modernization"
+
+# Template configuration with parameterization
+config:
+  # Project and global settings
+  project_id: "${PROJECT_ID}"
+  region: "${REGION}"
+  zone: "${ZONE}"
+  
+  # Resource naming configuration
+  resource_prefix: "${RESOURCE_PREFIX:-legacy-modernization}"
+  random_suffix: "${RANDOM_SUFFIX}"
+  
+  # Network configuration
+  network_name: "${NETWORK_NAME:-default}"
+  subnet_name: "${SUBNET_NAME:-default}"
+  
+  # Database configuration
+  source_database:
+    host: "${SOURCE_DB_HOST}"
+    port: "${SOURCE_DB_PORT:-1433}"
+    username: "${SOURCE_DB_USERNAME}"
+    password: "${SOURCE_DB_PASSWORD}"
+    database_name: "${SOURCE_DB_NAME}"
+  
+  target_database:
+    version: "${POSTGRES_VERSION:-POSTGRES_15}"
+    tier: "${DB_TIER:-db-standard-2}"
+    storage_size: "${DB_STORAGE_SIZE:-100}"
+    storage_type: "${DB_STORAGE_TYPE:-SSD}"
+    backup_enabled: true
+    point_in_time_recovery: true
+    deletion_protection: true
+  
+  # Migration configuration
+  migration:
+    type: "CONTINUOUS"
+    filter_tables: "${FILTER_TABLES:-}"
+    exclude_objects: "${EXCLUDE_OBJECTS:-}"
+  
+  # Application modernization configuration
+  application_design:
+    workspace_name: "${WORKSPACE_NAME:-legacy-modernization-workspace}"
+    project_name: "${PROJECT_NAME:-modernization-project}"
+    analysis_scope:
+      - "database_layer"
+      - "business_logic"
+      - "data_access_patterns"
+    target_frameworks:
+      - "spring-boot"
+      - "hibernate"
+      - "hikari"
+
+# Resources definition using Infrastructure Manager syntax
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${PROJECT_ID}/services/sqladmin.googleapis.com
+      
+  - name: enable-dms-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${PROJECT_ID}/services/datamigration.googleapis.com
+      
+  - name: enable-app-design-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${PROJECT_ID}/services/applicationdesigncenter.googleapis.com
+      
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${PROJECT_ID}/services/monitoring.googleapis.com
+      
+  - name: enable-logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${PROJECT_ID}/services/logging.googleapis.com
+
+  # Cloud SQL PostgreSQL instance for migration target
+  - name: postgres-instance
+    type: gcp-types/sqladmin-v1beta4:instances
+    properties:
+      name: $(ref.naming.postgres_instance_name)
+      project: ${PROJECT_ID}
+      region: ${REGION}
+      databaseVersion: $(ref.config.target_database.version)
+      settings:
+        tier: $(ref.config.target_database.tier)
+        diskType: $(ref.config.target_database.storage_type)
+        diskSize: $(ref.config.target_database.storage_size)
+        diskAutoresize: true
+        diskAutoresizeLimit: 0
+        pricingPlan: PER_USE
+        replicationType: SYNCHRONOUS
+        storageAutoResize: true
+        storageAutoResizeLimit: 0
+        activationPolicy: ALWAYS
+        # High availability configuration
+        availabilityType: REGIONAL
+        # Backup configuration
+        backupConfiguration:
+          enabled: $(ref.config.target_database.backup_enabled)
+          startTime: "02:00"
+          pointInTimeRecoveryEnabled: $(ref.config.target_database.point_in_time_recovery)
+          transactionLogRetentionDays: 7
+          backupRetentionSettings:
+            retentionUnit: COUNT
+            retainedBackups: 30
+        # Maintenance window
+        maintenanceWindow:
+          day: 7  # Sunday
+          hour: 3
+          updateTrack: stable
+        # Security and networking
+        ipConfiguration:
+          ipv4Enabled: true
+          requireSsl: true
+          authorizedNetworks:
+            - name: "allow-internal"
+              value: "10.0.0.0/8"
+        # Database flags for PostgreSQL optimization
+        databaseFlags:
+          - name: shared_preload_libraries
+            value: pg_stat_statements
+          - name: log_statement
+            value: all
+          - name: log_min_duration_statement
+            value: "1000"
+          - name: track_activity_query_size
+            value: "2048"
+        # Deletion protection
+        deletionProtectionEnabled: $(ref.config.target_database.deletion_protection)
+        # User labels for resource management
+        userLabels:
+          environment: modernization
+          purpose: postgres-target
+          migration-source: sqlserver
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # Database Migration Service connection profile for source SQL Server
+  - name: source-connection-profile
+    type: gcp-types/datamigration-v1:projects.locations.connectionProfiles
+    properties:
+      parent: projects/${PROJECT_ID}/locations/${REGION}
+      connectionProfileId: $(ref.naming.source_profile_name)
+      connectionProfile:
+        displayName: "SQL Server Source Connection Profile"
+        labels:
+          environment: modernization
+          database-type: sqlserver
+          purpose: migration-source
+        sqlserver:
+          host: $(ref.config.source_database.host)
+          port: $(ref.config.source_database.port)
+          username: $(ref.config.source_database.username)
+          password: $(ref.config.source_database.password)
+          ssl: false
+    metadata:
+      dependsOn:
+        - enable-dms-api
+
+  # Database Migration Service connection profile for destination Cloud SQL
+  - name: destination-connection-profile
+    type: gcp-types/datamigration-v1:projects.locations.connectionProfiles
+    properties:
+      parent: projects/${PROJECT_ID}/locations/${REGION}
+      connectionProfileId: $(ref.naming.destination_profile_name)
+      connectionProfile:
+        displayName: "Cloud SQL PostgreSQL Destination Profile"
+        labels:
+          environment: modernization
+          database-type: postgresql
+          purpose: migration-destination
+        cloudsql:
+          cloudSqlId: projects/${PROJECT_ID}/instances/$(ref.postgres-instance.name)
+    metadata:
+      dependsOn:
+        - postgres-instance
+        - enable-dms-api
+
+  # Database Migration Service migration job
+  - name: migration-job
+    type: gcp-types/datamigration-v1:projects.locations.migrationJobs
+    properties:
+      parent: projects/${PROJECT_ID}/locations/${REGION}
+      migrationJobId: $(ref.naming.migration_job_name)
+      migrationJob:
+        displayName: "SQL Server to PostgreSQL Migration"
+        labels:
+          environment: modernization
+          source-type: sqlserver
+          destination-type: postgresql
+        type: $(ref.config.migration.type)
+        source: $(ref.source-connection-profile.name)
+        destination: $(ref.destination-connection-profile.name)
+        # Migration configuration
+        performanceConfig:
+          dumpParallelLevel: OPTIMAL
+        # VPC peering configuration
+        vpcPeeringConnectivity:
+          vpc: projects/${PROJECT_ID}/global/networks/$(ref.config.network_name)
+        # Filter configuration (if specified)
+        filter:
+          $if: $(ref.config.migration.filter_tables)
+          $then:
+            includeTables:
+              schemas:
+                - name: $(ref.config.source_database.database_name)
+                  tables:
+                    $split: $(ref.config.migration.filter_tables)
+    metadata:
+      dependsOn:
+        - source-connection-profile
+        - destination-connection-profile
+
+  # Application Design Center workspace for modernization
+  - name: app-design-workspace
+    type: gcp-types/applicationdesigncenter-v1alpha:projects.locations.workspaces
+    properties:
+      parent: projects/${PROJECT_ID}/locations/${REGION}
+      workspaceId: $(ref.config.application_design.workspace_name)
+      workspace:
+        displayName: "Legacy Application Modernization Workspace"
+        description: "AI-powered workspace for modernizing legacy database applications"
+        labels:
+          environment: modernization
+          purpose: application-modernization
+          migration-target: postgresql
+    metadata:
+      dependsOn:
+        - enable-app-design-api
+
+  # Application Design Center project for analysis
+  - name: app-design-project
+    type: gcp-types/applicationdesigncenter-v1alpha:projects.locations.workspaces.projects
+    properties:
+      parent: $(ref.app-design-workspace.name)
+      projectId: $(ref.config.application_design.project_name)
+      project:
+        displayName: "Database Modernization Project"
+        description: "Project for analyzing and modernizing legacy database applications"
+        analysisConfiguration:
+          scope: $(ref.config.application_design.analysis_scope)
+          targetFrameworks: $(ref.config.application_design.target_frameworks)
+          databaseMigration:
+            sourceType: "SQL_SERVER"
+            targetType: "POSTGRESQL"
+            migrationJobReference: $(ref.migration-job.name)
+        labels:
+          analysis-type: database-modernization
+          target-platform: postgresql
+    metadata:
+      dependsOn:
+        - app-design-workspace
+        - migration-job
+
+  # Cloud Monitoring workspace for observability
+  - name: monitoring-workspace
+    type: gcp-types/monitoring-v1:projects.metricDescriptors
+    properties:
+      name: projects/${PROJECT_ID}/metricDescriptors/custom.googleapis.com/database_migration/progress
+      metricDescriptor:
+        displayName: "Database Migration Progress"
+        description: "Tracks the progress of database migration operations"
+        type: custom.googleapis.com/database_migration/progress
+        metricKind: GAUGE
+        valueType: DOUBLE
+        unit: "1"
+        labels:
+          - key: migration_job
+            valueType: STRING
+            description: "Name of the migration job"
+          - key: source_database
+            valueType: STRING
+            description: "Source database identifier"
+          - key: target_database
+            valueType: STRING
+            description: "Target database identifier"
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+
+  # Cloud Logging sink for migration logs
+  - name: migration-log-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      parent: projects/${PROJECT_ID}
+      sinkId: migration-logs-sink
+      sink:
+        name: migration-logs-sink
+        destination: storage.googleapis.com/$(ref.naming.log_bucket_name)
+        filter: |
+          resource.type="gce_instance"
+          logName="projects/${PROJECT_ID}/logs/datamigration"
+          OR
+          resource.type="cloudsql_database"
+        description: "Centralized logging for database migration operations"
+        includeChildren: true
+    metadata:
+      dependsOn:
+        - enable-logging-api
+
+  # Cloud Storage bucket for migration logs and artifacts
+  - name: migration-artifacts-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(ref.naming.log_bucket_name)
+      project: ${PROJECT_ID}
+      location: ${REGION}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      labels:
+        environment: modernization
+        purpose: migration-artifacts
+        retention-period: "90-days"
+
+  # IAM service account for migration operations
+  - name: migration-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      name: projects/${PROJECT_ID}/serviceAccounts/$(ref.naming.service_account_email)
+      accountId: $(ref.naming.service_account_name)
+      serviceAccount:
+        displayName: "Database Migration Service Account"
+        description: "Service account for database migration and application modernization operations"
+
+  # IAM policy bindings for migration service account
+  - name: migration-service-account-bindings
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${PROJECT_ID}
+      member: serviceAccount:$(ref.migration-service-account.email)
+      role: roles/cloudsql.client
+    metadata:
+      dependsOn:
+        - migration-service-account
+
+  - name: migration-dms-permissions
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${PROJECT_ID}
+      member: serviceAccount:$(ref.migration-service-account.email)
+      role: roles/datamigration.admin
+    metadata:
+      dependsOn:
+        - migration-service-account
+
+  # Naming helper for consistent resource naming
+  - name: naming
+    type: helper/naming.yaml
+    properties:
+      prefix: $(ref.config.resource_prefix)
+      suffix: $(ref.config.random_suffix)
+      components:
+        postgres_instance: "postgres"
+        source_profile: "sqlserver-source"
+        destination_profile: "postgres-dest"
+        migration_job: "migration"
+        log_bucket: "migration-logs"
+        service_account: "migration-sa"
+
+# Outputs for integration and verification
+outputs:
+  # Database connection information
+  postgres_instance_name:
+    description: "Name of the Cloud SQL PostgreSQL instance"
+    value: $(ref.postgres-instance.name)
+    
+  postgres_connection_name:
+    description: "Connection name for the PostgreSQL instance"
+    value: $(ref.postgres-instance.connectionName)
+    
+  postgres_ip_address:
+    description: "IP address of the PostgreSQL instance"
+    value: $(ref.postgres-instance.ipAddresses[0].ipAddress)
+    
+  # Migration job information
+  migration_job_name:
+    description: "Name of the database migration job"
+    value: $(ref.migration-job.name)
+    
+  migration_job_state:
+    description: "Current state of the migration job"
+    value: $(ref.migration-job.state)
+    
+  source_connection_profile:
+    description: "Name of the source connection profile"
+    value: $(ref.source-connection-profile.name)
+    
+  destination_connection_profile:
+    description: "Name of the destination connection profile"
+    value: $(ref.destination-connection-profile.name)
+    
+  # Application Design Center information
+  app_design_workspace:
+    description: "Application Design Center workspace name"
+    value: $(ref.app-design-workspace.name)
+    
+  app_design_project:
+    description: "Application Design Center project name"
+    value: $(ref.app-design-project.name)
+    
+  # Monitoring and logging
+  migration_logs_bucket:
+    description: "Cloud Storage bucket for migration logs"
+    value: $(ref.migration-artifacts-bucket.name)
+    
+  service_account_email:
+    description: "Email of the migration service account"
+    value: $(ref.migration-service-account.email)
+    
+  # Instructions for next steps
+  deployment_instructions:
+    description: "Instructions for using this deployment"
+    value: |
+      1. Set required environment variables:
+         - PROJECT_ID: Your Google Cloud project ID
+         - REGION: Target region (e.g., us-central1)
+         - SOURCE_DB_HOST: SQL Server hostname
+         - SOURCE_DB_USERNAME: SQL Server username
+         - SOURCE_DB_PASSWORD: SQL Server password
+         
+      2. Deploy the infrastructure:
+         gcloud infra-manager deployments apply DEPLOYMENT_NAME \
+           --location=REGION \
+           --service-account=SERVICE_ACCOUNT \
+           --git-source-repo=REPO_URL \
+           --git-source-directory=PATH_TO_THIS_DIRECTORY
+         
+      3. Monitor migration progress:
+         gcloud datamigration migration-jobs describe MIGRATION_JOB_NAME \
+           --region=REGION
+         
+      4. Access Application Design Center workspace for modernization guidance:
+         gcloud alpha application-design-center workspaces describe WORKSPACE_NAME \
+           --region=REGION

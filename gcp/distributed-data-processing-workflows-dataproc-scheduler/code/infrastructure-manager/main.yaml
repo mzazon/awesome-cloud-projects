@@ -1,0 +1,465 @@
+# Infrastructure Manager Configuration for Distributed Data Processing Workflows
+# This configuration deploys Cloud Dataproc, Cloud Scheduler, Cloud Storage, and BigQuery
+# for automated data processing pipelines using Apache Spark
+
+# Deployment configuration
+deployment:
+  name: distributed-data-processing-workflows
+  location: us-central1
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    default: ""
+    
+  region:
+    type: string
+    description: "Google Cloud region for resources"
+    default: "us-central1"
+    
+  zone:
+    type: string
+    description: "Google Cloud zone for compute resources"
+    default: "us-central1-a"
+    
+  random_suffix:
+    type: string
+    description: "Random suffix for unique resource names"
+    default: ""
+    
+  bucket_name:
+    type: string
+    description: "Name for the main data bucket"
+    default: ""
+    
+  staging_bucket_name:
+    type: string
+    description: "Name for the staging bucket"
+    default: ""
+    
+  dataset_name:
+    type: string
+    description: "BigQuery dataset name"
+    default: "analytics_results"
+    
+  workflow_name:
+    type: string
+    description: "Dataproc workflow template name"
+    default: "sales-analytics-workflow"
+    
+  schedule_timezone:
+    type: string
+    description: "Timezone for Cloud Scheduler"
+    default: "America/New_York"
+    
+  schedule_cron:
+    type: string
+    description: "Cron schedule for data processing"
+    default: "0 2 * * *"
+
+# Resource definitions
+resources:
+  # ============================================================================
+  # CLOUD STORAGE RESOURCES
+  # ============================================================================
+  
+  # Main data bucket for input files and processed results
+  data_storage_bucket:
+    type: gcp-types/storage-v1:buckets
+    name: $(ref.data_storage_bucket.name)
+    properties:
+      name: ${bucket_name}
+      location: ${region}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycleManagement:
+        enabled: true
+        rules:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90
+          - action:
+              type: Delete
+            condition:
+              age: 365
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      publicAccessPrevention: enforced
+      
+  # Staging bucket for Dataproc operations and temporary files
+  staging_storage_bucket:
+    type: gcp-types/storage-v1:buckets
+    name: $(ref.staging_storage_bucket.name)
+    properties:
+      name: ${staging_bucket_name}
+      location: ${region}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycleManagement:
+        enabled: true
+        rules:
+          - action:
+              type: Delete
+            condition:
+              age: 7
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      publicAccessPrevention: enforced
+
+  # ============================================================================
+  # BIGQUERY RESOURCES
+  # ============================================================================
+  
+  # BigQuery dataset for analytics results
+  analytics_dataset:
+    type: gcp-types/bigquery-v2:datasets
+    name: ${dataset_name}
+    properties:
+      datasetId: ${dataset_name}
+      location: ${region}
+      description: "Sales analytics results from Dataproc processing"
+      defaultTableExpirationMs: 2592000000  # 30 days
+      access:
+        - role: OWNER
+          userByEmail: $(ref.dataproc_service_account.email)
+        - role: WRITER
+          userByEmail: $(ref.scheduler_service_account.email)
+      labels:
+        purpose: analytics
+        component: data-processing
+        
+  # BigQuery table for processed sales summary
+  sales_summary_table:
+    type: gcp-types/bigquery-v2:tables
+    name: sales_summary
+    properties:
+      tableId: sales_summary
+      datasetId: $(ref.analytics_dataset.datasetId)
+      description: "Processed sales analytics summary data"
+      schema:
+        fields:
+          - name: region
+            type: STRING
+            mode: REQUIRED
+            description: "Sales region"
+          - name: category
+            type: STRING
+            mode: REQUIRED
+            description: "Product category"
+          - name: total_sales
+            type: FLOAT
+            mode: REQUIRED
+            description: "Total sales amount"
+          - name: transaction_count
+            type: INTEGER
+            mode: REQUIRED
+            description: "Number of transactions"
+          - name: avg_order_value
+            type: FLOAT
+            mode: REQUIRED
+            description: "Average order value"
+          - name: processing_timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "Processing timestamp"
+      timePartitioning:
+        type: DAY
+        field: processing_timestamp
+      clustering:
+        fields: ["region", "category"]
+      labels:
+        purpose: analytics
+        component: data-processing
+    depends_on:
+      - analytics_dataset
+
+  # ============================================================================
+  # IAM SERVICE ACCOUNTS
+  # ============================================================================
+  
+  # Service account for Cloud Scheduler to invoke Dataproc workflows
+  scheduler_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    name: dataproc-scheduler
+    properties:
+      accountId: dataproc-scheduler
+      displayName: "Dataproc Workflow Scheduler"
+      description: "Service account for scheduling Dataproc workflows"
+      
+  # Service account for Dataproc clusters and jobs
+  dataproc_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    name: dataproc-worker
+    properties:
+      accountId: dataproc-worker
+      displayName: "Dataproc Worker Service Account"
+      description: "Service account for Dataproc cluster workers"
+
+  # ============================================================================
+  # IAM POLICY BINDINGS
+  # ============================================================================
+  
+  # Grant scheduler service account permissions to manage Dataproc workflows
+  scheduler_dataproc_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    name: scheduler-dataproc-editor
+    properties:
+      resource: ${project_id}
+      role: roles/dataproc.editor
+      member: serviceAccount:$(ref.scheduler_service_account.email)
+    depends_on:
+      - scheduler_service_account
+      
+  # Grant scheduler service account storage object viewer permissions
+  scheduler_storage_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    name: scheduler-storage-viewer
+    properties:
+      resource: ${project_id}
+      role: roles/storage.objectViewer
+      member: serviceAccount:$(ref.scheduler_service_account.email)
+    depends_on:
+      - scheduler_service_account
+      
+  # Grant scheduler service account BigQuery data editor permissions
+  scheduler_bigquery_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    name: scheduler-bigquery-editor
+    properties:
+      resource: ${project_id}
+      role: roles/bigquery.dataEditor
+      member: serviceAccount:$(ref.scheduler_service_account.email)
+    depends_on:
+      - scheduler_service_account
+      
+  # Grant Dataproc service account storage admin permissions for buckets
+  dataproc_storage_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    name: dataproc-storage-admin
+    properties:
+      resource: ${project_id}
+      role: roles/storage.admin
+      member: serviceAccount:$(ref.dataproc_service_account.email)
+    depends_on:
+      - dataproc_service_account
+      
+  # Grant Dataproc service account BigQuery job user permissions
+  dataproc_bigquery_job_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    name: dataproc-bigquery-job-user
+    properties:
+      resource: ${project_id}
+      role: roles/bigquery.jobUser
+      member: serviceAccount:$(ref.dataproc_service_account.email)
+    depends_on:
+      - dataproc_service_account
+      
+  # Grant Dataproc service account BigQuery data editor permissions
+  dataproc_bigquery_data_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    name: dataproc-bigquery-data-editor
+    properties:
+      resource: ${project_id}
+      role: roles/bigquery.dataEditor
+      member: serviceAccount:$(ref.dataproc_service_account.email)
+    depends_on:
+      - dataproc_service_account
+
+  # ============================================================================
+  # DATAPROC WORKFLOW TEMPLATE
+  # ============================================================================
+  
+  # Dataproc workflow template for sales analytics processing
+  sales_analytics_workflow:
+    type: gcp-types/dataproc-v1:projects.regions.workflowTemplates
+    name: ${workflow_name}
+    properties:
+      workflowTemplateId: ${workflow_name}
+      placement:
+        managedCluster:
+          clusterName: sales-analytics-cluster
+          config:
+            masterConfig:
+              numInstances: 1
+              machineTypeUri: e2-standard-4
+              diskConfig:
+                bootDiskType: pd-standard
+                bootDiskSizeGb: 50
+            workerConfig:
+              numInstances: 2
+              machineTypeUri: e2-standard-4
+              diskConfig:
+                bootDiskType: pd-standard
+                bootDiskSizeGb: 50
+            secondaryWorkerConfig:
+              isPreemptible: true
+              numInstances: 0
+              machineTypeUri: e2-standard-4
+            softwareConfig:
+              imageVersion: 2.1-debian11
+              properties:
+                "dataproc:dataproc.allow.zero.workers": "true"
+                "spark:spark.sql.adaptive.enabled": "true"
+                "spark:spark.sql.adaptive.coalescePartitions.enabled": "true"
+            gceClusterConfig:
+              zoneUri: ${zone}
+              subnetworkUri: default
+              serviceAccount: $(ref.dataproc_service_account.email)
+              serviceAccountScopes:
+                - https://www.googleapis.com/auth/cloud-platform
+              metadata:
+                enable-cloud-sql-hive-metastore: "false"
+              tags:
+                - dataproc-cluster
+                - analytics-processing
+            autoscalingConfig:
+              policyUri: $(ref.autoscaling_policy.name)
+            encryptionConfig:
+              gcePdKmsKeyName: ""
+            lifecycleConfig:
+              idleDeleteTtl: 600s  # Delete cluster after 10 minutes of inactivity
+      jobs:
+        - stepId: sales-analytics-job
+          pysparkJob:
+            mainPythonFileUri: gs://${staging_bucket_name}/scripts/spark_sales_analysis.py
+            args:
+              - gs://${bucket_name}/input/sales_data.csv
+              - gs://${bucket_name}/output/
+              - ${project_id}
+            pythonFileUris:
+              - gs://${staging_bucket_name}/scripts/spark_sales_analysis.py
+            properties:
+              "spark.jars.packages": "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.28.0"
+      labels:
+        purpose: analytics
+        component: data-processing
+    depends_on:
+      - dataproc_service_account
+      - autoscaling_policy
+      
+  # Autoscaling policy for the Dataproc cluster
+  autoscaling_policy:
+    type: gcp-types/dataproc-v1:projects.regions.autoscalingPolicies
+    name: sales-analytics-autoscaling
+    properties:
+      autoscalingPolicyId: sales-analytics-autoscaling
+      basicAlgorithm:
+        cooldownPeriod: 120s
+        yarnConfig:
+          scaleUpFactor: 0.1
+          scaleDownFactor: 1.0
+          gracefulDecommissionTimeout: 600s
+      secondaryWorkerConfig:
+        minInstances: 0
+        maxInstances: 4
+        weight: 1
+      labels:
+        purpose: analytics
+        component: autoscaling
+
+  # ============================================================================
+  # CLOUD SCHEDULER JOB
+  # ============================================================================
+  
+  # Cloud Scheduler job for daily analytics processing
+  daily_analytics_scheduler:
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    name: sales-analytics-daily
+    properties:
+      name: projects/${project_id}/locations/${region}/jobs/sales-analytics-daily
+      description: "Daily sales analytics processing workflow"
+      schedule: ${schedule_cron}
+      timeZone: ${schedule_timezone}
+      httpTarget:
+        uri: https://dataproc.googleapis.com/v1/projects/${project_id}/regions/${region}/workflowTemplates/${workflow_name}:instantiate
+        httpMethod: POST
+        headers:
+          Content-Type: application/json
+        body: |
+          {"requestId": "scheduled-$(date +%s)"}
+        oauthToken:
+          serviceAccountEmail: $(ref.scheduler_service_account.email)
+          scope: https://www.googleapis.com/auth/cloud-platform
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 300s
+        minBackoffDuration: 60s
+        maxBackoffDuration: 300s
+        maxDoublings: 2
+      labels:
+        purpose: scheduling
+        component: data-processing
+    depends_on:
+      - scheduler_service_account
+      - sales_analytics_workflow
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+
+outputs:
+  data_bucket_name:
+    description: "Name of the main data storage bucket"
+    value: $(ref.data_storage_bucket.name)
+    
+  staging_bucket_name:
+    description: "Name of the staging storage bucket"
+    value: $(ref.staging_storage_bucket.name)
+    
+  bigquery_dataset_id:
+    description: "BigQuery dataset ID for analytics results"
+    value: $(ref.analytics_dataset.datasetId)
+    
+  bigquery_table_id:
+    description: "BigQuery table ID for sales summary"
+    value: $(ref.sales_summary_table.tableId)
+    
+  workflow_template_name:
+    description: "Dataproc workflow template name"
+    value: $(ref.sales_analytics_workflow.workflowTemplateId)
+    
+  scheduler_job_name:
+    description: "Cloud Scheduler job name"
+    value: $(ref.daily_analytics_scheduler.name)
+    
+  dataproc_service_account_email:
+    description: "Dataproc service account email"
+    value: $(ref.dataproc_service_account.email)
+    
+  scheduler_service_account_email:
+    description: "Scheduler service account email"
+    value: $(ref.scheduler_service_account.email)
+    
+  autoscaling_policy_name:
+    description: "Dataproc autoscaling policy name"
+    value: $(ref.autoscaling_policy.name)
+
+# ============================================================================
+# METADATA AND LABELS
+# ============================================================================
+
+metadata:
+  version: "1.0"
+  description: "Infrastructure Manager configuration for distributed data processing workflows"
+  author: "Cloud Recipes"
+  created: "2025-07-12"
+  
+labels:
+  purpose: data-processing
+  framework: apache-spark
+  automation: cloud-scheduler
+  storage: cloud-storage
+  analytics: bigquery

@@ -1,0 +1,909 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  VMware Cloud on AWS Migration Infrastructure
+  This template creates the AWS infrastructure components needed for VMware Cloud on AWS migration,
+  including VPC, security groups, monitoring, backup storage, and supporting services.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcCidr
+          - SubnetCidr
+          - SddcManagementSubnet
+      - Label:
+          default: "VMware Configuration"
+        Parameters:
+          - SddcName
+          - SddcRegion
+          - HostType
+          - NumberOfHosts
+      - Label:
+          default: "Migration Configuration"
+        Parameters:
+          - MigrationBucketName
+          - BackupRetentionDays
+          - NotificationEmail
+      - Label:
+          default: "Cost Management"
+        Parameters:
+          - BudgetLimit
+          - CostAlertThreshold
+    ParameterLabels:
+      VpcCidr:
+        default: "VPC CIDR Block"
+      SubnetCidr:
+        default: "Subnet CIDR Block"
+      SddcManagementSubnet:
+        default: "SDDC Management Subnet"
+      SddcName:
+        default: "SDDC Name"
+      NotificationEmail:
+        default: "Notification Email Address"
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: "10.1.0.0/16"
+    Description: "CIDR block for the VPC that will connect to VMware Cloud on AWS"
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    ConstraintDescription: "Must be a valid CIDR range in the format x.x.x.x/16-28"
+
+  SubnetCidr:
+    Type: String
+    Default: "10.1.1.0/24"
+    Description: "CIDR block for the subnet that will connect to VMware Cloud on AWS"
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    ConstraintDescription: "Must be a valid CIDR range in the format x.x.x.x/16-28"
+
+  SddcManagementSubnet:
+    Type: String
+    Default: "10.0.0.0/16"
+    Description: "CIDR block for VMware Cloud on AWS SDDC management network"
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    ConstraintDescription: "Must be a valid CIDR range in the format x.x.x.x/16-28"
+
+  SddcName:
+    Type: String
+    Default: "vmware-migration-sddc"
+    Description: "Name for the VMware Cloud on AWS SDDC"
+    MinLength: 1
+    MaxLength: 50
+    AllowedPattern: ^[a-zA-Z0-9-]+$
+    ConstraintDescription: "Must contain only alphanumeric characters and hyphens"
+
+  SddcRegion:
+    Type: String
+    Default: !Ref AWS::Region
+    Description: "AWS region for VMware Cloud on AWS SDDC deployment"
+    AllowedValues:
+      - us-east-1
+      - us-west-2
+      - eu-west-1
+      - ap-southeast-1
+      - ap-southeast-2
+      - ap-northeast-1
+      - eu-central-1
+      - ca-central-1
+      - ap-south-1
+      - eu-west-2
+      - eu-west-3
+      - ap-northeast-2
+      - sa-east-1
+      - us-gov-west-1
+
+  HostType:
+    Type: String
+    Default: "i3.metal"
+    Description: "Instance type for VMware Cloud on AWS hosts"
+    AllowedValues:
+      - i3.metal
+      - i3en.metal
+      - i4i.metal
+      - r5.metal
+      - r5d.metal
+      - r6i.metal
+      - m5.metal
+      - m5d.metal
+      - m6i.metal
+      - c5.metal
+      - c5d.metal
+      - c6i.metal
+
+  NumberOfHosts:
+    Type: Number
+    Default: 3
+    MinValue: 3
+    MaxValue: 16
+    Description: "Number of hosts for the VMware Cloud on AWS SDDC (minimum 3)"
+
+  MigrationBucketName:
+    Type: String
+    Default: ""
+    Description: "Name for the S3 bucket for VMware backups (leave empty for auto-generation)"
+    AllowedPattern: ^[a-z0-9.-]*$
+    ConstraintDescription: "Must be lowercase letters, numbers, dots, and hyphens only"
+
+  BackupRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: "Number of days to retain VMware backups in S3"
+
+  NotificationEmail:
+    Type: String
+    Description: "Email address for VMware migration notifications and alerts"
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: "Must be a valid email address"
+
+  BudgetLimit:
+    Type: Number
+    Default: 15000
+    MinValue: 1000
+    MaxValue: 100000
+    Description: "Monthly budget limit for VMware Cloud on AWS (in USD)"
+
+  CostAlertThreshold:
+    Type: Number
+    Default: 80
+    MinValue: 50
+    MaxValue: 95
+    Description: "Percentage of budget limit to trigger cost alerts"
+
+Conditions:
+  CreateCustomBucketName: !Not [!Equals [!Ref MigrationBucketName, ""]]
+  CreateDirectConnectGateway: !Equals [!Ref AWS::Region, "us-east-1"]
+
+Resources:
+  # VPC and Networking Components
+  VmwareVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${SddcName}-vpc"
+        - Key: Purpose
+          Value: "VMware Cloud on AWS Connectivity"
+        - Key: Environment
+          Value: "Migration"
+
+  VmwareSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VmwareVpc
+      CidrBlock: !Ref SubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${SddcName}-subnet"
+        - Key: Purpose
+          Value: "VMware Cloud on AWS Connectivity"
+
+  VmwareInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${SddcName}-igw"
+        - Key: Purpose
+          Value: "VMware Cloud on AWS Internet Access"
+
+  VmwareGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VmwareVpc
+      InternetGatewayId: !Ref VmwareInternetGateway
+
+  VmwareRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VmwareVpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${SddcName}-rt"
+        - Key: Purpose
+          Value: "VMware Cloud on AWS Routing"
+
+  VmwareDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VmwareGatewayAttachment
+    Properties:
+      RouteTableId: !Ref VmwareRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref VmwareInternetGateway
+
+  VmwareSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref VmwareSubnet
+      RouteTableId: !Ref VmwareRouteTable
+
+  # Security Groups
+  HcxSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${SddcName}-hcx-sg"
+      GroupDescription: "Security group for VMware HCX traffic"
+      VpcId: !Ref VmwareVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+          Description: "HTTPS for HCX Manager"
+        - IpProtocol: tcp
+          FromPort: 9443
+          ToPort: 9443
+          CidrIp: "0.0.0.0/0"
+          Description: "HCX Manager API"
+        - IpProtocol: tcp
+          FromPort: 8043
+          ToPort: 8043
+          CidrIp: "0.0.0.0/0"
+          Description: "HCX Manager Registration"
+        - IpProtocol: tcp
+          FromPort: 902
+          ToPort: 902
+          CidrIp: "192.168.0.0/16"
+          Description: "HCX Mobility Agent"
+        - IpProtocol: tcp
+          FromPort: 31031
+          ToPort: 31031
+          CidrIp: "192.168.0.0/16"
+          Description: "HCX Bulk Migration"
+        - IpProtocol: tcp
+          FromPort: 44046
+          ToPort: 44046
+          CidrIp: "192.168.0.0/16"
+          Description: "HCX Replication"
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: "0.0.0.0/0"
+          Description: "All outbound traffic"
+      Tags:
+        - Key: Name
+          Value: !Sub "${SddcName}-hcx-sg"
+        - Key: Purpose
+          Value: "VMware HCX Security"
+
+  MgnSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${SddcName}-mgn-sg"
+      GroupDescription: "Security group for AWS Application Migration Service"
+      VpcId: !Ref VmwareVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+          Description: "HTTPS for MGN Agent"
+        - IpProtocol: tcp
+          FromPort: 1500
+          ToPort: 1500
+          CidrIp: "0.0.0.0/0"
+          Description: "MGN Agent Communication"
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: "0.0.0.0/0"
+          Description: "All outbound traffic"
+      Tags:
+        - Key: Name
+          Value: !Sub "${SddcName}-mgn-sg"
+        - Key: Purpose
+          Value: "AWS Application Migration Service Security"
+
+  # Direct Connect Gateway (Optional)
+  DirectConnectGateway:
+    Type: AWS::DirectConnect::DirectConnectGateway
+    Condition: CreateDirectConnectGateway
+    Properties:
+      Name: !Sub "${SddcName}-dx-gateway"
+      AmazonSideAsn: 64512
+      Tags:
+        - Key: Name
+          Value: !Sub "${SddcName}-dx-gateway"
+        - Key: Purpose
+          Value: "VMware Cloud on AWS Hybrid Connectivity"
+
+  # IAM Role for VMware Cloud on AWS
+  VMwareCloudServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${SddcName}-service-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: "arn:aws:iam::063048924651:root"
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "sts:ExternalId": !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/VMwareCloudOnAWSServiceRolePolicy"
+      Tags:
+        - Key: Name
+          Value: !Sub "${SddcName}-service-role"
+        - Key: Purpose
+          Value: "VMware Cloud on AWS Service Role"
+
+  # S3 Bucket for VMware Backups
+  VmwareBackupBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - CreateCustomBucketName
+        - !Ref MigrationBucketName
+        - !Sub "${SddcName}-backup-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: VMwareBackupLifecycle
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 180
+                StorageClass: DEEP_ARCHIVE
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${SddcName}-backup-bucket"
+        - Key: Purpose
+          Value: "VMware Backup Storage"
+
+  # DynamoDB Table for Migration Tracking
+  MigrationTrackingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${SddcName}-migration-tracking"
+      AttributeDefinitions:
+        - AttributeName: VMName
+          AttributeType: S
+        - AttributeName: MigrationWave
+          AttributeType: S
+      KeySchema:
+        - AttributeName: VMName
+          KeyType: HASH
+        - AttributeName: MigrationWave
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${SddcName}-migration-tracking"
+        - Key: Purpose
+          Value: "VMware Migration Progress Tracking"
+
+  # CloudWatch Log Group
+  VmwareMigrationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/vmware/${SddcName}"
+      RetentionInDays: 30
+      KmsKeyId: !Ref VmwareLogGroupKmsKey
+      Tags:
+        - Key: Name
+          Value: !Sub "${SddcName}-log-group"
+        - Key: Purpose
+          Value: "VMware Migration Logging"
+
+  # KMS Key for Log Group Encryption
+  VmwareLogGroupKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: "KMS key for VMware migration log group encryption"
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey"
+            Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${SddcName}-log-group-kms-key"
+        - Key: Purpose
+          Value: "VMware Log Group Encryption"
+
+  VmwareLogGroupKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${SddcName}-log-group-key"
+      TargetKeyId: !Ref VmwareLogGroupKmsKey
+
+  # SNS Topic for Notifications
+  VmwareMigrationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${SddcName}-migration-alerts"
+      DisplayName: "VMware Migration Alerts"
+      KmsMasterKeyId: "alias/aws/sns"
+      Tags:
+        - Key: Name
+          Value: !Sub "${SddcName}-migration-alerts"
+        - Key: Purpose
+          Value: "VMware Migration Notifications"
+
+  VmwareMigrationTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref VmwareMigrationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Alarms
+  SddcHostHealthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${SddcName}-host-health"
+      AlarmDescription: "Monitor VMware SDDC host health"
+      MetricName: "HostHealth"
+      Namespace: "AWS/VMwareCloudOnAWS"
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref VmwareMigrationTopic
+      OKActions:
+        - !Ref VmwareMigrationTopic
+      Tags:
+        - Key: Name
+          Value: !Sub "${SddcName}-host-health-alarm"
+        - Key: Purpose
+          Value: "VMware SDDC Health Monitoring"
+
+  MigrationProgressAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${SddcName}-migration-progress"
+      AlarmDescription: "Monitor VMware migration progress"
+      MetricName: "MigrationProgress"
+      Namespace: "VMware/Migration"
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref VmwareMigrationTopic
+      Tags:
+        - Key: Name
+          Value: !Sub "${SddcName}-migration-progress-alarm"
+        - Key: Purpose
+          Value: "VMware Migration Progress Monitoring"
+
+  # CloudWatch Dashboard
+  VmwareMigrationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${SddcName}-migration-dashboard"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/VMwareCloudOnAWS", "HostHealth"],
+                  ["VMware/Migration", "MigrationProgress"],
+                  ["AWS/ApplicationMigrationService", "ReplicationProgress"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "VMware Migration Status",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["VMware/Migration", "CurrentWave"],
+                  ["VMware/Migration", "WaveProgress"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Migration Wave Progress",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/vmware/${SddcName}' | fields @timestamp, @message | sort @timestamp desc | limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Migration Logs"
+              }
+            }
+          ]
+        }
+
+  # EventBridge Rule for SDDC Events
+  VmwareSddcEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${SddcName}-sddc-state-change"
+      Description: "Capture VMware Cloud on AWS SDDC state changes"
+      EventPattern:
+        source:
+          - "aws.vmware"
+        detail-type:
+          - "VMware Cloud on AWS SDDC State Change"
+      State: ENABLED
+      Targets:
+        - Arn: !Ref VmwareMigrationTopic
+          Id: "VMwareSDDCStateChange"
+
+  # Budget for Cost Management
+  VmwareMigrationBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub "${SddcName}-budget"
+        BudgetLimit:
+          Amount: !Ref BudgetLimit
+          Unit: USD
+        TimeUnit: MONTHLY
+        BudgetType: COST
+        CostFilters:
+          Service:
+            - "VMware Cloud on AWS"
+        TimePeriod:
+          Start: "2025-01-01"
+          End: "2026-12-31"
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: !Ref CostAlertThreshold
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref NotificationEmail
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref NotificationEmail
+
+  # Cost Anomaly Detection
+  VmwareCostAnomalyDetector:
+    Type: AWS::CE::AnomalyDetector
+    Properties:
+      AnomalyDetectorName: !Sub "${SddcName}-cost-anomaly-detector"
+      MonitorType: DIMENSIONAL
+      MonitorSpecification:
+        DimensionKey: SERVICE
+        MatchOptions:
+          - EQUALS
+        Values:
+          - "VMware Cloud on AWS"
+      Tags:
+        - Key: Name
+          Value: !Sub "${SddcName}-cost-anomaly-detector"
+        - Key: Purpose
+          Value: "VMware Cost Anomaly Detection"
+
+  # Lambda Execution Role for Migration Orchestrator
+  MigrationOrchestratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${SddcName}-migration-orchestrator-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: MigrationOrchestratorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - s3:GetObject
+                  - s3:PutObject
+                  - sns:Publish
+                Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${SddcName}-migration-orchestrator-role"
+        - Key: Purpose
+          Value: "VMware Migration Orchestrator Lambda Role"
+
+  # Lambda Function for Migration Orchestration
+  MigrationOrchestratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${SddcName}-migration-orchestrator"
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt MigrationOrchestratorRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          BACKUP_BUCKET: !Ref VmwareBackupBucket
+          SNS_TOPIC_ARN: !Ref VmwareMigrationTopic
+          TRACKING_TABLE: !Ref MigrationTrackingTable
+          LOG_GROUP: !Ref VmwareMigrationLogGroup
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              """
+              VMware Migration Orchestrator Lambda Function
+              Manages migration waves and tracks progress
+              """
+              
+              # Initialize AWS clients
+              cloudwatch = boto3.client('cloudwatch')
+              dynamodb = boto3.client('dynamodb')
+              sns = boto3.client('sns')
+              logs = boto3.client('logs')
+              
+              # Environment variables
+              backup_bucket = os.environ['BACKUP_BUCKET']
+              sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+              tracking_table = os.environ['TRACKING_TABLE']
+              log_group = os.environ['LOG_GROUP']
+              
+              try:
+                  # Parse event data
+                  wave_number = event.get('wave_number', 1)
+                  action = event.get('action', 'start')
+                  
+                  if action == 'start':
+                      # Start migration wave
+                      response = start_migration_wave(wave_number, cloudwatch, dynamodb, sns, sns_topic_arn, tracking_table)
+                  elif action == 'update':
+                      # Update migration progress
+                      progress = event.get('progress', 0)
+                      response = update_migration_progress(wave_number, progress, cloudwatch)
+                  elif action == 'complete':
+                      # Complete migration wave
+                      response = complete_migration_wave(wave_number, cloudwatch, dynamodb, sns, sns_topic_arn, tracking_table)
+                  else:
+                      response = {'error': 'Invalid action'}
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(response)
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def start_migration_wave(wave_number, cloudwatch, dynamodb, sns, sns_topic_arn, tracking_table):
+              """Start a migration wave"""
+              
+              # Put CloudWatch metric
+              cloudwatch.put_metric_data(
+                  Namespace='VMware/Migration',
+                  MetricData=[
+                      {
+                          'MetricName': 'CurrentWave',
+                          'Value': wave_number,
+                          'Unit': 'Count'
+                      }
+                  ]
+              )
+              
+              # Send SNS notification
+              sns.publish(
+                  TopicArn=sns_topic_arn,
+                  Message=f"Migration wave {wave_number} started",
+                  Subject=f"VMware Migration Wave {wave_number} Started"
+              )
+              
+              return {'message': f'Migration wave {wave_number} started'}
+          
+          def update_migration_progress(wave_number, progress, cloudwatch):
+              """Update migration progress"""
+              
+              # Put CloudWatch metric
+              cloudwatch.put_metric_data(
+                  Namespace='VMware/Migration',
+                  MetricData=[
+                      {
+                          'MetricName': 'WaveProgress',
+                          'Value': progress,
+                          'Unit': 'Percent'
+                      }
+                  ]
+              )
+              
+              return {'message': f'Migration wave {wave_number} progress updated to {progress}%'}
+          
+          def complete_migration_wave(wave_number, cloudwatch, dynamodb, sns, sns_topic_arn, tracking_table):
+              """Complete a migration wave"""
+              
+              # Put CloudWatch metric
+              cloudwatch.put_metric_data(
+                  Namespace='VMware/Migration',
+                  MetricData=[
+                      {
+                          'MetricName': 'WaveProgress',
+                          'Value': 100,
+                          'Unit': 'Percent'
+                      }
+                  ]
+              )
+              
+              # Send SNS notification
+              sns.publish(
+                  TopicArn=sns_topic_arn,
+                  Message=f"Migration wave {wave_number} completed successfully",
+                  Subject=f"VMware Migration Wave {wave_number} Completed"
+              )
+              
+              return {'message': f'Migration wave {wave_number} completed'}
+      Tags:
+        - Key: Name
+          Value: !Sub "${SddcName}-migration-orchestrator"
+        - Key: Purpose
+          Value: "VMware Migration Orchestration"
+
+Outputs:
+  VpcId:
+    Description: "VPC ID for VMware Cloud on AWS connectivity"
+    Value: !Ref VmwareVpc
+    Export:
+      Name: !Sub "${AWS::StackName}-VpcId"
+
+  SubnetId:
+    Description: "Subnet ID for VMware Cloud on AWS connectivity"
+    Value: !Ref VmwareSubnet
+    Export:
+      Name: !Sub "${AWS::StackName}-SubnetId"
+
+  HcxSecurityGroupId:
+    Description: "Security Group ID for HCX traffic"
+    Value: !Ref HcxSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-HcxSecurityGroupId"
+
+  MgnSecurityGroupId:
+    Description: "Security Group ID for AWS Application Migration Service"
+    Value: !Ref MgnSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-MgnSecurityGroupId"
+
+  DirectConnectGatewayId:
+    Description: "Direct Connect Gateway ID (if created)"
+    Value: !If [CreateDirectConnectGateway, !Ref DirectConnectGateway, "Not Created"]
+    Export:
+      Name: !Sub "${AWS::StackName}-DirectConnectGatewayId"
+
+  ServiceRoleArn:
+    Description: "IAM Role ARN for VMware Cloud on AWS service"
+    Value: !GetAtt VMwareCloudServiceRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceRoleArn"
+
+  BackupBucketName:
+    Description: "S3 Bucket name for VMware backups"
+    Value: !Ref VmwareBackupBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-BackupBucketName"
+
+  MigrationTrackingTableName:
+    Description: "DynamoDB table name for migration tracking"
+    Value: !Ref MigrationTrackingTable
+    Export:
+      Name: !Sub "${AWS::StackName}-MigrationTrackingTableName"
+
+  LogGroupName:
+    Description: "CloudWatch Log Group name for VMware operations"
+    Value: !Ref VmwareMigrationLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-LogGroupName"
+
+  SnsTopicArn:
+    Description: "SNS Topic ARN for migration notifications"
+    Value: !Ref VmwareMigrationTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-SnsTopicArn"
+
+  DashboardUrl:
+    Description: "CloudWatch Dashboard URL for migration monitoring"
+    Value: !Sub "https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${SddcName}-migration-dashboard"
+    Export:
+      Name: !Sub "${AWS::StackName}-DashboardUrl"
+
+  MigrationOrchestratorFunctionName:
+    Description: "Lambda function name for migration orchestration"
+    Value: !Ref MigrationOrchestratorFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-MigrationOrchestratorFunctionName"
+
+  SddcConfiguration:
+    Description: "SDDC configuration parameters for VMware Cloud Console"
+    Value: !Sub |
+      SDDC Name: ${SddcName}
+      Region: ${SddcRegion}
+      Host Type: ${HostType}
+      Number of Hosts: ${NumberOfHosts}
+      Management Subnet: ${SddcManagementSubnet}
+      Connected VPC: ${VmwareVpc}
+      Connected Subnet: ${VmwareSubnet}
+      Service Role ARN: ${VMwareCloudServiceRole.Arn}
+    Export:
+      Name: !Sub "${AWS::StackName}-SddcConfiguration"

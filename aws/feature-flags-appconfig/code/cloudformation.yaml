@@ -1,0 +1,665 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Feature Flags with AWS AppConfig
+  This template creates a complete feature flag management system using AWS AppConfig,
+  Lambda functions, and CloudWatch monitoring with automated rollback capabilities.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Application Configuration"
+        Parameters:
+          - ApplicationName
+          - EnvironmentName
+          - ConfigurationProfileName
+          - LambdaFunctionName
+      - Label:
+          default: "Deployment Configuration"
+        Parameters:
+          - DeploymentDurationInMinutes
+          - GrowthFactor
+          - FinalBakeTimeInMinutes
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - AlarmThreshold
+          - AlarmEvaluationPeriods
+          - EnableAutomaticRollback
+      - Label:
+          default: "Resource Naming"
+        Parameters:
+          - ResourcePrefix
+          - Environment
+
+    ParameterLabels:
+      ApplicationName:
+        default: "AppConfig Application Name"
+      EnvironmentName:
+        default: "AppConfig Environment Name"
+      ConfigurationProfileName:
+        default: "Configuration Profile Name"
+      LambdaFunctionName:
+        default: "Lambda Function Name"
+      DeploymentDurationInMinutes:
+        default: "Deployment Duration (Minutes)"
+      GrowthFactor:
+        default: "Growth Factor (%)"
+      FinalBakeTimeInMinutes:
+        default: "Final Bake Time (Minutes)"
+      AlarmThreshold:
+        default: "Error Alarm Threshold"
+      AlarmEvaluationPeriods:
+        default: "Alarm Evaluation Periods"
+      EnableAutomaticRollback:
+        default: "Enable Automatic Rollback"
+      ResourcePrefix:
+        default: "Resource Prefix"
+      Environment:
+        default: "Environment"
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: "feature-demo-app"
+    Description: "Name for the AppConfig application"
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: "^[a-zA-Z0-9._-]+$"
+    ConstraintDescription: "Must contain only alphanumeric characters, periods, underscores, and hyphens"
+
+  EnvironmentName:
+    Type: String
+    Default: "production"
+    Description: "Name for the AppConfig environment"
+    AllowedValues:
+      - development
+      - staging
+      - production
+      - testing
+
+  ConfigurationProfileName:
+    Type: String
+    Default: "feature-flags"
+    Description: "Name for the configuration profile"
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: "^[a-zA-Z0-9._-]+$"
+
+  LambdaFunctionName:
+    Type: String
+    Default: "feature-flag-demo"
+    Description: "Name for the Lambda function"
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: "^[a-zA-Z0-9._-]+$"
+
+  DeploymentDurationInMinutes:
+    Type: Number
+    Default: 20
+    Description: "Duration of the gradual deployment in minutes"
+    MinValue: 1
+    MaxValue: 1440
+
+  GrowthFactor:
+    Type: Number
+    Default: 25
+    Description: "Percentage growth factor for gradual deployment"
+    MinValue: 1
+    MaxValue: 100
+
+  FinalBakeTimeInMinutes:
+    Type: Number
+    Default: 10
+    Description: "Final bake time after deployment completion"
+    MinValue: 0
+    MaxValue: 1440
+
+  AlarmThreshold:
+    Type: Number
+    Default: 5
+    Description: "Error count threshold for triggering rollback alarm"
+    MinValue: 1
+    MaxValue: 100
+
+  AlarmEvaluationPeriods:
+    Type: Number
+    Default: 2
+    Description: "Number of periods to evaluate alarm condition"
+    MinValue: 1
+    MaxValue: 10
+
+  EnableAutomaticRollback:
+    Type: String
+    Default: "true"
+    Description: "Enable automatic rollback on alarm trigger"
+    AllowedValues: ["true", "false"]
+
+  ResourcePrefix:
+    Type: String
+    Default: "appconfig-demo"
+    Description: "Prefix for resource names"
+    MinLength: 1
+    MaxLength: 20
+    AllowedPattern: "^[a-zA-Z0-9-]+$"
+
+  Environment:
+    Type: String
+    Default: "dev"
+    Description: "Environment tag for resources"
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+Conditions:
+  EnableRollback: !Equals [!Ref EnableAutomaticRollback, "true"]
+
+Resources:
+  # IAM Role for Lambda function to access AppConfig
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-lambda-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AppConfigAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - appconfig:StartConfigurationSession
+                  - appconfig:GetLatestConfiguration
+                Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-lambda-role"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "AppConfig Lambda Execution Role"
+
+  # AppConfig Application
+  AppConfigApplication:
+    Type: AWS::AppConfig::Application
+    Properties:
+      Name: !Sub "${ResourcePrefix}-${ApplicationName}-${Environment}"
+      Description: !Sub "Feature flag demo application for ${Environment} environment with safe deployments"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-${ApplicationName}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Feature Flag Management"
+
+  # CloudWatch Alarm for monitoring Lambda errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-lambda-error-rate-${Environment}"
+      AlarmDescription: "Monitor Lambda function error rate for feature flag deployment safety"
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      Threshold: !Ref AlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LambdaFunction
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-lambda-alarm"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Feature Flag Monitoring"
+
+  # Service-linked role for AppConfig monitoring (created automatically if needed)
+  # Note: This is managed by AWS and cannot be created via CloudFormation
+  # The service-linked role AWSServiceRoleForAppConfig is created automatically
+
+  # AppConfig Environment with monitoring configuration
+  AppConfigEnvironment:
+    Type: AWS::AppConfig::Environment
+    Properties:
+      ApplicationId: !Ref AppConfigApplication
+      Name: !Sub "${EnvironmentName}-${Environment}"
+      Description: !Sub "${EnvironmentName} environment with automated rollback monitoring"
+      Monitors: !If
+        - EnableRollback
+        - - AlarmArn: !Sub "${LambdaErrorAlarm}"
+            AlarmRoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/appconfig.amazonaws.com/AWSServiceRoleForAppConfig"
+        - !Ref "AWS::NoValue"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-${EnvironmentName}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Feature Flag Environment"
+
+  # Feature Flag Configuration Profile
+  ConfigurationProfile:
+    Type: AWS::AppConfig::ConfigurationProfile
+    Properties:
+      ApplicationId: !Ref AppConfigApplication
+      Name: !Sub "${ConfigurationProfileName}-${Environment}"
+      LocationUri: hosted
+      Type: AWS.AppConfig.FeatureFlags
+      Description: "Feature flags for gradual rollout and A/B testing"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-${ConfigurationProfileName}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Feature Flag Configuration"
+
+  # Deployment Strategy for gradual rollout
+  DeploymentStrategy:
+    Type: AWS::AppConfig::DeploymentStrategy
+    Properties:
+      Name: !Sub "${ResourcePrefix}-gradual-rollout-${Environment}"
+      Description: !Sub "Gradual rollout over ${DeploymentDurationInMinutes} minutes with monitoring"
+      DeploymentDurationInMinutes: !Ref DeploymentDurationInMinutes
+      FinalBakeTimeInMinutes: !Ref FinalBakeTimeInMinutes
+      GrowthFactor: !Ref GrowthFactor
+      GrowthType: LINEAR
+      ReplicateTo: NONE
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-deployment-strategy"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Feature Flag Deployment Strategy"
+
+  # Lambda function demonstrating feature flag consumption
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-${LambdaFunctionName}-${Environment}"
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          APP_ID: !Ref AppConfigApplication
+          ENV_ID: !Ref AppConfigEnvironment
+          PROFILE_ID: !Ref ConfigurationProfile
+      Layers:
+        - !Sub "arn:aws:lambda:${AWS::Region}:027255383542:layer:AWS-AppConfig-Extension:82"
+      Code:
+        ZipFile: |
+          import json
+          import urllib.request
+          import urllib.error
+          import os
+          
+          def lambda_handler(event, context):
+              # AppConfig Lambda extension endpoint
+              appconfig_url = f"http://localhost:2772/applications/{os.environ['APP_ID']}/environments/{os.environ['ENV_ID']}/configurations/{os.environ['PROFILE_ID']}"
+              
+              try:
+                  # Retrieve feature flags from AppConfig
+                  request = urllib.request.Request(appconfig_url)
+                  with urllib.request.urlopen(request, timeout=10) as response:
+                      config_data = json.loads(response.read().decode())
+                  
+                  # Extract feature flags
+                  flags = config_data.get('flags', {})
+                  attributes = config_data.get('attributes', {})
+                  
+                  # Business logic using feature flags
+                  result = {
+                      'message': 'Feature flag demo response',
+                      'timestamp': context.aws_request_id,
+                      'features': {}
+                  }
+                  
+                  # Check new checkout flow
+                  if flags.get('new-checkout-flow', {}).get('enabled', False):
+                      rollout_percentage = attributes.get('rollout-percentage', {}).get('number', 0)
+                      result['features']['checkout'] = {
+                          'enabled': True,
+                          'type': 'new-flow',
+                          'rollout_percentage': rollout_percentage
+                      }
+                  else:
+                      result['features']['checkout'] = {
+                          'enabled': False,
+                          'type': 'legacy-flow'
+                      }
+                  
+                  # Check enhanced search
+                  if flags.get('enhanced-search', {}).get('enabled', False):
+                      search_algorithm = attributes.get('search-algorithm', {}).get('string', 'basic')
+                      cache_ttl = attributes.get('cache-ttl', {}).get('number', 300)
+                      result['features']['search'] = {
+                          'enabled': True,
+                          'algorithm': search_algorithm,
+                          'cache_ttl': cache_ttl
+                      }
+                  else:
+                      result['features']['search'] = {
+                          'enabled': False,
+                          'algorithm': 'basic'
+                      }
+                  
+                  # Check premium features
+                  if flags.get('premium-features', {}).get('enabled', False):
+                      feature_list = attributes.get('feature-list', {}).get('string', '')
+                      result['features']['premium'] = {
+                          'enabled': True,
+                          'features': feature_list.split(',') if feature_list else []
+                      }
+                  else:
+                      result['features']['premium'] = {
+                          'enabled': False,
+                          'features': []
+                      }
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'X-AppConfig-Application': os.environ['APP_ID'],
+                          'X-AppConfig-Environment': os.environ['ENV_ID']
+                      },
+                      'body': json.dumps(result, indent=2)
+                  }
+                  
+              except urllib.error.HTTPError as e:
+                  print(f"HTTP Error retrieving feature flags: {e.code} - {e.reason}")
+                  return create_fallback_response(str(e), context.aws_request_id)
+              except urllib.error.URLError as e:
+                  print(f"URL Error retrieving feature flags: {str(e)}")
+                  return create_fallback_response(str(e), context.aws_request_id)
+              except json.JSONDecodeError as e:
+                  print(f"JSON decode error: {str(e)}")
+                  return create_fallback_response(str(e), context.aws_request_id)
+              except Exception as e:
+                  print(f"Unexpected error retrieving feature flags: {str(e)}")
+                  return create_fallback_response(str(e), context.aws_request_id)
+          
+          def create_fallback_response(error_msg, request_id):
+              return {
+                  'statusCode': 200,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'X-Fallback-Mode': 'true'
+                  },
+                  'body': json.dumps({
+                      'message': 'Using default configuration due to error',
+                      'timestamp': request_id,
+                      'error': error_msg,
+                      'features': {
+                          'checkout': {'enabled': False, 'type': 'legacy-flow'},
+                          'search': {'enabled': False, 'algorithm': 'basic'},
+                          'premium': {'enabled': False, 'features': []}
+                      }
+                  }, indent=2)
+              }
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-${LambdaFunctionName}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Feature Flag Demo Function"
+
+  # CloudWatch Log Group for Lambda function
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${LambdaFunction}"
+      RetentionInDays: 14
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-lambda-logs"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Lambda Function Logs"
+
+  # Initial Feature Flag Configuration
+  InitialConfiguration:
+    Type: AWS::AppConfig::HostedConfigurationVersion
+    Properties:
+      ApplicationId: !Ref AppConfigApplication
+      ConfigurationProfileId: !Ref ConfigurationProfile
+      ContentType: application/json
+      Content: |
+        {
+          "flags": {
+            "new-checkout-flow": {
+              "name": "new-checkout-flow",
+              "enabled": false,
+              "attributes": {
+                "rollout-percentage": {
+                  "constraints": {
+                    "type": "number",
+                    "required": true
+                  }
+                },
+                "target-audience": {
+                  "constraints": {
+                    "type": "string",
+                    "required": false
+                  }
+                }
+              }
+            },
+            "enhanced-search": {
+              "name": "enhanced-search",
+              "enabled": true,
+              "attributes": {
+                "search-algorithm": {
+                  "constraints": {
+                    "type": "string",
+                    "required": true
+                  }
+                },
+                "cache-ttl": {
+                  "constraints": {
+                    "type": "number",
+                    "required": false
+                  }
+                }
+              }
+            },
+            "premium-features": {
+              "name": "premium-features",
+              "enabled": false,
+              "attributes": {
+                "feature-list": {
+                  "constraints": {
+                    "type": "string",
+                    "required": false
+                  }
+                }
+              }
+            }
+          },
+          "attributes": {
+            "rollout-percentage": {
+              "number": 0
+            },
+            "target-audience": {
+              "string": "beta-users"
+            },
+            "search-algorithm": {
+              "string": "elasticsearch"
+            },
+            "cache-ttl": {
+              "number": 300
+            },
+            "feature-list": {
+              "string": "advanced-analytics,priority-support"
+            }
+          }
+        }
+      Description: "Initial feature flag configuration with default values"
+
+  # CloudWatch Dashboard for monitoring
+  FeatureFlagDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${ResourcePrefix}-feature-flags-${Environment}"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${LambdaFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Errors", "FunctionName", "${LambdaFunction}" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Error Rate",
+                "period": 300,
+                "annotations": {
+                  "horizontal": [
+                    {
+                      "label": "Alarm Threshold",
+                      "value": ${AlarmThreshold}
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${LambdaFunction}'\n| fields @timestamp, @message\n| filter @message like /Feature flag/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Feature Flag Activity Logs",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  AppConfigApplicationId:
+    Description: "AppConfig Application ID"
+    Value: !Ref AppConfigApplication
+    Export:
+      Name: !Sub "${AWS::StackName}-AppConfigApplicationId"
+
+  AppConfigEnvironmentId:
+    Description: "AppConfig Environment ID"
+    Value: !Ref AppConfigEnvironment
+    Export:
+      Name: !Sub "${AWS::StackName}-AppConfigEnvironmentId"
+
+  ConfigurationProfileId:
+    Description: "Configuration Profile ID"
+    Value: !Ref ConfigurationProfile
+    Export:
+      Name: !Sub "${AWS::StackName}-ConfigurationProfileId"
+
+  DeploymentStrategyId:
+    Description: "Deployment Strategy ID"
+    Value: !Ref DeploymentStrategy
+    Export:
+      Name: !Sub "${AWS::StackName}-DeploymentStrategyId"
+
+  LambdaFunctionName:
+    Description: "Lambda Function Name"
+    Value: !Ref LambdaFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaFunctionName"
+
+  LambdaFunctionArn:
+    Description: "Lambda Function ARN"
+    Value: !GetAtt LambdaFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaFunctionArn"
+
+  CloudWatchAlarmName:
+    Description: "CloudWatch Alarm Name for monitoring"
+    Value: !Ref LambdaErrorAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudWatchAlarmName"
+
+  DashboardURL:
+    Description: "CloudWatch Dashboard URL"
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ResourcePrefix}-feature-flags-${Environment}"
+
+  TestLambdaCommand:
+    Description: "AWS CLI command to test the Lambda function"
+    Value: !Sub "aws lambda invoke --function-name ${LambdaFunction} --payload '{}' response.json && cat response.json"
+
+  DeployConfigurationCommand:
+    Description: "AWS CLI command to deploy feature flag configuration"
+    Value: !Sub |
+      aws appconfig start-deployment \
+        --application-id ${AppConfigApplication} \
+        --environment-id ${AppConfigEnvironment} \
+        --deployment-strategy-id ${DeploymentStrategy} \
+        --configuration-profile-id ${ConfigurationProfile} \
+        --configuration-version 1 \
+        --description "CloudFormation initial deployment"
+
+  MonitoringInstructions:
+    Description: "Instructions for monitoring feature flag deployments"
+    Value: !Sub |
+      Monitor deployments using:
+      1. CloudWatch Dashboard: ${ResourcePrefix}-feature-flags-${Environment}
+      2. AppConfig Console: https://${AWS::Region}.console.aws.amazon.com/systems-manager/appconfig/
+      3. Lambda Function: ${LambdaFunction}
+      4. Error Alarm: ${LambdaErrorAlarm}
+
+  NextSteps:
+    Description: "Next steps after stack creation"
+    Value: |
+      1. Test the Lambda function using the provided CLI command
+      2. Deploy the initial configuration using the deployment command
+      3. Monitor the deployment progress in the AppConfig console
+      4. Update feature flags and test rollback scenarios
+      5. Review CloudWatch metrics and logs for application behavior

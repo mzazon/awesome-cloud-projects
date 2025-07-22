@@ -1,0 +1,538 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFront Content Delivery Network with Origin Access Controls, S3, and WAF integration'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'cdn-project'
+    Description: 'Name prefix for all resources'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must begin with a letter and contain only alphanumeric characters and hyphens'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    Description: 'Environment name (dev, staging, prod)'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  PriceClass:
+    Type: String
+    Default: 'PriceClass_All'
+    Description: 'CloudFront price class (affects edge locations used)'
+    AllowedValues:
+      - PriceClass_100
+      - PriceClass_200
+      - PriceClass_All
+
+  RateLimitThreshold:
+    Type: Number
+    Default: 2000
+    Description: 'WAF rate limit threshold (requests per 5 minutes per IP)'
+    MinValue: 100
+    MaxValue: 20000
+
+  CacheHitRateThreshold:
+    Type: Number
+    Default: 80
+    Description: 'CloudWatch alarm threshold for cache hit rate percentage'
+    MinValue: 50
+    MaxValue: 95
+
+  ErrorRateThreshold:
+    Type: Number
+    Default: 5
+    Description: 'CloudWatch alarm threshold for 4xx error rate percentage'
+    MinValue: 1
+    MaxValue: 20
+
+  EnableLogging:
+    Type: String
+    Default: 'true'
+    Description: 'Enable CloudFront access logging'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableRealTimeMetrics:
+    Type: String
+    Default: 'true'
+    Description: 'Enable CloudFront real-time metrics'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  EnableLoggingCondition: !Equals [!Ref EnableLogging, 'true']
+  EnableRealTimeMetricsCondition: !Equals [!Ref EnableRealTimeMetrics, 'true']
+
+Resources:
+  # S3 Bucket for content storage
+  ContentBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${ProjectName}-content-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [IsProduction, 'Enabled', 'Suspended']
+      LifecycleConfiguration:
+        Rules:
+          - Id: 'DeleteIncompleteMultipartUploads'
+            Status: 'Enabled'
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: 'TransitionToIA'
+            Status: !If [IsProduction, 'Enabled', 'Disabled']
+            Transition:
+              StorageClass: 'STANDARD_IA'
+              TransitionInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Purpose'
+          Value: 'CDN Content Storage'
+
+  # S3 Bucket for CloudFront logs (conditional)
+  LogsBucket:
+    Type: 'AWS::S3::Bucket'
+    Condition: EnableLoggingCondition
+    Properties:
+      BucketName: !Sub '${ProjectName}-logs-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+            BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: 'DeleteOldLogs'
+            Status: 'Enabled'
+            ExpirationInDays: !If [IsProduction, 90, 30]
+          - Id: 'DeleteIncompleteMultipartUploads'
+            Status: 'Enabled'
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Purpose'
+          Value: 'CloudFront Access Logs'
+
+  # Origin Access Control for secure S3 access
+  OriginAccessControl:
+    Type: 'AWS::CloudFront::OriginAccessControl'
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-oac-${Environment}'
+        Description: !Sub 'OAC for ${ProjectName} CDN in ${Environment} environment'
+        OriginAccessControlOriginType: 's3'
+        SigningBehavior: 'always'
+        SigningProtocol: 'sigv4'
+
+  # WAF Web ACL for security
+  WebACL:
+    Type: 'AWS::WAFv2::WebACL'
+    Properties:
+      Name: !Sub '${ProjectName}-waf-${Environment}'
+      Description: !Sub 'WAF for ${ProjectName} CDN protection'
+      Scope: 'CLOUDFRONT'
+      DefaultAction:
+        Allow: {}
+      Rules:
+        # AWS Managed Rules - Common Rule Set
+        - Name: 'AWSManagedRulesCommonRuleSet'
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: 'AWS'
+              Name: 'AWSManagedRulesCommonRuleSet'
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: 'CommonRuleSetMetric'
+        # AWS Managed Rules - Known Bad Inputs
+        - Name: 'AWSManagedRulesKnownBadInputsRuleSet'
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: 'AWS'
+              Name: 'AWSManagedRulesKnownBadInputsRuleSet'
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: 'KnownBadInputsMetric'
+        # Rate Limiting Rule
+        - Name: 'RateLimitRule'
+          Priority: 3
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref RateLimitThreshold
+              AggregateKeyType: 'IP'
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: 'RateLimitMetric'
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${ProjectName}WebACL'
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+
+  # CloudFront Distribution
+  CloudFrontDistribution:
+    Type: 'AWS::CloudFront::Distribution'
+    Properties:
+      DistributionConfig:
+        Comment: !Sub '${ProjectName} CDN Distribution - ${Environment}'
+        DefaultRootObject: 'index.html'
+        Enabled: true
+        HttpVersion: 'http2and3'
+        IPV6Enabled: true
+        PriceClass: !Ref PriceClass
+        WebACLId: !GetAtt WebACL.Arn
+        
+        # Origins Configuration
+        Origins:
+          - Id: !Sub '${ProjectName}-s3-origin'
+            DomainName: !GetAtt ContentBucket.RegionalDomainName
+            OriginPath: ''
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            ConnectionAttempts: 3
+            ConnectionTimeout: 10
+        
+        # Default Cache Behavior
+        DefaultCacheBehavior:
+          TargetOriginId: !Sub '${ProjectName}-s3-origin'
+          ViewerProtocolPolicy: 'redirect-to-https'
+          CachePolicyId: '4135ea2d-6df8-44a3-9df3-4b5a84be39ad'  # Managed-CachingOptimized
+          OriginRequestPolicyId: '88a5eaf4-2fd4-4709-b370-b4c650ea3fcf'  # Managed-CORS-S3Origin
+          ResponseHeadersPolicyId: '5cc3b908-e619-4b99-88e5-2cf7f45965bd'  # Managed-SecurityHeadersPolicy
+          Compress: true
+          AllowedMethods:
+            - 'GET'
+            - 'HEAD'
+            - 'OPTIONS'
+          CachedMethods:
+            - 'GET'
+            - 'HEAD'
+        
+        # Cache Behaviors for different content types
+        CacheBehaviors:
+          # Static Images
+          - PathPattern: '/images/*'
+            TargetOriginId: !Sub '${ProjectName}-s3-origin'
+            ViewerProtocolPolicy: 'redirect-to-https'
+            CachePolicyId: '4135ea2d-6df8-44a3-9df3-4b5a84be39ad'  # Managed-CachingOptimized
+            Compress: true
+            AllowedMethods:
+              - 'GET'
+              - 'HEAD'
+            CachedMethods:
+              - 'GET'
+              - 'HEAD'
+          # CSS Files
+          - PathPattern: '/css/*'
+            TargetOriginId: !Sub '${ProjectName}-s3-origin'
+            ViewerProtocolPolicy: 'redirect-to-https'
+            CachePolicyId: '4135ea2d-6df8-44a3-9df3-4b5a84be39ad'  # Managed-CachingOptimized
+            Compress: true
+            AllowedMethods:
+              - 'GET'
+              - 'HEAD'
+            CachedMethods:
+              - 'GET'
+              - 'HEAD'
+          # JavaScript Files
+          - PathPattern: '/js/*'
+            TargetOriginId: !Sub '${ProjectName}-s3-origin'
+            ViewerProtocolPolicy: 'redirect-to-https'
+            CachePolicyId: '4135ea2d-6df8-44a3-9df3-4b5a84be39ad'  # Managed-CachingOptimized
+            Compress: true
+            AllowedMethods:
+              - 'GET'
+              - 'HEAD'
+            CachedMethods:
+              - 'GET'
+              - 'HEAD'
+        
+        # Custom Error Pages
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: '/index.html'
+            ErrorCachingMinTTL: 300
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: '/index.html'
+            ErrorCachingMinTTL: 300
+        
+        # Logging Configuration (conditional)
+        Logging: !If
+          - EnableLoggingCondition
+          - Bucket: !GetAtt LogsBucket.DomainName
+            Prefix: 'cloudfront-logs/'
+            IncludeCookies: false
+          - !Ref 'AWS::NoValue'
+        
+        # Viewer Certificate
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          MinimumProtocolVersion: 'TLSv1.2_2021'
+        
+        # Geo Restrictions
+        Restrictions:
+          GeoRestriction:
+            RestrictionType: 'none'
+      
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+
+  # S3 Bucket Policy for OAC
+  ContentBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref ContentBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: 'AllowCloudFrontServicePrincipalReadOnly'
+            Effect: 'Allow'
+            Principal:
+              Service: 'cloudfront.amazonaws.com'
+            Action: 's3:GetObject'
+            Resource: !Sub '${ContentBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  # CloudWatch Monitoring Subscription (conditional)
+  MonitoringSubscription:
+    Type: 'AWS::CloudFront::MonitoringSubscription'
+    Condition: EnableRealTimeMetricsCondition
+    Properties:
+      DistributionId: !Ref CloudFrontDistribution
+      MonitoringSubscription:
+        RealtimeMetricsSubscriptionConfig:
+          RealtimeMetricsSubscriptionStatus: 'Enabled'
+
+  # CloudWatch Alarms
+  HighErrorRateAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${ProjectName}-CloudFront-High-4xx-Error-Rate-${Environment}'
+      AlarmDescription: 'High 4xx error rate detected for CloudFront distribution'
+      MetricName: '4xxErrorRate'
+      Namespace: 'AWS/CloudFront'
+      Statistic: 'Average'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref ErrorRateThreshold
+      ComparisonOperator: 'GreaterThanThreshold'
+      Dimensions:
+        - Name: 'DistributionId'
+          Value: !Ref CloudFrontDistribution
+      TreatMissingData: 'notBreaching'
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+
+  LowCacheHitRateAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${ProjectName}-CloudFront-Low-Cache-Hit-Rate-${Environment}'
+      AlarmDescription: 'Low cache hit rate detected for CloudFront distribution'
+      MetricName: 'CacheHitRate'
+      Namespace: 'AWS/CloudFront'
+      Statistic: 'Average'
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref CacheHitRateThreshold
+      ComparisonOperator: 'LessThanThreshold'
+      Dimensions:
+        - Name: 'DistributionId'
+          Value: !Ref CloudFrontDistribution
+      TreatMissingData: 'notBreaching'
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+
+  # SNS Topic for notifications (optional enhancement)
+  NotificationTopic:
+    Type: 'AWS::SNS::Topic'
+    Condition: IsProduction
+    Properties:
+      TopicName: !Sub '${ProjectName}-cdn-alerts-${Environment}'
+      DisplayName: !Sub 'CDN Alerts for ${ProjectName}'
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+
+Outputs:
+  # CloudFront Distribution Information
+  DistributionId:
+    Description: 'CloudFront Distribution ID'
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub '${AWS::StackName}-DistributionId'
+
+  DistributionDomainName:
+    Description: 'CloudFront Distribution Domain Name'
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-DomainName'
+
+  DistributionURL:
+    Description: 'CloudFront Distribution URL'
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-URL'
+
+  # S3 Bucket Information
+  ContentBucketName:
+    Description: 'S3 Content Bucket Name'
+    Value: !Ref ContentBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ContentBucket'
+
+  ContentBucketRegionalDomainName:
+    Description: 'S3 Content Bucket Regional Domain Name'
+    Value: !GetAtt ContentBucket.RegionalDomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-ContentBucketDomain'
+
+  LogsBucketName:
+    Description: 'S3 Logs Bucket Name'
+    Condition: EnableLoggingCondition
+    Value: !Ref LogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-LogsBucket'
+
+  # Security Information
+  OriginAccessControlId:
+    Description: 'Origin Access Control ID'
+    Value: !GetAtt OriginAccessControl.Id
+    Export:
+      Name: !Sub '${AWS::StackName}-OACId'
+
+  WebACLId:
+    Description: 'WAF Web ACL ID'
+    Value: !GetAtt WebACL.Id
+    Export:
+      Name: !Sub '${AWS::StackName}-WebACLId'
+
+  WebACLArn:
+    Description: 'WAF Web ACL ARN'
+    Value: !GetAtt WebACL.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-WebACLArn'
+
+  # Monitoring Information
+  HighErrorRateAlarmName:
+    Description: 'CloudWatch Alarm for High Error Rate'
+    Value: !Ref HighErrorRateAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-ErrorAlarm'
+
+  LowCacheHitRateAlarmName:
+    Description: 'CloudWatch Alarm for Low Cache Hit Rate'
+    Value: !Ref LowCacheHitRateAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-CacheAlarm'
+
+  # Useful Commands for Testing
+  TestCommands:
+    Description: 'Commands to test the CDN deployment'
+    Value: !Sub |
+      # Test main page
+      curl -I https://${CloudFrontDistribution.DomainName}
+      
+      # Test cache headers
+      curl -I https://${CloudFrontDistribution.DomainName}/css/styles.css
+      
+      # Test that direct S3 access is blocked
+      curl -I https://${ContentBucket.RegionalDomainName}/index.html
+
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: 'Project Configuration'
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: 'CloudFront Configuration'
+        Parameters:
+          - PriceClass
+          - EnableLogging
+          - EnableRealTimeMetrics
+      - Label:
+          default: 'Security Configuration'
+        Parameters:
+          - RateLimitThreshold
+      - Label:
+          default: 'Monitoring Configuration'
+        Parameters:
+          - CacheHitRateThreshold
+          - ErrorRateThreshold
+    ParameterLabels:
+      ProjectName:
+        default: 'Project Name'
+      Environment:
+        default: 'Environment'
+      PriceClass:
+        default: 'CloudFront Price Class'
+      RateLimitThreshold:
+        default: 'WAF Rate Limit (requests per 5 min)'
+      CacheHitRateThreshold:
+        default: 'Cache Hit Rate Alarm Threshold (%)'
+      ErrorRateThreshold:
+        default: '4xx Error Rate Alarm Threshold (%)'
+      EnableLogging:
+        default: 'Enable CloudFront Logging'
+      EnableRealTimeMetrics:
+        default: 'Enable Real-time Metrics'

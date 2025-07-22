@@ -1,0 +1,723 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'S3 Event Notifications and Automated Processing - Creates event-driven architecture using S3 event notifications to trigger automated processing workflows through Lambda, SQS, and SNS'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "S3 Configuration"
+        Parameters:
+          - BucketName
+          - EnableVersioning
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+          - EnableEmailNotifications
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaTimeout
+          - LambdaMemorySize
+      - Label:
+          default: "SQS Configuration"
+        Parameters:
+          - SQSVisibilityTimeout
+          - SQSMessageRetentionPeriod
+    ParameterLabels:
+      Environment:
+        default: "Environment"
+      ProjectName:
+        default: "Project Name"
+      BucketName:
+        default: "S3 Bucket Name"
+      EnableVersioning:
+        default: "Enable S3 Versioning"
+      NotificationEmail:
+        default: "Email for Notifications"
+      EnableEmailNotifications:
+        default: "Enable Email Notifications"
+      LambdaTimeout:
+        default: "Lambda Function Timeout"
+      LambdaMemorySize:
+        default: "Lambda Memory Size"
+      SQSVisibilityTimeout:
+        default: "SQS Visibility Timeout"
+      SQSMessageRetentionPeriod:
+        default: "SQS Message Retention Period"
+
+# Input Parameters
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name for resource tagging and naming
+    
+  ProjectName:
+    Type: String
+    Default: file-processing
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    Description: Project name for resource naming (lowercase, alphanumeric and hyphens only)
+    
+  BucketName:
+    Type: String
+    Default: ''
+    Description: 'S3 bucket name (leave empty for auto-generated name). Must be globally unique.'
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    
+  EnableVersioning:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable S3 bucket versioning
+    
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for SNS notifications (leave empty to skip email subscription)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    
+  EnableEmailNotifications:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable email notifications via SNS
+    
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    Description: Lambda function timeout in seconds
+    
+  LambdaMemorySize:
+    Type: Number
+    Default: 128
+    AllowedValues: [128, 256, 512, 1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192, 9216, 10240]
+    Description: Lambda function memory size in MB
+    
+  SQSVisibilityTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 0
+    MaxValue: 43200
+    Description: SQS queue visibility timeout in seconds
+    
+  SQSMessageRetentionPeriod:
+    Type: Number
+    Default: 1209600
+    MinValue: 60
+    MaxValue: 1209600
+    Description: SQS message retention period in seconds (default 14 days)
+
+# Conditional Logic
+Conditions:
+  CreateEmailSubscription: !And
+    - !Equals [!Ref EnableEmailNotifications, 'true']
+    - !Not [!Equals [!Ref NotificationEmail, '']]
+  AutoGenerateBucketName: !Equals [!Ref BucketName, '']
+  EnableS3Versioning: !Equals [!Ref EnableVersioning, 'true']
+  IsProdEnvironment: !Equals [!Ref Environment, 'prod']
+
+# Resource Definitions
+Resources:
+  
+  # ====================
+  # S3 BUCKET RESOURCES
+  # ====================
+  
+  # Main S3 bucket for file processing
+  FileProcessingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - AutoGenerateBucketName
+        - !Sub '${ProjectName}-${Environment}-${AWS::AccountId}-${AWS::Region}'
+        - !Ref BucketName
+      VersioningConfiguration: !If
+        - EnableS3Versioning
+        - Status: Enabled
+        - !Ref AWS::NoValue
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transition:
+              StorageClass: GLACIER
+              TransitionInDays: 90
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Topic: !Ref FileProcessingTopic
+            Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: uploads/
+        QueueConfigurations:
+          - Queue: !GetAtt FileProcessingQueue.Arn
+            Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: batch/
+        LambdaConfigurations:
+          - Function: !GetAtt FileProcessorFunction.Arn
+            Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: immediate/
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: EventDrivenFileProcessing
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ====================
+  # SNS TOPIC RESOURCES
+  # ====================
+  
+  # SNS topic for file processing notifications
+  FileProcessingTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-file-notifications'
+      DisplayName: !Sub '${ProjectName} File Processing Notifications'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: FileProcessingNotifications
+
+  # SNS topic policy to allow S3 to publish messages
+  FileProcessingTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref FileProcessingTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3ToPublishMessages
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: SNS:Publish
+            Resource: !Ref FileProcessingTopic
+            Condition:
+              ArnEquals:
+                'aws:SourceArn': !Sub '${FileProcessingBucket}'
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+
+  # Email subscription for SNS topic (conditional)
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateEmailSubscription
+    Properties:
+      TopicArn: !Ref FileProcessingTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ====================
+  # SQS QUEUE RESOURCES
+  # ====================
+  
+  # SQS queue for batch file processing
+  FileProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-batch-processing'
+      VisibilityTimeoutSeconds: !Ref SQSVisibilityTimeout
+      MessageRetentionPeriod: !Ref SQSMessageRetentionPeriod
+      ReceiveMessageWaitTimeSeconds: 20  # Enable long polling
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt FileProcessingDLQ.Arn
+        maxReceiveCount: 3
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: BatchFileProcessing
+
+  # Dead letter queue for failed processing attempts
+  FileProcessingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-batch-processing-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DeadLetterQueue
+
+  # SQS queue policy to allow S3 to send messages
+  FileProcessingQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref FileProcessingQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3ToSendMessages
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: SQS:SendMessage
+            Resource: !GetAtt FileProcessingQueue.Arn
+            Condition:
+              ArnEquals:
+                'aws:SourceArn': !Sub '${FileProcessingBucket}'
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+
+  # ====================
+  # IAM ROLES AND POLICIES
+  # ====================
+  
+  # IAM role for Lambda function execution
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3ReadOnlyAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub '${FileProcessingBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub '${FileProcessingBucket}'
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-${Environment}-*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: LambdaExecution
+
+  # ====================
+  # LAMBDA FUNCTION RESOURCES
+  # ====================
+  
+  # Lambda function for immediate file processing
+  FileProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-file-processor'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+          BUCKET_NAME: !Ref FileProcessingBucket
+      ReservedConcurrencyLimit: !If
+        - IsProdEnvironment
+        - 100
+        - 10
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib.parse
+          from datetime import datetime
+          import os
+          
+          def lambda_handler(event, context):
+              """
+              Process S3 object creation events for immediate file processing.
+              
+              This function handles real-time processing of uploaded files,
+              implementing file type detection and routing logic for
+              content-aware processing workflows.
+              """
+              print(f"Environment: {os.environ.get('ENVIRONMENT', 'unknown')}")
+              print(f"Project: {os.environ.get('PROJECT_NAME', 'unknown')}")
+              print(f"Received event: {json.dumps(event, indent=2)}")
+              
+              # Initialize AWS clients
+              s3_client = boto3.client('s3')
+              
+              processed_files = []
+              
+              try:
+                  for record in event['Records']:
+                      # Parse S3 event information
+                      bucket = record['s3']['bucket']['name']
+                      key = urllib.parse.unquote_plus(record['s3']['object']['key'])
+                      size = record['s3']['object']['size']
+                      event_name = record['eventName']
+                      event_time = record['eventTime']
+                      
+                      print(f"Processing {event_name} for {key} in bucket {bucket}")
+                      print(f"File size: {size} bytes, Event time: {event_time}")
+                      
+                      # Get file metadata
+                      try:
+                          response = s3_client.head_object(Bucket=bucket, Key=key)
+                          content_type = response.get('ContentType', 'unknown')
+                          last_modified = response.get('LastModified', 'unknown')
+                          print(f"Content type: {content_type}, Last modified: {last_modified}")
+                      except Exception as e:
+                          print(f"Error getting object metadata: {str(e)}")
+                          content_type = 'unknown'
+                      
+                      # File type-based processing logic
+                      file_extension = key.lower().split('.')[-1] if '.' in key else ''
+                      
+                      if file_extension in ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'tiff']:
+                          print("🖼️  Processing image file - would trigger image processing pipeline")
+                          processing_type = "image"
+                          # Future: Integrate with Amazon Rekognition for image analysis
+                          # Future: Generate thumbnails using PIL/Pillow
+                          # Future: Extract EXIF metadata
+                          
+                      elif file_extension in ['mp4', 'mov', 'avi', 'wmv', 'flv', 'webm', 'mkv']:
+                          print("🎥 Processing video file - would trigger video transcoding pipeline")
+                          processing_type = "video"
+                          # Future: Integrate with AWS Elemental MediaConvert
+                          # Future: Generate video thumbnails
+                          # Future: Extract video metadata
+                          
+                      elif file_extension in ['pdf', 'doc', 'docx', 'txt', 'rtf']:
+                          print("📄 Processing document - would extract text and metadata")
+                          processing_type = "document"
+                          # Future: Integrate with Amazon Textract for OCR
+                          # Future: Extract document metadata
+                          # Future: Index content in Amazon OpenSearch
+                          
+                      elif file_extension in ['mp3', 'wav', 'flac', 'aac', 'm4a']:
+                          print("🎵 Processing audio file - would trigger audio analysis")
+                          processing_type = "audio"
+                          # Future: Integrate with Amazon Transcribe
+                          # Future: Audio format conversion
+                          # Future: Extract audio metadata
+                          
+                      else:
+                          print(f"❓ Unknown file type (.{file_extension}) - logging for review")
+                          processing_type = "unknown"
+                          # Future: Implement custom processing logic
+                          # Future: Move to quarantine folder for manual review
+                      
+                      # Simulate processing time and success
+                      processing_result = {
+                          'file_key': key,
+                          'bucket': bucket,
+                          'size_bytes': size,
+                          'processing_type': processing_type,
+                          'content_type': content_type,
+                          'status': 'completed',
+                          'processed_at': datetime.now().isoformat(),
+                          'processing_duration_ms': 50  # Simulated processing time
+                      }
+                      
+                      processed_files.append(processing_result)
+                      print(f"✅ Completed processing {key} at {datetime.now()}")
+                  
+                  # Return success response
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'File processing completed successfully',
+                          'processed_files': processed_files,
+                          'total_files': len(processed_files)
+                      }, indent=2)
+                  }
+                  
+              except Exception as e:
+                  print(f"❌ Error processing files: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': 'File processing failed',
+                          'message': str(e),
+                          'processed_files': processed_files
+                      }, indent=2)
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: ImmediateFileProcessing
+
+  # Lambda permission for S3 to invoke the function
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FileProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub '${FileProcessingBucket}'
+      SourceAccount: !Ref AWS::AccountId
+
+  # ====================
+  # CLOUDWATCH RESOURCES
+  # ====================
+  
+  # CloudWatch Log Group for Lambda function
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${FileProcessorFunction}'
+      RetentionInDays: !If
+        - IsProdEnvironment
+        - 30
+        - 7
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: LambdaLogs
+
+  # CloudWatch Alarm for Lambda function errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-lambda-errors'
+      AlarmDescription: 'Alarm for Lambda function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FileProcessorFunction
+      AlarmActions: !If
+        - CreateEmailSubscription
+        - [!Ref FileProcessingTopic]
+        - []
+
+  # CloudWatch Alarm for SQS queue message age
+  SQSMessageAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-sqs-message-age'
+      AlarmDescription: 'Alarm for old messages in SQS queue'
+      MetricName: ApproximateAgeOfOldestMessage
+      Namespace: AWS/SQS
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 900  # 15 minutes
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt FileProcessingQueue.QueueName
+      AlarmActions: !If
+        - CreateEmailSubscription
+        - [!Ref FileProcessingTopic]
+        - []
+
+# Stack Outputs
+Outputs:
+  
+  # S3 Bucket Information
+  BucketName:
+    Description: 'Name of the S3 bucket for file processing'
+    Value: !Ref FileProcessingBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketName'
+      
+  BucketArn:
+    Description: 'ARN of the S3 bucket'
+    Value: !GetAtt FileProcessingBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketArn'
+      
+  BucketWebsiteURL:
+    Description: 'Website URL of the S3 bucket'
+    Value: !GetAtt FileProcessingBucket.WebsiteURL
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketWebsiteURL'
+  
+  # SNS Topic Information
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for file processing notifications'
+    Value: !Ref FileProcessingTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+      
+  SNSTopicName:
+    Description: 'Name of the SNS topic'
+    Value: !GetAtt FileProcessingTopic.TopicName
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicName'
+  
+  # SQS Queue Information
+  SQSQueueURL:
+    Description: 'URL of the SQS queue for batch processing'
+    Value: !Ref FileProcessingQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-SQSQueueURL'
+      
+  SQSQueueArn:
+    Description: 'ARN of the SQS queue'
+    Value: !GetAtt FileProcessingQueue.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SQSQueueArn'
+      
+  SQSQueueName:
+    Description: 'Name of the SQS queue'
+    Value: !GetAtt FileProcessingQueue.QueueName
+    Export:
+      Name: !Sub '${AWS::StackName}-SQSQueueName'
+      
+  # Dead Letter Queue Information
+  DLQQueueURL:
+    Description: 'URL of the Dead Letter Queue'
+    Value: !Ref FileProcessingDLQ
+    Export:
+      Name: !Sub '${AWS::StackName}-DLQQueueURL'
+      
+  DLQQueueArn:
+    Description: 'ARN of the Dead Letter Queue'
+    Value: !GetAtt FileProcessingDLQ.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DLQQueueArn'
+  
+  # Lambda Function Information
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function for file processing'
+    Value: !GetAtt FileProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+      
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function'
+    Value: !Ref FileProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+  
+  # IAM Role Information
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+  
+  # CloudWatch Information
+  LambdaLogGroupName:
+    Description: 'Name of the CloudWatch Log Group for Lambda'
+    Value: !Ref LambdaLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaLogGroupName'
+  
+  # Upload Instructions
+  UploadInstructions:
+    Description: 'Instructions for testing the event-driven file processing'
+    Value: !Sub |
+      To test the event-driven file processing:
+      
+      1. SNS Notifications (uploads/ prefix):
+         aws s3 cp myfile.jpg s3://${FileProcessingBucket}/uploads/
+      
+      2. SQS Batch Processing (batch/ prefix):
+         aws s3 cp myfile.pdf s3://${FileProcessingBucket}/batch/
+      
+      3. Lambda Immediate Processing (immediate/ prefix):
+         aws s3 cp myfile.mp4 s3://${FileProcessingBucket}/immediate/
+      
+      Monitor processing in CloudWatch Logs: /aws/lambda/${FileProcessorFunction}
+      
+      Check SQS messages: aws sqs receive-message --queue-url ${FileProcessingQueue}
+      
+  # Cost Optimization Notes
+  CostOptimizationNotes:
+    Description: 'Cost optimization recommendations'
+    Value: !Sub |
+      Cost Optimization Tips:
+      - S3 Lifecycle policies automatically transition files to cheaper storage classes
+      - Lambda reserved concurrency limits costs in ${Environment} environment
+      - SQS long polling reduces API calls and costs
+      - CloudWatch log retention is optimized for ${Environment} (prod: 30 days, dev: 7 days)
+      - Dead letter queue prevents infinite retry costs
+      - KMS encryption uses AWS managed keys to reduce costs

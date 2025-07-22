@@ -1,0 +1,782 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Automated Data Governance Pipeline with Amazon DataZone and AWS Config - Creates a comprehensive governance framework for data compliance monitoring and automated remediation'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Data Governance Configuration"
+        Parameters:
+          - DataZoneDomainName
+          - ProjectName
+          - EnableComplianceMonitoring
+          - NotificationEmail
+      - Label:
+          default: "AWS Config Settings"
+        Parameters:
+          - ConfigBucketName
+          - EnableConfigRecorder
+          - RecordAllResources
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaTimeout
+          - LambdaMemorySize
+          - LogRetentionDays
+      - Label:
+          default: "Monitoring and Alerting"
+        Parameters:
+          - EnableCloudWatchAlarms
+          - ComplianceThreshold
+          - AlertingSeverity
+    ParameterLabels:
+      DataZoneDomainName:
+        default: "DataZone Domain Name"
+      ProjectName:
+        default: "Governance Project Name"
+      EnableComplianceMonitoring:
+        default: "Enable Real-time Compliance Monitoring"
+      NotificationEmail:
+        default: "Email for Governance Alerts"
+
+# Input Parameters
+Parameters:
+  DataZoneDomainName:
+    Type: String
+    Description: 'Name for the Amazon DataZone domain (must be unique within region)'
+    Default: 'governance-domain'
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+
+  ProjectName:
+    Type: String
+    Description: 'Name for the DataZone governance project'
+    Default: 'data-governance-project'
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+
+  EnableComplianceMonitoring:
+    Type: String
+    Description: 'Enable real-time compliance monitoring with AWS Config'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for governance and compliance notifications'
+    Default: 'governance-team@example.com'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  ConfigBucketName:
+    Type: String
+    Description: 'S3 bucket name for AWS Config delivery channel (leave empty for auto-generated)'
+    Default: ''
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be a valid S3 bucket name or empty for auto-generation'
+
+  EnableConfigRecorder:
+    Type: String
+    Description: 'Enable AWS Config configuration recorder'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  RecordAllResources:
+    Type: String
+    Description: 'Record all supported AWS resource types'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  LambdaTimeout:
+    Type: Number
+    Description: 'Lambda function timeout in seconds'
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+
+  LambdaMemorySize:
+    Type: Number
+    Description: 'Lambda function memory size in MB'
+    Default: 512
+    AllowedValues: [128, 256, 512, 1024, 1536, 2048, 3008]
+
+  LogRetentionDays:
+    Type: Number
+    Description: 'CloudWatch logs retention period in days'
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+  EnableCloudWatchAlarms:
+    Type: String
+    Description: 'Enable CloudWatch alarms for monitoring'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  ComplianceThreshold:
+    Type: Number
+    Description: 'Minimum compliance percentage threshold for alerts (0.0-1.0)'
+    Default: 0.8
+    MinValue: 0.0
+    MaxValue: 1.0
+
+  AlertingSeverity:
+    Type: String
+    Description: 'Severity level for compliance alerts'
+    Default: 'HIGH'
+    AllowedValues: ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']
+
+# Conditional Resource Creation
+Conditions:
+  CreateConfigBucket: !Equals [!Ref ConfigBucketName, '']
+  EnableConfig: !Equals [!Ref EnableComplianceMonitoring, 'true']
+  CreateConfigRecorder: !And [!Condition EnableConfig, !Equals [!Ref EnableConfigRecorder, 'true']]
+  EnableAlarming: !Equals [!Ref EnableCloudWatchAlarms, 'true']
+  RecordAllResourceTypes: !Equals [!Ref RecordAllResources, 'true']
+
+# AWS Resources
+Resources:
+
+  # ================================
+  # IAM Roles and Policies
+  # ================================
+
+  # AWS Config Service Role
+  ConfigServiceRole:
+    Type: AWS::IAM::Role
+    Condition: EnableConfig
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ConfigServiceRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'AWS:SourceAccount': !Ref 'AWS::AccountId'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/ConfigRole
+      Path: /service-role/
+      Tags:
+        - Key: Purpose
+          Value: DataGovernance
+        - Key: Service
+          Value: AWSConfig
+
+  # DataZone Service Linked Role (created automatically by DataZone service)
+  # Note: Service-linked roles are created automatically when needed
+
+  # Lambda Execution Role for Governance Processing
+  GovernanceLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-GovernanceLambdaRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DataGovernanceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # DataZone Permissions
+              - Effect: Allow
+                Action:
+                  - datazone:Get*
+                  - datazone:List*
+                  - datazone:Search*
+                  - datazone:UpdateAsset
+                  - datazone:CreateAsset
+                  - datazone:DeleteAsset
+                Resource: '*'
+              # AWS Config Permissions
+              - Effect: Allow
+                Action:
+                  - config:GetComplianceDetailsByConfigRule
+                  - config:GetResourceConfigHistory
+                  - config:GetComplianceDetailsByResource
+                  - config:DescribeConfigRules
+                  - config:GetComplianceSummaryByConfigRule
+                Resource: '*'
+              # SNS Permissions for Notifications
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref GovernanceNotificationTopic
+              # CloudWatch Logs Permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Purpose
+          Value: DataGovernance
+        - Key: Service
+          Value: Lambda
+
+  # ================================
+  # S3 Resources for AWS Config
+  # ================================
+
+  # S3 Bucket for Config Delivery Channel
+  ConfigDeliveryBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateConfigBucket
+    Properties:
+      BucketName: !Sub 'aws-config-${AWS::AccountId}-${AWS::Region}-${AWS::StackName}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ConfigDataRetention
+            Status: Enabled
+            ExpirationInDays: 2555  # 7 years retention for compliance
+            NoncurrentVersionExpirationInDays: 90
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref ConfigDeliveryLogGroup
+      Tags:
+        - Key: Purpose
+          Value: DataGovernance
+        - Key: Service
+          Value: AWSConfig
+
+  # S3 Bucket Policy for AWS Config Access
+  ConfigDeliveryBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateConfigBucket
+    Properties:
+      Bucket: !Ref ConfigDeliveryBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSConfigBucketPermissionsCheck
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt ConfigDeliveryBucket.Arn
+            Condition:
+              StringEquals:
+                'AWS:SourceAccount': !Ref 'AWS::AccountId'
+          - Sid: AWSConfigBucketExistenceCheck
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:ListBucket
+            Resource: !GetAtt ConfigDeliveryBucket.Arn
+            Condition:
+              StringEquals:
+                'AWS:SourceAccount': !Ref 'AWS::AccountId'
+          - Sid: AWSConfigBucketDelivery
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${ConfigDeliveryBucket.Arn}/AWSLogs/${AWS::AccountId}/Config/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+                'AWS:SourceAccount': !Ref 'AWS::AccountId'
+
+  # ================================
+  # AWS Config Resources
+  # ================================
+
+  # Configuration Recorder
+  ConfigurationRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Condition: CreateConfigRecorder
+    Properties:
+      Name: DataGovernanceRecorder
+      RoleARN: !GetAtt ConfigServiceRole.Arn
+      RecordingGroup:
+        AllSupported: !If [RecordAllResourceTypes, true, false]
+        IncludeGlobalResourceTypes: true
+        ResourceTypes: !If
+          - RecordAllResourceTypes
+          - !Ref 'AWS::NoValue'
+          - - 'AWS::S3::Bucket'
+            - 'AWS::RDS::DBInstance'
+            - 'AWS::RDS::DBCluster'
+            - 'AWS::DynamoDB::Table'
+            - 'AWS::Redshift::Cluster'
+            - 'AWS::IAM::Role'
+            - 'AWS::IAM::Policy'
+
+  # Delivery Channel
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Condition: CreateConfigRecorder
+    Properties:
+      Name: DataGovernanceDeliveryChannel
+      S3BucketName: !If
+        - CreateConfigBucket
+        - !Ref ConfigDeliveryBucket
+        - !Ref ConfigBucketName
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: TwentyFour_Hours
+
+  # Config Rules for Data Governance
+  S3EncryptionConfigRule:
+    Type: AWS::Config::ConfigRule
+    Condition: EnableConfig
+    DependsOn: ConfigurationRecorder
+    Properties:
+      ConfigRuleName: s3-bucket-server-side-encryption-enabled
+      Description: 'Checks whether S3 buckets have server-side encryption enabled'
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_SERVER_SIDE_ENCRYPTION_ENABLED
+      Scope:
+        ComplianceResourceTypes:
+          - 'AWS::S3::Bucket'
+
+  RDSEncryptionConfigRule:
+    Type: AWS::Config::ConfigRule
+    Condition: EnableConfig
+    DependsOn: ConfigurationRecorder
+    Properties:
+      ConfigRuleName: rds-storage-encrypted
+      Description: 'Checks whether storage encryption is enabled for RDS instances'
+      Source:
+        Owner: AWS
+        SourceIdentifier: RDS_STORAGE_ENCRYPTED
+      Scope:
+        ComplianceResourceTypes:
+          - 'AWS::RDS::DBInstance'
+
+  S3PublicReadConfigRule:
+    Type: AWS::Config::ConfigRule
+    Condition: EnableConfig
+    DependsOn: ConfigurationRecorder
+    Properties:
+      ConfigRuleName: s3-bucket-public-read-prohibited
+      Description: 'Checks whether S3 buckets prohibit public read access'
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_PUBLIC_READ_PROHIBITED
+      Scope:
+        ComplianceResourceTypes:
+          - 'AWS::S3::Bucket'
+
+  # ================================
+  # Amazon DataZone Resources
+  # ================================
+
+  # DataZone Domain
+  DataZoneDomain:
+    Type: AWS::DataZone::Domain
+    Properties:
+      Name: !Sub '${DataZoneDomainName}-${AWS::StackName}'
+      Description: 'Automated data governance domain for compliance monitoring and data cataloging'
+      DomainExecutionRole: !Sub 'arn:aws:iam::${AWS::AccountId}:role/service-role/AmazonDataZoneServiceRole'
+      Tags:
+        - Key: Purpose
+          Value: DataGovernance
+        - Key: Environment
+          Value: Production
+
+  # DataZone Project
+  DataZoneProject:
+    Type: AWS::DataZone::Project
+    Properties:
+      DomainIdentifier: !Ref DataZoneDomain
+      Name: !Sub '${ProjectName}-${AWS::StackName}'
+      Description: 'Governance project for automated compliance monitoring and data asset management'
+
+  # ================================
+  # Lambda Function for Governance
+  # ================================
+
+  # CloudWatch Log Group for Lambda
+  GovernanceLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-governance-processor'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # Lambda Function for Governance Processing
+  GovernanceProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-governance-processor'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt GovernanceLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Description: 'Processes data governance events and automates compliance responses'
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+          AWS_ACCOUNT_ID: !Ref 'AWS::AccountId'
+          AWS_REGION: !Ref 'AWS::Region'
+          DATAZONE_DOMAIN_ID: !Ref DataZoneDomain
+          DATAZONE_PROJECT_ID: !Ref DataZoneProject
+          SNS_TOPIC_ARN: !Ref GovernanceNotificationTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          from botocore.exceptions import ClientError
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+
+          def lambda_handler(event, context):
+              """Process governance events and update DataZone metadata"""
+              
+              try:
+                  logger.info(f"Received event: {json.dumps(event, default=str)}")
+                  
+                  # Parse EventBridge event structure
+                  detail = event.get('detail', {})
+                  config_item = detail.get('configurationItem', {})
+                  compliance_result = detail.get('newEvaluationResult', {})
+                  compliance_type = compliance_result.get('complianceType', 'UNKNOWN')
+                  
+                  resource_type = config_item.get('resourceType', '')
+                  resource_id = config_item.get('resourceId', '')
+                  resource_arn = config_item.get('arn', '')
+                  
+                  logger.info(f"Processing governance event for {resource_type}: {resource_id}")
+                  logger.info(f"Compliance status: {compliance_type}")
+                  
+                  # Initialize AWS clients with error handling
+                  try:
+                      datazone_client = boto3.client('datazone')
+                      config_client = boto3.client('config')
+                      sns_client = boto3.client('sns')
+                  except Exception as e:
+                      logger.error(f"Failed to initialize AWS clients: {str(e)}")
+                      raise
+                  
+                  # Create governance metadata
+                  governance_metadata = {
+                      'resourceId': resource_id,
+                      'resourceType': resource_type,
+                      'resourceArn': resource_arn,
+                      'complianceStatus': compliance_type,
+                      'evaluationTimestamp': compliance_result.get('resultRecordedTime', ''),
+                      'configRuleName': compliance_result.get('configRuleName', ''),
+                      'awsAccountId': detail.get('awsAccountId', ''),
+                      'awsRegion': detail.get('awsRegion', ''),
+                      'processedAt': datetime.utcnow().isoformat(),
+                      'datazoneProjectId': os.environ.get('DATAZONE_PROJECT_ID', '')
+                  }
+                  
+                  # Log governance event for audit trail
+                  logger.info(f"Governance metadata: {json.dumps(governance_metadata, default=str)}")
+                  
+                  # Process compliance violations
+                  if compliance_type == 'NON_COMPLIANT':
+                      logger.warning(f"Compliance violation detected for {resource_type}: {resource_id}")
+                      
+                      # Send SNS notification for high-severity violations
+                      try:
+                          severity = 'HIGH' if 'encryption' in compliance_result.get('configRuleName', '') else 'MEDIUM'
+                          
+                          message = {
+                              'violationType': 'COMPLIANCE_VIOLATION',
+                              'severity': severity,
+                              'resource': resource_id,
+                              'resourceType': resource_type,
+                              'rule': compliance_result.get('configRuleName', ''),
+                              'timestamp': datetime.utcnow().isoformat(),
+                              'requiresAttention': True,
+                              'account': detail.get('awsAccountId', ''),
+                              'region': detail.get('awsRegion', '')
+                          }
+                          
+                          sns_client.publish(
+                              TopicArn=os.environ.get('SNS_TOPIC_ARN'),
+                              Subject=f'Data Governance Alert - {severity} Severity',
+                              Message=json.dumps(message, indent=2)
+                          )
+                          
+                          logger.info(f"Sent governance alert for {resource_id}")
+                          
+                      except Exception as e:
+                          logger.error(f"Failed to send SNS notification: {str(e)}")
+                  
+                  # Prepare response
+                  response_body = {
+                      'statusCode': 200,
+                      'message': 'Governance event processed successfully',
+                      'metadata': governance_metadata,
+                      'processedResources': 1
+                  }
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(response_body, default=str)
+                  }
+                  
+              except ClientError as e:
+                  error_code = e.response['Error']['Code']
+                  error_message = e.response['Error']['Message']
+                  logger.error(f"AWS service error ({error_code}): {error_message}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': f'AWS service error: {error_code}',
+                          'message': error_message
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Unexpected error processing governance event: {str(e)}", exc_info=True)
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': 'Internal processing error',
+                          'message': str(e)
+                      })
+                  }
+      Tags:
+        - Key: Purpose
+          Value: DataGovernance
+        - Key: Service
+          Value: Lambda
+
+  # ================================
+  # EventBridge Resources
+  # ================================
+
+  # EventBridge Rule for Config Compliance Events
+  GovernanceEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-governance-events'
+      Description: 'Routes data governance events to Lambda processor'
+      State: ENABLED
+      EventPattern:
+        source:
+          - 'aws.config'
+        detail-type:
+          - 'Config Rules Compliance Change'
+        detail:
+          newEvaluationResult:
+            complianceType:
+              - 'NON_COMPLIANT'
+              - 'COMPLIANT'
+          configRuleName:
+            - 's3-bucket-server-side-encryption-enabled'
+            - 'rds-storage-encrypted'
+            - 's3-bucket-public-read-prohibited'
+      Targets:
+        - Arn: !GetAtt GovernanceProcessorFunction.Arn
+          Id: 'GovernanceLambdaTarget'
+          RetryPolicy:
+            MaximumRetryAttempts: 3
+            MaximumEventAge: 3600
+
+  # Permission for EventBridge to invoke Lambda
+  GovernanceLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GovernanceProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt GovernanceEventRule.Arn
+
+  # ================================
+  # SNS Resources for Notifications
+  # ================================
+
+  # SNS Topic for Governance Notifications
+  GovernanceNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-governance-alerts'
+      DisplayName: 'Data Governance Alerts'
+      KmsMasterKeyId: alias/aws/sns
+
+  # SNS Subscription for Email Notifications
+  GovernanceEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref GovernanceNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ================================
+  # CloudWatch Resources
+  # ================================
+
+  # CloudWatch Log Group for Config Delivery
+  ConfigDeliveryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateConfigBucket
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${AWS::StackName}-config-delivery'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # CloudWatch Alarm for Lambda Errors
+  GovernanceLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlarming
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-governance-lambda-errors'
+      AlarmDescription: 'Monitor Lambda function errors in governance pipeline'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref GovernanceNotificationTopic
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref GovernanceProcessorFunction
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for Lambda Duration
+  GovernanceLambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlarming
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-governance-lambda-duration'
+      AlarmDescription: 'Monitor Lambda function execution duration'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 240000  # 4 minutes (80% of 5-minute timeout)
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref GovernanceNotificationTopic
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref GovernanceProcessorFunction
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for Overall Compliance
+  GovernanceComplianceAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlarming
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-governance-compliance-ratio'
+      AlarmDescription: 'Monitor overall compliance ratio across Config rules'
+      MetricName: ComplianceByConfigRule
+      Namespace: AWS/Config
+      Statistic: Average
+      Period: 600
+      EvaluationPeriods: 2
+      Threshold: !Ref ComplianceThreshold
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref GovernanceNotificationTopic
+      TreatMissingData: notBreaching
+
+# Template Outputs
+Outputs:
+  DataZoneDomainId:
+    Description: 'Amazon DataZone Domain ID for data governance'
+    Value: !Ref DataZoneDomain
+    Export:
+      Name: !Sub '${AWS::StackName}-DataZoneDomainId'
+
+  DataZoneProjectId:
+    Description: 'DataZone Project ID for governance workflows'
+    Value: !Ref DataZoneProject
+    Export:
+      Name: !Sub '${AWS::StackName}-DataZoneProjectId'
+
+  DataZonePortalUrl:
+    Description: 'URL to access the DataZone data portal'
+    Value: !Sub 'https://${DataZoneDomain}.datazone.${AWS::Region}.amazonaws.com'
+
+  ConfigDeliveryBucketName:
+    Description: 'S3 bucket name for AWS Config delivery channel'
+    Value: !If
+      - CreateConfigBucket
+      - !Ref ConfigDeliveryBucket
+      - !Ref ConfigBucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigBucket'
+
+  GovernanceLambdaFunctionName:
+    Description: 'Lambda function name for governance processing'
+    Value: !Ref GovernanceProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-GovernanceLambda'
+
+  GovernanceLambdaArn:
+    Description: 'Lambda function ARN for governance processing'
+    Value: !GetAtt GovernanceProcessorFunction.Arn
+
+  EventBridgeRuleName:
+    Description: 'EventBridge rule name for governance automation'
+    Value: !Ref GovernanceEventRule
+    Export:
+      Name: !Sub '${AWS::StackName}-EventRule'
+
+  SNSTopicArn:
+    Description: 'SNS topic ARN for governance notifications'
+    Value: !Ref GovernanceNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopic'
+
+  ConfigRules:
+    Description: 'List of deployed AWS Config rules for data governance'
+    Value: !Sub
+      - '${S3Encryption}, ${RDSEncryption}, ${S3PublicRead}'
+      - S3Encryption: !If [EnableConfig, !Ref S3EncryptionConfigRule, 'Not Deployed']
+        RDSEncryption: !If [EnableConfig, !Ref RDSEncryptionConfigRule, 'Not Deployed']
+        S3PublicRead: !If [EnableConfig, !Ref S3PublicReadConfigRule, 'Not Deployed']
+
+  CloudWatchAlarms:
+    Description: 'CloudWatch alarms for governance monitoring'
+    Value: !If
+      - EnableAlarming
+      - !Sub '${GovernanceLambdaErrorAlarm}, ${GovernanceLambdaDurationAlarm}, ${GovernanceComplianceAlarm}'
+      - 'Monitoring disabled'
+
+  DeploymentInstructions:
+    Description: 'Next steps after deployment'
+    Value: !Sub |
+      1. Confirm email subscription for SNS topic: ${GovernanceNotificationTopic}
+      2. Access DataZone portal: https://${DataZoneDomain}.datazone.${AWS::Region}.amazonaws.com
+      3. Monitor compliance in Config console: https://console.aws.amazon.com/config/
+      4. View governance metrics in CloudWatch: https://console.aws.amazon.com/cloudwatch/
+
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for this governance solution'
+    Value: '$50-100 USD (varies by usage: Config rules, Lambda invocations, DataZone activity, SNS notifications)'

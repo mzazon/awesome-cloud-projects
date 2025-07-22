@@ -1,0 +1,994 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Secure Self-Service File Portal with AWS Transfer Family Web Apps, IAM Identity Center,
+  and S3 Access Grants. Provides enterprise-grade file sharing with fine-grained access
+  control and centralized identity management.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Identity Configuration"
+        Parameters:
+          - IdentityCenterInstanceArn
+          - TestUserName
+          - TestUserEmail
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - BucketName
+          - EnableVersioning
+          - StorageClass
+      - Label:
+          default: "Web App Configuration"
+        Parameters:
+          - WebAppName
+          - WebAppUnits
+      - Label:
+          default: "Access Control"
+        Parameters:
+          - AccessGrantPermission
+          - S3SubPrefix
+      - Label:
+          default: "Tags and Metadata"
+        Parameters:
+          - Environment
+          - ProjectName
+    ParameterLabels:
+      IdentityCenterInstanceArn:
+        default: "IAM Identity Center Instance ARN"
+      BucketName:
+        default: "S3 Bucket Name"
+      WebAppName:
+        default: "Transfer Family Web App Name"
+
+Parameters:
+  # Identity Configuration
+  IdentityCenterInstanceArn:
+    Type: String
+    Description: >
+      ARN of existing IAM Identity Center instance. If you don't have one,
+      the web app creation process can help you set one up.
+    AllowedPattern: arn:aws:sso:::instance/ssoins-[0-9a-zA-Z]{16}
+    ConstraintDescription: Must be a valid IAM Identity Center instance ARN
+
+  TestUserName:
+    Type: String
+    Default: portal-test-user
+    Description: Username for test user in IAM Identity Center
+    MinLength: 3
+    MaxLength: 64
+    AllowedPattern: ^[a-zA-Z0-9._-]+$
+    ConstraintDescription: Must be 3-64 characters containing only letters, numbers, periods, underscores, and hyphens
+
+  TestUserEmail:
+    Type: String
+    Default: test-user@example.com
+    Description: Email address for test user
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address
+
+  # Storage Configuration
+  BucketName:
+    Type: String
+    Description: >
+      Name for S3 bucket (must be globally unique). Leave empty to auto-generate.
+    Default: ""
+    AllowedPattern: ^$|^[a-z0-9][a-z0-9.-]*[a-z0-9]$
+    ConstraintDescription: Must be empty or a valid S3 bucket name
+
+  EnableVersioning:
+    Type: String
+    Default: Enabled
+    AllowedValues: [Enabled, Suspended]
+    Description: Enable S3 bucket versioning for file history
+
+  StorageClass:
+    Type: String
+    Default: STANDARD
+    AllowedValues: 
+      - STANDARD
+      - STANDARD_IA
+      - ONEZONE_IA
+      - REDUCED_REDUNDANCY
+    Description: Default storage class for S3 objects
+
+  # Web App Configuration
+  WebAppName:
+    Type: String
+    Default: secure-file-portal
+    Description: Name for the Transfer Family web app
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: ^[a-zA-Z0-9-]+$
+    ConstraintDescription: Must be 3-50 characters containing only letters, numbers, and hyphens
+
+  WebAppUnits:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: Number of web app units (affects performance and cost)
+
+  # Access Control
+  AccessGrantPermission:
+    Type: String
+    Default: READWRITE
+    AllowedValues: [READ, WRITE, READWRITE]
+    Description: Permission level for S3 access grants
+
+  S3SubPrefix:
+    Type: String
+    Default: "*"
+    Description: S3 sub-prefix for access grants (use * for all objects)
+    AllowedPattern: ^[\w\-_./*]+$
+
+  # Tags and Metadata
+  Environment:
+    Type: String
+    Default: Development
+    AllowedValues: [Development, Testing, Staging, Production]
+    Description: Environment type for resource tagging
+
+  ProjectName:
+    Type: String
+    Default: SecureFilePortal
+    Description: Project name for resource tagging
+    MinLength: 3
+    MaxLength: 50
+
+Conditions:
+  # Create bucket name if not provided
+  CreateBucketName: !Equals [!Ref BucketName, ""]
+  
+  # Enable versioning condition
+  EnableS3Versioning: !Equals [!Ref EnableVersioning, "Enabled"]
+  
+  # Production environment condition for enhanced security
+  IsProduction: !Equals [!Ref Environment, "Production"]
+
+Resources:
+  # Generate unique suffix for resource names
+  RandomSuffixCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt RandomSuffixFunction.Arn
+      Length: 6
+
+  RandomSuffixFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-random-suffix-${AWS::StackName}"
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt RandomSuffixFunctionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import random
+          import string
+          import cfnresponse
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  length = int(event['ResourceProperties'].get('Length', 8))
+                  suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
+                  
+                  response_data = {'Suffix': suffix}
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  RandomSuffixFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # S3 Bucket for file storage
+  FileStorageBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !If 
+        - CreateBucketName
+        - !Sub "file-portal-bucket-${RandomSuffixCustomResource.Suffix}"
+        - !Ref BucketName
+      VersioningConfiguration:
+        Status: !Ref EnableVersioning
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref FileStorageBucket
+        LogFilePrefix: access-logs/
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: DeleteOldVersions
+            Status: !If [EnableS3Versioning, Enabled, Disabled]
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 365
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-file-storage"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: TransferFamilyWebApp
+
+  # CloudWatch Log Group for S3 access monitoring
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/s3/${ProjectName}-access-logs"
+      RetentionInDays: !If [IsProduction, 365, 30]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for S3 Access Grants Location
+  S3AccessGrantsLocationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "S3AccessGrantsLocationRole-${RandomSuffixCustomResource.Suffix}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-access-grants-location-role"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for Transfer Family Web App
+  TransferFamilyWebAppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "AWSTransferFamilyWebAppIdentityBearerRole-${RandomSuffixCustomResource.Suffix}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: transfer.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSTransferFamilyWebAppIdentityBearerRole
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-webapp-identity-role"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Custom Resource for S3 Access Grants Instance
+  AccessGrantsInstanceCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt AccessGrantsInstanceFunction.Arn
+      IdentityCenterArn: !Ref IdentityCenterInstanceArn
+      AccountId: !Ref AWS::AccountId
+
+  AccessGrantsInstanceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-access-grants-instance-${AWS::StackName}"
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt AccessGrantsInstanceFunctionRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          
+          def handler(event, context):
+              s3control = boto3.client('s3control')
+              account_id = event['ResourceProperties']['AccountId']
+              identity_center_arn = event['ResourceProperties']['IdentityCenterArn']
+              
+              try:
+                  if event['RequestType'] == 'Create':
+                      response = s3control.create_access_grants_instance(
+                          AccountId=account_id,
+                          IdentityCenterArn=identity_center_arn
+                      )
+                      instance_id = response['AccessGrantsInstanceId']
+                      response_data = {'AccessGrantsInstanceId': instance_id}
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  
+                  elif event['RequestType'] == 'Delete':
+                      try:
+                          s3control.delete_access_grants_instance(AccountId=account_id)
+                      except s3control.exceptions.NoSuchAccessGrantsInstance:
+                          pass  # Already deleted
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  AccessGrantsInstanceFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AccessGrantsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:CreateAccessGrantsInstance
+                  - s3:DeleteAccessGrantsInstance
+                  - s3:GetAccessGrantsInstance
+                  - s3:ListAccessGrantsInstances
+                Resource: "*"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Custom Resource for S3 Access Grants Location
+  AccessGrantsLocationCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: AccessGrantsInstanceCustomResource
+    Properties:
+      ServiceToken: !GetAtt AccessGrantsLocationFunction.Arn
+      AccountId: !Ref AWS::AccountId
+      LocationScope: !Sub "s3://${FileStorageBucket}/*"
+      IamRoleArn: !GetAtt S3AccessGrantsLocationRole.Arn
+
+  AccessGrantsLocationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-access-grants-location-${AWS::StackName}"
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt AccessGrantsLocationFunctionRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          
+          def handler(event, context):
+              s3control = boto3.client('s3control')
+              account_id = event['ResourceProperties']['AccountId']
+              
+              try:
+                  if event['RequestType'] == 'Create':
+                      response = s3control.create_access_grants_location(
+                          AccountId=account_id,
+                          LocationScope=event['ResourceProperties']['LocationScope'],
+                          IAMRoleArn=event['ResourceProperties']['IamRoleArn'],
+                          Tags=[
+                              {'Key': 'Purpose', 'Value': 'TransferFamilyWebApp'},
+                              {'Key': 'CreatedBy', 'Value': 'CloudFormation'}
+                          ]
+                      )
+                      location_id = response['AccessGrantsLocationId']
+                      response_data = {'LocationId': location_id}
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  
+                  elif event['RequestType'] == 'Delete':
+                      location_id = event['PhysicalResourceId']
+                      if location_id and location_id != 'failed':
+                          try:
+                              s3control.delete_access_grants_location(
+                                  AccountId=account_id,
+                                  AccessGrantsLocationId=location_id
+                              )
+                          except Exception as e:
+                              print(f"Error deleting location: {str(e)}")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  AccessGrantsLocationFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AccessGrantsLocationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:CreateAccessGrantsLocation
+                  - s3:DeleteAccessGrantsLocation
+                  - s3:GetAccessGrantsLocation
+                  - s3:ListAccessGrantsLocations
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt S3AccessGrantsLocationRole.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Custom Resource for Identity Center User
+  IdentityCenterUserCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt IdentityCenterUserFunction.Arn
+      IdentityCenterInstanceArn: !Ref IdentityCenterInstanceArn
+      UserName: !Ref TestUserName
+      UserEmail: !Ref TestUserEmail
+
+  IdentityCenterUserFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-identity-center-user-${AWS::StackName}"
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt IdentityCenterUserFunctionRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          
+          def handler(event, context):
+              sso_admin = boto3.client('sso-admin')
+              identitystore = boto3.client('identitystore')
+              
+              try:
+                  # Extract Identity Store ID from Instance ARN
+                  instance_arn = event['ResourceProperties']['IdentityCenterInstanceArn']
+                  instances = sso_admin.list_instances()
+                  identity_store_id = None
+                  
+                  for instance in instances['Instances']:
+                      if instance['InstanceArn'] == instance_arn:
+                          identity_store_id = instance['IdentityStoreId']
+                          break
+                  
+                  if not identity_store_id:
+                      raise Exception("Could not find Identity Store ID")
+                  
+                  if event['RequestType'] == 'Create':
+                      user_name = event['ResourceProperties']['UserName']
+                      user_email = event['ResourceProperties']['UserEmail']
+                      
+                      response = identitystore.create_user(
+                          IdentityStoreId=identity_store_id,
+                          UserName=user_name,
+                          Name={'GivenName': 'Test', 'FamilyName': 'User'},
+                          DisplayName='Test User',
+                          Emails=[{
+                              'Value': user_email,
+                              'Type': 'work',
+                              'Primary': True
+                          }]
+                      )
+                      
+                      user_id = response['UserId']
+                      response_data = {
+                          'UserId': user_id,
+                          'IdentityStoreId': identity_store_id
+                      }
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  
+                  elif event['RequestType'] == 'Delete':
+                      user_id = event.get('PhysicalResourceId')
+                      if user_id and user_id != 'failed':
+                          try:
+                              identitystore.delete_user(
+                                  IdentityStoreId=identity_store_id,
+                                  UserId=user_id
+                              )
+                          except Exception as e:
+                              print(f"Error deleting user: {str(e)}")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  IdentityCenterUserFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: IdentityCenterUserPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sso:ListInstances
+                  - sso-admin:ListInstances
+                  - identitystore:CreateUser
+                  - identitystore:DeleteUser
+                  - identitystore:ListUsers
+                  - identitystore:DescribeUser
+                Resource: "*"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Custom Resource for Access Grant
+  AccessGrantCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: 
+      - AccessGrantsLocationCustomResource
+      - IdentityCenterUserCustomResource
+    Properties:
+      ServiceToken: !GetAtt AccessGrantFunction.Arn
+      AccountId: !Ref AWS::AccountId
+      LocationId: !GetAtt AccessGrantsLocationCustomResource.LocationId
+      UserId: !GetAtt IdentityCenterUserCustomResource.UserId
+      Permission: !Ref AccessGrantPermission
+      S3SubPrefix: !Ref S3SubPrefix
+
+  AccessGrantFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-access-grant-${AWS::StackName}"
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt AccessGrantFunctionRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          
+          def handler(event, context):
+              s3control = boto3.client('s3control')
+              account_id = event['ResourceProperties']['AccountId']
+              
+              try:
+                  if event['RequestType'] == 'Create':
+                      response = s3control.create_access_grant(
+                          AccountId=account_id,
+                          AccessGrantsLocationId=event['ResourceProperties']['LocationId'],
+                          AccessGrantsLocationConfiguration={
+                              'S3SubPrefix': event['ResourceProperties']['S3SubPrefix']
+                          },
+                          Grantee={
+                              'GranteeType': 'DIRECTORY_USER',
+                              'GranteeIdentifier': event['ResourceProperties']['UserId']
+                          },
+                          Permission=event['ResourceProperties']['Permission'],
+                          Tags=[
+                              {'Key': 'CreatedBy', 'Value': 'CloudFormation'},
+                              {'Key': 'Purpose', 'Value': 'TransferFamilyWebApp'}
+                          ]
+                      )
+                      
+                      grant_id = response['AccessGrantId']
+                      response_data = {'GrantId': grant_id}
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  
+                  elif event['RequestType'] == 'Delete':
+                      grant_id = event.get('PhysicalResourceId')
+                      if grant_id and grant_id != 'failed':
+                          try:
+                              s3control.delete_access_grant(
+                                  AccountId=account_id,
+                                  AccessGrantId=grant_id
+                              )
+                          except Exception as e:
+                              print(f"Error deleting access grant: {str(e)}")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  AccessGrantFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AccessGrantPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:CreateAccessGrant
+                  - s3:DeleteAccessGrant
+                  - s3:GetAccessGrant
+                  - s3:ListAccessGrants
+                Resource: "*"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Transfer Family Web App
+  TransferFamilyWebApp:
+    Type: AWS::Transfer::WebApp
+    DependsOn: AccessGrantsInstanceCustomResource
+    Properties:
+      IdentityProviderType: IDENTITY_CENTER
+      IdentityProviderDetails:
+        IdentityCenterConfig:
+          InstanceArn: !Ref IdentityCenterInstanceArn
+          Role: !GetAtt TransferFamilyWebAppRole.Arn
+      WebAppUnits: !Ref WebAppUnits
+      Tags:
+        - Key: Name
+          Value: !Ref WebAppName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Custom Resource to configure CORS after Web App is created
+  CorsConfigurationCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: TransferFamilyWebApp
+    Properties:
+      ServiceToken: !GetAtt CorsConfigurationFunction.Arn
+      BucketName: !Ref FileStorageBucket
+      WebAppId: !Ref TransferFamilyWebApp
+
+  CorsConfigurationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-cors-config-${AWS::StackName}"
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt CorsConfigurationFunctionRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          
+          def handler(event, context):
+              s3 = boto3.client('s3')
+              transfer = boto3.client('transfer')
+              
+              try:
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      bucket_name = event['ResourceProperties']['BucketName']
+                      web_app_id = event['ResourceProperties']['WebAppId']
+                      
+                      # Get web app access endpoint
+                      response = transfer.describe_web_app(WebAppId=web_app_id)
+                      access_endpoint = response['WebApp']['AccessEndpoint']
+                      
+                      # Configure CORS
+                      cors_config = {
+                          'CORSRules': [{
+                              'AllowedHeaders': ['*'],
+                              'AllowedMethods': ['GET', 'PUT', 'POST', 'DELETE', 'HEAD'],
+                              'AllowedOrigins': [f'https://{access_endpoint}'],
+                              'ExposeHeaders': [
+                                  'last-modified', 'content-length', 'etag',
+                                  'x-amz-version-id', 'content-type', 'x-amz-request-id',
+                                  'x-amz-id-2', 'date', 'x-amz-cf-id', 'x-amz-storage-class'
+                              ],
+                              'MaxAgeSeconds': 3000
+                          }]
+                      }
+                      
+                      s3.put_bucket_cors(Bucket=bucket_name, CORSConfiguration=cors_config)
+                      
+                      response_data = {'AccessEndpoint': access_endpoint}
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  CorsConfigurationFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CorsConfigurationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutBucketCors
+                  - s3:GetBucketCors
+                Resource: !Sub "${FileStorageBucket}/*"
+              - Effect: Allow
+                Action:
+                  - s3:PutBucketCors
+                  - s3:GetBucketCors
+                Resource: !GetAtt FileStorageBucket.Arn
+              - Effect: Allow
+                Action:
+                  - transfer:DescribeWebApp
+                Resource: !Sub "arn:aws:transfer:${AWS::Region}:${AWS::AccountId}:web-app/${TransferFamilyWebApp}"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarms for monitoring
+  S3ObjectCountAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub "${ProjectName}-S3-High-Object-Count"
+      AlarmDescription: Alert when S3 bucket has high number of objects
+      MetricName: NumberOfObjects
+      Namespace: AWS/S3
+      Statistic: Average
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 10000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: BucketName
+          Value: !Ref FileStorageBucket
+        - Name: StorageType
+          Value: AllStorageTypes
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  S3BucketSizeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub "${ProjectName}-S3-Large-Bucket-Size"
+      AlarmDescription: Alert when S3 bucket size exceeds threshold
+      MetricName: BucketSizeBytes
+      Namespace: AWS/S3
+      Statistic: Average
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1073741824000  # 1TB in bytes
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: BucketName
+          Value: !Ref FileStorageBucket
+        - Name: StorageType
+          Value: StandardStorage
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  # S3 Bucket Information
+  S3BucketName:
+    Description: Name of the S3 bucket for file storage
+    Value: !Ref FileStorageBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-S3BucketName"
+
+  S3BucketArn:
+    Description: ARN of the S3 bucket
+    Value: !GetAtt FileStorageBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-S3BucketArn"
+
+  # Transfer Family Web App Information
+  WebAppId:
+    Description: ID of the Transfer Family Web App
+    Value: !Ref TransferFamilyWebApp
+    Export:
+      Name: !Sub "${AWS::StackName}-WebAppId"
+
+  WebAppAccessEndpoint:
+    Description: Access endpoint URL for the web app
+    Value: !GetAtt CorsConfigurationCustomResource.AccessEndpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-WebAppAccessEndpoint"
+
+  WebAppAccessUrl:
+    Description: Complete HTTPS URL to access the web app
+    Value: !Sub "https://${CorsConfigurationCustomResource.AccessEndpoint}"
+    Export:
+      Name: !Sub "${AWS::StackName}-WebAppAccessUrl"
+
+  # Identity Center Information
+  IdentityCenterInstanceArn:
+    Description: ARN of the IAM Identity Center instance
+    Value: !Ref IdentityCenterInstanceArn
+    Export:
+      Name: !Sub "${AWS::StackName}-IdentityCenterInstanceArn"
+
+  TestUserId:
+    Description: ID of the created test user
+    Value: !GetAtt IdentityCenterUserCustomResource.UserId
+    Export:
+      Name: !Sub "${AWS::StackName}-TestUserId"
+
+  TestUserName:
+    Description: Username of the created test user
+    Value: !Ref TestUserName
+    Export:
+      Name: !Sub "${AWS::StackName}-TestUserName"
+
+  # Access Grants Information
+  AccessGrantsInstanceId:
+    Description: ID of the S3 Access Grants instance
+    Value: !GetAtt AccessGrantsInstanceCustomResource.AccessGrantsInstanceId
+    Export:
+      Name: !Sub "${AWS::StackName}-AccessGrantsInstanceId"
+
+  AccessGrantsLocationId:
+    Description: ID of the S3 Access Grants location
+    Value: !GetAtt AccessGrantsLocationCustomResource.LocationId
+    Export:
+      Name: !Sub "${AWS::StackName}-AccessGrantsLocationId"
+
+  AccessGrantId:
+    Description: ID of the created access grant
+    Value: !GetAtt AccessGrantCustomResource.GrantId
+    Export:
+      Name: !Sub "${AWS::StackName}-AccessGrantId"
+
+  # IAM Role Information
+  TransferFamilyWebAppRoleArn:
+    Description: ARN of the Transfer Family Web App IAM role
+    Value: !GetAtt TransferFamilyWebAppRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-TransferFamilyWebAppRoleArn"
+
+  S3AccessGrantsLocationRoleArn:
+    Description: ARN of the S3 Access Grants location IAM role
+    Value: !GetAtt S3AccessGrantsLocationRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-S3AccessGrantsLocationRoleArn"
+
+  # Monitoring Information
+  S3AccessLogGroup:
+    Description: CloudWatch Log Group for S3 access logging
+    Value: !Ref S3AccessLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-S3AccessLogGroup"
+
+  # Configuration Information
+  Environment:
+    Description: Environment type for this deployment
+    Value: !Ref Environment
+    Export:
+      Name: !Sub "${AWS::StackName}-Environment"
+
+  ProjectName:
+    Description: Project name for this deployment
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub "${AWS::StackName}-ProjectName"
+
+  # Usage Instructions
+  UsageInstructions:
+    Description: Instructions for using the deployed solution
+    Value: !Sub |
+      1. Navigate to the web app URL: https://${CorsConfigurationCustomResource.AccessEndpoint}
+      2. Sign in with IAM Identity Center using the test user credentials
+      3. Upload and download files through the secure web interface
+      4. Monitor usage through CloudWatch logs and metrics
+      5. Manage access grants through the AWS Console or CLI

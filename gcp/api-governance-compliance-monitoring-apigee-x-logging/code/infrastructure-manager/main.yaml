@@ -1,0 +1,540 @@
+# Infrastructure Manager Configuration for API Governance and Compliance Monitoring
+# This configuration deploys a complete API governance solution using Apigee X, 
+# Cloud Logging, Eventarc, and Cloud Functions for automated compliance monitoring
+
+# Import required modules and providers
+imports:
+  - path: modules/logging/main.yaml
+    name: logging
+  - path: modules/functions/main.yaml
+    name: functions
+  - path: modules/eventarc/main.yaml
+    name: eventarc
+  - path: modules/monitoring/main.yaml
+    name: monitoring
+
+# Resource definitions for API governance infrastructure
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apigee-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/apigee.googleapis.com
+      parent: projects/$(ref.project.projectId)
+
+  - name: enable-logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/logging.googleapis.com
+      parent: projects/$(ref.project.projectId)
+
+  - name: enable-eventarc-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/eventarc.googleapis.com
+      parent: projects/$(ref.project.projectId)
+
+  - name: enable-cloudfunctions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/cloudfunctions.googleapis.com
+      parent: projects/$(ref.project.projectId)
+
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/monitoring.googleapis.com
+      parent: projects/$(ref.project.projectId)
+
+  - name: enable-pubsub-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/pubsub.googleapis.com
+      parent: projects/$(ref.project.projectId)
+
+  - name: enable-bigquery-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/bigquery.googleapis.com
+      parent: projects/$(ref.project.projectId)
+
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/storage.googleapis.com
+      parent: projects/$(ref.project.projectId)
+
+  # Cloud Storage bucket for Cloud Function source code
+  - name: governance-functions-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: governance-functions-$(ref.random-suffix.hex)
+      location: $(ref.region)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              isLive: false
+      labels:
+        purpose: "api-governance"
+        environment: "production"
+    depends_on:
+      - enable-storage-api
+
+  # Pub/Sub topic for real-time API governance events
+  - name: api-governance-events-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project.projectId)/topics/api-governance-events
+      labels:
+        purpose: "api-governance"
+        component: "event-streaming"
+    depends_on:
+      - enable-pubsub-api
+
+  # Pub/Sub subscription for governance events
+  - name: api-governance-events-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(ref.project.projectId)/subscriptions/api-governance-events-sub
+      topic: $(ref.api-governance-events-topic.name)
+      ackDeadlineSeconds: 60
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+      deadLetterPolicy:
+        deadLetterTopic: projects/$(ref.project.projectId)/topics/api-governance-dlq
+        maxDeliveryAttempts: 10
+      labels:
+        purpose: "api-governance"
+        component: "event-processing"
+    depends_on:
+      - api-governance-events-topic
+
+  # Dead letter queue for failed message processing
+  - name: api-governance-dlq-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project.projectId)/topics/api-governance-dlq
+      labels:
+        purpose: "api-governance"
+        component: "dead-letter-queue"
+    depends_on:
+      - enable-pubsub-api
+
+  # BigQuery dataset for API governance analytics
+  - name: api-governance-dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      datasetId: api_governance
+      friendlyName: "API Governance Analytics Dataset"
+      description: "Dataset for storing API governance metrics and compliance data"
+      location: $(ref.region)
+      access:
+        - role: OWNER
+          userByEmail: $(ref.project.projectId)@appspot.gserviceaccount.com
+        - role: READER
+          specialGroup: projectReaders
+        - role: WRITER
+          specialGroup: projectWriters
+      labels:
+        purpose: "api-governance"
+        component: "analytics"
+    depends_on:
+      - enable-bigquery-api
+
+  # Cloud Logging sink for Apigee audit logs to BigQuery
+  - name: apigee-governance-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      name: apigee-governance-sink
+      destination: bigquery.googleapis.com/projects/$(ref.project.projectId)/datasets/$(ref.api-governance-dataset.datasetId)
+      filter: |
+        resource.type="apigee_organization" OR
+        resource.type="apigee_environment" OR
+        protoPayload.serviceName="apigee.googleapis.com"
+      description: "Sink for Apigee governance and compliance audit logs"
+      includeChildren: true
+      bigqueryOptions:
+        usePartitionedTables: true
+        writeIdentity: serviceAccount:$(ref.project.projectId)@appspot.gserviceaccount.com
+    depends_on:
+      - enable-logging-api
+      - api-governance-dataset
+
+  # Cloud Logging sink for real-time event processing
+  - name: apigee-realtime-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      name: apigee-realtime-sink
+      destination: pubsub.googleapis.com/projects/$(ref.project.projectId)/topics/api-governance-events
+      filter: |
+        resource.type="apigee_organization" AND
+        severity >= WARNING
+      description: "Sink for real-time API governance event processing"
+      includeChildren: true
+    depends_on:
+      - enable-logging-api
+      - api-governance-events-topic
+
+  # Service account for Cloud Functions with appropriate permissions
+  - name: governance-function-sa
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: api-governance-function
+      displayName: "API Governance Function Service Account"
+      description: "Service account for API governance monitoring Cloud Functions"
+    depends_on:
+      - enable-cloudfunctions-api
+
+  # IAM bindings for governance function service account
+  - name: governance-function-sa-logging-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project.projectId)
+      role: roles/logging.logWriter
+      member: serviceAccount:$(ref.governance-function-sa.email)
+
+  - name: governance-function-sa-monitoring-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project.projectId)
+      role: roles/monitoring.metricWriter
+      member: serviceAccount:$(ref.governance-function-sa.email)
+
+  - name: governance-function-sa-pubsub-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project.projectId)
+      role: roles/pubsub.subscriber
+      member: serviceAccount:$(ref.governance-function-sa.email)
+
+  - name: governance-function-sa-bigquery-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project.projectId)
+      role: roles/bigquery.dataEditor
+      member: serviceAccount:$(ref.governance-function-sa.email)
+
+  # Cloud Function for compliance monitoring
+  - name: api-compliance-monitor-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project.projectId)/locations/$(ref.region)
+      function: api-compliance-monitor
+      description: "Function to monitor API compliance and detect violations"
+      sourceArchiveUrl: gs://$(ref.governance-functions-bucket.name)/compliance-monitor-source.zip
+      entryPoint: monitor_api_compliance
+      runtime: python39
+      timeout: 60s
+      availableMemoryMb: 256
+      maxInstances: 100
+      serviceAccountEmail: $(ref.governance-function-sa.email)
+      eventTrigger:
+        eventType: providers/cloud.pubsub/eventTypes/topic.publish
+        resource: projects/$(ref.project.projectId)/topics/api-governance-events
+      environmentVariables:
+        GCP_PROJECT: $(ref.project.projectId)
+        DATASET_ID: $(ref.api-governance-dataset.datasetId)
+        GOVERNANCE_TOPIC: $(ref.api-governance-events-topic.name)
+      labels:
+        purpose: "api-governance"
+        component: "compliance-monitoring"
+    depends_on:
+      - governance-functions-bucket
+      - api-governance-events-topic
+      - governance-function-sa
+
+  # Cloud Function for policy enforcement
+  - name: api-policy-enforcer-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project.projectId)/locations/$(ref.region)
+      function: api-policy-enforcer
+      description: "Function to automatically enforce API governance policies"
+      sourceArchiveUrl: gs://$(ref.governance-functions-bucket.name)/policy-enforcer-source.zip
+      entryPoint: enforce_api_policies
+      runtime: python39
+      timeout: 120s
+      availableMemoryMb: 512
+      maxInstances: 50
+      serviceAccountEmail: $(ref.governance-function-sa.email)
+      eventTrigger:
+        eventType: providers/cloud.pubsub/eventTypes/topic.publish
+        resource: projects/$(ref.project.projectId)/topics/api-governance-events
+      environmentVariables:
+        GCP_PROJECT: $(ref.project.projectId)
+        DATASET_ID: $(ref.api-governance-dataset.datasetId)
+        APIGEE_ORG: $(ref.project.projectId)
+      labels:
+        purpose: "api-governance"
+        component: "policy-enforcement"
+    depends_on:
+      - governance-functions-bucket
+      - api-governance-events-topic
+      - governance-function-sa
+
+  # Eventarc trigger for API security violations
+  - name: api-security-violations-trigger
+    type: gcp-types/eventarc-v1:projects.locations.triggers
+    properties:
+      name: api-security-violations
+      location: $(ref.region)
+      destination:
+        cloudFunction:
+          function: projects/$(ref.project.projectId)/locations/$(ref.region)/functions/api-compliance-monitor
+          region: $(ref.region)
+      eventFilters:
+        - attribute: type
+          value: google.cloud.audit.log.v1.written
+        - attribute: serviceName
+          value: apigee.googleapis.com
+      serviceAccount: $(ref.governance-function-sa.email)
+      labels:
+        purpose: "api-governance"
+        component: "security-automation"
+    depends_on:
+      - enable-eventarc-api
+      - api-compliance-monitor-function
+
+  # Eventarc trigger for API quota violations
+  - name: api-quota-violations-trigger
+    type: gcp-types/eventarc-v1:projects.locations.triggers
+    properties:
+      name: api-quota-violations
+      location: $(ref.region)
+      destination:
+        cloudFunction:
+          function: projects/$(ref.project.projectId)/locations/$(ref.region)/functions/api-policy-enforcer
+          region: $(ref.region)
+      eventFilters:
+        - attribute: type
+          value: google.cloud.audit.log.v1.written
+        - attribute: methodName
+          value: QuotaExceeded
+      serviceAccount: $(ref.governance-function-sa.email)
+      labels:
+        purpose: "api-governance"
+        component: "quota-enforcement"
+    depends_on:
+      - enable-eventarc-api
+      - api-policy-enforcer-function
+
+  # Cloud Monitoring alert policy for API governance violations
+  - name: api-governance-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: "API Governance Violations Alert"
+      documentation:
+        content: "Alert policy for monitoring API governance and compliance violations"
+        mimeType: "text/markdown"
+      conditions:
+        - displayName: "High rate of authentication failures"
+          conditionThreshold:
+            filter: >
+              resource.type="cloud_function" AND
+              resource.labels.function_name="api-compliance-monitor"
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 10
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_SUM
+                groupByFields:
+                  - "resource.labels.function_name"
+      alertStrategy:
+        autoClose: 604800s
+      enabled: true
+      combiner: OR
+      labels:
+        purpose: "api-governance"
+        component: "alerting"
+    depends_on:
+      - enable-monitoring-api
+      - api-compliance-monitor-function
+
+  # Cloud Monitoring dashboard for API governance metrics
+  - name: api-governance-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      displayName: "API Governance Dashboard"
+      mosaicLayout:
+        tiles:
+          - width: 6
+            height: 4
+            widget:
+              title: "API Request Volume"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: >
+                          resource.type="apigee_organization"
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_RATE
+                          crossSeriesReducer: REDUCE_SUM
+                yAxis:
+                  label: "Requests per second"
+                  scale: LINEAR
+                chartOptions:
+                  mode: COLOR
+          - width: 6
+            height: 4
+            widget:
+              title: "Compliance Violations"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: >
+                          resource.type="cloud_function" AND
+                          resource.labels.function_name="api-compliance-monitor"
+                        aggregation:
+                          alignmentPeriod: 300s
+                          perSeriesAligner: ALIGN_RATE
+                          crossSeriesReducer: REDUCE_SUM
+                yAxis:
+                  label: "Violations per 5 minutes"
+                  scale: LINEAR
+                chartOptions:
+                  mode: COLOR
+          - width: 12
+            height: 4
+            widget:
+              title: "API Error Rate"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: >
+                          resource.type="apigee_organization" AND
+                          metric.type="apigee.googleapis.com/organization/request_count"
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_RATE
+                          crossSeriesReducer: REDUCE_SUM
+                          groupByFields:
+                            - "metric.labels.response_code"
+                yAxis:
+                  label: "Error rate"
+                  scale: LINEAR
+                chartOptions:
+                  mode: COLOR
+      labels:
+        purpose: "api-governance"
+        component: "monitoring"
+    depends_on:
+      - enable-monitoring-api
+
+  # Random suffix generator for unique resource names
+  - name: random-suffix
+    type: gcp-types/random-v1:randomId
+    properties:
+      byteLength: 3
+
+  # Project reference for obtaining project ID
+  - name: project
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      name: $(ref.project-id)
+
+# Template parameters for customization
+parameters:
+  - name: project-id
+    type: string
+    description: "Google Cloud Project ID"
+    required: true
+
+  - name: region
+    type: string
+    description: "Google Cloud region for resource deployment"
+    default: "us-central1"
+    required: false
+
+  - name: environment
+    type: string
+    description: "Environment name (dev, staging, prod)"
+    default: "dev"
+    required: false
+
+  - name: apigee-organization
+    type: string
+    description: "Apigee organization name"
+    required: false
+
+  - name: enable-advanced-monitoring
+    type: boolean
+    description: "Enable advanced monitoring features"
+    default: true
+    required: false
+
+# Template outputs providing deployment information
+outputs:
+  - name: governance-functions-bucket
+    description: "Cloud Storage bucket for governance function source code"
+    value: $(ref.governance-functions-bucket.name)
+
+  - name: api-governance-dataset
+    description: "BigQuery dataset for API governance analytics"
+    value: $(ref.api-governance-dataset.datasetId)
+
+  - name: pub-sub-topic
+    description: "Pub/Sub topic for API governance events"
+    value: $(ref.api-governance-events-topic.name)
+
+  - name: compliance-monitor-function
+    description: "Cloud Function for compliance monitoring"
+    value: $(ref.api-compliance-monitor-function.name)
+
+  - name: policy-enforcer-function
+    description: "Cloud Function for policy enforcement"
+    value: $(ref.api-policy-enforcer-function.name)
+
+  - name: monitoring-dashboard-url
+    description: "URL to the API governance monitoring dashboard"
+    value: "https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.api-governance-dashboard.name)"
+
+  - name: bigquery-dataset-url
+    description: "URL to the BigQuery dataset for governance analytics"
+    value: "https://console.cloud.google.com/bigquery?project=$(ref.project.projectId)&ws=!1m1!1m3!3m2!1s$(ref.project.projectId)!2s$(ref.api-governance-dataset.datasetId)"
+
+  - name: logs-explorer-url
+    description: "URL to view API governance logs in Cloud Logging"
+    value: "https://console.cloud.google.com/logs/query?project=$(ref.project.projectId)&query=resource.type%3D%22apigee_organization%22%20OR%20resource.type%3D%22apigee_environment%22"
+
+  - name: eventarc-triggers
+    description: "Eventarc triggers for governance automation"
+    value:
+      - $(ref.api-security-violations-trigger.name)
+      - $(ref.api-quota-violations-trigger.name)
+
+  - name: service-account-email
+    description: "Service account email for governance functions"
+    value: $(ref.governance-function-sa.email)
+
+# Metadata for the Infrastructure Manager configuration
+metadata:
+  version: "1.0.0"
+  description: "Complete API governance and compliance monitoring infrastructure using Apigee X and Cloud Logging"
+  author: "Google Cloud Infrastructure Manager"
+  created: "2025-01-27"
+  tags:
+    - "api-governance"
+    - "compliance-monitoring"
+    - "apigee-x"
+    - "cloud-logging"
+    - "eventarc"
+    - "automation"
+  dependencies:
+    - "Google Cloud APIs enabled"
+    - "Apigee X organization provisioned"
+    - "Cloud Function source code uploaded"
+  estimated-cost: "$150-300/month"
+  complexity: "intermediate"

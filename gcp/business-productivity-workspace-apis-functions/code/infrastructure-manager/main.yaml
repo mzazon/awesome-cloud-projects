@@ -1,0 +1,494 @@
+# Google Cloud Infrastructure Manager Configuration
+# Business Productivity Workflows with Google Workspace APIs and Cloud Functions
+# Recipe ID: f4a7b8c2
+
+# This configuration deploys a complete serverless automation system that integrates
+# Google Workspace APIs (Gmail, Calendar, Drive) with Cloud Functions to automate
+# email processing, meeting scheduling, document organization, and productivity analytics
+
+deployment:
+  # Deployment metadata and configuration
+  name: business-productivity-workspace-automation
+  description: "Automated business productivity workflows using Google Workspace APIs and Cloud Functions"
+  location: us-central1
+
+# Input variables for customizable deployment
+variables:
+  # Project and location configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID for deployment"
+    
+  region:
+    type: string
+    description: "Google Cloud region for resource deployment"
+    default: "us-central1"
+    
+  zone:
+    type: string
+    description: "Google Cloud zone for zonal resources"
+    default: "us-central1-a"
+    
+  # Database configuration
+  database_name:
+    type: string
+    description: "Cloud SQL database name for productivity analytics"
+    default: "productivity_db"
+    
+  instance_name:
+    type: string
+    description: "Cloud SQL instance name"
+    default: "productivity-instance"
+    
+  # Function naming configuration
+  function_prefix:
+    type: string
+    description: "Prefix for Cloud Function names"
+    default: "productivity"
+    
+  # Environment configuration
+  environment:
+    type: string
+    description: "Deployment environment (dev, staging, prod)"
+    default: "dev"
+    validation:
+      values: ["dev", "staging", "prod"]
+
+# Resource definitions organized by service type
+resources:
+  
+  # Enable required Google Cloud APIs
+  enable_apis:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      # Cloud Functions API for serverless computing
+      - name: projects/${var.project_id}/services/cloudfunctions.googleapis.com
+      # Cloud Scheduler API for workflow orchestration
+      - name: projects/${var.project_id}/services/cloudscheduler.googleapis.com
+      # Cloud SQL API for managed database
+      - name: projects/${var.project_id}/services/sqladmin.googleapis.com
+      # Google Workspace APIs for productivity integration
+      - name: projects/${var.project_id}/services/gmail.googleapis.com
+      - name: projects/${var.project_id}/services/calendar.googleapis.com
+      - name: projects/${var.project_id}/services/drive.googleapis.com
+      # Cloud Build API for function deployment
+      - name: projects/${var.project_id}/services/cloudbuild.googleapis.com
+      # Monitoring and logging APIs
+      - name: projects/${var.project_id}/services/logging.googleapis.com
+      - name: projects/${var.project_id}/services/monitoring.googleapis.com
+
+  # Service account for Google Workspace API integration
+  workspace_automation_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: workspace-automation
+      displayName: "Workspace Automation Service Account"
+      description: "Service account for Google Workspace API integration and Cloud Functions execution"
+    depends_on:
+      - enable_apis
+
+  # IAM policy binding for Cloud SQL client access
+  sql_client_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/cloudsql.client
+      member: serviceAccount:${workspace_automation_service_account.email}
+    depends_on:
+      - workspace_automation_service_account
+
+  # IAM policy binding for Cloud Storage admin access
+  storage_admin_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/storage.admin
+      member: serviceAccount:${workspace_automation_service_account.email}
+    depends_on:
+      - workspace_automation_service_account
+
+  # IAM policy binding for Cloud Functions invoker
+  functions_invoker_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/cloudfunctions.invoker
+      member: serviceAccount:${workspace_automation_service_account.email}
+    depends_on:
+      - workspace_automation_service_account
+
+  # Cloud SQL instance for productivity analytics database
+  # PostgreSQL 15 provides advanced analytics capabilities and JSON support
+  productivity_sql_instance:
+    type: gcp-types/sqladmin-v1beta4:instances
+    properties:
+      name: ${var.instance_name}
+      region: ${var.region}
+      databaseVersion: POSTGRES_15
+      settings:
+        # f1-micro tier provides cost-effective solution for development/testing
+        tier: db-f1-micro
+        # SSD storage for better performance
+        diskType: PD_SSD
+        diskSize: 20
+        # Automatic backups for data protection
+        backupConfiguration:
+          enabled: true
+          startTime: "03:00"
+          retainedBackups: 7
+        # IP configuration for secure access
+        ipConfiguration:
+          ipv4Enabled: true
+          requireSsl: false
+        # Activation policy for cost optimization
+        activationPolicy: ALWAYS
+        # Data protection settings
+        dataDiskSizeGb: 20
+        storageAutoResize: true
+        storageAutoResizeLimit: 100
+      # Root password will be set separately for security
+    depends_on:
+      - enable_apis
+
+  # Database within the Cloud SQL instance
+  productivity_database:
+    type: gcp-types/sqladmin-v1beta4:databases
+    properties:
+      name: ${var.database_name}
+      instance: ${productivity_sql_instance.name}
+      charset: UTF8
+      collation: en_US.UTF8
+    depends_on:
+      - productivity_sql_instance
+
+  # Cloud Storage bucket for document organization and function source code
+  productivity_storage_bucket:
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${var.project_id}-productivity-automation
+      location: ${var.region}
+      storageClass: STANDARD
+      # Versioning for document history tracking
+      versioning:
+        enabled: true
+      # Lifecycle management for cost optimization
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 365
+              isLive: false
+      # Public access prevention for security
+      publicAccessPrevention: enforced
+      # Uniform bucket-level access
+      uniformBucketLevelAccess:
+        enabled: true
+    depends_on:
+      - enable_apis
+
+  # Email Processing Cloud Function
+  # Processes Gmail data for productivity insights and email categorization
+  email_processor_function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: ${var.region}
+      function: ${var.function_prefix}-email-processor
+      sourceArchiveUrl: gs://${productivity_storage_bucket.name}/email-processor.zip
+      entryPoint: process_emails
+      runtime: python311
+      # HTTP trigger for scheduler and manual invocation
+      httpsTrigger: {}
+      # Service account for Workspace API access
+      serviceAccountEmail: ${workspace_automation_service_account.email}
+      # Environment variables for database connection
+      environmentVariables:
+        INSTANCE_CONNECTION_NAME: ${var.project_id}:${var.region}:${productivity_sql_instance.name}
+        DATABASE_NAME: ${var.database_name}
+        PROJECT_ID: ${var.project_id}
+        ENVIRONMENT: ${var.environment}
+      # Resource allocation for email processing workload
+      availableMemoryMb: 256
+      timeout: 120s
+      # Labels for resource management
+      labels:
+        component: email-processor
+        environment: ${var.environment}
+        function: productivity-automation
+    depends_on:
+      - productivity_sql_instance
+      - productivity_database
+      - workspace_automation_service_account
+      - productivity_storage_bucket
+
+  # Meeting Automation Cloud Function
+  # Analyzes calendar data and suggests optimal meeting times
+  meeting_automation_function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: ${var.region}
+      function: ${var.function_prefix}-meeting-automation
+      sourceArchiveUrl: gs://${productivity_storage_bucket.name}/meeting-automation.zip
+      entryPoint: automate_meetings
+      runtime: python311
+      # HTTP trigger for scheduler access
+      httpsTrigger: {}
+      serviceAccountEmail: ${workspace_automation_service_account.email}
+      environmentVariables:
+        INSTANCE_CONNECTION_NAME: ${var.project_id}:${var.region}:${productivity_sql_instance.name}
+        DATABASE_NAME: ${var.database_name}
+        PROJECT_ID: ${var.project_id}
+        ENVIRONMENT: ${var.environment}
+      # Resource allocation for calendar analysis
+      availableMemoryMb: 256
+      timeout: 120s
+      labels:
+        component: meeting-automation
+        environment: ${var.environment}
+        function: productivity-automation
+    depends_on:
+      - productivity_sql_instance
+      - productivity_database
+      - workspace_automation_service_account
+      - productivity_storage_bucket
+
+  # Document Organization Cloud Function
+  # Processes Google Drive documents for organization and analytics
+  document_organization_function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: ${var.region}
+      function: ${var.function_prefix}-document-organization
+      sourceArchiveUrl: gs://${productivity_storage_bucket.name}/document-organization.zip
+      entryPoint: organize_documents
+      runtime: python311
+      httpsTrigger: {}
+      serviceAccountEmail: ${workspace_automation_service_account.email}
+      environmentVariables:
+        INSTANCE_CONNECTION_NAME: ${var.project_id}:${var.region}:${productivity_sql_instance.name}
+        DATABASE_NAME: ${var.database_name}
+        PROJECT_ID: ${var.project_id}
+        ENVIRONMENT: ${var.environment}
+      # Higher memory for document processing
+      availableMemoryMb: 512
+      timeout: 180s
+      labels:
+        component: document-organization
+        environment: ${var.environment}
+        function: productivity-automation
+    depends_on:
+      - productivity_sql_instance
+      - productivity_database
+      - workspace_automation_service_account
+      - productivity_storage_bucket
+
+  # Productivity Metrics Cloud Function
+  # Aggregates data from all sources to calculate comprehensive productivity metrics
+  productivity_metrics_function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: ${var.region}
+      function: ${var.function_prefix}-productivity-metrics
+      sourceArchiveUrl: gs://${productivity_storage_bucket.name}/productivity-metrics.zip
+      entryPoint: calculate_productivity_metrics
+      runtime: python311
+      httpsTrigger: {}
+      serviceAccountEmail: ${workspace_automation_service_account.email}
+      environmentVariables:
+        INSTANCE_CONNECTION_NAME: ${var.project_id}:${var.region}:${productivity_sql_instance.name}
+        DATABASE_NAME: ${var.database_name}
+        PROJECT_ID: ${var.project_id}
+        ENVIRONMENT: ${var.environment}
+      # Higher resources for analytics processing
+      availableMemoryMb: 512
+      timeout: 300s
+      labels:
+        component: productivity-metrics
+        environment: ${var.environment}
+        function: productivity-automation
+    depends_on:
+      - productivity_sql_instance
+      - productivity_database
+      - workspace_automation_service_account
+      - productivity_storage_bucket
+
+  # Cloud Scheduler Jobs for Automated Workflow Orchestration
+  
+  # Email processing job - runs every 2 hours during business hours
+  email_processing_scheduler:
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      name: email-processing-job
+      description: "Process emails every 2 hours during business hours for productivity analysis"
+      # Cron schedule: every 2 hours, 9 AM to 5 PM, Monday to Friday
+      schedule: "0 */2 9-17 * * MON-FRI"
+      timeZone: "America/New_York"
+      httpTarget:
+        uri: ${email_processor_function.httpsTrigger.url}
+        httpMethod: GET
+        # Authentication using service account
+        oidcToken:
+          serviceAccountEmail: ${workspace_automation_service_account.email}
+      # Retry configuration for reliability
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 300s
+        minBackoffDuration: 10s
+        maxBackoffDuration: 60s
+    depends_on:
+      - email_processor_function
+      - workspace_automation_service_account
+
+  # Meeting automation job - runs daily at 8 AM
+  meeting_automation_scheduler:
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      name: meeting-automation-job
+      description: "Analyze meetings and suggest optimal times daily"
+      schedule: "0 8 * * MON-FRI"
+      timeZone: "America/New_York"
+      httpTarget:
+        uri: ${meeting_automation_function.httpsTrigger.url}
+        httpMethod: GET
+        oidcToken:
+          serviceAccountEmail: ${workspace_automation_service_account.email}
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 300s
+        minBackoffDuration: 10s
+        maxBackoffDuration: 60s
+    depends_on:
+      - meeting_automation_function
+      - workspace_automation_service_account
+
+  # Document organization job - runs every 4 hours
+  document_organization_scheduler:
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      name: document-organization-job
+      description: "Organize and analyze documents every 4 hours"
+      schedule: "0 */4 * * *"
+      timeZone: "America/New_York"
+      httpTarget:
+        uri: ${document_organization_function.httpsTrigger.url}
+        httpMethod: GET
+        oidcToken:
+          serviceAccountEmail: ${workspace_automation_service_account.email}
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 300s
+        minBackoffDuration: 10s
+        maxBackoffDuration: 60s
+    depends_on:
+      - document_organization_function
+      - workspace_automation_service_account
+
+  # Productivity metrics job - runs daily at 6 PM
+  productivity_metrics_scheduler:
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      name: productivity-metrics-job
+      description: "Calculate daily productivity metrics and generate insights"
+      schedule: "0 18 * * MON-FRI"
+      timeZone: "America/New_York"
+      httpTarget:
+        uri: ${productivity_metrics_function.httpsTrigger.url}
+        httpMethod: GET
+        oidcToken:
+          serviceAccountEmail: ${workspace_automation_service_account.email}
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 300s
+        minBackoffDuration: 10s
+        maxBackoffDuration: 60s
+    depends_on:
+      - productivity_metrics_function
+      - workspace_automation_service_account
+
+  # Cloud Monitoring Alert Policy for Function Failures
+  function_failure_alert:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: "Productivity Automation Function Failures"
+      documentation:
+        content: "Alert when Cloud Functions in the productivity automation system fail"
+      # Alert when function execution fails
+      conditions:
+        - displayName: "Function execution failures"
+          conditionThreshold:
+            filter: 'resource.type="cloud_function" AND resource.label.function_name=~"${var.function_prefix}-.*"'
+            comparison: COMPARISON_GT
+            thresholdValue: 5
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_SUM
+      # Notification channels would be configured separately
+      enabled: true
+    depends_on:
+      - enable_apis
+
+# Output values for verification and integration
+outputs:
+  # Database connection information
+  sql_instance_name:
+    description: "Cloud SQL instance name for productivity analytics"
+    value: ${productivity_sql_instance.name}
+    
+  sql_connection_name:
+    description: "Cloud SQL connection name for applications"
+    value: ${var.project_id}:${var.region}:${productivity_sql_instance.name}
+    
+  database_name:
+    description: "Database name for productivity data"
+    value: ${productivity_database.name}
+    
+  # Cloud Function URLs for testing and integration
+  email_processor_url:
+    description: "Email processing function HTTP trigger URL"
+    value: ${email_processor_function.httpsTrigger.url}
+    
+  meeting_automation_url:
+    description: "Meeting automation function HTTP trigger URL"
+    value: ${meeting_automation_function.httpsTrigger.url}
+    
+  document_organization_url:
+    description: "Document organization function HTTP trigger URL"
+    value: ${document_organization_function.httpsTrigger.url}
+    
+  productivity_metrics_url:
+    description: "Productivity metrics function HTTP trigger URL"
+    value: ${productivity_metrics_function.httpsTrigger.url}
+    
+  # Service account information
+  service_account_email:
+    description: "Service account email for Workspace API integration"
+    value: ${workspace_automation_service_account.email}
+    
+  # Storage bucket for documents and function source
+  storage_bucket_name:
+    description: "Cloud Storage bucket for productivity automation"
+    value: ${productivity_storage_bucket.name}
+    
+  # Scheduler job names for management
+  scheduler_jobs:
+    description: "Cloud Scheduler job names for workflow orchestration"
+    value:
+      - ${email_processing_scheduler.name}
+      - ${meeting_automation_scheduler.name}
+      - ${document_organization_scheduler.name}
+      - ${productivity_metrics_scheduler.name}
+
+# Deployment metadata
+metadata:
+  version: "1.0"
+  created_by: "Infrastructure Manager"
+  purpose: "Business productivity automation using Google Workspace APIs"
+  cost_estimate: "$15-25/month (varies by usage)"
+  deployment_time: "15-20 minutes"
+  prerequisites:
+    - "Google Cloud project with billing enabled"
+    - "Google Workspace domain with admin access"
+    - "Infrastructure Manager API enabled"
+    - "Appropriate IAM permissions for resource creation"

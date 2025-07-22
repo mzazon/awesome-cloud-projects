@@ -1,0 +1,750 @@
+# Infrastructure Manager Configuration for Enterprise Kubernetes Fleet Management
+# This configuration deploys a complete GKE Fleet management solution with:
+# - Multi-project fleet architecture with host and workload projects
+# - GKE clusters across different environments (production, staging)
+# - Fleet registration and centralized management
+# - Backup for GKE with automated policies
+# - Config Connector for GitOps workflows
+# - Cross-project IAM for fleet operations
+
+metadata:
+  name: enterprise-kubernetes-fleet-management
+  description: "Enterprise GKE Fleet Management with Backup for GKE"
+  version: "1.0"
+
+# Input variables for customization
+inputs:
+  # Project Configuration
+  fleet_host_project_id:
+    description: "Project ID for the fleet host project"
+    type: string
+    default: "fleet-host-${random_suffix}"
+
+  workload_project_1_id:
+    description: "Project ID for the production workload project"
+    type: string
+    default: "workload-prod-${random_suffix}"
+
+  workload_project_2_id:
+    description: "Project ID for the staging workload project"
+    type: string
+    default: "workload-staging-${random_suffix}"
+
+  # Regional Configuration
+  region:
+    description: "Google Cloud region for resource deployment"
+    type: string
+    default: "us-central1"
+
+  zone:
+    description: "Google Cloud zone for zonal resources"
+    type: string
+    default: "us-central1-a"
+
+  # Resource Naming
+  fleet_name:
+    description: "Name for the GKE fleet"
+    type: string
+    default: "enterprise-fleet"
+
+  backup_plan_name:
+    description: "Base name for backup plans"
+    type: string
+    default: "fleet-backup-plan"
+
+  # Cluster Configuration
+  prod_cluster_name:
+    description: "Name for the production GKE cluster"
+    type: string
+    default: "prod-cluster"
+
+  staging_cluster_name:
+    description: "Name for the staging GKE cluster"
+    type: string
+    default: "staging-cluster"
+
+  # Production cluster sizing
+  prod_node_count:
+    description: "Initial node count for production cluster"
+    type: int
+    default: 2
+
+  prod_machine_type:
+    description: "Machine type for production cluster nodes"
+    type: string
+    default: "e2-standard-4"
+
+  prod_max_nodes:
+    description: "Maximum nodes for production cluster autoscaling"
+    type: int
+    default: 5
+
+  # Staging cluster sizing
+  staging_node_count:
+    description: "Initial node count for staging cluster"
+    type: int
+    default: 1
+
+  staging_machine_type:
+    description: "Machine type for staging cluster nodes"
+    type: string
+    default: "e2-standard-2"
+
+  staging_max_nodes:
+    description: "Maximum nodes for staging cluster autoscaling"
+    type: int
+    default: 3
+
+  # Backup Configuration
+  prod_backup_schedule:
+    description: "Cron schedule for production backup (daily at 2 AM)"
+    type: string
+    default: "0 2 * * *"
+
+  staging_backup_schedule:
+    description: "Cron schedule for staging backup (weekly on Sunday at 3 AM)"
+    type: string
+    default: "0 3 * * 0"
+
+  prod_backup_retention:
+    description: "Retention period for production backups in days"
+    type: int
+    default: 30
+
+  staging_backup_retention:
+    description: "Retention period for staging backups in days"
+    type: int
+    default: 14
+
+resources:
+  # Generate random suffix for unique naming
+  random_suffix:
+    type: gcp-types/cloudresourcemanager-v1:random
+    properties:
+      length: 6
+      special: false
+      upper: false
+
+  # Fleet Host Project
+  fleet_host_project:
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: $(ref.fleet_host_project.projectId)
+      name: "Fleet Host Project"
+      labels:
+        environment: "shared"
+        purpose: "fleet-management"
+
+  # Production Workload Project
+  workload_project_1:
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: $(ref.workload_project_1.projectId)
+      name: "Production Workload Project"
+      labels:
+        environment: "production"
+        purpose: "workload"
+
+  # Staging Workload Project
+  workload_project_2:
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: $(ref.workload_project_2.projectId)
+      name: "Staging Workload Project"
+      labels:
+        environment: "staging"
+        purpose: "workload"
+
+  # Enable APIs for Fleet Host Project
+  fleet_host_apis:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      parent: projects/$(ref.fleet_host_project.projectId)
+      services:
+        - container.googleapis.com
+        - gkehub.googleapis.com
+        - gkebackup.googleapis.com
+        - cloudresourcemanager.googleapis.com
+        - krmapihosting.googleapis.com
+        - anthosconfigmanagement.googleapis.com
+        - iam.googleapis.com
+        - compute.googleapis.com
+
+  # Enable APIs for Production Workload Project
+  workload_project_1_apis:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      parent: projects/$(ref.workload_project_1.projectId)
+      services:
+        - container.googleapis.com
+        - gkehub.googleapis.com
+        - gkebackup.googleapis.com
+        - iam.googleapis.com
+        - compute.googleapis.com
+
+  # Enable APIs for Staging Workload Project
+  workload_project_2_apis:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      parent: projects/$(ref.workload_project_2.projectId)
+      services:
+        - container.googleapis.com
+        - gkehub.googleapis.com
+        - gkebackup.googleapis.com
+        - iam.googleapis.com
+        - compute.googleapis.com
+
+  # Production GKE Cluster
+  production_cluster:
+    type: gcp-types/container-v1:projects.locations.clusters
+    properties:
+      parent: projects/$(ref.workload_project_1.projectId)/locations/$(inputs.region)
+      cluster:
+        name: $(inputs.prod_cluster_name)-$(ref.random_suffix.result)
+        description: "Production GKE cluster for fleet management"
+        location: $(inputs.region)
+        initialNodeCount: $(inputs.prod_node_count)
+        
+        # Node pool configuration
+        nodeConfig:
+          machineType: $(inputs.prod_machine_type)
+          diskSizeGb: 50
+          diskType: pd-ssd
+          imageType: COS_CONTAINERD
+          
+          # Enable Workload Identity
+          workloadMetadataConfig:
+            mode: GKE_METADATA
+          
+          # Security configurations
+          shieldedInstanceConfig:
+            enableSecureBoot: true
+            enableIntegrityMonitoring: true
+          
+          # OAuth scopes for node access
+          oauthScopes:
+            - https://www.googleapis.com/auth/cloud-platform
+          
+          # Resource labels
+          labels:
+            environment: production
+            cluster-tier: prod
+            
+        # Cluster features
+        addonsConfig:
+          httpLoadBalancing:
+            disabled: false
+          horizontalPodAutoscaling:
+            disabled: false
+          networkPolicyConfig:
+            disabled: false
+          gcePersistentDiskCsiDriverConfig:
+            enabled: true
+          gkeBackupAgentConfig:
+            enabled: true
+            
+        # Enable Workload Identity at cluster level
+        workloadIdentityConfig:
+          workloadPool: $(ref.workload_project_1.projectId).svc.id.goog
+          
+        # Network configuration
+        ipAllocationPolicy:
+          useIpAliases: true
+          
+        # Enable network policy
+        networkPolicy:
+          enabled: true
+          provider: CALICO
+          
+        # Cluster autoscaling
+        clusterAutoscaling:
+          enabled: true
+          resourceLimits:
+            - resourceType: cpu
+              minimum: 1
+              maximum: 100
+            - resourceType: memory
+              minimum: 1
+              maximum: 1000
+              
+        # Node pool autoscaling
+        nodePools:
+          - name: default-pool
+            initialNodeCount: $(inputs.prod_node_count)
+            autoscaling:
+              enabled: true
+              minNodeCount: 1
+              maxNodeCount: $(inputs.prod_max_nodes)
+            management:
+              autoUpgrade: true
+              autoRepair: true
+            config:
+              machineType: $(inputs.prod_machine_type)
+              diskSizeGb: 50
+              
+        # Master auth configuration
+        masterAuth:
+          clientCertificateConfig:
+            issueClientCertificate: false
+            
+        # Private cluster configuration for enhanced security
+        privateClusterConfig:
+          enablePrivateNodes: true
+          enablePrivateEndpoint: false
+          masterIpv4CidrBlock: 172.16.0.0/28
+          
+        # Maintenance policy
+        maintenancePolicy:
+          window:
+            dailyMaintenanceWindow:
+              startTime: "03:00"
+    dependsOn:
+      - workload_project_1_apis
+
+  # Staging GKE Cluster
+  staging_cluster:
+    type: gcp-types/container-v1:projects.locations.clusters
+    properties:
+      parent: projects/$(ref.workload_project_2.projectId)/locations/$(inputs.region)
+      cluster:
+        name: $(inputs.staging_cluster_name)-$(ref.random_suffix.result)
+        description: "Staging GKE cluster for fleet management"
+        location: $(inputs.region)
+        initialNodeCount: $(inputs.staging_node_count)
+        
+        # Node pool configuration
+        nodeConfig:
+          machineType: $(inputs.staging_machine_type)
+          diskSizeGb: 50
+          diskType: pd-standard
+          imageType: COS_CONTAINERD
+          
+          # Enable Workload Identity
+          workloadMetadataConfig:
+            mode: GKE_METADATA
+          
+          # Security configurations
+          shieldedInstanceConfig:
+            enableSecureBoot: true
+            enableIntegrityMonitoring: true
+          
+          # OAuth scopes for node access
+          oauthScopes:
+            - https://www.googleapis.com/auth/cloud-platform
+          
+          # Resource labels
+          labels:
+            environment: staging
+            cluster-tier: staging
+            
+        # Cluster features
+        addonsConfig:
+          httpLoadBalancing:
+            disabled: false
+          horizontalPodAutoscaling:
+            disabled: false
+          networkPolicyConfig:
+            disabled: false
+          gcePersistentDiskCsiDriverConfig:
+            enabled: true
+          gkeBackupAgentConfig:
+            enabled: true
+            
+        # Enable Workload Identity at cluster level
+        workloadIdentityConfig:
+          workloadPool: $(ref.workload_project_2.projectId).svc.id.goog
+          
+        # Network configuration
+        ipAllocationPolicy:
+          useIpAliases: true
+          
+        # Enable network policy
+        networkPolicy:
+          enabled: true
+          provider: CALICO
+          
+        # Cluster autoscaling
+        clusterAutoscaling:
+          enabled: true
+          resourceLimits:
+            - resourceType: cpu
+              minimum: 1
+              maximum: 50
+            - resourceType: memory
+              minimum: 1
+              maximum: 500
+              
+        # Node pool autoscaling
+        nodePools:
+          - name: default-pool
+            initialNodeCount: $(inputs.staging_node_count)
+            autoscaling:
+              enabled: true
+              minNodeCount: 1
+              maxNodeCount: $(inputs.staging_max_nodes)
+            management:
+              autoUpgrade: true
+              autoRepair: true
+            config:
+              machineType: $(inputs.staging_machine_type)
+              diskSizeGb: 50
+              
+        # Master auth configuration
+        masterAuth:
+          clientCertificateConfig:
+            issueClientCertificate: false
+            
+        # Maintenance policy
+        maintenancePolicy:
+          window:
+            dailyMaintenanceWindow:
+              startTime: "04:00"
+    dependsOn:
+      - workload_project_2_apis
+
+  # Fleet Manager Service Account
+  fleet_manager_sa:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      parent: projects/$(ref.fleet_host_project.projectId)
+      accountId: fleet-manager
+      serviceAccount:
+        displayName: "Fleet Manager Service Account"
+        description: "Service account for managing fleet operations across projects"
+    dependsOn:
+      - fleet_host_apis
+
+  # Config Connector Service Account for Production
+  cnrm_system_sa_prod:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      parent: projects/$(ref.workload_project_1.projectId)
+      accountId: cnrm-system
+      serviceAccount:
+        displayName: "Config Connector Service Account"
+        description: "Service account for Config Connector in production"
+    dependsOn:
+      - workload_project_1_apis
+
+  # Config Connector Service Account for Staging
+  cnrm_system_sa_staging:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      parent: projects/$(ref.workload_project_2.projectId)
+      accountId: cnrm-system
+      serviceAccount:
+        displayName: "Config Connector Service Account"
+        description: "Service account for Config Connector in staging"
+    dependsOn:
+      - workload_project_2_apis
+
+  # IAM Policy Bindings for Fleet Manager - Production Project
+  fleet_manager_iam_prod_cluster_viewer:
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: $(ref.workload_project_1.projectId)
+      policy:
+        bindings:
+          - role: roles/container.clusterViewer
+            members:
+              - serviceAccount:$(ref.fleet_manager_sa.email)
+    dependsOn:
+      - fleet_manager_sa
+
+  fleet_manager_iam_prod_backup_admin:
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: $(ref.workload_project_1.projectId)
+      policy:
+        bindings:
+          - role: roles/gkebackup.admin
+            members:
+              - serviceAccount:$(ref.fleet_manager_sa.email)
+    dependsOn:
+      - fleet_manager_sa
+
+  # IAM Policy Bindings for Fleet Manager - Staging Project
+  fleet_manager_iam_staging_cluster_viewer:
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: $(ref.workload_project_2.projectId)
+      policy:
+        bindings:
+          - role: roles/container.clusterViewer
+            members:
+              - serviceAccount:$(ref.fleet_manager_sa.email)
+    dependsOn:
+      - fleet_manager_sa
+
+  fleet_manager_iam_staging_backup_admin:
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: $(ref.workload_project_2.projectId)
+      policy:
+        bindings:
+          - role: roles/gkebackup.admin
+            members:
+              - serviceAccount:$(ref.fleet_manager_sa.email)
+    dependsOn:
+      - fleet_manager_sa
+
+  # IAM Policy Bindings for Config Connector - Production
+  cnrm_iam_prod_editor:
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: $(ref.workload_project_1.projectId)
+      policy:
+        bindings:
+          - role: roles/editor
+            members:
+              - serviceAccount:$(ref.cnrm_system_sa_prod.email)
+    dependsOn:
+      - cnrm_system_sa_prod
+
+  # IAM Policy Bindings for Config Connector - Staging
+  cnrm_iam_staging_editor:
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: $(ref.workload_project_2.projectId)
+      policy:
+        bindings:
+          - role: roles/editor
+            members:
+              - serviceAccount:$(ref.cnrm_system_sa_staging.email)
+    dependsOn:
+      - cnrm_system_sa_staging
+
+  # Fleet Membership Registration - Production Cluster
+  prod_fleet_membership:
+    type: gcp-types/gkehub-v1:projects.locations.memberships
+    properties:
+      parent: projects/$(ref.fleet_host_project.projectId)/locations/global
+      membershipId: $(inputs.prod_cluster_name)-$(ref.random_suffix.result)
+      membership:
+        description: "Production cluster fleet membership"
+        endpoint:
+          gkeCluster:
+            resourceLink: projects/$(ref.workload_project_1.projectId)/locations/$(inputs.region)/clusters/$(inputs.prod_cluster_name)-$(ref.random_suffix.result)
+        labels:
+          environment: production
+          cluster-tier: prod
+    dependsOn:
+      - production_cluster
+      - fleet_host_apis
+
+  # Fleet Membership Registration - Staging Cluster
+  staging_fleet_membership:
+    type: gcp-types/gkehub-v1:projects.locations.memberships
+    properties:
+      parent: projects/$(ref.fleet_host_project.projectId)/locations/global
+      membershipId: $(inputs.staging_cluster_name)-$(ref.random_suffix.result)
+      membership:
+        description: "Staging cluster fleet membership"
+        endpoint:
+          gkeCluster:
+            resourceLink: projects/$(ref.workload_project_2.projectId)/locations/$(inputs.region)/clusters/$(inputs.staging_cluster_name)-$(ref.random_suffix.result)
+        labels:
+          environment: staging
+          cluster-tier: staging
+    dependsOn:
+      - staging_cluster
+      - fleet_host_apis
+
+  # Backup Plan for Production Cluster
+  prod_backup_plan:
+    type: gcp-types/gkebackup-v1:projects.locations.backupPlans
+    properties:
+      parent: projects/$(ref.fleet_host_project.projectId)/locations/$(inputs.region)
+      backupPlanId: $(inputs.backup_plan_name)-prod-$(ref.random_suffix.result)
+      backupPlan:
+        description: "Daily backup plan for production workloads"
+        cluster: projects/$(ref.workload_project_1.projectId)/locations/$(inputs.region)/clusters/$(inputs.prod_cluster_name)-$(ref.random_suffix.result)
+        
+        # Backup configuration
+        backupConfig:
+          includeVolumeData: true
+          includeSecrets: true
+          allNamespaces: true
+          
+        # Backup schedule
+        backupSchedule:
+          cronSchedule: $(inputs.prod_backup_schedule)
+          
+        # Retention policy
+        retentionPolicy:
+          backupDeleteLockDays: 7
+          backupRetainDays: $(inputs.prod_backup_retention)
+          locked: false
+          
+        labels:
+          environment: production
+          backup-tier: daily
+    dependsOn:
+      - production_cluster
+      - fleet_host_apis
+
+  # Backup Plan for Staging Cluster
+  staging_backup_plan:
+    type: gcp-types/gkebackup-v1:projects.locations.backupPlans
+    properties:
+      parent: projects/$(ref.fleet_host_project.projectId)/locations/$(inputs.region)
+      backupPlanId: $(inputs.backup_plan_name)-staging-$(ref.random_suffix.result)
+      backupPlan:
+        description: "Weekly backup plan for staging workloads"
+        cluster: projects/$(ref.workload_project_2.projectId)/locations/$(inputs.region)/clusters/$(inputs.staging_cluster_name)-$(ref.random_suffix.result)
+        
+        # Backup configuration
+        backupConfig:
+          includeVolumeData: true
+          includeSecrets: true
+          allNamespaces: true
+          
+        # Backup schedule
+        backupSchedule:
+          cronSchedule: $(inputs.staging_backup_schedule)
+          
+        # Retention policy
+        retentionPolicy:
+          backupDeleteLockDays: 3
+          backupRetainDays: $(inputs.staging_backup_retention)
+          locked: false
+          
+        labels:
+          environment: staging
+          backup-tier: weekly
+    dependsOn:
+      - staging_cluster
+      - fleet_host_apis
+
+  # Config Management Feature for Production Cluster
+  prod_config_management:
+    type: gcp-types/gkehub-v1:projects.locations.features
+    properties:
+      parent: projects/$(ref.fleet_host_project.projectId)/locations/global
+      featureId: configmanagement
+      feature:
+        spec:
+          fleetobservability:
+            loggingConfig:
+              defaultConfig:
+                mode: COPY
+              fleetScopeLogsConfig:
+                mode: COPY
+          multiclusteringress:
+            configMembership: projects/$(ref.fleet_host_project.projectId)/locations/global/memberships/$(inputs.prod_cluster_name)-$(ref.random_suffix.result)
+    dependsOn:
+      - prod_fleet_membership
+
+  # Config Management Member Configuration for Production
+  prod_config_management_membership:
+    type: gcp-types/gkehub-v1:projects.locations.memberships.configManagement
+    properties:
+      parent: projects/$(ref.fleet_host_project.projectId)/locations/global/memberships/$(inputs.prod_cluster_name)-$(ref.random_suffix.result)
+      configManagement:
+        version: "1.17.0"
+        configSync:
+          enabled: true
+          sourceFormat: unstructured
+        policyController:
+          enabled: true
+          referentialRulesEnabled: true
+          logDeniesEnabled: true
+          mutationEnabled: true
+        binauthz:
+          enabled: true
+    dependsOn:
+      - prod_config_management
+
+  # Config Management Member Configuration for Staging
+  staging_config_management_membership:
+    type: gcp-types/gkehub-v1:projects.locations.memberships.configManagement
+    properties:
+      parent: projects/$(ref.fleet_host_project.projectId)/locations/global/memberships/$(inputs.staging_cluster_name)-$(ref.random_suffix.result)
+      configManagement:
+        version: "1.17.0"
+        configSync:
+          enabled: true
+          sourceFormat: unstructured
+        policyController:
+          enabled: true
+          referentialRulesEnabled: true
+          logDeniesEnabled: true
+          mutationEnabled: true
+        binauthz:
+          enabled: true
+    dependsOn:
+      - staging_fleet_membership
+
+# Outputs for verification and integration
+outputs:
+  fleet_host_project_id:
+    description: "Fleet host project ID"
+    value: $(ref.fleet_host_project.projectId)
+
+  workload_project_1_id:
+    description: "Production workload project ID"
+    value: $(ref.workload_project_1.projectId)
+
+  workload_project_2_id:
+    description: "Staging workload project ID"
+    value: $(ref.workload_project_2.projectId)
+
+  production_cluster_name:
+    description: "Production GKE cluster name"
+    value: $(inputs.prod_cluster_name)-$(ref.random_suffix.result)
+
+  staging_cluster_name:
+    description: "Staging GKE cluster name"
+    value: $(inputs.staging_cluster_name)-$(ref.random_suffix.result)
+
+  production_cluster_endpoint:
+    description: "Production cluster endpoint for kubectl access"
+    value: $(ref.production_cluster.endpoint)
+
+  staging_cluster_endpoint:
+    description: "Staging cluster endpoint for kubectl access"
+    value: $(ref.staging_cluster.endpoint)
+
+  prod_backup_plan_id:
+    description: "Production backup plan resource ID"
+    value: $(ref.prod_backup_plan.name)
+
+  staging_backup_plan_id:
+    description: "Staging backup plan resource ID"
+    value: $(ref.staging_backup_plan.name)
+
+  fleet_manager_sa_email:
+    description: "Fleet manager service account email"
+    value: $(ref.fleet_manager_sa.email)
+
+  cnrm_system_sa_prod_email:
+    description: "Config Connector service account email for production"
+    value: $(ref.cnrm_system_sa_prod.email)
+
+  cnrm_system_sa_staging_email:
+    description: "Config Connector service account email for staging"
+    value: $(ref.cnrm_system_sa_staging.email)
+
+  prod_fleet_membership_name:
+    description: "Production cluster fleet membership name"
+    value: $(ref.prod_fleet_membership.name)
+
+  staging_fleet_membership_name:
+    description: "Staging cluster fleet membership name"
+    value: $(ref.staging_fleet_membership.name)
+
+  gcloud_get_credentials_prod:
+    description: "Command to get credentials for production cluster"
+    value: "gcloud container clusters get-credentials $(inputs.prod_cluster_name)-$(ref.random_suffix.result) --region $(inputs.region) --project $(ref.workload_project_1.projectId)"
+
+  gcloud_get_credentials_staging:
+    description: "Command to get credentials for staging cluster"
+    value: "gcloud container clusters get-credentials $(inputs.staging_cluster_name)-$(ref.random_suffix.result) --region $(inputs.region) --project $(ref.workload_project_2.projectId)"
+
+  fleet_membership_list_command:
+    description: "Command to list fleet memberships"
+    value: "gcloud container fleet memberships list --project $(ref.fleet_host_project.projectId)"
+
+  backup_plans_list_command:
+    description: "Command to list backup plans"
+    value: "gcloud backup-dr backup-plans list --location $(inputs.region) --project $(ref.fleet_host_project.projectId)"

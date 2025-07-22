@@ -1,0 +1,756 @@
+# Infrastructure Manager Configuration for API Middleware with Cloud Run MCP Servers and Service Extensions
+# This configuration deploys intelligent API middleware using Model Context Protocol (MCP) servers
+# on Cloud Run with Service Extensions and Vertex AI integration for AI-powered request processing
+
+# Import required modules and define deployment metadata
+apiVersion: infra.manager.gcp.dev/v1
+kind: InfraManager
+metadata:
+  name: mcp-api-middleware
+  labels:
+    environment: production
+    application: intelligent-api-middleware
+    mcp-protocol: enabled
+    ai-integration: vertex-ai
+
+# Define global variables for consistent resource naming and configuration
+variables:
+  # Project and location configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID for deployment"
+    default: "mcp-middleware-project"
+  
+  region:
+    type: string
+    description: "Google Cloud region for resource deployment"
+    default: "us-central1"
+  
+  zone:
+    type: string
+    description: "Google Cloud zone for zonal resources"
+    default: "us-central1-a"
+  
+  # Resource naming configuration
+  resource_prefix:
+    type: string
+    description: "Prefix for all resource names to ensure uniqueness"
+    default: "mcp-middleware"
+  
+  random_suffix:
+    type: string
+    description: "Random suffix for unique resource naming"
+    default: "${random_id.suffix.hex}"
+  
+  # Service configuration
+  container_concurrency:
+    type: number
+    description: "Maximum concurrent requests per Cloud Run container instance"
+    default: 100
+  
+  container_timeout:
+    type: number
+    description: "Request timeout in seconds for Cloud Run services"
+    default: 300
+  
+  container_memory:
+    type: string
+    description: "Memory allocation for Cloud Run containers"
+    default: "512Mi"
+  
+  container_cpu:
+    type: string
+    description: "CPU allocation for Cloud Run containers"
+    default: "1"
+  
+  # Vertex AI configuration
+  vertex_ai_location:
+    type: string
+    description: "Location for Vertex AI resources"
+    default: "us-central1"
+  
+  # Endpoints configuration
+  api_title:
+    type: string
+    description: "Title for the Cloud Endpoints API"
+    default: "Intelligent API Middleware Gateway"
+  
+  api_version:
+    type: string
+    description: "Version for the Cloud Endpoints API"
+    default: "1.0.0"
+
+# Random ID generation for unique resource naming
+resources:
+  # Generate random suffix for unique resource names
+  random_suffix:
+    type: gcp:random:RandomId
+    properties:
+      byteLength: 3
+  
+  # Enable required Google Cloud APIs
+  # Cloud Run API for serverless container deployment
+  cloudrun_api:
+    type: gcp:projects:Service
+    properties:
+      project: ${variables.project_id}
+      service: run.googleapis.com
+      disableOnDestroy: false
+  
+  # Vertex AI API for machine learning capabilities
+  aiplatform_api:
+    type: gcp:projects:Service
+    properties:
+      project: ${variables.project_id}
+      service: aiplatform.googleapis.com
+      disableOnDestroy: false
+  
+  # Cloud Endpoints API for API management
+  endpoints_api:
+    type: gcp:projects:Service
+    properties:
+      project: ${variables.project_id}
+      service: endpoints.googleapis.com
+      disableOnDestroy: false
+  
+  # Service Control API for Service Extensions
+  servicecontrol_api:
+    type: gcp:projects:Service
+    properties:
+      project: ${variables.project_id}
+      service: servicecontrol.googleapis.com
+      disableOnDestroy: false
+  
+  # Cloud Build API for container image building
+  cloudbuild_api:
+    type: gcp:projects:Service
+    properties:
+      project: ${variables.project_id}
+      service: cloudbuild.googleapis.com
+      disableOnDestroy: false
+  
+  # Artifact Registry API for container image storage
+  artifactregistry_api:
+    type: gcp:projects:Service
+    properties:
+      project: ${variables.project_id}
+      service: artifactregistry.googleapis.com
+      disableOnDestroy: false
+
+  # IAM Service Account for Cloud Run services with least privilege access
+  cloudrun_service_account:
+    type: gcp:serviceAccount:Account
+    properties:
+      accountId: ${variables.resource_prefix}-cloudrun-${random_suffix.hex}
+      displayName: "Cloud Run Service Account for MCP API Middleware"
+      description: "Service account with minimal permissions for MCP servers and middleware"
+      project: ${variables.project_id}
+    dependsOn:
+      - cloudrun_api
+
+  # IAM binding for Vertex AI access (required for AI-powered content analysis)
+  vertex_ai_user_binding:
+    type: gcp:projects:IAMBinding
+    properties:
+      project: ${variables.project_id}
+      role: roles/aiplatform.user
+      members:
+        - serviceAccount:${cloudrun_service_account.email}
+    dependsOn:
+      - cloudrun_service_account
+      - aiplatform_api
+
+  # IAM binding for Cloud Run Invoker (allows services to call each other)
+  cloudrun_invoker_binding:
+    type: gcp:projects:IAMBinding
+    properties:
+      project: ${variables.project_id}
+      role: roles/run.invoker
+      members:
+        - serviceAccount:${cloudrun_service_account.email}
+    dependsOn:
+      - cloudrun_service_account
+
+  # MCP Content Analyzer Server - Analyzes API request content using Vertex AI
+  mcp_content_analyzer:
+    type: gcp:cloudrun:Service
+    properties:
+      name: ${variables.resource_prefix}-content-analyzer-${random_suffix.hex}
+      location: ${variables.region}
+      project: ${variables.project_id}
+      metadata:
+        annotations:
+          # Enable CPU allocation during request processing only for cost optimization
+          run.googleapis.com/cpu-throttling: "true"
+          # Allow unauthenticated access for demo purposes (configure IAM for production)
+          run.googleapis.com/ingress: all
+        labels:
+          application: mcp-api-middleware
+          component: content-analyzer
+          mcp-server: "true"
+      
+      template:
+        metadata:
+          annotations:
+            # Auto-scale to zero when not in use
+            autoscaling.knative.dev/minScale: "0"
+            autoscaling.knative.dev/maxScale: "10"
+            # Set execution environment to second generation for better performance
+            run.googleapis.com/execution-environment: gen2
+        
+        spec:
+          serviceAccountName: ${cloudrun_service_account.email}
+          containerConcurrency: ${variables.container_concurrency}
+          timeoutSeconds: ${variables.container_timeout}
+          
+          containers:
+            - name: content-analyzer
+              # Use Cloud Build to build container from source
+              image: gcr.io/${variables.project_id}/${variables.resource_prefix}-content-analyzer:latest
+              
+              # Resource allocation for optimal performance
+              resources:
+                limits:
+                  memory: ${variables.container_memory}
+                  cpu: ${variables.container_cpu}
+              
+              # Environment variables for MCP server configuration
+              env:
+                - name: PROJECT_ID
+                  value: ${variables.project_id}
+                - name: REGION
+                  value: ${variables.region}
+                - name: SERVICE_NAME
+                  value: content-analyzer
+                - name: MCP_PROTOCOL_VERSION
+                  value: "1.0"
+              
+              # Health check configuration
+              ports:
+                - containerPort: 8080
+                  protocol: TCP
+              
+              # Startup and liveness probes for reliability
+              startupProbe:
+                httpGet:
+                  path: /health
+                  port: 8080
+                initialDelaySeconds: 10
+                periodSeconds: 5
+                timeoutSeconds: 5
+                failureThreshold: 3
+              
+              livenessProbe:
+                httpGet:
+                  path: /health
+                  port: 8080
+                periodSeconds: 30
+                timeoutSeconds: 5
+                failureThreshold: 3
+    
+    dependsOn:
+      - cloudrun_api
+      - cloudrun_service_account
+      - vertex_ai_user_binding
+
+  # MCP Request Router Server - Intelligent routing based on AI analysis
+  mcp_request_router:
+    type: gcp:cloudrun:Service
+    properties:
+      name: ${variables.resource_prefix}-request-router-${random_suffix.hex}
+      location: ${variables.region}
+      project: ${variables.project_id}
+      metadata:
+        annotations:
+          run.googleapis.com/cpu-throttling: "true"
+          run.googleapis.com/ingress: all
+        labels:
+          application: mcp-api-middleware
+          component: request-router
+          mcp-server: "true"
+      
+      template:
+        metadata:
+          annotations:
+            autoscaling.knative.dev/minScale: "0"
+            autoscaling.knative.dev/maxScale: "10"
+            run.googleapis.com/execution-environment: gen2
+        
+        spec:
+          serviceAccountName: ${cloudrun_service_account.email}
+          containerConcurrency: ${variables.container_concurrency}
+          timeoutSeconds: ${variables.container_timeout}
+          
+          containers:
+            - name: request-router
+              image: gcr.io/${variables.project_id}/${variables.resource_prefix}-request-router:latest
+              
+              resources:
+                limits:
+                  memory: ${variables.container_memory}
+                  cpu: ${variables.container_cpu}
+              
+              env:
+                - name: PROJECT_ID
+                  value: ${variables.project_id}
+                - name: REGION
+                  value: ${variables.region}
+                - name: SERVICE_NAME
+                  value: request-router
+                - name: MCP_PROTOCOL_VERSION
+                  value: "1.0"
+              
+              ports:
+                - containerPort: 8080
+                  protocol: TCP
+              
+              startupProbe:
+                httpGet:
+                  path: /health
+                  port: 8080
+                initialDelaySeconds: 10
+                periodSeconds: 5
+                timeoutSeconds: 5
+                failureThreshold: 3
+              
+              livenessProbe:
+                httpGet:
+                  path: /health
+                  port: 8080
+                periodSeconds: 30
+                timeoutSeconds: 5
+                failureThreshold: 3
+    
+    dependsOn:
+      - cloudrun_api
+      - cloudrun_service_account
+
+  # MCP Response Enhancer Server - AI-powered response optimization
+  mcp_response_enhancer:
+    type: gcp:cloudrun:Service
+    properties:
+      name: ${variables.resource_prefix}-response-enhancer-${random_suffix.hex}
+      location: ${variables.region}
+      project: ${variables.project_id}
+      metadata:
+        annotations:
+          run.googleapis.com/cpu-throttling: "true"
+          run.googleapis.com/ingress: all
+        labels:
+          application: mcp-api-middleware
+          component: response-enhancer
+          mcp-server: "true"
+      
+      template:
+        metadata:
+          annotations:
+            autoscaling.knative.dev/minScale: "0"
+            autoscaling.knative.dev/maxScale: "10"
+            run.googleapis.com/execution-environment: gen2
+        
+        spec:
+          serviceAccountName: ${cloudrun_service_account.email}
+          containerConcurrency: ${variables.container_concurrency}
+          timeoutSeconds: ${variables.container_timeout}
+          
+          containers:
+            - name: response-enhancer
+              image: gcr.io/${variables.project_id}/${variables.resource_prefix}-response-enhancer:latest
+              
+              resources:
+                limits:
+                  memory: ${variables.container_memory}
+                  cpu: ${variables.container_cpu}
+              
+              env:
+                - name: PROJECT_ID
+                  value: ${variables.project_id}
+                - name: REGION
+                  value: ${variables.region}
+                - name: SERVICE_NAME
+                  value: response-enhancer
+                - name: MCP_PROTOCOL_VERSION
+                  value: "1.0"
+              
+              ports:
+                - containerPort: 8080
+                  protocol: TCP
+              
+              startupProbe:
+                httpGet:
+                  path: /health
+                  port: 8080
+                initialDelaySeconds: 10
+                periodSeconds: 5
+                timeoutSeconds: 5
+                failureThreshold: 3
+              
+              livenessProbe:
+                httpGet:
+                  path: /health
+                  port: 8080
+                periodSeconds: 30
+                timeoutSeconds: 5
+                failureThreshold: 3
+    
+    dependsOn:
+      - cloudrun_api
+      - cloudrun_service_account
+      - vertex_ai_user_binding
+
+  # Main API Middleware Service - Orchestrates MCP servers for intelligent processing
+  api_middleware_service:
+    type: gcp:cloudrun:Service
+    properties:
+      name: ${variables.resource_prefix}-api-middleware-${random_suffix.hex}
+      location: ${variables.region}
+      project: ${variables.project_id}
+      metadata:
+        annotations:
+          run.googleapis.com/cpu-throttling: "true"
+          run.googleapis.com/ingress: all
+        labels:
+          application: mcp-api-middleware
+          component: main-middleware
+          orchestrator: "true"
+      
+      template:
+        metadata:
+          annotations:
+            # Higher scale for main middleware service
+            autoscaling.knative.dev/minScale: "1"
+            autoscaling.knative.dev/maxScale: "20"
+            run.googleapis.com/execution-environment: gen2
+        
+        spec:
+          serviceAccountName: ${cloudrun_service_account.email}
+          containerConcurrency: ${variables.container_concurrency}
+          timeoutSeconds: ${variables.container_timeout}
+          
+          containers:
+            - name: api-middleware
+              image: gcr.io/${variables.project_id}/${variables.resource_prefix}-api-middleware:latest
+              
+              # Higher resource allocation for main orchestrator
+              resources:
+                limits:
+                  memory: "1Gi"
+                  cpu: "2"
+              
+              env:
+                - name: PROJECT_ID
+                  value: ${variables.project_id}
+                - name: REGION
+                  value: ${variables.region}
+                - name: SERVICE_NAME
+                  value: api-middleware
+                # MCP server URLs for orchestration
+                - name: CONTENT_ANALYZER_URL
+                  value: ${mcp_content_analyzer.status.url}
+                - name: REQUEST_ROUTER_URL
+                  value: ${mcp_request_router.status.url}
+                - name: RESPONSE_ENHANCER_URL
+                  value: ${mcp_response_enhancer.status.url}
+              
+              ports:
+                - containerPort: 8080
+                  protocol: TCP
+              
+              startupProbe:
+                httpGet:
+                  path: /health
+                  port: 8080
+                initialDelaySeconds: 15
+                periodSeconds: 5
+                timeoutSeconds: 10
+                failureThreshold: 5
+              
+              livenessProbe:
+                httpGet:
+                  path: /health
+                  port: 8080
+                periodSeconds: 30
+                timeoutSeconds: 10
+                failureThreshold: 3
+    
+    dependsOn:
+      - cloudrun_api
+      - cloudrun_service_account
+      - cloudrun_invoker_binding
+      - mcp_content_analyzer
+      - mcp_request_router
+      - mcp_response_enhancer
+
+  # Cloud Endpoints Service for API management and Service Extensions
+  # This creates a managed API gateway with intelligent middleware backend
+  endpoints_service:
+    type: gcp:endpoints:Service
+    properties:
+      serviceName: ${variables.resource_prefix}-endpoints-${random_suffix.hex}.endpoints.${variables.project_id}.cloud.goog
+      project: ${variables.project_id}
+      
+      # OpenAPI specification for the intelligent API middleware
+      openapiConfig: |
+        swagger: '2.0'
+        info:
+          title: ${variables.api_title}
+          description: AI-powered API gateway using MCP servers for intelligent request processing
+          version: ${variables.api_version}
+          contact:
+            name: MCP API Middleware
+            url: https://modelcontextprotocol.io/
+        host: ${variables.resource_prefix}-endpoints-${random_suffix.hex}.endpoints.${variables.project_id}.cloud.goog
+        schemes:
+          - https
+        produces:
+          - application/json
+        consumes:
+          - application/json
+        
+        # Backend configuration pointing to our intelligent middleware
+        x-google-backend:
+          address: ${api_middleware_service.status.url}
+          path_translation: APPEND_PATH_TO_ADDRESS
+        
+        # Define API endpoints that will be processed intelligently
+        paths:
+          /{proxy+}:
+            x-google-backend:
+              address: ${api_middleware_service.status.url}
+              path_translation: APPEND_PATH_TO_ADDRESS
+            get:
+              summary: Intelligent GET request processing
+              description: Process GET requests through MCP servers for AI-powered analysis and routing
+              operationId: intelligentGet
+              parameters:
+                - name: proxy
+                  in: path
+                  required: true
+                  type: string
+                  description: Dynamic path for request routing
+              responses:
+                200:
+                  description: Successfully processed request with AI enhancements
+                  schema:
+                    type: object
+                    properties:
+                      data:
+                        type: object
+                        description: Original response data
+                      ai_insights:
+                        type: object
+                        description: AI-generated insights and recommendations
+                      middleware_metadata:
+                        type: object
+                        description: Processing metadata from MCP servers
+                400:
+                  description: Bad request or invalid input
+                500:
+                  description: Internal server error during processing
+            
+            post:
+              summary: Intelligent POST request processing
+              description: Process POST requests through MCP servers for content analysis and enhancement
+              operationId: intelligentPost
+              parameters:
+                - name: proxy
+                  in: path
+                  required: true
+                  type: string
+                  description: Dynamic path for request routing
+                - name: body
+                  in: body
+                  required: false
+                  schema:
+                    type: object
+                    description: Request payload for AI analysis
+              responses:
+                200:
+                  description: Successfully processed request with AI enhancements
+                201:
+                  description: Resource created with intelligent processing
+                400:
+                  description: Bad request or invalid input
+                500:
+                  description: Internal server error during processing
+            
+            put:
+              summary: Intelligent PUT request processing
+              description: Process PUT requests through MCP servers for intelligent routing
+              operationId: intelligentPut
+              parameters:
+                - name: proxy
+                  in: path
+                  required: true
+                  type: string
+                - name: body
+                  in: body
+                  required: false
+                  schema:
+                    type: object
+              responses:
+                200:
+                  description: Successfully updated resource with AI insights
+                400:
+                  description: Bad request or invalid input
+                500:
+                  description: Internal server error during processing
+            
+            delete:
+              summary: Intelligent DELETE request processing
+              description: Process DELETE requests through MCP servers with safety analysis
+              operationId: intelligentDelete
+              parameters:
+                - name: proxy
+                  in: path
+                  required: true
+                  type: string
+              responses:
+                200:
+                  description: Successfully deleted resource
+                204:
+                  description: Resource deleted (no content)
+                400:
+                  description: Bad request or invalid input
+                500:
+                  description: Internal server error during processing
+        
+        # Security definitions for API key management
+        securityDefinitions:
+          api_key:
+            type: apiKey
+            name: key
+            in: query
+            description: API key for accessing the intelligent middleware
+        
+        # Default security requirement
+        security:
+          - api_key: []
+    
+    dependsOn:
+      - endpoints_api
+      - api_middleware_service
+
+  # IAM Policy for Cloud Endpoints Service
+  endpoints_iam_policy:
+    type: gcp:endpoints:ServiceIamBinding
+    properties:
+      serviceName: ${endpoints_service.serviceName}
+      role: roles/servicemanagement.serviceController
+      members:
+        - serviceAccount:${cloudrun_service_account.email}
+    dependsOn:
+      - endpoints_service
+      - cloudrun_service_account
+
+# Outputs for verification and integration
+outputs:
+  # Project and deployment information
+  project_id:
+    description: "Google Cloud Project ID where resources are deployed"
+    value: ${variables.project_id}
+  
+  region:
+    description: "Google Cloud region for deployed resources"
+    value: ${variables.region}
+  
+  # MCP Server URLs for direct access and testing
+  content_analyzer_url:
+    description: "URL for the MCP Content Analyzer server"
+    value: ${mcp_content_analyzer.status.url}
+    sensitive: false
+  
+  request_router_url:
+    description: "URL for the MCP Request Router server"
+    value: ${mcp_request_router.status.url}
+    sensitive: false
+  
+  response_enhancer_url:
+    description: "URL for the MCP Response Enhancer server"
+    value: ${mcp_response_enhancer.status.url}
+    sensitive: false
+  
+  # Main middleware service information
+  api_middleware_url:
+    description: "URL for the main API Middleware orchestrator service"
+    value: ${api_middleware_service.status.url}
+    sensitive: false
+  
+  # Cloud Endpoints API Gateway URL
+  api_gateway_url:
+    description: "Public URL for the Cloud Endpoints API Gateway"
+    value: https://${endpoints_service.serviceName}
+    sensitive: false
+  
+  # Service account information
+  service_account_email:
+    description: "Email of the service account used by Cloud Run services"
+    value: ${cloudrun_service_account.email}
+    sensitive: false
+  
+  # Resource naming information
+  resource_suffix:
+    description: "Random suffix used for resource naming"
+    value: ${random_suffix.hex}
+    sensitive: false
+  
+  # API configuration
+  endpoints_service_name:
+    description: "Name of the Cloud Endpoints service"
+    value: ${endpoints_service.serviceName}
+    sensitive: false
+  
+  # Health check endpoints for monitoring
+  health_check_urls:
+    description: "Health check URLs for all MCP servers and middleware"
+    value:
+      content_analyzer: ${mcp_content_analyzer.status.url}/health
+      request_router: ${mcp_request_router.status.url}/health
+      response_enhancer: ${mcp_response_enhancer.status.url}/health
+      api_middleware: ${api_middleware_service.status.url}/health
+    sensitive: false
+
+# Deployment configuration and metadata
+deployment:
+  # Deployment strategy for zero-downtime updates
+  strategy:
+    type: rolling
+    maxSurge: 1
+    maxUnavailable: 0
+  
+  # Resource tags for organization and billing
+  labels:
+    environment: production
+    application: mcp-api-middleware
+    protocol: mcp
+    ai-enabled: "true"
+    cost-center: innovation
+    team: platform-engineering
+  
+  # Monitoring and alerting configuration
+  monitoring:
+    enabled: true
+    metrics:
+      - request_count
+      - request_latency
+      - error_rate
+      - ai_analysis_latency
+    
+    alerts:
+      - name: high_error_rate
+        condition: error_rate > 0.05
+        duration: 5m
+      - name: high_latency
+        condition: request_latency_p95 > 2s
+        duration: 10m
+  
+  # Backup and disaster recovery
+  backup:
+    enabled: false  # Stateless services don't require backup
+    
+  # Security and compliance
+  security:
+    enable_private_google_access: true
+    require_ssl: true
+    cors_enabled: true
+    api_key_required: true

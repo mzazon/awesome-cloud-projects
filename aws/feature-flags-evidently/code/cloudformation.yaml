@@ -1,0 +1,516 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for Feature Flags with CloudWatch Evidently - Creates Evidently project, feature flags, launch configuration, and Lambda function for demonstration'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'feature-demo'
+    Description: 'Name for the CloudWatch Evidently project'
+    AllowedPattern: '^[a-zA-Z0-9\-_]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, hyphens, and underscores'
+    MinLength: 3
+    MaxLength: 127
+
+  FeatureName:
+    Type: String
+    Default: 'new-checkout-flow'
+    Description: 'Name for the feature flag'
+    AllowedPattern: '^[a-zA-Z0-9\-_]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, hyphens, and underscores'
+    MinLength: 1
+    MaxLength: 127
+
+  LaunchName:
+    Type: String
+    Default: 'checkout-gradual-rollout'
+    Description: 'Name for the launch configuration'
+    AllowedPattern: '^[a-zA-Z0-9\-_]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, hyphens, and underscores'
+    MinLength: 1
+    MaxLength: 127
+
+  TreatmentTrafficPercentage:
+    Type: Number
+    Default: 10
+    Description: 'Percentage of traffic to route to the treatment group (new feature)'
+    MinValue: 0
+    MaxValue: 100
+    ConstraintDescription: 'Must be a number between 0 and 100'
+
+  LambdaRuntime:
+    Type: String
+    Default: 'python3.9'
+    Description: 'Runtime for the Lambda function'
+    AllowedValues:
+      - 'python3.8'
+      - 'python3.9'
+      - 'python3.10'
+      - 'python3.11'
+
+  EnableDataDelivery:
+    Type: String
+    Default: 'true'
+    Description: 'Enable data delivery to CloudWatch Logs for evaluation events'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  AutoStartLaunch:
+    Type: String
+    Default: 'false'
+    Description: 'Automatically start the launch after creation (use with caution in production)'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Conditions:
+  EnableDataDeliveryCondition: !Equals [!Ref EnableDataDelivery, 'true']
+  AutoStartLaunchCondition: !Equals [!Ref AutoStartLaunch, 'true']
+
+Resources:
+  # CloudWatch Log Group for Evidently evaluations
+  EvidentlyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableDataDeliveryCondition
+    Properties:
+      LogGroupName: '/aws/evidently/evaluations'
+      RetentionInDays: 30
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Purpose'
+          Value: 'Evidently-Feature-Evaluations'
+
+  # IAM Role for Lambda function with Evidently permissions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EvidentlyFeatureEvaluationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - evidently:EvaluateFeature
+                  - evidently:GetProject
+                  - evidently:GetFeature
+                  - evidently:GetLaunch
+                Resource:
+                  - !Sub 'arn:aws:evidently:${AWS::Region}:${AWS::AccountId}:project/${ProjectName}'
+                  - !Sub 'arn:aws:evidently:${AWS::Region}:${AWS::AccountId}:project/${ProjectName}/*'
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Purpose'
+          Value: 'Lambda-Evidently-Integration'
+
+  # CloudWatch Evidently Project
+  EvidentlyProject:
+    Type: AWS::Evidently::Project
+    Properties:
+      Name: !Ref ProjectName
+      Description: !Sub 'Feature flag demonstration project for ${ProjectName}'
+      DataDelivery: !If
+        - EnableDataDeliveryCondition
+        - CloudWatchLogs:
+            LogGroup: !Ref EvidentlyLogGroup
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: 'Environment'
+          Value: 'Demo'
+        - Key: 'Purpose'
+          Value: 'Feature-Flag-Management'
+
+  # Feature Flag with boolean variations
+  CheckoutFeatureFlag:
+    Type: AWS::Evidently::Feature
+    Properties:
+      Project: !Ref EvidentlyProject
+      Name: !Ref FeatureName
+      Description: 'Controls visibility of the new checkout experience'
+      Variations:
+        - VariationName: 'enabled'
+          BooleanValue: true
+        - VariationName: 'disabled'
+          BooleanValue: false
+      DefaultVariation: 'disabled'
+      EvaluationStrategy: 'ALL_RULES'
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'FeatureType'
+          Value: 'Boolean'
+
+  # Launch configuration for gradual rollout
+  GradualRolloutLaunch:
+    Type: AWS::Evidently::Launch
+    Properties:
+      Project: !Ref EvidentlyProject
+      Name: !Ref LaunchName
+      Description: !Sub 'Gradual rollout of new checkout flow to ${TreatmentTrafficPercentage}% of users'
+      Groups:
+        - GroupName: 'control-group'
+          Description: 'Users with existing checkout flow'
+          Feature: !Ref CheckoutFeatureFlag
+          Variation: 'disabled'
+        - GroupName: 'treatment-group'
+          Description: 'Users with new checkout flow'
+          Feature: !Ref CheckoutFeatureFlag
+          Variation: 'enabled'
+      ScheduledSplitsConfig:
+        - StartTime: !Sub '${AWS::StackName}-start-time'
+          GroupWeights:
+            control-group: !Sub '${100 - TreatmentTrafficPercentage}'
+            treatment-group: !Ref TreatmentTrafficPercentage
+      ExecutionStatus: !If
+        - AutoStartLaunchCondition
+        - 'START'
+        - 'STOP'
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'LaunchType'
+          Value: 'Gradual-Rollout'
+
+  # Lambda function for feature evaluation demonstration
+  FeatureEvaluationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-evidently-demo'
+      Description: 'Demonstrates feature flag evaluation using CloudWatch Evidently'
+      Runtime: !Ref LambdaRuntime
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref EvidentlyProject
+          FEATURE_NAME: !Ref FeatureName
+          AWS_REGION: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from botocore.exceptions import ClientError
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              """
+              Lambda function to demonstrate CloudWatch Evidently feature flag evaluation.
+              
+              Expected event format:
+              {
+                  "userId": "user-123",
+                  "userAttributes": {
+                      "tier": "premium",
+                      "region": "us-east-1"
+                  }
+              }
+              """
+              
+              # Initialize Evidently client
+              evidently = boto3.client('evidently', region_name=os.environ.get('AWS_REGION'))
+              
+              # Extract user information from event
+              user_id = event.get('userId', f'anonymous-user-{context.aws_request_id[:8]}')
+              user_attributes = event.get('userAttributes', {})
+              
+              project_name = os.environ['PROJECT_NAME']
+              feature_name = os.environ['FEATURE_NAME']
+              
+              try:
+                  # Prepare evaluation request
+                  evaluation_request = {
+                      'project': project_name,
+                      'feature': feature_name,
+                      'entityId': user_id
+                  }
+                  
+                  # Add user attributes if provided
+                  if user_attributes:
+                      evaluation_request['evaluationContext'] = json.dumps(user_attributes)
+                  
+                  # Evaluate feature flag for user
+                  response = evidently.evaluate_feature(**evaluation_request)
+                  
+                  feature_enabled = response['variation'] == 'enabled'
+                  
+                  # Log evaluation for monitoring and debugging
+                  logger.info(f"Feature evaluation - User: {user_id}, "
+                             f"Feature: {feature_name}, "
+                             f"Variation: {response['variation']}, "
+                             f"Reason: {response.get('reason', 'default')}")
+                  
+                  # Return structured response
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'X-Feature-Evaluation': 'success'
+                      },
+                      'body': json.dumps({
+                          'success': True,
+                          'data': {
+                              'userId': user_id,
+                              'featureEnabled': feature_enabled,
+                              'variation': response['variation'],
+                              'reason': response.get('reason', 'default'),
+                              'details': response.get('details', {}),
+                              'project': project_name,
+                              'feature': feature_name
+                          },
+                          'metadata': {
+                              'evaluationTime': context.get_remaining_time_in_millis(),
+                              'requestId': context.aws_request_id
+                          }
+                      })
+                  }
+                  
+              except ClientError as e:
+                  error_code = e.response['Error']['Code']
+                  error_message = e.response['Error']['Message']
+                  
+                  logger.error(f"AWS API Error evaluating feature: {error_code} - {error_message}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'X-Feature-Evaluation': 'aws-error'
+                      },
+                      'body': json.dumps({
+                          'success': False,
+                          'error': {
+                              'type': 'AWS_API_ERROR',
+                              'code': error_code,
+                              'message': error_message,
+                              'userId': user_id,
+                              'featureEnabled': False  # Safe default
+                          },
+                          'data': {
+                              'userId': user_id,
+                              'featureEnabled': False,
+                              'variation': 'disabled',
+                              'reason': 'error_fallback'
+                          }
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Unexpected error evaluating feature: {str(e)}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'X-Feature-Evaluation': 'unexpected-error'
+                      },
+                      'body': json.dumps({
+                          'success': False,
+                          'error': {
+                              'type': 'UNEXPECTED_ERROR',
+                              'message': 'Feature evaluation failed',
+                              'userId': user_id,
+                              'featureEnabled': False  # Safe default
+                          },
+                          'data': {
+                              'userId': user_id,
+                              'featureEnabled': False,
+                              'variation': 'disabled',
+                              'reason': 'error_fallback'
+                          }
+                      })
+                  }
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Purpose'
+          Value: 'Feature-Flag-Evaluation'
+
+  # CloudWatch Log Group for Lambda function
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${FeatureEvaluationFunction}'
+      RetentionInDays: 14
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Purpose'
+          Value: 'Lambda-Function-Logs'
+
+  # CloudWatch Alarms for monitoring
+  FeatureEvaluationErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-feature-evaluation-errors'
+      AlarmDescription: 'Monitors feature evaluation errors in Lambda function'
+      MetricName: 'Errors'
+      Namespace: 'AWS/Lambda'
+      Statistic: 'Sum'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: 'GreaterThanThreshold'
+      Dimensions:
+        - Name: 'FunctionName'
+          Value: !Ref FeatureEvaluationFunction
+      TreatMissingData: 'notBreaching'
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Purpose'
+          Value: 'Error-Monitoring'
+
+  FeatureEvaluationDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-feature-evaluation-duration'
+      AlarmDescription: 'Monitors feature evaluation duration in Lambda function'
+      MetricName: 'Duration'
+      Namespace: 'AWS/Lambda'
+      Statistic: 'Average'
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 5000
+      ComparisonOperator: 'GreaterThanThreshold'
+      Dimensions:
+        - Name: 'FunctionName'
+          Value: !Ref FeatureEvaluationFunction
+      TreatMissingData: 'notBreaching'
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Purpose'
+          Value: 'Performance-Monitoring'
+
+Outputs:
+  EvidentlyProjectName:
+    Description: 'Name of the CloudWatch Evidently project'
+    Value: !Ref EvidentlyProject
+    Export:
+      Name: !Sub '${AWS::StackName}-evidently-project'
+
+  EvidentlyProjectArn:
+    Description: 'ARN of the CloudWatch Evidently project'
+    Value: !Sub 'arn:aws:evidently:${AWS::Region}:${AWS::AccountId}:project/${EvidentlyProject}'
+    Export:
+      Name: !Sub '${AWS::StackName}-evidently-project-arn'
+
+  FeatureFlagName:
+    Description: 'Name of the feature flag'
+    Value: !Ref CheckoutFeatureFlag
+    Export:
+      Name: !Sub '${AWS::StackName}-feature-flag'
+
+  FeatureFlagArn:
+    Description: 'ARN of the feature flag'
+    Value: !Sub 'arn:aws:evidently:${AWS::Region}:${AWS::AccountId}:project/${EvidentlyProject}/feature/${CheckoutFeatureFlag}'
+    Export:
+      Name: !Sub '${AWS::StackName}-feature-flag-arn'
+
+  LaunchConfigurationName:
+    Description: 'Name of the launch configuration'
+    Value: !Ref GradualRolloutLaunch
+    Export:
+      Name: !Sub '${AWS::StackName}-launch-config'
+
+  LaunchConfigurationArn:
+    Description: 'ARN of the launch configuration'
+    Value: !Sub 'arn:aws:evidently:${AWS::Region}:${AWS::AccountId}:project/${EvidentlyProject}/launch/${GradualRolloutLaunch}'
+    Export:
+      Name: !Sub '${AWS::StackName}-launch-config-arn'
+
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function for feature evaluation'
+    Value: !Ref FeatureEvaluationFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-lambda-function'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function for feature evaluation'
+    Value: !GetAtt FeatureEvaluationFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-lambda-function-arn'
+
+  IAMRoleArn:
+    Description: 'ARN of the IAM role used by Lambda'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-iam-role-arn'
+
+  TreatmentTrafficPercentage:
+    Description: 'Percentage of traffic routed to treatment group'
+    Value: !Ref TreatmentTrafficPercentage
+    Export:
+      Name: !Sub '${AWS::StackName}-treatment-percentage'
+
+  EvidentlyLogGroup:
+    Condition: EnableDataDeliveryCondition
+    Description: 'CloudWatch Log Group for Evidently evaluations'
+    Value: !Ref EvidentlyLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-evidently-log-group'
+
+  TestLambdaCommand:
+    Description: 'AWS CLI command to test the Lambda function'
+    Value: !Sub |
+      aws lambda invoke --function-name ${FeatureEvaluationFunction} --payload '{"userId": "test-user-123"}' response.json && cat response.json
+
+  MonitoringDashboard:
+    Description: 'CloudWatch Console URL for monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Project Configuration'
+        Parameters:
+          - ProjectName
+          - FeatureName
+          - LaunchName
+      - Label:
+          default: 'Traffic Configuration'
+        Parameters:
+          - TreatmentTrafficPercentage
+          - AutoStartLaunch
+      - Label:
+          default: 'Lambda Configuration'
+        Parameters:
+          - LambdaRuntime
+      - Label:
+          default: 'Monitoring Configuration'
+        Parameters:
+          - EnableDataDelivery
+    ParameterLabels:
+      ProjectName:
+        default: 'Evidently Project Name'
+      FeatureName:
+        default: 'Feature Flag Name'
+      LaunchName:
+        default: 'Launch Configuration Name'
+      TreatmentTrafficPercentage:
+        default: 'Treatment Traffic Percentage'
+      LambdaRuntime:
+        default: 'Lambda Runtime Version'
+      EnableDataDelivery:
+        default: 'Enable Evaluation Logging'
+      AutoStartLaunch:
+        default: 'Auto-Start Launch'

@@ -1,0 +1,580 @@
+# Infrastructure Manager Configuration for Carbon-Aware Workload Orchestration
+# Recipe: Developing Carbon-Aware Workload Orchestration with Cloud Carbon Footprint and Cloud Workflows
+# This configuration creates a complete carbon-aware workload orchestration system
+# that leverages Google Cloud's Carbon Footprint APIs and Cloud Workflows
+
+imports:
+- path: https://www.googleapis.com/compute/v1/projects/{{ env["project"] }}/global/images/family/debian-11
+  name: debian-11
+
+resources:
+  # Enable required APIs for the carbon-aware orchestration system
+  - name: enable-compute-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: compute.googleapis.com
+      consumerId: project:{{ env["project"] }}
+
+  - name: enable-workflows-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: workflows.googleapis.com
+      consumerId: project:{{ env["project"] }}
+
+  - name: enable-cloudfunctions-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: cloudfunctions.googleapis.com
+      consumerId: project:{{ env["project"] }}
+
+  - name: enable-bigquery-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: bigquery.googleapis.com
+      consumerId: project:{{ env["project"] }}
+
+  - name: enable-bigquerydatatransfer-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: bigquerydatatransfer.googleapis.com
+      consumerId: project:{{ env["project"] }}
+
+  - name: enable-cloudscheduler-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: cloudscheduler.googleapis.com
+      consumerId: project:{{ env["project"] }}
+
+  - name: enable-pubsub-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: pubsub.googleapis.com
+      consumerId: project:{{ env["project"] }}
+
+  - name: enable-logging-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: logging.googleapis.com
+      consumerId: project:{{ env["project"] }}
+
+  - name: enable-monitoring-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: monitoring.googleapis.com
+      consumerId: project:{{ env["project"] }}
+
+  # Service account for carbon footprint data transfer and orchestration
+  - name: carbon-footprint-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: carbon-footprint-sa
+      serviceAccount:
+        displayName: Carbon Footprint Data Transfer Service Account
+        description: Service account for automated carbon footprint data exports and workload orchestration
+    metadata:
+      dependsOn:
+        - enable-compute-api
+
+  # IAM binding for BigQuery data transfer permissions
+  - name: carbon-footprint-bigquery-permissions
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.carbon-footprint-service-account.name)
+      role: roles/bigquery.dataTransfer.serviceAgent
+      member: serviceAccount:$(ref.carbon-footprint-service-account.email)
+
+  - name: carbon-footprint-bigquery-editor
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.carbon-footprint-service-account.name)
+      role: roles/bigquery.dataEditor
+      member: serviceAccount:$(ref.carbon-footprint-service-account.email)
+
+  # BigQuery dataset for carbon footprint data analysis
+  - name: carbon-footprint-dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      datasetId: {{ properties["datasetName"] | default("carbon_footprint_data") }}
+      location: {{ properties["region"] | default("us-central1") }}
+      description: Dataset for carbon footprint metrics and analysis
+      labels:
+        purpose: carbon-aware-orchestration
+        environment: production
+      access:
+        - role: OWNER
+          userByEmail: $(ref.carbon-footprint-service-account.email)
+        - role: READER
+          specialGroup: projectReaders
+        - role: WRITER
+          specialGroup: projectWriters
+    metadata:
+      dependsOn:
+        - enable-bigquery-api
+        - carbon-footprint-service-account
+
+  # BigQuery view for hourly carbon intensity analysis
+  - name: hourly-carbon-intensity-view
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      datasetId: $(ref.carbon-footprint-dataset.datasetId)
+      tableId: hourly_carbon_intensity
+      view:
+        query: |
+          SELECT
+            EXTRACT(HOUR FROM usage_month) as hour_of_day,
+            EXTRACT(DAYOFWEEK FROM usage_month) as day_of_week,
+            region,
+            AVG(carbon_footprint_total_kgCO2e) as avg_carbon_intensity,
+            COUNT(*) as sample_count,
+            STDDEV(carbon_footprint_total_kgCO2e) as carbon_variance
+          FROM `{{ env["project"] }}.$(ref.carbon-footprint-dataset.datasetId).carbon_footprint`
+          WHERE usage_month >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+          GROUP BY hour_of_day, day_of_week, region
+          ORDER BY avg_carbon_intensity ASC
+        useLegacySql: false
+      description: View providing hourly carbon intensity analysis for optimal scheduling
+    metadata:
+      dependsOn:
+        - carbon-footprint-dataset
+
+  # BigQuery view for optimal scheduling recommendations
+  - name: optimal-scheduling-windows-view
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      datasetId: $(ref.carbon-footprint-dataset.datasetId)
+      tableId: optimal_scheduling_windows
+      view:
+        query: |
+          SELECT
+            hour_of_day,
+            day_of_week,
+            region,
+            avg_carbon_intensity,
+            CASE 
+              WHEN avg_carbon_intensity < (SELECT PERCENTILE_CONT(avg_carbon_intensity, 0.25) OVER() FROM `{{ env["project"] }}.$(ref.carbon-footprint-dataset.datasetId).hourly_carbon_intensity`) THEN 'GREEN'
+              WHEN avg_carbon_intensity < (SELECT PERCENTILE_CONT(avg_carbon_intensity, 0.75) OVER() FROM `{{ env["project"] }}.$(ref.carbon-footprint-dataset.datasetId).hourly_carbon_intensity`) THEN 'YELLOW'
+              ELSE 'RED'
+            END as carbon_tier
+          FROM `{{ env["project"] }}.$(ref.carbon-footprint-dataset.datasetId).hourly_carbon_intensity`
+          WHERE sample_count > 5
+        useLegacySql: false
+      description: View providing carbon tier classifications for scheduling decisions
+    metadata:
+      dependsOn:
+        - hourly-carbon-intensity-view
+
+  # Pub/Sub topic for carbon-aware scheduling decisions
+  - name: carbon-aware-decisions-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/{{ env["project"] }}/topics/carbon-aware-decisions
+      labels:
+        purpose: carbon-orchestration
+        component: messaging
+    metadata:
+      dependsOn:
+        - enable-pubsub-api
+
+  # Pub/Sub subscription for workflow consumption
+  - name: carbon-aware-workflow-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/{{ env["project"] }}/subscriptions/carbon-aware-workflow-sub
+      topic: $(ref.carbon-aware-decisions-topic.name)
+      ackDeadlineSeconds: 60
+      labels:
+        purpose: carbon-orchestration
+        component: workflow-integration
+    metadata:
+      dependsOn:
+        - carbon-aware-decisions-topic
+
+  # Pub/Sub topic for workload execution status
+  - name: workload-execution-status-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/{{ env["project"] }}/topics/workload-execution-status
+      labels:
+        purpose: carbon-orchestration
+        component: status-tracking
+    metadata:
+      dependsOn:
+        - enable-pubsub-api
+
+  # Pub/Sub subscription for monitoring workload status
+  - name: workload-status-monitoring-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/{{ env["project"] }}/subscriptions/workload-status-monitoring
+      topic: $(ref.workload-execution-status-topic.name)
+      ackDeadlineSeconds: 300
+      labels:
+        purpose: carbon-orchestration
+        component: monitoring
+    metadata:
+      dependsOn:
+        - workload-execution-status-topic
+
+  # Cloud Storage bucket for Cloud Function source code
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: {{ env["project"] }}-carbon-function-source
+      location: {{ properties["region"] | default("us-central1") }}
+      storageClass: STANDARD
+      labels:
+        purpose: carbon-orchestration
+        component: function-source
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+      versioning:
+        enabled: true
+    metadata:
+      dependsOn:
+        - enable-cloudfunctions-api
+
+  # Upload Cloud Function source code to bucket
+  - name: function-source-object
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: $(ref.function-source-bucket.name)
+      name: carbon-scheduler-source.zip
+      # Note: In a real deployment, this would reference a pre-built ZIP file
+      # For this template, we're creating a placeholder
+      metadata:
+        description: Carbon-aware scheduling function source code
+    metadata:
+      dependsOn:
+        - function-source-bucket
+
+  # Cloud Function for carbon-aware scheduling logic
+  - name: carbon-aware-scheduler-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/{{ env["project"] }}/locations/{{ properties["region"] | default("us-central1") }}
+      function:
+        name: {{ properties["functionName"] | default("workload-scheduler") }}
+        description: Carbon-aware scheduling decision engine
+        sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/$(ref.function-source-object.name)
+        entryPoint: carbon_aware_scheduler
+        runtime: python311
+        timeout: 60s
+        availableMemoryMb: 256
+        environmentVariables:
+          DATASET_ID: $(ref.carbon-footprint-dataset.datasetId)
+          PROJECT_ID: {{ env["project"] }}
+        httpsTrigger: {}
+        labels:
+          purpose: carbon-orchestration
+          component: scheduling-engine
+    metadata:
+      dependsOn:
+        - enable-cloudfunctions-api
+        - function-source-object
+        - carbon-footprint-dataset
+
+  # IAM binding to allow unauthenticated invocation of the function
+  - name: function-invoker-binding
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions.setIamPolicy
+    properties:
+      resource: $(ref.carbon-aware-scheduler-function.name)
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - carbon-aware-scheduler-function
+
+  # Cloud Workflows definition for carbon-aware orchestration
+  - name: carbon-aware-orchestration-workflow
+    type: gcp-types/workflows-v1:projects.locations.workflows
+    properties:
+      parent: projects/{{ env["project"] }}/locations/{{ properties["region"] | default("us-central1") }}
+      workflowId: {{ properties["workflowName"] | default("carbon-aware-orchestrator") }}
+      workflow:
+        description: Carbon-aware workload orchestration system
+        labels:
+          purpose: carbon-orchestration
+          component: workflow-engine
+        sourceContents: |
+          main:
+            params: [args]
+            steps:
+              - initialize:
+                  assign:
+                    - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+                    - workload_id: ${args.workload_id}
+                    - workload_type: ${default(args.workload_type, "standard")}
+                    - urgency: ${default(args.urgency, "normal")}
+                    - region: ${default(args.region, "us-central1")}
+                    - max_delay_hours: ${default(args.max_delay_hours, 8)}
+              
+              - log_workflow_start:
+                  call: sys.log
+                  args:
+                    data: ${"Starting carbon-aware orchestration for workload: " + workload_id}
+                    severity: "INFO"
+              
+              - get_carbon_decision:
+                  call: http.post
+                  args:
+                    url: $(ref.carbon-aware-scheduler-function.httpsTrigger.url)
+                    headers:
+                      Content-Type: "application/json"
+                    body:
+                      workload_type: ${workload_type}
+                      urgency: ${urgency}
+                      region: ${region}
+                      workload_id: ${workload_id}
+                  result: carbon_decision_response
+              
+              - parse_carbon_decision:
+                  assign:
+                    - carbon_decision: ${json.decode(carbon_decision_response.body)}
+              
+              - log_decision:
+                  call: sys.log
+                  args:
+                    data: ${"Carbon decision: " + carbon_decision.action + " - " + carbon_decision.reason}
+                    severity: "INFO"
+              
+              - return_result:
+                  return: ${carbon_decision}
+    metadata:
+      dependsOn:
+        - enable-workflows-api
+        - carbon-aware-scheduler-function
+
+  # Compute instance template for carbon-aware workloads
+  - name: carbon-aware-instance-template
+    type: gcp-types/compute-v1:instanceTemplates
+    properties:
+      name: {{ properties["instanceTemplateName"] | default("carbon-aware-template") }}
+      description: Instance template optimized for carbon-aware workload execution
+      properties:
+        machineType: e2-standard-2  # Energy-efficient E2 instance type
+        disks:
+          - boot: true
+            autoDelete: true
+            initializeParams:
+              sourceImage: projects/debian-cloud/global/images/family/debian-11
+              diskSizeGb: 50
+              diskType: pd-standard
+        networkInterfaces:
+          - network: global/networks/default
+            accessConfigs:
+              - type: ONE_TO_ONE_NAT
+                name: External NAT
+        labels:
+          purpose: carbon-aware-workload
+          energy-efficient: "true"
+        metadata:
+          items:
+            - key: startup-script
+              value: |
+                #!/bin/bash
+                echo "Starting carbon-aware workload execution..."
+                # Log startup to Cloud Logging
+                gcloud logging write carbon-workload-logs "Carbon-aware workload instance started" --severity=INFO
+                # Workload-specific execution logic would go here
+                echo "Workload execution environment ready"
+        tags:
+          items:
+            - carbon-aware-workload
+            - energy-efficient
+        serviceAccounts:
+          - email: $(ref.carbon-footprint-service-account.email)
+            scopes:
+              - https://www.googleapis.com/auth/cloud-platform
+    metadata:
+      dependsOn:
+        - enable-compute-api
+        - carbon-footprint-service-account
+
+  # Cloud Scheduler job for daily batch processing
+  - name: daily-batch-carbon-scheduler
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/{{ env["project"] }}/locations/{{ properties["region"] | default("us-central1") }}
+      job:
+        name: daily-batch-carbon-aware
+        description: Daily batch processing with carbon-aware scheduling
+        schedule: "0 2 * * *"
+        timeZone: America/New_York
+        httpTarget:
+          uri: https://workflowexecutions.googleapis.com/v1/$(ref.carbon-aware-orchestration-workflow.name)/executions
+          httpMethod: POST
+          headers:
+            Content-Type: application/json
+          body: |
+            {
+              "argument": "{\"workload_id\":\"daily-batch\",\"workload_type\":\"batch_processing\",\"urgency\":\"normal\",\"region\":\"{{ properties["region"] | default("us-central1") }}\",\"max_delay_hours\":6}"
+            }
+          oidcToken:
+            serviceAccountEmail: $(ref.carbon-footprint-service-account.email)
+    metadata:
+      dependsOn:
+        - enable-cloudscheduler-api
+        - carbon-aware-orchestration-workflow
+
+  # Cloud Scheduler job for weekly analytics
+  - name: weekly-analytics-carbon-scheduler
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/{{ env["project"] }}/locations/{{ properties["region"] | default("us-central1") }}
+      job:
+        name: weekly-analytics-carbon-aware
+        description: Weekly analytics processing optimized for low carbon periods
+        schedule: "0 1 * * 0"
+        timeZone: UTC
+        httpTarget:
+          uri: https://workflowexecutions.googleapis.com/v1/$(ref.carbon-aware-orchestration-workflow.name)/executions
+          httpMethod: POST
+          headers:
+            Content-Type: application/json
+          body: |
+            {
+              "argument": "{\"workload_id\":\"weekly-analytics\",\"workload_type\":\"analytics\",\"urgency\":\"low\",\"region\":\"{{ properties["region"] | default("us-central1") }}\",\"max_delay_hours\":24}"
+            }
+          oidcToken:
+            serviceAccountEmail: $(ref.carbon-footprint-service-account.email)
+    metadata:
+      dependsOn:
+        - enable-cloudscheduler-api
+        - carbon-aware-orchestration-workflow
+
+  # Cloud Monitoring alert policy for high carbon intensity
+  - name: high-carbon-intensity-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: High Carbon Intensity Alert
+      documentation:
+        content: Alert when carbon intensity is consistently high, indicating suboptimal scheduling conditions
+        mimeType: text/markdown
+      conditions:
+        - displayName: Carbon Intensity High
+          conditionThreshold:
+            filter: resource.type="cloud_function" AND metric.type="custom.googleapis.com/carbon-workload-emissions"
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 0.8
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_MEAN
+      alertStrategy:
+        autoClose: 1800s
+      enabled: true
+      combiner: OR
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+        - carbon-aware-scheduler-function
+
+# Output configuration providing essential resource information
+outputs:
+  - name: carbon_footprint_dataset_id
+    value: $(ref.carbon-footprint-dataset.datasetId)
+    description: BigQuery dataset ID for carbon footprint analysis
+
+  - name: carbon_scheduler_function_url
+    value: $(ref.carbon-aware-scheduler-function.httpsTrigger.url)
+    description: URL of the carbon-aware scheduling Cloud Function
+
+  - name: carbon_workflow_name
+    value: $(ref.carbon-aware-orchestration-workflow.name)
+    description: Full name of the carbon-aware orchestration workflow
+
+  - name: service_account_email
+    value: $(ref.carbon-footprint-service-account.email)
+    description: Email of the carbon footprint service account
+
+  - name: instance_template_name
+    value: $(ref.carbon-aware-instance-template.name)
+    description: Name of the carbon-aware compute instance template
+
+  - name: carbon_decisions_topic
+    value: $(ref.carbon-aware-decisions-topic.name)
+    description: Pub/Sub topic for carbon-aware scheduling decisions
+
+  - name: workload_status_topic
+    value: $(ref.workload-execution-status-topic.name)
+    description: Pub/Sub topic for workload execution status updates
+
+  - name: daily_scheduler_job
+    value: $(ref.daily-batch-carbon-scheduler.name)
+    description: Cloud Scheduler job for daily batch processing
+
+  - name: weekly_scheduler_job
+    value: $(ref.weekly-analytics-carbon-scheduler.name)
+    description: Cloud Scheduler job for weekly analytics processing
+
+# Schema definition for template parameters
+schema:
+  info:
+    title: Carbon-Aware Workload Orchestration Infrastructure
+    description: Complete infrastructure for carbon-aware workload orchestration using Google Cloud services
+    version: "1.0"
+
+  imports:
+    - path: main.yaml
+
+  required:
+    - project
+
+  properties:
+    project:
+      type: string
+      description: Google Cloud Project ID where resources will be created
+
+    region:
+      type: string
+      default: us-central1
+      description: Primary region for resource deployment
+      enum:
+        - us-central1
+        - us-east1
+        - us-west1
+        - europe-west1
+        - asia-northeast1
+
+    datasetName:
+      type: string
+      default: carbon_footprint_data
+      description: Name for the BigQuery dataset storing carbon footprint metrics
+      pattern: "^[a-zA-Z0-9_]+$"
+
+    functionName:
+      type: string
+      default: workload-scheduler
+      description: Name for the carbon-aware scheduling Cloud Function
+      pattern: "^[a-z]([a-z0-9-]*[a-z0-9])?$"
+
+    workflowName:
+      type: string
+      default: carbon-aware-orchestrator
+      description: Name for the carbon-aware orchestration workflow
+      pattern: "^[a-z]([a-z0-9-]*[a-z0-9])?$"
+
+    instanceTemplateName:
+      type: string
+      default: carbon-aware-template
+      description: Name for the carbon-optimized compute instance template
+      pattern: "^[a-z]([a-z0-9-]*[a-z0-9])?$"
+
+    enableScheduledJobs:
+      type: boolean
+      default: true
+      description: Whether to create scheduled jobs for automated carbon-aware orchestration
+
+    enableMonitoring:
+      type: boolean
+      default: true
+      description: Whether to create monitoring and alerting for carbon metrics
+
+  additionalProperties: false

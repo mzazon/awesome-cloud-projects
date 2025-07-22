@@ -1,0 +1,532 @@
+# Infrastructure Manager Configuration for Data Pipeline Recovery Workflows
+# This configuration deploys a complete data pipeline recovery system using
+# Dataform, Cloud Tasks, Cloud Functions, and Cloud Monitoring
+
+# Import required modules
+imports:
+  - path: https://github.com/GoogleCloudPlatform/cloud-foundation-fabric/tree/master/modules/bigquery-dataset
+    name: bigquery-dataset
+  - path: https://github.com/GoogleCloudPlatform/cloud-foundation-fabric/tree/master/modules/cloud-function-v2
+    name: cloud-function-v2
+  - path: https://github.com/GoogleCloudPlatform/cloud-foundation-fabric/tree/master/modules/pubsub
+    name: pubsub
+
+# Configuration variables with validation
+resources:
+  # Random suffix for unique resource naming
+  - name: random-suffix
+    type: gcp-types/cloudfunctions-v1:generateRandom
+    properties:
+      length: 6
+      special: false
+      upper: false
+
+  # BigQuery dataset for pipeline data and monitoring
+  - name: pipeline-dataset
+    type: bigquery.v2.dataset
+    properties:
+      datasetId: pipeline-monitoring-$(ref.random-suffix.result)
+      projectId: $(ref.project-id)
+      location: $(ref.region)
+      description: Dataset for pipeline recovery demo with monitoring tables
+      labels:
+        environment: demo
+        component: data-pipeline
+        purpose: monitoring
+      access:
+        - role: OWNER
+          userByEmail: $(ref.service-account-email)
+        - role: READER
+          specialGroup: projectReaders
+        - role: WRITER
+          specialGroup: projectWriters
+
+  # Source table for pipeline input data
+  - name: source-data-table
+    type: bigquery.v2.table
+    properties:
+      projectId: $(ref.project-id)
+      datasetId: $(ref.pipeline-dataset.datasetId)
+      tableId: source_data
+      description: Source table for pipeline input data
+      schema:
+        fields:
+          - name: id
+            type: INTEGER
+            mode: REQUIRED
+            description: Unique identifier for records
+          - name: name
+            type: STRING
+            mode: REQUIRED
+            description: Record name
+          - name: timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: Record creation timestamp
+          - name: status
+            type: STRING
+            mode: REQUIRED
+            description: Processing status
+      labels:
+        table-type: source
+        data-classification: internal
+
+  # Processed data table for pipeline output
+  - name: processed-data-table
+    type: bigquery.v2.table
+    properties:
+      projectId: $(ref.project-id)
+      datasetId: $(ref.pipeline-dataset.datasetId)
+      tableId: processed_data
+      description: Target table for processed pipeline output
+      schema:
+        fields:
+          - name: id
+            type: INTEGER
+            mode: REQUIRED
+          - name: processed_name
+            type: STRING
+            mode: REQUIRED
+            description: Processed version of the name field
+          - name: processing_time
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: When the record was processed
+          - name: batch_id
+            type: STRING
+            mode: REQUIRED
+            description: Unique batch identifier for processing run
+      labels:
+        table-type: target
+        data-classification: internal
+
+  # Dataform repository for pipeline definitions
+  - name: dataform-repository
+    type: dataform.v1beta1.repository
+    properties:
+      repositoryId: pipeline-recovery-repo-$(ref.random-suffix.result)
+      parent: projects/$(ref.project-id)/locations/$(ref.region)
+      displayName: Pipeline Recovery Repository
+      description: Dataform repository for data pipeline recovery demo
+      gitRemoteSettings:
+        # Note: In production, connect to actual Git repository
+        url: https://github.com/example/pipeline-recovery.git
+        defaultBranch: main
+        authenticationTokenSecretVersion: projects/$(ref.project-id)/secrets/dataform-git-token/versions/latest
+      labels:
+        environment: demo
+        component: dataform
+        purpose: pipeline-recovery
+
+  # Dataform workspace for development
+  - name: dataform-workspace
+    type: dataform.v1beta1.workspace
+    properties:
+      workspaceId: main-workspace
+      parent: $(ref.dataform-repository.name)
+      displayName: Main Workspace
+      description: Primary workspace for pipeline development
+    dependsOn:
+      - dataform-repository
+
+  # Cloud Tasks queue for recovery management
+  - name: recovery-task-queue
+    type: cloudtasks.v2.queue
+    properties:
+      name: projects/$(ref.project-id)/locations/$(ref.region)/queues/pipeline-recovery-queue-$(ref.random-suffix.result)
+      parent: projects/$(ref.project-id)/locations/$(ref.region)
+      displayName: Pipeline Recovery Queue
+      # Optimized retry configuration for pipeline recovery
+      retryConfig:
+        maxAttempts: 5
+        minBackoff: 30s
+        maxBackoff: 300s
+        maxRetryDuration: 3600s
+        maxDoublings: 3
+      # Rate limiting to prevent overwhelming downstream systems
+      rateLimits:
+        maxDispatchesPerSecond: 10.0
+        maxConcurrentDispatches: 5
+        maxBurstSize: 10
+      labels:
+        environment: demo
+        component: cloud-tasks
+        purpose: pipeline-recovery
+
+  # Pub/Sub topic for notifications
+  - name: notification-topic
+    type: pubsub.v1.topic
+    properties:
+      name: projects/$(ref.project-id)/topics/pipeline-notifications
+      displayName: Pipeline Notifications
+      description: Topic for pipeline recovery notifications
+      labels:
+        environment: demo
+        component: pubsub
+        purpose: notifications
+      messageRetentionDuration: 604800s  # 7 days
+      messageStoragePolicy:
+        allowedPersistenceRegions:
+          - $(ref.region)
+
+  # Service account for Cloud Functions
+  - name: pipeline-recovery-service-account
+    type: iam.v1.serviceAccount
+    properties:
+      accountId: pipeline-recovery-sa-$(ref.random-suffix.result)
+      projectId: $(ref.project-id)
+      displayName: Pipeline Recovery Service Account
+      description: Service account for pipeline recovery Cloud Functions
+
+  # IAM bindings for service account
+  - name: dataform-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id)
+      role: roles/dataform.admin
+      member: serviceAccount:$(ref.pipeline-recovery-service-account.email)
+
+  - name: tasks-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id)
+      role: roles/cloudtasks.admin
+      member: serviceAccount:$(ref.pipeline-recovery-service-account.email)
+
+  - name: pubsub-publisher-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id)
+      role: roles/pubsub.publisher
+      member: serviceAccount:$(ref.pipeline-recovery-service-account.email)
+
+  - name: logging-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id)
+      role: roles/logging.logWriter
+      member: serviceAccount:$(ref.pipeline-recovery-service-account.email)
+
+  - name: bigquery-user-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id)
+      role: roles/bigquery.user
+      member: serviceAccount:$(ref.pipeline-recovery-service-account.email)
+
+  # Cloud Storage bucket for function source code
+  - name: function-source-bucket
+    type: storage.v1.bucket
+    properties:
+      name: pipeline-recovery-functions-$(ref.project-id)-$(ref.random-suffix.result)
+      location: $(ref.region)
+      storageClass: REGIONAL
+      labels:
+        environment: demo
+        component: cloud-storage
+        purpose: function-source
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              matchesStorageClass:
+                - REGIONAL
+      versioning:
+        enabled: true
+
+  # Cloud Storage object for controller function source
+  - name: controller-function-source
+    type: storage.v1.object
+    properties:
+      name: controller-function-source.zip
+      bucket: $(ref.function-source-bucket.name)
+      # In production, upload actual source code ZIP file
+      source: |
+        const {CloudTasksClient} = require('@google-cloud/tasks');
+        const {Logging} = require('@google-cloud/logging');
+        
+        const tasksClient = new CloudTasksClient();
+        const logging = new Logging();
+        const log = logging.log('pipeline-controller');
+        
+        exports.handlePipelineAlert = async (req, res) => {
+          try {
+            const alertData = req.body;
+            
+            // Extract pipeline failure details from monitoring alert
+            const pipelineId = alertData.incident?.resource?.labels?.pipeline_id || 'unknown';
+            const failureType = alertData.incident?.condition_name || 'general_failure';
+            const severity = alertData.incident?.state || 'OPEN';
+            
+            await log.write(log.entry('INFO', {
+              message: 'Processing pipeline failure alert',
+              pipelineId,
+              failureType,
+              severity
+            }));
+            
+            // Determine recovery strategy based on failure type
+            const recoveryAction = determineRecoveryAction(failureType);
+            
+            // Create recovery task with exponential backoff
+            const taskPayload = {
+              pipelineId,
+              failureType,
+              recoveryAction,
+              attemptCount: 0,
+              timestamp: new Date().toISOString()
+            };
+            
+            await enqueueRecoveryTask(taskPayload);
+            
+            res.status(200).send('Recovery task enqueued successfully');
+            
+          } catch (error) {
+            await log.write(log.entry('ERROR', {
+              message: 'Failed to process pipeline alert',
+              error: error.message
+            }));
+            res.status(500).send('Error processing alert');
+          }
+        };
+
+  # Pipeline Controller Cloud Function
+  - name: pipeline-controller-function
+    type: cloudfunctions.v1.cloudFunction
+    properties:
+      name: projects/$(ref.project-id)/locations/$(ref.region)/functions/pipeline-controller-$(ref.random-suffix.result)
+      description: Handles pipeline failure alerts and orchestrates recovery
+      sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/controller-function-source.zip
+      entryPoint: handlePipelineAlert
+      runtime: nodejs18
+      timeout: 540s
+      availableMemoryMb: 256
+      serviceAccountEmail: $(ref.pipeline-recovery-service-account.email)
+      httpsTrigger: {}
+      environmentVariables:
+        PROJECT_ID: $(ref.project-id)
+        REGION: $(ref.region)
+        TASK_QUEUE: $(ref.recovery-task-queue.name)
+        DATAFORM_REPO: $(ref.dataform-repository.name)
+      labels:
+        environment: demo
+        component: cloud-functions
+        purpose: pipeline-controller
+    dependsOn:
+      - pipeline-recovery-service-account
+      - recovery-task-queue
+      - function-source-bucket
+      - controller-function-source
+
+  # Recovery Worker Cloud Function
+  - name: recovery-worker-function
+    type: cloudfunctions.v1.cloudFunction
+    properties:
+      name: projects/$(ref.project-id)/locations/$(ref.region)/functions/recovery-worker-$(ref.random-suffix.result)
+      description: Executes pipeline recovery tasks with intelligent retry logic
+      sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/worker-function-source.zip
+      entryPoint: executeRecovery
+      runtime: nodejs18
+      timeout: 540s
+      availableMemoryMb: 512
+      serviceAccountEmail: $(ref.pipeline-recovery-service-account.email)
+      httpsTrigger: {}
+      environmentVariables:
+        PROJECT_ID: $(ref.project-id)
+        REGION: $(ref.region)
+        DATAFORM_REPO: $(ref.dataform-repository.name)
+        NOTIFICATION_TOPIC: $(ref.notification-topic.name)
+      labels:
+        environment: demo
+        component: cloud-functions
+        purpose: recovery-worker
+    dependsOn:
+      - pipeline-recovery-service-account
+      - dataform-repository
+      - notification-topic
+
+  # Notification Handler Cloud Function
+  - name: notification-handler-function
+    type: cloudfunctions.v1.cloudFunction
+    properties:
+      name: projects/$(ref.project-id)/locations/$(ref.region)/functions/notification-handler-$(ref.random-suffix.result)
+      description: Processes recovery notifications and sends stakeholder alerts
+      sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/notification-function-source.zip
+      entryPoint: handleNotification
+      runtime: nodejs18
+      timeout: 540s
+      availableMemoryMb: 256
+      serviceAccountEmail: $(ref.pipeline-recovery-service-account.email)
+      eventTrigger:
+        eventType: providers/cloud.pubsub/eventTypes/topic.publish
+        resource: $(ref.notification-topic.name)
+      environmentVariables:
+        PROJECT_ID: $(ref.project-id)
+        NOTIFICATION_RECIPIENTS: admin@company.com,ops-team@company.com
+      labels:
+        environment: demo
+        component: cloud-functions
+        purpose: notification-handler
+    dependsOn:
+      - pipeline-recovery-service-account
+      - notification-topic
+
+  # Log-based metric for pipeline execution tracking
+  - name: pipeline-execution-metric
+    type: logging.v2.metric
+    properties:
+      name: projects/$(ref.project-id)/metrics/pipeline_execution_status
+      description: Tracks Dataform pipeline execution status and failures
+      filter: 'resource.type="dataform_repository" AND jsonPayload.status="FAILED"'
+      metricDescriptor:
+        metricKind: GAUGE
+        valueType: INT64
+        displayName: Pipeline Execution Status
+        description: Number of failed pipeline executions
+      labelExtractors:
+        pipeline_id: EXTRACT(jsonPayload.pipeline_id)
+        failure_type: EXTRACT(jsonPayload.failure_type)
+
+  # Webhook notification channel for alerts
+  - name: webhook-notification-channel
+    type: monitoring.v1.notificationChannel
+    properties:
+      name: projects/$(ref.project-id)/notificationChannels/pipeline-recovery-webhook
+      type: webhook_tokenauth
+      displayName: Pipeline Recovery Webhook
+      description: Webhook endpoint for pipeline failure notifications
+      labels:
+        url: $(ref.pipeline-controller-function.httpsTrigger.url)
+      enabled: true
+
+  # Monitoring alert policy for pipeline failures
+  - name: pipeline-failure-alert-policy
+    type: monitoring.v1.alertPolicy
+    properties:
+      name: projects/$(ref.project-id)/alertPolicies/dataform-pipeline-failure
+      displayName: Dataform Pipeline Failure Alert
+      documentation:
+        content: |
+          This alert triggers when Dataform pipeline workflows fail,
+          automatically initiating the recovery workflow through Cloud Tasks.
+          
+          The alert sends notifications to the pipeline controller function
+          which analyzes the failure and determines appropriate recovery actions.
+        mimeType: text/markdown
+      conditions:
+        - displayName: Dataform workflow failure condition
+          conditionThreshold:
+            filter: 'resource.type="dataform_repository" AND severity>=ERROR'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 0
+            duration: 60s
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_SUM
+                groupByFields:
+                  - resource.label.repository_id
+      notificationChannels:
+        - $(ref.webhook-notification-channel.name)
+      alertStrategy:
+        autoClose: 1800s  # Auto-close after 30 minutes
+      enabled: true
+    dependsOn:
+      - webhook-notification-channel
+      - pipeline-controller-function
+
+# Configuration parameters
+properties:
+  # Project configuration
+  project-id:
+    type: string
+    description: Google Cloud Project ID
+    default: ${PROJECT_ID}
+  
+  region:
+    type: string
+    description: Google Cloud region for resources
+    default: us-central1
+    enum:
+      - us-central1
+      - us-east1
+      - us-west1
+      - europe-west1
+      - asia-southeast1
+  
+  # Service account configuration
+  service-account-email:
+    type: string
+    description: Email of the service account for resource access
+    default: $(ref.pipeline-recovery-service-account.email)
+
+# Outputs for integration and verification
+outputs:
+  # Infrastructure information
+  - name: dataset-id
+    description: BigQuery dataset ID for pipeline monitoring
+    value: $(ref.pipeline-dataset.datasetId)
+  
+  - name: dataform-repository-name
+    description: Dataform repository name for pipeline definitions
+    value: $(ref.dataform-repository.name)
+  
+  - name: task-queue-name
+    description: Cloud Tasks queue name for recovery operations
+    value: $(ref.recovery-task-queue.name)
+  
+  # Function endpoints
+  - name: controller-function-url
+    description: Pipeline controller function HTTP trigger URL
+    value: $(ref.pipeline-controller-function.httpsTrigger.url)
+  
+  - name: worker-function-name
+    description: Recovery worker function name
+    value: $(ref.recovery-worker-function.name)
+  
+  - name: notification-function-name
+    description: Notification handler function name
+    value: $(ref.notification-handler-function.name)
+  
+  # Monitoring resources
+  - name: notification-topic-name
+    description: Pub/Sub topic for pipeline notifications
+    value: $(ref.notification-topic.name)
+  
+  - name: alert-policy-name
+    description: Monitoring alert policy for pipeline failures
+    value: $(ref.pipeline-failure-alert-policy.name)
+  
+  # Service account information
+  - name: service-account-email
+    description: Service account email for pipeline recovery system
+    value: $(ref.pipeline-recovery-service-account.email)
+  
+  # Testing and validation
+  - name: source-table-name
+    description: Source data table for pipeline testing
+    value: $(ref.source-data-table.tableId)
+  
+  - name: processed-table-name
+    description: Processed data table for pipeline output
+    value: $(ref.processed-data-table.tableId)
+
+# Metadata for deployment tracking
+metadata:
+  version: 1.0
+  description: Infrastructure Manager configuration for Data Pipeline Recovery Workflows
+  author: Infrastructure Manager Generator
+  created: 2025-07-12
+  recipe-id: 7f8a9c2d
+  recipe-title: Data Pipeline Recovery Workflows with Dataform and Cloud Tasks
+  tags:
+    - data-pipeline
+    - automation
+    - monitoring
+    - error-recovery
+    - dataform
+    - cloud-tasks
+    - infrastructure-manager
+    - gcp

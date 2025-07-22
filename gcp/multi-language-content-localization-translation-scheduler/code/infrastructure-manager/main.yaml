@@ -1,0 +1,412 @@
+# Infrastructure Manager Configuration for Multi-Language Content Localization Workflows
+# This configuration deploys Cloud Translation Advanced, Cloud Scheduler, Cloud Storage, 
+# Pub/Sub, and Cloud Functions to create an automated content localization pipeline.
+
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Enable required Google Cloud APIs for the translation workflow
+enable-translate-api:
+  type: gcp-types/serviceusage-v1:serviceusage.services.batchEnable
+  properties:
+    parent: projects/{{ env["project"] }}
+    serviceIds:
+      - translate.googleapis.com
+      - storage.googleapis.com
+      - pubsub.googleapis.com
+      - cloudfunctions.googleapis.com
+      - cloudscheduler.googleapis.com
+      - cloudbuild.googleapis.com
+  metadata:
+    dependsOn: []
+
+# Create Cloud Storage bucket for source content
+source-content-bucket:
+  type: gcp-types/storage-v1:storage.buckets
+  properties:
+    bucket: source-content-{{ env["deployment"] }}-{{ env["project"] }}
+    project: {{ env["project"] }}
+    location: {{ properties["region"] }}
+    storageClass: STANDARD
+    versioning:
+      enabled: true
+    lifecycleConfiguration:
+      rule:
+        - action:
+            type: Delete
+          condition:
+            age: 365
+            isLive: false
+    iamConfiguration:
+      uniformBucketLevelAccess:
+        enabled: true
+  metadata:
+    dependsOn:
+      - enable-translate-api
+
+# Create Cloud Storage bucket for translated content with organized structure
+translated-content-bucket:
+  type: gcp-types/storage-v1:storage.buckets
+  properties:
+    bucket: translated-content-{{ env["deployment"] }}-{{ env["project"] }}
+    project: {{ env["project"] }}
+    location: {{ properties["region"] }}
+    storageClass: STANDARD
+    versioning:
+      enabled: true
+    lifecycleConfiguration:
+      rule:
+        - action:
+            type: SetStorageClass
+            storageClass: NEARLINE
+          condition:
+            age: 30
+        - action:
+            type: SetStorageClass
+            storageClass: COLDLINE
+          condition:
+            age: 90
+    iamConfiguration:
+      uniformBucketLevelAccess:
+        enabled: true
+  metadata:
+    dependsOn:
+      - enable-translate-api
+
+# Create Pub/Sub topic for translation workflow events
+translation-workflow-topic:
+  type: gcp-types/pubsub-v1:projects.topics
+  properties:
+    name: projects/{{ env["project"] }}/topics/translation-workflow-{{ env["deployment"] }}
+    messageStoragePolicy:
+      allowedPersistenceRegions:
+        - {{ properties["region"] }}
+  metadata:
+    dependsOn:
+      - enable-translate-api
+
+# Create Pub/Sub subscription for Cloud Function processing
+translation-workflow-subscription:
+  type: gcp-types/pubsub-v1:projects.subscriptions
+  properties:
+    name: projects/{{ env["project"] }}/subscriptions/translation-workflow-{{ env["deployment"] }}-sub
+    topic: $(ref.translation-workflow-topic.name)
+    ackDeadlineSeconds: 600
+    messageRetentionDuration: 604800s  # 7 days
+    retryPolicy:
+      minimumBackoff: 10s
+      maximumBackoff: 600s
+    deadLetterPolicy:
+      deadLetterTopic: $(ref.translation-workflow-topic.name)
+      maxDeliveryAttempts: 5
+  metadata:
+    dependsOn:
+      - translation-workflow-topic
+
+# Create service account for Cloud Function with appropriate permissions
+translation-function-service-account:
+  type: gcp-types/iam-v1:projects.serviceAccounts
+  properties:
+    accountId: translation-function-sa-{{ env["deployment"] }}
+    serviceAccount:
+      displayName: Translation Function Service Account
+      description: Service account for automated translation processing function
+  metadata:
+    dependsOn:
+      - enable-translate-api
+
+# Grant Cloud Translation API usage permissions to service account
+translation-api-permission:
+  type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+  properties:
+    resource: {{ env["project"] }}
+    role: roles/cloudtranslate.user
+    member: serviceAccount:$(ref.translation-function-service-account.email)
+  metadata:
+    dependsOn:
+      - translation-function-service-account
+
+# Grant Cloud Storage object admin permissions for bucket access
+storage-admin-permission:
+  type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+  properties:
+    resource: {{ env["project"] }}
+    role: roles/storage.objectAdmin
+    member: serviceAccount:$(ref.translation-function-service-account.email)
+  metadata:
+    dependsOn:
+      - translation-function-service-account
+
+# Grant Pub/Sub subscriber permissions for message processing
+pubsub-subscriber-permission:
+  type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+  properties:
+    resource: {{ env["project"] }}
+    role: roles/pubsub.subscriber
+    member: serviceAccount:$(ref.translation-function-service-account.email)
+  metadata:
+    dependsOn:
+      - translation-function-service-account
+
+# Create Cloud Function for translation processing with enterprise-grade configuration
+translation-processor-function:
+  type: gcp-types/cloudfunctions-v1:projects.locations.functions
+  properties:
+    location: projects/{{ env["project"] }}/locations/{{ properties["region"] }}
+    function:
+      name: translation-processor-{{ env["deployment"] }}
+      description: Automated document translation processing function
+      sourceArchiveUrl: gs://{{ properties["functionSourceBucket"] }}/function-source.zip
+      entryPoint: translate_document
+      runtime: python39
+      timeout: 540s
+      availableMemoryMb: 512
+      maxInstances: 100
+      serviceAccountEmail: $(ref.translation-function-service-account.email)
+      environmentVariables:
+        TRANSLATED_BUCKET: $(ref.translated-content-bucket.name)
+        TARGET_LANGUAGES: "es,fr,de,it,pt,ja,ko,zh"
+        MAX_CONTENT_SIZE: "1048576"  # 1MB limit for content processing
+      eventTrigger:
+        eventType: providers/cloud.pubsub/eventTypes/topic.publish
+        resource: $(ref.translation-workflow-topic.name)
+        failurePolicy:
+          retry: {}
+  metadata:
+    dependsOn:
+      - translation-workflow-topic
+      - translation-function-service-account
+      - translation-api-permission
+      - storage-admin-permission
+      - pubsub-subscriber-permission
+
+# Create Cloud Storage notification for automatic processing triggers
+storage-notification:
+  type: gcp-types/storage-v1:storage.notifications
+  properties:
+    bucket: $(ref.source-content-bucket.name)
+    topic: $(ref.translation-workflow-topic.name)
+    payloadFormat: JSON_API_V1
+    eventTypes:
+      - OBJECT_FINALIZE
+      - OBJECT_METADATA_UPDATE
+    objectNamePrefix: ""
+    customAttributes:
+      eventType: file_upload
+      processor: translation_workflow
+  metadata:
+    dependsOn:
+      - source-content-bucket
+      - translation-workflow-topic
+      - translation-processor-function
+
+# Create service account for Cloud Scheduler jobs
+scheduler-service-account:
+  type: gcp-types/iam-v1:projects.serviceAccounts
+  properties:
+    accountId: scheduler-sa-{{ env["deployment"] }}
+    serviceAccount:
+      displayName: Translation Scheduler Service Account
+      description: Service account for Cloud Scheduler translation jobs
+  metadata:
+    dependsOn:
+      - enable-translate-api
+
+# Grant Pub/Sub publisher permissions to scheduler service account
+scheduler-pubsub-permission:
+  type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+  properties:
+    resource: {{ env["project"] }}
+    role: roles/pubsub.publisher
+    member: serviceAccount:$(ref.scheduler-service-account.email)
+  metadata:
+    dependsOn:
+      - scheduler-service-account
+
+# Create Cloud Scheduler job for batch translation processing
+batch-translation-scheduler:
+  type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+  properties:
+    parent: projects/{{ env["project"] }}/locations/{{ properties["region"] }}
+    job:
+      name: batch-translation-job-{{ env["deployment"] }}
+      description: Daily batch translation processing for pending content
+      schedule: "0 2 * * *"  # Daily at 2 AM UTC
+      timeZone: "UTC"
+      attemptDeadline: 3600s  # 1 hour timeout
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 1800s
+        minBackoffDuration: 5s
+        maxBackoffDuration: 300s
+        maxDoublings: 5
+      pubsubTarget:
+        topicName: $(ref.translation-workflow-topic.name)
+        data: eyJ0eXBlIjoiYmF0Y2giLCJhY3Rpb24iOiJwcm9jZXNzX3BlbmRpbmciLCJwcmlvcml0eSI6ImhpZ2gifQ==  # Base64: {"type":"batch","action":"process_pending","priority":"high"}
+        attributes:
+          jobType: batch_processing
+          priority: high
+      serviceAccountEmail: $(ref.scheduler-service-account.email)
+  metadata:
+    dependsOn:
+      - translation-workflow-topic
+      - scheduler-service-account
+      - scheduler-pubsub-permission
+
+# Create Cloud Scheduler job for system health monitoring
+system-monitor-scheduler:
+  type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+  properties:
+    parent: projects/{{ env["project"] }}/locations/{{ properties["region"] }}
+    job:
+      name: translation-monitor-{{ env["deployment"] }}
+      description: Regular monitoring of translation system health and performance
+      schedule: "*/30 * * * *"  # Every 30 minutes
+      timeZone: "UTC"
+      attemptDeadline: 300s  # 5 minutes timeout
+      retryConfig:
+        retryCount: 2
+        maxRetryDuration: 600s
+        minBackoffDuration: 5s
+        maxBackoffDuration: 60s
+      pubsubTarget:
+        topicName: $(ref.translation-workflow-topic.name)
+        data: eyJ0eXBlIjoibW9uaXRvciIsImFjdGlvbiI6ImhlYWx0aF9jaGVjayIsInNlcnZpY2VzIjpbInRyYW5zbGF0aW9uIiwic3RvcmFnZSIsInB1YnN1YiJdfQ==  # Base64: {"type":"monitor","action":"health_check","services":["translation","storage","pubsub"]}
+        attributes:
+          jobType: health_monitoring
+          interval: "30m"
+      serviceAccountEmail: $(ref.scheduler-service-account.email)
+  metadata:
+    dependsOn:
+      - translation-workflow-topic
+      - scheduler-service-account
+      - scheduler-pubsub-permission
+
+# Create Cloud Logging sink for translation audit trail
+translation-audit-sink:
+  type: gcp-types/logging-v2:projects.sinks
+  properties:
+    parent: projects/{{ env["project"] }}
+    sink:
+      name: translation-audit-{{ env["deployment"] }}
+      description: Audit trail for translation workflow operations
+      destination: storage.googleapis.com/$(ref.translated-content-bucket.name)/audit-logs
+      filter: 'resource.type="cloud_function" AND resource.labels.function_name="translation-processor-{{ env["deployment"] }}" OR resource.type="pubsub_topic" AND resource.labels.topic_id="translation-workflow-{{ env["deployment"] }}"'
+      includeChildren: true
+  metadata:
+    dependsOn:
+      - translated-content-bucket
+      - translation-processor-function
+
+# Create monitoring policy for translation error rate alerting
+translation-error-monitoring:
+  type: gcp-types/monitoring-v1:projects.alertPolicies
+  properties:
+    name: projects/{{ env["project"] }}/alertPolicies/translation-error-alert-{{ env["deployment"] }}
+    displayName: Translation Workflow Error Rate Alert
+    documentation:
+      content: Alert triggered when translation error rate exceeds 10% over 5 minutes
+      mimeType: text/markdown
+    conditions:
+      - displayName: High Translation Error Rate
+        conditionThreshold:
+          filter: 'resource.type="cloud_function" AND resource.label.function_name="translation-processor-{{ env["deployment"] }}"'
+          comparison: COMPARISON_GREATER_THAN
+          thresholdValue: 0.1
+          duration: 300s
+          aggregations:
+            - alignmentPeriod: 60s
+              perSeriesAligner: ALIGN_RATE
+              crossSeriesReducer: REDUCE_MEAN
+              groupByFields:
+                - resource.label.function_name
+    combiner: OR
+    enabled: true
+    alertStrategy:
+      autoClose: 1800s  # Auto-close after 30 minutes
+  metadata:
+    dependsOn:
+      - translation-processor-function
+
+# Configuration properties for customization
+properties:
+  region:
+    type: string
+    default: us-central1
+    description: Google Cloud region for resource deployment
+  functionSourceBucket:
+    type: string
+    description: Cloud Storage bucket containing the Cloud Function source code
+  targetLanguages:
+    type: array
+    default: ["es", "fr", "de", "it", "pt", "ja", "ko", "zh"]
+    description: List of target languages for translation processing
+  batchSchedule:
+    type: string
+    default: "0 2 * * *"
+    description: Cron schedule for batch translation processing (default: daily at 2 AM UTC)
+  monitoringInterval:
+    type: string
+    default: "*/30 * * * *"
+    description: Cron schedule for system health monitoring (default: every 30 minutes)
+  maxFunctionInstances:
+    type: integer
+    default: 100
+    description: Maximum number of Cloud Function instances for scaling
+  contentSizeLimit:
+    type: integer
+    default: 1048576
+    description: Maximum content size in bytes for translation processing (default: 1MB)
+
+# Outputs for integration and verification
+outputs:
+  source-bucket-name:
+    description: Name of the source content Cloud Storage bucket
+    value: $(ref.source-content-bucket.name)
+  
+  translated-bucket-name:
+    description: Name of the translated content Cloud Storage bucket
+    value: $(ref.translated-content-bucket.name)
+  
+  pubsub-topic-name:
+    description: Name of the Pub/Sub topic for translation events
+    value: $(ref.translation-workflow-topic.name)
+  
+  function-name:
+    description: Name of the translation processing Cloud Function
+    value: $(ref.translation-processor-function.name)
+  
+  service-account-email:
+    description: Email of the translation function service account
+    value: $(ref.translation-function-service-account.email)
+  
+  batch-job-name:
+    description: Name of the batch translation scheduler job
+    value: $(ref.batch-translation-scheduler.name)
+  
+  monitor-job-name:
+    description: Name of the system monitoring scheduler job
+    value: $(ref.system-monitor-scheduler.name)
+  
+  audit-sink-name:
+    description: Name of the Cloud Logging audit sink
+    value: $(ref.translation-audit-sink.name)
+  
+  deployment-region:
+    description: Google Cloud region where resources are deployed
+    value: {{ properties["region"] }}
+  
+  project-id:
+    description: Google Cloud project ID
+    value: {{ env["project"] }}

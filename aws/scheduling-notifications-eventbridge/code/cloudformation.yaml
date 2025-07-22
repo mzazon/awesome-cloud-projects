@@ -1,0 +1,580 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudFormation template for Scheduling Notifications with EventBridge and SNS.
+  This template creates a complete serverless notification system for automated business communications.
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+
+Parameters:
+  
+  # Core Configuration Parameters
+  ProjectName:
+    Type: String
+    Default: business-notifications
+    Description: Name prefix for all resources created by this template
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    MinLength: 3
+    MaxLength: 30
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: Environment name for resource tagging and configuration
+
+  # Notification Configuration
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive business notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+
+  # Scheduling Configuration
+  TimeZone:
+    Type: String
+    Default: America/New_York
+    Description: Time zone for schedule expressions
+    AllowedValues:
+      - America/New_York
+      - America/Chicago
+      - America/Denver
+      - America/Los_Angeles
+      - America/Phoenix
+      - Europe/London
+      - Europe/Berlin
+      - Europe/Paris
+      - Asia/Tokyo
+      - Asia/Shanghai
+      - Australia/Sydney
+
+  DailyReportTime:
+    Type: String
+    Default: '09:00'
+    Description: Time for daily reports (24-hour format HH:MM)
+    AllowedPattern: '^([01]?[0-9]|2[0-3]):[0-5][0-9]$'
+    ConstraintDescription: Must be in HH:MM format (24-hour)
+
+  WeeklyReportTime:
+    Type: String
+    Default: '08:00'
+    Description: Time for weekly reports (24-hour format HH:MM)
+    AllowedPattern: '^([01]?[0-9]|2[0-3]):[0-5][0-9]$'
+    ConstraintDescription: Must be in HH:MM format (24-hour)
+
+  MonthlyReportTime:
+    Type: String
+    Default: '10:00'
+    Description: Time for monthly reports (24-hour format HH:MM)
+    AllowedPattern: '^([01]?[0-9]|2[0-3]):[0-5][0-9]$'
+    ConstraintDescription: Must be in HH:MM format (24-hour)
+
+  # Advanced Configuration
+  EnableSMSNotifications:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable SMS notifications (requires phone number)
+
+  SMSPhoneNumber:
+    Type: String
+    Default: ''
+    Description: Phone number for SMS notifications (format +1234567890)
+    AllowedPattern: '^(\+[1-9]\d{1,14})?$'
+    ConstraintDescription: Must be in international format starting with + (optional)
+
+  EnableFlexibleTimeWindows:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable flexible time windows for schedule optimization
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+
+Conditions:
+  
+  # SMS Configuration Conditions
+  CreateSMSSubscription: !Equals [!Ref EnableSMSNotifications, 'true']
+  HasSMSPhoneNumber: !Not [!Equals [!Ref SMSPhoneNumber, '']]
+  EnableSMS: !And 
+    - !Condition CreateSMSSubscription
+    - !Condition HasSMSPhoneNumber
+
+  # Environment-based Conditions
+  IsProduction: !Equals [!Ref Environment, 'production']
+  IsDevelopment: !Equals [!Ref Environment, 'development']
+
+  # Feature Conditions
+  UseFlexibleWindows: !Equals [!Ref EnableFlexibleTimeWindows, 'true']
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+
+Resources:
+
+  # SNS Topic for Business Notifications
+  BusinessNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-notifications-${Environment}'
+      DisplayName: !Sub '${ProjectName} Business Notifications'
+      Description: SNS topic for automated business notifications
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-notifications-topic'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: BusinessNotifications
+        - Key: Service
+          Value: SNS
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # SNS Topic Policy for EventBridge Scheduler Access
+  BusinessNotificationsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref BusinessNotificationsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Id: BusinessNotificationsTopicPolicy
+        Statement:
+          - Sid: AllowEventBridgeSchedulerPublish
+            Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action:
+              - sns:Publish
+            Resource: !Ref BusinessNotificationsTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # Email Subscription to SNS Topic
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref BusinessNotificationsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+      FilterPolicy: !If
+        - IsProduction
+        - {}
+        - MessageType: ['business-notification']
+
+  # SMS Subscription to SNS Topic (Conditional)
+  SMSSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: EnableSMS
+    Properties:
+      TopicArn: !Ref BusinessNotificationsTopic
+      Protocol: sms
+      Endpoint: !Ref SMSPhoneNumber
+
+  # IAM Role for EventBridge Scheduler Execution
+  SchedulerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-scheduler-role-${Environment}'
+      Description: IAM role for EventBridge Scheduler to publish to SNS
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns: []
+      Policies:
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref BusinessNotificationsTopic
+                Condition:
+                  StringEquals:
+                    aws:SourceAccount: !Ref AWS::AccountId
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-scheduler-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: EventBridgeSchedulerExecution
+        - Key: Service
+          Value: IAM
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # EventBridge Scheduler Group
+  BusinessScheduleGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: !Sub '${ProjectName}-schedules-${Environment}'
+      Description: Schedule group for business notification schedules
+      Tags:
+        Name: !Sub '${ProjectName}-schedule-group'
+        Environment: !Ref Environment
+        Purpose: BusinessNotifications
+        Service: EventBridgeScheduler
+        ManagedBy: CloudFormation
+
+  # Daily Business Report Schedule
+  DailyReportSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: daily-business-report
+      GroupName: !Ref BusinessScheduleGroup
+      Description: Daily business report notification (weekdays at specified time)
+      State: ENABLED
+      ScheduleExpression: !Sub 'cron(${DailyReportTime} ? * MON-FRI *)'
+      ScheduleExpressionTimezone: !Ref TimeZone
+      FlexibleTimeWindow: !If
+        - UseFlexibleWindows
+        - Mode: FLEXIBLE
+          MaximumWindowInMinutes: 15
+        - Mode: 'OFF'
+      Target:
+        Arn: !Ref BusinessNotificationsTopic
+        RoleArn: !GetAtt SchedulerExecutionRole.Arn
+        SnsParameters:
+          Subject: 'Daily Business Report - Ready for Review'
+          Message: !Sub |
+            Good morning from ${ProjectName}!
+            
+            Your daily business report is ready for review. Please check the dashboard for key metrics including:
+            
+            • Sales performance and revenue trends
+            • Customer engagement and satisfaction scores
+            • Operational status and system health
+            • Key performance indicators (KPIs)
+            
+            Environment: ${Environment}
+            Generated at: {{aws.scheduler.scheduled-time}}
+            
+            Have a productive day!
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAge: 3600
+
+  # Weekly Summary Schedule
+  WeeklySummarySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: weekly-summary
+      GroupName: !Ref BusinessScheduleGroup
+      Description: Weekly business summary notification (Mondays at specified time)
+      State: ENABLED
+      ScheduleExpression: !Sub 'cron(${WeeklyReportTime} ? * MON *)'
+      ScheduleExpressionTimezone: !Ref TimeZone
+      FlexibleTimeWindow: !If
+        - UseFlexibleWindows
+        - Mode: FLEXIBLE
+          MaximumWindowInMinutes: 30
+        - Mode: 'OFF'
+      Target:
+        Arn: !Ref BusinessNotificationsTopic
+        RoleArn: !GetAtt SchedulerExecutionRole.Arn
+        SnsParameters:
+          Subject: 'Weekly Business Summary - New Week Ahead'
+          Message: !Sub |
+            Good Monday morning from ${ProjectName}!
+            
+            Here is your weekly business summary with key achievements from last week and priorities ahead:
+            
+            📊 LAST WEEK'S HIGHLIGHTS:
+            • Review weekly performance metrics
+            • Completed project milestones
+            • Customer feedback and insights
+            • Team achievements and recognitions
+            
+            🎯 THIS WEEK'S PRIORITIES:
+            • Strategic goals and objectives
+            • Important meetings and deadlines
+            • Resource allocation and planning
+            • Process improvements and initiatives
+            
+            Environment: ${Environment}
+            Generated at: {{aws.scheduler.scheduled-time}}
+            
+            Let's make this week productive and successful!
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAge: 7200
+
+  # Monthly Reminder Schedule
+  MonthlyReminderSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: monthly-reminder
+      GroupName: !Ref BusinessScheduleGroup
+      Description: Monthly business reminder notification (1st of each month)
+      State: ENABLED
+      ScheduleExpression: !Sub 'cron(${MonthlyReportTime} 1 * ? *)'
+      ScheduleExpressionTimezone: !Ref TimeZone
+      FlexibleTimeWindow:
+        Mode: 'OFF'  # Fixed timing for monthly processes
+      Target:
+        Arn: !Ref BusinessNotificationsTopic
+        RoleArn: !GetAtt SchedulerExecutionRole.Arn
+        SnsParameters:
+          Subject: 'Monthly Business Reminder - Important Tasks'
+          Message: !Sub |
+            Welcome to a new month from ${ProjectName}!
+            
+            This is your monthly reminder for important business tasks and activities:
+            
+            📈 FINANCIAL REVIEWS:
+            • Review monthly financial reports and statements
+            • Update quarterly projections and forecasts
+            • Analyze budget performance and variances
+            • Assess investment and expenditure patterns
+            
+            👥 TEAM & OPERATIONS:
+            • Conduct team performance reviews and one-on-ones
+            • Update organizational goals and KPIs
+            • Review operational efficiency metrics
+            • Plan resource allocation for upcoming quarter
+            
+            🎯 STRATEGIC PLANNING:
+            • Assess progress toward quarterly and annual goals
+            • Review market conditions and competitive landscape
+            • Plan process improvements and technology updates
+            • Schedule strategic planning sessions
+            
+            📋 COMPLIANCE & GOVERNANCE:
+            • Review compliance requirements and deadlines
+            • Update policies and procedures as needed
+            • Conduct security and risk assessments
+            • Prepare regulatory reports and submissions
+            
+            Environment: ${Environment}
+            Generated at: {{aws.scheduler.scheduled-time}}
+            
+            Make this month count toward your strategic objectives!
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+          MaximumEventAge: 86400
+
+  # CloudWatch Log Group for EventBridge Scheduler (Optional monitoring)
+  SchedulerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/events/scheduler/${ProjectName}-${Environment}'
+      RetentionInDays: !If [IsProduction, 90, 30]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-scheduler-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: SchedulerMonitoring
+        - Key: Service
+          Value: CloudWatchLogs
+        - Key: ManagedBy
+          Value: CloudFormation
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+
+Outputs:
+
+  # SNS Topic Information
+  SNSTopicArn:
+    Description: ARN of the SNS topic for business notifications
+    Value: !Ref BusinessNotificationsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNS-Topic-Arn'
+
+  SNSTopicName:
+    Description: Name of the SNS topic
+    Value: !GetAtt BusinessNotificationsTopic.TopicName
+    Export:
+      Name: !Sub '${AWS::StackName}-SNS-Topic-Name'
+
+  # Schedule Group Information
+  ScheduleGroupName:
+    Description: Name of the EventBridge Scheduler group
+    Value: !Ref BusinessScheduleGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-Schedule-Group-Name'
+
+  # IAM Role Information
+  SchedulerRoleArn:
+    Description: ARN of the IAM role used by EventBridge Scheduler
+    Value: !GetAtt SchedulerExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-Scheduler-Role-Arn'
+
+  # Schedule Information
+  DailyScheduleName:
+    Description: Name of the daily report schedule
+    Value: !Ref DailyReportSchedule
+    Export:
+      Name: !Sub '${AWS::StackName}-Daily-Schedule-Name'
+
+  WeeklyScheduleName:
+    Description: Name of the weekly summary schedule
+    Value: !Ref WeeklySummarySchedule
+    Export:
+      Name: !Sub '${AWS::StackName}-Weekly-Schedule-Name'
+
+  MonthlyScheduleName:
+    Description: Name of the monthly reminder schedule
+    Value: !Ref MonthlyReminderSchedule
+    Export:
+      Name: !Sub '${AWS::StackName}-Monthly-Schedule-Name'
+
+  # Configuration Information
+  NotificationEmail:
+    Description: Email address receiving notifications
+    Value: !Ref NotificationEmail
+
+  TimeZone:
+    Description: Time zone used for schedules
+    Value: !Ref TimeZone
+
+  Environment:
+    Description: Environment name
+    Value: !Ref Environment
+
+  # SMS Information (Conditional)
+  SMSEnabled:
+    Description: Whether SMS notifications are enabled
+    Value: !If [EnableSMS, 'Yes', 'No']
+
+  SMSPhoneNumber:
+    Condition: EnableSMS
+    Description: Phone number for SMS notifications
+    Value: !Ref SMSPhoneNumber
+
+  # Monitoring Information
+  LogGroupName:
+    Description: CloudWatch Log Group for scheduler monitoring
+    Value: !Ref SchedulerLogGroup
+
+  # Quick Actions
+  TestNotificationCommand:
+    Description: AWS CLI command to send a test notification
+    Value: !Sub 'aws sns publish --topic-arn ${BusinessNotificationsTopic} --subject "Test Notification" --message "This is a test message from your business notification system."'
+
+  # Cost Estimation
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for this notification system
+    Value: '$0.01 - $0.50 (depends on message volume and SMS usage)'
+
+# =============================================================================
+# METADATA
+# =============================================================================
+
+Metadata:
+  
+  # Template Information
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Notification Settings"
+        Parameters:
+          - NotificationEmail
+          - EnableSMSNotifications
+          - SMSPhoneNumber
+      - Label:
+          default: "Schedule Configuration"
+        Parameters:
+          - TimeZone
+          - DailyReportTime
+          - WeeklyReportTime
+          - MonthlyReportTime
+      - Label:
+          default: "Advanced Options"
+        Parameters:
+          - EnableFlexibleTimeWindows
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      NotificationEmail:
+        default: "Notification Email Address"
+      EnableSMSNotifications:
+        default: "Enable SMS Notifications"
+      SMSPhoneNumber:
+        default: "SMS Phone Number"
+      TimeZone:
+        default: "Time Zone"
+      DailyReportTime:
+        default: "Daily Report Time"
+      WeeklyReportTime:
+        default: "Weekly Report Time"
+      MonthlyReportTime:
+        default: "Monthly Report Time"
+      EnableFlexibleTimeWindows:
+        default: "Enable Flexible Time Windows"
+
+  # Template Metadata
+  TemplateInfo:
+    Version: "1.0"
+    Description: "CloudFormation template for simple business notifications with EventBridge Scheduler and SNS"
+    Author: "AWS Recipe Generator"
+    CreatedDate: "2025-01-12"
+    LastModified: "2025-01-12"
+    RecipeId: "a7b3c8d9"
+    Category: "serverless"
+    Difficulty: "100"
+    EstimatedTime: "60 minutes"
+    Services: "EventBridge Scheduler, SNS, IAM"
+
+  # Cost Information
+  CostEstimation:
+    SNS:
+      Description: "$0.50 per 1 million email notifications, $0.75 per 100 SMS messages"
+      MonthlyEstimate: "$0.01-$0.10 for typical usage"
+    EventBridgeScheduler:
+      Description: "$1.00 per million schedule invocations"
+      MonthlyEstimate: "$0.00-$0.01 for typical usage"
+    CloudWatchLogs:
+      Description: "$0.50 per GB ingested"
+      MonthlyEstimate: "$0.00-$0.05 for typical usage"
+    Total:
+      MonthlyEstimate: "$0.01-$0.50 depending on message volume and SMS usage"
+
+  # Security Information
+  SecurityFeatures:
+    - "IAM role with least privilege permissions"
+    - "SNS topic encryption with AWS KMS"
+    - "Account-scoped resource access controls"
+    - "CloudTrail logging for audit trail"
+    - "Parameter validation and input sanitization"
+
+  # Best Practices Implemented
+  BestPractices:
+    - "Resource tagging for cost allocation and management"
+    - "Environment-based resource naming"
+    - "Conditional resource creation based on requirements"
+    - "Comprehensive parameter validation"
+    - "Detailed outputs for integration and monitoring"
+    - "Retry policies for fault tolerance"
+    - "Flexible time windows for system optimization"

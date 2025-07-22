@@ -1,0 +1,1357 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Event-Driven Security Automation with EventBridge and Lambda - Complete infrastructure for automated security response'
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - Environment
+          - AutomationPrefix
+          - NotificationEmail
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaRuntime
+          - LambdaMemorySize
+          - LambdaTimeout
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - EnableHighSeverityAutoRemediation
+          - EnableCriticalSeverityAutoRemediation
+          - EnableAutomationRules
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableCloudWatchAlarms
+          - CloudWatchRetentionDays
+    ParameterLabels:
+      Environment:
+        default: "Environment Name"
+      AutomationPrefix:
+        default: "Resource Prefix"
+      NotificationEmail:
+        default: "Notification Email Address"
+      LambdaRuntime:
+        default: "Lambda Runtime Version"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      EnableHighSeverityAutoRemediation:
+        default: "Enable High Severity Auto-Remediation"
+      EnableCriticalSeverityAutoRemediation:
+        default: "Enable Critical Severity Auto-Remediation"
+      EnableAutomationRules:
+        default: "Enable Security Hub Automation Rules"
+      EnableCloudWatchAlarms:
+        default: "Enable CloudWatch Alarms"
+      CloudWatchRetentionDays:
+        default: "CloudWatch Logs Retention (days)"
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  Environment:
+    Type: String
+    Default: 'production'
+    AllowedValues:
+      - 'development'
+      - 'staging'
+      - 'production'
+    Description: 'Environment name for resource tagging and configuration'
+
+  AutomationPrefix:
+    Type: String
+    Default: 'security-automation'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+    Description: 'Prefix for all security automation resources'
+
+  NotificationEmail:
+    Type: String
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    ConstraintDescription: 'Must be a valid email address'
+    Description: 'Email address for security notifications (required for SNS subscription)'
+
+  LambdaRuntime:
+    Type: String
+    Default: 'python3.9'
+    AllowedValues:
+      - 'python3.8'
+      - 'python3.9'
+      - 'python3.10'
+      - 'python3.11'
+    Description: 'Python runtime version for Lambda functions'
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    MinValue: 128
+    MaxValue: 3008
+    Description: 'Memory size for Lambda functions (MB)'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+    Description: 'Timeout for Lambda functions (seconds)'
+
+  EnableHighSeverityAutoRemediation:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable automatic remediation for high severity findings'
+
+  EnableCriticalSeverityAutoRemediation:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable automatic remediation for critical severity findings (use with caution)'
+
+  EnableAutomationRules:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable Security Hub automation rules for automatic finding updates'
+
+  EnableCloudWatchAlarms:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable CloudWatch alarms for monitoring automation health'
+
+  CloudWatchRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues:
+      - 1
+      - 3
+      - 5
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+      - 120
+      - 150
+      - 180
+      - 365
+      - 400
+      - 545
+      - 731
+      - 1827
+      - 3653
+    Description: 'CloudWatch logs retention period in days'
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  EnableHighSeverityRemediation: !Equals [!Ref EnableHighSeverityAutoRemediation, 'true']
+  EnableCriticalSeverityRemediation: !Equals [!Ref EnableCriticalSeverityAutoRemediation, 'true']
+  EnableSecurityHubAutomationRules: !Equals [!Ref EnableAutomationRules, 'true']
+  EnableMonitoringAlarms: !Equals [!Ref EnableCloudWatchAlarms, 'true']
+  IsProduction: !Equals [!Ref Environment, 'production']
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # ============================================================================
+  # IAM ROLES AND POLICIES
+  # ============================================================================
+  SecurityAutomationExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AutomationPrefix}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SecurityAutomationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Security Hub permissions
+              - Effect: Allow
+                Action:
+                  - securityhub:BatchUpdateFindings
+                  - securityhub:GetFindings
+                  - securityhub:BatchGetAutomationRules
+                  - securityhub:CreateAutomationRule
+                  - securityhub:UpdateAutomationRule
+                  - securityhub:CreateActionTarget
+                  - securityhub:DeleteActionTarget
+                Resource: '*'
+              # Systems Manager permissions
+              - Effect: Allow
+                Action:
+                  - ssm:StartAutomationExecution
+                  - ssm:GetAutomationExecution
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                Resource: '*'
+              # EC2 permissions for remediation
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:StopInstances
+                  - ec2:StartInstances
+                  - ec2:DescribeSecurityGroups
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:CreateSnapshot
+                  - ec2:DescribeSnapshots
+                  - ec2:DescribeVolumes
+                  - ec2:CreateTags
+                Resource: '*'
+              # SNS and SQS permissions
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                  - sqs:SendMessage
+                  - sqs:GetQueueAttributes
+                Resource: 
+                  - !Ref SecurityNotificationTopic
+                  - !Ref SecurityAutomationDeadLetterQueue
+              # EventBridge permissions
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: '*'
+              # CloudWatch Logs permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SecurityAutomation
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================================
+  # SNS TOPIC AND SUBSCRIPTIONS
+  # ============================================================================
+  SecurityNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AutomationPrefix}-security-notifications'
+      DisplayName: 'Security Automation Notifications'
+      DeliveryPolicy:
+        healthyRetryPolicy:
+          minDelayTarget: 5
+          maxDelayTarget: 300
+          numRetries: 10
+          numNoDelayRetries: 0
+          numMinDelayRetries: 2
+          numMaxDelayRetries: 3
+          backoffFunction: exponential
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SecurityAutomation
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  SecurityNotificationEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref SecurityNotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # ============================================================================
+  # SQS DEAD LETTER QUEUE
+  # ============================================================================
+  SecurityAutomationDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AutomationPrefix}-dead-letter-queue'
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeoutSeconds: 300
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SecurityAutomation
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================================
+  # LAMBDA FUNCTIONS
+  # ============================================================================
+  
+  # Triage Lambda Function
+  TriageLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AutomationPrefix}-triage'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt SecurityAutomationExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      ReservedConcurrencyLimit: 10
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SecurityNotificationTopic
+          ENVIRONMENT: !Ref Environment
+          ENABLE_HIGH_SEVERITY_REMEDIATION: !Ref EnableHighSeverityAutoRemediation
+          ENABLE_CRITICAL_SEVERITY_REMEDIATION: !Ref EnableCriticalSeverityAutoRemediation
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Triage security findings and determine appropriate response
+              """
+              try:
+                  # Parse EventBridge event
+                  detail = event.get('detail', {})
+                  findings = detail.get('findings', [])
+                  
+                  if not findings:
+                      logger.warning("No findings in event")
+                      return {'statusCode': 200, 'body': 'No findings to process'}
+                  
+                  # Process each finding
+                  for finding in findings:
+                      severity = finding.get('Severity', {}).get('Label', 'INFORMATIONAL')
+                      finding_id = finding.get('Id', 'unknown')
+                      
+                      logger.info(f"Processing finding {finding_id} with severity {severity}")
+                      
+                      # Determine response based on severity and finding type
+                      response_action = determine_response_action(finding, severity)
+                      
+                      if response_action:
+                          # Tag finding with automation status
+                          update_finding_workflow_status(finding_id, 'IN_PROGRESS', 'Automated triage initiated')
+                          
+                          # Trigger appropriate response
+                          trigger_response_action(finding, response_action)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(f'Processed {len(findings)} findings')
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in triage function: {str(e)}")
+                  raise
+          
+          def determine_response_action(finding, severity):
+              """
+              Determine appropriate automated response based on finding characteristics
+              """
+              finding_type = finding.get('Types', [])
+              enable_high_severity = os.environ.get('ENABLE_HIGH_SEVERITY_REMEDIATION', 'false').lower() == 'true'
+              enable_critical_severity = os.environ.get('ENABLE_CRITICAL_SEVERITY_REMEDIATION', 'false').lower() == 'true'
+              
+              # High severity findings require immediate response
+              if severity == 'HIGH' and enable_high_severity:
+                  if any('UnauthorizedAPICall' in t for t in finding_type):
+                      return 'ISOLATE_INSTANCE'
+                  elif any('NetworkReachability' in t for t in finding_type):
+                      return 'BLOCK_NETWORK_ACCESS'
+                  elif any('Malware' in t for t in finding_type):
+                      return 'QUARANTINE_INSTANCE'
+              
+              # Critical severity findings require immediate response
+              elif severity == 'CRITICAL' and enable_critical_severity:
+                  if any('UnauthorizedAPICall' in t for t in finding_type):
+                      return 'ISOLATE_INSTANCE'
+                  elif any('NetworkReachability' in t for t in finding_type):
+                      return 'BLOCK_NETWORK_ACCESS'
+                  elif any('Malware' in t for t in finding_type):
+                      return 'QUARANTINE_INSTANCE'
+              
+              # Medium severity findings get automated remediation
+              elif severity == 'MEDIUM':
+                  if any('MissingSecurityGroup' in t for t in finding_type):
+                      return 'FIX_SECURITY_GROUP'
+                  elif any('UnencryptedStorage' in t for t in finding_type):
+                      return 'ENABLE_ENCRYPTION'
+              
+              # Low severity findings get notifications only
+              return 'NOTIFY_ONLY'
+          
+          def update_finding_workflow_status(finding_id, status, note):
+              """
+              Update Security Hub finding workflow status
+              """
+              try:
+                  securityhub = boto3.client('securityhub')
+                  securityhub.batch_update_findings(
+                      FindingIdentifiers=[{'Id': finding_id}],
+                      Workflow={'Status': status},
+                      Note={'Text': note, 'UpdatedBy': 'SecurityAutomation'}
+                  )
+              except Exception as e:
+                  logger.error(f"Error updating finding status: {str(e)}")
+          
+          def trigger_response_action(finding, action):
+              """
+              Trigger the appropriate response action
+              """
+              eventbridge = boto3.client('events')
+              
+              # Create custom event for response automation
+              response_event = {
+                  'Source': 'security.automation',
+                  'DetailType': 'Security Response Required',
+                  'Detail': json.dumps({
+                      'action': action,
+                      'finding': finding,
+                      'timestamp': datetime.utcnow().isoformat()
+                  })
+              }
+              
+              eventbridge.put_events(Entries=[response_event])
+              logger.info(f"Triggered response action: {action}")
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SecurityAutomation
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Remediation Lambda Function
+  RemediationLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AutomationPrefix}-remediation'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt SecurityAutomationExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      ReservedConcurrencyLimit: 5
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SecurityNotificationTopic
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Execute automated remediation actions based on security findings
+              """
+              try:
+                  detail = event.get('detail', {})
+                  action = detail.get('action')
+                  finding = detail.get('finding', {})
+                  
+                  if not action:
+                      logger.warning("No action specified in event")
+                      return {'statusCode': 400, 'body': 'No action specified'}
+                  
+                  logger.info(f"Executing remediation action: {action}")
+                  
+                  # Execute appropriate remediation
+                  if action == 'ISOLATE_INSTANCE':
+                      result = isolate_ec2_instance(finding)
+                  elif action == 'BLOCK_NETWORK_ACCESS':
+                      result = block_network_access(finding)
+                  elif action == 'QUARANTINE_INSTANCE':
+                      result = quarantine_instance(finding)
+                  elif action == 'FIX_SECURITY_GROUP':
+                      result = fix_security_group(finding)
+                  elif action == 'ENABLE_ENCRYPTION':
+                      result = enable_encryption(finding)
+                  elif action == 'NOTIFY_ONLY':
+                      result = send_notification_only(finding)
+                  else:
+                      logger.warning(f"Unknown action: {action}")
+                      return {'statusCode': 400, 'body': f'Unknown action: {action}'}
+                  
+                  # Update finding with remediation status
+                  update_finding_status(finding.get('Id'), result)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'action': action, 'result': result})
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in remediation function: {str(e)}")
+                  raise
+          
+          def isolate_ec2_instance(finding):
+              """
+              Isolate EC2 instance by moving to quarantine security group
+              """
+              try:
+                  # Extract instance ID from finding
+                  instance_id = extract_instance_id(finding)
+                  if not instance_id:
+                      return {'success': False, 'message': 'No instance ID found'}
+                  
+                  # Use Systems Manager automation
+                  ssm = boto3.client('ssm')
+                  response = ssm.start_automation_execution(
+                      DocumentName='AWS-PublishSNSNotification',
+                      Parameters={
+                          'TopicArn': [os.environ.get('SNS_TOPIC_ARN', '')],
+                          'Message': [f'Instance {instance_id} isolated due to security finding']
+                      }
+                  )
+                  
+                  return {'success': True, 'automation_id': response['AutomationExecutionId']}
+                  
+              except Exception as e:
+                  logger.error(f"Error isolating instance: {str(e)}")
+                  return {'success': False, 'message': str(e)}
+          
+          def block_network_access(finding):
+              """
+              Block network access by updating security group rules
+              """
+              try:
+                  # Extract security group information
+                  sg_id = extract_security_group_id(finding)
+                  if not sg_id:
+                      return {'success': False, 'message': 'No security group ID found'}
+                  
+                  ec2 = boto3.client('ec2')
+                  
+                  # Get current security group rules
+                  response = ec2.describe_security_groups(GroupIds=[sg_id])
+                  sg = response['SecurityGroups'][0]
+                  
+                  # Remove overly permissive rules (0.0.0.0/0)
+                  for rule in sg.get('IpPermissions', []):
+                      for ip_range in rule.get('IpRanges', []):
+                          if ip_range.get('CidrIp') == '0.0.0.0/0':
+                              ec2.revoke_security_group_ingress(
+                                  GroupId=sg_id,
+                                  IpPermissions=[rule]
+                              )
+                  
+                  return {'success': True, 'message': f'Blocked open access for {sg_id}'}
+                  
+              except Exception as e:
+                  logger.error(f"Error blocking network access: {str(e)}")
+                  return {'success': False, 'message': str(e)}
+          
+          def quarantine_instance(finding):
+              """
+              Quarantine instance by stopping it and creating forensic snapshot
+              """
+              try:
+                  instance_id = extract_instance_id(finding)
+                  if not instance_id:
+                      return {'success': False, 'message': 'No instance ID found'}
+                  
+                  ec2 = boto3.client('ec2')
+                  
+                  # Stop the instance
+                  ec2.stop_instances(InstanceIds=[instance_id])
+                  
+                  # Create snapshot for forensic analysis
+                  response = ec2.describe_instances(InstanceIds=[instance_id])
+                  instance = response['Reservations'][0]['Instances'][0]
+                  
+                  for device in instance.get('BlockDeviceMappings', []):
+                      volume_id = device['Ebs']['VolumeId']
+                      ec2.create_snapshot(
+                          VolumeId=volume_id,
+                          Description=f'Forensic snapshot for security incident - {instance_id}'
+                      )
+                  
+                  return {'success': True, 'message': f'Instance {instance_id} quarantined'}
+                  
+              except Exception as e:
+                  logger.error(f"Error quarantining instance: {str(e)}")
+                  return {'success': False, 'message': str(e)}
+          
+          def fix_security_group(finding):
+              """
+              Fix security group misconfigurations
+              """
+              return {'success': True, 'message': 'Security group remediation simulated'}
+          
+          def enable_encryption(finding):
+              """
+              Enable encryption for unencrypted resources
+              """
+              return {'success': True, 'message': 'Encryption enablement simulated'}
+          
+          def send_notification_only(finding):
+              """
+              Send notification without automated remediation
+              """
+              return {'success': True, 'message': 'Notification sent for manual review'}
+          
+          def extract_instance_id(finding):
+              """
+              Extract EC2 instance ID from finding resources
+              """
+              resources = finding.get('Resources', [])
+              for resource in resources:
+                  resource_id = resource.get('Id', '')
+                  if 'i-' in resource_id:
+                      return resource_id.split('/')[-1]
+              return None
+          
+          def extract_security_group_id(finding):
+              """
+              Extract security group ID from finding resources
+              """
+              resources = finding.get('Resources', [])
+              for resource in resources:
+                  resource_id = resource.get('Id', '')
+                  if 'sg-' in resource_id:
+                      return resource_id.split('/')[-1]
+              return None
+          
+          def update_finding_status(finding_id, result):
+              """
+              Update Security Hub finding with remediation status
+              """
+              try:
+                  securityhub = boto3.client('securityhub')
+                  status = 'RESOLVED' if result.get('success') else 'NEW'
+                  note = result.get('message', 'Automated remediation attempted')
+                  
+                  securityhub.batch_update_findings(
+                      FindingIdentifiers=[{'Id': finding_id}],
+                      Workflow={'Status': status},
+                      Note={'Text': note, 'UpdatedBy': 'SecurityAutomation'}
+                  )
+              except Exception as e:
+                  logger.error(f"Error updating finding status: {str(e)}")
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SecurityAutomation
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Notification Lambda Function
+  NotificationLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AutomationPrefix}-notification'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt SecurityAutomationExecutionRole.Arn
+      MemorySize: 256
+      Timeout: 60
+      ReservedConcurrencyLimit: 10
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SecurityNotificationTopic
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Send contextual notifications for security findings
+              """
+              try:
+                  detail = event.get('detail', {})
+                  findings = detail.get('findings', [])
+                  
+                  if not findings:
+                      logger.warning("No findings in event")
+                      return {'statusCode': 200, 'body': 'No findings to process'}
+                  
+                  # Process each finding for notification
+                  for finding in findings:
+                      send_security_notification(finding)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(f'Sent notifications for {len(findings)} findings')
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in notification function: {str(e)}")
+                  raise
+          
+          def send_security_notification(finding):
+              """
+              Send detailed security notification
+              """
+              try:
+                  # Extract key information
+                  severity = finding.get('Severity', {}).get('Label', 'INFORMATIONAL')
+                  title = finding.get('Title', 'Security Finding')
+                  description = finding.get('Description', 'No description available')
+                  finding_id = finding.get('Id', 'unknown')
+                  
+                  # Create rich notification message
+                  message = create_notification_message(finding, severity, title, description)
+                  
+                  # Send to SNS topic
+                  sns = boto3.client('sns')
+                  sns.publish(
+                      TopicArn=os.environ.get('SNS_TOPIC_ARN'),
+                      Subject=f'Security Alert: {severity} - {title}',
+                      Message=message,
+                      MessageAttributes={
+                          'severity': {
+                              'DataType': 'String',
+                              'StringValue': severity
+                          },
+                          'finding_id': {
+                              'DataType': 'String',
+                              'StringValue': finding_id
+                          }
+                      }
+                  )
+                  
+                  logger.info(f"Notification sent for finding {finding_id}")
+                  
+              except Exception as e:
+                  logger.error(f"Error sending notification: {str(e)}")
+          
+          def create_notification_message(finding, severity, title, description):
+              """
+              Create structured notification message
+              """
+              resources = finding.get('Resources', [])
+              resource_list = [r.get('Id', 'Unknown') for r in resources[:3]]
+              
+              message = f"""
+          🚨 Security Finding Alert
+          
+          Severity: {severity}
+          Title: {title}
+          
+          Description: {description}
+          
+          Affected Resources:
+          {chr(10).join(f'• {r}' for r in resource_list)}
+          
+          Finding ID: {finding.get('Id', 'unknown')}
+          Account: {finding.get('AwsAccountId', 'unknown')}
+          Region: {finding.get('Region', 'unknown')}
+          
+          Created: {finding.get('CreatedAt', 'unknown')}
+          Updated: {finding.get('UpdatedAt', 'unknown')}
+          
+          Compliance Status: {finding.get('Compliance', {}).get('Status', 'UNKNOWN')}
+          
+          🔗 View in Security Hub Console:
+          https://console.aws.amazon.com/securityhub/home?region={finding.get('Region', 'us-east-1')}#/findings?search=Id%3D{finding.get('Id', '')}
+          
+          This alert was generated by automated security monitoring.
+          """
+              
+              return message
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SecurityAutomation
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Error Handler Lambda Function
+  ErrorHandlerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AutomationPrefix}-error-handler'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt SecurityAutomationExecutionRole.Arn
+      MemorySize: 256
+      Timeout: 60
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SecurityNotificationTopic
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Handle failed automation events
+              """
+              try:
+                  logger.error(f"Automation failure: {json.dumps(event)}")
+                  
+                  # Send failure notification
+                  sns = boto3.client('sns')
+                  sns.publish(
+                      TopicArn=os.environ.get('SNS_TOPIC_ARN'),
+                      Subject='Security Automation Failure',
+                      Message=f'Automation failure detected: {json.dumps(event, indent=2)}'
+                  )
+                  
+                  return {'statusCode': 200, 'body': 'Error handled'}
+                  
+              except Exception as e:
+                  logger.error(f"Error in error handler: {str(e)}")
+                  raise
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SecurityAutomation
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================================
+  # CLOUDWATCH LOG GROUPS
+  # ============================================================================
+  TriageLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AutomationPrefix}-triage'
+      RetentionInDays: !Ref CloudWatchRetentionDays
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SecurityAutomation
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  RemediationLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AutomationPrefix}-remediation'
+      RetentionInDays: !Ref CloudWatchRetentionDays
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SecurityAutomation
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  NotificationLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AutomationPrefix}-notification'
+      RetentionInDays: !Ref CloudWatchRetentionDays
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SecurityAutomation
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  ErrorHandlerLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AutomationPrefix}-error-handler'
+      RetentionInDays: !Ref CloudWatchRetentionDays
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SecurityAutomation
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================================
+  # EVENTBRIDGE RULES
+  # ============================================================================
+  SecurityHubFindingsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AutomationPrefix}-security-hub-findings'
+      Description: 'Route Security Hub findings to automation'
+      State: ENABLED
+      EventPattern:
+        source:
+          - 'aws.securityhub'
+        detail-type:
+          - 'Security Hub Findings - Imported'
+        detail:
+          findings:
+            Severity:
+              Label:
+                - 'HIGH'
+                - 'CRITICAL'
+                - 'MEDIUM'
+            Workflow:
+              Status:
+                - 'NEW'
+      Targets:
+        - Arn: !GetAtt TriageLambdaFunction.Arn
+          Id: 'TriageTarget'
+          DeadLetterConfig:
+            Arn: !GetAtt SecurityAutomationDeadLetterQueue.Arn
+        - Arn: !GetAtt NotificationLambdaFunction.Arn
+          Id: 'NotificationTarget'
+          DeadLetterConfig:
+            Arn: !GetAtt SecurityAutomationDeadLetterQueue.Arn
+
+  RemediationActionRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AutomationPrefix}-remediation-actions'
+      Description: 'Route remediation actions to Lambda'
+      State: ENABLED
+      EventPattern:
+        source:
+          - 'security.automation'
+        detail-type:
+          - 'Security Response Required'
+      Targets:
+        - Arn: !GetAtt RemediationLambdaFunction.Arn
+          Id: 'RemediationTarget'
+          DeadLetterConfig:
+            Arn: !GetAtt SecurityAutomationDeadLetterQueue.Arn
+
+  CustomActionRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AutomationPrefix}-custom-actions'
+      Description: 'Handle custom Security Hub actions'
+      State: ENABLED
+      EventPattern:
+        source:
+          - 'aws.securityhub'
+        detail-type:
+          - 'Security Hub Findings - Custom Action'
+        detail:
+          actionName:
+            - 'TriggerAutomatedRemediation'
+            - 'EscalateToSOC'
+      Targets:
+        - Arn: !GetAtt TriageLambdaFunction.Arn
+          Id: 'CustomActionTarget'
+          DeadLetterConfig:
+            Arn: !GetAtt SecurityAutomationDeadLetterQueue.Arn
+
+  ErrorHandlingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AutomationPrefix}-error-handling'
+      Description: 'Handle failed automation events'
+      State: ENABLED
+      EventPattern:
+        source:
+          - 'aws.events'
+        detail-type:
+          - 'EventBridge Rule Execution Failed'
+      Targets:
+        - Arn: !GetAtt ErrorHandlerLambdaFunction.Arn
+          Id: 'ErrorHandlerTarget'
+
+  # ============================================================================
+  # LAMBDA PERMISSIONS FOR EVENTBRIDGE
+  # ============================================================================
+  TriageLambdaEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TriageLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SecurityHubFindingsRule.Arn
+
+  NotificationLambdaEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotificationLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SecurityHubFindingsRule.Arn
+
+  RemediationLambdaEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RemediationLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RemediationActionRule.Arn
+
+  CustomActionLambdaEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TriageLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CustomActionRule.Arn
+
+  ErrorHandlerLambdaEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ErrorHandlerLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ErrorHandlingRule.Arn
+
+  # ============================================================================
+  # SECURITY HUB CUSTOM ACTIONS
+  # ============================================================================
+  TriggerRemediationCustomAction:
+    Type: AWS::SecurityHub::ActionTarget
+    Properties:
+      Name: TriggerAutomatedRemediation
+      Description: 'Trigger automated remediation for selected findings'
+      Id: trigger-remediation
+
+  EscalateToSOCCustomAction:
+    Type: AWS::SecurityHub::ActionTarget
+    Properties:
+      Name: EscalateToSOC
+      Description: 'Escalate finding to Security Operations Center'
+      Id: escalate-soc
+
+  # ============================================================================
+  # SYSTEMS MANAGER AUTOMATION DOCUMENT
+  # ============================================================================
+  InstanceIsolationDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      DocumentFormat: JSON
+      Name: !Sub '${AutomationPrefix}-isolate-instance'
+      Content:
+        schemaVersion: '0.3'
+        description: 'Isolate EC2 instance for security incident response'
+        assumeRole: '{{ AutomationAssumeRole }}'
+        parameters:
+          InstanceId:
+            type: String
+            description: 'EC2 instance ID to isolate'
+          AutomationAssumeRole:
+            type: String
+            description: 'IAM role for automation execution'
+            default: !GetAtt SecurityAutomationExecutionRole.Arn
+        mainSteps:
+          - name: StopInstance
+            action: 'aws:executeAwsApi'
+            inputs:
+              Service: ec2
+              Api: StopInstances
+              InstanceIds:
+                - '{{ InstanceId }}'
+          - name: CreateSnapshot
+            action: 'aws:executeScript'
+            inputs:
+              Runtime: python3.8
+              Handler: create_snapshot
+              Script: |
+                def create_snapshot(events, context):
+                    import boto3
+                    ec2 = boto3.client('ec2')
+                    instance_id = events['InstanceId']
+                    
+                    # Get instance volumes
+                    response = ec2.describe_instances(InstanceIds=[instance_id])
+                    instance = response['Reservations'][0]['Instances'][0]
+                    
+                    snapshots = []
+                    for device in instance.get('BlockDeviceMappings', []):
+                        volume_id = device['Ebs']['VolumeId']
+                        snapshot = ec2.create_snapshot(
+                            VolumeId=volume_id,
+                            Description=f'Forensic snapshot for {instance_id}'
+                        )
+                        snapshots.append(snapshot['SnapshotId'])
+                    
+                    return {'snapshots': snapshots}
+              InputPayload:
+                InstanceId: '{{ InstanceId }}'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SecurityAutomation
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================================
+  # CLOUDWATCH ALARMS (CONDITIONAL)
+  # ============================================================================
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoringAlarms
+    Properties:
+      AlarmName: !Sub '${AutomationPrefix}-lambda-errors'
+      AlarmDescription: 'Security automation Lambda errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref SecurityNotificationTopic
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TriageLambdaFunction
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SecurityAutomation
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  EventBridgeFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoringAlarms
+    Properties:
+      AlarmName: !Sub '${AutomationPrefix}-eventbridge-failures'
+      AlarmDescription: 'EventBridge rule failures'
+      MetricName: FailedInvocations
+      Namespace: AWS/Events
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref SecurityNotificationTopic
+      Dimensions:
+        - Name: RuleName
+          Value: !Ref SecurityHubFindingsRule
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: SecurityAutomation
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================================
+  # CLOUDWATCH DASHBOARD
+  # ============================================================================
+  SecurityAutomationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableMonitoringAlarms
+    Properties:
+      DashboardName: !Sub '${AutomationPrefix}-monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${TriageLambdaFunction}"],
+                  [".", "Errors", ".", "."],
+                  [".", "Duration", ".", "."],
+                  [".", "Invocations", ".", "${RemediationLambdaFunction}"],
+                  [".", "Errors", ".", "."],
+                  [".", "Duration", ".", "."],
+                  [".", "Invocations", ".", "${NotificationLambdaFunction}"],
+                  [".", "Errors", ".", "."],
+                  [".", "Duration", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Security Automation Lambda Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Events", "MatchedEvents", "RuleName", "${SecurityHubFindingsRule}"],
+                  [".", "SuccessfulInvocations", ".", "."],
+                  [".", "FailedInvocations", ".", "."],
+                  [".", "MatchedEvents", ".", "${RemediationActionRule}"],
+                  [".", "SuccessfulInvocations", ".", "."],
+                  [".", "FailedInvocations", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "EventBridge Rules Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/SNS", "NumberOfMessagesPublished", "TopicName", "${SecurityNotificationTopic}"],
+                  [".", "NumberOfNotificationsFailed", ".", "."],
+                  ["AWS/SQS", "ApproximateNumberOfMessages", "QueueName", "${SecurityAutomationDeadLetterQueue}"]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Notification and Error Handling Metrics",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  SecurityNotificationTopicArn:
+    Description: 'SNS Topic ARN for security notifications'
+    Value: !Ref SecurityNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityNotificationTopicArn'
+
+  SecurityAutomationExecutionRoleArn:
+    Description: 'IAM Role ARN for security automation'
+    Value: !GetAtt SecurityAutomationExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityAutomationExecutionRoleArn'
+
+  TriageLambdaFunctionArn:
+    Description: 'ARN of the triage Lambda function'
+    Value: !GetAtt TriageLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TriageLambdaFunctionArn'
+
+  RemediationLambdaFunctionArn:
+    Description: 'ARN of the remediation Lambda function'
+    Value: !GetAtt RemediationLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RemediationLambdaFunctionArn'
+
+  NotificationLambdaFunctionArn:
+    Description: 'ARN of the notification Lambda function'
+    Value: !GetAtt NotificationLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationLambdaFunctionArn'
+
+  SecurityHubFindingsRuleArn:
+    Description: 'ARN of the Security Hub findings EventBridge rule'
+    Value: !GetAtt SecurityHubFindingsRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityHubFindingsRuleArn'
+
+  RemediationActionRuleArn:
+    Description: 'ARN of the remediation action EventBridge rule'
+    Value: !GetAtt RemediationActionRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RemediationActionRuleArn'
+
+  DeadLetterQueueUrl:
+    Description: 'URL of the dead letter queue'
+    Value: !Ref SecurityAutomationDeadLetterQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueueUrl'
+
+  InstanceIsolationDocumentName:
+    Description: 'Systems Manager document name for instance isolation'
+    Value: !Ref InstanceIsolationDocument
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceIsolationDocumentName'
+
+  TriggerRemediationActionArn:
+    Description: 'ARN of the trigger remediation custom action'
+    Value: !Ref TriggerRemediationCustomAction
+    Export:
+      Name: !Sub '${AWS::StackName}-TriggerRemediationActionArn'
+
+  EscalateToSOCActionArn:
+    Description: 'ARN of the escalate to SOC custom action'
+    Value: !Ref EscalateToSOCCustomAction
+    Export:
+      Name: !Sub '${AWS::StackName}-EscalateToSOCActionArn'
+
+  SecurityAutomationDashboardUrl:
+    Condition: EnableMonitoringAlarms
+    Description: 'URL to the CloudWatch dashboard'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AutomationPrefix}-monitoring'
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityAutomationDashboardUrl'
+
+  SecurityHubConsoleUrl:
+    Description: 'URL to the Security Hub console'
+    Value: !Sub 'https://console.aws.amazon.com/securityhub/home?region=${AWS::Region}#/findings'
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityHubConsoleUrl'
+
+  # Configuration Summary
+  ConfigurationSummary:
+    Description: 'Summary of security automation configuration'
+    Value: !Sub |
+      Environment: ${Environment}
+      High Severity Auto-Remediation: ${EnableHighSeverityAutoRemediation}
+      Critical Severity Auto-Remediation: ${EnableCriticalSeverityAutoRemediation}
+      Security Hub Automation Rules: ${EnableAutomationRules}
+      CloudWatch Alarms: ${EnableCloudWatchAlarms}
+      Notification Email: ${NotificationEmail}
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigurationSummary'

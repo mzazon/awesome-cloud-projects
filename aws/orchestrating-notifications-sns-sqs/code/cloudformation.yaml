@@ -1,0 +1,1195 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Serverless Notification System using SNS, SQS, and Lambda for scalable, reliable message processing and delivery'
+
+# Template parameters for customization
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'serverless-notifications'
+    Description: 'Name prefix for all resources'
+    AllowedPattern: '[a-zA-Z0-9-]+'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+  
+  TestEmail:
+    Type: String
+    Default: 'test@example.com'
+    Description: 'Email address for testing notifications'
+    AllowedPattern: '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+    ConstraintDescription: 'Must be a valid email address'
+  
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - 'dev'
+      - 'staging'
+      - 'prod'
+    Description: 'Environment for deployment'
+  
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable detailed monitoring for Lambda functions'
+  
+  MessageRetentionPeriod:
+    Type: Number
+    Default: 1209600
+    MinValue: 60
+    MaxValue: 1209600
+    Description: 'SQS message retention period in seconds (1-14 days)'
+  
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 30
+    MaxValue: 900
+    Description: 'Lambda function timeout in seconds'
+  
+  MaxReceiveCount:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+    Description: 'Maximum number of receive attempts before moving to DLQ'
+
+# Conditional resources based on parameters
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  EnableMonitoring: !Equals [!Ref EnableDetailedMonitoring, 'true']
+
+# CloudFormation resources
+Resources:
+  # SNS Topic for message distribution
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-topic'
+      DisplayName: !Sub '${ProjectName} Notification Topic'
+      KmsMasterKeyId: !If
+        - IsProduction
+        - !Ref SNSTopicKMSKey
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Message Distribution'
+  
+  # SNS Topic Policy for secure cross-service access
+  NotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSameAccountPublish
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - SNS:Publish
+              - SNS:GetTopicAttributes
+            Resource: !Ref NotificationTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+          - Sid: AllowAWSServicesPublish
+            Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+                - lambda.amazonaws.com
+                - apigateway.amazonaws.com
+            Action:
+              - SNS:Publish
+            Resource: !Ref NotificationTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+      Topics:
+        - !Ref NotificationTopic
+  
+  # KMS Key for SNS Topic encryption (production only)
+  SNSTopicKMSKey:
+    Type: AWS::KMS::Key
+    Condition: IsProduction
+    Properties:
+      Description: 'KMS key for SNS Topic encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow SNS Service
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:Encrypt
+              - kms:GenerateDataKey
+              - kms:ReEncrypt*
+            Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # KMS Key Alias for SNS Topic
+  SNSTopicKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: IsProduction
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-sns-key'
+      TargetKeyId: !Ref SNSTopicKMSKey
+  
+  # Dead Letter Queue - must be created first for redrive policy
+  NotificationDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-dlq'
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      VisibilityTimeoutSeconds: 300
+      KmsMasterKeyId: !If
+        - IsProduction
+        - !Ref SQSKMSKey
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Dead Letter Queue'
+  
+  # Email Processing Queue
+  EmailNotificationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-email-queue'
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      VisibilityTimeoutSeconds: !Ref LambdaTimeout
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt NotificationDeadLetterQueue.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+      KmsMasterKeyId: !If
+        - IsProduction
+        - !Ref SQSKMSKey
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Email Processing'
+  
+  # SMS Processing Queue
+  SMSNotificationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-sms-queue'
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      VisibilityTimeoutSeconds: !Ref LambdaTimeout
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt NotificationDeadLetterQueue.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+      KmsMasterKeyId: !If
+        - IsProduction
+        - !Ref SQSKMSKey
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'SMS Processing'
+  
+  # Webhook Processing Queue
+  WebhookNotificationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-webhook-queue'
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      VisibilityTimeoutSeconds: !Ref LambdaTimeout
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt NotificationDeadLetterQueue.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+      KmsMasterKeyId: !If
+        - IsProduction
+        - !Ref SQSKMSKey
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Webhook Processing'
+  
+  # KMS Key for SQS Queue encryption (production only)
+  SQSKMSKey:
+    Type: AWS::KMS::Key
+    Condition: IsProduction
+    Properties:
+      Description: 'KMS key for SQS Queue encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow SQS Service
+            Effect: Allow
+            Principal:
+              Service: sqs.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:Encrypt
+              - kms:GenerateDataKey
+              - kms:ReEncrypt*
+            Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # KMS Key Alias for SQS
+  SQSKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: IsProduction
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-sqs-key'
+      TargetKeyId: !Ref SQSKMSKey
+  
+  # SNS Subscriptions with message filtering
+  EmailQueueSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: sqs
+      Endpoint: !GetAtt EmailNotificationQueue.Arn
+      FilterPolicy:
+        notification_type:
+          - 'email'
+          - 'all'
+      RawMessageDelivery: true
+  
+  SMSQueueSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: sqs
+      Endpoint: !GetAtt SMSNotificationQueue.Arn
+      FilterPolicy:
+        notification_type:
+          - 'sms'
+          - 'all'
+      RawMessageDelivery: true
+  
+  WebhookQueueSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: sqs
+      Endpoint: !GetAtt WebhookNotificationQueue.Arn
+      FilterPolicy:
+        notification_type:
+          - 'webhook'
+          - 'all'
+      RawMessageDelivery: true
+  
+  # Queue policies to allow SNS to send messages
+  EmailQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSNSToSendMessages
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt EmailNotificationQueue.Arn
+            Condition:
+              ArnEquals:
+                'aws:SourceArn': !Ref NotificationTopic
+      Queues:
+        - !Ref EmailNotificationQueue
+  
+  SMSQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSNSToSendMessages
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt SMSNotificationQueue.Arn
+            Condition:
+              ArnEquals:
+                'aws:SourceArn': !Ref NotificationTopic
+      Queues:
+        - !Ref SMSNotificationQueue
+  
+  WebhookQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSNSToSendMessages
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt WebhookNotificationQueue.Arn
+            Condition:
+              ArnEquals:
+                'aws:SourceArn': !Ref NotificationTopic
+      Queues:
+        - !Ref WebhookNotificationQueue
+  
+  # IAM Role for Lambda functions
+  NotificationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !If
+          - EnableMonitoring
+          - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+          - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: SQSAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt EmailNotificationQueue.Arn
+                  - !GetAtt SMSNotificationQueue.Arn
+                  - !GetAtt WebhookNotificationQueue.Arn
+                  - !GetAtt NotificationDeadLetterQueue.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - !If
+                - IsProduction
+                - Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                    - kms:DescribeKey
+                    - kms:Encrypt
+                    - kms:GenerateDataKey
+                    - kms:ReEncrypt*
+                  Resource:
+                    - !GetAtt SQSKMSKey.Arn
+                - !Ref AWS::NoValue
+              - !If
+                - EnableMonitoring
+                - Effect: Allow
+                  Action:
+                    - sns:Publish
+                  Resource: !Ref NotificationTopic
+                - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # Email Processing Lambda Function
+  EmailNotificationHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-email-handler'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt NotificationLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      ReservedConcurrencyLimit: !If
+        - IsProduction
+        - 100
+        - !Ref AWS::NoValue
+      TracingConfig:
+        Mode: !If
+          - EnableMonitoring
+          - Active
+          - PassThrough
+      Environment:
+        Variables:
+          TEST_EMAIL: !Ref TestEmail
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+          LOG_LEVEL: !If
+            - IsProduction
+            - 'INFO'
+            - 'DEBUG'
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import os
+          import boto3
+          from datetime import datetime
+          
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger = logging.getLogger()
+          logger.setLevel(getattr(logging, log_level))
+          
+          # Initialize AWS clients
+          if os.environ.get('ENVIRONMENT') == 'prod':
+              sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              """Process email notification messages from SQS"""
+              
+              processed_messages = []
+              failed_messages = []
+              
+              logger.info(f"Processing {len(event['Records'])} messages")
+              
+              for record in event['Records']:
+                  try:
+                      # Parse message body
+                      message_body = json.loads(record['body'])
+                      
+                      # Extract notification details
+                      subject = message_body.get('subject', 'Notification')
+                      message = message_body.get('message', '')
+                      recipient = message_body.get('recipient', os.environ.get('TEST_EMAIL', 'default@example.com'))
+                      priority = message_body.get('priority', 'normal')
+                      timestamp = message_body.get('timestamp', datetime.utcnow().isoformat())
+                      
+                      # Log email details (in production, integrate with SES or other email service)
+                      logger.info(f"Processing email notification:")
+                      logger.info(f"  To: {recipient}")
+                      logger.info(f"  Subject: {subject}")
+                      logger.info(f"  Message: {message}")
+                      logger.info(f"  Priority: {priority}")
+                      logger.info(f"  Timestamp: {timestamp}")
+                      
+                      # TODO: Replace with actual email service integration
+                      # Example: Send email using Amazon SES
+                      # ses = boto3.client('ses')
+                      # ses.send_email(
+                      #     Source='noreply@example.com',
+                      #     Destination={'ToAddresses': [recipient]},
+                      #     Message={
+                      #         'Subject': {'Data': subject},
+                      #         'Body': {'Text': {'Data': message}}
+                      #     }
+                      # )
+                      
+                      processed_messages.append({
+                          'messageId': record['messageId'],
+                          'status': 'success',
+                          'recipient': recipient,
+                          'subject': subject,
+                          'timestamp': timestamp
+                      })
+                      
+                      logger.info(f"Successfully processed email message {record['messageId']}")
+                      
+                  except json.JSONDecodeError as e:
+                      logger.error(f"Invalid JSON in message {record['messageId']}: {str(e)}")
+                      failed_messages.append({
+                          'messageId': record['messageId'],
+                          'error': 'Invalid JSON format',
+                          'details': str(e)
+                      })
+                      # Don't raise - let SQS handle this as a processing failure
+                      
+                  except Exception as e:
+                      logger.error(f"Error processing message {record['messageId']}: {str(e)}")
+                      failed_messages.append({
+                          'messageId': record['messageId'],
+                          'error': 'Processing error',
+                          'details': str(e)
+                      })
+                      # Raise to trigger SQS retry mechanism
+                      raise e
+              
+              # Return summary of processing results
+              result = {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'processed': len(processed_messages),
+                      'failed': len(failed_messages),
+                      'messages': processed_messages,
+                      'failures': failed_messages,
+                      'timestamp': datetime.utcnow().isoformat()
+                  })
+              }
+              
+              logger.info(f"Email processing complete: {len(processed_messages)} processed, {len(failed_messages)} failed")
+              return result
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Email Processing'
+  
+  # SMS Processing Lambda Function
+  SMSNotificationHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-sms-handler'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt NotificationLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      ReservedConcurrencyLimit: !If
+        - IsProduction
+        - 100
+        - !Ref AWS::NoValue
+      TracingConfig:
+        Mode: !If
+          - EnableMonitoring
+          - Active
+          - PassThrough
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+          LOG_LEVEL: !If
+            - IsProduction
+            - 'INFO'
+            - 'DEBUG'
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import os
+          import boto3
+          from datetime import datetime
+          
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger = logging.getLogger()
+          logger.setLevel(getattr(logging, log_level))
+          
+          # Initialize AWS clients
+          if os.environ.get('ENVIRONMENT') == 'prod':
+              sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              """Process SMS notification messages from SQS"""
+              
+              processed_messages = []
+              failed_messages = []
+              
+              logger.info(f"Processing {len(event['Records'])} SMS messages")
+              
+              for record in event['Records']:
+                  try:
+                      # Parse message body
+                      message_body = json.loads(record['body'])
+                      
+                      # Extract notification details
+                      subject = message_body.get('subject', 'Notification')
+                      message = message_body.get('message', '')
+                      phone_number = message_body.get('phone_number', '+1234567890')
+                      priority = message_body.get('priority', 'normal')
+                      timestamp = message_body.get('timestamp', datetime.utcnow().isoformat())
+                      
+                      # Log SMS details (in production, integrate with SNS SMS or Amazon Pinpoint)
+                      logger.info(f"Processing SMS notification:")
+                      logger.info(f"  To: {phone_number}")
+                      logger.info(f"  Subject: {subject}")
+                      logger.info(f"  Message: {message}")
+                      logger.info(f"  Priority: {priority}")
+                      logger.info(f"  Timestamp: {timestamp}")
+                      
+                      # TODO: Replace with actual SMS service integration
+                      # Example: Send SMS using Amazon SNS
+                      # sns.publish(
+                      #     PhoneNumber=phone_number,
+                      #     Message=f"{subject}: {message}"
+                      # )
+                      
+                      processed_messages.append({
+                          'messageId': record['messageId'],
+                          'status': 'success',
+                          'phone_number': phone_number,
+                          'subject': subject,
+                          'timestamp': timestamp
+                      })
+                      
+                      logger.info(f"Successfully processed SMS message {record['messageId']}")
+                      
+                  except json.JSONDecodeError as e:
+                      logger.error(f"Invalid JSON in message {record['messageId']}: {str(e)}")
+                      failed_messages.append({
+                          'messageId': record['messageId'],
+                          'error': 'Invalid JSON format',
+                          'details': str(e)
+                      })
+                      
+                  except Exception as e:
+                      logger.error(f"Error processing message {record['messageId']}: {str(e)}")
+                      failed_messages.append({
+                          'messageId': record['messageId'],
+                          'error': 'Processing error',
+                          'details': str(e)
+                      })
+                      # Raise to trigger SQS retry mechanism
+                      raise e
+              
+              # Return summary of processing results
+              result = {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'processed': len(processed_messages),
+                      'failed': len(failed_messages),
+                      'messages': processed_messages,
+                      'failures': failed_messages,
+                      'timestamp': datetime.utcnow().isoformat()
+                  })
+              }
+              
+              logger.info(f"SMS processing complete: {len(processed_messages)} processed, {len(failed_messages)} failed")
+              return result
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'SMS Processing'
+  
+  # Webhook Processing Lambda Function
+  WebhookNotificationHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-webhook-handler'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt NotificationLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      ReservedConcurrencyLimit: !If
+        - IsProduction
+        - 100
+        - !Ref AWS::NoValue
+      TracingConfig:
+        Mode: !If
+          - EnableMonitoring
+          - Active
+          - PassThrough
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+          LOG_LEVEL: !If
+            - IsProduction
+            - 'INFO'
+            - 'DEBUG'
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import os
+          import urllib3
+          from datetime import datetime
+          
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger = logging.getLogger()
+          logger.setLevel(getattr(logging, log_level))
+          
+          # Initialize HTTP client
+          http = urllib3.PoolManager()
+          
+          def lambda_handler(event, context):
+              """Process webhook notification messages from SQS"""
+              
+              processed_messages = []
+              failed_messages = []
+              
+              logger.info(f"Processing {len(event['Records'])} webhook messages")
+              
+              for record in event['Records']:
+                  try:
+                      # Parse message body
+                      message_body = json.loads(record['body'])
+                      
+                      # Extract webhook details
+                      webhook_url = message_body.get('webhook_url', '')
+                      payload = message_body.get('payload', {})
+                      headers = message_body.get('headers', {'Content-Type': 'application/json'})
+                      retry_count = message_body.get('retry_count', 0)
+                      timestamp = message_body.get('timestamp', datetime.utcnow().isoformat())
+                      
+                      if not webhook_url:
+                          logger.error(f"No webhook URL provided in message {record['messageId']}")
+                          failed_messages.append({
+                              'messageId': record['messageId'],
+                              'error': 'No webhook URL provided',
+                              'timestamp': timestamp
+                          })
+                          continue
+                      
+                      # Log webhook details
+                      logger.info(f"Processing webhook notification:")
+                      logger.info(f"  URL: {webhook_url}")
+                      logger.info(f"  Payload: {json.dumps(payload, indent=2)}")
+                      logger.info(f"  Retry Count: {retry_count}")
+                      logger.info(f"  Timestamp: {timestamp}")
+                      
+                      # Send webhook request with timeout and error handling
+                      try:
+                          response = http.request(
+                              'POST',
+                              webhook_url,
+                              body=json.dumps(payload),
+                              headers=headers,
+                              timeout=30,
+                              retries=urllib3.Retry(
+                                  total=2,
+                                  backoff_factor=1,
+                                  status_forcelist=[500, 502, 503, 504]
+                              )
+                          )
+                          
+                          if response.status == 200:
+                              logger.info(f"Webhook sent successfully to {webhook_url}")
+                              status = 'success'
+                          else:
+                              logger.warning(f"Webhook returned status {response.status} for {webhook_url}")
+                              status = 'retry'
+                              
+                      except Exception as webhook_error:
+                          logger.error(f"Webhook request failed for {webhook_url}: {str(webhook_error)}")
+                          status = 'failed'
+                          
+                          # Only retry if we haven't exceeded the retry limit
+                          if retry_count < 3:
+                              logger.info(f"Will retry webhook {webhook_url} (attempt {retry_count + 1}/3)")
+                              raise webhook_error  # Will trigger SQS retry
+                      
+                      processed_messages.append({
+                          'messageId': record['messageId'],
+                          'status': status,
+                          'webhook_url': webhook_url,
+                          'retry_count': retry_count,
+                          'timestamp': timestamp
+                      })
+                      
+                      logger.info(f"Successfully processed webhook message {record['messageId']}")
+                      
+                  except json.JSONDecodeError as e:
+                      logger.error(f"Invalid JSON in message {record['messageId']}: {str(e)}")
+                      failed_messages.append({
+                          'messageId': record['messageId'],
+                          'error': 'Invalid JSON format',
+                          'details': str(e)
+                      })
+                      
+                  except Exception as e:
+                      logger.error(f"Error processing message {record['messageId']}: {str(e)}")
+                      failed_messages.append({
+                          'messageId': record['messageId'],
+                          'error': 'Processing error',
+                          'details': str(e)
+                      })
+                      # Raise to trigger SQS retry mechanism
+                      raise e
+              
+              # Return summary of processing results
+              result = {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'processed': len(processed_messages),
+                      'failed': len(failed_messages),
+                      'messages': processed_messages,
+                      'failures': failed_messages,
+                      'timestamp': datetime.utcnow().isoformat()
+                  })
+              }
+              
+              logger.info(f"Webhook processing complete: {len(processed_messages)} processed, {len(failed_messages)} failed")
+              return result
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Webhook Processing'
+  
+  # Dead Letter Queue Processing Lambda Function
+  DLQProcessorHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-dlq-processor'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt NotificationLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      TracingConfig:
+        Mode: !If
+          - EnableMonitoring
+          - Active
+          - PassThrough
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+          LOG_LEVEL: !If
+            - IsProduction
+            - 'INFO'
+            - 'DEBUG'
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import os
+          import boto3
+          from datetime import datetime
+          
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger = logging.getLogger()
+          logger.setLevel(getattr(logging, log_level))
+          
+          # Initialize AWS clients
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              """Process messages from Dead Letter Queue for analysis and alerting"""
+              
+              processed_messages = []
+              sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
+              
+              logger.info(f"Processing {len(event['Records'])} DLQ messages")
+              
+              for record in event['Records']:
+                  try:
+                      # Parse message body
+                      message_body = json.loads(record['body'])
+                      
+                      # Extract failure details
+                      original_message = message_body.get('message', 'Unknown')
+                      failure_reason = message_body.get('failure_reason', 'Unknown failure')
+                      original_timestamp = message_body.get('timestamp', 'Unknown')
+                      queue_name = message_body.get('source_queue', 'Unknown')
+                      
+                      # Log DLQ message details
+                      logger.error(f"DLQ Message Analysis:")
+                      logger.error(f"  Message ID: {record['messageId']}")
+                      logger.error(f"  Original Message: {original_message}")
+                      logger.error(f"  Failure Reason: {failure_reason}")
+                      logger.error(f"  Original Timestamp: {original_timestamp}")
+                      logger.error(f"  Source Queue: {queue_name}")
+                      logger.error(f"  DLQ Timestamp: {datetime.utcnow().isoformat()}")
+                      
+                      # TODO: Implement alerting logic
+                      # Example: Send alert to operations team
+                      # if sns_topic_arn:
+                      #     sns.publish(
+                      #         TopicArn=sns_topic_arn,
+                      #         Subject=f"DLQ Alert - {queue_name}",
+                      #         Message=f"Failed message detected in DLQ: {failure_reason}",
+                      #         MessageAttributes={
+                      #             'notification_type': {
+                      #                 'DataType': 'String',
+                      #                 'StringValue': 'alert'
+                      #             }
+                      #         }
+                      #     )
+                      
+                      processed_messages.append({
+                          'messageId': record['messageId'],
+                          'status': 'analyzed',
+                          'failure_reason': failure_reason,
+                          'source_queue': queue_name,
+                          'timestamp': datetime.utcnow().isoformat()
+                      })
+                      
+                      logger.info(f"Successfully analyzed DLQ message {record['messageId']}")
+                      
+                  except json.JSONDecodeError as e:
+                      logger.error(f"Invalid JSON in DLQ message {record['messageId']}: {str(e)}")
+                      
+                  except Exception as e:
+                      logger.error(f"Error processing DLQ message {record['messageId']}: {str(e)}")
+                      # Don't raise - we don't want DLQ messages to fail processing
+              
+              # Return summary of processing results
+              result = {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'processed': len(processed_messages),
+                      'messages': processed_messages,
+                      'timestamp': datetime.utcnow().isoformat()
+                  })
+              }
+              
+              logger.info(f"DLQ processing complete: {len(processed_messages)} messages analyzed")
+              return result
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'DLQ Processing'
+  
+  # Event Source Mappings - Connect SQS queues to Lambda functions
+  EmailQueueEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt EmailNotificationQueue.Arn
+      FunctionName: !Ref EmailNotificationHandler
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      StartingPosition: LATEST
+      ParallelizationFactor: !If
+        - IsProduction
+        - 10
+        - 2
+      MaximumRetryAttempts: 3
+      BisectBatchOnFunctionError: true
+      MaximumRecordAgeInSeconds: 3600
+  
+  SMSQueueEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt SMSNotificationQueue.Arn
+      FunctionName: !Ref SMSNotificationHandler
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      StartingPosition: LATEST
+      ParallelizationFactor: !If
+        - IsProduction
+        - 10
+        - 2
+      MaximumRetryAttempts: 3
+      BisectBatchOnFunctionError: true
+      MaximumRecordAgeInSeconds: 3600
+  
+  WebhookQueueEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt WebhookNotificationQueue.Arn
+      FunctionName: !Ref WebhookNotificationHandler
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      StartingPosition: LATEST
+      ParallelizationFactor: !If
+        - IsProduction
+        - 10
+        - 2
+      MaximumRetryAttempts: 3
+      BisectBatchOnFunctionError: true
+      MaximumRecordAgeInSeconds: 3600
+  
+  DLQEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt NotificationDeadLetterQueue.Arn
+      FunctionName: !Ref DLQProcessorHandler
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 30
+      StartingPosition: LATEST
+      ParallelizationFactor: 2
+      MaximumRetryAttempts: 1
+      BisectBatchOnFunctionError: false
+      MaximumRecordAgeInSeconds: 3600
+  
+  # CloudWatch Alarms for monitoring (production only)
+  DLQDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub '${ProjectName}-dlq-depth-alarm'
+      AlarmDescription: 'Alert when DLQ has messages'
+      MetricName: ApproximateNumberOfMessages
+      Namespace: AWS/SQS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt NotificationDeadLetterQueue.QueueName
+      AlarmActions:
+        - !Ref NotificationTopic
+  
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-error-alarm'
+      AlarmDescription: 'Alert when Lambda functions have errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref NotificationTopic
+
+# CloudFormation outputs
+Outputs:
+  SNSTopicArn:
+    Description: 'ARN of the SNS Topic for publishing notifications'
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${ProjectName}-sns-topic-arn'
+  
+  SNSTopicName:
+    Description: 'Name of the SNS Topic'
+    Value: !GetAtt NotificationTopic.TopicName
+    Export:
+      Name: !Sub '${ProjectName}-sns-topic-name'
+  
+  EmailQueueArn:
+    Description: 'ARN of the Email Processing Queue'
+    Value: !GetAtt EmailNotificationQueue.Arn
+    Export:
+      Name: !Sub '${ProjectName}-email-queue-arn'
+  
+  EmailQueueUrl:
+    Description: 'URL of the Email Processing Queue'
+    Value: !Ref EmailNotificationQueue
+    Export:
+      Name: !Sub '${ProjectName}-email-queue-url'
+  
+  SMSQueueArn:
+    Description: 'ARN of the SMS Processing Queue'
+    Value: !GetAtt SMSNotificationQueue.Arn
+    Export:
+      Name: !Sub '${ProjectName}-sms-queue-arn'
+  
+  SMSQueueUrl:
+    Description: 'URL of the SMS Processing Queue'
+    Value: !Ref SMSNotificationQueue
+    Export:
+      Name: !Sub '${ProjectName}-sms-queue-url'
+  
+  WebhookQueueArn:
+    Description: 'ARN of the Webhook Processing Queue'
+    Value: !GetAtt WebhookNotificationQueue.Arn
+    Export:
+      Name: !Sub '${ProjectName}-webhook-queue-arn'
+  
+  WebhookQueueUrl:
+    Description: 'URL of the Webhook Processing Queue'
+    Value: !Ref WebhookNotificationQueue
+    Export:
+      Name: !Sub '${ProjectName}-webhook-queue-url'
+  
+  DeadLetterQueueArn:
+    Description: 'ARN of the Dead Letter Queue'
+    Value: !GetAtt NotificationDeadLetterQueue.Arn
+    Export:
+      Name: !Sub '${ProjectName}-dlq-arn'
+  
+  DeadLetterQueueUrl:
+    Description: 'URL of the Dead Letter Queue'
+    Value: !Ref NotificationDeadLetterQueue
+    Export:
+      Name: !Sub '${ProjectName}-dlq-url'
+  
+  EmailHandlerArn:
+    Description: 'ARN of the Email Processing Lambda Function'
+    Value: !GetAtt EmailNotificationHandler.Arn
+    Export:
+      Name: !Sub '${ProjectName}-email-handler-arn'
+  
+  SMSHandlerArn:
+    Description: 'ARN of the SMS Processing Lambda Function'
+    Value: !GetAtt SMSNotificationHandler.Arn
+    Export:
+      Name: !Sub '${ProjectName}-sms-handler-arn'
+  
+  WebhookHandlerArn:
+    Description: 'ARN of the Webhook Processing Lambda Function'
+    Value: !GetAtt WebhookNotificationHandler.Arn
+    Export:
+      Name: !Sub '${ProjectName}-webhook-handler-arn'
+  
+  DLQProcessorArn:
+    Description: 'ARN of the DLQ Processor Lambda Function'
+    Value: !GetAtt DLQProcessorHandler.Arn
+    Export:
+      Name: !Sub '${ProjectName}-dlq-processor-arn'
+  
+  LambdaRoleArn:
+    Description: 'ARN of the Lambda Execution Role'
+    Value: !GetAtt NotificationLambdaRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-lambda-role-arn'
+  
+  TestingInstructions:
+    Description: 'Instructions for testing the notification system'
+    Value: !Sub |
+      To test the notification system, use the AWS CLI to publish a message to the SNS topic:
+      
+      aws sns publish \
+        --topic-arn ${NotificationTopic} \
+        --message '{"subject":"Test","message":"Hello World","recipient":"${TestEmail}"}' \
+        --message-attributes '{"notification_type":{"DataType":"String","StringValue":"email"}}'
+  
+  ManagementConsoleLinks:
+    Description: 'AWS Management Console links for monitoring'
+    Value: !Sub |
+      SNS Topic: https://console.aws.amazon.com/sns/v3/home?region=${AWS::Region}#/topic/${NotificationTopic}
+      Email Queue: https://console.aws.amazon.com/sqs/v2/home?region=${AWS::Region}#/queues/${EmailNotificationQueue}
+      SMS Queue: https://console.aws.amazon.com/sqs/v2/home?region=${AWS::Region}#/queues/${SMSNotificationQueue}
+      Webhook Queue: https://console.aws.amazon.com/sqs/v2/home?region=${AWS::Region}#/queues/${WebhookNotificationQueue}
+      Dead Letter Queue: https://console.aws.amazon.com/sqs/v2/home?region=${AWS::Region}#/queues/${NotificationDeadLetterQueue}
+      Email Handler: https://console.aws.amazon.com/lambda/home?region=${AWS::Region}#/functions/${EmailNotificationHandler}
+      SMS Handler: https://console.aws.amazon.com/lambda/home?region=${AWS::Region}#/functions/${SMSNotificationHandler}
+      Webhook Handler: https://console.aws.amazon.com/lambda/home?region=${AWS::Region}#/functions/${WebhookNotificationHandler}
+      DLQ Processor: https://console.aws.amazon.com/lambda/home?region=${AWS::Region}#/functions/${DLQProcessorHandler}

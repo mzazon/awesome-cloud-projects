@@ -1,0 +1,648 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Automated Cost Optimization Workflows with AWS Cost Optimization Hub and AWS Budgets.
+  This template creates a comprehensive cost monitoring and optimization system including
+  budgets, SNS notifications, Lambda automation, and Cost Anomaly Detection integration.
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive budget and cost optimization notifications
+    AllowedPattern: '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+    ConstraintDescription: Must be a valid email address
+    
+  MonthlyCostBudgetAmount:
+    Type: Number
+    Description: Monthly cost budget amount in USD
+    Default: 1000
+    MinValue: 1
+    MaxValue: 100000
+    ConstraintDescription: Must be between $1 and $100,000
+    
+  EC2UsageBudgetHours:
+    Type: Number
+    Description: Monthly EC2 usage budget in hours
+    Default: 2000
+    MinValue: 1
+    MaxValue: 100000
+    ConstraintDescription: Must be between 1 and 100,000 hours
+    
+  RIUtilizationThreshold:
+    Type: Number
+    Description: Reserved Instance utilization threshold percentage (alert when below this value)
+    Default: 80
+    MinValue: 50
+    MaxValue: 99
+    ConstraintDescription: Must be between 50% and 99%
+    
+  CostAnomalyThreshold:
+    Type: Number
+    Description: Cost anomaly threshold in USD for daily anomaly detection
+    Default: 100
+    MinValue: 10
+    MaxValue: 10000
+    ConstraintDescription: Must be between $10 and $10,000
+    
+  EnableBudgetActions:
+    Type: String
+    Description: Enable automated budget actions to restrict resource provisioning
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    
+  Environment:
+    Type: String
+    Description: Environment name for resource tagging
+    Default: production
+    AllowedValues: [development, staging, production]
+
+Conditions:
+  EnableBudgetActionsCondition: !Equals [!Ref EnableBudgetActions, 'true']
+
+Resources:
+  # ============================================================================
+  # SNS Topic and Subscription for Notifications
+  # ============================================================================
+  
+  CostOptimizationSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'cost-optimization-alerts-${AWS::StackName}'
+      DisplayName: 'AWS Cost Optimization Alerts'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub 'cost-optimization-alerts-${AWS::StackName}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: CostOptimization
+        
+  CostOptimizationSNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref CostOptimizationSNSTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: budgets.amazonaws.com
+            Action: SNS:Publish
+            Resource: !Ref CostOptimizationSNSTopic
+          - Effect: Allow
+            Principal:
+              Service: ce.amazonaws.com
+            Action: SNS:Publish
+            Resource: !Ref CostOptimizationSNSTopic
+            
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref CostOptimizationSNSTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ============================================================================
+  # IAM Roles for Budget Actions and Lambda Function
+  # ============================================================================
+  
+  BudgetActionsRole:
+    Type: AWS::IAM::Role
+    Condition: EnableBudgetActionsCondition
+    Properties:
+      RoleName: !Sub 'BudgetActionsRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: budgets.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSBudgetsActionsWithAWSResourceControlAccess
+      Tags:
+        - Key: Name
+          Value: !Sub 'BudgetActionsRole-${AWS::StackName}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: BudgetActions
+
+  BudgetRestrictionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: EnableBudgetActionsCondition
+    Properties:
+      ManagedPolicyName: !Sub 'BudgetRestrictionPolicy-${AWS::StackName}'
+      Description: 'Policy to restrict resource provisioning when budget thresholds are exceeded'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Action:
+              - ec2:RunInstances
+              - ec2:StartInstances
+              - rds:CreateDBInstance
+              - rds:CreateDBCluster
+              - ecs:CreateCluster
+              - ecs:CreateService
+              - lambda:CreateFunction
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref AWS::Region
+      Roles:
+        - !Ref BudgetActionsRole
+
+  CostOptimizationLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'CostOptimizationLambdaRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/CostOptimizationHubServiceRolePolicy
+      Policies:
+        - PolicyName: CostOptimizationPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ce:GetAnomalyDetectors
+                  - ce:GetAnomalySubscriptions
+                  - ce:GetAnomalies
+                  - budgets:ViewBudget
+                  - budgets:DescribeBudgets
+                  - sns:Publish
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub 'CostOptimizationLambdaRole-${AWS::StackName}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: CostOptimization
+
+  # ============================================================================
+  # Lambda Function for Cost Optimization Automation
+  # ============================================================================
+  
+  CostOptimizationLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'cost-optimization-handler-${AWS::StackName}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt CostOptimizationLambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      ReservedConcurrencyLimit: 10
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref CostOptimizationSNSTopic
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime, timedelta
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          # Initialize AWS clients
+          coh_client = boto3.client('cost-optimization-hub')
+          ce_client = boto3.client('ce')
+          sns_client = boto3.client('sns')
+          budgets_client = boto3.client('budgets')
+          
+          def lambda_handler(event, context):
+              """
+              Process Cost Optimization Hub recommendations and budget alerts.
+              Automatically analyze cost optimization opportunities and send detailed reports.
+              """
+              try:
+                  logger.info(f"Processing cost optimization event: {json.dumps(event, default=str)}")
+                  
+                  sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
+                  environment = os.environ.get('ENVIRONMENT', 'unknown')
+                  
+                  # Initialize response data
+                  recommendations_processed = 0
+                  total_potential_savings = 0.0
+                  
+                  # Process SNS message from budget alerts or direct invocation
+                  if 'Records' in event:
+                      for record in event['Records']:
+                          if record.get('EventSource') == 'aws:sns':
+                              message = json.loads(record['Sns']['Message'])
+                              logger.info(f"Processing budget alert: {message.get('AlarmName', 'Unknown Alert')}")
+                              
+                              # Trigger cost optimization analysis
+                              recommendations_processed, total_potential_savings = analyze_cost_optimization()
+                  else:
+                      # Direct invocation - perform routine analysis
+                      logger.info("Performing routine cost optimization analysis")
+                      recommendations_processed, total_potential_savings = analyze_cost_optimization()
+                  
+                  # Send summary notification
+                  if recommendations_processed > 0:
+                      summary_message = create_summary_report(recommendations_processed, total_potential_savings, environment)
+                      
+                      sns_client.publish(
+                          TopicArn=sns_topic_arn,
+                          Subject=f"Cost Optimization Report - {environment.title()}",
+                          Message=summary_message
+                      )
+                      logger.info(f"Sent summary notification for {recommendations_processed} recommendations")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Cost optimization processing completed successfully',
+                          'recommendations_processed': recommendations_processed,
+                          'total_potential_savings': total_potential_savings,
+                          'environment': environment
+                      })
+                  }
+                  
+              except Exception as e:
+                  error_message = f"Error processing cost optimization: {str(e)}"
+                  logger.error(error_message)
+                  
+                  # Send error notification
+                  try:
+                      sns_client.publish(
+                          TopicArn=os.environ.get('SNS_TOPIC_ARN'),
+                          Subject="Cost Optimization Processing Error",
+                          Message=f"An error occurred during cost optimization processing:\n\n{error_message}"
+                      )
+                  except Exception as sns_error:
+                      logger.error(f"Failed to send error notification: {str(sns_error)}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': error_message
+                      })
+                  }
+          
+          def analyze_cost_optimization():
+              """
+              Analyze Cost Optimization Hub recommendations and return summary statistics.
+              """
+              try:
+                  recommendations_processed = 0
+                  total_potential_savings = 0.0
+                  
+                  # Get cost optimization recommendations
+                  logger.info("Fetching Cost Optimization Hub recommendations")
+                  
+                  try:
+                      response = coh_client.list_recommendations(
+                          includeAllRecommendations=True,
+                          maxResults=50
+                      )
+                      
+                      recommendations = response.get('items', [])
+                      logger.info(f"Found {len(recommendations)} cost optimization recommendations")
+                      
+                      # Process each recommendation
+                      for rec in recommendations:
+                          try:
+                              rec_id = rec.get('recommendationId', 'unknown')
+                              action_type = rec.get('actionType', 'unknown')
+                              estimated_savings = float(rec.get('estimatedMonthlySavings', 0))
+                              
+                              logger.info(f"Processing recommendation {rec_id}: {action_type} - ${estimated_savings:.2f} potential monthly savings")
+                              
+                              # Categorize recommendations for reporting
+                              if action_type in ['RightSizeEc2Instance', 'StopEc2Instance']:
+                                  logger.info(f"EC2 optimization opportunity: {action_type}")
+                              elif action_type in ['StopRdsDbInstance', 'RightSizeRdsDbInstance']:
+                                  logger.info(f"RDS optimization opportunity: {action_type}")
+                              elif 'ReservedInstance' in action_type or 'SavingsPlans' in action_type:
+                                  logger.info(f"Purchase recommendation: {action_type}")
+                              
+                              recommendations_processed += 1
+                              total_potential_savings += estimated_savings
+                              
+                          except Exception as rec_error:
+                              logger.error(f"Error processing individual recommendation: {str(rec_error)}")
+                              continue
+                              
+                  except Exception as coh_error:
+                      logger.warning(f"Cost Optimization Hub not available or no recommendations: {str(coh_error)}")
+                  
+                  return recommendations_processed, total_potential_savings
+                  
+              except Exception as e:
+                  logger.error(f"Error in analyze_cost_optimization: {str(e)}")
+                  return 0, 0.0
+          
+          def create_summary_report(recommendations_count, total_savings, environment):
+              """
+              Create a formatted summary report for cost optimization findings.
+              """
+              current_time = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+              
+              report = f"""
+          AWS Cost Optimization Report
+          ============================
+          
+          Environment: {environment.title()}
+          Generated: {current_time}
+          
+          Summary:
+          --------
+          • Total Recommendations: {recommendations_count}
+          • Estimated Monthly Savings: ${total_savings:.2f}
+          • Estimated Annual Savings: ${total_savings * 12:.2f}
+          
+          Next Steps:
+          -----------
+          1. Review detailed recommendations in the AWS Cost Optimization Hub console
+          2. Prioritize recommendations based on business impact and implementation effort
+          3. Schedule implementation of approved optimizations
+          4. Monitor savings realization through AWS Cost Explorer
+          
+          Console Links:
+          --------------
+          • Cost Optimization Hub: https://console.aws.amazon.com/cost-optimization-hub/
+          • Cost Explorer: https://console.aws.amazon.com/cost-management/home#/cost-explorer
+          • AWS Budgets: https://console.aws.amazon.com/billing/home#/budgets
+          
+          This is an automated report. For questions, contact your cloud operations team.
+          """
+              
+              return report.strip()
+      Tags:
+        - Key: Name
+          Value: !Sub 'cost-optimization-handler-${AWS::StackName}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: CostOptimization
+
+  # ============================================================================
+  # SNS Topic Subscription for Lambda Function
+  # ============================================================================
+  
+  LambdaSNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref CostOptimizationSNSTopic
+      Protocol: lambda
+      Endpoint: !GetAtt CostOptimizationLambdaFunction.Arn
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CostOptimizationLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref CostOptimizationSNSTopic
+
+  # ============================================================================
+  # AWS Budgets Configuration
+  # ============================================================================
+  
+  MonthlyCostBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub 'monthly-cost-budget-${AWS::StackName}'
+        BudgetLimit:
+          Amount: !Ref MonthlyCostBudgetAmount
+          Unit: USD
+        TimeUnit: MONTHLY
+        BudgetType: COST
+        CostFilters: {}
+        TimePeriod:
+          Start: !Sub '${AWS::AccountId}'  # Will be replaced by current month start
+          End: !Sub '${AWS::AccountId}'    # Will be replaced by current month end
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+            NotificationState: ENABLED
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref CostOptimizationSNSTopic
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+            NotificationState: ENABLED
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref CostOptimizationSNSTopic
+
+  EC2UsageBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub 'ec2-usage-budget-${AWS::StackName}'
+        BudgetLimit:
+          Amount: !Ref EC2UsageBudgetHours
+          Unit: HOURS
+        TimeUnit: MONTHLY
+        BudgetType: USAGE
+        CostFilters:
+          Service:
+            - Amazon Elastic Compute Cloud - Compute
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+            NotificationState: ENABLED
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref CostOptimizationSNSTopic
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 90
+            ThresholdType: PERCENTAGE
+            NotificationState: ENABLED
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref CostOptimizationSNSTopic
+
+  RIUtilizationBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub 'ri-utilization-budget-${AWS::StackName}'
+        BudgetLimit:
+          Amount: !Ref RIUtilizationThreshold
+          Unit: PERCENT
+        TimeUnit: MONTHLY
+        BudgetType: RI_UTILIZATION
+        CostFilters:
+          Service:
+            - Amazon Elastic Compute Cloud - Compute
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: LESS_THAN
+            Threshold: !Ref RIUtilizationThreshold
+            ThresholdType: PERCENTAGE
+            NotificationState: ENABLED
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref CostOptimizationSNSTopic
+
+  # ============================================================================
+  # EventBridge Rule for Scheduled Cost Optimization Analysis
+  # ============================================================================
+  
+  CostOptimizationScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'cost-optimization-schedule-${AWS::StackName}'
+      Description: 'Triggers daily cost optimization analysis'
+      ScheduleExpression: 'cron(0 8 * * ? *)'  # Daily at 8 AM UTC
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CostOptimizationLambdaFunction.Arn
+          Id: CostOptimizationTarget
+          Input: '{"source": "scheduled-analysis", "detail-type": "Daily Cost Optimization Check"}'
+
+  LambdaEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CostOptimizationLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CostOptimizationScheduleRule.Arn
+
+  # ============================================================================
+  # CloudWatch Alarms for Additional Monitoring
+  # ============================================================================
+  
+  BudgetLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'cost-optimization-lambda-errors-${AWS::StackName}'
+      AlarmDescription: 'Monitors Lambda function errors for cost optimization processing'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CostOptimizationLambdaFunction
+      AlarmActions:
+        - !Ref CostOptimizationSNSTopic
+      TreatMissingData: notBreaching
+
+  BudgetLambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'cost-optimization-lambda-duration-${AWS::StackName}'
+      AlarmDescription: 'Monitors Lambda function duration for performance optimization'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 240000  # 4 minutes (80% of 5-minute timeout)
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CostOptimizationLambdaFunction
+      AlarmActions:
+        - !Ref CostOptimizationSNSTopic
+      TreatMissingData: notBreaching
+
+# ============================================================================
+# Outputs
+# ============================================================================
+
+Outputs:
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for cost optimization notifications'
+    Value: !Ref CostOptimizationSNSTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+      
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function for cost optimization automation'
+    Value: !GetAtt CostOptimizationLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+      
+  MonthlyCostBudgetName:
+    Description: 'Name of the monthly cost budget'
+    Value: !Sub 'monthly-cost-budget-${AWS::StackName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-MonthlyCostBudgetName'
+      
+  EC2UsageBudgetName:
+    Description: 'Name of the EC2 usage budget'
+    Value: !Sub 'ec2-usage-budget-${AWS::StackName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-EC2UsageBudgetName'
+      
+  RIUtilizationBudgetName:
+    Description: 'Name of the Reserved Instance utilization budget'
+    Value: !Sub 'ri-utilization-budget-${AWS::StackName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-RIUtilizationBudgetName'
+      
+  BudgetActionsRoleArn:
+    Description: 'ARN of the IAM role for budget actions (if enabled)'
+    Value: !If 
+      - EnableBudgetActionsCondition
+      - !GetAtt BudgetActionsRole.Arn
+      - 'Budget actions not enabled'
+    Export:
+      Name: !Sub '${AWS::StackName}-BudgetActionsRoleArn'
+      
+  CostOptimizationHubConsoleURL:
+    Description: 'URL to AWS Cost Optimization Hub console'
+    Value: 'https://console.aws.amazon.com/cost-optimization-hub/'
+    Export:
+      Name: !Sub '${AWS::StackName}-CostOptimizationHubURL'
+      
+  BudgetsConsoleURL:
+    Description: 'URL to AWS Budgets console'
+    Value: 'https://console.aws.amazon.com/billing/home#/budgets'
+    Export:
+      Name: !Sub '${AWS::StackName}-BudgetsConsoleURL'
+      
+  ScheduledAnalysisRule:
+    Description: 'EventBridge rule for scheduled cost optimization analysis'
+    Value: !Ref CostOptimizationScheduleRule
+    Export:
+      Name: !Sub '${AWS::StackName}-ScheduledAnalysisRule'
+      
+  DeploymentSummary:
+    Description: 'Summary of deployed cost optimization components'
+    Value: !Sub |
+      Cost Optimization Hub: Enabled (manual setup required)
+      Monthly Budget: $${MonthlyCostBudgetAmount} USD
+      EC2 Usage Budget: ${EC2UsageBudgetHours} hours
+      RI Utilization Threshold: ${RIUtilizationThreshold}%
+      Budget Actions: ${EnableBudgetActions}
+      Environment: ${Environment}
+      Notification Email: ${NotificationEmail}

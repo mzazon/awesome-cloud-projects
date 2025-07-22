@@ -1,0 +1,699 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for EKS Node Groups with Spot Instances and Mixed Instance Types - Cost-optimized Kubernetes worker nodes with fault tolerance'
+
+Parameters:
+  # Cluster Configuration
+  ClusterName:
+    Type: String
+    Description: 'Name of the existing EKS cluster'
+    MinLength: 1
+    MaxLength: 100
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9\-]*$'
+    ConstraintDescription: 'Must begin with a letter and contain only alphanumeric characters and hyphens'
+  
+  # Node Group Configuration
+  SpotNodeGroupName:
+    Type: String
+    Description: 'Name for the Spot instance node group'
+    Default: 'spot-mixed-nodegroup'
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9\-]*$'
+  
+  OnDemandNodeGroupName:
+    Type: String
+    Description: 'Name for the On-Demand instance node group'
+    Default: 'ondemand-backup-nodegroup'
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9\-]*$'
+  
+  # Scaling Configuration
+  SpotMinSize:
+    Type: Number
+    Description: 'Minimum number of Spot instances'
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+  
+  SpotMaxSize:
+    Type: Number
+    Description: 'Maximum number of Spot instances'
+    Default: 10
+    MinValue: 2
+    MaxValue: 100
+  
+  SpotDesiredSize:
+    Type: Number
+    Description: 'Desired number of Spot instances'
+    Default: 4
+    MinValue: 1
+    MaxValue: 50
+  
+  OnDemandMinSize:
+    Type: Number
+    Description: 'Minimum number of On-Demand instances'
+    Default: 1
+    MinValue: 1
+    MaxValue: 5
+  
+  OnDemandMaxSize:
+    Type: Number
+    Description: 'Maximum number of On-Demand instances'
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+  
+  OnDemandDesiredSize:
+    Type: Number
+    Description: 'Desired number of On-Demand instances'
+    Default: 2
+    MinValue: 1
+    MaxValue: 5
+  
+  # Instance Configuration
+  InstanceTypes:
+    Type: CommaDelimitedList
+    Description: 'List of instance types for mixed instance groups'
+    Default: 'm5.large,m5a.large,c5.large,c5a.large,m5.xlarge,c5.xlarge'
+    AllowedValues:
+      - 'm5.large,m5a.large,c5.large,c5a.large,m5.xlarge,c5.xlarge'
+      - 'm5.large,c5.large,m5.xlarge,c5.xlarge'
+      - 'm5.large,m5a.large,c5.large,c5a.large'
+  
+  OnDemandInstanceTypes:
+    Type: CommaDelimitedList
+    Description: 'List of instance types for On-Demand node group'
+    Default: 'm5.large,c5.large'
+    AllowedValues:
+      - 'm5.large,c5.large'
+      - 'm5.large,m5a.large,c5.large'
+      - 'm5.xlarge,c5.xlarge'
+  
+  DiskSize:
+    Type: Number
+    Description: 'EBS volume size in GB'
+    Default: 30
+    MinValue: 20
+    MaxValue: 1000
+  
+  # Networking Configuration
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: 'List of subnet IDs for the node groups (private subnets recommended)'
+    MinLength: 1
+  
+  # Security Configuration
+  AllowedSshCidr:
+    Type: String
+    Description: 'CIDR block allowed for SSH access (optional)'
+    Default: '0.0.0.0/0'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+  
+  # Monitoring Configuration
+  EnableDetailedMonitoring:
+    Type: String
+    Description: 'Enable detailed CloudWatch monitoring for instances'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+  
+  # Cost Optimization Configuration
+  SpotAllocationStrategy:
+    Type: String
+    Description: 'Spot allocation strategy for cost optimization'
+    Default: 'capacity-optimized'
+    AllowedValues:
+      - 'capacity-optimized'
+      - 'diversified'
+      - 'lowest-price'
+  
+  # Tagging Configuration
+  Environment:
+    Type: String
+    Description: 'Environment tag for resources'
+    Default: 'production'
+    AllowedValues: ['development', 'staging', 'production']
+  
+  ProjectName:
+    Type: String
+    Description: 'Project name for resource tagging'
+    Default: 'cost-optimized-eks'
+    MinLength: 1
+    MaxLength: 50
+
+Conditions:
+  EnableMonitoring: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  IsProduction: !Equals [!Ref Environment, 'production']
+
+Resources:
+  # IAM Role for EKS Node Groups
+  EKSNodeGroupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-EKSNodeGroupRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ProjectName
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: EKS-NodeGroup-Role
+
+  # Security Group for Node Groups
+  NodeGroupSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-NodeGroupSecurityGroup'
+      GroupDescription: 'Security group for EKS node groups with mixed instance types'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedSshCidr
+          Description: 'SSH access for troubleshooting'
+        - IpProtocol: tcp
+          FromPort: 1025
+          ToPort: 65535
+          SourceSecurityGroupId: !Ref ClusterSecurityGroup
+          Description: 'Allow communication from EKS control plane'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ClusterSecurityGroup
+          Description: 'Allow HTTPS communication from EKS control plane'
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: 'Allow all outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-NodeGroupSecurityGroup'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ProjectName
+          Value: !Ref ProjectName
+        - Key: !Sub 'kubernetes.io/cluster/${ClusterName}'
+          Value: 'owned'
+
+  # Get VPC ID from existing cluster
+  VpcId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: !Sub '/aws/service/eks/cluster/${ClusterName}/vpc-id'
+    Description: 'VPC ID from existing EKS cluster'
+
+  # Get Cluster Security Group
+  ClusterSecurityGroup:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: !Sub '/aws/service/eks/cluster/${ClusterName}/cluster-security-group-id'
+    Description: 'Cluster security group ID from existing EKS cluster'
+
+  # Launch Template for Spot Instances
+  SpotLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-SpotLaunchTemplate'
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: m5.large  # Default, will be overridden by mixed instance policy
+        SecurityGroupIds:
+          - !Ref NodeGroupSecurityGroup
+        IamInstanceProfile:
+          Name: !Ref NodeInstanceProfile
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref DiskSize
+              VolumeType: gp3
+              DeleteOnTermination: true
+              Encrypted: true
+        Monitoring:
+          Enabled: !If [EnableMonitoring, true, false]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            /etc/eks/bootstrap.sh ${ClusterName}
+            # Install AWS Node Termination Handler
+            curl -o- https://raw.githubusercontent.com/aws/aws-node-termination-handler/v1.21.0/scripts/install-spot-interruption-handler | bash
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-SpotWorker'
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: ProjectName
+                Value: !Ref ProjectName
+              - Key: NodeType
+                Value: spot
+              - Key: !Sub 'kubernetes.io/cluster/${ClusterName}'
+                Value: 'owned'
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-SpotWorker-Volume'
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: ProjectName
+                Value: !Ref ProjectName
+
+  # Launch Template for On-Demand Instances
+  OnDemandLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-OnDemandLaunchTemplate'
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: m5.large  # Default, will be overridden by mixed instance policy
+        SecurityGroupIds:
+          - !Ref NodeGroupSecurityGroup
+        IamInstanceProfile:
+          Name: !Ref NodeInstanceProfile
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref DiskSize
+              VolumeType: gp3
+              DeleteOnTermination: true
+              Encrypted: true
+        Monitoring:
+          Enabled: !If [EnableMonitoring, true, false]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            /etc/eks/bootstrap.sh ${ClusterName}
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-OnDemandWorker'
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: ProjectName
+                Value: !Ref ProjectName
+              - Key: NodeType
+                Value: on-demand
+              - Key: !Sub 'kubernetes.io/cluster/${ClusterName}'
+                Value: 'owned'
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-OnDemandWorker-Volume'
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: ProjectName
+                Value: !Ref ProjectName
+
+  # Get Latest EKS Optimized AMI ID
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/eks/optimized-ami/1.28/amazon-linux-2/recommended/image_id
+    Description: 'Latest EKS optimized AMI ID'
+
+  # Instance Profile for Node Groups
+  NodeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-NodeInstanceProfile'
+      Roles:
+        - !Ref EKSNodeGroupRole
+
+  # Spot Instance Node Group
+  SpotNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      NodegroupName: !Ref SpotNodeGroupName
+      ClusterName: !Ref ClusterName
+      NodeRole: !GetAtt EKSNodeGroupRole.Arn
+      Subnets: !Ref SubnetIds
+      CapacityType: SPOT
+      ScalingConfig:
+        MinSize: !Ref SpotMinSize
+        MaxSize: !Ref SpotMaxSize
+        DesiredSize: !Ref SpotDesiredSize
+      UpdateConfig:
+        MaxUnavailable: 1
+      InstanceTypes: !Ref InstanceTypes
+      AmiType: AL2_x86_64
+      DiskSize: !Ref DiskSize
+      LaunchTemplate:
+        Id: !Ref SpotLaunchTemplate
+        Version: !GetAtt SpotLaunchTemplate.LatestVersionNumber
+      Labels:
+        node-type: spot
+        cost-optimization: enabled
+        workload-type: fault-tolerant
+      Tags:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        NodeType: spot
+        CostOptimization: enabled
+        ManagedBy: CloudFormation
+        !Sub 'kubernetes.io/cluster/${ClusterName}': 'owned'
+
+  # On-Demand Instance Node Group
+  OnDemandNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      NodegroupName: !Ref OnDemandNodeGroupName
+      ClusterName: !Ref ClusterName
+      NodeRole: !GetAtt EKSNodeGroupRole.Arn
+      Subnets: !Ref SubnetIds
+      CapacityType: ON_DEMAND
+      ScalingConfig:
+        MinSize: !Ref OnDemandMinSize
+        MaxSize: !Ref OnDemandMaxSize
+        DesiredSize: !Ref OnDemandDesiredSize
+      UpdateConfig:
+        MaxUnavailable: 1
+      InstanceTypes: !Ref OnDemandInstanceTypes
+      AmiType: AL2_x86_64
+      DiskSize: !Ref DiskSize
+      LaunchTemplate:
+        Id: !Ref OnDemandLaunchTemplate
+        Version: !GetAtt OnDemandLaunchTemplate.LatestVersionNumber
+      Labels:
+        node-type: on-demand
+        workload-type: critical
+        reliability: high
+      Tags:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        NodeType: on-demand
+        WorkloadType: critical
+        ManagedBy: CloudFormation
+        !Sub 'kubernetes.io/cluster/${ClusterName}': 'owned'
+
+  # IAM Role for Cluster Autoscaler
+  ClusterAutoscalerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ClusterAutoscalerRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/${OidcProvider}'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                !Sub '${OidcProvider}:sub': 'system:serviceaccount:kube-system:cluster-autoscaler'
+                !Sub '${OidcProvider}:aud': 'sts.amazonaws.com'
+      Policies:
+        - PolicyName: ClusterAutoscalerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:DescribeAutoScalingInstances
+                  - autoscaling:DescribeLaunchConfigurations
+                  - autoscaling:DescribeTags
+                  - autoscaling:SetDesiredCapacity
+                  - autoscaling:TerminateInstanceInAutoScalingGroup
+                  - ec2:DescribeLaunchTemplateVersions
+                  - ec2:DescribeImages
+                  - ec2:GetInstanceTypesFromInstanceRequirements
+                  - eks:DescribeNodegroup
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ProjectName
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: Cluster-Autoscaler
+
+  # Get OIDC Provider from existing cluster
+  OidcProvider:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: !Sub '/aws/service/eks/cluster/${ClusterName}/oidc-provider-arn'
+    Description: 'OIDC Provider ARN from existing EKS cluster'
+
+  # CloudWatch Log Group for Spot Interruption Monitoring
+  SpotInterruptionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/eks/${ClusterName}/spot-interruptions'
+      RetentionInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ProjectName
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudWatch Alarm for High Spot Interruption Rate
+  SpotInterruptionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-HighSpotInterruptions'
+      AlarmDescription: 'High spot instance interruption rate detected'
+      MetricName: SpotInterruptionRate
+      Namespace: AWS/EKS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ClusterName
+        - Name: NodeGroupName
+          Value: !Ref SpotNodeGroupName
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ProjectName
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudWatch Metric Filter for Spot Interruptions
+  SpotInterruptionMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref SpotInterruptionLogGroup
+      FilterPattern: '[timestamp, request_id, message="Spot interruption detected"]'
+      MetricTransformations:
+        - MetricNamespace: AWS/EKS
+          MetricName: SpotInterruptionRate
+          MetricValue: '1'
+          DefaultValue: 0
+          Unit: Count
+
+  # Systems Manager Parameter for Node Group Configuration
+  NodeGroupConfigParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/eks/${ClusterName}/nodegroup-config'
+      Type: String
+      Value: !Sub |
+        {
+          "spot_node_group": "${SpotNodeGroup}",
+          "ondemand_node_group": "${OnDemandNodeGroup}",
+          "spot_instance_types": "${InstanceTypes}",
+          "ondemand_instance_types": "${OnDemandInstanceTypes}",
+          "cluster_autoscaler_role": "${ClusterAutoscalerRole}",
+          "created_by": "CloudFormation",
+          "stack_name": "${AWS::StackName}"
+        }
+      Description: 'Configuration parameters for EKS node groups'
+      Tags:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        ManagedBy: CloudFormation
+
+Outputs:
+  # Node Group Information
+  SpotNodeGroupName:
+    Description: 'Name of the Spot instance node group'
+    Value: !Ref SpotNodeGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SpotNodeGroupName'
+
+  OnDemandNodeGroupName:
+    Description: 'Name of the On-Demand instance node group'
+    Value: !Ref OnDemandNodeGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-OnDemandNodeGroupName'
+
+  # IAM Role Information
+  NodeGroupRoleArn:
+    Description: 'ARN of the EKS node group IAM role'
+    Value: !GetAtt EKSNodeGroupRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-NodeGroupRoleArn'
+
+  ClusterAutoscalerRoleArn:
+    Description: 'ARN of the Cluster Autoscaler IAM role'
+    Value: !GetAtt ClusterAutoscalerRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterAutoscalerRoleArn'
+
+  # Security Group Information
+  NodeGroupSecurityGroupId:
+    Description: 'ID of the node group security group'
+    Value: !Ref NodeGroupSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-NodeGroupSecurityGroupId'
+
+  # Launch Template Information
+  SpotLaunchTemplateId:
+    Description: 'ID of the Spot instance launch template'
+    Value: !Ref SpotLaunchTemplate
+    Export:
+      Name: !Sub '${AWS::StackName}-SpotLaunchTemplateId'
+
+  OnDemandLaunchTemplateId:
+    Description: 'ID of the On-Demand instance launch template'
+    Value: !Ref OnDemandLaunchTemplate
+    Export:
+      Name: !Sub '${AWS::StackName}-OnDemandLaunchTemplateId'
+
+  # Monitoring Information
+  SpotInterruptionLogGroupName:
+    Description: 'CloudWatch log group for Spot interruption monitoring'
+    Value: !Ref SpotInterruptionLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SpotInterruptionLogGroup'
+
+  SpotInterruptionAlarmName:
+    Description: 'CloudWatch alarm for high Spot interruption rate'
+    Value: !If [IsProduction, !Ref SpotInterruptionAlarm, 'Not created (non-production environment)']
+    Export:
+      Name: !Sub '${AWS::StackName}-SpotInterruptionAlarm'
+
+  # Configuration Information
+  NodeGroupConfigParameter:
+    Description: 'Systems Manager parameter containing node group configuration'
+    Value: !Ref NodeGroupConfigParameter
+    Export:
+      Name: !Sub '${AWS::StackName}-NodeGroupConfigParameter'
+
+  # Cost Optimization Information
+  EstimatedMonthlyCostSavings:
+    Description: 'Estimated monthly cost savings using Spot instances (assumes 70% Spot usage)'
+    Value: 'Up to 90% cost savings on Spot instances compared to On-Demand'
+    Export:
+      Name: !Sub '${AWS::StackName}-EstimatedCostSavings'
+
+  # Deployment Commands
+  KubectlCommands:
+    Description: 'kubectl commands to verify deployment'
+    Value: !Sub |
+      # Verify node groups
+      kubectl get nodes -l node-type=spot
+      kubectl get nodes -l node-type=on-demand
+      
+      # Check node group status
+      aws eks describe-nodegroup --cluster-name ${ClusterName} --nodegroup-name ${SpotNodeGroup}
+      aws eks describe-nodegroup --cluster-name ${ClusterName} --nodegroup-name ${OnDemandNodeGroup}
+      
+      # Install AWS Node Termination Handler
+      kubectl apply -f https://github.com/aws/aws-node-termination-handler/releases/download/v1.21.0/all-resources.yaml
+      
+      # Configure Cluster Autoscaler service account
+      kubectl annotate serviceaccount cluster-autoscaler -n kube-system eks.amazonaws.com/role-arn=${ClusterAutoscalerRole.Arn}
+    Export:
+      Name: !Sub '${AWS::StackName}-KubectlCommands'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'EKS Cluster Configuration'
+        Parameters:
+          - ClusterName
+          - SubnetIds
+      - Label:
+          default: 'Node Group Names'
+        Parameters:
+          - SpotNodeGroupName
+          - OnDemandNodeGroupName
+      - Label:
+          default: 'Spot Instance Configuration'
+        Parameters:
+          - SpotMinSize
+          - SpotMaxSize
+          - SpotDesiredSize
+          - InstanceTypes
+          - SpotAllocationStrategy
+      - Label:
+          default: 'On-Demand Instance Configuration'
+        Parameters:
+          - OnDemandMinSize
+          - OnDemandMaxSize
+          - OnDemandDesiredSize
+          - OnDemandInstanceTypes
+      - Label:
+          default: 'Instance Configuration'
+        Parameters:
+          - DiskSize
+          - EnableDetailedMonitoring
+      - Label:
+          default: 'Security Configuration'
+        Parameters:
+          - AllowedSshCidr
+      - Label:
+          default: 'Tagging Configuration'
+        Parameters:
+          - Environment
+          - ProjectName
+    ParameterLabels:
+      ClusterName:
+        default: 'EKS Cluster Name'
+      SubnetIds:
+        default: 'Subnet IDs'
+      SpotNodeGroupName:
+        default: 'Spot Node Group Name'
+      OnDemandNodeGroupName:
+        default: 'On-Demand Node Group Name'
+      SpotMinSize:
+        default: 'Spot Min Size'
+      SpotMaxSize:
+        default: 'Spot Max Size'
+      SpotDesiredSize:
+        default: 'Spot Desired Size'
+      OnDemandMinSize:
+        default: 'On-Demand Min Size'
+      OnDemandMaxSize:
+        default: 'On-Demand Max Size'
+      OnDemandDesiredSize:
+        default: 'On-Demand Desired Size'
+      InstanceTypes:
+        default: 'Spot Instance Types'
+      OnDemandInstanceTypes:
+        default: 'On-Demand Instance Types'
+      DiskSize:
+        default: 'EBS Volume Size (GB)'
+      AllowedSshCidr:
+        default: 'SSH Access CIDR'
+      EnableDetailedMonitoring:
+        default: 'Enable Detailed Monitoring'
+      SpotAllocationStrategy:
+        default: 'Spot Allocation Strategy'
+      Environment:
+        default: 'Environment'
+      ProjectName:
+        default: 'Project Name'

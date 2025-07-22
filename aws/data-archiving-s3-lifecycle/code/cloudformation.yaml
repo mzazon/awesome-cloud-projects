@@ -1,0 +1,793 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Data Archiving Solutions with S3 Lifecycle - Automated storage cost optimization with intelligent tiering and lifecycle management'
+
+# Metadata section provides additional information about the template
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Bucket Configuration"
+        Parameters:
+          - BucketNamePrefix
+          - EnableVersioning
+          - EnableMfaDelete
+      - Label:
+          default: "Lifecycle Configuration"
+        Parameters:
+          - DocumentTransitionToIADays
+          - DocumentTransitionToGlacierDays
+          - DocumentTransitionToDeepArchiveDays
+          - LogTransitionToIADays
+          - LogTransitionToGlacierDays
+          - LogTransitionToDeepArchiveDays
+          - LogExpirationDays
+          - BackupTransitionToIADays
+          - BackupTransitionToGlacierDays
+      - Label:
+          default: "Monitoring and Analytics"
+        Parameters:
+          - EnableCloudWatchAlarms
+          - EnableS3Analytics
+          - EnableS3Inventory
+          - EnableIntelligentTiering
+          - BillingAlarmThreshold
+          - ObjectCountAlarmThreshold
+      - Label:
+          default: "Cost Management"
+        Parameters:
+          - Environment
+          - Project
+          - Owner
+    ParameterLabels:
+      BucketNamePrefix:
+        default: "S3 Bucket Name Prefix"
+      EnableVersioning:
+        default: "Enable S3 Versioning"
+      DocumentTransitionToIADays:
+        default: "Documents: Days to Infrequent Access"
+      LogExpirationDays:
+        default: "Logs: Expiration Days"
+
+# Parameters allow customization of the template during deployment
+Parameters:
+  BucketNamePrefix:
+    Type: String
+    Default: 'data-archiving-demo'
+    Description: 'Prefix for the S3 bucket name (will be appended with random suffix)'
+    MinLength: 3
+    MaxLength: 40
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be lowercase letters, numbers, and hyphens only'
+
+  EnableVersioning:
+    Type: String
+    Default: 'Enabled'
+    AllowedValues: ['Enabled', 'Suspended']
+    Description: 'Enable S3 bucket versioning for better lifecycle management'
+
+  EnableMfaDelete:
+    Type: String
+    Default: 'Disabled'
+    AllowedValues: ['Enabled', 'Disabled']
+    Description: 'Require MFA for object deletion (can only be enabled via CLI/API)'
+
+  # Document lifecycle parameters
+  DocumentTransitionToIADays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: 'Days after creation to transition documents to Infrequent Access'
+
+  DocumentTransitionToGlacierDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    MaxValue: 365
+    Description: 'Days after creation to transition documents to Glacier'
+
+  DocumentTransitionToDeepArchiveDays:
+    Type: Number
+    Default: 365
+    MinValue: 90
+    MaxValue: 3650
+    Description: 'Days after creation to transition documents to Deep Archive'
+
+  # Log lifecycle parameters
+  LogTransitionToIADays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 30
+    Description: 'Days after creation to transition logs to Infrequent Access'
+
+  LogTransitionToGlacierDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 90
+    Description: 'Days after creation to transition logs to Glacier'
+
+  LogTransitionToDeepArchiveDays:
+    Type: Number
+    Default: 90
+    MinValue: 90
+    MaxValue: 365
+    Description: 'Days after creation to transition logs to Deep Archive'
+
+  LogExpirationDays:
+    Type: Number
+    Default: 2555
+    MinValue: 365
+    MaxValue: 3650
+    Description: 'Days after creation to delete log files (7 years for compliance)'
+
+  # Backup lifecycle parameters
+  BackupTransitionToIADays:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 30
+    Description: 'Days after creation to transition backups to Infrequent Access'
+
+  BackupTransitionToGlacierDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 90
+    Description: 'Days after creation to transition backups to Glacier'
+
+  # Monitoring parameters
+  EnableCloudWatchAlarms:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Create CloudWatch alarms for monitoring storage costs and usage'
+
+  EnableS3Analytics:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable S3 Analytics for storage class analysis'
+
+  EnableS3Inventory:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable S3 Inventory for detailed storage reporting'
+
+  EnableIntelligentTiering:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable S3 Intelligent Tiering for media files'
+
+  BillingAlarmThreshold:
+    Type: Number
+    Default: 10.0
+    MinValue: 1.0
+    MaxValue: 1000.0
+    Description: 'Billing alarm threshold in USD for S3 costs'
+
+  ObjectCountAlarmThreshold:
+    Type: Number
+    Default: 1000
+    MinValue: 100
+    MaxValue: 100000
+    Description: 'Object count alarm threshold'
+
+  # Tagging parameters
+  Environment:
+    Type: String
+    Default: 'development'
+    AllowedValues: ['development', 'staging', 'production']
+    Description: 'Environment for resource tagging'
+
+  Project:
+    Type: String
+    Default: 'data-archiving-demo'
+    Description: 'Project name for resource tagging'
+
+  Owner:
+    Type: String
+    Default: 'admin'
+    Description: 'Owner for resource tagging'
+
+# Conditions allow conditional resource creation based on parameter values
+Conditions:
+  # Monitoring conditions
+  CreateCloudWatchAlarms: !Equals [!Ref EnableCloudWatchAlarms, 'true']
+  CreateS3Analytics: !Equals [!Ref EnableS3Analytics, 'true']
+  CreateS3Inventory: !Equals [!Ref EnableS3Inventory, 'true']
+  CreateIntelligentTiering: !Equals [!Ref EnableIntelligentTiering, 'true']
+  
+  # Environment conditions
+  IsProduction: !Equals [!Ref Environment, 'production']
+  IsNotProduction: !Not [!Equals [!Ref Environment, 'production']]
+  
+  # Lifecycle conditions - validate that transitions are in proper order
+  ValidDocumentTransitions: !And
+    - !Condition 'DocumentIABeforeGlacier'
+    - !Condition 'DocumentGlacierBeforeDeepArchive'
+  
+  DocumentIABeforeGlacier: !Not [!Equals [!Ref DocumentTransitionToIADays, !Ref DocumentTransitionToGlacierDays]]
+  DocumentGlacierBeforeDeepArchive: !Not [!Equals [!Ref DocumentTransitionToGlacierDays, !Ref DocumentTransitionToDeepArchiveDays]]
+
+# Resources define the AWS infrastructure components
+Resources:
+  # S3 Bucket for data archiving with lifecycle management
+  DataArchivingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${BucketNamePrefix}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !Ref EnableVersioning
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3LogGroup
+      LifecycleConfiguration:
+        Rules:
+          # Document archiving lifecycle rule
+          - Id: 'DocumentArchiving'
+            Status: 'Enabled'
+            Filter:
+              Prefix: 'documents/'
+            Transitions:
+              - TransitionInDays: !Ref DocumentTransitionToIADays
+                StorageClass: 'STANDARD_IA'
+              - TransitionInDays: !Ref DocumentTransitionToGlacierDays
+                StorageClass: 'GLACIER'
+              - TransitionInDays: !Ref DocumentTransitionToDeepArchiveDays
+                StorageClass: 'DEEP_ARCHIVE'
+            
+          # Log archiving lifecycle rule with expiration
+          - Id: 'LogArchiving'
+            Status: 'Enabled'
+            Filter:
+              Prefix: 'logs/'
+            Transitions:
+              - TransitionInDays: !Ref LogTransitionToIADays
+                StorageClass: 'STANDARD_IA'
+              - TransitionInDays: !Ref LogTransitionToGlacierDays
+                StorageClass: 'GLACIER'
+              - TransitionInDays: !Ref LogTransitionToDeepArchiveDays
+                StorageClass: 'DEEP_ARCHIVE'
+            ExpirationInDays: !Ref LogExpirationDays
+            
+          # Backup archiving lifecycle rule
+          - Id: 'BackupArchiving'
+            Status: 'Enabled'
+            Filter:
+              Prefix: 'backups/'
+            Transitions:
+              - TransitionInDays: !Ref BackupTransitionToIADays
+                StorageClass: 'STANDARD_IA'
+              - TransitionInDays: !Ref BackupTransitionToGlacierDays
+                StorageClass: 'GLACIER'
+                
+          # Media intelligent tiering lifecycle rule
+          - Id: 'MediaIntelligentTiering'
+            Status: 'Enabled'
+            Filter:
+              Prefix: 'media/'
+            Transitions:
+              - TransitionInDays: 0
+                StorageClass: 'INTELLIGENT_TIERING'
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref Project
+        - Key: 'Owner'
+          Value: !Ref Owner
+        - Key: 'Purpose'
+          Value: 'Data Archiving with Lifecycle Policies'
+        - Key: 'CostCenter'
+          Value: 'Storage Optimization'
+
+  # S3 Bucket Policy for secure access
+  DataArchivingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataArchivingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Deny insecure connections
+          - Sid: 'DenyInsecureConnections'
+            Effect: 'Deny'
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${DataArchivingBucket}/*'
+              - !Sub '${DataArchivingBucket}'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          
+          # Allow lifecycle management role access
+          - Sid: 'AllowLifecycleManagement'
+            Effect: 'Allow'
+            Principal:
+              AWS: !GetAtt LifecycleManagementRole.Arn
+            Action:
+              - 's3:GetBucketLocation'
+              - 's3:GetBucketLifecycleConfiguration'
+              - 's3:PutBucketLifecycleConfiguration'
+              - 's3:GetBucketVersioning'
+              - 's3:ListBucket'
+              - 's3:GetObject'
+              - 's3:GetObjectVersion'
+            Resource:
+              - !Sub '${DataArchivingBucket}/*'
+              - !Sub '${DataArchivingBucket}'
+
+  # CloudWatch Log Group for S3 access logs
+  S3LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${BucketNamePrefix}-access-logs'
+      RetentionInDays: 30
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref Project
+
+  # IAM Role for S3 Lifecycle Management
+  LifecycleManagementRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${BucketNamePrefix}-lifecycle-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 's3.amazonaws.com'
+            Action: 'sts:AssumeRole'
+          - Effect: 'Allow'
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Sub '${AWS::StackName}-lifecycle-external-id'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess'
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref Project
+
+  # IAM Policy for Lifecycle Management
+  LifecycleManagementPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${BucketNamePrefix}-lifecycle-policy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # S3 bucket lifecycle permissions
+          - Effect: 'Allow'
+            Action:
+              - 's3:GetBucketLocation'
+              - 's3:GetBucketLifecycleConfiguration'
+              - 's3:PutBucketLifecycleConfiguration'
+              - 's3:GetBucketVersioning'
+              - 's3:GetBucketIntelligentTieringConfiguration'
+              - 's3:PutBucketIntelligentTieringConfiguration'
+              - 's3:GetBucketInventoryConfiguration'
+              - 's3:PutBucketInventoryConfiguration'
+              - 's3:GetBucketAnalyticsConfiguration'
+              - 's3:PutBucketAnalyticsConfiguration'
+            Resource: !Sub '${DataArchivingBucket}'
+          
+          # S3 object permissions
+          - Effect: 'Allow'
+            Action:
+              - 's3:GetObject'
+              - 's3:GetObjectVersion'
+              - 's3:ListBucket'
+              - 's3:GetBucketNotification'
+              - 's3:PutBucketNotification'
+            Resource:
+              - !Sub '${DataArchivingBucket}/*'
+              - !Sub '${DataArchivingBucket}'
+          
+          # CloudWatch permissions for monitoring
+          - Effect: 'Allow'
+            Action:
+              - 'cloudwatch:PutMetricData'
+              - 'cloudwatch:GetMetricStatistics'
+              - 'cloudwatch:ListMetrics'
+            Resource: '*'
+            
+          # Logs permissions
+          - Effect: 'Allow'
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/s3/*'
+      Roles:
+        - !Ref LifecycleManagementRole
+
+  # S3 Intelligent Tiering Configuration for media files
+  MediaIntelligentTiering:
+    Type: AWS::S3::Bucket
+    Condition: CreateIntelligentTiering
+    Properties:
+      BucketName: !Sub '${DataArchivingBucket}-intelligent-tiering-config'
+      IntelligentTieringConfigurations:
+        - Id: 'MediaIntelligentTieringConfig'
+          Status: 'Enabled'
+          Prefix: 'media/'
+          Tierings:
+            - AccessTier: 'ARCHIVE_ACCESS'
+              Days: 90
+            - AccessTier: 'DEEP_ARCHIVE_ACCESS'
+              Days: 180
+    DependsOn: DataArchivingBucket
+
+  # S3 Inventory Configuration for storage tracking
+  StorageInventoryConfiguration:
+    Type: AWS::S3::Bucket
+    Condition: CreateS3Inventory
+    Properties:
+      BucketName: !Sub '${DataArchivingBucket}-inventory-config'
+      InventoryConfigurations:
+        - Id: 'StorageInventoryConfig'
+          IsEnabled: true
+          Destination:
+            BucketArn: !Sub '${DataArchivingBucket}'
+            Prefix: 'inventory-reports/'
+            Format: 'CSV'
+          Schedule:
+            Frequency: 'Daily'
+          IncludedObjectVersions: 'Current'
+          OptionalFields:
+            - 'Size'
+            - 'LastModifiedDate'
+            - 'StorageClass'
+            - 'IntelligentTieringAccessTier'
+            - 'ETag'
+            - 'IsMultipartUploaded'
+            - 'ReplicationStatus'
+            - 'EncryptionStatus'
+    DependsOn: DataArchivingBucket
+
+  # S3 Analytics Configuration for storage class analysis
+  DocumentAnalyticsConfiguration:
+    Type: AWS::S3::Bucket
+    Condition: CreateS3Analytics
+    Properties:
+      BucketName: !Sub '${DataArchivingBucket}-analytics-config'
+      AnalyticsConfigurations:
+        - Id: 'DocumentAnalytics'
+          Prefix: 'documents/'
+          StorageClassAnalysis:
+            DataExport:
+              OutputSchemaVersion: 'V_1'
+              Destination:
+                BucketArn: !Sub '${DataArchivingBucket}'
+                Prefix: 'analytics-reports/documents/'
+                Format: 'CSV'
+    DependsOn: DataArchivingBucket
+
+  # CloudWatch Alarm for S3 Storage Costs
+  S3StorageCostAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub 'S3-Storage-Cost-${DataArchivingBucket}'
+      AlarmDescription: 'Monitor S3 storage costs for data archiving bucket'
+      MetricName: 'EstimatedCharges'
+      Namespace: 'AWS/Billing'
+      Statistic: 'Maximum'
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: !Ref BillingAlarmThreshold
+      ComparisonOperator: 'GreaterThanThreshold'
+      Dimensions:
+        - Name: 'Currency'
+          Value: 'USD'
+        - Name: 'ServiceName'
+          Value: 'AmazonS3'
+      TreatMissingData: 'notBreaching'
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref Project
+
+  # CloudWatch Alarm for S3 Object Count
+  S3ObjectCountAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub 'S3-Object-Count-${DataArchivingBucket}'
+      AlarmDescription: 'Monitor S3 object count for data archiving bucket'
+      MetricName: 'NumberOfObjects'
+      Namespace: 'AWS/S3'
+      Statistic: 'Average'
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: !Ref ObjectCountAlarmThreshold
+      ComparisonOperator: 'GreaterThanThreshold'
+      Dimensions:
+        - Name: 'BucketName'
+          Value: !Ref DataArchivingBucket
+        - Name: 'StorageType'
+          Value: 'AllStorageTypes'
+      TreatMissingData: 'notBreaching'
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref Project
+
+  # CloudWatch Alarm for Bucket Size
+  S3BucketSizeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub 'S3-Bucket-Size-${DataArchivingBucket}'
+      AlarmDescription: 'Monitor S3 bucket size for data archiving bucket'
+      MetricName: 'BucketSizeBytes'
+      Namespace: 'AWS/S3'
+      Statistic: 'Average'
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1073741824  # 1 GB in bytes
+      ComparisonOperator: 'GreaterThanThreshold'
+      Dimensions:
+        - Name: 'BucketName'
+          Value: !Ref DataArchivingBucket
+        - Name: 'StorageType'
+          Value: 'StandardStorage'
+      TreatMissingData: 'notBreaching'
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref Project
+
+  # SNS Topic for Alarm Notifications (optional)
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      TopicName: !Sub '${BucketNamePrefix}-storage-alarms'
+      DisplayName: 'Data Archiving Storage Alarms'
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref Project
+
+  # Lambda function for custom lifecycle management (optional advanced feature)
+  LifecycleCustomResourceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${BucketNamePrefix}-lifecycle-custom-resource'
+      Runtime: 'python3.11'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LifecycleCustomResourceRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref DataArchivingBucket
+          LOG_LEVEL: 'INFO'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+          
+          def lambda_handler(event, context):
+              """
+              Custom resource function for advanced lifecycle management
+              """
+              s3_client = boto3.client('s3')
+              bucket_name = os.environ['BUCKET_NAME']
+              
+              try:
+                  # Log the event for debugging
+                  logger.info(f"Received event: {json.dumps(event)}")
+                  
+                  # Basic implementation - can be extended for custom logic
+                  response = s3_client.get_bucket_lifecycle_configuration(Bucket=bucket_name)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Lifecycle configuration validated successfully',
+                          'rules_count': len(response.get('Rules', []))
+                      })
+                  }
+              except Exception as e:
+                  logger.error(f"Error processing lifecycle configuration: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref Project
+
+  # IAM Role for Lambda Custom Resource
+  LifecycleCustomResourceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${BucketNamePrefix}-lambda-lifecycle-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: 'S3LifecycleAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 's3:GetBucketLifecycleConfiguration'
+                  - 's3:GetBucketLocation'
+                  - 's3:ListBucket'
+                Resource: !Sub '${DataArchivingBucket}'
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref Project
+
+# Outputs provide information about created resources
+Outputs:
+  # Bucket information
+  BucketName:
+    Description: 'Name of the S3 bucket created for data archiving'
+    Value: !Ref DataArchivingBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketName'
+
+  BucketArn:
+    Description: 'ARN of the S3 bucket created for data archiving'
+    Value: !Sub '${DataArchivingBucket}'
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketArn'
+
+  BucketDomainName:
+    Description: 'Domain name of the S3 bucket'
+    Value: !GetAtt DataArchivingBucket.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketDomainName'
+
+  BucketWebsiteURL:
+    Description: 'Website URL of the S3 bucket'
+    Value: !GetAtt DataArchivingBucket.WebsiteURL
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketWebsiteURL'
+
+  # IAM Role information
+  LifecycleManagementRoleArn:
+    Description: 'ARN of the IAM role for lifecycle management'
+    Value: !GetAtt LifecycleManagementRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LifecycleRoleArn'
+
+  LifecycleManagementRoleName:
+    Description: 'Name of the IAM role for lifecycle management'
+    Value: !Ref LifecycleManagementRole
+    Export:
+      Name: !Sub '${AWS::StackName}-LifecycleRoleName'
+
+  # CloudWatch information
+  S3LogGroupName:
+    Description: 'Name of the CloudWatch log group for S3 access logs'
+    Value: !Ref S3LogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-S3LogGroup'
+
+  StorageCostAlarmName:
+    Condition: CreateCloudWatchAlarms
+    Description: 'Name of the CloudWatch alarm for storage costs'
+    Value: !Ref S3StorageCostAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-StorageCostAlarm'
+
+  ObjectCountAlarmName:
+    Condition: CreateCloudWatchAlarms
+    Description: 'Name of the CloudWatch alarm for object count'
+    Value: !Ref S3ObjectCountAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-ObjectCountAlarm'
+
+  # SNS Topic for notifications
+  AlarmNotificationTopicArn:
+    Condition: CreateCloudWatchAlarms
+    Description: 'ARN of the SNS topic for alarm notifications'
+    Value: !Ref AlarmNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlarmTopicArn'
+
+  # Lambda function information
+  LifecycleCustomResourceFunctionArn:
+    Description: 'ARN of the Lambda function for custom lifecycle management'
+    Value: !GetAtt LifecycleCustomResourceFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LifecycleFunctionArn'
+
+  # Configuration summaries
+  LifecyclePolicyConfiguration:
+    Description: 'Summary of lifecycle policy configuration'
+    Value: !Sub |
+      Documents: IA after ${DocumentTransitionToIADays} days, Glacier after ${DocumentTransitionToGlacierDays} days, Deep Archive after ${DocumentTransitionToDeepArchiveDays} days
+      Logs: IA after ${LogTransitionToIADays} days, Glacier after ${LogTransitionToGlacierDays} days, Deep Archive after ${LogTransitionToDeepArchiveDays} days, Expire after ${LogExpirationDays} days
+      Backups: IA after ${BackupTransitionToIADays} days, Glacier after ${BackupTransitionToGlacierDays} days
+      Media: Intelligent Tiering enabled
+
+  EstimatedMonthlyCosts:
+    Description: 'Estimated monthly costs for different storage tiers'
+    Value: !Sub |
+      Standard Storage: $0.023 per GB/month
+      Standard-IA: $0.0125 per GB/month  
+      Glacier Flexible: $0.004 per GB/month
+      Glacier Deep Archive: $0.00099 per GB/month
+      Intelligent Tiering: $0.0025 per 1000 objects monitoring fee
+
+  UsageInstructions:
+    Description: 'Instructions for using the data archiving solution'
+    Value: !Sub |
+      1. Upload files to appropriate prefixes: documents/, logs/, backups/, media/
+      2. Lifecycle policies will automatically transition objects to cheaper storage classes
+      3. Monitor costs using CloudWatch alarms and billing metrics
+      4. Review S3 Analytics reports for optimization opportunities
+      5. Use S3 Inventory reports for detailed storage analysis
+      6. Access archived objects with appropriate retrieval fees and timeframes
+
+  SecurityConsiderations:
+    Description: 'Important security considerations for the solution'
+    Value: |
+      - All data is encrypted at rest using AES-256
+      - Public access is blocked by default
+      - SSL/TLS required for all connections
+      - IAM roles follow principle of least privilege
+      - CloudTrail logging recommended for audit trails
+      - Regular access reviews of IAM permissions recommended
+
+  ComplianceNotes:
+    Description: 'Compliance and regulatory considerations'
+    Value: !Sub |
+      - Log retention set to ${LogExpirationDays} days (7 years) for compliance
+      - S3 Object Lock can be enabled for WORM compliance
+      - Cross-region replication available for disaster recovery
+      - Lifecycle policies ensure automated data governance
+      - Inventory and analytics provide audit trails

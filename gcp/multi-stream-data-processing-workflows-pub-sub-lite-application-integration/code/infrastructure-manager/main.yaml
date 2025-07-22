@@ -1,0 +1,748 @@
+# Infrastructure Manager Configuration for Multi-Stream Data Processing Workflows
+# This configuration deploys a complete data streaming architecture using:
+# - Pub/Sub Lite for partition-based messaging with cost optimization
+# - Application Integration for workflow orchestration
+# - Cloud Dataflow for stream processing
+# - BigQuery for real-time analytics
+# - Cloud Storage for data lake and staging
+# - Cloud Monitoring for observability
+
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: blueprints.cloud.google.com/v1alpha1
+kind: BlueprintMetadata
+metadata:
+  name: multi-stream-data-processing-workflows
+  annotations:
+    config.kubernetes.io/local-config: "true"
+spec:
+  title: Multi-Stream Data Processing Workflows
+  description: >-
+    Deploy a cost-optimized data streaming architecture using Pub/Sub Lite,
+    Application Integration, Cloud Dataflow, and BigQuery for multi-stream
+    data processing with workflow orchestration.
+  version: 1.0.0
+
+---
+
+# Input parameters for customization
+inputs:
+  - name: project_id
+    type: string
+    description: Google Cloud project ID
+    required: true
+  
+  - name: region
+    type: string
+    description: Primary region for resources
+    default: us-central1
+  
+  - name: zone
+    type: string
+    description: Zone for zonal resources
+    default: us-central1-a
+  
+  - name: environment
+    type: string
+    description: Environment name (dev, staging, prod)
+    default: dev
+  
+  - name: dataset_location
+    type: string
+    description: BigQuery dataset location
+    default: US
+  
+  - name: storage_class
+    type: string
+    description: Cloud Storage bucket storage class
+    default: STANDARD
+  
+  - name: retention_days
+    type: number
+    description: Data retention period in days
+    default: 365
+  
+  - name: throughput_capacity
+    type: number
+    description: Total Pub/Sub Lite throughput capacity (MiB/s)
+    default: 9
+
+# Template configuration
+template:
+  # Local variables for resource naming and configuration
+  locals:
+    # Generate unique suffix for resource names
+    random_suffix: ${substr(uuid(), 0, 6)}
+    
+    # Common labels for all resources
+    common_labels:
+      environment: ${inputs.environment}
+      project: data-streaming
+      managed-by: infrastructure-manager
+      recipe: multi-stream-data-processing
+    
+    # Resource naming with random suffix
+    bucket_name: data-lake-${inputs.project_id}-${local.random_suffix}
+    dataset_name: streaming_analytics_${local.random_suffix}
+    
+    # Pub/Sub Lite topic configurations
+    iot_topic: iot-data-stream-${local.random_suffix}
+    app_events_topic: app-events-stream-${local.random_suffix}
+    system_logs_topic: system-logs-stream-${local.random_suffix}
+    
+    # Service account name
+    service_account_name: app-integration-sa-${local.random_suffix}
+    
+    # Reservation name
+    reservation_name: multi-stream-reservation-${local.random_suffix}
+
+  # Resources definition
+  resources:
+    # Enable required Google Cloud APIs
+    - name: enable_pubsublite_api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        name: projects/${inputs.project_id}/services/pubsublite.googleapis.com
+        
+    - name: enable_integrations_api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        name: projects/${inputs.project_id}/services/integrations.googleapis.com
+        
+    - name: enable_dataflow_api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        name: projects/${inputs.project_id}/services/dataflow.googleapis.com
+        
+    - name: enable_bigquery_api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        name: projects/${inputs.project_id}/services/bigquery.googleapis.com
+        
+    - name: enable_storage_api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        name: projects/${inputs.project_id}/services/storage.googleapis.com
+        
+    - name: enable_monitoring_api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        name: projects/${inputs.project_id}/services/monitoring.googleapis.com
+        
+    - name: enable_logging_api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        name: projects/${inputs.project_id}/services/logging.googleapis.com
+
+    # Cloud Storage bucket for data lake
+    - name: data_lake_bucket
+      type: gcp-types/storage-v1:buckets
+      properties:
+        name: ${local.bucket_name}
+        project: ${inputs.project_id}
+        location: ${inputs.region}
+        storageClass: ${inputs.storage_class}
+        labels: ${local.common_labels}
+        versioning:
+          enabled: true
+        lifecycleRule:
+          - condition:
+              age: 30
+            action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+          - condition:
+              age: 365
+            action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+          - condition:
+              age: ${inputs.retention_days}
+            action:
+              type: Delete
+        iamConfiguration:
+          uniformBucketLevelAccess:
+            enabled: true
+      depends_on:
+        - enable_storage_api
+
+    # Create subdirectories in the bucket for organization
+    - name: dataflow_temp_folder
+      type: gcp-types/storage-v1:objects
+      properties:
+        bucket: ${local.bucket_name}
+        name: dataflow-temp/.keep
+        contentType: text/plain
+        data: ""
+      depends_on:
+        - data_lake_bucket
+
+    - name: dataflow_staging_folder
+      type: gcp-types/storage-v1:objects
+      properties:
+        bucket: ${local.bucket_name}
+        name: dataflow-staging/.keep
+        contentType: text/plain
+        data: ""
+      depends_on:
+        - data_lake_bucket
+
+    - name: templates_folder
+      type: gcp-types/storage-v1:objects
+      properties:
+        bucket: ${local.bucket_name}
+        name: templates/.keep
+        contentType: text/plain
+        data: ""
+      depends_on:
+        - data_lake_bucket
+
+    # BigQuery dataset for analytics
+    - name: analytics_dataset
+      type: gcp-types/bigquery-v2:datasets
+      properties:
+        datasetId: ${local.dataset_name}
+        projectId: ${inputs.project_id}
+        location: ${inputs.dataset_location}
+        description: "Streaming analytics dataset for multi-stream data processing"
+        labels: ${local.common_labels}
+        defaultTableExpirationMs: ${inputs.retention_days * 24 * 60 * 60 * 1000}
+        access:
+          - role: OWNER
+            specialGroup: projectOwners
+          - role: READER
+            specialGroup: projectReaders
+          - role: WRITER
+            specialGroup: projectWriters
+          - role: WRITER
+            userByEmail: ${service_account.email}
+      depends_on:
+        - enable_bigquery_api
+        - service_account
+
+    # BigQuery tables for different data streams
+    - name: iot_sensor_data_table
+      type: gcp-types/bigquery-v2:tables
+      properties:
+        datasetId: ${local.dataset_name}
+        projectId: ${inputs.project_id}
+        tableId: iot_sensor_data
+        description: "IoT sensor data with real-time streaming ingestion"
+        labels: ${local.common_labels}
+        timePartitioning:
+          type: DAY
+          field: timestamp
+          expirationMs: ${inputs.retention_days * 24 * 60 * 60 * 1000}
+        clustering:
+          fields:
+            - device_id
+            - sensor_type
+        schema:
+          fields:
+            - name: timestamp
+              type: TIMESTAMP
+              mode: REQUIRED
+              description: "Event timestamp"
+            - name: device_id
+              type: STRING
+              mode: REQUIRED
+              description: "Unique device identifier"
+            - name: sensor_type
+              type: STRING
+              mode: REQUIRED
+              description: "Type of sensor (temperature, humidity, pressure)"
+            - name: value
+              type: FLOAT64
+              mode: REQUIRED
+              description: "Sensor reading value"
+            - name: location
+              type: GEOGRAPHY
+              mode: NULLABLE
+              description: "Geographic location of device"
+            - name: metadata
+              type: JSON
+              mode: NULLABLE
+              description: "Additional device metadata"
+      depends_on:
+        - analytics_dataset
+
+    - name: application_events_table
+      type: gcp-types/bigquery-v2:tables
+      properties:
+        datasetId: ${local.dataset_name}
+        projectId: ${inputs.project_id}
+        tableId: application_events
+        description: "Application events and user interactions"
+        labels: ${local.common_labels}
+        timePartitioning:
+          type: DAY
+          field: event_timestamp
+          expirationMs: ${inputs.retention_days * 2 * 24 * 60 * 60 * 1000}  # 2x retention for app events
+        clustering:
+          fields:
+            - user_id
+            - event_type
+        schema:
+          fields:
+            - name: event_timestamp
+              type: TIMESTAMP
+              mode: REQUIRED
+              description: "Event occurrence timestamp"
+            - name: user_id
+              type: STRING
+              mode: REQUIRED
+              description: "User identifier"
+            - name: event_type
+              type: STRING
+              mode: REQUIRED
+              description: "Type of user event"
+            - name: session_id
+              type: STRING
+              mode: NULLABLE
+              description: "User session identifier"
+            - name: properties
+              type: JSON
+              mode: NULLABLE
+              description: "Event properties and attributes"
+            - name: revenue
+              type: FLOAT64
+              mode: NULLABLE
+              description: "Revenue associated with event"
+      depends_on:
+        - analytics_dataset
+
+    - name: system_logs_summary_table
+      type: gcp-types/bigquery-v2:tables
+      properties:
+        datasetId: ${local.dataset_name}
+        projectId: ${inputs.project_id}
+        tableId: system_logs_summary
+        description: "Aggregated system logs and performance metrics"
+        labels: ${local.common_labels}
+        timePartitioning:
+          type: DAY
+          field: log_timestamp
+          expirationMs: ${inputs.retention_days * 24 * 60 * 60 * 1000}
+        clustering:
+          fields:
+            - service_name
+            - log_level
+        schema:
+          fields:
+            - name: log_timestamp
+              type: TIMESTAMP
+              mode: REQUIRED
+              description: "Log entry timestamp"
+            - name: service_name
+              type: STRING
+              mode: REQUIRED
+              description: "Name of the service generating logs"
+            - name: log_level
+              type: STRING
+              mode: REQUIRED
+              description: "Log severity level"
+            - name: error_count
+              type: INT64
+              mode: NULLABLE
+              description: "Number of errors in aggregation period"
+            - name: response_time_ms
+              type: FLOAT64
+              mode: NULLABLE
+              description: "Average response time in milliseconds"
+            - name: request_count
+              type: INT64
+              mode: NULLABLE
+              description: "Number of requests in aggregation period"
+      depends_on:
+        - analytics_dataset
+
+    # Service account for Application Integration
+    - name: service_account
+      type: gcp-types/iam-v1:projects.serviceAccounts
+      properties:
+        accountId: ${local.service_account_name}
+        displayName: Application Integration Service Account
+        description: Service account for multi-stream data processing workflows
+        project: ${inputs.project_id}
+      depends_on:
+        - enable_integrations_api
+
+    # IAM bindings for the service account
+    - name: pubsublite_editor_binding
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: ${inputs.project_id}
+        role: roles/pubsublite.editor
+        member: serviceAccount:${service_account.email}
+      depends_on:
+        - service_account
+
+    - name: bigquery_data_editor_binding
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: ${inputs.project_id}
+        role: roles/bigquery.dataEditor
+        member: serviceAccount:${service_account.email}
+      depends_on:
+        - service_account
+
+    - name: storage_object_admin_binding
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: ${inputs.project_id}
+        role: roles/storage.objectAdmin
+        member: serviceAccount:${service_account.email}
+      depends_on:
+        - service_account
+
+    - name: dataflow_admin_binding
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: ${inputs.project_id}
+        role: roles/dataflow.admin
+        member: serviceAccount:${service_account.email}
+      depends_on:
+        - service_account
+
+    - name: monitoring_writer_binding
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: ${inputs.project_id}
+        role: roles/monitoring.metricWriter
+        member: serviceAccount:${service_account.email}
+      depends_on:
+        - service_account
+
+    - name: logging_writer_binding
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: ${inputs.project_id}
+        role: roles/logging.logWriter
+        member: serviceAccount:${service_account.email}
+      depends_on:
+        - service_account
+
+    # Pub/Sub Lite throughput reservation for cost optimization
+    - name: pubsub_lite_reservation
+      type: gcp-types/pubsublite-v1:projects.locations.reservations
+      properties:
+        parent: projects/${inputs.project_id}/locations/${inputs.region}
+        reservationId: ${local.reservation_name}
+        reservation:
+          throughputCapacity: ${inputs.throughput_capacity}
+      depends_on:
+        - enable_pubsublite_api
+
+    # Pub/Sub Lite topics with optimized partition configurations
+    - name: iot_data_topic
+      type: gcp-types/pubsublite-v1:projects.locations.topics
+      properties:
+        parent: projects/${inputs.project_id}/locations/${inputs.region}
+        topicId: ${local.iot_topic}
+        topic:
+          partitionConfig:
+            count: 4  # High frequency, small messages
+            scale: 1
+          retentionConfig:
+            perPartitionBytes: 32212254720  # 30 GiB
+            period: 604800s  # 7 days
+          reservationConfig:
+            throughputReservation: projects/${inputs.project_id}/locations/${inputs.region}/reservations/${local.reservation_name}
+      depends_on:
+        - enable_pubsublite_api
+        - pubsub_lite_reservation
+
+    - name: app_events_topic
+      type: gcp-types/pubsublite-v1:projects.locations.topics
+      properties:
+        parent: projects/${inputs.project_id}/locations/${inputs.region}
+        topicId: ${local.app_events_topic}
+        topic:
+          partitionConfig:
+            count: 2  # Medium frequency, structured data
+            scale: 1
+          retentionConfig:
+            perPartitionBytes: 53687091200  # 50 GiB
+            period: 1209600s  # 14 days
+          reservationConfig:
+            throughputReservation: projects/${inputs.project_id}/locations/${inputs.region}/reservations/${local.reservation_name}
+      depends_on:
+        - enable_pubsublite_api
+        - pubsub_lite_reservation
+
+    - name: system_logs_topic
+      type: gcp-types/pubsublite-v1:projects.locations.topics
+      properties:
+        parent: projects/${inputs.project_id}/locations/${inputs.region}
+        topicId: ${local.system_logs_topic}
+        topic:
+          partitionConfig:
+            count: 3  # Variable frequency, larger messages
+            scale: 1
+          retentionConfig:
+            perPartitionBytes: 42949672960  # 40 GiB
+            period: 2592000s  # 30 days
+          reservationConfig:
+            throughputReservation: projects/${inputs.project_id}/locations/${inputs.region}/reservations/${local.reservation_name}
+      depends_on:
+        - enable_pubsublite_api
+        - pubsub_lite_reservation
+
+    # Pub/Sub Lite subscriptions for analytics processing
+    - name: iot_analytics_subscription
+      type: gcp-types/pubsublite-v1:projects.locations.subscriptions
+      properties:
+        parent: projects/${inputs.project_id}/locations/${inputs.region}
+        subscriptionId: ${local.iot_topic}-analytics
+        subscription:
+          topic: projects/${inputs.project_id}/locations/${inputs.region}/topics/${local.iot_topic}
+          deliveryConfig:
+            deliveryRequirement: DELIVER_IMMEDIATELY
+      depends_on:
+        - iot_data_topic
+
+    - name: app_events_analytics_subscription
+      type: gcp-types/pubsublite-v1:projects.locations.subscriptions
+      properties:
+        parent: projects/${inputs.project_id}/locations/${inputs.region}
+        subscriptionId: ${local.app_events_topic}-analytics
+        subscription:
+          topic: projects/${inputs.project_id}/locations/${inputs.region}/topics/${local.app_events_topic}
+          deliveryConfig:
+            deliveryRequirement: DELIVER_IMMEDIATELY
+      depends_on:
+        - app_events_topic
+
+    - name: system_logs_analytics_subscription
+      type: gcp-types/pubsublite-v1:projects.locations.subscriptions
+      properties:
+        parent: projects/${inputs.project_id}/locations/${inputs.region}
+        subscriptionId: ${local.system_logs_topic}-analytics
+        subscription:
+          topic: projects/${inputs.project_id}/locations/${inputs.region}/topics/${local.system_logs_topic}
+          deliveryConfig:
+            deliveryRequirement: DELIVER_IMMEDIATELY
+      depends_on:
+        - system_logs_topic
+
+    # Pub/Sub Lite subscriptions for workflow orchestration
+    - name: iot_workflow_subscription
+      type: gcp-types/pubsublite-v1:projects.locations.subscriptions
+      properties:
+        parent: projects/${inputs.project_id}/locations/${inputs.region}
+        subscriptionId: ${local.iot_topic}-workflow
+        subscription:
+          topic: projects/${inputs.project_id}/locations/${inputs.region}/topics/${local.iot_topic}
+          deliveryConfig:
+            deliveryRequirement: DELIVER_AFTER_STORED
+      depends_on:
+        - iot_data_topic
+
+    - name: app_events_workflow_subscription
+      type: gcp-types/pubsublite-v1:projects.locations.subscriptions
+      properties:
+        parent: projects/${inputs.project_id}/locations/${inputs.region}
+        subscriptionId: ${local.app_events_topic}-workflow
+        subscription:
+          topic: projects/${inputs.project_id}/locations/${inputs.region}/topics/${local.app_events_topic}
+          deliveryConfig:
+            deliveryRequirement: DELIVER_AFTER_STORED
+      depends_on:
+        - app_events_topic
+
+    # Application Integration provisioning
+    - name: application_integration_provision
+      type: gcp-types/integrations-v1:projects.locations.provision
+      properties:
+        parent: projects/${inputs.project_id}/locations/${inputs.region}
+      depends_on:
+        - enable_integrations_api
+
+    # Cloud Monitoring dashboard for pipeline observability
+    - name: monitoring_dashboard
+      type: gcp-types/monitoring-v1:projects.dashboards
+      properties:
+        parent: projects/${inputs.project_id}
+        dashboard:
+          displayName: Multi-Stream Data Processing Pipeline
+          labels: ${local.common_labels}
+          mosaicLayout:
+            tiles:
+              - width: 6
+                height: 4
+                widget:
+                  title: Pub/Sub Lite Message Rate
+                  xyChart:
+                    dataSets:
+                      - timeSeriesQuery:
+                          timeSeriesFilter:
+                            filter: 'resource.type="pubsub_lite_topic"'
+                            aggregation:
+                              alignmentPeriod: 60s
+                              perSeriesAligner: ALIGN_RATE
+                      plotType: LINE
+              - width: 6
+                height: 4
+                widget:
+                  title: BigQuery Streaming Inserts
+                  xyChart:
+                    dataSets:
+                      - timeSeriesQuery:
+                          timeSeriesFilter:
+                            filter: 'resource.type="bigquery_table"'
+                            aggregation:
+                              alignmentPeriod: 60s
+                              perSeriesAligner: ALIGN_RATE
+                      plotType: LINE
+              - width: 12
+                height: 4
+                widget:
+                  title: Dataflow Job Metrics
+                  xyChart:
+                    dataSets:
+                      - timeSeriesQuery:
+                          timeSeriesFilter:
+                            filter: 'resource.type="dataflow_job"'
+                            aggregation:
+                              alignmentPeriod: 60s
+                              perSeriesAligner: ALIGN_MEAN
+                      plotType: STACKED_AREA
+      depends_on:
+        - enable_monitoring_api
+
+    # Cloud Monitoring alerting policy for high message backlog
+    - name: high_backlog_alert
+      type: gcp-types/monitoring-v1:projects.alertPolicies
+      properties:
+        parent: projects/${inputs.project_id}
+        alertPolicy:
+          displayName: High Pub/Sub Lite Message Backlog
+          documentation:
+            content: "Alert when Pub/Sub Lite subscription backlog exceeds threshold"
+            mimeType: text/markdown
+          conditions:
+            - displayName: Message backlog too high
+              conditionThreshold:
+                filter: 'resource.type="pubsub_lite_subscription"'
+                comparison: COMPARISON_GREATER_THAN
+                thresholdValue: 10000
+                duration: 300s
+                aggregations:
+                  - alignmentPeriod: 60s
+                    perSeriesAligner: ALIGN_MEAN
+                    crossSeriesReducer: REDUCE_SUM
+          alertStrategy:
+            autoClose: 604800s  # 7 days
+          combiner: OR
+          enabled: true
+      depends_on:
+        - enable_monitoring_api
+
+# Outputs for verification and integration
+outputs:
+  - name: project_id
+    description: Google Cloud project ID
+    value: ${inputs.project_id}
+  
+  - name: region
+    description: Primary deployment region
+    value: ${inputs.region}
+  
+  - name: data_lake_bucket
+    description: Cloud Storage bucket for data lake
+    value: ${local.bucket_name}
+  
+  - name: bigquery_dataset
+    description: BigQuery dataset for analytics
+    value: ${local.dataset_name}
+  
+  - name: service_account_email
+    description: Service account email for Application Integration
+    value: ${service_account.email}
+  
+  - name: pubsub_lite_topics
+    description: Created Pub/Sub Lite topics
+    value:
+      iot_data: projects/${inputs.project_id}/locations/${inputs.region}/topics/${local.iot_topic}
+      app_events: projects/${inputs.project_id}/locations/${inputs.region}/topics/${local.app_events_topic}
+      system_logs: projects/${inputs.project_id}/locations/${inputs.region}/topics/${local.system_logs_topic}
+  
+  - name: pubsub_lite_subscriptions
+    description: Created Pub/Sub Lite subscriptions
+    value:
+      analytics:
+        - projects/${inputs.project_id}/locations/${inputs.region}/subscriptions/${local.iot_topic}-analytics
+        - projects/${inputs.project_id}/locations/${inputs.region}/subscriptions/${local.app_events_topic}-analytics
+        - projects/${inputs.project_id}/locations/${inputs.region}/subscriptions/${local.system_logs_topic}-analytics
+      workflow:
+        - projects/${inputs.project_id}/locations/${inputs.region}/subscriptions/${local.iot_topic}-workflow
+        - projects/${inputs.project_id}/locations/${inputs.region}/subscriptions/${local.app_events_topic}-workflow
+  
+  - name: bigquery_tables
+    description: Created BigQuery tables
+    value:
+      - ${inputs.project_id}.${local.dataset_name}.iot_sensor_data
+      - ${inputs.project_id}.${local.dataset_name}.application_events
+      - ${inputs.project_id}.${local.dataset_name}.system_logs_summary
+  
+  - name: monitoring_dashboard_url
+    description: URL to the monitoring dashboard
+    value: https://console.cloud.google.com/monitoring/dashboards/custom/${monitoring_dashboard.name}?project=${inputs.project_id}
+  
+  - name: dataflow_staging_location
+    description: Cloud Storage location for Dataflow staging
+    value: gs://${local.bucket_name}/dataflow-staging
+  
+  - name: dataflow_temp_location
+    description: Cloud Storage location for Dataflow temporary files
+    value: gs://${local.bucket_name}/dataflow-temp
+  
+  - name: pubsub_lite_reservation
+    description: Pub/Sub Lite reservation for cost optimization
+    value: projects/${inputs.project_id}/locations/${inputs.region}/reservations/${local.reservation_name}
+  
+  - name: deployment_summary
+    description: Summary of deployed resources
+    value: |
+      Multi-Stream Data Processing Pipeline deployed successfully:
+      
+      Infrastructure Components:
+      - 3 Pub/Sub Lite topics with optimized partitioning (4, 2, 3 partitions)
+      - 1 Pub/Sub Lite reservation with ${inputs.throughput_capacity} MiB/s capacity
+      - 5 Pub/Sub Lite subscriptions (3 analytics + 2 workflow)
+      - 1 BigQuery dataset with 3 partitioned and clustered tables
+      - 1 Cloud Storage bucket for data lake with lifecycle management
+      - Application Integration environment provisioned
+      - Monitoring dashboard and alerting configured
+      - Service account with appropriate IAM permissions
+      
+      Cost Optimization Features:
+      - Pub/Sub Lite reserved capacity for predictable costs
+      - BigQuery partitioned tables with automatic expiration
+      - Cloud Storage lifecycle management (Standard → Nearline → Coldline)
+      - Automated resource cleanup and monitoring
+      
+      Next Steps:
+      1. Deploy Cloud Dataflow pipeline using staging locations
+      2. Configure Application Integration workflows
+      3. Set up data publishers to send messages to Pub/Sub Lite topics
+      4. Monitor pipeline performance through the dashboard
+      5. Adjust throughput capacity based on actual usage patterns
+      
+      Important Notes:
+      - Pub/Sub Lite uses partition-based messaging for ordered delivery
+      - Reserved capacity pricing provides cost predictability
+      - Monitor partition utilization to optimize capacity allocation
+      - Application Integration workflows can be configured through the Console

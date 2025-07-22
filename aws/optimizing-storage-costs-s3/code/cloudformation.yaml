@@ -1,0 +1,581 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'S3 Storage Cost Optimization with Storage Classes, Lifecycle Policies, and Monitoring'
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: 'Name for the S3 bucket (leave empty for auto-generated name)'
+    Default: ''
+    AllowedPattern: '^[a-z0-9.-]*$'
+    ConstraintDescription: 'Bucket name can only contain lowercase letters, numbers, dots, and hyphens'
+  
+  Environment:
+    Type: String
+    Description: 'Environment name for resource tagging'
+    Default: 'demo'
+    AllowedValues:
+      - 'dev'
+      - 'test'
+      - 'prod'
+      - 'demo'
+  
+  EnableIntelligentTiering:
+    Type: String
+    Description: 'Enable S3 Intelligent Tiering for automatic cost optimization'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+  
+  EnableStorageAnalytics:
+    Type: String
+    Description: 'Enable S3 Storage Analytics for access pattern analysis'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+  
+  EnableLifecyclePolicies:
+    Type: String
+    Description: 'Enable custom lifecycle policies for different data types'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+  
+  EnableCloudWatchDashboard:
+    Type: String
+    Description: 'Create CloudWatch dashboard for storage monitoring'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+  
+  EnableCostBudget:
+    Type: String
+    Description: 'Create AWS Budget for cost monitoring'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+  
+  BudgetAmount:
+    Type: Number
+    Description: 'Monthly budget amount in USD for S3 storage costs'
+    Default: 50
+    MinValue: 1
+    MaxValue: 10000
+  
+  BudgetAlertEmail:
+    Type: String
+    Description: 'Email address for budget alerts (optional)'
+    Default: ''
+    AllowedPattern: '^[a-zA-Z0-9._%+-]*@[a-zA-Z0-9.-]*\.[a-zA-Z]{2,}$|^$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+  
+  FrequentlyAccessedTransitionDays:
+    Type: Number
+    Description: 'Days after which frequently accessed data transitions to Standard-IA'
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+  
+  InfrequentlyAccessedTransitionDays:
+    Type: Number
+    Description: 'Days after which infrequently accessed data transitions to Standard-IA'
+    Default: 1
+    MinValue: 1
+    MaxValue: 365
+  
+  GlacierTransitionDays:
+    Type: Number
+    Description: 'Days after which data transitions to Glacier'
+    Default: 90
+    MinValue: 1
+    MaxValue: 365
+  
+  DeepArchiveTransitionDays:
+    Type: Number
+    Description: 'Days after which data transitions to Deep Archive'
+    Default: 180
+    MinValue: 1
+    MaxValue: 2555  # 7 years
+
+Conditions:
+  # Condition to generate bucket name if not provided
+  CreateBucketName: !Equals [!Ref BucketName, '']
+  
+  # Feature enablement conditions
+  EnableIntelligentTieringCondition: !Equals [!Ref EnableIntelligentTiering, 'true']
+  EnableStorageAnalyticsCondition: !Equals [!Ref EnableStorageAnalytics, 'true']
+  EnableLifecyclePoliciesCondition: !Equals [!Ref EnableLifecyclePolicies, 'true']
+  EnableCloudWatchDashboardCondition: !Equals [!Ref EnableCloudWatchDashboard, 'true']
+  EnableCostBudgetCondition: !Equals [!Ref EnableCostBudget, 'true']
+  
+  # Budget alert email condition
+  HasBudgetEmail: !Not [!Equals [!Ref BudgetAlertEmail, '']]
+  
+  # Combined conditions for budget with email
+  CreateBudgetWithEmail: !And
+    - !Condition EnableCostBudgetCondition
+    - !Condition HasBudgetEmail
+  
+  CreateBudgetWithoutEmail: !And
+    - !Condition EnableCostBudgetCondition
+    - !Not [!Condition HasBudgetEmail]
+
+Resources:
+  # S3 Bucket for cost optimization demonstration
+  StorageOptimizationBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - CreateBucketName
+        - !Sub 'storage-optimization-${Environment}-${AWS::AccountId}-${AWS::Region}'
+        - !Ref BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Storage Cost Optimization'
+        - Key: CostCenter
+          Value: 'IT-Storage'
+
+  # S3 Bucket Policy for secure access
+  StorageOptimizationBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StorageOptimizationBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${StorageOptimizationBucket}/*'
+              - !Sub '${StorageOptimizationBucket}'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # S3 Intelligent Tiering Configuration
+  IntelligentTieringConfig:
+    Type: AWS::S3::Bucket
+    Condition: EnableIntelligentTieringCondition
+    Properties:
+      BucketName: !Ref StorageOptimizationBucket
+      IntelligentTieringConfigurations:
+        - Id: 'EntireBucketIntelligentTiering'
+          Status: Enabled
+          Prefix: 'data/'
+          Tierings:
+            - Days: 90
+              AccessTier: ARCHIVE_ACCESS
+            - Days: 180
+              AccessTier: DEEP_ARCHIVE_ACCESS
+          OptionalFields:
+            - BucketKeyEnabled
+
+  # S3 Storage Analytics Configuration
+  StorageAnalyticsConfig:
+    Type: AWS::S3::Bucket
+    Condition: EnableStorageAnalyticsCondition
+    Properties:
+      BucketName: !Ref StorageOptimizationBucket
+      AnalyticsConfigurations:
+        - Id: 'StorageAnalyticsConfig'
+          StorageClassAnalysis:
+            DataExport:
+              Destination:
+                BucketArn: !GetAtt StorageOptimizationBucket.Arn
+                Format: CSV
+                Prefix: 'analytics-reports/'
+                BucketAccountId: !Ref AWS::AccountId
+              OutputSchemaVersion: V_1
+          Prefix: 'data/'
+
+  # S3 Lifecycle Configuration
+  LifecycleConfig:
+    Type: AWS::S3::Bucket
+    Condition: EnableLifecyclePoliciesCondition
+    Properties:
+      BucketName: !Ref StorageOptimizationBucket
+      LifecycleConfiguration:
+        Rules:
+          # Frequently accessed data lifecycle
+          - Id: 'FrequentlyAccessedDataLifecycle'
+            Status: Enabled
+            Prefix: 'data/frequently-accessed/'
+            Transitions:
+              - TransitionInDays: !Ref FrequentlyAccessedTransitionDays
+                StorageClass: STANDARD_IA
+              - TransitionInDays: !Ref GlacierTransitionDays
+                StorageClass: GLACIER
+            NoncurrentVersionTransitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 60
+                StorageClass: GLACIER
+            NoncurrentVersionExpirationInDays: 365
+          
+          # Infrequently accessed data lifecycle
+          - Id: 'InfrequentlyAccessedDataLifecycle'
+            Status: Enabled
+            Prefix: 'data/infrequently-accessed/'
+            Transitions:
+              - TransitionInDays: !Ref InfrequentlyAccessedTransitionDays
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 30
+                StorageClass: GLACIER
+              - TransitionInDays: !Ref DeepArchiveTransitionDays
+                StorageClass: DEEP_ARCHIVE
+            NoncurrentVersionTransitions:
+              - TransitionInDays: 1
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 30
+                StorageClass: DEEP_ARCHIVE
+            NoncurrentVersionExpirationInDays: 365
+          
+          # Archive data lifecycle
+          - Id: 'ArchiveDataLifecycle'
+            Status: Enabled
+            Prefix: 'data/archive/'
+            Transitions:
+              - TransitionInDays: 1
+                StorageClass: GLACIER
+              - TransitionInDays: 30
+                StorageClass: DEEP_ARCHIVE
+            NoncurrentVersionTransitions:
+              - TransitionInDays: 1
+                StorageClass: DEEP_ARCHIVE
+            NoncurrentVersionExpirationInDays: 2555  # 7 years
+          
+          # Cleanup incomplete multipart uploads
+          - Id: 'CleanupIncompleteUploads'
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  # CloudWatch Dashboard for Storage Monitoring
+  StorageMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableCloudWatchDashboardCondition
+    Properties:
+      DashboardName: !Sub 'S3-Storage-Cost-Optimization-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "BucketSizeBytes", "BucketName", "${StorageOptimizationBucket}", "StorageType", "StandardStorage" ],
+                  [ "...", "StandardIAStorage" ],
+                  [ "...", "GlacierStorage" ],
+                  [ "...", "DeepArchiveStorage" ],
+                  [ "...", "IntelligentTieringFAStorage" ],
+                  [ "...", "IntelligentTieringIAStorage" ],
+                  [ "...", "IntelligentTieringAAStorage" ],
+                  [ "...", "IntelligentTieringAIAStorage" ],
+                  [ "...", "IntelligentTieringDAAStorage" ]
+                ],
+                "view": "timeSeries",
+                "stacked": true,
+                "region": "${AWS::Region}",
+                "title": "S3 Storage by Class - ${StorageOptimizationBucket}",
+                "period": 86400,
+                "stat": "Average",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "NumberOfObjects", "BucketName", "${StorageOptimizationBucket}", "StorageType", "AllStorageTypes" ]
+                ],
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "title": "Total Objects in ${StorageOptimizationBucket}",
+                "period": 86400,
+                "stat": "Average",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "AllRequests", "BucketName", "${StorageOptimizationBucket}" ],
+                  [ ".", "GetRequests", ".", "." ],
+                  [ ".", "PutRequests", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "title": "S3 Request Metrics - ${StorageOptimizationBucket}",
+                "period": 3600,
+                "stat": "Sum",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+  # AWS Budget for Cost Monitoring (with email)
+  S3StorageBudgetWithEmail:
+    Type: AWS::Budgets::Budget
+    Condition: CreateBudgetWithEmail
+    Properties:
+      Budget:
+        BudgetName: !Sub 'S3-Storage-Cost-Budget-${Environment}'
+        BudgetLimit:
+          Amount: !Ref BudgetAmount
+          Unit: USD
+        TimeUnit: MONTHLY
+        BudgetType: COST
+        CostFilters:
+          Service:
+            - 'Amazon Simple Storage Service'
+        TimePeriod:
+          Start: !Sub '${AWS::AccountId}-01-01'
+          End: '2087-06-15'
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref BudgetAlertEmail
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref BudgetAlertEmail
+
+  # AWS Budget for Cost Monitoring (without email)
+  S3StorageBudgetWithoutEmail:
+    Type: AWS::Budgets::Budget
+    Condition: CreateBudgetWithoutEmail
+    Properties:
+      Budget:
+        BudgetName: !Sub 'S3-Storage-Cost-Budget-${Environment}'
+        BudgetLimit:
+          Amount: !Ref BudgetAmount
+          Unit: USD
+        TimeUnit: MONTHLY
+        BudgetType: COST
+        CostFilters:
+          Service:
+            - 'Amazon Simple Storage Service'
+        TimePeriod:
+          Start: !Sub '${AWS::AccountId}-01-01'
+          End: '2087-06-15'
+
+  # IAM Role for Lambda function (for future enhancements)
+  StorageOptimizationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'StorageOptimization-Role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3StorageOptimizationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:GetBucketVersioning
+                  - s3:GetBucketNotification
+                  - s3:GetBucketPolicy
+                  - s3:GetBucketTagging
+                  - s3:GetBucketLifecycleConfiguration
+                  - s3:GetAnalyticsConfiguration
+                  - s3:GetIntelligentTieringConfiguration
+                Resource:
+                  - !Sub '${StorageOptimizationBucket}/*'
+                  - !Sub '${StorageOptimizationBucket}'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Storage Cost Optimization'
+
+  # CloudWatch Alarm for High Storage Costs
+  HighStorageCostAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'S3-High-Storage-Cost-${Environment}'
+      AlarmDescription: 'Alarm when S3 storage costs exceed threshold'
+      MetricName: EstimatedCharges
+      Namespace: AWS/Billing
+      Statistic: Maximum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: !Ref BudgetAmount
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Currency
+          Value: USD
+        - Name: ServiceName
+          Value: 'AmazonS3'
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Storage Cost Monitoring'
+
+Outputs:
+  BucketName:
+    Description: 'Name of the S3 bucket created for storage cost optimization'
+    Value: !Ref StorageOptimizationBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketName'
+
+  BucketArn:
+    Description: 'ARN of the S3 bucket'
+    Value: !GetAtt StorageOptimizationBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketArn'
+
+  BucketDomainName:
+    Description: 'Domain name of the S3 bucket'
+    Value: !GetAtt StorageOptimizationBucket.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketDomainName'
+
+  BucketWebsiteURL:
+    Description: 'Website URL of the S3 bucket'
+    Value: !GetAtt StorageOptimizationBucket.WebsiteURL
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketWebsiteURL'
+
+  IntelligentTieringEnabled:
+    Description: 'Whether S3 Intelligent Tiering is enabled'
+    Value: !Ref EnableIntelligentTiering
+    Export:
+      Name: !Sub '${AWS::StackName}-IntelligentTieringEnabled'
+
+  StorageAnalyticsEnabled:
+    Description: 'Whether S3 Storage Analytics is enabled'
+    Value: !Ref EnableStorageAnalytics
+    Export:
+      Name: !Sub '${AWS::StackName}-StorageAnalyticsEnabled'
+
+  LifecyclePoliciesEnabled:
+    Description: 'Whether S3 Lifecycle Policies are enabled'
+    Value: !Ref EnableLifecyclePolicies
+    Export:
+      Name: !Sub '${AWS::StackName}-LifecyclePoliciesEnabled'
+
+  CloudWatchDashboardURL:
+    Description: 'URL to the CloudWatch dashboard for storage monitoring'
+    Condition: EnableCloudWatchDashboardCondition
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${StorageMonitoringDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchDashboardURL'
+
+  BudgetName:
+    Description: 'Name of the AWS Budget for cost monitoring'
+    Condition: EnableCostBudgetCondition
+    Value: !Sub 'S3-Storage-Cost-Budget-${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-BudgetName'
+
+  IAMRoleArn:
+    Description: 'ARN of the IAM role for storage optimization functions'
+    Value: !GetAtt StorageOptimizationRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IAMRoleArn'
+
+  CostOptimizationTips:
+    Description: 'Tips for maximizing cost optimization'
+    Value: !Sub |
+      1. Monitor the CloudWatch dashboard regularly: ${AWS::Region}
+      2. Review Storage Analytics reports after 24-48 hours
+      3. Adjust lifecycle policies based on access patterns
+      4. Consider enabling additional Intelligent Tiering features
+      5. Review budget alerts and adjust thresholds as needed
+
+  DeploymentCommands:
+    Description: 'Commands to test the storage optimization setup'
+    Value: !Sub |
+      # Upload test files to different prefixes:
+      aws s3 cp test-file.txt s3://${StorageOptimizationBucket}/data/frequently-accessed/
+      aws s3 cp test-file.txt s3://${StorageOptimizationBucket}/data/infrequently-accessed/
+      aws s3 cp test-file.txt s3://${StorageOptimizationBucket}/data/archive/
+      
+      # Check bucket configuration:
+      aws s3api get-bucket-lifecycle-configuration --bucket ${StorageOptimizationBucket}
+      aws s3api get-bucket-intelligent-tiering-configuration --bucket ${StorageOptimizationBucket} --id EntireBucketIntelligentTiering
+      
+      # Monitor costs:
+      aws budgets describe-budget --account-id ${AWS::AccountId} --budget-name S3-Storage-Cost-Budget-${Environment}

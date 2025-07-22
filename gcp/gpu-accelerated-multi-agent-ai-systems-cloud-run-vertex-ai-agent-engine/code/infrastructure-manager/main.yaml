@@ -1,0 +1,503 @@
+# Google Cloud Infrastructure Manager Configuration
+# Multi-Agent AI System with GPU-Accelerated Cloud Run and Vertex AI Agent Engine
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: infrastructure-manager-config
+  namespace: default
+data:
+  # Project and region configuration
+  project_id: ${PROJECT_ID}
+  region: us-central1
+  zone: us-central1-a
+
+---
+# Main Infrastructure Manager Deployment
+apiVersion: infrastructuremanager.cnrm.cloud.google.com/v1beta1
+kind: InfrastructureManagerDeployment
+metadata:
+  name: multi-agent-ai-system
+  namespace: default
+spec:
+  # Infrastructure Manager configuration
+  location: us-central1
+  template:
+    # Terraform configuration for the multi-agent AI system
+    terraformConfig:
+      # Enable required Google Cloud APIs
+      - resource_type: "google_project_service"
+        name: "apis"
+        config:
+          services:
+            - "run.googleapis.com"                    # Cloud Run for GPU-enabled containers
+            - "aiplatform.googleapis.com"            # Vertex AI for agent orchestration
+            - "redis.googleapis.com"                 # Cloud Memorystore for state management
+            - "monitoring.googleapis.com"            # Cloud Monitoring for observability
+            - "pubsub.googleapis.com"                # Pub/Sub for async messaging
+            - "cloudbuild.googleapis.com"            # Cloud Build for container images
+            - "artifactregistry.googleapis.com"      # Artifact Registry for container storage
+            - "logging.googleapis.com"               # Cloud Logging for system logs
+            - "cloudtrace.googleapis.com"            # Cloud Trace for distributed tracing
+
+      # Artifact Registry for storing agent container images
+      - resource_type: "google_artifact_registry_repository"
+        name: "agent_images_repo"
+        config:
+          repository_id: "agent-images"
+          location: "us-central1"
+          format: "DOCKER"
+          description: "Container repository for multi-agent AI system images"
+          labels:
+            environment: "production"
+            purpose: "multi-agent-ai"
+
+      # Cloud Memorystore Redis instance for shared state management
+      - resource_type: "google_redis_instance"
+        name: "agent_cache"
+        config:
+          name: "agent-cache-${random_suffix}"
+          memory_size_gb: 1
+          region: "us-central1"
+          tier: "BASIC"
+          redis_version: "REDIS_7_0"
+          auth_enabled: true
+          transit_encryption_mode: "SERVER_AUTH"
+          display_name: "Multi-Agent AI Cache"
+          labels:
+            environment: "production"
+            component: "cache"
+            purpose: "agent-coordination"
+
+      # Pub/Sub topic for asynchronous agent task coordination
+      - resource_type: "google_pubsub_topic"
+        name: "agent_tasks_topic"
+        config:
+          name: "agent-tasks-${random_suffix}"
+          labels:
+            environment: "production"
+            component: "messaging"
+            purpose: "task-coordination"
+
+      # Pub/Sub subscription for task processing
+      - resource_type: "google_pubsub_subscription"
+        name: "agent_tasks_subscription"
+        config:
+          name: "agent-tasks-subscription-${random_suffix}"
+          topic: "${google_pubsub_topic.agent_tasks_topic.name}"
+          ack_deadline_seconds: 600
+          message_retention_duration: "604800s"  # 7 days
+          retain_acked_messages: false
+          enable_message_ordering: true
+          labels:
+            environment: "production"
+            component: "messaging"
+
+      # Vision Agent - GPU-enabled Cloud Run service for image processing
+      - resource_type: "google_cloud_run_v2_service"
+        name: "vision_agent"
+        config:
+          name: "vision-agent-${random_suffix}"
+          location: "us-central1"
+          template:
+            # GPU configuration for vision processing
+            containers:
+              - name: "vision-agent"
+                image: "us-central1-docker.pkg.dev/${PROJECT_ID}/agent-images/vision-agent:latest"
+                ports:
+                  - container_port: 8080
+                    protocol: "TCP"
+                # GPU resource allocation
+                resources:
+                  limits:
+                    cpu: "4000m"
+                    memory: "16Gi"
+                    nvidia.com/gpu: "1"
+                  requests:
+                    cpu: "2000m"
+                    memory: "8Gi"
+                # Environment variables for Redis connection
+                env:
+                  - name: "REDIS_HOST"
+                    value: "${google_redis_instance.agent_cache.host}"
+                  - name: "REDIS_PORT"
+                    value: "${google_redis_instance.agent_cache.port}"
+                  - name: "PROJECT_ID"
+                    value: "${PROJECT_ID}"
+                  - name: "AGENT_TYPE"
+                    value: "vision"
+            # Scaling configuration
+            scaling:
+              min_instance_count: 0
+              max_instance_count: 10
+            # GPU node selector
+            node_selector:
+              cloud.google.com/gke-accelerator: "nvidia-l4"
+          labels:
+            environment: "production"
+            component: "ai-agent"
+            agent-type: "vision"
+            gpu-enabled: "true"
+
+      # Language Agent - GPU-enabled Cloud Run service for NLP tasks
+      - resource_type: "google_cloud_run_v2_service"
+        name: "language_agent"
+        config:
+          name: "language-agent-${random_suffix}"
+          location: "us-central1"
+          template:
+            containers:
+              - name: "language-agent"
+                image: "us-central1-docker.pkg.dev/${PROJECT_ID}/agent-images/language-agent:latest"
+                ports:
+                  - container_port: 8080
+                    protocol: "TCP"
+                # GPU configuration for language model inference
+                resources:
+                  limits:
+                    cpu: "4000m"
+                    memory: "16Gi"
+                    nvidia.com/gpu: "1"
+                  requests:
+                    cpu: "2000m"
+                    memory: "8Gi"
+                env:
+                  - name: "REDIS_HOST"
+                    value: "${google_redis_instance.agent_cache.host}"
+                  - name: "REDIS_PORT"
+                    value: "${google_redis_instance.agent_cache.port}"
+                  - name: "PROJECT_ID"
+                    value: "${PROJECT_ID}"
+                  - name: "AGENT_TYPE"
+                    value: "language"
+            scaling:
+              min_instance_count: 0
+              max_instance_count: 10
+            node_selector:
+              cloud.google.com/gke-accelerator: "nvidia-l4"
+          labels:
+            environment: "production"
+            component: "ai-agent"
+            agent-type: "language"
+            gpu-enabled: "true"
+
+      # Reasoning Agent - GPU-enabled Cloud Run service for complex analytics
+      - resource_type: "google_cloud_run_v2_service"
+        name: "reasoning_agent"
+        config:
+          name: "reasoning-agent-${random_suffix}"
+          location: "us-central1"
+          template:
+            containers:
+              - name: "reasoning-agent"
+                image: "us-central1-docker.pkg.dev/${PROJECT_ID}/agent-images/reasoning-agent:latest"
+                ports:
+                  - container_port: 8080
+                    protocol: "TCP"
+                # Enhanced GPU resources for complex reasoning tasks
+                resources:
+                  limits:
+                    cpu: "4000m"
+                    memory: "16Gi"
+                    nvidia.com/gpu: "1"
+                  requests:
+                    cpu: "2000m"
+                    memory: "8Gi"
+                env:
+                  - name: "REDIS_HOST"
+                    value: "${google_redis_instance.agent_cache.host}"
+                  - name: "REDIS_PORT"
+                    value: "${google_redis_instance.agent_cache.port}"
+                  - name: "PROJECT_ID"
+                    value: "${PROJECT_ID}"
+                  - name: "AGENT_TYPE"
+                    value: "reasoning"
+            scaling:
+              min_instance_count: 0
+              max_instance_count: 10
+            node_selector:
+              cloud.google.com/gke-accelerator: "nvidia-l4"
+          labels:
+            environment: "production"
+            component: "ai-agent"
+            agent-type: "reasoning"
+            gpu-enabled: "true"
+
+      # Tool Agent - Standard Cloud Run service for utility functions
+      - resource_type: "google_cloud_run_v2_service"
+        name: "tool_agent"
+        config:
+          name: "tool-agent-${random_suffix}"
+          location: "us-central1"
+          template:
+            containers:
+              - name: "tool-agent"
+                image: "us-central1-docker.pkg.dev/${PROJECT_ID}/agent-images/tool-agent:latest"
+                ports:
+                  - container_port: 8080
+                    protocol: "TCP"
+                # Standard CPU resources for tool operations
+                resources:
+                  limits:
+                    cpu: "1000m"
+                    memory: "2Gi"
+                  requests:
+                    cpu: "500m"
+                    memory: "1Gi"
+                env:
+                  - name: "REDIS_HOST"
+                    value: "${google_redis_instance.agent_cache.host}"
+                  - name: "REDIS_PORT"
+                    value: "${google_redis_instance.agent_cache.port}"
+                  - name: "PROJECT_ID"
+                    value: "${PROJECT_ID}"
+                  - name: "AGENT_TYPE"
+                    value: "tool"
+            scaling:
+              min_instance_count: 0
+              max_instance_count: 5
+          labels:
+            environment: "production"
+            component: "ai-agent"
+            agent-type: "tool"
+            gpu-enabled: "false"
+
+      # IAM service account for agent services
+      - resource_type: "google_service_account"
+        name: "agent_service_account"
+        config:
+          account_id: "multi-agent-service-${random_suffix}"
+          display_name: "Multi-Agent AI Service Account"
+          description: "Service account for multi-agent AI system components"
+
+      # IAM bindings for agent service account
+      - resource_type: "google_project_iam_member"
+        name: "agent_ai_platform_user"
+        config:
+          project: "${PROJECT_ID}"
+          role: "roles/aiplatform.user"
+          member: "serviceAccount:${google_service_account.agent_service_account.email}"
+
+      - resource_type: "google_project_iam_member"
+        name: "agent_redis_editor"
+        config:
+          project: "${PROJECT_ID}"
+          role: "roles/redis.editor"
+          member: "serviceAccount:${google_service_account.agent_service_account.email}"
+
+      - resource_type: "google_project_iam_member"
+        name: "agent_pubsub_editor"
+        config:
+          project: "${PROJECT_ID}"
+          role: "roles/pubsub.editor"
+          member: "serviceAccount:${google_service_account.agent_service_account.email}"
+
+      - resource_type: "google_project_iam_member"
+        name: "agent_monitoring_writer"
+        config:
+          project: "${PROJECT_ID}"
+          role: "roles/monitoring.metricWriter"
+          member: "serviceAccount:${google_service_account.agent_service_account.email}"
+
+      # Cloud Run IAM policy to allow unauthenticated access (for demo purposes)
+      - resource_type: "google_cloud_run_service_iam_member"
+        name: "vision_agent_invoker"
+        config:
+          service: "${google_cloud_run_v2_service.vision_agent.name}"
+          location: "us-central1"
+          role: "roles/run.invoker"
+          member: "allUsers"
+
+      - resource_type: "google_cloud_run_service_iam_member"
+        name: "language_agent_invoker"
+        config:
+          service: "${google_cloud_run_v2_service.language_agent.name}"
+          location: "us-central1"
+          role: "roles/run.invoker"
+          member: "allUsers"
+
+      - resource_type: "google_cloud_run_service_iam_member"
+        name: "reasoning_agent_invoker"
+        config:
+          service: "${google_cloud_run_v2_service.reasoning_agent.name}"
+          location: "us-central1"
+          role: "roles/run.invoker"
+          member: "allUsers"
+
+      - resource_type: "google_cloud_run_service_iam_member"
+        name: "tool_agent_invoker"
+        config:
+          service: "${google_cloud_run_v2_service.tool_agent.name}"
+          location: "us-central1"
+          role: "roles/run.invoker"
+          member: "allUsers"
+
+      # Cloud Monitoring custom metrics for agent performance
+      - resource_type: "google_monitoring_metric_descriptor"
+        name: "agent_response_time_metric"
+        config:
+          type: "custom.googleapis.com/agent/response_time"
+          metric_kind: "GAUGE"
+          value_type: "DOUBLE"
+          display_name: "Agent Response Time"
+          description: "Response time in seconds for agent processing"
+          labels:
+            - key: "agent_type"
+              value_type: "STRING"
+              description: "Type of AI agent (vision, language, reasoning, tool)"
+            - key: "gpu_enabled"
+              value_type: "BOOL"
+              description: "Whether the agent uses GPU acceleration"
+
+      # Cloud Monitoring alerting policy for high GPU costs
+      - resource_type: "google_monitoring_alert_policy"
+        name: "high_gpu_cost_alert"
+        config:
+          display_name: "High GPU Cost Alert - Multi-Agent AI"
+          documentation:
+            content: "Alert when GPU costs exceed threshold for multi-agent AI system"
+            mime_type: "text/markdown"
+          conditions:
+            - display_name: "GPU cost threshold exceeded"
+              condition_threshold:
+                filter: 'resource.type="cloud_run_revision" AND resource.labels.service_name=~".*-agent-.*"'
+                comparison: "COMPARISON_GT"
+                threshold_value: 100.0
+                duration: "300s"
+                aggregations:
+                  - alignment_period: "60s"
+                    per_series_aligner: "ALIGN_RATE"
+                    cross_series_reducer: "REDUCE_SUM"
+          notification_channels: []
+          alert_strategy:
+            auto_close: "86400s"
+          enabled: true
+
+      # Log-based metric for tracking agent performance
+      - resource_type: "google_logging_metric"
+        name: "agent_processing_time"
+        config:
+          name: "agent_processing_time"
+          description: "Tracks processing time across all agents"
+          filter: 'resource.type="cloud_run_revision" AND jsonPayload.processing_time > 0'
+          metric_descriptor:
+            metric_kind: "GAUGE"
+            value_type: "DOUBLE"
+            display_name: "Agent Processing Time"
+          value_extractor: "EXTRACT(jsonPayload.processing_time)"
+          label_extractors:
+            agent_type: "EXTRACT(jsonPayload.agent_type)"
+            gpu_used: "EXTRACT(jsonPayload.gpu_used)"
+
+      # Random suffix generator for unique resource names
+      - resource_type: "random_id"
+        name: "suffix"
+        config:
+          byte_length: 3
+
+  # Variables for customization
+  variables:
+    project_id:
+      description: "Google Cloud Project ID"
+      type: "string"
+    
+    region:
+      description: "Google Cloud region for resources"
+      type: "string"
+      default: "us-central1"
+    
+    zone:
+      description: "Google Cloud zone for resources"
+      type: "string"
+      default: "us-central1-a"
+    
+    redis_memory_size:
+      description: "Memory size in GB for Redis instance"
+      type: "number"
+      default: 1
+    
+    max_agent_instances:
+      description: "Maximum number of instances per agent"
+      type: "number"
+      default: 10
+    
+    enable_gpu:
+      description: "Enable GPU acceleration for agents"
+      type: "bool"
+      default: true
+    
+    gpu_type:
+      description: "Type of GPU to use for agents"
+      type: "string"
+      default: "nvidia-l4"
+    
+    agent_memory:
+      description: "Memory allocation for GPU agents"
+      type: "string"
+      default: "16Gi"
+    
+    agent_cpu:
+      description: "CPU allocation for GPU agents"
+      type: "string"
+      default: "4000m"
+
+  # Outputs for accessing deployed resources
+  outputs:
+    # Redis connection details
+    redis_host:
+      description: "Redis instance host for agent state management"
+      value: "${google_redis_instance.agent_cache.host}"
+    
+    redis_port:
+      description: "Redis instance port"
+      value: "${google_redis_instance.agent_cache.port}"
+    
+    # Agent service URLs
+    vision_agent_url:
+      description: "URL for the Vision Agent service"
+      value: "${google_cloud_run_v2_service.vision_agent.uri}"
+    
+    language_agent_url:
+      description: "URL for the Language Agent service"
+      value: "${google_cloud_run_v2_service.language_agent.uri}"
+    
+    reasoning_agent_url:
+      description: "URL for the Reasoning Agent service"
+      value: "${google_cloud_run_v2_service.reasoning_agent.uri}"
+    
+    tool_agent_url:
+      description: "URL for the Tool Agent service"
+      value: "${google_cloud_run_v2_service.tool_agent.uri}"
+    
+    # Pub/Sub details
+    pubsub_topic:
+      description: "Pub/Sub topic for agent task coordination"
+      value: "${google_pubsub_topic.agent_tasks_topic.name}"
+    
+    pubsub_subscription:
+      description: "Pub/Sub subscription for task processing"
+      value: "${google_pubsub_subscription.agent_tasks_subscription.name}"
+    
+    # Artifact Registry
+    container_registry:
+      description: "Artifact Registry repository for agent images"
+      value: "${google_artifact_registry_repository.agent_images_repo.name}"
+    
+    # Service Account
+    service_account_email:
+      description: "Service account email for agent authentication"
+      value: "${google_service_account.agent_service_account.email}"
+
+  # Deployment configuration
+  annotations:
+    description: "Multi-Agent AI System with GPU-accelerated Cloud Run and Vertex AI Agent Engine"
+    version: "1.0"
+    environment: "production"
+    cost-center: "ai-research"
+    team: "ml-engineering"
+    
+  labels:
+    project: "multi-agent-ai"
+    component: "infrastructure"
+    gpu-enabled: "true"
+    ai-platform: "vertex-ai"

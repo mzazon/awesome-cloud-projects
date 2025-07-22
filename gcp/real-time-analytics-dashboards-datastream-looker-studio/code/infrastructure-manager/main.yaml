@@ -1,0 +1,534 @@
+# Infrastructure Manager Configuration for Real-Time Analytics Dashboards
+# Recipe: Real-Time Analytics Dashboards with Datastream and Looker Studio
+# This configuration deploys the complete infrastructure for real-time analytics
+# including BigQuery, Datastream, and supporting resources.
+
+metadata:
+  version: 1.0
+  description: "Real-time analytics infrastructure with Datastream and BigQuery"
+  labels:
+    environment: "production"
+    purpose: "analytics"
+    recipe: "real-time-analytics-dashboards"
+
+# Import required Terraform modules for Google Cloud resources
+imports:
+  - path: modules/bigquery/
+  - path: modules/datastream/
+  - path: modules/iam/
+
+# Define input variables for customization
+variables:
+  # Project Configuration
+  project_id:
+    description: "Google Cloud Project ID for deployment"
+    type: string
+    required: true
+  
+  region:
+    description: "Google Cloud region for resource deployment"
+    type: string
+    default: "us-central1"
+    
+  # Dataset Configuration
+  dataset_name:
+    description: "BigQuery dataset name for analytics data"
+    type: string
+    default: "ecommerce_analytics"
+    
+  dataset_description:
+    description: "Description for the BigQuery dataset"
+    type: string
+    default: "Real-time e-commerce analytics dataset"
+    
+  # Datastream Configuration
+  stream_name:
+    description: "Name for the Datastream pipeline"
+    type: string
+    default: "sales-stream"
+    
+  # Source Database Configuration
+  source_db_type:
+    description: "Source database type (mysql, postgresql, oracle, sqlserver)"
+    type: string
+    default: "mysql"
+    validation:
+      condition: contains(["mysql", "postgresql", "oracle", "sqlserver"], var.source_db_type)
+      error_message: "Source database type must be one of: mysql, postgresql, oracle, sqlserver"
+  
+  source_db_hostname:
+    description: "Source database hostname or IP address"
+    type: string
+    required: true
+    
+  source_db_port:
+    description: "Source database port"
+    type: number
+    default: 3306
+    
+  source_db_username:
+    description: "Source database username for Datastream connection"
+    type: string
+    required: true
+    
+  source_db_password:
+    description: "Source database password (use Secret Manager reference)"
+    type: string
+    required: true
+    sensitive: true
+    
+  # Tables to replicate
+  source_tables:
+    description: "List of tables to replicate from source database"
+    type: list(string)
+    default: ["sales_orders", "customers", "products", "inventory"]
+    
+  # Resource Labels
+  resource_labels:
+    description: "Labels to apply to all resources"
+    type: map(string)
+    default:
+      environment: "production"
+      team: "analytics"
+      cost-center: "data-engineering"
+
+# Define the infrastructure resources
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/datastream.googleapis.com
+      
+  - name: enable-bigquery-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/bigquery.googleapis.com
+      
+  - name: enable-sql-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/sqladmin.googleapis.com
+      
+  # Create BigQuery dataset for analytics
+  - name: analytics-dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      projectId: ${var.project_id}
+      datasetId: ${var.dataset_name}
+      location: ${var.region}
+      description: ${var.dataset_description}
+      labels: ${var.resource_labels}
+      access:
+        - role: OWNER
+          userByEmail: ${google.client_email}
+        - role: READER
+          specialGroup: projectReaders
+        - role: WRITER
+          specialGroup: projectWriters
+      defaultTableExpirationMs: null  # No expiration for analytics tables
+      defaultPartitionExpirationMs: 7776000000  # 90 days for partitions
+    depends_on:
+      - enable-bigquery-api
+
+  # Create IAM service account for Datastream
+  - name: datastream-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      projectId: ${var.project_id}
+      accountId: datastream-analytics-sa
+      serviceAccount:
+        displayName: "Datastream Analytics Service Account"
+        description: "Service account for Datastream real-time analytics pipeline"
+
+  # Grant BigQuery Data Editor role to Datastream service account
+  - name: datastream-bigquery-editor-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: ${var.project_id}
+      policy:
+        bindings:
+          - role: roles/bigquery.dataEditor
+            members:
+              - serviceAccount:${datastream-service-account.email}
+          - role: roles/bigquery.jobUser
+            members:
+              - serviceAccount:${datastream-service-account.email}
+    depends_on:
+      - datastream-service-account
+
+  # Create Datastream connection profile for source database
+  - name: source-connection-profile
+    type: gcp-types/datastream-v1:projects.locations.connectionProfiles
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      connectionProfileId: source-db-profile-${random_id}
+      connectionProfile:
+        displayName: "Source Database Connection Profile"
+        labels: ${var.resource_labels}
+        mysqlProfile:
+          hostname: ${var.source_db_hostname}
+          port: ${var.source_db_port}
+          username: ${var.source_db_username}
+          password: ${var.source_db_password}
+          sslConfig:
+            clientCertificate: ""
+            clientKey: ""
+            caCertificate: ""
+    depends_on:
+      - enable-apis
+
+  # Create Datastream connection profile for BigQuery destination
+  - name: bigquery-connection-profile
+    type: gcp-types/datastream-v1:projects.locations.connectionProfiles
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      connectionProfileId: bigquery-dest-profile-${random_id}
+      connectionProfile:
+        displayName: "BigQuery Destination Connection Profile"
+        labels: ${var.resource_labels}
+        bigqueryProfile: {}
+    depends_on:
+      - analytics-dataset
+
+  # Create the main Datastream for real-time replication
+  - name: analytics-datastream
+    type: gcp-types/datastream-v1:projects.locations.streams
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      streamId: ${var.stream_name}
+      stream:
+        displayName: "Real-time Sales Analytics Stream"
+        labels: ${var.resource_labels}
+        sourceConfig:
+          sourceConnectionProfile: ${source-connection-profile.name}
+          mysqlSourceConfig:
+            includeObjects:
+              mysqlDatabases:
+                - database: ecommerce_db
+                  mysqlTables:
+                    - table: sales_orders
+                      mysqlColumns:
+                        - column: "*"
+                    - table: customers
+                      mysqlColumns:
+                        - column: "*"
+                    - table: products
+                      mysqlColumns:
+                        - column: "*"
+                    - table: inventory
+                      mysqlColumns:
+                        - column: "*"
+            excludeObjects: {}
+            maxConcurrentCdcTasks: 5
+            maxConcurrentBackfillTasks: 12
+        destinationConfig:
+          destinationConnectionProfile: ${bigquery-connection-profile.name}
+          bigqueryDestinationConfig:
+            sourceHierarchyDatasets:
+              datasetTemplate:
+                location: ${var.region}
+                datasetIdPrefix: ${var.dataset_name}_
+                kmsKeyName: ""
+        backfillAll: {}
+        state: RUNNING
+    depends_on:
+      - source-connection-profile
+      - bigquery-connection-profile
+      - datastream-bigquery-editor-binding
+
+  # Create business intelligence views for Looker Studio
+  - name: sales-performance-view
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: ${var.project_id}
+      datasetId: ${var.dataset_name}
+      tableId: sales_performance
+      table:
+        tableReference:
+          projectId: ${var.project_id}
+          datasetId: ${var.dataset_name}
+          tableId: sales_performance
+        description: "Sales performance view with customer and product details"
+        labels: ${var.resource_labels}
+        view:
+          query: |
+            SELECT 
+                DATE(o.order_date) as order_date,
+                o.customer_id,
+                c.customer_name,
+                o.product_id,
+                p.product_name,
+                o.quantity,
+                o.unit_price,
+                o.quantity * o.unit_price as total_amount,
+                o._metadata_timestamp as last_updated
+            FROM `${var.project_id}.${var.dataset_name}.sales_orders` o
+            JOIN `${var.project_id}.${var.dataset_name}.customers` c 
+                ON o.customer_id = c.customer_id
+            JOIN `${var.project_id}.${var.dataset_name}.products` p 
+                ON o.product_id = p.product_id
+            WHERE o._metadata_deleted = false
+          useLegacySql: false
+    depends_on:
+      - analytics-datastream
+
+  # Create daily sales summary view for dashboard
+  - name: daily-sales-summary-view
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: ${var.project_id}
+      datasetId: ${var.dataset_name}
+      tableId: daily_sales_summary
+      table:
+        tableReference:
+          projectId: ${var.project_id}
+          datasetId: ${var.dataset_name}
+          tableId: daily_sales_summary
+        description: "Daily sales summary for executive dashboards"
+        labels: ${var.resource_labels}
+        view:
+          query: |
+            SELECT 
+                DATE(order_date) as sales_date,
+                COUNT(*) as total_orders,
+                SUM(total_amount) as total_revenue,
+                AVG(total_amount) as avg_order_value,
+                COUNT(DISTINCT customer_id) as unique_customers
+            FROM `${var.project_id}.${var.dataset_name}.sales_performance`
+            GROUP BY DATE(order_date)
+            ORDER BY sales_date DESC
+          useLegacySql: false
+    depends_on:
+      - sales-performance-view
+
+  # Create customer insights view for analytics
+  - name: customer-insights-view
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: ${var.project_id}
+      datasetId: ${var.dataset_name}
+      tableId: customer_insights
+      table:
+        tableReference:
+          projectId: ${var.project_id}
+          datasetId: ${var.dataset_name}
+          tableId: customer_insights
+        description: "Customer behavior and lifetime value insights"
+        labels: ${var.resource_labels}
+        view:
+          query: |
+            SELECT 
+                customer_id,
+                customer_name,
+                COUNT(*) as total_orders,
+                SUM(total_amount) as lifetime_value,
+                AVG(total_amount) as avg_order_value,
+                MIN(order_date) as first_order_date,
+                MAX(order_date) as last_order_date,
+                DATE_DIFF(CURRENT_DATE(), DATE(MAX(order_date)), DAY) as days_since_last_order
+            FROM `${var.project_id}.${var.dataset_name}.sales_performance`
+            GROUP BY customer_id, customer_name
+            ORDER BY lifetime_value DESC
+          useLegacySql: false
+    depends_on:
+      - sales-performance-view
+
+  # Create product performance view for inventory management
+  - name: product-performance-view
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: ${var.project_id}
+      datasetId: ${var.dataset_name}
+      tableId: product_performance
+      table:
+        tableReference:
+          projectId: ${var.project_id}
+          datasetId: ${var.dataset_name}
+          tableId: product_performance
+        description: "Product sales performance and inventory insights"
+        labels: ${var.resource_labels}
+        view:
+          query: |
+            SELECT 
+                p.product_id,
+                p.product_name,
+                COUNT(o.order_id) as total_orders,
+                SUM(o.quantity) as total_quantity_sold,
+                SUM(o.total_amount) as total_revenue,
+                AVG(o.unit_price) as avg_selling_price,
+                DATE(MAX(o.order_date)) as last_sale_date,
+                i.current_stock,
+                CASE 
+                    WHEN i.current_stock <= 10 THEN 'Low Stock'
+                    WHEN i.current_stock <= 50 THEN 'Medium Stock'
+                    ELSE 'High Stock'
+                END as stock_status
+            FROM `${var.project_id}.${var.dataset_name}.products` p
+            LEFT JOIN `${var.project_id}.${var.dataset_name}.sales_orders` o 
+                ON p.product_id = o.product_id
+            LEFT JOIN `${var.project_id}.${var.dataset_name}.inventory` i 
+                ON p.product_id = i.product_id
+            WHERE o._metadata_deleted = false OR o._metadata_deleted IS NULL
+            GROUP BY p.product_id, p.product_name, i.current_stock
+            ORDER BY total_revenue DESC
+          useLegacySql: false
+    depends_on:
+      - sales-performance-view
+
+  # Create Cloud Monitoring dashboard for operational insights
+  - name: analytics-monitoring-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      parent: projects/${var.project_id}
+      dashboard:
+        displayName: "Real-time Analytics Pipeline Monitoring"
+        mosaicLayout:
+          tiles:
+            - width: 6
+              height: 4
+              widget:
+                title: "Datastream Throughput"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="datastream_stream"'
+                          aggregation:
+                            alignmentPeriod: "60s"
+                            perSeriesAligner: "ALIGN_RATE"
+                            crossSeriesReducer: "REDUCE_SUM"
+                      plotType: "LINE"
+            - width: 6
+              height: 4
+              widget:
+                title: "BigQuery Query Performance"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="bigquery_project"'
+                          aggregation:
+                            alignmentPeriod: "300s"
+                            perSeriesAligner: "ALIGN_MEAN"
+                            crossSeriesReducer: "REDUCE_MEAN"
+                      plotType: "LINE"
+
+# Generate random ID for unique resource naming
+  - name: random-id-generator
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: ${var.project_id}
+    metadata:
+      runtimePolicy:
+        CREATE: |
+          import random
+          import string
+          random_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+          outputs["random_id"] = random_id
+
+# Define outputs for reference and validation
+outputs:
+  # Project Information
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${var.project_id}
+    
+  region:
+    description: "Deployment region"
+    value: ${var.region}
+    
+  # BigQuery Resources
+  dataset_id:
+    description: "BigQuery dataset ID for analytics"
+    value: ${analytics-dataset.datasetId}
+    
+  dataset_location:
+    description: "BigQuery dataset location"
+    value: ${analytics-dataset.location}
+    
+  # Datastream Resources  
+  datastream_name:
+    description: "Datastream pipeline name"
+    value: ${analytics-datastream.name}
+    
+  source_connection_profile:
+    description: "Source database connection profile"
+    value: ${source-connection-profile.name}
+    
+  bigquery_connection_profile:
+    description: "BigQuery destination connection profile"
+    value: ${bigquery-connection-profile.name}
+    
+  # Analytical Views
+  sales_performance_view:
+    description: "Sales performance view for Looker Studio"
+    value: "${var.project_id}.${var.dataset_name}.sales_performance"
+    
+  daily_sales_summary_view:
+    description: "Daily sales summary view for dashboards"
+    value: "${var.project_id}.${var.dataset_name}.daily_sales_summary"
+    
+  customer_insights_view:
+    description: "Customer insights view for analytics"
+    value: "${var.project_id}.${var.dataset_name}.customer_insights"
+    
+  product_performance_view:
+    description: "Product performance view for inventory management"
+    value: "${var.project_id}.${var.dataset_name}.product_performance"
+    
+  # Looker Studio Connection
+  looker_studio_url:
+    description: "URL to create Looker Studio reports"
+    value: "https://lookerstudio.google.com/"
+    
+  bigquery_connection_string:
+    description: "BigQuery connection details for Looker Studio"
+    value: "Project: ${var.project_id}, Dataset: ${var.dataset_name}"
+    
+  # Service Account
+  datastream_service_account_email:
+    description: "Datastream service account email"
+    value: ${datastream-service-account.email}
+    
+  # Monitoring
+  monitoring_dashboard_url:
+    description: "Cloud Monitoring dashboard for pipeline monitoring"
+    value: "https://console.cloud.google.com/monitoring/dashboards/custom/${analytics-monitoring-dashboard.name}"
+
+# Configuration validation and best practices
+validation:
+  # Ensure project ID follows naming conventions
+  - condition: length(var.project_id) >= 6 && length(var.project_id) <= 30
+    error_message: "Project ID must be between 6 and 30 characters"
+    
+  # Validate region is supported for Datastream
+  - condition: contains(["us-central1", "us-east1", "us-west1", "europe-west1", "asia-east1"], var.region)
+    error_message: "Region must be supported by Datastream service"
+    
+  # Ensure dataset name follows BigQuery naming rules
+  - condition: can(regex("^[a-zA-Z0-9_]+$", var.dataset_name))
+    error_message: "Dataset name must contain only letters, numbers, and underscores"
+    
+  # Validate database port range
+  - condition: var.source_db_port > 0 && var.source_db_port <= 65535
+    error_message: "Database port must be between 1 and 65535"
+
+# Deployment metadata for Infrastructure Manager
+metadata:
+  annotations:
+    # Infrastructure Manager specific annotations
+    infra-manager.goog/cost-estimate: "medium"
+    infra-manager.goog/security-level: "standard"
+    infra-manager.goog/compliance: "general"
+    
+    # Recipe metadata
+    recipe.name: "real-time-analytics-dashboards-datastream-looker-studio"
+    recipe.version: "1.0"
+    recipe.category: "analytics"
+    recipe.difficulty: "200"
+    
+    # Deployment guidance
+    deployment.prerequisites: "Source database with CDC enabled, appropriate IAM permissions"
+    deployment.estimated-time: "30-45 minutes"
+    deployment.cost-estimate: "$50-150/month for moderate data volumes"

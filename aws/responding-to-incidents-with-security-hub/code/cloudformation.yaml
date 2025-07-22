@@ -1,0 +1,1392 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudFormation template for building a comprehensive security incident response system
+  using AWS Security Hub, EventBridge, Lambda, and SNS. This solution provides automated
+  triage, escalation workflows, and integration with external security tools.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Security Hub Configuration"
+        Parameters:
+          - EnableSecurityHub
+          - EnableSecurityStandards
+          - SecurityStandardsToEnable
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+          - EnableSlackIntegration
+          - SlackWebhookUrl
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaTimeout
+          - LambdaMemorySize
+          - LogRetentionDays
+      - Label:
+          default: "Automation Settings"
+        Parameters:
+          - AutoSuppressLowPriority
+          - EnableThreatIntelligence
+          - CriticalFindingThreshold
+      - Label:
+          default: "Tagging Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+          - CostCenter
+    ParameterLabels:
+      EnableSecurityHub:
+        default: "Enable AWS Security Hub"
+      EnableSecurityStandards:
+        default: "Enable Security Standards"
+      NotificationEmail:
+        default: "Email for Security Notifications"
+      LambdaTimeout:
+        default: "Lambda Function Timeout (seconds)"
+      Environment:
+        default: "Environment Name"
+
+Parameters:
+  EnableSecurityHub:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to enable AWS Security Hub in this account and region
+    
+  EnableSecurityStandards:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to enable AWS security standards in Security Hub
+    
+  SecurityStandardsToEnable:
+    Type: CommaDelimitedList
+    Default: "aws-foundational-security-best-practices,cis-aws-foundations-benchmark"
+    Description: List of security standards to enable (comma-separated)
+    
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive security incident notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+    
+  EnableSlackIntegration:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Whether to enable Slack integration for notifications
+    
+  SlackWebhookUrl:
+    Type: String
+    Default: ''
+    Description: Slack webhook URL for notifications (optional)
+    NoEcho: true
+    
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 30
+    MaxValue: 900
+    Description: Timeout for Lambda functions in seconds
+    
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+    Description: Memory allocation for Lambda functions in MB
+    
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: CloudWatch Logs retention period in days
+    
+  AutoSuppressLowPriority:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Automatically suppress low priority/informational findings
+    
+  EnableThreatIntelligence:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable threat intelligence enrichment for findings
+    
+  CriticalFindingThreshold:
+    Type: Number
+    Default: 8.0
+    MinValue: 0.0
+    MaxValue: 10.0
+    Description: Severity score threshold for critical finding escalation
+    
+  Environment:
+    Type: String
+    Default: 'production'
+    AllowedValues: ['development', 'staging', 'production']
+    Description: Environment name for resource tagging
+    
+  ProjectName:
+    Type: String
+    Default: 'security-incident-response'
+    Description: Project name for resource tagging
+    MinLength: 3
+    MaxLength: 50
+    
+  CostCenter:
+    Type: String
+    Default: 'security'
+    Description: Cost center for resource tagging
+    MinLength: 3
+    MaxLength: 20
+
+Conditions:
+  ShouldEnableSecurityHub: !Equals [!Ref EnableSecurityHub, 'true']
+  ShouldEnableSecurityStandards: !And 
+    - !Condition ShouldEnableSecurityHub
+    - !Equals [!Ref EnableSecurityStandards, 'true']
+  ShouldEnableSlack: !Equals [!Ref EnableSlackIntegration, 'true']
+  ShouldAutoSuppressLowPriority: !Equals [!Ref AutoSuppressLowPriority, 'true']
+  ShouldEnableThreatIntelligence: !Equals [!Ref EnableThreatIntelligence, 'true']
+  IsProduction: !Equals [!Ref Environment, 'production']
+
+Resources:
+  # =============================================================================
+  # IAM ROLES AND POLICIES
+  # =============================================================================
+  
+  SecurityHubServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-SecurityHub-ServiceRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: securityhub.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSSecurityHubServiceRolePolicy
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: SecurityHub service role
+
+  IncidentProcessorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-IncidentProcessor-Role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SecurityHubIncidentProcessorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - securityhub:BatchUpdateFindings
+                  - securityhub:GetFindings
+                  - securityhub:BatchImportFindings
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SecurityIncidentTopic
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: Lambda execution role for incident processing
+
+  ThreatIntelligenceLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: ShouldEnableThreatIntelligence
+    Properties:
+      RoleName: !Sub '${ProjectName}-ThreatIntel-Role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ThreatIntelligencePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - securityhub:BatchUpdateFindings
+                  - securityhub:GetFindings
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: Lambda execution role for threat intelligence
+
+  # =============================================================================
+  # SNS TOPICS AND SUBSCRIPTIONS
+  # =============================================================================
+  
+  SecurityIncidentTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-security-incidents-${AWS::Region}'
+      DisplayName: Security Incident Alerts
+      DeliveryPolicy:
+        http:
+          defaultHealthyRetryPolicy:
+            numRetries: 3
+            minDelayTarget: 20
+            maxDelayTarget: 20
+            numMinDelayRetries: 0
+            numMaxDelayRetries: 0
+            numNoDelayRetries: 0
+            backoffFunction: linear
+          disableSubscriptionOverrides: false
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: Security incident notifications
+
+  SecurityIncidentTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref SecurityIncidentTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref SecurityIncidentTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SecurityIncidentTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+      FilterPolicy:
+        severity:
+          - HIGH
+          - CRITICAL
+
+  # SQS Queue for reliable message delivery and external integrations
+  SecurityIncidentQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-security-incidents-${AWS::Region}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      ReceiveMessageWaitTimeSeconds: 20  # Enable long polling
+      VisibilityTimeoutSeconds: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt SecurityIncidentDLQ.Arn
+        maxReceiveCount: 3
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: Security incident message buffer
+
+  SecurityIncidentDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-security-incidents-dlq-${AWS::Region}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: Dead letter queue for failed incident messages
+
+  SQSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SecurityIncidentTopic
+      Protocol: sqs
+      Endpoint: !GetAtt SecurityIncidentQueue.Arn
+      RawMessageDelivery: true
+
+  SecurityIncidentQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref SecurityIncidentQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt SecurityIncidentQueue.Arn
+            Condition:
+              ArnEquals:
+                'aws:SourceArn': !Ref SecurityIncidentTopic
+
+  # =============================================================================
+  # LAMBDA FUNCTIONS
+  # =============================================================================
+  
+  IncidentProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-incident-processor-${AWS::Region}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt IncidentProcessorLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SecurityIncidentTopic
+          AWS_REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+          CRITICAL_THRESHOLD: !Ref CriticalFindingThreshold
+          SLACK_WEBHOOK_URL: !If [ShouldEnableSlack, !Ref SlackWebhookUrl, '']
+      ReservedConcurrencyLimit: !If [IsProduction, 100, 10]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import urllib3
+          from datetime import datetime, timezone
+          
+          def lambda_handler(event, context):
+              """
+              Main Lambda handler for processing Security Hub findings
+              and orchestrating incident response workflows
+              """
+              try:
+                  # Initialize AWS clients
+                  sns = boto3.client('sns')
+                  securityhub = boto3.client('securityhub')
+                  cloudwatch = boto3.client('cloudwatch')
+                  
+                  # Process Security Hub finding or custom action
+                  if 'findings' in event.get('detail', {}):
+                      return process_security_finding(event, sns, securityhub, cloudwatch)
+                  elif event.get('detail-type') == 'Security Hub Findings - Custom Action':
+                      return process_custom_action(event, sns, securityhub, cloudwatch)
+                  else:
+                      print(f"Unsupported event type: {event.get('detail-type', 'Unknown')}")
+                      return {'statusCode': 400, 'body': 'Unsupported event type'}
+                      
+              except Exception as e:
+                  print(f"Critical error in incident processor: {str(e)}")
+                  send_error_notification(str(e))
+                  return {'statusCode': 500, 'body': f'Error: {str(e)}'}
+          
+          def process_security_finding(event, sns, securityhub, cloudwatch):
+              """Process automated Security Hub finding"""
+              finding = event['detail']['findings'][0]
+              
+              # Extract key information
+              severity = finding.get('Severity', {}).get('Label', 'UNKNOWN')
+              title = finding.get('Title', 'Unknown Security Finding')
+              description = finding.get('Description', 'No description available')
+              account_id = finding.get('AwsAccountId', 'Unknown')
+              region = finding.get('Region', 'Unknown')
+              finding_id = finding.get('Id', 'Unknown')
+              product_arn = finding.get('ProductArn', '')
+              
+              # Determine response based on severity and context
+              response_action = determine_response_action(severity, finding)
+              
+              # Create incident payload
+              incident_payload = create_incident_payload(finding, response_action)
+              
+              # Send notification
+              send_incident_notification(sns, incident_payload, severity, title)
+              
+              # Update finding workflow
+              update_finding_workflow(securityhub, finding_id, product_arn, response_action)
+              
+              # Send metrics to CloudWatch
+              send_metrics(cloudwatch, severity, response_action)
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': 'Security finding processed successfully',
+                      'finding_id': finding_id,
+                      'severity': severity,
+                      'response_action': response_action
+                  })
+              }
+          
+          def process_custom_action(event, sns, securityhub, cloudwatch):
+              """Process manual custom action escalation"""
+              action_name = event['detail']['actionName']
+              finding_ids = event['detail']['findings']
+              
+              # Process each finding in the custom action
+              processed_findings = []
+              
+              for finding_id in finding_ids:
+                  # Get full finding details
+                  response = securityhub.get_findings(
+                      Filters={'Id': [{'Value': finding_id, 'Comparison': 'EQUALS'}]}
+                  )
+                  
+                  if response['Findings']:
+                      finding = response['Findings'][0]
+                      
+                      # Force escalation for manual actions
+                      response_action = 'manual_escalation'
+                      
+                      # Create incident payload
+                      incident_payload = create_incident_payload(finding, response_action)
+                      incident_payload['escalation_type'] = 'manual'
+                      incident_payload['action_name'] = action_name
+                      
+                      # Send high-priority notification
+                      send_incident_notification(sns, incident_payload, 'ESCALATED', f"Manual Escalation: {finding.get('Title', 'Unknown')}")
+                      
+                      # Update finding workflow
+                      update_finding_workflow(securityhub, finding_id, finding.get('ProductArn', ''), response_action)
+                      
+                      processed_findings.append(finding_id)
+              
+              # Send metrics
+              send_metrics(cloudwatch, 'ESCALATED', 'manual_escalation', len(processed_findings))
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': f'Custom action processed: {action_name}',
+                      'processed_findings': len(processed_findings),
+                      'finding_ids': processed_findings
+                  })
+              }
+          
+          def determine_response_action(severity, finding):
+              """Determine appropriate response action based on severity and context"""
+              severity_map = {
+                  'CRITICAL': 'immediate_response',
+                  'HIGH': 'escalated_response',
+                  'MEDIUM': 'standard_response',
+                  'LOW': 'low_priority_response',
+                  'INFORMATIONAL': 'log_only'
+              }
+              
+              base_action = severity_map.get(severity, 'standard_response')
+              
+              # Check for specific finding types that require escalation
+              finding_type = finding.get('Types', [])
+              if any('Malware' in t or 'Backdoor' in t for t in finding_type):
+                  return 'immediate_response'
+              
+              # Check compliance status
+              compliance = finding.get('Compliance', {}).get('Status')
+              if compliance == 'FAILED' and severity in ['HIGH', 'CRITICAL']:
+                  return 'compliance_escalation'
+              
+              return base_action
+          
+          def create_incident_payload(finding, response_action):
+              """Create formatted incident payload"""
+              return {
+                  'incident_details': {
+                      'id': finding.get('Id', 'Unknown'),
+                      'severity': finding.get('Severity', {}).get('Label', 'UNKNOWN'),
+                      'title': finding.get('Title', 'Unknown Security Finding'),
+                      'description': finding.get('Description', 'No description available'),
+                      'account': finding.get('AwsAccountId', 'Unknown'),
+                      'region': finding.get('Region', 'Unknown'),
+                      'timestamp': datetime.now(timezone.utc).isoformat(),
+                      'resources': [r.get('Id', 'Unknown') for r in finding.get('Resources', [])],
+                      'compliance_status': finding.get('Compliance', {}).get('Status', 'UNKNOWN'),
+                      'finding_types': finding.get('Types', [])
+                  },
+                  'response_plan': {
+                      'action': response_action,
+                      'priority': get_priority_level(finding.get('Severity', {}).get('Label', 'UNKNOWN')),
+                      'sla_minutes': get_sla_minutes(finding.get('Severity', {}).get('Label', 'UNKNOWN')),
+                      'auto_remediation': should_auto_remediate(finding, response_action)
+                  },
+                  'integration': {
+                      'jira_project': 'SEC',
+                      'slack_channel': '#security-incidents',
+                      'pagerduty_service': 'security-team',
+                      'environment': os.environ.get('ENVIRONMENT', 'unknown')
+                  }
+              }
+          
+          def send_incident_notification(sns, incident_payload, severity, title):
+              """Send incident notification via SNS"""
+              try:
+                  # Format message for different audiences
+                  formatted_message = {
+                      'summary': f"Security Incident: {severity} - {title[:50]}",
+                      'details': incident_payload,
+                      'action_required': incident_payload['response_plan']['action'],
+                      'sla_minutes': incident_payload['response_plan']['sla_minutes']
+                  }
+                  
+                  # Send to SNS with message attributes for filtering
+                  response = sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Message=json.dumps(formatted_message, indent=2),
+                      Subject=f"Security Incident: {severity} - {title[:50]}",
+                      MessageAttributes={
+                          'severity': {
+                              'DataType': 'String',
+                              'StringValue': severity
+                          },
+                          'account_id': {
+                              'DataType': 'String',
+                              'StringValue': incident_payload['incident_details']['account']
+                          },
+                          'response_action': {
+                              'DataType': 'String',
+                              'StringValue': incident_payload['response_plan']['action']
+                          },
+                          'priority': {
+                              'DataType': 'String',
+                              'StringValue': incident_payload['response_plan']['priority']
+                          }
+                      }
+                  )
+                  
+                  # Send to Slack if configured
+                  if os.environ.get('SLACK_WEBHOOK_URL'):
+                      send_slack_notification(incident_payload, severity, title)
+                      
+                  print(f"Notification sent successfully: {response['MessageId']}")
+                  
+              except Exception as e:
+                  print(f"Error sending notification: {str(e)}")
+                  raise
+          
+          def send_slack_notification(incident_payload, severity, title):
+              """Send notification to Slack webhook"""
+              try:
+                  webhook_url = os.environ.get('SLACK_WEBHOOK_URL')
+                  if not webhook_url:
+                      return
+                  
+                  # Create Slack message format
+                  color_map = {
+                      'CRITICAL': 'danger',
+                      'HIGH': 'warning',
+                      'MEDIUM': 'good',
+                      'LOW': '#439FE0',
+                      'ESCALATED': 'danger'
+                  }
+                  
+                  slack_payload = {
+                      'text': f"Security Incident: {severity}",
+                      'attachments': [{
+                          'color': color_map.get(severity, 'warning'),
+                          'title': title,
+                          'fields': [
+                              {
+                                  'title': 'Severity',
+                                  'value': severity,
+                                  'short': True
+                              },
+                              {
+                                  'title': 'Account',
+                                  'value': incident_payload['incident_details']['account'],
+                                  'short': True
+                              },
+                              {
+                                  'title': 'Action Required',
+                                  'value': incident_payload['response_plan']['action'],
+                                  'short': True
+                              },
+                              {
+                                  'title': 'SLA',
+                                  'value': f"{incident_payload['response_plan']['sla_minutes']} minutes",
+                                  'short': True
+                              }
+                          ],
+                          'footer': 'AWS Security Hub',
+                          'ts': int(datetime.now(timezone.utc).timestamp())
+                      }]
+                  }
+                  
+                  http = urllib3.PoolManager()
+                  response = http.request(
+                      'POST',
+                      webhook_url,
+                      body=json.dumps(slack_payload).encode('utf-8'),
+                      headers={'Content-Type': 'application/json'}
+                  )
+                  
+                  print(f"Slack notification sent: {response.status}")
+                  
+              except Exception as e:
+                  print(f"Error sending Slack notification: {str(e)}")
+          
+          def update_finding_workflow(securityhub, finding_id, product_arn, response_action):
+              """Update finding workflow status"""
+              try:
+                  workflow_status = 'NOTIFIED' if response_action != 'log_only' else 'NEW'
+                  
+                  securityhub.batch_update_findings(
+                      FindingIdentifiers=[{
+                          'Id': finding_id,
+                          'ProductArn': product_arn
+                      }],
+                      Note={
+                          'Text': f'Automated incident response initiated: {response_action}',
+                          'UpdatedBy': 'SecurityHubAutomation'
+                      },
+                      Workflow={
+                          'Status': workflow_status
+                      },
+                      UserDefinedFields={
+                          'ResponseAction': response_action,
+                          'ProcessedAt': datetime.now(timezone.utc).isoformat()
+                      }
+                  )
+                  
+                  print(f"Finding workflow updated: {finding_id}")
+                  
+              except Exception as e:
+                  print(f"Error updating finding workflow: {str(e)}")
+          
+          def send_metrics(cloudwatch, severity, response_action, finding_count=1):
+              """Send custom metrics to CloudWatch"""
+              try:
+                  cloudwatch.put_metric_data(
+                      Namespace='SecurityHub/IncidentResponse',
+                      MetricData=[
+                          {
+                              'MetricName': 'FindingsProcessed',
+                              'Value': finding_count,
+                              'Unit': 'Count',
+                              'Dimensions': [
+                                  {'Name': 'Severity', 'Value': severity},
+                                  {'Name': 'ResponseAction', 'Value': response_action},
+                                  {'Name': 'Environment', 'Value': os.environ.get('ENVIRONMENT', 'unknown')}
+                              ]
+                          },
+                          {
+                              'MetricName': 'ResponseTime',
+                              'Value': 1,  # This would be calculated based on actual processing time
+                              'Unit': 'Seconds',
+                              'Dimensions': [
+                                  {'Name': 'Severity', 'Value': severity},
+                                  {'Name': 'ResponseAction', 'Value': response_action}
+                              ]
+                          }
+                      ]
+                  )
+              except Exception as e:
+                  print(f"Error sending metrics: {str(e)}")
+          
+          def get_priority_level(severity):
+              """Map severity to priority level"""
+              priority_map = {
+                  'CRITICAL': 'P1',
+                  'HIGH': 'P2',
+                  'MEDIUM': 'P3',
+                  'LOW': 'P4',
+                  'INFORMATIONAL': 'P5'
+              }
+              return priority_map.get(severity, 'P4')
+          
+          def get_sla_minutes(severity):
+              """Get SLA response time in minutes"""
+              sla_map = {
+                  'CRITICAL': 15,
+                  'HIGH': 60,
+                  'MEDIUM': 240,
+                  'LOW': 1440,
+                  'INFORMATIONAL': 2880
+              }
+              return sla_map.get(severity, 1440)
+          
+          def should_auto_remediate(finding, response_action):
+              """Determine if finding should be auto-remediated"""
+              # Define safe auto-remediation scenarios
+              auto_remediate_types = [
+                  'public-read-access',
+                  'insecure-protocol',
+                  'missing-encryption'
+              ]
+              
+              finding_types = finding.get('Types', [])
+              return any(remediate_type in str(finding_types).lower() for remediate_type in auto_remediate_types)
+          
+          def send_error_notification(error_message):
+              """Send error notification for Lambda failures"""
+              try:
+                  sns = boto3.client('sns')
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Message=f"CRITICAL: Security Hub incident processor error: {error_message}",
+                      Subject="Security Hub Automation Failure"
+                  )
+              except:
+                  pass  # Fail silently to avoid recursion
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: Process security incidents from Security Hub
+
+  IncidentProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${IncidentProcessorFunction}'
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt LogsKMSKey.Arn
+
+  ThreatIntelligenceFunction:
+    Type: AWS::Lambda::Function
+    Condition: ShouldEnableThreatIntelligence
+    Properties:
+      FunctionName: !Sub '${ProjectName}-threat-intelligence-${AWS::Region}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ThreatIntelligenceLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          AWS_REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import re
+          from datetime import datetime, timezone
+          
+          def lambda_handler(event, context):
+              """
+              Enrich Security Hub findings with threat intelligence data
+              """
+              try:
+                  securityhub = boto3.client('securityhub')
+                  
+                  finding = event['detail']['findings'][0]
+                  finding_id = finding.get('Id')
+                  product_arn = finding.get('ProductArn')
+                  
+                  # Extract threat indicators from finding
+                  threat_indicators = extract_threat_indicators(finding)
+                  
+                  # Calculate threat score (in production, this would query real threat feeds)
+                  threat_score = calculate_threat_score(threat_indicators, finding)
+                  
+                  # Update finding with threat intelligence
+                  update_finding_with_threat_intel(securityhub, finding_id, product_arn, threat_score, threat_indicators)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'finding_id': finding_id,
+                          'threat_score': threat_score,
+                          'indicators_found': len(threat_indicators)
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in threat intelligence processing: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def extract_threat_indicators(finding):
+              """Extract potential threat indicators from finding resources and details"""
+              indicators = []
+              
+              # Extract from resources
+              for resource in finding.get('Resources', []):
+                  resource_id = resource.get('Id', '')
+                  resource_details = resource.get('Details', {})
+                  
+                  # Extract IP addresses
+                  ip_pattern = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
+                  ips = re.findall(ip_pattern, resource_id)
+                  indicators.extend([{'type': 'ip', 'value': ip} for ip in ips])
+                  
+                  # Extract domains
+                  domain_pattern = r'\b[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b'
+                  domains = re.findall(domain_pattern, resource_id)
+                  indicators.extend([{'type': 'domain', 'value': domain} for domain in domains])
+                  
+                  # Extract from AWS-specific resource details
+                  if 'AwsEc2Instance' in resource_details:
+                      instance_details = resource_details['AwsEc2Instance']
+                      public_ip = instance_details.get('PublicIpAddress')
+                      if public_ip:
+                          indicators.append({'type': 'ip', 'value': public_ip})
+                  
+                  # Extract file hashes if present
+                  hash_pattern = r'\b[a-fA-F0-9]{32,64}\b'
+                  hashes = re.findall(hash_pattern, str(resource_details))
+                  indicators.extend([{'type': 'hash', 'value': hash_val} for hash_val in hashes])
+              
+              # Extract from finding description and title
+              description = finding.get('Description', '')
+              title = finding.get('Title', '')
+              combined_text = f"{description} {title}"
+              
+              # Look for suspicious patterns in text
+              suspicious_patterns = [
+                  r'malware',
+                  r'backdoor',
+                  r'trojan',
+                  r'ransomware',
+                  r'cryptominer'
+              ]
+              
+              for pattern in suspicious_patterns:
+                  if re.search(pattern, combined_text, re.IGNORECASE):
+                      indicators.append({'type': 'keyword', 'value': pattern})
+              
+              return indicators
+          
+          def calculate_threat_score(indicators, finding):
+              """Calculate threat score based on indicators and finding characteristics"""
+              base_score = 10
+              
+              # Score based on number and type of indicators
+              indicator_scores = {
+                  'ip': 15,
+                  'domain': 10,
+                  'hash': 20,
+                  'keyword': 25
+              }
+              
+              indicator_bonus = sum(indicator_scores.get(ind['type'], 5) for ind in indicators)
+              
+              # Score based on finding severity
+              severity = finding.get('Severity', {}).get('Label', 'UNKNOWN')
+              severity_scores = {
+                  'CRITICAL': 40,
+                  'HIGH': 30,
+                  'MEDIUM': 20,
+                  'LOW': 10,
+                  'INFORMATIONAL': 5
+              }
+              
+              severity_bonus = severity_scores.get(severity, 10)
+              
+              # Score based on finding types
+              finding_types = finding.get('Types', [])
+              malware_indicators = ['malware', 'backdoor', 'trojan']
+              if any(indicator in str(finding_types).lower() for indicator in malware_indicators):
+                  type_bonus = 30
+              else:
+                  type_bonus = 0
+              
+              # Score based on resource exposure
+              resources = finding.get('Resources', [])
+              public_resources = any('public' in str(resource).lower() for resource in resources)
+              exposure_bonus = 15 if public_resources else 0
+              
+              total_score = base_score + indicator_bonus + severity_bonus + type_bonus + exposure_bonus
+              
+              return min(total_score, 100)  # Cap at 100
+          
+          def update_finding_with_threat_intel(securityhub, finding_id, product_arn, threat_score, indicators):
+              """Update finding with threat intelligence information"""
+              try:
+                  # Determine threat level based on score
+                  if threat_score >= 80:
+                      threat_level = 'HIGH'
+                  elif threat_score >= 60:
+                      threat_level = 'MEDIUM'
+                  elif threat_score >= 40:
+                      threat_level = 'LOW'
+                  else:
+                      threat_level = 'MINIMAL'
+                  
+                  # Create indicator summary
+                  indicator_summary = {}
+                  for indicator in indicators:
+                      ind_type = indicator['type']
+                      if ind_type in indicator_summary:
+                          indicator_summary[ind_type] += 1
+                      else:
+                          indicator_summary[ind_type] = 1
+                  
+                  securityhub.batch_update_findings(
+                      FindingIdentifiers=[{
+                          'Id': finding_id,
+                          'ProductArn': product_arn
+                      }],
+                      Note={
+                          'Text': f'Threat Intelligence Analysis - Score: {threat_score}/100, Level: {threat_level}, Indicators: {len(indicators)}',
+                          'UpdatedBy': 'ThreatIntelligenceAutomation'
+                      },
+                      UserDefinedFields={
+                          'ThreatScore': str(threat_score),
+                          'ThreatLevel': threat_level,
+                          'ThreatIndicators': str(len(indicators)),
+                          'IndicatorTypes': json.dumps(indicator_summary),
+                          'ThreatAnalysisTime': datetime.now(timezone.utc).isoformat()
+                      }
+                  )
+                  
+                  print(f"Threat intelligence updated for finding {finding_id}: Score={threat_score}, Level={threat_level}")
+                  
+              except Exception as e:
+                  print(f"Error updating finding with threat intelligence: {str(e)}")
+                  raise
+
+  ThreatIntelligenceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ShouldEnableThreatIntelligence
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ThreatIntelligenceFunction}'
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt LogsKMSKey.Arn
+
+  # =============================================================================
+  # EVENTBRIDGE RULES
+  # =============================================================================
+  
+  HighSeverityFindingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-high-severity-findings'
+      Description: Process high and critical severity Security Hub findings
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.securityhub
+        detail-type:
+          - Security Hub Findings - Imported
+        detail:
+          findings:
+            Severity:
+              Label:
+                - HIGH
+                - CRITICAL
+            Workflow:
+              Status:
+                - NEW
+      Targets:
+        - Arn: !GetAtt IncidentProcessorFunction.Arn
+          Id: IncidentProcessorTarget
+
+  HighSeverityRuleLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IncidentProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt HighSeverityFindingRule.Arn
+
+  ThreatIntelligenceRule:
+    Type: AWS::Events::Rule
+    Condition: ShouldEnableThreatIntelligence
+    Properties:
+      Name: !Sub '${ProjectName}-threat-intelligence-enrichment'
+      Description: Enrich findings with threat intelligence data
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.securityhub
+        detail-type:
+          - Security Hub Findings - Imported
+        detail:
+          findings:
+            Severity:
+              Label:
+                - MEDIUM
+                - HIGH
+                - CRITICAL
+            Workflow:
+              Status:
+                - NEW
+      Targets:
+        - Arn: !GetAtt ThreatIntelligenceFunction.Arn
+          Id: ThreatIntelligenceTarget
+
+  ThreatIntelligenceRuleLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Condition: ShouldEnableThreatIntelligence
+    Properties:
+      FunctionName: !Ref ThreatIntelligenceFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ThreatIntelligenceRule.Arn
+
+  # =============================================================================
+  # SECURITY HUB CONFIGURATIONS
+  # =============================================================================
+  
+  SecurityHubHub:
+    Type: AWS::SecurityHub::Hub
+    Condition: ShouldEnableSecurityHub
+    Properties:
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Custom Action for manual escalation
+  EscalateToSOCAction:
+    Type: AWS::SecurityHub::ActionTarget
+    Condition: ShouldEnableSecurityHub
+    Properties:
+      Name: !Sub 'escalate-to-soc-${AWS::Region}'
+      Description: Escalate this finding to the Security Operations Center
+      Id: !Sub 'escalate-to-soc-${AWS::Region}'
+
+  CustomActionRule:
+    Type: AWS::Events::Rule
+    Condition: ShouldEnableSecurityHub
+    Properties:
+      Name: !Sub '${ProjectName}-custom-escalation'
+      Description: Process manual escalation from Security Hub
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.securityhub
+        detail-type:
+          - Security Hub Findings - Custom Action
+        detail:
+          actionName:
+            - !Sub 'escalate-to-soc-${AWS::Region}'
+      Targets:
+        - Arn: !GetAtt IncidentProcessorFunction.Arn
+          Id: CustomActionTarget
+
+  CustomActionRuleLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Condition: ShouldEnableSecurityHub
+    Properties:
+      FunctionName: !Ref IncidentProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CustomActionRule.Arn
+
+  # =============================================================================
+  # KMS KEYS FOR ENCRYPTION
+  # =============================================================================
+  
+  LogsKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for CloudWatch Logs encryption
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: CloudWatch Logs encryption
+
+  LogsKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-logs-${AWS::Region}'
+      TargetKeyId: !Ref LogsKMSKey
+
+  # =============================================================================
+  # CLOUDWATCH MONITORING AND ALARMS
+  # =============================================================================
+  
+  SecurityHubDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-SecurityHub-IncidentResponse'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${IncidentProcessorFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${IncidentProcessorFunction}"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${IncidentProcessorFunction}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Security Incident Processing Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/SNS", "NumberOfMessagesPublished", "TopicName", "${SecurityIncidentTopic.TopicName}"],
+                  ["AWS/SNS", "NumberOfNotificationsFailed", "TopicName", "${SecurityIncidentTopic.TopicName}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Notification Delivery Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["SecurityHub/IncidentResponse", "FindingsProcessed", "Severity", "CRITICAL"],
+                  ["SecurityHub/IncidentResponse", "FindingsProcessed", "Severity", "HIGH"],
+                  ["SecurityHub/IncidentResponse", "FindingsProcessed", "Severity", "MEDIUM"],
+                  ["SecurityHub/IncidentResponse", "FindingsProcessed", "Severity", "LOW"]
+                ],
+                "period": 3600,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Findings Processed by Severity (Hourly)",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            }
+          ]
+        }
+
+  IncidentProcessingFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-IncidentProcessing-Failures'
+      AlarmDescription: Alert when Security Hub incident processing fails
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref SecurityIncidentTopic
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IncidentProcessorFunction
+      TreatMissingData: notBreaching
+
+  HighVolumeSecurityFindingsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-HighVolume-SecurityFindings'
+      AlarmDescription: Alert when high volume of security findings are processed
+      MetricName: FindingsProcessed
+      Namespace: SecurityHub/IncidentResponse
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref SecurityIncidentTopic
+      TreatMissingData: notBreaching
+
+  CriticalFindingsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-Critical-Findings'
+      AlarmDescription: Alert when critical security findings are detected
+      MetricName: FindingsProcessed
+      Namespace: SecurityHub/IncidentResponse
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref SecurityIncidentTopic
+      Dimensions:
+        - Name: Severity
+          Value: CRITICAL
+      TreatMissingData: notBreaching
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+
+Outputs:
+  SecurityHubHubArn:
+    Description: ARN of the Security Hub hub
+    Value: !If [ShouldEnableSecurityHub, !GetAtt SecurityHubHub.HubArn, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityHubArn'
+
+  SecurityIncidentTopicArn:
+    Description: ARN of the Security Incident SNS Topic
+    Value: !Ref SecurityIncidentTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityIncidentTopicArn'
+
+  SecurityIncidentQueueUrl:
+    Description: URL of the Security Incident SQS Queue
+    Value: !Ref SecurityIncidentQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityIncidentQueueUrl'
+
+  IncidentProcessorFunctionArn:
+    Description: ARN of the Incident Processor Lambda Function
+    Value: !GetAtt IncidentProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IncidentProcessorFunctionArn'
+
+  ThreatIntelligenceFunctionArn:
+    Description: ARN of the Threat Intelligence Lambda Function
+    Value: !If [ShouldEnableThreatIntelligence, !GetAtt ThreatIntelligenceFunction.Arn, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-ThreatIntelligenceFunctionArn'
+
+  CustomActionId:
+    Description: ID of the Security Hub Custom Action
+    Value: !If [ShouldEnableSecurityHub, !Ref EscalateToSOCAction, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomActionId'
+
+  DashboardUrl:
+    Description: URL to the CloudWatch Dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-SecurityHub-IncidentResponse'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardUrl'
+
+  SecurityHubConsoleUrl:
+    Description: URL to the Security Hub console
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/securityhub/home?region=${AWS::Region}'
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityHubConsoleUrl'
+
+  DeploymentInstructions:
+    Description: Post-deployment configuration instructions
+    Value: !Sub |
+      1. Confirm SNS email subscription in your inbox
+      2. Navigate to Security Hub console: https://${AWS::Region}.console.aws.amazon.com/securityhub/home?region=${AWS::Region}
+      3. Test custom action: Select a finding and use "escalate-to-soc-${AWS::Region}" action
+      4. Monitor dashboard: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-SecurityHub-IncidentResponse
+      5. Review SQS queue for external system integration: ${SecurityIncidentQueue}
+
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for this solution (USD)
+    Value: !Sub |
+      Based on typical usage patterns:
+      - Lambda: $5-15 (depends on finding volume)
+      - SNS: $2-5 (depends on notification volume) 
+      - SQS: $1-3 (depends on message volume)
+      - CloudWatch: $3-10 (logs and metrics)
+      - Security Hub: $1.20 per 10,000 findings
+      Total estimated: $15-50/month (varies by finding volume)

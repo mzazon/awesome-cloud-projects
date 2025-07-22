@@ -1,0 +1,769 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Infrastructure for Real-Time Edge AI Inference with SageMaker and IoT Greengrass.
+  This template creates the complete infrastructure for deploying machine learning models
+  to edge devices using AWS IoT Greengrass v2 with ONNX runtime for real-time inference,
+  combined with EventBridge for centralized monitoring and orchestration.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Edge Device Configuration"
+        Parameters:
+          - EdgeDeviceName
+          - EdgeDeviceOS
+      - Label:
+          default: "Model Configuration"
+        Parameters:
+          - ModelName
+          - ModelVersion
+          - InferenceInterval
+          - ConfidenceThreshold
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableDetailedMonitoring
+          - LogRetentionDays
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      EdgeDeviceName:
+        default: "Edge Device Name"
+      EdgeDeviceOS:
+        default: "Edge Device Operating System"
+      ModelName:
+        default: "ML Model Name"
+      ModelVersion:
+        default: "Model Version"
+      InferenceInterval:
+        default: "Inference Interval (seconds)"
+      ConfidenceThreshold:
+        default: "Confidence Threshold"
+      EnableDetailedMonitoring:
+        default: "Enable Detailed Monitoring"
+      LogRetentionDays:
+        default: "Log Retention Period (days)"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: edge-ai-inference
+    Description: Name of the project used for resource naming
+    AllowedPattern: ^[a-z0-9-]{3,30}$
+    ConstraintDescription: Must be 3-30 characters, lowercase letters, numbers, and hyphens only
+
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment name (dev, test, prod)
+    AllowedValues:
+      - dev
+      - test
+      - prod
+
+  EdgeDeviceName:
+    Type: String
+    Default: edge-device-001
+    Description: Name of the edge device/thing in IoT Core
+    AllowedPattern: ^[a-zA-Z0-9_-]{1,128}$
+    ConstraintDescription: Must be 1-128 characters, letters, numbers, underscores, and hyphens only
+
+  EdgeDeviceOS:
+    Type: String
+    Default: linux
+    Description: Operating system of the edge device
+    AllowedValues:
+      - linux
+      - windows
+
+  ModelName:
+    Type: String
+    Default: defect-detection
+    Description: Name of the machine learning model
+    AllowedPattern: ^[a-z0-9-]{3,50}$
+    ConstraintDescription: Must be 3-50 characters, lowercase letters, numbers, and hyphens only
+
+  ModelVersion:
+    Type: String
+    Default: 1.0.0
+    Description: Version of the machine learning model
+    AllowedPattern: ^\d+\.\d+\.\d+$
+    ConstraintDescription: Must be in semantic version format (x.y.z)
+
+  InferenceInterval:
+    Type: Number
+    Default: 10
+    Description: Interval between inference runs in seconds
+    MinValue: 1
+    MaxValue: 3600
+
+  ConfidenceThreshold:
+    Type: Number
+    Default: 0.8
+    Description: Minimum confidence threshold for predictions
+    MinValue: 0.1
+    MaxValue: 1.0
+
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    Description: Enable detailed CloudWatch monitoring
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    Description: Number of days to retain CloudWatch logs
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+Conditions:
+  IsDetailedMonitoringEnabled: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  IsProductionEnvironment: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # ====================================
+  # S3 Bucket for Model Storage
+  # ====================================
+  ModelStorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-models-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref ModelUpdateLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-model-storage-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ====================================
+  # IAM Roles and Policies
+  # ====================================
+  GreengrassTokenExchangeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-GreengrassV2TokenExchangeRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: credentials.iot.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/GreengrassV2TokenExchangeRoleAccess
+      Policies:
+        - PolicyName: EdgeAIInferencePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub '${ModelStorageBucket}/models/*'
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/${EdgeMonitoringEventBus}'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/greengrass/*'
+              - Effect: Allow
+                Action:
+                  - iot:Publish
+                  - iot:Subscribe
+                  - iot:Receive
+                Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/greengrass/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-greengrass-token-exchange-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  GreengrassDeviceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-GreengrassV2DeviceRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt GreengrassTokenExchangeRole.Arn
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EdgeDevicePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - greengrass:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iot:Connect
+                  - iot:Publish
+                  - iot:Subscribe
+                  - iot:Receive
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-greengrass-device-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ====================================
+  # IoT Core Resources
+  # ====================================
+  EdgeIoTThing:
+    Type: AWS::IoT::Thing
+    Properties:
+      ThingName: !Sub '${ProjectName}-${EdgeDeviceName}-${Environment}'
+      AttributePayload:
+        Attributes:
+          Project: !Ref ProjectName
+          Environment: !Ref Environment
+          DeviceType: GreengrassCore
+          ModelName: !Ref ModelName
+          ModelVersion: !Ref ModelVersion
+
+  EdgeIoTPolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-GreengrassV2IoTThingPolicy-${Environment}'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - iot:Connect
+              - iot:Publish
+              - iot:Subscribe
+              - iot:Receive
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - greengrass:*
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - iot:GetThingShadow
+              - iot:UpdateThingShadow
+              - iot:DeleteThingShadow
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:thing/${EdgeIoTThing}'
+
+  IoTRoleAlias:
+    Type: AWS::IoT::RoleAlias
+    Properties:
+      RoleAlias: !Sub '${ProjectName}-GreengrassV2TokenExchangeRoleAlias-${Environment}'
+      RoleArn: !GetAtt GreengrassTokenExchangeRole.Arn
+      CredentialDurationSeconds: 3600
+
+  # ====================================
+  # EventBridge Resources
+  # ====================================
+  EdgeMonitoringEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${ProjectName}-edge-monitoring-bus-${Environment}'
+      EventSourceName: edge.ai.inference
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-edge-monitoring-bus-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  InferenceEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-edge-inference-monitoring-${Environment}'
+      Description: Rule to capture edge AI inference events
+      EventBusName: !Ref EdgeMonitoringEventBus
+      EventPattern:
+        source:
+          - edge.ai.inference
+        detail-type:
+          - InferenceCompleted
+          - InferenceError
+          - ModelLoadError
+      State: ENABLED
+      Targets:
+        - Arn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${InferenceEventLogGroup}'
+          Id: InferenceEventLogTarget
+        - Arn: !GetAtt InferenceMetricsLambda.Arn
+          Id: InferenceMetricsTarget
+        - !If
+          - IsDetailedMonitoringEnabled
+          - Arn: !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AlertingTopic}'
+            Id: AlertingTarget
+          - !Ref AWS::NoValue
+
+  # ====================================
+  # CloudWatch Resources
+  # ====================================
+  InferenceEventLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/events/${ProjectName}-edge-inference-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-inference-events-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ModelUpdateLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-model-updates-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-model-updates-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  GreengrassLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/greengrass/${ProjectName}-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-greengrass-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Custom CloudWatch Metrics for Inference Performance
+  InferenceLatencyMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref InferenceEventLogGroup
+      FilterPattern: '[timestamp, request_id="\"inference_completed\"", device_id, inference_time_ms]'
+      MetricTransformations:
+        - MetricNamespace: !Sub '${ProjectName}/EdgeAI'
+          MetricName: InferenceLatency
+          MetricValue: '$inference_time_ms'
+          DefaultValue: 0
+
+  InferenceAccuracyMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref InferenceEventLogGroup
+      FilterPattern: '[timestamp, request_id="\"inference_completed\"", device_id, confidence]'
+      MetricTransformations:
+        - MetricNamespace: !Sub '${ProjectName}/EdgeAI'
+          MetricName: InferenceConfidence
+          MetricValue: '$confidence'
+          DefaultValue: 0
+
+  # ====================================
+  # Lambda Functions
+  # ====================================
+  InferenceMetricsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: MetricsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+  InferenceMetricsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-inference-metrics-${Environment}'
+      Description: Process edge inference events and publish custom metrics
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt InferenceMetricsLambdaRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          METRIC_NAMESPACE: !Sub '${ProjectName}/EdgeAI'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          cloudwatch = boto3.client('cloudwatch')
+          
+          def lambda_handler(event, context):
+              """Process edge inference events and publish custom metrics"""
+              try:
+                  detail = event.get('detail', {})
+                  detail_type = event.get('detail-type', '')
+                  
+                  # Extract metrics based on event type
+                  metrics = []
+                  
+                  if detail_type == 'InferenceCompleted':
+                      # Inference success rate
+                      metrics.append({
+                          'MetricName': 'InferenceSuccess',
+                          'Value': 1,
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {'Name': 'DeviceId', 'Value': detail.get('device_id', 'unknown')},
+                              {'Name': 'ModelName', 'Value': detail.get('model_name', 'unknown')}
+                          ]
+                      })
+                      
+                      # Confidence score
+                      if 'confidence' in detail:
+                          metrics.append({
+                              'MetricName': 'PredictionConfidence',
+                              'Value': float(detail['confidence']),
+                              'Unit': 'None',
+                              'Dimensions': [
+                                  {'Name': 'DeviceId', 'Value': detail.get('device_id', 'unknown')},
+                                  {'Name': 'Prediction', 'Value': detail.get('prediction', 'unknown')}
+                              ]
+                          })
+                  
+                  elif detail_type in ['InferenceError', 'ModelLoadError']:
+                      # Error rate
+                      metrics.append({
+                          'MetricName': 'InferenceError',
+                          'Value': 1,
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {'Name': 'DeviceId', 'Value': detail.get('device_id', 'unknown')},
+                              {'Name': 'ErrorType', 'Value': detail_type}
+                          ]
+                      })
+                  
+                  # Publish metrics to CloudWatch
+                  if metrics:
+                      cloudwatch.put_metric_data(
+                          Namespace=os.environ['METRIC_NAMESPACE'],
+                          MetricData=metrics
+                      )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(f'Processed {len(metrics)} metrics')
+                  }
+                  
+              except Exception as e:
+                  print(f"Error processing event: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-inference-metrics-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref InferenceMetricsLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt InferenceEventRule.Arn
+
+  # ====================================
+  # SNS Topic for Alerting (Optional)
+  # ====================================
+  AlertingTopic:
+    Type: AWS::SNS::Topic
+    Condition: IsDetailedMonitoringEnabled
+    Properties:
+      TopicName: !Sub '${ProjectName}-edge-ai-alerts-${Environment}'
+      DisplayName: Edge AI Inference Alerts
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-edge-ai-alerts-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ====================================
+  # CloudWatch Alarms
+  # ====================================
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsDetailedMonitoringEnabled
+    Properties:
+      AlarmName: !Sub '${ProjectName}-HighErrorRate-${Environment}'
+      AlarmDescription: Alarm when edge inference error rate is high
+      MetricName: InferenceError
+      Namespace: !Sub '${ProjectName}/EdgeAI'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertingTopic
+      TreatMissingData: notBreaching
+
+  LowConfidenceAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsDetailedMonitoringEnabled
+    Properties:
+      AlarmName: !Sub '${ProjectName}-LowConfidence-${Environment}'
+      AlarmDescription: Alarm when prediction confidence is consistently low
+      MetricName: PredictionConfidence
+      Namespace: !Sub '${ProjectName}/EdgeAI'
+      Statistic: Average
+      Period: 900
+      EvaluationPeriods: 2
+      Threshold: !Ref ConfidenceThreshold
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref AlertingTopic
+      TreatMissingData: notBreaching
+
+  # ====================================
+  # CloudWatch Dashboard
+  # ====================================
+  EdgeAIDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: IsDetailedMonitoringEnabled
+    Properties:
+      DashboardName: !Sub '${ProjectName}-EdgeAI-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["${ProjectName}/EdgeAI", "InferenceSuccess"],
+                  [".", "InferenceError"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Inference Success vs Error Rate"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["${ProjectName}/EdgeAI", "PredictionConfidence"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Average Prediction Confidence"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/events/${ProjectName}-edge-inference-${Environment}'\n| fields @timestamp, detail.device_id, detail.prediction, detail.confidence\n| filter detail.detail-type = \"InferenceCompleted\"\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Inference Results"
+              }
+            }
+          ]
+        }
+
+# ====================================
+# Outputs
+# ====================================
+Outputs:
+  ModelStorageBucketName:
+    Description: Name of the S3 bucket for storing ML models
+    Value: !Ref ModelStorageBucket
+    Export:
+      Name: !Sub '${ProjectName}-ModelBucket-${Environment}'
+
+  ModelStorageBucketArn:
+    Description: ARN of the S3 bucket for storing ML models
+    Value: !GetAtt ModelStorageBucket.Arn
+    Export:
+      Name: !Sub '${ProjectName}-ModelBucketArn-${Environment}'
+
+  EdgeIoTThingName:
+    Description: Name of the IoT Thing for the edge device
+    Value: !Ref EdgeIoTThing
+    Export:
+      Name: !Sub '${ProjectName}-EdgeThing-${Environment}'
+
+  EdgeIoTThingArn:
+    Description: ARN of the IoT Thing for the edge device
+    Value: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:thing/${EdgeIoTThing}'
+    Export:
+      Name: !Sub '${ProjectName}-EdgeThingArn-${Environment}'
+
+  TokenExchangeRoleArn:
+    Description: ARN of the Greengrass Token Exchange Role
+    Value: !GetAtt GreengrassTokenExchangeRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-TokenExchangeRoleArn-${Environment}'
+
+  IoTRoleAliasArn:
+    Description: ARN of the IoT Role Alias
+    Value: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:rolealias/${IoTRoleAlias}'
+    Export:
+      Name: !Sub '${ProjectName}-IoTRoleAliasArn-${Environment}'
+
+  EventBusName:
+    Description: Name of the EventBridge custom event bus
+    Value: !Ref EdgeMonitoringEventBus
+    Export:
+      Name: !Sub '${ProjectName}-EventBus-${Environment}'
+
+  EventBusArn:
+    Description: ARN of the EventBridge custom event bus
+    Value: !GetAtt EdgeMonitoringEventBus.Arn
+    Export:
+      Name: !Sub '${ProjectName}-EventBusArn-${Environment}'
+
+  InferenceEventLogGroup:
+    Description: CloudWatch Log Group for inference events
+    Value: !Ref InferenceEventLogGroup
+    Export:
+      Name: !Sub '${ProjectName}-InferenceLogGroup-${Environment}'
+
+  DashboardURL:
+    Condition: IsDetailedMonitoringEnabled
+    Description: URL to the CloudWatch Dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${EdgeAIDashboard}'
+
+  GreengrassInstallCommand:
+    Description: Command to install Greengrass on edge device
+    Value: !Sub |
+      # Download and install AWS IoT Greengrass Core software
+      curl -s https://d2s8p88vqu9w66.cloudfront.net/releases/greengrass-nucleus-latest.zip > greengrass-nucleus-latest.zip
+      unzip greengrass-nucleus-latest.zip -d GreengrassCore
+      sudo -E java -Droot="/greengrass/v2" -Dlog.store=FILE \
+        -jar ./GreengrassCore/lib/Greengrass.jar \
+        --thing-name ${EdgeIoTThing} \
+        --thing-group-name ${ProjectName}-${Environment}-group \
+        --tes-role-name ${GreengrassTokenExchangeRole} \
+        --tes-role-alias-name ${IoTRoleAlias} \
+        --component-default-user ggc_user:ggc_group \
+        --provision true \
+        --setup-system-service true \
+        --deploy-dev-tools true
+
+  ModelUploadCommand:
+    Description: Example command to upload model to S3
+    Value: !Sub |
+      # Upload your ONNX model to S3
+      aws s3 cp your-model.onnx s3://${ModelStorageBucket}/models/${ModelVersion}/model.onnx
+      aws s3 cp model-config.json s3://${ModelStorageBucket}/models/${ModelVersion}/config.json
+
+  ComponentDeploymentJSON:
+    Description: JSON configuration for Greengrass component deployment
+    Value: !Sub |
+      {
+        "targetArn": "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:thing/${EdgeIoTThing}",
+        "deploymentName": "${ProjectName}-EdgeAI-Deployment-${Environment}",
+        "components": {
+          "com.edge.OnnxRuntime": {
+            "componentVersion": "1.0.0"
+          },
+          "com.edge.DefectDetectionModel": {
+            "componentVersion": "1.0.0"
+          },
+          "com.edge.InferenceEngine": {
+            "componentVersion": "1.0.0",
+            "configurationUpdate": {
+              "merge": "{\"EventBusName\":\"${EdgeMonitoringEventBus}\",\"InferenceInterval\":${InferenceInterval},\"ConfidenceThreshold\":${ConfidenceThreshold}}"
+            }
+          }
+        }
+      }

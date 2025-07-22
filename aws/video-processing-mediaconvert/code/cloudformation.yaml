@@ -1,0 +1,1189 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for Building Video Processing Workflows with S3, Lambda, and MediaConvert'
+
+# Template Parameters for customization
+Parameters:
+  
+  # General Parameters
+  ProjectName:
+    Type: String
+    Default: 'video-processing-workflow'
+    Description: 'Name prefix for all resources'
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+  
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - 'dev'
+      - 'test'
+      - 'staging'
+      - 'prod'
+    Description: 'Environment name for resource tagging'
+  
+  # Lambda Configuration
+  LambdaRuntime:
+    Type: String
+    Default: 'python3.9'
+    AllowedValues:
+      - 'python3.9'
+      - 'python3.10'
+      - 'python3.11'
+    Description: 'Lambda runtime version'
+  
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 30
+    MaxValue: 300
+    Description: 'Lambda function timeout in seconds'
+  
+  # MediaConvert Configuration
+  MediaConvertOutputBitrate:
+    Type: Number
+    Default: 2000000
+    MinValue: 500000
+    MaxValue: 20000000
+    Description: 'MediaConvert output bitrate in bps'
+  
+  MediaConvertOutputWidth:
+    Type: Number
+    Default: 1280
+    MinValue: 480
+    MaxValue: 3840
+    Description: 'MediaConvert output video width'
+  
+  MediaConvertOutputHeight:
+    Type: Number
+    Default: 720
+    MinValue: 360
+    MaxValue: 2160
+    Description: 'MediaConvert output video height'
+  
+  # CloudFront Configuration
+  CloudFrontPriceClass:
+    Type: String
+    Default: 'PriceClass_100'
+    AllowedValues:
+      - 'PriceClass_100'
+      - 'PriceClass_200'
+      - 'PriceClass_All'
+    Description: 'CloudFront price class for distribution'
+  
+  # S3 Configuration
+  S3StorageClass:
+    Type: String
+    Default: 'STANDARD'
+    AllowedValues:
+      - 'STANDARD'
+      - 'STANDARD_IA'
+      - 'ONEZONE_IA'
+    Description: 'S3 storage class for buckets'
+  
+  # Notification Configuration
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for notifications (optional)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+# Template Conditions
+Conditions:
+  
+  # Check if email notification is provided
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  
+  # Check if this is a production environment
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  
+  # Check if high performance CloudFront is needed
+  HighPerformanceCloudFront: !Or 
+    - !Equals [!Ref CloudFrontPriceClass, 'PriceClass_200']
+    - !Equals [!Ref CloudFrontPriceClass, 'PriceClass_All']
+
+# Template Resources
+Resources:
+  
+  # ===== S3 RESOURCES =====
+  
+  # Source S3 Bucket for video uploads
+  VideoSourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-source-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt VideoProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .mp4
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt VideoProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .mov
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt VideoProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .avi
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt VideoProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .mkv
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt VideoProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .m4v
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-source-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Video source storage'
+  
+  # Output S3 Bucket for processed videos
+  VideoOutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-output-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 180
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+              - HEAD
+            AllowedOrigins:
+              - '*'
+            ExposedHeaders:
+              - ETag
+            MaxAge: 3600
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-output-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Processed video storage'
+  
+  # ===== IAM RESOURCES =====
+  
+  # IAM Role for MediaConvert Service
+  MediaConvertRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-mediaconvert-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: mediaconvert.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+      Policies:
+        - PolicyName: MediaConvertS3OutputPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:GetObject
+                  - s3:GetObjectAcl
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${VideoOutputBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt VideoOutputBucket.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-mediaconvert-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'MediaConvert service role'
+  
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: MediaConvertLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - mediaconvert:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource:
+                  - !Sub '${VideoSourceBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource:
+                  - !Sub '${VideoOutputBucket}/*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !GetAtt MediaConvertRole.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !If
+                  - HasNotificationEmail
+                  - !Ref NotificationTopic
+                  - !Ref AWS::NoValue
+                Condition:
+                  StringEquals:
+                    sns:TopicArn: !If
+                      - HasNotificationEmail
+                      - !Ref NotificationTopic
+                      - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Lambda execution role'
+  
+  # ===== LAMBDA RESOURCES =====
+  
+  # Lambda Function for Video Processing
+  VideoProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-video-processor'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: 512
+      ReservedConcurrencyLimit: 10
+      Environment:
+        Variables:
+          MEDIACONVERT_ENDPOINT: !Sub 'https://${MediaConvertEndpoint}.mediaconvert.${AWS::Region}.amazonaws.com'
+          MEDIACONVERT_ROLE_ARN: !GetAtt MediaConvertRole.Arn
+          S3_OUTPUT_BUCKET: !Ref VideoOutputBucket
+          OUTPUT_BITRATE: !Ref MediaConvertOutputBitrate
+          OUTPUT_WIDTH: !Ref MediaConvertOutputWidth
+          OUTPUT_HEIGHT: !Ref MediaConvertOutputHeight
+          ENVIRONMENT: !Ref Environment
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib.parse
+          import os
+          import logging
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Lambda function to process video files using AWS Elemental MediaConvert
+              """
+              try:
+                  # Initialize MediaConvert client
+                  mediaconvert = boto3.client('mediaconvert', 
+                      endpoint_url=os.environ['MEDIACONVERT_ENDPOINT'])
+                  
+                  # Parse S3 event
+                  for record in event['Records']:
+                      bucket = record['s3']['bucket']['name']
+                      key = urllib.parse.unquote_plus(record['s3']['object']['key'])
+                      
+                      logger.info(f"Processing file: {key} from bucket: {bucket}")
+                      
+                      # Skip if not a video file
+                      if not key.lower().endswith(('.mp4', '.mov', '.avi', '.mkv', '.m4v')):
+                          logger.info(f"Skipping non-video file: {key}")
+                          continue
+                      
+                      # Get video file name without extension
+                      video_name = key.split('.')[0]
+                      
+                      # Create job settings
+                      job_settings = create_job_settings(bucket, key, video_name)
+                      
+                      # Create MediaConvert job
+                      response = mediaconvert.create_job(**job_settings)
+                      job_id = response['Job']['Id']
+                      
+                      logger.info(f"Created MediaConvert job: {job_id} for {key}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Video processing initiated successfully')
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing video: {str(e)}")
+                  raise
+          
+          def create_job_settings(bucket, key, video_name):
+              """
+              Create MediaConvert job settings for video processing
+              """
+              return {
+                  "Role": os.environ['MEDIACONVERT_ROLE_ARN'],
+                  "Settings": {
+                      "Inputs": [{
+                          "AudioSelectors": {
+                              "Audio Selector 1": {
+                                  "Offset": 0,
+                                  "DefaultSelection": "DEFAULT",
+                                  "ProgramSelection": 1
+                              }
+                          },
+                          "VideoSelector": {
+                              "ColorSpace": "FOLLOW"
+                          },
+                          "FilterEnable": "AUTO",
+                          "PsiControl": "USE_PSI",
+                          "FilterStrength": 0,
+                          "DeblockFilter": "DISABLED",
+                          "DenoiseFilter": "DISABLED",
+                          "TimecodeSource": "EMBEDDED",
+                          "FileInput": f"s3://{bucket}/{key}"
+                      }],
+                      "OutputGroups": [
+                          create_hls_output_group(video_name),
+                          create_mp4_output_group()
+                      ]
+                  }
+              }
+          
+          def create_hls_output_group(video_name):
+              """
+              Create HLS output group for adaptive bitrate streaming
+              """
+              return {
+                  "Name": "Apple HLS",
+                  "OutputGroupSettings": {
+                      "Type": "HLS_GROUP_SETTINGS",
+                      "HlsGroupSettings": {
+                          "ManifestDurationFormat": "INTEGER",
+                          "Destination": f"s3://{os.environ['S3_OUTPUT_BUCKET']}/hls/{video_name}/",
+                          "TimedMetadataId3Frame": "PRIV",
+                          "CodecSpecification": "RFC_4281",
+                          "OutputSelection": "MANIFESTS_AND_SEGMENTS",
+                          "ProgramDateTimePeriod": 600,
+                          "MinSegmentLength": 0,
+                          "DirectoryStructure": "SINGLE_DIRECTORY",
+                          "ProgramDateTime": "EXCLUDE",
+                          "SegmentLength": 10,
+                          "ManifestCompression": "NONE",
+                          "ClientCache": "ENABLED",
+                          "AudioOnlyHeader": "INCLUDE"
+                      }
+                  },
+                  "Outputs": [{
+                      "VideoDescription": {
+                          "ScalingBehavior": "DEFAULT",
+                          "TimecodeInsertion": "DISABLED",
+                          "AntiAlias": "ENABLED",
+                          "Sharpness": 50,
+                          "CodecSettings": {
+                              "Codec": "H_264",
+                              "H264Settings": {
+                                  "InterlaceMode": "PROGRESSIVE",
+                                  "NumberReferenceFrames": 3,
+                                  "Syntax": "DEFAULT",
+                                  "Softness": 0,
+                                  "GopClosedCadence": 1,
+                                  "GopSize": 90,
+                                  "Slices": 1,
+                                  "GopBReference": "DISABLED",
+                                  "SlowPal": "DISABLED",
+                                  "SpatialAdaptiveQuantization": "ENABLED",
+                                  "TemporalAdaptiveQuantization": "ENABLED",
+                                  "FlickerAdaptiveQuantization": "DISABLED",
+                                  "EntropyEncoding": "CABAC",
+                                  "Bitrate": int(os.environ['OUTPUT_BITRATE']),
+                                  "FramerateControl": "SPECIFIED",
+                                  "RateControlMode": "CBR",
+                                  "CodecProfile": "MAIN",
+                                  "Telecine": "NONE",
+                                  "MinIInterval": 0,
+                                  "AdaptiveQuantization": "HIGH",
+                                  "CodecLevel": "AUTO",
+                                  "FieldEncoding": "PAFF",
+                                  "SceneChangeDetect": "ENABLED",
+                                  "QualityTuningLevel": "SINGLE_PASS",
+                                  "FramerateConversionAlgorithm": "DUPLICATE_DROP",
+                                  "UnregisteredSeiTimecode": "DISABLED",
+                                  "GopSizeUnits": "FRAMES",
+                                  "ParControl": "SPECIFIED",
+                                  "NumberBFramesBetweenReferenceFrames": 2,
+                                  "RepeatPps": "DISABLED",
+                                  "FramerateNumerator": 30,
+                                  "FramerateDenominator": 1,
+                                  "ParNumerator": 1,
+                                  "ParDenominator": 1
+                              }
+                          },
+                          "AfdSignaling": "NONE",
+                          "DropFrameTimecode": "ENABLED",
+                          "RespondToAfd": "NONE",
+                          "ColorMetadata": "INSERT",
+                          "Width": int(os.environ['OUTPUT_WIDTH']),
+                          "Height": int(os.environ['OUTPUT_HEIGHT'])
+                      },
+                      "AudioDescriptions": [{
+                          "AudioTypeControl": "FOLLOW_INPUT",
+                          "CodecSettings": {
+                              "Codec": "AAC",
+                              "AacSettings": {
+                                  "AudioDescriptionBroadcasterMix": "NORMAL",
+                                  "Bitrate": 96000,
+                                  "RateControlMode": "CBR",
+                                  "CodecProfile": "LC",
+                                  "CodingMode": "CODING_MODE_2_0",
+                                  "RawFormat": "NONE",
+                                  "SampleRate": 48000,
+                                  "Specification": "MPEG4"
+                              }
+                          },
+                          "AudioSourceName": "Audio Selector 1",
+                          "LanguageCodeControl": "FOLLOW_INPUT"
+                      }],
+                      "OutputSettings": {
+                          "HlsSettings": {
+                              "AudioGroupId": "program_audio",
+                              "AudioTrackType": "ALTERNATE_AUDIO_AUTO_SELECT_DEFAULT",
+                              "IFrameOnlyManifest": "EXCLUDE"
+                          }
+                      },
+                      "NameModifier": "_720p"
+                  }]
+              }
+          
+          def create_mp4_output_group():
+              """
+              Create MP4 output group for file-based delivery
+              """
+              return {
+                  "Name": "File Group",
+                  "OutputGroupSettings": {
+                      "Type": "FILE_GROUP_SETTINGS",
+                      "FileGroupSettings": {
+                          "Destination": f"s3://{os.environ['S3_OUTPUT_BUCKET']}/mp4/"
+                      }
+                  },
+                  "Outputs": [{
+                      "VideoDescription": {
+                          "Width": int(os.environ['OUTPUT_WIDTH']),
+                          "Height": int(os.environ['OUTPUT_HEIGHT']),
+                          "CodecSettings": {
+                              "Codec": "H_264",
+                              "H264Settings": {
+                                  "Bitrate": int(os.environ['OUTPUT_BITRATE']),
+                                  "RateControlMode": "CBR",
+                                  "CodecProfile": "MAIN",
+                                  "GopSize": 90,
+                                  "FramerateControl": "SPECIFIED",
+                                  "FramerateNumerator": 30,
+                                  "FramerateDenominator": 1
+                              }
+                          }
+                      },
+                      "AudioDescriptions": [{
+                          "CodecSettings": {
+                              "Codec": "AAC",
+                              "AacSettings": {
+                                  "Bitrate": 96000,
+                                  "SampleRate": 48000
+                              }
+                          },
+                          "AudioSourceName": "Audio Selector 1"
+                      }],
+                      "ContainerSettings": {
+                          "Container": "MP4",
+                          "Mp4Settings": {
+                              "CslgAtom": "INCLUDE",
+                              "FreeSpaceBox": "EXCLUDE",
+                              "MoovPlacement": "PROGRESSIVE_DOWNLOAD"
+                          }
+                      },
+                      "NameModifier": "_720p"
+                  }]
+              }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-video-processor'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Video processing orchestration'
+  
+  # Lambda Permission for S3 to invoke the function
+  VideoProcessorS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref VideoProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt VideoSourceBucket.Arn
+  
+  # Job Completion Handler Lambda Function
+  JobCompletionHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-job-completion-handler'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          NOTIFICATION_TOPIC_ARN: !If
+            - HasNotificationEmail
+            - !Ref NotificationTopic
+            - ''
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Lambda function to handle MediaConvert job completion events
+              """
+              try:
+                  logger.info(f"MediaConvert job completed: {json.dumps(event)}")
+                  
+                  # Extract job details
+                  job_id = event['detail']['jobId']
+                  status = event['detail']['status']
+                  
+                  # Send notification if SNS topic is configured
+                  if os.environ.get('NOTIFICATION_TOPIC_ARN'):
+                      send_notification(job_id, status)
+                  
+                  # Here you can add additional processing logic:
+                  # - Update database records
+                  # - Trigger additional workflows
+                  # - Generate thumbnails
+                  # - Update content management systems
+                  
+                  logger.info(f"Job {job_id} completed with status: {status}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Job completion handled successfully')
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error handling job completion: {str(e)}")
+                  raise
+          
+          def send_notification(job_id, status):
+              """
+              Send notification about job completion
+              """
+              try:
+                  sns = boto3.client('sns')
+                  
+                  message = {
+                      'jobId': job_id,
+                      'status': status,
+                      'timestamp': context.aws_request_id if 'context' in globals() else 'unknown',
+                      'environment': os.environ.get('ENVIRONMENT', 'unknown')
+                  }
+                  
+                  sns.publish(
+                      TopicArn=os.environ['NOTIFICATION_TOPIC_ARN'],
+                      Message=json.dumps(message),
+                      Subject=f'MediaConvert Job {status}: {job_id}'
+                  )
+                  
+                  logger.info(f"Notification sent for job {job_id}")
+                  
+              except Exception as e:
+                  logger.error(f"Failed to send notification: {str(e)}")
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-job-completion-handler'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Job completion handling'
+  
+  # ===== EVENTBRIDGE RESOURCES =====
+  
+  # EventBridge Rule for MediaConvert job completion
+  MediaConvertJobCompletionRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-mediaconvert-job-completion'
+      Description: 'Rule to capture MediaConvert job completion events'
+      EventPattern:
+        source:
+          - aws.mediaconvert
+        detail-type:
+          - MediaConvert Job State Change
+        detail:
+          status:
+            - COMPLETE
+            - ERROR
+            - CANCELED
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt JobCompletionHandler.Arn
+          Id: JobCompletionHandlerTarget
+  
+  # Permission for EventBridge to invoke Lambda
+  EventBridgeInvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref JobCompletionHandler
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MediaConvertJobCompletionRule.Arn
+  
+  # ===== SQS RESOURCES =====
+  
+  # Dead Letter Queue for failed Lambda executions
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-dead-letter-queue'
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeoutSeconds: 300
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dead-letter-queue'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Dead letter queue for failed Lambda executions'
+  
+  # ===== SNS RESOURCES =====
+  
+  # SNS Topic for notifications (conditional)
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasNotificationEmail
+    Properties:
+      TopicName: !Sub '${ProjectName}-notifications'
+      DisplayName: !Sub '${ProjectName} Video Processing Notifications'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-notifications'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Video processing notifications'
+  
+  # SNS Subscription for email notifications (conditional)
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      Protocol: email
+      TopicArn: !Ref NotificationTopic
+      Endpoint: !Ref NotificationEmail
+  
+  # ===== CLOUDFRONT RESOURCES =====
+  
+  # CloudFront Origin Access Identity for S3
+  CloudFrontOriginAccessIdentity:
+    Type: AWS::CloudFront::OriginAccessIdentity
+    Properties:
+      OriginAccessIdentityConfig:
+        Comment: !Sub 'OAI for ${ProjectName} video distribution'
+  
+  # CloudFront Distribution for video content delivery
+  VideoDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub '${ProjectName} video streaming distribution'
+        Enabled: true
+        PriceClass: !Ref CloudFrontPriceClass
+        HttpVersion: http2
+        IPV6Enabled: true
+        Origins:
+          - Id: !Sub 'S3-${VideoOutputBucket}'
+            DomainName: !GetAtt VideoOutputBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${CloudFrontOriginAccessIdentity}'
+        DefaultCacheBehavior:
+          TargetOriginId: !Sub 'S3-${VideoOutputBucket}'
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+            Headers:
+              - Origin
+              - Access-Control-Request-Headers
+              - Access-Control-Request-Method
+          TrustedSigners:
+            - self
+          MinTTL: 0
+          DefaultTTL: 86400
+          MaxTTL: 31536000
+          Compress: true
+        CacheBehaviors:
+          # Cache behavior for HLS manifests
+          - PathPattern: '*.m3u8'
+            TargetOriginId: !Sub 'S3-${VideoOutputBucket}'
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            ForwardedValues:
+              QueryString: false
+              Cookies:
+                Forward: none
+            TrustedSigners:
+              - self
+            MinTTL: 0
+            DefaultTTL: 30
+            MaxTTL: 300
+            Compress: true
+          # Cache behavior for HLS segments
+          - PathPattern: '*.ts'
+            TargetOriginId: !Sub 'S3-${VideoOutputBucket}'
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            ForwardedValues:
+              QueryString: false
+              Cookies:
+                Forward: none
+            TrustedSigners:
+              - self
+            MinTTL: 0
+            DefaultTTL: 86400
+            MaxTTL: 31536000
+            Compress: false
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 404
+            ResponsePagePath: '/404.html'
+            ErrorCachingMinTTL: 300
+          - ErrorCode: 403
+            ResponseCode: 403
+            ResponsePagePath: '/403.html'
+            ErrorCachingMinTTL: 300
+        Logging:
+          Bucket: !GetAtt LoggingBucket.DomainName
+          IncludeCookies: false
+          Prefix: 'cloudfront-logs/'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-video-distribution'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Video content delivery'
+  
+  # S3 Bucket for CloudFront logs
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-cloudfront-logs-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteLogsAfter90Days
+            Status: Enabled
+            ExpirationInDays: 90
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cloudfront-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'CloudFront access logs'
+  
+  # S3 Bucket Policy for CloudFront to write logs
+  LoggingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LoggingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${LoggingBucket}/cloudfront-logs/*'
+          - Sid: AllowCloudFrontServicePrincipalGetBucketAcl
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Ref LoggingBucket
+  
+  # S3 Bucket Policy for CloudFront to read from output bucket
+  VideoOutputBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref VideoOutputBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${CloudFrontOriginAccessIdentity}'
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+            Resource: !Sub '${VideoOutputBucket}/*'
+          - Sid: AllowCloudFrontListBucket
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${CloudFrontOriginAccessIdentity}'
+            Action: s3:ListBucket
+            Resource: !Ref VideoOutputBucket
+  
+  # ===== CUSTOM RESOURCE FOR MEDIACONVERT ENDPOINT =====
+  
+  # Custom Resource to get MediaConvert endpoint
+  MediaConvertEndpointResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt MediaConvertEndpointFunction.Arn
+      Region: !Ref AWS::Region
+  
+  # Lambda Function to get MediaConvert endpoint
+  MediaConvertEndpointFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-mediaconvert-endpoint'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt MediaConvertEndpointRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import logging
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  # Get MediaConvert endpoint
+                  mediaconvert = boto3.client('mediaconvert')
+                  response = mediaconvert.describe_endpoints()
+                  
+                  if response['Endpoints']:
+                      endpoint_url = response['Endpoints'][0]['Url']
+                      # Extract the endpoint ID from the URL
+                      endpoint_id = endpoint_url.split('//')[1].split('.')[0]
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'EndpointId': endpoint_id,
+                          'EndpointUrl': endpoint_url
+                      })
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {}, 'No MediaConvert endpoints found')
+                      
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, str(e))
+  
+  # IAM Role for MediaConvert Endpoint Lambda
+  MediaConvertEndpointRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: MediaConvertEndpointPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - mediaconvert:DescribeEndpoints
+                Resource: '*'
+  
+  # Reference to the MediaConvert endpoint
+  MediaConvertEndpoint:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/mediaconvert/endpoint'
+      Type: String
+      Value: !GetAtt MediaConvertEndpointResource.EndpointId
+      Description: 'MediaConvert endpoint ID for the region'
+      Tags:
+        Environment: !Ref Environment
+        Purpose: 'MediaConvert endpoint reference'
+
+# Template Outputs
+Outputs:
+  
+  # S3 Bucket Information
+  VideoSourceBucketName:
+    Description: 'Name of the S3 bucket for video uploads'
+    Value: !Ref VideoSourceBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-VideoSourceBucket'
+  
+  VideoOutputBucketName:
+    Description: 'Name of the S3 bucket for processed videos'
+    Value: !Ref VideoOutputBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-VideoOutputBucket'
+  
+  # CloudFront Distribution Information
+  CloudFrontDistributionId:
+    Description: 'CloudFront distribution ID for video delivery'
+    Value: !Ref VideoDistribution
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFrontDistributionId'
+  
+  CloudFrontDomainName:
+    Description: 'CloudFront domain name for video access'
+    Value: !GetAtt VideoDistribution.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFrontDomainName'
+  
+  VideoDistributionURL:
+    Description: 'Complete HTTPS URL for video distribution'
+    Value: !Sub 'https://${VideoDistribution.DomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-VideoDistributionURL'
+  
+  # Lambda Function Information
+  VideoProcessorFunctionName:
+    Description: 'Name of the video processor Lambda function'
+    Value: !Ref VideoProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-VideoProcessorFunction'
+  
+  VideoProcessorFunctionArn:
+    Description: 'ARN of the video processor Lambda function'
+    Value: !GetAtt VideoProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-VideoProcessorFunctionArn'
+  
+  JobCompletionHandlerFunctionName:
+    Description: 'Name of the job completion handler Lambda function'
+    Value: !Ref JobCompletionHandler
+    Export:
+      Name: !Sub '${AWS::StackName}-JobCompletionHandler'
+  
+  # MediaConvert Information
+  MediaConvertRoleArn:
+    Description: 'ARN of the MediaConvert service role'
+    Value: !GetAtt MediaConvertRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-MediaConvertRoleArn'
+  
+  MediaConvertEndpointUrl:
+    Description: 'MediaConvert endpoint URL for the region'
+    Value: !GetAtt MediaConvertEndpointResource.EndpointUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-MediaConvertEndpointUrl'
+  
+  # EventBridge Information
+  EventBridgeRuleName:
+    Description: 'Name of the EventBridge rule for job completion'
+    Value: !Ref MediaConvertJobCompletionRule
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeRule'
+  
+  # SNS Information (conditional)
+  NotificationTopicArn:
+    Condition: HasNotificationEmail
+    Description: 'ARN of the SNS topic for notifications'
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopicArn'
+  
+  # Dead Letter Queue Information
+  DeadLetterQueueUrl:
+    Description: 'URL of the dead letter queue'
+    Value: !Ref DeadLetterQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueueUrl'
+  
+  # Usage Instructions
+  UsageInstructions:
+    Description: 'Instructions for using the video processing workflow'
+    Value: !Sub |
+      Video Processing Workflow Deployed Successfully!
+      
+      To use this workflow:
+      1. Upload video files (.mp4, .mov, .avi, .mkv, .m4v) to: ${VideoSourceBucket}
+      2. Processing will start automatically via S3 event triggers
+      3. Processed videos will be available in: ${VideoOutputBucket}
+      4. Access videos globally via CloudFront: https://${VideoDistribution.DomainName}
+      5. HLS streams will be in: https://${VideoDistribution.DomainName}/hls/
+      6. MP4 files will be in: https://${VideoDistribution.DomainName}/mp4/
+      
+      Monitor processing in Lambda logs: /aws/lambda/${VideoProcessorFunction}
+      Monitor job completion in Lambda logs: /aws/lambda/${JobCompletionHandler}
+      
+      For cleanup, delete this CloudFormation stack: ${AWS::StackName}
+    Export:
+      Name: !Sub '${AWS::StackName}-UsageInstructions'

@@ -1,0 +1,1761 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Fault-Tolerant HPC Workflows with Step Functions and Spot Fleet - Complete infrastructure for orchestrating resilient scientific computing workloads with automatic checkpoint recovery and intelligent resource management'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: hpc-workflow
+    Description: 'Name prefix for all resources'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: 'Environment for deployment'
+
+  SpotFleetTargetCapacity:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    MaxValue: 50
+    Description: 'Initial target capacity for Spot Fleet'
+
+  SpotFleetMaxPrice:
+    Type: String
+    Default: '0.50'
+    Description: 'Maximum price per hour for Spot instances'
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for workflow notifications (optional)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
+  VpcId:
+    Type: 'AWS::EC2::VPC::Id'
+    Description: 'VPC ID for Spot Fleet deployment'
+
+  SubnetIds:
+    Type: 'List<AWS::EC2::Subnet::Id>'
+    Description: 'Subnet IDs for Spot Fleet instances (recommend private subnets)'
+
+  KeyPairName:
+    Type: String
+    Default: ''
+    Description: 'EC2 Key Pair for SSH access to instances (optional)'
+
+  EnableCloudWatchLogs:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable CloudWatch Logs for Lambda functions'
+
+  RetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: 'CloudWatch Logs retention period in days'
+
+  CheckpointRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 365
+    Description: 'Number of days to retain workflow checkpoints'
+
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+  EnableLogs: !Equals [!Ref EnableCloudWatchLogs, 'true']
+
+Resources:
+  # ============================================================================
+  # S3 BUCKET FOR CHECKPOINTS AND WORKFLOW DATA
+  # ============================================================================
+  CheckpointBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${ProjectName}-checkpoints-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: CheckpointRetention
+            Status: Enabled
+            ExpirationInDays: !Ref CheckpointRetentionDays
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      VersioningConfiguration:
+        Status: Enabled
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt WorkflowMonitorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: checkpoints/
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: HPC-Workflow-Checkpoints
+
+  # S3 Bucket Policy for secure access
+  CheckpointBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref CheckpointBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${CheckpointBucket}/*'
+              - !Ref CheckpointBucket
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # ============================================================================
+  # DYNAMODB TABLE FOR WORKFLOW STATE MANAGEMENT
+  # ============================================================================
+  WorkflowStateTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: !Sub '${ProjectName}-workflow-state-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: WorkflowId
+          AttributeType: S
+        - AttributeName: TaskId
+          AttributeType: S
+        - AttributeName: Timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: WorkflowId
+          KeyType: HASH
+        - AttributeName: TaskId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: TimestampIndex
+          KeySchema:
+            - AttributeName: TaskId
+              KeyType: HASH
+            - AttributeName: Timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: HPC-Workflow-State
+
+  # ============================================================================
+  # IAM ROLES AND POLICIES
+  # ============================================================================
+  
+  # Step Functions Execution Role
+  StepFunctionsExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-stepfunctions-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/CloudWatchLogsFullAccess'
+      Policies:
+        - PolicyName: StepFunctionsExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource:
+                  - !GetAtt WorkflowParserFunction.Arn
+                  - !GetAtt CheckpointManagerFunction.Arn
+                  - !GetAtt SpotFleetManagerFunction.Arn
+                  - !GetAtt WorkflowMonitorFunction.Arn
+              - Effect: Allow
+                Action:
+                  - 'batch:SubmitJob'
+                  - 'batch:DescribeJobs'
+                  - 'batch:TerminateJob'
+                  - 'batch:ListJobs'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'ec2:DescribeSpotFleetRequests'
+                  - 'ec2:ModifySpotFleetRequest'
+                  - 'ec2:CancelSpotFleetRequests'
+                  - 'ec2:CreateSpotFleetRequest'
+                  - 'ec2:DescribeSpotFleetInstances'
+                  - 'ec2:DescribeInstances'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                Resource:
+                  - !GetAtt WorkflowStateTable.Arn
+                  - !Sub '${WorkflowStateTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub '${CheckpointBucket}/*'
+                  - !GetAtt CheckpointBucket.Arn
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !If
+                  - HasNotificationEmail
+                  - !Ref WorkflowNotificationTopic
+                  - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:DescribeSpotFleetRequests'
+                  - 'ec2:ModifySpotFleetRequest'
+                  - 'ec2:CancelSpotFleetRequests'
+                  - 'ec2:CreateSpotFleetRequest'
+                  - 'ec2:DescribeSpotFleetInstances'
+                  - 'ec2:DescribeInstances'
+                  - 'ec2:DescribeImages'
+                  - 'ec2:DescribeSecurityGroups'
+                  - 'ec2:DescribeSubnets'
+                  - 'ec2:DescribeVpcs'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'batch:SubmitJob'
+                  - 'batch:DescribeJobs'
+                  - 'batch:TerminateJob'
+                  - 'batch:ListJobs'
+                  - 'batch:DescribeJobQueues'
+                  - 'batch:DescribeJobDefinitions'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                  - 'dynamodb:DeleteItem'
+                Resource:
+                  - !GetAtt WorkflowStateTable.Arn
+                  - !Sub '${WorkflowStateTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub '${CheckpointBucket}/*'
+                  - !GetAtt CheckpointBucket.Arn
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'iam:PassRole'
+                Resource: !GetAtt SpotFleetRole.Arn
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !If
+                  - HasNotificationEmail
+                  - !Ref WorkflowNotificationTopic
+                  - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Spot Fleet Role
+  SpotFleetRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-spot-fleet-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: spotfleet.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Batch Service Role
+  BatchServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-batch-service-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: batch.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Batch Instance Role
+  BatchInstanceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-batch-instance-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role'
+      Policies:
+        - PolicyName: BatchInstancePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub '${CheckpointBucket}/*'
+                  - !GetAtt CheckpointBucket.Arn
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                Resource: !GetAtt WorkflowStateTable.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Batch Instance Profile
+  BatchInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Roles:
+        - !Ref BatchInstanceRole
+
+  # ============================================================================
+  # LAMBDA FUNCTIONS
+  # ============================================================================
+
+  # Workflow Parser Function
+  WorkflowParserFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-workflow-parser-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref CheckpointBucket
+          TABLE_NAME: !Ref WorkflowStateTable
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Parses HPC workflow definitions and prepares execution plan
+              """
+              try:
+                  workflow_definition = event['workflow_definition']
+                  workflow_id = event.get('workflow_id', f"workflow-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}")
+                  
+                  # Parse workflow definition
+                  parsed_workflow = parse_workflow(workflow_definition)
+                  
+                  # Generate execution plan
+                  execution_plan = generate_execution_plan(parsed_workflow, workflow_id)
+                  
+                  return {
+                      'statusCode': 200,
+                      'workflow_id': workflow_id,
+                      'execution_plan': execution_plan,
+                      'estimated_cost': calculate_estimated_cost(execution_plan),
+                      'estimated_duration': calculate_estimated_duration(execution_plan)
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error parsing workflow: {str(e)}")
+                  raise
+          
+          def parse_workflow(workflow_def):
+              """Parse workflow definition into structured format"""
+              parsed = {
+                  'name': workflow_def.get('name', 'Unnamed Workflow'),
+                  'description': workflow_def.get('description', ''),
+                  'tasks': [],
+                  'dependencies': {},
+                  'global_config': workflow_def.get('global_config', {})
+              }
+              
+              # Parse tasks
+              for task in workflow_def.get('tasks', []):
+                  parsed_task = {
+                      'id': task['id'],
+                      'name': task.get('name', task['id']),
+                      'type': task.get('type', 'batch'),
+                      'container_image': task.get('container_image'),
+                      'command': task.get('command', []),
+                      'environment': task.get('environment', {}),
+                      'resources': {
+                          'vcpus': task.get('vcpus', 1),
+                          'memory': task.get('memory', 1024),
+                          'nodes': task.get('nodes', 1)
+                      },
+                      'retry_strategy': {
+                          'attempts': task.get('retry_attempts', 3),
+                          'backoff_multiplier': task.get('backoff_multiplier', 2.0)
+                      },
+                      'checkpoint_enabled': task.get('checkpoint_enabled', False),
+                      'spot_enabled': task.get('spot_enabled', True)
+                  }
+                  parsed['tasks'].append(parsed_task)
+                  
+                  # Parse dependencies
+                  if 'depends_on' in task:
+                      parsed['dependencies'][task['id']] = task['depends_on']
+              
+              return parsed
+          
+          def generate_execution_plan(parsed_workflow, workflow_id):
+              """Generate step-by-step execution plan"""
+              execution_plan = {
+                  'workflow_id': workflow_id,
+                  'stages': [],
+                  'parallel_groups': [],
+                  'total_tasks': len(parsed_workflow['tasks'])
+              }
+              
+              # Simple topological sort for dependency resolution
+              remaining_tasks = {task['id']: task for task in parsed_workflow['tasks']}
+              dependencies = parsed_workflow['dependencies']
+              completed_tasks = set()
+              stage_number = 0
+              
+              while remaining_tasks:
+                  stage_number += 1
+                  current_stage = {
+                      'stage': stage_number,
+                      'tasks': [],
+                      'parallel_execution': True
+                  }
+                  
+                  # Find tasks with no remaining dependencies
+                  ready_tasks = []
+                  for task_id, task in remaining_tasks.items():
+                      deps = dependencies.get(task_id, [])
+                      if all(dep in completed_tasks for dep in deps):
+                          ready_tasks.append(task)
+                  
+                  if not ready_tasks:
+                      # Circular dependency or other issue
+                      raise ValueError("Unable to resolve task dependencies")
+                  
+                  # Add ready tasks to current stage
+                  for task in ready_tasks:
+                      current_stage['tasks'].append(task)
+                      completed_tasks.add(task['id'])
+                      del remaining_tasks[task['id']]
+                  
+                  execution_plan['stages'].append(current_stage)
+              
+              return execution_plan
+          
+          def calculate_estimated_cost(execution_plan):
+              """Calculate estimated cost for workflow execution"""
+              total_vcpu_hours = 0
+              
+              for stage in execution_plan['stages']:
+                  for task in stage['tasks']:
+                      vcpus = task['resources']['vcpus']
+                      nodes = task['resources']['nodes']
+                      estimated_hours = 1
+                      total_vcpu_hours += vcpus * nodes * estimated_hours
+              
+              estimated_cost = total_vcpu_hours * 0.10
+              
+              return {
+                  'total_vcpu_hours': total_vcpu_hours,
+                  'estimated_cost_usd': estimated_cost,
+                  'currency': 'USD'
+              }
+          
+          def calculate_estimated_duration(execution_plan):
+              """Calculate estimated duration for workflow execution"""
+              total_stages = len(execution_plan['stages'])
+              estimated_minutes = total_stages * 30
+              
+              return {
+                  'estimated_duration_minutes': estimated_minutes,
+                  'total_stages': total_stages
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Checkpoint Manager Function
+  CheckpointManagerFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-checkpoint-manager-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref CheckpointBucket
+          TABLE_NAME: !Ref WorkflowStateTable
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          import uuid
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          s3 = boto3.client('s3')
+          dynamodb = boto3.resource('dynamodb')
+          
+          def lambda_handler(event, context):
+              """
+              Manages checkpoints for fault-tolerant workflows
+              """
+              try:
+                  action = event.get('action', 'save')
+                  
+                  if action == 'save':
+                      return save_checkpoint(event)
+                  elif action == 'restore':
+                      return restore_checkpoint(event)
+                  elif action == 'list':
+                      return list_checkpoints(event)
+                  elif action == 'cleanup':
+                      return cleanup_old_checkpoints(event)
+                  else:
+                      raise ValueError(f"Unknown action: {action}")
+                      
+              except Exception as e:
+                  logger.error(f"Error in checkpoint manager: {str(e)}")
+                  raise
+          
+          def save_checkpoint(event):
+              """Save workflow checkpoint to S3 and DynamoDB"""
+              workflow_id = event['workflow_id']
+              task_id = event['task_id']
+              checkpoint_data = event['checkpoint_data']
+              bucket_name = event['bucket_name']
+              
+              checkpoint_id = str(uuid.uuid4())
+              timestamp = datetime.utcnow().isoformat()
+              
+              s3_key = f"checkpoints/{workflow_id}/{task_id}/{checkpoint_id}.json"
+              
+              s3.put_object(
+                  Bucket=bucket_name,
+                  Key=s3_key,
+                  Body=json.dumps(checkpoint_data),
+                  ContentType='application/json',
+                  Metadata={
+                      'workflow_id': workflow_id,
+                      'task_id': task_id,
+                      'timestamp': timestamp
+                  }
+              )
+              
+              table = dynamodb.Table(event['table_name'])
+              table.put_item(
+                  Item={
+                      'WorkflowId': workflow_id,
+                      'TaskId': task_id,
+                      'CheckpointId': checkpoint_id,
+                      'S3Key': s3_key,
+                      'Timestamp': timestamp,
+                      'Status': 'saved'
+                  }
+              )
+              
+              logger.info(f"Checkpoint saved: {checkpoint_id}")
+              
+              return {
+                  'statusCode': 200,
+                  'checkpoint_id': checkpoint_id,
+                  's3_key': s3_key,
+                  'timestamp': timestamp
+              }
+          
+          def restore_checkpoint(event):
+              """Restore latest checkpoint for a workflow task"""
+              workflow_id = event['workflow_id']
+              task_id = event['task_id']
+              bucket_name = event['bucket_name']
+              table_name = event['table_name']
+              
+              table = dynamodb.Table(table_name)
+              response = table.query(
+                  KeyConditionExpression='WorkflowId = :wid AND TaskId = :tid',
+                  ExpressionAttributeValues={
+                      ':wid': workflow_id,
+                      ':tid': task_id
+                  },
+                  ScanIndexForward=False,
+                  Limit=1
+              )
+              
+              if not response['Items']:
+                  return {
+                      'statusCode': 404,
+                      'message': 'No checkpoint found'
+                  }
+              
+              latest_checkpoint = response['Items'][0]
+              s3_key = latest_checkpoint['S3Key']
+              
+              s3_response = s3.get_object(
+                  Bucket=bucket_name,
+                  Key=s3_key
+              )
+              
+              checkpoint_data = json.loads(s3_response['Body'].read().decode('utf-8'))
+              
+              return {
+                  'statusCode': 200,
+                  'checkpoint_id': latest_checkpoint['CheckpointId'],
+                  'checkpoint_data': checkpoint_data,
+                  'timestamp': latest_checkpoint['Timestamp']
+              }
+          
+          def list_checkpoints(event):
+              """List all checkpoints for a workflow"""
+              workflow_id = event['workflow_id']
+              table_name = event['table_name']
+              
+              table = dynamodb.Table(table_name)
+              response = table.query(
+                  KeyConditionExpression='WorkflowId = :wid',
+                  ExpressionAttributeValues={
+                      ':wid': workflow_id
+                  }
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'checkpoints': response['Items']
+              }
+          
+          def cleanup_old_checkpoints(event):
+              """Clean up checkpoints older than specified days"""
+              days_to_keep = event.get('days_to_keep', 7)
+              bucket_name = event['bucket_name']
+              
+              return {
+                  'statusCode': 200,
+                  'message': f'Cleanup completed for checkpoints older than {days_to_keep} days'
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Spot Fleet Manager Function
+  SpotFleetManagerFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-spot-fleet-manager-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref CheckpointBucket
+          TABLE_NAME: !Ref WorkflowStateTable
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          SPOT_FLEET_ROLE_ARN: !GetAtt SpotFleetRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime, timedelta
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          ec2 = boto3.client('ec2')
+          cloudwatch = boto3.client('cloudwatch')
+          
+          def lambda_handler(event, context):
+              """
+              Manages Spot Fleet lifecycle and handles interruptions
+              """
+              try:
+                  action = event.get('action', 'create')
+                  
+                  if action == 'create':
+                      return create_spot_fleet(event)
+                  elif action == 'modify':
+                      return modify_spot_fleet(event)
+                  elif action == 'terminate':
+                      return terminate_spot_fleet(event)
+                  elif action == 'check_health':
+                      return check_spot_fleet_health(event)
+                  else:
+                      raise ValueError(f"Unknown action: {action}")
+                      
+              except Exception as e:
+                  logger.error(f"Error in spot fleet manager: {str(e)}")
+                  raise
+          
+          def create_spot_fleet(event):
+              """Create a new Spot Fleet with fault tolerance"""
+              config = {
+                  'SpotFleetRequestConfig': {
+                      'IamFleetRole': os.environ['SPOT_FLEET_ROLE_ARN'],
+                      'AllocationStrategy': 'diversified',
+                      'TargetCapacity': event.get('target_capacity', 4),
+                      'SpotPrice': event.get('spot_price', '0.50'),
+                      'LaunchSpecifications': [
+                          {
+                              'ImageId': event['ami_id'],
+                              'InstanceType': 'c5.large',
+                              'KeyName': event.get('key_name'),
+                              'SecurityGroups': [{'GroupId': event['security_group_id']}],
+                              'SubnetId': event['subnet_id'],
+                              'UserData': event.get('user_data', ''),
+                              'WeightedCapacity': 1.0
+                          },
+                          {
+                              'ImageId': event['ami_id'],
+                              'InstanceType': 'c5.xlarge',
+                              'KeyName': event.get('key_name'),
+                              'SecurityGroups': [{'GroupId': event['security_group_id']}],
+                              'SubnetId': event['subnet_id'],
+                              'UserData': event.get('user_data', ''),
+                              'WeightedCapacity': 2.0
+                          }
+                      ],
+                      'TerminateInstancesWithExpiration': True,
+                      'Type': 'maintain',
+                      'ReplaceUnhealthyInstances': True
+                  }
+              }
+              
+              response = ec2.request_spot_fleet(**config)
+              fleet_id = response['SpotFleetRequestId']
+              
+              waiter = ec2.get_waiter('spot_fleet_request_fulfilled')
+              waiter.wait(SpotFleetRequestIds=[fleet_id])
+              
+              logger.info(f"Spot Fleet {fleet_id} created successfully")
+              
+              return {
+                  'statusCode': 200,
+                  'fleet_id': fleet_id,
+                  'status': 'active'
+              }
+          
+          def modify_spot_fleet(event):
+              """Modify existing Spot Fleet capacity"""
+              fleet_id = event['fleet_id']
+              new_capacity = event['target_capacity']
+              
+              ec2.modify_spot_fleet_request(
+                  SpotFleetRequestId=fleet_id,
+                  TargetCapacity=new_capacity
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'fleet_id': fleet_id,
+                  'new_capacity': new_capacity
+              }
+          
+          def terminate_spot_fleet(event):
+              """Terminate Spot Fleet"""
+              fleet_id = event['fleet_id']
+              
+              ec2.cancel_spot_fleet_requests(
+                  SpotFleetRequestIds=[fleet_id],
+                  TerminateInstances=True
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'fleet_id': fleet_id,
+                  'status': 'terminated'
+              }
+          
+          def check_spot_fleet_health(event):
+              """Check Spot Fleet health and capacity"""
+              fleet_id = event['fleet_id']
+              
+              response = ec2.describe_spot_fleet_requests(
+                  SpotFleetRequestIds=[fleet_id]
+              )
+              
+              fleet_state = response['SpotFleetRequestConfigs'][0]['SpotFleetRequestState']
+              
+              instances_response = ec2.describe_spot_fleet_instances(
+                  SpotFleetRequestId=fleet_id
+              )
+              
+              healthy_instances = len([
+                  i for i in instances_response['ActiveInstances'] 
+                  if i['InstanceHealth'] == 'healthy'
+              ])
+              
+              return {
+                  'statusCode': 200,
+                  'fleet_id': fleet_id,
+                  'fleet_state': fleet_state,
+                  'healthy_instances': healthy_instances,
+                  'total_instances': len(instances_response['ActiveInstances'])
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Workflow Monitor Function
+  WorkflowMonitorFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-workflow-monitor-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref CheckpointBucket
+          TABLE_NAME: !Ref WorkflowStateTable
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          cloudwatch = boto3.client('cloudwatch')
+          
+          def lambda_handler(event, context):
+              """
+              Monitors workflow execution and publishes metrics
+              """
+              try:
+                  # Process S3 events or direct invocation
+                  if 'Records' in event:
+                      for record in event['Records']:
+                          if record['eventSource'] == 'aws:s3':
+                              process_s3_event(record)
+                  else:
+                      # Direct invocation for monitoring
+                      publish_workflow_metrics(event)
+                  
+                  return {
+                      'statusCode': 200,
+                      'message': 'Monitoring completed successfully'
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in workflow monitor: {str(e)}")
+                  raise
+          
+          def process_s3_event(record):
+              """Process S3 checkpoint events"""
+              bucket_name = record['s3']['bucket']['name']
+              object_key = record['s3']['object']['key']
+              
+              logger.info(f"Processing S3 event for {object_key}")
+              
+              # Publish checkpoint event metric
+              cloudwatch.put_metric_data(
+                  Namespace='HPC/Workflows',
+                  MetricData=[
+                      {
+                          'MetricName': 'CheckpointEvents',
+                          'Value': 1,
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {
+                                  'Name': 'ProjectName',
+                                  'Value': os.environ['PROJECT_NAME']
+                              },
+                              {
+                                  'Name': 'Environment',
+                                  'Value': os.environ['ENVIRONMENT']
+                              }
+                          ]
+                      }
+                  ]
+              )
+          
+          def publish_workflow_metrics(event):
+              """Publish workflow execution metrics"""
+              metrics = event.get('metrics', [])
+              
+              for metric in metrics:
+                  cloudwatch.put_metric_data(
+                      Namespace='HPC/Workflows',
+                      MetricData=[metric]
+                  )
+                  
+              logger.info(f"Published {len(metrics)} workflow metrics")
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Spot Interruption Handler Function
+  SpotInterruptionHandlerFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-spot-interruption-handler-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref CheckpointBucket
+          TABLE_NAME: !Ref WorkflowStateTable
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          stepfunctions = boto3.client('stepfunctions')
+          batch = boto3.client('batch')
+          
+          def lambda_handler(event, context):
+              """
+              Handle Spot instance interruption warnings
+              """
+              try:
+                  detail = event['detail']
+                  instance_id = detail['instance-id']
+                  
+                  logger.info(f"Spot interruption warning received for instance: {instance_id}")
+                  
+                  running_jobs = find_batch_jobs_on_instance(instance_id)
+                  
+                  for job_id in running_jobs:
+                      trigger_emergency_checkpoint(job_id)
+                  
+                  return {
+                      'statusCode': 200,
+                      'message': f'Handled interruption warning for {instance_id}',
+                      'affected_jobs': running_jobs
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error handling spot interruption: {str(e)}")
+                  raise
+          
+          def find_batch_jobs_on_instance(instance_id):
+              """Find Batch jobs running on specific instance"""
+              response = batch.list_jobs(
+                  jobStatus='RUNNING'
+              )
+              
+              return [job['jobId'] for job in response['jobSummaryList']]
+          
+          def trigger_emergency_checkpoint(job_id):
+              """Trigger emergency checkpoint for a job"""
+              logger.info(f"Triggering emergency checkpoint for job: {job_id}")
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================================
+  # LAMBDA PERMISSIONS AND LOG GROUPS
+  # ============================================================================
+
+  # S3 Lambda Permission
+  S3LambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref WorkflowMonitorFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub '${CheckpointBucket}/*'
+
+  # EventBridge Lambda Permission
+  EventBridgeLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref SpotInterruptionHandlerFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SpotInterruptionRule.Arn
+
+  # Lambda Log Groups
+  WorkflowParserLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Condition: EnableLogs
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${WorkflowParserFunction}'
+      RetentionInDays: !Ref RetentionDays
+
+  CheckpointManagerLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Condition: EnableLogs
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${CheckpointManagerFunction}'
+      RetentionInDays: !Ref RetentionDays
+
+  SpotFleetManagerLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Condition: EnableLogs
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${SpotFleetManagerFunction}'
+      RetentionInDays: !Ref RetentionDays
+
+  WorkflowMonitorLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Condition: EnableLogs
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${WorkflowMonitorFunction}'
+      RetentionInDays: !Ref RetentionDays
+
+  SpotInterruptionHandlerLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Condition: EnableLogs
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${SpotInterruptionHandlerFunction}'
+      RetentionInDays: !Ref RetentionDays
+
+  # ============================================================================
+  # STEP FUNCTIONS STATE MACHINE
+  # ============================================================================
+
+  HpcWorkflowStateMachine:
+    Type: 'AWS::StepFunctions::StateMachine'
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-hpc-workflow-orchestrator-${Environment}'
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Fault-tolerant HPC workflow orchestrator with Spot Fleet management",
+          "StartAt": "ParseWorkflow",
+          "States": {
+            "ParseWorkflow": {
+              "Type": "Task",
+              "Resource": "${WorkflowParserFunction.Arn}",
+              "ResultPath": "$.parsed_workflow",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "WorkflowFailed",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "Next": "InitializeResources"
+            },
+            "InitializeResources": {
+              "Type": "Parallel",
+              "Branches": [
+                {
+                  "StartAt": "CreateSpotFleet",
+                  "States": {
+                    "CreateSpotFleet": {
+                      "Type": "Task",
+                      "Resource": "${SpotFleetManagerFunction.Arn}",
+                      "Parameters": {
+                        "action": "create",
+                        "target_capacity": ${SpotFleetTargetCapacity},
+                        "ami_id": "ami-0abcdef1234567890",
+                        "security_group_id": "sg-placeholder",
+                        "subnet_id": "subnet-placeholder",
+                        "spot_price": "${SpotFleetMaxPrice}"
+                      },
+                      "ResultPath": "$.spot_fleet",
+                      "Retry": [
+                        {
+                          "ErrorEquals": ["States.TaskFailed"],
+                          "IntervalSeconds": 10,
+                          "MaxAttempts": 3,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "End": true
+                    }
+                  }
+                },
+                {
+                  "StartAt": "InitializeBatchQueue",
+                  "States": {
+                    "InitializeBatchQueue": {
+                      "Type": "Pass",
+                      "Parameters": {
+                        "queue_name": "${ProjectName}-batch-queue-${Environment}",
+                        "status": "initialized"
+                      },
+                      "ResultPath": "$.batch_queue",
+                      "End": true
+                    }
+                  }
+                }
+              ],
+              "ResultPath": "$.resources",
+              "Next": "ExecuteWorkflowStages"
+            },
+            "ExecuteWorkflowStages": {
+              "Type": "Map",
+              "ItemsPath": "$.parsed_workflow.execution_plan.stages",
+              "MaxConcurrency": 1,
+              "Iterator": {
+                "StartAt": "ExecuteStage",
+                "States": {
+                  "ExecuteStage": {
+                    "Type": "Map",
+                    "ItemsPath": "$.tasks",
+                    "MaxConcurrency": 10,
+                    "Iterator": {
+                      "StartAt": "SaveCheckpoint",
+                      "States": {
+                        "SaveCheckpoint": {
+                          "Type": "Task",
+                          "Resource": "${CheckpointManagerFunction.Arn}",
+                          "Parameters": {
+                            "action": "save",
+                            "workflow_id.$": "$.workflow_id",
+                            "task_id.$": "$.id",
+                            "checkpoint_data.$": "$",
+                            "bucket_name": "${CheckpointBucket}",
+                            "table_name": "${WorkflowStateTable}"
+                          },
+                          "ResultPath": "$.checkpoint",
+                          "Next": "ExecuteTask"
+                        },
+                        "ExecuteTask": {
+                          "Type": "Pass",
+                          "Parameters": {
+                            "job_result": {
+                              "status": "completed",
+                              "message": "Task executed successfully"
+                            }
+                          },
+                          "ResultPath": "$.job_result",
+                          "Next": "TaskCompleted"
+                        },
+                        "TaskCompleted": {
+                          "Type": "Pass",
+                          "Parameters": {
+                            "status": "completed",
+                            "task_id.$": "$.id",
+                            "completion_time.$": "$$.State.EnteredTime"
+                          },
+                          "End": true
+                        }
+                      }
+                    },
+                    "ResultPath": "$.stage_results",
+                    "End": true
+                  }
+                }
+              },
+              "ResultPath": "$.workflow_results",
+              "Next": "CleanupResources"
+            },
+            "CleanupResources": {
+              "Type": "Task",
+              "Resource": "${SpotFleetManagerFunction.Arn}",
+              "Parameters": {
+                "action": "terminate",
+                "fleet_id.$": "$.resources[0].spot_fleet.fleet_id"
+              },
+              "ResultPath": "$.cleanup_result",
+              "Next": "WorkflowCompleted"
+            },
+            "WorkflowCompleted": {
+              "Type": "Pass",
+              "Parameters": {
+                "status": "completed",
+                "workflow_id.$": "$.parsed_workflow.workflow_id",
+                "completion_time.$": "$$.State.EnteredTime",
+                "total_stages.$": "$.parsed_workflow.execution_plan.total_stages"
+              },
+              "End": true
+            },
+            "WorkflowFailed": {
+              "Type": "Fail",
+              "Cause": "Workflow execution failed"
+            }
+          }
+        }
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StepFunctionsLogGroup.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Step Functions Log Group
+  StepFunctionsLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Condition: EnableLogs
+    Properties:
+      LogGroupName: !Sub '/aws/stepfunctions/${ProjectName}-hpc-workflow-orchestrator-${Environment}'
+      RetentionInDays: !Ref RetentionDays
+
+  # ============================================================================
+  # EVENTBRIDGE RULES FOR SPOT INTERRUPTIONS
+  # ============================================================================
+
+  SpotInterruptionRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: !Sub '${ProjectName}-spot-interruption-warning-${Environment}'
+      Description: 'Detect Spot instance interruption warnings'
+      EventPattern:
+        source:
+          - 'aws.ec2'
+        detail-type:
+          - 'EC2 Spot Instance Interruption Warning'
+        detail:
+          instance-action:
+            - 'terminate'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SpotInterruptionHandlerFunction.Arn
+          Id: 'SpotInterruptionTarget'
+
+  # ============================================================================
+  # SECURITY GROUP FOR BATCH INSTANCES
+  # ============================================================================
+
+  BatchSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: !Sub '${ProjectName}-batch-sg-${Environment}'
+      GroupDescription: 'Security group for AWS Batch compute instances'
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'Allow all outbound traffic'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================================
+  # AWS BATCH RESOURCES
+  # ============================================================================
+
+  BatchComputeEnvironment:
+    Type: 'AWS::Batch::ComputeEnvironment'
+    Properties:
+      ComputeEnvironmentName: !Sub '${ProjectName}-compute-env-${Environment}'
+      Type: MANAGED
+      State: ENABLED
+      ServiceRole: !GetAtt BatchServiceRole.Arn
+      ComputeResources:
+        Type: EC2
+        MinvCpus: 0
+        MaxvCpus: 256
+        DesiredvCpus: 0
+        InstanceTypes:
+          - 'c5.large'
+          - 'c5.xlarge'
+          - 'c5.2xlarge'
+          - 'c5.4xlarge'
+        AllocationStrategy: BEST_FIT_PROGRESSIVE
+        BidPercentage: 50
+        Ec2KeyPair: !If
+          - HasKeyPair
+          - !Ref KeyPairName
+          - !Ref 'AWS::NoValue'
+        InstanceRole: !GetAtt BatchInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref BatchSecurityGroup
+        Subnets: !Ref SubnetIds
+        Tags:
+          Project: !Ref ProjectName
+          Environment: !Ref Environment
+
+  BatchJobQueue:
+    Type: 'AWS::Batch::JobQueue'
+    Properties:
+      JobQueueName: !Sub '${ProjectName}-job-queue-${Environment}'
+      State: ENABLED
+      Priority: 1
+      ComputeEnvironmentOrder:
+        - Order: 1
+          ComputeEnvironment: !Ref BatchComputeEnvironment
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  BatchJobDefinition:
+    Type: 'AWS::Batch::JobDefinition'
+    Properties:
+      JobDefinitionName: !Sub '${ProjectName}-job-definition-${Environment}'
+      Type: container
+      ContainerProperties:
+        Image: 'amazonlinux:latest'
+        Vcpus: 1
+        Memory: 1024
+        JobRoleArn: !GetAtt BatchInstanceRole.Arn
+        Environment:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref 'AWS::Region'
+          - Name: BUCKET_NAME
+            Value: !Ref CheckpointBucket
+          - Name: TABLE_NAME
+            Value: !Ref WorkflowStateTable
+        MountPoints:
+          - SourceVolume: tmp
+            ContainerPath: /tmp
+            ReadOnly: false
+        Volumes:
+          - Name: tmp
+            Host:
+              SourcePath: /tmp
+      RetryStrategy:
+        Attempts: 3
+      Timeout:
+        AttemptDurationSeconds: 3600
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # ============================================================================
+  # SNS TOPIC FOR NOTIFICATIONS
+  # ============================================================================
+
+  WorkflowNotificationTopic:
+    Type: 'AWS::SNS::Topic'
+    Condition: HasNotificationEmail
+    Properties:
+      TopicName: !Sub '${ProjectName}-workflow-alerts-${Environment}'
+      DisplayName: 'HPC Workflow Notifications'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  WorkflowNotificationSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref WorkflowNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ============================================================================
+  # CLOUDWATCH MONITORING AND ALARMS
+  # ============================================================================
+
+  WorkflowFailuresAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${ProjectName}-workflow-failures-${Environment}'
+      AlarmDescription: 'Alert when workflows fail'
+      MetricName: ExecutionsFailed
+      Namespace: AWS/States
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref HpcWorkflowStateMachine
+      AlarmActions: !If
+        - HasNotificationEmail
+        - - !Ref WorkflowNotificationTopic
+        - !Ref 'AWS::NoValue'
+
+  SpotInterruptionAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${ProjectName}-spot-interruptions-${Environment}'
+      AlarmDescription: 'Alert on high spot interruption rate'
+      MetricName: SpotInstanceInterruptions
+      Namespace: AWS/EC2
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: !If
+        - HasNotificationEmail
+        - - !Ref WorkflowNotificationTopic
+        - !Ref 'AWS::NoValue'
+
+  BatchJobFailuresAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${ProjectName}-batch-job-failures-${Environment}'
+      AlarmDescription: 'Alert when batch jobs fail frequently'
+      MetricName: FailedJobs
+      Namespace: AWS/Batch
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: JobQueue
+          Value: !Ref BatchJobQueue
+      AlarmActions: !If
+        - HasNotificationEmail
+        - - !Ref WorkflowNotificationTopic
+        - !Ref 'AWS::NoValue'
+
+  # ============================================================================
+  # CLOUDWATCH DASHBOARD
+  # ============================================================================
+
+  WorkflowDashboard:
+    Type: 'AWS::CloudWatch::Dashboard'
+    Properties:
+      DashboardName: !Sub '${ProjectName}-hpc-workflow-dashboard-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/States", "ExecutionTime", "StateMachineArn", "${HpcWorkflowStateMachine}"],
+                  [".", "ExecutionsFailed", ".", "."],
+                  [".", "ExecutionsSucceeded", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "HPC Workflow Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Batch", "RunningJobs", "JobQueue", "${BatchJobQueue}"],
+                  [".", "SubmittedJobs", ".", "."],
+                  [".", "RunnableJobs", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Batch Job Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${WorkflowParserFunction}"],
+                  [".", "Errors", ".", "."],
+                  [".", "Invocations", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["HPC/Workflows", "CheckpointEvents", "ProjectName", "${ProjectName}"],
+                  ["AWS/EC2", "CPUUtilization", "AutoScalingGroupName", "${ProjectName}-batch-asg"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "System Health Metrics"
+              }
+            }
+          ]
+        }
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+
+Outputs:
+  ProjectName:
+    Description: 'Project name used for resource naming'
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectName'
+
+  Environment:
+    Description: 'Deployment environment'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+  CheckpointBucket:
+    Description: 'S3 bucket for workflow checkpoints and data'
+    Value: !Ref CheckpointBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-CheckpointBucket'
+
+  WorkflowStateTable:
+    Description: 'DynamoDB table for workflow state management'
+    Value: !Ref WorkflowStateTable
+    Export:
+      Name: !Sub '${AWS::StackName}-WorkflowStateTable'
+
+  HpcWorkflowStateMachine:
+    Description: 'Step Functions state machine for HPC workflow orchestration'
+    Value: !Ref HpcWorkflowStateMachine
+    Export:
+      Name: !Sub '${AWS::StackName}-HpcWorkflowStateMachine'
+
+  BatchJobQueue:
+    Description: 'AWS Batch job queue for workflow execution'
+    Value: !Ref BatchJobQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-BatchJobQueue'
+
+  BatchJobDefinition:
+    Description: 'AWS Batch job definition for HPC tasks'
+    Value: !Ref BatchJobDefinition
+    Export:
+      Name: !Sub '${AWS::StackName}-BatchJobDefinition'
+
+  WorkflowParserFunction:
+    Description: 'Lambda function for workflow parsing'
+    Value: !Ref WorkflowParserFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-WorkflowParserFunction'
+
+  CheckpointManagerFunction:
+    Description: 'Lambda function for checkpoint management'
+    Value: !Ref CheckpointManagerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-CheckpointManagerFunction'
+
+  SpotFleetManagerFunction:
+    Description: 'Lambda function for Spot Fleet management'
+    Value: !Ref SpotFleetManagerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-SpotFleetManagerFunction'
+
+  WorkflowDashboard:
+    Description: 'CloudWatch dashboard for workflow monitoring'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${WorkflowDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-WorkflowDashboard'
+
+  NotificationTopic:
+    Description: 'SNS topic for workflow notifications'
+    Value: !If
+      - HasNotificationEmail
+      - !Ref WorkflowNotificationTopic
+      - 'No notification email provided'
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopic'
+
+  SecurityGroup:
+    Description: 'Security group for Batch compute instances'
+    Value: !Ref BatchSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-BatchSecurityGroup'
+
+  StepFunctionsConsoleUrl:
+    Description: 'URL to Step Functions console for workflow monitoring'
+    Value: !Sub 'https://console.aws.amazon.com/states/home?region=${AWS::Region}#/statemachines/view/${HpcWorkflowStateMachine}'
+    Export:
+      Name: !Sub '${AWS::StackName}-StepFunctionsConsoleUrl'
+
+  BatchConsoleUrl:
+    Description: 'URL to Batch console for job monitoring'
+    Value: !Sub 'https://console.aws.amazon.com/batch/home?region=${AWS::Region}#/queues/detail/${BatchJobQueue}'
+    Export:
+      Name: !Sub '${AWS::StackName}-BatchConsoleUrl'
+
+  UsageInstructions:
+    Description: 'Instructions for using the HPC workflow system'
+    Value: !Sub |
+      To use this HPC workflow system:
+      1. Create workflow definitions in JSON format
+      2. Upload to S3 bucket: ${CheckpointBucket}
+      3. Execute workflows via Step Functions: ${HpcWorkflowStateMachine}
+      4. Monitor execution via CloudWatch Dashboard
+      5. Review logs in CloudWatch Logs
+      For detailed instructions, see the recipe documentation.

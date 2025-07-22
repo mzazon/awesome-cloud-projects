@@ -1,0 +1,851 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for ETL Pipelines with AWS Glue and Data Catalog Management'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "S3 Configuration"
+        Parameters:
+          - S3BucketPrefix
+          - EnableS3Versioning
+          - S3StorageClass
+      - Label:
+          default: "Glue Configuration"
+        Parameters:
+          - GlueVersion
+          - MaxRetries
+          - JobTimeout
+          - WorkerType
+          - NumberOfWorkers
+      - Label:
+          default: "Data Configuration"
+        Parameters:
+          - CreateSampleData
+          - DataFormat
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      S3BucketPrefix:
+        default: "S3 Bucket Prefix"
+      EnableS3Versioning:
+        default: "Enable S3 Versioning"
+      S3StorageClass:
+        default: "S3 Storage Class"
+      GlueVersion:
+        default: "Glue Version"
+      MaxRetries:
+        default: "Maximum Retries"
+      JobTimeout:
+        default: "Job Timeout (minutes)"
+      WorkerType:
+        default: "Worker Type"
+      NumberOfWorkers:
+        default: "Number of Workers"
+      CreateSampleData:
+        default: "Create Sample Data"
+      DataFormat:
+        default: "Output Data Format"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'glue-etl-pipeline'
+    Description: 'Name of the project used for resource naming'
+    MinLength: 3
+    MaxLength: 30
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be 3-30 characters, start with lowercase letter, contain only lowercase letters, numbers, and hyphens'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'test', 'prod']
+    Description: 'Environment name for resource tagging and naming'
+
+  S3BucketPrefix:
+    Type: String
+    Default: 'analytics-data'
+    Description: 'Prefix for S3 bucket names'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be 3-20 characters, start with lowercase letter, contain only lowercase letters, numbers, and hyphens'
+
+  EnableS3Versioning:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable versioning on S3 buckets for data protection'
+
+  S3StorageClass:
+    Type: String
+    Default: 'STANDARD'
+    AllowedValues: ['STANDARD', 'STANDARD_IA', 'ONEZONE_IA']
+    Description: 'Default storage class for S3 objects'
+
+  GlueVersion:
+    Type: String
+    Default: '4.0'
+    AllowedValues: ['3.0', '4.0']
+    Description: 'AWS Glue version for ETL jobs'
+
+  MaxRetries:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 10
+    Description: 'Maximum number of retries for failed Glue jobs'
+
+  JobTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 1
+    MaxValue: 2880
+    Description: 'Timeout for Glue jobs in minutes'
+
+  WorkerType:
+    Type: String
+    Default: 'G.1X'
+    AllowedValues: ['G.1X', 'G.2X', 'G.025X']
+    Description: 'Type of predefined worker for Glue jobs'
+
+  NumberOfWorkers:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    MaxValue: 100
+    Description: 'Number of workers for Glue jobs'
+
+  CreateSampleData:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Create sample data files during deployment'
+
+  DataFormat:
+    Type: String
+    Default: 'parquet'
+    AllowedValues: ['parquet', 'json', 'csv']
+    Description: 'Output format for processed data'
+
+Conditions:
+  EnableVersioning: !Equals [!Ref EnableS3Versioning, 'true']
+  CreateSamples: !Equals [!Ref CreateSampleData, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # S3 Bucket for Raw Data
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${S3BucketPrefix}-raw-${Environment}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [EnableVersioning, 'Enabled', 'Suspended']
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldVersions
+            Status: Enabled
+            NoncurrentVersionTransitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt DataProcessingTrigger.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: 'sales/'
+                  - Name: suffix
+                    Value: '.csv'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Raw data storage'
+
+  # S3 Bucket for Processed Data
+  ProcessedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${S3BucketPrefix}-processed-${Environment}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [EnableVersioning, 'Enabled', 'Suspended']
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Processed data storage'
+
+  # S3 Bucket for Athena Query Results
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${S3BucketPrefix}-athena-results-${Environment}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldResults
+            Status: Enabled
+            ExpirationInDays: 7
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Athena query results'
+
+  # IAM Role for AWS Glue Service
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-glue-service-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:GetObjectVersion
+                Resource:
+                  - !Sub '${RawDataBucket}/*'
+                  - !Sub '${ProcessedDataBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Ref RawDataBucket
+                  - !Ref ProcessedDataBucket
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Glue Database
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectName}_database_${Environment}'
+        Description: !Sub 'Analytics database for ${ProjectName} ETL pipeline in ${Environment} environment'
+
+  # Glue Crawler for Raw Data
+  RawDataCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ProjectName}-raw-data-crawler-${Environment}'
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Description: 'Crawler to discover raw data schemas and populate catalog'
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${RawDataBucket}/'
+            Exclusions:
+              - '**/_temporary/**'
+              - '**/.spark-staging/**'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": { "AddOrUpdateBehavior": "InheritFromTable" },
+            "Tables": { "AddOrUpdateBehavior": "MergeNewColumns" }
+          }
+        }
+      Schedule:
+        ScheduleExpression: !If [IsProduction, 'cron(0 2 * * ? *)', 'cron(0 6 * * ? *)'] # Daily at 2 AM for prod, 6 AM for others
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Purpose: 'Raw data discovery'
+
+  # Glue Crawler for Processed Data
+  ProcessedDataCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ProjectName}-processed-data-crawler-${Environment}'
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Description: 'Crawler to catalog processed/transformed data'
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${ProcessedDataBucket}/enriched-sales/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": { "AddOrUpdateBehavior": "InheritFromTable" },
+            "Tables": { "AddOrUpdateBehavior": "MergeNewColumns" }
+          }
+        }
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Purpose: 'Processed data discovery'
+
+  # ETL Job Script in S3
+  ETLJobScript:
+    Type: AWS::S3::Object
+    Properties:
+      Bucket: !Ref ProcessedDataBucket
+      Key: 'scripts/etl-script.py'
+      Body: !Sub |
+        import sys
+        from awsglue.transforms import *
+        from awsglue.utils import getResolvedOptions
+        from pyspark.context import SparkContext
+        from awsglue.context import GlueContext
+        from awsglue.job import Job
+        from awsglue.dynamicframe import DynamicFrame
+        from pyspark.sql.functions import col, current_timestamp, lit
+        
+        # Get job parameters
+        args = getResolvedOptions(sys.argv, [
+            'JOB_NAME', 
+            'DATABASE_NAME', 
+            'OUTPUT_BUCKET',
+            'OUTPUT_FORMAT'
+        ])
+        
+        # Initialize Glue context
+        sc = SparkContext()
+        glueContext = GlueContext(sc)
+        spark = glueContext.spark_session
+        job = Job(glueContext)
+        job.init(args['JOB_NAME'], args)
+        
+        try:
+            # Read sales data from catalog
+            print("Reading sales data from catalog...")
+            sales_dynamic_frame = glueContext.create_dynamic_frame.from_catalog(
+                database = args['DATABASE_NAME'],
+                table_name = "sales",
+                transformation_ctx = "sales_dynamic_frame"
+            )
+            print(f"Sales records: {sales_dynamic_frame.count()}")
+            
+            # Read customer data from catalog
+            print("Reading customer data from catalog...")
+            customers_dynamic_frame = glueContext.create_dynamic_frame.from_catalog(
+                database = args['DATABASE_NAME'],
+                table_name = "customers",
+                transformation_ctx = "customers_dynamic_frame"
+            )
+            print(f"Customer records: {customers_dynamic_frame.count()}")
+            
+            # Convert to DataFrames for advanced transformations
+            sales_df = sales_dynamic_frame.toDF()
+            customers_df = customers_dynamic_frame.toDF()
+            
+            # Data quality checks
+            print("Performing data quality checks...")
+            sales_df = sales_df.filter(col("quantity") > 0).filter(col("price") > 0)
+            customers_df = customers_df.filter(col("customer_id").isNotNull())
+            
+            # Join sales with customer data
+            print("Joining sales and customer data...")
+            enriched_sales = sales_df.join(customers_df, "customer_id", "left")
+            
+            # Calculate derived metrics
+            enriched_sales = enriched_sales.withColumn("total_amount", 
+                                                     col("quantity") * col("price"))
+            enriched_sales = enriched_sales.withColumn("processing_timestamp", 
+                                                     current_timestamp())
+            enriched_sales = enriched_sales.withColumn("environment", 
+                                                     lit("${Environment}"))
+            
+            # Convert back to DynamicFrame for Glue optimizations
+            enriched_dynamic_frame = DynamicFrame.fromDF(
+                enriched_sales, 
+                glueContext, 
+                "enriched_sales"
+            )
+            
+            # Apply any necessary schema transformations
+            enriched_dynamic_frame = enriched_dynamic_frame.resolveChoice(specs = [('_c0','drop')])
+            
+            # Write to S3 in specified format with partitioning
+            print(f"Writing enriched data to S3 in {args['OUTPUT_FORMAT']} format...")
+            glueContext.write_dynamic_frame.from_options(
+                frame = enriched_dynamic_frame,
+                connection_type = "s3",
+                connection_options = {
+                    "path": f"s3://{args['OUTPUT_BUCKET']}/enriched-sales/",
+                    "partitionKeys": ["environment"]
+                },
+                format = args['OUTPUT_FORMAT'],
+                transformation_ctx = "enriched_sales_sink"
+            )
+            
+            print("ETL job completed successfully!")
+            
+        except Exception as e:
+            print(f"ETL job failed with error: {str(e)}")
+            raise
+        
+        finally:
+            job.commit()
+      ContentType: 'text/x-python'
+
+  # Glue ETL Job
+  ETLJob:
+    Type: AWS::Glue::Job
+    DependsOn: ETLJobScript
+    Properties:
+      Name: !Sub '${ProjectName}-etl-job-${Environment}'
+      Role: !GetAtt GlueServiceRole.Arn
+      Command:
+        Name: 'glueetl'
+        ScriptLocation: !Sub 's3://${ProcessedDataBucket}/scripts/etl-script.py'
+        PythonVersion: '3'
+      DefaultArguments:
+        '--job-language': 'python'
+        '--job-bookmark-option': 'job-bookmark-enable'
+        '--enable-metrics': 'true'
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--DATABASE_NAME': !Ref GlueDatabase
+        '--OUTPUT_BUCKET': !Ref ProcessedDataBucket
+        '--OUTPUT_FORMAT': !Ref DataFormat
+        '--TempDir': !Sub 's3://${ProcessedDataBucket}/temp/'
+        '--enable-glue-datacatalog': 'true'
+      MaxRetries: !Ref MaxRetries
+      Timeout: !Ref JobTimeout
+      GlueVersion: !Ref GlueVersion
+      WorkerType: !Ref WorkerType
+      NumberOfWorkers: !Ref NumberOfWorkers
+      MaxCapacity: !If 
+        - IsProduction
+        - !Ref 'AWS::NoValue'  # Use NumberOfWorkers for production
+        - !Ref 'AWS::NoValue'
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Purpose: 'Data transformation'
+
+  # Lambda Function for ETL Job Triggering
+  DataProcessingTrigger:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-etl-trigger-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          GLUE_JOB_NAME: !Ref ETLJob
+          GLUE_DATABASE_NAME: !Ref GlueDatabase
+          RAW_DATA_CRAWLER: !Ref RawDataCrawler
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          import os
+          import logging
+          from urllib.parse import unquote_plus
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          glue_client = boto3.client('glue')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Parse S3 event
+                  for record in event['Records']:
+                      bucket = record['s3']['bucket']['name']
+                      key = unquote_plus(record['s3']['object']['key'])
+                      
+                      logger.info(f"Processing S3 event: bucket={bucket}, key={key}")
+                      
+                      # Only process CSV files in sales folder
+                      if key.startswith('sales/') and key.endswith('.csv'):
+                          logger.info("Starting Glue crawler for raw data discovery...")
+                          
+                          # Start crawler first to update catalog
+                          crawler_response = glue_client.start_crawler(
+                              Name=os.environ['RAW_DATA_CRAWLER']
+                          )
+                          logger.info(f"Crawler started: {crawler_response}")
+                          
+                          # Wait a moment, then start ETL job
+                          # Note: In production, you might want to use Step Functions
+                          # for more sophisticated workflow orchestration
+                          import time
+                          time.sleep(60)  # Wait for crawler to complete
+                          
+                          # Start ETL job
+                          job_response = glue_client.start_job_run(
+                              JobName=os.environ['GLUE_JOB_NAME'],
+                              Arguments={
+                                  '--DATABASE_NAME': os.environ['GLUE_DATABASE_NAME'],
+                                  '--OUTPUT_BUCKET': '${ProcessedDataBucket}',
+                                  '--OUTPUT_FORMAT': '${DataFormat}'
+                              }
+                          )
+                          
+                          logger.info(f"ETL job started: {job_response['JobRunId']}")
+                          
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('ETL pipeline triggered successfully')
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  raise
+      Timeout: 300
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GlueJobTriggerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:StartCrawler
+                  - glue:GetCrawler
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${ETLJob}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:crawler/${RawDataCrawler}'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Permission for S3 to invoke function
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataProcessingTrigger
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt RawDataBucket.Arn
+
+  # Sample Data Creation (Optional)
+  SampleDataCreation:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: CreateSamples
+    Properties:
+      ServiceToken: !GetAtt SampleDataLambda.Arn
+      RawDataBucket: !Ref RawDataBucket
+
+  SampleDataLambda:
+    Type: AWS::Lambda::Function
+    Condition: CreateSamples
+    Properties:
+      FunctionName: !Sub '${ProjectName}-sample-data-creator-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt SampleDataLambdaRole.Arn
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          import cfnresponse
+          import logging
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          s3_client = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Create':
+                      bucket_name = event['ResourceProperties']['RawDataBucket']
+                      
+                      # Sample sales data
+                      sales_data = """order_id,customer_id,product_name,quantity,price,order_date
+          1001,C001,Laptop,1,999.99,2024-01-15
+          1002,C002,Mouse,2,25.50,2024-01-15
+          1003,C001,Keyboard,1,75.00,2024-01-16
+          1004,C003,Monitor,1,299.99,2024-01-16
+          1005,C002,Headphones,1,149.99,2024-01-17
+          1006,C004,Webcam,1,89.99,2024-01-17
+          1007,C001,USB Drive,3,15.99,2024-01-18
+          1008,C003,Mousepad,2,12.50,2024-01-18
+          1009,C002,Speakers,1,199.99,2024-01-19
+          1010,C004,Tablet,1,399.99,2024-01-19"""
+                      
+                      # Sample customer data
+                      customer_data = '''{"customer_id": "C001", "name": "John Smith", "email": "john@email.com", "region": "North"}
+          {"customer_id": "C002", "name": "Jane Doe", "email": "jane@email.com", "region": "South"}
+          {"customer_id": "C003", "name": "Bob Johnson", "email": "bob@email.com", "region": "East"}
+          {"customer_id": "C004", "name": "Alice Wilson", "email": "alice@email.com", "region": "West"}'''
+                      
+                      # Upload sales data
+                      s3_client.put_object(
+                          Bucket=bucket_name,
+                          Key='sales/sample-sales.csv',
+                          Body=sales_data,
+                          ContentType='text/csv'
+                      )
+                      
+                      # Upload customer data
+                      s3_client.put_object(
+                          Bucket=bucket_name,
+                          Key='customers/sample-customers.json',
+                          Body=customer_data,
+                          ContentType='application/json'
+                      )
+                      
+                      logger.info(f"Sample data uploaded to {bucket_name}")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+                  elif event['RequestType'] == 'Delete':
+                      # Clean up sample data on stack deletion
+                      bucket_name = event['ResourceProperties']['RawDataBucket']
+                      try:
+                          s3_client.delete_object(Bucket=bucket_name, Key='sales/sample-sales.csv')
+                          s3_client.delete_object(Bucket=bucket_name, Key='customers/sample-customers.json')
+                      except Exception as e:
+                          logger.warning(f"Failed to delete sample data: {e}")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+      Timeout: 300
+
+  SampleDataLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: CreateSamples
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3SampleDataPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub '${RawDataBucket}/*'
+
+  # CloudWatch Log Groups for better log management
+  GlueJobLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws-glue/jobs/logs-v2/${ETLJob}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  LambdaTriggerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DataProcessingTrigger}'
+      RetentionInDays: !If [IsProduction, 14, 3]
+
+Outputs:
+  RawDataBucketName:
+    Description: 'Name of the S3 bucket for raw data storage'
+    Value: !Ref RawDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-RawDataBucket'
+
+  ProcessedDataBucketName:
+    Description: 'Name of the S3 bucket for processed data storage'
+    Value: !Ref ProcessedDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessedDataBucket'
+
+  AthenaResultsBucketName:
+    Description: 'Name of the S3 bucket for Athena query results'
+    Value: !Ref AthenaResultsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaResultsBucket'
+
+  GlueDatabaseName:
+    Description: 'Name of the Glue database'
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabase'
+
+  ETLJobName:
+    Description: 'Name of the Glue ETL job'
+    Value: !Ref ETLJob
+    Export:
+      Name: !Sub '${AWS::StackName}-ETLJob'
+
+  RawDataCrawlerName:
+    Description: 'Name of the Glue crawler for raw data'
+    Value: !Ref RawDataCrawler
+    Export:
+      Name: !Sub '${AWS::StackName}-RawDataCrawler'
+
+  ProcessedDataCrawlerName:
+    Description: 'Name of the Glue crawler for processed data'
+    Value: !Ref ProcessedDataCrawler
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessedDataCrawler'
+
+  GlueServiceRoleArn:
+    Description: 'ARN of the Glue service role'
+    Value: !GetAtt GlueServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueServiceRole'
+
+  DataProcessingTriggerArn:
+    Description: 'ARN of the Lambda function that triggers ETL processing'
+    Value: !GetAtt DataProcessingTrigger.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataProcessingTrigger'
+
+  AthenaDatabaseQuery:
+    Description: 'Sample Athena query to test the data pipeline'
+    Value: !Sub |
+      SELECT 
+        customer_id, 
+        product_name, 
+        total_amount,
+        processing_timestamp
+      FROM ${GlueDatabase}.enriched_sales 
+      WHERE total_amount > 100 
+      ORDER BY total_amount DESC 
+      LIMIT 10;
+
+  QuickStartInstructions:
+    Description: 'Quick start instructions for using the ETL pipeline'
+    Value: !Sub |
+      1. Upload CSV files to s3://${RawDataBucket}/sales/
+      2. Upload JSON files to s3://${RawDataBucket}/customers/
+      3. Monitor ETL job execution in AWS Glue console
+      4. Query results with Athena using database: ${GlueDatabase}
+      5. View processed data in s3://${ProcessedDataBucket}/enriched-sales/
+
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for this ETL pipeline (USD)'
+    Value: !Sub |
+      Development: $10-25/month
+      Production: $50-150/month
+      (Costs vary based on data volume and processing frequency)

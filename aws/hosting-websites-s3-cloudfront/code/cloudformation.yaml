@@ -1,0 +1,500 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Static website hosting with S3, CloudFront, and Route 53 - Complete solution with SSL/TLS certificate and global CDN'
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+Parameters:
+  DomainName:
+    Type: String
+    Description: 'Root domain name for the website (e.g., example.com)'
+    AllowedPattern: '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$'
+    ConstraintDescription: 'Must be a valid domain name'
+    
+  SubdomainPrefix:
+    Type: String
+    Default: 'www'
+    Description: 'Subdomain prefix for the website (e.g., www)'
+    AllowedPattern: '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
+    ConstraintDescription: 'Must be a valid subdomain prefix'
+    
+  HostedZoneId:
+    Type: String
+    Description: 'Route 53 Hosted Zone ID for the domain'
+    AllowedPattern: '^[A-Z0-9]{10,32}$'
+    ConstraintDescription: 'Must be a valid Route 53 Hosted Zone ID'
+    
+  PriceClass:
+    Type: String
+    Default: 'PriceClass_100'
+    AllowedValues:
+      - 'PriceClass_All'
+      - 'PriceClass_200'
+      - 'PriceClass_100'
+    Description: 'CloudFront price class (100=US/Europe, 200=US/Europe/Asia, All=Global)'
+    
+  IndexDocument:
+    Type: String
+    Default: 'index.html'
+    Description: 'Default index document for the website'
+    
+  ErrorDocument:
+    Type: String
+    Default: 'error.html'
+    Description: 'Error document for 4xx/5xx errors'
+    
+  EnableLogging:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable CloudFront access logging'
+    
+  LogRetentionDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    MaxValue: 3653
+    Description: 'Number of days to retain CloudFront access logs'
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+Conditions:
+  EnableAccessLogging: !Equals [!Ref EnableLogging, 'true']
+  IsUsEast1: !Equals [!Ref 'AWS::Region', 'us-east-1']
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+  # ------------------------------------------------------------------------------
+  # S3 BUCKETS
+  # ------------------------------------------------------------------------------
+  
+  # Primary website bucket (www subdomain)
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${SubdomainPrefix}.${DomainName}'
+      WebsiteConfiguration:
+        IndexDocument: !Ref IndexDocument
+        ErrorDocument: !Ref ErrorDocument
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      NotificationConfiguration:
+        LambdaConfigurations: []
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-website-bucket'
+        - Key: Purpose
+          Value: 'Static Website Hosting'
+        - Key: Domain
+          Value: !Sub '${SubdomainPrefix}.${DomainName}'
+          
+  # Website bucket policy for public read access
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub '${WebsiteBucket}/*'
+            
+  # Root domain redirect bucket
+  RedirectBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref DomainName
+      WebsiteConfiguration:
+        RedirectAllRequestsTo:
+          HostName: !Sub '${SubdomainPrefix}.${DomainName}'
+          Protocol: https
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-redirect-bucket'
+        - Key: Purpose
+          Value: 'Root Domain Redirect'
+        - Key: Domain
+          Value: !Ref DomainName
+          
+  # CloudFront access logs bucket (conditional)
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: EnableAccessLogging
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-cloudfront-logs-${AWS::AccountId}'
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: !Ref LogRetentionDays
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-logs-bucket'
+        - Key: Purpose
+          Value: 'CloudFront Access Logs'
+
+  # ------------------------------------------------------------------------------
+  # SSL/TLS CERTIFICATE
+  # ------------------------------------------------------------------------------
+  
+  # SSL certificate for both root and www domains
+  # Note: Must be created in us-east-1 for CloudFront
+  SSLCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      SubjectAlternativeNames:
+        - !Sub '${SubdomainPrefix}.${DomainName}'
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+        - DomainName: !Sub '${SubdomainPrefix}.${DomainName}'
+          HostedZoneId: !Ref HostedZoneId
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ssl-certificate'
+        - Key: Domain
+          Value: !Ref DomainName
+
+  # ------------------------------------------------------------------------------
+  # CLOUDFRONT DISTRIBUTIONS
+  # ------------------------------------------------------------------------------
+  
+  # CloudFront distribution for www subdomain
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub 'CloudFront distribution for ${SubdomainPrefix}.${DomainName}'
+        Enabled: true
+        DefaultRootObject: !Ref IndexDocument
+        PriceClass: !Ref PriceClass
+        
+        # Domain aliases
+        Aliases:
+          - !Sub '${SubdomainPrefix}.${DomainName}'
+          
+        # Origin configuration
+        Origins:
+          - Id: S3Origin
+            DomainName: !Sub '${WebsiteBucket}.s3-website-${AWS::Region}.amazonaws.com'
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+              OriginSSLProtocols:
+                - TLSv1.2
+                
+        # Default cache behavior
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # Managed-CachingOptimized
+          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf # Managed-CORS-S3Origin
+          ResponseHeadersPolicyId: 5cc3b908-e619-4b99-88e5-2cf7f45965bd # Managed-SimpleCORS
+          
+        # Custom error pages
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 404
+            ResponsePagePath: !Sub '/${ErrorDocument}'
+            ErrorCachingMinTTL: 300
+          - ErrorCode: 403
+            ResponseCode: 404
+            ResponsePagePath: !Sub '/${ErrorDocument}'
+            ErrorCachingMinTTL: 300
+            
+        # SSL/TLS configuration
+        ViewerCertificate:
+          AcmCertificateArn: !Ref SSLCertificate
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+          
+        # Access logging (conditional)
+        Logging: !If
+          - EnableAccessLogging
+          - Bucket: !GetAtt LogsBucket.DomainName
+            IncludeCookies: false
+            Prefix: !Sub 'cloudfront-logs/${SubdomainPrefix}.${DomainName}/'
+          - !Ref AWS::NoValue
+          
+        # Security headers and restrictions
+        WebACLId: !Ref AWS::NoValue
+        
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-cloudfront-distribution'
+        - Key: Domain
+          Value: !Sub '${SubdomainPrefix}.${DomainName}'
+        - Key: Purpose
+          Value: 'Static Website CDN'
+          
+  # CloudFront distribution for root domain redirect
+  RedirectCloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub 'CloudFront distribution for ${DomainName} redirect'
+        Enabled: true
+        PriceClass: !Ref PriceClass
+        
+        # Domain aliases
+        Aliases:
+          - !Ref DomainName
+          
+        # Origin configuration
+        Origins:
+          - Id: S3RedirectOrigin
+            DomainName: !Sub '${RedirectBucket}.s3-website-${AWS::Region}.amazonaws.com'
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+              OriginSSLProtocols:
+                - TLSv1.2
+                
+        # Default cache behavior
+        DefaultCacheBehavior:
+          TargetOriginId: S3RedirectOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # Managed-CachingOptimized
+          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf # Managed-CORS-S3Origin
+          
+        # SSL/TLS configuration
+        ViewerCertificate:
+          AcmCertificateArn: !Ref SSLCertificate
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+          
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-redirect-cloudfront-distribution'
+        - Key: Domain
+          Value: !Ref DomainName
+        - Key: Purpose
+          Value: 'Root Domain Redirect CDN'
+
+  # ------------------------------------------------------------------------------
+  # ROUTE 53 DNS RECORDS
+  # ------------------------------------------------------------------------------
+  
+  # DNS record for www subdomain
+  SubdomainDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub '${SubdomainPrefix}.${DomainName}'
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2 # CloudFront hosted zone ID
+        EvaluateTargetHealth: false
+        
+  # DNS record for root domain
+  RootDomainDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt RedirectCloudFrontDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2 # CloudFront hosted zone ID
+        EvaluateTargetHealth: false
+
+  # ------------------------------------------------------------------------------
+  # IAM ROLES AND POLICIES (Optional - for future enhancements)
+  # ------------------------------------------------------------------------------
+  
+  # IAM role for CloudWatch logs (if implementing custom logging)
+  CloudWatchLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-cloudwatch-logs-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/CloudWatchLogsFullAccess
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-cloudwatch-logs-role'
+        - Key: Purpose
+          Value: 'CloudFront Logging'
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+Outputs:
+  WebsiteURL:
+    Description: 'URL of the website'
+    Value: !Sub 'https://${SubdomainPrefix}.${DomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-website-url'
+      
+  RootDomainURL:
+    Description: 'Root domain URL (redirects to www)'
+    Value: !Sub 'https://${DomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-root-domain-url'
+      
+  CloudFrontDistributionId:
+    Description: 'CloudFront distribution ID for www subdomain'
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub '${AWS::StackName}-cloudfront-distribution-id'
+      
+  RedirectCloudFrontDistributionId:
+    Description: 'CloudFront distribution ID for root domain redirect'
+    Value: !Ref RedirectCloudFrontDistribution
+    Export:
+      Name: !Sub '${AWS::StackName}-redirect-cloudfront-distribution-id'
+      
+  CloudFrontDomainName:
+    Description: 'CloudFront domain name for www subdomain'
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-cloudfront-domain-name'
+      
+  WebsiteBucketName:
+    Description: 'Name of the S3 bucket hosting the website'
+    Value: !Ref WebsiteBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-website-bucket-name'
+      
+  RedirectBucketName:
+    Description: 'Name of the S3 bucket for root domain redirect'
+    Value: !Ref RedirectBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-redirect-bucket-name'
+      
+  SSLCertificateArn:
+    Description: 'ARN of the SSL certificate'
+    Value: !Ref SSLCertificate
+    Export:
+      Name: !Sub '${AWS::StackName}-ssl-certificate-arn'
+      
+  LogsBucketName:
+    Condition: EnableAccessLogging
+    Description: 'Name of the S3 bucket for CloudFront access logs'
+    Value: !Ref LogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-logs-bucket-name'
+      
+  WebsiteBucketWebsiteURL:
+    Description: 'S3 bucket website endpoint'
+    Value: !GetAtt WebsiteBucket.WebsiteURL
+    Export:
+      Name: !Sub '${AWS::StackName}-s3-website-url'
+      
+  StackRegion:
+    Description: 'AWS region where the stack is deployed'
+    Value: !Ref 'AWS::Region'
+    Export:
+      Name: !Sub '${AWS::StackName}-region'
+      
+  DeploymentInstructions:
+    Description: 'Instructions for uploading website content'
+    Value: !Sub |
+      To upload your website content:
+      1. aws s3 sync ./website-files s3://${WebsiteBucket}/
+      2. aws cloudfront create-invalidation --distribution-id ${CloudFrontDistribution} --paths "/*"
+    Export:
+      Name: !Sub '${AWS::StackName}-deployment-instructions'
+
+# ==============================================================================
+# METADATA
+# ==============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Domain Configuration'
+        Parameters:
+          - DomainName
+          - SubdomainPrefix
+          - HostedZoneId
+      - Label:
+          default: 'Website Configuration'
+        Parameters:
+          - IndexDocument
+          - ErrorDocument
+      - Label:
+          default: 'CloudFront Configuration'
+        Parameters:
+          - PriceClass
+          - EnableLogging
+          - LogRetentionDays
+    ParameterLabels:
+      DomainName:
+        default: 'Root Domain Name'
+      SubdomainPrefix:
+        default: 'Subdomain Prefix'
+      HostedZoneId:
+        default: 'Route 53 Hosted Zone ID'
+      IndexDocument:
+        default: 'Index Document'
+      ErrorDocument:
+        default: 'Error Document'
+      PriceClass:
+        default: 'CloudFront Price Class'
+      EnableLogging:
+        default: 'Enable Access Logging'
+      LogRetentionDays:
+        default: 'Log Retention Period (Days)'
+        
+  AWS::CloudFormation::Designer:
+    # This section can be populated by the CloudFormation Designer
+    # for visual representation of the template
+    {}
+    
+  # Template information
+  Template:
+    Version: '1.0'
+    Description: 'Complete static website hosting solution with S3, CloudFront, and Route 53'
+    Author: 'AWS CloudFormation Best Practices'
+    CreatedDate: '2025-01-27'
+    LastModified: '2025-01-27'
+    
+  # Cost estimation hints
+  CostEstimation:
+    - Resource: 'S3 Storage'
+      EstimatedMonthlyCost: '$0.02-0.10'
+      Description: 'Based on 1-10GB of website content'
+    - Resource: 'CloudFront'
+      EstimatedMonthlyCost: '$0.50-2.00'
+      Description: 'First 1TB of data transfer free, then $0.085/GB'
+    - Resource: 'Route 53'
+      EstimatedMonthlyCost: '$0.50'
+      Description: 'Hosted zone cost'
+    - Resource: 'Certificate Manager'
+      EstimatedMonthlyCost: '$0.00'
+      Description: 'Free for AWS integrated services'

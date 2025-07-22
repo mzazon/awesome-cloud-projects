@@ -1,0 +1,465 @@
+{
+  "Comment": "Multi-language voice processing pipeline orchestrating Transcribe, Translate, and Polly services",
+  "StartAt": "InitializeJob",
+  "States": {
+    "InitializeJob": {
+      "Type": "Pass",
+      "Comment": "Initialize job parameters and set up processing context",
+      "Parameters": {
+        "bucket.$": "$.bucket",
+        "key.$": "$.key", 
+        "job_id.$": "$.job_id",
+        "jobs_table": "${jobs_table_name}",
+        "target_languages.$": "$.target_languages"
+      },
+      "Next": "ValidateInput"
+    },
+    
+    "ValidateInput": {
+      "Type": "Choice",
+      "Comment": "Validate required input parameters",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.bucket",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.key", 
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.job_id",
+              "IsPresent": true
+            }
+          ],
+          "Next": "DetectLanguage"
+        }
+      ],
+      "Default": "InputValidationError"
+    },
+    
+    "InputValidationError": {
+      "Type": "Fail",
+      "Comment": "Input validation failed",
+      "Cause": "Missing required parameters: bucket, key, or job_id"
+    },
+    
+    "DetectLanguage": {
+      "Type": "Task",
+      "Comment": "Start language detection using Amazon Transcribe",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${language_detector_arn}",
+        "Payload.$": "$"
+      },
+      "ResultPath": "$.language_detection_result",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "Next": "HandleLanguageDetectionError",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "WaitForLanguageDetection"
+    },
+    
+    "HandleLanguageDetectionError": {
+      "Type": "Pass",
+      "Comment": "Handle language detection errors",
+      "Parameters": {
+        "error_stage": "language_detection",
+        "error_details.$": "$.error",
+        "job_id.$": "$.job_id"
+      },
+      "Next": "NotifyError"
+    },
+    
+    "WaitForLanguageDetection": {
+      "Type": "Wait",
+      "Comment": "Wait for language detection job to process",
+      "Seconds": 30,
+      "Next": "CheckLanguageDetectionStatus"
+    },
+    
+    "CheckLanguageDetectionStatus": {
+      "Type": "Task",
+      "Comment": "Check the status of language detection job",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${job_status_checker_arn}",
+        "Payload": {
+          "transcribe_job_name.$": "$.language_detection_result.Payload.body.transcribe_job_name",
+          "job_type": "language_detection"
+        }
+      },
+      "ResultPath": "$.language_status",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "Next": "HandleStatusCheckError",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "IsLanguageDetectionComplete"
+    },
+    
+    "IsLanguageDetectionComplete": {
+      "Type": "Choice",
+      "Comment": "Check if language detection is complete",
+      "Choices": [
+        {
+          "Variable": "$.language_status.Payload.body.is_complete",
+          "BooleanEquals": true,
+          "Next": "EvaluateLanguageDetectionResult"
+        }
+      ],
+      "Default": "WaitForLanguageDetection"
+    },
+    
+    "EvaluateLanguageDetectionResult": {
+      "Type": "Choice",
+      "Comment": "Evaluate language detection result",
+      "Choices": [
+        {
+          "Variable": "$.language_status.Payload.body.job_status",
+          "StringEquals": "COMPLETED",
+          "Next": "ProcessTranscription"
+        },
+        {
+          "Variable": "$.language_status.Payload.body.job_status",
+          "StringEquals": "FAILED",
+          "Next": "HandleLanguageDetectionFailure"
+        }
+      ],
+      "Default": "ProcessTranscription"
+    },
+    
+    "HandleLanguageDetectionFailure": {
+      "Type": "Pass",
+      "Comment": "Handle language detection job failure",
+      "Parameters": {
+        "error_stage": "language_detection",
+        "failure_reason.$": "$.language_status.Payload.body.failure_reason",
+        "job_id.$": "$.job_id"
+      },
+      "Next": "NotifyError"
+    },
+    
+    "ProcessTranscription": {
+      "Type": "Task",
+      "Comment": "Start transcription processing with detected language",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${transcription_processor_arn}",
+        "Payload": {
+          "job_id.$": "$.job_id",
+          "bucket.$": "$.bucket",
+          "key.$": "$.key",
+          "detected_language.$": "$.language_status.Payload.body.detected_language",
+          "jobs_table": "${jobs_table_name}"
+        }
+      },
+      "ResultPath": "$.transcription_result",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "Next": "HandleTranscriptionError",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "WaitForTranscription"
+    },
+    
+    "HandleTranscriptionError": {
+      "Type": "Pass",
+      "Comment": "Handle transcription processing errors",
+      "Parameters": {
+        "error_stage": "transcription",
+        "error_details.$": "$.error",
+        "job_id.$": "$.job_id"
+      },
+      "Next": "NotifyError"
+    },
+    
+    "WaitForTranscription": {
+      "Type": "Wait",
+      "Comment": "Wait for transcription job to process",
+      "Seconds": 60,
+      "Next": "CheckTranscriptionStatus"
+    },
+    
+    "CheckTranscriptionStatus": {
+      "Type": "Task",
+      "Comment": "Check the status of transcription job",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${job_status_checker_arn}",
+        "Payload": {
+          "transcribe_job_name.$": "$.transcription_result.Payload.body.transcribe_job_name",
+          "job_type": "transcription"
+        }
+      },
+      "ResultPath": "$.transcription_status",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "Next": "HandleStatusCheckError",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "IsTranscriptionComplete"
+    },
+    
+    "IsTranscriptionComplete": {
+      "Type": "Choice",
+      "Comment": "Check if transcription is complete",
+      "Choices": [
+        {
+          "Variable": "$.transcription_status.Payload.body.is_complete",
+          "BooleanEquals": true,
+          "Next": "EvaluateTranscriptionResult"
+        }
+      ],
+      "Default": "WaitForTranscription"
+    },
+    
+    "EvaluateTranscriptionResult": {
+      "Type": "Choice",
+      "Comment": "Evaluate transcription result",
+      "Choices": [
+        {
+          "Variable": "$.transcription_status.Payload.body.job_status",
+          "StringEquals": "COMPLETED",
+          "Next": "ProcessTranslation"
+        },
+        {
+          "Variable": "$.transcription_status.Payload.body.job_status",
+          "StringEquals": "FAILED",
+          "Next": "HandleTranscriptionFailure"
+        }
+      ],
+      "Default": "ProcessTranslation"
+    },
+    
+    "HandleTranscriptionFailure": {
+      "Type": "Pass",
+      "Comment": "Handle transcription job failure",
+      "Parameters": {
+        "error_stage": "transcription",
+        "failure_reason.$": "$.transcription_status.Payload.body.failure_reason",
+        "job_id.$": "$.job_id"
+      },
+      "Next": "NotifyError"
+    },
+    
+    "ProcessTranslation": {
+      "Type": "Task",
+      "Comment": "Process text translation using Amazon Translate",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${translation_processor_arn}",
+        "Payload": {
+          "job_id.$": "$.job_id",
+          "bucket.$": "$.bucket",
+          "source_language.$": "$.transcription_status.Payload.body.source_language",
+          "target_languages.$": "$.target_languages",
+          "transcription_uri.$": "$.transcription_status.Payload.body.transcript_s3_key",
+          "jobs_table": "${jobs_table_name}"
+        }
+      },
+      "ResultPath": "$.translation_result",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "Next": "HandleTranslationError",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "ValidateTranslationResults"
+    },
+    
+    "HandleTranslationError": {
+      "Type": "Pass",
+      "Comment": "Handle translation processing errors",
+      "Parameters": {
+        "error_stage": "translation",
+        "error_details.$": "$.error",
+        "job_id.$": "$.job_id"
+      },
+      "Next": "NotifyError"
+    },
+    
+    "ValidateTranslationResults": {
+      "Type": "Choice",
+      "Comment": "Validate translation results before proceeding",
+      "Choices": [
+        {
+          "Variable": "$.translation_result.Payload.statusCode",
+          "NumericEquals": 200,
+          "Next": "SynthesizeSpeech"
+        }
+      ],
+      "Default": "HandleTranslationError"
+    },
+    
+    "SynthesizeSpeech": {
+      "Type": "Task",
+      "Comment": "Synthesize speech using Amazon Polly",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${speech_synthesizer_arn}",
+        "Payload": {
+          "job_id.$": "$.job_id",
+          "bucket.$": "$.bucket",
+          "translations.$": "$.translation_result.Payload.body.translations",
+          "jobs_table": "${jobs_table_name}"
+        }
+      },
+      "ResultPath": "$.synthesis_result",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "Next": "HandleSpeechSynthesisError",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "ValidateSynthesisResults"
+    },
+    
+    "HandleSpeechSynthesisError": {
+      "Type": "Pass",
+      "Comment": "Handle speech synthesis errors",
+      "Parameters": {
+        "error_stage": "speech_synthesis",
+        "error_details.$": "$.error",
+        "job_id.$": "$.job_id"
+      },
+      "Next": "NotifyError"
+    },
+    
+    "ValidateSynthesisResults": {
+      "Type": "Choice",
+      "Comment": "Validate speech synthesis results",
+      "Choices": [
+        {
+          "Variable": "$.synthesis_result.Payload.statusCode",
+          "NumericEquals": 200,
+          "Next": "ProcessingComplete"
+        }
+      ],
+      "Default": "HandleSpeechSynthesisError"
+    },
+    
+    "ProcessingComplete": {
+      "Type": "Pass",
+      "Comment": "Voice processing pipeline completed successfully",
+      "Parameters": {
+        "status": "SUCCESS",
+        "job_id.$": "$.job_id",
+        "completion_time.$": "$$.State.EnteredTime",
+        "results": {
+          "detected_language.$": "$.language_status.Payload.body.detected_language",
+          "source_language.$": "$.transcription_status.Payload.body.source_language",
+          "target_languages.$": "$.target_languages",
+          "translation_summary.$": "$.translation_result.Payload.body.translation_summary",
+          "audio_outputs.$": "$.synthesis_result.Payload.body.audio_outputs",
+          "synthesis_summary.$": "$.synthesis_result.Payload.body.synthesis_summary"
+        }
+      },
+      "Next": "NotifySuccess"
+    },
+    
+    "NotifySuccess": {
+      "Type": "Pass",
+      "Comment": "Notify successful completion",
+      "Parameters": {
+        "notification_type": "SUCCESS",
+        "message": "Voice processing pipeline completed successfully",
+        "job_id.$": "$.job_id",
+        "results.$": "$.results"
+      },
+      "End": true
+    },
+    
+    "HandleStatusCheckError": {
+      "Type": "Pass",
+      "Comment": "Handle status check errors",
+      "Parameters": {
+        "error_stage": "status_check",
+        "error_details.$": "$.error",
+        "job_id.$": "$.job_id"
+      },
+      "Next": "NotifyError"
+    },
+    
+    "NotifyError": {
+      "Type": "Pass",
+      "Comment": "Notify error occurrence",
+      "Parameters": {
+        "notification_type": "ERROR",
+        "message": "Voice processing pipeline encountered an error",
+        "job_id.$": "$.job_id",
+        "error_stage.$": "$.error_stage",
+        "error_details.$": "$.error_details",
+        "failure_time.$": "$$.State.EnteredTime"
+      },
+      "Next": "ProcessingFailed"
+    },
+    
+    "ProcessingFailed": {
+      "Type": "Fail",
+      "Comment": "Voice processing pipeline failed",
+      "Cause": "Pipeline execution failed at one of the processing stages"
+    }
+  }
+}

@@ -1,0 +1,920 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Infrastructure as Code for Oracle to PostgreSQL Database Migration using AWS DMS and Aurora PostgreSQL.
+  This template creates a complete migration environment including VPC, Aurora PostgreSQL cluster,
+  DMS replication instance, and all necessary supporting resources for enterprise-grade database migration.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Migration Configuration"
+        Parameters:
+          - MigrationProjectName
+          - OracleServerName
+          - OraclePort
+          - OracleDatabaseName
+          - OracleUsername
+          - OraclePassword
+      - Label:
+          default: "Aurora PostgreSQL Configuration"
+        Parameters:
+          - AuroraClusterIdentifier
+          - AuroraInstanceClass
+          - AuroraEngineVersion
+          - DatabaseMasterUsername
+          - DatabaseMasterPassword
+      - Label:
+          default: "DMS Configuration"
+        Parameters:
+          - DMSReplicationInstanceClass
+          - DMSReplicationInstanceId
+          - DMSEngineVersion
+          - AllocatedStorage
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcCidr
+          - PrivateSubnet1Cidr
+          - PrivateSubnet2Cidr
+          - EnableMultiAZ
+      - Label:
+          default: "Monitoring and Backup"
+        Parameters:
+          - BackupRetentionPeriod
+          - PreferredBackupWindow
+          - PreferredMaintenanceWindow
+          - MonitoringInterval
+          - EnablePerformanceInsights
+    ParameterLabels:
+      MigrationProjectName:
+        default: "Migration Project Name"
+      OracleServerName:
+        default: "Oracle Server Hostname"
+      AuroraClusterIdentifier:
+        default: "Aurora Cluster Name"
+      DMSReplicationInstanceClass:
+        default: "DMS Instance Class"
+
+Parameters:
+  # Migration Configuration
+  MigrationProjectName:
+    Type: String
+    Description: Unique name for the migration project (will be used as prefix for resources)
+    Default: oracle-to-postgresql-migration
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9-]*$
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters and hyphens
+    MinLength: 3
+    MaxLength: 50
+
+  # Oracle Source Database Configuration
+  OracleServerName:
+    Type: String
+    Description: Hostname or IP address of the Oracle source database
+    MinLength: 1
+    MaxLength: 253
+
+  OraclePort:
+    Type: Number
+    Description: Port number for Oracle database connection
+    Default: 1521
+    MinValue: 1
+    MaxValue: 65535
+
+  OracleDatabaseName:
+    Type: String
+    Description: Oracle database name or SID
+    Default: ORCL
+    MinLength: 1
+    MaxLength: 64
+
+  OracleUsername:
+    Type: String
+    Description: Username for Oracle database connection
+    MinLength: 1
+    MaxLength: 128
+    NoEcho: false
+
+  OraclePassword:
+    Type: String
+    Description: Password for Oracle database connection
+    MinLength: 8
+    MaxLength: 128
+    NoEcho: true
+
+  # Aurora PostgreSQL Configuration
+  AuroraClusterIdentifier:
+    Type: String
+    Description: Identifier for the Aurora PostgreSQL cluster
+    Default: aurora-postgresql-migration
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9-]*$
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters and hyphens
+    MinLength: 1
+    MaxLength: 63
+
+  AuroraInstanceClass:
+    Type: String
+    Description: Instance class for Aurora PostgreSQL
+    Default: db.r6g.large
+    AllowedValues:
+      - db.r6g.large
+      - db.r6g.xlarge
+      - db.r6g.2xlarge
+      - db.r6g.4xlarge
+      - db.r6g.8xlarge
+      - db.r6g.12xlarge
+      - db.r6g.16xlarge
+
+  AuroraEngineVersion:
+    Type: String
+    Description: Aurora PostgreSQL engine version
+    Default: '15.4'
+    AllowedValues:
+      - '15.4'
+      - '14.9'
+      - '13.13'
+
+  DatabaseMasterUsername:
+    Type: String
+    Description: Master username for Aurora PostgreSQL cluster
+    Default: dbadmin
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9]*$
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters
+    MinLength: 1
+    MaxLength: 63
+
+  DatabaseMasterPassword:
+    Type: String
+    Description: Master password for Aurora PostgreSQL cluster
+    MinLength: 8
+    MaxLength: 128
+    NoEcho: true
+    AllowedPattern: ^[a-zA-Z0-9!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]*$
+    ConstraintDescription: Must contain only alphanumeric characters and special characters
+
+  # DMS Configuration
+  DMSReplicationInstanceClass:
+    Type: String
+    Description: Instance class for DMS replication instance
+    Default: dms.c5.large
+    AllowedValues:
+      - dms.t3.micro
+      - dms.t3.small
+      - dms.t3.medium
+      - dms.t3.large
+      - dms.c5.large
+      - dms.c5.xlarge
+      - dms.c5.2xlarge
+      - dms.c5.4xlarge
+
+  DMSReplicationInstanceId:
+    Type: String
+    Description: Identifier for DMS replication instance
+    Default: dms-replication-instance
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9-]*$
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters and hyphens
+    MinLength: 1
+    MaxLength: 60
+
+  DMSEngineVersion:
+    Type: String
+    Description: DMS engine version
+    Default: '3.5.2'
+    AllowedValues:
+      - '3.5.2'
+      - '3.5.1'
+      - '3.4.7'
+
+  AllocatedStorage:
+    Type: Number
+    Description: Allocated storage for DMS replication instance (GB)
+    Default: 100
+    MinValue: 20
+    MaxValue: 16384
+
+  # Network Configuration
+  VpcCidr:
+    Type: String
+    Description: CIDR block for the VPC
+    Default: 10.0.0.0/16
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$
+    ConstraintDescription: CIDR block parameter must be in the form x.x.x.x/16-28
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Description: CIDR block for the first private subnet
+    Default: 10.0.1.0/24
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$
+    ConstraintDescription: CIDR block parameter must be in the form x.x.x.x/16-28
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Description: CIDR block for the second private subnet
+    Default: 10.0.2.0/24
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$
+    ConstraintDescription: CIDR block parameter must be in the form x.x.x.x/16-28
+
+  EnableMultiAZ:
+    Type: String
+    Description: Enable Multi-AZ deployment for high availability
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  # Monitoring and Backup Configuration
+  BackupRetentionPeriod:
+    Type: Number
+    Description: Number of days to retain automated backups
+    Default: 7
+    MinValue: 1
+    MaxValue: 35
+
+  PreferredBackupWindow:
+    Type: String
+    Description: Preferred backup window (UTC)
+    Default: '03:00-04:00'
+    AllowedPattern: ^([0-1]?[0-9]|2[0-3]):[0-5][0-9]-([0-1]?[0-9]|2[0-3]):[0-5][0-9]$
+    ConstraintDescription: Must be in the format HH:MM-HH:MM
+
+  PreferredMaintenanceWindow:
+    Type: String
+    Description: Preferred maintenance window (UTC)
+    Default: 'sun:04:00-sun:05:00'
+    AllowedPattern: ^(sun|mon|tue|wed|thu|fri|sat):[0-2][0-9]:[0-5][0-9]-(sun|mon|tue|wed|thu|fri|sat):[0-2][0-9]:[0-5][0-9]$
+    ConstraintDescription: Must be in the format ddd:HH:MM-ddd:HH:MM
+
+  MonitoringInterval:
+    Type: Number
+    Description: Enhanced monitoring interval in seconds
+    Default: 60
+    AllowedValues:
+      - 0
+      - 1
+      - 5
+      - 10
+      - 15
+      - 30
+      - 60
+
+  EnablePerformanceInsights:
+    Type: String
+    Description: Enable Performance Insights for Aurora PostgreSQL
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Conditions:
+  IsMultiAZ: !Equals [!Ref EnableMultiAZ, 'true']
+  IsPerformanceInsightsEnabled: !Equals [!Ref EnablePerformanceInsights, 'true']
+  IsEnhancedMonitoringEnabled: !Not [!Equals [!Ref MonitoringInterval, 0]]
+
+Resources:
+  # VPC and Networking Resources
+  MigrationVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${MigrationProjectName}-vpc'
+        - Key: Project
+          Value: !Ref MigrationProjectName
+        - Key: Purpose
+          Value: Database Migration
+
+  # Internet Gateway for NAT Gateway connectivity
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${MigrationProjectName}-igw'
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MigrationVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public Subnet for NAT Gateway
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MigrationVPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${MigrationProjectName}-public-subnet'
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  # NAT Gateway for private subnet internet access
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${MigrationProjectName}-nat-eip'
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub '${MigrationProjectName}-nat-gateway'
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  # Private Subnets for Database and DMS Resources
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MigrationVPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${MigrationProjectName}-private-subnet-1'
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MigrationVPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${MigrationProjectName}-private-subnet-2'
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  # Route Tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MigrationVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${MigrationProjectName}-public-rt'
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MigrationVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${MigrationProjectName}-private-rt'
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  # Route Table Associations
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # Security Groups
+  AuroraSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Aurora PostgreSQL cluster
+      VpcId: !Ref MigrationVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref DMSSecurityGroup
+          Description: Allow DMS access to PostgreSQL
+      Tags:
+        - Key: Name
+          Value: !Sub '${MigrationProjectName}-aurora-sg'
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  DMSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for DMS replication instance
+      VpcId: !Ref MigrationVPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 1521
+          ToPort: 1521
+          CidrIp: 0.0.0.0/0
+          Description: Allow outbound Oracle connections
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: !Ref VpcCidr
+          Description: Allow outbound PostgreSQL connections within VPC
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTPS for AWS API calls
+      Tags:
+        - Key: Name
+          Value: !Sub '${MigrationProjectName}-dms-sg'
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  # IAM Roles for DMS
+  DMSVPCRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${MigrationProjectName}-dms-vpc-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: dms.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonDMSVPCManagementRole
+      Tags:
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  DMSCloudWatchLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${MigrationProjectName}-dms-cloudwatch-logs-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: dms.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonDMSCloudWatchLogsRole
+      Tags:
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  # Enhanced Monitoring Role for Aurora (conditional)
+  EnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Condition: IsEnhancedMonitoringEnabled
+    Properties:
+      RoleName: !Sub '${MigrationProjectName}-aurora-monitoring-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+      Tags:
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  # Aurora PostgreSQL Subnet Group
+  AuroraSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${AuroraClusterIdentifier}-subnet-group'
+      DBSubnetGroupDescription: Subnet group for Aurora PostgreSQL cluster
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${AuroraClusterIdentifier}-subnet-group'
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  # Aurora PostgreSQL Cluster Parameter Group
+  AuroraClusterParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      DBClusterParameterGroupName: !Sub '${AuroraClusterIdentifier}-cluster-params'
+      Description: Parameter group for Aurora PostgreSQL cluster
+      Family: aurora-postgresql15
+      Parameters:
+        shared_preload_libraries: pg_stat_statements
+        log_statement: all
+        log_min_duration_statement: 1000
+        track_activity_query_size: 2048
+      Tags:
+        - Key: Name
+          Value: !Sub '${AuroraClusterIdentifier}-cluster-params'
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  # Aurora PostgreSQL Instance Parameter Group
+  AuroraInstanceParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      DBParameterGroupName: !Sub '${AuroraClusterIdentifier}-instance-params'
+      Description: Parameter group for Aurora PostgreSQL instances
+      Family: aurora-postgresql15
+      Parameters:
+        pg_stat_statements.track: ALL
+        pg_stat_statements.max: 10000
+      Tags:
+        - Key: Name
+          Value: !Sub '${AuroraClusterIdentifier}-instance-params'
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  # Aurora PostgreSQL Cluster
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    Properties:
+      DBClusterIdentifier: !Ref AuroraClusterIdentifier
+      Engine: aurora-postgresql
+      EngineVersion: !Ref AuroraEngineVersion
+      MasterUsername: !Ref DatabaseMasterUsername
+      MasterUserPassword: !Ref DatabaseMasterPassword
+      DatabaseName: postgres
+      Port: 5432
+      DBSubnetGroupName: !Ref AuroraSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref AuroraSecurityGroup
+      DBClusterParameterGroupName: !Ref AuroraClusterParameterGroup
+      BackupRetentionPeriod: !Ref BackupRetentionPeriod
+      PreferredBackupWindow: !Ref PreferredBackupWindow
+      PreferredMaintenanceWindow: !Ref PreferredMaintenanceWindow
+      StorageEncrypted: true
+      EnableCloudwatchLogsExports:
+        - postgresql
+      DeletionProtection: false
+      Tags:
+        - Key: Name
+          Value: !Ref AuroraClusterIdentifier
+        - Key: Project
+          Value: !Ref MigrationProjectName
+        - Key: Purpose
+          Value: Migration Target Database
+
+  # Aurora PostgreSQL Instance
+  AuroraInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${AuroraClusterIdentifier}-instance-1'
+      DBInstanceClass: !Ref AuroraInstanceClass
+      Engine: aurora-postgresql
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBParameterGroupName: !Ref AuroraInstanceParameterGroup
+      MonitoringInterval: !Ref MonitoringInterval
+      MonitoringRoleArn: !If
+        - IsEnhancedMonitoringEnabled
+        - !GetAtt EnhancedMonitoringRole.Arn
+        - !Ref 'AWS::NoValue'
+      PerformanceInsightsEnabled: !Ref EnablePerformanceInsights
+      PerformanceInsightsRetentionPeriod: !If
+        - IsPerformanceInsightsEnabled
+        - 7
+        - !Ref 'AWS::NoValue'
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AuroraClusterIdentifier}-instance-1'
+        - Key: Project
+          Value: !Ref MigrationProjectName
+        - Key: Purpose
+          Value: Migration Target Database
+
+  # DMS Subnet Group
+  DMSSubnetGroup:
+    Type: AWS::DMS::ReplicationSubnetGroup
+    Properties:
+      ReplicationSubnetGroupIdentifier: !Sub '${DMSReplicationInstanceId}-subnet-group'
+      ReplicationSubnetGroupDescription: Subnet group for DMS replication instance
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${DMSReplicationInstanceId}-subnet-group'
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  # DMS Replication Instance
+  DMSReplicationInstance:
+    Type: AWS::DMS::ReplicationInstance
+    Properties:
+      ReplicationInstanceIdentifier: !Ref DMSReplicationInstanceId
+      ReplicationInstanceClass: !Ref DMSReplicationInstanceClass
+      AllocatedStorage: !Ref AllocatedStorage
+      AutoMinorVersionUpgrade: true
+      MultiAZ: !Ref EnableMultiAZ
+      EngineVersion: !Ref DMSEngineVersion
+      ReplicationSubnetGroupIdentifier: !Ref DMSSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DMSSecurityGroup
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: !Ref DMSReplicationInstanceId
+        - Key: Project
+          Value: !Ref MigrationProjectName
+        - Key: Purpose
+          Value: Database Migration Service
+
+  # DMS Oracle Source Endpoint
+  DMSOracleSourceEndpoint:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointIdentifier: !Sub '${MigrationProjectName}-oracle-source'
+      EndpointType: source
+      EngineName: oracle
+      ServerName: !Ref OracleServerName
+      Port: !Ref OraclePort
+      DatabaseName: !Ref OracleDatabaseName
+      Username: !Ref OracleUsername
+      Password: !Ref OraclePassword
+      OracleSettings:
+        SecurityDbEncryption: NONE
+        CharLengthSemantics: default
+        DirectPathNoLog: false
+        DirectPathParallelLoad: false
+        EnableHomogenousTablespace: true
+        FailTasksOnLobTruncation: true
+        NumberDatatypeScale: 0
+        ReadAheadBlocks: 10000
+        ReadTableSpaceName: false
+        ReplacePathPrefix: false
+        RetryInterval: 5
+        UseAlternateFolderForOnline: false
+        UsePathPrefix: ''
+      Tags:
+        - Key: Name
+          Value: !Sub '${MigrationProjectName}-oracle-source'
+        - Key: Project
+          Value: !Ref MigrationProjectName
+        - Key: Purpose
+          Value: Oracle Source Database Endpoint
+
+  # DMS PostgreSQL Target Endpoint
+  DMSPostgreSQLTargetEndpoint:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointIdentifier: !Sub '${MigrationProjectName}-postgresql-target'
+      EndpointType: target
+      EngineName: postgres
+      ServerName: !GetAtt AuroraCluster.Endpoint.Address
+      Port: !GetAtt AuroraCluster.Endpoint.Port
+      DatabaseName: postgres
+      Username: !Ref DatabaseMasterUsername
+      Password: !Ref DatabaseMasterPassword
+      PostgreSqlSettings:
+        HeartbeatEnable: true
+        HeartbeatSchema: replication
+        HeartbeatFrequency: 5
+        CaptureDdls: true
+        MaxFileSize: 512
+        DatabaseMode: default
+        DdlArtifactsSchema: public
+        ExecuteTimeout: 60
+        FailTasksOnLobTruncation: true
+        MapBooleanAsBoolean: false
+        MapJsonbAsClob: false
+        MapLongVarcharAs: wstring
+        BatchApplyEnabled: false
+        BatchApplyPreserveTransaction: true
+        BatchApplyTimeoutMax: 30
+        BatchApplyTimeoutMin: 1
+        BatchSplitSize: 0
+      Tags:
+        - Key: Name
+          Value: !Sub '${MigrationProjectName}-postgresql-target'
+        - Key: Project
+          Value: !Ref MigrationProjectName
+        - Key: Purpose
+          Value: PostgreSQL Target Database Endpoint
+
+  # CloudWatch Log Group for DMS
+  DMSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/dms/${MigrationProjectName}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${MigrationProjectName}-dms-logs'
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  # SNS Topic for DMS Alerts
+  DMSAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${MigrationProjectName}-dms-alerts'
+      DisplayName: DMS Migration Alerts
+      Tags:
+        - Key: Name
+          Value: !Sub '${MigrationProjectName}-dms-alerts'
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  # CloudWatch Alarms for Monitoring
+  ReplicationLagAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${MigrationProjectName}-replication-lag'
+      AlarmDescription: Monitor DMS replication lag
+      MetricName: ReplicationLag
+      Namespace: AWS/DMS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 300
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref DMSAlertsTopic
+      Dimensions:
+        - Name: ReplicationInstanceIdentifier
+          Value: !Ref DMSReplicationInstance
+      Tags:
+        - Key: Name
+          Value: !Sub '${MigrationProjectName}-replication-lag'
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  TaskFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${MigrationProjectName}-task-failure'
+      AlarmDescription: Monitor DMS task failures
+      MetricName: ReplicationTaskFailure
+      Namespace: AWS/DMS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref DMSAlertsTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${MigrationProjectName}-task-failure'
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+Outputs:
+  # VPC and Network Information
+  VPCId:
+    Description: VPC ID for the migration environment
+    Value: !Ref MigrationVPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPC-ID'
+
+  PrivateSubnet1Id:
+    Description: Private Subnet 1 ID
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet1-ID'
+
+  PrivateSubnet2Id:
+    Description: Private Subnet 2 ID
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet2-ID'
+
+  # Aurora PostgreSQL Information
+  AuroraClusterEndpoint:
+    Description: Aurora PostgreSQL cluster endpoint
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-Aurora-Endpoint'
+
+  AuroraClusterPort:
+    Description: Aurora PostgreSQL cluster port
+    Value: !GetAtt AuroraCluster.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-Aurora-Port'
+
+  AuroraClusterIdentifier:
+    Description: Aurora PostgreSQL cluster identifier
+    Value: !Ref AuroraCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-Aurora-Cluster-ID'
+
+  AuroraInstanceIdentifier:
+    Description: Aurora PostgreSQL instance identifier
+    Value: !Ref AuroraInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-Aurora-Instance-ID'
+
+  # DMS Information
+  DMSReplicationInstanceIdentifier:
+    Description: DMS replication instance identifier
+    Value: !Ref DMSReplicationInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-DMS-Instance-ID'
+
+  DMSReplicationInstanceArn:
+    Description: DMS replication instance ARN
+    Value: !Sub 'arn:aws:dms:${AWS::Region}:${AWS::AccountId}:rep:${DMSReplicationInstance}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DMS-Instance-ARN'
+
+  DMSOracleSourceEndpointArn:
+    Description: DMS Oracle source endpoint ARN
+    Value: !Ref DMSOracleSourceEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-Oracle-Endpoint-ARN'
+
+  DMSPostgreSQLTargetEndpointArn:
+    Description: DMS PostgreSQL target endpoint ARN
+    Value: !Ref DMSPostgreSQLTargetEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-PostgreSQL-Endpoint-ARN'
+
+  # Security Groups
+  AuroraSecurityGroupId:
+    Description: Security Group ID for Aurora PostgreSQL
+    Value: !Ref AuroraSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-Aurora-SG-ID'
+
+  DMSSecurityGroupId:
+    Description: Security Group ID for DMS replication instance
+    Value: !Ref DMSSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-DMS-SG-ID'
+
+  # Monitoring and Alerting
+  SNSTopicArn:
+    Description: SNS Topic ARN for DMS alerts
+    Value: !Ref DMSAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNS-Topic-ARN'
+
+  CloudWatchLogGroup:
+    Description: CloudWatch Log Group for DMS logs
+    Value: !Ref DMSLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatch-LogGroup'
+
+  # Connection Information
+  PostgreSQLConnectionString:
+    Description: PostgreSQL connection string for applications
+    Value: !Sub 'postgresql://${DatabaseMasterUsername}:${DatabaseMasterPassword}@${AuroraCluster.Endpoint.Address}:${AuroraCluster.Endpoint.Port}/postgres'
+    Export:
+      Name: !Sub '${AWS::StackName}-PostgreSQL-ConnectionString'
+
+  # Next Steps Information
+  NextStepsDocumentation:
+    Description: Next steps for completing the migration
+    Value: |
+      1. Test connectivity to Oracle source database from DMS
+      2. Create DMS migration task using the provided endpoints
+      3. Run AWS Schema Conversion Tool (SCT) for schema conversion
+      4. Apply converted schema objects to PostgreSQL target
+      5. Start migration task and monitor progress
+      6. Perform post-migration validation and testing
+    Export:
+      Name: !Sub '${AWS::StackName}-NextSteps'

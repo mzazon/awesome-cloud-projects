@@ -1,0 +1,1053 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Database Disaster Recovery with Read Replicas - Complete DR infrastructure with automated failover capabilities'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Database Configuration"
+        Parameters:
+          - DBInstanceClass
+          - DBAllocatedStorage
+          - DBMasterUsername
+          - DBPassword
+          - DBBackupRetentionPeriod
+          - DBMaintenanceWindow
+          - DBBackupWindow
+      - Label:
+          default: "Disaster Recovery Configuration"
+        Parameters:
+          - DRRegion
+          - ReplicaInstanceClass
+          - EnableDeletionProtection
+          - EnablePerformanceInsights
+      - Label:
+          default: "Monitoring and Alerting"
+        Parameters:
+          - NotificationEmail
+          - AlarmEvaluationPeriods
+          - ReplicaLagThreshold
+          - CPUThreshold
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VPCId
+          - DBSubnetIds
+          - CreateNewDBSubnetGroup
+      - Label:
+          default: "Tagging"
+        Parameters:
+          - Environment
+          - ProjectName
+          - CostCenter
+    ParameterLabels:
+      DBInstanceClass:
+        default: "Primary DB Instance Class"
+      ReplicaInstanceClass:
+        default: "DR Replica Instance Class"
+      DRRegion:
+        default: "Disaster Recovery Region"
+
+Parameters:
+  # Database Configuration
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+      - db.t3.large
+      - db.t3.xlarge
+      - db.t3.2xlarge
+      - db.r5.large
+      - db.r5.xlarge
+      - db.r5.2xlarge
+      - db.r5.4xlarge
+    Description: "Primary database instance class for production workloads"
+
+  ReplicaInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+      - db.t3.large
+      - db.t3.xlarge
+      - db.t3.2xlarge
+      - db.r5.large
+      - db.r5.xlarge
+      - db.r5.2xlarge
+      - db.r5.4xlarge
+    Description: "DR replica instance class (can be different from primary)"
+
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 65536
+    Description: "Allocated storage for the database in GB (20-65536)"
+
+  DBMasterUsername:
+    Type: String
+    Default: admin
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9]*$'
+    Description: "Master username for the database (must start with a letter)"
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 128
+    AllowedPattern: '^[a-zA-Z0-9!@#$%^&*()_+={}|:<>?`~;,./-]*$'
+    Description: "Master password (8-128 chars, exclude quotes, backslash, forward slash)"
+    ConstraintDescription: "Must be 8-128 characters and cannot contain quotes, backslash, or forward slash"
+
+  DBBackupRetentionPeriod:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 35
+    Description: "Number of days to retain automated backups (1-35)"
+
+  DBMaintenanceWindow:
+    Type: String
+    Default: "sun:03:00-sun:04:00"
+    AllowedPattern: '^(mon|tue|wed|thu|fri|sat|sun):[0-2][0-9]:[0-5][0-9]-(mon|tue|wed|thu|fri|sat|sun):[0-2][0-9]:[0-5][0-9]$'
+    Description: "Preferred maintenance window (format: day:hh24:mi-day:hh24:mi)"
+
+  DBBackupWindow:
+    Type: String
+    Default: "02:00-03:00"
+    AllowedPattern: '^[0-2][0-9]:[0-5][0-9]-[0-2][0-9]:[0-5][0-9]$'
+    Description: "Preferred backup window (format: hh24:mi-hh24:mi)"
+
+  # Disaster Recovery Configuration
+  DRRegion:
+    Type: String
+    Default: us-west-2
+    AllowedValues:
+      - us-east-1
+      - us-west-1
+      - us-west-2
+      - eu-west-1
+      - eu-central-1
+      - ap-southeast-1
+      - ap-northeast-1
+    Description: "Target region for disaster recovery read replica"
+
+  EnableDeletionProtection:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: "Enable deletion protection for database instances"
+
+  EnablePerformanceInsights:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: "Enable Performance Insights for monitoring"
+
+  # Monitoring and Alerting
+  NotificationEmail:
+    Type: String
+    Default: admin@example.com
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    Description: "Email address for disaster recovery notifications"
+
+  AlarmEvaluationPeriods:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 5
+    Description: "Number of periods for alarm evaluation"
+
+  ReplicaLagThreshold:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 3600
+    Description: "Replica lag threshold in seconds (60-3600)"
+
+  CPUThreshold:
+    Type: Number
+    Default: 80
+    MinValue: 50
+    MaxValue: 95
+    Description: "CPU utilization threshold percentage (50-95)"
+
+  # Network Configuration
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: "VPC ID where the database will be deployed"
+
+  DBSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: "List of subnet IDs for the database subnet group (minimum 2 in different AZs)"
+
+  CreateNewDBSubnetGroup:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: "Create new DB subnet group or use existing default"
+
+  # Tagging
+  Environment:
+    Type: String
+    Default: Production
+    AllowedValues: [Development, Testing, Staging, Production]
+    Description: "Environment type for resource tagging"
+
+  ProjectName:
+    Type: String
+    Default: DisasterRecovery
+    MinLength: 1
+    MaxLength: 50
+    Description: "Project name for resource tagging"
+
+  CostCenter:
+    Type: String
+    Default: IT-Operations
+    MinLength: 1
+    MaxLength: 50
+    Description: "Cost center for billing allocation"
+
+Conditions:
+  # Condition to check if we should create a new DB subnet group
+  CreateDBSubnetGroup: !Equals [!Ref CreateNewDBSubnetGroup, 'true']
+  
+  # Condition to enable Performance Insights
+  EnablePerfInsights: !Equals [!Ref EnablePerformanceInsights, 'true']
+  
+  # Condition to enable deletion protection
+  EnableDelProtection: !Equals [!Ref EnableDeletionProtection, 'true']
+
+Resources:
+  # Enhanced Monitoring Role for RDS
+  RDSEnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-rds-monitoring-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: 'AllowRDSMonitoring'
+            Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rds-monitoring-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Lambda Execution Role for DR Coordinator
+  DRCoordinatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-dr-coordinator-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DRCoordinatorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:PromoteReadReplica
+                  - rds:ModifyDBInstance
+                Resource: !Sub 'arn:aws:rds:*:${AWS::AccountId}:db:*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: 
+                  - !Ref PrimarySNSTopic
+                  - !Sub 'arn:aws:sns:${DRRegion}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:GetParameter
+                Resource: !Sub 'arn:aws:ssm:*:${AWS::AccountId}:parameter/disaster-recovery/*'
+              - Effect: Allow
+                Action:
+                  - route53:ChangeResourceRecordSets
+                  - route53:GetHealthCheck
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:*:${AWS::AccountId}:*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dr-coordinator-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Custom DB Parameter Group for Replication Optimization
+  MySQLParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      DBParameterGroupName: !Sub '${ProjectName}-mysql-replication-optimized'
+      Description: 'Optimized parameters for cross-region replication performance'
+      Family: mysql8.0
+      Parameters:
+        innodb_flush_log_at_trx_commit: '2'
+        sync_binlog: '0'
+        binlog_format: 'ROW'
+        read_only: '0'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-mysql-replication-optimized'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # DB Subnet Group
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Condition: CreateDBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${ProjectName}-db-subnet-group'
+      DBSubnetGroupDescription: 'Subnet group for disaster recovery database'
+      SubnetIds: !Ref DBSubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db-subnet-group'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Primary Database Instance
+  PrimaryDatabase:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-primary-db'
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: mysql
+      EngineVersion: '8.0.35'
+      MasterUsername: !Ref DBMasterUsername
+      MasterUserPassword: !Ref DBPassword
+      AllocatedStorage: !Ref DBAllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true
+      KmsKeyId: alias/aws/rds
+      BackupRetentionPeriod: !Ref DBBackupRetentionPeriod
+      PreferredBackupWindow: !Ref DBBackupWindow
+      PreferredMaintenanceWindow: !Ref DBMaintenanceWindow
+      DBSubnetGroupName: !If [CreateDBSubnetGroup, !Ref DBSubnetGroup, !Ref 'AWS::NoValue']
+      DBParameterGroupName: !Ref MySQLParameterGroup
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt RDSEnhancedMonitoringRole.Arn
+      EnablePerformanceInsights: !If [EnablePerfInsights, true, !Ref 'AWS::NoValue']
+      PerformanceInsightsRetentionPeriod: !If [EnablePerfInsights, 7, !Ref 'AWS::NoValue']
+      DeletionProtection: !If [EnableDelProtection, true, false]
+      CopyTagsToSnapshot: true
+      EnableCloudwatchLogsExports:
+        - error
+        - general
+        - slow-query
+      AssociatedRoles:
+        - RoleArn: !GetAtt RDSEnhancedMonitoringRole.Arn
+          FeatureName: s3Import
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-primary-db'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: DisasterRecovery
+        - Key: Role
+          Value: Primary
+
+  # Database Security Group
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-database-sg'
+      GroupDescription: 'Security group for disaster recovery database instances'
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 10.0.0.0/8
+          Description: 'MySQL access from private networks'
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 172.16.0.0/12
+          Description: 'MySQL access from RFC 1918 networks'
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 192.168.0.0/16
+          Description: 'MySQL access from RFC 1918 networks'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'Allow all outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-database-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # S3 Bucket for DR Configuration and Logs
+  DRConfigBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-dr-config-bucket-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Sub '/aws/s3/${ProjectName}-dr-config-bucket'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dr-config-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # SNS Topic for Primary Region Alerts
+  PrimarySNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-dr-primary-alerts'
+      DisplayName: 'Disaster Recovery Primary Region Alerts'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dr-primary-alerts'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # SNS Topic Policy
+  PrimarySNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref PrimarySNSTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudWatchAlarmsToPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref PrimarySNSTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+
+  # Email Subscription to SNS Topic
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref PrimarySNSTopic
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Alarm for Database Connection Failures
+  DatabaseConnectionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${PrimaryDatabase}-database-connection-failure'
+      AlarmDescription: 'Alarm when primary database connection fails'
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: 0
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref PrimarySNSTopic
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref PrimaryDatabase
+      Tags:
+        - Key: Name
+          Value: !Sub '${PrimaryDatabase}-database-connection-failure'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # CloudWatch Alarm for High CPU Utilization
+  DatabaseCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${PrimaryDatabase}-cpu-utilization-high'
+      AlarmDescription: !Sub 'Alarm when CPU exceeds ${CPUThreshold}%'
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref CPUThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref PrimarySNSTopic
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref PrimaryDatabase
+      Tags:
+        - Key: Name
+          Value: !Sub '${PrimaryDatabase}-cpu-utilization-high'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Lambda Function for DR Coordination
+  DRCoordinatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-dr-coordinator'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt DRCoordinatorRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          DR_REGION: !Ref DRRegion
+          DR_SNS_TOPIC: !Sub 'arn:aws:sns:${DRRegion}:${AWS::AccountId}:${ProjectName}-dr-failover-alerts'
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          import logging
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              """
+              Disaster Recovery Coordinator Lambda Function
+              Handles primary database failure detection and initiates failover
+              """
+              
+              # Initialize AWS clients
+              dr_region = os.environ['DR_REGION']
+              project_name = os.environ['PROJECT_NAME']
+              
+              rds = boto3.client('rds', region_name=dr_region)
+              sns = boto3.client('sns', region_name=dr_region)
+              ssm = boto3.client('ssm', region_name=dr_region)
+              
+              try:
+                  logger.info(f"Processing DR coordinator event: {json.dumps(event)}")
+                  
+                  # Parse CloudWatch alarm from SNS message
+                  sns_message = json.loads(event['Records'][0]['Sns']['Message'])
+                  alarm_name = sns_message['AlarmName']
+                  alarm_state = sns_message['NewStateValue']
+                  
+                  logger.info(f"Processing alarm: {alarm_name}, State: {alarm_state}")
+                  
+                  # Check if this is a database connection failure alarm in ALARM state
+                  if 'database-connection-failure' in alarm_name and alarm_state == 'ALARM':
+                      # Extract DB instance ID and construct replica ID
+                      db_instance_id = alarm_name.replace('-database-connection-failure', '')
+                      replica_id = f"{project_name}-dr-replica"
+                      
+                      logger.info(f"Initiating disaster recovery for {db_instance_id}, replica: {replica_id}")
+                      
+                      # Check replica status before promotion
+                      try:
+                          replica_response = rds.describe_db_instances(
+                              DBInstanceIdentifier=replica_id
+                          )
+                          replica_status = replica_response['DBInstances'][0]['DBInstanceStatus']
+                          
+                          if replica_status == 'available':
+                              logger.info(f"Promoting read replica {replica_id} to standalone instance")
+                              
+                              # Promote read replica
+                              rds.promote_read_replica(
+                                  DBInstanceIdentifier=replica_id
+                              )
+                              
+                              # Update parameter store with failover status
+                              ssm.put_parameter(
+                                  Name='/disaster-recovery/failover-status',
+                                  Value=json.dumps({
+                                      'status': 'in-progress',
+                                      'timestamp': datetime.utcnow().isoformat(),
+                                      'replica_id': replica_id,
+                                      'original_primary': db_instance_id
+                                  }),
+                                  Type='String',
+                                  Overwrite=True
+                              )
+                              
+                              # Send success notification
+                              dr_sns_topic = os.environ['DR_SNS_TOPIC']
+                              sns.publish(
+                                  TopicArn=dr_sns_topic,
+                                  Subject='Disaster Recovery Initiated',
+                                  Message=f'''Disaster Recovery Process Initiated
+                                  
+          Primary Database: {db_instance_id}
+          Read Replica: {replica_id}
+          Action: Promotion started
+          Timestamp: {datetime.utcnow().isoformat()}
+          
+          The read replica promotion is in progress. Monitor the DR region for completion.
+          
+          Next Steps:
+          1. Verify promotion completion
+          2. Update application connection strings
+          3. Test application functionality
+          4. Update DNS records if needed
+                                  '''
+                              )
+                              
+                              logger.info(f"DR procedure initiated for {replica_id}")
+                              return {
+                                  'statusCode': 200,
+                                  'body': json.dumps({
+                                      'message': f'DR procedure initiated for {replica_id}',
+                                      'replica_id': replica_id,
+                                      'status': 'promotion-started'
+                                  })
+                              }
+                          else:
+                              logger.warning(f"Replica {replica_id} is not available for promotion: {replica_status}")
+                              sns.publish(
+                                  TopicArn=os.environ['DR_SNS_TOPIC'],
+                                  Subject='Disaster Recovery Failed - Replica Not Ready',
+                                  Message=f'Replica {replica_id} is not available for promotion. Current status: {replica_status}'
+                              )
+                              return {
+                                  'statusCode': 400,
+                                  'body': json.dumps(f'Replica not ready for promotion: {replica_status}')
+                              }
+                      
+                      except rds.exceptions.DBInstanceNotFoundFault:
+                          logger.error(f"Read replica {replica_id} not found")
+                          sns.publish(
+                              TopicArn=os.environ['DR_SNS_TOPIC'],
+                              Subject='Disaster Recovery Failed - Replica Not Found',
+                              Message=f'Read replica {replica_id} not found in DR region {dr_region}'
+                          )
+                          return {
+                              'statusCode': 404,
+                              'body': json.dumps(f'Read replica {replica_id} not found')
+                          }
+                  
+                  elif alarm_state == 'OK':
+                      logger.info(f"Alarm {alarm_name} returned to OK state - no action needed")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps('Alarm returned to OK state - no action needed')
+                      }
+                  
+                  else:
+                      logger.info(f"Alarm {alarm_name} is not a disaster recovery trigger")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps('Not a disaster recovery trigger alarm')
+                      }
+              
+              except Exception as e:
+                  logger.error(f"Error in DR coordinator: {str(e)}")
+                  try:
+                      sns.publish(
+                          TopicArn=os.environ['DR_SNS_TOPIC'],
+                          Subject='Disaster Recovery Error',
+                          Message=f'''Error in Disaster Recovery Coordinator
+                          
+          Error: {str(e)}
+          Event: {json.dumps(event)}
+          Timestamp: {datetime.utcnow().isoformat()}
+          
+          Manual intervention may be required.
+                          '''
+                      )
+                  except:
+                      logger.error("Failed to send error notification")
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dr-coordinator'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Lambda Permission for SNS to invoke the function
+  DRCoordinatorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DRCoordinatorFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref PrimarySNSTopic
+
+  # SNS Subscription for Lambda
+  LambdaSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref PrimarySNSTopic
+      Endpoint: !GetAtt DRCoordinatorFunction.Arn
+
+  # Route 53 Health Check for Primary Database
+  PrimaryHealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Properties:
+      Type: CLOUDWATCH_METRIC
+      CloudWatchAlarmRegion: !Ref AWS::Region
+      CloudWatchAlarmName: !Ref DatabaseConnectionAlarm
+      InsufficientDataHealthStatus: Failure
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-primary-db-health'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Systems Manager Parameters for DR Configuration
+  DRConfigParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/disaster-recovery/configuration'
+      Type: String
+      Value: !Sub |
+        {
+          "primary_region": "${AWS::Region}",
+          "dr_region": "${DRRegion}",
+          "primary_db_instance": "${PrimaryDatabase}",
+          "replica_instance_prefix": "${ProjectName}-dr-replica",
+          "sns_primary_topic": "${PrimarySNSTopic}",
+          "project_name": "${ProjectName}",
+          "environment": "${Environment}",
+          "created_date": "${AWS::Timestamp}"
+        }
+      Description: 'Disaster recovery configuration parameters'
+      Tags:
+        Name: !Sub '${ProjectName}-dr-configuration'
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        CostCenter: !Ref CostCenter
+
+  # Custom Resource for DR Runbook Creation
+  DRRunbookCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt DRRunbookCreatorFunction.Arn
+      BucketName: !Ref DRConfigBucket
+      Configuration:
+        primary_region: !Ref AWS::Region
+        dr_region: !Ref DRRegion
+        primary_db: !Ref PrimaryDatabase
+        project_name: !Ref ProjectName
+        sns_primary: !Ref PrimarySNSTopic
+
+  # Lambda Function for Creating DR Runbook
+  DRRunbookCreatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-dr-runbook-creator'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt DRRunbookCreatorRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              try:
+                  s3 = boto3.client('s3')
+                  
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      bucket_name = event['ResourceProperties']['BucketName']
+                      config = event['ResourceProperties']['Configuration']
+                      
+                      # Create DR runbook
+                      runbook = {
+                          "disaster_recovery_runbook": {
+                              "version": "1.0",
+                              "created_date": datetime.utcnow().isoformat(),
+                              "primary_region": config['primary_region'],
+                              "dr_region": config['dr_region'],
+                              "resources": {
+                                  "primary_db": config['primary_db'],
+                                  "replica_db": f"{config['project_name']}-dr-replica",
+                                  "sns_primary": config['sns_primary'],
+                                  "sns_dr": f"arn:aws:sns:{config['dr_region']}:{context.invoked_function_arn.split(':')[4]}:{config['project_name']}-dr-failover-alerts",
+                                  "lambda_coordinator": f"{config['project_name']}-dr-coordinator"
+                              },
+                              "manual_failover_steps": [
+                                  "1. Verify primary database is truly unavailable",
+                                  "2. Check replica lag is minimal (< 5 minutes)",
+                                  f"3. Promote replica using: aws rds promote-read-replica --db-instance-identifier {config['project_name']}-dr-replica --region {config['dr_region']}",
+                                  "4. Wait for promotion to complete (monitor RDS console)",
+                                  "5. Update application connection strings to new endpoint",
+                                  "6. Verify application functionality",
+                                  "7. Update DNS records if needed",
+                                  "8. Notify stakeholders of failover completion"
+                              ],
+                              "rollback_steps": [
+                                  "1. Create new read replica from promoted instance",
+                                  "2. Switch applications back to original region",
+                                  "3. Verify data consistency between regions",
+                                  "4. Clean up temporary resources",
+                                  "5. Update monitoring and alerting"
+                              ],
+                              "contact_information": {
+                                  "primary_contact": "Database Administrator",
+                                  "escalation_contact": "IT Operations Manager",
+                                  "emergency_contact": "On-call Engineer"
+                              }
+                          }
+                      }
+                      
+                      # Upload runbook to S3
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key='dr-runbook.json',
+                          Body=json.dumps(runbook, indent=2),
+                          ContentType='application/json',
+                          ServerSideEncryption='AES256'
+                      )
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'RunbookLocation': f's3://{bucket_name}/dr-runbook.json'})
+                  
+                  elif event['RequestType'] == 'Delete':
+                      # Optionally clean up runbook on stack deletion
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  # IAM Role for DR Runbook Creator Lambda
+  DRRunbookCreatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub '${DRConfigBucket}/*'
+
+Outputs:
+  # Database Information
+  PrimaryDatabaseIdentifier:
+    Description: 'Primary database instance identifier'
+    Value: !Ref PrimaryDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryDatabaseId'
+
+  PrimaryDatabaseEndpoint:
+    Description: 'Primary database endpoint'
+    Value: !GetAtt PrimaryDatabase.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryDatabaseEndpoint'
+
+  PrimaryDatabasePort:
+    Description: 'Primary database port'
+    Value: !GetAtt PrimaryDatabase.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryDatabasePort'
+
+  # DR Configuration
+  DRRegion:
+    Description: 'Disaster recovery target region'
+    Value: !Ref DRRegion
+    Export:
+      Name: !Sub '${AWS::StackName}-DRRegion'
+
+  ReplicaInstanceIdentifier:
+    Description: 'Expected read replica instance identifier in DR region'
+    Value: !Sub '${ProjectName}-dr-replica'
+    Export:
+      Name: !Sub '${AWS::StackName}-ReplicaInstanceId'
+
+  # Monitoring and Alerting
+  PrimarySNSTopicArn:
+    Description: 'SNS topic ARN for primary region alerts'
+    Value: !Ref PrimarySNSTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimarySNSTopic'
+
+  DRSNSTopicArn:
+    Description: 'Expected SNS topic ARN for DR region alerts'
+    Value: !Sub 'arn:aws:sns:${DRRegion}:${AWS::AccountId}:${ProjectName}-dr-failover-alerts'
+    Export:
+      Name: !Sub '${AWS::StackName}-DRSNSTopic'
+
+  DatabaseConnectionAlarmName:
+    Description: 'CloudWatch alarm name for database connection monitoring'
+    Value: !Ref DatabaseConnectionAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseConnectionAlarm'
+
+  # Lambda Functions
+  DRCoordinatorFunctionArn:
+    Description: 'ARN of the disaster recovery coordinator Lambda function'
+    Value: !GetAtt DRCoordinatorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DRCoordinatorFunction'
+
+  # Route 53 Health Check
+  PrimaryHealthCheckId:
+    Description: 'Route 53 health check ID for primary database'
+    Value: !Ref PrimaryHealthCheck
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryHealthCheck'
+
+  # S3 Configuration
+  DRConfigBucketName:
+    Description: 'S3 bucket name for DR configuration storage'
+    Value: !Ref DRConfigBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DRConfigBucket'
+
+  DRRunbookLocation:
+    Description: 'S3 location of the disaster recovery runbook'
+    Value: !Sub 's3://${DRConfigBucket}/dr-runbook.json'
+    Export:
+      Name: !Sub '${AWS::StackName}-DRRunbookLocation'
+
+  # Security
+  DatabaseSecurityGroupId:
+    Description: 'Security group ID for database instances'
+    Value: !Ref DatabaseSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseSecurityGroup'
+
+  # IAM Roles
+  RDSMonitoringRoleArn:
+    Description: 'ARN of the RDS enhanced monitoring role'
+    Value: !GetAtt RDSEnhancedMonitoringRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RDSMonitoringRole'
+
+  DRCoordinatorRoleArn:
+    Description: 'ARN of the disaster recovery coordinator role'
+    Value: !GetAtt DRCoordinatorRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DRCoordinatorRole'
+
+  # Next Steps
+  NextSteps:
+    Description: 'Instructions for completing the disaster recovery setup'
+    Value: !Sub |
+      1. Deploy this stack in the primary region (${AWS::Region})
+      2. Create cross-region read replica in ${DRRegion} using the exported outputs
+      3. Create DR region SNS topic: ${ProjectName}-dr-failover-alerts
+      4. Deploy replica promoter Lambda function in ${DRRegion}
+      5. Configure EventBridge rule for RDS promotion events in ${DRRegion}
+      6. Test the complete disaster recovery workflow
+      7. Download DR runbook from: s3://${DRConfigBucket}/dr-runbook.json

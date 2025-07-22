@@ -1,0 +1,800 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Serverless Web Application with AWS Amplify, Lambda, API Gateway, Cognito, and DynamoDB'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Application Configuration"
+        Parameters:
+          - ApplicationName
+          - Environment
+          - GitHubRepository
+          - GitHubBranch
+          - GitHubToken
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - CorsOrigin
+          - ApiThrottleBurstLimit
+          - ApiThrottleRateLimit
+      - Label:
+          default: "Resource Configuration"
+        Parameters:
+          - DynamoDBBillingMode
+          - LambdaMemorySize
+          - LambdaTimeout
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: 'serverless-web-app'
+    Description: 'Name of the application (used for resource naming)'
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+    MaxLength: 50
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: 'Deployment environment'
+
+  GitHubRepository:
+    Type: String
+    Description: 'GitHub repository URL for Amplify hosting (optional)'
+    Default: ''
+
+  GitHubBranch:
+    Type: String
+    Default: 'main'
+    Description: 'GitHub branch for deployment'
+
+  GitHubToken:
+    Type: String
+    NoEcho: true
+    Description: 'GitHub personal access token for Amplify (optional)'
+    Default: ''
+
+  CorsOrigin:
+    Type: String
+    Default: '*'
+    Description: 'CORS origin for API Gateway'
+
+  ApiThrottleBurstLimit:
+    Type: Number
+    Default: 100
+    MinValue: 0
+    MaxValue: 5000
+    Description: 'API Gateway throttle burst limit'
+
+  ApiThrottleRateLimit:
+    Type: Number
+    Default: 50
+    MinValue: 0
+    MaxValue: 10000
+    Description: 'API Gateway throttle rate limit'
+
+  DynamoDBBillingMode:
+    Type: String
+    Default: 'PAY_PER_REQUEST'
+    AllowedValues:
+      - PAY_PER_REQUEST
+      - PROVISIONED
+    Description: 'DynamoDB billing mode'
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 10240
+    Description: 'Lambda function memory size in MB'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    Description: 'Lambda function timeout in seconds'
+
+Conditions:
+  HasGitHubIntegration: !And
+    - !Not [!Equals [!Ref GitHubRepository, '']]
+    - !Not [!Equals [!Ref GitHubToken, '']]
+  
+  IsProductionEnvironment: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # DynamoDB Table for Todo Items
+  TodoTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ApplicationName}-${Environment}-todos'
+      BillingMode: !Ref DynamoDBBillingMode
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProductionEnvironment, true, false]
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Todo data storage'
+
+  # IAM Role for Lambda Function
+  TodoLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-${Environment}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                Resource: !GetAtt TodoTable.Arn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:DescribeLogGroups
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+  # Lambda Function for Todo API
+  TodoLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ApplicationName}-${Environment}-todo-api'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt TodoLambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TodoTable
+          CORS_ORIGIN: !Ref CorsOrigin
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          
+          exports.handler = async (event) => {
+              console.log('Event:', JSON.stringify(event, null, 2));
+              
+              const { httpMethod, path, body, pathParameters } = event;
+              const tableName = process.env.TABLE_NAME;
+              const corsOrigin = process.env.CORS_ORIGIN;
+              
+              const corsHeaders = {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': corsOrigin,
+                  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                  'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+              };
+              
+              try {
+                  // Handle CORS preflight requests
+                  if (httpMethod === 'OPTIONS') {
+                      return {
+                          statusCode: 200,
+                          headers: corsHeaders
+                      };
+                  }
+                  
+                  switch (httpMethod) {
+                      case 'GET':
+                          return await getTodos(tableName, corsHeaders);
+                      case 'POST':
+                          return await createTodo(tableName, JSON.parse(body || '{}'), corsHeaders);
+                      case 'PUT':
+                          return await updateTodo(tableName, pathParameters?.id, JSON.parse(body || '{}'), corsHeaders);
+                      case 'DELETE':
+                          return await deleteTodo(tableName, pathParameters?.id, corsHeaders);
+                      default:
+                          return {
+                              statusCode: 405,
+                              headers: corsHeaders,
+                              body: JSON.stringify({ error: 'Method not allowed' })
+                          };
+                  }
+              } catch (error) {
+                  console.error('Error:', error);
+                  return {
+                      statusCode: 500,
+                      headers: corsHeaders,
+                      body: JSON.stringify({ error: 'Internal server error', message: error.message })
+                  };
+              }
+          };
+          
+          async function getTodos(tableName, headers) {
+              const result = await dynamodb.scan({
+                  TableName: tableName
+              }).promise();
+              
+              return {
+                  statusCode: 200,
+                  headers,
+                  body: JSON.stringify(result.Items)
+              };
+          }
+          
+          async function createTodo(tableName, todo, headers) {
+              if (!todo.title) {
+                  return {
+                      statusCode: 400,
+                      headers,
+                      body: JSON.stringify({ error: 'Title is required' })
+                  };
+              }
+              
+              const item = {
+                  id: AWS.util.uuid.v4(),
+                  title: todo.title,
+                  completed: todo.completed || false,
+                  createdAt: new Date().toISOString(),
+                  updatedAt: new Date().toISOString()
+              };
+              
+              await dynamodb.put({
+                  TableName: tableName,
+                  Item: item
+              }).promise();
+              
+              return {
+                  statusCode: 201,
+                  headers,
+                  body: JSON.stringify(item)
+              };
+          }
+          
+          async function updateTodo(tableName, id, updates, headers) {
+              if (!id) {
+                  return {
+                      statusCode: 400,
+                      headers,
+                      body: JSON.stringify({ error: 'ID is required' })
+                  };
+              }
+              
+              const updateExpression = [];
+              const expressionAttributeNames = {};
+              const expressionAttributeValues = {};
+              
+              if (updates.title !== undefined) {
+                  updateExpression.push('#title = :title');
+                  expressionAttributeNames['#title'] = 'title';
+                  expressionAttributeValues[':title'] = updates.title;
+              }
+              
+              if (updates.completed !== undefined) {
+                  updateExpression.push('#completed = :completed');
+                  expressionAttributeNames['#completed'] = 'completed';
+                  expressionAttributeValues[':completed'] = updates.completed;
+              }
+              
+              updateExpression.push('#updatedAt = :updatedAt');
+              expressionAttributeNames['#updatedAt'] = 'updatedAt';
+              expressionAttributeValues[':updatedAt'] = new Date().toISOString();
+              
+              const result = await dynamodb.update({
+                  TableName: tableName,
+                  Key: { id },
+                  UpdateExpression: 'SET ' + updateExpression.join(', '),
+                  ExpressionAttributeNames: expressionAttributeNames,
+                  ExpressionAttributeValues: expressionAttributeValues,
+                  ReturnValues: 'ALL_NEW'
+              }).promise();
+              
+              return {
+                  statusCode: 200,
+                  headers,
+                  body: JSON.stringify(result.Attributes)
+              };
+          }
+          
+          async function deleteTodo(tableName, id, headers) {
+              if (!id) {
+                  return {
+                      statusCode: 400,
+                      headers,
+                      body: JSON.stringify({ error: 'ID is required' })
+                  };
+              }
+              
+              await dynamodb.delete({
+                  TableName: tableName,
+                  Key: { id }
+              }).promise();
+              
+              return {
+                  statusCode: 204,
+                  headers
+              };
+          }
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Todo API backend'
+
+  # Lambda Permission for API Gateway
+  TodoLambdaApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TodoLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub '${TodoRestApi}/*/*'
+
+  # API Gateway REST API
+  TodoRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ApplicationName}-${Environment}-api'
+      Description: 'REST API for Todo application'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: execute-api:Invoke
+            Resource: '*'
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # API Gateway Resource for /todos
+  TodosResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TodoRestApi
+      ParentId: !GetAtt TodoRestApi.RootResourceId
+      PathPart: todos
+
+  # API Gateway Resource for /todos/{id}
+  TodoIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TodoRestApi
+      ParentId: !Ref TodosResource
+      PathPart: '{id}'
+
+  # API Gateway Methods
+  TodosGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TodoRestApi
+      ResourceId: !Ref TodosResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TodoLambdaFunction.Arn}/invocations'
+
+  TodosPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TodoRestApi
+      ResourceId: !Ref TodosResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TodoLambdaFunction.Arn}/invocations'
+
+  TodosOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TodoRestApi
+      ResourceId: !Ref TodosResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TodoLambdaFunction.Arn}/invocations'
+
+  TodoIdPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TodoRestApi
+      ResourceId: !Ref TodoIdResource
+      HttpMethod: PUT
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TodoLambdaFunction.Arn}/invocations'
+
+  TodoIdDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TodoRestApi
+      ResourceId: !Ref TodoIdResource
+      HttpMethod: DELETE
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TodoLambdaFunction.Arn}/invocations'
+
+  TodoIdOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TodoRestApi
+      ResourceId: !Ref TodoIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TodoLambdaFunction.Arn}/invocations'
+
+  # API Gateway Deployment
+  TodoApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - TodosGetMethod
+      - TodosPostMethod
+      - TodosOptionsMethod
+      - TodoIdPutMethod
+      - TodoIdDeleteMethod
+      - TodoIdOptionsMethod
+    Properties:
+      RestApiId: !Ref TodoRestApi
+      Description: !Sub 'Deployment for ${Environment} environment'
+
+  # API Gateway Stage
+  TodoApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref TodoRestApi
+      DeploymentId: !Ref TodoApiDeployment
+      StageName: !Ref Environment
+      ThrottleSettings:
+        BurstLimit: !Ref ApiThrottleBurstLimit
+        RateLimit: !Ref ApiThrottleRateLimit
+      MethodSettings:
+        - ResourcePath: '/*/*'
+          HttpMethod: '*'
+          LoggingLevel: INFO
+          DataTraceEnabled: true
+          MetricsEnabled: true
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Cognito User Pool
+  TodoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${ApplicationName}-${Environment}-users'
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      PasswordPolicy:
+        MinimumLength: 8
+        RequireUppercase: true
+        RequireLowercase: true
+        RequireNumbers: true
+        RequireSymbols: false
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+      UserPoolTags:
+        Application: !Ref ApplicationName
+        Environment: !Ref Environment
+        Purpose: 'User authentication'
+
+  # Cognito User Pool Client
+  TodoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${ApplicationName}-${Environment}-client'
+      UserPoolId: !Ref TodoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      SupportedIdentityProviders:
+        - COGNITO
+      CallbackURLs:
+        - http://localhost:3000
+        - !If
+          - HasGitHubIntegration
+          - !Sub 'https://${Environment}.${AmplifyApp.DefaultDomain}'
+          - 'https://localhost:3000'
+      LogoutURLs:
+        - http://localhost:3000
+        - !If
+          - HasGitHubIntegration
+          - !Sub 'https://${Environment}.${AmplifyApp.DefaultDomain}'
+          - 'https://localhost:3000'
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+      AllowedOAuthFlowsUserPoolClient: true
+
+  # Cognito Identity Pool
+  TodoIdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub '${ApplicationName}_${Environment}_identity'
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref TodoUserPoolClient
+          ProviderName: !GetAtt TodoUserPool.ProviderName
+
+  # IAM Role for Authenticated Users
+  AuthenticatedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-${Environment}-authenticated-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref TodoIdentityPool
+              'ForAnyValue:StringLike':
+                'cognito-identity.amazonaws.com:amr': authenticated
+      Policies:
+        - PolicyName: CognitoAuthenticatedPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - execute-api:Invoke
+                Resource: !Sub '${TodoRestApi}/*'
+
+  # IAM Role for Unauthenticated Users
+  UnauthenticatedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-${Environment}-unauthenticated-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref TodoIdentityPool
+              'ForAnyValue:StringLike':
+                'cognito-identity.amazonaws.com:amr': unauthenticated
+      Policies:
+        - PolicyName: CognitoUnauthenticatedPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Deny
+                Action: '*'
+                Resource: '*'
+
+  # Identity Pool Role Attachment
+  IdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref TodoIdentityPool
+      Roles:
+        authenticated: !GetAtt AuthenticatedRole.Arn
+        unauthenticated: !GetAtt UnauthenticatedRole.Arn
+
+  # Amplify App (conditional - only if GitHub integration is configured)
+  AmplifyApp:
+    Type: AWS::Amplify::App
+    Condition: HasGitHubIntegration
+    Properties:
+      Name: !Sub '${ApplicationName}-${Environment}'
+      Description: 'Serverless Todo Application'
+      Repository: !Ref GitHubRepository
+      AccessToken: !Ref GitHubToken
+      BuildSpec: |
+        version: 1
+        frontend:
+          phases:
+            preBuild:
+              commands:
+                - npm ci
+            build:
+              commands:
+                - npm run build
+          artifacts:
+            baseDirectory: build
+            files:
+              - '**/*'
+          cache:
+            paths:
+              - node_modules/**/*
+      EnvironmentVariables:
+        - Name: REACT_APP_USER_POOL_ID
+          Value: !Ref TodoUserPool
+        - Name: REACT_APP_USER_POOL_CLIENT_ID
+          Value: !Ref TodoUserPoolClient
+        - Name: REACT_APP_IDENTITY_POOL_ID
+          Value: !Ref TodoIdentityPool
+        - Name: REACT_APP_API_ENDPOINT
+          Value: !Sub 'https://${TodoRestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+        - Name: REACT_APP_REGION
+          Value: !Ref AWS::Region
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Amplify Branch
+  AmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Condition: HasGitHubIntegration
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      BranchName: !Ref GitHubBranch
+      EnableAutoBuild: true
+      EnablePullRequestPreview: !If [IsProductionEnvironment, false, true]
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group for Lambda
+  TodoLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${TodoLambdaFunction}'
+      RetentionInDays: !If [IsProductionEnvironment, 30, 7]
+
+  # CloudWatch Log Group for API Gateway
+  TodoApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${TodoRestApi}'
+      RetentionInDays: !If [IsProductionEnvironment, 30, 7]
+
+Outputs:
+  # API Gateway Outputs
+  ApiEndpoint:
+    Description: 'API Gateway endpoint URL'
+    Value: !Sub 'https://${TodoRestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiEndpoint'
+
+  ApiId:
+    Description: 'API Gateway REST API ID'
+    Value: !Ref TodoRestApi
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiId'
+
+  # DynamoDB Outputs
+  TodoTableName:
+    Description: 'DynamoDB table name for todos'
+    Value: !Ref TodoTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TodoTableName'
+
+  TodoTableArn:
+    Description: 'DynamoDB table ARN'
+    Value: !GetAtt TodoTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TodoTableArn'
+
+  # Lambda Outputs
+  TodoLambdaFunctionName:
+    Description: 'Lambda function name'
+    Value: !Ref TodoLambdaFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  TodoLambdaFunctionArn:
+    Description: 'Lambda function ARN'
+    Value: !GetAtt TodoLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  # Cognito Outputs
+  UserPoolId:
+    Description: 'Cognito User Pool ID'
+    Value: !Ref TodoUserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolId'
+
+  UserPoolClientId:
+    Description: 'Cognito User Pool Client ID'
+    Value: !Ref TodoUserPoolClient
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolClientId'
+
+  IdentityPoolId:
+    Description: 'Cognito Identity Pool ID'
+    Value: !Ref TodoIdentityPool
+    Export:
+      Name: !Sub '${AWS::StackName}-IdentityPoolId'
+
+  # Amplify Outputs (conditional)
+  AmplifyAppId:
+    Condition: HasGitHubIntegration
+    Description: 'Amplify App ID'
+    Value: !GetAtt AmplifyApp.AppId
+    Export:
+      Name: !Sub '${AWS::StackName}-AmplifyAppId'
+
+  AmplifyAppUrl:
+    Condition: HasGitHubIntegration
+    Description: 'Amplify App URL'
+    Value: !Sub 'https://${Environment}.${AmplifyApp.DefaultDomain}'
+    Export:
+      Name: !Sub '${AWS::StackName}-AmplifyAppUrl'
+
+  # Configuration for Frontend
+  FrontendConfig:
+    Description: 'Frontend configuration (JSON format)'
+    Value: !Sub |
+      {
+        "region": "${AWS::Region}",
+        "userPoolId": "${TodoUserPool}",
+        "userPoolClientId": "${TodoUserPoolClient}",
+        "identityPoolId": "${TodoIdentityPool}",
+        "apiEndpoint": "https://${TodoRestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}",
+        "amplifyAppId": "${AmplifyApp}"
+      }
+    Export:
+      Name: !Sub '${AWS::StackName}-FrontendConfig'

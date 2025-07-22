@@ -1,0 +1,297 @@
+{
+  "Comment": "Order Processing Workflow with comprehensive error handling and retry logic",
+  "StartAt": "ProcessPayment",
+  "States": {
+    "ProcessPayment": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${payment_service_arn}",
+        "Payload.$": "$"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "PaymentFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "CheckPaymentStatus"
+    },
+    "CheckPaymentStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.Payload.body",
+          "StringMatches": "*SUCCESS*",
+          "Next": "ReserveInventory"
+        },
+        {
+          "Variable": "$.Payload.statusCode",
+          "NumericEquals": 200,
+          "Next": "ValidatePaymentResponse"
+        }
+      ],
+      "Default": "PaymentFailed"
+    },
+    "ValidatePaymentResponse": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${notification_service_arn}",
+        "Payload": {
+          "message": "Payment validation in progress",
+          "orderId.$": "$.detail.orderId",
+          "customerId.$": "$.detail.customerId",
+          "status": "PAYMENT_VALIDATING",
+          "type": "ORDER_UPDATE"
+        }
+      },
+      "Next": "ReserveInventory",
+      "ResultPath": "$.validationResult"
+    },
+    "ReserveInventory": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${inventory_service_arn}",
+        "Payload.$": "$"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "InventoryFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "CheckInventoryStatus"
+    },
+    "CheckInventoryStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.Payload.body",
+          "StringMatches": "*RESERVED*",
+          "Next": "OrderSuccessNotification"
+        },
+        {
+          "Variable": "$.Payload.statusCode",
+          "NumericEquals": 200,
+          "Next": "ValidateInventoryResponse"
+        }
+      ],
+      "Default": "InventoryFailed"
+    },
+    "ValidateInventoryResponse": {
+      "Type": "Pass",
+      "Parameters": {
+        "inventoryStatus.$": "$.Payload.body",
+        "originalInput.$": "$"
+      },
+      "Next": "OrderSuccessNotification"
+    },
+    "OrderSuccessNotification": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "SendCustomerSuccessNotification",
+          "States": {
+            "SendCustomerSuccessNotification": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${notification_service_arn}",
+                "Payload": {
+                  "message": "Order processed successfully! Your items have been reserved and payment confirmed.",
+                  "orderId.$": "$.detail.orderId",
+                  "customerId.$": "$.detail.customerId",
+                  "status": "COMPLETED",
+                  "type": "ORDER_COMPLETED",
+                  "notificationChannel": "CUSTOMER"
+                }
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "SendInternalSuccessNotification",
+          "States": {
+            "SendInternalSuccessNotification": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${notification_service_arn}",
+                "Payload": {
+                  "message": "Order workflow completed successfully",
+                  "orderId.$": "$.detail.orderId",
+                  "customerId.$": "$.detail.customerId",
+                  "status": "WORKFLOW_COMPLETED",
+                  "type": "INTERNAL_NOTIFICATION",
+                  "notificationChannel": "INTERNAL"
+                }
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "Next": "OrderCompleted"
+    },
+    "OrderCompleted": {
+      "Type": "Pass",
+      "Parameters": {
+        "result": "Order processing completed successfully",
+        "orderId.$": "$.detail.orderId",
+        "status": "COMPLETED",
+        "completedAt.$": "$$.State.EnteredTime"
+      },
+      "End": true
+    },
+    "PaymentFailed": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "SendPaymentFailureNotification",
+          "States": {
+            "SendPaymentFailureNotification": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${notification_service_arn}",
+                "Payload": {
+                  "message": "Payment processing failed. Please check your payment method and try again.",
+                  "orderId.$": "$.detail.orderId",
+                  "customerId.$": "$.detail.customerId",
+                  "status": "PAYMENT_FAILED",
+                  "type": "PAYMENT_FAILED",
+                  "errorDetails.$": "$.error",
+                  "notificationChannel": "CUSTOMER"
+                }
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "LogPaymentFailure",
+          "States": {
+            "LogPaymentFailure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${notification_service_arn}",
+                "Payload": {
+                  "message": "Payment processing workflow failed",
+                  "orderId.$": "$.detail.orderId",
+                  "status": "PAYMENT_WORKFLOW_FAILED",
+                  "type": "INTERNAL_NOTIFICATION",
+                  "errorDetails.$": "$.error",
+                  "notificationChannel": "INTERNAL"
+                }
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "Next": "PaymentFailedEnd"
+    },
+    "PaymentFailedEnd": {
+      "Type": "Pass",
+      "Parameters": {
+        "result": "Order processing failed due to payment issues",
+        "orderId.$": "$.detail.orderId",
+        "status": "PAYMENT_FAILED",
+        "failedAt.$": "$$.State.EnteredTime",
+        "error.$": "$.error"
+      },
+      "End": true
+    },
+    "InventoryFailed": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "SendInventoryFailureNotification",
+          "States": {
+            "SendInventoryFailureNotification": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${notification_service_arn}",
+                "Payload": {
+                  "message": "Some items in your order are currently unavailable. We will notify you when they are back in stock.",
+                  "orderId.$": "$.detail.orderId",
+                  "customerId.$": "$.detail.customerId",
+                  "status": "INVENTORY_FAILED",
+                  "type": "INVENTORY_UNAVAILABLE",
+                  "errorDetails.$": "$.error",
+                  "notificationChannel": "CUSTOMER"
+                }
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "InitiateRefundProcess",
+          "States": {
+            "InitiateRefundProcess": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${notification_service_arn}",
+                "Payload": {
+                  "message": "Initiating refund process due to inventory unavailability",
+                  "orderId.$": "$.detail.orderId",
+                  "customerId.$": "$.detail.customerId",
+                  "status": "REFUND_INITIATED",
+                  "type": "INTERNAL_NOTIFICATION",
+                  "notificationChannel": "INTERNAL"
+                }
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "Next": "InventoryFailedEnd"
+    },
+    "InventoryFailedEnd": {
+      "Type": "Pass",
+      "Parameters": {
+        "result": "Order processing failed due to inventory issues",
+        "orderId.$": "$.detail.orderId",
+        "status": "INVENTORY_FAILED",
+        "failedAt.$": "$$.State.EnteredTime",
+        "error.$": "$.error"
+      },
+      "End": true
+    }
+  }
+}

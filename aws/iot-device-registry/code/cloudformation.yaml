@@ -1,0 +1,719 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for IoT Device Management with AWS IoT Core - Implements secure device connectivity, registration, and lifecycle management'
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'iot-device-mgmt'
+    Description: 'Name prefix for all resources'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+    MaxLength: 20
+
+  DeviceType:
+    Type: String
+    Default: 'TemperatureSensor'
+    Description: 'Type of IoT device to register'
+    AllowedValues:
+      - 'TemperatureSensor'
+      - 'HumiditySensor'
+      - 'PressureSensor'
+      - 'GenericSensor'
+
+  DeviceManufacturer:
+    Type: String
+    Default: 'SensorCorp'
+    Description: 'Device manufacturer name'
+    MaxLength: 50
+
+  DeviceModel:
+    Type: String
+    Default: 'TC-2000'
+    Description: 'Device model identifier'
+    MaxLength: 50
+
+  DeviceLocation:
+    Type: String
+    Default: 'ProductionFloor-A'
+    Description: 'Physical location of the device'
+    MaxLength: 100
+
+  TemperatureThreshold:
+    Type: Number
+    Default: 75
+    Description: 'Temperature threshold for alerts (Celsius)'
+    MinValue: 0
+    MaxValue: 200
+
+  ReportingInterval:
+    Type: Number
+    Default: 60
+    Description: 'Device reporting interval in seconds'
+    MinValue: 10
+    MaxValue: 3600
+
+  EnableHighTemperatureAlerts:
+    Type: String
+    Default: 'true'
+    Description: 'Enable CloudWatch alarms for high temperature readings'
+    AllowedValues: ['true', 'false']
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    Description: 'Environment name'
+    AllowedValues: ['dev', 'staging', 'prod']
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+Conditions:
+  CreateTemperatureAlerts: !Equals [!Ref EnableHighTemperatureAlerts, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+  # --------------------------------------------------------------------------
+  # IAM ROLES AND POLICIES
+  # --------------------------------------------------------------------------
+  
+  # Lambda execution role for IoT data processing
+  IoTLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: IoTDataProcessingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iot:UpdateThingShadow
+                  - iot:GetThingShadow
+                Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:thing/${IoTThing}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IoT service role for rules engine
+  IoTRuleServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-iot-rule-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: IoTRuleLambdaInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt IoTDataProcessorFunction.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-iot-rule-service-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # --------------------------------------------------------------------------
+  # IOT CORE RESOURCES
+  # --------------------------------------------------------------------------
+
+  # IoT Thing Type for categorizing devices
+  IoTThingType:
+    Type: AWS::IoT::ThingType
+    Properties:
+      ThingTypeName: !Ref DeviceType
+      ThingTypeDescription: !Sub 'Thing type for ${DeviceType} devices'
+      ThingTypeProperties:
+        Description: !Sub 'Managed ${DeviceType} devices with temperature monitoring capabilities'
+      Tags:
+        - Key: Name
+          Value: !Ref DeviceType
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IoT Thing (Device) registration
+  IoTThing:
+    Type: AWS::IoT::Thing
+    Properties:
+      ThingName: !Sub '${ProjectName}-${DeviceType}-${Environment}'
+      ThingTypeName: !Ref IoTThingType
+      AttributePayload:
+        Attributes:
+          deviceType: !Ref DeviceType
+          manufacturer: !Ref DeviceManufacturer
+          model: !Ref DeviceModel
+          location: !Ref DeviceLocation
+          environment: !Ref Environment
+          project: !Ref ProjectName
+
+  # IoT Policy for device permissions
+  IoTDevicePolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-device-policy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow device to connect with its own thing name
+          - Effect: Allow
+            Action:
+              - iot:Connect
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/${iot:Connection.Thing.ThingName}'
+          # Allow device to publish to its designated topic
+          - Effect: Allow
+            Action:
+              - iot:Publish
+            Resource: 
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/sensor/temperature/${iot:Connection.Thing.ThingName}'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/device/status/${iot:Connection.Thing.ThingName}'
+          # Allow device to subscribe to configuration topics
+          - Effect: Allow
+            Action:
+              - iot:Subscribe
+              - iot:Receive
+            Resource:
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/device/config/${iot:Connection.Thing.ThingName}'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/device/config/${iot:Connection.Thing.ThingName}'
+          # Allow device shadow operations
+          - Effect: Allow
+            Action:
+              - iot:GetThingShadow
+              - iot:UpdateThingShadow
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:thing/${iot:Connection.Thing.ThingName}'
+
+  # --------------------------------------------------------------------------
+  # LAMBDA FUNCTIONS
+  # --------------------------------------------------------------------------
+
+  # Lambda function for processing IoT data
+  IoTDataProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-data-processor'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt IoTLambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          TEMPERATURE_THRESHOLD: !Ref TemperatureThreshold
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          THING_NAME: !Ref IoTThing
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize AWS clients
+          cloudwatch = boto3.client('cloudwatch')
+          iot_data = boto3.client('iot-data')
+
+          def lambda_handler(event, context):
+              """
+              Process IoT sensor data and handle temperature monitoring
+              """
+              try:
+                  logger.info(f"Received IoT data: {json.dumps(event)}")
+                  
+                  # Extract device data
+                  device_name = event.get('device', 'unknown')
+                  temperature = event.get('temperature', 0)
+                  humidity = event.get('humidity', 0)
+                  timestamp = event.get('timestamp', datetime.utcnow().isoformat())
+                  
+                  # Get environment variables
+                  temp_threshold = float(os.environ.get('TEMPERATURE_THRESHOLD', 75))
+                  project_name = os.environ.get('PROJECT_NAME', 'iot-device-mgmt')
+                  environment = os.environ.get('ENVIRONMENT', 'dev')
+                  thing_name = os.environ.get('THING_NAME', device_name)
+                  
+                  # Send custom metrics to CloudWatch
+                  try:
+                      cloudwatch.put_metric_data(
+                          Namespace=f'{project_name}/IoT/Sensors',
+                          MetricData=[
+                              {
+                                  'MetricName': 'Temperature',
+                                  'Dimensions': [
+                                      {
+                                          'Name': 'DeviceName',
+                                          'Value': device_name
+                                      },
+                                      {
+                                          'Name': 'Environment',
+                                          'Value': environment
+                                      }
+                                  ],
+                                  'Value': temperature,
+                                  'Unit': 'None',
+                                  'Timestamp': datetime.utcnow()
+                              },
+                              {
+                                  'MetricName': 'Humidity',
+                                  'Dimensions': [
+                                      {
+                                          'Name': 'DeviceName',
+                                          'Value': device_name
+                                      },
+                                      {
+                                          'Name': 'Environment',
+                                          'Value': environment
+                                      }
+                                  ],
+                                  'Value': humidity,
+                                  'Unit': 'Percent',
+                                  'Timestamp': datetime.utcnow()
+                              }
+                          ]
+                      )
+                      logger.info(f"Metrics sent to CloudWatch for device: {device_name}")
+                  except Exception as e:
+                      logger.error(f"Failed to send metrics to CloudWatch: {str(e)}")
+                  
+                  # Check temperature threshold
+                  if temperature > temp_threshold:
+                      logger.warning(f"High temperature alert: {temperature}°C from {device_name} (threshold: {temp_threshold}°C)")
+                      
+                      # Update device shadow with alert status
+                      try:
+                          shadow_update = {
+                              "state": {
+                                  "reported": {
+                                      "last_alert": timestamp,
+                                      "alert_temperature": temperature,
+                                      "alert_active": True
+                                  }
+                              }
+                          }
+                          
+                          iot_data.update_thing_shadow(
+                              thingName=thing_name,
+                              payload=json.dumps(shadow_update)
+                          )
+                          logger.info(f"Updated device shadow for {thing_name} with alert status")
+                      except Exception as e:
+                          logger.error(f"Failed to update device shadow: {str(e)}")
+                  else:
+                      # Clear alert status in device shadow
+                      try:
+                          shadow_update = {
+                              "state": {
+                                  "reported": {
+                                      "alert_active": False,
+                                      "last_normal_reading": timestamp
+                                  }
+                              }
+                          }
+                          
+                          iot_data.update_thing_shadow(
+                              thingName=thing_name,
+                              payload=json.dumps(shadow_update)
+                          )
+                      except Exception as e:
+                          logger.error(f"Failed to update device shadow: {str(e)}")
+                  
+                  # Process additional business logic here
+                  # Examples: Store in DynamoDB, send to SNS, trigger Step Functions
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Data processed successfully',
+                          'device': device_name,
+                          'temperature': temperature,
+                          'humidity': humidity,
+                          'alert_triggered': temperature > temp_threshold,
+                          'timestamp': timestamp
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing IoT data: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': 'Failed to process IoT data',
+                          'message': str(e)
+                      })
+                  }
+      Description: 'Process IoT sensor data and handle temperature monitoring with CloudWatch metrics'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-data-processor'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda permission for IoT rule to invoke function
+  IoTLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IoTDataProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: iot.amazonaws.com
+      SourceArn: !GetAtt IoTTopicRule.Arn
+
+  # --------------------------------------------------------------------------
+  # IOT RULES ENGINE
+  # --------------------------------------------------------------------------
+
+  # IoT rule for routing sensor data to Lambda
+  IoTTopicRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub '${ProjectName}_sensor_data_rule'
+      TopicRulePayload:
+        Sql: !Sub "SELECT *, topic(3) as device, timestamp() as aws_timestamp FROM 'sensor/temperature/+'"
+        Description: 'Route temperature sensor data to Lambda for processing and analytics'
+        RuleDisabled: false
+        Actions:
+          - Lambda:
+              FunctionArn: !GetAtt IoTDataProcessorFunction.Arn
+        ErrorAction:
+          CloudwatchLogs:
+            LogGroupName: !Ref IoTRuleErrorLogGroup
+            RoleArn: !GetAtt IoTRuleServiceRole.Arn
+
+  # Additional IoT rule for device status monitoring
+  IoTDeviceStatusRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub '${ProjectName}_device_status_rule'
+      TopicRulePayload:
+        Sql: !Sub "SELECT *, topic(3) as device, timestamp() as aws_timestamp FROM 'device/status/+'"
+        Description: 'Monitor device status and connectivity'
+        RuleDisabled: false
+        Actions:
+          - CloudwatchMetric:
+              MetricName: DeviceStatus
+              MetricNamespace: !Sub '${ProjectName}/IoT/DeviceHealth'
+              MetricUnit: Count
+              MetricValue: '1'
+              RoleArn: !GetAtt IoTRuleServiceRole.Arn
+              MetricTimestamp: '${timestamp()}'
+
+  # --------------------------------------------------------------------------
+  # CLOUDWATCH RESOURCES
+  # --------------------------------------------------------------------------
+
+  # CloudWatch Log Group for IoT rule errors
+  IoTRuleErrorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/iot/rules/${ProjectName}-errors'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-iot-rule-errors'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Group for Lambda function
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${IoTDataProcessorFunction}'
+      RetentionInDays: !If [IsProduction, 14, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarm for high temperature readings
+  HighTemperatureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateTemperatureAlerts
+    Properties:
+      AlarmName: !Sub '${ProjectName}-high-temperature-alert'
+      AlarmDescription: 'Alert when device temperature exceeds threshold'
+      MetricName: Temperature
+      Namespace: !Sub '${ProjectName}/IoT/Sensors'
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref TemperatureThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DeviceName
+          Value: !Ref IoTThing
+        - Name: Environment
+          Value: !Ref Environment
+      AlarmActions:
+        - !Ref TemperatureAlertTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-high-temperature-alert'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarm for Lambda function errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors'
+      AlarmDescription: 'Alert when Lambda function has errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IoTDataProcessorFunction
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-errors'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # --------------------------------------------------------------------------
+  # SNS TOPICS FOR NOTIFICATIONS
+  # --------------------------------------------------------------------------
+
+  # SNS Topic for temperature alerts
+  TemperatureAlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateTemperatureAlerts
+    Properties:
+      TopicName: !Sub '${ProjectName}-temperature-alerts'
+      DisplayName: 'IoT Temperature Alerts'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-temperature-alerts'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+Outputs:
+  IoTThingName:
+    Description: 'Name of the created IoT Thing (device)'
+    Value: !Ref IoTThing
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTThingName'
+
+  IoTThingArn:
+    Description: 'ARN of the created IoT Thing'
+    Value: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:thing/${IoTThing}'
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTThingArn'
+
+  IoTThingType:
+    Description: 'Thing type for the IoT device'
+    Value: !Ref IoTThingType
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTThingType'
+
+  IoTDevicePolicyName:
+    Description: 'Name of the IoT device policy'
+    Value: !Ref IoTDevicePolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTDevicePolicyName'
+
+  IoTDataEndpoint:
+    Description: 'AWS IoT data endpoint for device connections'
+    Value: !Sub '${AWS::AccountId}.iot.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTDataEndpoint'
+
+  SensorTopicName:
+    Description: 'MQTT topic for sensor data publishing'
+    Value: !Sub 'sensor/temperature/${IoTThing}'
+    Export:
+      Name: !Sub '${AWS::StackName}-SensorTopicName'
+
+  DeviceStatusTopicName:
+    Description: 'MQTT topic for device status updates'
+    Value: !Sub 'device/status/${IoTThing}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DeviceStatusTopicName'
+
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function processing IoT data'
+    Value: !Ref IoTDataProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function processing IoT data'
+    Value: !GetAtt IoTDataProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  IoTTopicRuleName:
+    Description: 'Name of the IoT topic rule for sensor data'
+    Value: !Ref IoTTopicRule
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTTopicRuleName'
+
+  IoTTopicRuleArn:
+    Description: 'ARN of the IoT topic rule for sensor data'
+    Value: !GetAtt IoTTopicRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTTopicRuleArn'
+
+  CloudWatchLogGroup:
+    Description: 'CloudWatch Log Group for Lambda function'
+    Value: !Ref LambdaLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchLogGroup'
+
+  TemperatureThreshold:
+    Description: 'Configured temperature threshold for alerts'
+    Value: !Ref TemperatureThreshold
+    Export:
+      Name: !Sub '${AWS::StackName}-TemperatureThreshold'
+
+  SNSTopicArn:
+    Condition: CreateTemperatureAlerts
+    Description: 'SNS Topic ARN for temperature alerts'
+    Value: !Ref TemperatureAlertTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  ConnectionCommand:
+    Description: 'Sample AWS CLI command to test device connection'
+    Value: !Sub |
+      # First, create a device certificate:
+      aws iot create-keys-and-certificate --set-as-active --certificate-pem-outfile device-cert.pem --public-key-outfile device-public.pem --private-key-outfile device-private.pem --query 'certificateArn' --output text > cert-arn.txt
+      
+      # Attach the policy to the certificate:
+      aws iot attach-policy --policy-name ${IoTDevicePolicy} --target $(cat cert-arn.txt)
+      
+      # Attach the certificate to the thing:
+      aws iot attach-thing-principal --thing-name ${IoTThing} --principal $(cat cert-arn.txt)
+      
+      # Test message publishing:
+      aws iot-data publish --topic sensor/temperature/${IoTThing} --payload '{"temperature": 25.5, "humidity": 60, "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)'", "device": "${IoTThing}"}'
+
+  CloudWatchDashboardURL:
+    Description: 'URL to view CloudWatch metrics for this IoT solution'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#metricsV2:graph=~();query=${ProjectName}%252FIoT'
+
+# ==============================================================================
+# METADATA
+# ==============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Device Configuration"
+        Parameters:
+          - DeviceType
+          - DeviceManufacturer
+          - DeviceModel
+          - DeviceLocation
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - TemperatureThreshold
+          - ReportingInterval
+          - EnableHighTemperatureAlerts
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      DeviceType:
+        default: "Device Type"
+      DeviceManufacturer:
+        default: "Device Manufacturer"
+      DeviceModel:
+        default: "Device Model"
+      DeviceLocation:
+        default: "Device Location"
+      TemperatureThreshold:
+        default: "Temperature Alert Threshold (°C)"
+      ReportingInterval:
+        default: "Reporting Interval (seconds)"
+      EnableHighTemperatureAlerts:
+        default: "Enable Temperature Alerts"
+
+  # Template documentation
+  AWS::CloudFormation::Designer:
+    Description: |
+      This CloudFormation template creates a complete IoT device management solution using AWS IoT Core.
+      
+      The template includes:
+      - IoT Thing registration with device metadata
+      - X.509 certificate-based authentication
+      - IoT policies with least privilege permissions
+      - Lambda function for real-time data processing
+      - IoT Rules Engine for automatic message routing
+      - CloudWatch monitoring and alerting
+      - Device Shadow for state management
+      
+      This template follows AWS best practices for IoT security, scalability, and observability.

@@ -1,0 +1,384 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Long-term Data Archiving with S3 Glacier Deep Archive
+  Creates an S3 bucket with lifecycle policies for automated data archiving,
+  SNS notifications for monitoring, and inventory reporting for compliance tracking.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Bucket Configuration"
+        Parameters:
+          - BucketNamePrefix
+          - BucketVersioning
+      - Label:
+          default: "Lifecycle Configuration"
+        Parameters:
+          - ArchivesFolderTransitionDays
+          - GeneralDataTransitionDays
+          - EnableLifecycleAbortIncompleteUploads
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+          - NotificationFileExtension
+      - Label:
+          default: "Inventory Configuration"
+        Parameters:
+          - EnableInventoryReporting
+          - InventoryFrequency
+      - Label:
+          default: "Access Control"
+        Parameters:
+          - RestrictPublicAccess
+          - EnableServerSideEncryption
+
+Parameters:
+  BucketNamePrefix:
+    Type: String
+    Description: Prefix for the S3 bucket name (will be appended with random suffix)
+    Default: long-term-archive
+    AllowedPattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    MinLength: 3
+    MaxLength: 50
+
+  BucketVersioning:
+    Type: String
+    Description: Enable versioning for the archive bucket
+    Default: Enabled
+    AllowedValues:
+      - Enabled
+      - Suspended
+
+  ArchivesFolderTransitionDays:
+    Type: Number
+    Description: Number of days before objects in 'archives/' folder transition to Glacier Deep Archive
+    Default: 90
+    MinValue: 1
+    MaxValue: 3650
+
+  GeneralDataTransitionDays:
+    Type: Number
+    Description: Number of days before all other objects transition to Glacier Deep Archive
+    Default: 180
+    MinValue: 1
+    MaxValue: 3650
+
+  EnableLifecycleAbortIncompleteUploads:
+    Type: String
+    Description: Automatically abort incomplete multipart uploads after 7 days
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive archive notifications
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address
+
+  NotificationFileExtension:
+    Type: String
+    Description: File extension to monitor for lifecycle transitions (e.g., .pdf, .log)
+    Default: .pdf
+    AllowedPattern: ^\.[a-zA-Z0-9]+$
+    ConstraintDescription: Must start with a dot followed by alphanumeric characters
+
+  EnableInventoryReporting:
+    Type: String
+    Description: Enable S3 inventory reporting for compliance tracking
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  InventoryFrequency:
+    Type: String
+    Description: Frequency for S3 inventory reports
+    Default: Weekly
+    AllowedValues:
+      - Daily
+      - Weekly
+
+  RestrictPublicAccess:
+    Type: String
+    Description: Block all public access to the archive bucket
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableServerSideEncryption:
+    Type: String
+    Description: Enable server-side encryption with S3 managed keys (SSE-S3)
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Conditions:
+  EnableVersioning: !Equals [!Ref BucketVersioning, 'Enabled']
+  EnableAbortIncompleteUploads: !Equals [!Ref EnableLifecycleAbortIncompleteUploads, 'true']
+  EnableInventory: !Equals [!Ref EnableInventoryReporting, 'true']
+  EnablePublicAccessBlock: !Equals [!Ref RestrictPublicAccess, 'true']
+  EnableEncryption: !Equals [!Ref EnableServerSideEncryption, 'true']
+
+Resources:
+  # S3 Bucket for Long-term Archive Storage
+  ArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 
+        - '${Prefix}-${RandomSuffix}'
+        - Prefix: !Ref BucketNamePrefix
+          RandomSuffix: !Select [2, !Split ['-', !Ref 'AWS::StackId']]
+      VersioningConfiguration:
+        Status: !If [EnableVersioning, Enabled, Suspended]
+      BucketEncryption:
+        !If
+          - EnableEncryption
+          - ServerSideEncryptionConfiguration:
+              - ServerSideEncryptionByDefault:
+                  SSEAlgorithm: AES256
+                BucketKeyEnabled: true
+          - !Ref AWS::NoValue
+      PublicAccessBlockConfiguration:
+        !If
+          - EnablePublicAccessBlock
+          - BlockPublicAcls: true
+            BlockPublicPolicy: true
+            IgnorePublicAcls: true
+            RestrictPublicBuckets: true
+          - !Ref AWS::NoValue
+      LifecycleConfiguration:
+        Rules:
+          # Rule for archives folder - faster transition to Deep Archive
+          - Id: ArchivesFolderToDeepArchive
+            Status: Enabled
+            Filter:
+              Prefix: archives/
+            Transitions:
+              - TransitionInDays: !Ref ArchivesFolderTransitionDays
+                StorageClass: DEEP_ARCHIVE
+            AbortIncompleteMultipartUpload:
+              !If
+                - EnableAbortIncompleteUploads
+                - DaysAfterInitiation: 7
+                - !Ref AWS::NoValue
+          # Rule for all other files - longer retention before archiving
+          - Id: GeneralDataToDeepArchive
+            Status: Enabled
+            Filter:
+              Prefix: ''
+            Transitions:
+              - TransitionInDays: !Ref GeneralDataTransitionDays
+                StorageClass: DEEP_ARCHIVE
+            AbortIncompleteMultipartUpload:
+              !If
+                - EnableAbortIncompleteUploads
+                - DaysAfterInitiation: 7
+                - !Ref AWS::NoValue
+      InventoryConfigurations:
+        !If
+          - EnableInventory
+          - - Id: WeeklyInventoryReport
+              IsEnabled: true
+              Destination:
+                BucketArn: !GetAtt ArchiveBucket.Arn
+                Format: CSV
+                Prefix: inventory-reports/
+              IncludedObjectVersions: Current
+              ScheduleFrequency: !Ref InventoryFrequency
+              OptionalFields:
+                - Size
+                - LastModifiedDate
+                - StorageClass
+                - ETag
+                - ReplicationStatus
+                - EncryptionStatus
+          - !Ref AWS::NoValue
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Topic: !Ref ArchiveNotificationTopic
+            Event: s3:LifecycleTransition
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: !Ref NotificationFileExtension
+      Tags:
+        - Key: Purpose
+          Value: LongTermArchiving
+        - Key: CostCenter
+          Value: DataRetention
+        - Key: Environment
+          Value: Production
+        - Key: Compliance
+          Value: DataGovernance
+
+  # S3 Bucket Policy for Enhanced Security
+  ArchiveBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArchiveBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Deny insecure connections
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ArchiveBucket.Arn
+              - !Sub '${ArchiveBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          # Deny unencrypted uploads if encryption is enabled
+          - !If
+            - EnableEncryption
+            - Sid: DenyUnencryptedObjectUploads
+              Effect: Deny
+              Principal: '*'
+              Action: 's3:PutObject'
+              Resource: !Sub '${ArchiveBucket.Arn}/*'
+              Condition:
+                StringNotEquals:
+                  's3:x-amz-server-side-encryption': 'AES256'
+            - !Ref AWS::NoValue
+
+  # SNS Topic for Archive Notifications
+  ArchiveNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-archive-notifications'
+      DisplayName: S3 Archive Lifecycle Notifications
+      KmsMasterKeyId: alias/aws/sns
+
+  # SNS Topic Policy to Allow S3 Publishing
+  ArchiveNotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref ArchiveNotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3Publishing
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - sns:Publish
+            Resource: !Ref ArchiveNotificationTopic
+            Condition:
+              StringEquals:
+                'aws:SourceArn': !GetAtt ArchiveBucket.Arn
+
+  # Email Subscription for Notifications
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref ArchiveNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # IAM Role for Lambda Function (if custom processing needed)
+  ArchiveProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-archive-processor-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ArchiveBucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:RestoreObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ArchiveBucket.Arn
+                  - !Sub '${ArchiveBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref ArchiveNotificationTopic
+
+  # CloudWatch Log Group for Archive Operations
+  ArchiveLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${AWS::StackName}-archive-operations'
+      RetentionInDays: 90
+
+Outputs:
+  ArchiveBucketName:
+    Description: Name of the created S3 archive bucket
+    Value: !Ref ArchiveBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ArchiveBucketName'
+
+  ArchiveBucketArn:
+    Description: ARN of the created S3 archive bucket
+    Value: !GetAtt ArchiveBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ArchiveBucketArn'
+
+  NotificationTopicArn:
+    Description: ARN of the SNS topic for archive notifications
+    Value: !Ref ArchiveNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopicArn'
+
+  ArchiveProcessorRoleArn:
+    Description: ARN of the IAM role for archive processing functions
+    Value: !GetAtt ArchiveProcessorRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ArchiveProcessorRoleArn'
+
+  BucketDomainName:
+    Description: Domain name of the S3 bucket
+    Value: !GetAtt ArchiveBucket.DomainName
+
+  BucketRegionalDomainName:
+    Description: Regional domain name of the S3 bucket
+    Value: !GetAtt ArchiveBucket.RegionalDomainName
+
+  LifecyclePolicyConfiguration:
+    Description: Summary of lifecycle policy configuration
+    Value: !Sub 
+      - 'Archives folder: ${ArchiveDays} days, General data: ${GeneralDays} days to Deep Archive'
+      - ArchiveDays: !Ref ArchivesFolderTransitionDays
+        GeneralDays: !Ref GeneralDataTransitionDays
+
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for 1TB of data in Deep Archive (excluding retrieval costs)
+    Value: '$1.00 USD per TB/month (99% cost reduction vs S3 Standard)'
+
+  ComplianceFeatures:
+    Description: Compliance and governance features enabled
+    Value: 'Lifecycle automation, SNS notifications, S3 inventory reporting, encryption at rest'
+
+  UsageInstructions:
+    Description: Quick start instructions for using the archive bucket
+    Value: !Sub 
+      - 'Upload files to s3://${BucketName}/archives/ for ${ArchiveDays}-day retention or s3://${BucketName}/ for ${GeneralDays}-day retention'
+      - BucketName: !Ref ArchiveBucket
+        ArchiveDays: !Ref ArchivesFolderTransitionDays
+        GeneralDays: !Ref GeneralDataTransitionDays

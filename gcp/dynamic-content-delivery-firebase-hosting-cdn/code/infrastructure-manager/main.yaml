@@ -1,0 +1,516 @@
+# Infrastructure Manager Configuration for Dynamic Content Delivery with Firebase Hosting and Cloud CDN
+# This configuration deploys a complete global content delivery solution using Firebase Hosting,
+# Cloud Functions, Cloud Storage, and Cloud CDN for optimal performance worldwide.
+
+apiVersion: v1
+kind: ResourceManagerPolicy
+metadata:
+  name: dynamic-content-delivery-infra
+  labels:
+    recipe: dynamic-content-delivery-firebase-hosting-cdn
+    category: networking
+    difficulty: "200"
+    provider: gcp
+
+# Input parameters for customizing the deployment
+inputs:
+  - name: project_id
+    description: "Google Cloud Project ID for deployment"
+    type: string
+    required: true
+    
+  - name: region
+    description: "Primary region for Cloud Functions and resources"
+    type: string
+    default: "us-central1"
+    
+  - name: site_id
+    description: "Firebase Hosting site identifier"
+    type: string
+    required: true
+    
+  - name: storage_bucket_name
+    description: "Cloud Storage bucket name for media assets"
+    type: string
+    required: true
+    
+  - name: function_name_prefix
+    description: "Prefix for Cloud Functions names"
+    type: string
+    default: "dynamic-content"
+    
+  - name: environment
+    description: "Deployment environment (dev, staging, prod)"
+    type: string
+    default: "dev"
+    enum: ["dev", "staging", "prod"]
+
+# Output values for integration and verification
+outputs:
+  - name: hosting_url
+    description: "Firebase Hosting URL for the deployed application"
+    value: ${firebase_hosting_site.main_site.default_url}
+    
+  - name: cdn_load_balancer_ip
+    description: "Global Load Balancer IP address for CDN"
+    value: ${google_compute_global_forwarding_rule.cdn_forwarding_rule.ip_address}
+    
+  - name: storage_bucket_url
+    description: "Cloud Storage bucket URL for media assets"
+    value: "gs://${google_storage_bucket.media_bucket.name}"
+    
+  - name: functions_urls
+    description: "Cloud Functions trigger URLs"
+    value:
+      get_products: ${google_cloudfunctions_function.get_products.https_trigger_url}
+      get_recommendations: ${google_cloudfunctions_function.get_recommendations.https_trigger_url}
+
+# Resource definitions following Google Cloud best practices
+resources:
+  # Enable required APIs for the solution
+  - name: firebase_api
+    type: google_project_service
+    properties:
+      project: ${inputs.project_id}
+      service: firebase.googleapis.com
+      disable_dependent_services: true
+      disable_on_destroy: false
+      
+  - name: cloudfunctions_api
+    type: google_project_service
+    properties:
+      project: ${inputs.project_id}
+      service: cloudfunctions.googleapis.com
+      disable_dependent_services: true
+      disable_on_destroy: false
+      
+  - name: storage_api
+    type: google_project_service
+    properties:
+      project: ${inputs.project_id}
+      service: storage.googleapis.com
+      disable_dependent_services: true
+      disable_on_destroy: false
+      
+  - name: compute_api
+    type: google_project_service
+    properties:
+      project: ${inputs.project_id}
+      service: compute.googleapis.com
+      disable_dependent_services: true
+      disable_on_destroy: false
+      
+  - name: monitoring_api
+    type: google_project_service
+    properties:
+      project: ${inputs.project_id}
+      service: monitoring.googleapis.com
+      disable_dependent_services: true
+      disable_on_destroy: false
+
+  # Firebase project initialization
+  - name: firebase_project
+    type: google_firebase_project
+    properties:
+      provider: google-beta
+      project: ${inputs.project_id}
+    depends_on:
+      - firebase_api
+
+  # Firebase Hosting site with global CDN capabilities
+  - name: firebase_hosting_site
+    type: google_firebase_hosting_site
+    properties:
+      provider: google-beta
+      project: ${inputs.project_id}
+      site_id: ${inputs.site_id}
+      app_id: ${google_firebase_web_app.main_app.app_id}
+    depends_on:
+      - firebase_project
+
+  # Firebase Web App for hosting integration
+  - name: firebase_web_app
+    type: google_firebase_web_app
+    properties:
+      provider: google-beta
+      project: ${inputs.project_id}
+      display_name: "Dynamic Content Delivery App"
+      deletion_policy: "DELETE"
+    depends_on:
+      - firebase_project
+
+  # Cloud Storage bucket for media assets with CDN optimization
+  - name: media_bucket
+    type: google_storage_bucket
+    properties:
+      name: ${inputs.storage_bucket_name}
+      location: "US"  # Multi-region for global access
+      project: ${inputs.project_id}
+      storage_class: "STANDARD"
+      
+      # Enable uniform bucket-level access for security
+      uniform_bucket_level_access: true
+      
+      # Configure for web serving and CDN integration
+      website:
+        main_page_suffix: "index.html"
+        not_found_page: "404.html"
+        
+      # Lifecycle management for cost optimization
+      lifecycle_rule:
+        - condition:
+            age: 30
+            matches_storage_class: ["STANDARD"]
+          action:
+            type: "SetStorageClass"
+            storage_class: "NEARLINE"
+            
+      # CORS configuration for web access
+      cors:
+        - origin: ["*"]
+          method: ["GET", "HEAD"]
+          response_header: ["Content-Type", "Cache-Control"]
+          max_age_seconds: 3600
+          
+      # Labels for resource management
+      labels:
+        environment: ${inputs.environment}
+        purpose: "media-assets"
+        recipe: "dynamic-content-delivery"
+    depends_on:
+      - storage_api
+
+  # IAM binding for public read access to media bucket
+  - name: media_bucket_iam
+    type: google_storage_bucket_iam_binding
+    properties:
+      bucket: ${google_storage_bucket.media_bucket.name}
+      role: "roles/storage.objectViewer"
+      members:
+        - "allUsers"
+    depends_on:
+      - media_bucket
+
+  # Service account for Cloud Functions
+  - name: functions_service_account
+    type: google_service_account
+    properties:
+      account_id: "${inputs.function_name_prefix}-sa"
+      project: ${inputs.project_id}
+      display_name: "Dynamic Content Functions Service Account"
+      description: "Service account for Cloud Functions in dynamic content delivery solution"
+
+  # IAM binding for Functions service account
+  - name: functions_sa_iam
+    type: google_project_iam_binding
+    properties:
+      project: ${inputs.project_id}
+      role: "roles/cloudsql.client"
+      members:
+        - "serviceAccount:${google_service_account.functions_service_account.email}"
+    depends_on:
+      - functions_service_account
+
+  # Cloud Function source code storage bucket
+  - name: functions_source_bucket
+    type: google_storage_bucket
+    properties:
+      name: "${inputs.project_id}-functions-source"
+      location: ${inputs.region}
+      project: ${inputs.project_id}
+      storage_class: "REGIONAL"
+      uniform_bucket_level_access: true
+      labels:
+        environment: ${inputs.environment}
+        purpose: "functions-source"
+    depends_on:
+      - storage_api
+
+  # Cloud Function: Get Products with caching optimization
+  - name: get_products_function
+    type: google_cloudfunctions_function
+    properties:
+      name: "${inputs.function_name_prefix}-get-products"
+      project: ${inputs.project_id}
+      region: ${inputs.region}
+      runtime: "nodejs18"
+      entry_point: "getProducts"
+      service_account_email: ${google_service_account.functions_service_account.email}
+      
+      # Source code configuration
+      source_archive_bucket: ${google_storage_bucket.functions_source_bucket.name}
+      source_archive_object: "functions-source.zip"
+      
+      # HTTP trigger for API access
+      trigger:
+        http_trigger: {}
+        
+      # Environment variables for configuration
+      environment_variables:
+        NODE_ENV: ${inputs.environment}
+        CORS_ORIGIN: "*"
+        CACHE_TTL: "300"
+        
+      # Performance and scaling settings
+      available_memory_mb: 256
+      timeout: "60s"
+      max_instances: 100
+      min_instances: 0
+      
+      # Labels for resource management
+      labels:
+        environment: ${inputs.environment}
+        function-type: "api"
+        caching: "enabled"
+    depends_on:
+      - cloudfunctions_api
+      - functions_service_account
+      - functions_source_bucket
+
+  # Cloud Function: Get Recommendations with personalization
+  - name: get_recommendations_function
+    type: google_cloudfunctions_function
+    properties:
+      name: "${inputs.function_name_prefix}-get-recommendations"
+      project: ${inputs.project_id}
+      region: ${inputs.region}
+      runtime: "nodejs18"
+      entry_point: "getRecommendations"
+      service_account_email: ${google_service_account.functions_service_account.email}
+      
+      # Source code configuration
+      source_archive_bucket: ${google_storage_bucket.functions_source_bucket.name}
+      source_archive_object: "functions-source.zip"
+      
+      # HTTP trigger for API access
+      trigger:
+        http_trigger: {}
+        
+      # Environment variables for personalization
+      environment_variables:
+        NODE_ENV: ${inputs.environment}
+        CORS_ORIGIN: "*"
+        CACHE_TTL: "300"
+        ENABLE_PERSONALIZATION: "true"
+        
+      # Performance and scaling settings
+      available_memory_mb: 256
+      timeout: "60s"
+      max_instances: 50
+      min_instances: 0
+      
+      # Labels for resource management
+      labels:
+        environment: ${inputs.environment}
+        function-type: "recommendation"
+        personalization: "enabled"
+    depends_on:
+      - cloudfunctions_api
+      - functions_service_account
+      - functions_source_bucket
+
+  # IAM for public access to Cloud Functions
+  - name: get_products_invoker
+    type: google_cloudfunctions_function_iam_binding
+    properties:
+      project: ${inputs.project_id}
+      region: ${inputs.region}
+      cloud_function: ${google_cloudfunctions_function.get_products_function.name}
+      role: "roles/cloudfunctions.invoker"
+      members:
+        - "allUsers"
+    depends_on:
+      - get_products_function
+
+  - name: get_recommendations_invoker
+    type: google_cloudfunctions_function_iam_binding
+    properties:
+      project: ${inputs.project_id}
+      region: ${inputs.region}
+      cloud_function: ${google_cloudfunctions_function.get_recommendations_function.name}
+      role: "roles/cloudfunctions.invoker"
+      members:
+        - "allUsers"
+    depends_on:
+      - get_recommendations_function
+
+  # Backend bucket for Cloud CDN integration with Cloud Storage
+  - name: cdn_backend_bucket
+    type: google_compute_backend_bucket
+    properties:
+      name: "${inputs.storage_bucket_name}-backend"
+      project: ${inputs.project_id}
+      bucket_name: ${google_storage_bucket.media_bucket.name}
+      enable_cdn: true
+      
+      # CDN caching configuration
+      cdn_policy:
+        cache_mode: "CACHE_ALL_STATIC"
+        default_ttl: 3600  # 1 hour default cache
+        max_ttl: 86400     # 24 hours maximum cache
+        client_ttl: 3600   # 1 hour client cache
+        negative_caching: true
+        negative_caching_policy:
+          - code: 404
+            ttl: 120
+          - code: 410
+            ttl: 120
+            
+        # Cache key policy for optimization
+        cache_key_policy:
+          include_host: true
+          include_protocol: true
+          include_query_string: false
+          
+      # Compression for bandwidth optimization
+      compression_mode: "AUTOMATIC"
+      
+      # Description for documentation
+      description: "Backend bucket for media assets with CDN optimization"
+    depends_on:
+      - compute_api
+      - media_bucket
+
+  # URL map for routing traffic to appropriate backends
+  - name: cdn_url_map
+    type: google_compute_url_map
+    properties:
+      name: "${inputs.site_id}-cdn-url-map"
+      project: ${inputs.project_id}
+      default_service: ${google_compute_backend_bucket.cdn_backend_bucket.self_link}
+      
+      # Path matchers for different content types
+      path_matcher:
+        - name: "media-matcher"
+          default_service: ${google_compute_backend_bucket.cdn_backend_bucket.self_link}
+          path_rule:
+            - paths: ["/images/*", "/videos/*", "/assets/*"]
+              service: ${google_compute_backend_bucket.cdn_backend_bucket.self_link}
+              
+      # Host rules for routing
+      host_rule:
+        - hosts: ["*"]
+          path_matcher: "media-matcher"
+          
+      # Description for documentation
+      description: "URL map for dynamic content delivery with CDN optimization"
+    depends_on:
+      - cdn_backend_bucket
+
+  # HTTP proxy for load balancing
+  - name: cdn_http_proxy
+    type: google_compute_target_http_proxy
+    properties:
+      name: "${inputs.site_id}-cdn-http-proxy"
+      project: ${inputs.project_id}
+      url_map: ${google_compute_url_map.cdn_url_map.self_link}
+      description: "HTTP proxy for CDN load balancing"
+    depends_on:
+      - cdn_url_map
+
+  # Global forwarding rule for external access
+  - name: cdn_forwarding_rule
+    type: google_compute_global_forwarding_rule
+    properties:
+      name: "${inputs.site_id}-cdn-forwarding-rule"
+      project: ${inputs.project_id}
+      target: ${google_compute_target_http_proxy.cdn_http_proxy.self_link}
+      port_range: "80"
+      ip_protocol: "TCP"
+      load_balancing_scheme: "EXTERNAL"
+      description: "Global forwarding rule for CDN traffic distribution"
+    depends_on:
+      - cdn_http_proxy
+
+  # Cloud Monitoring alerts for performance tracking
+  - name: hosting_uptime_check
+    type: google_monitoring_uptime_check_config
+    properties:
+      display_name: "Firebase Hosting Uptime Check"
+      project: ${inputs.project_id}
+      timeout: "10s"
+      period: "300s"  # Check every 5 minutes
+      
+      # HTTP check configuration
+      http_check:
+        use_ssl: true
+        path: "/"
+        port: 443
+        
+      # Monitored resource
+      monitored_resource:
+        type: "uptime_url"
+        labels:
+          project_id: ${inputs.project_id}
+          host: ${firebase_hosting_site.main_site.default_url}
+          
+      # Selected regions for global monitoring
+      selected_regions: ["USA", "EUROPE", "ASIA_PACIFIC"]
+    depends_on:
+      - monitoring_api
+      - firebase_hosting_site
+
+  # Performance monitoring alert policy
+  - name: performance_alert_policy
+    type: google_monitoring_alert_policy
+    properties:
+      display_name: "CDN Performance Alert"
+      project: ${inputs.project_id}
+      combiner: "OR"
+      enabled: true
+      
+      # Conditions for triggering alerts
+      conditions:
+        - display_name: "High response time"
+          condition_threshold:
+            filter: 'resource.type="gce_instance"'
+            comparison: "COMPARISON_GREATER_THAN"
+            threshold_value: 5.0  # 5 seconds
+            duration: "300s"      # 5 minutes
+            aggregations:
+              - alignment_period: "60s"
+                per_series_aligner: "ALIGN_MEAN"
+                cross_series_reducer: "REDUCE_MEAN"
+                group_by_fields: ["resource.label.instance_id"]
+                
+      # Notification channels (can be configured post-deployment)
+      documentation:
+        content: "CDN performance degradation detected. Check Firebase Hosting and Cloud CDN status."
+        mime_type: "text/markdown"
+    depends_on:
+      - monitoring_api
+
+# Validation rules to ensure proper configuration
+validation:
+  # Project ID format validation
+  - condition: ${length(inputs.project_id) >= 6 && length(inputs.project_id) <= 30}
+    message: "Project ID must be between 6 and 30 characters"
+    
+  # Site ID format validation
+  - condition: ${can(regex("^[a-z0-9-]+$", inputs.site_id))}
+    message: "Site ID must contain only lowercase letters, numbers, and hyphens"
+    
+  # Storage bucket name validation
+  - condition: ${can(regex("^[a-z0-9-._]+$", inputs.storage_bucket_name))}
+    message: "Storage bucket name must follow Google Cloud naming conventions"
+    
+  # Region validation
+  - condition: ${contains(["us-central1", "us-east1", "us-west1", "europe-west1", "asia-east1"], inputs.region)}
+    message: "Region must be a valid Google Cloud region"
+
+# Metadata for Infrastructure Manager
+metadata:
+  annotations:
+    recipe.version: "1.0"
+    recipe.category: "networking"
+    recipe.difficulty: "200"
+    recipe.estimated-time: "75 minutes"
+    recipe.services: "Firebase Hosting, Cloud CDN, Cloud Functions, Cloud Storage"
+    recipe.description: "Complete global content delivery solution with Firebase Hosting and Cloud CDN"
+    deployment.order: "apis,storage,functions,cdn,monitoring"
+    
+  labels:
+    managed-by: "infrastructure-manager"
+    recipe-name: "dynamic-content-delivery-firebase-hosting-cdn"
+    provider: "gcp"
+    environment: ${inputs.environment}

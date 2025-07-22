@@ -1,0 +1,1027 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Complete serverless container deployment with AWS Fargate, ECS, Application Load Balancer, and ECR - Production-ready infrastructure with auto-scaling, monitoring, and security best practices'
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'fargate-demo'
+    Description: 'Name prefix for all resources'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+    MinLength: 3
+    MaxLength: 50
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - 'dev'
+      - 'staging'
+      - 'prod'
+    Description: 'Environment name for resource tagging and configuration'
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC ID where resources will be created'
+
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: 'List of public subnet IDs for ALB (minimum 2 subnets in different AZs)'
+
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: 'List of private subnet IDs for Fargate tasks (minimum 2 subnets in different AZs)'
+
+  # Container Configuration
+  ContainerImage:
+    Type: String
+    Default: 'nginx:latest'
+    Description: 'Container image URI (will be overridden by ECR image after build)'
+
+  ContainerPort:
+    Type: Number
+    Default: 3000
+    Description: 'Port on which the container listens'
+    MinValue: 1
+    MaxValue: 65535
+
+  ContainerCpu:
+    Type: Number
+    Default: 256
+    AllowedValues: [256, 512, 1024, 2048, 4096]
+    Description: 'CPU units for Fargate task (256 CPU units = 0.25 vCPU)'
+
+  ContainerMemory:
+    Type: Number
+    Default: 512
+    AllowedValues: [512, 1024, 2048, 4096, 8192, 16384, 30720]
+    Description: 'Memory in MB for Fargate task'
+
+  # Service Configuration
+  DesiredCount:
+    Type: Number
+    Default: 3
+    Description: 'Desired number of running tasks'
+    MinValue: 1
+    MaxValue: 100
+
+  MinCapacity:
+    Type: Number
+    Default: 2
+    Description: 'Minimum number of tasks for auto scaling'
+    MinValue: 1
+    MaxValue: 10
+
+  MaxCapacity:
+    Type: Number
+    Default: 10
+    Description: 'Maximum number of tasks for auto scaling'
+    MinValue: 1
+    MaxValue: 100
+
+  # Auto Scaling Configuration
+  CPUTargetValue:
+    Type: Number
+    Default: 70
+    Description: 'Target CPU utilization percentage for auto scaling'
+    MinValue: 10
+    MaxValue: 90
+
+  MemoryTargetValue:
+    Type: Number
+    Default: 80
+    Description: 'Target memory utilization percentage for auto scaling'
+    MinValue: 10
+    MaxValue: 90
+
+  # Health Check Configuration
+  HealthCheckPath:
+    Type: String
+    Default: '/health'
+    Description: 'Path for ALB health checks'
+
+  HealthCheckIntervalSeconds:
+    Type: Number
+    Default: 30
+    Description: 'Health check interval in seconds'
+    MinValue: 5
+    MaxValue: 300
+
+  HealthyThresholdCount:
+    Type: Number
+    Default: 2
+    Description: 'Number of consecutive successful health checks required'
+    MinValue: 2
+    MaxValue: 10
+
+  UnhealthyThresholdCount:
+    Type: Number
+    Default: 3
+    Description: 'Number of consecutive failed health checks required'
+    MinValue: 2
+    MaxValue: 10
+
+  # Logging Configuration
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: 'CloudWatch log retention period in days'
+
+  # Capacity Provider Configuration
+  FargateSpotWeight:
+    Type: Number
+    Default: 4
+    Description: 'Weight for Fargate Spot capacity provider (0 to disable Spot)'
+    MinValue: 0
+    MaxValue: 10
+
+  FargateOnDemandWeight:
+    Type: Number
+    Default: 1
+    Description: 'Weight for Fargate On-Demand capacity provider'
+    MinValue: 0
+    MaxValue: 10
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  EnableFargateSpot: !Not [!Equals [!Ref FargateSpotWeight, 0]]
+  EnableDetailedMonitoring: !Or [!Equals [!Ref Environment, 'prod'], !Equals [!Ref Environment, 'staging']]
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # ECR Repository
+  # ---------------------------------------------------------------------------
+
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}-${Environment}'
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: MUTABLE
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 production images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["prod"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep last 5 development images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["dev", "staging"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5
+                },
+                "action": {
+                  "type": "expire"
+                }
+              },
+              {
+                "rulePriority": 3,
+                "description": "Delete untagged images after 1 day",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 1
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-ecr'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # Security Groups
+  # ---------------------------------------------------------------------------
+
+  # ALB Security Group
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-${Environment}-alb-sg'
+      GroupDescription: 'Security group for Application Load Balancer'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTP traffic from internet'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTPS traffic from internet'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-alb-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Fargate Security Group
+  FargateSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-${Environment}-fargate-sg'
+      GroupDescription: 'Security group for Fargate tasks'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: 'Traffic from ALB'
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTP outbound for package downloads'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTPS outbound for secure connections'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-fargate-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # IAM Roles
+  # ---------------------------------------------------------------------------
+
+  # Task Execution Role
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-task-execution-role'
+      Description: 'IAM role for ECS task execution'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: 'ECRAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: '*'
+        - PolicyName: 'CloudWatchLogs'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${ProjectName}-${Environment}*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-task-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Task Role
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-task-role'
+      Description: 'IAM role for ECS tasks'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: 'ApplicationPermissions'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${ProjectName}-${Environment}*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': !Sub '${ProjectName}/${Environment}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-task-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Log Group
+  # ---------------------------------------------------------------------------
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !If
+        - IsProduction
+        - !Ref LogGroupKMSKey
+        - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # KMS Key for log encryption in production
+  LogGroupKMSKey:
+    Type: AWS::KMS::Key
+    Condition: IsProduction
+    Properties:
+      Description: 'KMS key for CloudWatch log encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${ProjectName}-${Environment}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-log-key'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  LogGroupKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: IsProduction
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-${Environment}-log-key'
+      TargetKeyId: !Ref LogGroupKMSKey
+
+  # ---------------------------------------------------------------------------
+  # ECS Cluster
+  # ---------------------------------------------------------------------------
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-${Environment}'
+      CapacityProviders:
+        - FARGATE
+        - !If [EnableFargateSpot, 'FARGATE_SPOT', !Ref 'AWS::NoValue']
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: !Ref FargateOnDemandWeight
+          Base: 1
+        - !If
+          - EnableFargateSpot
+          - CapacityProvider: FARGATE_SPOT
+            Weight: !Ref FargateSpotWeight
+          - !Ref 'AWS::NoValue'
+      ClusterSettings:
+        - Name: containerInsights
+          Value: !If [EnableDetailedMonitoring, 'enabled', 'disabled']
+      Configuration:
+        ExecuteCommandConfiguration:
+          Logging: DEFAULT
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-cluster'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # Task Definition
+  # ---------------------------------------------------------------------------
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref ContainerCpu
+      Memory: !Ref ContainerMemory
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: !Sub '${ProjectName}-container'
+          Image: !Ref ContainerImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          Environment:
+            - Name: NODE_ENV
+              Value: !Ref Environment
+            - Name: PORT
+              Value: !Ref ContainerPort
+            - Name: AWS_REGION
+              Value: !Ref 'AWS::Region'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - !Sub 'curl -f http://localhost:${ContainerPort}${HealthCheckPath} || exit 1'
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+          # Resource limits for better resource management
+          Ulimits:
+            - Name: nofile
+              SoftLimit: 1024
+              HardLimit: 1024
+          # Security settings
+          ReadonlyRootFilesystem: false
+          LinuxParameters:
+            InitProcessEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-task-definition'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # Application Load Balancer
+  # ---------------------------------------------------------------------------
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-alb'
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+        - Key: deletion_protection.enabled
+          Value: !If [IsProduction, 'true', 'false']
+        - Key: access_logs.s3.enabled
+          Value: 'false'
+        - Key: routing.http2.enabled
+          Value: 'true'
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: 'true'
+        - Key: routing.http.preserve_host_header.enabled
+          Value: 'true'
+        - Key: routing.http.xff_client_port.enabled
+          Value: 'true'
+        - Key: waf.fail_open.enabled
+          Value: 'false'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-alb'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Target Group
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-tg'
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: !Ref HealthCheckIntervalSeconds
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: !Ref HealthyThresholdCount
+      UnhealthyThresholdCount: !Ref UnhealthyThresholdCount
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+        - Key: slow_start.duration_seconds
+          Value: '30'
+        - Key: stickiness.enabled
+          Value: 'false'
+        - Key: load_balancing.algorithm.type
+          Value: 'round_robin'
+        - Key: load_balancing.cross_zone.enabled
+          Value: 'true'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-tg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # HTTP Listener
+  HTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # ---------------------------------------------------------------------------
+  # ECS Service
+  # ---------------------------------------------------------------------------
+
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: HTTPListener
+    Properties:
+      ServiceName: !Sub '${ProjectName}-${Environment}'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref FargateSecurityGroup
+          Subnets: !Ref PrivateSubnetIds
+          AssignPublicIp: ENABLED
+      LoadBalancers:
+        - ContainerName: !Sub '${ProjectName}-container'
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+      HealthCheckGracePeriodSeconds: 120
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      EnableExecuteCommand: true
+      PropagateTags: SERVICE
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-service'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # Auto Scaling
+  # ---------------------------------------------------------------------------
+
+  # Scalable Target
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ResourceId: !Sub 'service/${ECSCluster}/${ECSService.Name}'
+      ScalableDimension: ecs:service:DesiredCount
+      MinCapacity: !Ref MinCapacity
+      MaxCapacity: !Ref MaxCapacity
+      RoleARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService'
+
+  # CPU Scaling Policy
+  CPUScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-${Environment}-cpu-scaling'
+      PolicyType: TargetTrackingScaling
+      ServiceNamespace: ecs
+      ResourceId: !Sub 'service/${ECSCluster}/${ECSService.Name}'
+      ScalableDimension: ecs:service:DesiredCount
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: !Ref CPUTargetValue
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleOutCooldown: 300
+        ScaleInCooldown: 300
+        DisableScaleIn: false
+
+  # Memory Scaling Policy
+  MemoryScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-${Environment}-memory-scaling'
+      PolicyType: TargetTrackingScaling
+      ServiceNamespace: ecs
+      ResourceId: !Sub 'service/${ECSCluster}/${ECSService.Name}'
+      ScalableDimension: ecs:service:DesiredCount
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: !Ref MemoryTargetValue
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageMemoryUtilization
+        ScaleOutCooldown: 300
+        ScaleInCooldown: 300
+        DisableScaleIn: false
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Alarms
+  # ---------------------------------------------------------------------------
+
+  # High CPU Alarm
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoring
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-high-cpu'
+      AlarmDescription: 'Alert when CPU exceeds 85%'
+      MetricName: CPUUtilization
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ServiceName
+          Value: !Sub '${ProjectName}-${Environment}'
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+      TreatMissingData: notBreaching
+
+  # High Memory Alarm
+  HighMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoring
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-high-memory'
+      AlarmDescription: 'Alert when memory exceeds 90%'
+      MetricName: MemoryUtilization
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 90
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ServiceName
+          Value: !Sub '${ProjectName}-${Environment}'
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+      TreatMissingData: notBreaching
+
+  # ALB Target Health Alarm
+  ALBTargetHealthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-unhealthy-targets'
+      AlarmDescription: 'Alert when ALB has unhealthy targets'
+      MetricName: UnHealthyHostCount
+      Namespace: AWS/ApplicationELB
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt TargetGroup.TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+      TreatMissingData: notBreaching
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Dashboard
+  # ---------------------------------------------------------------------------
+
+  CloudWatchDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableDetailedMonitoring
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ECS", "CPUUtilization", "ServiceName", "${ProjectName}-${Environment}", "ClusterName", "${ECSCluster}" ],
+                  [ ".", "MemoryUtilization", ".", ".", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "ECS Service Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${ApplicationLoadBalancer.LoadBalancerFullName}" ],
+                  [ ".", "TargetResponseTime", ".", "." ],
+                  [ ".", "HTTPCode_Target_2XX_Count", ".", "." ],
+                  [ ".", "HTTPCode_Target_4XX_Count", ".", "." ],
+                  [ ".", "HTTPCode_Target_5XX_Count", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "ALB Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ECS", "RunningTaskCount", "ServiceName", "${ProjectName}-${Environment}", "ClusterName", "${ECSCluster}" ],
+                  [ ".", "PendingTaskCount", ".", ".", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Task Counts"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", "${TargetGroup.TargetGroupFullName}", "LoadBalancer", "${ApplicationLoadBalancer.LoadBalancerFullName}" ],
+                  [ ".", "UnHealthyHostCount", ".", ".", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Target Health"
+              }
+            }
+          ]
+        }
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+
+Outputs:
+  # Infrastructure Information
+  VPCId:
+    Description: 'VPC ID used for deployment'
+    Value: !Ref VpcId
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-vpc-id'
+
+  ClusterName:
+    Description: 'ECS Cluster name'
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-cluster-name'
+
+  ServiceName:
+    Description: 'ECS Service name'
+    Value: !Ref ECSService
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-service-name'
+
+  # Container Registry
+  ECRRepositoryURI:
+    Description: 'ECR Repository URI for container images'
+    Value: !GetAtt ECRRepository.RepositoryUri
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ecr-uri'
+
+  ECRRepositoryName:
+    Description: 'ECR Repository name'
+    Value: !Ref ECRRepository
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ecr-name'
+
+  # Load Balancer Information
+  ApplicationLoadBalancerDNS:
+    Description: 'Application Load Balancer DNS name'
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-alb-dns'
+
+  ApplicationLoadBalancerURL:
+    Description: 'Application Load Balancer URL'
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-alb-url'
+
+  ApplicationLoadBalancerArn:
+    Description: 'Application Load Balancer ARN'
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-alb-arn'
+
+  TargetGroupArn:
+    Description: 'Target Group ARN'
+    Value: !Ref TargetGroup
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-tg-arn'
+
+  # Security Groups
+  ALBSecurityGroupId:
+    Description: 'ALB Security Group ID'
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-alb-sg-id'
+
+  FargateSecurityGroupId:
+    Description: 'Fargate Security Group ID'
+    Value: !Ref FargateSecurityGroup
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-fargate-sg-id'
+
+  # IAM Roles
+  TaskExecutionRoleArn:
+    Description: 'Task Execution Role ARN'
+    Value: !GetAtt TaskExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-task-execution-role-arn'
+
+  TaskRoleArn:
+    Description: 'Task Role ARN'
+    Value: !GetAtt TaskRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-task-role-arn'
+
+  # Monitoring
+  LogGroupName:
+    Description: 'CloudWatch Log Group name'
+    Value: !Ref LogGroup
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-log-group-name'
+
+  LogGroupArn:
+    Description: 'CloudWatch Log Group ARN'
+    Value: !GetAtt LogGroup.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-log-group-arn'
+
+  DashboardURL:
+    Description: 'CloudWatch Dashboard URL'
+    Condition: EnableDetailedMonitoring
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-dashboard'
+
+  # Auto Scaling
+  ScalableTargetArn:
+    Description: 'Application Auto Scaling Scalable Target ARN'
+    Value: !Ref ScalableTarget
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-scalable-target-arn'
+
+  CPUScalingPolicyArn:
+    Description: 'CPU Scaling Policy ARN'
+    Value: !Ref CPUScalingPolicy
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-cpu-scaling-policy-arn'
+
+  MemoryScalingPolicyArn:
+    Description: 'Memory Scaling Policy ARN'
+    Value: !Ref MemoryScalingPolicy
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-memory-scaling-policy-arn'
+
+  # Deployment Information
+  TaskDefinitionArn:
+    Description: 'Task Definition ARN'
+    Value: !Ref TaskDefinition
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-task-definition-arn'
+
+  Environment:
+    Description: 'Environment name'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-environment'
+
+  ProjectName:
+    Description: 'Project name'
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-project-name'
+
+  # Quick Commands
+  ECSExecuteCommand:
+    Description: 'AWS CLI command to execute into a running container'
+    Value: !Sub 'aws ecs execute-command --cluster ${ECSCluster} --task <TASK_ID> --container ${ProjectName}-container --interactive --command "/bin/bash"'
+
+  LogsCommand:
+    Description: 'AWS CLI command to view logs'
+    Value: !Sub 'aws logs tail /ecs/${ProjectName}-${Environment} --follow'
+
+  ServiceUpdateCommand:
+    Description: 'AWS CLI command to update service with new task definition'
+    Value: !Sub 'aws ecs update-service --cluster ${ECSCluster} --service ${ECSService} --task-definition ${TaskDefinition}'

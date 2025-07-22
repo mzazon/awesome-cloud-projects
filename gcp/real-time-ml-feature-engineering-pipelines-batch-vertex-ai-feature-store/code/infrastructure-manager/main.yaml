@@ -1,0 +1,539 @@
+# Infrastructure Manager Configuration for Real-Time ML Feature Engineering Pipeline
+# This configuration deploys a complete ML feature engineering pipeline using
+# Cloud Batch, Vertex AI Feature Store, Pub/Sub, and BigQuery
+
+imports:
+  - path: variables.yaml
+
+resources:
+  # Enable required APIs
+  - name: enable-aiplatform-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/aiplatform.googleapis.com
+      parent: projects/${project_id}
+    metadata:
+      runtimePolicy:
+        - CREATE
+
+  - name: enable-batch-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/batch.googleapis.com
+      parent: projects/${project_id}
+    metadata:
+      runtimePolicy:
+        - CREATE
+
+  - name: enable-pubsub-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/pubsub.googleapis.com
+      parent: projects/${project_id}
+    metadata:
+      runtimePolicy:
+        - CREATE
+
+  - name: enable-bigquery-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/bigquery.googleapis.com
+      parent: projects/${project_id}
+    metadata:
+      runtimePolicy:
+        - CREATE
+
+  - name: enable-cloudfunctions-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/cloudfunctions.googleapis.com
+      parent: projects/${project_id}
+    metadata:
+      runtimePolicy:
+        - CREATE
+
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/storage.googleapis.com
+      parent: projects/${project_id}
+    metadata:
+      runtimePolicy:
+        - CREATE
+
+  # Cloud Storage bucket for batch processing artifacts
+  - name: ml-features-bucket
+    type: gcp-types/storage-v1:bucket
+    properties:
+      name: ml-features-bucket-${random_suffix}
+      location: ${region}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              numNewerVersions: 5
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # BigQuery dataset for feature storage
+  - name: feature-dataset
+    type: gcp-types/bigquery-v2:dataset
+    properties:
+      datasetId: feature_dataset_${random_suffix}
+      projectId: ${project_id}
+      location: ${region}
+      description: "Dataset for ML feature engineering pipeline"
+      defaultTableExpirationMs: 2592000000  # 30 days
+      access:
+        - role: OWNER
+          specialGroup: projectOwners
+        - role: READER
+          specialGroup: projectReaders
+        - role: WRITER
+          specialGroup: projectWriters
+    metadata:
+      dependsOn:
+        - enable-bigquery-api
+
+  # BigQuery table for user features
+  - name: user-features-table
+    type: gcp-types/bigquery-v2:table
+    properties:
+      projectId: ${project_id}
+      datasetId: $(ref.feature-dataset.datasetId)
+      tableId: user_features
+      description: "Table storing computed user features for ML models"
+      schema:
+        fields:
+          - name: user_id
+            type: STRING
+            mode: REQUIRED
+            description: "Unique identifier for the user"
+          - name: feature_timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "Timestamp when features were computed"
+          - name: avg_session_duration
+            type: FLOAT
+            mode: NULLABLE
+            description: "Average session duration in minutes"
+          - name: total_purchases
+            type: INTEGER
+            mode: NULLABLE
+            description: "Total number of purchases"
+          - name: days_since_last_login
+            type: INTEGER
+            mode: NULLABLE
+            description: "Days since last login"
+          - name: purchase_frequency
+            type: FLOAT
+            mode: NULLABLE
+            description: "Purchase frequency per day"
+          - name: preferred_category
+            type: STRING
+            mode: NULLABLE
+            description: "Most frequently purchased category"
+      timePartitioning:
+        type: DAY
+        field: feature_timestamp
+        expirationMs: 7776000000  # 90 days
+    metadata:
+      dependsOn:
+        - feature-dataset
+
+  # BigQuery table for raw user events (source data)
+  - name: raw-user-events-table
+    type: gcp-types/bigquery-v2:table
+    properties:
+      projectId: ${project_id}
+      datasetId: $(ref.feature-dataset.datasetId)
+      tableId: raw_user_events
+      description: "Table storing raw user events for feature engineering"
+      schema:
+        fields:
+          - name: user_id
+            type: STRING
+            mode: REQUIRED
+            description: "Unique identifier for the user"
+          - name: event_timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "Timestamp when event occurred"
+          - name: event_type
+            type: STRING
+            mode: REQUIRED
+            description: "Type of user event (login, purchase, etc.)"
+          - name: session_duration
+            type: FLOAT
+            mode: NULLABLE
+            description: "Session duration in minutes"
+          - name: purchase_amount
+            type: FLOAT
+            mode: NULLABLE
+            description: "Purchase amount in dollars"
+          - name: category
+            type: STRING
+            mode: NULLABLE
+            description: "Product or content category"
+      timePartitioning:
+        type: DAY
+        field: event_timestamp
+        expirationMs: 15552000000  # 180 days
+    metadata:
+      dependsOn:
+        - feature-dataset
+
+  # Pub/Sub topic for event-driven feature pipeline triggers
+  - name: feature-updates-topic
+    type: gcp-types/pubsub-v1:topic
+    properties:
+      name: projects/${project_id}/topics/feature-updates-${random_suffix}
+      messageRetentionDuration: 604800s  # 7 days
+      messageStoragePolicy:
+        allowedPersistenceRegions:
+          - ${region}
+    metadata:
+      dependsOn:
+        - enable-pubsub-api
+
+  # Pub/Sub subscription for batch job triggering
+  - name: feature-pipeline-subscription
+    type: gcp-types/pubsub-v1:subscription
+    properties:
+      name: projects/${project_id}/subscriptions/feature-pipeline-sub-${random_suffix}
+      topic: $(ref.feature-updates-topic.name)
+      ackDeadlineSeconds: 600
+      messageRetentionDuration: 604800s  # 7 days
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+      deadLetterPolicy:
+        maxDeliveryAttempts: 10
+    metadata:
+      dependsOn:
+        - feature-updates-topic
+
+  # Service Account for Cloud Batch jobs
+  - name: batch-service-account
+    type: gcp-types/iam-v1:serviceAccount
+    properties:
+      accountId: batch-feature-pipeline-${random_suffix}
+      displayName: "Service Account for Feature Engineering Batch Jobs"
+      description: "Service account used by Cloud Batch for feature engineering pipeline"
+      project: ${project_id}
+    metadata:
+      dependsOn:
+        - enable-batch-api
+
+  # IAM bindings for Batch service account
+  - name: batch-sa-bigquery-binding
+    type: gcp-types/cloudresourcemanager-v1:bindings
+    properties:
+      resource: projects/${project_id}
+      bindings:
+        - role: roles/bigquery.dataEditor
+          members:
+            - serviceAccount:$(ref.batch-service-account.email)
+        - role: roles/bigquery.jobUser
+          members:
+            - serviceAccount:$(ref.batch-service-account.email)
+        - role: roles/storage.objectViewer
+          members:
+            - serviceAccount:$(ref.batch-service-account.email)
+    metadata:
+      dependsOn:
+        - batch-service-account
+
+  # Vertex AI Feature Group for centralized feature management
+  - name: user-feature-group
+    type: gcp-types/aiplatform-v1:projects.locations.featureGroups
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      featureGroupId: user-feature-group-${random_suffix}
+      description: "Feature group for user behavior features"
+      bigQuery:
+        bigQuerySource:
+          inputUri: bq://${project_id}.$(ref.feature-dataset.datasetId).user_features
+        entityIdColumns:
+          - user_id
+      labels:
+        environment: ${environment}
+        team: ml-engineering
+        purpose: feature-store
+    metadata:
+      dependsOn:
+        - enable-aiplatform-api
+        - user-features-table
+
+  # Individual features within the feature group
+  - name: avg-session-duration-feature
+    type: gcp-types/aiplatform-v1:projects.locations.featureGroups.features
+    properties:
+      parent: $(ref.user-feature-group.name)
+      featureId: avg_session_duration
+      description: "Average session duration in minutes"
+      valueType: DOUBLE
+      labels:
+        feature-type: numerical
+        business-domain: user-behavior
+    metadata:
+      dependsOn:
+        - user-feature-group
+
+  - name: total-purchases-feature
+    type: gcp-types/aiplatform-v1:projects.locations.featureGroups.features
+    properties:
+      parent: $(ref.user-feature-group.name)
+      featureId: total_purchases
+      description: "Total number of purchases"
+      valueType: INT64
+      labels:
+        feature-type: numerical
+        business-domain: commerce
+    metadata:
+      dependsOn:
+        - user-feature-group
+
+  - name: purchase-frequency-feature
+    type: gcp-types/aiplatform-v1:projects.locations.featureGroups.features
+    properties:
+      parent: $(ref.user-feature-group.name)
+      featureId: purchase_frequency
+      description: "Purchase frequency per day"
+      valueType: DOUBLE
+      labels:
+        feature-type: numerical
+        business-domain: commerce
+    metadata:
+      dependsOn:
+        - user-feature-group
+
+  - name: days-since-last-login-feature
+    type: gcp-types/aiplatform-v1:projects.locations.featureGroups.features
+    properties:
+      parent: $(ref.user-feature-group.name)
+      featureId: days_since_last_login
+      description: "Days since last user login"
+      valueType: INT64
+      labels:
+        feature-type: numerical
+        business-domain: user-behavior
+    metadata:
+      dependsOn:
+        - user-feature-group
+
+  - name: preferred-category-feature
+    type: gcp-types/aiplatform-v1:projects.locations.featureGroups.features
+    properties:
+      parent: $(ref.user-feature-group.name)
+      featureId: preferred_category
+      description: "User's most frequently purchased category"
+      valueType: STRING
+      labels:
+        feature-type: categorical
+        business-domain: commerce
+    metadata:
+      dependsOn:
+        - user-feature-group
+
+  # Vertex AI Online Store for real-time feature serving
+  - name: user-features-online-store
+    type: gcp-types/aiplatform-v1:projects.locations.featureOnlineStores
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      featureOnlineStoreId: user-features-store-${random_suffix}
+      description: "Online store for real-time user feature serving"
+      bigtable:
+        autoScaling:
+          minNodeCount: 1
+          maxNodeCount: 10
+          cpuUtilizationTarget: 70
+      labels:
+        environment: ${environment}
+        team: ml-engineering
+        purpose: online-serving
+    metadata:
+      dependsOn:
+        - enable-aiplatform-api
+
+  # Feature View for online serving configuration
+  - name: user-feature-view
+    type: gcp-types/aiplatform-v1:projects.locations.featureOnlineStores.featureViews
+    properties:
+      parent: $(ref.user-features-online-store.name)
+      featureViewId: user-feature-view-${random_suffix}
+      description: "Feature view for online user feature serving"
+      featureRegistrySource:
+        featureGroups:
+          - featureGroupId: $(ref.user-feature-group.featureGroupId)
+            featureIds:
+              - avg_session_duration
+              - total_purchases
+              - purchase_frequency
+              - days_since_last_login
+              - preferred_category
+      syncConfig:
+        cron: "0 */6 * * *"  # Sync every 6 hours
+      labels:
+        environment: ${environment}
+        serving-type: online
+    metadata:
+      dependsOn:
+        - user-features-online-store
+        - user-feature-group
+
+  # Service Account for Cloud Functions
+  - name: function-service-account
+    type: gcp-types/iam-v1:serviceAccount
+    properties:
+      accountId: function-feature-pipeline-${random_suffix}
+      displayName: "Service Account for Feature Pipeline Cloud Function"
+      description: "Service account for Cloud Function that triggers feature pipeline"
+      project: ${project_id}
+    metadata:
+      dependsOn:
+        - enable-cloudfunctions-api
+
+  # IAM bindings for Function service account
+  - name: function-sa-bindings
+    type: gcp-types/cloudresourcemanager-v1:bindings
+    properties:
+      resource: projects/${project_id}
+      bindings:
+        - role: roles/batch.jobsEditor
+          members:
+            - serviceAccount:$(ref.function-service-account.email)
+        - role: roles/pubsub.subscriber
+          members:
+            - serviceAccount:$(ref.function-service-account.email)
+        - role: roles/logging.logWriter
+          members:
+            - serviceAccount:$(ref.function-service-account.email)
+    metadata:
+      dependsOn:
+        - function-service-account
+
+# Output important resource identifiers and connection strings
+outputs:
+  - name: project_id
+    value: ${project_id}
+    description: "Google Cloud Project ID"
+
+  - name: region
+    value: ${region}
+    description: "Primary deployment region"
+
+  - name: bucket_name
+    value: $(ref.ml-features-bucket.name)
+    description: "Cloud Storage bucket for batch processing artifacts"
+
+  - name: dataset_id
+    value: $(ref.feature-dataset.datasetId)
+    description: "BigQuery dataset ID for feature storage"
+
+  - name: user_features_table
+    value: ${project_id}.$(ref.feature-dataset.datasetId).user_features
+    description: "Fully qualified BigQuery table name for user features"
+
+  - name: raw_events_table
+    value: ${project_id}.$(ref.feature-dataset.datasetId).raw_user_events
+    description: "Fully qualified BigQuery table name for raw user events"
+
+  - name: pubsub_topic
+    value: $(ref.feature-updates-topic.name)
+    description: "Pub/Sub topic for feature pipeline triggers"
+
+  - name: pubsub_subscription
+    value: $(ref.feature-pipeline-subscription.name)
+    description: "Pub/Sub subscription for batch job triggering"
+
+  - name: feature_group_name
+    value: $(ref.user-feature-group.name)
+    description: "Vertex AI Feature Group resource name"
+
+  - name: online_store_name
+    value: $(ref.user-features-online-store.name)
+    description: "Vertex AI Online Store resource name"
+
+  - name: feature_view_name
+    value: $(ref.user-feature-view.name)
+    description: "Vertex AI Feature View resource name"
+
+  - name: batch_service_account
+    value: $(ref.batch-service-account.email)
+    description: "Service account email for Cloud Batch jobs"
+
+  - name: function_service_account
+    value: $(ref.function-service-account.email)
+    description: "Service account email for Cloud Functions"
+
+# Variables schema definition
+schema:
+  info:
+    title: ML Feature Engineering Pipeline Infrastructure
+    description: "Infrastructure Manager configuration for real-time ML feature engineering pipeline with Cloud Batch and Vertex AI Feature Store"
+    version: "1.0"
+
+  required:
+    - project_id
+    - region
+    - random_suffix
+
+  properties:
+    project_id:
+      type: string
+      description: "Google Cloud Project ID where resources will be created"
+      pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+
+    region:
+      type: string
+      description: "Primary region for resource deployment"
+      default: "us-central1"
+      enum:
+        - "us-central1"
+        - "us-east1"
+        - "us-west1"
+        - "europe-west1"
+        - "asia-southeast1"
+
+    zone:
+      type: string
+      description: "Primary zone for zonal resources"
+      default: "us-central1-a"
+
+    random_suffix:
+      type: string
+      description: "Random suffix for unique resource naming"
+      pattern: "^[a-z0-9]{6}$"
+
+    environment:
+      type: string
+      description: "Environment label for resource organization"
+      default: "development"
+      enum:
+        - "development"
+        - "staging"
+        - "production"
+
+# Metadata for Infrastructure Manager
+metadata:
+  version: "1.0"
+  description: "Complete ML feature engineering pipeline infrastructure"
+  author: "Google Cloud Infrastructure Manager"
+  created: "2025-07-12"
+  tags:
+    - machine-learning
+    - feature-engineering
+    - batch-processing
+    - vertex-ai
+    - bigquery
+    - pubsub

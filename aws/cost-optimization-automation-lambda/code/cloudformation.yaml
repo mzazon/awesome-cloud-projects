@@ -1,0 +1,1534 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Cost Optimization Automation with Lambda and Trusted Advisor APIs - Automated system for continuous cost monitoring and optimization'
+
+# Template metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "Notification Settings"
+        Parameters:
+          - NotificationEmail
+          - SlackWebhookUrl
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaRuntime
+          - LambdaMemorySize
+          - LambdaTimeout
+      - Label:
+          default: "Scheduling Configuration"
+        Parameters:
+          - DailyAnalysisSchedule
+          - WeeklyAnalysisSchedule
+          - EnableAutoRemediation
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - RetentionPeriodDays
+          - DynamoDBReadCapacity
+          - DynamoDBWriteCapacity
+    ParameterLabels:
+      Environment:
+        default: "Environment Name"
+      ProjectName:
+        default: "Project Name"
+      NotificationEmail:
+        default: "Notification Email Address"
+      SlackWebhookUrl:
+        default: "Slack Webhook URL (Optional)"
+      LambdaRuntime:
+        default: "Lambda Runtime Version"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      DailyAnalysisSchedule:
+        default: "Daily Analysis Schedule"
+      WeeklyAnalysisSchedule:
+        default: "Weekly Analysis Schedule"
+      EnableAutoRemediation:
+        default: "Enable Auto Remediation"
+      RetentionPeriodDays:
+        default: "Data Retention Period (days)"
+      DynamoDBReadCapacity:
+        default: "DynamoDB Read Capacity Units"
+      DynamoDBWriteCapacity:
+        default: "DynamoDB Write Capacity Units"
+
+# Input parameters for customization
+Parameters:
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name for resource naming and tagging'
+
+  ProjectName:
+    Type: String
+    Default: 'cost-optimization'
+    Description: 'Project name for resource naming and tagging'
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for cost optimization notifications'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  SlackWebhookUrl:
+    Type: String
+    Default: ''
+    Description: 'Optional Slack webhook URL for notifications'
+    NoEcho: true
+
+  LambdaRuntime:
+    Type: String
+    Default: 'python3.9'
+    AllowedValues: ['python3.9', 'python3.10', 'python3.11']
+    Description: 'Python runtime version for Lambda functions'
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    MinValue: 256
+    MaxValue: 3008
+    Description: 'Memory size for Lambda functions in MB'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 30
+    MaxValue: 900
+    Description: 'Timeout for Lambda functions in seconds'
+
+  DailyAnalysisSchedule:
+    Type: String
+    Default: 'rate(1 day)'
+    Description: 'Schedule expression for daily cost analysis'
+    AllowedPattern: '^(rate\(\d+\s+(minute|minutes|hour|hours|day|days)\)|cron\(.+\))$'
+    ConstraintDescription: 'Must be a valid rate or cron expression'
+
+  WeeklyAnalysisSchedule:
+    Type: String
+    Default: 'rate(7 days)'
+    Description: 'Schedule expression for weekly comprehensive analysis'
+    AllowedPattern: '^(rate\(\d+\s+(minute|minutes|hour|hours|day|days)\)|cron\(.+\))$'
+    ConstraintDescription: 'Must be a valid rate or cron expression'
+
+  EnableAutoRemediation:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable automatic remediation for approved actions'
+
+  RetentionPeriodDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    MaxValue: 2555
+    Description: 'Number of days to retain cost optimization data'
+
+  DynamoDBReadCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+    Description: 'DynamoDB read capacity units'
+
+  DynamoDBWriteCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+    Description: 'DynamoDB write capacity units'
+
+# Conditional resource creation
+Conditions:
+  HasSlackWebhook: !Not [!Equals [!Ref SlackWebhookUrl, '']]
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  AutoRemediationEnabled: !Equals [!Ref EnableAutoRemediation, 'true']
+
+# Infrastructure resources
+Resources:
+  # S3 Bucket for storing cost optimization reports and Lambda code
+  CostOptimizationBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-reports-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldReports
+            Status: Enabled
+            ExpirationInDays: !Ref RetentionPeriodDays
+          - Id: TransitionToIA
+            Status: Enabled
+            TransitionInDays: 30
+            StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            TransitionInDays: 90
+            StorageClass: GLACIER
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref CostOptimizationLogGroup
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Cost Optimization Reports'
+
+  # S3 Bucket Policy for secure access
+  CostOptimizationBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CostOptimizationBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${CostOptimizationBucket}/*'
+              - !Sub '${CostOptimizationBucket}'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: AllowLambdaAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt CostOptimizationRole.Arn
+            Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+              - 's3:DeleteObject'
+            Resource: !Sub '${CostOptimizationBucket}/*'
+
+  # DynamoDB Table for tracking cost optimization opportunities
+  CostOptimizationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-tracking-${Environment}'
+      AttributeDefinitions:
+        - AttributeName: ResourceId
+          AttributeType: S
+        - AttributeName: CheckId
+          AttributeType: S
+        - AttributeName: Timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ResourceId
+          KeyType: HASH
+        - AttributeName: CheckId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: CheckId-Timestamp-index
+          KeySchema:
+            - AttributeName: CheckId
+              KeyType: HASH
+            - AttributeName: Timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !Ref DynamoDBReadCapacity
+            WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref DynamoDBReadCapacity
+        WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Cost Optimization Tracking'
+
+  # SNS Topic for notifications
+  CostOptimizationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-alerts-${Environment}'
+      DisplayName: 'Cost Optimization Alerts'
+      KmsMasterKeyId: alias/aws/sns
+      DeliveryStatusLogging:
+        - Protocol: email
+          SuccessFeedbackRoleArn: !GetAtt SNSLoggingRole.Arn
+          FailureFeedbackRoleArn: !GetAtt SNSLoggingRole.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Cost Optimization Notifications'
+
+  # SNS Topic Policy
+  CostOptimizationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref CostOptimizationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowLambdaPublish
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt CostOptimizationRole.Arn
+            Action:
+              - 'sns:Publish'
+            Resource: !Ref CostOptimizationTopic
+
+  # Email subscription to SNS topic
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref CostOptimizationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # Optional Slack webhook subscription
+  SlackSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasSlackWebhook
+    Properties:
+      Protocol: https
+      TopicArn: !Ref CostOptimizationTopic
+      Endpoint: !Ref SlackWebhookUrl
+
+  # CloudWatch Log Group for centralized logging
+  CostOptimizationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}'
+      RetentionInDays: !Ref RetentionPeriodDays
+      KmsKeyId: !GetAtt LogsKMSKey.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # KMS Key for CloudWatch Logs encryption
+  LogsKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'KMS key for Cost Optimization CloudWatch Logs encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:DescribeKey'
+            Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # KMS Key Alias
+  LogsKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-logs-${Environment}'
+      TargetKeyId: !Ref LogsKMSKey
+
+  # IAM Role for Lambda functions
+  CostOptimizationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: CostOptimizationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CloudWatch Logs permissions
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-${Environment}*'
+              
+              # Trusted Advisor and Support permissions
+              - Effect: Allow
+                Action:
+                  - 'support:DescribeTrustedAdvisorChecks'
+                  - 'support:DescribeTrustedAdvisorCheckResult'
+                  - 'support:RefreshTrustedAdvisorCheck'
+                Resource: '*'
+              
+              # Cost Explorer permissions
+              - Effect: Allow
+                Action:
+                  - 'ce:GetCostAndUsage'
+                  - 'ce:GetDimensionValues'
+                  - 'ce:GetUsageReport'
+                  - 'ce:GetReservationCoverage'
+                  - 'ce:GetReservationPurchaseRecommendation'
+                  - 'ce:GetReservationUtilization'
+                  - 'ce:GetRightsizingRecommendation'
+                  - 'ce:GetSavingsUtilization'
+                  - 'ce:GetSavingsPlansUtilization'
+                Resource: '*'
+              
+              # DynamoDB permissions
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                Resource: !GetAtt CostOptimizationTable.Arn
+              
+              # DynamoDB GSI permissions
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                Resource: !Sub '${CostOptimizationTable.Arn}/index/*'
+              
+              # SNS permissions
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref CostOptimizationTopic
+              
+              # S3 permissions
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                Resource: !Sub '${CostOptimizationBucket}/*'
+              
+              # Lambda invocation permissions
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: 
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-analysis-${Environment}'
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-remediation-${Environment}'
+              
+              # EC2 permissions for remediation
+              - Effect: Allow
+                Action:
+                  - 'ec2:DescribeInstances'
+                  - 'ec2:DescribeVolumes'
+                  - 'ec2:DescribeSnapshots'
+                  - 'ec2:CreateSnapshot'
+                  - 'ec2:ModifyInstanceAttribute'
+                  - 'ec2:StopInstances'
+                  - 'ec2:TerminateInstances'
+                  - 'ec2:ModifyVolume'
+                  - 'ec2:DeleteVolume'
+                Resource: '*'
+              
+              # RDS permissions for remediation
+              - Effect: Allow
+                Action:
+                  - 'rds:DescribeDBInstances'
+                  - 'rds:DescribeDBClusters'
+                  - 'rds:ModifyDBInstance'
+                  - 'rds:StopDBInstance'
+                  - 'rds:StartDBInstance'
+                  - 'rds:CreateDBSnapshot'
+                Resource: '*'
+              
+              # KMS permissions for encryption
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:GenerateDataKey'
+                Resource: !GetAtt LogsKMSKey.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for SNS delivery status logging
+  SNSLoggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-sns-logging-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: SNSLoggingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/sns/*'
+
+  # IAM Role for EventBridge Scheduler
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-scheduler-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: SchedulerLambdaInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: 
+                  - !GetAtt CostAnalysisFunction.Arn
+                  - !GetAtt CostRemediationFunction.Arn
+
+  # Lambda function for cost analysis
+  CostAnalysisFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-analysis-${Environment}'
+      Runtime: !Ref LambdaRuntime
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt CostOptimizationRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      ReservedConcurrencyLimit: !If [IsProduction, 10, 5]
+      Environment:
+        Variables:
+          COST_OPT_TABLE: !Ref CostOptimizationTable
+          REMEDIATION_FUNCTION_NAME: !Sub '${ProjectName}-remediation-${Environment}'
+          SNS_TOPIC_ARN: !Ref CostOptimizationTopic
+          S3_BUCKET: !Ref CostOptimizationBucket
+          ENVIRONMENT: !Ref Environment
+          AUTO_REMEDIATION_ENABLED: !Ref EnableAutoRemediation
+          LOG_LEVEL: !If [IsProduction, 'INFO', 'DEBUG']
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from datetime import datetime, timedelta
+          from decimal import Decimal
+          
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+          
+          def lambda_handler(event, context):
+              """
+              Main handler for cost analysis using Trusted Advisor APIs
+              """
+              logger.info("Starting cost optimization analysis...")
+              
+              # Initialize AWS clients
+              support_client = boto3.client('support', region_name='us-east-1')
+              ce_client = boto3.client('ce')
+              dynamodb = boto3.resource('dynamodb')
+              lambda_client = boto3.client('lambda')
+              s3_client = boto3.client('s3')
+              
+              # Get environment variables
+              table_name = os.environ['COST_OPT_TABLE']
+              remediation_function = os.environ['REMEDIATION_FUNCTION_NAME']
+              s3_bucket = os.environ['S3_BUCKET']
+              auto_remediation_enabled = os.environ.get('AUTO_REMEDIATION_ENABLED', 'false').lower() == 'true'
+              
+              table = dynamodb.Table(table_name)
+              
+              try:
+                  # Get list of cost optimization checks
+                  cost_checks = get_cost_optimization_checks(support_client)
+                  logger.info(f"Found {len(cost_checks)} cost optimization checks")
+                  
+                  # Process each check
+                  optimization_opportunities = []
+                  for check in cost_checks:
+                      logger.info(f"Processing check: {check['name']}")
+                      
+                      try:
+                          # Get check results
+                          check_result = support_client.describe_trusted_advisor_check_result(
+                              checkId=check['id'],
+                              language='en'
+                          )
+                          
+                          # Process flagged resources
+                          flagged_resources = check_result['result']['flaggedResources']
+                          logger.info(f"Found {len(flagged_resources)} flagged resources for check {check['name']}")
+                          
+                          for resource in flagged_resources:
+                              opportunity = {
+                                  'check_id': check['id'],
+                                  'check_name': check['name'],
+                                  'resource_id': resource['resourceId'],
+                                  'status': resource['status'],
+                                  'metadata': resource['metadata'],
+                                  'estimated_savings': extract_estimated_savings(resource),
+                                  'timestamp': datetime.now().isoformat()
+                              }
+                              
+                              # Store in DynamoDB
+                              store_optimization_opportunity(table, opportunity)
+                              
+                              # Add to opportunities list
+                              optimization_opportunities.append(opportunity)
+                      
+                      except Exception as e:
+                          logger.error(f"Error processing check {check['name']}: {str(e)}")
+                          continue
+                  
+                  # Get additional cost insights from Cost Explorer
+                  cost_insights = get_cost_explorer_insights(ce_client)
+                  
+                  # Trigger remediation for auto-approved actions
+                  auto_remediation_results = []
+                  if auto_remediation_enabled:
+                      for opportunity in optimization_opportunities:
+                          if should_auto_remediate(opportunity):
+                              logger.info(f"Triggering auto-remediation for: {opportunity['resource_id']}")
+                              
+                              remediation_payload = {
+                                  'opportunity': opportunity,
+                                  'action': 'auto_remediate'
+                              }
+                              
+                              try:
+                                  response = lambda_client.invoke(
+                                      FunctionName=remediation_function,
+                                      InvocationType='Event',
+                                      Payload=json.dumps(remediation_payload)
+                                  )
+                                  
+                                  auto_remediation_results.append({
+                                      'resource_id': opportunity['resource_id'],
+                                      'remediation_triggered': True
+                                  })
+                              except Exception as e:
+                                  logger.error(f"Failed to trigger remediation for {opportunity['resource_id']}: {str(e)}")
+                  
+                  # Generate and store summary report
+                  report = generate_cost_optimization_report(
+                      optimization_opportunities, 
+                      cost_insights, 
+                      auto_remediation_results
+                  )
+                  
+                  # Store report in S3
+                  store_report_s3(s3_client, s3_bucket, report)
+                  
+                  logger.info(f"Cost optimization analysis completed. Found {len(optimization_opportunities)} opportunities")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Cost optimization analysis completed successfully',
+                          'opportunities_found': len(optimization_opportunities),
+                          'auto_remediations_triggered': len(auto_remediation_results),
+                          'total_potential_savings': calculate_total_savings(optimization_opportunities),
+                          'report_s3_key': f"reports/{datetime.now().strftime('%Y/%m/%d')}/cost-optimization-report.json"
+                      }, default=str)
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in cost analysis: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+          
+          def get_cost_optimization_checks(support_client):
+              """Get all cost optimization related Trusted Advisor checks"""
+              response = support_client.describe_trusted_advisor_checks(language='en')
+              
+              cost_checks = []
+              for check in response['checks']:
+                  if 'cost' in check['category'].lower():
+                      cost_checks.append({
+                          'id': check['id'],
+                          'name': check['name'],
+                          'category': check['category'],
+                          'description': check['description']
+                      })
+              
+              return cost_checks
+          
+          def extract_estimated_savings(resource):
+              """Extract estimated savings from resource metadata"""
+              try:
+                  # Trusted Advisor stores savings in different metadata positions
+                  metadata = resource.get('metadata', [])
+                  
+                  # Common patterns for savings extraction
+                  for item in metadata:
+                      if '$' in str(item) and any(keyword in str(item).lower() 
+                                                for keyword in ['save', 'saving', 'cost']):
+                          # Extract numeric value
+                          import re
+                          savings_match = re.search(r'\$[\d,]+\.?\d*', str(item))
+                          if savings_match:
+                              return float(savings_match.group().replace('$', '').replace(',', ''))
+                  
+                  return 0.0
+              except Exception as e:
+                  logger.warning(f"Error extracting savings: {str(e)}")
+                  return 0.0
+          
+          def store_optimization_opportunity(table, opportunity):
+              """Store optimization opportunity in DynamoDB"""
+              try:
+                  table.put_item(
+                      Item={
+                          'ResourceId': opportunity['resource_id'],
+                          'CheckId': opportunity['check_id'],
+                          'CheckName': opportunity['check_name'],
+                          'Status': opportunity['status'],
+                          'EstimatedSavings': Decimal(str(opportunity['estimated_savings'])),
+                          'Timestamp': opportunity['timestamp'],
+                          'Metadata': json.dumps(opportunity['metadata']),
+                          'TTL': int((datetime.now() + timedelta(days=int(os.environ.get('RETENTION_DAYS', 90)))).timestamp())
+                      }
+                  )
+              except Exception as e:
+                  logger.error(f"Error storing opportunity: {str(e)}")
+          
+          def get_cost_explorer_insights(ce_client):
+              """Get additional cost insights from Cost Explorer"""
+              end_date = datetime.now()
+              start_date = end_date - timedelta(days=30)
+              
+              try:
+                  response = ce_client.get_cost_and_usage(
+                      TimePeriod={
+                          'Start': start_date.strftime('%Y-%m-%d'),
+                          'End': end_date.strftime('%Y-%m-%d')
+                      },
+                      Granularity='MONTHLY',
+                      Metrics=['BlendedCost'],
+                      GroupBy=[
+                          {'Type': 'DIMENSION', 'Key': 'SERVICE'}
+                      ]
+                  )
+                  
+                  return response['ResultsByTime']
+              except Exception as e:
+                  logger.error(f"Error getting Cost Explorer insights: {str(e)}")
+                  return []
+          
+          def should_auto_remediate(opportunity):
+              """Determine if opportunity should be auto-remediated"""
+              # Conservative auto-remediation policies
+              auto_remediate_checks = [
+                  'Amazon EBS volumes unattached',
+                  'Amazon RDS Idle DB Instances'
+              ]
+              
+              return (any(check in opportunity['check_name'] for check in auto_remediate_checks) and 
+                      opportunity['status'] == 'warning')
+          
+          def generate_cost_optimization_report(opportunities, cost_insights, auto_remediations):
+              """Generate comprehensive cost optimization report"""
+              report = {
+                  'summary': {
+                      'total_opportunities': len(opportunities),
+                      'total_potential_savings': calculate_total_savings(opportunities),
+                      'auto_remediations_applied': len(auto_remediations),
+                      'analysis_date': datetime.now().isoformat()
+                  },
+                  'top_opportunities': sorted(opportunities, 
+                                            key=lambda x: x['estimated_savings'], 
+                                            reverse=True)[:10],
+                  'savings_by_category': categorize_savings(opportunities),
+                  'cost_trends': cost_insights,
+                  'auto_remediations': auto_remediations
+              }
+              
+              return report
+          
+          def calculate_total_savings(opportunities):
+              """Calculate total potential savings"""
+              return sum(op['estimated_savings'] for op in opportunities)
+          
+          def categorize_savings(opportunities):
+              """Categorize savings by service type"""
+              categories = {}
+              for op in opportunities:
+                  service = extract_service_from_check(op['check_name'])
+                  if service not in categories:
+                      categories[service] = {'count': 0, 'total_savings': 0}
+                  categories[service]['count'] += 1
+                  categories[service]['total_savings'] += op['estimated_savings']
+              
+              return categories
+          
+          def extract_service_from_check(check_name):
+              """Extract AWS service from check name"""
+              if 'EC2' in check_name or 'Amazon EC2' in check_name:
+                  return 'EC2'
+              elif 'RDS' in check_name or 'Amazon RDS' in check_name:
+                  return 'RDS'
+              elif 'EBS' in check_name or 'Amazon EBS' in check_name:
+                  return 'EBS'
+              elif 'S3' in check_name or 'Amazon S3' in check_name:
+                  return 'S3'
+              elif 'ElastiCache' in check_name:
+                  return 'ElastiCache'
+              else:
+                  return 'Other'
+          
+          def store_report_s3(s3_client, bucket, report):
+              """Store report in S3"""
+              try:
+                  key = f"reports/{datetime.now().strftime('%Y/%m/%d')}/cost-optimization-report.json"
+                  s3_client.put_object(
+                      Bucket=bucket,
+                      Key=key,
+                      Body=json.dumps(report, indent=2, default=str),
+                      ContentType='application/json'
+                  )
+                  logger.info(f"Report stored in S3: s3://{bucket}/{key}")
+              except Exception as e:
+                  logger.error(f"Error storing report in S3: {str(e)}")
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Cost Analysis'
+
+  # Lambda function for cost remediation
+  CostRemediationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-remediation-${Environment}'
+      Runtime: !Ref LambdaRuntime
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt CostOptimizationRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      ReservedConcurrencyLimit: !If [IsProduction, 10, 5]
+      Environment:
+        Variables:
+          COST_OPT_TABLE: !Ref CostOptimizationTable
+          SNS_TOPIC_ARN: !Ref CostOptimizationTopic
+          S3_BUCKET: !Ref CostOptimizationBucket
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: !If [IsProduction, 'INFO', 'DEBUG']
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from datetime import datetime, timedelta
+          
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+          
+          def lambda_handler(event, context):
+              """
+              Handle cost optimization remediation actions
+              """
+              logger.info("Starting cost optimization remediation...")
+              
+              # Initialize AWS clients
+              ec2_client = boto3.client('ec2')
+              rds_client = boto3.client('rds')
+              s3_client = boto3.client('s3')
+              sns_client = boto3.client('sns')
+              dynamodb = boto3.resource('dynamodb')
+              
+              # Get environment variables
+              table_name = os.environ['COST_OPT_TABLE']
+              sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+              s3_bucket = os.environ['S3_BUCKET']
+              
+              table = dynamodb.Table(table_name)
+              
+              try:
+                  # Parse the incoming opportunity
+                  opportunity = event['opportunity']
+                  action = event.get('action', 'manual')
+                  
+                  logger.info(f"Processing remediation for: {opportunity['resource_id']}")
+                  logger.info(f"Check: {opportunity['check_name']}")
+                  
+                  # Route to appropriate remediation handler
+                  remediation_result = None
+                  
+                  if 'EC2' in opportunity['check_name']:
+                      remediation_result = handle_ec2_remediation(
+                          ec2_client, opportunity, action
+                      )
+                  elif 'RDS' in opportunity['check_name']:
+                      remediation_result = handle_rds_remediation(
+                          rds_client, opportunity, action
+                      )
+                  elif 'EBS' in opportunity['check_name']:
+                      remediation_result = handle_ebs_remediation(
+                          ec2_client, opportunity, action
+                      )
+                  elif 'S3' in opportunity['check_name']:
+                      remediation_result = handle_s3_remediation(
+                          s3_client, opportunity, action
+                      )
+                  else:
+                      remediation_result = {
+                          'status': 'skipped',
+                          'message': f"No automated remediation available for: {opportunity['check_name']}"
+                      }
+                  
+                  # Update tracking record
+                  update_remediation_tracking(table, opportunity, remediation_result)
+                  
+                  # Send notification
+                  send_remediation_notification(
+                      sns_client, sns_topic_arn, opportunity, remediation_result
+                  )
+                  
+                  logger.info(f"Remediation completed for {opportunity['resource_id']}: {remediation_result['status']}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Remediation completed',
+                          'resource_id': opportunity['resource_id'],
+                          'remediation_result': remediation_result
+                      }, default=str)
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in remediation: {str(e)}")
+                  
+                  # Send error notification
+                  try:
+                      error_notification = {
+                          'resource_id': opportunity.get('resource_id', 'unknown'),
+                          'error': str(e),
+                          'timestamp': datetime.now().isoformat()
+                      }
+                      
+                      sns_client.publish(
+                          TopicArn=sns_topic_arn,
+                          Message=json.dumps(error_notification, indent=2),
+                          Subject='Cost Optimization Remediation Error'
+                      )
+                  except Exception as notify_error:
+                      logger.error(f"Failed to send error notification: {str(notify_error)}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+          
+          def handle_ec2_remediation(ec2_client, opportunity, action):
+              """Handle EC2-related cost optimization remediation"""
+              resource_id = opportunity['resource_id']
+              check_name = opportunity['check_name']
+              
+              try:
+                  if 'stopped' in check_name.lower():
+                      # For stopped instances, consider termination after validation
+                      instance_info = ec2_client.describe_instances(
+                          InstanceIds=[resource_id]
+                      )
+                      
+                      if not instance_info['Reservations']:
+                          return {
+                              'status': 'error',
+                              'message': f'Instance {resource_id} not found'
+                          }
+                      
+                      instance = instance_info['Reservations'][0]['Instances'][0]
+                      
+                      # Check if instance has been stopped for more than 30 days
+                      if should_terminate_stopped_instance(instance):
+                          if action == 'auto_remediate':
+                              # Create snapshot before termination
+                              snapshot_ids = create_instance_snapshot(ec2_client, resource_id)
+                              
+                              # Terminate instance
+                              ec2_client.terminate_instances(InstanceIds=[resource_id])
+                              
+                              return {
+                                  'status': 'remediated',
+                                  'action': 'terminated',
+                                  'message': f'Terminated long-stopped instance {resource_id}',
+                                  'estimated_savings': opportunity['estimated_savings'],
+                                  'backup_snapshots': snapshot_ids
+                              }
+                          else:
+                              return {
+                                  'status': 'recommendation',
+                                  'action': 'terminate',
+                                  'message': f'Recommend terminating stopped instance {resource_id}',
+                                  'estimated_savings': opportunity['estimated_savings']
+                              }
+                  
+                  elif 'underutilized' in check_name.lower():
+                      # For underutilized instances, recommend downsizing
+                      return {
+                          'status': 'recommendation',
+                          'action': 'downsize',
+                          'message': f'Recommend downsizing underutilized instance {resource_id}',
+                          'estimated_savings': opportunity['estimated_savings']
+                      }
+                  
+                  return {
+                      'status': 'analyzed',
+                      'message': f'No automatic remediation for {check_name}'
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error handling EC2 remediation: {str(e)}")
+                  return {
+                      'status': 'error',
+                      'message': f'Error handling EC2 remediation: {str(e)}'
+                  }
+          
+          def handle_rds_remediation(rds_client, opportunity, action):
+              """Handle RDS-related cost optimization remediation"""
+              resource_id = opportunity['resource_id']
+              check_name = opportunity['check_name']
+              
+              try:
+                  if 'idle' in check_name.lower():
+                      # For idle RDS instances, recommend stopping
+                      if action == 'auto_remediate':
+                          # Stop the RDS instance
+                          rds_client.stop_db_instance(
+                              DBInstanceIdentifier=resource_id
+                          )
+                          
+                          return {
+                              'status': 'remediated',
+                              'action': 'stopped',
+                              'message': f'Stopped idle RDS instance {resource_id}',
+                              'estimated_savings': opportunity['estimated_savings']
+                          }
+                      else:
+                          return {
+                              'status': 'recommendation',
+                              'action': 'stop',
+                              'message': f'Recommend stopping idle RDS instance {resource_id}',
+                              'estimated_savings': opportunity['estimated_savings']
+                          }
+                  
+                  return {
+                      'status': 'analyzed',
+                      'message': f'No automatic remediation for {check_name}'
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error handling RDS remediation: {str(e)}")
+                  return {
+                      'status': 'error',
+                      'message': f'Error handling RDS remediation: {str(e)}'
+                  }
+          
+          def handle_ebs_remediation(ec2_client, opportunity, action):
+              """Handle EBS-related cost optimization remediation"""
+              resource_id = opportunity['resource_id']
+              check_name = opportunity['check_name']
+              
+              try:
+                  if 'unattached' in check_name.lower():
+                      # For unattached volumes, create snapshot and delete
+                      if action == 'auto_remediate':
+                          # Create snapshot before deletion
+                          snapshot_response = ec2_client.create_snapshot(
+                              VolumeId=resource_id,
+                              Description=f'Automated snapshot before deleting unattached volume {resource_id}'
+                          )
+                          
+                          # Delete unattached volume
+                          ec2_client.delete_volume(VolumeId=resource_id)
+                          
+                          return {
+                              'status': 'remediated',
+                              'action': 'deleted',
+                              'message': f'Deleted unattached EBS volume {resource_id}, snapshot: {snapshot_response["SnapshotId"]}',
+                              'estimated_savings': opportunity['estimated_savings'],
+                              'backup_snapshot': snapshot_response['SnapshotId']
+                          }
+                      else:
+                          return {
+                              'status': 'recommendation',
+                              'action': 'delete',
+                              'message': f'Recommend deleting unattached EBS volume {resource_id}',
+                              'estimated_savings': opportunity['estimated_savings']
+                          }
+                  
+                  return {
+                      'status': 'analyzed',
+                      'message': f'No automatic remediation for {check_name}'
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error handling EBS remediation: {str(e)}")
+                  return {
+                      'status': 'error',
+                      'message': f'Error handling EBS remediation: {str(e)}'
+                  }
+          
+          def handle_s3_remediation(s3_client, opportunity, action):
+              """Handle S3-related cost optimization remediation"""
+              resource_id = opportunity['resource_id']
+              check_name = opportunity['check_name']
+              
+              try:
+                  if 'lifecycle' in check_name.lower():
+                      # For S3 lifecycle issues, recommend lifecycle policies
+                      return {
+                          'status': 'recommendation',
+                          'action': 'configure_lifecycle',
+                          'message': f'Recommend configuring lifecycle policy for S3 bucket {resource_id}',
+                          'estimated_savings': opportunity['estimated_savings']
+                      }
+                  
+                  return {
+                      'status': 'analyzed',
+                      'message': f'No automatic remediation for {check_name}'
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error handling S3 remediation: {str(e)}")
+                  return {
+                      'status': 'error',
+                      'message': f'Error handling S3 remediation: {str(e)}'
+                  }
+          
+          def should_terminate_stopped_instance(instance):
+              """Check if stopped instance should be terminated"""
+              # This is a simplified check - in practice, you'd want to check
+              # CloudTrail logs or use custom tags to track stop duration
+              return instance['State']['Name'] == 'stopped'
+          
+          def create_instance_snapshot(ec2_client, instance_id):
+              """Create snapshots of instance volumes before termination"""
+              snapshot_ids = []
+              try:
+                  # Get instance volumes
+                  instance_info = ec2_client.describe_instances(
+                      InstanceIds=[instance_id]
+                  )
+                  
+                  instance = instance_info['Reservations'][0]['Instances'][0]
+                  
+                  # Create snapshots for all attached volumes
+                  for mapping in instance.get('BlockDeviceMappings', []):
+                      if 'Ebs' in mapping:
+                          volume_id = mapping['Ebs']['VolumeId']
+                          snapshot_response = ec2_client.create_snapshot(
+                              VolumeId=volume_id,
+                              Description=f'Automated snapshot before terminating instance {instance_id}'
+                          )
+                          snapshot_ids.append(snapshot_response['SnapshotId'])
+                  
+                  return snapshot_ids
+                  
+              except Exception as e:
+                  logger.error(f"Error creating snapshots: {str(e)}")
+                  return []
+          
+          def update_remediation_tracking(table, opportunity, remediation_result):
+              """Update DynamoDB tracking record with remediation results"""
+              try:
+                  table.update_item(
+                      Key={
+                          'ResourceId': opportunity['resource_id'],
+                          'CheckId': opportunity['check_id']
+                      },
+                      UpdateExpression='SET RemediationStatus = :status, RemediationResult = :result, RemediationTimestamp = :timestamp',
+                      ExpressionAttributeValues={
+                          ':status': remediation_result['status'],
+                          ':result': json.dumps(remediation_result),
+                          ':timestamp': datetime.now().isoformat()
+                      }
+                  )
+              except Exception as e:
+                  logger.error(f"Error updating remediation tracking: {str(e)}")
+          
+          def send_remediation_notification(sns_client, topic_arn, opportunity, remediation_result):
+              """Send notification about remediation action"""
+              try:
+                  notification = {
+                      'resource_id': opportunity['resource_id'],
+                      'check_name': opportunity['check_name'],
+                      'remediation_status': remediation_result['status'],
+                      'remediation_action': remediation_result.get('action', 'none'),
+                      'estimated_savings': opportunity['estimated_savings'],
+                      'message': remediation_result.get('message', ''),
+                      'timestamp': datetime.now().isoformat()
+                  }
+                  
+                  subject = f"Cost Optimization: {remediation_result['status'].title()} - {opportunity['check_name']}"
+                  
+                  sns_client.publish(
+                      TopicArn=topic_arn,
+                      Message=json.dumps(notification, indent=2),
+                      Subject=subject
+                  )
+              except Exception as e:
+                  logger.error(f"Error sending notification: {str(e)}")
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Cost Remediation'
+
+  # EventBridge Schedule Group
+  CostOptimizationScheduleGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: !Sub '${ProjectName}-schedules-${Environment}'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Daily cost analysis schedule
+  DailyCostAnalysisSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${ProjectName}-daily-analysis-${Environment}'
+      GroupName: !Ref CostOptimizationScheduleGroup
+      ScheduleExpression: !Ref DailyAnalysisSchedule
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !GetAtt CostAnalysisFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub |
+          {
+            "source": "scheduled",
+            "analysis_type": "daily",
+            "environment": "${Environment}"
+          }
+      State: 'ENABLED'
+
+  # Weekly comprehensive analysis schedule
+  WeeklyCostAnalysisSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${ProjectName}-weekly-analysis-${Environment}'
+      GroupName: !Ref CostOptimizationScheduleGroup
+      ScheduleExpression: !Ref WeeklyAnalysisSchedule
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !GetAtt CostAnalysisFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub |
+          {
+            "source": "scheduled",
+            "analysis_type": "comprehensive",
+            "comprehensive_analysis": true,
+            "environment": "${Environment}"
+          }
+      State: 'ENABLED'
+
+  # Lambda permission for EventBridge Scheduler
+  CostAnalysisSchedulerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CostAnalysisFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'scheduler.amazonaws.com'
+      SourceArn: !Sub 'arn:aws:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/${CostOptimizationScheduleGroup}/*'
+
+  # CloudWatch Dashboard
+  CostOptimizationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-dashboard-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${CostAnalysisFunction}" ],
+                  [ ".", "Invocations", ".", "." ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", "FunctionName", "${CostRemediationFunction}" ],
+                  [ ".", "Invocations", ".", "." ],
+                  [ ".", "Errors", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Cost Optimization Lambda Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${CostOptimizationTable}" ],
+                  [ ".", "ConsumedWriteCapacityUnits", ".", "." ],
+                  [ ".", "ItemCount", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "DynamoDB Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/SNS", "NumberOfMessagesPublished", "TopicName", "${CostOptimizationTopic}" ],
+                  [ ".", "NumberOfNotificationsDelivered", ".", "." ],
+                  [ ".", "NumberOfNotificationsFailed", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "SNS Notification Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${CostOptimizationLogGroup}'\n| fields @timestamp, @message\n| filter @message like /optimization/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Cost Optimization Analysis Logs"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms
+  CostAnalysisErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-analysis-errors-${Environment}'
+      AlarmDescription: 'Alarm for cost analysis function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CostAnalysisFunction
+      AlarmActions:
+        - !Ref CostOptimizationTopic
+      TreatMissingData: notBreaching
+
+  CostRemediationErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-remediation-errors-${Environment}'
+      AlarmDescription: 'Alarm for cost remediation function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CostRemediationFunction
+      AlarmActions:
+        - !Ref CostOptimizationTopic
+      TreatMissingData: notBreaching
+
+  # Lambda function duration alarm
+  CostAnalysisDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-analysis-duration-${Environment}'
+      AlarmDescription: 'Alarm for cost analysis function duration'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 240000  # 4 minutes (80% of 5-minute timeout)
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CostAnalysisFunction
+      AlarmActions:
+        - !Ref CostOptimizationTopic
+      TreatMissingData: notBreaching
+
+# Stack outputs
+Outputs:
+  CostOptimizationBucketName:
+    Description: 'S3 bucket name for cost optimization reports'
+    Value: !Ref CostOptimizationBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-CostOptimizationBucket'
+
+  CostOptimizationTableName:
+    Description: 'DynamoDB table name for cost optimization tracking'
+    Value: !Ref CostOptimizationTable
+    Export:
+      Name: !Sub '${AWS::StackName}-CostOptimizationTable'
+
+  CostOptimizationTopicArn:
+    Description: 'SNS topic ARN for cost optimization notifications'
+    Value: !Ref CostOptimizationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-CostOptimizationTopic'
+
+  CostAnalysisFunctionArn:
+    Description: 'Lambda function ARN for cost analysis'
+    Value: !GetAtt CostAnalysisFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CostAnalysisFunction'
+
+  CostRemediationFunctionArn:
+    Description: 'Lambda function ARN for cost remediation'
+    Value: !GetAtt CostRemediationFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CostRemediationFunction'
+
+  CostOptimizationDashboardURL:
+    Description: 'CloudWatch dashboard URL for cost optimization monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${CostOptimizationDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  CostOptimizationRoleArn:
+    Description: 'IAM role ARN for cost optimization Lambda functions'
+    Value: !GetAtt CostOptimizationRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CostOptimizationRole'
+
+  ScheduleGroupName:
+    Description: 'EventBridge schedule group name'
+    Value: !Ref CostOptimizationScheduleGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ScheduleGroup'
+
+  LogGroupName:
+    Description: 'CloudWatch log group name for cost optimization functions'
+    Value: !Ref CostOptimizationLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  KMSKeyArn:
+    Description: 'KMS key ARN for encryption'
+    Value: !GetAtt LogsKMSKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKey'

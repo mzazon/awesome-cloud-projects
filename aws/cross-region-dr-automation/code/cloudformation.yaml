@@ -1,0 +1,1064 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Cross-Region Disaster Recovery Automation with AWS Elastic Disaster Recovery - Complete infrastructure template for automated failover, monitoring, and orchestration'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Regional Configuration"
+        Parameters:
+          - PrimaryRegion
+          - DRRegion
+          - CrossRegionReplication
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - DRVpcCidr
+          - DRPublicSubnetCidr
+          - DRPrivateSubnetCidr
+          - CreateInternetGateway
+      - Label:
+          default: "DRS Configuration"
+        Parameters:
+          - ReplicationServerInstanceType
+          - StagingDiskType
+          - BandwidthThrottling
+          - UseDefaultSecurityGroup
+      - Label:
+          default: "Automation Configuration"
+        Parameters:
+          - ProjectName
+          - EnableAutomatedFailover
+          - EnableDRTesting
+          - TestingSchedule
+          - NotificationEmail
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - HealthCheckThreshold
+          - ReplicationLagThreshold
+          - AlarmEvaluationPeriods
+          - CreateDashboard
+    ParameterLabels:
+      PrimaryRegion:
+        default: "Primary AWS Region"
+      DRRegion:
+        default: "Disaster Recovery Region"
+      ProjectName:
+        default: "Project Name"
+      NotificationEmail:
+        default: "Email for Notifications"
+
+# Input Parameters
+Parameters:
+  PrimaryRegion:
+    Type: String
+    Default: us-east-1
+    AllowedValues:
+      - us-east-1
+      - us-west-2
+      - eu-west-1
+      - eu-central-1
+      - ap-southeast-1
+      - ap-northeast-1
+    Description: Primary AWS region where source servers are located
+    
+  DRRegion:
+    Type: String
+    Default: us-west-2
+    AllowedValues:
+      - us-east-1
+      - us-west-2
+      - eu-west-1
+      - eu-central-1
+      - ap-southeast-1
+      - ap-northeast-1
+    Description: Disaster recovery region (must be different from primary)
+    
+  ProjectName:
+    Type: String
+    Default: enterprise-dr
+    MinLength: 3
+    MaxLength: 32
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    Description: Project name for resource naming and tagging
+    
+  DRVpcCidr:
+    Type: String
+    Default: 10.100.0.0/16
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a valid CIDR block
+    Description: CIDR block for DR VPC
+    
+  DRPublicSubnetCidr:
+    Type: String
+    Default: 10.100.1.0/24
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a valid CIDR block
+    Description: CIDR block for DR public subnet
+    
+  DRPrivateSubnetCidr:
+    Type: String
+    Default: 10.100.2.0/24
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a valid CIDR block
+    Description: CIDR block for DR private subnet
+    
+  ReplicationServerInstanceType:
+    Type: String
+    Default: m5.large
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - m5.large
+      - m5.xlarge
+      - c5.large
+      - c5.xlarge
+    Description: Instance type for DRS replication servers
+    
+  StagingDiskType:
+    Type: String
+    Default: gp3
+    AllowedValues:
+      - gp2
+      - gp3
+      - io1
+      - io2
+    Description: EBS volume type for staging area
+    
+  BandwidthThrottling:
+    Type: Number
+    Default: 50000
+    MinValue: 1000
+    MaxValue: 100000
+    Description: Bandwidth throttling for replication (Mbps)
+    
+  EnableAutomatedFailover:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable automated failover capabilities
+    
+  EnableDRTesting:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable automated DR testing
+    
+  TestingSchedule:
+    Type: String
+    Default: 'rate(30 days)'
+    Description: Schedule expression for automated DR testing
+    
+  NotificationEmail:
+    Type: String
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    ConstraintDescription: Must be a valid email address
+    Description: Email address for DR notifications
+    
+  HealthCheckThreshold:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: Threshold for application health check alarm
+    
+  ReplicationLagThreshold:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 3600
+    Description: Threshold for replication lag alarm (seconds)
+    
+  AlarmEvaluationPeriods:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 5
+    Description: Number of periods for alarm evaluation
+    
+  CreateInternetGateway:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Create Internet Gateway for DR VPC
+    
+  CreateDashboard:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Create CloudWatch dashboard for monitoring
+    
+  UseDefaultSecurityGroup:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Use default security group for DRS replication
+    
+  CrossRegionReplication:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable cross-region replication
+
+# Conditions
+Conditions:
+  CreateIGW: !Equals [!Ref CreateInternetGateway, 'true']
+  EnableFailover: !Equals [!Ref EnableAutomatedFailover, 'true']
+  EnableTesting: !Equals [!Ref EnableDRTesting, 'true']
+  CreateDash: !Equals [!Ref CreateDashboard, 'true']
+  UseDefaultSG: !Equals [!Ref UseDefaultSecurityGroup, 'true']
+  EnableCrossRegion: !Equals [!Ref CrossRegionReplication, 'true']
+
+# Resources
+Resources:
+  # ===== IAM ROLES AND POLICIES =====
+  
+  # DR Automation Role
+  DRAutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-DR-Automation-Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - states.amazonaws.com
+                - ssm.amazonaws.com
+                - events.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Sub '${ProjectName}-dr-automation'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DRAutomationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  # DRS permissions
+                  - drs:*
+                  # EC2 permissions for DR infrastructure
+                  - ec2:Describe*
+                  - ec2:CreateTags
+                  - ec2:RunInstances
+                  - ec2:TerminateInstances
+                  - ec2:StopInstances
+                  - ec2:StartInstances
+                  - ec2:RebootInstances
+                  # Route 53 permissions for DNS failover
+                  - route53:ListHostedZones
+                  - route53:ChangeResourceRecordSets
+                  - route53:GetChange
+                  - route53:ListResourceRecordSets
+                  # SNS permissions for notifications
+                  - sns:Publish
+                  - sns:Subscribe
+                  - sns:Unsubscribe
+                  - sns:CreateTopic
+                  - sns:DeleteTopic
+                  # SSM permissions for automation
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                  - ssm:DescribeInstanceInformation
+                  - ssm:ListCommands
+                  # CloudWatch permissions
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  # Step Functions permissions
+                  - states:StartExecution
+                  - states:DescribeExecution
+                  - states:StopExecution
+                  # IAM permissions
+                  - iam:PassRole
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DisasterRecovery
+
+  # ===== NETWORKING INFRASTRUCTURE =====
+  
+  # DR VPC
+  DRVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref DRVpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DR-VPC'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DisasterRecovery
+
+  # Internet Gateway
+  DRInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: CreateIGW
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DR-IGW'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Attach Internet Gateway to VPC
+  DRIGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: CreateIGW
+    Properties:
+      VpcId: !Ref DRVPC
+      InternetGatewayId: !Ref DRInternetGateway
+
+  # Public Subnet
+  DRPublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref DRVPC
+      CidrBlock: !Ref DRPublicSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DR-Public-Subnet'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Type
+          Value: Public
+
+  # Private Subnet
+  DRPrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref DRVPC
+      CidrBlock: !Ref DRPrivateSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DR-Private-Subnet'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Type
+          Value: Private
+
+  # Public Route Table
+  DRPublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref DRVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DR-Public-RT'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Public Route to Internet Gateway
+  DRPublicRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateIGW
+    DependsOn: DRIGWAttachment
+    Properties:
+      RouteTableId: !Ref DRPublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref DRInternetGateway
+
+  # Associate Public Subnet with Public Route Table
+  DRPublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DRPublicSubnet
+      RouteTableId: !Ref DRPublicRouteTable
+
+  # Security Group for DRS
+  DRSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-DRS-SG'
+      GroupDescription: Security group for AWS Elastic Disaster Recovery
+      VpcId: !Ref DRVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS for DRS communication
+        - IpProtocol: tcp
+          FromPort: 1500
+          ToPort: 1500
+          CidrIp: 0.0.0.0/0
+          Description: DRS replication port
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref DRVpcCidr
+          Description: SSH within VPC
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          CidrIp: !Ref DRVpcCidr
+          Description: RDP within VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DRS-SecurityGroup'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ===== DRS CONFIGURATION =====
+  
+  # DRS Replication Configuration Template
+  DRSReplicationTemplate:
+    Type: AWS::DRS::ReplicationConfigurationTemplate
+    Properties:
+      AssociateDefaultSecurityGroup: !Ref UseDefaultSecurityGroup
+      BandwidthThrottling: !Ref BandwidthThrottling
+      CreatePublicIP: true
+      DataPlaneRouting: PRIVATE_IP
+      DefaultLargeStagingDiskType: !Ref StagingDiskType
+      EbsEncryption: DEFAULT
+      ReplicationServerInstanceType: !Ref ReplicationServerInstanceType
+      ReplicationServersSecurityGroupsIDs:
+        - !If [UseDefaultSG, !Ref 'AWS::NoValue', !Ref DRSSecurityGroup]
+      StagingAreaSubnetId: !Ref DRPrivateSubnet
+      StagingAreaTags:
+        Project: !Ref ProjectName
+        Purpose: DRS-Staging
+        CreatedBy: CloudFormation
+      UseDedicatedReplicationServer: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DRS-Replication
+
+  # ===== SNS TOPIC FOR NOTIFICATIONS =====
+  
+  # SNS Topic for DR Alerts
+  DRAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-DR-Alerts'
+      DisplayName: Disaster Recovery Alerts
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DRNotifications
+
+  # SNS Subscription for Email Notifications
+  DRAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref DRAlertsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ===== LAMBDA FUNCTIONS =====
+  
+  # Automated Failover Lambda Function
+  FailoverLambdaFunction:
+    Type: AWS::Lambda::Function
+    Condition: EnableFailover
+    Properties:
+      FunctionName: !Sub '${ProjectName}-automated-failover'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt DRAutomationRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          DR_REGION: !Ref DRRegion
+          SNS_TOPIC_ARN: !Ref DRAlertsTopic
+          PROJECT_NAME: !Ref ProjectName
+          VPC_ID: !Ref DRVPC
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              drs_client = boto3.client('drs', region_name=os.environ['DR_REGION'])
+              route53_client = boto3.client('route53')
+              sns_client = boto3.client('sns')
+              
+              try:
+                  # Get source servers for recovery
+                  response = drs_client.describe_source_servers()
+                  source_servers = response.get('sourceServers', [])
+                  
+                  recovery_jobs = []
+                  
+                  for server in source_servers:
+                      if server.get('sourceServerID'):
+                          # Start recovery job
+                          job_response = drs_client.start_recovery(
+                              sourceServers=[{
+                                  'sourceServerID': server['sourceServerID'],
+                                  'recoverySnapshotID': 'LATEST'
+                              }],
+                              tags={
+                                  'Purpose': 'AutomatedDR',
+                                  'Timestamp': datetime.utcnow().isoformat(),
+                                  'Project': os.environ['PROJECT_NAME']
+                              }
+                          )
+                          recovery_jobs.append(job_response['job']['jobID'])
+                  
+                  # Send notification
+                  sns_client.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Message=f'Automated DR failover initiated. Jobs: {recovery_jobs}',
+                      Subject='DR Failover Activated'
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Failover initiated successfully',
+                          'recoveryJobs': recovery_jobs
+                      })
+                  }
+                  
+              except Exception as e:
+                  sns_client.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Message=f'DR failover failed: {str(e)}',
+                      Subject='DR Failover Failed'
+                  )
+                  raise e
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DRAutomation
+
+  # DR Testing Lambda Function
+  DRTestingLambdaFunction:
+    Type: AWS::Lambda::Function
+    Condition: EnableTesting
+    Properties:
+      FunctionName: !Sub '${ProjectName}-dr-testing'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt DRAutomationRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          DR_REGION: !Ref DRRegion
+          PROJECT_NAME: !Ref ProjectName
+          SNS_TOPIC_ARN: !Ref DRAlertsTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          
+          def lambda_handler(event, context):
+              drs_client = boto3.client('drs', region_name=os.environ['DR_REGION'])
+              ssm_client = boto3.client('ssm', region_name=os.environ['DR_REGION'])
+              sns_client = boto3.client('sns')
+              
+              try:
+                  # Start drill for all source servers
+                  response = drs_client.describe_source_servers()
+                  source_servers = response.get('sourceServers', [])
+                  
+                  drill_jobs = []
+                  
+                  for server in source_servers:
+                      if server.get('sourceServerID'):
+                          # Start drill job
+                          job_response = drs_client.start_recovery(
+                              sourceServers=[{
+                                  'sourceServerID': server['sourceServerID'],
+                                  'recoverySnapshotID': 'LATEST'
+                              }],
+                              isDrill=True,
+                              tags={
+                                  'Purpose': 'DR-Drill',
+                                  'Timestamp': datetime.utcnow().isoformat(),
+                                  'Project': os.environ['PROJECT_NAME']
+                              }
+                          )
+                          drill_jobs.append(job_response['job']['jobID'])
+                  
+                  # Schedule automatic cleanup
+                  cleanup_time = datetime.utcnow() + timedelta(hours=2)
+                  
+                  # Send notification
+                  sns_client.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Message=f'DR drill initiated successfully. Jobs: {drill_jobs}. Cleanup scheduled for {cleanup_time}',
+                      Subject='DR Drill Started'
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'DR drill initiated successfully',
+                          'drillJobs': drill_jobs,
+                          'cleanupScheduled': cleanup_time.isoformat()
+                      })
+                  }
+                  
+              except Exception as e:
+                  sns_client.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Message=f'DR drill failed: {str(e)}',
+                      Subject='DR Drill Failed'
+                  )
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DRTesting
+
+  # Failback Lambda Function
+  FailbackLambdaFunction:
+    Type: AWS::Lambda::Function
+    Condition: EnableFailover
+    Properties:
+      FunctionName: !Sub '${ProjectName}-automated-failback'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt DRAutomationRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          PRIMARY_REGION: !Ref PrimaryRegion
+          PROJECT_NAME: !Ref ProjectName
+          SNS_TOPIC_ARN: !Ref DRAlertsTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              drs_client = boto3.client('drs', region_name=os.environ['PRIMARY_REGION'])
+              route53_client = boto3.client('route53')
+              sns_client = boto3.client('sns')
+              
+              try:
+                  # Initiate failback to primary region
+                  response = drs_client.describe_recovery_instances()
+                  recovery_instances = response.get('recoveryInstances', [])
+                  
+                  failback_jobs = []
+                  
+                  for instance in recovery_instances:
+                      if instance.get('recoveryInstanceID'):
+                          # Start failback job
+                          job_response = drs_client.start_failback_launch(
+                              recoveryInstanceIDs=[instance['recoveryInstanceID']],
+                              tags={
+                                  'Purpose': 'AutomatedFailback',
+                                  'Timestamp': datetime.utcnow().isoformat(),
+                                  'Project': os.environ['PROJECT_NAME']
+                              }
+                          )
+                          failback_jobs.append(job_response['job']['jobID'])
+                  
+                  # Send notification
+                  sns_client.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Message=f'Automated failback initiated. Jobs: {failback_jobs}',
+                      Subject='DR Failback Activated'
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Failback initiated successfully',
+                          'failbackJobs': failback_jobs
+                      })
+                  }
+                  
+              except Exception as e:
+                  sns_client.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Message=f'Failback failed: {str(e)}',
+                      Subject='DR Failback Failed'
+                  )
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DRFailback
+
+  # ===== STEP FUNCTIONS STATE MACHINE =====
+  
+  # DR Orchestration State Machine
+  DROrchestrationStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Condition: EnableFailover
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-dr-orchestration'
+      DefinitionString: !Sub |
+        {
+          "Comment": "Disaster Recovery Orchestration",
+          "StartAt": "ValidateSourceServers",
+          "States": {
+            "ValidateSourceServers": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:drs:describeSourceServers",
+              "Next": "CheckReplicationStatus"
+            },
+            "CheckReplicationStatus": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:drs:describeSourceServers",
+              "Next": "InitiateRecovery"
+            },
+            "InitiateRecovery": {
+              "Type": "Task",
+              "Resource": "${FailoverLambdaFunction.Arn}",
+              "Next": "MonitorRecoveryJobs"
+            },
+            "MonitorRecoveryJobs": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:drs:describeJobs",
+              "Next": "CheckJobStatus"
+            },
+            "CheckJobStatus": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.jobs[0].status",
+                  "StringEquals": "COMPLETED",
+                  "Next": "NotifySuccess"
+                },
+                {
+                  "Variable": "$.jobs[0].status",
+                  "StringEquals": "FAILED",
+                  "Next": "NotifyFailure"
+                }
+              ],
+              "Default": "WaitForCompletion"
+            },
+            "WaitForCompletion": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "MonitorRecoveryJobs"
+            },
+            "NotifySuccess": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${DRAlertsTopic}",
+                "Message": "Disaster recovery completed successfully"
+              },
+              "End": true
+            },
+            "NotifyFailure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${DRAlertsTopic}",
+                "Message": "Disaster recovery failed"
+              },
+              "End": true
+            }
+          }
+        }
+      RoleArn: !GetAtt DRAutomationRole.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DROrchestration
+
+  # ===== CLOUDWATCH ALARMS =====
+  
+  # Application Health Alarm
+  ApplicationHealthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-Application-Health'
+      AlarmDescription: Monitor application health for DR trigger
+      MetricName: HealthCheckStatus
+      Namespace: AWS/Route53
+      Statistic: Minimum
+      Period: 60
+      Threshold: !Ref HealthCheckThreshold
+      ComparisonOperator: LessThanThreshold
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      AlarmActions:
+        - !Ref DRAlertsTopic
+      OKActions:
+        - !Ref DRAlertsTopic
+      TreatMissingData: breaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DRMonitoring
+
+  # DRS Replication Lag Alarm
+  DRSReplicationLagAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-DRS-Replication-Lag'
+      AlarmDescription: Monitor DRS replication lag
+      MetricName: ReplicationLag
+      Namespace: Custom/DRS
+      Statistic: Average
+      Period: 300
+      Threshold: !Ref ReplicationLagThreshold
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 2
+      AlarmActions:
+        - !Ref DRAlertsTopic
+      OKActions:
+        - !Ref DRAlertsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DRMonitoring
+
+  # ===== EVENTBRIDGE RULES =====
+  
+  # EventBridge Rule for Automated DR Testing
+  DRTestingScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: EnableTesting
+    Properties:
+      Name: !Sub '${ProjectName}-monthly-dr-drill'
+      Description: Monthly automated DR drill
+      ScheduleExpression: !Ref TestingSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DRTestingLambdaFunction.Arn
+          Id: DRTestingTarget
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DRTesting
+
+  # Lambda Permission for EventBridge
+  DRTestingLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableTesting
+    Properties:
+      FunctionName: !Ref DRTestingLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DRTestingScheduleRule.Arn
+
+  # ===== CLOUDWATCH DASHBOARD =====
+  
+  # CloudWatch Dashboard for DR Monitoring
+  DRMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateDash
+    Properties:
+      DashboardName: !Sub '${ProjectName}-DR-Monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/DRS", "ReplicationLag", "SourceServerID", "ALL"],
+                  [".", "ReplicationStatus", ".", "."],
+                  [".", "StagingStorageUtilization", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${PrimaryRegion}",
+                "title": "DRS Replication Metrics",
+                "view": "timeSeries",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${ProjectName}-automated-failover' | fields @timestamp, @message | sort @timestamp desc | limit 20",
+                "region": "${PrimaryRegion}",
+                "title": "DR Automation Logs",
+                "view": "table"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${ProjectName}-automated-failover"],
+                  [".", "Errors", ".", "."],
+                  [".", "Invocations", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${PrimaryRegion}",
+                "title": "Lambda Function Metrics",
+                "view": "timeSeries"
+              }
+            }
+          ]
+        }
+
+# Outputs
+Outputs:
+  DRVPCId:
+    Description: DR VPC ID
+    Value: !Ref DRVPC
+    Export:
+      Name: !Sub '${ProjectName}-DR-VPC-ID'
+    
+  DRPublicSubnetId:
+    Description: DR Public Subnet ID
+    Value: !Ref DRPublicSubnet
+    Export:
+      Name: !Sub '${ProjectName}-DR-Public-Subnet-ID'
+    
+  DRPrivateSubnetId:
+    Description: DR Private Subnet ID
+    Value: !Ref DRPrivateSubnet
+    Export:
+      Name: !Sub '${ProjectName}-DR-Private-Subnet-ID'
+    
+  DRSSecurityGroupId:
+    Description: DRS Security Group ID
+    Value: !Ref DRSSecurityGroup
+    Export:
+      Name: !Sub '${ProjectName}-DRS-SecurityGroup-ID'
+    
+  DRSReplicationTemplateId:
+    Description: DRS Replication Configuration Template ID
+    Value: !Ref DRSReplicationTemplate
+    Export:
+      Name: !Sub '${ProjectName}-DRS-ReplicationTemplate-ID'
+    
+  DRAutomationRoleArn:
+    Description: DR Automation Role ARN
+    Value: !GetAtt DRAutomationRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-DR-Automation-Role-ARN'
+    
+  DRAlertsTopicArn:
+    Description: DR Alerts SNS Topic ARN
+    Value: !Ref DRAlertsTopic
+    Export:
+      Name: !Sub '${ProjectName}-DR-Alerts-Topic-ARN'
+    
+  FailoverLambdaFunctionArn:
+    Condition: EnableFailover
+    Description: Automated Failover Lambda Function ARN
+    Value: !GetAtt FailoverLambdaFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-Failover-Lambda-ARN'
+    
+  DRTestingLambdaFunctionArn:
+    Condition: EnableTesting
+    Description: DR Testing Lambda Function ARN
+    Value: !GetAtt DRTestingLambdaFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-DR-Testing-Lambda-ARN'
+    
+  FailbackLambdaFunctionArn:
+    Condition: EnableFailover
+    Description: Automated Failback Lambda Function ARN
+    Value: !GetAtt FailbackLambdaFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-Failback-Lambda-ARN'
+    
+  DROrchestrationStateMachineArn:
+    Condition: EnableFailover
+    Description: DR Orchestration Step Functions State Machine ARN
+    Value: !Ref DROrchestrationStateMachine
+    Export:
+      Name: !Sub '${ProjectName}-DR-StateMachine-ARN'
+    
+  ApplicationHealthAlarmName:
+    Description: Application Health CloudWatch Alarm Name
+    Value: !Ref ApplicationHealthAlarm
+    Export:
+      Name: !Sub '${ProjectName}-Application-Health-Alarm'
+    
+  DRSReplicationLagAlarmName:
+    Description: DRS Replication Lag CloudWatch Alarm Name
+    Value: !Ref DRSReplicationLagAlarm
+    Export:
+      Name: !Sub '${ProjectName}-Replication-Lag-Alarm'
+    
+  DRMonitoringDashboardURL:
+    Condition: CreateDash
+    Description: CloudWatch Dashboard URL for DR Monitoring
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-DR-Monitoring'
+    
+  DRSAgentInstallationInstructions:
+    Description: Instructions for installing DRS agents on source servers
+    Value: !Sub |
+      To install DRS agents on your source servers:
+      1. Download the agent from: https://aws-elastic-disaster-recovery-${PrimaryRegion}.s3.amazonaws.com/latest/linux/aws-replication-installer-init.py
+      2. Run: sudo python3 aws-replication-installer-init.py --region ${PrimaryRegion} --aws-access-key-id YOUR_ACCESS_KEY --aws-secret-access-key YOUR_SECRET_KEY --no-prompt
+      3. Use Replication Template ID: ${DRSReplicationTemplate}
+    
+  NextSteps:
+    Description: Next steps to complete DR setup
+    Value: !Sub |
+      1. Install DRS agents on source servers using the provided instructions
+      2. Configure Route 53 health checks for automatic DNS failover
+      3. Test the automation by running the DR testing Lambda function
+      4. Review and customize the CloudWatch dashboard
+      5. Set up additional monitoring metrics as needed
+      6. Document recovery procedures and train your team

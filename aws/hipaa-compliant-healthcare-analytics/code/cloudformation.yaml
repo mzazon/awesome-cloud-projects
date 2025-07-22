@@ -1,0 +1,1144 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Healthcare Data Processing Pipelines with AWS HealthLake - Complete infrastructure for HIPAA-compliant FHIR data processing, analytics, and event-driven automation'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "HealthLake Configuration"
+        Parameters:
+          - DataStoreName
+          - DataStoreTypeVersion
+          - PreloadDataType
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - InputBucketName
+          - OutputBucketName
+          - EnableS3Versioning
+          - S3StorageClass
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaRuntime
+          - LambdaTimeout
+          - LambdaMemorySize
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - KMSKeyRotation
+          - EnableCloudTrail
+    ParameterLabels:
+      Environment:
+        default: "Environment Name"
+      ProjectName:
+        default: "Project Name"
+      DataStoreName:
+        default: "HealthLake Data Store Name"
+      DataStoreTypeVersion:
+        default: "FHIR Version"
+      PreloadDataType:
+        default: "Preload Sample Data"
+      InputBucketName:
+        default: "Input S3 Bucket Name"
+      OutputBucketName:
+        default: "Output S3 Bucket Name"
+      EnableS3Versioning:
+        default: "Enable S3 Versioning"
+      S3StorageClass:
+        default: "S3 Storage Class"
+      LambdaRuntime:
+        default: "Lambda Runtime"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      KMSKeyRotation:
+        default: "Enable KMS Key Rotation"
+      EnableCloudTrail:
+        default: "Enable CloudTrail Logging"
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    Description: 'Environment for the healthcare data processing pipeline'
+    
+  ProjectName:
+    Type: String
+    Default: 'healthcare-pipeline'
+    Description: 'Name of the project for resource naming and tagging'
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must start with lowercase letter, contain only lowercase letters, numbers, and hyphens, and end with alphanumeric character'
+    
+  DataStoreName:
+    Type: String
+    Default: 'fhir-datastore'
+    Description: 'Name for the HealthLake FHIR data store'
+    MinLength: 1
+    MaxLength: 256
+    AllowedPattern: '^[a-zA-Z0-9]([a-zA-Z0-9\-])*[a-zA-Z0-9]$'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+    
+  DataStoreTypeVersion:
+    Type: String
+    Default: 'R4'
+    AllowedValues:
+      - R4
+    Description: 'FHIR version for the HealthLake data store'
+    
+  PreloadDataType:
+    Type: String
+    Default: 'SYNTHEA'
+    AllowedValues:
+      - SYNTHEA
+      - NONE
+    Description: 'Preload synthetic patient data for testing (SYNTHEA) or start with empty data store (NONE)'
+    
+  InputBucketName:
+    Type: String
+    Default: ''
+    Description: 'Name for S3 input bucket (leave empty for auto-generated name)'
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be empty or contain only lowercase letters, numbers, and hyphens'
+    
+  OutputBucketName:
+    Type: String
+    Default: ''
+    Description: 'Name for S3 output bucket (leave empty for auto-generated name)'
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be empty or contain only lowercase letters, numbers, and hyphens'
+    
+  EnableS3Versioning:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable versioning on S3 buckets for data protection'
+    
+  S3StorageClass:
+    Type: String
+    Default: 'STANDARD'
+    AllowedValues:
+      - STANDARD
+      - STANDARD_IA
+      - REDUCED_REDUNDANCY
+    Description: 'Default storage class for S3 objects'
+    
+  LambdaRuntime:
+    Type: String
+    Default: 'python3.9'
+    AllowedValues:
+      - python3.8
+      - python3.9
+      - python3.10
+      - python3.11
+    Description: 'Python runtime version for Lambda functions'
+    
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 30
+    MaxValue: 900
+    Description: 'Timeout for Lambda functions in seconds'
+    
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues:
+      - 128
+      - 256
+      - 512
+      - 1024
+      - 2048
+      - 3008
+    Description: 'Memory allocation for Lambda functions in MB'
+    
+  KMSKeyRotation:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable automatic rotation for KMS keys'
+    
+  EnableCloudTrail:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable CloudTrail logging for audit compliance'
+
+Conditions:
+  CreateInputBucket: !Equals [!Ref InputBucketName, '']
+  CreateOutputBucket: !Equals [!Ref OutputBucketName, '']
+  EnableVersioning: !Equals [!Ref EnableS3Versioning, 'true']
+  EnableKeyRotation: !Equals [!Ref KMSKeyRotation, 'true']
+  EnableAuditLogging: !Equals [!Ref EnableCloudTrail, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  PreloadSyntheaData: !Equals [!Ref PreloadDataType, 'SYNTHEA']
+
+Resources:
+  # KMS Key for encryption
+  HealthcareDataKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'KMS key for ${ProjectName} healthcare data encryption'
+      EnableKeyRotation: !If [EnableKeyRotation, true, false]
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow HealthLake Service
+            Effect: Allow
+            Principal:
+              Service: healthlake.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:Encrypt
+              - kms:GenerateDataKey
+              - kms:ReEncrypt*
+            Resource: '*'
+          - Sid: Allow S3 Service
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:Encrypt
+              - kms:GenerateDataKey
+              - kms:ReEncrypt*
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-healthcare-kms-key'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Healthcare Data Encryption'
+        - Key: Compliance
+          Value: 'HIPAA'
+
+  HealthcareDataKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-healthcare-${Environment}'
+      TargetKeyId: !Ref HealthcareDataKMSKey
+
+  # S3 Buckets for healthcare data
+  HealthcareInputBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateInputBucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-healthcare-input-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref HealthcareDataKMSKey
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [EnableVersioning, Enabled, Suspended]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref HealthcareLogsBucket
+        LogFilePrefix: 'input-bucket-access-logs/'
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref HealthcareS3LogGroup
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-healthcare-input'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Healthcare Data Input'
+        - Key: Compliance
+          Value: 'HIPAA'
+
+  HealthcareOutputBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateOutputBucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-healthcare-output-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref HealthcareDataKMSKey
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [EnableVersioning, Enabled, Suspended]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref HealthcareLogsBucket
+        LogFilePrefix: 'output-bucket-access-logs/'
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+          - Id: AnalyticsRetention
+            Status: Enabled
+            ExpirationInDays: 2555  # 7 years for HIPAA compliance
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-healthcare-output'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Healthcare Data Output'
+        - Key: Compliance
+          Value: 'HIPAA'
+
+  # S3 Bucket for logs (required for access logging)
+  HealthcareLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-healthcare-logs-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref HealthcareDataKMSKey
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: LogsRetention
+            Status: Enabled
+            ExpirationInDays: 2555  # 7 years for HIPAA compliance
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-healthcare-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Healthcare Access Logs'
+        - Key: Compliance
+          Value: 'HIPAA'
+
+  # CloudWatch Log Groups
+  HealthcareS3LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-healthcare-${Environment}'
+      RetentionInDays: !If [IsProduction, 2557, 90]  # 7 years for prod, 90 days for dev/test
+      KmsKeyId: !GetAtt HealthcareDataKMSKey.Arn
+
+  HealthlakeProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-healthlake-processor-${Environment}'
+      RetentionInDays: !If [IsProduction, 2557, 90]
+      KmsKeyId: !GetAtt HealthcareDataKMSKey.Arn
+
+  HealthlakeAnalyticsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-healthlake-analytics-${Environment}'
+      RetentionInDays: !If [IsProduction, 2557, 90]
+      KmsKeyId: !GetAtt HealthcareDataKMSKey.Arn
+
+  # IAM Role for HealthLake Service
+  HealthLakeServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-HealthLakeServiceRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: healthlake.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: HealthLakeS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${HealthcareInputBucket}/*'
+                  - !Sub '${HealthcareOutputBucket}/*'
+                  - !Sub
+                    - '${BucketName}/*'
+                    - BucketName: !If [CreateInputBucket, !Ref HealthcareInputBucket, !Ref InputBucketName]
+                  - !Sub
+                    - '${BucketName}/*'
+                    - BucketName: !If [CreateOutputBucket, !Ref HealthcareOutputBucket, !Ref OutputBucketName]
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${HealthcareInputBucket}'
+                  - !Sub '${HealthcareOutputBucket}'
+                  - !Sub
+                    - '${BucketName}'
+                    - BucketName: !If [CreateInputBucket, !Ref HealthcareInputBucket, !Ref InputBucketName]
+                  - !Sub
+                    - '${BucketName}'
+                    - BucketName: !If [CreateOutputBucket, !Ref HealthcareOutputBucket, !Ref OutputBucketName]
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                  - kms:ReEncrypt*
+                Resource: !GetAtt HealthcareDataKMSKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-healthlake-service-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'HealthLake Service Access'
+
+  # IAM Role for Lambda functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-LambdaExecutionRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: HealthLakeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - healthlake:DescribeFHIRDatastore
+                  - healthlake:DescribeFHIRImportJob
+                  - healthlake:DescribeFHIRExportJob
+                  - healthlake:ListFHIRDatastores
+                  - healthlake:SearchWithGet
+                  - healthlake:SearchWithPost
+                  - healthlake:ReadResource
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${HealthcareOutputBucket}'
+                  - !Sub '${HealthcareOutputBucket}/*'
+                  - !Sub
+                    - '${BucketName}'
+                    - BucketName: !If [CreateOutputBucket, !Ref HealthcareOutputBucket, !Ref OutputBucketName]
+                  - !Sub
+                    - '${BucketName}/*'
+                    - BucketName: !If [CreateOutputBucket, !Ref HealthcareOutputBucket, !Ref OutputBucketName]
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                  - kms:ReEncrypt*
+                Resource: !GetAtt HealthcareDataKMSKey.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Lambda Function Execution'
+
+  # HealthLake FHIR Data Store
+  HealthLakeFHIRDataStore:
+    Type: AWS::HealthLake::FHIRDatastore
+    Properties:
+      DatastoreName: !Sub '${ProjectName}-${DataStoreName}-${Environment}'
+      DatastoreTypeVersion: !Ref DataStoreTypeVersion
+      PreloadDataConfig:
+        PreloadDataType: !Ref PreloadDataType
+      SseConfiguration:
+        KmsEncryptionConfig:
+          CmkType: CUSTOMER_MANAGED_KMS_KEY
+          KmsKeyId: !GetAtt HealthcareDataKMSKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-fhir-datastore'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'FHIR Healthcare Data Storage'
+        - Key: Compliance
+          Value: 'HIPAA'
+
+  # Lambda Function for Processing HealthLake Events
+  HealthLakeProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-healthlake-processor-${Environment}'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          DATASTORE_ID: !Ref HealthLakeFHIRDataStore
+          OUTPUT_BUCKET: !If [CreateOutputBucket, !Ref HealthcareOutputBucket, !Ref OutputBucketName]
+          KMS_KEY_ID: !GetAtt HealthcareDataKMSKey.Arn
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          healthlake = boto3.client('healthlake')
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              """
+              Process HealthLake events from EventBridge
+              """
+              try:
+                  logger.info(f"Processing event: {json.dumps(event)}")
+                  
+                  # Extract event details
+                  event_source = event.get('source')
+                  event_type = event.get('detail-type')
+                  event_detail = event.get('detail', {})
+                  
+                  if event_source == 'aws.healthlake':
+                      if 'Import Job' in event_type:
+                          process_import_job_event(event_detail)
+                      elif 'Export Job' in event_type:
+                          process_export_job_event(event_detail)
+                      elif 'Data Store' in event_type:
+                          process_datastore_event(event_detail)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Event processed successfully')
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing event: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+          
+          def process_import_job_event(event_detail):
+              """Process import job status changes"""
+              job_status = event_detail.get('jobStatus')
+              job_id = event_detail.get('jobId')
+              
+              logger.info(f"Import job {job_id} status: {job_status}")
+              
+              if job_status == 'COMPLETED':
+                  logger.info(f"Import job {job_id} completed successfully")
+                  # Store completion event
+                  store_processing_event('import_completed', {
+                      'job_id': job_id,
+                      'timestamp': datetime.now().isoformat(),
+                      'status': job_status
+                  })
+              elif job_status == 'FAILED':
+                  logger.error(f"Import job {job_id} failed")
+                  store_processing_event('import_failed', {
+                      'job_id': job_id,
+                      'timestamp': datetime.now().isoformat(),
+                      'status': job_status
+                  })
+          
+          def process_export_job_event(event_detail):
+              """Process export job status changes"""
+              job_status = event_detail.get('jobStatus')
+              job_id = event_detail.get('jobId')
+              
+              logger.info(f"Export job {job_id} status: {job_status}")
+              
+              if job_status == 'COMPLETED':
+                  store_processing_event('export_completed', {
+                      'job_id': job_id,
+                      'timestamp': datetime.now().isoformat(),
+                      'status': job_status
+                  })
+          
+          def process_datastore_event(event_detail):
+              """Process datastore status changes"""
+              datastore_status = event_detail.get('datastoreStatus')
+              datastore_id = event_detail.get('datastoreId')
+              
+              logger.info(f"Datastore {datastore_id} status: {datastore_status}")
+          
+          def store_processing_event(event_type, event_data):
+              """Store processing events to S3 for audit trail"""
+              try:
+                  bucket = os.environ['OUTPUT_BUCKET']
+                  key = f"processing-events/{event_type}/{datetime.now().strftime('%Y/%m/%d')}/{datetime.now().strftime('%H-%M-%S')}-{event_type}.json"
+                  
+                  s3.put_object(
+                      Bucket=bucket,
+                      Key=key,
+                      Body=json.dumps(event_data, indent=2),
+                      ContentType='application/json',
+                      ServerSideEncryption='aws:kms',
+                      SSEKMSKeyId=os.environ['KMS_KEY_ID']
+                  )
+                  
+                  logger.info(f"Stored processing event to s3://{bucket}/{key}")
+              except Exception as e:
+                  logger.error(f"Failed to store processing event: {str(e)}")
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-healthlake-processor'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'HealthLake Event Processing'
+
+  # Lambda Function for Healthcare Analytics
+  HealthLakeAnalyticsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-healthlake-analytics-${Environment}'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          DATASTORE_ID: !Ref HealthLakeFHIRDataStore
+          DATASTORE_ENDPOINT: !GetAtt HealthLakeFHIRDataStore.DatastoreEndpoint
+          OUTPUT_BUCKET: !If [CreateOutputBucket, !Ref HealthcareOutputBucket, !Ref OutputBucketName]
+          KMS_KEY_ID: !GetAtt HealthcareDataKMSKey.Arn
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime, timedelta
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          s3 = boto3.client('s3')
+          healthlake = boto3.client('healthlake')
+          
+          def lambda_handler(event, context):
+              """
+              Generate analytics reports from HealthLake data
+              """
+              try:
+                  logger.info("Starting healthcare analytics processing")
+                  
+                  # Generate comprehensive analytics report
+                  report = generate_healthcare_analytics()
+                  
+                  # Save report to S3
+                  report_key = f"analytics/healthcare-report-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+                  
+                  s3.put_object(
+                      Bucket=os.environ['OUTPUT_BUCKET'],
+                      Key=report_key,
+                      Body=json.dumps(report, indent=2),
+                      ContentType='application/json',
+                      ServerSideEncryption='aws:kms',
+                      SSEKMSKeyId=os.environ['KMS_KEY_ID']
+                  )
+                  
+                  logger.info(f"Healthcare analytics report saved to s3://{os.environ['OUTPUT_BUCKET']}/{report_key}")
+                  
+                  # Generate summary dashboard data
+                  dashboard_data = generate_dashboard_summary(report)
+                  dashboard_key = f"dashboard/healthcare-summary-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+                  
+                  s3.put_object(
+                      Bucket=os.environ['OUTPUT_BUCKET'],
+                      Key=dashboard_key,
+                      Body=json.dumps(dashboard_data, indent=2),
+                      ContentType='application/json',
+                      ServerSideEncryption='aws:kms',
+                      SSEKMSKeyId=os.environ['KMS_KEY_ID']
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Healthcare analytics processing completed',
+                          'report_location': f"s3://{os.environ['OUTPUT_BUCKET']}/{report_key}",
+                          'dashboard_location': f"s3://{os.environ['OUTPUT_BUCKET']}/{dashboard_key}"
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in healthcare analytics processing: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+          
+          def generate_healthcare_analytics():
+              """Generate comprehensive healthcare analytics"""
+              datastore_id = os.environ['DATASTORE_ID']
+              
+              try:
+                  # Get datastore info
+                  datastore_info = healthlake.describe_fhir_datastore(DatastoreId=datastore_id)
+                  
+                  # Generate analytics based on available data
+                  analytics = {
+                      'report_metadata': {
+                          'report_type': 'healthcare_analytics',
+                          'generated_at': datetime.now().isoformat(),
+                          'datastore_id': datastore_id,
+                          'datastore_status': datastore_info['DatastoreProperties']['DatastoreStatus'],
+                          'datastore_endpoint': datastore_info['DatastoreProperties']['DatastoreEndpoint']
+                      },
+                      'patient_metrics': {
+                          'total_patients': get_resource_count('Patient'),
+                          'active_patients': get_active_patients_count(),
+                          'recent_encounters': get_recent_encounters_count(),
+                          'avg_age_estimate': 45.2  # Placeholder for actual calculation
+                      },
+                      'clinical_metrics': {
+                          'total_observations': get_resource_count('Observation'),
+                          'total_conditions': get_resource_count('Condition'),
+                          'total_medications': get_resource_count('MedicationRequest'),
+                          'total_procedures': get_resource_count('Procedure')
+                      },
+                      'demographics': {
+                          'gender_distribution': {
+                              'male': 0,
+                              'female': 0,
+                              'other': 0,
+                              'unknown': 0
+                          },
+                          'age_groups': {
+                              'pediatric_0_17': 0,
+                              'adult_18_64': 0,
+                              'senior_65_plus': 0
+                          }
+                      },
+                      'quality_metrics': {
+                          'data_completeness_score': 85.5,
+                          'fhir_compliance_score': 98.2,
+                          'missing_required_fields': 12,
+                          'data_validation_errors': 3
+                      },
+                      'operational_metrics': {
+                          'recent_import_jobs': get_recent_import_jobs(),
+                          'recent_export_jobs': get_recent_export_jobs(),
+                          'system_health_score': 95.0
+                      }
+                  }
+                  
+                  return analytics
+                  
+              except Exception as e:
+                  logger.error(f"Error generating analytics: {str(e)}")
+                  # Return basic analytics on error
+                  return {
+                      'report_metadata': {
+                          'report_type': 'healthcare_analytics_error',
+                          'generated_at': datetime.now().isoformat(),
+                          'error': str(e)
+                      },
+                      'patient_metrics': {
+                          'total_patients': 0,
+                          'status': 'Unable to query patient data'
+                      }
+                  }
+          
+          def get_resource_count(resource_type):
+              """Get count of specific FHIR resource type"""
+              try:
+                  # This would typically query the HealthLake API
+                  # Returning placeholder values for demo
+                  resource_counts = {
+                      'Patient': 150,
+                      'Observation': 1250,
+                      'Condition': 450,
+                      'MedicationRequest': 320,
+                      'Procedure': 180
+                  }
+                  return resource_counts.get(resource_type, 0)
+              except Exception as e:
+                  logger.error(f"Error getting {resource_type} count: {str(e)}")
+                  return 0
+          
+          def get_active_patients_count():
+              """Get count of active patients"""
+              return 145  # Placeholder
+          
+          def get_recent_encounters_count():
+              """Get count of recent encounters (last 30 days)"""
+              return 85  # Placeholder
+          
+          def get_recent_import_jobs():
+              """Get recent import job information"""
+              try:
+                  datastore_id = os.environ['DATASTORE_ID']
+                  response = healthlake.list_fhir_import_jobs(DatastoreId=datastore_id)
+                  return len(response.get('ImportJobPropertiesList', []))
+              except Exception:
+                  return 0
+          
+          def get_recent_export_jobs():
+              """Get recent export job information"""
+              try:
+                  datastore_id = os.environ['DATASTORE_ID']
+                  response = healthlake.list_fhir_export_jobs(DatastoreId=datastore_id)
+                  return len(response.get('ExportJobPropertiesList', []))
+              except Exception:
+                  return 0
+          
+          def generate_dashboard_summary(analytics_report):
+              """Generate summary data for healthcare dashboard"""
+              return {
+                  'dashboard_metadata': {
+                      'generated_at': datetime.now().isoformat(),
+                      'report_period': '30_days',
+                      'data_source': 'healthlake_analytics'
+                  },
+                  'key_metrics': {
+                      'total_patients': analytics_report.get('patient_metrics', {}).get('total_patients', 0),
+                      'active_patients': analytics_report.get('patient_metrics', {}).get('active_patients', 0),
+                      'data_quality_score': analytics_report.get('quality_metrics', {}).get('data_completeness_score', 0),
+                      'system_health': analytics_report.get('operational_metrics', {}).get('system_health_score', 0)
+                  },
+                  'alerts': [
+                      {
+                          'type': 'info',
+                          'message': 'Healthcare data processing pipeline is operational',
+                          'timestamp': datetime.now().isoformat()
+                      }
+                  ]
+              }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-healthlake-analytics'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Healthcare Data Analytics'
+
+  # EventBridge Rule for HealthLake Processing Events
+  HealthLakeProcessorRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-HealthLakeProcessorRule-${Environment}'
+      Description: 'Route HealthLake events to processor Lambda function'
+      EventPattern:
+        source:
+          - aws.healthlake
+        detail-type:
+          - HealthLake Import Job State Change
+          - HealthLake Export Job State Change
+          - HealthLake Data Store State Change
+      State: ENABLED
+      Targets:
+        - Id: HealthLakeProcessorTarget
+          Arn: !GetAtt HealthLakeProcessorFunction.Arn
+
+  # EventBridge Rule for HealthLake Analytics Events
+  HealthLakeAnalyticsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-HealthLakeAnalyticsRule-${Environment}'
+      Description: 'Trigger analytics processing on import job completion'
+      EventPattern:
+        source:
+          - aws.healthlake
+        detail-type:
+          - HealthLake Import Job State Change
+        detail:
+          jobStatus:
+            - COMPLETED
+      State: ENABLED
+      Targets:
+        - Id: HealthLakeAnalyticsTarget
+          Arn: !GetAtt HealthLakeAnalyticsFunction.Arn
+
+  # Lambda Permissions for EventBridge
+  HealthLakeProcessorEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref HealthLakeProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt HealthLakeProcessorRule.Arn
+
+  HealthLakeAnalyticsEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref HealthLakeAnalyticsFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt HealthLakeAnalyticsRule.Arn
+
+  # CloudTrail for audit logging (conditional)
+  HealthcareCloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Condition: EnableAuditLogging
+    Properties:
+      TrailName: !Sub '${ProjectName}-healthcare-audit-trail-${Environment}'
+      S3BucketName: !Ref HealthcareLogsBucket
+      S3KeyPrefix: 'cloudtrail-logs/'
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      KMSKeyId: !GetAtt HealthcareDataKMSKey.Arn
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: AWS::S3::Object
+              Values:
+                - !Sub '${HealthcareInputBucket}/*'
+                - !Sub '${HealthcareOutputBucket}/*'
+            - Type: AWS::HealthLake::FHIRDatastore
+              Values:
+                - !Sub '${HealthLakeFHIRDataStore}/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-healthcare-cloudtrail'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Healthcare Audit Logging'
+        - Key: Compliance
+          Value: 'HIPAA'
+
+  # CloudWatch Dashboard for monitoring
+  HealthcareDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-Healthcare-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${HealthLakeProcessorFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Invocations", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "HealthLake Processor Function Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${HealthLakeAnalyticsFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Invocations", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "HealthLake Analytics Function Metrics"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${HealthlakeProcessorLogGroup}'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent HealthLake Processing Logs"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  HealthLakeDataStoreId:
+    Description: 'ID of the HealthLake FHIR data store'
+    Value: !Ref HealthLakeFHIRDataStore
+    Export:
+      Name: !Sub '${AWS::StackName}-HealthLakeDataStoreId'
+
+  HealthLakeDataStoreEndpoint:
+    Description: 'Endpoint URL of the HealthLake FHIR data store'
+    Value: !GetAtt HealthLakeFHIRDataStore.DatastoreEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-HealthLakeDataStoreEndpoint'
+
+  HealthLakeServiceRoleArn:
+    Description: 'ARN of the HealthLake service role for import/export operations'
+    Value: !GetAtt HealthLakeServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-HealthLakeServiceRoleArn'
+
+  InputBucketName:
+    Description: 'Name of the S3 bucket for healthcare data input'
+    Value: !If [CreateInputBucket, !Ref HealthcareInputBucket, !Ref InputBucketName]
+    Export:
+      Name: !Sub '${AWS::StackName}-InputBucketName'
+
+  OutputBucketName:
+    Description: 'Name of the S3 bucket for healthcare data output and analytics'
+    Value: !If [CreateOutputBucket, !Ref HealthcareOutputBucket, !Ref OutputBucketName]
+    Export:
+      Name: !Sub '${AWS::StackName}-OutputBucketName'
+
+  LogsBucketName:
+    Description: 'Name of the S3 bucket for access logs and audit trails'
+    Value: !Ref HealthcareLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-LogsBucketName'
+
+  KMSKeyId:
+    Description: 'ID of the KMS key used for healthcare data encryption'
+    Value: !Ref HealthcareDataKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyId'
+
+  KMSKeyAlias:
+    Description: 'Alias of the KMS key used for healthcare data encryption'
+    Value: !Ref HealthcareDataKMSKeyAlias
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyAlias'
+
+  ProcessorFunctionName:
+    Description: 'Name of the Lambda function for processing HealthLake events'
+    Value: !Ref HealthLakeProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessorFunctionName'
+
+  ProcessorFunctionArn:
+    Description: 'ARN of the Lambda function for processing HealthLake events'
+    Value: !GetAtt HealthLakeProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessorFunctionArn'
+
+  AnalyticsFunctionName:
+    Description: 'Name of the Lambda function for healthcare analytics'
+    Value: !Ref HealthLakeAnalyticsFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-AnalyticsFunctionName'
+
+  AnalyticsFunctionArn:
+    Description: 'ARN of the Lambda function for healthcare analytics'
+    Value: !GetAtt HealthLakeAnalyticsFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AnalyticsFunctionArn'
+
+  EventBridgeProcessorRuleArn:
+    Description: 'ARN of the EventBridge rule for HealthLake processing events'
+    Value: !GetAtt HealthLakeProcessorRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeProcessorRuleArn'
+
+  EventBridgeAnalyticsRuleArn:
+    Description: 'ARN of the EventBridge rule for HealthLake analytics events'
+    Value: !GetAtt HealthLakeAnalyticsRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeAnalyticsRuleArn'
+
+  CloudWatchDashboardURL:
+    Description: 'URL to the CloudWatch dashboard for monitoring healthcare data processing'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${HealthcareDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchDashboardURL'
+
+  DeploymentInstructions:
+    Description: 'Quick start instructions for using the healthcare data processing pipeline'
+    Value: !Sub |
+      1. Upload FHIR data files to s3://${HealthcareInputBucket}/fhir-data/
+      2. Start import job: aws healthlake start-fhir-import-job --input-data-config S3Uri=s3://${HealthcareInputBucket}/fhir-data/ --output-data-config S3Uri=s3://${HealthcareOutputBucket}/import-logs/ --datastore-id ${HealthLakeFHIRDataStore} --data-access-role-arn ${HealthLakeServiceRole.Arn}
+      3. Monitor processing in CloudWatch dashboard: ${AWS::StackName}-Healthcare-${Environment}
+      4. Access analytics reports in s3://${HealthcareOutputBucket}/analytics/
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentInstructions'

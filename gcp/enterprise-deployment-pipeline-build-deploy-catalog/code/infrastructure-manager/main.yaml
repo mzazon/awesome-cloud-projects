@@ -1,0 +1,420 @@
+# Infrastructure Manager configuration for Enterprise Deployment Pipeline Management
+# This configuration deploys Cloud Build, Cloud Deploy, Service Catalog, and GKE resources
+# for automated enterprise deployment pipelines
+
+terraform:
+  required_version: ">= 1.5"
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 5.0"
+
+variables:
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    validation:
+      condition: length(var.project_id) > 0
+      error_message: "Project ID must not be empty."
+
+  region:
+    description: "Primary region for resources"
+    type: string
+    default: "us-central1"
+    validation:
+      condition: contains(["us-central1", "us-east1", "us-west1", "europe-west1", "asia-east1"], var.region)
+      error_message: "Region must be a valid Google Cloud region."
+
+  cluster_name_prefix:
+    description: "Prefix for GKE cluster names"
+    type: string
+    default: "enterprise-gke"
+
+  repo_name:
+    description: "Artifact Registry repository name"
+    type: string
+    default: "enterprise-apps"
+
+  service_catalog_name:
+    description: "Service Catalog name"
+    type: string
+    default: "enterprise-templates"
+
+  enable_shielded_nodes:
+    description: "Enable shielded nodes for production cluster"
+    type: bool
+    default: true
+
+  enable_network_policy:
+    description: "Enable network policy for all clusters"
+    type: bool
+    default: true
+
+  labels:
+    description: "Labels to apply to all resources"
+    type: map(string)
+    default:
+      environment: "enterprise"
+      managed-by: "infrastructure-manager"
+      purpose: "cicd-pipeline"
+
+# Enable required APIs
+resources:
+  # Enable Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/cloudbuild.googleapis.com
+      parent: projects/${var.project_id}
+    metadata:
+      dependsOn:
+        - enable-clouddeploy-api
+        - enable-servicecatalog-api
+        - enable-container-api
+        - enable-artifactregistry-api
+        - enable-sourcerepo-api
+
+  - name: enable-clouddeploy-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/clouddeploy.googleapis.com
+      parent: projects/${var.project_id}
+
+  - name: enable-servicecatalog-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/servicecatalog.googleapis.com
+      parent: projects/${var.project_id}
+
+  - name: enable-container-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/container.googleapis.com
+      parent: projects/${var.project_id}
+
+  - name: enable-artifactregistry-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/artifactregistry.googleapis.com
+      parent: projects/${var.project_id}
+
+  - name: enable-sourcerepo-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/sourcerepo.googleapis.com
+      parent: projects/${var.project_id}
+
+  # Artifact Registry Repository
+  - name: artifact-registry-repo
+    type: gcp-types/artifactregistry-v1:projects.locations.repositories
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      repositoryId: ${var.repo_name}
+      repository:
+        description: "Enterprise application container images"
+        format: DOCKER
+        labels: ${var.labels}
+    metadata:
+      dependsOn:
+        - enable-artifactregistry-api
+
+  # Service Account for Cloud Build Deploy operations
+  - name: cloudbuild-deploy-sa
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: cloudbuild-deploy
+      serviceAccount:
+        displayName: "Cloud Build Deploy Service Account"
+        description: "Service account for Cloud Build to deploy applications"
+      parent: projects/${var.project_id}
+
+  # IAM bindings for Cloud Build Deploy Service Account
+  - name: cloudbuild-deploy-iam-clouddeploy
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      member: serviceAccount:cloudbuild-deploy@${var.project_id}.iam.gserviceaccount.com
+      role: roles/clouddeploy.operator
+    metadata:
+      dependsOn:
+        - cloudbuild-deploy-sa
+
+  - name: cloudbuild-deploy-iam-gke
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      member: serviceAccount:cloudbuild-deploy@${var.project_id}.iam.gserviceaccount.com
+      role: roles/container.clusterAdmin
+    metadata:
+      dependsOn:
+        - cloudbuild-deploy-sa
+
+  - name: cloudbuild-deploy-iam-artifact
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      member: serviceAccount:cloudbuild-deploy@${var.project_id}.iam.gserviceaccount.com
+      role: roles/artifactregistry.writer
+    metadata:
+      dependsOn:
+        - cloudbuild-deploy-sa
+
+  - name: cloudbuild-iam-serviceaccount
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      member: serviceAccount:${var.project_id}@cloudbuild.gserviceaccount.com
+      role: roles/iam.serviceAccountUser
+
+  # GKE Development Cluster
+  - name: gke-dev-cluster
+    type: gcp-types/container-v1beta1:projects.locations.clusters
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      cluster:
+        name: ${var.cluster_name_prefix}-dev
+        description: "Development environment GKE cluster"
+        autopilot:
+          enabled: true
+        ipAllocationPolicy:
+          useIpAliases: true
+        networkPolicy:
+          enabled: ${var.enable_network_policy}
+        resourceLabels: ${var.labels}
+        addonsConfig:
+          networkPolicyConfig:
+            disabled: false
+        workloadIdentityConfig:
+          workloadPool: ${var.project_id}.svc.id.goog
+    metadata:
+      dependsOn:
+        - enable-container-api
+
+  # GKE Staging Cluster
+  - name: gke-staging-cluster
+    type: gcp-types/container-v1beta1:projects.locations.clusters
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      cluster:
+        name: ${var.cluster_name_prefix}-staging
+        description: "Staging environment GKE cluster"
+        autopilot:
+          enabled: true
+        ipAllocationPolicy:
+          useIpAliases: true
+        networkPolicy:
+          enabled: ${var.enable_network_policy}
+        resourceLabels: ${var.labels}
+        addonsConfig:
+          networkPolicyConfig:
+            disabled: false
+        workloadIdentityConfig:
+          workloadPool: ${var.project_id}.svc.id.goog
+    metadata:
+      dependsOn:
+        - enable-container-api
+
+  # GKE Production Cluster with enhanced security
+  - name: gke-prod-cluster
+    type: gcp-types/container-v1beta1:projects.locations.clusters
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      cluster:
+        name: ${var.cluster_name_prefix}-prod
+        description: "Production environment GKE cluster"
+        autopilot:
+          enabled: true
+        ipAllocationPolicy:
+          useIpAliases: true
+        networkPolicy:
+          enabled: ${var.enable_network_policy}
+        resourceLabels: ${var.labels}
+        shieldedNodes:
+          enabled: ${var.enable_shielded_nodes}
+        addonsConfig:
+          networkPolicyConfig:
+            disabled: false
+        workloadIdentityConfig:
+          workloadPool: ${var.project_id}.svc.id.goog
+        binaryAuthorization:
+          enabled: true
+    metadata:
+      dependsOn:
+        - enable-container-api
+
+  # Cloud Source Repositories
+  - name: pipeline-templates-repo
+    type: gcp-types/sourcerepo-v1:projects.repos
+    properties:
+      parent: projects/${var.project_id}
+      name: projects/${var.project_id}/repos/pipeline-templates
+      repo:
+        description: "Repository for pipeline templates and configurations"
+    metadata:
+      dependsOn:
+        - enable-sourcerepo-api
+
+  - name: sample-app-repo
+    type: gcp-types/sourcerepo-v1:projects.repos
+    properties:
+      parent: projects/${var.project_id}
+      name: projects/${var.project_id}/repos/sample-app
+      repo:
+        description: "Repository for sample application"
+    metadata:
+      dependsOn:
+        - enable-sourcerepo-api
+
+  # Cloud Deploy Delivery Pipeline
+  - name: clouddeploy-pipeline
+    type: gcp-types/clouddeploy-v1:projects.locations.deliveryPipelines
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      deliveryPipelineId: enterprise-pipeline
+      deliveryPipeline:
+        description: "Enterprise deployment pipeline for applications"
+        serialPipeline:
+          stages:
+            - targetId: dev-target
+              profiles: []
+            - targetId: staging-target
+              profiles: []
+            - targetId: prod-target
+              profiles: []
+        labels: ${var.labels}
+    metadata:
+      dependsOn:
+        - enable-clouddeploy-api
+        - gke-dev-cluster
+        - gke-staging-cluster
+        - gke-prod-cluster
+
+  # Cloud Deploy Targets
+  - name: clouddeploy-dev-target
+    type: gcp-types/clouddeploy-v1:projects.locations.targets
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      targetId: dev-target
+      target:
+        description: "Development environment target"
+        gke:
+          cluster: projects/${var.project_id}/locations/${var.region}/clusters/${var.cluster_name_prefix}-dev
+        labels: ${var.labels}
+    metadata:
+      dependsOn:
+        - gke-dev-cluster
+
+  - name: clouddeploy-staging-target
+    type: gcp-types/clouddeploy-v1:projects.locations.targets
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      targetId: staging-target
+      target:
+        description: "Staging environment target"
+        gke:
+          cluster: projects/${var.project_id}/locations/${var.region}/clusters/${var.cluster_name_prefix}-staging
+        labels: ${var.labels}
+    metadata:
+      dependsOn:
+        - gke-staging-cluster
+
+  - name: clouddeploy-prod-target
+    type: gcp-types/clouddeploy-v1:projects.locations.targets
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      targetId: prod-target
+      target:
+        description: "Production environment target"
+        gke:
+          cluster: projects/${var.project_id}/locations/${var.region}/clusters/${var.cluster_name_prefix}-prod
+        labels: ${var.labels}
+    metadata:
+      dependsOn:
+        - gke-prod-cluster
+
+  # Cloud Build Trigger for Sample Application
+  - name: cloudbuild-trigger
+    type: gcp-types/cloudbuild-v1:projects.triggers
+    properties:
+      parent: projects/${var.project_id}
+      trigger:
+        name: enterprise-deployment-trigger
+        description: "Enterprise deployment pipeline trigger"
+        triggerTemplate:
+          repoName: sample-app
+          branchName: main
+        filename: cloudbuild.yaml
+        substitutions:
+          _SERVICE_NAME: sample-app
+          _NAMESPACE: default
+          _REGION: ${var.region}
+          _REPO_NAME: ${var.repo_name}
+    metadata:
+      dependsOn:
+        - sample-app-repo
+        - enable-apis
+
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${var.project_id}
+
+  region:
+    description: "Primary deployment region"
+    value: ${var.region}
+
+  artifact_registry_repo:
+    description: "Artifact Registry repository for container images"
+    value: ${var.region}-docker.pkg.dev/${var.project_id}/${var.repo_name}
+
+  gke_dev_cluster:
+    description: "Development GKE cluster name"
+    value: ${var.cluster_name_prefix}-dev
+
+  gke_staging_cluster:
+    description: "Staging GKE cluster name"
+    value: ${var.cluster_name_prefix}-staging
+
+  gke_prod_cluster:
+    description: "Production GKE cluster name"
+    value: ${var.cluster_name_prefix}-prod
+
+  clouddeploy_pipeline:
+    description: "Cloud Deploy pipeline name"
+    value: enterprise-pipeline
+
+  pipeline_templates_repo:
+    description: "Cloud Source Repository for pipeline templates"
+    value: projects/${var.project_id}/repos/pipeline-templates
+
+  sample_app_repo:
+    description: "Cloud Source Repository for sample application"
+    value: projects/${var.project_id}/repos/sample-app
+
+  cloudbuild_service_account:
+    description: "Cloud Build deploy service account email"
+    value: cloudbuild-deploy@${var.project_id}.iam.gserviceaccount.com
+
+  cloud_console_urls:
+    description: "Useful Cloud Console URLs for monitoring"
+    value:
+      cloud_build: https://console.cloud.google.com/cloud-build/builds?project=${var.project_id}
+      cloud_deploy: https://console.cloud.google.com/deploy/delivery-pipelines?project=${var.project_id}
+      gke_clusters: https://console.cloud.google.com/kubernetes/list?project=${var.project_id}
+      artifact_registry: https://console.cloud.google.com/artifacts?project=${var.project_id}
+      source_repos: https://console.cloud.google.com/source/repos?project=${var.project_id}
+
+metadata:
+  name: enterprise-deployment-pipeline
+  description: "Complete enterprise deployment pipeline infrastructure with Cloud Build, Cloud Deploy, and GKE"
+  version: "1.0"
+  created_by: "Infrastructure Manager"
+  tags:
+    - enterprise
+    - cicd
+    - kubernetes
+    - cloud-build
+    - cloud-deploy

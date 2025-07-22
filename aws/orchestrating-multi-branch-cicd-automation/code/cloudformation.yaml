@@ -1,0 +1,1977 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Multi-Branch CI/CD Pipeline infrastructure with CodePipeline, CodeCommit, CodeBuild, and Lambda for automated branch management'
+
+Parameters:
+  # Repository Configuration
+  RepositoryName:
+    Type: String
+    Description: 'Name of the CodeCommit repository'
+    Default: 'multi-branch-app'
+    AllowedPattern: '[a-zA-Z0-9_.-]+'
+    ConstraintDescription: 'Repository name can only contain alphanumeric characters, hyphens, periods, and underscores'
+  
+  RepositoryDescription:
+    Type: String
+    Description: 'Description for the CodeCommit repository'
+    Default: 'Multi-branch CI/CD demo application'
+    MaxLength: 1000
+  
+  # Build Configuration
+  BuildEnvironmentImage:
+    Type: String
+    Description: 'Docker image for CodeBuild environment'
+    Default: 'aws/codebuild/amazonlinux2-x86_64-standard:5.0'
+    AllowedValues:
+      - 'aws/codebuild/amazonlinux2-x86_64-standard:3.0'
+      - 'aws/codebuild/amazonlinux2-x86_64-standard:4.0'
+      - 'aws/codebuild/amazonlinux2-x86_64-standard:5.0'
+      - 'aws/codebuild/ubuntu-base:14.04'
+      - 'aws/codebuild/ubuntu-base:18.04'
+      - 'aws/codebuild/ubuntu-base:20.04'
+  
+  BuildComputeType:
+    Type: String
+    Description: 'Compute type for CodeBuild'
+    Default: 'BUILD_GENERAL1_SMALL'
+    AllowedValues:
+      - 'BUILD_GENERAL1_SMALL'
+      - 'BUILD_GENERAL1_MEDIUM'
+      - 'BUILD_GENERAL1_LARGE'
+      - 'BUILD_GENERAL1_2XLARGE'
+  
+  # Pipeline Configuration
+  MainBranchName:
+    Type: String
+    Description: 'Name of the main branch'
+    Default: 'main'
+    AllowedPattern: '[a-zA-Z0-9_.-/]+'
+  
+  DevelopBranchName:
+    Type: String
+    Description: 'Name of the develop branch'
+    Default: 'develop'
+    AllowedPattern: '[a-zA-Z0-9_.-/]+'
+  
+  FeatureBranchPattern:
+    Type: String
+    Description: 'Pattern for feature branches that trigger pipeline creation'
+    Default: 'feature/*'
+    MinLength: 1
+    MaxLength: 50
+  
+  # Lambda Configuration
+  LambdaRuntime:
+    Type: String
+    Description: 'Runtime for Lambda function'
+    Default: 'python3.11'
+    AllowedValues:
+      - 'python3.8'
+      - 'python3.9'
+      - 'python3.10'
+      - 'python3.11'
+      - 'python3.12'
+  
+  # Pipeline Timeout
+  PipelineTimeoutMinutes:
+    Type: Number
+    Description: 'Timeout for pipeline executions in minutes'
+    Default: 60
+    MinValue: 5
+    MaxValue: 480
+  
+  # Monitoring Configuration
+  EnableCloudWatchDashboard:
+    Type: String
+    Description: 'Enable CloudWatch dashboard for monitoring'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+  
+  EnableDetailedMonitoring:
+    Type: String
+    Description: 'Enable detailed monitoring and additional alarms'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+  
+  # Notification Configuration
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for pipeline notifications (optional)'
+    Default: ''
+    AllowedPattern: '(^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$)'
+    ConstraintDescription: 'Must be a valid email address or empty'
+  
+  # Security Configuration
+  EnableKMSEncryption:
+    Type: String
+    Description: 'Enable KMS encryption for artifacts and logs'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+  
+  # Artifact Storage Configuration
+  ArtifactRetentionDays:
+    Type: Number
+    Description: 'Number of days to retain pipeline artifacts'
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+  
+  # Build Cache Configuration
+  EnableBuildCache:
+    Type: String
+    Description: 'Enable build caching for faster builds'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Conditions:
+  # Condition to check if CloudWatch dashboard should be created
+  CreateDashboard: !Equals [!Ref EnableCloudWatchDashboard, 'true']
+  
+  # Condition to check if detailed monitoring should be enabled
+  EnableDetailedMonitoringCondition: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  
+  # Condition to check if notification email is provided
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  
+  # Condition to check if KMS encryption should be enabled
+  UseKMSEncryption: !Equals [!Ref EnableKMSEncryption, 'true']
+  
+  # Condition to check if build cache should be enabled
+  UseBuildCache: !Equals [!Ref EnableBuildCache, 'true']
+
+Resources:
+  # ====================================
+  # KMS Key for Encryption
+  # ====================================
+  PipelineKMSKey:
+    Type: AWS::KMS::Key
+    Condition: UseKMSEncryption
+    Properties:
+      Description: 'KMS key for multi-branch CI/CD pipeline encryption'
+      KeyPolicy:
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow use of the key by CodePipeline
+            Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+                - codebuild.amazonaws.com
+                - s3.amazonaws.com
+                - logs.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+              - 'kms:CreateGrant'
+              - 'kms:DescribeKey'
+            Resource: '*'
+      Tags:
+        - Key: 'Purpose'
+          Value: 'Multi-branch CI/CD Pipeline'
+        - Key: 'Environment'
+          Value: 'All'
+
+  PipelineKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: UseKMSEncryption
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-pipeline-key'
+      TargetKeyId: !Ref PipelineKMSKey
+
+  # ====================================
+  # S3 Bucket for Pipeline Artifacts
+  # ====================================
+  PipelineArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-pipeline-artifacts-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [UseKMSEncryption, 'aws:kms', 'AES256']
+              KMSMasterKeyID: !If [UseKMSEncryption, !Ref PipelineKMSKey, !Ref 'AWS::NoValue']
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldArtifacts
+            Status: Enabled
+            ExpirationInDays: !Ref ArtifactRetentionDays
+            NoncurrentVersionExpirationInDays: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            TransitionInDays: 30
+            StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            TransitionInDays: 90
+            StorageClass: GLACIER
+      ReplicationConfiguration:
+        Role: !GetAtt S3ReplicationRole.Arn
+        Rules:
+          - Id: ReplicateToBackupBucket
+            Status: Enabled
+            Prefix: 'critical-artifacts/'
+            Destination:
+              Bucket: !Sub '${PipelineArtifactsBucket}-backup'
+              StorageClass: STANDARD_IA
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: 'pipeline-artifacts-access-logs/'
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      Tags:
+        - Key: 'Purpose'
+          Value: 'Multi-branch CI/CD Pipeline'
+        - Key: 'Environment'
+          Value: 'All'
+        - Key: 'BackupRequired'
+          Value: 'true'
+
+  # S3 Bucket for Access Logs
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-access-logs-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags:
+        - Key: 'Purpose'
+          Value: 'Access Logs'
+        - Key: 'Environment'
+          Value: 'All'
+
+  # S3 Bucket Policy for Pipeline Artifacts
+  PipelineArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref PipelineArtifactsBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyUnSecureCommunications
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${PipelineArtifactsBucket}/*'
+              - !Ref PipelineArtifactsBucket
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: AllowCodePipelineAccess
+            Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action:
+              - 's3:GetBucketAcl'
+              - 's3:GetBucketLocation'
+              - 's3:GetBucketVersioning'
+              - 's3:GetObject'
+              - 's3:GetObjectVersion'
+              - 's3:PutObject'
+              - 's3:PutObjectAcl'
+            Resource:
+              - !Sub '${PipelineArtifactsBucket}/*'
+              - !Ref PipelineArtifactsBucket
+            Condition:
+              StringEquals:
+                's3:x-amz-server-side-encryption': !If [UseKMSEncryption, 'aws:kms', 'AES256']
+          - Sid: AllowCodeBuildAccess
+            Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action:
+              - 's3:GetBucketAcl'
+              - 's3:GetBucketLocation'
+              - 's3:GetBucketVersioning'
+              - 's3:GetObject'
+              - 's3:GetObjectVersion'
+              - 's3:PutObject'
+              - 's3:PutObjectAcl'
+            Resource:
+              - !Sub '${PipelineArtifactsBucket}/*'
+              - !Ref PipelineArtifactsBucket
+            Condition:
+              StringEquals:
+                's3:x-amz-server-side-encryption': !If [UseKMSEncryption, 'aws:kms', 'AES256']
+
+  # S3 Replication Role
+  S3ReplicationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: S3ReplicationPolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObjectVersion'
+                  - 's3:GetObjectVersionAcl'
+                Resource: !Sub '${PipelineArtifactsBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 's3:ReplicateObject'
+                  - 's3:ReplicateDelete'
+                Resource: !Sub '${PipelineArtifactsBucket}-backup/*'
+
+  # ====================================
+  # CodeCommit Repository
+  # ====================================
+  CodeCommitRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      RepositoryDescription: !Ref RepositoryDescription
+      Tags:
+        - Key: 'Purpose'
+          Value: 'Multi-branch CI/CD'
+        - Key: 'Environment'
+          Value: 'All'
+        - Key: 'BackupRequired'
+          Value: 'true'
+
+  # ====================================
+  # IAM Roles and Policies
+  # ====================================
+  
+  # CodePipeline Service Role
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-CodePipelineServiceRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AWSCodePipelineFullAccess'
+      Policies:
+        - PolicyName: CodePipelineExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'codecommit:GetBranch'
+                  - 'codecommit:GetCommit'
+                  - 'codecommit:GetRepository'
+                  - 'codecommit:ListBranches'
+                  - 'codecommit:ListRepositories'
+                  - 'codecommit:CancelUploadArchive'
+                  - 'codecommit:GetUploadArchiveStatus'
+                  - 'codecommit:UploadArchive'
+                Resource: !GetAtt CodeCommitRepository.Arn
+              - Effect: Allow
+                Action:
+                  - 'codebuild:BatchGetBuilds'
+                  - 'codebuild:StartBuild'
+                Resource: !GetAtt CodeBuildProject.Arn
+              - Effect: Allow
+                Action:
+                  - 's3:GetBucketAcl'
+                  - 's3:GetBucketLocation'
+                  - 's3:GetBucketVersioning'
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:PutObject'
+                  - 's3:PutObjectAcl'
+                Resource:
+                  - !Sub '${PipelineArtifactsBucket}/*'
+                  - !Ref PipelineArtifactsBucket
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref PipelineEventTopic
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+              - !If
+                - UseKMSEncryption
+                - Effect: Allow
+                  Action:
+                    - 'kms:Decrypt'
+                    - 'kms:GenerateDataKey'
+                    - 'kms:DescribeKey'
+                  Resource: !GetAtt PipelineKMSKey.Arn
+                - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: 'Purpose'
+          Value: 'Multi-branch CI/CD'
+        - Key: 'Component'
+          Value: 'CodePipeline'
+  
+  # CodeBuild Service Role
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-CodeBuildServiceRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/CloudWatchLogsFullAccess'
+      Policies:
+        - PolicyName: CodeBuildExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'codecommit:GitPull'
+                  - 'codecommit:GetBranch'
+                  - 'codecommit:GetCommit'
+                  - 'codecommit:GetRepository'
+                  - 'codecommit:ListBranches'
+                  - 'codecommit:ListRepositories'
+                Resource: !GetAtt CodeCommitRepository.Arn
+              - Effect: Allow
+                Action:
+                  - 's3:GetBucketAcl'
+                  - 's3:GetBucketLocation'
+                  - 's3:GetBucketVersioning'
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:PutObject'
+                  - 's3:PutObjectAcl'
+                Resource:
+                  - !Sub '${PipelineArtifactsBucket}/*'
+                  - !Ref PipelineArtifactsBucket
+              - Effect: Allow
+                Action:
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:GetAuthorizationToken'
+                  - 'ecr:BatchGetImage'
+                  - 'ecr:CreateRepository'
+                  - 'ecr:InitiateLayerUpload'
+                  - 'ecr:UploadLayerPart'
+                  - 'ecr:CompleteLayerUpload'
+                  - 'ecr:PutImage'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'ssm:GetParameter'
+                  - 'ssm:GetParameters'
+                  - 'ssm:GetParametersByPath'
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*'
+              - Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*'
+              - !If
+                - UseKMSEncryption
+                - Effect: Allow
+                  Action:
+                    - 'kms:Decrypt'
+                    - 'kms:GenerateDataKey'
+                    - 'kms:DescribeKey'
+                  Resource: !GetAtt PipelineKMSKey.Arn
+                - !Ref 'AWS::NoValue'
+              - !If
+                - UseBuildCache
+                - Effect: Allow
+                  Action:
+                    - 's3:GetObject'
+                    - 's3:PutObject'
+                  Resource: !Sub '${PipelineArtifactsBucket}/build-cache/*'
+                - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: 'Purpose'
+          Value: 'Multi-branch CI/CD'
+        - Key: 'Component'
+          Value: 'CodeBuild'
+  
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-LambdaExecutionRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: PipelineManagementPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'codepipeline:CreatePipeline'
+                  - 'codepipeline:DeletePipeline'
+                  - 'codepipeline:GetPipeline'
+                  - 'codepipeline:GetPipelineExecution'
+                  - 'codepipeline:GetPipelineState'
+                  - 'codepipeline:ListPipelines'
+                  - 'codepipeline:UpdatePipeline'
+                  - 'codepipeline:StartPipelineExecution'
+                  - 'codepipeline:StopPipelineExecution'
+                  - 'codepipeline:TagResource'
+                  - 'codepipeline:UntagResource'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'codebuild:BatchGetBuilds'
+                  - 'codebuild:BatchGetProjects'
+                  - 'codebuild:CreateProject'
+                  - 'codebuild:DeleteProject'
+                  - 'codebuild:ListProjects'
+                  - 'codebuild:StartBuild'
+                  - 'codebuild:StopBuild'
+                  - 'codebuild:UpdateProject'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'codecommit:GetBranch'
+                  - 'codecommit:GetCommit'
+                  - 'codecommit:GetRepository'
+                  - 'codecommit:ListBranches'
+                  - 'codecommit:ListRepositories'
+                Resource: !GetAtt CodeCommitRepository.Arn
+              - Effect: Allow
+                Action:
+                  - 'iam:PassRole'
+                Resource:
+                  - !GetAtt CodePipelineServiceRole.Arn
+                  - !GetAtt CodeBuildServiceRole.Arn
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref PipelineEventTopic
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                Resource: '*'
+              - !If
+                - UseKMSEncryption
+                - Effect: Allow
+                  Action:
+                    - 'kms:Decrypt'
+                    - 'kms:GenerateDataKey'
+                    - 'kms:DescribeKey'
+                  Resource: !GetAtt PipelineKMSKey.Arn
+                - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: 'Purpose'
+          Value: 'Multi-branch CI/CD'
+        - Key: 'Component'
+          Value: 'Lambda'
+  
+  # EventBridge Service Role
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-EventBridgeRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: EventBridgeExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: !GetAtt PipelineManagerFunction.Arn
+      Tags:
+        - Key: 'Purpose'
+          Value: 'Multi-branch CI/CD'
+        - Key: 'Component'
+          Value: 'EventBridge'
+
+  # ====================================
+  # CodeBuild Project
+  # ====================================
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${AWS::StackName}-multi-branch-build'
+      Description: 'Build project for multi-branch CI/CD pipelines'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Cache: !If
+        - UseBuildCache
+        - Type: S3
+          Location: !Sub '${PipelineArtifactsBucket}/build-cache'
+        - !Ref 'AWS::NoValue'
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: !Ref BuildComputeType
+        Image: !Ref BuildEnvironmentImage
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: IMAGE_REPO_NAME
+            Value: !Ref RepositoryName
+          - Name: IMAGE_TAG
+            Value: latest
+          - Name: PIPELINE_NAME
+            Value: !Sub '${AWS::StackName}'
+          - Name: BRANCH_NAME
+            Value: '${CODEBUILD_WEBHOOK_HEAD_REF}'
+          - Name: COMMIT_ID
+            Value: '${CODEBUILD_RESOLVED_SOURCE_VERSION}'
+          - Name: BUILD_CACHE_ENABLED
+            Value: !Ref EnableBuildCache
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          
+          env:
+            variables:
+              DOCKER_BUILDKIT: 1
+              BUILDKIT_PROGRESS: plain
+            
+          phases:
+            install:
+              runtime-versions:
+                nodejs: 18
+                python: 3.11
+                docker: 20
+              commands:
+                - echo Install phase started on `date`
+                - apt-get update -y
+                - apt-get install -y jq curl wget
+                - echo Install phase completed on `date`
+            
+            pre_build:
+              commands:
+                - echo Pre-build phase started on `date`
+                - echo Logging in to Amazon ECR...
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com || echo "ECR login failed, continuing without Docker registry"
+                - echo Creating ECR repository if it doesn't exist...
+                - aws ecr describe-repositories --repository-names $IMAGE_REPO_NAME --region $AWS_DEFAULT_REGION || aws ecr create-repository --repository-name $IMAGE_REPO_NAME --region $AWS_DEFAULT_REGION
+                - echo Branch name from environment - $BRANCH_NAME
+                - echo Commit ID - $COMMIT_ID
+                - echo Pipeline name - $PIPELINE_NAME
+                - echo Pre-build phase completed on `date`
+            
+            build:
+              commands:
+                - echo Build phase started on `date`
+                - echo Installing dependencies...
+                - |
+                  if [ -f package.json ]; then
+                    echo "Found package.json, installing Node.js dependencies..."
+                    npm ci
+                    echo "Running linting..."
+                    npm run lint || echo "No lint script found"
+                    echo "Running unit tests..."
+                    npm test || echo "No test script found"
+                    echo "Building application..."
+                    npm run build || echo "No build script found"
+                  elif [ -f requirements.txt ]; then
+                    echo "Found requirements.txt, installing Python dependencies..."
+                    pip install -r requirements.txt
+                    echo "Running Python tests..."
+                    python -m pytest --junitxml=test-results.xml || echo "No tests found"
+                    echo "Running code quality checks..."
+                    python -m pylint . || echo "No pylint configuration found"
+                  elif [ -f pom.xml ]; then
+                    echo "Found pom.xml, building Java application..."
+                    mvn clean compile test package
+                  elif [ -f go.mod ]; then
+                    echo "Found go.mod, building Go application..."
+                    go mod tidy
+                    go test ./...
+                    go build -o app .
+                  elif [ -f Dockerfile ]; then
+                    echo "Found Dockerfile, building Docker image..."
+                    docker build -t $IMAGE_REPO_NAME:$IMAGE_TAG .
+                    docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+                  else
+                    echo "No recognized build configuration found, creating default artifact"
+                    mkdir -p build
+                    echo "Build completed for branch $BRANCH_NAME at $(date)" > build/build-info.txt
+                  fi
+                - echo Build phase completed on `date`
+            
+            post_build:
+              commands:
+                - echo Post-build phase started on `date`
+                - echo Pushing Docker image if built...
+                - |
+                  if docker images | grep -q $IMAGE_REPO_NAME; then
+                    docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+                    echo "Docker image pushed successfully"
+                  else
+                    echo "No Docker image to push"
+                  fi
+                - echo Creating build artifacts...
+                - |
+                  if [ -f package.json ]; then
+                    echo "Packaging Node.js application..."
+                    tar -czf build-artifacts.tar.gz dist/ node_modules/ package.json || echo "No dist directory found"
+                  elif [ -f requirements.txt ]; then
+                    echo "Packaging Python application..."
+                    tar -czf build-artifacts.tar.gz *.py requirements.txt || echo "No Python files found"
+                  elif [ -f pom.xml ]; then
+                    echo "Packaging Java application..."
+                    cp target/*.jar build-artifacts.jar || echo "No JAR file found"
+                  elif [ -f go.mod ]; then
+                    echo "Packaging Go application..."
+                    tar -czf build-artifacts.tar.gz app go.mod go.sum || echo "No Go binary found"
+                  fi
+                - echo Writing image definitions file...
+                - |
+                  if docker images | grep -q $IMAGE_REPO_NAME; then
+                    printf '[{"name":"%s","imageUri":"%s"}]' $IMAGE_REPO_NAME $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG > imagedefinitions.json
+                  else
+                    echo "[]" > imagedefinitions.json
+                  fi
+                - echo Post-build phase completed on `date`
+          
+          reports:
+            test-results:
+              files:
+                - 'test-results.xml'
+                - '**/target/surefire-reports/*.xml'
+                - '**/pytest-results.xml'
+              file-format: 'JUNITXML'
+            
+            coverage-report:
+              files:
+                - 'coverage.xml'
+                - '**/target/site/jacoco/jacoco.xml'
+                - '**/coverage.xml'
+              file-format: 'COBERTURAXML'
+          
+          artifacts:
+            files:
+              - '**/*'
+            exclude-paths:
+              - 'node_modules/**/*'
+              - '.git/**/*'
+              - '**/.DS_Store'
+              - '**/Thumbs.db'
+      
+      TimeoutInMinutes: !Ref PipelineTimeoutMinutes
+      
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub '/aws/codebuild/${AWS::StackName}-multi-branch-build'
+          StreamName: 'build-logs'
+        S3Logs:
+          Status: ENABLED
+          Location: !Sub '${PipelineArtifactsBucket}/build-logs'
+          EncryptionDisabled: false
+      
+      VpcConfig:
+        VpcId: !Ref 'AWS::NoValue'
+        Subnets: !Ref 'AWS::NoValue'
+        SecurityGroupIds: !Ref 'AWS::NoValue'
+      
+      Tags:
+        - Key: 'Purpose'
+          Value: 'Multi-branch CI/CD'
+        - Key: 'Environment'
+          Value: 'Development'
+        - Key: 'Component'
+          Value: 'CodeBuild'
+
+  # ====================================
+  # Lambda Function for Pipeline Management
+  # ====================================
+  PipelineManagerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-pipeline-manager'
+      Runtime: !Ref LambdaRuntime
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      ReservedConcurrencyLimit: 10
+      Description: 'Lambda function to manage multi-branch CI/CD pipelines'
+      Environment:
+        Variables:
+          AWS_ACCOUNT_ID: !Ref AWS::AccountId
+          PIPELINE_ROLE_ARN: !GetAtt CodePipelineServiceRole.Arn
+          CODEBUILD_PROJECT_NAME: !Ref CodeBuildProject
+          ARTIFACT_BUCKET: !Ref PipelineArtifactsBucket
+          REPOSITORY_NAME: !Ref RepositoryName
+          MAIN_BRANCH: !Ref MainBranchName
+          DEVELOP_BRANCH: !Ref DevelopBranchName
+          FEATURE_BRANCH_PATTERN: !Ref FeatureBranchPattern
+          STACK_NAME: !Ref AWS::StackName
+          KMS_KEY_ID: !If [UseKMSEncryption, !Ref PipelineKMSKey, '']
+          NOTIFICATION_TOPIC_ARN: !Ref PipelineEventTopic
+          ENABLE_DETAILED_LOGGING: !Ref EnableDetailedMonitoring
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          import traceback
+          from typing import Dict, Any, List
+          import datetime
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO if os.environ.get('ENABLE_DETAILED_LOGGING', 'false') == 'true' else logging.WARNING)
+          
+          # Initialize AWS clients
+          codepipeline = boto3.client('codepipeline')
+          codecommit = boto3.client('codecommit')
+          cloudwatch = boto3.client('cloudwatch')
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              Lambda function to manage multi-branch CI/CD pipelines
+              Enhanced with better error handling and monitoring
+              """
+              try:
+                  logger.info(f"Received event: {json.dumps(event, default=str)}")
+                  
+                  # Send custom metrics
+                  send_custom_metric('PipelineManagerInvocations', 1)
+                  
+                  # Parse EventBridge event
+                  detail = event.get('detail', {})
+                  event_name = detail.get('eventName', '')
+                  repository_name = detail.get('repositoryName', '')
+                  
+                  if event_name == 'referenceCreated':
+                      return handle_branch_creation(detail, repository_name)
+                  elif event_name == 'referenceDeleted':
+                      return handle_branch_deletion(detail, repository_name)
+                  elif event_name == 'referenceUpdated':
+                      return handle_git_push(detail, repository_name)
+                  
+                  logger.warning(f"Unhandled event type: {event_name}")
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Event processed but no action taken')
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing event: {str(e)}")
+                  logger.error(f"Traceback: {traceback.format_exc()}")
+                  
+                  # Send error metric
+                  send_custom_metric('PipelineManagerErrors', 1)
+                  
+                  # Send SNS notification for errors
+                  send_notification(
+                      subject="Pipeline Manager Error",
+                      message=f"Error processing event: {str(e)}\n\nEvent: {json.dumps(event, default=str)}"
+                  )
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+          
+          def handle_branch_creation(detail: Dict[str, Any], repository_name: str) -> Dict[str, Any]:
+              """Handle branch creation events with enhanced validation"""
+              try:
+                  reference_name = detail.get('referenceName', '')
+                  branch_name = reference_name.replace('refs/heads/', '')
+                  
+                  logger.info(f"Branch created: {branch_name} in repository: {repository_name}")
+                  
+                  if not branch_name or not repository_name:
+                      logger.error("Missing branch name or repository name")
+                      return {'statusCode': 400, 'body': 'Branch name or repository name not found'}
+                  
+                  # Validate branch name format
+                  if not is_valid_branch_name(branch_name):
+                      logger.warning(f"Invalid branch name format: {branch_name}")
+                      return {'statusCode': 400, 'body': 'Invalid branch name format'}
+                  
+                  # Check if branch matches feature pattern
+                  feature_pattern = os.environ.get('FEATURE_BRANCH_PATTERN', 'feature/*').replace('*', '')
+                  if branch_name.startswith(feature_pattern):
+                      pipeline_name = generate_pipeline_name(branch_name)
+                      
+                      # Check if pipeline already exists
+                      if pipeline_exists(pipeline_name):
+                          logger.warning(f"Pipeline {pipeline_name} already exists")
+                          return {
+                              'statusCode': 409,
+                              'body': json.dumps(f'Pipeline {pipeline_name} already exists')
+                          }
+                      
+                      try:
+                          create_branch_pipeline(repository_name, branch_name, pipeline_name)
+                          logger.info(f"Created pipeline {pipeline_name} for branch {branch_name}")
+                          
+                          # Send success metric
+                          send_custom_metric('PipelineCreations', 1)
+                          
+                          # Send notification
+                          send_notification(
+                              subject="New Pipeline Created",
+                              message=f"Pipeline {pipeline_name} created successfully for branch {branch_name}"
+                          )
+                          
+                          return {
+                              'statusCode': 200,
+                              'body': json.dumps(f'Pipeline {pipeline_name} created successfully')
+                          }
+                      except Exception as e:
+                          logger.error(f"Failed to create pipeline: {str(e)}")
+                          send_custom_metric('PipelineCreationFailures', 1)
+                          return {
+                              'statusCode': 500,
+                              'body': json.dumps(f'Pipeline creation failed: {str(e)}')
+                          }
+                  
+                  logger.info(f"No pipeline created for branch type: {branch_name}")
+                  return {'statusCode': 200, 'body': 'No pipeline created for this branch type'}
+                  
+              except Exception as e:
+                  logger.error(f"Error handling branch creation: {str(e)}")
+                  return {'statusCode': 500, 'body': json.dumps(f'Error handling branch creation: {str(e)}')}
+          
+          def handle_branch_deletion(detail: Dict[str, Any], repository_name: str) -> Dict[str, Any]:
+              """Handle branch deletion events with enhanced validation"""
+              try:
+                  reference_name = detail.get('referenceName', '')
+                  branch_name = reference_name.replace('refs/heads/', '')
+                  
+                  logger.info(f"Branch deleted: {branch_name} in repository: {repository_name}")
+                  
+                  feature_pattern = os.environ.get('FEATURE_BRANCH_PATTERN', 'feature/*').replace('*', '')
+                  if branch_name.startswith(feature_pattern):
+                      pipeline_name = generate_pipeline_name(branch_name)
+                      
+                      try:
+                          # Check if pipeline exists before trying to delete
+                          if not pipeline_exists(pipeline_name):
+                              logger.warning(f"Pipeline {pipeline_name} does not exist")
+                              return {
+                                  'statusCode': 404,
+                                  'body': json.dumps(f'Pipeline {pipeline_name} not found')
+                              }
+                          
+                          # Delete the pipeline
+                          codepipeline.delete_pipeline(name=pipeline_name)
+                          logger.info(f"Deleted pipeline {pipeline_name}")
+                          
+                          # Send success metric
+                          send_custom_metric('PipelineDeletions', 1)
+                          
+                          # Send notification
+                          send_notification(
+                              subject="Pipeline Deleted",
+                              message=f"Pipeline {pipeline_name} deleted successfully for branch {branch_name}"
+                          )
+                          
+                          return {
+                              'statusCode': 200,
+                              'body': json.dumps(f'Pipeline {pipeline_name} deleted successfully')
+                          }
+                      except Exception as e:
+                          logger.error(f"Failed to delete pipeline: {str(e)}")
+                          send_custom_metric('PipelineDeletionFailures', 1)
+                          return {
+                              'statusCode': 500,
+                              'body': json.dumps(f'Pipeline deletion failed: {str(e)}')
+                          }
+                  
+                  return {'statusCode': 200, 'body': 'No pipeline deleted for this branch type'}
+                  
+              except Exception as e:
+                  logger.error(f"Error handling branch deletion: {str(e)}")
+                  return {'statusCode': 500, 'body': json.dumps(f'Error handling branch deletion: {str(e)}')}
+          
+          def handle_git_push(detail: Dict[str, Any], repository_name: str) -> Dict[str, Any]:
+              """Handle git push events with enhanced logging"""
+              try:
+                  reference_name = detail.get('referenceName', '')
+                  branch_name = reference_name.replace('refs/heads/', '')
+                  
+                  logger.info(f"Git push detected on branch {branch_name} in repository {repository_name}")
+                  
+                  # Send metric for git push events
+                  send_custom_metric('GitPushEvents', 1)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Git push event processed')
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error handling git push: {str(e)}")
+                  return {'statusCode': 500, 'body': json.dumps(f'Error handling git push: {str(e)}')}
+          
+          def create_branch_pipeline(repository_name: str, branch_name: str, pipeline_name: str) -> None:
+              """Create a new pipeline for the specified branch with enhanced configuration"""
+              
+              # Enhanced pipeline configuration
+              pipeline_definition = {
+                  "pipeline": {
+                      "name": pipeline_name,
+                      "roleArn": os.environ['PIPELINE_ROLE_ARN'],
+                      "artifactStore": {
+                          "type": "S3",
+                          "location": os.environ['ARTIFACT_BUCKET'],
+                          "encryptionKey": {
+                              "id": os.environ.get('KMS_KEY_ID', ''),
+                              "type": "KMS"
+                          } if os.environ.get('KMS_KEY_ID') else {}
+                      },
+                      "stages": [
+                          {
+                              "name": "Source",
+                              "actions": [
+                                  {
+                                      "name": "SourceAction",
+                                      "actionTypeId": {
+                                          "category": "Source",
+                                          "owner": "AWS",
+                                          "provider": "CodeCommit",
+                                          "version": "1"
+                                      },
+                                      "configuration": {
+                                          "RepositoryName": repository_name,
+                                          "BranchName": branch_name,
+                                          "OutputArtifactFormat": "CODE_ZIP",
+                                          "PollForSourceChanges": "false"
+                                      },
+                                      "outputArtifacts": [
+                                          {
+                                              "name": "SourceOutput"
+                                          }
+                                      ]
+                                  }
+                              ]
+                          },
+                          {
+                              "name": "Build",
+                              "actions": [
+                                  {
+                                      "name": "BuildAction",
+                                      "actionTypeId": {
+                                          "category": "Build",
+                                          "owner": "AWS",
+                                          "provider": "CodeBuild",
+                                          "version": "1"
+                                      },
+                                      "configuration": {
+                                          "ProjectName": os.environ['CODEBUILD_PROJECT_NAME'],
+                                          "EnvironmentVariables": json.dumps([
+                                              {
+                                                  "name": "BRANCH_NAME",
+                                                  "value": branch_name
+                                              },
+                                              {
+                                                  "name": "PIPELINE_NAME",
+                                                  "value": pipeline_name
+                                              }
+                                          ])
+                                      },
+                                      "inputArtifacts": [
+                                          {
+                                              "name": "SourceOutput"
+                                          }
+                                      ],
+                                      "outputArtifacts": [
+                                          {
+                                              "name": "BuildOutput"
+                                          }
+                                      ]
+                                  }
+                              ]
+                          }
+                      ],
+                      "tags": [
+                          {
+                              "key": "Purpose",
+                              "value": "Multi-branch CI/CD"
+                          },
+                          {
+                              "key": "Branch",
+                              "value": branch_name
+                          },
+                          {
+                              "key": "CreatedBy",
+                              "value": "PipelineManager"
+                          },
+                          {
+                              "key": "CreatedDate",
+                              "value": datetime.datetime.now().isoformat()
+                          }
+                      ]
+                  }
+              }
+              
+              # Remove empty encryptionKey if no KMS key
+              if not os.environ.get('KMS_KEY_ID'):
+                  del pipeline_definition["pipeline"]["artifactStore"]["encryptionKey"]
+              
+              # Create the pipeline
+              codepipeline.create_pipeline(**pipeline_definition)
+              
+              logger.info(f"Pipeline {pipeline_name} created successfully")
+          
+          def generate_pipeline_name(branch_name: str) -> str:
+              """Generate a valid pipeline name from branch name"""
+              # Replace invalid characters and ensure length limits
+              pipeline_name = f"{os.environ['STACK_NAME']}-{branch_name.replace('/', '-').replace('_', '-')}"
+              # AWS CodePipeline name limit is 100 characters
+              if len(pipeline_name) > 100:
+                  pipeline_name = pipeline_name[:100]
+              return pipeline_name
+          
+          def pipeline_exists(pipeline_name: str) -> bool:
+              """Check if a pipeline already exists"""
+              try:
+                  codepipeline.get_pipeline(name=pipeline_name)
+                  return True
+              except codepipeline.exceptions.PipelineNotFoundException:
+                  return False
+              except Exception as e:
+                  logger.error(f"Error checking pipeline existence: {str(e)}")
+                  return False
+          
+          def is_valid_branch_name(branch_name: str) -> bool:
+              """Validate branch name format"""
+              if not branch_name or len(branch_name) < 1 or len(branch_name) > 100:
+                  return False
+              
+              # Check for invalid characters
+              invalid_chars = ['..', '~', '^', ':', '\\', '*', '?', '[', ']']
+              for char in invalid_chars:
+                  if char in branch_name:
+                      return False
+              
+              return True
+          
+          def send_custom_metric(metric_name: str, value: float, unit: str = 'Count') -> None:
+              """Send custom metric to CloudWatch"""
+              try:
+                  cloudwatch.put_metric_data(
+                      Namespace='MultiBranchPipeline',
+                      MetricData=[
+                          {
+                              'MetricName': metric_name,
+                              'Value': value,
+                              'Unit': unit,
+                              'Timestamp': datetime.datetime.now(),
+                              'Dimensions': [
+                                  {
+                                      'Name': 'StackName',
+                                      'Value': os.environ['STACK_NAME']
+                                  }
+                              ]
+                          }
+                      ]
+                  )
+              except Exception as e:
+                  logger.error(f"Error sending metric {metric_name}: {str(e)}")
+          
+          def send_notification(subject: str, message: str) -> None:
+              """Send SNS notification"""
+              try:
+                  if os.environ.get('NOTIFICATION_TOPIC_ARN'):
+                      sns.publish(
+                          TopicArn=os.environ['NOTIFICATION_TOPIC_ARN'],
+                          Subject=subject,
+                          Message=message
+                      )
+              except Exception as e:
+                  logger.error(f"Error sending notification: {str(e)}")
+      
+      Tags:
+        - Key: 'Purpose'
+          Value: 'Multi-branch CI/CD'
+        - Key: 'Environment'
+          Value: 'Development'
+        - Key: 'Component'
+          Value: 'Lambda'
+
+  # ====================================
+  # EventBridge Rules and Targets
+  # ====================================
+  CodeCommitEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-codecommit-events'
+      Description: 'Capture CodeCommit repository events for pipeline management'
+      EventPattern:
+        source:
+          - 'aws.codecommit'
+        detail-type:
+          - 'CodeCommit Repository State Change'
+        detail:
+          repositoryName:
+            - !Ref RepositoryName
+          eventName:
+            - 'referenceCreated'
+            - 'referenceDeleted'
+            - 'referenceUpdated'
+      State: 'ENABLED'
+      Targets:
+        - Arn: !GetAtt PipelineManagerFunction.Arn
+          Id: 'PipelineManagerTarget'
+          RoleArn: !GetAtt EventBridgeRole.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 3
+            MaximumEventAge: 3600
+          DeadLetterConfig:
+            Arn: !GetAtt DeadLetterQueue.Arn
+  
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PipelineManagerFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt CodeCommitEventRule.Arn
+
+  # ====================================
+  # SNS Topic for Notifications
+  # ====================================
+  PipelineEventTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-pipeline-events'
+      DisplayName: 'Multi-Branch Pipeline Events'
+      KmsMasterKeyId: !If [UseKMSEncryption, !Ref PipelineKMSKey, 'alias/aws/sns']
+      DeliveryStatusLogging:
+        - Protocol: 'email'
+          SuccessFeedbackRoleArn: !GetAtt SNSLoggingRole.Arn
+          FailureFeedbackRoleArn: !GetAtt SNSLoggingRole.Arn
+      Tags:
+        - Key: 'Purpose'
+          Value: 'Multi-branch CI/CD'
+        - Key: 'Component'
+          Value: 'SNS'
+  
+  # SNS Topic Policy
+  PipelineEventTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref PipelineEventTopic
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - 'codepipeline.amazonaws.com'
+                - 'codebuild.amazonaws.com'
+                - 'lambda.amazonaws.com'
+                - 'events.amazonaws.com'
+            Action:
+              - 'sns:Publish'
+            Resource: !Ref PipelineEventTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+
+  # SNS Logging Role
+  SNSLoggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonSNSRole'
+
+  # SNS Subscription for Email Notifications
+  PipelineEventSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      Protocol: 'email'
+      TopicArn: !Ref PipelineEventTopic
+      Endpoint: !Ref NotificationEmail
+      FilterPolicy:
+        eventType:
+          - 'pipeline-created'
+          - 'pipeline-deleted'
+          - 'pipeline-failed'
+          - 'build-failed'
+
+  # ====================================
+  # Dead Letter Queue for Failed Events
+  # ====================================
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-pipeline-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: !If [UseKMSEncryption, !Ref PipelineKMSKey, 'alias/aws/sqs']
+      Tags:
+        - Key: 'Purpose'
+          Value: 'Multi-branch CI/CD'
+        - Key: 'Component'
+          Value: 'SQS'
+
+  # ====================================
+  # Main Branch Pipeline
+  # ====================================
+  MainBranchPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub '${AWS::StackName}-${MainBranchName}'
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineArtifactsBucket
+        EncryptionKey: !If
+          - UseKMSEncryption
+          - Id: !Ref PipelineKMSKey
+            Type: KMS
+          - !Ref 'AWS::NoValue'
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: '1'
+              Configuration:
+                RepositoryName: !Ref RepositoryName
+                BranchName: !Ref MainBranchName
+                OutputArtifactFormat: CODE_ZIP
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceOutput
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+                EnvironmentVariables: !Sub |
+                  [
+                    {
+                      "name": "BRANCH_NAME",
+                      "value": "${MainBranchName}"
+                    },
+                    {
+                      "name": "PIPELINE_NAME",
+                      "value": "${AWS::StackName}-${MainBranchName}"
+                    },
+                    {
+                      "name": "ENVIRONMENT",
+                      "value": "production"
+                    }
+                  ]
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+        - Name: Deploy
+          Actions:
+            - Name: DeployAction
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: S3
+                Version: '1'
+              Configuration:
+                BucketName: !Ref PipelineArtifactsBucket
+                ObjectKey: !Sub 'deployments/${MainBranchName}'
+                Extract: true
+              InputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+      Tags:
+        - Key: 'Purpose'
+          Value: 'Multi-branch CI/CD'
+        - Key: 'Environment'
+          Value: 'Production'
+        - Key: 'Branch'
+          Value: !Ref MainBranchName
+        - Key: 'Pipeline-Type'
+          Value: 'Permanent'
+
+  # ====================================
+  # Develop Branch Pipeline
+  # ====================================
+  DevelopBranchPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub '${AWS::StackName}-${DevelopBranchName}'
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineArtifactsBucket
+        EncryptionKey: !If
+          - UseKMSEncryption
+          - Id: !Ref PipelineKMSKey
+            Type: KMS
+          - !Ref 'AWS::NoValue'
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: '1'
+              Configuration:
+                RepositoryName: !Ref RepositoryName
+                BranchName: !Ref DevelopBranchName
+                OutputArtifactFormat: CODE_ZIP
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceOutput
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+                EnvironmentVariables: !Sub |
+                  [
+                    {
+                      "name": "BRANCH_NAME",
+                      "value": "${DevelopBranchName}"
+                    },
+                    {
+                      "name": "PIPELINE_NAME",
+                      "value": "${AWS::StackName}-${DevelopBranchName}"
+                    },
+                    {
+                      "name": "ENVIRONMENT",
+                      "value": "development"
+                    }
+                  ]
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+        - Name: Deploy
+          Actions:
+            - Name: DeployAction
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: S3
+                Version: '1'
+              Configuration:
+                BucketName: !Ref PipelineArtifactsBucket
+                ObjectKey: !Sub 'deployments/${DevelopBranchName}'
+                Extract: true
+              InputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+      Tags:
+        - Key: 'Purpose'
+          Value: 'Multi-branch CI/CD'
+        - Key: 'Environment'
+          Value: 'Development'
+        - Key: 'Branch'
+          Value: !Ref DevelopBranchName
+        - Key: 'Pipeline-Type'
+          Value: 'Permanent'
+
+  # ====================================
+  # CloudWatch Dashboard
+  # ====================================
+  PipelineDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateDashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-MultibranchPipelines'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/CodePipeline", "PipelineExecutionSuccess", "PipelineName", "${AWS::StackName}-${MainBranchName}"],
+                  [".", "PipelineExecutionFailure", ".", "."],
+                  [".", "PipelineExecutionSuccess", ".", "${AWS::StackName}-${DevelopBranchName}"],
+                  [".", "PipelineExecutionFailure", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Pipeline Execution Results",
+                "view": "timeSeries",
+                "stacked": false,
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/CodeBuild", "Duration", "ProjectName", "${CodeBuildProject}"],
+                  [".", "SucceededBuilds", ".", "."],
+                  [".", "FailedBuilds", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Build Performance",
+                "view": "timeSeries",
+                "stacked": false,
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["MultiBranchPipeline", "PipelineCreations", "StackName", "${AWS::StackName}"],
+                  [".", "PipelineDeletions", ".", "."],
+                  [".", "PipelineManagerInvocations", ".", "."],
+                  [".", "PipelineManagerErrors", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Pipeline Management Metrics",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${PipelineManagerFunction}"],
+                  [".", "Invocations", ".", "."],
+                  [".", "Errors", ".", "."],
+                  [".", "Throttles", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Performance",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/S3", "BucketSizeBytes", "BucketName", "${PipelineArtifactsBucket}", "StorageType", "StandardStorage"],
+                  [".", "NumberOfObjects", ".", ".", ".", "AllStorageTypes"]
+                ],
+                "period": 86400,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Artifact Storage Metrics",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${AWS::StackName}-pipeline-manager'\n| fields @timestamp, @message\n| filter @message like /ERROR/ or @message like /Created pipeline/ or @message like /Deleted pipeline/\n| sort @timestamp desc\n| limit 50",
+                "region": "${AWS::Region}",
+                "title": "Pipeline Manager Function Logs",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # ====================================
+  # CloudWatch Alarms
+  # ====================================
+  PipelineFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-pipeline-failure'
+      AlarmDescription: 'Alert when any pipeline fails'
+      MetricName: PipelineExecutionFailure
+      Namespace: AWS/CodePipeline
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref PipelineEventTopic
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: PipelineName
+          Value: !Sub '${AWS::StackName}-${MainBranchName}'
+
+  BuildFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-build-failure'
+      AlarmDescription: 'Alert when builds fail frequently'
+      MetricName: FailedBuilds
+      Namespace: AWS/CodeBuild
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref PipelineEventTopic
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: ProjectName
+          Value: !Ref CodeBuildProject
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-lambda-errors'
+      AlarmDescription: 'Alert when Lambda function errors occur'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref PipelineEventTopic
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PipelineManagerFunction
+
+  LambdaThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-lambda-throttles'
+      AlarmDescription: 'Alert when Lambda function is throttled'
+      MetricName: Throttles
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref PipelineEventTopic
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PipelineManagerFunction
+
+  CustomMetricAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-pipeline-manager-errors'
+      AlarmDescription: 'Alert when pipeline manager has errors'
+      MetricName: PipelineManagerErrors
+      Namespace: MultiBranchPipeline
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref PipelineEventTopic
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: StackName
+          Value: !Ref AWS::StackName
+
+  # ====================================
+  # CloudWatch Log Groups
+  # ====================================
+  PipelineManagerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-pipeline-manager'
+      RetentionInDays: 30
+      KmsKeyId: !If [UseKMSEncryption, !GetAtt PipelineKMSKey.Arn, !Ref 'AWS::NoValue']
+
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${AWS::StackName}-multi-branch-build'
+      RetentionInDays: 30
+      KmsKeyId: !If [UseKMSEncryption, !GetAtt PipelineKMSKey.Arn, !Ref 'AWS::NoValue']
+
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${AWS::StackName}-access-logs'
+      RetentionInDays: 90
+      KmsKeyId: !If [UseKMSEncryption, !GetAtt PipelineKMSKey.Arn, !Ref 'AWS::NoValue']
+
+Outputs:
+  # Repository Information
+  RepositoryName:
+    Description: 'Name of the CodeCommit repository'
+    Value: !Ref RepositoryName
+    Export:
+      Name: !Sub '${AWS::StackName}-RepositoryName'
+  
+  RepositoryCloneUrl:
+    Description: 'HTTPS clone URL for the repository'
+    Value: !GetAtt CodeCommitRepository.CloneUrlHttp
+    Export:
+      Name: !Sub '${AWS::StackName}-RepositoryCloneUrl'
+  
+  RepositoryArn:
+    Description: 'ARN of the CodeCommit repository'
+    Value: !GetAtt CodeCommitRepository.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RepositoryArn'
+  
+  # Pipeline Information
+  MainPipelineName:
+    Description: 'Name of the main branch pipeline'
+    Value: !Ref MainBranchPipeline
+    Export:
+      Name: !Sub '${AWS::StackName}-MainPipelineName'
+  
+  DevelopPipelineName:
+    Description: 'Name of the develop branch pipeline'
+    Value: !Ref DevelopBranchPipeline
+    Export:
+      Name: !Sub '${AWS::StackName}-DevelopPipelineName'
+  
+  # Build Information
+  CodeBuildProjectName:
+    Description: 'Name of the CodeBuild project'
+    Value: !Ref CodeBuildProject
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeBuildProjectName'
+  
+  # Lambda Function Information
+  PipelineManagerFunctionName:
+    Description: 'Name of the pipeline manager Lambda function'
+    Value: !Ref PipelineManagerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-PipelineManagerFunctionName'
+  
+  PipelineManagerFunctionArn:
+    Description: 'ARN of the pipeline manager Lambda function'
+    Value: !GetAtt PipelineManagerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PipelineManagerFunctionArn'
+  
+  # Storage Information
+  ArtifactsBucketName:
+    Description: 'Name of the S3 bucket for pipeline artifacts'
+    Value: !Ref PipelineArtifactsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ArtifactsBucketName'
+  
+  ArtifactsBucketArn:
+    Description: 'ARN of the S3 bucket for pipeline artifacts'
+    Value: !GetAtt PipelineArtifactsBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ArtifactsBucketArn'
+  
+  # Notification Information
+  NotificationTopicArn:
+    Description: 'ARN of the SNS topic for notifications'
+    Value: !Ref PipelineEventTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopicArn'
+  
+  # EventBridge Information
+  EventRuleName:
+    Description: 'Name of the EventBridge rule for CodeCommit events'
+    Value: !Ref CodeCommitEventRule
+    Export:
+      Name: !Sub '${AWS::StackName}-EventRuleName'
+  
+  # Monitoring Information
+  DashboardUrl:
+    Condition: CreateDashboard
+    Description: 'URL to the CloudWatch dashboard'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-MultibranchPipelines'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardUrl'
+  
+  # Security Information
+  KMSKeyId:
+    Condition: UseKMSEncryption
+    Description: 'KMS Key ID for encryption'
+    Value: !Ref PipelineKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyId'
+  
+  KMSKeyArn:
+    Condition: UseKMSEncryption
+    Description: 'KMS Key ARN for encryption'
+    Value: !GetAtt PipelineKMSKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyArn'
+  
+  # IAM Role Information
+  PipelineServiceRoleArn:
+    Description: 'ARN of the CodePipeline service role'
+    Value: !GetAtt CodePipelineServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PipelineServiceRoleArn'
+  
+  BuildServiceRoleArn:
+    Description: 'ARN of the CodeBuild service role'
+    Value: !GetAtt CodeBuildServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BuildServiceRoleArn'
+  
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+  
+  # Dead Letter Queue Information
+  DeadLetterQueueArn:
+    Description: 'ARN of the dead letter queue for failed events'
+    Value: !GetAtt DeadLetterQueue.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueueArn'
+  
+  # Getting Started Information
+  NextSteps:
+    Description: 'Next steps to get started with your multi-branch CI/CD pipeline'
+    Value: !Sub |
+      1. Clone the repository: git clone ${CodeCommitRepository.CloneUrlHttp}
+      2. Create feature branches: git checkout -b feature/your-feature-name
+      3. Push changes to trigger pipeline creation
+      4. Monitor pipeline execution in the AWS CodePipeline console
+      5. View logs and metrics in CloudWatch dashboard: ${AWS::StackName}-MultibranchPipelines
+      6. Configure branch protection rules in CodeCommit for main and develop branches
+      7. Set up additional deployment stages as needed
+      8. Review and adjust alarm thresholds in CloudWatch
+  
+  # Configuration Summary
+  ConfigurationSummary:
+    Description: 'Summary of the deployed configuration'
+    Value: !Sub |
+      Repository: ${RepositoryName}
+      Main Branch: ${MainBranchName}
+      Develop Branch: ${DevelopBranchName}
+      Feature Pattern: ${FeatureBranchPattern}
+      Build Image: ${BuildEnvironmentImage}
+      Build Compute: ${BuildComputeType}
+      Lambda Runtime: ${LambdaRuntime}
+      KMS Encryption: ${EnableKMSEncryption}
+      Build Cache: ${EnableBuildCache}
+      Monitoring: ${EnableCloudWatchDashboard}
+      Notifications: ${NotificationEmail}

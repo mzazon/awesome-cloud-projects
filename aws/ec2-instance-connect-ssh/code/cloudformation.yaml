@@ -1,0 +1,669 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  AWS CloudFormation template for Secure SSH Access with EC2 Instance Connect.
+  This template creates the complete infrastructure for demonstrating EC2 Instance Connect
+  including IAM policies, security groups, EC2 instances, and EC2 Instance Connect Endpoints.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - PublicSubnetId
+          - CreatePrivateSubnet
+          - PrivateSubnetCidr
+          - AllowedCidrBlock
+      - Label:
+          default: "Instance Configuration"
+        Parameters:
+          - InstanceType
+          - LatestAmiId
+          - CreatePrivateInstance
+      - Label:
+          default: "IAM Configuration"
+        Parameters:
+          - CreateTestUser
+          - CreateRestrictivePolicy
+      - Label:
+          default: "Logging Configuration"
+        Parameters:
+          - EnableCloudTrail
+          - CloudTrailRetentionDays
+      - Label:
+          default: "Resource Naming"
+        Parameters:
+          - Environment
+          - ProjectName
+    ParameterLabels:
+      VpcId:
+        default: "VPC ID"
+      PublicSubnetId:
+        default: "Public Subnet ID"
+      CreatePrivateSubnet:
+        default: "Create Private Subnet"
+      PrivateSubnetCidr:
+        default: "Private Subnet CIDR"
+      AllowedCidrBlock:
+        default: "Allowed SSH CIDR Block"
+      InstanceType:
+        default: "EC2 Instance Type"
+      LatestAmiId:
+        default: "Latest Amazon Linux 2023 AMI ID"
+      CreatePrivateInstance:
+        default: "Create Private Instance"
+      CreateTestUser:
+        default: "Create Test IAM User"
+      CreateRestrictivePolicy:
+        default: "Create Restrictive IAM Policy"
+      EnableCloudTrail:
+        default: "Enable CloudTrail Logging"
+      CloudTrailRetentionDays:
+        default: "CloudTrail Log Retention Days"
+      Environment:
+        default: "Environment Name"
+      ProjectName:
+        default: "Project Name"
+
+Parameters:
+  # Network Configuration
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The VPC ID where resources will be created
+    ConstraintDescription: Must be a valid VPC ID
+
+  PublicSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: The public subnet ID for the EC2 instance
+    ConstraintDescription: Must be a valid subnet ID in the selected VPC
+
+  CreatePrivateSubnet:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to create a private subnet for demonstrating Instance Connect Endpoints
+
+  PrivateSubnetCidr:
+    Type: String
+    Default: '172.31.64.0/24'
+    Description: CIDR block for the private subnet (only used if CreatePrivateSubnet is true)
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    ConstraintDescription: Must be a valid CIDR block
+
+  AllowedCidrBlock:
+    Type: String
+    Default: '0.0.0.0/0'
+    Description: CIDR block allowed for SSH access (restrict for production use)
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    ConstraintDescription: Must be a valid CIDR block
+
+  # Instance Configuration
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+    Description: EC2 instance type for the test instances
+    ConstraintDescription: Must be a valid EC2 instance type
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+    Description: Latest Amazon Linux 2023 AMI ID (automatically retrieved)
+
+  CreatePrivateInstance:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to create a private instance for demonstrating Instance Connect Endpoints
+
+  # IAM Configuration
+  CreateTestUser:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to create a test IAM user with EC2 Instance Connect permissions
+
+  CreateRestrictivePolicy:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to create resource-level restrictive IAM policies
+
+  # Logging Configuration
+  EnableCloudTrail:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to enable CloudTrail for auditing EC2 Instance Connect activities
+
+  CloudTrailRetentionDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    MaxValue: 365
+    Description: Number of days to retain CloudTrail logs
+
+  # Resource Naming
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedPattern: '^[a-z0-9]+$'
+    MaxLength: 10
+    Description: Environment name (dev, test, prod, etc.)
+    ConstraintDescription: Must be lowercase alphanumeric characters only
+
+  ProjectName:
+    Type: String
+    Default: 'ec2-connect'
+    AllowedPattern: '^[a-z0-9-]+$'
+    MaxLength: 20
+    Description: Project name for resource tagging
+    ConstraintDescription: Must be lowercase alphanumeric characters and hyphens only
+
+Conditions:
+  CreatePrivateSubnetCondition: !Equals [!Ref CreatePrivateSubnet, 'true']
+  CreatePrivateInstanceCondition: !And
+    - !Equals [!Ref CreatePrivateInstance, 'true']
+    - !Condition CreatePrivateSubnetCondition
+  CreateTestUserCondition: !Equals [!Ref CreateTestUser, 'true']
+  CreateRestrictivePolicyCondition: !Equals [!Ref CreateRestrictivePolicy, 'true']
+  EnableCloudTrailCondition: !Equals [!Ref EnableCloudTrail, 'true']
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      AvailabilityZone: us-east-1a
+    us-east-2:
+      AvailabilityZone: us-east-2a
+    us-west-1:
+      AvailabilityZone: us-west-1a
+    us-west-2:
+      AvailabilityZone: us-west-2a
+    eu-west-1:
+      AvailabilityZone: eu-west-1a
+    eu-central-1:
+      AvailabilityZone: eu-central-1a
+    ap-southeast-1:
+      AvailabilityZone: ap-southeast-1a
+    ap-southeast-2:
+      AvailabilityZone: ap-southeast-2a
+
+Resources:
+  # Security Group for EC2 Instance Connect
+  InstanceConnectSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-${Environment}-ec2-connect-sg'
+      GroupDescription: Security group for EC2 Instance Connect demonstration
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedCidrBlock
+          Description: SSH access for EC2 Instance Connect
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-ec2-connect-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: EC2InstanceConnect
+
+  # Private Subnet (conditional)
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Condition: CreatePrivateSubnetCondition
+    Properties:
+      VpcId: !Ref VpcId
+      CidrBlock: !Ref PrivateSubnetCidr
+      AvailabilityZone: !FindInMap [RegionMap, !Ref 'AWS::Region', AvailabilityZone]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-private-subnet'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Policy for EC2 Instance Connect
+  EC2InstanceConnectPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ProjectName}-${Environment}-EC2InstanceConnectPolicy'
+      Description: IAM policy for EC2 Instance Connect access
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ec2-instance-connect:SendSSHPublicKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'ec2:osuser': 'ec2-user'
+          - Effect: Allow
+            Action:
+              - ec2:DescribeInstances
+              - ec2:DescribeVpcs
+              - ec2:DescribeInstanceConnectEndpoints
+            Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Restrictive IAM Policy (conditional)
+  RestrictiveEC2InstanceConnectPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: CreateRestrictivePolicyCondition
+    Properties:
+      ManagedPolicyName: !Sub '${ProjectName}-${Environment}-RestrictiveEC2InstanceConnectPolicy'
+      Description: Restrictive IAM policy for EC2 Instance Connect with resource-level permissions
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ec2-instance-connect:SendSSHPublicKey
+            Resource: !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${PublicInstance}'
+            Condition:
+              StringEquals:
+                'ec2:osuser': 'ec2-user'
+          - Effect: Allow
+            Action:
+              - ec2:DescribeInstances
+              - ec2:DescribeVpcs
+              - ec2:DescribeInstanceConnectEndpoints
+            Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Test IAM User (conditional)
+  TestUser:
+    Type: AWS::IAM::User
+    Condition: CreateTestUserCondition
+    Properties:
+      UserName: !Sub '${ProjectName}-${Environment}-ec2-connect-user'
+      ManagedPolicyArns:
+        - !Ref EC2InstanceConnectPolicy
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: EC2InstanceConnectTesting
+
+  # Access Keys for Test User (conditional)
+  TestUserAccessKey:
+    Type: AWS::IAM::AccessKey
+    Condition: CreateTestUserCondition
+    Properties:
+      UserName: !Ref TestUser
+
+  # Public EC2 Instance
+  PublicInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref PublicSubnetId
+      SecurityGroupIds:
+        - !Ref InstanceConnectSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          
+          # Ensure EC2 Instance Connect is installed and configured
+          yum install -y ec2-instance-connect
+          
+          # Enable and start the service
+          systemctl enable ec2-instance-connect
+          systemctl start ec2-instance-connect
+          
+          # Create a test file to verify connectivity
+          echo "EC2 Instance Connect configured successfully on $(date)" > /home/ec2-user/instance-connect-test.txt
+          chown ec2-user:ec2-user /home/ec2-user/instance-connect-test.txt
+          
+          # Install additional debugging tools
+          yum install -y htop curl wget
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-public-instance'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: InstanceConnectEnabled
+          Value: 'true'
+
+  # Private EC2 Instance (conditional)
+  PrivateInstance:
+    Type: AWS::EC2::Instance
+    Condition: CreatePrivateInstanceCondition
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref InstanceConnectSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          
+          # Ensure EC2 Instance Connect is installed and configured
+          yum install -y ec2-instance-connect
+          
+          # Enable and start the service
+          systemctl enable ec2-instance-connect
+          systemctl start ec2-instance-connect
+          
+          # Create a test file to verify connectivity
+          echo "Private EC2 Instance Connect configured successfully on $(date)" > /home/ec2-user/private-instance-connect-test.txt
+          chown ec2-user:ec2-user /home/ec2-user/private-instance-connect-test.txt
+          
+          # Install additional debugging tools
+          yum install -y htop curl wget
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-private-instance'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: InstanceConnectEnabled
+          Value: 'true'
+
+  # IAM Role for EC2 instances
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-EC2InstanceRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Instance Profile
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ProjectName}-${Environment}-EC2InstanceProfile'
+      Roles:
+        - !Ref InstanceRole
+
+  # EC2 Instance Connect Endpoint (conditional)
+  InstanceConnectEndpoint:
+    Type: AWS::EC2::InstanceConnectEndpoint
+    Condition: CreatePrivateInstanceCondition
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref InstanceConnectSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-eice'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # S3 Bucket for CloudTrail (conditional)
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Condition: EnableCloudTrailCondition
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-cloudtrail-${AWS::AccountId}'
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: !Ref CloudTrailRetentionDays
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      NotificationConfiguration:
+        LambdaConfigurations: []
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # S3 Bucket Policy for CloudTrail (conditional)
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: EnableCloudTrailCondition
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub '${CloudTrailBucket.Arn}'
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CloudTrailBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': 'bucket-owner-full-control'
+
+  # CloudTrail for Auditing (conditional)
+  EC2InstanceConnectCloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Condition: EnableCloudTrailCondition
+    DependsOn: CloudTrailBucketPolicy
+    Properties:
+      TrailName: !Sub '${ProjectName}-${Environment}-ec2-connect-audit'
+      S3BucketName: !Ref CloudTrailBucket
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: AWS::EC2::Instance
+              Values:
+                - 'arn:aws:ec2:*'
+      InsightSelectors:
+        - InsightType: ApiCallRateInsight
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: EC2InstanceConnectAuditing
+
+Outputs:
+  # Network Outputs
+  VpcId:
+    Description: VPC ID used for the deployment
+    Value: !Ref VpcId
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+
+  PublicSubnetId:
+    Description: Public subnet ID used for the deployment
+    Value: !Ref PublicSubnetId
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnetId'
+
+  PrivateSubnetId:
+    Condition: CreatePrivateSubnetCondition
+    Description: Private subnet ID created for the deployment
+    Value: !Ref PrivateSubnet
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnetId'
+
+  SecurityGroupId:
+    Description: Security Group ID for EC2 Instance Connect
+    Value: !Ref InstanceConnectSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroupId'
+
+  # Instance Outputs
+  PublicInstanceId:
+    Description: Public EC2 Instance ID
+    Value: !Ref PublicInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicInstanceId'
+
+  PublicInstancePublicIp:
+    Description: Public IP address of the public EC2 instance
+    Value: !GetAtt PublicInstance.PublicIp
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicInstancePublicIp'
+
+  PrivateInstanceId:
+    Condition: CreatePrivateInstanceCondition
+    Description: Private EC2 Instance ID
+    Value: !Ref PrivateInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateInstanceId'
+
+  PrivateInstancePrivateIp:
+    Condition: CreatePrivateInstanceCondition
+    Description: Private IP address of the private EC2 instance
+    Value: !GetAtt PrivateInstance.PrivateIp
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateInstancePrivateIp'
+
+  # IAM Outputs
+  EC2InstanceConnectPolicyArn:
+    Description: ARN of the EC2 Instance Connect IAM policy
+    Value: !Ref EC2InstanceConnectPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-EC2InstanceConnectPolicyArn'
+
+  RestrictiveEC2InstanceConnectPolicyArn:
+    Condition: CreateRestrictivePolicyCondition
+    Description: ARN of the restrictive EC2 Instance Connect IAM policy
+    Value: !Ref RestrictiveEC2InstanceConnectPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-RestrictiveEC2InstanceConnectPolicyArn'
+
+  TestUserName:
+    Condition: CreateTestUserCondition
+    Description: Name of the test IAM user
+    Value: !Ref TestUser
+    Export:
+      Name: !Sub '${AWS::StackName}-TestUserName'
+
+  TestUserAccessKeyId:
+    Condition: CreateTestUserCondition
+    Description: Access Key ID for the test user
+    Value: !Ref TestUserAccessKey
+    Export:
+      Name: !Sub '${AWS::StackName}-TestUserAccessKeyId'
+
+  TestUserSecretAccessKey:
+    Condition: CreateTestUserCondition
+    Description: Secret Access Key for the test user (handle securely)
+    Value: !GetAtt TestUserAccessKey.SecretAccessKey
+    Export:
+      Name: !Sub '${AWS::StackName}-TestUserSecretAccessKey'
+    NoEcho: true
+
+  # Instance Connect Endpoint Outputs
+  InstanceConnectEndpointId:
+    Condition: CreatePrivateInstanceCondition
+    Description: EC2 Instance Connect Endpoint ID
+    Value: !Ref InstanceConnectEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceConnectEndpointId'
+
+  # CloudTrail Outputs
+  CloudTrailArn:
+    Condition: EnableCloudTrailCondition
+    Description: ARN of the CloudTrail for auditing
+    Value: !GetAtt EC2InstanceConnectCloudTrail.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrailArn'
+
+  CloudTrailBucketName:
+    Condition: EnableCloudTrailCondition
+    Description: S3 bucket name for CloudTrail logs
+    Value: !Ref CloudTrailBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrailBucketName'
+
+  # Connection Commands
+  PublicInstanceConnectCommand:
+    Description: AWS CLI command to connect to the public instance
+    Value: !Sub 'aws ec2-instance-connect ssh --instance-id ${PublicInstance} --os-user ec2-user'
+
+  PrivateInstanceConnectCommand:
+    Condition: CreatePrivateInstanceCondition
+    Description: AWS CLI command to connect to the private instance via endpoint
+    Value: !Sub 'aws ec2-instance-connect ssh --instance-id ${PrivateInstance} --os-user ec2-user --connection-type eice'
+
+  # Validation Commands
+  VerifyInstanceConnectCommand:
+    Description: Command to verify EC2 Instance Connect service status
+    Value: !Sub 'aws ec2-instance-connect ssh --instance-id ${PublicInstance} --os-user ec2-user --command "sudo systemctl status ec2-instance-connect"'
+
+  ViewCloudTrailLogsCommand:
+    Condition: EnableCloudTrailCondition
+    Description: Command to view CloudTrail logs for Instance Connect activities
+    Value: !Sub 'aws logs filter-log-events --log-group-name CloudTrail/EC2InstanceConnect --start-time $(date -d "1 hour ago" +%s)000 --filter-pattern "{ $.eventName = SendSSHPublicKey }"'

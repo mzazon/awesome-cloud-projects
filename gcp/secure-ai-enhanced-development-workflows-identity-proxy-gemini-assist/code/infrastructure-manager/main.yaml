@@ -1,0 +1,534 @@
+# Infrastructure Manager Configuration for Secure AI-Enhanced Development Workflows
+# This configuration deploys a comprehensive zero-trust development environment
+# combining Cloud Identity-Aware Proxy, Gemini Code Assist, Cloud Secrets Manager,
+# and Cloud Build for secure AI-powered development workflows.
+
+apiVersion: infra-manager.googleapis.com/v1
+kind: Deployment
+metadata:
+  name: secure-ai-dev-environment
+  labels:
+    environment: development
+    component: secure-ai-development
+    managed-by: infrastructure-manager
+
+spec:
+  # Deployment configuration
+  location: us-central1
+  
+  # Variable definitions for customization
+  variables:
+    project_id:
+      description: "Google Cloud Project ID"
+      type: string
+      required: true
+    
+    region:
+      description: "Primary region for resources"
+      type: string
+      default: "us-central1"
+    
+    zone:
+      description: "Primary zone for compute resources"
+      type: string
+      default: "us-central1-a"
+    
+    app_name:
+      description: "Application name prefix"
+      type: string
+      default: "secure-dev-app"
+    
+    workstation_name:
+      description: "Cloud Workstation instance name"
+      type: string
+      default: "secure-workstation"
+    
+    oauth_support_email:
+      description: "Email address for OAuth consent screen"
+      type: string
+      required: true
+    
+    developer_emails:
+      description: "List of developer email addresses for IAP access"
+      type: list(string)
+      default: []
+    
+    enable_gemini_assist:
+      description: "Enable Gemini Code Assist integration"
+      type: bool
+      default: true
+    
+    workstation_machine_type:
+      description: "Machine type for Cloud Workstations"
+      type: string
+      default: "e2-standard-4"
+    
+    workstation_disk_size:
+      description: "Disk size for Cloud Workstations in GB"
+      type: number
+      default: 100
+
+  # Resource definitions
+  resources:
+    # Enable required Google Cloud APIs
+    - name: enable-apis
+      type: gcp:projects:Service
+      properties:
+        project: ${var.project_id}
+        services:
+          - iap.googleapis.com
+          - compute.googleapis.com
+          - cloudbuild.googleapis.com
+          - secretmanager.googleapis.com
+          - cloudkms.googleapis.com
+          - workstations.googleapis.com
+          - run.googleapis.com
+          - artifactregistry.googleapis.com
+          - sourcerepo.googleapis.com
+          - aiplatform.googleapis.com
+          - cloudasset.googleapis.com
+      options:
+        dependsOn: []
+    
+    # Random suffix for unique resource naming
+    - name: random-suffix
+      type: random:RandomId
+      properties:
+        byteLength: 3
+        keepers:
+          project_id: ${var.project_id}
+    
+    # Cloud KMS Keyring for encryption
+    - name: kms-keyring
+      type: gcp:kms:KeyRing
+      properties:
+        name: secure-dev-keyring
+        location: ${var.region}
+        project: ${var.project_id}
+      options:
+        dependsOn:
+          - ${enable-apis}
+    
+    # Cloud KMS encryption key for secrets
+    - name: kms-encryption-key
+      type: gcp:kms:CryptoKey
+      properties:
+        name: secret-encryption-key
+        keyRing: ${kms-keyring.id}
+        purpose: ENCRYPT_DECRYPT
+        rotationPeriod: 7776000s  # 90 days
+        versionTemplate:
+          algorithm: GOOGLE_SYMMETRIC_ENCRYPTION
+          protectionLevel: SOFTWARE
+      options:
+        dependsOn:
+          - ${kms-keyring}
+    
+    # Service account for secure applications
+    - name: secure-app-service-account
+      type: gcp:serviceaccount:Account
+      properties:
+        accountId: secure-app-sa-${random-suffix.hex}
+        displayName: "Secure Application Service Account"
+        description: "Service account for secure development application"
+        project: ${var.project_id}
+      options:
+        dependsOn:
+          - ${enable-apis}
+    
+    # Service account for Gemini Code Assist
+    - name: gemini-assist-service-account
+      type: gcp:serviceaccount:Account
+      properties:
+        accountId: gemini-code-assist-sa-${random-suffix.hex}
+        displayName: "Gemini Code Assist Service Account"
+        description: "Service account for AI-powered development assistance"
+        project: ${var.project_id}
+      options:
+        dependsOn:
+          - ${enable-apis}
+    
+    # Cloud Secrets Manager secrets
+    - name: database-secret
+      type: gcp:secretmanager:Secret
+      properties:
+        secretId: app-secrets-db-${random-suffix.hex}
+        replication:
+          automatic: true
+        project: ${var.project_id}
+        labels:
+          environment: development
+          component: database
+      options:
+        dependsOn:
+          - ${enable-apis}
+    
+    - name: api-secret
+      type: gcp:secretmanager:Secret
+      properties:
+        secretId: app-secrets-api-${random-suffix.hex}
+        replication:
+          automatic: true
+        project: ${var.project_id}
+        labels:
+          environment: development
+          component: api
+      options:
+        dependsOn:
+          - ${enable-apis}
+    
+    # Secret versions with initial values
+    - name: database-secret-version
+      type: gcp:secretmanager:SecretVersion
+      properties:
+        secret: ${database-secret.id}
+        secretData: "postgresql://user:password@localhost:5432/secure_dev_db"
+      options:
+        dependsOn:
+          - ${database-secret}
+    
+    - name: api-secret-version
+      type: gcp:secretmanager:SecretVersion
+      properties:
+        secret: ${api-secret.id}
+        secretData: "sk-api-key-example-12345"
+      options:
+        dependsOn:
+          - ${api-secret}
+    
+    # IAM bindings for secret access
+    - name: database-secret-iam
+      type: gcp:secretmanager:SecretIamMember
+      properties:
+        project: ${var.project_id}
+        secretId: ${database-secret.secretId}
+        role: roles/secretmanager.secretAccessor
+        member: serviceAccount:${secure-app-service-account.email}
+      options:
+        dependsOn:
+          - ${database-secret}
+          - ${secure-app-service-account}
+    
+    - name: api-secret-iam
+      type: gcp:secretmanager:SecretIamMember
+      properties:
+        project: ${var.project_id}
+        secretId: ${api-secret.secretId}
+        role: roles/secretmanager.secretAccessor
+        member: serviceAccount:${secure-app-service-account.email}
+      options:
+        dependsOn:
+          - ${api-secret}
+          - ${secure-app-service-account}
+    
+    # Grant Gemini Code Assist permissions
+    - name: gemini-assist-ai-platform-user
+      type: gcp:projects:IamMember
+      properties:
+        project: ${var.project_id}
+        role: roles/aiplatform.user
+        member: serviceAccount:${gemini-assist-service-account.email}
+      options:
+        dependsOn:
+          - ${gemini-assist-service-account}
+    
+    # Cloud Workstations cluster
+    - name: workstations-cluster
+      type: gcp:workstations:Cluster
+      properties:
+        clusterId: secure-dev-cluster-${random-suffix.hex}
+        location: ${var.region}
+        project: ${var.project_id}
+        network: projects/${var.project_id}/global/networks/default
+        subnetwork: projects/${var.project_id}/regions/${var.region}/subnetworks/default
+        labels:
+          environment: development
+          component: workstations
+      options:
+        dependsOn:
+          - ${enable-apis}
+    
+    # Cloud Workstations configuration
+    - name: workstations-config
+      type: gcp:workstations:Config
+      properties:
+        configId: secure-dev-config-${random-suffix.hex}
+        location: ${var.region}
+        cluster: ${workstations-cluster.clusterId}
+        project: ${var.project_id}
+        host:
+          gceInstance:
+            machineType: ${var.workstation_machine_type}
+            bootDiskSizeGb: ${var.workstation_disk_size}
+            serviceAccount: ${secure-app-service-account.email}
+            enableNestedVirtualization: false
+            accelerators: []
+            tags:
+              - secure-workstation
+        container:
+          image: us-central1-docker.pkg.dev/cloud-workstations-images/predefined/code-oss:latest
+          env:
+            GEMINI_CODE_ASSIST_ENABLED: "${var.enable_gemini_assist}"
+            GOOGLE_CLOUD_PROJECT: ${var.project_id}
+        persistentDirectories:
+          - gcePd:
+              sizeGb: 200
+              fsType: ext4
+              diskType: pd-standard
+            mountPath: /home
+        idleTimeout: 3600s  # 1 hour
+        runningTimeout: 43200s  # 12 hours
+        labels:
+          environment: development
+          ai-assist: gemini
+      options:
+        dependsOn:
+          - ${workstations-cluster}
+          - ${secure-app-service-account}
+    
+    # Cloud Workstation instance
+    - name: workstation-instance
+      type: gcp:workstations:Workstation
+      properties:
+        workstationId: ${var.workstation_name}-${random-suffix.hex}
+        location: ${var.region}
+        cluster: ${workstations-cluster.clusterId}
+        config: ${workstations-config.configId}
+        project: ${var.project_id}
+        labels:
+          environment: development
+          user-type: developer
+        annotations:
+          created-by: infrastructure-manager
+          gemini-assist: enabled
+      options:
+        dependsOn:
+          - ${workstations-config}
+    
+    # Artifact Registry repository for container images
+    - name: artifact-registry-repo
+      type: gcp:artifactregistry:Repository
+      properties:
+        repositoryId: secure-dev-images-${random-suffix.hex}
+        location: ${var.region}
+        project: ${var.project_id}
+        format: DOCKER
+        description: "Secure development container images"
+        labels:
+          environment: development
+          component: container-registry
+      options:
+        dependsOn:
+          - ${enable-apis}
+    
+    # Cloud Source Repository
+    - name: source-repository
+      type: gcp:sourcerepo:Repository
+      properties:
+        name: secure-dev-repo-${random-suffix.hex}
+        project: ${var.project_id}
+      options:
+        dependsOn:
+          - ${enable-apis}
+    
+    # Cloud Build service account IAM bindings
+    - name: cloud-build-run-developer
+      type: gcp:projects:IamMember
+      properties:
+        project: ${var.project_id}
+        role: roles/run.developer
+        member: serviceAccount:${var.project_id}@cloudbuild.gserviceaccount.com
+      options:
+        dependsOn:
+          - ${enable-apis}
+    
+    - name: cloud-build-artifact-writer
+      type: gcp:projects:IamMember
+      properties:
+        project: ${var.project_id}
+        role: roles/artifactregistry.writer
+        member: serviceAccount:${var.project_id}@cloudbuild.gserviceaccount.com
+      options:
+        dependsOn:
+          - ${enable-apis}
+    
+    # Sample Cloud Run service for demonstration
+    - name: secure-cloud-run-service
+      type: gcp:cloudrun:Service
+      properties:
+        name: ${var.app_name}-${random-suffix.hex}
+        location: ${var.region}
+        project: ${var.project_id}
+        template:
+          spec:
+            serviceAccountName: ${secure-app-service-account.email}
+            containerConcurrency: 10
+            timeoutSeconds: 300
+            containers:
+              - image: gcr.io/cloudrun/hello  # Placeholder image
+                resources:
+                  limits:
+                    cpu: 1000m
+                    memory: 512Mi
+                env:
+                  - name: DB_SECRET_NAME
+                    value: ${database-secret.secretId}
+                  - name: API_SECRET_NAME
+                    value: ${api-secret.secretId}
+                  - name: IAP_ENABLED
+                    value: "true"
+                ports:
+                  - containerPort: 8080
+                    name: http1
+          metadata:
+            annotations:
+              run.googleapis.com/ingress: all
+              autoscaling.knative.dev/maxScale: "10"
+              autoscaling.knative.dev/minScale: "0"
+        traffic:
+          - percent: 100
+            latestRevision: true
+        metadata:
+          labels:
+            environment: development
+            component: api
+            security: iap-protected
+          annotations:
+            run.googleapis.com/ingress: all
+      options:
+        dependsOn:
+          - ${enable-apis}
+          - ${secure-app-service-account}
+          - ${database-secret}
+          - ${api-secret}
+    
+    # Cloud Run IAM policy to require authentication
+    - name: cloud-run-no-auth
+      type: gcp:cloudrun:IamMember
+      properties:
+        service: ${secure-cloud-run-service.name}
+        location: ${var.region}
+        project: ${var.project_id}
+        role: roles/run.invoker
+        member: allUsers
+      options:
+        dependsOn:
+          - ${secure-cloud-run-service}
+        deleteBeforeReplace: true
+    
+    # OAuth brand for IAP (conditional creation)
+    - name: oauth-brand
+      type: gcp:iap:Brand
+      properties:
+        supportEmail: ${var.oauth_support_email}
+        applicationTitle: "Secure Development Environment"
+        project: ${var.project_id}
+      options:
+        dependsOn:
+          - ${enable-apis}
+        ignoreChanges:
+          - supportEmail
+    
+    # IAP IAM bindings for developers
+    - name: iap-access-policy
+      type: gcp:projects:IamMember
+      properties:
+        project: ${var.project_id}
+        role: roles/iap.httpsResourceAccessor
+        member: user:${var.oauth_support_email}
+      options:
+        dependsOn:
+          - ${oauth-brand}
+    
+    # Additional IAP access for developer team (if specified)
+    - name: developer-iap-access
+      type: gcp:projects:IamMember
+      properties:
+        project: ${var.project_id}
+        role: roles/iap.httpsResourceAccessor
+        member: user:${each.value}
+      forEach: ${var.developer_emails}
+      options:
+        dependsOn:
+          - ${oauth-brand}
+
+  # Output values
+  outputs:
+    kms_keyring_id:
+      description: "Cloud KMS KeyRing ID"
+      value: ${kms-keyring.id}
+    
+    kms_key_id:
+      description: "Cloud KMS CryptoKey ID"
+      value: ${kms-encryption-key.id}
+    
+    secure_app_service_account_email:
+      description: "Service account email for secure applications"
+      value: ${secure-app-service-account.email}
+    
+    gemini_assist_service_account_email:
+      description: "Service account email for Gemini Code Assist"
+      value: ${gemini-assist-service-account.email}
+    
+    database_secret_id:
+      description: "Database secret ID in Secret Manager"
+      value: ${database-secret.secretId}
+    
+    api_secret_id:
+      description: "API secret ID in Secret Manager"
+      value: ${api-secret.secretId}
+    
+    workstations_cluster_name:
+      description: "Cloud Workstations cluster name"
+      value: ${workstations-cluster.clusterId}
+    
+    workstation_instance_name:
+      description: "Cloud Workstation instance name"
+      value: ${workstation-instance.workstationId}
+    
+    workstation_access_url:
+      description: "URL to access Cloud Workstation"
+      value: "https://workstations.googleusercontent.com/"
+    
+    artifact_registry_repository:
+      description: "Artifact Registry repository for container images"
+      value: ${artifact-registry-repo.repositoryId}
+    
+    source_repository_name:
+      description: "Cloud Source Repository name"
+      value: ${source-repository.name}
+    
+    cloud_run_service_url:
+      description: "Cloud Run service URL (IAP protected)"
+      value: ${secure-cloud-run-service.status[0].url}
+    
+    cloud_run_service_name:
+      description: "Cloud Run service name"
+      value: ${secure-cloud-run-service.name}
+    
+    oauth_brand_name:
+      description: "OAuth brand name for IAP"
+      value: ${oauth-brand.name}
+    
+    random_suffix:
+      description: "Random suffix used for resource naming"
+      value: ${random-suffix.hex}
+    
+    deployment_instructions:
+      description: "Next steps for completing the deployment"
+      value: |
+        Deployment completed successfully! Next steps:
+        
+        1. Access your Cloud Workstation at: https://workstations.googleusercontent.com/
+        2. Install Gemini Code Assist extension in your IDE
+        3. Configure OAuth consent screen if needed
+        4. Add developer email addresses to IAP access policy
+        5. Deploy your application code using Cloud Build
+        
+        Resources created:
+        - Secure Cloud Workstation: ${workstation-instance.workstationId}
+        - Cloud Run Service: ${secure-cloud-run-service.name}
+        - Artifact Registry: ${artifact-registry-repo.repositoryId}
+        - Source Repository: ${source-repository.name}
+        - KMS Encryption Key: ${kms-encryption-key.id}
+        - Secrets: ${database-secret.secretId}, ${api-secret.secretId}

@@ -1,0 +1,385 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudFormation template for Secure EC2 Management with Systems Manager.
+  This template creates an EC2 instance configured for secure management through Systems Manager
+  Session Manager and Run Command, eliminating the need for SSH keys or bastion hosts.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Instance Configuration"
+        Parameters:
+          - InstanceType
+          - OperatingSystem
+          - SubnetId
+          - VpcId
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - AllowHttpAccess
+          - SessionLoggingEnabled
+      - Label:
+          default: "Resource Naming"
+        Parameters:
+          - ResourcePrefix
+    ParameterLabels:
+      InstanceType:
+        default: "EC2 Instance Type"
+      OperatingSystem:
+        default: "Operating System"
+      SubnetId:
+        default: "Subnet ID"
+      VpcId:
+        default: "VPC ID"
+      AllowHttpAccess:
+        default: "Allow HTTP Access"
+      SessionLoggingEnabled:
+        default: "Enable Session Logging"
+      ResourcePrefix:
+        default: "Resource Name Prefix"
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+    Description: EC2 instance type for the managed server
+    ConstraintDescription: Must be a valid EC2 instance type
+
+  OperatingSystem:
+    Type: String
+    Default: AmazonLinux2023
+    AllowedValues:
+      - AmazonLinux2023
+      - Ubuntu22
+    Description: Operating system for the EC2 instance
+    ConstraintDescription: Must be either Amazon Linux 2023 or Ubuntu 22.04
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet ID where the EC2 instance will be launched
+    ConstraintDescription: Must be a valid subnet ID in the selected VPC
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where resources will be created
+    ConstraintDescription: Must be a valid VPC ID
+
+  AllowHttpAccess:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Whether to allow HTTP access (port 80) to the instance
+    ConstraintDescription: Must be either true or false
+
+  SessionLoggingEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable CloudWatch logging for Systems Manager sessions
+    ConstraintDescription: Must be either true or false
+
+  ResourcePrefix:
+    Type: String
+    Default: SSMSecure
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9]*$'
+    Description: Prefix for resource names (3-20 characters, alphanumeric, must start with letter)
+    ConstraintDescription: Must be 3-20 characters, alphanumeric, and start with a letter
+
+Conditions:
+  EnableHttpAccess: !Equals [!Ref AllowHttpAccess, 'true']
+  EnableSessionLogging: !Equals [!Ref SessionLoggingEnabled, 'true']
+  IsAmazonLinux: !Equals [!Ref OperatingSystem, 'AmazonLinux2023']
+  IsUbuntu: !Equals [!Ref OperatingSystem, 'Ubuntu22']
+
+Mappings:
+  # Latest AMI IDs for supported operating systems
+  # Note: In production, consider using AWS Systems Manager Parameter Store
+  # to automatically get the latest AMI IDs
+  RegionAMIMap:
+    us-east-1:
+      AmazonLinux2023: ami-0c7217cdde317cfec
+      Ubuntu22: ami-0e001c9271cf7f3b9
+    us-east-2:
+      AmazonLinux2023: ami-0f30a9c3a48f3fa79
+      Ubuntu22: ami-0900fe555666598a2
+    us-west-1:
+      AmazonLinux2023: ami-0da424eb883458071
+      Ubuntu22: ami-0f8e81a3da6e2510a
+    us-west-2:
+      AmazonLinux2023: ami-0c2d3e23d311c5ab1
+      Ubuntu22: ami-0efcece6bed30fd98
+    eu-west-1:
+      AmazonLinux2023: ami-0c9c942bd7bf113a2
+      Ubuntu22: ami-0a8e758f5e873d1c1
+    eu-central-1:
+      AmazonLinux2023: ami-0e067cc8a2b58de59
+      Ubuntu22: ami-0e067cc8a2b58de59
+    ap-southeast-1:
+      AmazonLinux2023: ami-047126e50991d067b
+      Ubuntu22: ami-047126e50991d067b
+    ap-northeast-1:
+      AmazonLinux2023: ami-0d52744d6551d851e
+      Ubuntu22: ami-0d52744d6551d851e
+
+Resources:
+  # IAM Role for EC2 instance to access Systems Manager
+  SSMInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-SSMInstanceRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-SSMInstanceRole'
+        - Key: Purpose
+          Value: 'Systems Manager EC2 Instance Role'
+        - Key: Stack
+          Value: !Ref AWS::StackName
+
+  # Instance Profile to attach the IAM role to EC2
+  SSMInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ResourcePrefix}-SSMInstanceProfile-${AWS::StackName}'
+      Roles:
+        - !Ref SSMInstanceRole
+
+  # Security Group for the EC2 instance
+  SSMSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ResourcePrefix}-SSMSecurityGroup-${AWS::StackName}'
+      GroupDescription: Security group for Systems Manager managed EC2 instance
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        # Allow outbound HTTPS for Systems Manager communication
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTPS outbound for Systems Manager'
+        # Allow outbound HTTP for package updates
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTP outbound for package updates'
+        # Allow DNS queries
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: 'DNS queries'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-SSMSecurityGroup'
+        - Key: Purpose
+          Value: 'Systems Manager EC2 Security Group'
+        - Key: Stack
+          Value: !Ref AWS::StackName
+
+  # Conditional Security Group Rule for HTTP access
+  HTTPIngressRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: EnableHttpAccess
+    Properties:
+      GroupId: !Ref SSMSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      CidrIp: 0.0.0.0/0
+      Description: 'HTTP access for web server testing'
+
+  # CloudWatch Log Group for session logging (conditional)
+  SessionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableSessionLogging
+    Properties:
+      LogGroupName: !Sub '/aws/ssm/sessions/${ResourcePrefix}-${AWS::StackName}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-SessionLogs'
+        - Key: Purpose
+          Value: 'Systems Manager Session Logs'
+        - Key: Stack
+          Value: !Ref AWS::StackName
+
+  # EC2 Instance configured for Systems Manager
+  SSMManagedInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !FindInMap [RegionAMIMap, !Ref 'AWS::Region', !Ref OperatingSystem]
+      IamInstanceProfile: !Ref SSMInstanceProfile
+      SecurityGroupIds:
+        - !Ref SSMSecurityGroup
+      SubnetId: !Ref SubnetId
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Update the system
+          if command -v dnf &> /dev/null; then
+              # Amazon Linux 2023
+              dnf update -y
+              # Install additional packages if needed
+              dnf install -y htop
+          elif command -v apt-get &> /dev/null; then
+              # Ubuntu
+              apt-get update -y
+              apt-get upgrade -y
+              # Install additional packages if needed
+              apt-get install -y htop
+          fi
+          
+          # Create a simple web page for testing
+          if command -v dnf &> /dev/null; then
+              # Amazon Linux - install nginx
+              dnf install -y nginx
+              systemctl enable nginx
+              systemctl start nginx
+              echo "<html><body><h1>Hello from Systems Manager</h1><p>This server is managed securely without SSH!</p><p>Instance ID: $(curl -s http://169.254.169.254/latest/meta-data/instance-id)</p><p>Stack: ${AWS::StackName}</p></body></html>" > /usr/share/nginx/html/index.html
+          elif command -v apt-get &> /dev/null; then
+              # Ubuntu - install nginx
+              apt-get install -y nginx
+              systemctl enable nginx
+              systemctl start nginx
+              echo "<html><body><h1>Hello from Systems Manager</h1><p>This server is managed securely without SSH!</p><p>Instance ID: $(curl -s http://169.254.169.254/latest/meta-data/instance-id)</p><p>Stack: ${AWS::StackName}</p></body></html>" > /var/www/html/index.html
+          fi
+          
+          # Signal completion to CloudFormation
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource SSMManagedInstance --region ${AWS::Region}
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-SecureServer'
+        - Key: Purpose
+          Value: 'Systems Manager Managed Instance'
+        - Key: Stack
+          Value: !Ref AWS::StackName
+        - Key: SSMManaged
+          Value: 'true'
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT10M
+
+  # Systems Manager Document for session preferences (conditional)
+  SessionManagerPreferences:
+    Type: AWS::SSM::Document
+    Condition: EnableSessionLogging
+    Properties:
+      DocumentType: Session
+      Name: !Sub '${ResourcePrefix}-SessionManagerPreferences-${AWS::StackName}'
+      Content:
+        schemaVersion: '1.0'
+        description: 'Session Manager preferences for logging'
+        sessionType: Standard_Stream
+        inputs:
+          s3BucketName: ''
+          s3KeyPrefix: ''
+          s3EncryptionEnabled: true
+          cloudWatchLogGroupName: !Ref SessionLogGroup
+          cloudWatchEncryptionEnabled: false
+          idleSessionTimeout: '20'
+          maxSessionDuration: '60'
+          runAsEnabled: false
+          runAsDefaultUser: ''
+          shellProfile:
+            windows: ''
+            linux: 'cd /home && pwd'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-SessionPreferences'
+        - Key: Purpose
+          Value: 'Systems Manager Session Preferences'
+        - Key: Stack
+          Value: !Ref AWS::StackName
+
+Outputs:
+  InstanceId:
+    Description: ID of the created EC2 instance
+    Value: !Ref SSMManagedInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceId'
+
+  InstancePrivateIP:
+    Description: Private IP address of the EC2 instance
+    Value: !GetAtt SSMManagedInstance.PrivateIp
+    Export:
+      Name: !Sub '${AWS::StackName}-InstancePrivateIP'
+
+  InstancePublicIP:
+    Description: Public IP address of the EC2 instance (if available)
+    Value: !GetAtt SSMManagedInstance.PublicIp
+    Condition: EnableHttpAccess
+    Export:
+      Name: !Sub '${AWS::StackName}-InstancePublicIP'
+
+  SecurityGroupId:
+    Description: ID of the created security group
+    Value: !Ref SSMSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroupId'
+
+  IAMRoleArn:
+    Description: ARN of the IAM role for Systems Manager
+    Value: !GetAtt SSMInstanceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IAMRoleArn'
+
+  SessionLogGroupName:
+    Description: CloudWatch Log Group name for session logging
+    Value: !Ref SessionLogGroup
+    Condition: EnableSessionLogging
+    Export:
+      Name: !Sub '${AWS::StackName}-SessionLogGroup'
+
+  SessionManagerCommand:
+    Description: AWS CLI command to start a session with the instance
+    Value: !Sub 'aws ssm start-session --target ${SSMManagedInstance}'
+
+  WebServerURL:
+    Description: URL to access the web server (if HTTP access is enabled)
+    Value: !Sub 'http://${SSMManagedInstance.PublicIp}'
+    Condition: EnableHttpAccess
+
+  ConnectInstructions:
+    Description: Instructions for connecting to the instance
+    Value: !Sub |
+      To connect to your instance securely:
+      1. Install the Session Manager plugin: https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html
+      2. Run: aws ssm start-session --target ${SSMManagedInstance}
+      3. Or use the AWS Console: EC2 > Instances > ${SSMManagedInstance} > Connect > Session Manager
+
+  ManagementInstructions:
+    Description: Instructions for managing the instance with Systems Manager
+    Value: !Sub |
+      Manage your instance with these Systems Manager capabilities:
+      1. Session Manager: Secure shell access without SSH
+      2. Run Command: Execute scripts remotely
+      3. Patch Manager: Automated patching
+      4. Inventory: Track software and configurations
+      5. State Manager: Maintain consistent configurations

@@ -1,0 +1,745 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for EKS cluster with comprehensive logging and monitoring using CloudWatch and Prometheus'
+
+Parameters:
+  ClusterName:
+    Type: String
+    Description: Name of the EKS cluster
+    Default: eks-observability-cluster
+    MinLength: 1
+    MaxLength: 100
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+
+  KubernetesVersion:
+    Type: String
+    Description: Kubernetes version for the EKS cluster
+    Default: '1.28'
+    AllowedValues:
+      - '1.27'
+      - '1.28'
+      - '1.29'
+      - '1.30'
+
+  NodeGroupInstanceType:
+    Type: String
+    Description: Instance type for worker nodes
+    Default: t3.medium
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - m5.large
+      - m5.xlarge
+      - m5.2xlarge
+
+  NodeGroupDesiredCapacity:
+    Type: Number
+    Description: Desired number of worker nodes
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+
+  NodeGroupMinSize:
+    Type: Number
+    Description: Minimum number of worker nodes
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+
+  NodeGroupMaxSize:
+    Type: Number
+    Description: Maximum number of worker nodes
+    Default: 4
+    MinValue: 1
+    MaxValue: 10
+
+  PrometheusWorkspaceName:
+    Type: String
+    Description: Name of the Amazon Managed Service for Prometheus workspace
+    Default: eks-prometheus-workspace
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+
+  EnableControlPlaneLogging:
+    Type: String
+    Description: Enable EKS control plane logging
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableContainerInsights:
+    Type: String
+    Description: Enable CloudWatch Container Insights
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  CreateDashboard:
+    Type: String
+    Description: Create CloudWatch dashboard
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  AlertingEmail:
+    Type: String
+    Description: Email address for CloudWatch alarms (optional)
+    Default: ''
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address or empty
+
+Conditions:
+  EnableLogging: !Equals [!Ref EnableControlPlaneLogging, 'true']
+  EnableInsights: !Equals [!Ref EnableContainerInsights, 'true']
+  CreateDashboardCondition: !Equals [!Ref CreateDashboard, 'true']
+  CreateAlertingTopic: !Not [!Equals [!Ref AlertingEmail, '']]
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      AMI: ami-0c02fb55956c7d316
+    us-west-2:
+      AMI: ami-0d1cd67c26f5fca19
+    eu-west-1:
+      AMI: ami-08ca3fed11864d6bb
+    ap-southeast-1:
+      AMI: ami-0c802847a7dd848c0
+
+Resources:
+  # VPC and Networking Resources
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-vpc'
+        - Key: Purpose
+          Value: EKS-Cluster
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-igw'
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-subnet-1'
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-subnet-2'
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.3.0/24
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-subnet-1'
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.0.4.0/24
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-subnet-2'
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+
+  # NAT Gateway for private subnets
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat-eip-1'
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat-1'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-routes'
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-routes-1'
+
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet2
+
+  # Security Group for EKS Control Plane
+  ControlPlaneSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EKS control plane
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS access to EKS API server
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-control-plane-sg'
+
+  # IAM Roles
+  EKSClusterServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-service-role'
+
+  EKSNodeGroupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-node-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-node-role'
+
+  # CloudWatch Agent Role for Container Insights
+  CloudWatchAgentRole:
+    Type: AWS::IAM::Role
+    Condition: EnableInsights
+    Properties:
+      RoleName: !Sub '${ClusterName}-cloudwatch-agent-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/${EKSCluster.OpenIdConnectIssuerUrl}'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                !Sub '${EKSCluster.OpenIdConnectIssuerUrl}:sub': 'system:serviceaccount:amazon-cloudwatch:cloudwatch-agent'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-cloudwatch-agent-role'
+
+  # Prometheus Scraper Role
+  PrometheusScraperRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-prometheus-scraper-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: aps.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonPrometheusRemoteWriteAccess
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-prometheus-scraper-role'
+
+  # EKS Cluster
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt EKSClusterServiceRole.Arn
+      ResourcesVpcConfig:
+        SecurityGroupIds:
+          - !Ref ControlPlaneSecurityGroup
+        SubnetIds:
+          - !Ref PublicSubnet1
+          - !Ref PublicSubnet2
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+        EndpointConfigPrivate: false
+        EndpointConfigPublic: true
+      Logging: !If
+        - EnableLogging
+        - ClusterLogging:
+            EnabledTypes:
+              - Type: api
+              - Type: audit
+              - Type: authenticator
+              - Type: controllerManager
+              - Type: scheduler
+        - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Name
+          Value: !Ref ClusterName
+
+  # EKS Node Group
+  EKSNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref EKSCluster
+      NodegroupName: !Sub '${ClusterName}-nodegroup'
+      NodeRole: !GetAtt EKSNodeGroupRole.Arn
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      InstanceTypes:
+        - !Ref NodeGroupInstanceType
+      ScalingConfig:
+        DesiredSize: !Ref NodeGroupDesiredCapacity
+        MaxSize: !Ref NodeGroupMaxSize
+        MinSize: !Ref NodeGroupMinSize
+      UpdateConfig:
+        MaxUnavailable: 1
+      AmiType: AL2_x86_64
+      Tags:
+        Name: !Sub '${ClusterName}-nodegroup'
+
+  # Amazon Managed Service for Prometheus
+  PrometheusWorkspace:
+    Type: AWS::APS::Workspace
+    Properties:
+      Alias: !Ref PrometheusWorkspaceName
+      Tags:
+        - Key: Name
+          Value: !Ref PrometheusWorkspaceName
+
+  # CloudWatch Log Groups for EKS
+  EKSControlPlaneLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: !Sub '/aws/eks/${ClusterName}/cluster'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-control-plane-logs'
+
+  ContainerInsightsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableInsights
+    Properties:
+      LogGroupName: !Sub '/aws/containerinsights/${ClusterName}/application'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-container-insights-logs'
+
+  DataplaneLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableInsights
+    Properties:
+      LogGroupName: !Sub '/aws/containerinsights/${ClusterName}/dataplane'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-dataplane-logs'
+
+  # SNS Topic for Alerts
+  AlertingTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateAlertingTopic
+    Properties:
+      TopicName: !Sub '${ClusterName}-alerts'
+      DisplayName: !Sub 'EKS Cluster ${ClusterName} Alerts'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-alerts'
+
+  AlertingSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateAlertingTopic
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AlertingTopic
+      Endpoint: !Ref AlertingEmail
+
+  # CloudWatch Alarms
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableInsights
+    Properties:
+      AlarmName: !Sub '${ClusterName}-high-cpu-utilization'
+      AlarmDescription: 'High CPU utilization in EKS cluster'
+      MetricName: node_cpu_utilization
+      Namespace: ContainerInsights
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ClusterName
+      AlarmActions: !If
+        - CreateAlertingTopic
+        - [!Ref AlertingTopic]
+        - []
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-high-cpu-alarm'
+
+  HighMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableInsights
+    Properties:
+      AlarmName: !Sub '${ClusterName}-high-memory-utilization'
+      AlarmDescription: 'High memory utilization in EKS cluster'
+      MetricName: node_memory_utilization
+      Namespace: ContainerInsights
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ClusterName
+      AlarmActions: !If
+        - CreateAlertingTopic
+        - [!Ref AlertingTopic]
+        - []
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-high-memory-alarm'
+
+  HighFailedPodsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableInsights
+    Properties:
+      AlarmName: !Sub '${ClusterName}-high-failed-pods'
+      AlarmDescription: 'High number of failed pods in EKS cluster'
+      MetricName: cluster_failed_count
+      Namespace: ContainerInsights
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ClusterName
+      AlarmActions: !If
+        - CreateAlertingTopic
+        - [!Ref AlertingTopic]
+        - []
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-high-failed-pods-alarm'
+
+  # CloudWatch Dashboard
+  EKSObservabilityDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateDashboardCondition
+    Properties:
+      DashboardName: !Sub '${ClusterName}-observability'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "ContainerInsights", "cluster_node_count", "ClusterName", "${ClusterName}" ],
+                  [ ".", "cluster_node_running_count", ".", "." ],
+                  [ ".", "cluster_node_failed_count", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "EKS Cluster Node Status",
+                "period": 300,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "ContainerInsights", "cluster_running_count", "ClusterName", "${ClusterName}" ],
+                  [ ".", "cluster_pending_count", ".", "." ],
+                  [ ".", "cluster_failed_count", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "EKS Cluster Pod Status",
+                "period": 300,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "ContainerInsights", "node_cpu_utilization", "ClusterName", "${ClusterName}" ],
+                  [ ".", "node_memory_utilization", ".", "." ],
+                  [ ".", "node_filesystem_utilization", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Node Resource Utilization",
+                "period": 300,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "log",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/eks/${ClusterName}/cluster' | fields @timestamp, @message\\n| filter @message like /ERROR/\\n| sort @timestamp desc\\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "EKS Control Plane Errors",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  ClusterName:
+    Description: Name of the EKS cluster
+    Value: !Ref EKSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterName'
+
+  ClusterArn:
+    Description: ARN of the EKS cluster
+    Value: !GetAtt EKSCluster.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterArn'
+
+  ClusterEndpoint:
+    Description: Endpoint of the EKS cluster
+    Value: !GetAtt EKSCluster.Endpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterEndpoint'
+
+  ClusterSecurityGroupId:
+    Description: Security group ID of the EKS cluster
+    Value: !GetAtt EKSCluster.ClusterSecurityGroupId
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterSecurityGroupId'
+
+  NodeGroupArn:
+    Description: ARN of the EKS node group
+    Value: !GetAtt EKSNodeGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-NodeGroupArn'
+
+  PrometheusWorkspaceId:
+    Description: ID of the Prometheus workspace
+    Value: !GetAtt PrometheusWorkspace.WorkspaceId
+    Export:
+      Name: !Sub '${AWS::StackName}-PrometheusWorkspaceId'
+
+  PrometheusWorkspaceArn:
+    Description: ARN of the Prometheus workspace
+    Value: !GetAtt PrometheusWorkspace.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PrometheusWorkspaceArn'
+
+  PrometheusWorkspaceUrl:
+    Description: URL of the Prometheus workspace
+    Value: !GetAtt PrometheusWorkspace.PrometheusEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-PrometheusWorkspaceUrl'
+
+  VPCId:
+    Description: ID of the VPC
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCId'
+
+  PrivateSubnetIds:
+    Description: IDs of the private subnets
+    Value: !Join
+      - ','
+      - - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnetIds'
+
+  PublicSubnetIds:
+    Description: IDs of the public subnets
+    Value: !Join
+      - ','
+      - - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnetIds'
+
+  CloudWatchDashboardURL:
+    Condition: CreateDashboardCondition
+    Description: URL of the CloudWatch dashboard
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ClusterName}-observability'
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchDashboardURL'
+
+  AlertingTopicArn:
+    Condition: CreateAlertingTopic
+    Description: ARN of the SNS topic for alerts
+    Value: !Ref AlertingTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertingTopicArn'
+
+  KubeconfigCommand:
+    Description: Command to update kubeconfig
+    Value: !Sub 'aws eks update-kubeconfig --region ${AWS::Region} --name ${ClusterName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-KubeconfigCommand'
+
+  EKSClusterServiceRoleArn:
+    Description: ARN of the EKS cluster service role
+    Value: !GetAtt EKSClusterServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EKSClusterServiceRoleArn'
+
+  EKSNodeGroupRoleArn:
+    Description: ARN of the EKS node group role
+    Value: !GetAtt EKSNodeGroupRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EKSNodeGroupRoleArn'
+
+  CloudWatchAgentRoleArn:
+    Condition: EnableInsights
+    Description: ARN of the CloudWatch agent role
+    Value: !GetAtt CloudWatchAgentRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchAgentRoleArn'
+
+  PrometheusScraperRoleArn:
+    Description: ARN of the Prometheus scraper role
+    Value: !GetAtt PrometheusScraperRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PrometheusScraperRoleArn'

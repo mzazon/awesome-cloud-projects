@@ -1,0 +1,918 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Cross-Organization Data Sharing with Amazon Managed Blockchain - Enterprise-grade blockchain network for secure data sharing between organizations with automated compliance monitoring and event-driven notifications'
+
+Parameters:
+  NetworkName:
+    Type: String
+    Description: Name for the Amazon Managed Blockchain network
+    Default: cross-org-network
+    AllowedPattern: '^[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]$'
+    ConstraintDescription: Must be a valid blockchain network name (alphanumeric and hyphens only)
+    
+  OrganizationAName:
+    Type: String
+    Description: Name for the first organization (financial institution)
+    Default: financial-institution
+    AllowedPattern: '^[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]$'
+    ConstraintDescription: Must be a valid organization name (alphanumeric and hyphens only)
+    
+  OrganizationBName:
+    Type: String
+    Description: Name for the second organization (healthcare provider)
+    Default: healthcare-provider
+    AllowedPattern: '^[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]$'
+    ConstraintDescription: Must be a valid organization name (alphanumeric and hyphens only)
+    
+  AdminUsername:
+    Type: String
+    Description: Admin username for blockchain members
+    Default: admin
+    MinLength: 3
+    MaxLength: 16
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9]*$'
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters
+    
+  AdminPassword:
+    Type: String
+    Description: Admin password for blockchain members (minimum 8 characters)
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 32
+    AllowedPattern: '^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$'
+    ConstraintDescription: Must contain at least 8 characters with uppercase, lowercase, number and special character
+    
+  NodeInstanceType:
+    Type: String
+    Description: Instance type for blockchain peer nodes
+    Default: bc.t3.medium
+    AllowedValues: [bc.t3.small, bc.t3.medium, bc.t3.large, bc.m5.large, bc.m5.xlarge, bc.m5.2xlarge]
+    ConstraintDescription: Must be a valid blockchain instance type
+    
+  VotingThresholdPercentage:
+    Type: Number
+    Description: Percentage threshold for network voting (1-100)
+    Default: 66
+    MinValue: 1
+    MaxValue: 100
+    ConstraintDescription: Must be between 1 and 100
+    
+  ProposalDurationHours:
+    Type: Number
+    Description: Duration in hours for proposal voting
+    Default: 24
+    MinValue: 1
+    MaxValue: 168
+    ConstraintDescription: Must be between 1 and 168 hours (1 week)
+    
+  LambdaMemorySize:
+    Type: Number
+    Description: Memory size for Lambda function (MB)
+    Default: 512
+    MinValue: 128
+    MaxValue: 3008
+    ConstraintDescription: Must be between 128 and 3008 MB
+    
+  LambdaTimeout:
+    Type: Number
+    Description: Timeout for Lambda function (seconds)
+    Default: 60
+    MinValue: 1
+    MaxValue: 900
+    ConstraintDescription: Must be between 1 and 900 seconds
+    
+  DynamoDBReadCapacity:
+    Type: Number
+    Description: Read capacity units for DynamoDB audit trail table
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+    ConstraintDescription: Must be between 1 and 40000
+    
+  DynamoDBWriteCapacity:
+    Type: Number
+    Description: Write capacity units for DynamoDB audit trail table
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+    ConstraintDescription: Must be between 1 and 40000
+    
+  EnvironmentType:
+    Type: String
+    Description: Environment type for resource tagging and naming
+    Default: Development
+    AllowedValues: [Development, Testing, Staging, Production]
+    ConstraintDescription: Must be a valid environment type
+
+Conditions:
+  IsProduction: !Equals [!Ref EnvironmentType, Production]
+  IsNotProduction: !Not [!Equals [!Ref EnvironmentType, Production]]
+
+Resources:
+  # S3 Bucket for shared data storage and chaincode artifacts
+  CrossOrgDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${NetworkName}-data-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: IntelligentTiering
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: INTELLIGENT_TIERING
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt DataProcessingLambda.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: agreements/
+      Tags:
+        - Key: Name
+          Value: !Sub '${NetworkName}-shared-data-bucket'
+        - Key: Environment
+          Value: !Ref EnvironmentType
+        - Key: Purpose
+          Value: Cross-organization data sharing
+        - Key: Service
+          Value: Amazon Managed Blockchain
+
+  # S3 Bucket Policy for secure access
+  CrossOrgDataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CrossOrgDataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !Sub '${CrossOrgDataBucket}/*'
+              - !Ref CrossOrgDataBucket
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: AllowLambdaAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt DataProcessingLambdaRole.Arn
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+            Resource: !Sub '${CrossOrgDataBucket}/*'
+
+  # DynamoDB Table for audit trail
+  CrossOrgAuditTrail:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${NetworkName}-audit-trail'
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref DynamoDBReadCapacity
+        WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      AttributeDefinitions:
+        - AttributeName: TransactionId
+          AttributeType: S
+        - AttributeName: Timestamp
+          AttributeType: N
+        - AttributeName: AgreementId
+          AttributeType: S
+        - AttributeName: EventType
+          AttributeType: S
+      KeySchema:
+        - AttributeName: TransactionId
+          KeyType: HASH
+        - AttributeName: Timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: AgreementIdIndex
+          KeySchema:
+            - AttributeName: AgreementId
+              KeyType: HASH
+            - AttributeName: Timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !Ref DynamoDBReadCapacity
+            WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+        - IndexName: EventTypeIndex
+          KeySchema:
+            - AttributeName: EventType
+              KeyType: HASH
+            - AttributeName: Timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !Ref DynamoDBReadCapacity
+            WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${NetworkName}-audit-trail'
+        - Key: Environment
+          Value: !Ref EnvironmentType
+        - Key: Purpose
+          Value: Blockchain audit trail
+        - Key: Service
+          Value: Amazon Managed Blockchain
+
+  # SNS Topic for cross-organization notifications
+  CrossOrgNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${NetworkName}-notifications'
+      DisplayName: Cross-Organization Blockchain Notifications
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${NetworkName}-notifications'
+        - Key: Environment
+          Value: !Ref EnvironmentType
+        - Key: Purpose
+          Value: Cross-organization notifications
+        - Key: Service
+          Value: Amazon Managed Blockchain
+
+  # EventBridge Custom Bus for blockchain events
+  CrossOrgEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${NetworkName}-event-bus'
+      EventSourceName: cross-org.blockchain
+      Tags:
+        - Key: Name
+          Value: !Sub '${NetworkName}-event-bus'
+        - Key: Environment
+          Value: !Ref EnvironmentType
+        - Key: Purpose
+          Value: Blockchain event routing
+        - Key: Service
+          Value: Amazon Managed Blockchain
+
+  # EventBridge Rule for data sharing events
+  CrossOrgDataSharingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${NetworkName}-data-sharing-rule'
+      Description: Rule for cross-organization data sharing events
+      EventBusName: !Ref CrossOrgEventBus
+      EventPattern:
+        source: ['cross-org.blockchain']
+        detail-type:
+          - 'DataSharingAgreementCreated'
+          - 'OrganizationJoinedAgreement'
+          - 'DataShared'
+          - 'DataAccessed'
+      State: ENABLED
+      Targets:
+        - Arn: !Ref CrossOrgNotificationsTopic
+          Id: 'SNSTarget'
+        - Arn: !GetAtt DataProcessingLambda.Arn
+          Id: 'LambdaTarget'
+
+  # Permission for EventBridge to invoke Lambda
+  EventBridgeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataProcessingLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CrossOrgDataSharingRule.Arn
+
+  # Permission for S3 to invoke Lambda
+  S3LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataProcessingLambda
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub '${CrossOrgDataBucket}/*'
+
+  # IAM Role for Lambda function
+  DataProcessingLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NetworkName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CrossOrgDataProcessingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt CrossOrgAuditTrail.Arn
+                  - !Sub '${CrossOrgAuditTrail.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !GetAtt CrossOrgEventBus.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref CrossOrgNotificationsTopic
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub '${CrossOrgDataBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Ref CrossOrgDataBucket
+              - Effect: Allow
+                Action:
+                  - managedblockchain:GetNetwork
+                  - managedblockchain:GetMember
+                  - managedblockchain:GetNode
+                  - managedblockchain:ListMembers
+                  - managedblockchain:ListNodes
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'managedblockchain:NetworkId': !Ref BlockchainNetwork
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:DescribeKey
+                Resource: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${NetworkName}-lambda-role'
+        - Key: Environment
+          Value: !Ref EnvironmentType
+        - Key: Purpose
+          Value: Blockchain data processing
+        - Key: Service
+          Value: Amazon Managed Blockchain
+
+  # Lambda function for data validation and event processing
+  DataProcessingLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${NetworkName}-data-processor'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Role: !GetAtt DataProcessingLambdaRole.Arn
+      Environment:
+        Variables:
+          AUDIT_TRAIL_TABLE: !Ref CrossOrgAuditTrail
+          NOTIFICATION_TOPIC: !Ref CrossOrgNotificationsTopic
+          EVENT_BUS_NAME: !Ref CrossOrgEventBus
+          SHARED_BUCKET: !Ref CrossOrgDataBucket
+          NETWORK_ID: !Ref BlockchainNetwork
+          ENVIRONMENT: !Ref EnvironmentType
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          const eventbridge = new AWS.EventBridge();
+          const sns = new AWS.SNS();
+          const s3 = new AWS.S3();
+          
+          exports.handler = async (event) => {
+              try {
+                  console.log('Processing blockchain event:', JSON.stringify(event, null, 2));
+                  
+                  // Determine event source and type
+                  let blockchainEvent;
+                  if (event.Records && event.Records[0].eventSource === 'aws:s3') {
+                      // S3 event - new data uploaded
+                      blockchainEvent = await processS3Event(event);
+                  } else if (event.source === 'cross-org.blockchain') {
+                      // Direct blockchain event
+                      blockchainEvent = event;
+                  } else {
+                      // EventBridge event
+                      blockchainEvent = event.detail || event;
+                  }
+                  
+                  // Validate event data
+                  if (!blockchainEvent.agreementId && !blockchainEvent.AgreementId) {
+                      throw new Error('Agreement ID is required');
+                  }
+                  
+                  const agreementId = blockchainEvent.agreementId || blockchainEvent.AgreementId;
+                  const eventType = blockchainEvent.eventType || blockchainEvent.EventType || 'UNKNOWN';
+                  const timestamp = blockchainEvent.timestamp || Date.now();
+                  
+                  // Store audit trail in DynamoDB
+                  const auditRecord = {
+                      TransactionId: `${agreementId}-${timestamp}`,
+                      Timestamp: timestamp,
+                      EventType: eventType,
+                      AgreementId: agreementId,
+                      OrganizationId: blockchainEvent.organizationId || blockchainEvent.OrganizationId || 'UNKNOWN',
+                      DataId: blockchainEvent.dataId || blockchainEvent.DataId,
+                      Metadata: blockchainEvent.metadata || blockchainEvent.Metadata || {},
+                      ProcessedAt: new Date().toISOString()
+                  };
+                  
+                  await dynamodb.put({
+                      TableName: process.env.AUDIT_TRAIL_TABLE,
+                      Item: auditRecord
+                  }).promise();
+                  
+                  // Process different event types
+                  await processEventType(eventType, blockchainEvent);
+                  
+                  // Send notification via EventBridge
+                  await eventbridge.putEvents({
+                      Entries: [{
+                          Source: 'cross-org.blockchain',
+                          DetailType: eventType,
+                          Detail: JSON.stringify(blockchainEvent),
+                          EventBusName: process.env.EVENT_BUS_NAME
+                      }]
+                  }).promise();
+                  
+                  // Send SNS notification for critical events
+                  if (['DataSharingAgreementCreated', 'DataShared', 'DataAccessed'].includes(eventType)) {
+                      await sns.publish({
+                          TopicArn: process.env.NOTIFICATION_TOPIC,
+                          Subject: `Blockchain Event: ${eventType}`,
+                          Message: JSON.stringify({
+                              eventType,
+                              agreementId,
+                              timestamp: new Date(timestamp).toISOString(),
+                              organizationId: auditRecord.OrganizationId
+                          }, null, 2)
+                      }).promise();
+                  }
+                  
+                  return {
+                      statusCode: 200,
+                      body: JSON.stringify({
+                          message: 'Blockchain event processed successfully',
+                          eventType,
+                          agreementId,
+                          timestamp
+                      })
+                  };
+                  
+              } catch (error) {
+                  console.error('Error processing blockchain event:', error);
+                  throw error;
+              }
+          };
+          
+          async function processS3Event(event) {
+              const record = event.Records[0];
+              const bucket = record.s3.bucket.name;
+              const key = decodeURIComponent(record.s3.object.key.replace(/\+/g, ' '));
+              
+              console.log(`Processing S3 event for object: ${key}`);
+              
+              // Extract agreement ID from S3 key
+              const agreementMatch = key.match(/agreements\/([^\/]+)\//);
+              const agreementId = agreementMatch ? agreementMatch[1] : 'UNKNOWN';
+              
+              return {
+                  eventType: 'DataUploaded',
+                  agreementId,
+                  dataId: key,
+                  timestamp: Date.now(),
+                  metadata: {
+                      bucket,
+                      key,
+                      eventName: record.eventName
+                  }
+              };
+          }
+          
+          async function processEventType(eventType, event) {
+              switch (eventType) {
+                  case 'DataSharingAgreementCreated':
+                      await processAgreementCreated(event);
+                      break;
+                  case 'OrganizationJoinedAgreement':
+                      await processOrganizationJoined(event);
+                      break;
+                  case 'DataShared':
+                      await processDataShared(event);
+                      break;
+                  case 'DataAccessed':
+                      await processDataAccessed(event);
+                      break;
+                  case 'DataUploaded':
+                      await processDataUploaded(event);
+                      break;
+                  default:
+                      console.log(`Unknown event type: ${eventType}`);
+              }
+          }
+          
+          async function processAgreementCreated(event) {
+              console.log(`Processing agreement creation: ${event.agreementId}`);
+              
+              // Create metadata record in S3
+              const metadata = {
+                  agreementId: event.agreementId,
+                  creator: event.organizationId,
+                  createdAt: new Date(event.timestamp).toISOString(),
+                  status: 'ACTIVE',
+                  participants: [event.organizationId]
+              };
+              
+              await s3.putObject({
+                  Bucket: process.env.SHARED_BUCKET,
+                  Key: `agreements/${event.agreementId}/metadata.json`,
+                  Body: JSON.stringify(metadata, null, 2),
+                  ContentType: 'application/json'
+              }).promise();
+          }
+          
+          async function processOrganizationJoined(event) {
+              console.log(`Processing organization join: ${event.organizationId} to ${event.agreementId}`);
+              // Additional processing for organization joins
+          }
+          
+          async function processDataShared(event) {
+              console.log(`Processing data sharing: ${event.dataId} in ${event.agreementId}`);
+              // Additional processing for data sharing
+          }
+          
+          async function processDataAccessed(event) {
+              console.log(`Processing data access: ${event.dataId} by ${event.organizationId}`);
+              // Additional processing for data access
+          }
+          
+          async function processDataUploaded(event) {
+              console.log(`Processing data upload: ${event.dataId}`);
+              // Additional processing for data uploads
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub '${NetworkName}-data-processor'
+        - Key: Environment
+          Value: !Ref EnvironmentType
+        - Key: Purpose
+          Value: Blockchain data processing
+        - Key: Service
+          Value: Amazon Managed Blockchain
+
+  # IAM Role for cross-organization access control
+  CrossOrgAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NetworkName}-access-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Sub '${NetworkName}-external-id'
+      Policies:
+        - PolicyName: CrossOrgAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - managedblockchain:GetNetwork
+                  - managedblockchain:GetMember
+                  - managedblockchain:GetNode
+                  - managedblockchain:ListMembers
+                  - managedblockchain:ListNodes
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'managedblockchain:NetworkId': !Ref BlockchainNetwork
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${CrossOrgDataBucket}/agreements/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:Query
+                  - dynamodb:GetItem
+                Resource:
+                  - !GetAtt CrossOrgAuditTrail.Arn
+                  - !Sub '${CrossOrgAuditTrail.Arn}/index/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${NetworkName}-access-role'
+        - Key: Environment
+          Value: !Ref EnvironmentType
+        - Key: Purpose
+          Value: Cross-organization access control
+        - Key: Service
+          Value: Amazon Managed Blockchain
+
+  # CloudWatch Dashboard for monitoring
+  CrossOrgMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${NetworkName}-monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${DataProcessingLambda}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${DataProcessingLambda}"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${DataProcessingLambda}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Cross-Organization Data Processing Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Events", "MatchedEvents", "RuleName", "${CrossOrgDataSharingRule}"],
+                  ["AWS/Events", "InvocationsCount", "RuleName", "${CrossOrgDataSharingRule}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Cross-Organization Event Processing"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${CrossOrgAuditTrail}"],
+                  ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "${CrossOrgAuditTrail}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Audit Trail Storage Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/S3", "BucketSizeBytes", "BucketName", "${CrossOrgDataBucket}", "StorageType", "StandardStorage"],
+                  ["AWS/S3", "NumberOfObjects", "BucketName", "${CrossOrgDataBucket}", "StorageType", "AllStorageTypes"]
+                ],
+                "period": 86400,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Shared Data Storage Metrics"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarm for Lambda errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${NetworkName}-lambda-errors'
+      AlarmDescription: Alert on cross-organization Lambda function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DataProcessingLambda
+      AlarmActions:
+        - !Ref CrossOrgNotificationsTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for DynamoDB throttling
+  DynamoDBThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${NetworkName}-dynamodb-throttles'
+      AlarmDescription: Alert on DynamoDB throttling events
+      MetricName: ThrottledRequests
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref CrossOrgAuditTrail
+      AlarmActions:
+        - !Ref CrossOrgNotificationsTopic
+      TreatMissingData: notBreaching
+
+  # Amazon Managed Blockchain Network
+  BlockchainNetwork:
+    Type: AWS::ManagedBlockchain::Network
+    Properties:
+      Name: !Ref NetworkName
+      Description: Cross-Organization Data Sharing Network
+      Framework: HYPERLEDGER_FABRIC
+      FrameworkVersion: '2.2'
+      FrameworkConfiguration:
+        NetworkFabricConfiguration:
+          Edition: STANDARD
+      VotingPolicy:
+        ApprovalThresholdPolicy:
+          ThresholdPercentage: !Ref VotingThresholdPercentage
+          ProposalDurationInHours: !Ref ProposalDurationHours
+          ThresholdComparator: GREATER_THAN
+      MemberConfiguration:
+        Name: !Ref OrganizationAName
+        Description: Financial Institution Member
+        MemberFabricConfiguration:
+          AdminUsername: !Ref AdminUsername
+          AdminPassword: !Ref AdminPassword
+      Tags:
+        - Key: Name
+          Value: !Ref NetworkName
+        - Key: Environment
+          Value: !Ref EnvironmentType
+        - Key: Purpose
+          Value: Cross-organization data sharing
+        - Key: Service
+          Value: Amazon Managed Blockchain
+
+  # First Organization Member (created with network)
+  OrganizationAMember:
+    Type: AWS::ManagedBlockchain::Member
+    Properties:
+      NetworkId: !Ref BlockchainNetwork
+      MemberConfiguration:
+        Name: !Ref OrganizationAName
+        Description: !Sub 'Financial Institution Member - ${OrganizationAName}'
+        MemberFabricConfiguration:
+          AdminUsername: !Ref AdminUsername
+          AdminPassword: !Ref AdminPassword
+      NetworkConfiguration:
+        Name: !Ref NetworkName
+        Description: Cross-Organization Data Sharing Network
+        Framework: HYPERLEDGER_FABRIC
+        FrameworkVersion: '2.2'
+        FrameworkConfiguration:
+          NetworkFabricConfiguration:
+            Edition: STANDARD
+        VotingPolicy:
+          ApprovalThresholdPolicy:
+            ThresholdPercentage: !Ref VotingThresholdPercentage
+            ProposalDurationInHours: !Ref ProposalDurationHours
+            ThresholdComparator: GREATER_THAN
+
+  # Peer Node for Organization A
+  OrganizationANode:
+    Type: AWS::ManagedBlockchain::Node
+    Properties:
+      NetworkId: !Ref BlockchainNetwork
+      MemberId: !GetAtt OrganizationAMember.MemberId
+      NodeConfiguration:
+        InstanceType: !Ref NodeInstanceType
+        AvailabilityZone: !Sub '${AWS::Region}a'
+
+Outputs:
+  NetworkId:
+    Description: Amazon Managed Blockchain Network ID
+    Value: !Ref BlockchainNetwork
+    Export:
+      Name: !Sub '${AWS::StackName}-NetworkId'
+      
+  OrganizationAMemberId:
+    Description: Organization A Member ID
+    Value: !GetAtt OrganizationAMember.MemberId
+    Export:
+      Name: !Sub '${AWS::StackName}-OrgAMemberId'
+      
+  OrganizationANodeId:
+    Description: Organization A Node ID
+    Value: !Ref OrganizationANode
+    Export:
+      Name: !Sub '${AWS::StackName}-OrgANodeId'
+      
+  SharedDataBucket:
+    Description: S3 bucket for shared data storage
+    Value: !Ref CrossOrgDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-SharedDataBucket'
+      
+  AuditTrailTable:
+    Description: DynamoDB table for audit trail
+    Value: !Ref CrossOrgAuditTrail
+    Export:
+      Name: !Sub '${AWS::StackName}-AuditTrailTable'
+      
+  DataProcessingFunction:
+    Description: Lambda function for data processing
+    Value: !Ref DataProcessingLambda
+    Export:
+      Name: !Sub '${AWS::StackName}-DataProcessingFunction'
+      
+  NotificationTopic:
+    Description: SNS topic for notifications
+    Value: !Ref CrossOrgNotificationsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopic'
+      
+  EventBus:
+    Description: EventBridge custom event bus
+    Value: !Ref CrossOrgEventBus
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBus'
+      
+  AccessRole:
+    Description: IAM role for cross-organization access
+    Value: !Ref CrossOrgAccessRole
+    Export:
+      Name: !Sub '${AWS::StackName}-AccessRole'
+      
+  MonitoringDashboard:
+    Description: CloudWatch dashboard for monitoring
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${NetworkName}-monitoring'
+    Export:
+      Name: !Sub '${AWS::StackName}-MonitoringDashboard'
+      
+  NetworkEndpoint:
+    Description: Blockchain network VPC endpoint
+    Value: !Sub '${BlockchainNetwork}.managedblockchain.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-NetworkEndpoint'
+      
+  DeploymentRegion:
+    Description: AWS region where resources are deployed
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentRegion'
+      
+  EnvironmentType:
+    Description: Environment type for this deployment
+    Value: !Ref EnvironmentType
+    Export:
+      Name: !Sub '${AWS::StackName}-EnvironmentType'

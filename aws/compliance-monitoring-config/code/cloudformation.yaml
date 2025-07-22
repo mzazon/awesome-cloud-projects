@@ -1,0 +1,877 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Comprehensive compliance monitoring system using AWS Config with automated remediation and real-time notifications'
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'config-compliance'
+    Description: 'Project name for resource naming and tagging'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must be lowercase alphanumeric with hyphens only'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'test', 'staging', 'prod']
+    Description: 'Environment name for resource naming and tagging'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for compliance notifications'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  EnableRemediation:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable automatic remediation for non-compliant resources'
+
+  ConfigDeliveryFrequency:
+    Type: String
+    Default: 'TwentyFour_Hours'
+    AllowedValues: 
+      - 'One_Hour'
+      - 'Three_Hours'
+      - 'Six_Hours'
+      - 'Twelve_Hours'
+      - 'TwentyFour_Hours'
+    Description: 'Frequency for Config snapshot delivery to S3'
+
+  RequiredTagKey1:
+    Type: String
+    Default: 'Environment'
+    Description: 'First required tag key for EC2 instances'
+    MinLength: 1
+    MaxLength: 128
+
+  RequiredTagKey2:
+    Type: String
+    Default: 'Owner'
+    Description: 'Second required tag key for EC2 instances'
+    MinLength: 1
+    MaxLength: 128
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+Conditions:
+  EnableRemediationCondition: !Equals [!Ref EnableRemediation, 'true']
+  IsProductionEnvironment: !Equals [!Ref Environment, 'prod']
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+
+  # ==============================================================================
+  # S3 BUCKET FOR CONFIG DATA
+  # ==============================================================================
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-config-${Environment}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ConfigDataRetention
+            Status: Enabled
+            ExpirationInDays: !If [IsProductionEnvironment, 2555, 365]  # 7 years for prod, 1 year for dev
+            NoncurrentVersionExpirationInDays: 30
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Topic: !Ref ComplianceTopic
+            Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: AWSLogs/
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-config-bucket-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # S3 Bucket Policy for AWS Config
+  ConfigBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ConfigBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AWSConfigBucketPermissionsCheck
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt ConfigBucket.Arn
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref AWS::AccountId
+          - Sid: AWSConfigBucketExistenceCheck
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:ListBucket
+            Resource: !GetAtt ConfigBucket.Arn
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref AWS::AccountId
+          - Sid: AWSConfigBucketDelivery
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${ConfigBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+                AWS:SourceAccount: !Ref AWS::AccountId
+
+  # ==============================================================================
+  # SNS TOPIC FOR NOTIFICATIONS
+  # ==============================================================================
+  ComplianceTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-compliance-notifications-${Environment}'
+      DisplayName: 'Config Compliance Notifications'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-compliance-topic-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # SNS Topic Policy
+  ComplianceTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref ComplianceTopic
+      PolicyDocument:
+        Statement:
+          - Sid: AllowConfigServiceToPublish
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref ComplianceTopic
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref AWS::AccountId
+          - Sid: AllowCloudWatchAlarmsToPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref ComplianceTopic
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref AWS::AccountId
+
+  # Email Subscription to SNS Topic
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref ComplianceTopic
+      Endpoint: !Ref NotificationEmail
+
+  # ==============================================================================
+  # IAM ROLES AND POLICIES
+  # ==============================================================================
+  
+  # Config Service Role
+  ConfigServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ConfigServiceRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/ConfigRole
+      Policies:
+        - PolicyName: ConfigS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                  - s3:GetBucketPolicy
+                  - s3:ListBucket
+                Resource: !GetAtt ConfigBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: !Sub '${ConfigBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref ComplianceTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-config-service-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Lambda Execution Role for Custom Config Rules
+  ConfigLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ConfigLambdaRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-config-lambda-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Remediation Lambda Role
+  RemediationLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: EnableRemediationCondition
+    Properties:
+      RoleName: !Sub '${ProjectName}-RemediationLambdaRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RemediationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:CreateTags
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:DescribeSecurityGroups
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:GetBucketPublicAccessBlock
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-remediation-lambda-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ==============================================================================
+  # AWS CONFIG CONFIGURATION
+  # ==============================================================================
+  
+  # Configuration Recorder
+  ConfigurationRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      Name: !Sub '${ProjectName}-recorder-${Environment}'
+      RoleARN: !GetAtt ConfigServiceRole.Arn
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+        ResourceTypes: []
+
+  # Delivery Channel
+  DeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Properties:
+      Name: !Sub '${ProjectName}-delivery-channel-${Environment}'
+      S3BucketName: !Ref ConfigBucket
+      SnsTopicARN: !Ref ComplianceTopic
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: !Ref ConfigDeliveryFrequency
+
+  # ==============================================================================
+  # AWS MANAGED CONFIG RULES
+  # ==============================================================================
+  
+  # S3 Bucket Public Access Prohibited
+  S3BucketPublicAccessProhibitedRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigurationRecorder
+    Properties:
+      ConfigRuleName: s3-bucket-public-access-prohibited
+      Description: 'Checks that S3 buckets do not allow public access'
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_PUBLIC_ACCESS_PROHIBITED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::S3::Bucket
+
+  # Encrypted EBS Volumes
+  EncryptedVolumesRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigurationRecorder
+    Properties:
+      ConfigRuleName: encrypted-volumes
+      Description: 'Checks whether EBS volumes are encrypted'
+      Source:
+        Owner: AWS
+        SourceIdentifier: ENCRYPTED_VOLUMES
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Volume
+
+  # Root Access Key Check
+  RootAccessKeyCheckRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigurationRecorder
+    Properties:
+      ConfigRuleName: root-access-key-check
+      Description: 'Checks whether root access keys exist'
+      Source:
+        Owner: AWS
+        SourceIdentifier: ROOT_ACCESS_KEY_CHECK
+
+  # Required Tags for EC2 Instances
+  RequiredTagsEC2Rule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigurationRecorder
+    Properties:
+      ConfigRuleName: required-tags-ec2
+      Description: 'Checks whether EC2 instances have required tags'
+      Source:
+        Owner: AWS
+        SourceIdentifier: REQUIRED_TAGS
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Instance
+      InputParameters: !Sub |
+        {
+          "tag1Key": "${RequiredTagKey1}",
+          "tag2Key": "${RequiredTagKey2}"
+        }
+
+  # ==============================================================================
+  # LAMBDA FUNCTIONS
+  # ==============================================================================
+  
+  # Custom Security Group Rule Lambda Function
+  SecurityGroupRuleLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-SecurityGroupRule-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ConfigLambdaRole.Arn
+      Timeout: 60
+      Description: 'Custom Config rule to check security group ingress rules'
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          
+          def lambda_handler(event, context):
+              # Initialize AWS Config client
+              config = boto3.client('config')
+              
+              # Get configuration item from event
+              configuration_item = event['configurationItem']
+              
+              # Initialize compliance status
+              compliance_status = 'COMPLIANT'
+              
+              # Check if resource is a Security Group
+              if configuration_item['resourceType'] == 'AWS::EC2::SecurityGroup':
+                  # Get security group configuration
+                  sg_config = configuration_item['configuration']
+                  
+                  # Check for overly permissive ingress rules
+                  for rule in sg_config.get('ipPermissions', []):
+                      for ip_range in rule.get('ipRanges', []):
+                          if ip_range.get('cidrIp') == '0.0.0.0/0':
+                              # Check if it's not port 80 or 443
+                              if rule.get('fromPort') not in [80, 443]:
+                                  compliance_status = 'NON_COMPLIANT'
+                                  break
+                      if compliance_status == 'NON_COMPLIANT':
+                          break
+              
+              # Put evaluation result
+              config.put_evaluations(
+                  Evaluations=[
+                      {
+                          'ComplianceResourceType': configuration_item['resourceType'],
+                          'ComplianceResourceId': configuration_item['resourceId'],
+                          'ComplianceType': compliance_status,
+                          'OrderingTimestamp': configuration_item['configurationItemCaptureTime']
+                      }
+                  ],
+                  ResultToken=event['resultToken']
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Config rule evaluation completed')
+              }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-security-group-rule-lambda-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Lambda Permission for Config to invoke Security Group Rule function
+  SecurityGroupRuleLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SecurityGroupRuleLambda
+      Action: lambda:InvokeFunction
+      Principal: config.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  # Custom Security Group Config Rule
+  SecurityGroupRestrictedIngressRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: 
+      - ConfigurationRecorder
+      - SecurityGroupRuleLambdaPermission
+    Properties:
+      ConfigRuleName: security-group-restricted-ingress
+      Description: 'Checks that security groups do not allow unrestricted ingress except for ports 80 and 443'
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceIdentifier: !GetAtt SecurityGroupRuleLambda.Arn
+        SourceDetails:
+          - EventSource: aws.config
+            MessageType: ConfigurationItemChangeNotification
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::SecurityGroup
+
+  # Remediation Lambda Function
+  RemediationLambda:
+    Type: AWS::Lambda::Function
+    Condition: EnableRemediationCondition
+    Properties:
+      FunctionName: !Sub '${ProjectName}-Remediation-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt RemediationLambdaRole.Arn
+      Timeout: 60
+      Description: 'Automated remediation for compliance violations'
+      Environment:
+        Variables:
+          REQUIRED_TAG_KEY_1: !Ref RequiredTagKey1
+          REQUIRED_TAG_KEY_2: !Ref RequiredTagKey2
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          
+          def lambda_handler(event, context):
+              ec2 = boto3.client('ec2')
+              s3 = boto3.client('s3')
+              
+              # Parse the event
+              detail = event['detail']
+              config_rule_name = detail['configRuleName']
+              compliance_type = detail['newEvaluationResult']['complianceType']
+              resource_type = detail['resourceType']
+              resource_id = detail['resourceId']
+              
+              print(f"Processing {config_rule_name} for {resource_type} {resource_id} with status {compliance_type}")
+              
+              if compliance_type == 'NON_COMPLIANT':
+                  try:
+                      if config_rule_name == 'required-tags-ec2' and resource_type == 'AWS::EC2::Instance':
+                          # Add missing tags to EC2 instance
+                          tag_key_1 = os.environ.get('REQUIRED_TAG_KEY_1', 'Environment')
+                          tag_key_2 = os.environ.get('REQUIRED_TAG_KEY_2', 'Owner')
+                          
+                          ec2.create_tags(
+                              Resources=[resource_id],
+                              Tags=[
+                                  {'Key': tag_key_1, 'Value': 'Unknown'},
+                                  {'Key': tag_key_2, 'Value': 'Unknown'}
+                              ]
+                          )
+                          print(f"Added missing tags to EC2 instance {resource_id}")
+                      
+                      elif config_rule_name == 's3-bucket-public-access-prohibited' and resource_type == 'AWS::S3::Bucket':
+                          # Block public access on S3 bucket
+                          s3.put_public_access_block(
+                              Bucket=resource_id,
+                              PublicAccessBlockConfiguration={
+                                  'BlockPublicAcls': True,
+                                  'IgnorePublicAcls': True,
+                                  'BlockPublicPolicy': True,
+                                  'RestrictPublicBuckets': True
+                              }
+                          )
+                          print(f"Blocked public access on S3 bucket {resource_id}")
+                      
+                      else:
+                          print(f"No remediation available for rule {config_rule_name}")
+                          
+                  except Exception as e:
+                      print(f"Error during remediation: {str(e)}")
+                      raise e
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Remediation completed')
+              }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-remediation-lambda-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Lambda Permission for EventBridge to invoke Remediation function
+  RemediationLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableRemediationCondition
+    Properties:
+      FunctionName: !Ref RemediationLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ComplianceRemediationRule.Arn
+
+  # ==============================================================================
+  # EVENTBRIDGE RULES
+  # ==============================================================================
+  
+  # EventBridge Rule for Compliance Changes
+  ComplianceRemediationRule:
+    Type: AWS::Events::Rule
+    Condition: EnableRemediationCondition
+    Properties:
+      Name: !Sub '${ProjectName}-ComplianceRule-${Environment}'
+      Description: 'Triggers remediation for non-compliant resources'
+      EventPattern:
+        source:
+          - aws.config
+        detail-type:
+          - Config Rules Compliance Change
+        detail:
+          newEvaluationResult:
+            complianceType:
+              - NON_COMPLIANT
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt RemediationLambda.Arn
+          Id: RemediationTarget
+
+  # ==============================================================================
+  # CLOUDWATCH DASHBOARD
+  # ==============================================================================
+  
+  ComplianceDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-Compliance-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Config", "ComplianceByConfigRule", "ConfigRuleName", "s3-bucket-public-access-prohibited"],
+                  [".", ".", ".", "encrypted-volumes"],
+                  [".", ".", ".", "root-access-key-check"],
+                  [".", ".", ".", "required-tags-ec2"],
+                  [".", ".", ".", "security-group-restricted-ingress"]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Config Rule Compliance Status",
+                "period": 300,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${ProjectName}-Remediation-${Environment}"],
+                  [".", "Errors", ".", "."],
+                  [".", "Duration", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Remediation Function Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Config", "TotalDiscoveredResources"],
+                  [".", "ComplianceSummary", "ComplianceType", "COMPLIANT"],
+                  [".", ".", ".", "NON_COMPLIANT"],
+                  [".", ".", ".", "NOT_APPLICABLE"]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Overall Compliance Summary",
+                "period": 3600,
+                "stat": "Average"
+              }
+            }
+          ]
+        }
+
+  # ==============================================================================
+  # CLOUDWATCH ALARMS
+  # ==============================================================================
+  
+  # Alarm for Non-Compliant Resources
+  NonCompliantResourcesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-NonCompliantResources-${Environment}'
+      AlarmDescription: 'Alert when non-compliant resources are detected'
+      MetricName: ComplianceByConfigRule
+      Namespace: AWS/Config
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref ComplianceTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-non-compliant-alarm-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Alarm for Remediation Function Errors
+  RemediationErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableRemediationCondition
+    Properties:
+      AlarmName: !Sub '${ProjectName}-RemediationErrors-${Environment}'
+      AlarmDescription: 'Alert when remediation function encounters errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RemediationLambda
+      AlarmActions:
+        - !Ref ComplianceTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-remediation-errors-alarm-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+Outputs:
+  ConfigBucketName:
+    Description: 'Name of the S3 bucket storing Config data'
+    Value: !Ref ConfigBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigBucket'
+
+  ComplianceTopicArn:
+    Description: 'ARN of the SNS topic for compliance notifications'
+    Value: !Ref ComplianceTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-ComplianceTopic'
+
+  ConfigServiceRoleArn:
+    Description: 'ARN of the Config service role'
+    Value: !GetAtt ConfigServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigServiceRole'
+
+  SecurityGroupRuleLambdaArn:
+    Description: 'ARN of the custom security group rule Lambda function'
+    Value: !GetAtt SecurityGroupRuleLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroupRuleLambda'
+
+  RemediationLambdaArn:
+    Condition: EnableRemediationCondition
+    Description: 'ARN of the remediation Lambda function'
+    Value: !GetAtt RemediationLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RemediationLambda'
+
+  DashboardURL:
+    Description: 'URL to the CloudWatch compliance dashboard'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-Compliance-${Environment}'
+
+  ConfigRuleNames:
+    Description: 'List of created Config rule names'
+    Value: !Join
+      - ', '
+      - - !Ref S3BucketPublicAccessProhibitedRule
+        - !Ref EncryptedVolumesRule
+        - !Ref RootAccessKeyCheckRule
+        - !Ref RequiredTagsEC2Rule
+        - !Ref SecurityGroupRestrictedIngressRule
+
+  StackStatus:
+    Description: 'Status of the compliance monitoring stack deployment'
+    Value: 'Successfully deployed AWS Config compliance monitoring system'
+
+# ==============================================================================
+# METADATA
+# ==============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Project Configuration'
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: 'Notification Settings'
+        Parameters:
+          - NotificationEmail
+      - Label:
+          default: 'Config Settings'
+        Parameters:
+          - ConfigDeliveryFrequency
+          - EnableRemediation
+      - Label:
+          default: 'Compliance Rules Configuration'
+        Parameters:
+          - RequiredTagKey1
+          - RequiredTagKey2
+    ParameterLabels:
+      ProjectName:
+        default: 'Project Name'
+      Environment:
+        default: 'Environment'
+      NotificationEmail:
+        default: 'Notification Email'
+      EnableRemediation:
+        default: 'Enable Automated Remediation'
+      ConfigDeliveryFrequency:
+        default: 'Config Snapshot Delivery Frequency'
+      RequiredTagKey1:
+        default: 'First Required Tag Key'
+      RequiredTagKey2:
+        default: 'Second Required Tag Key'
+
+  CloudFormationTemplateDescription: |
+    This CloudFormation template creates a comprehensive compliance monitoring system using AWS Config.
+    It includes:
+    - AWS Config service configuration with delivery channel and recorder
+    - S3 bucket for Config data storage with lifecycle policies
+    - SNS topic for real-time notifications
+    - Multiple AWS managed Config rules for common compliance checks
+    - Custom Lambda-based Config rule for security group evaluation
+    - Automated remediation Lambda function with EventBridge integration
+    - CloudWatch dashboard for compliance visibility
+    - CloudWatch alarms for proactive monitoring
+    - Proper IAM roles and policies following least privilege principle
+    
+    The template is designed for production use with comprehensive security controls,
+    monitoring capabilities, and automated remediation workflows.
+
+  Version: '1.0'
+  Author: 'AWS CloudFormation Template Generator'
+  LastUpdated: '2025-01-12'

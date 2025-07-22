@@ -1,0 +1,496 @@
+# Infrastructure Manager Configuration for Cross-Cloud Data Migration
+# This configuration deploys Cloud Storage Transfer Service and Cloud Composer
+# for orchestrating automated cross-cloud data migration workflows
+
+# Import required modules
+imports:
+  - path: gcp-types/composer-v1:composer.googleapis.com
+    name: composer
+
+# Template variables for customization
+variables:
+  # Project configuration
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    default: "{{ env.PROJECT_ID }}"
+  
+  region:
+    description: "Primary region for resources"
+    type: string
+    default: "us-central1"
+  
+  zone:
+    description: "Primary zone for Composer environment"
+    type: string
+    default: "us-central1-a"
+  
+  # Environment naming
+  environment_suffix:
+    description: "Suffix for resource naming"
+    type: string
+    default: "{{ env.RANDOM_SUFFIX | default('demo') }}"
+  
+  composer_env_name:
+    description: "Name for Cloud Composer environment"
+    type: string
+    default: "data-migration-env"
+  
+  # Storage configuration
+  staging_bucket_name:
+    description: "Name for staging bucket"
+    type: string
+    default: "migration-staging-{{ variables.environment_suffix }}"
+  
+  target_bucket_name:
+    description: "Name for target bucket"
+    type: string
+    default: "migration-target-{{ variables.environment_suffix }}"
+  
+  # Composer configuration
+  composer_node_count:
+    description: "Number of nodes in Composer environment"
+    type: integer
+    default: 3
+    minimum: 3
+  
+  composer_disk_size:
+    description: "Disk size for Composer nodes (GB)"
+    type: integer
+    default: 30
+    minimum: 20
+  
+  composer_machine_type:
+    description: "Machine type for Composer nodes"
+    type: string
+    default: "n1-standard-1"
+  
+  # Transfer job configuration
+  transfer_job_description:
+    description: "Description for Storage Transfer job"
+    type: string
+    default: "Cross-cloud data migration orchestrated by Composer"
+
+# Resource definitions
+resources:
+  # Enable required APIs
+  - name: enable-composer-api
+    type: gcp-types/serviceusage-v1:serviceusage.projects.services
+    properties:
+      name: projects/{{ variables.project_id }}/services/composer.googleapis.com
+      project: {{ variables.project_id }}
+    metadata:
+      dependsOn: []
+
+  - name: enable-storage-transfer-api
+    type: gcp-types/serviceusage-v1:serviceusage.projects.services
+    properties:
+      name: projects/{{ variables.project_id }}/services/storagetransfer.googleapis.com
+      project: {{ variables.project_id }}
+    metadata:
+      dependsOn: []
+
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:serviceusage.projects.services
+    properties:
+      name: projects/{{ variables.project_id }}/services/storage.googleapis.com
+      project: {{ variables.project_id }}
+    metadata:
+      dependsOn: []
+
+  - name: enable-logging-api
+    type: gcp-types/serviceusage-v1:serviceusage.projects.services
+    properties:
+      name: projects/{{ variables.project_id }}/services/logging.googleapis.com
+      project: {{ variables.project_id }}
+    metadata:
+      dependsOn: []
+
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:serviceusage.projects.services
+    properties:
+      name: projects/{{ variables.project_id }}/services/monitoring.googleapis.com
+      project: {{ variables.project_id }}
+    metadata:
+      dependsOn: []
+
+  # Create staging bucket for temporary data processing
+  - name: staging-bucket
+    type: gcp-types/storage-v1:storage.buckets
+    properties:
+      project: {{ variables.project_id }}
+      name: {{ variables.staging_bucket_name }}
+      location: {{ variables.region }}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 7
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      labels:
+        environment: migration
+        purpose: staging
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # Create target bucket for final migrated data
+  - name: target-bucket
+    type: gcp-types/storage-v1:storage.buckets
+    properties:
+      project: {{ variables.project_id }}
+      name: {{ variables.target_bucket_name }}
+      location: {{ variables.region }}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      labels:
+        environment: migration
+        purpose: target
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # Create service account for Storage Transfer Service
+  - name: storage-transfer-service-account
+    type: gcp-types/iam-v1:iam.projects.serviceAccounts
+    properties:
+      project: {{ variables.project_id }}
+      accountId: storage-transfer-sa-{{ variables.environment_suffix }}
+      serviceAccount:
+        displayName: "Storage Transfer Service Account"
+        description: "Service account for cross-cloud data migration operations"
+        disabled: false
+    metadata:
+      dependsOn: []
+
+  # Grant Storage Transfer Admin role to service account
+  - name: storage-transfer-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:cloudresourcemanager.projects.setIamPolicy
+    properties:
+      resource: {{ variables.project_id }}
+      policy:
+        bindings:
+          - role: roles/storagetransfer.admin
+            members:
+              - serviceAccount:storage-transfer-sa-{{ variables.environment_suffix }}@{{ variables.project_id }}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - storage-transfer-service-account
+
+  # Grant Storage Admin role to service account
+  - name: storage-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:cloudresourcemanager.projects.setIamPolicy
+    properties:
+      resource: {{ variables.project_id }}
+      policy:
+        bindings:
+          - role: roles/storage.admin
+            members:
+              - serviceAccount:storage-transfer-sa-{{ variables.environment_suffix }}@{{ variables.project_id }}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - storage-transfer-service-account
+
+  # Create Cloud Composer environment for workflow orchestration
+  - name: composer-environment
+    type: gcp-types/composer-v1:composer.projects.locations.environments
+    properties:
+      parent: projects/{{ variables.project_id }}/locations/{{ variables.region }}
+      environmentId: {{ variables.composer_env_name }}-{{ variables.environment_suffix }}
+      environment:
+        name: {{ variables.composer_env_name }}-{{ variables.environment_suffix }}
+        config:
+          nodeCount: {{ variables.composer_node_count }}
+          nodeConfig:
+            location: {{ variables.zone }}
+            machineType: {{ variables.composer_machine_type }}
+            diskSizeGb: {{ variables.composer_disk_size }}
+            oauthScopes:
+              - https://www.googleapis.com/auth/cloud-platform
+            serviceAccount: storage-transfer-sa-{{ variables.environment_suffix }}@{{ variables.project_id }}.iam.gserviceaccount.com
+            tags:
+              - composer-environment
+              - data-migration
+          softwareConfig:
+            pythonVersion: "3"
+            airflowConfigOverrides:
+              # Configure Airflow for data migration workflows
+              core-max_active_runs_per_dag: "1"
+              core-max_active_tasks_per_dag: "10"
+              core-default_task_retries: "2"
+              webserver-expose_config: "True"
+              scheduler-catchup_by_default: "False"
+            envVariables:
+              # Environment variables for migration workflows
+              STAGING_BUCKET: {{ variables.staging_bucket_name }}
+              TARGET_BUCKET: {{ variables.target_bucket_name }}
+              PROJECT_ID: {{ variables.project_id }}
+              REGION: {{ variables.region }}
+              TRANSFER_SA_EMAIL: storage-transfer-sa-{{ variables.environment_suffix }}@{{ variables.project_id }}.iam.gserviceaccount.com
+          # Private IP configuration for enhanced security
+          privateEnvironmentConfig:
+            enablePrivateIpEnvironment: true
+            enablePrivatelyUsedPublicIps: true
+          # Web server access control
+          webServerAccessControl:
+            allowedIpRanges:
+              - value: "0.0.0.0/0"
+                description: "Allow access from all IPs (configure as needed)"
+        labels:
+          environment: migration
+          purpose: orchestration
+          managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable-composer-api
+        - storage-transfer-service-account
+        - storage-transfer-admin-binding
+        - storage-admin-binding
+
+  # Create log sink for Storage Transfer Service monitoring
+  - name: storage-transfer-log-sink
+    type: gcp-types/logging-v2:logging.projects.sinks
+    properties:
+      parent: projects/{{ variables.project_id }}
+      sinkId: storage-transfer-sink-{{ variables.environment_suffix }}
+      sink:
+        name: storage-transfer-sink-{{ variables.environment_suffix }}
+        description: "Log sink for Storage Transfer Service operations"
+        destination: storage.googleapis.com/{{ variables.target_bucket_name }}/logs
+        filter: 'resource.type="storage_transfer_job"'
+        includeChildren: true
+    metadata:
+      dependsOn:
+        - enable-logging-api
+        - target-bucket
+
+  # Create log sink for Cloud Composer monitoring
+  - name: composer-log-sink
+    type: gcp-types/logging-v2:logging.projects.sinks
+    properties:
+      parent: projects/{{ variables.project_id }}
+      sinkId: composer-migration-sink-{{ variables.environment_suffix }}
+      sink:
+        name: composer-migration-sink-{{ variables.environment_suffix }}
+        description: "Log sink for Cloud Composer migration workflows"
+        destination: storage.googleapis.com/{{ variables.target_bucket_name }}/composer-logs
+        filter: 'resource.type="gce_instance" AND resource.labels.instance_name:composer'
+        includeChildren: true
+    metadata:
+      dependsOn:
+        - enable-logging-api
+        - target-bucket
+
+  # Grant log sink permissions to write to storage buckets
+  - name: log-sink-storage-permissions
+    type: gcp-types/storage-v1:storage.buckets.iam
+    properties:
+      bucket: {{ variables.target_bucket_name }}
+      bindings:
+        - role: roles/storage.objectCreator
+          members:
+            - $(ref.storage-transfer-log-sink.writerIdentity)
+            - $(ref.composer-log-sink.writerIdentity)
+    metadata:
+      dependsOn:
+        - storage-transfer-log-sink
+        - composer-log-sink
+        - target-bucket
+
+  # Create monitoring notification channel for alerts
+  - name: email-notification-channel
+    type: gcp-types/monitoring-v1:monitoring.projects.notificationChannels
+    properties:
+      parent: projects/{{ variables.project_id }}
+      notificationChannel:
+        type: email
+        displayName: "Data Migration Alerts"
+        description: "Email notifications for data migration pipeline alerts"
+        labels:
+          email_address: "admin@example.com"  # Replace with actual email
+        enabled: true
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+
+  # Create alert policy for transfer job failures
+  - name: transfer-failure-alert-policy
+    type: gcp-types/monitoring-v1:monitoring.projects.alertPolicies
+    properties:
+      parent: projects/{{ variables.project_id }}
+      alertPolicy:
+        displayName: "Storage Transfer Job Failures"
+        documentation:
+          content: "Alert triggered when Storage Transfer Service jobs fail"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "Transfer job failure rate"
+            conditionThreshold:
+              filter: 'resource.type="storage_transfer_job" AND severity="ERROR"'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 0.0
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+                  groupByFields:
+                    - resource.label.job_name
+        enabled: true
+        alertStrategy:
+          autoClose: 86400s
+        notificationChannels:
+          - $(ref.email-notification-channel.name)
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+        - email-notification-channel
+
+  # Create alert policy for Composer environment health
+  - name: composer-health-alert-policy
+    type: gcp-types/monitoring-v1:monitoring.projects.alertPolicies
+    properties:
+      parent: projects/{{ variables.project_id }}
+      alertPolicy:
+        displayName: "Composer Environment Health"
+        documentation:
+          content: "Alert triggered when Composer environment becomes unhealthy"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "Composer environment down"
+            conditionThreshold:
+              filter: 'resource.type="composer_environment" AND metric.type="composer.googleapis.com/environment/health"'
+              comparison: COMPARISON_LESS_THAN
+              thresholdValue: 1.0
+              duration: 600s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_MEAN
+                  crossSeriesReducer: REDUCE_MEAN
+        enabled: true
+        alertStrategy:
+          autoClose: 86400s
+        notificationChannels:
+          - $(ref.email-notification-channel.name)
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+        - email-notification-channel
+
+# Outputs for reference and integration
+outputs:
+  # Project and region information
+  project_id:
+    description: "Google Cloud Project ID"
+    value: {{ variables.project_id }}
+  
+  region:
+    description: "Primary region for resources"
+    value: {{ variables.region }}
+  
+  # Storage bucket information
+  staging_bucket_name:
+    description: "Name of the staging bucket"
+    value: $(ref.staging-bucket.name)
+  
+  staging_bucket_url:
+    description: "URL of the staging bucket"
+    value: gs://$(ref.staging-bucket.name)
+  
+  target_bucket_name:
+    description: "Name of the target bucket"
+    value: $(ref.target-bucket.name)
+  
+  target_bucket_url:
+    description: "URL of the target bucket"
+    value: gs://$(ref.target-bucket.name)
+  
+  # Service account information
+  transfer_service_account_email:
+    description: "Email of the Storage Transfer Service account"
+    value: $(ref.storage-transfer-service-account.email)
+  
+  # Composer environment information
+  composer_environment_name:
+    description: "Name of the Cloud Composer environment"
+    value: $(ref.composer-environment.name)
+  
+  composer_airflow_uri:
+    description: "URI for accessing Airflow web interface"
+    value: $(ref.composer-environment.config.airflowUri)
+  
+  composer_gcs_bucket:
+    description: "GCS bucket used by Composer environment"
+    value: $(ref.composer-environment.config.dagGcsPrefix)
+  
+  # Log sink information
+  storage_transfer_log_sink_name:
+    description: "Name of the Storage Transfer log sink"
+    value: $(ref.storage-transfer-log-sink.name)
+  
+  composer_log_sink_name:
+    description: "Name of the Composer log sink"
+    value: $(ref.composer-log-sink.name)
+  
+  # Monitoring information
+  transfer_failure_alert_policy_name:
+    description: "Name of the transfer failure alert policy"
+    value: $(ref.transfer-failure-alert-policy.name)
+  
+  composer_health_alert_policy_name:
+    description: "Name of the Composer health alert policy"
+    value: $(ref.composer-health-alert-policy.name)
+  
+  # Getting started information
+  next_steps:
+    description: "Next steps for using the deployed infrastructure"
+    value: |
+      1. Access Airflow UI at: $(ref.composer-environment.config.airflowUri)
+      2. Upload migration DAGs to: $(ref.composer-environment.config.dagGcsPrefix)/dags/
+      3. Configure source credentials for Storage Transfer Service
+      4. Update email notification channel with your email address
+      5. Test migration workflows with small datasets first
+      6. Monitor logs at: https://console.cloud.google.com/logs/query
+
+# Metadata for the deployment
+metadata:
+  version: "1.0"
+  description: "Cross-cloud data migration infrastructure with Storage Transfer Service and Cloud Composer"
+  author: "Infrastructure Manager Generator"
+  created: "2025-01-27"
+  tags:
+    - data-migration
+    - cross-cloud
+    - composer
+    - storage-transfer
+    - orchestration
+    - automation

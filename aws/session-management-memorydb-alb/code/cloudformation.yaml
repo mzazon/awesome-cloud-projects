@@ -1,0 +1,999 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Distributed Session Management with MemoryDB - A scalable, stateless web application architecture with centralized session storage'
+
+# Template Metadata
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: 'Network Configuration'
+        Parameters:
+          - VpcCidr
+          - PublicSubnet1Cidr
+          - PublicSubnet2Cidr
+          - PrivateSubnet1Cidr
+          - PrivateSubnet2Cidr
+      - Label:
+          default: 'MemoryDB Configuration'
+        Parameters:
+          - MemoryDBNodeType
+          - MemoryDBNumShards
+          - MemoryDBNumReplicasPerShard
+          - SessionTimeoutSeconds
+      - Label:
+          default: 'ECS Configuration'
+        Parameters:
+          - ECSTaskCpu
+          - ECSTaskMemory
+          - ECSDesiredCount
+          - ECSMaxCapacity
+          - ECSMinCapacity
+      - Label:
+          default: 'Application Configuration'
+        Parameters:
+          - ContainerImage
+          - ContainerPort
+          - HealthCheckPath
+      - Label:
+          default: 'Monitoring Configuration'
+        Parameters:
+          - LogRetentionDays
+    ParameterLabels:
+      VpcCidr:
+        default: 'VPC CIDR Block'
+      MemoryDBNodeType:
+        default: 'MemoryDB Node Instance Type'
+      ECSDesiredCount:
+        default: 'Initial Number of ECS Tasks'
+
+# Template Parameters
+Parameters:
+  # Network Configuration
+  VpcCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: 'CIDR block for the VPC'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$'
+    ConstraintDescription: 'Must be a valid CIDR block with /16-/28 subnet mask'
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: '10.0.1.0/24'
+    Description: 'CIDR block for public subnet in first AZ'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$'
+
+  PublicSubnet2Cidr:
+    Type: String
+    Default: '10.0.2.0/24'
+    Description: 'CIDR block for public subnet in second AZ'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$'
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: '10.0.3.0/24'
+    Description: 'CIDR block for private subnet in first AZ'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$'
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: '10.0.4.0/24'
+    Description: 'CIDR block for private subnet in second AZ'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$'
+
+  # MemoryDB Configuration
+  MemoryDBNodeType:
+    Type: String
+    Default: 'db.r6g.large'
+    Description: 'MemoryDB node instance type'
+    AllowedValues:
+      - 'db.r6g.xlarge'
+      - 'db.r6g.large'
+      - 'db.r6g.2xlarge'
+      - 'db.r6g.4xlarge'
+      - 'db.r6g.8xlarge'
+      - 'db.r6g.12xlarge'
+      - 'db.r6g.16xlarge'
+      - 'db.r7g.xlarge'
+      - 'db.r7g.large'
+      - 'db.r7g.2xlarge'
+      - 'db.r7g.4xlarge'
+
+  MemoryDBNumShards:
+    Type: Number
+    Default: 2
+    Description: 'Number of shards for MemoryDB cluster'
+    MinValue: 1
+    MaxValue: 500
+
+  MemoryDBNumReplicasPerShard:
+    Type: Number
+    Default: 1
+    Description: 'Number of replicas per shard for high availability'
+    MinValue: 0
+    MaxValue: 5
+
+  SessionTimeoutSeconds:
+    Type: Number
+    Default: 1800
+    Description: 'Session timeout in seconds (30 minutes default)'
+    MinValue: 300
+    MaxValue: 86400
+
+  # ECS Configuration
+  ECSTaskCpu:
+    Type: Number
+    Default: 256
+    Description: 'CPU units for ECS task (1024 = 1 vCPU)'
+    AllowedValues: [256, 512, 1024, 2048, 4096]
+
+  ECSTaskMemory:
+    Type: Number
+    Default: 512
+    Description: 'Memory in MB for ECS task'
+    AllowedValues: [512, 1024, 2048, 4096, 8192, 16384, 30720]
+
+  ECSDesiredCount:
+    Type: Number
+    Default: 2
+    Description: 'Desired number of ECS tasks'
+    MinValue: 1
+    MaxValue: 100
+
+  ECSMinCapacity:
+    Type: Number
+    Default: 2
+    Description: 'Minimum number of ECS tasks for auto scaling'
+    MinValue: 1
+    MaxValue: 100
+
+  ECSMaxCapacity:
+    Type: Number
+    Default: 10
+    Description: 'Maximum number of ECS tasks for auto scaling'
+    MinValue: 1
+    MaxValue: 1000
+
+  # Application Configuration
+  ContainerImage:
+    Type: String
+    Default: 'nginx:latest'
+    Description: 'Container image for the web application'
+
+  ContainerPort:
+    Type: Number
+    Default: 80
+    Description: 'Port on which the container listens'
+    MinValue: 1
+    MaxValue: 65535
+
+  HealthCheckPath:
+    Type: String
+    Default: '/'
+    Description: 'Health check path for ALB target group'
+
+  # Monitoring Configuration
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    Description: 'CloudWatch Logs retention period in days'
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+# Conditions for optional features
+Conditions:
+  # Condition to check if we should create NAT Gateway for private subnets (based on container needing internet access)
+  CreateNATGateway: !Not [!Equals [!Ref ContainerImage, 'local']]
+
+# Resources
+Resources:
+  # ============================================
+  # VPC and Networking Infrastructure
+  # ============================================
+  
+  # VPC for hosting all resources with DNS support enabled
+  SessionVPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+        - Key: Purpose
+          Value: 'Distributed Session Management'
+
+  # Internet Gateway for public internet access
+  InternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-igw'
+
+  # Attach Internet Gateway to VPC
+  InternetGatewayAttachment:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref SessionVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public Subnet 1 for ALB in first AZ
+  PublicSubnet1:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref SessionVPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet1Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-subnet-1'
+        - Key: Type
+          Value: 'Public'
+
+  # Public Subnet 2 for ALB in second AZ
+  PublicSubnet2:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref SessionVPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet2Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-subnet-2'
+        - Key: Type
+          Value: 'Public'
+
+  # Private Subnet 1 for ECS tasks and MemoryDB in first AZ
+  PrivateSubnet1:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref SessionVPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-subnet-1'
+        - Key: Type
+          Value: 'Private'
+
+  # Private Subnet 2 for ECS tasks and MemoryDB in second AZ
+  PrivateSubnet2:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref SessionVPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-subnet-2'
+        - Key: Type
+          Value: 'Private'
+
+  # Elastic IP for NAT Gateway
+  NATGatewayEIP:
+    Type: 'AWS::EC2::EIP'
+    Condition: CreateNATGateway
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-eip'
+
+  # NAT Gateway for private subnet internet access
+  NATGateway:
+    Type: 'AWS::EC2::NatGateway'
+    Condition: CreateNATGateway
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-gateway'
+
+  # Route table for public subnets
+  PublicRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref SessionVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-rt'
+
+  # Default route for public subnets to Internet Gateway
+  DefaultPublicRoute:
+    Type: 'AWS::EC2::Route'
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  # Associate public subnet 1 with public route table
+  PublicSubnet1RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  # Associate public subnet 2 with public route table
+  PublicSubnet2RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # Route table for private subnets
+  PrivateRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref SessionVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-rt'
+
+  # Default route for private subnets to NAT Gateway (conditional)
+  DefaultPrivateRoute:
+    Type: 'AWS::EC2::Route'
+    Condition: CreateNATGateway
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref NATGateway
+
+  # Associate private subnet 1 with private route table
+  PrivateSubnet1RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  # Associate private subnet 2 with private route table
+  PrivateSubnet2RouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ============================================
+  # Security Groups
+  # ============================================
+
+  # Security group for Application Load Balancer
+  ALBSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-alb-sg'
+      GroupDescription: 'Security group for Application Load Balancer'
+      VpcId: !Ref SessionVPC
+      SecurityGroupIngress:
+        # Allow HTTP traffic from internet
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: '0.0.0.0/0'
+          Description: 'Allow HTTP traffic from internet'
+        # Allow HTTPS traffic from internet
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+          Description: 'Allow HTTPS traffic from internet'
+      SecurityGroupEgress:
+        # Allow all outbound traffic
+        - IpProtocol: -1
+          CidrIp: '0.0.0.0/0'
+          Description: 'Allow all outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alb-sg'
+
+  # Security group for ECS tasks
+  ECSSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-ecs-sg'
+      GroupDescription: 'Security group for ECS tasks'
+      VpcId: !Ref SessionVPC
+      SecurityGroupIngress:
+        # Allow traffic from ALB on container port
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: 'Allow traffic from ALB'
+      SecurityGroupEgress:
+        # Allow all outbound traffic for pulling images and Parameter Store access
+        - IpProtocol: -1
+          CidrIp: '0.0.0.0/0'
+          Description: 'Allow all outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ecs-sg'
+
+  # Security group for MemoryDB cluster
+  MemoryDBSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-memorydb-sg'
+      GroupDescription: 'Security group for MemoryDB cluster'
+      VpcId: !Ref SessionVPC
+      SecurityGroupIngress:
+        # Allow Redis traffic from ECS tasks
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref ECSSecurityGroup
+          Description: 'Allow Redis traffic from ECS tasks'
+      SecurityGroupEgress:
+        # No outbound rules needed for MemoryDB
+        []
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-memorydb-sg'
+
+  # ============================================
+  # MemoryDB for Redis Session Storage
+  # ============================================
+
+  # MemoryDB subnet group for Multi-AZ deployment
+  MemoryDBSubnetGroup:
+    Type: 'AWS::MemoryDB::SubnetGroup'
+    Properties:
+      SubnetGroupName: !Sub '${AWS::StackName}-memorydb-subnet-group'
+      Description: 'Subnet group for MemoryDB cluster'
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-memorydb-subnet-group'
+
+  # MemoryDB cluster for session storage with high availability
+  MemoryDBCluster:
+    Type: 'AWS::MemoryDB::Cluster'
+    Properties:
+      ClusterName: !Sub '${AWS::StackName}-session-cluster'
+      Description: 'MemoryDB cluster for distributed session management'
+      NodeType: !Ref MemoryDBNodeType
+      NumShards: !Ref MemoryDBNumShards
+      NumReplicasPerShard: !Ref MemoryDBNumReplicasPerShard
+      SubnetGroupName: !Ref MemoryDBSubnetGroup
+      SecurityGroupIds:
+        - !Ref MemoryDBSecurityGroup
+      # Use default parameter group for Redis 7.0
+      ParameterGroupName: 'default.memorydb-redis7'
+      # Enable Multi-AZ for high availability
+      DataTiering: 'false'
+      # Maintenance window during low-traffic hours
+      MaintenanceWindow: 'sun:03:00-sun:05:00'
+      # Backup configuration
+      SnapshotRetentionLimit: 7
+      SnapshotWindow: '02:00-03:00'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-session-cluster'
+        - Key: Purpose
+          Value: 'Session Storage'
+
+  # ============================================
+  # Systems Manager Parameter Store Configuration
+  # ============================================
+
+  # Store MemoryDB endpoint in Parameter Store
+  MemoryDBEndpointParameter:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: !Sub '/session-app/${AWS::StackName}/memorydb/endpoint'
+      Type: 'String'
+      Value: !GetAtt MemoryDBCluster.ClusterEndpoint.Address
+      Description: 'MemoryDB cluster endpoint for session storage'
+      Tags:
+        Environment: !Ref AWS::StackName
+
+  # Store MemoryDB port in Parameter Store
+  MemoryDBPortParameter:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: !Sub '/session-app/${AWS::StackName}/memorydb/port'
+      Type: 'String'
+      Value: '6379'
+      Description: 'MemoryDB port for Redis connections'
+      Tags:
+        Environment: !Ref AWS::StackName
+
+  # Store session timeout configuration
+  SessionTimeoutParameter:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: !Sub '/session-app/${AWS::StackName}/config/session-timeout'
+      Type: 'String'
+      Value: !Ref SessionTimeoutSeconds
+      Description: 'Session timeout in seconds'
+      Tags:
+        Environment: !Ref AWS::StackName
+
+  # Store Redis database number
+  RedisDBParameter:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: !Sub '/session-app/${AWS::StackName}/config/redis-db'
+      Type: 'String'
+      Value: '0'
+      Description: 'Redis database number for session storage'
+      Tags:
+        Environment: !Ref AWS::StackName
+
+  # ============================================
+  # Application Load Balancer Configuration
+  # ============================================
+
+  # Application Load Balancer for traffic distribution
+  ApplicationLoadBalancer:
+    Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+    Properties:
+      Name: !Sub '${AWS::StackName}-alb'
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alb'
+
+  # Target group for ECS tasks with health checks
+  ALBTargetGroup:
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    Properties:
+      Name: !Sub '${AWS::StackName}-tg'
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      VpcId: !Ref SessionVPC
+      TargetType: ip
+      # Health check configuration optimized for session management
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      # Stickiness disabled for stateless session management
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: 'false'
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+        - Key: load_balancing.algorithm.type
+          Value: 'round_robin'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-tg'
+
+  # ALB Listener for HTTP traffic
+  ALBListener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # ============================================
+  # ECS Cluster and Service Configuration
+  # ============================================
+
+  # CloudWatch Log Group for ECS task logs
+  ECSLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/ecs/${AWS::StackName}/session-app'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ECS Cluster for running containerized applications
+  ECSCluster:
+    Type: 'AWS::ECS::Cluster'
+    Properties:
+      ClusterName: !Sub '${AWS::StackName}-cluster'
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+          Base: 0
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-cluster'
+
+  # IAM Role for ECS Task Execution
+  ECSTaskExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ecs-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+      Policies:
+        # Allow access to Parameter Store for configuration
+        - PolicyName: ParameterStoreAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ssm:GetParameter'
+                  - 'ssm:GetParameters'
+                  - 'ssm:GetParametersByPath'
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/session-app/${AWS::StackName}/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ecs-execution-role'
+
+  # IAM Role for ECS Tasks (application runtime)
+  ECSTaskRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ecs-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        # Allow access to Parameter Store for runtime configuration
+        - PolicyName: ParameterStoreAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ssm:GetParameter'
+                  - 'ssm:GetParameters'
+                  - 'ssm:GetParametersByPath'
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/session-app/${AWS::StackName}/*'
+        # Allow CloudWatch metrics for monitoring
+        - PolicyName: CloudWatchMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ecs-task-role'
+
+  # ECS Task Definition for session-aware web application
+  ECSTaskDefinition:
+    Type: 'AWS::ECS::TaskDefinition'
+    Properties:
+      Family: !Sub '${AWS::StackName}-session-app'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref ECSTaskCpu
+      Memory: !Ref ECSTaskMemory
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: session-app
+          Image: !Ref ContainerImage
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          Environment:
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: PARAMETER_PREFIX
+              Value: !Sub '/session-app/${AWS::StackName}'
+            - Name: REDIS_ENDPOINT
+              Value: !GetAtt MemoryDBCluster.ClusterEndpoint.Address
+            - Name: REDIS_PORT
+              Value: '6379'
+            - Name: SESSION_TIMEOUT
+              Value: !Ref SessionTimeoutSeconds
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          # Health check configuration
+          HealthCheck:
+            Command:
+              - 'CMD-SHELL'
+              - !Sub 'curl -f http://localhost:${ContainerPort}${HealthCheckPath} || exit 1'
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-task-definition'
+
+  # ECS Service with ALB integration and auto scaling
+  ECSService:
+    Type: 'AWS::ECS::Service'
+    DependsOn: ALBListener
+    Properties:
+      ServiceName: !Sub '${AWS::StackName}-service'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ECSTaskDefinition
+      DesiredCount: !Ref ECSDesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+      LoadBalancers:
+        - ContainerName: session-app
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref ALBTargetGroup
+      # Health check grace period for initial startup
+      HealthCheckGracePeriodSeconds: 300
+      # Service deployment configuration for zero-downtime deployments
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      # Enable service discovery for inter-service communication
+      EnableExecuteCommand: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-service'
+
+  # ============================================
+  # Auto Scaling Configuration
+  # ============================================
+
+  # Auto Scaling Target for ECS Service
+  ECSAutoScalingTarget:
+    Type: 'AWS::ApplicationAutoScaling::ScalableTarget'
+    Properties:
+      ServiceNamespace: ecs
+      ResourceId: !Sub 'service/${ECSCluster}/${ECSService.Name}'
+      ScalableDimension: 'ecs:service:DesiredCount'
+      MinCapacity: !Ref ECSMinCapacity
+      MaxCapacity: !Ref ECSMaxCapacity
+      RoleARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService'
+
+  # Auto Scaling Policy based on CPU Utilization
+  ECSAutoScalingPolicy:
+    Type: 'AWS::ApplicationAutoScaling::ScalingPolicy'
+    Properties:
+      ServiceNamespace: ecs
+      ResourceId: !Sub 'service/${ECSCluster}/${ECSService.Name}'
+      ScalableDimension: 'ecs:service:DesiredCount'
+      PolicyName: !Sub '${AWS::StackName}-cpu-scaling-policy'
+      PolicyType: TargetTrackingScaling
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 70.0
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleOutCooldown: 300
+        ScaleInCooldown: 300
+
+  # ============================================
+  # CloudWatch Alarms and Monitoring
+  # ============================================
+
+  # CloudWatch Alarm for high CPU utilization
+  HighCPUAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-high-cpu'
+      AlarmDescription: 'Alert when ECS service CPU exceeds 80%'
+      MetricName: CPUUtilization
+      Namespace: 'AWS/ECS'
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ServiceName
+          Value: !Sub '${AWS::StackName}-service'
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+
+  # CloudWatch Alarm for MemoryDB connection count
+  MemoryDBConnectionAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-memorydb-connections'
+      AlarmDescription: 'Alert when MemoryDB connection count is high'
+      MetricName: CurrConnections
+      Namespace: 'AWS/MemoryDB'
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref MemoryDBCluster
+
+  # CloudWatch Alarm for ALB target health
+  ALBTargetHealthAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-alb-unhealthy-targets'
+      AlarmDescription: 'Alert when ALB has unhealthy targets'
+      MetricName: UnHealthyHostCount
+      Namespace: 'AWS/ApplicationELB'
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt ALBTargetGroup.TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+
+# Template Outputs for integration and verification
+Outputs:
+  # Network Infrastructure Outputs
+  VPCId:
+    Description: 'VPC ID for the session management infrastructure'
+    Value: !Ref SessionVPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCId'
+
+  PublicSubnets:
+    Description: 'Public subnet IDs for ALB deployment'
+    Value: !Sub '${PublicSubnet1},${PublicSubnet2}'
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnets'
+
+  PrivateSubnets:
+    Description: 'Private subnet IDs for ECS and MemoryDB deployment'
+    Value: !Sub '${PrivateSubnet1},${PrivateSubnet2}'
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnets'
+
+  # Application Load Balancer Outputs
+  LoadBalancerDNSName:
+    Description: 'DNS name of the Application Load Balancer'
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-LoadBalancerDNSName'
+
+  LoadBalancerURL:
+    Description: 'URL of the Application Load Balancer'
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+
+  LoadBalancerArn:
+    Description: 'ARN of the Application Load Balancer'
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: !Sub '${AWS::StackName}-LoadBalancerArn'
+
+  # MemoryDB Outputs
+  MemoryDBClusterEndpoint:
+    Description: 'MemoryDB cluster endpoint for session storage'
+    Value: !GetAtt MemoryDBCluster.ClusterEndpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-MemoryDBEndpoint'
+
+  MemoryDBClusterPort:
+    Description: 'MemoryDB cluster port'
+    Value: !GetAtt MemoryDBCluster.ClusterEndpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-MemoryDBPort'
+
+  MemoryDBClusterArn:
+    Description: 'MemoryDB cluster ARN'
+    Value: !GetAtt MemoryDBCluster.ARN
+    Export:
+      Name: !Sub '${AWS::StackName}-MemoryDBArn'
+
+  # ECS Outputs
+  ECSClusterName:
+    Description: 'Name of the ECS cluster'
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSClusterName'
+
+  ECSServiceName:
+    Description: 'Name of the ECS service'
+    Value: !Sub '${AWS::StackName}-service'
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSServiceName'
+
+  ECSTaskDefinitionArn:
+    Description: 'ARN of the ECS task definition'
+    Value: !Ref ECSTaskDefinition
+    Export:
+      Name: !Sub '${AWS::StackName}-TaskDefinitionArn'
+
+  # Parameter Store Outputs
+  ParameterStorePrefix:
+    Description: 'Parameter Store prefix for configuration values'
+    Value: !Sub '/session-app/${AWS::StackName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ParameterStorePrefix'
+
+  # Security Groups
+  ALBSecurityGroupId:
+    Description: 'Security Group ID for Application Load Balancer'
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ALBSecurityGroupId'
+
+  ECSSecurityGroupId:
+    Description: 'Security Group ID for ECS tasks'
+    Value: !Ref ECSSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSSecurityGroupId'
+
+  MemoryDBSecurityGroupId:
+    Description: 'Security Group ID for MemoryDB cluster'
+    Value: !Ref MemoryDBSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-MemoryDBSecurityGroupId'
+
+  # Monitoring and Logging
+  CloudWatchLogGroup:
+    Description: 'CloudWatch Log Group for ECS tasks'
+    Value: !Ref ECSLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  # Configuration Information
+  SessionTimeout:
+    Description: 'Configured session timeout in seconds'
+    Value: !Ref SessionTimeoutSeconds
+
+  AutoScalingConfiguration:
+    Description: 'Auto scaling configuration summary'
+    Value: !Sub 'Min: ${ECSMinCapacity}, Desired: ${ECSDesiredCount}, Max: ${ECSMaxCapacity}'
+
+  # Cost Optimization Information
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost breakdown (USD)'
+    Value: !Sub 
+      - 'MemoryDB (${NodeType}, ${Shards} shards): ~$${MemoryDBCost}, ALB: ~$22, ECS Fargate (${Tasks} tasks): ~$${ECSCost}, Total: ~$${TotalCost}'
+      - NodeType: !Ref MemoryDBNodeType
+        Shards: !Ref MemoryDBNumShards
+        Tasks: !Ref ECSDesiredCount
+        MemoryDBCost: !If
+          - !Equals [!Ref MemoryDBNodeType, 'db.r6g.large']
+          - '120'
+          - '240'
+        ECSCost: !If
+          - !Equals [!Ref ECSDesiredCount, 2]
+          - '25'
+          - '50'
+        TotalCost: !If
+          - !Equals [!Ref ECSDesiredCount, 2]
+          - '167'
+          - '312'

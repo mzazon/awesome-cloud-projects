@@ -1,0 +1,721 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Auto Scaling Groups with Mixed Instance Types and Spot Instances
+  This template creates a comprehensive auto scaling solution that combines On-Demand and Spot Instances
+  across multiple instance families for cost optimization while maintaining high availability.
+  Generated from recipe: Mixed Instance Auto Scaling Groups
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - SubnetIds
+      - Label:
+          default: "Auto Scaling Configuration"
+        Parameters:
+          - MinSize
+          - MaxSize
+          - DesiredCapacity
+          - OnDemandBaseCapacity
+          - OnDemandPercentageAboveBase
+      - Label:
+          default: "Instance Configuration"
+        Parameters:
+          - KeyPairName
+          - InstanceAmiId
+          - EnableDetailedMonitoring
+      - Label:
+          default: "Load Balancer Configuration"
+        Parameters:
+          - CreateLoadBalancer
+          - LoadBalancerScheme
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+          - EnableNotifications
+
+Parameters:
+  # Network Configuration
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where the Auto Scaling group will be deployed
+    ConstraintDescription: Must be a valid VPC ID
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of subnet IDs across multiple Availability Zones for high availability
+    ConstraintDescription: Must specify at least 2 subnets in different AZs
+
+  # Auto Scaling Configuration
+  MinSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 20
+    Description: Minimum number of instances in the Auto Scaling group
+    ConstraintDescription: Must be between 1 and 20
+
+  MaxSize:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+    Description: Maximum number of instances in the Auto Scaling group
+    ConstraintDescription: Must be between 1 and 100
+
+  DesiredCapacity:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    MaxValue: 50
+    Description: Desired number of instances in the Auto Scaling group
+    ConstraintDescription: Must be between MinSize and MaxSize
+
+  OnDemandBaseCapacity:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 10
+    Description: Minimum number of On-Demand instances (provides baseline capacity)
+    ConstraintDescription: Must be between 0 and 10
+
+  OnDemandPercentageAboveBase:
+    Type: Number
+    Default: 20
+    MinValue: 0
+    MaxValue: 100
+    Description: Percentage of On-Demand instances above base capacity (0-100)
+    ConstraintDescription: Must be between 0 and 100
+
+  # Instance Configuration
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access to instances
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair
+
+  InstanceAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: AMI ID for Auto Scaling group instances (defaults to latest Amazon Linux 2)
+
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable detailed CloudWatch monitoring for instances
+
+  # Load Balancer Configuration
+  CreateLoadBalancer:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Create an Application Load Balancer for the Auto Scaling group
+
+  LoadBalancerScheme:
+    Type: String
+    Default: internet-facing
+    AllowedValues: [internet-facing, internal]
+    Description: Load balancer scheme (internet-facing or internal)
+
+  # Notification Configuration
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: Email address for Auto Scaling notifications (optional)
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address or empty
+
+  EnableNotifications:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable SNS notifications for scaling events
+
+Conditions:
+  ShouldCreateLoadBalancer: !Equals [!Ref CreateLoadBalancer, 'true']
+  ShouldEnableNotifications: !Equals [!Ref EnableNotifications, 'true']
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  ShouldCreateSNSSubscription: !And 
+    - !Condition ShouldEnableNotifications
+    - !Condition HasNotificationEmail
+
+Resources:
+  # IAM Role for EC2 instances
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-EC2InstanceRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-EC2InstanceRole'
+        - Key: Purpose
+          Value: Mixed Instance Auto Scaling Group
+
+  # Instance Profile for EC2 instances
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-EC2InstanceProfile'
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # Security Group for Auto Scaling Group instances
+  AutoScalingSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-AutoScalingSecurityGroup'
+      GroupDescription: Security group for mixed instance Auto Scaling group
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP access from anywhere
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS access from anywhere
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH access for debugging
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-AutoScalingSecurityGroup'
+        - Key: Purpose
+          Value: Mixed Instance Auto Scaling Group
+
+  # Security Group for Load Balancer
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: ShouldCreateLoadBalancer
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-LoadBalancerSecurityGroup'
+      GroupDescription: Security group for Application Load Balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP access for load balancer
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS access for load balancer
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          DestinationSecurityGroupId: !Ref AutoScalingSecurityGroup
+          Description: Forward to Auto Scaling instances
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-LoadBalancerSecurityGroup'
+        - Key: Purpose
+          Value: Application Load Balancer
+
+  # Launch Template for Auto Scaling Group
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-LaunchTemplate'
+      LaunchTemplateData:
+        ImageId: !Ref InstanceAmiId
+        InstanceType: m5.large
+        KeyName: !Ref KeyPairName
+        SecurityGroupIds:
+          - !Ref AutoScalingSecurityGroup
+        IamInstanceProfile:
+          Name: !Ref EC2InstanceProfile
+        Monitoring:
+          Enabled: !Ref EnableDetailedMonitoring
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+          HttpEndpoint: enabled
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd
+            
+            # Get instance metadata for display
+            INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+            INSTANCE_TYPE=$(curl -s http://169.254.169.254/latest/meta-data/instance-type)
+            AZ=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            SPOT_TERMINATION=$(curl -s http://169.254.169.254/latest/meta-data/spot/instance-action 2>/dev/null || echo "On-Demand")
+            
+            # Create informative web page
+            cat > /var/www/html/index.html << HTML
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Mixed Instance Auto Scaling Demo</title>
+                <style>
+                    body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+                    .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+                    .info { background: #e8f4fd; padding: 20px; border-radius: 5px; margin: 20px 0; border-left: 4px solid #2196F3; }
+                    .spot { color: #4CAF50; font-weight: bold; }
+                    .ondemand { color: #2196F3; font-weight: bold; }
+                    .header { color: #333; border-bottom: 2px solid #2196F3; padding-bottom: 10px; }
+                    .stack-info { background: #fff3cd; padding: 15px; border-radius: 5px; margin: 20px 0; border-left: 4px solid #ffc107; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1 class="header">Mixed Instance Auto Scaling Demo</h1>
+                    
+                    <div class="stack-info">
+                        <h3>CloudFormation Stack Information</h3>
+                        <p><strong>Stack Name:</strong> ${AWS::StackName}</p>
+                        <p><strong>Region:</strong> ${AWS::Region}</p>
+                        <p><strong>Deployment Time:</strong> $(date)</p>
+                    </div>
+                    
+                    <div class="info">
+                        <h2>Instance Information</h2>
+                        <p><strong>Instance ID:</strong> $INSTANCE_ID</p>
+                        <p><strong>Instance Type:</strong> $INSTANCE_TYPE</p>
+                        <p><strong>Availability Zone:</strong> $AZ</p>
+                        <p><strong>Purchase Type:</strong> 
+                            <span class="$([ "$SPOT_TERMINATION" = "On-Demand" ] && echo "ondemand" || echo "spot")">
+                                $([ "$SPOT_TERMINATION" = "On-Demand" ] && echo "On-Demand" || echo "Spot Instance")
+                            </span>
+                        </p>
+                    </div>
+                    
+                    <h2>Auto Scaling Group Benefits</h2>
+                    <ul>
+                        <li><strong>Cost Optimization:</strong> Up to 90% savings with Spot Instances</li>
+                        <li><strong>High Availability:</strong> Multi-AZ deployment with capacity rebalancing</li>
+                        <li><strong>Automatic Scaling:</strong> Responds to demand changes automatically</li>
+                        <li><strong>Instance Diversification:</strong> Multiple instance types for resilience</li>
+                        <li><strong>Intelligent Allocation:</strong> Balanced mix of On-Demand and Spot capacity</li>
+                    </ul>
+                    
+                    <h2>Configuration Details</h2>
+                    <ul>
+                        <li><strong>On-Demand Base Capacity:</strong> ${OnDemandBaseCapacity} instances</li>
+                        <li><strong>On-Demand Percentage Above Base:</strong> ${OnDemandPercentageAboveBase}%</li>
+                        <li><strong>Min/Max/Desired Capacity:</strong> ${MinSize}/${MaxSize}/${DesiredCapacity}</li>
+                        <li><strong>Allocation Strategy:</strong> Diversified across instance pools</li>
+                    </ul>
+                </div>
+            </body>
+            </html>
+            HTML
+            
+            # Start and enable Apache
+            systemctl start httpd
+            systemctl enable httpd
+            
+            # Install and configure CloudWatch agent
+            yum install -y amazon-cloudwatch-agent
+            
+            # Create CloudWatch agent configuration
+            cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << JSON
+            {
+                "metrics": {
+                    "namespace": "AutoScaling/MixedInstances",
+                    "metrics_collected": {
+                        "cpu": {
+                            "measurement": ["cpu_usage_idle", "cpu_usage_iowait", "cpu_usage_user", "cpu_usage_system"],
+                            "metrics_collection_interval": 60
+                        },
+                        "disk": {
+                            "measurement": ["used_percent"],
+                            "metrics_collection_interval": 60,
+                            "resources": ["*"]
+                        },
+                        "mem": {
+                            "measurement": ["mem_used_percent"],
+                            "metrics_collection_interval": 60
+                        }
+                    }
+                }
+            }
+            JSON
+            
+            # Start CloudWatch agent
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+                -a fetch-config -m ec2 -s \
+                -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-MixedInstance'
+              - Key: Environment
+                Value: Demo
+              - Key: StackName
+                Value: !Ref AWS::StackName
+              - Key: LaunchedBy
+                Value: CloudFormation
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: Name
+              Value: !Sub '${AWS::StackName}-LaunchTemplate'
+            - Key: Purpose
+              Value: Mixed Instance Auto Scaling Group
+
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Condition: ShouldCreateLoadBalancer
+    Properties:
+      Name: !Sub '${AWS::StackName}-ALB'
+      Type: application
+      Scheme: !Ref LoadBalancerScheme
+      IpAddressType: ipv4
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Subnets: !Ref SubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ApplicationLoadBalancer'
+        - Key: Purpose
+          Value: Mixed Instance Auto Scaling Group
+
+  # Target Group for Auto Scaling Group
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: ShouldCreateLoadBalancer
+    Properties:
+      Name: !Sub '${AWS::StackName}-TG'
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: instance
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: traffic-port
+      Matcher:
+        HttpCode: '200'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-TargetGroup'
+        - Key: Purpose
+          Value: Mixed Instance Auto Scaling Group
+
+  # Load Balancer Listener
+  LoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: ShouldCreateLoadBalancer
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # SNS Topic for Auto Scaling notifications
+  AutoScalingNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: ShouldEnableNotifications
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-AutoScalingNotifications'
+      DisplayName: Auto Scaling Group Notifications
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-AutoScalingNotifications'
+        - Key: Purpose
+          Value: Mixed Instance Auto Scaling Group
+
+  # SNS Subscription for email notifications
+  AutoScalingNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: ShouldCreateSNSSubscription
+    Properties:
+      TopicArn: !Ref AutoScalingNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # Auto Scaling Group with Mixed Instance Policy
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${AWS::StackName}-MixedInstanceASG'
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      DefaultCooldown: 300
+      HealthCheckType: !If [ShouldCreateLoadBalancer, ELB, EC2]
+      HealthCheckGracePeriod: 300
+      VPCZoneIdentifier: !Ref SubnetIds
+      CapacityRebalance: true
+      TargetGroupARNs: !If 
+        - ShouldCreateLoadBalancer
+        - [!Ref TargetGroup]
+        - !Ref AWS::NoValue
+      NotificationConfigurations: !If
+        - ShouldEnableNotifications
+        - - TopicARN: !Ref AutoScalingNotificationTopic
+            NotificationTypes:
+              - autoscaling:EC2_INSTANCE_LAUNCH
+              - autoscaling:EC2_INSTANCE_LAUNCH_ERROR
+              - autoscaling:EC2_INSTANCE_TERMINATE
+              - autoscaling:EC2_INSTANCE_TERMINATE_ERROR
+        - !Ref AWS::NoValue
+      MixedInstancesPolicy:
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref LaunchTemplate
+            Version: !GetAtt LaunchTemplate.LatestVersionNumber
+          Overrides:
+            # M5 family instances - General purpose
+            - InstanceType: m5.large
+              WeightedCapacity: 1
+            - InstanceType: m5.xlarge
+              WeightedCapacity: 2
+            - InstanceType: m5.2xlarge
+              WeightedCapacity: 4
+            # C5 family instances - Compute optimized
+            - InstanceType: c5.large
+              WeightedCapacity: 1
+            - InstanceType: c5.xlarge
+              WeightedCapacity: 2
+            - InstanceType: c5.2xlarge
+              WeightedCapacity: 4
+            # R5 family instances - Memory optimized
+            - InstanceType: r5.large
+              WeightedCapacity: 1
+            - InstanceType: r5.xlarge
+              WeightedCapacity: 2
+            # M5a family instances - AMD processors
+            - InstanceType: m5a.large
+              WeightedCapacity: 1
+            - InstanceType: m5a.xlarge
+              WeightedCapacity: 2
+        InstancesDistribution:
+          OnDemandAllocationStrategy: prioritized
+          OnDemandBaseCapacity: !Ref OnDemandBaseCapacity
+          OnDemandPercentageAboveBaseCapacity: !Ref OnDemandPercentageAboveBase
+          SpotAllocationStrategy: diversified
+          SpotInstancePools: 4
+          SpotMaxPrice: ''  # Use current Spot price
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-MixedInstanceASG'
+          PropagateAtLaunch: false
+        - Key: Environment
+          Value: Demo
+          PropagateAtLaunch: true
+        - Key: StackName
+          Value: !Ref AWS::StackName
+          PropagateAtLaunch: true
+        - Key: Purpose
+          Value: Mixed Instance Auto Scaling Group
+          PropagateAtLaunch: true
+
+  # CPU-based Target Tracking Scaling Policy
+  CPUTargetTrackingScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 70.0
+        ScaleOutCooldown: 300
+        ScaleInCooldown: 300
+
+  # Network-based Target Tracking Scaling Policy
+  NetworkTargetTrackingScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageNetworkIn
+        TargetValue: 1000000.0  # 1MB
+        ScaleOutCooldown: 300
+        ScaleInCooldown: 300
+
+  # CloudWatch Dashboard for monitoring
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-AutoScalingDashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/AutoScaling", "GroupDesiredCapacity", "AutoScalingGroupName", "${AutoScalingGroup}" ],
+                  [ ".", "GroupInServiceInstances", ".", "." ],
+                  [ ".", "GroupTotalInstances", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Auto Scaling Group Capacity"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/EC2", "CPUUtilization", "AutoScalingGroupName", "${AutoScalingGroup}" ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Average CPU Utilization"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${ApplicationLoadBalancer}", { "stat": "Sum" } ],
+                  [ ".", "TargetResponseTime", ".", ".", { "stat": "Average" } ]
+                ],
+                "period": 300,
+                "region": "${AWS::Region}",
+                "title": "Load Balancer Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+Outputs:
+  # Auto Scaling Group Information
+  AutoScalingGroupName:
+    Description: Name of the created Auto Scaling Group
+    Value: !Ref AutoScalingGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AutoScalingGroupName'
+
+  AutoScalingGroupARN:
+    Description: ARN of the created Auto Scaling Group
+    Value: !Sub 'arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${AutoScalingGroup}'
+    Export:
+      Name: !Sub '${AWS::StackName}-AutoScalingGroupARN'
+
+  # Load Balancer Information
+  LoadBalancerDNS:
+    Condition: ShouldCreateLoadBalancer
+    Description: DNS name of the Application Load Balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-LoadBalancerDNS'
+
+  ApplicationURL:
+    Condition: ShouldCreateLoadBalancer
+    Description: URL to access the web application
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationURL'
+
+  LoadBalancerARN:
+    Condition: ShouldCreateLoadBalancer
+    Description: ARN of the Application Load Balancer
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: !Sub '${AWS::StackName}-LoadBalancerARN'
+
+  # Instance Configuration
+  LaunchTemplateId:
+    Description: ID of the Launch Template
+    Value: !Ref LaunchTemplate
+    Export:
+      Name: !Sub '${AWS::StackName}-LaunchTemplateId'
+
+  SecurityGroupId:
+    Description: Security Group ID for Auto Scaling instances
+    Value: !Ref AutoScalingSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroupId'
+
+  # Monitoring and Notifications
+  SNSTopicARN:
+    Condition: ShouldEnableNotifications
+    Description: ARN of the SNS topic for Auto Scaling notifications
+    Value: !Ref AutoScalingNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicARN'
+
+  CloudWatchDashboardURL:
+    Description: URL to the CloudWatch Dashboard for monitoring
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-AutoScalingDashboard'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  # Cost Optimization Information
+  ConfigurationSummary:
+    Description: Summary of cost optimization configuration
+    Value: !Sub |
+      On-Demand Base: ${OnDemandBaseCapacity} instances, 
+      On-Demand %: ${OnDemandPercentageAboveBase}%, 
+      Spot Allocation: Diversified across 4 pools, 
+      Capacity Rebalancing: Enabled
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigurationSummary'
+
+  # Scaling Information
+  ScalingPolicies:
+    Description: Information about configured scaling policies
+    Value: 'CPU Target: 70%, Network Target: 1MB/s, Cooldown: 300s'
+    Export:
+      Name: !Sub '${AWS::StackName}-ScalingPolicies'
+
+  # Deployment Information
+  StackInfo:
+    Description: Stack deployment information
+    Value: !Sub |
+      Stack: ${AWS::StackName}, 
+      Region: ${AWS::Region}, 
+      Template: CloudFormation Mixed Instance Auto Scaling,
+      Cost Savings: Up to 90% vs On-Demand only
+    Export:
+      Name: !Sub '${AWS::StackName}-StackInfo'

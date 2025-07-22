@@ -1,0 +1,617 @@
+# Infrastructure Manager Configuration for Remote Developer Onboarding
+# This configuration deploys Cloud Workstations, Firebase Studio integration, and developer onboarding automation
+# for streamlined remote team collaboration and rapid developer productivity
+
+metadata:
+  labels:
+    solution: "remote-developer-onboarding"
+    environment: "development"
+    team: "engineering"
+    cost-center: "development-infrastructure"
+
+# Input parameters for customization
+imports:
+  - path: "variables.yaml"
+    name: "variables"
+
+resources:
+  # Enable required Google Cloud APIs
+  - name: workstations-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/workstations.googleapis.com
+      parent: projects/{{ env["project"] }}
+    metadata:
+      description: "Enable Cloud Workstations API for managed development environments"
+
+  - name: sourcerepo-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/sourcerepo.googleapis.com
+      parent: projects/{{ env["project"] }}
+    metadata:
+      description: "Enable Cloud Source Repositories API for team collaboration"
+
+  - name: compute-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/compute.googleapis.com
+      parent: projects/{{ env["project"] }}
+    metadata:
+      description: "Enable Compute Engine API for workstation infrastructure"
+
+  - name: firebase-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/firebase.googleapis.com
+      parent: projects/{{ env["project"] }}
+    metadata:
+      description: "Enable Firebase API for Studio integration"
+
+  - name: cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/cloudbuild.googleapis.com
+      parent: projects/{{ env["project"] }}
+    metadata:
+      description: "Enable Cloud Build API for CI/CD integration"
+
+  - name: iam-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/iam.googleapis.com
+      parent: projects/{{ env["project"] }}
+    metadata:
+      description: "Enable IAM API for access management"
+
+  # Create Cloud Source Repository for team templates
+  - name: team-templates-repository
+    type: gcp-types/sourcerepo-v1:projects.repos
+    properties:
+      parent: projects/{{ env["project"] }}
+      name: projects/{{ env["project"] }}/repos/team-templates-{{ properties["randomSuffix"] }}
+      size: "0"
+    metadata:
+      description: "Central repository for team project templates and shared resources"
+    depends_on:
+      - sourcerepo-api
+
+  # Create custom IAM role for workstation developers
+  - name: workstation-developer-role
+    type: gcp-types/iam-v1:projects.roles
+    properties:
+      parent: projects/{{ env["project"] }}
+      roleId: workstationDeveloper
+      role:
+        title: "Workstation Developer"
+        description: "Custom role for Cloud Workstation access and development resources"
+        stage: "GA"
+        includedPermissions:
+          - "workstations.workstations.use"
+          - "workstations.workstations.create"
+          - "workstations.workstations.list"
+          - "workstations.workstations.get"
+          - "source.repos.get"
+          - "source.repos.list"
+          - "source.repos.update"
+          - "logging.logEntries.create"
+          - "firebase.projects.get"
+          - "resourcemanager.projects.get"
+    metadata:
+      description: "Custom IAM role with minimal required permissions for workstation users"
+    depends_on:
+      - iam-api
+
+  # Create network for workstation cluster (using default VPC)
+  - name: workstation-network
+    type: gcp-types/compute-v1:networks
+    properties:
+      name: workstation-network-{{ properties["randomSuffix"] }}
+      description: "Dedicated network for Cloud Workstations with enhanced security"
+      autoCreateSubnetworks: false
+      routingConfig:
+        routingMode: REGIONAL
+    metadata:
+      description: "Custom VPC network for workstation cluster isolation"
+    depends_on:
+      - compute-api
+
+  # Create subnet for workstation cluster
+  - name: workstation-subnet
+    type: gcp-types/compute-v1:subnetworks
+    properties:
+      name: workstation-subnet-{{ properties["randomSuffix"] }}
+      description: "Subnet for Cloud Workstations in {{ properties["region"] }}"
+      region: {{ properties["region"] }}
+      network: $(ref.workstation-network.selfLink)
+      ipCidrRange: "10.0.0.0/24"
+      enableFlowLogs: true
+      logConfig:
+        enable: true
+        flowSampling: 0.5
+        aggregationInterval: "INTERVAL_10_MIN"
+      privateIpGoogleAccess: true
+    metadata:
+      description: "Dedicated subnet with private Google access for workstations"
+    depends_on:
+      - workstation-network
+
+  # Create firewall rules for workstation access
+  - name: workstation-firewall-ssh
+    type: gcp-types/compute-v1:firewalls
+    properties:
+      name: workstation-allow-ssh-{{ properties["randomSuffix"] }}
+      description: "Allow SSH access to workstations for debugging"
+      network: $(ref.workstation-network.selfLink)
+      direction: INGRESS
+      priority: 1000
+      sourceRanges:
+        - "35.235.240.0/20"  # Google Cloud Shell IP range
+      allowed:
+        - IPProtocol: "tcp"
+          ports: ["22"]
+      targetTags: ["workstation"]
+    metadata:
+      description: "Firewall rule allowing SSH access from Cloud Shell"
+    depends_on:
+      - workstation-network
+
+  - name: workstation-firewall-http
+    type: gcp-types/compute-v1:firewalls
+    properties:
+      name: workstation-allow-http-{{ properties["randomSuffix"] }}
+      description: "Allow HTTP/HTTPS access for development servers"
+      network: $(ref.workstation-network.selfLink)
+      direction: INGRESS
+      priority: 1000
+      sourceRanges:
+        - "0.0.0.0/0"
+      allowed:
+        - IPProtocol: "tcp"
+          ports: ["80", "443", "3000", "8080", "8000", "5000"]
+      targetTags: ["workstation"]
+    metadata:
+      description: "Firewall rule for common development server ports"
+    depends_on:
+      - workstation-network
+
+  # Create Cloud Workstations cluster
+  - name: developer-workstations-cluster
+    type: gcp-types/workstations-v1:projects.locations.workstationClusters
+    properties:
+      parent: projects/{{ env["project"] }}/locations/{{ properties["region"] }}
+      workstationClusterId: developer-workstations-{{ properties["randomSuffix"] }}
+      workstationCluster:
+        displayName: "Developer Workstations Cluster"
+        annotations:
+          environment: "development"
+          team: "engineering"
+          cost-center: "development-infrastructure"
+        network: $(ref.workstation-network.selfLink)
+        subnetwork: $(ref.workstation-subnet.selfLink)
+        privateClusterConfig:
+          enablePrivateEndpoint: true
+          clusterHostname: "workstations-{{ properties["randomSuffix"] }}.{{ properties["region"] }}.c.{{ env["project"] }}.internal"
+        labels:
+          environment: "development"
+          team: "engineering"
+    metadata:
+      description: "Managed cluster for Cloud Workstations with private networking"
+    depends_on:
+      - workstations-api
+      - workstation-subnet
+
+  # Create workstation configuration for full-stack development
+  - name: fullstack-dev-config
+    type: gcp-types/workstations-v1:projects.locations.workstationClusters.workstationConfigs
+    properties:
+      parent: projects/{{ env["project"] }}/locations/{{ properties["region"] }}/workstationClusters/developer-workstations-{{ properties["randomSuffix"] }}
+      workstationConfigId: fullstack-dev-{{ properties["randomSuffix"] }}
+      workstationConfig:
+        displayName: "Full-Stack Developer Environment"
+        annotations:
+          framework: "multi-language"
+          tools: "vscode,docker,nodejs,python,go"
+          version: "latest"
+        machineType: "e2-standard-4"
+        persistentDirectories:
+          - gcePd:
+              sizeGb: 200
+              fsType: "ext4"
+              diskType: "pd-standard"
+              sourceSnapshot: ""
+              reclaimPolicy: "DELETE"
+            mountPath: "/home"
+        container:
+          image: "us-central1-docker.pkg.dev/cloud-workstations-images/predefined/code-oss:latest"
+          workingDir: "/home"
+          env:
+            # Development environment configuration
+            NODE_VERSION: "18"
+            PYTHON_VERSION: "3.11"
+            GO_VERSION: "1.21"
+            DOCKER_ENABLED: "true"
+            GIT_CONFIG_GLOBAL: "true"
+            # Firebase and Google Cloud configuration
+            GOOGLE_CLOUD_PROJECT: "{{ env['project'] }}"
+            FIREBASE_PROJECT: "{{ env['project'] }}"
+            # Development tools configuration
+            EDITOR: "code"
+            SHELL: "/bin/bash"
+            # Performance optimization
+            TERM: "xterm-256color"
+            COLORTERM: "truecolor"
+          args: []
+          command: []
+        runAs:
+          user: "codeoss"
+          group: "codeoss"
+        idleTimeout: "7200s"  # 2 hours
+        runningTimeout: "28800s"  # 8 hours
+        enableAuditAgent: true
+        labels:
+          environment: "development"
+          type: "fullstack"
+          cost-optimization: "enabled"
+    metadata:
+      description: "Comprehensive development environment with multi-language support"
+    depends_on:
+      - developer-workstations-cluster
+
+  # Create IAM service account for workstation instances
+  - name: workstation-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      name: projects/{{ env["project"] }}
+      accountId: workstation-sa-{{ properties["randomSuffix"] }}
+      serviceAccount:
+        displayName: "Workstation Service Account"
+        description: "Service account for Cloud Workstation instances with minimal required permissions"
+    metadata:
+      description: "Dedicated service account for workstation instances"
+    depends_on:
+      - iam-api
+
+  # Grant necessary permissions to workstation service account
+  - name: workstation-sa-source-reader
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ env["project"] }}
+      role: roles/source.reader
+      member: serviceAccount:$(ref.workstation-service-account.email)
+    metadata:
+      description: "Grant source repository read access to workstation service account"
+
+  - name: workstation-sa-firebase-viewer
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ env["project"] }}
+      role: roles/firebase.viewer
+      member: serviceAccount:$(ref.workstation-service-account.email)
+    metadata:
+      description: "Grant Firebase project viewer access to workstation service account"
+
+  - name: workstation-sa-logging-writer
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ env["project"] }}
+      role: roles/logging.logWriter
+      member: serviceAccount:$(ref.workstation-service-account.email)
+    metadata:
+      description: "Grant logging write access to workstation service account"
+
+  # Create Cloud Storage bucket for team shared resources
+  - name: team-shared-storage
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: team-shared-{{ env["project"] }}-{{ properties["randomSuffix"] }}
+      location: {{ properties["region"] }}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 365  # Delete objects older than 1 year
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30  # Move to Nearline after 30 days
+      encryption:
+        defaultKmsKeyName: ""  # Use Google-managed encryption
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      labels:
+        environment: "development"
+        team: "engineering"
+        purpose: "shared-resources"
+    metadata:
+      description: "Shared storage bucket for team templates and resources"
+
+  # Grant storage access to workstation service account
+  - name: workstation-sa-storage-access
+    type: gcp-types/storage-v1:buckets/iam
+    properties:
+      bucket: $(ref.team-shared-storage.name)
+      bindings:
+        - role: roles/storage.objectViewer
+          members:
+            - serviceAccount:$(ref.workstation-service-account.email)
+        - role: roles/storage.legacyBucketReader
+          members:
+            - serviceAccount:$(ref.workstation-service-account.email)
+    metadata:
+      description: "Grant read access to shared storage for workstation instances"
+
+  # Create budget alert for cost management
+  - name: workstation-budget-alert
+    type: gcp-types/billingbudgets-v1:billingAccounts.budgets
+    properties:
+      parent: billingAccounts/{{ properties["billingAccountId"] }}
+      budget:
+        displayName: "Developer Workstations Budget"
+        budgetFilter:
+          projects:
+            - projects/{{ env["project"] }}
+          services:
+            - services/6F81-5844-456A  # Compute Engine service ID
+          labels:
+            - key: "team"
+              value: "engineering"
+        amount:
+          specifiedAmount:
+            currencyCode: "USD"
+            units: "1000"  # $1000 per month
+        thresholdRules:
+          - thresholdPercent: 0.75
+            spendBasis: CURRENT_SPEND
+          - thresholdPercent: 0.90
+            spendBasis: CURRENT_SPEND
+          - thresholdPercent: 1.0
+            spendBasis: CURRENT_SPEND
+        allUpdatesRule:
+          pubsubTopic: ""  # Can be configured to send alerts to Pub/Sub
+          schemaVersion: "1.0"
+          monitoringNotificationChannels: []
+    metadata:
+      description: "Budget monitoring for workstation infrastructure costs"
+    condition: properties["enableBudgetAlerts"]
+
+  # Create Cloud Monitoring dashboard for workstation metrics
+  - name: workstation-monitoring-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      parent: projects/{{ env["project"] }}
+      dashboard:
+        displayName: "Developer Workstations Dashboard"
+        mosaicLayout:
+          tiles:
+            - width: 6
+              height: 4
+              widget:
+                title: "Active Workstations"
+                scorecard:
+                  timeSeriesQuery:
+                    timeSeriesFilter:
+                      filter: 'resource.type="gce_instance" resource.label.instance_name=~"workstation-.*"'
+                      aggregation:
+                        alignmentPeriod: "60s"
+                        perSeriesAligner: "ALIGN_MEAN"
+                        crossSeriesReducer: "REDUCE_COUNT"
+                  sparkChartView:
+                    sparkChartType: "SPARK_LINE"
+            - width: 6
+              height: 4
+              xPos: 6
+              widget:
+                title: "Workstation CPU Utilization"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="gce_instance" resource.label.instance_name=~"workstation-.*" metric.type="compute.googleapis.com/instance/cpu/utilization"'
+                          aggregation:
+                            alignmentPeriod: "300s"
+                            perSeriesAligner: "ALIGN_MEAN"
+                            crossSeriesReducer: "REDUCE_MEAN"
+                      plotType: "LINE"
+                  yAxis:
+                    label: "CPU Utilization"
+                    scale: "LINEAR"
+            - width: 12
+              height: 4
+              yPos: 4
+              widget:
+                title: "Workstation Costs (Last 30 Days)"
+                scorecard:
+                  timeSeriesQuery:
+                    timeSeriesFilter:
+                      filter: 'resource.type="billing_account"'
+                      aggregation:
+                        alignmentPeriod: "86400s"
+                        perSeriesAligner: "ALIGN_SUM"
+        labels:
+          team: "engineering"
+          environment: "development"
+    metadata:
+      description: "Comprehensive monitoring dashboard for workstation infrastructure"
+
+  # Create Pub/Sub topic for developer onboarding notifications
+  - name: onboarding-notifications
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/{{ env["project"] }}/topics/developer-onboarding-{{ properties["randomSuffix"] }}
+      labels:
+        environment: "development"
+        team: "engineering"
+        purpose: "notifications"
+    metadata:
+      description: "Pub/Sub topic for automated developer onboarding notifications"
+
+  # Create Cloud Function for automated developer onboarding
+  - name: onboarding-automation-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/{{ env["project"] }}/locations/{{ properties["region"] }}
+      function:
+        name: projects/{{ env["project"] }}/locations/{{ properties["region"] }}/functions/onboard-developer-{{ properties["randomSuffix"] }}
+        description: "Automated developer onboarding function for workstation provisioning"
+        sourceArchiveUrl: "gs://{{ properties['deploymentBucket'] }}/onboarding-function.zip"
+        entryPoint: "onboardDeveloper"
+        runtime: "python39"
+        timeout: "540s"
+        availableMemoryMb: 256
+        environmentVariables:
+          WORKSTATION_CLUSTER: developer-workstations-{{ properties["randomSuffix"] }}
+          WORKSTATION_CONFIG: fullstack-dev-{{ properties["randomSuffix"] }}
+          PROJECT_ID: "{{ env['project'] }}"
+          REGION: "{{ properties['region'] }}"
+          SOURCE_REPO: team-templates-{{ properties["randomSuffix"] }}
+        eventTrigger:
+          eventType: "google.pubsub.topic.publish"
+          resource: projects/{{ env["project"] }}/topics/developer-onboarding-{{ properties["randomSuffix"] }}
+          failurePolicy:
+            retry: {}
+        serviceAccountEmail: $(ref.workstation-service-account.email)
+        labels:
+          environment: "development"
+          team: "engineering"
+          function: "onboarding"
+    metadata:
+      description: "Serverless function for automated developer workstation provisioning"
+    depends_on:
+      - onboarding-notifications
+      - workstation-service-account
+    condition: properties["enableAutomation"]
+
+outputs:
+  # Infrastructure endpoints and identifiers
+  - name: workstation-cluster-name
+    description: "Name of the Cloud Workstations cluster"
+    value: developer-workstations-{{ properties["randomSuffix"] }}
+
+  - name: workstation-config-name
+    description: "Name of the workstation configuration"
+    value: fullstack-dev-{{ properties["randomSuffix"] }}
+
+  - name: source-repository-name
+    description: "Name of the team templates repository"
+    value: team-templates-{{ properties["randomSuffix"] }}
+
+  - name: network-name
+    description: "Name of the workstation network"
+    value: $(ref.workstation-network.name)
+
+  - name: subnet-name
+    description: "Name of the workstation subnet"
+    value: $(ref.workstation-subnet.name)
+
+  # Access and management endpoints
+  - name: workstation-cluster-endpoint
+    description: "Cloud Console URL for workstation cluster management"
+    value: "https://console.cloud.google.com/workstations/clusters/{{ properties['region'] }}/developer-workstations-{{ properties['randomSuffix'] }}/overview?project={{ env['project'] }}"
+
+  - name: source-repository-url
+    description: "Clone URL for the team templates repository"
+    value: "https://source.developers.google.com/p/{{ env['project'] }}/r/team-templates-{{ properties['randomSuffix'] }}"
+
+  - name: firebase-console-url
+    description: "Firebase Console URL for Studio access"
+    value: "https://console.firebase.google.com/project/{{ env['project'] }}/overview"
+
+  # Service account and permissions
+  - name: workstation-service-account-email
+    description: "Email of the workstation service account"
+    value: $(ref.workstation-service-account.email)
+
+  - name: custom-iam-role-name
+    description: "Name of the custom workstation developer IAM role"
+    value: "projects/{{ env['project'] }}/roles/workstationDeveloper"
+
+  # Storage and collaboration resources
+  - name: shared-storage-bucket
+    description: "Name of the team shared storage bucket"
+    value: $(ref.team-shared-storage.name)
+
+  - name: monitoring-dashboard-url
+    description: "Cloud Console URL for workstation monitoring dashboard"
+    value: "https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.workstation-monitoring-dashboard.name)?project={{ env['project'] }}"
+
+  # Automation and notifications
+  - name: onboarding-topic-name
+    description: "Pub/Sub topic for developer onboarding notifications"
+    value: developer-onboarding-{{ properties["randomSuffix"] }}
+
+  - name: onboarding-function-name
+    description: "Cloud Function for automated developer onboarding"
+    value: onboard-developer-{{ properties["randomSuffix"] }}
+    condition: properties["enableAutomation"]
+
+  # Cost management
+  - name: budget-alert-name
+    description: "Name of the workstation budget alert"
+    value: "Developer Workstations Budget"
+    condition: properties["enableBudgetAlerts"]
+
+  # Developer onboarding instructions
+  - name: developer-onboarding-command
+    description: "Command to create a new developer workstation"
+    value: |
+      gcloud workstations create DEVELOPER_NAME-workstation \
+        --cluster=developer-workstations-{{ properties["randomSuffix"] }} \
+        --config=fullstack-dev-{{ properties["randomSuffix"] }} \
+        --region={{ properties["region"] }} \
+        --labels=owner=DEVELOPER_NAME,team=engineering
+
+  - name: access-instructions
+    description: "Instructions for developers to access their workstations"
+    value: |
+      1. Navigate to: https://console.cloud.google.com/workstations
+      2. Select your workstation: DEVELOPER_NAME-workstation
+      3. Click "START" then "CONNECT VIA SSH IN BROWSER"
+      4. Clone team repository: git clone $(ref.team-templates-repository.cloneUrls[0])
+      5. Access Firebase Studio: https://console.firebase.google.com/project/{{ env['project'] }}/overview
+
+# Configuration properties with default values
+properties:
+  region:
+    type: string
+    default: "us-central1"
+    description: "Google Cloud region for workstation deployment"
+
+  randomSuffix:
+    type: string
+    default: "dev"
+    description: "Random suffix for unique resource naming"
+
+  billingAccountId:
+    type: string
+    description: "Billing account ID for budget alerts (format: XXXXXX-YYYYYY-ZZZZZZ)"
+
+  enableBudgetAlerts:
+    type: boolean
+    default: false
+    description: "Enable budget monitoring and alerts"
+
+  enableAutomation:
+    type: boolean
+    default: false
+    description: "Deploy automation functions for developer onboarding"
+
+  deploymentBucket:
+    type: string
+    description: "Cloud Storage bucket containing deployment artifacts"
+
+  maxWorkstations:
+    type: integer
+    default: 10
+    description: "Maximum number of workstations to allow"
+
+  autoShutdownEnabled:
+    type: boolean
+    default: true
+    description: "Enable automatic workstation shutdown during idle periods"

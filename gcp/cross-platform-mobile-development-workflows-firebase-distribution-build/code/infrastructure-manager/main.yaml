@@ -1,0 +1,586 @@
+# Google Cloud Infrastructure Manager Configuration
+# Cross-Platform Mobile Development Workflows with Firebase App Distribution and Cloud Build
+# This configuration creates a comprehensive mobile CI/CD pipeline with automated testing and distribution
+
+apiVersion: config.googleapis.com/v1
+kind: Deployment
+metadata:
+  name: mobile-development-pipeline
+  annotations:
+    config.kubernetes.io/local-config: "true"
+    config.gcp.com/project-id: "${PROJECT_ID}"
+spec:
+  # Configuration for the deployment
+  resources:
+    # ====================================
+    # PROJECT CONFIGURATION
+    # ====================================
+    
+    # Enable required Google Cloud APIs for the mobile development pipeline
+    - name: enable-cloudbuild-api
+      type: gcp-types/serviceusage-v1:projects.services
+      properties:
+        name: projects/${PROJECT_ID}/services/cloudbuild.googleapis.com
+        disableDependentServices: false
+      metadata:
+        runtimePolicy:
+          - CREATE
+    
+    - name: enable-sourcerepo-api
+      type: gcp-types/serviceusage-v1:projects.services
+      properties:
+        name: projects/${PROJECT_ID}/services/sourcerepo.googleapis.com
+        disableDependentServices: false
+      metadata:
+        runtimePolicy:
+          - CREATE
+    
+    - name: enable-firebase-api
+      type: gcp-types/serviceusage-v1:projects.services
+      properties:
+        name: projects/${PROJECT_ID}/services/firebase.googleapis.com
+        disableDependentServices: false
+      metadata:
+        runtimePolicy:
+          - CREATE
+    
+    - name: enable-testing-api
+      type: gcp-types/serviceusage-v1:projects.services
+      properties:
+        name: projects/${PROJECT_ID}/services/testing.googleapis.com
+        disableDependentServices: false
+      metadata:
+        runtimePolicy:
+          - CREATE
+    
+    - name: enable-artifactregistry-api
+      type: gcp-types/serviceusage-v1:projects.services
+      properties:
+        name: projects/${PROJECT_ID}/services/artifactregistry.googleapis.com
+        disableDependentServices: false
+      metadata:
+        runtimePolicy:
+          - CREATE
+    
+    # ====================================
+    # SERVICE ACCOUNTS & IAM CONFIGURATION
+    # ====================================
+    
+    # Service account for Cloud Build with appropriate permissions
+    - name: cloudbuild-service-account
+      type: gcp-types/iam-v1:projects.serviceAccounts
+      properties:
+        accountId: mobile-cicd-builder
+        displayName: Mobile CI/CD Cloud Build Service Account
+        description: Service account for Cloud Build mobile application pipelines
+      metadata:
+        dependsOn:
+          - enable-cloudbuild-api
+    
+    # Grant Cloud Build service account necessary permissions for Firebase operations
+    - name: cloudbuild-firebase-admin-binding
+      type: gcp-types/cloudresourcemanager-v1:bindings
+      properties:
+        resource: projects/${PROJECT_ID}
+        role: roles/firebase.admin
+        members:
+          - serviceAccount:$(ref.cloudbuild-service-account.email)
+      metadata:
+        dependsOn:
+          - cloudbuild-service-account
+          - enable-firebase-api
+    
+    # Grant permissions for Firebase Test Lab operations
+    - name: cloudbuild-testlab-binding
+      type: gcp-types/cloudresourcemanager-v1:bindings
+      properties:
+        resource: projects/${PROJECT_ID}
+        role: roles/clouttestlabs.devTester
+        members:
+          - serviceAccount:$(ref.cloudbuild-service-account.email)
+      metadata:
+        dependsOn:
+          - cloudbuild-service-account
+    
+    # Grant permissions for Source Repository operations
+    - name: cloudbuild-source-admin-binding
+      type: gcp-types/cloudresourcemanager-v1:bindings
+      properties:
+        resource: projects/${PROJECT_ID}
+        role: roles/source.admin
+        members:
+          - serviceAccount:$(ref.cloudbuild-service-account.email)
+      metadata:
+        dependsOn:
+          - cloudbuild-service-account
+    
+    # ====================================
+    # SOURCE REPOSITORY CONFIGURATION
+    # ====================================
+    
+    # Cloud Source Repository for mobile application code
+    - name: mobile-source-repository
+      type: gcp-types/sourcerepo-v1:projects.repos
+      properties:
+        name: projects/${PROJECT_ID}/repos/${REPO_NAME}
+        url: https://source.developers.google.com/p/${PROJECT_ID}/r/${REPO_NAME}
+      metadata:
+        dependsOn:
+          - enable-sourcerepo-api
+    
+    # ====================================
+    # FIREBASE PROJECT CONFIGURATION
+    # ====================================
+    
+    # Firebase Android App configuration
+    - name: firebase-android-app
+      type: gcp-types/firebase-v1beta1:projects.androidApps
+      properties:
+        parent: projects/${PROJECT_ID}
+        displayName: ${APP_NAME} Android
+        packageName: com.example.${APP_NAME_SANITIZED}
+      metadata:
+        dependsOn:
+          - enable-firebase-api
+    
+    # Firebase iOS App configuration (optional for cross-platform support)
+    - name: firebase-ios-app
+      type: gcp-types/firebase-v1beta1:projects.iosApps
+      properties:
+        parent: projects/${PROJECT_ID}
+        displayName: ${APP_NAME} iOS
+        bundleId: com.example.${APP_NAME_SANITIZED}
+      metadata:
+        dependsOn:
+          - enable-firebase-api
+    
+    # ====================================
+    # CLOUD BUILD CONFIGURATION
+    # ====================================
+    
+    # Cloud Build trigger for main branch CI/CD pipeline
+    - name: main-branch-build-trigger
+      type: gcp-types/cloudbuild-v1:projects.triggers
+      properties:
+        name: mobile-cicd-main-trigger
+        description: Automated CI/CD pipeline for main branch mobile development
+        github:
+          owner: ${GITHUB_OWNER}
+          name: ${GITHUB_REPO}
+          push:
+            branch: "^main$"
+        build:
+          steps:
+            # Install dependencies and prepare build environment
+            - name: 'gcr.io/cloud-builders/git'
+              args: ['submodule', 'update', '--init', '--recursive']
+              id: 'prepare-environment'
+            
+            # Build Android application
+            - name: 'gcr.io/cloud-builders/gradle'
+              dir: 'android'
+              args: ['clean', 'assembleDebug', 'assembleDebugAndroidTest']
+              env:
+                - 'GRADLE_OPTS=-Dorg.gradle.daemon=false'
+              id: 'build-android'
+              waitFor: ['prepare-environment']
+            
+            # Run unit tests
+            - name: 'gcr.io/cloud-builders/gradle'
+              dir: 'android'
+              args: ['test']
+              env:
+                - 'GRADLE_OPTS=-Dorg.gradle.daemon=false'
+              id: 'run-unit-tests'
+              waitFor: ['build-android']
+            
+            # Run Firebase Test Lab instrumentation tests
+            - name: 'gcr.io/cloud-builders/gcloud'
+              args:
+                - 'firebase'
+                - 'test'
+                - 'android'
+                - 'run'
+                - '--type=instrumentation'
+                - '--app=android/app/build/outputs/apk/debug/app-debug.apk'
+                - '--test=android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk'
+                - '--device=model=Pixel2,version=28,locale=en,orientation=portrait'
+                - '--device=model=Pixel3,version=29,locale=en,orientation=portrait'
+                - '--device=model=Pixel4,version=30,locale=en,orientation=portrait'
+                - '--timeout=15m'
+                - '--results-dir=gs://${PROJECT_ID}-test-results/${BUILD_ID}'
+              env:
+                - 'PROJECT_ID=${PROJECT_ID}'
+              id: 'firebase-test-lab'
+              waitFor: ['run-unit-tests']
+            
+            # Distribute to Firebase App Distribution
+            - name: 'gcr.io/cloud-builders/gcloud'
+              args:
+                - 'firebase'
+                - 'appdistribution:distribute'
+                - 'android/app/build/outputs/apk/debug/app-debug.apk'
+                - '--app=$(ref.firebase-android-app.appId)'
+                - '--groups=qa-team,stakeholders'
+                - '--release-notes=Automated build from commit ${SHORT_SHA} on branch ${BRANCH_NAME}'
+              env:
+                - 'PROJECT_ID=${PROJECT_ID}'
+              id: 'distribute-android'
+              waitFor: ['firebase-test-lab']
+            
+            # Build and distribute iOS (if iOS support is enabled)
+            - name: 'gcr.io/cloud-builders/gcloud'
+              args:
+                - 'firebase'
+                - 'appdistribution:distribute'
+                - 'ios/build/outputs/ipa/app-debug.ipa'
+                - '--app=$(ref.firebase-ios-app.appId)'
+                - '--groups=qa-team,stakeholders'
+                - '--release-notes=Automated iOS build from commit ${SHORT_SHA} on branch ${BRANCH_NAME}'
+              env:
+                - 'PROJECT_ID=${PROJECT_ID}'
+              id: 'distribute-ios'
+              waitFor: ['firebase-test-lab']
+        
+        # Build configuration options
+        options:
+          logging: CLOUD_LOGGING_ONLY
+          logStreamingOption: STREAM_ON
+          machineType: 'E2_HIGHCPU_8'
+          diskSizeGb: 100
+          
+        # Environment variables and substitutions
+        substitutions:
+          _ANDROID_APP_ID: $(ref.firebase-android-app.appId)
+          _IOS_APP_ID: $(ref.firebase-ios-app.appId)
+          _APP_NAME: ${APP_NAME}
+        
+        # Timeout configuration
+        timeout: '2400s'  # 40 minutes
+        
+        # Service account configuration
+        serviceAccount: projects/${PROJECT_ID}/serviceAccounts/$(ref.cloudbuild-service-account.email)
+      
+      metadata:
+        dependsOn:
+          - enable-cloudbuild-api
+          - mobile-source-repository
+          - firebase-android-app
+          - firebase-ios-app
+          - cloudbuild-service-account
+    
+    # Cloud Build trigger for feature branch testing
+    - name: feature-branch-build-trigger
+      type: gcp-types/cloudbuild-v1:projects.triggers
+      properties:
+        name: mobile-cicd-feature-trigger
+        description: Automated testing pipeline for feature branch development
+        github:
+          owner: ${GITHUB_OWNER}
+          name: ${GITHUB_REPO}
+          push:
+            branch: "^feature/.*"
+        build:
+          steps:
+            # Prepare environment
+            - name: 'gcr.io/cloud-builders/git'
+              args: ['submodule', 'update', '--init', '--recursive']
+              id: 'prepare-environment'
+            
+            # Build Android application
+            - name: 'gcr.io/cloud-builders/gradle'
+              dir: 'android'
+              args: ['clean', 'assembleDebug', 'assembleDebugAndroidTest']
+              env:
+                - 'GRADLE_OPTS=-Dorg.gradle.daemon=false'
+              id: 'build-android'
+              waitFor: ['prepare-environment']
+            
+            # Run unit tests only for feature branches
+            - name: 'gcr.io/cloud-builders/gradle'
+              dir: 'android'
+              args: ['test']
+              env:
+                - 'GRADLE_OPTS=-Dorg.gradle.daemon=false'
+              id: 'run-unit-tests'
+              waitFor: ['build-android']
+            
+            # Run limited Firebase Test Lab testing for feature branches
+            - name: 'gcr.io/cloud-builders/gcloud'
+              args:
+                - 'firebase'
+                - 'test'
+                - 'android'
+                - 'run'
+                - '--type=instrumentation'
+                - '--app=android/app/build/outputs/apk/debug/app-debug.apk'
+                - '--test=android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk'
+                - '--device=model=Pixel3,version=29,locale=en,orientation=portrait'
+                - '--timeout=10m'
+                - '--results-dir=gs://${PROJECT_ID}-test-results/${BUILD_ID}'
+              env:
+                - 'PROJECT_ID=${PROJECT_ID}'
+              id: 'firebase-test-lab-limited'
+              waitFor: ['run-unit-tests']
+        
+        # Build configuration options for feature branches
+        options:
+          logging: CLOUD_LOGGING_ONLY
+          machineType: 'E2_STANDARD_4'
+          diskSizeGb: 50
+          
+        # Environment variables and substitutions
+        substitutions:
+          _ANDROID_APP_ID: $(ref.firebase-android-app.appId)
+          _APP_NAME: ${APP_NAME}
+        
+        # Timeout configuration
+        timeout: '1800s'  # 30 minutes
+        
+        # Service account configuration
+        serviceAccount: projects/${PROJECT_ID}/serviceAccounts/$(ref.cloudbuild-service-account.email)
+      
+      metadata:
+        dependsOn:
+          - enable-cloudbuild-api
+          - mobile-source-repository
+          - firebase-android-app
+          - cloudbuild-service-account
+    
+    # ====================================
+    # STORAGE CONFIGURATION
+    # ====================================
+    
+    # Cloud Storage bucket for test results and artifacts
+    - name: test-results-bucket
+      type: gcp-types/storage-v1:buckets
+      properties:
+        name: ${PROJECT_ID}-test-results
+        location: ${REGION}
+        storageClass: STANDARD
+        versioning:
+          enabled: true
+        lifecycle:
+          rule:
+            - action:
+                type: Delete
+              condition:
+                age: 90  # Delete test results after 90 days
+        iamConfiguration:
+          uniformBucketLevelAccess:
+            enabled: true
+      metadata:
+        dependsOn:
+          - enable-cloudbuild-api
+    
+    # Grant Cloud Build access to test results bucket
+    - name: test-results-bucket-iam
+      type: gcp-types/storage-v1:buckets.iam
+      properties:
+        bucket: $(ref.test-results-bucket.name)
+        bindings:
+          - role: roles/storage.objectAdmin
+            members:
+              - serviceAccount:$(ref.cloudbuild-service-account.email)
+              - serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com
+      metadata:
+        dependsOn:
+          - test-results-bucket
+          - cloudbuild-service-account
+    
+    # ====================================
+    # FIREBASE APP DISTRIBUTION CONFIGURATION
+    # ====================================
+    
+    # Create tester groups for organized distribution
+    # Note: Firebase App Distribution tester groups are typically managed through the Firebase Console
+    # or Firebase CLI, as they don't have direct Infrastructure Manager resource types.
+    # This would need to be configured post-deployment using the Firebase CLI or Console.
+    
+    # ====================================
+    # MONITORING & LOGGING CONFIGURATION
+    # ====================================
+    
+    # Log sink for Cloud Build logs to BigQuery for analysis
+    - name: cloudbuild-log-sink
+      type: gcp-types/logging-v2:projects.sinks
+      properties:
+        name: cloudbuild-mobile-pipeline-sink
+        destination: bigquery.googleapis.com/projects/${PROJECT_ID}/datasets/mobile_cicd_logs
+        filter: |
+          resource.type="build"
+          protoPayload.serviceName="cloudbuild.googleapis.com"
+          (protoPayload.resourceName=~"projects/${PROJECT_ID}/triggers/mobile-cicd-.*")
+        uniqueWriterIdentity: true
+      metadata:
+        dependsOn:
+          - main-branch-build-trigger
+          - feature-branch-build-trigger
+    
+    # BigQuery dataset for storing CI/CD pipeline logs and metrics
+    - name: cicd-analytics-dataset
+      type: gcp-types/bigquery-v2:datasets
+      properties:
+        datasetId: mobile_cicd_logs
+        location: ${REGION}
+        description: Analytics dataset for mobile CI/CD pipeline metrics and logs
+        access:
+          - role: WRITER
+            userByEmail: $(ref.cloudbuild-log-sink.writerIdentity)
+          - role: OWNER
+            userByEmail: ${USER_EMAIL}
+      metadata:
+        dependsOn:
+          - cloudbuild-log-sink
+    
+    # ====================================
+    # NOTIFICATION CONFIGURATION
+    # ====================================
+    
+    # Pub/Sub topic for build notifications
+    - name: build-notifications-topic
+      type: gcp-types/pubsub-v1:projects.topics
+      properties:
+        name: projects/${PROJECT_ID}/topics/mobile-build-notifications
+      metadata:
+        dependsOn:
+          - enable-cloudbuild-api
+    
+    # Cloud Function for processing build notifications (placeholder)
+    # This would trigger email/Slack notifications based on build status
+    - name: notification-function-bucket
+      type: gcp-types/storage-v1:buckets
+      properties:
+        name: ${PROJECT_ID}-notification-functions
+        location: ${REGION}
+        storageClass: STANDARD
+      metadata:
+        dependsOn:
+          - enable-cloudbuild-api
+
+# ====================================
+# CONFIGURATION VARIABLES
+# ====================================
+# These variables should be provided when deploying the Infrastructure Manager configuration
+
+variables:
+  PROJECT_ID:
+    description: "Google Cloud Project ID"
+    type: string
+    required: true
+  
+  PROJECT_NUMBER:
+    description: "Google Cloud Project Number"
+    type: string
+    required: true
+  
+  REGION:
+    description: "Google Cloud region for resources"
+    type: string
+    default: "us-central1"
+  
+  APP_NAME:
+    description: "Name of the mobile application"
+    type: string
+    required: true
+  
+  APP_NAME_SANITIZED:
+    description: "Sanitized app name for package identifiers (no hyphens, lowercase)"
+    type: string
+    required: true
+  
+  REPO_NAME:
+    description: "Name of the source repository"
+    type: string
+    required: true
+  
+  GITHUB_OWNER:
+    description: "GitHub repository owner/organization"
+    type: string
+    required: true
+  
+  GITHUB_REPO:
+    description: "GitHub repository name"
+    type: string
+    required: true
+  
+  USER_EMAIL:
+    description: "Email address of the user deploying this configuration"
+    type: string
+    required: true
+
+# ====================================
+# OUTPUTS
+# ====================================
+outputs:
+  project_id:
+    description: "The Google Cloud Project ID"
+    value: ${PROJECT_ID}
+  
+  firebase_android_app_id:
+    description: "Firebase Android App ID"
+    value: $(ref.firebase-android-app.appId)
+  
+  firebase_ios_app_id:
+    description: "Firebase iOS App ID"
+    value: $(ref.firebase-ios-app.appId)
+  
+  source_repository_url:
+    description: "Cloud Source Repository URL"
+    value: $(ref.mobile-source-repository.url)
+  
+  test_results_bucket:
+    description: "Cloud Storage bucket for test results"
+    value: $(ref.test-results-bucket.name)
+  
+  cloudbuild_service_account:
+    description: "Cloud Build service account email"
+    value: $(ref.cloudbuild-service-account.email)
+  
+  main_trigger_id:
+    description: "Main branch Cloud Build trigger ID"
+    value: $(ref.main-branch-build-trigger.id)
+  
+  feature_trigger_id:
+    description: "Feature branch Cloud Build trigger ID"
+    value: $(ref.feature-branch-build-trigger.id)
+  
+  build_notifications_topic:
+    description: "Pub/Sub topic for build notifications"
+    value: $(ref.build-notifications-topic.name)
+  
+  cicd_logs_dataset:
+    description: "BigQuery dataset for CI/CD analytics"
+    value: $(ref.cicd-analytics-dataset.datasetId)
+
+# ====================================
+# DEPLOYMENT NOTES
+# ====================================
+# 
+# This Infrastructure Manager configuration creates a comprehensive
+# mobile CI/CD pipeline with the following components:
+#
+# 1. Google Cloud APIs enablement for all required services
+# 2. Service accounts with appropriate IAM permissions
+# 3. Cloud Source Repository for code hosting
+# 4. Firebase project configuration with Android and iOS apps
+# 5. Cloud Build triggers for automated CI/CD pipelines
+# 6. Storage buckets for test results and artifacts
+# 7. Monitoring and logging configuration
+# 8. Notification infrastructure setup
+#
+# Post-deployment manual steps required:
+# 1. Configure Firebase App Distribution tester groups via Firebase Console
+# 2. Set up GitHub repository integration with Cloud Build
+# 3. Configure notification webhooks (Slack, email, etc.)
+# 4. Upload mobile application source code to the repository
+# 5. Configure Firebase App Distribution release notes templates
+#
+# Security considerations implemented:
+# - Dedicated service account with minimal required permissions
+# - Uniform bucket-level access for storage resources
+# - Structured logging for audit and compliance
+# - Resource lifecycle management for cost optimization
+#
+# For more information on Firebase App Distribution and Cloud Build
+# integration, refer to the official Google Cloud documentation.

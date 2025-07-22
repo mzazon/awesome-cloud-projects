@@ -1,0 +1,873 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudFormation template for EKS CloudWatch Container Insights monitoring and alerting.
+  This template sets up comprehensive monitoring for an existing EKS cluster with 
+  CloudWatch Container Insights, SNS alerting, and CloudWatch alarms for cluster health.
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "EKS Cluster Configuration"
+        Parameters:
+          - ClusterName
+          - NodeRole
+      - Label:
+          default: "CloudWatch Configuration" 
+        Parameters:
+          - EnableContainerInsights
+          - EnableControlPlaneLogs
+          - LogRetentionDays
+      - Label:
+          default: "Alerting Configuration"
+        Parameters:
+          - AlertEmail
+          - CPUThreshold
+          - MemoryThreshold
+          - EnableSlackNotifications
+          - SlackWebhookUrl
+      - Label:
+          default: "Tagging"
+        Parameters:
+          - Environment
+          - ProjectName
+          - CostCenter
+    ParameterLabels:
+      ClusterName:
+        default: "EKS Cluster Name"
+      NodeRole:
+        default: "EKS Node Group Role ARN"
+      EnableContainerInsights:
+        default: "Enable Container Insights"
+      EnableControlPlaneLogs:
+        default: "Enable Control Plane Logging"
+      LogRetentionDays:
+        default: "Log Retention Period (Days)"
+      AlertEmail:
+        default: "Alert Email Address"
+      CPUThreshold:
+        default: "CPU Utilization Threshold (%)"
+      MemoryThreshold:
+        default: "Memory Utilization Threshold (%)"
+      EnableSlackNotifications:
+        default: "Enable Slack Notifications"
+      SlackWebhookUrl:
+        default: "Slack Webhook URL"
+      Environment:
+        default: "Environment"
+      ProjectName:
+        default: "Project Name"
+      CostCenter:
+        default: "Cost Center"
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  # EKS Cluster Configuration
+  ClusterName:
+    Type: String
+    Description: Name of the existing EKS cluster to monitor
+    MinLength: 1
+    MaxLength: 100
+    AllowedPattern: ^[a-zA-Z0-9][a-zA-Z0-9\-_]*[a-zA-Z0-9]$
+    ConstraintDescription: Must be a valid EKS cluster name
+
+  NodeRole:
+    Type: String
+    Description: ARN of the IAM role used by EKS worker nodes
+    AllowedPattern: ^arn:aws:iam::[0-9]{12}:role/.*
+    ConstraintDescription: Must be a valid IAM role ARN
+
+  # CloudWatch Configuration
+  EnableContainerInsights:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable CloudWatch Container Insights for the EKS cluster
+
+  EnableControlPlaneLogs:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable EKS control plane logging
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: Number of days to retain CloudWatch logs
+
+  # Alerting Configuration
+  AlertEmail:
+    Type: String
+    Description: Email address to receive monitoring alerts
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address
+
+  CPUThreshold:
+    Type: Number
+    Default: 80
+    MinValue: 1
+    MaxValue: 100
+    Description: CPU utilization threshold percentage for alerts
+
+  MemoryThreshold:
+    Type: Number
+    Default: 85
+    MinValue: 1
+    MaxValue: 100
+    Description: Memory utilization threshold percentage for alerts
+
+  EnableSlackNotifications:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable Slack webhook notifications
+
+  SlackWebhookUrl:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: Slack webhook URL for notifications (optional)
+
+  # Tagging
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'test', 'staging', 'prod']
+    Description: Environment name for resource tagging
+
+  ProjectName:
+    Type: String
+    Default: 'eks-monitoring'
+    Description: Project name for resource tagging
+
+  CostCenter:
+    Type: String
+    Default: ''
+    Description: Cost center for resource tagging (optional)
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  EnableContainerInsightsCondition: !Equals [!Ref EnableContainerInsights, 'true']
+  EnableControlPlaneLogsCondition: !Equals [!Ref EnableControlPlaneLogs, 'true']
+  EnableSlackCondition: !Equals [!Ref EnableSlackNotifications, 'true']
+  HasCostCenter: !Not [!Equals [!Ref CostCenter, '']]
+  HasSlackWebhook: !Not [!Equals [!Ref SlackWebhookUrl, '']]
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # SNS Topic for Monitoring Alerts
+  MonitoringTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ClusterName}-monitoring-alerts'
+      DisplayName: !Sub 'EKS ${ClusterName} Monitoring Alerts'
+      KmsMasterKeyId: 'alias/aws/sns'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-monitoring-alerts'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: EKS-Monitoring
+        - !If
+          - HasCostCenter
+          - Key: CostCenter
+            Value: !Ref CostCenter
+          - !Ref AWS::NoValue
+
+  # Email Subscription for SNS Topic
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref MonitoringTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # Slack Lambda Function for Webhook Notifications
+  SlackNotificationFunction:
+    Type: AWS::Lambda::Function
+    Condition: EnableSlackCondition
+    Properties:
+      FunctionName: !Sub '${ClusterName}-slack-notifications'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt SlackLambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          SLACK_WEBHOOK_URL: !Ref SlackWebhookUrl
+          CLUSTER_NAME: !Ref ClusterName
+      Code:
+        ZipFile: |
+          import json
+          import urllib3
+          import os
+          
+          def lambda_handler(event, context):
+              webhook_url = os.environ.get('SLACK_WEBHOOK_URL')
+              cluster_name = os.environ.get('CLUSTER_NAME')
+              
+              if not webhook_url:
+                  print("No Slack webhook URL configured")
+                  return {'statusCode': 200}
+              
+              try:
+                  # Parse SNS message
+                  message = json.loads(event['Records'][0]['Sns']['Message'])
+                  alarm_name = message.get('AlarmName', 'Unknown Alarm')
+                  new_state = message.get('NewStateValue', 'Unknown')
+                  reason = message.get('NewStateReason', 'No reason provided')
+                  
+                  # Determine color based on alarm state
+                  color_map = {
+                      'ALARM': '#FF0000',      # Red
+                      'OK': '#00FF00',         # Green
+                      'INSUFFICIENT_DATA': '#FFA500'  # Orange
+                  }
+                  color = color_map.get(new_state, '#808080')
+                  
+                  # Create Slack message
+                  slack_message = {
+                      "attachments": [
+                          {
+                              "color": color,
+                              "title": f"EKS Cluster Alert: {cluster_name}",
+                              "fields": [
+                                  {
+                                      "title": "Alarm",
+                                      "value": alarm_name,
+                                      "short": True
+                                  },
+                                  {
+                                      "title": "State",
+                                      "value": new_state,
+                                      "short": True
+                                  },
+                                  {
+                                      "title": "Reason",
+                                      "value": reason,
+                                      "short": False
+                                  }
+                              ],
+                              "footer": "AWS CloudWatch",
+                              "ts": message.get('StateChangeTime', '')
+                          }
+                      ]
+                  }
+                  
+                  # Send to Slack
+                  http = urllib3.PoolManager()
+                  response = http.request(
+                      'POST',
+                      webhook_url,
+                      body=json.dumps(slack_message),
+                      headers={'Content-Type': 'application/json'}
+                  )
+                  
+                  print(f"Slack notification sent: {response.status}")
+                  return {'statusCode': 200}
+                  
+              except Exception as e:
+                  print(f"Error sending Slack notification: {str(e)}")
+                  return {'statusCode': 500}
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-slack-notifications'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # IAM Role for Slack Lambda Function
+  SlackLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: EnableSlackCondition
+    Properties:
+      RoleName: !Sub '${ClusterName}-slack-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-slack-lambda-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # SNS Subscription for Slack Lambda
+  SlackSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: EnableSlackCondition
+    Properties:
+      TopicArn: !Ref MonitoringTopic
+      Protocol: lambda
+      Endpoint: !GetAtt SlackNotificationFunction.Arn
+
+  # Lambda Permission for SNS
+  SlackLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableSlackCondition
+    Properties:
+      FunctionName: !Ref SlackNotificationFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref MonitoringTopic
+
+  # IAM Role for CloudWatch Agent
+  CloudWatchAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-cloudwatch-agent-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/${ClusterOIDCProvider}'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                !Sub '${ClusterOIDCProvider}:sub': 'system:serviceaccount:amazon-cloudwatch:cloudwatch-agent'
+                !Sub '${ClusterOIDCProvider}:aud': 'sts.amazonaws.com'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-cloudwatch-agent-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Custom Resource to get EKS OIDC Provider
+  ClusterOIDCProvider:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt OIDCProviderFunction.Arn
+      ClusterName: !Ref ClusterName
+
+  # Lambda Function to Get OIDC Provider
+  OIDCProviderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ClusterName}-oidc-provider-lookup'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt OIDCProviderLambdaRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+          
+          def lambda_handler(event, context):
+              try:
+                  cluster_name = event['ResourceProperties']['ClusterName']
+                  eks_client = boto3.client('eks')
+                  
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  # Get cluster information
+                  response = eks_client.describe_cluster(name=cluster_name)
+                  cluster = response['cluster']
+                  
+                  # Extract OIDC issuer URL and get provider ID
+                  oidc_issuer = cluster['identity']['oidc']['issuer']
+                  # Remove https:// prefix to get the provider ID
+                  provider_id = oidc_issuer.replace('https://', '')
+                  
+                  response_data = {
+                      'OIDCProvider': provider_id,
+                      'OIDCIssuer': oidc_issuer
+                  }
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  # IAM Role for OIDC Provider Lambda
+  OIDCProviderLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-oidc-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EKSDescribeCluster
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - eks:DescribeCluster
+                Resource: !Sub 'arn:aws:eks:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}'
+
+  # CloudWatch Log Groups for Container Insights
+  ApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableContainerInsightsCondition
+    Properties:
+      LogGroupName: !Sub '/aws/containerinsights/${ClusterName}/application'
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !Ref LogGroupKMSKey
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-application-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  DataplaneLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableContainerInsightsCondition
+    Properties:
+      LogGroupName: !Sub '/aws/containerinsights/${ClusterName}/dataplane'
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !Ref LogGroupKMSKey
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-dataplane-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  HostLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableContainerInsightsCondition
+    Properties:
+      LogGroupName: !Sub '/aws/containerinsights/${ClusterName}/host'
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !Ref LogGroupKMSKey
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-host-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PerformanceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableContainerInsightsCondition
+    Properties:
+      LogGroupName: !Sub '/aws/containerinsights/${ClusterName}/performance'
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !Ref LogGroupKMSKey
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-performance-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # KMS Key for Log Group Encryption
+  LogGroupKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'KMS key for EKS ${ClusterName} CloudWatch log encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                'kms:EncryptionContext:aws:logs:arn': 
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/containerinsights/${ClusterName}/application'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/containerinsights/${ClusterName}/dataplane'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/containerinsights/${ClusterName}/host'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/containerinsights/${ClusterName}/performance'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-logs-kms-key'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # KMS Key Alias
+  LogGroupKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ClusterName}-logs-encryption'
+      TargetKeyId: !Ref LogGroupKMSKey
+
+  # CloudWatch Alarms
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'EKS-${ClusterName}-HighCPU'
+      AlarmDescription: !Sub 'High CPU utilization detected in EKS cluster ${ClusterName}'
+      MetricName: node_cpu_utilization
+      Namespace: ContainerInsights
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref CPUThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      ActionsEnabled: true
+      AlarmActions:
+        - !Ref MonitoringTopic
+      OKActions:
+        - !Ref MonitoringTopic
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ClusterName
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-high-cpu-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  HighMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'EKS-${ClusterName}-HighMemory'
+      AlarmDescription: !Sub 'High memory utilization detected in EKS cluster ${ClusterName}'
+      MetricName: node_memory_utilization
+      Namespace: ContainerInsights
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref MemoryThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      ActionsEnabled: true
+      AlarmActions:
+        - !Ref MonitoringTopic
+      OKActions:
+        - !Ref MonitoringTopic
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ClusterName
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-high-memory-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  FailedPodsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'EKS-${ClusterName}-FailedPods'
+      AlarmDescription: !Sub 'Failed pods detected in EKS cluster ${ClusterName}'
+      MetricName: cluster_failed_node_count
+      Namespace: ContainerInsights
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      ActionsEnabled: true
+      AlarmActions:
+        - !Ref MonitoringTopic
+      OKActions:
+        - !Ref MonitoringTopic
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ClusterName
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-failed-pods-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudWatch Dashboard
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'EKS-${ClusterName}-Monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "ContainerInsights", "node_cpu_utilization", "ClusterName", "${ClusterName}" ],
+                  [ ".", "node_memory_utilization", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Node Resource Utilization",
+                "period": 300,
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 100
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "ContainerInsights", "pod_cpu_utilization", "ClusterName", "${ClusterName}" ],
+                  [ ".", "pod_memory_utilization", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Pod Resource Utilization",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "ContainerInsights", "cluster_node_count", "ClusterName", "${ClusterName}" ],
+                  [ ".", "cluster_failed_node_count", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Cluster Node Status",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "ContainerInsights", "pod_number_of_containers", "ClusterName", "${ClusterName}" ],
+                  [ ".", "pod_number_of_running_containers", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Pod Container Status",
+                "period": 300
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/containerinsights/${ClusterName}/application'\n| fields @timestamp, kubernetes.pod_name, log\n| filter kubernetes.namespace_name != \"kube-system\"\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Application Logs",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  # SNS Topic Information
+  MonitoringTopicArn:
+    Description: ARN of the SNS topic for monitoring alerts
+    Value: !Ref MonitoringTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-MonitoringTopicArn'
+
+  MonitoringTopicName:
+    Description: Name of the SNS topic for monitoring alerts
+    Value: !GetAtt MonitoringTopic.TopicName
+    Export:
+      Name: !Sub '${AWS::StackName}-MonitoringTopicName'
+
+  # CloudWatch Information
+  CloudWatchAgentRoleArn:
+    Description: ARN of the IAM role for CloudWatch agent service account
+    Value: !GetAtt CloudWatchAgentRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchAgentRoleArn'
+
+  DashboardURL:
+    Description: URL to the CloudWatch dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${MonitoringDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  # KMS Key Information
+  LogGroupKMSKeyId:
+    Description: KMS Key ID for log group encryption
+    Value: !Ref LogGroupKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupKMSKeyId'
+
+  LogGroupKMSKeyAlias:
+    Description: KMS Key alias for log group encryption
+    Value: !Ref LogGroupKMSKeyAlias
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupKMSKeyAlias'
+
+  # Alarm Information
+  HighCPUAlarmArn:
+    Description: ARN of the high CPU utilization alarm
+    Value: !GetAtt HighCPUAlarm.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-HighCPUAlarmArn'
+
+  HighMemoryAlarmArn:
+    Description: ARN of the high memory utilization alarm
+    Value: !GetAtt HighMemoryAlarm.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-HighMemoryAlarmArn'
+
+  FailedPodsAlarmArn:
+    Description: ARN of the failed pods alarm
+    Value: !GetAtt FailedPodsAlarm.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FailedPodsAlarmArn'
+
+  # Log Group Information
+  ApplicationLogGroupName:
+    Description: Name of the application log group
+    Value: !Ref ApplicationLogGroup
+    Condition: EnableContainerInsightsCondition
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationLogGroup'
+
+  DataplaneLogGroupName:
+    Description: Name of the dataplane log group
+    Value: !Ref DataplaneLogGroup
+    Condition: EnableContainerInsightsCondition
+    Export:
+      Name: !Sub '${AWS::StackName}-DataplaneLogGroup'
+
+  HostLogGroupName:
+    Description: Name of the host log group
+    Value: !Ref HostLogGroup
+    Condition: EnableContainerInsightsCondition
+    Export:
+      Name: !Sub '${AWS::StackName}-HostLogGroup'
+
+  PerformanceLogGroupName:
+    Description: Name of the performance log group
+    Value: !Ref PerformanceLogGroup
+    Condition: EnableContainerInsightsCondition
+    Export:
+      Name: !Sub '${AWS::StackName}-PerformanceLogGroup'
+
+  # Slack Function Information
+  SlackFunctionArn:
+    Description: ARN of the Slack notification Lambda function
+    Value: !GetAtt SlackNotificationFunction.Arn
+    Condition: EnableSlackCondition
+    Export:
+      Name: !Sub '${AWS::StackName}-SlackFunctionArn'
+
+  # OIDC Provider Information
+  OIDCProviderArn:
+    Description: ARN of the EKS OIDC provider
+    Value: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/${ClusterOIDCProvider}'
+    Export:
+      Name: !Sub '${AWS::StackName}-OIDCProviderArn'
+
+  # Deployment Instructions
+  DeploymentInstructions:
+    Description: Next steps for deploying monitoring components to EKS cluster
+    Value: !Sub |
+      1. Confirm SNS email subscription by checking your email
+      2. Deploy CloudWatch agent using eksctl or kubectl
+      3. Enable Container Insights on your EKS cluster
+      4. Verify metrics are flowing in CloudWatch Console
+      5. Test alerts by generating high CPU/memory load
+      6. Access dashboard: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${MonitoringDashboard}

@@ -1,0 +1,896 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Infrastructure as Code for implementing Model Monitoring and Drift Detection 
+  with Amazon SageMaker Model Monitor. This template creates a complete MLOps 
+  monitoring pipeline including SageMaker endpoint with data capture, monitoring 
+  schedules, CloudWatch alarms, SNS notifications, and Lambda-based automated 
+  response system.
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: model-monitor
+    Description: >
+      Project name used as prefix for all resources. Must be lowercase and 
+      contain only letters, numbers, and hyphens.
+    AllowedPattern: '^[a-z0-9\-]+$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    MinLength: 3
+    MaxLength: 20
+
+  ModelName:
+    Type: String
+    Default: demo-sklearn-model
+    Description: Name for the SageMaker model
+    AllowedPattern: '^[a-zA-Z0-9\-]+$'
+    ConstraintDescription: Must contain only letters, numbers, and hyphens
+    MinLength: 1
+    MaxLength: 63
+
+  EndpointInstanceType:
+    Type: String
+    Default: ml.t2.medium
+    Description: Instance type for the SageMaker endpoint
+    AllowedValues:
+      - ml.t2.medium
+      - ml.t2.large
+      - ml.t2.xlarge
+      - ml.m5.large
+      - ml.m5.xlarge
+      - ml.m5.2xlarge
+      - ml.c5.large
+      - ml.c5.xlarge
+      - ml.c5.2xlarge
+
+  MonitoringInstanceType:
+    Type: String
+    Default: ml.m5.xlarge
+    Description: Instance type for monitoring jobs
+    AllowedValues:
+      - ml.m5.large
+      - ml.m5.xlarge
+      - ml.m5.2xlarge
+      - ml.m5.4xlarge
+      - ml.c5.xlarge
+      - ml.c5.2xlarge
+      - ml.c5.4xlarge
+
+  AlertEmail:
+    Type: String
+    Description: Email address to receive monitoring alerts
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+
+  DataQualityScheduleExpression:
+    Type: String
+    Default: cron(0 * * * ? *)
+    Description: >
+      Cron expression for data quality monitoring schedule (default: hourly).
+      Format: cron(minutes hours day-of-month month day-of-week year)
+    AllowedPattern: '^cron\(.*\)$'
+    ConstraintDescription: Must be a valid cron expression
+
+  ModelQualityScheduleExpression:
+    Type: String
+    Default: cron(0 6 * * ? *)
+    Description: >
+      Cron expression for model quality monitoring schedule (default: daily at 6 AM).
+      Format: cron(minutes hours day-of-month month day-of-week year)
+    AllowedPattern: '^cron\(.*\)$'
+    ConstraintDescription: Must be a valid cron expression
+
+  EnableDataCapture:
+    Type: String
+    Default: 'true'
+    Description: Enable data capture for the SageMaker endpoint
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  DataCaptureSamplingPercentage:
+    Type: Number
+    Default: 100
+    Description: Percentage of requests to capture (1-100)
+    MinValue: 1
+    MaxValue: 100
+
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment name (dev, staging, prod)
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  IsProductionEnvironment: !Equals [!Ref Environment, prod]
+  EnableDataCaptureCondition: !Equals [!Ref EnableDataCapture, 'true']
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # -------------------------------------------------------------------------
+  # S3 BUCKET FOR MODEL MONITOR ARTIFACTS
+  # -------------------------------------------------------------------------
+  ModelMonitorBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-model-monitor-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: TransitionToIA
+            Status: Enabled
+            TransitionInDays: 30
+            StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            TransitionInDays: 90
+            StorageClass: GLACIER
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref ModelMonitorLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-model-monitor-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Model monitoring artifacts storage'
+
+  # -------------------------------------------------------------------------
+  # IAM ROLES AND POLICIES
+  # -------------------------------------------------------------------------
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-sagemaker-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      Policies:
+        - PolicyName: ModelMonitorS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${ModelMonitorBucket}/*'
+                  - !GetAtt ModelMonitorBucket.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-sagemaker-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ModelMonitorLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref MonitoringAlertsTopic
+              - Effect: Allow
+                Action:
+                  - sagemaker:DescribeMonitoringSchedule
+                  - sagemaker:DescribeProcessingJob
+                  - sagemaker:ListMonitoringExecutions
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -------------------------------------------------------------------------
+  # CLOUDWATCH LOG GROUP
+  # -------------------------------------------------------------------------
+  ModelMonitorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/sagemaker/model-monitor/${ProjectName}'
+      RetentionInDays: !If [IsProductionEnvironment, 90, 30]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-model-monitor-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-model-monitor-handler'
+      RetentionInDays: !If [IsProductionEnvironment, 30, 14]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -------------------------------------------------------------------------
+  # SAGEMAKER MODEL
+  # -------------------------------------------------------------------------
+  SageMakerModel:
+    Type: AWS::SageMaker::Model
+    Properties:
+      ModelName: !Sub '${ProjectName}-${ModelName}'
+      ExecutionRoleArn: !GetAtt SageMakerExecutionRole.Arn
+      PrimaryContainer:
+        Image: !Sub '763104351884.dkr.ecr.${AWS::Region}.amazonaws.com/sklearn-inference:0.23-1-cpu-py3'
+        ModelDataUrl: !Sub '${ModelMonitorBucket}/model-artifacts/model.tar.gz'
+        Environment:
+          SAGEMAKER_PROGRAM: inference.py
+          SAGEMAKER_SUBMIT_DIRECTORY: /opt/ml/code
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${ModelName}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Demo model for monitoring'
+
+  # -------------------------------------------------------------------------
+  # SAGEMAKER ENDPOINT CONFIGURATION
+  # -------------------------------------------------------------------------
+  SageMakerEndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    Properties:
+      EndpointConfigName: !Sub '${ProjectName}-endpoint-config'
+      ProductionVariants:
+        - VariantName: Primary
+          ModelName: !GetAtt SageMakerModel.ModelName
+          InitialInstanceCount: 1
+          InstanceType: !Ref EndpointInstanceType
+          InitialVariantWeight: 1.0
+      DataCaptureConfig: !If
+        - EnableDataCaptureCondition
+        - EnableCapture: true
+          InitialSamplingPercentage: !Ref DataCaptureSamplingPercentage
+          DestinationS3Uri: !Sub '${ModelMonitorBucket}/captured-data'
+          CaptureOptions:
+            - CaptureMode: Input
+            - CaptureMode: Output
+          CaptureContentTypeHeader:
+            JsonContentTypes:
+              - 'application/json'
+            CsvContentTypes:
+              - 'text/csv'
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-endpoint-config'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -------------------------------------------------------------------------
+  # SAGEMAKER ENDPOINT
+  # -------------------------------------------------------------------------
+  SageMakerEndpoint:
+    Type: AWS::SageMaker::Endpoint
+    Properties:
+      EndpointName: !Sub '${ProjectName}-endpoint'
+      EndpointConfigName: !GetAtt SageMakerEndpointConfig.EndpointConfigName
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-endpoint'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Model endpoint with data capture for monitoring'
+
+  # -------------------------------------------------------------------------
+  # SNS TOPIC FOR ALERTS
+  # -------------------------------------------------------------------------
+  MonitoringAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-model-monitor-alerts'
+      DisplayName: !Sub '${ProjectName} Model Monitor Alerts'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-model-monitor-alerts'
+        - Key: Environment
+          Value: !Ref Environment
+
+  MonitoringAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref MonitoringAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # -------------------------------------------------------------------------
+  # LAMBDA FUNCTION FOR AUTOMATED RESPONSE
+  # -------------------------------------------------------------------------
+  ModelMonitorLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-model-monitor-handler'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref MonitoringAlertsTopic
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from datetime import datetime
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              """
+              Lambda function to handle Model Monitor alerts and trigger automated responses
+              """
+              try:
+                  sns = boto3.client('sns')
+                  sagemaker = boto3.client('sagemaker')
+                  
+                  # Parse the CloudWatch alarm from SNS
+                  message = json.loads(event['Records'][0]['Sns']['Message'])
+                  
+                  alarm_name = message.get('AlarmName', 'Unknown')
+                  alarm_description = message.get('AlarmDescription', 'No description')
+                  new_state = message.get('NewStateValue', 'Unknown')
+                  timestamp = message.get('StateChangeTime', datetime.utcnow().isoformat())
+                  
+                  logger.info(f"Processing alarm: {alarm_name} - State: {new_state}")
+                  
+                  # Check if this is a model drift alarm
+                  if new_state == 'ALARM' and 'ModelMonitor' in alarm_name:
+                      logger.warning(f"Model drift detected: {alarm_description}")
+                      
+                      # Send detailed notification
+                      notification_message = f"""
+          Model Monitor Alert - Action Required
+          
+          Timestamp: {timestamp}
+          Alarm: {alarm_name}
+          Status: {new_state}
+          Description: {alarm_description}
+          Environment: {os.environ.get('ENVIRONMENT', 'Unknown')}
+          Project: {os.environ.get('PROJECT_NAME', 'Unknown')}
+          
+          Recommended Actions:
+          1. Review monitoring results in S3 bucket
+          2. Analyze drift patterns and root cause
+          3. Consider model retraining if drift is significant
+          4. Update baseline if data distribution has legitimately changed
+          5. Check data quality issues in upstream systems
+          
+          AWS Console Links:
+          - SageMaker Model Monitor: https://console.aws.amazon.com/sagemaker/home#{os.environ.get('AWS_REGION', 'us-east-1')}#/model-monitor
+          - CloudWatch Alarms: https://console.aws.amazon.com/cloudwatch/home#{os.environ.get('AWS_REGION', 'us-east-1')}#alarmsV2:
+          """
+                      
+                      sns.publish(
+                          TopicArn=os.environ['SNS_TOPIC_ARN'],
+                          Subject=f'🚨 Model Monitor Alert - {alarm_name}',
+                          Message=notification_message
+                      )
+                      
+                      # Log additional monitoring details
+                      try:
+                          # Get monitoring schedule details
+                          monitoring_schedules = sagemaker.list_monitoring_schedules(
+                              NameContains=os.environ.get('PROJECT_NAME', '')
+                          )
+                          
+                          for schedule in monitoring_schedules['MonitoringScheduleSummaries']:
+                              schedule_name = schedule['MonitoringScheduleName']
+                              logger.info(f"Monitoring schedule: {schedule_name} - Status: {schedule['MonitoringScheduleStatus']}")
+                              
+                      except Exception as e:
+                          logger.error(f"Error getting monitoring details: {str(e)}")
+                      
+                      # Additional automated actions can be added here:
+                      # - Trigger Step Functions workflow for model retraining
+                      # - Update endpoint traffic routing
+                      # - Create ServiceNow tickets
+                      # - Send Slack notifications
+                      # - Update monitoring dashboards
+                      
+                  elif new_state == 'OK':
+                      logger.info(f"Alarm resolved: {alarm_name}")
+                      sns.publish(
+                          TopicArn=os.environ['SNS_TOPIC_ARN'],
+                          Subject=f'✅ Model Monitor Alert Resolved - {alarm_name}',
+                          Message=f"""
+          Model Monitor Alert Resolved
+          
+          Timestamp: {timestamp}
+          Alarm: {alarm_name}
+          Status: {new_state}
+          Description: {alarm_description}
+          
+          The monitoring alarm has returned to normal state. Continue monitoring for any recurring issues.
+          """
+                      )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Alert processed successfully',
+                          'alarm': alarm_name,
+                          'state': new_state
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing alert: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-model-monitor-handler'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Automated response to model monitoring alerts'
+
+  # SNS permission for Lambda
+  LambdaSNSPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ModelMonitorLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref MonitoringAlertsTopic
+
+  # SNS subscription for Lambda
+  LambdaSNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref MonitoringAlertsTopic
+      Protocol: lambda
+      Endpoint: !GetAtt ModelMonitorLambdaFunction.Arn
+
+  # -------------------------------------------------------------------------
+  # DATA QUALITY MONITORING SCHEDULE
+  # -------------------------------------------------------------------------
+  DataQualityMonitoringSchedule:
+    Type: AWS::SageMaker::MonitoringSchedule
+    Properties:
+      MonitoringScheduleName: !Sub '${ProjectName}-data-quality-schedule'
+      MonitoringScheduleConfig:
+        ScheduleConfig:
+          ScheduleExpression: !Ref DataQualityScheduleExpression
+        MonitoringJobDefinition:
+          MonitoringInputs:
+            - EndpointInput:
+                EndpointName: !GetAtt SageMakerEndpoint.EndpointName
+                LocalPath: /opt/ml/processing/input/endpoint
+                S3InputMode: File
+                S3DataDistributionType: FullyReplicated
+          MonitoringOutputConfig:
+            MonitoringOutputs:
+              - S3Output:
+                  S3Uri: !Sub '${ModelMonitorBucket}/monitoring-results/data-quality'
+                  LocalPath: /opt/ml/processing/output
+                  S3UploadMode: EndOfJob
+          MonitoringResources:
+            ClusterConfig:
+              InstanceType: !Ref MonitoringInstanceType
+              InstanceCount: 1
+              VolumeSizeInGB: 20
+          MonitoringAppSpecification:
+            ImageUri: !Sub '159807026194.dkr.ecr.${AWS::Region}.amazonaws.com/sagemaker-model-monitor-analyzer:latest'
+          BaselineConfig:
+            StatisticsResource:
+              S3Uri: !Sub '${ModelMonitorBucket}/monitoring-results/statistics'
+            ConstraintsResource:
+              S3Uri: !Sub '${ModelMonitorBucket}/monitoring-results/constraints'
+          RoleArn: !GetAtt SageMakerExecutionRole.Arn
+          StoppingCondition:
+            MaxRuntimeInSeconds: 3600
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-data-quality-schedule'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Data quality drift detection'
+
+  # -------------------------------------------------------------------------
+  # MODEL QUALITY MONITORING SCHEDULE
+  # -------------------------------------------------------------------------
+  ModelQualityMonitoringSchedule:
+    Type: AWS::SageMaker::MonitoringSchedule
+    Properties:
+      MonitoringScheduleName: !Sub '${ProjectName}-model-quality-schedule'
+      MonitoringScheduleConfig:
+        ScheduleConfig:
+          ScheduleExpression: !Ref ModelQualityScheduleExpression
+        MonitoringJobDefinition:
+          MonitoringInputs:
+            - EndpointInput:
+                EndpointName: !GetAtt SageMakerEndpoint.EndpointName
+                LocalPath: /opt/ml/processing/input/endpoint
+                S3InputMode: File
+                S3DataDistributionType: FullyReplicated
+          MonitoringOutputConfig:
+            MonitoringOutputs:
+              - S3Output:
+                  S3Uri: !Sub '${ModelMonitorBucket}/monitoring-results/model-quality'
+                  LocalPath: /opt/ml/processing/output
+                  S3UploadMode: EndOfJob
+          MonitoringResources:
+            ClusterConfig:
+              InstanceType: !Ref MonitoringInstanceType
+              InstanceCount: 1
+              VolumeSizeInGB: 20
+          MonitoringAppSpecification:
+            ImageUri: !Sub '159807026194.dkr.ecr.${AWS::Region}.amazonaws.com/sagemaker-model-monitor-analyzer:latest'
+          RoleArn: !GetAtt SageMakerExecutionRole.Arn
+          StoppingCondition:
+            MaxRuntimeInSeconds: 3600
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-model-quality-schedule'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Model quality monitoring'
+
+  # -------------------------------------------------------------------------
+  # CLOUDWATCH ALARMS
+  # -------------------------------------------------------------------------
+  ConstraintViolationsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-ModelMonitor-ConstraintViolations'
+      AlarmDescription: !Sub 'Triggers when ${ProjectName} model monitor detects constraint violations indicating data drift'
+      MetricName: constraint_violations
+      Namespace: AWS/SageMaker/ModelMonitor
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref MonitoringAlertsTopic
+      OKActions:
+        - !Ref MonitoringAlertsTopic
+      Dimensions:
+        - Name: MonitoringSchedule
+          Value: !GetAtt DataQualityMonitoringSchedule.MonitoringScheduleName
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-constraint-violations-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+  MonitoringJobFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-ModelMonitor-JobFailures'
+      AlarmDescription: !Sub 'Triggers when ${ProjectName} model monitoring jobs fail'
+      MetricName: monitoring_job_failures
+      Namespace: AWS/SageMaker/ModelMonitor
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref MonitoringAlertsTopic
+      OKActions:
+        - !Ref MonitoringAlertsTopic
+      Dimensions:
+        - Name: MonitoringSchedule
+          Value: !GetAtt DataQualityMonitoringSchedule.MonitoringScheduleName
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-job-failures-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+  EndpointInvocationsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-Endpoint-LowInvocations'
+      AlarmDescription: !Sub 'Triggers when ${ProjectName} endpoint receives unusually low traffic'
+      MetricName: Invocations
+      Namespace: AWS/SageMaker/Endpoints
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref MonitoringAlertsTopic
+      Dimensions:
+        - Name: EndpointName
+          Value: !GetAtt SageMakerEndpoint.EndpointName
+        - Name: VariantName
+          Value: Primary
+      TreatMissingData: breaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-low-invocations-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -------------------------------------------------------------------------
+  # CLOUDWATCH DASHBOARD
+  # -------------------------------------------------------------------------
+  ModelMonitorDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-ModelMonitor-Dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/SageMaker/ModelMonitor", "constraint_violations", "MonitoringSchedule", "${DataQualityMonitoringSchedule}" ],
+                  [ ".", "monitoring_job_failures", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Model Monitor Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/SageMaker/Endpoints", "Invocations", "EndpointName", "${SageMakerEndpoint}", "VariantName", "Primary" ],
+                  [ ".", "ModelLatency", ".", ".", ".", "." ],
+                  [ ".", "OverheadLatency", ".", ".", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Endpoint Performance Metrics"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${ModelMonitorLogGroup}' | fields @timestamp, @message\n| filter @message like /constraint/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Model Monitor Constraint Violations"
+              }
+            }
+          ]
+        }
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  SageMakerEndpointName:
+    Description: Name of the created SageMaker endpoint
+    Value: !GetAtt SageMakerEndpoint.EndpointName
+    Export:
+      Name: !Sub '${AWS::StackName}-EndpointName'
+
+  SageMakerEndpointArn:
+    Description: ARN of the created SageMaker endpoint
+    Value: !Ref SageMakerEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-EndpointArn'
+
+  ModelMonitorBucketName:
+    Description: Name of the S3 bucket containing monitoring artifacts
+    Value: !Ref ModelMonitorBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketName'
+
+  ModelMonitorBucketArn:
+    Description: ARN of the S3 bucket containing monitoring artifacts
+    Value: !GetAtt ModelMonitorBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketArn'
+
+  DataQualityMonitoringScheduleName:
+    Description: Name of the data quality monitoring schedule
+    Value: !GetAtt DataQualityMonitoringSchedule.MonitoringScheduleName
+    Export:
+      Name: !Sub '${AWS::StackName}-DataQualitySchedule'
+
+  ModelQualityMonitoringScheduleName:
+    Description: Name of the model quality monitoring schedule
+    Value: !GetAtt ModelQualityMonitoringSchedule.MonitoringScheduleName
+    Export:
+      Name: !Sub '${AWS::StackName}-ModelQualitySchedule'
+
+  SNSTopicArn:
+    Description: ARN of the SNS topic for monitoring alerts
+    Value: !Ref MonitoringAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function for automated response
+    Value: !GetAtt ModelMonitorLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaArn'
+
+  CloudWatchDashboardURL:
+    Description: URL to the CloudWatch dashboard
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-ModelMonitor-Dashboard'
+
+  SageMakerConsoleURL:
+    Description: URL to SageMaker Model Monitor console
+    Value: !Sub 'https://console.aws.amazon.com/sagemaker/home?region=${AWS::Region}#/model-monitor'
+
+  ModelArtifactsLocation:
+    Description: S3 location for model artifacts
+    Value: !Sub 's3://${ModelMonitorBucket}/model-artifacts/'
+
+  CapturedDataLocation:
+    Description: S3 location for captured endpoint data
+    Value: !Sub 's3://${ModelMonitorBucket}/captured-data/'
+
+  MonitoringResultsLocation:
+    Description: S3 location for monitoring results
+    Value: !Sub 's3://${ModelMonitorBucket}/monitoring-results/'
+
+  BaselineStatisticsLocation:
+    Description: S3 location for baseline statistics
+    Value: !Sub 's3://${ModelMonitorBucket}/monitoring-results/statistics/'
+
+  ConstraintsLocation:
+    Description: S3 location for monitoring constraints
+    Value: !Sub 's3://${ModelMonitorBucket}/monitoring-results/constraints/'
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+          - AlertEmail
+      - Label:
+          default: "Model Configuration"
+        Parameters:
+          - ModelName
+          - EndpointInstanceType
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - MonitoringInstanceType
+          - DataQualityScheduleExpression
+          - ModelQualityScheduleExpression
+      - Label:
+          default: "Data Capture Configuration"
+        Parameters:
+          - EnableDataCapture
+          - DataCaptureSamplingPercentage
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      ModelName:
+        default: "Model Name"
+      EndpointInstanceType:
+        default: "Endpoint Instance Type"
+      MonitoringInstanceType:
+        default: "Monitoring Instance Type"
+      AlertEmail:
+        default: "Alert Email Address"
+      DataQualityScheduleExpression:
+        default: "Data Quality Monitoring Schedule"
+      ModelQualityScheduleExpression:
+        default: "Model Quality Monitoring Schedule"
+      EnableDataCapture:
+        default: "Enable Data Capture"
+      DataCaptureSamplingPercentage:
+        default: "Data Capture Sampling Percentage"
+
+  AWS::CloudFormation::Designer:
+    SageMakerModel:
+      id: a1b2c3d4-e5f6-7890-abcd-ef1234567890
+    SageMakerEndpointConfig:
+      id: b2c3d4e5-f6g7-8901-bcde-f23456789012
+    SageMakerEndpoint:
+      id: c3d4e5f6-g7h8-9012-cdef-345678901234

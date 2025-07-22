@@ -1,0 +1,723 @@
+# Infrastructure Manager Configuration for Multi-Regional API Gateways
+# Recipe: Securing Multi-Regional API Gateways with Apigee and Cloud Armor
+# This configuration deploys a comprehensive API security architecture with
+# Apigee X for API management, Cloud Armor for WAF protection, and Global Load Balancing
+
+apiVersion: config.gcp.crossplane.io/v1beta1
+kind: InfrastructureManager
+metadata:
+  name: multi-regional-api-security
+  labels:
+    recipe: multi-regional-api-gateways-apigee-cloud-armor
+    version: "1.0"
+    
+# Input parameters for customization
+inputs:
+  # Project and region configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    required: true
+  
+  region_us:
+    type: string
+    description: "Primary US region for Apigee deployment"
+    default: "us-central1"
+  
+  region_eu:
+    type: string
+    description: "Primary EU region for Apigee deployment"
+    default: "europe-west1"
+  
+  # Network configuration
+  network_name:
+    type: string
+    description: "VPC network name for Apigee deployment"
+    default: "apigee-network"
+  
+  subnet_us_cidr:
+    type: string
+    description: "CIDR range for US subnet"
+    default: "10.1.0.0/16"
+  
+  subnet_eu_cidr:
+    type: string
+    description: "CIDR range for EU subnet"
+    default: "10.2.0.0/16"
+  
+  # Domain and SSL configuration
+  domain_name:
+    type: string
+    description: "Primary domain name for API gateway"
+    required: true
+  
+  eu_domain_name:
+    type: string
+    description: "EU domain name for API gateway"
+    required: true
+  
+  # Security configuration
+  blocked_regions:
+    type: list
+    description: "List of country codes to block via Cloud Armor"
+    default: ["CN", "RU"]
+  
+  rate_limit_threshold:
+    type: number
+    description: "Rate limiting threshold per minute"
+    default: 100
+  
+  # Resource naming
+  resource_suffix:
+    type: string
+    description: "Suffix for resource names to ensure uniqueness"
+    default: "prod"
+
+# Resources definition
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      parent: projects/${inputs.project_id}
+      body:
+        serviceName: apigee.googleapis.com
+    metadata:
+      dependsOn: []
+  
+  - name: enable-compute-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      parent: projects/${inputs.project_id}
+      body:
+        serviceName: compute.googleapis.com
+    metadata:
+      dependsOn: []
+  
+  - name: enable-servicenetworking-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      parent: projects/${inputs.project_id}
+      body:
+        serviceName: servicenetworking.googleapis.com
+    metadata:
+      dependsOn: []
+
+  # Global VPC Network for multi-regional deployment
+  - name: apigee-vpc-network
+    type: gcp-types/compute-v1:networks
+    properties:
+      project: ${inputs.project_id}
+      name: ${inputs.network_name}
+      description: "Global VPC network for Apigee X multi-regional deployment"
+      autoCreateSubnetworks: false
+      routingConfig:
+        routingMode: GLOBAL
+    metadata:
+      dependsOn:
+        - enable-compute-api
+
+  # US Region Subnet
+  - name: apigee-subnet-us
+    type: gcp-types/compute-v1:subnetworks
+    properties:
+      project: ${inputs.project_id}
+      region: ${inputs.region_us}
+      name: apigee-subnet-us
+      description: "Subnet for Apigee X deployment in US region"
+      network: $(ref.apigee-vpc-network.selfLink)
+      ipCidrRange: ${inputs.subnet_us_cidr}
+      enableFlowLogs: true
+      logConfig:
+        enable: true
+        aggregationInterval: INTERVAL_5_SEC
+        flowSampling: 0.5
+        metadata: INCLUDE_ALL_METADATA
+    metadata:
+      dependsOn:
+        - apigee-vpc-network
+
+  # EU Region Subnet
+  - name: apigee-subnet-eu
+    type: gcp-types/compute-v1:subnetworks
+    properties:
+      project: ${inputs.project_id}
+      region: ${inputs.region_eu}
+      name: apigee-subnet-eu
+      description: "Subnet for Apigee X deployment in EU region"
+      network: $(ref.apigee-vpc-network.selfLink)
+      ipCidrRange: ${inputs.subnet_eu_cidr}
+      enableFlowLogs: true
+      logConfig:
+        enable: true
+        aggregationInterval: INTERVAL_5_SEC
+        flowSampling: 0.5
+        metadata: INCLUDE_ALL_METADATA
+    metadata:
+      dependsOn:
+        - apigee-vpc-network
+
+  # Service Networking Connection for Apigee private service access
+  - name: apigee-service-networking
+    type: gcp-types/servicenetworking-v1:projects.global.networks.connections
+    properties:
+      parent: projects/${inputs.project_id}/global/networks/${inputs.network_name}
+      body:
+        network: $(ref.apigee-vpc-network.selfLink)
+        reservedPeeringRanges:
+          - apigee-peering-range
+        service: servicenetworking.googleapis.com
+    metadata:
+      dependsOn:
+        - apigee-vpc-network
+        - enable-servicenetworking-api
+
+  # Reserved IP range for service networking
+  - name: apigee-peering-range
+    type: gcp-types/compute-v1:globalAddresses
+    properties:
+      project: ${inputs.project_id}
+      name: apigee-peering-range
+      description: "Reserved IP range for Apigee service networking"
+      purpose: VPC_PEERING
+      addressType: INTERNAL
+      prefixLength: 16
+      network: $(ref.apigee-vpc-network.selfLink)
+    metadata:
+      dependsOn:
+        - apigee-vpc-network
+
+  # Apigee Organization
+  - name: apigee-organization
+    type: gcp-types/apigee-v1:projects.organizations
+    properties:
+      parent: projects/${inputs.project_id}
+      body:
+        name: ${inputs.project_id}
+        displayName: "Multi-Regional API Security Organization"
+        description: "Apigee X organization for secure multi-regional API management"
+        runtimeType: CLOUD
+        billingType: PAYG
+        authorizedNetwork: $(ref.apigee-vpc-network.selfLink)
+        runtimeDatabaseEncryptionKeyName: ""
+        analyticsRegion: ${inputs.region_us}
+        properties:
+          property:
+            - name: "features.hybrid.enabled"
+              value: "false"
+            - name: "features.analytics.enabled"
+              value: "true"
+    metadata:
+      dependsOn:
+        - apigee-vpc-network
+        - enable-apis
+        - apigee-service-networking
+
+  # Apigee Instance - US Region
+  - name: apigee-instance-us
+    type: gcp-types/apigee-v1:projects.organizations.instances
+    properties:
+      parent: $(ref.apigee-organization.name)
+      body:
+        name: us-instance
+        displayName: "US Multi-Regional Instance"
+        description: "Apigee X instance for US region deployment"
+        location: ${inputs.region_us}
+        diskEncryptionKeyName: ""
+        peeringCidrRange: SLASH_16
+        ipRange: ${inputs.subnet_us_cidr}
+    metadata:
+      dependsOn:
+        - apigee-organization
+        - apigee-subnet-us
+
+  # Apigee Instance - EU Region
+  - name: apigee-instance-eu
+    type: gcp-types/apigee-v1:projects.organizations.instances
+    properties:
+      parent: $(ref.apigee-organization.name)
+      body:
+        name: eu-instance
+        displayName: "EU Multi-Regional Instance"
+        description: "Apigee X instance for EU region deployment"
+        location: ${inputs.region_eu}
+        diskEncryptionKeyName: ""
+        peeringCidrRange: SLASH_16
+        ipRange: ${inputs.subnet_eu_cidr}
+    metadata:
+      dependsOn:
+        - apigee-organization
+        - apigee-subnet-eu
+
+  # Apigee Environment Groups
+  - name: apigee-envgroup-us
+    type: gcp-types/apigee-v1:projects.organizations.envgroups
+    properties:
+      parent: $(ref.apigee-organization.name)
+      body:
+        name: prod-us
+        displayName: "Production US Environment Group"
+        hostnames:
+          - ${inputs.domain_name}
+        createdAt: ""
+        lastModifiedAt: ""
+        state: ACTIVE
+    metadata:
+      dependsOn:
+        - apigee-organization
+
+  - name: apigee-envgroup-eu
+    type: gcp-types/apigee-v1:projects.organizations.envgroups
+    properties:
+      parent: $(ref.apigee-organization.name)
+      body:
+        name: prod-eu
+        displayName: "Production EU Environment Group"
+        hostnames:
+          - ${inputs.eu_domain_name}
+        createdAt: ""
+        lastModifiedAt: ""
+        state: ACTIVE
+    metadata:
+      dependsOn:
+        - apigee-organization
+
+  # Apigee Environments
+  - name: apigee-environment-us
+    type: gcp-types/apigee-v1:projects.organizations.environments
+    properties:
+      parent: $(ref.apigee-organization.name)
+      body:
+        name: production-us
+        displayName: "Production US Environment"
+        description: "Production environment for US region API deployment"
+        type: INTERMEDIATE
+        properties:
+          property:
+            - name: "features.analytics.enabled"
+              value: "true"
+            - name: "features.runtime.enabled"
+              value: "true"
+    metadata:
+      dependsOn:
+        - apigee-organization
+
+  - name: apigee-environment-eu
+    type: gcp-types/apigee-v1:projects.organizations.environments
+    properties:
+      parent: $(ref.apigee-organization.name)
+      body:
+        name: production-eu
+        displayName: "Production EU Environment"
+        description: "Production environment for EU region API deployment"
+        type: INTERMEDIATE
+        properties:
+          property:
+            - name: "features.analytics.enabled"
+              value: "true"
+            - name: "features.runtime.enabled"
+              value: "true"
+    metadata:
+      dependsOn:
+        - apigee-organization
+
+  # Attach environments to instances
+  - name: apigee-attachment-us
+    type: gcp-types/apigee-v1:projects.organizations.instances.attachments
+    properties:
+      parent: $(ref.apigee-instance-us.name)
+      body:
+        environment: $(ref.apigee-environment-us.name)
+        createdAt: ""
+        name: us-attachment
+    metadata:
+      dependsOn:
+        - apigee-instance-us
+        - apigee-environment-us
+
+  - name: apigee-attachment-eu
+    type: gcp-types/apigee-v1:projects.organizations.instances.attachments
+    properties:
+      parent: $(ref.apigee-instance-eu.name)
+      body:
+        environment: $(ref.apigee-environment-eu.name)
+        createdAt: ""
+        name: eu-attachment
+    metadata:
+      dependsOn:
+        - apigee-instance-eu
+        - apigee-environment-eu
+
+  # Cloud Armor Security Policy
+  - name: api-security-policy
+    type: gcp-types/compute-v1:securityPolicies
+    properties:
+      project: ${inputs.project_id}
+      name: api-security-policy-${inputs.resource_suffix}
+      description: "Comprehensive API security policy with DDoS and WAF protection"
+      type: CLOUD_ARMOR
+      adaptiveProtectionConfig:
+        layer7DdosDefenseConfig:
+          enable: true
+          ruleVisibility: STANDARD
+      advancedOptionsConfig:
+        logLevel: VERBOSE
+        jsonParsing: STANDARD
+        jsonCustomConfig:
+          contentTypes:
+            - application/json
+            - application/x-www-form-urlencoded
+      rules:
+        # Default rule - allow traffic
+        - priority: 2147483647
+          action: allow
+          description: "Default allow rule"
+          match:
+            versionedExpr: SRC_IPS_V1
+            config:
+              srcIpRanges:
+                - "*"
+        
+        # Geographic blocking rule
+        - priority: 1000
+          action: deny(403)
+          description: "Block traffic from high-risk regions"
+          match:
+            expr:
+              expression: >
+                origin.region_code == 'CN' || origin.region_code == 'RU'
+        
+        # Rate limiting rule for DDoS protection
+        - priority: 2000
+          action: rate_based_ban
+          rateLimitOptions:
+            rateLimitThreshold:
+              count: ${inputs.rate_limit_threshold}
+              intervalSec: 60
+            banDurationSec: 600
+            banThreshold:
+              count: ${inputs.rate_limit_threshold}
+              intervalSec: 60
+            conformAction: allow
+            exceedAction: deny(429)
+            enforceOnKeyName: ""
+            exceedRedirectOptions: {}
+          description: "Rate limiting for DDoS protection"
+          match:
+            versionedExpr: SRC_IPS_V1
+            config:
+              srcIpRanges:
+                - "*"
+        
+        # SQL Injection protection
+        - priority: 3000
+          action: deny(403)
+          description: "Block SQL injection attacks"
+          match:
+            expr:
+              expression: "evaluatePreconfiguredExpr('sqli-stable')"
+        
+        # XSS protection
+        - priority: 4000
+          action: deny(403)
+          description: "Block cross-site scripting attacks"
+          match:
+            expr:
+              expression: "evaluatePreconfiguredExpr('xss-stable')"
+        
+        # Local File Inclusion protection
+        - priority: 5000
+          action: deny(403)
+          description: "Block local file inclusion attacks"
+          match:
+            expr:
+              expression: "evaluatePreconfiguredExpr('lfi-stable')"
+        
+        # Bot protection
+        - priority: 6000
+          action: deny(403)
+          description: "Block known malicious user agents"
+          match:
+            expr:
+              expression: >
+                request.headers['user-agent'].contains('BadBot') ||
+                request.headers['user-agent'].contains('Wget') ||
+                request.headers['user-agent'].contains('curl')
+    metadata:
+      dependsOn:
+        - enable-compute-api
+
+  # Global static IP address for load balancer
+  - name: global-api-ip
+    type: gcp-types/compute-v1:globalAddresses
+    properties:
+      project: ${inputs.project_id}
+      name: global-api-lb-ip-${inputs.resource_suffix}
+      description: "Global static IP for API load balancer"
+      addressType: EXTERNAL
+      ipVersion: IPV4
+    metadata:
+      dependsOn:
+        - enable-compute-api
+
+  # Health check for backend services
+  - name: api-health-check
+    type: gcp-types/compute-v1:healthChecks
+    properties:
+      project: ${inputs.project_id}
+      name: api-health-check-${inputs.resource_suffix}
+      description: "Health check for Apigee backend services"
+      type: HTTPS
+      httpsHealthCheck:
+        port: 443
+        portName: https
+        requestPath: /healthz
+        proxyHeader: NONE
+        response: "OK"
+      checkIntervalSec: 10
+      timeoutSec: 5
+      healthyThreshold: 2
+      unhealthyThreshold: 3
+      logConfig:
+        enable: true
+    metadata:
+      dependsOn:
+        - enable-compute-api
+
+  # Backend service for US region
+  - name: apigee-backend-us
+    type: gcp-types/compute-v1:backendServices
+    properties:
+      project: ${inputs.project_id}
+      name: apigee-backend-us-${inputs.resource_suffix}
+      description: "Backend service for Apigee US region"
+      protocol: HTTPS
+      portName: https
+      timeoutSec: 30
+      healthChecks:
+        - $(ref.api-health-check.selfLink)
+      securityPolicy: $(ref.api-security-policy.selfLink)
+      loadBalancingScheme: EXTERNAL_MANAGED
+      sessionAffinity: CLIENT_IP
+      affinityCookieTtlSec: 3600
+      enableCDN: false
+      logConfig:
+        enable: true
+        sampleRate: 1.0
+      backends:
+        - group: "" # Will be populated with Apigee managed instance group
+          balancingMode: UTILIZATION
+          maxUtilization: 0.8
+          capacityScaler: 1.0
+    metadata:
+      dependsOn:
+        - api-health-check
+        - api-security-policy
+
+  # Backend service for EU region
+  - name: apigee-backend-eu
+    type: gcp-types/compute-v1:backendServices
+    properties:
+      project: ${inputs.project_id}
+      name: apigee-backend-eu-${inputs.resource_suffix}
+      description: "Backend service for Apigee EU region"
+      protocol: HTTPS
+      portName: https
+      timeoutSec: 30
+      healthChecks:
+        - $(ref.api-health-check.selfLink)
+      securityPolicy: $(ref.api-security-policy.selfLink)
+      loadBalancingScheme: EXTERNAL_MANAGED
+      sessionAffinity: CLIENT_IP
+      affinityCookieTtlSec: 3600
+      enableCDN: false
+      logConfig:
+        enable: true
+        sampleRate: 1.0
+      backends:
+        - group: "" # Will be populated with Apigee managed instance group
+          balancingMode: UTILIZATION
+          maxUtilization: 0.8
+          capacityScaler: 1.0
+    metadata:
+      dependsOn:
+        - api-health-check
+        - api-security-policy
+
+  # Managed SSL certificate
+  - name: api-ssl-certificate
+    type: gcp-types/compute-v1:sslCertificates
+    properties:
+      project: ${inputs.project_id}
+      name: api-ssl-cert-${inputs.resource_suffix}
+      description: "Managed SSL certificate for API domains"
+      type: MANAGED
+      managed:
+        domains:
+          - ${inputs.domain_name}
+          - ${inputs.eu_domain_name}
+    metadata:
+      dependsOn:
+        - enable-compute-api
+
+  # URL map for traffic routing
+  - name: api-url-map
+    type: gcp-types/compute-v1:urlMaps
+    properties:
+      project: ${inputs.project_id}
+      name: api-url-map-${inputs.resource_suffix}
+      description: "URL map for multi-regional API routing"
+      defaultService: $(ref.apigee-backend-us.selfLink)
+      hostRules:
+        - hosts:
+            - ${inputs.domain_name}
+          pathMatcher: us-matcher
+        - hosts:
+            - ${inputs.eu_domain_name}
+          pathMatcher: eu-matcher
+      pathMatchers:
+        - name: us-matcher
+          defaultService: $(ref.apigee-backend-us.selfLink)
+          pathRules:
+            - paths:
+                - /api/v1/*
+                - /oauth/*
+                - /health/*
+              service: $(ref.apigee-backend-us.selfLink)
+        - name: eu-matcher
+          defaultService: $(ref.apigee-backend-eu.selfLink)
+          pathRules:
+            - paths:
+                - /api/v1/*
+                - /oauth/*
+                - /health/*
+              service: $(ref.apigee-backend-eu.selfLink)
+    metadata:
+      dependsOn:
+        - apigee-backend-us
+        - apigee-backend-eu
+
+  # Target HTTPS proxy
+  - name: api-target-proxy
+    type: gcp-types/compute-v1:targetHttpsProxies
+    properties:
+      project: ${inputs.project_id}
+      name: api-target-proxy-${inputs.resource_suffix}
+      description: "Target HTTPS proxy for API load balancer"
+      urlMap: $(ref.api-url-map.selfLink)
+      sslCertificates:
+        - $(ref.api-ssl-certificate.selfLink)
+      sslPolicy: ""
+      quicOverride: NONE
+    metadata:
+      dependsOn:
+        - api-url-map
+        - api-ssl-certificate
+
+  # Global forwarding rule
+  - name: api-forwarding-rule
+    type: gcp-types/compute-v1:globalForwardingRules
+    properties:
+      project: ${inputs.project_id}
+      name: api-forwarding-rule-${inputs.resource_suffix}
+      description: "Global forwarding rule for API load balancer"
+      target: $(ref.api-target-proxy.selfLink)
+      portRange: "443-443"
+      IPAddress: $(ref.global-api-ip.selfLink)
+      IPProtocol: TCP
+      loadBalancingScheme: EXTERNAL_MANAGED
+    metadata:
+      dependsOn:
+        - api-target-proxy
+        - global-api-ip
+
+  # Firewall rules for Apigee access
+  - name: apigee-firewall-rule
+    type: gcp-types/compute-v1:firewalls
+    properties:
+      project: ${inputs.project_id}
+      name: apigee-firewall-${inputs.resource_suffix}
+      description: "Firewall rule for Apigee access"
+      network: $(ref.apigee-vpc-network.selfLink)
+      direction: INGRESS
+      priority: 1000
+      sourceRanges:
+        - "0.0.0.0/0"
+      allowed:
+        - IPProtocol: tcp
+          ports:
+            - "443"
+            - "80"
+      targetTags:
+        - apigee-instance
+      logConfig:
+        enable: true
+        metadata: INCLUDE_ALL_METADATA
+    metadata:
+      dependsOn:
+        - apigee-vpc-network
+
+# Outputs for external reference
+outputs:
+  apigee_organization_name:
+    description: "Name of the created Apigee organization"
+    value: $(ref.apigee-organization.name)
+  
+  global_ip_address:
+    description: "Global static IP address for the load balancer"
+    value: $(ref.global-api-ip.address)
+  
+  us_instance_name:
+    description: "Name of the US Apigee instance"
+    value: $(ref.apigee-instance-us.name)
+  
+  eu_instance_name:
+    description: "Name of the EU Apigee instance"
+    value: $(ref.apigee-instance-eu.name)
+  
+  security_policy_name:
+    description: "Name of the Cloud Armor security policy"
+    value: $(ref.api-security-policy.name)
+  
+  ssl_certificate_status:
+    description: "Status of the managed SSL certificate"
+    value: $(ref.api-ssl-certificate.managed.status)
+  
+  network_name:
+    description: "Name of the VPC network"
+    value: $(ref.apigee-vpc-network.name)
+  
+  backend_service_us:
+    description: "Name of the US backend service"
+    value: $(ref.apigee-backend-us.name)
+  
+  backend_service_eu:
+    description: "Name of the EU backend service"
+    value: $(ref.apigee-backend-eu.name)
+
+# Deployment configuration
+options:
+  # Enable deletion protection for critical resources
+  deletionPolicy: retain
+  
+  # Resource creation timeouts
+  createTimeout: 3600s # 1 hour for Apigee provisioning
+  updateTimeout: 1800s # 30 minutes for updates
+  deleteTimeout: 1800s # 30 minutes for cleanup
+  
+  # Retry configuration for transient failures
+  retryConfig:
+    maxRetries: 3
+    initialRetryDelay: 30s
+    maxRetryDelay: 300s
+    retryDelayMultiplier: 2.0
+
+# Tags for resource management
+labels:
+  environment: production
+  component: api-gateway
+  security-level: high
+  compliance: soc2
+  cost-center: platform
+  owner: platform-team
+  recipe: multi-regional-api-gateways-apigee-cloud-armor

@@ -1,0 +1,864 @@
+# Infrastructure Manager Configuration for Code Quality Enforcement Pipeline
+# This configuration deploys a comprehensive code quality enforcement system using
+# Cloud Build Triggers, Binary Authorization, and Security Command Center
+
+# Copyright 2025 Google LLC
+# Licensed under the Apache License, Version 2.0
+
+# Define the blueprint for the Infrastructure Manager deployment
+apiVersion: blueprints.cloud.google.com/v1alpha1
+kind: BlueprintMetadata
+metadata:
+  name: code-quality-enforcement-pipeline
+  annotations:
+    config.kubernetes.io/local-config: "true"
+spec:
+  info:
+    title: Code Quality Enforcement with Cloud Build and Security Command Center
+    source:
+      repo: https://github.com/GoogleCloudPlatform/recipes
+      sourceType: git
+    version: 1.0.0
+    actuationTool:
+      type: "Google Cloud Infrastructure Manager"
+      version: ">= 1.0.0"
+    description:
+      tagline: Automated code quality and security enforcement pipeline
+      detailed: |
+        This Infrastructure Manager configuration creates a comprehensive code quality 
+        enforcement pipeline that integrates Cloud Build Triggers, Binary Authorization,
+        Security Command Center, and Container Analysis to provide automated security
+        scanning, policy enforcement, and compliance monitoring.
+
+        Key Features:
+        - Automated CI/CD pipeline with security scanning
+        - Binary Authorization for deployment policy enforcement
+        - Security Command Center integration for centralized monitoring
+        - Container vulnerability scanning and analysis
+        - Attestation-based security controls
+
+---
+# Main Infrastructure Manager Configuration
+terraform:
+  source:
+    # Use Terraform configurations embedded in this Infrastructure Manager blueprint
+    # This approach allows for comprehensive resource management while leveraging
+    # Infrastructure Manager's deployment orchestration capabilities
+    repo: "."
+    ref: "main"
+
+# Input variables for customizing the deployment
+inputs:
+  # Project and location configuration
+  project_id:
+    description: "Google Cloud Project ID where resources will be created"
+    type: string
+    required: true
+
+  region:
+    description: "Google Cloud region for regional resources"
+    type: string
+    default: "us-central1"
+
+  zone:
+    description: "Google Cloud zone for zonal resources"
+    type: string
+    default: "us-central1-a"
+
+  # Resource naming configuration
+  resource_prefix:
+    description: "Prefix for all created resources to ensure uniqueness"
+    type: string
+    default: "code-quality"
+
+  deployment_name:
+    description: "Name for this deployment instance"
+    type: string
+    default: "enforcement-pipeline"
+
+  # Repository configuration
+  source_repo_name:
+    description: "Name of the Cloud Source Repository to create"
+    type: string
+    default: "secure-application"
+
+  # Build configuration
+  build_trigger_name:
+    description: "Name of the Cloud Build trigger"
+    type: string
+    default: "quality-enforcement-trigger"
+
+  # Security configuration
+  attestor_name:
+    description: "Name of the Binary Authorization attestor"
+    type: string
+    default: "quality-attestor"
+
+  # GKE cluster configuration
+  gke_cluster_name:
+    description: "Name of the GKE cluster for deployment testing"
+    type: string
+    default: "quality-enforcement-cluster"
+
+  gke_node_count:
+    description: "Number of nodes in the GKE cluster"
+    type: number
+    default: 3
+
+  # Security Command Center configuration
+  scc_source_display_name:
+    description: "Display name for the Security Command Center source"
+    type: string
+    default: "Code Quality Enforcement Pipeline"
+
+  # Enable/disable features
+  enable_container_analysis:
+    description: "Enable Container Analysis API for vulnerability scanning"
+    type: bool
+    default: true
+
+  enable_binary_authorization:
+    description: "Enable Binary Authorization for policy enforcement"
+    type: bool
+    default: true
+
+  enable_security_command_center:
+    description: "Enable Security Command Center integration"
+    type: bool
+    default: true
+
+  # Network configuration
+  create_vpc:
+    description: "Create a new VPC for the deployment"
+    type: bool
+    default: true
+
+  vpc_name:
+    description: "Name of the VPC (created or existing)"
+    type: string
+    default: "quality-enforcement-vpc"
+
+  subnet_cidr:
+    description: "CIDR range for the subnet"
+    type: string
+    default: "10.0.0.0/24"
+
+---
+# Terraform configuration embedded within Infrastructure Manager
+# This provides the actual resource definitions using Terraform's rich provider ecosystem
+
+# Configure Terraform and required providers
+terraform {
+  required_version = ">= 1.0"
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+    google-beta = {
+      source  = "hashicorp/google-beta"
+      version = "~> 5.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.4"
+    }
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.9"
+    }
+  }
+}
+
+# Configure the Google Cloud Provider
+provider "google" {
+  project = var.project_id
+  region  = var.region
+  zone    = var.zone
+}
+
+provider "google-beta" {
+  project = var.project_id
+  region  = var.region
+  zone    = var.zone
+}
+
+# Generate random suffix for unique resource naming
+resource "random_id" "suffix" {
+  byte_length = 4
+}
+
+# Local values for consistent naming and configuration
+locals {
+  # Resource naming with unique suffix
+  suffix = random_id.suffix.hex
+  
+  # Service names with consistent prefixes
+  repo_name = "${var.resource_prefix}-${var.source_repo_name}-${local.suffix}"
+  trigger_name = "${var.resource_prefix}-${var.build_trigger_name}-${local.suffix}"
+  attestor_name = "${var.resource_prefix}-${var.attestor_name}-${local.suffix}"
+  cluster_name = "${var.resource_prefix}-${var.gke_cluster_name}-${local.suffix}"
+  service_account_name = "${var.resource_prefix}-build-sa-${local.suffix}"
+  
+  # KMS configuration
+  kms_keyring_name = "${var.resource_prefix}-binauthz-ring-${local.suffix}"
+  kms_key_name = "${var.resource_prefix}-attestor-key-${local.suffix}"
+  
+  # Network configuration
+  vpc_name = var.create_vpc ? "${var.resource_prefix}-${var.vpc_name}-${local.suffix}" : var.vpc_name
+  subnet_name = "${var.resource_prefix}-subnet-${local.suffix}"
+  
+  # Required APIs for the pipeline
+  required_apis = [
+    "cloudbuild.googleapis.com",
+    "sourcerepo.googleapis.com",
+    "binaryauthorization.googleapis.com",
+    "securitycenter.googleapis.com",
+    "container.googleapis.com",
+    "containeranalysis.googleapis.com",
+    "run.googleapis.com",
+    "cloudkms.googleapis.com",
+    "compute.googleapis.com",
+    "artifactregistry.googleapis.com",
+    "monitoring.googleapis.com",
+    "logging.googleapis.com"
+  ]
+  
+  # IAM roles for the build service account
+  build_sa_roles = [
+    "roles/cloudbuild.builds.builder",
+    "roles/binaryauthorization.attestorsEditor",
+    "roles/containeranalysis.notes.editor",
+    "roles/securitycenter.findingsEditor",
+    "roles/source.reader",
+    "roles/storage.admin",
+    "roles/artifactregistry.writer",
+    "roles/cloudkms.cryptoKeyEncrypterDecrypter",
+    "roles/cloudkms.signerVerifier"
+  ]
+
+  # Container image configuration
+  app_image_name = "secure-app"
+  
+  # Binary Authorization policy configuration
+  binauthz_policy = {
+    default_admission_rule = {
+      require_attestations_by = ["projects/${var.project_id}/attestors/${local.attestor_name}"]
+      enforcement_mode = "ENFORCED_BLOCK_AND_AUDIT_LOG"
+    }
+    global_policy_evaluation_mode = "ENABLE"
+    cluster_admission_rules = {
+      "${var.zone}.${local.cluster_name}" = {
+        require_attestations_by = ["projects/${var.project_id}/attestors/${local.attestor_name}"]
+        enforcement_mode = "ENFORCED_BLOCK_AND_AUDIT_LOG"
+      }
+    }
+  }
+}
+
+# Enable required Google Cloud APIs
+resource "google_project_service" "required_apis" {
+  for_each = toset(local.required_apis)
+  
+  project = var.project_id
+  service = each.value
+  
+  # Prevent disabling APIs when destroying
+  disable_dependent_services = false
+  disable_on_destroy = false
+}
+
+# Create VPC network if requested
+resource "google_compute_network" "vpc" {
+  count = var.create_vpc ? 1 : 0
+  
+  name                    = local.vpc_name
+  auto_create_subnetworks = false
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Create subnet for the VPC
+resource "google_compute_subnetwork" "subnet" {
+  count = var.create_vpc ? 1 : 0
+  
+  name          = local.subnet_name
+  network       = google_compute_network.vpc[0].name
+  ip_cidr_range = var.subnet_cidr
+  region        = var.region
+  
+  # Enable private Google access for GKE nodes
+  private_ip_google_access = true
+  
+  # Configure secondary IP ranges for GKE
+  secondary_ip_range {
+    range_name    = "pods"
+    ip_cidr_range = "10.1.0.0/16"
+  }
+  
+  secondary_ip_range {
+    range_name    = "services"
+    ip_cidr_range = "10.2.0.0/16"
+  }
+}
+
+# Create firewall rules for GKE
+resource "google_compute_firewall" "allow_internal" {
+  count = var.create_vpc ? 1 : 0
+  
+  name    = "${local.vpc_name}-allow-internal"
+  network = google_compute_network.vpc[0].name
+  
+  allow {
+    protocol = "tcp"
+    ports    = ["0-65535"]
+  }
+  
+  allow {
+    protocol = "udp"
+    ports    = ["0-65535"]
+  }
+  
+  allow {
+    protocol = "icmp"
+  }
+  
+  source_ranges = [var.subnet_cidr, "10.1.0.0/16", "10.2.0.0/16"]
+}
+
+# Create service account for Cloud Build
+resource "google_service_account" "build_service_account" {
+  account_id   = local.service_account_name
+  display_name = "Cloud Build Service Account for Code Quality Pipeline"
+  description  = "Service account used by Cloud Build for automated security pipeline operations"
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Grant necessary IAM roles to the build service account
+resource "google_project_iam_member" "build_sa_roles" {
+  for_each = toset(local.build_sa_roles)
+  
+  project = var.project_id
+  role    = each.value
+  member  = "serviceAccount:${google_service_account.build_service_account.email}"
+}
+
+# Create Cloud Source Repository
+resource "google_sourcerepo_repository" "repo" {
+  name = local.repo_name
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Create Cloud KMS key ring for Binary Authorization
+resource "google_kms_key_ring" "binauthz_keyring" {
+  count = var.enable_binary_authorization ? 1 : 0
+  
+  name     = local.kms_keyring_name
+  location = "global"
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Create Cloud KMS key for attestation signing
+resource "google_kms_crypto_key" "attestor_key" {
+  count = var.enable_binary_authorization ? 1 : 0
+  
+  name     = local.kms_key_name
+  key_ring = google_kms_key_ring.binauthz_keyring[0].id
+  purpose  = "ASYMMETRIC_SIGN"
+  
+  version_template {
+    algorithm = "RSA_SIGN_PKCS1_4096_SHA512"
+  }
+  
+  # Prevent destruction of crypto keys
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# Create Binary Authorization attestor
+resource "google_binary_authorization_attestor" "attestor" {
+  count = var.enable_binary_authorization ? 1 : 0
+  
+  name = local.attestor_name
+  description = "Attestor for code quality enforcement pipeline"
+  
+  attestation_authority_note {
+    note_reference = google_container_analysis_note.attestor_note[0].name
+    public_keys {
+      id = google_kms_crypto_key.attestor_key[0].id
+      pkix_public_key {
+        public_key_pem      = data.google_kms_crypto_key_version.attestor_key_version[0].public_key[0].pem
+        signature_algorithm = data.google_kms_crypto_key_version.attestor_key_version[0].public_key[0].algorithm
+      }
+    }
+  }
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Get the latest version of the attestor key
+data "google_kms_crypto_key_version" "attestor_key_version" {
+  count = var.enable_binary_authorization ? 1 : 0
+  
+  crypto_key = google_kms_crypto_key.attestor_key[0].id
+}
+
+# Create Container Analysis note for the attestor
+resource "google_container_analysis_note" "attestor_note" {
+  count = var.enable_binary_authorization ? 1 : 0
+  
+  name = local.attestor_name
+  
+  attestation_authority {
+    hint {
+      human_readable_name = "Code Quality Attestor"
+    }
+  }
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Configure Binary Authorization policy
+resource "google_binary_authorization_policy" "policy" {
+  count = var.enable_binary_authorization ? 1 : 0
+  
+  # Default admission rule requiring attestation
+  default_admission_rule {
+    evaluation_mode  = "REQUIRE_ATTESTATION"
+    enforcement_mode = "ENFORCED_BLOCK_AND_AUDIT_LOG"
+    require_attestations_by = [google_binary_authorization_attestor.attestor[0].name]
+  }
+  
+  # Global policy evaluation mode
+  global_policy_evaluation_mode = "ENABLE"
+  
+  # Cluster-specific admission rules
+  dynamic "cluster_admission_rules" {
+    for_each = var.enable_binary_authorization ? [1] : []
+    content {
+      cluster                 = "${var.zone}.${local.cluster_name}"
+      evaluation_mode        = "REQUIRE_ATTESTATION"
+      enforcement_mode       = "ENFORCED_BLOCK_AND_AUDIT_LOG"
+      require_attestations_by = [google_binary_authorization_attestor.attestor[0].name]
+    }
+  }
+  
+  depends_on = [google_container_gke_cluster.primary]
+}
+
+# Create GKE cluster with security features enabled
+resource "google_container_cluster" "primary" {
+  name     = local.cluster_name
+  location = var.zone
+  
+  # Configure network settings
+  network    = var.create_vpc ? google_compute_network.vpc[0].name : "default"
+  subnetwork = var.create_vpc ? google_compute_subnetwork.subnet[0].name : null
+  
+  # Remove default node pool
+  remove_default_node_pool = true
+  initial_node_count       = 1
+  
+  # Enable security features
+  enable_binary_authorization = var.enable_binary_authorization
+  enable_shielded_nodes      = true
+  
+  # Enable network policy
+  network_policy {
+    enabled  = true
+    provider = "CALICO"
+  }
+  
+  # Configure addons
+  addons_config {
+    network_policy_config {
+      disabled = false
+    }
+  }
+  
+  # Configure IP allocation for VPC-native networking
+  dynamic "ip_allocation_policy" {
+    for_each = var.create_vpc ? [1] : []
+    content {
+      cluster_secondary_range_name  = "pods"
+      services_secondary_range_name = "services"
+    }
+  }
+  
+  # Enable workload identity
+  workload_identity_config {
+    workload_pool = "${var.project_id}.svc.id.goog"
+  }
+  
+  # Configure master authorized networks for security
+  master_authorized_networks_config {
+    cidr_blocks {
+      cidr_block   = "0.0.0.0/0"
+      display_name = "All networks"
+    }
+  }
+  
+  # Private cluster configuration
+  private_cluster_config {
+    enable_private_nodes    = true
+    enable_private_endpoint = false
+    master_ipv4_cidr_block  = "172.16.0.0/28"
+  }
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_compute_subnetwork.subnet,
+    google_project_iam_member.build_sa_roles
+  ]
+}
+
+# Create GKE node pool with security configurations
+resource "google_container_node_pool" "primary_nodes" {
+  name       = "${local.cluster_name}-nodes"
+  location   = var.zone
+  cluster    = google_container_cluster.primary.name
+  node_count = var.gke_node_count
+  
+  # Configure node settings
+  node_config {
+    preemptible  = false
+    machine_type = "e2-medium"
+    
+    # Configure service account
+    service_account = google_service_account.build_service_account.email
+    oauth_scopes = [
+      "https://www.googleapis.com/auth/cloud-platform"
+    ]
+    
+    # Enable shielded nodes features
+    shielded_instance_config {
+      enable_secure_boot          = true
+      enable_integrity_monitoring = true
+    }
+    
+    # Configure workload identity
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
+    
+    # Node labels for identification
+    labels = {
+      environment = "code-quality-enforcement"
+      managed-by  = "infrastructure-manager"
+    }
+    
+    # Node tagging for network policies
+    tags = ["gke-${local.cluster_name}-node"]
+  }
+  
+  # Configure node management
+  management {
+    auto_repair  = true
+    auto_upgrade = true
+  }
+  
+  # Configure upgrade settings
+  upgrade_settings {
+    max_surge       = 1
+    max_unavailable = 0
+  }
+}
+
+# Create Cloud Build trigger
+resource "google_cloudbuild_trigger" "quality_trigger" {
+  name        = local.trigger_name
+  description = "Automated code quality enforcement pipeline"
+  
+  # Trigger on Cloud Source Repository
+  trigger_template {
+    branch_name = "main"
+    repo_name   = google_sourcerepo_repository.repo.name
+  }
+  
+  # Build configuration
+  build {
+    # Unit tests step
+    step {
+      name = "python:3.11-slim"
+      entrypoint = "bash"
+      args = [
+        "-c",
+        <<-EOT
+        pip install -r requirements.txt pytest
+        python -m pytest tests/ -v || exit 1
+        EOT
+      ]
+      id = "unit-tests"
+    }
+    
+    # Static code analysis with bandit
+    step {
+      name = "python:3.11-slim"
+      entrypoint = "bash"
+      args = [
+        "-c",
+        <<-EOT
+        pip install bandit[toml]
+        bandit -r app/ -f json -o security/bandit-report.json || true
+        bandit -r app/ --severity-level medium || exit 1
+        EOT
+      ]
+      id = "static-analysis"
+      wait_for = ["unit-tests"]
+    }
+    
+    # Dependency vulnerability scanning
+    step {
+      name = "python:3.11-slim"
+      entrypoint = "bash"
+      args = [
+        "-c",
+        <<-EOT
+        pip install safety
+        safety check --json --output security/safety-report.json || true
+        safety check --short-report || exit 1
+        EOT
+      ]
+      id = "dependency-scan"
+      wait_for = ["static-analysis"]
+    }
+    
+    # Build container image
+    step {
+      name = "gcr.io/cloud-builders/docker"
+      args = ["build", "-t", "gcr.io/$PROJECT_ID/${local.app_image_name}:$BUILD_ID", "."]
+      id = "build-image"
+      wait_for = ["dependency-scan"]
+    }
+    
+    # Push container image
+    step {
+      name = "gcr.io/cloud-builders/docker"
+      args = ["push", "gcr.io/$PROJECT_ID/${local.app_image_name}:$BUILD_ID"]
+      id = "push-image"
+      wait_for = ["build-image"]
+    }
+    
+    # Create Binary Authorization attestation
+    dynamic "step" {
+      for_each = var.enable_binary_authorization ? [1] : []
+      content {
+        name = "gcr.io/cloud-builders/gcloud"
+        entrypoint = "bash"
+        args = [
+          "-c",
+          <<-EOT
+          gcloud container binauthz attestations sign-and-create \
+            --artifact-url=gcr.io/$PROJECT_ID/${local.app_image_name}:$BUILD_ID \
+            --attestor=${local.attestor_name} \
+            --attestor-project=$PROJECT_ID \
+            --keyversion=${google_kms_crypto_key.attestor_key[0].id}/cryptoKeyVersions/1
+          EOT
+        ]
+        id = "create-attestation"
+        wait_for = ["push-image"]
+      }
+    }
+    
+    # Configure substitutions
+    substitutions = {
+      _IMAGE_NAME    = local.app_image_name
+      _ATTESTOR_NAME = local.attestor_name
+    }
+    
+    # Configure logging
+    options {
+      logging = "CLOUD_LOGGING_ONLY"
+    }
+    
+    # Configure images to be stored
+    images = ["gcr.io/$PROJECT_ID/${local.app_image_name}:$BUILD_ID"]
+  }
+  
+  # Use custom service account
+  service_account = google_service_account.build_service_account.id
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_sourcerepo_repository.repo,
+    google_binary_authorization_attestor.attestor
+  ]
+}
+
+# Create Security Command Center notification config
+resource "google_scc_notification_config" "scc_notification" {
+  count = var.enable_security_command_center ? 1 : 0
+  
+  config_id   = "${var.resource_prefix}-quality-notifications-${local.suffix}"
+  organization = data.google_project.current.org_id
+  description = "Notification config for code quality enforcement findings"
+  
+  pubsub_topic = google_pubsub_topic.scc_notifications[0].id
+  
+  streaming_config {
+    filter = "category=\"SECURITY_SCAN_RESULT\" OR category=\"POLICY_VIOLATION\""
+  }
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Create Pub/Sub topic for SCC notifications
+resource "google_pubsub_topic" "scc_notifications" {
+  count = var.enable_security_command_center ? 1 : 0
+  
+  name = "${var.resource_prefix}-scc-notifications-${local.suffix}"
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Get current project information
+data "google_project" "current" {
+  project_id = var.project_id
+}
+
+# Create sample security finding for testing
+resource "google_scc_source" "custom_source" {
+  count = var.enable_security_command_center ? 1 : 0
+  
+  display_name = var.scc_source_display_name
+  organization = data.google_project.current.org_id
+  description  = "Custom source for code quality enforcement pipeline findings"
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Wait for resources to be fully created before completing
+resource "time_sleep" "wait_for_resources" {
+  depends_on = [
+    google_container_cluster.primary,
+    google_container_node_pool.primary_nodes,
+    google_cloudbuild_trigger.quality_trigger,
+    google_binary_authorization_policy.policy,
+    google_scc_source.custom_source
+  ]
+  
+  create_duration = "60s"
+}
+
+# Output important resource information
+output "project_id" {
+  description = "The Google Cloud Project ID"
+  value       = var.project_id
+}
+
+output "region" {
+  description = "The Google Cloud region"
+  value       = var.region
+}
+
+output "zone" {
+  description = "The Google Cloud zone"
+  value       = var.zone
+}
+
+output "source_repository_name" {
+  description = "Name of the created Cloud Source Repository"
+  value       = google_sourcerepo_repository.repo.name
+}
+
+output "source_repository_url" {
+  description = "URL of the created Cloud Source Repository"
+  value       = google_sourcerepo_repository.repo.url
+}
+
+output "cloud_build_trigger_name" {
+  description = "Name of the created Cloud Build trigger"
+  value       = google_cloudbuild_trigger.quality_trigger.name
+}
+
+output "cloud_build_trigger_id" {
+  description = "ID of the created Cloud Build trigger"
+  value       = google_cloudbuild_trigger.quality_trigger.trigger_id
+}
+
+output "gke_cluster_name" {
+  description = "Name of the created GKE cluster"
+  value       = google_container_cluster.primary.name
+}
+
+output "gke_cluster_endpoint" {
+  description = "Endpoint of the created GKE cluster"
+  value       = google_container_cluster.primary.endpoint
+  sensitive   = true
+}
+
+output "gke_cluster_ca_certificate" {
+  description = "CA certificate of the created GKE cluster"
+  value       = google_container_cluster.primary.master_auth.0.cluster_ca_certificate
+  sensitive   = true
+}
+
+output "build_service_account_email" {
+  description = "Email of the Cloud Build service account"
+  value       = google_service_account.build_service_account.email
+}
+
+output "attestor_name" {
+  description = "Name of the Binary Authorization attestor"
+  value       = var.enable_binary_authorization ? google_binary_authorization_attestor.attestor[0].name : null
+}
+
+output "kms_key_id" {
+  description = "ID of the KMS key used for attestation signing"
+  value       = var.enable_binary_authorization ? google_kms_crypto_key.attestor_key[0].id : null
+}
+
+output "scc_source_name" {
+  description = "Name of the Security Command Center source"
+  value       = var.enable_security_command_center ? google_scc_source.custom_source[0].name : null
+}
+
+output "pubsub_topic_name" {
+  description = "Name of the Pub/Sub topic for SCC notifications"
+  value       = var.enable_security_command_center ? google_pubsub_topic.scc_notifications[0].name : null
+}
+
+output "vpc_network_name" {
+  description = "Name of the VPC network"
+  value       = var.create_vpc ? google_compute_network.vpc[0].name : "default"
+}
+
+output "subnet_name" {
+  description = "Name of the subnet"
+  value       = var.create_vpc ? google_compute_subnetwork.subnet[0].name : null
+}
+
+# Deployment instructions and next steps
+output "deployment_instructions" {
+  description = "Instructions for completing the deployment"
+  value = <<-EOT
+    
+    Code Quality Enforcement Pipeline Deployed Successfully!
+    
+    Next Steps:
+    1. Clone the repository: gcloud source repos clone ${google_sourcerepo_repository.repo.name}
+    2. Add application code and cloudbuild.yaml to the repository
+    3. Push code to trigger the automated pipeline
+    4. Monitor builds in Cloud Build console
+    5. View security findings in Security Command Center
+    
+    Key Resources Created:
+    - Cloud Source Repository: ${google_sourcerepo_repository.repo.name}
+    - Cloud Build Trigger: ${google_cloudbuild_trigger.quality_trigger.name}
+    - GKE Cluster: ${google_container_cluster.primary.name}
+    - Build Service Account: ${google_service_account.build_service_account.email}
+    ${var.enable_binary_authorization ? "- Binary Authorization Attestor: ${google_binary_authorization_attestor.attestor[0].name}" : ""}
+    ${var.enable_security_command_center ? "- Security Command Center Source: ${google_scc_source.custom_source[0].display_name}" : ""}
+    
+    Connect to GKE cluster:
+    gcloud container clusters get-credentials ${google_container_cluster.primary.name} --zone ${var.zone}
+    
+    Monitor pipeline:
+    gcloud builds list --ongoing
+    
+  EOT
+}

@@ -1,0 +1,682 @@
+# Infrastructure Manager Configuration for Dynamic Resource Governance
+# This configuration deploys a complete governance system using Cloud Asset Inventory,
+# Policy Simulator, Cloud Functions, and Pub/Sub for automated compliance monitoring
+
+# Terraform configuration for Infrastructure Manager
+terraform:
+  required_version: ">= 1.0"
+  required_providers:
+    google:
+      source: hashicorp/google
+      version: "~> 5.0"
+    google-beta:
+      source: hashicorp/google-beta
+      version: "~> 5.0"
+    archive:
+      source: hashicorp/archive
+      version: "~> 2.4"
+    random:
+      source: hashicorp/random
+      version: "~> 3.6"
+
+# Input variables for customization
+variables:
+  project_id:
+    description: "Google Cloud Project ID for governance system deployment"
+    type: string
+    validation:
+      condition: length(var.project_id) > 0
+      error_message: "Project ID must not be empty."
+  
+  region:
+    description: "Google Cloud region for deploying resources"
+    type: string
+    default: "us-central1"
+    validation:
+      condition: contains(["us-central1", "us-east1", "us-west1", "europe-west1", "asia-east1"], var.region)
+      error_message: "Region must be a valid Google Cloud region."
+  
+  governance_prefix:
+    description: "Prefix for all governance-related resources"
+    type: string
+    default: "governance"
+    validation:
+      condition: can(regex("^[a-z]([a-z0-9-]*[a-z0-9])?$", var.governance_prefix))
+      error_message: "Governance prefix must be lowercase letters, numbers, and hyphens only."
+  
+  environment:
+    description: "Environment name (dev, staging, prod)"
+    type: string
+    default: "dev"
+    validation:
+      condition: contains(["dev", "staging", "prod"], var.environment)
+      error_message: "Environment must be one of: dev, staging, prod."
+  
+  monitoring_project_id:
+    description: "Project ID for monitoring resources (optional, defaults to main project)"
+    type: string
+    default: ""
+  
+  enable_organization_level:
+    description: "Enable organization-level governance (requires organization permissions)"
+    type: bool
+    default: false
+
+# Local values for resource naming and configuration
+locals:
+  # Generate random suffix for unique resource names
+  random_suffix = random_id.governance_suffix.hex
+  
+  # Common resource names with prefix and suffix
+  asset_feed_name = "${var.governance_prefix}-feed-${local.random_suffix}"
+  topic_name = "${var.governance_prefix}-changes-${local.random_suffix}"
+  subscription_name = "${var.governance_prefix}-compliance-${local.random_suffix}"
+  
+  # Cloud Function names
+  function_analyzer = "${var.governance_prefix}-analyzer-${local.random_suffix}"
+  function_validator = "${var.governance_prefix}-validator-${local.random_suffix}"
+  function_engine = "${var.governance_prefix}-engine-${local.random_suffix}"
+  
+  # Service account names
+  governance_sa_name = "${var.governance_prefix}-automation-${local.random_suffix}"
+  
+  # Cloud Storage bucket for function source code
+  source_bucket = "${var.governance_prefix}-source-${local.random_suffix}"
+  
+  # Common labels for all resources
+  common_labels = {
+    environment = var.environment
+    project     = "governance-automation"
+    managed_by  = "infrastructure-manager"
+    component   = "governance-system"
+  }
+  
+  # Monitoring project (use main project if not specified)
+  monitoring_project = var.monitoring_project_id != "" ? var.monitoring_project_id : var.project_id
+  
+  # Required APIs for the governance system
+  required_apis = [
+    "cloudasset.googleapis.com",
+    "pubsub.googleapis.com",
+    "cloudfunctions.googleapis.com",
+    "policysimulator.googleapis.com",
+    "cloudbuild.googleapis.com",
+    "logging.googleapis.com",
+    "monitoring.googleapis.com",
+    "storage.googleapis.com"
+  ]
+}
+
+# Generate random suffix for unique resource names
+resource "random_id" "governance_suffix":
+  byte_length: 3
+
+# Enable required Google Cloud APIs
+resource "google_project_service" "governance_apis":
+  for_each = toset(local.required_apis)
+  
+  project = var.project_id
+  service = each.value
+  
+  # Prevent accidental deletion of APIs
+  disable_dependent_services = false
+  disable_on_destroy = false
+  
+  depends_on = [
+    random_id.governance_suffix
+  ]
+
+# Create Cloud Storage bucket for Cloud Function source code
+resource "google_storage_bucket" "function_source":
+  name     = local.source_bucket
+  location = var.region
+  project  = var.project_id
+  
+  # Enable versioning for source code management
+  versioning {
+    enabled = true
+  }
+  
+  # Lifecycle management for cost optimization
+  lifecycle_rule {
+    condition {
+      age = 30
+    }
+    action {
+      type = "Delete"
+    }
+  }
+  
+  # Security settings
+  uniform_bucket_level_access = true
+  
+  labels = local.common_labels
+  
+  depends_on = [
+    google_project_service.governance_apis
+  ]
+}
+
+# Create Pub/Sub topic for asset change notifications
+resource "google_pubsub_topic" "asset_changes":
+  name    = local.topic_name
+  project = var.project_id
+  
+  labels = local.common_labels
+  
+  # Message retention for compliance audit trail
+  message_retention_duration = "604800s" # 7 days
+  
+  depends_on = [
+    google_project_service.governance_apis
+  ]
+}
+
+# Create Pub/Sub subscription for compliance processing
+resource "google_pubsub_subscription" "compliance_processing":
+  name  = local.subscription_name
+  topic = google_pubsub_topic.asset_changes.name
+  project = var.project_id
+  
+  labels = local.common_labels
+  
+  # Subscription configuration for reliable processing
+  ack_deadline_seconds = 300 # 5 minutes for complex governance operations
+  
+  # Retry policy for failed message processing
+  retry_policy {
+    minimum_backoff = "10s"
+    maximum_backoff = "600s"
+  }
+  
+  # Dead letter policy for unprocessable messages
+  dead_letter_policy {
+    dead_letter_topic = google_pubsub_topic.dead_letter.id
+    max_delivery_attempts = 5
+  }
+  
+  depends_on = [
+    google_pubsub_topic.asset_changes
+  ]
+}
+
+# Create dead letter topic for failed message processing
+resource "google_pubsub_topic" "dead_letter":
+  name    = "${local.topic_name}-dead-letter"
+  project = var.project_id
+  
+  labels = merge(local.common_labels, {
+    purpose = "dead-letter-queue"
+  })
+  
+  depends_on = [
+    google_project_service.governance_apis
+  ]
+}
+
+# Create service account for governance automation
+resource "google_service_account" "governance_automation":
+  account_id   = local.governance_sa_name
+  display_name = "Governance Automation Service Account"
+  description  = "Service account for automated governance and compliance operations"
+  project      = var.project_id
+  
+  depends_on = [
+    google_project_service.governance_apis
+  ]
+}
+
+# Grant necessary IAM permissions to governance service account
+resource "google_project_iam_member" "governance_permissions":
+  for_each = toset([
+    "roles/cloudasset.viewer",           # Access to Cloud Asset Inventory
+    "roles/iam.securityReviewer",        # Access to Policy Simulator
+    "roles/monitoring.metricWriter",      # Write compliance metrics
+    "roles/logging.logWriter",           # Write governance logs
+    "roles/pubsub.subscriber",           # Subscribe to asset changes
+    "roles/storage.objectViewer"         # Access function source code
+  ])
+  
+  project = var.project_id
+  role    = each.value
+  member  = "serviceAccount:${google_service_account.governance_automation.email}"
+  
+  depends_on = [
+    google_service_account.governance_automation
+  ]
+}
+
+# Create Cloud Asset Inventory feed for real-time monitoring
+resource "google_cloud_asset_folder_feed" "governance_feed":
+  count = var.enable_organization_level ? 1 : 0
+  
+  billing_project = var.project_id
+  folder         = data.google_folder.organization_folder[0].name
+  feed_id        = local.asset_feed_name
+  
+  # Monitor all resource types and changes
+  asset_types = ["*"]
+  content_type = "RESOURCE"
+  
+  # Send notifications to Pub/Sub topic
+  feed_output_config {
+    pubsub_destination {
+      topic = google_pubsub_topic.asset_changes.id
+    }
+  }
+  
+  depends_on = [
+    google_pubsub_topic.asset_changes,
+    google_project_service.governance_apis
+  ]
+}
+
+# Alternative project-level feed for non-organization deployments
+resource "google_cloud_asset_project_feed" "governance_project_feed":
+  count = var.enable_organization_level ? 0 : 1
+  
+  project = var.project_id
+  feed_id = local.asset_feed_name
+  
+  # Monitor all resource types and changes
+  asset_types = ["*"]
+  content_type = "RESOURCE"
+  
+  # Send notifications to Pub/Sub topic
+  feed_output_config {
+    pubsub_destination {
+      topic = google_pubsub_topic.asset_changes.id
+    }
+  }
+  
+  depends_on = [
+    google_pubsub_topic.asset_changes,
+    google_project_service.governance_apis
+  ]
+}
+
+# Create ZIP archive for Asset Analyzer function
+data "archive_file" "asset_analyzer_source":
+  type        = "zip"
+  output_path = "/tmp/asset_analyzer_source.zip"
+  
+  source {
+    content = templatefile("${path.module}/functions/asset_analyzer.py", {
+      project_id = var.project_id
+      region     = var.region
+    })
+    filename = "main.py"
+  }
+  
+  source {
+    content = file("${path.module}/functions/requirements.txt")
+    filename = "requirements.txt"
+  }
+}
+
+# Upload Asset Analyzer function source to Cloud Storage
+resource "google_storage_bucket_object" "asset_analyzer_source":
+  name   = "asset-analyzer-source-${local.random_suffix}.zip"
+  bucket = google_storage_bucket.function_source.name
+  source = data.archive_file.asset_analyzer_source.output_path
+  
+  depends_on = [
+    data.archive_file.asset_analyzer_source
+  ]
+}
+
+# Deploy Asset Analyzer Cloud Function
+resource "google_cloudfunctions2_function" "asset_analyzer":
+  name     = local.function_analyzer
+  location = var.region
+  project  = var.project_id
+  
+  description = "Analyzes asset changes and triggers governance workflows"
+  
+  build_config {
+    runtime     = "python311"
+    entry_point = "analyze_asset_change"
+    
+    source {
+      storage_source {
+        bucket = google_storage_bucket.function_source.name
+        object = google_storage_bucket_object.asset_analyzer_source.name
+      }
+    }
+  }
+  
+  service_config {
+    max_instance_count = 100
+    min_instance_count = 0
+    available_memory   = "512Mi"
+    timeout_seconds    = 300
+    
+    # Use governance service account
+    service_account_email = google_service_account.governance_automation.email
+    
+    environment_variables = {
+      PROJECT_ID = var.project_id
+      REGION     = var.region
+      ENVIRONMENT = var.environment
+    }
+  }
+  
+  # Pub/Sub trigger configuration
+  event_trigger {
+    trigger_region = var.region
+    event_type     = "google.cloud.pubsub.topic.v1.messagePublished"
+    pubsub_topic   = google_pubsub_topic.asset_changes.id
+    
+    retry_policy = "RETRY_POLICY_RETRY"
+  }
+  
+  labels = merge(local.common_labels, {
+    function_type = "asset-analyzer"
+  })
+  
+  depends_on = [
+    google_storage_bucket_object.asset_analyzer_source,
+    google_service_account.governance_automation
+  ]
+}
+
+# Create ZIP archive for Policy Validator function
+data "archive_file" "policy_validator_source":
+  type        = "zip"
+  output_path = "/tmp/policy_validator_source.zip"
+  
+  source {
+    content = templatefile("${path.module}/functions/policy_validator.py", {
+      project_id = var.project_id
+      region     = var.region
+    })
+    filename = "main.py"
+  }
+  
+  source {
+    content = file("${path.module}/functions/requirements.txt")
+    filename = "requirements.txt"
+  }
+}
+
+# Upload Policy Validator function source to Cloud Storage
+resource "google_storage_bucket_object" "policy_validator_source":
+  name   = "policy-validator-source-${local.random_suffix}.zip"
+  bucket = google_storage_bucket.function_source.name
+  source = data.archive_file.policy_validator_source.output_path
+  
+  depends_on = [
+    data.archive_file.policy_validator_source
+  ]
+}
+
+# Deploy Policy Validator Cloud Function
+resource "google_cloudfunctions2_function" "policy_validator":
+  name     = local.function_validator
+  location = var.region
+  project  = var.project_id
+  
+  description = "Validates policy changes using Policy Simulator"
+  
+  build_config {
+    runtime     = "python311"
+    entry_point = "validate_policy_changes"
+    
+    source {
+      storage_source {
+        bucket = google_storage_bucket.function_source.name
+        object = google_storage_bucket_object.policy_validator_source.name
+      }
+    }
+  }
+  
+  service_config {
+    max_instance_count = 50
+    min_instance_count = 0
+    available_memory   = "1Gi"
+    timeout_seconds    = 540
+    
+    # Use governance service account
+    service_account_email = google_service_account.governance_automation.email
+    
+    environment_variables = {
+      PROJECT_ID = var.project_id
+      REGION     = var.region
+      ENVIRONMENT = var.environment
+    }
+  }
+  
+  labels = merge(local.common_labels, {
+    function_type = "policy-validator"
+  })
+  
+  depends_on = [
+    google_storage_bucket_object.policy_validator_source,
+    google_service_account.governance_automation
+  ]
+}
+
+# Create ZIP archive for Compliance Engine function
+data "archive_file" "compliance_engine_source":
+  type        = "zip"
+  output_path = "/tmp/compliance_engine_source.zip"
+  
+  source {
+    content = templatefile("${path.module}/functions/compliance_engine.py", {
+      project_id = var.project_id
+      region     = var.region
+      monitoring_project = local.monitoring_project
+    })
+    filename = "main.py"
+  }
+  
+  source {
+    content = file("${path.module}/functions/requirements.txt")
+    filename = "requirements.txt"
+  }
+}
+
+# Upload Compliance Engine function source to Cloud Storage
+resource "google_storage_bucket_object" "compliance_engine_source":
+  name   = "compliance-engine-source-${local.random_suffix}.zip"
+  bucket = google_storage_bucket.function_source.name
+  source = data.archive_file.compliance_engine_source.output_path
+  
+  depends_on = [
+    data.archive_file.compliance_engine_source
+  ]
+}
+
+# Deploy Compliance Engine Cloud Function
+resource "google_cloudfunctions2_function" "compliance_engine":
+  name     = local.function_engine
+  location = var.region
+  project  = var.project_id
+  
+  description = "Orchestrates compliance enforcement and automated remediation"
+  
+  build_config {
+    runtime     = "python311"
+    entry_point = "enforce_compliance"
+    
+    source {
+      storage_source {
+        bucket = google_storage_bucket.function_source.name
+        object = google_storage_bucket_object.compliance_engine_source.name
+      }
+    }
+  }
+  
+  service_config {
+    max_instance_count = 100
+    min_instance_count = 0
+    available_memory   = "1Gi"
+    timeout_seconds    = 540
+    
+    # Use governance service account
+    service_account_email = google_service_account.governance_automation.email
+    
+    environment_variables = {
+      PROJECT_ID = var.project_id
+      REGION     = var.region
+      ENVIRONMENT = var.environment
+      MONITORING_PROJECT = local.monitoring_project
+    }
+  }
+  
+  # Pub/Sub trigger configuration
+  event_trigger {
+    trigger_region = var.region
+    event_type     = "google.cloud.pubsub.topic.v1.messagePublished"
+    pubsub_topic   = google_pubsub_topic.asset_changes.id
+    
+    retry_policy = "RETRY_POLICY_RETRY"
+  }
+  
+  labels = merge(local.common_labels, {
+    function_type = "compliance-engine"
+  })
+  
+  depends_on = [
+    google_storage_bucket_object.compliance_engine_source,
+    google_service_account.governance_automation
+  ]
+}
+
+# Create Cloud Monitoring alert policy for governance system health
+resource "google_monitoring_alert_policy" "governance_health":
+  display_name = "Governance System Health Alert"
+  project      = local.monitoring_project
+  
+  documentation {
+    content = "Alert triggers when governance system functions experience high error rates or execution timeouts"
+  }
+  
+  conditions {
+    display_name = "Cloud Function Error Rate"
+    
+    condition_threshold {
+      filter         = "resource.type=\"cloud_function\" AND resource.labels.function_name=~\"${var.governance_prefix}-.*\""
+      duration       = "300s"
+      comparison     = "COMPARISON_GT"
+      threshold_value = 0.1 # 10% error rate
+      
+      aggregations {
+        alignment_period   = "300s"
+        per_series_aligner = "ALIGN_RATE"
+      }
+    }
+  }
+  
+  # Notification channels would be configured based on organization needs
+  combiner = "OR"
+  enabled  = true
+  
+  depends_on = [
+    google_project_service.governance_apis
+  ]
+}
+
+# Create Cloud Monitoring dashboard for governance metrics
+resource "google_monitoring_dashboard" "governance_dashboard":
+  project        = local.monitoring_project
+  dashboard_json = jsonencode({
+    displayName = "Governance System Dashboard"
+    mosaicLayout = {
+      tiles = [
+        {
+          width = 6
+          height = 4
+          widget = {
+            title = "Asset Change Events"
+            scorecard = {
+              timeSeriesQuery = {
+                timeSeriesFilter = {
+                  filter = "resource.type=\"pubsub_topic\" AND resource.labels.topic_id=\"${local.topic_name}\""
+                }
+              }
+            }
+          }
+        },
+        {
+          width = 6
+          height = 4
+          widget = {
+            title = "Function Execution Count"
+            scorecard = {
+              timeSeriesQuery = {
+                timeSeriesFilter = {
+                  filter = "resource.type=\"cloud_function\" AND resource.labels.function_name=~\"${var.governance_prefix}-.*\""
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  })
+  
+  depends_on = [
+    google_cloudfunctions2_function.asset_analyzer,
+    google_cloudfunctions2_function.policy_validator,
+    google_cloudfunctions2_function.compliance_engine
+  ]
+}
+
+# Data source for organization folder (when organization-level governance is enabled)
+data "google_folder" "organization_folder":
+  count = var.enable_organization_level ? 1 : 0
+  
+  folder = "folders/${var.organization_folder_id}"
+}
+
+# Output important resource information
+output "governance_system_info":
+  description = "Information about the deployed governance system"
+  value = {
+    project_id = var.project_id
+    region     = var.region
+    
+    # Pub/Sub resources
+    asset_changes_topic = google_pubsub_topic.asset_changes.name
+    compliance_subscription = google_pubsub_subscription.compliance_processing.name
+    
+    # Cloud Functions
+    asset_analyzer_function = google_cloudfunctions2_function.asset_analyzer.name
+    policy_validator_function = google_cloudfunctions2_function.policy_validator.name
+    compliance_engine_function = google_cloudfunctions2_function.compliance_engine.name
+    
+    # Service Account
+    governance_service_account = google_service_account.governance_automation.email
+    
+    # Storage
+    function_source_bucket = google_storage_bucket.function_source.name
+    
+    # Monitoring
+    dashboard_url = "https://console.cloud.google.com/monitoring/dashboards/custom/${google_monitoring_dashboard.governance_dashboard.id}?project=${local.monitoring_project}"
+  }
+}
+
+output "asset_feed_info":
+  description = "Information about the configured asset feed"
+  value = var.enable_organization_level ? {
+    type = "organization"
+    feed_name = google_cloud_asset_folder_feed.governance_feed[0].name
+    scope = "Organization-level monitoring enabled"
+  } : {
+    type = "project"
+    feed_name = google_cloud_asset_project_feed.governance_project_feed[0].name
+    scope = "Project-level monitoring for ${var.project_id}"
+  }
+}
+
+output "next_steps":
+  description = "Next steps for governance system configuration"
+  value = [
+    "1. Configure notification channels for monitoring alerts",
+    "2. Customize compliance policies in Cloud Functions",
+    "3. Set up integration with ITSM or security orchestration tools",
+    "4. Configure organization policies for proactive governance",
+    "5. Test governance workflows with sample resource changes"
+  ]
+}

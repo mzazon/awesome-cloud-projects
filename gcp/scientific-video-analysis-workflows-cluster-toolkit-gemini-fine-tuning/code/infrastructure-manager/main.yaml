@@ -1,0 +1,549 @@
+# Infrastructure Manager Configuration for Scientific Video Analysis Workflows
+# This configuration deploys a complete solution for scientific video analysis
+# using Google Cloud's Cluster Toolkit, Vertex AI, Cloud Dataflow, and Cloud Storage
+
+# Infrastructure Manager metadata
+apiVersion: infra-manager/v1
+kind: Blueprint
+metadata:
+  name: scientific-video-analysis-workflows
+  description: HPC cluster with AI-powered video analysis capabilities
+  version: "1.0"
+
+# Configuration variables
+vars:
+  # Project and region configuration
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    required: true
+  
+  region:
+    description: "Google Cloud region for resource deployment"
+    type: string
+    default: "us-central1"
+    validation:
+      condition: "contains(['us-central1', 'us-east1', 'us-west1', 'europe-west1'], var.region)"
+      error_message: "Region must be one of the supported regions for HPC workloads"
+  
+  zone:
+    description: "Google Cloud zone for compute resources"
+    type: string
+    default: "us-central1-a"
+  
+  # Naming and identification
+  deployment_name:
+    description: "Name for the deployment (used as prefix for resources)"
+    type: string
+    default: "scientific-video-analysis"
+    validation:
+      condition: "length(var.deployment_name) <= 20"
+      error_message: "Deployment name must be 20 characters or less"
+  
+  cluster_name:
+    description: "Name for the HPC cluster"
+    type: string
+    default: "video-analysis-cluster"
+  
+  # Storage configuration
+  bucket_name_suffix:
+    description: "Suffix for Cloud Storage bucket name (must be globally unique)"
+    type: string
+    default: ""
+  
+  storage_size_gb:
+    description: "Size of shared file system in GB"
+    type: number
+    default: 2560
+    validation:
+      condition: "var.storage_size_gb >= 1024"
+      error_message: "Storage size must be at least 1TB for scientific workloads"
+  
+  # Cluster configuration
+  max_compute_nodes:
+    description: "Maximum number of compute nodes in the cluster"
+    type: number
+    default: 10
+    validation:
+      condition: "var.max_compute_nodes >= 1 && var.max_compute_nodes <= 50"
+      error_message: "Compute nodes must be between 1 and 50"
+  
+  max_gpu_nodes:
+    description: "Maximum number of GPU nodes in the cluster"
+    type: number
+    default: 4
+    validation:
+      condition: "var.max_gpu_nodes >= 1 && var.max_gpu_nodes <= 20"
+      error_message: "GPU nodes must be between 1 and 20"
+  
+  # Machine types
+  compute_machine_type:
+    description: "Machine type for compute nodes"
+    type: string
+    default: "c2-standard-16"
+  
+  gpu_machine_type:
+    description: "Machine type for GPU nodes"
+    type: string
+    default: "n1-standard-4"
+  
+  gpu_type:
+    description: "GPU accelerator type"
+    type: string
+    default: "nvidia-tesla-t4"
+    validation:
+      condition: "contains(['nvidia-tesla-t4', 'nvidia-tesla-v100', 'nvidia-tesla-k80'], var.gpu_type)"
+      error_message: "GPU type must be one of the supported accelerators"
+
+# Resource deployment groups
+deployment_groups:
+  # Primary infrastructure group
+  - group: primary
+    modules:
+      # Enable required APIs
+      - id: enable_apis
+        source: modules/project/service-apis
+        settings:
+          project_id: ${var.project_id}
+          activate_apis:
+            - compute.googleapis.com
+            - storage.googleapis.com
+            - aiplatform.googleapis.com
+            - dataflow.googleapis.com
+            - bigquery.googleapis.com
+            - container.googleapis.com
+            - file.googleapis.com
+            - monitoring.googleapis.com
+            - logging.googleapis.com
+            - cloudresourcemanager.googleapis.com
+          
+      # Network infrastructure for HPC cluster
+      - id: network
+        source: modules/network/vpc
+        use: [enable_apis]
+        settings:
+          project_id: ${var.project_id}
+          network_name: ${var.deployment_name}-network
+          subnets:
+            - subnet_name: ${var.deployment_name}-subnet
+              subnet_ip: "10.0.0.0/16"
+              subnet_region: ${var.region}
+              description: "Subnet for scientific video analysis cluster"
+          
+          # Firewall rules for HPC communication
+          firewall_rules:
+            - name: ${var.deployment_name}-allow-internal
+              description: "Allow internal communication within cluster"
+              direction: INGRESS
+              allow:
+                - protocol: tcp
+                  ports: ["0-65535"]
+                - protocol: udp
+                  ports: ["0-65535"]
+                - protocol: icmp
+              source_ranges: ["10.0.0.0/16"]
+              
+            - name: ${var.deployment_name}-allow-ssh
+              description: "Allow SSH access to cluster nodes"
+              direction: INGRESS
+              allow:
+                - protocol: tcp
+                  ports: ["22"]
+              source_ranges: ["0.0.0.0/0"]
+              target_tags: ["hpc-cluster"]
+  
+  # Storage infrastructure group
+  - group: storage
+    modules:
+      # High-performance shared file system using Filestore
+      - id: filestore
+        source: modules/file-system/filestore
+        use: [network]
+        settings:
+          project_id: ${var.project_id}
+          filestore_name: ${var.deployment_name}-shared-fs
+          zone: ${var.zone}
+          tier: HIGH_SCALE_SSD
+          capacity_gb: ${var.storage_size_gb}
+          network_name: ${var.deployment_name}-network
+          reserved_ip_range: "10.0.1.0/29"
+          description: "High-performance shared file system for video processing"
+          
+          # File system configuration for scientific workloads
+          file_shares:
+            - name: shared
+              capacity_gb: ${var.storage_size_gb}
+              nfs_export_options:
+                - ip_ranges: ["10.0.0.0/16"]
+                  access_mode: READ_WRITE
+                  squash_mode: NO_ROOT_SQUASH
+      
+      # Cloud Storage bucket for video data and results
+      - id: storage_bucket
+        source: modules/storage/cloud-storage
+        use: [enable_apis]
+        settings:
+          project_id: ${var.project_id}
+          names: ["${var.deployment_name}-data-${var.bucket_name_suffix}"]
+          location: ${var.region}
+          storage_class: STANDARD
+          
+          # Lifecycle management for cost optimization
+          lifecycle_rules:
+            - action:
+                type: SetStorageClass
+                storage_class: NEARLINE
+              condition:
+                age: 30
+                matches_storage_class: ["STANDARD"]
+            - action:
+                type: SetStorageClass
+                storage_class: COLDLINE
+              condition:
+                age: 90
+                matches_storage_class: ["NEARLINE"]
+          
+          # Versioning for data protection
+          versioning: true
+          
+          # Uniform bucket-level access for security
+          uniform_bucket_level_access: true
+          
+          # Labels for resource management
+          labels:
+            purpose: "scientific-video-analysis"
+            environment: "research"
+            project: ${var.deployment_name}
+
+  # HPC Cluster infrastructure group
+  - group: hpc_cluster
+    modules:
+      # Compute partition for CPU-intensive video processing
+      - id: compute_partition
+        source: modules/compute/schedmd-slurm-gcp-v5-partition
+        use: [network, filestore]
+        settings:
+          project_id: ${var.project_id}
+          partition_name: compute
+          machine_type: ${var.compute_machine_type}
+          max_node_count: ${var.max_compute_nodes}
+          zone: ${var.zone}
+          
+          # Instance configuration for scientific computing
+          disk_size_gb: 200
+          disk_type: pd-ssd
+          preemptible: false
+          
+          # Network and security configuration
+          subnetwork_name: ${var.deployment_name}-subnet
+          tags: ["hpc-cluster", "compute-partition"]
+          
+          # Custom metadata for node identification
+          metadata:
+            partition-type: "compute"
+            workload-type: "video-processing"
+          
+          # Startup script for software installation
+          startup_script: |
+            #!/bin/bash
+            # Install required software for video analysis
+            yum update -y
+            yum install -y epel-release
+            yum install -y ffmpeg opencv python3-pip
+            
+            # Install Python packages for video processing
+            pip3 install opencv-python numpy google-cloud-storage google-cloud-aiplatform
+            
+            # Create shared directories
+            mkdir -p /shared/{scripts,logs,data}
+            chmod 755 /shared/{scripts,logs,data}
+            
+            # Install video analysis tools
+            yum install -y ImageMagick
+            
+      # GPU partition for AI-accelerated analysis
+      - id: gpu_partition
+        source: modules/compute/schedmd-slurm-gcp-v5-partition
+        use: [network, filestore]
+        settings:
+          project_id: ${var.project_id}
+          partition_name: gpu
+          machine_type: ${var.gpu_machine_type}
+          max_node_count: ${var.max_gpu_nodes}
+          zone: ${var.zone}
+          
+          # GPU configuration
+          accelerator_type: ${var.gpu_type}
+          accelerator_count: 1
+          
+          # Instance configuration optimized for AI workloads
+          disk_size_gb: 300
+          disk_type: pd-ssd
+          preemptible: false
+          
+          # Network and security configuration
+          subnetwork_name: ${var.deployment_name}-subnet
+          tags: ["hpc-cluster", "gpu-partition"]
+          
+          # Custom metadata for GPU nodes
+          metadata:
+            partition-type: "gpu"
+            workload-type: "ai-inference"
+            gpu-type: ${var.gpu_type}
+          
+          # Startup script for GPU software installation
+          startup_script: |
+            #!/bin/bash
+            # Install NVIDIA drivers and CUDA
+            yum update -y
+            yum install -y epel-release
+            
+            # Install NVIDIA drivers
+            yum install -y nvidia-driver nvidia-settings
+            
+            # Install CUDA toolkit
+            yum install -y cuda-toolkit
+            
+            # Install cuDNN
+            yum install -y libcudnn8 libcudnn8-devel
+            
+            # Install Python packages for AI workloads
+            pip3 install torch torchvision tensorflow-gpu google-cloud-aiplatform
+            
+            # Verify GPU installation
+            nvidia-smi
+          
+      # Slurm controller for job scheduling
+      - id: slurm_controller
+        source: modules/scheduler/schedmd-slurm-gcp-v5-controller
+        use: [network, filestore, compute_partition, gpu_partition]
+        settings:
+          project_id: ${var.project_id}
+          controller_name: ${var.cluster_name}-controller
+          zone: ${var.zone}
+          machine_type: n1-standard-4
+          
+          # Controller configuration
+          disk_size_gb: 100
+          disk_type: pd-standard
+          
+          # Network configuration
+          subnetwork_name: ${var.deployment_name}-subnet
+          tags: ["hpc-cluster", "slurm-controller"]
+          
+          # Slurm configuration for scientific workloads
+          slurm_conf_tpl: |
+            # Slurm configuration for scientific video analysis
+            ClusterName=${var.cluster_name}
+            ControlMachine=${var.cluster_name}-controller
+            SlurmUser=slurm
+            SlurmctldPort=6817
+            SlurmdPort=6818
+            AuthType=auth/munge
+            StateSaveLocation=/var/spool/slurm/ctld
+            SlurmdSpoolDir=/var/spool/slurm/d
+            SwitchType=switch/none
+            MpiDefault=none
+            SlurmctldPidFile=/var/run/slurmctld.pid
+            SlurmdPidFile=/var/run/slurmd.pid
+            ProctrackType=proctrack/cgroup
+            CgroupAutomount=yes
+            ReturnToService=1
+            MaxJobCount=10000
+            MaxArraySize=10000
+            
+            # Job scheduling configuration
+            SchedulerType=sched/backfill
+            SelectType=select/cons_tres
+            SelectTypeParameters=CR_Core_Memory
+            
+            # Resource limits for video processing
+            DefMemPerCPU=4096
+            MaxMemPerCPU=8192
+            
+            # Accounting configuration
+            AccountingStorageType=accounting_storage/slurmdbd
+            JobAcctGatherType=jobacct_gather/cgroup
+          
+          # Custom metadata
+          metadata:
+            cluster-name: ${var.cluster_name}
+            purpose: "scientific-video-analysis"
+          
+      # Login node for user access
+      - id: slurm_login
+        source: modules/scheduler/schedmd-slurm-gcp-v5-login
+        use: [network, slurm_controller]
+        settings:
+          project_id: ${var.project_id}
+          name_prefix: ${var.cluster_name}-login
+          zone: ${var.zone}
+          machine_type: n1-standard-2
+          
+          # Login node configuration
+          disk_size_gb: 50
+          disk_type: pd-standard
+          
+          # Network configuration
+          subnetwork_name: ${var.deployment_name}-subnet
+          tags: ["hpc-cluster", "login-node"]
+          
+          # Enable external IP for SSH access
+          enable_external_ip: true
+          
+          # Custom metadata
+          metadata:
+            node-type: "login"
+            cluster-name: ${var.cluster_name}
+
+  # AI and Analytics infrastructure group
+  - group: ai_analytics
+    modules:
+      # BigQuery dataset for analysis results
+      - id: bigquery_dataset
+        source: modules/bigquery/dataset
+        use: [enable_apis]
+        settings:
+          project_id: ${var.project_id}
+          dataset_id: video_analysis_results
+          dataset_name: "Scientific Video Analysis Results"
+          description: "Dataset for storing video analysis results and metadata"
+          location: ${var.region}
+          
+          # Access controls for research data
+          access:
+            - role: "OWNER"
+              user_by_email: "video-analysis-service@${var.project_id}.iam.gserviceaccount.com"
+            - role: "READER"
+              special_group: "projectReaders"
+            - role: "WRITER"
+              special_group: "projectEditors"
+          
+          # Default table expiration for cost management
+          default_table_expiration_ms: 7776000000  # 90 days
+          
+          # Labels for dataset management
+          labels:
+            purpose: "video-analysis"
+            data_type: "research_results"
+            environment: "production"
+      
+      # Service account for video analysis workflows
+      - id: video_analysis_sa
+        source: modules/iam/service-accounts
+        use: [enable_apis]
+        settings:
+          project_id: ${var.project_id}
+          names: ["video-analysis"]
+          display_name: "Video Analysis Service Account"
+          description: "Service account for video analysis workflows and AI model access"
+          
+          # Generate and download key for cluster access
+          generate_keys: true
+          
+          # Project-level IAM roles
+          project_roles:
+            - "roles/aiplatform.user"              # Vertex AI access
+            - "roles/storage.objectAdmin"          # Cloud Storage access
+            - "roles/bigquery.dataEditor"          # BigQuery write access
+            - "roles/dataflow.admin"               # Dataflow job management
+            - "roles/monitoring.metricWriter"      # Monitoring metrics
+            - "roles/logging.logWriter"            # Logging access
+            - "roles/compute.instanceAdmin"        # Compute instance management
+
+# Outputs for integration and verification
+outputs:
+  # Network information
+  network_name:
+    description: "Name of the created VPC network"
+    value: ${module.network.network_name}
+  
+  subnet_name:
+    description: "Name of the created subnet"
+    value: ${module.network.subnets[0].name}
+  
+  # Storage information
+  filestore_ip:
+    description: "IP address of the Filestore instance"
+    value: ${module.filestore.ip_address}
+  
+  storage_bucket_name:
+    description: "Name of the Cloud Storage bucket"
+    value: ${module.storage_bucket.name}
+  
+  storage_bucket_url:
+    description: "URL of the Cloud Storage bucket"
+    value: ${module.storage_bucket.url}
+  
+  # Cluster information
+  cluster_name:
+    description: "Name of the HPC cluster"
+    value: ${var.cluster_name}
+  
+  controller_instance:
+    description: "Name of the Slurm controller instance"
+    value: ${module.slurm_controller.controller_instance_name}
+  
+  login_node:
+    description: "Name of the login node instance"
+    value: ${module.slurm_login.login_instance_names[0]}
+  
+  login_node_external_ip:
+    description: "External IP address of the login node"
+    value: ${module.slurm_login.external_ip[0]}
+  
+  # BigQuery information
+  bigquery_dataset_id:
+    description: "BigQuery dataset ID for analysis results"
+    value: ${module.bigquery_dataset.dataset_id}
+  
+  bigquery_table_id:
+    description: "BigQuery table ID for video analysis results"
+    value: "${module.bigquery_dataset.dataset_id}.video_analysis_results"
+  
+  # Service account information
+  service_account_email:
+    description: "Email of the video analysis service account"
+    value: ${module.video_analysis_sa.email}
+  
+  # Connection information
+  ssh_command:
+    description: "SSH command to connect to the login node"
+    value: "gcloud compute ssh ${module.slurm_login.login_instance_names[0]} --zone=${var.zone}"
+  
+  filestore_mount_command:
+    description: "Command to mount the shared file system"
+    value: "sudo mount -t nfs ${module.filestore.ip_address}:/shared /shared"
+  
+  # Resource management URLs
+  cluster_monitoring_url:
+    description: "URL for cluster monitoring in Google Cloud Console"
+    value: "https://console.cloud.google.com/compute/instances?project=${var.project_id}&instancessize=50"
+  
+  storage_console_url:
+    description: "URL for storage management in Google Cloud Console"
+    value: "https://console.cloud.google.com/storage/browser/${module.storage_bucket.name}?project=${var.project_id}"
+  
+  bigquery_console_url:
+    description: "URL for BigQuery dataset in Google Cloud Console"
+    value: "https://console.cloud.google.com/bigquery?project=${var.project_id}&d=${module.bigquery_dataset.dataset_id}"
+
+# Resource labels for management and billing
+labels:
+  purpose: "scientific-video-analysis"
+  environment: "research"
+  managed_by: "infrastructure-manager"
+  deployment: ${var.deployment_name}
+  
+# Deployment metadata
+metadata:
+  annotations:
+    description: "Infrastructure for scientific video analysis using HPC clusters and AI"
+    documentation: "https://cloud.google.com/cluster-toolkit/docs"
+    cost_center: "research-computing"
+    owner: "scientific-computing-team"
+    
+  labels:
+    solution_type: "hpc_ai_analytics"
+    complexity: "advanced"
+    maintenance_window: "weekend"

@@ -1,0 +1,945 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  CloudFormation template for AWS Cloud9 Developer Environments
+  Creates collaborative Cloud9 IDE environments with CodeCommit integration
+  and custom IAM roles for team development workflows
+
+# ============================================================================
+# PARAMETERS
+# ============================================================================
+Parameters:
+  EnvironmentName:
+    Description: Name for the Cloud9 development environment
+    Type: String
+    Default: dev-environment
+    MinLength: 1
+    MaxLength: 60
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9\-]*$'
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters and hyphens
+
+  EnvironmentDescription:
+    Description: Description for the Cloud9 environment
+    Type: String
+    Default: Shared development environment for team collaboration
+    MaxLength: 200
+
+  InstanceType:
+    Description: EC2 instance type for the Cloud9 environment
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - m5.large
+      - m5.xlarge
+      - c5.large
+      - c5.xlarge
+    ConstraintDescription: Must be a valid EC2 instance type
+
+  AutomaticStopTimeMinutes:
+    Description: Number of minutes of inactivity after which to stop the environment
+    Type: Number
+    Default: 60
+    MinValue: 15
+    MaxValue: 20160  # 14 days
+    ConstraintDescription: Must be between 15 minutes and 14 days
+
+  ImageId:
+    Description: Amazon Machine Image for the Cloud9 environment
+    Type: String
+    Default: amazonlinux-2023-x86_64
+    AllowedValues:
+      - amazonlinux-2023-x86_64
+      - amazonlinux-2-x86_64
+      - ubuntu-18.04-x86_64
+      - ubuntu-22.04-x86_64
+    ConstraintDescription: Must be a supported Cloud9 AMI
+
+  SubnetId:
+    Description: Subnet ID for the Cloud9 environment (leave empty for default VPC)
+    Type: String
+    Default: ''
+
+  TeamMemberArns:
+    Description: Comma-separated list of IAM user ARNs to add as team members (optional)
+    Type: CommaDelimitedList
+    Default: ''
+
+  RepositoryName:
+    Description: Name for the CodeCommit repository
+    Type: String
+    Default: team-development-repo
+    MinLength: 1
+    MaxLength: 100
+    AllowedPattern: '^[a-zA-Z][\w\.\-]*$'
+    ConstraintDescription: Repository name must begin with a letter and contain only letters, numbers, periods, hyphens and underscores
+
+  EnableMonitoring:
+    Description: Enable CloudWatch monitoring dashboard
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  ProjectType:
+    Description: Type of development project to optimize environment for
+    Type: String
+    Default: web-development
+    AllowedValues:
+      - web-development
+      - data-science
+      - mobile-development
+      - serverless
+      - general-purpose
+    ConstraintDescription: Select the primary development focus
+
+# ============================================================================
+# CONDITIONS
+# ============================================================================
+Conditions:
+  # Check if subnet ID is provided
+  HasSubnetId: !Not [!Equals [!Ref SubnetId, '']]
+  
+  # Check if team members are provided
+  HasTeamMembers: !Not [!Equals [!Join ['', !Ref TeamMemberArns], '']]
+  
+  # Check if monitoring should be enabled
+  EnableMonitoringDashboard: !Equals [!Ref EnableMonitoring, 'true']
+  
+  # Check project type for specific configurations
+  IsDataScienceProject: !Equals [!Ref ProjectType, 'data-science']
+  IsServerlessProject: !Equals [!Ref ProjectType, 'serverless']
+  IsMobileProject: !Equals [!Ref ProjectType, 'mobile-development']
+
+# ============================================================================
+# RESOURCES
+# ============================================================================
+Resources:
+  # ========================================================================
+  # IAM ROLES AND POLICIES
+  # ========================================================================
+  
+  # IAM Role for Cloud9 Environment
+  Cloud9ServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-Cloud9-ServiceRole-${AWS::AccountId}'
+      Description: Service role for Cloud9 environment with development permissions
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              Service: cloud9.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCloud9EnvironmentMember
+        - arn:aws:iam::aws:policy/AWSCodeCommitReadOnly
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-Cloud9-ServiceRole'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Purpose
+          Value: Cloud9 Development Environment
+
+  # Custom IAM Policy for Development Activities
+  Cloud9DevelopmentPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${EnvironmentName}-Development-Policy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # S3 Development Permissions
+          - Sid: S3DevelopmentAccess
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:ListBucket
+              - s3:GetBucketLocation
+              - s3:GetBucketVersioning
+            Resource: '*'
+            Condition:
+              StringLike:
+                's3:prefix': 
+                  - 'development/*'
+                  - 'temp/*'
+                  - 'testing/*'
+          
+          # DynamoDB Development Permissions
+          - Sid: DynamoDBDevelopmentAccess
+            Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+              - dynamodb:DeleteItem
+              - dynamodb:Query
+              - dynamodb:Scan
+              - dynamodb:BatchGetItem
+              - dynamodb:BatchWriteItem
+              - dynamodb:DescribeTable
+              - dynamodb:ListTables
+            Resource: '*'
+            Condition:
+              StringLike:
+                'dynamodb:LeadingKeys': 
+                  - 'dev-*'
+                  - 'test-*'
+          
+          # Lambda Development Permissions
+          - Sid: LambdaDevelopmentAccess
+            Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+              - lambda:GetFunction
+              - lambda:ListFunctions
+              - lambda:GetFunctionConfiguration
+            Resource: '*'
+            Condition:
+              StringLike:
+                'lambda:FunctionName': 
+                  - 'dev-*'
+                  - 'test-*'
+          
+          # CloudWatch Logs for Development
+          - Sid: CloudWatchLogsDevelopmentAccess
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogGroups
+              - logs:DescribeLogStreams
+              - logs:GetLogEvents
+            Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/cloud9/${EnvironmentName}*'
+          
+          # CodeCommit Access
+          - Sid: CodeCommitDevelopmentAccess
+            Effect: Allow
+            Action:
+              - codecommit:BatchGet*
+              - codecommit:Get*
+              - codecommit:Describe*
+              - codecommit:List*
+              - codecommit:GitPull
+              - codecommit:GitPush
+            Resource: !GetAtt CodeCommitRepository.Arn
+          
+          # Additional permissions for specific project types
+          - !If
+            - IsDataScienceProject
+            - Sid: DataSciencePermissions
+              Effect: Allow
+              Action:
+                - sagemaker:DescribeNotebookInstance
+                - sagemaker:ListNotebookInstances
+                - sagemaker:CreateTrainingJob
+                - sagemaker:DescribeTrainingJob
+                - athena:StartQueryExecution
+                - athena:GetQueryExecution
+                - athena:GetQueryResults
+                - glue:GetTable
+                - glue:GetTables
+                - glue:GetDatabase
+                - glue:GetDatabases
+              Resource: '*'
+            - !Ref AWS::NoValue
+          
+          - !If
+            - IsServerlessProject
+            - Sid: ServerlessPermissions
+              Effect: Allow
+              Action:
+                - apigateway:GET
+                - apigateway:POST
+                - apigateway:PUT
+                - apigateway:DELETE
+                - events:PutRule
+                - events:DeleteRule
+                - events:PutTargets
+                - events:RemoveTargets
+                - events:DescribeRule
+                - events:ListRules
+              Resource: '*'
+            - !Ref AWS::NoValue
+
+      Roles:
+        - !Ref Cloud9ServiceRole
+
+  # Instance Profile for Cloud9 EC2 Instance
+  Cloud9InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${EnvironmentName}-Cloud9-InstanceProfile'
+      Roles:
+        - !Ref Cloud9ServiceRole
+
+  # ========================================================================
+  # CODECOMMIT REPOSITORY
+  # ========================================================================
+  
+  # CodeCommit Repository for Team Development
+  CodeCommitRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Sub '${RepositoryName}-${AWS::AccountId}'
+      RepositoryDescription: !Sub 'Team development repository for ${EnvironmentName} Cloud9 environment'
+      Code:
+        BranchName: main
+        S3:
+          Bucket: !Ref InitialCodeBucket
+          Key: !Ref InitialCodeArchive
+      Tags:
+        - Key: Name
+          Value: !Sub '${RepositoryName}-Repository'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Purpose
+          Value: Cloud9 Team Development
+
+  # S3 Bucket for Initial Code and Templates
+  InitialCodeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${EnvironmentName}-initial-code-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-InitialCode'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Lambda Function to Create Initial Code Archive
+  InitialCodeCreatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-InitialCodeCreator'
+      Description: Creates initial code archive for Cloud9 environment
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt InitialCodeCreatorRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import zipfile
+          import io
+          import cfnresponse
+          
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  s3 = boto3.client('s3')
+                  bucket = event['ResourceProperties']['Bucket']
+                  key = event['ResourceProperties']['Key']
+                  project_type = event['ResourceProperties']['ProjectType']
+                  
+                  # Create in-memory zip file
+                  zip_buffer = io.BytesIO()
+                  
+                  with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                      # Add README
+                      readme_content = f"""# {event['ResourceProperties']['EnvironmentName']} Development Environment
+          
+          Welcome to your Cloud9 development environment!
+          
+          ## Quick Start
+          
+          1. Clone this repository to get started
+          2. Check out the project templates in the templates/ directory
+          3. Install dependencies using the setup scripts
+          
+          ## Project Type: {project_type}
+          
+          This environment is optimized for {project_type} development.
+          
+          ## Getting Started
+          
+          ```bash
+          # Install dependencies
+          ./scripts/setup.sh
+          
+          # Start development server
+          npm start  # for Node.js projects
+          # or
+          python app.py  # for Python projects
+          ```
+          
+          ## Team Collaboration
+          
+          This Cloud9 environment supports real-time collaboration. 
+          Share your environment with team members for pair programming.
+          """
+                      zip_file.writestr('README.md', readme_content)
+                      
+                      # Add project-specific templates
+                      if project_type == 'web-development':
+                          # Web app template
+                          html_content = """<!DOCTYPE html>
+          <html lang="en">
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>Cloud9 Web App</title>
+              <style>
+                  body { font-family: Arial, sans-serif; margin: 40px; }
+                  .container { max-width: 800px; margin: 0 auto; }
+                  .header { color: #232F3E; }
+              </style>
+          </head>
+          <body>
+              <div class="container">
+                  <h1 class="header">Welcome to Cloud9 Development</h1>
+                  <p>This is a template for web applications in Cloud9.</p>
+                  <p>Start building your application here!</p>
+              </div>
+          </body>
+          </html>"""
+                          zip_file.writestr('templates/web-app/index.html', html_content)
+                          
+                          # Package.json template
+                          package_json = {
+                              "name": "cloud9-web-app",
+                              "version": "1.0.0",
+                              "description": "Web application template for Cloud9",
+                              "main": "index.js",
+                              "scripts": {
+                                  "start": "node server.js",
+                                  "dev": "nodemon server.js",
+                                  "test": "jest"
+                              },
+                              "dependencies": {
+                                  "express": "^4.18.2",
+                                  "ejs": "^3.1.9"
+                              },
+                              "devDependencies": {
+                                  "nodemon": "^3.0.1",
+                                  "jest": "^29.0.0"
+                              }
+                          }
+                          zip_file.writestr('templates/web-app/package.json', json.dumps(package_json, indent=2))
+                      
+                      elif project_type == 'data-science':
+                          # Python data science template
+                          python_content = """import pandas as pd
+          import numpy as np
+          import matplotlib.pyplot as plt
+          import seaborn as sns
+          
+          def main():
+              # Sample data analysis code
+              data = pd.DataFrame({
+                  'x': np.random.randn(100),
+                  'y': np.random.randn(100)
+              })
+              
+              plt.figure(figsize=(10, 6))
+              sns.scatterplot(data=data, x='x', y='y')
+              plt.title('Sample Data Visualization')
+              plt.show()
+              
+              print("Data Science template loaded successfully!")
+          
+          if __name__ == "__main__":
+              main()
+          """
+                          zip_file.writestr('templates/data-science/analysis.py', python_content)
+                          
+                          requirements_content = """pandas>=1.5.0
+          numpy>=1.24.0
+          matplotlib>=3.6.0
+          seaborn>=0.12.0
+          jupyter>=1.0.0
+          scikit-learn>=1.3.0
+          boto3>=1.28.0
+          """
+                          zip_file.writestr('templates/data-science/requirements.txt', requirements_content)
+                      
+                      # Add setup script
+                      setup_script = """#!/bin/bash
+          # Cloud9 Environment Setup Script
+          
+          echo "Setting up development environment..."
+          
+          # Update system packages
+          sudo yum update -y
+          
+          # Install common development tools
+          sudo yum install -y git htop tree jq curl wget
+          
+          # Project-specific setup based on project type
+          PROJECT_TYPE="${project_type}"
+          
+          case "$PROJECT_TYPE" in
+              "web-development")
+                  echo "Setting up web development environment..."
+                  # Install Node.js via nvm
+                  curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
+                  source ~/.bashrc
+                  nvm install --lts
+                  nvm use --lts
+                  npm install -g nodemon jest
+                  ;;
+              "data-science")
+                  echo "Setting up data science environment..."
+                  # Install Python packages
+                  pip3 install --user -r templates/data-science/requirements.txt
+                  # Install Jupyter extensions
+                  pip3 install --user jupyter-contrib-nbextensions
+                  ;;
+              "serverless")
+                  echo "Setting up serverless development environment..."
+                  # Install AWS SAM CLI
+                  pip3 install --user aws-sam-cli
+                  # Install Serverless Framework
+                  npm install -g serverless
+                  ;;
+          esac
+          
+          # Configure Git
+          git config --global init.defaultBranch main
+          git config --global pull.rebase false
+          
+          # Create project directories
+          mkdir -p ~/projects/{src,tests,docs,scripts}
+          
+          echo "Environment setup complete!"
+          echo "Please restart your terminal or run 'source ~/.bashrc' to apply changes."
+          """
+                      zip_file.writestr('scripts/setup.sh', setup_script)
+                  
+                  zip_buffer.seek(0)
+                  
+                  # Upload to S3
+                  s3.put_object(
+                      Bucket=bucket,
+                      Key=key,
+                      Body=zip_buffer.getvalue(),
+                      ContentType='application/zip'
+                  )
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'Bucket': bucket,
+                      'Key': key
+                  })
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  # IAM Role for Initial Code Creator Lambda
+  InitialCodeCreatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: !Sub '${InitialCodeBucket}/*'
+
+  # Custom Resource to Trigger Initial Code Creation
+  InitialCodeArchive:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt InitialCodeCreatorFunction.Arn
+      Bucket: !Ref InitialCodeBucket
+      Key: 'initial-code.zip'
+      EnvironmentName: !Ref EnvironmentName
+      ProjectType: !Ref ProjectType
+
+  # ========================================================================
+  # CLOUD9 ENVIRONMENT
+  # ========================================================================
+  
+  # Main Cloud9 Environment
+  Cloud9Environment:
+    Type: AWS::Cloud9::EnvironmentEC2
+    Properties:
+      Name: !Ref EnvironmentName
+      Description: !Ref EnvironmentDescription
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref ImageId
+      AutomaticStopTimeMinutes: !Ref AutomaticStopTimeMinutes
+      SubnetId: !If [HasSubnetId, !Ref SubnetId, !Ref 'AWS::NoValue']
+      ConnectionType: CONNECT_SSM
+      OwnerArn: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+      Tags:
+        - Key: Name
+          Value: !Ref EnvironmentName
+        - Key: Purpose
+          Value: Team Development
+        - Key: ProjectType
+          Value: !Ref ProjectType
+        - Key: Environment
+          Value: development
+
+  # ========================================================================
+  # CLOUDWATCH MONITORING
+  # ========================================================================
+  
+  # CloudWatch Dashboard for Environment Monitoring
+  Cloud9MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableMonitoringDashboard
+    Properties:
+      DashboardName: !Sub '${EnvironmentName}-Cloud9-Dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/EC2", "CPUUtilization", "InstanceId", "AUTO"],
+                  ["AWS/EC2", "NetworkIn", "InstanceId", "AUTO"],
+                  ["AWS/EC2", "NetworkOut", "InstanceId", "AUTO"]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Cloud9 Environment Metrics",
+                "period": 300,
+                "stat": "Average",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/EC2", "DiskReadOps", "InstanceId", "AUTO"],
+                  ["AWS/EC2", "DiskWriteOps", "InstanceId", "AUTO"]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Disk I/O Operations",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/cloud9/${EnvironmentName}'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Cloud9 Environment Logs",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Log Group for Environment
+  Cloud9LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/cloud9/${EnvironmentName}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-LogGroup'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ========================================================================
+  # SYSTEMS MANAGER DOCUMENTS
+  # ========================================================================
+  
+  # SSM Document for Environment Setup Automation
+  EnvironmentSetupDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      DocumentFormat: YAML
+      Name: !Sub '${EnvironmentName}-Setup-Document'
+      Content:
+        schemaVersion: '2.2'
+        description: 'Automated setup for Cloud9 development environment'
+        parameters:
+          projectType:
+            type: String
+            description: 'Type of development project'
+            default: !Ref ProjectType
+          repositoryUrl:
+            type: String
+            description: 'CodeCommit repository URL'
+            default: !GetAtt CodeCommitRepository.CloneUrlHttp
+        mainSteps:
+          - action: 'aws:runShellScript'
+            name: 'setupEnvironment'
+            inputs:
+              timeoutSeconds: '600'
+              runCommand:
+                - '#!/bin/bash'
+                - 'echo "Starting Cloud9 environment setup..."'
+                - ''
+                - '# Update system packages'
+                - 'sudo yum update -y'
+                - ''
+                - '# Install development tools'
+                - 'sudo yum install -y git htop tree jq curl wget unzip'
+                - ''
+                - '# Clone repository'
+                - 'cd /home/ec2-user/environment'
+                - !Sub 'git clone ${CodeCommitRepository.CloneUrlHttp} project'
+                - ''
+                - '# Project-specific setup'
+                - 'PROJECT_TYPE="{{projectType}}"'
+                - 'case "$PROJECT_TYPE" in'
+                - '  "web-development")'
+                - '    echo "Setting up web development tools..."'
+                - '    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash'
+                - '    export NVM_DIR="$HOME/.nvm"'
+                - '    [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"'
+                - '    nvm install --lts && nvm use --lts'
+                - '    npm install -g nodemon jest @aws-cdk/cli'
+                - '    ;;'
+                - '  "data-science")'
+                - '    echo "Setting up data science tools..."'
+                - '    pip3 install --user pandas numpy matplotlib seaborn jupyter scikit-learn boto3'
+                - '    ;;'
+                - '  "serverless")'
+                - '    echo "Setting up serverless tools..."'
+                - '    pip3 install --user aws-sam-cli'
+                - '    npm install -g serverless @aws-cdk/cli'
+                - '    ;;'
+                - 'esac'
+                - ''
+                - '# Configure Git'
+                - 'git config --global init.defaultBranch main'
+                - 'git config --global pull.rebase false'
+                - ''
+                - '# Create project structure'
+                - 'mkdir -p /home/ec2-user/environment/{projects,scripts,docs}'
+                - ''
+                - 'echo "Cloud9 environment setup completed successfully!"'
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+Outputs:
+  Cloud9EnvironmentId:
+    Description: ID of the Cloud9 environment
+    Value: !Ref Cloud9Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Cloud9EnvironmentId'
+
+  Cloud9EnvironmentName:
+    Description: Name of the Cloud9 environment
+    Value: !Ref EnvironmentName
+    Export:
+      Name: !Sub '${AWS::StackName}-Cloud9EnvironmentName'
+
+  Cloud9EnvironmentArn:
+    Description: ARN of the Cloud9 environment
+    Value: !Sub 'arn:aws:cloud9:${AWS::Region}:${AWS::AccountId}:environment:${Cloud9Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-Cloud9EnvironmentArn'
+
+  Cloud9AccessUrl:
+    Description: URL to access the Cloud9 environment (via AWS Console)
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloud9/ide/${Cloud9Environment}'
+
+  CodeCommitRepositoryName:
+    Description: Name of the CodeCommit repository
+    Value: !GetAtt CodeCommitRepository.Name
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeCommitRepositoryName'
+
+  CodeCommitRepositoryArn:
+    Description: ARN of the CodeCommit repository
+    Value: !GetAtt CodeCommitRepository.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeCommitRepositoryArn'
+
+  CodeCommitCloneUrlHttp:
+    Description: HTTPS clone URL for the CodeCommit repository
+    Value: !GetAtt CodeCommitRepository.CloneUrlHttp
+
+  CodeCommitCloneUrlSsh:
+    Description: SSH clone URL for the CodeCommit repository
+    Value: !GetAtt CodeCommitRepository.CloneUrlSsh
+
+  IAMRoleArn:
+    Description: ARN of the IAM role for Cloud9 environment
+    Value: !GetAtt Cloud9ServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IAMRoleArn'
+
+  CloudWatchDashboardUrl:
+    Condition: EnableMonitoringDashboard
+    Description: URL to the CloudWatch monitoring dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${EnvironmentName}-Cloud9-Dashboard'
+
+  SSMDocumentName:
+    Description: Name of the SSM document for environment setup
+    Value: !Ref EnvironmentSetupDocument
+    Export:
+      Name: !Sub '${AWS::StackName}-SSMDocumentName'
+
+  ProjectType:
+    Description: Development project type for this environment
+    Value: !Ref ProjectType
+
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost range (USD) based on instance type and 8 hours daily usage
+    Value: !Sub 
+      - '${CostRange} (based on ${InstanceType} running ~8 hours/day)'
+      - CostRange: !FindInMap
+          - InstanceCostMap
+          - !Ref InstanceType
+          - MonthlyCost
+
+  UsageGuidelines:
+    Description: Important usage guidelines for cost optimization
+    Value: 'Environment auto-stops after inactivity. Use hibernation feature to reduce costs. Monitor usage via CloudWatch dashboard.'
+
+# ============================================================================
+# MAPPINGS
+# ============================================================================
+Mappings:
+  # Cost estimation mapping for different instance types
+  InstanceCostMap:
+    t2.micro:
+      MonthlyCost: '$15-25'
+    t2.small:
+      MonthlyCost: '$25-35'
+    t2.medium:
+      MonthlyCost: '$45-60'
+    t3.micro:
+      MonthlyCost: '$15-25'
+    t3.small:
+      MonthlyCost: '$25-35'
+    t3.medium:
+      MonthlyCost: '$45-65'
+    t3.large:
+      MonthlyCost: '$85-110'
+    t3.xlarge:
+      MonthlyCost: '$170-220'
+    m5.large:
+      MonthlyCost: '$95-125'
+    m5.xlarge:
+      MonthlyCost: '$190-250'
+    c5.large:
+      MonthlyCost: '$85-115'
+    c5.xlarge:
+      MonthlyCost: '$170-230'
+
+# ============================================================================
+# METADATA
+# ============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - EnvironmentName
+          - EnvironmentDescription
+          - ProjectType
+          - InstanceType
+          - AutomaticStopTimeMinutes
+          - ImageId
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - SubnetId
+      - Label:
+          default: "Team Collaboration"
+        Parameters:
+          - TeamMemberArns
+          - RepositoryName
+      - Label:
+          default: "Monitoring and Management"
+        Parameters:
+          - EnableMonitoring
+    ParameterLabels:
+      EnvironmentName:
+        default: "Environment Name"
+      EnvironmentDescription:
+        default: "Environment Description"
+      ProjectType:
+        default: "Development Project Type"
+      InstanceType:
+        default: "EC2 Instance Type"
+      AutomaticStopTimeMinutes:
+        default: "Auto-Stop Time (Minutes)"
+      ImageId:
+        default: "AMI Image ID"
+      SubnetId:
+        default: "VPC Subnet ID (Optional)"
+      TeamMemberArns:
+        default: "Team Member ARNs"
+      RepositoryName:
+        default: "Repository Name"
+      EnableMonitoring:
+        default: "Enable CloudWatch Dashboard"
+
+  AWS::CloudFormation::Designer:
+    ApplicationName: AWS Cloud9 Developer Environments
+    ApplicationDescription: Collaborative cloud-based development environments with integrated tooling
+    Version: 1.0.0

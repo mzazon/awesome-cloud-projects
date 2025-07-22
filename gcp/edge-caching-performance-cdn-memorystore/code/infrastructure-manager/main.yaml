@@ -1,0 +1,613 @@
+# Infrastructure Manager Configuration for Edge Caching Performance with Cloud CDN and Memorystore
+# This configuration deploys a complete intelligent edge caching system using:
+# - Cloud CDN for global content distribution
+# - Memorystore for Redis as high-performance cache layer
+# - Cloud Load Balancing for traffic distribution
+# - Cloud Storage for origin content
+# - VPC networking for secure communication
+
+apiVersion: blueprints.cloud.google.com/v1alpha1
+kind: Blueprint
+metadata:
+  name: edge-caching-performance-cdn-memorystore
+  annotations:
+    version: 1.0.0
+    description: "Intelligent edge caching system with Cloud CDN and Memorystore"
+    author: "Google Cloud Recipes"
+    category: "networking"
+    difficulty: "200"
+    estimated-time: "120 minutes"
+
+spec:
+  # Input parameters for customization
+  parameters:
+    - name: project_id
+      description: "GCP Project ID"
+      type: string
+      required: true
+    
+    - name: region
+      description: "Primary deployment region"
+      type: string
+      default: "us-central1"
+      required: true
+    
+    - name: zone
+      description: "Primary deployment zone"
+      type: string
+      default: "us-central1-a"
+      required: true
+    
+    - name: redis_size
+      description: "Redis instance memory size in GB"
+      type: integer
+      default: 5
+      minimum: 1
+      maximum: 300
+    
+    - name: cache_ttl
+      description: "Default cache TTL in seconds"
+      type: integer
+      default: 3600
+      minimum: 300
+      maximum: 86400
+    
+    - name: enable_monitoring
+      description: "Enable advanced monitoring and alerting"
+      type: boolean
+      default: true
+    
+    - name: resource_suffix
+      description: "Suffix for resource names to ensure uniqueness"
+      type: string
+      default: "001"
+      pattern: "^[a-z0-9]{3}$"
+
+  # Resource definitions
+  resources:
+    # Enable required APIs
+    - name: required-apis
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        parent: projects/{{ .project_id }}
+        serviceName: compute.googleapis.com
+        consumerId: project:{{ .project_id }}
+      metadata:
+        dependsOn: []
+
+    - name: redis-api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        parent: projects/{{ .project_id }}
+        serviceName: redis.googleapis.com
+        consumerId: project:{{ .project_id }}
+      metadata:
+        dependsOn: []
+
+    - name: storage-api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        parent: projects/{{ .project_id }}
+        serviceName: storage.googleapis.com
+        consumerId: project:{{ .project_id }}
+      metadata:
+        dependsOn: []
+
+    - name: dns-api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        parent: projects/{{ .project_id }}
+        serviceName: dns.googleapis.com
+        consumerId: project:{{ .project_id }}
+      metadata:
+        dependsOn: []
+
+    - name: monitoring-api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        parent: projects/{{ .project_id }}
+        serviceName: monitoring.googleapis.com
+        consumerId: project:{{ .project_id }}
+      metadata:
+        dependsOn: []
+
+    # VPC Network Infrastructure
+    - name: cdn-network
+      type: gcp-types/compute-v1:networks
+      properties:
+        project: {{ .project_id }}
+        name: cdn-network-{{ .resource_suffix }}
+        description: "VPC network for CDN and cache infrastructure"
+        autoCreateSubnetworks: false
+        routingConfig:
+          routingMode: REGIONAL
+      metadata:
+        dependsOn: ["required-apis"]
+
+    - name: cdn-subnet
+      type: gcp-types/compute-v1:subnetworks
+      properties:
+        project: {{ .project_id }}
+        region: {{ .region }}
+        name: cdn-subnet-{{ .resource_suffix }}
+        description: "Subnet for cache infrastructure components"
+        network: $(ref.cdn-network.selfLink)
+        ipCidrRange: "10.0.0.0/24"
+        enableFlowLogs: true
+        logConfig:
+          enable: true
+          aggregationInterval: INTERVAL_5_SEC
+          flowSampling: 0.5
+          metadata: INCLUDE_ALL_METADATA
+      metadata:
+        dependsOn: ["cdn-network"]
+
+    # Firewall Rules for secure communication
+    - name: cdn-firewall-allow-internal
+      type: gcp-types/compute-v1:firewalls
+      properties:
+        project: {{ .project_id }}
+        name: cdn-firewall-allow-internal-{{ .resource_suffix }}
+        description: "Allow internal communication within CDN network"
+        network: $(ref.cdn-network.selfLink)
+        sourceRanges: ["10.0.0.0/24"]
+        targetTags: ["cdn-cache"]
+        allowed:
+          - IPProtocol: tcp
+            ports: ["80", "443", "6379"]
+          - IPProtocol: icmp
+      metadata:
+        dependsOn: ["cdn-network"]
+
+    - name: cdn-firewall-allow-health-check
+      type: gcp-types/compute-v1:firewalls
+      properties:
+        project: {{ .project_id }}
+        name: cdn-firewall-allow-health-check-{{ .resource_suffix }}
+        description: "Allow health check probes from Google Cloud load balancers"
+        network: $(ref.cdn-network.selfLink)
+        sourceRanges: ["130.211.0.0/22", "35.191.0.0/16"]
+        targetTags: ["cdn-backend"]
+        allowed:
+          - IPProtocol: tcp
+            ports: ["80", "443"]
+      metadata:
+        dependsOn: ["cdn-network"]
+
+    # Memorystore Redis Instance
+    - name: intelligent-cache-redis
+      type: gcp-types/redis-v1:projects.locations.instances
+      properties:
+        parent: projects/{{ .project_id }}/locations/{{ .region }}
+        instanceId: intelligent-cache-{{ .resource_suffix }}
+        instance:
+          displayName: "Intelligent Cache Redis Instance"
+          description: "High-performance Redis cache for CDN edge caching"
+          tier: STANDARD_HA
+          memorySizeGb: {{ .redis_size }}
+          redisVersion: REDIS_6_X
+          authorizedNetwork: $(ref.cdn-network.selfLink)
+          redisConfigs:
+            maxmemory-policy: "allkeys-lru"
+            timeout: "300"
+            tcp-keepalive: "60"
+          locationId: {{ .zone }}
+          alternativeLocationId: {{ .zone | replace "a" "b" }}
+          authEnabled: true
+          connectMode: PRIVATE_SERVICE_ACCESS
+          transitEncryptionMode: SERVER_AUTHENTICATION
+          readReplicasMode: READ_REPLICAS_ENABLED
+          replicaCount: 1
+          labels:
+            environment: "production"
+            component: "cache"
+            recipe: "edge-caching-performance"
+      metadata:
+        dependsOn: ["redis-api", "cdn-subnet"]
+
+    # Cloud Storage Bucket for origin content
+    - name: origin-content-bucket
+      type: gcp-types/storage-v1:buckets
+      properties:
+        project: {{ .project_id }}
+        name: cdn-origin-content-{{ .project_id }}-{{ .resource_suffix }}
+        location: US
+        storageClass: STANDARD
+        versioning:
+          enabled: true
+        lifecycle:
+          rule:
+            - action:
+                type: Delete
+              condition:
+                age: 90
+                isLive: false
+            - action:
+                type: SetStorageClass
+                storageClass: NEARLINE
+              condition:
+                age: 30
+                isLive: true
+        cors:
+          - origin: ["*"]
+            method: ["GET", "HEAD"]
+            responseHeader: ["Content-Type", "Cache-Control"]
+            maxAgeSeconds: 3600
+        uniformBucketLevelAccess:
+          enabled: true
+        labels:
+          environment: "production"
+          component: "origin"
+          recipe: "edge-caching-performance"
+      metadata:
+        dependsOn: ["storage-api"]
+
+    # IAM binding for public read access to bucket
+    - name: bucket-public-read-policy
+      type: gcp-types/storage-v1:buckets/iam
+      properties:
+        bucket: $(ref.origin-content-bucket.name)
+        bindings:
+          - role: roles/storage.objectViewer
+            members:
+              - allUsers
+      metadata:
+        dependsOn: ["origin-content-bucket"]
+
+    # Static IP address for CDN
+    - name: cdn-static-ip
+      type: gcp-types/compute-v1:globalAddresses
+      properties:
+        project: {{ .project_id }}
+        name: cdn-static-ip-{{ .resource_suffix }}
+        description: "Static IP address for CDN global load balancer"
+        addressType: EXTERNAL
+        ipVersion: IPV4
+      metadata:
+        dependsOn: ["required-apis"]
+
+    # Health Check for backend services
+    - name: cdn-health-check
+      type: gcp-types/compute-v1:healthChecks
+      properties:
+        project: {{ .project_id }}
+        name: cdn-health-check-{{ .resource_suffix }}
+        description: "Health check for CDN backend services"
+        type: HTTP
+        httpHealthCheck:
+          port: 80
+          requestPath: "/"
+          checkIntervalSec: 30
+          timeoutSec: 10
+          healthyThreshold: 2
+          unhealthyThreshold: 3
+        logConfig:
+          enable: true
+      metadata:
+        dependsOn: ["required-apis"]
+
+    # Backend Service with CDN enabled
+    - name: cdn-backend-service
+      type: gcp-types/compute-v1:backendServices
+      properties:
+        project: {{ .project_id }}
+        name: cdn-backend-service-{{ .resource_suffix }}
+        description: "Backend service for CDN with Cloud Storage origin"
+        protocol: HTTP
+        portName: http
+        timeoutSec: 30
+        healthChecks:
+          - $(ref.cdn-health-check.selfLink)
+        enableCDN: true
+        cdnPolicy:
+          cacheMode: CACHE_ALL_STATIC
+          defaultTtl: {{ .cache_ttl }}
+          maxTtl: {{ .cache_ttl | mul 24 }}
+          clientTtl: {{ .cache_ttl }}
+          negativeCaching: true
+          negativeCachingPolicy:
+            - code: 404
+              ttl: 120
+            - code: 403
+              ttl: 120
+          cacheKeyPolicy:
+            includeProtocol: true
+            includeHost: true
+            includeQueryString: false
+            queryStringWhitelist: []
+            queryStringBlacklist: []
+            includeHttpHeaders: []
+            includeNamedCookies: []
+          compressionMode: AUTOMATIC
+          serveWhileStale: 86400
+        customRequestHeaders:
+          - "X-Client-Region:{client_region}"
+          - "X-Client-City:{client_city}"
+        backends:
+          - backendBucket: $(ref.origin-content-bucket.name)
+            description: "Cloud Storage origin backend"
+        iap:
+          enabled: false
+        loadBalancingScheme: EXTERNAL
+        localityLbPolicy: ROUND_ROBIN
+        logConfig:
+          enable: true
+          sampleRate: 1.0
+      metadata:
+        dependsOn: ["cdn-health-check", "origin-content-bucket"]
+
+    # URL Map for intelligent traffic routing
+    - name: cdn-url-map
+      type: gcp-types/compute-v1:urlMaps
+      properties:
+        project: {{ .project_id }}
+        name: cdn-url-map-{{ .resource_suffix }}
+        description: "URL map for intelligent CDN traffic routing"
+        defaultService: $(ref.cdn-backend-service.selfLink)
+        pathMatchers:
+          - name: api-path-matcher
+            description: "Path matcher for API endpoints"
+            defaultService: $(ref.cdn-backend-service.selfLink)
+            pathRules:
+              - paths: ["/api/*"]
+                service: $(ref.cdn-backend-service.selfLink)
+              - paths: ["/static/*"]
+                service: $(ref.cdn-backend-service.selfLink)
+              - paths: ["/*.html", "/*.css", "/*.js", "/*.jpg", "/*.png", "/*.gif"]
+                service: $(ref.cdn-backend-service.selfLink)
+        hostRules:
+          - hosts: ["*"]
+            pathMatcher: api-path-matcher
+        tests:
+          - service: $(ref.cdn-backend-service.selfLink)
+            host: "test.example.com"
+            path: "/"
+      metadata:
+        dependsOn: ["cdn-backend-service"]
+
+    # SSL Certificate (self-managed, replace with managed certificate in production)
+    - name: cdn-ssl-certificate
+      type: gcp-types/compute-v1:sslCertificates
+      properties:
+        project: {{ .project_id }}
+        name: cdn-ssl-certificate-{{ .resource_suffix }}
+        description: "SSL certificate for CDN HTTPS termination"
+        type: SELF_MANAGED
+        certificate: |
+          -----BEGIN CERTIFICATE-----
+          # Replace with your actual certificate
+          # This is a placeholder for demo purposes
+          -----END CERTIFICATE-----
+        privateKey: |
+          -----BEGIN PRIVATE KEY-----
+          # Replace with your actual private key
+          # This is a placeholder for demo purposes
+          -----END PRIVATE KEY-----
+      metadata:
+        dependsOn: ["required-apis"]
+
+    # Target HTTPS Proxy
+    - name: cdn-target-proxy
+      type: gcp-types/compute-v1:targetHttpsProxies
+      properties:
+        project: {{ .project_id }}
+        name: cdn-target-proxy-{{ .resource_suffix }}
+        description: "Target HTTPS proxy for CDN with QUIC support"
+        urlMap: $(ref.cdn-url-map.selfLink)
+        sslCertificates:
+          - $(ref.cdn-ssl-certificate.selfLink)
+        quicOverride: ENABLE
+        sslPolicy: ""
+      metadata:
+        dependsOn: ["cdn-url-map", "cdn-ssl-certificate"]
+
+    # Global Forwarding Rule
+    - name: cdn-forwarding-rule
+      type: gcp-types/compute-v1:globalForwardingRules
+      properties:
+        project: {{ .project_id }}
+        name: cdn-forwarding-rule-{{ .resource_suffix }}
+        description: "Global forwarding rule for CDN traffic"
+        IPAddress: $(ref.cdn-static-ip.address)
+        IPProtocol: TCP
+        portRange: "443"
+        target: $(ref.cdn-target-proxy.selfLink)
+        loadBalancingScheme: EXTERNAL
+        networkTier: PREMIUM
+      metadata:
+        dependsOn: ["cdn-target-proxy", "cdn-static-ip"]
+
+    # Cloud Monitoring Dashboard (if monitoring is enabled)
+    - name: cdn-monitoring-dashboard
+      type: gcp-types/monitoring-v1:projects.dashboards
+      properties:
+        parent: projects/{{ .project_id }}
+        dashboard:
+          displayName: "CDN Cache Performance Dashboard"
+          mosaicLayout:
+            tiles:
+              - width: 6
+                height: 4
+                widget:
+                  title: "Cache Hit Ratio"
+                  xyChart:
+                    dataSets:
+                      - timeSeriesQuery:
+                          timeSeriesFilter:
+                            filter: 'resource.type="cdn_origin"'
+                            aggregation:
+                              alignmentPeriod: "60s"
+                              perSeriesAligner: "ALIGN_RATE"
+                              crossSeriesReducer: "REDUCE_MEAN"
+                      plotType: "LINE"
+                    yAxis:
+                      label: "Hit Ratio"
+                      scale: "LINEAR"
+                    xAxis:
+                      label: "Time"
+                      scale: "TIME"
+              - width: 6
+                height: 4
+                widget:
+                  title: "Request Latency"
+                  xyChart:
+                    dataSets:
+                      - timeSeriesQuery:
+                          timeSeriesFilter:
+                            filter: 'resource.type="cdn_origin"'
+                            aggregation:
+                              alignmentPeriod: "60s"
+                              perSeriesAligner: "ALIGN_MEAN"
+                              crossSeriesReducer: "REDUCE_MEAN"
+                      plotType: "LINE"
+                    yAxis:
+                      label: "Latency (ms)"
+                      scale: "LINEAR"
+                    xAxis:
+                      label: "Time"
+                      scale: "TIME"
+              - width: 6
+                height: 4
+                widget:
+                  title: "Redis Memory Usage"
+                  xyChart:
+                    dataSets:
+                      - timeSeriesQuery:
+                          timeSeriesFilter:
+                            filter: 'resource.type="redis_instance"'
+                            aggregation:
+                              alignmentPeriod: "60s"
+                              perSeriesAligner: "ALIGN_MEAN"
+                              crossSeriesReducer: "REDUCE_MEAN"
+                      plotType: "LINE"
+                    yAxis:
+                      label: "Memory Usage (%)"
+                      scale: "LINEAR"
+                    xAxis:
+                      label: "Time"
+                      scale: "TIME"
+              - width: 6
+                height: 4
+                widget:
+                  title: "Origin Request Rate"
+                  xyChart:
+                    dataSets:
+                      - timeSeriesQuery:
+                          timeSeriesFilter:
+                            filter: 'resource.type="cdn_origin"'
+                            aggregation:
+                              alignmentPeriod: "60s"
+                              perSeriesAligner: "ALIGN_RATE"
+                              crossSeriesReducer: "REDUCE_SUM"
+                      plotType: "LINE"
+                    yAxis:
+                      label: "Requests/sec"
+                      scale: "LINEAR"
+                    xAxis:
+                      label: "Time"
+                      scale: "TIME"
+          labels:
+            environment: "production"
+            component: "monitoring"
+            recipe: "edge-caching-performance"
+      metadata:
+        dependsOn: ["monitoring-api"]
+        runtimePolicy:
+          CREATE: '{{ .enable_monitoring }}'
+          UPDATE: '{{ .enable_monitoring }}'
+          DELETE: '{{ .enable_monitoring }}'
+
+    # Alerting Policy for low cache hit ratio
+    - name: low-cache-hit-ratio-alert
+      type: gcp-types/monitoring-v1:projects.alertPolicies
+      properties:
+        parent: projects/{{ .project_id }}
+        alertPolicy:
+          displayName: "Low CDN Cache Hit Ratio Alert"
+          documentation:
+            content: "Alert when CDN cache hit ratio drops below 70%"
+            mimeType: "text/markdown"
+          conditions:
+            - displayName: "Cache hit ratio below threshold"
+              conditionThreshold:
+                filter: 'resource.type="cdn_origin"'
+                comparison: "COMPARISON_LESS_THAN"
+                thresholdValue: 0.7
+                duration: "300s"
+                aggregations:
+                  - alignmentPeriod: "60s"
+                    perSeriesAligner: "ALIGN_RATE"
+                    crossSeriesReducer: "REDUCE_MEAN"
+          combiner: "OR"
+          enabled: true
+          notificationChannels: []
+          alertStrategy:
+            autoClose: "1800s"
+        enabled: true
+      metadata:
+        dependsOn: ["monitoring-api"]
+        runtimePolicy:
+          CREATE: '{{ .enable_monitoring }}'
+          UPDATE: '{{ .enable_monitoring }}'
+          DELETE: '{{ .enable_monitoring }}'
+
+  # Output values for verification and integration
+  outputs:
+    - name: cdn_ip_address
+      description: "Static IP address for the CDN endpoint"
+      value: $(ref.cdn-static-ip.address)
+    
+    - name: redis_host
+      description: "Redis instance host address"
+      value: $(ref.intelligent-cache-redis.host)
+    
+    - name: redis_port
+      description: "Redis instance port"
+      value: $(ref.intelligent-cache-redis.port)
+    
+    - name: bucket_name
+      description: "Origin content bucket name"
+      value: $(ref.origin-content-bucket.name)
+    
+    - name: backend_service_name
+      description: "CDN backend service name"
+      value: $(ref.cdn-backend-service.name)
+    
+    - name: network_name
+      description: "VPC network name"
+      value: $(ref.cdn-network.name)
+    
+    - name: subnet_name
+      description: "VPC subnet name"
+      value: $(ref.cdn-subnet.name)
+    
+    - name: url_map_name
+      description: "URL map name for traffic routing"
+      value: $(ref.cdn-url-map.name)
+    
+    - name: health_check_name
+      description: "Health check name"
+      value: $(ref.cdn-health-check.name)
+    
+    - name: cdn_endpoint_url
+      description: "CDN endpoint URL (requires DNS configuration)"
+      value: "https://$(ref.cdn-static-ip.address)"
+    
+    - name: dashboard_url
+      description: "Monitoring dashboard URL"
+      value: "https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.cdn-monitoring-dashboard.name)?project={{ .project_id }}"
+      condition: '{{ .enable_monitoring }}'
+
+  # Deployment metadata
+  metadata:
+    labels:
+      recipe: "edge-caching-performance-cdn-memorystore"
+      version: "1.0"
+      category: "networking"
+      difficulty: "200"
+      provider: "gcp"
+    annotations:
+      description: "Intelligent edge caching system with Cloud CDN and Memorystore"
+      documentation: "https://cloud.google.com/cdn/docs"
+      cost-estimate: "$150-300/month"
+      deployment-time: "15-20 minutes"

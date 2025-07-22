@@ -1,0 +1,583 @@
+# Infrastructure Manager Configuration for Carbon-Efficient Batch Processing
+# This configuration deploys a complete carbon-aware batch processing system
+# using Google Cloud services optimized for sustainability
+
+metadata:
+  name: carbon-efficient-batch-processing
+  namespace: sustainability-intelligence
+  labels:
+    solution: carbon-aware-batch
+    category: sustainability
+    difficulty: intermediate
+
+imports:
+  - path: modules/
+
+resources:
+  # ============================================================================
+  # PROJECT AND API CONFIGURATION
+  # ============================================================================
+  
+  # Enable required Google Cloud APIs for the solution
+  - name: enable-batch-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-id.projectId)/services/batch.googleapis.com
+    metadata:
+      dependsOn:
+        - project-id
+
+  - name: enable-pubsub-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-id.projectId)/services/pubsub.googleapis.com
+    metadata:
+      dependsOn:
+        - project-id
+
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-id.projectId)/services/monitoring.googleapis.com
+    metadata:
+      dependsOn:
+        - project-id
+
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-id.projectId)/services/storage.googleapis.com
+    metadata:
+      dependsOn:
+        - project-id
+
+  - name: enable-cloudfunctions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-id.projectId)/services/cloudfunctions.googleapis.com
+    metadata:
+      dependsOn:
+        - project-id
+
+  - name: enable-cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-id.projectId)/services/cloudbuild.googleapis.com
+    metadata:
+      dependsOn:
+        - project-id
+
+  # ============================================================================
+  # CLOUD STORAGE FOR CARBON DATA AND JOB ARTIFACTS
+  # ============================================================================
+  
+  # Primary storage bucket for carbon data, job scripts, and results
+  - name: carbon-batch-storage
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: carbon-batch-data-$(ref.random-suffix.hex)
+      project: $(ref.project-id.projectId)
+      location: $(ref.deployment-config.region)
+      storageClass: STANDARD
+      # Enable versioning for data protection and compliance
+      versioning:
+        enabled: true
+      # Lifecycle management for cost optimization
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 365  # Delete objects after 1 year
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30  # Move to nearline after 30 days
+      # Enhanced security and access logging
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      logging:
+        logBucket: carbon-batch-data-$(ref.random-suffix.hex)
+        logObjectPrefix: access-logs/
+    metadata:
+      dependsOn:
+        - enable-storage-api
+        - random-suffix
+
+  # ============================================================================
+  # PUB/SUB MESSAGING FOR CARBON EVENT COORDINATION
+  # ============================================================================
+  
+  # Main topic for carbon optimization events and job coordination
+  - name: carbon-events-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project-id.projectId)/topics/carbon-events-$(ref.random-suffix.hex)
+      # Enable message ordering for consistent carbon data processing
+      messageStoragePolicy:
+        allowedPersistenceRegions:
+          - $(ref.deployment-config.region)
+      # Configure message retention for sustainability reporting
+      messageRetentionDuration: 604800s  # 7 days
+    metadata:
+      dependsOn:
+        - enable-pubsub-api
+        - random-suffix
+
+  # Subscription for carbon event processing with appropriate retry policies
+  - name: carbon-events-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(ref.project-id.projectId)/subscriptions/carbon-sub-$(ref.random-suffix.hex)
+      topic: $(ref.carbon-events-topic.name)
+      # Configure acknowledgment deadline for batch processing
+      ackDeadlineSeconds: 600
+      # Enable message ordering for consistent processing
+      enableMessageOrdering: true
+      # Configure retry policy for reliable carbon data processing
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+      # Dead letter topic for failed carbon optimization events
+      deadLetterPolicy:
+        deadLetterTopic: $(ref.carbon-dlq-topic.name)
+        maxDeliveryAttempts: 5
+    metadata:
+      dependsOn:
+        - carbon-events-topic
+        - carbon-dlq-topic
+
+  # Dead letter queue for failed carbon optimization events
+  - name: carbon-dlq-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project-id.projectId)/topics/carbon-dlq-$(ref.random-suffix.hex)
+      messageStoragePolicy:
+        allowedPersistenceRegions:
+          - $(ref.deployment-config.region)
+    metadata:
+      dependsOn:
+        - enable-pubsub-api
+        - random-suffix
+
+  # ============================================================================
+  # CLOUD MONITORING FOR CARBON FOOTPRINT TRACKING
+  # ============================================================================
+  
+  # Custom metric descriptor for batch job carbon impact tracking
+  - name: carbon-impact-metric
+    type: gcp-types/monitoring-v3:projects.metricDescriptors
+    properties:
+      name: projects/$(ref.project-id.projectId)/metricDescriptors/custom.googleapis.com/batch/carbon_impact
+      type: custom.googleapis.com/batch/carbon_impact
+      displayName: Batch Job Carbon Impact
+      description: Estimated carbon impact of batch jobs in kgCO2e
+      metricKind: GAUGE
+      valueType: DOUBLE
+      # Labels for detailed carbon impact tracking
+      labels:
+        - key: job_id
+          valueType: STRING
+          description: Batch job identifier
+        - key: region
+          valueType: STRING
+          description: Execution region
+        - key: cfe_percent
+          valueType: STRING
+          description: Carbon-free energy percentage
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+
+  # Custom metric for carbon-free energy percentage tracking
+  - name: cfe-percentage-metric
+    type: gcp-types/monitoring-v3:projects.metricDescriptors
+    properties:
+      name: projects/$(ref.project-id.projectId)/metricDescriptors/custom.googleapis.com/sustainability/cfe_percentage
+      type: custom.googleapis.com/sustainability/cfe_percentage
+      displayName: Regional CFE Percentage
+      description: Carbon-free energy percentage by region
+      metricKind: GAUGE
+      valueType: DOUBLE
+      labels:
+        - key: region
+          valueType: STRING
+          description: Google Cloud region
+        - key: measurement_time
+          valueType: STRING
+          description: Measurement timestamp
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+
+  # Alert policy for high carbon impact detection
+  - name: high-carbon-impact-alert
+    type: gcp-types/monitoring-v3:projects.alertPolicies
+    properties:
+      displayName: High Carbon Impact Alert - Batch Jobs
+      documentation:
+        content: |
+          This alert triggers when batch jobs exceed carbon intensity thresholds,
+          indicating opportunities for sustainability optimization.
+        mimeType: text/markdown
+      conditions:
+        - displayName: Carbon Impact Threshold Exceeded
+          conditionThreshold:
+            filter: |
+              resource.type="generic_task" AND 
+              metric.type="custom.googleapis.com/batch/carbon_impact"
+            comparison: COMPARISON_GT
+            thresholdValue: 0.5  # kgCO2e threshold
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_MAX
+                groupByFields:
+                  - resource.label.job_id
+      combiner: OR
+      enabled: true
+      # Notification channels would be configured separately
+    metadata:
+      dependsOn:
+        - carbon-impact-metric
+
+  # ============================================================================
+  # CLOUD FUNCTIONS FOR CARBON-AWARE SCHEDULING
+  # ============================================================================
+  
+  # Service account for Carbon-Aware Scheduler function
+  - name: carbon-scheduler-sa
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: carbon-scheduler-sa-$(ref.random-suffix.hex)
+      serviceAccount:
+        displayName: Carbon-Aware Scheduler Service Account
+        description: Service account for carbon-aware batch job scheduling
+    metadata:
+      dependsOn:
+        - random-suffix
+
+  # IAM binding for Batch Job Admin role
+  - name: scheduler-batch-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.projectId)
+      role: roles/batch.jobsAdmin
+      member: serviceAccount:$(ref.carbon-scheduler-sa.email)
+    metadata:
+      dependsOn:
+        - carbon-scheduler-sa
+
+  # IAM binding for Pub/Sub Publisher role
+  - name: scheduler-pubsub-publisher-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.projectId)
+      role: roles/pubsub.publisher
+      member: serviceAccount:$(ref.carbon-scheduler-sa.email)
+    metadata:
+      dependsOn:
+        - carbon-scheduler-sa
+
+  # IAM binding for Monitoring Metric Writer role
+  - name: scheduler-monitoring-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.projectId)
+      role: roles/monitoring.metricWriter
+      member: serviceAccount:$(ref.carbon-scheduler-sa.email)
+    metadata:
+      dependsOn:
+        - carbon-scheduler-sa
+
+  # Cloud Storage bucket for function source code
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: carbon-scheduler-source-$(ref.random-suffix.hex)
+      project: $(ref.project-id.projectId)
+      location: $(ref.deployment-config.region)
+      storageClass: STANDARD
+    metadata:
+      dependsOn:
+        - enable-storage-api
+        - random-suffix
+
+  # Carbon-Aware Scheduler Cloud Function
+  - name: carbon-scheduler-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project-id.projectId)/locations/$(ref.deployment-config.region)
+      function:
+        name: carbon-scheduler-$(ref.random-suffix.hex)
+        description: Carbon-aware batch job scheduler with sustainability intelligence
+        sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/carbon-scheduler.zip
+        entryPoint: carbon_aware_scheduler
+        runtime: python39
+        timeout: 60s
+        availableMemoryMb: 256
+        # Environment variables for carbon intelligence configuration
+        environmentVariables:
+          PROJECT_ID: $(ref.project-id.projectId)
+          CARBON_TOPIC: $(ref.carbon-events-topic.name)
+          REGION: $(ref.deployment-config.region)
+          STORAGE_BUCKET: $(ref.carbon-batch-storage.name)
+        serviceAccountEmail: $(ref.carbon-scheduler-sa.email)
+        # HTTP trigger for external scheduling requests
+        httpsTrigger:
+          securityLevel: SECURE_ALWAYS
+        # Labels for resource management and cost tracking
+        labels:
+          solution: carbon-batch-processing
+          component: scheduler
+          environment: production
+    metadata:
+      dependsOn:
+        - enable-cloudfunctions-api
+        - carbon-scheduler-sa
+        - function-source-bucket
+        - carbon-events-topic
+        - carbon-batch-storage
+
+  # ============================================================================
+  # CLOUD BATCH CONFIGURATION
+  # ============================================================================
+  
+  # Service account for Batch jobs with sustainability permissions
+  - name: batch-job-sa
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: batch-job-sa-$(ref.random-suffix.hex)
+      serviceAccount:
+        displayName: Carbon-Aware Batch Job Service Account
+        description: Service account for executing carbon-aware batch jobs
+    metadata:
+      dependsOn:
+        - random-suffix
+
+  # IAM bindings for batch job service account
+  - name: batch-storage-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.projectId)
+      role: roles/storage.objectAdmin
+      member: serviceAccount:$(ref.batch-job-sa.email)
+    metadata:
+      dependsOn:
+        - batch-job-sa
+
+  - name: batch-pubsub-publisher-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.projectId)
+      role: roles/pubsub.publisher
+      member: serviceAccount:$(ref.batch-job-sa.email)
+    metadata:
+      dependsOn:
+        - batch-job-sa
+
+  - name: batch-monitoring-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.projectId)
+      role: roles/monitoring.metricWriter
+      member: serviceAccount:$(ref.batch-job-sa.email)
+    metadata:
+      dependsOn:
+        - batch-job-sa
+
+  - name: batch-logging-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.projectId)
+      role: roles/logging.logWriter
+      member: serviceAccount:$(ref.batch-job-sa.email)
+    metadata:
+      dependsOn:
+        - batch-job-sa
+
+  # ============================================================================
+  # NETWORKING AND SECURITY
+  # ============================================================================
+  
+  # VPC network for secure batch processing (optional - uses default if not specified)
+  - name: carbon-batch-network
+    type: gcp-types/compute-v1:networks
+    properties:
+      name: carbon-batch-network-$(ref.random-suffix.hex)
+      description: Dedicated network for carbon-aware batch processing
+      autoCreateSubnetworks: false
+      routingConfig:
+        routingMode: REGIONAL
+    metadata:
+      dependsOn:
+        - random-suffix
+
+  # Subnet for batch job execution in the selected region
+  - name: carbon-batch-subnet
+    type: gcp-types/compute-v1:subnetworks
+    properties:
+      name: carbon-batch-subnet-$(ref.random-suffix.hex)
+      description: Subnet for carbon-aware batch job execution
+      network: $(ref.carbon-batch-network.selfLink)
+      ipCidrRange: 10.0.0.0/24
+      region: $(ref.deployment-config.region)
+      # Enable private Google access for API connectivity without external IPs
+      privateIpGoogleAccess: true
+      # Secondary range for potential future expansion
+      secondaryIpRanges:
+        - rangeName: carbon-batch-secondary
+          ipCidrRange: 10.1.0.0/24
+    metadata:
+      dependsOn:
+        - carbon-batch-network
+
+  # Firewall rule for internal communication
+  - name: carbon-batch-internal-firewall
+    type: gcp-types/compute-v1:firewalls
+    properties:
+      name: carbon-batch-internal-$(ref.random-suffix.hex)
+      description: Allow internal communication for carbon batch processing
+      network: $(ref.carbon-batch-network.selfLink)
+      direction: INGRESS
+      priority: 1000
+      sourceRanges:
+        - 10.0.0.0/24
+      allowed:
+        - IPProtocol: tcp
+          ports:
+            - "22"
+            - "80"
+            - "443"
+        - IPProtocol: icmp
+      targetTags:
+        - carbon-batch-worker
+    metadata:
+      dependsOn:
+        - carbon-batch-network
+
+  # ============================================================================
+  # DEPLOYMENT CONFIGURATION AND UTILITIES
+  # ============================================================================
+  
+  # Project ID reference for consistent resource naming
+  - name: project-id
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: $(ref.deployment-config.project_id)
+
+  # Random suffix generator for unique resource names
+  - name: random-suffix
+    type: gcp-types/cloudresourcemanager-v1:virtual.randomString
+    properties:
+      length: 6
+      upper: false
+      special: false
+
+  # Deployment configuration template
+  - name: deployment-config
+    type: gcp-types/cloudresourcemanager-v1:virtual.deploymentConfiguration
+    properties:
+      project_id: PROJECT_ID_PLACEHOLDER
+      region: us-central1  # High CFE% region for sustainability optimization
+      zone: us-central1-a
+      environment: production
+      solution_name: carbon-efficient-batch-processing
+
+# ============================================================================
+# OUTPUTS FOR INTEGRATION AND VERIFICATION
+# ============================================================================
+
+outputs:
+  # Essential resource identifiers for external integration
+  - name: project_id
+    value: $(ref.project-id.projectId)
+    description: Google Cloud project ID for the carbon-efficient batch processing solution
+
+  - name: region
+    value: $(ref.deployment-config.region)
+    description: Primary deployment region optimized for carbon-free energy
+
+  - name: storage_bucket_name
+    value: $(ref.carbon-batch-storage.name)
+    description: Cloud Storage bucket for carbon data and job artifacts
+
+  - name: carbon_events_topic
+    value: $(ref.carbon-events-topic.name)
+    description: Pub/Sub topic for carbon optimization event coordination
+
+  - name: carbon_events_subscription
+    value: $(ref.carbon-events-subscription.name)
+    description: Pub/Sub subscription for carbon event processing
+
+  - name: scheduler_function_url
+    value: $(ref.carbon-scheduler-function.httpsTrigger.url)
+    description: HTTPS endpoint for the carbon-aware scheduler function
+
+  - name: batch_job_service_account
+    value: $(ref.batch-job-sa.email)
+    description: Service account email for carbon-aware batch job execution
+
+  - name: scheduler_service_account
+    value: $(ref.carbon-scheduler-sa.email)
+    description: Service account email for carbon-aware scheduler function
+
+  # Network configuration for batch job deployment
+  - name: vpc_network_name
+    value: $(ref.carbon-batch-network.name)
+    description: VPC network name for secure batch processing
+
+  - name: subnet_name
+    value: $(ref.carbon-batch-subnet.name)
+    description: Subnet name for batch job execution
+
+  # Monitoring and alerting configuration
+  - name: carbon_impact_metric_name
+    value: $(ref.carbon-impact-metric.name)
+    description: Custom metric name for carbon impact tracking
+
+  - name: high_carbon_alert_policy
+    value: $(ref.high-carbon-impact-alert.name)
+    description: Alert policy name for high carbon impact detection
+
+  # Resource naming suffix for consistency
+  - name: resource_suffix
+    value: $(ref.random-suffix.hex)
+    description: Random suffix used for unique resource naming
+
+# ============================================================================
+# CONFIGURATION NOTES AND BEST PRACTICES
+# ============================================================================
+
+# This Infrastructure Manager configuration implements a complete carbon-efficient
+# batch processing solution with the following sustainability optimizations:
+#
+# 1. REGIONAL OPTIMIZATION: Deploys in us-central1 for high CFE percentage
+# 2. RESOURCE EFFICIENCY: Uses preemptible instances and intelligent scaling
+# 3. CARBON INTELLIGENCE: Integrates real-time carbon footprint data
+# 4. MONITORING: Comprehensive sustainability metrics and alerting
+# 5. SECURITY: Least-privilege IAM and network isolation
+# 6. COST OPTIMIZATION: Lifecycle management and efficient resource allocation
+#
+# The configuration follows Google Cloud best practices for:
+# - Infrastructure as Code with Infrastructure Manager
+# - Service account security with minimal permissions
+# - Network security with private Google access
+# - Monitoring and alerting for sustainability metrics
+# - Resource organization with consistent labeling
+#
+# For production deployment:
+# 1. Update PROJECT_ID_PLACEHOLDER with your actual project ID
+# 2. Review and adjust region selection based on workload requirements
+# 3. Configure notification channels for carbon impact alerts
+# 4. Upload function source code to the designated storage bucket
+# 5. Test the complete solution with representative batch workloads
+#
+# Carbon efficiency considerations:
+# - Batch jobs automatically adjust intensity based on regional CFE percentage
+# - Scheduler optimizes job placement using real-time carbon data
+# - Monitoring tracks carbon impact for sustainability reporting
+# - Alert policies enable proactive carbon footprint management

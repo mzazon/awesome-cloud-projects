@@ -1,0 +1,1326 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Real-Time Recommendations with Amazon Personalize and A/B Testing Infrastructure'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'personalize-ab-test'
+    Description: 'Name of the project used as prefix for resources'
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+    MinLength: 3
+    MaxLength: 20
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'test', 'prod']
+    Description: 'Environment name for resource tagging and configuration'
+
+  EnablePersonalizeRealTimeEvents:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable real-time event tracking to Personalize'
+
+  MinProvisionedTPS:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 500
+    Description: 'Minimum provisioned transactions per second for Personalize campaigns'
+
+  ApiGatewayThrottleBurstLimit:
+    Type: Number
+    Default: 5000
+    MinValue: 1000
+    MaxValue: 10000
+    Description: 'API Gateway throttle burst limit'
+
+  ApiGatewayThrottleRateLimit:
+    Type: Number
+    Default: 2000
+    MinValue: 500
+    MaxValue: 5000
+    Description: 'API Gateway throttle rate limit'
+
+Conditions:
+  EnableRealTimeEvents: !Equals [!Ref EnablePersonalizeRealTimeEvents, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # S3 Bucket for Personalize Training Data
+  PersonalizeDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-personalize-data-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3LogGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: PersonalizeTrainingData
+
+  # CloudWatch Log Group for S3 Events
+  S3LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-personalize-bucket'
+      RetentionInDays: !If [IsProduction, 90, 30]
+
+  # IAM Role for Personalize
+  PersonalizeServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-PersonalizeServiceRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - personalize.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonPersonalizeFullAccess
+      Policies:
+        - PolicyName: PersonalizeS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: 
+                  - !GetAtt PersonalizeDataBucket.Arn
+                  - !Sub '${PersonalizeDataBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-LambdaExecutionRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt UsersTable.Arn
+                  - !GetAtt ItemsTable.Arn
+                  - !GetAtt ABAssignmentsTable.Arn
+                  - !GetAtt EventsTable.Arn
+                  - !Sub '${ItemsTable.Arn}/index/*'
+        - PolicyName: PersonalizeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - personalize:GetRecommendations
+                  - personalize:PutEvents
+                  - personalize:DescribeCampaign
+                  - personalize:DescribeSolution
+                  - personalize:DescribeDatasetImportJob
+                  - personalize:CreateDatasetGroup
+                  - personalize:CreateDataset
+                  - personalize:CreateDatasetImportJob
+                  - personalize:CreateSolution
+                  - personalize:CreateSolutionVersion
+                  - personalize:CreateCampaign
+                  - personalize:UpdateCampaign
+                Resource: '*'
+        - PolicyName: CloudWatchMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # DynamoDB Table for User Profiles
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-users-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: UserId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: UserId
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: UserProfiles
+
+  # DynamoDB Table for Item Catalog
+  ItemsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-items-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ItemId
+          AttributeType: S
+        - AttributeName: Category
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ItemId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: CategoryIndex
+          KeySchema:
+            - AttributeName: Category
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: ItemCatalog
+
+  # DynamoDB Table for A/B Test Assignments
+  ABAssignmentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-ab-assignments-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: UserId
+          AttributeType: S
+        - AttributeName: TestName
+          AttributeType: S
+      KeySchema:
+        - AttributeName: UserId
+          KeyType: HASH
+        - AttributeName: TestName
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: ABTestAssignments
+
+  # DynamoDB Table for Real-time Events
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-events-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: UserId
+          AttributeType: S
+        - AttributeName: Timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: UserId
+          KeyType: HASH
+        - AttributeName: Timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: EventTracking
+
+  # Lambda Function for A/B Test Router
+  ABTestRouterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-ab-test-router-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          AB_ASSIGNMENTS_TABLE: !Ref ABAssignmentsTable
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import hashlib
+          import os
+          from datetime import datetime, timedelta
+          
+          dynamodb = boto3.resource('dynamodb')
+          
+          def lambda_handler(event, context):
+              user_id = event.get('user_id')
+              test_name = event.get('test_name', 'default_recommendation_test')
+              
+              if not user_id:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'user_id is required'})
+                  }
+              
+              try:
+                  # Get or assign A/B test variant
+                  variant = get_or_assign_variant(user_id, test_name)
+                  
+                  # Get recommendation model configuration for variant
+                  model_config = get_model_config(variant)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'user_id': user_id,
+                          'test_name': test_name,
+                          'variant': variant,
+                          'model_config': model_config
+                      })
+                  }
+                  
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def get_or_assign_variant(user_id, test_name):
+              table = dynamodb.Table(os.environ['AB_ASSIGNMENTS_TABLE'])
+              
+              try:
+                  # Check if user already has assignment
+                  response = table.get_item(
+                      Key={'UserId': user_id, 'TestName': test_name}
+                  )
+                  
+                  if 'Item' in response:
+                      return response['Item']['Variant']
+                  
+              except Exception:
+                  pass
+              
+              # Assign new variant using consistent hashing
+              variant = assign_variant(user_id, test_name)
+              
+              # Store assignment with TTL (30 days)
+              ttl = int((datetime.now() + timedelta(days=30)).timestamp())
+              table.put_item(
+                  Item={
+                      'UserId': user_id,
+                      'TestName': test_name,
+                      'Variant': variant,
+                      'AssignmentTimestamp': int(datetime.now().timestamp()),
+                      'TTL': ttl
+                  }
+              )
+              
+              return variant
+          
+          def assign_variant(user_id, test_name):
+              # Use consistent hashing for stable assignment
+              hash_input = f"{user_id}-{test_name}".encode('utf-8')
+              hash_value = int(hashlib.md5(hash_input).hexdigest(), 16)
+              
+              # Define test configuration
+              test_config = {
+                  'default_recommendation_test': {
+                      'variant_a': 0.33,  # User-Personalization
+                      'variant_b': 0.33,  # Similar-Items
+                      'variant_c': 0.34   # Popularity-Count
+                  }
+              }
+              
+              config = test_config.get(test_name, test_config['default_recommendation_test'])
+              
+              # Determine variant based on hash
+              normalized_hash = (hash_value % 10000) / 10000.0
+              
+              cumulative = 0
+              for variant, probability in config.items():
+                  cumulative += probability
+                  if normalized_hash <= cumulative:
+                      return variant
+              
+              return 'variant_a'  # Fallback
+          
+          def get_model_config(variant):
+              # Configuration for each variant
+              configs = {
+                  'variant_a': {
+                      'recipe': 'aws-user-personalization',
+                      'campaign_arn': os.environ.get('CAMPAIGN_A_ARN', ''),
+                      'description': 'User-Personalization Algorithm'
+                  },
+                  'variant_b': {
+                      'recipe': 'aws-sims',
+                      'campaign_arn': os.environ.get('CAMPAIGN_B_ARN', ''),
+                      'description': 'Item-to-Item Similarity Algorithm'
+                  },
+                  'variant_c': {
+                      'recipe': 'aws-popularity-count',
+                      'campaign_arn': os.environ.get('CAMPAIGN_C_ARN', ''),
+                      'description': 'Popularity-Based Algorithm'
+                  }
+              }
+              
+              return configs.get(variant, configs['variant_a'])
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function for Recommendation Engine
+  RecommendationEngineFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-recommendation-engine-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          ITEMS_TABLE: !Ref ItemsTable
+          EVENTS_TABLE: !Ref EventsTable
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          
+          personalize_runtime = boto3.client('personalize-runtime')
+          dynamodb = boto3.resource('dynamodb')
+          cloudwatch = boto3.client('cloudwatch')
+          
+          def lambda_handler(event, context):
+              user_id = event.get('user_id')
+              model_config = event.get('model_config', {})
+              num_results = event.get('num_results', 10)
+              context_data = event.get('context', {})
+              
+              if not user_id:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'user_id is required'})
+                  }
+              
+              try:
+                  # Get recommendations from Personalize
+                  recommendations = get_personalize_recommendations(
+                      user_id, model_config, num_results, context_data
+                  )
+                  
+                  # Enrich recommendations with item metadata
+                  enriched_recommendations = enrich_recommendations(recommendations)
+                  
+                  # Track recommendation request
+                  track_recommendation_request(user_id, model_config, enriched_recommendations)
+                  
+                  # Send metrics to CloudWatch
+                  send_metrics(model_config, len(enriched_recommendations))
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'user_id': user_id,
+                          'recommendations': enriched_recommendations,
+                          'algorithm': model_config.get('description', 'Unknown'),
+                          'timestamp': datetime.now().isoformat()
+                      })
+                  }
+                  
+              except Exception as e:
+                  # Fallback to popularity-based recommendations
+                  fallback_recommendations = get_fallback_recommendations(num_results)
+                  
+                  # Send error metric
+                  send_error_metric(str(e))
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'user_id': user_id,
+                          'recommendations': fallback_recommendations,
+                          'algorithm': 'Fallback - Popularity Based',
+                          'error': str(e),
+                          'timestamp': datetime.now().isoformat()
+                      })
+                  }
+          
+          def get_personalize_recommendations(user_id, model_config, num_results, context_data):
+              campaign_arn = model_config.get('campaign_arn')
+              
+              if not campaign_arn:
+                  raise ValueError("No campaign ARN provided")
+              
+              # Build request parameters
+              request_params = {
+                  'campaignArn': campaign_arn,
+                  'userId': user_id,
+                  'numResults': num_results
+              }
+              
+              # Add context if provided
+              if context_data:
+                  request_params['context'] = context_data
+              
+              # Get recommendations from Personalize
+              response = personalize_runtime.get_recommendations(**request_params)
+              
+              return response['itemList']
+          
+          def enrich_recommendations(recommendations):
+              items_table = dynamodb.Table(os.environ['ITEMS_TABLE'])
+              
+              enriched = []
+              for item in recommendations:
+                  item_id = item['itemId']
+                  
+                  try:
+                      # Get item metadata from DynamoDB
+                      response = items_table.get_item(Key={'ItemId': item_id})
+                      
+                      if 'Item' in response:
+                          item_data = response['Item']
+                          enriched.append({
+                              'item_id': item_id,
+                              'score': float(item.get('score', 0)),
+                              'category': item_data.get('Category', 'Unknown'),
+                              'price': float(item_data.get('Price', 0)),
+                              'brand': item_data.get('Brand', 'Unknown')
+                          })
+                      else:
+                          # Item not found in catalog
+                          enriched.append({
+                              'item_id': item_id,
+                              'score': float(item.get('score', 0)),
+                              'category': 'Unknown',
+                              'price': 0,
+                              'brand': 'Unknown'
+                          })
+                          
+                  except Exception as e:
+                      print(f"Error enriching item {item_id}: {str(e)}")
+                      enriched.append({
+                          'item_id': item_id,
+                          'score': float(item.get('score', 0)),
+                          'error': str(e)
+                      })
+              
+              return enriched
+          
+          def get_fallback_recommendations(num_results):
+              # Simple fallback - return popular items
+              items_table = dynamodb.Table(os.environ['ITEMS_TABLE'])
+              
+              try:
+                  response = items_table.scan(Limit=num_results)
+                  items = response.get('Items', [])
+                  
+                  fallback = []
+                  for item in items:
+                      fallback.append({
+                          'item_id': item['ItemId'],
+                          'score': 0.5,
+                          'category': item.get('Category', 'Unknown'),
+                          'price': float(item.get('Price', 0)),
+                          'brand': item.get('Brand', 'Unknown')
+                      })
+                  
+                  return fallback
+                  
+              except Exception:
+                  return []
+          
+          def track_recommendation_request(user_id, model_config, recommendations):
+              events_table = dynamodb.Table(os.environ['EVENTS_TABLE'])
+              
+              try:
+                  ttl = int((datetime.now() + timedelta(days=7)).timestamp())
+                  events_table.put_item(
+                      Item={
+                          'UserId': user_id,
+                          'Timestamp': int(datetime.now().timestamp() * 1000),
+                          'EventType': 'recommendation_served',
+                          'Algorithm': model_config.get('description', 'Unknown'),
+                          'ItemCount': len(recommendations),
+                          'Items': json.dumps([r['item_id'] for r in recommendations]),
+                          'TTL': ttl
+                      }
+                  )
+              except Exception as e:
+                  print(f"Failed to track recommendation request: {str(e)}")
+          
+          def send_metrics(model_config, recommendation_count):
+              try:
+                  cloudwatch.put_metric_data(
+                      Namespace=f"{os.environ['PROJECT_NAME']}/Recommendations",
+                      MetricData=[
+                          {
+                              'MetricName': 'RecommendationsServed',
+                              'Value': recommendation_count,
+                              'Unit': 'Count',
+                              'Dimensions': [
+                                  {
+                                      'Name': 'Algorithm',
+                                      'Value': model_config.get('description', 'Unknown')
+                                  },
+                                  {
+                                      'Name': 'Environment',
+                                      'Value': os.environ['ENVIRONMENT']
+                                  }
+                              ]
+                          }
+                      ]
+                  )
+              except Exception as e:
+                  print(f"Failed to send metrics: {str(e)}")
+          
+          def send_error_metric(error_message):
+              try:
+                  cloudwatch.put_metric_data(
+                      Namespace=f"{os.environ['PROJECT_NAME']}/Recommendations",
+                      MetricData=[
+                          {
+                              'MetricName': 'RecommendationErrors',
+                              'Value': 1,
+                              'Unit': 'Count',
+                              'Dimensions': [
+                                  {
+                                      'Name': 'Environment',
+                                      'Value': os.environ['ENVIRONMENT']
+                                  }
+                              ]
+                          }
+                      ]
+                  )
+              except Exception as e:
+                  print(f"Failed to send error metric: {str(e)}")
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function for Event Tracking
+  EventTrackerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-event-tracker-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          EVENTS_TABLE: !Ref EventsTable
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          ENABLE_PERSONALIZE_EVENTS: !Ref EnablePersonalizeRealTimeEvents
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          
+          personalize_events = boto3.client('personalize-events')
+          dynamodb = boto3.resource('dynamodb')
+          cloudwatch = boto3.client('cloudwatch')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Parse event data
+                  user_id = event.get('user_id')
+                  session_id = event.get('session_id', user_id)
+                  event_type = event.get('event_type')
+                  item_id = event.get('item_id')
+                  recommendation_id = event.get('recommendation_id')
+                  properties = event.get('properties', {})
+                  
+                  if not all([user_id, event_type]):
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'user_id and event_type are required'})
+                      }
+                  
+                  # Store event in DynamoDB for analytics
+                  store_event_analytics(event)
+                  
+                  # Send event to Personalize (if enabled and item_id provided)
+                  if os.environ.get('ENABLE_PERSONALIZE_EVENTS') == 'true' and item_id:
+                      try:
+                          send_to_personalize(user_id, session_id, event_type, item_id, properties)
+                      except Exception as e:
+                          print(f"Failed to send event to Personalize: {str(e)}")
+                  
+                  # Send metrics to CloudWatch
+                  send_event_metrics(event_type)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'message': 'Event tracked successfully'})
+                  }
+                  
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def store_event_analytics(event):
+              events_table = dynamodb.Table(os.environ['EVENTS_TABLE'])
+              
+              # Store detailed event for analytics with TTL
+              ttl = int((datetime.now() + timedelta(days=7)).timestamp())
+              events_table.put_item(
+                  Item={
+                      'UserId': event['user_id'],
+                      'Timestamp': int(datetime.now().timestamp() * 1000),
+                      'EventType': event['event_type'],
+                      'ItemId': event.get('item_id', ''),
+                      'SessionId': event.get('session_id', ''),
+                      'RecommendationId': event.get('recommendation_id', ''),
+                      'Properties': json.dumps(event.get('properties', {})),
+                      'TTL': ttl
+                  }
+              )
+          
+          def send_to_personalize(user_id, session_id, event_type, item_id, properties):
+              # Note: This requires an Event Tracker ARN to be configured
+              event_tracker_arn = os.environ.get('EVENT_TRACKER_ARN')
+              
+              if not event_tracker_arn:
+                  print("No Event Tracker ARN configured")
+                  return
+              
+              # Prepare event for Personalize
+              personalize_event = {
+                  'userId': user_id,
+                  'sessionId': session_id,
+                  'eventType': event_type,
+                  'sentAt': datetime.now().timestamp()
+              }
+              
+              if item_id:
+                  personalize_event['itemId'] = item_id
+              
+              if properties:
+                  personalize_event['properties'] = json.dumps(properties)
+              
+              # Send to Personalize
+              personalize_events.put_events(
+                  trackingId=event_tracker_arn.split('/')[-1],
+                  userId=user_id,
+                  sessionId=session_id,
+                  eventList=[personalize_event]
+              )
+          
+          def send_event_metrics(event_type):
+              try:
+                  cloudwatch.put_metric_data(
+                      Namespace=f"{os.environ['PROJECT_NAME']}/Events",
+                      MetricData=[
+                          {
+                              'MetricName': 'EventsTracked',
+                              'Value': 1,
+                              'Unit': 'Count',
+                              'Dimensions': [
+                                  {
+                                      'Name': 'EventType',
+                                      'Value': event_type
+                                  },
+                                  {
+                                      'Name': 'Environment',
+                                      'Value': os.environ['ENVIRONMENT']
+                                  }
+                              ]
+                          }
+                      ]
+                  )
+              except Exception as e:
+                  print(f"Failed to send event metrics: {str(e)}")
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function for Personalize Management
+  PersonalizeManagerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-personalize-manager-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          PERSONALIZE_ROLE_ARN: !GetAtt PersonalizeServiceRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          personalize = boto3.client('personalize')
+          
+          def lambda_handler(event, context):
+              action = event.get('action')
+              
+              try:
+                  if action == 'create_dataset_group':
+                      return create_dataset_group(event)
+                  elif action == 'import_data':
+                      return import_data(event)
+                  elif action == 'create_solution':
+                      return create_solution(event)
+                  elif action == 'create_solution_version':
+                      return create_solution_version(event)
+                  elif action == 'create_campaign':
+                      return create_campaign(event)
+                  elif action == 'check_status':
+                      return check_status(event)
+                  elif action == 'update_campaign':
+                      return update_campaign(event)
+                  else:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': f'Unknown action: {action}'})
+                      }
+                      
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def create_dataset_group(event):
+              dataset_group_name = event.get('dataset_group_name', f"{os.environ['PROJECT_NAME']}-dataset-group")
+              domain = event.get('domain', 'ECOMMERCE')
+              
+              response = personalize.create_dataset_group(
+                  name=dataset_group_name,
+                  domain=domain
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'dataset_group_arn': response['datasetGroupArn']
+                  })
+              }
+          
+          def import_data(event):
+              dataset_arn = event['dataset_arn']
+              job_name = event['job_name']
+              s3_data_source = event['s3_data_source']
+              role_arn = event.get('role_arn', os.environ['PERSONALIZE_ROLE_ARN'])
+              
+              response = personalize.create_dataset_import_job(
+                  jobName=job_name,
+                  datasetArn=dataset_arn,
+                  dataSource={
+                      's3DataSource': {
+                          'path': s3_data_source
+                      }
+                  },
+                  roleArn=role_arn
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'dataset_import_job_arn': response['datasetImportJobArn']
+                  })
+              }
+          
+          def create_solution(event):
+              solution_name = event['solution_name']
+              dataset_group_arn = event['dataset_group_arn']
+              recipe_arn = event['recipe_arn']
+              solution_config = event.get('solution_config', {})
+              
+              params = {
+                  'name': solution_name,
+                  'datasetGroupArn': dataset_group_arn,
+                  'recipeArn': recipe_arn
+              }
+              
+              if solution_config:
+                  params['solutionConfig'] = solution_config
+              
+              response = personalize.create_solution(**params)
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'solution_arn': response['solutionArn']
+                  })
+              }
+          
+          def create_solution_version(event):
+              solution_arn = event['solution_arn']
+              
+              response = personalize.create_solution_version(
+                  solutionArn=solution_arn
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'solution_version_arn': response['solutionVersionArn']
+                  })
+              }
+          
+          def create_campaign(event):
+              campaign_name = event['campaign_name']
+              solution_version_arn = event['solution_version_arn']
+              min_provisioned_tps = event.get('min_provisioned_tps', 1)
+              
+              response = personalize.create_campaign(
+                  name=campaign_name,
+                  solutionVersionArn=solution_version_arn,
+                  minProvisionedTPS=min_provisioned_tps
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'campaign_arn': response['campaignArn']
+                  })
+              }
+          
+          def update_campaign(event):
+              campaign_arn = event['campaign_arn']
+              solution_version_arn = event.get('solution_version_arn')
+              min_provisioned_tps = event.get('min_provisioned_tps')
+              
+              params = {'campaignArn': campaign_arn}
+              
+              if solution_version_arn:
+                  params['solutionVersionArn'] = solution_version_arn
+              if min_provisioned_tps:
+                  params['minProvisionedTPS'] = min_provisioned_tps
+              
+              response = personalize.update_campaign(**params)
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'campaign_arn': response['campaignArn']
+                  })
+              }
+          
+          def check_status(event):
+              resource_arn = event['resource_arn']
+              resource_type = event['resource_type']
+              
+              if resource_type == 'solution':
+                  response = personalize.describe_solution(solutionArn=resource_arn)
+                  status = response['solution']['status']
+              elif resource_type == 'solution_version':
+                  response = personalize.describe_solution_version(solutionVersionArn=resource_arn)
+                  status = response['solutionVersion']['status']
+              elif resource_type == 'campaign':
+                  response = personalize.describe_campaign(campaignArn=resource_arn)
+                  status = response['campaign']['status']
+              elif resource_type == 'dataset_import_job':
+                  response = personalize.describe_dataset_import_job(datasetImportJobArn=resource_arn)
+                  status = response['datasetImportJob']['status']
+              else:
+                  raise ValueError(f"Unknown resource type: {resource_type}")
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'resource_arn': resource_arn,
+                      'status': status,
+                      'is_complete': status in ['ACTIVE', 'CREATE FAILED']
+                  })
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # API Gateway HTTP API
+  RecommendationAPI:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ProjectName}-recommendation-api-${Environment}'
+      Description: 'Real-time recommendation API with A/B testing'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowHeaders:
+          - 'Content-Type'
+          - 'X-Amz-Date'
+          - 'Authorization'
+          - 'X-Api-Key'
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        MaxAge: 300
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # API Gateway Stage
+  APIStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref RecommendationAPI
+      StageName: !Ref Environment
+      Description: !Sub 'API stage for ${Environment}'
+      AutoDeploy: true
+      ThrottleSettings:
+        BurstLimit: !Ref ApiGatewayThrottleBurstLimit
+        RateLimit: !Ref ApiGatewayThrottleRateLimit
+      AccessLogSettings:
+        DestinationArn: !GetAtt APILogGroup.Arn
+        Format: !Sub |
+          {
+            "requestId": "$context.requestId",
+            "extendedRequestId": "$context.extendedRequestId",
+            "ip": "$context.identity.sourceIp",
+            "caller": "$context.identity.caller",
+            "user": "$context.identity.user",
+            "requestTime": "$context.requestTime",
+            "httpMethod": "$context.httpMethod",
+            "resourcePath": "$context.resourcePath",
+            "status": "$context.status",
+            "protocol": "$context.protocol",
+            "responseLength": "$context.responseLength",
+            "responseLatency": "$context.responseLatency",
+            "integrationLatency": "$context.integrationLatency"
+          }
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # CloudWatch Log Group for API Gateway
+  APILogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}-${Environment}'
+      RetentionInDays: !If [IsProduction, 90, 30]
+
+  # Lambda Integration for A/B Test Router
+  ABTestRouterIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref RecommendationAPI
+      IntegrationType: AWS_PROXY
+      IntegrationMethod: POST
+      IntegrationUri: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ABTestRouterFunction}'
+      PayloadFormatVersion: '2.0'
+
+  # Lambda Integration for Event Tracker
+  EventTrackerIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref RecommendationAPI
+      IntegrationType: AWS_PROXY
+      IntegrationMethod: POST
+      IntegrationUri: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${EventTrackerFunction}'
+      PayloadFormatVersion: '2.0'
+
+  # Route for Recommendations
+  RecommendationsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RecommendationAPI
+      RouteKey: 'POST /recommendations'
+      Target: !Sub 'integrations/${ABTestRouterIntegration}'
+      AuthorizationType: NONE
+
+  # Route for Event Tracking
+  EventsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RecommendationAPI
+      RouteKey: 'POST /events'
+      Target: !Sub 'integrations/${EventTrackerIntegration}'
+      AuthorizationType: NONE
+
+  # Lambda Permission for A/B Test Router
+  ABTestRouterPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ABTestRouterFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RecommendationAPI}/*/*'
+
+  # Lambda Permission for Event Tracker
+  EventTrackerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EventTrackerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RecommendationAPI}/*/*'
+
+  # CloudWatch Dashboard
+  RecommendationsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-recommendations-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "${ProjectName}/Recommendations", "RecommendationsServed", "Environment", "${Environment}" ],
+                  [ ".", "RecommendationErrors", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Recommendation Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "${ProjectName}/Events", "EventsTracked", "Environment", "${Environment}" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Event Tracking Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${ABTestRouterFunction}'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "A/B Test Router Logs",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  ProjectName:
+    Description: 'Project name used for resource naming'
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectName'
+
+  PersonalizeDataBucket:
+    Description: 'S3 bucket for Personalize training data'
+    Value: !Ref PersonalizeDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-PersonalizeDataBucket'
+
+  PersonalizeServiceRoleArn:
+    Description: 'IAM role ARN for Personalize service'
+    Value: !GetAtt PersonalizeServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PersonalizeServiceRoleArn'
+
+  LambdaExecutionRoleArn:
+    Description: 'IAM role ARN for Lambda functions'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  UsersTableName:
+    Description: 'DynamoDB table name for user profiles'
+    Value: !Ref UsersTable
+    Export:
+      Name: !Sub '${AWS::StackName}-UsersTable'
+
+  ItemsTableName:
+    Description: 'DynamoDB table name for item catalog'
+    Value: !Ref ItemsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ItemsTable'
+
+  ABAssignmentsTableName:
+    Description: 'DynamoDB table name for A/B test assignments'
+    Value: !Ref ABAssignmentsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ABAssignmentsTable'
+
+  EventsTableName:
+    Description: 'DynamoDB table name for event tracking'
+    Value: !Ref EventsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-EventsTable'
+
+  ABTestRouterFunctionName:
+    Description: 'Lambda function name for A/B test routing'
+    Value: !Ref ABTestRouterFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-ABTestRouterFunction'
+
+  RecommendationEngineFunctionName:
+    Description: 'Lambda function name for recommendation engine'
+    Value: !Ref RecommendationEngineFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-RecommendationEngineFunction'
+
+  EventTrackerFunctionName:
+    Description: 'Lambda function name for event tracking'
+    Value: !Ref EventTrackerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-EventTrackerFunction'
+
+  PersonalizeManagerFunctionName:
+    Description: 'Lambda function name for Personalize management'
+    Value: !Ref PersonalizeManagerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-PersonalizeManagerFunction'
+
+  RecommendationAPIId:
+    Description: 'API Gateway HTTP API ID'
+    Value: !Ref RecommendationAPI
+    Export:
+      Name: !Sub '${AWS::StackName}-RecommendationAPIId'
+
+  RecommendationAPIEndpoint:
+    Description: 'API Gateway HTTP API endpoint URL'
+    Value: !Sub 'https://${RecommendationAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-RecommendationAPIEndpoint'
+
+  CloudWatchDashboardURL:
+    Description: 'CloudWatch Dashboard URL for monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-recommendations-${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchDashboardURL'
+
+  NextSteps:
+    Description: 'Next steps to complete the Personalize setup'
+    Value: |
+      1. Upload training data to the S3 bucket
+      2. Use the Personalize Manager Lambda to create dataset groups, solutions, and campaigns
+      3. Update Lambda environment variables with campaign ARNs
+      4. Test the API endpoints for recommendations and event tracking
+      5. Monitor performance using the CloudWatch dashboard

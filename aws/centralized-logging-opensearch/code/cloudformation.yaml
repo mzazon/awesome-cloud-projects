@@ -1,0 +1,948 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Centralized Logging with Amazon OpenSearch Service
+  This template creates a complete centralized logging solution using OpenSearch Service,
+  CloudWatch Logs, Lambda, and Kinesis for scalable log aggregation and analysis.
+
+# Template Parameters for customization
+Parameters:
+  ProjectName:
+    Type: String
+    Default: central-logging
+    Description: Name prefix for all resources
+    AllowedPattern: ^[a-z][a-z0-9-]*$
+    ConstraintDescription: Must start with a letter and contain only lowercase letters, numbers, and hyphens
+    MinLength: 3
+    MaxLength: 20
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name for resource tagging and configuration
+
+  OpenSearchInstanceType:
+    Type: String
+    Default: t3.small.search
+    AllowedValues: 
+      - t3.small.search
+      - t3.medium.search
+      - m6g.large.search
+      - m6g.xlarge.search
+      - r6g.large.search
+    Description: OpenSearch instance type for data nodes
+
+  OpenSearchMasterInstanceType:
+    Type: String
+    Default: t3.small.search
+    AllowedValues:
+      - t3.small.search
+      - t3.medium.search
+      - m6g.large.search
+      - m6g.xlarge.search
+    Description: OpenSearch instance type for dedicated master nodes
+
+  OpenSearchInstanceCount:
+    Type: Number
+    Default: 3
+    MinValue: 3
+    MaxValue: 10
+    Description: Number of OpenSearch data nodes (minimum 3 for multi-AZ)
+
+  OpenSearchMasterInstanceCount:
+    Type: Number
+    Default: 3
+    AllowedValues: [3, 5]
+    Description: Number of dedicated master nodes (must be odd number)
+
+  OpenSearchVolumeSize:
+    Type: Number
+    Default: 20
+    MinValue: 10
+    MaxValue: 100
+    Description: EBS volume size in GB for each OpenSearch node
+
+  KinesisShardCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Number of shards for Kinesis Data Stream
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    AllowedValues: [256, 512, 1024, 2048]
+    Description: Memory allocation for Lambda log processor function
+
+  EnableVPCAccess:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Deploy OpenSearch in VPC for enhanced security
+
+  RetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [7, 14, 30, 60, 90, 365]
+    Description: Log retention period in days
+
+# Conditional resource creation based on parameters
+Conditions:
+  CreateVPCResources: !Equals [!Ref EnableVPCAccess, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+# Metadata for parameter grouping in console
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Project Configuration
+        Parameters:
+          - ProjectName
+          - Environment
+          - RetentionDays
+      - Label:
+          default: OpenSearch Configuration
+        Parameters:
+          - OpenSearchInstanceType
+          - OpenSearchMasterInstanceType
+          - OpenSearchInstanceCount
+          - OpenSearchMasterInstanceCount
+          - OpenSearchVolumeSize
+          - EnableVPCAccess
+      - Label:
+          default: Streaming Configuration
+        Parameters:
+          - KinesisShardCount
+          - LambdaMemorySize
+    ParameterLabels:
+      ProjectName:
+        default: Project Name
+      Environment:
+        default: Environment
+      OpenSearchInstanceType:
+        default: Data Node Instance Type
+      OpenSearchMasterInstanceType:
+        default: Master Node Instance Type
+
+# Main template resources
+Resources:
+  # ============================================================================
+  # VPC Resources (Optional - only if EnableVPCAccess is true)
+  # ============================================================================
+  
+  VPC:
+    Type: AWS::EC2::VPC
+    Condition: CreateVPCResources
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-vpc
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVPCResources
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-private-subnet-1
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVPCResources
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-private-subnet-2
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrivateSubnet3:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVPCResources
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [2, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-private-subnet-3
+        - Key: Environment
+          Value: !Ref Environment
+
+  OpenSearchSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateVPCResources
+    Properties:
+      GroupDescription: Security group for OpenSearch cluster
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: HTTPS access from Lambda
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: HTTP access from Lambda
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-opensearch-sg
+        - Key: Environment
+          Value: !Ref Environment
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateVPCResources
+    Properties:
+      GroupDescription: Security group for Lambda functions
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-lambda-sg
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================================
+  # IAM Roles and Policies
+  # ============================================================================
+
+  # OpenSearch Service Role
+  OpenSearchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-opensearch-service-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: opensearch.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonOpenSearchServiceRolePolicy
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Logs Role for Kinesis
+  CloudWatchLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-cwlogs-kinesis-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: logs.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringLike:
+                'aws:SourceArn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Policies:
+        - PolicyName: KinesisAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource: !GetAtt KinesisStream.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-lambda-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !If 
+          - CreateVPCResources
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+          - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: LambdaProcessingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListStreams
+                Resource: !GetAtt KinesisStream.Arn
+              - Effect: Allow
+                Action:
+                  - firehose:PutRecord
+                  - firehose:PutRecordBatch
+                Resource: !GetAtt FirehoseDeliveryStream.Arn
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Kinesis Firehose Delivery Role
+  FirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-firehose-delivery-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehoseDeliveryPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - es:ESHttpPost
+                  - es:ESHttpPut
+                Resource: !Sub '${OpenSearchDomain.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource: 
+                  - !GetAtt BackupBucket.Arn
+                  - !Sub '${BackupBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================================
+  # S3 Bucket for Failed Delivery Backup
+  # ============================================================================
+
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-${Environment}-logging-backup-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldBackups
+            Status: Enabled
+            ExpirationInDays: !Ref RetentionDays
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transition:
+              StorageClass: GLACIER
+              TransitionInDays: 90
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-logging-backup
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================================
+  # Kinesis Data Stream
+  # ============================================================================
+
+  KinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-log-stream
+      ShardCount: !Ref KinesisShardCount
+      RetentionPeriodHours: 24
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-log-stream
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================================
+  # Amazon OpenSearch Service Domain
+  # ============================================================================
+
+  OpenSearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      DomainName: !Sub ${ProjectName}-${Environment}-logs
+      OpenSearchVersion: OpenSearch_2.9
+      ClusterConfig:
+        InstanceType: !Ref OpenSearchInstanceType
+        InstanceCount: !Ref OpenSearchInstanceCount
+        DedicatedMasterEnabled: true
+        MasterInstanceType: !Ref OpenSearchMasterInstanceType
+        MasterInstanceCount: !Ref OpenSearchMasterInstanceCount
+        ZoneAwarenessEnabled: true
+        ZoneAwarenessConfig:
+          AvailabilityZoneCount: 3
+        WarmEnabled: !If [IsProduction, true, false]
+        WarmType: !If [IsProduction, 'ultrawarm1.medium.search', !Ref 'AWS::NoValue']
+        WarmCount: !If [IsProduction, 2, !Ref 'AWS::NoValue']
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: gp3
+        VolumeSize: !Ref OpenSearchVolumeSize
+        Iops: !If [IsProduction, 3000, !Ref 'AWS::NoValue']
+        Throughput: !If [IsProduction, 125, !Ref 'AWS::NoValue']
+      VPCOptions:
+        !If
+          - CreateVPCResources
+          - SecurityGroupIds: 
+              - !Ref OpenSearchSecurityGroup
+            SubnetIds: 
+              - !Ref PrivateSubnet1
+              - !Ref PrivateSubnet2
+              - !Ref PrivateSubnet3
+          - !Ref 'AWS::NoValue'
+      EncryptionAtRestOptions:
+        Enabled: true
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+        TLSSecurityPolicy: Policy-Min-TLS-1-2-2019-07
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'es:*'
+            Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ProjectName}-${Environment}-logs/*'
+      AdvancedOptions:
+        'rest.action.multi.allow_explicit_index': 'true'
+        'indices.fielddata.cache.size': '20%'
+        'indices.query.bool.max_clause_count': '1024'
+      LogPublishingOptions:
+        SEARCH_SLOW_LOGS:
+          CloudWatchLogsLogGroupArn: !GetAtt OpenSearchSlowLogGroup.Arn
+          Enabled: true
+        INDEX_SLOW_LOGS:
+          CloudWatchLogsLogGroupArn: !GetAtt OpenSearchIndexSlowLogGroup.Arn
+          Enabled: true
+        ES_APPLICATION_LOGS:
+          CloudWatchLogsLogGroupArn: !GetAtt OpenSearchApplicationLogGroup.Arn
+          Enabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-opensearch
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================================
+  # CloudWatch Log Groups for OpenSearch
+  # ============================================================================
+
+  OpenSearchSlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/opensearch/${ProjectName}-${Environment}/search-slow-logs'
+      RetentionInDays: !Ref RetentionDays
+
+  OpenSearchIndexSlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/opensearch/${ProjectName}-${Environment}/index-slow-logs'
+      RetentionInDays: !Ref RetentionDays
+
+  OpenSearchApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/opensearch/${ProjectName}-${Environment}/application-logs'
+      RetentionInDays: !Ref RetentionDays
+
+  # ============================================================================
+  # Lambda Function for Log Processing
+  # ============================================================================
+
+  LogProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${Environment}-log-processor
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrencyLimit: 10
+      VpcConfig:
+        !If
+          - CreateVPCResources
+          - SecurityGroupIds: 
+              - !Ref LambdaSecurityGroup
+            SubnetIds: 
+              - !Ref PrivateSubnet1
+              - !Ref PrivateSubnet2
+          - !Ref 'AWS::NoValue'
+      Environment:
+        Variables:
+          FIREHOSE_STREAM_NAME: !Ref FirehoseDeliveryStream
+          OPENSEARCH_ENDPOINT: !GetAtt OpenSearchDomain.DomainEndpoint
+          AWS_REGION: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          import json
+          import base64
+          import gzip
+          import boto3
+          import datetime
+          import os
+          import re
+          from typing import Dict, List, Any
+          
+          firehose = boto3.client('firehose')
+          cloudwatch = boto3.client('cloudwatch')
+          
+          def lambda_handler(event, context):
+              """
+              Process CloudWatch Logs data from Kinesis stream
+              Enrich logs and forward to Kinesis Data Firehose
+              """
+              records_to_firehose = []
+              error_count = 0
+              
+              for record in event['Records']:
+                  try:
+                      # Decode Kinesis data
+                      compressed_payload = base64.b64decode(record['kinesis']['data'])
+                      uncompressed_payload = gzip.decompress(compressed_payload)
+                      log_data = json.loads(uncompressed_payload)
+                      
+                      # Process each log event
+                      for log_event in log_data.get('logEvents', []):
+                          enriched_log = enrich_log_event(log_event, log_data)
+                          
+                          # Convert to JSON string for Firehose
+                          json_record = json.dumps(enriched_log) + '\n'
+                          
+                          records_to_firehose.append({
+                              'Data': json_record
+                          })
+                          
+                  except Exception as e:
+                      print(f"Error processing record: {str(e)}")
+                      error_count += 1
+                      continue
+              
+              # Send processed records to Firehose
+              if records_to_firehose:
+                  try:
+                      response = firehose.put_record_batch(
+                          DeliveryStreamName=os.environ['FIREHOSE_STREAM_NAME'],
+                          Records=records_to_firehose
+                      )
+                      
+                      failed_records = response.get('FailedPutCount', 0)
+                      if failed_records > 0:
+                          print(f"Failed to process {failed_records} records")
+                          
+                  except Exception as e:
+                      print(f"Error sending to Firehose: {str(e)}")
+                      error_count += len(records_to_firehose)
+              
+              # Send metrics to CloudWatch
+              if error_count > 0:
+                  cloudwatch.put_metric_data(
+                      Namespace='CentralLogging/Processing',
+                      MetricData=[
+                          {
+                              'MetricName': 'ProcessingErrors',
+                              'Value': error_count,
+                              'Unit': 'Count',
+                              'Timestamp': datetime.datetime.utcnow()
+                          }
+                      ]
+                  )
+              
+              return {
+                  'statusCode': 200,
+                  'processedRecords': len(records_to_firehose),
+                  'errorCount': error_count
+              }
+          
+          def enrich_log_event(log_event: Dict, log_data: Dict) -> Dict:
+              """
+              Enrich log events with additional metadata and parsing
+              """
+              enriched = {
+                  '@timestamp': datetime.datetime.fromtimestamp(
+                      log_event['timestamp'] / 1000
+                  ).isoformat() + 'Z',
+                  'message': log_event.get('message', ''),
+                  'log_group': log_data.get('logGroup', ''),
+                  'log_stream': log_data.get('logStream', ''),
+                  'aws_account_id': log_data.get('owner', ''),
+                  'aws_region': os.environ.get('AWS_REGION', ''),
+                  'source_type': determine_source_type(log_data.get('logGroup', ''))
+              }
+              
+              # Parse structured logs (JSON)
+              try:
+                  if log_event['message'].strip().startswith('{'):
+                      parsed_message = json.loads(log_event['message'])
+                      enriched['parsed_message'] = parsed_message
+                      
+                      # Extract common fields
+                      if 'level' in parsed_message:
+                          enriched['log_level'] = parsed_message['level'].upper()
+                      if 'timestamp' in parsed_message:
+                          enriched['original_timestamp'] = parsed_message['timestamp']
+                          
+              except (json.JSONDecodeError, KeyError):
+                  pass
+              
+              # Extract log level from message
+              if 'log_level' not in enriched:
+                  enriched['log_level'] = extract_log_level(log_event['message'])
+              
+              # Add security context for security-related logs
+              if is_security_related(log_event['message'], log_data.get('logGroup', '')):
+                  enriched['security_event'] = True
+                  enriched['priority'] = 'high'
+              
+              return enriched
+          
+          def determine_source_type(log_group: str) -> str:
+              """Determine the type of service generating the logs"""
+              if '/aws/lambda/' in log_group:
+                  return 'lambda'
+              elif '/aws/apigateway/' in log_group:
+                  return 'api-gateway'
+              elif '/aws/rds/' in log_group:
+                  return 'rds'
+              elif '/aws/vpc/flowlogs' in log_group:
+                  return 'vpc-flow-logs'
+              elif 'cloudtrail' in log_group.lower():
+                  return 'cloudtrail'
+              else:
+                  return 'application'
+          
+          def extract_log_level(message: str) -> str:
+              """Extract log level from message content"""
+              log_levels = ['ERROR', 'WARN', 'WARNING', 'INFO', 'DEBUG', 'TRACE']
+              message_upper = message.upper()
+              
+              for level in log_levels:
+                  if level in message_upper:
+                      return level
+              
+              return 'INFO'
+          
+          def is_security_related(message: str, log_group: str) -> bool:
+              """Identify potentially security-related log events"""
+              security_keywords = [
+                  'authentication failed', 'access denied', 'unauthorized',
+                  'security group', 'iam', 'login failed', 'brute force',
+                  'suspicious', 'blocked', 'firewall', 'intrusion'
+              ]
+              
+              message_lower = message.lower()
+              log_group_lower = log_group.lower()
+              
+              # Check for security keywords
+              for keyword in security_keywords:
+                  if keyword in message_lower:
+                      return True
+              
+              # Security-related log groups
+              if any(term in log_group_lower for term in ['cloudtrail', 'security', 'auth', 'iam']):
+                  return True
+              
+              return False
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-log-processor
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Event Source Mapping for Kinesis
+  KinesisEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt KinesisStream.Arn
+      FunctionName: !GetAtt LogProcessorFunction.Arn
+      StartingPosition: LATEST
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 10
+      ParallelizationFactor: 1
+
+  # ============================================================================
+  # Kinesis Data Firehose Delivery Stream
+  # ============================================================================
+
+  FirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub ${ProjectName}-${Environment}-log-delivery
+      DeliveryStreamType: DirectPut
+      OpenSearchDestinationConfiguration:
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        DomainARN: !GetAtt OpenSearchDomain.Arn
+        IndexName: logs-%Y.%m.%d
+        IndexRotationPeriod: OneDay
+        TypeName: _doc
+        RetryDuration: 300
+        S3BackupMode: FailedDocumentsOnly
+        S3Configuration:
+          RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+          BucketARN: !GetAtt BackupBucket.Arn
+          Prefix: failed-logs/
+          ErrorOutputPrefix: errors/
+          BufferingHints:
+            SizeInMBs: 5
+            IntervalInSeconds: 300
+          CompressionFormat: GZIP
+        ProcessingConfiguration:
+          Enabled: false
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref FirehoseLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-log-delivery
+        - Key: Environment
+          Value: !Ref Environment
+
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/kinesisfirehose/${ProjectName}-${Environment}-log-delivery'
+      RetentionInDays: !Ref RetentionDays
+
+  # ============================================================================
+  # CloudWatch Alarms and Monitoring
+  # ============================================================================
+
+  # OpenSearch cluster health alarm
+  OpenSearchClusterHealthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-opensearch-cluster-health
+      AlarmDescription: OpenSearch cluster health alarm
+      MetricName: ClusterStatus.yellow
+      Namespace: AWS/ES
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DomainName
+          Value: !Ref OpenSearchDomain
+        - Name: ClientId
+          Value: !Ref AWS::AccountId
+      TreatMissingData: breaching
+
+  # Lambda function error rate alarm
+  LambdaErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-lambda-error-rate
+      AlarmDescription: Lambda function error rate alarm
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LogProcessorFunction
+      TreatMissingData: notBreaching
+
+  # Kinesis stream incoming records alarm
+  KinesisIncomingRecordsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-kinesis-incoming-records
+      AlarmDescription: Kinesis stream incoming records alarm
+      MetricName: IncomingRecords
+      Namespace: AWS/Kinesis
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: StreamName
+          Value: !Ref KinesisStream
+      TreatMissingData: breaching
+
+  # ============================================================================
+  # Sample Subscription Filter for Demonstration
+  # ============================================================================
+
+  DemoLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/demo/${ProjectName}-${Environment}'
+      RetentionInDays: 7
+
+  DemoSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      LogGroupName: !Ref DemoLogGroup
+      FilterName: !Sub ${ProjectName}-${Environment}-demo-filter
+      FilterPattern: ''
+      DestinationArn: !GetAtt KinesisStream.Arn
+      RoleArn: !GetAtt CloudWatchLogsRole.Arn
+      Distribution: Random
+
+# Template outputs
+Outputs:
+  OpenSearchDomainEndpoint:
+    Description: OpenSearch domain endpoint
+    Value: !Sub 'https://${OpenSearchDomain.DomainEndpoint}'
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-opensearch-endpoint
+
+  OpenSearchDashboardURL:
+    Description: OpenSearch Dashboards URL
+    Value: !Sub 'https://${OpenSearchDomain.DomainEndpoint}/_dashboards/'
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-opensearch-dashboards
+
+  KinesisStreamName:
+    Description: Kinesis Data Stream name
+    Value: !Ref KinesisStream
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-kinesis-stream
+
+  KinesisStreamArn:
+    Description: Kinesis Data Stream ARN
+    Value: !GetAtt KinesisStream.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-kinesis-stream-arn
+
+  FirehoseDeliveryStreamName:
+    Description: Kinesis Data Firehose delivery stream name
+    Value: !Ref FirehoseDeliveryStream
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-firehose-stream
+
+  LambdaFunctionName:
+    Description: Log processor Lambda function name
+    Value: !Ref LogProcessorFunction
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-lambda-function
+
+  LambdaFunctionArn:
+    Description: Log processor Lambda function ARN
+    Value: !GetAtt LogProcessorFunction.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-lambda-function-arn
+
+  BackupBucketName:
+    Description: S3 bucket for failed delivery backup
+    Value: !Ref BackupBucket
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-backup-bucket
+
+  CloudWatchLogsRoleArn:
+    Description: CloudWatch Logs role ARN for subscription filters
+    Value: !GetAtt CloudWatchLogsRole.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-cwlogs-role-arn
+
+  DemoLogGroupName:
+    Description: Demo log group for testing
+    Value: !Ref DemoLogGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-demo-log-group
+
+  VPCId:
+    Condition: CreateVPCResources
+    Description: VPC ID (if VPC deployment is enabled)
+    Value: !Ref VPC
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-vpc-id
+
+  OpenSearchSecurityGroupId:
+    Condition: CreateVPCResources
+    Description: OpenSearch security group ID (if VPC deployment is enabled)
+    Value: !Ref OpenSearchSecurityGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-opensearch-sg-id
+
+  TemplateVersion:
+    Description: CloudFormation template version
+    Value: '1.0'
+
+  DeploymentInstructions:
+    Description: Next steps after deployment
+    Value: >
+      1. Access OpenSearch Dashboards using the provided URL
+      2. Create index patterns for logs-* to view your data
+      3. Add subscription filters to existing CloudWatch Log Groups to forward logs
+      4. Monitor CloudWatch Alarms for system health
+      5. Review the demo log group for testing log ingestion

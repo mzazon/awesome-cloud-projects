@@ -1,0 +1,581 @@
+# Infrastructure Manager Configuration for Secure Database Modernization Workflows
+# This configuration deploys Cloud Workstations, Database Migration Service, and supporting infrastructure
+# for secure database modernization workflows with integrated CI/CD and credential management
+
+# Enable required APIs
+apiVersion: gcp.platform.compute.v1
+kind: Project
+metadata:
+  name: project-apis
+spec:
+  project_id: ${PROJECT_ID}
+  apis:
+    - workstations.googleapis.com
+    - datamigration.googleapis.com
+    - cloudbuild.googleapis.com
+    - secretmanager.googleapis.com
+    - artifactregistry.googleapis.com
+    - sqladmin.googleapis.com
+    - logging.googleapis.com
+    - monitoring.googleapis.com
+    - iam.googleapis.com
+    - compute.googleapis.com
+
+---
+# Artifact Registry repository for custom workstation container images
+apiVersion: artifactregistry.cnrm.cloud.google.com/v1beta1
+kind: ArtifactRegistryRepository
+metadata:
+  name: db-migration-images
+  namespace: ${PROJECT_ID}
+spec:
+  location: ${REGION}
+  repositoryId: db-migration-images
+  format: DOCKER
+  description: "Container images for database migration workstations"
+  labels:
+    purpose: database-migration
+    environment: development
+
+---
+# Secret Manager secret for database credentials
+apiVersion: secretmanager.cnrm.cloud.google.com/v1beta1
+kind: SecretManagerSecret
+metadata:
+  name: db-credentials
+  namespace: ${PROJECT_ID}
+spec:
+  secretId: db-credentials-${RANDOM_SUFFIX}
+  replication:
+    automatic: true
+  labels:
+    purpose: database-migration
+    credential-type: source-database
+
+---
+# Secret Manager secret version with database credentials
+apiVersion: secretmanager.cnrm.cloud.google.com/v1beta1
+kind: SecretManagerSecretVersion
+metadata:
+  name: db-credentials-version
+  namespace: ${PROJECT_ID}
+spec:
+  secretId: db-credentials-${RANDOM_SUFFIX}
+  secretData: "host=source-db.example.com,user=migration_user,password=secure_password123,dbname=legacy_db"
+  depends_on:
+    - name: db-credentials
+
+---
+# IAM service account for workstations
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMServiceAccount
+metadata:
+  name: workstation-service-account
+  namespace: ${PROJECT_ID}
+spec:
+  accountId: workstation-migration-sa
+  displayName: "Workstation Migration Service Account"
+  description: "Service account for Cloud Workstations database migration instances"
+
+---
+# Custom IAM role for database migration developers
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMCustomRole
+metadata:
+  name: database-migration-developer-role
+  namespace: ${PROJECT_ID}
+spec:
+  roleId: databaseMigrationDeveloper
+  title: "Database Migration Developer"
+  description: "Custom role for database migration team members"
+  permissions:
+    - workstations.workstations.use
+    - workstations.workstations.create
+    - workstations.workstations.get
+    - workstations.workstations.list
+    - datamigration.migrationjobs.create
+    - datamigration.migrationjobs.get
+    - datamigration.migrationjobs.list
+    - datamigration.connectionprofiles.get
+    - datamigration.connectionprofiles.list
+    - secretmanager.versions.access
+    - cloudsql.instances.connect
+    - cloudsql.instances.get
+    - logging.logEntries.create
+    - monitoring.metricDescriptors.list
+    - monitoring.timeSeries.list
+    - cloudbuild.builds.create
+    - cloudbuild.builds.get
+    - cloudbuild.builds.list
+    - artifactregistry.repositories.get
+    - artifactregistry.repositories.list
+    - artifactregistry.dockerimages.get
+    - artifactregistry.dockerimages.list
+  stage: GA
+
+---
+# IAM policy binding for Secret Manager access
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: secret-accessor-binding
+  namespace: ${PROJECT_ID}
+spec:
+  member: serviceAccount:workstation-migration-sa@${PROJECT_ID}.iam.gserviceaccount.com
+  role: roles/secretmanager.secretAccessor
+  resourceRef:
+    apiVersion: secretmanager.cnrm.cloud.google.com/v1beta1
+    kind: SecretManagerSecret
+    name: db-credentials
+  depends_on:
+    - name: workstation-service-account
+    - name: db-credentials
+
+---
+# IAM policy binding for workstation service account
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: workstation-sa-binding
+  namespace: ${PROJECT_ID}
+spec:
+  member: serviceAccount:workstation-migration-sa@${PROJECT_ID}.iam.gserviceaccount.com
+  role: roles/workstations.user
+  resourceRef:
+    apiVersion: resourcemanager.cnrm.cloud.google.com/v1beta1
+    kind: Project
+    external: ${PROJECT_ID}
+  depends_on:
+    - name: workstation-service-account
+
+---
+# Target Cloud SQL instance for database migration
+apiVersion: sql.cnrm.cloud.google.com/v1beta1
+kind: SQLInstance
+metadata:
+  name: target-mysql-instance
+  namespace: ${PROJECT_ID}
+spec:
+  databaseVersion: MYSQL_8_0
+  region: ${REGION}
+  settings:
+    tier: db-custom-2-7680
+    diskType: PD_SSD
+    diskSize: 100
+    storageAutoResize: true
+    storageAutoResizeLimit: 500
+    deletionProtectionEnabled: false
+    backupConfiguration:
+      enabled: true
+      startTime: "03:00"
+      location: ${REGION}
+      retainedBackups: 7
+      binaryLogEnabled: true
+      transactionLogRetentionDays: 7
+    databaseFlags:
+      - name: slow_query_log
+        value: "on"
+      - name: log_output
+        value: "FILE"
+    locationPreference:
+      zone: ${ZONE}
+    maintenanceWindow:
+      day: 7
+      hour: 3
+      updateTrack: stable
+    ipConfiguration:
+      ipv4Enabled: true
+      requireSsl: true
+      authorizedNetworks:
+        - name: default-network
+          value: "0.0.0.0/0"
+    insightsConfig:
+      queryInsightsEnabled: true
+      recordApplicationTags: true
+      recordClientAddress: true
+  labels:
+    purpose: database-migration
+    environment: development
+
+---
+# Database Migration Service source connection profile
+apiVersion: datamigration.cnrm.cloud.google.com/v1beta1
+kind: DataMigrationConnectionProfile
+metadata:
+  name: source-db-profile
+  namespace: ${PROJECT_ID}
+spec:
+  connectionProfileId: source-db-profile
+  location: ${REGION}
+  displayName: "Source Database Connection Profile"
+  mysql:
+    host: source-db.example.com
+    port: 3306
+    username: migration_user
+    password:
+      secretManagerSecretVersion: projects/${PROJECT_ID}/secrets/db-credentials-${RANDOM_SUFFIX}/versions/latest
+    ssl:
+      type: SERVER_ONLY
+      caCertificate: ""
+    cloudSqlId: ""
+  labels:
+    purpose: database-migration
+    connection-type: source
+  depends_on:
+    - name: db-credentials-version
+
+---
+# Database Migration Service target connection profile
+apiVersion: datamigration.cnrm.cloud.google.com/v1beta1
+kind: DataMigrationConnectionProfile
+metadata:
+  name: target-db-profile
+  namespace: ${PROJECT_ID}
+spec:
+  connectionProfileId: target-db-profile
+  location: ${REGION}
+  displayName: "Target Cloud SQL Connection Profile"
+  cloudsql:
+    cloudSqlId: projects/${PROJECT_ID}/instances/target-mysql-instance
+  labels:
+    purpose: database-migration
+    connection-type: target
+  depends_on:
+    - name: target-mysql-instance
+
+---
+# Cloud Build trigger for migration pipeline automation
+apiVersion: cloudbuild.cnrm.cloud.google.com/v1beta1
+kind: CloudBuildTrigger
+metadata:
+  name: migration-pipeline-trigger
+  namespace: ${PROJECT_ID}
+spec:
+  name: migration-pipeline-trigger
+  description: "Automated pipeline for database migration testing and validation"
+  disabled: false
+  substitutions:
+    _REGION: ${REGION}
+    _PROJECT_ID: ${PROJECT_ID}
+    _ARTIFACT_REGISTRY: ${REGION}-docker.pkg.dev/${PROJECT_ID}/db-migration-images
+  build:
+    steps:
+      # Build custom workstation image with migration tools
+      - name: gcr.io/cloud-builders/docker
+        args:
+          - build
+          - -t
+          - ${_ARTIFACT_REGISTRY}/migration-workstation:latest
+          - .
+        dir: workstation-image
+      
+      # Push image to Artifact Registry
+      - name: gcr.io/cloud-builders/docker
+        args:
+          - push
+          - ${_ARTIFACT_REGISTRY}/migration-workstation:latest
+      
+      # Run migration validation tests
+      - name: ${_ARTIFACT_REGISTRY}/migration-workstation:latest
+        entrypoint: bash
+        args:
+          - -c
+          - |
+            # Validate database connectivity and migration tools
+            echo "Validating migration environment..."
+            gcloud database-migration connection-profiles list --location=${_REGION} --format="table(name,state)"
+            mysql --version || echo "MySQL client not found"
+            psql --version || echo "PostgreSQL client not found"
+            
+            # Test secret access
+            gcloud secrets versions access latest --secret=db-credentials-${RANDOM_SUFFIX} || echo "Secret access test failed"
+            
+            echo "Migration environment validation complete"
+    
+    options:
+      logging: CLOUD_LOGGING_ONLY
+      substitutionOption: ALLOW_LOOSE
+      machineType: E2_STANDARD_4
+  
+  # Manual trigger for controlled deployments
+  manual: {}
+  
+  tags:
+    - database-migration
+    - workstation-build
+
+---
+# Cloud Workstations cluster for secure development environments
+apiVersion: workstations.cnrm.cloud.google.com/v1beta1
+kind: WorkstationsCluster
+metadata:
+  name: db-migration-cluster
+  namespace: ${PROJECT_ID}
+spec:
+  workstationClusterId: db-migration-cluster-${RANDOM_SUFFIX}
+  location: ${REGION}
+  displayName: "Database Migration Workstation Cluster"
+  network: projects/${PROJECT_ID}/global/networks/default
+  subnetwork: projects/${PROJECT_ID}/regions/${REGION}/subnetworks/default
+  
+  # Enable private endpoints for enhanced security
+  privateClusterConfig:
+    enablePrivateEndpoint: true
+    clusterHostname: db-migration-cluster.${PROJECT_ID}.internal
+  
+  # Configure domain settings for secure access
+  domainConfig:
+    domain: db-migration.${PROJECT_ID}.internal
+  
+  labels:
+    purpose: database-migration
+    environment: development
+    security-level: high
+  
+  annotations:
+    description: "Secure workstation cluster for database migration workflows"
+
+---
+# Cloud Workstations configuration template
+apiVersion: workstations.cnrm.cloud.google.com/v1beta1
+kind: WorkstationsConfig
+metadata:
+  name: db-migration-config
+  namespace: ${PROJECT_ID}
+spec:
+  workstationConfigId: db-migration-config-${RANDOM_SUFFIX}
+  location: ${REGION}
+  cluster: projects/${PROJECT_ID}/locations/${REGION}/workstationClusters/db-migration-cluster-${RANDOM_SUFFIX}
+  displayName: "Database Migration Configuration"
+  
+  # Container configuration with custom migration tools
+  container:
+    image: ${REGION}-docker.pkg.dev/${PROJECT_ID}/db-migration-images/migration-workstation:latest
+    command: ["/google/scripts/entrypoint.sh"]
+    env:
+      PROJECT_ID: ${PROJECT_ID}
+      REGION: ${REGION}
+      MIGRATION_WORKSPACE: "/home/user/migration-workspace"
+      SECRET_NAME: db-credentials-${RANDOM_SUFFIX}
+    runAsUser: 1000
+    
+  # Persistent directories for migration workspace
+  persistentDirectories:
+    - mountPath: /home/user/migration-workspace
+      gcePersistentDisk:
+        sizeGb: 50
+        fsType: ext4
+        diskType: pd-ssd
+        sourceSnapshot: ""
+        reclaimPolicy: DELETE
+    
+    - mountPath: /home/user/.config
+      gcePersistentDisk:
+        sizeGb: 10
+        fsType: ext4
+        diskType: pd-standard
+        reclaimPolicy: DELETE
+  
+  # Host configuration for workstation instances
+  host:
+    gceInstance:
+      machineType: e2-standard-4
+      bootDiskSizeGb: 50
+      disablePublicIpAddresses: true
+      shieldedInstanceConfig:
+        enableSecureBoot: true
+        enableVtpm: true
+        enableIntegrityMonitoring: true
+      confidentialInstanceConfig:
+        enableConfidentialCompute: false
+      serviceAccount: workstation-migration-sa@${PROJECT_ID}.iam.gserviceaccount.com
+      scopes:
+        - https://www.googleapis.com/auth/cloud-platform
+        - https://www.googleapis.com/auth/sqlservice.admin
+      
+      # Network tags for firewall rules
+      tags:
+        - database-migration
+        - workstation-instance
+      
+      # Metadata for instance configuration
+      metadata:
+        enable-oslogin: "true"
+        enable-guest-attributes: "true"
+        workspace-type: "database-migration"
+  
+  # Idle timeout to optimize costs
+  idleTimeout: 3600s  # 1 hour
+  runningTimeout: 43200s  # 12 hours
+  
+  # Readiness timeout for container startup
+  readinessTimeout: 300s  # 5 minutes
+  
+  # Annotations for workstation instances
+  annotations:
+    workstation.cloud.google.com/allow-unauthenticated: "false"
+    workstation.cloud.google.com/creator-role: "projects/${PROJECT_ID}/roles/databaseMigrationDeveloper"
+  
+  labels:
+    purpose: database-migration
+    environment: development
+    workstation-type: migration-development
+  
+  depends_on:
+    - name: db-migration-cluster
+    - name: workstation-service-account
+    - name: db-migration-images
+
+---
+# Sample workstation instance for immediate use
+apiVersion: workstations.cnrm.cloud.google.com/v1beta1
+kind: WorkstationsInstance
+metadata:
+  name: migration-dev-workspace
+  namespace: ${PROJECT_ID}
+spec:
+  workstationId: migration-dev-workspace-${RANDOM_SUFFIX}
+  location: ${REGION}
+  cluster: projects/${PROJECT_ID}/locations/${REGION}/workstationClusters/db-migration-cluster-${RANDOM_SUFFIX}
+  config: projects/${PROJECT_ID}/locations/${REGION}/workstationClusters/db-migration-cluster-${RANDOM_SUFFIX}/workstationConfigs/db-migration-config-${RANDOM_SUFFIX}
+  displayName: "Database Migration Development Workspace"
+  
+  # Environment-specific settings
+  env:
+    WORKSPACE_NAME: migration-dev-workspace
+    MIGRATION_PROJECT: ${PROJECT_ID}
+    TARGET_REGION: ${REGION}
+  
+  labels:
+    purpose: database-migration
+    environment: development
+    owner: migration-team
+    workspace-type: development
+  
+  annotations:
+    description: "Development workspace for database migration workflows"
+    created-by: "infrastructure-manager"
+  
+  depends_on:
+    - name: db-migration-config
+
+---
+# Cloud Logging sink for workstation and migration activity
+apiVersion: logging.cnrm.cloud.google.com/v1beta1
+kind: LoggingLogSink
+metadata:
+  name: migration-activity-sink
+  namespace: ${PROJECT_ID}
+spec:
+  name: migration-activity-sink
+  destination: storage.googleapis.com/${PROJECT_ID}-migration-logs
+  description: "Log sink for database migration activity monitoring"
+  
+  # Filter for workstation and migration service logs
+  filter: |
+    resource.type="workstations_workstation" OR
+    resource.type="cloudsql_database" OR
+    resource.type="cloud_build" OR
+    protoPayload.serviceName="datamigration.googleapis.com"
+  
+  # Include children resources
+  includeChildren: true
+  
+  # Disable log sink if not needed
+  disabled: false
+
+---
+# Cloud Storage bucket for migration logs and artifacts
+apiVersion: storage.cnrm.cloud.google.com/v1beta1
+kind: StorageBucket
+metadata:
+  name: migration-logs-bucket
+  namespace: ${PROJECT_ID}
+spec:
+  name: ${PROJECT_ID}-migration-logs
+  location: ${REGION}
+  storageClass: STANDARD
+  
+  # Lifecycle configuration for log retention
+  lifecycle:
+    rules:
+      - condition:
+          age: 90
+        action:
+          type: Delete
+      - condition:
+          age: 30
+        action:
+          type: SetStorageClass
+          storageClass: COLDLINE
+  
+  # Versioning for audit trail
+  versioning:
+    enabled: true
+  
+  # Public access prevention
+  publicAccessPrevention: enforced
+  
+  # Uniform bucket-level access
+  uniformBucketLevelAccess: true
+  
+  labels:
+    purpose: migration-logs
+    environment: development
+    retention-policy: "90-days"
+
+---
+# Monitoring alert policy for migration failures
+apiVersion: monitoring.cnrm.cloud.google.com/v1beta1
+kind: MonitoringAlertPolicy
+metadata:
+  name: migration-failure-alert
+  namespace: ${PROJECT_ID}
+spec:
+  displayName: "Database Migration Failure Alert"
+  documentation:
+    content: "Alert triggered when database migration jobs fail or workstations become unhealthy"
+    mimeType: "text/markdown"
+  
+  # Enable alert policy
+  enabled: true
+  
+  # Alert conditions
+  conditions:
+    - displayName: "Migration Job Failure"
+      conditionThreshold:
+        filter: |
+          resource.type="datamigration_migration_job"
+          protoPayload.methodName="google.cloud.datamigration.v1.DataMigrationService.CreateMigrationJob"
+          protoPayload.request.migrationJob.state="FAILED"
+        comparison: COMPARISON_GT
+        thresholdValue: 0
+        duration: 60s
+        aggregations:
+          - alignmentPeriod: 300s
+            perSeriesAligner: ALIGN_RATE
+            crossSeriesReducer: REDUCE_SUM
+    
+    - displayName: "Workstation Unhealthy"
+      conditionThreshold:
+        filter: |
+          resource.type="workstations_workstation"
+          resource.labels.workstation_id=~"migration-.*"
+          jsonPayload.state="UNHEALTHY"
+        comparison: COMPARISON_GT
+        thresholdValue: 0
+        duration: 300s
+        aggregations:
+          - alignmentPeriod: 300s
+            perSeriesAligner: ALIGN_RATE
+            crossSeriesReducer: REDUCE_SUM
+  
+  # Notification channels (configure based on your setup)
+  notificationChannels: []
+  
+  # Alert strategy
+  alertStrategy:
+    autoClose: 604800s  # 7 days
+  
+  # Severity level
+  severity: ERROR

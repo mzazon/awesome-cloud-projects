@@ -1,0 +1,362 @@
+# governance_workflow.yaml - Cloud Workflows definition for database governance automation
+# Orchestrates automated compliance checking, reporting, and alerting
+
+main:
+  params: [input]
+  steps:
+    - init:
+        assign:
+          - project_id: "${project_id}"
+          - region: "${region}"
+          - function_name: "${function_name}"
+          - compliance_threshold: ${compliance_threshold}
+          - start_time: $${time.now()}
+          - workflow_id: $${text.split(sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID"), "/")[5]}
+    
+    - log_start:
+        call: sys.log
+        args:
+          data: 
+            message: "Starting database governance workflow"
+            workflow_id: $${workflow_id}
+            trigger: $${default(input.trigger, "unknown")}
+            project: $${project_id}
+          severity: INFO
+    
+    - validate_input:
+        switch:
+          - condition: $${input.trigger == "asset_change"}
+            steps:
+              - process_asset_change:
+                  call: handle_asset_change
+                  args:
+                    input: $${input}
+                  result: asset_change_result
+              - set_context:
+                  assign:
+                    - context: "asset_change"
+                    - trigger_details: $${asset_change_result}
+          - condition: $${input.trigger == "scheduled"}
+            steps:
+              - set_scheduled_context:
+                  assign:
+                    - context: "scheduled"
+                    - trigger_details: {"type": "scheduled_compliance_check"}
+          - condition: $${input.trigger == "manual"}
+            steps:
+              - set_manual_context:
+                  assign:
+                    - context: "manual"
+                    - trigger_details: {"type": "manual_governance_check"}
+        next: run_compliance_check
+
+    - run_compliance_check:
+        call: execute_compliance_analysis
+        args:
+          project_id: $${project_id}
+          region: $${region}
+          function_name: $${function_name}
+          context: $${context}
+        result: compliance_result
+    
+    - evaluate_compliance:
+        switch:
+          - condition: $${compliance_result.status == "success"}
+            steps:
+              - check_compliance_score:
+                  switch:
+                    - condition: $${compliance_result.compliance_score < compliance_threshold}
+                      steps:
+                        - handle_compliance_violation:
+                            call: process_compliance_violation
+                            args:
+                              compliance_result: $${compliance_result}
+                              threshold: $${compliance_threshold}
+                            result: violation_response
+                        - set_violation_status:
+                            assign:
+                              - final_status: "compliance_violation"
+                              - violation_details: $${violation_response}
+                    - condition: $${compliance_result.compliance_score >= compliance_threshold}
+                      steps:
+                        - set_compliant_status:
+                            assign:
+                              - final_status: "compliant"
+                              - violation_details: null
+          - condition: $${compliance_result.status == "error"}
+            steps:
+              - handle_error:
+                  call: process_error
+                  args:
+                    error_details: $${compliance_result}
+                  result: error_response
+              - set_error_status:
+                  assign:
+                    - final_status: "error"
+                    - error_details: $${error_response}
+        next: generate_report
+
+    - generate_report:
+        call: create_governance_report
+        args:
+          compliance_result: $${compliance_result}
+          workflow_context:
+            workflow_id: $${workflow_id}
+            trigger: $${input.trigger}
+            start_time: $${start_time}
+            end_time: $${time.now()}
+            status: $${final_status}
+        result: report_result
+    
+    - send_notifications:
+        switch:
+          - condition: $${final_status == "compliance_violation"}
+            call: send_compliance_alerts
+            args:
+              compliance_result: $${compliance_result}
+              violation_details: $${violation_details}
+            result: notification_result
+          - condition: $${final_status == "error"}
+            call: send_error_alerts  
+            args:
+              error_details: $${error_details}
+            result: notification_result
+        next: log_completion
+    
+    - log_completion:
+        call: sys.log
+        args:
+          data:
+            message: "Database governance workflow completed"
+            workflow_id: $${workflow_id}
+            status: $${final_status}
+            compliance_score: $${default(compliance_result.compliance_score, 0)}
+            duration_seconds: $${time.now() - start_time}
+            report_location: $${default(report_result.location, "none")}
+          severity: INFO
+    
+    - return_result:
+        return:
+          workflow_id: $${workflow_id}
+          status: $${final_status}
+          compliance_score: $${default(compliance_result.compliance_score, 0)}
+          total_databases: $${default(compliance_result.summary.total_databases, 0)}
+          compliant_databases: $${default(compliance_result.summary.compliant_databases, 0)}
+          violations: $${default(compliance_result.summary.total_violations, 0)}
+          report_location: $${default(report_result.location, "")}
+          execution_time: $${time.now() - start_time}
+
+# Subworkflow: Handle asset change events
+handle_asset_change:
+  params: [input]
+  steps:
+    - parse_asset_event:
+        assign:
+          - asset_name: $${default(input.asset_name, "unknown")}
+          - asset_type: $${default(input.asset_type, "unknown")}
+          - change_type: $${default(input.change_type, "unknown")}
+    
+    - log_asset_change:
+        call: sys.log
+        args:
+          data:
+            message: "Processing database asset change"
+            asset_name: $${asset_name}
+            asset_type: $${asset_type}
+            change_type: $${change_type}
+          severity: INFO
+    
+    - return_asset_details:
+        return:
+          asset_name: $${asset_name}
+          asset_type: $${asset_type}
+          change_type: $${change_type}
+          processing_required: true
+
+# Subworkflow: Execute compliance analysis
+execute_compliance_analysis:
+  params: [project_id, region, function_name, context]
+  steps:
+    - call_compliance_function:
+        try:
+          call: http.post
+          args:
+            url: $${" https://" + region + "-" + project_id + ".cloudfunctions.net/" + function_name}
+            headers:
+              Content-Type: "application/json"
+            body:
+              trigger_context: $${context}
+              project_id: $${project_id}
+            auth:
+              type: OIDC
+          result: function_response
+        retry:
+          predicate: $${http.default_retry_predicate}
+          max_retries: 3
+          backoff:
+            initial_delay: 2
+            max_delay: 60
+            multiplier: 2
+    
+    - parse_function_response:
+        assign:
+          - compliance_data: $${function_response.body}
+    
+    - validate_response:
+        switch:
+          - condition: $${compliance_data.status == "success"}
+            return: $${compliance_data}
+          - condition: $${compliance_data.status == "error"}
+            return:
+              status: "error"
+              message: $${compliance_data.message}
+              compliance_score: 0
+        next: handle_unexpected_response
+    
+    - handle_unexpected_response:
+        return:
+          status: "error"
+          message: "Unexpected response format from compliance function"
+          compliance_score: 0
+
+# Subworkflow: Process compliance violations
+process_compliance_violation:
+  params: [compliance_result, threshold]
+  steps:
+    - analyze_violations:
+        assign:
+          - violation_count: $${compliance_result.summary.total_violations}
+          - compliance_score: $${compliance_result.compliance_score}
+          - severity: $${if(compliance_score < 0.5, "critical", if(compliance_score < threshold, "high", "medium"))}
+    
+    - log_violation:
+        call: sys.log
+        args:
+          data:
+            message: "Compliance violation detected"
+            compliance_score: $${compliance_score}
+            threshold: $${threshold}
+            violation_count: $${violation_count}
+            severity: $${severity}
+          severity: WARNING
+    
+    - create_violation_record:
+        return:
+          severity: $${severity}
+          compliance_score: $${compliance_score}
+          threshold: $${threshold}
+          violation_count: $${violation_count}
+          requires_immediate_action: $${severity == "critical"}
+
+# Subworkflow: Process errors
+process_error:
+  params: [error_details]
+  steps:
+    - log_error:
+        call: sys.log
+        args:
+          data:
+            message: "Error in database governance workflow"
+            error: $${error_details.message}
+          severity: ERROR
+    
+    - return_error_summary:
+        return:
+          error_type: "governance_workflow_error"
+          message: $${error_details.message}
+          requires_intervention: true
+
+# Subworkflow: Create comprehensive governance report
+create_governance_report:
+  params: [compliance_result, workflow_context]
+  steps:
+    - compile_report:
+        assign:
+          - report:
+              governance_report:
+                timestamp: $${time.now()}
+                workflow_execution: $${workflow_context}
+                compliance_summary: $${compliance_result.summary}
+                compliance_score: $${compliance_result.compliance_score}
+                report_location: $${compliance_result.report_location}
+                status: $${workflow_context.status}
+    
+    - log_report_creation:
+        call: sys.log
+        args:
+          data:
+            message: "Governance report created"
+            report_location: $${default(compliance_result.report_location, "none")}
+            compliance_score: $${compliance_result.compliance_score}
+          severity: INFO
+    
+    - return_report_info:
+        return:
+          location: $${default(compliance_result.report_location, "")}
+          timestamp: $${time.now()}
+          status: "created"
+
+# Subworkflow: Send compliance alerts
+send_compliance_alerts:
+  params: [compliance_result, violation_details]
+  steps:
+    - create_alert_payload:
+        assign:
+          - alert_data:
+              alert_type: "compliance_violation"
+              severity: $${violation_details.severity}
+              compliance_score: $${compliance_result.compliance_score}
+              violation_count: $${violation_details.violation_count}
+              requires_action: $${violation_details.requires_immediate_action}
+              details: $${compliance_result.summary}
+    
+    - send_monitoring_alert:
+        try:
+          call: http.post
+          args:
+            url: $${" https://monitoring.googleapis.com/v3/projects/" + sys.get_env("GOOGLE_CLOUD_PROJECT_ID") + "/alertPolicies"}
+            headers:
+              Content-Type: "application/json"
+            body: $${alert_data}
+            auth:
+              type: OAuth2
+              scopes: "https://www.googleapis.com/auth/monitoring"
+        retry:
+          max_retries: 2
+    
+    - log_alert_sent:
+        call: sys.log
+        args:
+          data:
+            message: "Compliance violation alert sent"
+            severity: $${violation_details.severity}
+          severity: INFO
+    
+    - return_notification_status:
+        return:
+          status: "sent"
+          alert_type: "compliance_violation"
+
+# Subworkflow: Send error alerts
+send_error_alerts:
+  params: [error_details]
+  steps:
+    - create_error_alert:
+        assign:
+          - error_alert:
+              alert_type: "workflow_error"
+              error_message: $${error_details.message}
+              requires_intervention: true
+    
+    - log_error_alert:
+        call: sys.log
+        args:
+          data:
+            message: "Error alert sent for governance workflow"
+            error: $${error_details.message}
+          severity: ERROR
+    
+    - return_error_notification:
+        return:
+          status: "sent"
+          alert_type: "workflow_error"

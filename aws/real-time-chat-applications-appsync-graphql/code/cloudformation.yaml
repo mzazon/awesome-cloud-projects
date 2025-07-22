@@ -1,0 +1,923 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Real-Time Chat Application Infrastructure using AWS AppSync GraphQL API, 
+  DynamoDB for data storage, and Amazon Cognito for user authentication.
+  This template creates a complete serverless chat platform with real-time messaging capabilities.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Application Configuration"
+        Parameters:
+          - ApplicationName
+          - Environment
+      - Label:
+          default: "DynamoDB Configuration"
+        Parameters:
+          - DynamoDBReadCapacityUnits
+          - DynamoDBWriteCapacityUnits
+          - EnablePointInTimeRecovery
+      - Label:
+          default: "Cognito Configuration"
+        Parameters:
+          - EnableMFA
+          - PasswordMinLength
+          - CreateTestUsers
+      - Label:
+          default: "Monitoring and Logging"
+        Parameters:
+          - EnableXRayTracing
+          - LogRetentionInDays
+    ParameterLabels:
+      ApplicationName:
+        default: "Application Name"
+      Environment:
+        default: "Environment"
+      DynamoDBReadCapacityUnits:
+        default: "DynamoDB Read Capacity Units"
+      DynamoDBWriteCapacityUnits:
+        default: "DynamoDB Write Capacity Units"
+      EnablePointInTimeRecovery:
+        default: "Enable Point-in-Time Recovery"
+      EnableMFA:
+        default: "Enable Multi-Factor Authentication"
+      PasswordMinLength:
+        default: "Password Minimum Length"
+      CreateTestUsers:
+        default: "Create Test Users"
+      EnableXRayTracing:
+        default: "Enable X-Ray Tracing"
+      LogRetentionInDays:
+        default: "Log Retention Period"
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Description: Name of the chat application (used for resource naming)
+    Default: realtime-chat
+    AllowedPattern: ^[a-z][a-z0-9-]*$
+    ConstraintDescription: Must start with lowercase letter and contain only lowercase letters, numbers, and hyphens
+    MinLength: 3
+    MaxLength: 30
+
+  Environment:
+    Type: String
+    Description: Environment name (dev, staging, prod)
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  DynamoDBReadCapacityUnits:
+    Type: Number
+    Description: Read capacity units for DynamoDB tables
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+
+  DynamoDBWriteCapacityUnits:
+    Type: Number
+    Description: Write capacity units for DynamoDB tables
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+
+  EnablePointInTimeRecovery:
+    Type: String
+    Description: Enable point-in-time recovery for DynamoDB tables
+    Default: false
+    AllowedValues:
+      - true
+      - false
+
+  EnableMFA:
+    Type: String
+    Description: Enable multi-factor authentication for Cognito User Pool
+    Default: false
+    AllowedValues:
+      - true
+      - false
+
+  PasswordMinLength:
+    Type: Number
+    Description: Minimum password length for Cognito User Pool
+    Default: 8
+    MinValue: 6
+    MaxValue: 99
+
+  CreateTestUsers:
+    Type: String
+    Description: Create test users for development and testing
+    Default: false
+    AllowedValues:
+      - true
+      - false
+
+  EnableXRayTracing:
+    Type: String
+    Description: Enable AWS X-Ray tracing for AppSync
+    Default: false
+    AllowedValues:
+      - true
+      - false
+
+  LogRetentionInDays:
+    Type: Number
+    Description: CloudWatch log retention period in days
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+  EnablePITR: !Equals [!Ref EnablePointInTimeRecovery, true]
+  EnableMFACondition: !Equals [!Ref EnableMFA, true]
+  CreateTestUsersCondition: !Equals [!Ref CreateTestUsers, true]
+  EnableXRayCondition: !Equals [!Ref EnableXRayTracing, true]
+
+Resources:
+  # ============================================================================
+  # Amazon Cognito User Pool for Authentication
+  # ============================================================================
+  
+  ChatUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${ApplicationName}-${Environment}-users"
+      # User sign-up and sign-in options
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      # Password policy
+      Policies:
+        PasswordPolicy:
+          MinimumLength: !Ref PasswordMinLength
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          TemporaryPasswordValidityDays: 7
+      # MFA configuration
+      MfaConfiguration: !If [EnableMFACondition, OPTIONAL, 'OFF']
+      EnabledMfas: !If 
+        - EnableMFACondition
+        - [SMS_MFA, SOFTWARE_TOKEN_MFA]
+        - !Ref AWS::NoValue
+      # Email configuration
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+      # Schema configuration
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: preferred_username
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+      # Account recovery
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      # User pool add-ons
+      UserPoolAddOns:
+        AdvancedSecurityMode: !If [IsProduction, ENFORCED, AUDIT]
+      # Deletion protection for production
+      DeletionProtection: !If [IsProduction, ACTIVE, INACTIVE]
+      UserPoolTags:
+        Name: !Sub "${ApplicationName}-${Environment}-user-pool"
+        Environment: !Ref Environment
+        Application: !Ref ApplicationName
+
+  ChatUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${ApplicationName}-${Environment}-client"
+      UserPoolId: !Ref ChatUserPool
+      GenerateSecret: true
+      # Authentication flows
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      # Token validity
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      # Prevent user existence errors
+      PreventUserExistenceErrors: ENABLED
+      # Read and write attributes
+      ReadAttributes:
+        - email
+        - preferred_username
+        - email_verified
+      WriteAttributes:
+        - email
+        - preferred_username
+
+  # ============================================================================
+  # DynamoDB Tables for Chat Data Storage
+  # ============================================================================
+
+  MessagesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ApplicationName}-${Environment}-messages"
+      BillingMode: PROVISIONED
+      # Primary key configuration
+      AttributeDefinitions:
+        - AttributeName: conversationId
+          AttributeType: S
+        - AttributeName: messageId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: conversationId
+          KeyType: HASH
+        - AttributeName: messageId
+          KeyType: RANGE
+      # Provisioned throughput
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref DynamoDBReadCapacityUnits
+        WriteCapacityUnits: !Ref DynamoDBWriteCapacityUnits
+      # Global Secondary Index for time-based queries
+      GlobalSecondaryIndexes:
+        - IndexName: MessagesByTime
+          KeySchema:
+            - AttributeName: conversationId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !Ref DynamoDBReadCapacityUnits
+            WriteCapacityUnits: !Ref DynamoDBWriteCapacityUnits
+      # DynamoDB Streams for real-time processing
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      # Point-in-time recovery
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnablePITR, true, false]
+      # Server-side encryption
+      SSESpecification:
+        SSEEnabled: true
+        KMSMasterKeyId: alias/aws/dynamodb
+      # Tags
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-${Environment}-messages"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  ConversationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ApplicationName}-${Environment}-conversations"
+      BillingMode: PROVISIONED
+      # Primary key configuration
+      AttributeDefinitions:
+        - AttributeName: conversationId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: conversationId
+          KeyType: HASH
+      # Provisioned throughput
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref DynamoDBReadCapacityUnits
+        WriteCapacityUnits: !Ref DynamoDBWriteCapacityUnits
+      # Global Secondary Index for user conversations
+      GlobalSecondaryIndexes:
+        - IndexName: UserConversations
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: conversationId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !Ref DynamoDBReadCapacityUnits
+            WriteCapacityUnits: !Ref DynamoDBWriteCapacityUnits
+      # Point-in-time recovery
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnablePITR, true, false]
+      # Server-side encryption
+      SSESpecification:
+        SSEEnabled: true
+        KMSMasterKeyId: alias/aws/dynamodb
+      # Tags
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-${Environment}-conversations"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ApplicationName}-${Environment}-users"
+      BillingMode: PROVISIONED
+      # Primary key configuration
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+      # Provisioned throughput
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref DynamoDBReadCapacityUnits
+        WriteCapacityUnits: !Ref DynamoDBWriteCapacityUnits
+      # Point-in-time recovery
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnablePITR, true, false]
+      # Server-side encryption
+      SSESpecification:
+        SSEEnabled: true
+        KMSMasterKeyId: alias/aws/dynamodb
+      # Tags
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-${Environment}-users"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # ============================================================================
+  # IAM Role for AppSync to Access DynamoDB
+  # ============================================================================
+
+  AppSyncServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ApplicationName}-${Environment}-appsync-service-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: appsync.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Query
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt MessagesTable.Arn
+                  - !Sub "${MessagesTable.Arn}/index/*"
+                  - !GetAtt ConversationsTable.Arn
+                  - !Sub "${ConversationsTable.Arn}/index/*"
+                  - !GetAtt UsersTable.Arn
+                  - !Sub "${UsersTable.Arn}/index/*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-${Environment}-appsync-role"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # ============================================================================
+  # CloudWatch Log Group for AppSync
+  # ============================================================================
+
+  AppSyncLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/appsync/apis/${ApplicationName}-${Environment}"
+      RetentionInDays: !Ref LogRetentionInDays
+
+  # ============================================================================
+  # AWS AppSync GraphQL API
+  # ============================================================================
+
+  ChatGraphQLApi:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      Name: !Sub "${ApplicationName}-${Environment}-api"
+      AuthenticationType: AMAZON_COGNITO_USER_POOLS
+      UserPoolConfig:
+        UserPoolId: !Ref ChatUserPool
+        AwsRegion: !Ref AWS::Region
+        DefaultAction: ALLOW
+      # Enable logging
+      LogConfig:
+        CloudWatchLogsRoleArn: !GetAtt AppSyncLogsRole.Arn
+        ExcludeVerboseContent: false
+        FieldLogLevel: ALL
+      # X-Ray tracing
+      XrayEnabled: !If [EnableXRayCondition, true, false]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-${Environment}-graphql-api"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # IAM Role for AppSync CloudWatch Logging
+  AppSyncLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: appsync.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AppSyncPushToCloudWatchLogs
+
+  # ============================================================================
+  # GraphQL Schema
+  # ============================================================================
+
+  ChatGraphQLSchema:
+    Type: AWS::AppSync::GraphQLSchema
+    Properties:
+      ApiId: !GetAtt ChatGraphQLApi.ApiId
+      Definition: |
+        type Message {
+            messageId: ID!
+            conversationId: ID!
+            userId: ID!
+            content: String!
+            messageType: MessageType!
+            createdAt: AWSDateTime!
+            updatedAt: AWSDateTime
+            author: User
+        }
+        
+        type Conversation {
+            conversationId: ID!
+            name: String
+            participants: [ID!]!
+            lastMessageAt: AWSDateTime
+            lastMessage: String
+            createdAt: AWSDateTime!
+            updatedAt: AWSDateTime
+            createdBy: ID!
+            messageCount: Int
+        }
+        
+        type User {
+            userId: ID!
+            username: String!
+            email: AWSEmail!
+            displayName: String
+            avatarUrl: String
+            lastSeen: AWSDateTime
+            isOnline: Boolean
+            createdAt: AWSDateTime!
+            updatedAt: AWSDateTime
+        }
+        
+        enum MessageType {
+            TEXT
+            IMAGE
+            FILE
+            SYSTEM
+        }
+        
+        type Query {
+            getMessage(conversationId: ID!, messageId: ID!): Message
+            getConversation(conversationId: ID!): Conversation
+            getUser(userId: ID!): User
+            listMessages(conversationId: ID!, limit: Int, nextToken: String): MessageConnection
+            listConversations(userId: ID!, limit: Int, nextToken: String): ConversationConnection
+            searchMessages(conversationId: ID!, searchTerm: String!, limit: Int): [Message]
+        }
+        
+        type Mutation {
+            sendMessage(input: SendMessageInput!): Message
+            createConversation(input: CreateConversationInput!): Conversation
+            updateConversation(input: UpdateConversationInput!): Conversation
+            deleteMessage(conversationId: ID!, messageId: ID!): Message
+            updateUserPresence(userId: ID!, isOnline: Boolean!): User
+            updateUserProfile(input: UpdateUserProfileInput!): User
+        }
+        
+        type Subscription {
+            onMessageSent(conversationId: ID!): Message
+                @aws_subscribe(mutations: ["sendMessage"])
+            onConversationUpdated(userId: ID!): Conversation
+                @aws_subscribe(mutations: ["createConversation", "updateConversation"])
+            onUserPresenceUpdated(conversationId: ID!): User
+                @aws_subscribe(mutations: ["updateUserPresence"])
+        }
+        
+        input SendMessageInput {
+            conversationId: ID!
+            content: String!
+            messageType: MessageType = TEXT
+        }
+        
+        input CreateConversationInput {
+            name: String
+            participants: [ID!]!
+        }
+        
+        input UpdateConversationInput {
+            conversationId: ID!
+            name: String
+        }
+        
+        input UpdateUserProfileInput {
+            userId: ID!
+            displayName: String
+            avatarUrl: String
+        }
+        
+        type MessageConnection {
+            items: [Message]
+            nextToken: String
+        }
+        
+        type ConversationConnection {
+            items: [Conversation]
+            nextToken: String
+        }
+        
+        schema {
+            query: Query
+            mutation: Mutation
+            subscription: Subscription
+        }
+
+  # ============================================================================
+  # AppSync Data Sources
+  # ============================================================================
+
+  MessagesDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt ChatGraphQLApi.ApiId
+      Name: MessagesTable
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      DynamoDBConfig:
+        TableName: !Ref MessagesTable
+        AwsRegion: !Ref AWS::Region
+
+  ConversationsDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt ChatGraphQLApi.ApiId
+      Name: ConversationsTable
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      DynamoDBConfig:
+        TableName: !Ref ConversationsTable
+        AwsRegion: !Ref AWS::Region
+
+  UsersDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt ChatGraphQLApi.ApiId
+      Name: UsersTable
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      DynamoDBConfig:
+        TableName: !Ref UsersTable
+        AwsRegion: !Ref AWS::Region
+
+  # ============================================================================
+  # AppSync Resolvers
+  # ============================================================================
+
+  SendMessageResolver:
+    Type: AWS::AppSync::Resolver
+    DependsOn: ChatGraphQLSchema
+    Properties:
+      ApiId: !GetAtt ChatGraphQLApi.ApiId
+      TypeName: Mutation
+      FieldName: sendMessage
+      DataSourceName: !GetAtt MessagesDataSource.Name
+      RequestMappingTemplate: |
+        {
+            "version": "2017-02-28",
+            "operation": "PutItem",
+            "key": {
+                "conversationId": $util.dynamodb.toDynamoDBJson($ctx.args.input.conversationId),
+                "messageId": $util.dynamodb.toDynamoDBJson($util.autoId())
+            },
+            "attributeValues": {
+                "userId": $util.dynamodb.toDynamoDBJson($ctx.identity.sub),
+                "content": $util.dynamodb.toDynamoDBJson($ctx.args.input.content),
+                "messageType": $util.dynamodb.toDynamoDBJson($ctx.args.input.messageType),
+                "createdAt": $util.dynamodb.toDynamoDBJson($util.time.nowISO8601()),
+                "updatedAt": $util.dynamodb.toDynamoDBJson($util.time.nowISO8601())
+            }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result)
+
+  ListMessagesResolver:
+    Type: AWS::AppSync::Resolver
+    DependsOn: ChatGraphQLSchema
+    Properties:
+      ApiId: !GetAtt ChatGraphQLApi.ApiId
+      TypeName: Query
+      FieldName: listMessages
+      DataSourceName: !GetAtt MessagesDataSource.Name
+      RequestMappingTemplate: |
+        {
+            "version": "2017-02-28",
+            "operation": "Query",
+            "index": "MessagesByTime",
+            "query": {
+                "expression": "conversationId = :conversationId",
+                "expressionValues": {
+                    ":conversationId": $util.dynamodb.toDynamoDBJson($ctx.args.conversationId)
+                }
+            },
+            "scanIndexForward": false,
+            "limit": #if($ctx.args.limit) $ctx.args.limit #else 50 #end
+            #if($ctx.args.nextToken)
+            ,"nextToken": "$ctx.args.nextToken"
+            #end
+        }
+      ResponseMappingTemplate: |
+        {
+            "items": $util.toJson($ctx.result.items),
+            "nextToken": #if($ctx.result.nextToken) "$ctx.result.nextToken" #else null #end
+        }
+
+  CreateConversationResolver:
+    Type: AWS::AppSync::Resolver
+    DependsOn: ChatGraphQLSchema
+    Properties:
+      ApiId: !GetAtt ChatGraphQLApi.ApiId
+      TypeName: Mutation
+      FieldName: createConversation
+      DataSourceName: !GetAtt ConversationsDataSource.Name
+      RequestMappingTemplate: |
+        {
+            "version": "2017-02-28",
+            "operation": "PutItem",
+            "key": {
+                "conversationId": $util.dynamodb.toDynamoDBJson($util.autoId())
+            },
+            "attributeValues": {
+                "name": $util.dynamodb.toDynamoDBJson($ctx.args.input.name),
+                "participants": $util.dynamodb.toDynamoDBJson($ctx.args.input.participants),
+                "createdBy": $util.dynamodb.toDynamoDBJson($ctx.identity.sub),
+                "createdAt": $util.dynamodb.toDynamoDBJson($util.time.nowISO8601()),
+                "updatedAt": $util.dynamodb.toDynamoDBJson($util.time.nowISO8601()),
+                "messageCount": $util.dynamodb.toDynamoDBJson(0)
+            }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result)
+
+  UpdateUserPresenceResolver:
+    Type: AWS::AppSync::Resolver
+    DependsOn: ChatGraphQLSchema
+    Properties:
+      ApiId: !GetAtt ChatGraphQLApi.ApiId
+      TypeName: Mutation
+      FieldName: updateUserPresence
+      DataSourceName: !GetAtt UsersDataSource.Name
+      RequestMappingTemplate: |
+        {
+            "version": "2017-02-28",
+            "operation": "UpdateItem",
+            "key": {
+                "userId": $util.dynamodb.toDynamoDBJson($ctx.args.userId)
+            },
+            "update": {
+                "expression": "SET isOnline = :isOnline, lastSeen = :lastSeen, updatedAt = :updatedAt",
+                "expressionValues": {
+                    ":isOnline": $util.dynamodb.toDynamoDBJson($ctx.args.isOnline),
+                    ":lastSeen": $util.dynamodb.toDynamoDBJson($util.time.nowISO8601()),
+                    ":updatedAt": $util.dynamodb.toDynamoDBJson($util.time.nowISO8601())
+                }
+            }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result)
+
+  GetConversationResolver:
+    Type: AWS::AppSync::Resolver
+    DependsOn: ChatGraphQLSchema
+    Properties:
+      ApiId: !GetAtt ChatGraphQLApi.ApiId
+      TypeName: Query
+      FieldName: getConversation
+      DataSourceName: !GetAtt ConversationsDataSource.Name
+      RequestMappingTemplate: |
+        {
+            "version": "2017-02-28",
+            "operation": "GetItem",
+            "key": {
+                "conversationId": $util.dynamodb.toDynamoDBJson($ctx.args.conversationId)
+            }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result)
+
+  GetUserResolver:
+    Type: AWS::AppSync::Resolver
+    DependsOn: ChatGraphQLSchema
+    Properties:
+      ApiId: !GetAtt ChatGraphQLApi.ApiId
+      TypeName: Query
+      FieldName: getUser
+      DataSourceName: !GetAtt UsersDataSource.Name
+      RequestMappingTemplate: |
+        {
+            "version": "2017-02-28",
+            "operation": "GetItem",
+            "key": {
+                "userId": $util.dynamodb.toDynamoDBJson($ctx.args.userId)
+            }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result)
+
+  # ============================================================================
+  # Test Users (Conditional)
+  # ============================================================================
+
+  TestUser1:
+    Type: AWS::Cognito::UserPoolUser
+    Condition: CreateTestUsersCondition
+    Properties:
+      UserPoolId: !Ref ChatUserPool
+      Username: testuser1
+      UserAttributes:
+        - Name: email
+          Value: testuser1@example.com
+        - Name: email_verified
+          Value: true
+      MessageAction: SUPPRESS
+      TemporaryPassword: TempPassword123!
+
+  TestUser2:
+    Type: AWS::Cognito::UserPoolUser
+    Condition: CreateTestUsersCondition
+    Properties:
+      UserPoolId: !Ref ChatUserPool
+      Username: testuser2
+      UserAttributes:
+        - Name: email
+          Value: testuser2@example.com
+        - Name: email_verified
+          Value: true
+      MessageAction: SUPPRESS
+      TemporaryPassword: TempPassword123!
+
+# ============================================================================
+# Outputs
+# ============================================================================
+
+Outputs:
+  # AppSync API Information
+  GraphQLApiId:
+    Description: ID of the AppSync GraphQL API
+    Value: !GetAtt ChatGraphQLApi.ApiId
+    Export:
+      Name: !Sub "${AWS::StackName}-GraphQLApiId"
+
+  GraphQLApiUrl:
+    Description: URL of the AppSync GraphQL API
+    Value: !GetAtt ChatGraphQLApi.GraphQLUrl
+    Export:
+      Name: !Sub "${AWS::StackName}-GraphQLApiUrl"
+
+  GraphQLApiRealTimeUrl:
+    Description: Real-time URL of the AppSync GraphQL API for subscriptions
+    Value: !GetAtt ChatGraphQLApi.RealtimeUrl
+    Export:
+      Name: !Sub "${AWS::StackName}-GraphQLApiRealTimeUrl"
+
+  # Cognito Information
+  UserPoolId:
+    Description: ID of the Cognito User Pool
+    Value: !Ref ChatUserPool
+    Export:
+      Name: !Sub "${AWS::StackName}-UserPoolId"
+
+  UserPoolClientId:
+    Description: ID of the Cognito User Pool Client
+    Value: !Ref ChatUserPoolClient
+    Export:
+      Name: !Sub "${AWS::StackName}-UserPoolClientId"
+
+  UserPoolArn:
+    Description: ARN of the Cognito User Pool
+    Value: !GetAtt ChatUserPool.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-UserPoolArn"
+
+  # DynamoDB Table Information
+  MessagesTableName:
+    Description: Name of the Messages DynamoDB table
+    Value: !Ref MessagesTable
+    Export:
+      Name: !Sub "${AWS::StackName}-MessagesTableName"
+
+  MessagesTableArn:
+    Description: ARN of the Messages DynamoDB table
+    Value: !GetAtt MessagesTable.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-MessagesTableArn"
+
+  ConversationsTableName:
+    Description: Name of the Conversations DynamoDB table
+    Value: !Ref ConversationsTable
+    Export:
+      Name: !Sub "${AWS::StackName}-ConversationsTableName"
+
+  ConversationsTableArn:
+    Description: ARN of the Conversations DynamoDB table
+    Value: !GetAtt ConversationsTable.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ConversationsTableArn"
+
+  UsersTableName:
+    Description: Name of the Users DynamoDB table
+    Value: !Ref UsersTable
+    Export:
+      Name: !Sub "${AWS::StackName}-UsersTableName"
+
+  UsersTableArn:
+    Description: ARN of the Users DynamoDB table
+    Value: !GetAtt UsersTable.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-UsersTableArn"
+
+  # IAM Role Information
+  AppSyncServiceRoleArn:
+    Description: ARN of the AppSync service role
+    Value: !GetAtt AppSyncServiceRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-AppSyncServiceRoleArn"
+
+  # Test Users (Conditional)
+  TestUser1Username:
+    Condition: CreateTestUsersCondition
+    Description: Username of Test User 1
+    Value: testuser1
+    Export:
+      Name: !Sub "${AWS::StackName}-TestUser1Username"
+
+  TestUser2Username:
+    Condition: CreateTestUsersCondition
+    Description: Username of Test User 2
+    Value: testuser2
+    Export:
+      Name: !Sub "${AWS::StackName}-TestUser2Username"
+
+  # Deployment Information
+  Region:
+    Description: AWS Region where the stack is deployed
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub "${AWS::StackName}-Region"
+
+  StackName:
+    Description: Name of the CloudFormation stack
+    Value: !Ref AWS::StackName
+    Export:
+      Name: !Sub "${AWS::StackName}-StackName"
+
+  Environment:
+    Description: Environment name
+    Value: !Ref Environment
+    Export:
+      Name: !Sub "${AWS::StackName}-Environment"
+
+  ApplicationName:
+    Description: Application name
+    Value: !Ref ApplicationName
+    Export:
+      Name: !Sub "${AWS::StackName}-ApplicationName"

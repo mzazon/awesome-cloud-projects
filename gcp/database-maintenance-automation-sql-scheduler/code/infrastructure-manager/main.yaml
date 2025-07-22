@@ -1,0 +1,581 @@
+# Google Cloud Infrastructure Manager Configuration
+# Database Maintenance Automation with Cloud SQL and Cloud Scheduler
+#
+# This configuration deploys a complete database maintenance automation system
+# including Cloud SQL instance, Cloud Functions for maintenance tasks,
+# Cloud Scheduler for automated execution, and comprehensive monitoring.
+
+metadata:
+  description: "Database maintenance automation infrastructure"
+  labels:
+    environment: "production"
+    purpose: "database-automation"
+    recipe: "database-maintenance-automation"
+
+# Input parameters for customization
+parameters:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    required: true
+  
+  region:
+    type: string
+    description: "Google Cloud region for resource deployment"
+    default: "us-central1"
+    
+  zone:
+    type: string
+    description: "Google Cloud zone for zonal resources"
+    default: "us-central1-a"
+    
+  db_instance_name:
+    type: string
+    description: "Cloud SQL instance name"
+    default: "maintenance-db"
+    
+  function_name:
+    type: string
+    description: "Cloud Function name for maintenance tasks"
+    default: "db-maintenance-function"
+    
+  scheduler_job_name:
+    type: string
+    description: "Cloud Scheduler job name"
+    default: "db-maintenance-scheduler"
+    
+  bucket_name:
+    type: string
+    description: "Cloud Storage bucket name for maintenance logs"
+    required: true
+    
+  db_password:
+    type: string
+    description: "Database user password"
+    default: "TempPassword123!"
+    sensitive: true
+
+# Enable required Google Cloud APIs
+resources:
+  # API Services
+  - name: sqladmin-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/sqladmin.googleapis.com
+      
+  - name: cloudfunctions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/cloudfunctions.googleapis.com
+      
+  - name: cloudscheduler-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/cloudscheduler.googleapis.com
+      
+  - name: monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/monitoring.googleapis.com
+      
+  - name: logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/logging.googleapis.com
+      
+  - name: storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/storage.googleapis.com
+
+  # Cloud Storage bucket for maintenance logs
+  - name: maintenance-logs-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${bucket_name}
+      project: ${project_id}
+      location: ${region}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+          - action:
+              type: Delete
+            condition:
+              age: 365
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      labels:
+        purpose: "database-maintenance-logs"
+        environment: "production"
+    metadata:
+      dependsOn:
+        - storage-api
+
+  # Cloud SQL Database Instance
+  - name: maintenance-sql-instance
+    type: gcp-types/sqladmin-v1beta4:instances
+    properties:
+      name: ${db_instance_name}
+      project: ${project_id}
+      region: ${region}
+      databaseVersion: MYSQL_8_0
+      settings:
+        tier: db-f1-micro
+        availabilityType: ZONAL
+        dataDiskType: PD_SSD
+        dataDiskSizeGb: 20
+        storageAutoResize: true
+        storageAutoResizeLimit: 100
+        # Backup configuration
+        backupConfiguration:
+          enabled: true
+          startTime: "02:00"
+          binaryLogEnabled: true
+          transactionLogRetentionDays: 7
+          backupRetentionSettings:
+            retentionUnit: COUNT
+            retainedBackups: 7
+        # Maintenance window
+        maintenanceWindow:
+          day: 7  # Sunday
+          hour: 3
+          updateTrack: stable
+        # Database flags for monitoring
+        databaseFlags:
+          - name: slow_query_log
+            value: "on"
+          - name: long_query_time
+            value: "2"
+          - name: log_output
+            value: "TABLE"
+        # IP configuration
+        ipConfiguration:
+          authorizedNetworks: []
+          ipv4Enabled: true
+          requireSsl: false
+        # Insights configuration
+        insightsConfig:
+          queryInsightsEnabled: true
+          recordApplicationTags: true
+          recordClientAddress: true
+      labels:
+        purpose: "database-maintenance"
+        environment: "production"
+    metadata:
+      dependsOn:
+        - sqladmin-api
+
+  # Cloud SQL Database
+  - name: maintenance-database
+    type: gcp-types/sqladmin-v1beta4:databases
+    properties:
+      project: ${project_id}
+      instance: $(ref.maintenance-sql-instance.name)
+      name: maintenance_app
+      charset: utf8mb4
+      collation: utf8mb4_unicode_ci
+    metadata:
+      dependsOn:
+        - maintenance-sql-instance
+
+  # Cloud SQL User
+  - name: maintenance-user
+    type: gcp-types/sqladmin-v1beta4:users
+    properties:
+      project: ${project_id}
+      instance: $(ref.maintenance-sql-instance.name)
+      name: maintenance_user
+      password: ${db_password}
+      host: "%"
+    metadata:
+      dependsOn:
+        - maintenance-sql-instance
+
+  # Service Account for Cloud Function
+  - name: function-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: ${function_name}-sa
+      serviceAccount:
+        displayName: "Database Maintenance Function Service Account"
+        description: "Service account for database maintenance Cloud Function"
+      project: ${project_id}
+
+  # IAM bindings for service account
+  - name: function-sql-client-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/cloudsql.client
+      member: serviceAccount:$(ref.function-service-account.email)
+    metadata:
+      dependsOn:
+        - function-service-account
+
+  - name: function-storage-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/storage.objectAdmin
+      member: serviceAccount:$(ref.function-service-account.email)
+    metadata:
+      dependsOn:
+        - function-service-account
+
+  - name: function-monitoring-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/monitoring.metricWriter
+      member: serviceAccount:$(ref.function-service-account.email)
+    metadata:
+      dependsOn:
+        - function-service-account
+
+  - name: function-logging-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/logging.logWriter
+      member: serviceAccount:$(ref.function-service-account.email)
+    metadata:
+      dependsOn:
+        - function-service-account
+
+  # Cloud Function for database maintenance
+  - name: maintenance-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/${project_id}/locations/${region}
+      function:
+        name: ${function_name}
+        description: "Automated database maintenance function"
+        sourceArchiveUrl: gs://gcf-sources-${project_id}-${region}/maintenance-function.zip
+        httpsTrigger: {}
+        runtime: python39
+        entryPoint: database_maintenance
+        timeout: 540s
+        availableMemoryMb: 256
+        maxInstances: 10
+        serviceAccountEmail: $(ref.function-service-account.email)
+        environmentVariables:
+          DB_USER: maintenance_user
+          DB_NAME: maintenance_app
+          DB_PASSWORD: ${db_password}
+          BUCKET_NAME: ${bucket_name}
+          CONNECTION_NAME: ${project_id}:${region}:${db_instance_name}
+          PROJECT_ID: ${project_id}
+        # Cloud SQL connection
+        sqlConnectionSettings:
+          cloudsqlInstances:
+            - $(ref.maintenance-sql-instance.connectionName)
+        labels:
+          purpose: "database-maintenance"
+          environment: "production"
+    metadata:
+      dependsOn:
+        - cloudfunctions-api
+        - maintenance-sql-instance
+        - function-service-account
+        - maintenance-logs-bucket
+
+  # Cloud Scheduler Job for daily maintenance
+  - name: daily-maintenance-job
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      job:
+        name: ${scheduler_job_name}
+        description: "Daily database maintenance automation"
+        schedule: "0 2 * * *"
+        timeZone: "America/New_York"
+        httpTarget:
+          uri: $(ref.maintenance-function.httpsTrigger.url)
+          httpMethod: POST
+          headers:
+            Content-Type: application/json
+          body: |
+            {"maintenance_type": "daily", "triggered_by": "scheduler"}
+        retryConfig:
+          retryCount: 3
+          maxRetryDuration: 600s
+          minBackoffDuration: 60s
+          maxBackoffDuration: 300s
+          maxDoublings: 3
+        attemptDeadline: 600s
+    metadata:
+      dependsOn:
+        - cloudscheduler-api
+        - maintenance-function
+
+  # Cloud Scheduler Job for performance monitoring
+  - name: performance-monitoring-job
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      job:
+        name: ${scheduler_job_name}-monitor
+        description: "Database performance monitoring"
+        schedule: "0 */6 * * *"
+        timeZone: "America/New_York"
+        httpTarget:
+          uri: $(ref.maintenance-function.httpsTrigger.url)
+          httpMethod: POST
+          headers:
+            Content-Type: application/json
+          body: |
+            {"maintenance_type": "monitoring", "triggered_by": "scheduler"}
+        retryConfig:
+          retryCount: 2
+          maxRetryDuration: 300s
+          minBackoffDuration: 60s
+          maxBackoffDuration: 180s
+        attemptDeadline: 300s
+    metadata:
+      dependsOn:
+        - cloudscheduler-api
+        - maintenance-function
+
+  # Cloud Monitoring Alert Policy for CPU utilization
+  - name: cpu-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/${project_id}
+      alertPolicy:
+        displayName: "Cloud SQL High CPU Usage"
+        documentation:
+          content: "Alert when Cloud SQL CPU usage exceeds 80% for 5 minutes"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "Cloud SQL CPU > 80%"
+            conditionThreshold:
+              filter: |
+                resource.type="cloudsql_database" AND
+                metric.type="cloudsql.googleapis.com/database/cpu/utilization" AND
+                resource.labels.database_id="${project_id}:${db_instance_name}"
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 0.8
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_MEAN
+                  crossSeriesReducer: REDUCE_MEAN
+                  groupByFields:
+                    - resource.labels.database_id
+        enabled: true
+        alertStrategy:
+          autoClose: 1800s
+        combiner: OR
+    metadata:
+      dependsOn:
+        - monitoring-api
+        - maintenance-sql-instance
+
+  # Cloud Monitoring Alert Policy for connection count
+  - name: connection-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/${project_id}
+      alertPolicy:
+        displayName: "Cloud SQL High Connection Count"
+        documentation:
+          content: "Alert when active connections exceed 80% of max connections"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "High Connection Count"
+            conditionThreshold:
+              filter: |
+                resource.type="cloudsql_database" AND
+                metric.type="cloudsql.googleapis.com/database/mysql/connections" AND
+                resource.labels.database_id="${project_id}:${db_instance_name}"
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 80
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_MEAN
+        enabled: true
+        combiner: OR
+    metadata:
+      dependsOn:
+        - monitoring-api
+        - maintenance-sql-instance
+
+  # Cloud Monitoring Dashboard
+  - name: maintenance-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      parent: projects/${project_id}
+      dashboard:
+        displayName: "Database Maintenance Dashboard"
+        mosaicLayout:
+          tiles:
+            # CPU Utilization Chart
+            - width: 6
+              height: 4
+              widget:
+                title: "Database CPU Utilization"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: |
+                            resource.type="cloudsql_database" AND
+                            metric.type="cloudsql.googleapis.com/database/cpu/utilization" AND
+                            resource.labels.database_id="${project_id}:${db_instance_name}"
+                          aggregation:
+                            alignmentPeriod: 60s
+                            perSeriesAligner: ALIGN_MEAN
+                      plotType: LINE
+                  yAxis:
+                    label: "CPU Utilization"
+                    scale: LINEAR
+                  chartOptions:
+                    mode: COLOR
+            # Active Connections Chart
+            - width: 6
+              height: 4
+              xPos: 6
+              widget:
+                title: "Active Database Connections"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: |
+                            resource.type="cloudsql_database" AND
+                            metric.type="cloudsql.googleapis.com/database/mysql/connections" AND
+                            resource.labels.database_id="${project_id}:${db_instance_name}"
+                          aggregation:
+                            alignmentPeriod: 60s
+                            perSeriesAligner: ALIGN_MEAN
+                      plotType: LINE
+                  yAxis:
+                    label: "Connection Count"
+                    scale: LINEAR
+                  chartOptions:
+                    mode: COLOR
+            # Memory Usage Chart
+            - width: 6
+              height: 4
+              yPos: 4
+              widget:
+                title: "Database Memory Usage"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: |
+                            resource.type="cloudsql_database" AND
+                            metric.type="cloudsql.googleapis.com/database/memory/utilization" AND
+                            resource.labels.database_id="${project_id}:${db_instance_name}"
+                          aggregation:
+                            alignmentPeriod: 60s
+                            perSeriesAligner: ALIGN_MEAN
+                      plotType: LINE
+                  yAxis:
+                    label: "Memory Utilization"
+                    scale: LINEAR
+                  chartOptions:
+                    mode: COLOR
+            # Disk Usage Chart
+            - width: 6
+              height: 4
+              xPos: 6
+              yPos: 4
+              widget:
+                title: "Database Disk Usage"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: |
+                            resource.type="cloudsql_database" AND
+                            metric.type="cloudsql.googleapis.com/database/disk/utilization" AND
+                            resource.labels.database_id="${project_id}:${db_instance_name}"
+                          aggregation:
+                            alignmentPeriod: 60s
+                            perSeriesAligner: ALIGN_MEAN
+                      plotType: LINE
+                  yAxis:
+                    label: "Disk Utilization"
+                    scale: LINEAR
+                  chartOptions:
+                    mode: COLOR
+    metadata:
+      dependsOn:
+        - monitoring-api
+        - maintenance-sql-instance
+
+  # Log-based metric for function executions
+  - name: function-execution-metric
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      parent: projects/${project_id}
+      metric:
+        name: "database_maintenance_executions"
+        description: "Count of database maintenance function executions"
+        filter: |
+          resource.type="cloud_function" AND
+          resource.labels.function_name="${function_name}" AND
+          textPayload="Maintenance completed successfully"
+        metricDescriptor:
+          metricKind: COUNTER
+          valueType: INT64
+          displayName: "Database Maintenance Executions"
+        labelExtractors:
+          status: "EXTRACT(jsonPayload.status)"
+    metadata:
+      dependsOn:
+        - logging-api
+        - maintenance-function
+
+# Outputs for verification and integration
+outputs:
+  - name: sql_instance_name
+    value: $(ref.maintenance-sql-instance.name)
+    description: "Cloud SQL instance name"
+    
+  - name: sql_connection_name
+    value: $(ref.maintenance-sql-instance.connectionName)
+    description: "Cloud SQL connection name for applications"
+    
+  - name: sql_instance_ip
+    value: $(ref.maintenance-sql-instance.ipAddresses[0].ipAddress)
+    description: "Cloud SQL instance IP address"
+    
+  - name: function_name
+    value: $(ref.maintenance-function.name)
+    description: "Cloud Function name"
+    
+  - name: function_url
+    value: $(ref.maintenance-function.httpsTrigger.url)
+    description: "Cloud Function trigger URL"
+    
+  - name: storage_bucket
+    value: $(ref.maintenance-logs-bucket.name)
+    description: "Cloud Storage bucket for maintenance logs"
+    
+  - name: service_account_email
+    value: $(ref.function-service-account.email)
+    description: "Service account email for the maintenance function"
+    
+  - name: scheduler_job_name
+    value: $(ref.daily-maintenance-job.name)
+    description: "Cloud Scheduler job name for daily maintenance"
+    
+  - name: monitoring_job_name
+    value: $(ref.performance-monitoring-job.name)
+    description: "Cloud Scheduler job name for performance monitoring"
+    
+  - name: dashboard_url
+    value: "https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.maintenance-dashboard.name)?project=${project_id}"
+    description: "URL to access the monitoring dashboard"

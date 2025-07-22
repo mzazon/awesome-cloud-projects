@@ -1,0 +1,699 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure as Code for Fraud Detection with Amazon Fraud Detector'
+
+# Parameters section for customization
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, prod]
+    Description: Environment name for resource naming
+    
+  BucketName:
+    Type: String
+    Default: ''
+    Description: S3 bucket name for training data (leave empty for auto-generated name)
+    
+  EventTypeName:
+    Type: String
+    Default: payment_fraud
+    Description: Name for the fraud detection event type
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z0-9_]+$'
+    
+  EntityTypeName:
+    Type: String
+    Default: customer
+    Description: Name for the customer entity type
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z0-9_]+$'
+    
+  ModelName:
+    Type: String
+    Default: fraud_detection_model
+    Description: Name for the ML model
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z0-9_]+$'
+    
+  DetectorName:
+    Type: String
+    Default: payment_fraud_detector
+    Description: Name for the fraud detector
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z0-9_]+$'
+    
+  LambdaMemorySize:
+    Type: Number
+    Default: 128
+    MinValue: 128
+    MaxValue: 10240
+    Description: Memory allocation for Lambda function (MB)
+    
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    Description: Timeout for Lambda function (seconds)
+
+# Conditions for conditional resource creation
+Conditions:
+  CreateBucketName: !Equals [!Ref BucketName, '']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+# Resources section
+Resources:
+  # S3 Bucket for storing training data
+  FraudDetectionDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - CreateBucketName
+        - !Sub 'fraud-detection-data-${Environment}-${AWS::AccountId}-${AWS::Region}'
+        - !Ref BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt TrainingDataProcessor.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .csv
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: FraudDetection
+        - Key: Component
+          Value: DataStorage
+
+  # IAM Role for Fraud Detector Service
+  FraudDetectorServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'FraudDetectorServiceRole-${Environment}-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: frauddetector.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonFraudDetectorFullAccessPolicy
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt FraudDetectionDataBucket.Arn
+                  - !Sub '${FraudDetectionDataBucket}/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: FraudDetection
+        - Key: Component
+          Value: ServiceRole
+
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'FraudDetectionLambdaRole-${Environment}-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: FraudDetectorAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - frauddetector:GetEventPrediction
+                  - frauddetector:GetDetectors
+                  - frauddetector:GetEventTypes
+                  - frauddetector:GetEntityTypes
+                Resource: '*'
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${FraudDetectionDataBucket}/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: FraudDetection
+        - Key: Component
+          Value: LambdaRole
+
+  # Lambda Function for Processing Fraud Detection Results
+  FraudPredictionProcessor:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'fraud-prediction-processor-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          DETECTOR_NAME: !Ref DetectorName
+          EVENT_TYPE_NAME: !Ref EventTypeName
+          ENTITY_TYPE_NAME: !Ref EntityTypeName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          frauddetector = boto3.client('frauddetector')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Extract configuration from environment variables
+                  detector_name = os.environ.get('DETECTOR_NAME')
+                  event_type_name = os.environ.get('EVENT_TYPE_NAME')
+                  entity_type_name = os.environ.get('ENTITY_TYPE_NAME')
+                  
+                  # Extract transaction data from event
+                  transaction_data = event.get('transaction', {})
+                  
+                  # Prepare variables for fraud detection
+                  variables = {
+                      'customer_id': transaction_data.get('customer_id', 'unknown'),
+                      'email_address': transaction_data.get('email_address', 'unknown'),
+                      'ip_address': transaction_data.get('ip_address', 'unknown'),
+                      'customer_name': transaction_data.get('customer_name', 'unknown'),
+                      'phone_number': transaction_data.get('phone_number', 'unknown'),
+                      'billing_address': transaction_data.get('billing_address', 'unknown'),
+                      'billing_city': transaction_data.get('billing_city', 'unknown'),
+                      'billing_state': transaction_data.get('billing_state', 'unknown'),
+                      'billing_zip': transaction_data.get('billing_zip', 'unknown'),
+                      'payment_method': transaction_data.get('payment_method', 'unknown'),
+                      'card_bin': transaction_data.get('card_bin', 'unknown'),
+                      'order_price': str(transaction_data.get('order_price', 0.0)),
+                      'product_category': transaction_data.get('product_category', 'unknown')
+                  }
+                  
+                  # Get fraud prediction
+                  response = frauddetector.get_event_prediction(
+                      detectorId=detector_name,
+                      eventId=f"txn_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                      eventTypeName=event_type_name,
+                      entities=[{
+                          'entityType': entity_type_name,
+                          'entityId': variables['customer_id']
+                      }],
+                      eventTimestamp=datetime.now().isoformat(),
+                      eventVariables=variables
+                  )
+                  
+                  # Process results
+                  prediction_result = {
+                      'transaction_id': event.get('transaction_id'),
+                      'customer_id': variables['customer_id'],
+                      'timestamp': datetime.now().isoformat(),
+                      'fraud_prediction': response
+                  }
+                  
+                  # Extract outcomes and scores
+                  outcomes = response.get('ruleResults', [])
+                  model_scores = response.get('modelScores', [])
+                  
+                  # Log prediction results
+                  logger.info(f"Fraud prediction completed for transaction: {event.get('transaction_id')}")
+                  logger.info(f"Outcomes: {outcomes}")
+                  logger.info(f"Model scores: {model_scores}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(prediction_result)
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing fraud prediction: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'transaction_id': event.get('transaction_id')
+                      })
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: FraudDetection
+        - Key: Component
+          Value: PredictionProcessor
+
+  # Lambda Function for Processing Training Data
+  TrainingDataProcessor:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'training-data-processor-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: 256
+      Timeout: 300
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref FraudDetectionDataBucket
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import csv
+          from io import StringIO
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Process S3 event notification
+                  for record in event['Records']:
+                      bucket = record['s3']['bucket']['name']
+                      key = record['s3']['object']['key']
+                      
+                      logger.info(f"Processing training data file: {key}")
+                      
+                      # Get object from S3
+                      response = s3.get_object(Bucket=bucket, Key=key)
+                      content = response['Body'].read().decode('utf-8')
+                      
+                      # Validate CSV format
+                      csv_reader = csv.DictReader(StringIO(content))
+                      row_count = 0
+                      fraud_count = 0
+                      legit_count = 0
+                      
+                      for row in csv_reader:
+                          row_count += 1
+                          label = row.get('EVENT_LABEL', '').lower()
+                          if label == 'fraud':
+                              fraud_count += 1
+                          elif label == 'legit':
+                              legit_count += 1
+                      
+                      # Log statistics
+                      logger.info(f"Training data validation complete:")
+                      logger.info(f"Total rows: {row_count}")
+                      logger.info(f"Fraud events: {fraud_count}")
+                      logger.info(f"Legitimate events: {legit_count}")
+                      
+                      # Create validation report
+                      validation_report = {
+                          'file': key,
+                          'total_rows': row_count,
+                          'fraud_events': fraud_count,
+                          'legitimate_events': legit_count,
+                          'fraud_percentage': (fraud_count / row_count * 100) if row_count > 0 else 0,
+                          'validation_status': 'valid' if row_count > 0 else 'invalid'
+                      }
+                      
+                      # Save validation report
+                      report_key = key.replace('.csv', '_validation_report.json')
+                      s3.put_object(
+                          Bucket=bucket,
+                          Key=report_key,
+                          Body=json.dumps(validation_report, indent=2),
+                          ContentType='application/json'
+                      )
+                      
+                      logger.info(f"Validation report saved: {report_key}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Training data processed successfully')
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing training data: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: FraudDetection
+        - Key: Component
+          Value: DataProcessor
+
+  # Lambda Permission for S3 to invoke training data processor
+  TrainingDataProcessorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TrainingDataProcessor
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt FraudDetectionDataBucket.Arn
+
+  # CloudWatch Log Groups for Lambda functions
+  FraudPredictionProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/fraud-prediction-processor-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 14]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: FraudDetection
+
+  TrainingDataProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/training-data-processor-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 14]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: FraudDetection
+
+  # CloudWatch Alarms for monitoring
+  FraudPredictionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'FraudPrediction-Errors-${Environment}'
+      AlarmDescription: 'Monitor fraud prediction Lambda function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FraudPredictionProcessor
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: FraudDetection
+
+  FraudPredictionDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'FraudPrediction-Duration-${Environment}'
+      AlarmDescription: 'Monitor fraud prediction Lambda function duration'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 25000  # 25 seconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FraudPredictionProcessor
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: FraudDetection
+
+  # API Gateway for fraud prediction endpoint (optional)
+  FraudDetectionApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub 'fraud-detection-api-${Environment}'
+      Description: 'API Gateway for fraud detection predictions'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: FraudDetection
+
+  # API Gateway Resource
+  PredictionResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref FraudDetectionApi
+      ParentId: !GetAtt FraudDetectionApi.RootResourceId
+      PathPart: predict
+
+  # API Gateway Method
+  PredictionMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref FraudDetectionApi
+      ResourceId: !Ref PredictionResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FraudPredictionProcessor.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+        - StatusCode: 500
+          ResponseModels:
+            application/json: Empty
+
+  # Lambda Permission for API Gateway
+  ApiGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FraudPredictionProcessor
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${FraudDetectionApi}/*/*'
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - PredictionMethod
+    Properties:
+      RestApiId: !Ref FraudDetectionApi
+      StageName: !Ref Environment
+      StageDescription: !Sub 'Deployment for ${Environment} environment'
+
+  # CloudWatch Dashboard for monitoring
+  FraudDetectionDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'FraudDetection-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${FraudPredictionProcessor}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Fraud Prediction Lambda Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApiGateway", "Count", "ApiName", "${FraudDetectionApi}" ],
+                  [ ".", "4XXError", ".", "." ],
+                  [ ".", "5XXError", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "API Gateway Metrics"
+              }
+            }
+          ]
+        }
+
+# Outputs section for important resource information
+Outputs:
+  FraudDetectionBucketName:
+    Description: 'Name of the S3 bucket for fraud detection training data'
+    Value: !Ref FraudDetectionDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-FraudDetectionBucket'
+
+  FraudDetectionBucketArn:
+    Description: 'ARN of the S3 bucket for fraud detection training data'
+    Value: !GetAtt FraudDetectionDataBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FraudDetectionBucketArn'
+
+  FraudDetectorServiceRoleArn:
+    Description: 'ARN of the IAM role for Amazon Fraud Detector service'
+    Value: !GetAtt FraudDetectorServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FraudDetectorServiceRoleArn'
+
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the IAM role for Lambda functions'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  FraudPredictionProcessorArn:
+    Description: 'ARN of the fraud prediction processor Lambda function'
+    Value: !GetAtt FraudPredictionProcessor.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FraudPredictionProcessorArn'
+
+  TrainingDataProcessorArn:
+    Description: 'ARN of the training data processor Lambda function'
+    Value: !GetAtt TrainingDataProcessor.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TrainingDataProcessorArn'
+
+  ApiGatewayUrl:
+    Description: 'URL of the API Gateway endpoint for fraud predictions'
+    Value: !Sub 'https://${FraudDetectionApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/predict'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiGatewayUrl'
+
+  DashboardUrl:
+    Description: 'URL of the CloudWatch dashboard for monitoring'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${FraudDetectionDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardUrl'
+
+  ConfigurationCommands:
+    Description: 'AWS CLI commands to configure Fraud Detector resources'
+    Value: !Sub |
+      # Set environment variables for fraud detector configuration
+      export FRAUD_BUCKET="${FraudDetectionDataBucket}"
+      export FRAUD_DETECTOR_ROLE_ARN="${FraudDetectorServiceRole.Arn}"
+      export EVENT_TYPE_NAME="${EventTypeName}_${Environment}"
+      export ENTITY_TYPE_NAME="${EntityTypeName}_${Environment}"
+      export MODEL_NAME="${ModelName}_${Environment}"
+      export DETECTOR_NAME="${DetectorName}_${Environment}"
+      
+      # Upload sample training data (replace with your actual data)
+      aws s3 cp training-data.csv s3://${FraudDetectionDataBucket}/training-data.csv
+      
+      # Create entity type
+      aws frauddetector create-entity-type --name $ENTITY_TYPE_NAME --description "Customer entity for fraud detection"
+      
+      # Create event type with variables
+      aws frauddetector create-event-type --name $EVENT_TYPE_NAME --description "Payment fraud detection event" --event-variables '[{"name": "customer_id", "dataType": "STRING", "dataSource": "EVENT", "defaultValue": "unknown"}]' --entity-types $ENTITY_TYPE_NAME --event-ingestion ENABLED
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+      - Label:
+          default: "Fraud Detector Configuration"
+        Parameters:
+          - DetectorName
+          - EventTypeName
+          - EntityTypeName
+          - ModelName
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - BucketName
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaMemorySize
+          - LambdaTimeout
+    ParameterLabels:
+      Environment:
+        default: "Environment Name"
+      BucketName:
+        default: "S3 Bucket Name"
+      EventTypeName:
+        default: "Event Type Name"
+      EntityTypeName:
+        default: "Entity Type Name"
+      ModelName:
+        default: "Model Name"
+      DetectorName:
+        default: "Detector Name"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"

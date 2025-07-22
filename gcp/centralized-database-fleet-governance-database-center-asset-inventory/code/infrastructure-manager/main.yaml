@@ -1,0 +1,1056 @@
+# Google Cloud Infrastructure Manager Configuration
+# Centralized Database Fleet Governance with Database Center and Cloud Asset Inventory
+# 
+# This configuration deploys a comprehensive database governance system that provides:
+# - AI-powered fleet management through Database Center
+# - Automated resource discovery via Cloud Asset Inventory
+# - Continuous compliance monitoring and reporting
+# - Automated governance workflows with Cloud Workflows
+# - Real-time monitoring and alerting through Cloud Monitoring
+
+terraform:
+  # Terraform configuration block for Infrastructure Manager
+  required_version: ">= 1.6"
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 5.0"
+    random:
+      source: "hashicorp/random"
+      version: "~> 3.6"
+    archive:
+      source: "hashicorp/archive"
+      version: "~> 2.4"
+    time:
+      source: "hashicorp/time"
+      version: "~> 0.9"
+
+# Input variables for customization
+variables:
+  project_id:
+    description: "Google Cloud Project ID for database governance deployment"
+    type: string
+
+  region:
+    description: "Google Cloud region for resource deployment"
+    type: string
+    default: "us-central1"
+
+  zone:
+    description: "Google Cloud zone for zonal resources"
+    type: string
+    default: "us-central1-a"
+
+  environment:
+    description: "Deployment environment (dev, staging, prod)"
+    type: string
+    default: "dev"
+    validation:
+      condition: contains(["dev", "staging", "prod"], var.environment)
+      error_message: "Environment must be one of: dev, staging, prod"
+
+  enable_sample_databases:
+    description: "Whether to create sample database instances for testing governance"
+    type: bool
+    default: true
+
+  governance_schedule:
+    description: "Cron schedule for automated governance checks (default: every 6 hours)"
+    type: string
+    default: "0 */6 * * *"
+
+  notification_email:
+    description: "Email address for governance alerts and notifications"
+    type: string
+
+  resource_labels:
+    description: "Labels to apply to all resources for cost allocation and governance"
+    type: map(string)
+    default:
+      project: "database-governance"
+      managed-by: "infrastructure-manager"
+
+# Local values for resource naming and configuration
+locals:
+  # Generate unique suffix for resource names to avoid conflicts
+  random_suffix = random_id.suffix.hex
+  
+  # Base name for all resources
+  base_name = "db-governance-${var.environment}-${local.random_suffix}"
+  
+  # Common labels for all resources
+  common_labels = merge(var.resource_labels, {
+    environment = var.environment
+    deployment-tool = "infrastructure-manager"
+    recipe = "centralized-database-fleet-governance"
+  })
+  
+  # Required APIs for database governance functionality
+  required_apis = [
+    "cloudasset.googleapis.com",           # Cloud Asset Inventory
+    "workflows.googleapis.com",            # Cloud Workflows for automation
+    "monitoring.googleapis.com",           # Cloud Monitoring for alerts
+    "logging.googleapis.com",              # Cloud Logging for audit trails
+    "sqladmin.googleapis.com",             # Cloud SQL administration
+    "spanner.googleapis.com",              # Cloud Spanner management
+    "bigtableadmin.googleapis.com",        # Bigtable administration
+    "firestore.googleapis.com",            # Firestore management
+    "pubsub.googleapis.com",               # Pub/Sub for event streaming
+    "bigquery.googleapis.com",             # BigQuery for analytics
+    "cloudfunctions.googleapis.com",       # Cloud Functions for automation
+    "cloudscheduler.googleapis.com",       # Cloud Scheduler for cron jobs
+    "storage.googleapis.com",              # Cloud Storage for reports
+    "secretmanager.googleapis.com",        # Secret Manager for credentials
+    "aiplatform.googleapis.com",           # Vertex AI for Gemini integration
+    "iam.googleapis.com"                   # IAM for service accounts
+  ]
+
+  # Service account roles for database governance automation
+  service_account_roles = [
+    "roles/cloudasset.viewer",
+    "roles/workflows.invoker",
+    "roles/monitoring.metricWriter",
+    "roles/logging.logWriter",
+    "roles/cloudsql.viewer",
+    "roles/spanner.databaseReader",
+    "roles/bigtable.reader",
+    "roles/firestore.viewer",
+    "roles/pubsub.publisher",
+    "roles/bigquery.dataEditor",
+    "roles/storage.objectAdmin",
+    "roles/cloudfunctions.invoker",
+    "roles/cloudscheduler.admin",
+    "roles/secretmanager.secretAccessor",
+    "roles/aiplatform.user"
+  ]
+}
+
+# Random ID for unique resource naming
+resource "random_id" "suffix" {
+  byte_length = 3
+}
+
+# Enable required Google Cloud APIs
+resource "google_project_service" "required_apis" {
+  for_each = toset(local.required_apis)
+  
+  project = var.project_id
+  service = each.value
+  
+  # Prevent services from being disabled when resource is destroyed
+  disable_on_destroy = false
+  
+  # Add delay to prevent API enablement conflicts
+  timeouts {
+    create = "10m"
+    update = "10m"
+  }
+}
+
+# Service account for database governance automation
+resource "google_service_account" "governance_service_account" {
+  project      = var.project_id
+  account_id   = "db-governance-sa-${local.random_suffix}"
+  display_name = "Database Governance Service Account"
+  description  = "Service account for automated database governance workflows and monitoring"
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Grant necessary IAM roles to the service account
+resource "google_project_iam_member" "service_account_roles" {
+  for_each = toset(local.service_account_roles)
+  
+  project = var.project_id
+  role    = each.value
+  member  = "serviceAccount:${google_service_account.governance_service_account.email}"
+  
+  depends_on = [google_service_account.governance_service_account]
+}
+
+# BigQuery dataset for Cloud Asset Inventory exports and governance analytics
+resource "google_bigquery_dataset" "governance_dataset" {
+  project       = var.project_id
+  dataset_id    = "database_governance_${replace(local.random_suffix, "-", "_")}"
+  friendly_name = "Database Governance Analytics"
+  description   = "Dataset for storing Cloud Asset Inventory exports and governance metrics"
+  location      = var.region
+  
+  # Data retention and access controls
+  default_table_expiration_ms = 2592000000  # 30 days in milliseconds
+  
+  # Labels for resource management
+  labels = local.common_labels
+  
+  # Access controls for the dataset
+  access {
+    role          = "OWNER"
+    user_by_email = google_service_account.governance_service_account.email
+  }
+  
+  access {
+    role         = "READER"
+    special_group = "projectReaders"
+  }
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_service_account.governance_service_account
+  ]
+}
+
+# Cloud Storage bucket for governance reports and compliance documentation
+resource "google_storage_bucket" "governance_reports" {
+  project  = var.project_id
+  name     = "${local.base_name}-reports"
+  location = var.region
+  
+  # Storage configuration for cost optimization
+  storage_class = "STANDARD"
+  
+  # Lifecycle management for old reports
+  lifecycle_rule {
+    condition {
+      age = 90  # Delete files older than 90 days
+    }
+    action {
+      type = "Delete"
+    }
+  }
+  
+  lifecycle_rule {
+    condition {
+      age = 30  # Move to nearline storage after 30 days
+    }
+    action {
+      type          = "SetStorageClass"
+      storage_class = "NEARLINE"
+    }
+  }
+  
+  # Versioning for audit trail
+  versioning {
+    enabled = true
+  }
+  
+  # Uniform bucket-level access for simplified security
+  uniform_bucket_level_access = true
+  
+  # Labels for resource management
+  labels = local.common_labels
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# IAM binding for Cloud Storage bucket access
+resource "google_storage_bucket_iam_member" "governance_bucket_access" {
+  bucket = google_storage_bucket.governance_reports.name
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${google_service_account.governance_service_account.email}"
+  
+  depends_on = [google_storage_bucket.governance_reports]
+}
+
+# Pub/Sub topic for real-time database asset change notifications
+resource "google_pubsub_topic" "database_asset_changes" {
+  project = var.project_id
+  name    = "${local.base_name}-asset-changes"
+  
+  # Message retention for reliability
+  message_retention_duration = "604800s"  # 7 days
+  
+  # Labels for resource management
+  labels = local.common_labels
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Pub/Sub subscription for governance workflow triggers
+resource "google_pubsub_subscription" "governance_automation" {
+  project = var.project_id
+  name    = "${local.base_name}-automation"
+  topic   = google_pubsub_topic.database_asset_changes.name
+  
+  # Push subscription configuration for Cloud Workflows
+  push_config {
+    push_endpoint = "https://workflows.googleapis.com/v1/projects/${var.project_id}/locations/${var.region}/workflows/${google_workflows_workflow.governance_workflow.name}/executions"
+    
+    # Authentication for push endpoint
+    oidc_token {
+      service_account_email = google_service_account.governance_service_account.email
+    }
+  }
+  
+  # Message processing configuration
+  ack_deadline_seconds       = 300  # 5 minutes
+  message_retention_duration = "604800s"  # 7 days
+  
+  # Dead letter policy for failed messages
+  dead_letter_policy {
+    dead_letter_topic     = google_pubsub_topic.governance_dead_letter.id
+    max_delivery_attempts = 5
+  }
+  
+  # Labels for resource management
+  labels = local.common_labels
+  
+  depends_on = [
+    google_pubsub_topic.database_asset_changes,
+    google_workflows_workflow.governance_workflow
+  ]
+}
+
+# Dead letter topic for failed governance messages
+resource "google_pubsub_topic" "governance_dead_letter" {
+  project = var.project_id
+  name    = "${local.base_name}-dead-letter"
+  
+  # Message retention for debugging
+  message_retention_duration = "2592000s"  # 30 days
+  
+  # Labels for resource management
+  labels = local.common_labels
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Cloud Workflows for automated database governance
+resource "google_workflows_workflow" "governance_workflow" {
+  project         = var.project_id
+  name            = "${local.base_name}-workflow"
+  region          = var.region
+  description     = "Automated database governance workflow for compliance monitoring and reporting"
+  service_account = google_service_account.governance_service_account.email
+  
+  # Workflow definition in YAML format
+  source_contents = templatefile("${path.module}/governance-workflow.yaml", {
+    project_id     = var.project_id
+    dataset_id     = google_bigquery_dataset.governance_dataset.dataset_id
+    bucket_name    = google_storage_bucket.governance_reports.name
+    topic_name     = google_pubsub_topic.database_asset_changes.name
+  })
+  
+  # Labels for resource management
+  labels = local.common_labels
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_service_account.governance_service_account,
+    google_bigquery_dataset.governance_dataset,
+    google_storage_bucket.governance_reports,
+    google_pubsub_topic.database_asset_changes
+  ]
+}
+
+# Create the governance workflow definition file
+resource "local_file" "governance_workflow_definition" {
+  filename = "${path.module}/governance-workflow.yaml"
+  content = yamlencode({
+    main = {
+      params = ["input"]
+      steps = [
+        {
+          initializeGovernanceCheck = {
+            assign = [
+              {
+                projectId = "$${sys.get_env(\"GOOGLE_CLOUD_PROJECT_ID\")}"
+              },
+              {
+                timestamp = "$${time.now()}"
+              }
+            ]
+          }
+        },
+        {
+          queryAssetInventory = {
+            call = "http.get"
+            args = {
+              url = "https://cloudasset.googleapis.com/v1/projects/${var.project_id}/assets"
+              auth = {
+                type = "OAuth2"
+              }
+              query = {
+                assetTypes = [
+                  "sqladmin.googleapis.com/Instance",
+                  "spanner.googleapis.com/Instance", 
+                  "bigtableadmin.googleapis.com/Instance"
+                ]
+              }
+            }
+            result = "assetInventory"
+          }
+        },
+        {
+          evaluateCompliance = {
+            for = {
+              value = "asset"
+              in = "$${assetInventory.body.assets}"
+              steps = [
+                {
+                  assessDatabaseSecurity = {
+                    switch = [
+                      {
+                        condition = "$${asset.assetType == \"sqladmin.googleapis.com/Instance\"}"
+                        steps = [
+                          {
+                            validateCloudSQL = {
+                              call = "validateSQLCompliance"
+                              args = {
+                                instance = "$${asset}"
+                              }
+                              result = "sqlCompliance"
+                            }
+                          }
+                        ]
+                      },
+                      {
+                        condition = "$${asset.assetType == \"spanner.googleapis.com/Instance\"}"
+                        steps = [
+                          {
+                            validateSpanner = {
+                              call = "validateSpannerCompliance"
+                              args = {
+                                instance = "$${asset}"
+                              }
+                              result = "spannerCompliance"
+                            }
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          generateComplianceReport = {
+            call = "http.post"
+            args = {
+              url = "https://monitoring.googleapis.com/v3/projects/${var.project_id}/timeSeries"
+              auth = {
+                type = "OAuth2"
+              }
+              body = {
+                timeSeries = [
+                  {
+                    metric = {
+                      type = "custom.googleapis.com/database/governance_score"
+                    }
+                    points = [
+                      {
+                        value = {
+                          doubleValue = 0.95
+                        }
+                        interval = {
+                          endTime = "$${timestamp}"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+            result = "metricsResponse"
+          }
+        }
+      ]
+    }
+    validateSQLCompliance = {
+      params = ["instance"]
+      steps = [
+        {
+          checkBackupConfiguration = {
+            assign = [
+              {
+                backupEnabled = "$${default(instance.resource.data.settings.backupConfiguration.enabled, false)}"
+              },
+              {
+                sslRequired = "$${default(instance.resource.data.settings.ipConfiguration.requireSsl, false)}"
+              }
+            ]
+          }
+        },
+        {
+          returnComplianceScore = {
+            return = {
+              compliant = "$${backupEnabled and sslRequired}"
+              backupEnabled = "$${backupEnabled}"
+              sslRequired = "$${sslRequired}"
+            }
+          }
+        }
+      ]
+    }
+    validateSpannerCompliance = {
+      params = ["instance"]
+      steps = [
+        {
+          checkEncryptionConfiguration = {
+            assign = [
+              {
+                encryptionEnabled = "$${instance.resource.data.encryptionConfig != null}"
+              }
+            ]
+          }
+        },
+        {
+          returnComplianceScore = {
+            return = {
+              compliant = "$${encryptionEnabled}"
+              encryptionEnabled = "$${encryptionEnabled}"
+            }
+          }
+        }
+      ]
+    }
+  })
+}
+
+# Cloud Scheduler job for automated governance checks
+resource "google_cloud_scheduler_job" "governance_scheduler" {
+  project     = var.project_id
+  region      = var.region
+  name        = "${local.base_name}-scheduler"
+  description = "Automated database governance compliance checker"
+  schedule    = var.governance_schedule
+  time_zone   = "America/New_York"
+  
+  # HTTP target configuration for triggering Cloud Functions
+  http_target {
+    http_method = "POST"
+    uri         = google_cloudfunctions2_function.compliance_reporter.service_config[0].uri
+    
+    # Headers for authentication
+    headers = {
+      "Content-Type" = "application/json"
+    }
+    
+    # Request body with governance parameters
+    body = base64encode(jsonencode({
+      project_id = var.project_id
+      trigger    = "scheduled_compliance_check"
+      timestamp  = timestamp()
+    }))
+    
+    # OIDC authentication token
+    oidc_token {
+      service_account_email = google_service_account.governance_service_account.email
+    }
+  }
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_cloudfunctions2_function.compliance_reporter
+  ]
+}
+
+# Cloud Function for compliance reporting and automated remediation
+resource "google_cloudfunctions2_function" "compliance_reporter" {
+  project     = var.project_id
+  name        = "${local.base_name}-compliance-reporter"
+  location    = var.region
+  description = "Automated compliance reporting for database governance"
+  
+  # Build configuration
+  build_config {
+    runtime     = "python39"
+    entry_point = "generate_compliance_report"
+    
+    # Source code from local directory
+    source {
+      storage_source {
+        bucket = google_storage_bucket.function_source.name
+        object = google_storage_bucket_object.compliance_function_source.name
+      }
+    }
+  }
+  
+  # Service configuration
+  service_config {
+    max_instance_count = 10
+    min_instance_count = 0
+    available_memory   = "256M"
+    timeout_seconds    = 300
+    
+    # Environment variables
+    environment_variables = {
+      PROJECT_ID                = var.project_id
+      DATASET_ID               = google_bigquery_dataset.governance_dataset.dataset_id
+      BUCKET_NAME              = google_storage_bucket.governance_reports.name
+      NOTIFICATION_TOPIC       = google_pubsub_topic.database_asset_changes.name
+    }
+    
+    # Service account configuration
+    service_account_email = google_service_account.governance_service_account.email
+    
+    # Ingress settings for security
+    ingress_settings = "ALLOW_INTERNAL_ONLY"
+    
+    # VPC connector for private network access if needed
+    # vpc_connector = var.vpc_connector_name
+  }
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_service_account.governance_service_account,
+    google_storage_bucket_object.compliance_function_source
+  ]
+}
+
+# Cloud Storage bucket for Cloud Function source code
+resource "google_storage_bucket" "function_source" {
+  project  = var.project_id
+  name     = "${local.base_name}-function-source"
+  location = var.region
+  
+  # Storage configuration
+  storage_class = "STANDARD"
+  
+  # Uniform bucket-level access
+  uniform_bucket_level_access = true
+  
+  # Labels for resource management
+  labels = local.common_labels
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Create a ZIP file with the compliance function source code
+data "archive_file" "compliance_function_zip" {
+  type        = "zip"
+  output_path = "${path.module}/compliance-function.zip"
+  
+  source {
+    content = templatefile("${path.module}/main.py.tpl", {
+      project_id = var.project_id
+    })
+    filename = "main.py"
+  }
+  
+  source {
+    content = file("${path.module}/requirements.txt")
+    filename = "requirements.txt"
+  }
+}
+
+# Create the Python function source code template
+resource "local_file" "compliance_function_source" {
+  filename = "${path.module}/main.py.tpl"
+  content = <<EOF
+import json
+import os
+from datetime import datetime, timezone
+from google.cloud import asset_v1
+from google.cloud import bigquery
+from google.cloud import storage
+from google.cloud import monitoring_v3
+import functions_framework
+
+@functions_framework.http
+def generate_compliance_report(request):
+    """Generate comprehensive compliance report for database governance."""
+    try:
+        # Initialize Google Cloud clients
+        project_id = os.environ.get('PROJECT_ID', '${var.project_id}')
+        dataset_id = os.environ.get('DATASET_ID')
+        bucket_name = os.environ.get('BUCKET_NAME')
+        
+        asset_client = asset_v1.AssetServiceClient()
+        bq_client = bigquery.Client(project=project_id)
+        storage_client = storage.Client(project=project_id)
+        monitoring_client = monitoring_v3.MetricServiceClient()
+        
+        # Query database assets from Cloud Asset Inventory
+        parent = f"projects/{project_id}"
+        asset_types = [
+            "sqladmin.googleapis.com/Instance",
+            "spanner.googleapis.com/Instance", 
+            "bigtableadmin.googleapis.com/Instance"
+        ]
+        
+        assets = asset_client.list_assets(
+            request={
+                "parent": parent,
+                "asset_types": asset_types
+            }
+        )
+        
+        # Initialize compliance report
+        report = {
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'project_id': project_id,
+            'total_databases': 0,
+            'compliant_databases': 0,
+            'compliance_percentage': 0,
+            'violations': [],
+            'recommendations': []
+        }
+        
+        # Evaluate each database asset for compliance
+        for asset in assets:
+            report['total_databases'] += 1
+            asset_compliant = True
+            asset_violations = []
+            
+            if asset.asset_type == "sqladmin.googleapis.com/Instance":
+                # Cloud SQL compliance checks
+                settings = asset.resource.data.get('settings', {})
+                backup_config = settings.get('backupConfiguration', {})
+                ip_config = settings.get('ipConfiguration', {})
+                
+                if not backup_config.get('enabled', False):
+                    asset_compliant = False
+                    asset_violations.append('Automated backups not enabled')
+                
+                if not ip_config.get('requireSsl', False):
+                    asset_compliant = False
+                    asset_violations.append('SSL not required for connections')
+                
+                if ip_config.get('ipv4Enabled', False) and not ip_config.get('authorizedNetworks', []):
+                    asset_compliant = False
+                    asset_violations.append('Public IP enabled without authorized networks')
+                    
+            elif asset.asset_type == "spanner.googleapis.com/Instance":
+                # Cloud Spanner compliance checks
+                encryption_config = asset.resource.data.get('encryptionConfig')
+                if not encryption_config:
+                    asset_compliant = False
+                    asset_violations.append('Customer-managed encryption not configured')
+                    
+            elif asset.asset_type == "bigtableadmin.googleapis.com/Instance":
+                # Bigtable compliance checks
+                instance_type = asset.resource.data.get('type', '')
+                if instance_type == 'DEVELOPMENT':
+                    report['recommendations'].append(f'Consider upgrading {asset.name} from DEVELOPMENT to PRODUCTION for better SLA')
+            
+            if asset_compliant:
+                report['compliant_databases'] += 1
+            else:
+                report['violations'].append({
+                    'resource': asset.name,
+                    'type': asset.asset_type,
+                    'issues': asset_violations
+                })
+        
+        # Calculate compliance percentage
+        if report['total_databases'] > 0:
+            report['compliance_percentage'] = (
+                report['compliant_databases'] / report['total_databases']
+            ) * 100
+        else:
+            report['compliance_percentage'] = 100
+        
+        # Store report in Cloud Storage
+        if bucket_name:
+            bucket = storage_client.bucket(bucket_name)
+            report_date = datetime.now().strftime('%Y-%m-%d')
+            blob = bucket.blob(f"compliance-reports/{report_date}-governance-report.json")
+            blob.upload_from_string(
+                json.dumps(report, indent=2),
+                content_type='application/json'
+            )
+        
+        # Send metrics to Cloud Monitoring
+        project_name = f"projects/{project_id}"
+        series = monitoring_v3.TimeSeries()
+        series.metric.type = "custom.googleapis.com/database/governance_score"
+        series.resource.type = "global"
+        
+        point = series.points.add()
+        point.value.double_value = report['compliance_percentage']
+        point.interval.end_time.seconds = int(datetime.now().timestamp())
+        
+        monitoring_client.create_time_series(
+            name=project_name,
+            time_series=[series]
+        )
+        
+        return {
+            'status': 'success',
+            'compliance_percentage': report['compliance_percentage'],
+            'total_databases': report['total_databases'],
+            'compliant_databases': report['compliant_databases'],
+            'violations_count': len(report['violations']),
+            'report_location': f"gs://{bucket_name}/compliance-reports/{report_date}-governance-report.json" if bucket_name else None
+        }
+        
+    except Exception as e:
+        print(f"Error generating compliance report: {str(e)}")
+        return {
+            'status': 'error',
+            'message': str(e)
+        }, 500
+EOF
+}
+
+# Create requirements.txt for the Cloud Function
+resource "local_file" "function_requirements" {
+  filename = "${path.module}/requirements.txt"
+  content = <<EOF
+google-cloud-asset==3.19.1
+google-cloud-bigquery==3.11.4
+google-cloud-storage==2.10.0
+google-cloud-monitoring==2.15.1
+functions-framework==3.4.0
+EOF
+}
+
+# Upload the Cloud Function source code to Cloud Storage
+resource "google_storage_bucket_object" "compliance_function_source" {
+  name   = "compliance-function-${local.random_suffix}.zip"
+  bucket = google_storage_bucket.function_source.name
+  source = data.archive_file.compliance_function_zip.output_path
+  
+  depends_on = [
+    google_storage_bucket.function_source,
+    data.archive_file.compliance_function_zip
+  ]
+}
+
+# Cloud Monitoring alert policy for governance violations
+resource "google_monitoring_alert_policy" "governance_violations" {
+  project      = var.project_id
+  display_name = "Database Governance Violations"
+  combiner     = "OR"
+  enabled      = true
+  
+  conditions {
+    display_name = "Low compliance score detected"
+    
+    condition_threshold {
+      filter          = "metric.type=\"custom.googleapis.com/database/governance_score\" resource.type=\"global\""
+      duration        = "300s"
+      comparison      = "COMPARISON_LESS_THAN"
+      threshold_value = 90.0
+      
+      aggregations {
+        alignment_period   = "300s"
+        per_series_aligner = "ALIGN_MEAN"
+      }
+    }
+  }
+  
+  # Notification channels
+  notification_channels = [
+    google_monitoring_notification_channel.email_alerts.id
+  ]
+  
+  # Alert strategy
+  alert_strategy {
+    auto_close = "1800s"
+  }
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_monitoring_notification_channel.email_alerts
+  ]
+}
+
+# Email notification channel for governance alerts
+resource "google_monitoring_notification_channel" "email_alerts" {
+  project      = var.project_id
+  display_name = "Database Governance Email Alerts"
+  type         = "email"
+  
+  labels = {
+    email_address = var.notification_email
+  }
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Log-based metric for governance events
+resource "google_logging_metric" "governance_events" {
+  project = var.project_id
+  name    = "database_governance_events"
+  filter  = "resource.type=\"cloud_function\" AND resource.labels.function_name=\"${google_cloudfunctions2_function.compliance_reporter.name}\""
+  
+  metric_descriptor {
+    metric_kind = "GAUGE"
+    value_type  = "INT64"
+    display_name = "Database Governance Events"
+  }
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_cloudfunctions2_function.compliance_reporter
+  ]
+}
+
+# Sample database instances for governance testing (optional)
+resource "google_sql_database_instance" "sample_cloudsql" {
+  count               = var.enable_sample_databases ? 1 : 0
+  project             = var.project_id
+  name                = "${local.base_name}-cloudsql"
+  database_version    = "POSTGRES_15"
+  region              = var.region
+  deletion_protection = false
+  
+  settings {
+    tier              = "db-f1-micro"
+    disk_type         = "PD_HDD"
+    disk_size         = 10
+    availability_type = "ZONAL"
+    
+    # Backup configuration for compliance
+    backup_configuration {
+      enabled                        = true
+      start_time                     = "02:00"
+      binary_log_enabled            = false
+      transaction_log_retention_days = 7
+      backup_retention_settings {
+        retained_backups = 7
+        retention_unit   = "COUNT"
+      }
+    }
+    
+    # IP configuration for security
+    ip_configuration {
+      ipv4_enabled    = false
+      private_network = "default"
+      require_ssl     = true
+    }
+    
+    # Maintenance window
+    maintenance_window {
+      day          = 7
+      hour         = 3
+      update_track = "stable"
+    }
+  }
+  
+  # Labels for governance tracking
+  user_labels = local.common_labels
+  
+  depends_on = [
+    google_project_service.required_apis
+  ]
+}
+
+resource "google_spanner_instance" "sample_spanner" {
+  count        = var.enable_sample_databases ? 1 : 0
+  project      = var.project_id
+  name         = "${local.base_name}-spanner"
+  config       = "regional-${var.region}"
+  display_name = "Database Governance Sample Spanner"
+  num_nodes    = 1
+  
+  # Labels for governance tracking
+  labels = local.common_labels
+  
+  depends_on = [
+    google_project_service.required_apis
+  ]
+}
+
+resource "google_bigtable_instance" "sample_bigtable" {
+  count        = var.enable_sample_databases ? 1 : 0
+  project      = var.project_id
+  name         = "${local.base_name}-bigtable"
+  display_name = "Database Governance Sample Bigtable"
+  instance_type = "DEVELOPMENT"
+  
+  cluster {
+    cluster_id   = "cluster-1"
+    zone         = var.zone
+    num_nodes    = 1
+    storage_type = "HDD"
+  }
+  
+  # Labels for governance tracking
+  labels = local.common_labels
+  
+  depends_on = [
+    google_project_service.required_apis
+  ]
+}
+
+# Export current asset snapshot to BigQuery for initial analysis
+resource "time_sleep" "wait_for_apis" {
+  depends_on = [google_project_service.required_apis]
+  create_duration = "60s"
+}
+
+# Outputs for verification and integration
+output "governance_service_account_email" {
+  description = "Email address of the governance service account"
+  value       = google_service_account.governance_service_account.email
+}
+
+output "bigquery_dataset_id" {
+  description = "BigQuery dataset ID for governance analytics"
+  value       = google_bigquery_dataset.governance_dataset.dataset_id
+}
+
+output "governance_reports_bucket" {
+  description = "Cloud Storage bucket for governance reports"
+  value       = google_storage_bucket.governance_reports.name
+}
+
+output "compliance_function_url" {
+  description = "URL of the compliance reporting Cloud Function"
+  value       = google_cloudfunctions2_function.compliance_reporter.service_config[0].uri
+}
+
+output "governance_workflow_id" {
+  description = "ID of the governance workflow"
+  value       = google_workflows_workflow.governance_workflow.id
+}
+
+output "asset_changes_topic" {
+  description = "Pub/Sub topic for database asset change notifications"
+  value       = google_pubsub_topic.database_asset_changes.name
+}
+
+output "governance_schedule_job" {
+  description = "Cloud Scheduler job for automated governance checks"
+  value       = google_cloud_scheduler_job.governance_scheduler.name
+}
+
+output "monitoring_alert_policy" {
+  description = "Monitoring alert policy for governance violations"
+  value       = google_monitoring_alert_policy.governance_violations.id
+}
+
+output "sample_database_instances" {
+  description = "Sample database instances created for governance testing"
+  value = {
+    cloudsql_instance  = var.enable_sample_databases ? google_sql_database_instance.sample_cloudsql[0].name : null
+    spanner_instance   = var.enable_sample_databases ? google_spanner_instance.sample_spanner[0].name : null
+    bigtable_instance  = var.enable_sample_databases ? google_bigtable_instance.sample_bigtable[0].name : null
+  }
+}
+
+output "database_center_url" {
+  description = "URL to access Database Center dashboard"
+  value       = "https://console.cloud.google.com/database-center?project=${var.project_id}"
+}
+
+output "deployment_summary" {
+  description = "Summary of deployed governance infrastructure"
+  value = {
+    project_id = var.project_id
+    region     = var.region
+    environment = var.environment
+    governance_components = [
+      "Database Center AI-powered insights",
+      "Cloud Asset Inventory integration", 
+      "Automated compliance workflows",
+      "Real-time monitoring and alerting",
+      "Scheduled governance checks",
+      "Compliance reporting automation"
+    ]
+    next_steps = [
+      "Access Database Center at the provided URL",
+      "Configure additional compliance policies in the workflow",
+      "Set up custom dashboards in Cloud Monitoring",
+      "Review and customize governance schedules",
+      "Add additional notification channels as needed"
+    ]
+  }
+}

@@ -1,0 +1,861 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Intelligent Document QA System with AWS Bedrock and Amazon Kendra - Production-ready infrastructure for building AI-powered document question-answering capabilities'
+
+# ==========================================
+# PARAMETERS
+# ==========================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'intelligent-qa-system'
+    Description: 'Name prefix for all resources'
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+    MinLength: 3
+    MaxLength: 32
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment for resource deployment'
+
+  KendraEdition:
+    Type: String
+    Default: 'DEVELOPER_EDITION'
+    AllowedValues: ['DEVELOPER_EDITION', 'ENTERPRISE_EDITION']
+    Description: 'Kendra index edition (DEVELOPER_EDITION for testing, ENTERPRISE_EDITION for production)'
+
+  BedrockModelId:
+    Type: String
+    Default: 'anthropic.claude-3-sonnet-20240229-v1:0'
+    Description: 'Bedrock foundation model ID for text generation'
+    AllowedValues:
+      - 'anthropic.claude-3-sonnet-20240229-v1:0'
+      - 'anthropic.claude-3-haiku-20240307-v1:0'
+      - 'anthropic.claude-v2'
+
+  DocumentBucketRetentionDays:
+    Type: Number
+    Default: 365
+    MinValue: 1
+    MaxValue: 3653
+    Description: 'Number of days to retain documents in S3 (1-3653 days)'
+
+  EnableVersioning:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable S3 bucket versioning for document management'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+    Description: 'Lambda function timeout in seconds (60-900)'
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 1024
+    AllowedValues: [512, 1024, 2048, 3008]
+    Description: 'Lambda function memory allocation in MB'
+
+# ==========================================
+# CONDITIONS
+# ==========================================
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  IsEnterpriseKendra: !Equals [!Ref KendraEdition, 'ENTERPRISE_EDITION']
+  EnableS3Versioning: !Equals [!Ref EnableVersioning, 'true']
+
+# ==========================================
+# RESOURCES
+# ==========================================
+Resources:
+  # ==========================================
+  # S3 BUCKET FOR DOCUMENTS
+  # ==========================================
+  DocumentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-documents-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [EnableS3Versioning, 'Enabled', 'Suspended']
+      LifecycleConfiguration:
+        Rules:
+          - Id: DocumentRetentionPolicy
+            Status: Enabled
+            ExpirationInDays: !Ref DocumentBucketRetentionDays
+            NoncurrentVersionExpirationInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: documents/
+            Function: !GetAtt DocumentProcessorFunction.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-documents-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Document storage for QA system'
+
+  # S3 Bucket Policy for Kendra Access
+  DocumentBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DocumentBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowKendraAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt KendraServiceRole.Arn
+            Action:
+              - 's3:GetObject'
+              - 's3:ListBucket'
+            Resource:
+              - !Sub '${DocumentBucket}/*'
+              - !GetAtt DocumentBucket.Arn
+
+  # ==========================================
+  # IAM ROLES AND POLICIES
+  # ==========================================
+  
+  # Kendra Service Role
+  KendraServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-kendra-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: kendra.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Policies:
+        - PolicyName: KendraS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                  - 's3:GetBucketLocation'
+                Resource:
+                  - !GetAtt DocumentBucket.Arn
+                  - !Sub '${DocumentBucket}/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-kendra-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: QASystemAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kendra:Query'
+                  - 'kendra:DescribeIndex'
+                  - 'kendra:GetQuerySuggestions'
+                Resource: !GetAtt KendraIndex.Arn
+              - Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModel'
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - 'kendra:StartDataSourceSyncJob'
+                  - 'kendra:StopDataSourceSyncJob'
+                  - 'kendra:DescribeDataSourceSyncJob'
+                Resource: !GetAtt S3DataSource.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # API Gateway Execution Role
+  ApiGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-apigateway-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaInvokeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: !GetAtt QAProcessorFunction.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-apigateway-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==========================================
+  # AMAZON KENDRA INDEX
+  # ==========================================
+  KendraIndex:
+    Type: AWS::Kendra::Index
+    Properties:
+      Name: !Sub '${ProjectName}-index-${Environment}'
+      Edition: !Ref KendraEdition
+      RoleArn: !GetAtt KendraServiceRole.Arn
+      Description: 'Intelligent search index for document QA system'
+      DocumentMetadataConfigurations:
+        - Name: '_source_uri'
+          Type: 'STRING_VALUE'
+          Search:
+            Displayable: true
+            Facetable: true
+            Searchable: true
+        - Name: '_created_at'
+          Type: 'DATE_VALUE'
+          Search:
+            Displayable: true
+            Facetable: true
+            Searchable: false
+      UserTokenConfigurations:
+        - JwtTokenTypeConfiguration:
+            KeyLocation: 'URL'
+            Url: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/auth'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-index-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Document search and retrieval'
+
+  # S3 Data Source for Kendra
+  S3DataSource:
+    Type: AWS::Kendra::DataSource
+    Properties:
+      IndexId: !Ref KendraIndex
+      Name: !Sub '${ProjectName}-s3-datasource-${Environment}'
+      Type: 'S3'
+      DataSourceConfiguration:
+        S3Configuration:
+          BucketName: !Ref DocumentBucket
+          InclusionPrefixes:
+            - 'documents/'
+          ExclusionPatterns:
+            - '*.tmp'
+            - '*.log'
+          DocumentsMetadataConfiguration:
+            S3Prefix: 'metadata/'
+      RoleArn: !GetAtt KendraServiceRole.Arn
+      Description: 'S3 data source for document indexing'
+      Schedule: 'cron(0 6 * * ? *)'  # Daily at 6 AM UTC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-s3-datasource-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==========================================
+  # LAMBDA FUNCTIONS
+  # ==========================================
+  
+  # Main QA Processor Function
+  QAProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-qa-processor-${Environment}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrencyLimit: !If [IsProduction, 100, 10]
+      Environment:
+        Variables:
+          KENDRA_INDEX_ID: !Ref KendraIndex
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          ENVIRONMENT: !Ref Environment
+          MAX_RESULTS: !If [IsProduction, '10', '5']
+          ENABLE_CACHING: !If [IsProduction, 'true', 'false']
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from datetime import datetime
+          from typing import Dict, List, Any
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          # Initialize AWS clients
+          kendra = boto3.client('kendra')
+          bedrock = boto3.client('bedrock-runtime')
+          
+          def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
+              """
+              Main handler for QA processing requests
+              Combines Kendra search with Bedrock text generation
+              """
+              try:
+                  # Extract question from event
+                  body = json.loads(event.get('body', '{}')) if isinstance(event.get('body'), str) else event
+                  question = body.get('question', '').strip()
+                  
+                  if not question:
+                      return create_response(400, {'error': 'Question is required'})
+                  
+                  logger.info(f"Processing question: {question}")
+                  
+                  # Query Kendra for relevant documents
+                  kendra_response = query_kendra(question)
+                  
+                  if not kendra_response['passages']:
+                      return create_response(200, {
+                          'question': question,
+                          'answer': 'I could not find relevant information in the documents to answer your question.',
+                          'sources': [],
+                          'confidence': 'low'
+                      })
+                  
+                  # Generate answer using Bedrock
+                  answer_response = generate_answer(question, kendra_response['passages'])
+                  
+                  return create_response(200, {
+                      'question': question,
+                      'answer': answer_response['answer'],
+                      'sources': kendra_response['sources'],
+                      'confidence': kendra_response['confidence'],
+                      'timestamp': datetime.utcnow().isoformat()
+                  })
+                  
+              except Exception as e:
+                  logger.error(f"Error processing request: {str(e)}")
+                  return create_response(500, {'error': 'Internal server error'})
+          
+          def query_kendra(question: str) -> Dict[str, Any]:
+              """Query Kendra index for relevant document passages"""
+              try:
+                  index_id = os.environ['KENDRA_INDEX_ID']
+                  max_results = int(os.environ.get('MAX_RESULTS', '5'))
+                  
+                  response = kendra.query(
+                      IndexId=index_id,
+                      QueryText=question,
+                      PageSize=max_results,
+                      QueryResultTypeFilter='DOCUMENT'
+                  )
+                  
+                  passages = []
+                  sources = []
+                  total_score = 0
+                  
+                  for item in response.get('ResultItems', []):
+                      if item.get('Type') == 'DOCUMENT':
+                          excerpt = item.get('DocumentExcerpt', {})
+                          title = item.get('DocumentTitle', {})
+                          
+                          passage_text = excerpt.get('Text', '')
+                          if passage_text:
+                              passages.append({
+                                  'text': passage_text,
+                                  'title': title.get('Text', 'Unknown Document'),
+                                  'uri': item.get('DocumentURI', ''),
+                                  'score': item.get('ScoreAttributes', {}).get('ScoreConfidence', 'MEDIUM')
+                              })
+                              
+                              sources.append({
+                                  'title': title.get('Text', 'Unknown Document'),
+                                  'uri': item.get('DocumentURI', ''),
+                                  'excerpt': passage_text[:200] + '...' if len(passage_text) > 200 else passage_text
+                              })
+                              
+                              # Calculate confidence based on Kendra scores
+                              score_map = {'VERY_HIGH': 4, 'HIGH': 3, 'MEDIUM': 2, 'LOW': 1}
+                              total_score += score_map.get(item.get('ScoreAttributes', {}).get('ScoreConfidence', 'LOW'), 1)
+                  
+                  # Determine overall confidence
+                  avg_score = total_score / len(passages) if passages else 0
+                  if avg_score >= 3.5:
+                      confidence = 'high'
+                  elif avg_score >= 2.5:
+                      confidence = 'medium'
+                  else:
+                      confidence = 'low'
+                  
+                  return {
+                      'passages': passages,
+                      'sources': sources,
+                      'confidence': confidence
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error querying Kendra: {str(e)}")
+                  return {'passages': [], 'sources': [], 'confidence': 'low'}
+          
+          def generate_answer(question: str, passages: List[Dict[str, Any]]) -> Dict[str, Any]:
+              """Generate answer using Bedrock foundation model"""
+              try:
+                  model_id = os.environ['BEDROCK_MODEL_ID']
+                  
+                  # Prepare context from passages
+                  context_parts = []
+                  for i, passage in enumerate(passages, 1):
+                      context_parts.append(f"Document {i}: {passage['title']}\n{passage['text']}")
+                  
+                  context_text = '\n\n'.join(context_parts)
+                  
+                  # Create prompt for Claude
+                  prompt = f"""Based on the following document excerpts, please provide a comprehensive and accurate answer to the question. If the documents don't contain sufficient information to answer the question completely, please indicate what information is missing.
+
+Question: {question}
+
+Document Excerpts:
+{context_text}
+
+Instructions:
+1. Provide a clear, factual answer based solely on the information in the documents
+2. If the documents don't contain enough information, state this clearly
+3. Include relevant details and context from the documents
+4. Maintain a professional and helpful tone
+5. Do not make assumptions beyond what's stated in the documents
+
+Answer:"""
+                  
+                  # Invoke Bedrock model
+                  response = bedrock.invoke_model(
+                      modelId=model_id,
+                      body=json.dumps({
+                          'anthropic_version': 'bedrock-2023-05-31',
+                          'max_tokens': 1000,
+                          'temperature': 0.1,
+                          'messages': [{'role': 'user', 'content': prompt}]
+                      })
+                  )
+                  
+                  response_body = json.loads(response['body'].read())
+                  answer = response_body['content'][0]['text']
+                  
+                  return {'answer': answer}
+                  
+              except Exception as e:
+                  logger.error(f"Error generating answer with Bedrock: {str(e)}")
+                  return {'answer': 'I apologize, but I encountered an error while generating an answer to your question.'}
+          
+          def create_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
+              """Create standardized API response"""
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'POST, OPTIONS',
+                      'Access-Control-Allow-Headers': 'Content-Type'
+                  },
+                  'body': json.dumps(body)
+              }
+      DeadLetterConfig:
+        TargetArn: !GetAtt QAProcessorDLQ.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-qa-processor-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Main QA processing logic'
+
+  # Document Processor Function (for S3 events)
+  DocumentProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-doc-processor-${Environment}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          KENDRA_INDEX_ID: !Ref KendraIndex
+          KENDRA_DATA_SOURCE_ID: !Ref S3DataSource
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          from urllib.parse import unquote_plus
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          kendra = boto3.client('kendra')
+          
+          def lambda_handler(event, context):
+              """Process S3 events and trigger Kendra sync when needed"""
+              try:
+                  for record in event.get('Records', []):
+                      if record.get('eventSource') == 'aws:s3':
+                          bucket = record['s3']['bucket']['name']
+                          key = unquote_plus(record['s3']['object']['key'])
+                          
+                          logger.info(f"Processing S3 event for {bucket}/{key}")
+                          
+                          # Only trigger sync for documents in the documents/ prefix
+                          if key.startswith('documents/'):
+                              trigger_kendra_sync()
+                  
+                  return {'statusCode': 200, 'body': 'Processed successfully'}
+                  
+              except Exception as e:
+                  logger.error(f"Error processing S3 event: {str(e)}")
+                  return {'statusCode': 500, 'body': 'Error processing event'}
+          
+          def trigger_kendra_sync():
+              """Trigger Kendra data source synchronization"""
+              try:
+                  index_id = os.environ['KENDRA_INDEX_ID']
+                  data_source_id = os.environ['KENDRA_DATA_SOURCE_ID']
+                  
+                  response = kendra.start_data_source_sync_job(
+                      Id=data_source_id,
+                      IndexId=index_id
+                  )
+                  
+                  logger.info(f"Started Kendra sync job: {response['ExecutionId']}")
+                  
+              except Exception as e:
+                  logger.error(f"Error triggering Kendra sync: {str(e)}")
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-doc-processor-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==========================================
+  # SQS DEAD LETTER QUEUE
+  # ==========================================
+  QAProcessorDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-qa-processor-dlq-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-qa-processor-dlq-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==========================================
+  # LAMBDA PERMISSIONS
+  # ==========================================
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DocumentProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt DocumentBucket.Arn
+
+  ApiGatewayInvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref QAProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub '${ApiGateway}/*/*'
+
+  # ==========================================
+  # API GATEWAY
+  # ==========================================
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-api-${Environment}'
+      Description: 'API Gateway for intelligent document QA system'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 'execute-api:Invoke'
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-api-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # API Gateway Resource
+  QAResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: 'qa'
+
+  # API Gateway Method
+  QAMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref QAResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QAProcessorFunction.Arn}/invocations'
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseHeaders:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Methods: "'POST, OPTIONS'"
+              Access-Control-Allow-Headers: "'Content-Type'"
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+            Access-Control-Allow-Methods: true
+            Access-Control-Allow-Headers: true
+
+  # CORS Options Method
+  QAOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref QAResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseHeaders:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Methods: "'POST, OPTIONS'"
+              Access-Control-Allow-Headers: "'Content-Type'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+            Access-Control-Allow-Methods: true
+            Access-Control-Allow-Headers: true
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - QAMethod
+      - QAOptionsMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: !Ref Environment
+
+  # ==========================================
+  # CLOUDWATCH LOG GROUPS
+  # ==========================================
+  QAProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-qa-processor-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-qa-processor-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  DocumentProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-doc-processor-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-doc-processor-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}-api-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-api-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+# ==========================================
+# OUTPUTS
+# ==========================================
+Outputs:
+  # API Gateway Outputs
+  ApiGatewayUrl:
+    Description: 'API Gateway endpoint URL for QA requests'
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/qa'
+    Export:
+      Name: !Sub '${ProjectName}-api-url-${Environment}'
+
+  ApiGatewayId:
+    Description: 'API Gateway ID'
+    Value: !Ref ApiGateway
+    Export:
+      Name: !Sub '${ProjectName}-api-id-${Environment}'
+
+  # S3 Bucket Outputs
+  DocumentBucketName:
+    Description: 'S3 bucket name for document storage'
+    Value: !Ref DocumentBucket
+    Export:
+      Name: !Sub '${ProjectName}-bucket-name-${Environment}'
+
+  DocumentBucketArn:
+    Description: 'S3 bucket ARN for document storage'
+    Value: !GetAtt DocumentBucket.Arn
+    Export:
+      Name: !Sub '${ProjectName}-bucket-arn-${Environment}'
+
+  # Kendra Outputs
+  KendraIndexId:
+    Description: 'Kendra index ID for document search'
+    Value: !Ref KendraIndex
+    Export:
+      Name: !Sub '${ProjectName}-kendra-index-id-${Environment}'
+
+  KendraIndexArn:
+    Description: 'Kendra index ARN'
+    Value: !GetAtt KendraIndex.Arn
+    Export:
+      Name: !Sub '${ProjectName}-kendra-index-arn-${Environment}'
+
+  KendraDataSourceId:
+    Description: 'Kendra S3 data source ID'
+    Value: !Ref S3DataSource
+    Export:
+      Name: !Sub '${ProjectName}-kendra-datasource-id-${Environment}'
+
+  # Lambda Function Outputs
+  QAProcessorFunctionName:
+    Description: 'QA processor Lambda function name'
+    Value: !Ref QAProcessorFunction
+    Export:
+      Name: !Sub '${ProjectName}-qa-function-name-${Environment}'
+
+  QAProcessorFunctionArn:
+    Description: 'QA processor Lambda function ARN'
+    Value: !GetAtt QAProcessorFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-qa-function-arn-${Environment}'
+
+  DocumentProcessorFunctionName:
+    Description: 'Document processor Lambda function name'
+    Value: !Ref DocumentProcessorFunction
+    Export:
+      Name: !Sub '${ProjectName}-doc-function-name-${Environment}'
+
+  # IAM Role Outputs
+  KendraServiceRoleArn:
+    Description: 'Kendra service role ARN'
+    Value: !GetAtt KendraServiceRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-kendra-role-arn-${Environment}'
+
+  LambdaExecutionRoleArn:
+    Description: 'Lambda execution role ARN'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-lambda-role-arn-${Environment}'
+
+  # System Information
+  BedrockModelId:
+    Description: 'Bedrock foundation model ID being used'
+    Value: !Ref BedrockModelId
+    Export:
+      Name: !Sub '${ProjectName}-bedrock-model-${Environment}'
+
+  SystemEnvironment:
+    Description: 'Deployment environment'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${ProjectName}-environment'
+
+  # Usage Instructions
+  UsageInstructions:
+    Description: 'Instructions for using the QA system'
+    Value: !Sub |
+      1. Upload documents to s3://${DocumentBucket}/documents/
+      2. Wait for Kendra indexing to complete (check AWS Console)
+      3. Send POST requests to ${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/qa
+      4. Request body: {"question": "Your question here"}
+      5. Monitor CloudWatch logs for troubleshooting
+
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost (USD) - varies by usage'
+    Value: !If 
+      - IsEnterpriseKendra
+      - '$1000+ (Enterprise Kendra + usage)'
+      - '$120+ (Developer Kendra + usage)'

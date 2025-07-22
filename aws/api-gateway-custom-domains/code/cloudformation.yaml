@@ -1,0 +1,970 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Complete API Gateway Custom Domain Names implementation with SSL certificates,
+  Lambda backend functions, custom authorizers, and Route 53 DNS configuration.
+  
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Domain Configuration"
+        Parameters:
+          - DomainName
+          - APISubdomain
+          - HostedZoneId
+          - CertificateValidationMethod
+      - Label:
+          default: "API Configuration"
+        Parameters:
+          - APIName
+          - APIDescription
+          - ThrottleRateLimit
+          - ThrottleBurstLimit
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaRuntime
+          - LambdaTimeout
+          - LambdaMemorySize
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - AuthTokenSecret
+          - EnableAPILogging
+          - LogRetentionDays
+    ParameterLabels:
+      DomainName:
+        default: "Root Domain Name"
+      APISubdomain:
+        default: "API Subdomain"
+      HostedZoneId:
+        default: "Route 53 Hosted Zone ID"
+
+Parameters:
+  # Domain Configuration
+  DomainName:
+    Type: String
+    Description: "Your root domain name (e.g., example.com)"
+    Default: "example.com"
+    AllowedPattern: "^[a-z0-9]([a-z0-9\\-]{0,61}[a-z0-9])?\\.[a-z0-9]([a-z0-9\\-]{0,61}[a-z0-9])?$"
+    ConstraintDescription: "Must be a valid domain name"
+
+  APISubdomain:
+    Type: String
+    Description: "Subdomain for your API (e.g., api for api.example.com)"
+    Default: "api"
+    AllowedPattern: "^[a-z0-9]([a-z0-9\\-]{0,61}[a-z0-9])?$"
+    ConstraintDescription: "Must be a valid subdomain"
+
+  HostedZoneId:
+    Type: String
+    Description: "Route 53 Hosted Zone ID for your domain (leave empty to skip DNS setup)"
+    Default: ""
+
+  CertificateValidationMethod:
+    Type: String
+    Description: "Certificate validation method"
+    Default: "DNS"
+    AllowedValues:
+      - "DNS"
+      - "EMAIL"
+
+  # API Configuration
+  APIName:
+    Type: String
+    Description: "Name for the API Gateway"
+    Default: "petstore-api"
+    MinLength: 1
+    MaxLength: 128
+
+  APIDescription:
+    Type: String
+    Description: "Description for the API Gateway"
+    Default: "Pet Store API with custom domain"
+
+  ThrottleRateLimit:
+    Type: Number
+    Description: "API throttle rate limit (requests per second)"
+    Default: 100
+    MinValue: 1
+    MaxValue: 10000
+
+  ThrottleBurstLimit:
+    Type: Number
+    Description: "API throttle burst limit"
+    Default: 200
+    MinValue: 1
+    MaxValue: 10000
+
+  # Lambda Configuration
+  LambdaRuntime:
+    Type: String
+    Description: "Lambda runtime version"
+    Default: "python3.9"
+    AllowedValues:
+      - "python3.8"
+      - "python3.9"
+      - "python3.10"
+      - "python3.11"
+
+  LambdaTimeout:
+    Type: Number
+    Description: "Lambda function timeout (seconds)"
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+
+  LambdaMemorySize:
+    Type: Number
+    Description: "Lambda function memory size (MB)"
+    Default: 128
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+
+  # Security Configuration
+  AuthTokenSecret:
+    Type: String
+    Description: "Secret token for API authentication (will be hashed)"
+    Default: "valid-token"
+    NoEcho: true
+    MinLength: 8
+
+  EnableAPILogging:
+    Type: String
+    Description: "Enable API Gateway access logging"
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+  LogRetentionDays:
+    Type: Number
+    Description: "CloudWatch log retention period (days)"
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+Conditions:
+  CreateDNSRecord: !Not [!Equals [!Ref HostedZoneId, ""]]
+  EnableLogging: !Equals [!Ref EnableAPILogging, "true"]
+  ValidateByCertificate: !Equals [!Ref CertificateValidationMethod, "DNS"]
+
+Resources:
+  # ========================================
+  # SSL Certificate Management
+  # ========================================
+  
+  SSLCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Sub "${APISubdomain}.${DomainName}"
+      SubjectAlternativeNames:
+        - !Sub "*.${APISubdomain}.${DomainName}"
+      ValidationMethod: !Ref CertificateValidationMethod
+      DomainValidationOptions:
+        - DomainName: !Sub "${APISubdomain}.${DomainName}"
+          HostedZoneId: !If
+            - CreateDNSRecord
+            - !Ref HostedZoneId
+            - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub "${APIName}-ssl-certificate"
+        - Key: Purpose
+          Value: "API Gateway Custom Domain"
+
+  # ========================================
+  # IAM Roles and Policies
+  # ========================================
+  
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${APIName}-lambda-execution-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt PetStoreTable.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub "${APIName}-lambda-role"
+
+  APIGatewayLoggingRole:
+    Type: AWS::IAM::Role
+    Condition: EnableLogging
+    Properties:
+      RoleName: !Sub "${APIName}-apigateway-logging-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  # ========================================
+  # DynamoDB Table for Sample Data
+  # ========================================
+  
+  PetStoreTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${APIName}-pets"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: N
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      Tags:
+        - Key: Name
+          Value: !Sub "${APIName}-pets-table"
+        - Key: Purpose
+          Value: "Pet Store API Data"
+
+  # ========================================
+  # Lambda Functions
+  # ========================================
+  
+  PetStoreFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${APIName}-handler"
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref PetStoreTable
+          API_NAME: !Ref APIName
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import os
+          import boto3
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize DynamoDB resource
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['TABLE_NAME'])
+
+          def lambda_handler(event, context):
+              logger.info(f"Event: {json.dumps(event)}")
+              
+              # Extract HTTP method and path
+              http_method = event.get('httpMethod', 'GET')
+              path = event.get('path', '/')
+              
+              # CORS headers
+              cors_headers = {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                  'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+              }
+              
+              try:
+                  if path == '/pets' and http_method == 'GET':
+                      return handle_get_pets(cors_headers)
+                  elif path == '/pets' and http_method == 'POST':
+                      return handle_post_pet(event, cors_headers)
+                  elif path.startswith('/pets/') and http_method == 'GET':
+                      pet_id = path.split('/')[-1]
+                      return handle_get_pet(pet_id, cors_headers)
+                  elif http_method == 'OPTIONS':
+                      return {
+                          'statusCode': 200,
+                          'headers': cors_headers,
+                          'body': ''
+                      }
+                  else:
+                      return {
+                          'statusCode': 404,
+                          'headers': cors_headers,
+                          'body': json.dumps({
+                              'error': 'Not Found',
+                              'message': f'Path {path} with method {http_method} not found'
+                          })
+                      }
+              except Exception as e:
+                  logger.error(f"Error processing request: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': cors_headers,
+                      'body': json.dumps({
+                          'error': 'Internal Server Error',
+                          'message': str(e)
+                      })
+                  }
+
+          def handle_get_pets(headers):
+              try:
+                  response = table.scan()
+                  pets = response.get('Items', [])
+                  
+                  # Convert Decimal to int for JSON serialization
+                  for pet in pets:
+                      if 'id' in pet:
+                          pet['id'] = int(pet['id'])
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'pets': pets,
+                          'count': len(pets)
+                      })
+                  }
+              except ClientError as e:
+                  logger.error(f"DynamoDB error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'error': 'Database Error',
+                          'message': 'Failed to retrieve pets'
+                      })
+                  }
+
+          def handle_post_pet(event, headers):
+              try:
+                  body = json.loads(event.get('body', '{}'))
+                  
+                  if not body.get('name') or not body.get('type'):
+                      return {
+                          'statusCode': 400,
+                          'headers': headers,
+                          'body': json.dumps({
+                              'error': 'Bad Request',
+                              'message': 'Name and type are required'
+                          })
+                      }
+                  
+                  # Generate a simple ID (in production, use UUID)
+                  import random
+                  pet_id = random.randint(1000, 9999)
+                  
+                  item = {
+                      'id': pet_id,
+                      'name': body['name'],
+                      'type': body['type'],
+                      'description': body.get('description', '')
+                  }
+                  
+                  table.put_item(Item=item)
+                  
+                  return {
+                      'statusCode': 201,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'message': 'Pet created successfully',
+                          'pet': item
+                      })
+                  }
+              except json.JSONDecodeError:
+                  return {
+                      'statusCode': 400,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'error': 'Bad Request',
+                          'message': 'Invalid JSON in request body'
+                      })
+                  }
+              except ClientError as e:
+                  logger.error(f"DynamoDB error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'error': 'Database Error',
+                          'message': 'Failed to create pet'
+                      })
+                  }
+
+          def handle_get_pet(pet_id, headers):
+              try:
+                  pet_id_int = int(pet_id)
+                  response = table.get_item(Key={'id': pet_id_int})
+                  
+                  if 'Item' not in response:
+                      return {
+                          'statusCode': 404,
+                          'headers': headers,
+                          'body': json.dumps({
+                              'error': 'Not Found',
+                              'message': f'Pet with ID {pet_id} not found'
+                          })
+                      }
+                  
+                  pet = response['Item']
+                  pet['id'] = int(pet['id'])  # Convert Decimal to int
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps({'pet': pet})
+                  }
+              except ValueError:
+                  return {
+                      'statusCode': 400,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'error': 'Bad Request',
+                          'message': 'Pet ID must be a number'
+                      })
+                  }
+              except ClientError as e:
+                  logger.error(f"DynamoDB error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'error': 'Database Error',
+                          'message': 'Failed to retrieve pet'
+                      })
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub "${APIName}-handler"
+        - Key: Purpose
+          Value: "API Gateway Backend Function"
+
+  CustomAuthorizerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${APIName}-authorizer"
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          AUTH_TOKEN: !Ref AuthTokenSecret
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import os
+          import hashlib
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info(f"Authorizer Event: {json.dumps(event)}")
+              
+              # Extract the authorization token
+              token = event.get('authorizationToken', '')
+              method_arn = event.get('methodArn', '')
+              
+              # Remove 'Bearer ' prefix if present
+              if token.startswith('Bearer '):
+                  token = token[7:]
+              
+              # Validate token (in production, use proper JWT validation)
+              expected_token = os.environ.get('AUTH_TOKEN', 'valid-token')
+              
+              if token == expected_token:
+                  effect = 'Allow'
+                  principal_id = 'user123'
+                  context_info = {
+                      'userId': 'user123',
+                      'userRole': 'user',
+                      'tokenHash': hashlib.md5(token.encode()).hexdigest()[:8]
+                  }
+              else:
+                  effect = 'Deny'
+                  principal_id = 'anonymous'
+                  context_info = {
+                      'userId': 'anonymous',
+                      'userRole': 'none'
+                  }
+              
+              # Generate policy document
+              policy_document = {
+                  'Version': '2012-10-17',
+                  'Statement': [
+                      {
+                          'Action': 'execute-api:Invoke',
+                          'Effect': effect,
+                          'Resource': method_arn
+                      }
+                  ]
+              }
+              
+              response = {
+                  'principalId': principal_id,
+                  'policyDocument': policy_document,
+                  'context': context_info
+              }
+              
+              logger.info(f"Authorizer Response: {json.dumps(response)}")
+              return response
+      Tags:
+        - Key: Name
+          Value: !Sub "${APIName}-authorizer"
+        - Key: Purpose
+          Value: "API Gateway Custom Authorizer"
+
+  # ========================================
+  # Lambda Permissions
+  # ========================================
+  
+  PetStoreFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PetStoreFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PetStoreAPI}/*"
+
+  AuthorizerFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CustomAuthorizerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PetStoreAPI}/authorizers/*"
+
+  # ========================================
+  # CloudWatch Log Groups
+  # ========================================
+  
+  PetStoreFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${PetStoreFunction}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  AuthorizerFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${CustomAuthorizerFunction}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  APIGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${APIName}-access-logs"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ========================================
+  # API Gateway Configuration
+  # ========================================
+  
+  PetStoreAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Ref APIName
+      Description: !Ref APIDescription
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: execute-api:Invoke
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Ref APIName
+        - Key: Purpose
+          Value: "Pet Store API with Custom Domain"
+
+  # Custom Authorizer
+  CustomAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      RestApiId: !Ref PetStoreAPI
+      Name: !Sub "${APIName}-authorizer"
+      Type: TOKEN
+      AuthorizerUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CustomAuthorizerFunction.Arn}/invocations"
+      IdentitySource: method.request.header.Authorization
+      AuthorizerResultTtlInSeconds: 300
+
+  # Request Validator
+  RequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      RestApiId: !Ref PetStoreAPI
+      Name: !Sub "${APIName}-validator"
+      ValidateRequestBody: true
+      ValidateRequestParameters: true
+
+  # Resources
+  PetsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PetStoreAPI
+      ParentId: !GetAtt PetStoreAPI.RootResourceId
+      PathPart: pets
+
+  PetByIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PetStoreAPI
+      ParentId: !Ref PetsResource
+      PathPart: "{id}"
+
+  # Methods - GET /pets
+  GetPetsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PetStoreAPI
+      ResourceId: !Ref PetsResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref CustomAuthorizer
+      RequestValidatorId: !Ref RequestValidator
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PetStoreFunction.Arn}/invocations"
+
+  # Methods - POST /pets
+  PostPetsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PetStoreAPI
+      ResourceId: !Ref PetsResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref CustomAuthorizer
+      RequestValidatorId: !Ref RequestValidator
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PetStoreFunction.Arn}/invocations"
+
+  # Methods - GET /pets/{id}
+  GetPetByIdMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PetStoreAPI
+      ResourceId: !Ref PetByIdResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref CustomAuthorizer
+      RequestValidatorId: !Ref RequestValidator
+      RequestParameters:
+        method.request.path.id: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PetStoreFunction.Arn}/invocations"
+
+  # OPTIONS method for CORS
+  OptionsPetsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PetStoreAPI
+      ResourceId: !Ref PetsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+
+  # Deployment and Stages
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - GetPetsMethod
+      - PostPetsMethod
+      - GetPetByIdMethod
+      - OptionsPetsMethod
+    Properties:
+      RestApiId: !Ref PetStoreAPI
+      Description: "Initial deployment"
+
+  DevStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref PetStoreAPI
+      DeploymentId: !Ref APIDeployment
+      StageName: dev
+      Description: "Development stage"
+      Variables:
+        environment: development
+      ThrottleSettings:
+        RateLimit: !Ref ThrottleRateLimit
+        BurstLimit: !Ref ThrottleBurstLimit
+      AccessLogSetting: !If
+        - EnableLogging
+        - DestinationArn: !GetAtt APIGatewayLogGroup.Arn
+          Format: >
+            {
+              "requestId": "$context.requestId",
+              "ip": "$context.identity.sourceIp",
+              "caller": "$context.identity.caller",
+              "user": "$context.identity.user",
+              "requestTime": "$context.requestTime",
+              "httpMethod": "$context.httpMethod",
+              "resourcePath": "$context.resourcePath",
+              "status": "$context.status",
+              "protocol": "$context.protocol",
+              "responseLength": "$context.responseLength"
+            }
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub "${APIName}-dev"
+        - Key: Environment
+          Value: "Development"
+
+  ProdStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref PetStoreAPI
+      DeploymentId: !Ref APIDeployment
+      StageName: prod
+      Description: "Production stage"
+      Variables:
+        environment: production
+      ThrottleSettings:
+        RateLimit: !Ref ThrottleRateLimit
+        BurstLimit: !Ref ThrottleBurstLimit
+      AccessLogSetting: !If
+        - EnableLogging
+        - DestinationArn: !GetAtt APIGatewayLogGroup.Arn
+          Format: >
+            {
+              "requestId": "$context.requestId",
+              "ip": "$context.identity.sourceIp",
+              "caller": "$context.identity.caller",
+              "user": "$context.identity.user",
+              "requestTime": "$context.requestTime",
+              "httpMethod": "$context.httpMethod",
+              "resourcePath": "$context.resourcePath",
+              "status": "$context.status",
+              "protocol": "$context.protocol",
+              "responseLength": "$context.responseLength"
+            }
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub "${APIName}-prod"
+        - Key: Environment
+          Value: "Production"
+
+  # ========================================
+  # Custom Domain Configuration
+  # ========================================
+  
+  CustomDomainName:
+    Type: AWS::ApiGateway::DomainName
+    Properties:
+      DomainName: !Sub "${APISubdomain}.${DomainName}"
+      CertificateArn: !Ref SSLCertificate
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      SecurityPolicy: TLS_1_2
+      Tags:
+        - Key: Name
+          Value: !Sub "${APISubdomain}.${DomainName}"
+        - Key: Purpose
+          Value: "API Gateway Custom Domain"
+
+  # Base Path Mappings
+  ProdBasePathMapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    Properties:
+      DomainName: !Ref CustomDomainName
+      RestApiId: !Ref PetStoreAPI
+      Stage: !Ref ProdStage
+
+  ProdVersionedBasePathMapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    Properties:
+      DomainName: !Ref CustomDomainName
+      RestApiId: !Ref PetStoreAPI
+      Stage: !Ref ProdStage
+      BasePath: v1
+
+  DevBasePathMapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    Properties:
+      DomainName: !Ref CustomDomainName
+      RestApiId: !Ref PetStoreAPI
+      Stage: !Ref DevStage
+      BasePath: v1-dev
+
+  # ========================================
+  # Route 53 DNS Configuration
+  # ========================================
+  
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: CreateDNSRecord
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub "${APISubdomain}.${DomainName}"
+      Type: CNAME
+      TTL: 300
+      ResourceRecords:
+        - !GetAtt CustomDomainName.RegionalDomainName
+
+  # ========================================
+  # API Gateway Account Configuration
+  # ========================================
+  
+  APIGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Condition: EnableLogging
+    Properties:
+      CloudWatchRoleArn: !GetAtt APIGatewayLoggingRole.Arn
+
+Outputs:
+  # API Gateway Outputs
+  APIGatewayId:
+    Description: "API Gateway REST API ID"
+    Value: !Ref PetStoreAPI
+    Export:
+      Name: !Sub "${AWS::StackName}-api-id"
+
+  APIGatewayRootResourceId:
+    Description: "API Gateway Root Resource ID"
+    Value: !GetAtt PetStoreAPI.RootResourceId
+    Export:
+      Name: !Sub "${AWS::StackName}-api-root-resource-id"
+
+  # Custom Domain Outputs
+  CustomDomainName:
+    Description: "Custom domain name for the API"
+    Value: !Sub "${APISubdomain}.${DomainName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-custom-domain"
+
+  RegionalDomainName:
+    Description: "Regional domain name for DNS configuration"
+    Value: !GetAtt CustomDomainName.RegionalDomainName
+    Export:
+      Name: !Sub "${AWS::StackName}-regional-domain"
+
+  # API Endpoints
+  ProductionAPIURL:
+    Description: "Production API base URL"
+    Value: !Sub "https://${APISubdomain}.${DomainName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-prod-url"
+
+  ProductionVersionedAPIURL:
+    Description: "Production API URL with version"
+    Value: !Sub "https://${APISubdomain}.${DomainName}/v1"
+    Export:
+      Name: !Sub "${AWS::StackName}-prod-versioned-url"
+
+  DevelopmentAPIURL:
+    Description: "Development API URL"
+    Value: !Sub "https://${APISubdomain}.${DomainName}/v1-dev"
+    Export:
+      Name: !Sub "${AWS::StackName}-dev-url"
+
+  DefaultAPIURL:
+    Description: "Default API Gateway URL (without custom domain)"
+    Value: !Sub "https://${PetStoreAPI}.execute-api.${AWS::Region}.amazonaws.com/prod"
+    Export:
+      Name: !Sub "${AWS::StackName}-default-url"
+
+  # Lambda Function Outputs
+  PetStoreFunctionArn:
+    Description: "Pet Store Lambda Function ARN"
+    Value: !GetAtt PetStoreFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-lambda-arn"
+
+  AuthorizerFunctionArn:
+    Description: "Custom Authorizer Lambda Function ARN"
+    Value: !GetAtt CustomAuthorizerFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-authorizer-arn"
+
+  # SSL Certificate Output
+  SSLCertificateArn:
+    Description: "SSL Certificate ARN"
+    Value: !Ref SSLCertificate
+    Export:
+      Name: !Sub "${AWS::StackName}-ssl-cert-arn"
+
+  # DynamoDB Table Output
+  PetStoreTableName:
+    Description: "DynamoDB table name for pets data"
+    Value: !Ref PetStoreTable
+    Export:
+      Name: !Sub "${AWS::StackName}-table-name"
+
+  # Configuration Information
+  AuthTokenExample:
+    Description: "Example authorization header for API requests"
+    Value: !Sub "Bearer ${AuthTokenSecret}"
+
+  TestCommands:
+    Description: "Example curl commands to test the API"
+    Value: !Sub |
+      # Test unauthorized access (should return 401):
+      curl -v https://${APISubdomain}.${DomainName}/pets
+      
+      # Test authorized access:
+      curl -v -H "Authorization: Bearer ${AuthTokenSecret}" https://${APISubdomain}.${DomainName}/pets
+      
+      # Create a new pet:
+      curl -v -X POST -H "Authorization: Bearer ${AuthTokenSecret}" -H "Content-Type: application/json" -d '{"name":"Fluffy","type":"cat","description":"A friendly cat"}' https://${APISubdomain}.${DomainName}/pets
+      
+      # Test different stages:
+      curl -v -H "Authorization: Bearer ${AuthTokenSecret}" https://${APISubdomain}.${DomainName}/v1/pets
+      curl -v -H "Authorization: Bearer ${AuthTokenSecret}" https://${APISubdomain}.${DomainName}/v1-dev/pets
+
+  DNSSetupInstructions:
+    Condition: CreateDNSRecord
+    Description: "DNS record automatically created in Route 53"
+    Value: !Sub "DNS record created: ${APISubdomain}.${DomainName} -> ${CustomDomainName.RegionalDomainName}"
+
+  ManualDNSSetupInstructions:
+    Condition: !CreateDNSRecord
+    Description: "Manual DNS setup instructions"
+    Value: !Sub "Create CNAME record: ${APISubdomain}.${DomainName} -> ${CustomDomainName.RegionalDomainName}"

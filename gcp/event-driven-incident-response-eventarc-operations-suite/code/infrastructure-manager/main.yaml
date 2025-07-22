@@ -1,0 +1,910 @@
+# Infrastructure Manager Configuration for Event-Driven Incident Response
+# This configuration deploys a complete incident response system using Eventarc,
+# Cloud Operations Suite, Cloud Functions, and Cloud Run services.
+
+# Copyright 2025 Google LLC
+# Licensed under the Apache License, Version 2.0
+
+# Infrastructure Manager configuration for event-driven incident response system
+# Deploys: Eventarc triggers, Cloud Functions, Cloud Run services, Pub/Sub topics, IAM, and monitoring alerts
+
+terraform:
+  # Use the latest stable version of Terraform
+  required_version: ">= 1.0"
+  
+  # Configure required providers
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 5.0"
+    archive:
+      source: "hashicorp/archive"
+      version: "~> 2.4"
+    random:
+      source: "hashicorp/random"
+      version: "~> 3.5"
+
+# Input variables for customization
+variable "project_id":
+  type: string
+  description: "Google Cloud project ID"
+  
+variable "region":
+  type: string
+  description: "Default region for resources"
+  default: "us-central1"
+
+variable "zone":
+  type: string
+  description: "Default zone for resources"
+  default: "us-central1-a"
+
+variable "environment":
+  type: string
+  description: "Environment name (dev, staging, prod)"
+  default: "dev"
+
+variable "notification_email":
+  type: string
+  description: "Email address for incident notifications"
+  default: "admin@example.com"
+
+# Local values for resource naming and configuration
+locals:
+  # Generate unique suffix for resources
+  resource_suffix: "${random_string.suffix.result}"
+  
+  # Base resource names
+  base_name: "incident-response-${local.resource_suffix}"
+  
+  # Service account email
+  service_account_email: "${google_service_account.incident_response.email}"
+  
+  # Common labels for all resources
+  common_labels:
+    environment: "${var.environment}"
+    project: "incident-response"
+    managed-by: "infrastructure-manager"
+    created-by: "recipe-system"
+  
+  # Cloud Functions source bucket
+  functions_bucket: "${google_storage_bucket.functions_source.name}"
+
+# Generate random suffix for unique resource names
+resource "random_string" "suffix":
+  length: 6
+  special: false
+  upper: false
+
+# Enable required Google Cloud APIs
+resource "google_project_service" "required_apis":
+  for_each = toset([
+    "eventarc.googleapis.com",
+    "cloudfunctions.googleapis.com",
+    "run.googleapis.com",
+    "monitoring.googleapis.com",
+    "logging.googleapis.com",
+    "pubsub.googleapis.com",
+    "cloudbuild.googleapis.com",
+    "storage.googleapis.com",
+    "iam.googleapis.com"
+  ])
+  
+  project = var.project_id
+  service = each.value
+  
+  # Prevent accidental deletion of essential services
+  disable_dependent_services = false
+  disable_on_destroy = false
+
+# Service account for incident response automation
+resource "google_service_account" "incident_response":
+  project = var.project_id
+  account_id = "incident-response-sa-${local.resource_suffix}"
+  display_name = "Incident Response Service Account"
+  description = "Service account for automated incident response system"
+  
+  depends_on = [google_project_service.required_apis]
+
+# IAM bindings for the service account
+resource "google_project_iam_member" "incident_response_permissions":
+  for_each = toset([
+    "roles/monitoring.viewer",
+    "roles/compute.instanceAdmin.v1",
+    "roles/pubsub.publisher",
+    "roles/pubsub.subscriber",
+    "roles/logging.viewer",
+    "roles/eventarc.eventReceiver",
+    "roles/run.invoker"
+  ])
+  
+  project = var.project_id
+  role = each.value
+  member = "serviceAccount:${google_service_account.incident_response.email}"
+  
+  depends_on = [google_service_account.incident_response]
+
+# Cloud Storage bucket for Cloud Functions source code
+resource "google_storage_bucket" "functions_source":
+  project = var.project_id
+  name = "incident-response-functions-${local.resource_suffix}"
+  location = var.region
+  
+  # Enable versioning for source code management
+  versioning {
+    enabled = true
+  }
+  
+  # Lifecycle management for cost optimization
+  lifecycle_rule {
+    condition {
+      age = 30
+    }
+    action {
+      type = "Delete"
+    }
+  }
+  
+  labels = local.common_labels
+  
+  depends_on = [google_project_service.required_apis]
+
+# Pub/Sub topics for event routing
+resource "google_pubsub_topic" "incident_alerts":
+  project = var.project_id
+  name = "incident-alerts-${local.resource_suffix}"
+  
+  labels = local.common_labels
+  
+  depends_on = [google_project_service.required_apis]
+
+resource "google_pubsub_topic" "remediation_topic":
+  project = var.project_id
+  name = "remediation-topic-${local.resource_suffix}"
+  
+  labels = local.common_labels
+  
+  depends_on = [google_project_service.required_apis]
+
+resource "google_pubsub_topic" "escalation_topic":
+  project = var.project_id
+  name = "escalation-topic-${local.resource_suffix}"
+  
+  labels = local.common_labels
+  
+  depends_on = [google_project_service.required_apis]
+
+resource "google_pubsub_topic" "notification_topic":
+  project = var.project_id
+  name = "notification-topic-${local.resource_suffix}"
+  
+  labels = local.common_labels
+  
+  depends_on = [google_project_service.required_apis]
+
+# Create ZIP archive for triage function source code
+data "archive_file" "triage_function_zip":
+  type = "zip"
+  output_path = "/tmp/triage-function-${local.resource_suffix}.zip"
+  
+  source {
+    content = <<-EOT
+import json
+import base64
+from google.cloud import pubsub_v1
+from google.cloud import monitoring_v3
+import functions_framework
+import os
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+PROJECT_ID = os.environ.get('GCP_PROJECT')
+publisher = pubsub_v1.PublisherClient()
+
+@functions_framework.cloud_event
+def triage_incident(cloud_event):
+    """Analyze and triage incoming monitoring alerts"""
+    try:
+        # Decode Pub/Sub message
+        if 'data' in cloud_event.data:
+            message_data = base64.b64decode(cloud_event.data['data']).decode('utf-8')
+            alert_data = json.loads(message_data)
+        else:
+            alert_data = cloud_event.data
+        
+        # Extract alert metadata
+        incident_type = alert_data.get('incident', {}).get('condition_name', 'unknown')
+        severity = determine_severity(alert_data)
+        resource_type = alert_data.get('incident', {}).get('resource_name', '')
+        
+        # Create triage decision
+        triage_result = {
+            'incident_id': alert_data.get('incident', {}).get('incident_id'),
+            'severity': severity,
+            'incident_type': incident_type,
+            'resource_type': resource_type,
+            'automated_response': determine_response_action(severity, incident_type),
+            'requires_escalation': severity in ['CRITICAL', 'HIGH'],
+            'timestamp': cloud_event.get('time'),
+            'original_alert': alert_data
+        }
+        
+        # Route to appropriate response services
+        route_incident(triage_result)
+        
+        logger.info(f"Successfully triaged incident: {triage_result['incident_id']}")
+        return 'Incident triaged successfully'
+        
+    except Exception as e:
+        logger.error(f"Error triaging incident: {str(e)}")
+        raise
+
+def determine_severity(alert_data):
+    """Determine incident severity based on alert conditions"""
+    condition = alert_data.get('incident', {}).get('condition_name', '').lower()
+    
+    if any(keyword in condition for keyword in ['down', 'failure', 'error_rate_high']):
+        return 'CRITICAL'
+    elif any(keyword in condition for keyword in ['latency_high', 'cpu_high', 'memory_high']):
+        return 'HIGH'
+    elif any(keyword in condition for keyword in ['warning', 'threshold']):
+        return 'MEDIUM'
+    else:
+        return 'LOW'
+
+def determine_response_action(severity, incident_type):
+    """Determine automated response based on severity and type"""
+    if severity == 'CRITICAL':
+        return 'immediate_remediation'
+    elif severity == 'HIGH':
+        return 'auto_scale_and_notify'
+    elif severity == 'MEDIUM':
+        return 'notify_only'
+    else:
+        return 'log_only'
+
+def route_incident(triage_result):
+    """Route incident to appropriate response services"""
+    response_action = triage_result['automated_response']
+    
+    if response_action == 'immediate_remediation':
+        publish_to_topic('remediation-topic-${local.resource_suffix}', triage_result)
+    elif response_action == 'auto_scale_and_notify':
+        publish_to_topic('remediation-topic-${local.resource_suffix}', triage_result)
+        publish_to_topic('notification-topic-${local.resource_suffix}', triage_result)
+    elif response_action == 'notify_only':
+        publish_to_topic('notification-topic-${local.resource_suffix}', triage_result)
+    
+    if triage_result['requires_escalation']:
+        publish_to_topic('escalation-topic-${local.resource_suffix}', triage_result)
+
+def publish_to_topic(topic_name, data):
+    """Publish data to specified Pub/Sub topic"""
+    try:
+        topic_path = publisher.topic_path(PROJECT_ID, topic_name)
+        message_data = json.dumps(data).encode('utf-8')
+        future = publisher.publish(topic_path, message_data)
+        logger.info(f"Published to {topic_name}: {future.result()}")
+    except Exception as e:
+        logger.error(f"Failed to publish to {topic_name}: {str(e)}")
+EOT
+    filename = "main.py"
+  }
+  
+  source {
+    content = <<-EOT
+functions-framework==3.4.0
+google-cloud-pubsub==2.18.0
+google-cloud-monitoring==2.15.0
+EOT
+    filename = "requirements.txt"
+  }
+}
+
+# Upload triage function source to Cloud Storage
+resource "google_storage_bucket_object" "triage_function_source":
+  bucket = google_storage_bucket.functions_source.name
+  name = "triage-function-${local.resource_suffix}.zip"
+  source = data.archive_file.triage_function_zip.output_path
+  
+  depends_on = [
+    google_storage_bucket.functions_source,
+    data.archive_file.triage_function_zip
+  ]
+}
+
+# Create ZIP archive for notification function source code
+data "archive_file" "notification_function_zip":
+  type = "zip"
+  output_path = "/tmp/notification-function-${local.resource_suffix}.zip"
+  
+  source {
+    content = <<-EOT
+import json
+import base64
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import functions_framework
+import logging
+import os
+from google.cloud import secretmanager
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+PROJECT_ID = os.environ.get('GCP_PROJECT')
+
+@functions_framework.cloud_event
+def send_notifications(cloud_event):
+    """Send incident notifications to appropriate channels"""
+    try:
+        # Decode Pub/Sub message
+        if 'data' in cloud_event.data:
+            message_data = base64.b64decode(cloud_event.data['data']).decode('utf-8')
+            incident_data = json.loads(message_data)
+        else:
+            incident_data = cloud_event.data
+        
+        severity = incident_data.get('severity', 'UNKNOWN')
+        incident_id = incident_data.get('incident_id', 'N/A')
+        incident_type = incident_data.get('incident_type', 'Unknown')
+        
+        # Determine notification channels based on severity
+        channels = get_notification_channels(severity)
+        
+        # Create notification content
+        notification_content = create_notification_content(incident_data)
+        
+        # Send notifications through each channel
+        for channel in channels:
+            send_channel_notification(channel, notification_content, incident_data)
+        
+        logger.info(f"Notifications sent for incident: {incident_id}")
+        return 'Notifications sent successfully'
+        
+    except Exception as e:
+        logger.error(f"Error sending notifications: {str(e)}")
+        raise
+
+def get_notification_channels(severity):
+    """Get notification channels based on incident severity"""
+    channels = ['email']  # Always send email
+    
+    if severity in ['CRITICAL', 'HIGH']:
+        channels.extend(['slack', 'sms'])  # Add urgent channels for high severity
+    
+    return channels
+
+def create_notification_content(incident_data):
+    """Create formatted notification content"""
+    severity = incident_data.get('severity', 'UNKNOWN')
+    incident_id = incident_data.get('incident_id', 'N/A')
+    incident_type = incident_data.get('incident_type', 'Unknown')
+    resource_type = incident_data.get('resource_type', 'Unknown')
+    automated_response = incident_data.get('automated_response', 'None')
+    
+    subject = f"🚨 {severity} Incident Alert: {incident_type}"
+    
+    body = f"""
+Incident Alert Summary
+=====================
+Incident ID: {incident_id}
+Severity: {severity}
+Type: {incident_type}
+Affected Resource: {resource_type}
+Automated Response: {automated_response}
+Timestamp: {incident_data.get('timestamp', 'N/A')}
+
+This incident has been automatically triaged and appropriate response actions have been initiated.
+Monitor the incident response dashboard for real-time updates.
+
+Google Cloud Incident Response System
+"""
+    
+    return {'subject': subject, 'body': body}
+
+def send_channel_notification(channel, content, incident_data):
+    """Send notification through specified channel"""
+    try:
+        if channel == 'email':
+            send_email_notification(content, incident_data)
+        elif channel == 'slack':
+            send_slack_notification(content, incident_data)
+        elif channel == 'sms':
+            send_sms_notification(content, incident_data)
+        
+        logger.info(f"Notification sent via {channel}")
+        
+    except Exception as e:
+        logger.error(f"Failed to send {channel} notification: {str(e)}")
+
+def send_email_notification(content, incident_data):
+    """Send email notification (placeholder implementation)"""
+    # In production, integrate with SendGrid, Gmail API, or SMTP server
+    logger.info(f"Email notification: {content['subject']}")
+
+def send_slack_notification(content, incident_data):
+    """Send Slack notification (placeholder implementation)"""
+    # In production, integrate with Slack webhook or API
+    logger.info(f"Slack notification: {content['subject']}")
+
+def send_sms_notification(content, incident_data):
+    """Send SMS notification (placeholder implementation)"""
+    # In production, integrate with Twilio or Google Cloud SMS API
+    logger.info(f"SMS notification: {content['subject']}")
+EOT
+    filename = "main.py"
+  }
+  
+  source {
+    content = <<-EOT
+functions-framework==3.4.0
+google-cloud-secret-manager==2.16.0
+EOT
+    filename = "requirements.txt"
+  }
+}
+
+# Upload notification function source to Cloud Storage
+resource "google_storage_bucket_object" "notification_function_source":
+  bucket = google_storage_bucket.functions_source.name
+  name = "notification-function-${local.resource_suffix}.zip"
+  source = data.archive_file.notification_function_zip.output_path
+  
+  depends_on = [
+    google_storage_bucket.functions_source,
+    data.archive_file.notification_function_zip
+  ]
+}
+
+# Incident Triage Cloud Function
+resource "google_cloudfunctions2_function" "triage_function":
+  project = var.project_id
+  name = "incident-triage-${local.resource_suffix}"
+  location = var.region
+  description = "Analyzes and triages incoming monitoring alerts"
+  
+  build_config {
+    runtime = "python311"
+    entry_point = "triage_incident"
+    
+    source {
+      storage_source {
+        bucket = google_storage_bucket.functions_source.name
+        object = google_storage_bucket_object.triage_function_source.name
+      }
+    }
+  }
+  
+  service_config {
+    max_instance_count = 100
+    min_instance_count = 0
+    available_memory = "512Mi"
+    timeout_seconds = 540
+    
+    environment_variables = {
+      GCP_PROJECT = var.project_id
+    }
+    
+    service_account_email = google_service_account.incident_response.email
+  }
+  
+  event_trigger {
+    trigger_region = var.region
+    event_type = "google.cloud.pubsub.topic.v1.messagePublished"
+    pubsub_topic = google_pubsub_topic.incident_alerts.id
+    retry_policy = "RETRY_POLICY_RETRY"
+  }
+  
+  labels = local.common_labels
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_storage_bucket_object.triage_function_source
+  ]
+}
+
+# Incident Notification Cloud Function
+resource "google_cloudfunctions2_function" "notification_function":
+  project = var.project_id
+  name = "incident-notify-${local.resource_suffix}"
+  location = var.region
+  description = "Sends incident notifications through multiple channels"
+  
+  build_config {
+    runtime = "python311"
+    entry_point = "send_notifications"
+    
+    source {
+      storage_source {
+        bucket = google_storage_bucket.functions_source.name
+        object = google_storage_bucket_object.notification_function_source.name
+      }
+    }
+  }
+  
+  service_config {
+    max_instance_count = 50
+    min_instance_count = 0
+    available_memory = "256Mi"
+    timeout_seconds = 300
+    
+    environment_variables = {
+      GCP_PROJECT = var.project_id
+    }
+    
+    service_account_email = google_service_account.incident_response.email
+  }
+  
+  event_trigger {
+    trigger_region = var.region
+    event_type = "google.cloud.pubsub.topic.v1.messagePublished"
+    pubsub_topic = google_pubsub_topic.notification_topic.id
+    retry_policy = "RETRY_POLICY_RETRY"
+  }
+  
+  labels = local.common_labels
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_storage_bucket_object.notification_function_source
+  ]
+}
+
+# Remediation Cloud Run Service
+resource "google_cloud_run_v2_service" "remediation_service":
+  project = var.project_id
+  name = "incident-remediate-${local.resource_suffix}"
+  location = var.region
+  ingress = "INGRESS_TRAFFIC_ALL"
+  
+  template {
+    service_account = google_service_account.incident_response.email
+    
+    scaling {
+      min_instance_count = 0
+      max_instance_count = 10
+    }
+    
+    containers {
+      image = "gcr.io/cloudrun/hello"  # Placeholder image - replace with actual remediation service
+      
+      ports {
+        container_port = 8080
+      }
+      
+      resources {
+        limits = {
+          cpu = "1000m"
+          memory = "1Gi"
+        }
+        cpu_idle = true
+        startup_cpu_boost = true
+      }
+      
+      env {
+        name = "GCP_PROJECT"
+        value = var.project_id
+      }
+      
+      env {
+        name = "GCP_ZONE"
+        value = var.zone
+      }
+    }
+    
+    timeout = "900s"
+  }
+  
+  traffic {
+    percent = 100
+    type = "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST"
+  }
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_service_account.incident_response
+  ]
+}
+
+# Escalation Cloud Run Service
+resource "google_cloud_run_v2_service" "escalation_service":
+  project = var.project_id
+  name = "incident-escalate-${local.resource_suffix}"
+  location = var.region
+  ingress = "INGRESS_TRAFFIC_ALL"
+  
+  template {
+    service_account = google_service_account.incident_response.email
+    
+    scaling {
+      min_instance_count = 0
+      max_instance_count = 5
+    }
+    
+    containers {
+      image = "gcr.io/cloudrun/hello"  # Placeholder image - replace with actual escalation service
+      
+      ports {
+        container_port = 8080
+      }
+      
+      resources {
+        limits = {
+          cpu = "1000m"
+          memory = "512Mi"
+        }
+        cpu_idle = true
+      }
+      
+      env {
+        name = "GCP_PROJECT"
+        value = var.project_id
+      }
+    }
+    
+    timeout = "600s"
+  }
+  
+  traffic {
+    percent = 100
+    type = "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST"
+  }
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_service_account.incident_response
+  ]
+}
+
+# Eventarc trigger for Cloud Monitoring alerts
+resource "google_eventarc_trigger" "monitoring_alert_trigger":
+  project = var.project_id
+  name = "monitoring-alert-trigger-${local.resource_suffix}"
+  location = var.region
+  
+  matching_criteria {
+    attribute = "type"
+    value = "google.cloud.monitoring.alert.v1.opened"
+  }
+  
+  matching_criteria {
+    attribute = "type"
+    value = "google.cloud.monitoring.alert.v1.closed"
+  }
+  
+  destination {
+    cloud_run_service {
+      service = google_cloudfunctions2_function.triage_function.name
+      region = var.region
+    }
+  }
+  
+  service_account = google_service_account.incident_response.email
+  
+  labels = local.common_labels
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_cloudfunctions2_function.triage_function
+  ]
+}
+
+# Eventarc trigger for remediation service
+resource "google_eventarc_trigger" "remediation_trigger":
+  project = var.project_id
+  name = "remediation-trigger-${local.resource_suffix}"
+  location = var.region
+  
+  matching_criteria {
+    attribute = "type"
+    value = "google.cloud.pubsub.topic.v1.messagePublished"
+  }
+  
+  destination {
+    cloud_run_service {
+      service = google_cloud_run_v2_service.remediation_service.name
+      region = var.region
+    }
+  }
+  
+  transport {
+    pubsub {
+      topic = google_pubsub_topic.remediation_topic.id
+    }
+  }
+  
+  service_account = google_service_account.incident_response.email
+  
+  labels = local.common_labels
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_cloud_run_v2_service.remediation_service,
+    google_pubsub_topic.remediation_topic
+  ]
+}
+
+# Eventarc trigger for escalation service
+resource "google_eventarc_trigger" "escalation_trigger":
+  project = var.project_id
+  name = "escalation-trigger-${local.resource_suffix}"
+  location = var.region
+  
+  matching_criteria {
+    attribute = "type"
+    value = "google.cloud.pubsub.topic.v1.messagePublished"
+  }
+  
+  destination {
+    cloud_run_service {
+      service = google_cloud_run_v2_service.escalation_service.name
+      region = var.region
+    }
+  }
+  
+  transport {
+    pubsub {
+      topic = google_pubsub_topic.escalation_topic.id
+    }
+  }
+  
+  service_account = google_service_account.incident_response.email
+  
+  labels = local.common_labels
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_cloud_run_v2_service.escalation_service,
+    google_pubsub_topic.escalation_topic
+  ]
+}
+
+# Sample monitoring alert policy for high CPU utilization
+resource "google_monitoring_alert_policy" "high_cpu_alert":
+  project = var.project_id
+  display_name = "High CPU Utilization Alert - ${local.resource_suffix}"
+  
+  documentation {
+    content = "This alert fires when CPU utilization exceeds 80% for 5 minutes"
+    mime_type = "text/markdown"
+  }
+  
+  conditions {
+    display_name = "CPU utilization is high"
+    
+    condition_threshold {
+      filter = "resource.type=\"gce_instance\""
+      comparison = "COMPARISON_GREATER_THAN"
+      threshold_value = 0.8
+      duration = "300s"
+      
+      aggregations {
+        alignment_period = "60s"
+        per_series_aligner = "ALIGN_MEAN"
+        cross_series_reducer = "REDUCE_MEAN"
+        group_by_fields = ["project", "resource.label.instance_id"]
+      }
+    }
+  }
+  
+  combiner = "OR"
+  enabled = true
+  
+  alert_strategy {
+    auto_close = "1800s"
+  }
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Sample monitoring alert policy for high error rate
+resource "google_monitoring_alert_policy" "high_error_rate_alert":
+  project = var.project_id
+  display_name = "High Error Rate Alert - ${local.resource_suffix}"
+  
+  documentation {
+    content = "This alert fires when error rate exceeds 5% for 10 minutes"
+    mime_type = "text/markdown"
+  }
+  
+  conditions {
+    display_name = "Error rate is high"
+    
+    condition_threshold {
+      filter = "resource.type=\"cloud_run_revision\""
+      comparison = "COMPARISON_GREATER_THAN"
+      threshold_value = 0.05
+      duration = "600s"
+      
+      aggregations {
+        alignment_period = "300s"
+        per_series_aligner = "ALIGN_RATE"
+        cross_series_reducer = "REDUCE_MEAN"
+        group_by_fields = ["resource.label.service_name"]
+      }
+    }
+  }
+  
+  combiner = "OR"
+  enabled = true
+  
+  alert_strategy {
+    auto_close = "3600s"
+  }
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Output values for verification and integration
+output "project_id":
+  description = "Google Cloud project ID"
+  value = var.project_id
+
+output "region":
+  description = "Deployment region"
+  value = var.region
+
+output "service_account_email":
+  description = "Service account email for incident response system"
+  value = google_service_account.incident_response.email
+
+output "pubsub_topics":
+  description = "Created Pub/Sub topics for event routing"
+  value = {
+    incident_alerts = google_pubsub_topic.incident_alerts.name
+    remediation = google_pubsub_topic.remediation_topic.name
+    escalation = google_pubsub_topic.escalation_topic.name
+    notification = google_pubsub_topic.notification_topic.name
+  }
+
+output "cloud_functions":
+  description = "Deployed Cloud Functions"
+  value = {
+    triage_function = google_cloudfunctions2_function.triage_function.name
+    notification_function = google_cloudfunctions2_function.notification_function.name
+  }
+
+output "cloud_run_services":
+  description = "Deployed Cloud Run services"
+  value = {
+    remediation_service = google_cloud_run_v2_service.remediation_service.name
+    escalation_service = google_cloud_run_v2_service.escalation_service.name
+  }
+
+output "eventarc_triggers":
+  description = "Created Eventarc triggers"
+  value = {
+    monitoring_alert_trigger = google_eventarc_trigger.monitoring_alert_trigger.name
+    remediation_trigger = google_eventarc_trigger.remediation_trigger.name
+    escalation_trigger = google_eventarc_trigger.escalation_trigger.name
+  }
+
+output "monitoring_alert_policies":
+  description = "Created monitoring alert policies"
+  value = {
+    high_cpu_alert = google_monitoring_alert_policy.high_cpu_alert.name
+    high_error_rate_alert = google_monitoring_alert_policy.high_error_rate_alert.name
+  }
+
+output "functions_source_bucket":
+  description = "Cloud Storage bucket for function source code"
+  value = google_storage_bucket.functions_source.name
+
+output "deployment_summary":
+  description = "Summary of deployed resources"
+  value = {
+    total_functions = 2
+    total_cloud_run_services = 2
+    total_eventarc_triggers = 3
+    total_pubsub_topics = 4
+    total_alert_policies = 2
+    service_account = google_service_account.incident_response.email
+    resource_suffix = local.resource_suffix
+  }

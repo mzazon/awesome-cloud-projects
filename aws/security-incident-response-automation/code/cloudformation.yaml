@@ -1,0 +1,1192 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Automated Security Incident Response with AWS Security Hub - Complete infrastructure for automated security incident classification, remediation, and notification'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Security Hub Configuration"
+        Parameters:
+          - EnableSecurityHub
+          - EnableDefaultStandards
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+          - SlackWebhookUrl
+      - Label:
+          default: "Incident Response Configuration"
+        Parameters:
+          - IncidentResponseLevel
+          - AutoRemediationEnabled
+          - EscalationThreshold
+      - Label:
+          default: "Resource Naming"
+        Parameters:
+          - ResourcePrefix
+          - Environment
+
+Parameters:
+  EnableSecurityHub:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable AWS Security Hub with default security standards'
+
+  EnableDefaultStandards:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable default security standards (AWS Foundational Security Standard and CIS)'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for security incident notifications'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  SlackWebhookUrl:
+    Type: String
+    Default: ''
+    Description: 'Optional Slack webhook URL for notifications (leave empty to skip Slack notifications)'
+    NoEcho: true
+
+  IncidentResponseLevel:
+    Type: String
+    Default: 'STANDARD'
+    AllowedValues: ['BASIC', 'STANDARD', 'ADVANCED']
+    Description: 'Level of automated incident response (BASIC=notifications only, STANDARD=classification+notifications, ADVANCED=full automation with remediation)'
+
+  AutoRemediationEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable automated remediation for supported finding types'
+
+  EscalationThreshold:
+    Type: String
+    Default: 'HIGH'
+    AllowedValues: ['MEDIUM', 'HIGH', 'CRITICAL']
+    Description: 'Minimum severity level for automated escalation'
+
+  ResourcePrefix:
+    Type: String
+    Default: 'sec-incident-response'
+    Description: 'Prefix for all created resources'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+    MaxLength: 20
+
+  Environment:
+    Type: String
+    Default: 'prod'
+    AllowedValues: ['dev', 'test', 'prod']
+    Description: 'Environment designation for resource tagging'
+
+Conditions:
+  EnableSecurityHubCondition: !Equals [!Ref EnableSecurityHub, 'true']
+  EnableSlackNotifications: !Not [!Equals [!Ref SlackWebhookUrl, '']]
+  EnableAutoRemediation: !And
+    - !Equals [!Ref AutoRemediationEnabled, 'true']
+    - !Not [!Equals [!Ref IncidentResponseLevel, 'BASIC']]
+  EnableAdvancedFeatures: !Equals [!Ref IncidentResponseLevel, 'ADVANCED']
+
+Resources:
+  # Security Hub Configuration
+  SecurityHub:
+    Type: AWS::SecurityHub::Hub
+    Condition: EnableSecurityHubCondition
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-security-hub'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Centralized security findings aggregation'
+
+  # IAM Role for Lambda Functions
+  IncidentResponseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-incident-response-role-${Environment}'
+      Description: 'IAM role for automated security incident response Lambda functions'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SecurityHubAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - securityhub:GetFindings
+                  - securityhub:BatchUpdateFindings
+                  - securityhub:BatchImportFindings
+                  - securityhub:GetInsights
+                  - securityhub:GetInsightResults
+                Resource: '*'
+        - PolicyName: SNSPublishAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SecurityIncidentTopic
+        - PolicyName: RemediationAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  # EC2 Security Group remediation
+                  - ec2:DescribeSecurityGroups
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:CreateTags
+                  # S3 bucket policy remediation
+                  - s3:PutBucketPolicy
+                  - s3:GetBucketPolicy
+                  - s3:PutBucketPublicAccessBlock
+                  # IAM policy remediation (limited scope)
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:ListAttachedRolePolicies
+                  - iam:ListRolePolicies
+                Resource: '*'
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ResourcePrefix}-*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-incident-response-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Topic for Security Incident Notifications
+  SecurityIncidentTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ResourcePrefix}-security-incidents-${Environment}'
+      DisplayName: 'Security Incident Notifications'
+      KmsMasterKeyId: 'alias/aws/sns'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-security-incidents'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Security incident notifications'
+
+  # Email Subscription for SNS Topic
+  EmailNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref SecurityIncidentTopic
+      Endpoint: !Ref NotificationEmail
+
+  # SNS Topic Policy
+  SecurityIncidentTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref SecurityIncidentTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt IncidentResponseRole.Arn
+            Action:
+              - sns:Publish
+            Resource: !Ref SecurityIncidentTopic
+
+  # Lambda Function for Security Finding Classification
+  ClassificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-classification-${Environment}'
+      Description: 'Classifies security findings for automated incident response'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt IncidentResponseRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          ESCALATION_THRESHOLD: !Ref EscalationThreshold
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          securityhub = boto3.client('securityhub')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Extract finding details from EventBridge event
+                  finding = event['detail']['findings'][0]
+                  
+                  finding_id = finding['Id']
+                  product_arn = finding['ProductArn']
+                  severity = finding['Severity']['Label']
+                  title = finding['Title']
+                  description = finding['Description']
+                  
+                  logger.info(f"Processing finding {finding_id} with severity {severity}")
+                  
+                  # Classify finding based on severity and type
+                  classification = classify_finding(finding)
+                  
+                  # Update finding with classification
+                  response = securityhub.batch_update_findings(
+                      FindingIdentifiers=[
+                          {
+                              'Id': finding_id,
+                              'ProductArn': product_arn
+                          }
+                      ],
+                      Note={
+                          'Text': f'Auto-classified as {classification["category"]} - {classification["action"]}',
+                          'UpdatedBy': 'SecurityIncidentResponse'
+                      },
+                      UserDefinedFields={
+                          'AutoClassification': classification['category'],
+                          'RecommendedAction': classification['action'],
+                          'ProcessedAt': datetime.utcnow().isoformat(),
+                          'EscalationRequired': str(classification.get('escalate', False))
+                      }
+                  )
+                  
+                  logger.info(f"Successfully classified finding {finding_id} as {classification['category']}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'findingId': finding_id,
+                          'classification': classification,
+                          'updated': True
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing finding: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def classify_finding(finding):
+              """Classify finding based on severity, type, and content"""
+              severity = finding['Severity']['Label']
+              finding_type = finding.get('Types', ['Unknown'])[0]
+              title = finding['Title'].lower()
+              escalation_threshold = os.environ.get('ESCALATION_THRESHOLD', 'HIGH')
+              
+              # High-priority security incidents
+              if severity == 'CRITICAL':
+                  if 'root' in title or 'admin' in title:
+                      return {
+                          'category': 'CRITICAL_ADMIN_ISSUE',
+                          'action': 'IMMEDIATE_REVIEW_REQUIRED',
+                          'escalate': True,
+                          'priority': 1
+                      }
+                  elif 'malware' in title or 'backdoor' in title:
+                      return {
+                          'category': 'MALWARE_DETECTED',
+                          'action': 'QUARANTINE_RESOURCE',
+                          'escalate': True,
+                          'priority': 1
+                      }
+                  else:
+                      return {
+                          'category': 'CRITICAL_SECURITY_ISSUE',
+                          'action': 'INVESTIGATE_IMMEDIATELY',
+                          'escalate': True,
+                          'priority': 1
+                      }
+              
+              # Medium-priority issues
+              elif severity == 'HIGH':
+                  escalate = escalation_threshold in ['HIGH', 'MEDIUM']
+                  if 'mfa' in title:
+                      return {
+                          'category': 'MFA_COMPLIANCE_ISSUE',
+                          'action': 'ENFORCE_MFA_POLICY',
+                          'escalate': escalate,
+                          'priority': 2
+                      }
+                  elif 'encryption' in title:
+                      return {
+                          'category': 'ENCRYPTION_COMPLIANCE',
+                          'action': 'ENABLE_ENCRYPTION',
+                          'escalate': escalate,
+                          'priority': 2
+                      }
+                  elif 'security group' in title:
+                      return {
+                          'category': 'NETWORK_SECURITY_ISSUE',
+                          'action': 'RESTRICT_ACCESS',
+                          'escalate': escalate,
+                          'priority': 2
+                      }
+                  else:
+                      return {
+                          'category': 'HIGH_SECURITY_ISSUE',
+                          'action': 'SCHEDULE_REMEDIATION',
+                          'escalate': escalate,
+                          'priority': 2
+                      }
+              
+              # Lower priority issues
+              else:
+                  escalate = escalation_threshold == 'MEDIUM'
+                  return {
+                      'category': 'STANDARD_COMPLIANCE_ISSUE',
+                      'action': 'TRACK_FOR_REMEDIATION',
+                      'escalate': escalate,
+                      'priority': 3
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-classification'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Security finding classification'
+
+  # Lambda Function for Automated Remediation
+  RemediationFunction:
+    Type: AWS::Lambda::Function
+    Condition: EnableAutoRemediation
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-remediation-${Environment}'
+      Description: 'Performs automated remediation of security findings'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt IncidentResponseRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          AUTO_REMEDIATION_ENABLED: !Ref AutoRemediationEnabled
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          ec2 = boto3.client('ec2')
+          iam = boto3.client('iam')
+          s3 = boto3.client('s3')
+          securityhub = boto3.client('securityhub')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Check if auto-remediation is enabled
+                  if os.environ.get('AUTO_REMEDIATION_ENABLED', 'false').lower() != 'true':
+                      logger.info("Auto-remediation is disabled")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({'message': 'Auto-remediation disabled'})
+                      }
+                  
+                  # Extract finding details
+                  finding = event['detail']['findings'][0]
+                  finding_id = finding['Id']
+                  product_arn = finding['ProductArn']
+                  title = finding['Title']
+                  severity = finding['Severity']['Label']
+                  resources = finding.get('Resources', [])
+                  
+                  logger.info(f"Processing remediation for finding {finding_id} with severity {severity}")
+                  
+                  # Only auto-remediate HIGH and CRITICAL findings
+                  if severity not in ['HIGH', 'CRITICAL']:
+                      logger.info(f"Skipping auto-remediation for {severity} severity finding")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({'message': f'No auto-remediation for {severity} findings'})
+                      }
+                  
+                  # Determine remediation action based on finding type
+                  remediation_result = perform_remediation(finding, resources)
+                  
+                  # Update finding with remediation status
+                  securityhub.batch_update_findings(
+                      FindingIdentifiers=[
+                          {
+                              'Id': finding_id,
+                              'ProductArn': product_arn
+                          }
+                      ],
+                      Note={
+                          'Text': f'Auto-remediation attempted: {remediation_result["action"]} - {remediation_result["status"]}',
+                          'UpdatedBy': 'SecurityIncidentResponse'
+                      },
+                      UserDefinedFields={
+                          'RemediationAction': remediation_result['action'],
+                          'RemediationStatus': remediation_result['status'],
+                          'RemediationTimestamp': datetime.utcnow().isoformat()
+                      },
+                      Workflow={
+                          'Status': 'RESOLVED' if remediation_result['status'] == 'SUCCESS' else 'NEW'
+                      }
+                  )
+                  
+                  logger.info(f"Remediation completed for finding {finding_id}: {remediation_result['status']}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(remediation_result)
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in remediation: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def perform_remediation(finding, resources):
+              """Perform automated remediation based on finding type"""
+              title = finding['Title'].lower()
+              
+              try:
+                  # Security Group remediation
+                  if 'security group' in title and ('open' in title or '0.0.0.0/0' in title):
+                      return remediate_security_group(finding, resources)
+                  
+                  # S3 bucket policy remediation
+                  elif 's3' in title and 'public' in title:
+                      return remediate_s3_bucket(finding, resources)
+                  
+                  # IAM policy remediation (limited scope)
+                  elif 'iam' in title and 'policy' in title:
+                      return remediate_iam_policy(finding, resources)
+                  
+                  # Default action for other findings
+                  else:
+                      return {
+                          'action': 'MANUAL_REVIEW_REQUIRED',
+                          'status': 'PENDING',
+                          'message': 'Finding requires manual investigation'
+                      }
+                      
+              except Exception as e:
+                  return {
+                      'action': 'REMEDIATION_FAILED',
+                      'status': 'ERROR',
+                      'message': str(e)
+                  }
+          
+          def remediate_security_group(finding, resources):
+              """Remediate overly permissive security group rules"""
+              for resource in resources:
+                  if resource['Type'] == 'AwsEc2SecurityGroup':
+                      sg_id = resource['Id'].split('/')[-1]
+                      
+                      try:
+                          # Get security group details
+                          response = ec2.describe_security_groups(GroupIds=[sg_id])
+                          sg = response['SecurityGroups'][0]
+                          
+                          # Remove overly permissive rules (0.0.0.0/0)
+                          rules_modified = 0
+                          for rule in sg.get('IpPermissions', []):
+                              for ip_range in rule.get('IpRanges', []):
+                                  if ip_range.get('CidrIp') == '0.0.0.0/0':
+                                      # Only modify HTTP/HTTPS and SSH ports for safety
+                                      if rule.get('FromPort') in [22, 80, 443, 3389]:
+                                          try:
+                                              ec2.revoke_security_group_ingress(
+                                                  GroupId=sg_id,
+                                                  IpPermissions=[rule]
+                                              )
+                                              rules_modified += 1
+                                              logger.info(f"Removed permissive rule for port {rule.get('FromPort')} from {sg_id}")
+                                          except Exception as e:
+                                              logger.warning(f"Failed to remove rule: {str(e)}")
+                          
+                          if rules_modified > 0:
+                              # Tag the security group for audit trail
+                              ec2.create_tags(
+                                  Resources=[sg_id],
+                                  Tags=[
+                                      {
+                                          'Key': 'AutoRemediated',
+                                          'Value': 'true'
+                                      },
+                                      {
+                                          'Key': 'RemediationDate',
+                                          'Value': datetime.utcnow().isoformat()
+                                      }
+                                  ]
+                              )
+                              
+                              return {
+                                  'action': 'SECURITY_GROUP_RESTRICTED',
+                                  'status': 'SUCCESS',
+                                  'message': f'Restricted {rules_modified} permissive rules in security group {sg_id}'
+                              }
+                          else:
+                              return {
+                                  'action': 'SECURITY_GROUP_NO_CHANGES',
+                                  'status': 'SUCCESS',
+                                  'message': f'No permissive rules found to remediate in security group {sg_id}'
+                              }
+                              
+                      except Exception as e:
+                          logger.error(f"Error remediating security group {sg_id}: {str(e)}")
+                          return {
+                              'action': 'SECURITY_GROUP_REMEDIATION_FAILED',
+                              'status': 'ERROR',
+                              'message': str(e)
+                          }
+              
+              return {
+                  'action': 'NO_SECURITY_GROUP_FOUND',
+                  'status': 'SKIPPED',
+                  'message': 'No security group resource found in finding'
+              }
+          
+          def remediate_s3_bucket(finding, resources):
+              """Remediate public S3 bucket access"""
+              for resource in resources:
+                  if resource['Type'] == 'AwsS3Bucket':
+                      bucket_name = resource['Id'].split('/')[-1]
+                      
+                      try:
+                          # Apply public access block
+                          s3.put_public_access_block(
+                              Bucket=bucket_name,
+                              PublicAccessBlockConfiguration={
+                                  'BlockPublicAcls': True,
+                                  'IgnorePublicAcls': True,
+                                  'BlockPublicPolicy': True,
+                                  'RestrictPublicBuckets': True
+                              }
+                          )
+                          
+                          return {
+                              'action': 'S3_BUCKET_SECURED',
+                              'status': 'SUCCESS',
+                              'message': f'Applied public access block to bucket {bucket_name}'
+                          }
+                          
+                      except Exception as e:
+                          logger.error(f"Error securing S3 bucket {bucket_name}: {str(e)}")
+                          return {
+                              'action': 'S3_BUCKET_REMEDIATION_FAILED',
+                              'status': 'ERROR',
+                              'message': str(e)
+                          }
+              
+              return {
+                  'action': 'NO_S3_BUCKET_FOUND',
+                  'status': 'SKIPPED',
+                  'message': 'No S3 bucket resource found in finding'
+              }
+          
+          def remediate_iam_policy(finding, resources):
+              """Remediate overly permissive IAM policies (conservative approach)"""
+              # For security, IAM policy changes require manual review
+              return {
+                  'action': 'IAM_POLICY_REVIEW_REQUIRED',
+                  'status': 'PENDING',
+                  'message': 'IAM policy changes require manual review for security'
+              }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-remediation'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Automated security remediation'
+
+  # Lambda Function for Notifications
+  NotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-notification-${Environment}'
+      Description: 'Sends notifications for security incidents'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt IncidentResponseRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SecurityIncidentTopic
+          SLACK_WEBHOOK_URL: !Ref SlackWebhookUrl
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          import urllib3
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          sns = boto3.client('sns')
+          http = urllib3.PoolManager()
+          
+          def lambda_handler(event, context):
+              try:
+                  # Extract finding details
+                  finding = event['detail']['findings'][0]
+                  
+                  finding_id = finding['Id']
+                  severity = finding['Severity']['Label']
+                  title = finding['Title']
+                  description = finding['Description']
+                  account_id = finding['AwsAccountId']
+                  region = finding['Resources'][0]['Region'] if finding['Resources'] else os.environ.get('AWS_REGION', 'Unknown')
+                  
+                  logger.info(f"Sending notifications for finding {finding_id} with severity {severity}")
+                  
+                  # Create notification messages
+                  email_message = create_email_notification_message(finding, severity, title, description, account_id, region)
+                  slack_message = create_slack_notification_message(finding, severity, title, description, account_id, region)
+                  
+                  # Send SNS notification (email)
+                  sns_response = sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Message=email_message,
+                      Subject=f'Security Alert: {severity} - {title[:50]}{"..." if len(title) > 50 else ""}'
+                  )
+                  
+                  logger.info(f"SNS notification sent: {sns_response['MessageId']}")
+                  
+                  # Send Slack notification if webhook URL is provided
+                  slack_response = None
+                  slack_webhook_url = os.environ.get('SLACK_WEBHOOK_URL', '')
+                  if slack_webhook_url:
+                      try:
+                          slack_response = send_slack_notification(slack_webhook_url, slack_message, severity, title)
+                          logger.info("Slack notification sent successfully")
+                      except Exception as e:
+                          logger.warning(f"Failed to send Slack notification: {str(e)}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'messageId': sns_response['MessageId'],
+                          'finding': finding_id,
+                          'severity': severity,
+                          'slackSent': slack_response is not None
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error sending notification: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def create_email_notification_message(finding, severity, title, description, account_id, region):
+              """Create formatted email notification message"""
+              
+              # Determine escalation based on severity
+              escalation_icons = {
+                  'CRITICAL': '🔴 CRITICAL',
+                  'HIGH': '🟠 HIGH',
+                  'MEDIUM': '🟡 MEDIUM',
+                  'LOW': '🟢 LOW'
+              }
+              escalation_level = escalation_icons.get(severity, f'⚪ {severity}')
+              
+              # Extract resource information
+              resources = []
+              for resource in finding.get('Resources', []):
+                  resources.append(f"- {resource['Type']}: {resource['Id']}")
+              
+              resource_list = "\n".join(resources) if resources else "No specific resources identified"
+              
+              # Create comprehensive message
+              message = f"""{escalation_level} SECURITY INCIDENT ALERT
+
+======================================
+INCIDENT DETAILS
+======================================
+
+Finding ID: {finding['Id']}
+Severity: {severity}
+Title: {title}
+
+Account: {account_id}
+Region: {region}
+Timestamp: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC
+Environment: {os.environ.get('ENVIRONMENT', 'Unknown')}
+
+======================================
+DESCRIPTION
+======================================
+
+{description}
+
+======================================
+AFFECTED RESOURCES
+======================================
+
+{resource_list}
+
+======================================
+RECOMMENDED ACTIONS
+======================================
+
+1. Review the finding details in AWS Security Hub
+2. Investigate the affected resources immediately
+3. Apply necessary remediation steps
+4. Update the finding status when resolved
+5. Document lessons learned for future prevention
+
+======================================
+SECURITY HUB LINK
+======================================
+
+https://console.aws.amazon.com/securityhub/home?region={region}#/findings
+
+======================================
+ADDITIONAL INFORMATION
+======================================
+
+- Finding Type: {finding.get('Types', ['Unknown'])[0] if finding.get('Types') else 'Unknown'}
+- Product: {finding.get('ProductName', 'Unknown')}
+- Compliance Status: {finding.get('Compliance', {}).get('Status', 'Unknown')}
+
+This is an automated alert from AWS Security Hub Incident Response System.
+For urgent issues, contact the security team immediately.
+"""
+              
+              return message
+          
+          def create_slack_notification_message(finding, severity, title, description, account_id, region):
+              """Create formatted Slack notification message"""
+              
+              # Determine color based on severity
+              color_map = {
+                  'CRITICAL': '#FF0000',  # Red
+                  'HIGH': '#FF8C00',      # Orange
+                  'MEDIUM': '#FFD700',    # Gold
+                  'LOW': '#32CD32'        # Green
+              }
+              color = color_map.get(severity, '#808080')  # Gray for unknown
+              
+              # Extract resource information
+              resource_list = []
+              for resource in finding.get('Resources', []):
+                  resource_list.append(f"• {resource['Type']}: `{resource['Id']}`")
+              
+              resources_text = "\n".join(resource_list) if resource_list else "No specific resources identified"
+              
+              # Create Slack message payload
+              message = {
+                  "attachments": [
+                      {
+                          "color": color,
+                          "title": f"🚨 Security Alert: {severity}",
+                          "title_link": f"https://console.aws.amazon.com/securityhub/home?region={region}#/findings",
+                          "fields": [
+                              {
+                                  "title": "Finding Title",
+                                  "value": title,
+                                  "short": False
+                              },
+                              {
+                                  "title": "Account",
+                                  "value": account_id,
+                                  "short": True
+                              },
+                              {
+                                  "title": "Region",
+                                  "value": region,
+                                  "short": True
+                              },
+                              {
+                                  "title": "Severity",
+                                  "value": severity,
+                                  "short": True
+                              },
+                              {
+                                  "title": "Environment",
+                                  "value": os.environ.get('ENVIRONMENT', 'Unknown'),
+                                  "short": True
+                              },
+                              {
+                                  "title": "Description",
+                                  "value": description[:500] + ("..." if len(description) > 500 else ""),
+                                  "short": False
+                              },
+                              {
+                                  "title": "Affected Resources",
+                                  "value": resources_text,
+                                  "short": False
+                              }
+                          ],
+                          "footer": "AWS Security Hub Incident Response",
+                          "ts": int(datetime.utcnow().timestamp())
+                      }
+                  ]
+              }
+              
+              return message
+          
+          def send_slack_notification(webhook_url, message, severity, title):
+              """Send notification to Slack via webhook"""
+              try:
+                  encoded_msg = json.dumps(message).encode('utf-8')
+                  resp = http.request('POST', webhook_url, body=encoded_msg, headers={'Content-Type': 'application/json'})
+                  
+                  if resp.status == 200:
+                      return {'status': 'success', 'response': resp.data.decode('utf-8')}
+                  else:
+                      raise Exception(f"Slack webhook returned status {resp.status}: {resp.data.decode('utf-8')}")
+                      
+              except Exception as e:
+                  raise Exception(f"Failed to send Slack notification: {str(e)}")
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-notification'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Security incident notifications'
+
+  # EventBridge Rule for Critical and High Severity Findings
+  CriticalHighFindingsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ResourcePrefix}-critical-high-findings-${Environment}'
+      Description: 'Triggers incident response for critical and high severity security findings'
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.securityhub
+        detail-type:
+          - Security Hub Findings - Imported
+        detail:
+          findings:
+            Severity:
+              Label:
+                - HIGH
+                - CRITICAL
+            RecordState:
+              - ACTIVE
+            WorkflowState:
+              - NEW
+      Targets:
+        - Arn: !GetAtt ClassificationFunction.Arn
+          Id: ClassificationTarget
+        - !If
+          - EnableAutoRemediation
+          - Arn: !GetAtt RemediationFunction.Arn
+            Id: RemediationTarget
+          - !Ref AWS::NoValue
+        - Arn: !GetAtt NotificationFunction.Arn
+          Id: NotificationTarget
+
+  # EventBridge Rule for Medium Severity Findings
+  MediumFindingsRule:
+    Type: AWS::Events::Rule
+    Condition: EnableAdvancedFeatures
+    Properties:
+      Name: !Sub '${ResourcePrefix}-medium-findings-${Environment}'
+      Description: 'Triggers classification and notifications for medium severity security findings'
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.securityhub
+        detail-type:
+          - Security Hub Findings - Imported
+        detail:
+          findings:
+            Severity:
+              Label:
+                - MEDIUM
+            RecordState:
+              - ACTIVE
+            WorkflowState:
+              - NEW
+      Targets:
+        - Arn: !GetAtt ClassificationFunction.Arn
+          Id: ClassificationTarget
+        - Arn: !GetAtt NotificationFunction.Arn
+          Id: NotificationTarget
+
+  # Lambda Permissions for EventBridge
+  ClassificationFunctionEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ClassificationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CriticalHighFindingsRule.Arn
+
+  RemediationFunctionEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableAutoRemediation
+    Properties:
+      FunctionName: !Ref RemediationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CriticalHighFindingsRule.Arn
+
+  NotificationFunctionEventBridgePermissionCriticalHigh:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotificationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CriticalHighFindingsRule.Arn
+
+  ClassificationFunctionEventBridgePermissionMedium:
+    Type: AWS::Lambda::Permission
+    Condition: EnableAdvancedFeatures
+    Properties:
+      FunctionName: !Ref ClassificationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MediumFindingsRule.Arn
+
+  NotificationFunctionEventBridgePermissionMedium:
+    Type: AWS::Lambda::Permission
+    Condition: EnableAdvancedFeatures
+    Properties:
+      FunctionName: !Ref NotificationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MediumFindingsRule.Arn
+
+  # Security Hub Custom Action for Manual Escalation
+  ManualEscalationAction:
+    Type: AWS::SecurityHub::ActionTarget
+    Properties:
+      Name: 'Escalate to Security Team'
+      Description: 'Manually escalate security finding to security team'
+      Id: 'escalate-to-security-team'
+
+  # EventBridge Rule for Manual Escalation
+  ManualEscalationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ResourcePrefix}-manual-escalation-${Environment}'
+      Description: 'Handles manual escalation of security findings'
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.securityhub
+        detail-type:
+          - Security Hub Findings - Custom Action
+        detail:
+          actionName:
+            - Escalate to Security Team
+      Targets:
+        - Arn: !GetAtt NotificationFunction.Arn
+          Id: ManualEscalationNotificationTarget
+
+  # Lambda Permission for Manual Escalation
+  NotificationFunctionManualEscalationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotificationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ManualEscalationRule.Arn
+
+  # Security Hub Insights for Incident Tracking
+  CriticalIncidentsInsight:
+    Type: AWS::SecurityHub::Insight
+    Properties:
+      Name: 'Critical Security Incidents'
+      Filters:
+        SeverityLabel:
+          - Value: 'CRITICAL'
+            Comparison: 'EQUALS'
+        RecordState:
+          - Value: 'ACTIVE'
+            Comparison: 'EQUALS'
+      GroupByAttribute: 'ProductName'
+
+  UnresolvedFindingsInsight:
+    Type: AWS::SecurityHub::Insight
+    Properties:
+      Name: 'Unresolved Security Findings'
+      Filters:
+        WorkflowStatus:
+          - Value: 'NEW'
+            Comparison: 'EQUALS'
+        RecordState:
+          - Value: 'ACTIVE'
+            Comparison: 'EQUALS'
+      GroupByAttribute: 'SeverityLabel'
+
+  # CloudWatch Log Groups for Lambda Functions
+  ClassificationFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}-classification-${Environment}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-classification-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  RemediationFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableAutoRemediation
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}-remediation-${Environment}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-remediation-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  NotificationFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}-notification-${Environment}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-notification-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  SecurityHubArn:
+    Description: 'ARN of the Security Hub'
+    Value: !If
+      - EnableSecurityHubCondition
+      - !Sub 'arn:aws:securityhub:${AWS::Region}:${AWS::AccountId}:hub/default'
+      - 'Security Hub not enabled'
+    Export:
+      Name: !Sub '${ResourcePrefix}-security-hub-arn-${Environment}'
+
+  SecurityIncidentTopicArn:
+    Description: 'ARN of the Security Incident SNS Topic'
+    Value: !Ref SecurityIncidentTopic
+    Export:
+      Name: !Sub '${ResourcePrefix}-incident-topic-arn-${Environment}'
+
+  ClassificationFunctionArn:
+    Description: 'ARN of the Classification Lambda Function'
+    Value: !GetAtt ClassificationFunction.Arn
+    Export:
+      Name: !Sub '${ResourcePrefix}-classification-function-arn-${Environment}'
+
+  RemediationFunctionArn:
+    Description: 'ARN of the Remediation Lambda Function'
+    Value: !If
+      - EnableAutoRemediation
+      - !GetAtt RemediationFunction.Arn
+      - 'Remediation function not enabled'
+    Export:
+      Name: !Sub '${ResourcePrefix}-remediation-function-arn-${Environment}'
+
+  NotificationFunctionArn:
+    Description: 'ARN of the Notification Lambda Function'
+    Value: !GetAtt NotificationFunction.Arn
+    Export:
+      Name: !Sub '${ResourcePrefix}-notification-function-arn-${Environment}'
+
+  IncidentResponseRoleArn:
+    Description: 'ARN of the Incident Response IAM Role'
+    Value: !GetAtt IncidentResponseRole.Arn
+    Export:
+      Name: !Sub '${ResourcePrefix}-incident-response-role-arn-${Environment}'
+
+  CriticalHighFindingsRuleArn:
+    Description: 'ARN of the Critical/High Findings EventBridge Rule'
+    Value: !GetAtt CriticalHighFindingsRule.Arn
+    Export:
+      Name: !Sub '${ResourcePrefix}-critical-high-rule-arn-${Environment}'
+
+  MediumFindingsRuleArn:
+    Description: 'ARN of the Medium Findings EventBridge Rule'
+    Value: !If
+      - EnableAdvancedFeatures
+      - !GetAtt MediumFindingsRule.Arn
+      - 'Medium findings rule not enabled'
+    Export:
+      Name: !Sub '${ResourcePrefix}-medium-rule-arn-${Environment}'
+
+  ManualEscalationActionArn:
+    Description: 'ARN of the Manual Escalation Custom Action'
+    Value: !Ref ManualEscalationAction
+    Export:
+      Name: !Sub '${ResourcePrefix}-manual-escalation-arn-${Environment}'
+
+  CriticalIncidentsInsightArn:
+    Description: 'ARN of the Critical Incidents Insight'
+    Value: !Ref CriticalIncidentsInsight
+    Export:
+      Name: !Sub '${ResourcePrefix}-critical-insights-arn-${Environment}'
+
+  UnresolvedFindingsInsightArn:
+    Description: 'ARN of the Unresolved Findings Insight'
+    Value: !Ref UnresolvedFindingsInsight
+    Export:
+      Name: !Sub '${ResourcePrefix}-unresolved-insights-arn-${Environment}'
+
+  SecurityHubConsoleUrl:
+    Description: 'URL to Security Hub Console'
+    Value: !Sub 'https://console.aws.amazon.com/securityhub/home?region=${AWS::Region}#/findings'
+
+  DeploymentSummary:
+    Description: 'Summary of deployed incident response capabilities'
+    Value: !Sub
+      - |
+        Deployed automated security incident response system with the following capabilities:
+        - Security Hub: ${SecurityHubStatus}
+        - Incident Response Level: ${IncidentResponseLevel}
+        - Auto-Remediation: ${AutoRemediationStatus}
+        - Email Notifications: Enabled (${NotificationEmail})
+        - Slack Notifications: ${SlackStatus}
+        - Manual Escalation: Enabled
+        - Security Insights: 2 insights created
+        - Event Rules: ${EventRulesCount} rules active
+      - SecurityHubStatus: !If [EnableSecurityHubCondition, 'Enabled', 'Not Enabled']
+        AutoRemediationStatus: !If [EnableAutoRemediation, 'Enabled', 'Disabled']
+        SlackStatus: !If [EnableSlackNotifications, 'Enabled', 'Disabled']
+        EventRulesCount: !If [EnableAdvancedFeatures, '3', '2']

@@ -1,0 +1,831 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'IoT Security with AWS IoT Device Defender - Comprehensive security monitoring for IoT fleets'
+
+# ============================================================================
+# METADATA
+# ============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - SecurityProfileName
+          - AlertEmailAddress
+          - EnableMLDetection
+          - EnableScheduledAudit
+      - Label:
+          default: "Behavioral Thresholds"
+        Parameters:
+          - MaxMessagesPerFiveMinutes
+          - MaxAuthorizationFailures
+          - MaxMessageByteSize
+          - MaxConnectionAttempts
+      - Label:
+          default: "Audit Configuration"
+        Parameters:
+          - AuditFrequency
+          - AuditDayOfWeek
+          - EnableAuditNotifications
+      - Label:
+          default: "Resource Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+    ParameterLabels:
+      SecurityProfileName:
+        default: "Security Profile Name"
+      AlertEmailAddress:
+        default: "Alert Email Address"
+      EnableMLDetection:
+        default: "Enable ML Detection"
+      EnableScheduledAudit:
+        default: "Enable Scheduled Audits"
+      MaxMessagesPerFiveMinutes:
+        default: "Max Messages (5 min)"
+      MaxAuthorizationFailures:
+        default: "Max Auth Failures (5 min)"
+      MaxMessageByteSize:
+        default: "Max Message Size (bytes)"
+      MaxConnectionAttempts:
+        default: "Max Connection Attempts (5 min)"
+      AuditFrequency:
+        default: "Audit Frequency"
+      AuditDayOfWeek:
+        default: "Audit Day of Week"
+      EnableAuditNotifications:
+        default: "Enable Audit Notifications"
+      Environment:
+        default: "Environment"
+      ProjectName:
+        default: "Project Name"
+
+# ============================================================================
+# PARAMETERS
+# ============================================================================
+Parameters:
+  # Security Configuration
+  SecurityProfileName:
+    Type: String
+    Default: 'IoTSecurityProfile'
+    Description: 'Name for the Device Defender security profile'
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: '[a-zA-Z0-9:_-]+'
+    ConstraintDescription: 'Security profile name must contain only alphanumeric characters, colons, underscores, and hyphens'
+
+  AlertEmailAddress:
+    Type: String
+    Description: 'Email address to receive security alerts'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  EnableMLDetection:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable machine learning-based anomaly detection'
+
+  EnableScheduledAudit:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable scheduled security audits'
+
+  # Behavioral Thresholds
+  MaxMessagesPerFiveMinutes:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 10000
+    Description: 'Maximum number of messages allowed per device in 5 minutes'
+
+  MaxAuthorizationFailures:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 100
+    Description: 'Maximum authorization failures allowed per device in 5 minutes'
+
+  MaxMessageByteSize:
+    Type: Number
+    Default: 1024
+    MinValue: 1
+    MaxValue: 262144
+    Description: 'Maximum message size in bytes (256KB limit)'
+
+  MaxConnectionAttempts:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    MaxValue: 1000
+    Description: 'Maximum connection attempts allowed per device in 5 minutes'
+
+  # Audit Configuration
+  AuditFrequency:
+    Type: String
+    Default: 'WEEKLY'
+    AllowedValues: ['DAILY', 'WEEKLY', 'BIWEEKLY', 'MONTHLY']
+    Description: 'Frequency of scheduled audits'
+
+  AuditDayOfWeek:
+    Type: String
+    Default: 'MON'
+    AllowedValues: ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT']
+    Description: 'Day of week for scheduled audits (only used for WEEKLY frequency)'
+
+  EnableAuditNotifications:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable SNS notifications for audit findings'
+
+  # Resource Configuration
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'test', 'staging', 'prod']
+    Description: 'Environment for resource naming and tagging'
+
+  ProjectName:
+    Type: String
+    Default: 'iot-security'
+    MinLength: 1
+    MaxLength: 32
+    AllowedPattern: '[a-z0-9-]+'
+    ConstraintDescription: 'Project name must contain only lowercase letters, numbers, and hyphens'
+    Description: 'Project name for resource naming and tagging'
+
+# ============================================================================
+# CONDITIONS
+# ============================================================================
+Conditions:
+  EnableMLDetectionCondition: !Equals [!Ref EnableMLDetection, 'true']
+  EnableScheduledAuditCondition: !Equals [!Ref EnableScheduledAudit, 'true']
+  EnableAuditNotificationsCondition: !Equals [!Ref EnableAuditNotifications, 'true']
+  WeeklyAuditCondition: !Equals [!Ref AuditFrequency, 'WEEKLY']
+
+# ============================================================================
+# RESOURCES
+# ============================================================================
+Resources:
+  # ========================================
+  # IAM ROLES AND POLICIES
+  # ========================================
+  
+  # IAM Role for Device Defender
+  DeviceDefenderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-device-defender-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSIoTDeviceDefenderAudit
+      Policies:
+        - PolicyName: DeviceDefenderSNSPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SecurityAlertsTopic
+              - Effect: Allow
+                Action:
+                  - iot:ListAuditFindings
+                  - iot:DescribeAuditTask
+                  - iot:ListAuditTasks
+                  - iot:ListViolationEvents
+                  - iot:DescribeSecurityProfile
+                  - iot:ListTargetsForSecurityProfile
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'iam-role'
+
+  # ========================================
+  # SNS TOPIC AND SUBSCRIPTION
+  # ========================================
+  
+  # SNS Topic for Security Alerts
+  SecurityAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-iot-security-alerts-${Environment}'
+      DisplayName: 'IoT Security Alerts'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'sns-topic'
+
+  # Email Subscription for Security Alerts
+  SecurityAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SecurityAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmailAddress
+
+  # ========================================
+  # CLOUDWATCH ALARMS
+  # ========================================
+  
+  # CloudWatch Alarm for Security Violations
+  SecurityViolationsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-iot-security-violations-${Environment}'
+      AlarmDescription: 'Alert on IoT Device Defender security violations'
+      MetricName: Violations
+      Namespace: AWS/IoT/DeviceDefender
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SecurityAlertsTopic
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'cloudwatch-alarm'
+
+  # CloudWatch Alarm for Audit Findings
+  AuditFindingsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAuditNotificationsCondition
+    Properties:
+      AlarmName: !Sub '${ProjectName}-iot-audit-findings-${Environment}'
+      AlarmDescription: 'Alert on IoT Device Defender audit findings'
+      MetricName: AuditFindings
+      Namespace: AWS/IoT/DeviceDefender
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SecurityAlertsTopic
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'cloudwatch-alarm'
+
+  # ========================================
+  # CUSTOM RESOURCES FOR IOT CONFIGURATIONS
+  # ========================================
+  
+  # Lambda Function for IoT Configuration
+  IoTConfigLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: IoTDeviceDefenderPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iot:CreateSecurityProfile
+                  - iot:DeleteSecurityProfile
+                  - iot:DescribeSecurityProfile
+                  - iot:UpdateSecurityProfile
+                  - iot:AttachSecurityProfile
+                  - iot:DetachSecurityProfile
+                  - iot:ListTargetsForSecurityProfile
+                  - iot:CreateScheduledAudit
+                  - iot:DeleteScheduledAudit
+                  - iot:DescribeScheduledAudit
+                  - iot:UpdateScheduledAudit
+                  - iot:UpdateAccountAuditConfiguration
+                  - iot:DescribeAccountAuditConfiguration
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'lambda-role'
+
+  # Lambda Function for IoT Device Defender Configuration
+  IoTConfigLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-iot-config-${Environment}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt IoTConfigLambdaRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          SECURITY_PROFILE_NAME: !Ref SecurityProfileName
+          SNS_TOPIC_ARN: !Ref SecurityAlertsTopic
+          IAM_ROLE_ARN: !GetAtt DeviceDefenderRole.Arn
+          MAX_MESSAGES: !Ref MaxMessagesPerFiveMinutes
+          MAX_AUTH_FAILURES: !Ref MaxAuthorizationFailures
+          MAX_MESSAGE_SIZE: !Ref MaxMessageByteSize
+          MAX_CONNECTIONS: !Ref MaxConnectionAttempts
+          ENABLE_ML: !Ref EnableMLDetection
+          AUDIT_FREQUENCY: !Ref AuditFrequency
+          AUDIT_DAY: !Ref AuditDayOfWeek
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import os
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          iot_client = boto3.client('iot')
+
+          def lambda_handler(event, context):
+              try:
+                  logger.info(f"Event: {json.dumps(event)}")
+                  
+                  request_type = event['RequestType']
+                  
+                  if request_type == 'Create':
+                      response_data = create_resources(event)
+                  elif request_type == 'Update':
+                      response_data = update_resources(event)
+                  elif request_type == 'Delete':
+                      response_data = delete_resources(event)
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+          def create_resources(event):
+              # Configure audit settings
+              configure_audit_settings()
+              
+              # Create security profile
+              security_profile_arn = create_security_profile()
+              
+              # Create ML security profile if enabled
+              ml_profile_arn = None
+              if os.environ['ENABLE_ML'].lower() == 'true':
+                  ml_profile_arn = create_ml_security_profile()
+              
+              # Attach security profiles
+              attach_security_profiles()
+              
+              # Create scheduled audit if enabled
+              audit_name = None
+              if os.environ.get('AUDIT_FREQUENCY'):
+                  audit_name = create_scheduled_audit()
+              
+              return {
+                  'SecurityProfileArn': security_profile_arn,
+                  'MLProfileArn': ml_profile_arn or 'Not created',
+                  'ScheduledAuditName': audit_name or 'Not created'
+              }
+
+          def update_resources(event):
+              # For updates, recreate the resources
+              return create_resources(event)
+
+          def delete_resources(event):
+              # Detach and delete security profiles
+              try:
+                  detach_security_profiles()
+                  delete_security_profiles()
+                  delete_scheduled_audit()
+              except Exception as e:
+                  logger.warning(f"Error during cleanup: {str(e)}")
+              
+              return {'Status': 'Deleted'}
+
+          def configure_audit_settings():
+              try:
+                  iot_client.update_account_audit_configuration(
+                      roleArn=os.environ['IAM_ROLE_ARN'],
+                      auditNotificationTargetConfigurations={
+                          'SNS': {
+                              'targetArn': os.environ['SNS_TOPIC_ARN'],
+                              'roleArn': os.environ['IAM_ROLE_ARN'],
+                              'enabled': True
+                          }
+                      },
+                      auditCheckConfigurations={
+                          'AUTHENTICATED_COGNITO_ROLE_OVERLY_PERMISSIVE_CHECK': {'enabled': True},
+                          'CA_CERTIFICATE_EXPIRING_CHECK': {'enabled': True},
+                          'CONFLICTING_CLIENT_IDS_CHECK': {'enabled': True},
+                          'DEVICE_CERTIFICATE_EXPIRING_CHECK': {'enabled': True},
+                          'DEVICE_CERTIFICATE_SHARED_CHECK': {'enabled': True},
+                          'IOT_POLICY_OVERLY_PERMISSIVE_CHECK': {'enabled': True},
+                          'LOGGING_DISABLED_CHECK': {'enabled': True},
+                          'REVOKED_CA_CERTIFICATE_STILL_ACTIVE_CHECK': {'enabled': True},
+                          'REVOKED_DEVICE_CERTIFICATE_STILL_ACTIVE_CHECK': {'enabled': True},
+                          'UNAUTHENTICATED_COGNITO_ROLE_OVERLY_PERMISSIVE_CHECK': {'enabled': True}
+                      }
+                  )
+                  logger.info("Audit configuration updated successfully")
+              except Exception as e:
+                  logger.error(f"Error configuring audit settings: {str(e)}")
+                  raise
+
+          def create_security_profile():
+              try:
+                  behaviors = [
+                      {
+                          'name': 'ExcessiveMessages',
+                          'metric': 'aws:num-messages-sent',
+                          'criteria': {
+                              'comparisonOperator': 'greater-than',
+                              'value': {'count': int(os.environ['MAX_MESSAGES'])},
+                              'durationSeconds': 300,
+                              'consecutiveDatapointsToAlarm': 1,
+                              'consecutiveDatapointsToClear': 1
+                          }
+                      },
+                      {
+                          'name': 'AuthorizationFailures',
+                          'metric': 'aws:num-authorization-failures',
+                          'criteria': {
+                              'comparisonOperator': 'greater-than',
+                              'value': {'count': int(os.environ['MAX_AUTH_FAILURES'])},
+                              'durationSeconds': 300,
+                              'consecutiveDatapointsToAlarm': 1,
+                              'consecutiveDatapointsToClear': 1
+                          }
+                      },
+                      {
+                          'name': 'LargeMessageSize',
+                          'metric': 'aws:message-byte-size',
+                          'criteria': {
+                              'comparisonOperator': 'greater-than',
+                              'value': {'count': int(os.environ['MAX_MESSAGE_SIZE'])},
+                              'consecutiveDatapointsToAlarm': 1,
+                              'consecutiveDatapointsToClear': 1
+                          }
+                      },
+                      {
+                          'name': 'UnusualConnectionAttempts',
+                          'metric': 'aws:num-connection-attempts',
+                          'criteria': {
+                              'comparisonOperator': 'greater-than',
+                              'value': {'count': int(os.environ['MAX_CONNECTIONS'])},
+                              'durationSeconds': 300,
+                              'consecutiveDatapointsToAlarm': 1,
+                              'consecutiveDatapointsToClear': 1
+                          }
+                      }
+                  ]
+                  
+                  response = iot_client.create_security_profile(
+                      securityProfileName=os.environ['SECURITY_PROFILE_NAME'],
+                      securityProfileDescription='Rule-based IoT security monitoring profile',
+                      behaviors=behaviors,
+                      alertTargets={
+                          'SNS': {
+                              'alertTargetArn': os.environ['SNS_TOPIC_ARN'],
+                              'roleArn': os.environ['IAM_ROLE_ARN']
+                          }
+                      },
+                      tags=[
+                          {'Key': 'Environment', 'Value': os.environ['ENVIRONMENT']},
+                          {'Key': 'Project', 'Value': os.environ['PROJECT_NAME']},
+                          {'Key': 'Component', 'Value': 'security-profile'},
+                          {'Key': 'Type', 'Value': 'rule-based'}
+                      ]
+                  )
+                  
+                  logger.info(f"Security profile created: {response['securityProfileArn']}")
+                  return response['securityProfileArn']
+                  
+              except Exception as e:
+                  logger.error(f"Error creating security profile: {str(e)}")
+                  raise
+
+          def create_ml_security_profile():
+              try:
+                  ml_behaviors = [
+                      {'name': 'MLMessagesReceived', 'metric': 'aws:num-messages-received'},
+                      {'name': 'MLMessagesSent', 'metric': 'aws:num-messages-sent'},
+                      {'name': 'MLConnectionAttempts', 'metric': 'aws:num-connection-attempts'},
+                      {'name': 'MLDisconnects', 'metric': 'aws:num-disconnects'}
+                  ]
+                  
+                  ml_profile_name = f"{os.environ['SECURITY_PROFILE_NAME']}-ML"
+                  
+                  response = iot_client.create_security_profile(
+                      securityProfileName=ml_profile_name,
+                      securityProfileDescription='Machine learning based threat detection',
+                      behaviors=ml_behaviors,
+                      alertTargets={
+                          'SNS': {
+                              'alertTargetArn': os.environ['SNS_TOPIC_ARN'],
+                              'roleArn': os.environ['IAM_ROLE_ARN']
+                          }
+                      },
+                      tags=[
+                          {'Key': 'Environment', 'Value': os.environ['ENVIRONMENT']},
+                          {'Key': 'Project', 'Value': os.environ['PROJECT_NAME']},
+                          {'Key': 'Component', 'Value': 'security-profile'},
+                          {'Key': 'Type', 'Value': 'ml-based'}
+                      ]
+                  )
+                  
+                  logger.info(f"ML security profile created: {response['securityProfileArn']}")
+                  return response['securityProfileArn']
+                  
+              except Exception as e:
+                  logger.error(f"Error creating ML security profile: {str(e)}")
+                  raise
+
+          def attach_security_profiles():
+              try:
+                  account_id = boto3.client('sts').get_caller_identity()['Account']
+                  region = boto3.Session().region_name
+                  target_arn = f"arn:aws:iot:{region}:{account_id}:all/registered-things"
+                  
+                  # Attach main security profile
+                  iot_client.attach_security_profile(
+                      securityProfileName=os.environ['SECURITY_PROFILE_NAME'],
+                      securityProfileTargetArn=target_arn
+                  )
+                  
+                  # Attach ML security profile if enabled
+                  if os.environ['ENABLE_ML'].lower() == 'true':
+                      ml_profile_name = f"{os.environ['SECURITY_PROFILE_NAME']}-ML"
+                      iot_client.attach_security_profile(
+                          securityProfileName=ml_profile_name,
+                          securityProfileTargetArn=target_arn
+                      )
+                  
+                  logger.info("Security profiles attached successfully")
+                  
+              except Exception as e:
+                  logger.error(f"Error attaching security profiles: {str(e)}")
+                  raise
+
+          def create_scheduled_audit():
+              try:
+                  audit_name = f"ScheduledAudit-{os.environ['PROJECT_NAME']}-{os.environ['ENVIRONMENT']}"
+                  
+                  audit_config = {
+                      'scheduledAuditName': audit_name,
+                      'frequency': os.environ['AUDIT_FREQUENCY'],
+                      'targetCheckNames': [
+                          'CA_CERTIFICATE_EXPIRING_CHECK',
+                          'DEVICE_CERTIFICATE_EXPIRING_CHECK',
+                          'DEVICE_CERTIFICATE_SHARED_CHECK',
+                          'IOT_POLICY_OVERLY_PERMISSIVE_CHECK',
+                          'CONFLICTING_CLIENT_IDS_CHECK'
+                      ],
+                      'tags': [
+                          {'Key': 'Environment', 'Value': os.environ['ENVIRONMENT']},
+                          {'Key': 'Project', 'Value': os.environ['PROJECT_NAME']},
+                          {'Key': 'Component', 'Value': 'scheduled-audit'}
+                      ]
+                  }
+                  
+                  if os.environ['AUDIT_FREQUENCY'] == 'WEEKLY':
+                      audit_config['dayOfWeek'] = os.environ['AUDIT_DAY']
+                  
+                  response = iot_client.create_scheduled_audit(**audit_config)
+                  logger.info(f"Scheduled audit created: {audit_name}")
+                  return audit_name
+                  
+              except Exception as e:
+                  logger.error(f"Error creating scheduled audit: {str(e)}")
+                  raise
+
+          def detach_security_profiles():
+              try:
+                  account_id = boto3.client('sts').get_caller_identity()['Account']
+                  region = boto3.Session().region_name
+                  target_arn = f"arn:aws:iot:{region}:{account_id}:all/registered-things"
+                  
+                  # Detach main security profile
+                  try:
+                      iot_client.detach_security_profile(
+                          securityProfileName=os.environ['SECURITY_PROFILE_NAME'],
+                          securityProfileTargetArn=target_arn
+                      )
+                  except:
+                      pass
+                  
+                  # Detach ML security profile
+                  try:
+                      ml_profile_name = f"{os.environ['SECURITY_PROFILE_NAME']}-ML"
+                      iot_client.detach_security_profile(
+                          securityProfileName=ml_profile_name,
+                          securityProfileTargetArn=target_arn
+                      )
+                  except:
+                      pass
+                  
+                  logger.info("Security profiles detached")
+                  
+              except Exception as e:
+                  logger.warning(f"Error detaching security profiles: {str(e)}")
+
+          def delete_security_profiles():
+              try:
+                  # Delete main security profile
+                  try:
+                      iot_client.delete_security_profile(
+                          securityProfileName=os.environ['SECURITY_PROFILE_NAME']
+                      )
+                  except:
+                      pass
+                  
+                  # Delete ML security profile
+                  try:
+                      ml_profile_name = f"{os.environ['SECURITY_PROFILE_NAME']}-ML"
+                      iot_client.delete_security_profile(
+                          securityProfileName=ml_profile_name
+                      )
+                  except:
+                      pass
+                  
+                  logger.info("Security profiles deleted")
+                  
+              except Exception as e:
+                  logger.warning(f"Error deleting security profiles: {str(e)}")
+
+          def delete_scheduled_audit():
+              try:
+                  audit_name = f"ScheduledAudit-{os.environ['PROJECT_NAME']}-{os.environ['ENVIRONMENT']}"
+                  iot_client.delete_scheduled_audit(scheduledAuditName=audit_name)
+                  logger.info("Scheduled audit deleted")
+              except:
+                  pass
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'lambda-function'
+
+  # Custom Resource to Configure IoT Device Defender
+  IoTDeviceDefenderConfig:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt IoTConfigLambdaFunction.Arn
+      SecurityProfileName: !Sub '${SecurityProfileName}-${Environment}'
+      Version: !Sub '${AWS::StackName}-${AWS::Region}'
+
+  # ========================================
+  # SCHEDULED AUDIT (if enabled)
+  # ========================================
+  
+  # This is handled by the Lambda function above
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+Outputs:
+  # SNS Topic Information
+  SecurityAlertsTopicArn:
+    Description: 'ARN of the SNS topic for security alerts'
+    Value: !Ref SecurityAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityAlertsTopicArn'
+
+  SecurityAlertsTopicName:
+    Description: 'Name of the SNS topic for security alerts'
+    Value: !GetAtt SecurityAlertsTopic.TopicName
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityAlertsTopicName'
+
+  # IAM Role Information
+  DeviceDefenderRoleArn:
+    Description: 'ARN of the Device Defender IAM role'
+    Value: !GetAtt DeviceDefenderRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DeviceDefenderRoleArn'
+
+  DeviceDefenderRoleName:
+    Description: 'Name of the Device Defender IAM role'
+    Value: !Ref DeviceDefenderRole
+    Export:
+      Name: !Sub '${AWS::StackName}-DeviceDefenderRoleName'
+
+  # Security Profile Information
+  SecurityProfileName:
+    Description: 'Name of the created security profile'
+    Value: !Sub '${SecurityProfileName}-${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityProfileName'
+
+  MLSecurityProfileName:
+    Condition: EnableMLDetectionCondition
+    Description: 'Name of the ML-based security profile'
+    Value: !Sub '${SecurityProfileName}-${Environment}-ML'
+    Export:
+      Name: !Sub '${AWS::StackName}-MLSecurityProfileName'
+
+  # CloudWatch Alarm Information
+  SecurityViolationsAlarmName:
+    Description: 'Name of the security violations CloudWatch alarm'
+    Value: !Ref SecurityViolationsAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityViolationsAlarmName'
+
+  AuditFindingsAlarmName:
+    Condition: EnableAuditNotificationsCondition
+    Description: 'Name of the audit findings CloudWatch alarm'
+    Value: !Ref AuditFindingsAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-AuditFindingsAlarmName'
+
+  # Lambda Function Information
+  IoTConfigLambdaFunctionArn:
+    Description: 'ARN of the IoT configuration Lambda function'
+    Value: !GetAtt IoTConfigLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTConfigLambdaFunctionArn'
+
+  # Configuration Information
+  MaxMessagesThreshold:
+    Description: 'Maximum messages threshold per 5 minutes'
+    Value: !Ref MaxMessagesPerFiveMinutes
+
+  MaxAuthFailuresThreshold:
+    Description: 'Maximum authorization failures threshold per 5 minutes'
+    Value: !Ref MaxAuthorizationFailures
+
+  MaxMessageSizeThreshold:
+    Description: 'Maximum message size threshold in bytes'
+    Value: !Ref MaxMessageByteSize
+
+  MaxConnectionAttemptsThreshold:
+    Description: 'Maximum connection attempts threshold per 5 minutes'
+    Value: !Ref MaxConnectionAttempts
+
+  # Audit Configuration
+  AuditFrequency:
+    Condition: EnableScheduledAuditCondition
+    Description: 'Configured audit frequency'
+    Value: !Ref AuditFrequency
+
+  AuditDayOfWeek:
+    Condition: WeeklyAuditCondition
+    Description: 'Configured audit day of week'
+    Value: !Ref AuditDayOfWeek
+
+  # Stack Information
+  StackName:
+    Description: 'Name of this CloudFormation stack'
+    Value: !Ref AWS::StackName
+
+  Environment:
+    Description: 'Environment for this deployment'
+    Value: !Ref Environment
+
+  ProjectName:
+    Description: 'Project name for this deployment'
+    Value: !Ref ProjectName
+
+  # Next Steps
+  NextSteps:
+    Description: 'Next steps for IoT Device Defender setup'
+    Value: |
+      1. Confirm email subscription for security alerts
+      2. Register IoT devices in AWS IoT Core
+      3. Monitor security violations in CloudWatch
+      4. Review audit findings when scheduled audits run
+      5. Adjust behavioral thresholds based on your device patterns

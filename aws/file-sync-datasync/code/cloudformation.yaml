@@ -1,0 +1,569 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for File System Sync with DataSync and EFS'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcCidr
+          - SubnetCidr
+          - AvailabilityZone
+      - Label:
+          default: "EFS Configuration"
+        Parameters:
+          - EfsPerformanceMode
+          - EfsThroughputMode
+          - EfsProvisionedThroughput
+          - EnableEfsEncryption
+      - Label:
+          default: "DataSync Configuration"
+        Parameters:
+          - SourceBucketName
+          - DataSyncTaskName
+          - EnableDataSyncLogging
+      - Label:
+          default: "Resource Tagging"
+        Parameters:
+          - Environment
+          - ProjectName
+    ParameterLabels:
+      VpcCidr:
+        default: "VPC CIDR Block"
+      SubnetCidr:
+        default: "Private Subnet CIDR Block"
+      AvailabilityZone:
+        default: "Availability Zone"
+      EfsPerformanceMode:
+        default: "EFS Performance Mode"
+      EfsThroughputMode:
+        default: "EFS Throughput Mode"
+      EfsProvisionedThroughput:
+        default: "EFS Provisioned Throughput (MiB/s)"
+      EnableEfsEncryption:
+        default: "Enable EFS Encryption"
+      SourceBucketName:
+        default: "Source S3 Bucket Name"
+      DataSyncTaskName:
+        default: "DataSync Task Name"
+      EnableDataSyncLogging:
+        default: "Enable DataSync CloudWatch Logging"
+      Environment:
+        default: "Environment"
+      ProjectName:
+        default: "Project Name"
+
+Parameters:
+  # Network Configuration
+  VpcCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: 'CIDR block for the VPC'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(/([0-9]|[1-2][0-9]|3[0-2]))$'
+    ConstraintDescription: 'Must be a valid CIDR block format'
+
+  SubnetCidr:
+    Type: String
+    Default: '10.0.1.0/24'
+    Description: 'CIDR block for the private subnet'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(/([0-9]|[1-2][0-9]|3[0-2]))$'
+    ConstraintDescription: 'Must be a valid CIDR block format'
+
+  AvailabilityZone:
+    Type: 'AWS::EC2::AvailabilityZone::Name'
+    Description: 'Availability Zone for the subnet'
+
+  # EFS Configuration
+  EfsPerformanceMode:
+    Type: String
+    Default: 'generalPurpose'
+    AllowedValues:
+      - 'generalPurpose'
+      - 'maxIO'
+    Description: 'Performance mode for the EFS file system'
+
+  EfsThroughputMode:
+    Type: String
+    Default: 'provisioned'
+    AllowedValues:
+      - 'bursting'
+      - 'provisioned'
+    Description: 'Throughput mode for the EFS file system'
+
+  EfsProvisionedThroughput:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 1024
+    Description: 'Provisioned throughput in MiB/s (only used if throughput mode is provisioned)'
+
+  EnableEfsEncryption:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable encryption at rest for EFS'
+
+  # DataSync Configuration
+  SourceBucketName:
+    Type: String
+    Description: 'Name of the source S3 bucket (leave empty to create a new bucket with sample data)'
+    Default: ''
+
+  DataSyncTaskName:
+    Type: String
+    Default: 'file-sync-task'
+    Description: 'Name for the DataSync task'
+    AllowedPattern: '^[a-zA-Z0-9\-_]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, hyphens, and underscores'
+
+  EnableDataSyncLogging:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable CloudWatch logging for DataSync'
+
+  # Resource Tagging
+  Environment:
+    Type: String
+    Default: 'development'
+    AllowedValues:
+      - 'development'
+      - 'staging'
+      - 'production'
+    Description: 'Environment name for resource tagging'
+
+  ProjectName:
+    Type: String
+    Default: 'datasync-efs-sync'
+    Description: 'Project name for resource tagging'
+    AllowedPattern: '^[a-zA-Z0-9\-_]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, hyphens, and underscores'
+
+Conditions:
+  # Condition to check if provisioned throughput should be set
+  UseProvisionedThroughput: !Equals [!Ref EfsThroughputMode, 'provisioned']
+  
+  # Condition to check if encryption should be enabled
+  EnableEncryption: !Equals [!Ref EnableEfsEncryption, 'true']
+  
+  # Condition to check if we should create a new S3 bucket
+  CreateNewBucket: !Equals [!Ref SourceBucketName, '']
+  
+  # Condition to check if DataSync logging should be enabled
+  EnableLogging: !Equals [!Ref EnableDataSyncLogging, 'true']
+
+Resources:
+  # VPC and Networking Resources
+  DataSyncVpc:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PrivateSubnet:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref DataSyncVpc
+      CidrBlock: !Ref SubnetCidr
+      AvailabilityZone: !Ref AvailabilityZone
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-subnet-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Security Group for EFS
+  EfsSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: !Sub '${ProjectName}-efs-sg-${Environment}'
+      GroupDescription: 'Security group for EFS access from DataSync'
+      VpcId: !Ref DataSyncVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          CidrIp: !Ref VpcCidr
+          Description: 'Allow NFS traffic from VPC'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: '0.0.0.0/0'
+          Description: 'Allow all outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-efs-sg-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # EFS File System
+  EfsFileSystem:
+    Type: 'AWS::EFS::FileSystem'
+    Properties:
+      CreationToken: !Sub '${ProjectName}-efs-${Environment}-${AWS::AccountId}'
+      PerformanceMode: !Ref EfsPerformanceMode
+      ThroughputMode: !Ref EfsThroughputMode
+      ProvisionedThroughputInMibps: !If
+        - UseProvisionedThroughput
+        - !Ref EfsProvisionedThroughput
+        - !Ref 'AWS::NoValue'
+      Encrypted: !If
+        - EnableEncryption
+        - true
+        - false
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-efs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # EFS Mount Target
+  EfsMountTarget:
+    Type: 'AWS::EFS::MountTarget'
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroups:
+        - !Ref EfsSecurityGroup
+
+  # S3 Bucket for source data (conditional)
+  SourceBucket:
+    Type: 'AWS::S3::Bucket'
+    Condition: CreateNewBucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-source-${AWS::AccountId}-${Environment}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-source-bucket-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for DataSync
+  DataSyncServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-DataSyncRole-${Environment}-${AWS::AccountId}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: datasync.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess'
+      Policies:
+        - PolicyName: DataSyncEfsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'elasticfilesystem:CreateAccessPoint'
+                  - 'elasticfilesystem:DeleteAccessPoint'
+                  - 'elasticfilesystem:DescribeAccessPoints'
+                  - 'elasticfilesystem:DescribeFileSystems'
+                Resource: !Sub 'arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:*'
+        - PolicyName: DataSyncLoggingAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DataSyncRole-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Group for DataSync (conditional)
+  DataSyncLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: !Sub '/aws/datasync/${ProjectName}-${Environment}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-datasync-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # DataSync S3 Location
+  DataSyncS3Location:
+    Type: 'AWS::DataSync::LocationS3'
+    Properties:
+      S3BucketArn: !If
+        - CreateNewBucket
+        - !GetAtt SourceBucket.Arn
+        - !Sub 'arn:aws:s3:::${SourceBucketName}'
+      S3Config:
+        BucketAccessRoleArn: !GetAtt DataSyncServiceRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-s3-location-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # DataSync EFS Location
+  DataSyncEfsLocation:
+    Type: 'AWS::DataSync::LocationEFS'
+    DependsOn: EfsMountTarget
+    Properties:
+      EfsFilesystemArn: !Sub 'arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/${EfsFileSystem}'
+      Ec2Config:
+        SubnetArn: !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${PrivateSubnet}'
+        SecurityGroupArns:
+          - !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${EfsSecurityGroup}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-efs-location-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # DataSync Task
+  DataSyncTask:
+    Type: 'AWS::DataSync::Task'
+    Properties:
+      Name: !Sub '${DataSyncTaskName}-${Environment}'
+      SourceLocationArn: !Ref DataSyncS3Location
+      DestinationLocationArn: !Ref DataSyncEfsLocation
+      CloudWatchLogGroupArn: !If
+        - EnableLogging
+        - !GetAtt DataSyncLogGroup.Arn
+        - !Ref 'AWS::NoValue'
+      Options:
+        VerifyMode: POINT_IN_TIME_CONSISTENT
+        OverwriteMode: ALWAYS
+        Atime: BEST_EFFORT
+        Mtime: PRESERVE
+        Uid: INT_VALUE
+        Gid: INT_VALUE
+        PreserveDeletedFiles: PRESERVE
+        PreserveDevices: NONE
+        PosixPermissions: PRESERVE
+        BytesPerSecond: -1
+        TaskQueueing: ENABLED
+        LogLevel: !If
+          - EnableLogging
+          - TRANSFER
+          - 'OFF'
+      Tags:
+        - Key: Name
+          Value: !Sub '${DataSyncTaskName}-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SNS Topic for notifications (optional enhancement)
+  NotificationTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      TopicName: !Sub '${ProjectName}-datasync-notifications-${Environment}'
+      DisplayName: !Sub '${ProjectName} DataSync Notifications'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-notifications-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarm for DataSync task failures
+  DataSyncTaskFailureAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${ProjectName}-DataSync-TaskFailure-${Environment}'
+      AlarmDescription: 'Alarm for DataSync task execution failures'
+      MetricName: 'TaskExecutionResultCode'
+      Namespace: 'AWS/DataSync'
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TaskId
+          Value: !Ref DataSyncTask
+      AlarmActions:
+        - !Ref NotificationTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-task-failure-alarm-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  # VPC and Network Outputs
+  VpcId:
+    Description: 'ID of the created VPC'
+    Value: !Ref DataSyncVpc
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+
+  PrivateSubnetId:
+    Description: 'ID of the private subnet'
+    Value: !Ref PrivateSubnet
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnetId'
+
+  EfsSecurityGroupId:
+    Description: 'ID of the EFS security group'
+    Value: !Ref EfsSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-EfsSecurityGroupId'
+
+  # EFS Outputs
+  EfsFileSystemId:
+    Description: 'ID of the EFS file system'
+    Value: !Ref EfsFileSystem
+    Export:
+      Name: !Sub '${AWS::StackName}-EfsFileSystemId'
+
+  EfsFileSystemArn:
+    Description: 'ARN of the EFS file system'
+    Value: !Sub 'arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/${EfsFileSystem}'
+    Export:
+      Name: !Sub '${AWS::StackName}-EfsFileSystemArn'
+
+  EfsMountTargetId:
+    Description: 'ID of the EFS mount target'
+    Value: !Ref EfsMountTarget
+    Export:
+      Name: !Sub '${AWS::StackName}-EfsMountTargetId'
+
+  EfsDnsName:
+    Description: 'DNS name for mounting the EFS file system'
+    Value: !Sub '${EfsFileSystem}.efs.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-EfsDnsName'
+
+  # S3 Outputs
+  SourceBucketName:
+    Description: 'Name of the source S3 bucket'
+    Value: !If
+      - CreateNewBucket
+      - !Ref SourceBucket
+      - !Ref SourceBucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-SourceBucketName'
+
+  SourceBucketArn:
+    Description: 'ARN of the source S3 bucket'
+    Value: !If
+      - CreateNewBucket
+      - !GetAtt SourceBucket.Arn
+      - !Sub 'arn:aws:s3:::${SourceBucketName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-SourceBucketArn'
+
+  # DataSync Outputs
+  DataSyncTaskArn:
+    Description: 'ARN of the DataSync task'
+    Value: !Ref DataSyncTask
+    Export:
+      Name: !Sub '${AWS::StackName}-DataSyncTaskArn'
+
+  DataSyncS3LocationArn:
+    Description: 'ARN of the DataSync S3 location'
+    Value: !Ref DataSyncS3Location
+    Export:
+      Name: !Sub '${AWS::StackName}-DataSyncS3LocationArn'
+
+  DataSyncEfsLocationArn:
+    Description: 'ARN of the DataSync EFS location'
+    Value: !Ref DataSyncEfsLocation
+    Export:
+      Name: !Sub '${AWS::StackName}-DataSyncEfsLocationArn'
+
+  DataSyncServiceRoleArn:
+    Description: 'ARN of the DataSync service role'
+    Value: !GetAtt DataSyncServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataSyncServiceRoleArn'
+
+  # Monitoring Outputs
+  NotificationTopicArn:
+    Description: 'ARN of the SNS notification topic'
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopicArn'
+
+  DataSyncLogGroupName:
+    Description: 'Name of the DataSync CloudWatch log group'
+    Value: !If
+      - EnableLogging
+      - !Ref DataSyncLogGroup
+      - 'Not created - logging disabled'
+    Export:
+      Name: !Sub '${AWS::StackName}-DataSyncLogGroupName'
+
+  # Instructions
+  MountCommand:
+    Description: 'Command to mount the EFS file system on an EC2 instance'
+    Value: !Sub 'sudo mount -t efs -o tls ${EfsFileSystem}:/ /mnt/efs'
+
+  DataSyncStartCommand:
+    Description: 'AWS CLI command to start the DataSync task'
+    Value: !Sub 'aws datasync start-task-execution --task-arn ${DataSyncTask}'
+
+  EstimatedCost:
+    Description: 'Estimated monthly cost breakdown (USD)'
+    Value: 'EFS Standard: $0.30/GB-month, DataSync: $0.0125/GB transferred, S3 Standard: $0.023/GB-month'

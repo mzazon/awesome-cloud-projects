@@ -1,0 +1,452 @@
+# Infrastructure Manager configuration for Edge-to-Cloud MLOps Pipelines
+# This template deploys a complete MLOps infrastructure spanning cloud and edge environments
+# using Google Distributed Cloud Edge, Vertex AI Pipelines, Cloud Storage, and Cloud Monitoring
+
+imports:
+  - path: gcp-types/storage-v1:buckets
+  - path: gcp-types/aiplatform-v1:projects.locations.models
+  - path: gcp-types/aiplatform-v1:projects.locations.experiments
+  - path: gcp-types/container-v1:projects.zones.clusters
+  - path: gcp-types/cloudfunctions-v1:projects.locations.functions
+  - path: gcp-types/monitoring-v1:projects.dashboards
+  - path: gcp-types/monitoring-v1:projects.alertPolicies
+  - path: gcp-types/iam-v1:projects.serviceAccounts
+  - path: gcp-types/cloudresourcemanager-v1:projects.iam
+
+resources:
+  # IAM Service Account for MLOps Pipeline
+  - name: mlops-pipeline-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: mlops-pipeline-sa
+      displayName: MLOps Pipeline Service Account
+      description: Service account for managing MLOps pipelines and edge deployments
+
+  # IAM Bindings for MLOps Service Account
+  - name: mlops-pipeline-iam-vertex-ai
+    type: gcp-types/cloudresourcemanager-v1:projects.iam
+    properties:
+      resource: $(ref.project-id)
+      policy:
+        bindings:
+          - role: roles/aiplatform.user
+            members:
+              - serviceAccount:$(ref.mlops-pipeline-service-account.email)
+          - role: roles/storage.admin
+            members:
+              - serviceAccount:$(ref.mlops-pipeline-service-account.email)
+          - role: roles/container.developer
+            members:
+              - serviceAccount:$(ref.mlops-pipeline-service-account.email)
+          - role: roles/monitoring.editor
+            members:
+              - serviceAccount:$(ref.mlops-pipeline-service-account.email)
+
+  # Cloud Storage Bucket for MLOps Artifacts
+  - name: mlops-artifacts-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: mlops-artifacts-$(ref.random-suffix)
+      location: $(ref.region)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90
+              isLive: false
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+              matchesStorageClass:
+                - STANDARD
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      labels:
+        purpose: mlops-artifacts
+        environment: production
+        managed-by: infrastructure-manager
+
+  # Cloud Storage Bucket for Edge Model Distribution
+  - name: edge-models-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: edge-models-$(ref.random-suffix)
+      location: $(ref.region)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 180
+              isLive: false
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 60
+              matchesStorageClass:
+                - STANDARD
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      labels:
+        purpose: edge-model-distribution
+        environment: production
+        managed-by: infrastructure-manager
+
+  # Vertex AI Model Registry Entry
+  - name: edge-inference-model
+    type: gcp-types/aiplatform-v1:projects.locations.models
+    properties:
+      parent: projects/$(ref.project-id)/locations/$(ref.region)
+      displayName: edge-inference-model
+      description: Edge inference model for distributed deployment across Google Distributed Cloud Edge
+      metadata:
+        framework: scikit-learn
+        version: "1.0"
+        targetPlatform: edge
+      labels:
+        model-type: classification
+        deployment-target: distributed-edge
+        managed-by: infrastructure-manager
+
+  # Vertex AI Experiment for Pipeline Tracking
+  - name: edge-mlops-experiment
+    type: gcp-types/aiplatform-v1:projects.locations.experiments
+    properties:
+      parent: projects/$(ref.project-id)/locations/$(ref.region)
+      displayName: Edge MLOps Pipeline Experiment
+      description: Experiment tracking for edge-to-cloud MLOps pipeline executions
+      metadata:
+        pipeline-type: edge-mlops
+        environment: production
+      labels:
+        purpose: experiment-tracking
+        managed-by: infrastructure-manager
+
+  # GKE Cluster for Edge Simulation and Development
+  - name: edge-simulation-cluster
+    type: gcp-types/container-v1:projects.zones.clusters
+    properties:
+      zone: $(ref.zone)
+      cluster:
+        name: edge-simulation-cluster-$(ref.random-suffix)
+        description: GKE cluster simulating distributed edge environments for MLOps development
+        initialNodeCount: 3
+        nodeConfig:
+          machineType: e2-standard-4
+          diskSizeGb: 50
+          diskType: pd-ssd
+          oauthScopes:
+            - https://www.googleapis.com/auth/cloud-platform
+          serviceAccount: $(ref.mlops-pipeline-service-account.email)
+          labels:
+            purpose: edge-simulation
+            managed-by: infrastructure-manager
+        # Enable autoscaling for cost optimization
+        nodePools:
+          - name: default-pool
+            config:
+              machineType: e2-standard-4
+              diskSizeGb: 50
+              diskType: pd-ssd
+              oauthScopes:
+                - https://www.googleapis.com/auth/cloud-platform
+              serviceAccount: $(ref.mlops-pipeline-service-account.email)
+            initialNodeCount: 3
+            autoscaling:
+              enabled: true
+              minNodeCount: 1
+              maxNodeCount: 5
+        # Enable cluster features for MLOps workloads
+        addonsConfig:
+          horizontalPodAutoscaling:
+            disabled: false
+          httpLoadBalancing:
+            disabled: false
+          networkPolicyConfig:
+            disabled: false
+        # Enable Workload Identity for secure pod authentication
+        workloadIdentityConfig:
+          workloadPool: $(ref.project-id).svc.id.goog
+        # Enable monitoring and logging
+        monitoringConfig:
+          enableComponents:
+            - SYSTEM_COMPONENTS
+            - WORKLOADS
+        loggingConfig:
+          enableComponents:
+            - SYSTEM_COMPONENTS
+            - WORKLOADS
+        # Network configuration for security
+        ipAllocationPolicy:
+          useIpAliases: true
+        networkPolicy:
+          enabled: true
+        # Enable maintenance window for updates
+        maintenancePolicy:
+          window:
+            recurringWindow:
+              window:
+                startTime: "2025-01-01T02:00:00Z"
+                endTime: "2025-01-01T06:00:00Z"
+              recurrence: FREQ=WEEKLY;BYDAY=SU
+        # Resource labels for cost tracking
+        resourceLabels:
+          purpose: edge-simulation
+          environment: development
+          managed-by: infrastructure-manager
+
+  # Cloud Function for Automated Model Updates
+  - name: edge-model-updater-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project-id)/locations/$(ref.region)
+      function:
+        name: edge-model-updater-$(ref.random-suffix)
+        description: Automated model update function for edge deployments
+        sourceArchiveUrl: gs://$(ref.mlops-artifacts-bucket.name)/functions/edge-model-updater.zip
+        entryPoint: update_edge_models
+        runtime: python39
+        timeout: 300s
+        availableMemoryMb: 512
+        serviceAccountEmail: $(ref.mlops-pipeline-service-account.email)
+        httpsTrigger: {}
+        environmentVariables:
+          PROJECT_ID: $(ref.project-id)
+          REGION: $(ref.region)
+          EDGE_MODELS_BUCKET: $(ref.edge-models-bucket.name)
+          MLOPS_BUCKET: $(ref.mlops-artifacts-bucket.name)
+        labels:
+          purpose: model-deployment
+          managed-by: infrastructure-manager
+
+  # Cloud Monitoring Dashboard for MLOps Observability
+  - name: mlops-monitoring-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      parent: projects/$(ref.project-id)
+      dashboard:
+        displayName: Edge MLOps Pipeline Dashboard
+        mosaicLayout:
+          tiles:
+            # Edge Inference Request Rate Chart
+            - width: 6
+              height: 4
+              widget:
+                title: Edge Inference Request Rate
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: resource.type="k8s_container" AND resource.labels.container_name="inference-server"
+                          aggregation:
+                            alignmentPeriod: 60s
+                            perSeriesAligner: ALIGN_RATE
+                            crossSeriesReducer: REDUCE_SUM
+                            groupByFields:
+                              - resource.labels.namespace_name
+                      plotType: LINE
+                  timeshiftDuration: 0s
+                  yAxis:
+                    label: Requests/second
+                    scale: LINEAR
+            # Model Prediction Latency Chart
+            - width: 6
+              height: 4
+              xPos: 6
+              widget:
+                title: Model Prediction Latency
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: resource.type="k8s_container" AND metric.type="custom.googleapis.com/inference/latency"
+                          aggregation:
+                            alignmentPeriod: 60s
+                            perSeriesAligner: ALIGN_MEAN
+                            crossSeriesReducer: REDUCE_MEAN
+                            groupByFields:
+                              - resource.labels.namespace_name
+                      plotType: LINE
+                  timeshiftDuration: 0s
+                  yAxis:
+                    label: Latency (ms)
+                    scale: LINEAR
+            # Model Accuracy Scorecard
+            - width: 3
+              height: 2
+              yPos: 4
+              widget:
+                title: Current Model Accuracy
+                scorecard:
+                  timeSeriesQuery:
+                    timeSeriesFilter:
+                      filter: resource.type="global" AND metric.type="custom.googleapis.com/model/accuracy"
+                      aggregation:
+                        alignmentPeriod: 300s
+                        perSeriesAligner: ALIGN_MEAN
+                  sparkChartView:
+                    sparkChartType: SPARK_LINE
+            # Edge Locations Status
+            - width: 3
+              height: 2
+              xPos: 3
+              yPos: 4
+              widget:
+                title: Active Edge Locations
+                scorecard:
+                  timeSeriesQuery:
+                    timeSeriesFilter:
+                      filter: resource.type="k8s_container" AND metric.type="kubernetes.io/container/uptime"
+                      aggregation:
+                        alignmentPeriod: 300s
+                        perSeriesAligner: ALIGN_COUNT
+                        crossSeriesReducer: REDUCE_COUNT
+        labels:
+          purpose: mlops-monitoring
+          managed-by: infrastructure-manager
+
+  # Alert Policy for Edge Service Health
+  - name: edge-service-health-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(ref.project-id)
+      alertPolicy:
+        displayName: Edge Inference Service Health Alert
+        documentation:
+          content: "Alert when edge inference services are not responding to health checks"
+          mimeType: text/markdown
+        conditions:
+          - displayName: Edge service health check failure
+            conditionThreshold:
+              filter: resource.type="k8s_container" AND resource.labels.container_name="inference-server"
+              comparison: COMPARISON_LESS_THAN
+              thresholdValue: 1
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_COUNT
+                  groupByFields:
+                    - resource.labels.namespace_name
+        combiner: OR
+        enabled: true
+        alertStrategy:
+          autoClose: 1800s
+        labels:
+          severity: high
+          component: edge-inference
+          managed-by: infrastructure-manager
+
+  # Alert Policy for Model Performance Degradation
+  - name: model-performance-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(ref.project-id)
+      alertPolicy:
+        displayName: Model Performance Degradation Alert
+        documentation:
+          content: "Alert when model accuracy drops below acceptable thresholds"
+          mimeType: text/markdown
+        conditions:
+          - displayName: Model accuracy below threshold
+            conditionThreshold:
+              filter: resource.type="global" AND metric.type="custom.googleapis.com/model/accuracy"
+              comparison: COMPARISON_LESS_THAN
+              thresholdValue: 0.85
+              duration: 600s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_MEAN
+        combiner: OR
+        enabled: true
+        alertStrategy:
+          autoClose: 3600s
+        labels:
+          severity: medium
+          component: model-performance
+          managed-by: infrastructure-manager
+
+# Template variables for customization
+variables:
+  - name: project-id
+    description: Google Cloud Project ID for resource deployment
+    type: string
+    default: "my-mlops-project"
+
+  - name: region
+    description: Google Cloud region for resource deployment
+    type: string
+    default: "us-central1"
+
+  - name: zone
+    description: Google Cloud zone for zonal resources
+    type: string
+    default: "us-central1-a"
+
+  - name: random-suffix
+    description: Random suffix for unique resource naming
+    type: string
+    default: "abc123"
+
+# Outputs for integration and validation
+outputs:
+  - name: mlops-artifacts-bucket-name
+    description: Name of the MLOps artifacts storage bucket
+    value: $(ref.mlops-artifacts-bucket.name)
+
+  - name: edge-models-bucket-name
+    description: Name of the edge models distribution bucket
+    value: $(ref.edge-models-bucket.name)
+
+  - name: gke-cluster-name
+    description: Name of the GKE cluster for edge simulation
+    value: $(ref.edge-simulation-cluster.name)
+
+  - name: gke-cluster-endpoint
+    description: Endpoint of the GKE cluster
+    value: $(ref.edge-simulation-cluster.endpoint)
+
+  - name: vertex-ai-model-name
+    description: Display name of the Vertex AI model
+    value: $(ref.edge-inference-model.displayName)
+
+  - name: vertex-ai-experiment-name
+    description: Display name of the Vertex AI experiment
+    value: $(ref.edge-mlops-experiment.displayName)
+
+  - name: model-update-function-url
+    description: HTTP trigger URL for the model update function
+    value: $(ref.edge-model-updater-function.httpsTrigger.url)
+
+  - name: monitoring-dashboard-name
+    description: Name of the Cloud Monitoring dashboard
+    value: $(ref.mlops-monitoring-dashboard.displayName)
+
+  - name: service-account-email
+    description: Email of the MLOps pipeline service account
+    value: $(ref.mlops-pipeline-service-account.email)
+
+# Metadata for Infrastructure Manager
+metadata:
+  version: "1.0"
+  description: "Complete MLOps infrastructure for edge-to-cloud machine learning pipelines"
+  author: "Cloud Architecture Team"
+  tags:
+    - mlops
+    - edge-computing
+    - vertex-ai
+    - distributed-cloud
+    - kubernetes
+  documentation: "https://cloud.google.com/architecture/mlops-continuous-delivery-and-automation-pipelines-in-machine-learning"

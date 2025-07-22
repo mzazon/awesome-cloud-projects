@@ -1,0 +1,451 @@
+# Infrastructure Manager Configuration
+# Resource Tagging and Cost Allocation with Policy Simulator and Cloud Asset Inventory
+# This configuration deploys the complete infrastructure for automated resource tagging,
+# policy enforcement, and cost allocation analytics using Google Cloud services.
+
+imports:
+  - path: "modules/"
+
+resources:
+  # Enable required APIs for the solution
+  - name: enable-required-apis
+    type: gcp-types/serviceusage-v1:serviceusage.services.batchEnable
+    properties:
+      parent: projects/$(ref.project-id.value)
+      serviceIds:
+        - cloudasset.googleapis.com
+        - policysimulator.googleapis.com
+        - cloudfunctions.googleapis.com
+        - cloudbuild.googleapis.com
+        - bigquery.googleapis.com
+        - cloudbilling.googleapis.com
+        - orgpolicy.googleapis.com
+        - pubsub.googleapis.com
+        - storage-api.googleapis.com
+        - storage-component.googleapis.com
+
+  # Project ID reference for other resources
+  - name: project-id
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: $(env.PROJECT_ID)
+
+  # Random suffix for unique resource naming
+  - name: random-suffix
+    type: random.v1.id
+    properties:
+      byteLength: 3
+
+  # Pub/Sub topic for asset change notifications
+  - name: asset-changes-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project-id.projectId)/topics/asset-changes
+      topic: asset-changes
+    depends_on:
+      - enable-required-apis
+
+  # BigQuery dataset for cost allocation analytics
+  - name: cost-allocation-dataset
+    type: bigquery.v2.dataset
+    properties:
+      datasetId: cost_allocation_$(ref.random-suffix.hex)
+      projectId: $(ref.project-id.projectId)
+      location: us-central1
+      description: "Cost allocation and tagging analytics dataset"
+      labels:
+        purpose: cost-allocation
+        environment: production
+        department: finance
+        cost_center: fin-001
+    depends_on:
+      - enable-required-apis
+
+  # BigQuery table for tag compliance tracking
+  - name: tag-compliance-table
+    type: bigquery.v2.table
+    properties:
+      datasetId: $(ref.cost-allocation-dataset.datasetId)
+      projectId: $(ref.project-id.projectId)
+      tableId: tag_compliance
+      schema:
+        fields:
+          - name: resource_name
+            type: STRING
+            mode: REQUIRED
+            description: "Full resource name"
+          - name: resource_type
+            type: STRING
+            mode: REQUIRED
+            description: "GCP resource type"
+          - name: labels
+            type: JSON
+            mode: NULLABLE
+            description: "Resource labels as JSON"
+          - name: compliant
+            type: BOOLEAN
+            mode: REQUIRED
+            description: "Whether resource meets tagging requirements"
+          - name: timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "When compliance was checked"
+          - name: cost_center
+            type: STRING
+            mode: NULLABLE
+            description: "Cost center from labels"
+          - name: department
+            type: STRING
+            mode: NULLABLE
+            description: "Department from labels"
+          - name: environment
+            type: STRING
+            mode: NULLABLE
+            description: "Environment from labels"
+          - name: project_code
+            type: STRING
+            mode: NULLABLE
+            description: "Project code from labels"
+      description: "Tracks resource tag compliance over time"
+    depends_on:
+      - cost-allocation-dataset
+
+  # BigQuery table for cost allocation data
+  - name: cost-allocation-table
+    type: bigquery.v2.table
+    properties:
+      datasetId: $(ref.cost-allocation-dataset.datasetId)
+      projectId: $(ref.project-id.projectId)
+      tableId: cost_allocation
+      schema:
+        fields:
+          - name: billing_date
+            type: DATE
+            mode: REQUIRED
+            description: "Date of billing usage"
+          - name: project_id
+            type: STRING
+            mode: REQUIRED
+            description: "GCP project ID"
+          - name: service
+            type: STRING
+            mode: REQUIRED
+            description: "GCP service name"
+          - name: sku
+            type: STRING
+            mode: REQUIRED
+            description: "Service SKU description"
+          - name: cost
+            type: FLOAT
+            mode: REQUIRED
+            description: "Cost amount"
+          - name: currency
+            type: STRING
+            mode: REQUIRED
+            description: "Currency code"
+          - name: department
+            type: STRING
+            mode: NULLABLE
+            description: "Department for cost allocation"
+          - name: cost_center
+            type: STRING
+            mode: NULLABLE
+            description: "Cost center for chargeback"
+          - name: environment
+            type: STRING
+            mode: NULLABLE
+            description: "Environment classification"
+          - name: project_code
+            type: STRING
+            mode: NULLABLE
+            description: "Business project code"
+      description: "Stores cost allocation data with business metadata"
+    depends_on:
+      - cost-allocation-dataset
+
+  # Cloud Storage bucket for billing export and reporting
+  - name: billing-export-bucket
+    type: storage.v1.bucket
+    properties:
+      name: $(ref.project-id.projectId)-billing-export-$(ref.random-suffix.hex)
+      project: $(ref.project-id.projectId)
+      location: us-central1
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: false
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90
+              matchesStorageClass: [STANDARD]
+      labels:
+        purpose: billing-export
+        environment: production
+        department: finance
+        cost_center: fin-001
+    depends_on:
+      - enable-required-apis
+
+  # IAM service account for Cloud Functions
+  - name: function-service-account
+    type: iam.v1.serviceAccount
+    properties:
+      accountId: tag-compliance-sa-$(ref.random-suffix.hex)
+      projectId: $(ref.project-id.projectId)
+      displayName: "Tag Compliance Function Service Account"
+      description: "Service account for tag compliance monitoring Cloud Function"
+    depends_on:
+      - enable-required-apis
+
+  # IAM binding for BigQuery access
+  - name: function-bigquery-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.projectId)
+      role: roles/bigquery.dataEditor
+      member: serviceAccount:$(ref.function-service-account.email)
+    depends_on:
+      - function-service-account
+
+  # IAM binding for Asset Inventory access
+  - name: function-asset-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.projectId)
+      role: roles/cloudasset.viewer
+      member: serviceAccount:$(ref.function-service-account.email)
+    depends_on:
+      - function-service-account
+
+  # Cloud Asset Inventory feed for resource monitoring
+  - name: asset-inventory-feed
+    type: gcp-types/cloudasset-v1:feeds
+    properties:
+      parent: projects/$(ref.project-id.projectId)
+      feedId: resource-compliance-feed
+      feed:
+        assetTypes:
+          - compute.googleapis.com/Instance
+          - storage.googleapis.com/Bucket
+          - container.googleapis.com/Cluster
+        contentType: RESOURCE
+        feedOutputConfig:
+          pubsubDestination:
+            topic: $(ref.asset-changes-topic.name)
+    depends_on:
+      - asset-changes-topic
+      - enable-required-apis
+
+  # Cloud Function for tag compliance monitoring
+  - name: tag-compliance-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/$(ref.project-id.projectId)/locations/us-central1
+      function:
+        name: projects/$(ref.project-id.projectId)/locations/us-central1/functions/tag-compliance-$(ref.random-suffix.hex)
+        description: "Monitors resource tag compliance and updates BigQuery"
+        sourceArchiveUrl: gs://$(ref.billing-export-bucket.name)/function-source.zip
+        entryPoint: process_asset_change
+        runtime: python311
+        timeout: 60s
+        availableMemoryMb: 256
+        eventTrigger:
+          eventType: providers/cloud.pubsub/eventTypes/topic.publish
+          resource: $(ref.asset-changes-topic.name)
+        serviceAccountEmail: $(ref.function-service-account.email)
+        environmentVariables:
+          PROJECT_ID: $(ref.project-id.projectId)
+          DATASET_NAME: $(ref.cost-allocation-dataset.datasetId)
+        labels:
+          purpose: tag-compliance
+          environment: production
+          department: engineering
+          cost_center: eng-001
+    depends_on:
+      - asset-changes-topic
+      - function-service-account
+      - cost-allocation-dataset
+      - billing-export-bucket
+
+  # Cloud Function for automated cost reporting
+  - name: cost-reporting-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/$(ref.project-id.projectId)/locations/us-central1
+      function:
+        name: projects/$(ref.project-id.projectId)/locations/us-central1/functions/cost-allocation-reporter-$(ref.random-suffix.hex)
+        description: "Generates automated cost allocation reports"
+        sourceArchiveUrl: gs://$(ref.billing-export-bucket.name)/reporting-function-source.zip
+        entryPoint: generate_cost_report
+        runtime: python311
+        timeout: 300s
+        availableMemoryMb: 512
+        httpsTrigger: {}
+        serviceAccountEmail: $(ref.function-service-account.email)
+        environmentVariables:
+          PROJECT_ID: $(ref.project-id.projectId)
+          DATASET_NAME: $(ref.cost-allocation-dataset.datasetId)
+          BUCKET_NAME: $(ref.billing-export-bucket.name)
+        labels:
+          purpose: cost-reporting
+          environment: production
+          department: finance
+          cost_center: fin-001
+    depends_on:
+      - function-service-account
+      - cost-allocation-dataset
+      - billing-export-bucket
+
+  # Cloud Scheduler job for weekly cost reports
+  - name: weekly-cost-report-schedule
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/$(ref.project-id.projectId)/locations/us-central1
+      job:
+        name: projects/$(ref.project-id.projectId)/locations/us-central1/jobs/weekly-cost-report-$(ref.random-suffix.hex)
+        description: "Triggers weekly cost allocation report generation"
+        schedule: "0 9 * * 1"  # Every Monday at 9 AM
+        timeZone: "America/New_York"
+        httpTarget:
+          uri: $(ref.cost-reporting-function.httpsTrigger.url)
+          httpMethod: GET
+    depends_on:
+      - cost-reporting-function
+
+  # BigQuery view for cost allocation summary
+  - name: cost-allocation-summary-view
+    type: bigquery.v2.table
+    properties:
+      datasetId: $(ref.cost-allocation-dataset.datasetId)
+      projectId: $(ref.project-id.projectId)
+      tableId: cost_allocation_summary
+      view:
+        query: |
+          SELECT
+            DATE(usage_start_time) as billing_date,
+            project.id as project_id,
+            service.description as service_name,
+            sku.description as sku_description,
+            SUM(cost) as total_cost,
+            currency,
+            labels.value as department,
+            tags.value as cost_center,
+            location.location as region,
+            COUNT(*) as resource_count
+          FROM `$(ref.project-id.projectId).$(ref.cost-allocation-dataset.datasetId).gcp_billing_export_v1_*`
+          WHERE
+            DATE(usage_start_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+            AND labels.key = 'department'
+            AND tags.key = 'cost_center'
+          GROUP BY
+            billing_date, project_id, service_name, sku_description,
+            currency, department, cost_center, region
+          ORDER BY
+            billing_date DESC, total_cost DESC
+        useLegacySql: false
+      description: "Summarizes cost allocation by department and cost center"
+    depends_on:
+      - cost-allocation-dataset
+
+  # BigQuery view for compliance summary
+  - name: compliance-summary-view
+    type: bigquery.v2.table
+    properties:
+      datasetId: $(ref.cost-allocation-dataset.datasetId)
+      projectId: $(ref.project-id.projectId)
+      tableId: compliance_summary
+      view:
+        query: |
+          SELECT
+            DATE(timestamp) as compliance_date,
+            resource_type,
+            department,
+            cost_center,
+            environment,
+            COUNT(*) as total_resources,
+            SUM(CASE WHEN compliant THEN 1 ELSE 0 END) as compliant_resources,
+            ROUND(100.0 * SUM(CASE WHEN compliant THEN 1 ELSE 0 END) / COUNT(*), 2) as compliance_percentage
+          FROM `$(ref.project-id.projectId).$(ref.cost-allocation-dataset.datasetId).tag_compliance`
+          WHERE
+            DATE(timestamp) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+          GROUP BY
+            compliance_date, resource_type, department, cost_center, environment
+          ORDER BY
+            compliance_date DESC, compliance_percentage ASC
+        useLegacySql: false
+      description: "Summarizes tag compliance across resources and departments"
+    depends_on:
+      - tag-compliance-table
+
+outputs:
+  # Essential information for setup and configuration
+  - name: project_id
+    description: "The GCP project ID where resources are deployed"
+    value: $(ref.project-id.projectId)
+
+  - name: dataset_name
+    description: "BigQuery dataset name for cost allocation analytics"
+    value: $(ref.cost-allocation-dataset.datasetId)
+
+  - name: billing_export_bucket
+    description: "Cloud Storage bucket for billing export and reports"
+    value: $(ref.billing-export-bucket.name)
+
+  - name: asset_feed_name
+    description: "Cloud Asset Inventory feed for resource monitoring"
+    value: $(ref.asset-inventory-feed.name)
+
+  - name: pubsub_topic
+    description: "Pub/Sub topic for asset change notifications"
+    value: $(ref.asset-changes-topic.name)
+
+  - name: tag_compliance_function_name
+    description: "Cloud Function for tag compliance monitoring"
+    value: $(ref.tag-compliance-function.name)
+
+  - name: cost_reporting_function_url
+    description: "HTTP URL for cost reporting function"
+    value: $(ref.cost-reporting-function.httpsTrigger.url)
+
+  - name: service_account_email
+    description: "Service account email for Cloud Functions"
+    value: $(ref.function-service-account.email)
+
+  - name: cost_allocation_view
+    description: "BigQuery view for cost allocation summary"
+    value: $(ref.project-id.projectId):$(ref.cost-allocation-dataset.datasetId).$(ref.cost-allocation-summary-view.tableId)
+
+  - name: compliance_summary_view
+    description: "BigQuery view for compliance summary"
+    value: $(ref.project-id.projectId):$(ref.cost-allocation-dataset.datasetId).$(ref.compliance-summary-view.tableId)
+
+  - name: next_steps
+    description: "Next configuration steps"
+    value: |
+      1. Configure Cloud Billing export to BigQuery dataset: $(ref.cost-allocation-dataset.datasetId)
+      2. Create organization policy constraints for mandatory tagging
+      3. Upload Cloud Function source code to: gs://$(ref.billing-export-bucket.name)/
+      4. Test tag compliance by creating resources with required labels
+      5. Access cost allocation reports through BigQuery or Looker Studio
+
+# Configuration metadata
+metadata:
+  version: "1.0"
+  description: "Infrastructure Manager configuration for resource tagging and cost allocation with Policy Simulator and Cloud Asset Inventory"
+  author: "Cloud Recipe Generator"
+  created_date: "2025-01-27"
+  last_updated: "2025-01-27"
+  tags:
+    - cost-allocation
+    - resource-tagging
+    - governance
+    - policy-enforcement
+    - billing-analytics
+    - cloud-asset-inventory
+    - policy-simulator
+  estimated_cost: "$5-15 per month"
+  deployment_time: "15-20 minutes"

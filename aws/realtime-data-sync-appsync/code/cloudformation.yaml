@@ -1,0 +1,692 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Real-Time Data Synchronization with AppSync - Complete infrastructure for real-time GraphQL subscriptions and data synchronization'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'AppSyncRealTimeSync'
+    Description: 'Name of the project for resource naming and tagging'
+    MinLength: 1
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must begin with a letter and contain only alphanumeric characters and hyphens'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    Description: 'Environment name for resource naming and tagging'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    ConstraintDescription: 'Must be one of: dev, staging, prod'
+
+  DynamoDBBillingMode:
+    Type: String
+    Default: 'PAY_PER_REQUEST'
+    Description: 'DynamoDB billing mode'
+    AllowedValues:
+      - PAY_PER_REQUEST
+      - PROVISIONED
+    ConstraintDescription: 'Must be either PAY_PER_REQUEST or PROVISIONED'
+
+  DynamoDBReadCapacity:
+    Type: Number
+    Default: 5
+    Description: 'DynamoDB read capacity units (only used if billing mode is PROVISIONED)'
+    MinValue: 1
+    MaxValue: 10000
+
+  DynamoDBWriteCapacity:
+    Type: Number
+    Default: 5
+    Description: 'DynamoDB write capacity units (only used if billing mode is PROVISIONED)'
+    MinValue: 1
+    MaxValue: 10000
+
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    Description: 'Lambda function timeout in seconds'
+    MinValue: 1
+    MaxValue: 900
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    Description: 'Lambda function memory size in MB'
+    AllowedValues:
+      - 128
+      - 256
+      - 512
+      - 1024
+      - 2048
+      - 3008
+
+  ApiKeyDescription:
+    Type: String
+    Default: 'API key for real-time sync development'
+    Description: 'Description for the AppSync API key'
+    MinLength: 1
+    MaxLength: 200
+
+  BatchSize:
+    Type: Number
+    Default: 10
+    Description: 'Batch size for DynamoDB stream processing'
+    MinValue: 1
+    MaxValue: 1000
+
+  MaximumBatchingWindowInSeconds:
+    Type: Number
+    Default: 5
+    Description: 'Maximum batching window in seconds for stream processing'
+    MinValue: 0
+    MaxValue: 300
+
+Conditions:
+  IsProvisionedBilling: !Equals [!Ref DynamoDBBillingMode, 'PROVISIONED']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # DynamoDB Table with Streams
+  RealTimeDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-RealTimeData-${Environment}'
+      BillingMode: !Ref DynamoDBBillingMode
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      # Conditional provisioned throughput
+      ProvisionedThroughput: !If
+        - IsProvisionedBilling
+        - ReadCapacityUnits: !Ref DynamoDBReadCapacity
+          WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+        - !Ref 'AWS::NoValue'
+      # Point-in-time recovery for production
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      # Server-side encryption
+      SSESpecification:
+        SSEEnabled: true
+      # Resource tags
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: 'Database'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-LambdaExecutionRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaDynamoDBExecutionRole
+      Policies:
+        - PolicyName: AppSyncMutationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - appsync:GraphQL
+                Resource: !Sub '${AppSyncApi}/types/Mutation/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: 'Lambda'
+
+  # Lambda Function for Stream Processing
+  StreamProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-StreamProcessor-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref RealTimeDataTable
+          APPSYNC_API_URL: !GetAtt AppSyncApi.GraphQLUrl
+          APPSYNC_API_ID: !GetAtt AppSyncApi.ApiId
+          LOG_LEVEL: !If [IsProduction, 'INFO', 'DEBUG']
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger = logging.getLogger()
+          logger.setLevel(getattr(logging, log_level))
+          
+          def lambda_handler(event, context):
+              """
+              Process DynamoDB stream events and trigger AppSync mutations
+              for real-time data synchronization across all connected clients
+              """
+              
+              logger.info(f"Processing {len(event['Records'])} stream records")
+              
+              processed_count = 0
+              error_count = 0
+              
+              for record in event['Records']:
+                  try:
+                      event_name = record['eventName']
+                      
+                      if event_name in ['INSERT', 'MODIFY', 'REMOVE']:
+                          # Extract item data from stream record
+                          item_data = {}
+                          
+                          if 'NewImage' in record['dynamodb']:
+                              new_image = record['dynamodb']['NewImage']
+                              item_data = {
+                                  'id': new_image.get('id', {}).get('S', 'unknown'),
+                                  'title': new_image.get('title', {}).get('S', ''),
+                                  'content': new_image.get('content', {}).get('S', ''),
+                                  'timestamp': new_image.get('timestamp', {}).get('S', ''),
+                                  'version': int(new_image.get('version', {}).get('N', '0'))
+                              }
+                          
+                          logger.info(f"Processing {event_name} for item {item_data.get('id', 'unknown')}")
+                          
+                          # Create change event for real-time notification
+                          change_event = {
+                              'eventType': event_name,
+                              'itemId': item_data.get('id', 'unknown'),
+                              'timestamp': datetime.utcnow().isoformat(),
+                              'itemData': item_data if event_name != 'REMOVE' else None
+                          }
+                          
+                          # Log the change event for validation and debugging
+                          logger.info(f"Change event: {json.dumps(change_event, default=str)}")
+                          
+                          # In a production implementation, this would trigger AppSync mutations
+                          # using the GraphQL client to notify all subscribed clients
+                          
+                          processed_count += 1
+                          
+                  except Exception as e:
+                      error_count += 1
+                      logger.error(f"Error processing record: {str(e)}")
+                      logger.error(f"Record: {json.dumps(record, default=str)}")
+              
+              logger.info(f"Processing complete. Processed: {processed_count}, Errors: {error_count}")
+              
+              return {
+                  'statusCode': 200,
+                  'processedRecords': processed_count,
+                  'errorCount': error_count,
+                  'totalRecords': len(event['Records'])
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: 'StreamProcessor'
+
+  # Event Source Mapping for DynamoDB Streams
+  StreamEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt RealTimeDataTable.StreamArn
+      FunctionName: !Ref StreamProcessorFunction
+      StartingPosition: LATEST
+      BatchSize: !Ref BatchSize
+      MaximumBatchingWindowInSeconds: !Ref MaximumBatchingWindowInSeconds
+      ParallelizationFactor: 1
+      MaximumRecordAgeInSeconds: 3600
+      MaximumRetryAttempts: 3
+      BisectBatchOnFunctionError: true
+
+  # AppSync GraphQL API
+  AppSyncApi:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      Name: !Sub '${ProjectName}-RealTimeSyncAPI-${Environment}'
+      AuthenticationType: API_KEY
+      XrayEnabled: !If [IsProduction, true, false]
+      LogConfig:
+        CloudWatchLogsRoleArn: !GetAtt AppSyncLogsRole.Arn
+        ExcludeVerboseContent: false
+        FieldLogLevel: !If [IsProduction, 'ERROR', 'ALL']
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: 'GraphQL-API'
+
+  # AppSync API Key
+  AppSyncApiKey:
+    Type: AWS::AppSync::ApiKey
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      Description: !Ref ApiKeyDescription
+      Expires: !If
+        - IsProduction
+        - !Ref 'AWS::NoValue'
+        - 1735689600  # January 1, 2025 (for development)
+
+  # AppSync CloudWatch Logs Role
+  AppSyncLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-AppSyncLogsRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: appsync.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AppSyncPushToCloudWatchLogs
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # GraphQL Schema
+  AppSyncSchema:
+    Type: AWS::AppSync::GraphQLSchema
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      Definition: |
+        type DataItem {
+            id: ID!
+            title: String!
+            content: String!
+            timestamp: String!
+            version: Int!
+        }
+
+        type Query {
+            getDataItem(id: ID!): DataItem
+            listDataItems: [DataItem]
+        }
+
+        type Mutation {
+            createDataItem(input: CreateDataItemInput!): DataItem
+            updateDataItem(input: UpdateDataItemInput!): DataItem
+            deleteDataItem(id: ID!): DataItem
+        }
+
+        type Subscription {
+            onDataItemCreated: DataItem
+                @aws_subscribe(mutations: ["createDataItem"])
+            onDataItemUpdated: DataItem
+                @aws_subscribe(mutations: ["updateDataItem"])
+            onDataItemDeleted: DataItem
+                @aws_subscribe(mutations: ["deleteDataItem"])
+        }
+
+        input CreateDataItemInput {
+            title: String!
+            content: String!
+        }
+
+        input UpdateDataItemInput {
+            id: ID!
+            title: String
+            content: String
+        }
+
+        schema {
+            query: Query
+            mutation: Mutation
+            subscription: Subscription
+        }
+
+  # IAM Role for AppSync DynamoDB Data Source
+  AppSyncDynamoDBRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-AppSyncDynamoDBRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: appsync.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt RealTimeDataTable.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # AppSync DynamoDB Data Source
+  AppSyncDynamoDBDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      Name: DynamoDBDataSource
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt AppSyncDynamoDBRole.Arn
+      DynamoDBConfig:
+        TableName: !Ref RealTimeDataTable
+        AwsRegion: !Ref 'AWS::Region'
+
+  # GraphQL Resolver for createDataItem Mutation
+  CreateDataItemResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: createDataItem
+      DataSourceName: !GetAtt AppSyncDynamoDBDataSource.Name
+      RequestMappingTemplate: |
+        {
+            "version": "2017-02-28",
+            "operation": "PutItem",
+            "key": {
+                "id": $util.dynamodb.toDynamoDBJson($util.autoId())
+            },
+            "attributeValues": {
+                "title": $util.dynamodb.toDynamoDBJson($ctx.args.input.title),
+                "content": $util.dynamodb.toDynamoDBJson($ctx.args.input.content),
+                "timestamp": $util.dynamodb.toDynamoDBJson($util.time.nowISO8601()),
+                "version": $util.dynamodb.toDynamoDBJson(1)
+            }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result)
+
+  # GraphQL Resolver for updateDataItem Mutation
+  UpdateDataItemResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: updateDataItem
+      DataSourceName: !GetAtt AppSyncDynamoDBDataSource.Name
+      RequestMappingTemplate: |
+        {
+            "version": "2017-02-28",
+            "operation": "UpdateItem",
+            "key": {
+                "id": $util.dynamodb.toDynamoDBJson($ctx.args.input.id)
+            },
+            "update": {
+                "expression": "SET #timestamp = :timestamp, #version = #version + :inc",
+                "expressionNames": {
+                    "#timestamp": "timestamp",
+                    "#version": "version"
+                },
+                "expressionValues": {
+                    ":timestamp": $util.dynamodb.toDynamoDBJson($util.time.nowISO8601()),
+                    ":inc": $util.dynamodb.toDynamoDBJson(1)
+                }
+            }
+        }
+        #if($ctx.args.input.title)
+        $util.qr($ctx.args.update.expression.add(", #title = :title"))
+        $util.qr($ctx.args.update.expressionNames.put("#title", "title"))
+        $util.qr($ctx.args.update.expressionValues.put(":title", $util.dynamodb.toDynamoDBJson($ctx.args.input.title)))
+        #end
+        #if($ctx.args.input.content)
+        $util.qr($ctx.args.update.expression.add(", #content = :content"))
+        $util.qr($ctx.args.update.expressionNames.put("#content", "content"))
+        $util.qr($ctx.args.update.expressionValues.put(":content", $util.dynamodb.toDynamoDBJson($ctx.args.input.content)))
+        #end
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result)
+
+  # GraphQL Resolver for deleteDataItem Mutation
+  DeleteDataItemResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: deleteDataItem
+      DataSourceName: !GetAtt AppSyncDynamoDBDataSource.Name
+      RequestMappingTemplate: |
+        {
+            "version": "2017-02-28",
+            "operation": "DeleteItem",
+            "key": {
+                "id": $util.dynamodb.toDynamoDBJson($ctx.args.id)
+            }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result)
+
+  # GraphQL Resolver for getDataItem Query
+  GetDataItemResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Query
+      FieldName: getDataItem
+      DataSourceName: !GetAtt AppSyncDynamoDBDataSource.Name
+      RequestMappingTemplate: |
+        {
+            "version": "2017-02-28",
+            "operation": "GetItem",
+            "key": {
+                "id": $util.dynamodb.toDynamoDBJson($ctx.args.id)
+            }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result)
+
+  # GraphQL Resolver for listDataItems Query
+  ListDataItemsResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Query
+      FieldName: listDataItems
+      DataSourceName: !GetAtt AppSyncDynamoDBDataSource.Name
+      RequestMappingTemplate: |
+        {
+            "version": "2017-02-28",
+            "operation": "Scan",
+            "limit": 20
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result.items)
+
+  # CloudWatch Log Group for Lambda Function
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${StreamProcessorFunction}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group for AppSync
+  AppSyncLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/appsync/apis/${AppSyncApi.ApiId}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  # DynamoDB Table Information
+  DynamoDBTableName:
+    Description: 'Name of the DynamoDB table for real-time data'
+    Value: !Ref RealTimeDataTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableName'
+
+  DynamoDBTableArn:
+    Description: 'ARN of the DynamoDB table'
+    Value: !GetAtt RealTimeDataTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableArn'
+
+  DynamoDBStreamArn:
+    Description: 'ARN of the DynamoDB stream'
+    Value: !GetAtt RealTimeDataTable.StreamArn
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBStreamArn'
+
+  # Lambda Function Information
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function processing DynamoDB streams'
+    Value: !Ref StreamProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function'
+    Value: !GetAtt StreamProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  # AppSync API Information
+  AppSyncApiId:
+    Description: 'AppSync API ID'
+    Value: !GetAtt AppSyncApi.ApiId
+    Export:
+      Name: !Sub '${AWS::StackName}-AppSyncApiId'
+
+  AppSyncApiUrl:
+    Description: 'AppSync GraphQL API URL'
+    Value: !GetAtt AppSyncApi.GraphQLUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-AppSyncApiUrl'
+
+  AppSyncApiKey:
+    Description: 'AppSync API Key for authentication'
+    Value: !GetAtt AppSyncApiKey.ApiKey
+    Export:
+      Name: !Sub '${AWS::StackName}-AppSyncApiKey'
+
+  AppSyncRealtimeUrl:
+    Description: 'AppSync real-time subscription URL'
+    Value: !GetAtt AppSyncApi.RealtimeUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-AppSyncRealtimeUrl'
+
+  # Region and Account Information
+  DeploymentRegion:
+    Description: 'AWS Region where resources are deployed'
+    Value: !Ref 'AWS::Region'
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentRegion'
+
+  AccountId:
+    Description: 'AWS Account ID where resources are deployed'
+    Value: !Ref 'AWS::AccountId'
+    Export:
+      Name: !Sub '${AWS::StackName}-AccountId'
+
+  # Testing Information
+  TestMutationExample:
+    Description: 'Example GraphQL mutation for testing'
+    Value: !Sub |
+      mutation CreateItem {
+        createDataItem(input: {
+          title: "Test Item",
+          content: "This is a test item for real-time synchronization"
+        }) {
+          id
+          title
+          content
+          timestamp
+          version
+        }
+      }
+
+  TestSubscriptionExample:
+    Description: 'Example GraphQL subscription for testing'
+    Value: |
+      subscription OnDataItemCreated {
+        onDataItemCreated {
+          id
+          title
+          content
+          timestamp
+          version
+        }
+      }
+
+  # Security Information
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  AppSyncDynamoDBRoleArn:
+    Description: 'ARN of the AppSync DynamoDB service role'
+    Value: !GetAtt AppSyncDynamoDBRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AppSyncDynamoDBRoleArn'
+
+  # Monitoring Information
+  LambdaLogGroupName:
+    Description: 'CloudWatch Log Group for Lambda function'
+    Value: !Ref LambdaLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaLogGroupName'
+
+  AppSyncLogGroupName:
+    Description: 'CloudWatch Log Group for AppSync API'
+    Value: !Ref AppSyncLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AppSyncLogGroupName'

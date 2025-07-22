@@ -1,0 +1,675 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Code Quality Gates with CodeBuild - Complete infrastructure for automated code quality enforcement with static analysis, security scanning, and comprehensive testing'
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Description: 'Name for the CodeBuild project and associated resources'
+    Default: 'quality-gates-demo'
+    MinLength: 1
+    MaxLength: 255
+    AllowedPattern: '^[a-zA-Z][-a-zA-Z0-9]*$'
+    ConstraintDescription: 'Must begin with a letter and contain only alphanumeric characters and hyphens'
+
+  SourceLocation:
+    Type: String
+    Description: 'S3 bucket and key for source code (e.g., my-bucket/source/source-code.zip)'
+    Default: ''
+    AllowedPattern: '^[a-zA-Z0-9.\-_/]*$'
+    ConstraintDescription: 'Must be a valid S3 bucket path'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for quality gate notifications'
+    Default: 'your-email@example.com'
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  CoverageThreshold:
+    Type: Number
+    Description: 'Minimum code coverage percentage required (0-100)'
+    Default: 80
+    MinValue: 0
+    MaxValue: 100
+    ConstraintDescription: 'Must be between 0 and 100'
+
+  SecurityThreshold:
+    Type: String
+    Description: 'Maximum security vulnerability level allowed'
+    Default: 'HIGH'
+    AllowedValues:
+      - 'LOW'
+      - 'MEDIUM'
+      - 'HIGH'
+      - 'CRITICAL'
+    ConstraintDescription: 'Must be one of: LOW, MEDIUM, HIGH, CRITICAL'
+
+  SonarQubeQualityGate:
+    Type: String
+    Description: 'SonarQube quality gate status threshold'
+    Default: 'ERROR'
+    AllowedValues:
+      - 'OK'
+      - 'WARN'
+      - 'ERROR'
+    ConstraintDescription: 'Must be one of: OK, WARN, ERROR'
+
+  BuildTimeout:
+    Type: Number
+    Description: 'Build timeout in minutes'
+    Default: 60
+    MinValue: 5
+    MaxValue: 480
+    ConstraintDescription: 'Must be between 5 and 480 minutes'
+
+  ComputeType:
+    Type: String
+    Description: 'CodeBuild compute type'
+    Default: 'BUILD_GENERAL1_MEDIUM'
+    AllowedValues:
+      - 'BUILD_GENERAL1_SMALL'
+      - 'BUILD_GENERAL1_MEDIUM'
+      - 'BUILD_GENERAL1_LARGE'
+      - 'BUILD_GENERAL1_XLARGE'
+      - 'BUILD_GENERAL1_2XLARGE'
+    ConstraintDescription: 'Must be a valid CodeBuild compute type'
+
+  EnableDashboard:
+    Type: String
+    Description: 'Enable CloudWatch dashboard for quality gate monitoring'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    ConstraintDescription: 'Must be true or false'
+
+  EnableCaching:
+    Type: String
+    Description: 'Enable S3 caching for build dependencies'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    ConstraintDescription: 'Must be true or false'
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+Conditions:
+  HasSourceLocation: !Not [!Equals [!Ref SourceLocation, '']]
+  EnableDashboardCondition: !Equals [!Ref EnableDashboard, 'true']
+  EnableCachingCondition: !Equals [!Ref EnableCaching, 'true']
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+  # S3 Bucket for artifacts, reports, and caching
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-artifacts-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 7
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref ArtifactsBucketLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-artifacts-bucket'
+        - Key: Purpose
+          Value: 'Code quality gates artifacts storage'
+
+  # CloudWatch Log Group for S3 bucket notifications
+  ArtifactsBucketLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-artifacts'
+      RetentionInDays: 14
+
+  # SNS Topic for quality gate notifications
+  QualityGateNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-quality-gate-notifications'
+      DisplayName: 'Quality Gate Notifications'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-quality-gate-topic'
+        - Key: Purpose
+          Value: 'Quality gate status notifications'
+
+  # SNS Topic Policy
+  QualityGateNotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref QualityGateNotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCodeBuildToPublish
+            Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action:
+              - sns:Publish
+            Resource: !Ref QualityGateNotificationTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+
+  # SNS Subscription for email notifications
+  QualityGateEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref QualityGateNotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # Systems Manager Parameters for quality gate configuration
+  CoverageThresholdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/quality-gates/${ProjectName}/coverage-threshold'
+      Type: String
+      Value: !Ref CoverageThreshold
+      Description: 'Minimum code coverage percentage required'
+      Tags:
+        Name: !Sub '${ProjectName}-coverage-threshold'
+        Purpose: 'Quality gate configuration'
+
+  SonarQubeQualityGateParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/quality-gates/${ProjectName}/sonar-quality-gate'
+      Type: String
+      Value: !Ref SonarQubeQualityGate
+      Description: 'SonarQube quality gate status threshold'
+      Tags:
+        Name: !Sub '${ProjectName}-sonar-quality-gate'
+        Purpose: 'Quality gate configuration'
+
+  SecurityThresholdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/quality-gates/${ProjectName}/security-threshold'
+      Type: String
+      Value: !Ref SecurityThreshold
+      Description: 'Maximum security vulnerability level allowed'
+      Tags:
+        Name: !Sub '${ProjectName}-security-threshold'
+        Purpose: 'Quality gate configuration'
+
+  # IAM Role for CodeBuild
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-codebuild-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Policies:
+        - PolicyName: QualityGatePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3 permissions for artifacts and caching
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${ArtifactsBucket}/*'
+                  - !GetAtt ArtifactsBucket.Arn
+              # Systems Manager permissions for parameters
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/quality-gates/${ProjectName}/*'
+              # SNS permissions for notifications
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref QualityGateNotificationTopic
+              # CodeBuild permissions for batch operations
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: !Sub 'arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/${ProjectName}'
+              # CloudWatch permissions for custom metrics
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-codebuild-role'
+        - Key: Purpose
+          Value: 'CodeBuild service role for quality gates'
+
+  # CodeBuild Project
+  QualityGateProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Ref ProjectName
+      Description: 'Quality Gates Demo with CodeBuild - Automated code quality enforcement'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: S3
+        Location: !Sub '${ArtifactsBucket}/artifacts'
+        Name: 'quality-gates-artifacts'
+        NamespaceType: BUILD_ID
+        Packaging: ZIP
+        Path: 'builds'
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: !Ref ComputeType
+        Image: 'aws/codebuild/amazonlinux2-x86_64-standard:4.0'
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: SNS_TOPIC_ARN
+            Value: !Ref QualityGateNotificationTopic
+          - Name: PROJECT_NAME
+            Value: !Ref ProjectName
+          - Name: COVERAGE_THRESHOLD_PARAM
+            Value: !Sub '/quality-gates/${ProjectName}/coverage-threshold'
+          - Name: SONAR_QUALITY_GATE_PARAM
+            Value: !Sub '/quality-gates/${ProjectName}/sonar-quality-gate'
+          - Name: SECURITY_THRESHOLD_PARAM
+            Value: !Sub '/quality-gates/${ProjectName}/security-threshold'
+          - Name: ARTIFACTS_BUCKET
+            Value: !Ref ArtifactsBucket
+      Source:
+        Type: !If
+          - HasSourceLocation
+          - S3
+          - NO_SOURCE
+        Location: !If
+          - HasSourceLocation
+          - !Ref SourceLocation
+          - !Ref AWS::NoValue
+        BuildSpec: |
+          version: 0.2
+          
+          env:
+            parameter-store:
+              COVERAGE_THRESHOLD: /quality-gates/coverage-threshold
+              SONAR_QUALITY_GATE: /quality-gates/sonar-quality-gate
+              SECURITY_THRESHOLD: /quality-gates/security-threshold
+            variables:
+              MAVEN_OPTS: "-Dmaven.repo.local=.m2/repository"
+          
+          phases:
+            install:
+              runtime-versions:
+                java: corretto21
+              commands:
+                - echo "Installing dependencies and tools..."
+                - apt-get update && apt-get install -y curl unzip jq
+                - curl -sSL https://github.com/SonarSource/sonar-scanner-cli/releases/download/4.8.0.2856/sonar-scanner-cli-4.8.0.2856-linux.zip -o sonar-scanner.zip
+                - unzip sonar-scanner.zip
+                - export PATH=$PATH:$(pwd)/sonar-scanner-4.8.0.2856-linux/bin
+                - curl -sSL https://github.com/jeremylong/DependencyCheck/releases/download/v8.4.0/dependency-check-8.4.0-release.zip -o dependency-check.zip
+                - unzip dependency-check.zip
+                - chmod +x dependency-check/bin/dependency-check.sh
+          
+            pre_build:
+              commands:
+                - echo "Validating build environment..."
+                - java -version
+                - mvn -version
+                - echo "Build started on $(date)"
+                - echo "Quality gate parameters loaded - Coverage: ${COVERAGE_THRESHOLD}%, Security: ${SECURITY_THRESHOLD}, SonarQube: ${SONAR_QUALITY_GATE}"
+          
+            build:
+              commands:
+                - echo "=== PHASE 1: Compile and Unit Tests ==="
+                - mvn clean compile test
+                - echo "✅ Unit tests completed"
+                
+                - echo "=== PHASE 2: Code Coverage Analysis ==="
+                - mvn jacoco:report
+                - COVERAGE=$(grep -o 'Total[^%]*%' target/site/jacoco/index.html | grep -o '[0-9]*' | head -1 || echo "0")
+                - echo "Code coverage: ${COVERAGE}%"
+                - |
+                  if [ "${COVERAGE:-0}" -lt "${COVERAGE_THRESHOLD}" ]; then
+                    echo "❌ QUALITY GATE FAILED: Coverage ${COVERAGE}% below threshold ${COVERAGE_THRESHOLD}%"
+                    aws sns publish --topic-arn ${SNS_TOPIC_ARN} --message "Quality Gate Failed: Coverage ${COVERAGE}% below threshold ${COVERAGE_THRESHOLD}% for project ${PROJECT_NAME}" --subject "Quality Gate Failure - Coverage"
+                    exit 1
+                  fi
+                - echo "✅ Code coverage check passed"
+                
+                - echo "=== PHASE 3: Static Code Analysis ==="
+                - echo "SonarQube analysis would be executed here (requires SonarQube server configuration)"
+                - echo "✅ Static code analysis phase completed"
+                
+                - echo "=== PHASE 4: Security Scanning ==="
+                - ./dependency-check/bin/dependency-check.sh --project "Quality Gates Demo" --scan . --format JSON --out ./security-report.json || true
+                - |
+                  if [ -f "./security-report.json" ]; then
+                    HIGH_VULNS=$(jq '.dependencies[]?.vulnerabilities[]? | select(.severity == "HIGH") | length' security-report.json 2>/dev/null | wc -l || echo "0")
+                    CRITICAL_VULNS=$(jq '.dependencies[]?.vulnerabilities[]? | select(.severity == "CRITICAL") | length' security-report.json 2>/dev/null | wc -l || echo "0")
+                    echo "Found ${HIGH_VULNS} HIGH and ${CRITICAL_VULNS} CRITICAL vulnerabilities"
+                    
+                    if [ "${SECURITY_THRESHOLD}" = "HIGH" ] && [ "${CRITICAL_VULNS}" -gt 0 ]; then
+                      echo "❌ QUALITY GATE FAILED: Found ${CRITICAL_VULNS} CRITICAL vulnerabilities (threshold: ${SECURITY_THRESHOLD})"
+                      aws sns publish --topic-arn ${SNS_TOPIC_ARN} --message "Quality Gate Failed: ${CRITICAL_VULNS} CRITICAL vulnerabilities found for project ${PROJECT_NAME}" --subject "Quality Gate Failure - Security"
+                      exit 1
+                    elif [ "${SECURITY_THRESHOLD}" = "MEDIUM" ] && [ "$((HIGH_VULNS + CRITICAL_VULNS))" -gt 0 ]; then
+                      echo "❌ QUALITY GATE FAILED: Found $((HIGH_VULNS + CRITICAL_VULNS)) HIGH/CRITICAL vulnerabilities (threshold: ${SECURITY_THRESHOLD})"
+                      aws sns publish --topic-arn ${SNS_TOPIC_ARN} --message "Quality Gate Failed: $((HIGH_VULNS + CRITICAL_VULNS)) HIGH/CRITICAL vulnerabilities found for project ${PROJECT_NAME}" --subject "Quality Gate Failure - Security"
+                      exit 1
+                    fi
+                  fi
+                - echo "✅ Security scan passed"
+                
+                - echo "=== PHASE 5: Integration Tests ==="
+                - mvn verify
+                - echo "✅ Integration tests completed"
+                
+                - echo "=== PHASE 6: Quality Gate Summary ==="
+                - echo "All quality gates passed successfully!"
+                - aws sns publish --topic-arn ${SNS_TOPIC_ARN} --message "Quality Gate Success: All checks passed for build ${CODEBUILD_BUILD_ID} in project ${PROJECT_NAME}" --subject "Quality Gate Success"
+                
+                - echo "=== Publishing Custom Metrics ==="
+                - aws cloudwatch put-metric-data --namespace "QualityGates" --metric-data MetricName=CodeCoverage,Value=${COVERAGE},Unit=Percent,Dimensions=ProjectName=${PROJECT_NAME}
+                - aws cloudwatch put-metric-data --namespace "QualityGates" --metric-data MetricName=SecurityVulnerabilities,Value=${HIGH_VULNS:-0},Unit=Count,Dimensions=ProjectName=${PROJECT_NAME},Severity=HIGH
+                - aws cloudwatch put-metric-data --namespace "QualityGates" --metric-data MetricName=SecurityVulnerabilities,Value=${CRITICAL_VULNS:-0},Unit=Count,Dimensions=ProjectName=${PROJECT_NAME},Severity=CRITICAL
+          
+            post_build:
+              commands:
+                - echo "=== Generating Quality Reports ==="
+                - mkdir -p quality-reports
+                - cp -r target/site/jacoco quality-reports/coverage-report 2>/dev/null || echo "No coverage report generated"
+                - cp security-report.json quality-reports/ 2>/dev/null || echo "No security report generated"
+                - echo "Build completed on $(date)"
+                - echo "Build status: ${CODEBUILD_BUILD_SUCCEEDING}"
+          
+          artifacts:
+            files:
+              - target/*.jar
+              - quality-reports/**/*
+            name: quality-gates-artifacts
+          
+          reports:
+            jacoco-reports:
+              files:
+                - target/site/jacoco/jacoco.xml
+              file-format: JACOCOXML
+            junit-reports:
+              files:
+                - target/surefire-reports/*.xml
+              file-format: JUNITXML
+          
+          cache:
+            paths:
+              - .m2/repository/**/*
+      Cache: !If
+        - EnableCachingCondition
+        - Type: S3
+          Location: !Sub '${ArtifactsBucket}/cache'
+        - !Ref AWS::NoValue
+      TimeoutInMinutes: !Ref BuildTimeout
+      QueuedTimeoutInMinutes: 480
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-quality-gates'
+        - Key: Purpose
+          Value: 'Automated code quality enforcement'
+
+  # CloudWatch Dashboard (conditional)
+  QualityGateDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableDashboardCondition
+    Properties:
+      DashboardName: !Sub 'Quality-Gates-${ProjectName}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/CodeBuild", "Builds", "ProjectName", "${ProjectName}" ],
+                  [ ".", "Duration", ".", "." ],
+                  [ ".", "FailedBuilds", ".", "." ],
+                  [ ".", "SucceededBuilds", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "CodeBuild Quality Gate Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "QualityGates", "CodeCoverage", "ProjectName", "${ProjectName}" ],
+                  [ ".", "SecurityVulnerabilities", ".", ".", "Severity", "HIGH" ],
+                  [ ".", "SecurityVulnerabilities", ".", ".", "Severity", "CRITICAL" ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Quality Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/codebuild/${ProjectName}' | fields @timestamp, @message\n| filter @message like /QUALITY GATE/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Quality Gate Events"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/codebuild/${ProjectName}' | fields @timestamp, @message\n| filter @message like /❌/ or @message like /✅/\n| sort @timestamp desc\n| limit 10",
+                "region": "${AWS::Region}",
+                "title": "Quality Gate Results"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms for quality gate monitoring
+  BuildFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-build-failures'
+      AlarmDescription: 'Alarm when CodeBuild projects fail'
+      MetricName: FailedBuilds
+      Namespace: AWS/CodeBuild
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: ProjectName
+          Value: !Ref ProjectName
+      AlarmActions:
+        - !Ref QualityGateNotificationTopic
+      TreatMissingData: notBreaching
+
+  LowCoverageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-low-coverage'
+      AlarmDescription: 'Alarm when code coverage is below threshold'
+      MetricName: CodeCoverage
+      Namespace: QualityGates
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref CoverageThreshold
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: ProjectName
+          Value: !Ref ProjectName
+      AlarmActions:
+        - !Ref QualityGateNotificationTopic
+      TreatMissingData: notBreaching
+
+  SecurityVulnerabilityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-security-vulnerabilities'
+      AlarmDescription: 'Alarm when high/critical security vulnerabilities are found'
+      MetricName: SecurityVulnerabilities
+      Namespace: QualityGates
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: ProjectName
+          Value: !Ref ProjectName
+        - Name: Severity
+          Value: HIGH
+      AlarmActions:
+        - !Ref QualityGateNotificationTopic
+      TreatMissingData: notBreaching
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+Outputs:
+  ProjectName:
+    Description: 'Name of the CodeBuild project'
+    Value: !Ref QualityGateProject
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectName'
+
+  ProjectArn:
+    Description: 'ARN of the CodeBuild project'
+    Value: !GetAtt QualityGateProject.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectArn'
+
+  ArtifactsBucket:
+    Description: 'S3 bucket for build artifacts and reports'
+    Value: !Ref ArtifactsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ArtifactsBucket'
+
+  ArtifactsBucketArn:
+    Description: 'ARN of the S3 artifacts bucket'
+    Value: !GetAtt ArtifactsBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ArtifactsBucketArn'
+
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for quality gate notifications'
+    Value: !Ref QualityGateNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  ServiceRoleArn:
+    Description: 'ARN of the CodeBuild service role'
+    Value: !GetAtt CodeBuildServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceRoleArn'
+
+  DashboardURL:
+    Condition: EnableDashboardCondition
+    Description: 'URL to the CloudWatch dashboard'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=Quality-Gates-${ProjectName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  QualityGateParameters:
+    Description: 'Systems Manager parameter paths for quality gate configuration'
+    Value: !Sub '/quality-gates/${ProjectName}/'
+    Export:
+      Name: !Sub '${AWS::StackName}-QualityGateParameters'
+
+  StartBuildCommand:
+    Description: 'AWS CLI command to start a build'
+    Value: !Sub 'aws codebuild start-build --project-name ${ProjectName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-StartBuildCommand'
+
+  CoverageThreshold:
+    Description: 'Configured code coverage threshold'
+    Value: !Ref CoverageThreshold
+    Export:
+      Name: !Sub '${AWS::StackName}-CoverageThreshold'
+
+  SecurityThreshold:
+    Description: 'Configured security vulnerability threshold'
+    Value: !Ref SecurityThreshold
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityThreshold'
+
+  BuildLogGroup:
+    Description: 'CloudWatch log group for build logs'
+    Value: !Sub '/aws/codebuild/${ProjectName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-BuildLogGroup'

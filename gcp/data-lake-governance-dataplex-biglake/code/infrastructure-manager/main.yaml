@@ -1,0 +1,475 @@
+# Infrastructure Manager Configuration for Data Lake Governance with Dataplex and BigLake
+# This configuration deploys a comprehensive data governance solution using Google Cloud Dataplex
+# Universal Catalog for AI-powered metadata discovery and BigLake for unified analytics access control
+
+metadata:
+  version: 1.0
+  description: "Data Lake Governance with Dataplex and BigLake"
+  author: "Google Cloud Infrastructure Manager"
+  
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    required: true
+    
+  region:
+    type: string
+    description: "Primary region for resource deployment"
+    default: "us-central1"
+    
+  zone:
+    type: string
+    description: "Primary zone for resource deployment"
+    default: "us-central1-a"
+    
+  lake_name:
+    type: string
+    description: "Name for the Dataplex lake"
+    default: "enterprise-data-lake"
+    
+  zone_name:
+    type: string
+    description: "Name for the Dataplex zone"
+    default: "raw-data-zone"
+    
+  dataset_name:
+    type: string
+    description: "BigQuery dataset name for analytics"
+    default: "governance_analytics"
+    
+  random_suffix:
+    type: string
+    description: "Random suffix for unique resource naming"
+    required: true
+
+# Required APIs for the data governance solution
+resources:
+  # Enable required Google Cloud APIs
+  enable_dataplex_api:
+    type: gcp-types/serviceusage-v1:services
+    name: projects/${var.project_id}/services/dataplex.googleapis.com
+    
+  enable_bigquery_api:
+    type: gcp-types/serviceusage-v1:services
+    name: projects/${var.project_id}/services/bigquery.googleapis.com
+    
+  enable_cloudfunctions_api:
+    type: gcp-types/serviceusage-v1:services
+    name: projects/${var.project_id}/services/cloudfunctions.googleapis.com
+    
+  enable_storage_api:
+    type: gcp-types/serviceusage-v1:services
+    name: projects/${var.project_id}/services/storage.googleapis.com
+    
+  enable_bigqueryconnection_api:
+    type: gcp-types/serviceusage-v1:services
+    name: projects/${var.project_id}/services/bigqueryconnection.googleapis.com
+
+  # Cloud Storage bucket for sample data and governance assets
+  governance_storage_bucket:
+    type: gcp-types/storage-v1:buckets
+    name: governance-demo-${var.random_suffix}
+    properties:
+      project: ${var.project_id}
+      location: ${var.region}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 365
+              isLive: false
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      # Enable object change notifications for governance monitoring
+      notification:
+        - topic: projects/${var.project_id}/topics/governance-notifications
+          eventTypes:
+            - OBJECT_FINALIZE
+            - OBJECT_DELETE
+    depends_on:
+      - enable_storage_api
+
+  # Dataplex Lake for centralized data governance
+  dataplex_lake:
+    type: gcp-types/dataplex-v1:projects.locations.lakes
+    name: ${var.lake_name}
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      lakeId: ${var.lake_name}
+      displayName: "Enterprise Data Lake"
+      description: "Centralized governance for enterprise data assets with AI-powered discovery"
+      labels:
+        environment: "governance"
+        purpose: "data-lake"
+        managed-by: "infrastructure-manager"
+    depends_on:
+      - enable_dataplex_api
+
+  # Dataplex Zone for raw data organization with discovery enabled
+  dataplex_zone:
+    type: gcp-types/dataplex-v1:projects.locations.lakes.zones
+    name: ${var.zone_name}
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}/lakes/${var.lake_name}
+      zoneId: ${var.zone_name}
+      type: RAW
+      discoverySpec:
+        enabled: true
+        includePatterns:
+          - "gs://governance-demo-${var.random_suffix}/raw/*"
+        csvOptions:
+          delimiter: ","
+          headerRows: 1
+          disableTypeInference: false
+        jsonOptions:
+          disableTypeInference: false
+      resourceSpec:
+        locationType: SINGLE_REGION
+      displayName: "Raw Data Zone"
+      description: "Zone for raw data with automatic discovery and cataloging"
+      labels:
+        zone-type: "raw"
+        discovery: "enabled"
+    depends_on:
+      - dataplex_lake
+
+  # BigQuery dataset for analytics with governance controls
+  bigquery_dataset:
+    type: gcp-types/bigquery-v2:datasets
+    name: ${var.dataset_name}
+    properties:
+      projectId: ${var.project_id}
+      datasetId: ${var.dataset_name}
+      location: ${var.region}
+      description: "Analytics dataset with BigLake governance and security controls"
+      defaultTableExpirationMs: "7776000000"  # 90 days
+      labels:
+        purpose: "analytics"
+        governance: "biglake"
+        environment: "enterprise"
+      access:
+        - role: OWNER
+          userByEmail: "$(ref.bigquery_connection.cloudResource.serviceAccountId)"
+        - role: READER
+          specialGroup: "projectReaders"
+    depends_on:
+      - enable_bigquery_api
+
+  # BigQuery external connection for BigLake tables
+  bigquery_connection:
+    type: gcp-types/bigqueryconnection-v1:projects.locations.connections
+    name: biglake-connection-${var.random_suffix}
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      connectionId: biglake-connection-${var.random_suffix}
+      connection:
+        description: "BigLake connection for multi-cloud data access with governance"
+        cloudResource: {}
+        friendlyName: "BigLake Governance Connection"
+    depends_on:
+      - enable_bigqueryconnection_api
+
+  # IAM binding for BigLake connection to access Cloud Storage
+  storage_access_binding:
+    type: gcp-types/storage-v1:buckets.iam
+    name: governance-demo-${var.random_suffix}-iam
+    properties:
+      bucket: governance-demo-${var.random_suffix}
+      bindings:
+        - role: roles/storage.objectViewer
+          members:
+            - "serviceAccount:$(ref.bigquery_connection.cloudResource.serviceAccountId)"
+        - role: roles/storage.legacyBucketReader
+          members:
+            - "serviceAccount:$(ref.bigquery_connection.cloudResource.serviceAccountId)"
+    depends_on:
+      - governance_storage_bucket
+      - bigquery_connection
+
+  # IAM binding for Dataplex integration
+  dataplex_access_binding:
+    type: gcp-types/cloudresourcemanager-v1:projects.iam
+    name: dataplex-integration-binding
+    properties:
+      resource: ${var.project_id}
+      bindings:
+        - role: roles/dataplex.viewer
+          members:
+            - "serviceAccount:$(ref.bigquery_connection.cloudResource.serviceAccountId)"
+        - role: roles/bigquery.dataEditor
+          members:
+            - "serviceAccount:$(ref.bigquery_connection.cloudResource.serviceAccountId)"
+    depends_on:
+      - bigquery_connection
+
+  # Dataplex Asset for automatic discovery of Cloud Storage bucket
+  dataplex_asset:
+    type: gcp-types/dataplex-v1:projects.locations.lakes.zones.assets
+    name: governance-bucket-asset
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}/lakes/${var.lake_name}/zones/${var.zone_name}
+      assetId: governance-bucket-asset
+      resourceSpec:
+        name: projects/${var.project_id}/buckets/governance-demo-${var.random_suffix}
+        type: STORAGE_BUCKET
+      discoverySpec:
+        enabled: true
+        includePatterns:
+          - "gs://governance-demo-${var.random_suffix}/raw/*"
+        csvOptions:
+          delimiter: ","
+          headerRows: 1
+          disableTypeInference: false
+        schedule: "0 */6 * * *"  # Run discovery every 6 hours
+      displayName: "Governance Storage Asset"
+      description: "Cloud Storage asset for automatic data discovery and cataloging"
+      labels:
+        asset-type: "storage"
+        discovery: "enabled"
+    depends_on:
+      - dataplex_zone
+      - governance_storage_bucket
+
+  # Pub/Sub topic for governance monitoring notifications
+  governance_pubsub_topic:
+    type: gcp-types/pubsub-v1:projects.topics
+    name: governance-notifications
+    properties:
+      name: projects/${var.project_id}/topics/governance-notifications
+      labels:
+        purpose: "governance"
+        component: "monitoring"
+    depends_on:
+      - enable_cloudfunctions_api
+
+  # Service Account for Cloud Function governance monitoring
+  governance_function_sa:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    name: governance-monitor-sa
+    properties:
+      accountId: governance-monitor-sa
+      project: ${var.project_id}
+      displayName: "Governance Monitoring Service Account"
+      description: "Service account for Cloud Function governance monitoring"
+
+  # IAM bindings for governance monitoring service account
+  governance_function_bindings:
+    type: gcp-types/cloudresourcemanager-v1:projects.iam
+    name: governance-function-bindings
+    properties:
+      resource: ${var.project_id}
+      bindings:
+        - role: roles/dataplex.viewer
+          members:
+            - "serviceAccount:$(ref.governance_function_sa.email)"
+        - role: roles/bigquery.dataViewer
+          members:
+            - "serviceAccount:$(ref.governance_function_sa.email)"
+        - role: roles/bigquery.jobUser
+          members:
+            - "serviceAccount:$(ref.governance_function_sa.email)"
+        - role: roles/logging.logWriter
+          members:
+            - "serviceAccount:$(ref.governance_function_sa.email)"
+        - role: roles/monitoring.metricWriter
+          members:
+            - "serviceAccount:$(ref.governance_function_sa.email)"
+    depends_on:
+      - governance_function_sa
+
+  # Cloud Scheduler job for regular governance monitoring
+  governance_scheduler:
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    name: governance-quality-monitor
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      name: governance-quality-monitor
+      description: "Scheduled job for data quality and governance monitoring"
+      schedule: "0 */2 * * *"  # Run every 2 hours
+      timeZone: "UTC"
+      httpTarget:
+        uri: "https://${var.region}-${var.project_id}.cloudfunctions.net/governance-monitor"
+        httpMethod: POST
+        headers:
+          Content-Type: "application/json"
+        body: '{"action": "scheduled_monitoring"}'
+        oidcToken:
+          serviceAccountEmail: "$(ref.governance_function_sa.email)"
+    depends_on:
+      - governance_function_sa
+
+  # Dataplex Data Quality task for automated quality profiling
+  data_quality_task:
+    type: gcp-types/dataplex-v1:projects.locations.lakes.tasks
+    name: quality-profile-task
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}/lakes/${var.lake_name}
+      taskId: quality-profile-task
+      description: "Automated data quality profiling and assessment"
+      displayName: "Data Quality Profiling Task"
+      labels:
+        task-type: "quality"
+        frequency: "daily"
+      triggerSpec:
+        type: RECURRING
+        schedule: "0 2 * * *"  # Run daily at 2 AM
+      executionSpec:
+        serviceAccount: "$(ref.governance_function_sa.email)"
+        project: ${var.project_id}
+        maxJobExecutionLifetime: "3600s"
+        kmsKey: ""  # Use default encryption
+      spark:
+        mainJarFileUri: "gs://dataplex-public-assets/data-quality-template.jar"
+        mainClass: "com.google.cloud.dataplex.templates.hive.HiveDDLExecutor"
+        args:
+          - "--template=DQ_DUPLICATE_CHECK,DQ_COMPLETENESS_CHECK,DQ_VALIDITY_CHECK"
+          - "--source_type=BIGQUERY"
+          - "--target_type=BIGQUERY"
+        fileUris:
+          - "gs://dataplex-public-assets/hive-ddl-executor-template.jar"
+    depends_on:
+      - dataplex_lake
+      - governance_function_sa
+
+  # Dataplex Data Lineage task for relationship tracking
+  data_lineage_task:
+    type: gcp-types/dataplex-v1:projects.locations.lakes.tasks
+    name: lineage-tracking-task
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}/lakes/${var.lake_name}
+      taskId: lineage-tracking-task
+      description: "Automated data lineage tracking and relationship mapping"
+      displayName: "Data Lineage Tracking Task"
+      labels:
+        task-type: "lineage"
+        frequency: "on-demand"
+      triggerSpec:
+        type: ON_DEMAND
+      executionSpec:
+        serviceAccount: "$(ref.governance_function_sa.email)"
+        project: ${var.project_id}
+        maxJobExecutionLifetime: "3600s"
+        kmsKey: ""  # Use default encryption
+      spark:
+        mainJarFileUri: "gs://dataplex-public-assets/hive-ddl-executor-template.jar"
+        mainClass: "com.google.cloud.dataplex.templates.hive.HiveDDLExecutor"
+        args:
+          - "--template=LINEAGE_DISCOVERY"
+          - "--source_type=MULTI_CLOUD"
+          - "--target_type=DATAPLEX_CATALOG"
+        fileUris:
+          - "gs://dataplex-public-assets/data-lineage-template.jar"
+    depends_on:
+      - dataplex_lake
+      - governance_function_sa
+
+# Outputs for verification and integration
+outputs:
+  dataplex_lake_name:
+    description: "Name of the created Dataplex lake"
+    value: "$(ref.dataplex_lake.name)"
+    
+  dataplex_zone_name:
+    description: "Name of the created Dataplex zone"
+    value: "$(ref.dataplex_zone.name)"
+    
+  storage_bucket_name:
+    description: "Name of the governance storage bucket"
+    value: "$(ref.governance_storage_bucket.name)"
+    
+  bigquery_dataset_id:
+    description: "BigQuery dataset ID for analytics"
+    value: "$(ref.bigquery_dataset.datasetId)"
+    
+  bigquery_connection_id:
+    description: "BigQuery connection ID for BigLake tables"
+    value: "$(ref.bigquery_connection.name)"
+    
+  connection_service_account:
+    description: "Service account email for BigLake connection"
+    value: "$(ref.bigquery_connection.cloudResource.serviceAccountId)"
+    
+  governance_function_sa_email:
+    description: "Service account email for governance monitoring"
+    value: "$(ref.governance_function_sa.email)"
+    
+  pubsub_topic_name:
+    description: "Pub/Sub topic for governance notifications"
+    value: "$(ref.governance_pubsub_topic.name)"
+    
+  dataplex_console_url:
+    description: "URL to access Dataplex console for this lake"
+    value: "https://console.cloud.google.com/dataplex/lakes/detail/${var.region}/${var.lake_name}?project=${var.project_id}"
+    
+  bigquery_console_url:
+    description: "URL to access BigQuery console for the dataset"
+    value: "https://console.cloud.google.com/bigquery?project=${var.project_id}&ws=!1m4!1m3!3m2!1s${var.project_id}!2s${var.dataset_name}"
+
+# Deployment configuration
+deployment:
+  # Resource creation timeout
+  timeoutInMinutes: 30
+  
+  # Deployment options
+  options:
+    # Skip preview for automated deployments
+    skipPreview: false
+    
+    # Delete policy for cleanup
+    deletePolicy: DELETE
+    
+    # Automatic rollback on failure
+    automaticrollbackOnError: true
+    
+  # Post-deployment validation
+  validation:
+    # Verify Dataplex lake is active
+    - type: gcp-types/dataplex-v1:projects.locations.lakes.get
+      name: verify-lake-status
+      properties:
+        name: "$(ref.dataplex_lake.name)"
+      expectedState: ACTIVE
+      
+    # Verify BigQuery dataset is accessible
+    - type: gcp-types/bigquery-v2:datasets.get
+      name: verify-dataset-access
+      properties:
+        projectId: ${var.project_id}
+        datasetId: "$(ref.bigquery_dataset.datasetId)"
+        
+    # Verify storage bucket is accessible
+    - type: gcp-types/storage-v1:buckets.get
+      name: verify-bucket-access
+      properties:
+        bucket: "$(ref.governance_storage_bucket.name)"
+
+# Configuration metadata for Infrastructure Manager
+configuration:
+  # Version compatibility
+  minimumInfrastructureManagerVersion: "1.0.0"
+  
+  # Required permissions for deployment
+  requiredPermissions:
+    - "roles/dataplex.admin"
+    - "roles/bigquery.admin"
+    - "roles/storage.admin"
+    - "roles/cloudfunctions.admin"
+    - "roles/iam.serviceAccountAdmin"
+    - "roles/pubsub.admin"
+    - "roles/cloudscheduler.admin"
+    
+  # Estimated deployment time
+  estimatedDeploymentTime: "15-20 minutes"
+  
+  # Cost estimation (monthly)
+  estimatedMonthlyCost:
+    currency: "USD"
+    amount: "50-150"
+    details: "Varies based on data volume, discovery frequency, and query usage"

@@ -1,0 +1,685 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure for distributed tracing with AWS X-Ray and Amazon EventBridge - Recipe: c4d6e8f0'
+
+# =============================================================================
+# PARAMETERS - Configurable values for deployment customization
+# =============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Description: 'Name prefix for all resources'
+    Default: 'distributed-tracing'
+    MinLength: 3
+    MaxLength: 30
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+
+  Environment:
+    Type: String
+    Description: 'Environment for deployment (dev, test, prod)'
+    Default: 'dev'
+    AllowedValues: ['dev', 'test', 'prod']
+
+  EnableXRayTracing:
+    Type: String
+    Description: 'Enable X-Ray tracing for all components'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  LambdaTimeout:
+    Type: Number
+    Description: 'Lambda function timeout in seconds'
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+
+  APIStage:
+    Type: String
+    Description: 'API Gateway deployment stage'
+    Default: 'prod'
+    AllowedPattern: '^[a-zA-Z0-9]+$'
+
+# =============================================================================
+# CONDITIONS - Conditional resource creation based on parameters
+# =============================================================================
+Conditions:
+  EnableTracing: !Equals [!Ref EnableXRayTracing, 'true']
+  IsProd: !Equals [!Ref Environment, 'prod']
+
+# =============================================================================
+# RESOURCES - AWS infrastructure components
+# =============================================================================
+Resources:
+  # -----------------------------------------------------------------------------
+  # IAM ROLE FOR LAMBDA FUNCTIONS
+  # -----------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${Environment}'
+      Description: 'IAM role for Lambda functions with X-Ray and EventBridge permissions'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !If 
+          - EnableTracing
+          - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+          - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: EventBridgePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !GetAtt CustomEventBus.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Distributed Tracing Demo'
+
+  # -----------------------------------------------------------------------------
+  # CUSTOM EVENTBRIDGE EVENT BUS
+  # -----------------------------------------------------------------------------
+  CustomEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${ProjectName}-bus-${Environment}'
+      Description: 'Custom event bus for distributed tracing demonstration'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-bus'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Event-driven microservices communication'
+
+  # -----------------------------------------------------------------------------
+  # LAMBDA FUNCTIONS WITH X-RAY TRACING
+  # -----------------------------------------------------------------------------
+  
+  # Order Service - Entry point Lambda function
+  OrderServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-order-service-${Environment}'
+      Description: 'Order service that initiates the distributed workflow'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      TracingConfig:
+        Mode: !If [EnableTracing, 'Active', 'PassThrough']
+      Environment:
+        Variables:
+          EVENT_BUS_NAME: !Ref CustomEventBus
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from aws_xray_sdk.core import xray_recorder
+          from aws_xray_sdk.core import patch_all
+          from datetime import datetime
+          
+          # Patch AWS SDK calls for X-Ray tracing
+          patch_all()
+          
+          eventbridge = boto3.client('events')
+          
+          @xray_recorder.capture('order_service_handler')
+          def lambda_handler(event, context):
+              # Extract trace context from API Gateway
+              trace_header = event.get('headers', {}).get('X-Amzn-Trace-Id')
+              
+              # Create subsegment for order processing
+              subsegment = xray_recorder.begin_subsegment('process_order')
+              
+              try:
+                  # Simulate order processing
+                  order_id = f"order-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+                  customer_id = event.get('pathParameters', {}).get('customerId', 'anonymous')
+                  
+                  # Add metadata to trace
+                  subsegment.put_metadata('order_details', {
+                      'order_id': order_id,
+                      'customer_id': customer_id,
+                      'timestamp': datetime.now().isoformat()
+                  })
+                  
+                  # Publish event to EventBridge with trace context
+                  event_detail = {
+                      'orderId': order_id,
+                      'customerId': customer_id,
+                      'amount': 99.99,
+                      'status': 'created'
+                  }
+                  
+                  response = eventbridge.put_events(
+                      Entries=[
+                          {
+                              'Source': 'order.service',
+                              'DetailType': 'Order Created',
+                              'Detail': json.dumps(event_detail),
+                              'EventBusName': os.environ['EVENT_BUS_NAME']
+                          }
+                      ]
+                  )
+                  
+                  # Add annotation for filtering
+                  xray_recorder.put_annotation('order_id', order_id)
+                  xray_recorder.put_annotation('service_name', 'order-service')
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'X-Amzn-Trace-Id': trace_header
+                      },
+                      'body': json.dumps({
+                          'orderId': order_id,
+                          'status': 'created',
+                          'message': 'Order created successfully'
+                      })
+                  }
+                  
+              except Exception as e:
+                  xray_recorder.put_annotation('error', str(e))
+                  raise e
+              finally:
+                  xray_recorder.end_subsegment()
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-order-service'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: 'order-service'
+
+  # Payment Service - Processes payment events
+  PaymentServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-payment-service-${Environment}'
+      Description: 'Payment service that processes order payment events'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      TracingConfig:
+        Mode: !If [EnableTracing, 'Active', 'PassThrough']
+      Environment:
+        Variables:
+          EVENT_BUS_NAME: !Ref CustomEventBus
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import time
+          from aws_xray_sdk.core import xray_recorder
+          from aws_xray_sdk.core import patch_all
+          
+          # Patch AWS SDK calls for X-Ray tracing
+          patch_all()
+          
+          eventbridge = boto3.client('events')
+          
+          @xray_recorder.capture('payment_service_handler')
+          def lambda_handler(event, context):
+              # Process EventBridge event
+              for record in event['Records']:
+                  detail = json.loads(record['body'])
+                  
+                  # Create subsegment for payment processing
+                  subsegment = xray_recorder.begin_subsegment('process_payment')
+                  
+                  try:
+                      order_id = detail['detail']['orderId']
+                      amount = detail['detail']['amount']
+                      
+                      # Add metadata to trace
+                      subsegment.put_metadata('payment_details', {
+                          'order_id': order_id,
+                          'amount': amount,
+                          'processor': 'stripe'
+                      })
+                      
+                      # Simulate payment processing delay
+                      time.sleep(0.5)
+                      
+                      # Publish payment processed event
+                      payment_event = {
+                          'orderId': order_id,
+                          'amount': amount,
+                          'paymentId': f"pay-{order_id}",
+                          'status': 'processed'
+                      }
+                      
+                      eventbridge.put_events(
+                          Entries=[
+                              {
+                                  'Source': 'payment.service',
+                                  'DetailType': 'Payment Processed',
+                                  'Detail': json.dumps(payment_event),
+                                  'EventBusName': os.environ['EVENT_BUS_NAME']
+                              }
+                          ]
+                      )
+                      
+                      # Add annotations for filtering
+                      xray_recorder.put_annotation('order_id', order_id)
+                      xray_recorder.put_annotation('service_name', 'payment-service')
+                      xray_recorder.put_annotation('payment_amount', amount)
+                      
+                  except Exception as e:
+                      xray_recorder.put_annotation('error', str(e))
+                      raise e
+                  finally:
+                      xray_recorder.end_subsegment()
+          
+              return {'statusCode': 200}
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-payment-service'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: 'payment-service'
+
+  # Inventory Service - Manages inventory reservations
+  InventoryServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-inventory-service-${Environment}'
+      Description: 'Inventory service that manages product reservations'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      TracingConfig:
+        Mode: !If [EnableTracing, 'Active', 'PassThrough']
+      Environment:
+        Variables:
+          EVENT_BUS_NAME: !Ref CustomEventBus
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from aws_xray_sdk.core import xray_recorder
+          from aws_xray_sdk.core import patch_all
+          
+          # Patch AWS SDK calls for X-Ray tracing
+          patch_all()
+          
+          eventbridge = boto3.client('events')
+          
+          @xray_recorder.capture('inventory_service_handler')
+          def lambda_handler(event, context):
+              for record in event['Records']:
+                  detail = json.loads(record['body'])
+                  
+                  subsegment = xray_recorder.begin_subsegment('update_inventory')
+                  
+                  try:
+                      order_id = detail['detail']['orderId']
+                      
+                      # Add metadata to trace
+                      subsegment.put_metadata('inventory_update', {
+                          'order_id': order_id,
+                          'items_reserved': 1,
+                          'warehouse': 'east-coast'
+                      })
+                      
+                      # Publish inventory updated event
+                      inventory_event = {
+                          'orderId': order_id,
+                          'status': 'reserved',
+                          'warehouse': 'east-coast'
+                      }
+                      
+                      eventbridge.put_events(
+                          Entries=[
+                              {
+                                  'Source': 'inventory.service',
+                                  'DetailType': 'Inventory Updated',
+                                  'Detail': json.dumps(inventory_event),
+                                  'EventBusName': os.environ['EVENT_BUS_NAME']
+                              }
+                          ]
+                      )
+                      
+                      xray_recorder.put_annotation('order_id', order_id)
+                      xray_recorder.put_annotation('service_name', 'inventory-service')
+                      
+                  except Exception as e:
+                      xray_recorder.put_annotation('error', str(e))
+                      raise e
+                  finally:
+                      xray_recorder.end_subsegment()
+          
+              return {'statusCode': 200}
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-inventory-service'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: 'inventory-service'
+
+  # Notification Service - Sends customer notifications
+  NotificationServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-notification-service-${Environment}'
+      Description: 'Notification service that sends customer communications'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      TracingConfig:
+        Mode: !If [EnableTracing, 'Active', 'PassThrough']
+      Environment:
+        Variables:
+          EVENT_BUS_NAME: !Ref CustomEventBus
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from aws_xray_sdk.core import xray_recorder
+          from aws_xray_sdk.core import patch_all
+          
+          # Patch AWS SDK calls for X-Ray tracing
+          patch_all()
+          
+          @xray_recorder.capture('notification_service_handler')
+          def lambda_handler(event, context):
+              for record in event['Records']:
+                  detail = json.loads(record['body'])
+                  
+                  subsegment = xray_recorder.begin_subsegment('send_notification')
+                  
+                  try:
+                      order_id = detail['detail']['orderId']
+                      event_type = detail['detail-type']
+                      
+                      # Add metadata to trace
+                      subsegment.put_metadata('notification_sent', {
+                          'order_id': order_id,
+                          'event_type': event_type,
+                          'channel': 'email'
+                      })
+                      
+                      xray_recorder.put_annotation('order_id', order_id)
+                      xray_recorder.put_annotation('service_name', 'notification-service')
+                      xray_recorder.put_annotation('notification_type', event_type)
+                      
+                  except Exception as e:
+                      xray_recorder.put_annotation('error', str(e))
+                      raise e
+                  finally:
+                      xray_recorder.end_subsegment()
+          
+              return {'statusCode': 200}
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-notification-service'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: 'notification-service'
+
+  # -----------------------------------------------------------------------------
+  # EVENTBRIDGE RULES FOR EVENT ROUTING
+  # -----------------------------------------------------------------------------
+
+  # Rule for payment processing - triggered by order creation
+  PaymentProcessingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-payment-rule-${Environment}'
+      Description: 'Routes order creation events to payment service'
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        source: ['order.service']
+        detail-type: ['Order Created']
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt PaymentServiceFunction.Arn
+          Id: PaymentServiceTarget
+
+  # Rule for inventory updates - triggered by order creation  
+  InventoryUpdateRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-inventory-rule-${Environment}'
+      Description: 'Routes order creation events to inventory service'
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        source: ['order.service']
+        detail-type: ['Order Created']
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt InventoryServiceFunction.Arn
+          Id: InventoryServiceTarget
+
+  # Rule for notifications - triggered by payment and inventory events
+  NotificationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-notification-rule-${Environment}'
+      Description: 'Routes completion events to notification service'
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        source: ['payment.service', 'inventory.service']
+        detail-type: ['Payment Processed', 'Inventory Updated']
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt NotificationServiceFunction.Arn
+          Id: NotificationServiceTarget
+
+  # -----------------------------------------------------------------------------
+  # LAMBDA PERMISSIONS FOR EVENTBRIDGE INVOCATION
+  # -----------------------------------------------------------------------------
+
+  # Allow EventBridge to invoke payment service
+  PaymentServiceEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PaymentServiceFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PaymentProcessingRule.Arn
+
+  # Allow EventBridge to invoke inventory service
+  InventoryServiceEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref InventoryServiceFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt InventoryUpdateRule.Arn
+
+  # Allow EventBridge to invoke notification service
+  NotificationServiceEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotificationServiceFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt NotificationRule.Arn
+
+  # -----------------------------------------------------------------------------
+  # API GATEWAY WITH X-RAY TRACING
+  # -----------------------------------------------------------------------------
+
+  # REST API Gateway
+  DistributedTracingAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-api-${Environment}'
+      Description: 'REST API for distributed tracing demonstration'
+      EndpointConfiguration:
+        Types: ['REGIONAL']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-api'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Orders resource path
+  OrdersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DistributedTracingAPI
+      ParentId: !GetAtt DistributedTracingAPI.RootResourceId
+      PathPart: orders
+
+  # Customer ID resource path
+  CustomerResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DistributedTracingAPI
+      ParentId: !Ref OrdersResource
+      PathPart: '{customerId}'
+
+  # POST method for order creation
+  OrderCreationMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DistributedTracingAPI
+      ResourceId: !Ref CustomerResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrderServiceFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+
+  # API Gateway deployment
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: OrderCreationMethod
+    Properties:
+      RestApiId: !Ref DistributedTracingAPI
+      Description: !Sub 'Deployment for ${ProjectName} API'
+
+  # API Gateway stage with X-Ray tracing
+  APIStageResource:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref DistributedTracingAPI
+      DeploymentId: !Ref APIDeployment
+      StageName: !Ref APIStage
+      Description: !Sub '${APIStage} stage for distributed tracing API'
+      TracingEnabled: !If [EnableTracing, true, false]
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: !If [IsProd, 'ERROR', 'INFO']
+          DataTraceEnabled: !If [IsProd, false, true]
+          MetricsEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${APIStage}-stage'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Allow API Gateway to invoke order service
+  OrderServiceAPIPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OrderServiceFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DistributedTracingAPI}/*/*/*'
+
+# =============================================================================
+# OUTPUTS - Key values for reference and integration
+# =============================================================================
+Outputs:
+  # API Gateway endpoint for testing
+  APIEndpoint:
+    Description: 'API Gateway endpoint URL for order creation'
+    Value: !Sub 'https://${DistributedTracingAPI}.execute-api.${AWS::Region}.amazonaws.com/${APIStage}'
+    Export:
+      Name: !Sub '${AWS::StackName}-api-endpoint'
+
+  # Custom EventBridge bus details
+  EventBusName:
+    Description: 'Name of the custom EventBridge event bus'
+    Value: !Ref CustomEventBus
+    Export:
+      Name: !Sub '${AWS::StackName}-event-bus-name'
+
+  EventBusArn:
+    Description: 'ARN of the custom EventBridge event bus'
+    Value: !GetAtt CustomEventBus.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-event-bus-arn'
+
+  # Lambda function ARNs for reference
+  OrderServiceArn:
+    Description: 'ARN of the order service Lambda function'
+    Value: !GetAtt OrderServiceFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-order-service-arn'
+
+  PaymentServiceArn:
+    Description: 'ARN of the payment service Lambda function'
+    Value: !GetAtt PaymentServiceFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-payment-service-arn'
+
+  InventoryServiceArn:
+    Description: 'ARN of the inventory service Lambda function'
+    Value: !GetAtt InventoryServiceFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-inventory-service-arn'
+
+  NotificationServiceArn:
+    Description: 'ARN of the notification service Lambda function'
+    Value: !GetAtt NotificationServiceFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-notification-service-arn'
+
+  # X-Ray service map link
+  XRayServiceMapLink:
+    Description: 'Direct link to X-Ray service map in AWS Console'
+    Value: !Sub 'https://console.aws.amazon.com/xray/home?region=${AWS::Region}#/service-map'
+
+  # Test command for easy validation
+  TestCommand:
+    Description: 'curl command to test the distributed tracing flow'
+    Value: !Sub |
+      curl -X POST \
+        -H "Content-Type: application/json" \
+        -d '{"productId": "12345", "quantity": 1}' \
+        "https://${DistributedTracingAPI}.execute-api.${AWS::Region}.amazonaws.com/${APIStage}/orders/customer123"
+
+  # IAM role for potential additional services
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda execution role for additional functions'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-lambda-execution-role-arn'

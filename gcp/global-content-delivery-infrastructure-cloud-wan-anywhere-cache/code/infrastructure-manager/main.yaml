@@ -1,0 +1,819 @@
+# Infrastructure Manager Configuration for Global Content Delivery Infrastructure
+# This configuration deploys a comprehensive global content delivery solution using
+# Cloud WAN, Anywhere Cache, Cloud Storage, and Cloud CDN across multiple regions
+#
+# Recipe: Establishing Global Content Delivery Infrastructure with Cloud WAN and Anywhere Cache
+# Provider: Google Cloud Platform
+# Services: Cloud WAN, Cloud Storage, Cloud Monitoring, Cloud CDN
+
+# Define the deployment configuration
+deployment:
+  # Multi-region deployment targeting global content delivery
+  name: global-content-delivery-infrastructure
+  description: "Global content delivery infrastructure with Cloud WAN and Anywhere Cache"
+  
+  # Template configuration
+  template:
+    # Import required Terraform modules for Infrastructure Manager
+    imports:
+      - path: terraform
+        name: global-content-delivery
+
+# Infrastructure Manager Terraform Configuration
+terraform:
+  # Provider configuration for Google Cloud
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 5.0"
+    random:
+      source: "hashicorp/random"
+      version: "~> 3.1"
+
+  # Variable definitions for customizable deployment
+  variables:
+    # Project and regional configuration
+    project_id:
+      description: "Google Cloud Project ID for deployment"
+      type: string
+      validation:
+        condition: "length(var.project_id) > 0"
+        error_message: "Project ID must not be empty."
+    
+    primary_region:
+      description: "Primary region for deployment (Americas)"
+      type: string
+      default: "us-central1"
+      validation:
+        condition: "contains(['us-central1', 'us-east1', 'us-west1'], var.primary_region)"
+        error_message: "Primary region must be a valid US region."
+    
+    secondary_region:
+      description: "Secondary region for deployment (EMEA)"
+      type: string
+      default: "europe-west1"
+      validation:
+        condition: "contains(['europe-west1', 'europe-north1', 'europe-west4'], var.secondary_region)"
+        error_message: "Secondary region must be a valid Europe region."
+    
+    tertiary_region:
+      description: "Tertiary region for deployment (APAC)"
+      type: string
+      default: "asia-east1"
+      validation:
+        condition: "contains(['asia-east1', 'asia-southeast1', 'asia-northeast1'], var.tertiary_region)"
+        error_message: "Tertiary region must be a valid Asia region."
+    
+    # Content delivery configuration
+    bucket_storage_class:
+      description: "Storage class for the global content bucket"
+      type: string
+      default: "STANDARD"
+      validation:
+        condition: "contains(['STANDARD', 'NEARLINE', 'COLDLINE'], var.bucket_storage_class)"
+        error_message: "Storage class must be STANDARD, NEARLINE, or COLDLINE."
+    
+    cache_ttl_seconds:
+      description: "Time-to-live for Anywhere Cache instances (seconds)"
+      type: number
+      default: 3600
+      validation:
+        condition: "var.cache_ttl_seconds >= 300 && var.cache_ttl_seconds <= 86400"
+        error_message: "Cache TTL must be between 300 and 86400 seconds."
+    
+    compute_machine_type:
+      description: "Machine type for content server instances"
+      type: string
+      default: "e2-standard-4"
+      validation:
+        condition: "contains(['e2-standard-2', 'e2-standard-4', 'e2-standard-8'], var.compute_machine_type)"
+        error_message: "Machine type must be a valid e2-standard type."
+    
+    enable_monitoring:
+      description: "Enable comprehensive monitoring and alerting"
+      type: bool
+      default: true
+    
+    enable_public_access:
+      description: "Enable public read access to storage bucket"
+      type: bool
+      default: false
+
+  # Resource definitions
+  resources:
+    # Generate random suffix for globally unique resource names
+    random_suffix:
+      type: random_id
+      properties:
+        byte_length: 4
+    
+    # Enable required Google Cloud APIs
+    enable_compute_api:
+      type: google_project_service
+      properties:
+        project: "${var.project_id}"
+        service: "compute.googleapis.com"
+        disable_dependent_services: true
+    
+    enable_storage_api:
+      type: google_project_service
+      properties:
+        project: "${var.project_id}"
+        service: "storage.googleapis.com"
+        disable_dependent_services: true
+        depends_on: ["enable_compute_api"]
+    
+    enable_monitoring_api:
+      type: google_project_service
+      properties:
+        project: "${var.project_id}"
+        service: "monitoring.googleapis.com"
+        disable_dependent_services: true
+        depends_on: ["enable_storage_api"]
+    
+    enable_logging_api:
+      type: google_project_service
+      properties:
+        project: "${var.project_id}"
+        service: "logging.googleapis.com"
+        disable_dependent_services: true
+        depends_on: ["enable_monitoring_api"]
+    
+    enable_networkmanagement_api:
+      type: google_project_service
+      properties:
+        project: "${var.project_id}"
+        service: "networkmanagement.googleapis.com"
+        disable_dependent_services: true
+        depends_on: ["enable_logging_api"]
+    
+    # Multi-region Cloud Storage bucket for global content distribution
+    global_content_bucket:
+      type: google_storage_bucket
+      properties:
+        name: "global-content-${random_suffix.hex}"
+        project: "${var.project_id}"
+        location: "US"  # Multi-region bucket for global distribution
+        storage_class: "${var.bucket_storage_class}"
+        force_destroy: true
+        
+        # Enable versioning for content protection and rollback
+        versioning:
+          enabled: true
+        
+        # Configure lifecycle management for cost optimization
+        lifecycle_rule:
+          - condition:
+              age: 30
+              with_state: "ARCHIVED"
+            action:
+              type: "Delete"
+          - condition:
+              age: 365
+            action:
+              type: "SetStorageClass"
+              storage_class: "COLDLINE"
+        
+        # Enable uniform bucket-level access for simplified IAM
+        uniform_bucket_level_access: true
+        
+        # Add labels for resource management
+        labels:
+          purpose: "global-content-delivery"
+          recipe: "cloud-wan-anywhere-cache"
+          environment: "demo"
+        
+        depends_on: ["enable_storage_api"]
+    
+    # IAM binding for public read access (conditional)
+    bucket_public_access:
+      type: google_storage_bucket_iam_member
+      count: "${var.enable_public_access ? 1 : 0}"
+      properties:
+        bucket: "${google_storage_bucket.global_content_bucket.name}"
+        role: "roles/storage.objectViewer"
+        member: "allUsers"
+        depends_on: ["global_content_bucket"]
+    
+    # Cloud WAN Hub for enterprise networking backbone
+    enterprise_wan_hub:
+      type: google_network_connectivity_hub
+      properties:
+        name: "enterprise-wan-${random_suffix.hex}"
+        project: "${var.project_id}"
+        description: "Global content delivery WAN hub leveraging Google's backbone"
+        
+        labels:
+          purpose: "global-content-delivery"
+          recipe: "cloud-wan-anywhere-cache"
+          environment: "demo"
+        
+        depends_on: ["enable_networkmanagement_api"]
+    
+    # Cloud WAN Spokes for multi-region connectivity
+    primary_region_spoke:
+      type: google_network_connectivity_spoke
+      properties:
+        name: "primary-spoke-${random_suffix.hex}"
+        project: "${var.project_id}"
+        location: "${var.primary_region}"
+        hub: "${google_network_connectivity_hub.enterprise_wan_hub.id}"
+        description: "Primary region spoke for ${var.primary_region}"
+        
+        labels:
+          purpose: "global-content-delivery"
+          region: "primary"
+          recipe: "cloud-wan-anywhere-cache"
+        
+        depends_on: ["enterprise_wan_hub"]
+    
+    secondary_region_spoke:
+      type: google_network_connectivity_spoke
+      properties:
+        name: "secondary-spoke-${random_suffix.hex}"
+        project: "${var.project_id}"
+        location: "${var.secondary_region}"
+        hub: "${google_network_connectivity_hub.enterprise_wan_hub.id}"
+        description: "Secondary region spoke for ${var.secondary_region}"
+        
+        labels:
+          purpose: "global-content-delivery"
+          region: "secondary"
+          recipe: "cloud-wan-anywhere-cache"
+        
+        depends_on: ["enterprise_wan_hub"]
+    
+    tertiary_region_spoke:
+      type: google_network_connectivity_spoke
+      properties:
+        name: "tertiary-spoke-${random_suffix.hex}"
+        project: "${var.project_id}"
+        location: "${var.tertiary_region}"
+        hub: "${google_network_connectivity_hub.enterprise_wan_hub.id}"
+        description: "Tertiary region spoke for ${var.tertiary_region}"
+        
+        labels:
+          purpose: "global-content-delivery"
+          region: "tertiary"
+          recipe: "cloud-wan-anywhere-cache"
+        
+        depends_on: ["enterprise_wan_hub"]
+    
+    # Anywhere Cache instances for regional high-performance caching
+    primary_anywhere_cache:
+      type: google_storage_bucket_anywhere_cache
+      properties:
+        bucket: "${google_storage_bucket.global_content_bucket.name}"
+        zone: "${var.primary_region}-a"
+        ttl: "${var.cache_ttl_seconds}s"
+        
+        depends_on: ["global_content_bucket"]
+    
+    secondary_anywhere_cache:
+      type: google_storage_bucket_anywhere_cache
+      properties:
+        bucket: "${google_storage_bucket.global_content_bucket.name}"
+        zone: "${var.secondary_region}-b"
+        ttl: "${var.cache_ttl_seconds}s"
+        
+        depends_on: ["global_content_bucket"]
+    
+    tertiary_anywhere_cache:
+      type: google_storage_bucket_anywhere_cache
+      properties:
+        bucket: "${google_storage_bucket.global_content_bucket.name}"
+        zone: "${var.tertiary_region}-a"
+        ttl: "${var.cache_ttl_seconds}s"
+        
+        depends_on: ["global_content_bucket"]
+    
+    # Default VPC network for compute instances
+    default_network:
+      type: google_compute_network
+      properties:
+        name: "content-delivery-network-${random_suffix.hex}"
+        project: "${var.project_id}"
+        auto_create_subnetworks: true
+        description: "Default network for content delivery infrastructure"
+        
+        depends_on: ["enable_compute_api"]
+    
+    # Firewall rule to allow HTTP traffic for content servers
+    allow_http_firewall:
+      type: google_compute_firewall
+      properties:
+        name: "allow-http-${random_suffix.hex}"
+        project: "${var.project_id}"
+        network: "${google_compute_network.default_network.name}"
+        description: "Allow HTTP traffic for content servers"
+        
+        allow:
+          - protocol: "tcp"
+            ports: ["80", "8080"]
+        
+        source_ranges: ["0.0.0.0/0"]
+        target_tags: ["content-server"]
+        
+        depends_on: ["default_network"]
+    
+    # Firewall rule to allow SSH access for management
+    allow_ssh_firewall:
+      type: google_compute_firewall
+      properties:
+        name: "allow-ssh-${random_suffix.hex}"
+        project: "${var.project_id}"
+        network: "${google_compute_network.default_network.name}"
+        description: "Allow SSH access for instance management"
+        
+        allow:
+          - protocol: "tcp"
+            ports: ["22"]
+        
+        source_ranges: ["0.0.0.0/0"]
+        target_tags: ["content-server"]
+        
+        depends_on: ["default_network"]
+    
+    # Compute Engine instances for content generation and processing
+    primary_content_server:
+      type: google_compute_instance
+      properties:
+        name: "content-server-primary-${random_suffix.hex}"
+        project: "${var.project_id}"
+        zone: "${var.primary_region}-a"
+        machine_type: "${var.compute_machine_type}"
+        description: "Primary region content server"
+        
+        boot_disk:
+          initialize_params:
+            image: "ubuntu-os-cloud/ubuntu-2004-lts"
+            size: 50
+            type: "pd-standard"
+        
+        network_interface:
+          network: "${google_compute_network.default_network.name}"
+          access_config: {}  # Ephemeral external IP
+        
+        tags: ["content-server"]
+        
+        # Startup script to install and configure nginx
+        metadata_startup_script: |
+          #!/bin/bash
+          apt-get update
+          apt-get install -y nginx
+          
+          # Create a simple index page with region information
+          cat > /var/www/html/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>Global Content Delivery - Primary Region</title>
+          </head>
+          <body>
+              <h1>Content Server - Primary Region (${var.primary_region})</h1>
+              <p>This server is part of the global content delivery infrastructure.</p>
+              <p>Served from: ${var.primary_region}-a</p>
+              <p>Timestamp: $(date)</p>
+          </body>
+          </html>
+          EOF
+          
+          systemctl start nginx
+          systemctl enable nginx
+          
+          # Log successful startup
+          echo "Content server startup completed on $(date)" >> /var/log/startup.log
+        
+        labels:
+          purpose: "content-server"
+          region: "primary"
+          recipe: "cloud-wan-anywhere-cache"
+        
+        depends_on: ["allow_http_firewall", "allow_ssh_firewall"]
+    
+    secondary_content_server:
+      type: google_compute_instance
+      properties:
+        name: "content-server-secondary-${random_suffix.hex}"
+        project: "${var.project_id}"
+        zone: "${var.secondary_region}-b"
+        machine_type: "${var.compute_machine_type}"
+        description: "Secondary region content server"
+        
+        boot_disk:
+          initialize_params:
+            image: "ubuntu-os-cloud/ubuntu-2004-lts"
+            size: 50
+            type: "pd-standard"
+        
+        network_interface:
+          network: "${google_compute_network.default_network.name}"
+          access_config: {}  # Ephemeral external IP
+        
+        tags: ["content-server"]
+        
+        # Startup script to install and configure nginx
+        metadata_startup_script: |
+          #!/bin/bash
+          apt-get update
+          apt-get install -y nginx
+          
+          # Create a simple index page with region information
+          cat > /var/www/html/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>Global Content Delivery - Secondary Region</title>
+          </head>
+          <body>
+              <h1>Content Server - Secondary Region (${var.secondary_region})</h1>
+              <p>This server is part of the global content delivery infrastructure.</p>
+              <p>Served from: ${var.secondary_region}-b</p>
+              <p>Timestamp: $(date)</p>
+          </body>
+          </html>
+          EOF
+          
+          systemctl start nginx
+          systemctl enable nginx
+          
+          # Log successful startup
+          echo "Content server startup completed on $(date)" >> /var/log/startup.log
+        
+        labels:
+          purpose: "content-server"
+          region: "secondary"
+          recipe: "cloud-wan-anywhere-cache"
+        
+        depends_on: ["allow_http_firewall", "allow_ssh_firewall"]
+    
+    tertiary_content_server:
+      type: google_compute_instance
+      properties:
+        name: "content-server-tertiary-${random_suffix.hex}"
+        project: "${var.project_id}"
+        zone: "${var.tertiary_region}-a"
+        machine_type: "${var.compute_machine_type}"
+        description: "Tertiary region content server"
+        
+        boot_disk:
+          initialize_params:
+            image: "ubuntu-os-cloud/ubuntu-2004-lts"
+            size: 50
+            type: "pd-standard"
+        
+        network_interface:
+          network: "${google_compute_network.default_network.name}"
+          access_config: {}  # Ephemeral external IP
+        
+        tags: ["content-server"]
+        
+        # Startup script to install and configure nginx
+        metadata_startup_script: |
+          #!/bin/bash
+          apt-get update
+          apt-get install -y nginx
+          
+          # Create a simple index page with region information
+          cat > /var/www/html/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>Global Content Delivery - Tertiary Region</title>
+          </head>
+          <body>
+              <h1>Content Server - Tertiary Region (${var.tertiary_region})</h1>
+              <p>This server is part of the global content delivery infrastructure.</p>
+              <p>Served from: ${var.tertiary_region}-a</p>
+              <p>Timestamp: $(date)</p>
+          </body>
+          </html>
+          EOF
+          
+          systemctl start nginx
+          systemctl enable nginx
+          
+          # Log successful startup
+          echo "Content server startup completed on $(date)" >> /var/log/startup.log
+        
+        labels:
+          purpose: "content-server"
+          region: "tertiary"
+          recipe: "cloud-wan-anywhere-cache"
+        
+        depends_on: ["allow_http_firewall", "allow_ssh_firewall"]
+    
+    # Global IP address for load balancer
+    global_ip_address:
+      type: google_compute_global_address
+      properties:
+        name: "content-delivery-ip-${random_suffix.hex}"
+        project: "${var.project_id}"
+        description: "Global IP address for content delivery load balancer"
+        
+        depends_on: ["enable_compute_api"]
+    
+    # Health check for backend services
+    health_check:
+      type: google_compute_health_check
+      properties:
+        name: "content-health-check-${random_suffix.hex}"
+        project: "${var.project_id}"
+        description: "Health check for content servers"
+        
+        timeout_sec: 5
+        check_interval_sec: 10
+        healthy_threshold: 2
+        unhealthy_threshold: 3
+        
+        http_health_check:
+          port: 80
+          request_path: "/"
+        
+        depends_on: ["enable_compute_api"]
+    
+    # Instance groups for load balancing
+    primary_instance_group:
+      type: google_compute_instance_group
+      properties:
+        name: "primary-instance-group-${random_suffix.hex}"
+        project: "${var.project_id}"
+        zone: "${var.primary_region}-a"
+        description: "Instance group for primary region content servers"
+        
+        instances: ["${google_compute_instance.primary_content_server.self_link}"]
+        
+        named_port:
+          - name: "http"
+            port: 80
+        
+        depends_on: ["primary_content_server"]
+    
+    # Backend service with CDN enabled
+    backend_service:
+      type: google_compute_backend_service
+      properties:
+        name: "content-backend-service-${random_suffix.hex}"
+        project: "${var.project_id}"
+        description: "Backend service for global content delivery with CDN"
+        
+        protocol: "HTTP"
+        port_name: "http"
+        timeout_sec: 30
+        enable_cdn: true
+        
+        # CDN policy configuration for optimal caching
+        cdn_policy:
+          cache_mode: "CACHE_ALL_STATIC"
+          default_ttl: 3600
+          max_ttl: 86400
+          client_ttl: 300
+          negative_caching: true
+          negative_caching_policy:
+            - code: 404
+              ttl: 300
+            - code: 410
+              ttl: 300
+        
+        # Backend configuration
+        backend:
+          - group: "${google_compute_instance_group.primary_instance_group.self_link}"
+            balancing_mode: "UTILIZATION"
+            max_utilization: 0.8
+            capacity_scaler: 1.0
+        
+        health_checks: ["${google_compute_health_check.health_check.self_link}"]
+        
+        depends_on: ["primary_instance_group", "health_check"]
+    
+    # URL map for routing
+    url_map:
+      type: google_compute_url_map
+      properties:
+        name: "content-url-map-${random_suffix.hex}"
+        project: "${var.project_id}"
+        description: "URL map for content delivery routing"
+        
+        default_service: "${google_compute_backend_service.backend_service.self_link}"
+        
+        depends_on: ["backend_service"]
+    
+    # Target HTTP proxy
+    target_http_proxy:
+      type: google_compute_target_http_proxy
+      properties:
+        name: "content-target-proxy-${random_suffix.hex}"
+        project: "${var.project_id}"
+        description: "Target HTTP proxy for content delivery"
+        
+        url_map: "${google_compute_url_map.url_map.self_link}"
+        
+        depends_on: ["url_map"]
+    
+    # Global forwarding rule to complete load balancer setup
+    forwarding_rule:
+      type: google_compute_global_forwarding_rule
+      properties:
+        name: "content-forwarding-rule-${random_suffix.hex}"
+        project: "${var.project_id}"
+        description: "Global forwarding rule for content delivery"
+        
+        ip_address: "${google_compute_global_address.global_ip_address.address}"
+        ip_protocol: "TCP"
+        port_range: "80"
+        target: "${google_compute_target_http_proxy.target_http_proxy.self_link}"
+        
+        depends_on: ["target_http_proxy", "global_ip_address"]
+    
+    # Cloud Monitoring Dashboard (conditional)
+    monitoring_dashboard:
+      type: google_monitoring_dashboard
+      count: "${var.enable_monitoring ? 1 : 0}"
+      properties:
+        project: "${var.project_id}"
+        dashboard_json: |
+          {
+            "displayName": "Global Content Delivery Performance - ${random_suffix.hex}",
+            "mosaicLayout": {
+              "tiles": [
+                {
+                  "width": 6,
+                  "height": 4,
+                  "widget": {
+                    "title": "CDN Cache Hit Rate",
+                    "xyChart": {
+                      "dataSets": [
+                        {
+                          "timeSeriesQuery": {
+                            "timeSeriesFilter": {
+                              "filter": "resource.type=\"http_load_balancer\" AND metric.type=\"loadbalancing.googleapis.com/https/request_count\"",
+                              "aggregation": {
+                                "alignmentPeriod": "300s",
+                                "perSeriesAligner": "ALIGN_RATE",
+                                "crossSeriesReducer": "REDUCE_SUM"
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "width": 6,
+                  "height": 4,
+                  "yPos": 0,
+                  "xPos": 6,
+                  "widget": {
+                    "title": "Backend Response Latency",
+                    "xyChart": {
+                      "dataSets": [
+                        {
+                          "timeSeriesQuery": {
+                            "timeSeriesFilter": {
+                              "filter": "resource.type=\"http_load_balancer\" AND metric.type=\"loadbalancing.googleapis.com/https/backend_latencies\"",
+                              "aggregation": {
+                                "alignmentPeriod": "300s",
+                                "perSeriesAligner": "ALIGN_MEAN",
+                                "crossSeriesReducer": "REDUCE_MEAN"
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "width": 12,
+                  "height": 4,
+                  "yPos": 4,
+                  "widget": {
+                    "title": "Storage Bucket Request Count",
+                    "xyChart": {
+                      "dataSets": [
+                        {
+                          "timeSeriesQuery": {
+                            "timeSeriesFilter": {
+                              "filter": "resource.type=\"gcs_bucket\" AND metric.type=\"storage.googleapis.com/api/request_count\"",
+                              "aggregation": {
+                                "alignmentPeriod": "300s",
+                                "perSeriesAligner": "ALIGN_RATE",
+                                "crossSeriesReducer": "REDUCE_SUM"
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        
+        depends_on: ["enable_monitoring_api"]
+
+  # Output values for verification and integration
+  outputs:
+    # Project and resource identification
+    project_id:
+      description: "Google Cloud Project ID"
+      value: "${var.project_id}"
+    
+    bucket_name:
+      description: "Name of the global content storage bucket"
+      value: "${google_storage_bucket.global_content_bucket.name}"
+    
+    bucket_url:
+      description: "URL of the global content storage bucket"
+      value: "${google_storage_bucket.global_content_bucket.url}"
+    
+    # Network and connectivity information
+    wan_hub_name:
+      description: "Name of the Cloud WAN hub"
+      value: "${google_network_connectivity_hub.enterprise_wan_hub.name}"
+    
+    wan_hub_id:
+      description: "Full resource ID of the Cloud WAN hub"
+      value: "${google_network_connectivity_hub.enterprise_wan_hub.id}"
+    
+    # Regional spoke information
+    primary_spoke_name:
+      description: "Name of the primary region WAN spoke"
+      value: "${google_network_connectivity_spoke.primary_region_spoke.name}"
+    
+    secondary_spoke_name:
+      description: "Name of the secondary region WAN spoke"
+      value: "${google_network_connectivity_spoke.secondary_region_spoke.name}"
+    
+    tertiary_spoke_name:
+      description: "Name of the tertiary region WAN spoke"
+      value: "${google_network_connectivity_spoke.tertiary_region_spoke.name}"
+    
+    # Anywhere Cache information
+    anywhere_caches:
+      description: "Anywhere Cache instances across regions"
+      value:
+        primary: "${google_storage_bucket_anywhere_cache.primary_anywhere_cache.zone}"
+        secondary: "${google_storage_bucket_anywhere_cache.secondary_anywhere_cache.zone}"
+        tertiary: "${google_storage_bucket_anywhere_cache.tertiary_anywhere_cache.zone}"
+    
+    # Compute instance information
+    content_servers:
+      description: "Content server instances across regions"
+      value:
+        primary: 
+          name: "${google_compute_instance.primary_content_server.name}"
+          zone: "${google_compute_instance.primary_content_server.zone}"
+          external_ip: "${google_compute_instance.primary_content_server.network_interface.0.access_config.0.nat_ip}"
+        secondary:
+          name: "${google_compute_instance.secondary_content_server.name}"
+          zone: "${google_compute_instance.secondary_content_server.zone}"
+          external_ip: "${google_compute_instance.secondary_content_server.network_interface.0.access_config.0.nat_ip}"
+        tertiary:
+          name: "${google_compute_instance.tertiary_content_server.name}"
+          zone: "${google_compute_instance.tertiary_content_server.zone}"
+          external_ip: "${google_compute_instance.tertiary_content_server.network_interface.0.access_config.0.nat_ip}"
+    
+    # Load balancer and CDN information
+    global_ip_address:
+      description: "Global IP address for the load balancer"
+      value: "${google_compute_global_address.global_ip_address.address}"
+    
+    cdn_enabled:
+      description: "Indicates if CDN is enabled on the backend service"
+      value: true
+    
+    load_balancer_url:
+      description: "URL to access the global load balancer"
+      value: "http://${google_compute_global_address.global_ip_address.address}"
+    
+    # Monitoring information
+    monitoring_enabled:
+      description: "Indicates if monitoring dashboard is enabled"
+      value: "${var.enable_monitoring}"
+    
+    # Deployment metadata
+    deployment_regions:
+      description: "Regions where infrastructure is deployed"
+      value:
+        primary: "${var.primary_region}"
+        secondary: "${var.secondary_region}"
+        tertiary: "${var.tertiary_region}"
+    
+    cache_ttl:
+      description: "Configured TTL for Anywhere Cache instances"
+      value: "${var.cache_ttl_seconds}"
+    
+    # Validation commands
+    validation_commands:
+      description: "Commands to validate the deployment"
+      value:
+        bucket_status: "gsutil ls -L -b gs://${google_storage_bucket.global_content_bucket.name}"
+        cache_status: "gcloud storage anywhere-caches list --bucket=${google_storage_bucket.global_content_bucket.name}"
+        wan_hub_status: "gcloud network-connectivity hubs describe ${google_network_connectivity_hub.enterprise_wan_hub.name}"
+        load_balancer_test: "curl -I http://${google_compute_global_address.global_ip_address.address}"

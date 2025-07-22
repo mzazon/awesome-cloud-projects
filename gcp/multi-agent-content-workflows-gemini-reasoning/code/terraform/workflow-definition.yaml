@@ -1,0 +1,537 @@
+# =============================================================================
+# Cloud Workflows Definition for Multi-Agent Content Analysis
+# =============================================================================
+# This workflow orchestrates multiple AI agents to process different content
+# types and synthesizes results using Gemini 2.5's reasoning capabilities.
+# =============================================================================
+
+main:
+  params: [input]
+  steps:
+    - initialize:
+        assign:
+          - content_uri: $${input.content_uri}
+          - content_type: $${input.content_type}
+          - analysis_results: {}
+          - project_id: "${project_id}"
+          - region: "${region}"
+          - bucket_name: "${bucket_name}"
+    
+    - load_configuration:
+        try:
+          call: http.get
+          args:
+            url: $${"https://storage.googleapis.com/" + bucket_name + "/config/gemini-config.json"}
+            headers:
+              Authorization: $${"Bearer " + sys.get_env("GOOGLE_CLOUD_ACCESS_TOKEN")}
+          result: config_response
+        except:
+          as: e
+          steps:
+            - log_config_error:
+                call: sys.log
+                args:
+                  text: $${"Failed to load configuration: " + string(e)}
+                  severity: "WARNING"
+            - use_default_config:
+                assign:
+                  - config_response:
+                      body: |
+                        {
+                          "reasoning_config": {
+                            "temperature": 0.1,
+                            "top_p": 0.9,
+                            "max_output_tokens": 4096
+                          }
+                        }
+    
+    - parse_config:
+        assign:
+          - config: $${json.decode(config_response.body)}
+    
+    - determine_processing_strategy:
+        switch:
+          - condition: $${content_type == "text"}
+            steps:
+              - process_text_content:
+                  call: text_analysis_agent
+                  args:
+                    content_uri: $${content_uri}
+                    config: $${config}
+                    project_id: $${project_id}
+                    region: $${region}
+                  result: text_result
+              - store_text_result:
+                  assign:
+                    - analysis_results.text: $${text_result}
+          
+          - condition: $${content_type == "image"}
+            steps:
+              - process_image_content:
+                  call: image_analysis_agent
+                  args:
+                    content_uri: $${content_uri}
+                    config: $${config}
+                    project_id: $${project_id}
+                    region: $${region}
+                  result: image_result
+              - store_image_result:
+                  assign:
+                    - analysis_results.image: $${image_result}
+          
+          - condition: $${content_type == "video"}
+            steps:
+              - process_video_content:
+                  call: video_analysis_agent
+                  args:
+                    content_uri: $${content_uri}
+                    config: $${config}
+                    project_id: $${project_id}
+                    region: $${region}
+                  result: video_result
+              - store_video_result:
+                  assign:
+                    - analysis_results.video: $${video_result}
+          
+          - condition: $${content_type == "multi_modal"}
+            steps:
+              - parallel_processing:
+                  parallel:
+                    branches:
+                      - text_branch:
+                          steps:
+                            - process_text:
+                                call: text_analysis_agent
+                                args:
+                                  content_uri: $${content_uri}
+                                  config: $${config}
+                                  project_id: $${project_id}
+                                  region: $${region}
+                                result: text_result
+                      - image_branch:
+                          steps:
+                            - process_image:
+                                call: image_analysis_agent
+                                args:
+                                  content_uri: $${content_uri}
+                                  config: $${config}
+                                  project_id: $${project_id}
+                                  region: $${region}
+                                result: image_result
+                      - video_branch:
+                          steps:
+                            - process_video:
+                                call: video_analysis_agent
+                                args:
+                                  content_uri: $${content_uri}
+                                  config: $${config}
+                                  project_id: $${project_id}
+                                  region: $${region}
+                                result: video_result
+                  result: parallel_results
+              - aggregate_parallel_results:
+                  assign:
+                    - analysis_results.text: $${parallel_results.text_branch}
+                    - analysis_results.image: $${parallel_results.image_branch}
+                    - analysis_results.video: $${parallel_results.video_branch}
+    
+    - reasoning_synthesis:
+        call: gemini_reasoning_engine
+        args:
+          analysis_data: $${analysis_results}
+          content_uri: $${content_uri}
+          config: $${config}
+          project_id: $${project_id}
+          region: $${region}
+        result: final_intelligence
+    
+    - store_results:
+        try:
+          call: http.post
+          args:
+            url: $${"https://storage.googleapis.com/upload/storage/v1/b/" + bucket_name + "/o"}
+            headers:
+              Authorization: $${"Bearer " + sys.get_env("GOOGLE_CLOUD_ACCESS_TOKEN")}
+              Content-Type: "application/json"
+            query:
+              uploadType: "media"
+              name: $${"results/" + text.split(content_uri, "/")[-1] + "_analysis.json"}
+            body:
+              $${base64.encode(text.encode(json.encode(final_intelligence)))}
+        except:
+          as: e
+          steps:
+            - log_storage_error:
+                call: sys.log
+                args:
+                  text: $${"Failed to store results: " + string(e)}
+                  severity: "ERROR"
+    
+    - return_results:
+        return: $${final_intelligence}
+
+# Text Analysis Agent Subworkflow
+# -----------------------------------------------------------------------------
+text_analysis_agent:
+  params: [content_uri, config, project_id, region]
+  steps:
+    - call_gemini_text:
+        try:
+          call: http.post
+          args:
+            url: $${"https://" + region + "-aiplatform.googleapis.com/v1/projects/" + project_id + "/locations/" + region + "/publishers/google/models/gemini-2.5-pro:generateContent"}
+            headers:
+              Authorization: $${"Bearer " + sys.get_env("GOOGLE_CLOUD_ACCESS_TOKEN")}
+              Content-Type: "application/json"
+            body:
+              contents:
+                - parts:
+                  - text: |
+                      Analyze this text content for comprehensive business intelligence:
+                      
+                      Content URI: $${content_uri}
+                      
+                      Provide detailed analysis including:
+                      1. KEY THEMES AND TOPICS: Identify main subjects and subtopics
+                      2. SENTIMENT ANALYSIS: Overall emotional tone and sentiment patterns
+                      3. ENTITY EXTRACTION: People, places, organizations, dates, numbers
+                      4. CONTENT CATEGORIZATION: Business category, document type, purpose
+                      5. SUMMARY AND INSIGHTS: Executive summary with key takeaways
+                      6. QUALITY ASSESSMENT: Content quality, clarity, completeness
+                      7. BUSINESS RELEVANCE: Strategic importance and actionable insights
+                      8. CONFIDENCE SCORES: Reliability assessment for each analysis component
+                      
+                      Format your response as structured JSON with clear sections.
+              generationConfig:
+                temperature: $${config.reasoning_config.temperature}
+                topP: $${config.reasoning_config.top_p}
+                maxOutputTokens: 2048
+          result: gemini_response
+        except:
+          as: e
+          steps:
+            - log_text_error:
+                call: sys.log
+                args:
+                  text: $${"Text analysis failed: " + string(e)}
+                  severity: "ERROR"
+            - return_error_result:
+                return:
+                  agent_type: "text_analyzer"
+                  content_uri: $${content_uri}
+                  error: $${string(e)}
+                  analysis: "Analysis failed - please check content format and try again"
+                  confidence_score: 0.0
+    
+    - return_analysis:
+        return:
+          agent_type: "text_analyzer"
+          content_uri: $${content_uri}
+          analysis: $${gemini_response.body.candidates[0].content.parts[0].text}
+          confidence_score: 0.95
+          processing_time: $${time.format(sys.now())}
+
+# Image Analysis Agent Subworkflow
+# -----------------------------------------------------------------------------
+image_analysis_agent:
+  params: [content_uri, config, project_id, region]
+  steps:
+    - call_vision_api:
+        try:
+          call: http.post
+          args:
+            url: "https://vision.googleapis.com/v1/images:annotate"
+            headers:
+              Authorization: $${"Bearer " + sys.get_env("GOOGLE_CLOUD_ACCESS_TOKEN")}
+              Content-Type: "application/json"
+            body:
+              requests:
+                - image:
+                    source:
+                      gcsImageUri: $${content_uri}
+                  features:
+                    - type: "LABEL_DETECTION"
+                      maxResults: 20
+                    - type: "TEXT_DETECTION"
+                    - type: "OBJECT_LOCALIZATION"
+                      maxResults: 10
+                    - type: "SAFE_SEARCH_DETECTION"
+                    - type: "IMAGE_PROPERTIES"
+                    - type: "CROP_HINTS"
+                      maxResults: 5
+          result: vision_response
+        except:
+          as: e
+          steps:
+            - log_vision_error:
+                call: sys.log
+                args:
+                  text: $${"Vision API failed: " + string(e)}
+                  severity: "ERROR"
+            - return_vision_error:
+                return:
+                  agent_type: "image_analyzer"
+                  content_uri: $${content_uri}
+                  error: $${string(e)}
+                  confidence_score: 0.0
+    
+    - enhance_with_gemini:
+        try:
+          call: http.post
+          args:
+            url: $${"https://" + region + "-aiplatform.googleapis.com/v1/projects/" + project_id + "/locations/" + region + "/publishers/google/models/gemini-2.5-pro:generateContent"}
+            headers:
+              Authorization: $${"Bearer " + sys.get_env("GOOGLE_CLOUD_ACCESS_TOKEN")}
+              Content-Type: "application/json"
+            body:
+              contents:
+                - parts:
+                  - text: |
+                      Analyze this image analysis data and provide comprehensive business insights:
+                      
+                      Vision API Results: $${json.encode(vision_response.body)}
+                      Image URI: $${content_uri}
+                      
+                      Provide detailed analysis including:
+                      1. SCENE UNDERSTANDING: What is depicted in the image
+                      2. BUSINESS CONTEXT: Commercial relevance and applications
+                      3. CONTENT CATEGORIZATION: Image type, purpose, industry relevance
+                      4. QUALITY ASSESSMENT: Technical quality, composition, usability
+                      5. TEXT CONTENT: Any text detected and its significance
+                      6. OBJECT ANALYSIS: Key objects and their business relevance
+                      7. BRAND ELEMENTS: Logos, branding, marketing elements
+                      8. ACTIONABLE INSIGHTS: Specific recommendations and opportunities
+                      
+                      Format response as structured analysis with confidence scores.
+              generationConfig:
+                temperature: $${config.reasoning_config.temperature}
+                topP: $${config.reasoning_config.top_p}
+                maxOutputTokens: 1024
+          result: enhanced_analysis
+        except:
+          as: e
+          steps:
+            - log_gemini_enhance_error:
+                call: sys.log
+                args:
+                  text: $${"Gemini enhancement failed: " + string(e)}
+                  severity: "WARNING"
+            - use_vision_only:
+                assign:
+                  - enhanced_analysis:
+                      body:
+                        candidates:
+                          - content:
+                              parts:
+                                - text: "Enhanced analysis unavailable, using Vision API results only"
+    
+    - return_analysis:
+        return:
+          agent_type: "image_analyzer"
+          content_uri: $${content_uri}
+          vision_data: $${vision_response.body}
+          enhanced_insights: $${enhanced_analysis.body.candidates[0].content.parts[0].text}
+          confidence_score: 0.88
+          processing_time: $${time.format(sys.now())}
+
+# Video Analysis Agent Subworkflow
+# -----------------------------------------------------------------------------
+video_analysis_agent:
+  params: [content_uri, config, project_id, region]
+  steps:
+    - extract_audio_transcript:
+        try:
+          call: http.post
+          args:
+            url: "https://speech.googleapis.com/v1/speech:longrunningrecognize"
+            headers:
+              Authorization: $${"Bearer " + sys.get_env("GOOGLE_CLOUD_ACCESS_TOKEN")}
+              Content-Type: "application/json"
+            body:
+              config:
+                encoding: "LINEAR16"
+                sampleRateHertz: 16000
+                languageCode: "en-US"
+                enableAutomaticPunctuation: true
+                enableWordTimeOffsets: true
+                model: "latest_long"
+                useEnhanced: true
+              audio:
+                uri: $${content_uri}
+          result: speech_operation
+        except:
+          as: e
+          steps:
+            - log_speech_error:
+                call: sys.log
+                args:
+                  text: $${"Speech-to-Text failed: " + string(e)}
+                  severity: "ERROR"
+            - return_speech_error:
+                return:
+                  agent_type: "video_analyzer"
+                  content_uri: $${content_uri}
+                  error: $${string(e)}
+                  confidence_score: 0.0
+    
+    - analyze_with_gemini:
+        try:
+          call: http.post
+          args:
+            url: $${"https://" + region + "-aiplatform.googleapis.com/v1/projects/" + project_id + "/locations/" + region + "/publishers/google/models/gemini-2.5-pro:generateContent"}
+            headers:
+              Authorization: $${"Bearer " + sys.get_env("GOOGLE_CLOUD_ACCESS_TOKEN")}
+              Content-Type: "application/json"
+            body:
+              contents:
+                - parts:
+                  - text: |
+                      Analyze this video/audio content based on the speech recognition data:
+                      
+                      Speech Operation: $${json.encode(speech_operation.body)}
+                      Content URI: $${content_uri}
+                      
+                      Provide comprehensive analysis including:
+                      1. CONTENT THEMES: Main topics and discussion points
+                      2. SPEAKER ANALYSIS: Tone, engagement level, presentation style
+                      3. KEY MOMENTS: Important timestamps and highlights
+                      4. CONTENT STRUCTURE: Organization, flow, transitions
+                      5. BUSINESS INSIGHTS: Commercial value and applications
+                      6. AUDIENCE ASSESSMENT: Target audience and effectiveness
+                      7. QUALITY METRICS: Audio quality, clarity, professionalism
+                      8. ACTIONABLE RECOMMENDATIONS: Specific improvement suggestions
+                      
+                      Include confidence scores and timing information where available.
+              generationConfig:
+                temperature: $${config.reasoning_config.temperature}
+                topP: $${config.reasoning_config.top_p}
+                maxOutputTokens: 1536
+          result: video_analysis
+        except:
+          as: e
+          steps:
+            - log_video_analysis_error:
+                call: sys.log
+                args:
+                  text: $${"Video analysis failed: " + string(e)}
+                  severity: "ERROR"
+            - return_video_error:
+                return:
+                  agent_type: "video_analyzer"
+                  content_uri: $${content_uri}
+                  error: $${string(e)}
+                  confidence_score: 0.0
+    
+    - return_analysis:
+        return:
+          agent_type: "video_analyzer"
+          content_uri: $${content_uri}
+          transcript_data: $${speech_operation.body}
+          content_analysis: $${video_analysis.body.candidates[0].content.parts[0].text}
+          confidence_score: 0.82
+          processing_time: $${time.format(sys.now())}
+
+# Gemini 2.5 Reasoning Engine for Final Synthesis
+# -----------------------------------------------------------------------------
+gemini_reasoning_engine:
+  params: [analysis_data, content_uri, config, project_id, region]
+  steps:
+    - synthesize_intelligence:
+        try:
+          call: http.post
+          args:
+            url: $${"https://" + region + "-aiplatform.googleapis.com/v1/projects/" + project_id + "/locations/" + region + "/publishers/google/models/gemini-2.5-pro:generateContent"}
+            headers:
+              Authorization: $${"Bearer " + sys.get_env("GOOGLE_CLOUD_ACCESS_TOKEN")}
+              Content-Type: "application/json"
+            body:
+              contents:
+                - parts:
+                  - text: |
+                      ADVANCED REASONING ENGINE - CONTENT INTELLIGENCE SYNTHESIS
+                      
+                      Multi-Agent Analysis Results: $${json.encode(analysis_data)}
+                      Content URI: $${content_uri}
+                      Processing Timestamp: $${time.format(sys.now())}
+                      
+                      Execute comprehensive reasoning across these dimensions:
+                      
+                      1. CROSS-MODAL COHERENCE ANALYSIS:
+                         - Identify consistency patterns across text, visual, and audio elements
+                         - Detect contradictions or reinforcing evidence between modalities
+                         - Synthesize unified narrative that reconciles all data sources
+                         - Assess information reliability across different content types
+                      
+                      2. EMERGENT INSIGHT DETECTION:
+                         - Apply advanced reasoning to discover insights not apparent to individual agents
+                         - Identify hidden relationships, patterns, and implications
+                         - Generate novel perspectives through multi-agent synthesis
+                         - Detect emergent themes that span multiple content modalities
+                      
+                      3. BUSINESS INTELLIGENCE REASONING:
+                         - Transform technical analysis into strategic business insights
+                         - Reason about market implications and competitive positioning
+                         - Generate actionable recommendations with ROI potential
+                         - Assess business risks and mitigation strategies
+                      
+                      4. CONFIDENCE AND UNCERTAINTY REASONING:
+                         - Assess reliability of insights across different modalities
+                         - Identify areas requiring additional analysis or validation
+                         - Provide confidence intervals and uncertainty quantification
+                         - Recommend data collection strategies for improvement
+                      
+                      5. TREND AND PATTERN REASONING:
+                         - Analyze content within broader industry and market contexts
+                         - Identify alignment with or deviation from established patterns
+                         - Predict potential future implications and opportunities
+                         - Assess timing and market readiness for identified opportunities
+                      
+                      6. STAKEHOLDER IMPACT ANALYSIS:
+                         - Reason about impact on different business stakeholders
+                         - Identify potential conflicts or alignment of interests
+                         - Recommend stakeholder-specific communication strategies
+                         - Assess change management implications
+                      
+                      Provide comprehensive intelligence that exceeds the sum of individual
+                      agent capabilities. Focus on actionable insights that drive strategic
+                      business decision-making. Include confidence scores, reasoning chains,
+                      and specific implementation recommendations.
+              generationConfig:
+                temperature: $${config.reasoning_config.temperature}
+                topP: $${config.reasoning_config.top_p}
+                maxOutputTokens: $${config.reasoning_config.max_output_tokens}
+          result: reasoning_output
+        except:
+          as: e
+          steps:
+            - log_reasoning_error:
+                call: sys.log
+                args:
+                  text: $${"Reasoning synthesis failed: " + string(e)}
+                  severity: "ERROR"
+            - return_reasoning_error:
+                return:
+                  content_uri: $${content_uri}
+                  error: $${string(e)}
+                  agent_results: $${analysis_data}
+                  reasoning_synthesis: "Advanced reasoning synthesis unavailable"
+                  overall_confidence: 0.5
+                  processing_status: "completed_with_errors"
+    
+    - format_final_results:
+        assign:
+          - final_intelligence:
+              content_uri: $${content_uri}
+              timestamp: $${time.format(sys.now())}
+              agent_results: $${analysis_data}
+              reasoning_synthesis: $${reasoning_output.body.candidates[0].content.parts[0].text}
+              overall_confidence: 0.91
+              processing_status: "completed_successfully"
+              metadata:
+                workflow_version: "2.0"
+                reasoning_engine: "gemini-2.5-pro"
+                processing_region: $${region}
+                total_agents: $${len(keys(analysis_data))}
+    
+    - return_intelligence:
+        return: $${final_intelligence}

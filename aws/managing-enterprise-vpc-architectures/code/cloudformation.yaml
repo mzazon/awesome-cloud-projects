@@ -1,0 +1,1003 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Multi-VPC Architecture with Transit Gateway and Route Table Management - Production-ready implementation with comprehensive network segmentation and monitoring'
+
+# ==============================================
+# PARAMETERS
+# ==============================================
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: 'enterprise'
+    Description: 'Environment name used for resource naming and tagging'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must begin with a letter and contain only alphanumeric characters and hyphens'
+
+  EnableCrossRegionPeering:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable cross-region Transit Gateway peering for disaster recovery'
+
+  PeerRegion:
+    Type: String
+    Default: 'us-west-2'
+    Description: 'AWS region for peer Transit Gateway (only used if EnableCrossRegionPeering is true)'
+    AllowedValues:
+      - us-east-1
+      - us-east-2
+      - us-west-1
+      - us-west-2
+      - eu-west-1
+      - eu-west-2
+      - eu-central-1
+      - ap-southeast-1
+      - ap-southeast-2
+      - ap-northeast-1
+
+  EnableVpcFlowLogs:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable VPC Flow Logs for network monitoring and security analysis'
+
+  VpcFlowLogsRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: 'Retention period for VPC Flow Logs in days'
+
+  TransitGatewayAsn:
+    Type: Number
+    Default: 64512
+    MinValue: 64512
+    MaxValue: 65534
+    Description: 'BGP ASN for the Transit Gateway (must be in private range 64512-65534)'
+
+  EnableMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable CloudWatch monitoring and alarms for Transit Gateway'
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for CloudWatch alarm notifications (optional)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+# ==============================================
+# CONDITIONS
+# ==============================================
+Conditions:
+  CreateCrossRegionPeering: !Equals [!Ref EnableCrossRegionPeering, 'true']
+  CreateVpcFlowLogs: !Equals [!Ref EnableVpcFlowLogs, 'true']
+  CreateMonitoring: !Equals [!Ref EnableMonitoring, 'true']
+  CreateNotifications: !And
+    - !Condition CreateMonitoring
+    - !Not [!Equals [!Ref NotificationEmail, '']]
+
+# ==============================================
+# RESOURCES
+# ==============================================
+Resources:
+
+  # ==============================================
+  # VPC INFRASTRUCTURE
+  # ==============================================
+  
+  # Production VPC
+  ProductionVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: '10.0.0.0/16'
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      InstanceTenancy: 'default'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-prod-vpc'
+        - Key: Environment
+          Value: 'production'
+        - Key: Purpose
+          Value: 'Production workloads'
+
+  ProductionSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ProductionVpc
+      CidrBlock: '10.0.1.0/24'
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-prod-subnet-a'
+        - Key: Environment
+          Value: 'production'
+
+  # Development VPC
+  DevelopmentVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: '10.1.0.0/16'
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      InstanceTenancy: 'default'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-dev-vpc'
+        - Key: Environment
+          Value: 'development'
+        - Key: Purpose
+          Value: 'Development workloads'
+
+  DevelopmentSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref DevelopmentVpc
+      CidrBlock: '10.1.1.0/24'
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-dev-subnet-a'
+        - Key: Environment
+          Value: 'development'
+
+  # Test VPC
+  TestVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: '10.2.0.0/16'
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      InstanceTenancy: 'default'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-test-vpc'
+        - Key: Environment
+          Value: 'test'
+        - Key: Purpose
+          Value: 'Testing and QA workloads'
+
+  TestSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref TestVpc
+      CidrBlock: '10.2.1.0/24'
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-test-subnet-a'
+        - Key: Environment
+          Value: 'test'
+
+  # Shared Services VPC
+  SharedServicesVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: '10.3.0.0/16'
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      InstanceTenancy: 'default'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-shared-vpc'
+        - Key: Environment
+          Value: 'shared'
+        - Key: Purpose
+          Value: 'Shared services (DNS, monitoring, security)'
+
+  SharedServicesSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref SharedServicesVpc
+      CidrBlock: '10.3.1.0/24'
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-shared-subnet-a'
+        - Key: Environment
+          Value: 'shared'
+
+  # ==============================================
+  # TRANSIT GATEWAY INFRASTRUCTURE
+  # ==============================================
+
+  # Main Transit Gateway
+  TransitGateway:
+    Type: AWS::EC2::TransitGateway
+    Properties:
+      AmazonSideAsn: !Ref TransitGatewayAsn
+      Description: !Sub 'Enterprise Multi-VPC Transit Gateway for ${EnvironmentName}'
+      DefaultRouteTableAssociation: 'disable'
+      DefaultRouteTablePropagation: 'disable'
+      DnsSupport: 'enable'
+      VpnEcmpSupport: 'enable'
+      MulticastSupport: 'disable'
+      AutoAcceptSharedAttachments: 'disable'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-transit-gateway'
+        - Key: Environment
+          Value: 'enterprise'
+        - Key: Purpose
+          Value: 'Multi-VPC connectivity hub'
+
+  # Custom Route Tables for Network Segmentation
+  ProductionRouteTable:
+    Type: AWS::EC2::TransitGatewayRouteTable
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-prod-route-table'
+        - Key: Environment
+          Value: 'production'
+        - Key: Purpose
+          Value: 'Production network routing'
+
+  DevelopmentRouteTable:
+    Type: AWS::EC2::TransitGatewayRouteTable
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-dev-route-table'
+        - Key: Environment
+          Value: 'development'
+        - Key: Purpose
+          Value: 'Development and test network routing'
+
+  SharedServicesRouteTable:
+    Type: AWS::EC2::TransitGatewayRouteTable
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-shared-route-table'
+        - Key: Environment
+          Value: 'shared'
+        - Key: Purpose
+          Value: 'Shared services network routing'
+
+  # ==============================================
+  # VPC ATTACHMENTS
+  # ==============================================
+
+  # Production VPC Attachment
+  ProductionAttachment:
+    Type: AWS::EC2::TransitGatewayVpcAttachment
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref ProductionVpc
+      SubnetIds:
+        - !Ref ProductionSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-prod-attachment'
+        - Key: Environment
+          Value: 'production'
+
+  # Development VPC Attachment
+  DevelopmentAttachment:
+    Type: AWS::EC2::TransitGatewayVpcAttachment
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref DevelopmentVpc
+      SubnetIds:
+        - !Ref DevelopmentSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-dev-attachment'
+        - Key: Environment
+          Value: 'development'
+
+  # Test VPC Attachment
+  TestAttachment:
+    Type: AWS::EC2::TransitGatewayVpcAttachment
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref TestVpc
+      SubnetIds:
+        - !Ref TestSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-test-attachment'
+        - Key: Environment
+          Value: 'test'
+
+  # Shared Services VPC Attachment
+  SharedServicesAttachment:
+    Type: AWS::EC2::TransitGatewayVpcAttachment
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref SharedServicesVpc
+      SubnetIds:
+        - !Ref SharedServicesSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-shared-attachment'
+        - Key: Environment
+          Value: 'shared'
+
+  # ==============================================
+  # ROUTE TABLE ASSOCIATIONS
+  # ==============================================
+
+  # Associate Production VPC with Production Route Table
+  ProductionRouteTableAssociation:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties:
+      TransitGatewayAttachmentId: !Ref ProductionAttachment
+      TransitGatewayRouteTableId: !Ref ProductionRouteTable
+
+  # Associate Development VPC with Development Route Table
+  DevelopmentRouteTableAssociation:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties:
+      TransitGatewayAttachmentId: !Ref DevelopmentAttachment
+      TransitGatewayRouteTableId: !Ref DevelopmentRouteTable
+
+  # Associate Test VPC with Development Route Table (shared dev environment)
+  TestRouteTableAssociation:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties:
+      TransitGatewayAttachmentId: !Ref TestAttachment
+      TransitGatewayRouteTableId: !Ref DevelopmentRouteTable
+
+  # Associate Shared Services VPC with Shared Route Table
+  SharedServicesRouteTableAssociation:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties:
+      TransitGatewayAttachmentId: !Ref SharedServicesAttachment
+      TransitGatewayRouteTableId: !Ref SharedServicesRouteTable
+
+  # ==============================================
+  # ROUTE PROPAGATIONS
+  # ==============================================
+
+  # Enable Production to access Shared Services
+  ProductionToSharedPropagation:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Properties:
+      TransitGatewayAttachmentId: !Ref SharedServicesAttachment
+      TransitGatewayRouteTableId: !Ref ProductionRouteTable
+
+  # Enable Development/Test to access Shared Services
+  DevelopmentToSharedPropagation:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Properties:
+      TransitGatewayAttachmentId: !Ref SharedServicesAttachment
+      TransitGatewayRouteTableId: !Ref DevelopmentRouteTable
+
+  # Enable Shared Services to access Production
+  SharedToProductionPropagation:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Properties:
+      TransitGatewayAttachmentId: !Ref ProductionAttachment
+      TransitGatewayRouteTableId: !Ref SharedServicesRouteTable
+
+  # Enable Shared Services to access Development
+  SharedToDevelopmentPropagation:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Properties:
+      TransitGatewayAttachmentId: !Ref DevelopmentAttachment
+      TransitGatewayRouteTableId: !Ref SharedServicesRouteTable
+
+  # Enable Shared Services to access Test
+  SharedToTestPropagation:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Properties:
+      TransitGatewayAttachmentId: !Ref TestAttachment
+      TransitGatewayRouteTableId: !Ref SharedServicesRouteTable
+
+  # ==============================================
+  # STATIC ROUTES FOR SECURITY POLICIES
+  # ==============================================
+
+  # Blackhole route to block direct Dev-to-Prod communication
+  DevelopmentToProductionBlackhole:
+    Type: AWS::EC2::TransitGatewayRoute
+    Properties:
+      DestinationCidrBlock: '10.0.0.0/16'
+      TransitGatewayRouteTableId: !Ref DevelopmentRouteTable
+      Blackhole: true
+
+  # Specific route for Production to Shared Services
+  ProductionToSharedRoute:
+    Type: AWS::EC2::TransitGatewayRoute
+    Properties:
+      DestinationCidrBlock: '10.3.0.0/16'
+      TransitGatewayRouteTableId: !Ref ProductionRouteTable
+      TransitGatewayAttachmentId: !Ref SharedServicesAttachment
+
+  # Specific route for Development to Shared Services
+  DevelopmentToSharedRoute:
+    Type: AWS::EC2::TransitGatewayRoute
+    Properties:
+      DestinationCidrBlock: '10.3.0.0/16'
+      TransitGatewayRouteTableId: !Ref DevelopmentRouteTable
+      TransitGatewayAttachmentId: !Ref SharedServicesAttachment
+
+  # ==============================================
+  # VPC ROUTE TABLE UPDATES
+  # ==============================================
+
+  # Update Production VPC Route Table
+  ProductionVpcRoute:
+    Type: AWS::EC2::Route
+    DependsOn: ProductionAttachment
+    Properties:
+      RouteTableId: !Ref ProductionVpcDefaultRouteTable
+      DestinationCidrBlock: '10.3.0.0/16'
+      TransitGatewayId: !Ref TransitGateway
+
+  # Update Development VPC Route Table
+  DevelopmentVpcRoute:
+    Type: AWS::EC2::Route
+    DependsOn: DevelopmentAttachment
+    Properties:
+      RouteTableId: !Ref DevelopmentVpcDefaultRouteTable
+      DestinationCidrBlock: '10.3.0.0/16'
+      TransitGatewayId: !Ref TransitGateway
+
+  # Update Test VPC Route Table
+  TestVpcRoute:
+    Type: AWS::EC2::Route
+    DependsOn: TestAttachment
+    Properties:
+      RouteTableId: !Ref TestVpcDefaultRouteTable
+      DestinationCidrBlock: '10.3.0.0/16'
+      TransitGatewayId: !Ref TransitGateway
+
+  # Update Shared Services VPC Route Table (broader access)
+  SharedServicesVpcRoute:
+    Type: AWS::EC2::Route
+    DependsOn: SharedServicesAttachment
+    Properties:
+      RouteTableId: !Ref SharedServicesVpcDefaultRouteTable
+      DestinationCidrBlock: '10.0.0.0/8'
+      TransitGatewayId: !Ref TransitGateway
+
+  # ==============================================
+  # SECURITY GROUPS
+  # ==============================================
+
+  # Production Security Group
+  ProductionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EnvironmentName}-prod-tgw-sg'
+      GroupDescription: 'Security group for production Transit Gateway traffic'
+      VpcId: !Ref ProductionVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ProductionSecurityGroup
+          Description: 'HTTPS within production environment'
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: '10.3.0.0/16'
+          Description: 'DNS queries to shared services'
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: '10.3.0.0/16'
+          Description: 'DNS queries to shared services'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: '0.0.0.0/0'
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-prod-tgw-sg'
+        - Key: Environment
+          Value: 'production'
+
+  # Development Security Group
+  DevelopmentSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EnvironmentName}-dev-tgw-sg'
+      GroupDescription: 'Security group for development Transit Gateway traffic'
+      VpcId: !Ref DevelopmentVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: '10.1.0.0/16'
+          Description: 'HTTP within development environment'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '10.1.0.0/16'
+          Description: 'HTTPS within development environment'
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: '10.2.0.0/16'
+          Description: 'SSH from test environment'
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: '10.3.0.0/16'
+          Description: 'DNS queries to shared services'
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: '10.3.0.0/16'
+          Description: 'DNS queries to shared services'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: '0.0.0.0/0'
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-dev-tgw-sg'
+        - Key: Environment
+          Value: 'development'
+
+  # Test Security Group
+  TestSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EnvironmentName}-test-tgw-sg'
+      GroupDescription: 'Security group for test Transit Gateway traffic'
+      VpcId: !Ref TestVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: '10.1.0.0/16'
+          Description: 'HTTP from development environment'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '10.1.0.0/16'
+          Description: 'HTTPS from development environment'
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: '10.1.0.0/16'
+          Description: 'SSH from development environment'
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: '10.3.0.0/16'
+          Description: 'DNS queries to shared services'
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: '10.3.0.0/16'
+          Description: 'DNS queries to shared services'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: '0.0.0.0/0'
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-test-tgw-sg'
+        - Key: Environment
+          Value: 'test'
+
+  # Shared Services Security Group
+  SharedServicesSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EnvironmentName}-shared-tgw-sg'
+      GroupDescription: 'Security group for shared services Transit Gateway traffic'
+      VpcId: !Ref SharedServicesVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: '10.0.0.0/8'
+          Description: 'DNS queries from all environments'
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: '10.0.0.0/8'
+          Description: 'DNS queries from all environments'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '10.0.0.0/8'
+          Description: 'HTTPS from all environments'
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: '10.0.0.0/8'
+          Description: 'HTTP from all environments'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: '0.0.0.0/0'
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-shared-tgw-sg'
+        - Key: Environment
+          Value: 'shared'
+
+  # ==============================================
+  # MONITORING AND LOGGING
+  # ==============================================
+
+  # IAM Role for VPC Flow Logs
+  FlowLogsRole:
+    Type: AWS::IAM::Role
+    Condition: CreateVpcFlowLogs
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-vpc-flow-logs-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FlowLogsDeliveryRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: '*'
+
+  # CloudWatch Log Group for VPC Flow Logs
+  VpcFlowLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateVpcFlowLogs
+    Properties:
+      LogGroupName: !Sub '/aws/vpc/flowlogs/${EnvironmentName}'
+      RetentionInDays: !Ref VpcFlowLogsRetentionDays
+
+  # VPC Flow Logs for Production VPC
+  ProductionVpcFlowLogs:
+    Type: AWS::EC2::FlowLog
+    Condition: CreateVpcFlowLogs
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref ProductionVpc
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref VpcFlowLogsGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogsRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-prod-vpc-flow-logs'
+
+  # VPC Flow Logs for Development VPC
+  DevelopmentVpcFlowLogs:
+    Type: AWS::EC2::FlowLog
+    Condition: CreateVpcFlowLogs
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref DevelopmentVpc
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref VpcFlowLogsGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogsRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-dev-vpc-flow-logs'
+
+  # VPC Flow Logs for Test VPC
+  TestVpcFlowLogs:
+    Type: AWS::EC2::FlowLog
+    Condition: CreateVpcFlowLogs
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref TestVpc
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref VpcFlowLogsGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogsRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-test-vpc-flow-logs'
+
+  # VPC Flow Logs for Shared Services VPC
+  SharedServicesVpcFlowLogs:
+    Type: AWS::EC2::FlowLog
+    Condition: CreateVpcFlowLogs
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref SharedServicesVpc
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref VpcFlowLogsGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogsRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-shared-vpc-flow-logs'
+
+  # CloudWatch Log Group for Transit Gateway monitoring
+  TransitGatewayLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateMonitoring
+    Properties:
+      LogGroupName: !Sub '/aws/transitgateway/flowlogs/${EnvironmentName}'
+      RetentionInDays: !Ref VpcFlowLogsRetentionDays
+
+  # SNS Topic for CloudWatch Alarms
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateNotifications
+    Properties:
+      TopicName: !Sub '${EnvironmentName}-transit-gateway-alarms'
+      DisplayName: 'Transit Gateway Monitoring Alarms'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Alarm for Transit Gateway Data Processing
+  TransitGatewayDataProcessingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateMonitoring
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-TransitGateway-DataProcessing-High'
+      AlarmDescription: 'High data processing on Transit Gateway'
+      MetricName: BytesIn
+      Namespace: AWS/TransitGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10000000000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TransitGateway
+          Value: !Ref TransitGateway
+      AlarmActions: !If
+        - CreateNotifications
+        - [!Ref AlarmNotificationTopic]
+        - []
+
+  # CloudWatch Alarm for Transit Gateway Packet Drop Count
+  TransitGatewayPacketDropAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateMonitoring
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-TransitGateway-PacketDrop-High'
+      AlarmDescription: 'High packet drop count on Transit Gateway'
+      MetricName: PacketDropCount
+      Namespace: AWS/TransitGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TransitGateway
+          Value: !Ref TransitGateway
+      AlarmActions: !If
+        - CreateNotifications
+        - [!Ref AlarmNotificationTopic]
+        - []
+
+  # ==============================================
+  # HELPER RESOURCES FOR VPC ROUTE TABLES
+  # ==============================================
+
+  # Custom Resource to get default route table IDs
+  ProductionVpcDefaultRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ProductionVpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-prod-route-table'
+
+  DevelopmentVpcDefaultRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref DevelopmentVpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-dev-route-table'
+
+  TestVpcDefaultRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref TestVpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-test-route-table'
+
+  SharedServicesVpcDefaultRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref SharedServicesVpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-shared-route-table'
+
+  # Route Table Associations
+  ProductionSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref ProductionSubnet
+      RouteTableId: !Ref ProductionVpcDefaultRouteTable
+
+  DevelopmentSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DevelopmentSubnet
+      RouteTableId: !Ref DevelopmentVpcDefaultRouteTable
+
+  TestSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref TestSubnet
+      RouteTableId: !Ref TestVpcDefaultRouteTable
+
+  SharedServicesSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SharedServicesSubnet
+      RouteTableId: !Ref SharedServicesVpcDefaultRouteTable
+
+# ==============================================
+# OUTPUTS
+# ==============================================
+Outputs:
+  TransitGatewayId:
+    Description: 'Transit Gateway ID for multi-VPC connectivity'
+    Value: !Ref TransitGateway
+    Export:
+      Name: !Sub '${EnvironmentName}-transit-gateway-id'
+
+  TransitGatewayArn:
+    Description: 'Transit Gateway ARN for cross-account sharing'
+    Value: !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:transit-gateway/${TransitGateway}'
+    Export:
+      Name: !Sub '${EnvironmentName}-transit-gateway-arn'
+
+  ProductionVpcId:
+    Description: 'Production VPC ID'
+    Value: !Ref ProductionVpc
+    Export:
+      Name: !Sub '${EnvironmentName}-prod-vpc-id'
+
+  DevelopmentVpcId:
+    Description: 'Development VPC ID'
+    Value: !Ref DevelopmentVpc
+    Export:
+      Name: !Sub '${EnvironmentName}-dev-vpc-id'
+
+  TestVpcId:
+    Description: 'Test VPC ID'
+    Value: !Ref TestVpc
+    Export:
+      Name: !Sub '${EnvironmentName}-test-vpc-id'
+
+  SharedServicesVpcId:
+    Description: 'Shared Services VPC ID'
+    Value: !Ref SharedServicesVpc
+    Export:
+      Name: !Sub '${EnvironmentName}-shared-vpc-id'
+
+  ProductionRouteTableId:
+    Description: 'Production Transit Gateway Route Table ID'
+    Value: !Ref ProductionRouteTable
+    Export:
+      Name: !Sub '${EnvironmentName}-prod-route-table-id'
+
+  DevelopmentRouteTableId:
+    Description: 'Development Transit Gateway Route Table ID'
+    Value: !Ref DevelopmentRouteTable
+    Export:
+      Name: !Sub '${EnvironmentName}-dev-route-table-id'
+
+  SharedServicesRouteTableId:
+    Description: 'Shared Services Transit Gateway Route Table ID'
+    Value: !Ref SharedServicesRouteTable
+    Export:
+      Name: !Sub '${EnvironmentName}-shared-route-table-id'
+
+  ProductionAttachmentId:
+    Description: 'Production VPC Transit Gateway Attachment ID'
+    Value: !Ref ProductionAttachment
+    Export:
+      Name: !Sub '${EnvironmentName}-prod-attachment-id'
+
+  DevelopmentAttachmentId:
+    Description: 'Development VPC Transit Gateway Attachment ID'
+    Value: !Ref DevelopmentAttachment
+    Export:
+      Name: !Sub '${EnvironmentName}-dev-attachment-id'
+
+  TestAttachmentId:
+    Description: 'Test VPC Transit Gateway Attachment ID'
+    Value: !Ref TestAttachment
+    Export:
+      Name: !Sub '${EnvironmentName}-test-attachment-id'
+
+  SharedServicesAttachmentId:
+    Description: 'Shared Services VPC Transit Gateway Attachment ID'
+    Value: !Ref SharedServicesAttachment
+    Export:
+      Name: !Sub '${EnvironmentName}-shared-attachment-id'
+
+  ProductionSecurityGroupId:
+    Description: 'Production Security Group ID for Transit Gateway traffic'
+    Value: !Ref ProductionSecurityGroup
+    Export:
+      Name: !Sub '${EnvironmentName}-prod-security-group-id'
+
+  DevelopmentSecurityGroupId:
+    Description: 'Development Security Group ID for Transit Gateway traffic'
+    Value: !Ref DevelopmentSecurityGroup
+    Export:
+      Name: !Sub '${EnvironmentName}-dev-security-group-id'
+
+  TestSecurityGroupId:
+    Description: 'Test Security Group ID for Transit Gateway traffic'
+    Value: !Ref TestSecurityGroup
+    Export:
+      Name: !Sub '${EnvironmentName}-test-security-group-id'
+
+  SharedServicesSecurityGroupId:
+    Description: 'Shared Services Security Group ID for Transit Gateway traffic'
+    Value: !Ref SharedServicesSecurityGroup
+    Export:
+      Name: !Sub '${EnvironmentName}-shared-security-group-id'
+
+  VpcFlowLogsGroupName:
+    Condition: CreateVpcFlowLogs
+    Description: 'CloudWatch Log Group name for VPC Flow Logs'
+    Value: !Ref VpcFlowLogsGroup
+    Export:
+      Name: !Sub '${EnvironmentName}-vpc-flow-logs-group'
+
+  TransitGatewayLogsGroupName:
+    Condition: CreateMonitoring
+    Description: 'CloudWatch Log Group name for Transit Gateway monitoring'
+    Value: !Ref TransitGatewayLogsGroup
+    Export:
+      Name: !Sub '${EnvironmentName}-tgw-logs-group'
+
+  AlarmNotificationTopicArn:
+    Condition: CreateNotifications
+    Description: 'SNS Topic ARN for CloudWatch alarm notifications'
+    Value: !Ref AlarmNotificationTopic
+    Export:
+      Name: !Sub '${EnvironmentName}-alarm-topic-arn'
+
+  NetworkCIDRBlocks:
+    Description: 'CIDR blocks for all networks in the architecture'
+    Value: !Sub |
+      Production VPC: 10.0.0.0/16
+      Development VPC: 10.1.0.0/16
+      Test VPC: 10.2.0.0/16
+      Shared Services VPC: 10.3.0.0/16
+
+  DeploymentInstructions:
+    Description: 'Quick deployment commands'
+    Value: !Sub |
+      Deploy: aws cloudformation create-stack --stack-name ${EnvironmentName}-multi-vpc-tgw --template-body file://cloudformation.yaml --capabilities CAPABILITY_NAMED_IAM
+      Update: aws cloudformation update-stack --stack-name ${EnvironmentName}-multi-vpc-tgw --template-body file://cloudformation.yaml --capabilities CAPABILITY_NAMED_IAM
+      Delete: aws cloudformation delete-stack --stack-name ${EnvironmentName}-multi-vpc-tgw
+
+  SecurityArchitectureNotes:
+    Description: 'Important security architecture implementation notes'
+    Value: !Sub |
+      ✅ Network segmentation enforced through Transit Gateway route tables
+      ✅ Production environment isolated from development/test environments
+      ✅ Shared services accessible from all environments for centralized functions
+      ✅ VPC Flow Logs enabled for security monitoring and compliance
+      ✅ Security groups configured for defense-in-depth protection
+      ✅ CloudWatch monitoring and alarms for operational visibility
+      ⚠️  Cross-region peering available but requires manual configuration
+      ⚠️  Review and customize security group rules for your specific requirements

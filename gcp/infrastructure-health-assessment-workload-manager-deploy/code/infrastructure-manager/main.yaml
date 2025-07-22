@@ -1,0 +1,493 @@
+# Infrastructure Manager Configuration for Infrastructure Health Assessment
+# This configuration deploys Cloud Workload Manager, Cloud Deploy, and supporting services
+# for automated infrastructure health assessment and remediation workflows
+
+# Infrastructure Manager configuration
+apiVersion: config.infra.manager.googleapis.com/v1
+kind: InfrastructureConfig
+metadata:
+  name: infrastructure-health-assessment
+  description: Automated infrastructure health assessment with Cloud Workload Manager and Cloud Deploy
+
+# Define project and region variables
+variables:
+  project_id:
+    description: Google Cloud Project ID
+    type: string
+    required: true
+  
+  region:
+    description: Deployment region
+    type: string
+    default: "us-central1"
+  
+  zone:
+    description: Deployment zone
+    type: string
+    default: "us-central1-a"
+  
+  cluster_name:
+    description: GKE cluster name for health assessment
+    type: string
+    default: "health-assessment-cluster"
+  
+  deployment_pipeline_name:
+    description: Cloud Deploy pipeline name
+    type: string
+    default: "health-remediation-pipeline"
+  
+  function_name:
+    description: Cloud Function name for assessment processing
+    type: string
+    default: "health-assessment-processor"
+
+# Enable required Google Cloud APIs
+resources:
+  # Enable Workload Manager API
+  - name: workload-manager-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_id)/services/workloadmanager.googleapis.com
+      parent: projects/$(ref.project_id)
+    metadata:
+      dependsOn: []
+
+  # Enable Cloud Deploy API
+  - name: cloud-deploy-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_id)/services/clouddeploy.googleapis.com
+      parent: projects/$(ref.project_id)
+    metadata:
+      dependsOn: []
+
+  # Enable Cloud Monitoring API
+  - name: monitoring-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_id)/services/monitoring.googleapis.com
+      parent: projects/$(ref.project_id)
+    metadata:
+      dependsOn: []
+
+  # Enable Cloud Functions API
+  - name: functions-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_id)/services/cloudfunctions.googleapis.com
+      parent: projects/$(ref.project_id)
+    metadata:
+      dependsOn: []
+
+  # Enable Cloud Build API
+  - name: build-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_id)/services/cloudbuild.googleapis.com
+      parent: projects/$(ref.project_id)
+    metadata:
+      dependsOn: []
+
+  # Enable Container API
+  - name: container-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_id)/services/container.googleapis.com
+      parent: projects/$(ref.project_id)
+    metadata:
+      dependsOn: []
+
+  # Enable Pub/Sub API
+  - name: pubsub-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_id)/services/pubsub.googleapis.com
+      parent: projects/$(ref.project_id)
+    metadata:
+      dependsOn: []
+
+  # Cloud Storage bucket for assessment reports
+  - name: health-assessment-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(ref.project_id)-health-assessments
+      location: $(ref.region)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90
+    metadata:
+      dependsOn:
+        - workload-manager-api
+
+  # Pub/Sub topic for health assessment events
+  - name: health-assessment-events-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project_id)/topics/health-assessment-events
+    metadata:
+      dependsOn:
+        - pubsub-api
+
+  # Pub/Sub subscription for deployment pipeline
+  - name: health-deployment-trigger-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(ref.project_id)/subscriptions/health-deployment-trigger
+      topic: $(ref.health-assessment-events-topic.name)
+    metadata:
+      dependsOn:
+        - health-assessment-events-topic
+
+  # Pub/Sub topic for monitoring alerts
+  - name: health-monitoring-alerts-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project_id)/topics/health-monitoring-alerts
+    metadata:
+      dependsOn:
+        - pubsub-api
+
+  # GKE cluster for infrastructure assessment
+  - name: health-assessment-cluster
+    type: gcp-types/container-v1:projects.zones.clusters
+    properties:
+      parent: projects/$(ref.project_id)/locations/$(ref.zone)
+      cluster:
+        name: $(ref.cluster_name)
+        description: GKE cluster for infrastructure health assessment
+        initialNodeCount: 3
+        nodeConfig:
+          machineType: e2-medium
+          diskSizeGb: 50
+          oauthScopes:
+            - https://www.googleapis.com/auth/cloud-platform
+            - https://www.googleapis.com/auth/logging.write
+            - https://www.googleapis.com/auth/monitoring
+        loggingService: logging.googleapis.com/kubernetes
+        monitoringService: monitoring.googleapis.com/kubernetes
+        addonsConfig:
+          httpLoadBalancing:
+            disabled: false
+          horizontalPodAutoscaling:
+            disabled: false
+        networkPolicy:
+          enabled: true
+        ipAllocationPolicy: {}
+        masterAuth:
+          clientCertificateConfig:
+            issueClientCertificate: false
+    metadata:
+      dependsOn:
+        - container-api
+
+  # Service Account for Cloud Function
+  - name: function-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: health-function-sa
+      displayName: Health Assessment Function Service Account
+      description: Service account for Cloud Function processing health assessments
+      parent: projects/$(ref.project_id)
+    metadata:
+      dependsOn: []
+
+  # IAM binding for Cloud Function service account - Storage Object Viewer
+  - name: function-storage-viewer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/storage.objectViewer
+      member: serviceAccount:$(ref.function-service-account.email)
+    metadata:
+      dependsOn:
+        - function-service-account
+        - health-assessment-bucket
+
+  # IAM binding for Cloud Function service account - Pub/Sub Publisher
+  - name: function-pubsub-publisher-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/pubsub.publisher
+      member: serviceAccount:$(ref.function-service-account.email)
+    metadata:
+      dependsOn:
+        - function-service-account
+        - health-assessment-events-topic
+
+  # Service Account for Cloud Deploy
+  - name: deploy-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: health-deploy-sa
+      displayName: Health Remediation Deploy Service Account
+      description: Service account for Cloud Deploy pipeline operations
+      parent: projects/$(ref.project_id)
+    metadata:
+      dependsOn: []
+
+  # IAM binding for Cloud Deploy service account - GKE Developer
+  - name: deploy-gke-developer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/container.developer
+      member: serviceAccount:$(ref.deploy-service-account.email)
+    metadata:
+      dependsOn:
+        - deploy-service-account
+        - health-assessment-cluster
+
+  # IAM binding for Cloud Deploy service account - Cloud Deploy Operator
+  - name: deploy-operator-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/clouddeploy.operator
+      member: serviceAccount:$(ref.deploy-service-account.email)
+    metadata:
+      dependsOn:
+        - deploy-service-account
+        - cloud-deploy-api
+
+  # Service Account for Workload Manager
+  - name: workload-manager-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: workload-manager-sa
+      displayName: Workload Manager Service Account
+      description: Service account for Workload Manager assessments
+      parent: projects/$(ref.project_id)
+    metadata:
+      dependsOn: []
+
+  # IAM binding for Workload Manager service account - Workload Manager Admin
+  - name: workload-manager-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/workloadmanager.admin
+      member: serviceAccount:$(ref.workload-manager-service-account.email)
+    metadata:
+      dependsOn:
+        - workload-manager-service-account
+        - workload-manager-api
+
+  # IAM binding for Workload Manager service account - Storage Object Creator
+  - name: workload-manager-storage-creator-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/storage.objectCreator
+      member: serviceAccount:$(ref.workload-manager-service-account.email)
+    metadata:
+      dependsOn:
+        - workload-manager-service-account
+        - health-assessment-bucket
+
+  # Cloud Deploy Delivery Pipeline
+  - name: health-remediation-pipeline
+    type: gcp-types/clouddeploy-v1:projects.locations.deliveryPipelines
+    properties:
+      parent: projects/$(ref.project_id)/locations/$(ref.region)
+      deliveryPipelineId: $(ref.deployment_pipeline_name)
+      deliveryPipeline:
+        description: Infrastructure health remediation delivery pipeline
+        serialPipeline:
+          stages:
+            - targetId: staging-target
+            - targetId: production-target
+        condition:
+          pipelineReadyCondition: {}
+          targetsTypeCondition: {}
+    metadata:
+      dependsOn:
+        - cloud-deploy-api
+        - health-assessment-cluster
+
+  # Cloud Deploy Staging Target
+  - name: staging-target
+    type: gcp-types/clouddeploy-v1:projects.locations.targets
+    properties:
+      parent: projects/$(ref.project_id)/locations/$(ref.region)
+      targetId: staging-target
+      target:
+        description: Staging environment for health remediation
+        gke:
+          cluster: projects/$(ref.project_id)/locations/$(ref.zone)/clusters/$(ref.cluster_name)
+        executionConfigs:
+          - usages:
+              - RENDER
+              - DEPLOY
+            serviceAccount: $(ref.deploy-service-account.email)
+    metadata:
+      dependsOn:
+        - health-assessment-cluster
+        - deploy-service-account
+        - health-remediation-pipeline
+
+  # Cloud Deploy Production Target
+  - name: production-target
+    type: gcp-types/clouddeploy-v1:projects.locations.targets
+    properties:
+      parent: projects/$(ref.project_id)/locations/$(ref.region)
+      targetId: production-target
+      target:
+        description: Production environment for health remediation
+        requireApproval: true
+        gke:
+          cluster: projects/$(ref.project_id)/locations/$(ref.zone)/clusters/$(ref.cluster_name)
+        executionConfigs:
+          - usages:
+              - RENDER
+              - DEPLOY
+            serviceAccount: $(ref.deploy-service-account.email)
+    metadata:
+      dependsOn:
+        - health-assessment-cluster
+        - deploy-service-account
+        - health-remediation-pipeline
+
+  # Cloud Function for assessment processing
+  - name: health-assessment-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/$(ref.project_id)/locations/$(ref.region)
+      function:
+        name: projects/$(ref.project_id)/locations/$(ref.region)/functions/$(ref.function_name)
+        description: Process Workload Manager assessment results
+        sourceArchiveUrl: gs://$(ref.project_id)-health-assessments/function-source.zip
+        entryPoint: process_health_assessment
+        runtime: python311
+        timeout: 60s
+        availableMemoryMb: 256
+        serviceAccountEmail: $(ref.function-service-account.email)
+        environmentVariables:
+          PROJECT_ID: $(ref.project_id)
+          REGION: $(ref.region)
+        eventTrigger:
+          eventType: google.storage.object.finalize
+          resource: projects/_/buckets/$(ref.project_id)-health-assessments
+    metadata:
+      dependsOn:
+        - functions-api
+        - function-service-account
+        - health-assessment-bucket
+
+  # Cloud Monitoring Alert Policy for Critical Health Issues
+  - name: critical-health-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(ref.project_id)
+      alertPolicy:
+        displayName: Infrastructure Health Critical Issues
+        documentation:
+          content: Alert triggered when critical infrastructure health issues are detected
+          mimeType: text/markdown
+        conditions:
+          - displayName: Critical assessment findings
+            conditionThreshold:
+              filter: >
+                resource.type="pubsub_topic" AND
+                resource.labels.topic_id="health-assessment-events"
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 0
+              duration: 60s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_RATE
+        combiner: OR
+        enabled: true
+        alertStrategy:
+          autoClose: 1800s
+    metadata:
+      dependsOn:
+        - monitoring-api
+        - health-assessment-events-topic
+
+  # Log-based metric for deployment success tracking
+  - name: deployment-success-metric
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      parent: projects/$(ref.project_id)
+      metric:
+        name: deployment_success
+        description: Track successful health remediation deployments
+        filter: >
+          resource.type="cloud_function" AND
+          "deployment successful"
+        metricDescriptor:
+          metricKind: COUNTER
+          valueType: INT64
+          displayName: Deployment Success Count
+    metadata:
+      dependsOn:
+        - monitoring-api
+
+# Outputs for verification and integration
+outputs:
+  project_id:
+    description: Google Cloud Project ID
+    value: $(ref.project_id)
+  
+  region:
+    description: Deployment region
+    value: $(ref.region)
+  
+  cluster_name:
+    description: GKE cluster name
+    value: $(ref.health-assessment-cluster.name)
+  
+  cluster_endpoint:
+    description: GKE cluster endpoint
+    value: $(ref.health-assessment-cluster.endpoint)
+  
+  storage_bucket:
+    description: Assessment reports storage bucket
+    value: $(ref.health-assessment-bucket.name)
+  
+  delivery_pipeline_name:
+    description: Cloud Deploy delivery pipeline name
+    value: $(ref.health-remediation-pipeline.name)
+  
+  function_name:
+    description: Assessment processing function name
+    value: $(ref.health-assessment-function.name)
+  
+  pubsub_topic_events:
+    description: Pub/Sub topic for assessment events
+    value: $(ref.health-assessment-events-topic.name)
+  
+  pubsub_topic_alerts:
+    description: Pub/Sub topic for monitoring alerts
+    value: $(ref.health-monitoring-alerts-topic.name)
+  
+  workload_manager_service_account:
+    description: Workload Manager service account email
+    value: $(ref.workload-manager-service-account.email)
+  
+  deploy_service_account:
+    description: Cloud Deploy service account email
+    value: $(ref.deploy-service-account.email)
+  
+  function_service_account:
+    description: Cloud Function service account email
+    value: $(ref.function-service-account.email)
+
+# Metadata for Infrastructure Manager
+metadata:
+  labels:
+    environment: infrastructure-health
+    component: assessment-pipeline
+    managed-by: infrastructure-manager
+  annotations:
+    config.infra.manager.googleapis.com/description: >
+      Automated infrastructure health assessment solution using Cloud Workload Manager
+      and Cloud Deploy for continuous evaluation and remediation workflows
+    config.infra.manager.googleapis.com/version: "1.0"

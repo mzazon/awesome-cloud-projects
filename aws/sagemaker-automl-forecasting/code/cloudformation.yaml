@@ -1,0 +1,1000 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure for SageMaker AutoML for Time Series Forecasting - Complete forecasting solution with AutoML, real-time endpoints, batch processing, and monitoring'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'automl-forecasting'
+    Description: 'Name prefix for all resources'
+    AllowedPattern: '^[a-z0-9\-]+$'
+    MinLength: 3
+    MaxLength: 30
+  
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment type for resource tagging and configuration'
+  
+  ForecastHorizon:
+    Type: Number
+    Default: 14
+    MinValue: 1
+    MaxValue: 500
+    Description: 'Number of time periods to forecast (days)'
+  
+  SageMakerInstanceType:
+    Type: String
+    Default: 'ml.m5.large'
+    AllowedValues: 
+      - 'ml.m5.large'
+      - 'ml.m5.xlarge'
+      - 'ml.m5.2xlarge'
+      - 'ml.c5.large'
+      - 'ml.c5.xlarge'
+    Description: 'Instance type for SageMaker endpoint'
+  
+  EnableMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable CloudWatch monitoring and alarms'
+  
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for monitoring alerts (optional)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
+Conditions:
+  CreateMonitoring: !Equals [!Ref EnableMonitoring, 'true']
+  CreateEmailNotification: !And
+    - !Condition CreateMonitoring
+    - !Not [!Equals [!Ref NotificationEmail, '']]
+
+Resources:
+  # S3 Bucket for data storage and model artifacts
+  ForecastingDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-data-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: ArchiveOldData
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref DataIngestionLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-data-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'SageMaker AutoML Forecasting Data Storage'
+
+  # CloudWatch Log Group for data ingestion monitoring
+  DataIngestionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-data-ingestion'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-data-ingestion-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for SageMaker AutoML and endpoints
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-sagemaker-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      Policies:
+        - PolicyName: S3BucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ForecastingDataBucket.Arn
+                  - !Sub '${ForecastingDataBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                Resource: '*'
+        - PolicyName: SageMakerModelRegistry
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sagemaker:CreateModelPackage
+                  - sagemaker:CreateModelPackageGroup
+                  - sagemaker:DescribeModelPackage
+                  - sagemaker:DescribeModelPackageGroup
+                  - sagemaker:UpdateModelPackage
+                  - sagemaker:ListModelPackages
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-sagemaker-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for Lambda functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SageMakerInference
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sagemaker:InvokeEndpoint
+                  - sagemaker:DescribeEndpoint
+                  - sagemaker:DescribeEndpointConfig
+                Resource: !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/*'
+        - PolicyName: S3DataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ForecastingDataBucket.Arn
+                  - !Sub '${ForecastingDataBucket.Arn}/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Layer for common dependencies
+  ForecastingLibraryLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub '${ProjectName}-forecasting-libraries'
+      Description: 'Common libraries for forecasting operations (pandas, numpy, boto3)'
+      Content:
+        S3Bucket: !Ref ForecastingDataBucket
+        S3Key: 'lambda-layers/forecasting-libraries.zip'
+      CompatibleRuntimes:
+        - python3.9
+        - python3.10
+        - python3.11
+      CompatibleArchitectures:
+        - x86_64
+
+  # Lambda function for real-time forecast API
+  ForecastApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-forecast-api'
+      Description: 'Real-time forecasting API using SageMaker AutoML endpoint'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: 30
+      MemorySize: 512
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Layers:
+        - !Ref ForecastingLibraryLayer
+      Environment:
+        Variables:
+          SAGEMAKER_ENDPOINT_NAME: !Sub '${ProjectName}-forecast-endpoint'
+          S3_BUCKET_NAME: !Ref ForecastingDataBucket
+          FORECAST_HORIZON: !Ref ForecastHorizon
+          LOG_LEVEL: 'INFO'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from datetime import datetime, timedelta
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+          
+          def lambda_handler(event, context):
+              """Real-time forecasting API using SageMaker AutoML endpoint"""
+              try:
+                  # Parse request
+                  if 'body' in event:
+                      body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
+                  else:
+                      body = event
+                  
+                  item_id = body.get('item_id')
+                  forecast_horizon = int(body.get('forecast_horizon', os.environ.get('FORECAST_HORIZON', 14)))
+                  
+                  if not item_id:
+                      return {
+                          'statusCode': 400,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': json.dumps({'error': 'item_id is required'})
+                      }
+                  
+                  # Initialize SageMaker runtime
+                  runtime = boto3.client('sagemaker-runtime')
+                  endpoint_name = os.environ.get('SAGEMAKER_ENDPOINT_NAME')
+                  
+                  if not endpoint_name:
+                      return {
+                          'statusCode': 500,
+                          'body': json.dumps({'error': 'Endpoint not configured'})
+                      }
+                  
+                  # In production, fetch real historical data from S3/database
+                  # For demo purposes, using mock data
+                  historical_data = [100 + i * 0.1 + (i % 30) * 2 for i in range(365)]
+                  
+                  # Prepare inference request
+                  inference_data = {
+                      'instances': [
+                          {
+                              'start': '2023-01-01',
+                              'target': historical_data,
+                              'item_id': item_id
+                          }
+                      ],
+                      'configuration': {
+                          'num_samples': 100,
+                          'output_types': ['mean', 'quantiles'],
+                          'quantiles': ['0.1', '0.5', '0.9']
+                      }
+                  }
+                  
+                  # Make prediction
+                  try:
+                      response = runtime.invoke_endpoint(
+                          EndpointName=endpoint_name,
+                          ContentType='application/json',
+                          Body=json.dumps(inference_data)
+                      )
+                      
+                      result = json.loads(response['Body'].read().decode())
+                      
+                      # Format response
+                      forecast_response = {
+                          'item_id': item_id,
+                          'forecast_horizon': forecast_horizon,
+                          'forecast': result.get('predictions', [{}])[0] if 'predictions' in result else result,
+                          'generated_at': datetime.now().isoformat(),
+                          'model_type': 'SageMaker AutoML',
+                          'confidence_intervals': True,
+                          'status': 'success'
+                      }
+                      
+                      logger.info(f"Successfully generated forecast for item {item_id}")
+                      
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Methods': 'POST, OPTIONS',
+                              'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+                          },
+                          'body': json.dumps(forecast_response)
+                      }
+                      
+                  except Exception as endpoint_error:
+                      logger.error(f"SageMaker endpoint error: {str(endpoint_error)}")
+                      return {
+                          'statusCode': 503,
+                          'body': json.dumps({
+                              'error': 'Forecasting service unavailable',
+                              'message': 'Please try again later'
+                          })
+                      }
+                  
+              except Exception as e:
+                  logger.error(f"Lambda function error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': 'Internal server error',
+                          'message': str(e)
+                      })
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-forecast-api-function'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda function for batch forecasting
+  BatchForecastFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-batch-forecast'
+      Description: 'Batch forecasting processing for large-scale operations'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: 900
+      MemorySize: 1024
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Layers:
+        - !Ref ForecastingLibraryLayer
+      Environment:
+        Variables:
+          SAGEMAKER_ENDPOINT_NAME: !Sub '${ProjectName}-forecast-endpoint'
+          S3_BUCKET_NAME: !Ref ForecastingDataBucket
+          FORECAST_HORIZON: !Ref ForecastHorizon
+          LOG_LEVEL: 'INFO'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import pandas as pd
+          import os
+          import logging
+          from datetime import datetime
+          from io import StringIO
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+          
+          def lambda_handler(event, context):
+              """Process batch forecasting requests"""
+              try:
+                  s3 = boto3.client('s3')
+                  runtime = boto3.client('sagemaker-runtime')
+                  
+                  bucket_name = os.environ.get('S3_BUCKET_NAME')
+                  endpoint_name = os.environ.get('SAGEMAKER_ENDPOINT_NAME')
+                  
+                  # Parse S3 event if triggered by S3
+                  if 'Records' in event and event['Records']:
+                      s3_event = event['Records'][0]['s3']
+                      input_key = s3_event['object']['key']
+                  else:
+                      # Direct invocation
+                      input_key = event.get('input_key', 'batch-input/sample.csv')
+                  
+                  logger.info(f"Processing batch forecast for: {input_key}")
+                  
+                  # Download input file
+                  try:
+                      response = s3.get_object(Bucket=bucket_name, Key=input_key)
+                      data = pd.read_csv(StringIO(response['Body'].read().decode()))
+                  except Exception as e:
+                      logger.error(f"Error reading input file: {str(e)}")
+                      return {'statusCode': 400, 'body': f'Error reading input file: {str(e)}'}
+                  
+                  # Process each unique item
+                  results = []
+                  unique_items = data['item_id'].unique()
+                  
+                  for item_id in unique_items:
+                      item_data = data[data['item_id'] == item_id].sort_values('timestamp')
+                      
+                      # Prepare inference request
+                      inference_data = {
+                          'instances': [
+                              {
+                                  'start': item_data['timestamp'].iloc[0],
+                                  'target': item_data['target_value'].tolist(),
+                                  'item_id': item_id
+                              }
+                          ],
+                          'configuration': {
+                              'num_samples': 100,
+                              'output_types': ['mean', 'quantiles'],
+                              'quantiles': ['0.1', '0.5', '0.9']
+                          }
+                      }
+                      
+                      try:
+                          # Make prediction
+                          response = runtime.invoke_endpoint(
+                              EndpointName=endpoint_name,
+                              ContentType='application/json',
+                              Body=json.dumps(inference_data)
+                          )
+                          
+                          result = json.loads(response['Body'].read().decode())
+                          
+                          results.append({
+                              'item_id': item_id,
+                              'forecast': result,
+                              'timestamp': datetime.now().isoformat(),
+                              'status': 'success'
+                          })
+                          
+                      except Exception as e:
+                          logger.error(f"Error processing {item_id}: {str(e)}")
+                          results.append({
+                              'item_id': item_id,
+                              'error': str(e),
+                              'timestamp': datetime.now().isoformat(),
+                              'status': 'error'
+                          })
+                  
+                  # Save results to S3
+                  output_key = f"batch-output/batch_forecast_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                  
+                  s3.put_object(
+                      Bucket=bucket_name,
+                      Key=output_key,
+                      Body=json.dumps(results, indent=2),
+                      ContentType='application/json'
+                  )
+                  
+                  logger.info(f"Batch processing completed. Results saved to: {output_key}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Batch processing completed',
+                          'processed_items': len(unique_items),
+                          'successful_forecasts': len([r for r in results if r.get('status') == 'success']),
+                          'output_location': f"s3://{bucket_name}/{output_key}"
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Batch processing error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-batch-forecast-function'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # API Gateway for REST API access
+  ForecastApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-forecast-api'
+      Description: 'REST API for real-time forecasting using SageMaker AutoML'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: execute-api:Invoke
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-forecast-api-gateway'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # API Gateway resource for forecast endpoint
+  ForecastApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ForecastApiGateway
+      ParentId: !GetAtt ForecastApiGateway.RootResourceId
+      PathPart: 'forecast'
+
+  # API Gateway method for POST requests
+  ForecastApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ForecastApiGateway
+      ResourceId: !Ref ForecastApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ForecastApiFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+        - StatusCode: 400
+        - StatusCode: 500
+
+  # API Gateway deployment
+  ForecastApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ForecastApiMethod
+    Properties:
+      RestApiId: !Ref ForecastApiGateway
+      StageName: !Ref Environment
+      StageDescription: !Sub 'Deployment for ${Environment} environment'
+
+  # Lambda permission for API Gateway
+  ApiGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ForecastApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ForecastApiGateway}/*/*'
+
+  # SNS Topic for monitoring alerts
+  MonitoringTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateMonitoring
+    Properties:
+      TopicName: !Sub '${ProjectName}-monitoring-alerts'
+      DisplayName: 'AutoML Forecasting Monitoring Alerts'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-monitoring-topic'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Subscription for email notifications
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateEmailNotification
+    Properties:
+      TopicArn: !Ref MonitoringTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Dashboard for monitoring
+  ForecastingDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateMonitoring
+    Properties:
+      DashboardName: !Sub '${ProjectName}-forecasting-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/SageMaker/Endpoints", "Invocations", "EndpointName", "${ProjectName}-forecast-endpoint"],
+                  ["AWS/SageMaker/Endpoints", "InvocationErrors", "EndpointName", "${ProjectName}-forecast-endpoint"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "SageMaker Endpoint Invocations",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/SageMaker/Endpoints", "ModelLatency", "EndpointName", "${ProjectName}-forecast-endpoint"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Model Latency (ms)",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${ForecastApiFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ForecastApiFunction}"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${ForecastApiFunction}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ApiGateway", "Count", "ApiName", "${ProjectName}-forecast-api"],
+                  ["AWS/ApiGateway", "4XXError", "ApiName", "${ProjectName}-forecast-api"],
+                  ["AWS/ApiGateway", "5XXError", "ApiName", "${ProjectName}-forecast-api"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "API Gateway Metrics",
+                "view": "timeSeries"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarm for high error rate
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateMonitoring
+    Properties:
+      AlarmName: !Sub '${ProjectName}-high-error-rate'
+      AlarmDescription: 'High error rate on SageMaker forecasting endpoint'
+      MetricName: InvocationErrors
+      Namespace: AWS/SageMaker/Endpoints
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: EndpointName
+          Value: !Sub '${ProjectName}-forecast-endpoint'
+      AlarmActions:
+        - !Ref MonitoringTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-high-error-rate-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarm for high latency
+  HighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateMonitoring
+    Properties:
+      AlarmName: !Sub '${ProjectName}-high-latency'
+      AlarmDescription: 'High latency on SageMaker forecasting endpoint'
+      MetricName: ModelLatency
+      Namespace: AWS/SageMaker/Endpoints
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 5000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: EndpointName
+          Value: !Sub '${ProjectName}-forecast-endpoint'
+      AlarmActions:
+        - !Ref MonitoringTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-high-latency-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group for Lambda functions
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-forecast-functions'
+      RetentionInDays: 14
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # EventBridge Rule for scheduled batch processing
+  BatchProcessingSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-batch-processing-schedule'
+      Description: 'Scheduled trigger for batch forecasting operations'
+      ScheduleExpression: 'cron(0 6 * * ? *)'  # Daily at 6 AM UTC
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt BatchForecastFunction.Arn
+          Id: 'BatchForecastTarget'
+          Input: !Sub |
+            {
+              "input_key": "batch-input/daily_batch.csv",
+              "scheduled": true,
+              "timestamp": "{{aws.events.event.ingestion-time}}"
+            }
+
+  # Lambda permission for EventBridge
+  EventBridgeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BatchForecastFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BatchProcessingSchedule.Arn
+
+  # Step Functions State Machine for AutoML job orchestration
+  AutoMLOrchestrationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-stepfunctions-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SageMakerOrchestration
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sagemaker:CreateAutoMLJobV2
+                  - sagemaker:DescribeAutoMLJobV2
+                  - sagemaker:StopAutoMLJobV2
+                  - sagemaker:CreateModel
+                  - sagemaker:CreateEndpointConfig
+                  - sagemaker:CreateEndpoint
+                  - sagemaker:DescribeEndpoint
+                  - sagemaker:UpdateEndpoint
+                  - sagemaker:DeleteEndpoint
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt SageMakerExecutionRole.Arn
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: 
+                  - !GetAtt ForecastApiFunction.Arn
+                  - !GetAtt BatchForecastFunction.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-stepfunctions-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Step Functions State Machine for AutoML workflow
+  AutoMLWorkflow:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-automl-workflow'
+      DefinitionString: !Sub |
+        {
+          "Comment": "AutoML Forecasting Workflow",
+          "StartAt": "CreateAutoMLJob",
+          "States": {
+            "CreateAutoMLJob": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sagemaker:createAutoMLJob.sync",
+              "Parameters": {
+                "AutoMLJobName.$": "$.JobName",
+                "InputDataConfig": [
+                  {
+                    "ChannelName": "training",
+                    "DataSource": {
+                      "S3DataSource": {
+                        "S3DataType": "S3Prefix",
+                        "S3Uri.$": "$.TrainingDataS3Uri",
+                        "S3DataDistributionType": "FullyReplicated"
+                      }
+                    },
+                    "ContentType": "text/csv",
+                    "CompressionType": "None",
+                    "TargetAttributeName": "target_value"
+                  }
+                ],
+                "OutputDataConfig": {
+                  "S3OutputPath.$": "$.OutputS3Uri"
+                },
+                "RoleArn": "${SageMakerExecutionRole.Arn}",
+                "AutoMLProblemTypeConfig": {
+                  "TimeSeriesForecastingJobConfig": {
+                    "ForecastFrequency": "D",
+                    "ForecastHorizon": ${ForecastHorizon},
+                    "TimeSeriesConfig": {
+                      "TargetAttributeName": "target_value",
+                      "TimestampAttributeName": "timestamp",
+                      "ItemIdentifierAttributeName": "item_id"
+                    },
+                    "ForecastQuantiles": ["0.1", "0.5", "0.9"]
+                  }
+                },
+                "AutoMLJobObjective": {
+                  "MetricName": "MAPE"
+                }
+              },
+              "Next": "CreateModel",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "Next": "JobFailed"
+                }
+              ]
+            },
+            "CreateModel": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sagemaker:createModel",
+              "Parameters": {
+                "ModelName.$": "$.BestCandidate.CandidateName",
+                "PrimaryContainer.$": "$.BestCandidate.InferenceContainers[0]",
+                "ExecutionRoleArn": "${SageMakerExecutionRole.Arn}"
+              },
+              "Next": "CreateEndpointConfig"
+            },
+            "CreateEndpointConfig": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sagemaker:createEndpointConfig",
+              "Parameters": {
+                "EndpointConfigName.$": "$.EndpointConfigName",
+                "ProductionVariants": [
+                  {
+                    "VariantName": "primary",
+                    "ModelName.$": "$.BestCandidate.CandidateName",
+                    "InitialInstanceCount": 1,
+                    "InstanceType": "${SageMakerInstanceType}",
+                    "InitialVariantWeight": 1.0
+                  }
+                ]
+              },
+              "Next": "CreateEndpoint"
+            },
+            "CreateEndpoint": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sagemaker:createEndpoint",
+              "Parameters": {
+                "EndpointName": "${ProjectName}-forecast-endpoint",
+                "EndpointConfigName.$": "$.EndpointConfigName"
+              },
+              "Next": "WorkflowComplete"
+            },
+            "WorkflowComplete": {
+              "Type": "Succeed",
+              "Result": "AutoML workflow completed successfully"
+            },
+            "JobFailed": {
+              "Type": "Fail",
+              "Error": "AutoMLJobFailed",
+              "Cause": "AutoML job failed to complete"
+            }
+          }
+        }
+      RoleArn: !GetAtt AutoMLOrchestrationRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-automl-workflow'
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  DataBucketName:
+    Description: 'S3 bucket for storing training data and model artifacts'
+    Value: !Ref ForecastingDataBucket
+    Export:
+      Name: !Sub '${ProjectName}-data-bucket'
+
+  SageMakerExecutionRoleArn:
+    Description: 'IAM role ARN for SageMaker AutoML jobs and endpoints'
+    Value: !GetAtt SageMakerExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-sagemaker-role-arn'
+
+  ForecastApiEndpoint:
+    Description: 'API Gateway endpoint URL for real-time forecasting'
+    Value: !Sub 'https://${ForecastApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/forecast'
+    Export:
+      Name: !Sub '${ProjectName}-api-endpoint'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the forecast API Lambda function'
+    Value: !GetAtt ForecastApiFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-lambda-function-arn'
+
+  BatchProcessingFunctionArn:
+    Description: 'ARN of the batch processing Lambda function'
+    Value: !GetAtt BatchForecastFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-batch-function-arn'
+
+  AutoMLWorkflowArn:
+    Description: 'ARN of the Step Functions state machine for AutoML workflow'
+    Value: !GetAtt AutoMLWorkflow.Arn
+    Export:
+      Name: !Sub '${ProjectName}-automl-workflow-arn'
+
+  MonitoringDashboardURL:
+    Condition: CreateMonitoring
+    Description: 'CloudWatch dashboard URL for monitoring'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-forecasting-dashboard'
+    Export:
+      Name: !Sub '${ProjectName}-dashboard-url'
+
+  TrainingDataPrefix:
+    Description: 'S3 prefix for training data'
+    Value: !Sub 's3://${ForecastingDataBucket}/training-data/'
+    Export:
+      Name: !Sub '${ProjectName}-training-data-prefix'
+
+  AutoMLOutputPrefix:
+    Description: 'S3 prefix for AutoML job outputs'
+    Value: !Sub 's3://${ForecastingDataBucket}/automl-output/'
+    Export:
+      Name: !Sub '${ProjectName}-automl-output-prefix'
+
+  BatchInputPrefix:
+    Description: 'S3 prefix for batch processing input'
+    Value: !Sub 's3://${ForecastingDataBucket}/batch-input/'
+    Export:
+      Name: !Sub '${ProjectName}-batch-input-prefix'
+
+  BatchOutputPrefix:
+    Description: 'S3 prefix for batch processing output'
+    Value: !Sub 's3://${ForecastingDataBucket}/batch-output/'
+    Export:
+      Name: !Sub '${ProjectName}-batch-output-prefix'

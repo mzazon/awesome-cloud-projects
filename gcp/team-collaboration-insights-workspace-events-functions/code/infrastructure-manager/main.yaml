@@ -1,0 +1,536 @@
+# Infrastructure Manager Configuration for Team Collaboration Insights
+# Deploys Google Workspace Events API integration with Cloud Functions and Firestore
+# for real-time team collaboration analytics
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: team-collaboration-config
+  labels:
+    solution: workspace-analytics
+    version: "1.0"
+data:
+  # Project configuration
+  project_id: "${PROJECT_ID}"
+  region: "us-central1"
+  
+  # Resource naming configuration
+  solution_name: "workspace-collaboration"
+  random_suffix: "${RANDOM_SUFFIX}"
+  
+  # Pub/Sub configuration
+  pubsub_topic_name: "workspace-events-topic"
+  pubsub_subscription_name: "workspace-events-subscription"
+  pubsub_ack_deadline: "600"
+  
+  # Cloud Functions configuration
+  processor_function_name: "process-workspace-events"
+  analytics_function_name: "collaboration-analytics"
+  function_memory: "256MB"
+  function_timeout: "60s"
+  analytics_memory: "512MB"
+  analytics_timeout: "120s"
+  
+  # Service account configuration
+  service_account_name: "workspace-events-sa"
+  service_account_display_name: "Workspace Events Service Account"
+
+---
+# Enable required Google Cloud APIs
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: enable-cloudfunctions-api
+  labels:
+    solution: workspace-analytics
+spec:
+  projectRef:
+    external: "${PROJECT_ID}"
+  resourceID: cloudfunctions.googleapis.com
+
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: enable-firestore-api
+  labels:
+    solution: workspace-analytics
+spec:
+  projectRef:
+    external: "${PROJECT_ID}"
+  resourceID: firestore.googleapis.com
+
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: enable-pubsub-api
+  labels:
+    solution: workspace-analytics
+spec:
+  projectRef:
+    external: "${PROJECT_ID}"
+  resourceID: pubsub.googleapis.com
+
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: enable-workspaceevents-api
+  labels:
+    solution: workspace-analytics
+spec:
+  projectRef:
+    external: "${PROJECT_ID}"
+  resourceID: workspaceevents.googleapis.com
+
+---
+# Create service account for Workspace Events API access
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMServiceAccount
+metadata:
+  name: workspace-events-service-account
+  labels:
+    solution: workspace-analytics
+spec:
+  accountId: workspace-events-sa
+  displayName: "Workspace Events Service Account"
+  description: "Service account for Google Workspace Events API integration"
+  projectRef:
+    external: "${PROJECT_ID}"
+
+---
+# Grant Pub/Sub publisher role to service account
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: workspace-events-pubsub-publisher
+  labels:
+    solution: workspace-analytics
+spec:
+  member: "serviceAccount:workspace-events-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+  role: "roles/pubsub.publisher"
+  resourceRef:
+    apiVersion: resourcemanager.cnrm.cloud.google.com/v1beta1
+    kind: Project
+    external: "${PROJECT_ID}"
+
+---
+# Grant Firestore access to Cloud Functions service account
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: functions-firestore-access
+  labels:
+    solution: workspace-analytics
+spec:
+  member: "serviceAccount:${PROJECT_ID}@appspot.gserviceaccount.com"
+  role: "roles/datastore.user"
+  resourceRef:
+    apiVersion: resourcemanager.cnrm.cloud.google.com/v1beta1
+    kind: Project
+    external: "${PROJECT_ID}"
+
+---
+# Create Pub/Sub topic for Workspace events
+apiVersion: pubsub.cnrm.cloud.google.com/v1beta1
+kind: PubSubTopic
+metadata:
+  name: workspace-events-topic
+  labels:
+    solution: workspace-analytics
+    component: messaging
+spec:
+  name: "workspace-events-topic"
+  projectRef:
+    external: "${PROJECT_ID}"
+  messageRetentionDuration: "604800s"  # 7 days retention
+  
+---
+# Create Pub/Sub subscription for Cloud Functions trigger
+apiVersion: pubsub.cnrm.cloud.google.com/v1beta1
+kind: PubSubSubscription
+metadata:
+  name: workspace-events-subscription
+  labels:
+    solution: workspace-analytics
+    component: messaging
+spec:
+  name: "workspace-events-subscription"
+  topicRef:
+    name: workspace-events-topic
+  projectRef:
+    external: "${PROJECT_ID}"
+  ackDeadlineSeconds: 600
+  retryPolicy:
+    minimumBackoff: "10s"
+    maximumBackoff: "600s"
+  deadLetterPolicy:
+    maxDeliveryAttempts: 5
+  messageRetentionDuration: "604800s"
+
+---
+# Create Cloud Storage bucket for function source code
+apiVersion: storage.cnrm.cloud.google.com/v1beta1
+kind: StorageBucket
+metadata:
+  name: function-source-bucket
+  labels:
+    solution: workspace-analytics
+    component: storage
+spec:
+  name: "${PROJECT_ID}-function-source"
+  location: "US-CENTRAL1"
+  storageClass: "STANDARD"
+  uniformBucketLevelAccess: true
+  versioning:
+    enabled: true
+  lifecycle:
+    rule:
+    - action:
+        type: "Delete"
+      condition:
+        age: 30  # Delete function source code after 30 days
+        withState: "ARCHIVED"
+
+---
+# Initialize Firestore database in native mode
+apiVersion: firestore.cnrm.cloud.google.com/v1beta1
+kind: FirestoreDatabase
+metadata:
+  name: collaboration-firestore-db
+  labels:
+    solution: workspace-analytics
+    component: database
+spec:
+  name: "(default)"
+  locationId: "us-central1"
+  type: "FIRESTORE_NATIVE"
+  concurrencyMode: "OPTIMISTIC"
+  appEngineIntegrationMode: "DISABLED"
+  pointInTimeRecoveryEnablement: "POINT_IN_TIME_RECOVERY_ENABLED"
+  deleteProtectionState: "DELETE_PROTECTION_DISABLED"
+  projectRef:
+    external: "${PROJECT_ID}"
+
+---
+# Deploy event processing Cloud Function
+apiVersion: cloudfunctions.cnrm.cloud.google.com/v1beta1
+kind: CloudFunctionsFunction
+metadata:
+  name: process-workspace-events-function
+  labels:
+    solution: workspace-analytics
+    component: processing
+spec:
+  name: "process-workspace-events"
+  location: "us-central1"
+  projectRef:
+    external: "${PROJECT_ID}"
+  
+  # Function configuration
+  runtime: "python311"
+  entryPoint: "process_workspace_event"
+  availableMemoryMb: 256
+  timeout: "60s"
+  maxInstances: 100
+  
+  # Event trigger configuration
+  eventTrigger:
+    eventType: "google.pubsub.topic.publish"
+    resource: "projects/${PROJECT_ID}/topics/workspace-events-topic"
+    failurePolicy:
+      retry: true
+  
+  # Function source code
+  sourceArchiveUrl: "gs://${PROJECT_ID}-function-source/process-workspace-events.zip"
+  
+  # Environment variables
+  environmentVariables:
+    GCP_PROJECT: "${PROJECT_ID}"
+    FIRESTORE_DATABASE: "(default)"
+    LOG_LEVEL: "INFO"
+  
+  # Service account configuration
+  serviceAccountEmail: "${PROJECT_ID}@appspot.gserviceaccount.com"
+
+---
+# Deploy analytics dashboard Cloud Function
+apiVersion: cloudfunctions.cnrm.cloud.google.com/v1beta1
+kind: CloudFunctionsFunction
+metadata:
+  name: collaboration-analytics-function
+  labels:
+    solution: workspace-analytics
+    component: analytics
+spec:
+  name: "collaboration-analytics"
+  location: "us-central1"
+  projectRef:
+    external: "${PROJECT_ID}"
+  
+  # Function configuration
+  runtime: "python311"
+  entryPoint: "get_collaboration_analytics"
+  availableMemoryMb: 512
+  timeout: "120s"
+  maxInstances: 50
+  
+  # HTTP trigger configuration
+  httpsTrigger:
+    securityLevel: "SECURE_ALWAYS"
+  
+  # Function source code
+  sourceArchiveUrl: "gs://${PROJECT_ID}-function-source/collaboration-analytics.zip"
+  
+  # Environment variables
+  environmentVariables:
+    GCP_PROJECT: "${PROJECT_ID}"
+    FIRESTORE_DATABASE: "(default)"
+    LOG_LEVEL: "INFO"
+    CORS_ORIGINS: "*"
+  
+  # Service account configuration
+  serviceAccountEmail: "${PROJECT_ID}@appspot.gserviceaccount.com"
+
+---
+# IAM policy to allow unauthenticated invocation of analytics function
+apiVersion: cloudfunctions.cnrm.cloud.google.com/v1beta1
+kind: CloudFunctionsCloudFunctionIamPolicy
+metadata:
+  name: analytics-function-iam-policy
+  labels:
+    solution: workspace-analytics
+spec:
+  cloudFunctionRef:
+    name: collaboration-analytics-function
+  policyData: |
+    {
+      "bindings": [
+        {
+          "role": "roles/cloudfunctions.invoker",
+          "members": [
+            "allUsers"
+          ]
+        }
+      ]
+    }
+
+---
+# Create Cloud Monitoring alert policy for function errors
+apiVersion: monitoring.cnrm.cloud.google.com/v1beta1
+kind: MonitoringAlertPolicy
+metadata:
+  name: workspace-events-function-errors
+  labels:
+    solution: workspace-analytics
+    component: monitoring
+spec:
+  displayName: "Workspace Events Function Errors"
+  documentation:
+    content: "Alert when Cloud Functions processing workspace events encounter errors"
+    mimeType: "text/markdown"
+  
+  conditions:
+  - displayName: "Function Error Rate"
+    conditionThreshold:
+      filter: 'resource.type="cloud_function" resource.label.function_name=~"process-workspace-events|collaboration-analytics"'
+      comparison: "COMPARISON_GREATER_THAN"
+      thresholdValue: 0.1  # Alert if error rate > 10%
+      duration: "300s"
+      aggregations:
+      - alignmentPeriod: "300s"
+        perSeriesAligner: "ALIGN_RATE"
+        crossSeriesReducer: "REDUCE_MEAN"
+        groupByFields:
+        - "resource.label.function_name"
+  
+  combiner: "OR"
+  enabled: true
+  
+  alertStrategy:
+    autoClose: "86400s"  # Auto-close after 24 hours
+
+---
+# Create Cloud Monitoring dashboard for collaboration analytics
+apiVersion: monitoring.cnrm.cloud.google.com/v1beta1
+kind: MonitoringDashboard
+metadata:
+  name: workspace-collaboration-dashboard
+  labels:
+    solution: workspace-analytics
+    component: monitoring
+spec:
+  displayName: "Workspace Collaboration Analytics"
+  
+  # Dashboard configuration with widgets for key metrics
+  mosaicLayout:
+    tiles:
+    - width: 6
+      height: 4
+      widget:
+        title: "Function Invocations"
+        xyChart:
+          dataSets:
+          - timeSeriesQuery:
+              timeSeriesFilter:
+                filter: 'resource.type="cloud_function" resource.label.function_name=~"process-workspace-events|collaboration-analytics"'
+                aggregation:
+                  alignmentPeriod: "300s"
+                  perSeriesAligner: "ALIGN_RATE"
+                  crossSeriesReducer: "REDUCE_SUM"
+              unitOverride: "1/s"
+          yAxis:
+            label: "Invocations per second"
+    
+    - width: 6
+      height: 4
+      widget:
+        title: "Pub/Sub Message Rate"
+        xyChart:
+          dataSets:
+          - timeSeriesQuery:
+              timeSeriesFilter:
+                filter: 'resource.type="pubsub_topic" resource.label.topic_id="workspace-events-topic"'
+                aggregation:
+                  alignmentPeriod: "300s"
+                  perSeriesAligner: "ALIGN_RATE"
+                  crossSeriesReducer: "REDUCE_SUM"
+              unitOverride: "1/s"
+          yAxis:
+            label: "Messages per second"
+    
+    - width: 12
+      height: 4
+      widget:
+        title: "Firestore Operations"
+        xyChart:
+          dataSets:
+          - timeSeriesQuery:
+              timeSeriesFilter:
+                filter: 'resource.type="firestore_database"'
+                aggregation:
+                  alignmentPeriod: "300s"
+                  perSeriesAligner: "ALIGN_RATE"
+                  crossSeriesReducer: "REDUCE_SUM"
+              unitOverride: "1/s"
+          yAxis:
+            label: "Operations per second"
+
+---
+# Create Cloud Logging sink for audit and security monitoring
+apiVersion: logging.cnrm.cloud.google.com/v1beta1
+kind: LoggingSink
+metadata:
+  name: workspace-events-audit-sink
+  labels:
+    solution: workspace-analytics
+    component: logging
+spec:
+  name: "workspace-events-audit-sink"
+  destination: "bigquery.googleapis.com/projects/${PROJECT_ID}/datasets/workspace_audit_logs"
+  filter: |
+    (resource.type="cloud_function" 
+     resource.labels.function_name=~"process-workspace-events|collaboration-analytics")
+    OR
+    (resource.type="pubsub_topic" 
+     resource.labels.topic_id="workspace-events-topic")
+  uniqueWriterIdentity: true
+  projectRef:
+    external: "${PROJECT_ID}"
+
+---
+# Create BigQuery dataset for audit logs (destination for logging sink)
+apiVersion: bigquery.cnrm.cloud.google.com/v1beta1
+kind: BigQueryDataset
+metadata:
+  name: workspace-audit-logs-dataset
+  labels:
+    solution: workspace-analytics
+    component: audit
+spec:
+  datasetId: "workspace_audit_logs"
+  location: "US"
+  defaultTableExpirationMs: 2592000000  # 30 days
+  description: "Audit logs for workspace collaboration analytics"
+  projectRef:
+    external: "${PROJECT_ID}"
+  
+  access:
+  - role: "OWNER"
+    userByEmail: "${PROJECT_ID}@appspot.gserviceaccount.com"
+  - role: "WRITER"
+    specialGroup: "projectWriters"
+  - role: "READER"
+    specialGroup: "projectReaders"
+
+---
+# Create Cloud Scheduler job for periodic analytics cleanup
+apiVersion: cloudscheduler.cnrm.cloud.google.com/v1beta1
+kind: CloudSchedulerJob
+metadata:
+  name: analytics-cleanup-job
+  labels:
+    solution: workspace-analytics
+    component: maintenance
+spec:
+  name: "analytics-cleanup-job"
+  description: "Periodic cleanup of old collaboration analytics data"
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  timeZone: "UTC"
+  region: "us-central1"
+  
+  httpTarget:
+    uri: "https://us-central1-${PROJECT_ID}.cloudfunctions.net/collaboration-analytics"
+    httpMethod: "POST"
+    headers:
+      "Content-Type": "application/json"
+    body: |
+      {
+        "action": "cleanup",
+        "retention_days": 90
+      }
+  
+  retryConfig:
+    retryCount: 3
+    maxRetryDuration: "300s"
+    minBackoffDuration: "5s"
+    maxBackoffDuration: "60s"
+
+---
+# Output important resource information
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: deployment-outputs
+  labels:
+    solution: workspace-analytics
+    component: outputs
+data:
+  project_id: "${PROJECT_ID}"
+  region: "us-central1"
+  
+  # Pub/Sub resources
+  pubsub_topic: "projects/${PROJECT_ID}/topics/workspace-events-topic"
+  pubsub_subscription: "projects/${PROJECT_ID}/subscriptions/workspace-events-subscription"
+  
+  # Cloud Functions
+  processor_function_url: "https://us-central1-${PROJECT_ID}.cloudfunctions.net/process-workspace-events"
+  analytics_function_url: "https://us-central1-${PROJECT_ID}.cloudfunctions.net/collaboration-analytics"
+  
+  # Storage
+  firestore_database: "(default)"
+  function_source_bucket: "${PROJECT_ID}-function-source"
+  
+  # Service accounts
+  workspace_events_service_account: "workspace-events-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+  
+  # Monitoring
+  dashboard_url: "https://console.cloud.google.com/monitoring/dashboards/custom/workspace-collaboration-dashboard"
+  
+  # BigQuery
+  audit_logs_dataset: "${PROJECT_ID}.workspace_audit_logs"
+  
+  # Deployment status
+  deployment_complete: "true"
+  deployment_timestamp: "${DEPLOYMENT_TIMESTAMP}"

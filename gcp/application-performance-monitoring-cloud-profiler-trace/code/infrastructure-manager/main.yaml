@@ -1,0 +1,629 @@
+# Infrastructure Manager Configuration for Application Performance Monitoring with Cloud Profiler and Trace
+# This configuration deploys a complete microservices architecture with comprehensive performance monitoring
+# using Cloud Profiler for continuous profiling and Cloud Trace for distributed tracing
+
+# Variables for customization
+variables:
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    required: true
+  
+  region:
+    description: "Google Cloud region for deployment"
+    type: string
+    default: "us-central1"
+    
+  service_name_prefix:
+    description: "Prefix for service names to ensure uniqueness"
+    type: string
+    default: "perf-monitor"
+    
+  container_image_tag:
+    description: "Container image tag for versioning"
+    type: string
+    default: "latest"
+    
+  max_instances:
+    description: "Maximum number of instances per service"
+    type: number
+    default: 10
+    
+  memory_limit:
+    description: "Memory limit for Cloud Run services"
+    type: string
+    default: "1Gi"
+    
+  cpu_limit:
+    description: "CPU limit for Cloud Run services"
+    type: string
+    default: "1"
+
+# Required APIs that need to be enabled
+resources:
+  # Enable Google Cloud APIs required for the solution
+  - name: enable-cloud-run-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/run.googleapis.com
+      
+  - name: enable-cloud-profiler-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/cloudprofiler.googleapis.com
+      
+  - name: enable-cloud-trace-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/cloudtrace.googleapis.com
+      
+  - name: enable-cloud-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/monitoring.googleapis.com
+      
+  - name: enable-cloud-logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/logging.googleapis.com
+      
+  - name: enable-cloud-build-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/cloudbuild.googleapis.com
+      
+  - name: enable-container-registry-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/containerregistry.googleapis.com
+
+  # Service Account for Cloud Profiler and Trace with appropriate permissions
+  - name: profiler-trace-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: profiler-trace-sa
+      displayName: "Cloud Profiler and Trace Service Account"
+      description: "Service account for microservices with profiling and tracing capabilities"
+    metadata:
+      dependsOn:
+        - enable-cloud-run-api
+        - enable-cloud-profiler-api
+        - enable-cloud-trace-api
+
+  # IAM binding for Cloud Profiler Agent role
+  - name: profiler-agent-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: $(ref.project_id.value)
+      policy:
+        bindings:
+          - role: roles/cloudprofiler.agent
+            members:
+              - serviceAccount:$(ref.profiler-trace-service-account.email)
+    metadata:
+      dependsOn:
+        - profiler-trace-service-account
+
+  # IAM binding for Cloud Trace Agent role
+  - name: trace-agent-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: $(ref.project_id.value)
+      policy:
+        bindings:
+          - role: roles/cloudtrace.agent
+            members:
+              - serviceAccount:$(ref.profiler-trace-service-account.email)
+    metadata:
+      dependsOn:
+        - profiler-trace-service-account
+
+  # Cloud Monitoring Workspace (automatically created for the project)
+  - name: monitoring-workspace
+    type: gcp-types/monitoring-v1:projects.metricDescriptors
+    properties:
+      name: projects/$(ref.project_id.value)
+      metricDescriptor:
+        type: custom.googleapis.com/application/performance_monitoring
+        displayName: "Application Performance Monitoring"
+        description: "Custom metric for application performance monitoring"
+        metricKind: GAUGE
+        valueType: DOUBLE
+        labels:
+          - key: service_name
+            valueType: STRING
+          - key: endpoint
+            valueType: STRING
+    metadata:
+      dependsOn:
+        - enable-cloud-monitoring-api
+
+  # Frontend Service - Entry point for the microservices architecture
+  - name: frontend-service
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/$(ref.project_id.value)
+      location: $(ref.region.value)
+      body:
+        apiVersion: serving.knative.dev/v1
+        kind: Service
+        metadata:
+          name: $(ref.service_name_prefix.value)-frontend
+          namespace: $(ref.project_id.value)
+          annotations:
+            run.googleapis.com/ingress: all
+            run.googleapis.com/execution-environment: gen2
+        spec:
+          template:
+            metadata:
+              annotations:
+                run.googleapis.com/service-account: $(ref.profiler-trace-service-account.email)
+                run.googleapis.com/cpu-throttling: "true"
+                autoscaling.knative.dev/maxScale: "$(ref.max_instances.value)"
+            spec:
+              serviceAccountName: $(ref.profiler-trace-service-account.email)
+              containerConcurrency: 100
+              timeoutSeconds: 300
+              containers:
+                - image: gcr.io/$(ref.project_id.value)/$(ref.service_name_prefix.value)-frontend:$(ref.container_image_tag.value)
+                  name: frontend-container
+                  ports:
+                    - containerPort: 8080
+                      name: http1
+                  resources:
+                    limits:
+                      cpu: $(ref.cpu_limit.value)
+                      memory: $(ref.memory_limit.value)
+                  env:
+                    - name: GOOGLE_CLOUD_PROJECT
+                      value: $(ref.project_id.value)
+                    - name: SERVICE_NAME
+                      value: frontend-service
+                    - name: SERVICE_VERSION
+                      value: "1.0.0"
+                    - name: API_SERVICE_URL
+                      value: $(ref.api-gateway-service.status.url)
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 10
+                    periodSeconds: 5
+                    timeoutSeconds: 3
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 10
+                    timeoutSeconds: 5
+    metadata:
+      dependsOn:
+        - profiler-trace-service-account
+        - enable-cloud-run-api
+        - profiler-agent-binding
+        - trace-agent-binding
+
+  # API Gateway Service - Central routing service for microservices
+  - name: api-gateway-service
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/$(ref.project_id.value)
+      location: $(ref.region.value)
+      body:
+        apiVersion: serving.knative.dev/v1
+        kind: Service
+        metadata:
+          name: $(ref.service_name_prefix.value)-api-gateway
+          namespace: $(ref.project_id.value)
+          annotations:
+            run.googleapis.com/ingress: all
+            run.googleapis.com/execution-environment: gen2
+        spec:
+          template:
+            metadata:
+              annotations:
+                run.googleapis.com/service-account: $(ref.profiler-trace-service-account.email)
+                run.googleapis.com/cpu-throttling: "true"
+                autoscaling.knative.dev/maxScale: "$(ref.max_instances.value)"
+            spec:
+              serviceAccountName: $(ref.profiler-trace-service-account.email)
+              containerConcurrency: 100
+              timeoutSeconds: 300
+              containers:
+                - image: gcr.io/$(ref.project_id.value)/$(ref.service_name_prefix.value)-api-gateway:$(ref.container_image_tag.value)
+                  name: api-gateway-container
+                  ports:
+                    - containerPort: 8080
+                      name: http1
+                  resources:
+                    limits:
+                      cpu: $(ref.cpu_limit.value)
+                      memory: $(ref.memory_limit.value)
+                  env:
+                    - name: GOOGLE_CLOUD_PROJECT
+                      value: $(ref.project_id.value)
+                    - name: SERVICE_NAME
+                      value: api-gateway-service
+                    - name: SERVICE_VERSION
+                      value: "1.0.0"
+                    - name: AUTH_SERVICE_URL
+                      value: $(ref.auth-service.status.url)
+                    - name: DATA_SERVICE_URL
+                      value: $(ref.data-service.status.url)
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 10
+                    periodSeconds: 5
+                    timeoutSeconds: 3
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 10
+                    timeoutSeconds: 5
+    metadata:
+      dependsOn:
+        - profiler-trace-service-account
+        - enable-cloud-run-api
+        - profiler-agent-binding
+        - trace-agent-binding
+
+  # Authentication Service - Handles user authentication with memory-intensive operations
+  - name: auth-service
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/$(ref.project_id.value)
+      location: $(ref.region.value)
+      body:
+        apiVersion: serving.knative.dev/v1
+        kind: Service
+        metadata:
+          name: $(ref.service_name_prefix.value)-auth
+          namespace: $(ref.project_id.value)
+          annotations:
+            run.googleapis.com/ingress: all
+            run.googleapis.com/execution-environment: gen2
+        spec:
+          template:
+            metadata:
+              annotations:
+                run.googleapis.com/service-account: $(ref.profiler-trace-service-account.email)
+                run.googleapis.com/cpu-throttling: "true"
+                autoscaling.knative.dev/maxScale: "$(ref.max_instances.value)"
+            spec:
+              serviceAccountName: $(ref.profiler-trace-service-account.email)
+              containerConcurrency: 50
+              timeoutSeconds: 300
+              containers:
+                - image: gcr.io/$(ref.project_id.value)/$(ref.service_name_prefix.value)-auth:$(ref.container_image_tag.value)
+                  name: auth-container
+                  ports:
+                    - containerPort: 8080
+                      name: http1
+                  resources:
+                    limits:
+                      cpu: $(ref.cpu_limit.value)
+                      memory: $(ref.memory_limit.value)
+                  env:
+                    - name: GOOGLE_CLOUD_PROJECT
+                      value: $(ref.project_id.value)
+                    - name: SERVICE_NAME
+                      value: auth-service
+                    - name: SERVICE_VERSION
+                      value: "1.0.0"
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 10
+                    periodSeconds: 5
+                    timeoutSeconds: 3
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 10
+                    timeoutSeconds: 5
+    metadata:
+      dependsOn:
+        - profiler-trace-service-account
+        - enable-cloud-run-api
+        - profiler-agent-binding
+        - trace-agent-binding
+
+  # Data Service - Handles data processing with database operations
+  - name: data-service
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/$(ref.project_id.value)
+      location: $(ref.region.value)
+      body:
+        apiVersion: serving.knative.dev/v1
+        kind: Service
+        metadata:
+          name: $(ref.service_name_prefix.value)-data
+          namespace: $(ref.project_id.value)
+          annotations:
+            run.googleapis.com/ingress: all
+            run.googleapis.com/execution-environment: gen2
+        spec:
+          template:
+            metadata:
+              annotations:
+                run.googleapis.com/service-account: $(ref.profiler-trace-service-account.email)
+                run.googleapis.com/cpu-throttling: "true"
+                autoscaling.knative.dev/maxScale: "$(ref.max_instances.value)"
+            spec:
+              serviceAccountName: $(ref.profiler-trace-service-account.email)
+              containerConcurrency: 80
+              timeoutSeconds: 300
+              containers:
+                - image: gcr.io/$(ref.project_id.value)/$(ref.service_name_prefix.value)-data:$(ref.container_image_tag.value)
+                  name: data-container
+                  ports:
+                    - containerPort: 8080
+                      name: http1
+                  resources:
+                    limits:
+                      cpu: $(ref.cpu_limit.value)
+                      memory: $(ref.memory_limit.value)
+                  env:
+                    - name: GOOGLE_CLOUD_PROJECT
+                      value: $(ref.project_id.value)
+                    - name: SERVICE_NAME
+                      value: data-service
+                    - name: SERVICE_VERSION
+                      value: "1.0.0"
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 10
+                    periodSeconds: 5
+                    timeoutSeconds: 3
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 10
+                    timeoutSeconds: 5
+    metadata:
+      dependsOn:
+        - profiler-trace-service-account
+        - enable-cloud-run-api
+        - profiler-agent-binding
+        - trace-agent-binding
+
+  # IAM Policy for Cloud Run Services to allow unauthenticated access
+  - name: frontend-service-iam-policy
+    type: gcp-types/run-v1:projects.locations.services.setIamPolicy
+    properties:
+      resource: projects/$(ref.project_id.value)/locations/$(ref.region.value)/services/$(ref.service_name_prefix.value)-frontend
+      policy:
+        bindings:
+          - role: roles/run.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - frontend-service
+
+  - name: api-gateway-service-iam-policy
+    type: gcp-types/run-v1:projects.locations.services.setIamPolicy
+    properties:
+      resource: projects/$(ref.project_id.value)/locations/$(ref.region.value)/services/$(ref.service_name_prefix.value)-api-gateway
+      policy:
+        bindings:
+          - role: roles/run.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - api-gateway-service
+
+  - name: auth-service-iam-policy
+    type: gcp-types/run-v1:projects.locations.services.setIamPolicy
+    properties:
+      resource: projects/$(ref.project_id.value)/locations/$(ref.region.value)/services/$(ref.service_name_prefix.value)-auth
+      policy:
+        bindings:
+          - role: roles/run.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - auth-service
+
+  - name: data-service-iam-policy
+    type: gcp-types/run-v1:projects.locations.services.setIamPolicy
+    properties:
+      resource: projects/$(ref.project_id.value)/locations/$(ref.region.value)/services/$(ref.service_name_prefix.value)-data
+      policy:
+        bindings:
+          - role: roles/run.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - data-service
+
+  # Cloud Monitoring Dashboard for Performance Visualization
+  - name: performance-monitoring-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      parent: projects/$(ref.project_id.value)
+      dashboard:
+        displayName: "Application Performance Monitoring Dashboard"
+        mosaicLayout:
+          tiles:
+            - width: 6
+              height: 4
+              widget:
+                title: "Cloud Run Request Latency"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="cloud_run_revision"'
+                          aggregation:
+                            alignmentPeriod: "60s"
+                            perSeriesAligner: "ALIGN_MEAN"
+                            crossSeriesReducer: "REDUCE_MEAN"
+                            groupByFields:
+                              - "resource.label.service_name"
+                      plotType: "LINE"
+            - width: 6
+              height: 4
+              xPos: 6
+              widget:
+                title: "Cloud Trace Request Count"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="gce_instance" AND metric.type="cloudtrace.googleapis.com/trace_span/count"'
+                          aggregation:
+                            alignmentPeriod: "60s"
+                            perSeriesAligner: "ALIGN_RATE"
+                            crossSeriesReducer: "REDUCE_SUM"
+                      plotType: "STACKED_AREA"
+            - width: 12
+              height: 4
+              yPos: 4
+              widget:
+                title: "Service CPU Utilization"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="cloud_run_revision"'
+                          aggregation:
+                            alignmentPeriod: "60s"
+                            perSeriesAligner: "ALIGN_MEAN"
+                            crossSeriesReducer: "REDUCE_MEAN"
+                            groupByFields:
+                              - "resource.label.service_name"
+                      plotType: "LINE"
+            - width: 12
+              height: 4
+              yPos: 8
+              widget:
+                title: "Memory Utilization by Service"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="cloud_run_revision" AND metric.type="run.googleapis.com/container/memory/utilizations"'
+                          aggregation:
+                            alignmentPeriod: "60s"
+                            perSeriesAligner: "ALIGN_MEAN"
+                            crossSeriesReducer: "REDUCE_MEAN"
+                            groupByFields:
+                              - "resource.label.service_name"
+                      plotType: "LINE"
+    metadata:
+      dependsOn:
+        - enable-cloud-monitoring-api
+        - monitoring-workspace
+
+  # Cloud Monitoring Alert Policy for High Latency
+  - name: high-latency-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(ref.project_id.value)
+      alertPolicy:
+        displayName: "High Application Latency Alert"
+        documentation:
+          content: "This alert triggers when application latency exceeds acceptable thresholds"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "Cloud Run request latency above threshold"
+            conditionThreshold:
+              filter: 'resource.type="cloud_run_revision"'
+              comparison: "COMPARISON_GREATER_THAN"
+              thresholdValue: 2.0
+              duration: "300s"
+              aggregations:
+                - alignmentPeriod: "60s"
+                  perSeriesAligner: "ALIGN_MEAN"
+                  crossSeriesReducer: "REDUCE_MEAN"
+                  groupByFields:
+                    - "resource.label.service_name"
+        combiner: "OR"
+        enabled: true
+        alertStrategy:
+          autoClose: "1800s"
+    metadata:
+      dependsOn:
+        - enable-cloud-monitoring-api
+        - monitoring-workspace
+
+  # Log-based Metric for Error Rate Monitoring
+  - name: error-rate-metric
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      parent: projects/$(ref.project_id.value)
+      metric:
+        name: "application_error_rate"
+        description: "Rate of application errors across all services"
+        filter: 'resource.type="cloud_run_revision" AND severity="ERROR"'
+        metricDescriptor:
+          metricKind: "GAUGE"
+          valueType: "DOUBLE"
+          displayName: "Application Error Rate"
+        labelExtractors:
+          service_name: 'EXTRACT(resource.labels.service_name)'
+          error_type: 'EXTRACT(jsonPayload.error_type)'
+    metadata:
+      dependsOn:
+        - enable-cloud-logging-api
+        - enable-cloud-monitoring-api
+
+# Outputs to provide important information about deployed resources
+outputs:
+  - name: project_id
+    value: $(ref.project_id.value)
+    
+  - name: region
+    value: $(ref.region.value)
+    
+  - name: service_account_email
+    value: $(ref.profiler-trace-service-account.email)
+    
+  - name: frontend_service_url
+    value: $(ref.frontend-service.status.url)
+    
+  - name: api_gateway_service_url
+    value: $(ref.api-gateway-service.status.url)
+    
+  - name: auth_service_url
+    value: $(ref.auth-service.status.url)
+    
+  - name: data_service_url
+    value: $(ref.data-service.status.url)
+    
+  - name: monitoring_dashboard_url
+    value: https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.performance-monitoring-dashboard.name)
+    
+  - name: cloud_profiler_url
+    value: https://console.cloud.google.com/profiler?project=$(ref.project_id.value)
+    
+  - name: cloud_trace_url
+    value: https://console.cloud.google.com/traces/overview?project=$(ref.project_id.value)
+    
+  - name: deployment_commands
+    value: |
+      # Build and push container images:
+      gcloud builds submit frontend/ --tag gcr.io/$(ref.project_id.value)/$(ref.service_name_prefix.value)-frontend:$(ref.container_image_tag.value)
+      gcloud builds submit api-gateway/ --tag gcr.io/$(ref.project_id.value)/$(ref.service_name_prefix.value)-api-gateway:$(ref.container_image_tag.value)
+      gcloud builds submit auth-service/ --tag gcr.io/$(ref.project_id.value)/$(ref.service_name_prefix.value)-auth:$(ref.container_image_tag.value)
+      gcloud builds submit data-service/ --tag gcr.io/$(ref.project_id.value)/$(ref.service_name_prefix.value)-data:$(ref.container_image_tag.value)
+      
+      # Deploy infrastructure:
+      gcloud infra-manager deployments apply deployment-name --location=$(ref.region.value) --config-file=main.yaml

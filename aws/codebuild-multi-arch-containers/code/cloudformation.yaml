@@ -1,0 +1,592 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for multi-architecture container image builds with CodeBuild, ECR, and supporting infrastructure'
+
+# Template metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Build Configuration"
+        Parameters:
+          - ComputeType
+          - BuildTimeoutMinutes
+          - SourceType
+      - Label:
+          default: "ECR Configuration"
+        Parameters:
+          - ECRRepositoryName
+          - EnableImageScanning
+          - EnableEncryption
+      - Label:
+          default: "Optional S3 Configuration"
+        Parameters:
+          - CreateS3Bucket
+          - S3BucketName
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      ComputeType:
+        default: "CodeBuild Compute Type"
+      BuildTimeoutMinutes:
+        default: "Build Timeout (minutes)"
+      SourceType:
+        default: "Source Type"
+      ECRRepositoryName:
+        default: "ECR Repository Name"
+      EnableImageScanning:
+        default: "Enable ECR Image Scanning"
+      EnableEncryption:
+        default: "Enable ECR Encryption"
+      CreateS3Bucket:
+        default: "Create S3 Bucket for Source"
+      S3BucketName:
+        default: "S3 Bucket Name"
+
+# Input parameters with validation and defaults
+Parameters:
+  ProjectName:
+    Type: String
+    Description: 'Name of the project (used for resource naming)'
+    Default: 'multi-arch-build'
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+
+  Environment:
+    Type: String
+    Description: 'Environment name (dev, staging, prod)'
+    Default: 'dev'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    ConstraintDescription: 'Must be dev, staging, or prod'
+
+  ComputeType:
+    Type: String
+    Description: 'CodeBuild compute type (affects cost and build performance)'
+    Default: 'BUILD_GENERAL1_MEDIUM'
+    AllowedValues:
+      - BUILD_GENERAL1_SMALL
+      - BUILD_GENERAL1_MEDIUM
+      - BUILD_GENERAL1_LARGE
+      - BUILD_GENERAL1_XLARGE
+      - BUILD_GENERAL1_2XLARGE
+    ConstraintDescription: 'Must be a valid CodeBuild compute type'
+
+  BuildTimeoutMinutes:
+    Type: Number
+    Description: 'Build timeout in minutes'
+    Default: 60
+    MinValue: 5
+    MaxValue: 480
+    ConstraintDescription: 'Must be between 5 and 480 minutes'
+
+  SourceType:
+    Type: String
+    Description: 'Source type for CodeBuild project'
+    Default: 'S3'
+    AllowedValues:
+      - S3
+      - GITHUB
+      - GITHUB_ENTERPRISE
+      - BITBUCKET
+      - CODECOMMIT
+      - NO_SOURCE
+    ConstraintDescription: 'Must be a valid CodeBuild source type'
+
+  ECRRepositoryName:
+    Type: String
+    Description: 'Name of the ECR repository (leave empty for auto-generated name)'
+    Default: ''
+    MaxLength: 256
+    AllowedPattern: '^$|^[a-z0-9]+(?:[._-][a-z0-9]+)*$'
+    ConstraintDescription: 'Must be a valid ECR repository name or empty'
+
+  EnableImageScanning:
+    Type: String
+    Description: 'Enable ECR image scanning for vulnerabilities'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableEncryption:
+    Type: String
+    Description: 'Enable ECR repository encryption'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  CreateS3Bucket:
+    Type: String
+    Description: 'Create S3 bucket for source code storage'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  S3BucketName:
+    Type: String
+    Description: 'S3 bucket name for source code (leave empty for auto-generated name)'
+    Default: ''
+    MaxLength: 63
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be a valid S3 bucket name or empty'
+
+# Conditions for conditional resource creation
+Conditions:
+  CreateS3BucketCondition: !Equals [!Ref CreateS3Bucket, 'true']
+  UseCustomECRName: !Not [!Equals [!Ref ECRRepositoryName, '']]
+  UseCustomS3Name: !Not [!Equals [!Ref S3BucketName, '']]
+  EnableImageScanningCondition: !Equals [!Ref EnableImageScanning, 'true']
+  EnableEncryptionCondition: !Equals [!Ref EnableEncryption, 'true']
+  IsS3Source: !Equals [!Ref SourceType, 'S3']
+
+# AWS Resources
+Resources:
+  # ECR Repository for storing multi-architecture container images
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !If
+        - UseCustomECRName
+        - !Ref ECRRepositoryName
+        - !Sub '${ProjectName}-${Environment}-${AWS::AccountId}'
+      ImageScanningConfiguration:
+        ScanOnPush: !If [EnableImageScanningCondition, true, false]
+      EncryptionConfiguration: !If
+        - EnableEncryptionCondition
+        - EncryptionType: 'AES256'
+        - !Ref 'AWS::NoValue'
+      ImageTagMutability: 'MUTABLE'
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["latest"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Delete untagged images older than 1 day",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 1
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Multi-architecture container builds'
+
+  # S3 Bucket for source code storage (conditional)
+  S3SourceBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateS3BucketCondition
+    Properties:
+      BucketName: !If
+        - UseCustomS3Name
+        - !Ref S3BucketName
+        - !Sub '${ProjectName}-${Environment}-source-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: 'Enabled'
+      LifecycleConfiguration:
+        Rules:
+          - Id: 'DeleteIncompleteMultipartUploads'
+            Status: 'Enabled'
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: 'DeleteOldVersions'
+            Status: 'Enabled'
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Source code storage for multi-architecture builds'
+
+  # IAM Role for CodeBuild with comprehensive permissions
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-CodeBuildMultiArchRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser'
+      Policies:
+        - PolicyName: 'CodeBuildMultiArchPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CloudWatch Logs permissions
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}-${Environment}-*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}-${Environment}-*:*'
+              # ECR permissions for multi-architecture builds
+              - Effect: Allow
+                Action:
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:BatchGetImage'
+                  - 'ecr:GetAuthorizationToken'
+                  - 'ecr:PutImage'
+                  - 'ecr:InitiateLayerUpload'
+                  - 'ecr:UploadLayerPart'
+                  - 'ecr:CompleteLayerUpload'
+                  - 'ecr:DescribeRepositories'
+                  - 'ecr:DescribeImages'
+                Resource: '*'
+              # S3 permissions for source code access
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:ListBucket'
+                Resource: !If
+                  - CreateS3BucketCondition
+                  - - !Sub '${S3SourceBucket}/*'
+                    - !GetAtt S3SourceBucket.Arn
+                  - - !Sub 'arn:aws:s3:::${ProjectName}-*/*'
+                    - !Sub 'arn:aws:s3:::${ProjectName}-*'
+              # CodeBuild report permissions
+              - Effect: Allow
+                Action:
+                  - 'codebuild:CreateReportGroup'
+                  - 'codebuild:CreateReport'
+                  - 'codebuild:UpdateReport'
+                  - 'codebuild:BatchPutTestCases'
+                  - 'codebuild:BatchPutCodeCoverages'
+                Resource: !Sub 'arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/${ProjectName}-*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'CodeBuild service role for multi-architecture builds'
+
+  # CloudWatch Log Group for CodeBuild
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectName}-${Environment}-multiarch'
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'CodeBuild logs for multi-architecture builds'
+
+  # CodeBuild Project for multi-architecture builds
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-multiarch'
+      Description: 'Multi-architecture container image build project supporting ARM64 and x86_64'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: 'NO_ARTIFACTS'
+      Environment:
+        Type: 'LINUX_CONTAINER'
+        ComputeType: !Ref ComputeType
+        Image: 'aws/codebuild/standard:7.0'
+        PrivilegedMode: true  # Required for Docker Buildx operations
+        EnvironmentVariables:
+          - Name: 'AWS_DEFAULT_REGION'
+            Value: !Ref 'AWS::Region'
+          - Name: 'AWS_ACCOUNT_ID'
+            Value: !Ref 'AWS::AccountId'
+          - Name: 'IMAGE_REPO_NAME'
+            Value: !Ref ECRRepository
+          - Name: 'ECR_REPOSITORY_URI'
+            Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}'
+          - Name: 'PROJECT_NAME'
+            Value: !Ref ProjectName
+          - Name: 'ENVIRONMENT'
+            Value: !Ref Environment
+      Source:
+        Type: !Ref SourceType
+        Location: !If
+          - IsS3Source
+          - !If
+            - CreateS3BucketCondition
+            - !Sub '${S3SourceBucket}/source.zip'
+            - !Sub '${ProjectName}-${Environment}-source-${AWS::AccountId}/source.zip'
+          - !Ref 'AWS::NoValue'
+        BuildSpec: |
+          version: 0.2
+          
+          phases:
+            pre_build:
+              commands:
+                - echo "Logging in to Amazon ECR..."
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+                - REPOSITORY_URI=$ECR_REPOSITORY_URI
+                - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+                - IMAGE_TAG=${COMMIT_HASH:=latest}
+                - echo "Repository URI is $REPOSITORY_URI"
+                - echo "Image tag is $IMAGE_TAG"
+                - echo "Project is $PROJECT_NAME in environment $ENVIRONMENT"
+                
+            build:
+              commands:
+                - echo "Build started on $(date)"
+                - echo "Building multi-architecture Docker image..."
+                
+                # Verify Docker Buildx is available
+                - docker buildx version
+                
+                # Create and use buildx builder for multi-architecture builds
+                - docker buildx create --name multiarch-builder --use --bootstrap
+                - docker buildx inspect --bootstrap
+                
+                # Build and push multi-architecture image
+                - |
+                  docker buildx build \
+                    --platform linux/amd64,linux/arm64 \
+                    --tag $REPOSITORY_URI:latest \
+                    --tag $REPOSITORY_URI:$IMAGE_TAG \
+                    --tag $REPOSITORY_URI:$ENVIRONMENT-latest \
+                    --push \
+                    --cache-from type=local,src=/tmp/.buildx-cache \
+                    --cache-to type=local,dest=/tmp/.buildx-cache-new,mode=max \
+                    .
+                
+                # Move cache to prevent unbounded growth
+                - rm -rf /tmp/.buildx-cache
+                - mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+                
+            post_build:
+              commands:
+                - echo "Build completed on $(date)"
+                - echo "Verifying multi-architecture image..."
+                - docker buildx imagetools inspect $REPOSITORY_URI:latest
+                - printf '{"ImageURI":"%s","ImageTag":"%s","Architecture":"multi-arch"}' $REPOSITORY_URI:latest $IMAGE_TAG > imageDetail.json
+                - echo "Multi-architecture build completed successfully"
+                
+          artifacts:
+            files:
+              - imageDetail.json
+              
+          cache:
+            paths:
+              - '/tmp/.buildx-cache/**/*'
+      TimeoutInMinutes: !Ref BuildTimeoutMinutes
+      Cache:
+        Type: 'LOCAL'
+        Modes:
+          - 'LOCAL_DOCKER_LAYER_CACHE'
+          - 'LOCAL_SOURCE_CACHE'
+      LogsConfig:
+        CloudWatchLogs:
+          Status: 'ENABLED'
+          GroupName: !Ref CodeBuildLogGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Multi-architecture container builds'
+        - Key: Architecture
+          Value: 'ARM64,x86_64'
+
+  # CloudWatch Dashboard for monitoring builds
+  BuildDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}-MultiArchBuilds'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/CodeBuild", "Duration", "ProjectName", "${CodeBuildProject}" ],
+                  [ ".", "Builds", ".", "." ],
+                  [ ".", "SucceededBuilds", ".", "." ],
+                  [ ".", "FailedBuilds", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "CodeBuild Metrics",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/codebuild/${ProjectName}-${Environment}-multiarch'\n| fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Build Errors",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarm for failed builds
+  BuildFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-BuildFailures'
+      AlarmDescription: 'Alarm when CodeBuild project has failed builds'
+      MetricName: 'FailedBuilds'
+      Namespace: 'AWS/CodeBuild'
+      Statistic: 'Sum'
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: 'GreaterThanOrEqualToThreshold'
+      Dimensions:
+        - Name: 'ProjectName'
+          Value: !Ref CodeBuildProject
+      TreatMissingData: 'notBreaching'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+# Stack outputs
+Outputs:
+  # ECR Repository information
+  ECRRepositoryName:
+    Description: 'Name of the ECR repository'
+    Value: !Ref ECRRepository
+    Export:
+      Name: !Sub '${AWS::StackName}-ECRRepository'
+
+  ECRRepositoryURI:
+    Description: 'URI of the ECR repository'
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ECRRepositoryURI'
+
+  # CodeBuild Project information
+  CodeBuildProjectName:
+    Description: 'Name of the CodeBuild project'
+    Value: !Ref CodeBuildProject
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeBuildProject'
+
+  CodeBuildProjectArn:
+    Description: 'ARN of the CodeBuild project'
+    Value: !GetAtt CodeBuildProject.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeBuildProjectArn'
+
+  # IAM Role information
+  CodeBuildServiceRoleArn:
+    Description: 'ARN of the CodeBuild service role'
+    Value: !GetAtt CodeBuildServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeBuildServiceRole'
+
+  # S3 Bucket information (conditional)
+  S3SourceBucketName:
+    Condition: CreateS3BucketCondition
+    Description: 'Name of the S3 source bucket'
+    Value: !Ref S3SourceBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3SourceBucket'
+
+  S3SourceBucketArn:
+    Condition: CreateS3BucketCondition
+    Description: 'ARN of the S3 source bucket'
+    Value: !GetAtt S3SourceBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-S3SourceBucketArn'
+
+  # CloudWatch information
+  LogGroupName:
+    Description: 'CloudWatch Log Group name for CodeBuild'
+    Value: !Ref CodeBuildLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  DashboardURL:
+    Description: 'URL to the CloudWatch Dashboard'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-MultiArchBuilds'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  # Quick start commands
+  StartBuildCommand:
+    Description: 'AWS CLI command to start a build'
+    Value: !Sub 'aws codebuild start-build --project-name ${CodeBuildProject} --region ${AWS::Region}'
+
+  InspectImageCommand:
+    Description: 'Docker command to inspect the multi-architecture image'
+    Value: !Sub 'docker buildx imagetools inspect ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}:latest'
+
+  # Cost estimation
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost (CodeBuild usage not included)'
+    Value: 'ECR: $0.10/GB/month for storage, S3: $0.023/GB/month for storage, CloudWatch: $0.50/GB for ingested logs'

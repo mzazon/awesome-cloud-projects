@@ -1,0 +1,625 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Real-time Data Processing Pipeline with Amazon Kinesis Data Streams and AWS Lambda - Serverless architecture for processing high-volume streaming data with automatic scaling and built-in error handling'
+
+# ===============================================
+# PARAMETERS - Configurable values for deployment
+# ===============================================
+Parameters:
+  # Environment and Naming
+  EnvironmentName:
+    Type: String
+    Default: 'dev'
+    Description: 'Environment name (dev, staging, prod) used for resource naming and tagging'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    ConstraintDescription: 'Must be one of: dev, staging, prod'
+
+  ProjectName:
+    Type: String
+    Default: 'realtime-data-processing'
+    Description: 'Project name used for resource naming and tagging'
+    MinLength: 3
+    MaxLength: 30
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+
+  # Kinesis Stream Configuration
+  StreamShardCount:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+    Description: 'Number of shards for the Kinesis stream (affects throughput and cost)'
+    ConstraintDescription: 'Must be between 1 and 10 shards'
+
+  StreamRetentionHours:
+    Type: Number
+    Default: 24
+    MinValue: 24
+    MaxValue: 8760
+    Description: 'Data retention period in hours (24 hours to 365 days)'
+    ConstraintDescription: 'Must be between 24 and 8760 hours'
+
+  # Lambda Function Configuration
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+    Description: 'Memory allocated to Lambda function (affects performance and cost)'
+    ConstraintDescription: 'Must be one of the allowed Lambda memory sizes'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 1
+    MaxValue: 900
+    Description: 'Lambda function timeout in seconds (max 15 minutes)'
+    ConstraintDescription: 'Must be between 1 and 900 seconds'
+
+  # Event Source Mapping Configuration
+  BatchSize:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 10000
+    Description: 'Maximum number of records to include in each Lambda invocation batch'
+    ConstraintDescription: 'Must be between 1 and 10000 records'
+
+  MaximumBatchingWindowInSeconds:
+    Type: Number
+    Default: 5
+    MinValue: 0
+    MaxValue: 300
+    Description: 'Maximum time to wait for a full batch before invoking Lambda (0-300 seconds)'
+    ConstraintDescription: 'Must be between 0 and 300 seconds'
+
+  # S3 Configuration
+  S3BucketName:
+    Type: String
+    Default: ''
+    Description: 'Optional: Custom S3 bucket name for processed data (leave empty for auto-generated name)'
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be empty or a valid S3 bucket name (lowercase, no underscores)'
+
+  # Monitoring Configuration
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable detailed CloudWatch monitoring for enhanced observability'
+
+# ===============================================
+# CONDITIONS - Conditional resource creation
+# ===============================================
+Conditions:
+  # Create custom S3 bucket name if not provided
+  CreateBucketName: !Equals [!Ref S3BucketName, '']
+  
+  # Enable enhanced monitoring features in production
+  IsProduction: !Equals [!Ref EnvironmentName, 'prod']
+  
+  # Enable detailed monitoring if requested
+  DetailedMonitoringEnabled: !Equals [!Ref EnableDetailedMonitoring, 'true']
+
+# ===============================================
+# RESOURCES - Infrastructure components
+# ===============================================
+Resources:
+  # ===============================================
+  # S3 BUCKET - Storage for processed data
+  # ===============================================
+  ProcessedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If 
+        - CreateBucketName
+        - !Sub '${ProjectName}-processed-data-${AWS::AccountId}-${AWS::Region}'
+        - !Ref S3BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: 'ProcessedDataLifecycle'
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Processed streaming data storage'
+
+  # ===============================================
+  # KINESIS DATA STREAM - Real-time data ingestion
+  # ===============================================
+  DataStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-stream'
+      ShardCount: !Ref StreamShardCount
+      RetentionPeriodHours: !Ref StreamRetentionHours
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Real-time data ingestion'
+
+  # ===============================================
+  # IAM ROLE - Lambda execution role with minimal permissions
+  # ===============================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: KinesisStreamAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:ListStreams
+                  - kinesis:ListShards
+                Resource: !GetAtt DataStream.Arn
+              - Effect: Allow
+                Action:
+                  - kinesis:ListStreams
+                Resource: '*'
+        - PolicyName: S3BucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:GetObject
+                Resource: !Sub '${ProcessedDataBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt ProcessedDataBucket.Arn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Lambda function execution role'
+
+  # ===============================================
+  # LAMBDA FUNCTION - Stream data processor
+  # ===============================================
+  DataProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-data-processor'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrencyLimit: !Ref StreamShardCount
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref ProcessedDataBucket
+          ENVIRONMENT: !Ref EnvironmentName
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import base64
+          import boto3
+          import os
+          import logging
+          from datetime import datetime
+          from typing import Dict, Any, List
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          # Initialize AWS clients
+          s3_client = boto3.client('s3')
+          
+          # Environment variables
+          BUCKET_NAME = os.environ['S3_BUCKET_NAME']
+          ENVIRONMENT = os.environ.get('ENVIRONMENT', 'dev')
+          PROJECT_NAME = os.environ.get('PROJECT_NAME', 'realtime-data-processing')
+          
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              Process Kinesis records and store processed data in S3
+              
+              Args:
+                  event: Kinesis event containing records to process
+                  context: Lambda execution context
+                  
+              Returns:
+                  dict: Processing results with status and metrics
+              """
+              processed_records = []
+              error_count = 0
+              
+              logger.info(f"Processing {len(event.get('Records', []))} Kinesis records")
+              
+              for record in event.get('Records', []):
+                  try:
+                      # Extract Kinesis record data
+                      kinesis_data = record['kinesis']
+                      encoded_data = kinesis_data['data']
+                      decoded_data = base64.b64decode(encoded_data).decode('utf-8')
+                      
+                      # Parse JSON data (handle non-JSON gracefully)
+                      try:
+                          json_data = json.loads(decoded_data)
+                      except json.JSONDecodeError:
+                          json_data = {"message": decoded_data, "data_type": "text"}
+                          logger.warning(f"Non-JSON data received: {decoded_data[:100]}...")
+                      
+                      # Enrich record with processing metadata
+                      processed_record = {
+                          "original_data": json_data,
+                          "processing_metadata": {
+                              "timestamp": datetime.utcnow().isoformat(),
+                              "partition_key": kinesis_data['partitionKey'],
+                              "sequence_number": kinesis_data['sequenceNumber'],
+                              "event_id": record['eventID'],
+                              "environment": ENVIRONMENT,
+                              "processor": "lambda"
+                          },
+                          "data_quality": {
+                              "is_valid_json": isinstance(json_data, dict) and "message" not in json_data,
+                              "record_size": len(decoded_data),
+                              "processing_status": "success"
+                          }
+                      }
+                      
+                      processed_records.append(processed_record)
+                      logger.debug(f"Successfully processed record: {record['eventID']}")
+                      
+                  except Exception as e:
+                      error_count += 1
+                      logger.error(f"Error processing record {record.get('eventID', 'unknown')}: {str(e)}")
+                      
+                      # Add error record for monitoring
+                      error_record = {
+                          "error_metadata": {
+                              "timestamp": datetime.utcnow().isoformat(),
+                              "event_id": record.get('eventID', 'unknown'),
+                              "error_message": str(e),
+                              "environment": ENVIRONMENT
+                          },
+                          "data_quality": {
+                              "processing_status": "error"
+                          }
+                      }
+                      processed_records.append(error_record)
+              
+              # Store processed records in S3 (if any were processed)
+              s3_key = None
+              if processed_records:
+                  try:
+                      # Create hierarchical S3 key for organization
+                      now = datetime.utcnow()
+                      s3_key = f"processed-data/{ENVIRONMENT}/{now.strftime('%Y/%m/%d/%H')}/batch-{context.aws_request_id}.json"
+                      
+                      # Prepare batch metadata
+                      batch_summary = {
+                          "batch_metadata": {
+                              "timestamp": now.isoformat(),
+                              "request_id": context.aws_request_id,
+                              "total_records": len(event.get('Records', [])),
+                              "processed_successfully": len(processed_records) - error_count,
+                              "error_count": error_count,
+                              "environment": ENVIRONMENT,
+                              "project": PROJECT_NAME
+                          },
+                          "records": processed_records
+                      }
+                      
+                      # Store in S3 with metadata
+                      s3_client.put_object(
+                          Bucket=BUCKET_NAME,
+                          Key=s3_key,
+                          Body=json.dumps(batch_summary, indent=2, default=str),
+                          ContentType='application/json',
+                          Metadata={
+                              'environment': ENVIRONMENT,
+                              'project': PROJECT_NAME,
+                              'record-count': str(len(processed_records)),
+                              'error-count': str(error_count)
+                          }
+                      )
+                      
+                      logger.info(f"Successfully stored {len(processed_records)} records to S3: {s3_key}")
+                      
+                  except Exception as e:
+                      logger.error(f"Error storing data to S3: {str(e)}")
+                      raise
+              
+              # Return processing summary
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'processed_count': len(processed_records) - error_count,
+                      'error_count': error_count,
+                      'total_records': len(event.get('Records', [])),
+                      's3_key': s3_key,
+                      'environment': ENVIRONMENT,
+                      'message': 'Successfully processed Kinesis records'
+                  })
+              }
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Stream data processing'
+
+  # ===============================================
+  # EVENT SOURCE MAPPING - Connect Kinesis to Lambda
+  # ===============================================
+  KinesisEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt DataStream.Arn
+      FunctionName: !GetAtt DataProcessorFunction.Arn
+      StartingPosition: LATEST
+      BatchSize: !Ref BatchSize
+      MaximumBatchingWindowInSeconds: !Ref MaximumBatchingWindowInSeconds
+      ParallelizationFactor: 1
+      MaximumRecordAgeInSeconds: 3600
+      BisectBatchOnFunctionError: true
+      MaximumRetryAttempts: 3
+      TumblingWindowInSeconds: 0
+
+  # ===============================================
+  # CLOUDWATCH LOG GROUPS - Centralized logging
+  # ===============================================
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DataProcessorFunction}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Lambda function logs'
+
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: DetailedMonitoringEnabled
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProcessedDataBucket}'
+      RetentionInDays: !If [IsProduction, 14, 3]
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'S3 access logs'
+
+  # ===============================================
+  # CLOUDWATCH ALARMS - Monitoring and alerting
+  # ===============================================
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DetailedMonitoringEnabled
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-lambda-errors'
+      AlarmDescription: 'Alarm for Lambda function errors in data processing pipeline'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DataProcessorFunction
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DetailedMonitoringEnabled
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-lambda-duration'
+      AlarmDescription: 'Alarm for Lambda function duration exceeding threshold'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref LambdaTimeout
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DataProcessorFunction
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  KinesisIncomingRecordsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DetailedMonitoringEnabled
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-kinesis-incoming-records'
+      AlarmDescription: 'Alarm for high volume of incoming Kinesis records'
+      MetricName: IncomingRecords
+      Namespace: AWS/Kinesis
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: StreamName
+          Value: !Ref DataStream
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+# ===============================================
+# OUTPUTS - Important values for integration and verification
+# ===============================================
+Outputs:
+  # Stream Information
+  KinesisStreamName:
+    Description: 'Name of the Kinesis Data Stream for real-time data ingestion'
+    Value: !Ref DataStream
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisStreamName'
+
+  KinesisStreamArn:
+    Description: 'ARN of the Kinesis Data Stream'
+    Value: !GetAtt DataStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisStreamArn'
+
+  # Lambda Function Information
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function processing Kinesis records'
+    Value: !Ref DataProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda data processor function'
+    Value: !GetAtt DataProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  # Storage Information
+  S3BucketName:
+    Description: 'Name of the S3 bucket storing processed data'
+    Value: !Ref ProcessedDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketName'
+
+  S3BucketArn:
+    Description: 'ARN of the S3 bucket for processed data'
+    Value: !GetAtt ProcessedDataBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketArn'
+
+  # Monitoring Information
+  LambdaLogGroupName:
+    Description: 'CloudWatch log group for Lambda function logs'
+    Value: !Ref LambdaLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaLogGroupName'
+
+  # Configuration Information
+  StreamConfiguration:
+    Description: 'Kinesis stream configuration summary'
+    Value: !Sub '${StreamShardCount} shards, ${StreamRetentionHours}h retention'
+
+  LambdaConfiguration:
+    Description: 'Lambda function configuration summary'
+    Value: !Sub '${LambdaMemorySize}MB memory, ${LambdaTimeout}s timeout, batch size ${BatchSize}'
+
+  # Integration Endpoints
+  StreamEndpoint:
+    Description: 'Kinesis stream endpoint for data ingestion'
+    Value: !Sub 'https://kinesis.${AWS::Region}.amazonaws.com'
+
+  # Dashboard URLs
+  CloudWatchDashboardUrl:
+    Description: 'CloudWatch console URL for monitoring the pipeline'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:'
+
+  # Cost Monitoring
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for this configuration (USD, approximate)'
+    Value: !Sub 
+      - 'Kinesis: $${KinesisCost}, Lambda: $${LambdaCost}, S3: $${S3Cost} (varies with usage)'
+      - KinesisCost: !Sub '${StreamShardCount}0'  # ~$10 per shard per month
+        LambdaCost: '5-50'  # Depends on invocations and duration
+        S3Cost: '1-10'  # Depends on storage and requests
+
+  # Quick Start Commands
+  TestCommandExample:
+    Description: 'Example AWS CLI command to send test data to the stream'
+    Value: !Sub 'aws kinesis put-record --stream-name ${DataStream} --partition-key test-key --data "{\\"test\\": \\"data\\"}"'
+
+  # Security Information
+  IAMRoleArn:
+    Description: 'ARN of the Lambda execution role (for reference)'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IAMRoleArn'

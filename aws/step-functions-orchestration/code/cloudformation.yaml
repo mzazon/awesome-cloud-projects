@@ -1,0 +1,938 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Microservices orchestration with AWS Step Functions. This template creates
+  a complete serverless workflow orchestrating Lambda microservices through
+  Step Functions with EventBridge integration for event-driven execution.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: microservices-stepfn
+    Description: Name prefix for all resources
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9-]*$
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+    MinLength: 3
+    MaxLength: 50
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    Description: Environment name for resource tagging and configuration
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: CloudWatch Logs retention period in days
+
+  EnableXRay:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable X-Ray tracing for Lambda functions and Step Functions
+
+  EventBridgeEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable EventBridge integration for automatic workflow triggering
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+  XRayEnabled: !Equals [!Ref EnableXRay, 'true']
+  EventBridgeIntegrationEnabled: !Equals [!Ref EventBridgeEnabled, 'true']
+
+Resources:
+  # IAM Roles and Policies
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !If
+          - XRayEnabled
+          - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+          - !Ref 'AWS::NoValue'
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-lambda-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-stepfunctions-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-stepfunctions-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt UserServiceFunction.Arn
+                  - !GetAtt OrderServiceFunction.Arn
+                  - !GetAtt PaymentServiceFunction.Arn
+                  - !GetAtt InventoryServiceFunction.Arn
+                  - !GetAtt NotificationServiceFunction.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: '*'
+              - !If
+                - XRayEnabled
+                - Effect: Allow
+                  Action:
+                    - xray:PutTraceSegments
+                    - xray:PutTelemetryRecords
+                    - xray:GetSamplingRules
+                    - xray:GetSamplingTargets
+                  Resource: '*'
+                - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  EventBridgeExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: EventBridgeIntegrationEnabled
+    Properties:
+      RoleName: !Sub '${ProjectName}-eventbridge-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-eventbridge-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !GetAtt MicroservicesStateMachine.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Groups
+  UserServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-user-service'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  OrderServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-order-service'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  PaymentServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-payment-service'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  InventoryServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-inventory-service'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  NotificationServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-notification-service'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  StepFunctionsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/stepfunctions/${ProjectName}-workflow'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Functions
+  UserServiceFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: UserServiceLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-user-service'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: !If [IsProduction, 256, 128]
+      ReservedConcurrencyLimit: !If [IsProduction, 100, 10]
+      TracingConfig:
+        Mode: !If [XRayEnabled, Active, PassThrough]
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: !If [IsProduction, INFO, DEBUG]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import random
+          import logging
+          import os
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+
+          def lambda_handler(event, context):
+              logger.info(f"Processing user validation request: {json.dumps(event)}")
+              
+              user_id = event.get('userId')
+              
+              # Validate input
+              if not user_id:
+                  logger.error("User ID is required")
+                  raise Exception("User ID is required")
+              
+              # Mock user data with realistic values
+              user_data = {
+                  'userId': user_id,
+                  'email': f'user{user_id}@example.com',
+                  'status': 'active',
+                  'creditScore': random.randint(600, 850),
+                  'accountType': random.choice(['standard', 'premium', 'enterprise']),
+                  'validatedAt': context.aws_request_id
+              }
+              
+              logger.info(f"User validation successful for user {user_id}")
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(user_data)
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: user-service
+
+  OrderServiceFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: OrderServiceLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-order-service'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: !If [IsProduction, 256, 128]
+      ReservedConcurrencyLimit: !If [IsProduction, 100, 10]
+      TracingConfig:
+        Mode: !If [XRayEnabled, Active, PassThrough]
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: !If [IsProduction, INFO, DEBUG]
+      Code:
+        ZipFile: |
+          import json
+          import uuid
+          import datetime
+          import logging
+          import os
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+
+          def lambda_handler(event, context):
+              logger.info(f"Processing order creation request: {json.dumps(event)}")
+              
+              order_data = event.get('orderData', {})
+              user_data = event.get('userData', {})
+              
+              # Validate order requirements
+              if not order_data.get('items'):
+                  logger.error("Order items are required")
+                  raise Exception("Order items are required")
+              
+              # Calculate total
+              total = sum(item.get('price', 0) * item.get('quantity', 1) for item in order_data.get('items', []))
+              
+              # Create order
+              order = {
+                  'orderId': str(uuid.uuid4()),
+                  'userId': user_data.get('userId'),
+                  'items': order_data.get('items'),
+                  'itemCount': len(order_data.get('items', [])),
+                  'total': round(total, 2),
+                  'status': 'pending',
+                  'created': datetime.datetime.utcnow().isoformat(),
+                  'requestId': context.aws_request_id
+              }
+              
+              logger.info(f"Order created successfully: {order['orderId']}")
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(order)
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: order-service
+
+  PaymentServiceFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: PaymentServiceLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-payment-service'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: !If [IsProduction, 256, 128]
+      ReservedConcurrencyLimit: !If [IsProduction, 100, 10]
+      TracingConfig:
+        Mode: !If [XRayEnabled, Active, PassThrough]
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: !If [IsProduction, INFO, DEBUG]
+          FAILURE_RATE: !If [IsProduction, '0.01', '0.1']  # 1% in prod, 10% in dev
+      Code:
+        ZipFile: |
+          import json
+          import random
+          import logging
+          import os
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+
+          def lambda_handler(event, context):
+              logger.info(f"Processing payment request: {json.dumps(event)}")
+              
+              order_data = event.get('orderData', {})
+              user_data = event.get('userData', {})
+              
+              order_total = order_data.get('total', 0)
+              credit_score = user_data.get('creditScore', 600)
+              
+              # Business rules for payment approval
+              if order_total > 1000 and credit_score < 650:
+                  logger.warning(f"Payment declined for user {user_data.get('userId')}: Insufficient credit rating")
+                  raise Exception("Payment declined: Insufficient credit rating for high-value transaction")
+              
+              # Simulate random payment failures based on environment
+              failure_rate = float(os.environ.get('FAILURE_RATE', '0.1'))
+              if random.random() < failure_rate:
+                  logger.error("Payment gateway timeout simulation")
+                  raise Exception("Payment gateway timeout - please retry")
+              
+              # Generate payment result
+              payment_result = {
+                  'transactionId': f"txn_{random.randint(100000, 999999)}",
+                  'amount': order_total,
+                  'status': 'authorized',
+                  'method': random.choice(['credit_card', 'debit_card', 'digital_wallet']),
+                  'processingTime': random.randint(100, 500),  # milliseconds
+                  'requestId': context.aws_request_id
+              }
+              
+              logger.info(f"Payment processed successfully: {payment_result['transactionId']}")
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(payment_result)
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: payment-service
+
+  InventoryServiceFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: InventoryServiceLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-inventory-service'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: !If [IsProduction, 256, 128]
+      ReservedConcurrencyLimit: !If [IsProduction, 100, 10]
+      TracingConfig:
+        Mode: !If [XRayEnabled, Active, PassThrough]
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: !If [IsProduction, INFO, DEBUG]
+      Code:
+        ZipFile: |
+          import json
+          import random
+          import logging
+          import os
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+
+          def lambda_handler(event, context):
+              logger.info(f"Processing inventory check request: {json.dumps(event)}")
+              
+              order_data = event.get('orderData', {})
+              items = order_data.get('items', [])
+              inventory_results = []
+              
+              for item in items:
+                  product_id = item.get('productId')
+                  requested_qty = item.get('quantity', 1)
+                  
+                  # Simulate inventory check with more realistic logic
+                  base_stock = random.randint(10, 200)
+                  reserved_stock = random.randint(0, 20)
+                  available_qty = max(0, base_stock - reserved_stock)
+                  
+                  logger.info(f"Checking inventory for product {product_id}: available={available_qty}, requested={requested_qty}")
+                  
+                  if available_qty >= requested_qty:
+                      inventory_results.append({
+                          'productId': product_id,
+                          'status': 'reserved',
+                          'quantity': requested_qty,
+                          'availableStock': available_qty,
+                          'reservationId': f"res_{random.randint(10000, 99999)}"
+                      })
+                  else:
+                      logger.error(f"Insufficient inventory for product {product_id}")
+                      raise Exception(f"Insufficient inventory for product {product_id}: available={available_qty}, requested={requested_qty}")
+              
+              result = {
+                  'reservations': inventory_results,
+                  'status': 'confirmed',
+                  'totalItems': len(inventory_results),
+                  'requestId': context.aws_request_id
+              }
+              
+              logger.info(f"Inventory check completed successfully for {len(inventory_results)} items")
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(result)
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: inventory-service
+
+  NotificationServiceFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: NotificationServiceLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-notification-service'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: !If [IsProduction, 256, 128]
+      ReservedConcurrencyLimit: !If [IsProduction, 100, 10]
+      TracingConfig:
+        Mode: !If [XRayEnabled, Active, PassThrough]
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: !If [IsProduction, INFO, DEBUG]
+      Code:
+        ZipFile: |
+          import json
+          import datetime
+          import logging
+          import os
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+
+          def lambda_handler(event, context):
+              logger.info(f"Processing notification request: {json.dumps(event)}")
+              
+              user_data = event.get('userData', {})
+              order_data = event.get('orderData', {})
+              payment_data = event.get('paymentData', {})
+              
+              # Create comprehensive notification
+              notification = {
+                  'to': user_data.get('email'),
+                  'subject': f"Order Confirmation #{order_data.get('orderId', 'N/A')[:8]}",
+                  'message': f"""
+                      Dear Customer,
+                      
+                      Your order has been successfully processed!
+                      
+                      Order Details:
+                      - Order ID: {order_data.get('orderId', 'N/A')}
+                      - Total Amount: ${order_data.get('total', 0):.2f}
+                      - Items: {order_data.get('itemCount', 0)} item(s)
+                      - Transaction ID: {payment_data.get('transactionId', 'N/A')}
+                      
+                      Thank you for your business!
+                  """.strip(),
+                  'status': 'sent',
+                  'sentAt': datetime.datetime.utcnow().isoformat(),
+                  'channel': 'email',
+                  'requestId': context.aws_request_id
+              }
+              
+              # In a real implementation, this would integrate with SNS, SES, or other notification services
+              logger.info(f"Notification sent to {notification['to']}")
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(notification)
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: notification-service
+
+  # Step Functions State Machine
+  MicroservicesStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-workflow'
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      TracingConfiguration:
+        Enabled: !If [XRayEnabled, true, false]
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StepFunctionsLogGroup.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Microservices orchestration workflow with comprehensive error handling and parallel processing",
+          "StartAt": "ValidateInput",
+          "States": {
+            "ValidateInput": {
+              "Type": "Pass",
+              "Comment": "Initial input validation and preparation",
+              "Parameters": {
+                "userId.$": "$.userId",
+                "orderData.$": "$.orderData",
+                "metadata": {
+                  "workflowStart.$": "$$.State.EnteredTime",
+                  "executionName.$": "$$.Execution.Name"
+                }
+              },
+              "Next": "GetUserData"
+            },
+            "GetUserData": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${UserServiceFunction}",
+                "Payload.$": "$"
+              },
+              "ResultPath": "$.userResult",
+              "TimeoutSeconds": 35,
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed", "States.Timeout"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2,
+                  "Comment": "Retry user service failures with exponential backoff"
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "HandleUserServiceFailure",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "Next": "ProcessOrderAndPayment"
+            },
+            "HandleUserServiceFailure": {
+              "Type": "Pass",
+              "Parameters": {
+                "error": "User validation failed",
+                "details.$": "$.error",
+                "timestamp.$": "$$.State.EnteredTime"
+              },
+              "Next": "WorkflowFailed"
+            },
+            "ProcessOrderAndPayment": {
+              "Type": "Parallel",
+              "Comment": "Execute order creation, payment processing, and inventory check in parallel for optimal performance",
+              "Branches": [
+                {
+                  "StartAt": "CreateOrder",
+                  "States": {
+                    "CreateOrder": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${OrderServiceFunction}",
+                        "Payload": {
+                          "orderData.$": "$.orderData",
+                          "userData.$": "$.userResult.Payload"
+                        }
+                      },
+                      "TimeoutSeconds": 35,
+                      "Retry": [
+                        {
+                          "ErrorEquals": ["States.TaskFailed"],
+                          "IntervalSeconds": 1,
+                          "MaxAttempts": 2,
+                          "BackoffRate": 2
+                        }
+                      ],
+                      "End": true
+                    }
+                  }
+                },
+                {
+                  "StartAt": "ProcessPayment",
+                  "States": {
+                    "ProcessPayment": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${PaymentServiceFunction}",
+                        "Payload": {
+                          "orderData.$": "$.orderData",
+                          "userData.$": "$.userResult.Payload"
+                        }
+                      },
+                      "TimeoutSeconds": 35,
+                      "Retry": [
+                        {
+                          "ErrorEquals": ["States.TaskFailed"],
+                          "IntervalSeconds": 1,
+                          "MaxAttempts": 2,
+                          "BackoffRate": 2,
+                          "Comment": "Retry payment failures twice with quick recovery"
+                        }
+                      ],
+                      "End": true
+                    }
+                  }
+                },
+                {
+                  "StartAt": "CheckInventory",
+                  "States": {
+                    "CheckInventory": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${InventoryServiceFunction}",
+                        "Payload": {
+                          "orderData.$": "$.orderData"
+                        }
+                      },
+                      "TimeoutSeconds": 35,
+                      "Retry": [
+                        {
+                          "ErrorEquals": ["States.TaskFailed"],
+                          "IntervalSeconds": 1,
+                          "MaxAttempts": 1,
+                          "Comment": "Single retry for inventory as stock changes rapidly"
+                        }
+                      ],
+                      "End": true
+                    }
+                  }
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "HandleProcessingFailure",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "Next": "SendNotification"
+            },
+            "HandleProcessingFailure": {
+              "Type": "Pass",
+              "Parameters": {
+                "error": "Order processing failed",
+                "details.$": "$.error",
+                "timestamp.$": "$$.State.EnteredTime"
+              },
+              "Next": "WorkflowFailed"
+            },
+            "SendNotification": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${NotificationServiceFunction}",
+                "Payload": {
+                  "userData.$": "$.userResult.Payload",
+                  "orderData.$": "$[0].Payload",
+                  "paymentData.$": "$[1].Payload",
+                  "inventoryData.$": "$[2].Payload"
+                }
+              },
+              "TimeoutSeconds": 35,
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 1.5,
+                  "Comment": "Retry notification failures as they are not critical to order completion"
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "WorkflowCompletedWithNotificationFailure",
+                  "ResultPath": "$.notificationError"
+                }
+              ],
+              "Next": "WorkflowCompleted"
+            },
+            "WorkflowCompleted": {
+              "Type": "Pass",
+              "Parameters": {
+                "status": "SUCCESS",
+                "message": "Order processed successfully",
+                "completedAt.$": "$$.State.EnteredTime",
+                "orderData.$": "$[0].Payload",
+                "paymentData.$": "$[1].Payload",
+                "inventoryData.$": "$[2].Payload",
+                "notificationData.$": "$.Payload"
+              },
+              "End": true
+            },
+            "WorkflowCompletedWithNotificationFailure": {
+              "Type": "Pass",
+              "Parameters": {
+                "status": "SUCCESS_WITH_WARNING",
+                "message": "Order processed successfully but notification failed",
+                "completedAt.$": "$$.State.EnteredTime",
+                "orderData.$": "$[0].Payload",
+                "paymentData.$": "$[1].Payload",
+                "inventoryData.$": "$[2].Payload",
+                "notificationError.$": "$.notificationError"
+              },
+              "End": true
+            },
+            "WorkflowFailed": {
+              "Type": "Fail",
+              "Cause": "Workflow execution failed",
+              "Error": "WorkflowExecutionError"
+            }
+          }
+        }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # EventBridge Resources
+  MicroservicesEventRule:
+    Type: AWS::Events::Rule
+    Condition: EventBridgeIntegrationEnabled
+    Properties:
+      Name: !Sub '${ProjectName}-trigger'
+      Description: 'Trigger microservices workflow for order submission events'
+      State: ENABLED
+      EventPattern:
+        source:
+          - microservices.orders
+        detail-type:
+          - Order Submitted
+          - Order Created
+      Targets:
+        - Arn: !GetAtt MicroservicesStateMachine.Arn
+          Id: MicroservicesWorkflowTarget
+          RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              userId: $.detail.userId
+              orderData: $.detail.orderData
+            InputTemplate: |
+              {
+                "userId": "<userId>",
+                "orderData": <orderData>,
+                "eventSource": "EventBridge",
+                "triggerTime": "<aws.events.event.ingestion-time>"
+              }
+
+# Outputs
+Outputs:
+  StateMachineArn:
+    Description: ARN of the Step Functions state machine
+    Value: !GetAtt MicroservicesStateMachine.Arn
+    Export:
+      Name: !Sub '${ProjectName}-StateMachineArn'
+
+  StateMachineName:
+    Description: Name of the Step Functions state machine
+    Value: !Ref MicroservicesStateMachine
+    Export:
+      Name: !Sub '${ProjectName}-StateMachineName'
+
+  UserServiceFunctionArn:
+    Description: ARN of the User Service Lambda function
+    Value: !GetAtt UserServiceFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-UserServiceArn'
+
+  OrderServiceFunctionArn:
+    Description: ARN of the Order Service Lambda function
+    Value: !GetAtt OrderServiceFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-OrderServiceArn'
+
+  PaymentServiceFunctionArn:
+    Description: ARN of the Payment Service Lambda function
+    Value: !GetAtt PaymentServiceFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-PaymentServiceArn'
+
+  InventoryServiceFunctionArn:
+    Description: ARN of the Inventory Service Lambda function
+    Value: !GetAtt InventoryServiceFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-InventoryServiceArn'
+
+  NotificationServiceFunctionArn:
+    Description: ARN of the Notification Service Lambda function
+    Value: !GetAtt NotificationServiceFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-NotificationServiceArn'
+
+  EventRuleArn:
+    Condition: EventBridgeIntegrationEnabled
+    Description: ARN of the EventBridge rule for workflow triggering
+    Value: !GetAtt MicroservicesEventRule.Arn
+    Export:
+      Name: !Sub '${ProjectName}-EventRuleArn'
+
+  StepFunctionsExecutionRoleArn:
+    Description: ARN of the Step Functions execution role
+    Value: !GetAtt StepFunctionsExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-StepFunctionsRoleArn'
+
+  LambdaExecutionRoleArn:
+    Description: ARN of the Lambda execution role
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-LambdaRoleArn'
+
+  WorkflowConsoleUrl:
+    Description: URL to view the Step Functions workflow in AWS Console
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/states/home?region=${AWS::Region}#/statemachines/view/${MicroservicesStateMachine}'
+
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for 1000 workflow executions
+    Value: !Sub |
+      Step Functions: $25 (1000 state transitions)
+      Lambda: $8.40 (1000 executions, 256MB, 30s avg)
+      CloudWatch Logs: $5 (1GB retention)
+      Total: ~$38.40/month for 1000 workflow executions

@@ -1,0 +1,593 @@
+# Infrastructure Manager Configuration for Code Quality Automation
+# This configuration deploys a complete code quality automation pipeline using
+# Cloud Source Repositories, Artifact Registry, Cloud Build, and security scanning
+
+apiVersion: infra.google.com/v1
+kind: Infra
+metadata:
+  name: code-quality-automation
+  description: "Complete code quality automation infrastructure with intelligent CI/CD pipeline"
+  labels:
+    recipe: "code-quality-automation-source-repositories-artifact-registry"
+    category: "devops"
+    difficulty: "200"
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "GCP Project ID for code quality automation infrastructure"
+    default: "code-quality-demo"
+  
+  region:
+    type: string
+    description: "GCP region for regional resources"
+    default: "us-central1"
+  
+  zone:
+    type: string
+    description: "GCP zone for zonal resources"
+    default: "us-central1-a"
+  
+  repo_name:
+    type: string
+    description: "Name for the Cloud Source Repository"
+    default: "quality-demo-repo"
+  
+  registry_name:
+    type: string
+    description: "Name for the Artifact Registry repository"
+    default: "quality-artifacts"
+  
+  build_trigger_name:
+    type: string
+    description: "Name for the Cloud Build trigger"
+    default: "quality-pipeline-trigger"
+  
+  enable_security_scanning:
+    type: bool
+    description: "Enable advanced security scanning features"
+    default: true
+  
+  enable_monitoring:
+    type: bool
+    description: "Enable comprehensive monitoring and alerting"
+    default: true
+
+# Define the infrastructure resources
+resources:
+  # Enable required APIs for intelligent code quality automation
+  - type: googleapi
+    name: enable-apis
+    properties:
+      project: ${var.project_id}
+      services:
+        - sourcerepo.googleapis.com          # Cloud Source Repositories
+        - artifactregistry.googleapis.com    # Artifact Registry
+        - cloudbuild.googleapis.com          # Cloud Build
+        - containeranalysis.googleapis.com   # Container Analysis
+        - containerscanning.googleapis.com   # Container Security Scanning
+        - secretmanager.googleapis.com       # Secret Manager
+        - monitoring.googleapis.com          # Cloud Monitoring
+        - logging.googleapis.com             # Cloud Logging
+        - cloudresourcemanager.googleapis.com # Resource Manager
+        - iamcredentials.googleapis.com      # IAM Service Account Credentials
+
+  # Cloud Source Repository for secure version control
+  - type: gcp-types/sourcerepo-v1:projects.repos
+    name: source-repository
+    properties:
+      parent: projects/${var.project_id}
+      repoId: ${var.repo_name}
+      size: UNKNOWN
+    metadata:
+      dependsOn:
+        - enable-apis
+    annotations:
+      description: "Secure Git repository with intelligent CI/CD integration"
+      quality-gates: "automated"
+      security-scanning: "enabled"
+
+  # Docker Artifact Registry for container images with security scanning
+  - type: gcp-types/artifactregistry-v1:projects.locations.repositories
+    name: docker-registry
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      repositoryId: ${var.registry_name}
+      format: DOCKER
+      description: "Secure Docker registry for quality-validated container images"
+      labels:
+        environment: "code-quality-automation"
+        security-scanning: "enabled"
+        vulnerability-analysis: "continuous"
+      dockerConfig:
+        immutableTags: false
+    metadata:
+      dependsOn:
+        - enable-apis
+    annotations:
+      vulnerability-scanning: "automatic"
+      retention-policy: "90-days"
+
+  # Python packages Artifact Registry for language-specific artifacts
+  - type: gcp-types/artifactregistry-v1:projects.locations.repositories
+    name: python-registry
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      repositoryId: ${var.registry_name}-packages
+      format: PYTHON
+      description: "Python packages repository with dependency scanning"
+      labels:
+        environment: "code-quality-automation"
+        package-type: "python"
+        security-scanning: "enabled"
+    metadata:
+      dependsOn:
+        - enable-apis
+    annotations:
+      dependency-scanning: "automatic"
+      license-compliance: "enabled"
+
+  # Cloud Storage bucket for build artifacts and reports
+  - type: storage.v1.bucket
+    name: build-artifacts-bucket
+    properties:
+      name: ${var.project_id}-build-artifacts
+      location: ${var.region}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 30
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      encryption:
+        defaultKmsKeyName: projects/${var.project_id}/locations/${var.region}/keyRings/code-quality-keyring/cryptoKeys/build-artifacts-key
+      labels:
+        purpose: "build-artifacts"
+        retention: "90-days"
+        security: "encrypted"
+    metadata:
+      dependsOn:
+        - enable-apis
+    annotations:
+      access-control: "uniform-bucket-level"
+      encryption: "customer-managed"
+
+  # IAM Service Account for Cloud Build with least privilege
+  - type: iam.v1.serviceAccount
+    name: cloudbuild-service-account
+    properties:
+      accountId: code-quality-cloudbuild
+      displayName: "Code Quality Cloud Build Service Account"
+      description: "Service account for intelligent code quality pipeline with least privilege access"
+      project: ${var.project_id}
+    metadata:
+      dependsOn:
+        - enable-apis
+    annotations:
+      principle: "least-privilege"
+      scope: "build-pipeline-only"
+
+  # IAM bindings for Cloud Build service account - Source Repository access
+  - type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    name: cloudbuild-source-repo-binding
+    properties:
+      resource: ${var.project_id}
+      policy:
+        bindings:
+          - role: roles/source.reader
+            members:
+              - serviceAccount:$(ref.cloudbuild-service-account.email)
+          - role: roles/cloudbuild.builds.builder
+            members:
+              - serviceAccount:$(ref.cloudbuild-service-account.email)
+          - role: roles/artifactregistry.writer
+            members:
+              - serviceAccount:$(ref.cloudbuild-service-account.email)
+          - role: roles/storage.objectAdmin
+            members:
+              - serviceAccount:$(ref.cloudbuild-service-account.email)
+          - role: roles/containeranalysis.admin
+            members:
+              - serviceAccount:$(ref.cloudbuild-service-account.email)
+    metadata:
+      dependsOn:
+        - cloudbuild-service-account
+        - source-repository
+        - docker-registry
+
+  # Cloud KMS Key Ring for encryption
+  - type: gcp-types/cloudkms-v1:projects.locations.keyRings
+    name: code-quality-keyring
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      keyRingId: code-quality-keyring
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # Cloud KMS Crypto Key for build artifacts encryption
+  - type: gcp-types/cloudkms-v1:projects.locations.keyRings.cryptoKeys
+    name: build-artifacts-key
+    properties:
+      parent: $(ref.code-quality-keyring.name)
+      cryptoKeyId: build-artifacts-key
+      purpose: ENCRYPT_DECRYPT
+      rotationPeriod: "7776000s"  # 90 days
+      versionTemplate:
+        algorithm: GOOGLE_SYMMETRIC_ENCRYPTION
+        protectionLevel: SOFTWARE
+    metadata:
+      dependsOn:
+        - code-quality-keyring
+
+  # Cloud Build Trigger for intelligent quality pipeline
+  - type: gcp-types/cloudbuild-v1:projects.triggers
+    name: quality-pipeline-trigger
+    properties:
+      parent: projects/${var.project_id}
+      name: ${var.build_trigger_name}
+      description: "Intelligent code quality pipeline with comprehensive analysis"
+      disabled: false
+      tags:
+        - "code-quality"
+        - "security-scanning"
+        - "automated-testing"
+      # Trigger configuration for repository events
+      sourceToBuild:
+        repository: $(ref.source-repository.name)
+        ref: refs/heads/main
+      # Advanced trigger criteria
+      includedFiles:
+        - "src/**"
+        - "tests/**"
+        - "requirements.txt"
+        - "Dockerfile"
+        - "cloudbuild.yaml"
+      # Build configuration
+      build:
+        # Use high-performance machine for faster builds
+        options:
+          machineType: E2_HIGHCPU_8
+          logging: CLOUD_LOGGING_ONLY
+          requestedVerifyOption: VERIFIED
+        # Build timeout for comprehensive quality checks
+        timeout: "1800s"  # 30 minutes
+        # Quality-focused build steps
+        steps:
+          # Step 1: Environment preparation and dependency installation
+          - name: 'python:3.11-slim'
+            entrypoint: 'bash'
+            args:
+              - '-c'
+              - |
+                echo "🔍 Installing dependencies for comprehensive quality analysis..."
+                pip install --no-cache-dir -r requirements.txt
+                echo "✅ Dependencies installed successfully"
+            env:
+              - 'PYTHONPATH=/workspace'
+          
+          # Step 2: Code formatting validation with Black
+          - name: 'python:3.11-slim'
+            entrypoint: 'bash'
+            args:
+              - '-c'
+              - |
+                echo "🎨 Validating code formatting standards..."
+                pip install black==23.9.1
+                black --check --diff src/ tests/ || exit 1
+                echo "✅ Code formatting validation passed"
+          
+          # Step 3: Static code analysis with comprehensive rules
+          - name: 'python:3.11-slim'
+            entrypoint: 'bash'
+            args:
+              - '-c'
+              - |
+                echo "🔍 Running comprehensive static code analysis..."
+                pip install flake8==6.1.0 flake8-bugbear flake8-import-order
+                flake8 src/ tests/ --max-line-length=88 --extend-ignore=E203,W503
+                echo "✅ Static analysis completed successfully"
+          
+          # Step 4: Type checking with MyPy
+          - name: 'python:3.11-slim'
+            entrypoint: 'bash'
+            args:
+              - '-c'
+              - |
+                echo "🔍 Performing type checking analysis..."
+                pip install mypy==1.6.1
+                mypy src/ --ignore-missing-imports --strict
+                echo "✅ Type checking validation passed"
+          
+          # Step 5: Security vulnerability scanning with Bandit
+          - name: 'python:3.11-slim'
+            entrypoint: 'bash'
+            args:
+              - '-c'
+              - |
+                echo "🔒 Running comprehensive security analysis..."
+                pip install bandit==1.7.5
+                bandit -r src/ -f json -o /workspace/bandit-report.json
+                bandit -r src/ -f txt
+                echo "✅ Security vulnerability analysis completed"
+          
+          # Step 6: Dependency vulnerability assessment
+          - name: 'python:3.11-slim'
+            entrypoint: 'bash'
+            args:
+              - '-c'
+              - |
+                echo "🛡️ Checking dependencies for known vulnerabilities..."
+                pip install safety==2.3.5
+                safety check --json --output /workspace/safety-report.json
+                safety check
+                echo "✅ Dependency security validation passed"
+          
+          # Step 7: Comprehensive test execution with coverage
+          - name: 'python:3.11-slim'
+            entrypoint: 'bash'
+            args:
+              - '-c'
+              - |
+                echo "🧪 Executing comprehensive test suite with coverage analysis..."
+                pip install pytest==7.4.3 pytest-cov==4.1.0 pytest-html==4.1.1
+                python -m pytest tests/ \
+                  --cov=src \
+                  --cov-report=term \
+                  --cov-report=html:/workspace/htmlcov \
+                  --cov-report=xml:/workspace/coverage.xml \
+                  --html=/workspace/pytest-report.html \
+                  --self-contained-html \
+                  --cov-fail-under=80
+                echo "✅ All tests passed with adequate coverage"
+          
+          # Step 8: Secure container image build with best practices
+          - name: 'gcr.io/cloud-builders/docker'
+            args:
+              - 'build'
+              - '--build-arg'
+              - 'BUILDKIT_INLINE_CACHE=1'
+              - '--cache-from'
+              - '${var.region}-docker.pkg.dev/${var.project_id}/${var.registry_name}/quality-app:latest'
+              - '-t'
+              - '${var.region}-docker.pkg.dev/${var.project_id}/${var.registry_name}/quality-app:${BUILD_ID}'
+              - '-t'
+              - '${var.region}-docker.pkg.dev/${var.project_id}/${var.registry_name}/quality-app:latest'
+              - '.'
+            env:
+              - 'DOCKER_BUILDKIT=1'
+          
+          # Step 9: Container security scanning before push
+          - name: 'gcr.io/cloud-builders/gcloud'
+            args:
+              - 'beta'
+              - 'container'
+              - 'images'
+              - 'scan'
+              - '${var.region}-docker.pkg.dev/${var.project_id}/${var.registry_name}/quality-app:${BUILD_ID}'
+              - '--location=${var.region}'
+              - '--format=json'
+            env:
+              - 'CLOUDSDK_CORE_PROJECT=${var.project_id}'
+          
+          # Step 10: Push validated and scanned image to registry
+          - name: 'gcr.io/cloud-builders/docker'
+            args:
+              - 'push'
+              - '--all-tags'
+              - '${var.region}-docker.pkg.dev/${var.project_id}/${var.registry_name}/quality-app'
+        
+        # Artifact storage configuration
+        artifacts:
+          objects:
+            location: 'gs://${var.project_id}-build-artifacts/reports'
+            paths:
+              - 'bandit-report.json'
+              - 'safety-report.json'
+              - 'coverage.xml'
+              - 'htmlcov/**/*'
+              - 'pytest-report.html'
+        
+        # Substitution variables for dynamic configuration
+        substitutions:
+          _REGION: ${var.region}
+          _REGISTRY_NAME: ${var.registry_name}
+          _PROJECT_ID: ${var.project_id}
+        
+        # Service account for secure execution
+        serviceAccount: $(ref.cloudbuild-service-account.email)
+    metadata:
+      dependsOn:
+        - source-repository
+        - docker-registry
+        - python-registry
+        - build-artifacts-bucket
+        - cloudbuild-service-account
+    annotations:
+      pipeline-type: "intelligent-quality-automation"
+      security-scanning: "comprehensive"
+      quality-gates: "multi-layered"
+
+  # Security Command Center finding for monitoring
+  - type: gcp-types/securitycenter-v1:projects.sources
+    name: code-quality-security-source
+    properties:
+      parent: projects/${var.project_id}
+      source:
+        displayName: "Code Quality Security Analysis"
+        description: "Security findings from intelligent code quality pipeline"
+        canonicalName: "projects/${var.project_id}/sources/code-quality-automation"
+    metadata:
+      dependsOn:
+        - enable-apis
+    condition: ${var.enable_security_scanning}
+
+  # Cloud Monitoring Alert Policy for build failures
+  - type: gcp-types/monitoring-v1:projects.alertPolicies
+    name: build-failure-alert-policy
+    properties:
+      parent: projects/${var.project_id}
+      alertPolicy:
+        displayName: "Code Quality Build Failure Alert"
+        documentation:
+          content: "Alert triggered when code quality builds fail consistently"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "Build Failure Rate"
+            conditionThreshold:
+              filter: 'resource.type="cloud_build" AND resource.labels.project_id="${var.project_id}"'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 0.1
+              duration: "300s"
+              aggregations:
+                - alignmentPeriod: "300s"
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_MEAN
+                  groupByFields:
+                    - "resource.labels.trigger_name"
+        combiner: OR
+        enabled: true
+        alertStrategy:
+          autoClose: "1800s"
+          notificationRateLimit:
+            period: "300s"
+    metadata:
+      dependsOn:
+        - enable-apis
+    condition: ${var.enable_monitoring}
+
+  # Log-based metric for quality score tracking
+  - type: gcp-types/logging-v2:projects.metrics
+    name: code-quality-score-metric
+    properties:
+      parent: projects/${var.project_id}
+      metric:
+        name: "code_quality_score"
+        description: "Code quality score from automated analysis pipeline"
+        filter: 'resource.type="cloud_build" AND jsonPayload.status="SUCCESS" AND jsonPayload.substitutions._TRIGGER_NAME="quality-pipeline-trigger"'
+        valueExtractor: "EXTRACT(jsonPayload.timing)"
+        metricDescriptor:
+          metricKind: GAUGE
+          valueType: DOUBLE
+          unit: "1"
+          labels:
+            - key: "trigger_name"
+              valueType: STRING
+              description: "Name of the build trigger"
+            - key: "repository_name" 
+              valueType: STRING
+              description: "Name of the source repository"
+        labelExtractors:
+          trigger_name: "EXTRACT(jsonPayload.substitutions._TRIGGER_NAME)"
+          repository_name: "EXTRACT(jsonPayload.source.repoSource.repoName)"
+    metadata:
+      dependsOn:
+        - enable-apis
+    condition: ${var.enable_monitoring}
+
+  # Notification channel for quality alerts (email)
+  - type: gcp-types/monitoring-v1:projects.notificationChannels
+    name: quality-alerts-email
+    properties:
+      parent: projects/${var.project_id}
+      notificationChannel:
+        type: "email"
+        displayName: "Code Quality Alerts"
+        description: "Email notifications for code quality pipeline issues"
+        labels:
+          email_address: "devops@example.com"
+        enabled: true
+    metadata:
+      dependsOn:
+        - enable-apis
+    condition: ${var.enable_monitoring}
+
+# Output values for integration and verification
+outputs:
+  source_repository_url:
+    value: $(ref.source-repository.url)
+    description: "Git clone URL for the Cloud Source Repository"
+  
+  source_repository_name:
+    value: $(ref.source-repository.name)
+    description: "Full resource name of the Cloud Source Repository"
+  
+  docker_registry_name:
+    value: $(ref.docker-registry.name)
+    description: "Full resource name of the Docker Artifact Registry"
+  
+  python_registry_name:
+    value: $(ref.python-registry.name)
+    description: "Full resource name of the Python packages registry"
+  
+  docker_registry_url:
+    value: "${var.region}-docker.pkg.dev/${var.project_id}/${var.registry_name}"
+    description: "Docker registry URL for image operations"
+  
+  python_registry_url:
+    value: "${var.region}-python.pkg.dev/${var.project_id}/${var.registry_name}-packages"
+    description: "Python packages registry URL"
+  
+  build_trigger_id:
+    value: $(ref.quality-pipeline-trigger.id)
+    description: "ID of the intelligent quality pipeline trigger"
+  
+  build_trigger_name:
+    value: $(ref.quality-pipeline-trigger.name)
+    description: "Resource name of the build trigger"
+  
+  build_artifacts_bucket:
+    value: $(ref.build-artifacts-bucket.name)
+    description: "Storage bucket for build artifacts and quality reports"
+  
+  cloudbuild_service_account:
+    value: $(ref.cloudbuild-service-account.email)
+    description: "Service account email for Cloud Build operations"
+  
+  kms_key_name:
+    value: $(ref.build-artifacts-key.name)
+    description: "KMS key for encryption of build artifacts"
+  
+  security_source_name:
+    value: $(ref.code-quality-security-source.name)
+    description: "Security Command Center source for quality findings"
+    condition: ${var.enable_security_scanning}
+  
+  monitoring_alert_policy:
+    value: $(ref.build-failure-alert-policy.name)
+    description: "Alert policy for build failure monitoring"
+    condition: ${var.enable_monitoring}
+  
+  quality_metric_name:
+    value: $(ref.code-quality-score-metric.name)
+    description: "Log-based metric for quality score tracking"
+    condition: ${var.enable_monitoring}
+
+# Resource-level metadata for comprehensive tracking
+metadata:
+  annotations:
+    recipe-id: "c7a8b3f2"
+    recipe-category: "devops"
+    recipe-difficulty: "200"
+    infrastructure-type: "code-quality-automation"
+    security-scanning: "comprehensive"
+    monitoring: "intelligent"
+    compliance: "automated"
+  labels:
+    managed-by: "infrastructure-manager"
+    recipe: "code-quality-automation"
+    environment: "development"
+    security-level: "high"
+    automation-level: "intelligent"

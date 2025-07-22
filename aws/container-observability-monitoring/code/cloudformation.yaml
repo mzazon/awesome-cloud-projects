@@ -1,0 +1,1496 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Comprehensive Container Observability and Performance Monitoring - Creates EKS cluster, ECS cluster, CloudWatch monitoring, X-Ray tracing, and OpenSearch for log analytics'
+
+Parameters:
+  # Cluster Configuration
+  EKSClusterName:
+    Type: String
+    Default: observability-eks
+    Description: Name for the EKS cluster
+    MinLength: 1
+    MaxLength: 100
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$'
+  
+  ECSClusterName:
+    Type: String
+    Default: observability-ecs
+    Description: Name for the ECS cluster
+    MinLength: 1
+    MaxLength: 255
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$'
+  
+  # Kubernetes Configuration
+  KubernetesVersion:
+    Type: String
+    Default: '1.28'
+    Description: Kubernetes version for EKS cluster
+    AllowedValues:
+      - '1.26'
+      - '1.27'
+      - '1.28'
+      - '1.29'
+  
+  # Node Group Configuration
+  NodeGroupInstanceType:
+    Type: String
+    Default: t3.large
+    Description: EC2 instance type for EKS worker nodes
+    AllowedValues:
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - t3.2xlarge
+      - m5.large
+      - m5.xlarge
+      - m5.2xlarge
+      - m5.4xlarge
+  
+  NodeGroupMinSize:
+    Type: Number
+    Default: 3
+    Description: Minimum number of nodes in the node group
+    MinValue: 1
+    MaxValue: 10
+  
+  NodeGroupMaxSize:
+    Type: Number
+    Default: 6
+    Description: Maximum number of nodes in the node group
+    MinValue: 1
+    MaxValue: 20
+  
+  NodeGroupDesiredCapacity:
+    Type: Number
+    Default: 3
+    Description: Desired number of nodes in the node group
+    MinValue: 1
+    MaxValue: 10
+  
+  # OpenSearch Configuration
+  OpenSearchDomainName:
+    Type: String
+    Default: container-logs
+    Description: Name for the OpenSearch domain
+    MinLength: 3
+    MaxLength: 28
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+  
+  OpenSearchInstanceType:
+    Type: String
+    Default: t3.small.search
+    Description: Instance type for OpenSearch nodes
+    AllowedValues:
+      - t3.small.search
+      - t3.medium.search
+      - m6g.large.search
+      - m6g.xlarge.search
+      - r6g.large.search
+  
+  OpenSearchInstanceCount:
+    Type: Number
+    Default: 3
+    Description: Number of OpenSearch instances
+    MinValue: 1
+    MaxValue: 10
+  
+  # Monitoring Configuration
+  MonitoringNamespace:
+    Type: String
+    Default: monitoring
+    Description: Kubernetes namespace for monitoring components
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+  
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    Description: CloudWatch log retention period in days
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+  
+  # Notification Configuration
+  NotificationEmail:
+    Type: String
+    Description: Email address for monitoring alerts (optional)
+    Default: ''
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+  
+  # Environment Configuration
+  Environment:
+    Type: String
+    Default: observability
+    Description: Environment name for resource tagging
+    AllowedValues:
+      - development
+      - staging
+      - production
+      - observability
+  
+  # Cost Management
+  EnableCostOptimization:
+    Type: String
+    Default: 'true'
+    Description: Enable automated cost optimization features
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Conditions:
+  # Conditional resource creation
+  CreateNotificationTopic: !Not [!Equals [!Ref NotificationEmail, '']]
+  EnableCostOptimizationCondition: !Equals [!Ref EnableCostOptimization, 'true']
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  IsProduction: !Equals [!Ref Environment, 'production']
+
+Mappings:
+  # Region-specific AMI mappings for EKS optimized AMIs
+  RegionMap:
+    us-east-1:
+      EKSOptimizedAMI: ami-0c02fb55956c7d316
+    us-west-2:
+      EKSOptimizedAMI: ami-0f2176987ee50226e
+    eu-west-1:
+      EKSOptimizedAMI: ami-0c956e207f9d113d5
+    ap-southeast-1:
+      EKSOptimizedAMI: ami-0c802847a7dd848c0
+
+Resources:
+  # =====================================================
+  # IAM ROLES AND POLICIES
+  # =====================================================
+  
+  # EKS Cluster Service Role
+  EKSClusterServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EKSClusterName}-cluster-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-cluster-service-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # EKS Node Group Role
+  EKSNodeGroupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EKSClusterName}-node-group-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-node-group-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # ECS Task Execution Role
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ECSClusterName}-task-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Tags:
+        - Key: Name
+          Value: !Sub '${ECSClusterName}-task-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # Performance Optimizer Lambda Role
+  PerformanceOptimizerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-performance-optimizer-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess
+      Policies:
+        - PolicyName: ECSOptimizationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:ListServices
+                  - ecs:DescribeServices
+                  - ecs:UpdateService
+                  - ecs:DescribeTaskDefinition
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-performance-optimizer-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # OpenSearch Service Role
+  OpenSearchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${OpenSearchDomainName}-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: es.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonOpenSearchServiceRolePolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${OpenSearchDomainName}-service-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # =====================================================
+  # NETWORKING
+  # =====================================================
+  
+  # VPC for EKS Cluster
+  ObservabilityVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # Internet Gateway
+  ObservabilityInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-igw'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # Attach Internet Gateway to VPC
+  ObservabilityInternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref ObservabilityInternetGateway
+      VpcId: !Ref ObservabilityVPC
+  
+  # Public Subnet 1
+  ObservabilityPublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ObservabilityVPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-public-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+  
+  # Public Subnet 2
+  ObservabilityPublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ObservabilityVPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-public-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+  
+  # Private Subnet 1
+  ObservabilityPrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ObservabilityVPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.11.0/24
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-private-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+  
+  # Private Subnet 2
+  ObservabilityPrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ObservabilityVPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.0.12.0/24
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-private-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+  
+  # NAT Gateway 1 Elastic IP
+  ObservabilityNatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: ObservabilityInternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-nat-gateway-1-eip'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # NAT Gateway 2 Elastic IP
+  ObservabilityNatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: ObservabilityInternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-nat-gateway-2-eip'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # NAT Gateway 1
+  ObservabilityNatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt ObservabilityNatGateway1EIP.AllocationId
+      SubnetId: !Ref ObservabilityPublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-nat-gateway-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # NAT Gateway 2
+  ObservabilityNatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt ObservabilityNatGateway2EIP.AllocationId
+      SubnetId: !Ref ObservabilityPublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-nat-gateway-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # Public Route Table
+  ObservabilityPublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ObservabilityVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-public-route-table'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # Public Route
+  ObservabilityPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: ObservabilityInternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref ObservabilityPublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref ObservabilityInternetGateway
+  
+  # Associate Public Subnet 1 with Public Route Table
+  ObservabilityPublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref ObservabilityPublicRouteTable
+      SubnetId: !Ref ObservabilityPublicSubnet1
+  
+  # Associate Public Subnet 2 with Public Route Table
+  ObservabilityPublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref ObservabilityPublicRouteTable
+      SubnetId: !Ref ObservabilityPublicSubnet2
+  
+  # Private Route Table 1
+  ObservabilityPrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ObservabilityVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-private-route-table-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # Private Route 1
+  ObservabilityPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref ObservabilityPrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref ObservabilityNatGateway1
+  
+  # Associate Private Subnet 1 with Private Route Table 1
+  ObservabilityPrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref ObservabilityPrivateRouteTable1
+      SubnetId: !Ref ObservabilityPrivateSubnet1
+  
+  # Private Route Table 2
+  ObservabilityPrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ObservabilityVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-private-route-table-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # Private Route 2
+  ObservabilityPrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref ObservabilityPrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref ObservabilityNatGateway2
+  
+  # Associate Private Subnet 2 with Private Route Table 2
+  ObservabilityPrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref ObservabilityPrivateRouteTable2
+      SubnetId: !Ref ObservabilityPrivateSubnet2
+  
+  # =====================================================
+  # SECURITY GROUPS
+  # =====================================================
+  
+  # EKS Cluster Security Group
+  EKSClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EKSClusterName}-cluster-security-group'
+      GroupDescription: Security group for EKS cluster control plane
+      VpcId: !Ref ObservabilityVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS access to EKS API server
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-cluster-security-group'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # EKS Node Group Security Group
+  EKSNodeGroupSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EKSClusterName}-node-group-security-group'
+      GroupDescription: Security group for EKS node group
+      VpcId: !Ref ObservabilityVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 10.0.0.0/16
+          Description: SSH access from VPC
+        - IpProtocol: tcp
+          FromPort: 1025
+          ToPort: 65535
+          SourceSecurityGroupId: !Ref EKSClusterSecurityGroup
+          Description: Communication with EKS cluster
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref EKSClusterSecurityGroup
+          Description: HTTPS communication with EKS cluster
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-node-group-security-group'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # OpenSearch Security Group
+  OpenSearchSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${OpenSearchDomainName}-security-group'
+      GroupDescription: Security group for OpenSearch domain
+      VpcId: !Ref ObservabilityVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.0.0/16
+          Description: HTTPS access from VPC
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 10.0.0.0/16
+          Description: HTTP access from VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${OpenSearchDomainName}-security-group'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # =====================================================
+  # CLOUDWATCH RESOURCES
+  # =====================================================
+  
+  # CloudWatch Log Group for EKS
+  EKSCloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/eks/${EKSClusterName}/cluster'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-log-group'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # CloudWatch Log Group for EKS Applications
+  EKSApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/eks/${EKSClusterName}/application'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-application-log-group'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # CloudWatch Log Group for Container Insights
+  ContainerInsightsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/containerinsights/${EKSClusterName}/application'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-container-insights-log-group'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # CloudWatch Log Group for ECS
+  ECSCloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/ecs/${ECSClusterName}/application'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${ECSClusterName}-log-group'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # SNS Topic for Alerts
+  ObservabilityAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: container-observability-alerts
+      DisplayName: Container Observability Alerts
+      Tags:
+        - Key: Name
+          Value: container-observability-alerts
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # SNS Topic Subscription (if email provided)
+  ObservabilityAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      Protocol: email
+      TopicArn: !Ref ObservabilityAlertsTopic
+      Endpoint: !Ref NotificationEmail
+  
+  # =====================================================
+  # EKS CLUSTER
+  # =====================================================
+  
+  # EKS Cluster
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref EKSClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt EKSClusterServiceRole.Arn
+      ResourcesVpcConfig:
+        SecurityGroupIds:
+          - !Ref EKSClusterSecurityGroup
+        SubnetIds:
+          - !Ref ObservabilityPrivateSubnet1
+          - !Ref ObservabilityPrivateSubnet2
+          - !Ref ObservabilityPublicSubnet1
+          - !Ref ObservabilityPublicSubnet2
+        EndpointConfigPrivate: false
+        EndpointConfigPublic: true
+        PublicAccessCidrs:
+          - 0.0.0.0/0
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+            - Type: controllerManager
+            - Type: scheduler
+      Tags:
+        - Key: Name
+          Value: !Ref EKSClusterName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # EKS Node Group
+  EKSNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref EKSCluster
+      NodegroupName: !Sub '${EKSClusterName}-observability-nodes'
+      NodeRole: !GetAtt EKSNodeGroupRole.Arn
+      Subnets:
+        - !Ref ObservabilityPrivateSubnet1
+        - !Ref ObservabilityPrivateSubnet2
+      InstanceTypes:
+        - !Ref NodeGroupInstanceType
+      ScalingConfig:
+        MinSize: !Ref NodeGroupMinSize
+        MaxSize: !Ref NodeGroupMaxSize
+        DesiredSize: !Ref NodeGroupDesiredCapacity
+      DiskSize: 50
+      AmiType: AL2_x86_64
+      CapacityType: ON_DEMAND
+      RemoteAccess:
+        Ec2SshKey: !If
+          - IsProduction
+          - !Ref AWS::NoValue
+          - !Ref AWS::NoValue
+      Labels:
+        role: observability
+        monitoring: enabled
+      Tags:
+        Name: !Sub '${EKSClusterName}-observability-nodes'
+        Environment: !Ref Environment
+        Purpose: observability
+        'k8s.io/cluster-autoscaler/enabled': 'true'
+        !Sub 'k8s.io/cluster-autoscaler/${EKSClusterName}': 'owned'
+  
+  # EKS Add-ons
+  EKSVPCCNIAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: vpc-cni
+      AddonVersion: latest
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-vpc-cni-addon'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  EKSCoreDNSAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: coredns
+      AddonVersion: latest
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-coredns-addon'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  EKSKubeProxyAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: kube-proxy
+      AddonVersion: latest
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-kube-proxy-addon'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  EKSEBSCSIAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref EKSCluster
+      AddonName: aws-ebs-csi-driver
+      AddonVersion: latest
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-ebs-csi-addon'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # =====================================================
+  # ECS CLUSTER
+  # =====================================================
+  
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ECSClusterName
+      CapacityProviders:
+        - EC2
+        - FARGATE
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Ref ECSClusterName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # =====================================================
+  # OPENSEARCH DOMAIN
+  # =====================================================
+  
+  # OpenSearch Domain
+  OpenSearchDomain:
+    Type: AWS::OpenSearch::Domain
+    Properties:
+      DomainName: !Sub '${OpenSearchDomainName}-${AWS::AccountId}'
+      EngineVersion: 'OpenSearch_2.3'
+      ClusterConfig:
+        InstanceType: !Ref OpenSearchInstanceType
+        InstanceCount: !Ref OpenSearchInstanceCount
+        DedicatedMasterEnabled: false
+        ZoneAwarenessEnabled: !If
+          - IsProduction
+          - true
+          - false
+        ZoneAwarenessConfig:
+          !If
+            - IsProduction
+            - AvailabilityZoneCount: 2
+            - !Ref AWS::NoValue
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: gp3
+        VolumeSize: 20
+        Iops: 3000
+        Throughput: 125
+      VPCOptions:
+        SecurityGroupIds:
+          - !Ref OpenSearchSecurityGroup
+        SubnetIds:
+          - !Ref ObservabilityPrivateSubnet1
+          - !If
+            - IsProduction
+            - !Ref ObservabilityPrivateSubnet2
+            - !Ref AWS::NoValue
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'es:*'
+            Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${OpenSearchDomainName}-${AWS::AccountId}/*'
+      EncryptionAtRestOptions:
+        Enabled: true
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+        TLSSecurityPolicy: 'Policy-Min-TLS-1-2-2019-07'
+      Tags:
+        - Key: Name
+          Value: !Sub '${OpenSearchDomainName}-${AWS::AccountId}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # =====================================================
+  # CLOUDWATCH ALARMS
+  # =====================================================
+  
+  # EKS High CPU Utilization Alarm
+  EKSHighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EKSClusterName}-High-CPU-Utilization'
+      AlarmDescription: High CPU utilization in EKS cluster
+      MetricName: pod_cpu_utilization
+      Namespace: AWS/ContainerInsights
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref EKSClusterName
+      AlarmActions:
+        - !Ref ObservabilityAlertsTopic
+      OKActions:
+        - !Ref ObservabilityAlertsTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-High-CPU-Utilization'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # EKS High Memory Utilization Alarm
+  EKSHighMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EKSClusterName}-High-Memory-Utilization'
+      AlarmDescription: High memory utilization in EKS cluster
+      MetricName: pod_memory_utilization
+      Namespace: AWS/ContainerInsights
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref EKSClusterName
+      AlarmActions:
+        - !Ref ObservabilityAlertsTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-High-Memory-Utilization'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # ECS Service Unhealthy Tasks Alarm
+  ECSUnhealthyTasksAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ECSClusterName}-Service-Unhealthy-Tasks'
+      AlarmDescription: Unhealthy tasks in ECS service
+      MetricName: RunningTaskCount
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ECSClusterName
+      AlarmActions:
+        - !Ref ObservabilityAlertsTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ECSClusterName}-Service-Unhealthy-Tasks'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # CloudWatch Anomaly Detector for EKS CPU
+  EKSCPUAnomalyDetector:
+    Type: AWS::CloudWatch::AnomalyDetector
+    Properties:
+      MetricName: pod_cpu_utilization
+      Namespace: AWS/ContainerInsights
+      Stat: Average
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref EKSClusterName
+  
+  # CloudWatch Anomaly Detector for EKS Memory
+  EKSMemoryAnomalyDetector:
+    Type: AWS::CloudWatch::AnomalyDetector
+    Properties:
+      MetricName: pod_memory_utilization
+      Namespace: AWS/ContainerInsights
+      Stat: Average
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref EKSClusterName
+  
+  # EKS CPU Anomaly Alarm
+  EKSCPUAnomalyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EKSClusterName}-CPU-Anomaly-Detection'
+      AlarmDescription: CPU utilization anomaly detection
+      ComparisonOperator: LessThanLowerOrGreaterThanUpperThreshold
+      EvaluationPeriods: 2
+      Metrics:
+        - Id: m1
+          ReturnData: true
+          MetricStat:
+            Metric:
+              MetricName: pod_cpu_utilization
+              Namespace: AWS/ContainerInsights
+              Dimensions:
+                - Name: ClusterName
+                  Value: !Ref EKSClusterName
+            Period: 300
+            Stat: Average
+        - Id: ad1
+          Expression: ANOMALY_DETECTION_FUNCTION(m1, 2)
+      ThresholdMetricId: ad1
+      AlarmActions:
+        - !Ref ObservabilityAlertsTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${EKSClusterName}-CPU-Anomaly-Detection'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # =====================================================
+  # LAMBDA FUNCTIONS
+  # =====================================================
+  
+  # Performance Optimizer Lambda Function
+  PerformanceOptimizerFunction:
+    Type: AWS::Lambda::Function
+    Condition: EnableCostOptimizationCondition
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-container-performance-optimizer'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt PerformanceOptimizerRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          EKS_CLUSTER_NAME: !Ref EKSClusterName
+          ECS_CLUSTER_NAME: !Ref ECSClusterName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          
+          def lambda_handler(event, context):
+              cloudwatch = boto3.client('cloudwatch')
+              ecs_client = boto3.client('ecs')
+              
+              eks_cluster_name = os.environ['EKS_CLUSTER_NAME']
+              ecs_cluster_name = os.environ['ECS_CLUSTER_NAME']
+              
+              # Get performance metrics for the last hour
+              end_time = datetime.utcnow()
+              start_time = end_time - timedelta(hours=1)
+              
+              recommendations = []
+              
+              try:
+                  # Get CPU utilization metrics
+                  cpu_metrics = cloudwatch.get_metric_statistics(
+                      Namespace='AWS/ContainerInsights',
+                      MetricName='pod_cpu_utilization',
+                      Dimensions=[
+                          {'Name': 'ClusterName', 'Value': eks_cluster_name}
+                      ],
+                      StartTime=start_time,
+                      EndTime=end_time,
+                      Period=300,
+                      Statistics=['Average', 'Maximum']
+                  )
+                  
+                  # Analyze CPU utilization
+                  if cpu_metrics['Datapoints']:
+                      avg_cpu = sum(point['Average'] for point in cpu_metrics['Datapoints']) / len(cpu_metrics['Datapoints'])
+                      max_cpu = max(point['Maximum'] for point in cpu_metrics['Datapoints'])
+                      
+                      if avg_cpu < 20:
+                          recommendations.append({
+                              'type': 'DOWNSIZE_CPU',
+                              'message': f'Average CPU utilization is {avg_cpu:.1f}%. Consider reducing CPU requests.',
+                              'severity': 'MEDIUM',
+                              'cluster': eks_cluster_name
+                          })
+                      elif max_cpu > 90:
+                          recommendations.append({
+                              'type': 'UPSIZE_CPU',
+                              'message': f'Maximum CPU utilization reached {max_cpu:.1f}%. Consider increasing CPU limits.',
+                              'severity': 'HIGH',
+                              'cluster': eks_cluster_name
+                          })
+                  
+                  # Get memory utilization metrics
+                  memory_metrics = cloudwatch.get_metric_statistics(
+                      Namespace='AWS/ContainerInsights',
+                      MetricName='pod_memory_utilization',
+                      Dimensions=[
+                          {'Name': 'ClusterName', 'Value': eks_cluster_name}
+                      ],
+                      StartTime=start_time,
+                      EndTime=end_time,
+                      Period=300,
+                      Statistics=['Average', 'Maximum']
+                  )
+                  
+                  # Analyze memory utilization
+                  if memory_metrics['Datapoints']:
+                      avg_memory = sum(point['Average'] for point in memory_metrics['Datapoints']) / len(memory_metrics['Datapoints'])
+                      max_memory = max(point['Maximum'] for point in memory_metrics['Datapoints'])
+                      
+                      if avg_memory < 30:
+                          recommendations.append({
+                              'type': 'DOWNSIZE_MEMORY',
+                              'message': f'Average memory utilization is {avg_memory:.1f}%. Consider reducing memory requests.',
+                              'severity': 'MEDIUM',
+                              'cluster': eks_cluster_name
+                          })
+                      elif max_memory > 85:
+                          recommendations.append({
+                              'type': 'UPSIZE_MEMORY',
+                              'message': f'Maximum memory utilization reached {max_memory:.1f}%. Consider increasing memory limits.',
+                              'severity': 'HIGH',
+                              'cluster': eks_cluster_name
+                          })
+                  
+              except Exception as e:
+                  print(f"Error analyzing metrics: {str(e)}")
+                  recommendations.append({
+                      'type': 'ERROR',
+                      'message': f'Error analyzing metrics: {str(e)}',
+                      'severity': 'LOW'
+                  })
+              
+              # Return optimization recommendations
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'recommendations': recommendations,
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'cluster_name': eks_cluster_name
+                  })
+              }
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-container-performance-optimizer'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: observability
+  
+  # EventBridge Rule for Performance Analysis
+  PerformanceAnalysisRule:
+    Type: AWS::Events::Rule
+    Condition: EnableCostOptimizationCondition
+    Properties:
+      Name: !Sub '${AWS::StackName}-container-performance-analysis'
+      Description: Trigger container performance optimization analysis
+      ScheduleExpression: 'rate(1 hour)'
+      Targets:
+        - Arn: !GetAtt PerformanceOptimizerFunction.Arn
+          Id: PerformanceOptimizerTarget
+  
+  # Lambda Permission for EventBridge
+  PerformanceOptimizerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableCostOptimizationCondition
+    Properties:
+      FunctionName: !Ref PerformanceOptimizerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PerformanceAnalysisRule.Arn
+  
+  # =====================================================
+  # CLOUDWATCH DASHBOARD
+  # =====================================================
+  
+  # Container Observability Dashboard
+  ContainerObservabilityDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'Container-Observability-${AWS::StackName}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ContainerInsights", "pod_cpu_utilization", "ClusterName", "${EKSClusterName}"],
+                  [".", "pod_memory_utilization", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "EKS Pod Resource Utilization",
+                "period": 300,
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 100
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ECS", "CPUUtilization", "ClusterName", "${ECSClusterName}"],
+                  [".", "MemoryUtilization", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "ECS Cluster Resource Utilization",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ContainerInsights", "pod_network_rx_bytes", "ClusterName", "${EKSClusterName}"],
+                  [".", "pod_network_tx_bytes", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "EKS Network I/O",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ECS", "RunningTaskCount", "ClusterName", "${ECSClusterName}"],
+                  [".", "PendingTaskCount", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "ECS Task Counts",
+                "period": 300
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/containerinsights/${EKSClusterName}/application' | fields @timestamp, log\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Application Errors",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  # Cluster Information
+  EKSClusterName:
+    Description: Name of the EKS cluster
+    Value: !Ref EKSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-EKSClusterName'
+  
+  EKSClusterEndpoint:
+    Description: Endpoint for EKS cluster API server
+    Value: !GetAtt EKSCluster.Endpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-EKSClusterEndpoint'
+  
+  EKSClusterArn:
+    Description: ARN of the EKS cluster
+    Value: !GetAtt EKSCluster.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EKSClusterArn'
+  
+  ECSClusterName:
+    Description: Name of the ECS cluster
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSClusterName'
+  
+  ECSClusterArn:
+    Description: ARN of the ECS cluster
+    Value: !GetAtt ECSCluster.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSClusterArn'
+  
+  # Networking Information
+  VPCId:
+    Description: ID of the VPC
+    Value: !Ref ObservabilityVPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCId'
+  
+  PrivateSubnetIds:
+    Description: IDs of the private subnets
+    Value: !Sub '${ObservabilityPrivateSubnet1},${ObservabilityPrivateSubnet2}'
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnetIds'
+  
+  PublicSubnetIds:
+    Description: IDs of the public subnets
+    Value: !Sub '${ObservabilityPublicSubnet1},${ObservabilityPublicSubnet2}'
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnetIds'
+  
+  # Security Groups
+  EKSClusterSecurityGroupId:
+    Description: ID of the EKS cluster security group
+    Value: !Ref EKSClusterSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-EKSClusterSecurityGroupId'
+  
+  EKSNodeGroupSecurityGroupId:
+    Description: ID of the EKS node group security group
+    Value: !Ref EKSNodeGroupSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-EKSNodeGroupSecurityGroupId'
+  
+  # IAM Roles
+  EKSClusterServiceRoleArn:
+    Description: ARN of the EKS cluster service role
+    Value: !GetAtt EKSClusterServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EKSClusterServiceRoleArn'
+  
+  EKSNodeGroupRoleArn:
+    Description: ARN of the EKS node group role
+    Value: !GetAtt EKSNodeGroupRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EKSNodeGroupRoleArn'
+  
+  ECSTaskExecutionRoleArn:
+    Description: ARN of the ECS task execution role
+    Value: !GetAtt ECSTaskExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSTaskExecutionRoleArn'
+  
+  # OpenSearch Information
+  OpenSearchDomainName:
+    Description: Name of the OpenSearch domain
+    Value: !Ref OpenSearchDomain
+    Export:
+      Name: !Sub '${AWS::StackName}-OpenSearchDomainName'
+  
+  OpenSearchDomainEndpoint:
+    Description: Endpoint of the OpenSearch domain
+    Value: !GetAtt OpenSearchDomain.DomainEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-OpenSearchDomainEndpoint'
+  
+  OpenSearchDashboardsURL:
+    Description: URL for OpenSearch Dashboards
+    Value: !Sub 'https://${OpenSearchDomain.DomainEndpoint}/_dashboards'
+    Export:
+      Name: !Sub '${AWS::StackName}-OpenSearchDashboardsURL'
+  
+  # Monitoring Information
+  SNSTopicArn:
+    Description: ARN of the SNS topic for alerts
+    Value: !Ref ObservabilityAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+  
+  CloudWatchDashboardURL:
+    Description: URL for the CloudWatch dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=Container-Observability-${AWS::StackName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchDashboardURL'
+  
+  # Log Groups
+  EKSLogGroupName:
+    Description: Name of the EKS CloudWatch log group
+    Value: !Ref EKSCloudWatchLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-EKSLogGroupName'
+  
+  ECSLogGroupName:
+    Description: Name of the ECS CloudWatch log group
+    Value: !Ref ECSCloudWatchLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSLogGroupName'
+  
+  # Lambda Functions
+  PerformanceOptimizerFunctionName:
+    Description: Name of the performance optimizer Lambda function
+    Value: !If
+      - EnableCostOptimizationCondition
+      - !Ref PerformanceOptimizerFunction
+      - 'N/A (Cost optimization disabled)'
+    Export:
+      Name: !Sub '${AWS::StackName}-PerformanceOptimizerFunctionName'
+  
+  # Configuration Commands
+  KubectlConfigCommand:
+    Description: Command to configure kubectl for EKS cluster
+    Value: !Sub 'aws eks update-kubeconfig --region ${AWS::Region} --name ${EKSCluster}'
+    Export:
+      Name: !Sub '${AWS::StackName}-KubectlConfigCommand'
+  
+  # Next Steps
+  NextSteps:
+    Description: Next steps to complete the observability setup
+    Value: |
+      1. Configure kubectl: Use the KubectlConfigCommand output
+      2. Install Container Insights: Deploy CloudWatch agent and Fluent Bit
+      3. Install Prometheus: Use Helm to deploy Prometheus stack
+      4. Install Grafana: Use Helm to deploy Grafana with dashboards
+      5. Deploy ADOT: Install AWS Distro for OpenTelemetry collector
+      6. Deploy sample applications: Create applications with observability
+      7. Configure alerts: Set up custom alerts and notifications
+      8. Access dashboards: Use the CloudWatch dashboard URL
+    Export:
+      Name: !Sub '${AWS::StackName}-NextSteps'

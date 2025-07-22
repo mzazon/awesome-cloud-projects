@@ -1,0 +1,684 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Comprehensive multi-region backup strategy using AWS Backup with cross-region copy,
+  EventBridge automation, Lambda validation, and SNS notifications.
+  This template creates a centralized backup solution with intelligent lifecycle management.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Backup Configuration"
+        Parameters:
+          - OrganizationName
+          - BackupPlanName
+          - NotificationEmail
+      - Label:
+          default: "Regional Configuration"
+        Parameters:
+          - SecondaryRegion
+          - TertiaryRegion
+      - Label:
+          default: "Lifecycle Settings"
+        Parameters:
+          - DailyColdStorageDays
+          - DailyDeleteAfterDays
+          - WeeklyColdStorageDays
+          - WeeklyDeleteAfterDays
+      - Label:
+          default: "Resource Tagging"
+        Parameters:
+          - EnvironmentTag
+          - BackupEnabledTag
+    ParameterLabels:
+      OrganizationName:
+        default: "Organization Name"
+      BackupPlanName:
+        default: "Backup Plan Name"
+      NotificationEmail:
+        default: "Notification Email Address"
+      SecondaryRegion:
+        default: "Secondary Backup Region"
+      TertiaryRegion:
+        default: "Tertiary Archive Region"
+      DailyColdStorageDays:
+        default: "Daily Backup Cold Storage Days"
+      DailyDeleteAfterDays:
+        default: "Daily Backup Retention Days"
+      WeeklyColdStorageDays:
+        default: "Weekly Backup Cold Storage Days"
+      WeeklyDeleteAfterDays:
+        default: "Weekly Backup Retention Days"
+
+Parameters:
+  OrganizationName:
+    Type: String
+    Default: YourOrg
+    Description: Organization name used for resource naming
+    MinLength: 1
+    MaxLength: 20
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9]*$
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters
+
+  BackupPlanName:
+    Type: String
+    Default: MultiRegionBackupPlan
+    Description: Name for the backup plan
+    MinLength: 1
+    MaxLength: 50
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for backup notifications
+    AllowedPattern: ^[^\s@]+@[^\s@]+\.[^\s@]+$
+    ConstraintDescription: Must be a valid email address
+
+  SecondaryRegion:
+    Type: String
+    Default: us-west-2
+    Description: Secondary region for backup replication
+    AllowedValues:
+      - us-east-1
+      - us-east-2
+      - us-west-1
+      - us-west-2
+      - eu-west-1
+      - eu-west-2
+      - eu-central-1
+      - ap-southeast-1
+      - ap-southeast-2
+      - ap-northeast-1
+
+  TertiaryRegion:
+    Type: String
+    Default: eu-west-1
+    Description: Tertiary region for long-term archival
+    AllowedValues:
+      - us-east-1
+      - us-east-2
+      - us-west-1
+      - us-west-2
+      - eu-west-1
+      - eu-west-2
+      - eu-central-1
+      - ap-southeast-1
+      - ap-southeast-2
+      - ap-northeast-1
+
+  DailyColdStorageDays:
+    Type: Number
+    Default: 30
+    Description: Number of days before moving daily backups to cold storage
+    MinValue: 1
+    MaxValue: 365
+
+  DailyDeleteAfterDays:
+    Type: Number
+    Default: 365
+    Description: Number of days to retain daily backups
+    MinValue: 1
+    MaxValue: 2555
+
+  WeeklyColdStorageDays:
+    Type: Number
+    Default: 90
+    Description: Number of days before moving weekly backups to cold storage
+    MinValue: 1
+    MaxValue: 365
+
+  WeeklyDeleteAfterDays:
+    Type: Number
+    Default: 2555
+    Description: Number of days to retain weekly backups (7 years)
+    MinValue: 365
+    MaxValue: 2555
+
+  EnvironmentTag:
+    Type: String
+    Default: Production
+    Description: Environment tag value for resource selection
+    AllowedValues:
+      - Production
+      - Staging
+      - Development
+
+  BackupEnabledTag:
+    Type: String
+    Default: 'true'
+    Description: Backup enabled tag value for resource selection
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Conditions:
+  # Validate that secondary and tertiary regions are different from current region
+  ValidSecondaryRegion: !Not [!Equals [!Ref SecondaryRegion, !Ref 'AWS::Region']]
+  ValidTertiaryRegion: !Not [!Equals [!Ref TertiaryRegion, !Ref 'AWS::Region']]
+
+Resources:
+  # AWS Backup Service Role with comprehensive permissions
+  AWSBackupServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${OrganizationName}-AWSBackupServiceRole'
+      Description: Service role for AWS Backup to access and backup AWS resources
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: backup.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForS3Backup
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForS3Restore
+      Tags:
+        - Key: Purpose
+          Value: AWS Backup Service Role
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  # Primary backup vault with KMS encryption
+  PrimaryBackupVault:
+    Type: AWS::Backup::BackupVault
+    Properties:
+      BackupVaultName: !Sub '${OrganizationName}-primary-vault'
+      EncryptionKeyArn: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/backup'
+      AccessPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyDeleteBackup
+            Effect: Deny
+            Principal: '*'
+            Action:
+              - backup:DeleteBackup
+              - backup:UpdateRecoveryPointLifecycle
+            Resource: '*'
+            Condition:
+              StringNotEquals:
+                'aws:userid': !Sub '${AWS::AccountId}:root'
+      LockConfiguration:
+        MinRetentionDays: 1
+        MaxRetentionDays: 2555
+        ChangeableForDays: 3
+      NotificationConfiguration:
+        BackupVaultEvents:
+          - BACKUP_JOB_STARTED
+          - BACKUP_JOB_COMPLETED
+          - BACKUP_JOB_FAILED
+          - COPY_JOB_STARTED
+          - COPY_JOB_SUCCESSFUL
+          - COPY_JOB_FAILED
+        SNSTopicArn: !Ref BackupNotificationsTopic
+
+  # SNS topic for backup notifications
+  BackupNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${OrganizationName}-backup-notifications'
+      DisplayName: AWS Backup Notifications
+      KmsMasterKeyId: alias/aws/sns
+
+  # SNS subscription for email notifications
+  BackupNotificationsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref BackupNotificationsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # Comprehensive backup plan with cross-region copy
+  MultiRegionBackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Properties:
+      BackupPlan:
+        BackupPlanName: !Ref BackupPlanName
+        BackupPlanRule:
+          # Daily backup rule with cross-region copy to secondary region
+          - RuleName: DailyBackupsWithCrossRegionCopy
+            TargetBackupVault: !Ref PrimaryBackupVault
+            ScheduleExpression: cron(0 2 ? * * *)
+            ScheduleExpressionTimezone: UTC
+            StartWindowMinutes: 480
+            CompletionWindowMinutes: 10080
+            EnableContinuousBackup: true
+            Lifecycle:
+              MoveToColdStorageAfterDays: !Ref DailyColdStorageDays
+              DeleteAfterDays: !Ref DailyDeleteAfterDays
+            CopyActions:
+              - DestinationBackupVaultArn: !Sub 
+                - 'arn:aws:backup:${SecondaryRegion}:${AWS::AccountId}:backup-vault:${OrganizationName}-secondary-vault'
+                - SecondaryRegion: !Ref SecondaryRegion
+                Lifecycle:
+                  MoveToColdStorageAfterDays: !Ref DailyColdStorageDays
+                  DeleteAfterDays: !Ref DailyDeleteAfterDays
+            RecoveryPointTags:
+              BackupType: Daily
+              Environment: !Ref EnvironmentTag
+              CrossRegion: 'true'
+              CreatedBy: CloudFormation
+          # Weekly backup rule with cross-region copy to tertiary region
+          - RuleName: WeeklyLongTermArchival
+            TargetBackupVault: !Ref PrimaryBackupVault
+            ScheduleExpression: cron(0 3 ? * SUN *)
+            ScheduleExpressionTimezone: UTC
+            StartWindowMinutes: 480
+            CompletionWindowMinutes: 10080
+            Lifecycle:
+              MoveToColdStorageAfterDays: !Ref WeeklyColdStorageDays
+              DeleteAfterDays: !Ref WeeklyDeleteAfterDays
+            CopyActions:
+              - DestinationBackupVaultArn: !Sub
+                - 'arn:aws:backup:${TertiaryRegion}:${AWS::AccountId}:backup-vault:${OrganizationName}-tertiary-vault'
+                - TertiaryRegion: !Ref TertiaryRegion
+                Lifecycle:
+                  MoveToColdStorageAfterDays: !Ref WeeklyColdStorageDays
+                  DeleteAfterDays: !Ref WeeklyDeleteAfterDays
+            RecoveryPointTags:
+              BackupType: Weekly
+              Environment: !Ref EnvironmentTag
+              LongTerm: 'true'
+              CreatedBy: CloudFormation
+
+  # Backup selection using tag-based resource discovery
+  BackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Properties:
+      BackupPlanId: !Ref MultiRegionBackupPlan
+      BackupSelection:
+        SelectionName: ProductionResourcesSelection
+        IamRoleArn: !GetAtt AWSBackupServiceRole.Arn
+        Resources:
+          - '*'
+        Conditions:
+          StringEquals:
+            'aws:ResourceTag/Environment': 
+              - !Ref EnvironmentTag
+            'aws:ResourceTag/BackupEnabled': 
+              - !Ref BackupEnabledTag
+
+  # Lambda execution role for backup validation
+  BackupValidatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${OrganizationName}-BackupValidatorRole'
+      Description: Execution role for backup validation Lambda function
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BackupValidatorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - backup:DescribeBackupJob
+                  - backup:ListCopyJobs
+                  - backup:DescribeRecoveryPoint
+                  - backup:GetRecoveryPointRestoreMetadata
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref BackupNotificationsTopic
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Purpose
+          Value: Backup Validation Lambda Role
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  # Lambda function for backup validation and monitoring
+  BackupValidatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${OrganizationName}-backup-validator'
+      Description: Validates backup jobs and sends notifications on failures
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt BackupValidatorRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      ReservedConcurrencyLimit: 10
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref BackupNotificationsTopic
+          ORGANIZATION_NAME: !Ref OrganizationName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from datetime import datetime, timedelta
+          from botocore.exceptions import ClientError
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              """
+              Lambda function to validate AWS Backup jobs and send notifications.
+              
+              This function processes EventBridge events from AWS Backup and performs
+              validation on backup jobs, sending SNS notifications for failures.
+              """
+              
+              backup_client = boto3.client('backup')
+              sns_client = boto3.client('sns')
+              
+              try:
+                  # Extract backup job details from EventBridge event
+                  detail = event.get('detail', {})
+                  backup_job_id = detail.get('backupJobId')
+                  
+                  if not backup_job_id:
+                      logger.warning('No backup job ID found in event')
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps('Invalid event - missing backup job ID')
+                      }
+                  
+                  logger.info(f'Processing backup job: {backup_job_id}')
+                  
+                  # Get backup job details
+                  response = backup_client.describe_backup_job(
+                      BackupJobId=backup_job_id
+                  )
+                  
+                  backup_job = response['BackupJob']
+                  job_state = backup_job.get('State', 'UNKNOWN')
+                  resource_arn = backup_job.get('ResourceArn', 'Unknown')
+                  
+                  # Process different job states
+                  if job_state == 'COMPLETED':
+                      recovery_point_arn = backup_job.get('RecoveryPointArn')
+                      message = f"""
+                      ✅ BACKUP VALIDATION SUCCESSFUL
+                      
+                      Job ID: {backup_job_id}
+                      Resource: {resource_arn}
+                      Recovery Point: {recovery_point_arn}
+                      Completion Time: {backup_job.get('CompletionDate', 'Unknown')}
+                      Backup Size: {backup_job.get('BackupSizeInBytes', 'Unknown')} bytes
+                      
+                      Organization: {os.environ.get('ORGANIZATION_NAME', 'Unknown')}
+                      """
+                      logger.info(f'Backup completed successfully: {backup_job_id}')
+                      
+                  elif job_state in ['FAILED', 'ABORTED']:
+                      error_message = backup_job.get('StatusMessage', 'Unknown error')
+                      message = f"""
+                      ❌ BACKUP JOB FAILED
+                      
+                      Job ID: {backup_job_id}
+                      Resource: {resource_arn}
+                      State: {job_state}
+                      Error: {error_message}
+                      Creation Time: {backup_job.get('CreationDate', 'Unknown')}
+                      
+                      Organization: {os.environ.get('ORGANIZATION_NAME', 'Unknown')}
+                      
+                      Please investigate and retry if necessary.
+                      """
+                      
+                      logger.error(f'Backup job failed: {backup_job_id} - {error_message}')
+                      
+                      # Send SNS notification for failed jobs
+                      sns_client.publish(
+                          TopicArn=os.environ['SNS_TOPIC_ARN'],
+                          Subject=f'AWS Backup Job Failed - {os.environ.get("ORGANIZATION_NAME", "Unknown")}',
+                          Message=message
+                      )
+                      
+                  else:
+                      logger.info(f'Backup job in state: {job_state}')
+                      
+              except ClientError as e:
+                  error_msg = f"AWS API error: {str(e)}"
+                  logger.error(error_msg)
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'AWS API error: {error_msg}')
+                  }
+              except Exception as e:
+                  error_msg = f"Unexpected error: {str(e)}"
+                  logger.error(error_msg)
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Validation error: {error_msg}')
+                  }
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Backup validation completed successfully')
+              }
+      Tags:
+        - Key: Purpose
+          Value: Backup Validation
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  # CloudWatch log group for Lambda function with retention
+  BackupValidatorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${BackupValidatorFunction}'
+      RetentionInDays: 30
+
+  # EventBridge rule for backup job state changes
+  BackupJobFailureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${OrganizationName}-BackupJobFailureRule'
+      Description: Monitors AWS Backup job failures and state changes
+      EventPattern:
+        source:
+          - aws.backup
+        detail-type:
+          - Backup Job State Change
+        detail:
+          state:
+            - FAILED
+            - ABORTED
+            - COMPLETED
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt BackupValidatorFunction.Arn
+          Id: BackupValidatorTarget
+
+  # Permission for EventBridge to invoke Lambda function
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BackupValidatorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BackupJobFailureRule.Arn
+
+  # CloudWatch dashboard for backup monitoring
+  BackupMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${OrganizationName}-Backup-Monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Backup", "NumberOfBackupJobsCompleted" ],
+                  [ ".", "NumberOfBackupJobsFailed" ],
+                  [ ".", "NumberOfBackupJobsCreated" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Backup Job Status",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Backup", "NumberOfCopyJobsCompleted" ],
+                  [ ".", "NumberOfCopyJobsFailed" ],
+                  [ ".", "NumberOfCopyJobsCreated" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Cross-Region Copy Job Status",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+  # CloudWatch alarm for backup job failures
+  BackupJobFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${OrganizationName}-BackupJobFailures'
+      AlarmDescription: Alert when backup jobs fail
+      MetricName: NumberOfBackupJobsFailed
+      Namespace: AWS/Backup
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref BackupNotificationsTopic
+
+  # CloudWatch alarm for copy job failures
+  CopyJobFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${OrganizationName}-CopyJobFailures'
+      AlarmDescription: Alert when cross-region copy jobs fail
+      MetricName: NumberOfCopyJobsFailed
+      Namespace: AWS/Backup
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref BackupNotificationsTopic
+
+Outputs:
+  BackupPlanId:
+    Description: ID of the created backup plan
+    Value: !Ref MultiRegionBackupPlan
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupPlanId'
+
+  BackupPlanArn:
+    Description: ARN of the created backup plan
+    Value: !Sub 'arn:aws:backup:${AWS::Region}:${AWS::AccountId}:backup-plan:${MultiRegionBackupPlan}'
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupPlanArn'
+
+  PrimaryBackupVaultName:
+    Description: Name of the primary backup vault
+    Value: !Ref PrimaryBackupVault
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryBackupVaultName'
+
+  PrimaryBackupVaultArn:
+    Description: ARN of the primary backup vault
+    Value: !GetAtt PrimaryBackupVault.BackupVaultArn
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryBackupVaultArn'
+
+  SecondaryVaultArn:
+    Condition: ValidSecondaryRegion
+    Description: ARN of the secondary backup vault (must be created manually)
+    Value: !Sub 
+      - 'arn:aws:backup:${SecondaryRegion}:${AWS::AccountId}:backup-vault:${OrganizationName}-secondary-vault'
+      - SecondaryRegion: !Ref SecondaryRegion
+
+  TertiaryVaultArn:
+    Condition: ValidTertiaryRegion
+    Description: ARN of the tertiary backup vault (must be created manually)
+    Value: !Sub 
+      - 'arn:aws:backup:${TertiaryRegion}:${AWS::AccountId}:backup-vault:${OrganizationName}-tertiary-vault'
+      - TertiaryRegion: !Ref TertiaryRegion
+
+  BackupServiceRoleArn:
+    Description: ARN of the AWS Backup service role
+    Value: !GetAtt AWSBackupServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupServiceRoleArn'
+
+  SNSTopicArn:
+    Description: ARN of the backup notifications SNS topic
+    Value: !Ref BackupNotificationsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  LambdaFunctionArn:
+    Description: ARN of the backup validator Lambda function
+    Value: !GetAtt BackupValidatorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  EventBridgeRuleArn:
+    Description: ARN of the EventBridge rule monitoring backup jobs
+    Value: !GetAtt BackupJobFailureRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeRuleArn'
+
+  DashboardURL:
+    Description: URL to the CloudWatch dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${OrganizationName}-Backup-Monitoring'
+
+  NextSteps:
+    Description: Next steps after deployment
+    Value: !Sub |
+      1. Create secondary backup vault in ${SecondaryRegion}
+      2. Create tertiary backup vault in ${TertiaryRegion}
+      3. Tag resources with Environment=${EnvironmentTag} and BackupEnabled=${BackupEnabledTag}
+      4. Confirm SNS subscription via email
+      5. Monitor backup jobs in CloudWatch dashboard
+
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost (varies by usage)
+    Value: "$50-200 USD depending on backup volume and cross-region transfer"
+
+  RequiredRegionalResources:
+    Description: Resources that must be created in other regions
+    Value: !Sub |
+      Secondary Region (${SecondaryRegion}): Backup Vault named '${OrganizationName}-secondary-vault'
+      Tertiary Region (${TertiaryRegion}): Backup Vault named '${OrganizationName}-tertiary-vault'

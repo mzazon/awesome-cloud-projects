@@ -1,0 +1,1398 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Decentralized Identity Management with Blockchain Infrastructure
+  This template creates a complete decentralized identity management system using
+  AWS Managed Blockchain (Hyperledger Fabric), Amazon QLDB, Lambda functions,
+  API Gateway, and supporting services for secure, blockchain-based identity management.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - NetworkName
+          - MemberName
+          - AdminUsername
+          - AdminPassword
+      - Label:
+          default: "Identity Management Configuration"
+        Parameters:
+          - QLDBLedgerName
+          - CredentialTableName
+          - AssetsBucketName
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - EnableEncryptionAtRest
+          - KMSKeyId
+          - EnableAccessLogging
+      - Label:
+          default: "Deployment Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+          - NotificationEmail
+    ParameterLabels:
+      NetworkName:
+        default: "Blockchain Network Name"
+      MemberName:
+        default: "Member Organization Name"
+      QLDBLedgerName:
+        default: "QLDB Ledger Name"
+      Environment:
+        default: "Environment Type"
+
+Parameters:
+  # Network Configuration
+  NetworkName:
+    Type: String
+    Default: "identity-network"
+    Description: "Name for the Managed Blockchain network"
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9-]{0,63}$"
+    ConstraintDescription: "Must be a valid network name (1-64 characters, alphanumeric and hyphens)"
+
+  MemberName:
+    Type: String
+    Default: "identity-org"
+    Description: "Name for the blockchain network member organization"
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9-]{0,63}$"
+    ConstraintDescription: "Must be a valid member name (1-64 characters, alphanumeric and hyphens)"
+
+  AdminUsername:
+    Type: String
+    Default: "admin"
+    Description: "Administrator username for the blockchain network"
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9]*$"
+    ConstraintDescription: "Must begin with a letter and contain only alphanumeric characters"
+
+  AdminPassword:
+    Type: String
+    NoEcho: true
+    Description: "Administrator password for the blockchain network (min 8 characters, alphanumeric)"
+    MinLength: 8
+    MaxLength: 32
+    AllowedPattern: "^[a-zA-Z0-9]*$"
+    ConstraintDescription: "Must be 8-32 characters, alphanumeric only"
+
+  # Identity Management Configuration
+  QLDBLedgerName:
+    Type: String
+    Default: "identity-ledger"
+    Description: "Name for the QLDB ledger for identity state management"
+    AllowedPattern: "^[A-Za-z][A-Za-z0-9-_]{0,31}$"
+    ConstraintDescription: "Must be a valid QLDB ledger name (1-32 characters)"
+
+  CredentialTableName:
+    Type: String
+    Default: "identity-credentials"
+    Description: "Name for the DynamoDB table storing credential index"
+    AllowedPattern: "^[A-Za-z][A-Za-z0-9-_]{0,254}$"
+    ConstraintDescription: "Must be a valid DynamoDB table name"
+
+  AssetsBucketName:
+    Type: String
+    Default: ""
+    Description: "S3 bucket name for blockchain assets (leave empty for auto-generated name)"
+    AllowedPattern: "^$|^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$"
+    ConstraintDescription: "Must be a valid S3 bucket name (3-63 characters, lowercase, alphanumeric and hyphens)"
+
+  # Security Configuration
+  EnableEncryptionAtRest:
+    Type: String
+    Default: "true"
+    Description: "Enable encryption at rest for data storage"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  KMSKeyId:
+    Type: String
+    Default: "alias/aws/s3"
+    Description: "KMS Key ID for encryption (use alias/aws/s3 for default S3 encryption)"
+
+  EnableAccessLogging:
+    Type: String
+    Default: "true"
+    Description: "Enable access logging for API Gateway"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  # Deployment Configuration
+  Environment:
+    Type: String
+    Default: "dev"
+    Description: "Environment type for resource tagging and naming"
+    AllowedValues:
+      - "dev"
+      - "staging"
+      - "prod"
+
+  ProjectName:
+    Type: String
+    Default: "decentralized-identity"
+    Description: "Project name for resource tagging"
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9-]{0,63}$"
+
+  NotificationEmail:
+    Type: String
+    Default: ""
+    Description: "Email address for notifications (optional)"
+    AllowedPattern: "^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
+    ConstraintDescription: "Must be a valid email address or empty"
+
+Conditions:
+  # Condition to check if custom bucket name is provided
+  UseCustomBucketName: !Not [!Equals [!Ref AssetsBucketName, ""]]
+  
+  # Condition to enable encryption
+  EnableEncryption: !Equals [!Ref EnableEncryptionAtRest, "true"]
+  
+  # Condition to enable access logging
+  EnableLogging: !Equals [!Ref EnableAccessLogging, "true"]
+  
+  # Condition to check if notification email is provided
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, ""]]
+  
+  # Condition for production environment (additional security)
+  IsProduction: !Equals [!Ref Environment, "prod"]
+
+Resources:
+  # ======================================================================
+  # IAM ROLES AND POLICIES
+  # ======================================================================
+  
+  # Lambda Execution Role
+  IdentityLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-lambda-execution-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: IdentityManagementPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # QLDB permissions
+              - Effect: Allow
+                Action:
+                  - qldb:ExecuteStatement
+                  - qldb:StartSession
+                  - qldb:SendCommand
+                  - qldb:CommitTransaction
+                  - qldb:AbortTransaction
+                Resource: !Sub "arn:aws:qldb:${AWS::Region}:${AWS::AccountId}:ledger/${QLDBLedgerName}"
+              # DynamoDB permissions
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt IdentityCredentialsTable.Arn
+              # Managed Blockchain permissions
+              - Effect: Allow
+                Action:
+                  - managedblockchain:GetNetwork
+                  - managedblockchain:GetMember
+                  - managedblockchain:GetNode
+                  - managedblockchain:CreateAccessor
+                  - managedblockchain:GetAccessor
+                  - managedblockchain:ListAccessors
+                Resource: "*"
+              # S3 permissions for chaincode and assets
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub "${BlockchainAssetsS3Bucket}/*"
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Ref BlockchainAssetsS3Bucket
+              # CloudWatch Logs permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # API Gateway CloudWatch Role
+  APIGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Condition: EnableLogging
+    Properties:
+      RoleName: !Sub "${ProjectName}-apigateway-cloudwatch-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ======================================================================
+  # STORAGE RESOURCES
+  # ======================================================================
+
+  # S3 Bucket for Blockchain Assets
+  BlockchainAssetsS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - UseCustomBucketName
+        - !Sub "${AssetsBucketName}-${Environment}"
+        - !Sub "${ProjectName}-blockchain-assets-${Environment}-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Blockchain chaincode and schema storage"
+
+  # S3 Bucket Policy
+  BlockchainAssetsS3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BlockchainAssetsS3Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "${BlockchainAssetsS3Bucket}/*"
+              - !Ref BlockchainAssetsS3Bucket
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+          - Sid: AllowLambdaAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt IdentityLambdaExecutionRole.Arn
+            Action:
+              - "s3:GetObject"
+              - "s3:PutObject"
+              - "s3:DeleteObject"
+            Resource: !Sub "${BlockchainAssetsS3Bucket}/*"
+
+  # DynamoDB Table for Credential Indexing
+  IdentityCredentialsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${CredentialTableName}-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: did
+          AttributeType: S
+        - AttributeName: credential_id
+          AttributeType: S
+        - AttributeName: credential_type
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: did
+          KeyType: HASH
+        - AttributeName: credential_id
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: credential-type-index
+          KeySchema:
+            - AttributeName: credential_type
+              KeyType: HASH
+            - AttributeName: credential_id
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: status-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: credential_id
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: !If [EnableEncryption, true, false]
+        KMSMasterKeyId: !If [EnableEncryption, !Ref KMSKeyId, !Ref "AWS::NoValue"]
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Credential indexing and fast lookup"
+
+  # ======================================================================
+  # BLOCKCHAIN RESOURCES
+  # ======================================================================
+
+  # Managed Blockchain Network
+  BlockchainNetwork:
+    Type: AWS::ManagedBlockchain::Network
+    Properties:
+      Name: !Sub "${NetworkName}-${Environment}"
+      Framework: HYPERLEDGER_FABRIC
+      FrameworkVersion: "2.2"
+      Description: !Sub "Decentralized Identity Management Network for ${Environment}"
+      VotingPolicy:
+        ApprovalThresholdPolicy:
+          ThresholdPercentage: 50
+          ProposalDurationInHours: 24
+          ThresholdComparator: GREATER_THAN
+      MemberConfiguration:
+        Name: !Sub "${MemberName}-${Environment}"
+        Description: !Sub "Identity management organization for ${Environment}"
+        MemberFrameworkConfiguration:
+          MemberFabricConfiguration:
+            AdminUsername: !Ref AdminUsername
+            AdminPassword: !Ref AdminPassword
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Blockchain network for identity management"
+
+  # Blockchain Member
+  BlockchainMember:
+    Type: AWS::ManagedBlockchain::Member
+    Properties:
+      NetworkId: !Ref BlockchainNetwork
+      MemberConfiguration:
+        Name: !Sub "${MemberName}-${Environment}"
+        Description: !Sub "Identity management organization member for ${Environment}"
+        MemberFrameworkConfiguration:
+          MemberFabricConfiguration:
+            AdminUsername: !Ref AdminUsername
+            AdminPassword: !Ref AdminPassword
+
+  # Blockchain Peer Node
+  BlockchainPeerNode:
+    Type: AWS::ManagedBlockchain::Node
+    Properties:
+      NetworkId: !Ref BlockchainNetwork
+      MemberId: !Ref BlockchainMember
+      NodeConfiguration:
+        InstanceType: bc.t3.small
+        AvailabilityZone: !Sub "${AWS::Region}a"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Peer node for identity transactions"
+
+  # ======================================================================
+  # QLDB RESOURCES
+  # ======================================================================
+
+  # QLDB Ledger for Identity State
+  IdentityQLDBLedger:
+    Type: AWS::QLDB::Ledger
+    Properties:
+      Name: !Sub "${QLDBLedgerName}-${Environment}"
+      PermissionsMode: STANDARD
+      KmsKeyId: !If [EnableEncryption, !Ref KMSKeyId, !Ref "AWS::NoValue"]
+      DeletionProtection: !If [IsProduction, true, false]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Identity state management and fast queries"
+
+  # ======================================================================
+  # LAMBDA FUNCTIONS
+  # ======================================================================
+
+  # Identity Management Lambda Function
+  IdentityManagementLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-identity-management-${Environment}"
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt IdentityLambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      ReservedConcurrencyLimit: 10
+      Environment:
+        Variables:
+          QLDB_LEDGER_NAME: !Ref IdentityQLDBLedger
+          CREDENTIAL_TABLE_NAME: !Ref IdentityCredentialsTable
+          BLOCKCHAIN_NETWORK_ID: !Ref BlockchainNetwork
+          BLOCKCHAIN_MEMBER_ID: !Ref BlockchainMember
+          BLOCKCHAIN_NODE_ID: !Ref BlockchainPeerNode
+          ASSETS_BUCKET_NAME: !Ref BlockchainAssetsS3Bucket
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          
+          // Initialize AWS services
+          const qldb = new AWS.QLDB();
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          const managedblockchain = new AWS.ManagedBlockchain();
+          
+          exports.handler = async (event, context) => {
+              console.log('Event:', JSON.stringify(event, null, 2));
+              
+              try {
+                  const { httpMethod, path, body } = event;
+                  const requestBody = body ? JSON.parse(body) : {};
+                  
+                  // CORS headers
+                  const headers = {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                      'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                  };
+                  
+                  // Handle OPTIONS request for CORS
+                  if (httpMethod === 'OPTIONS') {
+                      return {
+                          statusCode: 200,
+                          headers: headers,
+                          body: JSON.stringify({ message: 'CORS preflight response' })
+                      };
+                  }
+                  
+                  // Route requests based on path and method
+                  if (path === '/identity' && httpMethod === 'POST') {
+                      return await handleIdentityOperation(requestBody, headers);
+                  } else if (path === '/health' && httpMethod === 'GET') {
+                      return await handleHealthCheck(headers);
+                  } else {
+                      return {
+                          statusCode: 404,
+                          headers: headers,
+                          body: JSON.stringify({ error: 'Endpoint not found' })
+                      };
+                  }
+                  
+              } catch (error) {
+                  console.error('Error:', error);
+                  return {
+                      statusCode: 500,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      body: JSON.stringify({ 
+                          error: 'Internal server error',
+                          message: error.message 
+                      })
+                  };
+              }
+          };
+          
+          async function handleIdentityOperation(requestBody, headers) {
+              const { action } = requestBody;
+              
+              switch (action) {
+                  case 'createIdentity':
+                      return await createIdentity(requestBody, headers);
+                  case 'issueCredential':
+                      return await issueCredential(requestBody, headers);
+                  case 'verifyCredential':
+                      return await verifyCredential(requestBody, headers);
+                  case 'revokeCredential':
+                      return await revokeCredential(requestBody, headers);
+                  case 'queryIdentity':
+                      return await queryIdentity(requestBody, headers);
+                  default:
+                      return {
+                          statusCode: 400,
+                          headers: headers,
+                          body: JSON.stringify({ error: `Unknown action: ${action}` })
+                      };
+              }
+          }
+          
+          async function createIdentity(requestBody, headers) {
+              const { publicKey, metadata } = requestBody;
+              
+              // Generate DID (simplified version for demo)
+              const crypto = require('crypto');
+              const did = `did:fabric:${crypto.createHash('sha256').update(publicKey).digest('hex').substring(0, 16)}`;
+              
+              const identity = {
+                  did: did,
+                  publicKey: publicKey,
+                  metadata: metadata,
+                  created: new Date().toISOString(),
+                  status: 'active',
+                  credentialCount: 0
+              };
+              
+              // Store in QLDB (simplified - in real implementation, use proper QLDB session)
+              try {
+                  console.log('Creating identity in QLDB:', did);
+                  // Note: This is a simplified implementation
+                  // In production, implement proper QLDB session management
+                  
+                  return {
+                      statusCode: 200,
+                      headers: headers,
+                      body: JSON.stringify({ 
+                          did: did,
+                          message: 'Identity created successfully',
+                          timestamp: identity.created
+                      })
+                  };
+              } catch (error) {
+                  console.error('Error creating identity:', error);
+                  return {
+                      statusCode: 500,
+                      headers: headers,
+                      body: JSON.stringify({ error: 'Failed to create identity' })
+                  };
+              }
+          }
+          
+          async function issueCredential(requestBody, headers) {
+              const { did, credentialType, claims, issuerDID } = requestBody;
+              
+              // Generate credential ID
+              const crypto = require('crypto');
+              const credentialId = crypto.randomBytes(16).toString('hex');
+              
+              const credential = {
+                  id: credentialId,
+                  type: credentialType,
+                  holder: did,
+                  issuer: issuerDID || 'did:fabric:system',
+                  claims: claims,
+                  issued: new Date().toISOString(),
+                  status: 'active'
+              };
+              
+              try {
+                  // Store in DynamoDB for indexing
+                  await dynamodb.put({
+                      TableName: process.env.CREDENTIAL_TABLE_NAME,
+                      Item: {
+                          did: did,
+                          credential_id: credentialId,
+                          credential_type: credentialType,
+                          status: 'active',
+                          issued: credential.issued,
+                          claims: JSON.stringify(claims)
+                      }
+                  }).promise();
+                  
+                  return {
+                      statusCode: 200,
+                      headers: headers,
+                      body: JSON.stringify({ 
+                          credentialId: credentialId,
+                          message: 'Credential issued successfully',
+                          timestamp: credential.issued
+                      })
+                  };
+              } catch (error) {
+                  console.error('Error issuing credential:', error);
+                  return {
+                      statusCode: 500,
+                      headers: headers,
+                      body: JSON.stringify({ error: 'Failed to issue credential' })
+                  };
+              }
+          }
+          
+          async function verifyCredential(requestBody, headers) {
+              const { credentialId } = requestBody;
+              
+              try {
+                  // Query DynamoDB for credential
+                  const result = await dynamodb.scan({
+                      TableName: process.env.CREDENTIAL_TABLE_NAME,
+                      FilterExpression: 'credential_id = :id',
+                      ExpressionAttributeValues: {
+                          ':id': credentialId
+                      }
+                  }).promise();
+                  
+                  if (result.Items.length === 0) {
+                      return {
+                          statusCode: 404,
+                          headers: headers,
+                          body: JSON.stringify({ 
+                              valid: false, 
+                              reason: 'Credential not found' 
+                          })
+                      };
+                  }
+                  
+                  const credential = result.Items[0];
+                  const isValid = credential.status === 'active';
+                  
+                  return {
+                      statusCode: 200,
+                      headers: headers,
+                      body: JSON.stringify({ 
+                          valid: isValid,
+                          credential: credential,
+                          verifiedAt: new Date().toISOString()
+                      })
+                  };
+              } catch (error) {
+                  console.error('Error verifying credential:', error);
+                  return {
+                      statusCode: 500,
+                      headers: headers,
+                      body: JSON.stringify({ error: 'Failed to verify credential' })
+                  };
+              }
+          }
+          
+          async function revokeCredential(requestBody, headers) {
+              const { credentialId, reason } = requestBody;
+              
+              try {
+                  // Update credential status in DynamoDB
+                  await dynamodb.update({
+                      TableName: process.env.CREDENTIAL_TABLE_NAME,
+                      Key: { credential_id: credentialId },
+                      UpdateExpression: 'SET #status = :status, revocation_reason = :reason, revoked_at = :timestamp',
+                      ExpressionAttributeNames: {
+                          '#status': 'status'
+                      },
+                      ExpressionAttributeValues: {
+                          ':status': 'revoked',
+                          ':reason': reason,
+                          ':timestamp': new Date().toISOString()
+                      }
+                  }).promise();
+                  
+                  return {
+                      statusCode: 200,
+                      headers: headers,
+                      body: JSON.stringify({ 
+                          success: true,
+                          message: 'Credential revoked successfully',
+                          timestamp: new Date().toISOString()
+                      })
+                  };
+              } catch (error) {
+                  console.error('Error revoking credential:', error);
+                  return {
+                      statusCode: 500,
+                      headers: headers,
+                      body: JSON.stringify({ error: 'Failed to revoke credential' })
+                  };
+              }
+          }
+          
+          async function queryIdentity(requestBody, headers) {
+              const { did } = requestBody;
+              
+              try {
+                  // Query credentials for DID
+                  const result = await dynamodb.query({
+                      TableName: process.env.CREDENTIAL_TABLE_NAME,
+                      KeyConditionExpression: 'did = :did',
+                      ExpressionAttributeValues: {
+                          ':did': did
+                      }
+                  }).promise();
+                  
+                  return {
+                      statusCode: 200,
+                      headers: headers,
+                      body: JSON.stringify({ 
+                          did: did,
+                          credentials: result.Items,
+                          count: result.Count,
+                          queriedAt: new Date().toISOString()
+                      })
+                  };
+              } catch (error) {
+                  console.error('Error querying identity:', error);
+                  return {
+                      statusCode: 500,
+                      headers: headers,
+                      body: JSON.stringify({ error: 'Failed to query identity' })
+                  };
+              }
+          }
+          
+          async function handleHealthCheck(headers) {
+              try {
+                  // Check QLDB ledger status
+                  const qldbStatus = await qldb.describeLedger({
+                      Name: process.env.QLDB_LEDGER_NAME
+                  }).promise();
+                  
+                  // Check DynamoDB table status
+                  const dynamoStatus = await dynamodb.describe({
+                      TableName: process.env.CREDENTIAL_TABLE_NAME
+                  }).promise();
+                  
+                  return {
+                      statusCode: 200,
+                      headers: headers,
+                      body: JSON.stringify({ 
+                          status: 'healthy',
+                          services: {
+                              qldb: qldbStatus.State,
+                              dynamodb: dynamoStatus.Table.TableStatus,
+                              blockchain: 'connected'
+                          },
+                          timestamp: new Date().toISOString()
+                      })
+                  };
+              } catch (error) {
+                  console.error('Health check error:', error);
+                  return {
+                      statusCode: 503,
+                      headers: headers,
+                      body: JSON.stringify({ 
+                          status: 'unhealthy',
+                          error: error.message,
+                          timestamp: new Date().toISOString()
+                      })
+                  };
+              }
+          }
+      TracingConfig:
+        Mode: Active
+      DeadLetterQueue:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Identity management operations"
+
+  # Lambda Permission for API Gateway
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IdentityManagementLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "${IdentityAPI}/*/*"
+
+  # Dead Letter Queue for Lambda
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-identity-dlq-${Environment}"
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: !If [EnableEncryption, !Ref KMSKeyId, !Ref "AWS::NoValue"]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ======================================================================
+  # API GATEWAY RESOURCES
+  # ======================================================================
+
+  # API Gateway Rest API
+  IdentityAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${ProjectName}-identity-api-${Environment}"
+      Description: "Decentralized Identity Management API"
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: "execute-api:Invoke"
+            Resource: "*"
+          - Effect: Deny
+            Principal: "*"
+            Action: "execute-api:Invoke"
+            Resource: "*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # API Gateway Account (for logging)
+  APIGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Condition: EnableLogging
+    Properties:
+      CloudWatchRoleArn: !GetAtt APIGatewayCloudWatchRole.Arn
+
+  # API Gateway Resource - /identity
+  IdentityResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref IdentityAPI
+      ParentId: !GetAtt IdentityAPI.RootResourceId
+      PathPart: "identity"
+
+  # API Gateway Resource - /health
+  HealthResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref IdentityAPI
+      ParentId: !GetAtt IdentityAPI.RootResourceId
+      PathPart: "health"
+
+  # API Gateway Method - POST /identity
+  IdentityPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref IdentityAPI
+      ResourceId: !Ref IdentityResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      RequestValidatorId: !Ref RequestValidator
+      RequestModels:
+        application/json: !Ref IdentityRequestModel
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${IdentityManagementLambda.Arn}/invocations"
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: ""
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: !Ref IdentityResponseModel
+
+  # API Gateway Method - GET /health
+  HealthGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref IdentityAPI
+      ResourceId: !Ref HealthResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${IdentityManagementLambda.Arn}/invocations"
+      MethodResponses:
+        - StatusCode: 200
+
+  # OPTIONS method for CORS - /identity
+  IdentityOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref IdentityAPI
+      ResourceId: !Ref IdentityResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+
+  # Request Validator
+  RequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      RestApiId: !Ref IdentityAPI
+      Name: !Sub "${ProjectName}-request-validator-${Environment}"
+      ValidateRequestBody: true
+      ValidateRequestParameters: true
+
+  # API Gateway Models
+  IdentityRequestModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref IdentityAPI
+      ContentType: application/json
+      Name: IdentityRequest
+      Schema:
+        $schema: "http://json-schema.org/draft-04/schema#"
+        title: "Identity Request Schema"
+        type: object
+        properties:
+          action:
+            type: string
+            enum: ["createIdentity", "issueCredential", "verifyCredential", "revokeCredential", "queryIdentity"]
+          publicKey:
+            type: string
+          metadata:
+            type: object
+          did:
+            type: string
+          credentialType:
+            type: string
+          claims:
+            type: object
+          credentialId:
+            type: string
+          reason:
+            type: string
+        required:
+          - action
+
+  IdentityResponseModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref IdentityAPI
+      ContentType: application/json
+      Name: IdentityResponse
+      Schema:
+        $schema: "http://json-schema.org/draft-04/schema#"
+        title: "Identity Response Schema"
+        type: object
+        properties:
+          success:
+            type: boolean
+          message:
+            type: string
+          data:
+            type: object
+          error:
+            type: string
+          timestamp:
+            type: string
+
+  # API Gateway Deployment
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - IdentityPostMethod
+      - HealthGetMethod
+      - IdentityOptionsMethod
+    Properties:
+      RestApiId: !Ref IdentityAPI
+      Description: !Sub "Deployment for ${Environment} environment"
+
+  # API Gateway Stage
+  APIStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref IdentityAPI
+      DeploymentId: !Ref APIDeployment
+      StageName: !Ref Environment
+      Description: !Sub "Identity API ${Environment} stage"
+      ThrottleSettings:
+        BurstLimit: 500
+        RateLimit: 100
+      AccessLogSetting: !If
+        - EnableLogging
+        - DestinationArn: !GetAtt APIAccessLogGroup.Arn
+          Format: >
+            {
+              "requestId": "$context.requestId",
+              "ip": "$context.identity.sourceIp",
+              "caller": "$context.identity.caller",
+              "user": "$context.identity.user",
+              "requestTime": "$context.requestTime",
+              "httpMethod": "$context.httpMethod",
+              "resourcePath": "$context.resourcePath",
+              "status": "$context.status",
+              "protocol": "$context.protocol",
+              "responseLength": "$context.responseLength",
+              "error": "$context.error.message",
+              "integrationError": "$context.integration.error"
+            }
+        - !Ref "AWS::NoValue"
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          LoggingLevel: !If [EnableLogging, "INFO", "OFF"]
+          DataTraceEnabled: !If [EnableLogging, true, false]
+          MetricsEnabled: true
+          ThrottlingBurstLimit: 500
+          ThrottlingRateLimit: 100
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ======================================================================
+  # CLOUDWATCH RESOURCES
+  # ======================================================================
+
+  # CloudWatch Log Group for API Gateway Access Logs
+  APIAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${ProjectName}-identity-api-${Environment}"
+      RetentionInDays: !If [IsProduction, 90, 30]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group for S3 Access Logs
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/s3/${ProjectName}-blockchain-assets-${Environment}"
+      RetentionInDays: !If [IsProduction, 90, 30]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group for Lambda
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-identity-management-${Environment}"
+      RetentionInDays: !If [IsProduction, 90, 30]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ======================================================================
+  # MONITORING AND ALERTING
+  # ======================================================================
+
+  # SNS Topic for Notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasNotificationEmail
+    Properties:
+      TopicName: !Sub "${ProjectName}-identity-notifications-${Environment}"
+      DisplayName: "Identity Management Notifications"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Subscription
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Alarm - Lambda Errors
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasNotificationEmail
+    Properties:
+      AlarmName: !Sub "${ProjectName}-lambda-errors-${Environment}"
+      AlarmDescription: "Alert when Lambda function has errors"
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IdentityManagementLambda
+      AlarmActions:
+        - !Ref NotificationTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm - API Gateway Errors
+  APIGatewayErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasNotificationEmail
+    Properties:
+      AlarmName: !Sub "${ProjectName}-api-errors-${Environment}"
+      AlarmDescription: "Alert when API Gateway has high error rate"
+      MetricName: 4XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref IdentityAPI
+        - Name: Stage
+          Value: !Ref Environment
+      AlarmActions:
+        - !Ref NotificationTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm - DynamoDB Throttles
+  DynamoDBThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasNotificationEmail
+    Properties:
+      AlarmName: !Sub "${ProjectName}-dynamodb-throttles-${Environment}"
+      AlarmDescription: "Alert when DynamoDB table is throttled"
+      MetricName: ThrottledRequests
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref IdentityCredentialsTable
+      AlarmActions:
+        - !Ref NotificationTopic
+      TreatMissingData: notBreaching
+
+# ======================================================================
+# OUTPUTS
+# ======================================================================
+
+Outputs:
+  # API Gateway Outputs
+  APIGatewayURL:
+    Description: "API Gateway endpoint URL for the Identity Management API"
+    Value: !Sub "https://${IdentityAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "${ProjectName}-api-url-${Environment}"
+
+  APIGatewayId:
+    Description: "API Gateway ID"
+    Value: !Ref IdentityAPI
+    Export:
+      Name: !Sub "${ProjectName}-api-id-${Environment}"
+
+  # Blockchain Network Outputs
+  BlockchainNetworkId:
+    Description: "Managed Blockchain Network ID"
+    Value: !Ref BlockchainNetwork
+    Export:
+      Name: !Sub "${ProjectName}-blockchain-network-id-${Environment}"
+
+  BlockchainMemberId:
+    Description: "Blockchain Member ID"
+    Value: !Ref BlockchainMember
+    Export:
+      Name: !Sub "${ProjectName}-blockchain-member-id-${Environment}"
+
+  BlockchainNodeId:
+    Description: "Blockchain Peer Node ID"
+    Value: !Ref BlockchainPeerNode
+    Export:
+      Name: !Sub "${ProjectName}-blockchain-node-id-${Environment}"
+
+  # QLDB Outputs
+  QLDBLedgerName:
+    Description: "QLDB Ledger name for identity state management"
+    Value: !Ref IdentityQLDBLedger
+    Export:
+      Name: !Sub "${ProjectName}-qldb-ledger-name-${Environment}"
+
+  QLDBLedgerArn:
+    Description: "QLDB Ledger ARN"
+    Value: !Sub "arn:aws:qldb:${AWS::Region}:${AWS::AccountId}:ledger/${IdentityQLDBLedger}"
+    Export:
+      Name: !Sub "${ProjectName}-qldb-ledger-arn-${Environment}"
+
+  # DynamoDB Outputs
+  CredentialTableName:
+    Description: "DynamoDB table name for credential indexing"
+    Value: !Ref IdentityCredentialsTable
+    Export:
+      Name: !Sub "${ProjectName}-credential-table-name-${Environment}"
+
+  CredentialTableArn:
+    Description: "DynamoDB table ARN"
+    Value: !GetAtt IdentityCredentialsTable.Arn
+    Export:
+      Name: !Sub "${ProjectName}-credential-table-arn-${Environment}"
+
+  # Storage Outputs
+  AssetsBucketName:
+    Description: "S3 bucket name for blockchain assets"
+    Value: !Ref BlockchainAssetsS3Bucket
+    Export:
+      Name: !Sub "${ProjectName}-assets-bucket-name-${Environment}"
+
+  AssetsBucketArn:
+    Description: "S3 bucket ARN for blockchain assets"
+    Value: !GetAtt BlockchainAssetsS3Bucket.Arn
+    Export:
+      Name: !Sub "${ProjectName}-assets-bucket-arn-${Environment}"
+
+  # Lambda Outputs
+  LambdaFunctionName:
+    Description: "Lambda function name for identity management"
+    Value: !Ref IdentityManagementLambda
+    Export:
+      Name: !Sub "${ProjectName}-lambda-function-name-${Environment}"
+
+  LambdaFunctionArn:
+    Description: "Lambda function ARN"
+    Value: !GetAtt IdentityManagementLambda.Arn
+    Export:
+      Name: !Sub "${ProjectName}-lambda-function-arn-${Environment}"
+
+  # Security Outputs
+  LambdaExecutionRoleArn:
+    Description: "Lambda execution role ARN"
+    Value: !GetAtt IdentityLambdaExecutionRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-lambda-role-arn-${Environment}"
+
+  # Monitoring Outputs
+  DeadLetterQueueUrl:
+    Description: "Dead Letter Queue URL for failed Lambda invocations"
+    Value: !Ref DeadLetterQueue
+    Export:
+      Name: !Sub "${ProjectName}-dlq-url-${Environment}"
+
+  # Sample API Calls
+  SampleCreateIdentityCall:
+    Description: "Sample cURL command to create a new identity"
+    Value: !Sub |
+      curl -X POST ${IdentityAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/identity \
+        -H "Content-Type: application/json" \
+        -d '{
+          "action": "createIdentity",
+          "publicKey": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...\n-----END PUBLIC KEY-----",
+          "metadata": {
+            "name": "John Doe",
+            "email": "john.doe@example.com",
+            "organization": "Example Corp"
+          }
+        }'
+
+  SampleIssueCredentialCall:
+    Description: "Sample cURL command to issue a credential"
+    Value: !Sub |
+      curl -X POST ${IdentityAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/identity \
+        -H "Content-Type: application/json" \
+        -d '{
+          "action": "issueCredential",
+          "did": "did:fabric:abc123...",
+          "credentialType": "UniversityDegree",
+          "claims": {
+            "degree": "Bachelor of Science",
+            "university": "Example University",
+            "graduationYear": 2023
+          }
+        }'
+
+  SampleVerifyCredentialCall:
+    Description: "Sample cURL command to verify a credential"
+    Value: !Sub |
+      curl -X POST ${IdentityAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/identity \
+        -H "Content-Type: application/json" \
+        -d '{
+          "action": "verifyCredential",
+          "credentialId": "credential-id-here"
+        }'
+
+  # Deployment Information
+  StackName:
+    Description: "CloudFormation stack name"
+    Value: !Ref "AWS::StackName"
+
+  Region:
+    Description: "AWS Region where the stack is deployed"
+    Value: !Ref "AWS::Region"
+
+  Environment:
+    Description: "Environment type for this deployment"
+    Value: !Ref Environment
+
+  ProjectName:
+    Description: "Project name for this deployment"
+    Value: !Ref ProjectName
+
+  DeploymentTimestamp:
+    Description: "Timestamp when the stack was created/updated"
+    Value: !Sub "${AWS::StackName}-${AWS::Region}-${Environment}"

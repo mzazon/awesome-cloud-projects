@@ -1,0 +1,857 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Real-Time Data Processing with Kinesis Data Firehose - Complete serverless streaming analytics solution with Lambda transformation, S3 storage, and OpenSearch indexing'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Stream Configuration'
+        Parameters:
+          - StreamName
+          - BufferSize
+          - BufferInterval
+      - Label:
+          default: 'Storage Configuration'
+        Parameters:
+          - S3BucketName
+          - CompressionFormat
+          - DataFormat
+      - Label:
+          default: 'Search Configuration'
+        Parameters:
+          - OpenSearchDomainName
+          - OpenSearchInstanceType
+          - OpenSearchInstanceCount
+      - Label:
+          default: 'Lambda Configuration'
+        Parameters:
+          - LambdaMemorySize
+          - LambdaTimeout
+      - Label:
+          default: 'Monitoring Configuration'
+        Parameters:
+          - EnableDetailedMonitoring
+          - AlarmEmail
+    ParameterLabels:
+      StreamName:
+        default: 'Firehose Stream Name'
+      BufferSize:
+        default: 'Buffer Size (MB)'
+      BufferInterval:
+        default: 'Buffer Interval (seconds)'
+      S3BucketName:
+        default: 'S3 Bucket Name'
+      CompressionFormat:
+        default: 'Compression Format'
+      DataFormat:
+        default: 'Data Format'
+      OpenSearchDomainName:
+        default: 'OpenSearch Domain Name'
+      OpenSearchInstanceType:
+        default: 'OpenSearch Instance Type'
+      OpenSearchInstanceCount:
+        default: 'OpenSearch Instance Count'
+      LambdaMemorySize:
+        default: 'Lambda Memory Size (MB)'
+      LambdaTimeout:
+        default: 'Lambda Timeout (seconds)'
+      EnableDetailedMonitoring:
+        default: 'Enable Detailed Monitoring'
+      AlarmEmail:
+        default: 'Alarm Email Address'
+
+Parameters:
+  StreamName:
+    Type: String
+    Default: 'realtime-data-stream'
+    Description: 'Name for the Kinesis Data Firehose delivery stream'
+    AllowedPattern: '^[a-zA-Z0-9_.-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, underscores, periods, and hyphens'
+    MaxLength: 64
+    MinLength: 1
+
+  BufferSize:
+    Type: Number
+    Default: 5
+    Description: 'Buffer size in MB for S3 delivery (1-128)'
+    MinValue: 1
+    MaxValue: 128
+
+  BufferInterval:
+    Type: Number
+    Default: 300
+    Description: 'Buffer interval in seconds for S3 delivery (60-900)'
+    MinValue: 60
+    MaxValue: 900
+
+  S3BucketName:
+    Type: String
+    Description: 'Name for the S3 bucket (leave blank to auto-generate)'
+    Default: ''
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9.-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be a valid S3 bucket name (lowercase, alphanumeric, periods, hyphens)'
+
+  CompressionFormat:
+    Type: String
+    Default: 'GZIP'
+    Description: 'Compression format for S3 storage'
+    AllowedValues:
+      - 'GZIP'
+      - 'SNAPPY'
+      - 'ZIP'
+      - 'HADOOP_SNAPPY'
+      - 'UNCOMPRESSED'
+
+  DataFormat:
+    Type: String
+    Default: 'PARQUET'
+    Description: 'Data format for S3 storage'
+    AllowedValues:
+      - 'PARQUET'
+      - 'ORC'
+      - 'JSON'
+
+  OpenSearchDomainName:
+    Type: String
+    Default: 'firehose-search'
+    Description: 'Name for the OpenSearch domain'
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must start with lowercase letter, contain only lowercase letters, numbers, and hyphens'
+    MaxLength: 28
+    MinLength: 3
+
+  OpenSearchInstanceType:
+    Type: String
+    Default: 't3.small.search'
+    Description: 'Instance type for OpenSearch cluster'
+    AllowedValues:
+      - 't3.small.search'
+      - 't3.medium.search'
+      - 'm6g.large.search'
+      - 'm6g.xlarge.search'
+      - 'c6g.large.search'
+      - 'c6g.xlarge.search'
+
+  OpenSearchInstanceCount:
+    Type: Number
+    Default: 1
+    Description: 'Number of instances in OpenSearch cluster'
+    MinValue: 1
+    MaxValue: 10
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 128
+    Description: 'Memory size for Lambda function in MB'
+    MinValue: 128
+    MaxValue: 3008
+
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    Description: 'Timeout for Lambda function in seconds'
+    MinValue: 1
+    MaxValue: 900
+
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    Description: 'Enable detailed CloudWatch monitoring and alarms'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  AlarmEmail:
+    Type: String
+    Description: 'Email address for CloudWatch alarms (optional)'
+    Default: ''
+
+Conditions:
+  CreateS3BucketName: !Equals [!Ref S3BucketName, '']
+  EnableParquetConversion: !Or [!Equals [!Ref DataFormat, 'PARQUET'], !Equals [!Ref DataFormat, 'ORC']]
+  EnableMonitoring: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  CreateSNSTopic: !And [!Condition EnableMonitoring, !Not [!Equals [!Ref AlarmEmail, '']]]
+
+Resources:
+  # S3 Bucket for data storage
+  DataBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !If
+        - CreateS3BucketName
+        - !Sub '${AWS::StackName}-firehose-data-${AWS::AccountId}'
+        - !Ref S3BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: 'Enabled'
+      LifecycleConfiguration:
+        Rules:
+          - Id: 'DeleteIncompleteMultipartUploads'
+            Status: 'Enabled'
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: 'TransitionToIA'
+            Status: 'Enabled'
+            Transitions:
+              - StorageClass: 'STANDARD_IA'
+                TransitionInDays: 30
+          - Id: 'TransitionToGlacier'
+            Status: 'Enabled'
+            Transitions:
+              - StorageClass: 'GLACIER'
+                TransitionInDays: 90
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Sub '/aws/s3/${AWS::StackName}-bucket-access'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-firehose-data-bucket'
+        - Key: 'Purpose'
+          Value: 'Kinesis Data Firehose Storage'
+
+  # IAM Role for Kinesis Data Firehose
+  FirehoseDeliveryRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-firehose-delivery-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'firehose.amazonaws.com'
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref 'AWS::AccountId'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonKinesisFirehoseServiceRolePolicy'
+      Policies:
+        - PolicyName: 'S3DeliveryPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 's3:AbortMultipartUpload'
+                  - 's3:GetBucketLocation'
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                  - 's3:ListBucketMultipartUploads'
+                  - 's3:PutObject'
+                Resource:
+                  - !Sub '${DataBucket}'
+                  - !Sub '${DataBucket}/*'
+              - Effect: 'Allow'
+                Action:
+                  - 'lambda:InvokeFunction'
+                  - 'lambda:GetFunctionConfiguration'
+                Resource: !GetAtt TransformFunction.Arn
+              - Effect: 'Allow'
+                Action:
+                  - 'es:DescribeElasticsearchDomain'
+                  - 'es:DescribeElasticsearchDomains'
+                  - 'es:DescribeElasticsearchDomainConfig'
+                  - 'es:ESHttpPost'
+                  - 'es:ESHttpPut'
+                Resource: !Sub '${OpenSearchDomain}/*'
+              - Effect: 'Allow'
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-firehose-delivery-role'
+
+  # IAM Role for Lambda function
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: 'FirehoseTransformPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+              - Effect: 'Allow'
+                Action:
+                  - 'sqs:SendMessage'
+                Resource: !GetAtt ErrorQueue.Arn
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-lambda-execution-role'
+
+  # Lambda function for data transformation
+  TransformFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-transform-function'
+      Runtime: 'python3.9'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          ERROR_QUEUE_URL: !Ref ErrorQueue
+          LOG_LEVEL: 'INFO'
+      Code:
+        ZipFile: |
+          import json
+          import base64
+          import boto3
+          import os
+          import logging
+          from datetime import datetime
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(os.getenv('LOG_LEVEL', 'INFO'))
+          
+          def lambda_handler(event, context):
+              """
+              Transform streaming data records for Kinesis Data Firehose
+              Adds processing metadata and enriches business data
+              """
+              output = []
+              
+              logger.info(f"Processing {len(event['records'])} records")
+              
+              for record in event['records']:
+                  try:
+                      # Decode the data
+                      compressed_payload = base64.b64decode(record['data'])
+                      uncompressed_payload = compressed_payload.decode('utf-8')
+                      
+                      # Parse JSON data
+                      data = json.loads(uncompressed_payload)
+                      
+                      # Add processing metadata
+                      data['processed_timestamp'] = datetime.utcnow().isoformat()
+                      data['processing_status'] = 'SUCCESS'
+                      data['lambda_request_id'] = context.aws_request_id
+                      
+                      # Business logic enrichment
+                      if 'user_id' in data:
+                          data['user_category'] = 'registered' if data['user_id'] else 'guest'
+                      
+                      if 'amount' in data:
+                          try:
+                              amount_value = float(data['amount'])
+                              data['amount_category'] = 'high' if amount_value > 100 else 'low'
+                              data['amount_tier'] = (
+                                  'premium' if amount_value > 500 else
+                                  'standard' if amount_value > 100 else
+                                  'basic'
+                              )
+                          except (ValueError, TypeError):
+                              logger.warning(f"Invalid amount value: {data.get('amount')}")
+                              data['amount_category'] = 'unknown'
+                              data['amount_tier'] = 'unknown'
+                      
+                      # Add data quality indicators
+                      data['data_quality_score'] = calculate_quality_score(data)
+                      
+                      # Convert back to JSON with newline for better parsing
+                      transformed_data = json.dumps(data, separators=(',', ':')) + '\n'
+                      
+                      output_record = {
+                          'recordId': record['recordId'],
+                          'result': 'Ok',
+                          'data': base64.b64encode(transformed_data.encode('utf-8')).decode('utf-8')
+                      }
+                      
+                      logger.debug(f"Successfully transformed record {record['recordId']}")
+                      
+                  except Exception as e:
+                      logger.error(f"Error processing record {record['recordId']}: {str(e)}")
+                      
+                      # Handle transformation errors
+                      error_data = {
+                          'recordId': record['recordId'],
+                          'error': str(e),
+                          'error_type': type(e).__name__,
+                          'original_data': uncompressed_payload,
+                          'timestamp': datetime.utcnow().isoformat(),
+                          'lambda_request_id': context.aws_request_id
+                      }
+                      
+                      output_record = {
+                          'recordId': record['recordId'],
+                          'result': 'ProcessingFailed',
+                          'data': base64.b64encode(json.dumps(error_data).encode('utf-8')).decode('utf-8')
+                      }
+                  
+                  output.append(output_record)
+              
+              successful_records = sum(1 for r in output if r['result'] == 'Ok')
+              failed_records = len(output) - successful_records
+              
+              logger.info(f"Transformation complete: {successful_records} successful, {failed_records} failed")
+              
+              return {'records': output}
+          
+          def calculate_quality_score(data):
+              """Calculate a simple data quality score based on field completeness"""
+              score = 0
+              total_fields = 0
+              
+              # Check for essential fields
+              essential_fields = ['event_id', 'timestamp', 'event_type']
+              for field in essential_fields:
+                  total_fields += 1
+                  if field in data and data[field] is not None and str(data[field]).strip():
+                      score += 1
+              
+              # Check for optional business fields
+              optional_fields = ['user_id', 'amount', 'product_id']
+              for field in optional_fields:
+                  total_fields += 1
+                  if field in data and data[field] is not None and str(data[field]).strip():
+                      score += 0.5
+              
+              return round((score / total_fields) * 100, 2) if total_fields > 0 else 0
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-transform-function'
+        - Key: 'Purpose'
+          Value: 'Kinesis Data Firehose Transformation'
+
+  # OpenSearch Domain for real-time search
+  OpenSearchDomain:
+    Type: 'AWS::OpenSearch::Domain'
+    Properties:
+      DomainName: !Sub '${OpenSearchDomainName}-${AWS::AccountId}'
+      EngineVersion: 'OpenSearch_1.3'
+      ClusterConfig:
+        InstanceType: !Ref OpenSearchInstanceType
+        InstanceCount: !Ref OpenSearchInstanceCount
+        DedicatedMasterEnabled: false
+        ZoneAwarenessEnabled: false
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: 'gp3'
+        VolumeSize: 20
+        Iops: 3000
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+        TLSSecurityPolicy: 'Policy-Min-TLS-1-2-2019-07'
+      EncryptionAtRestOptions:
+        Enabled: true
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'es:*'
+            Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${OpenSearchDomainName}-${AWS::AccountId}/*'
+          - Effect: 'Allow'
+            Principal:
+              AWS: !GetAtt FirehoseDeliveryRole.Arn
+            Action:
+              - 'es:DescribeElasticsearchDomain'
+              - 'es:DescribeElasticsearchDomains'
+              - 'es:DescribeElasticsearchDomainConfig'
+              - 'es:ESHttpPost'
+              - 'es:ESHttpPut'
+            Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${OpenSearchDomainName}-${AWS::AccountId}/*'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-opensearch-domain'
+        - Key: 'Purpose'
+          Value: 'Real-time Search and Analytics'
+
+  # SQS Queue for error handling
+  ErrorQueue:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-error-queue'
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeoutSeconds: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ErrorDeadLetterQueue.Arn
+        maxReceiveCount: 3
+      KmsMasterKeyId: 'alias/aws/sqs'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-error-queue'
+        - Key: 'Purpose'
+          Value: 'Firehose Error Handling'
+
+  # Dead Letter Queue for failed error processing
+  ErrorDeadLetterQueue:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-error-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: 'alias/aws/sqs'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-error-dlq'
+        - Key: 'Purpose'
+          Value: 'Failed Error Processing'
+
+  # Kinesis Data Firehose Delivery Stream for S3
+  FirehoseDeliveryStream:
+    Type: 'AWS::KinesisFirehose::DeliveryStream'
+    Properties:
+      DeliveryStreamName: !Sub '${StreamName}-s3'
+      DeliveryStreamType: 'DirectPut'
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt DataBucket.Arn
+        BufferingHints:
+          SizeInMBs: !Ref BufferSize
+          IntervalInSeconds: !Ref BufferInterval
+        CompressionFormat: !Ref CompressionFormat
+        DataFormatConversionConfiguration: !If
+          - EnableParquetConversion
+          - Enabled: true
+            OutputFormatConfiguration:
+              Serializer: !If
+                - !Equals [!Ref DataFormat, 'PARQUET']
+                - ParquetSerDe: {}
+                - OrcSerDe: {}
+          - !Ref 'AWS::NoValue'
+        DynamicPartitioning:
+          Enabled: true
+          RetryOptions:
+            DurationInSeconds: 3600
+        Prefix: 'transformed-data/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/'
+        ErrorOutputPrefix: 'error-data/'
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: 'Lambda'
+              Parameters:
+                - ParameterName: 'LambdaArn'
+                  ParameterValue: !GetAtt TransformFunction.Arn
+                - ParameterName: 'BufferSizeInMBs'
+                  ParameterValue: '3'
+                - ParameterName: 'BufferIntervalInSeconds'
+                  ParameterValue: '60'
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Sub '/aws/kinesisfirehose/${StreamName}-s3'
+          LogStreamName: 'S3Delivery'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-firehose-s3-stream'
+        - Key: 'Purpose'
+          Value: 'S3 Data Delivery'
+
+  # Kinesis Data Firehose Delivery Stream for OpenSearch
+  FirehoseOpenSearchStream:
+    Type: 'AWS::KinesisFirehose::DeliveryStream'
+    DependsOn: OpenSearchDomain
+    Properties:
+      DeliveryStreamName: !Sub '${StreamName}-opensearch'
+      DeliveryStreamType: 'DirectPut'
+      OpenSearchDestinationConfiguration:
+        DomainARN: !GetAtt OpenSearchDomain.DomainArn
+        IndexName: 'realtime-events'
+        TypeName: '_doc'
+        IndexRotationPeriod: 'OneDay'
+        BufferingHints:
+          SizeInMBs: 1
+          IntervalInSeconds: 60
+        RetryOptions:
+          DurationInSeconds: 3600
+        S3BackupMode: 'AllDocuments'
+        S3Configuration:
+          BucketARN: !GetAtt DataBucket.Arn
+          BufferingHints:
+            SizeInMBs: 5
+            IntervalInSeconds: 300
+          CompressionFormat: 'GZIP'
+          Prefix: 'opensearch-backup/'
+          RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: 'Lambda'
+              Parameters:
+                - ParameterName: 'LambdaArn'
+                  ParameterValue: !GetAtt TransformFunction.Arn
+                - ParameterName: 'BufferSizeInMBs'
+                  ParameterValue: '1'
+                - ParameterName: 'BufferIntervalInSeconds'
+                  ParameterValue: '60'
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Sub '/aws/kinesisfirehose/${StreamName}-opensearch'
+          LogStreamName: 'OpenSearchDelivery'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-firehose-opensearch-stream'
+        - Key: 'Purpose'
+          Value: 'OpenSearch Data Delivery'
+
+  # SNS Topic for alerts (conditional)
+  AlertTopic:
+    Type: 'AWS::SNS::Topic'
+    Condition: CreateSNSTopic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-alerts'
+      DisplayName: 'Kinesis Firehose Alerts'
+      KmsMasterKeyId: 'alias/aws/sns'
+      Subscription:
+        - Endpoint: !Ref AlarmEmail
+          Protocol: 'email'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-alerts'
+        - Key: 'Purpose'
+          Value: 'Operational Alerts'
+
+  # CloudWatch Alarms for monitoring (conditional)
+  DeliveryErrorAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-delivery-errors'
+      AlarmDescription: 'Monitor Kinesis Data Firehose delivery errors'
+      MetricName: 'DeliveryToS3.Records'
+      Namespace: 'AWS/KinesisFirehose'
+      Statistic: 'Sum'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: 'GreaterThanThreshold'
+      Dimensions:
+        - Name: 'DeliveryStreamName'
+          Value: !Ref FirehoseDeliveryStream
+      AlarmActions: !If
+        - CreateSNSTopic
+        - [!Ref AlertTopic]
+        - []
+      TreatMissingData: 'notBreaching'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-delivery-errors'
+
+  LambdaErrorAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-lambda-errors'
+      AlarmDescription: 'Monitor Lambda transformation errors'
+      MetricName: 'Errors'
+      Namespace: 'AWS/Lambda'
+      Statistic: 'Sum'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: 'GreaterThanThreshold'
+      Dimensions:
+        - Name: 'FunctionName'
+          Value: !Ref TransformFunction
+      AlarmActions: !If
+        - CreateSNSTopic
+        - [!Ref AlertTopic]
+        - []
+      TreatMissingData: 'notBreaching'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-lambda-errors'
+
+  OpenSearchDeliveryErrorAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-opensearch-delivery-errors'
+      AlarmDescription: 'Monitor OpenSearch delivery errors'
+      MetricName: 'DeliveryToOpenSearch.Records'
+      Namespace: 'AWS/KinesisFirehose'
+      Statistic: 'Sum'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: 'GreaterThanThreshold'
+      Dimensions:
+        - Name: 'DeliveryStreamName'
+          Value: !Ref FirehoseOpenSearchStream
+      AlarmActions: !If
+        - CreateSNSTopic
+        - [!Ref AlertTopic]
+        - []
+      TreatMissingData: 'notBreaching'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-opensearch-delivery-errors'
+
+  # CloudWatch Log Groups
+  S3DeliveryLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/kinesisfirehose/${StreamName}-s3'
+      RetentionInDays: 30
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-s3-delivery-logs'
+
+  OpenSearchDeliveryLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/kinesisfirehose/${StreamName}-opensearch'
+      RetentionInDays: 30
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-opensearch-delivery-logs'
+
+  LambdaLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-transform-function'
+      RetentionInDays: 30
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-lambda-logs'
+
+Outputs:
+  # Kinesis Data Firehose Streams
+  S3DeliveryStreamName:
+    Description: 'Name of the S3 Kinesis Data Firehose delivery stream'
+    Value: !Ref FirehoseDeliveryStream
+    Export:
+      Name: !Sub '${AWS::StackName}-S3DeliveryStreamName'
+
+  OpenSearchDeliveryStreamName:
+    Description: 'Name of the OpenSearch Kinesis Data Firehose delivery stream'
+    Value: !Ref FirehoseOpenSearchStream
+    Export:
+      Name: !Sub '${AWS::StackName}-OpenSearchDeliveryStreamName'
+
+  # S3 Bucket Information
+  DataBucketName:
+    Description: 'Name of the S3 bucket for data storage'
+    Value: !Ref DataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBucketName'
+
+  DataBucketArn:
+    Description: 'ARN of the S3 bucket for data storage'
+    Value: !GetAtt DataBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBucketArn'
+
+  # OpenSearch Domain Information
+  OpenSearchDomainName:
+    Description: 'Name of the OpenSearch domain'
+    Value: !Ref OpenSearchDomain
+    Export:
+      Name: !Sub '${AWS::StackName}-OpenSearchDomainName'
+
+  OpenSearchDomainEndpoint:
+    Description: 'Endpoint of the OpenSearch domain'
+    Value: !GetAtt OpenSearchDomain.DomainEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-OpenSearchDomainEndpoint'
+
+  OpenSearchDashboardsURL:
+    Description: 'URL for OpenSearch Dashboards'
+    Value: !Sub 'https://${OpenSearchDomain.DomainEndpoint}/_dashboards'
+    Export:
+      Name: !Sub '${AWS::StackName}-OpenSearchDashboardsURL'
+
+  # Lambda Function Information
+  TransformFunctionName:
+    Description: 'Name of the Lambda transformation function'
+    Value: !Ref TransformFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-TransformFunctionName'
+
+  TransformFunctionArn:
+    Description: 'ARN of the Lambda transformation function'
+    Value: !GetAtt TransformFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TransformFunctionArn'
+
+  # Error Handling
+  ErrorQueueName:
+    Description: 'Name of the SQS error queue'
+    Value: !GetAtt ErrorQueue.QueueName
+    Export:
+      Name: !Sub '${AWS::StackName}-ErrorQueueName'
+
+  ErrorQueueURL:
+    Description: 'URL of the SQS error queue'
+    Value: !Ref ErrorQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-ErrorQueueURL'
+
+  # IAM Roles
+  FirehoseDeliveryRoleArn:
+    Description: 'ARN of the Kinesis Data Firehose delivery role'
+    Value: !GetAtt FirehoseDeliveryRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FirehoseDeliveryRoleArn'
+
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  # Monitoring
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for alerts'
+    Value: !If [CreateSNSTopic, !Ref AlertTopic, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  # Testing Information
+  TestCommandS3:
+    Description: 'AWS CLI command to send test data to S3 stream'
+    Value: !Sub |
+      aws firehose put-record \
+        --delivery-stream-name ${FirehoseDeliveryStream} \
+        --record 'Data=eyJldmVudF9pZCI6InRlc3QwMDEiLCJ1c2VyX2lkIjoidXNlcjEyMyIsImV2ZW50X3R5cGUiOiJwdXJjaGFzZSIsImFtb3VudCI6MTUwLjUwLCJwcm9kdWN0X2lkIjoicHJvZDQ1NiIsInRpbWVzdGFtcCI6IjIwMjQtMDEtMTVUMTA6MzA6MDBaIn0='
+
+  TestCommandOpenSearch:
+    Description: 'AWS CLI command to send test data to OpenSearch stream'
+    Value: !Sub |
+      aws firehose put-record \
+        --delivery-stream-name ${FirehoseOpenSearchStream} \
+        --record 'Data=eyJldmVudF9pZCI6InRlc3QwMDEiLCJ1c2VyX2lkIjoidXNlcjEyMyIsImV2ZW50X3R5cGUiOiJwdXJjaGFzZSIsImFtb3VudCI6MTUwLjUwLCJwcm9kdWN0X2lkIjoicHJvZDQ1NiIsInRpbWVzdGFtcCI6IjIwMjQtMDEtMTVUMTA6MzA6MDBaIn0='
+
+  # Architecture Information
+  ArchitectureNotes:
+    Description: 'Key architectural components and data flow'
+    Value: |
+      Data Flow: Client → Kinesis Data Firehose → Lambda Transform → S3 + OpenSearch
+      Security: IAM roles with least privilege, encryption at rest and in transit
+      Monitoring: CloudWatch alarms, detailed logging, error handling with SQS
+      Scaling: Serverless auto-scaling for Lambda and Firehose
+      Cost Optimization: Lifecycle policies, compression, efficient buffering

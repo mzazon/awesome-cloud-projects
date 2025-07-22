@@ -1,0 +1,864 @@
+# Infrastructure Manager Configuration for High-Frequency Trading Risk Analytics
+# Recipe: Engineering High-Frequency Trading Risk Analytics with TPU Ironwood and Cloud Datastream
+# This configuration deploys a comprehensive real-time trading risk analytics platform
+# with ultra-low latency AI inference capabilities using Google Cloud's premium services
+
+# Import declarations for resource schemas
+imports:
+- path: deploymentmanager/projects.py
+  name: projects.py
+- path: deploymentmanager/iam.py
+  name: iam.py
+
+# Global configuration and variables
+configuration:
+  project_id: 
+    type: string
+    description: "Google Cloud Project ID for deployment"
+    required: true
+  
+  region:
+    type: string
+    description: "Primary deployment region for resources"
+    default: "us-central1"
+  
+  zone:
+    type: string
+    description: "Primary deployment zone for TPU resources"
+    default: "us-central1-a"
+  
+  environment:
+    type: string
+    description: "Environment designation (dev, staging, prod)"
+    default: "prod"
+  
+  trading_db_host:
+    type: string
+    description: "Hostname of the source trading database for Cloud Datastream"
+    required: true
+  
+  trading_db_username:
+    type: string
+    description: "Username for trading database connection"
+    required: true
+  
+  trading_db_password:
+    type: string
+    description: "Password for trading database connection (use Secret Manager in production)"
+    required: true
+
+# Resource definitions organized by functional groups
+resources:
+
+  # =============================================================================
+  # FOUNDATIONAL SERVICES AND APIs
+  # Enable required Google Cloud APIs for the trading analytics platform
+  # =============================================================================
+  
+  - name: enable-apis
+    type: deploymentmanager.v2.virtual.enabledServices
+    properties:
+      servicesToEnable:
+        - tpu.googleapis.com                    # TPU Ironwood cluster management
+        - datastream.googleapis.com             # Real-time database replication
+        - bigquery.googleapis.com               # Analytics data warehouse
+        - run.googleapis.com                    # Serverless container platform
+        - artifactregistry.googleapis.com       # Container image registry
+        - aiplatform.googleapis.com             # Vertex AI ML platform
+        - monitoring.googleapis.com             # Cloud Monitoring
+        - logging.googleapis.com                # Cloud Logging
+        - cloudbuild.googleapis.com             # Container image building
+        - storage.googleapis.com                # Object storage
+        - iam.googleapis.com                    # Identity and access management
+        - compute.googleapis.com                # Compute infrastructure
+
+  # =============================================================================
+  # STORAGE AND DATA INFRASTRUCTURE
+  # Cloud Storage bucket for model artifacts, streaming data, and analytics results
+  # =============================================================================
+
+  - name: trading-data-bucket
+    type: storage.v1.bucket
+    properties:
+      name: hft-risk-data-$(ref.random-suffix.outputs.suffix)
+      location: $(ref.configuration.region)
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      publicAccessPrevention: enforced
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90  # Delete objects older than 90 days
+              matchesStorageClass:
+                - STANDARD
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30  # Move to Nearline after 30 days
+      labels:
+        purpose: trading-risk-analytics
+        environment: $(ref.configuration.environment)
+        component: storage
+
+  # Generate random suffix for unique resource naming
+  - name: random-suffix
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/$(ref.configuration.project_id)/locations/$(ref.configuration.region)
+      function: generate-suffix
+      sourceArchiveUrl: gs://gcp-deployment-manager-examples/random-suffix.zip
+      entryPoint: generateSuffix
+      runtime: python39
+      httpsTrigger: {}
+
+  # =============================================================================
+  # BIGQUERY ANALYTICS DATA WAREHOUSE
+  # High-performance analytics infrastructure for trading data and risk metrics
+  # =============================================================================
+
+  - name: trading-analytics-dataset
+    type: bigquery.v2.dataset
+    properties:
+      datasetId: trading_analytics
+      projectId: $(ref.configuration.project_id)
+      location: $(ref.configuration.region)
+      description: "High-frequency trading risk analytics dataset with real-time data streaming"
+      defaultTableExpirationMs: 7776000000  # 90 days in milliseconds
+      labels:
+        purpose: trading-analytics
+        environment: $(ref.configuration.environment)
+        data-classification: confidential
+      access:
+        - role: OWNER
+          userByEmail: cloud-datastream@$(ref.configuration.project_id).iam.gserviceaccount.com
+        - role: WRITER
+          userByEmail: tpu-inference@$(ref.configuration.project_id).iam.gserviceaccount.com
+
+  # Trading positions table with partitioning and clustering for optimal performance
+  - name: trading-positions-table
+    type: bigquery.v2.table
+    dependsOn:
+      - trading-analytics-dataset
+    properties:
+      datasetId: $(ref.trading-analytics-dataset.datasetId)
+      projectId: $(ref.configuration.project_id)
+      tableId: trading_positions
+      description: "Real-time trading positions with risk metrics and performance analytics"
+      timePartitioning:
+        type: DAY
+        field: timestamp
+        expirationMs: 7776000000  # 90 days
+      clustering:
+        fields:
+          - symbol
+          - trader_id
+          - portfolio_id
+      schema:
+        fields:
+          - name: position_id
+            type: STRING
+            mode: REQUIRED
+            description: "Unique identifier for trading position"
+          - name: symbol
+            type: STRING
+            mode: REQUIRED
+            description: "Financial instrument symbol (e.g., AAPL, GOOGL)"
+          - name: quantity
+            type: NUMERIC
+            mode: REQUIRED
+            description: "Position quantity (positive for long, negative for short)"
+          - name: price
+            type: NUMERIC
+            mode: REQUIRED
+            description: "Current market price per unit"
+          - name: timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "Position timestamp for partitioning and time-series analysis"
+          - name: trader_id
+            type: STRING
+            mode: REQUIRED
+            description: "Trader identifier for attribution and risk monitoring"
+          - name: portfolio_id
+            type: STRING
+            mode: NULLABLE
+            description: "Portfolio identifier for grouping and risk aggregation"
+          - name: risk_score
+            type: NUMERIC
+            mode: NULLABLE
+            description: "AI-calculated risk score from TPU inference models"
+          - name: var_1d
+            type: NUMERIC
+            mode: NULLABLE
+            description: "1-day Value at Risk calculation"
+          - name: expected_shortfall
+            type: NUMERIC
+            mode: NULLABLE
+            description: "Expected Shortfall (Conditional VaR) calculation"
+          - name: created_at
+            type: TIMESTAMP
+            mode: NULLABLE
+            description: "Record creation timestamp"
+
+  # Risk metrics table for aggregated portfolio and trader-level analytics
+  - name: risk-metrics-table
+    type: bigquery.v2.table
+    dependsOn:
+      - trading-analytics-dataset
+    properties:
+      datasetId: $(ref.trading-analytics-dataset.datasetId)
+      projectId: $(ref.configuration.project_id)
+      tableId: risk_metrics
+      description: "Aggregated risk metrics and calculations for portfolios and trading desks"
+      timePartitioning:
+        type: DAY
+        field: calculation_timestamp
+        expirationMs: 31536000000  # 365 days for regulatory compliance
+      clustering:
+        fields:
+          - portfolio_id
+          - metric_type
+          - trader_id
+      schema:
+        fields:
+          - name: metric_id
+            type: STRING
+            mode: REQUIRED
+            description: "Unique identifier for risk metric calculation"
+          - name: portfolio_id
+            type: STRING
+            mode: REQUIRED
+            description: "Portfolio identifier for risk aggregation"
+          - name: trader_id
+            type: STRING
+            mode: NULLABLE
+            description: "Individual trader identifier"
+          - name: metric_type
+            type: STRING
+            mode: REQUIRED
+            description: "Type of risk metric (VaR, ES, Beta, etc.)"
+          - name: metric_value
+            type: NUMERIC
+            mode: REQUIRED
+            description: "Calculated risk metric value"
+          - name: calculation_timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "When the risk calculation was performed"
+          - name: confidence_level
+            type: NUMERIC
+            mode: NULLABLE
+            description: "Confidence level for statistical risk measures (e.g., 0.95)"
+          - name: time_horizon_days
+            type: INTEGER
+            mode: NULLABLE
+            description: "Time horizon in days for risk calculation"
+          - name: model_version
+            type: STRING
+            mode: NULLABLE
+            description: "Version of AI model used for calculation"
+          - name: created_at
+            type: TIMESTAMP
+            mode: NULLABLE
+            description: "Record creation timestamp"
+
+  # Real-time analytics view for dashboard and API consumption
+  - name: real-time-risk-view
+    type: bigquery.v2.table
+    dependsOn:
+      - trading-positions-table
+      - risk-metrics-table
+    properties:
+      datasetId: $(ref.trading-analytics-dataset.datasetId)
+      projectId: $(ref.configuration.project_id)
+      tableId: real_time_risk_dashboard
+      description: "Real-time risk dashboard view with aggregated metrics for monitoring"
+      view:
+        query: |
+          SELECT 
+            tp.portfolio_id,
+            tp.symbol,
+            tp.trader_id,
+            SUM(tp.quantity * tp.price) as position_value,
+            MAX(tp.risk_score) as max_risk_score,
+            AVG(tp.var_1d) as avg_var_1d,
+            COUNT(*) as position_count,
+            MAX(tp.timestamp) as last_update,
+            rm.metric_value as portfolio_var,
+            rm.confidence_level
+          FROM `$(ref.configuration.project_id).trading_analytics.trading_positions` tp
+          LEFT JOIN `$(ref.configuration.project_id).trading_analytics.risk_metrics` rm
+            ON tp.portfolio_id = rm.portfolio_id 
+            AND rm.metric_type = 'VaR_1D'
+            AND DATE(rm.calculation_timestamp) = CURRENT_DATE()
+          WHERE tp.timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
+          GROUP BY tp.portfolio_id, tp.symbol, tp.trader_id, rm.metric_value, rm.confidence_level
+        useLegacySql: false
+
+  # =============================================================================
+  # TPU IRONWOOD CLUSTER FOR ULTRA-LOW LATENCY AI INFERENCE
+  # Seventh-generation tensor processing unit optimized for large-scale inference
+  # =============================================================================
+
+  # Service account for TPU cluster with minimal required permissions
+  - name: tpu-service-account
+    type: iam.v1.serviceAccount
+    properties:
+      accountId: tpu-inference-sa
+      projectId: $(ref.configuration.project_id)
+      displayName: "TPU Ironwood Inference Service Account"
+      description: "Service account for TPU cluster running financial risk inference models"
+
+  # IAM bindings for TPU service account
+  - name: tpu-sa-bindings
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.configuration.project_id)
+      role: roles/ml.developer
+      member: serviceAccount:$(ref.tpu-service-account.email)
+
+  - name: tpu-bigquery-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.configuration.project_id)
+      role: roles/bigquery.dataEditor
+      member: serviceAccount:$(ref.tpu-service-account.email)
+
+  # TPU Ironwood cluster configuration for high-frequency trading inference
+  - name: ironwood-risk-tpu
+    type: gcp-types/tpu-v2:projects.locations.nodes
+    dependsOn:
+      - enable-apis
+      - tpu-service-account
+    properties:
+      parent: projects/$(ref.configuration.project_id)/locations/$(ref.configuration.zone)
+      nodeId: ironwood-risk-tpu-$(ref.random-suffix.outputs.suffix)
+      acceleratorType: v6e-256  # TPU Ironwood with 256 cores for massive parallel inference
+      runtimeVersion: tpu-vm-v4-base
+      description: "TPU Ironwood cluster for ultra-low latency financial risk inference"
+      networkConfig:
+        network: projects/$(ref.configuration.project_id)/global/networks/default
+        subnetwork: projects/$(ref.configuration.project_id)/regions/$(ref.configuration.region)/subnetworks/default
+        enableExternalIps: true
+      serviceAccount:
+        email: $(ref.tpu-service-account.email)
+        scope:
+          - https://www.googleapis.com/auth/cloud-platform
+      schedulingConfig:
+        preemptible: false  # Non-preemptible for production trading workloads
+      labels:
+        purpose: trading-risk-inference
+        environment: $(ref.configuration.environment)
+        workload-type: financial-analytics
+        cost-center: trading-operations
+      metadata:
+        startup-script: |
+          #!/bin/bash
+          # TPU initialization script for trading risk models
+          apt-get update
+          apt-get install -y python3-pip git
+          pip3 install tensorflow==2.13.0 numpy pandas google-cloud-bigquery
+          
+          # Download pre-trained financial risk models
+          mkdir -p /opt/risk-models
+          gsutil -m cp -r gs://$(ref.trading-data-bucket.name)/models/* /opt/risk-models/
+          
+          # Configure TPU for optimal inference performance
+          export TPU_NAME=$(curl -H "Metadata-Flavor: Google" \
+            http://metadata.google.internal/computeMetadata/v1/instance/attributes/tpu-name)
+          export PYTHONPATH="/opt/risk-models:$PYTHONPATH"
+          
+          # Start inference server
+          cd /opt/risk-models
+          python3 inference_server.py --tpu-name=$TPU_NAME --port=8080 &
+
+  # =============================================================================
+  # CLOUD DATASTREAM FOR REAL-TIME DATABASE REPLICATION
+  # Serverless change data capture for streaming trading data to analytics
+  # =============================================================================
+
+  # Service account for Cloud Datastream operations
+  - name: datastream-service-account
+    type: iam.v1.serviceAccount
+    properties:
+      accountId: cloud-datastream-sa
+      projectId: $(ref.configuration.project_id)
+      displayName: "Cloud Datastream Service Account"
+      description: "Service account for real-time trading database replication"
+
+  # IAM bindings for Datastream service account
+  - name: datastream-sa-bigquery-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.configuration.project_id)
+      role: roles/bigquery.dataEditor
+      member: serviceAccount:$(ref.datastream-service-account.email)
+
+  - name: datastream-sa-storage-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.configuration.project_id)
+      role: roles/storage.objectAdmin
+      member: serviceAccount:$(ref.datastream-service-account.email)
+
+  # Source connection profile for trading database
+  - name: trading-db-source-profile
+    type: gcp-types/datastream-v1:projects.locations.connectionProfiles
+    dependsOn:
+      - enable-apis
+      - datastream-service-account
+    properties:
+      parent: projects/$(ref.configuration.project_id)/locations/$(ref.configuration.region)
+      connectionProfileId: trading-db-source-$(ref.random-suffix.outputs.suffix)
+      displayName: "Trading Database Source Connection"
+      mysqlProfile:
+        hostname: $(ref.configuration.trading_db_host)
+        port: 3306
+        username: $(ref.configuration.trading_db_username)
+        password: $(ref.configuration.trading_db_password)
+        sslConfig:
+          requireSsl: true
+          caCertificate: ""  # Provide SSL certificate in production
+      labels:
+        purpose: trading-data-source
+        environment: $(ref.configuration.environment)
+        database-type: mysql
+
+  # Destination connection profile for BigQuery
+  - name: bigquery-destination-profile
+    type: gcp-types/datastream-v1:projects.locations.connectionProfiles
+    dependsOn:
+      - enable-apis
+      - trading-analytics-dataset
+    properties:
+      parent: projects/$(ref.configuration.project_id)/locations/$(ref.configuration.region)
+      connectionProfileId: bigquery-dest-$(ref.random-suffix.outputs.suffix)
+      displayName: "BigQuery Analytics Destination"
+      bigqueryProfile: {}  # Uses default service account permissions
+      labels:
+        purpose: analytics-destination
+        environment: $(ref.configuration.environment)
+        target-type: bigquery
+
+  # Private connectivity configuration for secure database access
+  - name: datastream-private-connection
+    type: gcp-types/datastream-v1:projects.locations.privateConnections
+    dependsOn:
+      - enable-apis
+    properties:
+      parent: projects/$(ref.configuration.project_id)/locations/$(ref.configuration.region)
+      privateConnectionId: trading-private-conn-$(ref.random-suffix.outputs.suffix)
+      displayName: "Private connection for trading database"
+      vpcPeeringConfig:
+        vpcName: projects/$(ref.configuration.project_id)/global/networks/default
+        subnet: "10.0.0.0/29"  # Dedicated subnet for Datastream
+
+  # Real-time streaming configuration
+  - name: trading-data-stream
+    type: gcp-types/datastream-v1:projects.locations.streams
+    dependsOn:
+      - trading-db-source-profile
+      - bigquery-destination-profile
+      - datastream-private-connection
+    properties:
+      parent: projects/$(ref.configuration.project_id)/locations/$(ref.configuration.region)
+      streamId: trading-data-stream-$(ref.random-suffix.outputs.suffix)
+      displayName: "Real-time Trading Data Stream"
+      sourceConfig:
+        sourceConnectionProfile: $(ref.trading-db-source-profile.name)
+        mysqlSourceConfig:
+          includeObjects:
+            mysqlDatabases:
+              - database: trading_prod
+                mysqlTables:
+                  - table: positions
+                    mysqlColumns:
+                      - column: position_id
+                        dataType: varchar
+                        primaryKey: true
+                      - column: symbol
+                        dataType: varchar
+                      - column: quantity
+                        dataType: decimal
+                      - column: price
+                        dataType: decimal
+                      - column: timestamp
+                        dataType: timestamp
+                      - column: trader_id
+                        dataType: varchar
+                      - column: portfolio_id
+                        dataType: varchar
+                  - table: trades
+                    mysqlColumns:
+                      - column: trade_id
+                        dataType: varchar
+                        primaryKey: true
+                      - column: symbol
+                        dataType: varchar
+                      - column: quantity
+                        dataType: decimal
+                      - column: price
+                        dataType: decimal
+                      - column: trade_time
+                        dataType: timestamp
+                      - column: trader_id
+                        dataType: varchar
+          excludeObjects: {}
+      destinationConfig:
+        destinationConnectionProfile: $(ref.bigquery-destination-profile.name)
+        bigqueryDestinationConfig:
+          singleTargetDataset:
+            datasetId: projects/$(ref.configuration.project_id)/datasets/$(ref.trading-analytics-dataset.datasetId)
+          dataFreshness: 900s  # 15-minute data freshness guarantee
+          appendOnly: false    # Allow updates and deletes for accurate position tracking
+      backfillAll: {}  # Backfill existing data
+      labels:
+        purpose: real-time-trading-replication
+        environment: $(ref.configuration.environment)
+        criticality: high
+
+  # =============================================================================
+  # CLOUD RUN API SERVICE FOR RISK ANALYTICS
+  # Serverless container platform for scalable risk calculation APIs
+  # =============================================================================
+
+  # Artifact Registry repository for container images
+  - name: risk-api-repository
+    type: gcp-types/artifactregistry-v1:projects.locations.repositories
+    dependsOn:
+      - enable-apis
+    properties:
+      parent: projects/$(ref.configuration.project_id)/locations/$(ref.configuration.region)
+      repositoryId: risk-analytics-repo
+      format: DOCKER
+      description: "Container repository for risk analytics API services"
+      labels:
+        purpose: risk-analytics-api
+        environment: $(ref.configuration.environment)
+
+  # Service account for Cloud Run services
+  - name: cloudrun-service-account
+    type: iam.v1.serviceAccount
+    properties:
+      accountId: risk-api-cloudrun-sa
+      projectId: $(ref.configuration.project_id)
+      displayName: "Cloud Run Risk Analytics Service Account"
+      description: "Service account for Cloud Run risk analytics API"
+
+  # IAM bindings for Cloud Run service account
+  - name: cloudrun-sa-ai-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.configuration.project_id)
+      role: roles/aiplatform.user
+      member: serviceAccount:$(ref.cloudrun-service-account.email)
+
+  - name: cloudrun-sa-bigquery-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.configuration.project_id)
+      role: roles/bigquery.dataViewer
+      member: serviceAccount:$(ref.cloudrun-service-account.email)
+
+  - name: cloudrun-sa-tpu-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.configuration.project_id)
+      role: roles/tpu.viewer
+      member: serviceAccount:$(ref.cloudrun-service-account.email)
+
+  # Cloud Run service for risk analytics API
+  - name: risk-analytics-api
+    type: gcp-types/run-v1:namespaces.services
+    dependsOn:
+      - cloudrun-service-account
+      - ironwood-risk-tpu
+      - trading-analytics-dataset
+    properties:
+      parent: namespaces/$(ref.configuration.project_id)
+      location: $(ref.configuration.region)
+      apiVersion: serving.knative.dev/v1
+      kind: Service
+      metadata:
+        name: risk-analytics-api-$(ref.random-suffix.outputs.suffix)
+        namespace: $(ref.configuration.project_id)
+        labels:
+          purpose: risk-analytics
+          environment: $(ref.configuration.environment)
+        annotations:
+          run.googleapis.com/client-name: infrastructure-manager
+          run.googleapis.com/ingress: all
+      spec:
+        template:
+          metadata:
+            annotations:
+              autoscaling.knative.dev/maxScale: "100"    # Scale up to 100 instances
+              autoscaling.knative.dev/minScale: "5"      # Keep 5 warm instances
+              run.googleapis.com/cpu-throttling: "false" # Always allocate CPU
+              run.googleapis.com/execution-environment: gen2
+              run.googleapis.com/vpc-access-connector: ""
+          spec:
+            serviceAccountName: $(ref.cloudrun-service-account.email)
+            containerConcurrency: 1000  # High concurrency for trading APIs
+            timeoutSeconds: 30          # 30-second timeout for complex calculations
+            containers:
+              - image: $(ref.configuration.region)-docker.pkg.dev/$(ref.configuration.project_id)/risk-analytics-repo/risk-api:latest
+                ports:
+                  - containerPort: 8080
+                    name: http1
+                resources:
+                  limits:
+                    cpu: "2"        # 2 vCPU cores for optimal performance
+                    memory: "4Gi"   # 4GB memory for complex calculations
+                env:
+                  - name: PROJECT_ID
+                    value: $(ref.configuration.project_id)
+                  - name: DATASET_ID
+                    value: $(ref.trading-analytics-dataset.datasetId)
+                  - name: TPU_ENDPOINT
+                    value: $(ref.ironwood-risk-tpu.networkEndpoints[0].ipAddress)
+                  - name: ENVIRONMENT
+                    value: $(ref.configuration.environment)
+                  - name: LOG_LEVEL
+                    value: INFO
+                readinessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8080
+                  initialDelaySeconds: 5
+                  periodSeconds: 10
+                livenessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8080
+                  initialDelaySeconds: 30
+                  periodSeconds: 30
+
+  # IAM policy for public API access (adjust for production security requirements)
+  - name: cloudrun-invoker-policy
+    type: gcp-types/run-v1:projects.locations.services.setIamPolicy
+    dependsOn:
+      - risk-analytics-api
+    properties:
+      resource: projects/$(ref.configuration.project_id)/locations/$(ref.configuration.region)/services/$(ref.risk-analytics-api.metadata.name)
+      policy:
+        bindings:
+          - role: roles/run.invoker
+            members:
+              - allUsers  # Public access - restrict in production
+      updateMask: bindings
+
+  # =============================================================================
+  # MONITORING AND ALERTING INFRASTRUCTURE
+  # Comprehensive observability for high-frequency trading systems
+  # =============================================================================
+
+  # Custom monitoring dashboard for trading analytics
+  - name: trading-analytics-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    dependsOn:
+      - enable-apis
+    properties:
+      parent: projects/$(ref.configuration.project_id)
+      displayName: "High-Frequency Trading Risk Analytics Dashboard"
+      mosaicLayout:
+        tiles:
+          - width: 6
+            height: 4
+            xPos: 0
+            yPos: 0
+            widget:
+              title: "TPU Inference Latency"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: resource.type="tpu_worker"
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_MEAN
+                timeshiftDuration: 0s
+                yAxis:
+                  label: "Latency (ms)"
+                  scale: LINEAR
+          - width: 6
+            height: 4
+            xPos: 6
+            yPos: 0
+            widget:
+              title: "API Response Times"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: resource.type="cloud_run_revision"
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_MEAN
+                timeshiftDuration: 0s
+                yAxis:
+                  label: "Response Time (ms)"
+                  scale: LINEAR
+          - width: 12
+            height: 4
+            xPos: 0
+            yPos: 4
+            widget:
+              title: "Datastream Replication Lag"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: resource.type="datastream_stream"
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_MEAN
+                timeshiftDuration: 0s
+                yAxis:
+                  label: "Lag (seconds)"
+                  scale: LINEAR
+
+  # Alert policy for TPU inference latency
+  - name: tpu-latency-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    dependsOn:
+      - enable-apis
+    properties:
+      parent: projects/$(ref.configuration.project_id)
+      displayName: "TPU Inference Latency Alert"
+      documentation:
+        content: "Alert when TPU inference latency exceeds 1ms threshold for trading operations"
+        mimeType: text/markdown
+      conditions:
+        - displayName: "TPU inference latency too high"
+          conditionThreshold:
+            filter: resource.type="tpu_worker"
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 1.0  # 1ms threshold
+            duration: 60s
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_MEAN
+                groupByFields:
+                  - resource.label.node_id
+      enabled: true
+      alertStrategy:
+        autoClose: 86400s  # Auto-close after 24 hours
+
+  # Alert policy for API response times
+  - name: api-response-time-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    dependsOn:
+      - enable-apis
+    properties:
+      parent: projects/$(ref.configuration.project_id)
+      displayName: "API Response Time Alert"
+      documentation:
+        content: "Alert when risk analytics API response times exceed 500ms"
+        mimeType: text/markdown
+      conditions:
+        - displayName: "API response time too high"
+          conditionThreshold:
+            filter: resource.type="cloud_run_revision"
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 500  # 500ms threshold
+            duration: 120s
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_MEAN
+                groupByFields:
+                  - resource.label.service_name
+      enabled: true
+      alertStrategy:
+        autoClose: 3600s  # Auto-close after 1 hour
+
+  # Log-based metric for trading system errors
+  - name: trading-error-metric
+    type: gcp-types/logging-v2:projects.metrics
+    dependsOn:
+      - enable-apis
+    properties:
+      parent: projects/$(ref.configuration.project_id)
+      metricId: trading_system_errors
+      description: "Count of errors in trading risk analytics system"
+      filter: |
+        resource.type="cloud_run_revision"
+        severity="ERROR"
+        jsonPayload.component="risk-calculation"
+      metricDescriptor:
+        metricKind: COUNTER
+        valueType: INT64
+        displayName: "Trading System Errors"
+      labelExtractors:
+        service_name: EXTRACT(resource.labels.service_name)
+        error_type: EXTRACT(jsonPayload.error_type)
+
+# =============================================================================
+# OUTPUTS FOR INTEGRATION AND VERIFICATION
+# Provide essential information for system integration and validation
+# =============================================================================
+
+outputs:
+  - name: project_id
+    value: $(ref.configuration.project_id)
+    description: "Google Cloud Project ID where resources are deployed"
+
+  - name: tpu_cluster_name
+    value: $(ref.ironwood-risk-tpu.name)
+    description: "Name of the TPU Ironwood cluster for AI inference"
+
+  - name: tpu_endpoint
+    value: $(ref.ironwood-risk-tpu.networkEndpoints[0].ipAddress)
+    description: "IP address for TPU Ironwood cluster access"
+
+  - name: datastream_name
+    value: $(ref.trading-data-stream.name)
+    description: "Name of the Cloud Datastream for real-time replication"
+
+  - name: bigquery_dataset
+    value: $(ref.trading-analytics-dataset.datasetId)
+    description: "BigQuery dataset ID for trading analytics"
+
+  - name: storage_bucket
+    value: $(ref.trading-data-bucket.name)
+    description: "Cloud Storage bucket for model artifacts and data"
+
+  - name: api_endpoint
+    value: $(ref.risk-analytics-api.status.url)
+    description: "Cloud Run API endpoint for risk analytics"
+
+  - name: dashboard_url
+    value: "https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.trading-analytics-dashboard.name)?project=$(ref.configuration.project_id)"
+    description: "URL for the monitoring dashboard"
+
+  - name: deployment_region
+    value: $(ref.configuration.region)
+    description: "Primary deployment region for all resources"
+
+  - name: estimated_monthly_cost_usd
+    value: "75000-150000"
+    description: "Estimated monthly cost in USD for premium TPU Ironwood infrastructure"
+
+# =============================================================================
+# METADATA AND LABELS
+# Consistent labeling for resource management and cost allocation
+# =============================================================================
+
+metadata:
+  purpose: high-frequency-trading-risk-analytics
+  environment: production
+  cost-center: trading-operations
+  compliance-classification: financial-services
+  data-classification: confidential
+  deployment-method: infrastructure-manager
+  recipe-version: "1.0"
+  recipe-id: f7a8b3c2
+  last-updated: "2025-07-12"

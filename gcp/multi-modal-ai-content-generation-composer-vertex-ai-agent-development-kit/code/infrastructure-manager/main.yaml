@@ -1,0 +1,514 @@
+# Infrastructure Manager Configuration for Multi-Modal AI Content Generation
+# This configuration deploys Cloud Composer, Vertex AI, Cloud Storage, and Cloud Run
+# for an intelligent content generation pipeline using Agent Development Kit
+
+metadata:
+  name: multi-modal-content-pipeline
+  description: "Multi-modal AI content generation with Cloud Composer and Vertex AI ADK"
+  labels:
+    environment: production
+    application: content-generation
+    cost-center: ai-ml
+    managed-by: infrastructure-manager
+
+# Configuration variables for customization
+variables:
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    required: true
+  
+  region:
+    description: "Primary deployment region"
+    type: string
+    default: "us-central1"
+    
+  zone:
+    description: "Primary deployment zone"
+    type: string
+    default: "us-central1-a"
+    
+  environment:
+    description: "Environment name (dev, staging, prod)"
+    type: string
+    default: "prod"
+    validation:
+      allowed_values: ["dev", "staging", "prod"]
+  
+  composer_node_count:
+    description: "Number of nodes in Cloud Composer environment"
+    type: integer
+    default: 3
+    validation:
+      min: 1
+      max: 10
+  
+  storage_retention_days:
+    description: "Content storage retention period in days"
+    type: integer
+    default: 90
+    validation:
+      min: 30
+      max: 365
+
+# Enable required Google Cloud APIs
+resources:
+  # Enable APIs required for the content generation pipeline
+  - name: enable-composer-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${var.project_id}/services/composer.googleapis.com
+    metadata:
+      dependsOn: []
+
+  - name: enable-aiplatform-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${var.project_id}/services/aiplatform.googleapis.com
+    metadata:
+      dependsOn: []
+
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${var.project_id}/services/storage.googleapis.com
+    metadata:
+      dependsOn: []
+
+  - name: enable-run-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${var.project_id}/services/run.googleapis.com
+    metadata:
+      dependsOn: []
+
+  - name: enable-cloudbuild-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${var.project_id}/services/cloudbuild.googleapis.com
+    metadata:
+      dependsOn: []
+
+  - name: enable-artifactregistry-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${var.project_id}/services/artifactregistry.googleapis.com
+    metadata:
+      dependsOn: []
+
+  # Service account for the content generation pipeline
+  - name: content-pipeline-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: content-pipeline-sa
+      displayName: "Content Pipeline Service Account"
+      description: "Service account for multi-modal content generation pipeline"
+      project: ${var.project_id}
+    metadata:
+      dependsOn:
+        - enable-composer-api
+
+  # IAM bindings for the service account
+  - name: service-account-composer-worker-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/composer.worker
+      member: serviceAccount:$(ref.content-pipeline-service-account.email)
+    metadata:
+      dependsOn:
+        - content-pipeline-service-account
+
+  - name: service-account-aiplatform-user-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/aiplatform.user
+      member: serviceAccount:$(ref.content-pipeline-service-account.email)
+    metadata:
+      dependsOn:
+        - content-pipeline-service-account
+
+  - name: service-account-storage-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/storage.admin
+      member: serviceAccount:$(ref.content-pipeline-service-account.email)
+    metadata:
+      dependsOn:
+        - content-pipeline-service-account
+
+  - name: service-account-run-invoker-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/run.invoker
+      member: serviceAccount:$(ref.content-pipeline-service-account.email)
+    metadata:
+      dependsOn:
+        - content-pipeline-service-account
+
+  # Cloud Storage bucket for content artifacts and pipeline data
+  - name: content-pipeline-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: content-pipeline-${var.project_id}-${var.environment}
+      project: ${var.project_id}
+      location: ${var.region}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: ${var.storage_retention_days}
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+      uniformBucketLevelAccess:
+        enabled: true
+      publicAccessPrevention: enforced
+      labels:
+        component: storage
+        environment: ${var.environment}
+        purpose: content-generation
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # IAM binding for bucket access
+  - name: bucket-iam-binding
+    type: gcp-types/storage-v1:buckets.iamMemberBinding
+    properties:
+      bucket: $(ref.content-pipeline-bucket.name)
+      role: roles/storage.objectAdmin
+      member: serviceAccount:$(ref.content-pipeline-service-account.email)
+    metadata:
+      dependsOn:
+        - content-pipeline-bucket
+        - content-pipeline-service-account
+
+  # Cloud Composer environment for workflow orchestration
+  - name: content-pipeline-composer-environment
+    type: gcp-types/composer-v1:projects.locations.environments
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      environmentId: multi-modal-content-pipeline-${var.environment}
+      environment:
+        name: multi-modal-content-pipeline-${var.environment}
+        config:
+          nodeCount: ${var.composer_node_count}
+          nodeConfig:
+            location: ${var.zone}
+            machineType: n1-standard-2
+            diskSizeGb: 50
+            serviceAccount: $(ref.content-pipeline-service-account.email)
+            oauthScopes:
+              - https://www.googleapis.com/auth/cloud-platform
+            tags:
+              - content-pipeline
+              - composer
+            labels:
+              component: orchestration
+              environment: ${var.environment}
+          softwareConfig:
+            imageVersion: composer-2.9.1-airflow-2.9.3
+            pythonVersion: "3"
+            airflowConfigOverrides:
+              core-dags_are_paused_at_creation: "True"
+              core-max_active_runs_per_dag: "3"
+              core-parallelism: "32"
+              core-dag_concurrency: "16"
+              scheduler-dag_dir_list_interval: "300"
+              webserver-expose_config: "True"
+            pypiPackages:
+              google-cloud-adk: ">=1.5.0"
+              google-cloud-aiplatform: ">=1.48.0"
+              google-cloud-storage: ">=2.13.0"
+              google-cloud-run: ">=0.10.0"
+              apache-airflow-providers-google: ">=10.12.0"
+              pillow: ">=10.2.0"
+              moviepy: ">=1.0.3"
+              google-generativeai: ">=0.5.0"
+            envVariables:
+              PROJECT_ID: ${var.project_id}
+              REGION: ${var.region}
+              STORAGE_BUCKET: $(ref.content-pipeline-bucket.name)
+              ENVIRONMENT: ${var.environment}
+          webServerNetworkAccessControl:
+            allowedIpRanges:
+              - value: 0.0.0.0/0
+                description: "Allow access from all IPs (configure as needed)"
+        labels:
+          component: orchestration
+          environment: ${var.environment}
+          cost-center: ai-ml
+    metadata:
+      dependsOn:
+        - enable-composer-api
+        - content-pipeline-service-account
+        - content-pipeline-bucket
+
+  # Artifact Registry repository for Cloud Run images
+  - name: content-api-repository
+    type: gcp-types/artifactregistry-v1:projects.locations.repositories
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      repositoryId: content-api-${var.environment}
+      repository:
+        format: DOCKER
+        description: "Container repository for content generation API"
+        labels:
+          component: api
+          environment: ${var.environment}
+    metadata:
+      dependsOn:
+        - enable-artifactregistry-api
+
+  # Vertex AI Agent Engine configuration for ADK deployment
+  - name: vertex-ai-agent-pool
+    type: gcp-types/aiplatform-v1:projects.locations.agentPools
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      agentPoolId: content-generation-agents-${var.environment}
+      agentPool:
+        displayName: "Content Generation Multi-Agent Pool"
+        description: "Agent pool for multi-modal content generation using ADK"
+        agentConfig:
+          maxAgents: 20
+          minAgents: 5
+          machineSpec:
+            machineType: n1-standard-4
+            acceleratorType: NVIDIA_TESLA_T4
+            acceleratorCount: 1
+        networkConfig:
+          enablePrivateServiceConnect: false
+        encryptionSpec:
+          kmsKeyName: ""
+        labels:
+          component: ai-agents
+          environment: ${var.environment}
+          framework: adk
+    metadata:
+      dependsOn:
+        - enable-aiplatform-api
+        - content-pipeline-service-account
+
+  # Cloud Run service for content generation API
+  - name: content-generation-api
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/${var.project_id}
+      location: ${var.region}
+      service:
+        apiVersion: serving.knative.dev/v1
+        kind: Service
+        metadata:
+          name: content-api-${var.environment}
+          namespace: ${var.project_id}
+          labels:
+            component: api
+            environment: ${var.environment}
+            managed-by: infrastructure-manager
+          annotations:
+            run.googleapis.com/ingress: all
+            run.googleapis.com/execution-environment: gen2
+        spec:
+          template:
+            metadata:
+              labels:
+                component: api
+                environment: ${var.environment}
+              annotations:
+                autoscaling.knative.dev/maxScale: "10"
+                autoscaling.knative.dev/minScale: "1"
+                run.googleapis.com/cpu-throttling: "false"
+                run.googleapis.com/execution-environment: gen2
+            spec:
+              serviceAccountName: $(ref.content-pipeline-service-account.email)
+              containerConcurrency: 80
+              timeoutSeconds: 600
+              containers:
+                - image: ${var.region}-docker.pkg.dev/${var.project_id}/$(ref.content-api-repository.name)/content-api:latest
+                  ports:
+                    - name: http1
+                      containerPort: 8080
+                  env:
+                    - name: PROJECT_ID
+                      value: ${var.project_id}
+                    - name: REGION
+                      value: ${var.region}
+                    - name: STORAGE_BUCKET
+                      value: $(ref.content-pipeline-bucket.name)
+                    - name: COMPOSER_ENV_NAME
+                      value: $(ref.content-pipeline-composer-environment.name)
+                    - name: ENVIRONMENT
+                      value: ${var.environment}
+                  resources:
+                    limits:
+                      cpu: "2000m"
+                      memory: "4Gi"
+                    requests:
+                      cpu: "1000m"
+                      memory: "2Gi"
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 30
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 10
+                    periodSeconds: 10
+    metadata:
+      dependsOn:
+        - enable-run-api
+        - content-pipeline-service-account
+        - content-pipeline-bucket
+        - content-api-repository
+
+  # IAM policy for public access to Cloud Run service (configure as needed)
+  - name: content-api-public-access
+    type: gcp-types/run-v1:projects.locations.services.iamMemberBinding
+    properties:
+      name: projects/${var.project_id}/locations/${var.region}/services/$(ref.content-generation-api.metadata.name)
+      role: roles/run.invoker
+      member: allUsers
+    metadata:
+      dependsOn:
+        - content-generation-api
+
+  # Cloud Monitoring dashboard for pipeline observability
+  - name: content-pipeline-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      parent: projects/${var.project_id}
+      dashboard:
+        displayName: "Multi-Modal Content Generation Pipeline - ${var.environment}"
+        mosaicLayout:
+          tiles:
+            - width: 6
+              height: 4
+              widget:
+                title: "Composer Environment Health"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: resource.type="gce_instance" AND resource.labels.instance_name=~"airflow-worker.*"
+                          aggregation:
+                            alignmentPeriod: 300s
+                            perSeriesAligner: ALIGN_MEAN
+                            crossSeriesReducer: REDUCE_MEAN
+                            groupByFields:
+                              - resource.labels.instance_name
+                  timeshiftDuration: 0s
+                  yAxis:
+                    label: "CPU Utilization"
+                    scale: LINEAR
+            - width: 6
+              height: 4
+              xPos: 6
+              widget:
+                title: "Cloud Run Service Metrics"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: resource.type="cloud_run_revision" AND resource.labels.service_name="content-api-${var.environment}"
+                          aggregation:
+                            alignmentPeriod: 300s
+                            perSeriesAligner: ALIGN_RATE
+                            crossSeriesReducer: REDUCE_SUM
+                  timeshiftDuration: 0s
+                  yAxis:
+                    label: "Request Rate"
+                    scale: LINEAR
+            - width: 12
+              height: 4
+              yPos: 4
+              widget:
+                title: "Vertex AI Agent Performance"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: resource.type="aiplatform_agent"
+                          aggregation:
+                            alignmentPeriod: 300s
+                            perSeriesAligner: ALIGN_MEAN
+                            crossSeriesReducer: REDUCE_MEAN
+                  timeshiftDuration: 0s
+                  yAxis:
+                    label: "Response Time (ms)"
+                    scale: LINEAR
+        labels:
+          component: monitoring
+          environment: ${var.environment}
+    metadata:
+      dependsOn:
+        - content-pipeline-composer-environment
+        - content-generation-api
+        - vertex-ai-agent-pool
+
+# Output values for integration and verification
+outputs:
+  composer_environment_name:
+    description: "Name of the Cloud Composer environment"
+    value: $(ref.content-pipeline-composer-environment.name)
+
+  composer_airflow_uri:
+    description: "Airflow web UI URL"
+    value: $(ref.content-pipeline-composer-environment.config.airflowUri)
+
+  composer_gcs_bucket:
+    description: "GCS bucket used by Composer for DAGs and data"
+    value: $(ref.content-pipeline-composer-environment.config.dagGcsPrefix)
+
+  storage_bucket_name:
+    description: "Cloud Storage bucket for content artifacts"
+    value: $(ref.content-pipeline-bucket.name)
+
+  storage_bucket_url:
+    description: "Cloud Storage bucket URL"
+    value: gs://$(ref.content-pipeline-bucket.name)
+
+  cloud_run_service_url:
+    description: "Cloud Run service URL for content generation API"
+    value: $(ref.content-generation-api.status.url)
+
+  service_account_email:
+    description: "Service account email for the pipeline"
+    value: $(ref.content-pipeline-service-account.email)
+
+  artifact_registry_repository:
+    description: "Artifact Registry repository for container images"
+    value: ${var.region}-docker.pkg.dev/${var.project_id}/$(ref.content-api-repository.name)
+
+  vertex_agent_pool_name:
+    description: "Vertex AI Agent Pool name for ADK deployment"
+    value: $(ref.vertex-ai-agent-pool.name)
+
+  monitoring_dashboard_url:
+    description: "Cloud Monitoring dashboard URL"
+    value: https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.content-pipeline-dashboard.name)?project=${var.project_id}
+
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${var.project_id}
+
+  region:
+    description: "Deployment region"
+    value: ${var.region}
+
+  environment:
+    description: "Environment name"
+    value: ${var.environment}

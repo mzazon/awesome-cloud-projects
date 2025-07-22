@@ -1,0 +1,852 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Real-time Recommendation System using Amazon Personalize and API Gateway - Complete infrastructure deployment'
+
+Parameters:
+  # Environment and Naming Parameters
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name for resource naming and tagging
+  
+  ProjectName:
+    Type: String
+    Default: recommendation-system
+    Description: Project name used for resource naming
+    AllowedPattern: ^[a-z0-9-]+$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+  
+  # Data Configuration Parameters
+  TrainingDataS3Key:
+    Type: String
+    Default: training-data/interactions.csv
+    Description: S3 key for training data CSV file
+  
+  MinProvisionedTPS:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 100
+    Description: Minimum provisioned transactions per second for Personalize campaign
+  
+  # Lambda Configuration Parameters
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    Description: Lambda function timeout in seconds
+  
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 3008
+    Description: Lambda function memory size in MB
+  
+  # API Gateway Configuration Parameters
+  APIGatewayStage:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: API Gateway deployment stage
+  
+  EnableDetailedMetrics:
+    Type: String
+    Default: true
+    AllowedValues: [true, false]
+    Description: Enable detailed CloudWatch metrics for API Gateway
+  
+  # Monitoring Configuration Parameters
+  EnableCloudWatchAlarms:
+    Type: String
+    Default: true
+    AllowedValues: [true, false]
+    Description: Enable CloudWatch alarms for monitoring
+  
+  AlarmNotificationEmail:
+    Type: String
+    Default: ""
+    Description: Email address for alarm notifications (optional)
+    AllowedPattern: ^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address or empty
+
+Conditions:
+  # Environment-based conditions
+  IsProduction: !Equals [!Ref Environment, prod]
+  IsNotProduction: !Not [!Equals [!Ref Environment, prod]]
+  
+  # Feature flags
+  EnableAlarmsCondition: !Equals [!Ref EnableCloudWatchAlarms, true]
+  EnableEmailNotification: !And
+    - !Condition EnableAlarmsCondition
+    - !Not [!Equals [!Ref AlarmNotificationEmail, ""]]
+  
+  EnableDetailedMetricsCondition: !Equals [!Ref EnableDetailedMetrics, true]
+
+Resources:
+  # ==========================================
+  # S3 Bucket for Training Data Storage
+  # ==========================================
+  TrainingDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-training-data-${Environment}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: PersonalizeTrainingData
+
+  # ==========================================
+  # IAM Role for Amazon Personalize
+  # ==========================================
+  PersonalizeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-personalize-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: personalize.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonPersonalizeFullAccess
+      Policies:
+        - PolicyName: S3DataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${TrainingDataBucket}/*'
+                  - !GetAtt TrainingDataBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                Resource: !GetAtt TrainingDataBucket.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ==========================================
+  # Amazon Personalize Dataset Group
+  # ==========================================
+  PersonalizeDatasetGroup:
+    Type: AWS::Personalize::DatasetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-dataset-group-${Environment}'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ==========================================
+  # Amazon Personalize Schema
+  # ==========================================
+  PersonalizeSchema:
+    Type: AWS::Personalize::Schema
+    Properties:
+      Name: !Sub '${ProjectName}-interactions-schema-${Environment}'
+      Schema: |
+        {
+          "type": "record",
+          "name": "Interactions",
+          "namespace": "com.amazonaws.personalize.schema",
+          "fields": [
+            {
+              "name": "USER_ID",
+              "type": "string"
+            },
+            {
+              "name": "ITEM_ID",
+              "type": "string"
+            },
+            {
+              "name": "TIMESTAMP",
+              "type": "long"
+            },
+            {
+              "name": "EVENT_TYPE",
+              "type": "string"
+            }
+          ],
+          "version": "1.0"
+        }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ==========================================
+  # Amazon Personalize Dataset
+  # ==========================================
+  PersonalizeDataset:
+    Type: AWS::Personalize::Dataset
+    Properties:
+      Name: !Sub '${ProjectName}-interactions-dataset-${Environment}'
+      DatasetGroupArn: !Ref PersonalizeDatasetGroup
+      DatasetType: Interactions
+      SchemaArn: !Ref PersonalizeSchema
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ==========================================
+  # Amazon Personalize Solution
+  # ==========================================
+  PersonalizeSolution:
+    Type: AWS::Personalize::Solution
+    Properties:
+      Name: !Sub '${ProjectName}-user-personalization-${Environment}'
+      DatasetGroupArn: !Ref PersonalizeDatasetGroup
+      RecipeArn: arn:aws:personalize:::recipe/aws-user-personalization
+      SolutionConfig:
+        AlgorithmHyperParameters:
+          # Optimize for real-time recommendations
+          hidden_dimension: "149"
+          bptt: "32"
+          recency_mask: "true"
+        EventValueThreshold: "0.0"
+        HpoConfig:
+          HpoObjective:
+            Type: Maximize
+            MetricName: mean_reciprocal_rank_at_25
+        AutoMLConfig:
+          MetricName: mean_reciprocal_rank_at_25
+          RecipeList:
+            - arn:aws:personalize:::recipe/aws-user-personalization
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ==========================================
+  # IAM Role for Lambda Function
+  # ==========================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: PersonalizeRuntimeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - personalize-runtime:GetRecommendations
+                  - personalize-runtime:GetPersonalizedRanking
+                Resource: !Sub 'arn:aws:personalize:${AWS::Region}:${AWS::AccountId}:campaign/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ==========================================
+  # Lambda Function for Recommendation API
+  # ==========================================
+  RecommendationLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-recommendation-api-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          CAMPAIGN_ARN: !Sub 'arn:aws:personalize:${AWS::Region}:${AWS::AccountId}:campaign/${ProjectName}-campaign-${Environment}'
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+          LOG_LEVEL: !If [IsProduction, INFO, DEBUG]
+      TracingConfig:
+        Mode: Active
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from typing import Dict, List, Any
+          
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+          
+          # Initialize AWS clients
+          personalize_runtime = boto3.client('personalize-runtime')
+          
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              Lambda handler for processing recommendation requests.
+              
+              Args:
+                  event: API Gateway event containing request data
+                  context: Lambda context object
+                  
+              Returns:
+                  API Gateway response with recommendations or error
+              """
+              try:
+                  # Log incoming request for debugging
+                  logger.info(f"Received event: {json.dumps(event, default=str)}")
+                  
+                  # Extract user ID from path parameters
+                  path_params = event.get('pathParameters', {})
+                  if not path_params or 'userId' not in path_params:
+                      return create_error_response(400, "Missing userId in path parameters")
+                  
+                  user_id = path_params['userId']
+                  
+                  # Validate user ID
+                  if not user_id or not isinstance(user_id, str):
+                      return create_error_response(400, "Invalid userId format")
+                  
+                  # Get query parameters
+                  query_params = event.get('queryStringParameters') or {}
+                  num_results = int(query_params.get('numResults', 10))
+                  
+                  # Validate num_results
+                  if num_results <= 0 or num_results > 100:
+                      return create_error_response(400, "numResults must be between 1 and 100")
+                  
+                  # Get campaign ARN from environment
+                  campaign_arn = os.environ.get('CAMPAIGN_ARN')
+                  if not campaign_arn:
+                      logger.error("CAMPAIGN_ARN environment variable not set")
+                      return create_error_response(500, "Service configuration error")
+                  
+                  # Get recommendations from Personalize
+                  logger.info(f"Requesting recommendations for user: {user_id}")
+                  response = personalize_runtime.get_recommendations(
+                      campaignArn=campaign_arn,
+                      userId=user_id,
+                      numResults=num_results
+                  )
+                  
+                  # Format response
+                  recommendations = []
+                  for item in response.get('itemList', []):
+                      recommendations.append({
+                          'itemId': item['itemId'],
+                          'score': round(float(item['score']), 4)
+                      })
+                  
+                  # Create success response
+                  return {
+                      'statusCode': 200,
+                      'headers': get_cors_headers(),
+                      'body': json.dumps({
+                          'userId': user_id,
+                          'recommendations': recommendations,
+                          'totalResults': len(recommendations),
+                          'requestId': response['ResponseMetadata']['RequestId'],
+                          'timestamp': context.aws_request_id
+                      })
+                  }
+                  
+              except personalize_runtime.exceptions.ResourceNotFoundException:
+                  logger.error(f"Campaign not found: {campaign_arn}")
+                  return create_error_response(404, "Recommendation service not available")
+                  
+              except personalize_runtime.exceptions.InvalidInputException as e:
+                  logger.error(f"Invalid input: {str(e)}")
+                  return create_error_response(400, "Invalid request parameters")
+                  
+              except Exception as e:
+                  logger.error(f"Unexpected error: {str(e)}")
+                  return create_error_response(500, "Internal server error")
+          
+          def create_error_response(status_code: int, message: str) -> Dict[str, Any]:
+              """Create standardized error response."""
+              return {
+                  'statusCode': status_code,
+                  'headers': get_cors_headers(),
+                  'body': json.dumps({
+                      'error': message,
+                      'statusCode': status_code
+                  })
+              }
+          
+          def get_cors_headers() -> Dict[str, str]:
+              """Get CORS headers for API responses."""
+              return {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Methods': 'GET, OPTIONS',
+                  'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+              }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ==========================================
+  # Lambda Function Log Group
+  # ==========================================
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${RecommendationLambdaFunction}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ==========================================
+  # API Gateway REST API
+  # ==========================================
+  RecommendationAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-recommendation-api-${Environment}'
+      Description: Real-time recommendation API powered by Amazon Personalize
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      BinaryMediaTypes:
+        - application/json
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ==========================================
+  # API Gateway Resources
+  # ==========================================
+  RecommendationsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RecommendationAPI
+      ParentId: !GetAtt RecommendationAPI.RootResourceId
+      PathPart: recommendations
+
+  UserIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RecommendationAPI
+      ParentId: !Ref RecommendationsResource
+      PathPart: '{userId}'
+
+  # ==========================================
+  # API Gateway Method (GET)
+  # ==========================================
+  GetRecommendationsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RecommendationAPI
+      ResourceId: !Ref UserIdResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.userId: true
+        method.request.querystring.numResults: false
+      RequestValidatorId: !Ref RequestValidator
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RecommendationLambdaFunction.Arn}/invocations'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: 400
+          ResponseModels:
+            application/json: Error
+        - StatusCode: 404
+          ResponseModels:
+            application/json: Error
+        - StatusCode: 500
+          ResponseModels:
+            application/json: Error
+
+  # ==========================================
+  # API Gateway OPTIONS Method (CORS)
+  # ==========================================
+  OptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RecommendationAPI
+      ResourceId: !Ref UserIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # ==========================================
+  # API Gateway Request Validator
+  # ==========================================
+  RequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      RestApiId: !Ref RecommendationAPI
+      Name: ParameterValidator
+      ValidateRequestParameters: true
+      ValidateRequestBody: false
+
+  # ==========================================
+  # API Gateway Models
+  # ==========================================
+  ErrorModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref RecommendationAPI
+      ContentType: application/json
+      Name: Error
+      Schema:
+        $schema: 'http://json-schema.org/draft-04/schema#'
+        title: Error Schema
+        type: object
+        properties:
+          error:
+            type: string
+          statusCode:
+            type: integer
+
+  # ==========================================
+  # Lambda Permission for API Gateway
+  # ==========================================
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref RecommendationLambdaFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RecommendationAPI}/*/*/*'
+
+  # ==========================================
+  # API Gateway Deployment
+  # ==========================================
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - GetRecommendationsMethod
+      - OptionsMethod
+    Properties:
+      RestApiId: !Ref RecommendationAPI
+      StageName: !Ref APIGatewayStage
+      StageDescription:
+        MetricsEnabled: !If [EnableDetailedMetricsCondition, true, false]
+        DataTraceEnabled: !If [IsNotProduction, true, false]
+        LoggingLevel: !If [IsProduction, ERROR, INFO]
+        ThrottlingBurstLimit: !If [IsProduction, 2000, 100]
+        ThrottlingRateLimit: !If [IsProduction, 1000, 50]
+        CachingEnabled: !If [IsProduction, true, false]
+        CacheTtlInSeconds: !If [IsProduction, 300, 0]
+        Variables:
+          environment: !Ref Environment
+          version: '1.0'
+
+  # ==========================================
+  # SNS Topic for Alarms (Optional)
+  # ==========================================
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnableAlarmsCondition
+    Properties:
+      TopicName: !Sub '${ProjectName}-alarms-${Environment}'
+      DisplayName: !Sub '${ProjectName} Recommendation API Alarms'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  AlarmTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: EnableEmailNotification
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AlarmTopic
+      Endpoint: !Ref AlarmNotificationEmail
+
+  # ==========================================
+  # CloudWatch Alarms
+  # ==========================================
+  APIGateway4xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlarmsCondition
+    Properties:
+      AlarmName: !Sub '${ProjectName}-api-4xx-errors-${Environment}'
+      AlarmDescription: High number of 4xx errors in recommendation API
+      MetricName: 4XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub '${ProjectName}-recommendation-api-${Environment}'
+        - Name: Stage
+          Value: !Ref APIGatewayStage
+      AlarmActions:
+        - !Ref AlarmTopic
+      TreatMissingData: notBreaching
+
+  APIGateway5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlarmsCondition
+    Properties:
+      AlarmName: !Sub '${ProjectName}-api-5xx-errors-${Environment}'
+      AlarmDescription: High number of 5xx errors in recommendation API
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub '${ProjectName}-recommendation-api-${Environment}'
+        - Name: Stage
+          Value: !Ref APIGatewayStage
+      AlarmActions:
+        - !Ref AlarmTopic
+      TreatMissingData: notBreaching
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlarmsCondition
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors-${Environment}'
+      AlarmDescription: High number of errors in recommendation Lambda function
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RecommendationLambdaFunction
+      AlarmActions:
+        - !Ref AlarmTopic
+      TreatMissingData: notBreaching
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlarmsCondition
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-duration-${Environment}'
+      AlarmDescription: High duration in recommendation Lambda function
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 15000  # 15 seconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RecommendationLambdaFunction
+      AlarmActions:
+        - !Ref AlarmTopic
+      TreatMissingData: notBreaching
+
+# ==========================================
+# Outputs
+# ==========================================
+Outputs:
+  # API Gateway Outputs
+  APIGatewayURL:
+    Description: URL of the deployed API Gateway
+    Value: !Sub 'https://${RecommendationAPI}.execute-api.${AWS::Region}.amazonaws.com/${APIGatewayStage}'
+    Export:
+      Name: !Sub '${ProjectName}-api-url-${Environment}'
+
+  APIGatewayId:
+    Description: ID of the API Gateway
+    Value: !Ref RecommendationAPI
+    Export:
+      Name: !Sub '${ProjectName}-api-id-${Environment}'
+
+  RecommendationEndpoint:
+    Description: Complete endpoint URL for getting recommendations
+    Value: !Sub 'https://${RecommendationAPI}.execute-api.${AWS::Region}.amazonaws.com/${APIGatewayStage}/recommendations/{userId}'
+    Export:
+      Name: !Sub '${ProjectName}-recommendation-endpoint-${Environment}'
+
+  # Lambda Function Outputs
+  LambdaFunctionArn:
+    Description: ARN of the recommendation Lambda function
+    Value: !GetAtt RecommendationLambdaFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-lambda-arn-${Environment}'
+
+  LambdaFunctionName:
+    Description: Name of the recommendation Lambda function
+    Value: !Ref RecommendationLambdaFunction
+    Export:
+      Name: !Sub '${ProjectName}-lambda-name-${Environment}'
+
+  # Amazon Personalize Outputs
+  DatasetGroupArn:
+    Description: ARN of the Amazon Personalize dataset group
+    Value: !Ref PersonalizeDatasetGroup
+    Export:
+      Name: !Sub '${ProjectName}-dataset-group-arn-${Environment}'
+
+  SolutionArn:
+    Description: ARN of the Amazon Personalize solution
+    Value: !Ref PersonalizeSolution
+    Export:
+      Name: !Sub '${ProjectName}-solution-arn-${Environment}'
+
+  SchemaArn:
+    Description: ARN of the Amazon Personalize schema
+    Value: !Ref PersonalizeSchema
+    Export:
+      Name: !Sub '${ProjectName}-schema-arn-${Environment}'
+
+  DatasetArn:
+    Description: ARN of the Amazon Personalize dataset
+    Value: !Ref PersonalizeDataset
+    Export:
+      Name: !Sub '${ProjectName}-dataset-arn-${Environment}'
+
+  # S3 Bucket Outputs
+  TrainingDataBucketName:
+    Description: Name of the S3 bucket for training data
+    Value: !Ref TrainingDataBucket
+    Export:
+      Name: !Sub '${ProjectName}-training-bucket-${Environment}'
+
+  TrainingDataBucketArn:
+    Description: ARN of the S3 bucket for training data
+    Value: !GetAtt TrainingDataBucket.Arn
+    Export:
+      Name: !Sub '${ProjectName}-training-bucket-arn-${Environment}'
+
+  # IAM Role Outputs
+  PersonalizeExecutionRoleArn:
+    Description: ARN of the Amazon Personalize execution role
+    Value: !GetAtt PersonalizeExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-personalize-role-arn-${Environment}'
+
+  LambdaExecutionRoleArn:
+    Description: ARN of the Lambda execution role
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-lambda-role-arn-${Environment}'
+
+  # Monitoring Outputs
+  CloudWatchLogGroupName:
+    Description: Name of the CloudWatch log group for Lambda
+    Value: !Ref LambdaLogGroup
+    Export:
+      Name: !Sub '${ProjectName}-log-group-${Environment}'
+
+  AlarmTopicArn:
+    Condition: EnableAlarmsCondition
+    Description: ARN of the SNS topic for alarms
+    Value: !Ref AlarmTopic
+    Export:
+      Name: !Sub '${ProjectName}-alarm-topic-arn-${Environment}'
+
+  # Usage Instructions
+  UsageInstructions:
+    Description: Instructions for using the recommendation API
+    Value: !Sub |
+      1. Upload training data to S3: aws s3 cp interactions.csv s3://${TrainingDataBucket}/${TrainingDataS3Key}
+      2. Create dataset import job: aws personalize create-dataset-import-job --job-name import-${Environment} --dataset-arn ${PersonalizeDataset} --data-source dataLocation=s3://${TrainingDataBucket}/${TrainingDataS3Key} --role-arn ${PersonalizeExecutionRole.Arn}
+      3. Wait for import completion, then create solution version: aws personalize create-solution-version --solution-arn ${PersonalizeSolution}
+      4. Wait for training completion, then create campaign: aws personalize create-campaign --name ${ProjectName}-campaign-${Environment} --solution-version-arn SOLUTION_VERSION_ARN --min-provisioned-tps ${MinProvisionedTPS}
+      5. Update Lambda environment variable CAMPAIGN_ARN with the campaign ARN
+      6. Test API: curl -X GET "https://${RecommendationAPI}.execute-api.${AWS::Region}.amazonaws.com/${APIGatewayStage}/recommendations/user123?numResults=10"
+
+  # Sample cURL Commands
+  SampleCurlCommands:
+    Description: Sample cURL commands for testing the API
+    Value: !Sub |
+      # Get recommendations for user123
+      curl -X GET "https://${RecommendationAPI}.execute-api.${AWS::Region}.amazonaws.com/${APIGatewayStage}/recommendations/user123?numResults=10" -H "Content-Type: application/json"
+      
+      # Get recommendations with different parameters
+      curl -X GET "https://${RecommendationAPI}.execute-api.${AWS::Region}.amazonaws.com/${APIGatewayStage}/recommendations/user456?numResults=5" -H "Content-Type: application/json"
+      
+      # Test CORS preflight
+      curl -X OPTIONS "https://${RecommendationAPI}.execute-api.${AWS::Region}.amazonaws.com/${APIGatewayStage}/recommendations/user123" -H "Access-Control-Request-Method: GET" -H "Access-Control-Request-Headers: Content-Type"

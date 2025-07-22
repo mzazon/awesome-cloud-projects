@@ -1,0 +1,744 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure Testing with TaskCat and CloudFormation - Complete testing framework deployment'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - EnvironmentName
+          - OwnerEmail
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcCidr
+          - CreateNatGateway
+          - EnableFlowLogs
+      - Label:
+          default: "Testing Infrastructure"
+        Parameters:
+          - CreateTestBucket
+          - EnableDetailedReporting
+          - TestRegions
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - KeyPairName
+          - RestrictedAccessCidr
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      EnvironmentName:
+        default: "Environment Name"
+      VpcCidr:
+        default: "VPC CIDR Block"
+      CreateNatGateway:
+        default: "Create NAT Gateway"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'taskcat-demo'
+    Description: 'Project name used for resource naming and tagging'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must start with lowercase letter, contain only lowercase letters, numbers, and hyphens'
+
+  EnvironmentName:
+    Type: String
+    Default: 'TaskCatDemo'
+    Description: 'Environment name for resource tagging and identification'
+    MinLength: 3
+    MaxLength: 30
+    AllowedPattern: '^[A-Za-z][A-Za-z0-9]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters'
+
+  OwnerEmail:
+    Type: String
+    Default: 'taskcat-demo@example.com'
+    Description: 'Owner email for resource tagging and notifications'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  VpcCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: 'CIDR block for the VPC (must be a valid /16 CIDR)'
+    AllowedPattern: '^(10|172|192)\.([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])/16$'
+    ConstraintDescription: 'Must be a valid /16 CIDR block in private IP range'
+
+  CreateNatGateway:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Create NAT Gateway for private subnet internet access'
+
+  EnableFlowLogs:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable VPC Flow Logs for network monitoring'
+
+  CreateTestBucket:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Create S3 bucket for TaskCat artifacts and test results'
+
+  EnableDetailedReporting:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable detailed CloudWatch logging and reporting'
+
+  TestRegions:
+    Type: CommaDelimitedList
+    Default: 'us-east-1,us-west-2,eu-west-1'
+    Description: 'List of regions where TaskCat will run tests'
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: 'EC2 Key Pair for TaskCat testing instances'
+
+  RestrictedAccessCidr:
+    Type: String
+    Default: '0.0.0.0/0'
+    Description: 'CIDR block allowed to access testing resources'
+    AllowedPattern: '^([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])/([0-9]|[12][0-9]|3[0-2])$'
+
+Conditions:
+  CreateNatGatewayCondition: !Equals [!Ref CreateNatGateway, 'true']
+  EnableFlowLogsCondition: !Equals [!Ref EnableFlowLogs, 'true']
+  CreateTestBucketCondition: !Equals [!Ref CreateTestBucket, 'true']
+  EnableDetailedReportingCondition: !Equals [!Ref EnableDetailedReporting, 'true']
+
+Resources:
+  # VPC and Core Network Infrastructure
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-VPC'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Owner
+          Value: !Ref OwnerEmail
+        - Key: Purpose
+          Value: 'TaskCat Infrastructure Testing'
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-IGW'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public Subnets
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-Public-Subnet-1'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Type
+          Value: 'Public'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-Public-Subnet-2'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Type
+          Value: 'Public'
+
+  # Private Subnets
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-Private-Subnet-1'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Type
+          Value: 'Private'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-Private-Subnet-2'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Type
+          Value: 'Private'
+
+  # Public Route Table
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-Public-Routes'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  # NAT Gateway Resources (Conditional)
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    Condition: CreateNatGatewayCondition
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-NAT-EIP-1'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Condition: CreateNatGatewayCondition
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-NAT-Gateway-1'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Private Route Table
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-Private-Routes-1'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Condition: CreateNatGatewayCondition
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet2
+
+  # S3 Bucket for TaskCat Artifacts
+  TaskCatArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateTestBucketCondition
+    Properties:
+      BucketName: !Sub '${ProjectName}-taskcat-artifacts-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !If [EnableDetailedReportingCondition, !Ref TaskCatLogGroup, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-TaskCat-Artifacts'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'TaskCat test artifacts and reports'
+
+  # S3 Bucket Policy for TaskCat
+  TaskCatBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateTestBucketCondition
+    Properties:
+      Bucket: !Ref TaskCatArtifactsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${TaskCatArtifactsBucket}/*'
+              - !Ref TaskCatArtifactsBucket
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: AllowTaskCatAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+              - 's3:DeleteObject'
+              - 's3:ListBucket'
+            Resource:
+              - !Sub '${TaskCatArtifactsBucket}/*'
+              - !Ref TaskCatArtifactsBucket
+
+  # IAM Role for TaskCat Testing
+  TaskCatExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-TaskCat-Execution-Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+                - lambda.amazonaws.com
+                - cloudformation.amazonaws.com
+            Action: 'sts:AssumeRole'
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Sub '${ProjectName}-taskcat'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/CloudWatchLogsFullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonS3FullAccess'
+      Policies:
+        - PolicyName: TaskCatTestingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'cloudformation:*'
+                  - 'ec2:*'
+                  - 'iam:*'
+                  - 's3:*'
+                  - 'logs:*'
+                  - 'sts:GetCallerIdentity'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'ec2:CreateKeyPair'
+                  - 'ec2:DeleteKeyPair'
+                  - 'ec2:DescribeKeyPairs'
+                Resource: '*'
+              - Effect: Deny
+                Action:
+                  - 'iam:DeleteRole'
+                  - 'iam:DetachRolePolicy'
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/*TaskCat*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-TaskCat-Role'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Security Groups for Testing Infrastructure
+  TaskCatTestSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-TaskCat-Test-SG'
+      GroupDescription: 'Security group for TaskCat testing instances and resources'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref RestrictedAccessCidr
+          Description: 'HTTP access for testing'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref RestrictedAccessCidr
+          Description: 'HTTPS access for testing'
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref RestrictedAccessCidr
+          Description: 'SSH access for testing'
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: !Ref VpcCidr
+          Description: 'ICMP within VPC'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-TaskCat-Test-SG'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Group for TaskCat Logs
+  TaskCatLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableDetailedReportingCondition
+    Properties:
+      LogGroupName: !Sub '/aws/taskcat/${ProjectName}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-TaskCat-Logs'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # VPC Flow Logs (Conditional)
+  VPCFlowLogsRole:
+    Type: AWS::IAM::Role
+    Condition: EnableFlowLogsCondition
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: flowlogsDeliveryRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                Resource: '*'
+
+  VPCFlowLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableFlowLogsCondition
+    Properties:
+      LogGroupName: !Sub '/aws/vpc/flowlogs/${ProjectName}'
+      RetentionInDays: 14
+
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    Condition: EnableFlowLogsCondition
+    Properties:
+      ResourceType: 'VPC'
+      ResourceId: !Ref VPC
+      TrafficType: 'ALL'
+      LogDestinationType: cloud-watch-logs
+      LogDestination: !GetAtt VPCFlowLogsGroup.Arn
+      DeliverLogsPermissionArn: !GetAtt VPCFlowLogsRole.Arn
+      LogFormat: '${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-VPC-FlowLogs'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Sample Test Instance for Validation
+  TaskCatTestInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
+      InstanceType: t3.micro
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref TaskCatTestSecurityGroup
+      IamInstanceProfile: !Ref TaskCatInstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y aws-cli python3 pip
+          pip3 install taskcat
+          
+          # Create TaskCat working directory
+          mkdir -p /home/ec2-user/taskcat-demo
+          chown ec2-user:ec2-user /home/ec2-user/taskcat-demo
+          
+          # Signal successful completion
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource TaskCatTestInstance --region ${AWS::Region}
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-TaskCat-Test-Instance'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'TaskCat testing and validation'
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+        Count: 1
+
+  # Instance Profile for TaskCat Test Instance
+  TaskCatInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref TaskCatExecutionRole
+
+  # Systems Manager Parameters for Configuration
+  ProjectNameParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/taskcat/${ProjectName}/project-name'
+      Type: String
+      Value: !Ref ProjectName
+      Description: 'TaskCat project name'
+      Tags:
+        Environment: !Ref EnvironmentName
+        Project: !Ref ProjectName
+
+  TestRegionsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/taskcat/${ProjectName}/test-regions'
+      Type: StringList
+      Value: !Join [',', !Ref TestRegions]
+      Description: 'List of regions for TaskCat testing'
+      Tags:
+        Environment: !Ref EnvironmentName
+        Project: !Ref ProjectName
+
+  S3BucketParameter:
+    Type: AWS::SSM::Parameter
+    Condition: CreateTestBucketCondition
+    Properties:
+      Name: !Sub '/taskcat/${ProjectName}/s3-bucket'
+      Type: String
+      Value: !Ref TaskCatArtifactsBucket
+      Description: 'S3 bucket for TaskCat artifacts'
+      Tags:
+        Environment: !Ref EnvironmentName
+        Project: !Ref ProjectName
+
+Outputs:
+  VPCId:
+    Description: 'VPC ID for TaskCat testing infrastructure'
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPC-ID'
+
+  VPCCidr:
+    Description: 'VPC CIDR block'
+    Value: !Ref VpcCidr
+    Export:
+      Name: !Sub '${AWS::StackName}-VPC-CIDR'
+
+  PublicSubnets:
+    Description: 'Comma-separated list of public subnet IDs'
+    Value: !Join [',', [!Ref PublicSubnet1, !Ref PublicSubnet2]]
+    Export:
+      Name: !Sub '${AWS::StackName}-Public-Subnets'
+
+  PrivateSubnets:
+    Description: 'Comma-separated list of private subnet IDs'
+    Value: !Join [',', [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+    Export:
+      Name: !Sub '${AWS::StackName}-Private-Subnets'
+
+  TaskCatArtifactsBucket:
+    Condition: CreateTestBucketCondition
+    Description: 'S3 bucket for TaskCat artifacts and test results'
+    Value: !Ref TaskCatArtifactsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-TaskCat-Bucket'
+
+  TaskCatExecutionRoleArn:
+    Description: 'IAM role ARN for TaskCat execution'
+    Value: !GetAtt TaskCatExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TaskCat-Role-Arn'
+
+  TaskCatSecurityGroup:
+    Description: 'Security group ID for TaskCat testing resources'
+    Value: !Ref TaskCatTestSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-TaskCat-Security-Group'
+
+  TaskCatTestInstanceId:
+    Description: 'EC2 instance ID for TaskCat testing'
+    Value: !Ref TaskCatTestInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-Test-Instance-ID'
+
+  TaskCatTestInstancePublicIP:
+    Description: 'Public IP address of TaskCat test instance'
+    Value: !GetAtt TaskCatTestInstance.PublicIp
+    Export:
+      Name: !Sub '${AWS::StackName}-Test-Instance-Public-IP'
+
+  TaskCatLogGroup:
+    Condition: EnableDetailedReportingCondition
+    Description: 'CloudWatch log group for TaskCat logs'
+    Value: !Ref TaskCatLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-TaskCat-Log-Group'
+
+  NatGatewayIP:
+    Condition: CreateNatGatewayCondition
+    Description: 'Elastic IP address of NAT Gateway'
+    Value: !Ref NatGateway1EIP
+    Export:
+      Name: !Sub '${AWS::StackName}-NAT-Gateway-IP'
+
+  ProjectConfiguration:
+    Description: 'Project configuration summary'
+    Value: !Sub |
+      Project: ${ProjectName}
+      Environment: ${EnvironmentName}
+      Region: ${AWS::Region}
+      Test Regions: ${TestRegions}
+      VPC CIDR: ${VpcCidr}
+      NAT Gateway: ${CreateNatGateway}
+      Flow Logs: ${EnableFlowLogs}
+
+  TaskCatCommands:
+    Description: 'Useful TaskCat commands for this infrastructure'
+    Value: !Sub |
+      # Validate templates
+      taskcat lint
+
+      # Run tests
+      taskcat test run --output-directory ./taskcat_outputs
+
+      # Generate reports
+      taskcat test run --output-directory ./reports --enable-sig-v2 --keep-successful
+
+      # Clean up test stacks
+      taskcat test clean --project-root .
+
+  QuickStartInstructions:
+    Description: 'Quick start instructions for using this TaskCat infrastructure'
+    Value: !Sub |
+      1. Connect to test instance: ssh -i ${KeyPairName}.pem ec2-user@${TaskCatTestInstance.PublicIp}
+      2. Create TaskCat project: mkdir -p /home/ec2-user/taskcat-demo && cd /home/ec2-user/taskcat-demo
+      3. Set up AWS CLI: aws configure
+      4. Install TaskCat: pip3 install taskcat
+      5. Create .taskcat.yml configuration file
+      6. Run tests: taskcat test run
+      7. View results in S3 bucket: ${TaskCatArtifactsBucket}

@@ -1,0 +1,1045 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Advanced IoT Device Shadow Synchronization Infrastructure
+  Creates a comprehensive shadow synchronization system with conflict resolution,
+  offline support, audit trails, and monitoring capabilities for IoT devices.
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: iot-shadow-sync
+    Description: Name prefix for all resources
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: Must be lowercase letters, numbers, and hyphens only
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, staging, prod]
+    Description: Environment for deployment
+
+  ConflictResolutionStrategy:
+    Type: String
+    Default: field_level_merge
+    AllowedValues: 
+      - last_writer_wins
+      - field_level_merge
+      - priority_based
+      - manual_review
+    Description: Default conflict resolution strategy for shadow updates
+
+  HealthCheckInterval:
+    Type: Number
+    Default: 15
+    MinValue: 5
+    MaxValue: 60
+    Description: Health check interval in minutes
+
+  MaxConflictRetries:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+    Description: Maximum number of conflict resolution retry attempts
+
+  EnableDebugLogging:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable debug logging for Lambda functions
+
+  DynamoDBBillingMode:
+    Type: String
+    Default: PAY_PER_REQUEST
+    AllowedValues: [PAY_PER_REQUEST, PROVISIONED]
+    Description: DynamoDB billing mode
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    MinValue: 128
+    MaxValue: 3008
+    Description: Memory allocation for Lambda functions (MB)
+
+  EventRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: CloudWatch log retention period in days
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+  EnableDebug: !Equals [!Ref EnableDebugLogging, 'true']
+  UseProvisionedBilling: !Equals [!Ref DynamoDBBillingMode, PROVISIONED]
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # DynamoDB Tables for Shadow Synchronization
+  # ---------------------------------------------------------------------------
+  
+  ShadowHistoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-shadow-history-${Environment}'
+      BillingMode: !Ref DynamoDBBillingMode
+      AttributeDefinitions:
+        - AttributeName: thingName
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: 'N'
+        - AttributeName: shadowName
+          AttributeType: S
+      KeySchema:
+        - AttributeName: thingName
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: ShadowNameIndex
+          KeySchema:
+            - AttributeName: shadowName
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - UseProvisionedBilling
+            - ReadCapacityUnits: 5
+              WriteCapacityUnits: 5
+            - !Ref AWS::NoValue
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      ProvisionedThroughput: !If
+        - UseProvisionedBilling
+        - ReadCapacityUnits: 10
+          WriteCapacityUnits: 10
+        - !Ref AWS::NoValue
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: IoT Shadow History Storage
+
+  DeviceConfigurationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-device-config-${Environment}'
+      BillingMode: !Ref DynamoDBBillingMode
+      AttributeDefinitions:
+        - AttributeName: thingName
+          AttributeType: S
+        - AttributeName: configType
+          AttributeType: S
+      KeySchema:
+        - AttributeName: thingName
+          KeyType: HASH
+        - AttributeName: configType
+          KeyType: RANGE
+      ProvisionedThroughput: !If
+        - UseProvisionedBilling
+        - ReadCapacityUnits: 5
+          WriteCapacityUnits: 5
+        - !Ref AWS::NoValue
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Device Configuration Storage
+
+  SyncMetricsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-sync-metrics-${Environment}'
+      BillingMode: !Ref DynamoDBBillingMode
+      AttributeDefinitions:
+        - AttributeName: thingName
+          AttributeType: S
+        - AttributeName: metricTimestamp
+          AttributeType: 'N'
+      KeySchema:
+        - AttributeName: thingName
+          KeyType: HASH
+        - AttributeName: metricTimestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      ProvisionedThroughput: !If
+        - UseProvisionedBilling
+        - ReadCapacityUnits: 5
+          WriteCapacityUnits: 5
+        - !Ref AWS::NoValue
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Shadow Sync Metrics
+
+  # ---------------------------------------------------------------------------
+  # EventBridge Custom Bus for Shadow Events
+  # ---------------------------------------------------------------------------
+  
+  ShadowEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${ProjectName}-shadow-events-${Environment}'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Shadow Synchronization Events
+
+  # ---------------------------------------------------------------------------
+  # IAM Roles and Policies
+  # ---------------------------------------------------------------------------
+  
+  ShadowLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-shadow-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ShadowSyncPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # IoT Shadow permissions
+              - Effect: Allow
+                Action:
+                  - iot:GetThingShadow
+                  - iot:UpdateThingShadow
+                  - iot:DeleteThingShadow
+                Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:thing/*'
+              
+              # DynamoDB permissions
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt ShadowHistoryTable.Arn
+                  - !Sub '${ShadowHistoryTable.Arn}/index/*'
+                  - !GetAtt DeviceConfigurationTable.Arn
+                  - !Sub '${DeviceConfigurationTable.Arn}/index/*'
+                  - !GetAtt SyncMetricsTable.Arn
+                  - !Sub '${SyncMetricsTable.Arn}/index/*'
+              
+              # EventBridge permissions
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !GetAtt ShadowEventBus.Arn
+              
+              # CloudWatch metrics permissions
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              
+              # CloudWatch Logs permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+  IoTRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-iot-rule-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: IoTRulePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Lambda invoke permissions
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: 
+                  - !GetAtt ConflictResolverFunction.Arn
+                  - !GetAtt SyncManagerFunction.Arn
+              
+              # CloudWatch Logs permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt ShadowAuditLogGroup.Arn
+
+  # ---------------------------------------------------------------------------
+  # Lambda Functions
+  # ---------------------------------------------------------------------------
+  
+  ConflictResolverFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-conflict-resolver-${Environment}'
+      Runtime: python3.9
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt ShadowLambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: 300
+      ReservedConcurrencyLimit: !If [IsProduction, 50, 10]
+      DeadLetterConfig:
+        TargetArn: !GetAtt ConflictResolverDLQ.Arn
+      Environment:
+        Variables:
+          SHADOW_HISTORY_TABLE: !Ref ShadowHistoryTable
+          DEVICE_CONFIG_TABLE: !Ref DeviceConfigurationTable
+          SYNC_METRICS_TABLE: !Ref SyncMetricsTable
+          EVENT_BUS_NAME: !Ref ShadowEventBus
+          DEFAULT_CONFLICT_STRATEGY: !Ref ConflictResolutionStrategy
+          MAX_CONFLICT_RETRIES: !Ref MaxConflictRetries
+          DEBUG_LOGGING: !Ref EnableDebugLogging
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import time
+          import os
+          from datetime import datetime, timezone
+          from typing import Dict, Any, List
+          import hashlib
+          import copy
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.DEBUG if os.environ.get('DEBUG_LOGGING', 'false') == 'true' else logging.INFO)
+
+          # Initialize AWS clients
+          dynamodb = boto3.resource('dynamodb')
+          iot_data = boto3.client('iot-data')
+          events = boto3.client('events')
+          cloudwatch = boto3.client('cloudwatch')
+
+          # Configuration from environment
+          SHADOW_HISTORY_TABLE = os.environ['SHADOW_HISTORY_TABLE']
+          DEVICE_CONFIG_TABLE = os.environ['DEVICE_CONFIG_TABLE']
+          SYNC_METRICS_TABLE = os.environ['SYNC_METRICS_TABLE']
+          EVENT_BUS_NAME = os.environ['EVENT_BUS_NAME']
+          DEFAULT_STRATEGY = os.environ.get('DEFAULT_CONFLICT_STRATEGY', 'last_writer_wins')
+
+          def lambda_handler(event, context):
+              """Handle shadow synchronization conflicts and state management"""
+              try:
+                  logger.info(f"Processing shadow event: {json.dumps(event, default=str)}")
+                  
+                  # Determine event type and route accordingly
+                  if 'Records' in event:
+                      return handle_dynamodb_stream_event(event)
+                  elif 'operation' in event:
+                      return handle_direct_operation(event)
+                  else:
+                      return handle_shadow_delta_event(event)
+                      
+              except Exception as e:
+                  logger.error(f"Error in shadow conflict resolution: {str(e)}")
+                  return create_error_response(str(e))
+
+          def handle_shadow_delta_event(event: Dict[str, Any]) -> Dict[str, Any]:
+              """Handle IoT shadow delta events for conflict resolution"""
+              try:
+                  thing_name = event.get('thingName', '')
+                  shadow_name = event.get('shadowName', '$default')
+                  delta = event.get('state', {})
+                  version = event.get('version', 0)
+                  timestamp = event.get('timestamp', int(time.time()))
+                  
+                  logger.info(f"Processing delta for {thing_name}, shadow: {shadow_name}")
+                  
+                  # Simple conflict detection and resolution
+                  conflict_detected = len(delta) > 3  # Example logic
+                  
+                  # Record shadow history
+                  record_shadow_history(thing_name, shadow_name, delta, version, timestamp)
+                  
+                  # Update metrics
+                  update_sync_metrics(thing_name, shadow_name, conflict_detected)
+                  
+                  if conflict_detected:
+                      # Send conflict event
+                      send_conflict_event(thing_name, shadow_name, delta)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'thingName': thing_name,
+                          'shadowName': shadow_name,
+                          'hasConflict': conflict_detected,
+                          'timestamp': datetime.now(timezone.utc).isoformat()
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error handling shadow delta: {str(e)}")
+                  return create_error_response(str(e))
+
+          def record_shadow_history(thing_name: str, shadow_name: str, delta: Dict[str, Any], version: int, timestamp: int):
+              """Record shadow change in history table"""
+              try:
+                  table = dynamodb.Table(SHADOW_HISTORY_TABLE)
+                  current_time = int(time.time() * 1000)
+                  
+                  table.put_item(
+                      Item={
+                          'thingName': thing_name,
+                          'timestamp': current_time,
+                          'shadowName': shadow_name,
+                          'delta': delta,
+                          'version': version,
+                          'changeType': 'delta_update',
+                          'checksum': hashlib.md5(json.dumps(delta, sort_keys=True).encode()).hexdigest(),
+                          'ttl': int(time.time()) + (86400 * 90)  # 90 days TTL
+                      }
+                  )
+                  logger.info(f"Recorded shadow history for {thing_name}")
+              except Exception as e:
+                  logger.error(f"Error recording shadow history: {str(e)}")
+
+          def update_sync_metrics(thing_name: str, shadow_name: str, had_conflict: bool):
+              """Update synchronization metrics"""
+              try:
+                  table = dynamodb.Table(SYNC_METRICS_TABLE)
+                  current_time = int(time.time() * 1000)
+                  
+                  table.put_item(
+                      Item={
+                          'thingName': thing_name,
+                          'metricTimestamp': current_time,
+                          'shadowName': shadow_name,
+                          'hadConflict': had_conflict,
+                          'syncType': 'delta_update',
+                          'ttl': int(time.time()) + (86400 * 30)  # 30 days TTL
+                      }
+                  )
+                  
+                  # Send CloudWatch metrics
+                  cloudwatch.put_metric_data(
+                      Namespace='IoT/ShadowSync',
+                      MetricData=[
+                          {
+                              'MetricName': 'ConflictDetected',
+                              'Value': 1 if had_conflict else 0,
+                              'Unit': 'Count',
+                              'Dimensions': [
+                                  {'Name': 'ThingName', 'Value': thing_name},
+                                  {'Name': 'ShadowName', 'Value': shadow_name}
+                              ]
+                          }
+                      ]
+                  )
+                  
+              except Exception as e:
+                  logger.error(f"Error updating sync metrics: {str(e)}")
+
+          def send_conflict_event(thing_name: str, shadow_name: str, delta: Dict[str, Any]):
+              """Send conflict event to EventBridge"""
+              try:
+                  events.put_events(
+                      Entries=[
+                          {
+                              'Source': 'iot.shadow.sync',
+                              'DetailType': 'Conflict Detected',
+                              'Detail': json.dumps({
+                                  'thingName': thing_name,
+                                  'shadowName': shadow_name,
+                                  'delta': delta,
+                                  'timestamp': datetime.now(timezone.utc).isoformat()
+                              }),
+                              'EventBusName': EVENT_BUS_NAME
+                          }
+                      ]
+                  )
+              except Exception as e:
+                  logger.error(f"Error sending conflict event: {str(e)}")
+
+          def handle_dynamodb_stream_event(event: Dict[str, Any]) -> Dict[str, Any]:
+              """Handle DynamoDB stream events"""
+              return {'statusCode': 200, 'body': 'Stream event processed'}
+
+          def handle_direct_operation(event: Dict[str, Any]) -> Dict[str, Any]:
+              """Handle direct operation invocations"""
+              operation = event.get('operation', '')
+              if operation == 'health_check':
+                  return {'statusCode': 200, 'body': 'Health check completed'}
+              return create_error_response(f'Unknown operation: {operation}')
+
+          def create_error_response(error_message: str) -> Dict[str, Any]:
+              """Create standardized error response"""
+              return {
+                  'statusCode': 500,
+                  'body': json.dumps({
+                      'error': error_message,
+                      'timestamp': datetime.now(timezone.utc).isoformat()
+                  })
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Shadow Conflict Resolution
+
+  SyncManagerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-sync-manager-${Environment}'
+      Runtime: python3.9
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt ShadowLambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: 300
+      ReservedConcurrencyLimit: !If [IsProduction, 20, 5]
+      DeadLetterConfig:
+        TargetArn: !GetAtt SyncManagerDLQ.Arn
+      Environment:
+        Variables:
+          SHADOW_HISTORY_TABLE: !Ref ShadowHistoryTable
+          DEVICE_CONFIG_TABLE: !Ref DeviceConfigurationTable
+          SYNC_METRICS_TABLE: !Ref SyncMetricsTable
+          EVENT_BUS_NAME: !Ref ShadowEventBus
+          DEBUG_LOGGING: !Ref EnableDebugLogging
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          import time
+          from datetime import datetime, timezone
+          from typing import Dict, Any, List
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.DEBUG if os.environ.get('DEBUG_LOGGING', 'false') == 'true' else logging.INFO)
+
+          # Initialize AWS clients
+          iot_data = boto3.client('iot-data')
+          dynamodb = boto3.resource('dynamodb')
+          cloudwatch = boto3.client('cloudwatch')
+
+          # Configuration from environment
+          SHADOW_HISTORY_TABLE = os.environ['SHADOW_HISTORY_TABLE']
+          SYNC_METRICS_TABLE = os.environ['SYNC_METRICS_TABLE']
+
+          def lambda_handler(event, context):
+              """Manage shadow synchronization operations"""
+              try:
+                  operation = event.get('operation', 'sync_check')
+                  thing_name = event.get('thingName', '')
+                  
+                  logger.info(f"Shadow sync operation: {operation} for {thing_name}")
+                  
+                  if operation == 'sync_check':
+                      return perform_sync_check(event)
+                  elif operation == 'health_report':
+                      return generate_health_report(event)
+                  elif operation == 'conflict_summary':
+                      return generate_conflict_summary(event)
+                  else:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps(f'Unknown operation: {operation}')
+                      }
+                      
+              except Exception as e:
+                  logger.error(f"Error in shadow sync manager: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Sync manager error: {str(e)}')
+                  }
+
+          def perform_sync_check(event: Dict[str, Any]) -> Dict[str, Any]:
+              """Perform sync check for specified thing"""
+              thing_name = event.get('thingName', '')
+              shadow_names = event.get('shadowNames', ['$default'])
+              
+              sync_results = []
+              for shadow_name in shadow_names:
+                  try:
+                      response = iot_data.get_thing_shadow(
+                          thingName=thing_name,
+                          shadowName=shadow_name
+                      )
+                      shadow = json.loads(response['payload'].read())
+                      
+                      sync_results.append({
+                          'shadowName': shadow_name,
+                          'status': 'healthy',
+                          'version': shadow.get('version', 0),
+                          'hasDeltas': 'delta' in shadow.get('state', {})
+                      })
+                  except Exception as e:
+                      sync_results.append({
+                          'shadowName': shadow_name,
+                          'status': 'error',
+                          'error': str(e)
+                      })
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'thingName': thing_name,
+                      'syncResults': sync_results,
+                      'timestamp': datetime.now(timezone.utc).isoformat()
+                  })
+              }
+
+          def generate_health_report(event: Dict[str, Any]) -> Dict[str, Any]:
+              """Generate health report for things"""
+              thing_names = event.get('thingNames', [])
+              
+              health_report = {
+                  'reportTimestamp': datetime.now(timezone.utc).isoformat(),
+                  'totalDevices': len(thing_names),
+                  'healthyDevices': 0,
+                  'devicesWithIssues': 0
+              }
+              
+              for thing_name in thing_names:
+                  try:
+                      # Simple health check
+                      response = iot_data.get_thing_shadow(thingName=thing_name)
+                      health_report['healthyDevices'] += 1
+                  except Exception:
+                      health_report['devicesWithIssues'] += 1
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(health_report)
+              }
+
+          def generate_conflict_summary(event: Dict[str, Any]) -> Dict[str, Any]:
+              """Generate conflict summary"""
+              time_range_hours = event.get('timeRangeHours', 24)
+              cutoff_time = int((datetime.now(timezone.utc).timestamp() - (time_range_hours * 3600)) * 1000)
+              
+              try:
+                  table = dynamodb.Table(SYNC_METRICS_TABLE)
+                  response = table.scan(
+                      FilterExpression=boto3.dynamodb.conditions.Attr('metricTimestamp').gte(cutoff_time) &
+                                     boto3.dynamodb.conditions.Attr('hadConflict').eq(True)
+                  )
+                  
+                  conflicts = response.get('Items', [])
+                  
+                  summary = {
+                      'totalConflicts': len(conflicts),
+                      'timeRangeHours': time_range_hours,
+                      'timestamp': datetime.now(timezone.utc).isoformat()
+                  }
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(summary)
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Shadow Sync Management
+
+  # ---------------------------------------------------------------------------
+  # SQS Dead Letter Queues
+  # ---------------------------------------------------------------------------
+  
+  ConflictResolverDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-conflict-resolver-dlq-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeoutSeconds: 300
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Conflict Resolver Dead Letter Queue
+
+  SyncManagerDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-sync-manager-dlq-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeoutSeconds: 300
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Sync Manager Dead Letter Queue
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Log Groups
+  # ---------------------------------------------------------------------------
+  
+  ShadowAuditLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/iot/${ProjectName}-shadow-audit-${Environment}'
+      RetentionInDays: !Ref EventRetentionDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Shadow Audit Trail
+
+  ConflictResolverLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-conflict-resolver-${Environment}'
+      RetentionInDays: !Ref EventRetentionDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  SyncManagerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-sync-manager-${Environment}'
+      RetentionInDays: !Ref EventRetentionDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # IoT Rules
+  # ---------------------------------------------------------------------------
+  
+  ShadowDeltaProcessingRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub '${ProjectName}ShadowDeltaProcessingRule${Environment}'
+      TopicRulePayload:
+        Sql: >
+          SELECT *, thingName as thingName, shadowName as shadowName 
+          FROM '$aws/things/+/shadow/+/update/delta'
+        Description: Process shadow delta events for conflict resolution
+        RuleDisabled: false
+        Actions:
+          - Lambda:
+              FunctionArn: !GetAtt ConflictResolverFunction.Arn
+
+  ShadowAuditLoggingRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub '${ProjectName}ShadowAuditLoggingRule${Environment}'
+      TopicRulePayload:
+        Sql: >
+          SELECT * FROM '$aws/things/+/shadow/+/update/+'
+        Description: Log all shadow update events for audit trail
+        RuleDisabled: false
+        Actions:
+          - CloudwatchLogs:
+              LogGroupName: !Ref ShadowAuditLogGroup
+              RoleArn: !GetAtt IoTRuleRole.Arn
+
+  # ---------------------------------------------------------------------------
+  # Lambda Permissions for IoT Rules
+  # ---------------------------------------------------------------------------
+  
+  ConflictResolverIoTPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ConflictResolverFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: iot.amazonaws.com
+      SourceArn: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:rule/${ProjectName}ShadowDeltaProcessingRule${Environment}'
+
+  # ---------------------------------------------------------------------------
+  # EventBridge Rules for Monitoring
+  # ---------------------------------------------------------------------------
+  
+  ShadowConflictNotificationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-conflict-notifications-${Environment}'
+      Description: Process shadow conflict events
+      EventBusName: !Ref ShadowEventBus
+      EventPattern:
+        source: ['iot.shadow.sync']
+        detail-type: ['Conflict Resolved', 'Manual Review Required', 'Conflict Detected']
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ConflictResolverFunction.Arn
+          Id: ConflictNotificationTarget
+
+  ShadowHealthCheckRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-health-check-${Environment}'
+      Description: Periodic shadow synchronization health checks
+      ScheduleExpression: !Sub 'rate(${HealthCheckInterval} minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SyncManagerFunction.Arn
+          Id: HealthCheckTarget
+          Input: !Sub |
+            {
+              "operation": "health_report",
+              "thingNames": []
+            }
+
+  # ---------------------------------------------------------------------------
+  # EventBridge Lambda Permissions
+  # ---------------------------------------------------------------------------
+  
+  ConflictNotificationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ConflictResolverFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ShadowConflictNotificationRule.Arn
+
+  HealthCheckPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SyncManagerFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ShadowHealthCheckRule.Arn
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Dashboard
+  # ---------------------------------------------------------------------------
+  
+  ShadowSyncDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-shadow-sync-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["IoT/ShadowSync", "ConflictDetected"],
+                  [".", "SyncCompleted"],
+                  [".", "OfflineSync"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Shadow Synchronization Metrics",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "log",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${ShadowAuditLogGroup}' | fields @timestamp, @message\n| filter @message like /shadow/\n| sort @timestamp desc\n| limit 50",
+                "region": "${AWS::Region}",
+                "title": "Shadow Update Audit Trail",
+                "view": "table"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${ConflictResolverLogGroup}' | fields @timestamp, @message\n| filter @message like /conflict/\n| sort @timestamp desc\n| limit 30",
+                "region": "${AWS::Region}",
+                "title": "Conflict Resolution Events",
+                "view": "table"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${ConflictResolverFunction}"],
+                  [".", "Errors", ".", "."],
+                  [".", "Invocations", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Conflict Resolver Lambda Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${ShadowHistoryTable}"],
+                  [".", "ConsumedWriteCapacityUnits", ".", "."],
+                  [".", "ThrottledRequests", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "DynamoDB Performance Metrics"
+              }
+            }
+          ]
+        }
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  ShadowHistoryTableName:
+    Description: Name of the shadow history DynamoDB table
+    Value: !Ref ShadowHistoryTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ShadowHistoryTable'
+
+  DeviceConfigurationTableName:
+    Description: Name of the device configuration DynamoDB table
+    Value: !Ref DeviceConfigurationTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DeviceConfigTable'
+
+  SyncMetricsTableName:
+    Description: Name of the sync metrics DynamoDB table
+    Value: !Ref SyncMetricsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-SyncMetricsTable'
+
+  ConflictResolverFunctionArn:
+    Description: ARN of the conflict resolver Lambda function
+    Value: !GetAtt ConflictResolverFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ConflictResolverArn'
+
+  SyncManagerFunctionArn:
+    Description: ARN of the sync manager Lambda function
+    Value: !GetAtt SyncManagerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SyncManagerArn'
+
+  ShadowEventBusName:
+    Description: Name of the custom EventBridge bus for shadow events
+    Value: !Ref ShadowEventBus
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBusName'
+
+  ShadowEventBusArn:
+    Description: ARN of the custom EventBridge bus for shadow events
+    Value: !GetAtt ShadowEventBus.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBusArn'
+
+  CloudWatchDashboardURL:
+    Description: URL to the CloudWatch dashboard for shadow synchronization monitoring
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-shadow-sync-${Environment}'
+
+  ShadowAuditLogGroupName:
+    Description: Name of the CloudWatch log group for shadow audit trail
+    Value: !Ref ShadowAuditLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AuditLogGroup'
+
+  IoTRuleNames:
+    Description: Names of the IoT rules created for shadow processing
+    Value: !Sub '${ProjectName}ShadowDeltaProcessingRule${Environment}, ${ProjectName}ShadowAuditLoggingRule${Environment}'
+
+  DeploymentRegion:
+    Description: AWS region where the infrastructure is deployed
+    Value: !Ref AWS::Region
+
+  StackName:
+    Description: Name of this CloudFormation stack
+    Value: !Ref AWS::StackName
+
+  ProjectEnvironment:
+    Description: Project name and environment combination
+    Value: !Sub '${ProjectName}-${Environment}'

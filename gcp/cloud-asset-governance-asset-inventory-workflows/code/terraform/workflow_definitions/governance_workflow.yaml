@@ -1,0 +1,360 @@
+# Cloud Asset Governance Orchestration Workflow
+# This workflow orchestrates the complete governance process from asset change detection
+# through policy evaluation, violation recording, and remediation action triggering.
+
+main:
+  params: [args]
+  steps:
+    # Initialize workflow variables and configuration
+    - initialize:
+        assign:
+          - project_id: "${project_id}"
+          - governance_suffix: "${governance_suffix}"
+          - region: "${region}"
+          - function_url: "${function_url}"
+          - workflow_start_time: $${sys.now()}
+          - processing_errors: []
+          - violation_count: 0
+          - processed_assets: 0
+
+    # Parse and validate input asset change data
+    - parse_input:
+        try:
+          assign:
+            - asset_change: $${args.asset_change}
+            - asset_name: $${asset_change.asset.name}
+            - asset_type: $${asset_change.asset.assetType}
+            - change_type: $${asset_change.change_type}
+            - processing_id: $${text.split(asset_name, "/")[-1] + "-" + string(sys.now())}
+        except:
+          as: e
+          steps:
+            - log_parse_error:
+                call: sys.log
+                args:
+                  text: $${"Failed to parse input data: " + e.message}
+                  severity: "ERROR"
+            - return_parse_error:
+                return:
+                  status: "error"
+                  error: "Invalid input format"
+                  timestamp: $${sys.now()}
+
+    # Log the start of governance processing
+    - log_processing_start:
+        call: sys.log
+        args:
+          text: $${"Starting governance processing for asset: " + asset_name + " (type: " + asset_type + ", change: " + change_type + ")"}
+          severity: "INFO"
+          labels:
+            processing_id: $${processing_id}
+            asset_type: $${asset_type}
+            governance_workflow: "true"
+
+    # Pre-processing asset validation and filtering
+    - validate_asset:
+        switch:
+          # Skip processing if asset was deleted
+          - condition: $${change_type == "DELETE"}
+            steps:
+              - log_skip_deleted:
+                  call: sys.log
+                  args:
+                    text: $${"Skipping governance processing for deleted asset: " + asset_name}
+                    severity: "INFO"
+              - return_skipped:
+                  return:
+                    status: "skipped"
+                    reason: "Asset deleted"
+                    asset_name: $${asset_name}
+                    timestamp: $${sys.now()}
+          
+          # Skip system-managed resources
+          - condition: $${text.find_all(asset_name, "gke-") != [] or text.find_all(asset_name, "k8s-") != [] or text.find_all(asset_name, "goog-") != []}
+            steps:
+              - log_skip_system:
+                  call: sys.log
+                  args:
+                    text: $${"Skipping system-managed resource: " + asset_name}
+                    severity: "INFO"
+              - return_system_skip:
+                  return:
+                    status: "skipped"
+                    reason: "System-managed resource"
+                    asset_name: $${asset_name}
+                    timestamp: $${sys.now()}
+          
+          # Continue with governance evaluation
+          - condition: true
+            next: evaluate_policies
+
+    # Call policy evaluation Cloud Function
+    - evaluate_policies:
+        try:
+          call: http.post
+          args:
+            url: $${function_url}
+            headers:
+              Content-Type: "application/json"
+              X-Governance-Suffix: $${governance_suffix}
+              X-Processing-ID: $${processing_id}
+            body:
+              asset: $${asset_change.asset}
+              change_type: $${change_type}
+              workflow_context:
+                processing_id: $${processing_id}
+                trigger_source: "workflow"
+                timestamp: $${workflow_start_time}
+            timeout: 540
+          result: evaluation_result
+        except:
+          as: e
+          steps:
+            - log_evaluation_error:
+                call: sys.log
+                args:
+                  text: $${"Policy evaluation failed for " + asset_name + ": " + e.message}
+                  severity: "ERROR"
+                  labels:
+                    processing_id: $${processing_id}
+                    error_type: "policy_evaluation_failure"
+            - handle_evaluation_error:
+                assign:
+                  - processing_errors: $${list.concat(processing_errors, [{"step": "evaluate_policies", "error": e.message, "timestamp": sys.now()}])}
+                next: evaluation_error_handling
+
+    # Process policy evaluation results
+    - process_evaluation_results:
+        assign:
+          - violations_found: $${evaluation_result.body.violations_found}
+          - violation_count: $${violations_found}
+          - processed_assets: 1
+
+    # Log evaluation results
+    - log_evaluation_results:
+        call: sys.log
+        args:
+          text: $${"Policy evaluation completed for " + asset_name + ": " + string(violations_found) + " violations found"}
+          severity: $${if(violations_found > 0, "WARNING", "INFO")}
+          labels:
+            processing_id: $${processing_id}
+            violations_count: $${string(violations_found)}
+            asset_type: $${asset_type}
+
+    # Branch based on whether violations were found
+    - check_violations:
+        switch:
+          - condition: $${violations_found > 0}
+            next: process_violations
+          - condition: true
+            next: update_compliance_metrics
+
+    # Process governance violations and trigger remediation
+    - process_violations:
+        steps:
+          # Log detailed violation information
+          - log_violations_detail:
+              call: sys.log
+              args:
+                text: $${"Processing " + string(violations_found) + " violations for " + asset_name}
+                severity: "WARNING"
+                labels:
+                  processing_id: $${processing_id}
+                  violation_details: $${json.encode(evaluation_result.body.violations)}
+
+          # Determine violation severity levels
+          - analyze_violation_severity:
+              assign:
+                - high_severity_count: 0
+                - medium_severity_count: 0
+                - low_severity_count: 0
+                - violations_list: $${evaluation_result.body.violations}
+
+          # Count violations by severity
+          - count_violations_by_severity:
+              for:
+                value: violation
+                in: $${violations_list}
+                steps:
+                  - increment_severity_counters:
+                      switch:
+                        - condition: $${violation.severity == "HIGH"}
+                          assign:
+                            - high_severity_count: $${high_severity_count + 1}
+                        - condition: $${violation.severity == "MEDIUM"}
+                          assign:
+                            - medium_severity_count: $${medium_severity_count + 1}
+                        - condition: $${violation.severity == "LOW"}
+                          assign:
+                            - low_severity_count: $${low_severity_count + 1}
+
+          # Trigger alerts for high severity violations
+          - handle_high_severity_violations:
+              switch:
+                - condition: $${high_severity_count > 0}
+                  steps:
+                    - trigger_high_severity_alert:
+                        try:
+                          call: http.post
+                          args:
+                            url: $${"https://monitoring.googleapis.com/v3/projects/" + project_id + "/incidents"}
+                            headers:
+                              Authorization: $${"Bearer " + sys.get_env("GOOGLE_CLOUD_ACCESS_TOKEN")}
+                              Content-Type: "application/json"
+                            body:
+                              displayName: $${"High Severity Governance Violations - " + asset_name}
+                              summary: $${string(high_severity_count) + " high severity governance policy violations detected"}
+                              state: "OPEN"
+                              condition:
+                                name: "governance_violations_high_severity"
+                                displayName: "Governance Policy Violations"
+                        except:
+                          as: alert_error
+                          steps:
+                            - log_alert_error:
+                                call: sys.log
+                                args:
+                                  text: $${"Failed to create high severity alert: " + alert_error.message}
+                                  severity: "ERROR"
+
+          # Trigger automated remediation for specific violation types
+          - trigger_automated_remediation:
+              for:
+                value: violation
+                in: $${violations_list}
+                steps:
+                  - check_remediation_eligibility:
+                      switch:
+                        # Auto-remediate specific low-risk violations
+                        - condition: $${violation.policy == "required_labels_missing" and violation.severity == "MEDIUM"}
+                          steps:
+                            - log_auto_remediation:
+                                call: sys.log
+                                args:
+                                  text: $${"Triggering auto-remediation for label compliance on " + asset_name}
+                                  severity: "INFO"
+                        
+                        # Schedule remediation for high-risk violations
+                        - condition: $${violation.severity == "HIGH"}
+                          steps:
+                            - schedule_manual_remediation:
+                                call: sys.log
+                                args:
+                                  text: $${"High severity violation requires manual review: " + violation.description}
+                                  severity: "WARNING"
+                                  labels:
+                                    requires_manual_review: "true"
+                                    violation_policy: $${violation.policy}
+
+    # Update compliance metrics and reporting
+    - update_compliance_metrics:
+        try:
+          steps:
+            # Record compliance scan results
+            - record_compliance_scan:
+                call: http.post
+                args:
+                  url: $${"https://bigquery.googleapis.com/bigquery/v2/projects/" + project_id + "/jobs"}
+                  headers:
+                    Authorization: $${"Bearer " + sys.get_env("GOOGLE_CLOUD_ACCESS_TOKEN")}
+                    Content-Type: "application/json"
+                  body:
+                    configuration:
+                      query:
+                        query: >
+                          INSERT INTO `${project_id}.asset_governance_${governance_suffix}.compliance_reports`
+                          (report_id, scan_timestamp, total_resources, violations_found, high_severity, medium_severity, low_severity, compliance_score, scan_scope)
+                          VALUES
+                          (GENERATE_UUID(), CURRENT_TIMESTAMP(), 1, @violations_found, @high_severity, @medium_severity, @low_severity, @compliance_score, 'single_asset')
+                        parameters:
+                          - name: "violations_found"
+                            parameterType: 
+                              type: "INT64"
+                            parameterValue:
+                              value: $${string(violation_count)}
+                          - name: "high_severity"
+                            parameterType:
+                              type: "INT64"  
+                            parameterValue:
+                              value: $${string(default(high_severity_count, 0))}
+                          - name: "medium_severity"
+                            parameterType:
+                              type: "INT64"
+                            parameterValue:
+                              value: $${string(default(medium_severity_count, 0))}
+                          - name: "low_severity"
+                            parameterType:
+                              type: "INT64"
+                            parameterValue:
+                              value: $${string(default(low_severity_count, 0))}
+                          - name: "compliance_score"
+                            parameterType:
+                              type: "FLOAT64"
+                            parameterValue:
+                              value: $${string(if(violation_count == 0, 100.0, max(0.0, 100.0 - (violation_count * 10))))}
+                        useLegacySql: false
+        except:
+          as: metrics_error
+          steps:
+            - log_metrics_error:
+                call: sys.log
+                args:
+                  text: $${"Failed to update compliance metrics: " + metrics_error.message}
+                  severity: "ERROR"
+
+    # Final processing and workflow completion
+    - complete_processing:
+        steps:
+          - calculate_processing_duration:
+              assign:
+                - processing_duration: $${sys.now() - workflow_start_time}
+                
+          - log_completion:
+              call: sys.log
+              args:
+                text: $${"Governance processing completed for " + asset_name + " in " + string(processing_duration) + "ms"}
+                severity: "INFO"
+                labels:
+                  processing_id: $${processing_id}
+                  processing_duration_ms: $${string(processing_duration)}
+                  violations_found: $${string(violation_count)}
+                  errors_encountered: $${string(len(processing_errors))}
+
+    # Return final workflow results
+    - return_results:
+        return:
+          status: "completed"
+          processing_id: $${processing_id}
+          asset_name: $${asset_name}
+          asset_type: $${asset_type}
+          change_type: $${change_type}
+          violations_found: $${violation_count}
+          processing_duration_ms: $${processing_duration}
+          processed_assets: $${processed_assets}
+          high_severity_violations: $${default(high_severity_count, 0)}
+          medium_severity_violations: $${default(medium_severity_count, 0)}
+          low_severity_violations: $${default(low_severity_count, 0)}
+          compliance_score: $${if(violation_count == 0, 100.0, max(0.0, 100.0 - (violation_count * 10)))}
+          errors: $${processing_errors}
+          timestamp: $${sys.now()}
+
+    # Error handling for policy evaluation failures
+    - evaluation_error_handling:
+        steps:
+          - log_error_summary:
+              call: sys.log
+              args:
+                text: $${"Governance workflow failed for " + asset_name + " due to policy evaluation errors"}
+                severity: "ERROR"
+                labels:
+                  processing_id: $${processing_id}
+                  error_count: $${string(len(processing_errors))}
+          
+          - return_error_result:
+              return:
+                status: "error"
+                processing_id: $${processing_id}
+                asset_name: $${asset_name}
+                asset_type: $${asset_type}
+                errors: $${processing_errors}
+                timestamp: $${sys.now()}

@@ -1,0 +1,656 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Infrastructure for Secure File Sharing with S3 Presigned URLs.
+  Creates a private S3 bucket with proper security controls for secure file sharing
+  using presigned URLs. Includes IAM roles for URL generation and CloudTrail for
+  audit logging.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Bucket Configuration"
+        Parameters:
+          - BucketName
+          - EnableVersioning
+          - EnableLogging
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - EnableCloudTrail
+          - CloudTrailRetentionDays
+      - Label:
+          default: "Resource Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+    ParameterLabels:
+      BucketName:
+        default: "S3 Bucket Name"
+      EnableVersioning:
+        default: "Enable S3 Versioning"
+      EnableLogging:
+        default: "Enable Access Logging"
+      EnableCloudTrail:
+        default: "Enable CloudTrail Logging"
+      CloudTrailRetentionDays:
+        default: "CloudTrail Log Retention (Days)"
+      Environment:
+        default: "Environment Name"
+      ProjectName:
+        default: "Project Name"
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: >
+      Name for the S3 bucket (must be globally unique). If empty, a unique name
+      will be generated automatically.
+    Default: ""
+    AllowedPattern: "^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$"
+    ConstraintDescription: >
+      Bucket name must be lowercase, contain only letters, numbers, and hyphens,
+      and cannot start or end with a hyphen.
+    MaxLength: 63
+
+  EnableVersioning:
+    Type: String
+    Description: Enable versioning on the S3 bucket for better file management
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  EnableLogging:
+    Type: String
+    Description: Enable access logging for the S3 bucket
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  EnableCloudTrail:
+    Type: String
+    Description: Enable CloudTrail for API call auditing
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  CloudTrailRetentionDays:
+    Type: Number
+    Description: Number of days to retain CloudTrail logs
+    Default: 90
+    MinValue: 1
+    MaxValue: 3653
+
+  Environment:
+    Type: String
+    Description: Environment name (e.g., dev, test, prod)
+    Default: "dev"
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9-]*$"
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+    MaxLength: 20
+
+  ProjectName:
+    Type: String
+    Description: Project name for resource tagging
+    Default: "file-sharing-demo"
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9-]*$"
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+    MaxLength: 30
+
+Conditions:
+  # Create custom bucket name if not provided
+  CreateBucketName: !Equals [!Ref BucketName, ""]
+  
+  # Enable features based on parameters
+  EnableS3Versioning: !Equals [!Ref EnableVersioning, "true"]
+  EnableS3Logging: !Equals [!Ref EnableLogging, "true"]
+  EnableCloudTrailLogging: !Equals [!Ref EnableCloudTrail, "true"]
+
+Resources:
+  # Generate random suffix for bucket name if needed
+  BucketNameLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: CreateBucketName
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  BucketNameLambda:
+    Type: AWS::Lambda::Function
+    Condition: CreateBucketName
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-bucket-name-generator"
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt BucketNameLambdaRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import random
+          import string
+          import cfnresponse
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  # Generate random suffix
+                  suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+                  bucket_name = f"file-sharing-demo-{suffix}"
+                  
+                  response_data = {'BucketName': bucket_name}
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  BucketNameResource:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: CreateBucketName
+    Properties:
+      ServiceToken: !GetAtt BucketNameLambda.Arn
+
+  # S3 Bucket for Access Logs (created first to avoid circular dependency)
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Condition: EnableS3Logging
+    Properties:
+      BucketName: !Sub 
+        - "${BucketName}-access-logs"
+        - BucketName: !If 
+          - CreateBucketName
+          - !GetAtt BucketNameResource.BucketName
+          - !Ref BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteAccessLogsAfter90Days
+            Status: Enabled
+            ExpirationInDays: 90
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: "Access Logs"
+
+  # Main S3 Bucket for File Sharing
+  FileSharingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If 
+        - CreateBucketName
+        - !GetAtt BucketNameResource.BucketName
+        - !Ref BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration: !If
+        - EnableS3Versioning
+        - Status: Enabled
+        - !Ref "AWS::NoValue"
+      LoggingConfiguration: !If
+        - EnableS3Logging
+        - DestinationBucketName: !Ref LoggingBucket
+          LogFilePrefix: "access-logs/"
+        - !Ref "AWS::NoValue"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3LogGroup
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: "File Sharing"
+
+  # Bucket Policy for secure access
+  FileSharingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FileSharingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Deny unencrypted uploads
+          - Sid: DenyUnencryptedObjectUploads
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:PutObject"
+            Resource: !Sub "${FileSharingBucket}/*"
+            Condition:
+              StringNotEquals:
+                "s3:x-amz-server-side-encryption": "AES256"
+          # Deny insecure connections
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "${FileSharingBucket}/*"
+              - !Sub "${FileSharingBucket}"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  # IAM Role for presigned URL generation
+  PresignedUrlRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-presigned-url-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - ec2.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                "sts:ExternalId": !Sub "${ProjectName}-${Environment}"
+      Policies:
+        - PolicyName: S3PresignedUrlPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                  - "s3:DeleteObject"
+                Resource: !Sub "${FileSharingBucket}/*"
+              - Effect: Allow
+                Action:
+                  - "s3:ListBucket"
+                  - "s3:GetBucketLocation"
+                Resource: !Sub "${FileSharingBucket}"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM User for CLI access (optional)
+  FileSharingUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub "${ProjectName}-${Environment}-file-sharing-user"
+      Policies:
+        - PolicyName: FileSharingAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                  - "s3:DeleteObject"
+                Resource: !Sub "${FileSharingBucket}/*"
+              - Effect: Allow
+                Action:
+                  - "s3:ListBucket"
+                  - "s3:GetBucketLocation"
+                Resource: !Sub "${FileSharingBucket}"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Group for S3 events
+  S3LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/s3/${ProjectName}-${Environment}"
+      RetentionInDays: !Ref CloudTrailRetentionDays
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudTrail for API auditing
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Condition: EnableCloudTrailLogging
+    Properties:
+      BucketName: !Sub 
+        - "${BucketName}-cloudtrail"
+        - BucketName: !If 
+          - CreateBucketName
+          - !GetAtt BucketNameResource.BucketName
+          - !Ref BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteCloudTrailLogsAfterRetentionPeriod
+            Status: Enabled
+            ExpirationInDays: !Ref CloudTrailRetentionDays
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: "CloudTrail Logs"
+
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: EnableCloudTrailLogging
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub "${CloudTrailBucket}"
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${CloudTrailBucket}/*"
+            Condition:
+              StringEquals:
+                "s3:x-amz-acl": "bucket-owner-full-control"
+
+  CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Condition: EnableCloudTrailLogging
+    DependsOn: CloudTrailBucketPolicy
+    Properties:
+      TrailName: !Sub "${ProjectName}-${Environment}-cloudtrail"
+      S3BucketName: !Ref CloudTrailBucket
+      S3KeyPrefix: "cloudtrail-logs/"
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: "AWS::S3::Object"
+              Values:
+                - !Sub "${FileSharingBucket}/*"
+            - Type: "AWS::S3::Bucket"
+              Values:
+                - !Sub "${FileSharingBucket}"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda function for generating presigned URLs (example implementation)
+  PresignedUrlLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-lambda-presigned-url-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3PresignedUrlAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                Resource: !Sub "${FileSharingBucket}/*"
+              - Effect: Allow
+                Action:
+                  - "s3:ListBucket"
+                Resource: !Sub "${FileSharingBucket}"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PresignedUrlLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-presigned-url-generator"
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt PresignedUrlLambdaRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref FileSharingBucket
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          import os
+          from botocore.exceptions import ClientError
+          
+          s3_client = boto3.client('s3')
+          bucket_name = os.environ['BUCKET_NAME']
+          
+          def handler(event, context):
+              try:
+                  # Parse request
+                  action = event.get('action', 'download')  # download or upload
+                  object_key = event.get('object_key', '')
+                  expires_in = event.get('expires_in', 3600)  # 1 hour default
+                  
+                  if not object_key:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'object_key is required'})
+                      }
+                  
+                  # Generate presigned URL
+                  if action == 'download':
+                      url = s3_client.generate_presigned_url(
+                          'get_object',
+                          Params={'Bucket': bucket_name, 'Key': object_key},
+                          ExpiresIn=expires_in
+                      )
+                  elif action == 'upload':
+                      url = s3_client.generate_presigned_url(
+                          'put_object',
+                          Params={'Bucket': bucket_name, 'Key': object_key},
+                          ExpiresIn=expires_in,
+                          HttpMethod='PUT'
+                      )
+                  else:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'Invalid action. Use download or upload'})
+                      }
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'presigned_url': url,
+                          'expires_in': expires_in,
+                          'action': action,
+                          'object_key': object_key
+                      })
+                  }
+                  
+              except ClientError as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  BucketName:
+    Description: Name of the created S3 bucket for file sharing
+    Value: !Ref FileSharingBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-BucketName"
+
+  BucketArn:
+    Description: ARN of the S3 bucket
+    Value: !GetAtt FileSharingBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-BucketArn"
+
+  BucketDomainName:
+    Description: Domain name of the S3 bucket
+    Value: !GetAtt FileSharingBucket.DomainName
+    Export:
+      Name: !Sub "${AWS::StackName}-BucketDomainName"
+
+  BucketWebsiteURL:
+    Description: Website URL of the S3 bucket
+    Value: !GetAtt FileSharingBucket.WebsiteURL
+    Export:
+      Name: !Sub "${AWS::StackName}-BucketWebsiteURL"
+
+  PresignedUrlRoleArn:
+    Description: ARN of the IAM role for generating presigned URLs
+    Value: !GetAtt PresignedUrlRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-PresignedUrlRoleArn"
+
+  FileSharingUserArn:
+    Description: ARN of the IAM user for file sharing operations
+    Value: !GetAtt FileSharingUser.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-FileSharingUserArn"
+
+  PresignedUrlLambdaArn:
+    Description: ARN of the Lambda function for generating presigned URLs
+    Value: !GetAtt PresignedUrlLambda.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-PresignedUrlLambdaArn"
+
+  LoggingBucketName:
+    Condition: EnableS3Logging
+    Description: Name of the S3 bucket for access logs
+    Value: !Ref LoggingBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-LoggingBucketName"
+
+  CloudTrailArn:
+    Condition: EnableCloudTrailLogging
+    Description: ARN of the CloudTrail for API auditing
+    Value: !GetAtt CloudTrail.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudTrailArn"
+
+  CloudTrailBucketName:
+    Condition: EnableCloudTrailLogging
+    Description: Name of the S3 bucket for CloudTrail logs
+    Value: !Ref CloudTrailBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudTrailBucketName"
+
+  S3LogGroupName:
+    Description: Name of the CloudWatch Log Group for S3 events
+    Value: !Ref S3LogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-S3LogGroupName"
+
+  # Sample CLI commands for generating presigned URLs
+  SampleDownloadCommand:
+    Description: Sample AWS CLI command to generate a download presigned URL
+    Value: !Sub |
+      aws s3 presign s3://${FileSharingBucket}/path/to/file.txt --expires-in 3600
+
+  SampleUploadCommand:
+    Description: Sample AWS CLI command to generate an upload presigned URL
+    Value: !Sub |
+      aws s3 presign s3://${FileSharingBucket}/path/to/upload.txt --expires-in 1800
+
+  LambdaInvokeExample:
+    Description: Sample command to invoke the presigned URL Lambda function
+    Value: !Sub |
+      aws lambda invoke --function-name ${PresignedUrlLambda} --payload '{"action":"download","object_key":"path/to/file.txt","expires_in":3600}' response.json

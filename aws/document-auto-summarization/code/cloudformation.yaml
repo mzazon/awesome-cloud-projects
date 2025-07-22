@@ -1,0 +1,617 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Intelligent Document Summarization with Amazon Bedrock and Lambda - Automated document processing and AI-powered summarization system'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - InputBucketName
+          - OutputBucketName
+          - DocumentPrefix
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaFunctionName
+          - LambdaTimeout
+          - LambdaMemorySize
+      - Label:
+          default: "AI Model Configuration"
+        Parameters:
+          - BedrockModelId
+          - MaxTokens
+          - MaxTextLength
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableDetailedMonitoring
+          - LogRetentionDays
+    ParameterLabels:
+      InputBucketName:
+        default: "Input Bucket Name"
+      OutputBucketName:
+        default: "Output Bucket Name"
+      DocumentPrefix:
+        default: "Document Prefix"
+      LambdaFunctionName:
+        default: "Lambda Function Name"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Memory (MB)"
+      BedrockModelId:
+        default: "Bedrock Model ID"
+      MaxTokens:
+        default: "Maximum Tokens for Summary"
+      MaxTextLength:
+        default: "Maximum Text Length to Process"
+      EnableDetailedMonitoring:
+        default: "Enable Detailed Monitoring"
+      LogRetentionDays:
+        default: "CloudWatch Log Retention (days)"
+
+# Parameters for customization
+Parameters:
+  InputBucketName:
+    Type: String
+    Description: 'Name for the S3 bucket to store input documents'
+    Default: ''
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$|^$'
+    ConstraintDescription: 'Must be a valid S3 bucket name (lowercase, numbers, hyphens only)'
+
+  OutputBucketName:
+    Type: String
+    Description: 'Name for the S3 bucket to store generated summaries'
+    Default: ''
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$|^$'
+    ConstraintDescription: 'Must be a valid S3 bucket name (lowercase, numbers, hyphens only)'
+
+  DocumentPrefix:
+    Type: String
+    Description: 'S3 prefix for documents that should trigger processing'
+    Default: 'documents/'
+    MinLength: 1
+    MaxLength: 50
+
+  LambdaFunctionName:
+    Type: String
+    Description: 'Name for the Lambda function'
+    Default: ''
+    AllowedPattern: '^[a-zA-Z0-9-_]*$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, hyphens, and underscores'
+
+  LambdaTimeout:
+    Type: Number
+    Description: 'Lambda function timeout in seconds'
+    Default: 300
+    MinValue: 30
+    MaxValue: 900
+
+  LambdaMemorySize:
+    Type: Number
+    Description: 'Lambda function memory allocation in MB'
+    Default: 512
+    MinValue: 128
+    MaxValue: 10240
+
+  BedrockModelId:
+    Type: String
+    Description: 'Amazon Bedrock model ID to use for summarization'
+    Default: 'anthropic.claude-3-sonnet-20240229-v1:0'
+    AllowedValues:
+      - 'anthropic.claude-3-sonnet-20240229-v1:0'
+      - 'anthropic.claude-3-haiku-20240307-v1:0'
+      - 'anthropic.claude-v2:1'
+      - 'anthropic.claude-v2'
+
+  MaxTokens:
+    Type: Number
+    Description: 'Maximum tokens for generated summary'
+    Default: 1000
+    MinValue: 100
+    MaxValue: 4000
+
+  MaxTextLength:
+    Type: Number
+    Description: 'Maximum character length of text to process'
+    Default: 10000
+    MinValue: 1000
+    MaxValue: 50000
+
+  EnableDetailedMonitoring:
+    Type: String
+    Description: 'Enable detailed CloudWatch monitoring'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  LogRetentionDays:
+    Type: Number
+    Description: 'CloudWatch log retention period in days'
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+# Conditions for optional features
+Conditions:
+  CreateInputBucket: !Equals [!Ref InputBucketName, '']
+  CreateOutputBucket: !Equals [!Ref OutputBucketName, '']
+  CreateLambdaFunctionName: !Equals [!Ref LambdaFunctionName, '']
+  EnableMonitoring: !Equals [!Ref EnableDetailedMonitoring, 'true']
+
+# Resources
+Resources:
+  # S3 Bucket for Input Documents
+  InputDocumentsBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateInputBucket
+    Properties:
+      BucketName: !Sub 'documents-input-${AWS::StackName}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt DocumentProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: !Ref DocumentPrefix
+
+  # S3 Bucket for Output Summaries (when creating new bucket)
+  OutputSummariesBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateOutputBucket
+    Properties:
+      BucketName: !Sub 'summaries-output-${AWS::StackName}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+
+  # IAM Role for Lambda Function
+  DocumentProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'DocumentSummarizerRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DocumentProcessorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3 Permissions
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                Resource:
+                  - !Sub
+                    - '${BucketArn}/*'
+                    - BucketArn: !If
+                        - CreateInputBucket
+                        - !GetAtt InputDocumentsBucket.Arn
+                        - !Sub 'arn:aws:s3:::${InputBucketName}'
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:PutObjectAcl'
+                Resource:
+                  - !Sub
+                    - '${BucketArn}/*'
+                    - BucketArn: !If
+                        - CreateOutputBucket
+                        - !GetAtt OutputSummariesBucket.Arn
+                        - !Sub 'arn:aws:s3:::${OutputBucketName}'
+              # Textract Permissions
+              - Effect: Allow
+                Action:
+                  - 'textract:DetectDocumentText'
+                  - 'textract:AnalyzeDocument'
+                Resource: '*'
+              # Bedrock Permissions
+              - Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModel'
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}'
+              # CloudWatch Logs Permissions
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+
+  # CloudWatch Log Group for Lambda Function
+  DocumentProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DocumentProcessorFunction}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # Lambda Function for Document Processing
+  DocumentProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !If
+        - CreateLambdaFunctionName
+        - !Sub 'doc-summarizer-${AWS::StackName}'
+        - !Ref LambdaFunctionName
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt DocumentProcessorRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !If
+            - CreateOutputBucket
+            - !Ref OutputSummariesBucket
+            - !Ref OutputBucketName
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          MAX_TOKENS: !Ref MaxTokens
+          MAX_TEXT_LENGTH: !Ref MaxTextLength
+          LOG_LEVEL: 'INFO'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from urllib.parse import unquote_plus
+          import logging
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+          
+          # Initialize AWS clients
+          s3 = boto3.client('s3')
+          textract = boto3.client('textract')
+          bedrock = boto3.client('bedrock-runtime')
+          
+          def lambda_handler(event, context):
+              """Main Lambda handler for document summarization"""
+              try:
+                  # Parse S3 event
+                  record = event['Records'][0]
+                  bucket = record['s3']['bucket']['name']
+                  key = unquote_plus(record['s3']['object']['key'])
+                  
+                  logger.info(f"Processing document: {key} from bucket: {bucket}")
+                  
+                  # Extract text from document
+                  text_content = extract_text(bucket, key)
+                  logger.info(f"Extracted {len(text_content)} characters of text")
+                  
+                  # Generate summary using Bedrock
+                  summary = generate_summary(text_content)
+                  logger.info(f"Generated summary with {len(summary)} characters")
+                  
+                  # Store summary
+                  store_summary(key, summary, text_content)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Document processed successfully',
+                          'document': key,
+                          'text_length': len(text_content),
+                          'summary_length': len(summary)
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing document: {str(e)}", exc_info=True)
+                  raise
+          
+          def extract_text(bucket, key):
+              """Extract text from document using Amazon Textract"""
+              try:
+                  # Check file extension to determine processing method
+                  file_extension = key.lower().split('.')[-1]
+                  
+                  if file_extension in ['txt', 'csv']:
+                      # For text files, read directly from S3
+                      response = s3.get_object(Bucket=bucket, Key=key)
+                      return response['Body'].read().decode('utf-8')
+                  else:
+                      # Use Textract for other document types
+                      response = textract.detect_document_text(
+                          Document={'S3Object': {'Bucket': bucket, 'Name': key}}
+                      )
+                      
+                      text_blocks = []
+                      for block in response['Blocks']:
+                          if block['BlockType'] == 'LINE':
+                              text_blocks.append(block['Text'])
+                      
+                      return '\n'.join(text_blocks)
+                      
+              except Exception as e:
+                  logger.error(f"Text extraction failed for {key}: {str(e)}")
+                  raise
+          
+          def generate_summary(text_content):
+              """Generate summary using Amazon Bedrock Claude model"""
+              try:
+                  # Truncate text if too long
+                  max_length = int(os.environ.get('MAX_TEXT_LENGTH', 10000))
+                  if len(text_content) > max_length:
+                      text_content = text_content[:max_length] + "..."
+                      logger.info(f"Text truncated to {max_length} characters")
+                  
+                  # Prepare prompt for Claude
+                  prompt = f"""Please provide a comprehensive summary of the following document. Include:
+                  
+          1. Main topics and key points
+          2. Important facts, figures, and conclusions
+          3. Actionable insights or recommendations
+          4. Any critical deadlines or dates mentioned
+          5. Overall significance and implications
+          
+          Document content:
+          {text_content}
+          
+          Summary:"""
+                  
+                  # Call Bedrock
+                  model_id = os.environ.get('BEDROCK_MODEL_ID')
+                  max_tokens = int(os.environ.get('MAX_TOKENS', 1000))
+                  
+                  response = bedrock.invoke_model(
+                      modelId=model_id,
+                      body=json.dumps({
+                          'anthropic_version': 'bedrock-2023-05-31',
+                          'max_tokens': max_tokens,
+                          'messages': [{'role': 'user', 'content': prompt}],
+                          'temperature': 0.3
+                      })
+                  )
+                  
+                  response_body = json.loads(response['body'].read())
+                  return response_body['content'][0]['text']
+                  
+              except Exception as e:
+                  logger.error(f"Summary generation failed: {str(e)}")
+                  raise
+          
+          def store_summary(original_key, summary, full_text):
+              """Store summary and metadata in S3"""
+              try:
+                  output_bucket = os.environ['OUTPUT_BUCKET']
+                  
+                  # Generate summary key
+                  summary_key = f"summaries/{original_key}.summary.txt"
+                  
+                  # Store summary with metadata
+                  s3.put_object(
+                      Bucket=output_bucket,
+                      Key=summary_key,
+                      Body=summary,
+                      ContentType='text/plain',
+                      Metadata={
+                          'original-document': original_key,
+                          'summary-generated': 'true',
+                          'text-length': str(len(full_text)),
+                          'summary-length': str(len(summary)),
+                          'processing-timestamp': str(context.aws_request_id) if 'context' in globals() else 'unknown'
+                      }
+                  )
+                  
+                  logger.info(f"Summary stored successfully: {summary_key}")
+                  
+              except Exception as e:
+                  logger.error(f"Failed to store summary: {str(e)}")
+                  raise
+
+  # Lambda Permission for S3 to invoke the function
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DocumentProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !If
+        - CreateInputBucket
+        - !GetAtt InputDocumentsBucket.Arn
+        - !Sub 'arn:aws:s3:::${InputBucketName}'
+
+  # CloudWatch Alarm for Lambda Errors (if monitoring enabled)
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-DocumentProcessor-Errors'
+      AlarmDescription: 'Alarm for Lambda function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DocumentProcessorFunction
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for Lambda Duration (if monitoring enabled)
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-DocumentProcessor-Duration'
+      AlarmDescription: 'Alarm for Lambda function duration'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref LambdaTimeout
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DocumentProcessorFunction
+      TreatMissingData: notBreaching
+
+  # CloudWatch Dashboard (if monitoring enabled)
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableMonitoring
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-DocumentSummarization'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${DocumentProcessorFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${DocumentProcessorFunction}' | fields @timestamp, @message | sort @timestamp desc | limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Log Events"
+              }
+            }
+          ]
+        }
+
+# Outputs
+Outputs:
+  InputBucketName:
+    Description: 'Name of the S3 bucket for input documents'
+    Value: !If
+      - CreateInputBucket
+      - !Ref InputDocumentsBucket
+      - !Ref InputBucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-InputBucket'
+
+  OutputBucketName:
+    Description: 'Name of the S3 bucket for output summaries'
+    Value: !If
+      - CreateOutputBucket
+      - !Ref OutputSummariesBucket
+      - !Ref OutputBucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-OutputBucket'
+
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function processing documents'
+    Value: !Ref DocumentProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function processing documents'
+    Value: !GetAtt DocumentProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  DocumentUploadCommand:
+    Description: 'AWS CLI command to upload a test document'
+    Value: !Sub 
+      - 'aws s3 cp your-document.txt s3://${BucketName}/${DocumentPrefix}'
+      - BucketName: !If
+          - CreateInputBucket
+          - !Ref InputDocumentsBucket
+          - !Ref InputBucketName
+
+  SummaryDownloadCommand:
+    Description: 'AWS CLI command to download generated summaries'
+    Value: !Sub
+      - 'aws s3 sync s3://${BucketName}/summaries/ ./summaries/'
+      - BucketName: !If
+          - CreateOutputBucket
+          - !Ref OutputSummariesBucket
+          - !Ref OutputBucketName
+
+  MonitoringDashboardURL:
+    Condition: EnableMonitoring
+    Description: 'CloudWatch Dashboard URL for monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-DocumentSummarization'
+
+  CloudWatchLogsURL:
+    Description: 'CloudWatch Logs URL for Lambda function'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/$252Faws$252Flambda$252F${DocumentProcessorFunction}'
+
+  BedrockModelUsed:
+    Description: 'Bedrock model ID being used for summarization'
+    Value: !Ref BedrockModelId
+
+  StackInfo:
+    Description: 'Stack deployment information'
+    Value: !Sub
+      - 'Stack: ${StackName}, Region: ${Region}, Account: ${Account}'
+      - StackName: !Ref 'AWS::StackName'
+        Region: !Ref 'AWS::Region'
+        Account: !Ref 'AWS::AccountId'

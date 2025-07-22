@@ -1,0 +1,911 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Mobile Backend Services with AWS Amplify - Complete infrastructure for mobile applications including authentication, GraphQL API, storage, and push notifications'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: mobile-backend-app
+    Description: Name of the mobile backend project
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    Description: Environment name for resource tagging and naming
+
+  UserPoolDomainPrefix:
+    Type: String
+    Default: mobile-backend-auth
+    Description: Domain prefix for Cognito User Pool
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+
+  EnableMFA:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable Multi-Factor Authentication for Cognito User Pool
+
+  StorageBucketName:
+    Type: String
+    Description: S3 bucket name for file storage (leave empty for auto-generation)
+    Default: ''
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$|^$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+
+  DynamoDBReadCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 10000
+    Description: DynamoDB read capacity units
+
+  DynamoDBWriteCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 10000
+    Description: DynamoDB write capacity units
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: Email address for CloudWatch alarms (optional)
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$|^$'
+
+Conditions:
+  CreateCustomBucketName: !Not [!Equals [!Ref StorageBucketName, '']]
+  EnableAlarmNotifications: !Not [!Equals [!Ref NotificationEmail, '']]
+  IsProdEnvironment: !Equals [!Ref Environment, 'prod']
+  EnableMFACondition: !Equals [!Ref EnableMFA, 'true']
+
+Resources:
+  # ================================
+  # Cognito User Pool for Authentication
+  # ================================
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${ProjectName}-${Environment}-users'
+      AliasAttributes:
+        - email
+        - phone_number
+      AutoVerifiedAttributes:
+        - email
+        - phone_number
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+      MfaConfiguration: !If [EnableMFACondition, 'ON', 'OFF']
+      EnabledMfas:
+        - !If [EnableMFACondition, 'SMS_MFA', !Ref 'AWS::NoValue']
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 7
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: phone_number
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+        - Name: given_name
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+        - Name: family_name
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+      UserPoolTags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        Purpose: mobile-backend-authentication
+
+  # Cognito User Pool Client
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      ClientName: !Sub '${ProjectName}-${Environment}-client'
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+      ReadAttributes:
+        - email
+        - phone_number
+        - given_name
+        - family_name
+      WriteAttributes:
+        - email
+        - phone_number
+        - given_name
+        - family_name
+      RefreshTokenValidity: 30
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+      PreventUserExistenceErrors: ENABLED
+
+  # Cognito User Pool Domain
+  CognitoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub '${UserPoolDomainPrefix}-${Environment}-${AWS::AccountId}'
+      UserPoolId: !Ref CognitoUserPool
+
+  # Cognito Identity Pool
+  CognitoIdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub '${ProjectName}_${Environment}_identity_pool'
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref CognitoUserPoolClient
+          ProviderName: !GetAtt CognitoUserPool.ProviderName
+
+  # ================================
+  # IAM Roles for Cognito Identity Pool
+  # ================================
+  CognitoAuthenticatedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-authenticated-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref CognitoIdentityPool
+              'ForAnyValue:StringLike':
+                'cognito-identity.amazonaws.com:amr': authenticated
+      Policies:
+        - PolicyName: CognitoAuthenticatedPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # AppSync API access
+              - Effect: Allow
+                Action:
+                  - appsync:GraphQL
+                Resource: !Sub '${AppSyncApi}/types/*/fields/*'
+              # S3 access for file storage (user-specific folders)
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: 
+                  - !Sub '${S3StorageBucket}/public/*'
+                  - !Sub '${S3StorageBucket}/protected/$${cognito-identity.amazonaws.com:sub}/*'
+                  - !Sub '${S3StorageBucket}/private/$${cognito-identity.amazonaws.com:sub}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt S3StorageBucket.Arn
+                Condition:
+                  StringLike:
+                    's3:prefix':
+                      - 'public/*'
+                      - 'protected/${cognito-identity.amazonaws.com:sub}/*'
+                      - 'private/${cognito-identity.amazonaws.com:sub}/*'
+              # Pinpoint analytics access
+              - Effect: Allow
+                Action:
+                  - mobiletargeting:PutEvents
+                  - mobiletargeting:UpdateEndpoint
+                Resource: !Sub 'arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:apps/${PinpointProject}/*'
+
+  CognitoUnauthenticatedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-unauthenticated-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref CognitoIdentityPool
+              'ForAnyValue:StringLike':
+                'cognito-identity.amazonaws.com:amr': unauthenticated
+      Policies:
+        - PolicyName: CognitoUnauthenticatedPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Limited access for unauthenticated users
+              - Effect: Allow
+                Action:
+                  - cognito-identity:GetId
+                  - cognito-identity:GetCredentialsForIdentity
+                Resource: '*'
+
+  # Identity Pool Role Attachment
+  IdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref CognitoIdentityPool
+      Roles:
+        authenticated: !GetAtt CognitoAuthenticatedRole.Arn
+        unauthenticated: !GetAtt CognitoUnauthenticatedRole.Arn
+
+  # ================================
+  # DynamoDB Tables for Data Storage
+  # ================================
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-data'
+      BillingMode: !If [IsProdEnvironment, 'PROVISIONED', 'PAY_PER_REQUEST']
+      ProvisionedThroughput: !If
+        - IsProdEnvironment
+        - ReadCapacityUnits: !Ref DynamoDBReadCapacity
+          WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+        - !Ref 'AWS::NoValue'
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - IsProdEnvironment
+            - ReadCapacityUnits: !Ref DynamoDBReadCapacity
+              WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+            - !Ref 'AWS::NoValue'
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProdEnvironment, true, false]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: mobile-backend-data
+
+  # ================================
+  # AppSync GraphQL API
+  # ================================
+  AppSyncApi:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-api'
+      AuthenticationType: AMAZON_COGNITO_USER_POOLS
+      UserPoolConfig:
+        UserPoolId: !Ref CognitoUserPool
+        AwsRegion: !Ref 'AWS::Region'
+        DefaultAction: ALLOW
+      AdditionalAuthenticationProviders:
+        - AuthenticationType: AWS_IAM
+      LogConfig:
+        CloudWatchLogsRoleArn: !GetAtt AppSyncLogRole.Arn
+        FieldLogLevel: ERROR
+      XrayEnabled: !If [IsProdEnvironment, true, false]
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        Purpose: mobile-backend-api
+
+  # AppSync GraphQL Schema
+  AppSyncSchema:
+    Type: AWS::AppSync::GraphQLSchema
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      Definition: |
+        type Post @aws_cognito_user_pools @aws_iam {
+          id: ID!
+          title: String!
+          content: String!
+          userId: String!
+          createdAt: AWSDateTime!
+          updatedAt: AWSDateTime!
+        }
+
+        type Query {
+          getPost(id: ID!): Post
+          listPosts(userId: String, limit: Int, nextToken: String): PostConnection
+        }
+
+        type Mutation {
+          createPost(input: CreatePostInput!): Post
+          updatePost(input: UpdatePostInput!): Post
+          deletePost(input: DeletePostInput!): Post
+        }
+
+        type Subscription {
+          onCreatePost(userId: String): Post
+            @aws_subscribe(mutations: ["createPost"])
+          onUpdatePost(userId: String): Post
+            @aws_subscribe(mutations: ["updatePost"])
+          onDeletePost(userId: String): Post
+            @aws_subscribe(mutations: ["deletePost"])
+        }
+
+        input CreatePostInput {
+          title: String!
+          content: String!
+        }
+
+        input UpdatePostInput {
+          id: ID!
+          title: String
+          content: String
+        }
+
+        input DeletePostInput {
+          id: ID!
+        }
+
+        type PostConnection {
+          items: [Post]
+          nextToken: String
+        }
+
+  # AppSync Data Source for DynamoDB
+  AppSyncDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      Name: DynamoDBDataSource
+      Type: AMAZON_DYNAMODB
+      DynamoDBConfig:
+        TableName: !Ref DynamoDBTable
+        AwsRegion: !Ref 'AWS::Region'
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+
+  # AppSync Service Role
+  AppSyncServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-appsync-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: appsync.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt DynamoDBTable.Arn
+                  - !Sub '${DynamoDBTable.Arn}/index/*'
+
+  # AppSync Log Role
+  AppSyncLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-appsync-log-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: appsync.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AppSyncPushToCloudWatchLogs
+
+  # AppSync Resolvers
+  CreatePostResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: createPost
+      DataSourceName: !GetAtt AppSyncDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2017-02-28",
+          "operation": "PutItem",
+          "key": {
+            "id": $util.dynamodb.toDynamoDBJson($util.autoId())
+          },
+          "attributeValues": {
+            "title": $util.dynamodb.toDynamoDBJson($ctx.args.input.title),
+            "content": $util.dynamodb.toDynamoDBJson($ctx.args.input.content),
+            "userId": $util.dynamodb.toDynamoDBJson($ctx.identity.sub),
+            "createdAt": $util.dynamodb.toDynamoDBJson($util.time.nowISO8601()),
+            "updatedAt": $util.dynamodb.toDynamoDBJson($util.time.nowISO8601())
+          }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result)
+
+  GetPostResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Query
+      FieldName: getPost
+      DataSourceName: !GetAtt AppSyncDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2017-02-28",
+          "operation": "GetItem",
+          "key": {
+            "id": $util.dynamodb.toDynamoDBJson($ctx.args.id)
+          }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result)
+
+  ListPostsResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Query
+      FieldName: listPosts
+      DataSourceName: !GetAtt AppSyncDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2017-02-28",
+          "operation": "Query",
+          "index": "UserIndex",
+          "query": {
+            "expression": "userId = :userId",
+            "expressionValues": {
+              ":userId": $util.dynamodb.toDynamoDBJson($ctx.args.userId)
+            }
+          },
+          #if($ctx.args.limit)
+          "limit": $ctx.args.limit,
+          #end
+          #if($ctx.args.nextToken)
+          "nextToken": "$ctx.args.nextToken",
+          #end
+          "scanIndexForward": false
+        }
+      ResponseMappingTemplate: |
+        {
+          "items": $util.toJson($ctx.result.items),
+          #if($ctx.result.nextToken)
+          "nextToken": "$ctx.result.nextToken"
+          #end
+        }
+
+  # ================================
+  # S3 Bucket for File Storage
+  # ================================
+  S3StorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - CreateCustomBucketName
+        - !Sub '${StorageBucketName}-${Environment}-${AWS::AccountId}'
+        - !Sub '${ProjectName}-storage-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+              - DELETE
+              - HEAD
+            AllowedOrigins:
+              - '*'
+            ExposedHeaders:
+              - x-amz-server-side-encryption
+              - x-amz-request-id
+              - x-amz-id-2
+              - ETag
+            MaxAge: 3000
+      VersioningConfiguration:
+        Status: !If [IsProdEnvironment, 'Enabled', 'Suspended']
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: !If [IsProdEnvironment, 'Enabled', 'Disabled']
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: mobile-backend-storage
+
+  # ================================
+  # Lambda Function for Custom Business Logic
+  # ================================
+  PostProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-post-processor'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt PostProcessorFunctionRole.Arn
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          
+          exports.handler = async (event) => {
+              console.log('Event received:', JSON.stringify(event, null, 2));
+              
+              try {
+                  // Example: Process post creation and send notifications
+                  if (event.typeName === 'Mutation' && event.fieldName === 'createPost') {
+                      const post = event.arguments.input;
+                      
+                      // Add processing logic here
+                      // Example: content moderation, image processing, etc.
+                      console.log('Processing post:', post);
+                      
+                      return {
+                          statusCode: 200,
+                          body: JSON.stringify({
+                              message: 'Post processed successfully',
+                              postId: post.id
+                          })
+                      };
+                  }
+                  
+                  return {
+                      statusCode: 200,
+                      body: JSON.stringify({ message: 'Function executed successfully' })
+                  };
+              } catch (error) {
+                  console.error('Error:', error);
+                  return {
+                      statusCode: 500,
+                      body: JSON.stringify({ error: 'Internal server error' })
+                  };
+              }
+          };
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref DynamoDBTable
+          PINPOINT_APP_ID: !Ref PinpointProject
+      Timeout: 30
+      MemorySize: 256
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: mobile-backend-processing
+
+  PostProcessorFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt DynamoDBTable.Arn
+                  - !Sub '${DynamoDBTable.Arn}/index/*'
+        - PolicyName: PinpointAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - mobiletargeting:SendMessages
+                  - mobiletargeting:SendUsersMessages
+                Resource: !Sub 'arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:apps/${PinpointProject}/*'
+
+  # ================================
+  # Amazon Pinpoint for Push Notifications
+  # ================================
+  PinpointProject:
+    Type: AWS::Pinpoint::App
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-analytics'
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        Purpose: mobile-backend-analytics
+
+  # ================================
+  # CloudWatch Alarms and Monitoring
+  # ================================
+  SNSAlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnableAlarmNotifications
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-alarms'
+      DisplayName: !Sub '${ProjectName} ${Environment} Alarms'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+
+  # AppSync Error Rate Alarm
+  AppSyncErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlarmNotifications
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-appsync-errors'
+      AlarmDescription: AppSync API error rate is too high
+      MetricName: 4XXError
+      Namespace: AWS/AppSync
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref SNSAlarmTopic
+      Dimensions:
+        - Name: GraphQLAPIId
+          Value: !GetAtt AppSyncApi.ApiId
+
+  # DynamoDB Throttle Alarm
+  DynamoDBThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlarmNotifications
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-dynamodb-throttles'
+      AlarmDescription: DynamoDB throttling detected
+      MetricName: UserErrors
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref SNSAlarmTopic
+      Dimensions:
+        - Name: TableName
+          Value: !Ref DynamoDBTable
+
+  # Lambda Function Error Alarm
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlarmNotifications
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-lambda-errors'
+      AlarmDescription: Lambda function error rate is too high
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref SNSAlarmTopic
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PostProcessorFunction
+
+Outputs:
+  # Cognito Configuration
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolId'
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref CognitoUserPoolClient
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolClientId'
+
+  IdentityPoolId:
+    Description: Cognito Identity Pool ID
+    Value: !Ref CognitoIdentityPool
+    Export:
+      Name: !Sub '${AWS::StackName}-IdentityPoolId'
+
+  UserPoolDomain:
+    Description: Cognito User Pool Domain
+    Value: !Sub 'https://${CognitoUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolDomain'
+
+  # AppSync Configuration
+  GraphQLApiId:
+    Description: AppSync GraphQL API ID
+    Value: !GetAtt AppSyncApi.ApiId
+    Export:
+      Name: !Sub '${AWS::StackName}-GraphQLApiId'
+
+  GraphQLApiUrl:
+    Description: AppSync GraphQL API URL
+    Value: !GetAtt AppSyncApi.GraphQLUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-GraphQLApiUrl'
+
+  GraphQLApiKey:
+    Description: AppSync GraphQL API Key (Note: Not used with Cognito auth)
+    Value: 'Not applicable - using Cognito User Pool authentication'
+
+  # Storage Configuration
+  S3BucketName:
+    Description: S3 bucket name for file storage
+    Value: !Ref S3StorageBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketName'
+
+  S3BucketArn:
+    Description: S3 bucket ARN for file storage
+    Value: !GetAtt S3StorageBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketArn'
+
+  # Database Configuration
+  DynamoDBTableName:
+    Description: DynamoDB table name
+    Value: !Ref DynamoDBTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableName'
+
+  DynamoDBTableArn:
+    Description: DynamoDB table ARN
+    Value: !GetAtt DynamoDBTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableArn'
+
+  # Analytics Configuration
+  PinpointProjectId:
+    Description: Amazon Pinpoint Project ID
+    Value: !Ref PinpointProject
+    Export:
+      Name: !Sub '${AWS::StackName}-PinpointProjectId'
+
+  # Lambda Configuration
+  PostProcessorFunctionName:
+    Description: Lambda function name for post processing
+    Value: !Ref PostProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-PostProcessorFunctionName'
+
+  PostProcessorFunctionArn:
+    Description: Lambda function ARN for post processing
+    Value: !GetAtt PostProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PostProcessorFunctionArn'
+
+  # IAM Roles
+  AuthenticatedRoleArn:
+    Description: IAM role ARN for authenticated users
+    Value: !GetAtt CognitoAuthenticatedRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AuthenticatedRoleArn'
+
+  UnauthenticatedRoleArn:
+    Description: IAM role ARN for unauthenticated users
+    Value: !GetAtt CognitoUnauthenticatedRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-UnauthenticatedRoleArn'
+
+  # Configuration Summary
+  AmplifyConfigJson:
+    Description: Amplify configuration in JSON format for client applications
+    Value: !Sub |
+      {
+        "aws_project_region": "${AWS::Region}",
+        "aws_cognito_identity_pool_id": "${CognitoIdentityPool}",
+        "aws_cognito_region": "${AWS::Region}",
+        "aws_user_pools_id": "${CognitoUserPool}",
+        "aws_user_pools_web_client_id": "${CognitoUserPoolClient}",
+        "oauth": {},
+        "aws_appsync_graphqlEndpoint": "${AppSyncApi.GraphQLUrl}",
+        "aws_appsync_region": "${AWS::Region}",
+        "aws_appsync_authenticationType": "AMAZON_COGNITO_USER_POOLS",
+        "aws_user_files_s3_bucket": "${S3StorageBucket}",
+        "aws_user_files_s3_bucket_region": "${AWS::Region}",
+        "aws_mobile_analytics_app_id": "${PinpointProject}",
+        "aws_mobile_analytics_app_region": "${AWS::Region}"
+      }
+
+  StackInformation:
+    Description: Information about the deployed stack
+    Value: !Sub |
+      Mobile Backend Infrastructure deployed successfully!
+      
+      Environment: ${Environment}
+      Project: ${ProjectName}
+      Region: ${AWS::Region}
+      
+      Next Steps:
+      1. Configure your mobile app with the Amplify configuration JSON above
+      2. Set up push notification certificates in Pinpoint console
+      3. Test authentication and API endpoints
+      4. Configure monitoring alerts with the SNS topic if email was provided
+      
+      Resources Created:
+      - Cognito User Pool for authentication
+      - AppSync GraphQL API with real-time subscriptions
+      - DynamoDB table for data storage
+      - S3 bucket for file storage
+      - Lambda function for custom business logic
+      - Pinpoint project for analytics and push notifications
+      - CloudWatch alarms for monitoring

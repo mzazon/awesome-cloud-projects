@@ -1,0 +1,760 @@
+# Infrastructure Manager Configuration for Multi-Database Disaster Recovery
+# This configuration deploys AlloyDB and Cloud Spanner across multiple regions
+# with automated backup orchestration and monitoring for disaster recovery
+
+# Terraform configuration block
+terraform:
+  required_version: ">= 1.0"
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 5.0"
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID for disaster recovery deployment"
+  
+  primary_region:
+    type: string
+    description: "Primary region for database deployment"
+    default: "us-central1"
+  
+  secondary_region:
+    type: string
+    description: "Secondary region for disaster recovery"
+    default: "us-east1"
+  
+  zone_primary:
+    type: string
+    description: "Primary zone for compute resources"
+    default: "us-central1-a"
+  
+  zone_secondary:
+    type: string
+    description: "Secondary zone for disaster recovery"
+    default: "us-east1-b"
+  
+  cluster_id:
+    type: string
+    description: "Unique identifier for AlloyDB cluster"
+    default: "alloydb-dr"
+  
+  spanner_instance_id:
+    type: string
+    description: "Unique identifier for Cloud Spanner instance"
+    default: "spanner-dr"
+  
+  backup_retention_days:
+    type: number
+    description: "Number of days to retain backups"
+    default: 14
+  
+  alloydb_cpu_count:
+    type: number
+    description: "CPU count for AlloyDB primary instance"
+    default: 4
+  
+  alloydb_memory_gb:
+    type: number
+    description: "Memory in GB for AlloyDB primary instance"
+    default: 16
+  
+  spanner_node_count:
+    type: number
+    description: "Number of nodes for Cloud Spanner instance"
+    default: 3
+  
+  enable_monitoring:
+    type: bool
+    description: "Enable comprehensive monitoring and alerting"
+    default: true
+  
+  admin_email:
+    type: string
+    description: "Administrator email for alerting notifications"
+
+# Local values for computed configurations
+locals:
+  # Generate unique suffixes for resource naming
+  random_suffix: "${random_id.suffix.hex}"
+  
+  # Backup bucket names with unique suffixes
+  backup_bucket_primary: "backup-primary-${local.random_suffix}"
+  backup_bucket_secondary: "backup-secondary-${local.random_suffix}"
+  
+  # Common labels for all resources
+  common_labels:
+    environment: "production"
+    purpose: "disaster-recovery"
+    managed-by: "infrastructure-manager"
+    project: "${var.project_id}"
+  
+  # Network CIDR ranges for multi-region setup
+  primary_subnet_cidr: "10.0.0.0/24"
+  secondary_subnet_cidr: "10.1.0.0/24"
+
+# Random ID generation for unique resource naming
+resources:
+  random_suffix:
+    type: "random_id"
+    properties:
+      byte_length: 4
+
+  # Google Cloud APIs required for disaster recovery solution
+  enable_apis:
+    type: "google_project_service"
+    properties:
+      project: "${var.project_id}"
+      service: 
+        - "alloydb.googleapis.com"
+        - "spanner.googleapis.com"
+        - "storage.googleapis.com"
+        - "cloudfunctions.googleapis.com"
+        - "cloudscheduler.googleapis.com"
+        - "monitoring.googleapis.com"
+        - "logging.googleapis.com"
+        - "pubsub.googleapis.com"
+        - "compute.googleapis.com"
+      disable_dependent_services: false
+
+  # VPC network for AlloyDB connectivity and security
+  disaster_recovery_network:
+    type: "google_compute_network"
+    properties:
+      name: "alloydb-dr-network"
+      project: "${var.project_id}"
+      auto_create_subnetworks: false
+      routing_mode: "REGIONAL"
+      description: "Dedicated network for disaster recovery database infrastructure"
+    depends_on:
+      - "enable_apis"
+
+  # Primary region subnet for AlloyDB cluster
+  primary_subnet:
+    type: "google_compute_subnetwork"
+    properties:
+      name: "alloydb-primary-subnet"
+      project: "${var.project_id}"
+      region: "${var.primary_region}"
+      network: "${disaster_recovery_network.self_link}"
+      ip_cidr_range: "${local.primary_subnet_cidr}"
+      description: "Primary subnet for AlloyDB cluster and associated resources"
+      
+      # Enable private Google access for managed services
+      private_ip_google_access: true
+      
+      # Secondary IP ranges for future expansion
+      secondary_ip_range:
+        - range_name: "pods"
+          ip_cidr_range: "10.0.1.0/24"
+        - range_name: "services"
+          ip_cidr_range: "10.0.2.0/24"
+    depends_on:
+      - "disaster_recovery_network"
+
+  # Secondary region subnet for disaster recovery
+  secondary_subnet:
+    type: "google_compute_subnetwork"
+    properties:
+      name: "alloydb-secondary-subnet"
+      project: "${var.project_id}"
+      region: "${var.secondary_region}"
+      network: "${disaster_recovery_network.self_link}"
+      ip_cidr_range: "${local.secondary_subnet_cidr}"
+      description: "Secondary subnet for disaster recovery AlloyDB cluster"
+      
+      # Enable private Google access for managed services
+      private_ip_google_access: true
+      
+      # Secondary IP ranges for disaster recovery expansion
+      secondary_ip_range:
+        - range_name: "pods-dr"
+          ip_cidr_range: "10.1.1.0/24"
+        - range_name: "services-dr"
+          ip_cidr_range: "10.1.2.0/24"
+    depends_on:
+      - "disaster_recovery_network"
+
+  # Cloud Storage bucket for primary region backups
+  backup_bucket_primary:
+    type: "google_storage_bucket"
+    properties:
+      name: "${local.backup_bucket_primary}"
+      project: "${var.project_id}"
+      location: "${var.primary_region}"
+      storage_class: "STANDARD"
+      
+      # Enable versioning for backup integrity
+      versioning:
+        enabled: true
+      
+      # Lifecycle management for cost optimization
+      lifecycle_rule:
+        - condition:
+            age: 30
+          action:
+            type: "SetStorageClass"
+            storage_class: "NEARLINE"
+        - condition:
+            age: 90
+          action:
+            type: "SetStorageClass"
+            storage_class: "COLDLINE"
+        - condition:
+            age: "${var.backup_retention_days * 10}"
+          action:
+            type: "Delete"
+      
+      # Security and access controls
+      uniform_bucket_level_access: true
+      
+      labels: "${local.common_labels}"
+    depends_on:
+      - "enable_apis"
+
+  # Cloud Storage bucket for secondary region backups
+  backup_bucket_secondary:
+    type: "google_storage_bucket"
+    properties:
+      name: "${local.backup_bucket_secondary}"
+      project: "${var.project_id}"
+      location: "${var.secondary_region}"
+      storage_class: "STANDARD"
+      
+      # Enable versioning for backup integrity
+      versioning:
+        enabled: true
+      
+      # Lifecycle management for cost optimization
+      lifecycle_rule:
+        - condition:
+            age: 30
+          action:
+            type: "SetStorageClass"
+            storage_class: "NEARLINE"
+        - condition:
+            age: 90
+          action:
+            type: "SetStorageClass"
+            storage_class: "COLDLINE"
+        - condition:
+            age: "${var.backup_retention_days * 10}"
+          action:
+            type: "Delete"
+      
+      # Security and access controls
+      uniform_bucket_level_access: true
+      
+      labels: "${local.common_labels}"
+    depends_on:
+      - "enable_apis"
+
+  # AlloyDB cluster in primary region with HA and backup configuration
+  alloydb_primary_cluster:
+    type: "google_alloydb_cluster"
+    properties:
+      cluster_id: "${var.cluster_id}"
+      project: "${var.project_id}"
+      location: "${var.primary_region}"
+      
+      # Network configuration for private connectivity
+      network_config:
+        network: "${disaster_recovery_network.id}"
+        allocated_ip_range: "${primary_subnet.name}"
+      
+      # Continuous backup configuration for disaster recovery
+      continuous_backup_config:
+        enabled: true
+        recovery_window_days: "${var.backup_retention_days}"
+        
+        # Encryption configuration for backup security
+        encryption_config:
+          kms_key_name: "${backup_encryption_key.id}"
+      
+      # Automated backup policy for regular snapshots
+      automated_backup_policy:
+        enabled: true
+        
+        # Backup schedule during low-usage hours
+        backup_window: "02:00"
+        
+        # Weekly backup schedule
+        weekly_schedule:
+          days_of_week: ["MONDAY", "WEDNESDAY", "FRIDAY"]
+          start_times:
+            - hours: 2
+              minutes: 0
+        
+        # Backup retention configuration
+        retention_count: 7
+        retention_period: "${var.backup_retention_days * 24}h"
+        
+        # Cross-region backup location for disaster recovery
+        location: "${var.secondary_region}"
+        
+        labels: "${local.common_labels}"
+      
+      # Resource labels for management and billing
+      labels: "${merge(local.common_labels, {
+        cluster-type = "primary",
+        database-engine = "postgresql"
+      })}"
+    depends_on:
+      - "primary_subnet"
+      - "backup_encryption_key"
+
+  # Primary AlloyDB instance with high availability configuration
+  alloydb_primary_instance:
+    type: "google_alloydb_instance"
+    properties:
+      instance_id: "${var.cluster_id}-primary"
+      project: "${var.project_id}"
+      location: "${var.primary_region}"
+      cluster: "${alloydb_primary_cluster.name}"
+      instance_type: "PRIMARY"
+      
+      # Machine configuration for production workloads
+      machine_config:
+        cpu_count: "${var.alloydb_cpu_count}"
+      
+      # Database configuration and performance settings
+      database_flags:
+        "max_connections": "200"
+        "shared_preload_libraries": "pg_stat_statements"
+        "log_statement": "all"
+        "log_duration": "on"
+        "log_min_duration_statement": "1000"
+      
+      # High availability configuration
+      availability_type: "REGIONAL"
+      
+      # Enable public IP for management access (configure firewall rules separately)
+      enable_public_ip: true
+      
+      # Resource labels for management
+      labels: "${merge(local.common_labels, {
+        instance-role = "primary",
+        availability = "regional"
+      })}"
+    depends_on:
+      - "alloydb_primary_cluster"
+
+  # AlloyDB secondary cluster for cross-region disaster recovery
+  alloydb_secondary_cluster:
+    type: "google_alloydb_cluster"
+    properties:
+      cluster_id: "${var.cluster_id}-secondary"
+      project: "${var.project_id}"
+      location: "${var.secondary_region}"
+      cluster_type: "SECONDARY"
+      
+      # Network configuration for secondary region
+      network_config:
+        network: "${disaster_recovery_network.id}"
+        allocated_ip_range: "${secondary_subnet.name}"
+      
+      # Reference to primary cluster for replication
+      secondary_config:
+        primary_cluster_name: "${alloydb_primary_cluster.name}"
+      
+      # Resource labels for disaster recovery management
+      labels: "${merge(local.common_labels, {
+        cluster-type = "secondary",
+        database-engine = "postgresql",
+        purpose = "disaster-recovery"
+      })}"
+    depends_on:
+      - "alloydb_primary_cluster"
+      - "secondary_subnet"
+
+  # Read replica instance in secondary cluster
+  alloydb_secondary_instance:
+    type: "google_alloydb_instance"
+    properties:
+      instance_id: "${var.cluster_id}-secondary-replica"
+      project: "${var.project_id}"
+      location: "${var.secondary_region}"
+      cluster: "${alloydb_secondary_cluster.name}"
+      instance_type: "READ_POOL"
+      
+      # Machine configuration for read workloads
+      machine_config:
+        cpu_count: 2
+      
+      # Read pool configuration for disaster recovery
+      read_pool_config:
+        node_count: 2
+      
+      # Regional availability for read replica
+      availability_type: "REGIONAL"
+      
+      # Resource labels for read replica management
+      labels: "${merge(local.common_labels, {
+        instance-role = "read-replica",
+        availability = "regional"
+      })}"
+    depends_on:
+      - "alloydb_secondary_cluster"
+
+  # Cloud Spanner instance with multi-region configuration
+  spanner_instance:
+    type: "google_spanner_instance"
+    properties:
+      name: "${var.spanner_instance_id}"
+      project: "${var.project_id}"
+      config: "nam-eur-asia1"  # Multi-region configuration for global distribution
+      display_name: "Multi-region Spanner for disaster recovery"
+      num_nodes: "${var.spanner_node_count}"
+      
+      # Resource labels for Spanner management
+      labels: "${merge(local.common_labels, {
+        database-type = "spanner",
+        distribution = "multi-region"
+      })}"
+    depends_on:
+      - "enable_apis"
+
+  # Cloud Spanner database with schema for critical data
+  spanner_database:
+    type: "google_spanner_database"
+    properties:
+      name: "critical-data"
+      project: "${var.project_id}"
+      instance: "${spanner_instance.name}"
+      
+      # Database schema for critical business data
+      ddl: [
+        "CREATE TABLE UserProfiles (
+          UserId STRING(64) NOT NULL,
+          UserName STRING(100),
+          Email STRING(255),
+          CreatedAt TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+          LastModified TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+          Region STRING(50),
+          Status STRING(20),
+        ) PRIMARY KEY (UserId)",
+        
+        "CREATE TABLE TransactionLog (
+          TransactionId STRING(64) NOT NULL,
+          UserId STRING(64) NOT NULL,
+          Amount NUMERIC,
+          Currency STRING(3),
+          Timestamp TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+          Status STRING(20),
+          Source STRING(50),
+        ) PRIMARY KEY (TransactionId),
+          INTERLEAVE IN PARENT UserProfiles ON DELETE CASCADE"
+      ]
+      
+      # Deletion protection for production database
+      deletion_protection: true
+    depends_on:
+      - "spanner_instance"
+
+  # Cloud KMS key for backup encryption
+  backup_encryption_key:
+    type: "google_kms_crypto_key"
+    properties:
+      name: "disaster-recovery-backup-key"
+      key_ring: "${backup_key_ring.id}"
+      
+      # Key rotation for security
+      rotation_period: "7776000s"  # 90 days
+      
+      # Backup encryption purpose
+      purpose: "ENCRYPT_DECRYPT"
+      
+      labels: "${local.common_labels}"
+    depends_on:
+      - "backup_key_ring"
+
+  # KMS key ring for backup encryption keys
+  backup_key_ring:
+    type: "google_kms_key_ring"
+    properties:
+      name: "disaster-recovery-keys"
+      location: "${var.primary_region}"
+      project: "${var.project_id}"
+    depends_on:
+      - "enable_apis"
+
+  # Pub/Sub topic for data synchronization events
+  sync_events_topic:
+    type: "google_pubsub_topic"
+    properties:
+      name: "database-sync-events"
+      project: "${var.project_id}"
+      
+      # Message retention for reliable processing
+      message_retention_duration: "604800s"  # 7 days
+      
+      labels: "${local.common_labels}"
+    depends_on:
+      - "enable_apis"
+
+  # Pub/Sub subscription for monitoring sync operations
+  sync_monitoring_subscription:
+    type: "google_pubsub_subscription"
+    properties:
+      name: "database-sync-monitoring"
+      project: "${var.project_id}"
+      topic: "${sync_events_topic.name}"
+      
+      # Message retention for monitoring
+      message_retention_duration: "604800s"  # 7 days
+      
+      # Acknowledgment deadline for processing
+      ack_deadline_seconds: 300
+      
+      labels: "${local.common_labels}"
+    depends_on:
+      - "sync_events_topic"
+
+  # Service account for backup orchestration functions
+  backup_orchestrator_sa:
+    type: "google_service_account"
+    properties:
+      account_id: "backup-orchestrator"
+      project: "${var.project_id}"
+      display_name: "Disaster Recovery Backup Orchestrator"
+      description: "Service account for automated backup orchestration functions"
+    depends_on:
+      - "enable_apis"
+
+  # IAM binding for AlloyDB admin access
+  backup_orchestrator_alloydb_binding:
+    type: "google_project_iam_member"
+    properties:
+      project: "${var.project_id}"
+      role: "roles/alloydb.admin"
+      member: "serviceAccount:${backup_orchestrator_sa.email}"
+    depends_on:
+      - "backup_orchestrator_sa"
+
+  # IAM binding for Spanner admin access
+  backup_orchestrator_spanner_binding:
+    type: "google_project_iam_member"
+    properties:
+      project: "${var.project_id}"
+      role: "roles/spanner.admin"
+      member: "serviceAccount:${backup_orchestrator_sa.email}"
+    depends_on:
+      - "backup_orchestrator_sa"
+
+  # IAM binding for Storage admin access
+  backup_orchestrator_storage_binding:
+    type: "google_project_iam_member"
+    properties:
+      project: "${var.project_id}"
+      role: "roles/storage.admin"
+      member: "serviceAccount:${backup_orchestrator_sa.email}"
+    depends_on:
+      - "backup_orchestrator_sa"
+
+  # Cloud Scheduler job for automated backup orchestration
+  backup_scheduler_job:
+    type: "google_cloud_scheduler_job"
+    properties:
+      name: "disaster-recovery-backup-job"
+      project: "${var.project_id}"
+      region: "${var.primary_region}"
+      description: "Automated disaster recovery backup orchestration every 6 hours"
+      
+      # Schedule every 6 hours
+      schedule: "0 */6 * * *"
+      time_zone: "UTC"
+      
+      # HTTP target configuration (placeholder for Cloud Function)
+      http_target:
+        uri: "https://example.com/backup-orchestrator"  # Will be updated after function deployment
+        http_method: "POST"
+        headers:
+          "Content-Type": "application/json"
+        body: "${base64encode(jsonencode({
+          action = "backup"
+          priority = "high"
+        }))}"
+      
+      # Retry configuration for reliability
+      retry_config:
+        retry_count: 3
+        max_retry_duration: "300s"
+        min_backoff_duration: "5s"
+        max_backoff_duration: "60s"
+    depends_on:
+      - "enable_apis"
+
+  # Conditional monitoring dashboard creation
+  monitoring_dashboard:
+    type: "google_monitoring_dashboard"
+    count: "${var.enable_monitoring ? 1 : 0}"
+    properties:
+      dashboard_json: "${jsonencode({
+        displayName = "Multi-Database Disaster Recovery Dashboard"
+        mosaicLayout = {
+          tiles = [
+            {
+              width = 6
+              height = 4
+              widget = {
+                title = "AlloyDB Cluster Health"
+                xyChart = {
+                  dataSets = [
+                    {
+                      timeSeriesQuery = {
+                        timeSeriesFilter = {
+                          filter = "resource.type=\"alloydb_cluster\""
+                          aggregation = {
+                            alignmentPeriod = "300s"
+                            perSeriesAligner = "ALIGN_MEAN"
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              width = 6
+              height = 4
+              xPos = 6
+              widget = {
+                title = "Cloud Spanner Instance Metrics"
+                xyChart = {
+                  dataSets = [
+                    {
+                      timeSeriesQuery = {
+                        timeSeriesFilter = {
+                          filter = "resource.type=\"spanner_instance\""
+                          aggregation = {
+                            alignmentPeriod = "300s"
+                            perSeriesAligner = "ALIGN_MEAN"
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      })}"
+    depends_on:
+      - "alloydb_primary_cluster"
+      - "spanner_instance"
+
+  # Conditional notification channel for disaster recovery alerts
+  alert_notification_channel:
+    type: "google_monitoring_notification_channel"
+    count: "${var.enable_monitoring && var.admin_email != \"\" ? 1 : 0}"
+    properties:
+      display_name: "Disaster Recovery Alerts"
+      type: "email"
+      labels:
+        email_address: "${var.admin_email}"
+      description: "Critical alerts for disaster recovery scenarios"
+    depends_on:
+      - "enable_apis"
+
+# Output values for integration and verification
+outputs:
+  # Network infrastructure outputs
+  network_name:
+    description: "Name of the VPC network created for disaster recovery"
+    value: "${disaster_recovery_network.name}"
+  
+  primary_subnet_name:
+    description: "Name of the primary region subnet"
+    value: "${primary_subnet.name}"
+  
+  secondary_subnet_name:
+    description: "Name of the secondary region subnet"
+    value: "${secondary_subnet.name}"
+  
+  # AlloyDB cluster outputs
+  alloydb_primary_cluster_name:
+    description: "Name of the primary AlloyDB cluster"
+    value: "${alloydb_primary_cluster.name}"
+  
+  alloydb_primary_instance_ip:
+    description: "IP address of the primary AlloyDB instance"
+    value: "${alloydb_primary_instance.ip_address}"
+    sensitive: true
+  
+  alloydb_secondary_cluster_name:
+    description: "Name of the secondary AlloyDB cluster"
+    value: "${alloydb_secondary_cluster.name}"
+  
+  # Cloud Spanner outputs
+  spanner_instance_name:
+    description: "Name of the Cloud Spanner instance"
+    value: "${spanner_instance.name}"
+  
+  spanner_database_name:
+    description: "Name of the Cloud Spanner database"
+    value: "${spanner_database.name}"
+  
+  # Storage outputs
+  backup_bucket_primary_name:
+    description: "Name of the primary backup bucket"
+    value: "${backup_bucket_primary.name}"
+  
+  backup_bucket_secondary_name:
+    description: "Name of the secondary backup bucket"
+    value: "${backup_bucket_secondary.name}"
+  
+  # Pub/Sub outputs
+  sync_topic_name:
+    description: "Name of the data synchronization Pub/Sub topic"
+    value: "${sync_events_topic.name}"
+  
+  # Service account outputs
+  backup_orchestrator_email:
+    description: "Email of the backup orchestrator service account"
+    value: "${backup_orchestrator_sa.email}"
+  
+  # Scheduler outputs
+  backup_job_name:
+    description: "Name of the automated backup scheduler job"
+    value: "${backup_scheduler_job.name}"
+  
+  # Security outputs
+  encryption_key_name:
+    description: "Name of the backup encryption key"
+    value: "${backup_encryption_key.name}"
+  
+  # Monitoring outputs (conditional)
+  monitoring_dashboard_url:
+    description: "URL of the monitoring dashboard (if enabled)"
+    value: "${var.enable_monitoring ? \"https://console.cloud.google.com/monitoring/dashboards/custom/${google_monitoring_dashboard.monitoring_dashboard[0].id}\" : \"\"}"
+  
+  # Connection information
+  connection_info:
+    description: "Connection information for database access"
+    value: {
+      alloydb_primary_endpoint = "${alloydb_primary_instance.ip_address}:5432"
+      alloydb_secondary_endpoint = "${alloydb_secondary_instance.ip_address}:5432"
+      spanner_instance_id = "${spanner_instance.name}"
+      spanner_database_id = "${spanner_database.name}"
+    }
+    sensitive: true
+  
+  # Deployment summary
+  deployment_summary:
+    description: "Summary of deployed disaster recovery infrastructure"
+    value: {
+      primary_region = "${var.primary_region}"
+      secondary_region = "${var.secondary_region}"
+      alloydb_clusters = 2
+      spanner_instances = 1
+      backup_buckets = 2
+      monitoring_enabled = "${var.enable_monitoring}"
+      encryption_enabled = true
+    }

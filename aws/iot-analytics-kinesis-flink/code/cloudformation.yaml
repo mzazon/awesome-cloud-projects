@@ -1,0 +1,703 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Real-Time IoT Analytics Pipeline with Kinesis Data Streams, Managed Service for Apache Flink, Lambda, and S3'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'iot-analytics'
+    Description: 'Name prefix for all resources'
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+    MinLength: 3
+    MaxLength: 20
+
+  KinesisShardCount:
+    Type: Number
+    Default: 2
+    Description: 'Number of shards for Kinesis Data Stream'
+    MinValue: 1
+    MaxValue: 10
+    ConstraintDescription: 'Must be between 1 and 10'
+
+  KinesisRetentionPeriod:
+    Type: Number
+    Default: 24
+    Description: 'Data retention period in hours for Kinesis stream'
+    MinValue: 24
+    MaxValue: 168
+    ConstraintDescription: 'Must be between 24 and 168 hours'
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    Description: 'Memory size for Lambda function in MB'
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+    ConstraintDescription: 'Must be a valid Lambda memory size'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    Description: 'Timeout for Lambda function in seconds'
+    MinValue: 30
+    MaxValue: 900
+    ConstraintDescription: 'Must be between 30 and 900 seconds'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for SNS notifications'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  AnalyticsWindowMinutes:
+    Type: Number
+    Default: 5
+    Description: 'Window size for analytics aggregation in minutes'
+    MinValue: 1
+    MaxValue: 60
+    ConstraintDescription: 'Must be between 1 and 60 minutes'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name for resource tagging'
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # S3 Bucket for Data Storage
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-data-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldData
+            Status: Enabled
+            ExpirationInDays: !If [IsProduction, 365, 30]
+          - Id: TransitionToIA
+            Status: Enabled
+            TransitionInDays: 30
+            StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            TransitionInDays: 90
+            StorageClass: GLACIER
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt DataProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: raw-data/
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'IoT Data Storage'
+
+  # Kinesis Data Stream
+  IoTDataStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${ProjectName}-stream'
+      ShardCount: !Ref KinesisShardCount
+      RetentionPeriodHours: !Ref KinesisRetentionPeriod
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'IoT Data Ingestion'
+
+  # SNS Topic for Alerts
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-alerts'
+      DisplayName: 'IoT Analytics Alerts'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Alert Notifications'
+
+  # SNS Email Subscription
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: KinesisReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:ListStreams
+                Resource: !GetAtt IoTDataStream.Arn
+        - PolicyName: S3WriteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub '${DataBucket}/*'
+        - PolicyName: SNSPublishAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AlertTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function for IoT Data Processing
+  DataProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-processor'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref DataBucket
+          SNS_TOPIC_ARN: !Ref AlertTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import base64
+          from datetime import datetime
+          import os
+          
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              bucket_name = os.environ['S3_BUCKET_NAME']
+              topic_arn = os.environ['SNS_TOPIC_ARN']
+              
+              processed_records = []
+              
+              for record in event['Records']:
+                  # Decode Kinesis data
+                  payload = base64.b64decode(record['kinesis']['data']).decode('utf-8')
+                  data = json.loads(payload)
+                  
+                  # Process the IoT data
+                  processed_data = process_iot_data(data)
+                  processed_records.append(processed_data)
+                  
+                  # Store raw data in S3
+                  timestamp = datetime.now().strftime('%Y/%m/%d/%H')
+                  key = f"raw-data/{timestamp}/{record['kinesis']['sequenceNumber']}.json"
+                  
+                  s3.put_object(
+                      Bucket=bucket_name,
+                      Key=key,
+                      Body=json.dumps(data),
+                      ContentType='application/json'
+                  )
+                  
+                  # Check for anomalies and send alerts
+                  if is_anomaly(processed_data):
+                      send_alert(processed_data, topic_arn)
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(f'Processed {len(processed_records)} records')
+              }
+          
+          def process_iot_data(data):
+              """Process IoT sensor data"""
+              return {
+                  'device_id': data.get('device_id'),
+                  'timestamp': data.get('timestamp'),
+                  'sensor_type': data.get('sensor_type'),
+                  'value': data.get('value'),
+                  'unit': data.get('unit'),
+                  'location': data.get('location'),
+                  'processed_at': datetime.now().isoformat()
+              }
+          
+          def is_anomaly(data):
+              """Simple anomaly detection logic"""
+              if data['sensor_type'] == 'temperature' and data['value'] > 80:
+                  return True
+              if data['sensor_type'] == 'pressure' and data['value'] > 100:
+                  return True
+              if data['sensor_type'] == 'vibration' and data['value'] > 50:
+                  return True
+              return False
+          
+          def send_alert(data, topic_arn):
+              """Send alert via SNS"""
+              message = f"ALERT: Anomaly detected in {data['sensor_type']} sensor {data['device_id']}. Value: {data['value']} {data['unit']}"
+              
+              sns.publish(
+                  TopicArn=topic_arn,
+                  Message=message,
+                  Subject="IoT Sensor Anomaly Alert"
+              )
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'IoT Data Processing'
+
+  # Lambda Permission for S3
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DataProcessorFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub '${DataBucket}/*'
+
+  # Kinesis to Lambda Event Source Mapping
+  KinesisEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt IoTDataStream.Arn
+      FunctionName: !Ref DataProcessorFunction
+      StartingPosition: LATEST
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      ParallelizationFactor: 1
+
+  # IAM Role for Flink Application
+  FlinkExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-flink-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: kinesisanalytics.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: KinesisReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:ListStreams
+                Resource: !GetAtt IoTDataStream.Arn
+        - PolicyName: S3FullAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: 
+                  - !Sub '${DataBucket}'
+                  - !Sub '${DataBucket}/*'
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Flink Application Code S3 Object
+  FlinkApplicationCode:
+    Type: AWS::S3::Object
+    Properties:
+      Bucket: !Ref DataBucket
+      Key: flink-app/flink-application.py
+      Content: |
+        from pyflink.table import EnvironmentSettings, TableEnvironment
+        from pyflink.table.descriptors import Schema, Kafka, Json
+        import os
+        
+        def create_iot_analytics_job():
+            # Set up the execution environment
+            env_settings = EnvironmentSettings.new_instance().in_streaming_mode().build()
+            table_env = TableEnvironment.create(env_settings)
+            
+            # Define source table from Kinesis
+            source_ddl = f"""
+            CREATE TABLE iot_source (
+                device_id STRING,
+                timestamp TIMESTAMP(3),
+                sensor_type STRING,
+                value DOUBLE,
+                unit STRING,
+                location STRING,
+                WATERMARK FOR timestamp AS timestamp - INTERVAL '5' SECOND
+            ) WITH (
+                'connector' = 'kinesis',
+                'stream' = '{os.environ['KINESIS_STREAM_NAME']}',
+                'aws.region' = '{os.environ['AWS_REGION']}',
+                'format' = 'json'
+            )
+            """
+            
+            # Define sink table to S3
+            sink_ddl = f"""
+            CREATE TABLE iot_analytics_sink (
+                device_id STRING,
+                sensor_type STRING,
+                location STRING,
+                avg_value DOUBLE,
+                max_value DOUBLE,
+                min_value DOUBLE,
+                window_start TIMESTAMP(3),
+                window_end TIMESTAMP(3)
+            ) WITH (
+                'connector' = 's3',
+                'path' = 's3://{os.environ['S3_BUCKET_NAME']}/analytics-results/',
+                'format' = 'json'
+            )
+            """
+            
+            # Create tables
+            table_env.execute_sql(source_ddl)
+            table_env.execute_sql(sink_ddl)
+            
+            # Define analytics query
+            analytics_query = f"""
+            INSERT INTO iot_analytics_sink
+            SELECT 
+                device_id,
+                sensor_type,
+                location,
+                AVG(value) as avg_value,
+                MAX(value) as max_value,
+                MIN(value) as min_value,
+                TUMBLE_START(timestamp, INTERVAL '{os.environ['ANALYTICS_WINDOW_MINUTES']}' MINUTE) as window_start,
+                TUMBLE_END(timestamp, INTERVAL '{os.environ['ANALYTICS_WINDOW_MINUTES']}' MINUTE) as window_end
+            FROM iot_source
+            GROUP BY 
+                device_id,
+                sensor_type,
+                location,
+                TUMBLE(timestamp, INTERVAL '{os.environ['ANALYTICS_WINDOW_MINUTES']}' MINUTE)
+            """
+            
+            # Execute the query
+            table_env.execute_sql(analytics_query)
+        
+        if __name__ == "__main__":
+            create_iot_analytics_job()
+      ContentType: text/plain
+
+  # Managed Service for Apache Flink Application
+  FlinkApplication:
+    Type: AWS::KinesisAnalyticsV2::Application
+    Properties:
+      ApplicationName: !Sub '${ProjectName}-flink-app'
+      RuntimeEnvironment: FLINK-1_18
+      ServiceExecutionRole: !GetAtt FlinkExecutionRole.Arn
+      ApplicationConfiguration:
+        ApplicationCodeConfiguration:
+          CodeContent:
+            S3ContentLocation:
+              BucketARN: !GetAtt DataBucket.Arn
+              FileKey: flink-app/flink-application.py
+          CodeContentType: ZIPFILE
+        EnvironmentProperties:
+          PropertyGroups:
+            - PropertyGroupId: kinesis.analytics.flink.run.options
+              PropertyMap:
+                python: flink-application.py
+            - PropertyGroupId: kinesis.analytics.flink.run.options
+              PropertyMap:
+                KINESIS_STREAM_NAME: !Ref IoTDataStream
+                S3_BUCKET_NAME: !Ref DataBucket
+                ANALYTICS_WINDOW_MINUTES: !Ref AnalyticsWindowMinutes
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Stream Analytics'
+
+  # CloudWatch Alarm for Kinesis Stream
+  KinesisRecordsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-kinesis-records'
+      AlarmDescription: 'Monitor Kinesis stream incoming records'
+      MetricName: IncomingRecords
+      Namespace: AWS/Kinesis
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: StreamName
+          Value: !Ref IoTDataStream
+      AlarmActions:
+        - !Ref AlertTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarm for Lambda Errors
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors'
+      AlarmDescription: 'Monitor Lambda function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DataProcessorFunction
+      AlarmActions:
+        - !Ref AlertTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Dashboard
+  AnalyticsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-analytics'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Kinesis", "IncomingRecords", "StreamName", "${IoTDataStream}" ],
+                  [ ".", "OutgoingRecords", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Kinesis Stream Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${DataProcessorFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  # Infrastructure Outputs
+  DataBucketName:
+    Description: 'S3 bucket name for data storage'
+    Value: !Ref DataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBucket'
+
+  KinesisStreamName:
+    Description: 'Kinesis Data Stream name'
+    Value: !Ref IoTDataStream
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisStream'
+
+  KinesisStreamArn:
+    Description: 'Kinesis Data Stream ARN'
+    Value: !GetAtt IoTDataStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisStreamArn'
+
+  LambdaFunctionName:
+    Description: 'Lambda function name for data processing'
+    Value: !Ref DataProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
+
+  LambdaFunctionArn:
+    Description: 'Lambda function ARN'
+    Value: !GetAtt DataProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  FlinkApplicationName:
+    Description: 'Flink application name'
+    Value: !Ref FlinkApplication
+    Export:
+      Name: !Sub '${AWS::StackName}-FlinkApplication'
+
+  SNSTopicArn:
+    Description: 'SNS topic ARN for alerts'
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopic'
+
+  # Monitoring Outputs
+  DashboardURL:
+    Description: 'CloudWatch dashboard URL'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-analytics'
+
+  # Configuration Outputs
+  DataIngestionEndpoint:
+    Description: 'Kinesis stream endpoint for data ingestion'
+    Value: !Sub 'https://kinesis.${AWS::Region}.amazonaws.com'
+
+  RawDataPrefix:
+    Description: 'S3 prefix for raw data storage'
+    Value: !Sub 's3://${DataBucket}/raw-data/'
+
+  ProcessedDataPrefix:
+    Description: 'S3 prefix for processed data storage'
+    Value: !Sub 's3://${DataBucket}/processed-data/'
+
+  AnalyticsResultsPrefix:
+    Description: 'S3 prefix for analytics results storage'
+    Value: !Sub 's3://${DataBucket}/analytics-results/'
+
+  # Testing Outputs
+  TestDataCommand:
+    Description: 'AWS CLI command to send test data'
+    Value: !Sub |
+      aws kinesis put-record \
+        --stream-name ${IoTDataStream} \
+        --partition-key test-device \
+        --data '{"device_id":"test-sensor-001","timestamp":"2024-01-01T00:00:00Z","sensor_type":"temperature","value":25.5,"unit":"°C","location":"factory-floor-1"}'
+
+  SimulatorCommand:
+    Description: 'Command to run IoT data simulator'
+    Value: !Sub 'python3 iot-simulator.py ${IoTDataStream}'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Project Configuration'
+        Parameters:
+          - ProjectName
+          - Environment
+          - NotificationEmail
+      - Label:
+          default: 'Kinesis Configuration'
+        Parameters:
+          - KinesisShardCount
+          - KinesisRetentionPeriod
+      - Label:
+          default: 'Lambda Configuration'
+        Parameters:
+          - LambdaMemorySize
+          - LambdaTimeout
+      - Label:
+          default: 'Analytics Configuration'
+        Parameters:
+          - AnalyticsWindowMinutes
+    ParameterLabels:
+      ProjectName:
+        default: 'Project Name'
+      Environment:
+        default: 'Environment'
+      NotificationEmail:
+        default: 'Notification Email'
+      KinesisShardCount:
+        default: 'Kinesis Shard Count'
+      KinesisRetentionPeriod:
+        default: 'Kinesis Retention Period (hours)'
+      LambdaMemorySize:
+        default: 'Lambda Memory Size (MB)'
+      LambdaTimeout:
+        default: 'Lambda Timeout (seconds)'
+      AnalyticsWindowMinutes:
+        default: 'Analytics Window Size (minutes)'

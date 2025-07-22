@@ -1,0 +1,669 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for real-time data transformation with Amazon Kinesis Data Firehose, Lambda, and S3'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'firehose-transform'
+    Description: 'Name prefix for all resources'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+    MaxLength: 20
+    MinLength: 3
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - 'dev'
+      - 'staging'
+      - 'prod'
+    Description: 'Environment name for resource tagging and naming'
+
+  LogLevel:
+    Type: String
+    Default: 'INFO'
+    AllowedValues:
+      - 'DEBUG'
+      - 'INFO'
+      - 'WARN'
+      - 'ERROR'
+    Description: 'Minimum log level to process (logs below this level will be filtered out)'
+
+  BufferSizeInMBs:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 128
+    Description: 'Buffer size in MB for Firehose delivery (1-128 MB)'
+
+  BufferIntervalInSeconds:
+    Type: Number
+    Default: 60
+    MinValue: 60
+    MaxValue: 900
+    Description: 'Buffer interval in seconds for Firehose delivery (60-900 seconds)'
+
+  LambdaBufferSizeInMBs:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 128
+    Description: 'Buffer size in MB for Lambda processing (1-128 MB)'
+
+  LambdaBufferIntervalInSeconds:
+    Type: Number
+    Default: 60
+    MinValue: 60
+    MaxValue: 900
+    Description: 'Buffer interval in seconds for Lambda processing (60-900 seconds)'
+
+  EnableCloudWatchLogs:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable CloudWatch logging for Firehose delivery stream'
+
+  EnableSNSNotifications:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable SNS notifications for CloudWatch alarms'
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for alarm notifications (leave empty to skip email subscription)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+Conditions:
+  CreateCloudWatchLogs: !Equals [!Ref EnableCloudWatchLogs, 'true']
+  CreateSNSNotifications: !Equals [!Ref EnableSNSNotifications, 'true']
+  CreateEmailSubscription: !And 
+    - !Condition CreateSNSNotifications
+    - !Not [!Equals [!Ref NotificationEmail, '']]
+
+Resources:
+  # S3 Buckets for data storage
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-raw-data-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: TransitionToIA
+            Status: Enabled
+            TransitionInDays: 30
+            StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            TransitionInDays: 90
+            StorageClass: GLACIER
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-raw-data-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Raw data backup for Kinesis Firehose'
+
+  ProcessedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-processed-data-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: TransitionToIA
+            Status: Enabled
+            TransitionInDays: 30
+            StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            TransitionInDays: 90
+            StorageClass: GLACIER
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-processed-data-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Processed data destination for Kinesis Firehose'
+
+  ErrorDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-error-data-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: DeleteErrorRecords
+            Status: Enabled
+            ExpirationInDays: 365
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-error-data-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Error data destination for Kinesis Firehose'
+
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: FirehoseTransformPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - firehose:DescribeDeliveryStream
+                  - firehose:ListDeliveryStreams
+                  - firehose:ListTagsForDeliveryStream
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !Sub '${ErrorDataBucket}'
+                  - !Sub '${ErrorDataBucket}/*'
+                  - !Sub '${ProcessedDataBucket}'
+                  - !Sub '${ProcessedDataBucket}/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function for Data Transformation
+  TransformLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-transform-function-${Environment}'
+      Runtime: nodejs16.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Description: 'Transform function for Kinesis Data Firehose'
+      Environment:
+        Variables:
+          MIN_LOG_LEVEL: !Ref LogLevel
+          ADD_PROCESSING_TIMESTAMP: 'true'
+          FIELDS_TO_REDACT: 'password,creditCard,ssn'
+      Code:
+        ZipFile: |
+          /**
+           * Kinesis Firehose Data Transformation Lambda
+           * - Processes incoming log records
+           * - Filters out records that don't match criteria
+           * - Transforms and enriches valid records
+           * - Returns both processed records and failed records
+           */
+          
+          // Configuration options from environment variables
+          const config = {
+              minLogLevel: process.env.MIN_LOG_LEVEL || 'INFO',
+              addProcessingTimestamp: process.env.ADD_PROCESSING_TIMESTAMP === 'true',
+              fieldsToRedact: process.env.FIELDS_TO_REDACT ? process.env.FIELDS_TO_REDACT.split(',') : ['password', 'creditCard', 'ssn']
+          };
+          
+          exports.handler = async (event, context) => {
+              console.log('Received event:', JSON.stringify(event, null, 2));
+              
+              const output = {
+                  records: []
+              };
+              
+              // Process each record in the batch
+              for (const record of event.records) {
+                  console.log('Processing record:', record.recordId);
+                  
+                  try {
+                      // Decode and parse the record data
+                      const buffer = Buffer.from(record.data, 'base64');
+                      const decodedData = buffer.toString('utf8');
+                      
+                      // Try to parse as JSON, fail gracefully if not valid JSON
+                      let parsedData;
+                      try {
+                          parsedData = JSON.parse(decodedData);
+                      } catch (e) {
+                          console.error('Invalid JSON in record:', decodedData);
+                          
+                          // Mark record as processing failed
+                          output.records.push({
+                              recordId: record.recordId,
+                              result: 'ProcessingFailed',
+                              data: record.data
+                          });
+                          continue;
+                      }
+                      
+                      // Apply filtering logic - skip records with log level below minimum
+                      if (parsedData.level && 
+                          ['DEBUG', 'INFO', 'WARN', 'ERROR'].indexOf(parsedData.level) < 
+                          ['DEBUG', 'INFO', 'WARN', 'ERROR'].indexOf(config.minLogLevel)) {
+                          
+                          console.log(`Filtering out record with level ${parsedData.level}`);
+                          
+                          // Mark record as dropped
+                          output.records.push({
+                              recordId: record.recordId,
+                              result: 'Dropped', 
+                              data: record.data
+                          });
+                          continue;
+                      }
+                      
+                      // Apply transformations
+                      
+                      // Add processing metadata
+                      if (config.addProcessingTimestamp) {
+                          parsedData.processedAt = new Date().toISOString();
+                      }
+                      
+                      // Add AWS request ID for traceability
+                      parsedData.lambdaRequestId = context.awsRequestId;
+                      
+                      // Redact any sensitive fields
+                      for (const field of config.fieldsToRedact) {
+                          if (parsedData[field]) {
+                              parsedData[field] = '********';
+                          }
+                      }
+                      
+                      // Convert transformed data back to string and encode as base64
+                      const transformedData = JSON.stringify(parsedData) + '\n';
+                      const encodedData = Buffer.from(transformedData).toString('base64');
+                      
+                      // Add transformed record to output
+                      output.records.push({
+                          recordId: record.recordId,
+                          result: 'Ok',
+                          data: encodedData
+                      });
+                      
+                  } catch (error) {
+                      console.error('Error processing record:', error);
+                      
+                      // Mark record as processing failed
+                      output.records.push({
+                          recordId: record.recordId,
+                          result: 'ProcessingFailed',
+                          data: record.data
+                      });
+                  }
+              }
+              
+              console.log('Processing complete, returning', output.records.length, 'records');
+              return output;
+          };
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-transform-function'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for Kinesis Data Firehose
+  FirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-firehose-delivery-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehoseDeliveryPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !Sub '${RawDataBucket}'
+                  - !Sub '${RawDataBucket}/*'
+                  - !Sub '${ProcessedDataBucket}'
+                  - !Sub '${ProcessedDataBucket}/*'
+                  - !Sub '${ErrorDataBucket}'
+                  - !Sub '${ErrorDataBucket}/*'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:GetFunctionConfiguration
+                Resource: !Sub '${TransformLambdaFunction}:$LATEST'
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                Resource: !Sub 'arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-firehose-delivery-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group for Firehose (conditional)
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateCloudWatchLogs
+    Properties:
+      LogGroupName: !Sub '/aws/kinesisfirehose/${ProjectName}-delivery-stream-${Environment}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-firehose-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Kinesis Data Firehose Delivery Stream
+  DeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub '${ProjectName}-delivery-stream-${Environment}'
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt ProcessedDataBucket.Arn
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        Prefix: 'logs/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/'
+        ErrorOutputPrefix: 'errors/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/!{firehose:error-output-type}/'
+        BufferingHints:
+          SizeInMBs: !Ref BufferSizeInMBs
+          IntervalInSeconds: !Ref BufferIntervalInSeconds
+        CompressionFormat: GZIP
+        S3BackupMode: Enabled
+        S3BackupConfiguration:
+          BucketARN: !GetAtt RawDataBucket.Arn
+          RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+          Prefix: 'raw/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/'
+          BufferingHints:
+            SizeInMBs: !Ref BufferSizeInMBs
+            IntervalInSeconds: !Ref BufferIntervalInSeconds
+          CompressionFormat: GZIP
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !Sub '${TransformLambdaFunction}:$LATEST'
+                - ParameterName: BufferSizeInMBs
+                  ParameterValue: !Ref LambdaBufferSizeInMBs
+                - ParameterName: BufferIntervalInSeconds
+                  ParameterValue: !Ref LambdaBufferIntervalInSeconds
+        CloudWatchLoggingOptions:
+          Enabled: !If [CreateCloudWatchLogs, true, false]
+          LogGroupName: !If [CreateCloudWatchLogs, !Ref FirehoseLogGroup, !Ref 'AWS::NoValue']
+          LogStreamName: !If [CreateCloudWatchLogs, 'S3Delivery', !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-delivery-stream'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Topic for Alarms (conditional)
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSNSNotifications
+    Properties:
+      TopicName: !Sub '${ProjectName}-alarms-${Environment}'
+      DisplayName: !Sub '${ProjectName} Firehose Alarms'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alarm-topic'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Topic Subscription for Email (conditional)
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateEmailSubscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AlarmTopic
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Alarm for Delivery Failures
+  DeliveryFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateSNSNotifications
+    Properties:
+      AlarmName: !Sub '${ProjectName}-delivery-failure-${Environment}'
+      AlarmDescription: !Sub 'Alarm when Firehose records are not delivered to S3 within 15 minutes for ${ProjectName}'
+      MetricName: DeliveryToS3.DataFreshness
+      Namespace: AWS/Kinesis/Firehose
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 900
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DeliveryStreamName
+          Value: !Ref DeliveryStream
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-delivery-failure-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarm for Lambda Errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateSNSNotifications
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors-${Environment}'
+      AlarmDescription: !Sub 'Alarm when Lambda function has errors for ${ProjectName}'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TransformLambdaFunction
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-error-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarm for Lambda Duration
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateSNSNotifications
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-duration-${Environment}'
+      AlarmDescription: !Sub 'Alarm when Lambda function duration is high for ${ProjectName}'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 45000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TransformLambdaFunction
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-duration-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  DeliveryStreamName:
+    Description: 'Name of the Kinesis Data Firehose delivery stream'
+    Value: !Ref DeliveryStream
+    Export:
+      Name: !Sub '${AWS::StackName}-DeliveryStreamName'
+
+  DeliveryStreamArn:
+    Description: 'ARN of the Kinesis Data Firehose delivery stream'
+    Value: !GetAtt DeliveryStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DeliveryStreamArn'
+
+  RawDataBucketName:
+    Description: 'Name of the S3 bucket for raw data backup'
+    Value: !Ref RawDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-RawDataBucketName'
+
+  ProcessedDataBucketName:
+    Description: 'Name of the S3 bucket for processed data'
+    Value: !Ref ProcessedDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessedDataBucketName'
+
+  ErrorDataBucketName:
+    Description: 'Name of the S3 bucket for error data'
+    Value: !Ref ErrorDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ErrorDataBucketName'
+
+  LambdaFunctionName:
+    Description: 'Name of the Lambda transformation function'
+    Value: !Ref TransformLambdaFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda transformation function'
+    Value: !GetAtt TransformLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  FirehoseRoleArn:
+    Description: 'ARN of the Firehose delivery role'
+    Value: !GetAtt FirehoseDeliveryRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FirehoseRoleArn'
+
+  LambdaRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaRoleArn'
+
+  AlarmTopicArn:
+    Description: 'ARN of the SNS topic for alarms'
+    Value: !If [CreateSNSNotifications, !Ref AlarmTopic, 'N/A - SNS notifications disabled']
+    Export:
+      Name: !Sub '${AWS::StackName}-AlarmTopicArn'
+
+  FirehoseLogGroupName:
+    Description: 'Name of the CloudWatch log group for Firehose'
+    Value: !If [CreateCloudWatchLogs, !Ref FirehoseLogGroup, 'N/A - CloudWatch logs disabled']
+    Export:
+      Name: !Sub '${AWS::StackName}-FirehoseLogGroupName'
+
+  TestDataCommand:
+    Description: 'CLI command to send test data to the Firehose delivery stream'
+    Value: !Sub |
+      aws firehose put-record \
+        --delivery-stream-name ${DeliveryStream} \
+        --record 'Data=eyJ0aW1lc3RhbXAiOiIyMDI1LTAxLTEyVDEwOjMwOjAwWiIsImxldmVsIjoiSU5GTyIsInNlcnZpY2UiOiJ1c2VyLXNlcnZpY2UiLCJtZXNzYWdlIjoiVXNlciBsb2dpbiBzdWNjZXNzZnVsIiwidXNlcklkIjoidXNlcjEyMyJ9'
+
+  MonitoringDashboardUrl:
+    Description: 'URL to CloudWatch dashboard for monitoring'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}'

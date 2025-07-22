@@ -1,0 +1,1721 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Multi-Tenant SaaS Application with AWS Amplify and Fine-Grained Authorization - Complete infrastructure for building secure, scalable multi-tenant applications'
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: multitenant-saas
+    Description: Name of the project (used for resource naming)
+    AllowedPattern: '^[a-z0-9\-]+$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    MaxLength: 30
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+
+  DomainName:
+    Type: String
+    Default: ''
+    Description: Custom domain name for the application (optional)
+    AllowedPattern: '^$|^[a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9]$'
+
+  DefaultTenantPlan:
+    Type: String
+    Default: TRIAL
+    AllowedValues: [TRIAL, BASIC, PROFESSIONAL, ENTERPRISE]
+    Description: Default subscription plan for new tenants
+
+  EnableAuditLogging:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable comprehensive audit logging
+
+  DataRetentionDays:
+    Type: Number
+    Default: 90
+    MinValue: 30
+    MaxValue: 2555
+    Description: Data retention period in days (30-2555)
+
+  AdminEmailAddress:
+    Type: String
+    Description: Email address for the super admin user
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+
+Conditions:
+  HasCustomDomain: !Not [!Equals [!Ref DomainName, '']]
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  EnableAudit: !Equals [!Ref EnableAuditLogging, 'true']
+  EnableDataLakeExport: !Condition IsProduction
+
+# ==============================================================================
+# COGNITO USER POOL AND IDENTITY
+# ==============================================================================
+
+Resources:
+  # Cognito User Pool for multi-tenant authentication
+  MultiTenantUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${ProjectName}-${Environment}-user-pool'
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 7
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      UsernameConfiguration:
+        CaseSensitive: false
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: given_name
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: family_name
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: tenant_id
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+        - Name: user_role
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+        - Name: permissions
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+      UserPoolTags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Purpose: MultiTenantAuth
+      LambdaConfig:
+        PreSignUp: !GetAtt TenantAuthTriggerFunction.Arn
+        PostConfirmation: !GetAtt TenantAuthTriggerFunction.Arn
+        PreAuthentication: !GetAtt TenantAuthTriggerFunction.Arn
+        CreateAuthChallenge: !GetAtt TenantAuthTriggerFunction.Arn
+        DefineAuthChallenge: !GetAtt TenantAuthTriggerFunction.Arn
+        VerifyAuthChallengeResponse: !GetAtt TenantAuthTriggerFunction.Arn
+      MfaConfiguration: OPTIONAL
+      EnabledMfas:
+        - SOFTWARE_TOKEN_MFA
+        - SMS_MFA
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+          - Name: verified_phone_number
+            Priority: 2
+
+  # User Pool Client for web application
+  MultiTenantUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${ProjectName}-${Environment}-web-client'
+      UserPoolId: !Ref MultiTenantUserPool
+      GenerateSecret: false
+      RefreshTokenValidity: 30
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      TokenValidityUnits:
+        RefreshToken: days
+        AccessToken: minutes
+        IdToken: minutes
+      ReadAttributes:
+        - email
+        - given_name
+        - family_name
+        - custom:tenant_id
+        - custom:user_role
+        - custom:permissions
+      WriteAttributes:
+        - given_name
+        - family_name
+        - email
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_CUSTOM_AUTH
+      PreventUserExistenceErrors: ENABLED
+      SupportedIdentityProviders:
+        - COGNITO
+
+  # Identity Pool for AWS resource access
+  MultiTenantIdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub '${ProjectName}_${Environment}_identity_pool'
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref MultiTenantUserPoolClient
+          ProviderName: !GetAtt MultiTenantUserPool.ProviderName
+
+  # Super Admin User Group
+  SuperAdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: SuperAdmins
+      Description: Super administrators with platform-wide access
+      UserPoolId: !Ref MultiTenantUserPool
+      Precedence: 0
+      RoleArn: !GetAtt SuperAdminRole.Arn
+
+# ==============================================================================
+# DYNAMODB TABLES FOR MULTI-TENANT DATA
+# ==============================================================================
+
+  # Tenant management table
+  TenantTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-tenants'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: subdomain
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: subdomain-index
+          KeySchema:
+            - AttributeName: subdomain
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: status-createdAt-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !Condition IsProduction
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: TenantManagement
+
+  # User management table
+  UserTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-users'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: tenantId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: tenantId-createdAt-index
+          KeySchema:
+            - AttributeName: tenantId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: userId-index
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: email-index
+          KeySchema:
+            - AttributeName: email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !Condition IsProduction
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: UserManagement
+
+  # Project management table
+  ProjectTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-projects'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: tenantId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+        - AttributeName: createdBy
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: tenantId-createdAt-index
+          KeySchema:
+            - AttributeName: tenantId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: tenantId-status-index
+          KeySchema:
+            - AttributeName: tenantId
+              KeyType: HASH
+            - AttributeName: status
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: createdBy-index
+          KeySchema:
+            - AttributeName: createdBy
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !Condition IsProduction
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: ProjectManagement
+
+  # Task management table
+  TaskTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-tasks'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: tenantId
+          AttributeType: S
+        - AttributeName: projectId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: assignedTo
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: tenantId-status-createdAt-index
+          KeySchema:
+            - AttributeName: tenantId
+              KeyType: HASH
+            - AttributeName: status
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: projectId-status-createdAt-index
+          KeySchema:
+            - AttributeName: projectId
+              KeyType: HASH
+            - AttributeName: status
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: assignedTo-index
+          KeySchema:
+            - AttributeName: assignedTo
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !Condition IsProduction
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: TaskManagement
+
+  # Billing information table
+  BillingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-billing'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: tenantId
+          AttributeType: S
+        - AttributeName: plan
+          AttributeType: S
+        - AttributeName: currentPeriodStart
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: tenantId-index
+          KeySchema:
+            - AttributeName: tenantId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: plan-currentPeriodStart-index
+          KeySchema:
+            - AttributeName: plan
+              KeyType: HASH
+            - AttributeName: currentPeriodStart
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !Condition IsProduction
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: BillingManagement
+
+  # Tenant usage tracking table
+  TenantUsageTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-tenant-usage'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: tenantId
+          AttributeType: S
+        - AttributeName: month
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: tenantId-month-index
+          KeySchema:
+            - AttributeName: tenantId
+              KeyType: HASH
+            - AttributeName: month
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: month-index
+          KeySchema:
+            - AttributeName: month
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !Condition IsProduction
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: UsageTracking
+
+  # Activity log table for audit trails
+  ActivityLogTable:
+    Type: AWS::DynamoDB::Table
+    Condition: EnableAudit
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-activity-logs'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: tenantId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: action
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: tenantId-action-createdAt-index
+          KeySchema:
+            - AttributeName: tenantId
+              KeyType: HASH
+            - AttributeName: action
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: userId-createdAt-index
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !Condition IsProduction
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: AuditLogging
+
+# ==============================================================================
+# LAMBDA FUNCTIONS FOR TENANT MANAGEMENT
+# ==============================================================================
+
+  # IAM Role for tenant resolver Lambda function
+  TenantResolverLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-tenant-resolver-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: TenantResolverDynamoDBPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt TenantTable.Arn
+                  - !Sub '${TenantTable.Arn}/*'
+                  - !GetAtt UserTable.Arn
+                  - !Sub '${UserTable.Arn}/*'
+                  - !GetAtt BillingTable.Arn
+                  - !Sub '${BillingTable.Arn}/*'
+                  - !If
+                    - EnableAudit
+                    - !GetAtt ActivityLogTable.Arn
+                    - !Ref AWS::NoValue
+                  - !If
+                    - EnableAudit
+                    - !Sub '${ActivityLogTable.Arn}/*'
+                    - !Ref AWS::NoValue
+        - PolicyName: CognitoManagementPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminSetUserPassword
+                  - cognito-idp:AdminAddUserToGroup
+                  - cognito-idp:AdminRemoveUserFromGroup
+                  - cognito-idp:AdminListGroupsForUser
+                  - cognito-idp:AdminGetUser
+                  - cognito-idp:AdminUpdateUserAttributes
+                Resource: !GetAtt MultiTenantUserPool.Arn
+
+  # Tenant resolver Lambda function
+  TenantResolverFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-tenant-resolver'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt TenantResolverLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 512
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          TENANT_TABLE: !Ref TenantTable
+          USER_TABLE: !Ref UserTable
+          BILLING_TABLE: !Ref BillingTable
+          ACTIVITY_LOG_TABLE: !If [EnableAudit, !Ref ActivityLogTable, '']
+          USER_POOL_ID: !Ref MultiTenantUserPool
+          DEFAULT_TENANT_PLAN: !Ref DefaultTenantPlan
+          DATA_RETENTION_DAYS: !Ref DataRetentionDays
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          const cognitoIdentityServiceProvider = new AWS.CognitoIdentityServiceProvider();
+          
+          const TENANT_TABLE = process.env.TENANT_TABLE;
+          const USER_TABLE = process.env.USER_TABLE;
+          const BILLING_TABLE = process.env.BILLING_TABLE;
+          const ACTIVITY_LOG_TABLE = process.env.ACTIVITY_LOG_TABLE;
+          const USER_POOL_ID = process.env.USER_POOL_ID;
+          
+          exports.handler = async (event) => {
+            console.log('Tenant resolver event:', JSON.stringify(event, null, 2));
+            
+            const { field, source, arguments: args, identity, request } = event;
+            
+            try {
+              switch (field) {
+                case 'createTenant':
+                  return await createTenant(args.input, identity);
+                
+                case 'updateTenantSettings':
+                  return await updateTenantSettings(args.tenantId, args.settings, identity);
+                
+                case 'provisionTenantUser':
+                  return await provisionTenantUser(args.input, identity);
+                
+                case 'updateUserRole':
+                  return await updateUserRole(args.userId, args.role, args.permissions, identity);
+                
+                default:
+                  throw new Error(`Unknown field: ${field}`);
+              }
+            } catch (error) {
+              console.error('Tenant resolver error:', error);
+              throw new Error(`Tenant operation failed: ${error.message}`);
+            }
+          };
+          
+          async function createTenant(input, identity) {
+            // Validate super admin permissions
+            if (!hasRole(identity, 'SuperAdmins')) {
+              throw new Error('Unauthorized: Only super admins can create tenants');
+            }
+            
+            const tenantId = generateTenantId();
+            const timestamp = new Date().toISOString();
+            
+            // Check if subdomain is available
+            const existingTenant = await getTenantBySubdomain(input.subdomain);
+            if (existingTenant) {
+              throw new Error(`Subdomain ${input.subdomain} is already taken`);
+            }
+            
+            // Create tenant record
+            const tenant = {
+              id: tenantId,
+              name: input.name,
+              domain: input.domain,
+              subdomain: input.subdomain,
+              status: 'TRIAL',
+              plan: input.plan,
+              settings: getDefaultTenantSettings(input.plan),
+              customCSS: '',
+              logo: '',
+              primaryColor: '#4f46e5',
+              secondaryColor: '#6b7280',
+              timezone: 'America/New_York',
+              locale: 'en-US',
+              createdAt: timestamp,
+              updatedAt: timestamp
+            };
+            
+            await dynamodb.put({
+              TableName: TENANT_TABLE,
+              Item: tenant
+            }).promise();
+            
+            return tenant;
+          }
+          
+          function generateTenantId() {
+            return `tenant_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+          }
+          
+          function hasRole(identity, role) {
+            const groups = identity.groups || [];
+            return groups.includes(role);
+          }
+          
+          async function getTenantBySubdomain(subdomain) {
+            const result = await dynamodb.query({
+              TableName: TENANT_TABLE,
+              IndexName: 'subdomain-index',
+              KeyConditionExpression: 'subdomain = :subdomain',
+              ExpressionAttributeValues: {
+                ':subdomain': subdomain
+              }
+            }).promise();
+            
+            return result.Items.length > 0 ? result.Items[0] : null;
+          }
+          
+          function getDefaultTenantSettings(plan) {
+            const settingsMap = {
+              TRIAL: {
+                maxUsers: 5,
+                maxProjects: 3,
+                maxStorageGB: 1.0,
+                allowedFeatures: ['basic_tasks', 'basic_projects'],
+                ssoEnabled: false,
+                auditingEnabled: false,
+                dataRetentionDays: 30,
+                apiRateLimit: 100
+              },
+              BASIC: {
+                maxUsers: 25,
+                maxProjects: 10,
+                maxStorageGB: 5.0,
+                allowedFeatures: ['basic_tasks', 'basic_projects', 'reporting'],
+                ssoEnabled: false,
+                auditingEnabled: true,
+                dataRetentionDays: 90,
+                apiRateLimit: 500
+              },
+              PROFESSIONAL: {
+                maxUsers: 100,
+                maxProjects: 50,
+                maxStorageGB: 25.0,
+                allowedFeatures: ['basic_tasks', 'basic_projects', 'reporting', 'advanced_analytics', 'integrations'],
+                ssoEnabled: true,
+                auditingEnabled: true,
+                dataRetentionDays: 365,
+                apiRateLimit: 2000
+              },
+              ENTERPRISE: {
+                maxUsers: 1000,
+                maxProjects: 500,
+                maxStorageGB: 100.0,
+                allowedFeatures: ['all'],
+                ssoEnabled: true,
+                auditingEnabled: true,
+                dataRetentionDays: 2555,
+                apiRateLimit: 10000
+              }
+            };
+            
+            return settingsMap[plan] || settingsMap.TRIAL;
+          }
+          
+          // Additional functions would be implemented here
+          async function updateTenantSettings(tenantId, settings, identity) {
+            // Implementation placeholder
+            return {};
+          }
+          
+          async function provisionTenantUser(input, identity) {
+            // Implementation placeholder
+            return {};
+          }
+          
+          async function updateUserRole(userId, role, permissions, identity) {
+            // Implementation placeholder
+            return {};
+          }
+
+  # IAM Role for authentication trigger Lambda function
+  TenantAuthTriggerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-tenant-auth-trigger-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: TenantAuthDynamoDBPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt TenantTable.Arn
+                  - !Sub '${TenantTable.Arn}/*'
+                  - !GetAtt UserTable.Arn
+                  - !Sub '${UserTable.Arn}/*'
+                  - !If
+                    - EnableAudit
+                    - !GetAtt ActivityLogTable.Arn
+                    - !Ref AWS::NoValue
+                  - !If
+                    - EnableAudit
+                    - !Sub '${ActivityLogTable.Arn}/*'
+                    - !Ref AWS::NoValue
+        - PolicyName: CognitoGroupManagementPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminAddUserToGroup
+                  - cognito-idp:AdminListGroupsForUser
+                  - cognito-idp:AdminGetUser
+                Resource: !GetAtt MultiTenantUserPool.Arn
+
+  # Authentication trigger Lambda function
+  TenantAuthTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-tenant-auth-trigger'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt TenantAuthTriggerLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          TENANT_TABLE: !Ref TenantTable
+          USER_TABLE: !Ref UserTable
+          ACTIVITY_LOG_TABLE: !If [EnableAudit, !Ref ActivityLogTable, '']
+          USER_POOL_ID: !Ref MultiTenantUserPool
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          const cognitoIdentityServiceProvider = new AWS.CognitoIdentityServiceProvider();
+          
+          const TENANT_TABLE = process.env.TENANT_TABLE;
+          const USER_TABLE = process.env.USER_TABLE;
+          const ACTIVITY_LOG_TABLE = process.env.ACTIVITY_LOG_TABLE;
+          
+          exports.handler = async (event) => {
+            console.log('Tenant auth trigger:', JSON.stringify(event, null, 2));
+            
+            try {
+              switch (event.triggerSource) {
+                case 'PreSignUp_SignUp':
+                case 'PreSignUp_ExternalProvider':
+                  return await handlePreSignUp(event);
+                
+                case 'PostConfirmation_ConfirmSignUp':
+                case 'PostConfirmation_ConfirmForgotPassword':
+                  return await handlePostConfirmation(event);
+                
+                case 'PreAuthentication_Authentication':
+                  return await handlePreAuthentication(event);
+                
+                case 'TokenGeneration_HostedAuth':
+                case 'TokenGeneration_Authentication':
+                case 'TokenGeneration_NewPasswordChallenge':
+                case 'TokenGeneration_AuthenticateDevice':
+                  return await handleTokenGeneration(event);
+                
+                default:
+                  console.log('Unhandled trigger source:', event.triggerSource);
+                  return event;
+              }
+            } catch (error) {
+              console.error('Tenant auth trigger error:', error);
+              throw error;
+            }
+          };
+          
+          async function handlePreSignUp(event) {
+            const { userAttributes } = event.request;
+            const email = userAttributes.email;
+            const domain = email.split('@')[1];
+            
+            // Extract tenant information from custom attributes or domain
+            const tenantId = userAttributes['custom:tenant_id'];
+            
+            if (!tenantId) {
+              // Try to resolve tenant from domain mapping
+              const tenant = await getTenantByDomain(domain);
+              if (!tenant) {
+                throw new Error(`No tenant found for domain: ${domain}`);
+              }
+              
+              // Add tenant ID to user attributes
+              event.response.userAttributes = {
+                ...event.response.userAttributes,
+                'custom:tenant_id': tenant.id
+              };
+            }
+            
+            return event;
+          }
+          
+          async function handlePostConfirmation(event) {
+            // Implementation for post-confirmation processing
+            return event;
+          }
+          
+          async function handlePreAuthentication(event) {
+            // Implementation for pre-authentication validation
+            return event;
+          }
+          
+          async function handleTokenGeneration(event) {
+            // Implementation for token customization
+            return event;
+          }
+          
+          async function getTenantByDomain(domain) {
+            const result = await dynamodb.scan({
+              TableName: TENANT_TABLE,
+              FilterExpression: '#domain = :domain',
+              ExpressionAttributeNames: {
+                '#domain': 'domain'
+              },
+              ExpressionAttributeValues: {
+                ':domain': domain
+              }
+            }).promise();
+            
+            return result.Items.length > 0 ? result.Items[0] : null;
+          }
+
+  # Lambda permission for Cognito triggers
+  TenantAuthTriggerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TenantAuthTriggerFunction
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt MultiTenantUserPool.Arn
+
+# ==============================================================================
+# APPSYNC GRAPHQL API
+# ==============================================================================
+
+  # AppSync API IAM Role
+  AppSyncServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-appsync-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: appsync.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AppSyncDynamoDBPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt TenantTable.Arn
+                  - !Sub '${TenantTable.Arn}/*'
+                  - !GetAtt UserTable.Arn
+                  - !Sub '${UserTable.Arn}/*'
+                  - !GetAtt ProjectTable.Arn
+                  - !Sub '${ProjectTable.Arn}/*'
+                  - !GetAtt TaskTable.Arn
+                  - !Sub '${TaskTable.Arn}/*'
+                  - !GetAtt BillingTable.Arn
+                  - !Sub '${BillingTable.Arn}/*'
+                  - !GetAtt TenantUsageTable.Arn
+                  - !Sub '${TenantUsageTable.Arn}/*'
+                  - !If
+                    - EnableAudit
+                    - !GetAtt ActivityLogTable.Arn
+                    - !Ref AWS::NoValue
+                  - !If
+                    - EnableAudit
+                    - !Sub '${ActivityLogTable.Arn}/*'
+                    - !Ref AWS::NoValue
+        - PolicyName: AppSyncLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt TenantResolverFunction.Arn
+
+  # Multi-tenant GraphQL API
+  MultiTenantGraphQLApi:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-multitenant-api'
+      AuthenticationType: AMAZON_COGNITO_USER_POOLS
+      UserPoolConfig:
+        AwsRegion: !Ref AWS::Region
+        UserPoolId: !Ref MultiTenantUserPool
+        DefaultAction: ALLOW
+      AdditionalAuthenticationProviders:
+        - AuthenticationType: AWS_IAM
+      LogConfig:
+        CloudWatchLogsRoleArn: !GetAtt AppSyncLogsRole.Arn
+        FieldLogLevel: !If [IsProduction, ERROR, ALL]
+      XrayEnabled: !Condition IsProduction
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Purpose: MultiTenantAPI
+
+  # AppSync CloudWatch Logs Role
+  AppSyncLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-appsync-logs-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: appsync.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AppSyncPushToCloudWatchLogs
+
+  # GraphQL Schema
+  MultiTenantGraphQLSchema:
+    Type: AWS::AppSync::GraphQLSchema
+    Properties:
+      ApiId: !GetAtt MultiTenantGraphQLApi.ApiId
+      Definition: |
+        type Tenant @aws_cognito_user_pools @aws_iam {
+          id: ID!
+          name: String!
+          domain: String!
+          subdomain: String!
+          status: TenantStatus!
+          plan: SubscriptionPlan!
+          settings: TenantSettings
+          customCSS: String
+          logo: String
+          primaryColor: String
+          secondaryColor: String
+          timezone: String!
+          locale: String!
+          createdAt: AWSDateTime!
+          updatedAt: AWSDateTime!
+        }
+        
+        type User @aws_cognito_user_pools @aws_iam {
+          id: ID!
+          userId: String!
+          tenantId: ID!
+          email: String!
+          firstName: String!
+          lastName: String!
+          role: UserRole!
+          permissions: [String]!
+          isActive: Boolean!
+          lastLoginAt: AWSDateTime
+          createdAt: AWSDateTime!
+          updatedAt: AWSDateTime!
+        }
+        
+        type Project @aws_cognito_user_pools @aws_iam {
+          id: ID!
+          tenantId: ID!
+          name: String!
+          description: String
+          status: ProjectStatus!
+          createdBy: String!
+          createdAt: AWSDateTime!
+          updatedAt: AWSDateTime!
+        }
+        
+        type Task @aws_cognito_user_pools @aws_iam {
+          id: ID!
+          tenantId: ID!
+          projectId: ID!
+          title: String!
+          description: String
+          status: TaskStatus!
+          priority: TaskPriority!
+          assignedTo: String
+          createdBy: String!
+          dueDate: AWSDateTime
+          completedAt: AWSDateTime
+          tags: [String]
+          estimatedHours: Float
+          actualHours: Float
+          createdAt: AWSDateTime!
+          updatedAt: AWSDateTime!
+        }
+        
+        type TenantSettings {
+          maxUsers: Int!
+          maxProjects: Int!
+          maxStorageGB: Float!
+          allowedFeatures: [String]!
+          ssoEnabled: Boolean!
+          auditingEnabled: Boolean!
+          dataRetentionDays: Int!
+          customDomain: String
+          apiRateLimit: Int!
+        }
+        
+        enum TenantStatus {
+          ACTIVE
+          SUSPENDED
+          TRIAL
+          EXPIRED
+          CANCELLED
+        }
+        
+        enum SubscriptionPlan {
+          TRIAL
+          BASIC
+          PROFESSIONAL
+          ENTERPRISE
+          CUSTOM
+        }
+        
+        enum UserRole {
+          TENANT_ADMIN
+          PROJECT_MANAGER
+          TEAM_LEAD
+          DEVELOPER
+          VIEWER
+          GUEST
+        }
+        
+        enum ProjectStatus {
+          PLANNING
+          ACTIVE
+          ON_HOLD
+          COMPLETED
+          CANCELLED
+        }
+        
+        enum TaskStatus {
+          TODO
+          IN_PROGRESS
+          REVIEW
+          DONE
+          CANCELLED
+        }
+        
+        enum TaskPriority {
+          LOW
+          MEDIUM
+          HIGH
+          URGENT
+        }
+        
+        type Query {
+          getTenant(id: ID!): Tenant
+          listTenants: [Tenant]
+          getUser(id: ID!): User
+          listUsers(tenantId: ID!): [User]
+          getProject(id: ID!): Project
+          listProjects(tenantId: ID!): [Project]
+          getTask(id: ID!): Task
+          listTasks(tenantId: ID!, projectId: ID): [Task]
+        }
+        
+        type Mutation {
+          createTenant(input: CreateTenantInput!): Tenant
+          updateTenant(id: ID!, input: UpdateTenantInput!): Tenant
+          createUser(input: CreateUserInput!): User
+          updateUser(id: ID!, input: UpdateUserInput!): User
+          createProject(input: CreateProjectInput!): Project
+          updateProject(id: ID!, input: UpdateProjectInput!): Project
+          createTask(input: CreateTaskInput!): Task
+          updateTask(id: ID!, input: UpdateTaskInput!): Task
+        }
+        
+        input CreateTenantInput {
+          name: String!
+          domain: String!
+          subdomain: String!
+          plan: SubscriptionPlan!
+          adminEmail: String!
+          adminName: String!
+        }
+        
+        input UpdateTenantInput {
+          name: String
+          status: TenantStatus
+          plan: SubscriptionPlan
+        }
+        
+        input CreateUserInput {
+          tenantId: ID!
+          email: String!
+          firstName: String!
+          lastName: String!
+          role: UserRole!
+        }
+        
+        input UpdateUserInput {
+          firstName: String
+          lastName: String
+          role: UserRole
+          isActive: Boolean
+        }
+        
+        input CreateProjectInput {
+          tenantId: ID!
+          name: String!
+          description: String
+        }
+        
+        input UpdateProjectInput {
+          name: String
+          description: String
+          status: ProjectStatus
+        }
+        
+        input CreateTaskInput {
+          tenantId: ID!
+          projectId: ID!
+          title: String!
+          description: String
+          priority: TaskPriority!
+          assignedTo: String
+          dueDate: AWSDateTime
+        }
+        
+        input UpdateTaskInput {
+          title: String
+          description: String
+          status: TaskStatus
+          priority: TaskPriority
+          assignedTo: String
+          dueDate: AWSDateTime
+          completedAt: AWSDateTime
+        }
+
+  # Data Sources for DynamoDB tables
+  TenantDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt MultiTenantGraphQLApi.ApiId
+      Name: TenantDataSource
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      DynamoDBConfig:
+        AwsRegion: !Ref AWS::Region
+        TableName: !Ref TenantTable
+
+  UserDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt MultiTenantGraphQLApi.ApiId
+      Name: UserDataSource
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      DynamoDBConfig:
+        AwsRegion: !Ref AWS::Region
+        TableName: !Ref UserTable
+
+  ProjectDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt MultiTenantGraphQLApi.ApiId
+      Name: ProjectDataSource
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      DynamoDBConfig:
+        AwsRegion: !Ref AWS::Region
+        TableName: !Ref ProjectTable
+
+  TaskDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt MultiTenantGraphQLApi.ApiId
+      Name: TaskDataSource
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      DynamoDBConfig:
+        AwsRegion: !Ref AWS::Region
+        TableName: !Ref TaskTable
+
+  # Lambda data source for tenant resolver
+  TenantResolverDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt MultiTenantGraphQLApi.ApiId
+      Name: TenantResolverDataSource
+      Type: AWS_LAMBDA
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      LambdaConfig:
+        LambdaFunctionArn: !GetAtt TenantResolverFunction.Arn
+
+# ==============================================================================
+# IAM ROLES FOR COGNITO IDENTITY POOL
+# ==============================================================================
+
+  # Authenticated user role
+  AuthenticatedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-authenticated-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref MultiTenantIdentityPool
+              'ForAnyValue:StringLike':
+                'cognito-identity.amazonaws.com:amr': authenticated
+      Policies:
+        - PolicyName: AuthenticatedUserPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - appsync:GraphQL
+                Resource: !Sub '${MultiTenantGraphQLApi.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub '${TenantAssetsBucket.Arn}/*'
+
+  # Super admin role
+  SuperAdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-super-admin-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref MultiTenantIdentityPool
+              'ForAnyValue:StringLike':
+                'cognito-identity.amazonaws.com:amr': authenticated
+      Policies:
+        - PolicyName: SuperAdminPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - appsync:GraphQL
+                Resource: !Sub '${MultiTenantGraphQLApi.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt TenantTable.Arn
+                  - !Sub '${TenantTable.Arn}/*'
+                  - !GetAtt UserTable.Arn
+                  - !Sub '${UserTable.Arn}/*'
+                  - !GetAtt BillingTable.Arn
+                  - !Sub '${BillingTable.Arn}/*'
+                  - !GetAtt TenantUsageTable.Arn
+                  - !Sub '${TenantUsageTable.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - !GetAtt TenantAssetsBucket.Arn
+                  - !Sub '${TenantAssetsBucket.Arn}/*'
+
+  # Identity pool role attachment
+  IdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref MultiTenantIdentityPool
+      Roles:
+        authenticated: !GetAtt AuthenticatedRole.Arn
+      RoleMappings:
+        userpool:
+          Type: Token
+          AmbiguousRoleResolution: AuthenticatedRole
+          IdentityProvider: !Sub '${MultiTenantUserPool.ProviderName}:${MultiTenantUserPoolClient}'
+
+# ==============================================================================
+# S3 STORAGE FOR TENANT ASSETS
+# ==============================================================================
+
+  # S3 bucket for tenant-specific assets
+  TenantAssetsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-tenant-assets-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: !If [IsProduction, Enabled, Suspended]
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: TransitionToGlacier
+            Status: !If [IsProduction, Enabled, Disabled]
+            Transition:
+              StorageClass: GLACIER
+              TransitionInDays: 90
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref TenantAssetsBucketLogGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: TenantAssets
+
+  # CloudWatch Log Group for S3 bucket notifications
+  TenantAssetsBucketLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-${Environment}-tenant-assets'
+      RetentionInDays: !Ref DataRetentionDays
+
+# ==============================================================================
+# CLOUDWATCH MONITORING AND ALARMS
+# ==============================================================================
+
+  # CloudWatch Dashboard for multi-tenant metrics
+  MultiTenantDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}-multitenant-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${TenantTable}" ],
+                  [ ".", "ConsumedWriteCapacityUnits", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Tenant Table Capacity"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${TenantResolverFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Tenant Resolver Function Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/AppSync", "4XXError", "GraphQLAPIId", "${MultiTenantGraphQLApi}" ],
+                  [ ".", "5XXError", ".", "." ],
+                  [ ".", "Latency", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "AppSync API Metrics"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarm for high error rates
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-high-error-rate'
+      AlarmDescription: High error rate detected in multi-tenant application
+      MetricName: 5XXError
+      Namespace: AWS/AppSync
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: GraphQLAPIId
+          Value: !GetAtt MultiTenantGraphQLApi.ApiId
+      AlarmActions:
+        - !Ref ErrorNotificationTopic
+
+  # SNS Topic for error notifications
+  ErrorNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: IsProduction
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-error-notifications'
+      DisplayName: Multi-Tenant SaaS Error Notifications
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AdminEmailAddress
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+
+Outputs:
+  # Cognito Configuration
+  UserPoolId:
+    Description: Cognito User Pool ID for multi-tenant authentication
+    Value: !Ref MultiTenantUserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolId'
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref MultiTenantUserPoolClient
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolClientId'
+
+  IdentityPoolId:
+    Description: Cognito Identity Pool ID
+    Value: !Ref MultiTenantIdentityPool
+    Export:
+      Name: !Sub '${AWS::StackName}-IdentityPoolId'
+
+  # AppSync GraphQL API
+  GraphQLApiId:
+    Description: AppSync GraphQL API ID
+    Value: !GetAtt MultiTenantGraphQLApi.ApiId
+    Export:
+      Name: !Sub '${AWS::StackName}-GraphQLApiId'
+
+  GraphQLApiUrl:
+    Description: AppSync GraphQL API URL
+    Value: !GetAtt MultiTenantGraphQLApi.GraphQLUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-GraphQLApiUrl'
+
+  # DynamoDB Tables
+  TenantTableName:
+    Description: DynamoDB table name for tenant management
+    Value: !Ref TenantTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TenantTableName'
+
+  UserTableName:
+    Description: DynamoDB table name for user management
+    Value: !Ref UserTable
+    Export:
+      Name: !Sub '${AWS::StackName}-UserTableName'
+
+  ProjectTableName:
+    Description: DynamoDB table name for project management
+    Value: !Ref ProjectTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectTableName'
+
+  TaskTableName:
+    Description: DynamoDB table name for task management
+    Value: !Ref TaskTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TaskTableName'
+
+  # Lambda Functions
+  TenantResolverFunctionArn:
+    Description: ARN of the tenant resolver Lambda function
+    Value: !GetAtt TenantResolverFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TenantResolverFunctionArn'
+
+  TenantAuthTriggerFunctionArn:
+    Description: ARN of the tenant authentication trigger Lambda function
+    Value: !GetAtt TenantAuthTriggerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TenantAuthTriggerFunctionArn'
+
+  # S3 Storage
+  TenantAssetsBucketName:
+    Description: S3 bucket name for tenant-specific assets
+    Value: !Ref TenantAssetsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-TenantAssetsBucketName'
+
+  # Monitoring
+  CloudWatchDashboardUrl:
+    Description: CloudWatch Dashboard URL for monitoring
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${MultiTenantDashboard}'
+
+  # Configuration for Frontend
+  AmplifyConfig:
+    Description: Amplify configuration object (JSON format)
+    Value: !Sub |
+      {
+        "aws_project_region": "${AWS::Region}",
+        "aws_cognito_region": "${AWS::Region}",
+        "aws_user_pools_id": "${MultiTenantUserPool}",
+        "aws_user_pools_web_client_id": "${MultiTenantUserPoolClient}",
+        "aws_cognito_identity_pool_id": "${MultiTenantIdentityPool}",
+        "aws_appsync_graphqlEndpoint": "${MultiTenantGraphQLApi.GraphQLUrl}",
+        "aws_appsync_region": "${AWS::Region}",
+        "aws_appsync_authenticationType": "AMAZON_COGNITO_USER_POOLS",
+        "aws_appsync_additionalAuthenticationTypes": ["AWS_IAM"],
+        "aws_user_files_s3_bucket": "${TenantAssetsBucket}",
+        "aws_user_files_s3_bucket_region": "${AWS::Region}"
+      }
+
+  # Deployment Information
+  StackName:
+    Description: Name of this CloudFormation stack
+    Value: !Ref AWS::StackName
+
+  Region:
+    Description: AWS Region where resources are deployed
+    Value: !Ref AWS::Region
+
+  Environment:
+    Description: Deployment environment
+    Value: !Ref Environment
+
+  ProjectName:
+    Description: Project name used for resource naming
+    Value: !Ref ProjectName

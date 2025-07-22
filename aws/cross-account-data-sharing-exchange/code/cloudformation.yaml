@@ -1,0 +1,844 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Cross-Account Data Sharing with Data Exchange
+  This template creates infrastructure for secure data sharing between AWS accounts
+  using AWS Data Exchange, S3, Lambda, and EventBridge for automated notifications.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Data Exchange Configuration"
+        Parameters:
+          - DataSetName
+          - DataSetDescription
+          - SubscriberAccountId
+          - DataGrantEndDate
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - ProviderBucketName
+          - EnableS3Versioning
+          - S3StorageClass
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+          - EnableAutomatedUpdates
+          - UpdateScheduleExpression
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - LogRetentionDays
+          - EnableDetailedMonitoring
+    ParameterLabels:
+      DataSetName:
+        default: "Data Set Name"
+      DataSetDescription:
+        default: "Data Set Description"
+      SubscriberAccountId:
+        default: "Subscriber AWS Account ID"
+      DataGrantEndDate:
+        default: "Data Grant Expiration Date"
+      ProviderBucketName:
+        default: "Provider S3 Bucket Name"
+      EnableS3Versioning:
+        default: "Enable S3 Bucket Versioning"
+      S3StorageClass:
+        default: "S3 Storage Class"
+      NotificationEmail:
+        default: "Notification Email Address"
+      EnableAutomatedUpdates:
+        default: "Enable Automated Data Updates"
+      UpdateScheduleExpression:
+        default: "Update Schedule Expression"
+      LogRetentionDays:
+        default: "CloudWatch Log Retention (Days)"
+      EnableDetailedMonitoring:
+        default: "Enable Detailed Monitoring"
+
+Parameters:
+  DataSetName:
+    Type: String
+    Description: Name for the AWS Data Exchange data set
+    Default: enterprise-analytics-data
+    MinLength: 1
+    MaxLength: 255
+    AllowedPattern: '^[a-zA-Z0-9\-_\.]+$'
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, underscores, and periods
+
+  DataSetDescription:
+    Type: String
+    Description: Description for the AWS Data Exchange data set
+    Default: Enterprise customer analytics data for cross-account sharing
+    MaxLength: 1000
+
+  SubscriberAccountId:
+    Type: String
+    Description: AWS Account ID of the data subscriber
+    AllowedPattern: '^[0-9]{12}$'
+    ConstraintDescription: Must be a valid 12-digit AWS Account ID
+
+  DataGrantEndDate:
+    Type: String
+    Description: Data grant expiration date (ISO 8601 format, e.g., 2024-12-31T23:59:59Z)
+    Default: 2024-12-31T23:59:59Z
+    AllowedPattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$'
+    ConstraintDescription: Must be in ISO 8601 format (YYYY-MM-DDTHH:MM:SSZ)
+
+  ProviderBucketName:
+    Type: String
+    Description: Name for the provider S3 bucket (leave empty for auto-generated name)
+    Default: ''
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9\-]*[a-z0-9]$'
+    ConstraintDescription: Must be a valid S3 bucket name or empty for auto-generation
+
+  EnableS3Versioning:
+    Type: String
+    Description: Enable versioning for the S3 bucket
+    Default: Enabled
+    AllowedValues:
+      - Enabled
+      - Suspended
+
+  S3StorageClass:
+    Type: String
+    Description: Default storage class for S3 objects
+    Default: STANDARD
+    AllowedValues:
+      - STANDARD
+      - STANDARD_IA
+      - ONEZONE_IA
+      - REDUCED_REDUNDANCY
+      - GLACIER
+      - DEEP_ARCHIVE
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for Data Exchange notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+
+  EnableAutomatedUpdates:
+    Type: String
+    Description: Enable automated data updates using Lambda and EventBridge
+    Default: true
+    AllowedValues:
+      - true
+      - false
+
+  UpdateScheduleExpression:
+    Type: String
+    Description: Schedule expression for automated updates (EventBridge format)
+    Default: rate(24 hours)
+    AllowedPattern: '^(rate\(.*\)|cron\(.*\))$'
+    ConstraintDescription: Must be a valid EventBridge schedule expression
+
+  LogRetentionDays:
+    Type: Number
+    Description: CloudWatch log retention period in days
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+  EnableDetailedMonitoring:
+    Type: String
+    Description: Enable detailed CloudWatch monitoring and custom metrics
+    Default: true
+    AllowedValues:
+      - true
+      - false
+
+Conditions:
+  CreateBucketName: !Equals [!Ref ProviderBucketName, '']
+  EnableAutomation: !Equals [!Ref EnableAutomatedUpdates, 'true']
+  EnableMonitoring: !Equals [!Ref EnableDetailedMonitoring, 'true']
+
+Resources:
+  # =====================================
+  # S3 Storage Resources
+  # =====================================
+  
+  ProviderBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - CreateBucketName
+        - !Sub 'data-exchange-provider-${AWS::AccountId}-${AWS::StackName}'
+        - !Ref ProviderBucketName
+      VersioningConfiguration:
+        Status: !Ref EnableS3Versioning
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      Tags:
+        - Key: Purpose
+          Value: DataExchangeProvider
+        - Key: Environment
+          Value: !Ref AWS::StackName
+
+  ProviderBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ProviderBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${ProviderBucket}/*'
+              - !GetAtt ProviderBucket.Arn
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: AllowDataExchangeAccess
+            Effect: Allow
+            Principal:
+              Service: dataexchange.amazonaws.com
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:ListBucket
+            Resource:
+              - !Sub '${ProviderBucket}/*'
+              - !GetAtt ProviderBucket.Arn
+            Condition:
+              StringEquals:
+                's3:ExistingObjectTag/DataExchangeAsset': 'true'
+
+  # =====================================
+  # IAM Roles and Policies
+  # =====================================
+
+  DataExchangeProviderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'DataExchangeProviderRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: dataexchange.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSDataExchangeProviderFullAccess
+      Policies:
+        - PolicyName: S3DataExchangeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:PutObjectTagging
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${ProviderBucket}/*'
+                  - !GetAtt ProviderBucket.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Purpose
+          Value: DataExchangeOperations
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'DataExchangeLambdaRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DataExchangeOperations
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dataexchange:*
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - sns:Publish
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+      Tags:
+        - Key: Purpose
+          Value: DataExchangeLambdaExecution
+
+  # =====================================
+  # SNS Topic for Notifications
+  # =====================================
+
+  DataExchangeNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'DataExchangeNotifications-${AWS::StackName}'
+      DisplayName: AWS Data Exchange Notifications
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Purpose
+          Value: DataExchangeNotifications
+
+  NotificationTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref DataExchangeNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # =====================================
+  # Lambda Functions
+  # =====================================
+
+  NotificationLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'DataExchangeNotificationHandler-${AWS::StackName}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref DataExchangeNotificationTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          
+          def lambda_handler(event, context):
+              """
+              Handles AWS Data Exchange events and sends notifications
+              """
+              sns = boto3.client('sns')
+              
+              try:
+                  # Parse the Data Exchange event
+                  detail = event.get('detail', {})
+                  event_name = detail.get('eventName', 'Unknown')
+                  dataset_id = detail.get('dataSetId', 'Unknown')
+                  account_id = event.get('account', 'Unknown')
+                  
+                  message = f"""
+          AWS Data Exchange Event Notification
+          
+          Event: {event_name}
+          Dataset ID: {dataset_id}
+          Account: {account_id}
+          Timestamp: {event.get('time', 'Unknown')}
+          Region: {event.get('region', 'Unknown')}
+          
+          Event Details:
+          {json.dumps(detail, indent=2)}
+          
+          This is an automated notification from your AWS Data Exchange monitoring system.
+                  """
+                  
+                  # Send notification
+                  topic_arn = os.environ.get('SNS_TOPIC_ARN')
+                  if topic_arn:
+                      response = sns.publish(
+                          TopicArn=topic_arn,
+                          Message=message,
+                          Subject=f'Data Exchange Event: {event_name}'
+                      )
+                      print(f"Notification sent successfully. MessageId: {response['MessageId']}")
+                  else:
+                      print("Warning: SNS_TOPIC_ARN environment variable not set")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Notification sent successfully',
+                          'event_name': event_name,
+                          'dataset_id': dataset_id
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error processing Data Exchange event: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+      Tags:
+        - Key: Purpose
+          Value: DataExchangeNotifications
+
+  AutoUpdateLambdaFunction:
+    Type: AWS::Lambda::Function
+    Condition: EnableAutomation
+    Properties:
+      FunctionName: !Sub 'DataExchangeAutoUpdate-${AWS::StackName}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          PROVIDER_BUCKET: !Ref ProviderBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime
+          import csv
+          import random
+          import io
+          
+          def lambda_handler(event, context):
+              """
+              Automatically updates data sets with new revisions
+              """
+              dataexchange = boto3.client('dataexchange')
+              s3 = boto3.client('s3')
+              
+              try:
+                  dataset_id = event.get('dataset_id')
+                  bucket_name = event.get('bucket_name', os.environ.get('PROVIDER_BUCKET'))
+                  
+                  if not dataset_id:
+                      raise ValueError('dataset_id is required')
+                  if not bucket_name:
+                      raise ValueError('bucket_name is required')
+                  
+                  # Generate updated sample data
+                  current_date = datetime.now().strftime('%Y-%m-%d')
+                  current_timestamp = datetime.now().isoformat()
+                  
+                  # Create updated CSV data
+                  csv_data = []
+                  categories = ['electronics', 'books', 'clothing', 'home', 'sports']
+                  regions = ['us-east', 'us-west', 'eu-central', 'asia-pacific', 'sa-east']
+                  
+                  for i in range(1, 11):  # Generate 10 sample records
+                      csv_data.append([
+                          f'C{i:03d}',
+                          current_date,
+                          f'{random.uniform(25, 500):.2f}',
+                          random.choice(categories),
+                          random.choice(regions)
+                      ])
+                  
+                  # Convert to CSV string
+                  csv_buffer = io.StringIO()
+                  csv_writer = csv.writer(csv_buffer)
+                  csv_writer.writerow(['customer_id', 'purchase_date', 'amount', 'category', 'region'])
+                  csv_writer.writerows(csv_data)
+                  csv_content = csv_buffer.getvalue()
+                  
+                  # Upload updated data to S3
+                  key = f'analytics-data/customer-analytics-{current_date}.csv'
+                  s3.put_object(
+                      Bucket=bucket_name,
+                      Key=key,
+                      Body=csv_content,
+                      ContentType='text/csv',
+                      Tagging='DataExchangeAsset=true&UpdateDate=' + current_date
+                  )
+                  
+                  # Create new revision
+                  revision_response = dataexchange.create_revision(
+                      DataSetId=dataset_id,
+                      Comment=f'Automated update - {current_timestamp}'
+                  )
+                  
+                  revision_id = revision_response['Id']
+                  
+                  # Import new assets
+                  import_job = dataexchange.create_job(
+                      Type='IMPORT_ASSETS_FROM_S3',
+                      Details={
+                          'ImportAssetsFromS3JobDetails': {
+                              'DataSetId': dataset_id,
+                              'RevisionId': revision_id,
+                              'AssetSources': [
+                                  {
+                                      'Bucket': bucket_name,
+                                      'Key': key
+                                  }
+                              ]
+                          }
+                      }
+                  )
+                  
+                  # Wait briefly for job to start
+                  import time
+                  time.sleep(2)
+                  
+                  print(f"Created revision {revision_id} with import job {import_job['Id']}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'revision_id': revision_id,
+                          'import_job_id': import_job['Id'],
+                          's3_key': key,
+                          'timestamp': current_timestamp
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in auto-update: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+      Tags:
+        - Key: Purpose
+          Value: DataExchangeAutomation
+
+  # =====================================
+  # EventBridge Rules
+  # =====================================
+
+  DataExchangeEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'DataExchangeEvents-${AWS::StackName}'
+      Description: Captures AWS Data Exchange events for notifications
+      EventPattern:
+        source:
+          - aws.dataexchange
+        detail-type:
+          - Data Exchange Asset Import State Change
+          - Data Exchange Data Grant State Change
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt NotificationLambdaFunction.Arn
+          Id: NotificationTarget
+
+  AutoUpdateScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: EnableAutomation
+    Properties:
+      Name: !Sub 'DataExchangeAutoUpdate-${AWS::StackName}'
+      Description: Triggers automated data updates for Data Exchange
+      ScheduleExpression: !Ref UpdateScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AutoUpdateLambdaFunction.Arn
+          Id: AutoUpdateTarget
+          Input: !Sub |
+            {
+              "dataset_id": "${DataSetName}",
+              "bucket_name": "${ProviderBucket}"
+            }
+
+  # =====================================
+  # Lambda Permissions for EventBridge
+  # =====================================
+
+  NotificationLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotificationLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DataExchangeEventRule.Arn
+
+  AutoUpdateLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableAutomation
+    Properties:
+      FunctionName: !Ref AutoUpdateLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AutoUpdateScheduleRule.Arn
+
+  # =====================================
+  # CloudWatch Resources
+  # =====================================
+
+  DataExchangeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/dataexchange/operations-${AWS::StackName}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Purpose
+          Value: DataExchangeMonitoring
+
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/access-logs-${AWS::StackName}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Purpose
+          Value: S3AccessLogging
+
+  LambdaErrorMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: EnableMonitoring
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/DataExchangeAutoUpdate-${AWS::StackName}'
+      FilterPattern: ERROR
+      MetricTransformations:
+        - MetricNamespace: CustomMetrics/DataExchange
+          MetricName: LambdaErrors
+          MetricValue: '1'
+          DefaultValue: 0
+
+  DataExchangeFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub 'DataExchangeFailures-${AWS::StackName}'
+      AlarmDescription: Alert when Data Exchange operations fail
+      MetricName: LambdaErrors
+      Namespace: CustomMetrics/DataExchange
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref DataExchangeNotificationTopic
+      TreatMissingData: notBreaching
+
+  # =====================================
+  # Custom Resource for Sample Data
+  # =====================================
+
+  SampleDataUploader:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt SampleDataUploaderFunction.Arn
+      BucketName: !Ref ProviderBucket
+
+  SampleDataUploaderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'SampleDataUploader-${AWS::StackName}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import csv
+          import io
+          
+          def lambda_handler(event, context):
+              """
+              Custom resource to upload sample data to S3
+              """
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  s3 = boto3.client('s3')
+                  bucket_name = event['ResourceProperties']['BucketName']
+                  
+                  # Create sample customer analytics CSV
+                  csv_data = [
+                      ['customer_id', 'purchase_date', 'amount', 'category', 'region'],
+                      ['C001', '2024-01-15', '150.50', 'electronics', 'us-east'],
+                      ['C002', '2024-01-16', '89.99', 'books', 'us-west'],
+                      ['C003', '2024-01-17', '299.99', 'clothing', 'eu-central'],
+                      ['C004', '2024-01-18', '45.75', 'home', 'us-east'],
+                      ['C005', '2024-01-19', '199.99', 'electronics', 'asia-pacific']
+                  ]
+                  
+                  csv_buffer = io.StringIO()
+                  csv_writer = csv.writer(csv_buffer)
+                  csv_writer.writerows(csv_data)
+                  csv_content = csv_buffer.getvalue()
+                  
+                  # Upload CSV file
+                  s3.put_object(
+                      Bucket=bucket_name,
+                      Key='analytics-data/customer-analytics.csv',
+                      Body=csv_content,
+                      ContentType='text/csv',
+                      Tagging='DataExchangeAsset=true&SampleData=true'
+                  )
+                  
+                  # Create sample JSON file
+                  json_data = {
+                      "report_date": "2024-01-31",
+                      "total_sales": 785.72,
+                      "transaction_count": 5,
+                      "top_category": "electronics",
+                      "average_order_value": 157.14,
+                      "regions": ["us-east", "us-west", "eu-central", "asia-pacific"]
+                  }
+                  
+                  s3.put_object(
+                      Bucket=bucket_name,
+                      Key='analytics-data/sales-summary.json',
+                      Body=json.dumps(json_data, indent=2),
+                      ContentType='application/json',
+                      Tagging='DataExchangeAsset=true&SampleData=true'
+                  )
+                  
+                  print(f"Sample data uploaded successfully to {bucket_name}")
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'Message': 'Sample data uploaded successfully'
+                  })
+                  
+              except Exception as e:
+                  print(f"Error uploading sample data: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      'Error': str(e)
+                  })
+
+Outputs:
+  ProviderBucketName:
+    Description: Name of the S3 bucket for storing data assets
+    Value: !Ref ProviderBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ProviderBucket'
+
+  ProviderBucketArn:
+    Description: ARN of the S3 bucket for storing data assets
+    Value: !GetAtt ProviderBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ProviderBucketArn'
+
+  DataExchangeRoleArn:
+    Description: ARN of the IAM role for Data Exchange operations
+    Value: !GetAtt DataExchangeProviderRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataExchangeRole'
+
+  NotificationTopicArn:
+    Description: ARN of the SNS topic for notifications
+    Value: !Ref DataExchangeNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopic'
+
+  NotificationLambdaFunctionArn:
+    Description: ARN of the Lambda function for handling notifications
+    Value: !GetAtt NotificationLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationFunction'
+
+  AutoUpdateLambdaFunctionArn:
+    Description: ARN of the Lambda function for automated updates
+    Value: !If
+      - EnableAutomation
+      - !GetAtt AutoUpdateLambdaFunction.Arn
+      - 'Not Created'
+    Export:
+      Name: !Sub '${AWS::StackName}-AutoUpdateFunction'
+
+  DataExchangeLogGroupName:
+    Description: Name of the CloudWatch log group for Data Exchange operations
+    Value: !Ref DataExchangeLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  SubscriberAccountId:
+    Description: AWS Account ID of the data subscriber
+    Value: !Ref SubscriberAccountId
+    Export:
+      Name: !Sub '${AWS::StackName}-SubscriberAccount'
+
+  DataGrantEndDate:
+    Description: Expiration date for data grants
+    Value: !Ref DataGrantEndDate
+    Export:
+      Name: !Sub '${AWS::StackName}-GrantEndDate'
+
+  DeploymentCommands:
+    Description: Commands to complete the Data Exchange setup
+    Value: !Sub |
+      # After stack deployment, run these commands to complete setup:
+      
+      # 1. Create Data Exchange data set
+      export DATASET_ID=$(aws dataexchange create-data-set \
+        --asset-type S3_SNAPSHOT \
+        --description "${DataSetDescription}" \
+        --name "${DataSetName}-$(date +%Y%m%d)" \
+        --query 'Id' --output text)
+      
+      # 2. Create initial revision
+      export REVISION_ID=$(aws dataexchange create-revision \
+        --data-set-id $DATASET_ID \
+        --comment "Initial CloudFormation deployment" \
+        --query 'Id' --output text)
+      
+      # 3. Import assets from S3
+      aws dataexchange create-job \
+        --type IMPORT_ASSETS_FROM_S3 \
+        --details "{
+          \"ImportAssetsFromS3JobDetails\": {
+            \"DataSetId\": \"$DATASET_ID\",
+            \"RevisionId\": \"$REVISION_ID\",
+            \"AssetSources\": [
+              {\"Bucket\": \"${ProviderBucket}\", \"Key\": \"analytics-data/customer-analytics.csv\"},
+              {\"Bucket\": \"${ProviderBucket}\", \"Key\": \"analytics-data/sales-summary.json\"}
+            ]
+          }
+        }"
+      
+      # 4. After import job completes, finalize revision
+      aws dataexchange update-revision \
+        --data-set-id $DATASET_ID \
+        --revision-id $REVISION_ID \
+        --finalized
+      
+      # 5. Create data grant for subscriber
+      aws dataexchange create-data-grant \
+        --name "CloudFormation Data Grant" \
+        --description "Cross-account data sharing grant" \
+        --dataset-id $DATASET_ID \
+        --recipient-account-id ${SubscriberAccountId} \
+        --ends-at "${DataGrantEndDate}"

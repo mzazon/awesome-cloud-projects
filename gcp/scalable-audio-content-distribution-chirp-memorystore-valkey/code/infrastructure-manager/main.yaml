@@ -1,0 +1,588 @@
+# Infrastructure Manager Configuration for Scalable Audio Content Distribution
+# Recipe: Scalable Audio Content Distribution with Chirp 3 and Memorystore Valkey
+# Provider: Google Cloud Platform
+# Generated: 2025-07-12
+
+metadata:
+  name: scalable-audio-content-distribution
+  description: "Complete infrastructure for scalable audio content distribution using Chirp 3, Memorystore Valkey, Cloud Storage, and Cloud CDN"
+  labels:
+    recipe: "scalable-audio-content-distribution-chirp-memorystore-valkey"
+    category: "media-services"
+    difficulty: "200"
+
+# Input variables for customization
+variables:
+  # Project Configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    required: true
+  
+  region:
+    type: string
+    description: "Primary GCP region for resource deployment"
+    default: "us-central1"
+  
+  zone:
+    type: string
+    description: "Primary GCP zone for resource deployment"
+    default: "us-central1-a"
+  
+  # Resource Naming
+  random_suffix:
+    type: string
+    description: "Random suffix for unique resource naming"
+    default: "$(random_id.suffix.hex)"
+  
+  # Networking Configuration
+  vpc_network_name:
+    type: string
+    description: "Name for the VPC network"
+    default: "audio-network"
+  
+  subnet_name:
+    type: string
+    description: "Name for the subnet"
+    default: "audio-subnet"
+  
+  subnet_cidr:
+    type: string
+    description: "CIDR range for the subnet"
+    default: "10.0.0.0/24"
+  
+  # Storage Configuration
+  bucket_location:
+    type: string
+    description: "Location for Cloud Storage bucket"
+    default: "US"
+  
+  bucket_storage_class:
+    type: string
+    description: "Storage class for the bucket"
+    default: "STANDARD"
+  
+  # Memorystore Configuration
+  valkey_node_count:
+    type: number
+    description: "Number of nodes in the Valkey cluster"
+    default: 3
+  
+  valkey_memory_size_gb:
+    type: number
+    description: "Memory size in GB for each Valkey node"
+    default: 2
+  
+  valkey_version:
+    type: string
+    description: "Valkey version"
+    default: "8.0"
+  
+  # Cloud Function Configuration
+  function_memory:
+    type: string
+    description: "Memory allocation for Cloud Function"
+    default: "512MB"
+  
+  function_timeout:
+    type: string
+    description: "Timeout for Cloud Function"
+    default: "60s"
+  
+  # Cloud Run Configuration
+  run_memory:
+    type: string
+    description: "Memory allocation for Cloud Run service"
+    default: "512Mi"
+  
+  run_cpu:
+    type: string
+    description: "CPU allocation for Cloud Run service"
+    default: "1"
+  
+  run_min_instances:
+    type: number
+    description: "Minimum instances for Cloud Run service"
+    default: 1
+  
+  run_max_instances:
+    type: number
+    description: "Maximum instances for Cloud Run service"
+    default: 10
+
+# Random ID generator for unique resource naming
+resources:
+  # Generate random suffix for unique resource names
+  - name: suffix
+    type: gcp-types/random_id
+    properties:
+      byte_length: 3
+
+  # Enable required APIs
+  - name: enable-texttospeech-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/texttospeech.googleapis.com
+      
+  - name: enable-memcache-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/memcache.googleapis.com
+      
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/storage.googleapis.com
+      
+  - name: enable-cloudfunctions-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/cloudfunctions.googleapis.com
+      
+  - name: enable-cloudcdn-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/cloudcdn.googleapis.com
+      
+  - name: enable-compute-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/compute.googleapis.com
+      
+  - name: enable-cloudbuild-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/cloudbuild.googleapis.com
+      
+  - name: enable-run-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/run.googleapis.com
+
+  # VPC Network for secure communication
+  - name: audio-network
+    type: gcp-types/compute-v1:networks
+    properties:
+      name: ${vpc_network_name}
+      autoCreateSubnetworks: false
+      routingConfig:
+        routingMode: REGIONAL
+    metadata:
+      dependsOn:
+        - enable-compute-api
+
+  # Subnet for Memorystore and other resources
+  - name: audio-subnet
+    type: gcp-types/compute-v1:subnetworks
+    properties:
+      name: ${subnet_name}
+      network: $(ref.audio-network.selfLink)
+      ipCidrRange: ${subnet_cidr}
+      region: ${region}
+      privateIpGoogleAccess: true
+    metadata:
+      dependsOn:
+        - audio-network
+
+  # Cloud Storage bucket for audio assets
+  - name: audio-content-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: audio-content-${random_suffix}
+      project: ${project_id}
+      location: ${bucket_location}
+      storageClass: ${bucket_storage_class}
+      versioning:
+        enabled: true
+      cors:
+        - origin: ["*"]
+          method: ["GET", "HEAD"]
+          responseHeader: ["Content-Type", "Range"]
+          maxAgeSeconds: 3600
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90
+      uniformBucketLevelAccess:
+        enabled: true
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # IAM binding for public access to bucket objects
+  - name: bucket-public-access
+    type: gcp-types/storage-v1:buckets/iam
+    properties:
+      bucket: $(ref.audio-content-bucket.name)
+      bindings:
+        - role: roles/storage.objectViewer
+          members:
+            - allUsers
+    metadata:
+      dependsOn:
+        - audio-content-bucket
+
+  # Service Account for Text-to-Speech operations
+  - name: tts-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: tts-service-account-${random_suffix}
+      serviceAccount:
+        displayName: "Text-to-Speech Service Account"
+        description: "Service account for audio processing operations"
+
+  # IAM binding for TTS service account - Cloud TTS User
+  - name: tts-service-account-tts-binding
+    type: gcp-types/cloudresourcemanager-v1:projects/iam
+    properties:
+      resource: ${project_id}
+      policy:
+        bindings:
+          - role: roles/cloudtts.user
+            members:
+              - serviceAccount:$(ref.tts-service-account.email)
+    metadata:
+      dependsOn:
+        - tts-service-account
+
+  # IAM binding for TTS service account - Storage Object Admin
+  - name: tts-service-account-storage-binding
+    type: gcp-types/cloudresourcemanager-v1:projects/iam
+    properties:
+      resource: ${project_id}
+      policy:
+        bindings:
+          - role: roles/storage.objectAdmin
+            members:
+              - serviceAccount:$(ref.tts-service-account.email)
+    metadata:
+      dependsOn:
+        - tts-service-account
+
+  # Memorystore for Valkey instance
+  - name: audio-cache-valkey
+    type: gcp-types/memcache-v1:projects.locations.instances
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      instanceId: audio-cache-${random_suffix}
+      instance:
+        displayName: "Audio Content Cache"
+        nodeCount: ${valkey_node_count}
+        nodeConfig:
+          cpuCount: 1
+          memorySizeMb: $((${valkey_memory_size_gb} * 1024))
+        network: $(ref.audio-network.selfLink)
+        memcacheVersion: MEMCACHE_1_6_15
+        parameters:
+          max-item-size: "8388608"  # 8MB max item size for audio files
+        authEnabled: true
+        authorizedNetwork: $(ref.audio-network.selfLink)
+        zones:
+          - ${zone}
+    metadata:
+      dependsOn:
+        - enable-memcache-api
+        - audio-subnet
+
+  # Cloud Function for audio processing
+  - name: audio-processor-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/${project_id}/locations/${region}
+      function:
+        name: projects/${project_id}/locations/${region}/functions/audio-processor-${random_suffix}
+        description: "Audio processing function with TTS and caching"
+        sourceArchiveUrl: gs://audio-content-${random_suffix}/function-source.zip
+        entryPoint: processAudio
+        runtime: nodejs18
+        timeout: ${function_timeout}
+        availableMemoryMb: 512
+        serviceAccountEmail: $(ref.tts-service-account.email)
+        environmentVariables:
+          BUCKET_NAME: $(ref.audio-content-bucket.name)
+          VALKEY_HOST: $(ref.audio-cache-valkey.host)
+          VALKEY_PORT: "11211"
+        httpsTrigger: {}
+        ingressSettings: ALLOW_ALL
+    metadata:
+      dependsOn:
+        - enable-cloudfunctions-api
+        - audio-content-bucket
+        - audio-cache-valkey
+        - tts-service-account
+
+  # Cloud Run service for audio management
+  - name: audio-management-service
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/${project_id}
+      service:
+        apiVersion: serving.knative.dev/v1
+        kind: Service
+        metadata:
+          name: audio-management-service-${random_suffix}
+          namespace: ${project_id}
+          labels:
+            cloud.googleapis.com/location: ${region}
+          annotations:
+            run.googleapis.com/ingress: all
+        spec:
+          template:
+            metadata:
+              annotations:
+                autoscaling.knative.dev/minScale: "${run_min_instances}"
+                autoscaling.knative.dev/maxScale: "${run_max_instances}"
+                run.googleapis.com/cpu-throttling: "true"
+                run.googleapis.com/execution-environment: gen2
+            spec:
+              serviceAccountName: $(ref.tts-service-account.email)
+              containers:
+                - image: gcr.io/${project_id}/audio-management-service:latest
+                  ports:
+                    - name: http1
+                      containerPort: 8080
+                  resources:
+                    limits:
+                      cpu: ${run_cpu}
+                      memory: ${run_memory}
+                  env:
+                    - name: FUNCTION_URL
+                      value: $(ref.audio-processor-function.httpsTrigger.url)
+                    - name: VALKEY_HOST
+                      value: $(ref.audio-cache-valkey.host)
+                    - name: CDN_ENDPOINT
+                      value: $(ref.cdn-static-ip.address)
+                    - name: PROJECT_ID
+                      value: ${project_id}
+          traffic:
+            - percent: 100
+              latestRevision: true
+    metadata:
+      dependsOn:
+        - enable-run-api
+        - audio-processor-function
+        - audio-cache-valkey
+        - tts-service-account
+
+  # IAM policy for Cloud Run service (allow unauthenticated access)
+  - name: audio-management-service-iam
+    type: gcp-types/run-v1:projects.locations.services/iam
+    properties:
+      resource: projects/${project_id}/locations/${region}/services/audio-management-service-${random_suffix}
+      policy:
+        bindings:
+          - role: roles/run.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - audio-management-service
+
+  # Backend bucket for CDN
+  - name: cdn-backend-bucket
+    type: gcp-types/compute-v1:backendBuckets
+    properties:
+      name: audio-backend-${random_suffix}
+      bucketName: $(ref.audio-content-bucket.name)
+      description: "Backend bucket for audio content CDN"
+      enableCdn: true
+      cdnPolicy:
+        cacheMode: CACHE_ALL_STATIC
+        defaultTtl: 3600
+        maxTtl: 86400
+        clientTtl: 1800
+        negativeCaching: true
+        negativeCachingPolicy:
+          - code: 404
+            ttl: 60
+    metadata:
+      dependsOn:
+        - enable-compute-api
+        - audio-content-bucket
+
+  # URL map for CDN routing
+  - name: cdn-url-map
+    type: gcp-types/compute-v1:urlMaps
+    properties:
+      name: audio-cdn-map-${random_suffix}
+      description: "URL map for audio content CDN"
+      defaultBackendBucket: $(ref.cdn-backend-bucket.selfLink)
+      hostRules:
+        - hosts: ["*"]
+          pathMatcher: default
+      pathMatchers:
+        - name: default
+          defaultBackendBucket: $(ref.cdn-backend-bucket.selfLink)
+          pathRules:
+            - paths: ["/generated-audio/*"]
+              backendBucket: $(ref.cdn-backend-bucket.selfLink)
+    metadata:
+      dependsOn:
+        - cdn-backend-bucket
+
+  # HTTP(S) target proxy
+  - name: cdn-http-proxy
+    type: gcp-types/compute-v1:targetHttpProxies
+    properties:
+      name: audio-http-proxy-${random_suffix}
+      description: "HTTP proxy for audio content CDN"
+      urlMap: $(ref.cdn-url-map.selfLink)
+    metadata:
+      dependsOn:
+        - cdn-url-map
+
+  # Static IP address for CDN
+  - name: cdn-static-ip
+    type: gcp-types/compute-v1:addresses
+    properties:
+      name: audio-cdn-ip-${random_suffix}
+      description: "Static IP for audio content CDN"
+      addressType: EXTERNAL
+      networkTier: PREMIUM
+    metadata:
+      dependsOn:
+        - enable-compute-api
+
+  # Global forwarding rule for HTTP traffic
+  - name: cdn-forwarding-rule
+    type: gcp-types/compute-v1:globalForwardingRules
+    properties:
+      name: audio-http-rule-${random_suffix}
+      description: "Forwarding rule for audio content CDN"
+      target: $(ref.cdn-http-proxy.selfLink)
+      portRange: "80"
+      IPAddress: $(ref.cdn-static-ip.selfLink)
+      loadBalancingScheme: EXTERNAL
+    metadata:
+      dependsOn:
+        - cdn-http-proxy
+        - cdn-static-ip
+
+  # Firewall rule for health checks (if needed)
+  - name: allow-health-checks
+    type: gcp-types/compute-v1:firewalls
+    properties:
+      name: allow-health-checks-${random_suffix}
+      description: "Allow health check traffic"
+      network: $(ref.audio-network.selfLink)
+      allowed:
+        - IPProtocol: tcp
+          ports: ["80", "8080", "443"]
+      sourceRanges:
+        - "130.211.0.0/22"
+        - "35.191.0.0/16"
+      direction: INGRESS
+      priority: 1000
+    metadata:
+      dependsOn:
+        - audio-network
+
+# Output values for verification and integration
+outputs:
+  # Project Information
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${project_id}
+  
+  region:
+    description: "Primary deployment region"
+    value: ${region}
+  
+  # Network Information
+  vpc_network_name:
+    description: "VPC network name"
+    value: $(ref.audio-network.name)
+  
+  vpc_network_self_link:
+    description: "VPC network self link"
+    value: $(ref.audio-network.selfLink)
+  
+  subnet_name:
+    description: "Subnet name"
+    value: $(ref.audio-subnet.name)
+  
+  subnet_self_link:
+    description: "Subnet self link"
+    value: $(ref.audio-subnet.selfLink)
+  
+  # Storage Information
+  bucket_name:
+    description: "Cloud Storage bucket name for audio assets"
+    value: $(ref.audio-content-bucket.name)
+  
+  bucket_url:
+    description: "Cloud Storage bucket URL"
+    value: "gs://$(ref.audio-content-bucket.name)"
+  
+  # Caching Information
+  valkey_instance_name:
+    description: "Memorystore Valkey instance name"
+    value: $(ref.audio-cache-valkey.name)
+  
+  valkey_host:
+    description: "Memorystore Valkey host address"
+    value: $(ref.audio-cache-valkey.host)
+  
+  valkey_port:
+    description: "Memorystore Valkey port"
+    value: "11211"
+  
+  # Service Information
+  tts_service_account_email:
+    description: "Text-to-Speech service account email"
+    value: $(ref.tts-service-account.email)
+  
+  audio_processor_function_url:
+    description: "Audio processor Cloud Function trigger URL"
+    value: $(ref.audio-processor-function.httpsTrigger.url)
+  
+  audio_management_service_url:
+    description: "Audio management Cloud Run service URL"
+    value: $(ref.audio-management-service.status.url)
+  
+  # CDN Information
+  cdn_ip_address:
+    description: "CDN static IP address"
+    value: $(ref.cdn-static-ip.address)
+  
+  cdn_endpoint:
+    description: "CDN endpoint URL"
+    value: "http://$(ref.cdn-static-ip.address)"
+  
+  cdn_backend_bucket:
+    description: "CDN backend bucket name"
+    value: $(ref.cdn-backend-bucket.name)
+  
+  # Verification URLs
+  health_check_url:
+    description: "Health check endpoint"
+    value: "$(ref.audio-management-service.status.url)/health"
+  
+  api_generate_url:
+    description: "Audio generation API endpoint"
+    value: "$(ref.audio-management-service.status.url)/api/audio/generate"
+  
+  api_batch_url:
+    description: "Batch processing API endpoint"
+    value: "$(ref.audio-management-service.status.url)/api/audio/batch"
+  
+  api_cache_stats_url:
+    description: "Cache statistics API endpoint"
+    value: "$(ref.audio-management-service.status.url)/api/cache/stats"
+
+# Metadata for Infrastructure Manager
+labels:
+  environment: production
+  recipe: scalable-audio-content-distribution
+  provider: gcp
+  category: media-services
+  difficulty: "200"
+  services: "text-to-speech,memorystore,storage,cdn"

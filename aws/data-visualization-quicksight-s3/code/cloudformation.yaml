@@ -1,0 +1,766 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Comprehensive data visualization pipeline with QuickSight, S3, Glue, Athena, and Lambda automation'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'data-viz-pipeline'
+    Description: 'Base name for all resources'
+    AllowedPattern: '^[a-z0-9-]{3,20}$'
+    ConstraintDescription: 'Must be 3-20 characters, lowercase letters, numbers, and hyphens only'
+
+  QuickSightUserArn:
+    Type: String
+    Description: 'QuickSight user ARN for data source permissions (format: arn:aws:quicksight:region:account:user/default/username)'
+    AllowedPattern: '^arn:aws:quicksight:[a-z0-9-]+:[0-9]{12}:user/.+$'
+    ConstraintDescription: 'Must be a valid QuickSight user ARN'
+
+  EnableS3EventNotifications:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable S3 event notifications to trigger automated pipeline processing'
+
+  GlueVersion:
+    Type: String
+    Default: '4.0'
+    AllowedValues: ['3.0', '4.0']
+    Description: 'AWS Glue version for ETL jobs'
+
+  EnableEncryption:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable encryption for S3 buckets and Athena query results'
+
+Conditions:
+  CreateS3Notifications: !Equals [!Ref EnableS3EventNotifications, 'true']
+  EnableS3Encryption: !Equals [!Ref EnableEncryption, 'true']
+
+Resources:
+  # ========================================
+  # S3 STORAGE BUCKETS
+  # ========================================
+  
+  # Primary bucket for raw data storage
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-raw-data-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        !If
+          - EnableS3Encryption
+          - ServerSideEncryptionConfiguration:
+              - ServerSideEncryptionByDefault:
+                  SSEAlgorithm: AES256
+                BucketKeyEnabled: true
+          - !Ref AWS::NoValue
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: ArchiveOldVersions
+            Status: Enabled
+            NoncurrentVersionTransitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        !If
+          - CreateS3Notifications
+          - LambdaConfigurations:
+              - Event: 's3:ObjectCreated:*'
+                Function: !GetAtt PipelineAutomationFunction.Arn
+                Filter:
+                  S3Key:
+                    Rules:
+                      - Name: prefix
+                        Value: 'sales-data/'
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: Purpose
+          Value: 'Raw data storage for visualization pipeline'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Bucket for processed/transformed data
+  ProcessedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-processed-data-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        !If
+          - EnableS3Encryption
+          - ServerSideEncryptionConfiguration:
+              - ServerSideEncryptionByDefault:
+                  SSEAlgorithm: AES256
+                BucketKeyEnabled: true
+          - !Ref AWS::NoValue
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: OptimizeStorageClass
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Purpose
+          Value: 'Processed data storage for visualization pipeline'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Bucket for Athena query results
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-athena-results-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        !If
+          - EnableS3Encryption
+          - ServerSideEncryptionConfiguration:
+              - ServerSideEncryptionByDefault:
+                  SSEAlgorithm: AES256
+                BucketKeyEnabled: true
+          - !Ref AWS::NoValue
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteQueryResults
+            Status: Enabled
+            ExpirationInDays: 30
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Purpose
+          Value: 'Athena query results storage'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # IAM ROLES AND POLICIES
+  # ========================================
+
+  # Service role for AWS Glue
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-glue-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3DataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${RawDataBucket}/*'
+                  - !Sub '${ProcessedDataBucket}/*'
+                  - !Ref RawDataBucket
+                  - !Ref ProcessedDataBucket
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*'
+      Tags:
+        - Key: Purpose
+          Value: 'Service role for Glue crawlers and ETL jobs'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Service role for Lambda automation function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GlueOperations
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartCrawler
+                  - glue:GetCrawler
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:crawler/${ProjectName}-*'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${ProjectName}-*'
+        - PolicyName: S3ReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource:
+                  - !Sub '${RawDataBucket}/*'
+      Tags:
+        - Key: Purpose
+          Value: 'Execution role for pipeline automation Lambda'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # AWS GLUE DATA CATALOG AND CRAWLERS
+  # ========================================
+
+  # Glue database for data catalog
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectName}-database'
+        Description: 'Database for data visualization pipeline'
+
+  # Crawler for raw data discovery
+  RawDataCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ProjectName}-raw-crawler'
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Description: 'Crawler for raw sales data discovery'
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${RawDataBucket}/sales-data/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Configuration: |
+        {
+          "Version": 1.0,
+          "Grouping": {
+            "TableGroupingPolicy": "CombineCompatibleSchemas"
+          }
+        }
+      Tags:
+        Purpose: 'Raw data schema discovery'
+        Project: !Ref ProjectName
+
+  # Crawler for processed data discovery
+  ProcessedDataCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ProjectName}-processed-crawler'
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Description: 'Crawler for processed data discovery'
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${ProcessedDataBucket}/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Configuration: |
+        {
+          "Version": 1.0,
+          "Grouping": {
+            "TableGroupingPolicy": "CombineCompatibleSchemas"
+          }
+        }
+      Tags:
+        Purpose: 'Processed data schema discovery'
+        Project: !Ref ProjectName
+
+  # ========================================
+  # AWS GLUE ETL JOB
+  # ========================================
+
+  # ETL job for data transformation
+  DataTransformationJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${ProjectName}-etl-job'
+      Role: !GetAtt GlueServiceRole.Arn
+      Description: 'ETL job for sales data transformation and enrichment'
+      GlueVersion: !Ref GlueVersion
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://${ProcessedDataBucket}/scripts/sales-etl.py'
+      DefaultArguments:
+        '--SOURCE_DATABASE': !Ref GlueDatabase
+        '--TARGET_BUCKET': !Ref ProcessedDataBucket
+        '--enable-metrics': ''
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--job-language': 'python'
+        '--TempDir': !Sub 's3://${ProcessedDataBucket}/temp/'
+      ExecutionProperty:
+        MaxConcurrentRuns: 2
+      MaxRetries: 1
+      Timeout: 60
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Tags:
+        Purpose: 'Data transformation and enrichment'
+        Project: !Ref ProjectName
+
+  # ========================================
+  # ATHENA WORKGROUP
+  # ========================================
+
+  # Athena workgroup for query management
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub '${ProjectName}-workgroup'
+      Description: 'Workgroup for data visualization pipeline queries'
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${AthenaResultsBucket}/'
+          EncryptionConfiguration:
+            !If
+              - EnableS3Encryption
+              - EncryptionOption: SSE_S3
+              - !Ref AWS::NoValue
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetrics: true
+        BytesScannedCutoffPerQuery: 1000000000  # 1GB limit
+      Tags:
+        - Key: Purpose
+          Value: 'Query execution management for visualization pipeline'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # LAMBDA AUTOMATION FUNCTION
+  # ========================================
+
+  # Lambda function for pipeline automation
+  PipelineAutomationFunction:
+    Type: AWS::Lambda::Function
+    Condition: CreateS3Notifications
+    Properties:
+      FunctionName: !Sub '${ProjectName}-automation'
+      Description: 'Automates pipeline processing when new data is uploaded'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          RAW_CRAWLER_NAME: !Ref RawDataCrawler
+          ETL_JOB_NAME: !Ref DataTransformationJob
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const glue = new AWS.Glue();
+          
+          const PROJECT_NAME = process.env.PROJECT_NAME;
+          const RAW_CRAWLER_NAME = process.env.RAW_CRAWLER_NAME;
+          const ETL_JOB_NAME = process.env.ETL_JOB_NAME;
+          
+          exports.handler = async (event) => {
+              console.log('Received event:', JSON.stringify(event, null, 2));
+              
+              try {
+                  // Check if new data was uploaded to raw bucket
+                  for (const record of event.Records) {
+                      if (record.eventSource === 'aws:s3' && record.eventName.startsWith('ObjectCreated')) {
+                          const bucketName = record.s3.bucket.name;
+                          const objectKey = record.s3.object.key;
+                          
+                          console.log(`New file uploaded: ${objectKey} in bucket ${bucketName}`);
+                          
+                          // Trigger crawler to update schema
+                          await triggerCrawler(RAW_CRAWLER_NAME);
+                          
+                          // Wait a bit then trigger ETL job
+                          setTimeout(async () => {
+                              await triggerETLJob(ETL_JOB_NAME);
+                          }, 60000); // Wait 1 minute for crawler to complete
+                      }
+                  }
+                  
+                  return {
+                      statusCode: 200,
+                      body: JSON.stringify('Pipeline triggered successfully')
+                  };
+                  
+              } catch (error) {
+                  console.error('Error:', error);
+                  throw error;
+              }
+          };
+          
+          async function triggerCrawler(crawlerName) {
+              try {
+                  const params = { Name: crawlerName };
+                  await glue.startCrawler(params).promise();
+                  console.log(`Started crawler: ${crawlerName}`);
+              } catch (error) {
+                  if (error.code === 'CrawlerRunningException') {
+                      console.log(`Crawler ${crawlerName} is already running`);
+                  } else {
+                      throw error;
+                  }
+              }
+          }
+          
+          async function triggerETLJob(jobName) {
+              try {
+                  const params = { JobName: jobName };
+                  const result = await glue.startJobRun(params).promise();
+                  console.log(`Started ETL job: ${jobName}, Run ID: ${result.JobRunId}`);
+              } catch (error) {
+                  console.error(`Error starting ETL job ${jobName}:`, error);
+                  throw error;
+              }
+          }
+      Tags:
+        - Key: Purpose
+          Value: 'Automated pipeline processing trigger'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda permission for S3 to invoke the function
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Condition: CreateS3Notifications
+    Properties:
+      FunctionName: !Ref PipelineAutomationFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt RawDataBucket.Arn
+
+  # ========================================
+  # QUICKSIGHT DATA SOURCE
+  # ========================================
+
+  # QuickSight data source (Athena connection)
+  QuickSightDataSource:
+    Type: AWS::QuickSight::DataSource
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSourceId: !Sub '${ProjectName}-athena-source'
+      Name: 'Sales Analytics Data Source'
+      Type: ATHENA
+      DataSourceParameters:
+        AthenaParameters:
+          WorkGroup: !Ref AthenaWorkGroup
+      Permissions:
+        - Principal: !Ref QuickSightUserArn
+          Actions:
+            - quicksight:DescribeDataSource
+            - quicksight:DescribeDataSourcePermissions
+            - quicksight:PassDataSource
+            - quicksight:UpdateDataSource
+            - quicksight:DeleteDataSource
+            - quicksight:UpdateDataSourcePermissions
+      Tags:
+        - Key: Purpose
+          Value: 'QuickSight data source for visualization pipeline'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # CUSTOM RESOURCE FOR ETL SCRIPT DEPLOYMENT
+  # ========================================
+
+  # Custom resource to deploy ETL script to S3
+  ETLScriptDeployment:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt ETLScriptDeploymentFunction.Arn
+      ProcessedBucket: !Ref ProcessedDataBucket
+      ProjectName: !Ref ProjectName
+
+  # Lambda function for deploying ETL script
+  ETLScriptDeploymentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-etl-script-deployment'
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt ETLScriptDeploymentRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+          
+          def handler(event, context):
+              try:
+                  s3 = boto3.client('s3')
+                  bucket = event['ResourceProperties']['ProcessedBucket']
+                  project_name = event['ResourceProperties']['ProjectName']
+                  
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      # ETL script content
+                      etl_script = '''
+          import sys
+          from awsglue.transforms import *
+          from awsglue.utils import getResolvedOptions
+          from pyspark.context import SparkContext
+          from awsglue.context import GlueContext
+          from awsglue.job import Job
+          from pyspark.sql import functions as F
+          from pyspark.sql.types import *
+          
+          args = getResolvedOptions(sys.argv, ['JOB_NAME', 'SOURCE_DATABASE', 'TARGET_BUCKET'])
+          
+          sc = SparkContext()
+          glueContext = GlueContext(sc)
+          spark = glueContext.spark_session
+          job = Job(glueContext)
+          job.init(args['JOB_NAME'], args)
+          
+          try:
+              # Read sales data
+              sales_df = glueContext.create_dynamic_frame.from_catalog(
+                  database=args['SOURCE_DATABASE'],
+                  table_name="sales_2024_q1_csv"
+              ).toDF()
+              
+              # Data transformations
+              # Convert data types
+              sales_df = sales_df.withColumn("quantity", F.col("quantity").cast(IntegerType())) \\
+                               .withColumn("unit_price", F.col("unit_price").cast(DoubleType())) \\
+                               .withColumn("order_date", F.to_date(F.col("order_date"), "yyyy-MM-dd"))
+              
+              # Calculate total amount
+              sales_df = sales_df.withColumn("total_amount", F.col("quantity") * F.col("unit_price"))
+              
+              # Add derived columns
+              sales_df = sales_df.withColumn("order_month", F.month(F.col("order_date"))) \\
+                               .withColumn("order_year", F.year(F.col("order_date"))) \\
+                               .withColumn("order_quarter", F.quarter(F.col("order_date")))
+              
+              # Write enriched sales data
+              target_bucket = args['TARGET_BUCKET']
+              sales_df.write.mode("overwrite").parquet(f"s3://{target_bucket}/enriched-sales/")
+              
+              # Create monthly sales summary
+              monthly_sales = sales_df.groupBy("order_year", "order_month", "region") \\
+                  .agg(
+                      F.sum("total_amount").alias("total_revenue"),
+                      F.count("order_id").alias("total_orders"),
+                      F.avg("total_amount").alias("avg_order_value"),
+                      F.countDistinct("customer_id").alias("unique_customers")
+                  )
+              
+              monthly_sales.write.mode("overwrite").parquet(f"s3://{target_bucket}/monthly-sales/")
+              
+              # Product category performance
+              category_performance = sales_df.groupBy("product_category", "region") \\
+                  .agg(
+                      F.sum("total_amount").alias("category_revenue"),
+                      F.sum("quantity").alias("total_quantity"),
+                      F.count("order_id").alias("total_orders")
+                  )
+              
+              category_performance.write.mode("overwrite").parquet(f"s3://{target_bucket}/category-performance/")
+              
+          except Exception as e:
+              print(f"Error processing data: {str(e)}")
+              # Create empty datasets if tables don't exist yet
+              schema = StructType([
+                  StructField("placeholder", StringType(), True)
+              ])
+              empty_df = spark.createDataFrame([], schema)
+              target_bucket = args['TARGET_BUCKET']
+              empty_df.write.mode("overwrite").parquet(f"s3://{target_bucket}/enriched-sales/")
+              empty_df.write.mode("overwrite").parquet(f"s3://{target_bucket}/monthly-sales/")
+              empty_df.write.mode("overwrite").parquet(f"s3://{target_bucket}/category-performance/")
+          
+          job.commit()
+          '''
+                      
+                      # Upload ETL script to S3
+                      s3.put_object(
+                          Bucket=bucket,
+                          Key='scripts/sales-etl.py',
+                          Body=etl_script.encode('utf-8'),
+                          ContentType='text/x-python'
+                      )
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'Message': 'ETL script deployed successfully'
+                      })
+                  
+                  elif event['RequestType'] == 'Delete':
+                      # Clean up ETL script
+                      try:
+                          s3.delete_object(Bucket=bucket, Key='scripts/sales-etl.py')
+                      except:
+                          pass  # Ignore errors during cleanup
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'Message': 'ETL script cleanup completed'
+                      })
+              
+              except Exception as e:
+                  print(f'Error: {str(e)}')
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      'Message': f'Error: {str(e)}'
+                  })
+
+  # IAM role for ETL script deployment function
+  ETLScriptDeploymentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:GetObject
+                Resource:
+                  - !Sub '${ProcessedDataBucket}/*'
+
+# ========================================
+# OUTPUTS
+# ========================================
+
+Outputs:
+  RawDataBucketName:
+    Description: 'Name of the S3 bucket for raw data storage'
+    Value: !Ref RawDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-RawDataBucket'
+
+  ProcessedDataBucketName:
+    Description: 'Name of the S3 bucket for processed data storage'
+    Value: !Ref ProcessedDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessedDataBucket'
+
+  AthenaResultsBucketName:
+    Description: 'Name of the S3 bucket for Athena query results'
+    Value: !Ref AthenaResultsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaResultsBucket'
+
+  GlueDatabaseName:
+    Description: 'Name of the Glue database for data catalog'
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabase'
+
+  RawDataCrawlerName:
+    Description: 'Name of the Glue crawler for raw data'
+    Value: !Ref RawDataCrawler
+    Export:
+      Name: !Sub '${AWS::StackName}-RawDataCrawler'
+
+  ProcessedDataCrawlerName:
+    Description: 'Name of the Glue crawler for processed data'
+    Value: !Ref ProcessedDataCrawler
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessedDataCrawler'
+
+  ETLJobName:
+    Description: 'Name of the Glue ETL job for data transformation'
+    Value: !Ref DataTransformationJob
+    Export:
+      Name: !Sub '${AWS::StackName}-ETLJob'
+
+  AthenaWorkGroupName:
+    Description: 'Name of the Athena workgroup for query execution'
+    Value: !Ref AthenaWorkGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaWorkGroup'
+
+  QuickSightDataSourceId:
+    Description: 'ID of the QuickSight data source'
+    Value: !Ref QuickSightDataSource
+    Export:
+      Name: !Sub '${AWS::StackName}-QuickSightDataSource'
+
+  AutomationFunctionName:
+    Condition: CreateS3Notifications
+    Description: 'Name of the Lambda function for pipeline automation'
+    Value: !Ref PipelineAutomationFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-AutomationFunction'
+
+  GlueServiceRoleArn:
+    Description: 'ARN of the Glue service role'
+    Value: !GetAtt GlueServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueServiceRole'
+
+  SampleDataUploadCommand:
+    Description: 'AWS CLI command to upload sample data'
+    Value: !Sub 'aws s3 cp your-data-file.csv s3://${RawDataBucket}/sales-data/'
+
+  AthenaQueryLocation:
+    Description: 'S3 location for Athena query results'
+    Value: !Sub 's3://${AthenaResultsBucket}/'
+
+  QuickSightSetupInstructions:
+    Description: 'Instructions for setting up QuickSight dashboards'
+    Value: 'Use the QuickSight data source to create datasets from the Glue Data Catalog tables, then build visualizations and dashboards'

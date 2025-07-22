@@ -1,0 +1,848 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure as Code for Optimizing Amazon Redshift Performance'
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+Parameters:
+  ClusterIdentifier:
+    Type: String
+    Default: 'redshift-performance-cluster'
+    Description: 'Unique identifier for the Redshift cluster'
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be lowercase, start with a letter, and contain only letters, numbers, and hyphens'
+
+  DatabaseName:
+    Type: String
+    Default: 'performancedb'
+    Description: 'Name of the initial database to create'
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[a-z][a-z0-9_]*$'
+    ConstraintDescription: 'Must be lowercase and contain only letters, numbers, and underscores'
+
+  MasterUsername:
+    Type: String
+    Default: 'admin'
+    Description: 'Master username for the Redshift cluster'
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: '^[a-z][a-z0-9_]*$'
+    ConstraintDescription: 'Must be lowercase and contain only letters, numbers, and underscores'
+
+  MasterUserPassword:
+    Type: String
+    NoEcho: true
+    Description: 'Master password for the Redshift cluster (minimum 8 characters)'
+    MinLength: 8
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z0-9!@#$%^&*()_+=-]*$'
+    ConstraintDescription: 'Must be 8-64 characters and contain only alphanumeric and special characters'
+
+  NodeType:
+    Type: String
+    Default: 'ra3.xlplus'
+    AllowedValues:
+      - 'ra3.xlplus'
+      - 'ra3.4xlarge'
+      - 'ra3.16xlarge'
+      - 'dc2.large'
+      - 'dc2.8xlarge'
+    Description: 'Node type for the Redshift cluster'
+
+  NumberOfNodes:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 32
+    Description: 'Number of compute nodes in the cluster (1 for single-node, 2+ for multi-node)'
+
+  VpcId:
+    Type: 'AWS::EC2::VPC::Id'
+    Description: 'VPC ID where the Redshift cluster will be deployed'
+
+  SubnetIds:
+    Type: 'List<AWS::EC2::Subnet::Id>'
+    Description: 'List of subnet IDs for the Redshift cluster (minimum 2 in different AZs)'
+
+  AllowedCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: 'CIDR block allowed to access the Redshift cluster'
+    AllowedPattern: '^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})$'
+    ConstraintDescription: 'Must be a valid CIDR range'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for performance alerts'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  MaintenanceWindow:
+    Type: String
+    Default: 'sun:02:00-sun:03:00'
+    Description: 'Preferred maintenance window for the cluster (format: ddd:hh24:mi-ddd:hh24:mi)'
+
+  AutomatedSnapshotRetentionPeriod:
+    Type: Number
+    Default: 7
+    MinValue: 0
+    MaxValue: 35
+    Description: 'Number of days to retain automated snapshots (0 to disable)'
+
+  EnableConcurrencyScaling:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable concurrency scaling for the cluster'
+
+  EnableQueryMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable detailed query monitoring'
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+Conditions:
+  IsMultiNode: !Not [!Equals [!Ref NumberOfNodes, 1]]
+  IsConcurrencyScalingEnabled: !Equals [!Ref EnableConcurrencyScaling, 'true']
+  IsQueryMonitoringEnabled: !Equals [!Ref EnableQueryMonitoring, 'true']
+  IsSnapshotRetentionEnabled: !Not [!Equals [!Ref AutomatedSnapshotRetentionPeriod, 0]]
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+
+  # ------------------------------------------------------------------------------
+  # IAM ROLES AND POLICIES
+  # ------------------------------------------------------------------------------
+  
+  # IAM Role for Redshift Cluster
+  RedshiftServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ClusterIdentifier}-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: redshift.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess'
+        - 'arn:aws:iam::aws:policy/AmazonRedshiftAllCommandsFullAccess'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterIdentifier}-service-role'
+        - Key: Recipe
+          Value: 'redshift-performance'
+
+  # IAM Role for Lambda Maintenance Function
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ClusterIdentifier}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: RedshiftMaintenancePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'redshift:DescribeClusters'
+                  - 'redshift:ModifyCluster'
+                  - 'redshift:GetClusterCredentials'
+                Resource: !Sub 'arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:cluster:${ClusterIdentifier}'
+              - Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                Resource: !Ref DatabaseCredentials
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterIdentifier}-lambda-role'
+        - Key: Recipe
+          Value: 'redshift-performance'
+
+  # ------------------------------------------------------------------------------
+  # SECRETS MANAGER FOR DATABASE CREDENTIALS
+  # ------------------------------------------------------------------------------
+  
+  DatabaseCredentials:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: !Sub '${ClusterIdentifier}-credentials'
+      Description: 'Database credentials for Redshift cluster'
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "${MasterUsername}"}'
+        GenerateStringKey: 'password'
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterIdentifier}-credentials'
+        - Key: Recipe
+          Value: 'redshift-performance'
+
+  # ------------------------------------------------------------------------------
+  # NETWORKING RESOURCES
+  # ------------------------------------------------------------------------------
+  
+  # Security Group for Redshift Cluster
+  RedshiftSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: !Sub '${ClusterIdentifier}-sg'
+      GroupDescription: 'Security group for Redshift cluster'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5439
+          ToPort: 5439
+          CidrIp: !Ref AllowedCidr
+          Description: 'Redshift access from allowed CIDR'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: '0.0.0.0/0'
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterIdentifier}-sg'
+        - Key: Recipe
+          Value: 'redshift-performance'
+
+  # Subnet Group for Redshift Cluster
+  RedshiftSubnetGroup:
+    Type: 'AWS::Redshift::SubnetGroup'
+    Properties:
+      SubnetGroupName: !Sub '${ClusterIdentifier}-subnet-group'
+      Description: 'Subnet group for Redshift cluster'
+      SubnetIds: !Ref SubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterIdentifier}-subnet-group'
+        - Key: Recipe
+          Value: 'redshift-performance'
+
+  # ------------------------------------------------------------------------------
+  # REDSHIFT CLUSTER CONFIGURATION
+  # ------------------------------------------------------------------------------
+  
+  # Custom Parameter Group for Optimized WLM
+  RedshiftParameterGroup:
+    Type: 'AWS::Redshift::ClusterParameterGroup'
+    Properties:
+      ParameterGroupName: !Sub '${ClusterIdentifier}-params'
+      Description: 'Optimized parameter group for Redshift performance'
+      ParameterGroupFamily: 'redshift-1.0'
+      Parameters:
+        - ParameterName: 'wlm_json_configuration'
+          ParameterValue: !Sub |
+            [{
+              "query_group": [],
+              "query_group_wild_card": 0,
+              "user_group": [],
+              "user_group_wild_card": 0,
+              "concurrency_scaling": "${EnableConcurrencyScaling}",
+              "auto_wlm": true
+            }]
+        - ParameterName: 'enable_user_activity_logging'
+          ParameterValue: !If [IsQueryMonitoringEnabled, 'true', 'false']
+        - ParameterName: 'max_concurrency_scaling_clusters'
+          ParameterValue: !If [IsConcurrencyScalingEnabled, '10', '0']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterIdentifier}-params'
+        - Key: Recipe
+          Value: 'redshift-performance'
+
+  # Main Redshift Cluster
+  RedshiftCluster:
+    Type: 'AWS::Redshift::Cluster'
+    DeletionPolicy: Snapshot
+    Properties:
+      ClusterIdentifier: !Ref ClusterIdentifier
+      ClusterType: !If [IsMultiNode, 'multi-node', 'single-node']
+      NodeType: !Ref NodeType
+      NumberOfNodes: !If [IsMultiNode, !Ref NumberOfNodes, !Ref 'AWS::NoValue']
+      DBName: !Ref DatabaseName
+      MasterUsername: !Ref MasterUsername
+      MasterUserPassword: !Ref MasterUserPassword
+      
+      # Networking Configuration
+      ClusterSubnetGroupName: !Ref RedshiftSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref RedshiftSecurityGroup
+      PubliclyAccessible: false
+      
+      # Parameter and Security Configuration
+      ClusterParameterGroupName: !Ref RedshiftParameterGroup
+      IamRoles:
+        - !GetAtt RedshiftServiceRole.Arn
+      
+      # Backup and Maintenance Configuration
+      AutomatedSnapshotRetentionPeriod: !Ref AutomatedSnapshotRetentionPeriod
+      PreferredMaintenanceWindow: !Ref MaintenanceWindow
+      
+      # Monitoring Configuration
+      LoggingProperties:
+        BucketName: !Ref LoggingBucket
+        S3KeyPrefix: 'redshift-logs/'
+      
+      # Encryption Configuration
+      Encrypted: true
+      KmsKeyId: !Ref RedshiftKMSKey
+      
+      Tags:
+        - Key: Name
+          Value: !Ref ClusterIdentifier
+        - Key: Recipe
+          Value: 'redshift-performance'
+        - Key: Environment
+          Value: 'production'
+
+  # ------------------------------------------------------------------------------
+  # KMS KEY FOR ENCRYPTION
+  # ------------------------------------------------------------------------------
+  
+  RedshiftKMSKey:
+    Type: 'AWS::KMS::Key'
+    Properties:
+      Description: 'KMS key for Redshift cluster encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow Redshift Service
+            Effect: Allow
+            Principal:
+              Service: redshift.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterIdentifier}-kms-key'
+        - Key: Recipe
+          Value: 'redshift-performance'
+
+  RedshiftKMSKeyAlias:
+    Type: 'AWS::KMS::Alias'
+    Properties:
+      AliasName: !Sub 'alias/${ClusterIdentifier}-key'
+      TargetKeyId: !Ref RedshiftKMSKey
+
+  # ------------------------------------------------------------------------------
+  # S3 BUCKET FOR LOGGING
+  # ------------------------------------------------------------------------------
+  
+  LoggingBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${ClusterIdentifier}-logs-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 60
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterIdentifier}-logs'
+        - Key: Recipe
+          Value: 'redshift-performance'
+
+  LoggingBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref LoggingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: RedshiftLogDelivery
+            Effect: Allow
+            Principal:
+              Service: redshift.amazonaws.com
+            Action:
+              - 's3:PutObject'
+              - 's3:GetBucketAcl'
+            Resource:
+              - !Sub '${LoggingBucket}/*'
+              - !Ref LoggingBucket
+
+  # ------------------------------------------------------------------------------
+  # SNS TOPIC FOR ALERTS
+  # ------------------------------------------------------------------------------
+  
+  PerformanceAlertsTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      TopicName: !Sub '${ClusterIdentifier}-performance-alerts'
+      DisplayName: 'Redshift Performance Alerts'
+      KmsMasterKeyId: 'alias/aws/sns'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterIdentifier}-performance-alerts'
+        - Key: Recipe
+          Value: 'redshift-performance'
+
+  EmailSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      Protocol: email
+      TopicArn: !Ref PerformanceAlertsTopic
+      Endpoint: !Ref NotificationEmail
+
+  # ------------------------------------------------------------------------------
+  # CLOUDWATCH ALARMS
+  # ------------------------------------------------------------------------------
+  
+  HighCPUAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${ClusterIdentifier}-High-CPU-Usage'
+      AlarmDescription: 'Alert when Redshift CPU usage is high'
+      MetricName: CPUUtilization
+      Namespace: AWS/Redshift
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref PerformanceAlertsTopic
+      Dimensions:
+        - Name: ClusterIdentifier
+          Value: !Ref ClusterIdentifier
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterIdentifier}-High-CPU-Usage'
+        - Key: Recipe
+          Value: 'redshift-performance'
+
+  HighQueueLengthAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${ClusterIdentifier}-High-Queue-Length'
+      AlarmDescription: 'Alert when query queue length is high'
+      MetricName: QueueLength
+      Namespace: AWS/Redshift
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref PerformanceAlertsTopic
+      Dimensions:
+        - Name: ClusterIdentifier
+          Value: !Ref ClusterIdentifier
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterIdentifier}-High-Queue-Length'
+        - Key: Recipe
+          Value: 'redshift-performance'
+
+  LowDiskSpaceAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${ClusterIdentifier}-Low-Disk-Space'
+      AlarmDescription: 'Alert when disk space utilization is high'
+      MetricName: PercentageDiskSpaceUsed
+      Namespace: AWS/Redshift
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref PerformanceAlertsTopic
+      Dimensions:
+        - Name: ClusterIdentifier
+          Value: !Ref ClusterIdentifier
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterIdentifier}-Low-Disk-Space'
+        - Key: Recipe
+          Value: 'redshift-performance'
+
+  # ------------------------------------------------------------------------------
+  # CLOUDWATCH DASHBOARD
+  # ------------------------------------------------------------------------------
+  
+  PerformanceDashboard:
+    Type: 'AWS::CloudWatch::Dashboard'
+    Properties:
+      DashboardName: !Sub '${ClusterIdentifier}-Performance-Dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Redshift", "CPUUtilization", "ClusterIdentifier", "${ClusterIdentifier}"],
+                  [".", "DatabaseConnections", ".", "."],
+                  [".", "HealthStatus", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Redshift Cluster Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 100
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Redshift", "QueueLength", "ClusterIdentifier", "${ClusterIdentifier}"],
+                  [".", "WLMQueueLength", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Query Queue Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Redshift", "PercentageDiskSpaceUsed", "ClusterIdentifier", "${ClusterIdentifier}"],
+                  [".", "ReadIOPS", ".", "."],
+                  [".", "WriteIOPS", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Storage and I/O Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Redshift", "NetworkReceiveThroughput", "ClusterIdentifier", "${ClusterIdentifier}"],
+                  [".", "NetworkTransmitThroughput", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Network Throughput",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+  # ------------------------------------------------------------------------------
+  # LAMBDA FUNCTION FOR MAINTENANCE
+  # ------------------------------------------------------------------------------
+  
+  MaintenanceLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ClusterIdentifier}-maintenance'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          CLUSTER_IDENTIFIER: !Ref ClusterIdentifier
+          SECRET_ARN: !Ref DatabaseCredentials
+          REGION: !Ref 'AWS::Region'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import psycopg2
+          import os
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              cluster_id = os.environ['CLUSTER_IDENTIFIER']
+              secret_arn = os.environ['SECRET_ARN']
+              region = os.environ['REGION']
+              
+              # Initialize AWS clients
+              redshift = boto3.client('redshift', region_name=region)
+              secrets = boto3.client('secretsmanager', region_name=region)
+              
+              try:
+                  # Get cluster endpoint
+                  cluster_info = redshift.describe_clusters(ClusterIdentifier=cluster_id)
+                  endpoint = cluster_info['Clusters'][0]['Endpoint']['Address']
+                  port = cluster_info['Clusters'][0]['Endpoint']['Port']
+                  
+                  # Get database credentials
+                  secret = secrets.get_secret_value(SecretId=secret_arn)
+                  credentials = json.loads(secret['SecretString'])
+                  
+                  # Connect to Redshift
+                  conn = psycopg2.connect(
+                      host=endpoint,
+                      port=port,
+                      database='performancedb',
+                      user=credentials['username'],
+                      password=credentials['password']
+                  )
+                  
+                  cur = conn.cursor()
+                  
+                  # Get tables that need VACUUM
+                  cur.execute("""
+                      SELECT TRIM(name) as table_name,
+                             unsorted/DECODE(rows,0,1,rows)::FLOAT * 100 as pct_unsorted
+                      FROM stv_tbl_perm
+                      WHERE unsorted > 0 AND rows > 1000
+                      ORDER BY pct_unsorted DESC
+                      LIMIT 5;
+                  """)
+                  
+                  tables_to_vacuum = cur.fetchall()
+                  maintenance_log = []
+                  
+                  for table_name, pct_unsorted in tables_to_vacuum:
+                      if pct_unsorted > 10:  # Only VACUUM if >10% unsorted
+                          print(f"Vacuuming table: {table_name} ({pct_unsorted:.2f}% unsorted)")
+                          cur.execute(f"VACUUM {table_name};")
+                          cur.execute(f"ANALYZE {table_name};")
+                          maintenance_log.append(f"Processed {table_name}")
+                  
+                  conn.commit()
+                  cur.close()
+                  conn.close()
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Maintenance completed on {len(maintenance_log)} tables',
+                          'tables_processed': maintenance_log
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterIdentifier}-maintenance'
+        - Key: Recipe
+          Value: 'redshift-performance'
+
+  # ------------------------------------------------------------------------------
+  # EVENTBRIDGE RULE FOR SCHEDULED MAINTENANCE
+  # ------------------------------------------------------------------------------
+  
+  MaintenanceScheduleRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: !Sub '${ClusterIdentifier}-nightly-maintenance'
+      Description: 'Run Redshift maintenance tasks nightly at 2 AM'
+      ScheduleExpression: 'cron(0 2 * * ? *)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt MaintenanceLambdaFunction.Arn
+          Id: 'MaintenanceLambdaTarget'
+
+  LambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref MaintenanceLambdaFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MaintenanceScheduleRule.Arn
+
+  # ------------------------------------------------------------------------------
+  # CLOUDWATCH LOG GROUP
+  # ------------------------------------------------------------------------------
+  
+  PerformanceLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/redshift/${ClusterIdentifier}/performance-metrics'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterIdentifier}-performance-logs'
+        - Key: Recipe
+          Value: 'redshift-performance'
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+Outputs:
+  ClusterIdentifier:
+    Description: 'Redshift cluster identifier'
+    Value: !Ref ClusterIdentifier
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterIdentifier'
+
+  ClusterEndpoint:
+    Description: 'Redshift cluster endpoint'
+    Value: !GetAtt RedshiftCluster.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterEndpoint'
+
+  ClusterPort:
+    Description: 'Redshift cluster port'
+    Value: !GetAtt RedshiftCluster.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterPort'
+
+  DatabaseName:
+    Description: 'Database name'
+    Value: !Ref DatabaseName
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseName'
+
+  MasterUsername:
+    Description: 'Master username'
+    Value: !Ref MasterUsername
+    Export:
+      Name: !Sub '${AWS::StackName}-MasterUsername'
+
+  SecurityGroupId:
+    Description: 'Security group ID for the Redshift cluster'
+    Value: !Ref RedshiftSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroupId'
+
+  SubnetGroupName:
+    Description: 'Subnet group name for the Redshift cluster'
+    Value: !Ref RedshiftSubnetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SubnetGroupName'
+
+  ParameterGroupName:
+    Description: 'Parameter group name for the Redshift cluster'
+    Value: !Ref RedshiftParameterGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ParameterGroupName'
+
+  ServiceRoleArn:
+    Description: 'IAM role ARN for the Redshift cluster'
+    Value: !GetAtt RedshiftServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceRoleArn'
+
+  KmsKeyId:
+    Description: 'KMS key ID for encryption'
+    Value: !Ref RedshiftKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-KmsKeyId'
+
+  LoggingBucketName:
+    Description: 'S3 bucket name for audit logging'
+    Value: !Ref LoggingBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-LoggingBucket'
+
+  SNSTopicArn:
+    Description: 'SNS topic ARN for performance alerts'
+    Value: !Ref PerformanceAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  DashboardName:
+    Description: 'CloudWatch dashboard name'
+    Value: !Ref PerformanceDashboard
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardName'
+
+  MaintenanceFunctionArn:
+    Description: 'Lambda function ARN for automated maintenance'
+    Value: !GetAtt MaintenanceLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-MaintenanceFunctionArn'
+
+  DatabaseCredentialsSecret:
+    Description: 'Secrets Manager ARN for database credentials'
+    Value: !Ref DatabaseCredentials
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseCredentials'
+
+  DashboardURL:
+    Description: 'CloudWatch dashboard URL'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ClusterIdentifier}-Performance-Dashboard'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  ConnectionString:
+    Description: 'JDBC connection string for the Redshift cluster'
+    Value: !Sub 'jdbc:redshift://${RedshiftCluster.Endpoint.Address}:${RedshiftCluster.Endpoint.Port}/${DatabaseName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ConnectionString'

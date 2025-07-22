@@ -1,0 +1,391 @@
+# Low-severity security findings workflow
+# Handles low-severity and informational security findings with aggregation and trend monitoring
+main:
+  params: [input]
+  steps:
+    - init:
+        assign:
+          - finding: $${input.finding}
+          - metadata: $${input.metadata}
+          - severity: $${metadata.severity}
+          - project_id: "${project_id}"
+          - finding_id: $${finding.name}
+          - resource_name: $${finding.resourceName}
+          - category: $${finding.category}
+    
+    - log_finding:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: projects/$${project_id}/logs/security-compliance
+                severity: INFO
+                jsonPayload:
+                  workflow: "low_severity_workflow"
+                  finding_id: $${finding_id}
+                  severity: $${severity}
+                  category: $${category}
+                  resource: $${resource_name}
+                  action: "workflow_triggered"
+                  timestamp: $${metadata.timestamp}
+    
+    - assess_finding:
+        assign:
+          - requires_aggregation: true
+          - requires_periodic_review: true
+          - requires_immediate_action: false
+          - aggregation_category: $${category + "_" + severity}
+          - review_cycle: "weekly"
+    
+    - classify_finding_type:
+        switch:
+          - condition: $${category == "INFORMATIONAL"}
+            assign:
+              - finding_type: "informational"
+              - retention_days: 30
+              - review_priority: "low"
+          - condition: $${category == "POLICY_VIOLATION"}
+            assign:
+              - finding_type: "policy_compliance"
+              - retention_days: 90
+              - review_priority: "medium-low"
+          - condition: $${category == "CONFIGURATION"}
+            assign:
+              - finding_type: "configuration_drift"
+              - retention_days: 60
+              - review_priority: "low"
+          - condition: true
+            assign:
+              - finding_type: "general_security"
+              - retention_days: 45
+              - review_priority: "low"
+    
+    - aggregate_for_reporting:
+        call: aggregate_finding
+        args:
+          finding: $${finding}
+          category: $${aggregation_category}
+          finding_type: $${finding_type}
+          retention_days: $${retention_days}
+        result: aggregation_result
+    
+    - check_threshold:
+        call: check_aggregation_threshold
+        args:
+          category: $${aggregation_category}
+          finding_type: $${finding_type}
+          threshold_config:
+            daily_threshold: 50
+            weekly_threshold: 200
+            monthly_threshold: 500
+        result: threshold_check
+    
+    - conditional_notification:
+        switch:
+          - condition: $${threshold_check.threshold_exceeded}
+            steps:
+              - notify_trend:
+                  call: send_trend_notification
+                  args:
+                    category: $${aggregation_category}
+                    finding_type: $${finding_type}
+                    count: $${threshold_check.current_count}
+                    threshold_type: $${threshold_check.threshold_type}
+                    time_period: $${threshold_check.time_period}
+                  result: trend_notification_result
+    
+    - update_security_metrics:
+        call: update_compliance_metrics
+        args:
+          finding: $${finding}
+          category: $${category}
+          severity: $${severity}
+          finding_type: $${finding_type}
+    
+    - schedule_periodic_review:
+        switch:
+          - condition: $${requires_periodic_review}
+            steps:
+              - add_to_review_queue:
+                  call: schedule_review
+                  args:
+                    finding: $${finding}
+                    review_cycle: $${review_cycle}
+                    priority: $${review_priority}
+                    finding_type: $${finding_type}
+    
+    - final_logging:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: projects/$${project_id}/logs/security-compliance
+                severity: INFO
+                jsonPayload:
+                  workflow: "low_severity_workflow"
+                  finding_id: $${finding_id}
+                  action: "workflow_completed"
+                  processing_summary:
+                    aggregated: $${requires_aggregation}
+                    review_scheduled: $${requires_periodic_review}
+                    threshold_exceeded: $${threshold_check.threshold_exceeded}
+                    finding_type: $${finding_type}
+                    retention_days: $${retention_days}
+                  aggregation_result: $${aggregation_result}
+                  timestamp: $${metadata.timestamp}
+
+# Subworkflow for aggregating findings
+aggregate_finding:
+  params: [finding, category, finding_type, retention_days]
+  steps:
+    - create_aggregation_entry:
+        assign:
+          - aggregation_id: $${category + "_" + string(int(sys.now()))}
+          - aggregation_timestamp: $${int(sys.now())}
+          - time_bucket: $${string(int(sys.now() / 3600) * 3600)}  # Hour bucket
+    
+    - log_aggregation:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: projects/${project_id}/logs/security-aggregation
+                severity: INFO
+                jsonPayload:
+                  aggregation_type: $${category}
+                  aggregation_id: $${aggregation_id}
+                  finding_id: $${finding.name}
+                  finding_type: $${finding_type}
+                  resource: $${finding.resourceName}
+                  time_bucket: $${time_bucket}
+                  retention_days: $${retention_days}
+                  timestamp: $${aggregation_timestamp}
+    
+    - update_trend_data:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: projects/${project_id}/logs/security-trends
+                severity: INFO
+                jsonPayload:
+                  trend_type: "finding_aggregation"
+                  category: $${category}
+                  finding_type: $${finding_type}
+                  time_bucket: $${time_bucket}
+                  increment: 1
+                  resource_affected: $${finding.resourceName}
+    
+    - return_aggregation_result:
+        return:
+          aggregation_id: $${aggregation_id}
+          category: $${category}
+          finding_type: $${finding_type}
+          time_bucket: $${time_bucket}
+          status: "aggregated"
+
+# Subworkflow for checking aggregation thresholds
+check_aggregation_threshold:
+  params: [category, finding_type, threshold_config]
+  steps:
+    - initialize_check:
+        assign:
+          - current_time: $${int(sys.now())}
+          - daily_start: $${int(current_time / 86400) * 86400}
+          - weekly_start: $${daily_start - ((int(current_time / 86400) % 7) * 86400)}
+          - monthly_start: $${daily_start - ((int(current_time / 86400) % 30) * 86400)}
+          - threshold_exceeded: false
+          - threshold_type: ""
+          - current_count: 0
+          - time_period: ""
+    
+    # Simulate threshold checking (in real implementation, this would query actual data)
+    - simulate_daily_check:
+        assign:
+          - daily_count: 25  # Simulated count
+          - daily_exceeded: $${daily_count > threshold_config.daily_threshold}
+    
+    - simulate_weekly_check:
+        assign:
+          - weekly_count: 150  # Simulated count
+          - weekly_exceeded: $${weekly_count > threshold_config.weekly_threshold}
+    
+    - simulate_monthly_check:
+        assign:
+          - monthly_count: 400  # Simulated count
+          - monthly_exceeded: $${monthly_count > threshold_config.monthly_threshold}
+    
+    - determine_threshold_status:
+        switch:
+          - condition: $${daily_exceeded}
+            assign:
+              - threshold_exceeded: true
+              - threshold_type: "daily"
+              - current_count: $${daily_count}
+              - time_period: "24_hours"
+          - condition: $${weekly_exceeded}
+            assign:
+              - threshold_exceeded: true
+              - threshold_type: "weekly"
+              - current_count: $${weekly_count}
+              - time_period: "7_days"
+          - condition: $${monthly_exceeded}
+            assign:
+              - threshold_exceeded: true
+              - threshold_type: "monthly"
+              - current_count: $${monthly_count}
+              - time_period: "30_days"
+    
+    - log_threshold_check:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: projects/${project_id}/logs/security-thresholds
+                severity: $${threshold_exceeded ? "WARNING" : "INFO"}
+                jsonPayload:
+                  check_type: "threshold_analysis"
+                  category: $${category}
+                  finding_type: $${finding_type}
+                  threshold_exceeded: $${threshold_exceeded}
+                  threshold_type: $${threshold_type}
+                  current_count: $${current_count}
+                  time_period: $${time_period}
+                  daily_count: $${daily_count}
+                  weekly_count: $${weekly_count}
+                  monthly_count: $${monthly_count}
+    
+    - return_threshold_result:
+        return:
+          threshold_exceeded: $${threshold_exceeded}
+          threshold_type: $${threshold_type}
+          current_count: $${current_count}
+          time_period: $${time_period}
+          daily_count: $${daily_count}
+          weekly_count: $${weekly_count}
+          monthly_count: $${monthly_count}
+
+# Subworkflow for sending trend notifications
+send_trend_notification:
+  params: [category, finding_type, count, threshold_type, time_period]
+  steps:
+    - prepare_trend_message:
+        assign:
+          - alert_level: $${threshold_type == "daily" ? "medium" : "low"}
+          - message_title: "Security Finding Trend Alert: " + $${category}
+          - message_body: "Threshold exceeded for " + $${finding_type} + " findings: " + string($${count}) + " in " + $${time_period}
+    
+    - send_alert:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: projects/${project_id}/logs/security-trends
+                severity: WARNING
+                jsonPayload:
+                  alert_type: "trend_notification"
+                  alert_level: $${alert_level}
+                  category: $${category}
+                  finding_type: $${finding_type}
+                  count: $${count}
+                  threshold_type: $${threshold_type}
+                  time_period: $${time_period}
+                  title: $${message_title}
+                  message: $${message_body}
+                  requires_review: true
+    
+    - return_notification_result:
+        return:
+          notification_type: "trend_alert"
+          alert_level: $${alert_level}
+          message: $${message_body}
+          threshold_type: $${threshold_type}
+
+# Subworkflow for updating compliance metrics
+update_compliance_metrics:
+  params: [finding, category, severity, finding_type]
+  steps:
+    - calculate_metrics:
+        assign:
+          - metric_timestamp: $${int(sys.now())}
+          - resource_type: $${finding.resourceName}
+          - compliance_score_impact: $${severity == "LOW" ? 1 : 2}
+    
+    - update_metric_logs:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: projects/${project_id}/logs/security-metrics
+                severity: INFO
+                jsonPayload:
+                  metric_type: "compliance_update"
+                  finding_id: $${finding.name}
+                  category: $${category}
+                  severity: $${severity}
+                  finding_type: $${finding_type}
+                  resource_type: $${resource_type}
+                  compliance_score_impact: $${compliance_score_impact}
+                  timestamp: $${metric_timestamp}
+
+# Subworkflow for scheduling periodic reviews
+schedule_review:
+  params: [finding, review_cycle, priority, finding_type]
+  steps:
+    - calculate_review_time:
+        assign:
+          - current_time: $${int(sys.now())}
+          - review_interval: $${review_cycle == "weekly" ? 604800 : 2592000}  # 7 days or 30 days
+          - review_time: $${current_time + review_interval}
+          - review_id: $${finding.name + "_review"}
+    
+    - schedule_review_task:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: projects/${project_id}/logs/security-reviews
+                severity: INFO
+                jsonPayload:
+                  review_type: "periodic_review"
+                  review_id: $${review_id}
+                  finding_id: $${finding.name}
+                  finding_type: $${finding_type}
+                  review_cycle: $${review_cycle}
+                  priority: $${priority}
+                  scheduled_time: $${review_time}
+                  status: "scheduled"
+                  category: $${finding.category}
+                  resource: $${finding.resourceName}
+    
+    - return_review_result:
+        return:
+          review_id: $${review_id}
+          review_cycle: $${review_cycle}
+          scheduled_time: $${review_time}
+          priority: $${priority}
+          status: "scheduled"

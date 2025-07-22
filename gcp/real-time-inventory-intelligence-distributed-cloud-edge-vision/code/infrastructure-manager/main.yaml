@@ -1,0 +1,622 @@
+# Real-Time Inventory Intelligence Infrastructure Manager Configuration
+# This configuration deploys a complete inventory intelligence solution using
+# Google Distributed Cloud Edge, Cloud Vision API, Cloud SQL, and Cloud Monitoring
+#
+# Architecture:
+# - Edge processing with Google Distributed Cloud Edge for low-latency analysis
+# - Cloud Vision API for accurate product detection and counting
+# - Cloud SQL for inventory data storage and management
+# - Cloud Storage for image processing and caching
+# - Cloud Monitoring for observability and alerting
+#
+# Prerequisites:
+# - Google Distributed Cloud Edge hardware deployed at retail locations
+# - Appropriate IAM permissions for resource creation
+# - Project billing enabled
+
+# Project configuration for the inventory intelligence solution
+# This section defines the project settings and enables required APIs
+project:
+  - name: inventory-intelligence-project
+    project_id: ${PROJECT_ID}
+    billing_account: ${BILLING_ACCOUNT_ID}
+    labels:
+      environment: production
+      solution: inventory-intelligence
+      cost-center: retail-operations
+    
+    # Enable required Google Cloud APIs for the solution
+    apis:
+      - vision.googleapis.com          # Cloud Vision API for product detection
+      - sqladmin.googleapis.com        # Cloud SQL Admin API for database management
+      - storage.googleapis.com         # Cloud Storage API for image processing
+      - monitoring.googleapis.com      # Cloud Monitoring for observability
+      - container.googleapis.com       # Google Kubernetes Engine for edge workloads
+      - cloudbuild.googleapis.com      # Cloud Build for container image management
+      - serviceusage.googleapis.com    # Service Usage API for API management
+      - compute.googleapis.com         # Compute Engine for supporting infrastructure
+      - iam.googleapis.com            # Identity and Access Management
+
+# IAM service accounts for secure workload authentication
+# These service accounts follow the principle of least privilege
+iam:
+  service_accounts:
+    # Main service account for edge processing workloads
+    - name: inventory-edge-processor
+      account_id: inventory-edge-processor
+      display_name: "Inventory Edge Processor Service Account"
+      description: "Service account for edge inventory processing with minimal required permissions"
+      
+      # IAM roles for edge processing operations
+      roles:
+        - roles/ml.developer                    # Access to ML Vision API services
+        - roles/cloudsql.client                # Connect to Cloud SQL databases
+        - roles/storage.objectAdmin            # Read/write access to storage buckets
+        - roles/monitoring.metricWriter        # Write custom metrics to Cloud Monitoring
+        - roles/logging.logWriter              # Write application logs
+    
+    # Service account for Cloud SQL proxy connections
+    - name: cloudsql-proxy
+      account_id: cloudsql-proxy
+      display_name: "Cloud SQL Proxy Service Account"
+      description: "Service account for secure Cloud SQL proxy connections"
+      roles:
+        - roles/cloudsql.client                # Connect to Cloud SQL instances
+
+# Cloud Storage configuration for image processing and caching
+# Provides scalable storage for camera images and processing results
+storage:
+  buckets:
+    # Primary bucket for inventory images and processing results
+    - name: ${BUCKET_NAME}
+      location: ${REGION}
+      storage_class: STANDARD
+      
+      # Lifecycle management for cost optimization
+      lifecycle_rules:
+        - action:
+            type: Delete
+          condition:
+            age: 30  # Delete images after 30 days to manage costs
+            
+        - action:
+            type: SetStorageClass
+            storage_class: NEARLINE
+          condition:
+            age: 7   # Move to nearline storage after 7 days
+      
+      # IAM bindings for service account access
+      iam_bindings:
+        - role: roles/storage.objectViewer
+          members:
+            - serviceAccount:vision@system.gserviceaccount.com
+        - role: roles/storage.objectAdmin
+          members:
+            - serviceAccount:inventory-edge-processor@${PROJECT_ID}.iam.gserviceaccount.com
+      
+      # Uniform bucket-level access for simplified permissions
+      uniform_bucket_level_access: true
+      
+      # Labels for resource management and cost tracking
+      labels:
+        purpose: inventory-images
+        retention: thirty-days
+        cost-center: retail-operations
+
+# Cloud SQL configuration for inventory data management
+# Provides managed PostgreSQL database with high availability and automated backups
+sql:
+  instances:
+    # Primary Cloud SQL instance for inventory data
+    - name: ${DB_INSTANCE_NAME}
+      database_version: POSTGRES_14
+      region: ${REGION}
+      
+      # Instance configuration for production workloads
+      settings:
+        tier: db-f1-micro  # Can be upgraded to db-custom-* for production
+        disk_size: 20      # GB - can be increased as needed
+        disk_type: PD_SSD  # SSD for better performance
+        disk_autoresize: true
+        disk_autoresize_limit: 100  # Maximum auto-resize limit in GB
+        
+        # High availability configuration
+        availability_type: ZONAL  # Can be upgraded to REGIONAL for HA
+        
+        # Backup configuration for data protection
+        backup_configuration:
+          enabled: true
+          start_time: "03:00"  # Daily backup at 3 AM
+          location: ${REGION}
+          point_in_time_recovery_enabled: true
+          retained_backups: 7    # Keep 7 days of backups
+          
+        # Maintenance window configuration
+        maintenance_window:
+          day: 7        # Sunday
+          hour: 4       # 4 AM
+          update_track: stable
+        
+        # Database flags for optimization
+        database_flags:
+          - name: shared_preload_libraries
+            value: pg_stat_statements  # Enable query statistics
+          - name: log_statement
+            value: all                 # Log all statements for debugging
+            
+        # IP configuration for secure access
+        ip_configuration:
+          ipv4_enabled: true
+          require_ssl: true
+          
+          # Authorized networks (to be configured per deployment)
+          authorized_networks:
+            - name: "edge-processing-network"
+              value: "0.0.0.0/0"  # Update with actual edge network CIDR
+              
+        # User label configuration
+        user_labels:
+          environment: production
+          purpose: inventory-data
+          backup-policy: daily
+          
+      # Database creation within the instance
+      databases:
+        - name: inventory_intelligence
+          charset: UTF8
+          collation: en_US.UTF8
+          
+      # Database users configuration
+      users:
+        - name: inventory_app
+          password: ${DB_PASSWORD}  # Use strong password from Secret Manager
+          type: BUILT_IN
+          
+        # Service account user for application connections
+        - name: inventory-edge-processor@${PROJECT_ID}.iam
+          type: CLOUD_IAM_SERVICE_ACCOUNT
+
+# Cloud Vision API configuration for product recognition
+# Enables intelligent product detection and counting in retail environments
+vision:
+  # Product Search configuration for retail inventory
+  product_search:
+    - location: ${REGION}
+      
+      # Product sets for organizing inventory items
+      product_sets:
+        - product_set_id: retail_inventory_set
+          display_name: "Retail Inventory Products"
+          
+      # Sample product configuration (to be expanded with actual inventory)
+      products:
+        - product_id: sample_product_001
+          display_name: "Sample Product"
+          product_category: packagedgoods
+          product_labels:
+            - key: "category"
+              value: "beverages"
+            - key: "brand"
+              value: "sample-brand"
+            - key: "size"
+              value: "standard"
+
+# Cloud Monitoring configuration for observability and alerting
+# Provides comprehensive monitoring of both infrastructure and business metrics
+monitoring:
+  # Custom dashboards for inventory intelligence
+  dashboards:
+    - display_name: "Inventory Intelligence Dashboard"
+      
+      # Dashboard layout with key metrics
+      mosaic_layout:
+        tiles:
+          # Inventory levels monitoring
+          - width: 6
+            height: 4
+            widget:
+              title: "Inventory Levels by Location"
+              scorecard:
+                time_series_query:
+                  time_series_filter:
+                    filter: 'resource.type="global" metric.type="custom.googleapis.com/inventory/level"'
+                    aggregation:
+                      alignment_period: 60s
+                      per_series_aligner: ALIGN_MEAN
+                      cross_series_reducer: REDUCE_MEAN
+                      group_by_fields:
+                        - metric.label.location
+                        - metric.label.product_id
+                        
+          # Processing latency monitoring
+          - width: 6
+            height: 4
+            widget:
+              title: "Vision API Processing Latency"
+              xy_chart:
+                data_sets:
+                  - time_series_query:
+                      time_series_filter:
+                        filter: 'resource.type="consumed_api" resource.label.service="vision.googleapis.com"'
+                        aggregation:
+                          alignment_period: 300s
+                          per_series_aligner: ALIGN_MEAN
+                plot_type: LINE
+                
+          # Error rate monitoring
+          - width: 12
+            height: 4
+            widget:
+              title: "System Error Rates"
+              xy_chart:
+                data_sets:
+                  - time_series_query:
+                      time_series_filter:
+                        filter: 'resource.type="k8s_container" severity="ERROR"'
+                        aggregation:
+                          alignment_period: 300s
+                          per_series_aligner: ALIGN_RATE
+                plot_type: STACKED_BAR
+  
+  # Alert policies for proactive inventory management
+  alert_policies:
+    # Low inventory threshold alert
+    - display_name: "Low Inventory Alert"
+      documentation:
+        content: "Alert when inventory levels fall below defined thresholds"
+        mime_type: "text/markdown"
+        
+      conditions:
+        - display_name: "Inventory Count Low"
+          condition_threshold:
+            filter: 'resource.type="global" metric.type="custom.googleapis.com/inventory/level"'
+            comparison: COMPARISON_LESS_THAN
+            threshold_value: 10
+            duration: 300s  # 5 minutes
+            aggregations:
+              - alignment_period: 60s
+                per_series_aligner: ALIGN_MEAN
+                cross_series_reducer: REDUCE_MEAN
+                group_by_fields:
+                  - metric.label.product_id
+                  - metric.label.location
+                  
+      # Notification channels (to be configured with actual endpoints)
+      notification_channels: []
+      
+      # Alert policy configuration
+      alert_strategy:
+        auto_close: 604800s  # Auto-close after 7 days
+        
+      combiner: OR
+      enabled: true
+      
+    # High error rate alert for system health
+    - display_name: "High Error Rate Alert"
+      documentation:
+        content: "Alert when system error rates exceed acceptable thresholds"
+        
+      conditions:
+        - display_name: "Error Rate High"
+          condition_threshold:
+            filter: 'resource.type="k8s_container" severity="ERROR"'
+            comparison: COMPARISON_GREATER_THAN
+            threshold_value: 0.05  # 5% error rate
+            duration: 180s  # 3 minutes
+            aggregations:
+              - alignment_period: 60s
+                per_series_aligner: ALIGN_RATE
+                
+      combiner: OR
+      enabled: true
+      
+  # Notification channels for alerting
+  notification_channels:
+    # Email notification channel for inventory alerts
+    - type: email
+      display_name: "Inventory Operations Team"
+      description: "Email notifications for inventory-related alerts"
+      labels:
+        email_address: "inventory-alerts@company.com"  # Update with actual email
+        
+    # SMS notification channel for critical alerts
+    - type: sms
+      display_name: "On-Call Manager"
+      description: "SMS notifications for critical system alerts"
+      labels:
+        number: "+1-555-0123"  # Update with actual phone number
+
+# Kubernetes configuration for edge processing workloads
+# Deploys containerized applications on Google Distributed Cloud Edge
+kubernetes:
+  # Edge processing deployment configuration
+  deployments:
+    - name: inventory-processor
+      namespace: default
+      
+      # Deployment specification
+      spec:
+        replicas: 2
+        selector:
+          match_labels:
+            app: inventory-processor
+            
+        template:
+          metadata:
+            labels:
+              app: inventory-processor
+              version: v1.0
+              
+          spec:
+            # Service account for secure cloud access
+            service_account_name: inventory-edge-processor
+            
+            # Container configuration
+            containers:
+              # Main processing container
+              - name: processor
+                image: gcr.io/${PROJECT_ID}/inventory-processor:latest
+                
+                # Environment variables for cloud integration
+                env:
+                  - name: PROJECT_ID
+                    value: ${PROJECT_ID}
+                  - name: BUCKET_NAME
+                    value: ${BUCKET_NAME}
+                  - name: DB_INSTANCE_CONNECTION
+                    value: ${PROJECT_ID}:${REGION}:${DB_INSTANCE_NAME}
+                  - name: VISION_API_ENDPOINT
+                    value: vision.googleapis.com
+                    
+                # Resource limits for efficient operation
+                resources:
+                  requests:
+                    memory: "256Mi"
+                    cpu: "250m"
+                  limits:
+                    memory: "512Mi"
+                    cpu: "500m"
+                    
+                # Container ports
+                ports:
+                  - container_port: 8080
+                    name: http
+                    
+                # Health checks for reliability
+                liveness_probe:
+                  http_get:
+                    path: /health
+                    port: 8080
+                  initial_delay_seconds: 30
+                  period_seconds: 10
+                  
+                readiness_probe:
+                  http_get:
+                    path: /ready
+                    port: 8080
+                  initial_delay_seconds: 5
+                  period_seconds: 5
+                  
+              # Cloud SQL proxy sidecar for secure database access
+              - name: cloud-sql-proxy
+                image: gcr.io/cloudsql-docker/gce-proxy:1.33.2
+                command:
+                  - "/cloud_sql_proxy"
+                  - "-instances=${PROJECT_ID}:${REGION}:${DB_INSTANCE_NAME}=tcp:5432"
+                  - "-credential_file=/secrets/cloudsql/credentials.json"
+                  
+                # Security context for proxy operation
+                security_context:
+                  run_as_non_root: true
+                  run_as_user: 65532
+                  
+                # Volume mounts for service account credentials
+                volume_mounts:
+                  - name: cloudsql-credentials
+                    mount_path: /secrets/cloudsql
+                    read_only: true
+                    
+            # Volumes for service account authentication
+            volumes:
+              - name: cloudsql-credentials
+                secret:
+                  secret_name: cloudsql-credentials
+                  
+            # Pod security and scheduling configuration
+            security_context:
+              fs_group: 65532
+              
+            # Node selection for edge deployment
+            node_selector:
+              cloud.google.com/gke-nodepool: edge-processing
+              
+  # Service configuration for load balancing
+  services:
+    - name: inventory-processor-service
+      namespace: default
+      
+      spec:
+        type: ClusterIP
+        selector:
+          app: inventory-processor
+        ports:
+          - port: 8080
+            target_port: 8080
+            protocol: TCP
+            name: http
+            
+  # Horizontal Pod Autoscaler for dynamic scaling
+  hpa:
+    - name: inventory-processor-hpa
+      namespace: default
+      
+      spec:
+        scale_target_ref:
+          api_version: apps/v1
+          kind: Deployment
+          name: inventory-processor
+          
+        min_replicas: 2
+        max_replicas: 10
+        
+        # CPU-based scaling
+        target_cpu_utilization_percentage: 70
+        
+        # Custom metrics scaling (inventory processing rate)
+        metrics:
+          - type: Pods
+            pods:
+              metric:
+                name: inventory_processing_rate
+              target:
+                type: AverageValue
+                average_value: 100  # Process 100 items per second per pod
+
+# Secret Manager configuration for secure credential storage
+# Stores sensitive configuration data with proper access controls
+secret_manager:
+  secrets:
+    # Database password storage
+    - secret_id: db-password
+      replication:
+        automatic: {}
+      labels:
+        purpose: database-auth
+        environment: production
+        
+    # Cloud SQL proxy service account key
+    - secret_id: cloudsql-credentials
+      replication:
+        automatic: {}
+      labels:
+        purpose: database-proxy
+        environment: production
+        
+    # API keys and other sensitive configuration
+    - secret_id: vision-api-config
+      replication:
+        automatic: {}
+      labels:
+        purpose: api-configuration
+        environment: production
+
+# Network configuration for secure connectivity
+# Defines VPC and firewall rules for edge-to-cloud communication
+networking:
+  # VPC configuration for the solution
+  vpc:
+    - name: inventory-intelligence-vpc
+      auto_create_subnetworks: false
+      routing_mode: REGIONAL
+      
+      # Subnets for different components
+      subnets:
+        # Subnet for edge processing nodes
+        - name: edge-processing-subnet
+          ip_cidr_range: "10.1.0.0/24"
+          region: ${REGION}
+          
+          # Secondary ranges for GKE pods and services
+          secondary_ip_ranges:
+            - range_name: pod-range
+              ip_cidr_range: "10.2.0.0/16"
+            - range_name: service-range
+              ip_cidr_range: "10.3.0.0/16"
+              
+        # Subnet for Cloud SQL private IP
+        - name: database-subnet
+          ip_cidr_range: "10.4.0.0/24"
+          region: ${REGION}
+          
+  # Firewall rules for secure communication
+  firewall_rules:
+    # Allow internal communication between components
+    - name: allow-internal-inventory
+      direction: INGRESS
+      priority: 1000
+      source_ranges:
+        - "10.1.0.0/16"
+        - "10.2.0.0/16"
+        - "10.3.0.0/16"
+        - "10.4.0.0/16"
+      allowed:
+        - protocol: tcp
+          ports:
+            - "80"
+            - "443"
+            - "5432"   # PostgreSQL
+            - "8080"   # Application port
+            
+    # Allow HTTPS traffic from external sources
+    - name: allow-https-inventory
+      direction: INGRESS
+      priority: 1000
+      source_ranges:
+        - "0.0.0.0/0"
+      target_tags:
+        - inventory-https-server
+      allowed:
+        - protocol: tcp
+          ports:
+            - "443"
+
+# Variables for customization across environments
+# These variables should be provided during deployment
+variables:
+  PROJECT_ID:
+    description: "Google Cloud Project ID for the inventory intelligence solution"
+    type: string
+    
+  REGION:
+    description: "Google Cloud region for resource deployment"
+    type: string
+    default: "us-central1"
+    
+  ZONE:
+    description: "Google Cloud zone for zonal resources"
+    type: string
+    default: "us-central1-a"
+    
+  DB_INSTANCE_NAME:
+    description: "Name for the Cloud SQL instance"
+    type: string
+    
+  BUCKET_NAME:
+    description: "Name for the Cloud Storage bucket"
+    type: string
+    
+  DB_PASSWORD:
+    description: "Password for the database user"
+    type: string
+    sensitive: true
+    
+  BILLING_ACCOUNT_ID:
+    description: "Billing account ID for the project"
+    type: string
+
+# Outputs for integration and verification
+# Provides important resource information after deployment
+outputs:
+  project_id:
+    description: "The Google Cloud Project ID"
+    value: ${PROJECT_ID}
+    
+  bucket_url:
+    description: "URL of the Cloud Storage bucket for images"
+    value: "gs://${BUCKET_NAME}"
+    
+  database_connection:
+    description: "Cloud SQL instance connection name"
+    value: "${PROJECT_ID}:${REGION}:${DB_INSTANCE_NAME}"
+    
+  dashboard_url:
+    description: "URL for the Cloud Monitoring dashboard"
+    value: "https://console.cloud.google.com/monitoring/dashboards"
+    
+  vision_api_location:
+    description: "Location for Vision API Product Search"
+    value: ${REGION}
+    
+  service_account_email:
+    description: "Email of the edge processing service account"
+    value: "inventory-edge-processor@${PROJECT_ID}.iam.gserviceaccount.com"

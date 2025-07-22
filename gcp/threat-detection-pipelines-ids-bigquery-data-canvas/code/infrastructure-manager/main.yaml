@@ -1,0 +1,942 @@
+# Infrastructure Manager Configuration for Threat Detection Pipelines
+# Recipe: Threat Detection Pipelines with Cloud IDS and BigQuery Data Canvas
+# Version: 1.0
+# Generator Version: 1.3
+
+# This configuration deploys a comprehensive threat detection pipeline using:
+# - Cloud IDS for network intrusion detection
+# - BigQuery Data Canvas for AI-powered threat analytics
+# - Cloud Functions for automated processing
+# - Pub/Sub for event-driven architecture
+
+terraform:
+  # Use latest stable Google Cloud provider
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 5.0"
+
+# Input variables for customization
+variables:
+  project_id:
+    description: "Google Cloud Project ID for threat detection infrastructure"
+    type: string
+    validation:
+      condition: length(var.project_id) > 0
+      error_message: "Project ID must not be empty."
+
+  region:
+    description: "Primary region for threat detection resources"
+    type: string
+    default: "us-central1"
+    validation:
+      condition: contains(["us-central1", "us-east1", "us-west1", "europe-west1", "asia-southeast1"], var.region)
+      error_message: "Region must be a supported Cloud IDS region."
+
+  zone:
+    description: "Primary zone for compute resources"
+    type: string
+    default: "us-central1-a"
+
+  environment:
+    description: "Environment name (dev, staging, prod)"
+    type: string
+    default: "dev"
+    validation:
+      condition: contains(["dev", "staging", "prod"], var.environment)
+      error_message: "Environment must be dev, staging, or prod."
+
+  network_cidr:
+    description: "CIDR block for the threat detection VPC"
+    type: string
+    default: "10.0.0.0/16"
+
+  subnet_cidr:
+    description: "CIDR block for the subnet"
+    type: string
+    default: "10.0.1.0/24"
+
+  ids_severity:
+    description: "Minimum severity level for Cloud IDS alerts"
+    type: string
+    default: "INFORMATIONAL"
+    validation:
+      condition: contains(["INFORMATIONAL", "LOW", "MEDIUM", "HIGH", "CRITICAL"], var.ids_severity)
+      error_message: "IDS severity must be INFORMATIONAL, LOW, MEDIUM, HIGH, or CRITICAL."
+
+  enable_sample_data:
+    description: "Whether to create sample threat detection data"
+    type: bool
+    default: true
+
+# Local values for resource naming and configuration
+locals:
+  # Generate unique suffix for resources
+  random_suffix = substr(md5("${var.project_id}-${var.environment}"), 0, 6)
+  
+  # Common resource names
+  vpc_name = "threat-detection-vpc-${local.random_suffix}"
+  subnet_name = "threat-detection-subnet-${local.random_suffix}"
+  ids_endpoint_name = "threat-detection-endpoint-${local.random_suffix}"
+  
+  # Common labels for resource management
+  common_labels = {
+    environment = var.environment
+    project = "threat-detection"
+    managed-by = "infrastructure-manager"
+    recipe = "threat-detection-pipelines-ids-bigquery-data-canvas"
+  }
+}
+
+# Provider configuration
+providers:
+  google:
+    project = var.project_id
+    region = var.region
+    zone = var.zone
+  
+  google-beta:
+    project = var.project_id
+    region = var.region
+    zone = var.zone
+
+# Enable required Google Cloud APIs
+resources:
+  # Enable APIs required for threat detection infrastructure
+  apis:
+    type: google_project_service
+    properties:
+      for_each:
+        - compute.googleapis.com
+        - ids.googleapis.com
+        - bigquery.googleapis.com
+        - cloudfunctions.googleapis.com
+        - pubsub.googleapis.com
+        - servicenetworking.googleapis.com
+        - logging.googleapis.com
+        - monitoring.googleapis.com
+      service: "${each.value}"
+      disable_dependent_services: false
+      disable_on_destroy: false
+
+  # Create VPC network for threat detection infrastructure
+  threat_detection_vpc:
+    type: google_compute_network
+    properties:
+      name: ${local.vpc_name}
+      auto_create_subnetworks: false
+      routing_mode: "REGIONAL"
+      description: "VPC network for threat detection pipeline infrastructure"
+    depends_on:
+      - apis
+    metadata:
+      labels: ${local.common_labels}
+
+  # Create subnet for compute resources
+  threat_detection_subnet:
+    type: google_compute_subnetwork
+    properties:
+      name: ${local.subnet_name}
+      ip_cidr_range: ${var.subnet_cidr}
+      region: ${var.region}
+      network: ${threat_detection_vpc.id}
+      description: "Subnet for threat detection compute resources"
+      
+      # Enable private Google access for managed services
+      private_ip_google_access: true
+      
+      # Configure logging for network monitoring
+      log_config:
+        aggregation_interval: "INTERVAL_10_SEC"
+        flow_sampling: 0.5
+        metadata: "INCLUDE_ALL_METADATA"
+    depends_on:
+      - threat_detection_vpc
+
+  # Reserve IP range for private services access (required for Cloud IDS)
+  private_services_range:
+    type: google_compute_global_address
+    properties:
+      name: "google-managed-services-${local.random_suffix}"
+      purpose: "VPC_PEERING"
+      address_type: "INTERNAL"
+      prefix_length: 16
+      network: ${threat_detection_vpc.id}
+      description: "IP range for Google managed services private access"
+    depends_on:
+      - threat_detection_vpc
+
+  # Create private connection for Cloud IDS
+  private_vpc_connection:
+    type: google_service_networking_connection
+    properties:
+      network: ${threat_detection_vpc.id}
+      service: "servicenetworking.googleapis.com"
+      reserved_peering_ranges:
+        - ${private_services_range.name}
+      deletion_policy: "ABANDON"
+    depends_on:
+      - private_services_range
+
+  # Create BigQuery dataset for threat detection analytics
+  threat_detection_dataset:
+    type: google_bigquery_dataset
+    properties:
+      dataset_id: "threat_detection_${local.random_suffix}"
+      friendly_name: "Threat Detection Analytics"
+      description: "Dataset for storing and analyzing threat detection data from Cloud IDS"
+      location: ${var.region}
+      
+      # Configure access controls
+      access:
+        - role: "OWNER"
+          user_by_email: "${data.google_client_config.current.access_token}"
+        - role: "READER"
+          special_group: "projectReaders"
+        - role: "WRITER"
+          special_group: "projectWriters"
+      
+      # Enable deletion protection for production
+      delete_contents_on_destroy: var.environment == "dev"
+      
+      labels: ${local.common_labels}
+    depends_on:
+      - apis
+
+  # Create table for Cloud IDS findings
+  ids_findings_table:
+    type: google_bigquery_table
+    properties:
+      dataset_id: ${threat_detection_dataset.dataset_id}
+      table_id: "ids_findings"
+      description: "Raw Cloud IDS threat detection findings"
+      
+      # Define schema for threat detection data
+      schema: |
+        [
+          {
+            "name": "finding_id",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Unique identifier for the security finding"
+          },
+          {
+            "name": "timestamp",
+            "type": "TIMESTAMP",
+            "mode": "REQUIRED",
+            "description": "When the threat was detected"
+          },
+          {
+            "name": "severity",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Threat severity level (LOW, MEDIUM, HIGH, CRITICAL)"
+          },
+          {
+            "name": "threat_type",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Type of threat detected"
+          },
+          {
+            "name": "source_ip",
+            "type": "STRING",
+            "mode": "NULLABLE",
+            "description": "Source IP address of the threat"
+          },
+          {
+            "name": "destination_ip",
+            "type": "STRING",
+            "mode": "NULLABLE",
+            "description": "Destination IP address targeted"
+          },
+          {
+            "name": "protocol",
+            "type": "STRING",
+            "mode": "NULLABLE",
+            "description": "Network protocol used in the threat"
+          },
+          {
+            "name": "details",
+            "type": "STRING",
+            "mode": "NULLABLE",
+            "description": "Additional threat details as JSON"
+          },
+          {
+            "name": "raw_data",
+            "type": "STRING",
+            "mode": "NULLABLE",
+            "description": "Complete raw finding data as JSON"
+          }
+        ]
+      
+      # Configure time partitioning for performance
+      time_partitioning:
+        type: "DAY"
+        field: "timestamp"
+        
+      # Configure clustering for query optimization
+      clustering:
+        - "severity"
+        - "threat_type"
+        
+      labels: ${local.common_labels}
+    depends_on:
+      - threat_detection_dataset
+
+  # Create table for aggregated threat metrics
+  threat_metrics_table:
+    type: google_bigquery_table
+    properties:
+      dataset_id: ${threat_detection_dataset.dataset_id}
+      table_id: "threat_metrics"
+      description: "Aggregated threat detection metrics and trends"
+      
+      schema: |
+        [
+          {
+            "name": "metric_time",
+            "type": "TIMESTAMP",
+            "mode": "REQUIRED",
+            "description": "Time window for the metrics"
+          },
+          {
+            "name": "threat_count",
+            "type": "INTEGER",
+            "mode": "REQUIRED",
+            "description": "Total number of threats detected"
+          },
+          {
+            "name": "severity_high",
+            "type": "INTEGER",
+            "mode": "REQUIRED",
+            "description": "Count of high severity threats"
+          },
+          {
+            "name": "severity_medium",
+            "type": "INTEGER",
+            "mode": "REQUIRED",
+            "description": "Count of medium severity threats"
+          },
+          {
+            "name": "severity_low",
+            "type": "INTEGER",
+            "mode": "REQUIRED",
+            "description": "Count of low severity threats"
+          },
+          {
+            "name": "top_source_ips",
+            "type": "STRING",
+            "mode": "NULLABLE",
+            "description": "Top source IPs as JSON array"
+          },
+          {
+            "name": "top_threat_types",
+            "type": "STRING",
+            "mode": "NULLABLE",
+            "description": "Top threat types as JSON array"
+          }
+        ]
+      
+      time_partitioning:
+        type: "DAY"
+        field: "metric_time"
+        
+      clustering:
+        - "threat_count"
+        
+      labels: ${local.common_labels}
+    depends_on:
+      - threat_detection_dataset
+
+  # Create BigQuery view for threat analytics
+  threat_summary_view:
+    type: google_bigquery_table
+    properties:
+      dataset_id: ${threat_detection_dataset.dataset_id}
+      table_id: "threat_summary"
+      description: "Real-time threat detection summary view"
+      
+      view:
+        query: |
+          SELECT 
+            DATE(timestamp) as threat_date,
+            COUNT(*) as total_findings,
+            COUNTIF(severity = 'HIGH') as high_severity,
+            COUNTIF(severity = 'MEDIUM') as medium_severity,
+            COUNTIF(severity = 'LOW') as low_severity,
+            ARRAY_AGG(DISTINCT threat_type LIMIT 5) as top_threat_types,
+            ARRAY_AGG(DISTINCT source_ip LIMIT 10) as top_source_ips
+          FROM `${var.project_id}.${threat_detection_dataset.dataset_id}.ids_findings`
+          WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+          GROUP BY DATE(timestamp)
+          ORDER BY threat_date DESC
+        use_legacy_sql: false
+      
+      labels: ${local.common_labels}
+    depends_on:
+      - ids_findings_table
+
+  # Create Pub/Sub topic for IDS findings
+  threat_findings_topic:
+    type: google_pubsub_topic
+    properties:
+      name: "threat-detection-findings-${local.random_suffix}"
+      
+      # Configure message retention
+      message_retention_duration: "604800s"  # 7 days
+      
+      # Enable message ordering if needed
+      message_storage_policy:
+        allowed_persistence_regions:
+          - ${var.region}
+      
+      labels: ${local.common_labels}
+    depends_on:
+      - apis
+
+  # Create subscription for Cloud Functions processing
+  findings_subscription:
+    type: google_pubsub_subscription
+    properties:
+      name: "process-findings-sub-${local.random_suffix}"
+      topic: ${threat_findings_topic.name}
+      
+      # Configure acknowledgment deadline
+      ack_deadline_seconds: 60
+      
+      # Configure message retention
+      message_retention_duration: "604800s"  # 7 days
+      
+      # Configure retry policy
+      retry_policy:
+        minimum_backoff: "10s"
+        maximum_backoff: "600s"
+      
+      # Configure dead letter policy
+      dead_letter_policy:
+        dead_letter_topic: ${dead_letter_topic.id}
+        max_delivery_attempts: 5
+      
+      labels: ${local.common_labels}
+    depends_on:
+      - threat_findings_topic
+      - dead_letter_topic
+
+  # Create Pub/Sub topic for security alerts
+  security_alerts_topic:
+    type: google_pubsub_topic
+    properties:
+      name: "security-alerts-${local.random_suffix}"
+      
+      message_retention_duration: "604800s"
+      
+      message_storage_policy:
+        allowed_persistence_regions:
+          - ${var.region}
+      
+      labels: ${local.common_labels}
+    depends_on:
+      - apis
+
+  # Create dead letter topic for failed message processing
+  dead_letter_topic:
+    type: google_pubsub_topic
+    properties:
+      name: "threat-detection-dead-letter-${local.random_suffix}"
+      
+      message_retention_duration: "1209600s"  # 14 days
+      
+      labels: ${local.common_labels}
+    depends_on:
+      - apis
+
+  # Create Cloud Storage bucket for function source code
+  function_source_bucket:
+    type: google_storage_bucket
+    properties:
+      name: "${var.project_id}-threat-functions-${local.random_suffix}"
+      location: ${var.region}
+      
+      # Configure lifecycle management
+      lifecycle_rule:
+        - condition:
+            age: 30
+          action:
+            type: "Delete"
+      
+      # Enable versioning for function deployments
+      versioning:
+        enabled: true
+      
+      # Configure uniform bucket-level access
+      uniform_bucket_level_access: true
+      
+      labels: ${local.common_labels}
+    depends_on:
+      - apis
+
+  # Create service account for threat processing function
+  threat_processor_sa:
+    type: google_service_account
+    properties:
+      account_id: "threat-processor-${local.random_suffix}"
+      display_name: "Threat Detection Processor"
+      description: "Service account for processing threat detection findings"
+    depends_on:
+      - apis
+
+  # Grant BigQuery permissions to threat processor service account
+  threat_processor_bq_permissions:
+    type: google_project_iam_member
+    properties:
+      for_each:
+        - "roles/bigquery.dataEditor"
+        - "roles/bigquery.jobUser"
+      project: ${var.project_id}
+      role: "${each.value}"
+      member: "serviceAccount:${threat_processor_sa.email}"
+    depends_on:
+      - threat_processor_sa
+
+  # Grant Pub/Sub permissions to threat processor service account
+  threat_processor_pubsub_permissions:
+    type: google_project_iam_member
+    properties:
+      for_each:
+        - "roles/pubsub.editor"
+      project: ${var.project_id}
+      role: "${each.value}"
+      member: "serviceAccount:${threat_processor_sa.email}"
+    depends_on:
+      - threat_processor_sa
+
+  # Create service account for alert processing function
+  alert_processor_sa:
+    type: google_service_account
+    properties:
+      account_id: "alert-processor-${local.random_suffix}"
+      display_name: "Security Alert Processor"
+      description: "Service account for processing security alerts and automated response"
+    depends_on:
+      - apis
+
+  # Grant compute and monitoring permissions to alert processor
+  alert_processor_permissions:
+    type: google_project_iam_member
+    properties:
+      for_each:
+        - "roles/compute.instanceAdmin.v1"
+        - "roles/monitoring.editor"
+        - "roles/logging.logWriter"
+      project: ${var.project_id}
+      role: "${each.value}"
+      member: "serviceAccount:${alert_processor_sa.email}"
+    depends_on:
+      - alert_processor_sa
+
+  # Create Cloud Function for threat processing
+  threat_processor_function:
+    type: google_cloudfunctions2_function
+    properties:
+      name: "process-threat-finding-${local.random_suffix}"
+      location: ${var.region}
+      description: "Process Cloud IDS findings and store in BigQuery"
+      
+      build_config:
+        runtime: "python39"
+        entry_point: "process_threat_finding"
+        source:
+          storage_source:
+            bucket: ${function_source_bucket.name}
+            object: "threat-processor-source.zip"
+      
+      service_config:
+        max_instance_count: 100
+        min_instance_count: 0
+        available_memory: "512M"
+        timeout_seconds: 120
+        
+        # Configure environment variables
+        environment_variables:
+          PROJECT_ID: ${var.project_id}
+          DATASET_ID: ${threat_detection_dataset.dataset_id}
+          ALERTS_TOPIC: ${security_alerts_topic.name}
+        
+        # Set service account
+        service_account_email: ${threat_processor_sa.email}
+        
+        # Configure ingress
+        ingress_settings: "ALLOW_INTERNAL_ONLY"
+      
+      event_trigger:
+        trigger_region: ${var.region}
+        event_type: "google.cloud.pubsub.topic.v1.messagePublished"
+        pubsub_topic: ${threat_findings_topic.id}
+        retry_policy: "RETRY_POLICY_RETRY"
+      
+      labels: ${local.common_labels}
+    depends_on:
+      - threat_processor_sa
+      - function_source_bucket
+      - threat_findings_topic
+      - security_alerts_topic
+      - threat_detection_dataset
+
+  # Create Cloud Function for alert processing
+  alert_processor_function:
+    type: google_cloudfunctions2_function
+    properties:
+      name: "process-security-alert-${local.random_suffix}"
+      location: ${var.region}
+      description: "Process high-severity security alerts and trigger automated responses"
+      
+      build_config:
+        runtime: "python39"
+        entry_point: "process_security_alert"
+        source:
+          storage_source:
+            bucket: ${function_source_bucket.name}
+            object: "alert-processor-source.zip"
+      
+      service_config:
+        max_instance_count: 50
+        min_instance_count: 0
+        available_memory: "256M"
+        timeout_seconds: 60
+        
+        environment_variables:
+          PROJECT_ID: ${var.project_id}
+          REGION: ${var.region}
+        
+        service_account_email: ${alert_processor_sa.email}
+        ingress_settings: "ALLOW_INTERNAL_ONLY"
+      
+      event_trigger:
+        trigger_region: ${var.region}
+        event_type: "google.cloud.pubsub.topic.v1.messagePublished"
+        pubsub_topic: ${security_alerts_topic.id}
+        retry_policy: "RETRY_POLICY_RETRY"
+      
+      labels: ${local.common_labels}
+    depends_on:
+      - alert_processor_sa
+      - function_source_bucket
+      - security_alerts_topic
+
+  # Create test VMs for traffic generation and monitoring
+  web_server_vm:
+    type: google_compute_instance
+    properties:
+      name: "web-server-${local.random_suffix}"
+      machine_type: "e2-medium"
+      zone: ${var.zone}
+      
+      boot_disk:
+        initialize_params:
+          image: "debian-cloud/debian-11"
+          size: 20
+          type: "pd-standard"
+      
+      network_interface:
+        network: ${threat_detection_vpc.id}
+        subnetwork: ${threat_detection_subnet.id}
+        
+        # No external IP for security
+        access_config: []
+      
+      # Configure VM for web server role
+      metadata:
+        startup-script: |
+          #!/bin/bash
+          apt-get update
+          apt-get install -y apache2
+          systemctl enable apache2
+          systemctl start apache2
+          echo "<h1>Web Server - Threat Detection Test</h1>" > /var/www/html/index.html
+      
+      tags:
+        - "web-server"
+        - "mirrored-vm"
+        - "threat-detection"
+      
+      labels: ${local.common_labels}
+      
+      # Configure service account with minimal permissions
+      service_account:
+        email: ${threat_processor_sa.email}
+        scopes:
+          - "https://www.googleapis.com/auth/logging.write"
+          - "https://www.googleapis.com/auth/monitoring.write"
+    depends_on:
+      - threat_detection_subnet
+      - threat_processor_sa
+
+  # Create application server VM
+  app_server_vm:
+    type: google_compute_instance
+    properties:
+      name: "app-server-${local.random_suffix}"
+      machine_type: "e2-medium"
+      zone: ${var.zone}
+      
+      boot_disk:
+        initialize_params:
+          image: "debian-cloud/debian-11"
+          size: 20
+          type: "pd-standard"
+      
+      network_interface:
+        network: ${threat_detection_vpc.id}
+        subnetwork: ${threat_detection_subnet.id}
+        access_config: []
+      
+      metadata:
+        startup-script: |
+          #!/bin/bash
+          apt-get update
+          apt-get install -y python3 python3-pip
+          echo "Application Server - Threat Detection Test" > /tmp/app-status.txt
+      
+      tags:
+        - "app-server"
+        - "mirrored-vm"
+        - "threat-detection"
+      
+      labels: ${local.common_labels}
+      
+      service_account:
+        email: ${threat_processor_sa.email}
+        scopes:
+          - "https://www.googleapis.com/auth/logging.write"
+          - "https://www.googleapis.com/auth/monitoring.write"
+    depends_on:
+      - threat_detection_subnet
+      - threat_processor_sa
+
+  # Create Cloud IDS endpoint
+  ids_endpoint:
+    type: google_ids_endpoint
+    properties:
+      name: ${local.ids_endpoint_name}
+      location: ${var.zone}
+      network: ${threat_detection_vpc.id}
+      
+      # Configure threat detection settings
+      severity: ${var.ids_severity}
+      
+      # Enable threat exceptions if needed
+      threat_exceptions: []
+      
+      description: "Cloud IDS endpoint for threat detection pipeline"
+      
+      labels: ${local.common_labels}
+    depends_on:
+      - private_vpc_connection
+      - threat_detection_vpc
+
+  # Create packet mirroring policy
+  packet_mirroring:
+    type: google_compute_packet_mirroring
+    properties:
+      name: "threat-detection-mirroring-${local.random_suffix}"
+      region: ${var.region}
+      
+      network:
+        url: ${threat_detection_vpc.id}
+      
+      # Mirror traffic from VMs with specific tags
+      mirrored_resources:
+        tags:
+          - "mirrored-vm"
+      
+      # Forward to IDS endpoint
+      collector_ilb:
+        url: ${ids_endpoint.endpoint_forwarding_rule}
+      
+      description: "Packet mirroring for threat detection analysis"
+    depends_on:
+      - ids_endpoint
+      - web_server_vm
+      - app_server_vm
+
+  # Create firewall rules for secure access
+  allow_internal_traffic:
+    type: google_compute_firewall
+    properties:
+      name: "allow-internal-${local.random_suffix}"
+      network: ${threat_detection_vpc.id}
+      description: "Allow internal traffic between VMs"
+      
+      allow:
+        - protocol: "tcp"
+          ports:
+            - "22"
+            - "80"
+            - "443"
+        - protocol: "icmp"
+      
+      source_ranges:
+        - ${var.subnet_cidr}
+      
+      target_tags:
+        - "threat-detection"
+    depends_on:
+      - threat_detection_vpc
+
+  # Create firewall rule for IAP SSH access
+  allow_iap_ssh:
+    type: google_compute_firewall
+    properties:
+      name: "allow-iap-ssh-${local.random_suffix}"
+      network: ${threat_detection_vpc.id}
+      description: "Allow IAP SSH access to VMs"
+      
+      allow:
+        - protocol: "tcp"
+          ports:
+            - "22"
+      
+      # Google Cloud IAP IP ranges
+      source_ranges:
+        - "35.235.240.0/20"
+      
+      target_tags:
+        - "threat-detection"
+    depends_on:
+      - threat_detection_vpc
+
+  # Create sample threat data (if enabled)
+  sample_threat_data:
+    type: google_bigquery_job
+    count: var.enable_sample_data ? 1 : 0
+    properties:
+      job_id: "load-sample-data-${local.random_suffix}"
+      
+      query:
+        query: |
+          INSERT INTO `${var.project_id}.${threat_detection_dataset.dataset_id}.ids_findings` 
+          (finding_id, timestamp, severity, threat_type, source_ip, destination_ip, protocol, details, raw_data)
+          VALUES 
+          ('finding-001-${local.random_suffix}', CURRENT_TIMESTAMP(), 'HIGH', 'Malware Detection', '203.0.113.1', '10.0.1.5', 'TCP', '{"port": 80, "payload": "suspicious"}', '{"full_details": "sample_high_severity"}'),
+          ('finding-002-${local.random_suffix}', CURRENT_TIMESTAMP(), 'MEDIUM', 'Port Scan', '198.51.100.1', '10.0.1.0/24', 'TCP', '{"ports": [22, 80, 443]}', '{"scan_type": "stealth"}'),
+          ('finding-003-${local.random_suffix}', CURRENT_TIMESTAMP(), 'LOW', 'DNS Tunneling', '192.0.2.1', '8.8.8.8', 'UDP', '{"domain": "suspicious.example.com"}', '{"queries": 150}'),
+          ('finding-004-${local.random_suffix}', CURRENT_TIMESTAMP(), 'CRITICAL', 'Command and Control', '185.220.100.1', '10.0.1.10', 'HTTPS', '{"c2_domain": "malicious.example.org"}', '{"threat_actor": "APT-X"}'),
+          ('finding-005-${local.random_suffix}', CURRENT_TIMESTAMP(), 'MEDIUM', 'Data Exfiltration', '10.0.1.15', '93.184.216.34', 'HTTPS', '{"data_size": "150MB"}', '{"destination": "external_cloud"}}')
+        use_legacy_sql: false
+        write_disposition: "WRITE_APPEND"
+    depends_on:
+      - ids_findings_table
+
+# Output values for reference and integration
+outputs:
+  # Network infrastructure outputs
+  vpc_network_id:
+    description: "ID of the VPC network created for threat detection"
+    value: ${threat_detection_vpc.id}
+
+  subnet_id:
+    description: "ID of the subnet for compute resources"
+    value: ${threat_detection_subnet.id}
+
+  # Cloud IDS outputs
+  ids_endpoint_name:
+    description: "Name of the Cloud IDS endpoint"
+    value: ${ids_endpoint.name}
+
+  ids_endpoint_state:
+    description: "Current state of the Cloud IDS endpoint"
+    value: ${ids_endpoint.state}
+
+  ids_service_attachment:
+    description: "Service attachment for the IDS endpoint"
+    value: ${ids_endpoint.endpoint_forwarding_rule}
+
+  # BigQuery outputs
+  bigquery_dataset_id:
+    description: "BigQuery dataset ID for threat detection data"
+    value: ${threat_detection_dataset.dataset_id}
+
+  bigquery_dataset_location:
+    description: "Location of the BigQuery dataset"
+    value: ${threat_detection_dataset.location}
+
+  findings_table_id:
+    description: "Full table ID for IDS findings"
+    value: "${var.project_id}.${threat_detection_dataset.dataset_id}.ids_findings"
+
+  threat_summary_view_id:
+    description: "Full view ID for threat summary analytics"
+    value: "${var.project_id}.${threat_detection_dataset.dataset_id}.threat_summary"
+
+  # BigQuery Data Canvas URL
+  data_canvas_url:
+    description: "URL to access BigQuery Data Canvas for threat analytics"
+    value: "https://console.cloud.google.com/bigquery/canvas?project=${var.project_id}&ws=${threat_detection_dataset.dataset_id}"
+
+  # Pub/Sub outputs
+  threat_findings_topic_id:
+    description: "ID of the Pub/Sub topic for threat findings"
+    value: ${threat_findings_topic.id}
+
+  security_alerts_topic_id:
+    description: "ID of the Pub/Sub topic for security alerts"
+    value: ${security_alerts_topic.id}
+
+  # Cloud Functions outputs
+  threat_processor_function_name:
+    description: "Name of the threat processing Cloud Function"
+    value: ${threat_processor_function.name}
+
+  alert_processor_function_name:
+    description: "Name of the alert processing Cloud Function"
+    value: ${alert_processor_function.name}
+
+  # VM outputs for testing
+  web_server_internal_ip:
+    description: "Internal IP address of the web server VM"
+    value: ${web_server_vm.network_interface[0].network_ip}
+
+  app_server_internal_ip:
+    description: "Internal IP address of the app server VM"
+    value: ${app_server_vm.network_interface[0].network_ip}
+
+  # Service account outputs
+  threat_processor_service_account:
+    description: "Email of the threat processor service account"
+    value: ${threat_processor_sa.email}
+
+  alert_processor_service_account:
+    description: "Email of the alert processor service account"
+    value: ${alert_processor_sa.email}
+
+  # Security outputs
+  packet_mirroring_policy_name:
+    description: "Name of the packet mirroring policy"
+    value: ${packet_mirroring.name}
+
+  # Quick start commands
+  bigquery_query_example:
+    description: "Example BigQuery query to view threat data"
+    value: "bq query --use_legacy_sql=false 'SELECT * FROM `${var.project_id}.${threat_detection_dataset.dataset_id}.threat_summary` ORDER BY threat_date DESC LIMIT 10'"
+
+  test_alert_command:
+    description: "Command to publish a test security alert"
+    value: "gcloud pubsub topics publish ${security_alerts_topic.name} --message='{\"alert_type\":\"HIGH_SEVERITY_THREAT\",\"finding_id\":\"test-alert-001\",\"threat_type\":\"Malware Detection\",\"source_ip\":\"203.0.113.1\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}'"
+
+  # Monitoring and management URLs
+  cloud_console_monitoring_url:
+    description: "URL to view monitoring dashboards in Cloud Console"
+    value: "https://console.cloud.google.com/monitoring/dashboards?project=${var.project_id}"
+
+  ids_console_url:
+    description: "URL to manage Cloud IDS in Cloud Console"
+    value: "https://console.cloud.google.com/security/ids/endpoints?project=${var.project_id}"
+
+  # Cost estimation note
+  estimated_monthly_cost:
+    description: "Estimated monthly cost for this infrastructure (USD)"
+    value: "Approximately $200-500/month depending on traffic volume and analysis usage. Major cost drivers: Cloud IDS endpoint (~$100-200/month), BigQuery analysis queries (~$50-200/month), Cloud Functions executions (~$10-50/month), Compute VMs (~$30-50/month)"

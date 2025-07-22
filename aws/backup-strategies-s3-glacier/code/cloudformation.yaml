@@ -1,0 +1,1545 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Comprehensive backup strategy using S3 with intelligent lifecycle transitions to Glacier storage classes, automated backup scheduling with Lambda functions, and event-driven notifications through EventBridge'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+          - NotificationEmail
+      - Label:
+          default: "Backup Storage Configuration"
+        Parameters:
+          - EnableIntelligentTiering
+          - RetainObjectsAfterDeletion
+          - TransitionToIADays
+          - TransitionToGlacierDays
+          - TransitionToDeepArchiveDays
+      - Label:
+          default: "Backup Scheduling"
+        Parameters:
+          - DailyBackupSchedule
+          - WeeklyBackupSchedule
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaTimeout
+          - LambdaMemorySize
+      - Label:
+          default: "Disaster Recovery"
+        Parameters:
+          - EnableCrossRegionReplication
+          - DisasterRecoveryRegion
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      NotificationEmail:
+        default: "Notification Email Address"
+      EnableIntelligentTiering:
+        default: "Enable S3 Intelligent Tiering"
+      RetainObjectsAfterDeletion:
+        default: "Object Retention Period (Days)"
+      TransitionToIADays:
+        default: "Days to Transition to IA"
+      TransitionToGlacierDays:
+        default: "Days to Transition to Glacier"
+      TransitionToDeepArchiveDays:
+        default: "Days to Transition to Deep Archive"
+      DailyBackupSchedule:
+        default: "Daily Backup Schedule"
+      WeeklyBackupSchedule:
+        default: "Weekly Backup Schedule"
+      LambdaTimeout:
+        default: "Lambda Timeout (Seconds)"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      EnableCrossRegionReplication:
+        default: "Enable Cross-Region Replication"
+      DisasterRecoveryRegion:
+        default: "Disaster Recovery Region"
+
+Parameters:
+  # Naming and Environment
+  ProjectName:
+    Type: String
+    Default: 'backup-strategy'
+    Description: 'Project name used for resource naming'
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+  
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'test', 'staging', 'prod']
+    Description: 'Environment name for resource tagging and configuration'
+  
+  # S3 Configuration
+  EnableIntelligentTiering:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable S3 Intelligent Tiering for automatic cost optimization'
+  
+  RetainObjectsAfterDeletion:
+    Type: Number
+    Default: 2555
+    MinValue: 365
+    MaxValue: 10000
+    Description: 'Number of days to retain non-current versions before permanent deletion'
+  
+  # Lifecycle Configuration
+  TransitionToIADays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: 'Days after creation to transition objects to Infrequent Access'
+  
+  TransitionToGlacierDays:
+    Type: Number
+    Default: 90
+    MinValue: 30
+    MaxValue: 730
+    Description: 'Days after creation to transition objects to Glacier Flexible Retrieval'
+  
+  TransitionToDeepArchiveDays:
+    Type: Number
+    Default: 365
+    MinValue: 90
+    MaxValue: 3650
+    Description: 'Days after creation to transition objects to Glacier Deep Archive'
+  
+  # Lambda Configuration
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+    Description: 'Lambda function timeout in seconds'
+  
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 3008
+    Description: 'Lambda function memory allocation in MB'
+  
+  # Backup Schedule Configuration
+  DailyBackupSchedule:
+    Type: String
+    Default: 'cron(0 2 * * ? *)'
+    Description: 'Cron expression for daily backup schedule (default: 2 AM UTC daily)'
+  
+  WeeklyBackupSchedule:
+    Type: String
+    Default: 'cron(0 1 ? * SUN *)'
+    Description: 'Cron expression for weekly backup schedule (default: 1 AM UTC Sunday)'
+  
+  # Cross-Region Replication
+  EnableCrossRegionReplication:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable cross-region replication for disaster recovery'
+  
+  DisasterRecoveryRegion:
+    Type: String
+    Default: 'us-west-2'
+    AllowedValues: 
+      - 'us-east-1'
+      - 'us-east-2'
+      - 'us-west-1'
+      - 'us-west-2'
+      - 'eu-west-1'
+      - 'eu-central-1'
+      - 'ap-southeast-1'
+      - 'ap-northeast-1'
+    Description: 'AWS region for disaster recovery bucket'
+  
+  # Notification Configuration
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for backup notifications (optional)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+Conditions:
+  # Feature toggles
+  CreateIntelligentTiering: !Equals [!Ref EnableIntelligentTiering, 'true']
+  CreateCrossRegionReplication: !Equals [!Ref EnableCrossRegionReplication, 'true']
+  CreateEmailSubscription: !Not [!Equals [!Ref NotificationEmail, '']]
+  
+  # Region checks for cross-region replication
+  IsUsEast1: !Equals [!Ref 'AWS::Region', 'us-east-1']
+  IsUsWest2: !Equals [!Ref 'AWS::Region', 'us-west-2']
+  
+  # Ensure DR region is different from current region
+  ValidDRRegion: !And
+    - !If [IsUsEast1, !Not [!Equals [!Ref DisasterRecoveryRegion, 'us-east-1']], !Ref 'AWS::NoValue']
+    - !If [IsUsWest2, !Not [!Equals [!Ref DisasterRecoveryRegion, 'us-west-2']], !Ref 'AWS::NoValue']
+
+Resources:
+  # Random ID for unique resource naming
+  RandomId:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt RandomIdFunction.Arn
+      Length: 8
+  
+  # Lambda function to generate random ID
+  RandomIdFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-random-id-generator-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import string
+          import random
+          
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  length = int(event['ResourceProperties'].get('Length', 8))
+                  random_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {'RandomId': random_id})
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+      Role: !GetAtt RandomIdFunctionRole.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for Random ID Generator
+  RandomIdFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-random-id-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Primary S3 Bucket for Backups
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-backup-${Environment}-${RandomId.RandomId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: BackupLifecycleRule
+            Status: Enabled
+            Transitions:
+              - Days: !Ref TransitionToIADays
+                StorageClass: STANDARD_IA
+              - Days: !Ref TransitionToGlacierDays
+                StorageClass: GLACIER
+              - Days: !Ref TransitionToDeepArchiveDays
+                StorageClass: DEEP_ARCHIVE
+            NoncurrentVersionTransitions:
+              - NoncurrentDays: !Ref TransitionToIADays
+                StorageClass: STANDARD_IA
+              - NoncurrentDays: !Ref TransitionToGlacierDays
+                StorageClass: GLACIER
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref RetainObjectsAfterDeletion
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: backup-access-logs/
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref BackupLogGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: PrimaryBackup
+
+  # S3 Bucket for Access Logs
+  AccessLogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-access-logs-${Environment}-${RandomId.RandomId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: AccessLogLifecycle
+            Status: Enabled
+            ExpirationInDays: 90
+            Transitions:
+              - Days: 30
+                StorageClass: STANDARD_IA
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: AccessLogs
+
+  # S3 Intelligent Tiering Configuration
+  IntelligentTieringConfig:
+    Type: AWS::S3::Bucket
+    Condition: CreateIntelligentTiering
+    Properties:
+      BucketName: !Ref BackupBucket
+      IntelligentTieringConfigurations:
+        - Id: BackupIntelligentTiering
+          Status: Enabled
+          Prefix: intelligent-tier/
+          Tierings:
+            - AccessTier: ARCHIVE_ACCESS
+              Days: 90
+            - AccessTier: DEEP_ARCHIVE_ACCESS
+              Days: 180
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Topic for Backup Notifications
+  BackupNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-backup-notifications-${Environment}'
+      DisplayName: 'Backup Strategy Notifications'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Topic Policy
+  BackupNotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref BackupNotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - lambda.amazonaws.com
+                - cloudwatch.amazonaws.com
+            Action:
+              - sns:Publish
+            Resource: !Ref BackupNotificationTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+
+  # Email Subscription to SNS Topic
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateEmailSubscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref BackupNotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Log Group for Backup Operations
+  BackupLogGroup:
+    Type: AWS::CloudWatch::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/backup-strategy/${ProjectName}-${Environment}'
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt BackupLogGroupKMSKey.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # KMS Key for CloudWatch Logs Encryption
+  BackupLogGroupKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'KMS key for backup strategy CloudWatch logs encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/backup-strategy/${ProjectName}-${Environment}'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # KMS Key Alias
+  BackupLogGroupKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-backup-logs-${Environment}'
+      TargetKeyId: !Ref BackupLogGroupKMSKey
+
+  # IAM Role for Backup Lambda Function
+  BackupLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-backup-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BackupOperationsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                  - s3:GetBucketLocation
+                  - s3:GetBucketVersioning
+                  - s3:RestoreObject
+                  - s3:GetObjectAttributes
+                Resource:
+                  - !Sub '${BackupBucket}/*'
+                  - !GetAtt BackupBucket.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref BackupNotificationTopic
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': 'BackupStrategy'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !Sub '${BackupLogGroup}*'
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:DescribeKey
+                Resource: !GetAtt BackupLogGroupKMSKey.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function for Backup Orchestration
+  BackupLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-backup-orchestrator-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Role: !GetAtt BackupLambdaRole.Arn
+      Environment:
+        Variables:
+          BACKUP_BUCKET: !Ref BackupBucket
+          SNS_TOPIC_ARN: !Ref BackupNotificationTopic
+          LOG_GROUP_NAME: !Ref BackupLogGroup
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import hashlib
+          import logging
+          from datetime import datetime, timezone
+          from typing import Dict, Any, List
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          # Initialize AWS clients
+          s3_client = boto3.client('s3')
+          sns_client = boto3.client('sns')
+          cloudwatch_client = boto3.client('cloudwatch')
+          
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              Main handler for backup orchestration operations.
+              
+              Supports multiple backup types:
+              - incremental: Daily incremental backups
+              - full: Complete backup of all data
+              - validation: Backup integrity validation
+              - restore_test: Test restore operations
+              """
+              
+              # Extract environment variables
+              backup_bucket = os.environ['BACKUP_BUCKET']
+              sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+              project_name = os.environ['PROJECT_NAME']
+              environment = os.environ['ENVIRONMENT']
+              
+              try:
+                  # Parse event parameters
+                  backup_type = event.get('backup_type', 'incremental')
+                  source_prefix = event.get('source_prefix', 'data/')
+                  dry_run = event.get('dry_run', False)
+                  
+                  logger.info(f"Starting backup operation: type={backup_type}, source={source_prefix}, dry_run={dry_run}")
+                  
+                  # Generate backup metadata
+                  timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+                  backup_id = generate_backup_id(backup_type, timestamp)
+                  backup_key_prefix = f"backups/{backup_type}/{timestamp}/"
+                  
+                  # Execute backup operation based on type
+                  if backup_type == 'validation':
+                      result = perform_backup_validation(backup_bucket, backup_key_prefix)
+                  elif backup_type == 'restore_test':
+                      result = perform_restore_test(backup_bucket, source_prefix)
+                  else:
+                      result = perform_backup_operation(
+                          backup_bucket, 
+                          backup_key_prefix, 
+                          source_prefix, 
+                          backup_type,
+                          dry_run
+                      )
+                  
+                  # Record metrics
+                  record_backup_metrics(result, backup_type)
+                  
+                  # Send notification
+                  notification_message = create_notification_message(
+                      result, backup_type, timestamp, backup_bucket, backup_key_prefix
+                  )
+                  
+                  if not dry_run:
+                      send_notification(sns_topic_arn, notification_message, result['success'])
+                  
+                  logger.info(f"Backup operation completed: {result}")
+                  
+                  return {
+                      'statusCode': 200 if result['success'] else 500,
+                      'body': json.dumps({
+                          'backup_id': backup_id,
+                          'backup_type': backup_type,
+                          'timestamp': timestamp,
+                          'result': result,
+                          'dry_run': dry_run
+                      }, default=str)
+                  }
+                  
+              except Exception as e:
+                  error_message = f"Backup operation failed: {str(e)}"
+                  logger.error(error_message, exc_info=True)
+                  
+                  # Send failure notification
+                  if not event.get('dry_run', False):
+                      send_failure_notification(sns_topic_arn, error_message, backup_type)
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': error_message,
+                          'backup_type': backup_type,
+                          'timestamp': datetime.now(timezone.utc).isoformat()
+                      })
+                  }
+          
+          def generate_backup_id(backup_type: str, timestamp: str) -> str:
+              """Generate unique backup identifier."""
+              return hashlib.md5(f"{backup_type}-{timestamp}".encode()).hexdigest()[:12]
+          
+          def perform_backup_operation(
+              bucket: str, 
+              backup_prefix: str, 
+              source_prefix: str, 
+              backup_type: str,
+              dry_run: bool
+          ) -> Dict[str, Any]:
+              """Perform the actual backup operation."""
+              
+              try:
+                  start_time = datetime.now(timezone.utc)
+                  
+                  # List source objects
+                  source_objects = list_bucket_objects(bucket, source_prefix)
+                  
+                  if not source_objects:
+                      logger.warning(f"No objects found with prefix: {source_prefix}")
+                      return {
+                          'success': True,
+                          'objects_processed': 0,
+                          'objects_backed_up': 0,
+                          'duration_seconds': 0,
+                          'message': 'No objects to backup'
+                      }
+                  
+                  objects_backed_up = 0
+                  
+                  if not dry_run:
+                      # Process each object for backup
+                      for obj in source_objects[:10]:  # Limit for demo purposes
+                          backup_key = f"{backup_prefix}{obj['Key']}"
+                          
+                          # Copy object to backup location
+                          copy_source = {'Bucket': bucket, 'Key': obj['Key']}
+                          s3_client.copy_object(
+                              CopySource=copy_source,
+                              Bucket=bucket,
+                              Key=backup_key,
+                              MetadataDirective='COPY',
+                              TaggingDirective='COPY'
+                          )
+                          
+                          objects_backed_up += 1
+                          logger.info(f"Backed up object: {obj['Key']} -> {backup_key}")
+                  else:
+                      objects_backed_up = len(source_objects)
+                      logger.info(f"Dry run: would backup {objects_backed_up} objects")
+                  
+                  end_time = datetime.now(timezone.utc)
+                  duration = (end_time - start_time).total_seconds()
+                  
+                  return {
+                      'success': True,
+                      'objects_processed': len(source_objects),
+                      'objects_backed_up': objects_backed_up,
+                      'duration_seconds': duration,
+                      'backup_type': backup_type,
+                      'backup_prefix': backup_prefix
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Backup operation failed: {str(e)}", exc_info=True)
+                  return {
+                      'success': False,
+                      'error': str(e),
+                      'backup_type': backup_type
+                  }
+          
+          def perform_backup_validation(bucket: str, backup_prefix: str) -> Dict[str, Any]:
+              """Validate backup integrity and completeness."""
+              
+              try:
+                  start_time = datetime.now(timezone.utc)
+                  
+                  # List backup objects
+                  backup_objects = list_bucket_objects(bucket, backup_prefix)
+                  
+                  validation_results = []
+                  failed_validations = 0
+                  
+                  for obj in backup_objects[:10]:  # Limit for demo
+                      try:
+                          # Verify object exists and is accessible
+                          response = s3_client.head_object(Bucket=bucket, Key=obj['Key'])
+                          
+                          validation_results.append({
+                              'key': obj['Key'],
+                              'size': response.get('ContentLength'),
+                              'last_modified': response.get('LastModified'),
+                              'storage_class': response.get('StorageClass', 'STANDARD'),
+                              'status': 'valid'
+                          })
+                          
+                      except Exception as e:
+                          failed_validations += 1
+                          validation_results.append({
+                              'key': obj['Key'],
+                              'status': 'invalid',
+                              'error': str(e)
+                          })
+                  
+                  end_time = datetime.now(timezone.utc)
+                  duration = (end_time - start_time).total_seconds()
+                  
+                  success = failed_validations == 0
+                  
+                  return {
+                      'success': success,
+                      'objects_validated': len(backup_objects),
+                      'failed_validations': failed_validations,
+                      'duration_seconds': duration,
+                      'validation_results': validation_results
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Backup validation failed: {str(e)}", exc_info=True)
+                  return {
+                      'success': False,
+                      'error': str(e)
+                  }
+          
+          def perform_restore_test(bucket: str, source_prefix: str) -> Dict[str, Any]:
+              """Test restore operations from backup storage."""
+              
+              try:
+                  start_time = datetime.now(timezone.utc)
+                  
+                  # Find objects in Glacier storage classes
+                  glacier_objects = []
+                  
+                  response = s3_client.list_objects_v2(Bucket=bucket, Prefix='backups/')
+                  
+                  for obj in response.get('Contents', [])[:5]:  # Limit for demo
+                      head_response = s3_client.head_object(Bucket=bucket, Key=obj['Key'])
+                      storage_class = head_response.get('StorageClass', 'STANDARD')
+                      
+                      if storage_class in ['GLACIER', 'DEEP_ARCHIVE']:
+                          glacier_objects.append({
+                              'key': obj['Key'],
+                              'storage_class': storage_class,
+                              'size': obj['Size']
+                          })
+                  
+                  end_time = datetime.now(timezone.utc)
+                  duration = (end_time - start_time).total_seconds()
+                  
+                  return {
+                      'success': True,
+                      'glacier_objects_found': len(glacier_objects),
+                      'restore_candidates': glacier_objects,
+                      'duration_seconds': duration,
+                      'message': 'Restore test completed - objects identified for potential restoration'
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Restore test failed: {str(e)}", exc_info=True)
+                  return {
+                      'success': False,
+                      'error': str(e)
+                  }
+          
+          def list_bucket_objects(bucket: str, prefix: str) -> List[Dict[str, Any]]:
+              """List objects in bucket with given prefix."""
+              
+              objects = []
+              paginator = s3_client.get_paginator('list_objects_v2')
+              
+              for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                  objects.extend(page.get('Contents', []))
+              
+              return objects
+          
+          def record_backup_metrics(result: Dict[str, Any], backup_type: str) -> None:
+              """Record backup metrics to CloudWatch."""
+              
+              try:
+                  metrics = [
+                      {
+                          'MetricName': 'BackupSuccess',
+                          'Value': 1 if result['success'] else 0,
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {'Name': 'BackupType', 'Value': backup_type}
+                          ]
+                      }
+                  ]
+                  
+                  if 'duration_seconds' in result:
+                      metrics.append({
+                          'MetricName': 'BackupDuration',
+                          'Value': result['duration_seconds'],
+                          'Unit': 'Seconds',
+                          'Dimensions': [
+                              {'Name': 'BackupType', 'Value': backup_type}
+                          ]
+                      })
+                  
+                  if 'objects_backed_up' in result:
+                      metrics.append({
+                          'MetricName': 'ObjectsBackedUp',
+                          'Value': result['objects_backed_up'],
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {'Name': 'BackupType', 'Value': backup_type}
+                          ]
+                      })
+                  
+                  cloudwatch_client.put_metric_data(
+                      Namespace='BackupStrategy',
+                      MetricData=metrics
+                  )
+                  
+              except Exception as e:
+                  logger.error(f"Failed to record metrics: {str(e)}")
+          
+          def create_notification_message(
+              result: Dict[str, Any], 
+              backup_type: str, 
+              timestamp: str, 
+              bucket: str, 
+              backup_prefix: str
+          ) -> Dict[str, Any]:
+              """Create structured notification message."""
+              
+              status = "SUCCESS" if result['success'] else "FAILED"
+              
+              message = {
+                  'backup_type': backup_type,
+                  'status': status,
+                  'timestamp': timestamp,
+                  'bucket': bucket,
+                  'backup_location': backup_prefix,
+                  'details': result
+              }
+              
+              return message
+          
+          def send_notification(topic_arn: str, message: Dict[str, Any], success: bool) -> None:
+              """Send notification via SNS."""
+              
+              try:
+                  subject = f"Backup {message['status']}: {message['backup_type']}"
+                  
+                  sns_client.publish(
+                      TopicArn=topic_arn,
+                      Message=json.dumps(message, indent=2, default=str),
+                      Subject=subject
+                  )
+                  
+              except Exception as e:
+                  logger.error(f"Failed to send notification: {str(e)}")
+          
+          def send_failure_notification(topic_arn: str, error_message: str, backup_type: str) -> None:
+              """Send failure notification via SNS."""
+              
+              try:
+                  sns_client.publish(
+                      TopicArn=topic_arn,
+                      Message=f"Backup operation failed: {error_message}",
+                      Subject=f"Backup FAILED: {backup_type}"
+                  )
+                  
+              except Exception as e:
+                  logger.error(f"Failed to send failure notification: {str(e)}")
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # EventBridge Role for Lambda Invocation
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-eventbridge-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt BackupLambdaFunction.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # EventBridge Rule for Daily Backups
+  DailyBackupRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-daily-backup-${Environment}'
+      Description: 'Daily incremental backup schedule'
+      ScheduleExpression: !Ref DailyBackupSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt BackupLambdaFunction.Arn
+          Id: DailyBackupTarget
+          Input: !Sub |
+            {
+              "backup_type": "incremental",
+              "source_prefix": "daily/",
+              "triggered_by": "eventbridge_daily"
+            }
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+  # EventBridge Rule for Weekly Backups
+  WeeklyBackupRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-weekly-backup-${Environment}'
+      Description: 'Weekly full backup schedule'
+      ScheduleExpression: !Ref WeeklyBackupSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt BackupLambdaFunction.Arn
+          Id: WeeklyBackupTarget
+          Input: !Sub |
+            {
+              "backup_type": "full",
+              "source_prefix": "weekly/",
+              "triggered_by": "eventbridge_weekly"
+            }
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+  # Lambda Permissions for EventBridge
+  DailyBackupLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt BackupLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyBackupRule.Arn
+
+  WeeklyBackupLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt BackupLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WeeklyBackupRule.Arn
+
+  # CloudWatch Alarms for Comprehensive Monitoring
+  BackupFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-backup-failure-${Environment}'
+      AlarmDescription: 'Alert when backup operations fail'
+      MetricName: BackupSuccess
+      Namespace: BackupStrategy
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref BackupNotificationTopic
+      OKActions:
+        - !Ref BackupNotificationTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  BackupDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-backup-duration-${Environment}'
+      AlarmDescription: 'Alert when backup operations take too long'
+      MetricName: BackupDuration
+      Namespace: BackupStrategy
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 600
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref BackupNotificationTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Additional CloudWatch Alarms for Enhanced Monitoring
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors-${Environment}'
+      AlarmDescription: 'Alert when Lambda function encounters errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref BackupLambdaFunction
+      AlarmActions:
+        - !Ref BackupNotificationTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  LambdaThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-throttles-${Environment}'
+      AlarmDescription: 'Alert when Lambda function is throttled'
+      MetricName: Throttles
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref BackupLambdaFunction
+      AlarmActions:
+        - !Ref BackupNotificationTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  S3BucketSizeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-s3-bucket-size-${Environment}'
+      AlarmDescription: 'Alert when S3 bucket size exceeds threshold'
+      MetricName: BucketSizeBytes
+      Namespace: AWS/S3
+      Statistic: Average
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 107374182400  # 100 GB in bytes
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: BucketName
+          Value: !Ref BackupBucket
+        - Name: StorageType
+          Value: StandardStorage
+      AlarmActions:
+        - !Ref BackupNotificationTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Enhanced CloudWatch Dashboard for Comprehensive Monitoring
+  BackupDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-backup-strategy-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["BackupStrategy", "BackupSuccess", "BackupType", "incremental"],
+                  [".", ".", ".", "full"],
+                  [".", ".", ".", "validation"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Backup Success Rate",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["BackupStrategy", "BackupDuration", "BackupType", "incremental"],
+                  [".", ".", ".", "full"],
+                  [".", ".", ".", "validation"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Backup Duration (Seconds)",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["BackupStrategy", "ObjectsBackedUp", "BackupType", "incremental"],
+                  [".", ".", ".", "full"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Objects Backed Up",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/S3", "BucketSizeBytes", "BucketName", "${BackupBucket}", "StorageType", "StandardStorage"],
+                  ["...", "StandardIAStorage"],
+                  ["...", "GlacierStorage"],
+                  ["...", "DeepArchiveStorage"]
+                ],
+                "period": 86400,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Storage Distribution by Class",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${BackupLambdaFunction}"],
+                  [".", "Errors", ".", "."],
+                  [".", "Throttles", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Performance",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 12,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${BackupLogGroup}'\n| fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Backup Errors",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # Cross-Region Replication Resources (Conditional)
+  DRBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateCrossRegionReplication
+    Properties:
+      BucketName: !Sub '${ProjectName}-dr-backup-${Environment}-${RandomId.RandomId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DRBackupLifecycleRule
+            Status: Enabled
+            Transitions:
+              - Days: !Ref TransitionToIADays
+                StorageClass: STANDARD_IA
+              - Days: !Ref TransitionToGlacierDays
+                StorageClass: GLACIER
+              - Days: !Ref TransitionToDeepArchiveDays
+                StorageClass: DEEP_ARCHIVE
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: DisasterRecovery
+
+  CrossRegionReplicationRole:
+    Type: AWS::IAM::Role
+    Condition: CreateCrossRegionReplication
+    Properties:
+      RoleName: !Sub '${ProjectName}-replication-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReplicationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObjectVersionForReplication
+                  - s3:GetObjectVersionAcl
+                Resource: !Sub '${BackupBucket}/*'
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt BackupBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:ReplicateObject
+                  - s3:ReplicateDelete
+                Resource: !Sub '${DRBucket}/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Cross-Region Replication Configuration
+  BackupBucketReplication:
+    Type: AWS::S3::Bucket
+    Condition: CreateCrossRegionReplication
+    Properties:
+      BucketName: !Ref BackupBucket
+      ReplicationConfiguration:
+        Role: !GetAtt CrossRegionReplicationRole.Arn
+        Rules:
+          - Id: backup-replication-rule
+            Status: Enabled
+            Priority: 1
+            Filter:
+              Prefix: backups/
+            Destination:
+              Bucket: !Sub 'arn:aws:s3:::${DRBucket}'
+              StorageClass: STANDARD_IA
+              ReplicationTime:
+                Status: Enabled
+                Time:
+                  Minutes: 15
+              Metrics:
+                Status: Enabled
+                EventThreshold:
+                  Minutes: 15
+    DependsOn:
+      - BackupBucket
+      - CrossRegionReplicationRole
+
+Outputs:
+  # Bucket Information
+  BackupBucketName:
+    Description: 'Name of the primary backup S3 bucket'
+    Value: !Ref BackupBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupBucket'
+
+  BackupBucketArn:
+    Description: 'ARN of the primary backup S3 bucket'
+    Value: !GetAtt BackupBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupBucketArn'
+
+  AccessLogBucketName:
+    Description: 'Name of the access log S3 bucket'
+    Value: !Ref AccessLogBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AccessLogBucket'
+
+  # Lambda Function Information
+  BackupLambdaFunctionName:
+    Description: 'Name of the backup orchestration Lambda function'
+    Value: !Ref BackupLambdaFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupLambdaFunction'
+
+  BackupLambdaFunctionArn:
+    Description: 'ARN of the backup orchestration Lambda function'
+    Value: !GetAtt BackupLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupLambdaFunctionArn'
+
+  # SNS Information
+  BackupNotificationTopicArn:
+    Description: 'ARN of the backup notification SNS topic'
+    Value: !Ref BackupNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupNotificationTopic'
+
+  # EventBridge Rules
+  DailyBackupRuleName:
+    Description: 'Name of the daily backup EventBridge rule'
+    Value: !Ref DailyBackupRule
+    Export:
+      Name: !Sub '${AWS::StackName}-DailyBackupRule'
+
+  WeeklyBackupRuleName:
+    Description: 'Name of the weekly backup EventBridge rule'
+    Value: !Ref WeeklyBackupRule
+    Export:
+      Name: !Sub '${AWS::StackName}-WeeklyBackupRule'
+
+  # CloudWatch Resources
+  BackupLogGroupName:
+    Description: 'Name of the backup CloudWatch log group'
+    Value: !Ref BackupLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupLogGroup'
+
+  BackupDashboardURL:
+    Description: 'URL to the backup strategy CloudWatch dashboard'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${BackupDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupDashboardURL'
+
+  # KMS Information
+  BackupLogGroupKMSKeyId:
+    Description: 'KMS Key ID for CloudWatch logs encryption'
+    Value: !Ref BackupLogGroupKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupLogGroupKMSKey'
+
+  BackupLogGroupKMSKeyAlias:
+    Description: 'KMS Key Alias for CloudWatch logs encryption'
+    Value: !Ref BackupLogGroupKMSKeyAlias
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupLogGroupKMSKeyAlias'
+
+  # IAM Roles
+  BackupLambdaRoleArn:
+    Description: 'ARN of the backup Lambda execution role'
+    Value: !GetAtt BackupLambdaRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupLambdaRole'
+
+  # Cross-Region Replication (Conditional)
+  DRBucketName:
+    Condition: CreateCrossRegionReplication
+    Description: 'Name of the disaster recovery S3 bucket'
+    Value: !Ref DRBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DRBucket'
+
+  DRBucketArn:
+    Condition: CreateCrossRegionReplication
+    Description: 'ARN of the disaster recovery S3 bucket'
+    Value: !GetAtt DRBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DRBucketArn'
+
+  CrossRegionReplicationRoleArn:
+    Condition: CreateCrossRegionReplication
+    Description: 'ARN of the cross-region replication role'
+    Value: !GetAtt CrossRegionReplicationRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CrossRegionReplicationRole'
+
+  # Testing and Validation Commands
+  TestBackupCommand:
+    Description: 'AWS CLI command to test the backup function'
+    Value: !Sub |
+      aws lambda invoke --function-name ${BackupLambdaFunction} --payload '{"backup_type":"validation","source_prefix":"test/"}' response.json
+
+  ViewDashboardCommand:
+    Description: 'Command to open the CloudWatch dashboard'
+    Value: !Sub |
+      aws cloudwatch get-dashboard --dashboard-name ${BackupDashboard}
+
+  # Cost Estimation
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for basic usage (excludes data transfer and storage)'
+    Value: '$5-15 USD (varies by data volume and access patterns)'
+
+  # Security Information
+  SecurityFeatures:
+    Description: 'Implemented security features'
+    Value: 'S3 encryption, versioning, public access block, IAM least privilege, KMS log encryption, SNS encryption'
+
+  # Lifecycle Information
+  LifecyclePolicyDetails:
+    Description: 'Storage lifecycle transitions configured'
+    Value: !Sub 'Standard -> IA (${TransitionToIADays}d) -> Glacier (${TransitionToGlacierDays}d) -> Deep Archive (${TransitionToDeepArchiveDays}d)'
+
+  # S3 Console URLs
+  S3ConsoleURL:
+    Description: 'URL to view the backup bucket in the S3 console'
+    Value: !Sub 'https://s3.console.aws.amazon.com/s3/buckets/${BackupBucket}?region=${AWS::Region}&tab=objects'
+
+  DRS3ConsoleURL:
+    Condition: CreateCrossRegionReplication
+    Description: 'URL to view the DR bucket in the S3 console'
+    Value: !Sub 'https://s3.console.aws.amazon.com/s3/buckets/${DRBucket}?region=${DisasterRecoveryRegion}&tab=objects'
+
+  # CloudWatch Console URLs
+  CloudWatchAlarmsURL:
+    Description: 'URL to view backup monitoring alarms'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#alarmsV2:search=${ProjectName}-backup'
+
+  CloudWatchLogsURL:
+    Description: 'URL to view backup operation logs'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/${BackupLogGroup}'
+
+  # Lambda Console URL
+  LambdaConsoleURL:
+    Description: 'URL to view the backup Lambda function'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/lambda/home?region=${AWS::Region}#/functions/${BackupLambdaFunction}'
+
+  # EventBridge Console URL
+  EventBridgeConsoleURL:
+    Description: 'URL to view backup schedules in EventBridge'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/events/home?region=${AWS::Region}#/rules'
+
+  # SNS Console URL
+  SNSConsoleURL:
+    Description: 'URL to view backup notification topic'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/sns/v3/home?region=${AWS::Region}#/topic/${BackupNotificationTopic}'
+
+  # Deployment Instructions
+  DeploymentInstructions:
+    Description: 'Step-by-step instructions for testing the backup system'
+    Value: !Sub |
+      1. Confirm email subscription for ${NotificationEmail}
+      2. Upload test files: aws s3 cp test-file.txt s3://${BackupBucket}/data/
+      3. Test backup: aws lambda invoke --function-name ${BackupLambdaFunction} --payload '{"backup_type":"test","source_prefix":"data/"}' response.json
+      4. Monitor dashboard: ${BackupDashboard}
+      5. Check lifecycle transitions in S3 console after ${TransitionToIADays} days
+      6. Validate cross-region replication (if enabled) in ${DisasterRecoveryRegion}
+
+  # Architecture Summary
+  ArchitectureSummary:
+    Description: 'Summary of deployed backup architecture components'
+    Value: !Sub |
+      S3 Backup: ${BackupBucket}
+      Lambda Orchestrator: ${BackupLambdaFunction}
+      Daily Schedule: ${DailyBackupSchedule}
+      Weekly Schedule: ${WeeklyBackupSchedule}
+      Monitoring: ${BackupDashboard}
+      Notifications: ${BackupNotificationTopic}
+      Encryption: AES256 + KMS for logs
+      Cross-Region DR: ${EnableCrossRegionReplication}

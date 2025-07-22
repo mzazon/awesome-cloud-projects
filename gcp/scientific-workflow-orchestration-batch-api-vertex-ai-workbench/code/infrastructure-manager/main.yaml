@@ -1,0 +1,577 @@
+# Google Cloud Infrastructure Manager Configuration
+# Scientific Workflow Orchestration with Cloud Batch API and Vertex AI Workbench
+#
+# This configuration deploys a complete scientific workflow orchestration system
+# for genomic data processing using Cloud Batch API for parallel processing and
+# Vertex AI Workbench for interactive machine learning analysis.
+#
+# Architecture Components:
+# - Cloud Storage bucket for genomic data storage
+# - BigQuery dataset and tables for genomic analytics
+# - Vertex AI Workbench instance for ML development
+# - Cloud Batch job configuration for parallel processing
+# - IAM service accounts and roles for secure operations
+
+imports:
+  - path: https://www.googleapis.com/compute/v1/projects/$(ref.project_id.value)/zones/$(ref.zone.value)/instances
+    name: compute_instance_template
+
+terraform:
+  source:
+    repo: "https://github.com/terraform-google-modules/terraform-google-project-factory"
+    path: "modules/core_project_factory"
+    dir: "terraform-google-modules/terraform-google-project-factory"
+
+resources:
+  # Project ID reference for resource naming
+  - name: project_id
+    type: gcp-types/cloudresourcemanager-v1:project
+    properties:
+      projectId: $(env.project_id)
+
+  # Random suffix for unique resource names
+  - name: random_suffix
+    type: gcp-types/cloudfunctions-v1:function
+    properties:
+      name: random-generator-$(env.deployment)
+      sourceArchiveUrl: gs://gcp-community/random-suffix.zip
+      httpsTrigger: {}
+      runtime: python39
+      entryPoint: generate_random
+
+  # Enable required APIs for the workflow
+  - name: enable_batch_api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/batch.googleapis.com
+      
+  - name: enable_notebooks_api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/notebooks.googleapis.com
+      
+  - name: enable_bigquery_api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/bigquery.googleapis.com
+      
+  - name: enable_storage_api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/storage.googleapis.com
+      
+  - name: enable_aiplatform_api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/aiplatform.googleapis.com
+
+  # IAM Service Account for Batch jobs
+  - name: batch_service_account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: genomics-batch-sa-$(ref.random_suffix.name)
+      serviceAccount:
+        displayName: Genomics Batch Processing Service Account
+        description: Service account for Cloud Batch genomic processing jobs
+    depends_on:
+      - enable_batch_api
+
+  # IAM Service Account for Vertex AI Workbench
+  - name: workbench_service_account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: genomics-workbench-sa-$(ref.random_suffix.name)
+      serviceAccount:
+        displayName: Genomics Workbench Service Account
+        description: Service account for Vertex AI Workbench instance
+    depends_on:
+      - enable_notebooks_api
+
+  # IAM Policy Bindings for Batch Service Account
+  - name: batch_sa_bigquery_dataeditor_binding
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: $(ref.project_id.projectId)
+      policy:
+        bindings:
+          - role: roles/bigquery.dataEditor
+            members:
+              - serviceAccount:$(ref.batch_service_account.email)
+          - role: roles/bigquery.jobUser
+            members:
+              - serviceAccount:$(ref.batch_service_account.email)
+          - role: roles/storage.objectViewer
+            members:
+              - serviceAccount:$(ref.batch_service_account.email)
+
+  # IAM Policy Bindings for Workbench Service Account
+  - name: workbench_sa_bindings
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: $(ref.project_id.projectId)
+      policy:
+        bindings:
+          - role: roles/bigquery.dataViewer
+            members:
+              - serviceAccount:$(ref.workbench_service_account.email)
+          - role: roles/bigquery.user
+            members:
+              - serviceAccount:$(ref.workbench_service_account.email)
+          - role: roles/storage.objectViewer
+            members:
+              - serviceAccount:$(ref.workbench_service_account.email)
+          - role: roles/aiplatform.user
+            members:
+              - serviceAccount:$(ref.workbench_service_account.email)
+
+  # Cloud Storage bucket for genomic data
+  - name: genomics_data_bucket
+    type: gcp-types/storage-v1:bucket
+    properties:
+      name: genomics-data-$(ref.random_suffix.name)
+      location: $(ref.region.value)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      encryption:
+        defaultKmsKeyName: ""
+      lifecycle:
+        rule:
+          - condition:
+              age: 90
+              matchesStorageClass:
+                - STANDARD
+            action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+          - condition:
+              age: 365
+              matchesStorageClass:
+                - NEARLINE
+            action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      labels:
+        environment: $(env.environment)
+        use-case: genomics-workflow
+        data-type: scientific
+    depends_on:
+      - enable_storage_api
+
+  # Cloud Storage bucket objects for directory structure
+  - name: raw_data_folder
+    type: gcp-types/storage-v1:object
+    properties:
+      bucket: $(ref.genomics_data_bucket.name)
+      name: raw-data/.keep
+      contentType: text/plain
+
+  - name: processed_data_folder
+    type: gcp-types/storage-v1:object
+    properties:
+      bucket: $(ref.genomics_data_bucket.name)
+      name: processed-data/.keep
+      contentType: text/plain
+
+  - name: results_folder
+    type: gcp-types/storage-v1:object
+    properties:
+      bucket: $(ref.genomics_data_bucket.name)
+      name: results/.keep
+      contentType: text/plain
+
+  - name: scripts_folder
+    type: gcp-types/storage-v1:object
+    properties:
+      bucket: $(ref.genomics_data_bucket.name)
+      name: scripts/.keep
+      contentType: text/plain
+
+  - name: notebooks_folder
+    type: gcp-types/storage-v1:object
+    properties:
+      bucket: $(ref.genomics_data_bucket.name)
+      name: notebooks/.keep
+      contentType: text/plain
+
+  # BigQuery dataset for genomic analytics
+  - name: genomics_bigquery_dataset
+    type: gcp-types/bigquery-v2:dataset
+    properties:
+      datasetId: genomics_analysis_$(ref.random_suffix.name)
+      location: $(ref.region.value)
+      description: Genomic analysis dataset for variant calling and machine learning
+      defaultTableExpirationMs: null  # No automatic expiration
+      access:
+        - role: OWNER
+          userByEmail: $(env.user_email)
+        - role: READER
+          serviceAccount: $(ref.workbench_service_account.email)
+        - role: WRITER
+          serviceAccount: $(ref.batch_service_account.email)
+      labels:
+        environment: $(env.environment)
+        use-case: genomics-analytics
+        data-type: genomic-variants
+    depends_on:
+      - enable_bigquery_api
+
+  # BigQuery table for variant calls
+  - name: variant_calls_table
+    type: gcp-types/bigquery-v2:table
+    properties:
+      datasetId: $(ref.genomics_bigquery_dataset.datasetId)
+      tableId: variant_calls
+      description: Table storing genomic variant call data from processing pipeline
+      schema:
+        fields:
+          - name: chromosome
+            type: STRING
+            mode: REQUIRED
+            description: Chromosome identifier (e.g., chr1, chr2, chrX)
+          - name: position
+            type: INTEGER
+            mode: REQUIRED
+            description: Genomic position of the variant
+          - name: reference
+            type: STRING
+            mode: REQUIRED
+            description: Reference allele sequence
+          - name: alternate
+            type: STRING
+            mode: REQUIRED
+            description: Alternate allele sequence
+          - name: quality
+            type: FLOAT
+            mode: NULLABLE
+            description: Variant quality score
+          - name: filter
+            type: STRING
+            mode: NULLABLE
+            description: Filter status (PASS, FAIL, etc.)
+          - name: info
+            type: STRING
+            mode: NULLABLE
+            description: Additional variant information
+          - name: sample_id
+            type: STRING
+            mode: REQUIRED
+            description: Sample identifier
+          - name: genotype
+            type: STRING
+            mode: NULLABLE
+            description: Genotype call (0/0, 0/1, 1/1)
+          - name: depth
+            type: INTEGER
+            mode: NULLABLE
+            description: Read depth at variant position
+          - name: allele_frequency
+            type: FLOAT
+            mode: NULLABLE
+            description: Allele frequency in sample
+      labels:
+        table-type: variant-data
+        data-source: genomic-pipeline
+
+  # BigQuery table for analysis results
+  - name: analysis_results_table
+    type: gcp-types/bigquery-v2:table
+    properties:
+      datasetId: $(ref.genomics_bigquery_dataset.datasetId)
+      tableId: analysis_results
+      description: Table storing machine learning analysis results and drug discovery insights
+      schema:
+        fields:
+          - name: sample_id
+            type: STRING
+            mode: REQUIRED
+            description: Sample identifier
+          - name: variant_id
+            type: STRING
+            mode: REQUIRED
+            description: Unique variant identifier (chr:pos:ref>alt)
+          - name: gene
+            type: STRING
+            mode: NULLABLE
+            description: Gene symbol affected by variant
+          - name: effect
+            type: STRING
+            mode: NULLABLE
+            description: Predicted variant effect (missense, nonsense, etc.)
+          - name: clinical_significance
+            type: STRING
+            mode: NULLABLE
+            description: Clinical significance classification
+          - name: drug_response
+            type: STRING
+            mode: NULLABLE
+            description: Predicted drug response
+          - name: confidence_score
+            type: FLOAT
+            mode: NULLABLE
+            description: Machine learning confidence score
+          - name: analysis_timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: Timestamp of analysis completion
+      labels:
+        table-type: analysis-results
+        data-source: ml-pipeline
+
+  # Vertex AI Workbench Instance
+  - name: genomics_workbench_instance
+    type: gcp-types/notebooks-v1:projects.locations.instances
+    properties:
+      parent: projects/$(ref.project_id.projectId)/locations/$(ref.zone.value)
+      instanceId: genomics-workbench-$(ref.random_suffix.name)
+      instance:
+        machineType: projects/$(ref.project_id.projectId)/zones/$(ref.zone.value)/machineTypes/n1-standard-4
+        vmImage:
+          project: deeplearning-platform-release
+          imageFamily: tf-2-11-cu113-notebooks
+        serviceAccount: $(ref.workbench_service_account.email)
+        serviceAccountScopes:
+          - https://www.googleapis.com/auth/cloud-platform
+        bootDiskType: PD_STANDARD
+        bootDiskSizeGb: 100
+        dataDiskType: PD_SSD
+        dataDiskSizeGb: 200
+        noPublicIp: false
+        noProxyAccess: false
+        network: projects/$(ref.project_id.projectId)/global/networks/default
+        subnet: projects/$(ref.project_id.projectId)/regions/$(ref.region.value)/subnetworks/default
+        installGpuDriver: true
+        customGpuDriverPath: ""
+        metadata:
+          bigquery-dataset: $(ref.genomics_bigquery_dataset.datasetId)
+          storage-bucket: $(ref.genomics_data_bucket.name)
+          framework: tensorflow
+          version: "2.11"
+          install-nvidia-driver: "True"
+        labels:
+          environment: $(env.environment)
+          use-case: genomics-ml
+          instance-type: workbench
+        tags:
+          items:
+            - genomics-workbench
+            - ml-research
+    depends_on:
+      - enable_notebooks_api
+      - workbench_service_account
+      - genomics_bigquery_dataset
+      - genomics_data_bucket
+
+  # Cloud Batch Job Template Configuration
+  - name: genomics_batch_job_template
+    type: gcp-types/batch-v1:projects.locations.jobs
+    properties:
+      parent: projects/$(ref.project_id.projectId)/locations/$(ref.region.value)
+      jobId: genomics-processing-template-$(ref.random_suffix.name)
+      job:
+        taskGroups:
+          - taskSpec:
+              runnables:
+                - container:
+                    imageUri: gcr.io/google.com/cloudsdktool/cloud-sdk:latest
+                    commands:
+                      - /bin/bash
+                      - -c
+                      - |
+                        # Install required Python packages
+                        pip install google-cloud-bigquery google-cloud-storage pandas numpy
+                        
+                        # Download processing script from Cloud Storage
+                        gsutil cp gs://$(ref.genomics_data_bucket.name)/scripts/genomic_pipeline.py .
+                        
+                        # Execute genomic processing pipeline
+                        python3 genomic_pipeline.py
+                    volumes:
+                      - /mnt/disks/share:/mnt/disks/share
+              computeResource:
+                cpuMilli: 2000
+                memoryMib: 4096
+                bootDiskMib: 10240
+              maxRetryCount: 3
+              maxRunDuration: 3600s
+              environment:
+                variables:
+                  DATASET_NAME: $(ref.genomics_bigquery_dataset.datasetId)
+                  BUCKET_NAME: $(ref.genomics_data_bucket.name)
+                  PROJECT_ID: $(ref.project_id.projectId)
+                  GOOGLE_APPLICATION_CREDENTIALS: /etc/service-account/key.json
+              volumes:
+                - gcs:
+                    remotePath: $(ref.genomics_data_bucket.name)/scripts
+                  mountPath: /mnt/disks/share
+            taskCount: 5
+            parallelism: 3
+            taskCountPerNode: 1
+        allocationPolicy:
+          instances:
+            - instanceTemplate:
+                machineType: e2-standard-2
+                provisioningModel: STANDARD
+                accelerators: []
+              policy:
+                machineType: e2-standard-2
+                minCpuPlatform: ""
+                provisioningModel: STANDARD
+          location:
+            allowedLocations:
+              - zones/$(ref.zone.value)
+          serviceAccount:
+            email: $(ref.batch_service_account.email)
+            scopes:
+              - https://www.googleapis.com/auth/cloud-platform
+        logsPolicy:
+          destination: CLOUD_LOGGING
+        labels:
+          environment: $(env.environment)
+          use-case: genomics-batch-processing
+          job-type: variant-calling
+    depends_on:
+      - enable_batch_api
+      - batch_service_account
+      - genomics_bigquery_dataset
+      - genomics_data_bucket
+
+  # Firewall rule for Workbench access
+  - name: workbench_firewall_rule
+    type: gcp-types/compute-v1:firewall
+    properties:
+      name: allow-workbench-access-$(ref.random_suffix.name)
+      description: Allow access to Vertex AI Workbench instance
+      network: projects/$(ref.project_id.projectId)/global/networks/default
+      direction: INGRESS
+      priority: 1000
+      sourceRanges:
+        - 0.0.0.0/0
+      targetTags:
+        - genomics-workbench
+      allowed:
+        - IPProtocol: tcp
+          ports:
+            - "8080"
+            - "8888"
+            - "443"
+
+  # Cloud Storage IAM bindings for service accounts
+  - name: storage_iam_binding
+    type: gcp-types/storage-v1:bucket.setIamPolicy
+    properties:
+      bucket: $(ref.genomics_data_bucket.name)
+      policy:
+        bindings:
+          - role: roles/storage.objectAdmin
+            members:
+              - serviceAccount:$(ref.batch_service_account.email)
+          - role: roles/storage.objectViewer
+            members:
+              - serviceAccount:$(ref.workbench_service_account.email)
+
+# Output values for reference and validation
+outputs:
+  - name: project_id
+    value: $(ref.project_id.projectId)
+    
+  - name: region
+    value: $(ref.region.value)
+    
+  - name: zone
+    value: $(ref.zone.value)
+    
+  - name: genomics_bucket_name
+    value: $(ref.genomics_data_bucket.name)
+    
+  - name: genomics_bucket_url
+    value: gs://$(ref.genomics_data_bucket.name)
+    
+  - name: bigquery_dataset_id
+    value: $(ref.genomics_bigquery_dataset.datasetId)
+    
+  - name: bigquery_dataset_location
+    value: $(ref.genomics_bigquery_dataset.location)
+    
+  - name: variant_calls_table_id
+    value: $(ref.variant_calls_table.tableId)
+    
+  - name: analysis_results_table_id
+    value: $(ref.analysis_results_table.tableId)
+    
+  - name: workbench_instance_name
+    value: $(ref.genomics_workbench_instance.name)
+    
+  - name: workbench_access_url
+    value: https://console.cloud.google.com/ai-platform/notebooks/instances?project=$(ref.project_id.projectId)
+    
+  - name: batch_service_account_email
+    value: $(ref.batch_service_account.email)
+    
+  - name: workbench_service_account_email
+    value: $(ref.workbench_service_account.email)
+    
+  - name: batch_job_template_name
+    value: $(ref.genomics_batch_job_template.name)
+
+# Input parameters for customization
+parameters:
+  - name: region
+    type: string
+    default: us-central1
+    description: Google Cloud region for resource deployment
+    
+  - name: zone
+    type: string
+    default: us-central1-a
+    description: Google Cloud zone for compute resources
+    
+  - name: environment
+    type: string
+    default: development
+    description: Environment label for resources (development, staging, production)
+    
+  - name: user_email
+    type: string
+    description: Email address of the user who will own the BigQuery dataset
+    required: true
+
+# Metadata for Infrastructure Manager
+metadata:
+  version: "1.0"
+  description: "Scientific Workflow Orchestration infrastructure for genomic data processing"
+  author: "Google Cloud Infrastructure Manager"
+  created: "2025-07-12"
+  use_case: "genomics-workflow-orchestration"
+  services:
+    - Cloud Batch
+    - Vertex AI Workbench
+    - Cloud Storage
+    - BigQuery
+  estimated_cost: "$150-300 per complete workflow execution"
+  estimated_deployment_time: "15-20 minutes"
+  complexity: "Advanced (400-level)"
+  
+# Resource dependencies and ordering
+dependencies:
+  # API enablement must come first
+  - enable_batch_api
+  - enable_notebooks_api
+  - enable_bigquery_api
+  - enable_storage_api
+  - enable_aiplatform_api
+  
+  # Service accounts after API enablement
+  - batch_service_account
+  - workbench_service_account
+  
+  # Storage and data infrastructure
+  - genomics_data_bucket
+  - genomics_bigquery_dataset
+  
+  # Compute resources last
+  - genomics_workbench_instance
+  - genomics_batch_job_template

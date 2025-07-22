@@ -1,0 +1,546 @@
+# Infrastructure Manager Configuration for Sustainable Infrastructure Intelligence
+# This configuration deploys a complete sustainability monitoring system using
+# Google Cloud Carbon Footprint API, Smart Analytics Hub, and intelligent automation
+
+# Global metadata for the deployment
+metadata:
+  name: sustainable-infrastructure-intelligence
+  description: "Automated carbon footprint monitoring and optimization system"
+  labels:
+    category: analytics
+    purpose: sustainability
+    complexity: intermediate
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID for deployment"
+    required: true
+  
+  region:
+    type: string
+    description: "Primary region for resource deployment"
+    default: "us-central1"
+    validation:
+      # Prefer carbon-neutral regions
+      pattern: "^(us-central1|europe-west1|europe-west4|us-west1)$"
+  
+  billing_account_id:
+    type: string
+    description: "Billing account ID for carbon footprint data export"
+    required: true
+  
+  environment:
+    type: string
+    description: "Environment designation (dev, staging, prod)"
+    default: "dev"
+    validation:
+      pattern: "^(dev|staging|prod)$"
+  
+  alert_threshold_percentage:
+    type: number
+    description: "Percentage threshold for carbon emission alerts"
+    default: 20
+    validation:
+      minimum: 5
+      maximum: 100
+
+# Enable required Google Cloud APIs
+resources:
+  # API Services Enablement
+  - name: required-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      - name: projects/${var.project_id}/services/bigquery.googleapis.com
+      - name: projects/${var.project_id}/services/cloudfunctions.googleapis.com
+      - name: projects/${var.project_id}/services/bigquerydatatransfer.googleapis.com
+      - name: projects/${var.project_id}/services/pubsub.googleapis.com
+      - name: projects/${var.project_id}/services/storage.googleapis.com
+      - name: projects/${var.project_id}/services/cloudscheduler.googleapis.com
+      - name: projects/${var.project_id}/services/analyticsdata.googleapis.com
+    metadata:
+      dependsOn:
+        - project-setup
+
+  # BigQuery Dataset for Carbon Intelligence
+  - name: carbon-intelligence-dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      datasetId: carbon_intelligence
+      projectId: ${var.project_id}
+      location: ${var.region}
+      description: "Carbon footprint intelligence and analytics dataset"
+      labels:
+        environment: ${var.environment}
+        purpose: sustainability
+        data_type: carbon_footprint
+      access:
+        - role: OWNER
+          userByEmail: ${terraform.service_account.email}
+        - role: READER
+          specialGroup: projectReaders
+        - role: WRITER
+          specialGroup: projectWriters
+      datasetReference:
+        datasetId: carbon_intelligence
+        projectId: ${var.project_id}
+    metadata:
+      dependsOn:
+        - required-apis
+
+  # Carbon Footprint Data Transfer Configuration
+  - name: carbon-footprint-transfer
+    type: gcp-types/bigquerydatatransfer-v1:projects.locations.transferConfigs
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      transferConfig:
+        displayName: "Carbon Footprint Export"
+        dataSourceId: "61cede5a-0000-2440-ad42-883d24f8f7b8"
+        destinationDatasetId: carbon_intelligence
+        schedule: "every month 15th 06:00"
+        params:
+          billing_accounts: ${var.billing_account_id}
+        emailPreferences:
+          enableFailureEmail: true
+        notificationPubsubTopic: projects/${var.project_id}/topics/carbon-alerts
+    metadata:
+      dependsOn:
+        - carbon-intelligence-dataset
+        - carbon-alerts-topic
+
+  # Cloud Storage Bucket for Reports and Recommendations
+  - name: carbon-reports-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: carbon-reports-${var.project_id}-${random_id.bucket_suffix.hex}
+      project: ${var.project_id}
+      location: ${var.region}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycleRule:
+        - condition:
+            age: 90
+          action:
+            type: SetStorageClass
+            storageClass: NEARLINE
+        - condition:
+            age: 365
+          action:
+            type: SetStorageClass
+            storageClass: COLDLINE
+      labels:
+        environment: ${var.environment}
+        purpose: sustainability_reports
+      uniformBucketLevelAccess:
+        enabled: true
+      publicAccessPrevention: enforced
+    metadata:
+      dependsOn:
+        - required-apis
+
+  # Random ID for unique resource naming
+  - name: bucket-suffix
+    type: random_id
+    properties:
+      byte_length: 4
+
+  # Pub/Sub Topic for Carbon Emission Alerts
+  - name: carbon-alerts-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/${var.project_id}/topics/carbon-alerts
+      labels:
+        environment: ${var.environment}
+        purpose: carbon_alerts
+      messageRetentionDuration: "604800s"  # 7 days
+    metadata:
+      dependsOn:
+        - required-apis
+
+  # Pub/Sub Subscription for Alert Processing
+  - name: carbon-alerts-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/${var.project_id}/subscriptions/carbon-alerts-sub
+      topic: ${carbon-alerts-topic.name}
+      ackDeadlineSeconds: 60
+      messageRetentionDuration: "604800s"
+      retryPolicy:
+        minimumBackoff: "10s"
+        maximumBackoff: "600s"
+      deadLetterPolicy:
+        deadLetterTopic: projects/${var.project_id}/topics/carbon-alerts-dlq
+        maxDeliveryAttempts: 5
+    metadata:
+      dependsOn:
+        - carbon-alerts-topic
+
+  # Service Account for Cloud Functions
+  - name: carbon-functions-sa
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: carbon-functions-sa
+      projectId: ${var.project_id}
+      serviceAccount:
+        displayName: "Carbon Functions Service Account"
+        description: "Service account for carbon footprint processing functions"
+    metadata:
+      dependsOn:
+        - required-apis
+
+  # IAM Bindings for Function Service Account
+  - name: function-sa-bigquery-permissions
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/${var.project_id}
+      role: roles/bigquery.dataViewer
+      member: serviceAccount:${carbon-functions-sa.email}
+    metadata:
+      dependsOn:
+        - carbon-functions-sa
+
+  - name: function-sa-bigquery-job-permissions
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/${var.project_id}
+      role: roles/bigquery.jobUser
+      member: serviceAccount:${carbon-functions-sa.email}
+    metadata:
+      dependsOn:
+        - carbon-functions-sa
+
+  - name: function-sa-pubsub-permissions
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/${var.project_id}
+      role: roles/pubsub.publisher
+      member: serviceAccount:${carbon-functions-sa.email}
+    metadata:
+      dependsOn:
+        - carbon-functions-sa
+
+  - name: function-sa-storage-permissions
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/${var.project_id}
+      role: roles/storage.objectAdmin
+      member: serviceAccount:${carbon-functions-sa.email}
+    metadata:
+      dependsOn:
+        - carbon-functions-sa
+
+  # Cloud Function for Carbon Data Processing
+  - name: carbon-data-processor
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/${var.project_id}/locations/${var.region}
+      function:
+        name: projects/${var.project_id}/locations/${var.region}/functions/carbon-processor
+        description: "Processes carbon footprint data and generates insights"
+        sourceArchiveUrl: gs://gcf-sources-${var.project_id}/carbon-processor.zip
+        entryPoint: process_carbon_data
+        runtime: python39
+        timeout: 60s
+        availableMemoryMb: 256
+        maxInstances: 10
+        serviceAccountEmail: ${carbon-functions-sa.email}
+        environmentVariables:
+          DATASET_NAME: carbon_intelligence
+          TOPIC_NAME: carbon-alerts
+          PROJECT_ID: ${var.project_id}
+          ALERT_THRESHOLD: ${var.alert_threshold_percentage}
+        eventTrigger:
+          eventType: providers/cloud.pubsub/eventTypes/topic.publish
+          resource: projects/${var.project_id}/topics/carbon-alerts
+        labels:
+          environment: ${var.environment}
+          purpose: carbon_processing
+    metadata:
+      dependsOn:
+        - carbon-functions-sa
+        - carbon-alerts-topic
+        - carbon-intelligence-dataset
+
+  # Cloud Function for Recommendations Engine
+  - name: recommendations-engine
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/${var.project_id}/locations/${var.region}
+      function:
+        name: projects/${var.project_id}/locations/${var.region}/functions/recommendations-engine
+        description: "Generates sustainability recommendations based on carbon data analysis"
+        sourceArchiveUrl: gs://gcf-sources-${var.project_id}/recommendations-engine.zip
+        entryPoint: generate_recommendations
+        runtime: python39
+        timeout: 120s
+        availableMemoryMb: 512
+        maxInstances: 5
+        serviceAccountEmail: ${carbon-functions-sa.email}
+        environmentVariables:
+          DATASET_NAME: carbon_intelligence
+          BUCKET_NAME: ${carbon-reports-bucket.name}
+          PROJECT_ID: ${var.project_id}
+        httpsTrigger:
+          securityLevel: SECURE_ALWAYS
+        labels:
+          environment: ${var.environment}
+          purpose: recommendations
+    metadata:
+      dependsOn:
+        - carbon-functions-sa
+        - carbon-reports-bucket
+        - carbon-intelligence-dataset
+
+  # BigQuery Views for Analytics
+  - name: monthly-emissions-view
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: ${var.project_id}
+      datasetId: carbon_intelligence
+      tableId: monthly_emissions_trend
+      view:
+        query: |
+          SELECT 
+            month,
+            SUM(location_based_carbon_emissions_kgCO2e) as total_location_emissions,
+            SUM(market_based_carbon_emissions_kgCO2e) as total_market_emissions,
+            COUNT(DISTINCT project_id) as active_projects,
+            COUNT(DISTINCT service) as active_services,
+            AVG(location_based_carbon_emissions_kgCO2e) as avg_service_emissions
+          FROM `${var.project_id}.carbon_intelligence.carbon_footprint_dataset`
+          WHERE month >= DATE_SUB(CURRENT_DATE(), INTERVAL 12 MONTH)
+          GROUP BY month
+          ORDER BY month DESC
+        useLegacySql: false
+      description: "Monthly carbon emissions trends for dashboard visualization"
+      labels:
+        environment: ${var.environment}
+        view_type: analytical
+    metadata:
+      dependsOn:
+        - carbon-intelligence-dataset
+
+  - name: service-emissions-view
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: ${var.project_id}
+      datasetId: carbon_intelligence
+      tableId: service_emissions_analysis
+      view:
+        query: |
+          SELECT 
+            service,
+            region,
+            project_id,
+            AVG(location_based_carbon_emissions_kgCO2e) as avg_monthly_emissions,
+            MAX(location_based_carbon_emissions_kgCO2e) as peak_emissions,
+            MIN(location_based_carbon_emissions_kgCO2e) as min_emissions,
+            STDDEV(location_based_carbon_emissions_kgCO2e) as emissions_variability,
+            COUNT(*) as measurement_count,
+            CASE 
+              WHEN STDDEV(location_based_carbon_emissions_kgCO2e) > AVG(location_based_carbon_emissions_kgCO2e) * 0.5 THEN 'HIGH_VARIABILITY'
+              WHEN AVG(location_based_carbon_emissions_kgCO2e) > 100 THEN 'HIGH_EMISSIONS'
+              WHEN region NOT IN ('us-central1', 'europe-west1', 'europe-west4') THEN 'CARBON_INTENSIVE_REGION'
+              ELSE 'OPTIMIZED'
+            END as optimization_category
+          FROM `${var.project_id}.carbon_intelligence.carbon_footprint_dataset`
+          WHERE month >= DATE_SUB(CURRENT_DATE(), INTERVAL 12 MONTH)
+          GROUP BY service, region, project_id
+          HAVING avg_monthly_emissions > 0
+          ORDER BY avg_monthly_emissions DESC
+        useLegacySql: false
+      description: "Service-level emissions analysis for optimization recommendations"
+      labels:
+        environment: ${var.environment}
+        view_type: analytical
+    metadata:
+      dependsOn:
+        - carbon-intelligence-dataset
+
+  # Smart Analytics Hub Data Exchange
+  - name: sustainability-data-exchange
+    type: gcp-types/analyticshub-v1:projects.locations.dataExchanges
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      dataExchangeId: sustainability_exchange
+      dataExchange:
+        displayName: "Sustainability Analytics Exchange"
+        description: "Shared carbon footprint and sustainability metrics for organizational collaboration"
+        documentation: "Carbon footprint data and analytics following GHG Protocol standards"
+        icon: "https://www.gstatic.com/images/branding/product/2x/analytics_64dp.png"
+      labels:
+        environment: ${var.environment}
+        exchange_type: sustainability
+    metadata:
+      dependsOn:
+        - carbon-intelligence-dataset
+        - required-apis
+
+  # Analytics Hub Listing for Monthly Emissions
+  - name: monthly-emissions-listing
+    type: gcp-types/analyticshub-v1:projects.locations.dataExchanges.listings
+    properties:
+      parent: ${sustainability-data-exchange.name}
+      listingId: monthly_emissions_listing
+      listing:
+        displayName: "Monthly Carbon Emissions Trends"
+        description: "Monthly aggregated carbon emissions across projects and services with trend analysis"
+        documentation: "This dataset provides monthly carbon emissions data aggregated at the project and service level, enabling trend analysis and carbon footprint monitoring."
+        categories:
+          - CATEGORY_ANALYTICS
+          - CATEGORY_ENVIRONMENT
+        bigqueryDataset:
+          dataset: projects/${var.project_id}/datasets/carbon_intelligence/tables/monthly_emissions_trend
+        dataProvider:
+          name: "Sustainability Team"
+          primaryContact: "sustainability@company.com"
+      labels:
+        environment: ${var.environment}
+        data_type: carbon_trends
+    metadata:
+      dependsOn:
+        - sustainability-data-exchange
+        - monthly-emissions-view
+
+  # Service Account for Looker Studio Integration
+  - name: looker-studio-sa
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: looker-studio-sa
+      projectId: ${var.project_id}
+      serviceAccount:
+        displayName: "Looker Studio Service Account"
+        description: "Service account for Looker Studio dashboard access to carbon data"
+    metadata:
+      dependsOn:
+        - required-apis
+
+  # IAM Bindings for Looker Studio Service Account
+  - name: looker-sa-bigquery-viewer
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/${var.project_id}
+      role: roles/bigquery.dataViewer
+      member: serviceAccount:${looker-studio-sa.email}
+    metadata:
+      dependsOn:
+        - looker-studio-sa
+
+  - name: looker-sa-bigquery-job-user
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/${var.project_id}
+      role: roles/bigquery.jobUser
+      member: serviceAccount:${looker-studio-sa.email}
+    metadata:
+      dependsOn:
+        - looker-studio-sa
+
+  # Cloud Scheduler Jobs for Automated Processing
+  - name: weekly-recommendations-job
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      job:
+        name: projects/${var.project_id}/locations/${var.region}/jobs/recommendations-weekly
+        description: "Weekly generation of sustainability recommendations"
+        schedule: "0 9 * * 1"  # Every Monday at 9 AM
+        timeZone: "America/New_York"
+        httpTarget:
+          uri: https://${var.region}-${var.project_id}.cloudfunctions.net/recommendations-engine
+          httpMethod: POST
+          headers:
+            Content-Type: "application/json"
+          body: '{"trigger":"weekly_recommendations"}'
+          oidcToken:
+            serviceAccountEmail: ${carbon-functions-sa.email}
+        retryConfig:
+          retryCount: 3
+          maxRetryDuration: "600s"
+          minBackoffDuration: "5s"
+          maxBackoffDuration: "3600s"
+    metadata:
+      dependsOn:
+        - recommendations-engine
+        - carbon-functions-sa
+
+  - name: monthly-processing-job
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      job:
+        name: projects/${var.project_id}/locations/${var.region}/jobs/data-processing-monthly
+        description: "Monthly carbon data processing and analysis"
+        schedule: "0 6 15 * *"  # 15th of every month at 6 AM
+        timeZone: "America/New_York"
+        pubsubTarget:
+          topicName: projects/${var.project_id}/topics/carbon-alerts
+          data: '{"trigger":"monthly_processing","timestamp":"automated"}'
+        retryConfig:
+          retryCount: 3
+          maxRetryDuration: "1800s"
+    metadata:
+      dependsOn:
+        - carbon-data-processor
+        - carbon-alerts-topic
+
+# Outputs for integration and verification
+outputs:
+  - name: dataset_id
+    description: "BigQuery dataset ID for carbon intelligence data"
+    value: ${carbon-intelligence-dataset.datasetId}
+
+  - name: bucket_name
+    description: "Cloud Storage bucket name for sustainability reports"
+    value: ${carbon-reports-bucket.name}
+
+  - name: data_exchange_name
+    description: "Smart Analytics Hub data exchange name"
+    value: ${sustainability-data-exchange.name}
+
+  - name: pubsub_topic
+    description: "Pub/Sub topic for carbon emission alerts"
+    value: ${carbon-alerts-topic.name}
+
+  - name: carbon_processor_function
+    description: "Cloud Function name for carbon data processing"
+    value: ${carbon-data-processor.name}
+
+  - name: recommendations_function
+    description: "Cloud Function name for recommendations engine"
+    value: ${recommendations-engine.name}
+
+  - name: looker_studio_service_account
+    description: "Service account email for Looker Studio integration"
+    value: ${looker-studio-sa.email}
+
+  - name: monthly_emissions_view
+    description: "BigQuery view for monthly emissions trends"
+    value: "${var.project_id}.carbon_intelligence.monthly_emissions_trend"
+
+  - name: service_emissions_view
+    description: "BigQuery view for service-level emissions analysis"
+    value: "${var.project_id}.carbon_intelligence.service_emissions_analysis"
+
+  - name: data_transfer_config
+    description: "Carbon footprint data transfer configuration"
+    value: ${carbon-footprint-transfer.name}
+
+# Deployment configuration
+deployment:
+  preview: true
+  importExistingResources: true
+  parallelism: 5
+  quotaProject: ${var.project_id}
+  
+  # Deployment labels for tracking and management
+  labels:
+    recipe_name: sustainable-infrastructure-intelligence
+    infrastructure_type: analytics
+    carbon_footprint: enabled
+    smart_analytics: enabled
+    
+  # Worker pool configuration for deployment
+  workerPool: projects/${var.project_id}/locations/${var.region}/workerPools/default

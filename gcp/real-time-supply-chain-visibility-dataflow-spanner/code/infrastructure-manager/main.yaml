@@ -1,0 +1,501 @@
+# Infrastructure Manager Configuration for Real-Time Supply Chain Visibility
+# This configuration deploys Cloud Dataflow, Cloud Spanner, Pub/Sub, and BigQuery
+# for a comprehensive supply chain visibility platform
+
+# Variables for customization
+metadata:
+  name: "real-time-supply-chain-visibility"
+  description: "Real-time supply chain visibility platform with streaming analytics"
+  labels:
+    solution: "supply-chain-visibility"
+    environment: "production"
+    cost-center: "logistics"
+
+# Input variables
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    validation:
+      condition: "length(var.project_id) > 0"
+      error_message: "Project ID must be provided"
+  
+  region:
+    type: string
+    description: "Primary region for resources"
+    default: "us-central1"
+  
+  zone:
+    type: string
+    description: "Primary zone for resources"
+    default: "us-central1-a"
+  
+  environment:
+    type: string
+    description: "Environment name (dev, staging, prod)"
+    default: "prod"
+    validation:
+      condition: "contains(['dev', 'staging', 'prod'], var.environment)"
+      error_message: "Environment must be one of: dev, staging, prod"
+  
+  spanner_instance_config:
+    type: string
+    description: "Spanner instance configuration"
+    default: "regional-us-central1"
+  
+  spanner_node_count:
+    type: number
+    description: "Number of Spanner nodes"
+    default: 1
+    validation:
+      condition: "var.spanner_node_count >= 1 && var.spanner_node_count <= 10"
+      error_message: "Spanner node count must be between 1 and 10"
+  
+  dataflow_max_workers:
+    type: number
+    description: "Maximum number of Dataflow workers"
+    default: 5
+    validation:
+      condition: "var.dataflow_max_workers >= 1 && var.dataflow_max_workers <= 20"
+      error_message: "Dataflow max workers must be between 1 and 20"
+  
+  dataflow_num_workers:
+    type: number
+    description: "Initial number of Dataflow workers"
+    default: 2
+    validation:
+      condition: "var.dataflow_num_workers >= 1 && var.dataflow_num_workers <= var.dataflow_max_workers"
+      error_message: "Initial workers must be between 1 and max workers"
+
+# Resource definitions
+resources:
+  # Enable required APIs
+  - name: "dataflow-api"
+    type: "gcp-types/serviceusage-v1:projects.services"
+    properties:
+      name: "projects/${var.project_id}/services/dataflow.googleapis.com"
+      parent: "projects/${var.project_id}"
+    metadata:
+      dependsOn: []
+  
+  - name: "spanner-api"
+    type: "gcp-types/serviceusage-v1:projects.services"
+    properties:
+      name: "projects/${var.project_id}/services/spanner.googleapis.com"
+      parent: "projects/${var.project_id}"
+    metadata:
+      dependsOn: []
+  
+  - name: "pubsub-api"
+    type: "gcp-types/serviceusage-v1:projects.services"
+    properties:
+      name: "projects/${var.project_id}/services/pubsub.googleapis.com"
+      parent: "projects/${var.project_id}"
+    metadata:
+      dependsOn: []
+  
+  - name: "bigquery-api"
+    type: "gcp-types/serviceusage-v1:projects.services"
+    properties:
+      name: "projects/${var.project_id}/services/bigquery.googleapis.com"
+      parent: "projects/${var.project_id}"
+    metadata:
+      dependsOn: []
+  
+  - name: "storage-api"
+    type: "gcp-types/serviceusage-v1:projects.services"
+    properties:
+      name: "projects/${var.project_id}/services/storage.googleapis.com"
+      parent: "projects/${var.project_id}"
+    metadata:
+      dependsOn: []
+
+  # Cloud Storage bucket for Dataflow staging
+  - name: "dataflow-staging-bucket"
+    type: "gcp-types/storage-v1:buckets"
+    properties:
+      name: "supply-chain-dataflow-${var.environment}-${random_id.bucket_suffix.hex}"
+      project: "${var.project_id}"
+      location: "${var.region}"
+      storageClass: "STANDARD"
+      uniformBucketLevelAccess:
+        enabled: true
+      publicAccessPrevention: "enforced"
+      labels:
+        purpose: "dataflow-staging"
+        environment: "${var.environment}"
+        solution: "supply-chain-visibility"
+    metadata:
+      dependsOn: ["storage-api"]
+
+  # Random ID for unique naming
+  - name: "random_id"
+    type: "gcp-types/random-v1:id"
+    properties:
+      byte_length: 3
+
+  # Cloud Spanner Instance
+  - name: "supply-chain-spanner-instance"
+    type: "gcp-types/spanner-v1:projects.instances"
+    properties:
+      parent: "projects/${var.project_id}"
+      instanceId: "supply-chain-instance-${var.environment}"
+      instance:
+        name: "projects/${var.project_id}/instances/supply-chain-instance-${var.environment}"
+        displayName: "Supply Chain Visibility Database"
+        config: "projects/${var.project_id}/instanceConfigs/${var.spanner_instance_config}"
+        nodeCount: ${var.spanner_node_count}
+        labels:
+          purpose: "supply-chain-operations"
+          environment: "${var.environment}"
+          solution: "supply-chain-visibility"
+    metadata:
+      dependsOn: ["spanner-api"]
+
+  # Cloud Spanner Database
+  - name: "supply-chain-database"
+    type: "gcp-types/spanner-v1:projects.instances.databases"
+    properties:
+      parent: "projects/${var.project_id}/instances/supply-chain-instance-${var.environment}"
+      databaseId: "supply-chain-db"
+      database:
+        name: "projects/${var.project_id}/instances/supply-chain-instance-${var.environment}/databases/supply-chain-db"
+        labels:
+          purpose: "supply-chain-operations"
+          environment: "${var.environment}"
+    metadata:
+      dependsOn: ["supply-chain-spanner-instance"]
+
+  # Spanner Database Schema - Shipments Table
+  - name: "shipments-table"
+    type: "gcp-types/spanner-v1:projects.instances.databases.operations"
+    properties:
+      parent: "projects/${var.project_id}/instances/supply-chain-instance-${var.environment}/databases/supply-chain-db"
+      statements:
+        - |
+          CREATE TABLE Shipments (
+            ShipmentId STRING(50) NOT NULL,
+            OrderId STRING(50) NOT NULL,
+            CarrierId STRING(50),
+            TrackingNumber STRING(100),
+            Status STRING(20) NOT NULL,
+            OriginLocation STRING(100),
+            DestinationLocation STRING(100),
+            EstimatedDelivery TIMESTAMP,
+            ActualDelivery TIMESTAMP,
+            LastUpdated TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+            CreatedAt TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true)
+          ) PRIMARY KEY (ShipmentId)
+    metadata:
+      dependsOn: ["supply-chain-database"]
+
+  # Spanner Database Schema - Inventory Table
+  - name: "inventory-table"
+    type: "gcp-types/spanner-v1:projects.instances.databases.operations"
+    properties:
+      parent: "projects/${var.project_id}/instances/supply-chain-instance-${var.environment}/databases/supply-chain-db"
+      statements:
+        - |
+          CREATE TABLE Inventory (
+            ItemId STRING(50) NOT NULL,
+            LocationId STRING(50) NOT NULL,
+            Quantity INT64 NOT NULL,
+            AvailableQuantity INT64 NOT NULL,
+            ReservedQuantity INT64 NOT NULL,
+            LastUpdated TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true)
+          ) PRIMARY KEY (ItemId, LocationId)
+    metadata:
+      dependsOn: ["shipments-table"]
+
+  # Spanner Database Schema - Events Table
+  - name: "events-table"
+    type: "gcp-types/spanner-v1:projects.instances.databases.operations"
+    properties:
+      parent: "projects/${var.project_id}/instances/supply-chain-instance-${var.environment}/databases/supply-chain-db"
+      statements:
+        - |
+          CREATE TABLE Events (
+            EventId STRING(50) NOT NULL,
+            ShipmentId STRING(50),
+            EventType STRING(50) NOT NULL,
+            EventData JSON,
+            Location STRING(100),
+            Timestamp TIMESTAMP NOT NULL,
+            ProcessedAt TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true)
+          ) PRIMARY KEY (EventId)
+    metadata:
+      dependsOn: ["inventory-table"]
+
+  # Pub/Sub Topic for Logistics Events
+  - name: "logistics-events-topic"
+    type: "gcp-types/pubsub-v1:projects.topics"
+    properties:
+      name: "projects/${var.project_id}/topics/logistics-events-${var.environment}"
+      labels:
+        purpose: "event-ingestion"
+        environment: "${var.environment}"
+        solution: "supply-chain-visibility"
+      messageRetentionDuration: "604800s"  # 7 days
+      messageStoragePolicy:
+        allowedPersistenceRegions:
+          - "${var.region}"
+    metadata:
+      dependsOn: ["pubsub-api"]
+
+  # Pub/Sub Subscription for Dataflow
+  - name: "logistics-events-subscription"
+    type: "gcp-types/pubsub-v1:projects.subscriptions"
+    properties:
+      name: "projects/${var.project_id}/subscriptions/logistics-events-sub-${var.environment}"
+      topic: "projects/${var.project_id}/topics/logistics-events-${var.environment}"
+      ackDeadlineSeconds: 60
+      messageRetentionDuration: "604800s"  # 7 days
+      retryPolicy:
+        minimumBackoff: "10s"
+        maximumBackoff: "600s"
+      deadLetterPolicy:
+        maxDeliveryAttempts: 5
+      labels:
+        purpose: "dataflow-processing"
+        environment: "${var.environment}"
+        solution: "supply-chain-visibility"
+    metadata:
+      dependsOn: ["logistics-events-topic"]
+
+  # BigQuery Dataset for Analytics
+  - name: "supply-chain-analytics-dataset"
+    type: "gcp-types/bigquery-v2:datasets"
+    properties:
+      datasetId: "supply_chain_analytics_${var.environment}"
+      projectId: "${var.project_id}"
+      location: "${var.region}"
+      description: "Supply chain analytics and reporting dataset"
+      defaultTableExpirationMs: "7776000000"  # 90 days
+      labels:
+        purpose: "analytics"
+        environment: "${var.environment}"
+        solution: "supply-chain-visibility"
+      access:
+        - role: "OWNER"
+          userByEmail: "serviceAccount:${google_service_account.dataflow_sa.email}"
+        - role: "READER"
+          specialGroup: "projectReaders"
+        - role: "WRITER"
+          specialGroup: "projectWriters"
+    metadata:
+      dependsOn: ["bigquery-api"]
+
+  # BigQuery Table - Shipment Analytics
+  - name: "shipment-analytics-table"
+    type: "gcp-types/bigquery-v2:tables"
+    properties:
+      projectId: "${var.project_id}"
+      datasetId: "supply_chain_analytics_${var.environment}"
+      tableId: "shipment_analytics"
+      description: "Shipment analytics and performance metrics"
+      schema:
+        fields:
+          - name: "shipment_id"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Unique shipment identifier"
+          - name: "order_id"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Associated order identifier"
+          - name: "carrier_id"
+            type: "STRING"
+            mode: "NULLABLE"
+            description: "Shipping carrier identifier"
+          - name: "status"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Current shipment status"
+          - name: "origin"
+            type: "STRING"
+            mode: "NULLABLE"
+            description: "Origin location"
+          - name: "destination"
+            type: "STRING"
+            mode: "NULLABLE"
+            description: "Destination location"
+          - name: "estimated_delivery"
+            type: "TIMESTAMP"
+            mode: "NULLABLE"
+            description: "Estimated delivery timestamp"
+          - name: "actual_delivery"
+            type: "TIMESTAMP"
+            mode: "NULLABLE"
+            description: "Actual delivery timestamp"
+          - name: "transit_time_hours"
+            type: "FLOAT"
+            mode: "NULLABLE"
+            description: "Transit time in hours"
+          - name: "created_date"
+            type: "DATE"
+            mode: "REQUIRED"
+            description: "Date the shipment was created"
+      labels:
+        purpose: "shipment-analytics"
+        environment: "${var.environment}"
+    metadata:
+      dependsOn: ["supply-chain-analytics-dataset"]
+
+  # BigQuery Table - Event Analytics (Partitioned)
+  - name: "event-analytics-table"
+    type: "gcp-types/bigquery-v2:tables"
+    properties:
+      projectId: "${var.project_id}"
+      datasetId: "supply_chain_analytics_${var.environment}"
+      tableId: "event_analytics"
+      description: "Event analytics with time partitioning"
+      timePartitioning:
+        type: "DAY"
+        field: "event_timestamp"
+        requirePartitionFilter: true
+      schema:
+        fields:
+          - name: "event_id"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Unique event identifier"
+          - name: "shipment_id"
+            type: "STRING"
+            mode: "NULLABLE"
+            description: "Associated shipment identifier"
+          - name: "event_type"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Type of logistics event"
+          - name: "location"
+            type: "STRING"
+            mode: "NULLABLE"
+            description: "Event location"
+          - name: "event_timestamp"
+            type: "TIMESTAMP"
+            mode: "REQUIRED"
+            description: "Event timestamp"
+          - name: "processing_delay_seconds"
+            type: "FLOAT"
+            mode: "NULLABLE"
+            description: "Processing delay in seconds"
+      labels:
+        purpose: "event-analytics"
+        environment: "${var.environment}"
+    metadata:
+      dependsOn: ["shipment-analytics-table"]
+
+  # Service Account for Dataflow
+  - name: "dataflow-service-account"
+    type: "gcp-types/iam-v1:projects.serviceAccounts"
+    properties:
+      accountId: "dataflow-supply-chain-${var.environment}"
+      displayName: "Dataflow Supply Chain Service Account"
+      description: "Service account for Dataflow pipeline operations"
+      project: "${var.project_id}"
+    metadata:
+      dependsOn: []
+
+  # IAM bindings for Dataflow service account
+  - name: "dataflow-sa-spanner-user"
+    type: "gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding"
+    properties:
+      resource: "projects/${var.project_id}"
+      role: "roles/spanner.databaseUser"
+      member: "serviceAccount:${google_service_account.dataflow_sa.email}"
+    metadata:
+      dependsOn: ["dataflow-service-account"]
+
+  - name: "dataflow-sa-bigquery-editor"
+    type: "gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding"
+    properties:
+      resource: "projects/${var.project_id}"
+      role: "roles/bigquery.dataEditor"
+      member: "serviceAccount:${google_service_account.dataflow_sa.email}"
+    metadata:
+      dependsOn: ["dataflow-service-account"]
+
+  - name: "dataflow-sa-pubsub-subscriber"
+    type: "gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding"
+    properties:
+      resource: "projects/${var.project_id}"
+      role: "roles/pubsub.subscriber"
+      member: "serviceAccount:${google_service_account.dataflow_sa.email}"
+    metadata:
+      dependsOn: ["dataflow-service-account"]
+
+  - name: "dataflow-sa-dataflow-worker"
+    type: "gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding"
+    properties:
+      resource: "projects/${var.project_id}"
+      role: "roles/dataflow.worker"
+      member: "serviceAccount:${google_service_account.dataflow_sa.email}"
+    metadata:
+      dependsOn: ["dataflow-service-account"]
+
+  - name: "dataflow-sa-storage-admin"
+    type: "gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding"
+    properties:
+      resource: "projects/${var.project_id}"
+      role: "roles/storage.admin"
+      member: "serviceAccount:${google_service_account.dataflow_sa.email}"
+    metadata:
+      dependsOn: ["dataflow-service-account"]
+
+# Outputs for reference and integration
+outputs:
+  spanner_instance_id:
+    description: "Cloud Spanner instance ID"
+    value: "supply-chain-instance-${var.environment}"
+  
+  spanner_database_id:
+    description: "Cloud Spanner database ID"
+    value: "supply-chain-db"
+  
+  pubsub_topic_name:
+    description: "Pub/Sub topic name for logistics events"
+    value: "logistics-events-${var.environment}"
+  
+  pubsub_subscription_name:
+    description: "Pub/Sub subscription name for Dataflow"
+    value: "logistics-events-sub-${var.environment}"
+  
+  bigquery_dataset_id:
+    description: "BigQuery dataset ID for analytics"
+    value: "supply_chain_analytics_${var.environment}"
+  
+  dataflow_staging_bucket:
+    description: "Cloud Storage bucket for Dataflow staging"
+    value: "supply-chain-dataflow-${var.environment}-${random_id.bucket_suffix.hex}"
+  
+  dataflow_service_account_email:
+    description: "Service account email for Dataflow pipeline"
+    value: "${google_service_account.dataflow_sa.email}"
+  
+  spanner_connection_string:
+    description: "Cloud Spanner connection string"
+    value: "projects/${var.project_id}/instances/supply-chain-instance-${var.environment}/databases/supply-chain-db"
+  
+  pubsub_topic_path:
+    description: "Full Pub/Sub topic path"
+    value: "projects/${var.project_id}/topics/logistics-events-${var.environment}"
+  
+  pubsub_subscription_path:
+    description: "Full Pub/Sub subscription path"
+    value: "projects/${var.project_id}/subscriptions/logistics-events-sub-${var.environment}"
+  
+  bigquery_table_shipment_analytics:
+    description: "BigQuery shipment analytics table"
+    value: "${var.project_id}.supply_chain_analytics_${var.environment}.shipment_analytics"
+  
+  bigquery_table_event_analytics:
+    description: "BigQuery event analytics table"
+    value: "${var.project_id}.supply_chain_analytics_${var.environment}.event_analytics"
+  
+  region:
+    description: "Primary region for resources"
+    value: "${var.region}"
+  
+  environment:
+    description: "Environment name"
+    value: "${var.environment}"

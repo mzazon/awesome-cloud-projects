@@ -1,0 +1,1206 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Advanced Financial Analytics Dashboard with QuickSight and Cost Explorer - Creates a comprehensive data pipeline for cost analytics, visualization, and reporting'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+          - NotificationEmail
+      - Label:
+          default: "Data Collection Settings"
+        Parameters:
+          - DataRetentionDays
+          - CostDataGranularity
+          - EnableCostOptimizationRecommendations
+      - Label:
+          default: "QuickSight Configuration"
+        Parameters:
+          - QuickSightUserArn
+          - EnableQuickSightEmbedding
+      - Label:
+          default: "Security Settings"
+        Parameters:
+          - S3BucketEncryption
+          - EnableVPCEndpoints
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      NotificationEmail:
+        default: "Notification Email"
+      DataRetentionDays:
+        default: "Data Retention (Days)"
+      CostDataGranularity:
+        default: "Cost Data Granularity"
+      EnableCostOptimizationRecommendations:
+        default: "Enable Cost Optimization Recommendations"
+      QuickSightUserArn:
+        default: "QuickSight User ARN"
+      EnableQuickSightEmbedding:
+        default: "Enable QuickSight Embedding"
+      S3BucketEncryption:
+        default: "S3 Bucket Encryption"
+      EnableVPCEndpoints:
+        default: "Enable VPC Endpoints"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'financial-analytics'
+    Description: 'Name of the project used in resource naming'
+    AllowedPattern: '^[a-z][a-z0-9-]*$'
+    ConstraintDescription: 'Must start with lowercase letter and contain only lowercase letters, numbers, and hyphens'
+    MinLength: 3
+    MaxLength: 30
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - 'dev'
+      - 'test'
+      - 'staging'
+      - 'prod'
+    Description: 'Environment for resource tagging and naming'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for cost alerts and notifications'
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  DataRetentionDays:
+    Type: Number
+    Default: 90
+    MinValue: 30
+    MaxValue: 365
+    Description: 'Number of days to retain cost data in the analytics pipeline'
+
+  CostDataGranularity:
+    Type: String
+    Default: 'DAILY'
+    AllowedValues:
+      - 'DAILY'
+      - 'MONTHLY'
+    Description: 'Granularity for cost data collection (DAILY recommended for detailed analytics)'
+
+  EnableCostOptimizationRecommendations:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable collection of rightsizing and optimization recommendations'
+
+  QuickSightUserArn:
+    Type: String
+    Description: 'ARN of the QuickSight user who will own the data sources and datasets (e.g., arn:aws:quicksight:us-east-1:123456789012:user/default/admin/123456789012)'
+    AllowedPattern: '^arn:aws:quicksight:[a-z0-9-]+:[0-9]{12}:user/.*$'
+    ConstraintDescription: 'Must be a valid QuickSight user ARN'
+
+  EnableQuickSightEmbedding:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable QuickSight dashboard embedding for external applications'
+
+  S3BucketEncryption:
+    Type: String
+    Default: 'AES256'
+    AllowedValues:
+      - 'AES256'
+      - 'aws:kms'
+    Description: 'S3 bucket encryption method'
+
+  EnableVPCEndpoints:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Create VPC endpoints for enhanced security (requires existing VPC)'
+
+Conditions:
+  UseKMSEncryption: !Equals [!Ref S3BucketEncryption, 'aws:kms']
+  EnableOptimizationRecommendations: !Equals [!Ref EnableCostOptimizationRecommendations, 'true']
+  EnableEmbedding: !Equals [!Ref EnableQuickSightEmbedding, 'true']
+  CreateVPCEndpoints: !Equals [!Ref EnableVPCEndpoints, 'true']
+  IsProductionEnvironment: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # ==========================================
+  # S3 Buckets for Data Storage
+  # ==========================================
+  
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-raw-data-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [UseKMSEncryption, 'aws:kms', 'AES256']
+              KMSMasterKeyID: !If [UseKMSEncryption, !Ref DataEncryptionKey, !Ref 'AWS::NoValue']
+            BucketKeyEnabled: !If [UseKMSEncryption, true, !Ref 'AWS::NoValue']
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+            ExpirationInDays: !Ref DataRetentionDays
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt DataTransformerFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: 'raw-cost-data/'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-raw-data-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Cost Analytics Raw Data Storage'
+
+  ProcessedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-processed-data-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [UseKMSEncryption, 'aws:kms', 'AES256']
+              KMSMasterKeyID: !If [UseKMSEncryption, !Ref DataEncryptionKey, !Ref 'AWS::NoValue']
+            BucketKeyEnabled: !If [UseKMSEncryption, true, !Ref 'AWS::NoValue']
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+            ExpirationInDays: !Ref DataRetentionDays
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-processed-data-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Cost Analytics Processed Data Storage'
+
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-reports-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [UseKMSEncryption, 'aws:kms', 'AES256']
+              KMSMasterKeyID: !If [UseKMSEncryption, !Ref DataEncryptionKey, !Ref 'AWS::NoValue']
+            BucketKeyEnabled: !If [UseKMSEncryption, true, !Ref 'AWS::NoValue']
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+            ExpirationInDays: !Ref DataRetentionDays
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-reports-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Cost Analytics Reports Storage'
+
+  AnalyticsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-analytics-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [UseKMSEncryption, 'aws:kms', 'AES256']
+              KMSMasterKeyID: !If [UseKMSEncryption, !Ref DataEncryptionKey, !Ref 'AWS::NoValue']
+            BucketKeyEnabled: !If [UseKMSEncryption, true, !Ref 'AWS::NoValue']
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-analytics-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Athena Query Results and Analytics'
+
+  # ==========================================
+  # KMS Key for Encryption (Conditional)
+  # ==========================================
+  
+  DataEncryptionKey:
+    Type: AWS::KMS::Key
+    Condition: UseKMSEncryption
+    Properties:
+      Description: 'KMS key for financial analytics data encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM policies
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow Lambda functions
+            Effect: Allow
+            Principal:
+              AWS: 
+                - !GetAtt CostDataCollectorRole.Arn
+                - !GetAtt DataTransformerRole.Arn
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+            Resource: '*'
+          - Sid: Allow S3 service
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-data-encryption-key-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  DataEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: UseKMSEncryption
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-data-encryption-${Environment}'
+      TargetKeyId: !Ref DataEncryptionKey
+
+  # ==========================================
+  # IAM Roles and Policies
+  # ==========================================
+  
+  CostDataCollectorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-cost-collector-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CostExplorerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ce:GetCostAndUsage'
+                  - 'ce:GetUsageReport'
+                  - 'ce:GetRightsizingRecommendation'
+                  - 'ce:GetReservationCoverage'
+                  - 'ce:GetReservationPurchaseRecommendation'
+                  - 'ce:GetReservationUtilization'
+                  - 'ce:GetSavingsPlansUtilization'
+                  - 'ce:GetDimensionValues'
+                  - 'ce:ListCostCategoryDefinitions'
+                Resource: '*'
+        - PolicyName: OrganizationsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'organizations:ListAccounts'
+                  - 'organizations:DescribeOrganization'
+                  - 'organizations:ListOrganizationalUnitsForParent'
+                  - 'organizations:ListParents'
+                Resource: '*'
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                Resource:
+                  - !Sub '${RawDataBucket}/*'
+                  - !Sub '${ProcessedDataBucket}/*'
+                  - !Sub '${ReportsBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                Resource:
+                  - !Ref RawDataBucket
+                  - !Ref ProcessedDataBucket
+                  - !Ref ReportsBucket
+        - PolicyName: KMSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:GenerateDataKey'
+                Resource: !If [UseKMSEncryption, !GetAtt DataEncryptionKey.Arn, !Ref 'AWS::NoValue']
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 's3.${AWS::Region}.amazonaws.com'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cost-collector-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  DataTransformerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-data-transformer-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                Resource:
+                  - !Sub '${RawDataBucket}/*'
+                  - !Sub '${ProcessedDataBucket}/*'
+                  - !Sub '${ReportsBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                Resource:
+                  - !Ref RawDataBucket
+                  - !Ref ProcessedDataBucket
+                  - !Ref ReportsBucket
+        - PolicyName: GlueAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'glue:CreateTable'
+                  - 'glue:UpdateTable'
+                  - 'glue:GetTable'
+                  - 'glue:GetDatabase'
+                  - 'glue:CreateDatabase'
+                  - 'glue:CreatePartition'
+                  - 'glue:BatchCreatePartition'
+                  - 'glue:GetPartitions'
+                Resource: '*'
+        - PolicyName: QuickSightAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'quicksight:CreateDataSet'
+                  - 'quicksight:UpdateDataSet'
+                  - 'quicksight:DescribeDataSet'
+                  - 'quicksight:CreateAnalysis'
+                  - 'quicksight:UpdateAnalysis'
+                Resource: '*'
+        - PolicyName: KMSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:GenerateDataKey'
+                Resource: !If [UseKMSEncryption, !GetAtt DataEncryptionKey.Arn, !Ref 'AWS::NoValue']
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 's3.${AWS::Region}.amazonaws.com'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-data-transformer-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==========================================
+  # Lambda Functions
+  # ==========================================
+  
+  CostDataCollectorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-cost-data-collector-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt CostDataCollectorRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      Environment:
+        Variables:
+          RAW_DATA_BUCKET: !Ref RawDataBucket
+          DATA_RETENTION_DAYS: !Ref DataRetentionDays
+          COST_DATA_GRANULARITY: !Ref CostDataGranularity
+          ENABLE_OPTIMIZATION_RECOMMENDATIONS: !Ref EnableCostOptimizationRecommendations
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime, timedelta, date
+          import uuid
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              ce = boto3.client('ce')
+              s3 = boto3.client('s3')
+              
+              # Calculate date ranges for data collection
+              end_date = date.today()
+              start_date = end_date - timedelta(days=int(os.environ.get('DATA_RETENTION_DAYS', 90)))
+              
+              try:
+                  # 1. Daily cost by service
+                  daily_cost_response = ce.get_cost_and_usage(
+                      TimePeriod={
+                          'Start': start_date.strftime('%Y-%m-%d'),
+                          'End': end_date.strftime('%Y-%m-%d')
+                      },
+                      Granularity=os.environ.get('COST_DATA_GRANULARITY', 'DAILY'),
+                      Metrics=['BlendedCost', 'UnblendedCost', 'UsageQuantity'],
+                      GroupBy=[
+                          {'Type': 'DIMENSION', 'Key': 'SERVICE'},
+                          {'Type': 'DIMENSION', 'Key': 'LINKED_ACCOUNT'}
+                      ]
+                  )
+                  
+                  # 2. Monthly cost by department (tag-based)
+                  monthly_dept_response = ce.get_cost_and_usage(
+                      TimePeriod={
+                          'Start': (start_date.replace(day=1)).strftime('%Y-%m-%d'),
+                          'End': end_date.strftime('%Y-%m-%d')
+                      },
+                      Granularity='MONTHLY',
+                      Metrics=['BlendedCost'],
+                      GroupBy=[
+                          {'Type': 'TAG', 'Key': 'Department'},
+                          {'Type': 'TAG', 'Key': 'Project'},
+                          {'Type': 'TAG', 'Key': 'Environment'}
+                      ]
+                  )
+                  
+                  # 3. Reserved Instance utilization
+                  ri_utilization_response = ce.get_reservation_utilization(
+                      TimePeriod={
+                          'Start': start_date.strftime('%Y-%m-%d'),
+                          'End': end_date.strftime('%Y-%m-%d')
+                      },
+                      Granularity='MONTHLY'
+                  )
+                  
+                  # 4. Savings Plans utilization
+                  savings_plans_response = ce.get_savings_plans_utilization(
+                      TimePeriod={
+                          'Start': start_date.strftime('%Y-%m-%d'),
+                          'End': end_date.strftime('%Y-%m-%d')
+                      },
+                      Granularity='MONTHLY'
+                  )
+                  
+                  # 5. Rightsizing recommendations (if enabled)
+                  rightsizing_response = {}
+                  if os.environ.get('ENABLE_OPTIMIZATION_RECOMMENDATIONS', 'true').lower() == 'true':
+                      rightsizing_response = ce.get_rightsizing_recommendation(
+                          Service='AmazonEC2'
+                      )
+                  
+                  # Store all collected data
+                  collections = {
+                      'daily_costs': daily_cost_response,
+                      'monthly_department_costs': monthly_dept_response,
+                      'ri_utilization': ri_utilization_response,
+                      'savings_plans_utilization': savings_plans_response,
+                      'rightsizing_recommendations': rightsizing_response,
+                      'collection_timestamp': datetime.utcnow().isoformat(),
+                      'data_period': {
+                          'start_date': start_date.strftime('%Y-%m-%d'),
+                          'end_date': end_date.strftime('%Y-%m-%d')
+                      }
+                  }
+                  
+                  # Generate unique key for this collection
+                  collection_id = str(uuid.uuid4())
+                  s3_key = f"raw-cost-data/{datetime.utcnow().strftime('%Y/%m/%d')}/cost-collection-{collection_id}.json"
+                  
+                  # Store in S3
+                  s3.put_object(
+                      Bucket=os.environ['RAW_DATA_BUCKET'],
+                      Key=s3_key,
+                      Body=json.dumps(collections, default=str, indent=2),
+                      ContentType='application/json',
+                      Metadata={
+                          'collection-date': datetime.utcnow().strftime('%Y-%m-%d'),
+                          'data-type': 'cost-explorer-raw',
+                          'collection-id': collection_id
+                      }
+                  )
+                  
+                  logger.info(f"Cost data collected and stored: s3://{os.environ['RAW_DATA_BUCKET']}/{s3_key}")
+                  
+                  # Prepare summary for downstream processing
+                  summary = {
+                      'total_daily_records': len(daily_cost_response.get('ResultsByTime', [])),
+                      'total_monthly_records': len(monthly_dept_response.get('ResultsByTime', [])),
+                      'ri_utilization_periods': len(ri_utilization_response.get('UtilizationsByTime', [])),
+                      'rightsizing_recommendations': len(rightsizing_response.get('RightsizingRecommendations', [])),
+                      's3_location': f"s3://{os.environ['RAW_DATA_BUCKET']}/{s3_key}",
+                      'collection_id': collection_id
+                  }
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Cost data collection completed successfully',
+                          'summary': summary
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error collecting cost data: {str(e)}")
+                  raise
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cost-data-collector-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Cost Explorer Data Collection'
+
+  DataTransformerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-data-transformer-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt DataTransformerRole.Arn
+      Timeout: 900
+      MemorySize: 2048
+      Environment:
+        Variables:
+          RAW_DATA_BUCKET: !Ref RawDataBucket
+          PROCESSED_DATA_BUCKET: !Ref ProcessedDataBucket
+          GLUE_DATABASE_NAME: !Sub '${ProjectName}_financial_analytics_${Environment}'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          import uuid
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              s3 = boto3.client('s3')
+              glue = boto3.client('glue')
+              
+              try:
+                  # Check if triggered by S3 event or manual invocation
+                  if 'Records' in event:
+                      # S3 event trigger
+                      for record in event['Records']:
+                          bucket = record['s3']['bucket']['name']
+                          key = record['s3']['object']['key']
+                          
+                          if bucket == os.environ['RAW_DATA_BUCKET'] and key.startswith('raw-cost-data/'):
+                              process_cost_data_file(s3, glue, bucket, key)
+                  else:
+                      # Manual invocation - find latest file
+                      raw_bucket = os.environ['RAW_DATA_BUCKET']
+                      
+                      # List objects to find latest collection
+                      response = s3.list_objects_v2(
+                          Bucket=raw_bucket,
+                          Prefix='raw-cost-data/',
+                          MaxKeys=1000
+                      )
+                      
+                      if 'Contents' not in response:
+                          logger.info("No raw data files found")
+                          return {'statusCode': 200, 'body': 'No data to process'}
+                      
+                      # Sort by last modified and get the latest
+                      latest_file = sorted(response['Contents'], key=lambda x: x['LastModified'], reverse=True)[0]
+                      latest_key = latest_file['Key']
+                      
+                      process_cost_data_file(s3, glue, raw_bucket, latest_key)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Data transformation completed successfully'
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in data transformation: {str(e)}")
+                  raise
+
+          def process_cost_data_file(s3, glue, bucket, key):
+              logger.info(f"Processing file: {key}")
+              
+              # Read raw data from S3
+              obj = s3.get_object(Bucket=bucket, Key=key)
+              raw_data = json.loads(obj['Body'].read())
+              
+              # Transform data for analytics
+              transformed_data = transform_cost_data(raw_data)
+              
+              # Store transformed data
+              timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+              processed_bucket = os.environ['PROCESSED_DATA_BUCKET']
+              
+              for data_type, data in transformed_data.items():
+                  if data:  # Only process non-empty datasets
+                      json_key = f"processed-data/{data_type}/{datetime.utcnow().strftime('%Y/%m/%d')}/{data_type}_{timestamp}.json"
+                      
+                      s3.put_object(
+                          Bucket=processed_bucket,
+                          Key=json_key,
+                          Body=json.dumps(data, default=str, indent=2),
+                          ContentType='application/json'
+                      )
+              
+              # Update Glue Data Catalog
+              create_glue_tables(glue, processed_bucket)
+
+          def transform_cost_data(raw_data):
+              """Transform raw cost explorer data into analytics-friendly format"""
+              transformed = {}
+              
+              # Transform daily costs
+              if 'daily_costs' in raw_data:
+                  daily_costs = []
+                  for time_period in raw_data['daily_costs'].get('ResultsByTime', []):
+                      date = time_period['TimePeriod']['Start']
+                      
+                      for group in time_period.get('Groups', []):
+                          service = group['Keys'][0] if len(group['Keys']) > 0 else 'Unknown'
+                          account = group['Keys'][1] if len(group['Keys']) > 1 else 'Unknown'
+                          
+                          daily_costs.append({
+                              'date': date,
+                              'service': service,
+                              'account_id': account,
+                              'blended_cost': float(group['Metrics']['BlendedCost']['Amount']),
+                              'unblended_cost': float(group['Metrics']['UnblendedCost']['Amount']),
+                              'usage_quantity': float(group['Metrics']['UsageQuantity']['Amount']),
+                              'currency': group['Metrics']['BlendedCost']['Unit']
+                          })
+                  
+                  transformed['daily_costs'] = daily_costs
+              
+              # Transform department costs
+              if 'monthly_department_costs' in raw_data:
+                  dept_costs = []
+                  for time_period in raw_data['monthly_department_costs'].get('ResultsByTime', []):
+                      start_date = time_period['TimePeriod']['Start']
+                      
+                      for group in time_period.get('Groups', []):
+                          keys = group.get('Keys', [])
+                          department = keys[0] if len(keys) > 0 else 'Untagged'
+                          project = keys[1] if len(keys) > 1 else 'Untagged'
+                          environment = keys[2] if len(keys) > 2 else 'Untagged'
+                          
+                          dept_costs.append({
+                              'month': start_date,
+                              'department': department,
+                              'project': project,
+                              'environment': environment,
+                              'cost': float(group['Metrics']['BlendedCost']['Amount']),
+                              'currency': group['Metrics']['BlendedCost']['Unit']
+                          })
+                  
+                  transformed['department_costs'] = dept_costs
+              
+              return transformed
+
+          def create_glue_tables(glue_client, bucket):
+              """Create Glue tables for the transformed data"""
+              database_name = os.environ['GLUE_DATABASE_NAME']
+              
+              try:
+                  # Create database if it doesn't exist
+                  glue_client.create_database(
+                      DatabaseInput={
+                          'Name': database_name,
+                          'Description': 'Financial analytics database for cost data'
+                      }
+                  )
+              except glue_client.exceptions.AlreadyExistsException:
+                  pass
+              
+              logger.info(f"Glue database ready: {database_name}")
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-data-transformer-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Cost Data Transformation and Processing'
+
+  # ==========================================
+  # S3 Lambda Trigger Permission
+  # ==========================================
+  
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataTransformerFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !GetAtt RawDataBucket.Arn
+
+  # ==========================================
+  # EventBridge Scheduling Rules
+  # ==========================================
+  
+  DailyCostCollectionRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-daily-cost-collection-${Environment}'
+      Description: 'Daily collection of cost data for analytics'
+      ScheduleExpression: 'cron(0 6 * * ? *)'  # Daily at 6 AM UTC
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CostDataCollectorFunction.Arn
+          Id: 'CostDataCollectorTarget'
+          Input: '{"source": "scheduled-daily"}'
+
+  WeeklyDataTransformationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-weekly-data-transformation-${Environment}'
+      Description: 'Weekly transformation of cost data'
+      ScheduleExpression: 'cron(0 7 ? * SUN *)'  # Weekly on Sunday at 7 AM UTC
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DataTransformerFunction.Arn
+          Id: 'DataTransformerTarget'
+          Input: '{"source": "scheduled-weekly"}'
+
+  # EventBridge Lambda Permissions
+  EventBridgeInvokeCostCollectorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CostDataCollectorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyCostCollectionRule.Arn
+
+  EventBridgeInvokeDataTransformerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataTransformerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WeeklyDataTransformationRule.Arn
+
+  # ==========================================
+  # Athena Workgroup for Analytics
+  # ==========================================
+  
+  FinancialAnalyticsWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub '${ProjectName}-financial-analytics-${Environment}'
+      Description: 'Workgroup for financial analytics queries'
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${AnalyticsBucket}/athena-results/'
+          EncryptionConfiguration:
+            EncryptionOption: !If [UseKMSEncryption, 'SSE_KMS', 'SSE_S3']
+            KmsKey: !If [UseKMSEncryption, !Ref DataEncryptionKey, !Ref 'AWS::NoValue']
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetrics: true
+        BytesScannedCutoffPerQuery: 1073741824  # 1 GB limit
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-financial-analytics-workgroup-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==========================================
+  # Glue Database
+  # ==========================================
+  
+  FinancialAnalyticsDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectName}_financial_analytics_${Environment}'
+        Description: 'Database for financial analytics cost data'
+
+  # ==========================================
+  # QuickSight Data Sources
+  # ==========================================
+  
+  QuickSightS3DataSource:
+    Type: AWS::QuickSight::DataSource
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSourceId: !Sub '${ProjectName}-s3-datasource-${Environment}'
+      Name: !Sub '${ProjectName} Financial Analytics S3 Data'
+      Type: 'S3'
+      DataSourceParameters:
+        S3Parameters:
+          ManifestFileLocation:
+            Bucket: !Ref ProcessedDataBucket
+            Key: 'quicksight-manifest.json'
+      Permissions:
+        - Principal: !Ref QuickSightUserArn
+          Actions:
+            - 'quicksight:DescribeDataSource'
+            - 'quicksight:DescribeDataSourcePermissions'
+            - 'quicksight:PassDataSource'
+            - 'quicksight:UpdateDataSource'
+            - 'quicksight:DeleteDataSource'
+            - 'quicksight:UpdateDataSourcePermissions'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-s3-datasource-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  QuickSightAthenaDataSource:
+    Type: AWS::QuickSight::DataSource
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSourceId: !Sub '${ProjectName}-athena-datasource-${Environment}'
+      Name: !Sub '${ProjectName} Financial Analytics Athena'
+      Type: 'ATHENA'
+      DataSourceParameters:
+        AthenaParameters:
+          WorkGroup: !Ref FinancialAnalyticsWorkgroup
+      Permissions:
+        - Principal: !Ref QuickSightUserArn
+          Actions:
+            - 'quicksight:DescribeDataSource'
+            - 'quicksight:DescribeDataSourcePermissions'
+            - 'quicksight:PassDataSource'
+            - 'quicksight:UpdateDataSource'
+            - 'quicksight:DeleteDataSource'
+            - 'quicksight:UpdateDataSourcePermissions'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-athena-datasource-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==========================================
+  # SNS Topic for Notifications
+  # ==========================================
+  
+  CostAlertsNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-cost-alerts-${Environment}'
+      DisplayName: 'Financial Analytics Cost Alerts'
+      KmsMasterKeyId: !If [UseKMSEncryption, !Ref DataEncryptionKey, 'alias/aws/sns']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cost-alerts-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  CostAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref CostAlertsNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ==========================================
+  # CloudWatch Alarms for Monitoring
+  # ==========================================
+  
+  CostCollectorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-cost-collector-errors-${Environment}'
+      AlarmDescription: 'Alarm for cost data collector function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CostDataCollectorFunction
+      AlarmActions:
+        - !Ref CostAlertsNotificationTopic
+      TreatMissingData: notBreaching
+
+  DataTransformerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-data-transformer-errors-${Environment}'
+      AlarmDescription: 'Alarm for data transformer function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DataTransformerFunction
+      AlarmActions:
+        - !Ref CostAlertsNotificationTopic
+      TreatMissingData: notBreaching
+
+  # ==========================================
+  # QuickSight Manifest File Custom Resource
+  # ==========================================
+  
+  QuickSightManifestRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                Resource: !Sub '${ProcessedDataBucket}/*'
+
+  QuickSightManifestFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt QuickSightManifestRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              try:
+                  s3 = boto3.client('s3')
+                  bucket = event['ResourceProperties']['Bucket']
+                  
+                  manifest = {
+                      "fileLocations": [
+                          {
+                              "URIs": [
+                                  f"s3://{bucket}/processed-data/daily_costs/",
+                                  f"s3://{bucket}/processed-data/department_costs/",
+                                  f"s3://{bucket}/processed-data/ri_utilization/"
+                              ]
+                          }
+                      ],
+                      "globalUploadSettings": {
+                          "format": "JSON"
+                      }
+                  }
+                  
+                  if event['RequestType'] == 'Delete':
+                      s3.delete_object(Bucket=bucket, Key='quicksight-manifest.json')
+                  else:
+                      s3.put_object(
+                          Bucket=bucket,
+                          Key='quicksight-manifest.json',
+                          Body=json.dumps(manifest, indent=2),
+                          ContentType='application/json'
+                      )
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  QuickSightManifestCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt QuickSightManifestFunction.Arn
+      Bucket: !Ref ProcessedDataBucket
+
+Outputs:
+  RawDataBucketName:
+    Description: 'Name of the S3 bucket for raw cost data'
+    Value: !Ref RawDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-RawDataBucket'
+
+  ProcessedDataBucketName:
+    Description: 'Name of the S3 bucket for processed cost data'
+    Value: !Ref ProcessedDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessedDataBucket'
+
+  ReportsBucketName:
+    Description: 'Name of the S3 bucket for reports'
+    Value: !Ref ReportsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ReportsBucket'
+
+  AnalyticsBucketName:
+    Description: 'Name of the S3 bucket for analytics results'
+    Value: !Ref AnalyticsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AnalyticsBucket'
+
+  CostDataCollectorFunctionArn:
+    Description: 'ARN of the cost data collector Lambda function'
+    Value: !GetAtt CostDataCollectorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CostCollectorFunction'
+
+  DataTransformerFunctionArn:
+    Description: 'ARN of the data transformer Lambda function'
+    Value: !GetAtt DataTransformerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataTransformerFunction'
+
+  AthenaWorkgroupName:
+    Description: 'Name of the Athena workgroup for financial analytics'
+    Value: !Ref FinancialAnalyticsWorkgroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaWorkgroup'
+
+  GlueDatabaseName:
+    Description: 'Name of the Glue database for financial analytics'
+    Value: !Ref FinancialAnalyticsDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabase'
+
+  QuickSightS3DataSourceId:
+    Description: 'ID of the QuickSight S3 data source'
+    Value: !Ref QuickSightS3DataSource
+    Export:
+      Name: !Sub '${AWS::StackName}-QuickSightS3DataSource'
+
+  QuickSightAthenaDataSourceId:
+    Description: 'ID of the QuickSight Athena data source'
+    Value: !Ref QuickSightAthenaDataSource
+    Export:
+      Name: !Sub '${AWS::StackName}-QuickSightAthenaDataSource'
+
+  CostAlertsTopicArn:
+    Description: 'ARN of the SNS topic for cost alerts'
+    Value: !Ref CostAlertsNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-CostAlertsTopic'
+
+  DataEncryptionKeyId:
+    Condition: UseKMSEncryption
+    Description: 'ID of the KMS key used for data encryption'
+    Value: !Ref DataEncryptionKey
+    Export:
+      Name: !Sub '${AWS::StackName}-DataEncryptionKey'
+
+  QuickSightConsoleURL:
+    Description: 'URL to access QuickSight console for dashboard creation'
+    Value: 'https://quicksight.aws.amazon.com/'
+
+  DeploymentInstructions:
+    Description: 'Next steps after stack deployment'
+    Value: !Sub |
+      1. Set up QuickSight Enterprise Edition at https://quicksight.aws.amazon.com/
+      2. Configure QuickSight permissions for S3 access
+      3. Manually trigger the cost collector function: aws lambda invoke --function-name ${CostDataCollectorFunction} response.json
+      4. Create QuickSight datasets using the configured data sources
+      5. Build interactive dashboards in QuickSight console
+      6. Monitor CloudWatch logs and alarms for pipeline health

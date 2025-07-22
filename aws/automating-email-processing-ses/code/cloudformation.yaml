@@ -1,0 +1,878 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Serverless Email Processing System with Amazon SES and Lambda
+  Creates an automated email processing system that receives emails via SES,
+  stores them in S3, processes them with Lambda, and sends notifications via SNS.
+
+# ============================================================================
+# PARAMETERS
+# ============================================================================
+
+Parameters:
+  # Domain Configuration
+  DomainName:
+    Type: String
+    Description: >
+      Verified domain for SES email receiving (must be pre-verified in SES).
+      Example: example.com
+    AllowedPattern: '^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid domain name
+    Default: example.com
+
+  # Email Addresses
+  SupportEmailAddress:
+    Type: String
+    Description: Email address for support requests (e.g., support@yourdomain.com)
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+    Default: support@example.com
+
+  InvoiceEmailAddress:
+    Type: String
+    Description: Email address for invoice processing (e.g., invoices@yourdomain.com)
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+    Default: invoices@example.com
+
+  NotificationEmailAddress:
+    Type: String
+    Description: Email address to receive processing notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+
+  # Resource Configuration
+  ResourcePrefix:
+    Type: String
+    Description: Prefix for all resources to ensure uniqueness
+    Default: email-proc
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+
+  LambdaTimeout:
+    Type: Number
+    Description: Lambda function timeout in seconds
+    Default: 60
+    MinValue: 30
+    MaxValue: 900
+
+  LambdaMemorySize:
+    Type: Number
+    Description: Lambda function memory in MB
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+
+  # Environment Configuration
+  Environment:
+    Type: String
+    Description: Environment for tagging and naming
+    Default: production
+    AllowedValues: [development, staging, production]
+
+# ============================================================================
+# CONDITIONS
+# ============================================================================
+
+Conditions:
+  IsProductionEnvironment: !Equals [!Ref Environment, production]
+  EnableDetailedMonitoring: !Equals [!Ref Environment, production]
+
+# ============================================================================
+# RESOURCES
+# ============================================================================
+
+Resources:
+  # ------------------------------------------------------------------------
+  # S3 BUCKET FOR EMAIL STORAGE
+  # ------------------------------------------------------------------------
+  
+  EmailStorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ResourcePrefix}-emails-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: EmailRetentionPolicy
+            Status: Enabled
+            ExpirationInDays: !If [IsProductionEnvironment, 2555, 30]  # 7 years for prod, 30 days for dev
+            NoncurrentVersionExpirationInDays: 7
+          - Id: IntelligentTieringRule
+            Status: Enabled
+            Transition:
+              TransitionInDays: 1
+              StorageClass: INTELLIGENT_TIERING
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt EmailProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: emails/
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-email-storage'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: EmailProcessing
+
+  # S3 Bucket Policy to allow SES to write objects
+  EmailStorageBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref EmailStorageBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSESPuts
+            Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${EmailStorageBucket}/emails/*'
+            Condition:
+              StringEquals:
+                'aws:Referer': !Ref 'AWS::AccountId'
+
+  # ------------------------------------------------------------------------
+  # SNS TOPIC FOR NOTIFICATIONS
+  # ------------------------------------------------------------------------
+
+  EmailNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ResourcePrefix}-email-notifications'
+      DisplayName: Email Processing Notifications
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-notifications'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: EmailProcessing
+
+  # SNS Topic Policy
+  EmailNotificationsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref EmailNotificationsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowLambdaPublish
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt EmailProcessorRole.Arn
+            Action:
+              - sns:Publish
+            Resource: !Ref EmailNotificationsTopic
+
+  # SNS Subscription for email notifications
+  EmailNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref EmailNotificationsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmailAddress
+
+  # ------------------------------------------------------------------------
+  # IAM ROLE AND POLICIES FOR LAMBDA
+  # ------------------------------------------------------------------------
+
+  EmailProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-lambda-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref 'AWS::Region'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EmailProcessingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3 permissions for email storage
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub '${EmailStorageBucket}/emails/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt EmailStorageBucket.Arn
+                Condition:
+                  StringLike:
+                    's3:prefix': 'emails/*'
+              # SES permissions for sending replies
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                  - ses:GetSendQuota
+                  - ses:GetSendStatistics
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'ses:FromAddress': !Sub 'noreply@${DomainName}'
+              # SNS permissions for notifications
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref EmailNotificationsTopic
+              # CloudWatch permissions for enhanced monitoring
+              - !If
+                - EnableDetailedMonitoring
+                - Effect: Allow
+                  Action:
+                    - cloudwatch:PutMetricData
+                  Resource: '*'
+                  Condition:
+                    StringEquals:
+                      'cloudwatch:namespace': !Sub '${ResourcePrefix}/EmailProcessing'
+                - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-lambda-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ------------------------------------------------------------------------
+  # LAMBDA FUNCTION FOR EMAIL PROCESSING
+  # ------------------------------------------------------------------------
+
+  EmailProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-processor-${AWS::Region}'
+      Description: Processes incoming emails from SES, categorizes them, and sends automated responses
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt EmailProcessorRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrencyLimit: !If [IsProductionEnvironment, 100, 10]
+      DeadLetterQueue:
+        TargetArn: !GetAtt EmailProcessorDLQ.Arn
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref EmailStorageBucket
+          SNS_TOPIC_ARN: !Ref EmailNotificationsTopic
+          FROM_EMAIL: !Sub 'noreply@${DomainName}'
+          SUPPORT_EMAIL: !Ref SupportEmailAddress
+          INVOICE_EMAIL: !Ref InvoiceEmailAddress
+          ENVIRONMENT: !Ref Environment
+          RESOURCE_PREFIX: !Ref ResourcePrefix
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import email
+          import os
+          import logging
+          from datetime import datetime
+          from email.mime.text import MIMEText
+          from email.mime.multipart import MIMEMultipart
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          # Initialize AWS clients
+          s3 = boto3.client('s3')
+          ses = boto3.client('ses')
+          sns = boto3.client('sns')
+          cloudwatch = boto3.client('cloudwatch')
+          
+          def lambda_handler(event, context):
+              """
+              Main Lambda handler for processing SES emails
+              """
+              try:
+                  # Log the incoming event
+                  logger.info(f"Processing email event: {json.dumps(event, default=str)}")
+                  
+                  # Parse SES event
+                  ses_event = event['Records'][0]['ses']
+                  message_id = ses_event['mail']['messageId']
+                  receipt = ses_event['receipt']
+                  
+                  # Get email from S3
+                  bucket_name = os.environ.get('BUCKET_NAME')
+                  s3_key = f"emails/{message_id}"
+                  
+                  logger.info(f"Retrieving email from S3: {bucket_name}/{s3_key}")
+                  
+                  # Get email object from S3
+                  response = s3.get_object(Bucket=bucket_name, Key=s3_key)
+                  raw_email = response['Body'].read()
+                  
+                  # Parse email
+                  email_message = email.message_from_bytes(raw_email)
+                  
+                  # Extract email details
+                  sender = email_message.get('From', 'Unknown')
+                  subject = email_message.get('Subject', 'No Subject')
+                  recipient = receipt['recipients'][0] if receipt['recipients'] else 'Unknown'
+                  
+                  logger.info(f"Processing email - From: {sender}, Subject: {subject}, To: {recipient}")
+                  
+                  # Process email based on content and recipient
+                  processing_result = process_email_by_type(sender, subject, recipient, email_message)
+                  
+                  # Send notification about processing
+                  await_notification_result = notify_processing_complete(message_id, sender, subject, processing_result)
+                  
+                  # Put custom CloudWatch metrics
+                  put_custom_metrics(processing_result['email_type'])
+                  
+                  logger.info(f"Email processed successfully: {processing_result}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Email processed successfully',
+                          'messageId': message_id,
+                          'processingResult': processing_result
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing email: {str(e)}", exc_info=True)
+                  
+                  # Send error notification
+                  try:
+                      sns.publish(
+                          TopicArn=os.environ.get('SNS_TOPIC_ARN'),
+                          Subject='Email Processing Error',
+                          Message=f"Error processing email: {str(e)}\nEvent: {json.dumps(event, default=str)}"
+                      )
+                  except:
+                      pass
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'message': 'Failed to process email'
+                      })
+                  }
+          
+          def process_email_by_type(sender, subject, recipient, email_message):
+              """
+              Process email based on recipient and content
+              """
+              support_email = os.environ.get('SUPPORT_EMAIL', '').lower()
+              invoice_email = os.environ.get('INVOICE_EMAIL', '').lower()
+              
+              if recipient.lower() == support_email or 'support' in subject.lower():
+                  return process_support_email(sender, subject, email_message)
+              elif recipient.lower() == invoice_email or 'invoice' in subject.lower():
+                  return process_invoice_email(sender, subject, email_message)
+              else:
+                  return process_general_email(sender, subject, email_message)
+          
+          def process_support_email(sender, subject, email_message):
+              """Process support-related emails"""
+              ticket_id = f"TICKET-{hash(sender) % 10000:04d}"
+              
+              reply_subject = f"Re: {subject} - Support Ticket #{ticket_id}"
+              reply_body = f"""Dear Customer,
+
+Thank you for contacting our support team.
+
+Your support ticket has been created with the following details:
+- Ticket ID: {ticket_id}
+- Subject: {subject}
+- Received: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+
+Our support team will review your request and respond within 24 hours.
+
+For urgent matters, please call our support hotline.
+
+Best regards,
+Customer Support Team
+"""
+              
+              send_reply(sender, reply_subject, reply_body)
+              
+              # Notify support team via SNS
+              sns.publish(
+                  TopicArn=os.environ.get('SNS_TOPIC_ARN'),
+                  Subject=f'New Support Ticket #{ticket_id}',
+                  Message=f"""New support ticket created:
+
+Ticket ID: {ticket_id}
+From: {sender}
+Subject: {subject}
+Priority: Normal
+
+Please log into the support system to review and respond.
+"""
+              )
+              
+              return {
+                  'email_type': 'support',
+                  'action': 'ticket_created',
+                  'ticket_id': ticket_id,
+                  'auto_reply_sent': True
+              }
+          
+          def process_invoice_email(sender, subject, email_message):
+              """Process invoice-related emails"""
+              invoice_ref = f"INV-{hash(sender) % 10000:04d}"
+              
+              reply_subject = f"Invoice Received - Reference #{invoice_ref}"
+              reply_body = f"""Dear Vendor,
+
+We have successfully received your invoice.
+
+Invoice Details:
+- Reference Number: {invoice_ref}
+- Subject: {subject}
+- Received: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+
+Your invoice will be processed according to our payment terms (Net 30 days).
+You will receive payment confirmation once processing is complete.
+
+Please reference {invoice_ref} in any future correspondence regarding this invoice.
+
+Best regards,
+Accounts Payable Team
+"""
+              
+              send_reply(sender, reply_subject, reply_body)
+              
+              return {
+                  'email_type': 'invoice',
+                  'action': 'invoice_received',
+                  'reference': invoice_ref,
+                  'auto_reply_sent': True
+              }
+          
+          def process_general_email(sender, subject, email_message):
+              """Process general emails"""
+              reply_subject = f"Re: {subject}"
+              reply_body = f"""Thank you for your email.
+
+We have received your message with the subject "{subject}" and will review it promptly.
+
+If this is a support request, please send your email to {os.environ.get('SUPPORT_EMAIL', 'support@company.com')} for faster processing.
+
+If this is an invoice, please send it to {os.environ.get('INVOICE_EMAIL', 'invoices@company.com')}.
+
+Best regards,
+Customer Service Team
+"""
+              
+              send_reply(sender, reply_subject, reply_body)
+              
+              return {
+                  'email_type': 'general',
+                  'action': 'acknowledgment_sent',
+                  'auto_reply_sent': True
+              }
+          
+          def send_reply(to_email, subject, body):
+              """Send automated reply via SES"""
+              try:
+                  from_email = os.environ.get('FROM_EMAIL', 'noreply@example.com')
+                  
+                  logger.info(f"Sending reply to: {to_email}")
+                  
+                  response = ses.send_email(
+                      Source=from_email,
+                      Destination={
+                          'ToAddresses': [to_email]
+                      },
+                      Message={
+                          'Subject': {
+                              'Data': subject,
+                              'Charset': 'UTF-8'
+                          },
+                          'Body': {
+                              'Text': {
+                                  'Data': body,
+                                  'Charset': 'UTF-8'
+                              }
+                          }
+                      },
+                      Tags=[
+                          {
+                              'Name': 'EmailType',
+                              'Value': 'AutomatedReply'
+                          },
+                          {
+                              'Name': 'Environment',
+                              'Value': os.environ.get('ENVIRONMENT', 'development')
+                          }
+                      ]
+                  )
+                  
+                  logger.info(f"Reply sent successfully. MessageId: {response['MessageId']}")
+                  return response
+                  
+              except Exception as e:
+                  logger.error(f"Error sending reply to {to_email}: {str(e)}")
+                  raise
+          
+          def notify_processing_complete(message_id, sender, subject, processing_result):
+              """Send processing notification via SNS"""
+              try:
+                  message = f"""Email Processing Complete
+
+Message ID: {message_id}
+From: {sender}
+Subject: {subject}
+Processing Type: {processing_result.get('email_type', 'unknown')}
+Action Taken: {processing_result.get('action', 'none')}
+Auto-reply Sent: {processing_result.get('auto_reply_sent', False)}
+
+Processed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+"""
+                  
+                  sns.publish(
+                      TopicArn=os.environ.get('SNS_TOPIC_ARN'),
+                      Subject='Email Processed Successfully',
+                      Message=message
+                  )
+                  
+                  return True
+                  
+              except Exception as e:
+                  logger.error(f"Error sending processing notification: {str(e)}")
+                  return False
+          
+          def put_custom_metrics(email_type):
+              """Put custom CloudWatch metrics"""
+              try:
+                  if os.environ.get('ENVIRONMENT') == 'production':
+                      cloudwatch.put_metric_data(
+                          Namespace=f"{os.environ.get('RESOURCE_PREFIX', 'email-proc')}/EmailProcessing",
+                          MetricData=[
+                              {
+                                  'MetricName': 'EmailsProcessed',
+                                  'Value': 1,
+                                  'Unit': 'Count',
+                                  'Dimensions': [
+                                      {
+                                          'Name': 'EmailType',
+                                          'Value': email_type
+                                      }
+                                  ]
+                              }
+                          ]
+                      )
+              except Exception as e:
+                  logger.warning(f"Failed to put CloudWatch metrics: {str(e)}")
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-processor'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: EmailProcessing
+
+  # Lambda function permission for SES to invoke
+  EmailProcessorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EmailProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: ses.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  # Lambda function permission for S3 to invoke
+  EmailProcessorS3InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EmailProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt EmailStorageBucket.Arn
+
+  # Dead Letter Queue for failed Lambda executions
+  EmailProcessorDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ResourcePrefix}-processor-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-processor-dlq'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: EmailProcessing
+
+  # ------------------------------------------------------------------------
+  # SES CONFIGURATION
+  # ------------------------------------------------------------------------
+
+  # SES Rule Set
+  EmailReceiptRuleSet:
+    Type: AWS::SES::ReceiptRuleSet
+    Properties:
+      RuleSetName: !Sub '${ResourcePrefix}-receipt-rules'
+
+  # SES Receipt Rule for email processing
+  EmailReceiptRule:
+    Type: AWS::SES::ReceiptRule
+    Properties:
+      RuleSetName: !Ref EmailReceiptRuleSet
+      Rule:
+        Name: !Sub '${ResourcePrefix}-processing-rule'
+        Enabled: true
+        TlsPolicy: Optional
+        Recipients:
+          - !Ref SupportEmailAddress
+          - !Ref InvoiceEmailAddress
+        Actions:
+          # Store email in S3
+          - S3Action:
+              BucketName: !Ref EmailStorageBucket
+              ObjectKeyPrefix: emails/
+              TopicArn: !Ref EmailNotificationsTopic
+          # Trigger Lambda processing
+          - LambdaAction:
+              FunctionArn: !GetAtt EmailProcessorFunction.Arn
+              InvocationType: Event
+
+  # ------------------------------------------------------------------------
+  # CLOUDWATCH ALARMS (PRODUCTION ONLY)
+  # ------------------------------------------------------------------------
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoring
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-lambda-errors'
+      AlarmDescription: Alert when Lambda function has errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EmailProcessorFunction
+      AlarmActions:
+        - !Ref EmailNotificationsTopic
+      TreatMissingData: notBreaching
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoring
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-lambda-duration'
+      AlarmDescription: Alert when Lambda function duration is high
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Sub '${LambdaTimeout}000'  # Convert to milliseconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EmailProcessorFunction
+      AlarmActions:
+        - !Ref EmailNotificationsTopic
+      TreatMissingData: notBreaching
+
+  DLQMessageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoring
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-dlq-messages'
+      AlarmDescription: Alert when messages appear in DLQ
+      MetricName: ApproximateNumberOfVisibleMessages
+      Namespace: AWS/SQS
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt EmailProcessorDLQ.QueueName
+      AlarmActions:
+        - !Ref EmailNotificationsTopic
+      TreatMissingData: notBreaching
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+
+Outputs:
+  # Domain and Email Configuration
+  DomainName:
+    Description: Domain configured for email receiving
+    Value: !Ref DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-DomainName'
+
+  SupportEmailAddress:
+    Description: Email address for support requests
+    Value: !Ref SupportEmailAddress
+    Export:
+      Name: !Sub '${AWS::StackName}-SupportEmail'
+
+  InvoiceEmailAddress:
+    Description: Email address for invoice processing
+    Value: !Ref InvoiceEmailAddress
+    Export:
+      Name: !Sub '${AWS::StackName}-InvoiceEmail'
+
+  # S3 Resources
+  EmailStorageBucketName:
+    Description: S3 bucket for storing incoming emails
+    Value: !Ref EmailStorageBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-EmailBucket'
+
+  EmailStorageBucketArn:
+    Description: ARN of the S3 bucket for email storage
+    Value: !GetAtt EmailStorageBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EmailBucketArn'
+
+  # Lambda Resources
+  EmailProcessorFunctionName:
+    Description: Name of the Lambda function processing emails
+    Value: !Ref EmailProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessorFunction'
+
+  EmailProcessorFunctionArn:
+    Description: ARN of the Lambda function processing emails
+    Value: !GetAtt EmailProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessorFunctionArn'
+
+  # SNS Resources
+  EmailNotificationsTopicArn:
+    Description: ARN of SNS topic for email processing notifications
+    Value: !Ref EmailNotificationsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationsTopic'
+
+  # SES Resources
+  EmailReceiptRuleSetName:
+    Description: Name of SES receipt rule set
+    Value: !Ref EmailReceiptRuleSet
+    Export:
+      Name: !Sub '${AWS::StackName}-RuleSetName'
+
+  # IAM Resources
+  EmailProcessorRoleArn:
+    Description: ARN of IAM role used by Lambda function
+    Value: !GetAtt EmailProcessorRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaRoleArn'
+
+  # SQS Resources
+  EmailProcessorDLQArn:
+    Description: ARN of Dead Letter Queue for failed processing
+    Value: !GetAtt EmailProcessorDLQ.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DLQArn'
+
+  EmailProcessorDLQUrl:
+    Description: URL of Dead Letter Queue for failed processing
+    Value: !Ref EmailProcessorDLQ
+    Export:
+      Name: !Sub '${AWS::StackName}-DLQUrl'
+
+  # Setup Instructions
+  SetupInstructions:
+    Description: Next steps to complete setup
+    Value: !Sub |
+      1. Verify domain '${DomainName}' in Amazon SES if not already done
+      2. Add MX record to your DNS: '10 inbound-smtp.${AWS::Region}.amazonaws.com'
+      3. Set SES receipt rule set '${EmailReceiptRuleSet}' as active
+      4. Confirm SNS subscription for '${NotificationEmailAddress}'
+      5. Test by sending emails to '${SupportEmailAddress}' or '${InvoiceEmailAddress}'
+
+  # CloudWatch Dashboard URL (Production only)
+  CloudWatchDashboardUrl:
+    Condition: EnableDetailedMonitoring
+    Description: URL to CloudWatch dashboard for monitoring
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ResourcePrefix}-email-processing'
+
+# ============================================================================
+# METADATA
+# ============================================================================
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Email Configuration
+        Parameters:
+          - DomainName
+          - SupportEmailAddress
+          - InvoiceEmailAddress
+          - NotificationEmailAddress
+      - Label:
+          default: Resource Configuration
+        Parameters:
+          - ResourcePrefix
+          - Environment
+      - Label:
+          default: Lambda Configuration
+        Parameters:
+          - LambdaTimeout
+          - LambdaMemorySize
+    ParameterLabels:
+      DomainName:
+        default: Email Domain
+      SupportEmailAddress:
+        default: Support Email
+      InvoiceEmailAddress:
+        default: Invoice Email
+      NotificationEmailAddress:
+        default: Notification Email
+      ResourcePrefix:
+        default: Resource Prefix
+      Environment:
+        default: Environment
+      LambdaTimeout:
+        default: Lambda Timeout
+      LambdaMemorySize:
+        default: Lambda Memory
+
+  # Template information
+  AWS::CloudFormation::Designer:
+    ApplicationName: Serverless Email Processing System
+    ApplicationDescription: Automated email processing with SES, Lambda, S3, and SNS

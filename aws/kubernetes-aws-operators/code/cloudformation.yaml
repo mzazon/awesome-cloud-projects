@@ -1,0 +1,1089 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure for Kubernetes Operators AWS Resources - Creates EKS cluster with AWS Controllers for Kubernetes (ACK) and custom operators'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Cluster Configuration"
+        Parameters:
+          - ClusterName
+          - KubernetesVersion
+          - ClusterRegion
+      - Label:
+          default: "Node Group Configuration"
+        Parameters:
+          - NodeInstanceType
+          - NodeGroupSize
+          - NodeGroupMaxSize
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcCIDR
+          - PublicSubnet1CIDR
+          - PublicSubnet2CIDR
+          - PrivateSubnet1CIDR
+          - PrivateSubnet2CIDR
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - AllowedCIDR
+          - CreateBastion
+      - Label:
+          default: "ACK Controller Configuration"
+        Parameters:
+          - EnableS3Controller
+          - EnableIAMController
+          - EnableLambdaController
+      - Label:
+          default: "Resource Tagging"
+        Parameters:
+          - Environment
+          - Project
+          - Owner
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: ack-operators-cluster
+    Description: Name of the EKS cluster
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters and hyphens
+
+  KubernetesVersion:
+    Type: String
+    Default: '1.28'
+    AllowedValues: ['1.27', '1.28', '1.29', '1.30']
+    Description: Kubernetes version for the EKS cluster
+
+  ClusterRegion:
+    Type: String
+    Default: !Ref 'AWS::Region'
+    Description: AWS region for the cluster (defaults to current region)
+
+  NodeInstanceType:
+    Type: String
+    Default: m5.large
+    AllowedValues:
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - m5.large
+      - m5.xlarge
+      - m5.2xlarge
+      - c5.large
+      - c5.xlarge
+      - c5.2xlarge
+    Description: EC2 instance type for the worker nodes
+
+  NodeGroupSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Desired number of worker nodes
+
+  NodeGroupMaxSize:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    MaxValue: 20
+    Description: Maximum number of worker nodes
+
+  VpcCIDR:
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: '^(10|172|192)\..*'
+    Description: CIDR block for the VPC
+
+  PublicSubnet1CIDR:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR block for public subnet in first AZ
+
+  PublicSubnet2CIDR:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR block for public subnet in second AZ
+
+  PrivateSubnet1CIDR:
+    Type: String
+    Default: 10.0.10.0/24
+    Description: CIDR block for private subnet in first AZ
+
+  PrivateSubnet2CIDR:
+    Type: String
+    Default: 10.0.20.0/24
+    Description: CIDR block for private subnet in second AZ
+
+  AllowedCIDR:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR block allowed to access the cluster endpoint
+
+  CreateBastion:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Create a bastion host for secure cluster access
+
+  EnableS3Controller:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable S3 ACK Controller
+
+  EnableIAMController:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable IAM ACK Controller
+
+  EnableLambdaController:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable Lambda ACK Controller
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+
+  Project:
+    Type: String
+    Default: kubernetes-operators
+    Description: Project name for resource tagging
+
+  Owner:
+    Type: String
+    Default: platform-team
+    Description: Owner for resource tagging
+
+Conditions:
+  CreateBastionHost: !Equals [!Ref CreateBastion, 'true']
+  EnableS3: !Equals [!Ref EnableS3Controller, 'true']
+  EnableIAM: !Equals [!Ref EnableIAMController, 'true']
+  EnableLambda: !Equals [!Ref EnableLambdaController, 'true']
+
+Mappings:
+  # Latest AMI IDs for EKS optimized nodes by region
+  RegionMap:
+    us-east-1:
+      AMIID: ami-0c9424a408e18bcc9
+    us-east-2:
+      AMIID: ami-0c9424a408e18bcc9
+    us-west-1:
+      AMIID: ami-0c9424a408e18bcc9
+    us-west-2:
+      AMIID: ami-0c9424a408e18bcc9
+    eu-west-1:
+      AMIID: ami-0c9424a408e18bcc9
+    eu-central-1:
+      AMIID: ami-0c9424a408e18bcc9
+    ap-southeast-1:
+      AMIID: ami-0c9424a408e18bcc9
+    ap-northeast-1:
+      AMIID: ami-0c9424a408e18bcc9
+
+Resources:
+  # VPC and Networking Infrastructure
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: !Sub 'kubernetes.io/cluster/${ClusterName}'
+          Value: shared
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-igw'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # Public Subnets
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet1CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+        - Key: !Sub 'kubernetes.io/cluster/${ClusterName}'
+          Value: shared
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet2CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+        - Key: !Sub 'kubernetes.io/cluster/${ClusterName}'
+          Value: shared
+
+  # Private Subnets
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+        - Key: !Sub 'kubernetes.io/cluster/${ClusterName}'
+          Value: owned
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet2CIDR
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+        - Key: !Sub 'kubernetes.io/cluster/${ClusterName}'
+          Value: owned
+
+  # NAT Gateways
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat1-eip'
+        - Key: Environment
+          Value: !Ref Environment
+
+  NatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat2-eip'
+        - Key: Environment
+          Value: !Ref Environment
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat1'
+        - Key: Environment
+          Value: !Ref Environment
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat2'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Route Tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-routes'
+        - Key: Environment
+          Value: !Ref Environment
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-routes-1'
+        - Key: Environment
+          Value: !Ref Environment
+
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-routes-2'
+        - Key: Environment
+          Value: !Ref Environment
+
+  DefaultPrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet2
+
+  # Security Groups
+  ControlPlaneSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Cluster communication with worker nodes
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref AllowedCIDR
+          Description: HTTPS access to Kubernetes API
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-control-plane-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  NodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for all nodes in the cluster
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          SourceSecurityGroupId: !Ref ControlPlaneSecurityGroup
+          Description: Allow control plane to communicate with nodes
+        - IpProtocol: tcp
+          FromPort: 1025
+          ToPort: 65535
+          SourceSecurityGroupId: !Ref NodeSecurityGroup
+          Description: Allow nodes to communicate with each other
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref NodeSecurityGroup
+          Description: Allow nodes HTTPS communication
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-node-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: !Sub 'kubernetes.io/cluster/${ClusterName}'
+          Value: owned
+
+  # Bastion Host Security Group (conditional)
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateBastionHost
+    Properties:
+      GroupDescription: Security group for bastion host
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedCIDR
+          Description: SSH access to bastion
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-bastion-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Roles and Policies
+  EKSClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-cluster-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-cluster-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  EKSNodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-node-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-node-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # ACK Controller Role with comprehensive permissions
+  ACKControllerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-ack-controller-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/${EKSCluster.OpenIdConnectIssuerUrl}'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                !Sub '${EKSCluster.OpenIdConnectIssuerUrl}:sub': 'system:serviceaccount:ack-system:ack-controller'
+                !Sub '${EKSCluster.OpenIdConnectIssuerUrl}:aud': 'sts.amazonaws.com'
+      Policies:
+        - PolicyName: ACKControllerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3 Controller Permissions
+              - Sid: S3ControllerPermissions
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:DeleteBucket
+                  - s3:GetBucketLocation
+                  - s3:GetBucketVersioning
+                  - s3:GetBucketEncryption
+                  - s3:GetBucketPolicy
+                  - s3:GetBucketAcl
+                  - s3:GetBucketCors
+                  - s3:GetBucketNotification
+                  - s3:GetBucketWebsite
+                  - s3:GetBucketLogging
+                  - s3:GetBucketTagging
+                  - s3:PutBucketVersioning
+                  - s3:PutBucketEncryption
+                  - s3:PutBucketPolicy
+                  - s3:PutBucketAcl
+                  - s3:PutBucketCors
+                  - s3:PutBucketNotification
+                  - s3:PutBucketWebsite
+                  - s3:PutBucketLogging
+                  - s3:PutBucketTagging
+                  - s3:ListBucket
+                  - s3:ListAllMyBuckets
+                Resource: '*'
+              # IAM Controller Permissions
+              - Sid: IAMControllerPermissions
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:UpdateRole
+                  - iam:ListRoles
+                  - iam:CreatePolicy
+                  - iam:DeletePolicy
+                  - iam:GetPolicy
+                  - iam:ListPolicies
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:ListAttachedRolePolicies
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:ListRoleTags
+                Resource: '*'
+              # Lambda Controller Permissions
+              - Sid: LambdaControllerPermissions
+                Effect: Allow
+                Action:
+                  - lambda:CreateFunction
+                  - lambda:DeleteFunction
+                  - lambda:GetFunction
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:ListFunctions
+                  - lambda:PublishVersion
+                  - lambda:CreateAlias
+                  - lambda:DeleteAlias
+                  - lambda:GetAlias
+                  - lambda:UpdateAlias
+                  - lambda:ListAliases
+                  - lambda:TagResource
+                  - lambda:UntagResource
+                  - lambda:ListTags
+                  - lambda:InvokeFunction
+                  - lambda:GetPolicy
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                Resource: '*'
+              # CloudWatch Logs for Lambda
+              - Sid: CloudWatchLogsPermissions
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-ack-controller-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # Platform Operator Role for custom operators
+  PlatformOperatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-platform-operator-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/${EKSCluster.OpenIdConnectIssuerUrl}'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                !Sub '${EKSCluster.OpenIdConnectIssuerUrl}:sub': 'system:serviceaccount:platform-operator-system:platform-operator-controller-manager'
+                !Sub '${EKSCluster.OpenIdConnectIssuerUrl}:aud': 'sts.amazonaws.com'
+      Policies:
+        - PolicyName: PlatformOperatorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:DeleteBucket
+                  - s3:GetBucketLocation
+                  - s3:ListAllMyBuckets
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:ListRoles
+                  - lambda:CreateFunction
+                  - lambda:DeleteFunction
+                  - lambda:GetFunction
+                  - lambda:ListFunctions
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-platform-operator-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # EKS Cluster
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt EKSClusterRole.Arn
+      ResourcesVpcConfig:
+        SecurityGroupIds:
+          - !Ref ControlPlaneSecurityGroup
+        SubnetIds:
+          - !Ref PublicSubnet1
+          - !Ref PublicSubnet2
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+        EndpointConfigPrivate: false
+        EndpointConfigPublic: true
+        PublicAccessCidrs:
+          - !Ref AllowedCIDR
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP
+        BootstrapClusterCreatorAdminPermissions: true
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+            - Type: controllerManager
+            - Type: scheduler
+      EncryptionConfig:
+        - Resources:
+            - secrets
+          Provider:
+            KeyId: alias/aws/eks
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref Project
+        Owner: !Ref Owner
+
+  # OIDC Identity Provider for service accounts
+  OIDCProvider:
+    Type: AWS::IAM::OIDCIdentityProvider
+    Properties:
+      Url: !GetAtt EKSCluster.OpenIdConnectIssuerUrl
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 9e99a48a9960b14926bb7f3b02e22da2b0ab7280  # EKS OIDC root CA thumbprint
+        - a9d53002e97e00e043244f3d170d6f4c414104fd  # Additional thumbprint
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-oidc-provider'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # EKS Node Group
+  EKSNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref ClusterName
+      NodegroupName: !Sub '${ClusterName}-nodes'
+      NodeRole: !GetAtt EKSNodeRole.Arn
+      InstanceTypes:
+        - !Ref NodeInstanceType
+      AmiType: AL2_x86_64
+      CapacityType: ON_DEMAND
+      DiskSize: 20
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      ScalingConfig:
+        MinSize: 1
+        MaxSize: !Ref NodeGroupMaxSize
+        DesiredSize: !Ref NodeGroupSize
+      UpdateConfig:
+        MaxUnavailable: 1
+      Labels:
+        Environment: !Ref Environment
+        Project: !Ref Project
+        NodeGroupType: general
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref Project
+        Owner: !Ref Owner
+        Name: !Sub '${ClusterName}-node-group'
+
+  # Bastion Host (conditional)
+  BastionHost:
+    Type: AWS::EC2::Instance
+    Condition: CreateBastionHost
+    Properties:
+      ImageId: !FindInMap [RegionMap, !Ref 'AWS::Region', AMIID]
+      InstanceType: t3.micro
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref BastionSecurityGroup
+      IamInstanceProfile: !Ref BastionInstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y aws-cli kubectl
+          
+          # Install helm
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          
+          # Configure kubectl
+          aws eks update-kubeconfig --region ${AWS::Region} --name ${ClusterName}
+          
+          # Create kubectl config for ec2-user
+          mkdir -p /home/ec2-user/.kube
+          cp /root/.kube/config /home/ec2-user/.kube/config
+          chown ec2-user:ec2-user /home/ec2-user/.kube/config
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-bastion'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  BastionRole:
+    Type: AWS::IAM::Role
+    Condition: CreateBastionHost
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-bastion-role'
+
+  BastionInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: CreateBastionHost
+    Properties:
+      Roles:
+        - !Ref BastionRole
+
+  # CloudWatch Log Groups for cluster logging
+  EKSClusterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/eks/${ClusterName}/cluster'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-cluster-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # S3 Bucket for ACK demonstrations and operator artifacts
+  ACKDemoBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ClusterName}-ack-demo-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-ack-demo-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Purpose
+          Value: ACK-Demo-Operator-Testing
+
+  # Lambda function for ACK demonstrations
+  ACKDemoLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub '${ACKDemoBucket}/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-lambda-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  ACKDemoLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ClusterName}-ack-demo-function'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ACKDemoLambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          
+          def lambda_handler(event, context):
+              print(f"Received event: {json.dumps(event)}")
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': 'Hello from ACK Demo Lambda!',
+                      'event': event
+                  })
+              }
+      Description: Demo Lambda function for ACK operator testing
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          CLUSTER_NAME: !Ref ClusterName
+          DEMO_BUCKET: !Ref ACKDemoBucket
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-ack-demo-function'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+Outputs:
+  ClusterName:
+    Description: Name of the EKS cluster
+    Value: !Ref EKSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterName'
+
+  ClusterEndpoint:
+    Description: EKS cluster endpoint
+    Value: !GetAtt EKSCluster.Endpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterEndpoint'
+
+  ClusterArn:
+    Description: EKS cluster ARN
+    Value: !GetAtt EKSCluster.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterArn'
+
+  ClusterSecurityGroupId:
+    Description: Security group ID for the EKS cluster
+    Value: !Ref ControlPlaneSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterSecurityGroupId'
+
+  NodeSecurityGroupId:
+    Description: Security group ID for the EKS nodes
+    Value: !Ref NodeSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-NodeSecurityGroupId'
+
+  VpcId:
+    Description: VPC ID where the cluster is deployed
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+
+  PrivateSubnetIds:
+    Description: Private subnet IDs
+    Value: !Sub '${PrivateSubnet1},${PrivateSubnet2}'
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnetIds'
+
+  PublicSubnetIds:
+    Description: Public subnet IDs
+    Value: !Sub '${PublicSubnet1},${PublicSubnet2}'
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnetIds'
+
+  ACKControllerRoleArn:
+    Description: IAM role ARN for ACK controllers
+    Value: !GetAtt ACKControllerRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ACKControllerRoleArn'
+
+  PlatformOperatorRoleArn:
+    Description: IAM role ARN for platform operators
+    Value: !GetAtt PlatformOperatorRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PlatformOperatorRoleArn'
+
+  OIDCProviderArn:
+    Description: OIDC provider ARN for service accounts
+    Value: !Ref OIDCProvider
+    Export:
+      Name: !Sub '${AWS::StackName}-OIDCProviderArn'
+
+  OIDCIssuerUrl:
+    Description: OIDC issuer URL
+    Value: !GetAtt EKSCluster.OpenIdConnectIssuerUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-OIDCIssuerUrl'
+
+  ACKDemoBucketName:
+    Description: S3 bucket for ACK demonstrations
+    Value: !Ref ACKDemoBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ACKDemoBucketName'
+
+  ACKDemoLambdaFunctionName:
+    Description: Lambda function for ACK demonstrations
+    Value: !Ref ACKDemoLambdaFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-ACKDemoLambdaFunctionName'
+
+  ACKDemoLambdaFunctionArn:
+    Description: Lambda function ARN for ACK demonstrations
+    Value: !GetAtt ACKDemoLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ACKDemoLambdaFunctionArn'
+
+  BastionHostPublicIP:
+    Condition: CreateBastionHost
+    Description: Public IP of the bastion host
+    Value: !GetAtt BastionHost.PublicIp
+    Export:
+      Name: !Sub '${AWS::StackName}-BastionHostPublicIP'
+
+  KubectlConfigCommand:
+    Description: Command to configure kubectl
+    Value: !Sub 'aws eks update-kubeconfig --region ${AWS::Region} --name ${ClusterName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-KubectlConfigCommand'
+
+  HelmRepoAddCommands:
+    Description: Commands to add ACK Helm repositories
+    Value: |
+      helm repo add aws-controllers-k8s https://aws-controllers-k8s.github.io/charts
+      helm repo update
+    Export:
+      Name: !Sub '${AWS::StackName}-HelmRepoAddCommands'
+
+  NextSteps:
+    Description: Next steps to deploy ACK controllers
+    Value: |
+      1. Configure kubectl: aws eks update-kubeconfig --region ${AWS::Region} --name ${ClusterName}
+      2. Install ACK controllers using the provided Helm commands
+      3. Create ACK system namespace: kubectl create namespace ack-system
+      4. Deploy custom operators using the operator-sdk or kubebuilder
+      5. Apply sample Application CRDs to test the operators

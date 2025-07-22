@@ -1,0 +1,692 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'DynamoDB Global Tables for Multi-Region Apps - Complete infrastructure deployment with monitoring and testing capabilities'
+
+Parameters:
+  # Table Configuration
+  TableName:
+    Type: String
+    Description: 'Name of the DynamoDB Global Table'
+    Default: 'GlobalUserProfiles'
+    AllowedPattern: '[a-zA-Z0-9_.-]+'
+    MinLength: 3
+    MaxLength: 255
+    ConstraintDescription: 'Table name must be 3-255 characters and contain only letters, numbers, underscores, periods, and hyphens'
+
+  # Region Configuration
+  SecondaryRegion:
+    Type: String
+    Description: 'Secondary region for Global Table replica'
+    Default: 'eu-west-1'
+    AllowedValues:
+      - 'us-east-1'
+      - 'us-east-2'
+      - 'us-west-1'
+      - 'us-west-2'
+      - 'eu-west-1'
+      - 'eu-west-2'
+      - 'eu-central-1'
+      - 'ap-southeast-1'
+      - 'ap-southeast-2'
+      - 'ap-northeast-1'
+      - 'ap-northeast-2'
+      - 'ap-south-1'
+    ConstraintDescription: 'Must be a valid AWS region'
+
+  TertiaryRegion:
+    Type: String
+    Description: 'Tertiary region for Global Table replica'
+    Default: 'ap-northeast-1'
+    AllowedValues:
+      - 'us-east-1'
+      - 'us-east-2'
+      - 'us-west-1'
+      - 'us-west-2'
+      - 'eu-west-1'
+      - 'eu-west-2'
+      - 'eu-central-1'
+      - 'ap-southeast-1'
+      - 'ap-southeast-2'
+      - 'ap-northeast-1'
+      - 'ap-northeast-2'
+      - 'ap-south-1'
+    ConstraintDescription: 'Must be a valid AWS region'
+
+  # Monitoring Configuration
+  ReplicationLatencyThreshold:
+    Type: Number
+    Description: 'Replication latency threshold in milliseconds for CloudWatch alarms'
+    Default: 10000
+    MinValue: 1000
+    MaxValue: 60000
+    ConstraintDescription: 'Threshold must be between 1000ms and 60000ms'
+
+  UserErrorThreshold:
+    Type: Number
+    Description: 'User error threshold for CloudWatch alarms'
+    Default: 5
+    MinValue: 1
+    MaxValue: 100
+    ConstraintDescription: 'Threshold must be between 1 and 100'
+
+  # Lambda Configuration
+  LambdaRuntime:
+    Type: String
+    Description: 'Lambda runtime for testing functions'
+    Default: 'python3.9'
+    AllowedValues:
+      - 'python3.8'
+      - 'python3.9'
+      - 'python3.10'
+      - 'python3.11'
+    ConstraintDescription: 'Must be a supported Python runtime'
+
+  # Environment Configuration
+  Environment:
+    Type: String
+    Description: 'Environment tag for all resources'
+    Default: 'production'
+    AllowedValues:
+      - 'development'
+      - 'staging'
+      - 'production'
+    ConstraintDescription: 'Must be development, staging, or production'
+
+Conditions:
+  # Check if secondary region is different from current region
+  CreateSecondaryRegion: !Not [!Equals [!Ref SecondaryRegion, !Ref 'AWS::Region']]
+  
+  # Check if tertiary region is different from current and secondary regions
+  CreateTertiaryRegion: !And
+    - !Not [!Equals [!Ref TertiaryRegion, !Ref 'AWS::Region']]
+    - !Not [!Equals [!Ref TertiaryRegion, !Ref SecondaryRegion]]
+  
+  # Check if we're in production environment
+  IsProduction: !Equals [!Ref Environment, 'production']
+
+Resources:
+  # IAM Role for Lambda Functions
+  GlobalTableLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${TableName}-GlobalTableLambdaRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBGlobalTableAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:*:${AWS::AccountId}:table/${TableName}'
+                  - !Sub 'arn:aws:dynamodb:*:${AWS::AccountId}:table/${TableName}/index/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:*:${AWS::AccountId}:*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Global Table Testing'
+
+  # DynamoDB Global Table
+  GlobalUserProfilesTable:
+    Type: AWS::DynamoDB::GlobalTable
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      SSESpecification:
+        SSEEnabled: true
+      Replicas:
+        - Region: !Ref 'AWS::Region'
+          GlobalSecondaryIndexes:
+            - IndexName: EmailIndex
+              KeySchema:
+                - AttributeName: Email
+                  KeyType: HASH
+              Projection:
+                ProjectionType: ALL
+          Tags:
+            - Key: Environment
+              Value: !Ref Environment
+            - Key: Purpose
+              Value: 'Global Table Primary'
+        - !If
+          - CreateSecondaryRegion
+          - Region: !Ref SecondaryRegion
+            GlobalSecondaryIndexes:
+              - IndexName: EmailIndex
+                KeySchema:
+                  - AttributeName: Email
+                    KeyType: HASH
+                Projection:
+                  ProjectionType: ALL
+            Tags:
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: Purpose
+                Value: 'Global Table Secondary'
+          - !Ref AWS::NoValue
+        - !If
+          - CreateTertiaryRegion
+          - Region: !Ref TertiaryRegion
+            GlobalSecondaryIndexes:
+              - IndexName: EmailIndex
+                KeySchema:
+                  - AttributeName: Email
+                    KeyType: HASH
+                Projection:
+                  ProjectionType: ALL
+            Tags:
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: Purpose
+                Value: 'Global Table Tertiary'
+          - !Ref AWS::NoValue
+      AttributeDefinitions:
+        - AttributeName: UserId
+          AttributeType: S
+        - AttributeName: ProfileType
+          AttributeType: S
+        - AttributeName: Email
+          AttributeType: S
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: false
+
+  # Lambda Function for Testing Global Table Operations
+  GlobalTableProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${TableName}-GlobalTableProcessor-${AWS::Region}'
+      Description: 'Lambda function for testing DynamoDB Global Table operations'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt GlobalTableLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          CURRENT_REGION: !Ref 'AWS::Region'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import time
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              # Get region from environment or context
+              region = os.environ.get('CURRENT_REGION', context.invoked_function_arn.split(':')[3])
+              
+              # Initialize DynamoDB client
+              dynamodb = boto3.resource('dynamodb', region_name=region)
+              table = dynamodb.Table(os.environ['TABLE_NAME'])
+              
+              # Process the operation
+              operation = event.get('operation', 'put')
+              
+              try:
+                  if operation == 'put':
+                      # Create a test item
+                      user_id = event.get('userId', f'user-{int(time.time())}')
+                      profile_type = event.get('profileType', 'standard')
+                      
+                      response = table.put_item(
+                          Item={
+                              'UserId': user_id,
+                              'ProfileType': profile_type,
+                              'Name': event.get('name', 'Test User'),
+                              'Email': event.get('email', 'test@example.com'),
+                              'Region': region,
+                              'CreatedAt': datetime.utcnow().isoformat(),
+                              'LastModified': datetime.utcnow().isoformat(),
+                              'Version': 1
+                          }
+                      )
+                      
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': f'Item created in {region}',
+                              'userId': user_id,
+                              'profileType': profile_type,
+                              'operation': 'put'
+                          })
+                      }
+                  
+                  elif operation == 'get':
+                      # Retrieve an item
+                      user_id = event.get('userId')
+                      profile_type = event.get('profileType', 'standard')
+                      
+                      if not user_id:
+                          return {
+                              'statusCode': 400,
+                              'body': json.dumps({'error': 'userId is required for get operation'})
+                          }
+                      
+                      response = table.get_item(
+                          Key={
+                              'UserId': user_id,
+                              'ProfileType': profile_type
+                          }
+                      )
+                      
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': f'Item retrieved from {region}',
+                              'item': response.get('Item'),
+                              'operation': 'get'
+                          }, default=str)
+                      }
+                  
+                  elif operation == 'scan':
+                      # Scan for items in this region
+                      response = table.scan(
+                          ProjectionExpression='UserId, ProfileType, #r, CreatedAt',
+                          ExpressionAttributeNames={'#r': 'Region'},
+                          Limit=10
+                      )
+                      
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': f'Items scanned from {region}',
+                              'count': response['Count'],
+                              'items': response.get('Items', []),
+                              'operation': 'scan'
+                          }, default=str)
+                      }
+                  
+                  elif operation == 'query_email':
+                      # Query using GSI
+                      email = event.get('email')
+                      if not email:
+                          return {
+                              'statusCode': 400,
+                              'body': json.dumps({'error': 'email is required for query_email operation'})
+                          }
+                      
+                      response = table.query(
+                          IndexName='EmailIndex',
+                          KeyConditionExpression='Email = :email',
+                          ExpressionAttributeValues={':email': email}
+                      )
+                      
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': f'Items queried by email from {region}',
+                              'count': response['Count'],
+                              'items': response.get('Items', []),
+                              'operation': 'query_email'
+                          }, default=str)
+                      }
+                  
+                  else:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': f'Unknown operation: {operation}'})
+                      }
+              
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'operation': operation,
+                          'region': region
+                      })
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Global Table Testing'
+
+  # CloudWatch Alarms for Global Table Monitoring
+  ReplicationLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateSecondaryRegion
+    Properties:
+      AlarmName: !Sub '${TableName}-ReplicationLatency-${SecondaryRegion}'
+      AlarmDescription: !Sub 'Monitor replication latency for ${TableName} to ${SecondaryRegion}'
+      MetricName: ReplicationLatency
+      Namespace: AWS/DynamoDB
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref ReplicationLatencyThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: TableName
+          Value: !Ref TableName
+        - Name: ReceivingRegion
+          Value: !Ref SecondaryRegion
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Global Table Monitoring'
+
+  TertiaryReplicationLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateTertiaryRegion
+    Properties:
+      AlarmName: !Sub '${TableName}-ReplicationLatency-${TertiaryRegion}'
+      AlarmDescription: !Sub 'Monitor replication latency for ${TableName} to ${TertiaryRegion}'
+      MetricName: ReplicationLatency
+      Namespace: AWS/DynamoDB
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref ReplicationLatencyThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: TableName
+          Value: !Ref TableName
+        - Name: ReceivingRegion
+          Value: !Ref TertiaryRegion
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Global Table Monitoring'
+
+  UserErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${TableName}-UserErrors'
+      AlarmDescription: !Sub 'Monitor user errors for ${TableName}'
+      MetricName: UserErrors
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref UserErrorThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: TableName
+          Value: !Ref TableName
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Global Table Monitoring'
+
+  # CloudWatch Dashboard for Global Table Monitoring
+  GlobalTableDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${TableName}-GlobalTable-Dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${TableName}"],
+                  [".", "ConsumedWriteCapacityUnits", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Read/Write Capacity Consumption",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/DynamoDB", "ReplicationLatency", "TableName", "${TableName}", "ReceivingRegion", "${SecondaryRegion}"],
+                  [".", ".", ".", ".", ".", "${TertiaryRegion}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Replication Latency",
+                "view": "timeSeries",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/DynamoDB", "UserErrors", "TableName", "${TableName}"],
+                  [".", "SystemErrors", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Error Metrics",
+                "view": "timeSeries",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/DynamoDB", "SuccessfulRequestLatency", "TableName", "${TableName}", "Operation", "PutItem"],
+                  [".", ".", ".", ".", ".", "GetItem"],
+                  [".", ".", ".", ".", ".", "Query"],
+                  [".", ".", ".", ".", ".", "Scan"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Request Latency by Operation",
+                "view": "timeSeries",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+  # Log Group for Lambda Function
+  GlobalTableProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${TableName}-GlobalTableProcessor-${AWS::Region}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Global Table Testing Logs'
+
+  # SNS Topic for Alarms (Optional)
+  GlobalTableAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${TableName}-GlobalTable-Alarms'
+      DisplayName: !Sub '${TableName} Global Table Alarms'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Global Table Alerting'
+
+Outputs:
+  # Table Information
+  TableName:
+    Description: 'Name of the DynamoDB Global Table'
+    Value: !Ref GlobalUserProfilesTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TableName'
+
+  TableArn:
+    Description: 'ARN of the DynamoDB Global Table'
+    Value: !GetAtt GlobalUserProfilesTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TableArn'
+
+  TableStreamArn:
+    Description: 'Stream ARN of the DynamoDB Global Table'
+    Value: !GetAtt GlobalUserProfilesTable.StreamArn
+    Export:
+      Name: !Sub '${AWS::StackName}-TableStreamArn'
+
+  # Lambda Function Information
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function for testing Global Table operations'
+    Value: !Ref GlobalTableProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function for testing Global Table operations'
+    Value: !GetAtt GlobalTableProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  # IAM Role Information
+  LambdaRoleArn:
+    Description: 'ARN of the IAM role for Lambda function'
+    Value: !GetAtt GlobalTableLambdaRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaRoleArn'
+
+  # Monitoring Information
+  DashboardURL:
+    Description: 'URL to the CloudWatch Dashboard for Global Table monitoring'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${TableName}-GlobalTable-Dashboard'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  # Region Configuration
+  PrimaryRegion:
+    Description: 'Primary region for the Global Table'
+    Value: !Ref 'AWS::Region'
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryRegion'
+
+  SecondaryRegion:
+    Description: 'Secondary region for the Global Table'
+    Value: !Ref SecondaryRegion
+    Export:
+      Name: !Sub '${AWS::StackName}-SecondaryRegion'
+
+  TertiaryRegion:
+    Description: 'Tertiary region for the Global Table'
+    Value: !Ref TertiaryRegion
+    Export:
+      Name: !Sub '${AWS::StackName}-TertiaryRegion'
+
+  # Testing Commands
+  TestPutCommand:
+    Description: 'AWS CLI command to test putting an item via Lambda'
+    Value: !Sub |
+      aws lambda invoke \
+        --function-name ${GlobalTableProcessorFunction} \
+        --payload '{"operation": "put", "userId": "test-user", "profileType": "premium", "name": "Test User", "email": "test@example.com"}' \
+        --region ${AWS::Region} \
+        response.json
+
+  TestGetCommand:
+    Description: 'AWS CLI command to test getting an item via Lambda'
+    Value: !Sub |
+      aws lambda invoke \
+        --function-name ${GlobalTableProcessorFunction} \
+        --payload '{"operation": "get", "userId": "test-user", "profileType": "premium"}' \
+        --region ${AWS::Region} \
+        response.json
+
+  TestScanCommand:
+    Description: 'AWS CLI command to test scanning items via Lambda'
+    Value: !Sub |
+      aws lambda invoke \
+        --function-name ${GlobalTableProcessorFunction} \
+        --payload '{"operation": "scan"}' \
+        --region ${AWS::Region} \
+        response.json
+
+  TestQueryByEmailCommand:
+    Description: 'AWS CLI command to test querying by email via Lambda'
+    Value: !Sub |
+      aws lambda invoke \
+        --function-name ${GlobalTableProcessorFunction} \
+        --payload '{"operation": "query_email", "email": "test@example.com"}' \
+        --region ${AWS::Region} \
+        response.json
+
+  # Monitoring Commands
+  CheckReplicationLatencyCommand:
+    Description: 'AWS CLI command to check replication latency metrics'
+    Value: !Sub |
+      aws cloudwatch get-metric-statistics \
+        --namespace AWS/DynamoDB \
+        --metric-name ReplicationLatency \
+        --dimensions Name=TableName,Value=${TableName} Name=ReceivingRegion,Value=${SecondaryRegion} \
+        --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S) \
+        --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+        --period 300 \
+        --statistics Average \
+        --region ${AWS::Region}
+
+  # SNS Topic for Notifications
+  AlarmTopicArn:
+    Description: 'ARN of the SNS topic for Global Table alarms'
+    Value: !Ref GlobalTableAlarmTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlarmTopicArn'

@@ -1,0 +1,483 @@
+# Google Cloud Infrastructure Manager Configuration
+# Recipe: Developing Browser-Based AI Applications with Cloud Shell Editor and Vertex AI
+# This configuration deploys the complete infrastructure for browser-based AI application development
+
+apiVersion: blueprints.cloud.google.com/v1alpha1
+kind: BlueprintRevision
+metadata:
+  name: browser-ai-app-infrastructure
+  labels:
+    purpose: ai-development
+    environment: development
+    recipe-id: f7e8a9b2
+
+# Input variables for customization
+variables:
+  # Project configuration
+  - name: project_id
+    description: "Google Cloud Project ID for the AI application"
+    type: string
+    required: true
+    validation:
+      pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+
+  - name: region
+    description: "Google Cloud region for deploying resources"
+    type: string
+    required: false
+    default: "us-central1"
+    validation:
+      enum: ["us-central1", "us-east1", "us-west1", "europe-west1", "asia-east1"]
+
+  - name: service_name
+    description: "Name for the Cloud Run service"
+    type: string
+    required: false
+    default: "ai-chat-assistant"
+    validation:
+      pattern: "^[a-z][a-z0-9-]{1,61}[a-z0-9]$"
+
+  - name: environment
+    description: "Environment name (dev, staging, prod)"
+    type: string
+    required: false
+    default: "dev"
+    validation:
+      enum: ["dev", "staging", "prod"]
+
+  - name: enable_monitoring
+    description: "Enable advanced monitoring and logging"
+    type: bool
+    required: false
+    default: true
+
+  - name: max_instances
+    description: "Maximum number of Cloud Run instances"
+    type: number
+    required: false
+    default: 10
+    validation:
+      minimum: 1
+      maximum: 1000
+
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/cloudbuild.googleapis.com
+      
+  - name: enable-run-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/run.googleapis.com
+
+  - name: enable-aiplatform-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/aiplatform.googleapis.com
+
+  - name: enable-artifactregistry-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/artifactregistry.googleapis.com
+
+  - name: enable-secretmanager-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/secretmanager.googleapis.com
+
+  - name: enable-logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/logging.googleapis.com
+
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project.projectId)/services/monitoring.googleapis.com
+
+  # Project reference for other resources
+  - name: project
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: $(var.project_id)
+    metadata:
+      runtimePolicy: ["UPDATE_ON_CHANGE"]
+
+  # Artifact Registry repository for container images
+  - name: container-registry
+    type: gcp-types/artifactregistry-v1:projects.locations.repositories
+    properties:
+      parent: projects/$(var.project_id)/locations/$(var.region)
+      repositoryId: $(var.service_name)-repo
+      repository:
+        format: DOCKER
+        description: "Container repository for AI chat assistant application"
+        labels:
+          purpose: ai-application
+          environment: $(var.environment)
+    metadata:
+      dependsOn:
+        - enable-artifactregistry-api
+
+  # Service Account for Cloud Run service
+  - name: cloudrun-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: $(var.service_name)-sa
+      serviceAccount:
+        displayName: "Cloud Run Service Account for AI Chat Assistant"
+        description: "Service account for running AI chat assistant on Cloud Run"
+      parent: projects/$(var.project_id)
+    metadata:
+      dependsOn:
+        - project
+
+  # IAM binding for Vertex AI access
+  - name: vertexai-user-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/$(var.project_id)
+      role: roles/aiplatform.user
+      member: serviceAccount:$(ref.cloudrun-service-account.email)
+    metadata:
+      dependsOn:
+        - cloudrun-service-account
+        - enable-aiplatform-api
+
+  # IAM binding for Secret Manager access
+  - name: secretmanager-accessor-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/$(var.project_id)
+      role: roles/secretmanager.secretAccessor
+      member: serviceAccount:$(ref.cloudrun-service-account.email)
+    metadata:
+      dependsOn:
+        - cloudrun-service-account
+        - enable-secretmanager-api
+
+  # IAM binding for logging
+  - name: logging-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/$(var.project_id)
+      role: roles/logging.logWriter
+      member: serviceAccount:$(ref.cloudrun-service-account.email)
+    metadata:
+      dependsOn:
+        - cloudrun-service-account
+        - enable-logging-api
+
+  # IAM binding for monitoring
+  - name: monitoring-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/$(var.project_id)
+      role: roles/monitoring.metricWriter
+      member: serviceAccount:$(ref.cloudrun-service-account.email)
+    metadata:
+      dependsOn:
+        - cloudrun-service-account
+        - enable-monitoring-api
+
+  # Cloud Build service account IAM bindings
+  - name: cloudbuild-run-developer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/$(var.project_id)
+      role: roles/run.developer
+      member: serviceAccount:$(ref.project.projectNumber)@cloudbuild.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - project
+        - enable-cloudbuild-api
+
+  - name: cloudbuild-iam-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/$(var.project_id)
+      role: roles/iam.serviceAccountUser
+      member: serviceAccount:$(ref.project.projectNumber)@cloudbuild.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - project
+        - enable-cloudbuild-api
+
+  # Secret for storing configuration (optional, for production use)
+  - name: app-config-secret
+    type: gcp-types/secretmanager-v1:projects.secrets
+    properties:
+      parent: projects/$(var.project_id)
+      secretId: ai-app-config
+      secret:
+        replication:
+          automatic: {}
+        labels:
+          application: ai-chat-assistant
+          environment: $(var.environment)
+    metadata:
+      dependsOn:
+        - enable-secretmanager-api
+
+  # Cloud Run service for the AI application
+  - name: ai-chat-service
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/$(var.project_id)
+      location: $(var.region)
+      body:
+        apiVersion: serving.knative.dev/v1
+        kind: Service
+        metadata:
+          name: $(var.service_name)
+          namespace: $(var.project_id)
+          labels:
+            cloud.googleapis.com/location: $(var.region)
+            purpose: ai-application
+            environment: $(var.environment)
+          annotations:
+            # Enable CPU allocation during request processing only
+            run.googleapis.com/cpu-throttling: "true"
+            # Set up custom domain if needed
+            run.googleapis.com/ingress: all
+        spec:
+          template:
+            metadata:
+              labels:
+                purpose: ai-application
+                environment: $(var.environment)
+              annotations:
+                # Scaling configuration
+                autoscaling.knative.dev/maxScale: "$(var.max_instances)"
+                autoscaling.knative.dev/minScale: "0"
+                # Resource allocation
+                run.googleapis.com/memory: "1Gi"
+                run.googleapis.com/cpu: "1"
+                # Execution environment
+                run.googleapis.com/execution-environment: gen2
+                # VPC connector (if needed for private resources)
+                # run.googleapis.com/vpc-access-connector: "projects/$(var.project_id)/locations/$(var.region)/connectors/vpc-connector"
+            spec:
+              serviceAccountName: $(ref.cloudrun-service-account.email)
+              containerConcurrency: 80
+              timeoutSeconds: 300
+              containers:
+              - name: ai-chat-app
+                # Placeholder image - will be updated by Cloud Build
+                image: gcr.io/$(var.project_id)/$(var.service_name):latest
+                ports:
+                - name: http1
+                  containerPort: 8080
+                  protocol: TCP
+                env:
+                - name: GOOGLE_CLOUD_PROJECT
+                  value: $(var.project_id)
+                - name: GOOGLE_CLOUD_REGION
+                  value: $(var.region)
+                - name: ENVIRONMENT
+                  value: $(var.environment)
+                - name: SERVICE_NAME
+                  value: $(var.service_name)
+                resources:
+                  limits:
+                    cpu: "1"
+                    memory: "1Gi"
+                  requests:
+                    cpu: "0.5"
+                    memory: "512Mi"
+                # Health checks
+                livenessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8080
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+                  timeoutSeconds: 5
+                  failureThreshold: 3
+                readinessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8080
+                  initialDelaySeconds: 10
+                  periodSeconds: 5
+                  timeoutSeconds: 3
+                  successThreshold: 1
+          traffic:
+          - percent: 100
+            latestRevision: true
+    metadata:
+      dependsOn:
+        - enable-run-api
+        - cloudrun-service-account
+        - container-registry
+
+  # IAM policy to allow unauthenticated access (adjust for production)
+  - name: cloudrun-public-access
+    type: gcp-types/run-v1:projects.locations.services.setIamPolicy
+    properties:
+      resource: projects/$(var.project_id)/locations/$(var.region)/services/$(var.service_name)
+      policy:
+        bindings:
+        - role: roles/run.invoker
+          members:
+          - allUsers
+    metadata:
+      dependsOn:
+        - ai-chat-service
+
+  # Cloud Build trigger for automated deployment (optional)
+  - name: build-trigger
+    type: gcp-types/cloudbuild-v1:projects.triggers
+    properties:
+      parent: projects/$(var.project_id)
+      trigger:
+        name: $(var.service_name)-deploy-trigger
+        description: "Automated deployment trigger for AI chat assistant"
+        disabled: false
+        substitutions:
+          _SERVICE_NAME: $(var.service_name)
+          _REGION: $(var.region)
+          _ENVIRONMENT: $(var.environment)
+        # Configure based on your source repository
+        github:
+          owner: "your-github-username"
+          name: "your-repository-name"
+          push:
+            branch: "^main$"
+        filename: "cloudbuild.yaml"
+        includeBuildLogs: INCLUDE_BUILD_LOGS_WITH_STATUS
+    metadata:
+      dependsOn:
+        - enable-cloudbuild-api
+      # Optional: Remove this resource if not using GitHub integration
+
+  # Monitoring dashboard (if monitoring is enabled)
+  - name: monitoring-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      parent: projects/$(var.project_id)
+      dashboard:
+        displayName: "AI Chat Assistant - $(var.environment)"
+        mosaicLayout:
+          tiles:
+          - width: 6
+            height: 4
+            widget:
+              title: "Cloud Run Request Count"
+              xyChart:
+                dataSets:
+                - timeSeriesQuery:
+                    timeSeriesFilter:
+                      filter: 'resource.type="cloud_run_revision" AND resource.label.service_name="$(var.service_name)"'
+                      aggregation:
+                        alignmentPeriod: "60s"
+                        perSeriesAligner: "ALIGN_RATE"
+                        crossSeriesReducer: "REDUCE_SUM"
+                yAxis:
+                  label: "Requests/sec"
+          - width: 6
+            height: 4
+            xPos: 6
+            widget:
+              title: "Cloud Run Response Latency"
+              xyChart:
+                dataSets:
+                - timeSeriesQuery:
+                    timeSeriesFilter:
+                      filter: 'resource.type="cloud_run_revision" AND resource.label.service_name="$(var.service_name)" AND metric.type="run.googleapis.com/request_latencies"'
+                      aggregation:
+                        alignmentPeriod: "60s"
+                        perSeriesAligner: "ALIGN_DELTA"
+                        crossSeriesReducer: "REDUCE_MEAN"
+                yAxis:
+                  label: "Latency (ms)"
+          - width: 12
+            height: 4
+            yPos: 4
+            widget:
+              title: "Vertex AI API Calls"
+              xyChart:
+                dataSets:
+                - timeSeriesQuery:
+                    timeSeriesFilter:
+                      filter: 'resource.type="aiplatform.googleapis.com/Endpoint" AND metric.type="aiplatform.googleapis.com/prediction/online/request_count"'
+                      aggregation:
+                        alignmentPeriod: "300s"
+                        perSeriesAligner: "ALIGN_RATE"
+                        crossSeriesReducer: "REDUCE_SUM"
+                yAxis:
+                  label: "API Calls/sec"
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+      condition: $(var.enable_monitoring)
+
+  # Log-based alerting policy for error rate
+  - name: error-rate-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(var.project_id)
+      alertPolicy:
+        displayName: "High Error Rate - AI Chat Assistant"
+        documentation:
+          content: "Alert when error rate exceeds 5% for the AI chat assistant service"
+        conditions:
+        - displayName: "Cloud Run Error Rate"
+          conditionThreshold:
+            filter: 'resource.type="cloud_run_revision" AND resource.label.service_name="$(var.service_name)" AND metric.type="run.googleapis.com/request_count"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 0.05
+            duration: "300s"
+            aggregations:
+            - alignmentPeriod: "60s"
+              perSeriesAligner: "ALIGN_RATE"
+              crossSeriesReducer: "REDUCE_MEAN"
+              groupByFields:
+              - "resource.label.service_name"
+        enabled: true
+        combiner: OR
+        notificationChannels: []
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+        - ai-chat-service
+      condition: $(var.enable_monitoring)
+
+# Output values for reference and integration
+outputs:
+  - name: service_url
+    description: "URL of the deployed Cloud Run service"
+    value: $(ref.ai-chat-service.status.url)
+
+  - name: service_account_email
+    description: "Email of the service account used by Cloud Run"
+    value: $(ref.cloudrun-service-account.email)
+
+  - name: container_registry_url
+    description: "URL of the Artifact Registry repository"
+    value: $(var.region)-docker.pkg.dev/$(var.project_id)/$(var.service_name)-repo
+
+  - name: project_id
+    description: "Google Cloud Project ID"
+    value: $(var.project_id)
+
+  - name: region
+    description: "Deployment region"
+    value: $(var.region)
+
+  - name: monitoring_dashboard_url
+    description: "URL to the monitoring dashboard"
+    value: "https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.monitoring-dashboard.name)?project=$(var.project_id)"
+    condition: $(var.enable_monitoring)
+
+# Metadata for Infrastructure Manager
+metadata:
+  version: "1.0.0"
+  description: "Infrastructure for browser-based AI applications using Cloud Shell Editor and Vertex AI"
+  labels:
+    recipe-id: "f7e8a9b2"
+    category: "developer-tools"
+    difficulty: "200"
+    provider: "gcp"

@@ -1,0 +1,652 @@
+# Google Cloud Infrastructure Manager Configuration
+# Dynamic Email Campaign Workflows with Gmail API and Cloud Scheduler
+# This configuration deploys a complete email campaign automation system
+
+# Metadata and configuration
+imports:
+  - name: project-services
+    type: gcp-types/serviceusage-v1:serviceusage.services.batchEnable
+  - name: cloud-storage
+    type: gcp-types/storage-v1:storage.bucket
+  - name: cloud-functions
+    type: gcp-types/cloudfunctions-v1:cloudfunctions.projects.locations.functions
+  - name: cloud-scheduler
+    type: gcp-types/cloudscheduler-v1:cloudscheduler.projects.locations.jobs
+  - name: bigquery
+    type: gcp-types/bigquery-v2:bigquery.datasets
+
+# Template inputs
+inputs:
+  - name: project_id
+    type: string
+    description: "Google Cloud project ID"
+    required: true
+  - name: region
+    type: string
+    description: "Google Cloud region for resource deployment"
+    default: "us-central1"
+  - name: zone
+    type: string
+    description: "Google Cloud zone for resource deployment"
+    default: "us-central1-a"
+  - name: bucket_name_suffix
+    type: string
+    description: "Suffix for unique bucket naming"
+    default: ""
+  - name: function_name_prefix
+    type: string
+    description: "Prefix for Cloud Function names"
+    default: "email-campaign"
+  - name: time_zone
+    type: string
+    description: "Time zone for scheduler jobs"
+    default: "America/New_York"
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:serviceusage.services.batchEnable
+    properties:
+      parent: projects/{{ env.project_id }}
+      serviceIds:
+        - cloudfunctions.googleapis.com
+        - cloudscheduler.googleapis.com
+        - storage.googleapis.com
+        - gmail.googleapis.com
+        - bigquery.googleapis.com
+        - monitoring.googleapis.com
+        - logging.googleapis.com
+    metadata:
+      dependsOn: []
+
+  # Create service account for Gmail API automation
+  - name: gmail-automation-sa
+    type: gcp-types/iam-v1:iam.projects.serviceAccounts
+    properties:
+      parent: projects/{{ env.project_id }}
+      accountId: gmail-automation-sa
+      serviceAccount:
+        displayName: Gmail Automation Service Account
+        description: Service account for automated email campaigns
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # Create service account key for Gmail API access
+  - name: gmail-automation-key
+    type: gcp-types/iam-v1:iam.projects.serviceAccounts.keys
+    properties:
+      parent: projects/{{ env.project_id }}/serviceAccounts/gmail-automation-sa@{{ env.project_id }}.iam.gserviceaccount.com
+      privateKeyType: TYPE_GOOGLE_CREDENTIALS_FILE
+    metadata:
+      dependsOn:
+        - gmail-automation-sa
+
+  # Grant necessary IAM roles to service account
+  - name: gmail-sa-storage-binding
+    type: gcp-types/cloudresourcemanager-v1:cloudresourcemanager.projects.setIamPolicy
+    properties:
+      resource: {{ env.project_id }}
+      policy:
+        bindings:
+          - role: roles/storage.objectAdmin
+            members:
+              - serviceAccount:gmail-automation-sa@{{ env.project_id }}.iam.gserviceaccount.com
+          - role: roles/bigquery.dataEditor
+            members:
+              - serviceAccount:gmail-automation-sa@{{ env.project_id }}.iam.gserviceaccount.com
+          - role: roles/monitoring.metricWriter
+            members:
+              - serviceAccount:gmail-automation-sa@{{ env.project_id }}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - gmail-automation-sa
+
+  # Create Cloud Storage bucket for campaign data
+  - name: email-campaigns-bucket
+    type: gcp-types/storage-v1:storage.bucket
+    properties:
+      project: {{ env.project_id }}
+      name: email-campaigns-{{ inputs.bucket_name_suffix }}
+      location: {{ inputs.region }}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 365
+              matchesStorageClass:
+                - STANDARD
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # Create initial folder structure in bucket
+  - name: templates-folder
+    type: gcp-types/storage-v1:storage.object
+    properties:
+      bucket: email-campaigns-{{ inputs.bucket_name_suffix }}
+      name: templates/welcome.txt
+      contentType: text/plain
+      uploadType: media
+      data: |
+        Campaign data structure initialized
+    metadata:
+      dependsOn:
+        - email-campaigns-bucket
+
+  - name: analytics-folder
+    type: gcp-types/storage-v1:storage.object
+    properties:
+      bucket: email-campaigns-{{ inputs.bucket_name_suffix }}
+      name: analytics/metrics.json
+      contentType: application/json
+      uploadType: media
+      data: |
+        {"message": "User behavior tracking enabled"}
+    metadata:
+      dependsOn:
+        - email-campaigns-bucket
+
+  # Create BigQuery dataset for analytics
+  - name: email-campaigns-dataset
+    type: gcp-types/bigquery-v2:bigquery.datasets
+    properties:
+      projectId: {{ env.project_id }}
+      datasetId: email_campaigns
+      location: {{ inputs.region }}
+      description: Email campaign analytics and user behavior data
+      access:
+        - role: OWNER
+          userByEmail: gmail-automation-sa@{{ env.project_id }}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - enable-apis
+        - gmail-automation-sa
+
+  # Create BigQuery table for user behavior
+  - name: user-behavior-table
+    type: gcp-types/bigquery-v2:bigquery.tables
+    properties:
+      projectId: {{ env.project_id }}
+      datasetId: email_campaigns
+      tableId: user_behavior
+      description: User behavior tracking for email personalization
+      schema:
+        fields:
+          - name: user_id
+            type: STRING
+            mode: REQUIRED
+          - name: email
+            type: STRING
+            mode: REQUIRED
+          - name: last_activity
+            type: TIMESTAMP
+            mode: NULLABLE
+          - name: purchase_history
+            type: STRING
+            mode: NULLABLE
+          - name: preferences
+            type: STRING
+            mode: NULLABLE
+    metadata:
+      dependsOn:
+        - email-campaigns-dataset
+
+  # Create BigQuery table for campaign metrics
+  - name: campaign-metrics-table
+    type: gcp-types/bigquery-v2:bigquery.tables
+    properties:
+      projectId: {{ env.project_id }}
+      datasetId: email_campaigns
+      tableId: campaign_metrics
+      description: Campaign performance metrics and analytics
+      schema:
+        fields:
+          - name: campaign_id
+            type: STRING
+            mode: REQUIRED
+          - name: sent_count
+            type: INTEGER
+            mode: NULLABLE
+          - name: delivered_count
+            type: INTEGER
+            mode: NULLABLE
+          - name: opened_count
+            type: INTEGER
+            mode: NULLABLE
+          - name: clicked_count
+            type: INTEGER
+            mode: NULLABLE
+          - name: timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+    metadata:
+      dependsOn:
+        - email-campaigns-dataset
+
+  # Create Cloud Function for campaign generation
+  - name: campaign-generator-function
+    type: gcp-types/cloudfunctions-v1:cloudfunctions.projects.locations.functions
+    properties:
+      parent: projects/{{ env.project_id }}/locations/{{ inputs.region }}
+      functionId: {{ inputs.function_name_prefix }}-generator
+      function:
+        name: projects/{{ env.project_id }}/locations/{{ inputs.region }}/functions/{{ inputs.function_name_prefix }}-generator
+        description: Generate personalized email campaigns based on user behavior
+        sourceArchiveUrl: gs://email-campaigns-{{ inputs.bucket_name_suffix }}/source/campaign-generator.zip
+        httpsTrigger:
+          securityLevel: SECURE_OPTIONAL
+        runtime: python39
+        entryPoint: generate_campaign
+        timeout: 300s
+        availableMemoryMb: 512
+        maxInstances: 10
+        environmentVariables:
+          BUCKET_NAME: email-campaigns-{{ inputs.bucket_name_suffix }}
+          PROJECT_ID: {{ env.project_id }}
+        serviceAccountEmail: gmail-automation-sa@{{ env.project_id }}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - enable-apis
+        - email-campaigns-bucket
+        - gmail-automation-sa
+
+  # Create Cloud Function for email sending
+  - name: email-sender-function
+    type: gcp-types/cloudfunctions-v1:cloudfunctions.projects.locations.functions
+    properties:
+      parent: projects/{{ env.project_id }}/locations/{{ inputs.region }}
+      functionId: {{ inputs.function_name_prefix }}-sender
+      function:
+        name: projects/{{ env.project_id }}/locations/{{ inputs.region }}/functions/{{ inputs.function_name_prefix }}-sender
+        description: Send personalized emails using Gmail API
+        sourceArchiveUrl: gs://email-campaigns-{{ inputs.bucket_name_suffix }}/source/email-sender.zip
+        httpsTrigger:
+          securityLevel: SECURE_OPTIONAL
+        runtime: python39
+        entryPoint: send_emails
+        timeout: 300s
+        availableMemoryMb: 512
+        maxInstances: 10
+        environmentVariables:
+          BUCKET_NAME: email-campaigns-{{ inputs.bucket_name_suffix }}
+          PROJECT_ID: {{ env.project_id }}
+        serviceAccountEmail: gmail-automation-sa@{{ env.project_id }}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - enable-apis
+        - email-campaigns-bucket
+        - gmail-automation-sa
+
+  # Create Cloud Function for analytics
+  - name: analytics-function
+    type: gcp-types/cloudfunctions-v1:cloudfunctions.projects.locations.functions
+    properties:
+      parent: projects/{{ env.project_id }}/locations/{{ inputs.region }}
+      functionId: {{ inputs.function_name_prefix }}-analytics
+      function:
+        name: projects/{{ env.project_id }}/locations/{{ inputs.region }}/functions/{{ inputs.function_name_prefix }}-analytics
+        description: Analyze email campaign performance and generate insights
+        sourceArchiveUrl: gs://email-campaigns-{{ inputs.bucket_name_suffix }}/source/analytics.zip
+        httpsTrigger:
+          securityLevel: SECURE_OPTIONAL
+        runtime: python39
+        entryPoint: analyze_campaigns
+        timeout: 180s
+        availableMemoryMb: 256
+        maxInstances: 5
+        environmentVariables:
+          PROJECT_ID: {{ env.project_id }}
+          BUCKET_NAME: email-campaigns-{{ inputs.bucket_name_suffix }}
+        serviceAccountEmail: gmail-automation-sa@{{ env.project_id }}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - enable-apis
+        - email-campaigns-dataset
+        - gmail-automation-sa
+
+  # Create Cloud Scheduler job for daily campaign generation
+  - name: daily-campaign-scheduler
+    type: gcp-types/cloudscheduler-v1:cloudscheduler.projects.locations.jobs
+    properties:
+      parent: projects/{{ env.project_id }}/locations/{{ inputs.region }}
+      jobId: campaign-generator-daily
+      job:
+        name: projects/{{ env.project_id }}/locations/{{ inputs.region }}/jobs/campaign-generator-daily
+        description: Daily email campaign generation
+        schedule: "0 8 * * *"
+        timeZone: {{ inputs.time_zone }}
+        httpTarget:
+          uri: https://{{ inputs.region }}-{{ env.project_id }}.cloudfunctions.net/{{ inputs.function_name_prefix }}-generator
+          httpMethod: POST
+          headers:
+            Content-Type: application/json
+          body: |
+            {"trigger": "daily_campaign"}
+        retryConfig:
+          retryCount: 3
+          maxRetryDuration: 300s
+          minBackoffDuration: 5s
+          maxBackoffDuration: 60s
+          maxDoublings: 5
+    metadata:
+      dependsOn:
+        - enable-apis
+        - campaign-generator-function
+
+  # Create Cloud Scheduler job for weekly newsletter
+  - name: weekly-newsletter-scheduler
+    type: gcp-types/cloudscheduler-v1:cloudscheduler.projects.locations.jobs
+    properties:
+      parent: projects/{{ env.project_id }}/locations/{{ inputs.region }}
+      jobId: newsletter-weekly
+      job:
+        name: projects/{{ env.project_id }}/locations/{{ inputs.region }}/jobs/newsletter-weekly
+        description: Weekly newsletter campaign
+        schedule: "0 10 * * 1"
+        timeZone: {{ inputs.time_zone }}
+        httpTarget:
+          uri: https://{{ inputs.region }}-{{ env.project_id }}.cloudfunctions.net/{{ inputs.function_name_prefix }}-generator
+          httpMethod: POST
+          headers:
+            Content-Type: application/json
+          body: |
+            {"trigger": "weekly_newsletter"}
+        retryConfig:
+          retryCount: 3
+          maxRetryDuration: 300s
+          minBackoffDuration: 5s
+          maxBackoffDuration: 60s
+          maxDoublings: 5
+    metadata:
+      dependsOn:
+        - enable-apis
+        - campaign-generator-function
+
+  # Create Cloud Scheduler job for promotional campaigns
+  - name: promotional-campaign-scheduler
+    type: gcp-types/cloudscheduler-v1:cloudscheduler.projects.locations.jobs
+    properties:
+      parent: projects/{{ env.project_id }}/locations/{{ inputs.region }}
+      jobId: promotional-campaigns
+      job:
+        name: projects/{{ env.project_id }}/locations/{{ inputs.region }}/jobs/promotional-campaigns
+        description: Promotional email campaigns
+        schedule: "0 14 * * 3,6"
+        timeZone: {{ inputs.time_zone }}
+        httpTarget:
+          uri: https://{{ inputs.region }}-{{ env.project_id }}.cloudfunctions.net/{{ inputs.function_name_prefix }}-sender
+          httpMethod: POST
+          headers:
+            Content-Type: application/json
+          body: |
+            {"campaign_file": "campaigns/latest_promotional.json"}
+        retryConfig:
+          retryCount: 3
+          maxRetryDuration: 300s
+          minBackoffDuration: 5s
+          maxBackoffDuration: 60s
+          maxDoublings: 5
+    metadata:
+      dependsOn:
+        - enable-apis
+        - email-sender-function
+
+  # Create Cloud Monitoring alert policy for function errors
+  - name: function-error-alert-policy
+    type: gcp-types/monitoring-v1:monitoring.projects.alertPolicies
+    properties:
+      parent: projects/{{ env.project_id }}
+      alertPolicy:
+        displayName: Email Campaign Function Errors
+        documentation:
+          content: Alert when email campaign functions encounter errors
+          mimeType: text/markdown
+        conditions:
+          - displayName: Cloud Function Error Rate
+            conditionThreshold:
+              filter: |
+                resource.type="cloud_function"
+                resource.label.function_name=~"{{ inputs.function_name_prefix }}.*"
+                metric.type="cloudfunctions.googleapis.com/function/execution_count"
+                metric.label.status!="ok"
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 5
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+        enabled: true
+        notificationChannels: []
+        combiner: OR
+    metadata:
+      dependsOn:
+        - enable-apis
+        - campaign-generator-function
+        - email-sender-function
+        - analytics-function
+
+  # Create Cloud Monitoring dashboard for campaign metrics
+  - name: campaign-dashboard
+    type: gcp-types/monitoring-v1:monitoring.projects.dashboards
+    properties:
+      parent: projects/{{ env.project_id }}
+      dashboard:
+        displayName: Email Campaign Analytics Dashboard
+        mosaicLayout:
+          tiles:
+            - width: 6
+              height: 4
+              widget:
+                title: Function Execution Count
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: |
+                            resource.type="cloud_function"
+                            resource.label.function_name=~"{{ inputs.function_name_prefix }}.*"
+                            metric.type="cloudfunctions.googleapis.com/function/execution_count"
+                          aggregation:
+                            alignmentPeriod: 300s
+                            perSeriesAligner: ALIGN_RATE
+                            crossSeriesReducer: REDUCE_SUM
+                      plotType: LINE
+                      targetAxis: Y1
+                  timeshiftDuration: 0s
+                  yAxis:
+                    label: Executions/sec
+                    scale: LINEAR
+            - width: 6
+              height: 4
+              xPos: 6
+              widget:
+                title: Function Execution Duration
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: |
+                            resource.type="cloud_function"
+                            resource.label.function_name=~"{{ inputs.function_name_prefix }}.*"
+                            metric.type="cloudfunctions.googleapis.com/function/execution_times"
+                          aggregation:
+                            alignmentPeriod: 300s
+                            perSeriesAligner: ALIGN_MEAN
+                            crossSeriesReducer: REDUCE_MEAN
+                      plotType: LINE
+                      targetAxis: Y1
+                  timeshiftDuration: 0s
+                  yAxis:
+                    label: Duration (ms)
+                    scale: LINEAR
+    metadata:
+      dependsOn:
+        - enable-apis
+        - campaign-generator-function
+        - email-sender-function
+        - analytics-function
+
+# Output values for reference and verification
+outputs:
+  - name: project_id
+    value: {{ env.project_id }}
+    description: Google Cloud project ID where resources are deployed
+
+  - name: region
+    value: {{ inputs.region }}
+    description: Google Cloud region where resources are deployed
+
+  - name: storage_bucket_name
+    value: email-campaigns-{{ inputs.bucket_name_suffix }}
+    description: Name of the Cloud Storage bucket for campaign data
+
+  - name: bigquery_dataset_id
+    value: email_campaigns
+    description: BigQuery dataset ID for analytics data
+
+  - name: campaign_generator_function_url
+    value: https://{{ inputs.region }}-{{ env.project_id }}.cloudfunctions.net/{{ inputs.function_name_prefix }}-generator
+    description: URL for the campaign generator Cloud Function
+
+  - name: email_sender_function_url
+    value: https://{{ inputs.region }}-{{ env.project_id }}.cloudfunctions.net/{{ inputs.function_name_prefix }}-sender
+    description: URL for the email sender Cloud Function
+
+  - name: analytics_function_url
+    value: https://{{ inputs.region }}-{{ env.project_id }}.cloudfunctions.net/{{ inputs.function_name_prefix }}-analytics
+    description: URL for the analytics Cloud Function
+
+  - name: service_account_email
+    value: gmail-automation-sa@{{ env.project_id }}.iam.gserviceaccount.com
+    description: Service account email for Gmail API automation
+
+  - name: scheduler_jobs
+    value:
+      - campaign-generator-daily
+      - newsletter-weekly
+      - promotional-campaigns
+    description: List of created Cloud Scheduler jobs
+
+  - name: monitoring_dashboard_url
+    value: https://console.cloud.google.com/monitoring/dashboards/custom/{{ outputs.campaign_dashboard.name }}
+    description: URL to the Cloud Monitoring dashboard for campaign analytics
+
+# Validation and testing configurations
+validation:
+  # Ensure all required APIs are enabled
+  - name: validate-apis-enabled
+    type: gcp-types/serviceusage-v1:serviceusage.services.get
+    properties:
+      name: projects/{{ env.project_id }}/services/cloudfunctions.googleapis.com
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # Verify BigQuery dataset creation
+  - name: validate-bigquery-dataset
+    type: gcp-types/bigquery-v2:bigquery.datasets.get
+    properties:
+      projectId: {{ env.project_id }}
+      datasetId: email_campaigns
+    metadata:
+      dependsOn:
+        - email-campaigns-dataset
+
+  # Verify Cloud Storage bucket creation
+  - name: validate-storage-bucket
+    type: gcp-types/storage-v1:storage.bucket.get
+    properties:
+      bucket: email-campaigns-{{ inputs.bucket_name_suffix }}
+    metadata:
+      dependsOn:
+        - email-campaigns-bucket
+
+# Security configurations
+security:
+  # IAM binding for least privilege access
+  - name: function-invoker-binding
+    type: gcp-types/cloudresourcemanager-v1:cloudresourcemanager.projects.setIamPolicy
+    properties:
+      resource: {{ env.project_id }}
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - serviceAccount:gmail-automation-sa@{{ env.project_id }}.iam.gserviceaccount.com
+          - role: roles/cloudscheduler.jobRunner
+            members:
+              - serviceAccount:gmail-automation-sa@{{ env.project_id }}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - gmail-automation-sa
+
+  # VPC connector for secure function networking (optional enhancement)
+  - name: vpc-connector
+    type: gcp-types/vpcaccess-v1:vpcaccess.projects.locations.connectors
+    properties:
+      parent: projects/{{ env.project_id }}/locations/{{ inputs.region }}
+      connectorId: email-campaign-connector
+      connector:
+        name: projects/{{ env.project_id }}/locations/{{ inputs.region }}/connectors/email-campaign-connector
+        network: projects/{{ env.project_id }}/global/networks/default
+        ipCidrRange: 10.8.0.0/28
+        minThroughput: 200
+        maxThroughput: 1000
+        machineType: e2-micro
+    metadata:
+      dependsOn:
+        - enable-apis
+    optional: true
+
+# Cost optimization configurations
+cost_optimization:
+  # Cloud Storage lifecycle management
+  - name: bucket-lifecycle-policy
+    type: gcp-types/storage-v1:storage.bucket.patch
+    properties:
+      bucket: email-campaigns-{{ inputs.bucket_name_suffix }}
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+              matchesStorageClass:
+                - STANDARD
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90
+              matchesStorageClass:
+                - NEARLINE
+          - action:
+              type: Delete
+            condition:
+              age: 365
+    metadata:
+      dependsOn:
+        - email-campaigns-bucket
+
+  # BigQuery table expiration
+  - name: table-expiration-policy
+    type: gcp-types/bigquery-v2:bigquery.tables.patch
+    properties:
+      projectId: {{ env.project_id }}
+      datasetId: email_campaigns
+      tableId: campaign_metrics
+      expirationTime: 94608000000  # 3 years in milliseconds
+    metadata:
+      dependsOn:
+        - campaign-metrics-table

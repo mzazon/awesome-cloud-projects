@@ -1,0 +1,394 @@
+# Cloud Workflows Definition for Multilingual Customer Support
+# This workflow orchestrates complex customer support scenarios with intelligent routing
+# based on sentiment analysis and automated escalation procedures
+
+main:
+  params: [args]
+  steps:
+    # Initialize workflow variables and validate input
+    - init:
+        assign:
+          - customer_id: $${args.customer_id}
+          - audio_data: $${args.audio_data}
+          - session_id: $${args.session_id}
+          - priority_level: $${default(args.priority_level, "normal")}
+          - workflow_start_time: $${sys.now()}
+          - escalation_needed: false
+          - satisfaction_survey_needed: false
+        next: validate_input
+
+    # Validate required input parameters
+    - validate_input:
+        switch:
+          - condition: $${customer_id == null OR customer_id == ""}
+            raise:
+              code: 400
+              message: "customer_id is required"
+          - condition: $${audio_data == null OR audio_data == ""}
+            raise:
+              code: 400
+              message: "audio_data is required"
+          - condition: $${session_id == null OR session_id == ""}
+            assign:
+              - session_id: $${"session-" + string(int(sys.now()))}
+        next: log_workflow_start
+
+    # Log workflow initiation for monitoring
+    - log_workflow_start:
+        call: sys.log
+        args:
+          data:
+            workflow: "multilingual-customer-support"
+            customer_id: $${customer_id}
+            session_id: $${session_id}
+            priority_level: $${priority_level}
+            start_time: $${workflow_start_time}
+          severity: "INFO"
+        next: process_audio
+
+    # Call the AI processing function
+    - process_audio:
+        try:
+          call: http.post
+          args:
+            url: "https://${region}-${project_id}.cloudfunctions.net/${function_name}"
+            headers:
+              Content-Type: "application/json"
+            body:
+              customer_id: $${customer_id}
+              audio_data: $${audio_data}
+              session_id: $${session_id}
+            timeout: 60
+          result: processing_result
+        except:
+          as: e
+          steps:
+            - log_processing_error:
+                call: sys.log
+                args:
+                  data:
+                    error: "Function call failed"
+                    customer_id: $${customer_id}
+                    session_id: $${session_id}
+                    exception: $${e}
+                  severity: "ERROR"
+            - return_error:
+                return:
+                  success: false
+                  error: "Audio processing failed"
+                  customer_id: $${customer_id}
+                  session_id: $${session_id}
+                  timestamp: $${sys.now()}
+        next: validate_processing_result
+
+    # Validate the processing result
+    - validate_processing_result:
+        switch:
+          - condition: $${processing_result.code != 200}
+            steps:
+              - log_processing_failure:
+                  call: sys.log
+                  args:
+                    data:
+                      error: "Audio processing returned error"
+                      status_code: $${processing_result.code}
+                      customer_id: $${customer_id}
+                      session_id: $${session_id}
+                    severity: "ERROR"
+              - return_processing_error:
+                  return:
+                    success: false
+                    error: "Audio processing failed"
+                    status_code: $${processing_result.code}
+                    customer_id: $${customer_id}
+                    session_id: $${session_id}
+                    timestamp: $${sys.now()}
+        next: extract_sentiment_data
+
+    # Extract sentiment and response data
+    - extract_sentiment_data:
+        assign:
+          - sentiment_score: $${processing_result.body.sentiment_score}
+          - sentiment_magnitude: $${processing_result.body.sentiment_magnitude}
+          - detected_language: $${processing_result.body.detected_language}
+          - transcript: $${processing_result.body.transcript}
+          - response_text: $${processing_result.body.response_text}
+          - entities: $${processing_result.body.entities}
+        next: analyze_sentiment_level
+
+    # Determine appropriate action based on sentiment analysis
+    - analyze_sentiment_level:
+        switch:
+          # Highly negative sentiment - immediate escalation
+          - condition: $${sentiment_score < -0.5}
+            assign:
+              - escalation_needed: true
+              - escalation_level: "urgent"
+              - escalation_reason: "high_negative_sentiment"
+            next: log_urgent_escalation
+          
+          # Moderately negative sentiment - standard escalation
+          - condition: $${sentiment_score < -0.2}
+            assign:
+              - escalation_needed: true
+              - escalation_level: "standard"
+              - escalation_reason: "negative_sentiment"
+            next: log_standard_escalation
+          
+          # Highly positive sentiment - satisfaction survey
+          - condition: $${sentiment_score > 0.5}
+            assign:
+              - satisfaction_survey_needed: true
+              - survey_type: "positive_experience"
+            next: log_positive_interaction
+          
+          # Moderately positive sentiment - follow-up survey
+          - condition: $${sentiment_score > 0.2}
+            assign:
+              - satisfaction_survey_needed: true
+              - survey_type: "standard_followup"
+            next: log_positive_interaction
+          
+          # Neutral sentiment - standard processing
+          default:
+            next: log_neutral_interaction
+
+    # Log urgent escalation scenario
+    - log_urgent_escalation:
+        call: sys.log
+        args:
+          data:
+            action: "urgent_escalation"
+            customer_id: $${customer_id}
+            session_id: $${session_id}
+            sentiment_score: $${sentiment_score}
+            sentiment_magnitude: $${sentiment_magnitude}
+            escalation_level: $${escalation_level}
+            detected_language: $${detected_language}
+          severity: "WARNING"
+        next: escalate_to_human
+
+    # Log standard escalation scenario
+    - log_standard_escalation:
+        call: sys.log
+        args:
+          data:
+            action: "standard_escalation"
+            customer_id: $${customer_id}
+            session_id: $${session_id}
+            sentiment_score: $${sentiment_score}
+            escalation_level: $${escalation_level}
+            detected_language: $${detected_language}
+          severity: "INFO"
+        next: escalate_to_human
+
+    # Log positive customer interaction
+    - log_positive_interaction:
+        call: sys.log
+        args:
+          data:
+            action: "positive_interaction"
+            customer_id: $${customer_id}
+            session_id: $${session_id}
+            sentiment_score: $${sentiment_score}
+            survey_type: $${survey_type}
+            detected_language: $${detected_language}
+          severity: "INFO"
+        next: send_satisfaction_survey
+
+    # Log neutral interaction
+    - log_neutral_interaction:
+        call: sys.log
+        args:
+          data:
+            action: "neutral_interaction"
+            customer_id: $${customer_id}
+            session_id: $${session_id}
+            sentiment_score: $${sentiment_score}
+            detected_language: $${detected_language}
+          severity: "INFO"
+        next: store_interaction_summary
+
+    # Escalate to human agent
+    - escalate_to_human:
+        try:
+          # In a real implementation, this would call your support system API
+          # For now, we'll simulate the escalation call
+          call: http.post
+          args:
+            url: "https://api.example.com/support/escalate"
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Bearer YOUR_API_TOKEN"
+            body:
+              customer_id: $${customer_id}
+              session_id: $${session_id}
+              priority: $${escalation_level}
+              sentiment_score: $${sentiment_score}
+              language: $${detected_language}
+              transcript: $${transcript}
+              entities: $${entities}
+              escalation_reason: $${escalation_reason}
+              timestamp: $${sys.now()}
+            timeout: 30
+          result: escalation_result
+        except:
+          as: e
+          steps:
+            - log_escalation_failure:
+                call: sys.log
+                args:
+                  data:
+                    error: "Escalation API call failed"
+                    customer_id: $${customer_id}
+                    session_id: $${session_id}
+                    exception: $${e}
+                  severity: "ERROR"
+            # Continue with workflow even if escalation API fails
+        next: store_interaction_summary
+
+    # Send satisfaction survey
+    - send_satisfaction_survey:
+        try:
+          # In a real implementation, this would call your survey system API
+          # For now, we'll simulate the survey call
+          call: http.post
+          args:
+            url: "https://api.example.com/surveys/send"
+            headers:
+              Content-Type: "application/json"
+              Authorization: "Bearer YOUR_SURVEY_API_TOKEN"
+            body:
+              customer_id: $${customer_id}
+              session_id: $${session_id}
+              survey_type: $${survey_type}
+              language: $${detected_language}
+              sentiment_score: $${sentiment_score}
+              interaction_summary: $${response_text}
+              timestamp: $${sys.now()}
+            timeout: 30
+          result: survey_result
+        except:
+          as: e
+          steps:
+            - log_survey_failure:
+                call: sys.log
+                args:
+                  data:
+                    error: "Survey API call failed"
+                    customer_id: $${customer_id}
+                    session_id: $${session_id}
+                    exception: $${e}
+                  severity: "ERROR"
+            # Continue with workflow even if survey API fails
+        next: store_interaction_summary
+
+    # Store comprehensive interaction summary
+    - store_interaction_summary:
+        call: sys.log
+        args:
+          data:
+            workflow_summary:
+              customer_id: $${customer_id}
+              session_id: $${session_id}
+              sentiment_score: $${sentiment_score}
+              sentiment_magnitude: $${sentiment_magnitude}
+              detected_language: $${detected_language}
+              escalation_needed: $${escalation_needed}
+              satisfaction_survey_needed: $${satisfaction_survey_needed}
+              entities_count: $${len(entities)}
+              transcript_length: $${len(transcript)}
+              processing_duration: $${sys.now() - workflow_start_time}
+              workflow_version: "1.0"
+          severity: "INFO"
+        next: check_follow_up_needed
+
+    # Check if follow-up actions are needed
+    - check_follow_up_needed:
+        switch:
+          # Schedule follow-up for escalated cases
+          - condition: $${escalation_needed == true AND escalation_level == "urgent"}
+            next: schedule_urgent_followup
+          
+          # Schedule standard follow-up for negative sentiment
+          - condition: $${escalation_needed == true}
+            next: schedule_standard_followup
+          
+          # No follow-up needed for positive or neutral cases
+          default:
+            next: return_final_response
+
+    # Schedule urgent follow-up
+    - schedule_urgent_followup:
+        try:
+          # In a real implementation, this would schedule a follow-up task
+          call: http.post
+          args:
+            url: "https://api.example.com/followup/urgent"
+            headers:
+              Content-Type: "application/json"
+            body:
+              customer_id: $${customer_id}
+              session_id: $${session_id}
+              follow_up_time: $${sys.now() + 3600}  # 1 hour from now
+              priority: "urgent"
+              reason: "urgent_escalation_followup"
+            timeout: 30
+        except:
+          as: e
+          call: sys.log
+          args:
+            data:
+              error: "Failed to schedule urgent follow-up"
+              customer_id: $${customer_id}
+              exception: $${e}
+            severity: "ERROR"
+        next: return_final_response
+
+    # Schedule standard follow-up
+    - schedule_standard_followup:
+        try:
+          # In a real implementation, this would schedule a follow-up task
+          call: http.post
+          args:
+            url: "https://api.example.com/followup/standard"
+            headers:
+              Content-Type: "application/json"
+            body:
+              customer_id: $${customer_id}
+              session_id: $${session_id}
+              follow_up_time: $${sys.now() + 86400}  # 24 hours from now
+              priority: "standard"
+              reason: "escalation_followup"
+            timeout: 30
+        except:
+          as: e
+          call: sys.log
+          args:
+            data:
+              error: "Failed to schedule standard follow-up"
+              customer_id: $${customer_id}
+              exception: $${e}
+            severity: "ERROR"
+        next: return_final_response
+
+    # Return final workflow response
+    - return_final_response:
+        return:
+          success: true
+          workflow_id: $${sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID")}
+          customer_id: $${customer_id}
+          session_id: $${session_id}
+          processing_result: $${processing_result.body}
+          sentiment_analysis:
+            score: $${sentiment_score}
+            magnitude: $${sentiment_magnitude}
+            detected_language: $${detected_language}
+          actions_taken:
+            escalation_needed: $${escalation_needed}
+            escalation_level: $${default(escalation_level, "none")}
+            satisfaction_survey_needed: $${satisfaction_survey_needed}
+            survey_type: $${default(survey_type, "none")}
+          processing_time: $${sys.now() - workflow_start_time}
+          timestamp: $${sys.now()}
+          workflow_version: "1.0"

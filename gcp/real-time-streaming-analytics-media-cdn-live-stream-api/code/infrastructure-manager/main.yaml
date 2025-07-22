@@ -1,0 +1,868 @@
+# Infrastructure Manager Configuration for Real-Time Streaming Analytics
+# This configuration deploys a complete streaming analytics pipeline using:
+# - Cloud Media CDN for global content delivery
+# - Live Stream API for video transcoding
+# - Cloud Functions for real-time event processing
+# - BigQuery for analytics data warehouse
+# - Pub/Sub for event streaming
+# - Cloud Storage for video segment storage
+
+# Import required modules and templates
+imports:
+  - path: modules/storage.yaml
+  - path: modules/analytics.yaml
+  - path: modules/messaging.yaml
+  - path: modules/streaming.yaml
+  - path: modules/cdn.yaml
+  - path: modules/functions.yaml
+
+# Global variables and configuration
+variables:
+  # Project and location configuration
+  project_id:
+    type: string
+    description: "Google Cloud project ID"
+    default: "streaming-analytics-project"
+  
+  region:
+    type: string
+    description: "Primary region for resource deployment"
+    default: "us-central1"
+  
+  zone:
+    type: string
+    description: "Primary zone for resource deployment"
+    default: "us-central1-a"
+  
+  # Resource naming configuration
+  resource_suffix:
+    type: string
+    description: "Unique suffix for resource names"
+    default: "$(ref.random-suffix.value)"
+  
+  # Storage configuration
+  storage_bucket_name:
+    type: string
+    description: "Name for Cloud Storage bucket for video segments"
+    default: "streaming-content-$(ref.random-suffix.value)"
+  
+  storage_class:
+    type: string
+    description: "Storage class for video segments"
+    default: "STANDARD"
+    enum:
+      - "STANDARD"
+      - "NEARLINE" 
+      - "COLDLINE"
+      - "ARCHIVE"
+  
+  # Analytics configuration
+  dataset_name:
+    type: string
+    description: "BigQuery dataset name for analytics"
+    default: "streaming_analytics"
+  
+  # Messaging configuration
+  pubsub_topic_name:
+    type: string
+    description: "Pub/Sub topic for streaming events"
+    default: "stream-events"
+  
+  # Live streaming configuration
+  stream_input_type:
+    type: string
+    description: "Live stream input type"
+    default: "RTMP_PUSH"
+    enum:
+      - "RTMP_PUSH"
+      - "SRT_PUSH"
+  
+  stream_tier:
+    type: string
+    description: "Live stream tier for quality and pricing"
+    default: "HD"
+    enum:
+      - "SD"
+      - "HD"
+      - "UHD"
+  
+  # Video encoding configuration
+  video_profiles:
+    type: array
+    description: "Video encoding profiles for adaptive streaming"
+    default:
+      - name: "hd"
+        width: 1280
+        height: 720
+        bitrate: 3000000
+        frame_rate: 30
+      - name: "sd"
+        width: 854
+        height: 480
+        bitrate: 1500000
+        frame_rate: 30
+  
+  # Audio encoding configuration
+  audio_bitrate:
+    type: integer
+    description: "Audio bitrate in bits per second"
+    default: 128000
+    minimum: 64000
+    maximum: 320000
+  
+  audio_sample_rate:
+    type: integer
+    description: "Audio sample rate in Hz"
+    default: 48000
+    enum: [44100, 48000]
+  
+  # CDN configuration
+  cdn_cache_ttl:
+    type: string
+    description: "Default TTL for CDN caching"
+    default: "30s"
+  
+  cdn_max_ttl:
+    type: string
+    description: "Maximum TTL for CDN caching"
+    default: "300s"
+  
+  # Function configuration
+  function_memory:
+    type: string
+    description: "Memory allocation for Cloud Functions"
+    default: "256MB"
+    enum: ["128MB", "256MB", "512MB", "1024MB"]
+  
+  function_timeout:
+    type: string
+    description: "Timeout for Cloud Functions"
+    default: "60s"
+  
+  # Lifecycle policies
+  storage_lifecycle_nearline_days:
+    type: integer
+    description: "Days after which to move objects to Nearline storage"
+    default: 30
+    minimum: 1
+    maximum: 365
+  
+  storage_lifecycle_delete_days:
+    type: integer
+    description: "Days after which to delete objects"
+    default: 90
+    minimum: 1
+    maximum: 3650
+
+# Enable required Google Cloud APIs
+resources:
+  # Generate random suffix for unique resource naming
+  - name: random-suffix
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    metadata:
+      runtimePolicy:
+        - CREATE
+    properties:
+      resource: $(var.project_id)
+      role: roles/viewer
+      member: serviceAccount:$(var.project_id)@appspot.gserviceaccount.com
+    outputs:
+      - name: value
+        value: $(function.substring($(function.base64encode($(function.currentTime()))), 0, 6))
+
+  # Enable required APIs
+  - name: enable-livestream-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(var.project_id)/services/livestream.googleapis.com
+      consumerId: project:$(var.project_id)
+
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(var.project_id)/services/storage.googleapis.com
+      consumerId: project:$(var.project_id)
+    
+  - name: enable-networkservices-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(var.project_id)/services/networkservices.googleapis.com
+      consumerId: project:$(var.project_id)
+    
+  - name: enable-cloudfunctions-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(var.project_id)/services/cloudfunctions.googleapis.com
+      consumerId: project:$(var.project_id)
+    
+  - name: enable-bigquery-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(var.project_id)/services/bigquery.googleapis.com
+      consumerId: project:$(var.project_id)
+    
+  - name: enable-pubsub-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(var.project_id)/services/pubsub.googleapis.com
+      consumerId: project:$(var.project_id)
+
+  # Cloud Storage bucket for video segments
+  - name: streaming-storage-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(var.storage_bucket_name)
+      project: $(var.project_id)
+      location: $(var.region)
+      storageClass: $(var.storage_class)
+      uniformBucketLevelAccess:
+        enabled: true
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: $(var.storage_lifecycle_nearline_days)
+          - action:
+              type: Delete
+            condition:
+              age: $(var.storage_lifecycle_delete_days)
+      cors:
+        - origin: ["*"]
+          method: ["GET", "HEAD", "OPTIONS"]
+          responseHeader: ["Content-Type", "Access-Control-Allow-Origin"]
+          maxAgeSeconds: 3600
+      versioning:
+        enabled: false
+      logging:
+        logBucket: $(var.storage_bucket_name)
+        logObjectPrefix: "access-logs/"
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # BigQuery dataset for analytics
+  - name: streaming-analytics-dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      datasetId: $(var.dataset_name)
+      projectId: $(var.project_id)
+      location: $(var.region)
+      description: "Streaming analytics data warehouse for real-time insights"
+      defaultTableExpirationMs: 7776000000  # 90 days
+      access:
+        - role: OWNER
+          userByEmail: $(var.project_id)@appspot.gserviceaccount.com
+        - role: READER
+          specialGroup: projectReaders
+        - role: WRITER
+          specialGroup: projectWriters
+    metadata:
+      dependsOn:
+        - enable-bigquery-api
+
+  # BigQuery table for streaming events
+  - name: streaming-events-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      datasetId: $(ref.streaming-analytics-dataset.datasetId)
+      projectId: $(var.project_id)
+      tableId: streaming_events
+      description: "Real-time streaming events and viewer metrics"
+      schema:
+        fields:
+          - name: timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "Event timestamp"
+          - name: event_type
+            type: STRING
+            mode: REQUIRED
+            description: "Type of streaming event"
+          - name: viewer_id
+            type: STRING
+            mode: NULLABLE
+            description: "Unique viewer identifier"
+          - name: session_id
+            type: STRING
+            mode: NULLABLE
+            description: "Viewing session identifier"
+          - name: stream_id
+            type: STRING
+            mode: REQUIRED
+            description: "Live stream identifier"
+          - name: quality
+            type: STRING
+            mode: NULLABLE
+            description: "Video quality level"
+          - name: buffer_health
+            type: FLOAT
+            mode: NULLABLE
+            description: "Buffer health ratio (0.0 to 1.0)"
+          - name: latency_ms
+            type: INTEGER
+            mode: NULLABLE
+            description: "Stream latency in milliseconds"
+          - name: location
+            type: STRING
+            mode: NULLABLE
+            description: "Viewer geographic location"
+          - name: user_agent
+            type: STRING
+            mode: NULLABLE
+            description: "Client user agent string"
+          - name: bitrate
+            type: INTEGER
+            mode: NULLABLE
+            description: "Video bitrate in bits per second"
+          - name: resolution
+            type: STRING
+            mode: NULLABLE
+            description: "Video resolution (e.g., 1280x720)"
+          - name: cdn_cache_status
+            type: STRING
+            mode: NULLABLE
+            description: "CDN cache hit/miss status"
+          - name: edge_location
+            type: STRING
+            mode: NULLABLE
+            description: "CDN edge location"
+      timePartitioning:
+        type: DAY
+        field: timestamp
+        requirePartitionFilter: false
+      clustering:
+        fields: ["stream_id", "event_type", "quality"]
+    metadata:
+      dependsOn:
+        - streaming-analytics-dataset
+
+  # BigQuery table for CDN access logs
+  - name: cdn-access-logs-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      datasetId: $(ref.streaming-analytics-dataset.datasetId)
+      projectId: $(var.project_id)
+      tableId: cdn_access_logs
+      description: "CDN access logs for performance analysis"
+      schema:
+        fields:
+          - name: timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "Request timestamp"
+          - name: client_ip
+            type: STRING
+            mode: NULLABLE
+            description: "Client IP address"
+          - name: request_method
+            type: STRING
+            mode: REQUIRED
+            description: "HTTP request method"
+          - name: request_uri
+            type: STRING
+            mode: REQUIRED
+            description: "Requested URI"
+          - name: response_code
+            type: INTEGER
+            mode: REQUIRED
+            description: "HTTP response code"
+          - name: response_size
+            type: INTEGER
+            mode: NULLABLE
+            description: "Response size in bytes"
+          - name: cache_status
+            type: STRING
+            mode: NULLABLE
+            description: "Cache hit/miss status"
+          - name: edge_location
+            type: STRING
+            mode: NULLABLE
+            description: "CDN edge location"
+          - name: user_agent
+            type: STRING
+            mode: NULLABLE
+            description: "Client user agent"
+          - name: referer
+            type: STRING
+            mode: NULLABLE
+            description: "HTTP referer header"
+          - name: latency_ms
+            type: INTEGER
+            mode: NULLABLE
+            description: "Response latency in milliseconds"
+      timePartitioning:
+        type: DAY
+        field: timestamp
+        requirePartitionFilter: false
+      clustering:
+        fields: ["edge_location", "cache_status", "response_code"]
+    metadata:
+      dependsOn:
+        - streaming-analytics-dataset
+
+  # Pub/Sub topic for streaming events
+  - name: streaming-events-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(var.project_id)/topics/$(var.pubsub_topic_name)
+      labels:
+        environment: "streaming-analytics"
+        component: "event-processing"
+      messageRetentionDuration: "604800s"  # 7 days
+      schemaSettings:
+        encoding: JSON
+    metadata:
+      dependsOn:
+        - enable-pubsub-api
+
+  # Pub/Sub subscription for BigQuery streaming
+  - name: streaming-events-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(var.project_id)/subscriptions/$(var.pubsub_topic_name)-bq-subscription
+      topic: $(ref.streaming-events-topic.name)
+      ackDeadlineSeconds: 60
+      messageRetentionDuration: "604800s"  # 7 days
+      retryPolicy:
+        minimumBackoff: "10s"
+        maximumBackoff: "600s"
+      deadLetterPolicy:
+        deadLetterTopic: projects/$(var.project_id)/topics/$(var.pubsub_topic_name)-dead-letter
+        maxDeliveryAttempts: 5
+      labels:
+        environment: "streaming-analytics"
+        component: "bigquery-ingestion"
+    metadata:
+      dependsOn:
+        - streaming-events-topic
+
+  # Cloud Functions source bucket
+  - name: functions-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(var.project_id)-functions-source-$(var.resource_suffix)
+      project: $(var.project_id)
+      location: $(var.region)
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # Cloud Function for real-time analytics processing
+  - name: stream-analytics-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(var.project_id)/locations/$(var.region)
+      function:
+        name: projects/$(var.project_id)/locations/$(var.region)/functions/stream-analytics-processor-$(var.resource_suffix)
+        description: "Process streaming events and send to BigQuery"
+        sourceArchiveUrl: gs://$(ref.functions-source-bucket.name)/stream-analytics-function.zip
+        entryPoint: process_streaming_event
+        runtime: python311
+        timeout: $(var.function_timeout)
+        availableMemoryMb: $(function.parseInt($(function.substring($(var.function_memory), 0, $(function.length($(var.function_memory)))-2))))
+        environmentVariables:
+          PROJECT_ID: $(var.project_id)
+          DATASET_NAME: $(var.dataset_name)
+          REGION: $(var.region)
+        eventTrigger:
+          eventType: providers/cloud.pubsub/eventTypes/topic.publish
+          resource: $(ref.streaming-events-topic.name)
+          failurePolicy:
+            retry: {}
+        serviceAccountEmail: $(ref.functions-service-account.email)
+        labels:
+          environment: "streaming-analytics"
+          component: "event-processing"
+    metadata:
+      dependsOn:
+        - enable-cloudfunctions-api
+        - streaming-events-topic
+        - functions-source-bucket
+        - functions-service-account
+
+  # Service account for Cloud Functions
+  - name: functions-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      projectId: $(var.project_id)
+      accountId: stream-analytics-functions-$(var.resource_suffix)
+      serviceAccount:
+        displayName: "Stream Analytics Functions Service Account"
+        description: "Service account for stream analytics Cloud Functions"
+
+  # IAM binding for Functions service account - BigQuery Data Editor
+  - name: functions-bigquery-data-editor-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(var.project_id)
+      role: roles/bigquery.dataEditor
+      member: serviceAccount:$(ref.functions-service-account.email)
+    metadata:
+      dependsOn:
+        - functions-service-account
+
+  # IAM binding for Functions service account - Pub/Sub Subscriber
+  - name: functions-pubsub-subscriber-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(var.project_id)
+      role: roles/pubsub.subscriber
+      member: serviceAccount:$(ref.functions-service-account.email)
+    metadata:
+      dependsOn:
+        - functions-service-account
+
+  # Live Stream input endpoint
+  - name: live-stream-input
+    type: gcp-types/livestream-v1:projects.locations.inputs
+    properties:
+      parent: projects/$(var.project_id)/locations/$(var.region)
+      inputId: live-input-$(var.resource_suffix)
+      input:
+        type: $(var.stream_input_type)
+        tier: $(var.stream_tier)
+        labels:
+          environment: "streaming-analytics"
+          component: "video-input"
+    metadata:
+      dependsOn:
+        - enable-livestream-api
+
+  # Live Stream channel
+  - name: live-stream-channel
+    type: gcp-types/livestream-v1:projects.locations.channels
+    properties:
+      parent: projects/$(var.project_id)/locations/$(var.region)
+      channelId: live-channel-$(var.resource_suffix)
+      channel:
+        inputAttachments:
+          - key: "live-input"
+            input: $(ref.live-stream-input.name)
+        output:
+          uri: gs://$(ref.streaming-storage-bucket.name)/live-stream/
+        elementaryStreams:
+          # HD Video Stream
+          - key: "video-stream-hd"
+            videoStream:
+              h264:
+                widthPixels: 1280
+                heightPixels: 720
+                frameRate: 30
+                bitrateBps: 3000000
+                vbvSizeBits: 6000000
+                vbvFullnessBits: 5400000
+                gopDuration: "2s"
+                profile: "HIGH"
+                preset: "VERYFAST"
+          # SD Video Stream  
+          - key: "video-stream-sd"
+            videoStream:
+              h264:
+                widthPixels: 854
+                heightPixels: 480
+                frameRate: 30
+                bitrateBps: 1500000
+                vbvSizeBits: 3000000
+                vbvFullnessBits: 2700000
+                gopDuration: "2s"
+                profile: "HIGH"
+                preset: "VERYFAST"
+          # Audio Stream
+          - key: "audio-stream"
+            audioStream:
+              codec: "aac"
+              bitrateBps: $(var.audio_bitrate)
+              channelCount: 2
+              channelLayout: ["FL", "FR"]
+              sampleRateHertz: $(var.audio_sample_rate)
+        muxStreams:
+          - key: "hd-stream"
+            container: "fmp4"
+            elementaryStreams: ["video-stream-hd", "audio-stream"]
+          - key: "sd-stream"
+            container: "fmp4"
+            elementaryStreams: ["video-stream-sd", "audio-stream"]
+        manifests:
+          - fileName: "manifest.m3u8"
+            type: "HLS"
+            muxStreams: ["hd-stream", "sd-stream"]
+            maxSegmentCount: 5
+            segmentKeepDuration: "10s"
+        labels:
+          environment: "streaming-analytics"
+          component: "video-transcoding"
+    metadata:
+      dependsOn:
+        - live-stream-input
+        - streaming-storage-bucket
+
+  # Media CDN Edge Cache Origin
+  - name: streaming-cdn-origin
+    type: gcp-types/networkservices-v1:projects.locations.edgeCacheOrigins
+    properties:
+      parent: projects/$(var.project_id)/locations/global
+      edgeCacheOriginId: streaming-origin-$(var.resource_suffix)
+      edgeCacheOrigin:
+        originAddress: $(ref.streaming-storage-bucket.name).storage.googleapis.com
+        port: 443
+        protocol: HTTPS
+        description: "Origin for streaming content delivery"
+        maxAttempts: 3
+        timeout: "30s"
+        labels:
+          environment: "streaming-analytics"
+          component: "cdn-origin"
+    metadata:
+      dependsOn:
+        - enable-networkservices-api
+        - streaming-storage-bucket
+
+  # Media CDN Edge Cache Service
+  - name: streaming-cdn-service
+    type: gcp-types/networkservices-v1:projects.locations.edgeCacheServices
+    properties:
+      parent: projects/$(var.project_id)/locations/global
+      edgeCacheServiceId: streaming-service-$(var.resource_suffix)
+      edgeCacheService:
+        description: "Media CDN for live streaming distribution"
+        routing:
+          hostRules:
+            - hosts: ["streaming.$(var.project_id).example.com"]
+              pathMatcher: "streaming-matcher"
+          pathMatchers:
+            - name: "streaming-matcher"
+              routeRules:
+                - priority: 1
+                  matchRules:
+                    - pathTemplateMatch: "/live-stream/*"
+                  origin: $(ref.streaming-cdn-origin.name)
+                  routeAction:
+                    cacheKeyPolicy:
+                      includeHost: true
+                      includeProtocol: true
+                      includeQueryString: false
+                    cdnPolicy:
+                      cacheMode: "CACHE_ALL_STATIC"
+                      defaultTtl: $(var.cdn_cache_ttl)
+                      maxTtl: $(var.cdn_max_ttl)
+                      negativeCaching: true
+                      negativeCachingPolicy:
+                        - code: 404
+                          ttl: "120s"
+                        - code: 410
+                          ttl: "120s"
+        disableQuic: false
+        logConfig:
+          enable: true
+          sampleRate: 1.0
+        labels:
+          environment: "streaming-analytics"
+          component: "content-delivery"
+    metadata:
+      dependsOn:
+        - streaming-cdn-origin
+
+  # BigQuery views for analytics
+  - name: viewer-engagement-view
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      datasetId: $(ref.streaming-analytics-dataset.datasetId)
+      projectId: $(var.project_id)
+      tableId: viewer_engagement_metrics
+      view:
+        query: |
+          SELECT
+            DATE(timestamp) as date,
+            stream_id,
+            COUNT(DISTINCT viewer_id) as unique_viewers,
+            COUNT(DISTINCT session_id) as total_sessions,
+            AVG(buffer_health) as avg_buffer_health,
+            AVG(latency_ms) as avg_latency_ms,
+            COUNT(CASE WHEN event_type = 'buffer_start' THEN 1 END) as buffer_events,
+            COUNT(CASE WHEN event_type = 'quality_change' THEN 1 END) as quality_changes
+          FROM `$(var.project_id).$(var.dataset_name).streaming_events`
+          WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+          GROUP BY date, stream_id
+          ORDER BY date DESC, unique_viewers DESC
+        useLegacySql: false
+      description: "Aggregated viewer engagement metrics for streaming analysis"
+    metadata:
+      dependsOn:
+        - streaming-events-table
+
+  - name: cdn-performance-view
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      datasetId: $(ref.streaming-analytics-dataset.datasetId)
+      projectId: $(var.project_id)
+      tableId: cdn_performance_metrics
+      view:
+        query: |
+          SELECT
+            edge_location,
+            COUNT(*) as total_requests,
+            COUNT(CASE WHEN response_code = 200 THEN 1 END) as successful_requests,
+            COUNT(CASE WHEN cache_status = 'HIT' THEN 1 END) as cache_hits,
+            AVG(latency_ms) as avg_response_latency,
+            SUM(response_size) as total_bytes_served,
+            (COUNT(CASE WHEN cache_status = 'HIT' THEN 1 END) * 100.0 / COUNT(*)) as cache_hit_ratio
+          FROM `$(var.project_id).$(var.dataset_name).cdn_access_logs`
+          WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
+          GROUP BY edge_location
+          ORDER BY total_requests DESC
+        useLegacySql: false
+      description: "CDN performance metrics for optimization analysis"
+    metadata:
+      dependsOn:
+        - cdn-access-logs-table
+
+# Outputs for integration and verification
+outputs:
+  # Storage outputs
+  - name: storage_bucket_name
+    description: "Name of the Cloud Storage bucket for video segments"
+    value: $(ref.streaming-storage-bucket.name)
+  
+  - name: storage_bucket_url
+    description: "URL of the Cloud Storage bucket"
+    value: gs://$(ref.streaming-storage-bucket.name)
+  
+  # Analytics outputs
+  - name: bigquery_dataset_id
+    description: "BigQuery dataset ID for analytics"
+    value: $(ref.streaming-analytics-dataset.datasetId)
+  
+  - name: streaming_events_table
+    description: "BigQuery table for streaming events"
+    value: $(var.project_id).$(var.dataset_name).streaming_events
+  
+  - name: cdn_access_logs_table
+    description: "BigQuery table for CDN access logs"
+    value: $(var.project_id).$(var.dataset_name).cdn_access_logs
+  
+  # Messaging outputs
+  - name: pubsub_topic_name
+    description: "Pub/Sub topic for streaming events"
+    value: $(ref.streaming-events-topic.name)
+  
+  - name: pubsub_subscription_name
+    description: "Pub/Sub subscription for BigQuery streaming"
+    value: $(ref.streaming-events-subscription.name)
+  
+  # Live streaming outputs
+  - name: live_stream_input_endpoint
+    description: "Live Stream API input endpoint URI"
+    value: $(ref.live-stream-input.uri)
+  
+  - name: live_stream_channel_name
+    description: "Live Stream API channel name"
+    value: $(ref.live-stream-channel.name)
+  
+  # CDN outputs
+  - name: cdn_origin_name
+    description: "Media CDN origin name"
+    value: $(ref.streaming-cdn-origin.name)
+  
+  - name: cdn_service_name
+    description: "Media CDN service name"
+    value: $(ref.streaming-cdn-service.name)
+  
+  - name: cdn_domain
+    description: "CDN domain for streaming content"
+    value: streaming.$(var.project_id).example.com
+  
+  # Function outputs
+  - name: analytics_function_name
+    description: "Cloud Function for analytics processing"
+    value: $(ref.stream-analytics-function.name)
+  
+  - name: functions_service_account
+    description: "Service account for Cloud Functions"
+    value: $(ref.functions-service-account.email)
+  
+  # Analytics view outputs
+  - name: viewer_engagement_view
+    description: "BigQuery view for viewer engagement metrics"
+    value: $(var.project_id).$(var.dataset_name).viewer_engagement_metrics
+  
+  - name: cdn_performance_view
+    description: "BigQuery view for CDN performance metrics"
+    value: $(var.project_id).$(var.dataset_name).cdn_performance_metrics
+  
+  # Configuration outputs
+  - name: project_id
+    description: "Google Cloud project ID"
+    value: $(var.project_id)
+  
+  - name: region
+    description: "Primary deployment region"
+    value: $(var.region)
+  
+  - name: resource_suffix
+    description: "Unique suffix for resource names"
+    value: $(var.resource_suffix)
+
+# Metadata for Infrastructure Manager
+metadata:
+  version: "1.0"
+  description: "Real-time streaming analytics pipeline with Cloud Media CDN and Live Stream API"
+  author: "Google Cloud Infrastructure Manager"
+  tags:
+    - "streaming"
+    - "analytics"
+    - "media"
+    - "cdn"
+    - "real-time"
+    - "video-processing"
+  estimated_cost: "$50-100 for testing workloads"
+  deployment_time: "15-20 minutes"
+  
+  # Resource dependency graph
+  dependencies:
+    critical_path:
+      - "API enablement"
+      - "Storage bucket creation"
+      - "BigQuery dataset setup"
+      - "Pub/Sub topic creation"
+      - "Live Stream input endpoint"
+      - "Live Stream channel configuration"
+      - "Media CDN setup"
+      - "Analytics function deployment"
+    
+    parallel_deployable:
+      - "BigQuery tables and views"
+      - "IAM service accounts and bindings"
+      - "Function source bucket"
+      - "Analytics views"
+  
+  # Security considerations
+  security:
+    - "Uniform bucket-level access enabled"
+    - "Service account with least privilege permissions"
+    - "Function timeout and memory limits configured"
+    - "Message retention and dead letter policies"
+    - "CDN cache policies for security"
+  
+  # Monitoring and alerting recommendations
+  monitoring:
+    - "Set up alerts for function execution failures"
+    - "Monitor BigQuery slot usage and costs"
+    - "Track CDN cache hit ratios"
+    - "Monitor live stream channel health"
+    - "Set up budget alerts for cost control"
+  
+  # Scaling considerations
+  scaling:
+    - "Functions automatically scale with Pub/Sub volume"
+    - "BigQuery supports petabyte-scale analytics"
+    - "CDN provides global edge distribution"
+    - "Storage bucket supports unlimited capacity"
+    - "Live Stream API supports multiple concurrent streams"

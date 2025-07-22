@@ -1,0 +1,1041 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Real-Time Video Analytics Platform with Amazon Rekognition and Kinesis Video Streams.
+  This template creates a comprehensive video analytics solution with live stream processing,
+  face recognition, object detection, real-time alerting, and searchable metadata storage.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Video Analytics Configuration"
+        Parameters:
+          - VideoStreamRetentionHours
+          - FaceMatchThreshold
+          - AlertEmail
+      - Label:
+          default: "Database Configuration"
+        Parameters:
+          - DetectionsTableReadCapacity
+          - DetectionsTableWriteCapacity
+          - FacesTableReadCapacity
+          - FacesTableWriteCapacity
+      - Label:
+          default: "Processing Configuration"
+        Parameters:
+          - AnalyticsShardCount
+          - LambdaTimeout
+          - EventSourceMappingBatchSize
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      VideoStreamRetentionHours:
+        default: "Video Stream Retention (Hours)"
+      FaceMatchThreshold:
+        default: "Face Match Threshold (%)"
+      AlertEmail:
+        default: "Alert Email Address"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: video-analytics
+    Description: Name for the video analytics project (used for resource naming)
+    AllowedPattern: ^[a-z0-9-]+$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    MinLength: 3
+    MaxLength: 30
+
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment name for resource tagging
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+
+  VideoStreamRetentionHours:
+    Type: Number
+    Default: 24
+    Description: How long to retain video data in Kinesis Video Streams (hours)
+    MinValue: 1
+    MaxValue: 168
+
+  FaceMatchThreshold:
+    Type: Number
+    Default: 80.0
+    Description: Minimum confidence threshold for face matches (percentage)
+    MinValue: 50.0
+    MaxValue: 99.0
+
+  AlertEmail:
+    Type: String
+    Description: Email address to receive security alerts
+    AllowedPattern: ^[^\s@]+@[^\s@]+\.[^\s@]+$
+    ConstraintDescription: Must be a valid email address
+
+  DetectionsTableReadCapacity:
+    Type: Number
+    Default: 5
+    Description: Read capacity units for detections DynamoDB table
+    MinValue: 1
+    MaxValue: 40000
+
+  DetectionsTableWriteCapacity:
+    Type: Number
+    Default: 5
+    Description: Write capacity units for detections DynamoDB table
+    MinValue: 1
+    MaxValue: 40000
+
+  FacesTableReadCapacity:
+    Type: Number
+    Default: 5
+    Description: Read capacity units for faces DynamoDB table
+    MinValue: 1
+    MaxValue: 40000
+
+  FacesTableWriteCapacity:
+    Type: Number
+    Default: 5
+    Description: Write capacity units for faces DynamoDB table
+    MinValue: 1
+    MaxValue: 40000
+
+  AnalyticsShardCount:
+    Type: Number
+    Default: 2
+    Description: Number of shards for analytics Kinesis Data Stream
+    MinValue: 1
+    MaxValue: 100
+
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    Description: Timeout for Lambda functions (seconds)
+    MinValue: 30
+    MaxValue: 900
+
+  EventSourceMappingBatchSize:
+    Type: Number
+    Default: 10
+    Description: Batch size for Lambda event source mapping from Kinesis
+    MinValue: 1
+    MaxValue: 100
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+
+Resources:
+  # ================================
+  # IAM Roles and Policies
+  # ================================
+  
+  VideoAnalyticsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-video-analytics-role-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - rekognition.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: VideoAnalyticsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Rekognition permissions
+              - Effect: Allow
+                Action:
+                  - rekognition:*
+                Resource: '*'
+              # Kinesis Video Streams permissions
+              - Effect: Allow
+                Action:
+                  - kinesisvideo:CreateStream
+                  - kinesisvideo:DescribeStream
+                  - kinesisvideo:ListStreams
+                  - kinesisvideo:GetDataEndpoint
+                  - kinesisvideo:PutMedia
+                  - kinesisvideo:GetMedia
+                Resource: '*'
+              # Kinesis Data Streams permissions
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListStreams
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource: !GetAtt AnalyticsDataStream.Arn
+              # DynamoDB permissions
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                Resource:
+                  - !GetAtt DetectionsTable.Arn
+                  - !GetAtt FacesTable.Arn
+              # SNS permissions
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SecurityAlertsTopicArn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  ApiLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-api-lambda-role-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBReadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:GetItem
+                Resource:
+                  - !GetAtt DetectionsTable.Arn
+                  - !GetAtt FacesTable.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ================================
+  # Kinesis Video Stream
+  # ================================
+  
+  SecurityVideoStream:
+    Type: AWS::KinesisVideo::Stream
+    Properties:
+      Name: !Sub ${ProjectName}-security-stream-${Environment}
+      DataRetentionInHours: !Ref VideoStreamRetentionHours
+      MediaType: video/h264
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: VideoAnalytics
+
+  # ================================
+  # Kinesis Data Stream
+  # ================================
+  
+  AnalyticsDataStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub ${ProjectName}-analytics-${Environment}
+      ShardCount: !Ref AnalyticsShardCount
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: AnalyticsResults
+
+  # ================================
+  # Rekognition Face Collection
+  # ================================
+  
+  SecurityFaceCollection:
+    Type: AWS::Rekognition::Collection
+    Properties:
+      CollectionId: !Sub ${ProjectName}-security-faces-${Environment}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ================================
+  # DynamoDB Tables
+  # ================================
+  
+  DetectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-detections-${Environment}
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref DetectionsTableReadCapacity
+        WriteCapacityUnits: !Ref DetectionsTableWriteCapacity
+      AttributeDefinitions:
+        - AttributeName: StreamName
+          AttributeType: S
+        - AttributeName: Timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: StreamName
+          KeyType: HASH
+        - AttributeName: Timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: DetectionEvents
+
+  FacesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-faces-${Environment}
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref FacesTableReadCapacity
+        WriteCapacityUnits: !Ref FacesTableWriteCapacity
+      AttributeDefinitions:
+        - AttributeName: FaceId
+          AttributeType: S
+        - AttributeName: Timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: FaceId
+          KeyType: HASH
+        - AttributeName: Timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: FaceRecognition
+
+  # ================================
+  # SNS Topic for Alerts
+  # ================================
+  
+  SecurityAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${ProjectName}-security-alerts-${Environment}
+      DisplayName: Video Analytics Security Alerts
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  SecurityAlertsTopicArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ProjectName}/${Environment}/sns/security-alerts-topic-arn
+      Type: String
+      Value: !Ref SecurityAlertsTopic
+      Description: ARN of the security alerts SNS topic
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref SecurityAlertsTopic
+      Endpoint: !Ref AlertEmail
+
+  # ================================
+  # Lambda Functions
+  # ================================
+  
+  AnalyticsProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-analytics-processor-${Environment}
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt VideoAnalyticsRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: 512
+      Environment:
+        Variables:
+          DETECTIONS_TABLE: !Ref DetectionsTable
+          FACES_TABLE: !Ref FacesTable
+          SNS_TOPIC_ARN: !Ref SecurityAlertsTopic
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import base64
+          from datetime import datetime, timedelta
+          import os
+          import logging
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          # Initialize AWS clients
+          dynamodb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+          rekognition = boto3.client('rekognition')
+          
+          # Environment variables
+          DETECTIONS_TABLE = os.environ['DETECTIONS_TABLE']
+          FACES_TABLE = os.environ['FACES_TABLE']
+          SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN')
+          PROJECT_NAME = os.environ.get('PROJECT_NAME', 'video-analytics')
+          ENVIRONMENT = os.environ.get('ENVIRONMENT', 'dev')
+          
+          def lambda_handler(event, context):
+              """Main Lambda handler for processing video analytics events"""
+              logger.info(f"Processing {len(event['Records'])} records")
+              
+              for record in event['Records']:
+                  try:
+                      # Decode Kinesis data
+                      payload = base64.b64decode(record['kinesis']['data'])
+                      data = json.loads(payload)
+                      
+                      logger.info(f"Processing detection event: {data}")
+                      process_detection_event(data)
+                      
+                  except Exception as e:
+                      logger.error(f"Error processing record: {str(e)}")
+                      # Continue processing other records
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Successfully processed analytics events')
+              }
+          
+          def process_detection_event(data):
+              """Process a single detection event"""
+              timestamp = datetime.now().timestamp()
+              stream_name = data.get('StreamName', 'unknown')
+              
+              # Calculate TTL (30 days from now)
+              ttl = int((datetime.now() + timedelta(days=30)).timestamp())
+              
+              try:
+                  # Process face detections
+                  if 'FaceSearchResponse' in data:
+                      process_face_detection(data['FaceSearchResponse'], stream_name, timestamp, ttl)
+                  
+                  # Process label detections
+                  if 'LabelDetectionResponse' in data:
+                      process_label_detection(data['LabelDetectionResponse'], stream_name, timestamp, ttl)
+                  
+                  # Process person tracking
+                  if 'PersonTrackingResponse' in data:
+                      process_person_tracking(data['PersonTrackingResponse'], stream_name, timestamp, ttl)
+                      
+              except Exception as e:
+                  logger.error(f"Error processing detection event: {str(e)}")
+                  raise
+          
+          def process_face_detection(face_data, stream_name, timestamp, ttl):
+              """Process face detection results"""
+              table = dynamodb.Table(FACES_TABLE)
+              
+              for face_match in face_data.get('FaceMatches', []):
+                  try:
+                      face_id = face_match['Face']['FaceId']
+                      confidence = face_match['Face']['Confidence']
+                      similarity = face_match['Similarity']
+                      
+                      # Store face detection event
+                      table.put_item(
+                          Item={
+                              'FaceId': face_id,
+                              'Timestamp': int(timestamp * 1000),
+                              'StreamName': stream_name,
+                              'Confidence': str(confidence),
+                              'Similarity': str(similarity),
+                              'BoundingBox': face_match['Face']['BoundingBox'],
+                              'TTL': ttl
+                          }
+                      )
+                      
+                      # Send alert for high-confidence matches
+                      if similarity > 90:
+                          send_alert(
+                              f"High confidence face match detected: {face_id}",
+                              f"Similarity: {similarity}%, Stream: {stream_name}, Time: {datetime.fromtimestamp(timestamp)}"
+                          )
+                          
+                  except Exception as e:
+                      logger.error(f"Error processing face match: {str(e)}")
+          
+          def process_label_detection(label_data, stream_name, timestamp, ttl):
+              """Process object/label detection results"""
+              table = dynamodb.Table(DETECTIONS_TABLE)
+              
+              for label in label_data.get('Labels', []):
+                  try:
+                      label_name = label['Label']['Name']
+                      confidence = label['Label']['Confidence']
+                      
+                      # Store detection event
+                      table.put_item(
+                          Item={
+                              'StreamName': stream_name,
+                              'Timestamp': int(timestamp * 1000),
+                              'DetectionType': 'Label',
+                              'Label': label_name,
+                              'Confidence': str(confidence),
+                              'BoundingBox': json.dumps(label['Label'].get('BoundingBox', {})),
+                              'TTL': ttl
+                          }
+                      )
+                      
+                      # Check for security-relevant objects
+                      security_objects = ['Weapon', 'Gun', 'Knife', 'Person', 'Car', 'Motorcycle']
+                      if label_name in security_objects and confidence > 80:
+                          send_alert(
+                              f"Security object detected: {label_name}",
+                              f"Confidence: {confidence}%, Stream: {stream_name}, Time: {datetime.fromtimestamp(timestamp)}"
+                          )
+                          
+                  except Exception as e:
+                      logger.error(f"Error processing label detection: {str(e)}")
+          
+          def process_person_tracking(person_data, stream_name, timestamp, ttl):
+              """Process person tracking results"""
+              table = dynamodb.Table(DETECTIONS_TABLE)
+              
+              for person in person_data.get('Persons', []):
+                  try:
+                      person_id = person.get('Index', 'unknown')
+                      
+                      # Store person tracking event
+                      table.put_item(
+                          Item={
+                              'StreamName': stream_name,
+                              'Timestamp': int(timestamp * 1000),
+                              'DetectionType': 'Person',
+                              'PersonId': str(person_id),
+                              'BoundingBox': json.dumps(person.get('BoundingBox', {})),
+                              'TTL': ttl
+                          }
+                      )
+                      
+                  except Exception as e:
+                      logger.error(f"Error processing person tracking: {str(e)}")
+          
+          def send_alert(subject, message):
+              """Send security alert via SNS"""
+              if SNS_TOPIC_ARN:
+                  try:
+                      response = sns.publish(
+                          TopicArn=SNS_TOPIC_ARN,
+                          Subject=f"[{PROJECT_NAME}] {subject}",
+                          Message=message
+                      )
+                      logger.info(f"Alert sent: {response['MessageId']}")
+                  except Exception as e:
+                      logger.error(f"Failed to send alert: {str(e)}")
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  QueryApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-query-api-${Environment}
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ApiLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          DETECTIONS_TABLE: !Ref DetectionsTable
+          FACES_TABLE: !Ref FacesTable
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from boto3.dynamodb.conditions import Key
+          from datetime import datetime, timedelta
+          import os
+          import logging
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          # Initialize DynamoDB client
+          dynamodb = boto3.resource('dynamodb')
+          
+          # Environment variables
+          DETECTIONS_TABLE = os.environ['DETECTIONS_TABLE']
+          FACES_TABLE = os.environ['FACES_TABLE']
+          PROJECT_NAME = os.environ.get('PROJECT_NAME', 'video-analytics')
+          
+          def lambda_handler(event, context):
+              """Main API handler for querying video analytics data"""
+              try:
+                  # Parse request
+                  http_method = event['httpMethod']
+                  path = event['path']
+                  query_params = event.get('queryStringParameters', {}) or {}
+                  
+                  logger.info(f"API request: {http_method} {path} with params: {query_params}")
+                  
+                  if path == '/detections' and http_method == 'GET':
+                      return get_detections(query_params)
+                  elif path == '/faces' and http_method == 'GET':
+                      return get_face_detections(query_params)
+                  elif path == '/stats' and http_method == 'GET':
+                      return get_statistics(query_params)
+                  elif path == '/health' and http_method == 'GET':
+                      return get_health_check()
+                  else:
+                      return create_response(404, {'error': 'Not found'})
+                      
+              except Exception as e:
+                  logger.error(f"API error: {str(e)}")
+                  return create_response(500, {'error': str(e)})
+          
+          def get_detections(params):
+              """Get detection events for a specific stream"""
+              table = dynamodb.Table(DETECTIONS_TABLE)
+              
+              stream_name = params.get('stream')
+              hours_back = int(params.get('hours', 24))
+              limit = int(params.get('limit', 100))
+              
+              if not stream_name:
+                  return create_response(400, {'error': 'stream parameter required'})
+              
+              # Query recent detections
+              start_time = int((datetime.now() - timedelta(hours=hours_back)).timestamp() * 1000)
+              
+              try:
+                  response = table.query(
+                      KeyConditionExpression=Key('StreamName').eq(stream_name) & 
+                                           Key('Timestamp').gte(start_time),
+                      ScanIndexForward=False,
+                      Limit=limit
+                  )
+                  
+                  return create_response(200, {
+                      'detections': response['Items'],
+                      'count': len(response['Items']),
+                      'stream': stream_name,
+                      'hours_back': hours_back
+                  })
+                  
+              except Exception as e:
+                  logger.error(f"Error querying detections: {str(e)}")
+                  return create_response(500, {'error': 'Failed to query detections'})
+          
+          def get_face_detections(params):
+              """Get face detection events"""
+              table = dynamodb.Table(FACES_TABLE)
+              
+              hours_back = int(params.get('hours', 24))
+              limit = int(params.get('limit', 50))
+              
+              # For better performance in production, consider using a GSI
+              try:
+                  response = table.scan(
+                      Limit=limit,
+                      FilterExpression=Key('Timestamp').gte(
+                          int((datetime.now() - timedelta(hours=hours_back)).timestamp() * 1000)
+                      )
+                  )
+                  
+                  return create_response(200, {
+                      'faces': response['Items'],
+                      'count': len(response['Items']),
+                      'hours_back': hours_back
+                  })
+                  
+              except Exception as e:
+                  logger.error(f"Error querying face detections: {str(e)}")
+                  return create_response(500, {'error': 'Failed to query face detections'})
+          
+          def get_statistics(params):
+              """Get basic statistics (placeholder for analytics)"""
+              return create_response(200, {
+                  'message': 'Statistics endpoint - implement with your analytics requirements',
+                  'timestamp': datetime.now().isoformat(),
+                  'project': PROJECT_NAME
+              })
+          
+          def get_health_check():
+              """Health check endpoint"""
+              return create_response(200, {
+                  'status': 'healthy',
+                  'timestamp': datetime.now().isoformat(),
+                  'project': PROJECT_NAME
+              })
+          
+          def create_response(status_code, body):
+              """Create standardized API response"""
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type',
+                      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
+                  },
+                  'body': json.dumps(body, default=str)
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ================================
+  # Event Source Mapping
+  # ================================
+  
+  KinesisLambdaTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt AnalyticsDataStream.Arn
+      FunctionName: !GetAtt AnalyticsProcessorFunction.Arn
+      StartingPosition: LATEST
+      BatchSize: !Ref EventSourceMappingBatchSize
+      MaximumBatchingWindowInSeconds: 5
+
+  # ================================
+  # API Gateway
+  # ================================
+  
+  VideoAnalyticsApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub ${ProjectName}-api-${Environment}
+      ProtocolType: HTTP
+      Description: API for querying video analytics data
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+        MaxAge: 86400
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref VideoAnalyticsApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${QueryApiFunction}
+      PayloadFormatVersion: '2.0'
+
+  ApiRoute1:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref VideoAnalyticsApi
+      RouteKey: 'GET /detections'
+      Target: !Sub integrations/${ApiIntegration}
+
+  ApiRoute2:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref VideoAnalyticsApi
+      RouteKey: 'GET /faces'
+      Target: !Sub integrations/${ApiIntegration}
+
+  ApiRoute3:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref VideoAnalyticsApi
+      RouteKey: 'GET /stats'
+      Target: !Sub integrations/${ApiIntegration}
+
+  ApiRoute4:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref VideoAnalyticsApi
+      RouteKey: 'GET /health'
+      Target: !Sub integrations/${ApiIntegration}
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref VideoAnalyticsApi
+      StageName: v1
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 100
+        ThrottlingRateLimit: 50
+
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref QueryApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${VideoAnalyticsApi}/*/*
+
+  # ================================
+  # Rekognition Stream Processor
+  # ================================
+  
+  VideoStreamProcessor:
+    Type: AWS::Rekognition::StreamProcessor
+    Properties:
+      Name: !Sub ${ProjectName}-processor-${Environment}
+      RoleArn: !GetAtt VideoAnalyticsRole.Arn
+      KinesisVideoStream:
+        Arn: !GetAtt SecurityVideoStream.Arn
+      KinesisDataStream:
+        Arn: !GetAtt AnalyticsDataStream.Arn
+      FaceSearchSettings:
+        CollectionId: !Ref SecurityFaceCollection
+        FaceMatchThreshold: !Ref FaceMatchThreshold
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ================================
+  # CloudWatch Dashboards
+  # ================================
+  
+  VideoAnalyticsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${ProjectName}-video-analytics-${Environment}
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Kinesis", "IncomingRecords", "StreamName", "${AnalyticsDataStream}" ],
+                  [ ".", "OutgoingRecords", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Analytics Stream Activity"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${AnalyticsProcessorFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Analytics Processor Performance"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${DetectionsTable}" ],
+                  [ ".", "ConsumedWriteCapacityUnits", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Detections Table Usage"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/SNS", "NumberOfMessagesPublished", "TopicName", "${SecurityAlertsTopic}" ],
+                  [ ".", "NumberOfNotificationsDelivered", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Security Alerts"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  ProjectName:
+    Description: Name of the video analytics project
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub ${AWS::StackName}-ProjectName
+
+  Environment:
+    Description: Environment name
+    Value: !Ref Environment
+    Export:
+      Name: !Sub ${AWS::StackName}-Environment
+
+  VideoStreamArn:
+    Description: ARN of the Kinesis Video Stream
+    Value: !GetAtt SecurityVideoStream.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-VideoStreamArn
+
+  VideoStreamName:
+    Description: Name of the Kinesis Video Stream
+    Value: !Ref SecurityVideoStream
+    Export:
+      Name: !Sub ${AWS::StackName}-VideoStreamName
+
+  AnalyticsStreamArn:
+    Description: ARN of the analytics Kinesis Data Stream
+    Value: !GetAtt AnalyticsDataStream.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-AnalyticsStreamArn
+
+  AnalyticsStreamName:
+    Description: Name of the analytics Kinesis Data Stream
+    Value: !Ref AnalyticsDataStream
+    Export:
+      Name: !Sub ${AWS::StackName}-AnalyticsStreamName
+
+  FaceCollectionId:
+    Description: ID of the Rekognition face collection
+    Value: !Ref SecurityFaceCollection
+    Export:
+      Name: !Sub ${AWS::StackName}-FaceCollectionId
+
+  DetectionsTableName:
+    Description: Name of the detections DynamoDB table
+    Value: !Ref DetectionsTable
+    Export:
+      Name: !Sub ${AWS::StackName}-DetectionsTableName
+
+  FacesTableName:
+    Description: Name of the faces DynamoDB table
+    Value: !Ref FacesTable
+    Export:
+      Name: !Sub ${AWS::StackName}-FacesTableName
+
+  SecurityAlertsTopicArn:
+    Description: ARN of the security alerts SNS topic
+    Value: !Ref SecurityAlertsTopic
+    Export:
+      Name: !Sub ${AWS::StackName}-SecurityAlertsTopicArn
+
+  StreamProcessorName:
+    Description: Name of the Rekognition stream processor
+    Value: !Ref VideoStreamProcessor
+    Export:
+      Name: !Sub ${AWS::StackName}-StreamProcessorName
+
+  ApiEndpoint:
+    Description: URL of the video analytics API
+    Value: !Sub https://${VideoAnalyticsApi}.execute-api.${AWS::Region}.amazonaws.com/v1
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiEndpoint
+
+  DashboardUrl:
+    Description: URL of the CloudWatch dashboard
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-video-analytics-${Environment}
+    Export:
+      Name: !Sub ${AWS::StackName}-DashboardUrl
+
+  VideoAnalyticsRoleArn:
+    Description: ARN of the video analytics IAM role
+    Value: !GetAtt VideoAnalyticsRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-VideoAnalyticsRoleArn
+
+  TestCommands:
+    Description: Commands to test the API endpoints
+    Value: !Sub |
+      # Test API endpoints:
+      curl "${VideoAnalyticsApi}.execute-api.${AWS::Region}.amazonaws.com/v1/health"
+      curl "${VideoAnalyticsApi}.execute-api.${AWS::Region}.amazonaws.com/v1/detections?stream=${SecurityVideoStream}&hours=1"
+      curl "${VideoAnalyticsApi}.execute-api.${AWS::Region}.amazonaws.com/v1/faces?hours=1"
+      curl "${VideoAnalyticsApi}.execute-api.${AWS::Region}.amazonaws.com/v1/stats"
+
+  StartStreamProcessorCommand:
+    Description: AWS CLI command to start the stream processor
+    Value: !Sub aws rekognition start-stream-processor --name ${VideoStreamProcessor} --region ${AWS::Region}
+
+  StopStreamProcessorCommand:
+    Description: AWS CLI command to stop the stream processor
+    Value: !Sub aws rekognition stop-stream-processor --name ${VideoStreamProcessor} --region ${AWS::Region}

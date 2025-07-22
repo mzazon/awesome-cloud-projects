@@ -1,0 +1,715 @@
+# Infrastructure Manager Configuration for Cloud Asset Governance
+# This configuration deploys a comprehensive governance system using Cloud Asset Inventory,
+# Cloud Workflows, Cloud Functions, and BigQuery for automated compliance monitoring
+# and real-time policy enforcement across Google Cloud organizations.
+
+# Metadata and configuration for Infrastructure Manager deployment
+metadata:
+  name: cloud-asset-governance-system
+  description: "Automated governance system with Cloud Asset Inventory and Workflows"
+  version: "1.0"
+  labels:
+    application: governance
+    category: compliance
+    environment: production
+
+# Input variables for customizable deployment parameters
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud project ID for governance system deployment"
+    validation:
+      pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+  
+  organization_id:
+    type: string
+    description: "Organization ID for asset monitoring scope"
+    validation:
+      pattern: "^[0-9]+$"
+  
+  region:
+    type: string
+    description: "Primary region for governance system deployment"
+    default: "us-central1"
+    validation:
+      enum: ["us-central1", "us-east1", "us-west1", "europe-west1", "asia-east1"]
+  
+  governance_suffix:
+    type: string
+    description: "Unique suffix for resource names to prevent conflicts"
+    default: "gov"
+    validation:
+      pattern: "^[a-z0-9-]{3,10}$"
+  
+  billing_account:
+    type: string
+    description: "Billing account ID for cost tracking and allocation"
+    validation:
+      pattern: "^[0-9A-F]{6}-[0-9A-F]{6}-[0-9A-F]{6}$"
+  
+  monitored_asset_types:
+    type: array
+    description: "List of asset types to monitor for governance compliance"
+    default:
+      - "storage.googleapis.com/Bucket"
+      - "compute.googleapis.com/Instance"
+      - "bigquery.googleapis.com/Dataset"
+      - "iam.googleapis.com/ServiceAccount"
+      - "compute.googleapis.com/Network"
+  
+  notification_email:
+    type: string
+    description: "Email address for governance violation notifications"
+    validation:
+      pattern: "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
+
+# Resource definitions for the complete governance infrastructure
+resources:
+  
+  # Enable required Google Cloud APIs for governance functionality
+  governance_apis:
+    type: "gcp-types/serviceusage-v1:projects.services"
+    properties:
+      parent: "projects/${project_id}"
+      services:
+        - name: "cloudasset.googleapis.com"
+        - name: "workflows.googleapis.com"
+        - name: "cloudfunctions.googleapis.com"
+        - name: "pubsub.googleapis.com"
+        - name: "bigquery.googleapis.com"
+        - name: "storage.googleapis.com"
+        - name: "monitoring.googleapis.com"
+        - name: "logging.googleapis.com"
+        - name: "iam.googleapis.com"
+    metadata:
+      dependsOn:
+        - governance_project_configuration
+
+  # Project configuration and billing setup
+  governance_project_configuration:
+    type: "gcp-types/cloudresourcemanager-v1:projects"
+    properties:
+      projectId: "${project_id}"
+      name: "Cloud Asset Governance System"
+      parent:
+        type: "organization"
+        id: "${organization_id}"
+      labels:
+        purpose: "governance"
+        environment: "production"
+        team: "platform"
+    
+  # Link billing account to governance project
+  billing_configuration:
+    type: "gcp-types/cloudbilling-v1:projects"
+    properties:
+      name: "projects/${project_id}"
+      billingAccountName: "billingAccounts/${billing_account}"
+    metadata:
+      dependsOn:
+        - governance_project_configuration
+
+  # Cloud Storage bucket for governance artifacts and audit trails
+  governance_storage_bucket:
+    type: "gcp-types/storage-v1:buckets"
+    properties:
+      name: "${project_id}-governance-${governance_suffix}"
+      project: "${project_id}"
+      location: "${region}"
+      storageClass: "STANDARD"
+      versioning:
+        enabled: true
+      lifecycleRules:
+        - action:
+            type: "SetStorageClass"
+            storageClass: "NEARLINE"
+          condition:
+            age: 30
+        - action:
+            type: "SetStorageClass"
+            storageClass: "COLDLINE"
+          condition:
+            age: 90
+        - action:
+            type: "Delete"
+          condition:
+            age: 2555  # 7 years for compliance retention
+      uniformBucketLevelAccess:
+        enabled: true
+      labels:
+        purpose: "governance"
+        data_classification: "internal"
+    metadata:
+      dependsOn:
+        - governance_apis
+
+  # Create folder structure in storage bucket for organized data management
+  governance_bucket_folders:
+    type: "gcp-types/storage-v1:objects"
+    properties:
+      bucket: "${governance_storage_bucket.name}"
+      name: "policies/.keep"
+      contentType: "text/plain"
+      metadata:
+        purpose: "Policy definitions storage"
+    metadata:
+      dependsOn:
+        - governance_storage_bucket
+
+  # BigQuery dataset for governance analytics and compliance reporting
+  governance_analytics_dataset:
+    type: "gcp-types/bigquery-v2:datasets"
+    properties:
+      datasetId: "asset_governance_${governance_suffix}"
+      projectId: "${project_id}"
+      location: "${region}"
+      description: "Cloud Asset Governance Analytics and Compliance Dataset"
+      defaultTableExpirationMs: 31536000000  # 1 year retention
+      labels:
+        purpose: "governance_analytics"
+        data_classification: "internal"
+      access:
+        - role: "OWNER"
+          userByEmail: "governance-engine-${governance_suffix}@${project_id}.iam.gserviceaccount.com"
+        - role: "READER"
+          specialGroup: "projectReaders"
+    metadata:
+      dependsOn:
+        - governance_apis
+        - governance_service_account
+
+  # BigQuery table for asset violation tracking
+  asset_violations_table:
+    type: "gcp-types/bigquery-v2:tables"
+    properties:
+      projectId: "${project_id}"
+      datasetId: "${governance_analytics_dataset.datasetId}"
+      tableId: "asset_violations"
+      description: "Table for tracking governance policy violations"
+      schema:
+        fields:
+          - name: "violation_id"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Unique identifier for violation record"
+          - name: "resource_name"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Full resource name of violating asset"
+          - name: "policy_name"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Name of violated governance policy"
+          - name: "violation_type"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Description of policy violation"
+          - name: "severity"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Violation severity level (HIGH, MEDIUM, LOW)"
+          - name: "timestamp"
+            type: "TIMESTAMP"
+            mode: "REQUIRED"
+            description: "When violation was detected"
+          - name: "project_id"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Project containing the violating resource"
+          - name: "remediation_status"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Current remediation status"
+          - name: "remediation_actions"
+            type: "STRING"
+            mode: "NULLABLE"
+            description: "JSON array of available remediation actions"
+      timePartitioning:
+        type: "DAY"
+        field: "timestamp"
+      clustering:
+        fields: ["severity", "policy_name", "project_id"]
+    metadata:
+      dependsOn:
+        - governance_analytics_dataset
+
+  # BigQuery table for compliance reporting and metrics
+  compliance_reports_table:
+    type: "gcp-types/bigquery-v2:tables"
+    properties:
+      projectId: "${project_id}"
+      datasetId: "${governance_analytics_dataset.datasetId}"
+      tableId: "compliance_reports"
+      description: "Table for storing compliance scan reports and metrics"
+      schema:
+        fields:
+          - name: "report_id"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Unique identifier for compliance report"
+          - name: "scan_timestamp"
+            type: "TIMESTAMP"
+            mode: "REQUIRED"
+            description: "When compliance scan was performed"
+          - name: "total_resources"
+            type: "INTEGER"
+            mode: "REQUIRED"
+            description: "Total number of resources scanned"
+          - name: "violations_found"
+            type: "INTEGER"
+            mode: "REQUIRED"
+            description: "Number of policy violations detected"
+          - name: "high_severity"
+            type: "INTEGER"
+            mode: "REQUIRED"
+            description: "Count of high severity violations"
+          - name: "medium_severity"
+            type: "INTEGER"
+            mode: "REQUIRED"
+            description: "Count of medium severity violations"
+          - name: "low_severity"
+            type: "INTEGER"
+            mode: "REQUIRED"
+            description: "Count of low severity violations"
+          - name: "compliance_score"
+            type: "FLOAT"
+            mode: "REQUIRED"
+            description: "Overall compliance score (0.0 to 1.0)"
+          - name: "scan_scope"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Scope of compliance scan (organization, folder, project)"
+      timePartitioning:
+        type: "DAY"
+        field: "scan_timestamp"
+    metadata:
+      dependsOn:
+        - governance_analytics_dataset
+
+  # Pub/Sub topic for real-time asset change notifications
+  asset_changes_topic:
+    type: "gcp-types/pubsub-v1:projects.topics"
+    properties:
+      name: "projects/${project_id}/topics/asset-changes-${governance_suffix}"
+      labels:
+        purpose: "governance"
+        data_flow: "asset_changes"
+      messageRetentionDuration: "604800s"  # 7 days
+      schemaSettings:
+        encoding: "JSON"
+    metadata:
+      dependsOn:
+        - governance_apis
+
+  # Pub/Sub subscription for workflow processing
+  workflow_processor_subscription:
+    type: "gcp-types/pubsub-v1:projects.subscriptions"
+    properties:
+      name: "projects/${project_id}/subscriptions/workflow-processor-${governance_suffix}"
+      topic: "${asset_changes_topic.name}"
+      ackDeadlineSeconds: 600
+      messageRetentionDuration: "604800s"  # 7 days
+      retryPolicy:
+        minimumBackoff: "10s"
+        maximumBackoff: "300s"
+      deadLetterPolicy:
+        deadLetterTopic: "projects/${project_id}/topics/dead-letter-${governance_suffix}"
+        maxDeliveryAttempts: 5
+    metadata:
+      dependsOn:
+        - asset_changes_topic
+        - dead_letter_topic
+
+  # Dead letter topic for failed message processing
+  dead_letter_topic:
+    type: "gcp-types/pubsub-v1:projects.topics"
+    properties:
+      name: "projects/${project_id}/topics/dead-letter-${governance_suffix}"
+      labels:
+        purpose: "governance"
+        data_flow: "dead_letter"
+    metadata:
+      dependsOn:
+        - governance_apis
+
+  # Service account for governance operations with least privilege access
+  governance_service_account:
+    type: "gcp-types/iam-v1:projects.serviceAccounts"
+    properties:
+      accountId: "governance-engine-${governance_suffix}"
+      displayName: "Cloud Asset Governance Engine"
+      description: "Service account for automated governance operations and policy enforcement"
+      project: "${project_id}"
+    metadata:
+      dependsOn:
+        - governance_apis
+
+  # IAM binding for Cloud Asset Viewer at organization level
+  asset_viewer_binding:
+    type: "gcp-types/cloudresourcemanager-v1:organizations.getIamPolicy"
+    properties:
+      resource: "${organization_id}"
+      bindings:
+        - role: "roles/cloudasset.viewer"
+          members:
+            - "serviceAccount:governance-engine-${governance_suffix}@${project_id}.iam.gserviceaccount.com"
+    metadata:
+      dependsOn:
+        - governance_service_account
+
+  # IAM bindings for project-level permissions
+  project_iam_bindings:
+    type: "gcp-types/cloudresourcemanager-v1:projects.setIamPolicy"
+    properties:
+      resource: "${project_id}"
+      policy:
+        bindings:
+          - role: "roles/workflows.invoker"
+            members:
+              - "serviceAccount:governance-engine-${governance_suffix}@${project_id}.iam.gserviceaccount.com"
+          - role: "roles/bigquery.dataEditor"
+            members:
+              - "serviceAccount:governance-engine-${governance_suffix}@${project_id}.iam.gserviceaccount.com"
+          - role: "roles/storage.objectAdmin"
+            members:
+              - "serviceAccount:governance-engine-${governance_suffix}@${project_id}.iam.gserviceaccount.com"
+          - role: "roles/pubsub.subscriber"
+            members:
+              - "serviceAccount:governance-engine-${governance_suffix}@${project_id}.iam.gserviceaccount.com"
+          - role: "roles/cloudfunctions.invoker"
+            members:
+              - "serviceAccount:governance-engine-${governance_suffix}@${project_id}.iam.gserviceaccount.com"
+          - role: "roles/logging.logWriter"
+            members:
+              - "serviceAccount:governance-engine-${governance_suffix}@${project_id}.iam.gserviceaccount.com"
+    metadata:
+      dependsOn:
+        - governance_service_account
+
+  # Cloud Function for governance policy evaluation
+  policy_evaluation_function:
+    type: "gcp-types/cloudfunctions-v1:projects.locations.functions"
+    properties:
+      location: "projects/${project_id}/locations/${region}"
+      functionId: "governance-policy-evaluator"
+      function:
+        description: "Evaluates assets against governance policies and records violations"
+        sourceArchiveUrl: "gs://${governance_storage_bucket.name}/function-source/policy-evaluator.zip"
+        entryPoint: "evaluate_governance_policy"
+        runtime: "python311"
+        serviceAccountEmail: "governance-engine-${governance_suffix}@${project_id}.iam.gserviceaccount.com"
+        timeout: "540s"
+        availableMemoryMb: 512
+        maxInstances: 10
+        environmentVariables:
+          GOVERNANCE_SUFFIX: "${governance_suffix}"
+          PROJECT_ID: "${project_id}"
+          BQ_DATASET: "asset_governance_${governance_suffix}"
+        httpsTrigger: {}
+        labels:
+          purpose: "governance"
+          component: "policy_evaluation"
+    metadata:
+      dependsOn:
+        - governance_storage_bucket
+        - governance_service_account
+        - project_iam_bindings
+
+  # Cloud Function for workflow triggering from Pub/Sub
+  workflow_trigger_function:
+    type: "gcp-types/cloudfunctions-v1:projects.locations.functions"
+    properties:
+      location: "projects/${project_id}/locations/${region}"
+      functionId: "governance-workflow-trigger"
+      function:
+        description: "Triggers governance workflow from Pub/Sub asset change events"
+        sourceArchiveUrl: "gs://${governance_storage_bucket.name}/function-source/workflow-trigger.zip"
+        entryPoint: "trigger_governance_workflow"
+        runtime: "python311"
+        serviceAccountEmail: "governance-engine-${governance_suffix}@${project_id}.iam.gserviceaccount.com"
+        timeout: "60s"
+        availableMemoryMb: 256
+        maxInstances: 20
+        environmentVariables:
+          PROJECT_ID: "${project_id}"
+          REGION: "${region}"
+          WORKFLOW_ID: "governance-orchestrator"
+        eventTrigger:
+          eventType: "providers/cloud.pubsub/eventTypes/topic.publish"
+          resource: "${asset_changes_topic.name}"
+        labels:
+          purpose: "governance"
+          component: "workflow_trigger"
+    metadata:
+      dependsOn:
+        - asset_changes_topic
+        - governance_service_account
+        - project_iam_bindings
+
+  # Cloud Workflow for governance orchestration
+  governance_orchestrator_workflow:
+    type: "gcp-types/workflows-v1:projects.locations.workflows"
+    properties:
+      parent: "projects/${project_id}/locations/${region}"
+      workflowId: "governance-orchestrator"
+      workflow:
+        description: "Orchestrates governance policy evaluation and remediation processes"
+        serviceAccount: "governance-engine-${governance_suffix}@${project_id}.iam.gserviceaccount.com"
+        sourceContents: |
+          main:
+            steps:
+              - initialize:
+                  assign:
+                    - project_id: "${project_id}"
+                    - governance_suffix: "${governance_suffix}"
+                    - function_url: "https://${region}-${project_id}.cloudfunctions.net/governance-policy-evaluator"
+              
+              - parse_pubsub_message:
+                  assign:
+                    - message_data: ${base64.decode(args.message.data)}
+                    - asset_change: ${json.decode(message_data)}
+              
+              - log_asset_change:
+                  call: sys.log
+                  args:
+                    text: ${"Processing asset change: " + asset_change.asset.name}
+                    severity: "INFO"
+              
+              - evaluate_policies:
+                  call: http.post
+                  args:
+                    url: ${function_url}
+                    headers:
+                      Content-Type: "application/json"
+                      X-Governance-Suffix: ${governance_suffix}
+                    body:
+                      asset: ${asset_change.asset}
+                      change_type: ${asset_change.change_type}
+                  result: evaluation_result
+              
+              - check_violations:
+                  switch:
+                    - condition: ${evaluation_result.body.violations_found > 0}
+                      next: process_violations
+                    - condition: true
+                      next: complete_processing
+              
+              - process_violations:
+                  steps:
+                    - log_violations:
+                        call: sys.log
+                        args:
+                          text: ${"Found " + string(evaluation_result.body.violations_found) + " violations for " + evaluation_result.body.resource_name}
+                          severity: "WARNING"
+                    
+                    - send_notification:
+                        call: http.post
+                        args:
+                          url: "https://monitoring.googleapis.com/v3/projects/${project_id}/alertPolicies"
+                          headers:
+                            Authorization: ${"Bearer " + sys.get_env("GOOGLE_CLOUD_PROJECT")}
+                          body:
+                            displayName: "Governance Violation Alert"
+                            documentation:
+                              content: ${"Policy violation detected: " + evaluation_result.body.resource_name}
+              
+              - complete_processing:
+                  call: sys.log
+                  args:
+                    text: "Governance processing completed successfully"
+                    severity: "INFO"
+              
+              - return_result:
+                  return:
+                    status: "completed"
+                    violations: ${evaluation_result.body.violations_found}
+                    resource: ${evaluation_result.body.resource_name}
+        labels:
+          purpose: "governance"
+          component: "orchestration"
+    metadata:
+      dependsOn:
+        - governance_service_account
+        - policy_evaluation_function
+        - project_iam_bindings
+
+  # Cloud Asset Inventory feed for organization-wide monitoring
+  organization_asset_feed:
+    type: "gcp-types/cloudasset-v1:feeds"
+    properties:
+      parent: "organizations/${organization_id}"
+      feedId: "governance-feed-${governance_suffix}"
+      feed:
+        feedOutputConfig:
+          pubsubDestination:
+            topic: "${asset_changes_topic.name}"
+        contentType: "RESOURCE"
+        assetTypes: "${monitored_asset_types}"
+        relationshipTypes: []
+        condition:
+          expression: "true"  # Monitor all resources of specified types
+          title: "Governance Asset Monitoring"
+          description: "Monitor all specified asset types for governance compliance"
+    metadata:
+      dependsOn:
+        - asset_changes_topic
+        - pubsub_publisher_permissions
+
+  # Grant Asset Inventory service account permission to publish to Pub/Sub
+  pubsub_publisher_permissions:
+    type: "gcp-types/pubsub-v1:projects.topics.setIamPolicy"
+    properties:
+      resource: "${asset_changes_topic.name}"
+      policy:
+        bindings:
+          - role: "roles/pubsub.publisher"
+            members:
+              - "serviceAccount:service-${project_number}@gcp-sa-cloudasset.iam.gserviceaccount.com"
+    metadata:
+      dependsOn:
+        - asset_changes_topic
+
+  # Cloud Monitoring notification channel for governance alerts
+  notification_channel:
+    type: "gcp-types/monitoring-v1:projects.notificationChannels"
+    properties:
+      name: "projects/${project_id}/notificationChannels/governance-alerts-${governance_suffix}"
+      displayName: "Governance Violation Alerts"
+      description: "Email notifications for governance policy violations"
+      type: "email"
+      labels:
+        email_address: "${notification_email}"
+      enabled: true
+    metadata:
+      dependsOn:
+        - governance_apis
+
+  # Cloud Monitoring alert policy for high severity violations
+  high_severity_alert_policy:
+    type: "gcp-types/monitoring-v1:projects.alertPolicies"
+    properties:
+      displayName: "High Severity Governance Violations"
+      documentation:
+        content: "Alert triggered when high severity governance violations are detected"
+        mimeType: "text/markdown"
+      conditions:
+        - displayName: "High severity violations detected"
+          conditionThreshold:
+            filter: 'resource.type="bigquery_dataset" AND metric.type="logging.googleapis.com/user/governance_violations"'
+            comparison: "COMPARISON_GREATER_THAN"
+            thresholdValue: 0
+            duration: "60s"
+            aggregations:
+              - alignmentPeriod: "300s"
+                perSeriesAligner: "ALIGN_RATE"
+                crossSeriesReducer: "REDUCE_SUM"
+                groupByFields:
+                  - "metric.label.severity"
+      notificationChannels:
+        - "${notification_channel.name}"
+      enabled: true
+      alertStrategy:
+        autoClose: "1800s"  # Auto-close after 30 minutes
+    metadata:
+      dependsOn:
+        - notification_channel
+
+  # Log-based metric for tracking governance violations
+  governance_violations_metric:
+    type: "gcp-types/logging-v2:projects.metrics"
+    properties:
+      parent: "projects/${project_id}"
+      metricId: "governance_violations"
+      metric:
+        description: "Count of governance policy violations by severity"
+        filter: 'resource.type="cloud_function" AND resource.labels.function_name="governance-policy-evaluator" AND textPayload:"violations_found"'
+        metricDescriptor:
+          metricKind: "GAUGE"
+          valueType: "INT64"
+          displayName: "Governance Violations"
+        labelExtractors:
+          severity: 'EXTRACT(textPayload, r"severity:(\w+)")'
+          policy_name: 'EXTRACT(textPayload, r"policy:(\w+)")'
+    metadata:
+      dependsOn:
+        - governance_apis
+
+# Output values for external reference and integration
+outputs:
+  governance_project_id:
+    description: "Project ID containing the governance infrastructure"
+    value: "${project_id}"
+  
+  asset_feed_name:
+    description: "Name of the Cloud Asset Inventory feed"
+    value: "${organization_asset_feed.name}"
+  
+  storage_bucket_name:
+    description: "Name of the governance storage bucket"
+    value: "${governance_storage_bucket.name}"
+  
+  bigquery_dataset_id:
+    description: "BigQuery dataset ID for governance analytics"
+    value: "${governance_analytics_dataset.datasetId}"
+  
+  workflow_name:
+    description: "Name of the governance orchestrator workflow"
+    value: "${governance_orchestrator_workflow.name}"
+  
+  pubsub_topic:
+    description: "Pub/Sub topic for asset change notifications"
+    value: "${asset_changes_topic.name}"
+  
+  service_account_email:
+    description: "Email of the governance service account"
+    value: "governance-engine-${governance_suffix}@${project_id}.iam.gserviceaccount.com"
+  
+  policy_evaluation_function_url:
+    description: "HTTPS trigger URL for the policy evaluation function"
+    value: "https://${region}-${project_id}.cloudfunctions.net/governance-policy-evaluator"
+  
+  notification_channel_name:
+    description: "Cloud Monitoring notification channel for alerts"
+    value: "${notification_channel.name}"
+
+# Computed values for internal reference
+computed:
+  project_number:
+    description: "Project number for service account references"
+    value: "${governance_project_configuration.projectNumber}"
+
+# Health checks and validation rules
+validation:
+  - name: "project_id_format"
+    condition: "length(var.project_id) >= 6 && length(var.project_id) <= 30"
+    message: "Project ID must be between 6 and 30 characters"
+  
+  - name: "organization_access"
+    condition: "length(var.organization_id) > 0"
+    message: "Organization ID is required for asset feed creation"
+  
+  - name: "valid_region"
+    condition: "contains(['us-central1', 'us-east1', 'us-west1', 'europe-west1', 'asia-east1'], var.region)"
+    message: "Region must be a supported Google Cloud region"
+  
+  - name: "notification_email_required"
+    condition: "length(var.notification_email) > 0"
+    message: "Notification email is required for governance alerts"
+
+# Deployment configuration
+deployment:
+  create_policy: "CREATE_OR_ACQUIRE"
+  delete_policy: "DELETE"
+  
+  # Preview mode for testing without creating resources
+  preview: false
+  
+  # Timeout configuration for long-running operations
+  timeout: "1800s"  # 30 minutes
+  
+  # Automatic retry configuration
+  retry:
+    initial_delay: "10s"
+    max_delay: "60s"
+    multiplier: 2.0
+    max_attempts: 3

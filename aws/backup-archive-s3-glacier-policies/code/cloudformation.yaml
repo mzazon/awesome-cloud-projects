@@ -1,0 +1,587 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Comprehensive backup and archive strategy with S3 Glacier and lifecycle policies for cost-effective long-term data retention'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Bucket Configuration"
+        Parameters:
+          - BucketName
+          - EnableVersioning
+          - EnableMfaDelete
+      - Label:
+          default: "Lifecycle Policy Configuration"
+        Parameters:
+          - BackupTransitionDays
+          - LogRetentionDays
+          - DocumentArchiveEnabled
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableCostMonitoring
+          - CostThreshold
+          - NotificationEmail
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - EnableEncryption
+          - KmsKeyId
+          - BlockPublicAccess
+    ParameterLabels:
+      BucketName:
+        default: "S3 Bucket Name"
+      EnableVersioning:
+        default: "Enable Object Versioning"
+      BackupTransitionDays:
+        default: "Days before backup transition to IA"
+      CostThreshold:
+        default: "Cost Alert Threshold (USD)"
+
+# Input Parameters
+Parameters:
+  BucketName:
+    Type: String
+    Description: 'Name for the S3 bucket (leave empty for auto-generated name)'
+    Default: ''
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9\-]*[a-z0-9]$'
+    ConstraintDescription: 'Bucket name must be lowercase, alphanumeric, and hyphens only'
+    
+  EnableVersioning:
+    Type: String
+    Description: 'Enable S3 object versioning for backup integrity'
+    Default: 'Enabled'
+    AllowedValues:
+      - 'Enabled'
+      - 'Suspended'
+      
+  EnableMfaDelete:
+    Type: String
+    Description: 'Require MFA for object deletion (can only be enabled via CLI/API)'
+    Default: 'Disabled'
+    AllowedValues:
+      - 'Enabled'
+      - 'Disabled'
+      
+  BackupTransitionDays:
+    Type: Number
+    Description: 'Number of days before transitioning backup data to Infrequent Access'
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    
+  LogRetentionDays:
+    Type: Number
+    Description: 'Number of days to retain log files before deletion'
+    Default: 2555
+    MinValue: 90
+    MaxValue: 3650
+    
+  DocumentArchiveEnabled:
+    Type: String
+    Description: 'Enable tag-based lifecycle policy for document archives'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+      
+  EnableCostMonitoring:
+    Type: String
+    Description: 'Enable CloudWatch billing alarms for cost monitoring'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+      
+  CostThreshold:
+    Type: Number
+    Description: 'Monthly cost threshold in USD for billing alerts'
+    Default: 50
+    MinValue: 1
+    MaxValue: 10000
+    
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for cost and operational notifications'
+    Default: ''
+    AllowedPattern: '^$|^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    ConstraintDescription: 'Must be a valid email address'
+    
+  EnableEncryption:
+    Type: String
+    Description: 'Enable server-side encryption for S3 bucket'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+      
+  KmsKeyId:
+    Type: String
+    Description: 'KMS Key ID for encryption (leave empty for S3 managed keys)'
+    Default: ''
+    
+  BlockPublicAccess:
+    Type: String
+    Description: 'Block all public access to the S3 bucket'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+# Conditional Logic
+Conditions:
+  CreateBucketName: !Equals [!Ref BucketName, '']
+  EnableCostAlerting: !Equals [!Ref EnableCostMonitoring, 'true']
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  EnableDocumentArchive: !Equals [!Ref DocumentArchiveEnabled, 'true']
+  EnableS3Encryption: !Equals [!Ref EnableEncryption, 'true']
+  UseCustomKmsKey: !And 
+    - !Condition EnableS3Encryption
+    - !Not [!Equals [!Ref KmsKeyId, '']]
+  CreateSNSTopic: !And
+    - !Condition EnableCostAlerting
+    - !Condition HasNotificationEmail
+  BlockPublicS3Access: !Equals [!Ref BlockPublicAccess, 'true']
+
+# AWS Resources
+Resources:
+  # S3 Bucket for backup and archiving
+  BackupArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If 
+        - CreateBucketName
+        - !Sub 'backup-archive-${AWS::AccountId}-${AWS::Region}'
+        - !Ref BucketName
+      VersioningConfiguration:
+        Status: !Ref EnableVersioning
+      BucketEncryption: !If
+        - EnableS3Encryption
+        - ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: !If
+                  - UseCustomKmsKey
+                  - 'aws:kms'
+                  - 'AES256'
+                KMSMasterKeyID: !If
+                  - UseCustomKmsKey
+                  - !Ref KmsKeyId
+                  - !Ref AWS::NoValue
+              BucketKeyEnabled: !If
+                - UseCustomKmsKey
+                - true
+                - !Ref AWS::NoValue
+        - !Ref AWS::NoValue
+      PublicAccessBlockConfiguration: !If
+        - BlockPublicS3Access
+        - BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        - !Ref AWS::NoValue
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3LifecycleLogGroup
+      Tags:
+        - Key: 'Purpose'
+          Value: 'BackupAndArchive'
+        - Key: 'CostCenter'
+          Value: 'DataManagement'
+        - Key: 'Environment'
+          Value: 'Production'
+
+  # S3 Bucket Public Access Block
+  BackupArchiveBucketPublicAccessBlock:
+    Type: AWS::S3::BucketPublicAccessBlock
+    Condition: BlockPublicS3Access
+    Properties:
+      Bucket: !Ref BackupArchiveBucket
+      BlockPublicAcls: true
+      BlockPublicPolicy: true
+      IgnorePublicAcls: true
+      RestrictPublicBuckets: true
+
+  # Comprehensive Lifecycle Configuration
+  BackupArchiveLifecyclePolicy:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BackupArchiveBucket
+      LifecycleConfiguration:
+        Rules:
+          # Backup data lifecycle rule
+          - Id: 'backup-archive-strategy'
+            Status: 'Enabled'
+            Filter:
+              Prefix: 'backups/'
+            Transitions:
+              - Days: !Ref BackupTransitionDays
+                StorageClass: 'STANDARD_IA'
+              - Days: 90
+                StorageClass: 'GLACIER_IR'
+              - Days: 365
+                StorageClass: 'GLACIER'
+              - Days: 2555
+                StorageClass: 'DEEP_ARCHIVE'
+            NoncurrentVersionTransitions:
+              - NoncurrentDays: 7
+                StorageClass: 'STANDARD_IA'
+              - NoncurrentDays: 30
+                StorageClass: 'GLACIER'
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 2920
+          # Log data lifecycle rule
+          - Id: 'logs-retention-policy'
+            Status: 'Enabled'
+            Filter:
+              Prefix: 'logs/'
+            Transitions:
+              - Days: 7
+                StorageClass: 'STANDARD_IA'
+              - Days: 30
+                StorageClass: 'GLACIER_IR'
+              - Days: 90
+                StorageClass: 'GLACIER'
+            Expiration:
+              Days: !Ref LogRetentionDays
+          # Document archive lifecycle rule (conditional)
+          - !If
+            - EnableDocumentArchive
+            - Id: 'documents-long-term-archive'
+              Status: 'Enabled'
+              Filter:
+                And:
+                  Prefix: 'documents/'
+                  TagFilters:
+                    - Key: 'DataClass'
+                      Value: 'Archive'
+              Transitions:
+                - Days: 60
+                  StorageClass: 'GLACIER_IR'
+                - Days: 180
+                  StorageClass: 'GLACIER'
+                - Days: 1095
+                  StorageClass: 'DEEP_ARCHIVE'
+            - !Ref AWS::NoValue
+
+  # CloudWatch Log Group for S3 lifecycle events
+  S3LifecycleLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: '/aws/s3/lifecycle-transitions'
+      RetentionInDays: 90
+      Tags:
+        - Key: 'Purpose'
+          Value: 'S3LifecycleMonitoring'
+
+  # IAM Role for Glacier Operations
+  GlacierOperationsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'GlacierOperationsRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'glacier.amazonaws.com'
+            Action: 'sts:AssumeRole'
+          - Effect: 'Allow'
+            Principal:
+              Service: 's3.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonS3FullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonGlacierFullAccess'
+      Policies:
+        - PolicyName: 'LifecycleTransitionPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 's3:PutLifecycleConfiguration'
+                  - 's3:GetLifecycleConfiguration'
+                  - 's3:AbortMultipartUpload'
+                  - 's3:RestoreObject'
+                Resource: 
+                  - !Sub '${BackupArchiveBucket}/*'
+                  - !GetAtt BackupArchiveBucket.Arn
+              - Effect: 'Allow'
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !GetAtt S3LifecycleLogGroup.Arn
+      Tags:
+        - Key: 'Purpose'
+          Value: 'GlacierOperations'
+
+  # SNS Topic for notifications (conditional)
+  CostAlertsTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSNSTopic
+    Properties:
+      TopicName: !Sub 'backup-archive-cost-alerts-${AWS::StackName}'
+      DisplayName: 'Backup Archive Cost Alerts'
+      Subscription:
+        - Protocol: 'email'
+          Endpoint: !Ref NotificationEmail
+      Tags:
+        - Key: 'Purpose'
+          Value: 'CostMonitoring'
+
+  # CloudWatch Billing Alarm (conditional)
+  S3StorageCostAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableCostAlerting
+    Properties:
+      AlarmName: !Sub 'S3-Storage-Cost-Alarm-${AWS::StackName}'
+      AlarmDescription: 'Monitor S3 storage costs for backup and archive strategy'
+      MetricName: 'EstimatedCharges'
+      Namespace: 'AWS/Billing'
+      Statistic: 'Maximum'
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: !Ref CostThreshold
+      ComparisonOperator: 'GreaterThanThreshold'
+      Dimensions:
+        - Name: 'Currency'
+          Value: 'USD'
+        - Name: 'ServiceName'
+          Value: 'AmazonS3'
+      AlarmActions: !If
+        - CreateSNSTopic
+        - [!Ref CostAlertsTopic]
+        - []
+      TreatMissingData: 'notBreaching'
+      Tags:
+        - Key: 'Purpose'
+          Value: 'CostMonitoring'
+
+  # CloudWatch Dashboard for monitoring
+  BackupArchiveDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'BackupArchive-${AWS::StackName}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "BucketSizeBytes", "BucketName", "${BackupArchiveBucket}", "StorageType", "StandardStorage" ],
+                  [ "...", "StandardIAStorage" ],
+                  [ "...", "GlacierInstantRetrievalStorage" ],
+                  [ "...", "GlacierStorage" ],
+                  [ "...", "DeepArchiveStorage" ]
+                ],
+                "period": 86400,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Storage Usage by Class",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "NumberOfObjects", "BucketName", "${BackupArchiveBucket}", "StorageType", "AllStorageTypes" ]
+                ],
+                "period": 86400,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Total Object Count"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/s3/lifecycle-transitions'\n| fields @timestamp, @message\n| filter @message like /transition/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Lifecycle Transition Events"
+              }
+            }
+          ]
+        }
+
+  # Lambda function for compliance reporting (optional enhancement)
+  ComplianceReportFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'backup-compliance-report-${AWS::StackName}'
+      Runtime: 'python3.9'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt ComplianceReportRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import datetime
+          from botocore.exceptions import ClientError
+          
+          def lambda_handler(event, context):
+              s3_client = boto3.client('s3')
+              bucket_name = event.get('bucket_name')
+              
+              try:
+                  # Get lifecycle configuration
+                  lifecycle_response = s3_client.get_bucket_lifecycle_configuration(
+                      Bucket=bucket_name
+                  )
+                  
+                  # Get object inventory by storage class
+                  objects_response = s3_client.list_objects_v2(Bucket=bucket_name)
+                  
+                  storage_classes = {}
+                  for obj in objects_response.get('Contents', []):
+                      storage_class = obj.get('StorageClass', 'STANDARD')
+                      storage_classes[storage_class] = storage_classes.get(storage_class, 0) + 1
+                  
+                  report = {
+                      'timestamp': datetime.datetime.now().isoformat(),
+                      'bucket_name': bucket_name,
+                      'lifecycle_rules': len(lifecycle_response.get('Rules', [])),
+                      'storage_class_distribution': storage_classes,
+                      'total_objects': sum(storage_classes.values())
+                  }
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(report, indent=2)
+                  }
+                  
+              except ClientError as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: 'Purpose'
+          Value: 'ComplianceReporting'
+
+  # IAM Role for Lambda compliance reporting
+  ComplianceReportRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'ComplianceReportRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: 'S3ReadOnlyAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 's3:GetBucketLifecycleConfiguration'
+                  - 's3:ListBucket'
+                  - 's3:GetObject'
+                  - 's3:GetObjectTagging'
+                Resource:
+                  - !GetAtt BackupArchiveBucket.Arn
+                  - !Sub '${BackupArchiveBucket}/*'
+
+# Template Outputs
+Outputs:
+  BackupBucketName:
+    Description: 'Name of the S3 bucket for backup and archiving'
+    Value: !Ref BackupArchiveBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupBucketName'
+      
+  BackupBucketArn:
+    Description: 'ARN of the S3 bucket for backup and archiving'
+    Value: !GetAtt BackupArchiveBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupBucketArn'
+      
+  BackupBucketDomainName:
+    Description: 'Domain name of the S3 bucket'
+    Value: !GetAtt BackupArchiveBucket.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupBucketDomainName'
+      
+  GlacierOperationsRoleArn:
+    Description: 'ARN of the IAM role for Glacier operations'
+    Value: !GetAtt GlacierOperationsRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GlacierOperationsRoleArn'
+      
+  LifecycleLogGroupName:
+    Description: 'CloudWatch Log Group for lifecycle transitions'
+    Value: !Ref S3LifecycleLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LifecycleLogGroupName'
+      
+  DashboardURL:
+    Description: 'URL to the CloudWatch Dashboard'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${BackupArchiveDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+      
+  CostAlarmName:
+    Condition: EnableCostAlerting
+    Description: 'Name of the CloudWatch cost alarm'
+    Value: !Ref S3StorageCostAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-CostAlarmName'
+      
+  SNSTopicArn:
+    Condition: CreateSNSTopic
+    Description: 'ARN of the SNS topic for notifications'
+    Value: !Ref CostAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+      
+  ComplianceReportFunctionArn:
+    Description: 'ARN of the Lambda function for compliance reporting'
+    Value: !GetAtt ComplianceReportFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ComplianceReportFunctionArn'
+      
+  SampleCliCommands:
+    Description: 'Sample CLI commands for testing the backup strategy'
+    Value: !Sub |
+      # Upload test backup data:
+      aws s3 cp local-file.txt s3://${BackupArchiveBucket}/backups/test-backup.txt
+      
+      # Upload test log data:
+      aws s3 cp local-log.log s3://${BackupArchiveBucket}/logs/test-log.log
+      
+      # Upload document with archive tags:
+      aws s3 cp document.pdf s3://${BackupArchiveBucket}/documents/document.pdf --tagging "DataClass=Archive&Department=Legal"
+      
+      # Check lifecycle configuration:
+      aws s3api get-bucket-lifecycle-configuration --bucket ${BackupArchiveBucket}
+      
+      # Run compliance report:
+      aws lambda invoke --function-name ${ComplianceReportFunction} --payload '{"bucket_name":"${BackupArchiveBucket}"}' response.json

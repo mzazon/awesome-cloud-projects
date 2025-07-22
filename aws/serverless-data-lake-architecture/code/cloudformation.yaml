@@ -1,0 +1,941 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Advanced Serverless Data Lake Architecture with Lambda Layers, Glue, and EventBridge'
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'advanced-serverless-datalake'
+    Description: 'Name prefix for all resources'
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+    
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'test', 'staging', 'prod']
+    Description: 'Environment name for resource tagging'
+    
+  EnableXRayTracing:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable X-Ray tracing for Lambda functions'
+    
+  GlueCrawlerSchedule:
+    Type: String
+    Default: 'cron(0 */6 * * ? *)'
+    Description: 'Cron expression for Glue Crawler schedule (every 6 hours by default)'
+    
+  DataRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: 'Number of days to retain CloudWatch logs'
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+Conditions:
+  EnableXRay: !Equals [!Ref EnableXRayTracing, 'true']
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+  # --------------------------------------------------------------------------
+  # S3 BUCKETS FOR DATA LAKE
+  # --------------------------------------------------------------------------
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-raw-data-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Prefix: 'input/'
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt DataIngestionFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: 'input/'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: 'DataLakeStorage'
+
+  ProcessedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-processed-data-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: 'DataLakeStorage'
+
+  QuarantineDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-quarantine-data-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: 'DataLakeStorage'
+
+  # --------------------------------------------------------------------------
+  # DYNAMODB TABLE FOR METADATA
+  # --------------------------------------------------------------------------
+  MetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-metadata'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ProcessId
+          AttributeType: S
+        - AttributeName: Timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ProcessId
+          KeyType: HASH
+        - AttributeName: Timestamp
+          KeyType: RANGE
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: 'DataLakeMetadata'
+
+  # --------------------------------------------------------------------------
+  # EVENTBRIDGE CUSTOM BUS AND RULES
+  # --------------------------------------------------------------------------
+  CustomEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${ProjectName}-event-bus'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: 'EventOrchestration'
+
+  DataIngestionEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-data-ingestion-rule'
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        source: ['datalake.ingestion']
+        detail-type: ['Data Received']
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DataValidationFunction.Arn
+          Id: 'DataValidationTarget'
+
+  DataValidationEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-data-validation-rule'
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        source: ['datalake.validation']
+        detail-type: ['Data Validated']
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt QualityMonitoringFunction.Arn
+          Id: 'QualityMonitoringTarget'
+
+  DataQualityEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-data-quality-rule'
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        source: ['datalake.quality']
+        detail-type: ['Quality Check Complete']
+      State: ENABLED
+
+  # --------------------------------------------------------------------------
+  # IAM ROLES
+  # --------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !If
+          - EnableXRay
+          - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+          - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: DataLakeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3 Permissions
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${RawDataBucket}/*'
+                  - !Sub '${ProcessedDataBucket}/*'
+                  - !Sub '${QuarantineDataBucket}/*'
+                  - !GetAtt RawDataBucket.Arn
+                  - !GetAtt ProcessedDataBucket.Arn
+                  - !GetAtt QuarantineDataBucket.Arn
+              # DynamoDB Permissions
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt MetadataTable.Arn
+              # EventBridge Permissions
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !GetAtt CustomEventBus.Arn
+              # Glue Permissions
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:StartWorkflowRun
+                  - glue:GetWorkflowRun
+                Resource: '*'
+              # CloudWatch Metrics
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-glue-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${ProcessedDataBucket}/*'
+                  - !GetAtt ProcessedDataBucket.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # --------------------------------------------------------------------------
+  # LAMBDA LAYER
+  # --------------------------------------------------------------------------
+  SharedLibraryLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub '${ProjectName}-shared-layer'
+      Description: 'Shared utilities for data lake processing'
+      Content:
+        ZipFile: |
+          # This is a placeholder for the Lambda layer ZIP content
+          # In practice, this would be created separately and uploaded to S3
+          import json
+          import boto3
+          import uuid
+          import hashlib
+          from datetime import datetime
+          from typing import Dict, Any, List, Optional
+
+          class DataProcessor:
+              def __init__(self):
+                  self.s3_client = boto3.client('s3')
+                  self.dynamodb = boto3.resource('dynamodb')
+                  self.events_client = boto3.client('events')
+
+              def generate_process_id(self, source: str, timestamp: str) -> str:
+                  data = f"{source}-{timestamp}-{uuid.uuid4()}"
+                  return hashlib.md5(data.encode()).hexdigest()
+
+              def validate_json_structure(self, data: Dict[str, Any], required_fields: List[str]) -> bool:
+                  return all(field in data for field in required_fields)
+
+              def calculate_data_quality_score(self, data: Dict[str, Any]) -> float:
+                  total_fields = len(data)
+                  non_null_fields = sum(1 for v in data.values() if v is not None and v != "")
+                  return (non_null_fields / total_fields) * 100 if total_fields > 0 else 0
+
+              def publish_custom_event(self, event_bus: str, source: str, detail_type: str, detail: Dict[str, Any]):
+                  self.events_client.put_events(
+                      Entries=[
+                          {
+                              'Source': source,
+                              'DetailType': detail_type,
+                              'Detail': json.dumps(detail),
+                              'EventBusName': event_bus
+                          }
+                      ]
+                  )
+
+              def store_metadata(self, table_name: str, process_id: str, metadata: Dict[str, Any]):
+                  table = self.dynamodb.Table(table_name)
+                  item = {
+                      'ProcessId': process_id,
+                      'Timestamp': datetime.utcnow().isoformat(),
+                      **metadata
+                  }
+                  table.put_item(Item=item)
+      CompatibleRuntimes:
+        - python3.9
+        - python3.10
+        - python3.11
+      CompatibleArchitectures:
+        - x86_64
+        - arm64
+
+  # --------------------------------------------------------------------------
+  # LAMBDA FUNCTIONS
+  # --------------------------------------------------------------------------
+  DataIngestionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-data-ingestion'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Layers:
+        - !Ref SharedLibraryLayer
+      TracingConfig:
+        Mode: !If [EnableXRay, Active, PassThrough]
+      Environment:
+        Variables:
+          METADATA_TABLE: !Ref MetadataTable
+          CUSTOM_EVENT_BUS: !Ref CustomEventBus
+          PROCESSED_BUCKET: !Ref ProcessedDataBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          from data_utils import DataProcessor
+          
+          def lambda_handler(event, context):
+              processor = DataProcessor()
+              
+              # Extract event information
+              bucket = event['Records'][0]['s3']['bucket']['name']
+              key = event['Records'][0]['s3']['object']['key']
+              
+              # Generate process ID
+              process_id = processor.generate_process_id(bucket, datetime.utcnow().isoformat())
+              
+              try:
+                  # Download and process the file
+                  s3_response = processor.s3_client.get_object(Bucket=bucket, Key=key)
+                  file_content = s3_response['Body'].read().decode('utf-8')
+                  
+                  # Determine file type and process accordingly
+                  if key.endswith('.json'):
+                      data = json.loads(file_content)
+                      data_type = 'json'
+                  elif key.endswith('.csv'):
+                      data = {'raw_content': file_content, 'type': 'csv'}
+                      data_type = 'csv'
+                  else:
+                      data = {'raw_content': file_content, 'type': 'unknown'}
+                      data_type = 'unknown'
+                  
+                  # Store metadata
+                  metadata = {
+                      'SourceBucket': bucket,
+                      'SourceKey': key,
+                      'FileSize': len(file_content),
+                      'DataType': data_type,
+                      'Status': 'ingested',
+                      'ProcessingStage': 'ingestion'
+                  }
+                  
+                  processor.store_metadata(
+                      table_name=os.environ['METADATA_TABLE'],
+                      process_id=process_id,
+                      metadata=metadata
+                  )
+                  
+                  # Publish ingestion event
+                  event_detail = {
+                      'processId': process_id,
+                      'bucket': bucket,
+                      'key': key,
+                      'dataType': data_type,
+                      'fileSize': len(file_content)
+                  }
+                  
+                  processor.publish_custom_event(
+                      event_bus=os.environ['CUSTOM_EVENT_BUS'],
+                      source='datalake.ingestion',
+                      detail_type='Data Received',
+                      detail=event_detail
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'processId': process_id,
+                          'message': 'Data ingested successfully'
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error processing file: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: 'DataProcessing'
+
+  DataValidationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-data-validation'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Layers:
+        - !Ref SharedLibraryLayer
+      TracingConfig:
+        Mode: !If [EnableXRay, Active, PassThrough]
+      Environment:
+        Variables:
+          METADATA_TABLE: !Ref MetadataTable
+          CUSTOM_EVENT_BUS: !Ref CustomEventBus
+          PROCESSED_BUCKET: !Ref ProcessedDataBucket
+          QUARANTINE_BUCKET: !Ref QuarantineDataBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from data_utils import DataProcessor, DataValidator
+          
+          def lambda_handler(event, context):
+              processor = DataProcessor()
+              validator = DataValidator()
+              
+              # Parse EventBridge event
+              detail = event['detail']
+              process_id = detail['processId']
+              bucket = detail['bucket']
+              key = detail['key']
+              data_type = detail['dataType']
+              
+              try:
+                  # Download the file for validation
+                  s3_response = processor.s3_client.get_object(Bucket=bucket, Key=key)
+                  file_content = s3_response['Body'].read().decode('utf-8')
+                  
+                  validation_results = {
+                      'processId': process_id,
+                      'validationPassed': True,
+                      'validationErrors': [],
+                      'qualityScore': 0
+                  }
+                  
+                  if data_type == 'json':
+                      try:
+                          data = json.loads(file_content)
+                          
+                          # Validate required fields
+                          required_fields = ['id', 'timestamp', 'data']
+                          if not processor.validate_json_structure(data, required_fields):
+                              validation_results['validationPassed'] = False
+                              validation_results['validationErrors'].append('Missing required fields')
+                          
+                          # Calculate quality score
+                          validation_results['qualityScore'] = processor.calculate_data_quality_score(data)
+                          
+                      except json.JSONDecodeError:
+                          validation_results['validationPassed'] = False
+                          validation_results['validationErrors'].append('Invalid JSON format')
+                  
+                  elif data_type == 'csv':
+                      lines = file_content.strip().split('\n')
+                      if len(lines) < 2:
+                          validation_results['validationPassed'] = False
+                          validation_results['validationErrors'].append('CSV file must have header and data rows')
+                      else:
+                          validation_results['qualityScore'] = 85.0
+                  
+                  # Determine destination based on validation
+                  if validation_results['validationPassed'] and validation_results['qualityScore'] >= 70:
+                      destination_bucket = os.environ['PROCESSED_BUCKET']
+                      destination_prefix = 'validated/'
+                      status = 'validated'
+                  else:
+                      destination_bucket = os.environ['QUARANTINE_BUCKET']
+                      destination_prefix = 'quarantine/'
+                      status = 'quarantined'
+                  
+                  # Copy file to appropriate destination
+                  destination_key = f"{destination_prefix}{key}"
+                  processor.s3_client.copy_object(
+                      CopySource={'Bucket': bucket, 'Key': key},
+                      Bucket=destination_bucket,
+                      Key=destination_key
+                  )
+                  
+                  # Update metadata
+                  metadata = {
+                      'Status': status,
+                      'ProcessingStage': 'validation',
+                      'ValidationPassed': validation_results['validationPassed'],
+                      'QualityScore': validation_results['qualityScore'],
+                      'ValidationErrors': validation_results['validationErrors'],
+                      'DestinationBucket': destination_bucket,
+                      'DestinationKey': destination_key
+                  }
+                  
+                  processor.store_metadata(
+                      table_name=os.environ['METADATA_TABLE'],
+                      process_id=process_id,
+                      metadata=metadata
+                  )
+                  
+                  # Publish validation event
+                  processor.publish_custom_event(
+                      event_bus=os.environ['CUSTOM_EVENT_BUS'],
+                      source='datalake.validation',
+                      detail_type='Data Validated',
+                      detail=validation_results
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(validation_results)
+                  }
+                  
+              except Exception as e:
+                  print(f"Error validating data: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: 'DataProcessing'
+
+  QualityMonitoringFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-quality-monitoring'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Layers:
+        - !Ref SharedLibraryLayer
+      TracingConfig:
+        Mode: !If [EnableXRay, Active, PassThrough]
+      Environment:
+        Variables:
+          METADATA_TABLE: !Ref MetadataTable
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from data_utils import DataProcessor
+          from datetime import datetime, timedelta
+          
+          def lambda_handler(event, context):
+              processor = DataProcessor()
+              cloudwatch = boto3.client('cloudwatch')
+              
+              # Parse EventBridge event
+              detail = event['detail']
+              process_id = detail['processId']
+              quality_score = detail.get('qualityScore', 0)
+              validation_passed = detail.get('validationPassed', False)
+              
+              try:
+                  # Query recent processing metadata
+                  dynamodb = boto3.resource('dynamodb')
+                  table = dynamodb.Table(os.environ['METADATA_TABLE'])
+                  
+                  # Scan for recent records
+                  response = table.scan(
+                      FilterExpression='ProcessingStage = :stage',
+                      ExpressionAttributeValues={':stage': 'validation'}
+                  )
+                  
+                  # Calculate aggregate metrics
+                  total_records = len(response['Items'])
+                  passed_records = sum(1 for item in response['Items'] 
+                                     if item.get('ValidationPassed', False))
+                  avg_quality_score = sum(float(item.get('QualityScore', 0)) 
+                                        for item in response['Items']) / max(total_records, 1)
+                  
+                  # Publish CloudWatch metrics
+                  cloudwatch.put_metric_data(
+                      Namespace='DataLake/Quality',
+                      MetricData=[
+                          {
+                              'MetricName': 'ValidationSuccessRate',
+                              'Value': (passed_records / max(total_records, 1)) * 100,
+                              'Unit': 'Percent',
+                              'Dimensions': [
+                                  {
+                                      'Name': 'Pipeline',
+                                      'Value': os.environ.get('PROJECT_NAME', 'unknown')
+                                  }
+                              ]
+                          },
+                          {
+                              'MetricName': 'AverageQualityScore',
+                              'Value': avg_quality_score,
+                              'Unit': 'None',
+                              'Dimensions': [
+                                  {
+                                      'Name': 'Pipeline',
+                                      'Value': os.environ.get('PROJECT_NAME', 'unknown')
+                                  }
+                              ]
+                          },
+                          {
+                              'MetricName': 'ProcessedRecords',
+                              'Value': total_records,
+                              'Unit': 'Count',
+                              'Dimensions': [
+                                  {
+                                      'Name': 'Pipeline',
+                                      'Value': os.environ.get('PROJECT_NAME', 'unknown')
+                                  }
+                              ]
+                          }
+                      ]
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Quality metrics updated',
+                          'totalRecords': total_records,
+                          'passedRecords': passed_records,
+                          'averageQualityScore': avg_quality_score
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error monitoring quality: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: 'DataProcessing'
+
+  # --------------------------------------------------------------------------
+  # LAMBDA PERMISSIONS
+  # --------------------------------------------------------------------------
+  S3InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataIngestionFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt RawDataBucket.Arn
+
+  EventBridgeValidationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataValidationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DataIngestionEventRule.Arn
+
+  EventBridgeQualityPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref QualityMonitoringFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DataValidationEventRule.Arn
+
+  # --------------------------------------------------------------------------
+  # GLUE COMPONENTS
+  # --------------------------------------------------------------------------
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectName}_catalog'
+        Description: 'Data lake catalog database'
+
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ProjectName}-crawler'
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${ProcessedDataBucket}/validated/'
+      Schedule:
+        ScheduleExpression: !Ref GlueCrawlerSchedule
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": { "AddOrUpdateBehavior": "InheritFromTable" }
+          }
+        }
+      Tags:
+        Environment: !Ref Environment
+        Component: 'DataCatalog'
+
+  # --------------------------------------------------------------------------
+  # CLOUDWATCH LOG GROUPS
+  # --------------------------------------------------------------------------
+  DataIngestionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DataIngestionFunction}'
+      RetentionInDays: !Ref DataRetentionDays
+
+  DataValidationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DataValidationFunction}'
+      RetentionInDays: !Ref DataRetentionDays
+
+  QualityMonitoringLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${QualityMonitoringFunction}'
+      RetentionInDays: !Ref DataRetentionDays
+
+  # --------------------------------------------------------------------------
+  # CLOUDWATCH DASHBOARD
+  # --------------------------------------------------------------------------
+  DataLakeDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-data-lake-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "DataLake/Quality", "ValidationSuccessRate", "Pipeline", "${ProjectName}" ],
+                  [ ".", "AverageQualityScore", ".", "." ],
+                  [ ".", "ProcessedRecords", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Data Lake Quality Metrics"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${DataIngestionFunction}'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Ingestion Logs"
+              }
+            }
+          ]
+        }
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+Outputs:
+  RawDataBucketName:
+    Description: 'Name of the raw data S3 bucket'
+    Value: !Ref RawDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-RawDataBucket'
+
+  ProcessedDataBucketName:
+    Description: 'Name of the processed data S3 bucket'
+    Value: !Ref ProcessedDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessedDataBucket'
+
+  QuarantineDataBucketName:
+    Description: 'Name of the quarantine data S3 bucket'
+    Value: !Ref QuarantineDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-QuarantineDataBucket'
+
+  MetadataTableName:
+    Description: 'Name of the metadata DynamoDB table'
+    Value: !Ref MetadataTable
+    Export:
+      Name: !Sub '${AWS::StackName}-MetadataTable'
+
+  CustomEventBusName:
+    Description: 'Name of the custom EventBridge bus'
+    Value: !Ref CustomEventBus
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomEventBus'
+
+  GlueDatabaseName:
+    Description: 'Name of the Glue database'
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabase'
+
+  DataIngestionFunctionArn:
+    Description: 'ARN of the data ingestion Lambda function'
+    Value: !GetAtt DataIngestionFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataIngestionFunction'
+
+  DataValidationFunctionArn:
+    Description: 'ARN of the data validation Lambda function'
+    Value: !GetAtt DataValidationFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataValidationFunction'
+
+  QualityMonitoringFunctionArn:
+    Description: 'ARN of the quality monitoring Lambda function'
+    Value: !GetAtt QualityMonitoringFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-QualityMonitoringFunction'
+
+  SharedLayerArn:
+    Description: 'ARN of the shared Lambda layer'
+    Value: !Ref SharedLibraryLayer
+    Export:
+      Name: !Sub '${AWS::StackName}-SharedLayer'
+
+  CloudWatchDashboardURL:
+    Description: 'URL to the CloudWatch dashboard'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-data-lake-dashboard'
+
+  TestCommand:
+    Description: 'Sample command to test the data lake pipeline'
+    Value: !Sub 'aws s3 cp your-test-file.json s3://${RawDataBucket}/input/test-file.json'

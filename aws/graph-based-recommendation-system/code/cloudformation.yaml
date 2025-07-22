@@ -1,0 +1,954 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudFormation template for building graph databases and recommendation engines 
+  with Amazon Neptune. Creates a secure, multi-AZ Neptune cluster with read replicas,
+  VPC networking, and EC2 client instance for testing graph-based recommendations.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcCidr
+          - PublicSubnetCidr
+          - PrivateSubnet1Cidr
+          - PrivateSubnet2Cidr
+          - PrivateSubnet3Cidr
+      - Label:
+          default: "Neptune Configuration"
+        Parameters:
+          - NeptuneInstanceClass
+          - NeptuneEngineVersion
+          - BackupRetentionPeriod
+          - PreferredBackupWindow
+          - PreferredMaintenanceWindow
+          - StorageEncrypted
+      - Label:
+          default: "EC2 Configuration"
+        Parameters:
+          - EC2InstanceType
+          - KeyPairName
+          - LatestAmiId
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+    ParameterLabels:
+      VpcCidr:
+        default: "VPC CIDR Block"
+      NeptuneInstanceClass:
+        default: "Neptune Instance Type"
+      EC2InstanceType:
+        default: "EC2 Instance Type"
+      KeyPairName:
+        default: "EC2 Key Pair Name"
+
+Parameters:
+  # Network Configuration
+  VpcCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: CIDR block for the VPC
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    ConstraintDescription: CIDR block parameter must be in the form x.x.x.x/16-28
+
+  PublicSubnetCidr:
+    Type: String
+    Default: '10.0.10.0/24'
+    Description: CIDR block for the public subnet (EC2 client)
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: '10.0.1.0/24'
+    Description: CIDR block for the first private subnet (Neptune)
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: '10.0.2.0/24'
+    Description: CIDR block for the second private subnet (Neptune)
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+
+  PrivateSubnet3Cidr:
+    Type: String
+    Default: '10.0.3.0/24'
+    Description: CIDR block for the third private subnet (Neptune)
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+
+  # Neptune Configuration
+  NeptuneInstanceClass:
+    Type: String
+    Default: 'db.r5.large'
+    Description: Neptune DB instance class
+    AllowedValues:
+      - db.r5.large
+      - db.r5.xlarge
+      - db.r5.2xlarge
+      - db.r5.4xlarge
+      - db.r5.8xlarge
+      - db.r5.12xlarge
+      - db.r6g.large
+      - db.r6g.xlarge
+      - db.r6g.2xlarge
+      - db.r6g.4xlarge
+    ConstraintDescription: Must be a valid Neptune instance type
+
+  NeptuneEngineVersion:
+    Type: String
+    Default: '1.3.2.0'
+    Description: Neptune engine version
+    AllowedPattern: ^\d+\.\d+\.\d+\.\d+$
+
+  BackupRetentionPeriod:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 35
+    Description: Number of days to retain automated backups (1-35)
+
+  PreferredBackupWindow:
+    Type: String
+    Default: '03:00-04:00'
+    Description: Preferred backup window (UTC)
+    AllowedPattern: ^([0-1][0-9]|2[0-3]):[0-5][0-9]-([0-1][0-9]|2[0-3]):[0-5][0-9]$
+
+  PreferredMaintenanceWindow:
+    Type: String
+    Default: 'sun:04:00-sun:05:00'
+    Description: Preferred maintenance window (UTC)
+    AllowedPattern: ^(mon|tue|wed|thu|fri|sat|sun):[0-2][0-9]:[0-5][0-9]-(mon|tue|wed|thu|fri|sat|sun):[0-2][0-9]:[0-5][0-9]$
+
+  StorageEncrypted:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable storage encryption
+
+  # EC2 Configuration
+  EC2InstanceType:
+    Type: String
+    Default: 't3.medium'
+    Description: EC2 instance type for Neptune client
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - t3.2xlarge
+    ConstraintDescription: Must be a valid EC2 instance type
+
+  KeyPairName:
+    Type: String
+    Description: EC2 Key Pair name for SSH access (must exist in the region)
+    MinLength: 1
+    ConstraintDescription: Must specify an existing EC2 Key Pair
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: Latest Amazon Linux 2 AMI ID
+
+  # General Configuration
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'test', 'staging', 'prod']
+    Description: Environment name for resource tagging
+
+  ProjectName:
+    Type: String
+    Default: 'neptune-recommendations'
+    Description: Project name for resource naming and tagging
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9-]*$
+    MinLength: 3
+    MaxLength: 30
+
+Conditions:
+  # Condition to enable encryption based on parameter
+  EnableEncryption: !Equals [!Ref StorageEncrypted, 'true']
+  
+  # Condition for production environment additional configurations
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # ===================================
+  # VPC and Networking Infrastructure
+  # ===================================
+  
+  # Main VPC for Neptune deployment
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Internet Gateway for public subnet connectivity
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-igw-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Attach Internet Gateway to VPC
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # Public subnet for EC2 client instance
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PublicSubnetCidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-subnet-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Type
+          Value: 'Public'
+
+  # Private subnet 1 for Neptune (Multi-AZ deployment)
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-subnet-1-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Type
+          Value: 'Private'
+
+  # Private subnet 2 for Neptune (Multi-AZ deployment)
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-subnet-2-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Type
+          Value: 'Private'
+
+  # Private subnet 3 for Neptune (Multi-AZ deployment)
+  PrivateSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [2, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet3Cidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-subnet-3-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Type
+          Value: 'Private'
+
+  # Route table for public subnet
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-rt-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Default route for public subnet to Internet Gateway
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Associate public subnet with public route table
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+
+  # ===================================
+  # Security Groups
+  # ===================================
+
+  # Security group for Neptune cluster
+  NeptuneSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-neptune-sg-${Environment}'
+      GroupDescription: Security group for Neptune database cluster
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8182
+          ToPort: 8182
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+          Description: 'Neptune Gremlin port access from EC2 client'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-neptune-sg-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Security group for EC2 client instance
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-ec2-sg-${Environment}'
+      GroupDescription: Security group for EC2 Neptune client instance
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: 'SSH access from anywhere (restrict in production)'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ec2-sg-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Self-referencing rule for Neptune security group
+  NeptuneSecurityGroupSelfRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NeptuneSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8182
+      ToPort: 8182
+      SourceSecurityGroupId: !Ref NeptuneSecurityGroup
+      Description: 'Allow Neptune instances to communicate with each other'
+
+  # ===================================
+  # S3 Resources
+  # ===================================
+
+  # S3 bucket for sample data and bulk loading
+  SampleDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-sample-data-${AWS::AccountId}-${Environment}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-sample-data-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ===================================
+  # IAM Resources
+  # ===================================
+
+  # IAM role for Neptune bulk loading from S3
+  NeptuneBulkLoadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-neptune-bulk-load-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${SampleDataBucket}/*'
+                  - !GetAtt SampleDataBucket.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-neptune-bulk-load-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM role for EC2 instance to access Neptune and S3
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ec2-instance-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: NeptuneAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - neptune-db:connect
+                  - neptune-db:ReadDataViaQuery
+                  - neptune-db:WriteDataViaQuery
+                  - neptune-db:DeleteDataViaQuery
+                Resource: !Sub 'arn:aws:neptune-db:${AWS::Region}:${AWS::AccountId}:cluster-*/*'
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${SampleDataBucket}/*'
+                  - !GetAtt SampleDataBucket.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ec2-instance-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM instance profile for EC2 instance
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ProjectName}-ec2-instance-profile-${Environment}'
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # ===================================
+  # Neptune Database Resources
+  # ===================================
+
+  # Neptune subnet group for multi-AZ deployment
+  NeptuneSubnetGroup:
+    Type: AWS::Neptune::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${ProjectName}-neptune-subnet-group-${Environment}'
+      DBSubnetGroupDescription: Subnet group for Neptune cluster
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+        - !Ref PrivateSubnet3
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-neptune-subnet-group-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Neptune cluster parameter group for custom configurations
+  NeptuneClusterParameterGroup:
+    Type: AWS::Neptune::DBClusterParameterGroup
+    Properties:
+      Description: Custom parameter group for Neptune cluster
+      Family: neptune1.3
+      Parameters:
+        neptune_enable_audit_log: 1
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-neptune-cluster-pg-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Neptune DB parameter group for instance-level settings
+  NeptuneDBParameterGroup:
+    Type: AWS::Neptune::DBParameterGroup
+    Properties:
+      Description: Custom parameter group for Neptune instances
+      Family: neptune1.3
+      Parameters:
+        neptune_query_timeout: 120000
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-neptune-db-pg-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Main Neptune cluster
+  NeptuneCluster:
+    Type: AWS::Neptune::DBCluster
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBClusterIdentifier: !Sub '${ProjectName}-neptune-cluster-${Environment}'
+      Engine: neptune
+      EngineVersion: !Ref NeptuneEngineVersion
+      DBSubnetGroupName: !Ref NeptuneSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref NeptuneSecurityGroup
+      StorageEncrypted: !If [EnableEncryption, true, false]
+      BackupRetentionPeriod: !Ref BackupRetentionPeriod
+      PreferredBackupWindow: !Ref PreferredBackupWindow
+      PreferredMaintenanceWindow: !Ref PreferredMaintenanceWindow
+      IamAuthEnabled: true
+      DeletionProtection: !If [IsProduction, true, false]
+      DBClusterParameterGroupName: !Ref NeptuneClusterParameterGroup
+      AssociatedRoles:
+        - RoleArn: !GetAtt NeptuneBulkLoadRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-neptune-cluster-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Primary Neptune instance
+  NeptunePrimaryInstance:
+    Type: AWS::Neptune::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-neptune-primary-${Environment}'
+      DBClusterIdentifier: !Ref NeptuneCluster
+      DBInstanceClass: !Ref NeptuneInstanceClass
+      Engine: neptune
+      DBParameterGroupName: !Ref NeptuneDBParameterGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-neptune-primary-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Role
+          Value: 'Primary'
+
+  # Neptune read replica 1 for improved read performance
+  NeptuneReadReplica1:
+    Type: AWS::Neptune::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-neptune-replica-1-${Environment}'
+      DBClusterIdentifier: !Ref NeptuneCluster
+      DBInstanceClass: !Ref NeptuneInstanceClass
+      Engine: neptune
+      DBParameterGroupName: !Ref NeptuneDBParameterGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-neptune-replica-1-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Role
+          Value: 'ReadReplica'
+
+  # Neptune read replica 2 for additional read scaling
+  NeptuneReadReplica2:
+    Type: AWS::Neptune::DBInstance
+    Condition: IsProduction
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-neptune-replica-2-${Environment}'
+      DBClusterIdentifier: !Ref NeptuneCluster
+      DBInstanceClass: !Ref NeptuneInstanceClass
+      Engine: neptune
+      DBParameterGroupName: !Ref NeptuneDBParameterGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-neptune-replica-2-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Role
+          Value: 'ReadReplica'
+
+  # ===================================
+  # EC2 Instance for Neptune Client
+  # ===================================
+
+  # EC2 instance for connecting to Neptune and running Gremlin queries
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref EC2InstanceType
+      KeyName: !Ref KeyPairName
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      SubnetId: !Ref PublicSubnet
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y python3 python3-pip git
+
+          # Install Python Gremlin client
+          pip3 install gremlinpython boto3 awscli
+
+          # Create sample scripts and data directory
+          mkdir -p /home/ec2-user/neptune-client
+          cd /home/ec2-user/neptune-client
+
+          # Set environment variables
+          echo "export NEPTUNE_ENDPOINT=${NeptuneCluster.Endpoint}" >> /home/ec2-user/.bashrc
+          echo "export NEPTUNE_READ_ENDPOINT=${NeptuneCluster.ReadEndpoint}" >> /home/ec2-user/.bashrc
+          echo "export S3_BUCKET=${SampleDataBucket}" >> /home/ec2-user/.bashrc
+          echo "export AWS_DEFAULT_REGION=${AWS::Region}" >> /home/ec2-user/.bashrc
+
+          # Create connection test script
+          cat > test-connection.py << 'EOF'
+          #!/usr/bin/env python3
+          import os
+          import sys
+          from gremlin_python.driver import client
+          from gremlin_python.driver.driver_remote_connection import DriverRemoteConnection
+          from gremlin_python.structure.graph import Graph
+
+          def test_neptune_connection():
+              endpoint = os.environ.get('NEPTUNE_ENDPOINT')
+              if not endpoint:
+                  print("❌ NEPTUNE_ENDPOINT environment variable not set")
+                  return False
+              
+              try:
+                  connection = DriverRemoteConnection(f'wss://{endpoint}:8182/gremlin', 'g')
+                  g = Graph().traversal().withRemote(connection)
+                  
+                  vertex_count = g.V().count().next()
+                  edge_count = g.E().count().next()
+                  
+                  print(f"✅ Connected to Neptune successfully!")
+                  print(f"Graph contains {vertex_count} vertices and {edge_count} edges")
+                  
+                  connection.close()
+                  return True
+                  
+              except Exception as e:
+                  print(f"❌ Connection failed: {e}")
+                  return False
+
+          if __name__ == "__main__":
+              test_neptune_connection()
+          EOF
+
+          # Create sample data loading script
+          cat > load-sample-data.py << 'EOF'
+          #!/usr/bin/env python3
+          import os
+          from gremlin_python.driver.driver_remote_connection import DriverRemoteConnection
+          from gremlin_python.structure.graph import Graph
+
+          def load_sample_data():
+              endpoint = os.environ.get('NEPTUNE_ENDPOINT')
+              if not endpoint:
+                  print("❌ NEPTUNE_ENDPOINT environment variable not set")
+                  return
+              
+              try:
+                  connection = DriverRemoteConnection(f'wss://{endpoint}:8182/gremlin', 'g')
+                  g = Graph().traversal().withRemote(connection)
+                  
+                  # Clear existing data
+                  g.V().drop().iterate()
+                  
+                  # Create users
+                  users = [
+                      {'id': 'user1', 'name': 'Alice', 'age': 28, 'city': 'Seattle'},
+                      {'id': 'user2', 'name': 'Bob', 'age': 35, 'city': 'Portland'},
+                      {'id': 'user3', 'name': 'Carol', 'age': 42, 'city': 'Vancouver'},
+                      {'id': 'user4', 'name': 'David', 'age': 31, 'city': 'San Francisco'},
+                      {'id': 'user5', 'name': 'Eve', 'age': 26, 'city': 'Los Angeles'}
+                  ]
+                  
+                  for user in users:
+                      g.addV('user').property('userId', user['id']).property('name', user['name']).property('age', user['age']).property('city', user['city']).next()
+                  
+                  # Create products
+                  products = [
+                      {'id': 'prod1', 'name': 'Laptop', 'category': 'Electronics', 'price': 999.99},
+                      {'id': 'prod2', 'name': 'Running Shoes', 'category': 'Sports', 'price': 129.99},
+                      {'id': 'prod3', 'name': 'Camera', 'category': 'Electronics', 'price': 599.99},
+                      {'id': 'prod4', 'name': 'Cookbook', 'category': 'Books', 'price': 29.99},
+                      {'id': 'prod5', 'name': 'Headphones', 'category': 'Electronics', 'price': 199.99}
+                  ]
+                  
+                  for product in products:
+                      g.addV('product').property('productId', product['id']).property('name', product['name']).property('category', product['category']).property('price', product['price']).next()
+                  
+                  # Create purchase relationships
+                  purchases = [
+                      ('user1', 'prod1', 5, '2024-01-15'),
+                      ('user1', 'prod3', 4, '2024-01-20'),
+                      ('user2', 'prod2', 5, '2024-01-18'),
+                      ('user2', 'prod4', 4, '2024-01-25'),
+                      ('user3', 'prod3', 5, '2024-01-22'),
+                      ('user3', 'prod4', 3, '2024-01-28'),
+                      ('user4', 'prod1', 4, '2024-01-30'),
+                      ('user4', 'prod5', 5, '2024-02-02'),
+                      ('user5', 'prod5', 4, '2024-02-05')
+                  ]
+                  
+                  for user_id, product_id, rating, date in purchases:
+                      g.V().has('user', 'userId', user_id).as_('u').V().has('product', 'productId', product_id).addE('purchased').from_('u').property('rating', rating).property('date', date).next()
+                  
+                  print("✅ Sample data loaded successfully")
+                  connection.close()
+                  
+              except Exception as e:
+                  print(f"❌ Failed to load data: {e}")
+
+          if __name__ == "__main__":
+              load_sample_data()
+          EOF
+
+          # Create recommendation script
+          cat > recommendations.py << 'EOF'
+          #!/usr/bin/env python3
+          import os
+          from gremlin_python.driver.driver_remote_connection import DriverRemoteConnection
+          from gremlin_python.structure.graph import Graph
+
+          def get_recommendations(user_id):
+              endpoint = os.environ.get('NEPTUNE_ENDPOINT')
+              if not endpoint:
+                  print("❌ NEPTUNE_ENDPOINT environment variable not set")
+                  return
+              
+              try:
+                  connection = DriverRemoteConnection(f'wss://{endpoint}:8182/gremlin', 'g')
+                  g = Graph().traversal().withRemote(connection)
+                  
+                  print(f"Getting recommendations for {user_id}...")
+                  
+                  # Collaborative filtering: find similar users
+                  similar_users = g.V().has('user', 'userId', user_id).out('purchased').in_('purchased').where(__.not_(__.has('userId', user_id))).groupCount().order(__.local).by(__.values, __.desc).limit(__.local, 3).toList()
+                  
+                  print(f"Similar users: {similar_users}")
+                  
+                  # Get recommendations based on similar users
+                  user_products = g.V().has('user', 'userId', user_id).out('purchased').values('productId').toSet()
+                  
+                  recommendations = g.V().has('user', 'userId', user_id).out('purchased').in_('purchased').where(__.not_(__.has('userId', user_id))).out('purchased').where(__.not_(__.has('productId', __.within(user_products)))).groupCount().order(__.local).by(__.values, __.desc).limit(__.local, 3).toList()
+                  
+                  print(f"Product recommendations: {recommendations}")
+                  
+                  connection.close()
+                  
+              except Exception as e:
+                  print(f"❌ Failed to get recommendations: {e}")
+
+          if __name__ == "__main__":
+              import sys
+              if len(sys.argv) > 1:
+                  get_recommendations(sys.argv[1])
+              else:
+                  print("Usage: python3 recommendations.py <user_id>")
+          EOF
+
+          # Make scripts executable
+          chmod +x *.py
+          chown -R ec2-user:ec2-user /home/ec2-user/neptune-client
+
+          # Signal CloudFormation that setup is complete
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource EC2Instance --region ${AWS::Region}
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-neptune-client-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Neptune Client'
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT10M
+
+  # ===================================
+  # CloudWatch Alarms (Production Only)
+  # ===================================
+
+  # CloudWatch alarm for Neptune CPU utilization
+  NeptuneCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-neptune-cpu-high-${Environment}'
+      AlarmDescription: 'Neptune cluster CPU utilization is high'
+      MetricName: CPUUtilization
+      Namespace: AWS/Neptune
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref NeptuneCluster
+      TreatMissingData: notBreaching
+
+  # CloudWatch alarm for Neptune database connections
+  NeptuneConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-neptune-connections-high-${Environment}'
+      AlarmDescription: 'Neptune cluster connection count is high'
+      MetricName: DatabaseConnections
+      Namespace: AWS/Neptune
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 40
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref NeptuneCluster
+      TreatMissingData: notBreaching
+
+# ===================================
+# Outputs
+# ===================================
+
+Outputs:
+  # VPC and Networking Outputs
+  VpcId:
+    Description: 'VPC ID for the Neptune deployment'
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+
+  PublicSubnetId:
+    Description: 'Public subnet ID for EC2 client'
+    Value: !Ref PublicSubnet
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnetId'
+
+  PrivateSubnetIds:
+    Description: 'Private subnet IDs for Neptune cluster'
+    Value: !Join [',', [!Ref PrivateSubnet1, !Ref PrivateSubnet2, !Ref PrivateSubnet3]]
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnetIds'
+
+  # Neptune Cluster Outputs
+  NeptuneClusterIdentifier:
+    Description: 'Neptune cluster identifier'
+    Value: !Ref NeptuneCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-NeptuneClusterIdentifier'
+
+  NeptuneClusterEndpoint:
+    Description: 'Neptune cluster write endpoint'
+    Value: !GetAtt NeptuneCluster.Endpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-NeptuneClusterEndpoint'
+
+  NeptuneClusterReadEndpoint:
+    Description: 'Neptune cluster read endpoint for load-balanced queries'
+    Value: !GetAtt NeptuneCluster.ReadEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-NeptuneClusterReadEndpoint'
+
+  NeptunePort:
+    Description: 'Neptune cluster port number'
+    Value: !GetAtt NeptuneCluster.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-NeptunePort'
+
+  # Neptune Connection Information
+  GremlinEndpoint:
+    Description: 'Gremlin WebSocket endpoint for client connections'
+    Value: !Sub 'wss://${NeptuneCluster.Endpoint}:${NeptuneCluster.Port}/gremlin'
+    Export:
+      Name: !Sub '${AWS::StackName}-GremlinEndpoint'
+
+  SparqlEndpoint:
+    Description: 'SPARQL endpoint for RDF queries'
+    Value: !Sub 'https://${NeptuneCluster.Endpoint}:${NeptuneCluster.Port}/sparql'
+    Export:
+      Name: !Sub '${AWS::StackName}-SparqlEndpoint'
+
+  # EC2 Instance Outputs
+  EC2InstanceId:
+    Description: 'EC2 instance ID for Neptune client'
+    Value: !Ref EC2Instance
+    Export:
+      Name: !Sub '${AWS::StackName}-EC2InstanceId'
+
+  EC2PublicIp:
+    Description: 'Public IP address of EC2 Neptune client'
+    Value: !GetAtt EC2Instance.PublicIp
+    Export:
+      Name: !Sub '${AWS::StackName}-EC2PublicIp'
+
+  EC2PrivateIp:
+    Description: 'Private IP address of EC2 Neptune client'
+    Value: !GetAtt EC2Instance.PrivateIp
+    Export:
+      Name: !Sub '${AWS::StackName}-EC2PrivateIp'
+
+  # S3 and IAM Outputs
+  SampleDataBucketName:
+    Description: 'S3 bucket for sample data and bulk loading'
+    Value: !Ref SampleDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-SampleDataBucket'
+
+  NeptuneBulkLoadRoleArn:
+    Description: 'IAM role ARN for Neptune bulk loading from S3'
+    Value: !GetAtt NeptuneBulkLoadRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-NeptuneBulkLoadRoleArn'
+
+  # Connection Instructions
+  SSHCommand:
+    Description: 'SSH command to connect to EC2 Neptune client'
+    Value: !Sub 'ssh -i ${KeyPairName}.pem ec2-user@${EC2Instance.PublicIp}'
+
+  NeptuneConnectionCommand:
+    Description: 'Sample Python command to connect to Neptune'
+    Value: !Sub 'python3 -c "from gremlin_python.driver.driver_remote_connection import DriverRemoteConnection; from gremlin_python.structure.graph import Graph; connection = DriverRemoteConnection(\"wss://${NeptuneCluster.Endpoint}:${NeptuneCluster.Port}/gremlin\", \"g\"); g = Graph().traversal().withRemote(connection); print(\"Vertices:\", g.V().count().next())"'
+
+  # Quick Start Guide
+  QuickStartGuide:
+    Description: 'Quick start instructions for using the Neptune cluster'
+    Value: !Sub |
+      1. SSH to EC2 instance: ssh -i ${KeyPairName}.pem ec2-user@${EC2Instance.PublicIp}
+      2. Load sample data: cd neptune-client && python3 load-sample-data.py
+      3. Test connection: python3 test-connection.py
+      4. Get recommendations: python3 recommendations.py user1
+      5. Neptune endpoints - Write: ${NeptuneCluster.Endpoint} Read: ${NeptuneCluster.ReadEndpoint}

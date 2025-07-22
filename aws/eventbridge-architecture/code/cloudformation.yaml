@@ -1,0 +1,856 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Event-Driven Architecture with EventBridge Custom Buses and Rules - Complete infrastructure for building loosely coupled microservices communication'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "EventBridge Configuration"
+        Parameters:
+          - EventBusName
+          - EnableEventArchiving
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaFunctionName
+          - LambdaMemorySize
+          - LambdaTimeout
+      - Label:
+          default: "Messaging Configuration"
+        Parameters:
+          - SNSTopicName
+          - SQSQueueName
+          - SQSVisibilityTimeout
+          - SQSMessageRetentionPeriod
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableXRayTracing
+          - LogRetentionInDays
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      EventBusName:
+        default: "Custom Event Bus Name"
+      EnableEventArchiving:
+        default: "Enable Event Archiving"
+      LambdaFunctionName:
+        default: "Lambda Function Name"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      SNSTopicName:
+        default: "SNS Topic Name"
+      SQSQueueName:
+        default: "SQS Queue Name"
+      SQSVisibilityTimeout:
+        default: "SQS Visibility Timeout (seconds)"
+      SQSMessageRetentionPeriod:
+        default: "SQS Message Retention Period (seconds)"
+      EnableXRayTracing:
+        default: "Enable X-Ray Tracing"
+      LogRetentionInDays:
+        default: "CloudWatch Log Retention (days)"
+
+# Input Parameters
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'event-driven-arch'
+    Description: 'Name of the project used for resource naming'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must begin with a letter and contain only alphanumeric characters and hyphens'
+    MinLength: 3
+    MaxLength: 50
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    Description: 'Environment name (dev, staging, prod)'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    ConstraintDescription: 'Must be one of: dev, staging, prod'
+
+  EventBusName:
+    Type: String
+    Default: 'ecommerce-events'
+    Description: 'Name of the custom EventBridge event bus'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-_.]*$'
+    ConstraintDescription: 'Must begin with a letter and contain only alphanumeric characters, hyphens, underscores, and periods'
+    MinLength: 1
+    MaxLength: 256
+
+  EnableEventArchiving:
+    Type: String
+    Default: 'true'
+    Description: 'Enable event archiving and replay capability'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  LambdaFunctionName:
+    Type: String
+    Default: 'event-processor'
+    Description: 'Name of the Lambda function for event processing'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-_]*$'
+    ConstraintDescription: 'Must begin with a letter and contain only alphanumeric characters, hyphens, and underscores'
+    MinLength: 1
+    MaxLength: 64
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    Description: 'Lambda function memory size in MB'
+    MinValue: 128
+    MaxValue: 10240
+    ConstraintDescription: 'Must be between 128 and 10240 MB'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    Description: 'Lambda function timeout in seconds'
+    MinValue: 1
+    MaxValue: 900
+    ConstraintDescription: 'Must be between 1 and 900 seconds'
+
+  SNSTopicName:
+    Type: String
+    Default: 'order-notifications'
+    Description: 'Name of the SNS topic for notifications'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-_]*$'
+    ConstraintDescription: 'Must begin with a letter and contain only alphanumeric characters, hyphens, and underscores'
+    MinLength: 1
+    MaxLength: 256
+
+  SQSQueueName:
+    Type: String
+    Default: 'event-processing'
+    Description: 'Name of the SQS queue for batch processing'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-_]*$'
+    ConstraintDescription: 'Must begin with a letter and contain only alphanumeric characters, hyphens, and underscores'
+    MinLength: 1
+    MaxLength: 80
+
+  SQSVisibilityTimeout:
+    Type: Number
+    Default: 300
+    Description: 'SQS queue visibility timeout in seconds'
+    MinValue: 0
+    MaxValue: 43200
+    ConstraintDescription: 'Must be between 0 and 43200 seconds (12 hours)'
+
+  SQSMessageRetentionPeriod:
+    Type: Number
+    Default: 1209600
+    Description: 'SQS message retention period in seconds (default: 14 days)'
+    MinValue: 60
+    MaxValue: 1209600
+    ConstraintDescription: 'Must be between 60 seconds and 1209600 seconds (14 days)'
+
+  EnableXRayTracing:
+    Type: String
+    Default: 'true'
+    Description: 'Enable X-Ray tracing for Lambda functions'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  LogRetentionInDays:
+    Type: Number
+    Default: 30
+    Description: 'CloudWatch log retention period in days'
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    ConstraintDescription: 'Must be a valid CloudWatch log retention period'
+
+# Conditions
+Conditions:
+  EnableArchiving: !Equals [!Ref EnableEventArchiving, 'true']
+  EnableTracing: !Equals [!Ref EnableXRayTracing, 'true']
+  IsProd: !Equals [!Ref Environment, 'prod']
+
+# Resources
+Resources:
+  # ================================
+  # EventBridge Resources
+  # ================================
+  
+  # Custom Event Bus
+  CustomEventBus:
+    Type: 'AWS::Events::EventBus'
+    Properties:
+      Name: !Sub '${ProjectName}-${EventBusName}-${Environment}'
+      Description: !Sub 'Custom event bus for ${ProjectName} event-driven architecture'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EventBusName}-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'ECommerce-Events'
+
+  # Event Archive (conditional)
+  EventArchive:
+    Type: 'AWS::Events::Archive'
+    Condition: EnableArchiving
+    Properties:
+      ArchiveName: !Sub '${ProjectName}-event-archive-${Environment}'
+      Description: 'Archive for event replay and disaster recovery'
+      EventSourceArn: !GetAtt CustomEventBus.Arn
+      RetentionDays: !If [IsProd, 365, 30]
+      EventPattern:
+        source:
+          - 'ecommerce.orders'
+          - 'ecommerce.users'
+          - 'ecommerce.payments'
+
+  # ================================
+  # IAM Roles and Policies
+  # ================================
+  
+  # EventBridge Execution Role
+  EventBridgeExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-EventBridge-ExecutionRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Description: 'IAM role for EventBridge to deliver events to targets'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-EventBridge-ExecutionRole-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # EventBridge Execution Policy
+  EventBridgeExecutionPolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: !Sub '${ProjectName}-EventBridge-ExecutionPolicy-${Environment}'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'sns:Publish'
+            Resource: !Ref SNSNotificationTopic
+          - Effect: Allow
+            Action:
+              - 'sqs:SendMessage'
+            Resource: !GetAtt SQSProcessingQueue.Arn
+          - Effect: Allow
+            Action:
+              - 'lambda:InvokeFunction'
+            Resource: !GetAtt EventProcessorFunction.Arn
+          - Effect: Allow
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/events/*'
+      Roles:
+        - !Ref EventBridgeExecutionRole
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-Lambda-ExecutionRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - !If 
+          - EnableTracing
+          - 'arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess'
+          - !Ref 'AWS::NoValue'
+      Description: 'IAM role for Lambda function to process events'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-Lambda-ExecutionRole-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda Additional Permissions Policy
+  LambdaAdditionalPolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: !Sub '${ProjectName}-Lambda-AdditionalPolicy-${Environment}'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'events:PutEvents'
+            Resource: !GetAtt CustomEventBus.Arn
+          - Effect: Allow
+            Action:
+              - 'sns:Publish'
+            Resource: !Ref SNSNotificationTopic
+          - Effect: Allow
+            Action:
+              - 'sqs:SendMessage'
+              - 'sqs:GetQueueAttributes'
+            Resource: !GetAtt SQSProcessingQueue.Arn
+      Roles:
+        - !Ref LambdaExecutionRole
+
+  # ================================
+  # Lambda Function
+  # ================================
+  
+  # Lambda Log Group
+  LambdaLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${LambdaFunctionName}-${Environment}'
+      RetentionInDays: !Ref LogRetentionInDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${LambdaFunctionName}-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Event Processor Lambda Function
+  EventProcessorFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${LambdaFunctionName}-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Description: 'Process EventBridge events with business logic'
+      TracingConfig:
+        Mode: !If [EnableTracing, 'Active', 'PassThrough']
+      Environment:
+        Variables:
+          EVENT_BUS_NAME: !Ref CustomEventBus
+          SNS_TOPIC_ARN: !Ref SNSNotificationTopic
+          SQS_QUEUE_URL: !Ref SQSProcessingQueue
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import os
+          from datetime import datetime
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """Process EventBridge events"""
+              
+              try:
+                  logger.info(f"Received event: {json.dumps(event, indent=2)}")
+                  
+                  # Extract event details
+                  event_source = event.get('source', 'unknown')
+                  event_type = event.get('detail-type', 'unknown')
+                  event_detail = event.get('detail', {})
+                  
+                  # Process based on event type
+                  result = process_event(event_source, event_type, event_detail)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Event processed successfully',
+                          'eventSource': event_source,
+                          'eventType': event_type,
+                          'result': result,
+                          'timestamp': datetime.utcnow().isoformat(),
+                          'environment': os.environ.get('ENVIRONMENT', 'unknown'),
+                          'projectName': os.environ.get('PROJECT_NAME', 'unknown')
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing event: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def process_event(source, event_type, detail):
+              """Process different types of events"""
+              
+              if source == 'ecommerce.orders':
+                  return process_order_event(event_type, detail)
+              elif source == 'ecommerce.users':
+                  return process_user_event(event_type, detail)
+              elif source == 'ecommerce.payments':
+                  return process_payment_event(event_type, detail)
+              else:
+                  return process_generic_event(event_type, detail)
+          
+          def process_order_event(event_type, detail):
+              """Process order-related events"""
+              
+              if event_type == 'Order Created':
+                  order_id = detail.get('orderId')
+                  customer_id = detail.get('customerId')
+                  total_amount = detail.get('totalAmount', 0)
+                  
+                  logger.info(f"Processing new order: {order_id} for customer {customer_id}")
+                  
+                  # Business logic for order processing
+                  result = {
+                      'action': 'order_processed',
+                      'orderId': order_id,
+                      'customerId': customer_id,
+                      'totalAmount': total_amount,
+                      'priority': 'high' if total_amount > 1000 else 'normal'
+                  }
+                  
+                  return result
+                  
+              elif event_type == 'Order Cancelled':
+                  order_id = detail.get('orderId')
+                  logger.info(f"Processing order cancellation: {order_id}")
+                  
+                  return {
+                      'action': 'order_cancelled',
+                      'orderId': order_id
+                  }
+              
+              return {'action': 'order_event_processed'}
+          
+          def process_user_event(event_type, detail):
+              """Process user-related events"""
+              
+              if event_type == 'User Registered':
+                  user_id = detail.get('userId')
+                  email = detail.get('email')
+                  
+                  logger.info(f"Processing new user registration: {user_id}")
+                  
+                  return {
+                      'action': 'user_registered',
+                      'userId': user_id,
+                      'email': email,
+                      'welcomeEmailSent': True
+                  }
+              
+              return {'action': 'user_event_processed'}
+          
+          def process_payment_event(event_type, detail):
+              """Process payment-related events"""
+              
+              if event_type == 'Payment Processed':
+                  payment_id = detail.get('paymentId')
+                  amount = detail.get('amount')
+                  
+                  logger.info(f"Processing payment: {payment_id} for amount {amount}")
+                  
+                  return {
+                      'action': 'payment_processed',
+                      'paymentId': payment_id,
+                      'amount': amount
+                  }
+              
+              return {'action': 'payment_event_processed'}
+          
+          def process_generic_event(event_type, detail):
+              """Process generic events"""
+              
+              logger.info(f"Processing generic event: {event_type}")
+              
+              return {
+                  'action': 'generic_event_processed',
+                  'eventType': event_type
+              }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${LambdaFunctionName}-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
+  # Messaging Resources
+  # ================================
+  
+  # SNS Topic for Notifications
+  SNSNotificationTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      TopicName: !Sub '${ProjectName}-${SNSTopicName}-${Environment}'
+      DisplayName: !Sub '${ProjectName} Order Notifications'
+      Description: 'SNS topic for high-value order notifications and system alerts'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${SNSTopicName}-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SQS Queue for Batch Processing
+  SQSProcessingQueue:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: !Sub '${ProjectName}-${SQSQueueName}-${Environment}'
+      VisibilityTimeoutSeconds: !Ref SQSVisibilityTimeout
+      MessageRetentionPeriod: !Ref SQSMessageRetentionPeriod
+      ReceiveMessageWaitTimeSeconds: 20  # Enable long polling
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt SQSDeadLetterQueue.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${SQSQueueName}-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SQS Dead Letter Queue
+  SQSDeadLetterQueue:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: !Sub '${ProjectName}-${SQSQueueName}-dlq-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${SQSQueueName}-dlq-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
+  # EventBridge Rules
+  # ================================
+  
+  # Rule 1: Route all order events to Lambda
+  OrderEventsRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: !Sub '${ProjectName}-OrderEventsRule-${Environment}'
+      Description: 'Route order events to Lambda processor'
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        source:
+          - 'ecommerce.orders'
+        detail-type:
+          - 'Order Created'
+          - 'Order Updated'
+          - 'Order Cancelled'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt EventProcessorFunction.Arn
+          Id: 'OrderEventsLambdaTarget'
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+            MaximumEventAge: 3600
+          DeadLetterConfig:
+            Arn: !GetAtt EventRuleDLQ.Arn
+
+  # Lambda Permission for Order Events Rule
+  OrderEventsLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref EventProcessorFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt OrderEventsRule.Arn
+
+  # Rule 2: Route high-value orders to SNS
+  HighValueOrdersRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: !Sub '${ProjectName}-HighValueOrdersRule-${Environment}'
+      Description: 'Route high-value orders to SNS for immediate notifications'
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        source:
+          - 'ecommerce.orders'
+        detail-type:
+          - 'Order Created'
+        detail:
+          totalAmount:
+            - numeric: [">", 1000]
+      State: ENABLED
+      Targets:
+        - Arn: !Ref SNSNotificationTopic
+          Id: 'HighValueOrdersSNSTarget'
+          RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+            MaximumEventAge: 3600
+
+  # Rule 3: Route all events to SQS for batch processing
+  AllEventsToSQSRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: !Sub '${ProjectName}-AllEventsToSQSRule-${Environment}'
+      Description: 'Route all events to SQS for batch processing'
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        source:
+          - 'ecommerce.orders'
+          - 'ecommerce.users'
+          - 'ecommerce.payments'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SQSProcessingQueue.Arn
+          Id: 'AllEventsSQSTarget'
+          RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+            MaximumEventAge: 3600
+
+  # Rule 4: Route user registration events to Lambda
+  UserRegistrationRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: !Sub '${ProjectName}-UserRegistrationRule-${Environment}'
+      Description: 'Route user registration events to Lambda'
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        source:
+          - 'ecommerce.users'
+        detail-type:
+          - 'User Registered'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt EventProcessorFunction.Arn
+          Id: 'UserRegistrationLambdaTarget'
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+            MaximumEventAge: 3600
+
+  # Lambda Permission for User Registration Rule
+  UserRegistrationLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref EventProcessorFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt UserRegistrationRule.Arn
+
+  # Dead Letter Queue for Failed Events
+  EventRuleDLQ:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: !Sub '${ProjectName}-event-rule-dlq-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-event-rule-dlq-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
+  # CloudWatch Alarms
+  # ================================
+  
+  # EventBridge Failed Invocations Alarm
+  EventBridgeFailedInvocationsAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${ProjectName}-EventBridge-FailedInvocations-${Environment}'
+      AlarmDescription: 'Alert when EventBridge has failed invocations'
+      MetricName: FailedInvocations
+      Namespace: AWS/Events
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: EventBusName
+          Value: !Ref CustomEventBus
+      AlarmActions:
+        - !Ref SNSNotificationTopic
+      TreatMissingData: notBreaching
+
+  # Lambda Function Error Rate Alarm
+  LambdaErrorRateAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${ProjectName}-Lambda-ErrorRate-${Environment}'
+      AlarmDescription: 'Alert when Lambda function error rate exceeds threshold'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EventProcessorFunction
+      AlarmActions:
+        - !Ref SNSNotificationTopic
+      TreatMissingData: notBreaching
+
+  # SQS Queue Depth Alarm
+  SQSQueueDepthAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${ProjectName}-SQS-QueueDepth-${Environment}'
+      AlarmDescription: 'Alert when SQS queue depth exceeds threshold'
+      MetricName: ApproximateNumberOfMessages
+      Namespace: AWS/SQS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 100
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt SQSProcessingQueue.QueueName
+      AlarmActions:
+        - !Ref SNSNotificationTopic
+      TreatMissingData: notBreaching
+
+# Outputs
+Outputs:
+  # EventBridge Outputs
+  EventBusName:
+    Description: 'Name of the custom EventBridge event bus'
+    Value: !Ref CustomEventBus
+    Export:
+      Name: !Sub '${ProjectName}-EventBusName-${Environment}'
+
+  EventBusArn:
+    Description: 'ARN of the custom EventBridge event bus'
+    Value: !GetAtt CustomEventBus.Arn
+    Export:
+      Name: !Sub '${ProjectName}-EventBusArn-${Environment}'
+
+  # Lambda Outputs
+  LambdaFunctionName:
+    Description: 'Name of the event processor Lambda function'
+    Value: !Ref EventProcessorFunction
+    Export:
+      Name: !Sub '${ProjectName}-LambdaFunctionName-${Environment}'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the event processor Lambda function'
+    Value: !GetAtt EventProcessorFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-LambdaFunctionArn-${Environment}'
+
+  # Messaging Outputs
+  SNSTopicName:
+    Description: 'Name of the SNS notification topic'
+    Value: !GetAtt SNSNotificationTopic.TopicName
+    Export:
+      Name: !Sub '${ProjectName}-SNSTopicName-${Environment}'
+
+  SNSTopicArn:
+    Description: 'ARN of the SNS notification topic'
+    Value: !Ref SNSNotificationTopic
+    Export:
+      Name: !Sub '${ProjectName}-SNSTopicArn-${Environment}'
+
+  SQSQueueName:
+    Description: 'Name of the SQS processing queue'
+    Value: !GetAtt SQSProcessingQueue.QueueName
+    Export:
+      Name: !Sub '${ProjectName}-SQSQueueName-${Environment}'
+
+  SQSQueueUrl:
+    Description: 'URL of the SQS processing queue'
+    Value: !Ref SQSProcessingQueue
+    Export:
+      Name: !Sub '${ProjectName}-SQSQueueUrl-${Environment}'
+
+  SQSQueueArn:
+    Description: 'ARN of the SQS processing queue'
+    Value: !GetAtt SQSProcessingQueue.Arn
+    Export:
+      Name: !Sub '${ProjectName}-SQSQueueArn-${Environment}'
+
+  # IAM Role Outputs
+  EventBridgeExecutionRoleArn:
+    Description: 'ARN of the EventBridge execution role'
+    Value: !GetAtt EventBridgeExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-EventBridgeExecutionRoleArn-${Environment}'
+
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-LambdaExecutionRoleArn-${Environment}'
+
+  # Event Rules Outputs
+  OrderEventsRuleArn:
+    Description: 'ARN of the order events rule'
+    Value: !GetAtt OrderEventsRule.Arn
+    Export:
+      Name: !Sub '${ProjectName}-OrderEventsRuleArn-${Environment}'
+
+  HighValueOrdersRuleArn:
+    Description: 'ARN of the high-value orders rule'
+    Value: !GetAtt HighValueOrdersRule.Arn
+    Export:
+      Name: !Sub '${ProjectName}-HighValueOrdersRuleArn-${Environment}'
+
+  UserRegistrationRuleArn:
+    Description: 'ARN of the user registration rule'
+    Value: !GetAtt UserRegistrationRule.Arn
+    Export:
+      Name: !Sub '${ProjectName}-UserRegistrationRuleArn-${Environment}'
+
+  # Archive Output (conditional)
+  EventArchiveName:
+    Condition: EnableArchiving
+    Description: 'Name of the event archive'
+    Value: !Ref EventArchive
+    Export:
+      Name: !Sub '${ProjectName}-EventArchiveName-${Environment}'
+
+  # Testing and Monitoring Outputs
+  TestEventCommand:
+    Description: 'AWS CLI command to publish a test event'
+    Value: !Sub |
+      aws events put-events --entries Source=ecommerce.orders,DetailType="Order Created",Detail="{\"orderId\":\"test-order-123\",\"customerId\":\"test-customer\",\"totalAmount\":1500.00,\"currency\":\"USD\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}",EventBusName=${CustomEventBus}
+
+  MonitoringDashboardUrl:
+    Description: 'CloudWatch dashboard URL for monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-EventDriven-${Environment}'
+
+  # Cost Optimization Notes
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for typical usage (reference only)'
+    Value: 'EventBridge: $1.00/million events, Lambda: $0.20/million requests + $0.0000166667/GB-second, SNS: $0.50/million notifications, SQS: $0.40/million requests'

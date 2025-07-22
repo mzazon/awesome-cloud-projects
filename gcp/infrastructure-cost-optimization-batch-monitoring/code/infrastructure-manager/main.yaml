@@ -1,0 +1,659 @@
+# Infrastructure Manager Configuration for Infrastructure Cost Optimization
+# This configuration deploys a complete cost optimization system using Cloud Batch,
+# Cloud Monitoring, Cloud Functions, and supporting services for automated infrastructure analysis
+
+# Copyright 2025 Google LLC
+# Licensed under the Apache License, Version 2.0
+
+imports:
+  - path: schema.yaml
+
+info:
+  title: Infrastructure Cost Optimization with Cloud Batch and Monitoring
+  author: Google Cloud Architecture Team
+  description: |
+    Automated cost optimization system that leverages Cloud Batch for scheduled 
+    infrastructure analysis, Cloud Monitoring for resource utilization tracking,
+    and Cloud Functions for automated remediation actions.
+  version: 1.0
+
+# Template variables for customization
+variables:
+  # Project and location configuration
+  project_id:
+    type: string
+    description: Google Cloud project ID where resources will be created
+    
+  region:
+    type: string
+    description: Google Cloud region for resource deployment
+    default: us-central1
+    
+  zone:
+    type: string
+    description: Google Cloud zone for compute resources
+    default: us-central1-a
+  
+  # Resource naming configuration
+  resource_prefix:
+    type: string
+    description: Prefix for all resource names to ensure uniqueness
+    default: cost-opt
+    
+  random_suffix:
+    type: string
+    description: Random suffix for globally unique resource names
+    default: abcd1234
+  
+  # Storage configuration
+  storage_class:
+    type: string
+    description: Default storage class for Cloud Storage bucket
+    default: STANDARD
+    enum:
+      - STANDARD
+      - NEARLINE
+      - COLDLINE
+      - ARCHIVE
+  
+  # Batch job configuration
+  batch_machine_type:
+    type: string
+    description: Machine type for Cloud Batch job instances
+    default: e2-standard-2
+    
+  batch_provisioning_model:
+    type: string
+    description: Provisioning model for batch job instances (cost optimization)
+    default: PREEMPTIBLE
+    enum:
+      - STANDARD
+      - PREEMPTIBLE
+      - SPOT
+  
+  # Function configuration
+  function_memory:
+    type: string
+    description: Memory allocation for Cloud Function
+    default: 512Mi
+    
+  function_timeout:
+    type: string
+    description: Timeout for Cloud Function execution
+    default: 540s
+  
+  # Monitoring configuration
+  alert_cpu_threshold:
+    type: number
+    description: CPU utilization threshold for cost optimization alerts (0.0-1.0)
+    default: 0.1
+    minimum: 0.0
+    maximum: 1.0
+  
+  # BigQuery configuration
+  dataset_location:
+    type: string
+    description: Location for BigQuery dataset
+    default: US
+
+# Main resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  batch_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/batch.googleapis.com
+      
+  monitoring_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/monitoring.googleapis.com
+      
+  functions_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/cloudfunctions.googleapis.com
+      
+  bigquery_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/bigquery.googleapis.com
+      
+  storage_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/storage.googleapis.com
+      
+  compute_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/compute.googleapis.com
+      
+  pubsub_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/pubsub.googleapis.com
+      
+  run_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/run.googleapis.com
+      
+  scheduler_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/cloudscheduler.googleapis.com
+
+  # IAM Service Account for cost optimization workloads
+  cost_optimizer_sa:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: $(ref.resource_prefix)-sa-$(ref.random_suffix)
+      serviceAccount:
+        displayName: Cost Optimization Service Account
+        description: Service account for automated cost optimization workflows
+    depends_on:
+      - batch_api
+      - compute_api
+
+  # IAM bindings for service account permissions
+  sa_compute_viewer:
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: $(ref.project_id.projectId)
+      policy:
+        bindings:
+          - role: roles/compute.viewer
+            members:
+              - serviceAccount:$(ref.cost_optimizer_sa.email)
+              
+  sa_monitoring_viewer:
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: $(ref.project_id.projectId)
+      policy:
+        bindings:
+          - role: roles/monitoring.viewer
+            members:
+              - serviceAccount:$(ref.cost_optimizer_sa.email)
+              
+  sa_bigquery_user:
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: $(ref.project_id.projectId)
+      policy:
+        bindings:
+          - role: roles/bigquery.user
+            members:
+              - serviceAccount:$(ref.cost_optimizer_sa.email)
+              
+  sa_storage_object_admin:
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: $(ref.project_id.projectId)
+      policy:
+        bindings:
+          - role: roles/storage.objectAdmin
+            members:
+              - serviceAccount:$(ref.cost_optimizer_sa.email)
+
+  # Cloud Storage bucket for cost optimization analytics data
+  cost_analytics_bucket:
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(ref.resource_prefix)-analytics-$(ref.random_suffix)
+      project: $(ref.project_id.projectId)
+      location: $(ref.region)
+      storageClass: $(ref.storage_class)
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+              matchesStorageClass:
+                - STANDARD
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90
+              matchesStorageClass:
+                - NEARLINE
+          - action:
+              type: Delete
+            condition:
+              age: 365
+      uniformBucketLevelAccess:
+        enabled: true
+      publicAccessPrevention: enforced
+    depends_on:
+      - storage_api
+
+  # BigQuery dataset for cost analytics
+  cost_analytics_dataset:
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      datasetId: $(ref.resource_prefix)_analytics_$(ref.random_suffix)
+      projectId: $(ref.project_id.projectId)
+      location: $(ref.dataset_location)
+      description: Infrastructure cost optimization analytics dataset
+      access:
+        - role: OWNER
+          userByEmail: $(ref.cost_optimizer_sa.email)
+      defaultTableExpirationMs: "7776000000"  # 90 days
+    depends_on:
+      - bigquery_api
+      - cost_optimizer_sa
+
+  # BigQuery table for resource utilization metrics
+  resource_utilization_table:
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: $(ref.project_id.projectId)
+      datasetId: $(ref.cost_analytics_dataset.datasetId)
+      tableId: resource_utilization
+      schema:
+        fields:
+          - name: timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: Time when metrics were collected
+          - name: resource_id
+            type: STRING
+            mode: REQUIRED
+            description: Unique identifier for the resource
+          - name: resource_type
+            type: STRING
+            mode: REQUIRED
+            description: Type of Google Cloud resource
+          - name: cpu_utilization
+            type: FLOAT
+            mode: NULLABLE
+            description: CPU utilization percentage (0.0-1.0)
+          - name: memory_utilization
+            type: FLOAT
+            mode: NULLABLE
+            description: Memory utilization percentage (0.0-1.0)
+          - name: cost_per_hour
+            type: FLOAT
+            mode: NULLABLE
+            description: Estimated cost per hour in USD
+          - name: recommendation
+            type: STRING
+            mode: NULLABLE
+            description: Cost optimization recommendation
+      timePartitioning:
+        type: DAY
+        field: timestamp
+      clustering:
+        fields:
+          - resource_type
+          - resource_id
+    depends_on:
+      - cost_analytics_dataset
+
+  # BigQuery table for optimization actions
+  optimization_actions_table:
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: $(ref.project_id.projectId)
+      datasetId: $(ref.cost_analytics_dataset.datasetId)
+      tableId: optimization_actions
+      schema:
+        fields:
+          - name: timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: Time when action was taken
+          - name: resource_id
+            type: STRING
+            mode: REQUIRED
+            description: Resource that was optimized
+          - name: action_type
+            type: STRING
+            mode: REQUIRED
+            description: Type of optimization action taken
+          - name: estimated_savings
+            type: FLOAT
+            mode: NULLABLE
+            description: Estimated cost savings in USD
+          - name: status
+            type: STRING
+            mode: REQUIRED
+            description: Status of the optimization action
+          - name: details
+            type: STRING
+            mode: NULLABLE
+            description: Additional details about the action
+      timePartitioning:
+        type: DAY
+        field: timestamp
+      clustering:
+        fields:
+          - action_type
+          - status
+    depends_on:
+      - cost_analytics_dataset
+
+  # Pub/Sub topic for cost optimization events
+  cost_optimization_topic:
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project_id.projectId)/topics/cost-optimization-events
+      labels:
+        purpose: cost-optimization
+        component: messaging
+    depends_on:
+      - pubsub_api
+
+  # Pub/Sub subscription for processing optimization recommendations
+  cost_optimization_subscription:
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(ref.project_id.projectId)/subscriptions/cost-optimization-processor
+      topic: $(ref.cost_optimization_topic.name)
+      ackDeadlineSeconds: 600
+      messageRetentionDuration: 604800s  # 7 days
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+      deadLetterPolicy:
+        maxDeliveryAttempts: 5
+    depends_on:
+      - cost_optimization_topic
+
+  # Pub/Sub topic for batch job notifications
+  batch_notifications_topic:
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project_id.projectId)/topics/batch-job-notifications
+      labels:
+        purpose: cost-optimization
+        component: batch-jobs
+    depends_on:
+      - pubsub_api
+
+  # Pub/Sub subscription for batch job completion handling
+  batch_completion_subscription:
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(ref.project_id.projectId)/subscriptions/batch-completion-handler
+      topic: $(ref.batch_notifications_topic.name)
+      ackDeadlineSeconds: 300
+      messageRetentionDuration: 604800s  # 7 days
+    depends_on:
+      - batch_notifications_topic
+
+  # Cloud Function for automated cost optimization
+  cost_optimizer_function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project_id.projectId)/locations/$(ref.region)
+      functionId: cost-optimizer-$(ref.random_suffix)
+      sourceArchiveUrl: gs://$(ref.cost_analytics_bucket.name)/function-source.zip
+      entryPoint: optimize_infrastructure
+      runtime: python311
+      timeout: $(ref.function_timeout)
+      availableMemoryMb: $(ref.function_memory)
+      serviceAccountEmail: $(ref.cost_optimizer_sa.email)
+      environmentVariables:
+        PROJECT_ID: $(ref.project_id.projectId)
+        BUCKET_NAME: $(ref.cost_analytics_bucket.name)
+        DATASET_ID: $(ref.cost_analytics_dataset.datasetId)
+        TOPIC_NAME: $(ref.cost_optimization_topic.name)
+      httpsTrigger: {}
+      labels:
+        purpose: cost-optimization
+        component: automation
+    depends_on:
+      - functions_api
+      - cost_optimizer_sa
+      - cost_analytics_bucket
+      - cost_analytics_dataset
+
+  # Cloud Function IAM binding for public access (demo purposes)
+  function_invoker_binding:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions.setIamPolicy
+    properties:
+      resource: $(ref.cost_optimizer_function.name)
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+    depends_on:
+      - cost_optimizer_function
+
+  # Cloud Monitoring alert policy for high CPU utilization
+  high_cost_alert_policy:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: High Infrastructure Costs Alert - $(ref.random_suffix)
+      documentation:
+        content: |
+          This alert triggers when compute instances have consistently low CPU utilization,
+          indicating potential cost optimization opportunities through rightsizing or shutdown.
+        mimeType: text/markdown
+      conditions:
+        - displayName: CPU utilization below threshold
+          conditionThreshold:
+            filter: resource.type="gce_instance"
+            comparison: COMPARISON_LESS_THAN
+            thresholdValue: $(ref.alert_cpu_threshold)
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_MEAN
+                groupByFields:
+                  - resource.labels.instance_id
+      enabled: true
+      alertStrategy:
+        autoClose: 86400s  # 24 hours
+      combiner: OR
+    depends_on:
+      - monitoring_api
+
+  # Cloud Monitoring alert policy for memory utilization
+  memory_optimization_alert:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: Memory Optimization Alert - $(ref.random_suffix)
+      documentation:
+        content: |
+          This alert identifies instances with consistently low memory utilization
+          that may benefit from rightsizing to smaller machine types.
+        mimeType: text/markdown
+      conditions:
+        - displayName: Memory utilization below 20%
+          conditionThreshold:
+            filter: resource.type="gce_instance" AND metric.type="agent.googleapis.com/memory/percent_used"
+            comparison: COMPARISON_LESS_THAN
+            thresholdValue: 0.2
+            duration: 1800s  # 30 minutes
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_MEAN
+                groupByFields:
+                  - resource.labels.instance_id
+      enabled: true
+      alertStrategy:
+        autoClose: 86400s
+      combiner: OR
+    depends_on:
+      - monitoring_api
+
+  # Cloud Scheduler job for daily cost optimization
+  daily_optimization_job:
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      name: projects/$(ref.project_id.projectId)/locations/$(ref.region)/jobs/cost-optimization-daily-$(ref.random_suffix)
+      description: Daily infrastructure cost optimization analysis
+      schedule: "0 2 * * *"  # Daily at 2 AM
+      timeZone: UTC
+      httpTarget:
+        uri: $(ref.cost_optimizer_function.httpsTrigger.url)
+        httpMethod: GET
+        headers:
+          Content-Type: application/json
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 3600s
+        minBackoffDuration: 60s
+        maxBackoffDuration: 600s
+    depends_on:
+      - scheduler_api
+      - cost_optimizer_function
+
+  # Cloud Scheduler job for weekly comprehensive analysis
+  weekly_analysis_job:
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      name: projects/$(ref.project_id.projectId)/locations/$(ref.region)/jobs/weekly-analysis-$(ref.random_suffix)
+      description: Weekly comprehensive infrastructure analysis
+      schedule: "0 3 * * 0"  # Weekly on Sunday at 3 AM
+      timeZone: UTC
+      httpTarget:
+        uri: $(ref.cost_optimizer_function.httpsTrigger.url)
+        httpMethod: POST
+        headers:
+          Content-Type: application/json
+        body: '{"analysis_type": "comprehensive", "scope": "all_projects"}'
+      retryConfig:
+        retryCount: 2
+        maxRetryDuration: 7200s
+        minBackoffDuration: 300s
+        maxBackoffDuration: 1800s
+    depends_on:
+      - scheduler_api
+      - cost_optimizer_function
+
+  # Project reference for outputs
+  project_id:
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: $(ref.project_id)
+
+# Output values for validation and integration
+outputs:
+  # Infrastructure information
+  project_id:
+    description: Google Cloud project ID where resources were created
+    value: $(ref.project_id.projectId)
+    
+  region:
+    description: Google Cloud region used for resource deployment
+    value: $(ref.region)
+    
+  resource_prefix:
+    description: Resource prefix used for naming
+    value: $(ref.resource_prefix)
+
+  # Storage resources
+  storage_bucket_name:
+    description: Name of the Cloud Storage bucket for analytics data
+    value: $(ref.cost_analytics_bucket.name)
+    
+  storage_bucket_url:
+    description: URL of the Cloud Storage bucket
+    value: gs://$(ref.cost_analytics_bucket.name)
+
+  # BigQuery resources
+  dataset_id:
+    description: BigQuery dataset ID for cost analytics
+    value: $(ref.cost_analytics_dataset.datasetId)
+    
+  dataset_location:
+    description: BigQuery dataset location
+    value: $(ref.cost_analytics_dataset.location)
+    
+  resource_utilization_table:
+    description: Full table ID for resource utilization metrics
+    value: $(ref.project_id.projectId).$(ref.cost_analytics_dataset.datasetId).$(ref.resource_utilization_table.tableId)
+    
+  optimization_actions_table:
+    description: Full table ID for optimization actions
+    value: $(ref.project_id.projectId).$(ref.cost_analytics_dataset.datasetId).$(ref.optimization_actions_table.tableId)
+
+  # Pub/Sub resources
+  cost_optimization_topic_name:
+    description: Name of the cost optimization Pub/Sub topic
+    value: $(ref.cost_optimization_topic.name)
+    
+  batch_notifications_topic_name:
+    description: Name of the batch job notifications Pub/Sub topic
+    value: $(ref.batch_notifications_topic.name)
+
+  # Cloud Function
+  function_name:
+    description: Name of the cost optimization Cloud Function
+    value: $(ref.cost_optimizer_function.name)
+    
+  function_url:
+    description: HTTP trigger URL for the cost optimization function
+    value: $(ref.cost_optimizer_function.httpsTrigger.url)
+    
+  function_region:
+    description: Region where the Cloud Function is deployed
+    value: $(ref.region)
+
+  # Service Account
+  service_account_email:
+    description: Email of the cost optimization service account
+    value: $(ref.cost_optimizer_sa.email)
+    
+  service_account_name:
+    description: Name of the cost optimization service account
+    value: $(ref.cost_optimizer_sa.name)
+
+  # Monitoring
+  high_cost_alert_policy_name:
+    description: Name of the high cost alert policy
+    value: $(ref.high_cost_alert_policy.name)
+    
+  memory_optimization_alert_name:
+    description: Name of the memory optimization alert policy
+    value: $(ref.memory_optimization_alert.name)
+
+  # Scheduler jobs
+  daily_job_name:
+    description: Name of the daily optimization scheduler job
+    value: $(ref.daily_optimization_job.name)
+    
+  weekly_job_name:
+    description: Name of the weekly analysis scheduler job
+    value: $(ref.weekly_analysis_job.name)
+
+  # Usage instructions
+  validation_commands:
+    description: Commands to validate the cost optimization system
+    value: |
+      # Check Cloud Function status
+      gcloud functions describe cost-optimizer-$(ref.random_suffix) --region=$(ref.region)
+      
+      # Test the function
+      curl -X GET "$(ref.cost_optimizer_function.httpsTrigger.url)"
+      
+      # Check BigQuery tables
+      bq ls $(ref.project_id.projectId):$(ref.cost_analytics_dataset.datasetId)
+      
+      # Verify Pub/Sub topics
+      gcloud pubsub topics list --filter="name:cost-optimization-events OR name:batch-job-notifications"
+      
+      # Check scheduler jobs
+      gcloud scheduler jobs list --location=$(ref.region)
+
+  cleanup_commands:
+    description: Commands to clean up the cost optimization infrastructure
+    value: |
+      # Delete Infrastructure Manager deployment
+      gcloud infra-manager deployments delete [DEPLOYMENT_NAME] --location=$(ref.region)
+      
+      # Manual cleanup if needed
+      gsutil -m rm -r gs://$(ref.cost_analytics_bucket.name)
+      bq rm -r -f $(ref.project_id.projectId):$(ref.cost_analytics_dataset.datasetId)

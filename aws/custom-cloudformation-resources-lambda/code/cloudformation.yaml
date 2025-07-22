@@ -1,0 +1,848 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Production-ready custom CloudFormation resources with Lambda-backed implementation'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "Custom Resource Configuration"
+        Parameters:
+          - CustomResourceVersion
+          - EnableAdvancedLogging
+          - LambdaTimeout
+          - LambdaMemorySize
+      - Label:
+          default: "S3 Configuration"
+        Parameters:
+          - EnableS3Versioning
+          - S3LifecycleRetentionDays
+          - CustomDataContent
+    ParameterLabels:
+      Environment:
+        default: "Environment Name"
+      ProjectName:
+        default: "Project Name"
+      CustomResourceVersion:
+        default: "Custom Resource Version"
+      EnableAdvancedLogging:
+        default: "Enable Advanced Logging"
+      LambdaTimeout:
+        default: "Lambda Function Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Function Memory (MB)"
+      EnableS3Versioning:
+        default: "Enable S3 Versioning"
+      S3LifecycleRetentionDays:
+        default: "S3 Lifecycle Retention (days)"
+      CustomDataContent:
+        default: "Custom Data Content (JSON)"
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'development'
+    AllowedValues: 
+      - 'development'
+      - 'staging'
+      - 'production'
+    Description: 'Environment name for resource tagging and naming'
+    
+  ProjectName:
+    Type: String
+    Default: 'custom-resource-demo'
+    Description: 'Project name used for resource naming and tagging'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+    
+  CustomResourceVersion:
+    Type: String
+    Default: '1.0'
+    Description: 'Version of the custom resource implementation'
+    AllowedPattern: '^\d+\.\d+$'
+    ConstraintDescription: 'Must be in format X.Y (e.g., 1.0, 2.1)'
+    
+  EnableAdvancedLogging:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable advanced logging and monitoring for custom resources'
+    
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 30
+    MaxValue: 900
+    Description: 'Lambda function timeout in seconds (30-900)'
+    
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+    Description: 'Lambda function memory allocation in MB'
+    
+  EnableS3Versioning:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable versioning on S3 bucket'
+    
+  S3LifecycleRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: 'Number of days to retain old S3 object versions'
+    
+  CustomDataContent:
+    Type: String
+    Default: '{"environment": "cloudformation", "version": "1.0", "features": ["logging", "monitoring", "encryption"]}'
+    Description: 'JSON content for custom data object'
+    NoEcho: false
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'production']
+  EnableVersioning: !Equals [!Ref EnableS3Versioning, 'true']
+  EnableLogging: !Equals [!Ref EnableAdvancedLogging, 'true']
+  IsHighMemory: !Not [!Equals [!Ref LambdaMemorySize, 128]]
+
+Resources:
+  # S3 Bucket for custom resource data storage
+  CustomResourceDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [EnableVersioning, 'Enabled', 'Suspended']
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersionsRule
+            Status: !If [EnableVersioning, 'Enabled', 'Disabled']
+            NoncurrentVersionExpirationInDays: !Ref S3LifecycleRetentionDays
+          - Id: DeleteIncompleteMultipartUploads
+            Status: 'Enabled'
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !If [EnableLogging, !Ref S3AccessLogGroup, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Custom Resource Data Storage'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # S3 Bucket Policy for enhanced security
+  CustomResourceDataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CustomResourceDataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${CustomResourceDataBucket}/*'
+              - !Sub '${CustomResourceDataBucket}'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: AllowCustomResourceLambdaAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt CustomResourceLambdaRole.Arn
+            Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+              - 's3:DeleteObject'
+              - 's3:ListBucket'
+            Resource:
+              - !Sub '${CustomResourceDataBucket}/*'
+              - !Sub '${CustomResourceDataBucket}'
+
+  # IAM Role for Lambda execution
+  CustomResourceLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-CustomResourceRole-${Environment}-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref 'AWS::Region'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CustomResourceS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:DeleteObjectVersion'
+                Resource: !Sub '${CustomResourceDataBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                  - 's3:ListBucketVersions'
+                Resource: !Sub '${CustomResourceDataBucket}'
+        - PolicyName: CustomResourceCloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                Resource: 
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*:*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Custom Resource Lambda Execution'
+
+  # CloudWatch Log Group for S3 access (conditional)
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-${Environment}-access'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Group for Lambda function
+  CustomResourceLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-CustomResourceHandler-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 14]
+      KmsKeyId: !If [IsProduction, !Ref LogsKMSKey, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Custom Resource Lambda Logs'
+
+  # KMS Key for log encryption in production
+  LogsKMSKey:
+    Type: AWS::KMS::Key
+    Condition: IsProduction
+    Properties:
+      Description: 'KMS Key for CloudWatch Logs encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:DescribeKey'
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-CustomResourceHandler-${Environment}'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # KMS Key Alias
+  LogsKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: IsProduction
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-${Environment}-logs'
+      TargetKeyId: !Ref LogsKMSKey
+
+  # Lambda function for custom resource handling
+  CustomResourceLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: CustomResourceLambdaLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-CustomResourceHandler-${Environment}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt CustomResourceLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrencyLimit: !If [IsProduction, 10, 5]
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+          LOG_LEVEL: !If [EnableLogging, 'INFO', 'WARNING']
+          S3_BUCKET_NAME: !Ref CustomResourceDataBucket
+          ENABLE_DETAILED_LOGGING: !Ref EnableAdvancedLogging
+      DeadLetterConfig:
+        TargetArn: !GetAtt CustomResourceDLQ.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import logging
+          import traceback
+          import os
+          from datetime import datetime, timezone
+          from typing import Dict, Any, Optional
+          
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger = logging.getLogger()
+          logger.setLevel(getattr(logging, log_level))
+          
+          # Initialize AWS clients
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event: Dict[str, Any], context) -> None:
+              """
+              Advanced Lambda function for handling custom CloudFormation resources.
+              
+              Supports CREATE, UPDATE, and DELETE operations with comprehensive
+              error handling, input validation, and detailed logging.
+              """
+              physical_resource_id = event.get('PhysicalResourceId', f"CustomResource-{context.aws_request_id}")
+              
+              try:
+                  logger.info(f"Processing {event['RequestType']} request for {event.get('LogicalResourceId', 'Unknown')}")
+                  logger.debug(f"Full event: {json.dumps(event, default=str, indent=2)}")
+                  
+                  # Validate required properties
+                  resource_properties = event.get('ResourceProperties', {})
+                  validate_properties(resource_properties)
+                  
+                  # Extract configuration
+                  request_type = event['RequestType']
+                  old_properties = event.get('OldResourceProperties', {})
+                  
+                  # Route to appropriate handler
+                  if request_type == 'Create':
+                      response_data = handle_create(resource_properties, physical_resource_id, context)
+                  elif request_type == 'Update':
+                      response_data = handle_update(resource_properties, old_properties, physical_resource_id, context)
+                  elif request_type == 'Delete':
+                      response_data = handle_delete(resource_properties, physical_resource_id, context)
+                  else:
+                      raise ValueError(f"Unknown request type: {request_type}")
+                  
+                  # Add metadata to response
+                  response_data.update({
+                      'PhysicalResourceId': physical_resource_id,
+                      'RequestId': event['RequestId'],
+                      'LogicalResourceId': event['LogicalResourceId'],
+                      'StackId': event['StackId'],
+                      'ResponseTimestamp': datetime.now(timezone.utc).isoformat(),
+                      'Environment': os.environ.get('ENVIRONMENT', 'unknown'),
+                      'ProjectName': os.environ.get('PROJECT_NAME', 'unknown')
+                  })
+                  
+                  logger.info(f"Operation completed successfully: {request_type}")
+                  logger.debug(f"Response data: {json.dumps(response_data, default=str, indent=2)}")
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data, physical_resource_id)
+                  
+              except Exception as e:
+                  logger.error(f"Error processing {event.get('RequestType', 'Unknown')} request: {str(e)}")
+                  logger.error(f"Traceback: {traceback.format_exc()}")
+                  
+                  # Prepare error response
+                  error_data = {
+                      'Error': str(e),
+                      'ErrorType': type(e).__name__,
+                      'RequestId': event.get('RequestId', 'unknown'),
+                      'LogicalResourceId': event.get('LogicalResourceId', 'unknown'),
+                      'StackId': event.get('StackId', 'unknown'),
+                      'Timestamp': datetime.now(timezone.utc).isoformat()
+                  }
+                  
+                  cfnresponse.send(event, context, cfnresponse.FAILED, error_data, physical_resource_id)
+          
+          def validate_properties(properties: Dict[str, Any]) -> None:
+              """Validate required resource properties."""
+              required_props = ['BucketName']
+              missing_props = [prop for prop in required_props if prop not in properties]
+              
+              if missing_props:
+                  raise ValueError(f"Missing required properties: {', '.join(missing_props)}")
+              
+              # Validate JSON content if provided
+              data_content = properties.get('DataContent')
+              if data_content and isinstance(data_content, str):
+                  try:
+                      json.loads(data_content)
+                  except json.JSONDecodeError as e:
+                      raise ValueError(f"Invalid JSON in DataContent: {str(e)}")
+          
+          def handle_create(properties: Dict[str, Any], physical_id: str, context) -> Dict[str, Any]:
+              """Handle resource creation with comprehensive validation."""
+              bucket_name = properties['BucketName']
+              file_name = properties.get('FileName', 'custom-resource-data.json')
+              data_content = properties.get('DataContent', '{}')
+              version = properties.get('Version', '1.0')
+              
+              # Parse JSON content
+              if isinstance(data_content, str):
+                  data_content = json.loads(data_content)
+              
+              # Validate bucket accessibility
+              try:
+                  s3.head_bucket(Bucket=bucket_name)
+                  logger.info(f"Bucket {bucket_name} is accessible")
+              except Exception as e:
+                  raise RuntimeError(f"Cannot access bucket {bucket_name}: {str(e)}")
+              
+              # Create comprehensive data object
+              timestamp = datetime.now(timezone.utc)
+              data_object = {
+                  'metadata': {
+                      'resource_id': physical_id,
+                      'created_at': timestamp.isoformat(),
+                      'operation': 'CREATE',
+                      'version': version,
+                      'lambda_request_id': context.aws_request_id,
+                      'environment': os.environ.get('ENVIRONMENT', 'unknown'),
+                      'project': os.environ.get('PROJECT_NAME', 'unknown')
+                  },
+                  'configuration': data_content,
+                  'validation': {
+                      'bucket_accessible': True,
+                      'data_format_valid': True,
+                      'creation_successful': True
+                  },
+                  'system_info': {
+                      'lambda_function_name': context.function_name,
+                      'lambda_function_version': context.function_version,
+                      'memory_limit': context.memory_limit_in_mb,
+                      'remaining_time_ms': context.get_remaining_time_in_millis()
+                  }
+              }
+              
+              # Upload to S3 with detailed metadata
+              try:
+                  s3.put_object(
+                      Bucket=bucket_name,
+                      Key=file_name,
+                      Body=json.dumps(data_object, indent=2, default=str),
+                      ContentType='application/json',
+                      Metadata={
+                          'resource-id': physical_id,
+                          'operation': 'CREATE',
+                          'version': version,
+                          'environment': os.environ.get('ENVIRONMENT', 'unknown'),
+                          'created-by': 'custom-cloudformation-resource'
+                      },
+                      ServerSideEncryption='AES256'
+                  )
+                  logger.info(f"Successfully created object {file_name} in bucket {bucket_name}")
+              except Exception as e:
+                  raise RuntimeError(f"Failed to upload object to S3: {str(e)}")
+              
+              return {
+                  'BucketName': bucket_name,
+                  'FileName': file_name,
+                  'DataUrl': f"https://{bucket_name}.s3.amazonaws.com/{file_name}",
+                  'ObjectKey': file_name,
+                  'CreatedAt': timestamp.isoformat(),
+                  'Version': version,
+                  'Status': 'CREATE_COMPLETE',
+                  'ResourceSize': len(json.dumps(data_object)),
+                  'OperationId': context.aws_request_id
+              }
+          
+          def handle_update(properties: Dict[str, Any], old_properties: Dict[str, Any], 
+                          physical_id: str, context) -> Dict[str, Any]:
+              """Handle resource updates with change detection."""
+              bucket_name = properties['BucketName']
+              file_name = properties.get('FileName', 'custom-resource-data.json')
+              data_content = properties.get('DataContent', '{}')
+              version = properties.get('Version', '1.0')
+              
+              # Parse JSON content
+              if isinstance(data_content, str):
+                  data_content = json.loads(data_content)
+              
+              # Detect changes
+              old_data_content = old_properties.get('DataContent', '{}')
+              if isinstance(old_data_content, str):
+                  old_data_content = json.loads(old_data_content)
+              
+              has_data_changed = data_content != old_data_content
+              has_version_changed = version != old_properties.get('Version', '1.0')
+              
+              # Get existing data if available
+              existing_data = {}
+              try:
+                  response = s3.get_object(Bucket=bucket_name, Key=file_name)
+                  existing_data = json.loads(response['Body'].read())
+                  logger.info(f"Retrieved existing object {file_name}")
+              except s3.exceptions.NoSuchKey:
+                  logger.warning(f"Object {file_name} not found, creating new one")
+              except Exception as e:
+                  logger.warning(f"Error retrieving existing object: {str(e)}")
+              
+              # Create updated data object
+              timestamp = datetime.now(timezone.utc)
+              data_object = {
+                  'metadata': {
+                      'resource_id': physical_id,
+                      'created_at': existing_data.get('metadata', {}).get('created_at', timestamp.isoformat()),
+                      'updated_at': timestamp.isoformat(),
+                      'operation': 'UPDATE',
+                      'version': version,
+                      'lambda_request_id': context.aws_request_id,
+                      'environment': os.environ.get('ENVIRONMENT', 'unknown'),
+                      'project': os.environ.get('PROJECT_NAME', 'unknown'),
+                      'update_trigger': {
+                          'data_changed': has_data_changed,
+                          'version_changed': has_version_changed
+                      }
+                  },
+                  'configuration': data_content,
+                  'validation': {
+                      'bucket_accessible': True,
+                      'data_format_valid': True,
+                      'update_successful': True
+                  },
+                  'system_info': {
+                      'lambda_function_name': context.function_name,
+                      'lambda_function_version': context.function_version,
+                      'memory_limit': context.memory_limit_in_mb,
+                      'remaining_time_ms': context.get_remaining_time_in_millis()
+                  },
+                  'change_history': existing_data.get('change_history', []) + [{
+                      'timestamp': timestamp.isoformat(),
+                      'operation': 'UPDATE',
+                      'changes': {
+                          'data_changed': has_data_changed,
+                          'version_changed': has_version_changed
+                      }
+                  }]
+              }
+              
+              # Upload updated object
+              try:
+                  s3.put_object(
+                      Bucket=bucket_name,
+                      Key=file_name,
+                      Body=json.dumps(data_object, indent=2, default=str),
+                      ContentType='application/json',
+                      Metadata={
+                          'resource-id': physical_id,
+                          'operation': 'UPDATE',
+                          'version': version,
+                          'environment': os.environ.get('ENVIRONMENT', 'unknown'),
+                          'updated-by': 'custom-cloudformation-resource'
+                      },
+                      ServerSideEncryption='AES256'
+                  )
+                  logger.info(f"Successfully updated object {file_name} in bucket {bucket_name}")
+              except Exception as e:
+                  raise RuntimeError(f"Failed to update object in S3: {str(e)}")
+              
+              return {
+                  'BucketName': bucket_name,
+                  'FileName': file_name,
+                  'DataUrl': f"https://{bucket_name}.s3.amazonaws.com/{file_name}",
+                  'ObjectKey': file_name,
+                  'UpdatedAt': timestamp.isoformat(),
+                  'Version': version,
+                  'Status': 'UPDATE_COMPLETE',
+                  'ResourceSize': len(json.dumps(data_object)),
+                  'ChangesDetected': has_data_changed or has_version_changed,
+                  'OperationId': context.aws_request_id
+              }
+          
+          def handle_delete(properties: Dict[str, Any], physical_id: str, context) -> Dict[str, Any]:
+              """Handle resource deletion with cleanup verification."""
+              bucket_name = properties['BucketName']
+              file_name = properties.get('FileName', 'custom-resource-data.json')
+              
+              deletion_timestamp = datetime.now(timezone.utc)
+              
+              # Attempt to delete object
+              try:
+                  # Check if object exists first
+                  try:
+                      s3.head_object(Bucket=bucket_name, Key=file_name)
+                      object_existed = True
+                  except s3.exceptions.NoSuchKey:
+                      object_existed = False
+                      logger.info(f"Object {file_name} does not exist, no deletion needed")
+                  
+                  if object_existed:
+                      # Delete the object
+                      s3.delete_object(Bucket=bucket_name, Key=file_name)
+                      logger.info(f"Deleted object {file_name} from bucket {bucket_name}")
+                      
+                      # Verify deletion
+                      try:
+                          s3.head_object(Bucket=bucket_name, Key=file_name)
+                          logger.warning(f"Object {file_name} still exists after deletion attempt")
+                          deletion_verified = False
+                      except s3.exceptions.NoSuchKey:
+                          logger.info(f"Confirmed: Object {file_name} successfully deleted")
+                          deletion_verified = True
+                  else:
+                      deletion_verified = True
+                      
+              except Exception as e:
+                  logger.error(f"Error during deletion: {str(e)}")
+                  # Don't fail the stack deletion for cleanup errors
+                  deletion_verified = False
+              
+              return {
+                  'BucketName': bucket_name,
+                  'FileName': file_name,
+                  'DeletedAt': deletion_timestamp.isoformat(),
+                  'Status': 'DELETE_COMPLETE',
+                  'ObjectExisted': object_existed if 'object_existed' in locals() else False,
+                  'DeletionVerified': deletion_verified,
+                  'OperationId': context.aws_request_id
+              }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Custom Resource Handler'
+
+  # Dead Letter Queue for failed Lambda invocations
+  CustomResourceDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-CustomResource-DLQ-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Custom Resource Dead Letter Queue'
+
+  # CloudWatch Alarm for Lambda function errors
+  CustomResourceLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableLogging
+    Properties:
+      AlarmName: !Sub '${ProjectName}-CustomResource-Errors-${Environment}'
+      AlarmDescription: 'Monitor custom resource Lambda function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CustomResourceLambdaFunction
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Custom Resource instance demonstrating the functionality
+  DemoCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt CustomResourceLambdaFunction.Arn
+      BucketName: !Ref CustomResourceDataBucket
+      FileName: !Sub 'demo-${Environment}-data.json'
+      DataContent: !Ref CustomDataContent
+      Version: !Ref CustomResourceVersion
+      Environment: !Ref Environment
+      ProjectName: !Ref ProjectName
+      # Changing these properties will trigger UPDATE operations
+      Timestamp: !Sub '${AWS::StackName}-${AWS::Region}-deployed'
+
+  # Additional demo custom resource to show multiple instances
+  ConfigCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt CustomResourceLambdaFunction.Arn
+      BucketName: !Ref CustomResourceDataBucket
+      FileName: !Sub 'config-${Environment}.json'
+      DataContent: !Sub |
+        {
+          "stack_name": "${AWS::StackName}",
+          "region": "${AWS::Region}",
+          "account_id": "${AWS::AccountId}",
+          "environment": "${Environment}",
+          "project": "${ProjectName}",
+          "lambda_function": "${CustomResourceLambdaFunction}",
+          "s3_bucket": "${CustomResourceDataBucket}",
+          "deployment_time": "${AWS::StackName}-configuration"
+        }
+      Version: !Ref CustomResourceVersion
+      Environment: !Ref Environment
+
+Outputs:
+  # Custom Resource Outputs
+  CustomResourceDataUrl:
+    Description: 'URL of the data file created by the demo custom resource'
+    Value: !GetAtt DemoCustomResource.DataUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomResource-DataUrl'
+
+  CustomResourceFileName:
+    Description: 'Name of the file created by the demo custom resource'
+    Value: !GetAtt DemoCustomResource.FileName
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomResource-FileName'
+
+  CustomResourceCreatedAt:
+    Description: 'Timestamp when the custom resource was created'
+    Value: !GetAtt DemoCustomResource.CreatedAt
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomResource-CreatedAt'
+
+  CustomResourceStatus:
+    Description: 'Status of the custom resource operation'
+    Value: !GetAtt DemoCustomResource.Status
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomResource-Status'
+
+  ConfigResourceDataUrl:
+    Description: 'URL of the configuration file created by the config custom resource'
+    Value: !GetAtt ConfigCustomResource.DataUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigResource-DataUrl'
+
+  # Infrastructure Outputs
+  LambdaFunctionArn:
+    Description: 'ARN of the custom resource Lambda function'
+    Value: !GetAtt CustomResourceLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-Lambda-Arn'
+
+  LambdaFunctionName:
+    Description: 'Name of the custom resource Lambda function'
+    Value: !Ref CustomResourceLambdaFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-Lambda-Name'
+
+  S3BucketName:
+    Description: 'Name of the S3 bucket used for custom resource data'
+    Value: !Ref CustomResourceDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3-Bucket'
+
+  S3BucketArn:
+    Description: 'ARN of the S3 bucket used for custom resource data'
+    Value: !GetAtt CustomResourceDataBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-S3-BucketArn'
+
+  IAMRoleArn:
+    Description: 'ARN of the IAM role used by the Lambda function'
+    Value: !GetAtt CustomResourceLambdaRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IAM-RoleArn'
+
+  CloudWatchLogGroup:
+    Description: 'CloudWatch Log Group for the Lambda function'
+    Value: !Ref CustomResourceLambdaLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  DeadLetterQueueUrl:
+    Description: 'URL of the Dead Letter Queue for failed Lambda invocations'
+    Value: !Ref CustomResourceDLQ
+    Export:
+      Name: !Sub '${AWS::StackName}-DLQ-Url'
+
+  # Environment Information
+  Environment:
+    Description: 'Environment name'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+  ProjectName:
+    Description: 'Project name'
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectName'
+
+  StackRegion:
+    Description: 'AWS Region where the stack is deployed'
+    Value: !Ref 'AWS::Region'
+    Export:
+      Name: !Sub '${AWS::StackName}-Region'
+
+  # Security Information
+  KMSKeyId:
+    Condition: IsProduction
+    Description: 'KMS Key ID used for log encryption'
+    Value: !Ref LogsKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-KMS-KeyId'
+
+  KMSKeyAlias:
+    Condition: IsProduction
+    Description: 'KMS Key Alias used for log encryption'
+    Value: !Ref LogsKMSKeyAlias
+    Export:
+      Name: !Sub '${AWS::StackName}-KMS-KeyAlias'

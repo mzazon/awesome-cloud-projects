@@ -1,0 +1,1119 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Real-Time WebSocket API with Route Management and Connection Handling - Complete infrastructure for building scalable WebSocket applications with Lambda handlers, DynamoDB state management, and comprehensive message routing'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'websocket-api'
+    Description: 'Base name for all resources (will be suffixed with random string)'
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+    MaxLength: 40
+    MinLength: 3
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - 'dev'
+      - 'staging'
+      - 'prod'
+    Description: 'Environment for deployment'
+
+  LogLevel:
+    Type: String
+    Default: 'INFO'
+    AllowedValues:
+      - 'ERROR'
+      - 'WARN'
+      - 'INFO'
+      - 'DEBUG'
+    Description: 'CloudWatch log level for Lambda functions'
+
+  ThrottlingBurstLimit:
+    Type: Number
+    Default: 500
+    MinValue: 100
+    MaxValue: 5000
+    Description: 'Burst limit for WebSocket API throttling'
+
+  ThrottlingRateLimit:
+    Type: Number
+    Default: 1000
+    MinValue: 100
+    MaxValue: 10000
+    Description: 'Rate limit for WebSocket API throttling'
+
+  DynamoDBReadCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+    Description: 'Read capacity units for DynamoDB tables'
+
+  DynamoDBWriteCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+    Description: 'Write capacity units for DynamoDB tables'
+
+  EnableDetailedMetrics:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable detailed CloudWatch metrics for API Gateway'
+
+  EnableDataTrace:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable data trace logging for API Gateway'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    Description: 'Timeout in seconds for Lambda functions'
+
+  MessageHandlerTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 3
+    MaxValue: 900
+    Description: 'Timeout in seconds for message handler Lambda function'
+
+  MessageHandlerMemorySize:
+    Type: Number
+    Default: 512
+    MinValue: 128
+    MaxValue: 10240
+    Description: 'Memory size in MB for message handler Lambda function'
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  EnableDetailedMetricsCondition: !Equals [!Ref EnableDetailedMetrics, 'true']
+  EnableDataTraceCondition: !Equals [!Ref EnableDataTrace, 'true']
+
+Resources:
+  # Random suffix for unique resource naming
+  RandomSuffix:
+    Type: 'AWS::CloudFormation::CustomResource'
+    Properties:
+      ServiceToken: !GetAtt RandomSuffixFunction.Arn
+
+  RandomSuffixFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-random-suffix-${Environment}'
+      Runtime: 'python3.9'
+      Handler: 'index.handler'
+      Role: !GetAtt RandomSuffixRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import secrets
+          import string
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  # Generate 6-character random suffix
+                  suffix = ''.join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(6))
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {'RandomSuffix': suffix})
+              except Exception as e:
+                  print(f"Error: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  RandomSuffixRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+  # DynamoDB Tables for WebSocket state management
+  ConnectionsTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: !Sub '${ProjectName}-connections-${RandomSuffix.RandomSuffix}'
+      BillingMode: 'PROVISIONED'
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref DynamoDBReadCapacity
+        WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      AttributeDefinitions:
+        - AttributeName: connectionId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: roomId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: connectionId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !Ref DynamoDBReadCapacity
+            WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+        - IndexName: RoomIndex
+          KeySchema:
+            - AttributeName: roomId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !Ref DynamoDBReadCapacity
+            WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'WebSocket connection state management'
+
+  RoomsTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: !Sub '${ProjectName}-rooms-${RandomSuffix.RandomSuffix}'
+      BillingMode: 'PROVISIONED'
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref DynamoDBReadCapacity
+        WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      AttributeDefinitions:
+        - AttributeName: roomId
+          AttributeType: S
+        - AttributeName: ownerId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: roomId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: OwnerIndex
+          KeySchema:
+            - AttributeName: ownerId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !Ref DynamoDBReadCapacity
+            WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'WebSocket room management'
+
+  MessagesTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: !Sub '${ProjectName}-messages-${RandomSuffix.RandomSuffix}'
+      BillingMode: 'PROVISIONED'
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref DynamoDBReadCapacity
+        WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      AttributeDefinitions:
+        - AttributeName: messageId
+          AttributeType: S
+        - AttributeName: roomId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: messageId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: RoomTimestampIndex
+          KeySchema:
+            - AttributeName: roomId
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !Ref DynamoDBReadCapacity
+            WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'WebSocket message persistence'
+
+  # IAM Role for Lambda functions
+  WebSocketLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${RandomSuffix.RandomSuffix}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - !If 
+          - IsProduction
+          - 'arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess'
+          - !Ref 'AWS::NoValue'
+      Policies:
+        - PolicyName: WebSocketDynamoDBPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:DeleteItem'
+                Resource:
+                  - !GetAtt ConnectionsTable.Arn
+                  - !Sub '${ConnectionsTable.Arn}/index/*'
+                  - !GetAtt RoomsTable.Arn
+                  - !Sub '${RoomsTable.Arn}/index/*'
+                  - !GetAtt MessagesTable.Arn
+                  - !Sub '${MessagesTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - 'execute-api:ManageConnections'
+                Resource:
+                  - !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ProjectName
+
+  # Lambda function for WebSocket connection handling
+  ConnectHandlerFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-connect-${RandomSuffix.RandomSuffix}'
+      Runtime: 'python3.9'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt WebSocketLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: 256
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTable
+          LOG_LEVEL: !Ref LogLevel
+          ENVIRONMENT: !Ref Environment
+      TracingConfig:
+        Mode: !If [IsProduction, 'Active', 'PassThrough']
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import time
+          import logging
+          from botocore.exceptions import ClientError
+          
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+          
+          dynamodb = boto3.resource('dynamodb')
+          connections_table = dynamodb.Table(os.environ['CONNECTIONS_TABLE'])
+          
+          def lambda_handler(event, context):
+              connection_id = event['requestContext']['connectionId']
+              domain_name = event['requestContext']['domainName']
+              stage = event['requestContext']['stage']
+              
+              logger.info(f"Connection request for {connection_id}")
+              
+              # Extract query parameters for authentication and room joining
+              query_params = event.get('queryStringParameters') or {}
+              user_id = query_params.get('userId', 'anonymous')
+              room_id = query_params.get('roomId', 'general')
+              auth_token = query_params.get('token')
+              
+              try:
+                  # Basic token validation (integrate with Cognito in production)
+                  if auth_token:
+                      if not auth_token.startswith('valid_'):
+                          logger.warning(f"Invalid token for connection {connection_id}")
+                          return {
+                              'statusCode': 401,
+                              'body': json.dumps({'error': 'Invalid authentication token'})
+                          }
+                  
+                  # Store connection information
+                  connection_data = {
+                      'connectionId': connection_id,
+                      'userId': user_id,
+                      'roomId': room_id,
+                      'connectedAt': int(time.time()),
+                      'domainName': domain_name,
+                      'stage': stage,
+                      'lastActivity': int(time.time()),
+                      'status': 'connected'
+                  }
+                  
+                  # Add optional user metadata
+                  if 'username' in query_params:
+                      connection_data['username'] = query_params['username']
+                  
+                  connections_table.put_item(Item=connection_data)
+                  logger.info(f"Stored connection data for {connection_id}")
+                  
+                  # Send welcome message
+                  api_gateway = boto3.client('apigatewaymanagementapi',
+                      endpoint_url=f'https://{domain_name}/{stage}')
+                  
+                  welcome_message = {
+                      'type': 'welcome',
+                      'data': {
+                          'connectionId': connection_id,
+                          'userId': user_id,
+                          'roomId': room_id,
+                          'message': f'Welcome to room {room_id}!',
+                          'timestamp': int(time.time())
+                      }
+                  }
+                  
+                  api_gateway.post_to_connection(
+                      ConnectionId=connection_id,
+                      Data=json.dumps(welcome_message)
+                  )
+                  
+                  logger.info(f"Connection established: {connection_id} for user {user_id} in room {room_id}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'message': 'Connected successfully'})
+                  }
+                  
+              except ClientError as e:
+                  logger.error(f"DynamoDB error: {e}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': 'Connection failed'})
+                  }
+              except Exception as e:
+                  logger.error(f"Unexpected error: {e}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': 'Internal server error'})
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ProjectName
+        - Key: Function
+          Value: 'WebSocket connection handler'
+
+  # Lambda function for WebSocket disconnection handling
+  DisconnectHandlerFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-disconnect-${RandomSuffix.RandomSuffix}'
+      Runtime: 'python3.9'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt WebSocketLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: 256
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTable
+          LOG_LEVEL: !Ref LogLevel
+          ENVIRONMENT: !Ref Environment
+      TracingConfig:
+        Mode: !If [IsProduction, 'Active', 'PassThrough']
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from botocore.exceptions import ClientError
+          
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+          
+          dynamodb = boto3.resource('dynamodb')
+          connections_table = dynamodb.Table(os.environ['CONNECTIONS_TABLE'])
+          
+          def lambda_handler(event, context):
+              connection_id = event['requestContext']['connectionId']
+              
+              logger.info(f"Disconnect request for {connection_id}")
+              
+              try:
+                  # Get connection information before deletion
+                  response = connections_table.get_item(
+                      Key={'connectionId': connection_id}
+                  )
+                  
+                  if 'Item' in response:
+                      connection_data = response['Item']
+                      user_id = connection_data.get('userId', 'unknown')
+                      room_id = connection_data.get('roomId', 'unknown')
+                      
+                      logger.info(f"Disconnecting user {user_id} from room {room_id}")
+                  
+                  # Remove connection from table
+                  connections_table.delete_item(
+                      Key={'connectionId': connection_id}
+                  )
+                  
+                  logger.info(f"Connection removed: {connection_id}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'message': 'Disconnected successfully'})
+                  }
+                  
+              except ClientError as e:
+                  logger.error(f"DynamoDB error: {e}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': 'Disconnect failed'})
+                  }
+              except Exception as e:
+                  logger.error(f"Unexpected error: {e}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': 'Internal server error'})
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ProjectName
+        - Key: Function
+          Value: 'WebSocket disconnect handler'
+
+  # Lambda function for WebSocket message handling
+  MessageHandlerFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-message-${RandomSuffix.RandomSuffix}'
+      Runtime: 'python3.9'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt WebSocketLambdaRole.Arn
+      Timeout: !Ref MessageHandlerTimeout
+      MemorySize: !Ref MessageHandlerMemorySize
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTable
+          ROOMS_TABLE: !Ref RoomsTable
+          MESSAGES_TABLE: !Ref MessagesTable
+          LOG_LEVEL: !Ref LogLevel
+          ENVIRONMENT: !Ref Environment
+      TracingConfig:
+        Mode: !If [IsProduction, 'Active', 'PassThrough']
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import time
+          import uuid
+          import logging
+          from botocore.exceptions import ClientError
+          from boto3.dynamodb.conditions import Key
+          
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+          
+          dynamodb = boto3.resource('dynamodb')
+          connections_table = dynamodb.Table(os.environ['CONNECTIONS_TABLE'])
+          rooms_table = dynamodb.Table(os.environ['ROOMS_TABLE'])
+          messages_table = dynamodb.Table(os.environ['MESSAGES_TABLE'])
+          
+          def lambda_handler(event, context):
+              connection_id = event['requestContext']['connectionId']
+              domain_name = event['requestContext']['domainName']
+              stage = event['requestContext']['stage']
+              route_key = event['requestContext']['routeKey']
+              
+              logger.info(f"Message received on route {route_key} for connection {connection_id}")
+              
+              # Parse message from client
+              try:
+                  message_data = json.loads(event.get('body', '{}'))
+              except json.JSONDecodeError:
+                  logger.error(f"Invalid JSON from connection {connection_id}")
+                  return send_error(connection_id, domain_name, stage, 'Invalid JSON format')
+              
+              # Get sender connection info
+              try:
+                  sender_response = connections_table.get_item(
+                      Key={'connectionId': connection_id}
+                  )
+                  
+                  if 'Item' not in sender_response:
+                      logger.error(f"Connection not found: {connection_id}")
+                      return send_error(connection_id, domain_name, stage, 'Connection not found')
+                  
+                  sender_info = sender_response['Item']
+                  
+              except ClientError as e:
+                  logger.error(f"Error getting sender info: {e}")
+                  return {'statusCode': 500}
+              
+              # Route message based on type
+              message_type = message_data.get('type', 'chat')
+              logger.info(f"Processing message type: {message_type}")
+              
+              if message_type == 'chat':
+                  return handle_chat_message(message_data, sender_info, domain_name, stage)
+              elif message_type == 'join_room':
+                  return handle_join_room(message_data, sender_info, connection_id, domain_name, stage)
+              elif message_type == 'leave_room':
+                  return handle_leave_room(message_data, sender_info, connection_id, domain_name, stage)
+              elif message_type == 'private_message':
+                  return handle_private_message(message_data, sender_info, domain_name, stage)
+              elif message_type == 'room_list':
+                  return handle_room_list(sender_info, connection_id, domain_name, stage)
+              else:
+                  logger.warning(f"Unknown message type: {message_type}")
+                  return send_error(connection_id, domain_name, stage, f'Unknown message type: {message_type}')
+          
+          def handle_chat_message(message_data, sender_info, domain_name, stage):
+              room_id = message_data.get('roomId', sender_info['roomId'])
+              message_content = message_data.get('message', '')
+              
+              if not message_content.strip():
+                  return send_error(sender_info['connectionId'], domain_name, stage, 'Message cannot be empty')
+              
+              # Store message in database
+              message_id = str(uuid.uuid4())
+              timestamp = int(time.time())
+              
+              message_record = {
+                  'messageId': message_id,
+                  'roomId': room_id,
+                  'senderId': sender_info['userId'],
+                  'senderName': sender_info.get('username', sender_info['userId']),
+                  'message': message_content,
+                  'timestamp': timestamp,
+                  'type': 'chat'
+              }
+              
+              messages_table.put_item(Item=message_record)
+              logger.info(f"Stored message {message_id} in room {room_id}")
+              
+              # Broadcast to all connections in the room
+              broadcast_message = {
+                  'type': 'chat',
+                  'data': {
+                      'messageId': message_id,
+                      'roomId': room_id,
+                      'senderId': sender_info['userId'],
+                      'senderName': sender_info.get('username', sender_info['userId']),
+                      'message': message_content,
+                      'timestamp': timestamp
+                  }
+              }
+              
+              broadcast_to_room(room_id, broadcast_message, domain_name, stage)
+              
+              return {'statusCode': 200}
+          
+          def handle_join_room(message_data, sender_info, connection_id, domain_name, stage):
+              new_room_id = message_data.get('roomId')
+              
+              if not new_room_id:
+                  return send_error(connection_id, domain_name, stage, 'Room ID required')
+              
+              # Update connection's room
+              connections_table.update_item(
+                  Key={'connectionId': connection_id},
+                  UpdateExpression='SET roomId = :room_id, lastActivity = :timestamp',
+                  ExpressionAttributeValues={
+                      ':room_id': new_room_id,
+                      ':timestamp': int(time.time())
+                  }
+              )
+              
+              logger.info(f"User {sender_info['userId']} joined room {new_room_id}")
+              
+              # Notify room of new member
+              join_message = {
+                  'type': 'user_joined',
+                  'data': {
+                      'userId': sender_info['userId'],
+                      'username': sender_info.get('username', sender_info['userId']),
+                      'roomId': new_room_id,
+                      'timestamp': int(time.time())
+                  }
+              }
+              
+              broadcast_to_room(new_room_id, join_message, domain_name, stage)
+              
+              return {'statusCode': 200}
+          
+          def handle_leave_room(message_data, sender_info, connection_id, domain_name, stage):
+              # Implementation for leave room functionality
+              return {'statusCode': 200}
+          
+          def handle_private_message(message_data, sender_info, domain_name, stage):
+              target_user_id = message_data.get('targetUserId')
+              message_content = message_data.get('message')
+              
+              if not target_user_id or not message_content:
+                  return send_error(sender_info['connectionId'], domain_name, stage, 
+                                  'Target user ID and message required for private messages')
+              
+              # Find target user's connections
+              response = connections_table.query(
+                  IndexName='UserIndex',
+                  KeyConditionExpression=Key('userId').eq(target_user_id)
+              )
+              
+              if not response['Items']:
+                  return send_error(sender_info['connectionId'], domain_name, stage, 
+                                  'Target user not found or offline')
+              
+              # Send private message to all target user's connections
+              private_message = {
+                  'type': 'private_message',
+                  'data': {
+                      'senderId': sender_info['userId'],
+                      'senderName': sender_info.get('username', sender_info['userId']),
+                      'message': message_content,
+                      'timestamp': int(time.time())
+                  }
+              }
+              
+              api_gateway = boto3.client('apigatewaymanagementapi',
+                  endpoint_url=f'https://{domain_name}/{stage}')
+              
+              for target_connection in response['Items']:
+                  try:
+                      api_gateway.post_to_connection(
+                          ConnectionId=target_connection['connectionId'],
+                          Data=json.dumps(private_message)
+                      )
+                  except ClientError as e:
+                      if e.response['Error']['Code'] == 'GoneException':
+                          # Remove stale connection
+                          connections_table.delete_item(
+                              Key={'connectionId': target_connection['connectionId']}
+                          )
+              
+              return {'statusCode': 200}
+          
+          def handle_room_list(sender_info, connection_id, domain_name, stage):
+              # Get active rooms (rooms with at least one connection)
+              response = connections_table.scan(
+                  ProjectionExpression='roomId'
+              )
+              
+              active_rooms = {}
+              for item in response['Items']:
+                  room_id = item['roomId']
+                  active_rooms[room_id] = active_rooms.get(room_id, 0) + 1
+              
+              room_list_message = {
+                  'type': 'room_list',
+                  'data': {
+                      'rooms': [
+                          {'roomId': room_id, 'activeUsers': count}
+                          for room_id, count in active_rooms.items()
+                      ],
+                      'timestamp': int(time.time())
+                  }
+              }
+              
+              api_gateway = boto3.client('apigatewaymanagementapi',
+                  endpoint_url=f'https://{domain_name}/{stage}')
+              
+              api_gateway.post_to_connection(
+                  ConnectionId=connection_id,
+                  Data=json.dumps(room_list_message)
+              )
+              
+              return {'statusCode': 200}
+          
+          def broadcast_to_room(room_id, message, domain_name, stage):
+              # Get all connections in the room
+              response = connections_table.query(
+                  IndexName='RoomIndex',
+                  KeyConditionExpression=Key('roomId').eq(room_id)
+              )
+              
+              api_gateway = boto3.client('apigatewaymanagementapi',
+                  endpoint_url=f'https://{domain_name}/{stage}')
+              
+              message_data = json.dumps(message)
+              stale_connections = []
+              
+              for connection in response['Items']:
+                  try:
+                      api_gateway.post_to_connection(
+                          ConnectionId=connection['connectionId'],
+                          Data=message_data
+                      )
+                  except ClientError as e:
+                      if e.response['Error']['Code'] == 'GoneException':
+                          stale_connections.append(connection['connectionId'])
+              
+              # Clean up stale connections
+              for connection_id in stale_connections:
+                  connections_table.delete_item(Key={'connectionId': connection_id})
+          
+          def send_error(connection_id, domain_name, stage, error_message):
+              api_gateway = boto3.client('apigatewaymanagementapi',
+                  endpoint_url=f'https://{domain_name}/{stage}')
+              
+              error_response = {
+                  'type': 'error',
+                  'data': {
+                      'message': error_message,
+                      'timestamp': int(time.time())
+                  }
+              }
+              
+              try:
+                  api_gateway.post_to_connection(
+                      ConnectionId=connection_id,
+                      Data=json.dumps(error_response)
+                  )
+              except ClientError:
+                  pass  # Connection might be gone
+              
+              return {'statusCode': 400}
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ProjectName
+        - Key: Function
+          Value: 'WebSocket message handler'
+
+  # WebSocket API Gateway
+  WebSocketApi:
+    Type: 'AWS::ApiGatewayV2::Api'
+    Properties:
+      Name: !Sub '${ProjectName}-websocket-${RandomSuffix.RandomSuffix}'
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: '$request.body.type'
+      Description: 'Advanced WebSocket API with route management and connection handling'
+      Tags:
+        Environment: !Ref Environment
+        Application: !Ref ProjectName
+        Purpose: 'Real-time WebSocket communication'
+
+  # Lambda integrations for WebSocket routes
+  ConnectIntegration:
+    Type: 'AWS::ApiGatewayV2::Integration'
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ConnectHandlerFunction.Arn}/invocations'
+      Description: 'Integration for WebSocket connection handler'
+
+  DisconnectIntegration:
+    Type: 'AWS::ApiGatewayV2::Integration'
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DisconnectHandlerFunction.Arn}/invocations'
+      Description: 'Integration for WebSocket disconnect handler'
+
+  MessageIntegration:
+    Type: 'AWS::ApiGatewayV2::Integration'
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MessageHandlerFunction.Arn}/invocations'
+      Description: 'Integration for WebSocket message handler'
+
+  # WebSocket API routes
+  ConnectRoute:
+    Type: 'AWS::ApiGatewayV2::Route'
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: '$connect'
+      Target: !Sub 'integrations/${ConnectIntegration}'
+      RouteResponseSelectionExpression: '$default'
+
+  DisconnectRoute:
+    Type: 'AWS::ApiGatewayV2::Route'
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: '$disconnect'
+      Target: !Sub 'integrations/${DisconnectIntegration}'
+      RouteResponseSelectionExpression: '$default'
+
+  DefaultRoute:
+    Type: 'AWS::ApiGatewayV2::Route'
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: '$default'
+      Target: !Sub 'integrations/${MessageIntegration}'
+      RouteResponseSelectionExpression: '$default'
+
+  # Custom routes for message types
+  ChatRoute:
+    Type: 'AWS::ApiGatewayV2::Route'
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: 'chat'
+      Target: !Sub 'integrations/${MessageIntegration}'
+      RouteResponseSelectionExpression: '$default'
+
+  JoinRoomRoute:
+    Type: 'AWS::ApiGatewayV2::Route'
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: 'join_room'
+      Target: !Sub 'integrations/${MessageIntegration}'
+      RouteResponseSelectionExpression: '$default'
+
+  PrivateMessageRoute:
+    Type: 'AWS::ApiGatewayV2::Route'
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: 'private_message'
+      Target: !Sub 'integrations/${MessageIntegration}'
+      RouteResponseSelectionExpression: '$default'
+
+  # Lambda permissions for API Gateway
+  ConnectPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref ConnectHandlerFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/*'
+
+  DisconnectPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref DisconnectHandlerFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/*'
+
+  MessagePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref MessageHandlerFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/*'
+
+  # CloudWatch Log Groups for Lambda functions
+  ConnectLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ConnectHandlerFunction}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  DisconnectLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DisconnectHandlerFunction}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  MessageLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${MessageHandlerFunction}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  # API Gateway deployment
+  WebSocketDeployment:
+    Type: 'AWS::ApiGatewayV2::Deployment'
+    DependsOn:
+      - ConnectRoute
+      - DisconnectRoute
+      - DefaultRoute
+      - ChatRoute
+      - JoinRoomRoute
+      - PrivateMessageRoute
+    Properties:
+      ApiId: !Ref WebSocketApi
+      Description: 'WebSocket API deployment for real-time communication'
+
+  # API Gateway stage
+  WebSocketStage:
+    Type: 'AWS::ApiGatewayV2::Stage'
+    Properties:
+      ApiId: !Ref WebSocketApi
+      StageName: !Ref Environment
+      DeploymentId: !Ref WebSocketDeployment
+      Description: !Sub 'WebSocket API ${Environment} stage'
+      DefaultRouteSettings:
+        DetailedMetricsEnabled: !If [EnableDetailedMetricsCondition, true, false]
+        LoggingLevel: !Ref LogLevel
+        DataTraceEnabled: !If [EnableDataTraceCondition, true, false]
+        ThrottlingBurstLimit: !Ref ThrottlingBurstLimit
+        ThrottlingRateLimit: !Ref ThrottlingRateLimit
+      Tags:
+        Environment: !Ref Environment
+        Application: !Ref ProjectName
+
+  # CloudWatch alarms for monitoring
+  ConnectionsAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-high-connections-${Environment}'
+      AlarmDescription: 'High number of WebSocket connections'
+      MetricName: 'ConnectCount'
+      Namespace: 'AWS/ApiGatewayV2'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref WebSocketApi
+      TreatMissingData: notBreaching
+
+  MessageErrorsAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-message-errors-${Environment}'
+      AlarmDescription: 'High number of message processing errors'
+      MetricName: 'IntegrationError'
+      Namespace: 'AWS/ApiGatewayV2'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref WebSocketApi
+      TreatMissingData: notBreaching
+
+Outputs:
+  WebSocketApiId:
+    Description: 'WebSocket API ID'
+    Value: !Ref WebSocketApi
+    Export:
+      Name: !Sub '${AWS::StackName}-WebSocketApiId'
+
+  WebSocketApiEndpoint:
+    Description: 'WebSocket API endpoint URL'
+    Value: !Sub 'wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-WebSocketEndpoint'
+
+  ConnectionsTableName:
+    Description: 'DynamoDB table for WebSocket connections'
+    Value: !Ref ConnectionsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ConnectionsTable'
+
+  RoomsTableName:
+    Description: 'DynamoDB table for WebSocket rooms'
+    Value: !Ref RoomsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-RoomsTable'
+
+  MessagesTableName:
+    Description: 'DynamoDB table for WebSocket messages'
+    Value: !Ref MessagesTable
+    Export:
+      Name: !Sub '${AWS::StackName}-MessagesTable'
+
+  ConnectHandlerFunctionName:
+    Description: 'Lambda function for WebSocket connections'
+    Value: !Ref ConnectHandlerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-ConnectHandler'
+
+  DisconnectHandlerFunctionName:
+    Description: 'Lambda function for WebSocket disconnections'
+    Value: !Ref DisconnectHandlerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-DisconnectHandler'
+
+  MessageHandlerFunctionName:
+    Description: 'Lambda function for WebSocket message processing'
+    Value: !Ref MessageHandlerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-MessageHandler'
+
+  WebSocketLambdaRoleArn:
+    Description: 'IAM role ARN for WebSocket Lambda functions'
+    Value: !GetAtt WebSocketLambdaRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaRole'
+
+  Environment:
+    Description: 'Deployment environment'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+  RandomSuffix:
+    Description: 'Random suffix used for resource naming'
+    Value: !GetAtt RandomSuffix.RandomSuffix
+    Export:
+      Name: !Sub '${AWS::StackName}-RandomSuffix'
+
+  TestCommand:
+    Description: 'Command to test WebSocket connection'
+    Value: !Sub |
+      # Test connection with curl (if wscat is not available)
+      wscat -c '${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}?userId=testuser&username=TestUser&roomId=general&token=valid_test_token'
+      
+      # Or use Python test script:
+      # python websocket_client.py wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
+
+  DeploymentInstructions:
+    Description: 'Instructions for deploying this stack'
+    Value: !Sub |
+      Deploy with:
+      aws cloudformation create-stack \
+        --stack-name ${ProjectName}-${Environment} \
+        --template-body file://cloudformation.yaml \
+        --parameters ParameterKey=Environment,ParameterValue=${Environment} \
+        --capabilities CAPABILITY_NAMED_IAM \
+        --region ${AWS::Region}
+
+  MonitoringDashboard:
+    Description: 'CloudWatch dashboard for monitoring WebSocket API'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}'

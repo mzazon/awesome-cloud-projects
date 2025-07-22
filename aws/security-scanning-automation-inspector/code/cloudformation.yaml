@@ -1,0 +1,743 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Automated Security Scanning with Amazon Inspector and AWS Security Hub
+  This template creates a comprehensive security scanning pipeline with automated
+  response capabilities, compliance reporting, and centralized security findings management.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - EnableSecurityHubStandards
+          - InspectorScanMode
+          - ECRRescanDuration
+          - NotificationEmail
+      - Label:
+          default: "Automation Settings"
+        Parameters:
+          - AlertSeverityThreshold
+          - ComplianceReportingSchedule
+          - AutoRemediationEnabled
+      - Label:
+          default: "Resource Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+          - ResourceTagging
+
+    ParameterLabels:
+      EnableSecurityHubStandards:
+        default: "Enable Security Hub Standards"
+      InspectorScanMode:
+        default: "Inspector Scanning Mode"
+      ECRRescanDuration:
+        default: "ECR Rescan Duration"
+      NotificationEmail:
+        default: "Security Alert Email"
+      AlertSeverityThreshold:
+        default: "Alert Severity Threshold"
+      ComplianceReportingSchedule:
+        default: "Compliance Report Schedule"
+      AutoRemediationEnabled:
+        default: "Enable Auto-Remediation"
+      Environment:
+        default: "Environment"
+      ProjectName:
+        default: "Project Name"
+      ResourceTagging:
+        default: "Enable Resource Tagging"
+
+Parameters:
+  EnableSecurityHubStandards:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable AWS Foundational Security Best Practices and CIS standards
+    
+  InspectorScanMode:
+    Type: String
+    Default: 'EC2_HYBRID'
+    AllowedValues: ['EC2_AGENTLESS', 'EC2_HYBRID']
+    Description: Amazon Inspector scanning mode for EC2 instances
+    
+  ECRRescanDuration:
+    Type: String
+    Default: 'DAYS_30'
+    AllowedValues: ['DAYS_14', 'DAYS_30', 'DAYS_60', 'DAYS_90']
+    Description: How often to rescan ECR container images
+    
+  NotificationEmail:
+    Type: String
+    Description: Email address for security alert notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+    
+  AlertSeverityThreshold:
+    Type: String
+    Default: 'HIGH'
+    AllowedValues: ['MEDIUM', 'HIGH', 'CRITICAL']
+    Description: Minimum severity level for automated alerts
+    
+  ComplianceReportingSchedule:
+    Type: String
+    Default: 'rate(7 days)'
+    AllowedValues: ['rate(1 day)', 'rate(7 days)', 'rate(30 days)']
+    Description: Schedule for automated compliance reports
+    
+  AutoRemediationEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable automatic remediation actions for findings
+    
+  Environment:
+    Type: String
+    Default: 'production'
+    AllowedValues: ['development', 'staging', 'production']
+    Description: Environment for resource deployment
+    
+  ProjectName:
+    Type: String
+    Default: 'security-scanning'
+    Description: Project name for resource naming and tagging
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must start with letter, contain only letters, numbers, and hyphens
+    
+  ResourceTagging:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable automatic resource tagging for security findings
+
+Conditions:
+  EnableStandards: !Equals [!Ref EnableSecurityHubStandards, 'true']
+  EnableAutoRemediation: !Equals [!Ref AutoRemediationEnabled, 'true']
+  EnableResourceTagging: !Equals [!Ref ResourceTagging, 'true']
+  IsProduction: !Equals [!Ref Environment, 'production']
+
+Resources:
+  # SNS Topic for Security Alerts
+  SecurityAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-security-alerts-${Environment}'
+      DisplayName: Security Alerts
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: SecurityAlerts
+
+  SecurityAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref SecurityAlertsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref SecurityAlertsTopic
+          - Sid: AllowLambdaPublish
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref SecurityAlertsTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+
+  SecurityAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref SecurityAlertsTopic
+      Endpoint: !Ref NotificationEmail
+
+  # IAM Role for Security Response Lambda
+  SecurityResponseLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-security-response-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SecurityResponsePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - securityhub:BatchImportFindings
+                  - securityhub:BatchUpdateFindings
+                  - securityhub:GetFindings
+                  - inspector2:ListFindings
+                  - inspector2:BatchGetFinding
+                  - sns:Publish
+                Resource: '*'
+              - !If
+                - EnableResourceTagging
+                - Effect: Allow
+                  Action:
+                    - ec2:CreateTags
+                    - ec2:DescribeInstances
+                    - lambda:TagResource
+                    - lambda:ListTags
+                  Resource: '*'
+                - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Security Response Lambda Function
+  SecurityResponseFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-security-response-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt SecurityResponseLambdaRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SecurityAlertsTopic
+          SEVERITY_THRESHOLD: !Ref AlertSeverityThreshold
+          AUTO_REMEDIATION_ENABLED: !Ref AutoRemediationEnabled
+          RESOURCE_TAGGING_ENABLED: !Ref ResourceTagging
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Process Security Hub findings and trigger appropriate responses
+              """
+              try:
+                  # Parse the EventBridge event
+                  detail = event.get('detail', {})
+                  findings = detail.get('findings', [])
+                  
+                  sns = boto3.client('sns')
+                  ec2 = boto3.client('ec2')
+                  
+                  sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+                  severity_threshold = os.environ['SEVERITY_THRESHOLD']
+                  auto_remediation = os.environ['AUTO_REMEDIATION_ENABLED'] == 'true'
+                  resource_tagging = os.environ['RESOURCE_TAGGING_ENABLED'] == 'true'
+                  environment = os.environ['ENVIRONMENT']
+                  
+                  severity_levels = {'LOW': 1, 'MEDIUM': 2, 'HIGH': 3, 'CRITICAL': 4}
+                  threshold_level = severity_levels.get(severity_threshold, 3)
+                  
+                  for finding in findings:
+                      severity = finding.get('Severity', {}).get('Label', 'UNKNOWN')
+                      finding_level = severity_levels.get(severity, 0)
+                      
+                      if finding_level >= threshold_level:
+                          title = finding.get('Title', 'Security Finding')
+                          description = finding.get('Description', '')
+                          resource_id = finding.get('Resources', [{}])[0].get('Id', 'Unknown')
+                          resource_type = finding.get('Resources', [{}])[0].get('Type', 'Unknown')
+                          
+                          # Create alert message
+                          message = {
+                              'timestamp': datetime.utcnow().isoformat(),
+                              'environment': environment,
+                              'severity': severity,
+                              'title': title,
+                              'description': description,
+                              'resource_id': resource_id,
+                              'resource_type': resource_type,
+                              'finding_id': finding.get('Id', ''),
+                              'aws_account': finding.get('AwsAccountId', ''),
+                              'region': finding.get('Region', ''),
+                              'compliance_status': finding.get('Compliance', {}).get('Status', 'UNKNOWN')
+                          }
+                          
+                          # Send notification
+                          sns.publish(
+                              TopicArn=sns_topic_arn,
+                              Subject=f"Security Alert [{environment.upper()}]: {severity} - {title}",
+                              Message=json.dumps(message, indent=2)
+                          )
+                          logger.info(f"Sent alert for {severity} finding: {title}")
+                          
+                          # Auto-remediation logic
+                          if auto_remediation and resource_tagging:
+                              try:
+                                  if 'AwsEc2Instance' in resource_type and '/' in resource_id:
+                                      instance_id = resource_id.split('/')[-1]
+                                      if instance_id.startswith('i-'):
+                                          ec2.create_tags(
+                                              Resources=[instance_id],
+                                              Tags=[
+                                                  {'Key': 'SecurityStatus', 'Value': 'RequiresAttention'},
+                                                  {'Key': 'SecurityFinding', 'Value': severity},
+                                                  {'Key': 'LastSecurityScan', 'Value': datetime.utcnow().isoformat()},
+                                                  {'Key': 'AutoTagged', 'Value': 'true'}
+                                              ]
+                                          )
+                                          logger.info(f"Tagged EC2 instance {instance_id} for remediation")
+                              except Exception as e:
+                                  logger.error(f"Failed to tag resource {resource_id}: {str(e)}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Processed {len(findings)} security findings',
+                          'environment': environment,
+                          'timestamp': datetime.utcnow().isoformat()
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing security findings: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # EventBridge Rule for Security Hub Findings
+  SecurityFindingsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-security-findings-rule-${Environment}'
+      Description: Route high severity security findings to Lambda
+      EventPattern:
+        source: ['aws.securityhub']
+        detail-type: ['Security Hub Findings - Imported']
+        detail:
+          findings:
+            Severity:
+              Label: !If
+                - !Equals [!Ref AlertSeverityThreshold, 'MEDIUM']
+                - ['MEDIUM', 'HIGH', 'CRITICAL']
+                - !If
+                  - !Equals [!Ref AlertSeverityThreshold, 'HIGH']
+                  - ['HIGH', 'CRITICAL']
+                  - ['CRITICAL']
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SecurityResponseFunction.Arn
+          Id: SecurityResponseTarget
+
+  # Permission for EventBridge to invoke Lambda
+  SecurityResponseFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SecurityResponseFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SecurityFindingsRule.Arn
+
+  # IAM Role for Compliance Reporting Lambda
+  ComplianceReportingLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-compliance-reporting-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ComplianceReportingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - securityhub:GetFindings
+                  - securityhub:GetInsights
+                  - securityhub:GetInsightResults
+                  - inspector2:ListFindings
+                  - inspector2:GetCoverageStatistics
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub '${ComplianceReportsBucket}/*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SecurityAlertsTopic
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # S3 Bucket for Compliance Reports
+  ComplianceReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-compliance-reports-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ComplianceReportsRetention
+            Status: Enabled
+            ExpirationInDays: !If [IsProduction, 2555, 90]  # 7 years for production, 90 days for non-prod
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: ComplianceReports
+
+  # Compliance Reporting Lambda Function
+  ComplianceReportingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-compliance-reporting-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ComplianceReportingLambdaRole.Arn
+      Timeout: 900  # 15 minutes for large reports
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref ComplianceReportsBucket
+          SNS_TOPIC_ARN: !Ref SecurityAlertsTopic
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import csv
+          import os
+          from datetime import datetime, timedelta
+          from io import StringIO
+          
+          def lambda_handler(event, context):
+              """
+              Generate compliance report from Security Hub findings
+              """
+              try:
+                  securityhub = boto3.client('securityhub')
+                  s3 = boto3.client('s3')
+                  sns = boto3.client('sns')
+                  inspector = boto3.client('inspector2')
+                  
+                  bucket_name = os.environ['S3_BUCKET']
+                  sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+                  environment = os.environ['ENVIRONMENT']
+                  project_name = os.environ['PROJECT_NAME']
+                  
+                  # Get findings from last 7 days
+                  end_time = datetime.utcnow()
+                  start_time = end_time - timedelta(days=7)
+                  
+                  findings = []
+                  paginator = securityhub.get_paginator('get_findings')
+                  
+                  for page in paginator.paginate(
+                      Filters={
+                          'CreatedAt': [
+                              {
+                                  'Start': start_time.isoformat(),
+                                  'End': end_time.isoformat()
+                              }
+                          ]
+                      }
+                  ):
+                      findings.extend(page['Findings'])
+                  
+                  # Get Inspector coverage statistics
+                  try:
+                      coverage_stats = inspector.get_coverage_statistics()
+                  except Exception as e:
+                      coverage_stats = {'countsByResourceType': []}
+                  
+                  # Generate CSV report
+                  csv_buffer = StringIO()
+                  writer = csv.writer(csv_buffer)
+                  
+                  # Write header
+                  writer.writerow([
+                      'Finding ID', 'Title', 'Severity', 'Resource Type', 
+                      'Resource ID', 'Compliance Status', 'Created Date', 
+                      'Updated Date', 'Workflow State', 'Record State'
+                  ])
+                  
+                  # Write findings
+                  severity_counts = {'LOW': 0, 'MEDIUM': 0, 'HIGH': 0, 'CRITICAL': 0}
+                  resource_type_counts = {}
+                  
+                  for finding in findings:
+                      severity = finding.get('Severity', {}).get('Label', 'UNKNOWN')
+                      resource_type = finding.get('Resources', [{}])[0].get('Type', 'Unknown')
+                      
+                      severity_counts[severity] = severity_counts.get(severity, 0) + 1
+                      resource_type_counts[resource_type] = resource_type_counts.get(resource_type, 0) + 1
+                      
+                      writer.writerow([
+                          finding.get('Id', ''),
+                          finding.get('Title', ''),
+                          severity,
+                          resource_type,
+                          finding.get('Resources', [{}])[0].get('Id', ''),
+                          finding.get('Compliance', {}).get('Status', ''),
+                          finding.get('CreatedAt', ''),
+                          finding.get('UpdatedAt', ''),
+                          finding.get('WorkflowState', ''),
+                          finding.get('RecordState', '')
+                      ])
+                  
+                  # Save report to S3
+                  report_key = f"compliance-reports/{environment}/security-findings-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.csv"
+                  
+                  s3.put_object(
+                      Bucket=bucket_name,
+                      Key=report_key,
+                      Body=csv_buffer.getvalue(),
+                      ContentType='text/csv',
+                      Metadata={
+                          'environment': environment,
+                          'project': project_name,
+                          'report-type': 'security-findings',
+                          'findings-count': str(len(findings))
+                      }
+                  )
+                  
+                  # Send summary notification
+                  summary_message = {
+                      'report_timestamp': datetime.utcnow().isoformat(),
+                      'environment': environment,
+                      'project': project_name,
+                      'total_findings': len(findings),
+                      'severity_breakdown': severity_counts,
+                      'resource_type_breakdown': resource_type_counts,
+                      'coverage_stats': coverage_stats.get('countsByResourceType', []),
+                      's3_report_location': f"s3://{bucket_name}/{report_key}"
+                  }
+                  
+                  sns.publish(
+                      TopicArn=sns_topic_arn,
+                      Subject=f"Weekly Compliance Report [{environment.upper()}] - {len(findings)} Findings",
+                      Message=json.dumps(summary_message, indent=2)
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Generated compliance report with {len(findings)} findings',
+                          'report_location': f"s3://{bucket_name}/{report_key}",
+                          'environment': environment,
+                          'timestamp': datetime.utcnow().isoformat()
+                      })
+                  }
+                  
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # EventBridge Rule for Compliance Reporting
+  ComplianceReportingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-compliance-reporting-rule-${Environment}'
+      Description: Schedule compliance report generation
+      ScheduleExpression: !Ref ComplianceReportingSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ComplianceReportingFunction.Arn
+          Id: ComplianceReportingTarget
+
+  # Permission for EventBridge to invoke Compliance Reporting Lambda
+  ComplianceReportingFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ComplianceReportingFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ComplianceReportingRule.Arn
+
+  # Custom Security Hub Insights
+  CriticalVulnerabilitiesInsight:
+    Type: AWS::SecurityHub::Insight
+    Properties:
+      Name: !Sub '${ProjectName}-critical-vulnerabilities-${Environment}'
+      Filters:
+        SeverityLabel:
+          - Value: CRITICAL
+            Comparison: EQUALS
+        RecordState:
+          - Value: ACTIVE
+            Comparison: EQUALS
+      GroupByAttribute: ResourceType
+
+  UnpatchedInstancesInsight:
+    Type: AWS::SecurityHub::Insight
+    Properties:
+      Name: !Sub '${ProjectName}-unpatched-instances-${Environment}'
+      Filters:
+        ResourceType:
+          - Value: AwsEc2Instance
+            Comparison: EQUALS
+        ComplianceStatus:
+          - Value: FAILED
+            Comparison: EQUALS
+      GroupByAttribute: ResourceId
+
+  # CloudWatch Dashboard for Security Metrics
+  SecurityDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-security-dashboard-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${SecurityResponseFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Security Response Function Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/SNS", "NumberOfMessagesPublished", "TopicName", "${SecurityAlertsTopic.TopicName}" ],
+                  [ ".", "NumberOfNotificationsFailed", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Security Alert Notifications"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${SecurityResponseFunction}'\n| fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Security Response Function Errors"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  SecurityAlertsTopic:
+    Description: SNS Topic ARN for security alerts
+    Value: !Ref SecurityAlertsTopic
+    Export:
+      Name: !Sub '${ProjectName}-SecurityAlertsTopic-${Environment}'
+
+  SecurityResponseFunction:
+    Description: Security Response Lambda Function ARN
+    Value: !GetAtt SecurityResponseFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-SecurityResponseFunction-${Environment}'
+
+  ComplianceReportingFunction:
+    Description: Compliance Reporting Lambda Function ARN
+    Value: !GetAtt ComplianceReportingFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-ComplianceReportingFunction-${Environment}'
+
+  ComplianceReportsBucket:
+    Description: S3 Bucket for compliance reports
+    Value: !Ref ComplianceReportsBucket
+    Export:
+      Name: !Sub '${ProjectName}-ComplianceReportsBucket-${Environment}'
+
+  SecurityDashboard:
+    Description: CloudWatch Dashboard for security metrics
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${SecurityDashboard}'
+
+  DeploymentInstructions:
+    Description: Post-deployment setup instructions
+    Value: !Sub |
+      1. Enable Security Hub: aws securityhub enable-security-hub --enable-default-standards --region ${AWS::Region}
+      2. Enable Inspector: aws inspector2 enable --resource-types EC2 ECR LAMBDA --region ${AWS::Region}
+      3. Configure Inspector scanning: aws inspector2 update-configuration --ec2-configuration scanMode=${InspectorScanMode} --ecr-configuration rescanDuration=${ECRRescanDuration}
+      4. Confirm email subscription to SNS topic: ${SecurityAlertsTopic}
+      5. View Security Dashboard: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${SecurityDashboard}
+
+  SecurityHubConsole:
+    Description: AWS Security Hub Console URL
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/securityhub/home?region=${AWS::Region}#/summary'
+
+  InspectorConsole:
+    Description: Amazon Inspector Console URL
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/inspector/v2/home?region=${AWS::Region}#/dashboard'

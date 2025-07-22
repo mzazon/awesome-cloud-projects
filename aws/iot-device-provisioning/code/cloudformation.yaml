@@ -1,0 +1,1306 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS IoT Device Provisioning and Certificate Management Infrastructure - Complete solution for automated device onboarding with security validation and lifecycle management'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "IoT Device Configuration"
+        Parameters:
+          - DeviceTypes
+          - MaxDevicesPerType
+          - EnableBulkProvisioning
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - EnableClaimCertificates
+          - CertificateValidityDays
+          - RequireDeviceValidation
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableDetailedMonitoring
+          - ProvisioningAlertEmail
+          - LogRetentionDays
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      DeviceTypes:
+        default: "Supported Device Types"
+      MaxDevicesPerType:
+        default: "Maximum Devices per Type"
+      EnableBulkProvisioning:
+        default: "Enable Bulk Provisioning"
+      EnableClaimCertificates:
+        default: "Enable Claim Certificates"
+      CertificateValidityDays:
+        default: "Certificate Validity (Days)"
+      RequireDeviceValidation:
+        default: "Require Device Validation"
+      EnableDetailedMonitoring:
+        default: "Enable Detailed Monitoring"
+      ProvisioningAlertEmail:
+        default: "Provisioning Alert Email"
+      LogRetentionDays:
+        default: "Log Retention (Days)"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: 'Name of the project for resource naming and tagging'
+    Default: 'iot-device-provisioning'
+    AllowedPattern: '^[a-z0-9\-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+    MinLength: 3
+    MaxLength: 50
+
+  Environment:
+    Type: String
+    Description: 'Environment designation for resource isolation'
+    Default: 'dev'
+    AllowedValues:
+      - 'dev'
+      - 'staging'
+      - 'prod'
+    ConstraintDescription: 'Must be one of: dev, staging, prod'
+
+  DeviceTypes:
+    Type: CommaDelimitedList
+    Description: 'List of supported device types for provisioning'
+    Default: 'temperature-sensor,humidity-sensor,pressure-sensor,gateway'
+    ConstraintDescription: 'Comma-separated list of device types'
+
+  MaxDevicesPerType:
+    Type: Number
+    Description: 'Maximum number of devices per device type'
+    Default: 10000
+    MinValue: 100
+    MaxValue: 100000
+    ConstraintDescription: 'Must be between 100 and 100,000'
+
+  EnableBulkProvisioning:
+    Type: String
+    Description: 'Enable bulk provisioning capabilities'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableClaimCertificates:
+    Type: String
+    Description: 'Enable claim certificate generation for manufacturing'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  CertificateValidityDays:
+    Type: Number
+    Description: 'Validity period for device certificates in days'
+    Default: 365
+    MinValue: 30
+    MaxValue: 3650
+    ConstraintDescription: 'Must be between 30 and 3650 days'
+
+  RequireDeviceValidation:
+    Type: String
+    Description: 'Require device validation through pre-provisioning hook'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableDetailedMonitoring:
+    Type: String
+    Description: 'Enable detailed CloudWatch monitoring and alerting'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  ProvisioningAlertEmail:
+    Type: String
+    Description: 'Email address for provisioning alerts and notifications'
+    Default: 'admin@example.com'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  LogRetentionDays:
+    Type: Number
+    Description: 'CloudWatch log retention period in days'
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    ConstraintDescription: 'Must be a valid CloudWatch log retention period'
+
+Conditions:
+  # Feature toggles
+  EnableBulkProvisioningCondition: !Equals [!Ref EnableBulkProvisioning, 'true']
+  EnableClaimCertificatesCondition: !Equals [!Ref EnableClaimCertificates, 'true']
+  RequireDeviceValidationCondition: !Equals [!Ref RequireDeviceValidation, 'true']
+  EnableDetailedMonitoringCondition: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  
+  # Environment conditions
+  IsProductionEnvironment: !Equals [!Ref Environment, 'prod']
+  IsNonProductionEnvironment: !Not [!Equals [!Ref Environment, 'prod']]
+
+Resources:
+  # DynamoDB Table for Device Registry
+  DeviceRegistryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-device-registry-${Environment}'
+      AttributeDefinitions:
+        - AttributeName: serialNumber
+          AttributeType: S
+        - AttributeName: deviceType
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: provisioningTimestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: serialNumber
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: DeviceTypeIndex
+          KeySchema:
+            - AttributeName: deviceType
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !If [IsProductionEnvironment, 10, 5]
+            WriteCapacityUnits: !If [IsProductionEnvironment, 10, 5]
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: provisioningTimestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !If [IsProductionEnvironment, 5, 2]
+            WriteCapacityUnits: !If [IsProductionEnvironment, 5, 2]
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: !If [IsProductionEnvironment, 20, 10]
+        WriteCapacityUnits: !If [IsProductionEnvironment, 20, 10]
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProductionEnvironment, true, false]
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-device-registry-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'device-registry'
+
+  # Lambda Execution Role for Pre-Provisioning Hook
+  PreProvisioningHookRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-pre-provisioning-hook-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt DeviceRegistryTable.Arn
+                  - !Sub '${DeviceRegistryTable.Arn}/index/*'
+        - PolicyName: IoTAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iot:DescribeThing
+                  - iot:ListThingTypes
+                  - iot:DescribeThingGroup
+                Resource: '*'
+        - PolicyName: CloudWatchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-pre-provisioning-hook-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Pre-Provisioning Hook Lambda Function
+  PreProvisioningHookFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-pre-provisioning-hook-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt PreProvisioningHookRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      ReservedConcurrencyLimit: !If [IsProductionEnvironment, 100, 10]
+      Environment:
+        Variables:
+          DEVICE_REGISTRY_TABLE: !Ref DeviceRegistryTable
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          MAX_DEVICES_PER_TYPE: !Ref MaxDevicesPerType
+          CERTIFICATE_VALIDITY_DAYS: !Ref CertificateValidityDays
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime, timezone
+          from typing import Dict, Any, Optional
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize AWS clients
+          dynamodb = boto3.resource('dynamodb')
+          iot = boto3.client('iot')
+          cloudwatch = boto3.client('cloudwatch')
+
+          # Environment variables
+          DEVICE_REGISTRY_TABLE = os.environ['DEVICE_REGISTRY_TABLE']
+          PROJECT_NAME = os.environ['PROJECT_NAME']
+          ENVIRONMENT = os.environ['ENVIRONMENT']
+          MAX_DEVICES_PER_TYPE = int(os.environ['MAX_DEVICES_PER_TYPE'])
+          CERTIFICATE_VALIDITY_DAYS = int(os.environ['CERTIFICATE_VALIDITY_DAYS'])
+
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              Pre-provisioning hook to validate and authorize device provisioning
+              """
+              try:
+                  # Extract device information from provisioning request
+                  certificate_pem = event.get('certificatePem', '')
+                  template_arn = event.get('templateArn', '')
+                  parameters = event.get('parameters', {})
+                  
+                  serial_number = parameters.get('SerialNumber', '')
+                  device_type = parameters.get('DeviceType', '')
+                  firmware_version = parameters.get('FirmwareVersion', '')
+                  manufacturer = parameters.get('Manufacturer', '')
+                  location = parameters.get('Location', 'unknown')
+                  
+                  logger.info(f"Processing provisioning request for device: {serial_number}, type: {device_type}")
+                  
+                  # Validate required parameters
+                  if not all([serial_number, device_type, manufacturer]):
+                      return create_response(False, "Missing required device parameters", "VALIDATION_ERROR")
+                  
+                  # Validate device type
+                  valid_device_types = ['temperature-sensor', 'humidity-sensor', 'pressure-sensor', 'gateway']
+                  if device_type not in valid_device_types:
+                      return create_response(False, f"Invalid device type: {device_type}", "INVALID_DEVICE_TYPE")
+                  
+                  # Validate serial number format
+                  if not serial_number.isalnum() or len(serial_number) < 6:
+                      return create_response(False, "Invalid serial number format", "INVALID_SERIAL_NUMBER")
+                  
+                  # Check device registry
+                  table = dynamodb.Table(DEVICE_REGISTRY_TABLE)
+                  
+                  # Check if device already exists
+                  existing_device = check_existing_device(table, serial_number)
+                  if existing_device:
+                      status = existing_device.get('status', '')
+                      if status == 'provisioned':
+                          return create_response(False, "Device already provisioned", "ALREADY_PROVISIONED")
+                      elif status == 'revoked':
+                          return create_response(False, "Device has been revoked", "DEVICE_REVOKED")
+                      elif status == 'blocked':
+                          return create_response(False, "Device is blocked", "DEVICE_BLOCKED")
+                  
+                  # Check device type quota
+                  if not check_device_quota(table, device_type):
+                      return create_response(False, f"Device type quota exceeded: {device_type}", "QUOTA_EXCEEDED")
+                  
+                  # Validate firmware version
+                  if firmware_version and not validate_firmware_version(firmware_version):
+                      return create_response(False, "Invalid firmware version format", "INVALID_FIRMWARE_VERSION")
+                  
+                  # Validate manufacturer
+                  if not validate_manufacturer(manufacturer):
+                      return create_response(False, "Invalid or unauthorized manufacturer", "INVALID_MANUFACTURER")
+                  
+                  # Store device information in registry
+                  device_item = create_device_record(
+                      serial_number, device_type, manufacturer, 
+                      firmware_version, location, template_arn
+                  )
+                  
+                  try:
+                      table.put_item(Item=device_item)
+                      logger.info(f"Device {serial_number} registered in device registry")
+                  except Exception as e:
+                      logger.error(f"Error storing device in registry: {str(e)}")
+                      return create_response(False, "Failed to register device", "REGISTRY_ERROR")
+                  
+                  # Send custom metrics
+                  send_provisioning_metrics(device_type, "VALIDATION_SUCCESS")
+                  
+                  # Create response parameters
+                  response_parameters = {
+                      'ThingName': f"{device_type}-{serial_number}",
+                      'ThingGroupName': f"{device_type}-devices",
+                      'DeviceLocation': location,
+                      'ProvisioningTime': datetime.now(timezone.utc).isoformat(),
+                      'CertificateValidityDays': str(CERTIFICATE_VALIDITY_DAYS),
+                      'Environment': ENVIRONMENT
+                  }
+                  
+                  return create_response(True, "Device validation successful", "VALIDATION_SUCCESS", response_parameters)
+                  
+              except Exception as e:
+                  logger.error(f"Unexpected error in provisioning hook: {str(e)}")
+                  send_provisioning_metrics("unknown", "VALIDATION_ERROR")
+                  return create_response(False, "Internal provisioning error", "INTERNAL_ERROR")
+
+          def check_existing_device(table, serial_number: str) -> Optional[Dict]:
+              """Check if device already exists in registry"""
+              try:
+                  response = table.get_item(Key={'serialNumber': serial_number})
+                  return response.get('Item')
+              except Exception as e:
+                  logger.error(f"Error checking existing device: {str(e)}")
+                  return None
+
+          def check_device_quota(table, device_type: str) -> bool:
+              """Check if device type quota is exceeded"""
+              try:
+                  response = table.query(
+                      IndexName='DeviceTypeIndex',
+                      KeyConditionExpression='deviceType = :deviceType',
+                      ExpressionAttributeValues={':deviceType': device_type},
+                      Select='COUNT'
+                  )
+                  current_count = response.get('Count', 0)
+                  return current_count < MAX_DEVICES_PER_TYPE
+              except Exception as e:
+                  logger.error(f"Error checking device quota: {str(e)}")
+                  return False
+
+          def validate_firmware_version(firmware_version: str) -> bool:
+              """Validate firmware version format"""
+              import re
+              # Accept formats like v1.0.0, 1.0.0, v1.0, etc.
+              pattern = r'^v?\d+\.\d+(\.\d+)?$'
+              return bool(re.match(pattern, firmware_version))
+
+          def validate_manufacturer(manufacturer: str) -> bool:
+              """Validate manufacturer against allowed list"""
+              allowed_manufacturers = [
+                  'AcmeIoT', 'TechCorp', 'IoTSolutions', 'SmartDevices',
+                  'ConnectedSystems', 'IndustrialIoT', 'EdgeTech'
+              ]
+              return manufacturer in allowed_manufacturers
+
+          def create_device_record(serial_number: str, device_type: str, manufacturer: str,
+                                 firmware_version: str, location: str, template_arn: str) -> Dict:
+              """Create device record for registry"""
+              return {
+                  'serialNumber': serial_number,
+                  'deviceType': device_type,
+                  'manufacturer': manufacturer,
+                  'firmwareVersion': firmware_version,
+                  'location': location,
+                  'status': 'provisioning',
+                  'provisioningTimestamp': datetime.now(timezone.utc).isoformat(),
+                  'templateArn': template_arn,
+                  'environment': ENVIRONMENT,
+                  'project': PROJECT_NAME,
+                  'lastUpdated': datetime.now(timezone.utc).isoformat()
+              }
+
+          def send_provisioning_metrics(device_type: str, status: str):
+              """Send custom metrics to CloudWatch"""
+              try:
+                  cloudwatch.put_metric_data(
+                      Namespace=f'{PROJECT_NAME}/Provisioning',
+                      MetricData=[
+                          {
+                              'MetricName': 'DeviceValidationAttempts',
+                              'Dimensions': [
+                                  {'Name': 'DeviceType', 'Value': device_type},
+                                  {'Name': 'Status', 'Value': status},
+                                  {'Name': 'Environment', 'Value': ENVIRONMENT}
+                              ],
+                              'Value': 1,
+                              'Unit': 'Count'
+                          }
+                      ]
+                  )
+              except Exception as e:
+                  logger.error(f"Error sending metrics: {str(e)}")
+
+          def create_response(allow_provisioning: bool, message: str, 
+                            error_code: str = None, parameters: Dict = None) -> Dict:
+              """Create standardized response for provisioning hook"""
+              response = {
+                  'allowProvisioning': allow_provisioning,
+                  'message': message
+              }
+              
+              if error_code:
+                  response['errorCode'] = error_code
+              
+              if parameters:
+                  response['parameters'] = parameters
+              
+              logger.info(f"Provisioning response: {response}")
+              return response
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-pre-provisioning-hook-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Group for Pre-Provisioning Hook
+  PreProvisioningHookLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${PreProvisioningHookFunction}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-pre-provisioning-hook-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for IoT Provisioning Template
+  IoTProvisioningRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-iot-provisioning-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: IoTProvisioningPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iot:CreateThing
+                  - iot:DescribeThing
+                  - iot:UpdateThing
+                  - iot:CreateKeysAndCertificate
+                  - iot:AttachThingPrincipal
+                  - iot:DetachThingPrincipal
+                  - iot:AttachPolicy
+                  - iot:DetachPolicy
+                  - iot:AddThingToThingGroup
+                  - iot:RemoveThingFromThingGroup
+                  - iot:UpdateThingShadow
+                  - iot:GetThingShadow
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt PreProvisioningHookFunction.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-iot-provisioning-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Parent Thing Group for All Devices
+  ParentThingGroup:
+    Type: AWS::IoT::ThingGroup
+    Properties:
+      ThingGroupName: !Sub '${ProjectName}-provisioned-devices-${Environment}'
+      ThingGroupProperties:
+        Description: !Sub 'Parent group for all provisioned devices in ${Environment} environment'
+        AttributePayload:
+          Attributes:
+            Project: !Ref ProjectName
+            Environment: !Ref Environment
+            CreatedBy: 'CloudFormation'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-provisioned-devices-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Device Type Specific Thing Groups
+  TemperatureSensorThingGroup:
+    Type: AWS::IoT::ThingGroup
+    Properties:
+      ThingGroupName: !Sub '${ProjectName}-temperature-sensor-devices-${Environment}'
+      ThingGroupProperties:
+        Description: 'Temperature sensor devices'
+        ParentGroupName: !Ref ParentThingGroup
+        AttributePayload:
+          Attributes:
+            DeviceType: 'temperature-sensor'
+            SensorType: 'temperature'
+            Environment: !Ref Environment
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-temperature-sensor-devices-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: DeviceType
+          Value: 'temperature-sensor'
+
+  HumiditySensorThingGroup:
+    Type: AWS::IoT::ThingGroup
+    Properties:
+      ThingGroupName: !Sub '${ProjectName}-humidity-sensor-devices-${Environment}'
+      ThingGroupProperties:
+        Description: 'Humidity sensor devices'
+        ParentGroupName: !Ref ParentThingGroup
+        AttributePayload:
+          Attributes:
+            DeviceType: 'humidity-sensor'
+            SensorType: 'humidity'
+            Environment: !Ref Environment
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-humidity-sensor-devices-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: DeviceType
+          Value: 'humidity-sensor'
+
+  PressureSensorThingGroup:
+    Type: AWS::IoT::ThingGroup
+    Properties:
+      ThingGroupName: !Sub '${ProjectName}-pressure-sensor-devices-${Environment}'
+      ThingGroupProperties:
+        Description: 'Pressure sensor devices'
+        ParentGroupName: !Ref ParentThingGroup
+        AttributePayload:
+          Attributes:
+            DeviceType: 'pressure-sensor'
+            SensorType: 'pressure'
+            Environment: !Ref Environment
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-pressure-sensor-devices-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: DeviceType
+          Value: 'pressure-sensor'
+
+  GatewayThingGroup:
+    Type: AWS::IoT::ThingGroup
+    Properties:
+      ThingGroupName: !Sub '${ProjectName}-gateway-devices-${Environment}'
+      ThingGroupProperties:
+        Description: 'Gateway devices for IoT connectivity'
+        ParentGroupName: !Ref ParentThingGroup
+        AttributePayload:
+          Attributes:
+            DeviceType: 'gateway'
+            DeviceRole: 'gateway'
+            Environment: !Ref Environment
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-gateway-devices-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: DeviceType
+          Value: 'gateway'
+
+  # IoT Policies for Different Device Types
+  TemperatureSensorPolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-TemperatureSensorPolicy-${Environment}'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - iot:Connect
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/${ProjectName}-temperature-sensor-*'
+          - Effect: Allow
+            Action:
+              - iot:Publish
+            Resource:
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/sensors/temperature/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${ProjectName}/sensors/temperature/*'
+          - Effect: Allow
+            Action:
+              - iot:Subscribe
+              - iot:Receive
+            Resource:
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/config/temperature-sensor/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/config/temperature-sensor/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/${ProjectName}/config/temperature-sensor/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${ProjectName}/config/temperature-sensor/*'
+          - Effect: Allow
+            Action:
+              - iot:GetThingShadow
+              - iot:UpdateThingShadow
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:thing/${ProjectName}-temperature-sensor-*'
+
+  HumiditySensorPolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-HumiditySensorPolicy-${Environment}'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - iot:Connect
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/${ProjectName}-humidity-sensor-*'
+          - Effect: Allow
+            Action:
+              - iot:Publish
+            Resource:
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/sensors/humidity/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${ProjectName}/sensors/humidity/*'
+          - Effect: Allow
+            Action:
+              - iot:Subscribe
+              - iot:Receive
+            Resource:
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/config/humidity-sensor/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/config/humidity-sensor/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/${ProjectName}/config/humidity-sensor/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${ProjectName}/config/humidity-sensor/*'
+          - Effect: Allow
+            Action:
+              - iot:GetThingShadow
+              - iot:UpdateThingShadow
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:thing/${ProjectName}-humidity-sensor-*'
+
+  PressureSensorPolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-PressureSensorPolicy-${Environment}'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - iot:Connect
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/${ProjectName}-pressure-sensor-*'
+          - Effect: Allow
+            Action:
+              - iot:Publish
+            Resource:
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/sensors/pressure/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${ProjectName}/sensors/pressure/*'
+          - Effect: Allow
+            Action:
+              - iot:Subscribe
+              - iot:Receive
+            Resource:
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/config/pressure-sensor/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/config/pressure-sensor/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/${ProjectName}/config/pressure-sensor/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${ProjectName}/config/pressure-sensor/*'
+          - Effect: Allow
+            Action:
+              - iot:GetThingShadow
+              - iot:UpdateThingShadow
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:thing/${ProjectName}-pressure-sensor-*'
+
+  GatewayPolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-GatewayPolicy-${Environment}'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - iot:Connect
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/${ProjectName}-gateway-*'
+          - Effect: Allow
+            Action:
+              - iot:Publish
+            Resource:
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/gateway/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/sensors/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${ProjectName}/gateway/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${ProjectName}/sensors/*'
+          - Effect: Allow
+            Action:
+              - iot:Subscribe
+              - iot:Receive
+            Resource:
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/config/gateway/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/config/gateway/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/commands/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/commands/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/${ProjectName}/config/gateway/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${ProjectName}/config/gateway/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/${ProjectName}/commands/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${ProjectName}/commands/*'
+          - Effect: Allow
+            Action:
+              - iot:GetThingShadow
+              - iot:UpdateThingShadow
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:thing/${ProjectName}-gateway-*'
+
+  # Device Provisioning Template
+  DeviceProvisioningTemplate:
+    Type: AWS::IoT::ProvisioningTemplate
+    Condition: RequireDeviceValidationCondition
+    Properties:
+      TemplateName: !Sub '${ProjectName}-device-provisioning-template-${Environment}'
+      Description: !Sub 'Template for automated device provisioning with validation for ${ProjectName} in ${Environment}'
+      Enabled: true
+      ProvisioningRoleArn: !GetAtt IoTProvisioningRole.Arn
+      PreProvisioningHook:
+        TargetArn: !GetAtt PreProvisioningHookFunction.Arn
+        PayloadVersion: '2020-04-01'
+      TemplateBody: !Sub |
+        {
+          "Parameters": {
+            "SerialNumber": {
+              "Type": "String"
+            },
+            "DeviceType": {
+              "Type": "String"
+            },
+            "FirmwareVersion": {
+              "Type": "String"
+            },
+            "Manufacturer": {
+              "Type": "String"
+            },
+            "Location": {
+              "Type": "String"
+            },
+            "AWS::IoT::Certificate::Id": {
+              "Type": "String"
+            },
+            "AWS::IoT::Certificate::Arn": {
+              "Type": "String"
+            }
+          },
+          "Resources": {
+            "thing": {
+              "Type": "AWS::IoT::Thing",
+              "Properties": {
+                "ThingName": {
+                  "Ref": "ThingName"
+                },
+                "AttributePayload": {
+                  "serialNumber": {
+                    "Ref": "SerialNumber"
+                  },
+                  "deviceType": {
+                    "Ref": "DeviceType"
+                  },
+                  "firmwareVersion": {
+                    "Ref": "FirmwareVersion"
+                  },
+                  "manufacturer": {
+                    "Ref": "Manufacturer"
+                  },
+                  "location": {
+                    "Ref": "DeviceLocation"
+                  },
+                  "provisioningTime": {
+                    "Ref": "ProvisioningTime"
+                  },
+                  "environment": {
+                    "Ref": "Environment"
+                  },
+                  "certificateValidityDays": {
+                    "Ref": "CertificateValidityDays"
+                  }
+                }
+              }
+            },
+            "certificate": {
+              "Type": "AWS::IoT::Certificate",
+              "Properties": {
+                "CertificateId": {
+                  "Ref": "AWS::IoT::Certificate::Id"
+                },
+                "Status": "Active"
+              }
+            },
+            "policy": {
+              "Type": "AWS::IoT::Policy",
+              "Properties": {
+                "PolicyName": {
+                  "Fn::Sub": "${ProjectName}-${!DeviceType}Policy-${Environment}"
+                }
+              }
+            },
+            "thingGroup": {
+              "Type": "AWS::IoT::ThingGroup",
+              "Properties": {
+                "ThingGroupName": {
+                  "Ref": "ThingGroupName"
+                }
+              }
+            }
+          }
+        }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-device-provisioning-template-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Claim Certificate Policy for Device Manufacturing
+  ClaimCertificatePolicy:
+    Type: AWS::IoT::Policy
+    Condition: EnableClaimCertificatesCondition
+    Properties:
+      PolicyName: !Sub '${ProjectName}-ClaimCertificatePolicy-${Environment}'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - iot:Connect
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - iot:Publish
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/provisioning-templates/${ProjectName}-device-provisioning-template-${Environment}/provision/*'
+          - Effect: Allow
+            Action:
+              - iot:Subscribe
+              - iot:Receive
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/$aws/provisioning-templates/${ProjectName}-device-provisioning-template-${Environment}/provision/*'
+
+  # SNS Topic for Provisioning Alerts
+  ProvisioningAlertsTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      TopicName: !Sub '${ProjectName}-provisioning-alerts-${Environment}'
+      DisplayName: !Sub '${ProjectName} Device Provisioning Alerts'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-provisioning-alerts-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SNS Subscription for Email Alerts
+  ProvisioningAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      Protocol: email
+      TopicArn: !Ref ProvisioningAlertsTopic
+      Endpoint: !Ref ProvisioningAlertEmail
+
+  # CloudWatch Log Group for IoT Provisioning Events
+  IoTProvisioningLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      LogGroupName: !Sub '/aws/iot/provisioning/${ProjectName}-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-iot-provisioning-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Group Role for IoT Rules
+  IoTLogGroupRole:
+    Type: AWS::IAM::Role
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      RoleName: !Sub '${ProjectName}-iot-log-group-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${IoTProvisioningLogGroup.Arn}:*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-iot-log-group-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IoT Rule for Provisioning Audit Trail
+  ProvisioningAuditRule:
+    Type: AWS::IoT::TopicRule
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      RuleName: !Sub '${ProjectName}ProvisioningAuditRule${Environment}'
+      TopicRulePayload:
+        Sql: !Sub 'SELECT * FROM "$aws/events/provisioning/template/${ProjectName}-device-provisioning-template-${Environment}/+"'
+        Description: !Sub 'Log all provisioning events for ${ProjectName} in ${Environment} environment'
+        Actions:
+          - CloudwatchLogs:
+              LogGroupName: !Ref IoTProvisioningLogGroup
+              RoleArn: !GetAtt IoTLogGroupRole.Arn
+        RuleDisabled: false
+
+  # CloudWatch Alarm for Failed Provisioning Attempts
+  ProvisioningFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      AlarmName: !Sub '${ProjectName}-IoTProvisioningFailures-${Environment}'
+      AlarmDescription: !Sub 'Monitor failed device provisioning attempts for ${ProjectName} in ${Environment}'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PreProvisioningHookFunction
+      AlarmActions:
+        - !Ref ProvisioningAlertsTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-IoTProvisioningFailures-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarm for Device Quota Warnings
+  DeviceQuotaWarningAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      AlarmName: !Sub '${ProjectName}-DeviceQuotaWarning-${Environment}'
+      AlarmDescription: !Sub 'Monitor device quota usage for ${ProjectName} in ${Environment}'
+      MetricName: DeviceValidationAttempts
+      Namespace: !Sub '${ProjectName}/Provisioning'
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: !Sub '${MaxDevicesPerType}'
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref ProvisioningAlertsTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DeviceQuotaWarning-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Dashboard for IoT Provisioning
+  IoTProvisioningDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      DashboardName: !Sub '${ProjectName}-IoT-Provisioning-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "${ProjectName}/Provisioning", "DeviceValidationAttempts", "Status", "VALIDATION_SUCCESS" ],
+                  [ "...", "VALIDATION_ERROR" ],
+                  [ "...", "QUOTA_EXCEEDED" ],
+                  [ "...", "ALREADY_PROVISIONED" ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Device Validation Attempts"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${PreProvisioningHookFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${DeviceRegistryTable}" ],
+                  [ ".", "ConsumedWriteCapacityUnits", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "DynamoDB Capacity Utilization"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  # Core Infrastructure
+  DeviceRegistryTableName:
+    Description: 'Name of the DynamoDB table for device registry'
+    Value: !Ref DeviceRegistryTable
+    Export:
+      Name: !Sub '${ProjectName}-DeviceRegistryTable-${Environment}'
+
+  DeviceRegistryTableArn:
+    Description: 'ARN of the DynamoDB table for device registry'
+    Value: !GetAtt DeviceRegistryTable.Arn
+    Export:
+      Name: !Sub '${ProjectName}-DeviceRegistryTableArn-${Environment}'
+
+  PreProvisioningHookFunctionName:
+    Description: 'Name of the pre-provisioning hook Lambda function'
+    Value: !Ref PreProvisioningHookFunction
+    Export:
+      Name: !Sub '${ProjectName}-PreProvisioningHookFunction-${Environment}'
+
+  PreProvisioningHookFunctionArn:
+    Description: 'ARN of the pre-provisioning hook Lambda function'
+    Value: !GetAtt PreProvisioningHookFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-PreProvisioningHookFunctionArn-${Environment}'
+
+  # IAM Roles
+  IoTProvisioningRoleArn:
+    Description: 'ARN of the IoT provisioning role'
+    Value: !GetAtt IoTProvisioningRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-IoTProvisioningRoleArn-${Environment}'
+
+  # Thing Groups
+  ParentThingGroupName:
+    Description: 'Name of the parent thing group for all devices'
+    Value: !Ref ParentThingGroup
+    Export:
+      Name: !Sub '${ProjectName}-ParentThingGroup-${Environment}'
+
+  ParentThingGroupArn:
+    Description: 'ARN of the parent thing group for all devices'
+    Value: !GetAtt ParentThingGroup.Arn
+    Export:
+      Name: !Sub '${ProjectName}-ParentThingGroupArn-${Environment}'
+
+  # Device Type Thing Groups
+  TemperatureSensorThingGroupName:
+    Description: 'Name of the temperature sensor thing group'
+    Value: !Ref TemperatureSensorThingGroup
+    Export:
+      Name: !Sub '${ProjectName}-TemperatureSensorThingGroup-${Environment}'
+
+  HumiditySensorThingGroupName:
+    Description: 'Name of the humidity sensor thing group'
+    Value: !Ref HumiditySensorThingGroup
+    Export:
+      Name: !Sub '${ProjectName}-HumiditySensorThingGroup-${Environment}'
+
+  PressureSensorThingGroupName:
+    Description: 'Name of the pressure sensor thing group'
+    Value: !Ref PressureSensorThingGroup
+    Export:
+      Name: !Sub '${ProjectName}-PressureSensorThingGroup-${Environment}'
+
+  GatewayThingGroupName:
+    Description: 'Name of the gateway thing group'
+    Value: !Ref GatewayThingGroup
+    Export:
+      Name: !Sub '${ProjectName}-GatewayThingGroup-${Environment}'
+
+  # IoT Policies
+  TemperatureSensorPolicyName:
+    Description: 'Name of the temperature sensor IoT policy'
+    Value: !Ref TemperatureSensorPolicy
+    Export:
+      Name: !Sub '${ProjectName}-TemperatureSensorPolicy-${Environment}'
+
+  HumiditySensorPolicyName:
+    Description: 'Name of the humidity sensor IoT policy'
+    Value: !Ref HumiditySensorPolicy
+    Export:
+      Name: !Sub '${ProjectName}-HumiditySensorPolicy-${Environment}'
+
+  PressureSensorPolicyName:
+    Description: 'Name of the pressure sensor IoT policy'
+    Value: !Ref PressureSensorPolicy
+    Export:
+      Name: !Sub '${ProjectName}-PressureSensorPolicy-${Environment}'
+
+  GatewayPolicyName:
+    Description: 'Name of the gateway IoT policy'
+    Value: !Ref GatewayPolicy
+    Export:
+      Name: !Sub '${ProjectName}-GatewayPolicy-${Environment}'
+
+  # Provisioning Template
+  DeviceProvisioningTemplateName:
+    Description: 'Name of the device provisioning template'
+    Value: !If [RequireDeviceValidationCondition, !Ref DeviceProvisioningTemplate, 'Not Created']
+    Export:
+      Name: !Sub '${ProjectName}-DeviceProvisioningTemplate-${Environment}'
+
+  DeviceProvisioningTemplateArn:
+    Description: 'ARN of the device provisioning template'
+    Value: !If [RequireDeviceValidationCondition, !GetAtt DeviceProvisioningTemplate.TemplateArn, 'Not Created']
+    Export:
+      Name: !Sub '${ProjectName}-DeviceProvisioningTemplateArn-${Environment}'
+
+  # Claim Certificate Policy
+  ClaimCertificatePolicyName:
+    Description: 'Name of the claim certificate policy'
+    Value: !If [EnableClaimCertificatesCondition, !Ref ClaimCertificatePolicy, 'Not Created']
+    Export:
+      Name: !Sub '${ProjectName}-ClaimCertificatePolicy-${Environment}'
+
+  # Monitoring Resources
+  ProvisioningAlertsTopicArn:
+    Description: 'ARN of the SNS topic for provisioning alerts'
+    Value: !If [EnableDetailedMonitoringCondition, !Ref ProvisioningAlertsTopic, 'Not Created']
+    Export:
+      Name: !Sub '${ProjectName}-ProvisioningAlertsTopic-${Environment}'
+
+  IoTProvisioningLogGroupName:
+    Description: 'Name of the CloudWatch log group for IoT provisioning'
+    Value: !If [EnableDetailedMonitoringCondition, !Ref IoTProvisioningLogGroup, 'Not Created']
+    Export:
+      Name: !Sub '${ProjectName}-IoTProvisioningLogGroup-${Environment}'
+
+  IoTProvisioningDashboardURL:
+    Description: 'URL of the CloudWatch dashboard for IoT provisioning'
+    Value: !If 
+      - EnableDetailedMonitoringCondition
+      - !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-IoT-Provisioning-${Environment}'
+      - 'Not Created'
+    Export:
+      Name: !Sub '${ProjectName}-IoTProvisioningDashboardURL-${Environment}'
+
+  # Configuration Values
+  MaxDevicesPerType:
+    Description: 'Maximum number of devices allowed per device type'
+    Value: !Ref MaxDevicesPerType
+    Export:
+      Name: !Sub '${ProjectName}-MaxDevicesPerType-${Environment}'
+
+  CertificateValidityDays:
+    Description: 'Certificate validity period in days'
+    Value: !Ref CertificateValidityDays
+    Export:
+      Name: !Sub '${ProjectName}-CertificateValidityDays-${Environment}'
+
+  # IoT Core Endpoint
+  IoTCoreEndpoint:
+    Description: 'AWS IoT Core endpoint for device connectivity'
+    Value: !Sub '${AWS::AccountId}.iot.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${ProjectName}-IoTCoreEndpoint-${Environment}'
+
+  # Region and Account Information
+  DeploymentRegion:
+    Description: 'AWS region where the infrastructure is deployed'
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub '${ProjectName}-DeploymentRegion-${Environment}'
+
+  DeploymentAccountId:
+    Description: 'AWS account ID where the infrastructure is deployed'
+    Value: !Ref AWS::AccountId
+    Export:
+      Name: !Sub '${ProjectName}-DeploymentAccountId-${Environment}'

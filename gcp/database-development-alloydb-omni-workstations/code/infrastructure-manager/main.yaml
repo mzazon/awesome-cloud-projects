@@ -1,0 +1,475 @@
+# Infrastructure Manager Configuration for Database Development Workflows
+# Recipe: Database Development Workflows with AlloyDB Omni and Cloud Workstations
+# This configuration deploys a complete database development environment using
+# Google Cloud's managed services for secure, scalable development workflows.
+
+# Import required modules
+imports:
+  - path: https://registry.terraform.io/modules/terraform-google-modules/network/google/latest
+    name: vpc
+  - path: https://registry.terraform.io/modules/terraform-google-modules/iam/google/latest
+    name: iam
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID for deployment"
+    
+  region:
+    type: string
+    description: "Google Cloud region for resources"
+    default: "us-central1"
+    
+  zone:
+    type: string
+    description: "Google Cloud zone for compute resources"
+    default: "us-central1-a"
+    
+  cluster_name:
+    type: string
+    description: "Name for Cloud Workstations cluster"
+    default: "workstation-cluster"
+    
+  config_name:
+    type: string
+    description: "Name for workstation configuration"
+    default: "db-dev-config"
+    
+  repo_name:
+    type: string
+    description: "Name for Cloud Source Repository"
+    default: "database-development"
+    
+  workstation_name:
+    type: string
+    description: "Name for individual workstation"
+    default: "db-dev-workstation"
+    
+  machine_type:
+    type: string
+    description: "Machine type for workstations"
+    default: "e2-standard-4"
+    
+  disk_size_gb:
+    type: integer
+    description: "Boot disk size in GB for workstations"
+    default: 100
+    
+  persistent_disk_size_gb:
+    type: integer
+    description: "Persistent disk size in GB for workstations"
+    default: 200
+    
+  environment:
+    type: string
+    description: "Environment label for resources"
+    default: "development"
+
+# Required Google Cloud APIs
+resources:
+  # Enable required APIs for the deployment
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/workstations.googleapis.com
+      
+  - name: enable-compute-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/compute.googleapis.com
+      
+  - name: enable-sourcerepo-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/sourcerepo.googleapis.com
+      
+  - name: enable-cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/cloudbuild.googleapis.com
+      
+  - name: enable-artifactregistry-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/artifactregistry.googleapis.com
+      
+  - name: enable-logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/logging.googleapis.com
+      
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/monitoring.googleapis.com
+
+  # VPC Network for secure development environment
+  - name: db-dev-network
+    type: gcp-types/compute-v1:networks
+    properties:
+      name: db-dev-network
+      description: "Network for database development workstations"
+      autoCreateSubnetworks: false
+      routingConfig:
+        routingMode: REGIONAL
+    metadata:
+      dependsOn:
+        - enable-compute-api
+
+  # Subnet for workstations with appropriate IP range
+  - name: db-dev-subnet
+    type: gcp-types/compute-v1:subnetworks
+    properties:
+      name: db-dev-subnet
+      network: $(ref.db-dev-network.selfLink)
+      ipCidrRange: "10.0.0.0/24"
+      region: ${var.region}
+      description: "Subnet for database development workstations"
+      enableFlowLogs: true
+      logConfig:
+        enable: true
+        aggregationInterval: INTERVAL_5_MIN
+        flowSampling: 0.5
+        metadata: INCLUDE_ALL_METADATA
+    metadata:
+      dependsOn:
+        - db-dev-network
+
+  # Firewall rule for internal communication
+  - name: db-dev-allow-internal
+    type: gcp-types/compute-v1:firewalls
+    properties:
+      name: db-dev-allow-internal
+      network: $(ref.db-dev-network.selfLink)
+      description: "Allow internal communication for database development"
+      allowed:
+        - IPProtocol: tcp
+        - IPProtocol: udp
+        - IPProtocol: icmp
+      sourceRanges:
+        - "10.0.0.0/24"
+      direction: INGRESS
+      priority: 1000
+      targetTags:
+        - db-dev-workstation
+    metadata:
+      dependsOn:
+        - db-dev-network
+
+  # Firewall rule for AlloyDB Omni access (PostgreSQL port)
+  - name: db-dev-allow-postgresql
+    type: gcp-types/compute-v1:firewalls
+    properties:
+      name: db-dev-allow-postgresql
+      network: $(ref.db-dev-network.selfLink)
+      description: "Allow PostgreSQL access for AlloyDB Omni development"
+      allowed:
+        - IPProtocol: tcp
+          ports:
+            - "5432"
+      sourceRanges:
+        - "10.0.0.0/24"
+      direction: INGRESS
+      priority: 1000
+      targetTags:
+        - db-dev-workstation
+    metadata:
+      dependsOn:
+        - db-dev-network
+
+  # Service account for workstations with appropriate permissions
+  - name: workstation-service-account
+    type: gcp-types/iam-v1:serviceAccounts
+    properties:
+      accountId: workstation-sa-${var.cluster_name}
+      displayName: "Cloud Workstations Service Account"
+      description: "Service account for database development workstations"
+      
+  # IAM bindings for workstation service account
+  - name: workstation-sa-binding-storage
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMembers
+    properties:
+      projectId: ${var.project_id}
+      member: serviceAccount:$(ref.workstation-service-account.email)
+      role: roles/storage.objectViewer
+      
+  - name: workstation-sa-binding-sourcerepo
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMembers
+    properties:
+      projectId: ${var.project_id}
+      member: serviceAccount:$(ref.workstation-service-account.email)
+      role: roles/source.reader
+      
+  - name: workstation-sa-binding-artifactregistry
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMembers
+    properties:
+      projectId: ${var.project_id}
+      member: serviceAccount:$(ref.workstation-service-account.email)
+      role: roles/artifactregistry.reader
+      
+  - name: workstation-sa-binding-logging
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMembers
+    properties:
+      projectId: ${var.project_id}
+      member: serviceAccount:$(ref.workstation-service-account.email)
+      role: roles/logging.logWriter
+      
+  - name: workstation-sa-binding-monitoring
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMembers
+    properties:
+      projectId: ${var.project_id}
+      member: serviceAccount:$(ref.workstation-service-account.email)
+      role: roles/monitoring.metricWriter
+
+  # Cloud Workstations cluster for managed development environments
+  - name: workstation-cluster
+    type: gcp-types/workstations-v1:projects.locations.workstationClusters
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      workstationClusterId: ${var.cluster_name}
+      workstationCluster:
+        displayName: "Database Development Workstation Cluster"
+        network: $(ref.db-dev-network.selfLink)
+        subnetwork: $(ref.db-dev-subnet.selfLink)
+        annotations:
+          environment: ${var.environment}
+          purpose: database-development
+        labels:
+          environment: ${var.environment}
+          team: database
+    metadata:
+      dependsOn:
+        - enable-apis
+        - db-dev-subnet
+        - workstation-service-account
+
+  # Workstation configuration with database development tools
+  - name: workstation-config
+    type: gcp-types/workstations-v1:projects.locations.workstationClusters.workstationConfigs
+    properties:
+      parent: $(ref.workstation-cluster.name)
+      workstationConfigId: ${var.config_name}
+      workstationConfig:
+        displayName: "Database Development Environment"
+        machineType: ${var.machine_type}
+        bootDiskSizeGb: ${var.disk_size_gb}
+        container:
+          image: "us-central1-docker.pkg.dev/cloud-workstations-images/predefined/code-oss:latest"
+          env:
+            DEBIAN_FRONTEND: "noninteractive"
+            POSTGRES_CLIENT_VERSION: "15"
+        runAsUser: 1000
+        persistentDirectories:
+          - mountPath: "/home/user"
+            gcePersistentDisk:
+              sizeGb: ${var.persistent_disk_size_gb}
+              diskType: "pd-standard"
+        labels:
+          environment: ${var.environment}
+          purpose: database-development
+        annotations:
+          database-tools: "postgresql-client,docker,git"
+    metadata:
+      dependsOn:
+        - workstation-cluster
+
+  # Individual development workstation
+  - name: development-workstation
+    type: gcp-types/workstations-v1:projects.locations.workstationClusters.workstationConfigs.workstations
+    properties:
+      parent: $(ref.workstation-config.name)
+      workstationId: ${var.workstation_name}
+      workstation:
+        displayName: "Primary Database Development Workstation"
+        labels:
+          developer: primary
+          project: database-development
+        annotations:
+          created-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - workstation-config
+
+  # Cloud Source Repository for database projects
+  - name: database-source-repo
+    type: gcp-types/sourcerepo-v1:projects.repos
+    properties:
+      parent: projects/${var.project_id}
+      repoId: ${var.repo_name}
+      repo:
+        name: projects/${var.project_id}/repos/${var.repo_name}
+        description: "Repository for database development projects using AlloyDB Omni"
+    metadata:
+      dependsOn:
+        - enable-sourcerepo-api
+
+  # Cloud Build trigger for automated database testing
+  - name: database-build-trigger
+    type: gcp-types/cloudbuild-v1:projects.triggers
+    properties:
+      projectId: ${var.project_id}
+      trigger:
+        name: database-testing-trigger
+        description: "Automated database testing on main branch commits"
+        triggerTemplate:
+          projectId: ${var.project_id}
+          repoName: ${var.repo_name}
+          branchName: "^main$"
+        filename: "cloudbuild.yaml"
+        substitutions:
+          _ENVIRONMENT: ${var.environment}
+          _REGION: ${var.region}
+        tags:
+          - database-testing
+          - alloydb-omni
+          - automated
+    metadata:
+      dependsOn:
+        - enable-cloudbuild-api
+        - database-source-repo
+
+  # IAM policy for Cloud Build to access required services
+  - name: cloudbuild-sa-binding-storage
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMembers
+    properties:
+      projectId: ${var.project_id}
+      member: serviceAccount:$(ref.cloudbuild-service-account.email)
+      role: roles/storage.admin
+      
+  - name: cloudbuild-sa-binding-sourcerepo
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMembers
+    properties:
+      projectId: ${var.project_id}
+      member: serviceAccount:$(ref.cloudbuild-service-account.email)
+      role: roles/source.admin
+      
+  - name: cloudbuild-sa-binding-compute
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMembers
+    properties:
+      projectId: ${var.project_id}
+      member: serviceAccount:$(ref.cloudbuild-service-account.email)
+      role: roles/compute.instanceAdmin.v1
+
+  # Service account for Cloud Build operations
+  - name: cloudbuild-service-account
+    type: gcp-types/iam-v1:serviceAccounts
+    properties:
+      accountId: cloudbuild-sa-${var.cluster_name}
+      displayName: "Cloud Build Service Account"
+      description: "Service account for automated database testing builds"
+
+  # Monitoring workspace for development environment observability
+  - name: monitoring-notification-channel
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      parent: projects/${var.project_id}
+      notificationChannel:
+        displayName: "Database Development Alerts"
+        type: "email"
+        labels:
+          email_address: "dev-team@example.com"
+        description: "Notification channel for database development environment alerts"
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+
+  # Log sink for centralized logging of development activities
+  - name: development-log-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      parent: projects/${var.project_id}
+      sinkId: database-development-sink
+      sink:
+        name: projects/${var.project_id}/sinks/database-development-sink
+        description: "Centralized logging for database development workflows"
+        filter: |
+          resource.type="gce_instance" OR
+          resource.type="cloud_workstations_workstation" OR
+          resource.type="build"
+        destination: storage.googleapis.com/database-dev-logs-${var.project_id}
+        uniqueWriterIdentity: true
+    metadata:
+      dependsOn:
+        - enable-logging-api
+
+  # Storage bucket for development logs and artifacts
+  - name: development-logs-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: database-dev-logs-${var.project_id}
+      location: ${var.region}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90
+              matchesStorageClass:
+                - STANDARD
+      labels:
+        environment: ${var.environment}
+        purpose: development-logs
+
+# Output values for reference and integration
+outputs:
+  workstation_cluster_name:
+    description: "Name of the created Cloud Workstations cluster"
+    value: $(ref.workstation-cluster.name)
+    
+  workstation_config_name:
+    description: "Name of the workstation configuration"
+    value: $(ref.workstation-config.name)
+    
+  workstation_name:
+    description: "Name of the created workstation"
+    value: $(ref.development-workstation.name)
+    
+  source_repository_url:
+    description: "URL of the Cloud Source Repository"
+    value: https://source.cloud.google.com/projects/${var.project_id}/repos/${var.repo_name}
+    
+  build_trigger_id:
+    description: "ID of the Cloud Build trigger"
+    value: $(ref.database-build-trigger.id)
+    
+  vpc_network_name:
+    description: "Name of the VPC network"
+    value: $(ref.db-dev-network.name)
+    
+  subnet_name:
+    description: "Name of the subnet"
+    value: $(ref.db-dev-subnet.name)
+    
+  workstation_service_account:
+    description: "Email of the workstation service account"
+    value: $(ref.workstation-service-account.email)
+    
+  logs_bucket_name:
+    description: "Name of the logs storage bucket"
+    value: $(ref.development-logs-bucket.name)
+    
+  workstation_access_command:
+    description: "Command to access the workstation"
+    value: gcloud workstations start ${var.workstation_name} --region=${var.region} --cluster=${var.cluster_name} --config=${var.config_name}
+
+# Metadata for the deployment
+metadata:
+  version: "1.0"
+  description: "Infrastructure Manager configuration for database development workflows with AlloyDB Omni and Cloud Workstations"
+  author: "Google Cloud Infrastructure Manager"
+  recipe-id: "f2a8d6e3"
+  last-updated: "2025-07-12"
+  dependencies:
+    - "Cloud Workstations API"
+    - "Compute Engine API"
+    - "Cloud Source Repositories API"
+    - "Cloud Build API"
+    - "Artifact Registry API"
+    - "Cloud Logging API"
+    - "Cloud Monitoring API"
+  estimated-deployment-time: "15-20 minutes"
+  estimated-monthly-cost: "$50-75 USD (varies by usage)"

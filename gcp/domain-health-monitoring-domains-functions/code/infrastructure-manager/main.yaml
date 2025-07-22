@@ -1,0 +1,568 @@
+# Infrastructure Manager Configuration for Domain Health Monitoring
+# This configuration deploys a complete domain health monitoring solution using:
+# - Cloud Storage for function code and monitoring data
+# - Cloud Functions for serverless domain health checks
+# - Cloud Scheduler for automated monitoring execution
+# - Pub/Sub for reliable alert messaging
+# - Cloud Monitoring for metrics and alerting
+# - IAM roles and service accounts for secure operations
+
+apiVersion: config.terraform.io/v1alpha1
+kind: InfrastructureManager
+metadata:
+  name: domain-health-monitoring
+  labels:
+    environment: production
+    application: domain-monitoring
+    version: "1.0"
+spec:
+  # Input variables for customization
+  variables:
+    # Project configuration
+    project_id:
+      description: "Google Cloud Project ID for domain monitoring infrastructure"
+      type: string
+      default: "domain-monitor-${random_id.project_suffix.hex}"
+    
+    # Regional configuration  
+    region:
+      description: "Google Cloud region for resources"
+      type: string
+      default: "us-central1"
+    
+    # Monitoring configuration
+    monitoring_frequency:
+      description: "Cron schedule for domain health checks (every 6 hours by default)"
+      type: string
+      default: "0 */6 * * *"
+    
+    # Function configuration
+    function_timeout:
+      description: "Cloud Function timeout in seconds"
+      type: number
+      default: 300
+    
+    function_memory:
+      description: "Cloud Function memory allocation in MB"
+      type: number
+      default: 512
+    
+    # Domain list configuration
+    domains_to_monitor:
+      description: "List of domains to monitor for health checks"
+      type: list(string)
+      default: ["example.com", "test-domain.net"]
+    
+    # SSL certificate warning threshold
+    ssl_warning_days:
+      description: "Number of days before SSL expiration to trigger warnings"
+      type: number
+      default: 30
+    
+    # Notification configuration
+    notification_email:
+      description: "Email address for domain health alerts"
+      type: string
+      default: "admin@yourdomain.com"
+
+  # Resource definitions using Terraform providers
+  resources:
+    # Random ID generator for unique resource names
+    random_id:
+      project_suffix:
+        resource_type: random_id
+        byte_length: 4
+    
+    # Google Cloud APIs enablement
+    google_project_service:
+      # Enable Cloud Functions API
+      cloudfunctions_api:
+        resource_type: google_project_service
+        project: "${var.project_id}"
+        service: "cloudfunctions.googleapis.com"
+        disable_on_destroy: false
+      
+      # Enable Cloud Scheduler API
+      cloudscheduler_api:
+        resource_type: google_project_service
+        project: "${var.project_id}"
+        service: "cloudscheduler.googleapis.com"
+        disable_on_destroy: false
+      
+      # Enable Cloud Monitoring API
+      monitoring_api:
+        resource_type: google_project_service
+        project: "${var.project_id}"
+        service: "monitoring.googleapis.com"
+        disable_on_destroy: false
+      
+      # Enable Cloud Domains API
+      domains_api:
+        resource_type: google_project_service
+        project: "${var.project_id}"
+        service: "domains.googleapis.com"
+        disable_on_destroy: false
+      
+      # Enable Cloud Storage API
+      storage_api:
+        resource_type: google_project_service
+        project: "${var.project_id}"
+        service: "storage.googleapis.com"
+        disable_on_destroy: false
+      
+      # Enable Pub/Sub API
+      pubsub_api:
+        resource_type: google_project_service
+        project: "${var.project_id}"
+        service: "pubsub.googleapis.com"
+        disable_on_destroy: false
+
+    # Service Account for Cloud Function execution
+    google_service_account:
+      function_service_account:
+        resource_type: google_service_account
+        account_id: "domain-monitor-function"
+        display_name: "Domain Health Monitoring Function Service Account"
+        description: "Service account for executing domain health monitoring functions"
+        project: "${var.project_id}"
+        depends_on:
+          - google_project_service.cloudfunctions_api
+
+    # IAM binding for Cloud Function service account
+    google_project_iam_member:
+      # Storage Object Admin for function deployment and data storage
+      function_storage_admin:
+        resource_type: google_project_iam_member
+        project: "${var.project_id}"
+        role: "roles/storage.objectAdmin"
+        member: "serviceAccount:${google_service_account.function_service_account.email}"
+      
+      # Monitoring Metric Writer for custom metrics
+      function_monitoring_writer:
+        resource_type: google_project_iam_member
+        project: "${var.project_id}"
+        role: "roles/monitoring.metricWriter"
+        member: "serviceAccount:${google_service_account.function_service_account.email}"
+      
+      # Pub/Sub Publisher for alert notifications
+      function_pubsub_publisher:
+        resource_type: google_project_iam_member
+        project: "${var.project_id}"
+        role: "roles/pubsub.publisher"
+        member: "serviceAccount:${google_service_account.function_service_account.email}"
+      
+      # Cloud Domains Viewer for domain information access
+      function_domains_viewer:
+        resource_type: google_project_iam_member
+        project: "${var.project_id}"
+        role: "roles/domains.viewer"
+        member: "serviceAccount:${google_service_account.function_service_account.email}"
+
+    # Cloud Storage bucket for function source code and monitoring data
+    google_storage_bucket:
+      domain_monitor_bucket:
+        resource_type: google_storage_bucket
+        name: "domain-monitor-storage-${random_id.project_suffix.hex}"
+        location: "${var.region}"
+        project: "${var.project_id}"
+        storage_class: "STANDARD"
+        
+        # Enable versioning for code deployment tracking
+        versioning:
+          enabled: true
+        
+        # Lifecycle management for cost optimization
+        lifecycle_rule:
+          - condition:
+              age: 90
+            action:
+              type: "SetStorageClass"
+              storage_class: "NEARLINE"
+          - condition:
+              age: 365
+            action:
+              type: "Delete"
+        
+        # Security and access controls
+        uniform_bucket_level_access: true
+        
+        depends_on:
+          - google_project_service.storage_api
+
+    # Pub/Sub topic for domain health alerts
+    google_pubsub_topic:
+      domain_alerts_topic:
+        resource_type: google_pubsub_topic
+        name: "domain-alerts-${random_id.project_suffix.hex}"
+        project: "${var.project_id}"
+        
+        # Message retention for reliability
+        message_retention_duration: "86400s" # 24 hours
+        
+        depends_on:
+          - google_project_service.pubsub_api
+
+    # Pub/Sub subscription for alert processing
+    google_pubsub_subscription:
+      domain_alerts_subscription:
+        resource_type: google_pubsub_subscription
+        name: "domain-alerts-sub-${random_id.project_suffix.hex}"
+        topic: "${google_pubsub_topic.domain_alerts_topic.name}"
+        project: "${var.project_id}"
+        
+        # Message acknowledgment and retry configuration
+        ack_deadline_seconds: 20
+        message_retention_duration: "604800s" # 7 days
+        
+        retry_policy:
+          minimum_backoff: "10s"
+          maximum_backoff: "600s"
+        
+        depends_on:
+          - google_pubsub_topic.domain_alerts_topic
+
+    # Cloud Function source code archive
+    data:
+      archive_file:
+        function_source:
+          type: "zip"
+          output_path: "/tmp/domain-monitor-function.zip"
+          source_dir: "${path.module}/function-source"
+
+    # Cloud Storage object for function source code
+    google_storage_bucket_object:
+      function_source_archive:
+        resource_type: google_storage_bucket_object
+        name: "function-source/${random_id.project_suffix.hex}/domain-monitor-function.zip"
+        bucket: "${google_storage_bucket.domain_monitor_bucket.name}"
+        source: "${data.archive_file.function_source.output_path}"
+        
+        depends_on:
+          - google_storage_bucket.domain_monitor_bucket
+
+    # Cloud Function for domain health monitoring
+    google_cloudfunctions_function:
+      domain_health_monitor:
+        resource_type: google_cloudfunctions_function
+        name: "domain-health-monitor-${random_id.project_suffix.hex}"
+        location: "${var.region}"
+        project: "${var.project_id}"
+        runtime: "python39"
+        
+        # Function configuration
+        available_memory_mb: "${var.function_memory}"
+        timeout: "${var.function_timeout}"
+        entry_point: "domain_health_check"
+        service_account_email: "${google_service_account.function_service_account.email}"
+        
+        # Source code configuration
+        source_archive_bucket: "${google_storage_bucket.domain_monitor_bucket.name}"
+        source_archive_object: "${google_storage_bucket_object.function_source_archive.name}"
+        
+        # HTTP trigger configuration
+        trigger:
+          http_trigger: {}
+        
+        # Environment variables for function execution
+        environment_variables:
+          GCP_PROJECT: "${var.project_id}"
+          TOPIC_NAME: "${google_pubsub_topic.domain_alerts_topic.name}"
+          BUCKET_NAME: "${google_storage_bucket.domain_monitor_bucket.name}"
+          DOMAINS_TO_MONITOR: "${join(",", var.domains_to_monitor)}"
+          SSL_WARNING_DAYS: "${var.ssl_warning_days}"
+        
+        depends_on:
+          - google_project_service.cloudfunctions_api
+          - google_storage_bucket_object.function_source_archive
+          - google_service_account.function_service_account
+
+    # Cloud Scheduler job for automated monitoring
+    google_cloud_scheduler_job:
+      domain_monitor_schedule:
+        resource_type: google_cloud_scheduler_job
+        name: "domain-monitor-schedule-${random_id.project_suffix.hex}"
+        region: "${var.region}"
+        project: "${var.project_id}"
+        description: "Automated domain health monitoring execution"
+        schedule: "${var.monitoring_frequency}"
+        time_zone: "UTC"
+        
+        # HTTP target configuration
+        http_target:
+          uri: "${google_cloudfunctions_function.domain_health_monitor.https_trigger_url}"
+          http_method: "GET"
+          
+          # Authentication for secure function invocation
+          oidc_token:
+            service_account_email: "${google_service_account.function_service_account.email}"
+        
+        # Retry configuration for reliability
+        retry_config:
+          retry_count: 3
+          max_retry_duration: "300s"
+          min_backoff_duration: "5s"
+          max_backoff_duration: "60s"
+        
+        depends_on:
+          - google_project_service.cloudscheduler_api
+          - google_cloudfunctions_function.domain_health_monitor
+
+    # Cloud Monitoring notification channel for email alerts
+    google_monitoring_notification_channel:
+      email_notification:
+        resource_type: google_monitoring_notification_channel
+        display_name: "Domain Health Email Notifications"
+        type: "email"
+        project: "${var.project_id}"
+        
+        labels:
+          email_address: "${var.notification_email}"
+        
+        # Channel configuration
+        description: "Email notifications for domain health alerts"
+        enabled: true
+        
+        depends_on:
+          - google_project_service.monitoring_api
+
+    # Cloud Monitoring alert policy for SSL certificate expiration
+    google_monitoring_alert_policy:
+      ssl_certificate_expiration:
+        resource_type: google_monitoring_alert_policy
+        display_name: "Domain SSL Certificate Expiration Alert"
+        project: "${var.project_id}"
+        combiner: "OR"
+        enabled: true
+        
+        # Alert condition configuration
+        conditions:
+          - display_name: "SSL Certificate Expiring Soon"
+            condition_threshold:
+              filter: "metric.type=\"custom.googleapis.com/domain/ssl_valid\" AND resource.type=\"global\""
+              comparison: "COMPARISON_LESS_THAN"
+              threshold_value: 1.0
+              duration: "300s"
+              
+              # Aggregation configuration
+              aggregations:
+                - alignment_period: "300s"
+                  per_series_aligner: "ALIGN_MEAN"
+                  cross_series_reducer: "REDUCE_MEAN"
+                  group_by_fields: ["metric.label.domain"]
+        
+        # Notification configuration
+        notification_channels:
+          - "${google_monitoring_notification_channel.email_notification.name}"
+        
+        # Alert strategy
+        alert_strategy:
+          auto_close: "1800s" # Auto-close after 30 minutes
+        
+        # Documentation for alert handling
+        documentation:
+          content: |
+            This alert triggers when a domain's SSL certificate is approaching expiration.
+            
+            **Immediate Actions:**
+            1. Verify the specific domain(s) affected by checking the alert details
+            2. Review SSL certificate expiration dates using the monitoring dashboard
+            3. Initiate certificate renewal process for affected domains
+            4. Update DNS configurations if necessary
+            
+            **Investigation Steps:**
+            1. Check Cloud Storage bucket for detailed monitoring logs
+            2. Review Cloud Function execution logs for any errors
+            3. Verify domain registration status in Cloud Domains
+            4. Test domain accessibility and SSL configuration manually
+            
+            **Prevention:**
+            - Set up automated certificate renewal where possible
+            - Monitor certificate expiration dates regularly
+            - Maintain updated contact information for domain registrations
+          mime_type: "text/markdown"
+        
+        depends_on:
+          - google_monitoring_notification_channel.email_notification
+
+    # Cloud Monitoring alert policy for DNS resolution failures
+    google_monitoring_alert_policy:
+      dns_resolution_failure:
+        resource_type: google_monitoring_alert_policy
+        display_name: "Domain DNS Resolution Failure Alert"
+        project: "${var.project_id}"
+        combiner: "OR"
+        enabled: true
+        
+        # Alert condition for DNS failures
+        conditions:
+          - display_name: "DNS Resolution Failed"
+            condition_threshold:
+              filter: "metric.type=\"custom.googleapis.com/domain/dns_resolves\" AND resource.type=\"global\""
+              comparison: "COMPARISON_LESS_THAN"
+              threshold_value: 1.0
+              duration: "300s"
+              
+              # Aggregation for DNS monitoring
+              aggregations:
+                - alignment_period: "300s"
+                  per_series_aligner: "ALIGN_MEAN"
+                  cross_series_reducer: "REDUCE_MEAN"
+                  group_by_fields: ["metric.label.domain"]
+        
+        # Notification routing
+        notification_channels:
+          - "${google_monitoring_notification_channel.email_notification.name}"
+        
+        # Auto-resolution configuration
+        alert_strategy:
+          auto_close: "1800s"
+        
+        # Incident response documentation
+        documentation:
+          content: |
+            This alert indicates that DNS resolution has failed for one or more monitored domains.
+            
+            **Immediate Actions:**
+            1. Identify affected domain(s) from alert details
+            2. Test DNS resolution manually using dig or nslookup
+            3. Check domain registrar DNS settings
+            4. Verify DNS propagation status
+            
+            **Common Causes:**
+            - DNS configuration changes not yet propagated
+            - Domain registrar DNS server issues
+            - DNS record misconfiguration
+            - Domain registration expiration
+            
+            **Resolution Steps:**
+            1. Contact domain registrar if DNS servers are unresponsive
+            2. Update DNS records if configuration errors are found
+            3. Wait for DNS propagation (up to 48 hours for full propagation)
+            4. Monitor resolution status using external DNS checking tools
+          mime_type: "text/markdown"
+        
+        depends_on:
+          - google_monitoring_notification_channel.email_notification
+
+  # Output values for integration and monitoring
+  outputs:
+    # Project and resource identifiers
+    project_id:
+      description: "Google Cloud Project ID used for domain monitoring"
+      value: "${var.project_id}"
+    
+    region:
+      description: "Google Cloud region where resources are deployed"
+      value: "${var.region}"
+    
+    # Function and storage information
+    function_name:
+      description: "Name of the deployed Cloud Function"
+      value: "${google_cloudfunctions_function.domain_health_monitor.name}"
+    
+    function_url:
+      description: "HTTPS trigger URL for the domain monitoring function"
+      value: "${google_cloudfunctions_function.domain_health_monitor.https_trigger_url}"
+      sensitive: false
+    
+    storage_bucket_name:
+      description: "Name of the Cloud Storage bucket for monitoring data"
+      value: "${google_storage_bucket.domain_monitor_bucket.name}"
+    
+    # Messaging and alerting configuration
+    pubsub_topic_name:
+      description: "Name of the Pub/Sub topic for domain alerts"
+      value: "${google_pubsub_topic.domain_alerts_topic.name}"
+    
+    pubsub_subscription_name:
+      description: "Name of the Pub/Sub subscription for alert processing"
+      value: "${google_pubsub_subscription.domain_alerts_subscription.name}"
+    
+    # Monitoring and scheduling information
+    scheduler_job_name:
+      description: "Name of the Cloud Scheduler job for automated monitoring"
+      value: "${google_cloud_scheduler_job.domain_monitor_schedule.name}"
+    
+    monitoring_frequency:
+      description: "Cron schedule for automated domain health checks"
+      value: "${var.monitoring_frequency}"
+    
+    # Security and access information
+    service_account_email:
+      description: "Email address of the function service account"
+      value: "${google_service_account.function_service_account.email}"
+    
+    notification_channel_id:
+      description: "ID of the email notification channel for alerts"
+      value: "${google_monitoring_notification_channel.email_notification.name}"
+    
+    # Alert policy information
+    ssl_alert_policy_id:
+      description: "ID of the SSL certificate expiration alert policy"
+      value: "${google_monitoring_alert_policy.ssl_certificate_expiration.name}"
+    
+    dns_alert_policy_id:
+      description: "ID of the DNS resolution failure alert policy"
+      value: "${google_monitoring_alert_policy.dns_resolution_failure.name}"
+    
+    # Deployment metadata
+    domains_monitored:
+      description: "List of domains being monitored for health checks"
+      value: "${var.domains_to_monitor}"
+    
+    ssl_warning_threshold:
+      description: "Number of days before SSL expiration that triggers warnings"
+      value: "${var.ssl_warning_days}"
+
+# Configuration metadata and deployment information
+metadata:
+  annotations:
+    # Deployment tracking
+    config.terraform.io/sensitive-variables: "notification_email"
+    config.terraform.io/version: "1.0.0"
+    config.terraform.io/description: "Complete domain health monitoring infrastructure using Cloud Functions, Cloud Monitoring, and Cloud Scheduler"
+    
+    # Cost optimization notes
+    config.terraform.io/cost-optimization: |
+      This configuration is optimized for cost efficiency:
+      - Uses Cloud Functions for serverless execution (pay-per-invocation)
+      - Implements Cloud Storage lifecycle policies for data retention
+      - Configures appropriate monitoring frequency to balance coverage and cost
+      - Uses standard storage class with automatic transitions to nearline/coldline
+    
+    # Security and compliance
+    config.terraform.io/security-notes: |
+      Security features implemented:
+      - Service account with least privilege access
+      - Uniform bucket-level access for Cloud Storage
+      - Secure HTTPS triggers with OIDC authentication
+      - Encrypted storage and transmission of monitoring data
+      - IAM role separation for different service components
+    
+    # Maintenance and updates
+    config.terraform.io/maintenance: |
+      Regular maintenance required:
+      - Update function runtime and dependencies periodically
+      - Review and adjust monitoring frequency based on requirements
+      - Update domain list as organizational needs change
+      - Review and adjust SSL warning thresholds
+      - Monitor alert policy effectiveness and adjust as needed
+
+# Provider requirements and version constraints
+spec:
+  provider_requirements:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 5.0"
+    
+    random:
+      source: "hashicorp/random"
+      version: "~> 3.1"
+    
+    archive:
+      source: "hashicorp/archive"
+      version: "~> 2.2"

@@ -1,0 +1,420 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Complete user authentication solution using Amazon Cognito User Pools with MFA, social identity providers, and advanced security features'
+
+Parameters:
+  UserPoolName:
+    Type: String
+    Default: 'ecommerce-users'
+    Description: 'Name for the Cognito User Pool'
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: '^[a-zA-Z0-9_-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, hyphens, and underscores'
+
+  ClientName:
+    Type: String
+    Default: 'ecommerce-web-client'
+    Description: 'Name for the User Pool Client'
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: '^[a-zA-Z0-9_-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, hyphens, and underscores'
+
+  DomainPrefix:
+    Type: String
+    Description: 'Domain prefix for Cognito Hosted UI (must be globally unique)'
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+
+  CallbackUrls:
+    Type: CommaDelimitedList
+    Default: 'https://localhost:3000/callback,https://example.com/callback'
+    Description: 'Comma-separated list of callback URLs for OAuth flows'
+
+  LogoutUrls:
+    Type: CommaDelimitedList
+    Default: 'https://localhost:3000/logout,https://example.com/logout'
+    Description: 'Comma-separated list of logout URLs for OAuth flows'
+
+  SESFromAddress:
+    Type: String
+    Default: 'noreply@example.com'
+    Description: 'SES verified email address for sending auth emails'
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  SESReplyToAddress:
+    Type: String
+    Default: 'support@example.com'
+    Description: 'Reply-to email address for auth emails'
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  EnableAdvancedSecurity:
+    Type: String
+    Default: 'ENFORCED'
+    AllowedValues: ['OFF', 'AUDIT', 'ENFORCED']
+    Description: 'Advanced security mode for threat protection'
+
+  MFAConfiguration:
+    Type: String
+    Default: 'OPTIONAL'
+    AllowedValues: ['OFF', 'ON', 'OPTIONAL']
+    Description: 'Multi-factor authentication configuration'
+
+  GoogleClientId:
+    Type: String
+    Default: ''
+    Description: 'Google OAuth client ID (optional)'
+    NoEcho: false
+
+  GoogleClientSecret:
+    Type: String
+    Default: ''
+    Description: 'Google OAuth client secret (optional)'
+    NoEcho: true
+
+Conditions:
+  EnableGoogleAuth: !And
+    - !Not [!Equals [!Ref GoogleClientId, '']]
+    - !Not [!Equals [!Ref GoogleClientSecret, '']]
+
+  EnableAdvancedSecurityFeatures: !Not [!Equals [!Ref EnableAdvancedSecurity, 'OFF']]
+
+Resources:
+  # IAM Role for Cognito to send SMS messages via SNS
+  CognitoSNSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-cognito-sns-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cognito-idp.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSNSFullAccess
+      Tags:
+        - Key: Purpose
+          Value: 'Cognito SMS delivery via SNS'
+
+  # Cognito User Pool with comprehensive security configuration
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Ref UserPoolName
+      # Authentication and verification settings
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      AliasAttributes:
+        - email
+        - preferred_username
+      
+      # Password policy configuration
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 1
+      
+      # Multi-factor authentication settings
+      MfaConfiguration: !Ref MFAConfiguration
+      EnabledMfas:
+        - SOFTWARE_TOKEN_MFA
+        - SMS_MFA
+      
+      # Device tracking configuration
+      DeviceConfiguration:
+        ChallengeRequiredOnNewDevice: true
+        DeviceOnlyRememberedOnUserPrompt: false
+      
+      # User creation and management settings
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+        UnusedAccountValidityDays: 7
+        InviteMessageAction: SUPPRESS
+      
+      # Email verification configuration
+      VerificationMessageTemplate:
+        DefaultEmailOption: CONFIRM_WITH_LINK
+        EmailSubject: 'Welcome to ECommerce - Verify Your Email'
+        EmailMessage: 'Please click the link to verify your email: {##Verify Email##}'
+        EmailSubjectByLink: 'Welcome to ECommerce - Verify Your Email'
+        EmailMessageByLink: 'Please click the link to verify your email: {##Verify Email##}'
+      
+      # User attribute update settings
+      UserAttributeUpdateSettings:
+        AttributesRequireVerificationBeforeUpdate:
+          - email
+      
+      # Email configuration for SES integration
+      EmailConfiguration:
+        EmailSendingAccount: DEVELOPER
+        SourceArn: !Sub 'arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/${SESFromAddress}'
+        ReplyToEmailAddress: !Ref SESReplyToAddress
+      
+      # SMS configuration for SNS integration
+      SmsConfiguration:
+        SnsCallerArn: !GetAtt CognitoSNSRole.Arn
+        ExternalId: !Sub 'cognito-${AWS::StackName}'
+      
+      # User pool add-ons for advanced security
+      UserPoolAddOns:
+        AdvancedSecurityMode: !Ref EnableAdvancedSecurity
+      
+      # Schema configuration with custom attributes
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: name
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+        - Name: given_name
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+        - Name: family_name
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+        - Name: phone_number
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+        - Name: customer_tier
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+          StringAttributeConstraints:
+            MinLength: '1'
+            MaxLength: '20'
+        - Name: last_login
+          AttributeDataType: DateTime
+          Required: false
+          Mutable: true
+        - Name: subscription_status
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+          StringAttributeConstraints:
+            MinLength: '1'
+            MaxLength: '50'
+      
+      UserPoolTags:
+        Environment: !Ref 'AWS::StackName'
+        Purpose: 'User Authentication and Management'
+
+  # User Pool Client configuration for OAuth flows
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Ref ClientName
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true
+      
+      # Token validity settings (in minutes for access/id tokens, days for refresh)
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+      
+      # Supported authentication flows
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+      
+      # OAuth 2.0 configuration
+      SupportedIdentityProviders:
+        - COGNITO
+        - !If [EnableGoogleAuth, 'Google', !Ref 'AWS::NoValue']
+      
+      CallbackURLs: !Ref CallbackUrls
+      LogoutURLs: !Ref LogoutUrls
+      
+      AllowedOAuthFlows:
+        - code
+        - implicit
+      
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+      
+      AllowedOAuthFlowsUserPoolClient: true
+      
+      # Security settings
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AuthSessionValidity: 3
+      
+      # Attribute permissions
+      ReadAttributes:
+        - email
+        - email_verified
+        - name
+        - family_name
+        - given_name
+        - phone_number
+        - 'custom:customer_tier'
+        - 'custom:last_login'
+        - 'custom:subscription_status'
+      
+      WriteAttributes:
+        - email
+        - name
+        - family_name
+        - given_name
+        - phone_number
+        - 'custom:customer_tier'
+        - 'custom:subscription_status'
+
+  # Hosted UI Domain for authentication pages
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref DomainPrefix
+      UserPoolId: !Ref UserPool
+
+  # Google Identity Provider (conditional)
+  GoogleIdentityProvider:
+    Type: AWS::Cognito::UserPoolIdentityProvider
+    Condition: EnableGoogleAuth
+    Properties:
+      UserPoolId: !Ref UserPool
+      ProviderName: Google
+      ProviderType: Google
+      ProviderDetails:
+        client_id: !Ref GoogleClientId
+        client_secret: !Ref GoogleClientSecret
+        authorize_scopes: 'openid email profile'
+      AttributeMapping:
+        email: email
+        given_name: given_name
+        family_name: family_name
+        name: name
+
+  # User Groups for role-based access control
+  AdministratorsGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Administrators
+      Description: 'Administrator users with full access'
+      Precedence: 1
+      UserPoolId: !Ref UserPool
+
+  CustomersGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Customers
+      Description: 'Regular customer users'
+      Precedence: 10
+      UserPoolId: !Ref UserPool
+
+  PremiumCustomersGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: PremiumCustomers
+      Description: 'Premium customer users with enhanced features'
+      Precedence: 5
+      UserPoolId: !Ref UserPool
+
+Outputs:
+  UserPoolId:
+    Description: 'ID of the Cognito User Pool'
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolId'
+
+  UserPoolClientId:
+    Description: 'ID of the User Pool Client'
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolClientId'
+
+  UserPoolArn:
+    Description: 'ARN of the Cognito User Pool'
+    Value: !GetAtt UserPool.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolArn'
+
+  HostedUIUrl:
+    Description: 'URL for the Cognito Hosted UI'
+    Value: !Sub 'https://${DomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-HostedUIUrl'
+
+  LoginUrl:
+    Description: 'Complete login URL for OAuth flow'
+    Value: !Sub 
+      - 'https://${DomainPrefix}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${ClientId}&response_type=code&scope=openid+email+profile&redirect_uri=${CallbackUrl}'
+      - ClientId: !Ref UserPoolClient
+        CallbackUrl: !Select [0, !Ref CallbackUrls]
+    Export:
+      Name: !Sub '${AWS::StackName}-LoginUrl'
+
+  LogoutUrl:
+    Description: 'Complete logout URL for OAuth flow'
+    Value: !Sub 
+      - 'https://${DomainPrefix}.auth.${AWS::Region}.amazoncognito.com/logout?client_id=${ClientId}&logout_uri=${LogoutUri}'
+      - ClientId: !Ref UserPoolClient
+        LogoutUri: !Select [0, !Ref LogoutUrls]
+    Export:
+      Name: !Sub '${AWS::StackName}-LogoutUrl'
+
+  CognitoSNSRoleArn:
+    Description: 'ARN of the IAM role for Cognito SMS delivery'
+    Value: !GetAtt CognitoSNSRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CognitoSNSRoleArn'
+
+  UserPoolProviderName:
+    Description: 'Provider name for use with Cognito Identity Pool'
+    Value: !Sub 'cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolProviderName'
+
+  AdminGroupName:
+    Description: 'Name of the Administrators group'
+    Value: !Ref AdministratorsGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AdminGroupName'
+
+  CustomerGroupName:
+    Description: 'Name of the Customers group'
+    Value: !Ref CustomersGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomerGroupName'
+
+  PremiumCustomerGroupName:
+    Description: 'Name of the Premium Customers group'
+    Value: !Ref PremiumCustomersGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-PremiumCustomerGroupName'
+
+  ConfigurationJson:
+    Description: 'JSON configuration for application integration'
+    Value: !Sub |
+      {
+        "UserPoolId": "${UserPool}",
+        "ClientId": "${UserPoolClient}",
+        "Region": "${AWS::Region}",
+        "HostedUIUrl": "https://${DomainPrefix}.auth.${AWS::Region}.amazoncognito.com",
+        "LoginUrl": "https://${DomainPrefix}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${UserPoolClient}&response_type=code&scope=openid+email+profile&redirect_uri=${CallbackUrls}",
+        "LogoutUrl": "https://${DomainPrefix}.auth.${AWS::Region}.amazoncognito.com/logout?client_id=${UserPoolClient}&logout_uri=${LogoutUrls}"
+      }

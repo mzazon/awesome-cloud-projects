@@ -1,0 +1,914 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Cost-Aware Resource Lifecycle Management with EventBridge Scheduler and MemoryDB for Redis - Automated cost optimization through intelligent scaling and lifecycle management'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "MemoryDB Configuration"
+        Parameters:
+          - ClusterName
+          - NodeType
+          - NumShards
+          - NumReplicasPerShard
+          - MaintenanceWindow
+      - Label:
+          default: "Cost Optimization Settings"
+        Parameters:
+          - CostThreshold
+          - BusinessHoursStart
+          - BusinessHoursEnd
+          - WeeklyBudgetLimit
+      - Label:
+          default: "Security & Networking"
+        Parameters:
+          - VpcId
+          - SubnetIds
+          - SecurityGroupIds
+          - NotificationEmail
+      - Label:
+          default: "Resource Naming"
+        Parameters:
+          - Environment
+          - ProjectName
+    ParameterLabels:
+      ClusterName:
+        default: "MemoryDB Cluster Name"
+      NodeType:
+        default: "Initial Node Type"
+      CostThreshold:
+        default: "Cost Threshold for Optimization"
+      NotificationEmail:
+        default: "Email for Budget Alerts"
+
+# Input Parameters with comprehensive validation
+Parameters:
+  # MemoryDB Configuration
+  ClusterName:
+    Type: String
+    Description: Name for the MemoryDB cluster (3-40 characters, alphanumeric and hyphens only)
+    MinLength: 3
+    MaxLength: 40
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$'
+    ConstraintDescription: Must be 3-40 characters, start with a letter, and contain only alphanumeric characters and hyphens
+    Default: cost-aware-memorydb-cluster
+
+  NodeType:
+    Type: String
+    Description: Initial MemoryDB node type for cost optimization testing
+    Default: db.t4g.small
+    AllowedValues:
+      - db.t4g.small
+      - db.t4g.medium
+      - db.r6g.large
+      - db.r6g.xlarge
+      - db.r6g.2xlarge
+      - db.r6g.4xlarge
+    ConstraintDescription: Must be a valid MemoryDB node type
+
+  NumShards:
+    Type: Number
+    Description: Number of shards for the MemoryDB cluster
+    Default: 1
+    MinValue: 1
+    MaxValue: 500
+    ConstraintDescription: Must be between 1 and 500
+
+  NumReplicasPerShard:
+    Type: Number
+    Description: Number of replica nodes per shard
+    Default: 0
+    MinValue: 0
+    MaxValue: 5
+    ConstraintDescription: Must be between 0 and 5
+
+  MaintenanceWindow:
+    Type: String
+    Description: Weekly maintenance window for MemoryDB cluster
+    Default: sun:03:00-sun:04:00
+    AllowedPattern: '^(sun|mon|tue|wed|thu|fri|sat):[0-9]{2}:[0-9]{2}-(sun|mon|tue|wed|thu|fri|sat):[0-9]{2}:[0-9]{2}$'
+    ConstraintDescription: Must be in format 'ddd:hh:mm-ddd:hh:mm' (e.g., sun:03:00-sun:04:00)
+
+  # Cost Optimization Settings
+  CostThreshold:
+    Type: Number
+    Description: Weekly cost threshold in USD for triggering optimization actions
+    Default: 100
+    MinValue: 10
+    MaxValue: 10000
+    ConstraintDescription: Must be between $10 and $10,000
+
+  BusinessHoursStart:
+    Type: Number
+    Description: Business hours start time (24-hour format, 0-23)
+    Default: 8
+    MinValue: 0
+    MaxValue: 23
+    ConstraintDescription: Must be between 0 and 23 (24-hour format)
+
+  BusinessHoursEnd:
+    Type: Number
+    Description: Business hours end time (24-hour format, 0-23)
+    Default: 18
+    MinValue: 0
+    MaxValue: 23
+    ConstraintDescription: Must be between 0 and 23 (24-hour format)
+
+  WeeklyBudgetLimit:
+    Type: Number
+    Description: Weekly budget limit in USD for MemoryDB costs
+    Default: 200
+    MinValue: 50
+    MaxValue: 50000
+    ConstraintDescription: Must be between $50 and $50,000
+
+  # Security & Networking
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for MemoryDB cluster deployment
+    ConstraintDescription: Must be a valid VPC ID
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of subnet IDs for MemoryDB cluster (minimum 2 subnets in different AZs)
+    ConstraintDescription: Must select at least 2 subnets in different Availability Zones
+
+  SecurityGroupIds:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+    Description: List of security group IDs for MemoryDB cluster access
+    ConstraintDescription: Must select at least one security group
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for budget alerts and cost notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+    Default: admin@example.com
+
+  # Resource Naming
+  Environment:
+    Type: String
+    Description: Environment name for resource tagging and naming
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    ConstraintDescription: Must be one of dev, test, staging, or prod
+
+  ProjectName:
+    Type: String
+    Description: Project name for resource tagging
+    Default: cost-optimization
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$'
+    ConstraintDescription: Must be 3-20 characters, start with a letter, and contain only alphanumeric characters and hyphens
+
+# Conditional Logic for Resource Creation
+Conditions:
+  # Create production-specific resources
+  IsProduction: !Equals [!Ref Environment, prod]
+  
+  # Enable enhanced monitoring for production
+  EnableEnhancedMonitoring: !Or [!Equals [!Ref Environment, prod], !Equals [!Ref Environment, staging]]
+  
+  # Create multiple replicas for production
+  CreateReplicas: !And [!Condition IsProduction, !Not [!Equals [!Ref NumReplicasPerShard, 0]]]
+
+# Resources
+Resources:
+  # MemoryDB Subnet Group for cluster networking
+  MemoryDBSubnetGroup:
+    Type: AWS::MemoryDB::SubnetGroup
+    Properties:
+      SubnetGroupName: !Sub '${ClusterName}-subnet-group'
+      Description: !Sub 'Subnet group for ${ClusterName} MemoryDB cluster cost optimization'
+      SubnetIds: !Ref SubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-subnet-group'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: cost-optimization
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # MemoryDB Parameter Group for performance tuning
+  MemoryDBParameterGroup:
+    Type: AWS::MemoryDB::ParameterGroup
+    Properties:
+      ParameterGroupName: !Sub '${ClusterName}-params'
+      Description: !Sub 'Parameter group for ${ClusterName} with cost optimization settings'
+      Family: memorydb_redis7
+      Parameters:
+        maxmemory-policy: allkeys-lru
+        timeout: 300
+        tcp-keepalive: 60
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-params'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: cost-optimization
+
+  # MemoryDB Cluster with cost optimization configuration
+  MemoryDBCluster:
+    Type: AWS::MemoryDB::Cluster
+    Properties:
+      ClusterName: !Ref ClusterName
+      Description: !Sub 'Cost-aware MemoryDB cluster for ${ProjectName} in ${Environment} environment'
+      NodeType: !Ref NodeType
+      NumShards: !Ref NumShards
+      NumReplicasPerShard: !Ref NumReplicasPerShard
+      SubnetGroupName: !Ref MemoryDBSubnetGroup
+      SecurityGroupIds: !Ref SecurityGroupIds
+      ParameterGroupName: !Ref MemoryDBParameterGroup
+      MaintenanceWindow: !Ref MaintenanceWindow
+      SnapshotRetentionLimit: !If [IsProduction, 7, 1]
+      SnapshotWindow: '02:00-03:00'
+      SnsTopicArn: !Ref CostOptimizationTopic
+      SnsTopicStatus: active
+      TLSEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Ref ClusterName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: cost-optimization
+        - Key: CostCenter
+          Value: !Sub '${ProjectName}-${Environment}'
+        - Key: AutoScaling
+          Value: enabled
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # SNS Topic for cost optimization notifications
+  CostOptimizationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ClusterName}-cost-optimization-alerts'
+      DisplayName: !Sub 'MemoryDB Cost Optimization Alerts for ${ClusterName}'
+      KmsMasterKeyId: alias/aws/sns
+
+  # SNS Topic Subscription for email notifications
+  CostOptimizationTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref CostOptimizationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # IAM Role for Lambda Cost Optimizer Function
+  LambdaCostOptimizerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-cost-optimizer-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: MemoryDBCostOptimizationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - memorydb:DescribeClusters
+                  - memorydb:ModifyCluster
+                  - memorydb:DescribeSubnetGroups
+                  - memorydb:DescribeParameterGroups
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ce:GetCostAndUsage
+                  - ce:GetUsageReport
+                  - ce:GetDimensionValues
+                  - budgets:ViewBudget
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:GetMetricStatistics
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - scheduler:GetSchedule
+                  - scheduler:UpdateSchedule
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref CostOptimizationTopic
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ClusterName}-cost-optimizer:*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-cost-optimizer-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: cost-optimization
+
+  # Lambda Function for Cost Optimization Logic
+  CostOptimizerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ClusterName}-cost-optimizer'
+      Description: !Sub 'Intelligent cost optimization for MemoryDB cluster ${ClusterName}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaCostOptimizerRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          CLUSTER_NAME: !Ref ClusterName
+          COST_THRESHOLD: !Ref CostThreshold
+          SNS_TOPIC_ARN: !Ref CostOptimizationTopic
+          LOG_LEVEL: INFO
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import datetime
+          import logging
+          import os
+          from typing import Dict, Any
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+
+          memorydb = boto3.client('memorydb')
+          ce = boto3.client('ce')
+          cloudwatch = boto3.client('cloudwatch')
+          sns = boto3.client('sns')
+
+          def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
+              """
+              Intelligent cost-aware MemoryDB cluster management.
+              Analyzes cost patterns and adjusts cluster configuration based on thresholds.
+              """
+              
+              cluster_name = event.get('cluster_name', os.environ.get('CLUSTER_NAME'))
+              action = event.get('action', 'analyze')
+              cost_threshold = float(event.get('cost_threshold', os.environ.get('COST_THRESHOLD', 100)))
+              
+              if not cluster_name:
+                  return {
+                      'statusCode': 400,
+                      'body': {'error': 'cluster_name is required'}
+                  }
+              
+              try:
+                  # Get current cluster status
+                  cluster_response = memorydb.describe_clusters(ClusterName=cluster_name)
+                  if not cluster_response['Clusters']:
+                      return {
+                          'statusCode': 404,
+                          'body': {'error': f'Cluster {cluster_name} not found'}
+                      }
+                      
+                  cluster = cluster_response['Clusters'][0]
+                  current_node_type = cluster['NodeType']
+                  current_shards = cluster['NumberOfShards']
+                  cluster_status = cluster['Status']
+                  
+                  # Only proceed if cluster is available
+                  if cluster_status != 'available':
+                      logger.warning(f"Cluster {cluster_name} is not available, status: {cluster_status}")
+                      return {
+                          'statusCode': 200,
+                          'body': {'message': f'Cluster not available for modification, status: {cluster_status}'}
+                      }
+                  
+                  # Analyze recent cost trends
+                  cost_data = get_cost_analysis()
+                  memorydb_cost = cost_data['total_cost']
+                  
+                  # Determine scaling action based on cost analysis
+                  scaling_recommendation = analyze_scaling_needs(
+                      memorydb_cost, cost_threshold, current_node_type, action
+                  )
+                  
+                  # Execute scaling if recommended and cluster is available
+                  if scaling_recommendation['action'] != 'none' and cluster_status == 'available':
+                      modify_result = modify_cluster(cluster_name, scaling_recommendation)
+                      scaling_recommendation['execution_result'] = modify_result
+                  
+                  # Send metrics to CloudWatch
+                  send_cloudwatch_metrics(cluster_name, memorydb_cost, scaling_recommendation)
+                  
+                  # Send SNS notification for significant actions
+                  if scaling_recommendation['action'] != 'none':
+                      send_notification(cluster_name, scaling_recommendation, memorydb_cost)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': {
+                          'cluster_name': cluster_name,
+                          'current_cost': memorydb_cost,
+                          'current_node_type': current_node_type,
+                          'recommendation': scaling_recommendation,
+                          'timestamp': datetime.datetime.now().isoformat()
+                      }
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in cost optimization: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': {'error': str(e)}
+                  }
+
+          def get_cost_analysis() -> Dict[str, float]:
+              """Retrieve and analyze recent MemoryDB costs."""
+              try:
+                  end_date = datetime.datetime.now()
+                  start_date = end_date - datetime.timedelta(days=7)
+                  
+                  cost_response = ce.get_cost_and_usage(
+                      TimePeriod={
+                          'Start': start_date.strftime('%Y-%m-%d'),
+                          'End': end_date.strftime('%Y-%m-%d')
+                      },
+                      Granularity='DAILY',
+                      Metrics=['BlendedCost'],
+                      GroupBy=[
+                          {'Type': 'DIMENSION', 'Key': 'SERVICE'},
+                      ]
+                  )
+                  
+                  # Calculate MemoryDB costs
+                  memorydb_cost = 0.0
+                  for result_by_time in cost_response['ResultsByTime']:
+                      for group in result_by_time['Groups']:
+                          if 'MemoryDB' in group['Keys'][0] or 'ElastiCache' in group['Keys'][0]:
+                              memorydb_cost += float(group['Metrics']['BlendedCost']['Amount'])
+                  
+                  return {'total_cost': memorydb_cost}
+                  
+              except Exception as e:
+                  logger.warning(f"Could not retrieve cost data: {str(e)}")
+                  return {'total_cost': 0.0}
+
+          def analyze_scaling_needs(cost: float, threshold: float, node_type: str, action: str) -> Dict[str, Any]:
+              """Analyze cost patterns and recommend scaling actions."""
+              
+              if action == 'scale_down' and cost > threshold:
+                  # Business hours ended, scale down for cost savings
+                  if 'large' in node_type:
+                      return {
+                          'action': 'modify_node_type',
+                          'target_node_type': node_type.replace('large', 'small'),
+                          'reason': 'Off-peak cost optimization',
+                          'estimated_savings': '30-40%'
+                      }
+                  elif 'medium' in node_type:
+                      return {
+                          'action': 'modify_node_type',
+                          'target_node_type': node_type.replace('medium', 'small'),
+                          'reason': 'Off-peak cost optimization',
+                          'estimated_savings': '20-30%'
+                      }
+              elif action == 'scale_up':
+                  # Business hours starting, scale up for performance
+                  if 'small' in node_type:
+                      return {
+                          'action': 'modify_node_type',
+                          'target_node_type': node_type.replace('small', 'medium'),
+                          'reason': 'Business hours performance optimization',
+                          'estimated_impact': 'Improved performance for business workloads'
+                      }
+              
+              return {'action': 'none', 'reason': 'No scaling needed based on current conditions'}
+
+          def modify_cluster(cluster_name: str, recommendation: Dict[str, Any]) -> Dict[str, str]:
+              """Execute cluster modifications based on recommendations."""
+              
+              try:
+                  if recommendation['action'] == 'modify_node_type':
+                      response = memorydb.modify_cluster(
+                          ClusterName=cluster_name,
+                          NodeType=recommendation['target_node_type']
+                      )
+                      
+                      logger.info(f"Initiated cluster modification: {cluster_name} -> {recommendation['target_node_type']}")
+                      return {
+                          'status': 'initiated',
+                          'message': f"Cluster modification started to {recommendation['target_node_type']}"
+                      }
+                      
+              except Exception as e:
+                  logger.error(f"Failed to modify cluster {cluster_name}: {str(e)}")
+                  return {
+                      'status': 'failed',
+                      'message': f"Cluster modification failed: {str(e)}"
+                  }
+
+          def send_cloudwatch_metrics(cluster_name: str, cost: float, recommendation: Dict[str, Any]) -> None:
+              """Send cost optimization metrics to CloudWatch."""
+              
+              try:
+                  cloudwatch.put_metric_data(
+                      Namespace='MemoryDB/CostOptimization',
+                      MetricData=[
+                          {
+                              'MetricName': 'WeeklyCost',
+                              'Value': cost,
+                              'Unit': 'None',
+                              'Dimensions': [
+                                  {'Name': 'ClusterName', 'Value': cluster_name}
+                              ]
+                          },
+                          {
+                              'MetricName': 'OptimizationAction',
+                              'Value': 1 if recommendation['action'] != 'none' else 0,
+                              'Unit': 'Count',
+                              'Dimensions': [
+                                  {'Name': 'ClusterName', 'Value': cluster_name}
+                              ]
+                          }
+                      ]
+                  )
+              except Exception as e:
+                  logger.warning(f"Failed to send CloudWatch metrics: {str(e)}")
+
+          def send_notification(cluster_name: str, recommendation: Dict[str, Any], cost: float) -> None:
+              """Send SNS notification for cost optimization actions."""
+              
+              try:
+                  message = f"""
+          MemoryDB Cost Optimization Action Taken
+
+          Cluster: {cluster_name}
+          Action: {recommendation['action']}
+          Reason: {recommendation.get('reason', 'N/A')}
+          Current Weekly Cost: ${cost:.2f}
+          Target Configuration: {recommendation.get('target_node_type', 'N/A')}
+          Estimated Impact: {recommendation.get('estimated_savings', recommendation.get('estimated_impact', 'N/A'))}
+
+          Timestamp: {datetime.datetime.now().isoformat()}
+                  """
+                  
+                  sns.publish(
+                      TopicArn=os.environ.get('SNS_TOPIC_ARN'),
+                      Subject=f'MemoryDB Cost Optimization: {cluster_name}',
+                      Message=message
+                  )
+              except Exception as e:
+                  logger.warning(f"Failed to send SNS notification: {str(e)}")
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-cost-optimizer'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: cost-optimization
+
+  # IAM Role for EventBridge Scheduler
+  EventBridgeSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-eventbridge-scheduler-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt CostOptimizerLambdaFunction.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-eventbridge-scheduler-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: cost-optimization
+
+  # EventBridge Scheduler Group
+  SchedulerGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: !Sub '${ClusterName}-cost-optimization-schedules'
+      Description: !Sub 'Cost optimization schedules for ${ClusterName} MemoryDB lifecycle management'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-cost-optimization-schedules'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: cost-optimization
+
+  # Business Hours Start Schedule (Scale Up)
+  BusinessHoursStartSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${ClusterName}-business-hours-start'
+      GroupName: !Ref SchedulerGroup
+      Description: !Sub 'Scale up ${ClusterName} for business hours performance optimization'
+      ScheduleExpression: !Sub 'cron(0 ${BusinessHoursStart} ? * MON-FRI *)'
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !GetAtt CostOptimizerLambdaFunction.Arn
+        RoleArn: !GetAtt EventBridgeSchedulerRole.Arn
+        Input: !Sub |
+          {
+            "cluster_name": "${ClusterName}",
+            "action": "scale_up",
+            "cost_threshold": ${CostThreshold}
+          }
+
+  # Business Hours End Schedule (Scale Down)
+  BusinessHoursEndSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${ClusterName}-business-hours-end'
+      GroupName: !Ref SchedulerGroup
+      Description: !Sub 'Scale down ${ClusterName} for off-hours cost optimization'
+      ScheduleExpression: !Sub 'cron(0 ${BusinessHoursEnd} ? * MON-FRI *)'
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !GetAtt CostOptimizerLambdaFunction.Arn
+        RoleArn: !GetAtt EventBridgeSchedulerRole.Arn
+        Input: !Sub |
+          {
+            "cluster_name": "${ClusterName}",
+            "action": "scale_down",
+            "cost_threshold": ${CostThreshold}
+          }
+
+  # Weekly Cost Analysis Schedule
+  WeeklyCostAnalysisSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${ClusterName}-weekly-cost-analysis'
+      GroupName: !Ref SchedulerGroup
+      Description: !Sub 'Weekly cost analysis and optimization review for ${ClusterName}'
+      ScheduleExpression: 'cron(0 9 ? * MON *)'
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !GetAtt CostOptimizerLambdaFunction.Arn
+        RoleArn: !GetAtt EventBridgeSchedulerRole.Arn
+        Input: !Sub |
+          {
+            "cluster_name": "${ClusterName}",
+            "action": "analyze",
+            "cost_threshold": ${WeeklyBudgetLimit}
+          }
+
+  # AWS Budget for MemoryDB Cost Monitoring
+  MemoryDBBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub '${ClusterName}-cost-budget'
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref WeeklyBudgetLimit
+          Unit: USD
+        CostFilters:
+          Service:
+            - Amazon MemoryDB for Redis
+        TimePeriod:
+          Start: '2025-07-01'
+          End: '2025-12-31'
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref NotificationEmail
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 90
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref NotificationEmail
+
+  # CloudWatch Dashboard for Cost Optimization Monitoring
+  CostOptimizationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ClusterName}-cost-optimization-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["MemoryDB/CostOptimization", "WeeklyCost", "ClusterName", "${ClusterName}"],
+                  [".", "OptimizationAction", ".", "."]
+                ],
+                "period": 86400,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "MemoryDB Cost Optimization Metrics",
+                "yAxis": {
+                  "left": {"min": 0}
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/MemoryDB", "CPUUtilization", "ClusterName", "${ClusterName}"],
+                  [".", "NetworkBytesIn", ".", "."],
+                  [".", "NetworkBytesOut", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "MemoryDB Performance Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 6, "width": 24, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${ClusterName}-cost-optimizer"],
+                  [".", "Errors", ".", "."],
+                  [".", "Invocations", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Cost Optimization Lambda Metrics"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms for Cost and Performance Monitoring
+  WeeklyCostHighAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ClusterName}-weekly-cost-high'
+      AlarmDescription: !Sub 'Alert when ${ClusterName} weekly costs exceed threshold'
+      MetricName: WeeklyCost
+      Namespace: MemoryDB/CostOptimization
+      Statistic: Average
+      Period: 604800  # 1 week in seconds
+      Threshold: !Ref WeeklyBudgetLimit
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 1
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ClusterName
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref CostOptimizationTopic
+
+  # Lambda Function Error Alarm
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ClusterName}-optimizer-lambda-errors'
+      AlarmDescription: !Sub 'Alert when cost optimization Lambda function for ${ClusterName} has errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 2
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CostOptimizerLambdaFunction
+      AlarmActions:
+        - !Ref CostOptimizationTopic
+
+# Outputs providing key information for verification and integration
+Outputs:
+  # MemoryDB Cluster Information
+  MemoryDBClusterName:
+    Description: Name of the created MemoryDB cluster
+    Value: !Ref MemoryDBCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-MemoryDBClusterName'
+
+  MemoryDBClusterEndpoint:
+    Description: Configuration endpoint for the MemoryDB cluster
+    Value: !GetAtt MemoryDBCluster.ClusterEndpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-MemoryDBClusterEndpoint'
+
+  MemoryDBClusterPort:
+    Description: Port number for the MemoryDB cluster
+    Value: !GetAtt MemoryDBCluster.ClusterEndpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-MemoryDBClusterPort'
+
+  # Lambda Function Information
+  CostOptimizerLambdaFunctionName:
+    Description: Name of the cost optimizer Lambda function
+    Value: !Ref CostOptimizerLambdaFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-CostOptimizerLambdaFunction'
+
+  CostOptimizerLambdaFunctionArn:
+    Description: ARN of the cost optimizer Lambda function
+    Value: !GetAtt CostOptimizerLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CostOptimizerLambdaFunctionArn'
+
+  # EventBridge Scheduler Information
+  SchedulerGroupName:
+    Description: Name of the EventBridge Scheduler group
+    Value: !Ref SchedulerGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SchedulerGroupName'
+
+  # Monitoring and Notifications
+  SNSTopicArn:
+    Description: ARN of the SNS topic for cost optimization notifications
+    Value: !Ref CostOptimizationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  CloudWatchDashboardURL:
+    Description: URL to the CloudWatch dashboard for cost optimization monitoring
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ClusterName}-cost-optimization-dashboard'
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchDashboardURL'
+
+  # Budget Information
+  BudgetName:
+    Description: Name of the AWS Budget for cost monitoring
+    Value: !Sub '${ClusterName}-cost-budget'
+    Export:
+      Name: !Sub '${AWS::StackName}-BudgetName'
+
+  # Cost Optimization Settings
+  CostThreshold:
+    Description: Configured cost threshold for optimization triggers
+    Value: !Ref CostThreshold
+    Export:
+      Name: !Sub '${AWS::StackName}-CostThreshold'
+
+  BusinessHours:
+    Description: Configured business hours for automated scaling
+    Value: !Sub '${BusinessHoursStart}:00 - ${BusinessHoursEnd}:00'
+    Export:
+      Name: !Sub '${AWS::StackName}-BusinessHours'
+
+  # Testing and Validation Commands
+  TestLambdaCommand:
+    Description: AWS CLI command to test the cost optimizer Lambda function
+    Value: !Sub 'aws lambda invoke --function-name ${CostOptimizerLambdaFunction} --payload ''{"cluster_name":"${ClusterName}","action":"analyze","cost_threshold":${CostThreshold}}'' /tmp/lambda-response.json && cat /tmp/lambda-response.json'
+
+  ViewSchedulesCommand:
+    Description: AWS CLI command to view configured schedules
+    Value: !Sub 'aws scheduler list-schedules --group-name ${SchedulerGroup} --query ''Schedules[*].[Name,State,ScheduleExpression]'' --output table'

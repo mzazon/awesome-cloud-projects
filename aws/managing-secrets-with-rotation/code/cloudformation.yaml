@@ -1,0 +1,800 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Secrets Manager implementation with automatic rotation, KMS encryption, and Lambda function for credential management'
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+
+Parameters:
+  # Environment Configuration
+  Environment:
+    Type: String
+    Default: 'demo'
+    AllowedValues: ['dev', 'staging', 'prod', 'demo']
+    Description: 'Environment name for resource tagging and naming'
+  
+  ApplicationName:
+    Type: String
+    Default: 'myapp'
+    MinLength: 2
+    MaxLength: 20
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    Description: 'Application name for resource identification (alphanumeric and hyphens only)'
+  
+  # Database Configuration
+  DatabaseEngine:
+    Type: String
+    Default: 'mysql'
+    AllowedValues: ['mysql', 'postgres', 'oracle', 'sqlserver']
+    Description: 'Database engine type for connection configuration'
+  
+  DatabaseHost:
+    Type: String
+    Default: 'demo-database.cluster-abc123.us-east-1.rds.amazonaws.com'
+    Description: 'Database hostname or endpoint'
+  
+  DatabasePort:
+    Type: Number
+    Default: 3306
+    MinValue: 1
+    MaxValue: 65535
+    Description: 'Database port number'
+  
+  DatabaseName:
+    Type: String
+    Default: 'myapp'
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]*$'
+    Description: 'Database name for connection'
+  
+  DatabaseUsername:
+    Type: String
+    Default: 'admin'
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]*$'
+    Description: 'Database username for connection'
+  
+  # Rotation Configuration
+  RotationSchedule:
+    Type: String
+    Default: 'rate(7 days)'
+    AllowedValues: 
+      - 'rate(1 day)'
+      - 'rate(7 days)'
+      - 'rate(14 days)'
+      - 'rate(30 days)'
+    Description: 'Automatic rotation schedule expression'
+  
+  # Security Configuration
+  EnableCrossAccountAccess:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable cross-account access to secrets'
+  
+  TrustedAccountIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: 'List of AWS account IDs to grant cross-account access (comma-separated)'
+  
+  # Monitoring Configuration
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable detailed CloudWatch monitoring and alerting'
+  
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for rotation failure notifications (optional)'
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+
+Conditions:
+  # Cross-account access conditions
+  EnableCrossAccountAccessCondition: !Equals [!Ref EnableCrossAccountAccess, 'true']
+  HasTrustedAccounts: !Not [!Equals [!Join ['', !Ref TrustedAccountIds], '']]
+  
+  # Monitoring conditions
+  EnableDetailedMonitoringCondition: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  
+  # Environment-specific conditions
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+
+Resources:
+  # ------------------------------------------------------------------------------
+  # KMS Key for Secrets Encryption
+  # ------------------------------------------------------------------------------
+  
+  SecretsManagerKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'KMS key for encrypting Secrets Manager secrets - ${ApplicationName}-${Environment}'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # Root access for key management
+          - Sid: 'Enable IAM User Permissions'
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          
+          # Secrets Manager service access
+          - Sid: 'Allow Secrets Manager Service'
+            Effect: Allow
+            Principal:
+              Service: secretsmanager.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:DescribeKey'
+              - 'kms:Encrypt'
+              - 'kms:GenerateDataKey*'
+              - 'kms:ReEncrypt*'
+            Resource: '*'
+          
+          # Lambda rotation function access
+          - Sid: 'Allow Lambda Rotation Function'
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt LambdaExecutionRole.Arn
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:DescribeKey'
+              - 'kms:Encrypt'
+              - 'kms:GenerateDataKey*'
+              - 'kms:ReEncrypt*'
+            Resource: '*'
+          
+          # Cross-account access (conditional)
+          - !If
+            - HasTrustedAccounts
+            - Sid: 'Allow Cross-Account Access'
+              Effect: Allow
+              Principal:
+                AWS: !Split
+                  - ','
+                  - !Sub
+                    - 'arn:aws:iam::${inner}:root'
+                    - inner: !Join
+                      - ':root,arn:aws:iam::'
+                      - !Ref TrustedAccountIds
+              Action:
+                - 'kms:Decrypt'
+                - 'kms:DescribeKey'
+              Resource: '*'
+            - !Ref AWS::NoValue
+      
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyUsage: ENCRYPT_DECRYPT
+      MultiRegion: !If [IsProduction, true, false]
+      PendingWindowInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-secrets-manager-key-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Purpose
+          Value: 'Secrets Manager Encryption'
+  
+  # KMS Key Alias for easier reference
+  SecretsManagerKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ApplicationName}-secrets-manager-key-${Environment}'
+      TargetKeyId: !Ref SecretsManagerKMSKey
+  
+  # ------------------------------------------------------------------------------
+  # Lambda Execution Role and Policies
+  # ------------------------------------------------------------------------------
+  
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'SecretsManagerRotationRole-${ApplicationName}-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      
+      Policies:
+        # Secrets Manager permissions
+        - PolicyName: SecretsManagerRotationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                  - 'secretsmanager:DescribeSecret'
+                  - 'secretsmanager:PutSecretValue'
+                  - 'secretsmanager:UpdateSecretVersionStage'
+                  - 'secretsmanager:GetRandomPassword'
+                  - 'secretsmanager:ListSecretVersionIds'
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*'
+              
+              # KMS permissions for encryption/decryption
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:DescribeKey'
+                  - 'kms:Encrypt'
+                  - 'kms:GenerateDataKey*'
+                  - 'kms:ReEncrypt*'
+                Resource: !GetAtt SecretsManagerKMSKey.Arn
+              
+              # VPC permissions (if rotation function needs VPC access)
+              - Effect: Allow
+                Action:
+                  - 'ec2:CreateNetworkInterface'
+                  - 'ec2:DescribeNetworkInterfaces'
+                  - 'ec2:DeleteNetworkInterface'
+                  - 'ec2:AttachNetworkInterface'
+                  - 'ec2:DetachNetworkInterface'
+                Resource: '*'
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-rotation-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Purpose
+          Value: 'Secrets Manager Rotation'
+  
+  # ------------------------------------------------------------------------------
+  # Lambda Function for Secret Rotation
+  # ------------------------------------------------------------------------------
+  
+  RotationLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ApplicationName}-secret-rotation-${Environment}'
+      Description: !Sub 'Lambda function for rotating Secrets Manager secrets - ${ApplicationName}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      ReservedConcurrencyLimit: 2
+      
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          APPLICATION_NAME: !Ref ApplicationName
+          KMS_KEY_ID: !Ref SecretsManagerKMSKey
+      
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Lambda function to handle secret rotation
+              """
+              secretsmanager = boto3.client('secretsmanager')
+              
+              secret_arn = event['SecretId']
+              token = event['ClientRequestToken']
+              step = event['Step']
+              
+              logger.info(f"Rotation step: {step} for secret: {secret_arn}")
+              
+              try:
+                  if step == "createSecret":
+                      create_secret(secretsmanager, secret_arn, token)
+                  elif step == "setSecret":
+                      set_secret(secretsmanager, secret_arn, token)
+                  elif step == "testSecret":
+                      test_secret(secretsmanager, secret_arn, token)
+                  elif step == "finishSecret":
+                      finish_secret(secretsmanager, secret_arn, token)
+                  else:
+                      logger.error(f"Invalid step parameter: {step}")
+                      raise ValueError(f"Invalid step parameter: {step}")
+                  
+                  return {"statusCode": 200, "body": f"Rotation step {step} completed successfully"}
+              
+              except Exception as e:
+                  logger.error(f"Rotation step {step} failed: {str(e)}")
+                  raise
+          
+          def create_secret(secretsmanager, secret_arn, token):
+              """Create a new secret version"""
+              try:
+                  # Check if AWSPENDING version already exists
+                  try:
+                      secretsmanager.get_secret_value(
+                          SecretId=secret_arn,
+                          VersionId=token,
+                          VersionStage="AWSPENDING"
+                      )
+                      logger.info("createSecret: AWSPENDING version already exists")
+                      return
+                  except secretsmanager.exceptions.ResourceNotFoundException:
+                      pass
+                  
+                  # Get current secret
+                  current_secret = secretsmanager.get_secret_value(
+                      SecretId=secret_arn,
+                      VersionStage="AWSCURRENT"
+                  )
+                  
+                  # Parse current secret
+                  current_data = json.loads(current_secret['SecretString'])
+                  
+                  # Generate new password
+                  new_password = secretsmanager.get_random_password(
+                      PasswordLength=20,
+                      ExcludeCharacters='"@/\\',
+                      RequireEachIncludedType=True
+                  )['RandomPassword']
+                  
+                  # Update password in secret data
+                  current_data['password'] = new_password
+                  
+                  # Create new secret version
+                  secretsmanager.put_secret_value(
+                      SecretId=secret_arn,
+                      ClientRequestToken=token,
+                      SecretString=json.dumps(current_data),
+                      VersionStages=['AWSPENDING']
+                  )
+                  
+                  logger.info("createSecret: Successfully created new secret version")
+                  
+              except Exception as e:
+                  logger.error(f"createSecret: Error creating secret: {str(e)}")
+                  raise
+          
+          def set_secret(secretsmanager, secret_arn, token):
+              """Set the secret in the service"""
+              logger.info("setSecret: In a real implementation, this would update the database user password")
+              # In a real implementation, you would connect to the database
+              # and update the user's password here
+              
+              # For demonstration, we'll just log the action
+              try:
+                  secret = secretsmanager.get_secret_value(
+                      SecretId=secret_arn,
+                      VersionId=token,
+                      VersionStage="AWSPENDING"
+                  )
+                  
+                  secret_data = json.loads(secret['SecretString'])
+                  logger.info(f"setSecret: Would update password for user {secret_data.get('username', 'unknown')}")
+                  
+              except Exception as e:
+                  logger.error(f"setSecret: Error in set_secret: {str(e)}")
+                  raise
+          
+          def test_secret(secretsmanager, secret_arn, token):
+              """Test the secret"""
+              logger.info("testSecret: In a real implementation, this would test database connectivity")
+              # In a real implementation, you would test the database connection
+              # with the new credentials here
+              
+              try:
+                  secret = secretsmanager.get_secret_value(
+                      SecretId=secret_arn,
+                      VersionId=token,
+                      VersionStage="AWSPENDING"
+                  )
+                  
+                  secret_data = json.loads(secret['SecretString'])
+                  logger.info(f"testSecret: Would test connection to {secret_data.get('host', 'unknown')}")
+                  
+              except Exception as e:
+                  logger.error(f"testSecret: Error in test_secret: {str(e)}")
+                  raise
+          
+          def finish_secret(secretsmanager, secret_arn, token):
+              """Finish the rotation"""
+              try:
+                  # Get current version ID
+                  current_version_id = get_current_version_id(secretsmanager, secret_arn)
+                  
+                  if current_version_id:
+                      # Move AWSCURRENT to AWSPENDING and vice versa
+                      secretsmanager.update_secret_version_stage(
+                          SecretId=secret_arn,
+                          VersionStage="AWSCURRENT",
+                          MoveToVersionId=token,
+                          RemoveFromVersionId=current_version_id
+                      )
+                      
+                      logger.info("finishSecret: Successfully completed rotation")
+                  else:
+                      logger.error("finishSecret: Could not find current version ID")
+                      raise ValueError("Could not find current version ID")
+                      
+              except Exception as e:
+                  logger.error(f"finishSecret: Error finishing rotation: {str(e)}")
+                  raise
+          
+          def get_current_version_id(secretsmanager, secret_arn):
+              """Get the current version ID"""
+              try:
+                  versions = secretsmanager.list_secret_version_ids(SecretId=secret_arn)
+                  
+                  for version in versions['Versions']:
+                      if 'AWSCURRENT' in version['VersionStages']:
+                          return version['VersionId']
+                  
+                  return None
+                  
+              except Exception as e:
+                  logger.error(f"Error getting current version ID: {str(e)}")
+                  return None
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-rotation-function-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Purpose
+          Value: 'Secrets Manager Rotation'
+  
+  # Lambda permission for Secrets Manager to invoke
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RotationLambdaFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: secretsmanager.amazonaws.com
+      SourceArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*'
+  
+  # ------------------------------------------------------------------------------
+  # Secrets Manager Secret
+  # ------------------------------------------------------------------------------
+  
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ApplicationName}-db-credentials-${Environment}'
+      Description: !Sub 'Database credentials for ${ApplicationName} application - ${Environment}'
+      
+      KmsKeyId: !Ref SecretsManagerKMSKey
+      
+      # Generate initial secret with random password
+      GenerateSecretString:
+        SecretStringTemplate: !Sub |
+          {
+            "engine": "${DatabaseEngine}",
+            "host": "${DatabaseHost}",
+            "username": "${DatabaseUsername}",
+            "dbname": "${DatabaseName}",
+            "port": ${DatabasePort}
+          }
+        GenerateStringKey: 'password'
+        PasswordLength: 20
+        ExcludeCharacters: '"@/\\'
+        RequireEachIncludedType: true
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-db-credentials-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Purpose
+          Value: 'Database Credentials'
+  
+  # ------------------------------------------------------------------------------
+  # Secret Rotation Configuration
+  # ------------------------------------------------------------------------------
+  
+  SecretRotationSchedule:
+    Type: AWS::SecretsManager::RotationSchedule
+    Properties:
+      SecretId: !Ref DatabaseSecret
+      RotationLambdaArn: !GetAtt RotationLambdaFunction.Arn
+      RotationRules:
+        ScheduleExpression: !Ref RotationSchedule
+        RotationImmediatelyOnUpdate: false
+    DependsOn: LambdaInvokePermission
+  
+  # ------------------------------------------------------------------------------
+  # Resource-based Policy for Cross-Account Access
+  # ------------------------------------------------------------------------------
+  
+  SecretResourcePolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Condition: HasTrustedAccounts
+    Properties:
+      SecretId: !Ref DatabaseSecret
+      BlockPublicPolicy: true
+      ResourcePolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: 'AllowCrossAccountAccess'
+            Effect: Allow
+            Principal:
+              AWS: !Split
+                - ','
+                - !Sub
+                  - 'arn:aws:iam::${inner}:root'
+                  - inner: !Join
+                    - ':root,arn:aws:iam::'
+                    - !Ref TrustedAccountIds
+            Action: 'secretsmanager:GetSecretValue'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'secretsmanager:ResourceTag/Environment': !Ref Environment
+  
+  # ------------------------------------------------------------------------------
+  # CloudWatch Monitoring Resources
+  # ------------------------------------------------------------------------------
+  
+  # CloudWatch Dashboard
+  SecretsManagerDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      DashboardName: !Sub 'SecretsManager-${ApplicationName}-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/SecretsManager", "RotationSucceeded", "SecretName", "${DatabaseSecret}"],
+                  ["AWS/SecretsManager", "RotationFailed", "SecretName", "${DatabaseSecret}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Secret Rotation Status - ${ApplicationName}",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${RotationLambdaFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${RotationLambdaFunction}"],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${RotationLambdaFunction}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics - ${ApplicationName}",
+                "view": "timeSeries"
+              }
+            }
+          ]
+        }
+  
+  # SNS Topic for Notifications
+  RotationNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasNotificationEmail
+    Properties:
+      TopicName: !Sub '${ApplicationName}-rotation-notifications-${Environment}'
+      DisplayName: !Sub 'Secrets Manager Rotation Notifications - ${ApplicationName}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-rotation-notifications-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+  
+  # SNS Subscription for Email Notifications
+  RotationNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      Protocol: email
+      TopicArn: !Ref RotationNotificationTopic
+      Endpoint: !Ref NotificationEmail
+  
+  # CloudWatch Alarm for Rotation Failures
+  RotationFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      AlarmName: !Sub 'SecretsManager-RotationFailure-${ApplicationName}-${Environment}'
+      AlarmDescription: !Sub 'Alert when secret rotation fails for ${ApplicationName}'
+      MetricName: RotationFailed
+      Namespace: AWS/SecretsManager
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: SecretName
+          Value: !Ref DatabaseSecret
+      AlarmActions:
+        - !If
+          - HasNotificationEmail
+          - !Ref RotationNotificationTopic
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-rotation-failure-alarm-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+  
+  # CloudWatch Alarm for Lambda Function Errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      AlarmName: !Sub 'Lambda-RotationErrors-${ApplicationName}-${Environment}'
+      AlarmDescription: !Sub 'Alert when Lambda rotation function encounters errors - ${ApplicationName}'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RotationLambdaFunction
+      AlarmActions:
+        - !If
+          - HasNotificationEmail
+          - !Ref RotationNotificationTopic
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-lambda-error-alarm-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+
+Outputs:
+  # Secret Information
+  SecretArn:
+    Description: 'ARN of the created secret'
+    Value: !Ref DatabaseSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-SecretArn'
+  
+  SecretName:
+    Description: 'Name of the created secret'
+    Value: !Ref DatabaseSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-SecretName'
+  
+  # KMS Key Information
+  KMSKeyId:
+    Description: 'KMS Key ID used for encrypting secrets'
+    Value: !Ref SecretsManagerKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyId'
+  
+  KMSKeyArn:
+    Description: 'KMS Key ARN used for encrypting secrets'
+    Value: !GetAtt SecretsManagerKMSKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyArn'
+  
+  KMSKeyAlias:
+    Description: 'KMS Key Alias for easier reference'
+    Value: !Ref SecretsManagerKMSKeyAlias
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyAlias'
+  
+  # Lambda Function Information
+  LambdaFunctionArn:
+    Description: 'ARN of the rotation Lambda function'
+    Value: !GetAtt RotationLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+  
+  LambdaFunctionName:
+    Description: 'Name of the rotation Lambda function'
+    Value: !Ref RotationLambdaFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+  
+  # IAM Role Information
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+  
+  # Rotation Information
+  RotationSchedule:
+    Description: 'Rotation schedule expression'
+    Value: !Ref RotationSchedule
+    Export:
+      Name: !Sub '${AWS::StackName}-RotationSchedule'
+  
+  # Monitoring Information
+  DashboardURL:
+    Condition: EnableDetailedMonitoringCondition
+    Description: 'URL to the CloudWatch dashboard'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${SecretsManagerDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+  
+  NotificationTopicArn:
+    Condition: HasNotificationEmail
+    Description: 'ARN of the SNS topic for notifications'
+    Value: !Ref RotationNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopicArn'
+  
+  # Application Integration Information
+  ApplicationIntegrationExample:
+    Description: 'Example code for retrieving the secret in applications'
+    Value: !Sub |
+      import boto3
+      import json
+      
+      def get_secret():
+          client = boto3.client('secretsmanager', region_name='${AWS::Region}')
+          response = client.get_secret_value(SecretId='${DatabaseSecret}')
+          return json.loads(response['SecretString'])
+      
+      # Usage: credentials = get_secret()
+  
+  # Security Information
+  CrossAccountAccessEnabled:
+    Description: 'Whether cross-account access is enabled'
+    Value: !Ref EnableCrossAccountAccess
+    Export:
+      Name: !Sub '${AWS::StackName}-CrossAccountAccessEnabled'
+  
+  # Cost Information
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for this secrets management solution'
+    Value: !Sub |
+      Base cost: $0.40/month per secret
+      API calls: $0.05 per 10,000 calls
+      KMS key: $1.00/month
+      Lambda: ~$0.00 (within free tier for typical rotation frequency)
+      Total estimated: $1.40-$2.00/month

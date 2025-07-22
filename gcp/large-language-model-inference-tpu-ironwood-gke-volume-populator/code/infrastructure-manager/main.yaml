@@ -1,0 +1,685 @@
+# Infrastructure Manager Configuration for Large Language Model Inference with TPU Ironwood and GKE Volume Populator
+# This configuration deploys a complete LLM inference pipeline leveraging:
+# - TPU Ironwood accelerators for high-performance inference
+# - GKE cluster with workload identity and autoscaling
+# - Parallelstore for high-bandwidth model storage
+# - Volume Populator for automated model transfer from Cloud Storage
+# - Comprehensive monitoring and observability
+
+apiVersion: config.cloud.google.com/v1
+kind: ResourceList
+metadata:
+  name: tpu-ironwood-llm-inference
+  description: "Complete infrastructure for LLM inference with TPU Ironwood and Volume Populator"
+  labels:
+    recipe: "large-language-model-inference"
+    version: "1.0"
+    component: "ai-infrastructure"
+
+resources:
+  # =============================================================================
+  # PROJECT CONFIGURATION AND API ENABLEMENT
+  # =============================================================================
+  
+  # Enable required Google Cloud APIs for the inference pipeline
+  - name: enable-container-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project-id.projectId)/services/container.googleapis.com
+      parent: projects/$(ref.project-id.projectId)
+    metadata:
+      dependsOn:
+        - project-id
+
+  - name: enable-aiplatform-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project-id.projectId)/services/aiplatform.googleapis.com
+      parent: projects/$(ref.project-id.projectId)
+    metadata:
+      dependsOn:
+        - project-id
+
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project-id.projectId)/services/storage.googleapis.com
+      parent: projects/$(ref.project-id.projectId)
+    metadata:
+      dependsOn:
+        - project-id
+
+  - name: enable-parallelstore-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project-id.projectId)/services/parallelstore.googleapis.com
+      parent: projects/$(ref.project-id.projectId)
+    metadata:
+      dependsOn:
+        - project-id
+
+  - name: enable-compute-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project-id.projectId)/services/compute.googleapis.com
+      parent: projects/$(ref.project-id.projectId)
+    metadata:
+      dependsOn:
+        - project-id
+
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project-id.projectId)/services/monitoring.googleapis.com
+      parent: projects/$(ref.project-id.projectId)
+    metadata:
+      dependsOn:
+        - project-id
+
+  - name: enable-logging-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project-id.projectId)/services/logging.googleapis.com
+      parent: projects/$(ref.project-id.projectId)
+    metadata:
+      dependsOn:
+        - project-id
+
+  # Project reference for consistent project ID usage
+  - name: project-id
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: ${PROJECT_ID}
+
+  # =============================================================================
+  # CLOUD STORAGE FOR MODEL ARTIFACTS
+  # =============================================================================
+
+  # Primary storage bucket for LLM model artifacts with optimized configuration
+  - name: model-storage-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: llm-models-$(ref.random-suffix.value)
+      project: $(ref.project-id.projectId)
+      location: ${REGION}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90  # Auto-delete versions older than 90 days
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30  # Move to Nearline after 30 days
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      publicAccessPrevention: enforced
+      labels:
+        purpose: "llm-model-storage"
+        environment: "production"
+        cost-center: "ai-inference"
+    metadata:
+      dependsOn:
+        - enable-storage-api
+        - random-suffix
+
+  # Random suffix generator for unique resource naming
+  - name: random-suffix
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/$(ref.project-id.projectId)/locations/${REGION}
+      function:
+        name: random-suffix-generator
+        description: "Generates random suffix for resource naming"
+        sourceArchiveUrl: "gs://$(ref.model-storage-bucket.name)/functions/random-suffix.zip"
+        entryPoint: "generateSuffix"
+        runtime: "python39"
+        timeout: "60s"
+        availableMemoryMb: 128
+    metadata:
+      dependsOn:
+        - model-storage-bucket
+
+  # =============================================================================
+  # IAM SERVICE ACCOUNTS AND WORKLOAD IDENTITY
+  # =============================================================================
+
+  # Dedicated service account for TPU inference workloads with least privilege
+  - name: tpu-inference-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: tpu-inference-sa-$(ref.random-suffix.value)
+      serviceAccount:
+        displayName: "TPU Inference Service Account"
+        description: "Service account for LLM inference with TPU Ironwood"
+        project: $(ref.project-id.projectId)
+    metadata:
+      dependsOn:
+        - project-id
+        - random-suffix
+
+  # IAM binding for TPU administration
+  - name: tpu-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: $(ref.project-id.projectId)
+      policy:
+        bindings:
+          - role: roles/tpu.admin
+            members:
+              - serviceAccount:$(ref.tpu-inference-service-account.email)
+    metadata:
+      dependsOn:
+        - tpu-inference-service-account
+
+  # IAM binding for storage object viewing
+  - name: storage-viewer-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: $(ref.project-id.projectId)
+      policy:
+        bindings:
+          - role: roles/storage.objectViewer
+            members:
+              - serviceAccount:$(ref.tpu-inference-service-account.email)
+    metadata:
+      dependsOn:
+        - tpu-inference-service-account
+
+  # IAM binding for Parallelstore administration
+  - name: parallelstore-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: $(ref.project-id.projectId)
+      policy:
+        bindings:
+          - role: roles/parallelstore.admin
+            members:
+              - serviceAccount:$(ref.tpu-inference-service-account.email)
+    metadata:
+      dependsOn:
+        - tpu-inference-service-account
+
+  # Workload Identity binding for secure pod authentication
+  - name: workload-identity-binding
+    type: gcp-types/iam-v1:projects.serviceAccounts.setIamPolicy
+    properties:
+      resource: $(ref.tpu-inference-service-account.name)
+      policy:
+        bindings:
+          - role: roles/iam.workloadIdentityUser
+            members:
+              - serviceAccount:$(ref.project-id.projectId).svc.id.goog[default/tpu-inference-pod]
+    metadata:
+      dependsOn:
+        - tpu-inference-service-account
+
+  # =============================================================================
+  # PARALLELSTORE HIGH-PERFORMANCE STORAGE
+  # =============================================================================
+
+  # Parallelstore instance optimized for high-bandwidth AI workloads
+  - name: model-parallelstore
+    type: gcp-types/parallelstore-v1:projects.locations.instances
+    properties:
+      parent: projects/$(ref.project-id.projectId)/locations/${ZONE}
+      instanceId: model-storage-$(ref.random-suffix.value)
+      instance:
+        description: "High-performance storage for LLM model weights and inference data"
+        capacityGib: "1024"  # 1TB capacity with 12 GB/s aggregate bandwidth
+        performanceTier: SSD
+        network: projects/$(ref.project-id.projectId)/global/networks/default
+        labels:
+          purpose: "llm-model-storage"
+          performance-tier: "high-bandwidth"
+          ai-workload: "inference"
+        # Advanced configuration for optimal AI workload performance
+        directoryServicesConfig:
+          managedActiveDirectory:
+            computer: "parallelstore-$(ref.random-suffix.value)"
+            domain: "ai-inference.local"
+    metadata:
+      dependsOn:
+        - enable-parallelstore-api
+        - random-suffix
+        - enable-compute-api
+
+  # =============================================================================
+  # GOOGLE KUBERNETES ENGINE CLUSTER WITH TPU SUPPORT
+  # =============================================================================
+
+  # GKE cluster optimized for TPU Ironwood workloads with enterprise features
+  - name: tpu-ironwood-cluster
+    type: gcp-types/container-v1:projects.zones.clusters
+    properties:
+      parent: projects/$(ref.project-id.projectId)/locations/${ZONE}
+      cluster:
+        name: tpu-ironwood-cluster-$(ref.random-suffix.value)
+        description: "GKE cluster for TPU Ironwood LLM inference workloads"
+        location: ${ZONE}
+        
+        # Initial node pool configuration
+        initialNodeCount: 2
+        nodeConfig:
+          machineType: e2-standard-4
+          diskSizeGb: 100
+          diskType: pd-ssd
+          imageType: COS_CONTAINERD
+          
+          # Security and workload identity configuration
+          serviceAccount: $(ref.tpu-inference-service-account.email)
+          oauthScopes:
+            - https://www.googleapis.com/auth/cloud-platform
+          workloadMetadataConfig:
+            mode: GKE_METADATA
+          
+          # Node labels for scheduling optimization
+          labels:
+            workload-type: "ai-inference"
+            accelerator-type: "tpu-ironwood"
+          
+          # Resource taints for TPU node isolation
+          taints:
+            - key: "ai-workload"
+              value: "tpu-inference"
+              effect: "NO_SCHEDULE"
+
+        # Cluster-level features and configurations
+        addonsConfig:
+          horizontalPodAutoscaling:
+            disabled: false
+          httpLoadBalancing:
+            disabled: false
+          networkPolicyConfig:
+            disabled: false
+          cloudRunConfig:
+            disabled: true
+          dnsCacheConfig:
+            enabled: true
+          configConnectorConfig:
+            enabled: true
+          gkeBackupAgentConfig:
+            enabled: true
+
+        # Workload Identity for secure service authentication
+        workloadIdentityConfig:
+          workloadPool: $(ref.project-id.projectId).svc.id.goog
+
+        # Network policy for enhanced security
+        networkPolicy:
+          enabled: true
+          provider: CALICO
+
+        # IP allocation policy for private clusters
+        ipAllocationPolicy:
+          useIpAliases: true
+          clusterSecondaryRangeName: "pods"
+          servicesSecondaryRangeName: "services"
+
+        # Private cluster configuration for enhanced security
+        privateClusterConfig:
+          enablePrivateNodes: true
+          enablePrivateEndpoint: false
+          masterIpv4CidrBlock: "10.0.0.0/28"
+
+        # Master authorized networks for secure access
+        masterAuthorizedNetworksConfig:
+          enabled: true
+          cidrBlocks:
+            - displayName: "Corporate Network"
+              cidrBlock: "10.0.0.0/8"
+
+        # Cluster autoscaling configuration
+        clusterAutoscaling:
+          enabled: true
+          enableNodeAutoprovisioning: true
+          resourceLimits:
+            - resourceType: "cpu"
+              minimum: "1"
+              maximum: "1000"
+            - resourceType: "memory"
+              minimum: "1"
+              maximum: "4000"
+          autoprovisioningNodePoolDefaults:
+            serviceAccount: $(ref.tpu-inference-service-account.email)
+            oauthScopes:
+              - https://www.googleapis.com/auth/cloud-platform
+
+        # Release channel for managed updates
+        releaseChannel:
+          channel: STABLE
+
+        # Maintenance policy for automated updates
+        maintenancePolicy:
+          window:
+            dailyMaintenanceWindow:
+              startTime: "03:00"  # 3 AM maintenance window
+
+        # Monitoring and logging configuration
+        loggingService: logging.googleapis.com/kubernetes
+        monitoringService: monitoring.googleapis.com/kubernetes
+
+        # Binary authorization for container security
+        binaryAuthorization:
+          enabled: true
+
+        # Database encryption configuration
+        databaseEncryption:
+          state: ENCRYPTED
+          keyName: projects/$(ref.project-id.projectId)/locations/${REGION}/keyRings/gke-cluster/cryptoKeys/cluster-key
+
+        # Resource labels for cost tracking and governance
+        resourceLabels:
+          environment: "production"
+          workload: "ai-inference"
+          cost-center: "ml-platform"
+          recipe: "tpu-ironwood-llm"
+
+    metadata:
+      dependsOn:
+        - enable-container-api
+        - tpu-inference-service-account
+        - random-suffix
+
+  # Dedicated node pool for TPU Ironwood workloads
+  - name: tpu-ironwood-node-pool
+    type: gcp-types/container-v1:projects.zones.clusters.nodePools
+    properties:
+      parent: $(ref.tpu-ironwood-cluster.selfLink)
+      nodePool:
+        name: tpu-ironwood-nodes
+        
+        # Node pool configuration optimized for TPU workloads
+        initialNodeCount: 1
+        autoscaling:
+          enabled: true
+          minNodeCount: 0
+          maxNodeCount: 10
+
+        nodeConfig:
+          machineType: e2-highmem-8  # High memory for TPU coordination
+          diskSizeGb: 200
+          diskType: pd-ssd
+          imageType: COS_CONTAINERD
+          
+          # TPU resource configuration
+          accelerators:
+            - acceleratorCount: 8
+              acceleratorType: google.com/tpu-ironwood-v7
+          
+          # Service account and security
+          serviceAccount: $(ref.tpu-inference-service-account.email)
+          oauthScopes:
+            - https://www.googleapis.com/auth/cloud-platform
+          
+          # Workload identity configuration
+          workloadMetadataConfig:
+            mode: GKE_METADATA
+          
+          # Node labels for scheduling
+          labels:
+            node-type: "tpu-ironwood"
+            workload: "llm-inference"
+            accelerator: "tpu-v7"
+          
+          # Taints to ensure only TPU workloads schedule here
+          taints:
+            - key: "google.com/tpu"
+              value: "present"
+              effect: "NO_SCHEDULE"
+
+        # Node pool management configuration
+        management:
+          autoUpgrade: true
+          autoRepair: true
+
+        # Upgrade settings for controlled rollouts
+        upgradeSettings:
+          maxSurge: 1
+          maxUnavailable: 0
+
+    metadata:
+      dependsOn:
+        - tpu-ironwood-cluster
+
+  # =============================================================================
+  # CLOUD MONITORING DASHBOARD AND ALERTING
+  # =============================================================================
+
+  # Custom monitoring dashboard for TPU Ironwood inference metrics
+  - name: tpu-inference-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      parent: projects/$(ref.project-id.projectId)
+      dashboard:
+        displayName: "TPU Ironwood LLM Inference Dashboard"
+        gridLayout:
+          widgets:
+            # TPU Utilization Chart
+            - title: "TPU Ironwood Utilization"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="gce_instance" AND metric.type="compute.googleapis.com/instance/cpu/utilization"'
+                        aggregation:
+                          alignmentPeriod: "60s"
+                          perSeriesAligner: "ALIGN_MEAN"
+                          crossSeriesReducer: "REDUCE_MEAN"
+                          groupByFields: ["resource.label.instance_name"]
+                yAxis:
+                  label: "Utilization %"
+                  scale: "LINEAR"
+              
+            # Model Loading Time Metrics
+            - title: "Model Loading Performance"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="k8s_pod" AND metric.type="custom.googleapis.com/model_loading_time"'
+                        aggregation:
+                          alignmentPeriod: "300s"
+                          perSeriesAligner: "ALIGN_MEAN"
+                yAxis:
+                  label: "Loading Time (seconds)"
+                  scale: "LINEAR"
+
+            # Inference Throughput Metrics
+            - title: "Inference Throughput"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="k8s_pod" AND metric.type="custom.googleapis.com/tokens_per_second"'
+                        aggregation:
+                          alignmentPeriod: "60s"
+                          perSeriesAligner: "ALIGN_RATE"
+                yAxis:
+                  label: "Tokens/Second"
+                  scale: "LINEAR"
+
+            # Parallelstore Performance
+            - title: "Parallelstore Bandwidth Utilization"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="parallelstore_instance" AND metric.type="parallelstore.googleapis.com/instance/read_bandwidth"'
+                        aggregation:
+                          alignmentPeriod: "60s"
+                          perSeriesAligner: "ALIGN_MEAN"
+                yAxis:
+                  label: "Bandwidth (GB/s)"
+                  scale: "LINEAR"
+
+        labels:
+          purpose: "ai-inference-monitoring"
+          component: "tpu-ironwood"
+
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+        - tpu-ironwood-cluster
+
+  # Alert policy for TPU utilization monitoring
+  - name: tpu-utilization-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(ref.project-id.projectId)
+      alertPolicy:
+        displayName: "TPU Ironwood High Utilization Alert"
+        conditions:
+          - displayName: "TPU utilization above 90%"
+            conditionThreshold:
+              filter: 'resource.type="gce_instance" AND metric.type="compute.googleapis.com/instance/cpu/utilization"'
+              comparison: "COMPARISON_GREATER_THAN"
+              thresholdValue: 0.90
+              duration: "300s"
+              aggregations:
+                - alignmentPeriod: "60s"
+                  perSeriesAligner: "ALIGN_MEAN"
+                  crossSeriesReducer: "REDUCE_MEAN"
+                  groupByFields: ["resource.label.instance_name"]
+        
+        notificationChannels: []  # Configure notification channels as needed
+        
+        alertStrategy:
+          autoClose: "604800s"  # Auto-close after 7 days
+        
+        enabled: true
+        
+        documentation:
+          content: "TPU Ironwood utilization has exceeded 90% for more than 5 minutes. Consider scaling up inference resources or optimizing model serving."
+          mimeType: "text/markdown"
+
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+        - tpu-inference-dashboard
+
+  # =============================================================================
+  # OUTPUTS FOR INTEGRATION AND VERIFICATION
+  # =============================================================================
+
+outputs:
+  # Project and regional information
+  - name: project-id
+    value: $(ref.project-id.projectId)
+  
+  - name: region
+    value: ${REGION}
+  
+  - name: zone
+    value: ${ZONE}
+
+  # Storage resources
+  - name: model-storage-bucket
+    value: $(ref.model-storage-bucket.name)
+  
+  - name: parallelstore-instance
+    value: $(ref.model-parallelstore.name)
+  
+  - name: parallelstore-ip
+    value: $(ref.model-parallelstore.accessPoints[0].accessUrl)
+
+  # Kubernetes cluster information
+  - name: cluster-name
+    value: $(ref.tpu-ironwood-cluster.name)
+  
+  - name: cluster-endpoint
+    value: $(ref.tpu-ironwood-cluster.endpoint)
+  
+  - name: cluster-ca-certificate
+    value: $(ref.tpu-ironwood-cluster.masterAuth.clusterCaCertificate)
+
+  # Service account details
+  - name: service-account-email
+    value: $(ref.tpu-inference-service-account.email)
+  
+  - name: service-account-unique-id
+    value: $(ref.tpu-inference-service-account.uniqueId)
+
+  # Monitoring resources
+  - name: dashboard-url
+    value: https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.tpu-inference-dashboard.name)
+
+  # Deployment instructions
+  - name: deployment-commands
+    value: |
+      # Connect to the cluster
+      gcloud container clusters get-credentials $(ref.tpu-ironwood-cluster.name) --zone=${ZONE}
+      
+      # Create Kubernetes service account
+      kubectl create serviceaccount tpu-inference-pod --namespace=default
+      kubectl annotate serviceaccount tpu-inference-pod --namespace=default \
+        iam.gke.io/gcp-service-account=$(ref.tpu-inference-service-account.email)
+      
+      # Deploy Volume Populator configuration
+      kubectl apply -f volume-populator-config.yaml
+      
+      # Deploy TPU Ironwood inference workload
+      kubectl apply -f tpu-inference-deployment.yaml
+
+# =============================================================================
+# VARIABLE DEFINITIONS FOR CUSTOMIZATION
+# =============================================================================
+
+# Default variable values - can be overridden during deployment
+imports:
+  - path: variables.yaml
+    name: variables
+
+# Template metadata for Infrastructure Manager
+schema:
+  info:
+    title: "TPU Ironwood LLM Inference Infrastructure"
+    author: "Google Cloud AI Solutions"
+    description: "Complete infrastructure deployment for large language model inference using TPU Ironwood accelerators, GKE Volume Populator, and Parallelstore"
+    version: "1.0"
+  
+  required:
+    - PROJECT_ID
+    - REGION
+    - ZONE
+  
+  properties:
+    PROJECT_ID:
+      type: string
+      description: "Google Cloud project ID for deployment"
+    
+    REGION:
+      type: string
+      default: "us-central1"
+      description: "Google Cloud region for regional resources"
+    
+    ZONE:
+      type: string
+      default: "us-central1-a"
+      description: "Google Cloud zone for zonal resources (must support TPU Ironwood)"
+    
+    MODEL_BUCKET_PREFIX:
+      type: string
+      default: "llm-models"
+      description: "Prefix for the model storage bucket name"
+    
+    PARALLELSTORE_CAPACITY:
+      type: integer
+      default: 1024
+      description: "Parallelstore capacity in GiB (minimum 1024)"
+    
+    CLUSTER_NODE_COUNT:
+      type: integer
+      default: 2
+      description: "Initial number of nodes in the GKE cluster"
+    
+    TPU_NODE_COUNT:
+      type: integer
+      default: 1
+      description: "Initial number of TPU nodes in the dedicated node pool"

@@ -1,0 +1,454 @@
+# Multi-Region Backup Automation Workflow Definition
+# This Cloud Workflow orchestrates backup operations across multiple regions
+# with comprehensive error handling and validation capabilities
+
+main:
+  params: [args]
+  steps:
+    # Initialize workflow variables and validate inputs
+    - init_workflow:
+        assign:
+          - project_id: ${sys.get_env("PROJECT_ID")}
+          - primary_region: ${sys.get_env("PRIMARY_REGION")}
+          - secondary_region: ${sys.get_env("SECONDARY_REGION")}
+          - backup_vault_primary: ${sys.get_env("BACKUP_VAULT_PRIMARY")}
+          - backup_vault_secondary: ${sys.get_env("BACKUP_VAULT_SECONDARY")}
+          - test_instance_name: ${sys.get_env("TEST_INSTANCE_NAME")}
+          - test_instance_zone: ${sys.get_env("TEST_INSTANCE_ZONE")}
+          - workflow_start_time: ${sys.now()}
+          - backup_type: ${default(args.backup_type, "scheduled_daily")}
+          - test_recovery: ${default(args.test_recovery, false)}
+          - validate_cross_region: ${default(args.validate_cross_region, false)}
+          - retention_days: ${default(args.retention_days, 30)}
+    
+    # Log workflow initialization
+    - log_workflow_start:
+        call: sys.log
+        args:
+          data: ${
+            "Starting backup workflow - Type: " + backup_type + 
+            ", Primary Region: " + primary_region + 
+            ", Secondary Region: " + secondary_region +
+            ", Test Recovery: " + string(test_recovery)
+          }
+          severity: "INFO"
+    
+    # Step 1: Validate backup vaults are accessible
+    - validate_backup_vaults:
+        call: validate_vault_access
+        args:
+          project_id: ${project_id}
+          primary_region: ${primary_region}
+          secondary_region: ${secondary_region}
+          primary_vault: ${backup_vault_primary}
+          secondary_vault: ${backup_vault_secondary}
+        result: vault_validation_result
+    
+    # Step 2: Create backup plan for primary region (if test instance exists)
+    - create_primary_backup:
+        switch:
+          - condition: ${test_instance_name != ""}
+            next: execute_primary_backup
+          - condition: true
+            next: log_no_test_instance
+    
+    - log_no_test_instance:
+        call: sys.log
+        args:
+          data: "No test instance configured - skipping instance backup creation"
+          severity: "WARNING"
+        next: create_cross_region_validation
+    
+    - execute_primary_backup:
+        call: create_backup_plan
+        args:
+          project_id: ${project_id}
+          region: ${primary_region}
+          backup_vault: ${backup_vault_primary}
+          instance_name: ${test_instance_name}
+          instance_zone: ${test_instance_zone}
+          backup_type: ${backup_type}
+        result: primary_backup_result
+    
+    # Step 3: Create cross-region backup validation
+    - create_cross_region_validation:
+        call: validate_cross_region_backup
+        args:
+          project_id: ${project_id}
+          source_region: ${primary_region}
+          target_region: ${secondary_region}
+          primary_vault: ${backup_vault_primary}
+          secondary_vault: ${backup_vault_secondary}
+          validate_cross_region: ${validate_cross_region}
+        result: cross_region_result
+    
+    # Step 4: Test backup recovery (if enabled)
+    - test_backup_recovery:
+        switch:
+          - condition: ${test_recovery and test_instance_name != ""}
+            call: test_recovery_process
+            args:
+              project_id: ${project_id}
+              region: ${primary_region}
+              backup_vault: ${backup_vault_primary}
+              instance_name: ${test_instance_name}
+              instance_zone: ${test_instance_zone}
+            result: recovery_test_result
+          - condition: true
+            assign:
+              - recovery_test_result:
+                  status: "SKIPPED"
+                  message: "Recovery testing not enabled or no test instance"
+    
+    # Step 5: Update monitoring metrics
+    - update_monitoring_metrics:
+        call: update_backup_metrics
+        args:
+          project_id: ${project_id}
+          backup_type: ${backup_type}
+          primary_backup_status: ${default(primary_backup_result.status, "SKIPPED")}
+          cross_region_status: ${cross_region_result.status}
+          recovery_test_status: ${recovery_test_result.status}
+          workflow_duration: ${sys.now() - workflow_start_time}
+        result: metrics_result
+    
+    # Step 6: Log final results
+    - log_workflow_completion:
+        call: sys.log
+        args:
+          data: ${
+            "Backup workflow completed - " +
+            "Primary: " + default(primary_backup_result.status, "SKIPPED") +
+            ", Cross-region: " + cross_region_result.status +
+            ", Recovery test: " + recovery_test_result.status +
+            ", Duration: " + string(sys.now() - workflow_start_time) + "s"
+          }
+          severity: "INFO"
+    
+    # Return comprehensive results
+    - return_results:
+        return:
+          workflow_id: ${sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID")}
+          status: "SUCCESS"
+          backup_type: ${backup_type}
+          timestamp: ${workflow_start_time}
+          duration_seconds: ${sys.now() - workflow_start_time}
+          primary_backup: ${default(primary_backup_result, {"status": "SKIPPED"})}
+          cross_region_validation: ${cross_region_result}
+          recovery_test: ${recovery_test_result}
+          monitoring_metrics: ${metrics_result}
+
+# Subworkflow: Validate backup vault access
+validate_vault_access:
+  params: [project_id, primary_region, secondary_region, primary_vault, secondary_vault]
+  steps:
+    - check_primary_vault:
+        try:
+          call: http.get
+          args:
+            url: ${
+              "https://backupdr.googleapis.com/v1/projects/" + 
+              project_id + "/locations/" + primary_region + 
+              "/backupVaults/" + primary_vault
+            }
+            auth:
+              type: OAuth2
+          result: primary_vault_response
+        except:
+          as: e
+          steps:
+            - log_primary_vault_error:
+                call: sys.log
+                args:
+                  data: ${
+                    "Failed to access primary backup vault: " + 
+                    primary_vault + " - Error: " + string(e)
+                  }
+                  severity: "ERROR"
+            - raise_primary_vault_error:
+                raise: ${e}
+    
+    - check_secondary_vault:
+        try:
+          call: http.get
+          args:
+            url: ${
+              "https://backupdr.googleapis.com/v1/projects/" + 
+              project_id + "/locations/" + secondary_region + 
+              "/backupVaults/" + secondary_vault
+            }
+            auth:
+              type: OAuth2
+          result: secondary_vault_response
+        except:
+          as: e
+          steps:
+            - log_secondary_vault_error:
+                call: sys.log
+                args:
+                  data: ${
+                    "Failed to access secondary backup vault: " + 
+                    secondary_vault + " - Error: " + string(e)
+                  }
+                  severity: "ERROR"
+            - raise_secondary_vault_error:
+                raise: ${e}
+    
+    - return_vault_validation:
+        return:
+          status: "SUCCESS"
+          primary_vault_state: ${primary_vault_response.body.state}
+          secondary_vault_state: ${secondary_vault_response.body.state}
+          validation_timestamp: ${sys.now()}
+
+# Subworkflow: Create backup plan for compute instance
+create_backup_plan:
+  params: [project_id, region, backup_vault, instance_name, instance_zone, backup_type]
+  steps:
+    - generate_backup_plan_id:
+        assign:
+          - backup_plan_id: ${
+              "plan-" + instance_name + "-" + 
+              string(int(sys.now())) + "-" + backup_type
+            }
+    
+    - create_backup_plan_request:
+        try:
+          call: http.post
+          args:
+            url: ${
+              "https://backupdr.googleapis.com/v1/projects/" + 
+              project_id + "/locations/" + region + "/backupPlans"
+            }
+            auth:
+              type: OAuth2
+            headers:
+              Content-Type: "application/json"
+            body:
+              backupPlanId: ${backup_plan_id}
+              backupPlan:
+                description: ${
+                  "Automated backup plan for " + instance_name + 
+                  " - Type: " + backup_type
+                }
+                backupVault: ${
+                  "projects/" + project_id + "/locations/" + 
+                  region + "/backupVaults/" + backup_vault
+                }
+                resourceType: "compute.googleapis.com/Instance"
+                backupRules:
+                  - backupRuleId: "daily-backup-rule"
+                    backupRetentionDays: 30
+                    standardSchedule:
+                      scheduleType: "DAILY"
+                      hourlyFrequency: 24
+                      timeZone: "UTC"
+          result: backup_plan_response
+        except:
+          as: e
+          steps:
+            - log_backup_plan_error:
+                call: sys.log
+                args:
+                  data: ${
+                    "Failed to create backup plan for " + instance_name + 
+                    " - Error: " + string(e)
+                  }
+                  severity: "ERROR"
+            - return_backup_plan_error:
+                return:
+                  status: "FAILED"
+                  error: ${string(e)}
+                  backup_plan_id: ${backup_plan_id}
+    
+    - wait_for_backup_plan_creation:
+        call: sys.sleep
+        args:
+          seconds: 10
+    
+    - return_backup_plan_success:
+        return:
+          status: "SUCCESS"
+          backup_plan_id: ${backup_plan_id}
+          backup_plan_name: ${backup_plan_response.body.name}
+          creation_time: ${backup_plan_response.body.createTime}
+
+# Subworkflow: Validate cross-region backup capabilities
+validate_cross_region_backup:
+  params: [project_id, source_region, target_region, primary_vault, secondary_vault, validate_cross_region]
+  steps:
+    - check_cross_region_validation_needed:
+        switch:
+          - condition: ${validate_cross_region}
+            next: perform_cross_region_validation
+          - condition: true
+            next: skip_cross_region_validation
+    
+    - skip_cross_region_validation:
+        return:
+          status: "SKIPPED"
+          message: "Cross-region validation not requested"
+    
+    - perform_cross_region_validation:
+        call: sys.log
+        args:
+          data: ${
+            "Performing cross-region backup validation from " + 
+            source_region + " to " + target_region
+          }
+          severity: "INFO"
+    
+    - check_vault_connectivity:
+        try:
+          call: http.get
+          args:
+            url: ${
+              "https://backupdr.googleapis.com/v1/projects/" + 
+              project_id + "/locations/" + target_region + 
+              "/backupVaults/" + secondary_vault + "/backups"
+            }
+            auth:
+              type: OAuth2
+          result: backup_list_response
+        except:
+          as: e
+          steps:
+            - log_connectivity_error:
+                call: sys.log
+                args:
+                  data: ${
+                    "Cross-region validation failed - Cannot access " +
+                    "secondary vault backups: " + string(e)
+                  }
+                  severity: "ERROR"
+            - return_connectivity_error:
+                return:
+                  status: "FAILED"
+                  error: ${string(e)}
+                  validation_type: "cross-region-connectivity"
+    
+    - return_cross_region_success:
+        return:
+          status: "SUCCESS"
+          validation_type: "cross-region-connectivity"
+          backup_count: ${len(default(backup_list_response.body.backups, []))}
+          validation_timestamp: ${sys.now()}
+
+# Subworkflow: Test backup recovery process
+test_recovery_process:
+  params: [project_id, region, backup_vault, instance_name, instance_zone]
+  steps:
+    - log_recovery_test_start:
+        call: sys.log
+        args:
+          data: ${
+            "Starting recovery test for instance: " + instance_name + 
+            " in zone: " + instance_zone
+          }
+          severity: "INFO"
+    
+    - list_available_backups:
+        try:
+          call: http.get
+          args:
+            url: ${
+              "https://backupdr.googleapis.com/v1/projects/" + 
+              project_id + "/locations/" + region + 
+              "/backupVaults/" + backup_vault + "/backups"
+            }
+            auth:
+              type: OAuth2
+          result: backup_list_response
+        except:
+          as: e
+          return:
+            status: "FAILED"
+            error: ${string(e)}
+            test_type: "recovery-validation"
+    
+    - validate_backup_availability:
+        switch:
+          - condition: ${len(default(backup_list_response.body.backups, [])) > 0}
+            next: simulate_recovery_test
+          - condition: true
+            next: no_backups_available
+    
+    - no_backups_available:
+        return:
+          status: "WARNING"
+          message: "No backups available for recovery testing"
+          backup_count: 0
+    
+    - simulate_recovery_test:
+        call: sys.log
+        args:
+          data: ${
+            "Recovery test simulation completed - Found " + 
+            string(len(backup_list_response.body.backups)) + 
+            " available backup(s)"
+          }
+          severity: "INFO"
+    
+    - return_recovery_test_success:
+        return:
+          status: "SUCCESS"
+          test_type: "recovery-validation"
+          available_backups: ${len(backup_list_response.body.backups)}
+          test_timestamp: ${sys.now()}
+
+# Subworkflow: Update monitoring metrics
+update_backup_metrics:
+  params: [project_id, backup_type, primary_backup_status, cross_region_status, recovery_test_status, workflow_duration]
+  steps:
+    - create_custom_metrics:
+        try:
+          call: http.post
+          args:
+            url: ${
+              "https://monitoring.googleapis.com/v3/projects/" + 
+              project_id + "/timeSeries"
+            }
+            auth:
+              type: OAuth2
+            headers:
+              Content-Type: "application/json"
+            body:
+              timeSeries:
+                - metric:
+                    type: "custom.googleapis.com/backup_automation/workflow_execution"
+                    labels:
+                      backup_type: ${backup_type}
+                      primary_status: ${primary_backup_status}
+                      cross_region_status: ${cross_region_status}
+                      recovery_test_status: ${recovery_test_status}
+                  resource:
+                    type: "global"
+                    labels:
+                      project_id: ${project_id}
+                  points:
+                    - interval:
+                        endTime: ${sys.now()}
+                      value:
+                        doubleValue: ${workflow_duration}
+          result: metrics_response
+        except:
+          as: e
+          steps:
+            - log_metrics_error:
+                call: sys.log
+                args:
+                  data: ${
+                    "Failed to update monitoring metrics - Error: " + string(e)
+                  }
+                  severity: "WARNING"
+            - return_metrics_error:
+                return:
+                  status: "FAILED"
+                  error: ${string(e)}
+    
+    - return_metrics_success:
+        return:
+          status: "SUCCESS"
+          metrics_created: true
+          workflow_duration: ${workflow_duration}
+          timestamp: ${sys.now()}

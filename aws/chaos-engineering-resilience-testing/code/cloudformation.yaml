@@ -1,0 +1,527 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Automated Chaos Engineering with Fault Injection Service.
+  This template creates a complete chaos engineering infrastructure including FIS experiment templates,
+  EventBridge rules for automation and notifications, CloudWatch alarms for safety, and SNS for alerting.
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Experiment Configuration"
+        Parameters:
+          - ExperimentName
+          - Environment
+          - NotificationEmail
+      - Label:
+          default: "Target Configuration"
+        Parameters:
+          - TargetTagKey
+          - TargetTagValue
+          - EnableScheduledExperiments
+      - Label:
+          default: "Safety Configuration"
+        Parameters:
+          - ErrorRateThreshold
+          - CPUThreshold
+          - ExperimentDuration
+    ParameterLabels:
+      ExperimentName:
+        default: "Experiment Name Prefix"
+      Environment:
+        default: "Environment Tag"
+      NotificationEmail:
+        default: "Email for Notifications"
+      TargetTagKey:
+        default: "Target Resource Tag Key"
+      TargetTagValue:
+        default: "Target Resource Tag Value"
+      EnableScheduledExperiments:
+        default: "Enable Automated Scheduling"
+      ErrorRateThreshold:
+        default: "Error Rate Alarm Threshold"
+      CPUThreshold:
+        default: "CPU Utilization Threshold"
+      ExperimentDuration:
+        default: "Max Experiment Duration (minutes)"
+
+# Parameters with validation
+Parameters:
+  ExperimentName:
+    Type: String
+    Default: chaos-experiment
+    Description: Prefix for naming chaos engineering resources
+    AllowedPattern: ^[a-z][a-z0-9-]*$
+    ConstraintDescription: Must start with lowercase letter and contain only lowercase letters, numbers, and hyphens
+    MinLength: 3
+    MaxLength: 32
+
+  Environment:
+    Type: String
+    Default: testing
+    Description: Environment tag for all resources
+    AllowedValues:
+      - development
+      - testing
+      - staging
+      - production
+    ConstraintDescription: Must be a valid environment name
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for chaos engineering notifications
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address
+
+  TargetTagKey:
+    Type: String
+    Default: ChaosReady
+    Description: Tag key to identify resources eligible for chaos experiments
+    MinLength: 1
+    MaxLength: 128
+
+  TargetTagValue:
+    Type: String
+    Default: "true"
+    Description: Tag value to identify resources eligible for chaos experiments
+    MinLength: 1
+    MaxLength: 256
+
+  EnableScheduledExperiments:
+    Type: String
+    Default: "false"
+    Description: Enable automated daily chaos experiments
+    AllowedValues:
+      - "true"
+      - "false"
+
+  ErrorRateThreshold:
+    Type: Number
+    Default: 50
+    Description: Number of 4XX errors that triggers experiment stop condition
+    MinValue: 1
+    MaxValue: 1000
+
+  CPUThreshold:
+    Type: Number
+    Default: 90
+    Description: CPU utilization percentage that triggers monitoring alarm
+    MinValue: 50
+    MaxValue: 99
+
+  ExperimentDuration:
+    Type: Number
+    Default: 5
+    Description: Maximum duration for chaos experiments in minutes
+    MinValue: 1
+    MaxValue: 60
+
+# Conditions for conditional resource creation
+Conditions:
+  CreateScheduler: !Equals [!Ref EnableScheduledExperiments, "true"]
+  IsProduction: !Equals [!Ref Environment, "production"]
+
+# Resources
+Resources:
+  # SNS Topic for Notifications
+  FISNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ExperimentName}-fis-alerts"
+      DisplayName: !Sub "FIS Chaos Engineering Alerts - ${ExperimentName}"
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub "${ExperimentName}-fis-alerts"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: ChaosEngineering
+
+  # SNS Subscription for Email Notifications
+  FISNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref FISNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # IAM Role for FIS Experiments
+  FISExperimentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ExperimentName}-fis-experiment-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: fis.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        # Using PowerUserAccess for demo - restrict in production
+        - !If
+          - IsProduction
+          - !Ref FISProductionPolicy
+          - arn:aws:iam::aws:policy/PowerUserAccess
+      Tags:
+        - Key: Name
+          Value: !Sub "${ExperimentName}-fis-experiment-role"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: ChaosEngineering
+
+  # Custom IAM Policy for Production Environments
+  FISProductionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: IsProduction
+    Properties:
+      ManagedPolicyName: !Sub "${ExperimentName}-fis-production-policy"
+      Description: Restricted permissions for FIS experiments in production
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ec2:DescribeInstances
+              - ec2:DescribeInstanceStatus
+              - ec2:StopInstances
+              - ec2:TerminateInstances
+              - ssm:SendCommand
+              - ssm:GetCommandInvocation
+              - ssm:DescribeInstanceInformation
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'ec2:ResourceTag/ChaosReady': !Ref TargetTagValue
+
+  # CloudWatch Alarm for High Error Rate (Stop Condition)
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ExperimentName}-high-error-rate"
+      AlarmDescription: Stop FIS experiments when error rate exceeds threshold
+      MetricName: 4XXError
+      Namespace: AWS/ApplicationELB
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: !Ref ErrorRateThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref FISNotificationTopic
+      Tags:
+        - Key: Name
+          Value: !Sub "${ExperimentName}-high-error-rate"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: ChaosEngineering
+
+  # CloudWatch Alarm for High CPU Utilization
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ExperimentName}-high-cpu"
+      AlarmDescription: Monitor CPU utilization during chaos experiments
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref CPUThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref FISNotificationTopic
+      Tags:
+        - Key: Name
+          Value: !Sub "${ExperimentName}-high-cpu"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: ChaosEngineering
+
+  # FIS Experiment Template
+  FISExperimentTemplate:
+    Type: AWS::FIS::ExperimentTemplate
+    Properties:
+      Description: Multi-action chaos experiment for resilience testing
+      RoleArn: !GetAtt FISExperimentRole.Arn
+      StopConditions:
+        - Source: aws:cloudwatch:alarm
+          Value: !GetAtt HighErrorRateAlarm.Arn
+      Targets:
+        ec2-instances:
+          ResourceType: aws:ec2:instance
+          SelectionMode: COUNT(1)
+          ResourceTags:
+            !Ref TargetTagKey: !Ref TargetTagValue
+      Actions:
+        cpu-stress:
+          ActionId: aws:ssm:send-command
+          Description: Inject CPU stress on EC2 instances
+          Parameters:
+            documentArn: !Sub "arn:aws:ssm:${AWS::Region}::document/AWSFIS-Run-CPU-Stress"
+            documentParameters: !Sub |
+              {
+                "DurationSeconds": "120",
+                "CPU": "0",
+                "LoadPercent": "80"
+              }
+            duration: !Sub "PT${ExperimentDuration}M"
+          Targets:
+            Instances: ec2-instances
+        terminate-instance:
+          ActionId: aws:ec2:terminate-instances
+          Description: Terminate EC2 instance to test recovery
+          Targets:
+            Instances: ec2-instances
+          StartAfter:
+            - cpu-stress
+      Tags:
+        Name: !Sub "${ExperimentName}-template"
+        Environment: !Ref Environment
+        Purpose: ChaosEngineering
+
+  # IAM Role for EventBridge
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ExperimentName}-eventbridge-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref FISNotificationTopic
+      Tags:
+        - Key: Name
+          Value: !Sub "${ExperimentName}-eventbridge-role"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: ChaosEngineering
+
+  # EventBridge Rule for FIS State Changes
+  FISStateChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ExperimentName}-fis-state-changes"
+      Description: Capture all FIS experiment state changes
+      EventPattern:
+        source:
+          - aws.fis
+        detail-type:
+          - FIS Experiment State Change
+      State: ENABLED
+      Targets:
+        - Arn: !Ref FISNotificationTopic
+          Id: "SNSTarget"
+          RoleArn: !GetAtt EventBridgeRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              experimentId: "$.detail.experimentId"
+              state: "$.detail.state.status"
+              startTime: "$.detail.startTime"
+            InputTemplate: |
+              {
+                "experiment": "<experimentId>",
+                "status": "<state>",
+                "startTime": "<startTime>",
+                "message": "FIS Experiment <experimentId> changed state to <state>"
+              }
+
+  # IAM Role for EventBridge Scheduler
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Condition: CreateScheduler
+    Properties:
+      RoleName: !Sub "${ExperimentName}-scheduler-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FISStartExperimentPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: fis:StartExperiment
+                Resource:
+                  - !Sub "arn:aws:fis:${AWS::Region}:${AWS::AccountId}:experiment-template/${FISExperimentTemplate}"
+                  - !Sub "arn:aws:fis:${AWS::Region}:${AWS::AccountId}:experiment/*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ExperimentName}-scheduler-role"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: ChaosEngineering
+
+  # EventBridge Schedule for Automated Experiments
+  ChaosExperimentSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: CreateScheduler
+    Properties:
+      Name: !Sub "${ExperimentName}-daily-schedule"
+      Description: Daily automated chaos engineering experiments
+      # Run daily at 2 AM (modify for your timezone)
+      ScheduleExpression: "cron(0 2 * * ? *)"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !Sub "arn:aws:scheduler:::aws-sdk:fis:startExperiment"
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub |
+          {
+            "ExperimentTemplateId": "${FISExperimentTemplate}"
+          }
+
+  # CloudWatch Dashboard for Monitoring
+  ChaosDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${ExperimentName}-monitoring"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/FIS", "ExperimentsStarted", {"stat": "Sum"}],
+                  [".", "ExperimentsStopped", {"stat": "Sum"}],
+                  [".", "ExperimentsFailed", {"stat": "Sum"}]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "FIS Experiment Status",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/EC2", "CPUUtilization", {"stat": "Average"}],
+                  ["AWS/ApplicationELB", "TargetResponseTime", {"stat": "Average"}],
+                  [".", "HTTPCode_Target_4XX_Count", {"stat": "Sum"}]
+                ],
+                "period": 60,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Application Health During Experiments",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/events/rule/${ExperimentName}-fis-state-changes'\n| fields @timestamp, detail.experimentId, detail.state.status\n| filter detail.state.status = \"completed\" or detail.state.status = \"failed\"\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent FIS Experiment Results"
+              }
+            }
+          ]
+        }
+
+# Outputs
+Outputs:
+  FISExperimentTemplateId:
+    Description: ID of the FIS experiment template
+    Value: !Ref FISExperimentTemplate
+    Export:
+      Name: !Sub "${AWS::StackName}-FISTemplateId"
+
+  FISExperimentRole:
+    Description: ARN of the IAM role used by FIS experiments
+    Value: !GetAtt FISExperimentRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-FISRoleArn"
+
+  SNSTopicArn:
+    Description: ARN of the SNS topic for notifications
+    Value: !Ref FISNotificationTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-SNSTopicArn"
+
+  ErrorRateAlarmArn:
+    Description: ARN of the error rate CloudWatch alarm (stop condition)
+    Value: !GetAtt HighErrorRateAlarm.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ErrorAlarmArn"
+
+  CPUAlarmArn:
+    Description: ARN of the CPU utilization CloudWatch alarm
+    Value: !GetAtt HighCPUAlarm.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CPUAlarmArn"
+
+  DashboardURL:
+    Description: URL to the CloudWatch dashboard
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ExperimentName}-monitoring"
+
+  EventBridgeRuleName:
+    Description: Name of the EventBridge rule for FIS state changes
+    Value: !Ref FISStateChangeRule
+    Export:
+      Name: !Sub "${AWS::StackName}-EventBridgeRule"
+
+  SchedulerName:
+    Description: Name of the EventBridge scheduler (if enabled)
+    Value: !If
+      - CreateScheduler
+      - !Ref ChaosExperimentSchedule
+      - "Not Created"
+    Export:
+      Name: !Sub "${AWS::StackName}-SchedulerName"
+
+  TargetConfiguration:
+    Description: Tag configuration for targeting resources
+    Value: !Sub "${TargetTagKey}=${TargetTagValue}"
+
+  StartExperimentCommand:
+    Description: AWS CLI command to manually start an experiment
+    Value: !Sub "aws fis start-experiment --experiment-template-id ${FISExperimentTemplate} --region ${AWS::Region}"
+
+  CleanupInstructions:
+    Description: Instructions for cleaning up resources
+    Value: !Sub "Delete this CloudFormation stack to remove all chaos engineering resources. Stack name: ${AWS::StackName}"

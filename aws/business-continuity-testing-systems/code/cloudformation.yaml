@@ -1,0 +1,1237 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Business Continuity Testing Framework with AWS Systems Manager - Automated testing and validation of disaster recovery procedures'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectId
+          - Environment
+          - NotificationEmail
+      - Label:
+          default: "Testing Configuration"
+        Parameters:
+          - TestInstanceId
+          - BackupVaultName
+          - DatabaseInstanceId
+          - DatabaseSnapshotId
+      - Label:
+          default: "Application Configuration"
+        Parameters:
+          - PrimaryLoadBalancerArn
+          - SecondaryLoadBalancerArn
+          - Route53HostedZoneId
+          - DomainName
+      - Label:
+          default: "Schedule Configuration"
+        Parameters:
+          - DailyTestSchedule
+          - WeeklyTestSchedule
+          - MonthlyTestSchedule
+    ParameterLabels:
+      ProjectId:
+        default: "Project Identifier"
+      Environment:
+        default: "Environment Name"
+      NotificationEmail:
+        default: "Notification Email Address"
+
+Parameters:
+  ProjectId:
+    Type: String
+    Description: 'Unique identifier for the BC testing project'
+    Default: 'bc-test'
+    AllowedPattern: '^[a-z0-9\-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+    MinLength: 3
+    MaxLength: 20
+
+  Environment:
+    Type: String
+    Description: 'Environment name for resource tagging'
+    Default: 'production'
+    AllowedValues:
+      - 'development'
+      - 'staging'
+      - 'production'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for BC testing notifications'
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  TestInstanceId:
+    Type: String
+    Description: 'EC2 instance ID for backup testing (optional)'
+    Default: ''
+
+  BackupVaultName:
+    Type: String
+    Description: 'AWS Backup vault name for testing'
+    Default: 'default'
+
+  DatabaseInstanceId:
+    Type: String
+    Description: 'RDS instance identifier for database recovery testing (optional)'
+    Default: ''
+
+  DatabaseSnapshotId:
+    Type: String
+    Description: 'RDS snapshot identifier for testing (optional)'
+    Default: ''
+
+  PrimaryLoadBalancerArn:
+    Type: String
+    Description: 'Primary Application Load Balancer ARN for failover testing (optional)'
+    Default: ''
+
+  SecondaryLoadBalancerArn:
+    Type: String
+    Description: 'Secondary Application Load Balancer ARN for failover testing (optional)'
+    Default: ''
+
+  Route53HostedZoneId:
+    Type: String
+    Description: 'Route 53 hosted zone ID for DNS failover testing (optional)'
+    Default: ''
+
+  DomainName:
+    Type: String
+    Description: 'Domain name for application failover testing (optional)'
+    Default: ''
+
+  DailyTestSchedule:
+    Type: String
+    Description: 'EventBridge schedule expression for daily tests'
+    Default: 'rate(1 day)'
+
+  WeeklyTestSchedule:
+    Type: String
+    Description: 'EventBridge schedule expression for weekly tests'
+    Default: 'cron(0 2 ? * SUN *)'
+
+  MonthlyTestSchedule:
+    Type: String
+    Description: 'EventBridge schedule expression for monthly tests'
+    Default: 'cron(0 1 1 * ? *)'
+
+Conditions:
+  HasTestInstance: !Not [!Equals [!Ref TestInstanceId, '']]
+  HasDatabaseConfig: !And
+    - !Not [!Equals [!Ref DatabaseInstanceId, '']]
+    - !Not [!Equals [!Ref DatabaseSnapshotId, '']]
+  HasApplicationConfig: !And
+    - !Not [!Equals [!Ref PrimaryLoadBalancerArn, '']]
+    - !Not [!Equals [!Ref SecondaryLoadBalancerArn, '']]
+    - !Not [!Equals [!Ref Route53HostedZoneId, '']]
+    - !Not [!Equals [!Ref DomainName, '']]
+
+Resources:
+  # ================================================================
+  # IAM Role for Business Continuity Testing Automation
+  # ================================================================
+  
+  BCTestingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'BCTestingRole-${ProjectId}'
+      Description: 'IAM role for business continuity testing automation'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ssm.amazonaws.com
+                - lambda.amazonaws.com
+                - states.amazonaws.com
+                - events.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BCTestingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:*
+                  - ec2:*
+                  - rds:*
+                  - s3:*
+                  - lambda:*
+                  - states:*
+                  - events:*
+                  - cloudwatch:*
+                  - sns:*
+                  - logs:*
+                  - backup:*
+                  - route53:*
+                  - elasticloadbalancing:*
+                  - iam:PassRole
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/BCTestingRole-${ProjectId}'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectId
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'BusinessContinuityTesting'
+
+  # ================================================================
+  # S3 Bucket for Test Results and Reports
+  # ================================================================
+  
+  TestResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'bc-testing-results-${ProjectId}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: BCTestResultsRetention
+            Status: Enabled
+            Prefix: 'test-results/'
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+            ExpirationInDays: 2555
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref BCTestingLogGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectId
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'BusinessContinuityTesting'
+
+  # ================================================================
+  # CloudWatch Log Group for BC Testing
+  # ================================================================
+  
+  BCTestingLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/bc-testing/${ProjectId}'
+      RetentionInDays: 90
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectId
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ================================================================
+  # SNS Topic for BC Testing Notifications
+  # ================================================================
+  
+  BCAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'bc-alerts-${ProjectId}'
+      DisplayName: 'Business Continuity Testing Alerts'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectId
+        - Key: Environment
+          Value: !Ref Environment
+
+  BCAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref BCAlertsTopic
+      Endpoint: !Ref NotificationEmail
+
+  # ================================================================
+  # Systems Manager Automation Documents
+  # ================================================================
+  
+  BackupValidationDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: !Sub 'BC-BackupValidation-${ProjectId}'
+      DocumentType: Automation
+      DocumentFormat: YAML
+      Content:
+        schemaVersion: '0.3'
+        description: 'Validate backup integrity and restore capabilities'
+        assumeRole: '{{ AutomationAssumeRole }}'
+        parameters:
+          InstanceId:
+            type: String
+            description: 'EC2 instance ID to test backup restore'
+          BackupVaultName:
+            type: String
+            description: 'AWS Backup vault name'
+          AutomationAssumeRole:
+            type: String
+            description: 'IAM role for automation execution'
+        mainSteps:
+          - name: GetLatestRecoveryPoint
+            action: 'aws:executeScript'
+            inputs:
+              Runtime: python3.8
+              Handler: get_latest_recovery_point
+              Script: |
+                import boto3
+                import json
+                
+                def get_latest_recovery_point(events, context):
+                    backup = boto3.client('backup')
+                    vault_name = events['BackupVaultName']
+                    instance_id = events['InstanceId']
+                    
+                    try:
+                        response = backup.list_recovery_points_by_backup_vault(
+                            BackupVaultName=vault_name,
+                            ByResourceType='EC2'
+                        )
+                        
+                        # Find latest recovery point for the instance
+                        recovery_points = [rp for rp in response['RecoveryPoints'] 
+                                         if instance_id in rp.get('ResourceArn', '')]
+                        
+                        if not recovery_points:
+                            return {'statusCode': 404, 'body': 'No recovery points found'}
+                        
+                        latest = max(recovery_points, key=lambda x: x['CreationDate'])
+                        
+                        return {
+                            'statusCode': 200,
+                            'RecoveryPointArn': latest['RecoveryPointArn'],
+                            'CreationDate': latest['CreationDate'].isoformat()
+                        }
+                        
+                    except Exception as e:
+                        return {'statusCode': 500, 'body': str(e)}
+              InputPayload:
+                InstanceId: '{{ InstanceId }}'
+                BackupVaultName: '{{ BackupVaultName }}'
+            outputs:
+              - Name: RecoveryPointArn
+                Selector: $.Payload.RecoveryPointArn
+                Type: String
+          - name: ValidateBackupExists
+            action: 'aws:executeScript'
+            inputs:
+              Runtime: python3.8
+              Handler: validate_backup
+              Script: |
+                import boto3
+                
+                def validate_backup(events, context):
+                    backup = boto3.client('backup')
+                    recovery_point_arn = events['RecoveryPointArn']
+                    
+                    try:
+                        response = backup.describe_recovery_point(
+                            BackupVaultName=events['BackupVaultName'],
+                            RecoveryPointArn=recovery_point_arn
+                        )
+                        
+                        status = response['Status']
+                        
+                        return {
+                            'statusCode': 200,
+                            'backupStatus': status,
+                            'backupSize': response.get('BackupSizeInBytes', 0),
+                            'isValid': status == 'COMPLETED'
+                        }
+                        
+                    except Exception as e:
+                        return {'statusCode': 500, 'error': str(e)}
+              InputPayload:
+                RecoveryPointArn: '{{ GetLatestRecoveryPoint.RecoveryPointArn }}'
+                BackupVaultName: '{{ BackupVaultName }}'
+            outputs:
+              - Name: BackupStatus
+                Selector: $.Payload.backupStatus
+                Type: String
+              - Name: IsValid
+                Selector: $.Payload.isValid
+                Type: Boolean
+        outputs:
+          - BackupStatus: '{{ ValidateBackupExists.BackupStatus }}'
+          - IsValid: '{{ ValidateBackupExists.IsValid }}'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectId
+        - Key: Purpose
+          Value: 'BusinessContinuityTesting'
+
+  DatabaseRecoveryDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: !Sub 'BC-DatabaseRecovery-${ProjectId}'
+      DocumentType: Automation
+      DocumentFormat: YAML
+      Content:
+        schemaVersion: '0.3'
+        description: 'Test database backup and recovery procedures'
+        assumeRole: '{{ AutomationAssumeRole }}'
+        parameters:
+          DBInstanceIdentifier:
+            type: String
+            description: 'RDS instance identifier'
+          DBSnapshotIdentifier:
+            type: String
+            description: 'Snapshot to restore from'
+          TestDBInstanceIdentifier:
+            type: String
+            description: 'Test database instance identifier'
+          AutomationAssumeRole:
+            type: String
+            description: 'IAM role for automation execution'
+        mainSteps:
+          - name: ValidateSnapshot
+            action: 'aws:executeAwsApi'
+            inputs:
+              Service: rds
+              Api: DescribeDBSnapshots
+              DBSnapshotIdentifier: '{{ DBSnapshotIdentifier }}'
+            outputs:
+              - Name: SnapshotStatus
+                Selector: $.DBSnapshots[0].Status
+                Type: String
+          - name: CheckSnapshotReady
+            action: 'aws:assertAwsResourceProperty'
+            inputs:
+              Service: rds
+              Api: DescribeDBSnapshots
+              DBSnapshotIdentifier: '{{ DBSnapshotIdentifier }}'
+              PropertySelector: $.DBSnapshots[0].Status
+              DesiredValues:
+                - available
+          - name: CreateTestDatabase
+            action: 'aws:executeAwsApi'
+            inputs:
+              Service: rds
+              Api: RestoreDBInstanceFromDBSnapshot
+              DBInstanceIdentifier: '{{ TestDBInstanceIdentifier }}'
+              DBSnapshotIdentifier: '{{ DBSnapshotIdentifier }}'
+              DBInstanceClass: db.t3.micro
+              PubliclyAccessible: false
+              StorageEncrypted: true
+              DeletionProtection: false
+            outputs:
+              - Name: TestDBEndpoint
+                Selector: $.DBInstance.Endpoint.Address
+                Type: String
+          - name: WaitForDBAvailable
+            action: 'aws:waitForAwsResourceProperty'
+            inputs:
+              Service: rds
+              Api: DescribeDBInstances
+              DBInstanceIdentifier: '{{ TestDBInstanceIdentifier }}'
+              PropertySelector: $.DBInstances[0].DBInstanceStatus
+              DesiredValues:
+                - available
+            timeoutSeconds: 1800
+          - name: ValidateDBConnectivity
+            action: 'aws:executeScript'
+            inputs:
+              Runtime: python3.8
+              Handler: test_db_connection
+              Script: |
+                import boto3
+                import time
+                
+                def test_db_connection(events, context):
+                    endpoint = events.get('DBEndpoint', '')
+                    instance_id = events['TestDBInstanceIdentifier']
+                    
+                    # Simulate basic connectivity test
+                    # In real implementation, this would use actual database connection
+                    try:
+                        rds = boto3.client('rds')
+                        response = rds.describe_db_instances(
+                            DBInstanceIdentifier=instance_id
+                        )
+                        
+                        db_instance = response['DBInstances'][0]
+                        status = db_instance['DBInstanceStatus']
+                        
+                        return {
+                            'statusCode': 200,
+                            'connectionTest': 'SUCCESS' if status == 'available' else 'FAILED',
+                            'dbStatus': status,
+                            'endpoint': endpoint
+                        }
+                        
+                    except Exception as e:
+                        return {
+                            'statusCode': 500,
+                            'connectionTest': 'FAILED',
+                            'error': str(e)
+                        }
+              InputPayload:
+                DBEndpoint: '{{ CreateTestDatabase.TestDBEndpoint }}'
+                TestDBInstanceIdentifier: '{{ TestDBInstanceIdentifier }}'
+            outputs:
+              - Name: ConnectionTestResult
+                Selector: $.Payload.connectionTest
+                Type: String
+          - name: CleanupTestDatabase
+            action: 'aws:executeAwsApi'
+            inputs:
+              Service: rds
+              Api: DeleteDBInstance
+              DBInstanceIdentifier: '{{ TestDBInstanceIdentifier }}'
+              SkipFinalSnapshot: true
+              DeleteAutomatedBackups: true
+        outputs:
+          - ConnectionTestResult: '{{ ValidateDBConnectivity.ConnectionTestResult }}'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectId
+        - Key: Purpose
+          Value: 'BusinessContinuityTesting'
+
+  ApplicationFailoverDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: !Sub 'BC-ApplicationFailover-${ProjectId}'
+      DocumentType: Automation
+      DocumentFormat: YAML
+      Content:
+        schemaVersion: '0.3'
+        description: 'Test application failover to secondary region'
+        assumeRole: '{{ AutomationAssumeRole }}'
+        parameters:
+          PrimaryLoadBalancerArn:
+            type: String
+            description: 'Primary Application Load Balancer ARN'
+          SecondaryLoadBalancerArn:
+            type: String
+            description: 'Secondary Application Load Balancer ARN'
+          Route53HostedZoneId:
+            type: String
+            description: 'Route 53 hosted zone ID'
+          DomainName:
+            type: String
+            description: 'Domain name for failover testing'
+          AutomationAssumeRole:
+            type: String
+            description: 'IAM role for automation execution'
+        mainSteps:
+          - name: CheckPrimaryApplicationHealth
+            action: 'aws:executeScript'
+            inputs:
+              Runtime: python3.8
+              Handler: check_application_health
+              Script: |
+                import boto3
+                import json
+                
+                def check_application_health(events, context):
+                    domain = events['DomainName']
+                    
+                    # Simulate health check - in real implementation use actual HTTP requests
+                    try:
+                        elbv2 = boto3.client('elbv2')
+                        response = elbv2.describe_load_balancers(
+                            LoadBalancerArns=[events['PrimaryLoadBalancerArn']]
+                        )
+                        
+                        lb_state = response['LoadBalancers'][0]['State']['Code']
+                        healthy = lb_state == 'active'
+                        
+                        return {
+                            'statusCode': 200 if healthy else 500,
+                            'healthy': healthy,
+                            'loadBalancerState': lb_state
+                        }
+                        
+                    except Exception as e:
+                        return {
+                            'statusCode': 500,
+                            'healthy': False,
+                            'error': str(e)
+                        }
+              InputPayload:
+                DomainName: '{{ DomainName }}'
+                PrimaryLoadBalancerArn: '{{ PrimaryLoadBalancerArn }}'
+            outputs:
+              - Name: PrimaryHealthStatus
+                Selector: $.Payload.healthy
+                Type: Boolean
+          - name: ValidateRoute53Configuration
+            action: 'aws:executeScript'
+            inputs:
+              Runtime: python3.8
+              Handler: validate_dns_config
+              Script: |
+                import boto3
+                
+                def validate_dns_config(events, context):
+                    route53 = boto3.client('route53')
+                    hosted_zone_id = events['HostedZoneId']
+                    domain = events['DomainName']
+                    
+                    try:
+                        response = route53.list_resource_record_sets(
+                            HostedZoneId=hosted_zone_id
+                        )
+                        
+                        # Find existing records for the domain
+                        records = [r for r in response['ResourceRecordSets'] 
+                                 if r['Name'].rstrip('.') == domain.rstrip('.')]
+                        
+                        return {
+                            'statusCode': 200,
+                            'recordsFound': len(records),
+                            'configurationValid': len(records) > 0
+                        }
+                        
+                    except Exception as e:
+                        return {
+                            'statusCode': 500,
+                            'error': str(e),
+                            'configurationValid': False
+                        }
+              InputPayload:
+                HostedZoneId: '{{ Route53HostedZoneId }}'
+                DomainName: '{{ DomainName }}'
+            outputs:
+              - Name: ConfigurationValid
+                Selector: $.Payload.configurationValid
+                Type: Boolean
+        outputs:
+          - PrimaryHealthStatus: '{{ CheckPrimaryApplicationHealth.PrimaryHealthStatus }}'
+          - ConfigurationValid: '{{ ValidateRoute53Configuration.ConfigurationValid }}'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectId
+        - Key: Purpose
+          Value: 'BusinessContinuityTesting'
+
+  # ================================================================
+  # Lambda Functions for Test Orchestration
+  # ================================================================
+  
+  BCTestOrchestratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'bc-test-orchestrator-${ProjectId}'
+      Description: 'Lambda function for business continuity test orchestration'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt BCTestingRole.Arn
+      Timeout: 900
+      MemorySize: 256
+      Environment:
+        Variables:
+          PROJECT_ID: !Ref ProjectId
+          RESULTS_BUCKET: !Ref TestResultsBucket
+          AUTOMATION_ROLE_ARN: !GetAtt BCTestingRole.Arn
+          SNS_TOPIC_ARN: !Ref BCAlertsTopic
+          TEST_INSTANCE_ID: !Ref TestInstanceId
+          BACKUP_VAULT_NAME: !Ref BackupVaultName
+          DB_INSTANCE_ID: !Ref DatabaseInstanceId
+          DB_SNAPSHOT_ID: !Ref DatabaseSnapshotId
+          PRIMARY_ALB_ARN: !Ref PrimaryLoadBalancerArn
+          SECONDARY_ALB_ARN: !Ref SecondaryLoadBalancerArn
+          HOSTED_ZONE_ID: !Ref Route53HostedZoneId
+          DOMAIN_NAME: !Ref DomainName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import datetime
+          import uuid
+          import os
+          from typing import Dict, List
+          
+          def lambda_handler(event, context):
+              ssm = boto3.client('ssm')
+              s3 = boto3.client('s3')
+              sns = boto3.client('sns')
+              
+              test_type = event.get('testType', 'daily')
+              test_id = str(uuid.uuid4())
+              
+              test_results = {
+                  'testId': test_id,
+                  'testType': test_type,
+                  'timestamp': datetime.datetime.utcnow().isoformat(),
+                  'results': []
+              }
+              
+              try:
+                  if test_type in ['daily', 'weekly', 'monthly']:
+                      # Execute backup validation
+                      backup_result = execute_backup_validation(ssm, test_id)
+                      test_results['results'].append(backup_result)
+                  
+                  if test_type in ['weekly', 'monthly'] and os.environ.get('DB_INSTANCE_ID'):
+                      # Execute database recovery test
+                      db_result = execute_database_recovery_test(ssm, test_id)
+                      test_results['results'].append(db_result)
+                  
+                  if test_type == 'monthly' and os.environ.get('PRIMARY_ALB_ARN'):
+                      # Execute application failover test
+                      app_result = execute_application_failover_test(ssm, test_id)
+                      test_results['results'].append(app_result)
+                  
+                  # Store results in S3
+                  s3.put_object(
+                      Bucket=os.environ['RESULTS_BUCKET'],
+                      Key=f'test-results/{test_type}/{test_id}/results.json',
+                      Body=json.dumps(test_results, indent=2),
+                      ContentType='application/json'
+                  )
+                  
+                  # Generate summary report
+                  summary = generate_test_summary(test_results)
+                  
+                  # Send notification
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=f'BC Testing {test_type.title()} Report - {test_id[:8]}',
+                      Message=summary
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'testId': test_id,
+                          'summary': summary
+                      })
+                  }
+                  
+              except Exception as e:
+                  error_message = f'BC testing failed: {str(e)}'
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=f'BC Testing Failed - {test_id[:8]}',
+                      Message=error_message
+                  )
+                  raise e
+          
+          def execute_backup_validation(ssm, test_id):
+              response = ssm.start_automation_execution(
+                  DocumentName=f'BC-BackupValidation-{os.environ["PROJECT_ID"]}',
+                  Parameters={
+                      'InstanceId': [os.environ.get('TEST_INSTANCE_ID', 'i-1234567890abcdef0')],
+                      'BackupVaultName': [os.environ.get('BACKUP_VAULT_NAME', 'default')],
+                      'AutomationAssumeRole': [os.environ['AUTOMATION_ROLE_ARN']]
+                  }
+              )
+              
+              return {
+                  'test': 'backup_validation',
+                  'executionId': response['AutomationExecutionId'],
+                  'status': 'started'
+              }
+          
+          def execute_database_recovery_test(ssm, test_id):
+              response = ssm.start_automation_execution(
+                  DocumentName=f'BC-DatabaseRecovery-{os.environ["PROJECT_ID"]}',
+                  Parameters={
+                      'DBInstanceIdentifier': [os.environ.get('DB_INSTANCE_ID', 'prod-db')],
+                      'DBSnapshotIdentifier': [os.environ.get('DB_SNAPSHOT_ID', 'latest-snapshot')],
+                      'TestDBInstanceIdentifier': [f'test-db-{test_id[:8]}'],
+                      'AutomationAssumeRole': [os.environ['AUTOMATION_ROLE_ARN']]
+                  }
+              )
+              
+              return {
+                  'test': 'database_recovery',
+                  'executionId': response['AutomationExecutionId'],
+                  'status': 'started'
+              }
+          
+          def execute_application_failover_test(ssm, test_id):
+              response = ssm.start_automation_execution(
+                  DocumentName=f'BC-ApplicationFailover-{os.environ["PROJECT_ID"]}',
+                  Parameters={
+                      'PrimaryLoadBalancerArn': [os.environ.get('PRIMARY_ALB_ARN', '')],
+                      'SecondaryLoadBalancerArn': [os.environ.get('SECONDARY_ALB_ARN', '')],
+                      'Route53HostedZoneId': [os.environ.get('HOSTED_ZONE_ID', '')],
+                      'DomainName': [os.environ.get('DOMAIN_NAME', '')],
+                      'AutomationAssumeRole': [os.environ['AUTOMATION_ROLE_ARN']]
+                  }
+              )
+              
+              return {
+                  'test': 'application_failover',
+                  'executionId': response['AutomationExecutionId'],
+                  'status': 'started'
+              }
+          
+          def generate_test_summary(test_results):
+              total_tests = len(test_results['results'])
+              summary = f"""
+          Business Continuity Testing Summary
+          Test ID: {test_results['testId']}
+          Test Type: {test_results['testType']}
+          Timestamp: {test_results['timestamp']}
+          
+          Tests Executed: {total_tests}
+          
+          Test Results:
+          """
+              
+              for result in test_results['results']:
+                  summary += f"- {result['test']}: {result['status']}\n"
+              
+              return summary
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectId
+        - Key: Environment
+          Value: !Ref Environment
+
+  ComplianceReporterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'bc-compliance-reporter-${ProjectId}'
+      Description: 'Lambda function for BC compliance reporting'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt BCTestingRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          RESULTS_BUCKET: !Ref TestResultsBucket
+          PROJECT_ID: !Ref ProjectId
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import datetime
+          from typing import Dict, List
+          import os
+          
+          def lambda_handler(event, context):
+              s3 = boto3.client('s3')
+              ssm = boto3.client('ssm')
+              
+              # Generate monthly compliance report
+              report_data = generate_compliance_report(s3, ssm)
+              
+              # Store compliance report
+              report_key = f"compliance-reports/{datetime.datetime.utcnow().strftime('%Y-%m')}/bc-compliance-report.json"
+              
+              s3.put_object(
+                  Bucket=os.environ['RESULTS_BUCKET'],
+                  Key=report_key,
+                  Body=json.dumps(report_data, indent=2),
+                  ContentType='application/json'
+              )
+              
+              # Generate HTML report
+              html_report = generate_html_report(report_data)
+              
+              s3.put_object(
+                  Bucket=os.environ['RESULTS_BUCKET'],
+                  Key=f"compliance-reports/{datetime.datetime.utcnow().strftime('%Y-%m')}/bc-compliance-report.html",
+                  Body=html_report,
+                  ContentType='text/html'
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'reportGenerated': True,
+                      'reportLocation': report_key
+                  })
+              }
+          
+          def generate_compliance_report(s3, ssm):
+              # Collect test execution data from the past month
+              start_date = datetime.datetime.utcnow() - datetime.timedelta(days=30)
+              
+              report = {
+                  'reportPeriod': {
+                      'start': start_date.isoformat(),
+                      'end': datetime.datetime.utcnow().isoformat()
+                  },
+                  'testingSummary': {
+                      'dailyTests': 0,
+                      'weeklyTests': 0,
+                      'monthlyTests': 0,
+                      'totalTests': 0,
+                      'successfulTests': 0,
+                      'failedTests': 0
+                  },
+                  'complianceStatus': 'COMPLIANT',
+                  'recommendations': []
+              }
+              
+              # Analyze test execution history
+              # This would integrate with actual Systems Manager execution history
+              
+              return report
+          
+          def generate_html_report(report_data):
+              html = f"""
+              <!DOCTYPE html>
+              <html>
+              <head>
+                  <title>Business Continuity Compliance Report</title>
+                  <style>
+                      body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                      .header {{ background-color: #f0f0f0; padding: 20px; }}
+                      .summary {{ margin: 20px 0; }}
+                      .compliant {{ color: green; }}
+                      .non-compliant {{ color: red; }}
+                      table {{ border-collapse: collapse; width: 100%; }}
+                      th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+                      th {{ background-color: #f2f2f2; }}
+                  </style>
+              </head>
+              <body>
+                  <div class="header">
+                      <h1>Business Continuity Testing Compliance Report</h1>
+                      <p>Report Period: {report_data['reportPeriod']['start']} to {report_data['reportPeriod']['end']}</p>
+                  </div>
+                  
+                  <div class="summary">
+                      <h2>Testing Summary</h2>
+                      <p>Total Tests Executed: {report_data['testingSummary']['totalTests']}</p>
+                      <p>Successful Tests: {report_data['testingSummary']['successfulTests']}</p>
+                      <p>Failed Tests: {report_data['testingSummary']['failedTests']}</p>
+                      <p>Compliance Status: <span class="{report_data['complianceStatus'].lower()}">{report_data['complianceStatus']}</span></p>
+                  </div>
+              </body>
+              </html>
+              """
+              return html
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectId
+        - Key: Environment
+          Value: !Ref Environment
+
+  ManualTestExecutorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'bc-manual-test-executor-${ProjectId}'
+      Description: 'Lambda function for manual BC test execution'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt BCTestingRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          PROJECT_ID: !Ref ProjectId
+          AUTOMATION_ROLE_ARN: !GetAtt BCTestingRole.Arn
+          TEST_INSTANCE_ID: !Ref TestInstanceId
+          BACKUP_VAULT_NAME: !Ref BackupVaultName
+          DB_INSTANCE_ID: !Ref DatabaseInstanceId
+          DB_SNAPSHOT_ID: !Ref DatabaseSnapshotId
+          PRIMARY_ALB_ARN: !Ref PrimaryLoadBalancerArn
+          SECONDARY_ALB_ARN: !Ref SecondaryLoadBalancerArn
+          HOSTED_ZONE_ID: !Ref Route53HostedZoneId
+          DOMAIN_NAME: !Ref DomainName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          
+          def lambda_handler(event, context):
+              ssm = boto3.client('ssm')
+              
+              test_type = event.get('testType', 'comprehensive')
+              test_components = event.get('components', ['backup', 'database', 'application'])
+              
+              execution_results = []
+              
+              for component in test_components:
+                  if component == 'backup':
+                      result = execute_backup_test(ssm)
+                      execution_results.append(result)
+                  elif component == 'database' and os.environ.get('DB_INSTANCE_ID'):
+                      result = execute_database_test(ssm)
+                      execution_results.append(result)
+                  elif component == 'application' and os.environ.get('PRIMARY_ALB_ARN'):
+                      result = execute_application_test(ssm)
+                      execution_results.append(result)
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'testType': test_type,
+                      'executionId': str(uuid.uuid4()),
+                      'results': execution_results
+                  })
+              }
+          
+          def execute_backup_test(ssm):
+              response = ssm.start_automation_execution(
+                  DocumentName=f'BC-BackupValidation-{os.environ["PROJECT_ID"]}',
+                  Parameters={
+                      'InstanceId': [os.environ.get('TEST_INSTANCE_ID', 'i-1234567890abcdef0')],
+                      'BackupVaultName': [os.environ.get('BACKUP_VAULT_NAME', 'default')],
+                      'AutomationAssumeRole': [os.environ['AUTOMATION_ROLE_ARN']]
+                  }
+              )
+              return {'component': 'backup', 'executionId': response['AutomationExecutionId']}
+          
+          def execute_database_test(ssm):
+              response = ssm.start_automation_execution(
+                  DocumentName=f'BC-DatabaseRecovery-{os.environ["PROJECT_ID"]}',
+                  Parameters={
+                      'DBInstanceIdentifier': [os.environ.get('DB_INSTANCE_ID', 'prod-db')],
+                      'DBSnapshotIdentifier': [os.environ.get('DB_SNAPSHOT_ID', 'latest-snapshot')],
+                      'TestDBInstanceIdentifier': [f'manual-test-{uuid.uuid4().hex[:8]}'],
+                      'AutomationAssumeRole': [os.environ['AUTOMATION_ROLE_ARN']]
+                  }
+              )
+              return {'component': 'database', 'executionId': response['AutomationExecutionId']}
+          
+          def execute_application_test(ssm):
+              response = ssm.start_automation_execution(
+                  DocumentName=f'BC-ApplicationFailover-{os.environ["PROJECT_ID"]}',
+                  Parameters={
+                      'PrimaryLoadBalancerArn': [os.environ.get('PRIMARY_ALB_ARN', '')],
+                      'SecondaryLoadBalancerArn': [os.environ.get('SECONDARY_ALB_ARN', '')],
+                      'Route53HostedZoneId': [os.environ.get('HOSTED_ZONE_ID', '')],
+                      'DomainName': [os.environ.get('DOMAIN_NAME', '')],
+                      'AutomationAssumeRole': [os.environ['AUTOMATION_ROLE_ARN']]
+                  }
+              )
+              return {'component': 'application', 'executionId': response['AutomationExecutionId']}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectId
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ================================================================
+  # EventBridge Rules for Automated Testing Schedules
+  # ================================================================
+  
+  DailyTestScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'bc-daily-tests-${ProjectId}'
+      Description: 'Daily business continuity basic tests'
+      ScheduleExpression: !Ref DailyTestSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt BCTestOrchestratorFunction.Arn
+          Id: 'DailyTestTarget'
+          Input: '{"testType":"daily"}'
+
+  WeeklyTestScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'bc-weekly-tests-${ProjectId}'
+      Description: 'Weekly comprehensive business continuity tests'
+      ScheduleExpression: !Ref WeeklyTestSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt BCTestOrchestratorFunction.Arn
+          Id: 'WeeklyTestTarget'
+          Input: '{"testType":"weekly"}'
+
+  MonthlyTestScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'bc-monthly-tests-${ProjectId}'
+      Description: 'Monthly full disaster recovery tests'
+      ScheduleExpression: !Ref MonthlyTestSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt BCTestOrchestratorFunction.Arn
+          Id: 'MonthlyTestTarget'
+          Input: '{"testType":"monthly"}'
+
+  ComplianceReportingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'bc-compliance-reporting-${ProjectId}'
+      Description: 'Monthly BC compliance reporting'
+      ScheduleExpression: 'cron(0 8 1 * ? *)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ComplianceReporterFunction.Arn
+          Id: 'ComplianceReportingTarget'
+
+  # ================================================================
+  # Lambda Permissions for EventBridge
+  # ================================================================
+  
+  DailyTestLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BCTestOrchestratorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyTestScheduleRule.Arn
+
+  WeeklyTestLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BCTestOrchestratorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WeeklyTestScheduleRule.Arn
+
+  MonthlyTestLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BCTestOrchestratorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MonthlyTestScheduleRule.Arn
+
+  ComplianceReportingLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ComplianceReporterFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ComplianceReportingRule.Arn
+
+  # ================================================================
+  # CloudWatch Dashboard for BC Testing Monitoring
+  # ================================================================
+  
+  BCTestingDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'BC-Testing-${ProjectId}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${BCTestOrchestratorFunction}"],
+                  [".", "Errors", ".", "."],
+                  [".", "Invocations", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "BC Testing Lambda Metrics",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/SSM", "ExecutionSuccess", "DocumentName", "BC-BackupValidation-${ProjectId}"],
+                  [".", "ExecutionFailed", ".", "."],
+                  [".", "ExecutionSuccess", "DocumentName", "BC-DatabaseRecovery-${ProjectId}"],
+                  [".", "ExecutionFailed", ".", "."],
+                  [".", "ExecutionSuccess", "DocumentName", "BC-ApplicationFailover-${ProjectId}"],
+                  [".", "ExecutionFailed", ".", "."]
+                ],
+                "period": 86400,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "BC Testing Success/Failure Rates",
+                "view": "number"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${BCTestOrchestratorFunction}' | fields @timestamp, @message | filter @message like /Test/ | sort @timestamp desc | limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent BC Test Executions",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  BCTestingRoleArn:
+    Description: 'ARN of the IAM role for BC testing automation'
+    Value: !GetAtt BCTestingRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BCTestingRole'
+
+  TestResultsBucketName:
+    Description: 'S3 bucket name for test results and reports'
+    Value: !Ref TestResultsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-TestResultsBucket'
+
+  BCTestOrchestratorFunctionArn:
+    Description: 'ARN of the BC test orchestrator Lambda function'
+    Value: !GetAtt BCTestOrchestratorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BCTestOrchestrator'
+
+  ManualTestExecutorFunctionArn:
+    Description: 'ARN of the manual test executor Lambda function'
+    Value: !GetAtt ManualTestExecutorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ManualTestExecutor'
+
+  ComplianceReporterFunctionArn:
+    Description: 'ARN of the compliance reporter Lambda function'
+    Value: !GetAtt ComplianceReporterFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ComplianceReporter'
+
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for BC testing alerts'
+    Value: !Ref BCAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopic'
+
+  CloudWatchDashboardURL:
+    Description: 'URL of the CloudWatch dashboard for BC testing monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=BC-Testing-${ProjectId}'
+
+  AutomationDocuments:
+    Description: 'List of created Systems Manager automation documents'
+    Value: !Sub 'BC-BackupValidation-${ProjectId}, BC-DatabaseRecovery-${ProjectId}, BC-ApplicationFailover-${ProjectId}'
+
+  TestingSchedules:
+    Description: 'EventBridge rules for automated testing schedules'
+    Value: !Sub 'Daily: ${DailyTestSchedule}, Weekly: ${WeeklyTestSchedule}, Monthly: ${MonthlyTestSchedule}'
+
+  ManualTestInvocationCommand:
+    Description: 'AWS CLI command to manually trigger BC tests'
+    Value: !Sub 'aws lambda invoke --function-name ${ManualTestExecutorFunction} --payload '"'"'{"testType":"manual","components":["backup","database","application"]}'"'"' response.json'

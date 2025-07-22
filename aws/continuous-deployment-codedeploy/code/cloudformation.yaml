@@ -1,0 +1,926 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Complete CI/CD pipeline with CodeDeploy blue-green deployment strategy for continuous deployment automation'
+
+Parameters:
+  # Application Configuration
+  ApplicationName:
+    Type: String
+    Default: webapp-demo
+    Description: Name of the application to deploy
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+    MaxLength: 32
+    MinLength: 3
+
+  # Environment Configuration
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment type for resource tagging and configuration
+
+  # Network Configuration
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where resources will be created
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of subnet IDs for load balancer and instances (minimum 2 subnets in different AZs)
+
+  # Instance Configuration
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+    Description: EC2 instance type for the application servers
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access to instances
+
+  # Auto Scaling Configuration
+  MinSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Minimum number of instances in Auto Scaling Group
+
+  MaxSize:
+    Type: Number
+    Default: 4
+    MinValue: 2
+    MaxValue: 20
+    Description: Maximum number of instances in Auto Scaling Group
+
+  DesiredCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Desired number of instances in Auto Scaling Group
+
+  # Repository Configuration
+  RepositoryName:
+    Type: String
+    Default: webapp-repo
+    Description: Name of the CodeCommit repository
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+    MaxLength: 100
+    MinLength: 3
+
+  # Build Configuration
+  BuildProjectName:
+    Type: String
+    Default: webapp-build
+    Description: Name of the CodeBuild project
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+    MaxLength: 100
+    MinLength: 3
+
+  # Deployment Configuration
+  DeploymentGroupName:
+    Type: String
+    Default: webapp-deployment-group
+    Description: Name of the CodeDeploy deployment group
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+    MaxLength: 100
+    MinLength: 3
+
+  # Monitoring Configuration
+  EnableCloudWatchAlarms:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable CloudWatch alarms for monitoring deployment health
+
+  # Cost Control
+  TerminateBlueInstancesDelay:
+    Type: Number
+    Default: 5
+    MinValue: 0
+    MaxValue: 60
+    Description: Minutes to wait before terminating blue instances after successful deployment
+
+Conditions:
+  CreateCloudWatchAlarms: !Equals [!Ref EnableCloudWatchAlarms, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+Mappings:
+  # AMI mappings for different regions (Amazon Linux 2)
+  AmiMap:
+    us-east-1:
+      AMI: ami-0c02fb55956c7d316
+    us-west-2:
+      AMI: ami-0841edc20334f9287
+    eu-west-1:
+      AMI: ami-08ca3fed11864d6bb
+    ap-southeast-1:
+      AMI: ami-0c802847a7dd848c0
+
+Resources:
+  # ===== IAM ROLES AND POLICIES =====
+  
+  # CodeDeploy Service Role
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-CodeDeploy-ServiceRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-CodeDeploy-ServiceRole'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # EC2 Instance Role for CodeDeploy Agent
+  CodeDeployEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-CodeDeploy-EC2Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforAWSCodeDeploy
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-CodeDeploy-EC2Role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # EC2 Instance Profile
+  CodeDeployEC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ApplicationName}-CodeDeploy-InstanceProfile'
+      Roles:
+        - !Ref CodeDeployEC2Role
+
+  # CodeBuild Service Role
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-CodeBuild-ServiceRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildServicePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*'
+              - Effect: Allow
+                Action:
+                  - codecommit:GitPull
+                Resource: !GetAtt CodeCommitRepository.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource: !Sub '${ArtifactsBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource: !Ref ArtifactsBucket
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-CodeBuild-ServiceRole'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # ===== NETWORKING RESOURCES =====
+  
+  # Security Group for Application Load Balancer
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ApplicationName}-ALB-SecurityGroup'
+      GroupDescription: Security group for Application Load Balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTP traffic from internet
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTPS traffic from internet
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-ALB-SecurityGroup'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # Security Group for EC2 Instances
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ApplicationName}-EC2-SecurityGroup'
+      GroupDescription: Security group for EC2 instances
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Allow HTTP traffic from ALB
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 10.0.0.0/8
+          Description: Allow SSH access from private networks
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-EC2-SecurityGroup'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # ===== LOAD BALANCER RESOURCES =====
+  
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ApplicationName}-ALB'
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Ref SubnetIds
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-ALB'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # Target Group for Blue Environment
+  BlueTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ApplicationName}-Blue-TG'
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-Blue-TG'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # Target Group for Green Environment
+  GreenTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ApplicationName}-Green-TG'
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-Green-TG'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # ALB Listener
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref BlueTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # ===== COMPUTE RESOURCES =====
+  
+  # Launch Template for Auto Scaling Group
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ApplicationName}-LaunchTemplate'
+      LaunchTemplateData:
+        ImageId: !FindInMap [AmiMap, !Ref 'AWS::Region', AMI]
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyPairName
+        SecurityGroupIds:
+          - !Ref EC2SecurityGroup
+        IamInstanceProfile:
+          Name: !Ref CodeDeployEC2InstanceProfile
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y ruby wget httpd
+            
+            # Start and enable Apache
+            systemctl start httpd
+            systemctl enable httpd
+            
+            # Create initial web page
+            echo "<h1>Blue Environment - ${ApplicationName}</h1>" > /var/www/html/index.html
+            echo "<p>Version: 1.0</p>" >> /var/www/html/index.html
+            echo "<p>Environment: ${Environment}</p>" >> /var/www/html/index.html
+            echo "<p>Deployment: Initial</p>" >> /var/www/html/index.html
+            
+            # Install CodeDeploy Agent
+            cd /home/ec2-user
+            wget https://aws-codedeploy-${AWS::Region}.s3.${AWS::Region}.amazonaws.com/latest/install
+            chmod +x ./install
+            ./install auto
+            
+            # Start and enable CodeDeploy Agent
+            systemctl start codedeploy-agent
+            systemctl enable codedeploy-agent
+            
+            # Install CloudWatch Agent
+            yum install -y amazon-cloudwatch-agent
+            
+            # Configure CloudWatch Agent
+            cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'EOF'
+            {
+              "metrics": {
+                "namespace": "AWS/EC2",
+                "metrics_collected": {
+                  "cpu": {
+                    "measurement": [
+                      "cpu_usage_idle",
+                      "cpu_usage_iowait",
+                      "cpu_usage_user",
+                      "cpu_usage_system"
+                    ],
+                    "metrics_collection_interval": 60
+                  },
+                  "mem": {
+                    "measurement": [
+                      "mem_used_percent"
+                    ],
+                    "metrics_collection_interval": 60
+                  },
+                  "disk": {
+                    "measurement": [
+                      "used_percent"
+                    ],
+                    "metrics_collection_interval": 60,
+                    "resources": [
+                      "*"
+                    ]
+                  }
+                }
+              }
+            }
+            EOF
+            
+            # Start CloudWatch Agent
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+              -a fetch-config \
+              -m ec2 \
+              -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json \
+              -s
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${ApplicationName}-Instance'
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: Application
+                Value: !Ref ApplicationName
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: Name
+              Value: !Sub '${ApplicationName}-LaunchTemplate'
+            - Key: Environment
+              Value: !Ref Environment
+            - Key: Application
+              Value: !Ref ApplicationName
+
+  # Auto Scaling Group
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${ApplicationName}-ASG'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      TargetGroupARNs:
+        - !Ref BlueTargetGroup
+      VPCZoneIdentifier: !Ref SubnetIds
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-ASG'
+          PropagateAtLaunch: false
+        - Key: Environment
+          Value: !Ref Environment
+          PropagateAtLaunch: true
+        - Key: Application
+          Value: !Ref ApplicationName
+          PropagateAtLaunch: true
+
+  # ===== CI/CD PIPELINE RESOURCES =====
+  
+  # S3 Bucket for Build Artifacts
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ApplicationName}-artifacts-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-artifacts-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # CodeCommit Repository
+  CodeCommitRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      RepositoryDescription: !Sub 'Repository for ${ApplicationName} application'
+      Tags:
+        - Key: Name
+          Value: !Ref RepositoryName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # CodeBuild Project
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Ref BuildProjectName
+      Description: !Sub 'Build project for ${ApplicationName}'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: S3
+        Location: !Sub '${ArtifactsBucket}/artifacts'
+        Packaging: ZIP
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref 'AWS::Region'
+          - Name: APPLICATION_NAME
+            Value: !Ref ApplicationName
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+      Source:
+        Type: CODECOMMIT
+        Location: !GetAtt CodeCommitRepository.CloneUrlHttp
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                nodejs: 14
+            pre_build:
+              commands:
+                - echo Build started on `date`
+                - echo Logging in to Amazon ECR...
+            build:
+              commands:
+                - echo Build phase started on `date`
+                - echo Copying application files...
+                - cp -r . /tmp/build-output/
+            post_build:
+              commands:
+                - echo Build completed on `date`
+          artifacts:
+            files:
+              - '**/*'
+      TimeoutInMinutes: 15
+      Tags:
+        - Key: Name
+          Value: !Ref BuildProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # CodeDeploy Application
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Ref ApplicationName
+      ComputePlatform: EC2/On-Premises
+      Tags:
+        - Key: Name
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # CodeDeploy Deployment Group
+  CodeDeployDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentGroupName: !Ref DeploymentGroupName
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      DeploymentConfigName: CodeDeployDefault.AllAtOnceBlueGreen
+      AutoScalingGroups:
+        - !Ref AutoScalingGroup
+      LoadBalancerInfo:
+        TargetGroupInfoList:
+          - Name: !GetAtt BlueTargetGroup.TargetGroupName
+      BlueGreenDeploymentConfiguration:
+        DeploymentReadyOption:
+          ActionOnTimeout: CONTINUE_DEPLOYMENT
+        TerminateBlueInstancesOnDeploymentSuccess:
+          Action: TERMINATE
+          TerminationWaitTimeInMinutes: !Ref TerminateBlueInstancesDelay
+        GreenFleetProvisioningOption:
+          Action: COPY_AUTO_SCALING_GROUP
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
+          - DEPLOYMENT_STOP_ON_ALARM
+          - DEPLOYMENT_STOP_ON_INSTANCE_FAILURE
+      Tags:
+        - Key: Name
+          Value: !Ref DeploymentGroupName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # ===== MONITORING RESOURCES =====
+  
+  # CloudWatch Alarm for Deployment Failures
+  DeploymentFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-deployment-failure'
+      AlarmDescription: Alarm for CodeDeploy deployment failures
+      MetricName: FailedDeployments
+      Namespace: AWS/CodeDeploy
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: ApplicationName
+          Value: !Ref ApplicationName
+        - Name: DeploymentGroupName
+          Value: !Ref DeploymentGroupName
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-deployment-failure-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # CloudWatch Alarm for Target Group Health
+  TargetGroupHealthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-target-health'
+      AlarmDescription: Alarm for target group health
+      MetricName: HealthyHostCount
+      Namespace: AWS/ApplicationELB
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt BlueTargetGroup.TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+      TreatMissingData: breaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-target-health-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # CloudWatch Alarm for High CPU Usage
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-high-cpu'
+      AlarmDescription: Alarm for high CPU usage
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-high-cpu-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # CloudWatch Log Group for CodeBuild
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${BuildProjectName}'
+      RetentionInDays: !If [IsProduction, 90, 14]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-codebuild-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+# ===== OUTPUTS =====
+Outputs:
+  # Application Information
+  ApplicationName:
+    Description: Name of the CodeDeploy application
+    Value: !Ref ApplicationName
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationName'
+
+  # Load Balancer Information
+  LoadBalancerURL:
+    Description: URL of the Application Load Balancer
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-LoadBalancerURL'
+
+  LoadBalancerDNSName:
+    Description: DNS name of the Application Load Balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-LoadBalancerDNSName'
+
+  LoadBalancerArn:
+    Description: ARN of the Application Load Balancer
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: !Sub '${AWS::StackName}-LoadBalancerArn'
+
+  # Target Group Information
+  BlueTargetGroupArn:
+    Description: ARN of the Blue Target Group
+    Value: !Ref BlueTargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-BlueTargetGroupArn'
+
+  GreenTargetGroupArn:
+    Description: ARN of the Green Target Group
+    Value: !Ref GreenTargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-GreenTargetGroupArn'
+
+  # Auto Scaling Group Information
+  AutoScalingGroupName:
+    Description: Name of the Auto Scaling Group
+    Value: !Ref AutoScalingGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AutoScalingGroupName'
+
+  # CI/CD Pipeline Information
+  CodeCommitRepositoryArn:
+    Description: ARN of the CodeCommit repository
+    Value: !GetAtt CodeCommitRepository.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeCommitRepositoryArn'
+
+  CodeCommitRepositoryCloneUrlHttp:
+    Description: HTTP clone URL of the CodeCommit repository
+    Value: !GetAtt CodeCommitRepository.CloneUrlHttp
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeCommitRepositoryCloneUrlHttp'
+
+  CodeCommitRepositoryCloneUrlSsh:
+    Description: SSH clone URL of the CodeCommit repository
+    Value: !GetAtt CodeCommitRepository.CloneUrlSsh
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeCommitRepositoryCloneUrlSsh'
+
+  CodeBuildProjectName:
+    Description: Name of the CodeBuild project
+    Value: !Ref CodeBuildProject
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeBuildProjectName'
+
+  CodeBuildProjectArn:
+    Description: ARN of the CodeBuild project
+    Value: !GetAtt CodeBuildProject.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeBuildProjectArn'
+
+  CodeDeployApplicationName:
+    Description: Name of the CodeDeploy application
+    Value: !Ref CodeDeployApplication
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeDeployApplicationName'
+
+  CodeDeployDeploymentGroupName:
+    Description: Name of the CodeDeploy deployment group
+    Value: !Ref CodeDeployDeploymentGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeDeployDeploymentGroupName'
+
+  # Storage Information
+  ArtifactsBucketName:
+    Description: Name of the S3 bucket for build artifacts
+    Value: !Ref ArtifactsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ArtifactsBucketName'
+
+  ArtifactsBucketArn:
+    Description: ARN of the S3 bucket for build artifacts
+    Value: !GetAtt ArtifactsBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ArtifactsBucketArn'
+
+  # Security Information
+  EC2SecurityGroupId:
+    Description: ID of the EC2 security group
+    Value: !Ref EC2SecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-EC2SecurityGroupId'
+
+  ALBSecurityGroupId:
+    Description: ID of the ALB security group
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ALBSecurityGroupId'
+
+  # IAM Role Information
+  CodeDeployServiceRoleArn:
+    Description: ARN of the CodeDeploy service role
+    Value: !GetAtt CodeDeployServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeDeployServiceRoleArn'
+
+  CodeDeployEC2RoleArn:
+    Description: ARN of the CodeDeploy EC2 role
+    Value: !GetAtt CodeDeployEC2Role.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeDeployEC2RoleArn'
+
+  CodeBuildServiceRoleArn:
+    Description: ARN of the CodeBuild service role
+    Value: !GetAtt CodeBuildServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeBuildServiceRoleArn'
+
+  # Monitoring Information
+  DeploymentFailureAlarmArn:
+    Condition: CreateCloudWatchAlarms
+    Description: ARN of the deployment failure alarm
+    Value: !GetAtt DeploymentFailureAlarm.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentFailureAlarmArn'
+
+  TargetGroupHealthAlarmArn:
+    Condition: CreateCloudWatchAlarms
+    Description: ARN of the target group health alarm
+    Value: !GetAtt TargetGroupHealthAlarm.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TargetGroupHealthAlarmArn'
+
+  HighCPUAlarmArn:
+    Condition: CreateCloudWatchAlarms
+    Description: ARN of the high CPU alarm
+    Value: !GetAtt HighCPUAlarm.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-HighCPUAlarmArn'
+
+  # Deployment Commands
+  DeploymentCommand:
+    Description: Command to trigger a deployment
+    Value: !Sub |
+      aws deploy create-deployment \
+        --application-name ${ApplicationName} \
+        --deployment-group-name ${DeploymentGroupName} \
+        --s3-location bucket=${ArtifactsBucket},key=artifacts.zip,bundleType=zip \
+        --deployment-config-name CodeDeployDefault.AllAtOnceBlueGreen \
+        --description "Deployment triggered from CloudFormation"
+
+  BuildCommand:
+    Description: Command to trigger a build
+    Value: !Sub |
+      aws codebuild start-build \
+        --project-name ${BuildProjectName}

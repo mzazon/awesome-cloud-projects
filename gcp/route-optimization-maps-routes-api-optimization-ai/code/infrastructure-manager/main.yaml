@@ -1,0 +1,672 @@
+# Infrastructure Manager Configuration for Route Optimization Platform
+# This configuration deploys a complete route optimization solution using:
+# - Google Maps Routes API integration
+# - Cloud Run for serverless route processing
+# - Cloud SQL for route analytics storage
+# - Pub/Sub for event-driven architecture
+# - Cloud Functions for async processing
+# - Cloud Monitoring for observability
+
+# Copyright 2025 Google Cloud. Licensed under the Apache 2.0 License.
+
+metadata:
+  name: route-optimization-platform
+  namespace: default
+
+# Import required blueprints and modules
+imports:
+  - path: modules/networking.yaml
+    name: networking
+  - path: modules/storage.yaml
+    name: storage
+  - path: modules/compute.yaml
+    name: compute
+  - path: modules/monitoring.yaml
+    name: monitoring
+
+# Global configuration variables
+variables:
+  # Project and region configuration
+  project_id:
+    type: string
+    description: "GCP Project ID for deployment"
+    validation:
+      pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+  
+  region:
+    type: string
+    description: "GCP region for resource deployment"
+    default: "us-central1"
+    allowed:
+      - "us-central1"
+      - "us-east1"
+      - "us-west1"
+      - "europe-west1"
+      - "asia-southeast1"
+  
+  zone:
+    type: string
+    description: "GCP zone for zonal resources"
+    default: "us-central1-a"
+  
+  # Application configuration
+  environment:
+    type: string
+    description: "Environment name (dev, staging, prod)"
+    default: "dev"
+    allowed:
+      - "dev"
+      - "staging"
+      - "prod"
+  
+  maps_api_key:
+    type: string
+    description: "Google Maps Platform API key with Routes API enabled"
+    sensitive: true
+  
+  # Database configuration
+  database_tier:
+    type: string
+    description: "Cloud SQL instance tier"
+    default: "db-f1-micro"
+    allowed:
+      - "db-f1-micro"
+      - "db-g1-small"
+      - "db-n1-standard-1"
+      - "db-n1-standard-2"
+  
+  database_storage_size:
+    type: integer
+    description: "Database storage size in GB"
+    default: 20
+    validation:
+      minimum: 10
+      maximum: 1000
+  
+  # Service configuration
+  max_instances:
+    type: integer
+    description: "Maximum number of Cloud Run instances"
+    default: 10
+    validation:
+      minimum: 1
+      maximum: 100
+
+# Generate unique resource names with environment prefix
+locals:
+  name_prefix: "${var.environment}-route-opt"
+  random_suffix: "${random_id.suffix.hex}"
+  
+  # Resource names
+  sql_instance_name: "${local.name_prefix}-db-${local.random_suffix}"
+  service_name: "${local.name_prefix}-api-${local.random_suffix}"
+  topic_name: "${local.name_prefix}-events-${local.random_suffix}"
+  function_name: "${local.name_prefix}-processor-${local.random_suffix}"
+  
+  # Labels for resource organization
+  common_labels:
+    environment: "${var.environment}"
+    application: "route-optimization"
+    managed-by: "infrastructure-manager"
+    cost-center: "logistics"
+
+# Generate random suffix for unique resource names
+resources:
+  random_suffix:
+    type: gcp-types/random:Id
+    properties:
+      byteLength: 4
+
+  # Enable required APIs
+  apis:
+    type: gcp-types/serviceusage:BatchEnableServices
+    properties:
+      parent: "projects/${var.project_id}"
+      services:
+        - run.googleapis.com
+        - sqladmin.googleapis.com
+        - sql-component.googleapis.com
+        - pubsub.googleapis.com
+        - cloudbuild.googleapis.com
+        - cloudfunctions.googleapis.com
+        - cloudscheduler.googleapis.com
+        - monitoring.googleapis.com
+        - logging.googleapis.com
+        - secretmanager.googleapis.com
+
+  # Secret Manager for storing sensitive configuration
+  maps_api_secret:
+    type: gcp-types/secretmanager:Secret
+    properties:
+      secretId: "maps-api-key-${local.random_suffix}"
+      parent: "projects/${var.project_id}"
+      labels: "${local.common_labels}"
+      replication:
+        automatic: {}
+    depends_on:
+      - apis
+
+  maps_api_secret_version:
+    type: gcp-types/secretmanager:SecretVersion
+    properties:
+      parent: "${maps_api_secret.name}"
+      secretData: "${base64encode(var.maps_api_key)}"
+    depends_on:
+      - maps_api_secret
+
+  # Service Account for Cloud Run and Cloud Functions
+  service_account:
+    type: gcp-types/iam:ServiceAccount
+    properties:
+      accountId: "route-optimizer-${local.random_suffix}"
+      displayName: "Route Optimization Service Account"
+      description: "Service account for route optimization platform components"
+      project: "${var.project_id}"
+    depends_on:
+      - apis
+
+  # IAM bindings for service account
+  service_account_bindings:
+    type: gcp-types/cloudresourcemanager:ProjectIamPolicy
+    properties:
+      resource: "projects/${var.project_id}"
+      policy:
+        bindings:
+          # Cloud SQL Client permissions
+          - role: "roles/cloudsql.client"
+            members:
+              - "serviceAccount:${service_account.email}"
+          # Pub/Sub Publisher/Subscriber permissions
+          - role: "roles/pubsub.publisher"
+            members:
+              - "serviceAccount:${service_account.email}"
+          - role: "roles/pubsub.subscriber"
+            members:
+              - "serviceAccount:${service_account.email}"
+          # Secret Manager Secret Accessor
+          - role: "roles/secretmanager.secretAccessor"
+            members:
+              - "serviceAccount:${service_account.email}"
+          # Cloud Trace Agent (for distributed tracing)
+          - role: "roles/cloudtrace.agent"
+            members:
+              - "serviceAccount:${service_account.email}"
+          # Monitoring Metric Writer
+          - role: "roles/monitoring.metricWriter"
+            members:
+              - "serviceAccount:${service_account.email}"
+          # Logging Write
+          - role: "roles/logging.logWriter"
+            members:
+              - "serviceAccount:${service_account.email}"
+    depends_on:
+      - service_account
+
+  # Cloud SQL PostgreSQL instance for route analytics
+  sql_instance:
+    type: gcp-types/sqladmin:Instance
+    properties:
+      name: "${local.sql_instance_name}"
+      region: "${var.region}"
+      project: "${var.project_id}"
+      databaseVersion: "POSTGRES_14"
+      settings:
+        tier: "${var.database_tier}"
+        availabilityType: "ZONAL"
+        diskType: "PD_SSD"
+        diskSize: "${var.database_storage_size}"
+        diskAutoresize: true
+        diskAutoresizeLimit: 100
+        # Backup configuration
+        backupConfiguration:
+          enabled: true
+          startTime: "03:00"
+          pointInTimeRecoveryEnabled: true
+          transactionLogRetentionDays: 7
+          backupRetentionSettings:
+            retentionUnit: "COUNT"
+            retainedBackups: 7
+        # IP configuration for private access
+        ipConfiguration:
+          ipv4Enabled: false
+          privateNetwork: "projects/${var.project_id}/global/networks/default"
+          requireSsl: true
+        # Database flags for optimization
+        databaseFlags:
+          - name: "log_statement"
+            value: "all"
+          - name: "log_min_duration_statement"
+            value: "1000"
+          - name: "shared_preload_libraries"
+            value: "pg_stat_statements"
+        # Maintenance window
+        maintenanceWindow:
+          day: 7
+          hour: 4
+          updateTrack: "stable"
+        # User labels
+        userLabels: "${local.common_labels}"
+        # Insights configuration
+        insightsConfig:
+          queryInsightsEnabled: true
+          queryStringLength: 1024
+          recordApplicationTags: true
+          recordClientAddress: true
+    depends_on:
+      - apis
+
+  # Database user with secure password
+  database_user:
+    type: gcp-types/sqladmin:User
+    properties:
+      name: "route_app_user"
+      instance: "${sql_instance.name}"
+      project: "${var.project_id}"
+      password: "${random_password.db_password.result}"
+    depends_on:
+      - sql_instance
+
+  # Generate secure database password
+  db_password:
+    type: gcp-types/random:Password
+    properties:
+      length: 16
+      special: true
+
+  # Create application database
+  application_database:
+    type: gcp-types/sqladmin:Database
+    properties:
+      name: "route_analytics"
+      instance: "${sql_instance.name}"
+      project: "${var.project_id}"
+      charset: "UTF8"
+      collation: "en_US.UTF8"
+    depends_on:
+      - sql_instance
+
+  # Pub/Sub topic for route optimization events
+  pubsub_topic:
+    type: gcp-types/pubsub:Topic
+    properties:
+      name: "projects/${var.project_id}/topics/${local.topic_name}"
+      labels: "${local.common_labels}"
+      messageRetentionDuration: "604800s"  # 7 days
+      schemaSettings:
+        schema: "projects/${var.project_id}/schemas/route-event-schema"
+        encoding: "JSON"
+    depends_on:
+      - apis
+
+  # Pub/Sub schema for message validation
+  pubsub_schema:
+    type: gcp-types/pubsub:Schema
+    properties:
+      name: "projects/${var.project_id}/schemas/route-event-schema"
+      type: "AVRO"
+      definition: |
+        {
+          "type": "record",
+          "name": "RouteEvent",
+          "fields": [
+            {"name": "route_id", "type": "string"},
+            {"name": "event_type", "type": "string"},
+            {"name": "timestamp", "type": "string"},
+            {"name": "route_summary", "type": ["null", "string"], "default": null}
+          ]
+        }
+    depends_on:
+      - apis
+
+  # Pub/Sub subscription with dead letter queue
+  pubsub_subscription:
+    type: gcp-types/pubsub:Subscription
+    properties:
+      name: "projects/${var.project_id}/subscriptions/${local.topic_name}-sub"
+      topic: "${pubsub_topic.name}"
+      ackDeadlineSeconds: 600
+      messageRetentionDuration: "604800s"  # 7 days
+      retryPolicy:
+        minimumBackoff: "10s"
+        maximumBackoff: "600s"
+      deadLetterPolicy:
+        deadLetterTopic: "${pubsub_dlq_topic.name}"
+        maxDeliveryAttempts: 5
+      labels: "${local.common_labels}"
+    depends_on:
+      - pubsub_topic
+      - pubsub_dlq_topic
+
+  # Dead letter queue topic
+  pubsub_dlq_topic:
+    type: gcp-types/pubsub:Topic
+    properties:
+      name: "projects/${var.project_id}/topics/${local.topic_name}-dlq"
+      labels: "${local.common_labels}"
+      messageRetentionDuration: "2592000s"  # 30 days
+    depends_on:
+      - apis
+
+  # Dead letter queue subscription
+  pubsub_dlq_subscription:
+    type: gcp-types/pubsub:Subscription
+    properties:
+      name: "projects/${var.project_id}/subscriptions/${local.topic_name}-dlq-sub"
+      topic: "${pubsub_dlq_topic.name}"
+      labels: "${local.common_labels}"
+    depends_on:
+      - pubsub_dlq_topic
+
+  # Cloud Storage bucket for Cloud Functions source code
+  function_source_bucket:
+    type: gcp-types/storage:Bucket
+    properties:
+      name: "${local.name_prefix}-functions-${local.random_suffix}"
+      location: "${var.region}"
+      project: "${var.project_id}"
+      storageClass: "STANDARD"
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: "Delete"
+            condition:
+              age: 30
+              numNewerVersions: 3
+      labels: "${local.common_labels}"
+    depends_on:
+      - apis
+
+  # Cloud Build trigger for automated deployment
+  build_trigger:
+    type: gcp-types/cloudbuild:Trigger
+    properties:
+      name: "route-optimization-deploy-${local.random_suffix}"
+      project: "${var.project_id}"
+      description: "Deploy route optimization platform components"
+      disabled: false
+      substitutions:
+        _SERVICE_NAME: "${local.service_name}"
+        _REGION: "${var.region}"
+        _SQL_INSTANCE: "${local.sql_instance_name}"
+        _TOPIC_NAME: "${local.topic_name}"
+      github:
+        owner: "your-org"
+        name: "route-optimization"
+        push:
+          branch: "^main$"
+      filename: "cloudbuild.yaml"
+      includeBuildLogs: "INCLUDE_BUILD_LOGS_WITH_STATUS"
+      tags:
+        - "route-optimization"
+        - "${var.environment}"
+    depends_on:
+      - apis
+
+  # Cloud Run service for route optimization API
+  cloud_run_service:
+    type: gcp-types/run:Service
+    properties:
+      metadata:
+        name: "${local.service_name}"
+        namespace: "${var.project_id}"
+        labels: "${local.common_labels}"
+        annotations:
+          run.googleapis.com/ingress: "all"
+          run.googleapis.com/execution-environment: "gen2"
+      spec:
+        template:
+          metadata:
+            annotations:
+              # Cloud SQL connection
+              run.googleapis.com/cloudsql-instances: "${var.project_id}:${var.region}:${local.sql_instance_name}"
+              # Autoscaling configuration
+              autoscaling.knative.dev/maxScale: "${var.max_instances}"
+              autoscaling.knative.dev/minScale: "0"
+              # CPU allocation
+              run.googleapis.com/cpu-throttling: "false"
+              # VPC access (if needed)
+              run.googleapis.com/vpc-access-connector: "projects/${var.project_id}/locations/${var.region}/connectors/default"
+          spec:
+            serviceAccountName: "${service_account.email}"
+            containerConcurrency: 100
+            timeoutSeconds: 300
+            containers:
+              - image: "gcr.io/cloudrun/hello"  # Placeholder - will be updated by CI/CD
+                ports:
+                  - containerPort: 8080
+                    protocol: "TCP"
+                env:
+                  - name: "PROJECT_ID"
+                    value: "${var.project_id}"
+                  - name: "SQL_INSTANCE"
+                    value: "${local.sql_instance_name}"
+                  - name: "TOPIC_NAME"
+                    value: "${local.topic_name}"
+                  - name: "MAPS_API_KEY"
+                    valueFrom:
+                      secretKeyRef:
+                        name: "${maps_api_secret.secretId}"
+                        key: "latest"
+                  - name: "DATABASE_USER"
+                    value: "${database_user.name}"
+                  - name: "DATABASE_PASSWORD"
+                    value: "${random_password.db_password.result}"
+                resources:
+                  limits:
+                    cpu: "1000m"
+                    memory: "1Gi"
+                  requests:
+                    cpu: "100m"
+                    memory: "256Mi"
+                # Health checks
+                livenessProbe:
+                  httpGet:
+                    path: "/health"
+                    port: 8080
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+                  timeoutSeconds: 5
+                  failureThreshold: 3
+                readinessProbe:
+                  httpGet:
+                    path: "/health"
+                    port: 8080
+                  initialDelaySeconds: 5
+                  periodSeconds: 5
+                  timeoutSeconds: 3
+                  failureThreshold: 3
+        traffic:
+          - percent: 100
+            latestRevision: true
+    depends_on:
+      - service_account
+      - sql_instance
+      - pubsub_topic
+      - maps_api_secret_version
+
+  # Cloud Run IAM policy for public access
+  cloud_run_iam:
+    type: gcp-types/run:ServiceIamPolicy
+    properties:
+      resource: "${cloud_run_service.metadata.name}"
+      location: "${var.region}"
+      project: "${var.project_id}"
+      policy:
+        bindings:
+          - role: "roles/run.invoker"
+            members:
+              - "allUsers"
+    depends_on:
+      - cloud_run_service
+
+  # Cloud Function for event processing
+  event_processor_function:
+    type: gcp-types/cloudfunctions:Function
+    properties:
+      name: "projects/${var.project_id}/locations/${var.region}/functions/${local.function_name}"
+      description: "Process route optimization events from Pub/Sub"
+      runtime: "python311"
+      availableMemoryMb: 256
+      timeout: "60s"
+      entryPoint: "process_route_event"
+      serviceAccountEmail: "${service_account.email}"
+      environmentVariables:
+        PROJECT_ID: "${var.project_id}"
+        SQL_INSTANCE: "${local.sql_instance_name}"
+        DATABASE_USER: "${database_user.name}"
+        DATABASE_PASSWORD: "${random_password.db_password.result}"
+      eventTrigger:
+        eventType: "google.pubsub.topic.publish"
+        resource: "${pubsub_topic.name}"
+        failurePolicy:
+          retry: {}
+      sourceArchiveUrl: "gs://${function_source_bucket.name}/function-source.zip"
+      labels: "${local.common_labels}"
+      # VPC connector for private database access
+      vpcConnector: "projects/${var.project_id}/locations/${var.region}/connectors/default"
+      vpcConnectorEgressSettings: "PRIVATE_RANGES_ONLY"
+    depends_on:
+      - service_account
+      - pubsub_topic
+      - sql_instance
+      - function_source_bucket
+
+  # Cloud Scheduler job for periodic route optimization
+  scheduler_job:
+    type: gcp-types/cloudscheduler:Job
+    properties:
+      name: "projects/${var.project_id}/locations/${var.region}/jobs/route-optimization-${local.random_suffix}"
+      description: "Trigger periodic route optimization analysis"
+      schedule: "0 */6 * * *"  # Every 6 hours
+      timeZone: "UTC"
+      httpTarget:
+        uri: "${cloud_run_service.status.url}/analytics/optimize"
+        httpMethod: "POST"
+        headers:
+          Content-Type: "application/json"
+        body: "${base64encode('{\"type\": \"scheduled_optimization\"}')}"
+        oidcToken:
+          serviceAccountEmail: "${service_account.email}"
+          audience: "${cloud_run_service.status.url}"
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: "300s"
+        minBackoffDuration: "5s"
+        maxBackoffDuration: "60s"
+        maxDoublings: 3
+    depends_on:
+      - cloud_run_service
+      - service_account
+
+  # Cloud Monitoring alert policy for high error rates
+  alert_policy:
+    type: gcp-types/monitoring:AlertPolicy
+    properties:
+      displayName: "Route Optimization High Error Rate"
+      documentation:
+        content: "Alert when route optimization error rate exceeds threshold"
+        mimeType: "text/markdown"
+      conditions:
+        - displayName: "High Error Rate"
+          conditionThreshold:
+            filter: 'resource.type="cloud_run_revision" AND resource.labels.service_name="${local.service_name}"'
+            comparison: "COMPARISON_GREATER_THAN"
+            thresholdValue: 0.1
+            duration: "300s"
+            aggregations:
+              - alignmentPeriod: "60s"
+                perSeriesAligner: "ALIGN_RATE"
+                crossSeriesReducer: "REDUCE_MEAN"
+                groupByFields:
+                  - "resource.labels.service_name"
+      combiner: "OR"
+      enabled: true
+      notificationChannels: []  # Add notification channels as needed
+      alertStrategy:
+        autoClose: "1800s"
+      severity: "ERROR"
+    depends_on:
+      - cloud_run_service
+
+  # Log sink for route optimization events
+  log_sink:
+    type: gcp-types/logging:Sink
+    properties:
+      name: "route-optimization-sink-${local.random_suffix}"
+      destination: "bigquery.googleapis.com/projects/${var.project_id}/datasets/route_analytics_logs"
+      filter: 'resource.type="cloud_run_revision" AND resource.labels.service_name="${local.service_name}"'
+      description: "Export route optimization logs to BigQuery for analysis"
+      includeChildren: true
+    depends_on:
+      - cloud_run_service
+
+# Outputs for integration and verification
+outputs:
+  # Service endpoints
+  api_url:
+    description: "Cloud Run service URL for route optimization API"
+    value: "${cloud_run_service.status.url}"
+  
+  health_check_url:
+    description: "Health check endpoint URL"
+    value: "${cloud_run_service.status.url}/health"
+  
+  analytics_url:
+    description: "Analytics dashboard endpoint URL"
+    value: "${cloud_run_service.status.url}/analytics"
+  
+  # Database connection details
+  database_connection_name:
+    description: "Cloud SQL connection name for client applications"
+    value: "${var.project_id}:${var.region}:${local.sql_instance_name}"
+  
+  database_private_ip:
+    description: "Private IP address of Cloud SQL instance"
+    value: "${sql_instance.privateIpAddress}"
+  
+  # Pub/Sub resources
+  pubsub_topic_name:
+    description: "Pub/Sub topic name for route events"
+    value: "${pubsub_topic.name}"
+  
+  pubsub_subscription_name:
+    description: "Pub/Sub subscription name for event processing"
+    value: "${pubsub_subscription.name}"
+  
+  # Service account
+  service_account_email:
+    description: "Service account email for application components"
+    value: "${service_account.email}"
+  
+  # Monitoring
+  alert_policy_name:
+    description: "Cloud Monitoring alert policy name"
+    value: "${alert_policy.name}"
+  
+  # Resource identifiers
+  project_id:
+    description: "GCP Project ID"
+    value: "${var.project_id}"
+  
+  region:
+    description: "Deployment region"
+    value: "${var.region}"
+  
+  environment:
+    description: "Environment name"
+    value: "${var.environment}"
+  
+  # Cost optimization
+  estimated_monthly_cost:
+    description: "Estimated monthly cost in USD (development workload)"
+    value: "50-100"
+  
+  # Security
+  maps_api_secret_name:
+    description: "Secret Manager secret name for Maps API key"
+    value: "${maps_api_secret.name}"
+    sensitive: true

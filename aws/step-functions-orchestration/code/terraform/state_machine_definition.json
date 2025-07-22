@@ -1,0 +1,276 @@
+{
+  "Comment": "Microservices orchestration workflow for order processing",
+  "StartAt": "ValidateInput",
+  "States": {
+    "ValidateInput": {
+      "Type": "Pass",
+      "Comment": "Validate and prepare input data for the workflow",
+      "Next": "GetUserData"
+    },
+    "GetUserData": {
+      "Type": "Task",
+      "Comment": "Retrieve and validate user information",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${user_service_arn}",
+        "Payload.$": "$"
+      },
+      "ResultPath": "$.userResult",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "Comment": "Retry user service with exponential backoff"
+        },
+        {
+          "ErrorEquals": ["States.Timeout"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "UserServiceFailure",
+          "Comment": "Handle user service failures"
+        }
+      ],
+      "TimeoutSeconds": 30,
+      "Next": "ProcessOrderAndPayment"
+    },
+    "ProcessOrderAndPayment": {
+      "Type": "Parallel",
+      "Comment": "Process order, payment, and inventory check in parallel for optimal performance",
+      "Branches": [
+        {
+          "StartAt": "CreateOrder",
+          "States": {
+            "CreateOrder": {
+              "Type": "Task",
+              "Comment": "Create order with validation and business logic",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${order_service_arn}",
+                "Payload": {
+                  "orderData.$": "$.orderData",
+                  "userData.$": "$.userResult.Payload"
+                }
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 1,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "TimeoutSeconds": 30,
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "ProcessPayment",
+          "States": {
+            "ProcessPayment": {
+              "Type": "Task",
+              "Comment": "Process payment authorization with business rules",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${payment_service_arn}",
+                "Payload": {
+                  "orderData.$": "$.orderData",
+                  "userData.$": "$.userResult.Payload"
+                }
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 1,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2,
+                  "Comment": "Retry payment processing for transient failures"
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "PaymentFailure",
+                  "Comment": "Handle payment failures"
+                }
+              ],
+              "TimeoutSeconds": 45,
+              "Next": "PaymentSuccess"
+            },
+            "PaymentSuccess": {
+              "Type": "Pass",
+              "Comment": "Payment processed successfully",
+              "End": true
+            },
+            "PaymentFailure": {
+              "Type": "Fail",
+              "Comment": "Payment processing failed",
+              "Cause": "Payment authorization failed or timed out"
+            }
+          }
+        },
+        {
+          "StartAt": "CheckInventory",
+          "States": {
+            "CheckInventory": {
+              "Type": "Task",
+              "Comment": "Check inventory availability and reserve items",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${inventory_service_arn}",
+                "Payload": {
+                  "orderData.$": "$.orderData"
+                }
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 1,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 1.5,
+                  "Comment": "Retry inventory check for transient failures"
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "InventoryFailure",
+                  "Comment": "Handle inventory check failures"
+                }
+              ],
+              "TimeoutSeconds": 30,
+              "Next": "InventorySuccess"
+            },
+            "InventorySuccess": {
+              "Type": "Pass",
+              "Comment": "Inventory check completed successfully",
+              "End": true
+            },
+            "InventoryFailure": {
+              "Type": "Fail",
+              "Comment": "Inventory check failed",
+              "Cause": "Insufficient inventory or system error"
+            }
+          }
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "ProcessingFailure",
+          "Comment": "Handle any parallel processing failures"
+        }
+      ],
+      "Next": "AggregateResults"
+    },
+    "AggregateResults": {
+      "Type": "Pass",
+      "Comment": "Aggregate results from parallel processing",
+      "Parameters": {
+        "userResult.$": "$.userResult",
+        "orderResult.$": "$[0]",
+        "paymentResult.$": "$[1]",
+        "inventoryResult.$": "$[2]",
+        "aggregatedAt.$": "$$.State.EnteredTime"
+      },
+      "Next": "SendNotification"
+    },
+    "SendNotification": {
+      "Type": "Task",
+      "Comment": "Send order confirmation notifications to customer",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${notification_service_arn}",
+        "Payload": {
+          "userData.$": "$.userResult.Payload",
+          "orderData.$": "$.orderResult.Payload",
+          "paymentData.$": "$.paymentResult.Payload",
+          "inventoryData.$": "$.inventoryResult.Payload"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "Comment": "Retry notification sending"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotificationFailure",
+          "Comment": "Handle notification failures - order still processed"
+        }
+      ],
+      "TimeoutSeconds": 30,
+      "Next": "WorkflowSuccess"
+    },
+    "WorkflowSuccess": {
+      "Type": "Pass",
+      "Comment": "Workflow completed successfully",
+      "Parameters": {
+        "status": "SUCCESS",
+        "message": "Order processed successfully",
+        "completedAt.$": "$$.State.EnteredTime",
+        "results": {
+          "user.$": "$.userResult.Payload",
+          "order.$": "$.orderResult.Payload",
+          "payment.$": "$.paymentResult.Payload",
+          "inventory.$": "$.inventoryResult.Payload",
+          "notification.$": "$.Payload"
+        }
+      },
+      "End": true
+    },
+    "UserServiceFailure": {
+      "Type": "Pass",
+      "Comment": "User service failed - cannot proceed with order",
+      "Parameters": {
+        "status": "FAILED",
+        "error": "User validation failed",
+        "failedAt.$": "$$.State.EnteredTime",
+        "cause": "Unable to validate user information"
+      },
+      "Next": "WorkflowFailure"
+    },
+    "ProcessingFailure": {
+      "Type": "Pass",
+      "Comment": "Order processing failed in parallel execution",
+      "Parameters": {
+        "status": "FAILED",
+        "error": "Order processing failed",
+        "failedAt.$": "$$.State.EnteredTime",
+        "cause": "One or more services failed during parallel processing"
+      },
+      "Next": "WorkflowFailure"
+    },
+    "NotificationFailure": {
+      "Type": "Pass",
+      "Comment": "Notification failed but order was processed successfully",
+      "Parameters": {
+        "status": "PARTIAL_SUCCESS",
+        "error": "Notification delivery failed",
+        "failedAt.$": "$$.State.EnteredTime",
+        "cause": "Order processed but customer notification failed",
+        "orderData.$": "$.orderResult.Payload",
+        "paymentData.$": "$.paymentResult.Payload"
+      },
+      "End": true
+    },
+    "WorkflowFailure": {
+      "Type": "Fail",
+      "Comment": "Workflow failed - order not processed",
+      "Cause": "Critical failure in order processing workflow"
+    }
+  }
+}

@@ -1,0 +1,1910 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Distributed Transaction Processing with SQS - Implements the Saga pattern for distributed transaction coordination across microservices using SQS FIFO queues and DynamoDB for state management.'
+
+# ==============================================================================
+# METADATA
+# ==============================================================================
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaRuntime
+          - LambdaTimeout
+          - LambdaMemorySize
+      - Label:
+          default: "SQS Configuration"
+        Parameters:
+          - MessageRetentionPeriod
+          - VisibilityTimeoutSeconds
+      - Label:
+          default: "DynamoDB Configuration"
+        Parameters:
+          - DynamoDBReadCapacityUnits
+          - DynamoDBWriteCapacityUnits
+          - EnableDynamoDBStreams
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableCloudWatchAlarms
+          - FailedTransactionThreshold
+          - MessageAgeThreshold
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - EnableXRayTracing
+          - LogRetentionInDays
+    ParameterLabels:
+      Environment:
+        default: "Deployment Environment"
+      ProjectName:
+        default: "Project Name"
+      LambdaRuntime:
+        default: "Lambda Runtime Version"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      MessageRetentionPeriod:
+        default: "Message Retention Period (seconds)"
+      VisibilityTimeoutSeconds:
+        default: "Visibility Timeout (seconds)"
+      DynamoDBReadCapacityUnits:
+        default: "DynamoDB Read Capacity Units"
+      DynamoDBWriteCapacityUnits:
+        default: "DynamoDB Write Capacity Units"
+      EnableDynamoDBStreams:
+        default: "Enable DynamoDB Streams"
+      EnableCloudWatchAlarms:
+        default: "Enable CloudWatch Alarms"
+      FailedTransactionThreshold:
+        default: "Failed Transaction Alarm Threshold"
+      MessageAgeThreshold:
+        default: "Message Age Alarm Threshold (seconds)"
+      EnableXRayTracing:
+        default: "Enable X-Ray Tracing"
+      LogRetentionInDays:
+        default: "CloudWatch Log Retention (days)"
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name for resource naming and tagging
+    ConstraintDescription: Must be one of dev, staging, or prod
+
+  ProjectName:
+    Type: String
+    Default: distributed-tx
+    Description: Project name used for resource naming
+    AllowedPattern: ^[a-zA-Z0-9-]+$
+    ConstraintDescription: Must contain only alphanumeric characters and hyphens
+    MaxLength: 20
+
+  LambdaRuntime:
+    Type: String
+    Default: python3.9
+    AllowedValues:
+      - python3.9
+      - python3.10
+      - python3.11
+    Description: Lambda runtime version
+    ConstraintDescription: Must be a supported Python runtime version
+
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 30
+    MaxValue: 900
+    Description: Lambda function timeout in seconds
+    ConstraintDescription: Must be between 30 and 900 seconds
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    AllowedValues:
+      - 128
+      - 256
+      - 512
+      - 1024
+      - 2048
+    Description: Lambda function memory size in MB
+    ConstraintDescription: Must be a valid Lambda memory size
+
+  MessageRetentionPeriod:
+    Type: Number
+    Default: 1209600
+    MinValue: 60
+    MaxValue: 1209600
+    Description: Message retention period in seconds (14 days max)
+    ConstraintDescription: Must be between 60 seconds and 14 days
+
+  VisibilityTimeoutSeconds:
+    Type: Number
+    Default: 300
+    MinValue: 0
+    MaxValue: 43200
+    Description: Visibility timeout for SQS messages in seconds
+    ConstraintDescription: Must be between 0 and 43200 seconds
+
+  DynamoDBReadCapacityUnits:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+    Description: DynamoDB read capacity units (only used if not on-demand)
+    ConstraintDescription: Must be between 1 and 40000
+
+  DynamoDBWriteCapacityUnits:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+    Description: DynamoDB write capacity units (only used if not on-demand)
+    ConstraintDescription: Must be between 1 and 40000
+
+  EnableDynamoDBStreams:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable DynamoDB Streams for saga state table
+    ConstraintDescription: Must be true or false
+
+  EnableCloudWatchAlarms:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable CloudWatch alarms for monitoring
+    ConstraintDescription: Must be true or false
+
+  FailedTransactionThreshold:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 100
+    Description: Number of failed transactions before alarm triggers
+    ConstraintDescription: Must be between 1 and 100
+
+  MessageAgeThreshold:
+    Type: Number
+    Default: 600
+    MinValue: 60
+    MaxValue: 3600
+    Description: Message age threshold in seconds before alarm triggers
+    ConstraintDescription: Must be between 60 and 3600 seconds
+
+  EnableXRayTracing:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable X-Ray tracing for Lambda functions
+    ConstraintDescription: Must be true or false
+
+  LogRetentionInDays:
+    Type: Number
+    Default: 30
+    AllowedValues:
+      - 1
+      - 3
+      - 5
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+      - 120
+      - 150
+      - 180
+      - 365
+      - 400
+      - 545
+      - 731
+      - 1827
+      - 3653
+    Description: CloudWatch log retention period in days
+    ConstraintDescription: Must be a valid CloudWatch log retention period
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+  IsDevelopment: !Equals [!Ref Environment, dev]
+  EnableStreams: !Equals [!Ref EnableDynamoDBStreams, 'true']
+  EnableAlarms: !Equals [!Ref EnableCloudWatchAlarms, 'true']
+  EnableXRay: !Equals [!Ref EnableXRayTracing, 'true']
+  UseProvisionedThroughput: !Equals [!Ref Environment, dev]
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+
+Resources:
+  # ============================================================================
+  # IAM ROLES AND POLICIES
+  # ============================================================================
+
+  # Lambda execution role for all transaction processing functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !If
+          - EnableXRay
+          - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+          - !Ref 'AWS::NoValue'
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:ListStreams
+                Resource:
+                  - !GetAtt SagaStateTable.Arn
+                  - !GetAtt OrderTable.Arn
+                  - !GetAtt PaymentTable.Arn
+                  - !GetAtt InventoryTable.Arn
+                  - !If
+                    - EnableStreams
+                    - !Sub '${SagaStateTable.Arn}/stream/*'
+                    - !Ref 'AWS::NoValue'
+        - PolicyName: SQSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                Resource:
+                  - !GetAtt OrderProcessingQueue.Arn
+                  - !GetAtt PaymentProcessingQueue.Arn
+                  - !GetAtt InventoryUpdateQueue.Arn
+                  - !GetAtt CompensationQueue.Arn
+                  - !GetAtt DeadLetterQueue.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: IAM
+
+  # API Gateway execution role for Lambda integration
+  ApiGatewayExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-api-gateway-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaInvocationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt TransactionOrchestratorFunction.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: IAM
+
+  # ============================================================================
+  # DYNAMODB TABLES
+  # ============================================================================
+
+  # Saga state table for transaction coordination
+  SagaStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-saga-state'
+      BillingMode: !If [UseProvisionedThroughput, PROVISIONED, PAY_PER_REQUEST]
+      AttributeDefinitions:
+        - AttributeName: TransactionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: TransactionId
+          KeyType: HASH
+      StreamSpecification: !If
+        - EnableStreams
+        - StreamViewType: NEW_AND_OLD_IMAGES
+        - !Ref 'AWS::NoValue'
+      ProvisionedThroughput: !If
+        - UseProvisionedThroughput
+        - ReadCapacityUnits: !Ref DynamoDBReadCapacityUnits
+          WriteCapacityUnits: !Ref DynamoDBWriteCapacityUnits
+        - !Ref 'AWS::NoValue'
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: DynamoDB
+        - Key: Purpose
+          Value: SagaStateManagement
+
+  # Order table for order processing service
+  OrderTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-orders'
+      BillingMode: !If [UseProvisionedThroughput, PROVISIONED, PAY_PER_REQUEST]
+      AttributeDefinitions:
+        - AttributeName: OrderId
+          AttributeType: S
+        - AttributeName: TransactionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: OrderId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: TransactionIdIndex
+          KeySchema:
+            - AttributeName: TransactionId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - UseProvisionedThroughput
+            - ReadCapacityUnits: !Ref DynamoDBReadCapacityUnits
+              WriteCapacityUnits: !Ref DynamoDBWriteCapacityUnits
+            - !Ref 'AWS::NoValue'
+      ProvisionedThroughput: !If
+        - UseProvisionedThroughput
+        - ReadCapacityUnits: !Ref DynamoDBReadCapacityUnits
+          WriteCapacityUnits: !Ref DynamoDBWriteCapacityUnits
+        - !Ref 'AWS::NoValue'
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: DynamoDB
+        - Key: Purpose
+          Value: OrderManagement
+
+  # Payment table for payment processing service
+  PaymentTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-payments'
+      BillingMode: !If [UseProvisionedThroughput, PROVISIONED, PAY_PER_REQUEST]
+      AttributeDefinitions:
+        - AttributeName: PaymentId
+          AttributeType: S
+        - AttributeName: TransactionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PaymentId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: TransactionIdIndex
+          KeySchema:
+            - AttributeName: TransactionId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - UseProvisionedThroughput
+            - ReadCapacityUnits: !Ref DynamoDBReadCapacityUnits
+              WriteCapacityUnits: !Ref DynamoDBWriteCapacityUnits
+            - !Ref 'AWS::NoValue'
+      ProvisionedThroughput: !If
+        - UseProvisionedThroughput
+        - ReadCapacityUnits: !Ref DynamoDBReadCapacityUnits
+          WriteCapacityUnits: !Ref DynamoDBWriteCapacityUnits
+        - !Ref 'AWS::NoValue'
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: DynamoDB
+        - Key: Purpose
+          Value: PaymentManagement
+
+  # Inventory table for inventory management service
+  InventoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-inventory'
+      BillingMode: !If [UseProvisionedThroughput, PROVISIONED, PAY_PER_REQUEST]
+      AttributeDefinitions:
+        - AttributeName: ProductId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ProductId
+          KeyType: HASH
+      ProvisionedThroughput: !If
+        - UseProvisionedThroughput
+        - ReadCapacityUnits: !Ref DynamoDBReadCapacityUnits
+          WriteCapacityUnits: !Ref DynamoDBWriteCapacityUnits
+        - !Ref 'AWS::NoValue'
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: DynamoDB
+        - Key: Purpose
+          Value: InventoryManagement
+
+  # ============================================================================
+  # SQS QUEUES
+  # ============================================================================
+
+  # Dead letter queue for failed messages
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-dlq.fifo'
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      KmsDataKeyReusePeriodSeconds: 300
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: SQS
+        - Key: Purpose
+          Value: DeadLetterQueue
+
+  # Order processing queue
+  OrderProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-order-processing.fifo'
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      VisibilityTimeoutSeconds: !Ref VisibilityTimeoutSeconds
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+      KmsDataKeyReusePeriodSeconds: 300
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: SQS
+        - Key: Purpose
+          Value: OrderProcessing
+
+  # Payment processing queue
+  PaymentProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-payment-processing.fifo'
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      VisibilityTimeoutSeconds: !Ref VisibilityTimeoutSeconds
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+      KmsDataKeyReusePeriodSeconds: 300
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: SQS
+        - Key: Purpose
+          Value: PaymentProcessing
+
+  # Inventory update queue
+  InventoryUpdateQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-inventory-update.fifo'
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      VisibilityTimeoutSeconds: !Ref VisibilityTimeoutSeconds
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+      KmsDataKeyReusePeriodSeconds: 300
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: SQS
+        - Key: Purpose
+          Value: InventoryUpdate
+
+  # Compensation queue for rollback operations
+  CompensationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-compensation.fifo'
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      VisibilityTimeoutSeconds: !Ref VisibilityTimeoutSeconds
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+      KmsDataKeyReusePeriodSeconds: 300
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: SQS
+        - Key: Purpose
+          Value: Compensation
+
+  # ============================================================================
+  # LAMBDA FUNCTIONS
+  # ============================================================================
+
+  # Transaction orchestrator function
+  TransactionOrchestratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-orchestrator'
+      Runtime: !Ref LambdaRuntime
+      Handler: orchestrator.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          SAGA_STATE_TABLE: !Ref SagaStateTable
+          ORDER_QUEUE_URL: !Ref OrderProcessingQueue
+          COMPENSATION_QUEUE_URL: !Ref CompensationQueue
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      TracingConfig:
+        Mode: !If [EnableXRay, Active, PassThrough]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          from datetime import datetime
+          
+          dynamodb = boto3.resource('dynamodb')
+          sqs = boto3.client('sqs')
+          
+          SAGA_STATE_TABLE = os.environ['SAGA_STATE_TABLE']
+          ORDER_QUEUE_URL = os.environ['ORDER_QUEUE_URL']
+          COMPENSATION_QUEUE_URL = os.environ['COMPENSATION_QUEUE_URL']
+          
+          def lambda_handler(event, context):
+              try:
+                  # Initialize transaction
+                  transaction_id = str(uuid.uuid4())
+                  order_data = json.loads(event['body'])
+                  
+                  # Create saga state record
+                  saga_table = dynamodb.Table(SAGA_STATE_TABLE)
+                  saga_table.put_item(
+                      Item={
+                          'TransactionId': transaction_id,
+                          'Status': 'STARTED',
+                          'CurrentStep': 'ORDER_PROCESSING',
+                          'Steps': ['ORDER_PROCESSING', 'PAYMENT_PROCESSING', 'INVENTORY_UPDATE'],
+                          'CompletedSteps': [],
+                          'OrderData': order_data,
+                          'Timestamp': datetime.utcnow().isoformat(),
+                          'TTL': int(datetime.utcnow().timestamp()) + 86400  # 24 hours TTL
+                      }
+                  )
+                  
+                  # Start transaction by sending to order queue
+                  message_body = {
+                      'transactionId': transaction_id,
+                      'step': 'ORDER_PROCESSING',
+                      'data': order_data
+                  }
+                  
+                  sqs.send_message(
+                      QueueUrl=ORDER_QUEUE_URL,
+                      MessageBody=json.dumps(message_body),
+                      MessageGroupId=transaction_id
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'transactionId': transaction_id,
+                          'status': 'STARTED',
+                          'message': 'Transaction initiated successfully'
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in orchestrator: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+          
+          def handle_compensation(event, context):
+              try:
+                  # Process compensation messages
+                  for record in event['Records']:
+                      message_body = json.loads(record['body'])
+                      transaction_id = message_body['transactionId']
+                      failed_step = message_body['failedStep']
+                      
+                      # Update saga state to failed
+                      saga_table = dynamodb.Table(SAGA_STATE_TABLE)
+                      saga_table.update_item(
+                          Key={'TransactionId': transaction_id},
+                          UpdateExpression='SET #status = :status, FailedStep = :failed_step',
+                          ExpressionAttributeNames={'#status': 'Status'},
+                          ExpressionAttributeValues={
+                              ':status': 'FAILED',
+                              ':failed_step': failed_step
+                          }
+                      )
+                      
+                      print(f"Transaction {transaction_id} failed at step {failed_step}")
+                      
+              except Exception as e:
+                  print(f"Error in compensation handler: {str(e)}")
+                  raise
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: Lambda
+        - Key: Purpose
+          Value: TransactionOrchestration
+
+  # Compensation handler function
+  CompensationHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-compensation-handler'
+      Runtime: !Ref LambdaRuntime
+      Handler: orchestrator.handle_compensation
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          SAGA_STATE_TABLE: !Ref SagaStateTable
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      TracingConfig:
+        Mode: !If [EnableXRay, Active, PassThrough]
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          import os
+          
+          dynamodb = boto3.resource('dynamodb')
+          
+          SAGA_STATE_TABLE = os.environ['SAGA_STATE_TABLE']
+          
+          def lambda_handler(event, context):
+              try:
+                  # Process compensation messages
+                  for record in event['Records']:
+                      message_body = json.loads(record['body'])
+                      transaction_id = message_body['transactionId']
+                      failed_step = message_body['failedStep']
+                      
+                      # Update saga state to failed
+                      saga_table = dynamodb.Table(SAGA_STATE_TABLE)
+                      saga_table.update_item(
+                          Key={'TransactionId': transaction_id},
+                          UpdateExpression='SET #status = :status, FailedStep = :failed_step',
+                          ExpressionAttributeNames={'#status': 'Status'},
+                          ExpressionAttributeValues={
+                              ':status': 'FAILED',
+                              ':failed_step': failed_step
+                          }
+                      )
+                      
+                      print(f"Transaction {transaction_id} failed at step {failed_step}")
+                      
+              except Exception as e:
+                  print(f"Error in compensation handler: {str(e)}")
+                  raise
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: Lambda
+        - Key: Purpose
+          Value: CompensationHandling
+
+  # Order processing service function
+  OrderServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-order-service'
+      Runtime: !Ref LambdaRuntime
+      Handler: order_service.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          ORDER_TABLE: !Ref OrderTable
+          SAGA_STATE_TABLE: !Ref SagaStateTable
+          PAYMENT_QUEUE_URL: !Ref PaymentProcessingQueue
+          COMPENSATION_QUEUE_URL: !Ref CompensationQueue
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      TracingConfig:
+        Mode: !If [EnableXRay, Active, PassThrough]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          from datetime import datetime
+          
+          dynamodb = boto3.resource('dynamodb')
+          sqs = boto3.client('sqs')
+          
+          ORDER_TABLE = os.environ['ORDER_TABLE']
+          SAGA_STATE_TABLE = os.environ['SAGA_STATE_TABLE']
+          PAYMENT_QUEUE_URL = os.environ['PAYMENT_QUEUE_URL']
+          COMPENSATION_QUEUE_URL = os.environ['COMPENSATION_QUEUE_URL']
+          
+          def lambda_handler(event, context):
+              try:
+                  for record in event['Records']:
+                      message_body = json.loads(record['body'])
+                      transaction_id = message_body['transactionId']
+                      order_data = message_body['data']
+                      
+                      # Generate order ID
+                      order_id = str(uuid.uuid4())
+                      
+                      # Create order record
+                      order_table = dynamodb.Table(ORDER_TABLE)
+                      saga_table = dynamodb.Table(SAGA_STATE_TABLE)
+                      
+                      order_table.put_item(
+                          Item={
+                              'OrderId': order_id,
+                              'TransactionId': transaction_id,
+                              'CustomerId': order_data['customerId'],
+                              'ProductId': order_data['productId'],
+                              'Quantity': order_data['quantity'],
+                              'Amount': order_data['amount'],
+                              'Status': 'PENDING',
+                              'Timestamp': datetime.utcnow().isoformat()
+                          }
+                      )
+                      
+                      # Update saga state
+                      saga_table.update_item(
+                          Key={'TransactionId': transaction_id},
+                          UpdateExpression='SET CompletedSteps = list_append(CompletedSteps, :step), CurrentStep = :next_step',
+                          ExpressionAttributeValues={
+                              ':step': ['ORDER_PROCESSING'],
+                              ':next_step': 'PAYMENT_PROCESSING'
+                          }
+                      )
+                      
+                      # Send message to payment queue
+                      payment_message = {
+                          'transactionId': transaction_id,
+                          'step': 'PAYMENT_PROCESSING',
+                          'data': {
+                              'orderId': order_id,
+                              'customerId': order_data['customerId'],
+                              'amount': order_data['amount']
+                          }
+                      }
+                      
+                      sqs.send_message(
+                          QueueUrl=PAYMENT_QUEUE_URL,
+                          MessageBody=json.dumps(payment_message),
+                          MessageGroupId=transaction_id
+                      )
+                      
+                      print(f"Order {order_id} created for transaction {transaction_id}")
+                      
+              except Exception as e:
+                  print(f"Error in order service: {str(e)}")
+                  # Send compensation message
+                  compensation_message = {
+                      'transactionId': transaction_id,
+                      'failedStep': 'ORDER_PROCESSING',
+                      'error': str(e)
+                  }
+                  
+                  sqs.send_message(
+                      QueueUrl=COMPENSATION_QUEUE_URL,
+                      MessageBody=json.dumps(compensation_message),
+                      MessageGroupId=transaction_id
+                  )
+                  
+                  raise
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: Lambda
+        - Key: Purpose
+          Value: OrderProcessing
+
+  # Payment processing service function
+  PaymentServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-payment-service'
+      Runtime: !Ref LambdaRuntime
+      Handler: payment_service.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          PAYMENT_TABLE: !Ref PaymentTable
+          SAGA_STATE_TABLE: !Ref SagaStateTable
+          INVENTORY_QUEUE_URL: !Ref InventoryUpdateQueue
+          COMPENSATION_QUEUE_URL: !Ref CompensationQueue
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      TracingConfig:
+        Mode: !If [EnableXRay, Active, PassThrough]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          import random
+          from datetime import datetime
+          
+          dynamodb = boto3.resource('dynamodb')
+          sqs = boto3.client('sqs')
+          
+          PAYMENT_TABLE = os.environ['PAYMENT_TABLE']
+          SAGA_STATE_TABLE = os.environ['SAGA_STATE_TABLE']
+          INVENTORY_QUEUE_URL = os.environ['INVENTORY_QUEUE_URL']
+          COMPENSATION_QUEUE_URL = os.environ['COMPENSATION_QUEUE_URL']
+          
+          def lambda_handler(event, context):
+              try:
+                  for record in event['Records']:
+                      message_body = json.loads(record['body'])
+                      transaction_id = message_body['transactionId']
+                      payment_data = message_body['data']
+                      
+                      # Simulate payment processing (90% success rate)
+                      if random.random() < 0.1:
+                          raise Exception("Payment processing failed - insufficient funds")
+                      
+                      # Generate payment ID
+                      payment_id = str(uuid.uuid4())
+                      
+                      # Create payment record
+                      payment_table = dynamodb.Table(PAYMENT_TABLE)
+                      saga_table = dynamodb.Table(SAGA_STATE_TABLE)
+                      
+                      payment_table.put_item(
+                          Item={
+                              'PaymentId': payment_id,
+                              'TransactionId': transaction_id,
+                              'OrderId': payment_data['orderId'],
+                              'CustomerId': payment_data['customerId'],
+                              'Amount': payment_data['amount'],
+                              'Status': 'PROCESSED',
+                              'Timestamp': datetime.utcnow().isoformat()
+                          }
+                      )
+                      
+                      # Update saga state
+                      saga_table.update_item(
+                          Key={'TransactionId': transaction_id},
+                          UpdateExpression='SET CompletedSteps = list_append(CompletedSteps, :step), CurrentStep = :next_step',
+                          ExpressionAttributeValues={
+                              ':step': ['PAYMENT_PROCESSING'],
+                              ':next_step': 'INVENTORY_UPDATE'
+                          }
+                      )
+                      
+                      # Get original order data for inventory update
+                      saga_response = saga_table.get_item(
+                          Key={'TransactionId': transaction_id}
+                      )
+                      order_data = saga_response['Item']['OrderData']
+                      
+                      # Send message to inventory queue
+                      inventory_message = {
+                          'transactionId': transaction_id,
+                          'step': 'INVENTORY_UPDATE',
+                          'data': {
+                              'orderId': payment_data['orderId'],
+                              'paymentId': payment_id,
+                              'productId': order_data['productId'],
+                              'quantity': order_data['quantity']
+                          }
+                      }
+                      
+                      sqs.send_message(
+                          QueueUrl=INVENTORY_QUEUE_URL,
+                          MessageBody=json.dumps(inventory_message),
+                          MessageGroupId=transaction_id
+                      )
+                      
+                      print(f"Payment {payment_id} processed for transaction {transaction_id}")
+                      
+              except Exception as e:
+                  print(f"Error in payment service: {str(e)}")
+                  # Send compensation message
+                  compensation_message = {
+                      'transactionId': transaction_id,
+                      'failedStep': 'PAYMENT_PROCESSING',
+                      'error': str(e)
+                  }
+                  
+                  sqs.send_message(
+                      QueueUrl=COMPENSATION_QUEUE_URL,
+                      MessageBody=json.dumps(compensation_message),
+                      MessageGroupId=transaction_id
+                  )
+                  
+                  raise
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: Lambda
+        - Key: Purpose
+          Value: PaymentProcessing
+
+  # Inventory management service function
+  InventoryServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-inventory-service'
+      Runtime: !Ref LambdaRuntime
+      Handler: inventory_service.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          INVENTORY_TABLE: !Ref InventoryTable
+          SAGA_STATE_TABLE: !Ref SagaStateTable
+          COMPENSATION_QUEUE_URL: !Ref CompensationQueue
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      TracingConfig:
+        Mode: !If [EnableXRay, Active, PassThrough]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import random
+          from datetime import datetime
+          
+          dynamodb = boto3.resource('dynamodb')
+          sqs = boto3.client('sqs')
+          
+          INVENTORY_TABLE = os.environ['INVENTORY_TABLE']
+          SAGA_STATE_TABLE = os.environ['SAGA_STATE_TABLE']
+          COMPENSATION_QUEUE_URL = os.environ['COMPENSATION_QUEUE_URL']
+          
+          def lambda_handler(event, context):
+              try:
+                  for record in event['Records']:
+                      message_body = json.loads(record['body'])
+                      transaction_id = message_body['transactionId']
+                      inventory_data = message_body['data']
+                      
+                      # Simulate inventory check (85% success rate)
+                      if random.random() < 0.15:
+                          raise Exception("Insufficient inventory available")
+                      
+                      # Update inventory using DynamoDB transaction
+                      inventory_table = dynamodb.Table(INVENTORY_TABLE)
+                      saga_table = dynamodb.Table(SAGA_STATE_TABLE)
+                      
+                      # Try to update inventory atomically
+                      try:
+                          inventory_table.update_item(
+                              Key={'ProductId': inventory_data['productId']},
+                              UpdateExpression='SET QuantityAvailable = QuantityAvailable - :quantity, LastUpdated = :timestamp',
+                              ConditionExpression='QuantityAvailable >= :quantity',
+                              ExpressionAttributeValues={
+                                  ':quantity': inventory_data['quantity'],
+                                  ':timestamp': datetime.utcnow().isoformat()
+                              }
+                          )
+                      except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+                          raise Exception("Insufficient inventory - conditional check failed")
+                      
+                      # Update saga state to completed
+                      saga_table.update_item(
+                          Key={'TransactionId': transaction_id},
+                          UpdateExpression='SET CompletedSteps = list_append(CompletedSteps, :step), CurrentStep = :next_step, #status = :status',
+                          ExpressionAttributeNames={'#status': 'Status'},
+                          ExpressionAttributeValues={
+                              ':step': ['INVENTORY_UPDATE'],
+                              ':next_step': 'COMPLETED',
+                              ':status': 'COMPLETED'
+                          }
+                      )
+                      
+                      print(f"Inventory updated for transaction {transaction_id}, product {inventory_data['productId']}")
+                      
+              except Exception as e:
+                  print(f"Error in inventory service: {str(e)}")
+                  # Send compensation message
+                  compensation_message = {
+                      'transactionId': transaction_id,
+                      'failedStep': 'INVENTORY_UPDATE',
+                      'error': str(e)
+                  }
+                  
+                  sqs.send_message(
+                      QueueUrl=COMPENSATION_QUEUE_URL,
+                      MessageBody=json.dumps(compensation_message),
+                      MessageGroupId=transaction_id
+                  )
+                  
+                  raise
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: Lambda
+        - Key: Purpose
+          Value: InventoryManagement
+
+  # ============================================================================
+  # LAMBDA EVENT SOURCE MAPPINGS
+  # ============================================================================
+
+  # Order processing event source mapping
+  OrderProcessingEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt OrderProcessingQueue.Arn
+      FunctionName: !Ref OrderServiceFunction
+      BatchSize: 1
+      MaximumBatchingWindowInSeconds: 5
+      Enabled: true
+
+  # Payment processing event source mapping
+  PaymentProcessingEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt PaymentProcessingQueue.Arn
+      FunctionName: !Ref PaymentServiceFunction
+      BatchSize: 1
+      MaximumBatchingWindowInSeconds: 5
+      Enabled: true
+
+  # Inventory update event source mapping
+  InventoryUpdateEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt InventoryUpdateQueue.Arn
+      FunctionName: !Ref InventoryServiceFunction
+      BatchSize: 1
+      MaximumBatchingWindowInSeconds: 5
+      Enabled: true
+
+  # Compensation event source mapping
+  CompensationEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt CompensationQueue.Arn
+      FunctionName: !Ref CompensationHandlerFunction
+      BatchSize: 1
+      MaximumBatchingWindowInSeconds: 5
+      Enabled: true
+
+  # ============================================================================
+  # CLOUDWATCH LOG GROUPS
+  # ============================================================================
+
+  # Transaction orchestrator log group
+  TransactionOrchestratorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-orchestrator'
+      RetentionInDays: !Ref LogRetentionInDays
+      KmsKeyId: !If [IsProduction, !Ref CloudWatchKMSKey, !Ref 'AWS::NoValue']
+
+  # Compensation handler log group
+  CompensationHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-compensation-handler'
+      RetentionInDays: !Ref LogRetentionInDays
+      KmsKeyId: !If [IsProduction, !Ref CloudWatchKMSKey, !Ref 'AWS::NoValue']
+
+  # Order service log group
+  OrderServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-order-service'
+      RetentionInDays: !Ref LogRetentionInDays
+      KmsKeyId: !If [IsProduction, !Ref CloudWatchKMSKey, !Ref 'AWS::NoValue']
+
+  # Payment service log group
+  PaymentServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-payment-service'
+      RetentionInDays: !Ref LogRetentionInDays
+      KmsKeyId: !If [IsProduction, !Ref CloudWatchKMSKey, !Ref 'AWS::NoValue']
+
+  # Inventory service log group
+  InventoryServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-inventory-service'
+      RetentionInDays: !Ref LogRetentionInDays
+      KmsKeyId: !If [IsProduction, !Ref CloudWatchKMSKey, !Ref 'AWS::NoValue']
+
+  # API Gateway log group
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}-${Environment}-transaction-api'
+      RetentionInDays: !Ref LogRetentionInDays
+      KmsKeyId: !If [IsProduction, !Ref CloudWatchKMSKey, !Ref 'AWS::NoValue']
+
+  # ============================================================================
+  # KMS KEY FOR PRODUCTION ENCRYPTION
+  # ============================================================================
+
+  # KMS key for CloudWatch logs encryption in production
+  CloudWatchKMSKey:
+    Type: AWS::KMS::Key
+    Condition: IsProduction
+    Properties:
+      Description: !Sub 'KMS key for CloudWatch logs encryption - ${ProjectName}-${Environment}'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                kms:EncryptionContext:aws:logs:arn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-${Environment}-*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: KMS
+        - Key: Purpose
+          Value: CloudWatchLogsEncryption
+
+  # KMS key alias for CloudWatch logs
+  CloudWatchKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: IsProduction
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-${Environment}-cloudwatch-logs'
+      TargetKeyId: !Ref CloudWatchKMSKey
+
+  # ============================================================================
+  # API GATEWAY
+  # ============================================================================
+
+  # REST API for transaction initiation
+  TransactionRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-transaction-api'
+      Description: 'REST API for initiating distributed transactions'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      ApiKeySourceType: HEADER
+      BinaryMediaTypes:
+        - 'application/octet-stream'
+      MinimumCompressionSize: 1024
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: ApiGateway
+        - Key: Purpose
+          Value: TransactionInitiation
+
+  # Transactions resource
+  TransactionsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TransactionRestApi
+      ParentId: !GetAtt TransactionRestApi.RootResourceId
+      PathPart: transactions
+
+  # POST method for transaction initiation
+  TransactionsPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TransactionRestApi
+      ResourceId: !Ref TransactionsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      RequestValidatorId: !Ref ApiGatewayRequestValidator
+      RequestModels:
+        application/json: !Ref TransactionRequestModel
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TransactionOrchestratorFunction.Arn}/invocations'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+          ResponseModels:
+            application/json: !Ref TransactionResponseModel
+
+  # OPTIONS method for CORS
+  TransactionsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TransactionRestApi
+      ResourceId: !Ref TransactionsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  # Request validator for API Gateway
+  ApiGatewayRequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      RestApiId: !Ref TransactionRestApi
+      Name: !Sub '${ProjectName}-${Environment}-request-validator'
+      ValidateRequestBody: true
+      ValidateRequestParameters: true
+
+  # Transaction request model
+  TransactionRequestModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref TransactionRestApi
+      ContentType: application/json
+      Name: TransactionRequest
+      Schema:
+        $schema: 'http://json-schema.org/draft-04/schema#'
+        title: Transaction Request Schema
+        type: object
+        properties:
+          customerId:
+            type: string
+            pattern: '^[A-Z0-9-]+$'
+            minLength: 1
+            maxLength: 50
+          productId:
+            type: string
+            pattern: '^[A-Z0-9-]+$'
+            minLength: 1
+            maxLength: 50
+          quantity:
+            type: integer
+            minimum: 1
+            maximum: 1000
+          amount:
+            type: number
+            minimum: 0.01
+            maximum: 999999.99
+        required:
+          - customerId
+          - productId
+          - quantity
+          - amount
+        additionalProperties: false
+
+  # Transaction response model
+  TransactionResponseModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref TransactionRestApi
+      ContentType: application/json
+      Name: TransactionResponse
+      Schema:
+        $schema: 'http://json-schema.org/draft-04/schema#'
+        title: Transaction Response Schema
+        type: object
+        properties:
+          transactionId:
+            type: string
+          status:
+            type: string
+          message:
+            type: string
+          error:
+            type: string
+        additionalProperties: false
+
+  # Lambda permission for API Gateway
+  ApiGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TransactionOrchestratorFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TransactionRestApi}/*/*'
+
+  # API Gateway deployment
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - TransactionsPostMethod
+      - TransactionsOptionsMethod
+    Properties:
+      RestApiId: !Ref TransactionRestApi
+      Description: !Sub 'Deployment for ${Environment} environment'
+
+  # API Gateway stage
+  ApiGatewayStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref TransactionRestApi
+      DeploymentId: !Ref ApiGatewayDeployment
+      StageName: !Ref Environment
+      Description: !Sub 'Stage for ${Environment} environment'
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: !If [IsProduction, ERROR, INFO]
+          DataTraceEnabled: !If [IsDevelopment, true, false]
+          MetricsEnabled: true
+          ThrottlingBurstLimit: 1000
+          ThrottlingRateLimit: 500
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+        Format: '$context.requestId $context.extendedRequestId $context.identity.sourceIp $context.identity.caller $context.identity.user [$context.requestTime] "$context.httpMethod $context.resourcePath $context.protocol" $context.status $context.error.message $context.error.messageString'
+      TracingEnabled: !If [EnableXRay, true, false]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: ApiGateway
+        - Key: Purpose
+          Value: TransactionApi
+
+  # ============================================================================
+  # CLOUDWATCH ALARMS
+  # ============================================================================
+
+  # Failed transactions alarm
+  FailedTransactionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-failed-transactions'
+      AlarmDescription: 'Alert when transactions fail'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref FailedTransactionThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TransactionOrchestratorFunction
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref FailedTransactionsTopic
+
+  # Message age alarm
+  MessageAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-message-age'
+      AlarmDescription: 'Alert when messages age in queue'
+      MetricName: ApproximateAgeOfOldestMessage
+      Namespace: AWS/SQS
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref MessageAgeThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt OrderProcessingQueue.QueueName
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref MessageAgeAlarmTopic
+
+  # Dead letter queue alarm
+  DeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-dead-letter-queue'
+      AlarmDescription: 'Alert when messages appear in dead letter queue'
+      MetricName: ApproximateNumberOfVisibleMessages
+      Namespace: AWS/SQS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DeadLetterQueueAlarmTopic
+
+  # ============================================================================
+  # SNS TOPICS FOR ALARMS
+  # ============================================================================
+
+  # Failed transactions SNS topic
+  FailedTransactionsTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnableAlarms
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-failed-transactions'
+      DisplayName: 'Failed Transactions Alert'
+      KmsMasterKeyId: !If [IsProduction, !Ref CloudWatchKMSKey, alias/aws/sns]
+
+  # Message age alarm SNS topic
+  MessageAgeAlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnableAlarms
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-message-age'
+      DisplayName: 'Message Age Alert'
+      KmsMasterKeyId: !If [IsProduction, !Ref CloudWatchKMSKey, alias/aws/sns]
+
+  # Dead letter queue alarm SNS topic
+  DeadLetterQueueAlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnableAlarms
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-dead-letter-queue'
+      DisplayName: 'Dead Letter Queue Alert'
+      KmsMasterKeyId: !If [IsProduction, !Ref CloudWatchKMSKey, alias/aws/sns]
+
+  # ============================================================================
+  # CLOUDWATCH DASHBOARD
+  # ============================================================================
+
+  # Transaction monitoring dashboard
+  TransactionMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}-transactions'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${TransactionOrchestratorFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Transaction Orchestrator Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/SQS", "NumberOfMessagesSent", "QueueName", "${OrderProcessingQueue.QueueName}" ],
+                  [ ".", "NumberOfMessagesReceived", ".", "." ],
+                  [ ".", "ApproximateNumberOfMessagesVisible", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Order Processing Queue Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${OrderServiceFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Order Service Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${PaymentServiceFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Payment Service Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${InventoryServiceFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Inventory Service Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${SagaStateTable}" ],
+                  [ ".", "ConsumedWriteCapacityUnits", ".", "." ],
+                  [ ".", "ThrottledRequests", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Saga State Table Metrics"
+              }
+            }
+          ]
+        }
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+
+Outputs:
+  # API Gateway outputs
+  ApiGatewayRestApiId:
+    Description: 'REST API ID for the transaction processing system'
+    Value: !Ref TransactionRestApi
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-api-gateway-id'
+
+  ApiGatewayRestApiUrl:
+    Description: 'REST API URL for the transaction processing system'
+    Value: !Sub 'https://${TransactionRestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-api-gateway-url'
+
+  TransactionEndpoint:
+    Description: 'Endpoint URL for initiating transactions'
+    Value: !Sub 'https://${TransactionRestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/transactions'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-transaction-endpoint'
+
+  # DynamoDB table outputs
+  SagaStateTableName:
+    Description: 'Name of the saga state table'
+    Value: !Ref SagaStateTable
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-saga-state-table'
+
+  SagaStateTableArn:
+    Description: 'ARN of the saga state table'
+    Value: !GetAtt SagaStateTable.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-saga-state-table-arn'
+
+  OrderTableName:
+    Description: 'Name of the order table'
+    Value: !Ref OrderTable
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-order-table'
+
+  PaymentTableName:
+    Description: 'Name of the payment table'
+    Value: !Ref PaymentTable
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-payment-table'
+
+  InventoryTableName:
+    Description: 'Name of the inventory table'
+    Value: !Ref InventoryTable
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-inventory-table'
+
+  # SQS queue outputs
+  OrderProcessingQueueUrl:
+    Description: 'URL of the order processing queue'
+    Value: !Ref OrderProcessingQueue
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-order-queue-url'
+
+  PaymentProcessingQueueUrl:
+    Description: 'URL of the payment processing queue'
+    Value: !Ref PaymentProcessingQueue
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-payment-queue-url'
+
+  InventoryUpdateQueueUrl:
+    Description: 'URL of the inventory update queue'
+    Value: !Ref InventoryUpdateQueue
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-inventory-queue-url'
+
+  CompensationQueueUrl:
+    Description: 'URL of the compensation queue'
+    Value: !Ref CompensationQueue
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-compensation-queue-url'
+
+  DeadLetterQueueUrl:
+    Description: 'URL of the dead letter queue'
+    Value: !Ref DeadLetterQueue
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-dlq-url'
+
+  # Lambda function outputs
+  TransactionOrchestratorFunctionName:
+    Description: 'Name of the transaction orchestrator function'
+    Value: !Ref TransactionOrchestratorFunction
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-orchestrator-function'
+
+  TransactionOrchestratorFunctionArn:
+    Description: 'ARN of the transaction orchestrator function'
+    Value: !GetAtt TransactionOrchestratorFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-orchestrator-function-arn'
+
+  OrderServiceFunctionName:
+    Description: 'Name of the order service function'
+    Value: !Ref OrderServiceFunction
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-order-service-function'
+
+  PaymentServiceFunctionName:
+    Description: 'Name of the payment service function'
+    Value: !Ref PaymentServiceFunction
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-payment-service-function'
+
+  InventoryServiceFunctionName:
+    Description: 'Name of the inventory service function'
+    Value: !Ref InventoryServiceFunction
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-inventory-service-function'
+
+  CompensationHandlerFunctionName:
+    Description: 'Name of the compensation handler function'
+    Value: !Ref CompensationHandlerFunction
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-compensation-handler-function'
+
+  # CloudWatch dashboard output
+  DashboardUrl:
+    Description: 'URL of the CloudWatch dashboard'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-transactions'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-dashboard-url'
+
+  # IAM role outputs
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-lambda-execution-role-arn'
+
+  # Sample test command
+  TestCommand:
+    Description: 'Sample curl command to test the transaction endpoint'
+    Value: !Sub |
+      curl -X POST \
+        -H "Content-Type: application/json" \
+        -d '{"customerId": "CUST-001", "productId": "PROD-001", "quantity": 2, "amount": 2599.98}' \
+        https://${TransactionRestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/transactions
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-test-command'
+
+  # Environment information
+  Environment:
+    Description: 'Deployment environment'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-environment'
+
+  Region:
+    Description: 'AWS region where resources are deployed'
+    Value: !Ref 'AWS::Region'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-region'
+
+  StackName:
+    Description: 'Name of the CloudFormation stack'
+    Value: !Ref 'AWS::StackName'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-stack-name'

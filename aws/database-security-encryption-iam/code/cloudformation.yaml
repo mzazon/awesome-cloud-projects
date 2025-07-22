@@ -1,0 +1,750 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Comprehensive Database Security Solution with Encryption and IAM Authentication - Implements enterprise-grade security controls including customer-managed KMS encryption, IAM database authentication, RDS Proxy, and comprehensive monitoring'
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+Parameters:
+  # Environment Configuration
+  Environment:
+    Type: String
+    Default: Production
+    AllowedValues:
+      - Development
+      - Staging
+      - Production
+    Description: Environment for resource deployment and tagging
+
+  # Database Configuration
+  DBInstanceClass:
+    Type: String
+    Default: db.r5.large
+    AllowedValues:
+      - db.r5.large
+      - db.r5.xlarge
+      - db.r5.2xlarge
+      - db.r5.4xlarge
+      - db.r6g.large
+      - db.r6g.xlarge
+      - db.r6g.2xlarge
+    Description: RDS instance class for the encrypted database
+
+  PostgreSQLVersion:
+    Type: String
+    Default: '15.7'
+    AllowedValues:
+      - '15.7'
+      - '15.6'
+      - '15.5'
+      - '14.12'
+      - '14.11'
+    Description: PostgreSQL engine version
+
+  AllocatedStorage:
+    Type: Number
+    Default: 100
+    MinValue: 20
+    MaxValue: 65536
+    Description: Initial allocated storage in GB (20-65536)
+
+  BackupRetentionPeriod:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 35
+    Description: Backup retention period in days
+
+  # Security Configuration
+  DBUsername:
+    Type: String
+    Default: dbadmin
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]*$'
+    Description: Master username for RDS instance (must start with letter)
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 128
+    AllowedPattern: '^[a-zA-Z0-9!@#$%^&*()_+\-=\[\]{};:,.<>?]*$'
+    Description: Master password for RDS instance (8-128 characters)
+
+  IAMDBUserName:
+    Type: String
+    Default: app_user
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]*$'
+    Description: Database user for IAM authentication
+
+  # Network Configuration
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for database deployment
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnet IDs for database deployment (minimum 2 subnets in different AZs)
+
+  AllowedSecurityGroupId:
+    Type: String
+    Default: ''
+    Description: Optional - Security Group ID to allow database access from
+
+  # Monitoring Configuration
+  MonitoringInterval:
+    Type: Number
+    Default: 60
+    AllowedValues: [0, 1, 5, 10, 15, 30, 60]
+    Description: Enhanced monitoring interval in seconds (0 = disabled)
+
+  PerformanceInsightsRetentionPeriod:
+    Type: Number
+    Default: 7
+    AllowedValues: [7, 731]
+    Description: Performance Insights retention period in days
+
+  # Resource Naming
+  ResourcePrefix:
+    Type: String
+    Default: secure-db
+    MinLength: 1
+    MaxLength: 20
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    Description: Prefix for resource names (must start with letter)
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+Conditions:
+  # Check if enhanced monitoring is enabled
+  EnableEnhancedMonitoring: !Not [!Equals [!Ref MonitoringInterval, 0]]
+  
+  # Check if allowed security group is specified
+  HasAllowedSecurityGroup: !Not [!Equals [!Ref AllowedSecurityGroupId, '']]
+  
+  # Check if this is a production environment
+  IsProduction: !Equals [!Ref Environment, 'Production']
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+  # ------------------------------------------------------------------------------
+  # KMS Key for Database Encryption
+  # ------------------------------------------------------------------------------
+  DatabaseKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'Customer-managed KMS key for RDS encryption - ${ResourcePrefix}'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # Allow IAM root permissions
+          - Sid: EnableIAMUserPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          # Allow RDS service access
+          - Sid: AllowRDSService
+            Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:ViaService': !Sub 'rds.${AWS::Region}.amazonaws.com'
+          # Allow CloudWatch Logs access
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal:
+              Service: logs.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/rds/instance/${ResourcePrefix}-*'
+      KeyRotationEnabled: true
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyUsage: ENCRYPT_DECRYPT
+      MultiRegion: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-database-kms-key'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Database Encryption
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # KMS Key Alias for easier reference
+  DatabaseKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ResourcePrefix}-database-encryption-key'
+      TargetKeyId: !Ref DatabaseKMSKey
+
+  # ------------------------------------------------------------------------------
+  # Security Group for Database Access
+  # ------------------------------------------------------------------------------
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ResourcePrefix}-database-sg'
+      GroupDescription: Security group for encrypted RDS instance with IAM authentication
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        # Allow PostgreSQL access from within the same security group
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref DatabaseSecurityGroup
+          Description: PostgreSQL access from same security group
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-database-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Database Security
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Additional security group rule if allowed security group is specified
+  DatabaseSecurityGroupIngressRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasAllowedSecurityGroup
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref AllowedSecurityGroupId
+      Description: PostgreSQL access from allowed security group
+
+  # ------------------------------------------------------------------------------
+  # Database Subnet Group
+  # ------------------------------------------------------------------------------
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${ResourcePrefix}-db-subnet-group'
+      DBSubnetGroupDescription: Subnet group for secure database deployment
+      SubnetIds: !Ref SubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-db-subnet-group'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Database Security
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ------------------------------------------------------------------------------
+  # Database Parameter Group for Enhanced Security
+  # ------------------------------------------------------------------------------
+  DatabaseParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      DBParameterGroupName: !Sub '${ResourcePrefix}-postgres-params'
+      Description: Security-enhanced PostgreSQL parameters
+      Family: postgres15
+      Parameters:
+        # Force SSL connections
+        rds.force_ssl: '1'
+        # Enable connection logging
+        log_connections: '1'
+        # Enable disconnection logging
+        log_disconnections: '1'
+        # Log duration of statements
+        log_duration: '1'
+        # Log statements that take longer than this (in milliseconds)
+        log_min_duration_statement: '1000'
+        # Log hostname in connections
+        log_hostname: '1'
+        # Enhanced logging for security
+        log_statement: 'all'
+        # Enable query logging
+        log_min_messages: 'warning'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-postgres-params'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Database Security
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ------------------------------------------------------------------------------
+  # IAM Role for Enhanced Monitoring
+  # ------------------------------------------------------------------------------
+  RDSEnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Condition: EnableEnhancedMonitoring
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-rds-monitoring-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-rds-monitoring-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Database Monitoring
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ------------------------------------------------------------------------------
+  # RDS Instance with Encryption and IAM Authentication
+  # ------------------------------------------------------------------------------
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${ResourcePrefix}-database'
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: postgres
+      EngineVersion: !Ref PostgreSQLVersion
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      AllocatedStorage: !Ref AllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true
+      KmsKeyId: !Ref DatabaseKMSKey
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      DBParameterGroupName: !Ref DatabaseParameterGroup
+      BackupRetentionPeriod: !Ref BackupRetentionPeriod
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'sun:04:00-sun:05:00'
+      EnableIAMDatabaseAuthentication: true
+      MonitoringInterval: !Ref MonitoringInterval
+      MonitoringRoleArn: !If
+        - EnableEnhancedMonitoring
+        - !GetAtt RDSEnhancedMonitoringRole.Arn
+        - !Ref AWS::NoValue
+      EnablePerformanceInsights: true
+      PerformanceInsightsKMSKeyId: !Ref DatabaseKMSKey
+      PerformanceInsightsRetentionPeriod: !Ref PerformanceInsightsRetentionPeriod
+      DeletionProtection: !If [IsProduction, true, false]
+      CopyTagsToSnapshot: true
+      EnableCloudwatchLogsExports:
+        - postgresql
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-database'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Security
+          Value: Encrypted
+        - Key: Authentication
+          Value: IAM
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ------------------------------------------------------------------------------
+  # IAM Role for Database Access
+  # ------------------------------------------------------------------------------
+  DatabaseAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-database-access-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - ec2.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Sub '${ResourcePrefix}-database-access'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-database-access-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Database Access
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # IAM Policy for Database Access
+  DatabaseAccessPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${ResourcePrefix}-database-access-policy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow RDS connect for specific database user
+          - Effect: Allow
+            Action:
+              - rds-db:connect
+            Resource: !Sub 'arn:aws:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${DatabaseInstance}/${IAMDBUserName}'
+          # Allow RDS describe operations
+          - Effect: Allow
+            Action:
+              - rds:DescribeDBInstances
+              - rds:DescribeDBProxies
+            Resource: '*'
+          # Allow generating auth tokens
+          - Effect: Allow
+            Action:
+              - rds:GenerateAuthToken
+            Resource: !Sub 'arn:aws:rds:${AWS::Region}:${AWS::AccountId}:db:${DatabaseInstance}'
+      Roles:
+        - !Ref DatabaseAccessRole
+
+  # ------------------------------------------------------------------------------
+  # RDS Proxy for Enhanced Security and Connection Pooling
+  # ------------------------------------------------------------------------------
+  DatabaseProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-proxy-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ProxyPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBClusters
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-proxy-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: RDS Proxy
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  DatabaseProxy:
+    Type: AWS::RDS::DBProxy
+    Properties:
+      DBProxyName: !Sub '${ResourcePrefix}-proxy'
+      EngineFamily: POSTGRESQL
+      Auth:
+        - AuthScheme: IAM
+          Description: IAM authentication for secure database access
+      RoleArn: !GetAtt DatabaseProxyRole.Arn
+      VpcSubnetIds: !Ref SubnetIds
+      VpcSecurityGroupIds:
+        - !Ref DatabaseSecurityGroup
+      RequireTLS: true
+      IdleClientTimeout: 1800
+      DebugLogging: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-proxy'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Security
+          Value: TLS-Required
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Register RDS instance with proxy
+  DatabaseProxyTargetGroup:
+    Type: AWS::RDS::DBProxyTargetGroup
+    Properties:
+      DBProxyName: !Ref DatabaseProxy
+      TargetGroupName: default
+      DBInstanceIdentifiers:
+        - !Ref DatabaseInstance
+
+  # ------------------------------------------------------------------------------
+  # CloudWatch Log Group for Database Logs
+  # ------------------------------------------------------------------------------
+  DatabaseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/rds/instance/${ResourcePrefix}-database/postgresql'
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt DatabaseKMSKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-database-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Database Monitoring
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ------------------------------------------------------------------------------
+  # CloudWatch Alarms for Security Monitoring
+  # ------------------------------------------------------------------------------
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-HighCPU'
+      AlarmDescription: High CPU usage on RDS instance
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DatabaseInstance
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-HighCPU'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Database Monitoring
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  HighConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-HighConnections'
+      AlarmDescription: High number of database connections
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DatabaseInstance
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-HighConnections'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Database Monitoring
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  FreeableMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-LowFreeableMemory'
+      AlarmDescription: Low freeable memory on RDS instance
+      MetricName: FreeableMemory
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 2000000000  # 2GB in bytes
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DatabaseInstance
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-LowFreeableMemory'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Database Monitoring
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ------------------------------------------------------------------------------
+  # Lambda Function for Database User Setup (Optional)
+  # ------------------------------------------------------------------------------
+  DatabaseSetupLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-setup-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: DatabaseSetupPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:GenerateAuthToken
+                  - rds-db:connect
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ResourcePrefix}-setup:*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-setup-lambda-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Database Setup
+        - Key: ManagedBy
+          Value: CloudFormation
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+Outputs:
+  # Database Information
+  DatabaseInstanceIdentifier:
+    Description: RDS instance identifier
+    Value: !Ref DatabaseInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseInstanceIdentifier'
+
+  DatabaseEndpoint:
+    Description: RDS instance endpoint
+    Value: !GetAtt DatabaseInstance.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseEndpoint'
+
+  DatabasePort:
+    Description: RDS instance port
+    Value: !GetAtt DatabaseInstance.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabasePort'
+
+  # Proxy Information
+  DatabaseProxyEndpoint:
+    Description: RDS Proxy endpoint
+    Value: !GetAtt DatabaseProxy.Endpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseProxyEndpoint'
+
+  # Security Information
+  DatabaseSecurityGroupId:
+    Description: Security Group ID for database access
+    Value: !Ref DatabaseSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseSecurityGroupId'
+
+  DatabaseKMSKeyId:
+    Description: KMS Key ID for database encryption
+    Value: !Ref DatabaseKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseKMSKeyId'
+
+  DatabaseKMSKeyAlias:
+    Description: KMS Key Alias for database encryption
+    Value: !Ref DatabaseKMSKeyAlias
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseKMSKeyAlias'
+
+  # IAM Information
+  DatabaseAccessRoleArn:
+    Description: IAM Role ARN for database access
+    Value: !GetAtt DatabaseAccessRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseAccessRoleArn'
+
+  DatabaseAccessRoleName:
+    Description: IAM Role Name for database access
+    Value: !Ref DatabaseAccessRole
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseAccessRoleName'
+
+  # Monitoring Information
+  DatabaseLogGroupName:
+    Description: CloudWatch Log Group for database logs
+    Value: !Ref DatabaseLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseLogGroupName'
+
+  # Connection Information
+  DatabaseIAMUser:
+    Description: Database user for IAM authentication
+    Value: !Ref IAMDBUserName
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseIAMUser'
+
+  # Connection Command Examples
+  DirectConnectionCommand:
+    Description: Example command for direct database connection using IAM authentication
+    Value: !Sub |
+      # Generate authentication token
+      TOKEN=$(aws rds generate-db-auth-token --hostname ${DatabaseInstance.Endpoint.Address} --port ${DatabaseInstance.Endpoint.Port} --region ${AWS::Region} --username ${IAMDBUserName})
+      
+      # Connect to database
+      PGPASSWORD="$TOKEN" psql -h ${DatabaseInstance.Endpoint.Address} -U ${IAMDBUserName} -d postgres -p ${DatabaseInstance.Endpoint.Port}
+
+  ProxyConnectionCommand:
+    Description: Example command for proxy database connection using IAM authentication
+    Value: !Sub |
+      # Generate authentication token
+      TOKEN=$(aws rds generate-db-auth-token --hostname ${DatabaseProxy.Endpoint} --port 5432 --region ${AWS::Region} --username ${IAMDBUserName})
+      
+      # Connect to database through proxy
+      PGPASSWORD="$TOKEN" psql -h ${DatabaseProxy.Endpoint} -U ${IAMDBUserName} -d postgres -p 5432
+
+  # Security Compliance Information
+  SecurityComplianceReport:
+    Description: Security compliance summary
+    Value: !Sub |
+      Database Security Configuration:
+      - Encryption at Rest: Enabled (Customer-managed KMS key)
+      - Encryption in Transit: Enabled (TLS/SSL required)
+      - IAM Authentication: Enabled
+      - Enhanced Monitoring: ${MonitoringInterval} seconds
+      - Performance Insights: Enabled with encryption
+      - Backup Encryption: Enabled
+      - Deletion Protection: ${IsProduction}
+      - Network Isolation: VPC with security groups
+      - Parameter Group: Custom with security enhancements
+      - CloudWatch Monitoring: Enabled with alarms

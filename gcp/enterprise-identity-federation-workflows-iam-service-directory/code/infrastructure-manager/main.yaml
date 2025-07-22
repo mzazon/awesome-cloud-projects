@@ -1,0 +1,490 @@
+# Google Cloud Infrastructure Manager Configuration
+# Enterprise Identity Federation Workflows with Cloud IAM and Service Directory
+# This configuration deploys a complete enterprise identity federation system
+# using Workload Identity Federation, Service Directory, Cloud Functions, and Secret Manager
+
+# Infrastructure Manager deployment configuration
+# Supports parameterized deployment with secure defaults
+apiVersion: v1
+kind: InfrastructureManager
+metadata:
+  name: enterprise-identity-federation
+  description: "Enterprise identity federation system with automated provisioning workflows"
+
+# Input parameters for customizable deployment
+parameters:
+  # Project and location configuration
+  project_id:
+    type: string
+    description: "Google Cloud project ID for deployment"
+    required: true
+  
+  region:
+    type: string
+    description: "Primary region for resource deployment"
+    default: "us-central1"
+    
+  zone:
+    type: string
+    description: "Compute zone for zonal resources"
+    default: "us-central1-a"
+
+  # Identity federation configuration
+  workload_identity_pool_id:
+    type: string
+    description: "Unique identifier for workload identity pool"
+    default: "enterprise-pool"
+    
+  oidc_provider_id:
+    type: string
+    description: "OIDC provider identifier within the workload identity pool"
+    default: "oidc-provider"
+    
+  external_issuer_uri:
+    type: string
+    description: "External OIDC provider issuer URI"
+    default: "https://token.actions.githubusercontent.com"
+    
+  allowed_audiences:
+    type: string
+    description: "Allowed audiences for OIDC token validation"
+    default: "sts.googleapis.com"
+
+  # Service Directory configuration
+  service_directory_namespace:
+    type: string
+    description: "Service Directory namespace for enterprise services"
+    default: "enterprise-services"
+
+  # Function and automation configuration
+  cloud_function_name:
+    type: string
+    description: "Name for the identity provisioning Cloud Function"
+    default: "identity-provisioner"
+    
+  function_memory:
+    type: string
+    description: "Memory allocation for Cloud Function"
+    default: "256MB"
+    
+  function_timeout:
+    type: string
+    description: "Timeout for Cloud Function execution"
+    default: "60s"
+
+# Resource definitions using Google Cloud Infrastructure Manager
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id)/services/iamcredentials.googleapis.com
+      
+  - name: enable-sts-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id)/services/sts.googleapis.com
+      
+  - name: enable-service-directory-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id)/services/servicedirectory.googleapis.com
+      
+  - name: enable-cloud-functions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id)/services/cloudfunctions.googleapis.com
+      
+  - name: enable-secret-manager-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id)/services/secretmanager.googleapis.com
+      
+  - name: enable-cloud-build-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id)/services/cloudbuild.googleapis.com
+
+  # Workload Identity Pool for external identity federation
+  # This is the central trust boundary for external identities
+  - name: workload-identity-pool
+    type: gcp-types/iam-v1:projects.locations.workloadIdentityPools
+    properties:
+      parent: projects/$(ref.project_id)/locations/global
+      workloadIdentityPoolId: $(ref.workload_identity_pool_id)
+      workloadIdentityPool:
+        displayName: "Enterprise Identity Federation Pool"
+        description: "Workload Identity Pool for enterprise identity federation"
+        state: ACTIVE
+        disabled: false
+    metadata:
+      dependsOn:
+        - enable-sts-api
+
+  # OIDC Provider configuration for external identity integration
+  # Establishes trust relationship with external identity providers
+  - name: oidc-provider
+    type: gcp-types/iam-v1:projects.locations.workloadIdentityPools.providers
+    properties:
+      parent: $(ref.workload-identity-pool.name)
+      workloadIdentityPoolProviderId: $(ref.oidc_provider_id)
+      workloadIdentityPoolProvider:
+        displayName: "External OIDC Provider"
+        description: "OIDC provider for external identity federation"
+        state: ACTIVE
+        disabled: false
+        oidc:
+          issuerUri: $(ref.external_issuer_uri)
+          allowedAudiences:
+            - $(ref.allowed_audiences)
+        attributeMapping:
+          "google.subject": "assertion.sub"
+          "attribute.repository": "assertion.repository"
+          "attribute.actor": "assertion.actor"
+        attributeCondition: "true"  # Can be customized for conditional access
+    metadata:
+      dependsOn:
+        - workload-identity-pool
+
+  # Service Account for federated identity access
+  # Provides authorization context for external workloads
+  - name: federation-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      name: projects/$(ref.project_id)
+      accountId: federation-service-account
+      serviceAccount:
+        displayName: "Federation Service Account"
+        description: "Service account for identity federation workflows"
+        disabled: false
+
+  # Read-only service account for limited access scenarios
+  - name: read-only-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      name: projects/$(ref.project_id)
+      accountId: read-only-service-account
+      serviceAccount:
+        displayName: "Read-Only Federation Account"
+        description: "Read-only access for federated identities"
+        disabled: false
+
+  # Administrative service account for elevated access scenarios
+  - name: admin-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      name: projects/$(ref.project_id)
+      accountId: admin-service-account
+      serviceAccount:
+        displayName: "Admin Federation Account"
+        description: "Administrative access for federated identities"
+        disabled: false
+
+  # IAM binding for workload identity federation
+  # Allows external identities to impersonate service accounts
+  - name: workload-identity-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/iam.workloadIdentityUser
+      member: principalSet://iam.googleapis.com/$(ref.workload-identity-pool.name)/attribute.repository/$(ref.project_id)
+    metadata:
+      dependsOn:
+        - federation-service-account
+        - oidc-provider
+
+  # Service Directory namespace for enterprise service discovery
+  # Provides centralized service registry for hybrid environments
+  - name: service-directory-namespace
+    type: gcp-types/servicedirectory-v1:projects.locations.namespaces
+    properties:
+      parent: projects/$(ref.project_id)/locations/$(ref.region)
+      namespaceId: $(ref.service_directory_namespace)
+      namespace:
+        displayName: "Enterprise Services Namespace"
+        description: "Namespace for enterprise service discovery"
+        labels:
+          environment: "production"
+          managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - enable-service-directory-api
+
+  # User management service registration
+  - name: user-management-service
+    type: gcp-types/servicedirectory-v1:projects.locations.namespaces.services
+    properties:
+      parent: $(ref.service-directory-namespace.name)
+      serviceId: user-management
+      service:
+        displayName: "User Management Service"
+        metadata:
+          version: "v1"
+          environment: "production"
+          component: "identity"
+    metadata:
+      dependsOn:
+        - service-directory-namespace
+
+  # Identity provider service registration
+  - name: identity-provider-service
+    type: gcp-types/servicedirectory-v1:projects.locations.namespaces.services
+    properties:
+      parent: $(ref.service-directory-namespace.name)
+      serviceId: identity-provider
+      service:
+        displayName: "Identity Provider Service"
+        metadata:
+          version: "v2"
+          environment: "production"
+          component: "authentication"
+    metadata:
+      dependsOn:
+        - service-directory-namespace
+
+  # Resource manager service registration
+  - name: resource-manager-service
+    type: gcp-types/servicedirectory-v1:projects.locations.namespaces.services
+    properties:
+      parent: $(ref.service-directory-namespace.name)
+      serviceId: resource-manager
+      service:
+        displayName: "Resource Manager Service"
+        metadata:
+          version: "v1"
+          environment: "production"
+          component: "provisioning"
+    metadata:
+      dependsOn:
+        - service-directory-namespace
+
+  # Secret for federation configuration storage
+  # Securely stores identity federation parameters
+  - name: federation-config-secret
+    type: gcp-types/secretmanager-v1:projects.secrets
+    properties:
+      parent: projects/$(ref.project_id)
+      secretId: federation-config
+      secret:
+        displayName: "Federation Configuration"
+        replication:
+          automatic: {}
+        labels:
+          component: "identity-federation"
+          managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - enable-secret-manager-api
+
+  # Secret version with federation configuration data
+  - name: federation-config-version
+    type: gcp-types/secretmanager-v1:projects.secrets.versions
+    properties:
+      parent: $(ref.federation-config-secret.name)
+      secretVersion:
+        payload:
+          data: |
+            {
+              "pool_id": "$(ref.workload_identity_pool_id)",
+              "provider_id": "$(ref.oidc_provider_id)",
+              "service_account_email": "federation-service-account@$(ref.project_id).iam.gserviceaccount.com",
+              "namespace": "$(ref.service_directory_namespace)"
+            }
+    metadata:
+      dependsOn:
+        - federation-config-secret
+        - federation-service-account
+
+  # Secret for external identity provider configuration
+  - name: idp-config-secret
+    type: gcp-types/secretmanager-v1:projects.secrets
+    properties:
+      parent: projects/$(ref.project_id)
+      secretId: idp-config
+      secret:
+        displayName: "Identity Provider Configuration"
+        replication:
+          automatic: {}
+        labels:
+          component: "identity-provider"
+          managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - enable-secret-manager-api
+
+  # Secret version with identity provider configuration
+  - name: idp-config-version
+    type: gcp-types/secretmanager-v1:projects.secrets.versions
+    properties:
+      parent: $(ref.idp-config-secret.name)
+      secretVersion:
+        payload:
+          data: |
+            {
+              "issuer_url": "$(ref.external_issuer_uri)",
+              "audience": "$(ref.allowed_audiences)",
+              "allowed_repos": ["$(ref.project_id)"]
+            }
+    metadata:
+      dependsOn:
+        - idp-config-secret
+
+  # Cloud Storage bucket for Cloud Function source code
+  # Required for deploying Cloud Functions via Infrastructure Manager
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:bucket
+    properties:
+      name: $(ref.project_id)-function-source
+      project: $(ref.project_id)
+      location: $(ref.region)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      labels:
+        component: "cloud-functions"
+        managed-by: "infrastructure-manager"
+
+  # Cloud Function for automated identity provisioning
+  # Provides serverless automation for identity workflows
+  - name: identity-provisioning-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project_id)/locations/$(ref.region)
+      function:
+        name: $(ref.cloud_function_name)
+        description: "Automated identity provisioning workflow function"
+        sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/function-source.zip
+        entryPoint: "provision_identity"
+        runtime: "python311"
+        timeout: $(ref.function_timeout)
+        availableMemoryMb: 256
+        environmentVariables:
+          GCP_PROJECT: $(ref.project_id)
+          REGION: $(ref.region)
+        httpsTrigger:
+          securityLevel: SECURE_ALWAYS
+        serviceAccountEmail: $(ref.federation-service-account.email)
+        labels:
+          component: "identity-provisioning"
+          managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - enable-cloud-functions-api
+        - function-source-bucket
+        - federation-service-account
+
+  # IAM binding for service account Service Directory access
+  - name: service-directory-editor-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/servicedirectory.editor
+      member: serviceAccount:$(ref.federation-service-account.email)
+    metadata:
+      dependsOn:
+        - federation-service-account
+
+  # IAM binding for service account Secret Manager access
+  - name: secret-manager-accessor-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/secretmanager.secretAccessor
+      member: serviceAccount:$(ref.federation-service-account.email)
+    metadata:
+      dependsOn:
+        - federation-service-account
+
+  # DNS managed zone for service discovery integration
+  # Enables DNS-based service discovery using familiar patterns
+  - name: enterprise-services-dns-zone
+    type: gcp-types/dns-v1:managedZone
+    properties:
+      project: $(ref.project_id)
+      name: enterprise-services-zone
+      dnsName: services.$(ref.project_id).internal.
+      description: "DNS zone for enterprise service discovery"
+      visibility: private
+      privateVisibilityConfig:
+        networks:
+          - networkUrl: projects/$(ref.project_id)/global/networks/default
+
+  # DNS record set for user management service
+  - name: user-management-dns-record
+    type: gcp-types/dns-v1:resourceRecordSet
+    properties:
+      project: $(ref.project_id)
+      managedZone: $(ref.enterprise-services-dns-zone.name)
+      name: user-mgmt.services.$(ref.project_id).internal.
+      type: CNAME
+      ttl: 300
+      rrdatas:
+        - user-management.$(ref.service_directory_namespace).$(ref.region).sd.internal.
+    metadata:
+      dependsOn:
+        - enterprise-services-dns-zone
+        - user-management-service
+
+# Output values for verification and integration
+outputs:
+  # Workload Identity Federation outputs
+  workload_identity_pool_name:
+    description: "Full resource name of the workload identity pool"
+    value: $(ref.workload-identity-pool.name)
+    
+  oidc_provider_name:
+    description: "Full resource name of the OIDC provider"
+    value: $(ref.oidc-provider.name)
+    
+  federation_service_account_email:
+    description: "Email address of the federation service account"
+    value: $(ref.federation-service-account.email)
+
+  # Service Directory outputs
+  service_directory_namespace_name:
+    description: "Full resource name of the Service Directory namespace"
+    value: $(ref.service-directory-namespace.name)
+    
+  user_management_service_name:
+    description: "Full resource name of the user management service"
+    value: $(ref.user-management-service.name)
+
+  # Cloud Function outputs
+  identity_provisioning_function_name:
+    description: "Name of the identity provisioning Cloud Function"
+    value: $(ref.identity-provisioning-function.name)
+    
+  function_trigger_url:
+    description: "HTTP trigger URL for the identity provisioning function"
+    value: https://$(ref.region)-$(ref.project_id).cloudfunctions.net/$(ref.cloud_function_name)
+
+  # Secret Manager outputs
+  federation_config_secret_name:
+    description: "Full resource name of the federation configuration secret"
+    value: $(ref.federation-config-secret.name)
+    
+  idp_config_secret_name:
+    description: "Full resource name of the identity provider configuration secret"
+    value: $(ref.idp-config-secret.name)
+
+  # DNS outputs
+  dns_zone_name:
+    description: "Name of the DNS managed zone for service discovery"
+    value: $(ref.enterprise-services-dns-zone.name)
+    
+  dns_zone_name_servers:
+    description: "Name servers for the DNS managed zone"
+    value: $(ref.enterprise-services-dns-zone.nameServers)
+
+# Deployment configuration and metadata
+metadata:
+  labels:
+    solution: "enterprise-identity-federation"
+    provider: "google-cloud"
+    iac-tool: "infrastructure-manager"
+    version: "1.0"
+    
+  annotations:
+    description: "Complete enterprise identity federation system with automated provisioning"
+    documentation: "https://cloud.google.com/docs/authentication/external/workforce"
+    best-practices: "https://cloud.google.com/docs/security/best-practices-for-iam"

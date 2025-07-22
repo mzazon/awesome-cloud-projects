@@ -1,0 +1,587 @@
+# Infrastructure Manager Configuration for Real-Time Translation Services
+# This configuration deploys a complete real-time translation platform using
+# Google Cloud Speech-to-Text, Cloud Translation, Cloud Run, and Firestore
+
+# Import required modules and define project-wide variables
+imports:
+  - path: translation-service.jinja
+  - path: firestore-setup.jinja
+  - path: pubsub-messaging.jinja
+  - path: storage-resources.jinja
+  - path: iam-configuration.jinja
+
+# Global project configuration and resource naming
+info:
+  title: Real-Time Translation Services Infrastructure
+  author: Cloud Recipes Team
+  description: |
+    Deploys infrastructure for real-time speech translation using Google Cloud
+    AI services including Speech-to-Text, Translation API, Cloud Run for 
+    WebSocket handling, and Firestore for conversation persistence.
+  version: "1.0"
+
+# Input parameters for customization
+parameters:
+  # Project configuration
+  projectId:
+    type: string
+    description: Google Cloud Project ID
+    default: translation-platform-demo
+  
+  region:
+    type: string
+    description: Primary deployment region
+    default: us-central1
+    enum:
+      - us-central1
+      - us-east1
+      - us-west1
+      - europe-west1
+      - asia-northeast1
+  
+  zone:
+    type: string
+    description: Deployment zone within region
+    default: us-central1-a
+  
+  # Service configuration
+  serviceName:
+    type: string
+    description: Cloud Run service name for translation service
+    default: translation-service
+    pattern: ^[a-z]([a-z0-9-]*[a-z0-9])?$
+  
+  # Resource configuration
+  maxInstances:
+    type: integer
+    description: Maximum Cloud Run instances for auto-scaling
+    default: 10
+    minimum: 1
+    maximum: 100
+  
+  # Security and access configuration
+  allowUnauthenticated:
+    type: boolean
+    description: Allow unauthenticated access to Cloud Run service
+    default: false
+  
+  # Storage configuration
+  audioRetentionDays:
+    type: integer
+    description: Number of days to retain audio files in Cloud Storage
+    default: 30
+    minimum: 1
+    maximum: 365
+
+# Main resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-speech-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-info.projectId)/services/speech.googleapis.com
+      parent: projects/$(ref.project-info.projectId)
+    metadata:
+      dependsOn:
+        - project-info
+
+  - name: enable-translate-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-info.projectId)/services/translate.googleapis.com
+      parent: projects/$(ref.project-info.projectId)
+    metadata:
+      dependsOn:
+        - project-info
+
+  - name: enable-run-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-info.projectId)/services/run.googleapis.com
+      parent: projects/$(ref.project-info.projectId)
+    metadata:
+      dependsOn:
+        - project-info
+
+  - name: enable-firestore-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-info.projectId)/services/firestore.googleapis.com
+      parent: projects/$(ref.project-info.projectId)
+    metadata:
+      dependsOn:
+        - project-info
+
+  - name: enable-pubsub-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-info.projectId)/services/pubsub.googleapis.com
+      parent: projects/$(ref.project-info.projectId)
+    metadata:
+      dependsOn:
+        - project-info
+
+  - name: enable-cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project-info.projectId)/services/cloudbuild.googleapis.com
+      parent: projects/$(ref.project-info.projectId)
+    metadata:
+      dependsOn:
+        - project-info
+
+  # Project information resource for reference
+  - name: project-info
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: {{ properties.projectId }}
+      name: Real-time Translation Platform
+
+  # Service Account for Translation Services
+  - name: translation-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: translation-service
+      serviceAccount:
+        displayName: Real-time Translation Service
+        description: Service account for speech and translation APIs
+      parent: projects/$(ref.project-info.projectId)
+    metadata:
+      dependsOn:
+        - project-info
+
+  # IAM Policy Bindings for Service Account
+  - name: speech-client-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: $(ref.project-info.projectId)
+      policy:
+        bindings:
+          - role: roles/speech.client
+            members:
+              - serviceAccount:$(ref.translation-service-account.email)
+    metadata:
+      dependsOn:
+        - translation-service-account
+
+  - name: translate-user-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: $(ref.project-info.projectId)
+      policy:
+        bindings:
+          - role: roles/translate.user
+            members:
+              - serviceAccount:$(ref.translation-service-account.email)
+    metadata:
+      dependsOn:
+        - translation-service-account
+
+  - name: datastore-user-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: $(ref.project-info.projectId)
+      policy:
+        bindings:
+          - role: roles/datastore.user
+            members:
+              - serviceAccount:$(ref.translation-service-account.email)
+    metadata:
+      dependsOn:
+        - translation-service-account
+
+  - name: pubsub-publisher-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: $(ref.project-info.projectId)
+      policy:
+        bindings:
+          - role: roles/pubsub.publisher
+            members:
+              - serviceAccount:$(ref.translation-service-account.email)
+    metadata:
+      dependsOn:
+        - translation-service-account
+
+  # Firestore Database Configuration
+  - name: firestore-database
+    type: gcp-types/firestore-v1:projects.databases
+    properties:
+      parent: projects/$(ref.project-info.projectId)
+      databaseId: (default)
+      database:
+        type: FIRESTORE_NATIVE
+        locationId: {{ properties.region }}
+        concurrencyMode: OPTIMISTIC
+        appEngineIntegrationMode: DISABLED
+    metadata:
+      dependsOn:
+        - enable-firestore-api
+
+  # Firestore Index for Conversation Queries
+  - name: conversation-index
+    type: gcp-types/firestore-v1:projects.databases.collectionGroups.indexes
+    properties:
+      parent: projects/$(ref.project-info.projectId)/databases/(default)/collectionGroups/conversations
+      index:
+        queryScope: COLLECTION
+        fields:
+          - fieldPath: userId
+            order: ASCENDING
+          - fieldPath: timestamp
+            order: DESCENDING
+    metadata:
+      dependsOn:
+        - firestore-database
+
+  # Cloud Storage Bucket for Audio Files
+  - name: audio-storage-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(ref.project-info.projectId)-audio-files
+      location: {{ properties.region }}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: {{ properties.audioRetentionDays }}
+              matchesStorageClass:
+                - STANDARD
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+    metadata:
+      dependsOn:
+        - project-info
+
+  # Storage Bucket IAM for Service Account
+  - name: storage-object-admin-binding
+    type: gcp-types/storage-v1:buckets.setIamPolicy
+    properties:
+      bucket: $(ref.audio-storage-bucket.name)
+      policy:
+        bindings:
+          - role: roles/storage.objectAdmin
+            members:
+              - serviceAccount:$(ref.translation-service-account.email)
+    metadata:
+      dependsOn:
+        - audio-storage-bucket
+        - translation-service-account
+
+  # Pub/Sub Topic for Translation Events
+  - name: translation-events-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project-info.projectId)/topics/translation-events
+      topic:
+        messageRetentionDuration: 604800s  # 7 days
+        messageStoragePolicy:
+          allowedPersistenceRegions:
+            - {{ properties.region }}
+    metadata:
+      dependsOn:
+        - enable-pubsub-api
+
+  # Pub/Sub Subscription for Processing Translation Results
+  - name: translation-processor-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(ref.project-info.projectId)/subscriptions/translation-processor
+      subscription:
+        topic: $(ref.translation-events-topic.name)
+        messageRetentionDuration: 604800s  # 7 days
+        ackDeadlineSeconds: 300
+        retryPolicy:
+          minimumBackoff: 10s
+          maximumBackoff: 600s
+        deadLetterPolicy:
+          deadLetterTopic: $(ref.translation-dlq-topic.name)
+          maxDeliveryAttempts: 5
+    metadata:
+      dependsOn:
+        - translation-events-topic
+        - translation-dlq-topic
+
+  # Dead Letter Queue Topic
+  - name: translation-dlq-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project-info.projectId)/topics/translation-dlq
+      topic:
+        messageRetentionDuration: 604800s  # 7 days
+        messageStoragePolicy:
+          allowedPersistenceRegions:
+            - {{ properties.region }}
+    metadata:
+      dependsOn:
+        - enable-pubsub-api
+
+  # Cloud Build configuration for containerized application
+  - name: cloud-build-trigger
+    type: gcp-types/cloudbuild-v1:projects.triggers
+    properties:
+      parent: projects/$(ref.project-info.projectId)
+      trigger:
+        name: translation-service-build
+        description: Build trigger for real-time translation service
+        disabled: false
+        substitutions:
+          _SERVICE_NAME: {{ properties.serviceName }}
+          _REGION: {{ properties.region }}
+        build:
+          steps:
+            # Build container image
+            - name: gcr.io/cloud-builders/docker
+              args:
+                - build
+                - -t
+                - gcr.io/$(ref.project-info.projectId)/translation-service:$BUILD_ID
+                - .
+            # Push container image
+            - name: gcr.io/cloud-builders/docker
+              args:
+                - push
+                - gcr.io/$(ref.project-info.projectId)/translation-service:$BUILD_ID
+            # Deploy to Cloud Run
+            - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+              entrypoint: gcloud
+              args:
+                - run
+                - deploy
+                - $_SERVICE_NAME
+                - --image=gcr.io/$(ref.project-info.projectId)/translation-service:$BUILD_ID
+                - --region=$_REGION
+                - --platform=managed
+                - --service-account=$(ref.translation-service-account.email)
+                - --memory=2Gi
+                - --cpu=2
+                - --concurrency=1000
+                - --max-instances={{ properties.maxInstances }}
+                - --timeout=300
+                - --set-env-vars=PROJECT_ID=$(ref.project-info.projectId)
+                {% if properties.allowUnauthenticated %}
+                - --allow-unauthenticated
+                {% endif %}
+          images:
+            - gcr.io/$(ref.project-info.projectId)/translation-service:$BUILD_ID
+    metadata:
+      dependsOn:
+        - enable-cloudbuild-api
+        - translation-service-account
+
+  # Cloud Run Service (deployed via Cloud Build)
+  - name: translation-cloud-run-service
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/$(ref.project-info.projectId)
+      location: {{ properties.region }}
+      service:
+        metadata:
+          name: {{ properties.serviceName }}
+          namespace: $(ref.project-info.projectId)
+          annotations:
+            run.googleapis.com/ingress: all
+            run.googleapis.com/execution-environment: gen2
+        spec:
+          template:
+            metadata:
+              annotations:
+                autoscaling.knative.dev/maxScale: "{{ properties.maxInstances }}"
+                run.googleapis.com/cpu-throttling: "false"
+                run.googleapis.com/execution-environment: gen2
+            spec:
+              serviceAccountName: $(ref.translation-service-account.email)
+              containerConcurrency: 1000
+              timeoutSeconds: 300
+              containers:
+                - image: gcr.io/cloudrun/placeholder  # Placeholder until build completes
+                  ports:
+                    - containerPort: 8080
+                      protocol: TCP
+                  env:
+                    - name: PROJECT_ID
+                      value: $(ref.project-info.projectId)
+                    - name: GOOGLE_CLOUD_PROJECT
+                      value: $(ref.project-info.projectId)
+                  resources:
+                    limits:
+                      cpu: "2"
+                      memory: 2Gi
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 10
+                    timeoutSeconds: 5
+                    failureThreshold: 3
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 10
+                    periodSeconds: 5
+                    timeoutSeconds: 3
+                    successThreshold: 1
+                    failureThreshold: 3
+        {% if properties.allowUnauthenticated %}
+          traffic:
+            - percent: 100
+              latestRevision: true
+        {% endif %}
+    metadata:
+      dependsOn:
+        - enable-run-api
+        - translation-service-account
+
+  # IAM Policy for Cloud Run Service (if unauthenticated access)
+  {% if properties.allowUnauthenticated %}
+  - name: cloud-run-invoker-binding
+    type: gcp-types/run-v1:projects.locations.services.setIamPolicy
+    properties:
+      resource: projects/$(ref.project-info.projectId)/locations/{{ properties.region }}/services/{{ properties.serviceName }}
+      policy:
+        bindings:
+          - role: roles/run.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - translation-cloud-run-service
+  {% endif %}
+
+# Output values for verification and integration
+outputs:
+  # Project information
+  - name: projectId
+    description: Google Cloud Project ID
+    value: $(ref.project-info.projectId)
+
+  - name: region
+    description: Primary deployment region
+    value: {{ properties.region }}
+
+  # Service account information
+  - name: serviceAccountEmail
+    description: Translation service account email
+    value: $(ref.translation-service-account.email)
+
+  # Cloud Run service information
+  - name: cloudRunServiceName
+    description: Cloud Run service name
+    value: {{ properties.serviceName }}
+
+  - name: cloudRunServiceUrl
+    description: Cloud Run service URL
+    value: $(ref.translation-cloud-run-service.status.url)
+
+  # Storage information
+  - name: audioStorageBucket
+    description: Cloud Storage bucket for audio files
+    value: $(ref.audio-storage-bucket.name)
+
+  # Firestore information
+  - name: firestoreDatabase
+    description: Firestore database identifier
+    value: $(ref.firestore-database.name)
+
+  # Pub/Sub information
+  - name: translationEventsTopic
+    description: Pub/Sub topic for translation events
+    value: $(ref.translation-events-topic.name)
+
+  - name: translationProcessorSubscription
+    description: Pub/Sub subscription for processing translation results
+    value: $(ref.translation-processor-subscription.name)
+
+  # API endpoints and URLs
+  - name: websocketUrl
+    description: WebSocket URL for real-time translation
+    value: $(ref.translation-cloud-run-service.status.url | replace('https://', 'wss://'))
+
+  - name: healthCheckUrl
+    description: Health check endpoint URL
+    value: $(ref.translation-cloud-run-service.status.url)/health
+
+  # Resource counts and limits
+  - name: maxCloudRunInstances
+    description: Maximum Cloud Run instances configured
+    value: {{ properties.maxInstances }}
+
+  - name: audioRetentionDays
+    description: Audio file retention period in days
+    value: {{ properties.audioRetentionDays }}
+
+# Deployment metadata and documentation
+metadata:
+  version: "1.0"
+  description: |
+    Complete infrastructure deployment for real-time translation services using
+    Google Cloud AI services. This configuration creates:
+    
+    1. AI Services:
+       - Cloud Speech-to-Text API for audio transcription
+       - Cloud Translation API for multi-language translation
+    
+    2. Compute and Hosting:
+       - Cloud Run service for WebSocket handling and real-time processing
+       - Automatic scaling configuration for varying workloads
+    
+    3. Data Storage:
+       - Firestore database for conversation persistence
+       - Cloud Storage bucket for audio file storage with lifecycle management
+    
+    4. Event Processing:
+       - Pub/Sub topics and subscriptions for reliable event handling
+       - Dead letter queue for failed message processing
+    
+    5. Security and Access:
+       - Service account with least-privilege permissions
+       - IAM bindings for secure API access
+       - Optional unauthenticated access for public demos
+    
+    The infrastructure supports real-time speech recognition, multi-language
+    translation, conversation persistence, and WebSocket communication for
+    seamless global communication experiences.
+
+  author: Cloud Recipes Team
+  supportedRegions:
+    - us-central1
+    - us-east1  
+    - us-west1
+    - europe-west1
+    - asia-northeast1
+
+  estimatedCosts:
+    speech: "$0.024 per minute of audio processed"
+    translation: "$20 per 1M characters translated"
+    cloudRun: "Pay-per-use with 2M requests free per month"
+    firestore: "$0.18 per 100K document reads"
+    storage: "$0.020 per GB per month for standard storage"
+    pubsub: "$40 per TB of message throughput"
+
+  securityConsiderations:
+    - Service account uses least-privilege access principles
+    - Firestore data encrypted at rest and in transit
+    - Cloud Storage with uniform bucket-level access
+    - Optional authentication for Cloud Run service
+    - Audit logging enabled for all API calls
+
+  scalingCharacteristics:
+    - Cloud Run auto-scales from 0 to configured maximum instances
+    - Firestore automatically scales for document operations
+    - Pub/Sub handles millions of messages per second
+    - Cloud Storage provides virtually unlimited capacity
+    - Speech and Translation APIs scale automatically
+
+  monitoringAndObservability:
+    - Cloud Run provides built-in request metrics and logging
+    - Firestore operations tracked in Cloud Logging
+    - Pub/Sub message processing metrics available
+    - Custom application metrics can be added via Cloud Monitoring
+    - Health check endpoints for service availability monitoring

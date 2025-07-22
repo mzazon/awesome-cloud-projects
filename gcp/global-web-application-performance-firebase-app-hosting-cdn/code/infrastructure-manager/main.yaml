@@ -1,0 +1,516 @@
+# Infrastructure Manager configuration for Global Web Application Performance
+# Recipe: Accelerating Global Web Application Performance with Firebase App Hosting and Cloud CDN
+# This configuration deploys a complete global web application infrastructure with:
+# - Firebase App Hosting for serverless web hosting
+# - Cloud CDN for global content delivery
+# - Cloud Storage for static assets
+# - Cloud Monitoring for performance tracking
+# - Cloud Functions for automated optimization
+
+imports:
+  - path: terraform
+    name: terraform
+
+resources:
+  # Create a unique suffix for resource naming
+  - name: random-suffix
+    type: terraform
+    properties:
+      source:
+        module: terraform-google-modules/project-factory/google//modules/shared_vpc_access
+        version: ~> 14.0
+      variables:
+        project_id: ${var.project_id}
+
+  # Enable required APIs for the solution
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/firebase.googleapis.com
+      parent: projects/${var.project_id}
+    metadata:
+      dependsOn:
+        - random-suffix
+
+  - name: enable-firebasehosting-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/firebasehosting.googleapis.com
+      parent: projects/${var.project_id}
+
+  - name: enable-cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/cloudbuild.googleapis.com
+      parent: projects/${var.project_id}
+
+  - name: enable-run-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/run.googleapis.com
+      parent: projects/${var.project_id}
+
+  - name: enable-compute-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/compute.googleapis.com
+      parent: projects/${var.project_id}
+
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/monitoring.googleapis.com
+      parent: projects/${var.project_id}
+
+  - name: enable-cloudfunctions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/cloudfunctions.googleapis.com
+      parent: projects/${var.project_id}
+
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/storage.googleapis.com
+      parent: projects/${var.project_id}
+
+  # Cloud Storage bucket for static assets with CDN optimization
+  - name: web-assets-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: web-assets-${var.random_suffix}
+      project: ${var.project_id}
+      location: ${var.region}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      cors:
+        - origin: ["*"]
+          method: ["GET", "HEAD"]
+          responseHeader: ["Content-Type", "Cache-Control"]
+          maxAgeSeconds: 3600
+      # Enable uniform bucket-level access for CDN integration
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      # Lifecycle management for cost optimization
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+              matchesStorageClass: [STANDARD]
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90
+              matchesStorageClass: [NEARLINE]
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # IAM binding for public access to bucket objects
+  - name: bucket-public-access
+    type: gcp-types/storage-v1:buckets.iam.bindings
+    properties:
+      bucket: $(ref.web-assets-bucket.name)
+      role: roles/storage.objectViewer
+      members:
+        - allUsers
+    metadata:
+      dependsOn:
+        - web-assets-bucket
+
+  # Global IP address for the load balancer
+  - name: web-app-global-ip
+    type: compute.v1.globalAddress
+    properties:
+      name: web-app-ip-${var.random_suffix}
+      project: ${var.project_id}
+      addressType: EXTERNAL
+      ipVersion: IPV4
+    metadata:
+      dependsOn:
+        - enable-compute-api
+
+  # Backend bucket for Cloud CDN integration
+  - name: web-assets-backend-bucket
+    type: compute.v1.backendBucket
+    properties:
+      name: web-assets-backend-${var.random_suffix}
+      project: ${var.project_id}
+      bucketName: $(ref.web-assets-bucket.name)
+      enableCdn: true
+      # CDN cache configuration for optimal performance
+      cdnPolicy:
+        cacheMode: CACHE_ALL_STATIC
+        defaultTtl: 3600
+        maxTtl: 86400
+        clientTtl: 300
+        negativeCaching: true
+        negativeCachingPolicy:
+          - code: 404
+            ttl: 120
+          - code: 410
+            ttl: 120
+        # Enable compression for better performance
+        compressionEnabled: true
+        # Cache key policy for consistent caching
+        cacheKeyPolicy:
+          includeHost: true
+          includeProtocol: true
+          includeQueryString: false
+    metadata:
+      dependsOn:
+        - web-assets-bucket
+        - enable-compute-api
+
+  # URL map for routing traffic
+  - name: web-app-url-map
+    type: compute.v1.urlMap
+    properties:
+      name: web-app-urlmap-${var.random_suffix}
+      project: ${var.project_id}
+      defaultService: $(ref.web-assets-backend-bucket.selfLink)
+      # Path matchers for different content types
+      pathMatchers:
+        - name: static-assets
+          defaultService: $(ref.web-assets-backend-bucket.selfLink)
+          pathRules:
+            - paths: ["/static/*", "/assets/*", "*.js", "*.css", "*.png", "*.jpg", "*.jpeg", "*.webp", "*.svg"]
+              service: $(ref.web-assets-backend-bucket.selfLink)
+      hostRules:
+        - hosts: ["*"]
+          pathMatcher: static-assets
+    metadata:
+      dependsOn:
+        - web-assets-backend-bucket
+
+  # SSL certificate for HTTPS
+  - name: web-app-ssl-cert
+    type: compute.v1.sslCertificate
+    properties:
+      name: web-app-ssl-cert-${var.random_suffix}
+      project: ${var.project_id}
+      type: MANAGED
+      managed:
+        domains:
+          - ${var.domain_name}
+    metadata:
+      dependsOn:
+        - enable-compute-api
+
+  # Target HTTPS proxy
+  - name: web-app-https-proxy
+    type: compute.v1.targetHttpsProxy
+    properties:
+      name: web-app-proxy-${var.random_suffix}
+      project: ${var.project_id}
+      urlMap: $(ref.web-app-url-map.selfLink)
+      sslCertificates:
+        - $(ref.web-app-ssl-cert.selfLink)
+      # Enable HTTP/2 for better performance
+      quicOverride: ENABLE
+    metadata:
+      dependsOn:
+        - web-app-url-map
+        - web-app-ssl-cert
+
+  # Global forwarding rule for HTTPS traffic
+  - name: web-app-forwarding-rule-https
+    type: compute.v1.globalForwardingRule
+    properties:
+      name: web-app-forwarding-rule-https-${var.random_suffix}
+      project: ${var.project_id}
+      target: $(ref.web-app-https-proxy.selfLink)
+      portRange: "443"
+      IPAddress: $(ref.web-app-global-ip.address)
+      loadBalancingScheme: EXTERNAL
+    metadata:
+      dependsOn:
+        - web-app-https-proxy
+        - web-app-global-ip
+
+  # HTTP to HTTPS redirect
+  - name: web-app-http-redirect
+    type: compute.v1.urlMap
+    properties:
+      name: web-app-http-redirect-${var.random_suffix}
+      project: ${var.project_id}
+      defaultUrlRedirect:
+        redirectResponseCode: MOVED_PERMANENTLY_DEFAULT
+        httpsRedirect: true
+        stripQuery: false
+
+  - name: web-app-http-proxy
+    type: compute.v1.targetHttpProxy
+    properties:
+      name: web-app-http-proxy-${var.random_suffix}
+      project: ${var.project_id}
+      urlMap: $(ref.web-app-http-redirect.selfLink)
+    metadata:
+      dependsOn:
+        - web-app-http-redirect
+
+  - name: web-app-forwarding-rule-http
+    type: compute.v1.globalForwardingRule
+    properties:
+      name: web-app-forwarding-rule-http-${var.random_suffix}
+      project: ${var.project_id}
+      target: $(ref.web-app-http-proxy.selfLink)
+      portRange: "80"
+      IPAddress: $(ref.web-app-global-ip.address)
+      loadBalancingScheme: EXTERNAL
+    metadata:
+      dependsOn:
+        - web-app-http-proxy
+        - web-app-global-ip
+
+  # Cloud Storage bucket for Cloud Function source code
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: function-source-${var.random_suffix}
+      project: ${var.project_id}
+      location: ${var.region}
+      storageClass: STANDARD
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # Pub/Sub topic for performance metrics
+  - name: performance-metrics-topic
+    type: pubsub.v1.topic
+    properties:
+      name: projects/${var.project_id}/topics/performance-metrics-${var.random_suffix}
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # Cloud Function for performance optimization
+  - name: performance-optimizer-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      function:
+        name: perf-optimizer-${var.random_suffix}
+        description: "Automated performance optimization based on CDN metrics"
+        sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/function-source.zip
+        entryPoint: optimize_performance
+        runtime: python39
+        timeout: 60s
+        availableMemoryMb: 256
+        environmentVariables:
+          GCP_PROJECT: ${var.project_id}
+          BUCKET_NAME: $(ref.web-assets-bucket.name)
+        eventTrigger:
+          eventType: providers/cloud.pubsub/eventTypes/topic.publish
+          resource: $(ref.performance-metrics-topic.name)
+        # IAM configuration for function execution
+        serviceAccountEmail: ${var.project_id}@appspot.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - enable-cloudfunctions-api
+        - function-source-bucket
+        - performance-metrics-topic
+
+  # Cloud Monitoring alert policy for high latency
+  - name: high-latency-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/${var.project_id}
+      alertPolicy:
+        displayName: High Response Time Alert
+        documentation:
+          content: "Alert when web application response time exceeds 1000ms"
+          mimeType: text/markdown
+        conditions:
+          - displayName: High response time condition
+            conditionThreshold:
+              filter: 'resource.type="https_lb_rule" AND metric.type="loadbalancing.googleapis.com/https/request_latencies"'
+              comparison: COMPARISON_GT
+              thresholdValue: 1000
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_MEAN
+                  crossSeriesReducer: REDUCE_MEAN
+                  groupByFields:
+                    - resource.label.backend_target_name
+        alertStrategy:
+          autoClose: 1800s
+        enabled: true
+        # Notification channels would be configured separately
+        combiner: OR
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+
+  # Cloud Monitoring dashboard for performance metrics
+  - name: performance-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      parent: projects/${var.project_id}
+      dashboard:
+        displayName: Web App Performance Dashboard
+        mosaicLayout:
+          tiles:
+            - width: 6
+              height: 4
+              widget:
+                title: CDN Cache Hit Rate
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="https_lb_rule" AND metric.type="loadbalancing.googleapis.com/https/request_count"'
+                          aggregation:
+                            alignmentPeriod: 300s
+                            perSeriesAligner: ALIGN_RATE
+                            crossSeriesReducer: REDUCE_SUM
+                      plotType: LINE
+                  yAxis:
+                    label: Requests/sec
+                    scale: LINEAR
+            - width: 6
+              height: 4
+              xPos: 6
+              widget:
+                title: Response Latency
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="https_lb_rule" AND metric.type="loadbalancing.googleapis.com/https/request_latencies"'
+                          aggregation:
+                            alignmentPeriod: 300s
+                            perSeriesAligner: ALIGN_MEAN
+                            crossSeriesReducer: REDUCE_MEAN
+                      plotType: LINE
+                  yAxis:
+                    label: Latency (ms)
+                    scale: LINEAR
+            - width: 12
+              height: 4
+              yPos: 4
+              widget:
+                title: CDN Cache Performance
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="gce_backend_service" AND metric.type="loadbalancing.googleapis.com/https/backend_request_count"'
+                          aggregation:
+                            alignmentPeriod: 300s
+                            perSeriesAligner: ALIGN_RATE
+                            crossSeriesReducer: REDUCE_SUM
+                            groupByFields:
+                              - metric.label.cache_result
+                      plotType: STACKED_AREA
+                  yAxis:
+                    label: Requests/sec
+                    scale: LINEAR
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+
+  # Cloud Scheduler job to trigger performance optimization
+  - name: performance-optimization-scheduler
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      job:
+        name: performance-optimization-${var.random_suffix}
+        description: "Scheduled performance optimization analysis"
+        schedule: "0 */4 * * *"  # Every 4 hours
+        timeZone: "UTC"
+        pubsubTarget:
+          topicName: $(ref.performance-metrics-topic.name)
+          data: eyJ0cmlnZ2VyIjogInNjaGVkdWxlZCJ9  # Base64 encoded '{"trigger": "scheduled"}'
+    metadata:
+      dependsOn:
+        - performance-metrics-topic
+
+# Define template variables for customization
+variables:
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    required: true
+
+  region:
+    description: "Google Cloud region for resources"
+    type: string
+    default: "us-central1"
+
+  random_suffix:
+    description: "Random suffix for resource naming"
+    type: string
+    default: "$(random_id.suffix.hex)"
+
+  domain_name:
+    description: "Domain name for SSL certificate (use example.com for testing)"
+    type: string
+    default: "example.com"
+
+# Define outputs for verification and integration
+outputs:
+  global_ip_address:
+    description: "Global IP address for the load balancer"
+    value: $(ref.web-app-global-ip.address)
+
+  bucket_name:
+    description: "Cloud Storage bucket name for static assets"
+    value: $(ref.web-assets-bucket.name)
+
+  cdn_url:
+    description: "CDN URL for accessing the web application"
+    value: "https://$(ref.web-app-global-ip.address)"
+
+  function_name:
+    description: "Cloud Function name for performance optimization"
+    value: $(ref.performance-optimizer-function.name)
+
+  dashboard_url:
+    description: "Cloud Monitoring dashboard URL"
+    value: "https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.performance-dashboard.name)?project=${var.project_id}"
+
+  ssl_certificate_name:
+    description: "SSL certificate name for HTTPS"
+    value: $(ref.web-app-ssl-cert.name)
+
+  backend_bucket_name:
+    description: "Backend bucket name for CDN"
+    value: $(ref.web-assets-backend-bucket.name)
+
+metadata:
+  version: "1.0"
+  description: "Infrastructure Manager configuration for global web application performance optimization using Firebase App Hosting and Cloud CDN"
+  author: "Cloud Recipes Generator"
+  tags:
+    - firebase
+    - cdn
+    - performance
+    - monitoring
+    - global-distribution
+  documentation: |
+    This Infrastructure Manager configuration deploys a complete global web application 
+    performance solution including:
+    
+    1. Cloud Storage bucket with CDN optimization and lifecycle management
+    2. Global load balancer with Cloud CDN for content delivery
+    3. SSL certificate management for HTTPS
+    4. Cloud Function for automated performance optimization
+    5. Cloud Monitoring dashboard and alerting
+    6. Pub/Sub integration for event-driven optimization
+    7. Cloud Scheduler for periodic performance analysis
+    
+    The configuration follows Google Cloud best practices for:
+    - Security (IAM, SSL/TLS)
+    - Performance (CDN, compression, caching)
+    - Monitoring (dashboards, alerts)
+    - Cost optimization (storage classes, lifecycle management)
+    - Scalability (global load balancing, serverless functions)

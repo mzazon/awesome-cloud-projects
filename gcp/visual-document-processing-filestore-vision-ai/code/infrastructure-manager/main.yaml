@@ -1,0 +1,492 @@
+# Infrastructure Manager Configuration for Visual Document Processing
+# with Cloud Filestore and Vision AI
+#
+# This configuration deploys a complete event-driven document processing
+# pipeline using Google Cloud managed services including:
+# - Cloud Filestore for shared NFS storage
+# - Cloud Pub/Sub for reliable messaging
+# - Cloud Functions for serverless processing
+# - Cloud Vision AI for intelligent document analysis
+# - Cloud Storage for processed results
+# - Compute Engine for Filestore client access
+
+# Configure Terraform providers for Infrastructure Manager
+terraform:
+  required_version: ">= 1.5"
+  required_providers:
+    google:
+      source: hashicorp/google
+      version: "~> 5.0"
+    google-beta:
+      source: hashicorp/google-beta
+      version: "~> 5.0"
+    archive:
+      source: hashicorp/archive
+      version: "~> 2.4"
+    random:
+      source: hashicorp/random
+      version: "~> 3.5"
+
+# Configure the Google Cloud providers
+providers:
+  google:
+    project: ${var.project_id}
+    region: ${var.region}
+  google-beta:
+    project: ${var.project_id}
+    region: ${var.region}
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud project ID for deploying resources"
+    validation:
+      condition: length(var.project_id) > 0
+      error_message: "Project ID must not be empty."
+
+  region:
+    type: string
+    description: "Google Cloud region for regional resources"
+    default: "us-central1"
+    validation:
+      condition: contains(["us-central1", "us-east1", "us-west1", "europe-west1", "asia-southeast1"], var.region)
+      error_message: "Region must be a valid Google Cloud region."
+
+  zone:
+    type: string
+    description: "Google Cloud zone for zonal resources"
+    default: "us-central1-a"
+
+  filestore_capacity:
+    type: number
+    description: "Filestore capacity in GB (minimum 1024 for Standard tier)"
+    default: 1024
+    validation:
+      condition: var.filestore_capacity >= 1024
+      error_message: "Filestore capacity must be at least 1024 GB for Standard tier."
+
+  environment:
+    type: string
+    description: "Environment name for resource naming"
+    default: "dev"
+    validation:
+      condition: contains(["dev", "staging", "prod"], var.environment)
+      error_message: "Environment must be dev, staging, or prod."
+
+# Generate random suffix for unique resource names
+random_suffix:
+  type: random_id
+  byte_length: 3
+  keepers:
+    project_id: ${var.project_id}
+    environment: ${var.environment}
+
+# Local values for consistent resource naming
+locals:
+  suffix: ${random_suffix.hex}
+  common_labels:
+    project: "document-processing"
+    environment: ${var.environment}
+    managed-by: "infrastructure-manager"
+    recipe: "visual-document-processing-filestore-vision-ai"
+
+# Enable required Google Cloud APIs
+document_processing_apis:
+  type: google_project_service
+  for_each:
+    - compute.googleapis.com
+    - file.googleapis.com
+    - vision.googleapis.com
+    - pubsub.googleapis.com
+    - cloudfunctions.googleapis.com
+    - storage.googleapis.com
+    - cloudbuild.googleapis.com
+    - eventarc.googleapis.com
+  service: ${each.value}
+  project: ${var.project_id}
+  disable_on_destroy: false
+
+# Cloud Filestore instance for shared document storage
+document_filestore:
+  type: google_filestore_instance
+  depends_on: [document_processing_apis]
+  name: "docs-filestore-${local.suffix}"
+  location: ${var.zone}
+  project: ${var.project_id}
+  tier: "STANDARD"
+  
+  file_shares:
+    name: "documents"
+    capacity_gb: ${var.filestore_capacity}
+  
+  networks:
+    network: "default"
+    modes: ["MODE_IPV4"]
+  
+  labels: ${local.common_labels}
+  
+  description: "Filestore instance for document processing pipeline"
+
+# Pub/Sub topic for document processing events
+document_processing_topic:
+  type: google_pubsub_topic
+  depends_on: [document_processing_apis]
+  name: "document-processing-${local.suffix}"
+  project: ${var.project_id}
+  
+  labels: ${local.common_labels}
+  
+  message_retention_duration: "86400s"  # 24 hours
+  
+  message_storage_policy:
+    allowed_persistence_regions: [${var.region}]
+
+# Pub/Sub topic for processing results
+processing_results_topic:
+  type: google_pubsub_topic
+  depends_on: [document_processing_apis]
+  name: "processing-results-${local.suffix}"
+  project: ${var.project_id}
+  
+  labels: ${local.common_labels}
+  
+  message_retention_duration: "86400s"  # 24 hours
+  
+  message_storage_policy:
+    allowed_persistence_regions: [${var.region}]
+
+# Pub/Sub subscription for document processing
+document_processing_subscription:
+  type: google_pubsub_subscription
+  name: "document-processing-sub-${local.suffix}"
+  project: ${var.project_id}
+  topic: ${document_processing_topic.id}
+  
+  labels: ${local.common_labels}
+  
+  ack_deadline_seconds: 600
+  retain_acked_messages: false
+  message_retention_duration: "604800s"  # 7 days
+  
+  expiration_policy:
+    ttl: "2678400s"  # 31 days
+
+# Pub/Sub subscription for processing results
+processing_results_subscription:
+  type: google_pubsub_subscription
+  name: "results-sub-${local.suffix}"
+  project: ${var.project_id}
+  topic: ${processing_results_topic.id}
+  
+  labels: ${local.common_labels}
+  
+  ack_deadline_seconds: 300
+  retain_acked_messages: false
+  message_retention_duration: "604800s"  # 7 days
+  
+  expiration_policy:
+    ttl: "2678400s"  # 31 days
+
+# Cloud Storage bucket for processed document results
+processed_documents_bucket:
+  type: google_storage_bucket
+  depends_on: [document_processing_apis]
+  name: "processed-docs-${local.suffix}"
+  project: ${var.project_id}
+  location: ${var.region}
+  storage_class: "STANDARD"
+  
+  labels: ${local.common_labels}
+  
+  versioning:
+    enabled: true
+  
+  lifecycle_rule:
+    - condition:
+        age: 30
+      action:
+        type: "SetStorageClass"
+        storage_class: "NEARLINE"
+    - condition:
+        age: 90
+      action:
+        type: "SetStorageClass"
+        storage_class: "COLDLINE"
+    - condition:
+        age: 365
+      action:
+        type: "Delete"
+  
+  uniform_bucket_level_access: true
+  
+  public_access_prevention: "enforced"
+
+# Service account for Cloud Functions
+function_service_account:
+  type: google_service_account
+  account_id: "doc-processor-sa-${local.suffix}"
+  project: ${var.project_id}
+  display_name: "Document Processing Functions Service Account"
+  description: "Service account for document processing Cloud Functions"
+
+# IAM binding for Vision AI access
+vision_ai_iam:
+  type: google_project_iam_member
+  project: ${var.project_id}
+  role: "roles/ml.developer"
+  member: "serviceAccount:${function_service_account.email}"
+
+# IAM binding for Pub/Sub access
+pubsub_iam:
+  type: google_project_iam_member
+  project: ${var.project_id}
+  role: "roles/pubsub.editor"
+  member: "serviceAccount:${function_service_account.email}"
+
+# IAM binding for Storage access
+storage_iam:
+  type: google_project_iam_member
+  project: ${var.project_id}
+  role: "roles/storage.objectAdmin"
+  member: "serviceAccount:${function_service_account.email}"
+
+# Create source code archive for file monitor function
+file_monitor_source:
+  type: archive_file
+  type: "zip"
+  source_dir: "functions/file-monitor"
+  output_path: "file-monitor.zip"
+
+# Create source code archive for Vision AI processor function  
+vision_processor_source:
+  type: archive_file
+  type: "zip"
+  source_dir: "functions/vision-processor"
+  output_path: "vision-processor.zip"
+
+# Storage bucket for Cloud Functions source code
+functions_source_bucket:
+  type: google_storage_bucket
+  name: "functions-source-${local.suffix}"
+  project: ${var.project_id}
+  location: ${var.region}
+  storage_class: "STANDARD"
+  
+  labels: ${local.common_labels}
+  
+  uniform_bucket_level_access: true
+  public_access_prevention: "enforced"
+
+# Upload file monitor function source
+file_monitor_object:
+  type: google_storage_bucket_object
+  name: "file-monitor-${local.suffix}.zip"
+  bucket: ${functions_source_bucket.name}
+  source: ${file_monitor_source.output_path}
+
+# Upload Vision processor function source
+vision_processor_object:
+  type: google_storage_bucket_object
+  name: "vision-processor-${local.suffix}.zip"
+  bucket: ${functions_source_bucket.name}
+  source: ${vision_processor_source.output_path}
+
+# Cloud Function for file monitoring
+file_monitor_function:
+  type: google_cloudfunctions2_function
+  depends_on: [document_processing_apis, file_monitor_object]
+  name: "file-monitor-${local.suffix}"
+  project: ${var.project_id}
+  location: ${var.region}
+  description: "Monitor Filestore for new documents and trigger processing"
+  
+  labels: ${local.common_labels}
+  
+  build_config:
+    runtime: "python311"
+    entry_point: "monitor_documents"
+    source:
+      storage_source:
+        bucket: ${functions_source_bucket.name}
+        object: ${file_monitor_object.name}
+  
+  service_config:
+    max_instance_count: 10
+    min_instance_count: 0
+    available_memory: "256M"
+    timeout_seconds: 60
+    service_account_email: ${function_service_account.email}
+    
+    environment_variables:
+      PROJECT_ID: ${var.project_id}
+      PUBSUB_TOPIC: ${document_processing_topic.name}
+      FILESTORE_IP: ${document_filestore.networks[0].ip_addresses[0]}
+      FILESTORE_INSTANCE: ${document_filestore.name}
+  
+  event_trigger:
+    trigger_region: ${var.region}
+    event_type: "google.cloud.pubsub.topic.v1.messagePublished"
+    pubsub_topic: ${document_processing_topic.id}
+    retry_policy: "RETRY_POLICY_RETRY"
+
+# Cloud Function for Vision AI processing
+vision_processor_function:
+  type: google_cloudfunctions2_function
+  depends_on: [document_processing_apis, vision_processor_object]
+  name: "vision-processor-${local.suffix}"
+  project: ${var.project_id}
+  location: ${var.region}
+  description: "Process documents with Vision AI and publish results"
+  
+  labels: ${local.common_labels}
+  
+  build_config:
+    runtime: "python311"
+    entry_point: "process_document"
+    source:
+      storage_source:
+        bucket: ${functions_source_bucket.name}
+        object: ${vision_processor_object.name}
+  
+  service_config:
+    max_instance_count: 20
+    min_instance_count: 0
+    available_memory: "512M"
+    timeout_seconds: 300
+    service_account_email: ${function_service_account.email}
+    
+    environment_variables:
+      PROJECT_ID: ${var.project_id}
+      RESULTS_TOPIC: ${processing_results_topic.name}
+      STORAGE_BUCKET: ${processed_documents_bucket.name}
+  
+  event_trigger:
+    trigger_region: ${var.region}
+    event_type: "google.cloud.pubsub.topic.v1.messagePublished"
+    pubsub_topic: ${document_processing_topic.id}
+    retry_policy: "RETRY_POLICY_RETRY"
+
+# Compute Engine instance for Filestore client access
+filestore_client_instance:
+  type: google_compute_instance
+  depends_on: [document_processing_apis, document_filestore]
+  name: "filestore-client-${local.suffix}"
+  project: ${var.project_id}
+  zone: ${var.zone}
+  machine_type: "e2-medium"
+  
+  labels: ${local.common_labels}
+  
+  boot_disk:
+    initialize_params:
+      image: "projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts"
+      size: 20
+      type: "pd-standard"
+  
+  network_interface:
+    network: "default"
+    access_config: {}  # Ephemeral external IP
+  
+  service_account:
+    email: ${function_service_account.email}
+    scopes: ["cloud-platform"]
+  
+  metadata_startup_script: |
+    #!/bin/bash
+    apt-get update
+    apt-get install -y nfs-common
+    mkdir -p /mnt/filestore
+    echo "${document_filestore.networks[0].ip_addresses[0]}:/documents /mnt/filestore nfs defaults 0 0" >> /etc/fstab
+    mount -a
+    mkdir -p /mnt/filestore/{invoices,receipts,contracts}
+    chmod 777 /mnt/filestore /mnt/filestore/*
+    
+    # Create sample documents for testing
+    echo "INVOICE #12345" > /mnt/filestore/invoices/sample_invoice.txt
+    echo "Date: $(date)" >> /mnt/filestore/invoices/sample_invoice.txt
+    echo "Customer: Acme Corporation" >> /mnt/filestore/invoices/sample_invoice.txt
+    echo "Amount: $1,234.56" >> /mnt/filestore/invoices/sample_invoice.txt
+    
+    echo "RECEIPT #67890" > /mnt/filestore/receipts/sample_receipt.txt
+    echo "Store: Example Store" >> /mnt/filestore/receipts/sample_receipt.txt
+    echo "Total: $45.67" >> /mnt/filestore/receipts/sample_receipt.txt
+  
+  can_ip_forward: false
+  deletion_protection: false
+
+# Firewall rule for internal communication
+internal_firewall:
+  type: google_compute_firewall
+  name: "allow-internal-${local.suffix}"
+  project: ${var.project_id}
+  network: "default"
+  description: "Allow internal communication for document processing"
+  
+  allow:
+    - protocol: "tcp"
+      ports: ["2049"]  # NFS port
+    - protocol: "udp"
+      ports: ["2049"]  # NFS port
+  
+  source_ranges: ["10.0.0.0/8"]
+  target_tags: ["filestore-client"]
+
+# Output values for verification and integration
+outputs:
+  filestore_instance_name:
+    description: "Name of the Cloud Filestore instance"
+    value: ${document_filestore.name}
+  
+  filestore_ip_address:
+    description: "IP address of the Cloud Filestore instance"
+    value: ${document_filestore.networks[0].ip_addresses[0]}
+  
+  filestore_mount_path:
+    description: "NFS mount path for the Filestore instance"
+    value: "${document_filestore.networks[0].ip_addresses[0]}:/documents"
+  
+  document_processing_topic:
+    description: "Pub/Sub topic for document processing events"
+    value: ${document_processing_topic.name}
+  
+  processing_results_topic:
+    description: "Pub/Sub topic for processing results"
+    value: ${processing_results_topic.name}
+  
+  processed_documents_bucket:
+    description: "Cloud Storage bucket for processed documents"
+    value: ${processed_documents_bucket.name}
+  
+  file_monitor_function_name:
+    description: "Name of the file monitoring Cloud Function"
+    value: ${file_monitor_function.name}
+  
+  vision_processor_function_name:
+    description: "Name of the Vision AI processing Cloud Function"
+    value: ${vision_processor_function.name}
+  
+  filestore_client_instance:
+    description: "Name of the Filestore client Compute Engine instance"
+    value: ${filestore_client_instance.name}
+  
+  client_instance_external_ip:
+    description: "External IP address of the client instance"
+    value: ${filestore_client_instance.network_interface[0].access_config[0].nat_ip}
+  
+  project_id:
+    description: "Google Cloud project ID used for deployment"
+    value: ${var.project_id}
+  
+  region:
+    description: "Google Cloud region used for deployment"
+    value: ${var.region}
+  
+  deployment_instructions:
+    description: "Instructions for testing the document processing pipeline"
+    value: |
+      1. SSH to the client instance: gcloud compute ssh ${filestore_client_instance.name} --zone=${var.zone}
+      2. Upload documents to /mnt/filestore/invoices/, /mnt/filestore/receipts/, or /mnt/filestore/contracts/
+      3. Trigger processing: gcloud pubsub topics publish ${document_processing_topic.name} --message='{"filename":"test.txt","filepath":"/mnt/filestore/invoices/test.txt"}'
+      4. Check results in Cloud Storage bucket: gsutil ls gs://${processed_documents_bucket.name}/processed/
+      5. Monitor function logs: gcloud functions logs read ${vision_processor_function.name} --region=${var.region}

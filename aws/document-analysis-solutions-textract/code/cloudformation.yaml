@@ -1,0 +1,863 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Amazon Textract Document Analysis Solution - Complete infrastructure for intelligent document processing with automatic text, form, and table extraction'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - EnableS3Versioning
+          - S3StorageClass
+          - RetentionDays
+      - Label:
+          default: "Processing Configuration"
+        Parameters:
+          - LambdaTimeout
+          - LambdaMemorySize
+          - TextractFeatures
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+          - EnableSNSNotifications
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      EnableS3Versioning:
+        default: "Enable S3 Versioning"
+      S3StorageClass:
+        default: "S3 Storage Class"
+      RetentionDays:
+        default: "Object Retention Days"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      TextractFeatures:
+        default: "Textract Analysis Features"
+      NotificationEmail:
+        default: "Notification Email"
+      EnableSNSNotifications:
+        default: "Enable SNS Notifications"
+
+# Input Parameters
+Parameters:
+  ProjectName:
+    Type: String
+    Default: textract-document-analysis
+    Description: Name of the project for resource naming and tagging
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment for deployment (affects resource configurations)
+
+  EnableS3Versioning:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable versioning on S3 buckets for data protection
+
+  S3StorageClass:
+    Type: String
+    Default: STANDARD
+    AllowedValues:
+      - STANDARD
+      - STANDARD_IA
+      - REDUCED_REDUNDANCY
+    Description: Default storage class for S3 objects
+
+  RetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: Number of days to retain processed documents
+
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+    Description: Lambda function timeout in seconds
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    AllowedValues:
+      - 128
+      - 256
+      - 512
+      - 1024
+      - 2048
+      - 3008
+    Description: Lambda function memory allocation in MB
+
+  TextractFeatures:
+    Type: CommaDelimitedList
+    Default: "TABLES,FORMS,QUERIES"
+    Description: Comma-separated list of Textract features to enable
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: Email address for processing notifications (optional)
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address or empty
+
+  EnableSNSNotifications:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable SNS notifications for processing events
+
+# Conditional Resources
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+  EnableVersioning: !Equals [!Ref EnableS3Versioning, 'true']
+  EnableNotifications: !Equals [!Ref EnableSNSNotifications, 'true']
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  EnableEmailNotifications: !And [!Condition EnableNotifications, !Condition HasNotificationEmail]
+
+# Resources
+Resources:
+  # S3 Bucket for Input Documents
+  InputDocumentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-input-${Environment}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [EnableVersioning, Enabled, Suspended]
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: !Ref RetentionDays
+          - Id: DeleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt DocumentProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .pdf
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt DocumentProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .png
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt DocumentProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .jpg
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt DocumentProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .jpeg
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt DocumentProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .tiff
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-input-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: DocumentInput
+
+  # S3 Bucket for Processed Output
+  OutputDocumentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-output-${Environment}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [EnableVersioning, Enabled, Suspended]
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+          - Id: DeleteOldObjects
+            Status: Enabled
+            ExpirationInDays: !Ref RetentionDays
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-output-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: ProcessedOutput
+
+  # SNS Topic for Processing Notifications
+  ProcessingNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnableNotifications
+    Properties:
+      TopicName: !Sub '${ProjectName}-processing-notifications-${Environment}'
+      DisplayName: !Sub '${ProjectName} Document Processing Notifications'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-notifications'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: ProcessingNotifications
+
+  # SNS Topic Policy
+  ProcessingNotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: EnableNotifications
+    Properties:
+      Topics:
+        - !Ref ProcessingNotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowLambdaPublish
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt DocumentProcessorRole.Arn
+            Action:
+              - sns:Publish
+            Resource: !Ref ProcessingNotificationTopic
+
+  # Email Subscription for SNS Topic
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: EnableEmailNotifications
+    Properties:
+      Protocol: email
+      TopicArn: !Ref ProcessingNotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # IAM Role for Lambda Function
+  DocumentProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: TextractDocumentProcessingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Textract permissions
+              - Effect: Allow
+                Action:
+                  - textract:AnalyzeDocument
+                  - textract:DetectDocumentText
+                  - textract:StartDocumentAnalysis
+                  - textract:StartDocumentTextDetection
+                  - textract:GetDocumentAnalysis
+                  - textract:GetDocumentTextDetection
+                Resource: '*'
+              # S3 permissions for input bucket
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${InputDocumentBucket}/*'
+                  - !GetAtt InputDocumentBucket.Arn
+              # S3 permissions for output bucket
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${OutputDocumentBucket}/*'
+                  - !GetAtt OutputDocumentBucket.Arn
+              # SNS permissions
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !If
+                  - EnableNotifications
+                  - !Ref ProcessingNotificationTopic
+                  - !Ref AWS::NoValue
+              # CloudWatch Logs permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: DocumentProcessing
+
+  # Lambda Function for Document Processing
+  DocumentProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-document-processor-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt DocumentProcessorRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !Ref OutputDocumentBucket
+          SNS_TOPIC_ARN: !If
+            - EnableNotifications
+            - !Ref ProcessingNotificationTopic
+            - ''
+          TEXTRACT_FEATURES: !Join [',', !Ref TextractFeatures]
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import urllib.parse
+          from datetime import datetime
+          import uuid
+          
+          # Initialize AWS clients
+          textract = boto3.client('textract')
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns') if os.environ.get('SNS_TOPIC_ARN') else None
+          
+          def lambda_handler(event, context):
+              """
+              Main Lambda handler for processing documents with Amazon Textract
+              """
+              try:
+                  # Parse S3 event
+                  for record in event['Records']:
+                      s3_event = record['s3']
+                      bucket_name = s3_event['bucket']['name']
+                      object_key = urllib.parse.unquote_plus(s3_event['object']['key'])
+                      
+                      print(f"Processing document: {object_key} from bucket: {bucket_name}")
+                      
+                      # Process the document
+                      result = process_document(bucket_name, object_key)
+                      
+                      # Send notification if configured
+                      if sns and os.environ.get('SNS_TOPIC_ARN'):
+                          send_notification(object_key, result, success=True)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Documents processed successfully')
+                  }
+                  
+              except Exception as e:
+                  print(f"Error processing documents: {str(e)}")
+                  
+                  # Send error notification
+                  if sns and os.environ.get('SNS_TOPIC_ARN'):
+                      send_notification(object_key, {'error': str(e)}, success=False)
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error processing documents: {str(e)}')
+                  }
+          
+          def process_document(bucket_name, object_key):
+              """
+              Process a single document with Textract
+              """
+              try:
+                  # Get document file extension
+                  file_extension = object_key.lower().split('.')[-1]
+                  
+                  # Prepare Textract request
+                  document = {
+                      'S3Object': {
+                          'Bucket': bucket_name,
+                          'Name': object_key
+                      }
+                  }
+                  
+                  # Configure features based on environment variable
+                  features = os.environ.get('TEXTRACT_FEATURES', 'TABLES,FORMS').split(',')
+                  features = [f.strip() for f in features if f.strip()]
+                  
+                  # Analyze document with Textract
+                  response = textract.analyze_document(
+                      Document=document,
+                      FeatureTypes=features,
+                      QueriesConfig={
+                          'Queries': [
+                              {'Text': 'What is the document type?'},
+                              {'Text': 'What is the total amount?'},
+                              {'Text': 'What is the date?'},
+                              {'Text': 'What is the invoice number?'},
+                              {'Text': 'Who is the customer?'}
+                          ]
+                      } if 'QUERIES' in features else None
+                  )
+                  
+                  # Extract structured data
+                  extracted_data = {
+                      'document_name': object_key,
+                      'processed_at': datetime.now().isoformat(),
+                      'processing_id': str(uuid.uuid4()),
+                      'file_type': file_extension,
+                      'textract_job_status': 'SUCCEEDED',
+                      'blocks': response['Blocks'],
+                      'document_metadata': response['DocumentMetadata'],
+                      'extracted_text': extract_text_from_blocks(response['Blocks']),
+                      'key_value_pairs': extract_key_value_pairs(response['Blocks']),
+                      'tables': extract_tables(response['Blocks']),
+                      'query_results': extract_query_results(response['Blocks']) if 'QUERIES' in features else []
+                  }
+                  
+                  # Save results to output bucket
+                  output_key = f"processed/{datetime.now().strftime('%Y/%m/%d')}/{object_key.split('/')[-1]}.json"
+                  
+                  s3.put_object(
+                      Bucket=os.environ['OUTPUT_BUCKET'],
+                      Key=output_key,
+                      Body=json.dumps(extracted_data, indent=2, default=str),
+                      ContentType='application/json',
+                      Metadata={
+                          'source-bucket': bucket_name,
+                          'source-key': object_key,
+                          'processed-at': datetime.now().isoformat(),
+                          'processing-id': extracted_data['processing_id']
+                      }
+                  )
+                  
+                  print(f"Successfully processed document: {object_key}")
+                  print(f"Results saved to: s3://{os.environ['OUTPUT_BUCKET']}/{output_key}")
+                  
+                  return {
+                      'status': 'success',
+                      'output_location': f"s3://{os.environ['OUTPUT_BUCKET']}/{output_key}",
+                      'processing_id': extracted_data['processing_id'],
+                      'blocks_count': len(response['Blocks']),
+                      'pages_processed': response['DocumentMetadata']['Pages']
+                  }
+                  
+              except Exception as e:
+                  print(f"Error processing document {object_key}: {str(e)}")
+                  raise
+          
+          def extract_text_from_blocks(blocks):
+              """
+              Extract plain text from Textract blocks
+              """
+              text_blocks = [block for block in blocks if block['BlockType'] == 'LINE']
+              return '\n'.join([block['Text'] for block in text_blocks])
+          
+          def extract_key_value_pairs(blocks):
+              """
+              Extract key-value pairs from form data
+              """
+              key_map = {}
+              value_map = {}
+              block_map = {}
+              
+              for block in blocks:
+                  block_id = block['Id']
+                  block_map[block_id] = block
+                  
+                  if block['BlockType'] == "KEY_VALUE_SET":
+                      if 'KEY' in block['EntityTypes']:
+                          key_map[block_id] = block
+                      else:
+                          value_map[block_id] = block
+              
+              key_value_pairs = {}
+              for key_block_id, key_block in key_map.items():
+                  value_block = find_value_block(key_block, value_map)
+                  key = get_text_from_block(key_block, block_map)
+                  value = get_text_from_block(value_block, block_map) if value_block else ""
+                  key_value_pairs[key] = value
+              
+              return key_value_pairs
+          
+          def extract_tables(blocks):
+              """
+              Extract table data from Textract blocks
+              """
+              tables = []
+              
+              for block in blocks:
+                  if block['BlockType'] == 'TABLE':
+                      table_data = {
+                          'table_id': block['Id'],
+                          'rows': [],
+                          'confidence': block.get('Confidence', 0)
+                      }
+                      tables.append(table_data)
+              
+              return tables
+          
+          def extract_query_results(blocks):
+              """
+              Extract query results from Textract blocks
+              """
+              query_results = []
+              
+              for block in blocks:
+                  if block['BlockType'] == 'QUERY_RESULT':
+                      query_results.append({
+                          'query': block.get('Query', {}).get('Text', ''),
+                          'answer': block.get('Text', ''),
+                          'confidence': block.get('Confidence', 0)
+                      })
+              
+              return query_results
+          
+          def find_value_block(key_block, value_map):
+              """
+              Find the value block associated with a key block
+              """
+              for relationship in key_block.get('Relationships', []):
+                  if relationship['Type'] == 'VALUE':
+                      for value_id in relationship['Ids']:
+                          if value_id in value_map:
+                              return value_map[value_id]
+              return None
+          
+          def get_text_from_block(block, block_map):
+              """
+              Extract text from a block using relationships
+              """
+              text = ''
+              if block and 'Relationships' in block:
+                  for relationship in block['Relationships']:
+                      if relationship['Type'] == 'CHILD':
+                          for child_id in relationship['Ids']:
+                              if child_id in block_map:
+                                  child_block = block_map[child_id]
+                                  if child_block['BlockType'] == 'WORD':
+                                      text += child_block['Text'] + ' '
+              return text.strip()
+          
+          def send_notification(object_key, result, success=True):
+              """
+              Send SNS notification about processing result
+              """
+              try:
+                  if success:
+                      subject = f"Document Processing Complete - {os.environ.get('PROJECT_NAME', 'Textract')}"
+                      message = f"""
+          Document processed successfully!
+          
+          Document: {object_key}
+          Status: {result.get('status', 'success')}
+          Output Location: {result.get('output_location', 'N/A')}
+          Processing ID: {result.get('processing_id', 'N/A')}
+          Blocks Processed: {result.get('blocks_count', 0)}
+          Pages Processed: {result.get('pages_processed', 0)}
+          Processed At: {datetime.now().isoformat()}
+          Environment: {os.environ.get('ENVIRONMENT', 'unknown')}
+                      """
+                  else:
+                      subject = f"Document Processing Error - {os.environ.get('PROJECT_NAME', 'Textract')}"
+                      message = f"""
+          Document processing failed!
+          
+          Document: {object_key}
+          Error: {result.get('error', 'Unknown error')}
+          Processed At: {datetime.now().isoformat()}
+          Environment: {os.environ.get('ENVIRONMENT', 'unknown')}
+                      """
+                  
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=subject,
+                      Message=message
+                  )
+                  
+              except Exception as e:
+                  print(f"Error sending notification: {str(e)}")
+      ReservedConcurrencyConfiguration:
+        ReservedConcurrency: !If [IsProduction, 100, 10]
+      DeadLetterConfig:
+        TargetArn: !GetAtt ProcessingDeadLetterQueue.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-document-processor'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: DocumentProcessing
+
+  # Dead Letter Queue for Failed Lambda Invocations
+  ProcessingDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-processing-dlq-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-processing-dlq'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: DeadLetterQueue
+
+  # Lambda Permission for S3 to Invoke Function
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DocumentProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt InputDocumentBucket.Arn
+      SourceAccount: !Ref AWS::AccountId
+
+  # CloudWatch Log Group for Lambda Function
+  DocumentProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DocumentProcessorFunction}'
+      RetentionInDays: !If [IsProduction, 90, 30]
+      KmsKeyId: !If [IsProduction, !GetAtt LogsKMSKey.Arn, !Ref AWS::NoValue]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: LambdaLogs
+
+  # KMS Key for CloudWatch Logs (Production only)
+  LogsKMSKey:
+    Type: AWS::KMS::Key
+    Condition: IsProduction
+    Properties:
+      Description: KMS key for CloudWatch Logs encryption
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                kms:EncryptionContext:aws:logs:arn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-logs-key'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: LogsEncryption
+
+  # KMS Key Alias for CloudWatch Logs
+  LogsKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: IsProduction
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-logs-key-${Environment}'
+      TargetKeyId: !Ref LogsKMSKey
+
+  # CloudWatch Alarm for Lambda Function Errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors-${Environment}'
+      AlarmDescription: Alert when Lambda function has errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DocumentProcessorFunction
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !If [EnableNotifications, !Ref ProcessingNotificationTopic, !Ref AWS::NoValue]
+
+  # CloudWatch Alarm for Lambda Function Duration
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-duration-${Environment}'
+      AlarmDescription: Alert when Lambda function duration is high
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref LambdaTimeout
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DocumentProcessorFunction
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !If [EnableNotifications, !Ref ProcessingNotificationTopic, !Ref AWS::NoValue]
+
+# Outputs
+Outputs:
+  InputBucketName:
+    Description: Name of the S3 bucket for input documents
+    Value: !Ref InputDocumentBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-InputBucket'
+
+  OutputBucketName:
+    Description: Name of the S3 bucket for processed documents
+    Value: !Ref OutputDocumentBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-OutputBucket'
+
+  InputBucketArn:
+    Description: ARN of the S3 bucket for input documents
+    Value: !GetAtt InputDocumentBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-InputBucketArn'
+
+  OutputBucketArn:
+    Description: ARN of the S3 bucket for processed documents
+    Value: !GetAtt OutputDocumentBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OutputBucketArn'
+
+  LambdaFunctionName:
+    Description: Name of the Lambda function for document processing
+    Value: !Ref DocumentProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
+
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function for document processing
+    Value: !GetAtt DocumentProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  SNSTopicArn:
+    Description: ARN of the SNS topic for notifications
+    Value: !If [EnableNotifications, !Ref ProcessingNotificationTopic, 'SNS notifications disabled']
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+    Condition: EnableNotifications
+
+  DeadLetterQueueArn:
+    Description: ARN of the dead letter queue for failed processing
+    Value: !GetAtt ProcessingDeadLetterQueue.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueueArn'
+
+  DeadLetterQueueUrl:
+    Description: URL of the dead letter queue for failed processing
+    Value: !Ref ProcessingDeadLetterQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueueUrl'
+
+  CloudWatchLogGroup:
+    Description: CloudWatch Log Group for Lambda function
+    Value: !Ref DocumentProcessorLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  TestCommand:
+    Description: Command to test the document processing pipeline
+    Value: !Sub |
+      aws s3 cp your-document.pdf s3://${InputDocumentBucket}/test-documents/
+      
+  MonitoringCommand:
+    Description: Command to monitor processing logs
+    Value: !Sub |
+      aws logs tail /aws/lambda/${DocumentProcessorFunction} --follow
+      
+  ProcessingStatusCommand:
+    Description: Command to check processing status
+    Value: !Sub |
+      aws s3 ls s3://${OutputDocumentBucket}/processed/ --recursive --human-readable

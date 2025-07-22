@@ -1,0 +1,661 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure as Code demonstration with VPC, Auto Scaling, and Application Load Balancer - Complete solution for scalable web applications'
+
+# Parameters for customization and flexibility
+Parameters:
+  ProjectName:
+    Description: 'Name of the project for resource naming and tagging'
+    Type: String
+    Default: 'terraform-iac-demo'
+    MinLength: 3
+    MaxLength: 30
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must begin with a letter and contain only alphanumeric characters and hyphens'
+
+  Environment:
+    Description: 'Environment name for resource tagging and configuration'
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    ConstraintDescription: 'Must be one of: dev, staging, prod'
+
+  VpcCidr:
+    Description: 'CIDR block for the VPC'
+    Type: String
+    Default: '10.0.0.0/16'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    ConstraintDescription: 'Must be a valid IP CIDR range of the form x.x.x.x/x'
+
+  InstanceType:
+    Description: 'EC2 instance type for web servers'
+    Type: String
+    Default: 't3.micro'
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - c5.large
+      - c5.xlarge
+    ConstraintDescription: 'Must be a valid EC2 instance type'
+
+  MinSize:
+    Description: 'Minimum number of instances in Auto Scaling Group'
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    ConstraintDescription: 'Must be between 1 and 10'
+
+  MaxSize:
+    Description: 'Maximum number of instances in Auto Scaling Group'
+    Type: Number
+    Default: 4
+    MinValue: 1
+    MaxValue: 20
+    ConstraintDescription: 'Must be between 1 and 20'
+
+  DesiredCapacity:
+    Description: 'Desired number of instances in Auto Scaling Group'
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    ConstraintDescription: 'Must be between 1 and 10'
+
+  KeyPairName:
+    Description: 'Name of an existing EC2 KeyPair for SSH access (optional)'
+    Type: String
+    Default: ''
+
+# Conditions for conditional resource creation
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  CreateNATGateway: !Equals [!Ref Environment, 'prod']
+
+# Mappings for region-specific values
+Mappings:
+  RegionMap:
+    us-east-1:
+      AMI: ami-0c02fb55956c7d316  # Amazon Linux 2 AMI
+    us-west-2:
+      AMI: ami-008fe2fc65df48dac  # Amazon Linux 2 AMI
+    eu-west-1:
+      AMI: ami-01dd271720c1ba44f  # Amazon Linux 2 AMI
+    ap-southeast-1:
+      AMI: ami-0d728fd4e52be968f  # Amazon Linux 2 AMI
+
+# Resources section - Infrastructure components
+Resources:
+  # VPC and Networking Resources
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: 'cloudformation'
+
+  # Internet Gateway for public internet access
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-igw'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Attach Internet Gateway to VPC
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public Subnet in first Availability Zone
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-subnet-1'
+        - Key: Type
+          Value: 'public'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Public Subnet in second Availability Zone
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-subnet-2'
+        - Key: Type
+          Value: 'public'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Route table for public subnets
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-rt'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Route to Internet Gateway for public access
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  # Associate public subnet 1 with route table
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  # Associate public subnet 2 with route table
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # Security Group for Web Servers
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-web-sg'
+      GroupDescription: 'Security group for web servers allowing HTTP/HTTPS traffic'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: '0.0.0.0/0'
+          Description: 'Allow HTTP traffic from anywhere'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+          Description: 'Allow HTTPS traffic from anywhere'
+        - !If
+          - HasKeyPair
+          - IpProtocol: tcp
+            FromPort: 22
+            ToPort: 22
+            CidrIp: '0.0.0.0/0'
+            Description: 'Allow SSH access from anywhere'
+          - !Ref 'AWS::NoValue'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: '0.0.0.0/0'
+          Description: 'Allow all outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-web-sg'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Security Group for Application Load Balancer
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-alb-sg'
+      GroupDescription: 'Security group for Application Load Balancer'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: '0.0.0.0/0'
+          Description: 'Allow HTTP traffic from anywhere'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+          Description: 'Allow HTTPS traffic from anywhere'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: '0.0.0.0/0'
+          Description: 'Allow all outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alb-sg'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for EC2 instances
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ec2-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: EC2LogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Instance Profile for EC2 instances
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ProjectName}-ec2-profile'
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # Launch Template for EC2 instances
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ProjectName}-web-template'
+      LaunchTemplateData:
+        ImageId: !FindInMap [RegionMap, !Ref 'AWS::Region', AMI]
+        InstanceType: !Ref InstanceType
+        KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref 'AWS::NoValue']
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref WebSecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # Update system packages
+            yum update -y
+            
+            # Install and configure Apache web server
+            yum install -y httpd
+            systemctl start httpd
+            systemctl enable httpd
+            
+            # Install CloudWatch agent
+            yum install -y amazon-cloudwatch-agent
+            
+            # Create web content with instance metadata
+            cat > /var/www/html/index.html << 'HTML'
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Infrastructure as Code Demo</title>
+                <style>
+                    body { font-family: Arial, sans-serif; margin: 40px; background-color: #f5f5f5; }
+                    .container { background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+                    .header { color: #232f3e; border-bottom: 2px solid #ff9900; padding-bottom: 10px; }
+                    .info { background: #e8f4fd; padding: 15px; border-left: 4px solid #0073bb; margin: 20px 0; }
+                    .footer { margin-top: 30px; padding-top: 20px; border-top: 1px solid #ddd; color: #666; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1 class="header">🚀 Infrastructure as Code with CloudFormation</h1>
+                    <p>Welcome to the Infrastructure as Code demonstration! This web application is running on AWS infrastructure deployed using CloudFormation.</p>
+                    
+                    <div class="info">
+                        <h3>📋 Instance Information</h3>
+                        <p><strong>Instance ID:</strong> <span id="instance-id">Loading...</span></p>
+                        <p><strong>Availability Zone:</strong> <span id="az">Loading...</span></p>
+                        <p><strong>Instance Type:</strong> <span id="instance-type">Loading...</span></p>
+                        <p><strong>Project:</strong> ${ProjectName}</p>
+                        <p><strong>Environment:</strong> ${Environment}</p>
+                    </div>
+                    
+                    <h3>🏗️ Infrastructure Components</h3>
+                    <ul>
+                        <li><strong>VPC:</strong> Isolated network environment with public subnets</li>
+                        <li><strong>Auto Scaling Group:</strong> Automatically manages instance capacity</li>
+                        <li><strong>Application Load Balancer:</strong> Distributes traffic across instances</li>
+                        <li><strong>Security Groups:</strong> Network-level security controls</li>
+                        <li><strong>IAM Roles:</strong> Secure access management</li>
+                    </ul>
+                    
+                    <h3>✨ Key Features</h3>
+                    <ul>
+                        <li>High availability across multiple Availability Zones</li>
+                        <li>Auto scaling based on demand</li>
+                        <li>Load balancing for optimal performance</li>
+                        <li>Security best practices implementation</li>
+                        <li>Infrastructure as Code deployment</li>
+                    </ul>
+                    
+                    <div class="footer">
+                        <p>🔧 Deployed with AWS CloudFormation | 📊 Managed by Infrastructure as Code</p>
+                    </div>
+                </div>
+                
+                <script>
+                    // Fetch instance metadata
+                    fetch('http://169.254.169.254/latest/meta-data/instance-id')
+                        .then(response => response.text())
+                        .then(data => document.getElementById('instance-id').textContent = data)
+                        .catch(() => document.getElementById('instance-id').textContent = 'Unavailable');
+                    
+                    fetch('http://169.254.169.254/latest/meta-data/placement/availability-zone')
+                        .then(response => response.text())
+                        .then(data => document.getElementById('az').textContent = data)
+                        .catch(() => document.getElementById('az').textContent = 'Unavailable');
+                    
+                    fetch('http://169.254.169.254/latest/meta-data/instance-type')
+                        .then(response => response.text())
+                        .then(data => document.getElementById('instance-type').textContent = data)
+                        .catch(() => document.getElementById('instance-type').textContent = 'Unavailable');
+                </script>
+            </body>
+            </html>
+            HTML
+            
+            # Configure CloudWatch agent
+            cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'JSON'
+            {
+                "metrics": {
+                    "namespace": "AWS/EC2/Custom",
+                    "metrics_collected": {
+                        "cpu": {
+                            "measurement": ["cpu_usage_idle", "cpu_usage_iowait", "cpu_usage_user", "cpu_usage_system"],
+                            "metrics_collection_interval": 60
+                        },
+                        "disk": {
+                            "measurement": ["used_percent"],
+                            "metrics_collection_interval": 60,
+                            "resources": ["*"]
+                        },
+                        "mem": {
+                            "measurement": ["mem_used_percent"],
+                            "metrics_collection_interval": 60
+                        }
+                    }
+                },
+                "logs": {
+                    "logs_collected": {
+                        "files": {
+                            "collect_list": [
+                                {
+                                    "file_path": "/var/log/httpd/access_log",
+                                    "log_group_name": "/aws/ec2/${ProjectName}/httpd/access",
+                                    "log_stream_name": "{instance_id}"
+                                },
+                                {
+                                    "file_path": "/var/log/httpd/error_log",
+                                    "log_group_name": "/aws/ec2/${ProjectName}/httpd/error",
+                                    "log_stream_name": "{instance_id}"
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+            JSON
+            
+            # Start CloudWatch agent
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+                -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+            
+            # Create health check endpoint
+            echo "OK" > /var/www/html/health
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${ProjectName}-web-instance'
+              - Key: Project
+                Value: !Ref ProjectName
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: ManagedBy
+                Value: 'cloudformation'
+
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-web-alb'
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-web-alb'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: 'cloudformation'
+
+  # Target Group for Load Balancer
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-web-tg'
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      HealthCheckEnabled: true
+      HealthCheckPath: '/health'
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetType: instance
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-web-tg'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Load Balancer Listener
+  WebListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # Auto Scaling Group
+  WebAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${ProjectName}-web-asg'
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      TargetGroupARNs:
+        - !Ref WebTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      DefaultCooldown: 300
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-web-asg'
+          PropagateAtLaunch: false
+        - Key: Project
+          Value: !Ref ProjectName
+          PropagateAtLaunch: true
+        - Key: Environment
+          Value: !Ref Environment
+          PropagateAtLaunch: true
+        - Key: ManagedBy
+          Value: 'cloudformation'
+          PropagateAtLaunch: true
+
+  # Auto Scaling Policy - Scale Up
+  ScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Condition: IsProduction
+    Properties:
+      AutoScalingGroupName: !Ref WebAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 70.0
+        ScaleOutCooldown: 300
+        ScaleInCooldown: 300
+
+  # CloudWatch Log Group for Application Logs
+  ApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/ec2/${ProjectName}/application'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  # CloudWatch Log Group for Access Logs
+  AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/ec2/${ProjectName}/httpd/access'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  # CloudWatch Log Group for Error Logs
+  ErrorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/ec2/${ProjectName}/httpd/error'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+# Outputs section - Important values for integration and verification
+Outputs:
+  VPCId:
+    Description: 'ID of the created VPC'
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPC-ID'
+
+  PublicSubnet1Id:
+    Description: 'ID of the first public subnet'
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet1-ID'
+
+  PublicSubnet2Id:
+    Description: 'ID of the second public subnet'
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet2-ID'
+
+  WebSecurityGroupId:
+    Description: 'ID of the web security group'
+    Value: !Ref WebSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-WebSecurityGroup-ID'
+
+  ApplicationLoadBalancerDNS:
+    Description: 'DNS name of the Application Load Balancer'
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-ALB-DNS'
+
+  ApplicationLoadBalancerURL:
+    Description: 'URL of the deployed web application'
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+
+  AutoScalingGroupName:
+    Description: 'Name of the Auto Scaling Group'
+    Value: !Ref WebAutoScalingGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ASG-Name'
+
+  LaunchTemplateId:
+    Description: 'ID of the Launch Template'
+    Value: !Ref WebLaunchTemplate
+    Export:
+      Name: !Sub '${AWS::StackName}-LaunchTemplate-ID'
+
+  TargetGroupArn:
+    Description: 'ARN of the Target Group'
+    Value: !Ref WebTargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-TargetGroup-ARN'
+
+  ProjectName:
+    Description: 'Name of the project'
+    Value: !Ref ProjectName
+
+  Environment:
+    Description: 'Environment name'
+    Value: !Ref Environment
+
+  StackRegion:
+    Description: 'AWS Region where the stack is deployed'
+    Value: !Ref 'AWS::Region'

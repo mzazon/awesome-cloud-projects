@@ -1,0 +1,512 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for Establishing Private Blockchain Networks with Amazon Managed Blockchain'
+
+# This template creates a complete private blockchain network infrastructure including:
+# - Amazon Managed Blockchain network with Hyperledger Fabric
+# - VPC Endpoint for secure blockchain access
+# - EC2 instance configured as blockchain client
+# - IAM roles and security groups
+# - CloudWatch logging and monitoring
+
+Parameters:
+  # Network Configuration
+  NetworkName:
+    Type: String
+    Default: SupplyChainNetwork
+    Description: Name for the blockchain network
+    MaxLength: 64
+    MinLength: 1
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9\-]*'
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters and hyphens
+
+  NetworkDescription:
+    Type: String
+    Default: Private blockchain network for supply chain tracking
+    Description: Description for the blockchain network
+    MaxLength: 128
+
+  # Member Configuration
+  MemberName:
+    Type: String
+    Default: OrganizationA
+    Description: Name for the founding member organization
+    MaxLength: 64
+    MinLength: 1
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9\-]*'
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters and hyphens
+
+  MemberDescription:
+    Type: String
+    Default: Founding member of supply chain network
+    Description: Description for the founding member
+    MaxLength: 128
+
+  AdminUsername:
+    Type: String
+    Default: admin
+    Description: Administrator username for blockchain member
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters
+
+  AdminPassword:
+    Type: String
+    NoEcho: true
+    Description: Administrator password for blockchain member (minimum 8 characters)
+    MinLength: 8
+    MaxLength: 32
+    AllowedPattern: '[a-zA-Z0-9]*'
+    ConstraintDescription: Must contain only alphanumeric characters
+
+  # Infrastructure Configuration
+  NodeInstanceType:
+    Type: String
+    Default: bc.t3.small
+    AllowedValues:
+      - bc.t3.small
+      - bc.t3.medium
+      - bc.t3.large
+      - bc.m5.large
+      - bc.m5.xlarge
+    Description: Instance type for blockchain peer node
+
+  ClientInstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+    Description: Instance type for blockchain client EC2 instance
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where resources will be created
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet ID for EC2 instance and VPC endpoint
+
+  # Security Configuration
+  AllowedCidrBlock:
+    Type: String
+    Default: 10.0.0.0/8
+    Description: CIDR block allowed to access blockchain endpoints
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: Must be a valid CIDR range
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access to client instance
+
+  # Environment Configuration
+  Environment:
+    Type: String
+    Default: Production
+    AllowedValues:
+      - Development
+      - Staging
+      - Production
+    Description: Environment designation for resource tagging
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, Production]
+
+Resources:
+  # IAM Role for Managed Blockchain
+  ManagedBlockchainRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ManagedBlockchainRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: managedblockchain.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonManagedBlockchainFullAccess
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ManagedBlockchainRole'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for EC2 Client Instance
+  EC2ClientRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-EC2ClientRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BlockchainClientPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - managedblockchain:GetNetwork
+                  - managedblockchain:GetMember
+                  - managedblockchain:GetNode
+                  - managedblockchain:ListNetworks
+                  - managedblockchain:ListMembers
+                  - managedblockchain:ListNodes
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-EC2ClientRole'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Instance Profile for EC2 Client
+  EC2ClientInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2ClientRole
+
+  # Security Group for Blockchain Access
+  BlockchainSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-blockchain-sg'
+      GroupDescription: Security group for Managed Blockchain VPC endpoint and client access
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        # Hyperledger Fabric Certificate Authority
+        - IpProtocol: tcp
+          FromPort: 30001
+          ToPort: 30001
+          CidrIp: !Ref AllowedCidrBlock
+          Description: Hyperledger Fabric CA endpoint
+        # Hyperledger Fabric Peer
+        - IpProtocol: tcp
+          FromPort: 30002
+          ToPort: 30002
+          CidrIp: !Ref AllowedCidrBlock
+          Description: Hyperledger Fabric peer endpoint
+        # Internal peer communication
+        - IpProtocol: tcp
+          FromPort: 7051
+          ToPort: 7051
+          SourceSecurityGroupId: !Ref BlockchainSecurityGroup
+          Description: Peer to peer communication
+        # Peer event service
+        - IpProtocol: tcp
+          FromPort: 7053
+          ToPort: 7053
+          SourceSecurityGroupId: !Ref BlockchainSecurityGroup
+          Description: Peer event service
+        # SSH access for client management
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedCidrBlock
+          Description: SSH access to blockchain client
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-blockchain-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # VPC Endpoint for Managed Blockchain
+  BlockchainVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.managedblockchain'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref BlockchainSecurityGroup
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - managedblockchain:*
+            Resource: '*'
+
+  # CloudWatch Log Group for Blockchain Logs
+  BlockchainLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/managedblockchain/${NetworkName}'
+      RetentionInDays: !If [IsProduction, 365, 30]
+
+  # Managed Blockchain Network
+  BlockchainNetwork:
+    Type: AWS::ManagedBlockchain::Network
+    Properties:
+      Name: !Sub '${NetworkName}-${AWS::StackName}'
+      Description: !Ref NetworkDescription
+      Framework: HYPERLEDGER_FABRIC
+      FrameworkVersion: '2.2'
+      FrameworkConfiguration:
+        Fabric:
+          Edition: STANDARD
+      VotingPolicy:
+        ApprovalThresholdPolicy:
+          ThresholdPercentage: 50
+          ProposalDurationInHours: 24
+          ThresholdComparator: GREATER_THAN
+      MemberConfiguration:
+        Name: !Sub '${MemberName}-${AWS::StackName}'
+        Description: !Ref MemberDescription
+        MemberFrameworkConfiguration:
+          Fabric:
+            AdminUsername: !Ref AdminUsername
+            AdminPassword: !Ref AdminPassword
+
+  # Blockchain Member (automatically created with network)
+  # The member is created as part of the network resource above
+
+  # Peer Node for the Member
+  BlockchainPeerNode:
+    Type: AWS::ManagedBlockchain::Node
+    Properties:
+      NetworkId: !Ref BlockchainNetwork
+      MemberId: !GetAtt BlockchainNetwork.MemberId
+      NodeConfiguration:
+        InstanceType: !Ref NodeInstanceType
+        AvailabilityZone: !Sub '${AWS::Region}a'
+
+  # EC2 Instance for Blockchain Client
+  BlockchainClientInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
+      InstanceType: !Ref ClientInstanceType
+      KeyName: !Ref KeyPairName
+      IamInstanceProfile: !Ref EC2ClientInstanceProfile
+      SecurityGroupIds:
+        - !Ref BlockchainSecurityGroup
+      SubnetId: !Ref SubnetId
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y docker git jq
+
+          # Start and enable Docker
+          systemctl start docker
+          systemctl enable docker
+          usermod -a -G docker ec2-user
+
+          # Install Docker Compose
+          curl -L "https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+          chmod +x /usr/local/bin/docker-compose
+
+          # Install Node.js via nvm (as ec2-user)
+          su - ec2-user -c '
+          curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
+          export NVM_DIR="$HOME/.nvm"
+          [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+          nvm install 16
+          nvm use 16
+          '
+
+          # Download Hyperledger Fabric binaries
+          su - ec2-user -c '
+          cd /home/ec2-user
+          curl -sSL https://bit.ly/2ysbOFE | bash -s -- 2.2.0 1.4.9
+          echo "export PATH=/home/ec2-user/fabric-samples/bin:$PATH" >> ~/.bashrc
+          '
+
+          # Create blockchain client directory structure
+          su - ec2-user -c '
+          mkdir -p /home/ec2-user/blockchain-client/{crypto-config,channel-artifacts}
+          '
+
+          # Create network information file
+          cat > /home/ec2-user/network-info.json << EOF
+          {
+            "NetworkId": "${BlockchainNetwork}",
+            "NetworkName": "${NetworkName}-${AWS::StackName}",
+            "MemberId": "${BlockchainNetwork.MemberId}",
+            "MemberName": "${MemberName}-${AWS::StackName}",
+            "NodeId": "${BlockchainPeerNode}",
+            "Region": "${AWS::Region}",
+            "VPCEndpoint": "${BlockchainVPCEndpoint}"
+          }
+          EOF
+
+          # Set ownership
+          chown ec2-user:ec2-user /home/ec2-user/network-info.json
+
+          # Signal CloudFormation
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource BlockchainClientInstance --region ${AWS::Region}
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-blockchain-client'
+        - Key: Environment
+          Value: !Ref Environment
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+        Count: 1
+
+  # VPC Flow Logs for Network Monitoring
+  VPCFlowLogsRole:
+    Type: AWS::IAM::Role
+    Condition: IsProduction
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FlowLogsDeliveryRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: '*'
+
+  VPCFlowLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: IsProduction
+    Properties:
+      LogGroupName: !Sub '/aws/vpc/flowlogs/${AWS::StackName}'
+      RetentionInDays: 30
+
+  VPCFlowLogs:
+    Type: AWS::EC2::FlowLog
+    Condition: IsProduction
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref VpcId
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref VPCFlowLogsGroup
+      DeliverLogsPermissionArn: !GetAtt VPCFlowLogsRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc-flow-logs'
+
+Outputs:
+  # Network Information
+  NetworkId:
+    Description: ID of the created blockchain network
+    Value: !Ref BlockchainNetwork
+    Export:
+      Name: !Sub '${AWS::StackName}-NetworkId'
+
+  NetworkName:
+    Description: Name of the created blockchain network
+    Value: !Sub '${NetworkName}-${AWS::StackName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-NetworkName'
+
+  # Member Information
+  MemberId:
+    Description: ID of the blockchain network member
+    Value: !GetAtt BlockchainNetwork.MemberId
+    Export:
+      Name: !Sub '${AWS::StackName}-MemberId'
+
+  MemberName:
+    Description: Name of the blockchain network member
+    Value: !Sub '${MemberName}-${AWS::StackName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-MemberName'
+
+  # Node Information
+  NodeId:
+    Description: ID of the blockchain peer node
+    Value: !Ref BlockchainPeerNode
+    Export:
+      Name: !Sub '${AWS::StackName}-NodeId'
+
+  # Endpoints
+  CAEndpoint:
+    Description: Certificate Authority endpoint for the member
+    Value: !GetAtt BlockchainNetwork.MemberConfiguration.MemberFrameworkConfiguration.Fabric.CaEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-CAEndpoint'
+
+  PeerEndpoint:
+    Description: Peer node endpoint
+    Value: !GetAtt BlockchainPeerNode.PeerEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-PeerEndpoint'
+
+  # Infrastructure Information
+  VPCEndpointId:
+    Description: ID of the VPC endpoint for blockchain access
+    Value: !Ref BlockchainVPCEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCEndpointId'
+
+  ClientInstanceId:
+    Description: ID of the blockchain client EC2 instance
+    Value: !Ref BlockchainClientInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-ClientInstanceId'
+
+  ClientInstancePublicIP:
+    Description: Public IP address of the blockchain client instance
+    Value: !GetAtt BlockchainClientInstance.PublicIp
+    Export:
+      Name: !Sub '${AWS::StackName}-ClientInstancePublicIP'
+
+  ClientInstancePrivateIP:
+    Description: Private IP address of the blockchain client instance
+    Value: !GetAtt BlockchainClientInstance.PrivateIp
+    Export:
+      Name: !Sub '${AWS::StackName}-ClientInstancePrivateIP'
+
+  # Security Information
+  SecurityGroupId:
+    Description: ID of the blockchain security group
+    Value: !Ref BlockchainSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroupId'
+
+  # Access Information
+  SSHCommand:
+    Description: SSH command to connect to the blockchain client instance
+    Value: !Sub 'ssh -i ${KeyPairName}.pem ec2-user@${BlockchainClientInstance.PublicIp}'
+
+  NetworkInfoLocation:
+    Description: Location of network configuration file on client instance
+    Value: '/home/ec2-user/network-info.json'
+
+  # Next Steps
+  NextSteps:
+    Description: Instructions for next steps after deployment
+    Value: |
+      1. SSH to the client instance using the provided SSH command
+      2. Review network information in /home/ec2-user/network-info.json
+      3. Use Hyperledger Fabric CLI tools to create channels and deploy chaincode
+      4. Refer to AWS Managed Blockchain documentation for advanced configuration

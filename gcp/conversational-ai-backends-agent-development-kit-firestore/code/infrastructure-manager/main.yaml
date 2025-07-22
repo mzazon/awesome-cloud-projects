@@ -1,0 +1,379 @@
+# Infrastructure Manager configuration for Conversational AI Backends
+# This configuration deploys the complete infrastructure for a conversational AI system
+# using Google Cloud Agent Development Kit, Firestore, Cloud Functions, and Cloud Storage
+
+# Template metadata
+metadata:
+  name: conversational-ai-backends
+  description: "Complete infrastructure for conversational AI backends with Agent Development Kit and Firestore"
+  version: "1.0"
+
+# Input parameters for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    required: true
+  
+  region:
+    type: string
+    description: "Google Cloud region for resources"
+    default: "us-central1"
+    
+  environment:
+    type: string
+    description: "Environment name (dev, staging, prod)"
+    default: "dev"
+    
+  function_memory:
+    type: string
+    description: "Memory allocation for Cloud Functions"
+    default: "1Gi"
+    
+  firestore_location:
+    type: string
+    description: "Firestore database location"
+    default: "us-central"
+
+# Required APIs that need to be enabled
+resources:
+  # Enable required Google Cloud APIs
+  - name: aiplatform-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/aiplatform.googleapis.com
+      project: ${project_id}
+    metadata:
+      dependsOn: []
+
+  - name: cloudfunctions-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/cloudfunctions.googleapis.com
+      project: ${project_id}
+
+  - name: firestore-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/firestore.googleapis.com
+      project: ${project_id}
+
+  - name: storage-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/storage.googleapis.com
+      project: ${project_id}
+
+  - name: cloudbuild-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/cloudbuild.googleapis.com
+      project: ${project_id}
+
+  - name: run-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/${project_id}/services/run.googleapis.com
+      project: ${project_id}
+
+  # Firestore Database for conversation storage
+  - name: conversation-firestore-database
+    type: gcp-types/firestore-v1:projects.databases
+    properties:
+      parent: projects/${project_id}
+      databaseId: chat-conversations-${environment}
+      type: FIRESTORE_NATIVE
+      locationId: ${firestore_location}
+      # Enable point-in-time recovery for data protection
+      pointInTimeRecoveryEnablement: POINT_IN_TIME_RECOVERY_ENABLED
+    metadata:
+      dependsOn:
+        - firestore-api
+    annotations:
+      description: "Firestore database for storing conversation history and user context"
+
+  # Cloud Storage bucket for conversation artifacts and training data
+  - name: conversation-storage-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${project_id}-conversations-${environment}
+      project: ${project_id}
+      location: ${region}
+      storageClass: STANDARD
+      # Enable versioning for data protection
+      versioning:
+        enabled: true
+      # Lifecycle management for cost optimization
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90
+              matchesPrefix:
+                - "conversations/archived/"
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+              matchesPrefix:
+                - "conversations/logs/"
+      # Security configurations
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      encryption:
+        defaultKmsKeyName: ""  # Uses Google-managed encryption keys
+    metadata:
+      dependsOn:
+        - storage-api
+    annotations:
+      description: "Storage bucket for conversation artifacts, logs, and training data"
+
+  # Service Account for Cloud Functions with minimal required permissions
+  - name: conversation-function-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: conversation-function-sa-${environment}
+      project: ${project_id}
+      serviceAccount:
+        displayName: "Conversation Function Service Account"
+        description: "Service account for conversational AI Cloud Functions"
+    metadata:
+      dependsOn: []
+    annotations:
+      description: "Service account with minimal permissions for Cloud Functions"
+
+  # IAM binding for Firestore access
+  - name: firestore-datastore-user-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/datastore.user
+      member: serviceAccount:$(ref.conversation-function-service-account.email)
+    metadata:
+      dependsOn:
+        - conversation-function-service-account
+        - conversation-firestore-database
+
+  # IAM binding for Storage access
+  - name: storage-object-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/storage.objectAdmin
+      member: serviceAccount:$(ref.conversation-function-service-account.email)
+    metadata:
+      dependsOn:
+        - conversation-function-service-account
+        - conversation-storage-bucket
+
+  # IAM binding for Vertex AI access
+  - name: vertex-ai-user-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/aiplatform.user
+      member: serviceAccount:$(ref.conversation-function-service-account.email)
+    metadata:
+      dependsOn:
+        - conversation-function-service-account
+        - aiplatform-api
+
+  # Cloud Function for main conversation processing
+  - name: chat-processor-function
+    type: gcp-types/cloudfunctions-v2beta:projects.locations.functions
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      functionId: chat-processor-${environment}
+      function:
+        description: "Main conversation processing function using Agent Development Kit"
+        buildConfig:
+          runtime: python310
+          entryPoint: chat_processor
+          source:
+            storageSource:
+              bucket: ${project_id}-functions-source-${environment}
+              object: conversation-function-source.zip
+        serviceConfig:
+          maxInstanceCount: 100
+          minInstanceCount: 0
+          availableMemory: ${function_memory}
+          timeoutSeconds: 60
+          environmentVariables:
+            PROJECT_ID: ${project_id}
+            REGION: ${region}
+            FIRESTORE_DATABASE: chat-conversations-${environment}
+            ENVIRONMENT: ${environment}
+          serviceAccountEmail: $(ref.conversation-function-service-account.email)
+          ingressSettings: ALLOW_ALL
+          # Security settings
+          vpcConnector: ""
+          vpcConnectorEgressSettings: PRIVATE_RANGES_ONLY
+        # HTTP trigger configuration
+        eventTrigger:
+          eventType: providers/cloud.firestore/eventTypes/document.write
+          resource: projects/${project_id}/databases/chat-conversations-${environment}/documents/conversations/{conversationId}
+    metadata:
+      dependsOn:
+        - cloudfunctions-api
+        - conversation-function-service-account
+        - conversation-firestore-database
+        - function-source-bucket
+    annotations:
+      description: "Cloud Function for processing chat conversations with ADK integration"
+
+  # Cloud Function for conversation history retrieval
+  - name: conversation-history-function
+    type: gcp-types/cloudfunctions-v2beta:projects.locations.functions
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      functionId: conversation-history-${environment}
+      function:
+        description: "Function for retrieving conversation history"
+        buildConfig:
+          runtime: python310
+          entryPoint: get_conversation_history
+          source:
+            storageSource:
+              bucket: ${project_id}-functions-source-${environment}
+              object: conversation-function-source.zip
+        serviceConfig:
+          maxInstanceCount: 50
+          minInstanceCount: 0
+          availableMemory: "512Mi"
+          timeoutSeconds: 30
+          environmentVariables:
+            PROJECT_ID: ${project_id}
+            REGION: ${region}
+            FIRESTORE_DATABASE: chat-conversations-${environment}
+            ENVIRONMENT: ${environment}
+          serviceAccountEmail: $(ref.conversation-function-service-account.email)
+          ingressSettings: ALLOW_ALL
+    metadata:
+      dependsOn:
+        - cloudfunctions-api
+        - conversation-function-service-account
+        - conversation-firestore-database
+        - function-source-bucket
+    annotations:
+      description: "Cloud Function for retrieving conversation history"
+
+  # Storage bucket for Cloud Functions source code
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${project_id}-functions-source-${environment}
+      project: ${project_id}
+      location: ${region}
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+    metadata:
+      dependsOn:
+        - storage-api
+    annotations:
+      description: "Storage bucket for Cloud Functions source code deployment"
+
+  # Firestore composite index for efficient conversation queries
+  - name: conversation-composite-index
+    type: gcp-types/firestore-v1:projects.databases.collectionGroups.indexes
+    properties:
+      parent: projects/${project_id}/databases/chat-conversations-${environment}/collectionGroups/conversations
+      index:
+        queryScope: COLLECTION
+        fields:
+          - fieldPath: userId
+            order: ASCENDING
+          - fieldPath: timestamp
+            order: DESCENDING
+        state: READY
+    metadata:
+      dependsOn:
+        - conversation-firestore-database
+    annotations:
+      description: "Composite index for efficient conversation queries by user and timestamp"
+
+  # Cloud Monitoring notification channel for alerts
+  - name: monitoring-notification-channel
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      parent: projects/${project_id}
+      notificationChannel:
+        type: email
+        displayName: "Conversation AI Alerts"
+        description: "Email notifications for conversation AI system alerts"
+        labels:
+          email_address: "admin@example.com"  # Replace with actual email
+        enabled: true
+    annotations:
+      description: "Notification channel for system alerts and monitoring"
+
+  # Alert policy for function errors
+  - name: function-error-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/${project_id}
+      alertPolicy:
+        displayName: "Cloud Function Error Rate Alert"
+        documentation:
+          content: "Alert when Cloud Function error rate exceeds threshold"
+        conditions:
+          - displayName: "Function error rate"
+            conditionThreshold:
+              filter: 'resource.type="cloud_function" AND metric.type="cloudfunctions.googleapis.com/function/execution_count"'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 10
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_RATE
+        notificationChannels:
+          - $(ref.monitoring-notification-channel.name)
+        alertStrategy:
+          autoClose: 86400s  # 24 hours
+    metadata:
+      dependsOn:
+        - monitoring-notification-channel
+        - chat-processor-function
+    annotations:
+      description: "Alert policy for monitoring Cloud Function error rates"
+
+# Output values for verification and integration
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${project_id}
+
+  firestore_database:
+    description: "Firestore database name"
+    value: $(ref.conversation-firestore-database.name)
+
+  storage_bucket:
+    description: "Conversation storage bucket name"
+    value: $(ref.conversation-storage-bucket.name)
+
+  chat_function_url:
+    description: "Chat processor function URL"
+    value: $(ref.chat-processor-function.serviceConfig.uri)
+
+  history_function_url:
+    description: "Conversation history function URL"
+    value: $(ref.conversation-history-function.serviceConfig.uri)
+
+  service_account_email:
+    description: "Service account email for functions"
+    value: $(ref.conversation-function-service-account.email)
+
+  function_source_bucket:
+    description: "Function source code bucket"
+    value: $(ref.function-source-bucket.name)
+
+  region:
+    description: "Deployment region"
+    value: ${region}
+
+  environment:
+    description: "Environment name"
+    value: ${environment}

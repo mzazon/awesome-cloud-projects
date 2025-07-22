@@ -1,0 +1,724 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'EC2 Fleet Management with Spot Instances - Cost-optimized compute infrastructure with intelligent capacity management'
+
+# ====================================================================
+# METADATA
+# ====================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Fleet Configuration"
+        Parameters:
+          - FleetName
+          - TotalTargetCapacity
+          - OnDemandTargetCapacity
+          - SpotTargetCapacity
+          - MaxSpotPricePerHour
+      - Label:
+          default: "Instance Configuration"
+        Parameters:
+          - InstanceTypes
+          - KeyPairName
+          - AmiId
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - SubnetIds
+          - AllowedCidrBlocks
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableCloudWatchDashboard
+          - EnableDetailedMonitoring
+      - Label:
+          default: "Tags"
+        Parameters:
+          - ProjectName
+          - Environment
+    ParameterLabels:
+      FleetName:
+        default: "Fleet Name"
+      TotalTargetCapacity:
+        default: "Total Target Capacity"
+      OnDemandTargetCapacity:
+        default: "On-Demand Target Capacity"
+      SpotTargetCapacity:
+        default: "Spot Target Capacity"
+      MaxSpotPricePerHour:
+        default: "Max Spot Price Per Hour"
+      InstanceTypes:
+        default: "Instance Types"
+      KeyPairName:
+        default: "Key Pair Name"
+      AmiId:
+        default: "AMI ID"
+      VpcId:
+        default: "VPC ID"
+      SubnetIds:
+        default: "Subnet IDs"
+      AllowedCidrBlocks:
+        default: "Allowed CIDR Blocks"
+      EnableCloudWatchDashboard:
+        default: "Enable CloudWatch Dashboard"
+      EnableDetailedMonitoring:
+        default: "Enable Detailed Monitoring"
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+
+# ====================================================================
+# PARAMETERS
+# ====================================================================
+Parameters:
+  FleetName:
+    Type: String
+    Default: 'ec2-fleet-demo'
+    Description: 'Name prefix for the EC2 Fleet and related resources'
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must begin with a letter and contain only alphanumeric characters and hyphens'
+
+  TotalTargetCapacity:
+    Type: Number
+    Default: 6
+    MinValue: 1
+    MaxValue: 100
+    Description: 'Total target capacity for the fleet (number of instances)'
+
+  OnDemandTargetCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 0
+    MaxValue: 50
+    Description: 'Number of On-Demand instances to maintain'
+
+  SpotTargetCapacity:
+    Type: Number
+    Default: 4
+    MinValue: 0
+    MaxValue: 50
+    Description: 'Number of Spot instances to maintain'
+
+  MaxSpotPricePerHour:
+    Type: String
+    Default: '0.10'
+    Description: 'Maximum price per hour for Spot instances (USD)'
+    AllowedPattern: '^[0-9]+(\.[0-9]{1,2})?$'
+    ConstraintDescription: 'Must be a valid decimal number with up to 2 decimal places'
+
+  InstanceTypes:
+    Type: CommaDelimitedList
+    Default: 't3.micro,t3.small,t3.nano'
+    Description: 'Comma-delimited list of instance types for the fleet'
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: 'Name of the EC2 Key Pair for SSH access'
+
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+    Description: 'AMI ID for instances (defaults to latest Amazon Linux 2)'
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC ID where the fleet will be deployed'
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: 'List of subnet IDs across different AZs for fleet deployment'
+
+  AllowedCidrBlocks:
+    Type: CommaDelimitedList
+    Default: '0.0.0.0/0'
+    Description: 'Comma-delimited list of CIDR blocks allowed for SSH and HTTP access'
+
+  EnableCloudWatchDashboard:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable CloudWatch dashboard for fleet monitoring'
+
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable detailed CloudWatch monitoring for instances'
+
+  ProjectName:
+    Type: String
+    Default: 'EC2-Fleet-Demo'
+    Description: 'Project name for resource tagging'
+
+  Environment:
+    Type: String
+    Default: 'Development'
+    AllowedValues: ['Development', 'Staging', 'Production']
+    Description: 'Environment for deployment'
+
+# ====================================================================
+# CONDITIONS
+# ====================================================================
+Conditions:
+  CreateDashboard: !Equals [!Ref EnableCloudWatchDashboard, 'true']
+  EnableDetailedMonitoring: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  CreateSpotFleet: !Not [!Equals [!Ref SpotTargetCapacity, 0]]
+  CreateOnDemandFleet: !Not [!Equals [!Ref OnDemandTargetCapacity, 0]]
+
+# ====================================================================
+# RESOURCES
+# ====================================================================
+Resources:
+  # ----------------------------------------------------------------
+  # Security Group for Fleet Instances
+  # ----------------------------------------------------------------
+  FleetSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${FleetName}-security-group'
+      GroupDescription: 'Security group for EC2 Fleet instances'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Select [0, !Ref AllowedCidrBlocks]
+          Description: 'SSH access'
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Select [0, !Ref AllowedCidrBlocks]
+          Description: 'HTTP access'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Select [0, !Ref AllowedCidrBlocks]
+          Description: 'HTTPS access'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${FleetName}-security-group'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ----------------------------------------------------------------
+  # IAM Role for EC2 Fleet Service
+  # ----------------------------------------------------------------
+  FleetServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${FleetName}-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetRequestRole
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${FleetName}-service-role'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ----------------------------------------------------------------
+  # IAM Role for Spot Fleet Service
+  # ----------------------------------------------------------------
+  SpotFleetServiceRole:
+    Type: AWS::IAM::Role
+    Condition: CreateSpotFleet
+    Properties:
+      RoleName: !Sub '${FleetName}-spot-fleet-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: spotfleet.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetRequestRole
+      Tags:
+        - Key: Name
+          Value: !Sub '${FleetName}-spot-fleet-service-role'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ----------------------------------------------------------------
+  # IAM Instance Profile for EC2 Instances
+  # ----------------------------------------------------------------
+  FleetInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${FleetName}-instance-profile'
+      Roles:
+        - !Ref FleetServiceRole
+
+  # ----------------------------------------------------------------
+  # Launch Template for Fleet Instances
+  # ----------------------------------------------------------------
+  FleetLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${FleetName}-launch-template'
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Select [0, !Ref InstanceTypes]
+        KeyName: !Ref KeyPairName
+        IamInstanceProfile:
+          Arn: !GetAtt FleetInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref FleetSecurityGroup
+        Monitoring:
+          Enabled: !If [EnableDetailedMonitoring, true, false]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd
+            systemctl start httpd
+            systemctl enable httpd
+            
+            # Install CloudWatch agent
+            yum install -y amazon-cloudwatch-agent
+            
+            # Create simple web page with instance metadata
+            cat > /var/www/html/index.html << EOF
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>EC2 Fleet Instance</title>
+                <style>
+                    body { font-family: Arial, sans-serif; margin: 40px; }
+                    .container { max-width: 800px; margin: 0 auto; }
+                    .metadata { background: #f0f0f0; padding: 20px; border-radius: 5px; }
+                    .header { color: #232f3e; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1 class="header">EC2 Fleet Instance</h1>
+                    <div class="metadata">
+                        <p><strong>Instance ID:</strong> <span id="instance-id">Loading...</span></p>
+                        <p><strong>Instance Type:</strong> <span id="instance-type">Loading...</span></p>
+                        <p><strong>Availability Zone:</strong> <span id="availability-zone">Loading...</span></p>
+                        <p><strong>Fleet Name:</strong> ${FleetName}</p>
+                        <p><strong>Project:</strong> ${ProjectName}</p>
+                        <p><strong>Environment:</strong> ${Environment}</p>
+                    </div>
+                </div>
+                <script>
+                    function loadMetadata() {
+                        fetch('http://169.254.169.254/latest/meta-data/instance-id')
+                            .then(response => response.text())
+                            .then(data => document.getElementById('instance-id').textContent = data);
+                        
+                        fetch('http://169.254.169.254/latest/meta-data/instance-type')
+                            .then(response => response.text())
+                            .then(data => document.getElementById('instance-type').textContent = data);
+                        
+                        fetch('http://169.254.169.254/latest/meta-data/placement/availability-zone')
+                            .then(response => response.text())
+                            .then(data => document.getElementById('availability-zone').textContent = data);
+                    }
+                    loadMetadata();
+                </script>
+            </body>
+            </html>
+            EOF
+            
+            # Set permissions
+            chown -R apache:apache /var/www/html
+            chmod -R 755 /var/www/html
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${FleetName}-instance'
+              - Key: Project
+                Value: !Ref ProjectName
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: Fleet
+                Value: !Ref FleetName
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub '${FleetName}-volume'
+              - Key: Project
+                Value: !Ref ProjectName
+              - Key: Environment
+                Value: !Ref Environment
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: Name
+              Value: !Sub '${FleetName}-launch-template'
+            - Key: Project
+              Value: !Ref ProjectName
+            - Key: Environment
+              Value: !Ref Environment
+
+  # ----------------------------------------------------------------
+  # EC2 Fleet (Mixed Instance Types)
+  # ----------------------------------------------------------------
+  EC2Fleet:
+    Type: AWS::EC2::EC2Fleet
+    Properties:
+      LaunchTemplateConfigs:
+        - LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref FleetLaunchTemplate
+            Version: !GetAtt FleetLaunchTemplate.LatestVersionNumber
+          Overrides:
+            - !If
+              - CreateOnDemandFleet
+              - InstanceType: !Select [0, !Ref InstanceTypes]
+                SubnetId: !Select [0, !Ref SubnetIds]
+              - !Ref AWS::NoValue
+            - !If
+              - CreateOnDemandFleet
+              - InstanceType: !Select [1, !Ref InstanceTypes]
+                SubnetId: !Select [1, !Ref SubnetIds]
+              - !Ref AWS::NoValue
+            - !If
+              - CreateSpotFleet
+              - InstanceType: !Select [0, !Ref InstanceTypes]
+                SubnetId: !Select [0, !Ref SubnetIds]
+              - !Ref AWS::NoValue
+      TargetCapacitySpecification:
+        TotalTargetCapacity: !Ref TotalTargetCapacity
+        OnDemandTargetCapacity: !Ref OnDemandTargetCapacity
+        SpotTargetCapacity: !Ref SpotTargetCapacity
+        DefaultTargetCapacityType: spot
+      OnDemandOptions:
+        AllocationStrategy: diversified
+      SpotOptions:
+        AllocationStrategy: capacity-optimized
+        InstanceInterruptionBehavior: terminate
+        ReplaceUnhealthyInstances: true
+        MaxTotalPrice: !Ref MaxSpotPricePerHour
+      Type: maintain
+      ExcessCapacityTerminationPolicy: termination
+      ReplaceUnhealthyInstances: true
+      TagSpecifications:
+        - ResourceType: fleet
+          Tags:
+            - Key: Name
+              Value: !Sub '${FleetName}-ec2-fleet'
+            - Key: Project
+              Value: !Ref ProjectName
+            - Key: Environment
+              Value: !Ref Environment
+
+  # ----------------------------------------------------------------
+  # Spot Fleet (For Comparison)
+  # ----------------------------------------------------------------
+  SpotFleet:
+    Type: AWS::EC2::SpotFleet
+    Condition: CreateSpotFleet
+    Properties:
+      SpotFleetRequestConfigData:
+        IamFleetRole: !GetAtt SpotFleetServiceRole.Arn
+        AllocationStrategy: capacity-optimized
+        TargetCapacity: 3
+        SpotPrice: !Ref MaxSpotPricePerHour
+        LaunchSpecifications:
+          - ImageId: !Ref AmiId
+            InstanceType: !Select [0, !Ref InstanceTypes]
+            KeyName: !Ref KeyPairName
+            SecurityGroups:
+              - GroupId: !Ref FleetSecurityGroup
+            SubnetId: !Select [0, !Ref SubnetIds]
+            IamInstanceProfile:
+              Arn: !GetAtt FleetInstanceProfile.Arn
+            UserData:
+              Fn::Base64: !Sub |
+                #!/bin/bash
+                yum update -y
+                yum install -y httpd
+                systemctl start httpd
+                systemctl enable httpd
+                echo "<h1>Spot Fleet Instance</h1>" > /var/www/html/index.html
+                echo "<p>Instance ID: $(curl -s http://169.254.169.254/latest/meta-data/instance-id)</p>" >> /var/www/html/index.html
+                echo "<p>Instance Type: $(curl -s http://169.254.169.254/latest/meta-data/instance-type)</p>" >> /var/www/html/index.html
+                echo "<p>Availability Zone: $(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)</p>" >> /var/www/html/index.html
+            TagSpecifications:
+              - ResourceType: instance
+                Tags:
+                  - Key: Name
+                    Value: !Sub '${FleetName}-spot-instance'
+                  - Key: Project
+                    Value: !Ref ProjectName
+                  - Key: Environment
+                    Value: !Ref Environment
+          - ImageId: !Ref AmiId
+            InstanceType: !Select [1, !Ref InstanceTypes]
+            KeyName: !Ref KeyPairName
+            SecurityGroups:
+              - GroupId: !Ref FleetSecurityGroup
+            SubnetId: !Select [1, !Ref SubnetIds]
+            IamInstanceProfile:
+              Arn: !GetAtt FleetInstanceProfile.Arn
+            UserData:
+              Fn::Base64: !Sub |
+                #!/bin/bash
+                yum update -y
+                yum install -y httpd
+                systemctl start httpd
+                systemctl enable httpd
+                echo "<h1>Spot Fleet Instance</h1>" > /var/www/html/index.html
+                echo "<p>Instance ID: $(curl -s http://169.254.169.254/latest/meta-data/instance-id)</p>" >> /var/www/html/index.html
+                echo "<p>Instance Type: $(curl -s http://169.254.169.254/latest/meta-data/instance-type)</p>" >> /var/www/html/index.html
+                echo "<p>Availability Zone: $(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)</p>" >> /var/www/html/index.html
+            TagSpecifications:
+              - ResourceType: instance
+                Tags:
+                  - Key: Name
+                    Value: !Sub '${FleetName}-spot-instance'
+                  - Key: Project
+                    Value: !Ref ProjectName
+                  - Key: Environment
+                    Value: !Ref Environment
+        Type: maintain
+        ReplaceUnhealthyInstances: true
+
+  # ----------------------------------------------------------------
+  # CloudWatch Dashboard
+  # ----------------------------------------------------------------
+  FleetDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateDashboard
+    Properties:
+      DashboardName: !Sub '${FleetName}-monitoring-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/EC2", "CPUUtilization", "FleetRequestId", "${EC2Fleet}" ],
+                  [ "AWS/EC2", "NetworkIn", "FleetRequestId", "${EC2Fleet}" ],
+                  [ "AWS/EC2", "NetworkOut", "FleetRequestId", "${EC2Fleet}" ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "EC2 Fleet Performance Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/EC2Spot", "AvailableInstancePoolsCount", "FleetRequestId", "${SpotFleet}" ],
+                  [ "AWS/EC2Spot", "MaxPercentCapacityAllocation", "FleetRequestId", "${SpotFleet}" ],
+                  [ "AWS/EC2Spot", "TargetCapacity", "FleetRequestId", "${SpotFleet}" ],
+                  [ "AWS/EC2Spot", "FulfilledCapacity", "FleetRequestId", "${SpotFleet}" ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Spot Fleet Capacity Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/EC2", "StatusCheckFailed", "FleetRequestId", "${EC2Fleet}" ],
+                  [ "AWS/EC2", "StatusCheckFailed_Instance", "FleetRequestId", "${EC2Fleet}" ],
+                  [ "AWS/EC2", "StatusCheckFailed_System", "FleetRequestId", "${EC2Fleet}" ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Fleet Health Status",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+  # ----------------------------------------------------------------
+  # CloudWatch Alarms
+  # ----------------------------------------------------------------
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${FleetName}-high-cpu-utilization'
+      AlarmDescription: 'High CPU utilization across fleet instances'
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FleetRequestId
+          Value: !Ref EC2Fleet
+      AlarmActions:
+        - !Ref FleetNotificationTopic
+
+  FleetCapacityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateSpotFleet
+    Properties:
+      AlarmName: !Sub '${FleetName}-spot-fleet-capacity-shortfall'
+      AlarmDescription: 'Spot fleet capacity shortfall'
+      MetricName: FulfilledCapacity
+      Namespace: AWS/EC2Spot
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 2
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: FleetRequestId
+          Value: !Ref SpotFleet
+      AlarmActions:
+        - !Ref FleetNotificationTopic
+
+  # ----------------------------------------------------------------
+  # SNS Topic for Notifications
+  # ----------------------------------------------------------------
+  FleetNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${FleetName}-notifications'
+      DisplayName: !Sub '${FleetName} Fleet Notifications'
+      Tags:
+        - Key: Name
+          Value: !Sub '${FleetName}-notifications'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+# ====================================================================
+# OUTPUTS
+# ====================================================================
+Outputs:
+  FleetId:
+    Description: 'EC2 Fleet ID'
+    Value: !Ref EC2Fleet
+    Export:
+      Name: !Sub '${AWS::StackName}-FleetId'
+
+  SpotFleetId:
+    Condition: CreateSpotFleet
+    Description: 'Spot Fleet Request ID'
+    Value: !Ref SpotFleet
+    Export:
+      Name: !Sub '${AWS::StackName}-SpotFleetId'
+
+  LaunchTemplateId:
+    Description: 'Launch Template ID'
+    Value: !Ref FleetLaunchTemplate
+    Export:
+      Name: !Sub '${AWS::StackName}-LaunchTemplateId'
+
+  SecurityGroupId:
+    Description: 'Security Group ID for fleet instances'
+    Value: !Ref FleetSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroupId'
+
+  ServiceRoleArn:
+    Description: 'IAM Service Role ARN for fleet operations'
+    Value: !GetAtt FleetServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceRoleArn'
+
+  SpotFleetServiceRoleArn:
+    Condition: CreateSpotFleet
+    Description: 'IAM Service Role ARN for Spot Fleet operations'
+    Value: !GetAtt SpotFleetServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SpotFleetServiceRoleArn'
+
+  DashboardUrl:
+    Condition: CreateDashboard
+    Description: 'CloudWatch Dashboard URL'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${FleetName}-monitoring-dashboard'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardUrl'
+
+  NotificationTopicArn:
+    Description: 'SNS Topic ARN for fleet notifications'
+    Value: !Ref FleetNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopicArn'
+
+  TotalTargetCapacity:
+    Description: 'Total target capacity configured for the fleet'
+    Value: !Ref TotalTargetCapacity
+    Export:
+      Name: !Sub '${AWS::StackName}-TotalTargetCapacity'
+
+  OnDemandTargetCapacity:
+    Description: 'On-Demand target capacity configured for the fleet'
+    Value: !Ref OnDemandTargetCapacity
+    Export:
+      Name: !Sub '${AWS::StackName}-OnDemandTargetCapacity'
+
+  SpotTargetCapacity:
+    Description: 'Spot target capacity configured for the fleet'
+    Value: !Ref SpotTargetCapacity
+    Export:
+      Name: !Sub '${AWS::StackName}-SpotTargetCapacity'
+
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for the fleet (USD) - based on t3.micro pricing'
+    Value: !Sub 
+      - '${Cost}'
+      - Cost: !Join
+        - ''
+        - - '$'
+          - !Ref TotalTargetCapacity
+          - ' x $15/month (approximate)'
+    Export:
+      Name: !Sub '${AWS::StackName}-EstimatedMonthlyCost'

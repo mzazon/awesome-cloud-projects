@@ -1,0 +1,587 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Data Warehousing Solutions with Redshift
+  Creates a complete Redshift Serverless data warehouse with S3 integration,
+  IAM roles, and sample data for analytics workloads.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    Description: Environment name for resource tagging and naming
+
+  AdminUsername:
+    Type: String
+    Default: awsuser
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9_]*$
+    Description: Admin username for Redshift database (alphanumeric and underscore only)
+
+  AdminPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 64
+    AllowedPattern: ^[a-zA-Z0-9!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]*$
+    ConstraintDescription: Must be 8-64 characters with at least one uppercase, lowercase, number, and special character
+    Description: Admin password for Redshift database
+
+  DefaultDatabase:
+    Type: String
+    Default: sampledb
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9_]*$
+    Description: Default database name in Redshift namespace
+
+  BaseCapacity:
+    Type: Number
+    Default: 128
+    AllowedValues: [32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 264, 272, 280, 288, 296, 304, 312, 320, 328, 336, 344, 352, 360, 368, 376, 384, 392, 400, 408, 416, 424, 432, 440, 448, 456, 464, 472, 480, 488, 496, 504, 512]
+    Description: Base capacity for Redshift Serverless workgroup in RPUs (Redshift Processing Units)
+
+  PubliclyAccessible:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether the Redshift workgroup should be publicly accessible
+
+  EnableCloudWatchLogging:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable CloudWatch logging for Redshift workgroup
+
+  S3BucketName:
+    Type: String
+    Default: ''
+    Description: Optional custom S3 bucket name (leave empty for auto-generated name)
+
+Conditions:
+  CreateS3Bucket: !Equals [!Ref S3BucketName, '']
+  EnableLogging: !Equals [!Ref EnableCloudWatchLogging, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # S3 Bucket for data storage
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateS3Bucket
+    Properties:
+      BucketName: !Sub 'redshift-data-${Environment}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [IsProduction, Enabled, Suspended]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3LogGroup
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: RedshiftDataWarehouse
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudWatch Log Group for S3 events
+  S3LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/redshift-data-${Environment}'
+      RetentionInDays: !If [IsProduction, 90, 30]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: S3DataLogging
+
+  # IAM Role for Redshift Serverless
+  RedshiftServerlessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'RedshiftServerlessRole-${Environment}-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: redshift.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+      Policies:
+        - PolicyName: RedshiftServerlessDataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !If 
+                    - CreateS3Bucket
+                    - !GetAtt DataBucket.Arn
+                    - !Sub 'arn:aws:s3:::${S3BucketName}'
+                  - !If 
+                    - CreateS3Bucket
+                    - !Sub '${DataBucket.Arn}/*'
+                    - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/redshift/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: RedshiftServerlessAccess
+
+  # CloudWatch Log Group for Redshift
+  RedshiftLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: !Sub '/aws/redshift/serverless/${Environment}'
+      RetentionInDays: !If [IsProduction, 90, 30]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: RedshiftServerlessLogging
+
+  # Redshift Serverless Namespace
+  RedshiftNamespace:
+    Type: AWS::RedshiftServerless::Namespace
+    Properties:
+      NamespaceName: !Sub 'data-warehouse-ns-${Environment}'
+      AdminUsername: !Ref AdminUsername
+      AdminUserPassword: !Ref AdminPassword
+      DbName: !Ref DefaultDatabase
+      DefaultIamRoleArn: !GetAtt RedshiftServerlessRole.Arn
+      IamRoles:
+        - !GetAtt RedshiftServerlessRole.Arn
+      KmsKeyId: alias/aws/redshift
+      LogExports: !If
+        - EnableLogging
+        - - useractivitylog
+          - userlog
+          - connectionlog
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: DataWarehouse
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Redshift Serverless Workgroup
+  RedshiftWorkgroup:
+    Type: AWS::RedshiftServerless::Workgroup
+    Properties:
+      WorkgroupName: !Sub 'data-warehouse-wg-${Environment}'
+      NamespaceName: !Ref RedshiftNamespace
+      BaseCapacity: !Ref BaseCapacity
+      PubliclyAccessible: !Ref PubliclyAccessible
+      EnhancedVpcRouting: false
+      ConfigParameters:
+        - ParameterKey: enable_case_sensitive_identifier
+          ParameterValue: 'false'
+        - ParameterKey: max_query_execution_time
+          ParameterValue: '14400'  # 4 hours
+        - ParameterKey: query_group
+          ParameterValue: 'default'
+        - ParameterKey: search_path
+          ParameterValue: '$user,public'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: DataWarehouseCompute
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudWatch Dashboard for monitoring
+  RedshiftDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'RedshiftServerless-${Environment}-Dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Redshift-Serverless", "ComputeCapacity", "WorkgroupName", "${RedshiftWorkgroup}" ],
+                  [ ".", "ComputeSeconds", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Redshift Serverless Compute Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Redshift-Serverless", "DatabaseConnections", "WorkgroupName", "${RedshiftWorkgroup}" ],
+                  [ ".", "QueriesCompleted", ".", "." ],
+                  [ ".", "QueriesFailed", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Redshift Serverless Query Metrics",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms for monitoring
+  HighComputeUsageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'RedshiftServerless-HighComputeUsage-${Environment}'
+      AlarmDescription: 'High compute usage detected in Redshift Serverless workgroup'
+      MetricName: ComputeCapacity
+      Namespace: AWS/Redshift-Serverless
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref BaseCapacity
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: WorkgroupName
+          Value: !Ref RedshiftWorkgroup
+      AlarmActions: !If
+        - IsProduction
+        - - !Ref SNSTopicArn
+        - !Ref AWS::NoValue
+      TreatMissingData: notBreaching
+
+  # SNS Topic for production alerts (only in production)
+  SNSTopicArn:
+    Type: AWS::SNS::Topic
+    Condition: IsProduction
+    Properties:
+      TopicName: !Sub 'RedshiftServerless-Alerts-${Environment}'
+      DisplayName: 'Redshift Serverless Alerts'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: RedshiftAlerting
+
+# Sample data creation using Lambda Custom Resource
+  SampleDataFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'redshift-sample-data-${Environment}'
+      Runtime: python3.11
+      Handler: index.handler
+      Timeout: 300
+      Role: !GetAtt SampleDataLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+          import csv
+          import io
+          
+          def handler(event, context):
+              try:
+                  s3 = boto3.client('s3')
+                  bucket_name = event['ResourceProperties']['BucketName']
+                  
+                  if event['RequestType'] == 'Create':
+                      # Create sample sales data
+                      sales_data = [
+                          ['order_id', 'customer_id', 'product_id', 'quantity', 'price', 'order_date'],
+                          ['1001', '501', '2001', '2', '29.99', '2024-01-15'],
+                          ['1002', '502', '2002', '1', '49.99', '2024-01-15'],
+                          ['1003', '503', '2001', '3', '29.99', '2024-01-16'],
+                          ['1004', '501', '2003', '1', '79.99', '2024-01-16'],
+                          ['1005', '504', '2002', '2', '49.99', '2024-01-17']
+                      ]
+                      
+                      # Create sample customer data
+                      customer_data = [
+                          ['customer_id', 'first_name', 'last_name', 'email', 'city', 'state'],
+                          ['501', 'John', 'Doe', 'john.doe@email.com', 'Seattle', 'WA'],
+                          ['502', 'Jane', 'Smith', 'jane.smith@email.com', 'Portland', 'OR'],
+                          ['503', 'Mike', 'Johnson', 'mike.johnson@email.com', 'San Francisco', 'CA'],
+                          ['504', 'Sarah', 'Wilson', 'sarah.wilson@email.com', 'Los Angeles', 'CA']
+                      ]
+                      
+                      # Upload sales data
+                      sales_csv = io.StringIO()
+                      writer = csv.writer(sales_csv)
+                      writer.writerows(sales_data)
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key='data/sales_data.csv',
+                          Body=sales_csv.getvalue(),
+                          ContentType='text/csv'
+                      )
+                      
+                      # Upload customer data
+                      customer_csv = io.StringIO()
+                      writer = csv.writer(customer_csv)
+                      writer.writerows(customer_data)
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key='data/customer_data.csv',
+                          Body=customer_csv.getvalue(),
+                          ContentType='text/csv'
+                      )
+                      
+                      # Create SQL scripts
+                      create_tables_sql = """
+                      CREATE TABLE sales (
+                          order_id INTEGER,
+                          customer_id INTEGER,
+                          product_id INTEGER,
+                          quantity INTEGER,
+                          price DECIMAL(10,2),
+                          order_date DATE
+                      );
+                      
+                      CREATE TABLE customers (
+                          customer_id INTEGER,
+                          first_name VARCHAR(50),
+                          last_name VARCHAR(50),
+                          email VARCHAR(100),
+                          city VARCHAR(50),
+                          state VARCHAR(2)
+                      );
+                      """
+                      
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key='sql/create_tables.sql',
+                          Body=create_tables_sql,
+                          ContentType='text/plain'
+                      )
+                      
+                      load_data_sql = f"""
+                      COPY sales FROM 's3://{bucket_name}/data/sales_data.csv'
+                      IAM_ROLE 'arn:aws:iam::{context.invoked_function_arn.split(':')[4]}:role/{event['ResourceProperties']['RoleName']}'
+                      CSV
+                      IGNOREHEADER 1;
+                      
+                      COPY customers FROM 's3://{bucket_name}/data/customer_data.csv'
+                      IAM_ROLE 'arn:aws:iam::{context.invoked_function_arn.split(':')[4]}:role/{event['ResourceProperties']['RoleName']}'
+                      CSV
+                      IGNOREHEADER 1;
+                      """
+                      
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key='sql/load_data.sql',
+                          Body=load_data_sql,
+                          ContentType='text/plain'
+                      )
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': 'Sample data created successfully'})
+                  
+                  elif event['RequestType'] == 'Delete':
+                      # Clean up sample data
+                      try:
+                          objects_to_delete = s3.list_objects_v2(Bucket=bucket_name, Prefix='data/')
+                          if 'Contents' in objects_to_delete:
+                              delete_keys = [{'Key': obj['Key']} for obj in objects_to_delete['Contents']]
+                              s3.delete_objects(Bucket=bucket_name, Delete={'Objects': delete_keys})
+                          
+                          sql_objects = s3.list_objects_v2(Bucket=bucket_name, Prefix='sql/')
+                          if 'Contents' in sql_objects:
+                              delete_keys = [{'Key': obj['Key']} for obj in sql_objects['Contents']]
+                              s3.delete_objects(Bucket=bucket_name, Delete={'Objects': delete_keys})
+                      except Exception as e:
+                          print(f"Error during cleanup: {str(e)}")
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': 'Sample data cleaned up'})
+                  
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': 'No action required'})
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Message': str(e)})
+
+  SampleDataLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3DataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !If 
+                    - CreateS3Bucket
+                    - !GetAtt DataBucket.Arn
+                    - !Sub 'arn:aws:s3:::${S3BucketName}'
+                  - !If 
+                    - CreateS3Bucket
+                    - !Sub '${DataBucket.Arn}/*'
+                    - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+
+  SampleDataResource:
+    Type: Custom::SampleData
+    Properties:
+      ServiceToken: !GetAtt SampleDataFunction.Arn
+      BucketName: !If 
+        - CreateS3Bucket
+        - !Ref DataBucket
+        - !Ref S3BucketName
+      RoleName: !Ref RedshiftServerlessRole
+
+Outputs:
+  RedshiftNamespaceName:
+    Description: Name of the Redshift Serverless namespace
+    Value: !Ref RedshiftNamespace
+    Export:
+      Name: !Sub '${AWS::StackName}-NamespaceName'
+
+  RedshiftWorkgroupName:
+    Description: Name of the Redshift Serverless workgroup
+    Value: !Ref RedshiftWorkgroup
+    Export:
+      Name: !Sub '${AWS::StackName}-WorkgroupName'
+
+  RedshiftWorkgroupEndpoint:
+    Description: Endpoint address for the Redshift Serverless workgroup
+    Value: !GetAtt RedshiftWorkgroup.Workgroup.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-WorkgroupEndpoint'
+
+  RedshiftWorkgroupPort:
+    Description: Port for the Redshift Serverless workgroup
+    Value: !GetAtt RedshiftWorkgroup.Workgroup.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-WorkgroupPort'
+
+  DatabaseName:
+    Description: Name of the default database
+    Value: !Ref DefaultDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseName'
+
+  AdminUsername:
+    Description: Admin username for the database
+    Value: !Ref AdminUsername
+    Export:
+      Name: !Sub '${AWS::StackName}-AdminUsername'
+
+  S3BucketName:
+    Description: Name of the S3 bucket for data storage
+    Value: !If 
+      - CreateS3Bucket
+      - !Ref DataBucket
+      - !Ref S3BucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketName'
+
+  IAMRoleArn:
+    Description: ARN of the IAM role for Redshift Serverless
+    Value: !GetAtt RedshiftServerlessRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IAMRoleArn'
+
+  CloudWatchDashboardURL:
+    Description: URL to the CloudWatch dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${RedshiftDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  QueryEditorURL:
+    Description: URL to Redshift Query Editor v2
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/sqlworkbench/home?region=${AWS::Region}'
+    Export:
+      Name: !Sub '${AWS::StackName}-QueryEditorURL'
+
+  SampleDataLocation:
+    Description: S3 location of sample data files
+    Value: !Sub 
+      - 's3://${BucketName}/data/'
+      - BucketName: !If 
+        - CreateS3Bucket
+        - !Ref DataBucket
+        - !Ref S3BucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-SampleDataLocation'
+
+  ConnectionInstructions:
+    Description: Instructions for connecting to the Redshift workgroup
+    Value: !Sub |
+      Use the following connection details:
+      Endpoint: ${RedshiftWorkgroup.Workgroup.Endpoint.Address}
+      Port: ${RedshiftWorkgroup.Workgroup.Endpoint.Port}
+      Database: ${DefaultDatabase}
+      Username: ${AdminUsername}
+      Password: [Use the password you provided during stack creation]
+    Export:
+      Name: !Sub '${AWS::StackName}-ConnectionInstructions'

@@ -1,0 +1,874 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Circuit Breaker Pattern Implementation using AWS Step Functions, Lambda, and DynamoDB'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'test', 'staging', 'prod']
+    Description: 'Environment name for resource naming and tagging'
+  
+  ProjectName:
+    Type: String
+    Default: 'circuit-breaker'
+    Description: 'Project name used for resource naming'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be lowercase, start with letter, contain only letters, numbers, and hyphens'
+  
+  DownstreamServiceFailureRate:
+    Type: String
+    Default: '0.3'
+    Description: 'Simulated failure rate for downstream service (0.0 to 1.0)'
+    AllowedPattern: '^0\.[0-9]$|^1\.0$'
+    ConstraintDescription: 'Must be a decimal between 0.0 and 1.0'
+  
+  DownstreamServiceLatencyMs:
+    Type: Number
+    Default: 200
+    MinValue: 50
+    MaxValue: 5000
+    Description: 'Simulated latency for downstream service in milliseconds'
+  
+  CircuitBreakerFailureThreshold:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+    Description: 'Number of failures before circuit breaker trips to OPEN state'
+  
+  EnableCloudWatchAlarms:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable CloudWatch alarms for circuit breaker monitoring'
+
+Conditions:
+  CreateCloudWatchAlarms: !Equals [!Ref EnableCloudWatchAlarms, 'true']
+  IsProdEnvironment: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # DynamoDB Table for Circuit Breaker State
+  CircuitBreakerStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-circuit-breaker-state-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ServiceName
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ServiceName
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProdEnvironment, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Circuit Breaker State Storage'
+
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt CircuitBreakerStateTable.Arn
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for Step Functions
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-stepfunctions-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaInvokeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt DownstreamServiceFunction.Arn
+                  - !GetAtt FallbackServiceFunction.Arn
+                  - !GetAtt HealthCheckFunction.Arn
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt CircuitBreakerStateTable.Arn
+        - PolicyName: CloudWatchMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Downstream Service Lambda Function
+  DownstreamServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-downstream-service-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          FAILURE_RATE: !Ref DownstreamServiceFailureRate
+          LATENCY_MS: !Ref DownstreamServiceLatencyMs
+      Code:
+        ZipFile: |
+          import json
+          import random
+          import time
+          import os
+          import boto3
+
+          cloudwatch = boto3.client('cloudwatch')
+
+          def lambda_handler(event, context):
+              # Get configuration from environment variables
+              failure_rate = float(os.environ.get('FAILURE_RATE', '0.3'))
+              latency_ms = int(os.environ.get('LATENCY_MS', '100'))
+              
+              # Simulate latency
+              time.sleep(latency_ms / 1000)
+              
+              # Put custom metric for service calls
+              try:
+                  cloudwatch.put_metric_data(
+                      Namespace='CircuitBreaker',
+                      MetricData=[
+                          {
+                              'MetricName': 'ServiceCalls',
+                              'Value': 1,
+                              'Unit': 'Count',
+                              'Dimensions': [
+                                  {
+                                      'Name': 'ServiceName',
+                                      'Value': 'downstream-service'
+                                  }
+                              ]
+                          }
+                      ]
+                  )
+              except Exception as e:
+                  print(f"Failed to put metric: {e}")
+              
+              # Simulate failures based on failure rate
+              if random.random() < failure_rate:
+                  # Put failure metric
+                  try:
+                      cloudwatch.put_metric_data(
+                          Namespace='CircuitBreaker',
+                          MetricData=[
+                              {
+                                  'MetricName': 'ServiceFailures',
+                                  'Value': 1,
+                                  'Unit': 'Count',
+                                  'Dimensions': [
+                                      {
+                                          'Name': 'ServiceName',
+                                          'Value': 'downstream-service'
+                                      }
+                                  ]
+                              }
+                          ]
+                      )
+                  except Exception as e:
+                      print(f"Failed to put failure metric: {e}")
+                  
+                  raise Exception("Service temporarily unavailable")
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': 'Service response successful',
+                      'timestamp': context.aws_request_id,
+                      'service': 'downstream-service'
+                  })
+              }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Simulated Downstream Service'
+
+  # Fallback Service Lambda Function
+  FallbackServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-fallback-service-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime
+
+          cloudwatch = boto3.client('cloudwatch')
+
+          def lambda_handler(event, context):
+              # Put metric for fallback service usage
+              try:
+                  cloudwatch.put_metric_data(
+                      Namespace='CircuitBreaker',
+                      MetricData=[
+                          {
+                              'MetricName': 'FallbackActivations',
+                              'Value': 1,
+                              'Unit': 'Count',
+                              'Dimensions': [
+                                  {
+                                      'Name': 'ServiceName',
+                                      'Value': 'fallback-service'
+                                  }
+                              ]
+                          }
+                      ]
+                  )
+              except Exception as e:
+                  print(f"Failed to put metric: {e}")
+              
+              # Provide fallback response when primary service is unavailable
+              fallback_data = {
+                  'message': 'Fallback service response - primary service unavailable',
+                  'timestamp': datetime.utcnow().isoformat(),
+                  'source': 'fallback-service',
+                  'original_request': event.get('original_request', {}),
+                  'fallback_reason': 'Circuit breaker is open or service failure detected',
+                  'service_level': 'degraded'
+              }
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(fallback_data)
+              }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Fallback Service for Circuit Breaker'
+
+  # Health Check Lambda Function
+  HealthCheckFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-health-check-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          CIRCUIT_BREAKER_TABLE: !Ref CircuitBreakerStateTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import random
+          from datetime import datetime
+
+          dynamodb = boto3.resource('dynamodb')
+          cloudwatch = boto3.client('cloudwatch')
+
+          def lambda_handler(event, context):
+              table_name = event.get('table_name', os.environ.get('CIRCUIT_BREAKER_TABLE'))
+              service_name = event.get('service_name', 'default-service')
+              
+              table = dynamodb.Table(table_name)
+              
+              try:
+                  # Get current circuit breaker state
+                  response = table.get_item(
+                      Key={'ServiceName': service_name}
+                  )
+                  
+                  if 'Item' not in response:
+                      # Initialize circuit breaker state if not exists
+                      table.put_item(
+                          Item={
+                              'ServiceName': service_name,
+                              'State': 'CLOSED',
+                              'FailureCount': 0,
+                              'LastFailureTime': None,
+                              'LastSuccessTime': datetime.utcnow().isoformat()
+                          }
+                      )
+                      state = 'CLOSED'
+                  else:
+                      item = response['Item']
+                      state = item['State']
+                  
+                  # Simulate health check (70% success rate for demonstration)
+                  health_check_success = random.random() > 0.3
+                  
+                  # Put health check metric
+                  try:
+                      cloudwatch.put_metric_data(
+                          Namespace='CircuitBreaker',
+                          MetricData=[
+                              {
+                                  'MetricName': 'HealthChecks',
+                                  'Value': 1 if health_check_success else 0,
+                                  'Unit': 'Count',
+                                  'Dimensions': [
+                                      {
+                                          'Name': 'ServiceName',
+                                          'Value': service_name
+                                      }
+                                  ]
+                              }
+                          ]
+                      )
+                  except Exception as e:
+                      print(f"Failed to put health check metric: {e}")
+                  
+                  if health_check_success:
+                      # Reset circuit breaker to CLOSED on successful health check
+                      table.put_item(
+                          Item={
+                              'ServiceName': service_name,
+                              'State': 'CLOSED',
+                              'FailureCount': 0,
+                              'LastFailureTime': None,
+                              'LastSuccessTime': datetime.utcnow().isoformat()
+                          }
+                      )
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'service_name': service_name,
+                              'health_status': 'healthy',
+                              'circuit_state': 'CLOSED',
+                              'timestamp': datetime.utcnow().isoformat()
+                          })
+                      }
+                  else:
+                      return {
+                          'statusCode': 503,
+                          'body': json.dumps({
+                              'service_name': service_name,
+                              'health_status': 'unhealthy',
+                              'circuit_state': state,
+                              'timestamp': datetime.utcnow().isoformat()
+                          })
+                      }
+              
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'service_name': service_name
+                      })
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Health Check for Circuit Breaker Recovery'
+
+  # Step Functions State Machine for Circuit Breaker
+  CircuitBreakerStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-circuit-breaker-${Environment}'
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Circuit Breaker Pattern Implementation with configurable failure threshold",
+          "StartAt": "CheckCircuitBreakerState",
+          "States": {
+            "CheckCircuitBreakerState": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:getItem",
+              "Parameters": {
+                "TableName": "${CircuitBreakerStateTable}",
+                "Key": {
+                  "ServiceName": {
+                    "S.$": "$.service_name"
+                  }
+                }
+              },
+              "ResultPath": "$.circuit_state",
+              "Next": "EvaluateCircuitState",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "InitializeCircuitBreaker",
+                  "ResultPath": "$.error"
+                }
+              ]
+            },
+            "InitializeCircuitBreaker": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:putItem",
+              "Parameters": {
+                "TableName": "${CircuitBreakerStateTable}",
+                "Item": {
+                  "ServiceName": {
+                    "S.$": "$.service_name"
+                  },
+                  "State": {
+                    "S": "CLOSED"
+                  },
+                  "FailureCount": {
+                    "N": "0"
+                  },
+                  "LastFailureTime": {
+                    "NULL": true
+                  },
+                  "LastSuccessTime": {
+                    "S.$": "$$.State.EnteredTime"
+                  }
+                }
+              },
+              "Next": "CallDownstreamService",
+              "ResultPath": "$.init_result"
+            },
+            "EvaluateCircuitState": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.circuit_state.Item.State.S",
+                  "StringEquals": "OPEN",
+                  "Next": "CheckIfHalfOpenTime"
+                },
+                {
+                  "Variable": "$.circuit_state.Item.State.S",
+                  "StringEquals": "HALF_OPEN",
+                  "Next": "CallDownstreamService"
+                },
+                {
+                  "Variable": "$.circuit_state.Item.State.S",
+                  "StringEquals": "CLOSED",
+                  "Next": "CallDownstreamService"
+                }
+              ],
+              "Default": "CallDownstreamService"
+            },
+            "CheckIfHalfOpenTime": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${HealthCheckFunction}",
+                "Payload": {
+                  "table_name": "${CircuitBreakerStateTable}",
+                  "service_name.$": "$.service_name"
+                }
+              },
+              "ResultPath": "$.health_check_result",
+              "Next": "EvaluateHealthCheck",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ]
+            },
+            "EvaluateHealthCheck": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.health_check_result.Payload.statusCode",
+                  "NumericEquals": 200,
+                  "Next": "CallDownstreamService"
+                }
+              ],
+              "Default": "CallFallbackService"
+            },
+            "CallDownstreamService": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${DownstreamServiceFunction}",
+                "Payload.$": "$.request_payload"
+              },
+              "ResultPath": "$.service_result",
+              "Next": "RecordSuccess",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "RecordFailure",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 1,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ]
+            },
+            "RecordSuccess": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:updateItem",
+              "Parameters": {
+                "TableName": "${CircuitBreakerStateTable}",
+                "Key": {
+                  "ServiceName": {
+                    "S.$": "$.service_name"
+                  }
+                },
+                "UpdateExpression": "SET #state = :closed_state, FailureCount = :zero, LastSuccessTime = :timestamp",
+                "ExpressionAttributeNames": {
+                  "#state": "State"
+                },
+                "ExpressionAttributeValues": {
+                  ":closed_state": {
+                    "S": "CLOSED"
+                  },
+                  ":zero": {
+                    "N": "0"
+                  },
+                  ":timestamp": {
+                    "S.$": "$$.State.EnteredTime"
+                  }
+                }
+              },
+              "Next": "PublishSuccessMetric"
+            },
+            "PublishSuccessMetric": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:cloudwatch:putMetricData",
+              "Parameters": {
+                "Namespace": "CircuitBreaker",
+                "MetricData": [
+                  {
+                    "MetricName": "CircuitBreakerSuccess",
+                    "Value": 1,
+                    "Unit": "Count",
+                    "Dimensions": [
+                      {
+                        "Name": "ServiceName",
+                        "Value.$": "$.service_name"
+                      }
+                    ]
+                  }
+                ]
+              },
+              "Next": "ReturnSuccess",
+              "ResultPath": "$.metric_result"
+            },
+            "RecordFailure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:updateItem",
+              "Parameters": {
+                "TableName": "${CircuitBreakerStateTable}",
+                "Key": {
+                  "ServiceName": {
+                    "S.$": "$.service_name"
+                  }
+                },
+                "UpdateExpression": "SET FailureCount = FailureCount + :inc, LastFailureTime = :timestamp",
+                "ExpressionAttributeValues": {
+                  ":inc": {
+                    "N": "1"
+                  },
+                  ":timestamp": {
+                    "S.$": "$$.State.EnteredTime"
+                  }
+                }
+              },
+              "ResultPath": "$.update_result",
+              "Next": "CheckFailureThreshold"
+            },
+            "CheckFailureThreshold": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:getItem",
+              "Parameters": {
+                "TableName": "${CircuitBreakerStateTable}",
+                "Key": {
+                  "ServiceName": {
+                    "S.$": "$.service_name"
+                  }
+                }
+              },
+              "ResultPath": "$.current_state",
+              "Next": "EvaluateFailureCount"
+            },
+            "EvaluateFailureCount": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.current_state.Item.FailureCount.N",
+                  "NumericGreaterThanEquals": ${CircuitBreakerFailureThreshold},
+                  "Next": "TripCircuitBreaker"
+                }
+              ],
+              "Default": "CallFallbackService"
+            },
+            "TripCircuitBreaker": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:updateItem",
+              "Parameters": {
+                "TableName": "${CircuitBreakerStateTable}",
+                "Key": {
+                  "ServiceName": {
+                    "S.$": "$.service_name"
+                  }
+                },
+                "UpdateExpression": "SET #state = :open_state",
+                "ExpressionAttributeNames": {
+                  "#state": "State"
+                },
+                "ExpressionAttributeValues": {
+                  ":open_state": {
+                    "S": "OPEN"
+                  }
+                }
+              },
+              "Next": "PublishCircuitOpenMetric"
+            },
+            "PublishCircuitOpenMetric": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:cloudwatch:putMetricData",
+              "Parameters": {
+                "Namespace": "CircuitBreaker",
+                "MetricData": [
+                  {
+                    "MetricName": "CircuitBreakerOpen",
+                    "Value": 1,
+                    "Unit": "Count",
+                    "Dimensions": [
+                      {
+                        "Name": "ServiceName",
+                        "Value.$": "$.service_name"
+                      }
+                    ]
+                  }
+                ]
+              },
+              "Next": "CallFallbackService",
+              "ResultPath": "$.metric_result"
+            },
+            "CallFallbackService": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${FallbackServiceFunction}",
+                "Payload": {
+                  "original_request.$": "$.request_payload",
+                  "circuit_breaker_state.$": "$.circuit_state.Item.State.S",
+                  "service_name.$": "$.service_name"
+                }
+              },
+              "ResultPath": "$.fallback_result",
+              "Next": "ReturnFallback"
+            },
+            "ReturnSuccess": {
+              "Type": "Pass",
+              "Parameters": {
+                "statusCode": 200,
+                "body.$": "$.service_result.Payload.body",
+                "circuit_breaker_state": "CLOSED",
+                "service_name.$": "$.service_name",
+                "timestamp.$": "$$.State.EnteredTime"
+              },
+              "End": true
+            },
+            "ReturnFallback": {
+              "Type": "Pass",
+              "Parameters": {
+                "statusCode": 200,
+                "body.$": "$.fallback_result.Payload.body",
+                "circuit_breaker_state": "OPEN",
+                "fallback_used": true,
+                "service_name.$": "$.service_name",
+                "timestamp.$": "$$.State.EnteredTime"
+              },
+              "End": true
+            }
+          }
+        }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Circuit Breaker State Machine'
+
+  # CloudWatch Log Group for Step Functions
+  StepFunctionsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/stepfunctions/${ProjectName}-circuit-breaker-${Environment}'
+      RetentionInDays: !If [IsProdEnvironment, 30, 7]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarms (Conditional)
+  CircuitBreakerOpenAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-circuit-breaker-open-${Environment}'
+      AlarmDescription: 'Circuit breaker has been tripped to OPEN state'
+      MetricName: CircuitBreakerOpen
+      Namespace: CircuitBreaker
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ServiceFailureRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-service-failure-rate-${Environment}'
+      AlarmDescription: 'High failure rate detected in downstream service'
+      MetricName: ServiceFailures
+      Namespace: CircuitBreaker
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SNS Topic for Notifications (Optional)
+  CircuitBreakerNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      TopicName: !Sub '${ProjectName}-circuit-breaker-alerts-${Environment}'
+      DisplayName: 'Circuit Breaker Alerts'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  CircuitBreakerStateMachineArn:
+    Description: 'ARN of the Circuit Breaker Step Functions State Machine'
+    Value: !Ref CircuitBreakerStateMachine
+    Export:
+      Name: !Sub '${AWS::StackName}-StateMachineArn'
+
+  CircuitBreakerStateTableName:
+    Description: 'Name of the DynamoDB table storing circuit breaker state'
+    Value: !Ref CircuitBreakerStateTable
+    Export:
+      Name: !Sub '${AWS::StackName}-StateTableName'
+
+  DownstreamServiceFunctionArn:
+    Description: 'ARN of the Downstream Service Lambda Function'
+    Value: !GetAtt DownstreamServiceFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DownstreamServiceArn'
+
+  FallbackServiceFunctionArn:
+    Description: 'ARN of the Fallback Service Lambda Function'
+    Value: !GetAtt FallbackServiceFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FallbackServiceArn'
+
+  HealthCheckFunctionArn:
+    Description: 'ARN of the Health Check Lambda Function'
+    Value: !GetAtt HealthCheckFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-HealthCheckArn'
+
+  CircuitBreakerNotificationTopicArn:
+    Condition: CreateCloudWatchAlarms
+    Description: 'ARN of the SNS topic for circuit breaker notifications'
+    Value: !Ref CircuitBreakerNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopicArn'
+
+  TestExecutionCommand:
+    Description: 'AWS CLI command to test the circuit breaker'
+    Value: !Sub |
+      aws stepfunctions start-execution \
+        --state-machine-arn ${CircuitBreakerStateMachine} \
+        --name "test-execution-$(date +%s)" \
+        --input '{"service_name": "payment-service", "request_payload": {"amount": 100.00, "currency": "USD", "customer_id": "12345"}}'
+
+  MonitoringDashboardUrl:
+    Description: 'CloudWatch Dashboard URL for monitoring circuit breaker metrics'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-circuit-breaker-${Environment}'

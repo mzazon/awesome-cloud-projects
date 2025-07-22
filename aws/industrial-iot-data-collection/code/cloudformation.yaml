@@ -1,0 +1,756 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Industrial IoT Data Collection with AWS IoT SiteWise - Complete infrastructure for manufacturing equipment monitoring and analytics'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "IoT SiteWise Configuration"
+        Parameters:
+          - AssetModelName
+          - AssetInstanceName
+          - GatewayName
+      - Label:
+          default: "Data Storage Configuration"
+        Parameters:
+          - TimestreamDatabaseName
+          - TimestreamTableName
+          - DataRetentionDays
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - TemperatureThreshold
+          - PressureThreshold
+          - NotificationEmail
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - EnableEncryption
+          - KMSKeyId
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      AssetModelName:
+        default: "Asset Model Name"
+      AssetInstanceName:
+        default: "Asset Instance Name"
+      GatewayName:
+        default: "Gateway Name"
+      TimestreamDatabaseName:
+        default: "Timestream Database Name"
+      TimestreamTableName:
+        default: "Timestream Table Name"
+      DataRetentionDays:
+        default: "Data Retention Period (Days)"
+      TemperatureThreshold:
+        default: "Temperature Alert Threshold"
+      PressureThreshold:
+        default: "Pressure Alert Threshold"
+      NotificationEmail:
+        default: "Notification Email"
+      EnableEncryption:
+        default: "Enable Encryption"
+      KMSKeyId:
+        default: "KMS Key ID"
+
+# Input Parameters
+Parameters:
+  ProjectName:
+    Type: String
+    Default: manufacturing-plant
+    Description: Name of the manufacturing project
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '[a-zA-Z0-9-]*'
+    ConstraintDescription: Must contain only alphanumeric characters and hyphens
+
+  Environment:
+    Type: String
+    Default: development
+    AllowedValues:
+      - development
+      - testing
+      - production
+    Description: Environment for deployment
+
+  AssetModelName:
+    Type: String
+    Default: ProductionLineEquipment
+    Description: Name for the IoT SiteWise asset model
+    MinLength: 1
+    MaxLength: 256
+
+  AssetInstanceName:
+    Type: String
+    Default: ProductionLine-A-Pump-001
+    Description: Name for the physical asset instance
+    MinLength: 1
+    MaxLength: 256
+
+  GatewayName:
+    Type: String
+    Default: manufacturing-gateway
+    Description: Name for the IoT SiteWise gateway
+    MinLength: 1
+    MaxLength: 256
+
+  TimestreamDatabaseName:
+    Type: String
+    Default: industrial-data
+    Description: Name for the Timestream database
+    MinLength: 3
+    MaxLength: 64
+    AllowedPattern: '[a-zA-Z0-9_-]*'
+    ConstraintDescription: Must contain only alphanumeric characters, underscores, and hyphens
+
+  TimestreamTableName:
+    Type: String
+    Default: equipment-metrics
+    Description: Name for the Timestream table
+    MinLength: 3
+    MaxLength: 64
+    AllowedPattern: '[a-zA-Z0-9_-]*'
+    ConstraintDescription: Must contain only alphanumeric characters, underscores, and hyphens
+
+  DataRetentionDays:
+    Type: Number
+    Default: 365
+    MinValue: 1
+    MaxValue: 7300
+    Description: Number of days to retain data in magnetic storage
+
+  TemperatureThreshold:
+    Type: Number
+    Default: 80.0
+    MinValue: 0
+    MaxValue: 200
+    Description: Temperature threshold for CloudWatch alarms (Celsius)
+
+  PressureThreshold:
+    Type: Number
+    Default: 60.0
+    MinValue: 0
+    MaxValue: 1000
+    Description: Pressure threshold for CloudWatch alarms (PSI)
+
+  NotificationEmail:
+    Type: String
+    Default: admin@example.com
+    Description: Email address for alert notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+
+  EnableEncryption:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable encryption for data at rest
+
+  KMSKeyId:
+    Type: String
+    Default: alias/aws/iotsitewise
+    Description: KMS key ID for encryption (use alias/aws/iotsitewise for default)
+
+# Conditional Resources
+Conditions:
+  IsProduction: !Equals [!Ref Environment, production]
+  EnableEncryptionCondition: !Equals [!Ref EnableEncryption, 'true']
+  UseCustomKMSKey: !Not [!Equals [!Ref KMSKeyId, alias/aws/iotsitewise]]
+
+# Template Resources
+Resources:
+  # IAM Role for IoT SiteWise
+  IoTSiteWiseServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-iotsitewise-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iotsitewise.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSIoTSiteWiseServiceRolePolicy
+      Policies:
+        - PolicyName: TimestreamAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - timestream:WriteRecords
+                  - timestream:DescribeEndpoints
+                Resource: !Sub '${TimestreamTable.Arn}'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: !If
+                  - UseCustomKMSKey
+                  - !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/${KMSKeyId}'
+                  - !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 'timestream.${AWS::Region}.amazonaws.com'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Topic for Alerts
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-equipment-alerts'
+      DisplayName: Equipment Monitoring Alerts
+      KmsMasterKeyId: !If
+        - EnableEncryptionCondition
+        - !Ref KMSKeyId
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Subscription for Email Notifications
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AlertTopic
+      Endpoint: !Ref NotificationEmail
+
+  # Timestream Database
+  TimestreamDatabase:
+    Type: AWS::Timestream::Database
+    Properties:
+      DatabaseName: !Sub '${TimestreamDatabaseName}-${AWS::AccountId}'
+      KmsKeyId: !If
+        - EnableEncryptionCondition
+        - !Ref KMSKeyId
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Timestream Table
+  TimestreamTable:
+    Type: AWS::Timestream::Table
+    Properties:
+      DatabaseName: !Ref TimestreamDatabase
+      TableName: !Ref TimestreamTableName
+      RetentionProperties:
+        MemoryStoreRetentionPeriodInHours: 24
+        MagneticStoreRetentionPeriodInDays: !Ref DataRetentionDays
+      MagneticStoreWriteProperties:
+        EnableMagneticStoreWrites: true
+        MagneticStoreRejectedDataLocation:
+          S3Configuration:
+            BucketName: !Ref ErrorDataBucket
+            ObjectKeyPrefix: rejected-data/
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # S3 Bucket for Error Data Storage
+  ErrorDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-error-data-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If
+                - EnableEncryptionCondition
+                - aws:kms
+                - AES256
+              KMSMasterKeyID: !If
+                - EnableEncryptionCondition
+                - !Ref KMSKeyId
+                - !Ref AWS::NoValue
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldErrorData
+            Status: Enabled
+            ExpirationInDays: !If
+              - IsProduction
+              - 90
+              - 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IoT SiteWise Asset Model
+  AssetModel:
+    Type: AWS::IoTSiteWise::AssetModel
+    Properties:
+      AssetModelName: !Ref AssetModelName
+      AssetModelDescription: 'Asset model for production line machinery monitoring'
+      AssetModelProperties:
+        # Temperature Measurement Property
+        - Name: Temperature
+          DataType: DOUBLE
+          Unit: Celsius
+          Type:
+            TypeName: Measurement
+        # Pressure Measurement Property
+        - Name: Pressure
+          DataType: DOUBLE
+          Unit: PSI
+          Type:
+            TypeName: Measurement
+        # Operational Efficiency Transform Property
+        - Name: OperationalEfficiency
+          DataType: DOUBLE
+          Unit: Percent
+          Type:
+            TypeName: Transform
+            Transform:
+              Expression: 'temp / 100 * pressure / 50'
+              Variables:
+                - Name: temp
+                  Value:
+                    PropertyLogicalId: Temperature
+                - Name: pressure
+                  Value:
+                    PropertyLogicalId: Pressure
+        # Equipment Status Attribute
+        - Name: EquipmentStatus
+          DataType: STRING
+          DefaultValue: 'OPERATIONAL'
+          Type:
+            TypeName: Attribute
+        # Last Maintenance Date Attribute
+        - Name: LastMaintenanceDate
+          DataType: STRING
+          Type:
+            TypeName: Attribute
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IoT SiteWise Asset Instance
+  AssetInstance:
+    Type: AWS::IoTSiteWise::Asset
+    Properties:
+      AssetName: !Ref AssetInstanceName
+      AssetModelId: !Ref AssetModel
+      AssetProperties:
+        - LogicalId: EquipmentStatus
+          PropertyValues:
+            - Value:
+                StringValue: 'OPERATIONAL'
+        - LogicalId: LastMaintenanceDate
+          PropertyValues:
+            - Value:
+                StringValue: !Sub '${AWS::StackName}-deployment-date'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group for IoT SiteWise
+  IoTSiteWiseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/iotsitewise/${ProjectName}'
+      RetentionInDays: !If
+        - IsProduction
+        - 365
+        - 30
+      KmsKeyId: !If
+        - EnableEncryptionCondition
+        - !Ref KMSKeyId
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarm for High Temperature
+  HighTemperatureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-HighTemperature-${AssetInstanceName}'
+      AlarmDescription: 'Alert when equipment temperature exceeds threshold'
+      MetricName: Temperature
+      Namespace: AWS/IoTSiteWise
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref TemperatureThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+      Dimensions:
+        - Name: AssetId
+          Value: !Ref AssetInstance
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarm for High Pressure
+  HighPressureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-HighPressure-${AssetInstanceName}'
+      AlarmDescription: 'Alert when equipment pressure exceeds threshold'
+      MetricName: Pressure
+      Namespace: AWS/IoTSiteWise
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref PressureThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+      Dimensions:
+        - Name: AssetId
+          Value: !Ref AssetInstance
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarm for Low Operational Efficiency
+  LowEfficiencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-LowEfficiency-${AssetInstanceName}'
+      AlarmDescription: 'Alert when operational efficiency drops below 70%'
+      MetricName: OperationalEfficiency
+      Namespace: AWS/IoTSiteWise
+      Statistic: Average
+      Period: 600
+      EvaluationPeriods: 3
+      Threshold: 70.0
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+      Dimensions:
+        - Name: AssetId
+          Value: !Ref AssetInstance
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Dashboard for Equipment Monitoring
+  EquipmentDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-EquipmentMonitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/IoTSiteWise", "Temperature", "AssetId", "${AssetInstance}" ],
+                  [ ".", "Pressure", ".", "." ],
+                  [ ".", "OperationalEfficiency", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Equipment Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/IoTSiteWise", "Temperature", "AssetId", "${AssetInstance}" ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Temperature Trend",
+                "annotations": {
+                  "horizontal": [
+                    {
+                      "label": "High Temperature Threshold",
+                      "value": ${TemperatureThreshold}
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${IoTSiteWiseLogGroup}' | fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Errors"
+              }
+            }
+          ]
+        }
+
+  # Lambda Function for Custom Metrics Processing
+  MetricsProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-metrics-processor'
+      Description: 'Process IoT SiteWise metrics and generate custom CloudWatch metrics'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt MetricsProcessorRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          ASSET_ID: !Ref AssetInstance
+          TIMESTREAM_DATABASE: !Ref TimestreamDatabase
+          TIMESTREAM_TABLE: !Ref TimestreamTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          cloudwatch = boto3.client('cloudwatch')
+          timestream = boto3.client('timestream-write')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Extract metrics from IoT SiteWise
+                  asset_id = os.environ['ASSET_ID']
+                  
+                  # Sample metric processing
+                  # In production, this would process actual IoT SiteWise data
+                  metrics = [
+                      {
+                          'MetricName': 'ProcessedMetrics',
+                          'Value': 1.0,
+                          'Unit': 'Count',
+                          'Timestamp': datetime.utcnow()
+                      }
+                  ]
+                  
+                  # Put custom metrics to CloudWatch
+                  cloudwatch.put_metric_data(
+                      Namespace='Manufacturing/Custom',
+                      MetricData=metrics
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Metrics processed successfully')
+                  }
+                  
+              except Exception as e:
+                  print(f"Error processing metrics: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for Lambda Function
+  MetricsProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-metrics-processor-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudWatchMetricsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iotsitewise:GetAssetPropertyValue
+                  - iotsitewise:GetAssetPropertyValueHistory
+                Resource: !Sub 'arn:aws:iotsitewise:${AWS::Region}:${AWS::AccountId}:asset/${AssetInstance}'
+              - Effect: Allow
+                Action:
+                  - timestream:WriteRecords
+                  - timestream:DescribeEndpoints
+                Resource: !Sub '${TimestreamTable.Arn}'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # EventBridge Rule for Scheduled Metrics Processing
+  MetricsProcessingSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-metrics-processing-schedule'
+      Description: 'Schedule for processing IoT SiteWise metrics'
+      ScheduleExpression: 'rate(5 minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt MetricsProcessorFunction.Arn
+          Id: MetricsProcessorTarget
+
+  # Permission for EventBridge to invoke Lambda
+  MetricsProcessorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MetricsProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MetricsProcessingSchedule.Arn
+
+# Template Outputs
+Outputs:
+  AssetModelId:
+    Description: 'IoT SiteWise Asset Model ID'
+    Value: !Ref AssetModel
+    Export:
+      Name: !Sub '${AWS::StackName}-AssetModelId'
+
+  AssetInstanceId:
+    Description: 'IoT SiteWise Asset Instance ID'
+    Value: !Ref AssetInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-AssetInstanceId'
+
+  TimestreamDatabaseName:
+    Description: 'Timestream Database Name'
+    Value: !Ref TimestreamDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-TimestreamDatabase'
+
+  TimestreamTableName:
+    Description: 'Timestream Table Name'
+    Value: !Ref TimestreamTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TimestreamTable'
+
+  TimestreamTableArn:
+    Description: 'Timestream Table ARN'
+    Value: !GetAtt TimestreamTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TimestreamTableArn'
+
+  AlertTopicArn:
+    Description: 'SNS Topic ARN for Equipment Alerts'
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertTopicArn'
+
+  DashboardURL:
+    Description: 'CloudWatch Dashboard URL'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-EquipmentMonitoring'
+
+  ErrorDataBucketName:
+    Description: 'S3 Bucket for Error Data Storage'
+    Value: !Ref ErrorDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ErrorDataBucket'
+
+  LogGroupName:
+    Description: 'CloudWatch Log Group Name'
+    Value: !Ref IoTSiteWiseLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  MetricsProcessorFunctionArn:
+    Description: 'Lambda Function ARN for Metrics Processing'
+    Value: !GetAtt MetricsProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-MetricsProcessorFunction'
+
+  DeploymentInstructions:
+    Description: 'Next steps for deployment'
+    Value: !Sub |
+      1. Deploy this template: aws cloudformation create-stack --stack-name ${ProjectName}-stack --template-body file://cloudformation.yaml --capabilities CAPABILITY_NAMED_IAM
+      2. Confirm SNS subscription in your email
+      3. Configure your IoT SiteWise gateway to connect to Asset ID: ${AssetInstance}
+      4. Start sending data to your equipment asset
+      5. Monitor the CloudWatch dashboard for real-time metrics
+      6. Set up additional assets using the Asset Model ID: ${AssetModel}
+
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for this infrastructure'
+    Value: !Sub |
+      Base Infrastructure: $50-100/month
+      - IoT SiteWise: $0.50 per asset per month + $0.125 per 1000 data points
+      - Timestream: $0.50 per million writes + $0.03 per GB-hour (memory) + $0.03 per GB-month (magnetic)
+      - CloudWatch: $0.30 per dashboard + $0.50 per alarm
+      - Lambda: $0.20 per 1M requests + $0.0000166667 per GB-second
+      - S3: $0.023 per GB + $0.0004 per 1000 requests
+      - SNS: $0.50 per 1M notifications
+      
+      Note: Actual costs depend on data volume, query frequency, and usage patterns.

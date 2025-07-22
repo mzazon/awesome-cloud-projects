@@ -1,0 +1,463 @@
+# Infrastructure Manager Configuration for Firebase Studio Development Environment
+# This configuration sets up a complete cloud-native development environment
+# with Firebase Studio, Gemini Code Assist, and supporting GCP services
+
+# Import required Terraform modules and resources
+imports:
+  - path: terraform
+
+# Define template variables for customization
+variables:
+  # Project configuration
+  project_id:
+    description: "Google Cloud Project ID for the development environment"
+    type: string
+    default: "firebase-studio-dev-$(date +%s)"
+  
+  region:
+    description: "Google Cloud region for resources"
+    type: string
+    default: "us-central1"
+  
+  zone:
+    description: "Google Cloud zone for zonal resources"
+    type: string
+    default: "us-central1-a"
+  
+  # Application configuration
+  app_name:
+    description: "Name of the AI application to be developed"
+    type: string
+    default: "intelligent-task-manager"
+  
+  # Resource naming
+  repo_name:
+    description: "Name for the Cloud Source Repository"
+    type: string
+    default: "ai-app-repo"
+  
+  registry_name:
+    description: "Name for the Artifact Registry repository"
+    type: string
+    default: "ai-app-registry"
+  
+  # Firebase configuration
+  firebase_project_name:
+    description: "Display name for the Firebase project"
+    type: string
+    default: "AI Development Environment"
+  
+  # Build configuration
+  build_trigger_name:
+    description: "Name for the Cloud Build trigger"
+    type: string
+    default: "ai-app-build-trigger"
+  
+  # Security configuration
+  enable_apis:
+    description: "List of APIs to enable"
+    type: list
+    default:
+      - firebase.googleapis.com
+      - sourcerepo.googleapis.com
+      - artifactregistry.googleapis.com
+      - cloudbuild.googleapis.com
+      - run.googleapis.com
+      - aiplatform.googleapis.com
+      - generativelanguage.googleapis.com
+      - firestore.googleapis.com
+      - firebasehosting.googleapis.com
+
+# Configure Terraform backend for state management
+terraform:
+  backend:
+    gcs:
+      bucket: "tf-state-${var.project_id}"
+      prefix: "firebase-studio-dev"
+
+# Main configuration template
+template:
+  imports:
+    - path: modules/
+
+  resources:
+    # Enable required Google Cloud APIs
+    - name: enable-apis
+      type: gcp-types/serviceusage-v1:serviceusage.services.batchEnable
+      properties:
+        parent: projects/${var.project_id}
+        serviceIds: ${var.enable_apis}
+    
+    # Create Cloud Source Repository for version control
+    - name: source-repository
+      type: gcp-types/sourcerepo-v1:projects.repos
+      properties:
+        parent: projects/${var.project_id}
+        repoId: ${var.repo_name}
+        repo:
+          name: projects/${var.project_id}/repos/${var.repo_name}
+          mirrorConfig:
+            url: ""
+            webhookId: ""
+            deployKeyId: ""
+      depends_on:
+        - enable-apis
+    
+    # Create Artifact Registry repository for container images
+    - name: artifact-registry
+      type: gcp-types/artifactregistry-v1:projects.locations.repositories
+      properties:
+        parent: projects/${var.project_id}/locations/${var.region}
+        repositoryId: ${var.registry_name}
+        repository:
+          format: DOCKER
+          description: "Container registry for AI applications developed in Firebase Studio"
+          labels:
+            environment: "development"
+            tool: "firebase-studio"
+            purpose: "ai-development"
+      depends_on:
+        - enable-apis
+    
+    # Create service account for Gemini Code Assist
+    - name: gemini-code-assist-sa
+      type: gcp-types/iam-v1:projects.serviceAccounts
+      properties:
+        accountId: gemini-code-assist
+        serviceAccount:
+          displayName: "Gemini Code Assist Service Account"
+          description: "Service account for AI-powered development assistance in Firebase Studio"
+        name: projects/${var.project_id}/serviceAccounts/gemini-code-assist@${var.project_id}.iam.gserviceaccount.com
+      depends_on:
+        - enable-apis
+    
+    # Grant AI Platform permissions to Gemini Code Assist service account
+    - name: gemini-code-assist-ai-permission
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: projects/${var.project_id}
+        role: roles/aiplatform.user
+        member: serviceAccount:gemini-code-assist@${var.project_id}.iam.gserviceaccount.com
+      depends_on:
+        - gemini-code-assist-sa
+    
+    # Grant Generative Language permissions to Gemini Code Assist service account
+    - name: gemini-code-assist-genai-permission
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: projects/${var.project_id}
+        role: roles/generativelanguage.user
+        member: serviceAccount:gemini-code-assist@${var.project_id}.iam.gserviceaccount.com
+      depends_on:
+        - gemini-code-assist-sa
+    
+    # Create service account for Cloud Build
+    - name: cloud-build-sa
+      type: gcp-types/iam-v1:projects.serviceAccounts
+      properties:
+        accountId: cloud-build-firebase-studio
+        serviceAccount:
+          displayName: "Cloud Build Firebase Studio Service Account"
+          description: "Service account for Cloud Build operations in Firebase Studio environment"
+        name: projects/${var.project_id}/serviceAccounts/cloud-build-firebase-studio@${var.project_id}.iam.gserviceaccount.com
+      depends_on:
+        - enable-apis
+    
+    # Grant Cloud Build permissions
+    - name: cloud-build-permissions
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: projects/${var.project_id}
+        role: roles/cloudbuild.builds.editor
+        member: serviceAccount:cloud-build-firebase-studio@${var.project_id}.iam.gserviceaccount.com
+      depends_on:
+        - cloud-build-sa
+    
+    # Grant Artifact Registry permissions to Cloud Build
+    - name: cloud-build-artifact-registry-permissions
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: projects/${var.project_id}
+        role: roles/artifactregistry.writer
+        member: serviceAccount:cloud-build-firebase-studio@${var.project_id}.iam.gserviceaccount.com
+      depends_on:
+        - cloud-build-sa
+    
+    # Grant Cloud Run permissions to Cloud Build
+    - name: cloud-build-run-permissions
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: projects/${var.project_id}
+        role: roles/run.admin
+        member: serviceAccount:cloud-build-firebase-studio@${var.project_id}.iam.gserviceaccount.com
+      depends_on:
+        - cloud-build-sa
+    
+    # Create Cloud Build trigger for continuous integration
+    - name: build-trigger
+      type: gcp-types/cloudbuild-v1:projects.triggers
+      properties:
+        parent: projects/${var.project_id}
+        trigger:
+          name: ${var.build_trigger_name}
+          description: "Automated build and deployment trigger for Firebase Studio AI app"
+          triggerTemplate:
+            projectId: ${var.project_id}
+            repoName: ${var.repo_name}
+            branchName: "main"
+          build:
+            steps:
+              # Install dependencies
+              - name: 'node:18'
+                entrypoint: 'npm'
+                args: ['install']
+              
+              # Run tests
+              - name: 'node:18'
+                entrypoint: 'npm'
+                args: ['test']
+              
+              # Build application
+              - name: 'node:18'
+                entrypoint: 'npm'
+                args: ['run', 'build']
+              
+              # Build Docker image
+              - name: 'gcr.io/cloud-builders/docker'
+                args: 
+                  - 'build'
+                  - '-t'
+                  - '${var.region}-docker.pkg.dev/${var.project_id}/${var.registry_name}/ai-app:latest'
+                  - '.'
+              
+              # Push image to Artifact Registry
+              - name: 'gcr.io/cloud-builders/docker'
+                args: 
+                  - 'push'
+                  - '${var.region}-docker.pkg.dev/${var.project_id}/${var.registry_name}/ai-app:latest'
+              
+              # Deploy to Cloud Run
+              - name: 'gcr.io/cloud-builders/gcloud'
+                args:
+                  - 'run'
+                  - 'deploy'
+                  - 'ai-app'
+                  - '--image'
+                  - '${var.region}-docker.pkg.dev/${var.project_id}/${var.registry_name}/ai-app:latest'
+                  - '--region'
+                  - '${var.region}'
+                  - '--platform'
+                  - 'managed'
+                  - '--allow-unauthenticated'
+            
+            options:
+              logging: CLOUD_LOGGING_ONLY
+              serviceAccount: projects/${var.project_id}/serviceAccounts/cloud-build-firebase-studio@${var.project_id}.iam.gserviceaccount.com
+          
+          tags:
+            - firebase-studio
+            - ai-development
+            - continuous-integration
+      depends_on:
+        - source-repository
+        - artifact-registry
+        - cloud-build-sa
+        - cloud-build-permissions
+        - cloud-build-artifact-registry-permissions
+        - cloud-build-run-permissions
+    
+    # Create Firestore database for the AI application
+    - name: firestore-database
+      type: gcp-types/firestore-v1:projects.databases
+      properties:
+        parent: projects/${var.project_id}
+        databaseId: "(default)"
+        database:
+          type: FIRESTORE_NATIVE
+          locationId: ${var.region}
+          concurrencyMode: OPTIMISTIC
+          appEngineIntegrationMode: DISABLED
+          deleteProtectionState: DELETE_PROTECTION_DISABLED
+      depends_on:
+        - enable-apis
+    
+    # Create Firebase Hosting site for the AI application
+    - name: firebase-hosting-site
+      type: gcp-types/firebasehosting-v1beta1:projects.sites
+      properties:
+        parent: projects/${var.project_id}
+        siteId: ${var.app_name}
+        site:
+          type: DEFAULT_SITE
+          labels:
+            environment: "development"
+            created-by: "firebase-studio"
+      depends_on:
+        - enable-apis
+    
+    # Create Cloud Storage bucket for Terraform state (if not exists)
+    - name: terraform-state-bucket
+      type: gcp-types/storage-v1:buckets
+      properties:
+        bucket: tf-state-${var.project_id}
+        project: ${var.project_id}
+        location: ${var.region}
+        storageClass: STANDARD
+        uniformBucketLevelAccess:
+          enabled: true
+        versioning:
+          enabled: true
+        lifecycle:
+          rule:
+            - action:
+                type: Delete
+              condition:
+                age: 30
+                isLive: false
+        labels:
+          purpose: "terraform-state"
+          environment: "development"
+      depends_on:
+        - enable-apis
+    
+    # Create Cloud Monitoring notification channel for build alerts
+    - name: build-notification-channel
+      type: gcp-types/monitoring-v1:projects.notificationChannels
+      properties:
+        parent: projects/${var.project_id}
+        notificationChannel:
+          type: email
+          displayName: "Firebase Studio Build Notifications"
+          description: "Email notifications for Firebase Studio build events"
+          labels:
+            email_address: "admin@example.com"  # Update with actual email
+          enabled: true
+      depends_on:
+        - enable-apis
+
+# Define outputs for reference and verification
+outputs:
+  # Project information
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${var.project_id}
+  
+  region:
+    description: "Google Cloud region"
+    value: ${var.region}
+  
+  # Repository information
+  source_repository_url:
+    description: "Cloud Source Repository clone URL"
+    value: $(ref.source-repository.url)
+  
+  source_repository_name:
+    description: "Cloud Source Repository name"
+    value: $(ref.source-repository.name)
+  
+  # Artifact Registry information
+  artifact_registry_url:
+    description: "Artifact Registry repository URL"
+    value: ${var.region}-docker.pkg.dev/${var.project_id}/${var.registry_name}
+  
+  artifact_registry_name:
+    description: "Artifact Registry repository name"
+    value: $(ref.artifact-registry.name)
+  
+  # Service account information
+  gemini_code_assist_sa_email:
+    description: "Gemini Code Assist service account email"
+    value: gemini-code-assist@${var.project_id}.iam.gserviceaccount.com
+  
+  cloud_build_sa_email:
+    description: "Cloud Build service account email"
+    value: cloud-build-firebase-studio@${var.project_id}.iam.gserviceaccount.com
+  
+  # Build trigger information
+  build_trigger_id:
+    description: "Cloud Build trigger ID"
+    value: $(ref.build-trigger.id)
+  
+  build_trigger_name:
+    description: "Cloud Build trigger name"
+    value: $(ref.build-trigger.name)
+  
+  # Firebase information
+  firestore_database_name:
+    description: "Firestore database name"
+    value: $(ref.firestore-database.name)
+  
+  firebase_hosting_site_name:
+    description: "Firebase Hosting site name"
+    value: $(ref.firebase-hosting-site.name)
+  
+  # Firebase Studio access
+  firebase_studio_url:
+    description: "Firebase Studio access URL"
+    value: "https://studio.firebase.google.com"
+  
+  # Instructions for next steps
+  firebase_studio_instructions:
+    description: "Instructions for accessing Firebase Studio"
+    value: |
+      1. Navigate to: https://studio.firebase.google.com
+      2. Sign in with your Google account
+      3. Select project: ${var.project_id}
+      4. Create new workspace: 'ai-development-environment'
+      5. Choose 'Full-stack AI app' template
+      6. Connect to Cloud Source Repository: ${var.repo_name}
+      7. Start developing with Gemini Code Assist integration
+  
+  # Cloud Build configuration
+  cloudbuild_yaml_content:
+    description: "Cloud Build configuration content"
+    value: |
+      steps:
+      # Install dependencies
+      - name: 'node:18'
+        entrypoint: 'npm'
+        args: ['install']
+      
+      # Run tests
+      - name: 'node:18'
+        entrypoint: 'npm'
+        args: ['test']
+      
+      # Build application
+      - name: 'node:18'
+        entrypoint: 'npm'
+        args: ['run', 'build']
+      
+      # Build Docker image
+      - name: 'gcr.io/cloud-builders/docker'
+        args: ['build', '-t', '${var.region}-docker.pkg.dev/${var.project_id}/${var.registry_name}/ai-app:latest', '.']
+      
+      # Push image to Artifact Registry
+      - name: 'gcr.io/cloud-builders/docker'
+        args: ['push', '${var.region}-docker.pkg.dev/${var.project_id}/${var.registry_name}/ai-app:latest']
+      
+      # Deploy to Cloud Run
+      - name: 'gcr.io/cloud-builders/gcloud'
+        args: ['run', 'deploy', 'ai-app', 
+               '--image', '${var.region}-docker.pkg.dev/${var.project_id}/${var.registry_name}/ai-app:latest',
+               '--region', '${var.region}',
+               '--platform', 'managed',
+               '--allow-unauthenticated']
+      
+      options:
+        logging: CLOUD_LOGGING_ONLY
+        serviceAccount: 'projects/${var.project_id}/serviceAccounts/cloud-build-firebase-studio@${var.project_id}.iam.gserviceaccount.com'
+
+# Metadata for the deployment
+metadata:
+  name: firebase-studio-development-environment
+  labels:
+    purpose: "ai-development"
+    tool: "firebase-studio"
+    environment: "development"
+    created-by: "infrastructure-manager"
+    recipe-version: "1.0"
+  annotations:
+    description: "Complete Firebase Studio development environment with Gemini Code Assist integration"
+    documentation: "https://firebase.google.com/docs/studio"
+    support: "https://firebase.google.com/support"

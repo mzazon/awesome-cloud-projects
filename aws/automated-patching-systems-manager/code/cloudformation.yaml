@@ -1,0 +1,591 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Automated Patching and Maintenance Windows with Systems Manager - Creates custom patch baselines, maintenance windows, and monitoring for automated EC2 instance patching'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'automated-patching'
+    Description: 'Name prefix for all resources'
+    MinLength: 1
+    MaxLength: 32
+    AllowedPattern: '[a-zA-Z0-9-]*'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+
+  PatchingSchedule:
+    Type: String
+    Default: 'cron(0 2 ? * SUN *)'
+    Description: 'Cron expression for patching schedule (default: 2 AM UTC every Sunday)'
+    AllowedPattern: '^cron\(.+\)$'
+    ConstraintDescription: 'Must be a valid cron expression'
+
+  ScanningSchedule:
+    Type: String
+    Default: 'cron(0 1 * * ? *)'
+    Description: 'Cron expression for scanning schedule (default: 1 AM UTC daily)'
+    AllowedPattern: '^cron\(.+\)$'
+    ConstraintDescription: 'Must be a valid cron expression'
+
+  PatchingDuration:
+    Type: Number
+    Default: 4
+    Description: 'Duration of patching maintenance window in hours'
+    MinValue: 1
+    MaxValue: 24
+
+  PatchingCutoff:
+    Type: Number
+    Default: 1
+    Description: 'Stop scheduling new tasks this many hours before window ends'
+    MinValue: 0
+    MaxValue: 23
+
+  ScanningDuration:
+    Type: Number
+    Default: 2
+    Description: 'Duration of scanning maintenance window in hours'
+    MinValue: 1
+    MaxValue: 24
+
+  ScanningCutoff:
+    Type: Number
+    Default: 1
+    Description: 'Stop scheduling new tasks this many hours before scanning window ends'
+    MinValue: 0
+    MaxValue: 23
+
+  PatchingConcurrency:
+    Type: String
+    Default: '50%'
+    Description: 'Maximum number of instances to patch simultaneously'
+    AllowedValues: ['1', '2', '3', '4', '5', '10%', '25%', '50%', '75%', '100%']
+
+  PatchingErrorThreshold:
+    Type: String
+    Default: '10%'
+    Description: 'Maximum percentage of errors allowed during patching'
+    AllowedValues: ['0', '1', '2', '3', '4', '5', '10%', '25%', '50%']
+
+  TargetTagKey:
+    Type: String
+    Default: 'Environment'
+    Description: 'Tag key used to identify target instances'
+    MinLength: 1
+    MaxLength: 128
+
+  TargetTagValue:
+    Type: String
+    Default: 'Production'
+    Description: 'Tag value used to identify target instances'
+    MinLength: 1
+    MaxLength: 256
+
+  PatchGroup:
+    Type: String
+    Default: 'Production'
+    Description: 'Patch group name for organizing instances'
+    MinLength: 1
+    MaxLength: 256
+
+  ApprovalDelayDays:
+    Type: Number
+    Default: 7
+    Description: 'Number of days to wait before auto-approving patches'
+    MinValue: 0
+    MaxValue: 100
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for patch notifications (optional)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+  OperatingSystem:
+    Type: String
+    Default: 'AMAZON_LINUX_2'
+    Description: 'Operating system for patch baseline'
+    AllowedValues:
+      - 'AMAZON_LINUX'
+      - 'AMAZON_LINUX_2'
+      - 'AMAZON_LINUX_2022'
+      - 'AMAZON_LINUX_2023'
+      - 'UBUNTU'
+      - 'REDHAT_ENTERPRISE_LINUX'
+      - 'SUSE'
+      - 'CENTOS'
+      - 'ORACLE_LINUX'
+      - 'DEBIAN'
+      - 'MACOS'
+      - 'RASPBIAN'
+      - 'ROCKY_LINUX'
+      - 'ALMA_LINUX'
+
+Conditions:
+  CreateEmailNotification: !Not [!Equals [!Ref NotificationEmail, '']]
+  IsLinuxOS: !Or
+    - !Equals [!Ref OperatingSystem, 'AMAZON_LINUX']
+    - !Equals [!Ref OperatingSystem, 'AMAZON_LINUX_2']
+    - !Equals [!Ref OperatingSystem, 'AMAZON_LINUX_2022']
+    - !Equals [!Ref OperatingSystem, 'AMAZON_LINUX_2023']
+    - !Equals [!Ref OperatingSystem, 'UBUNTU']
+    - !Equals [!Ref OperatingSystem, 'REDHAT_ENTERPRISE_LINUX']
+    - !Equals [!Ref OperatingSystem, 'SUSE']
+    - !Equals [!Ref OperatingSystem, 'CENTOS']
+    - !Equals [!Ref OperatingSystem, 'ORACLE_LINUX']
+    - !Equals [!Ref OperatingSystem, 'DEBIAN']
+    - !Equals [!Ref OperatingSystem, 'RASPBIAN']
+    - !Equals [!Ref OperatingSystem, 'ROCKY_LINUX']
+    - !Equals [!Ref OperatingSystem, 'ALMA_LINUX']
+
+Resources:
+  # S3 Bucket for storing patch reports and logs
+  PatchReportsS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-patch-reports-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldReports
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-patch-reports'
+        - Key: Purpose
+          Value: 'Systems Manager patch reports and logs'
+
+  # S3 Bucket Policy for Systems Manager access
+  PatchReportsS3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref PatchReportsS3Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSSMPutObject
+            Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action:
+              - s3:PutObject
+              - s3:PutObjectAcl
+            Resource: !Sub '${PatchReportsS3Bucket}/*'
+          - Sid: AllowSSMGetBucketLocation
+            Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action:
+              - s3:GetBucketLocation
+            Resource: !Ref PatchReportsS3Bucket
+
+  # SNS Topic for patch notifications
+  PatchNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-patch-notifications'
+      DisplayName: 'Patch Management Notifications'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-patch-notifications'
+        - Key: Purpose
+          Value: 'Patch management notifications'
+
+  # SNS Topic Policy
+  PatchNotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref PatchNotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudWatchAlarmsToPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - sns:Publish
+            Resource: !Ref PatchNotificationTopic
+
+  # Email subscription for notifications (conditional)
+  PatchNotificationEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateEmailNotification
+    Properties:
+      Protocol: email
+      TopicArn: !Ref PatchNotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # IAM Role for Maintenance Window execution
+  MaintenanceWindowRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-maintenance-window-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonSSMMaintenanceWindowRole
+      Policies:
+        - PolicyName: S3LoggingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub '${PatchReportsS3Bucket}/*'
+                  - !Ref PatchReportsS3Bucket
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-maintenance-window-role'
+        - Key: Purpose
+          Value: 'Systems Manager maintenance window execution'
+
+  # Custom Patch Baseline
+  CustomPatchBaseline:
+    Type: AWS::SSM::PatchBaseline
+    Properties:
+      Name: !Sub '${ProjectName}-custom-baseline'
+      Description: 'Custom patch baseline for automated patching'
+      OperatingSystem: !Ref OperatingSystem
+      ApprovalRules:
+        PatchRules:
+          - PatchFilterGroup:
+              PatchFilters:
+                - Key: CLASSIFICATION
+                  Values:
+                    - Security
+                    - Bugfix
+                    - Critical
+            ApproveAfterDays: !Ref ApprovalDelayDays
+            ComplianceLevel: CRITICAL
+            EnableNonSecurity: true
+      ApprovedPatchesComplianceLevel: CRITICAL
+      RejectedPatchesAction: ALLOW_AS_DEPENDENCY
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-custom-baseline'
+        - Key: Purpose
+          Value: 'Custom patch baseline for automated patching'
+
+  # Patch Group Registration
+  PatchGroupRegistration:
+    Type: AWS::SSM::PatchBaselineRegistration
+    Properties:
+      BaselineId: !Ref CustomPatchBaseline
+      PatchGroup: !Ref PatchGroup
+
+  # Maintenance Window for Patching
+  PatchingMaintenanceWindow:
+    Type: AWS::SSM::MaintenanceWindow
+    Properties:
+      Name: !Sub '${ProjectName}-patching-window'
+      Description: 'Maintenance window for automated patching'
+      Schedule: !Ref PatchingSchedule
+      Duration: !Ref PatchingDuration
+      Cutoff: !Ref PatchingCutoff
+      ScheduleTimezone: UTC
+      AllowUnassociatedTargets: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-patching-window'
+        - Key: Purpose
+          Value: 'Automated patching maintenance window'
+
+  # Maintenance Window for Scanning
+  ScanningMaintenanceWindow:
+    Type: AWS::SSM::MaintenanceWindow
+    Properties:
+      Name: !Sub '${ProjectName}-scanning-window'
+      Description: 'Maintenance window for patch scanning'
+      Schedule: !Ref ScanningSchedule
+      Duration: !Ref ScanningDuration
+      Cutoff: !Ref ScanningCutoff
+      ScheduleTimezone: UTC
+      AllowUnassociatedTargets: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-scanning-window'
+        - Key: Purpose
+          Value: 'Automated patch scanning maintenance window'
+
+  # Maintenance Window Targets for Patching
+  PatchingMaintenanceWindowTarget:
+    Type: AWS::SSM::MaintenanceWindowTarget
+    Properties:
+      WindowId: !Ref PatchingMaintenanceWindow
+      ResourceType: INSTANCE
+      Targets:
+        - Key: !Sub 'tag:${TargetTagKey}'
+          Values:
+            - !Ref TargetTagValue
+      Name: !Sub '${ProjectName}-patching-targets'
+      Description: 'Target instances for patching'
+
+  # Maintenance Window Targets for Scanning
+  ScanningMaintenanceWindowTarget:
+    Type: AWS::SSM::MaintenanceWindowTarget
+    Properties:
+      WindowId: !Ref ScanningMaintenanceWindow
+      ResourceType: INSTANCE
+      Targets:
+        - Key: !Sub 'tag:${TargetTagKey}'
+          Values:
+            - !Ref TargetTagValue
+      Name: !Sub '${ProjectName}-scanning-targets'
+      Description: 'Target instances for scanning'
+
+  # Maintenance Window Task for Patching
+  PatchingMaintenanceWindowTask:
+    Type: AWS::SSM::MaintenanceWindowTask
+    Properties:
+      WindowId: !Ref PatchingMaintenanceWindow
+      TaskType: RUN_COMMAND
+      TaskArn: AWS-RunPatchBaseline
+      Targets:
+        - Key: WindowTargetIds
+          Values:
+            - !Ref PatchingMaintenanceWindowTarget
+      ServiceRoleArn: !GetAtt MaintenanceWindowRole.Arn
+      Name: !Sub '${ProjectName}-patching-task'
+      Description: 'Install patches using custom baseline'
+      MaxConcurrency: !Ref PatchingConcurrency
+      MaxErrors: !Ref PatchingErrorThreshold
+      Priority: 1
+      TaskParameters:
+        BaselineOverride:
+          - !Ref CustomPatchBaseline
+        Operation:
+          - Install
+      LoggingInfo:
+        S3BucketName: !Ref PatchReportsS3Bucket
+        S3KeyPrefix: patch-logs
+        S3Region: !Ref AWS::Region
+
+  # Maintenance Window Task for Scanning
+  ScanningMaintenanceWindowTask:
+    Type: AWS::SSM::MaintenanceWindowTask
+    Properties:
+      WindowId: !Ref ScanningMaintenanceWindow
+      TaskType: RUN_COMMAND
+      TaskArn: AWS-RunPatchBaseline
+      Targets:
+        - Key: WindowTargetIds
+          Values:
+            - !Ref ScanningMaintenanceWindowTarget
+      ServiceRoleArn: !GetAtt MaintenanceWindowRole.Arn
+      Name: !Sub '${ProjectName}-scanning-task'
+      Description: 'Scan for missing patches'
+      MaxConcurrency: '100%'
+      MaxErrors: '5%'
+      Priority: 1
+      TaskParameters:
+        BaselineOverride:
+          - !Ref CustomPatchBaseline
+        Operation:
+          - Scan
+      LoggingInfo:
+        S3BucketName: !Ref PatchReportsS3Bucket
+        S3KeyPrefix: scan-logs
+        S3Region: !Ref AWS::Region
+
+  # CloudWatch Alarm for Patch Compliance
+  PatchComplianceAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-patch-compliance-alarm'
+      AlarmDescription: 'Monitor patch compliance status'
+      MetricName: ComplianceByPatchGroup
+      Namespace: AWS/SSM-PatchCompliance
+      Statistic: Maximum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: PatchGroup
+          Value: !Ref PatchGroup
+      AlarmActions:
+        - !Ref PatchNotificationTopic
+      TreatMissingData: breaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-patch-compliance-alarm'
+        - Key: Purpose
+          Value: 'Patch compliance monitoring'
+
+  # CloudWatch Alarm for Maintenance Window Execution Failures
+  MaintenanceWindowFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-maintenance-window-failure-alarm'
+      AlarmDescription: 'Monitor maintenance window execution failures'
+      MetricName: TasksFailed
+      Namespace: AWS/SSM-MaintenanceWindow
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: WindowId
+          Value: !Ref PatchingMaintenanceWindow
+      AlarmActions:
+        - !Ref PatchNotificationTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-maintenance-window-failure-alarm'
+        - Key: Purpose
+          Value: 'Maintenance window failure monitoring'
+
+  # CloudWatch Log Group for Systems Manager
+  SystemsManagerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/ssm/${ProjectName}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ssm-logs'
+        - Key: Purpose
+          Value: 'Systems Manager execution logs'
+
+Outputs:
+  PatchBaselineId:
+    Description: 'ID of the custom patch baseline'
+    Value: !Ref CustomPatchBaseline
+    Export:
+      Name: !Sub '${AWS::StackName}-PatchBaselineId'
+
+  PatchingMaintenanceWindowId:
+    Description: 'ID of the patching maintenance window'
+    Value: !Ref PatchingMaintenanceWindow
+    Export:
+      Name: !Sub '${AWS::StackName}-PatchingMaintenanceWindowId'
+
+  ScanningMaintenanceWindowId:
+    Description: 'ID of the scanning maintenance window'
+    Value: !Ref ScanningMaintenanceWindow
+    Export:
+      Name: !Sub '${AWS::StackName}-ScanningMaintenanceWindowId'
+
+  PatchReportsS3BucketName:
+    Description: 'Name of the S3 bucket for patch reports'
+    Value: !Ref PatchReportsS3Bucket
+    Export:
+      Name: !Sub '${AWS::StackName}-PatchReportsS3BucketName'
+
+  PatchReportsS3BucketArn:
+    Description: 'ARN of the S3 bucket for patch reports'
+    Value: !GetAtt PatchReportsS3Bucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PatchReportsS3BucketArn'
+
+  PatchNotificationTopicArn:
+    Description: 'ARN of the SNS topic for patch notifications'
+    Value: !Ref PatchNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-PatchNotificationTopicArn'
+
+  MaintenanceWindowRoleArn:
+    Description: 'ARN of the maintenance window IAM role'
+    Value: !GetAtt MaintenanceWindowRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-MaintenanceWindowRoleArn'
+
+  PatchGroup:
+    Description: 'Name of the patch group'
+    Value: !Ref PatchGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-PatchGroup'
+
+  PatchingSchedule:
+    Description: 'Cron expression for patching schedule'
+    Value: !Ref PatchingSchedule
+    Export:
+      Name: !Sub '${AWS::StackName}-PatchingSchedule'
+
+  ScanningSchedule:
+    Description: 'Cron expression for scanning schedule'
+    Value: !Ref ScanningSchedule
+    Export:
+      Name: !Sub '${AWS::StackName}-ScanningSchedule'
+
+  PatchComplianceAlarmName:
+    Description: 'Name of the patch compliance CloudWatch alarm'
+    Value: !Ref PatchComplianceAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-PatchComplianceAlarmName'
+
+  MaintenanceWindowFailureAlarmName:
+    Description: 'Name of the maintenance window failure CloudWatch alarm'
+    Value: !Ref MaintenanceWindowFailureAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-MaintenanceWindowFailureAlarmName'
+
+  SystemsManagerLogGroupName:
+    Description: 'Name of the CloudWatch log group for Systems Manager'
+    Value: !Ref SystemsManagerLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SystemsManagerLogGroupName'
+
+  DeploymentInstructions:
+    Description: 'Instructions for deploying this CloudFormation template'
+    Value: !Sub |
+      Deploy this template using the AWS CLI:
+      aws cloudformation create-stack \
+        --stack-name ${ProjectName}-stack \
+        --template-body file://cloudformation.yaml \
+        --parameters ParameterKey=NotificationEmail,ParameterValue=your-email@example.com \
+        --capabilities CAPABILITY_NAMED_IAM \
+        --region ${AWS::Region}
+      
+      Or deploy using the AWS Management Console:
+      1. Navigate to CloudFormation in the AWS Console
+      2. Click "Create Stack" and upload this template
+      3. Provide parameter values (especially NotificationEmail)
+      4. Check the acknowledgment box for IAM resources
+      5. Click "Create Stack"
+      
+      After deployment, ensure your EC2 instances are tagged with:
+      Key: ${TargetTagKey}, Value: ${TargetTagValue}
+
+  ValidationCommands:
+    Description: 'Commands to validate the deployment'
+    Value: !Sub |
+      # Verify patch baseline
+      aws ssm describe-patch-baselines --baseline-ids ${CustomPatchBaseline}
+      
+      # Check maintenance windows
+      aws ssm describe-maintenance-windows --filters Key=Name,Values=${ProjectName}-patching-window
+      aws ssm describe-maintenance-windows --filters Key=Name,Values=${ProjectName}-scanning-window
+      
+      # Monitor patch compliance
+      aws ssm describe-instance-patch-states --query "InstancePatchStates[*].[InstanceId,PatchGroup,BaselineId,OperationEndTime]" --output table
+      
+      # Check CloudWatch alarms
+      aws cloudwatch describe-alarms --alarm-names ${PatchComplianceAlarm} ${MaintenanceWindowFailureAlarm}
+      
+      # View S3 bucket contents
+      aws s3 ls s3://${PatchReportsS3Bucket}/ --recursive

@@ -1,0 +1,675 @@
+# Infrastructure Manager Configuration for Edge Analytics with Cloud Run WebAssembly and Pub/Sub
+# This configuration deploys a complete edge analytics platform using:
+# - Cloud Run service with WebAssembly runtime for high-performance processing
+# - Pub/Sub for reliable IoT data ingestion
+# - Cloud Storage for analytics data lake with lifecycle management
+# - Firestore for metadata and operational queries
+# - Cloud Monitoring for observability and alerting
+
+apiVersion: blueprints.cloud.google.com/v1alpha1
+kind: Deployment
+metadata:
+  name: edge-analytics-deployment
+  labels:
+    recipe: edge-analytics-cloud-run-webassembly-pub-sub
+    version: "1.0"
+spec:
+  # Input variables for customization
+  variables:
+    project_id:
+      type: string
+      description: "Google Cloud Project ID"
+      required: true
+    
+    region:
+      type: string
+      description: "Primary region for resource deployment"
+      default: "us-central1"
+    
+    zone:
+      type: string
+      description: "Zone for zonal resources"
+      default: "us-central1-a"
+    
+    service_name:
+      type: string
+      description: "Name for the Cloud Run service"
+      default: "edge-analytics-service"
+    
+    bucket_name:
+      type: string
+      description: "Name for the Cloud Storage bucket (must be globally unique)"
+      required: true
+    
+    topic_name:
+      type: string
+      description: "Name for the Pub/Sub topic"
+      default: "iot-sensor-data"
+    
+    subscription_name:
+      type: string
+      description: "Name for the Pub/Sub subscription"
+      default: "analytics-subscription"
+    
+    container_image:
+      type: string
+      description: "Container image URL for Cloud Run service"
+      required: true
+    
+    max_instances:
+      type: integer
+      description: "Maximum number of Cloud Run instances"
+      default: 100
+    
+    memory:
+      type: string
+      description: "Memory allocation for Cloud Run service"
+      default: "1Gi"
+    
+    cpu:
+      type: string
+      description: "CPU allocation for Cloud Run service"
+      default: "2"
+    
+    concurrency:
+      type: integer
+      description: "Maximum concurrent requests per instance"
+      default: 80
+    
+    enable_monitoring:
+      type: boolean
+      description: "Enable enhanced monitoring and alerting"
+      default: true
+    
+    retention_days:
+      type: integer
+      description: "Message retention period in days"
+      default: 7
+    
+    lifecycle_nearline_age:
+      type: integer
+      description: "Days after which to transition to Nearline storage"
+      default: 30
+    
+    lifecycle_coldline_age:
+      type: integer
+      description: "Days after which to transition to Coldline storage"
+      default: 90
+
+  # Resource definitions
+  resources:
+    # Enable required Google Cloud APIs
+    - name: enable-apis
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        serviceName: run.googleapis.com
+        parent: projects/$(ref.project_id.value)
+      metadata:
+        dependsOn: []
+    
+    - name: enable-pubsub-api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        serviceName: pubsub.googleapis.com
+        parent: projects/$(ref.project_id.value)
+    
+    - name: enable-storage-api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        serviceName: storage.googleapis.com
+        parent: projects/$(ref.project_id.value)
+    
+    - name: enable-monitoring-api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        serviceName: monitoring.googleapis.com
+        parent: projects/$(ref.project_id.value)
+    
+    - name: enable-firestore-api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        serviceName: firestore.googleapis.com
+        parent: projects/$(ref.project_id.value)
+    
+    - name: enable-cloudbuild-api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        serviceName: cloudbuild.googleapis.com
+        parent: projects/$(ref.project_id.value)
+
+    # Cloud Storage bucket for analytics data lake
+    - name: analytics-data-bucket
+      type: gcp-types/storage-v1:buckets
+      properties:
+        name: $(ref.bucket_name.value)
+        project: $(ref.project_id.value)
+        location: $(ref.region.value)
+        storageClass: STANDARD
+        versioning:
+          enabled: true
+        # Lifecycle management for cost optimization
+        lifecycle:
+          rule:
+            - action:
+                type: SetStorageClass
+                storageClass: NEARLINE
+              condition:
+                age: $(ref.lifecycle_nearline_age.value)
+            - action:
+                type: SetStorageClass
+                storageClass: COLDLINE
+              condition:
+                age: $(ref.lifecycle_coldline_age.value)
+        # CORS configuration for web access if needed
+        cors:
+          - origin: ["*"]
+            method: ["GET", "POST", "PUT", "DELETE"]
+            responseHeader: ["Content-Type", "Authorization"]
+            maxAgeSeconds: 3600
+        # IAM configuration for secure access
+        iamConfiguration:
+          uniformBucketLevelAccess:
+            enabled: true
+      metadata:
+        dependsOn:
+          - enable-storage-api
+
+    # Pub/Sub topic for IoT data ingestion
+    - name: iot-data-topic
+      type: gcp-types/pubsub-v1:projects.topics
+      properties:
+        name: projects/$(ref.project_id.value)/topics/$(ref.topic_name.value)
+        # Message retention for reliability
+        messageRetentionDuration: $(ref.retention_days.value)d
+        # Schema settings for data validation (optional)
+        schemaSettings:
+          encoding: JSON
+        # Message ordering for maintaining sequence (if needed)
+        messageStoragePolicy:
+          allowedPersistenceRegions:
+            - $(ref.region.value)
+      metadata:
+        dependsOn:
+          - enable-pubsub-api
+
+    # Cloud Run service for WebAssembly analytics processing
+    - name: edge-analytics-service
+      type: gcp-types/run-v1:namespaces.services
+      properties:
+        parent: namespaces/$(ref.project_id.value)
+        location: $(ref.region.value)
+        apiVersion: serving.knative.dev/v1
+        kind: Service
+        metadata:
+          name: $(ref.service_name.value)
+          namespace: $(ref.project_id.value)
+          labels:
+            cloud.googleapis.com/location: $(ref.region.value)
+            recipe: edge-analytics-wasm
+          annotations:
+            # Enable CPU allocation during request processing only
+            run.googleapis.com/cpu-throttling: "false"
+            # Configure execution environment for WebAssembly
+            run.googleapis.com/execution-environment: gen2
+            # Enable detailed request logging
+            run.googleapis.com/enable-audit-logs: "true"
+        spec:
+          template:
+            metadata:
+              annotations:
+                # Resource allocation
+                run.googleapis.com/memory: $(ref.memory.value)
+                run.googleapis.com/cpu: $(ref.cpu.value)
+                # Scaling configuration
+                autoscaling.knative.dev/maxScale: "$(ref.max_instances.value)"
+                autoscaling.knative.dev/minScale: "0"
+                # Request timeout for processing
+                run.googleapis.com/timeout: "300s"
+                # Concurrency settings
+                run.googleapis.com/concurrency: "$(ref.concurrency.value)"
+                # Networking configuration
+                run.googleapis.com/vpc-access-egress: all
+            spec:
+              # Service account for secure access to GCP services
+              serviceAccountName: edge-analytics-sa@$(ref.project_id.value).iam.gserviceaccount.com
+              containerConcurrency: $(ref.concurrency.value)
+              timeoutSeconds: 300
+              containers:
+                - image: $(ref.container_image.value)
+                  name: analytics-container
+                  ports:
+                    - containerPort: 8080
+                      name: http1
+                  # Environment variables for service configuration
+                  env:
+                    - name: GOOGLE_CLOUD_PROJECT
+                      value: $(ref.project_id.value)
+                    - name: BUCKET_NAME
+                      value: $(ref.bucket_name.value)
+                    - name: TOPIC_NAME
+                      value: $(ref.topic_name.value)
+                    - name: REGION
+                      value: $(ref.region.value)
+                    - name: PORT
+                      value: "8080"
+                  # Resource specifications
+                  resources:
+                    limits:
+                      memory: $(ref.memory.value)
+                      cpu: $(ref.cpu.value)
+                  # Health checks for reliability
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 10
+                    periodSeconds: 10
+                  readinessProbe:
+                    httpGet:
+                      path: /ready
+                      port: 8080
+                    initialDelaySeconds: 5
+                    periodSeconds: 5
+      metadata:
+        dependsOn:
+          - enable-apis
+          - analytics-service-account
+          - iot-data-topic
+
+    # Service account for Cloud Run service
+    - name: analytics-service-account
+      type: gcp-types/iam-v1:projects.serviceAccounts
+      properties:
+        name: projects/$(ref.project_id.value)/serviceAccounts/edge-analytics-sa@$(ref.project_id.value).iam.gserviceaccount.com
+        accountId: edge-analytics-sa
+        displayName: "Edge Analytics Service Account"
+        description: "Service account for edge analytics Cloud Run service"
+
+    # IAM binding for Cloud Run service account - Storage access
+    - name: storage-access-binding
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: projects/$(ref.project_id.value)
+        role: roles/storage.objectAdmin
+        member: serviceAccount:edge-analytics-sa@$(ref.project_id.value).iam.gserviceaccount.com
+      metadata:
+        dependsOn:
+          - analytics-service-account
+
+    # IAM binding for Firestore access
+    - name: firestore-access-binding
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: projects/$(ref.project_id.value)
+        role: roles/datastore.user
+        member: serviceAccount:edge-analytics-sa@$(ref.project_id.value).iam.gserviceaccount.com
+      metadata:
+        dependsOn:
+          - analytics-service-account
+
+    # IAM binding for Monitoring access
+    - name: monitoring-access-binding
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: projects/$(ref.project_id.value)
+        role: roles/monitoring.metricWriter
+        member: serviceAccount:edge-analytics-sa@$(ref.project_id.value).iam.gserviceaccount.com
+      metadata:
+        dependsOn:
+          - analytics-service-account
+
+    # IAM policy for Cloud Run service to be publicly accessible
+    - name: cloud-run-invoker-binding
+      type: gcp-types/run-v1:projects.locations.services.iamMemberBinding
+      properties:
+        name: projects/$(ref.project_id.value)/locations/$(ref.region.value)/services/$(ref.service_name.value)
+        role: roles/run.invoker
+        member: allUsers
+      metadata:
+        dependsOn:
+          - edge-analytics-service
+
+    # Pub/Sub subscription with push configuration
+    - name: analytics-subscription
+      type: gcp-types/pubsub-v1:projects.subscriptions
+      properties:
+        name: projects/$(ref.project_id.value)/subscriptions/$(ref.subscription_name.value)
+        topic: projects/$(ref.project_id.value)/topics/$(ref.topic_name.value)
+        # Push configuration to trigger Cloud Run
+        pushConfig:
+          pushEndpoint: $(ref.edge-analytics-service.status.url)/process
+          attributes:
+            x-goog-version: v1
+          # Authentication configuration
+          oidcToken:
+            serviceAccountEmail: edge-analytics-sa@$(ref.project_id.value).iam.gserviceaccount.com
+        # Message retention and acknowledgment settings
+        messageRetentionDuration: $(ref.retention_days.value)d
+        ackDeadlineSeconds: 60
+        # Retry policy for failed deliveries
+        retryPolicy:
+          minimumBackoff: 10s
+          maximumBackoff: 600s
+        # Dead letter policy for persistent failures
+        deadLetterPolicy:
+          deadLetterTopic: projects/$(ref.project_id.value)/topics/$(ref.topic_name.value)-dlq
+          maxDeliveryAttempts: 5
+        # Flow control settings
+        enableExactlyOnceDelivery: true
+      metadata:
+        dependsOn:
+          - iot-data-topic
+          - edge-analytics-service
+          - analytics-service-account
+
+    # Dead letter topic for failed message processing
+    - name: dead-letter-topic
+      type: gcp-types/pubsub-v1:projects.topics
+      properties:
+        name: projects/$(ref.project_id.value)/topics/$(ref.topic_name.value)-dlq
+        messageRetentionDuration: $(ref.retention_days.value)d
+      metadata:
+        dependsOn:
+          - enable-pubsub-api
+
+    # Firestore database for metadata storage
+    - name: firestore-database
+      type: gcp-types/firestore-v1:projects.databases
+      properties:
+        parent: projects/$(ref.project_id.value)
+        databaseId: "(default)"
+        type: FIRESTORE_NATIVE
+        locationId: $(ref.region.value)
+        # Point-in-time recovery for data protection
+        pointInTimeRecoveryEnablement: POINT_IN_TIME_RECOVERY_ENABLED
+        # Application management mode
+        appEngineIntegrationMode: DISABLED
+        # Concurrency control
+        concurrencyMode: OPTIMISTIC
+      metadata:
+        dependsOn:
+          - enable-firestore-api
+
+    # Conditional monitoring resources (when enable_monitoring is true)
+    - name: anomaly-alert-policy
+      type: gcp-types/monitoring-v1:projects.alertPolicies
+      properties:
+        parent: projects/$(ref.project_id.value)
+        displayName: "IoT Anomaly Detection Alert"
+        documentation:
+          content: "Alert triggered when IoT sensor anomaly detection rate exceeds threshold"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "Anomaly Rate High"
+            conditionThreshold:
+              filter: 'metric.type="custom.googleapis.com/iot/anomaly_detected"'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 5
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+        combiner: OR
+        enabled: true
+        # Notification channels would be configured separately
+        notificationChannels: []
+      metadata:
+        condition: $(ref.enable_monitoring.value)
+        dependsOn:
+          - enable-monitoring-api
+
+    - name: processing-rate-alert-policy
+      type: gcp-types/monitoring-v1:projects.alertPolicies
+      properties:
+        parent: projects/$(ref.project_id.value)
+        displayName: "Data Processing Rate Alert"
+        documentation:
+          content: "Alert triggered when data processing rate drops below expected threshold"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "Low Processing Rate"
+            conditionThreshold:
+              filter: 'metric.type="custom.googleapis.com/iot/data_processed"'
+              comparison: COMPARISON_LESS_THAN
+              thresholdValue: 1
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+        combiner: OR
+        enabled: true
+        notificationChannels: []
+      metadata:
+        condition: $(ref.enable_monitoring.value)
+        dependsOn:
+          - enable-monitoring-api
+
+    # Monitoring dashboard for edge analytics
+    - name: edge-analytics-dashboard
+      type: gcp-types/monitoring-v1:projects.dashboards
+      properties:
+        parent: projects/$(ref.project_id.value)
+        displayName: "Edge Analytics Dashboard"
+        mosaicLayout:
+          tiles:
+            - width: 6
+              height: 4
+              widget:
+                title: "Data Processing Rate"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'metric.type="custom.googleapis.com/iot/data_processed"'
+                          aggregation:
+                            alignmentPeriod: 300s
+                            perSeriesAligner: ALIGN_RATE
+                            crossSeriesReducer: REDUCE_SUM
+                      plotType: LINE
+                  yAxis:
+                    label: "Messages per second"
+                    scale: LINEAR
+            - width: 6
+              height: 4
+              xPos: 6
+              widget:
+                title: "Anomaly Detection"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'metric.type="custom.googleapis.com/iot/anomaly_detected"'
+                          aggregation:
+                            alignmentPeriod: 300s
+                            perSeriesAligner: ALIGN_RATE
+                            crossSeriesReducer: REDUCE_SUM
+                      plotType: STACKED_BAR
+                  yAxis:
+                    label: "Anomalies per second"
+                    scale: LINEAR
+            - width: 12
+              height: 4
+              yPos: 4
+              widget:
+                title: "Cloud Run Service Health"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'metric.type="run.googleapis.com/container/request_count"'
+                          aggregation:
+                            alignmentPeriod: 300s
+                            perSeriesAligner: ALIGN_RATE
+                            crossSeriesReducer: REDUCE_SUM
+                      plotType: LINE
+                  yAxis:
+                    label: "Requests per second"
+                    scale: LINEAR
+      metadata:
+        condition: $(ref.enable_monitoring.value)
+        dependsOn:
+          - enable-monitoring-api
+
+  # Output values for verification and integration
+  outputs:
+    - name: project_id
+      value: $(ref.project_id.value)
+      description: "Google Cloud Project ID"
+    
+    - name: region
+      value: $(ref.region.value)
+      description: "Primary deployment region"
+    
+    - name: storage_bucket_name
+      value: $(ref.analytics-data-bucket.name)
+      description: "Cloud Storage bucket for analytics data"
+    
+    - name: storage_bucket_url
+      value: "gs://$(ref.analytics-data-bucket.name)"
+      description: "Cloud Storage bucket URL"
+    
+    - name: pubsub_topic_name
+      value: $(ref.iot-data-topic.name)
+      description: "Pub/Sub topic for IoT data ingestion"
+    
+    - name: pubsub_subscription_name
+      value: $(ref.analytics-subscription.name)
+      description: "Pub/Sub subscription for analytics processing"
+    
+    - name: cloud_run_service_name
+      value: $(ref.edge-analytics-service.metadata.name)
+      description: "Cloud Run service name"
+    
+    - name: cloud_run_service_url
+      value: $(ref.edge-analytics-service.status.url)
+      description: "Cloud Run service URL for external access"
+    
+    - name: service_account_email
+      value: "edge-analytics-sa@$(ref.project_id.value).iam.gserviceaccount.com"
+      description: "Service account email for the analytics service"
+    
+    - name: firestore_database_name
+      value: $(ref.firestore-database.name)
+      description: "Firestore database name for metadata storage"
+    
+    - name: dead_letter_topic_name
+      value: $(ref.dead-letter-topic.name)
+      description: "Dead letter topic for failed message processing"
+    
+    - name: monitoring_dashboard_name
+      value: $(ref.edge-analytics-dashboard.name)
+      description: "Cloud Monitoring dashboard name"
+      condition: $(ref.enable_monitoring.value)
+    
+    - name: deployment_region
+      value: $(ref.region.value)
+      description: "Region where resources are deployed"
+    
+    - name: deployment_summary
+      value: "Edge analytics platform deployed with Cloud Run WebAssembly processing, Pub/Sub ingestion, Cloud Storage data lake, and comprehensive monitoring"
+      description: "Summary of deployed infrastructure"
+
+# Deployment configuration
+deployment:
+  # Deployment constraints
+  constraints:
+    - expression: "variables.max_instances <= 1000"
+      description: "Maximum instances should not exceed 1000 for cost control"
+    
+    - expression: "variables.retention_days >= 1 && variables.retention_days <= 30"
+      description: "Message retention must be between 1 and 30 days"
+    
+    - expression: "variables.lifecycle_nearline_age < variables.lifecycle_coldline_age"
+      description: "Nearline transition must occur before Coldline transition"
+  
+  # Resource dependencies and ordering
+  dependencyOrder:
+    - enable-apis
+    - enable-pubsub-api
+    - enable-storage-api
+    - enable-monitoring-api
+    - enable-firestore-api
+    - enable-cloudbuild-api
+    - analytics-service-account
+    - analytics-data-bucket
+    - firestore-database
+    - iot-data-topic
+    - dead-letter-topic
+    - edge-analytics-service
+    - cloud-run-invoker-binding
+    - storage-access-binding
+    - firestore-access-binding
+    - monitoring-access-binding
+    - analytics-subscription
+    - anomaly-alert-policy
+    - processing-rate-alert-policy
+    - edge-analytics-dashboard
+  
+  # Deployment validation
+  validation:
+    - name: "verify-apis-enabled"
+      description: "Verify all required APIs are enabled"
+      command: "gcloud services list --enabled --filter='name:run.googleapis.com OR name:pubsub.googleapis.com OR name:storage.googleapis.com OR name:monitoring.googleapis.com OR name:firestore.googleapis.com'"
+    
+    - name: "verify-storage-bucket"
+      description: "Verify Cloud Storage bucket is accessible"
+      command: "gsutil ls gs://$(ref.bucket_name.value)"
+    
+    - name: "verify-cloud-run-service"
+      description: "Verify Cloud Run service is running"
+      command: "gcloud run services describe $(ref.service_name.value) --region=$(ref.region.value) --format='value(status.conditions[0].status)'"
+    
+    - name: "verify-pubsub-topic"
+      description: "Verify Pub/Sub topic exists"
+      command: "gcloud pubsub topics describe $(ref.topic_name.value)"
+    
+    - name: "verify-subscription"
+      description: "Verify Pub/Sub subscription is configured"
+      command: "gcloud pubsub subscriptions describe $(ref.subscription_name.value)"
+
+# Metadata for Infrastructure Manager
+metadata:
+  # Recipe information
+  recipe:
+    name: "edge-analytics-cloud-run-webassembly-pub-sub"
+    version: "1.0"
+    category: "edge-computing"
+    difficulty: 300
+    estimated_deployment_time: "15-20 minutes"
+  
+  # Cost estimation (approximate)
+  estimated_monthly_cost:
+    description: "Estimated monthly cost for moderate IoT workloads (1000 messages/hour)"
+    cloud_run: "$5-15 (depending on traffic)"
+    pub_sub: "$1-5 (depending on message volume)"
+    cloud_storage: "$2-10 (depending on data volume)"
+    firestore: "$1-5 (depending on operations)"
+    monitoring: "$0-2 (basic metrics included)"
+    total_estimate: "$9-37 per month"
+  
+  # Security considerations
+  security:
+    - "Service account follows principle of least privilege"
+    - "Cloud Storage bucket uses uniform access control"
+    - "Pub/Sub messages encrypted in transit and at rest"
+    - "Cloud Run service uses execution environment gen2"
+    - "Firestore uses native mode with point-in-time recovery"
+    - "IAM bindings use specific roles rather than owner/editor"
+  
+  # Performance considerations
+  performance:
+    - "Cloud Run configured with 2 CPU and 1GB memory for WebAssembly workloads"
+    - "Auto-scaling from 0 to 100 instances based on demand"
+    - "Pub/Sub configured with exactly-once delivery"
+    - "Storage lifecycle management for cost optimization"
+    - "Monitoring and alerting for proactive management"
+  
+  # Compliance and governance
+  compliance:
+    - "All resources deployed in specified region for data residency"
+    - "Audit logging enabled for Cloud Run service"
+    - "Message retention configured per regulatory requirements"
+    - "Point-in-time recovery enabled for Firestore"
+    - "Dead letter queue configured for failed message handling"

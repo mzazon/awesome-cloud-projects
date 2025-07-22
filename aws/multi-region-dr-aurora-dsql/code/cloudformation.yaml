@@ -1,0 +1,1060 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Multi-Region Disaster Recovery with Aurora DSQL and EventBridge - Production-ready infrastructure for zero-downtime availability with automated monitoring and alerting'
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  # Environment Configuration
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [development, staging, production]
+    Description: 'Environment name for resource tagging and configuration'
+  
+  Project:
+    Type: String
+    Default: disaster-recovery
+    Description: 'Project name for resource identification and cost allocation'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+  
+  # Regional Configuration
+  PrimaryRegion:
+    Type: String
+    Default: us-east-1
+    AllowedValues: [us-east-1, us-west-2, eu-west-1, ap-southeast-1]
+    Description: 'Primary AWS region for Aurora DSQL cluster deployment'
+  
+  SecondaryRegion:
+    Type: String
+    Default: us-west-2
+    AllowedValues: [us-east-1, us-west-2, eu-west-1, ap-southeast-1]
+    Description: 'Secondary AWS region for Aurora DSQL cluster deployment'
+  
+  WitnessRegion:
+    Type: String
+    Default: us-west-1
+    AllowedValues: [us-west-1, eu-central-1, ap-northeast-1]
+    Description: 'Witness region for Aurora DSQL cluster tie-breaking decisions'
+  
+  # Aurora DSQL Configuration
+  ClusterPrefix:
+    Type: String
+    Default: dr-dsql
+    Description: 'Prefix for Aurora DSQL cluster naming (8 characters max)'
+    MaxLength: 8
+    MinLength: 3
+    AllowedPattern: '^[a-z][a-z0-9-]*$'
+    ConstraintDescription: 'Must start with lowercase letter, contain only lowercase letters, numbers, and hyphens'
+  
+  # Monitoring Configuration
+  MonitoringFrequency:
+    Type: String
+    Default: rate(2 minutes)
+    AllowedValues: 
+      - rate(1 minute)
+      - rate(2 minutes)
+      - rate(5 minutes)
+    Description: 'EventBridge schedule for Aurora DSQL health monitoring'
+  
+  AlertEmail:
+    Type: String
+    Description: 'Email address for disaster recovery alerts and notifications'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+  
+  # Lambda Configuration
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 30
+    MaxValue: 300
+    Description: 'Lambda function timeout in seconds for health monitoring'
+  
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024]
+    Description: 'Lambda function memory allocation in MB'
+  
+  ReservedConcurrency:
+    Type: Number
+    Default: 10
+    MinValue: 5
+    MaxValue: 100
+    Description: 'Reserved concurrency for Lambda functions to prevent throttling'
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  IsProduction: !Equals [!Ref Environment, production]
+  EnableEncryption: !Equals [!Ref Environment, production]
+  CreateDashboard: !Equals [!Ref Environment, production]
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # =========================================================================
+  # UNIQUE NAMING SUPPORT
+  # =========================================================================
+  RandomSuffix:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt RandomSuffixFunction.Arn
+      Length: 8
+
+  RandomSuffixFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Project}-random-suffix-generator'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt RandomSuffixRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import random
+          import string
+          import boto3
+          import cfnresponse
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  length = int(event['ResourceProperties'].get('Length', 8))
+                  suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'Suffix': suffix
+                  })
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  RandomSuffixRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # =========================================================================
+  # IAM ROLES AND POLICIES
+  # =========================================================================
+  
+  # Lambda Execution Role for Health Monitoring
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Project}-lambda-execution-role-${RandomSuffix.Suffix}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AuroraDSQLMonitoringPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dsql:GetCluster
+                  - dsql:ListClusters
+                  - dsql:DescribeCluster
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: 
+                  - !Ref PrimarySNSTopic
+                  - !Ref SecondarySNSTopic
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/lambda/*'
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: IAM
+
+  # =========================================================================
+  # SNS TOPICS FOR ALERTING
+  # =========================================================================
+  
+  # Primary Region SNS Topic
+  PrimarySNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${Project}-alerts-primary-${RandomSuffix.Suffix}'
+      DisplayName: 'DR Alerts Primary Region'
+      KmsMasterKeyId: !If 
+        - EnableEncryption
+        - alias/aws/sns
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Region
+          Value: Primary
+        - Key: Component
+          Value: Alerting
+
+  # SNS Topic Policy for Primary Region
+  PrimarySNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref PrimarySNSTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - sns:Publish
+              - sns:Subscribe
+              - sns:ListSubscriptionsByTopic
+              - sns:GetTopicAttributes
+            Resource: !Ref PrimarySNSTopic
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref PrimarySNSTopic
+
+  # Primary Region Email Subscription
+  PrimaryEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref PrimarySNSTopic
+      Endpoint: !Ref AlertEmail
+
+  # Secondary Region SNS Topic (Cross-region reference)
+  SecondarySNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${Project}-alerts-secondary-${RandomSuffix.Suffix}'
+      DisplayName: 'DR Alerts Secondary Region'
+      KmsMasterKeyId: !If 
+        - EnableEncryption
+        - alias/aws/sns
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Region
+          Value: Secondary
+        - Key: Component
+          Value: Alerting
+
+  # Secondary Region Email Subscription
+  SecondaryEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref SecondarySNSTopic
+      Endpoint: !Ref AlertEmail
+
+  # =========================================================================
+  # LAMBDA FUNCTIONS FOR HEALTH MONITORING
+  # =========================================================================
+  
+  # Primary Region Lambda Function
+  PrimaryHealthMonitorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Project}-health-monitor-primary-${RandomSuffix.Suffix}'
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrencyConfiguration:
+        ReservedConcurrency: !Ref ReservedConcurrency
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          CLUSTER_ID: !Sub '${ClusterPrefix}-primary-${RandomSuffix.Suffix}'
+          SNS_TOPIC_ARN: !Ref PrimarySNSTopic
+          REGION: !Ref PrimaryRegion
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import time
+          from datetime import datetime
+          from botocore.exceptions import ClientError
+          
+          def lambda_handler(event, context):
+              """
+              Monitor Aurora DSQL cluster health and send alerts
+              """
+              dsql_client = boto3.client('dsql')
+              sns_client = boto3.client('sns')
+              cloudwatch_client = boto3.client('cloudwatch')
+              
+              cluster_id = os.environ['CLUSTER_ID']
+              sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+              region = os.environ['REGION']
+              
+              try:
+                  # Check cluster status with retry logic
+                  max_retries = 3
+                  for attempt in range(max_retries):
+                      try:
+                          response = dsql_client.get_cluster(identifier=cluster_id)
+                          break
+                      except ClientError as e:
+                          if attempt < max_retries - 1:
+                              time.sleep(2 ** attempt)  # Exponential backoff
+                              continue
+                          raise e
+                  
+                  cluster_status = response['status']
+                  cluster_arn = response['arn']
+                  
+                  # Create comprehensive health report
+                  health_report = {
+                      'timestamp': datetime.now().isoformat(),
+                      'region': region,
+                      'cluster_id': cluster_id,
+                      'cluster_arn': cluster_arn,
+                      'status': cluster_status,
+                      'healthy': cluster_status == 'ACTIVE',
+                      'function_name': context.function_name,
+                      'request_id': context.aws_request_id
+                  }
+                  
+                  # Publish custom CloudWatch metric
+                  cloudwatch_client.put_metric_data(
+                      Namespace='Aurora/DSQL/DisasterRecovery',
+                      MetricData=[
+                          {
+                              'MetricName': 'ClusterHealth',
+                              'Value': 1.0 if cluster_status == 'ACTIVE' else 0.0,
+                              'Unit': 'None',
+                              'Dimensions': [
+                                  {
+                                      'Name': 'ClusterID',
+                                      'Value': cluster_id
+                                  },
+                                  {
+                                      'Name': 'Region',
+                                      'Value': region
+                                  }
+                              ]
+                          }
+                      ]
+                  )
+                  
+                  # Send alert if cluster is not healthy
+                  if cluster_status != 'ACTIVE':
+                      alert_message = f"""
+                      ALERT: Aurora DSQL Cluster Health Issue
+                      
+                      Region: {region}
+                      Cluster ID: {cluster_id}
+                      Cluster ARN: {cluster_arn}
+                      Status: {cluster_status}
+                      Timestamp: {health_report['timestamp']}
+                      Function: {context.function_name}
+                      Request ID: {context.aws_request_id}
+                      
+                      Immediate investigation required.
+                      Check Aurora DSQL console for detailed status information.
+                      """
+                      
+                      sns_client.publish(
+                          TopicArn=sns_topic_arn,
+                          Subject=f'Aurora DSQL Alert - {region}',
+                          Message=alert_message
+                      )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(health_report),
+                      'headers': {
+                          'Content-Type': 'application/json'
+                      }
+                  }
+                  
+              except Exception as e:
+                  error_message = f"""
+                  ERROR: Aurora DSQL Health Check Failed
+                  
+                  Region: {region}
+                  Cluster ID: {cluster_id}
+                  Error: {str(e)}
+                  Error Type: {type(e).__name__}
+                  Timestamp: {datetime.now().isoformat()}
+                  Function: {context.function_name}
+                  Request ID: {context.aws_request_id}
+                  
+                  This error indicates a potential issue with the monitoring infrastructure.
+                  Verify Lambda function permissions and Aurora DSQL cluster accessibility.
+                  """
+                  
+                  try:
+                      sns_client.publish(
+                          TopicArn=sns_topic_arn,
+                          Subject=f'Aurora DSQL Health Check Error - {region}',
+                          Message=error_message
+                      )
+                  except Exception as sns_error:
+                      print(f"Failed to send SNS alert: {sns_error}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'error_type': type(e).__name__,
+                          'timestamp': datetime.now().isoformat()
+                      }),
+                      'headers': {
+                          'Content-Type': 'application/json'
+                      }
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Region
+          Value: Primary
+        - Key: Component
+          Value: Monitoring
+
+  # Secondary Region Lambda Function
+  SecondaryHealthMonitorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Project}-health-monitor-secondary-${RandomSuffix.Suffix}'
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrencyConfiguration:
+        ReservedConcurrency: !Ref ReservedConcurrency
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          CLUSTER_ID: !Sub '${ClusterPrefix}-secondary-${RandomSuffix.Suffix}'
+          SNS_TOPIC_ARN: !Ref SecondarySNSTopic
+          REGION: !Ref SecondaryRegion
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import time
+          from datetime import datetime
+          from botocore.exceptions import ClientError
+          
+          def lambda_handler(event, context):
+              """
+              Monitor Aurora DSQL cluster health and send alerts
+              """
+              dsql_client = boto3.client('dsql')
+              sns_client = boto3.client('sns')
+              cloudwatch_client = boto3.client('cloudwatch')
+              
+              cluster_id = os.environ['CLUSTER_ID']
+              sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+              region = os.environ['REGION']
+              
+              try:
+                  # Check cluster status with retry logic
+                  max_retries = 3
+                  for attempt in range(max_retries):
+                      try:
+                          response = dsql_client.get_cluster(identifier=cluster_id)
+                          break
+                      except ClientError as e:
+                          if attempt < max_retries - 1:
+                              time.sleep(2 ** attempt)  # Exponential backoff
+                              continue
+                          raise e
+                  
+                  cluster_status = response['status']
+                  cluster_arn = response['arn']
+                  
+                  # Create comprehensive health report
+                  health_report = {
+                      'timestamp': datetime.now().isoformat(),
+                      'region': region,
+                      'cluster_id': cluster_id,
+                      'cluster_arn': cluster_arn,
+                      'status': cluster_status,
+                      'healthy': cluster_status == 'ACTIVE',
+                      'function_name': context.function_name,
+                      'request_id': context.aws_request_id
+                  }
+                  
+                  # Publish custom CloudWatch metric
+                  cloudwatch_client.put_metric_data(
+                      Namespace='Aurora/DSQL/DisasterRecovery',
+                      MetricData=[
+                          {
+                              'MetricName': 'ClusterHealth',
+                              'Value': 1.0 if cluster_status == 'ACTIVE' else 0.0,
+                              'Unit': 'None',
+                              'Dimensions': [
+                                  {
+                                      'Name': 'ClusterID',
+                                      'Value': cluster_id
+                                  },
+                                  {
+                                      'Name': 'Region',
+                                      'Value': region
+                                  }
+                              ]
+                          }
+                      ]
+                  )
+                  
+                  # Send alert if cluster is not healthy
+                  if cluster_status != 'ACTIVE':
+                      alert_message = f"""
+                      ALERT: Aurora DSQL Cluster Health Issue
+                      
+                      Region: {region}
+                      Cluster ID: {cluster_id}
+                      Cluster ARN: {cluster_arn}
+                      Status: {cluster_status}
+                      Timestamp: {health_report['timestamp']}
+                      Function: {context.function_name}
+                      Request ID: {context.aws_request_id}
+                      
+                      Immediate investigation required.
+                      Check Aurora DSQL console for detailed status information.
+                      """
+                      
+                      sns_client.publish(
+                          TopicArn=sns_topic_arn,
+                          Subject=f'Aurora DSQL Alert - {region}',
+                          Message=alert_message
+                      )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(health_report),
+                      'headers': {
+                          'Content-Type': 'application/json'
+                      }
+                  }
+                  
+              except Exception as e:
+                  error_message = f"""
+                  ERROR: Aurora DSQL Health Check Failed
+                  
+                  Region: {region}
+                  Cluster ID: {cluster_id}
+                  Error: {str(e)}
+                  Error Type: {type(e).__name__}
+                  Timestamp: {datetime.now().isoformat()}
+                  Function: {context.function_name}
+                  Request ID: {context.aws_request_id}
+                  
+                  This error indicates a potential issue with the monitoring infrastructure.
+                  Verify Lambda function permissions and Aurora DSQL cluster accessibility.
+                  """
+                  
+                  try:
+                      sns_client.publish(
+                          TopicArn=sns_topic_arn,
+                          Subject=f'Aurora DSQL Health Check Error - {region}',
+                          Message=error_message
+                      )
+                  except Exception as sns_error:
+                      print(f"Failed to send SNS alert: {sns_error}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'error_type': type(e).__name__,
+                          'timestamp': datetime.now().isoformat()
+                      }),
+                      'headers': {
+                          'Content-Type': 'application/json'
+                      }
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Region
+          Value: Secondary
+        - Key: Component
+          Value: Monitoring
+
+  # =========================================================================
+  # EVENTBRIDGE RULES FOR AUTOMATED MONITORING
+  # =========================================================================
+  
+  # Primary Region EventBridge Rule
+  PrimaryMonitoringRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${Project}-health-monitor-primary-${RandomSuffix.Suffix}'
+      Description: 'Aurora DSQL health monitoring for primary region'
+      State: ENABLED
+      ScheduleExpression: !Ref MonitoringFrequency
+      Targets:
+        - Arn: !GetAtt PrimaryHealthMonitorFunction.Arn
+          Id: PrimaryHealthMonitorTarget
+          RetryPolicy:
+            MaximumRetryAttempts: 3
+            MaximumEventAge: 3600
+      EventBusName: default
+
+  # Permission for EventBridge to invoke Primary Lambda
+  PrimaryLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PrimaryHealthMonitorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PrimaryMonitoringRule.Arn
+
+  # Secondary Region EventBridge Rule
+  SecondaryMonitoringRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${Project}-health-monitor-secondary-${RandomSuffix.Suffix}'
+      Description: 'Aurora DSQL health monitoring for secondary region'
+      State: ENABLED
+      ScheduleExpression: !Ref MonitoringFrequency
+      Targets:
+        - Arn: !GetAtt SecondaryHealthMonitorFunction.Arn
+          Id: SecondaryHealthMonitorTarget
+          RetryPolicy:
+            MaximumRetryAttempts: 3
+            MaximumEventAge: 3600
+      EventBusName: default
+
+  # Permission for EventBridge to invoke Secondary Lambda
+  SecondaryLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SecondaryHealthMonitorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SecondaryMonitoringRule.Arn
+
+  # =========================================================================
+  # CLOUDWATCH ALARMS
+  # =========================================================================
+  
+  # Primary Lambda Function Error Alarm
+  PrimaryLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Project}-lambda-errors-primary-${RandomSuffix.Suffix}'
+      AlarmDescription: 'Alert when Lambda function errors occur in primary region'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PrimaryHealthMonitorFunction
+      AlarmActions:
+        - !Ref PrimarySNSTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: Monitoring
+
+  # Secondary Lambda Function Error Alarm
+  SecondaryLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Project}-lambda-errors-secondary-${RandomSuffix.Suffix}'
+      AlarmDescription: 'Alert when Lambda function errors occur in secondary region'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SecondaryHealthMonitorFunction
+      AlarmActions:
+        - !Ref SecondarySNSTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: Monitoring
+
+  # Aurora DSQL Cluster Health Alarm
+  AuroraDSQLHealthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Project}-cluster-health-${RandomSuffix.Suffix}'
+      AlarmDescription: 'Alert when Aurora DSQL cluster health degrades'
+      MetricName: ClusterHealth
+      Namespace: Aurora/DSQL/DisasterRecovery
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0.5
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref PrimarySNSTopic
+      TreatMissingData: breaching
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: Monitoring
+
+  # EventBridge Rule Failure Alarm
+  EventBridgeFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Project}-eventbridge-failures-${RandomSuffix.Suffix}'
+      AlarmDescription: 'Alert when EventBridge rules fail to execute'
+      MetricName: FailedInvocations
+      Namespace: AWS/Events
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: RuleName
+          Value: !Ref PrimaryMonitoringRule
+      AlarmActions:
+        - !Ref PrimarySNSTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: Monitoring
+
+  # =========================================================================
+  # CLOUDWATCH DASHBOARD (CONDITIONAL)
+  # =========================================================================
+  
+  # Comprehensive monitoring dashboard for production environments
+  DisasterRecoveryDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateDashboard
+    Properties:
+      DashboardName: !Sub 'Aurora-DSQL-DR-Dashboard-${RandomSuffix.Suffix}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${PrimaryHealthMonitorFunction}"],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${SecondaryHealthMonitorFunction}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Invocations",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Errors", "FunctionName", "${PrimaryHealthMonitorFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${SecondaryHealthMonitorFunction}"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${PrimaryHealthMonitorFunction}"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${SecondaryHealthMonitorFunction}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Errors and Duration"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 6, "width": 24, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Events", "MatchedEvents", "RuleName", "${PrimaryMonitoringRule}"],
+                  ["AWS/Events", "MatchedEvents", "RuleName", "${SecondaryMonitoringRule}"],
+                  ["AWS/Events", "SuccessfulInvocations", "RuleName", "${PrimaryMonitoringRule}"],
+                  ["AWS/Events", "SuccessfulInvocations", "RuleName", "${SecondaryMonitoringRule}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "EventBridge Rule Executions and Success Rate"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 12, "width": 24, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["Aurora/DSQL/DisasterRecovery", "ClusterHealth", "ClusterID", "${ClusterPrefix}-primary-${RandomSuffix.Suffix}", "Region", "${PrimaryRegion}"],
+                  ["Aurora/DSQL/DisasterRecovery", "ClusterHealth", "ClusterID", "${ClusterPrefix}-secondary-${RandomSuffix.Suffix}", "Region", "${SecondaryRegion}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Aurora DSQL Cluster Health Status",
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 1
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  # Environment Information
+  Environment:
+    Description: 'Deployment environment'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+  Project:
+    Description: 'Project name'
+    Value: !Ref Project
+    Export:
+      Name: !Sub '${AWS::StackName}-Project'
+
+  RandomSuffix:
+    Description: 'Random suffix used for resource naming'
+    Value: !GetAtt RandomSuffix.Suffix
+    Export:
+      Name: !Sub '${AWS::StackName}-RandomSuffix'
+
+  # Regional Configuration
+  PrimaryRegion:
+    Description: 'Primary AWS region for Aurora DSQL cluster'
+    Value: !Ref PrimaryRegion
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryRegion'
+
+  SecondaryRegion:
+    Description: 'Secondary AWS region for Aurora DSQL cluster'
+    Value: !Ref SecondaryRegion
+    Export:
+      Name: !Sub '${AWS::StackName}-SecondaryRegion'
+
+  WitnessRegion:
+    Description: 'Witness region for Aurora DSQL cluster'
+    Value: !Ref WitnessRegion
+    Export:
+      Name: !Sub '${AWS::StackName}-WitnessRegion'
+
+  # Aurora DSQL Cluster Identifiers
+  PrimaryClusterIdentifier:
+    Description: 'Aurora DSQL primary cluster identifier'
+    Value: !Sub '${ClusterPrefix}-primary-${RandomSuffix.Suffix}'
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryClusterID'
+
+  SecondaryClusterIdentifier:
+    Description: 'Aurora DSQL secondary cluster identifier'
+    Value: !Sub '${ClusterPrefix}-secondary-${RandomSuffix.Suffix}'
+    Export:
+      Name: !Sub '${AWS::StackName}-SecondaryClusterID'
+
+  # SNS Topics
+  PrimarySNSTopicArn:
+    Description: 'ARN of the primary region SNS topic for alerts'
+    Value: !Ref PrimarySNSTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimarySNSTopic'
+
+  SecondarySNSTopicArn:
+    Description: 'ARN of the secondary region SNS topic for alerts'
+    Value: !Ref SecondarySNSTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SecondarySNSTopic'
+
+  # Lambda Functions
+  PrimaryLambdaFunctionArn:
+    Description: 'ARN of the primary region health monitoring Lambda function'
+    Value: !GetAtt PrimaryHealthMonitorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryLambdaArn'
+
+  SecondaryLambdaFunctionArn:
+    Description: 'ARN of the secondary region health monitoring Lambda function'
+    Value: !GetAtt SecondaryHealthMonitorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SecondaryLambdaArn'
+
+  # EventBridge Rules
+  PrimaryEventBridgeRuleArn:
+    Description: 'ARN of the primary region EventBridge monitoring rule'
+    Value: !GetAtt PrimaryMonitoringRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryEventBridgeRule'
+
+  SecondaryEventBridgeRuleArn:
+    Description: 'ARN of the secondary region EventBridge monitoring rule'
+    Value: !GetAtt SecondaryMonitoringRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SecondaryEventBridgeRule'
+
+  # CloudWatch Dashboard
+  DashboardURL:
+    Description: 'URL to the CloudWatch dashboard for disaster recovery monitoring'
+    Condition: CreateDashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=Aurora-DSQL-DR-Dashboard-${RandomSuffix.Suffix}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  # Deployment Instructions
+  NextSteps:
+    Description: 'Next steps for completing the disaster recovery setup'
+    Value: |
+      1. Create Aurora DSQL clusters using the output cluster identifiers
+      2. Configure cluster peering between primary and secondary regions
+      3. Verify Lambda functions are receiving EventBridge triggers
+      4. Test the alerting system by publishing to SNS topics
+      5. Monitor the CloudWatch dashboard for system health
+    Export:
+      Name: !Sub '${AWS::StackName}-NextSteps'
+
+  # Cost Estimation
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for monitoring infrastructure (excluding Aurora DSQL clusters)'
+    Value: |
+      Lambda: ~$5-15/month (based on 2-minute monitoring frequency)
+      CloudWatch: ~$10-20/month (alarms, metrics, dashboard)
+      SNS: ~$1-3/month (email notifications)
+      EventBridge: ~$1-5/month (rule executions)
+      Total Monitoring: ~$17-43/month
+      Note: Aurora DSQL cluster costs depend on usage and capacity
+    Export:
+      Name: !Sub '${AWS::StackName}-EstimatedCost'
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - Project
+          - AlertEmail
+      - Label:
+          default: "Regional Configuration"
+        Parameters:
+          - PrimaryRegion
+          - SecondaryRegion
+          - WitnessRegion
+      - Label:
+          default: "Aurora DSQL Configuration"
+        Parameters:
+          - ClusterPrefix
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - MonitoringFrequency
+          - LambdaTimeout
+          - LambdaMemorySize
+          - ReservedConcurrency
+    ParameterLabels:
+      Environment:
+        default: "Environment"
+      Project:
+        default: "Project Name"
+      AlertEmail:
+        default: "Alert Email Address"
+      PrimaryRegion:
+        default: "Primary Region"
+      SecondaryRegion:
+        default: "Secondary Region"
+      WitnessRegion:
+        default: "Witness Region"
+      ClusterPrefix:
+        default: "Cluster Prefix"
+      MonitoringFrequency:
+        default: "Monitoring Frequency"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Memory (MB)"
+      ReservedConcurrency:
+        default: "Lambda Reserved Concurrency"
+
+  AWS::CloudFormation::Designer:
+    Description: "Multi-Region Disaster Recovery with Aurora DSQL and EventBridge"
+    CreatedBy: "AWS CloudFormation Template Generator"
+    Version: "1.0"
+    LastUpdated: "2025-01-27"

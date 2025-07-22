@@ -1,0 +1,448 @@
+# Infrastructure Manager Configuration for Code Review Automation
+# This configuration deploys an intelligent code review system using Firebase Studio,
+# Cloud Source Repositories, Vertex AI, and Cloud Functions for automated code analysis
+
+# Configuration metadata
+metadata:
+  name: code-review-automation-system
+  description: "Intelligent code review automation using Firebase Studio and AI"
+  version: "1.0"
+  labels:
+    environment: "production"
+    service: "code-review"
+    component: "ai-automation"
+    recipe: "code-review-automation-firebase-studio-source-repositories"
+
+# Input parameters for customization
+input:
+  properties:
+    # Required parameters
+    project_id:
+      type: string
+      description: "Google Cloud Project ID for resource deployment"
+    
+    # Optional parameters with defaults
+    region:
+      type: string
+      description: "Primary region for resource deployment"
+      default: "us-central1"
+    
+    repository_name:
+      type: string
+      description: "Name of the Cloud Source Repository"
+      default: "intelligent-review-system"
+    
+    function_name:
+      type: string
+      description: "Name of the Cloud Function for webhook processing"
+      default: "code-review-trigger"
+    
+    service_account_name:
+      type: string
+      description: "Name of the service account for Cloud Function"
+      default: "code-review-automation"
+    
+    bucket_suffix:
+      type: string
+      description: "Suffix for storage bucket names"
+      default: "code-review-functions"
+    
+    ai_model_name:
+      type: string
+      description: "Vertex AI model for code analysis"
+      default: "gemini-2.0-flash-thinking"
+    
+    function_memory:
+      type: integer
+      description: "Memory allocation for Cloud Function (MB)"
+      default: 512
+    
+    function_timeout:
+      type: integer
+      description: "Timeout for Cloud Function (seconds)"
+      default: 540
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-source-repositories-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id)/services/sourcerepo.googleapis.com
+    
+  - name: enable-cloud-functions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id)/services/cloudfunctions.googleapis.com
+    
+  - name: enable-vertex-ai-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id)/services/aiplatform.googleapis.com
+    
+  - name: enable-cloud-build-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id)/services/cloudbuild.googleapis.com
+    
+  - name: enable-firebase-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id)/services/firebase.googleapis.com
+    
+  - name: enable-eventarc-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id)/services/eventarc.googleapis.com
+    
+  - name: enable-secret-manager-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id)/services/secretmanager.googleapis.com
+    
+  - name: enable-cloud-scheduler-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id)/services/cloudscheduler.googleapis.com
+
+  # Cloud Source Repository for intelligent code review
+  - name: intelligent-code-repository
+    type: gcp-types/sourcerepo-v1:projects.repos
+    properties:
+      name: projects/$(ref.project_id)/repos/$(ref.repository_name)
+    metadata:
+      dependsOn:
+        - enable-source-repositories-api
+
+  # Service Account for Cloud Function with least privilege access
+  - name: code-review-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: $(ref.service_account_name)
+      displayName: "Code Review Automation Service Account"
+      description: "Service account for intelligent code review Cloud Function"
+    metadata:
+      dependsOn:
+        - enable-cloud-functions-api
+
+  # IAM role bindings for service account
+  - name: vertex-ai-user-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: $(ref.project_id)
+      policy:
+        bindings:
+          # Vertex AI access for code analysis
+          - role: roles/aiplatform.user
+            members:
+              - serviceAccount:$(ref.code-review-service-account.email)
+          # Source repository read access
+          - role: roles/source.reader
+            members:
+              - serviceAccount:$(ref.code-review-service-account.email)
+          # Cloud logging write access
+          - role: roles/logging.logWriter
+            members:
+              - serviceAccount:$(ref.code-review-service-account.email)
+          # Secret Manager access for API keys
+          - role: roles/secretmanager.secretAccessor
+            members:
+              - serviceAccount:$(ref.code-review-service-account.email)
+    metadata:
+      dependsOn:
+        - code-review-service-account
+        - enable-vertex-ai-api
+        - enable-secret-manager-api
+
+  # Cloud Storage bucket for Cloud Function source code
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(ref.project_id)-$(ref.bucket_suffix)
+      location: $(ref.region)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          # Automatically delete old versions after 30 days
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              isLive: false
+          # Transition to cheaper storage class after 7 days
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 7
+              isLive: true
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+    metadata:
+      dependsOn:
+        - enable-cloud-functions-api
+
+  # Cloud Function for repository webhook processing and AI analysis
+  - name: code-review-cloud-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      name: projects/$(ref.project_id)/locations/$(ref.region)/functions/$(ref.function_name)
+      sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/function-source.zip
+      entryPoint: codeReviewTrigger
+      runtime: nodejs20
+      timeout: $(ref.function_timeout)s
+      availableMemoryMb: $(ref.function_memory)
+      serviceAccountEmail: $(ref.code-review-service-account.email)
+      environmentVariables:
+        PROJECT_ID: $(ref.project_id)
+        REGION: $(ref.region)
+        AI_MODEL: $(ref.ai_model_name)
+        AI_TEMPERATURE: "0.3"
+        AI_MAX_TOKENS: "4096"
+        REPOSITORY_NAME: $(ref.repository_name)
+      httpsTrigger:
+        securityLevel: SECURE_ALWAYS
+      labels:
+        component: "code-review"
+        environment: "production"
+    metadata:
+      dependsOn:
+        - function-source-bucket
+        - vertex-ai-user-binding
+
+  # Firebase project initialization for Studio integration
+  - name: firebase-project
+    type: gcp-types/firebase-v1beta1:projects
+    properties:
+      projectId: $(ref.project_id)
+      displayName: "Code Review Automation Firebase Project"
+    metadata:
+      dependsOn:
+        - enable-firebase-api
+
+  # Cloud Monitoring Alert Policy for function errors
+  - name: function-error-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: "Code Review Function Errors"
+      documentation:
+        content: |
+          Alert triggered when the code review Cloud Function experiences high error rates.
+          This indicates issues with the AI-powered code analysis system.
+        mimeType: "text/markdown"
+      conditions:
+        - displayName: "Function error rate exceeds threshold"
+          conditionThreshold:
+            filter: |
+              resource.type="cloud_function"
+              resource.labels.function_name="$(ref.function_name)"
+              metric.type="cloudfunctions.googleapis.com/function/execution_count"
+              metric.labels.status!="ok"
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 5
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_SUM
+      alertStrategy:
+        autoClose: 86400s
+      enabled: true
+      notificationChannels: []
+    metadata:
+      dependsOn:
+        - code-review-cloud-function
+
+  # Cloud Logging Sink for function logs analysis
+  - name: code-review-log-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      name: code-review-function-logs
+      destination: storage.googleapis.com/$(ref.function-source-bucket.name)
+      filter: |
+        resource.type="cloud_function"
+        resource.labels.function_name="$(ref.function_name)"
+      description: "Export code review function logs for analysis and debugging"
+      includeChildren: false
+    metadata:
+      dependsOn:
+        - function-source-bucket
+        - code-review-cloud-function
+
+  # Vertex AI Endpoint for code analysis model serving
+  - name: vertex-ai-endpoint
+    type: gcp-types/aiplatform-v1:projects.locations.endpoints
+    properties:
+      parent: projects/$(ref.project_id)/locations/$(ref.region)
+      endpoint:
+        displayName: "Code Review AI Endpoint"
+        description: "Vertex AI endpoint for intelligent code review analysis"
+        labels:
+          component: "code-review"
+          environment: "production"
+    metadata:
+      dependsOn:
+        - enable-vertex-ai-api
+
+  # Cloud Scheduler job for periodic system health checks
+  - name: health-check-scheduler
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/$(ref.project_id)/locations/$(ref.region)
+      job:
+        name: projects/$(ref.project_id)/locations/$(ref.region)/jobs/code-review-health-check
+        description: "Periodic health check for code review automation system"
+        schedule: "0 */6 * * *"  # Every 6 hours
+        timeZone: "UTC"
+        httpTarget:
+          uri: $(ref.code-review-cloud-function.httpsTrigger.url)
+          httpMethod: GET
+          headers:
+            Content-Type: "application/json"
+          body: |
+            {
+              "eventType": "health_check",
+              "timestamp": "$(timestamp)",
+              "source": "cloud_scheduler"
+            }
+    metadata:
+      dependsOn:
+        - enable-cloud-scheduler-api
+        - code-review-cloud-function
+
+  # Secret Manager secret for external API keys and configurations
+  - name: api-keys-secret
+    type: gcp-types/secretmanager-v1:projects.secrets
+    properties:
+      parent: projects/$(ref.project_id)
+      secretId: code-review-api-keys
+      secret:
+        replication:
+          automatic: {}
+        labels:
+          component: "code-review"
+          environment: "production"
+          purpose: "api-integration"
+    metadata:
+      dependsOn:
+        - enable-secret-manager-api
+
+  # Initial secret version with placeholder data
+  - name: api-keys-secret-version
+    type: gcp-types/secretmanager-v1:projects.secrets.versions
+    properties:
+      parent: $(ref.api-keys-secret.name)
+      secretVersion:
+        payload:
+          data: |
+            {
+              "github_token": "placeholder",
+              "slack_webhook": "placeholder",
+              "custom_ai_endpoint": "placeholder"
+            }
+    metadata:
+      dependsOn:
+        - api-keys-secret
+
+# Output values for integration and post-deployment configuration
+outputs:
+  # Repository information
+  repository_clone_url:
+    description: "Clone URL for the Cloud Source Repository"
+    value: $(ref.intelligent-code-repository.url)
+  
+  repository_name:
+    description: "Name of the created repository"
+    value: $(ref.repository_name)
+  
+  # Cloud Function information
+  function_trigger_url:
+    description: "HTTP trigger URL for the Cloud Function webhook"
+    value: $(ref.code-review-cloud-function.httpsTrigger.url)
+  
+  function_name:
+    description: "Full name of the deployed Cloud Function"
+    value: $(ref.code-review-cloud-function.name)
+  
+  # Service account information
+  service_account_email:
+    description: "Email of the service account used by the function"
+    value: $(ref.code-review-service-account.email)
+  
+  # Storage information
+  storage_bucket_name:
+    description: "Name of the Cloud Storage bucket for function source"
+    value: $(ref.function-source-bucket.name)
+  
+  storage_bucket_url:
+    description: "Storage bucket URL for uploading function source"
+    value: gs://$(ref.function-source-bucket.name)
+  
+  # AI and Firebase integration
+  vertex_ai_endpoint:
+    description: "Vertex AI endpoint for custom model serving"
+    value: $(ref.vertex-ai-endpoint.name)
+  
+  firebase_project_id:
+    description: "Firebase project ID for Studio integration"
+    value: $(ref.firebase-project.projectId)
+  
+  # Monitoring and logging
+  monitoring_alert_policy:
+    description: "Cloud Monitoring alert policy for function errors"
+    value: $(ref.function-error-alert-policy.name)
+  
+  log_sink_name:
+    description: "Cloud Logging sink for function logs"
+    value: $(ref.code-review-log-sink.name)
+  
+  # Secret management
+  secret_name:
+    description: "Secret Manager secret for API keys"
+    value: $(ref.api-keys-secret.name)
+  
+  # Deployment instructions
+  deployment_instructions:
+    description: "Next steps for completing the intelligent code review setup"
+    value: |
+      ## Post-Deployment Setup Instructions
+      
+      1. **Upload Cloud Function Source Code:**
+         - Package the function code as function-source.zip
+         - Upload to: gs://$(ref.function-source-bucket.name)/function-source.zip
+      
+      2. **Access Firebase Studio:**
+         - Navigate to: https://studio.firebase.google.com
+         - Create a new workspace with project: $(ref.project_id)
+         - Develop intelligent code review agents using Gemini integration
+      
+      3. **Configure Repository Webhooks:**
+         - Set webhook URL: $(ref.code-review-cloud-function.httpsTrigger.url)
+         - Enable for push and pull request events
+         - Configure authentication if required
+      
+      4. **Update Secret Manager:**
+         - Add actual API keys to: $(ref.api-keys-secret.name)
+         - Include GitHub tokens, Slack webhooks, etc.
+      
+      5. **Test the System:**
+         - Clone repository: $(ref.intelligent-code-repository.url)
+         - Make test commits to trigger AI analysis
+         - Monitor function logs for analysis results
+      
+      6. **Monitor and Optimize:**
+         - Review alert policy: $(ref.function-error-alert-policy.name)
+         - Check function logs in: $(ref.log-sink-name)
+         - Optimize AI model parameters as needed
+  
+  # Project and region information
+  project_id:
+    description: "Google Cloud Project ID used for deployment"
+    value: $(ref.project_id)
+  
+  deployment_region:
+    description: "Primary region for resource deployment"
+    value: $(ref.region)

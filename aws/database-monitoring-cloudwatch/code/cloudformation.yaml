@@ -1,0 +1,664 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Comprehensive database monitoring solution with CloudWatch dashboards and alarms.
+  Creates an RDS MySQL instance with enhanced monitoring, CloudWatch dashboard
+  for visualization, and automated alerting through SNS.
+
+# ============================================================================
+# PARAMETERS
+# ============================================================================
+Parameters:
+  # Database Configuration
+  DatabaseInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+      - db.t3.large
+    Description: RDS instance class for the database
+    
+  DatabaseAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 100
+    Description: Amount of storage (in GB) allocated to the database
+    
+  DatabaseName:
+    Type: String
+    Default: monitoringdemo
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9]*$'
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters
+    Description: Name for the initial database
+    
+  DatabaseUsername:
+    Type: String
+    Default: admin
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9]*$'
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters
+    Description: Master username for the database
+    
+  DatabasePassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    AllowedPattern: '^[a-zA-Z0-9!@#$%^&*()_+=-]*$'
+    ConstraintDescription: Must be 8-41 characters and contain only alphanumeric and special characters
+    Description: Master password for the database (8-41 characters)
+    
+  # Monitoring Configuration
+  MonitoringInterval:
+    Type: Number
+    Default: 60
+    AllowedValues: [0, 1, 5, 10, 15, 30, 60]
+    Description: Enhanced monitoring interval in seconds (0 disables enhanced monitoring)
+    
+  PerformanceInsightsRetentionPeriod:
+    Type: Number
+    Default: 7
+    AllowedValues: [7, 731]
+    Description: Performance Insights retention period in days
+    
+  # Notification Configuration
+  AlertEmail:
+    Type: String
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+    Description: Email address to receive database monitoring alerts
+    
+  # Alarm Thresholds
+  CPUAlarmThreshold:
+    Type: Number
+    Default: 80
+    MinValue: 1
+    MaxValue: 100
+    Description: CPU utilization threshold for alarm (percentage)
+    
+  ConnectionsAlarmThreshold:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    MaxValue: 1000
+    Description: Database connections threshold for alarm
+    
+  FreeStorageSpaceThreshold:
+    Type: Number
+    Default: 2147483648
+    Description: Free storage space threshold for alarm (bytes, default 2GB)
+    
+  # Environment Configuration
+  Environment:
+    Type: String
+    Default: development
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: Environment name for resource tagging
+
+# ============================================================================
+# CONDITIONS
+# ============================================================================
+Conditions:
+  # Enable enhanced monitoring if interval > 0
+  EnableEnhancedMonitoring: !Not [!Equals [!Ref MonitoringInterval, 0]]
+  
+  # Enable Performance Insights for non-micro instances
+  EnablePerformanceInsights: !Not [!Equals [!Ref DatabaseInstanceClass, 'db.t3.micro']]
+  
+  # Production environment gets additional monitoring
+  IsProduction: !Equals [!Ref Environment, 'production']
+
+# ============================================================================
+# RESOURCES
+# ============================================================================
+Resources:
+  # -------------------------------------------------------------------------
+  # IAM Role for Enhanced Monitoring
+  # -------------------------------------------------------------------------
+  EnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Condition: EnableEnhancedMonitoring
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-rds-monitoring-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-enhanced-monitoring-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: RDS Enhanced Monitoring
+
+  # -------------------------------------------------------------------------
+  # Database Subnet Group
+  # -------------------------------------------------------------------------
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${AWS::StackName}-subnet-group'
+      DBSubnetGroupDescription: Subnet group for database monitoring demo
+      SubnetIds:
+        - !Ref DatabaseSubnet1
+        - !Ref DatabaseSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-db-subnet-group'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -------------------------------------------------------------------------
+  # VPC and Networking Resources
+  # -------------------------------------------------------------------------
+  DatabaseVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+
+  DatabaseSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref DatabaseVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+
+  DatabaseSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref DatabaseVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-db-security-group'
+      GroupDescription: Security group for database monitoring demo
+      VpcId: !Ref DatabaseVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 10.0.0.0/16
+          Description: MySQL access from VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-db-security-group'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -------------------------------------------------------------------------
+  # RDS Database Instance
+  # -------------------------------------------------------------------------
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub '${AWS::StackName}-database'
+      DBInstanceClass: !Ref DatabaseInstanceClass
+      Engine: mysql
+      EngineVersion: '8.0.35'
+      AllocatedStorage: !Ref DatabaseAllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true
+      
+      # Database Configuration
+      DBName: !Ref DatabaseName
+      MasterUsername: !Ref DatabaseUsername
+      MasterUserPassword: !Ref DatabasePassword
+      
+      # Network Configuration
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      PubliclyAccessible: false
+      
+      # Backup Configuration
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'sun:04:00-sun:05:00'
+      
+      # Monitoring Configuration
+      MonitoringInterval: !Ref MonitoringInterval
+      MonitoringRoleArn: !If
+        - EnableEnhancedMonitoring
+        - !GetAtt EnhancedMonitoringRole.Arn
+        - !Ref 'AWS::NoValue'
+      EnablePerformanceInsights: !If
+        - EnablePerformanceInsights
+        - true
+        - false
+      PerformanceInsightsRetentionPeriod: !If
+        - EnablePerformanceInsights
+        - !Ref PerformanceInsightsRetentionPeriod
+        - !Ref 'AWS::NoValue'
+      
+      # Additional Configuration
+      MultiAZ: !If [IsProduction, true, false]
+      DeletionProtection: !If [IsProduction, true, false]
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-database'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Database Monitoring Demo
+        - Key: Engine
+          Value: MySQL
+
+  # -------------------------------------------------------------------------
+  # SNS Topic for Alerts
+  # -------------------------------------------------------------------------
+  DatabaseAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-database-alerts'
+      DisplayName: Database Monitoring Alerts
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-database-alerts'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Database Monitoring Notifications
+
+  DatabaseAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref DatabaseAlertsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - sns:Publish
+            Resource: !Ref DatabaseAlertsTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+
+  DatabaseAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref DatabaseAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # -------------------------------------------------------------------------
+  # CloudWatch Alarms
+  # -------------------------------------------------------------------------
+  CPUUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-HighCPU'
+      AlarmDescription: !Sub 'High CPU utilization on ${DatabaseInstance}'
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref CPUAlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref DatabaseAlertsTopic
+      OKActions:
+        - !Ref DatabaseAlertsTopic
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DatabaseInstance
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-cpu-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+  DatabaseConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-HighConnections'
+      AlarmDescription: !Sub 'High database connections on ${DatabaseInstance}'
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref ConnectionsAlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref DatabaseAlertsTopic
+      OKActions:
+        - !Ref DatabaseAlertsTopic
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DatabaseInstance
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-connections-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+  FreeStorageSpaceAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-LowStorage'
+      AlarmDescription: !Sub 'Low free storage space on ${DatabaseInstance}'
+      MetricName: FreeStorageSpace
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref FreeStorageSpaceThreshold
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref DatabaseAlertsTopic
+      OKActions:
+        - !Ref DatabaseAlertsTopic
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DatabaseInstance
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-storage-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Additional alarms for production environments
+  ReadLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-HighReadLatency'
+      AlarmDescription: !Sub 'High read latency on ${DatabaseInstance}'
+      MetricName: ReadLatency
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 0.2
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref DatabaseAlertsTopic
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DatabaseInstance
+
+  WriteLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-HighWriteLatency'
+      AlarmDescription: !Sub 'High write latency on ${DatabaseInstance}'
+      MetricName: WriteLatency
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 0.2
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref DatabaseAlertsTopic
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DatabaseInstance
+
+  # -------------------------------------------------------------------------
+  # CloudWatch Dashboard
+  # -------------------------------------------------------------------------
+  DatabaseMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-DatabaseMonitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", "${DatabaseInstance}"],
+                  [".", "DatabaseConnections", ".", "."],
+                  [".", "FreeableMemory", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Database Performance Overview",
+                "period": 300,
+                "stat": "Average",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                },
+                "annotations": {
+                  "horizontal": [
+                    {
+                      "label": "CPU Alarm Threshold",
+                      "value": ${CPUAlarmThreshold}
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/RDS", "FreeStorageSpace", "DBInstanceIdentifier", "${DatabaseInstance}"],
+                  [".", "ReadLatency", ".", "."],
+                  [".", "WriteLatency", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Storage and Latency Metrics",
+                "period": 300,
+                "stat": "Average",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/RDS", "ReadIOPS", "DBInstanceIdentifier", "${DatabaseInstance}"],
+                  [".", "WriteIOPS", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "I/O Operations Per Second",
+                "period": 300,
+                "stat": "Average",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/RDS", "ReadThroughput", "DBInstanceIdentifier", "${DatabaseInstance}"],
+                  [".", "WriteThroughput", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "I/O Throughput (Bytes/Second)",
+                "period": 300,
+                "stat": "Average",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/RDS", "BinLogDiskUsage", "DBInstanceIdentifier", "${DatabaseInstance}"],
+                  [".", "ReplicaLag", ".", "."],
+                  [".", "SwapUsage", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Additional Database Metrics",
+                "period": 300,
+                "stat": "Average",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+Outputs:
+  # Database Information
+  DatabaseInstanceIdentifier:
+    Description: RDS Database Instance Identifier
+    Value: !Ref DatabaseInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseInstanceId'
+
+  DatabaseEndpoint:
+    Description: RDS Database Instance Endpoint
+    Value: !GetAtt DatabaseInstance.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseEndpoint'
+
+  DatabasePort:
+    Description: RDS Database Instance Port
+    Value: !GetAtt DatabaseInstance.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabasePort'
+
+  # Monitoring Information
+  SNSTopicArn:
+    Description: SNS Topic ARN for database alerts
+    Value: !Ref DatabaseAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  CloudWatchDashboardURL:
+    Description: URL to the CloudWatch Dashboard
+    Value: !Sub >
+      https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-DatabaseMonitoring
+
+  # Enhanced Monitoring Information
+  EnhancedMonitoringRoleArn:
+    Condition: EnableEnhancedMonitoring
+    Description: IAM Role ARN for Enhanced Monitoring
+    Value: !GetAtt EnhancedMonitoringRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EnhancedMonitoringRoleArn'
+
+  # Performance Insights Information
+  PerformanceInsightsEnabled:
+    Description: Whether Performance Insights is enabled
+    Value: !If [EnablePerformanceInsights, 'Enabled', 'Disabled']
+
+  # Security Information
+  DatabaseSecurityGroupId:
+    Description: Security Group ID for the database
+    Value: !Ref DatabaseSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseSecurityGroupId'
+
+  VPCId:
+    Description: VPC ID where database is deployed
+    Value: !Ref DatabaseVPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCId'
+
+  # Cost Information
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for this solution
+    Value: !Sub >
+      Database: $${DatabaseInstanceClass} ~$15-25/month,
+      Enhanced Monitoring: ~$2.50/month (if enabled),
+      Performance Insights: Free for 7 days retention,
+      CloudWatch: $0.30 per alarm + dashboard costs
+
+  # Next Steps
+  PostDeploymentSteps:
+    Description: Next steps after deployment
+    Value: >
+      1. Confirm SNS email subscription in your inbox
+      2. Access CloudWatch Dashboard using the provided URL
+      3. Connect to database using provided endpoint and credentials
+      4. Generate sample workload to test monitoring and alerts
+      5. Review and adjust alarm thresholds based on your workload

@@ -1,0 +1,680 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Complete GraphQL API infrastructure with AWS AppSync, DynamoDB, and Cognito User Pool authentication for a blog platform'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'blog-api'
+    Description: 'Name prefix for all resources'
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+    
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: 'Environment name for resource tagging and naming'
+    
+  DynamoDBReadCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+    Description: 'Read capacity units for DynamoDB table'
+    
+  DynamoDBWriteCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+    Description: 'Write capacity units for DynamoDB table'
+    
+  CognitoPasswordMinLength:
+    Type: Number
+    Default: 8
+    MinValue: 6
+    MaxValue: 99
+    Description: 'Minimum password length for Cognito User Pool'
+    
+  ApiKeyExpirationDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: 'Number of days until API key expires'
+    
+  EnablePointInTimeRecovery:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable point-in-time recovery for DynamoDB table'
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  EnablePITR: !Equals [!Ref EnablePointInTimeRecovery, 'true']
+
+Resources:
+  # DynamoDB Table for Blog Posts
+  BlogPostsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-blog-posts-${Environment}'
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref DynamoDBReadCapacity
+        WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: author
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: AuthorIndex
+          KeySchema:
+            - AttributeName: author
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !Ref DynamoDBReadCapacity
+            WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnablePITR, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-blog-posts-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Cognito User Pool
+  BlogUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${ProjectName}-user-pool-${Environment}'
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: false
+        - Name: name
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: !Ref CognitoPasswordMinLength
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          TemporaryPasswordValidityDays: 7
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+        InviteMessageAction: SUPPRESS
+      UserPoolTags:
+        Name: !Sub '${ProjectName}-user-pool-${Environment}'
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        ManagedBy: CloudFormation
+
+  # Cognito User Pool Client
+  BlogUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${ProjectName}-client-${Environment}'
+      UserPoolId: !Ref BlogUserPool
+      GenerateSecret: true
+      ExplicitAuthFlows:
+        - ADMIN_NO_SRP_AUTH
+        - USER_PASSWORD_AUTH
+      PreventUserExistenceErrors: ENABLED
+      SupportedIdentityProviders:
+        - COGNITO
+      RefreshTokenValidity: 30
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      TokenValidityUnits:
+        RefreshToken: days
+        AccessToken: minutes
+        IdToken: minutes
+
+  # IAM Role for AppSync to access DynamoDB
+  AppSyncDynamoDBRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-appsync-dynamodb-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: appsync.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt BlogPostsTable.Arn
+                  - !Sub '${BlogPostsTable.Arn}/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-appsync-dynamodb-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # AppSync GraphQL API
+  BlogGraphQLAPI:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      Name: !Sub '${ProjectName}-graphql-api-${Environment}'
+      AuthenticationType: AMAZON_COGNITO_USER_POOLS
+      UserPoolConfig:
+        UserPoolId: !Ref BlogUserPool
+        AwsRegion: !Ref AWS::Region
+        DefaultAction: ALLOW
+      AdditionalAuthenticationProviders:
+        - AuthenticationType: API_KEY
+      LogConfig:
+        CloudWatchLogsRoleArn: !GetAtt AppSyncLogsRole.Arn
+        FieldLogLevel: !If [IsProduction, ERROR, ALL]
+      XrayEnabled: !If [IsProduction, true, false]
+      Tags:
+        Name: !Sub '${ProjectName}-graphql-api-${Environment}'
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        ManagedBy: CloudFormation
+
+  # IAM Role for AppSync CloudWatch Logs
+  AppSyncLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-appsync-logs-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: appsync.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AppSyncPushToCloudWatchLogs
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-appsync-logs-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # GraphQL Schema
+  BlogGraphQLSchema:
+    Type: AWS::AppSync::GraphQLSchema
+    Properties:
+      ApiId: !GetAtt BlogGraphQLAPI.ApiId
+      Definition: |
+        type BlogPost {
+            id: ID!
+            title: String!
+            content: String!
+            author: String!
+            createdAt: AWSDateTime!
+            updatedAt: AWSDateTime!
+            tags: [String]
+            published: Boolean!
+        }
+
+        input CreateBlogPostInput {
+            title: String!
+            content: String!
+            tags: [String]
+            published: Boolean = false
+        }
+
+        input UpdateBlogPostInput {
+            id: ID!
+            title: String
+            content: String
+            tags: [String]
+            published: Boolean
+        }
+
+        type Query {
+            getBlogPost(id: ID!): BlogPost
+            listBlogPosts(limit: Int, nextToken: String): BlogPostConnection
+            listBlogPostsByAuthor(author: String!, limit: Int, nextToken: String): BlogPostConnection
+        }
+
+        type Mutation {
+            createBlogPost(input: CreateBlogPostInput!): BlogPost
+            updateBlogPost(input: UpdateBlogPostInput!): BlogPost
+            deleteBlogPost(id: ID!): BlogPost
+        }
+
+        type Subscription {
+            onCreateBlogPost: BlogPost
+                @aws_subscribe(mutations: ["createBlogPost"])
+            onUpdateBlogPost: BlogPost
+                @aws_subscribe(mutations: ["updateBlogPost"])
+            onDeleteBlogPost: BlogPost
+                @aws_subscribe(mutations: ["deleteBlogPost"])
+        }
+
+        type BlogPostConnection {
+            items: [BlogPost]
+            nextToken: String
+        }
+
+        schema {
+            query: Query
+            mutation: Mutation
+            subscription: Subscription
+        }
+
+  # DynamoDB Data Source
+  BlogPostsDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt BlogGraphQLAPI.ApiId
+      Name: BlogPostsDataSource
+      Type: AMAZON_DYNAMODB
+      DynamoDBConfig:
+        TableName: !Ref BlogPostsTable
+        AwsRegion: !Ref AWS::Region
+      ServiceRoleArn: !GetAtt AppSyncDynamoDBRole.Arn
+
+  # Resolver for getBlogPost Query
+  GetBlogPostResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt BlogGraphQLAPI.ApiId
+      TypeName: Query
+      FieldName: getBlogPost
+      DataSourceName: !GetAtt BlogPostsDataSource.Name
+      RequestMappingTemplate: |
+        {
+            "version": "2017-02-28",
+            "operation": "GetItem",
+            "key": {
+                "id": $util.dynamodb.toDynamoDBJson($ctx.args.id)
+            }
+        }
+      ResponseMappingTemplate: |
+        #if($ctx.error)
+            $util.error($ctx.error.message, $ctx.error.type)
+        #end
+        $util.toJson($ctx.result)
+
+  # Resolver for createBlogPost Mutation
+  CreateBlogPostResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt BlogGraphQLAPI.ApiId
+      TypeName: Mutation
+      FieldName: createBlogPost
+      DataSourceName: !GetAtt BlogPostsDataSource.Name
+      RequestMappingTemplate: |
+        #set($id = $util.autoId())
+        #set($createdAt = $util.time.nowISO8601())
+        {
+            "version": "2017-02-28",
+            "operation": "PutItem",
+            "key": {
+                "id": $util.dynamodb.toDynamoDBJson($id)
+            },
+            "attributeValues": {
+                "title": $util.dynamodb.toDynamoDBJson($ctx.args.input.title),
+                "content": $util.dynamodb.toDynamoDBJson($ctx.args.input.content),
+                "author": $util.dynamodb.toDynamoDBJson($ctx.identity.username),
+                "createdAt": $util.dynamodb.toDynamoDBJson($createdAt),
+                "updatedAt": $util.dynamodb.toDynamoDBJson($createdAt),
+                "tags": $util.dynamodb.toDynamoDBJson($ctx.args.input.tags),
+                "published": $util.dynamodb.toDynamoDBJson($ctx.args.input.published)
+            }
+        }
+      ResponseMappingTemplate: |
+        #if($ctx.error)
+            $util.error($ctx.error.message, $ctx.error.type)
+        #end
+        $util.toJson($ctx.result)
+
+  # Resolver for updateBlogPost Mutation
+  UpdateBlogPostResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt BlogGraphQLAPI.ApiId
+      TypeName: Mutation
+      FieldName: updateBlogPost
+      DataSourceName: !GetAtt BlogPostsDataSource.Name
+      RequestMappingTemplate: |
+        #set($updatedAt = $util.time.nowISO8601())
+        {
+            "version": "2017-02-28",
+            "operation": "UpdateItem",
+            "key": {
+                "id": $util.dynamodb.toDynamoDBJson($ctx.args.input.id)
+            },
+            "update": {
+                "expression": "SET updatedAt = :updatedAt",
+                "expressionNames": {},
+                "expressionValues": {
+                    ":updatedAt": $util.dynamodb.toDynamoDBJson($updatedAt)
+                }
+            },
+            "condition": {
+                "expression": "author = :author",
+                "expressionValues": {
+                    ":author": $util.dynamodb.toDynamoDBJson($ctx.identity.username)
+                }
+            }
+        }
+        #if($ctx.args.input.title)
+            #set($expression = "$expression, title = :title")
+            $util.qr($ctx.update.update.expressionValues.put(":title", $util.dynamodb.toDynamoDBJson($ctx.args.input.title)))
+        #end
+        #if($ctx.args.input.content)
+            #set($expression = "$expression, content = :content")
+            $util.qr($ctx.update.update.expressionValues.put(":content", $util.dynamodb.toDynamoDBJson($ctx.args.input.content)))
+        #end
+        #if($ctx.args.input.tags)
+            #set($expression = "$expression, tags = :tags")
+            $util.qr($ctx.update.update.expressionValues.put(":tags", $util.dynamodb.toDynamoDBJson($ctx.args.input.tags)))
+        #end
+        #if($ctx.args.input.published != null)
+            #set($expression = "$expression, published = :published")
+            $util.qr($ctx.update.update.expressionValues.put(":published", $util.dynamodb.toDynamoDBJson($ctx.args.input.published)))
+        #end
+        $util.qr($ctx.update.update.put("expression", $expression))
+        $util.toJson($ctx.update)
+      ResponseMappingTemplate: |
+        #if($ctx.error)
+            $util.error($ctx.error.message, $ctx.error.type)
+        #end
+        $util.toJson($ctx.result)
+
+  # Resolver for deleteBlogPost Mutation
+  DeleteBlogPostResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt BlogGraphQLAPI.ApiId
+      TypeName: Mutation
+      FieldName: deleteBlogPost
+      DataSourceName: !GetAtt BlogPostsDataSource.Name
+      RequestMappingTemplate: |
+        {
+            "version": "2017-02-28",
+            "operation": "DeleteItem",
+            "key": {
+                "id": $util.dynamodb.toDynamoDBJson($ctx.args.id)
+            },
+            "condition": {
+                "expression": "author = :author",
+                "expressionValues": {
+                    ":author": $util.dynamodb.toDynamoDBJson($ctx.identity.username)
+                }
+            }
+        }
+      ResponseMappingTemplate: |
+        #if($ctx.error)
+            $util.error($ctx.error.message, $ctx.error.type)
+        #end
+        $util.toJson($ctx.result)
+
+  # Resolver for listBlogPosts Query
+  ListBlogPostsResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt BlogGraphQLAPI.ApiId
+      TypeName: Query
+      FieldName: listBlogPosts
+      DataSourceName: !GetAtt BlogPostsDataSource.Name
+      RequestMappingTemplate: |
+        {
+            "version": "2017-02-28",
+            "operation": "Scan",
+            #if($ctx.args.limit)
+            "limit": $ctx.args.limit,
+            #end
+            #if($ctx.args.nextToken)
+            "nextToken": "$ctx.args.nextToken"
+            #end
+        }
+      ResponseMappingTemplate: |
+        #if($ctx.error)
+            $util.error($ctx.error.message, $ctx.error.type)
+        #end
+        {
+            "items": $util.toJson($ctx.result.items),
+            #if($ctx.result.nextToken)
+            "nextToken": "$ctx.result.nextToken"
+            #end
+        }
+
+  # Resolver for listBlogPostsByAuthor Query
+  ListBlogPostsByAuthorResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt BlogGraphQLAPI.ApiId
+      TypeName: Query
+      FieldName: listBlogPostsByAuthor
+      DataSourceName: !GetAtt BlogPostsDataSource.Name
+      RequestMappingTemplate: |
+        {
+            "version": "2017-02-28",
+            "operation": "Query",
+            "index": "AuthorIndex",
+            "query": {
+                "expression": "author = :author",
+                "expressionValues": {
+                    ":author": $util.dynamodb.toDynamoDBJson($ctx.args.author)
+                }
+            },
+            #if($ctx.args.limit)
+            "limit": $ctx.args.limit,
+            #end
+            #if($ctx.args.nextToken)
+            "nextToken": "$ctx.args.nextToken",
+            #end
+            "scanIndexForward": false
+        }
+      ResponseMappingTemplate: |
+        #if($ctx.error)
+            $util.error($ctx.error.message, $ctx.error.type)
+        #end
+        {
+            "items": $util.toJson($ctx.result.items),
+            #if($ctx.result.nextToken)
+            "nextToken": "$ctx.result.nextToken"
+            #end
+        }
+
+  # API Key for testing
+  BlogAPIKey:
+    Type: AWS::AppSync::ApiKey
+    Properties:
+      ApiId: !GetAtt BlogGraphQLAPI.ApiId
+      Description: !Sub 'API Key for ${ProjectName} GraphQL API - ${Environment}'
+      Expires: !Ref ApiKeyExpirationDate
+
+  # Custom resource to calculate API key expiration date
+  ApiKeyExpirationDate:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt CalculateExpirationFunction.Arn
+      Days: !Ref ApiKeyExpirationDays
+
+  # Lambda function to calculate API key expiration
+  CalculateExpirationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-calculate-expiration-${Environment}'
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt CalculateExpirationRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          from datetime import datetime, timedelta
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  days = int(event['ResourceProperties']['Days'])
+                  expiration_date = datetime.now() + timedelta(days=days)
+                  expiration_timestamp = int(expiration_date.timestamp())
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'ExpirationTimestamp': expiration_timestamp
+                  })
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-calculate-expiration-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # IAM Role for Lambda function
+  CalculateExpirationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-calculate-expiration-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-calculate-expiration-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Outputs:
+  GraphQLAPIId:
+    Description: 'AppSync GraphQL API ID'
+    Value: !GetAtt BlogGraphQLAPI.ApiId
+    Export:
+      Name: !Sub '${AWS::StackName}-GraphQLAPIId'
+
+  GraphQLAPIURL:
+    Description: 'AppSync GraphQL API URL'
+    Value: !GetAtt BlogGraphQLAPI.GraphQLUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-GraphQLAPIURL'
+
+  GraphQLAPIRealtimeURL:
+    Description: 'AppSync GraphQL API Realtime URL'
+    Value: !GetAtt BlogGraphQLAPI.RealtimeUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-GraphQLAPIRealtimeURL'
+
+  DynamoDBTableName:
+    Description: 'DynamoDB table name for blog posts'
+    Value: !Ref BlogPostsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableName'
+
+  DynamoDBTableArn:
+    Description: 'DynamoDB table ARN'
+    Value: !GetAtt BlogPostsTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableArn'
+
+  CognitoUserPoolId:
+    Description: 'Cognito User Pool ID'
+    Value: !Ref BlogUserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-CognitoUserPoolId'
+
+  CognitoUserPoolClientId:
+    Description: 'Cognito User Pool Client ID'
+    Value: !Ref BlogUserPoolClient
+    Export:
+      Name: !Sub '${AWS::StackName}-CognitoUserPoolClientId'
+
+  AppSyncAPIKey:
+    Description: 'AppSync API Key for testing'
+    Value: !GetAtt BlogAPIKey.ApiKey
+    Export:
+      Name: !Sub '${AWS::StackName}-AppSyncAPIKey'
+
+  AppSyncServiceRoleArn:
+    Description: 'AppSync service role ARN'
+    Value: !GetAtt AppSyncDynamoDBRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AppSyncServiceRoleArn'
+
+  Region:
+    Description: 'AWS Region'
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub '${AWS::StackName}-Region'
+
+  TestCommandsInfo:
+    Description: 'Information for testing the GraphQL API'
+    Value: !Sub |
+      GraphQL Endpoint: ${BlogGraphQLAPI.GraphQLUrl}
+      API Key: ${BlogAPIKey.ApiKey}
+      User Pool ID: ${BlogUserPool}
+      User Pool Client ID: ${BlogUserPoolClient}
+      Region: ${AWS::Region}

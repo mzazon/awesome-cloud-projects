@@ -1,0 +1,974 @@
+# Infrastructure Manager Configuration for Real-Time Fraud Detection
+# This configuration deploys a complete fraud detection system using:
+# - Vertex AI for machine learning model training and inference
+# - Cloud Dataflow for real-time stream processing
+# - Cloud Pub/Sub for message ingestion
+# - BigQuery for analytics and storage
+# - Cloud Storage for ML artifacts and data staging
+
+imports:
+  - path: modules/storage.yaml
+  - path: modules/pubsub.yaml
+  - path: modules/bigquery.yaml
+  - path: modules/vertex-ai.yaml
+  - path: modules/monitoring.yaml
+  - path: modules/iam.yaml
+
+resources:
+  # =============================================================================
+  # PROJECT CONFIGURATION AND APIS
+  # =============================================================================
+  
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env.project }}/services/compute.googleapis.com
+      parent: projects/{{ env.project }}
+    metadata:
+      dependsOn: []
+
+  - name: enable-dataflow-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env.project }}/services/dataflow.googleapis.com
+      parent: projects/{{ env.project }}
+    metadata:
+      dependsOn: 
+        - enable-apis
+
+  - name: enable-pubsub-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env.project }}/services/pubsub.googleapis.com
+      parent: projects/{{ env.project }}
+    metadata:
+      dependsOn: 
+        - enable-apis
+
+  - name: enable-bigquery-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env.project }}/services/bigquery.googleapis.com
+      parent: projects/{{ env.project }}
+    metadata:
+      dependsOn: 
+        - enable-apis
+
+  - name: enable-aiplatform-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env.project }}/services/aiplatform.googleapis.com
+      parent: projects/{{ env.project }}
+    metadata:
+      dependsOn: 
+        - enable-apis
+
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env.project }}/services/storage.googleapis.com
+      parent: projects/{{ env.project }}
+    metadata:
+      dependsOn: 
+        - enable-apis
+
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env.project }}/services/monitoring.googleapis.com
+      parent: projects/{{ env.project }}
+    metadata:
+      dependsOn: 
+        - enable-apis
+
+  - name: enable-logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env.project }}/services/logging.googleapis.com
+      parent: projects/{{ env.project }}
+    metadata:
+      dependsOn: 
+        - enable-apis
+
+  # =============================================================================
+  # IAM ROLES AND SERVICE ACCOUNTS
+  # =============================================================================
+
+  # Service account for Dataflow pipeline execution
+  - name: dataflow-service-account
+    type: iam.v1.serviceAccount
+    properties:
+      accountId: fraud-detection-dataflow-sa
+      displayName: Fraud Detection Dataflow Service Account
+      description: Service account for running fraud detection Dataflow pipeline
+      project: {{ env.project }}
+    metadata:
+      dependsOn: 
+        - enable-dataflow-api
+
+  # Service account for Vertex AI operations
+  - name: vertex-ai-service-account
+    type: iam.v1.serviceAccount
+    properties:
+      accountId: fraud-detection-vertex-ai-sa
+      displayName: Fraud Detection Vertex AI Service Account
+      description: Service account for Vertex AI model training and inference
+      project: {{ env.project }}
+    metadata:
+      dependsOn: 
+        - enable-aiplatform-api
+
+  # IAM bindings for Dataflow service account
+  - name: dataflow-sa-dataflow-admin
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ env.project }}
+      role: roles/dataflow.admin
+      member: serviceAccount:$(ref.dataflow-service-account.email)
+    metadata:
+      dependsOn: 
+        - dataflow-service-account
+
+  - name: dataflow-sa-pubsub-subscriber
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ env.project }}
+      role: roles/pubsub.subscriber
+      member: serviceAccount:$(ref.dataflow-service-account.email)
+    metadata:
+      dependsOn: 
+        - dataflow-service-account
+
+  - name: dataflow-sa-bigquery-data-editor
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ env.project }}
+      role: roles/bigquery.dataEditor
+      member: serviceAccount:$(ref.dataflow-service-account.email)
+    metadata:
+      dependsOn: 
+        - dataflow-service-account
+
+  - name: dataflow-sa-storage-object-admin
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ env.project }}
+      role: roles/storage.objectAdmin
+      member: serviceAccount:$(ref.dataflow-service-account.email)
+    metadata:
+      dependsOn: 
+        - dataflow-service-account
+
+  - name: dataflow-sa-aiplatform-user
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ env.project }}
+      role: roles/aiplatform.user
+      member: serviceAccount:$(ref.dataflow-service-account.email)
+    metadata:
+      dependsOn: 
+        - dataflow-service-account
+
+  # IAM bindings for Vertex AI service account
+  - name: vertex-ai-sa-aiplatform-admin
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ env.project }}
+      role: roles/aiplatform.admin
+      member: serviceAccount:$(ref.vertex-ai-service-account.email)
+    metadata:
+      dependsOn: 
+        - vertex-ai-service-account
+
+  - name: vertex-ai-sa-storage-admin
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ env.project }}
+      role: roles/storage.admin
+      member: serviceAccount:$(ref.vertex-ai-service-account.email)
+    metadata:
+      dependsOn: 
+        - vertex-ai-service-account
+
+  - name: vertex-ai-sa-bigquery-data-viewer
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ env.project }}
+      role: roles/bigquery.dataViewer
+      member: serviceAccount:$(ref.vertex-ai-service-account.email)
+    metadata:
+      dependsOn: 
+        - vertex-ai-service-account
+
+  # =============================================================================
+  # CLOUD STORAGE BUCKETS
+  # =============================================================================
+
+  # Primary storage bucket for ML artifacts and pipeline data
+  - name: fraud-detection-ml-bucket
+    type: storage.v1.bucket
+    properties:
+      name: {{ env.project }}-fraud-ml-{{ properties.resourceSuffix }}
+      location: {{ properties.region }}
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: true
+      labels:
+        environment: fraud-detection
+        purpose: ml-pipeline
+        managed-by: infrastructure-manager
+      lifecycle:
+        rule:
+          - condition:
+              age: 90
+              matchesStorageClass: 
+                - STANDARD
+            action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+          - condition:
+              age: 365
+              matchesStorageClass: 
+                - NEARLINE
+            action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+          - condition:
+              age: 2555  # 7 years for compliance
+            action:
+              type: Delete
+    metadata:
+      dependsOn: 
+        - enable-storage-api
+
+  # Staging bucket for Dataflow pipeline artifacts
+  - name: dataflow-staging-bucket
+    type: storage.v1.bucket
+    properties:
+      name: {{ env.project }}-dataflow-staging-{{ properties.resourceSuffix }}
+      location: {{ properties.region }}
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      labels:
+        environment: fraud-detection
+        purpose: dataflow-staging
+        managed-by: infrastructure-manager
+      lifecycle:
+        rule:
+          - condition:
+              age: 30
+            action:
+              type: Delete
+    metadata:
+      dependsOn: 
+        - enable-storage-api
+
+  # =============================================================================
+  # CLOUD PUB/SUB MESSAGING
+  # =============================================================================
+
+  # Main topic for transaction stream ingestion
+  - name: transaction-stream-topic
+    type: pubsub.v1.topic
+    properties:
+      name: projects/{{ env.project }}/topics/transaction-stream-{{ properties.resourceSuffix }}
+      labels:
+        environment: fraud-detection
+        purpose: transaction-ingestion
+        managed-by: infrastructure-manager
+      messageRetentionDuration: 604800s  # 7 days
+      messageStoragePolicy:
+        allowedPersistenceRegions:
+          - {{ properties.region }}
+    metadata:
+      dependsOn: 
+        - enable-pubsub-api
+
+  # Dead letter topic for failed message processing
+  - name: transaction-dead-letter-topic
+    type: pubsub.v1.topic
+    properties:
+      name: projects/{{ env.project }}/topics/transaction-dead-letter-{{ properties.resourceSuffix }}
+      labels:
+        environment: fraud-detection
+        purpose: dead-letter-queue
+        managed-by: infrastructure-manager
+      messageRetentionDuration: 1209600s  # 14 days
+    metadata:
+      dependsOn: 
+        - enable-pubsub-api
+
+  # Subscription for Dataflow pipeline consumption
+  - name: fraud-processor-subscription
+    type: pubsub.v1.subscription
+    properties:
+      name: projects/{{ env.project }}/subscriptions/fraud-processor-{{ properties.resourceSuffix }}
+      topic: $(ref.transaction-stream-topic.name)
+      labels:
+        environment: fraud-detection
+        purpose: dataflow-processing
+        managed-by: infrastructure-manager
+      ackDeadlineSeconds: 60
+      messageRetentionDuration: 604800s  # 7 days
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+      deadLetterPolicy:
+        deadLetterTopic: $(ref.transaction-dead-letter-topic.name)
+        maxDeliveryAttempts: 5
+      enableMessageOrdering: true
+      filter: ''
+      expirationPolicy:
+        ttl: 2678400s  # 31 days
+    metadata:
+      dependsOn: 
+        - transaction-stream-topic
+        - transaction-dead-letter-topic
+
+  # Subscription for dead letter monitoring
+  - name: dead-letter-monitoring-subscription
+    type: pubsub.v1.subscription
+    properties:
+      name: projects/{{ env.project }}/subscriptions/dead-letter-monitoring-{{ properties.resourceSuffix }}
+      topic: $(ref.transaction-dead-letter-topic.name)
+      labels:
+        environment: fraud-detection
+        purpose: monitoring
+        managed-by: infrastructure-manager
+      ackDeadlineSeconds: 300
+      messageRetentionDuration: 1209600s  # 14 days
+    metadata:
+      dependsOn: 
+        - transaction-dead-letter-topic
+
+  # =============================================================================
+  # BIGQUERY DATA WAREHOUSE
+  # =============================================================================
+
+  # Main dataset for fraud detection analytics
+  - name: fraud-detection-dataset
+    type: bigquery.v2.dataset
+    properties:
+      datasetId: fraud_detection_{{ properties.resourceSuffix }}
+      projectId: {{ env.project }}
+      location: {{ properties.region }}
+      description: Fraud detection analytics dataset for real-time transaction processing
+      labels:
+        environment: fraud-detection
+        purpose: analytics
+        managed-by: infrastructure-manager
+      defaultTableExpirationMs: 15552000000  # 180 days
+      defaultPartitionExpirationMs: 5184000000  # 60 days
+      access:
+        - role: OWNER
+          userByEmail: {{ properties.ownerEmail }}
+        - role: READER
+          specialGroup: projectReaders
+        - role: WRITER
+          serviceAccount: $(ref.dataflow-service-account.email)
+        - role: READER
+          serviceAccount: $(ref.vertex-ai-service-account.email)
+    metadata:
+      dependsOn: 
+        - enable-bigquery-api
+        - dataflow-service-account
+        - vertex-ai-service-account
+
+  # Transactions table for storing processed transaction data
+  - name: transactions-table
+    type: bigquery.v2.table
+    properties:
+      projectId: {{ env.project }}
+      datasetId: $(ref.fraud-detection-dataset.datasetId)
+      tableId: transactions
+      description: Real-time transaction data with fraud scoring
+      labels:
+        environment: fraud-detection
+        purpose: transaction-storage
+        managed-by: infrastructure-manager
+      timePartitioning:
+        type: DAY
+        field: timestamp
+        expirationMs: 15552000000  # 180 days
+      clustering:
+        fields:
+          - user_id
+          - is_fraud
+          - fraud_score
+      schema:
+        fields:
+          - name: transaction_id
+            type: STRING
+            mode: REQUIRED
+            description: Unique identifier for the transaction
+          - name: user_id
+            type: STRING
+            mode: REQUIRED
+            description: User identifier associated with the transaction
+          - name: amount
+            type: FLOAT
+            mode: REQUIRED
+            description: Transaction amount in base currency
+          - name: merchant
+            type: STRING
+            mode: NULLABLE
+            description: Merchant identifier or name
+          - name: timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: Transaction timestamp in UTC
+          - name: fraud_score
+            type: FLOAT
+            mode: NULLABLE
+            description: ML-generated fraud probability score (0.0-1.0)
+          - name: is_fraud
+            type: BOOLEAN
+            mode: NULLABLE
+            description: Boolean flag indicating if transaction is flagged as fraud
+          - name: features
+            type: JSON
+            mode: NULLABLE
+            description: JSON object containing engineered features used for fraud detection
+          - name: location
+            type: STRING
+            mode: NULLABLE
+            description: Transaction location or region
+          - name: payment_method
+            type: STRING
+            mode: NULLABLE
+            description: Payment method used for the transaction
+          - name: processing_timestamp
+            type: TIMESTAMP
+            mode: NULLABLE
+            description: Timestamp when transaction was processed by the fraud detection system
+          - name: risk_factors
+            type: STRING
+            mode: NULLABLE
+            description: Comma-separated list of risk factors identified
+          - name: confidence
+            type: FLOAT
+            mode: NULLABLE
+            description: Confidence score for the fraud prediction
+    metadata:
+      dependsOn: 
+        - fraud-detection-dataset
+
+  # Fraud alerts table for investigation workflow
+  - name: fraud-alerts-table
+    type: bigquery.v2.table
+    properties:
+      projectId: {{ env.project }}
+      datasetId: $(ref.fraud-detection-dataset.datasetId)
+      tableId: fraud_alerts
+      description: High-risk transaction alerts for fraud investigation
+      labels:
+        environment: fraud-detection
+        purpose: alert-management
+        managed-by: infrastructure-manager
+      timePartitioning:
+        type: DAY
+        field: alert_timestamp
+        expirationMs: 31536000000  # 365 days
+      clustering:
+        fields:
+          - status
+          - assigned_analyst
+          - fraud_score
+      schema:
+        fields:
+          - name: alert_id
+            type: STRING
+            mode: REQUIRED
+            description: Unique identifier for the fraud alert
+          - name: transaction_id
+            type: STRING
+            mode: REQUIRED
+            description: Associated transaction identifier
+          - name: fraud_score
+            type: FLOAT
+            mode: REQUIRED
+            description: Fraud probability score that triggered the alert
+          - name: alert_timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: Timestamp when the alert was generated
+          - name: status
+            type: STRING
+            mode: REQUIRED
+            description: Current status of the alert (PENDING, INVESTIGATING, RESOLVED, FALSE_POSITIVE)
+          - name: investigation_notes
+            type: STRING
+            mode: NULLABLE
+            description: Notes from fraud analyst investigation
+          - name: assigned_analyst
+            type: STRING
+            mode: NULLABLE
+            description: Analyst assigned to investigate the alert
+          - name: risk_factors
+            type: STRING
+            mode: NULLABLE
+            description: Risk factors that contributed to the alert
+          - name: confidence
+            type: FLOAT
+            mode: NULLABLE
+            description: Confidence level of the fraud prediction
+          - name: resolution_timestamp
+            type: TIMESTAMP
+            mode: NULLABLE
+            description: Timestamp when the alert was resolved
+    metadata:
+      dependsOn: 
+        - fraud-detection-dataset
+
+  # =============================================================================
+  # VERTEX AI MACHINE LEARNING PLATFORM
+  # =============================================================================
+
+  # Vertex AI dataset for fraud detection model training
+  - name: vertex-ai-dataset
+    type: gcp-types/aiplatform-v1:projects.locations.datasets
+    properties:
+      parent: projects/{{ env.project }}/locations/{{ properties.region }}
+      displayName: fraud-detection-dataset-{{ properties.resourceSuffix }}
+      description: Dataset for training fraud detection machine learning models
+      metadataSchemaUri: gs://google-cloud-aiplatform/schema/dataset/metadata/tabular_1.0.0.yaml
+      metadata:
+        inputConfig:
+          gcsSource:
+            uri: 
+              - gs://{{ env.project }}-fraud-ml-{{ properties.resourceSuffix }}/training_data/*.csv
+        targetColumn: is_fraud
+        weightColumn: null
+        mlUseColumnSpecsOverride: null
+      labels:
+        environment: fraud-detection
+        purpose: model-training
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn: 
+        - enable-aiplatform-api
+        - fraud-detection-ml-bucket
+
+  # Vertex AI model endpoint for real-time inference
+  - name: fraud-detection-endpoint
+    type: gcp-types/aiplatform-v1:projects.locations.endpoints
+    properties:
+      parent: projects/{{ env.project }}/locations/{{ properties.region }}
+      displayName: fraud-detection-endpoint-{{ properties.resourceSuffix }}
+      description: Endpoint for real-time fraud detection model inference
+      labels:
+        environment: fraud-detection
+        purpose: model-inference
+        managed-by: infrastructure-manager
+      encryptionSpec:
+        kmsKeyName: null  # Use Google-managed encryption by default
+      network: null  # Use default network
+      enablePrivateServiceConnect: false
+    metadata:
+      dependsOn: 
+        - enable-aiplatform-api
+
+  # =============================================================================
+  # CLOUD MONITORING AND ALERTING
+  # =============================================================================
+
+  # Log-based metric for fraud detection rate
+  - name: fraud-detection-rate-metric
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      parent: projects/{{ env.project }}
+      metricId: fraud_detection_rate_{{ properties.resourceSuffix }}
+      description: Rate of fraud alerts generated per minute
+      filter: resource.type="dataflow_job" AND jsonPayload.fraud_score>0.8
+      labelExtractors:
+        job_name: EXTRACT(labels.job_name)
+        region: EXTRACT(resource.labels.region)
+      valueExtractor: EXTRACT(jsonPayload.fraud_score)
+      metricDescriptor:
+        metricKind: GAUGE
+        valueType: DOUBLE
+        displayName: Fraud Detection Rate
+        description: Number of fraud alerts generated per minute
+        labels:
+          - key: job_name
+            valueType: STRING
+            description: Dataflow job name
+          - key: region
+            valueType: STRING
+            description: GCP region
+    metadata:
+      dependsOn: 
+        - enable-logging-api
+
+  # Log-based metric for transaction processing rate
+  - name: transaction-processing-rate-metric
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      parent: projects/{{ env.project }}
+      metricId: transaction_processing_rate_{{ properties.resourceSuffix }}
+      description: Rate of transactions processed per minute
+      filter: resource.type="dataflow_job" AND jsonPayload.transaction_id
+      labelExtractors:
+        job_name: EXTRACT(labels.job_name)
+        region: EXTRACT(resource.labels.region)
+      metricDescriptor:
+        metricKind: GAUGE
+        valueType: INT64
+        displayName: Transaction Processing Rate
+        description: Number of transactions processed per minute
+        labels:
+          - key: job_name
+            valueType: STRING
+            description: Dataflow job name
+          - key: region
+            valueType: STRING
+            description: GCP region
+    metadata:
+      dependsOn: 
+        - enable-logging-api
+
+  # Alerting policy for high fraud rate detection
+  - name: high-fraud-rate-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/{{ env.project }}
+      displayName: High Fraud Rate Detection Alert
+      documentation:
+        content: Alert triggered when fraud detection rate exceeds normal thresholds, indicating potential coordinated fraud attack or system anomaly
+        mimeType: text/markdown
+      enabled: true
+      alertStrategy:
+        autoClose: 1800s  # 30 minutes
+      conditions:
+        - displayName: Fraud rate exceeds threshold
+          conditionThreshold:
+            filter: metric.type="logging.googleapis.com/user/fraud_detection_rate_{{ properties.resourceSuffix }}"
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 15.0
+            duration: 300s  # 5 minutes
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_SUM
+                groupByFields:
+                  - resource.labels.region
+      combiner: OR
+      notificationChannels: []  # Add notification channels as needed
+    metadata:
+      dependsOn: 
+        - enable-monitoring-api
+        - fraud-detection-rate-metric
+
+  # Alerting policy for transaction processing lag
+  - name: processing-lag-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/{{ env.project }}
+      displayName: Transaction Processing Lag Alert
+      documentation:
+        content: Alert triggered when transaction processing experiences significant delays, potentially indicating system performance issues
+        mimeType: text/markdown
+      enabled: true
+      alertStrategy:
+        autoClose: 900s  # 15 minutes
+      conditions:
+        - displayName: Processing lag exceeds threshold
+          conditionThreshold:
+            filter: resource.type="dataflow_job" AND metric.type="dataflow.googleapis.com/job/system_lag"
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 30.0  # 30 seconds
+            duration: 180s  # 3 minutes
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_MAX
+                crossSeriesReducer: REDUCE_MAX
+                groupByFields:
+                  - resource.labels.job_name
+      combiner: OR
+      notificationChannels: []  # Add notification channels as needed
+    metadata:
+      dependsOn: 
+        - enable-monitoring-api
+
+  # =============================================================================
+  # CUSTOM MONITORING DASHBOARD
+  # =============================================================================
+
+  # Comprehensive monitoring dashboard for fraud detection system
+  - name: fraud-detection-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      parent: projects/{{ env.project }}
+      displayName: Fraud Detection Pipeline Dashboard
+      mosaicLayout:
+        tiles:
+          # Transaction processing rate chart
+          - width: 6
+            height: 4
+            widget:
+              title: Transaction Processing Rate (per minute)
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: metric.type="logging.googleapis.com/user/transaction_processing_rate_{{ properties.resourceSuffix }}"
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_RATE
+                          crossSeriesReducer: REDUCE_SUM
+                          groupByFields:
+                            - resource.labels.region
+                    plotType: LINE
+                    targetAxis: Y1
+                yAxis:
+                  label: Transactions/minute
+                  scale: LINEAR
+                xAxis:
+                  scale: LINEAR
+          # Fraud detection rate chart
+          - width: 6
+            height: 4
+            xPos: 6
+            widget:
+              title: Fraud Detection Rate (alerts per minute)
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: metric.type="logging.googleapis.com/user/fraud_detection_rate_{{ properties.resourceSuffix }}"
+                        aggregation:
+                          alignmentPeriod: 300s
+                          perSeriesAligner: ALIGN_MEAN
+                          crossSeriesReducer: REDUCE_SUM
+                          groupByFields:
+                            - resource.labels.region
+                    plotType: LINE
+                    targetAxis: Y1
+                yAxis:
+                  label: Fraud alerts/minute
+                  scale: LINEAR
+                xAxis:
+                  scale: LINEAR
+          # Dataflow job health
+          - width: 6
+            height: 4
+            yPos: 4
+            widget:
+              title: Dataflow Job Health
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: resource.type="dataflow_job" AND metric.type="dataflow.googleapis.com/job/is_failed"
+                        aggregation:
+                          alignmentPeriod: 300s
+                          perSeriesAligner: ALIGN_MAX
+                          crossSeriesReducer: REDUCE_SUM
+                          groupByFields:
+                            - resource.labels.job_name
+                    plotType: STACKED_BAR
+                    targetAxis: Y1
+                yAxis:
+                  label: Failed jobs
+                  scale: LINEAR
+          # Pub/Sub message backlog
+          - width: 6
+            height: 4
+            xPos: 6
+            yPos: 4
+            widget:
+              title: Pub/Sub Message Backlog
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: resource.type="pubsub_subscription" AND metric.type="pubsub.googleapis.com/subscription/num_undelivered_messages"
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_MAX
+                          crossSeriesReducer: REDUCE_SUM
+                          groupByFields:
+                            - resource.labels.subscription_id
+                    plotType: LINE
+                    targetAxis: Y1
+                yAxis:
+                  label: Undelivered messages
+                  scale: LINEAR
+          # BigQuery query performance
+          - width: 12
+            height: 4
+            yPos: 8
+            widget:
+              title: BigQuery Query Performance
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: resource.type="bigquery_dataset" AND metric.type="bigquery.googleapis.com/query/execution_times"
+                        aggregation:
+                          alignmentPeriod: 300s
+                          perSeriesAligner: ALIGN_PERCENTILE_95
+                          crossSeriesReducer: REDUCE_MEAN
+                          groupByFields:
+                            - resource.labels.dataset_id
+                    plotType: LINE
+                    targetAxis: Y1
+                yAxis:
+                  label: Query execution time (seconds)
+                  scale: LINEAR
+      labels:
+        environment: fraud-detection
+        purpose: monitoring
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn: 
+        - enable-monitoring-api
+        - fraud-detection-rate-metric
+        - transaction-processing-rate-metric
+
+outputs:
+  # =============================================================================
+  # INFRASTRUCTURE OUTPUTS
+  # =============================================================================
+  
+  - name: project_id
+    value: {{ env.project }}
+    description: Google Cloud Project ID
+
+  - name: region
+    value: {{ properties.region }}
+    description: Primary region for all resources
+
+  - name: resource_suffix
+    value: {{ properties.resourceSuffix }}
+    description: Unique suffix appended to resource names
+
+  # Storage outputs
+  - name: ml_bucket_name
+    value: $(ref.fraud-detection-ml-bucket.name)
+    description: Cloud Storage bucket for ML artifacts and training data
+
+  - name: staging_bucket_name
+    value: $(ref.dataflow-staging-bucket.name)
+    description: Cloud Storage bucket for Dataflow staging artifacts
+
+  # Pub/Sub outputs
+  - name: transaction_topic_name
+    value: $(ref.transaction-stream-topic.name)
+    description: Pub/Sub topic for transaction stream ingestion
+
+  - name: dead_letter_topic_name
+    value: $(ref.transaction-dead-letter-topic.name)
+    description: Dead letter topic for failed message processing
+
+  - name: subscription_name
+    value: $(ref.fraud-processor-subscription.name)
+    description: Pub/Sub subscription for Dataflow pipeline
+
+  # BigQuery outputs
+  - name: dataset_id
+    value: $(ref.fraud-detection-dataset.datasetId)
+    description: BigQuery dataset for fraud detection analytics
+
+  - name: transactions_table_id
+    value: $(ref.transactions-table.tableId)
+    description: BigQuery table for processed transactions
+
+  - name: fraud_alerts_table_id
+    value: $(ref.fraud-alerts-table.tableId)
+    description: BigQuery table for fraud alerts
+
+  # Vertex AI outputs
+  - name: vertex_ai_dataset_name
+    value: $(ref.vertex-ai-dataset.name)
+    description: Vertex AI dataset for model training
+
+  - name: vertex_ai_endpoint_name
+    value: $(ref.fraud-detection-endpoint.name)
+    description: Vertex AI endpoint for model inference
+
+  # Service Account outputs
+  - name: dataflow_service_account_email
+    value: $(ref.dataflow-service-account.email)
+    description: Service account email for Dataflow pipeline
+
+  - name: vertex_ai_service_account_email
+    value: $(ref.vertex-ai-service-account.email)
+    description: Service account email for Vertex AI operations
+
+  # Monitoring outputs
+  - name: dashboard_url
+    value: https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.fraud-detection-dashboard.name | basename)
+    description: URL to the fraud detection monitoring dashboard
+
+# =============================================================================
+# CONFIGURATION SCHEMA AND VALIDATION
+# =============================================================================
+
+schema:
+  info:
+    title: Real-Time Fraud Detection Infrastructure
+    description: Complete infrastructure for fraud detection using Vertex AI and Cloud Dataflow
+    version: 1.0.0
+  
+  imports:
+    - path: schema.yaml
+  
+  required:
+    - region
+    - resourceSuffix
+    - ownerEmail
+  
+  properties:
+    region:
+      type: string
+      description: GCP region for resource deployment
+      default: us-central1
+      enum:
+        - us-central1
+        - us-east1
+        - us-east4
+        - us-west1
+        - us-west2
+        - us-west3
+        - us-west4
+        - europe-west1
+        - europe-west2
+        - europe-west3
+        - europe-west4
+        - asia-east1
+        - asia-northeast1
+        - asia-southeast1
+    
+    resourceSuffix:
+      type: string
+      description: Unique suffix for resource names (4-8 characters, lowercase alphanumeric)
+      pattern: "^[a-z0-9]{4,8}$"
+      default: "{{ rand.hex(4) }}"
+    
+    ownerEmail:
+      type: string
+      description: Email address of the resource owner for BigQuery access
+      format: email
+    
+    enableAdvancedMonitoring:
+      type: boolean
+      description: Enable advanced monitoring and alerting features
+      default: true
+    
+    dataRetentionDays:
+      type: integer
+      description: Data retention period in days for BigQuery tables
+      default: 180
+      minimum: 30
+      maximum: 3653  # ~10 years
+    
+    fraudScoreThreshold:
+      type: number
+      description: Fraud score threshold for generating alerts (0.0-1.0)
+      default: 0.8
+      minimum: 0.0
+      maximum: 1.0

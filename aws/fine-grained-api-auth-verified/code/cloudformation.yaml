@@ -1,0 +1,902 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Fine-Grained API Authorization with Amazon Verified Permissions and Cognito - Creates a complete ABAC system with Cedar policies, Cognito identity management, and API Gateway integration'
+
+# ============================================================================
+# PARAMETERS
+# ============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'DocManagement'
+    Description: 'Project name used for resource naming and tagging'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - 'dev'
+      - 'staging'
+      - 'prod'
+    Description: 'Environment name for resource organization and tagging'
+
+  AdminUserEmail:
+    Type: String
+    Description: 'Email address for the admin test user'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  ManagerUserEmail:
+    Type: String
+    Description: 'Email address for the manager test user'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  EmployeeUserEmail:
+    Type: String
+    Description: 'Email address for the employee test user'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  AuthorizerResultTtl:
+    Type: Number
+    Default: 300
+    MinValue: 0
+    MaxValue: 3600
+    Description: 'TTL in seconds for API Gateway authorizer results (0-3600)'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 900
+    Description: 'Lambda function timeout in seconds'
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+    Description: 'Lambda function memory size in MB'
+
+# ============================================================================
+# CONDITIONS
+# ============================================================================
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  IsDevEnvironment: !Equals [!Ref Environment, 'dev']
+  EnableXRayTracing: !Equals [!Ref Environment, 'prod']
+
+# ============================================================================
+# RESOURCES
+# ============================================================================
+Resources:
+  # ------------------------------------------------------------------------
+  # DynamoDB Table for Document Storage
+  # ------------------------------------------------------------------------
+  DocumentsTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: !Sub '${ProjectName}-Documents-${Environment}'
+      BillingMode: 'PAY_PER_REQUEST'
+      AttributeDefinitions:
+        - AttributeName: 'documentId'
+          AttributeType: 'S'
+      KeySchema:
+        - AttributeName: 'documentId'
+          KeyType: 'HASH'
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+        KMSMasterKeyId: 'alias/aws/dynamodb'
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'VerifiedPermissionsDemo'
+        - Key: 'ResourceType'
+          Value: 'DocumentStorage'
+
+  # ------------------------------------------------------------------------
+  # Amazon Cognito User Pool
+  # ------------------------------------------------------------------------
+  UserPool:
+    Type: 'AWS::Cognito::UserPool'
+    Properties:
+      UserPoolName: !Sub '${ProjectName}-UserPool-${Environment}'
+      # Password Policy Configuration
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          TemporaryPasswordValidityDays: 7
+      # Auto-verified attributes
+      AutoVerifiedAttributes:
+        - 'email'
+      # Required and custom attributes
+      Schema:
+        - Name: 'email'
+          AttributeDataType: 'String'
+          Required: true
+          Mutable: true
+        - Name: 'department'
+          AttributeDataType: 'String'
+          DeveloperOnlyAttribute: false
+          Mutable: true
+        - Name: 'role'
+          AttributeDataType: 'String'
+          DeveloperOnlyAttribute: false
+          Mutable: true
+      # Account recovery settings
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: 'verified_email'
+            Priority: 1
+      # Admin create user configuration
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+        InviteMessageAction: 'SUPPRESS'
+        TemporaryPasswordValidityDays: 7
+      # User pool add-ons
+      UserPoolAddOns:
+        AdvancedSecurityMode: !If [IsProduction, 'ENFORCED', 'OFF']
+      # Deletion protection
+      DeletionProtection: !If [IsProduction, 'ACTIVE', 'INACTIVE']
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Purpose: 'VerifiedPermissionsDemo'
+        ResourceType: 'IdentityManagement'
+
+  # User Pool Client for API access
+  UserPoolClient:
+    Type: 'AWS::Cognito::UserPoolClient'
+    Properties:
+      ClientName: !Sub '${ProjectName}-Client-${Environment}'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true
+      ExplicitAuthFlows:
+        - 'ADMIN_NO_SRP_AUTH'
+        - 'USER_PASSWORD_AUTH'
+      # Token validity periods
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: 'hours'
+        IdToken: 'hours'
+        RefreshToken: 'days'
+      # OAuth settings
+      SupportedIdentityProviders:
+        - 'COGNITO'
+      AllowedOAuthFlows:
+        - 'code'
+        - 'implicit'
+      AllowedOAuthScopes:
+        - 'email'
+        - 'openid'
+        - 'profile'
+      CallbackURLs:
+        - 'https://localhost:3000/callback'
+      LogoutURLs:
+        - 'https://localhost:3000/logout'
+      AllowedOAuthFlowsUserPoolClient: true
+      PreventUserExistenceErrors: 'ENABLED'
+
+  # ------------------------------------------------------------------------
+  # Amazon Verified Permissions Resources
+  # ------------------------------------------------------------------------
+  PolicyStore:
+    Type: 'AWS::VerifiedPermissions::PolicyStore'
+    Properties:
+      Description: !Sub '${ProjectName} Authorization Policies for ${Environment}'
+      ValidationSettings:
+        Mode: 'STRICT'
+
+  # Identity Source linking Cognito to Verified Permissions
+  IdentitySource:
+    Type: 'AWS::VerifiedPermissions::IdentitySource'
+    Properties:
+      PolicyStoreId: !Ref PolicyStore
+      PrincipalEntityType: 'User'
+      Configuration:
+        CognitoUserPoolConfiguration:
+          UserPoolArn: !GetAtt UserPool.Arn
+          ClientIds:
+            - !Ref UserPoolClient
+
+  # Cedar Policy for Document Viewing
+  ViewDocumentPolicy:
+    Type: 'AWS::VerifiedPermissions::Policy'
+    Properties:
+      PolicyStoreId: !Ref PolicyStore
+      Definition:
+        Static:
+          Description: 'Allow document viewing based on department or management role'
+          Statement: |
+            permit(
+                principal,
+                action == Action::"ViewDocument",
+                resource
+            ) when {
+                principal.department == resource.department ||
+                principal.role == "Manager" ||
+                principal.role == "Admin"
+            };
+
+  # Cedar Policy for Document Editing
+  EditDocumentPolicy:
+    Type: 'AWS::VerifiedPermissions::Policy'
+    Properties:
+      PolicyStoreId: !Ref PolicyStore
+      Definition:
+        Static:
+          Description: 'Allow document editing for owners, department managers, or admins'
+          Statement: |
+            permit(
+                principal,
+                action == Action::"EditDocument",
+                resource
+            ) when {
+                (principal.sub == resource.owner) ||
+                (principal.role == "Manager" && principal.department == resource.department) ||
+                principal.role == "Admin"
+            };
+
+  # Cedar Policy for Document Deletion
+  DeleteDocumentPolicy:
+    Type: 'AWS::VerifiedPermissions::Policy'
+    Properties:
+      PolicyStoreId: !Ref PolicyStore
+      Definition:
+        Static:
+          Description: 'Allow document deletion for admins only'
+          Statement: |
+            permit(
+                principal,
+                action == Action::"DeleteDocument",
+                resource
+            ) when {
+                principal.role == "Admin"
+            };
+
+  # ------------------------------------------------------------------------
+  # IAM Roles and Policies
+  # ------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-Lambda-Role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - !If [EnableXRayTracing, 'arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess', !Ref 'AWS::NoValue']
+      Policies:
+        # Verified Permissions access policy
+        - PolicyName: 'VerifiedPermissionsAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'verifiedpermissions:IsAuthorizedWithToken'
+                Resource: !Sub 'arn:aws:verifiedpermissions::${AWS::AccountId}:policy-store/${PolicyStore}'
+        # DynamoDB access policy
+        - PolicyName: 'DynamoDBAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:DeleteItem'
+                  - 'dynamodb:Scan'
+                  - 'dynamodb:Query'
+                Resource: !GetAtt DocumentsTable.Arn
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'VerifiedPermissionsDemo'
+        - Key: 'ResourceType'
+          Value: 'IAMRole'
+
+  # ------------------------------------------------------------------------
+  # Lambda Functions
+  # ------------------------------------------------------------------------
+  AuthorizerFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-Authorizer-${Environment}'
+      Description: 'Lambda authorizer integrating Cognito with Verified Permissions'
+      Runtime: 'python3.9'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          POLICY_STORE_ID: !Ref PolicyStore
+          USER_POOL_ID: !Ref UserPool
+          USER_POOL_CLIENT_ID: !Ref UserPoolClient
+          AWS_REGION: !Ref 'AWS::Region'
+      TracingConfig:
+        Mode: !If [EnableXRayTracing, 'Active', 'PassThrough']
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import jwt
+          from jwt import PyJWKSClient
+          import os
+          import urllib.request
+
+          verifiedpermissions = boto3.client('verifiedpermissions')
+          policy_store_id = os.environ['POLICY_STORE_ID']
+          user_pool_id = os.environ['USER_POOL_ID']
+          region = os.environ['AWS_REGION']
+
+          def lambda_handler(event, context):
+              try:
+                  # Extract token from Authorization header
+                  token = event['authorizationToken'].replace('Bearer ', '')
+                  
+                  # Decode JWT token to get user attributes
+                  jwks_url = f'https://cognito-idp.{region}.amazonaws.com/{user_pool_id}/.well-known/jwks.json'
+                  jwks_client = PyJWKSClient(jwks_url)
+                  signing_key = jwks_client.get_signing_key_from_jwt(token)
+                  
+                  decoded_token = jwt.decode(
+                      token,
+                      signing_key.key,
+                      algorithms=['RS256'],
+                      audience=os.environ.get('USER_POOL_CLIENT_ID')
+                  )
+                  
+                  # Extract resource and action from method ARN
+                  method_arn = event['methodArn']
+                  resource_parts = method_arn.split(':')
+                  api_parts = resource_parts[5].split('/')
+                  
+                  http_method = api_parts[1]
+                  resource_path = '/'.join(api_parts[2:])
+                  
+                  # Map HTTP methods to actions
+                  action_map = {
+                      'GET': 'ViewDocument',
+                      'PUT': 'EditDocument',
+                      'POST': 'EditDocument',
+                      'DELETE': 'DeleteDocument'
+                  }
+                  
+                  action = action_map.get(http_method, 'ViewDocument')
+                  
+                  # Extract document ID from path
+                  document_id = resource_path.split('/')[-1] if resource_path else 'unknown'
+                  
+                  # Make authorization request to Verified Permissions
+                  response = verifiedpermissions.is_authorized_with_token(
+                      policyStoreId=policy_store_id,
+                      identityToken=token,
+                      action={
+                          'actionType': 'Action',
+                          'actionId': action
+                      },
+                      resource={
+                          'entityType': 'Document',
+                          'entityId': document_id
+                      }
+                  )
+                  
+                  # Generate policy based on decision
+                  effect = 'Allow' if response['decision'] == 'ALLOW' else 'Deny'
+                  
+                  return {
+                      'principalId': decoded_token['sub'],
+                      'policyDocument': {
+                          'Version': '2012-10-17',
+                          'Statement': [{
+                              'Action': 'execute-api:Invoke',
+                              'Effect': effect,
+                              'Resource': event['methodArn']
+                          }]
+                      },
+                      'context': {
+                          'userId': decoded_token['sub'],
+                          'department': decoded_token.get('custom:department', ''),
+                          'role': decoded_token.get('custom:role', ''),
+                          'authDecision': response['decision']
+                      }
+                  }
+                  
+              except Exception as e:
+                  print(f"Authorization error: {str(e)}")
+                  return {
+                      'principalId': 'unknown',
+                      'policyDocument': {
+                          'Version': '2012-10-17',
+                          'Statement': [{
+                              'Action': 'execute-api:Invoke',
+                              'Effect': 'Deny',
+                              'Resource': event['methodArn']
+                          }]
+                      }
+                  }
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'VerifiedPermissionsDemo'
+        - Key: 'ResourceType'
+          Value: 'Lambda'
+
+  BusinessLogicFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-Business-${Environment}'
+      Description: 'Business logic Lambda for document CRUD operations'
+      Runtime: 'python3.9'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          DOCUMENTS_TABLE: !Ref DocumentsTable
+      TracingConfig:
+        Mode: !If [EnableXRayTracing, 'Active', 'PassThrough']
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          from datetime import datetime
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['DOCUMENTS_TABLE'])
+
+          def lambda_handler(event, context):
+              try:
+                  # Extract user context from authorizer
+                  user_context = event['requestContext']['authorizer']
+                  user_id = user_context['userId']
+                  department = user_context['department']
+                  role = user_context['role']
+                  
+                  # Get HTTP method and document ID
+                  http_method = event['httpMethod']
+                  document_id = event['pathParameters'].get('documentId') if event.get('pathParameters') else None
+                  
+                  if http_method == 'GET' and document_id:
+                      # Retrieve specific document
+                      response = table.get_item(Key={'documentId': document_id})
+                      if 'Item' in response:
+                          return {
+                              'statusCode': 200,
+                              'headers': {'Content-Type': 'application/json'},
+                              'body': json.dumps(response['Item'])
+                          }
+                      else:
+                          return {
+                              'statusCode': 404,
+                              'body': json.dumps({'error': 'Document not found'})
+                          }
+                          
+                  elif http_method == 'GET':
+                      # List documents (simplified - in production, apply filtering)
+                      response = table.scan()
+                      return {
+                          'statusCode': 200,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': json.dumps(response['Items'])
+                      }
+                      
+                  elif http_method == 'POST':
+                      # Create new document
+                      body = json.loads(event['body'])
+                      document = {
+                          'documentId': str(uuid.uuid4()),
+                          'title': body['title'],
+                          'content': body['content'],
+                          'owner': user_id,
+                          'department': department,
+                          'createdAt': datetime.utcnow().isoformat(),
+                          'updatedAt': datetime.utcnow().isoformat()
+                      }
+                      
+                      table.put_item(Item=document)
+                      return {
+                          'statusCode': 201,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': json.dumps(document)
+                      }
+                      
+                  elif http_method == 'PUT' and document_id:
+                      # Update existing document
+                      body = json.loads(event['body'])
+                      response = table.update_item(
+                          Key={'documentId': document_id},
+                          UpdateExpression='SET title = :title, content = :content, updatedAt = :updated',
+                          ExpressionAttributeValues={
+                              ':title': body['title'],
+                              ':content': body['content'],
+                              ':updated': datetime.utcnow().isoformat()
+                          },
+                          ReturnValues='ALL_NEW'
+                      )
+                      
+                      return {
+                          'statusCode': 200,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': json.dumps(response['Attributes'])
+                      }
+                      
+                  elif http_method == 'DELETE' and document_id:
+                      # Delete document
+                      table.delete_item(Key={'documentId': document_id})
+                      return {
+                          'statusCode': 204,
+                          'body': ''
+                      }
+                      
+                  else:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'Invalid request'})
+                      }
+                      
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'VerifiedPermissionsDemo'
+        - Key: 'ResourceType'
+          Value: 'Lambda'
+
+  # ------------------------------------------------------------------------
+  # API Gateway Resources
+  # ------------------------------------------------------------------------
+  RestApi:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: !Sub '${ProjectName}-API-${Environment}'
+      Description: 'Document Management API with Verified Permissions authorization'
+      EndpointConfiguration:
+        Types:
+          - 'REGIONAL'
+      BinaryMediaTypes:
+        - 'application/octet-stream'
+        - 'image/*'
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'VerifiedPermissionsDemo'
+        - Key: 'ResourceType'
+          Value: 'APIGateway'
+
+  # Custom Authorizer
+  ApiAuthorizer:
+    Type: 'AWS::ApiGateway::Authorizer'
+    Properties:
+      Name: 'VerifiedPermissionsAuthorizer'
+      RestApiId: !Ref RestApi
+      Type: 'TOKEN'
+      AuthorizerUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizerFunction.Arn}/invocations'
+      AuthorizerCredentials: !GetAtt LambdaExecutionRole.Arn
+      IdentitySource: 'method.request.header.Authorization'
+      AuthorizerResultTtlInSeconds: !Ref AuthorizerResultTtl
+
+  # Documents Resource
+  DocumentsResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: 'documents'
+
+  # Document ID Resource (for specific document operations)
+  DocumentIdResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref DocumentsResource
+      PathPart: '{documentId}'
+
+  # API Methods
+  DocumentsPostMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DocumentsResource
+      HttpMethod: 'POST'
+      AuthorizationType: 'CUSTOM'
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: 'AWS_PROXY'
+        IntegrationHttpMethod: 'POST'
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BusinessLogicFunction.Arn}/invocations'
+
+  DocumentGetMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DocumentIdResource
+      HttpMethod: 'GET'
+      AuthorizationType: 'CUSTOM'
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: 'AWS_PROXY'
+        IntegrationHttpMethod: 'POST'
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BusinessLogicFunction.Arn}/invocations'
+
+  DocumentPutMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DocumentIdResource
+      HttpMethod: 'PUT'
+      AuthorizationType: 'CUSTOM'
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: 'AWS_PROXY'
+        IntegrationHttpMethod: 'POST'
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BusinessLogicFunction.Arn}/invocations'
+
+  DocumentDeleteMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DocumentIdResource
+      HttpMethod: 'DELETE'
+      AuthorizationType: 'CUSTOM'
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: 'AWS_PROXY'
+        IntegrationHttpMethod: 'POST'
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BusinessLogicFunction.Arn}/invocations'
+
+  # API Deployment
+  ApiDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    DependsOn:
+      - DocumentsPostMethod
+      - DocumentGetMethod
+      - DocumentPutMethod
+      - DocumentDeleteMethod
+    Properties:
+      RestApiId: !Ref RestApi
+      Description: 'Production deployment with Verified Permissions'
+
+  ApiStage:
+    Type: 'AWS::ApiGateway::Stage'
+    Properties:
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: 'prod'
+      Description: 'Production stage for Document Management API'
+      TracingEnabled: !If [EnableXRayTracing, true, false]
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: !If [IsDevEnvironment, 'INFO', 'ERROR']
+          DataTraceEnabled: !If [IsDevEnvironment, true, false]
+          MetricsEnabled: true
+          ThrottlingRateLimit: 1000
+          ThrottlingBurstLimit: 2000
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'VerifiedPermissionsDemo'
+        - Key: 'ResourceType'
+          Value: 'APIStage'
+
+  # Lambda Permissions for API Gateway
+  AuthorizerLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref AuthorizerFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'apigateway.amazonaws.com'
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/authorizers/${ApiAuthorizer}'
+
+  BusinessLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref BusinessLogicFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'apigateway.amazonaws.com'
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*'
+
+  # ------------------------------------------------------------------------
+  # Test Users (Optional - created with random passwords)
+  # ------------------------------------------------------------------------
+  AdminUser:
+    Type: 'AWS::Cognito::UserPoolUser'
+    Properties:
+      UserPoolId: !Ref UserPool
+      Username: !Ref AdminUserEmail
+      UserAttributes:
+        - Name: 'email'
+          Value: !Ref AdminUserEmail
+        - Name: 'custom:department'
+          Value: 'IT'
+        - Name: 'custom:role'
+          Value: 'Admin'
+        - Name: 'email_verified'
+          Value: 'true'
+      MessageAction: 'SUPPRESS'
+
+  ManagerUser:
+    Type: 'AWS::Cognito::UserPoolUser'
+    Properties:
+      UserPoolId: !Ref UserPool
+      Username: !Ref ManagerUserEmail
+      UserAttributes:
+        - Name: 'email'
+          Value: !Ref ManagerUserEmail
+        - Name: 'custom:department'
+          Value: 'Sales'
+        - Name: 'custom:role'
+          Value: 'Manager'
+        - Name: 'email_verified'
+          Value: 'true'
+      MessageAction: 'SUPPRESS'
+
+  EmployeeUser:
+    Type: 'AWS::Cognito::UserPoolUser'
+    Properties:
+      UserPoolId: !Ref UserPool
+      Username: !Ref EmployeeUserEmail
+      UserAttributes:
+        - Name: 'email'
+          Value: !Ref EmployeeUserEmail
+        - Name: 'custom:department'
+          Value: 'Sales'
+        - Name: 'custom:role'
+          Value: 'Employee'
+        - Name: 'email_verified'
+          Value: 'true'
+      MessageAction: 'SUPPRESS'
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+Outputs:
+  # API Gateway Information
+  ApiEndpoint:
+    Description: 'API Gateway endpoint URL for the Document Management API'
+    Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ApiEndpoint'
+
+  ApiId:
+    Description: 'API Gateway REST API ID'
+    Value: !Ref RestApi
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ApiId'
+
+  # Cognito Information
+  UserPoolId:
+    Description: 'Cognito User Pool ID for identity management'
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-UserPoolId'
+
+  UserPoolClientId:
+    Description: 'Cognito User Pool Client ID for authentication'
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-UserPoolClientId'
+
+  CognitoHostedUIUrl:
+    Description: 'Cognito Hosted UI URL for user authentication'
+    Value: !Sub 'https://${ProjectName}-${Environment}.auth.${AWS::Region}.amazoncognito.com'
+
+  # Verified Permissions Information
+  PolicyStoreId:
+    Description: 'Amazon Verified Permissions Policy Store ID'
+    Value: !Ref PolicyStore
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-PolicyStoreId'
+
+  IdentitySourceId:
+    Description: 'Verified Permissions Identity Source ID'
+    Value: !Ref IdentitySource
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-IdentitySourceId'
+
+  # DynamoDB Information
+  DocumentsTableName:
+    Description: 'DynamoDB table name for document storage'
+    Value: !Ref DocumentsTable
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-DocumentsTableName'
+
+  DocumentsTableArn:
+    Description: 'DynamoDB table ARN for document storage'
+    Value: !GetAtt DocumentsTable.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-DocumentsTableArn'
+
+  # Lambda Function Information
+  AuthorizerFunctionArn:
+    Description: 'Lambda authorizer function ARN'
+    Value: !GetAtt AuthorizerFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-AuthorizerFunctionArn'
+
+  BusinessLogicFunctionArn:
+    Description: 'Business logic Lambda function ARN'
+    Value: !GetAtt BusinessLogicFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-BusinessLogicFunctionArn'
+
+  # Test User Information
+  TestUsers:
+    Description: 'Test user accounts created for authorization testing'
+    Value: !Sub |
+      Admin: ${AdminUserEmail} (IT/Admin)
+      Manager: ${ManagerUserEmail} (Sales/Manager)
+      Employee: ${EmployeeUserEmail} (Sales/Employee)
+
+  # Security and Authorization Information
+  CedarPolicies:
+    Description: 'Cedar policies deployed for fine-grained authorization'
+    Value: |
+      1. ViewDocument: Department-based or management role access
+      2. EditDocument: Owner, department manager, or admin access
+      3. DeleteDocument: Admin-only access
+
+  # Quick Start Commands
+  TestingInstructions:
+    Description: 'Commands to test the authorization system'
+    Value: !Sub |
+      1. Get user pool client secret:
+         aws cognito-idp describe-user-pool-client --user-pool-id ${UserPool} --client-id ${UserPoolClient}
+      
+      2. Set user passwords (replace CLIENT_SECRET):
+         aws cognito-idp admin-set-user-password --user-pool-id ${UserPool} --username ${AdminUserEmail} --password "YourPassword123!" --permanent
+      
+      3. Test API endpoint:
+         curl -X POST "${ApiEndpoint}/documents" -H "Authorization: Bearer TOKEN" -H "Content-Type: application/json" -d '{"title":"Test","content":"Content"}'
+
+  StackInformation:
+    Description: 'CloudFormation stack deployment information'
+    Value: !Sub |
+      Stack Name: ${AWS::StackName}
+      Region: ${AWS::Region}
+      Account: ${AWS::AccountId}
+      Environment: ${Environment}
+      Deployment Time: ${AWS::Timestamp}

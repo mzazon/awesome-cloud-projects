@@ -1,0 +1,626 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Secure Content Delivery with CloudFront and AWS WAF
+  
+  This template creates a comprehensive security architecture using Amazon CloudFront 
+  and AWS WAF to protect web content delivery. It includes managed WAF rules for 
+  common threats, rate-based DDoS protection, geographic restrictions, and secure 
+  S3 origin access controls.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Content Configuration
+        Parameters:
+          - BucketName
+          - IndexDocument
+      - Label:
+          default: Security Configuration
+        Parameters:
+          - RateLimitThreshold
+          - BlockedCountries
+          - EnableManagedRules
+      - Label:
+          default: Distribution Configuration
+        Parameters:
+          - PriceClass
+          - EnableLogging
+          - LoggingBucket
+    ParameterLabels:
+      BucketName:
+        default: S3 Bucket Name
+      IndexDocument:
+        default: Default Index Document
+      RateLimitThreshold:
+        default: Rate Limit Threshold (per 5 minutes)
+      BlockedCountries:
+        default: Blocked Country Codes
+      EnableManagedRules:
+        default: Enable AWS Managed WAF Rules
+      PriceClass:
+        default: CloudFront Price Class
+      EnableLogging:
+        default: Enable Access Logging
+      LoggingBucket:
+        default: Logging S3 Bucket
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Name for the S3 bucket that will store content (must be globally unique)
+    Default: !Sub 'secure-content-${AWS::StackName}-${AWS::AccountId}'
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: Must be a valid S3 bucket name (lowercase, alphanumeric and hyphens only)
+    MinLength: 3
+    MaxLength: 63
+
+  IndexDocument:
+    Type: String
+    Description: Default document to serve from the S3 bucket
+    Default: index.html
+    AllowedPattern: '^[a-zA-Z0-9._-]+\.(html|htm)$'
+    ConstraintDescription: Must be a valid HTML file name
+
+  RateLimitThreshold:
+    Type: Number
+    Description: Maximum number of requests per IP address per 5-minute window before blocking
+    Default: 2000
+    MinValue: 100
+    MaxValue: 20000
+    ConstraintDescription: Must be between 100 and 20,000 requests
+
+  BlockedCountries:
+    Type: CommaDelimitedList
+    Description: List of two-letter country codes to block (e.g., RU,CN,KP)
+    Default: 'RU,CN'
+    ConstraintDescription: Use two-letter ISO country codes separated by commas
+
+  EnableManagedRules:
+    Type: String
+    Description: Enable AWS Managed Rules for common web vulnerabilities
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  PriceClass:
+    Type: String
+    Description: CloudFront price class determines which edge locations to use
+    Default: PriceClass_100
+    AllowedValues:
+      - PriceClass_All
+      - PriceClass_200
+      - PriceClass_100
+    ConstraintDescription: Must be a valid CloudFront price class
+
+  EnableLogging:
+    Type: String
+    Description: Enable CloudFront access logging
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+
+  LoggingBucket:
+    Type: String
+    Description: S3 bucket name for CloudFront access logs (leave empty to create new bucket)
+    Default: ''
+
+Conditions:
+  CreateLoggingBucket: !And
+    - !Equals [!Ref EnableLogging, 'true']
+    - !Equals [!Ref LoggingBucket, '']
+  
+  UseExistingLoggingBucket: !And
+    - !Equals [!Ref EnableLogging, 'true']
+    - !Not [!Equals [!Ref LoggingBucket, '']]
+  
+  EnableAccessLogging: !Equals [!Ref EnableLogging, 'true']
+  
+  EnableManagedRulesCondition: !Equals [!Ref EnableManagedRules, 'true']
+  
+  HasBlockedCountries: !Not [!Equals [!Join ['', !Ref BlockedCountries], '']]
+
+Resources:
+  # S3 Bucket for Content Storage
+  ContentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref ContentBucketLogGroup
+      Tags:
+        - Key: Purpose
+          Value: SecureContentDelivery
+        - Key: Security
+          Value: WAFProtected
+
+  # CloudWatch Log Group for S3 Events
+  ContentBucketLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${BucketName}'
+      RetentionInDays: 30
+
+  # S3 Bucket for CloudFront Logs (conditional)
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateLoggingBucket
+    Properties:
+      BucketName: !Sub '${BucketName}-logs'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+          - Id: TransitionToIA
+            Status: Enabled
+            TransitionInDays: 30
+            StorageClass: STANDARD_IA
+
+  # Origin Access Control for S3
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub 'OAC-${BucketName}'
+        Description: !Sub 'Origin Access Control for ${BucketName}'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # S3 Bucket Policy for CloudFront Access
+  ContentBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ContentBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${ContentBucket}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  # WAF Web ACL for CloudFront Protection
+  WebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub '${AWS::StackName}-web-acl'
+      Description: Web ACL for CloudFront security protection
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      Rules:
+        # AWS Managed Rules - Common Rule Set
+        - !If
+          - EnableManagedRulesCondition
+          - Name: AWSManagedRulesCommonRuleSet
+            Priority: 1
+            Statement:
+              ManagedRuleGroupStatement:
+                VendorName: AWS
+                Name: AWSManagedRulesCommonRuleSet
+                ExcludedRules:
+                  # Exclude rules that might block legitimate traffic
+                  - Name: SizeRestrictions_BODY
+                  - Name: GenericRFI_BODY
+            OverrideAction:
+              None: {}
+            VisibilityConfig:
+              SampledRequestsEnabled: true
+              CloudWatchMetricsEnabled: true
+              MetricName: CommonRuleSetMetric
+          - !Ref 'AWS::NoValue'
+        
+        # AWS Managed Rules - Known Bad Inputs
+        - !If
+          - EnableManagedRulesCondition
+          - Name: AWSManagedRulesKnownBadInputsRuleSet
+            Priority: 2
+            Statement:
+              ManagedRuleGroupStatement:
+                VendorName: AWS
+                Name: AWSManagedRulesKnownBadInputsRuleSet
+            OverrideAction:
+              None: {}
+            VisibilityConfig:
+              SampledRequestsEnabled: true
+              CloudWatchMetricsEnabled: true
+              MetricName: KnownBadInputsMetric
+          - !Ref 'AWS::NoValue'
+        
+        # AWS Managed Rules - Amazon IP Reputation List
+        - !If
+          - EnableManagedRulesCondition
+          - Name: AWSManagedRulesAmazonIpReputationList
+            Priority: 3
+            Statement:
+              ManagedRuleGroupStatement:
+                VendorName: AWS
+                Name: AWSManagedRulesAmazonIpReputationList
+            OverrideAction:
+              None: {}
+            VisibilityConfig:
+              SampledRequestsEnabled: true
+              CloudWatchMetricsEnabled: true
+              MetricName: AmazonIpReputationListMetric
+          - !Ref 'AWS::NoValue'
+        
+        # Rate-based rule for DDoS protection
+        - Name: RateLimitRule
+          Priority: 10
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref RateLimitThreshold
+              AggregateKeyType: IP
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitMetric
+        
+        # Block requests with missing User-Agent header
+        - Name: BlockMissingUserAgent
+          Priority: 11
+          Statement:
+            NotStatement:
+              Statement:
+                ByteMatchStatement:
+                  SearchString: "*"
+                  FieldToMatch:
+                    SingleHeader:
+                      Name: user-agent
+                  TextTransformations:
+                    - Priority: 0
+                      Type: NONE
+                  PositionalConstraint: CONTAINS
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: MissingUserAgentMetric
+
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${AWS::StackName}-WebACL'
+      Tags:
+        - Key: Purpose
+          Value: CloudFrontSecurity
+        - Key: Stack
+          Value: !Ref AWS::StackName
+
+  # CloudFront Distribution
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub 'Secure distribution for ${AWS::StackName}'
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: !Ref PriceClass
+        
+        # Origin Configuration
+        Origins:
+          - Id: !Sub 'S3-${BucketName}'
+            DomainName: !GetAtt ContentBucket.RegionalDomainName
+            OriginPath: ''
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+        
+        # Default Cache Behavior
+        DefaultCacheBehavior:
+          TargetOriginId: !Sub 'S3-${BucketName}'
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # Managed-CachingDisabled
+          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf  # Managed-CORS-S3Origin
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03  # Managed-SecurityHeadersPolicy
+          Compress: true
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+        
+        # Custom Error Pages
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 404
+            ResponsePagePath: '/error.html'
+            ErrorCachingMinTTL: 300
+          - ErrorCode: 404
+            ResponseCode: 404
+            ResponsePagePath: '/error.html'
+            ErrorCachingMinTTL: 300
+        
+        # Default Root Object
+        DefaultRootObject: !Ref IndexDocument
+        
+        # Geographic Restrictions
+        Restrictions: !If
+          - HasBlockedCountries
+          - GeoRestriction:
+              RestrictionType: blacklist
+              Locations: !Ref BlockedCountries
+          - !Ref 'AWS::NoValue'
+        
+        # SSL Certificate
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          MinimumProtocolVersion: TLSv1.2_2021
+        
+        # Access Logging
+        Logging: !If
+          - EnableAccessLogging
+          - Bucket: !If
+              - CreateLoggingBucket
+              - !GetAtt LoggingBucket.DomainName
+              - !Sub '${LoggingBucket}.s3.amazonaws.com'
+            Prefix: cloudfront-logs/
+            IncludeCookies: false
+          - !Ref 'AWS::NoValue'
+        
+        # WAF Association
+        WebACLId: !GetAtt WebACL.Arn
+      
+      Tags:
+        - Key: Purpose
+          Value: SecureContentDelivery
+        - Key: Security
+          Value: WAFEnabled
+        - Key: Stack
+          Value: !Ref AWS::StackName
+
+  # CloudWatch Dashboard for Monitoring
+  SecurityDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-Security-Dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/WAFV2", "AllowedRequests", "WebACL", "${WebACL}", "Rule", "ALL", "Region", "CloudFront" ],
+                  [ ".", "BlockedRequests", ".", ".", ".", ".", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "us-east-1",
+                "title": "WAF Request Status",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/CloudFront", "Requests", "DistributionId", "${CloudFrontDistribution}" ],
+                  [ ".", "BytesDownloaded", ".", "." ],
+                  [ ".", "BytesUploaded", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "us-east-1",
+                "title": "CloudFront Traffic",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/CloudFront", "4xxErrorRate", "DistributionId", "${CloudFrontDistribution}" ],
+                  [ ".", "5xxErrorRate", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "us-east-1",
+                "title": "CloudFront Error Rates",
+                "period": 300,
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 100
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms for Security Monitoring
+  HighBlockedRequestsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-HighBlockedRequests'
+      AlarmDescription: Alarm when blocked requests exceed threshold
+      MetricName: BlockedRequests
+      Namespace: AWS/WAFV2
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: WebACL
+          Value: !Ref WebACL
+        - Name: Rule
+          Value: ALL
+        - Name: Region
+          Value: CloudFront
+      TreatMissingData: notBreaching
+
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-HighErrorRate'
+      AlarmDescription: Alarm when 4xx error rate exceeds 5%
+      MetricName: 4xxErrorRate
+      Namespace: AWS/CloudFront
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DistributionId
+          Value: !Ref CloudFrontDistribution
+      TreatMissingData: notBreaching
+
+Outputs:
+  # Content Bucket Information
+  ContentBucketName:
+    Description: Name of the S3 bucket for content storage
+    Value: !Ref ContentBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ContentBucket'
+
+  ContentBucketDomainName:
+    Description: Domain name of the S3 bucket
+    Value: !GetAtt ContentBucket.RegionalDomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-ContentBucketDomain'
+
+  # CloudFront Distribution Information
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub '${AWS::StackName}-DistributionId'
+
+  CloudFrontDistributionDomainName:
+    Description: CloudFront distribution domain name
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-DistributionDomain'
+
+  CloudFrontDistributionURL:
+    Description: HTTPS URL for the CloudFront distribution
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DistributionURL'
+
+  # WAF Information
+  WebACLId:
+    Description: WAF Web ACL ID
+    Value: !Ref WebACL
+    Export:
+      Name: !Sub '${AWS::StackName}-WebACLId'
+
+  WebACLArn:
+    Description: WAF Web ACL ARN
+    Value: !GetAtt WebACL.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-WebACLArn'
+
+  # Security Configuration
+  RateLimitThreshold:
+    Description: Configured rate limit threshold
+    Value: !Ref RateLimitThreshold
+    Export:
+      Name: !Sub '${AWS::StackName}-RateLimit'
+
+  BlockedCountries:
+    Description: List of blocked countries
+    Value: !Join [', ', !Ref BlockedCountries]
+    Export:
+      Name: !Sub '${AWS::StackName}-BlockedCountries'
+
+  # Monitoring Information
+  SecurityDashboardURL:
+    Description: URL to the CloudWatch security dashboard
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-Security-Dashboard'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  # Origin Access Control
+  OriginAccessControlId:
+    Description: Origin Access Control ID for S3 access
+    Value: !Ref OriginAccessControl
+    Export:
+      Name: !Sub '${AWS::StackName}-OACId'
+
+  # Logging Information
+  LoggingBucketName:
+    Description: Name of the logging bucket (if created)
+    Value: !If
+      - CreateLoggingBucket
+      - !Ref LoggingBucket
+      - !If
+          - UseExistingLoggingBucket
+          - !Ref LoggingBucket
+          - 'Logging disabled'
+    Export:
+      Name: !Sub '${AWS::StackName}-LoggingBucket'
+
+  # Cost Estimation
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for this infrastructure (USD)
+    Value: '$0.50-$2.00 (varies by traffic volume)'
+    Export:
+      Name: !Sub '${AWS::StackName}-EstimatedCost'
+
+  # Deployment Instructions
+  DeploymentInstructions:
+    Description: Next steps after deployment
+    Value: !Sub |
+      1. Upload content to S3 bucket: ${ContentBucket}
+      2. Access your secure content at: https://${CloudFrontDistribution.DomainName}
+      3. Monitor security metrics at: https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-Security-Dashboard
+      4. Review WAF logs in CloudWatch for blocked requests
+    Export:
+      Name: !Sub '${AWS::StackName}-Instructions'

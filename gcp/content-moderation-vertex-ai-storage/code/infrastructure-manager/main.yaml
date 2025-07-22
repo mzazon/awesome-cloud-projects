@@ -1,0 +1,447 @@
+# Infrastructure Manager Configuration for Content Moderation with Vertex AI
+# This configuration deploys a complete content moderation system using
+# Vertex AI, Cloud Storage, Cloud Functions, and Pub/Sub
+
+# Import required modules
+imports:
+  - path: templates/storage.jinja
+  - path: templates/functions.jinja
+  - path: templates/pubsub.jinja
+  - path: templates/iam.jinja
+
+# Global configuration variables
+resources:
+  # Generate unique suffix for resource naming
+  - name: random-suffix
+    type: random-id
+    properties:
+      byte_length: 3
+      keepers:
+        project: $(ref.project.projectId)
+
+  # Project configuration
+  - name: project
+    type: project
+    properties:
+      projectId: content-mod-$(ref.random-suffix.hex)
+      name: Content Moderation Demo
+      billingAccountId: $(BILLING_ACCOUNT_ID)
+
+  # Enable required APIs
+  - name: enable-apis
+    type: serviceusage.v1.service
+    properties:
+      name: projects/$(ref.project.projectId)/services/storage.googleapis.com
+      parent: projects/$(ref.project.projectId)
+    metadata:
+      dependsOn: [project]
+
+  - name: enable-functions-api
+    type: serviceusage.v1.service
+    properties:
+      name: projects/$(ref.project.projectId)/services/cloudfunctions.googleapis.com
+      parent: projects/$(ref.project.projectId)
+    metadata:
+      dependsOn: [project]
+
+  - name: enable-pubsub-api
+    type: serviceusage.v1.service
+    properties:
+      name: projects/$(ref.project.projectId)/services/pubsub.googleapis.com
+      parent: projects/$(ref.project.projectId)
+    metadata:
+      dependsOn: [project]
+
+  - name: enable-aiplatform-api
+    type: serviceusage.v1.service
+    properties:
+      name: projects/$(ref.project.projectId)/services/aiplatform.googleapis.com
+      parent: projects/$(ref.project.projectId)
+    metadata:
+      dependsOn: [project]
+
+  - name: enable-eventarc-api
+    type: serviceusage.v1.service
+    properties:
+      name: projects/$(ref.project.projectId)/services/eventarc.googleapis.com
+      parent: projects/$(ref.project.projectId)
+    metadata:
+      dependsOn: [project]
+
+  - name: enable-cloudbuild-api
+    type: serviceusage.v1.service
+    properties:
+      name: projects/$(ref.project.projectId)/services/cloudbuild.googleapis.com
+      parent: projects/$(ref.project.projectId)
+    metadata:
+      dependsOn: [project]
+
+  # Cloud Storage Buckets for Content Workflow
+  - name: incoming-content-bucket
+    type: storage.v1.bucket
+    properties:
+      name: content-incoming-$(ref.random-suffix.hex)
+      project: $(ref.project.projectId)
+      location: $(REGION)
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: false
+      labels:
+        environment: demo
+        purpose: content-ingestion
+        cost-center: content-moderation
+    metadata:
+      dependsOn: [enable-apis]
+
+  - name: quarantine-content-bucket
+    type: storage.v1.bucket
+    properties:
+      name: content-quarantine-$(ref.random-suffix.hex)
+      project: $(ref.project.projectId)
+      location: $(REGION)
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+          - action:
+              type: Delete
+            condition:
+              age: 365
+      labels:
+        environment: demo
+        purpose: content-quarantine
+        cost-center: content-moderation
+    metadata:
+      dependsOn: [enable-apis]
+
+  - name: approved-content-bucket
+    type: storage.v1.bucket
+    properties:
+      name: content-approved-$(ref.random-suffix.hex)
+      project: $(ref.project.projectId)
+      location: $(REGION)
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: false
+      labels:
+        environment: demo
+        purpose: content-approved
+        cost-center: content-moderation
+    metadata:
+      dependsOn: [enable-apis]
+
+  # Pub/Sub Topic for Event-Driven Processing
+  - name: content-moderation-topic
+    type: pubsub.v1.topic
+    properties:
+      name: projects/$(ref.project.projectId)/topics/content-moderation-$(ref.random-suffix.hex)
+      messageRetentionDuration: 604800s  # 7 days
+      labels:
+        environment: demo
+        purpose: content-moderation
+    metadata:
+      dependsOn: [enable-pubsub-api]
+
+  # Pub/Sub Subscription for Cloud Function
+  - name: content-moderation-subscription
+    type: pubsub.v1.subscription
+    properties:
+      name: projects/$(ref.project.projectId)/subscriptions/content-moderation-$(ref.random-suffix.hex)-subscription
+      topic: $(ref.content-moderation-topic.name)
+      ackDeadlineSeconds: 600
+      messageRetentionDuration: 604800s  # 7 days
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+      deadLetterPolicy:
+        maxDeliveryAttempts: 3
+      labels:
+        environment: demo
+        purpose: content-moderation
+    metadata:
+      dependsOn: [content-moderation-topic]
+
+  # Service Account for Content Moderation Function
+  - name: content-moderator-sa
+    type: iam.v1.serviceAccount
+    properties:
+      accountId: content-moderator-sa
+      displayName: Content Moderation Service Account
+      description: Service account for automated content moderation functions
+      project: $(ref.project.projectId)
+    metadata:
+      dependsOn: [project]
+
+  # IAM Role Bindings for Service Account
+  - name: storage-admin-binding
+    type: resourcemanager.v1.project:setIamPolicy
+    properties:
+      resource: $(ref.project.projectId)
+      policy:
+        bindings:
+          - role: roles/storage.objectAdmin
+            members:
+              - serviceAccount:$(ref.content-moderator-sa.email)
+    metadata:
+      dependsOn: [content-moderator-sa]
+
+  - name: aiplatform-user-binding
+    type: resourcemanager.v1.project:setIamPolicy
+    properties:
+      resource: $(ref.project.projectId)
+      policy:
+        bindings:
+          - role: roles/aiplatform.user
+            members:
+              - serviceAccount:$(ref.content-moderator-sa.email)
+    metadata:
+      dependsOn: [content-moderator-sa]
+
+  - name: pubsub-publisher-binding
+    type: resourcemanager.v1.project:setIamPolicy
+    properties:
+      resource: $(ref.project.projectId)
+      policy:
+        bindings:
+          - role: roles/pubsub.publisher
+            members:
+              - serviceAccount:$(ref.content-moderator-sa.email)
+    metadata:
+      dependsOn: [content-moderator-sa]
+
+  # Cloud Function Source Code Bucket
+  - name: function-source-bucket
+    type: storage.v1.bucket
+    properties:
+      name: function-source-$(ref.random-suffix.hex)
+      project: $(ref.project.projectId)
+      location: $(REGION)
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      labels:
+        environment: demo
+        purpose: function-source
+    metadata:
+      dependsOn: [enable-apis]
+
+  # Cloud Function Source Archive
+  - name: function-source-archive
+    type: storage.v1.object
+    properties:
+      name: content-moderator-source.zip
+      bucket: $(ref.function-source-bucket.name)
+      source:
+        # This would be populated with the actual function source code
+        # In a real deployment, this would reference a ZIP file containing:
+        # - main.py (the function code)
+        # - requirements.txt (dependencies)
+        content: |
+          # Content moderation function source code
+          # This is a placeholder - actual implementation would include:
+          # - Python code for image and text analysis
+          # - Integration with Vertex AI Gemini model
+          # - Storage operations for file movement
+          # - Pub/Sub message publishing
+    metadata:
+      dependsOn: [function-source-bucket]
+
+  # Primary Content Moderation Cloud Function
+  - name: content-moderator-function
+    type: cloudfunctions.v1.cloudFunction
+    properties:
+      name: projects/$(ref.project.projectId)/locations/$(REGION)/functions/content-moderator-$(ref.random-suffix.hex)
+      sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/$(ref.function-source-archive.name)
+      entryPoint: moderate_content
+      runtime: python311
+      timeout: 540s
+      availableMemoryMb: 1024
+      maxInstances: 10
+      serviceAccountEmail: $(ref.content-moderator-sa.email)
+      environmentVariables:
+        GCP_PROJECT: $(ref.project.projectId)
+        FUNCTION_REGION: $(REGION)
+        QUARANTINE_BUCKET: $(ref.quarantine-content-bucket.name)
+        APPROVED_BUCKET: $(ref.approved-content-bucket.name)
+      eventTrigger:
+        eventType: google.storage.object.finalize
+        resource: $(ref.incoming-content-bucket.name)
+        failurePolicy:
+          retry: true
+      labels:
+        environment: demo
+        purpose: content-moderation
+    metadata:
+      dependsOn: [enable-functions-api, content-moderator-sa, function-source-archive]
+
+  # Notification Function Source Archive
+  - name: notification-function-source
+    type: storage.v1.object
+    properties:
+      name: quarantine-notifier-source.zip
+      bucket: $(ref.function-source-bucket.name)
+      source:
+        # Placeholder for notification function source
+        content: |
+          # Notification function source code
+          # This would contain Python code for:
+          # - Processing quarantine events
+          # - Sending notifications to moderators
+          # - Logging quarantine events
+    metadata:
+      dependsOn: [function-source-bucket]
+
+  # Quarantine Notification Cloud Function
+  - name: quarantine-notifier-function
+    type: cloudfunctions.v1.cloudFunction
+    properties:
+      name: projects/$(ref.project.projectId)/locations/$(REGION)/functions/quarantine-notifier-$(ref.random-suffix.hex)
+      sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/$(ref.notification-function-source.name)
+      entryPoint: notify_quarantine
+      runtime: python311
+      timeout: 60s
+      availableMemoryMb: 256
+      maxInstances: 5
+      serviceAccountEmail: $(ref.content-moderator-sa.email)
+      environmentVariables:
+        GCP_PROJECT: $(ref.project.projectId)
+        QUARANTINE_BUCKET: $(ref.quarantine-content-bucket.name)
+      eventTrigger:
+        eventType: google.storage.object.finalize
+        resource: $(ref.quarantine-content-bucket.name)
+        failurePolicy:
+          retry: true
+      labels:
+        environment: demo
+        purpose: quarantine-notification
+    metadata:
+      dependsOn: [enable-functions-api, content-moderator-sa, notification-function-source]
+
+  # Cloud Monitoring Alert Policy for High Quarantine Rate
+  - name: high-quarantine-rate-alert
+    type: monitoring.v1.alertPolicy
+    properties:
+      displayName: High Content Quarantine Rate
+      documentation:
+        content: |
+          This alert fires when the content quarantine rate exceeds 50% over a 10-minute window.
+          This may indicate an attack or misconfigured moderation rules.
+      conditions:
+        - displayName: High quarantine rate
+          conditionThreshold:
+            filter: |
+              resource.type="cloud_function"
+              resource.labels.function_name="content-moderator-$(ref.random-suffix.hex)"
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 0.5
+            duration: 600s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_MEAN
+      enabled: true
+      notificationChannels: []  # Add notification channels as needed
+    metadata:
+      dependsOn: [content-moderator-function]
+
+# Template variables for customization
+variables:
+  BILLING_ACCOUNT_ID:
+    description: Billing account ID for the project
+    type: string
+    required: true
+  
+  REGION:
+    description: GCP region for resources
+    type: string
+    default: us-central1
+    
+  ENVIRONMENT:
+    description: Environment name (dev, staging, prod)
+    type: string
+    default: demo
+
+# Outputs for reference and integration
+outputs:
+  project_id:
+    description: The ID of the created project
+    value: $(ref.project.projectId)
+    
+  incoming_bucket:
+    description: Name of the incoming content bucket
+    value: $(ref.incoming-content-bucket.name)
+    
+  quarantine_bucket:
+    description: Name of the quarantine content bucket
+    value: $(ref.quarantine-content-bucket.name)
+    
+  approved_bucket:
+    description: Name of the approved content bucket
+    value: $(ref.approved-content-bucket.name)
+    
+  moderation_function:
+    description: Name of the content moderation function
+    value: $(ref.content-moderator-function.name)
+    
+  notification_function:
+    description: Name of the quarantine notification function
+    value: $(ref.quarantine-notifier-function.name)
+    
+  pubsub_topic:
+    description: Name of the Pub/Sub topic for content moderation
+    value: $(ref.content-moderation-topic.name)
+    
+  service_account_email:
+    description: Email of the content moderation service account
+    value: $(ref.content-moderator-sa.email)
+    
+  function_source_bucket:
+    description: Name of the function source code bucket
+    value: $(ref.function-source-bucket.name)
+
+# Configuration metadata
+metadata:
+  version: 1.0
+  author: GCP Content Moderation Recipe
+  description: |
+    Complete Infrastructure Manager configuration for deploying a content moderation
+    system using Vertex AI, Cloud Storage, Cloud Functions, and Pub/Sub.
+    
+    This configuration creates:
+    - Three Cloud Storage buckets for content workflow
+    - Pub/Sub topic and subscription for event processing
+    - Two Cloud Functions for moderation and notification
+    - IAM service account with appropriate permissions
+    - Monitoring alerts for operational visibility
+    
+    The system automatically analyzes uploaded content using Vertex AI's Gemini model
+    and routes content to quarantine or approved buckets based on moderation results.
+  
+  prerequisites:
+    - GCP project with billing enabled
+    - Infrastructure Manager API enabled
+    - Appropriate IAM permissions for resource creation
+    - Billing account ID for project creation
+  
+  estimated_cost: "$10-20 for initial setup and testing"
+  
+  deployment_time: "5-10 minutes"
+  
+  maintenance_notes: |
+    - Monitor Vertex AI API quotas and usage
+    - Review quarantine bucket contents regularly
+    - Update function source code as needed
+    - Adjust lifecycle policies based on retention requirements
+    - Monitor Cloud Function execution metrics and errors

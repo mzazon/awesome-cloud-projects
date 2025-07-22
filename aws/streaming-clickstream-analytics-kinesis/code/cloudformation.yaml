@@ -1,0 +1,1023 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Real-time Clickstream Analytics with Kinesis Data Streams and Lambda - Complete infrastructure for processing user behavior data with sub-second latency'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Kinesis Configuration"
+        Parameters:
+          - KinesisShardCount
+          - DataRetentionPeriod
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - ProcessorMemorySize
+          - ProcessorTimeout
+          - AnomalyDetectorMemorySize
+          - BatchSize
+          - MaxBatchingWindow
+      - Label:
+          default: "DynamoDB Configuration"
+        Parameters:
+          - BillingMode
+          - PointInTimeRecovery
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - CreateDashboard
+          - AlertEmail
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      KinesisShardCount:
+        default: "Kinesis Shard Count"
+      DataRetentionPeriod:
+        default: "Data Retention Period (hours)"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Name of the project (used for resource naming)
+    Default: clickstream-analytics
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: Must start with lowercase letter, contain only lowercase letters, numbers, and hyphens, and end with letter or number
+    MinLength: 3
+    MaxLength: 30
+
+  Environment:
+    Type: String
+    Description: Environment name
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    ConstraintDescription: Must be one of dev, test, staging, or prod
+
+  KinesisShardCount:
+    Type: Number
+    Description: Number of shards for Kinesis Data Stream
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    ConstraintDescription: Must be between 1 and 10
+
+  DataRetentionPeriod:
+    Type: Number
+    Description: Data retention period in hours for Kinesis stream
+    Default: 24
+    MinValue: 24
+    MaxValue: 168
+    ConstraintDescription: Must be between 24 and 168 hours (1-7 days)
+
+  ProcessorMemorySize:
+    Type: Number
+    Description: Memory size in MB for event processor Lambda function
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024, 1536, 2048, 3008]
+    ConstraintDescription: Must be a valid Lambda memory size
+
+  ProcessorTimeout:
+    Type: Number
+    Description: Timeout in seconds for event processor Lambda function
+    Default: 60
+    MinValue: 30
+    MaxValue: 900
+    ConstraintDescription: Must be between 30 and 900 seconds
+
+  AnomalyDetectorMemorySize:
+    Type: Number
+    Description: Memory size in MB for anomaly detector Lambda function
+    Default: 128
+    AllowedValues: [128, 256, 512, 1024, 1536, 2048, 3008]
+    ConstraintDescription: Must be a valid Lambda memory size
+
+  BatchSize:
+    Type: Number
+    Description: Number of records to process in each Lambda batch
+    Default: 100
+    MinValue: 1
+    MaxValue: 1000
+    ConstraintDescription: Must be between 1 and 1000
+
+  MaxBatchingWindow:
+    Type: Number
+    Description: Maximum batching window in seconds
+    Default: 5
+    MinValue: 0
+    MaxValue: 300
+    ConstraintDescription: Must be between 0 and 300 seconds
+
+  BillingMode:
+    Type: String
+    Description: DynamoDB billing mode
+    Default: PAY_PER_REQUEST
+    AllowedValues:
+      - PAY_PER_REQUEST
+      - PROVISIONED
+    ConstraintDescription: Must be either PAY_PER_REQUEST or PROVISIONED
+
+  PointInTimeRecovery:
+    Type: String
+    Description: Enable point-in-time recovery for DynamoDB tables
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    ConstraintDescription: Must be either true or false
+
+  CreateDashboard:
+    Type: String
+    Description: Create CloudWatch dashboard for monitoring
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    ConstraintDescription: Must be either true or false
+
+  AlertEmail:
+    Type: String
+    Description: Email address for anomaly alerts (optional)
+    Default: ''
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address or empty
+
+Conditions:
+  CreateDashboardCondition: !Equals [!Ref CreateDashboard, 'true']
+  CreateSNSAlerts: !Not [!Equals [!Ref AlertEmail, '']]
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # S3 Bucket for raw data archival
+  ClickstreamArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-archive-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldData
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Clickstream data archival'
+
+  # CloudWatch Log Group for S3 access logging
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-archive-${Environment}'
+      RetentionInDays: 30
+
+  # Kinesis Data Stream
+  ClickstreamDataStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${ProjectName}-events-${Environment}'
+      ShardCount: !Ref KinesisShardCount
+      RetentionPeriodHours: !Ref DataRetentionPeriod
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Clickstream event ingestion'
+
+  # DynamoDB Tables
+  PageMetricsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-page-metrics'
+      BillingMode: !Ref BillingMode
+      AttributeDefinitions:
+        - AttributeName: page_url
+          AttributeType: S
+        - AttributeName: timestamp_hour
+          AttributeType: S
+      KeySchema:
+        - AttributeName: page_url
+          KeyType: HASH
+        - AttributeName: timestamp_hour
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !Ref PointInTimeRecovery
+      SSESpecification:
+        SSEEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Page view metrics storage'
+
+  SessionMetricsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-session-metrics'
+      BillingMode: !Ref BillingMode
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !Ref PointInTimeRecovery
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Session metrics storage'
+
+  CountersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-counters'
+      BillingMode: !Ref BillingMode
+      AttributeDefinitions:
+        - AttributeName: metric_name
+          AttributeType: S
+        - AttributeName: time_window
+          AttributeType: S
+      KeySchema:
+        - AttributeName: metric_name
+          KeyType: HASH
+        - AttributeName: time_window
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !Ref PointInTimeRecovery
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Real-time counters storage'
+
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ClickstreamProcessingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListStreams
+                Resource: !GetAtt ClickstreamDataStream.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt PageMetricsTable.Arn
+                  - !GetAtt SessionMetricsTable.Arn
+                  - !GetAtt CountersTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub '${ClickstreamArchiveBucket}/*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - !If
+                - CreateSNSAlerts
+                - Effect: Allow
+                  Action:
+                    - sns:Publish
+                  Resource: !Ref AnomalyAlertsTopic
+                - !Ref 'AWS::NoValue'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Topic for Anomaly Alerts (conditional)
+  AnomalyAlertsTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSNSAlerts
+    Properties:
+      TopicName: !Sub '${ProjectName}-anomaly-alerts-${Environment}'
+      DisplayName: 'Clickstream Anomaly Alerts'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Subscription for Email Alerts
+  AnomalyAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateSNSAlerts
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AnomalyAlertsTopic
+      Endpoint: !Ref AlertEmail
+
+  # Lambda Functions
+  EventProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-event-processor-${Environment}'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref ProcessorTimeout
+      MemorySize: !Ref ProcessorMemorySize
+      Environment:
+        Variables:
+          TABLE_PREFIX: !Sub '${ProjectName}-${Environment}'
+          BUCKET_NAME: !Ref ClickstreamArchiveBucket
+          SNS_TOPIC_ARN: !If [CreateSNSAlerts, !Ref AnomalyAlertsTopic, '']
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          const s3 = new AWS.S3();
+          const cloudwatch = new AWS.CloudWatch();
+          
+          const TABLE_PREFIX = process.env.TABLE_PREFIX;
+          const BUCKET_NAME = process.env.BUCKET_NAME;
+          
+          exports.handler = async (event) => {
+              console.log('Processing', event.Records.length, 'records');
+              
+              const promises = event.Records.map(async (record) => {
+                  try {
+                      // Decode the Kinesis data
+                      const payload = Buffer.from(record.kinesis.data, 'base64').toString('utf-8');
+                      const clickEvent = JSON.parse(payload);
+                      
+                      // Process different event types
+                      await Promise.all([
+                          processPageView(clickEvent),
+                          updateSessionMetrics(clickEvent),
+                          updateRealTimeCounters(clickEvent),
+                          archiveRawEvent(clickEvent),
+                          publishMetrics(clickEvent)
+                      ]);
+                      
+                  } catch (error) {
+                      console.error('Error processing record:', error);
+                      throw error;
+                  }
+              });
+              
+              await Promise.all(promises);
+              return { statusCode: 200, body: 'Successfully processed events' };
+          };
+          
+          async function processPageView(event) {
+              if (event.event_type !== 'page_view') return;
+              
+              const hour = new Date(event.timestamp).toISOString().slice(0, 13);
+              
+              const params = {
+                  TableName: `${TABLE_PREFIX}-page-metrics`,
+                  Key: {
+                      page_url: event.page_url,
+                      timestamp_hour: hour
+                  },
+                  UpdateExpression: 'ADD view_count :inc SET last_updated = :now, ttl = :ttl',
+                  ExpressionAttributeValues: {
+                      ':inc': 1,
+                      ':now': Date.now(),
+                      ':ttl': Math.floor(Date.now() / 1000) + (30 * 24 * 60 * 60) // 30 days TTL
+                  }
+              };
+              
+              await dynamodb.update(params).promise();
+          }
+          
+          async function updateSessionMetrics(event) {
+              const params = {
+                  TableName: `${TABLE_PREFIX}-session-metrics`,
+                  Key: { session_id: event.session_id },
+                  UpdateExpression: 'SET last_activity = :now, user_agent = :ua, ttl = :ttl ADD event_count :inc',
+                  ExpressionAttributeValues: {
+                      ':now': event.timestamp,
+                      ':ua': event.user_agent || 'unknown',
+                      ':inc': 1,
+                      ':ttl': Math.floor(Date.now() / 1000) + (7 * 24 * 60 * 60) // 7 days TTL
+                  }
+              };
+              
+              await dynamodb.update(params).promise();
+          }
+          
+          async function updateRealTimeCounters(event) {
+              const minute = new Date(event.timestamp).toISOString().slice(0, 16);
+              
+              const params = {
+                  TableName: `${TABLE_PREFIX}-counters`,
+                  Key: {
+                      metric_name: `events_per_minute_${event.event_type}`,
+                      time_window: minute
+                  },
+                  UpdateExpression: 'ADD event_count :inc SET ttl = :ttl',
+                  ExpressionAttributeValues: {
+                      ':inc': 1,
+                      ':ttl': Math.floor(Date.now() / 1000) + (24 * 60 * 60) // 24 hour TTL
+                  }
+              };
+              
+              await dynamodb.update(params).promise();
+          }
+          
+          async function archiveRawEvent(event) {
+              const date = new Date(event.timestamp);
+              const key = `year=${date.getFullYear()}/month=${date.getMonth() + 1}/day=${date.getDate()}/hour=${date.getHours()}/${event.session_id}-${Date.now()}.json`;
+              
+              const params = {
+                  Bucket: BUCKET_NAME,
+                  Key: key,
+                  Body: JSON.stringify(event),
+                  ContentType: 'application/json',
+                  ServerSideEncryption: 'AES256'
+              };
+              
+              await s3.putObject(params).promise();
+          }
+          
+          async function publishMetrics(event) {
+              const params = {
+                  Namespace: 'Clickstream/Events',
+                  MetricData: [
+                      {
+                          MetricName: 'EventsProcessed',
+                          Value: 1,
+                          Unit: 'Count',
+                          Dimensions: [
+                              {
+                                  Name: 'EventType',
+                                  Value: event.event_type
+                              },
+                              {
+                                  Name: 'Environment',
+                                  Value: process.env.AWS_LAMBDA_FUNCTION_NAME.split('-').slice(-1)[0]
+                              }
+                          ]
+                      }
+                  ]
+              };
+              
+              await cloudwatch.putMetricData(params).promise();
+          }
+      ReservedConcurrencyConfiguration:
+        ReservedConcurrency: !If [IsProduction, 100, 10]
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Event processing'
+
+  AnomalyDetectorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-anomaly-detector-${Environment}'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: !Ref AnomalyDetectorMemorySize
+      Environment:
+        Variables:
+          TABLE_PREFIX: !Sub '${ProjectName}-${Environment}'
+          SNS_TOPIC_ARN: !If [CreateSNSAlerts, !Ref AnomalyAlertsTopic, '']
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          const sns = new AWS.SNS();
+          
+          const TABLE_PREFIX = process.env.TABLE_PREFIX;
+          const SNS_TOPIC_ARN = process.env.SNS_TOPIC_ARN;
+          
+          exports.handler = async (event) => {
+              console.log('Checking for anomalies in', event.Records.length, 'records');
+              
+              for (const record of event.Records) {
+                  try {
+                      const payload = Buffer.from(record.kinesis.data, 'base64').toString('utf-8');
+                      const clickEvent = JSON.parse(payload);
+                      
+                      await checkForAnomalies(clickEvent);
+                      
+                  } catch (error) {
+                      console.error('Error processing record for anomaly detection:', error);
+                  }
+              }
+              
+              return { statusCode: 200 };
+          };
+          
+          async function checkForAnomalies(event) {
+              // Check for suspicious patterns
+              const checks = await Promise.all([
+                  checkHighFrequencyClicks(event),
+                  checkSuspiciousUserAgent(event),
+                  checkUnusualPageSequence(event)
+              ]);
+              
+              const anomalies = checks.filter(check => check.isAnomaly);
+              
+              if (anomalies.length > 0) {
+                  await sendAlert(event, anomalies);
+              }
+          }
+          
+          async function checkHighFrequencyClicks(event) {
+              const minute = new Date(event.timestamp).toISOString().slice(0, 16);
+              
+              const params = {
+                  TableName: `${TABLE_PREFIX}-counters`,
+                  Key: {
+                      metric_name: `session_events_${event.session_id}`,
+                      time_window: minute
+                  }
+              };
+              
+              const result = await dynamodb.get(params).promise();
+              const eventCount = result.Item ? result.Item.event_count : 0;
+              
+              // Flag if more than 50 events per minute from same session
+              return {
+                  isAnomaly: eventCount > 50,
+                  type: 'high_frequency_clicks',
+                  details: `${eventCount} events in one minute`
+              };
+          }
+          
+          async function checkSuspiciousUserAgent(event) {
+              const suspiciousPatterns = ['bot', 'crawler', 'spider', 'scraper', 'automated'];
+              const userAgent = (event.user_agent || '').toLowerCase();
+              
+              const isSuspicious = suspiciousPatterns.some(pattern => 
+                  userAgent.includes(pattern)
+              );
+              
+              return {
+                  isAnomaly: isSuspicious,
+                  type: 'suspicious_user_agent',
+                  details: event.user_agent
+              };
+          }
+          
+          async function checkUnusualPageSequence(event) {
+              // Simple check for direct access to checkout without viewing products
+              if (event.page_url && event.page_url.includes('/checkout')) {
+                  const params = {
+                      TableName: `${TABLE_PREFIX}-session-metrics`,
+                      Key: { session_id: event.session_id }
+                  };
+                  
+                  const result = await dynamodb.get(params).promise();
+                  const eventCount = result.Item ? result.Item.event_count : 0;
+                  
+                  // Flag if going to checkout with very few page views
+                  return {
+                      isAnomaly: eventCount < 3,
+                      type: 'unusual_page_sequence',
+                      details: `Direct checkout access with only ${eventCount} page views`
+                  };
+              }
+              
+              return { isAnomaly: false };
+          }
+          
+          async function sendAlert(event, anomalies) {
+              if (!SNS_TOPIC_ARN) return;
+              
+              const message = {
+                  timestamp: event.timestamp,
+                  session_id: event.session_id,
+                  anomalies: anomalies,
+                  event_details: event,
+                  environment: process.env.AWS_LAMBDA_FUNCTION_NAME.split('-').slice(-1)[0]
+              };
+              
+              const params = {
+                  TopicArn: SNS_TOPIC_ARN,
+                  Message: JSON.stringify(message, null, 2),
+                  Subject: `Clickstream Anomaly Detected - ${process.env.AWS_LAMBDA_FUNCTION_NAME.split('-').slice(-1)[0]}`
+              };
+              
+              await sns.publish(params).promise();
+              console.log('Alert sent for anomalies:', anomalies.map(a => a.type));
+          }
+      ReservedConcurrencyConfiguration:
+        ReservedConcurrency: !If [IsProduction, 50, 5]
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Anomaly detection'
+
+  # Dead Letter Queue for Lambda error handling
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-dlq-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Groups for Lambda Functions
+  EventProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${EventProcessorFunction}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  AnomalyDetectorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AnomalyDetectorFunction}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  # Event Source Mappings
+  EventProcessorMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ClickstreamDataStream.Arn
+      FunctionName: !GetAtt EventProcessorFunction.Arn
+      StartingPosition: LATEST
+      BatchSize: !Ref BatchSize
+      MaximumBatchingWindowInSeconds: !Ref MaxBatchingWindow
+      ParallelizationFactor: 2
+      MaximumRetryAttempts: 3
+      BisectBatchOnFunctionError: true
+      MaximumRecordAgeInSeconds: 86400  # 24 hours
+      DestinationConfig:
+        OnFailure:
+          Destination: !GetAtt DeadLetterQueue.Arn
+
+  AnomalyDetectorMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ClickstreamDataStream.Arn
+      FunctionName: !GetAtt AnomalyDetectorFunction.Arn
+      StartingPosition: LATEST
+      BatchSize: 50
+      MaximumBatchingWindowInSeconds: 10
+      ParallelizationFactor: 1
+      MaximumRetryAttempts: 2
+      BisectBatchOnFunctionError: true
+      MaximumRecordAgeInSeconds: 86400  # 24 hours
+      DestinationConfig:
+        OnFailure:
+          Destination: !GetAtt DeadLetterQueue.Arn
+
+  # CloudWatch Dashboard (conditional)
+  ClickstreamDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateDashboardCondition
+    Properties:
+      DashboardName: !Sub '${ProjectName}-analytics-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "Clickstream/Events", "EventsProcessed", "EventType", "page_view", "Environment", "${Environment}" ],
+                  [ "...", "click", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Events Processed by Type",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${EventProcessorFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Invocations", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Event Processor Performance"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Kinesis", "IncomingRecords", "StreamName", "${ClickstreamDataStream}" ],
+                  [ ".", "OutgoingRecords", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Kinesis Stream Throughput"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${AnomalyDetectorFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Invocations", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Anomaly Detector Performance"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${PageMetricsTable}" ],
+                  [ ".", "ConsumedWriteCapacityUnits", ".", "." ],
+                  [ ".", "ConsumedReadCapacityUnits", "TableName", "${SessionMetricsTable}" ],
+                  [ ".", "ConsumedWriteCapacityUnits", ".", "." ],
+                  [ ".", "ConsumedReadCapacityUnits", "TableName", "${CountersTable}" ],
+                  [ ".", "ConsumedWriteCapacityUnits", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "DynamoDB Capacity Consumption"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-high-error-rate'
+      AlarmDescription: 'High error rate in event processing'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EventProcessorFunction
+      AlarmActions:
+        - !If [CreateSNSAlerts, !Ref AnomalyAlertsTopic, !Ref 'AWS::NoValue']
+      TreatMissingData: notBreaching
+
+  HighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-high-latency'
+      AlarmDescription: 'High latency in event processing'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 30000  # 30 seconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EventProcessorFunction
+      AlarmActions:
+        - !If [CreateSNSAlerts, !Ref AnomalyAlertsTopic, !Ref 'AWS::NoValue']
+      TreatMissingData: notBreaching
+
+  KinesisIteratorAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-kinesis-iterator-age'
+      AlarmDescription: 'Kinesis iterator age is high indicating processing lag'
+      MetricName: IteratorAge
+      Namespace: AWS/Kinesis
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 60000  # 1 minute in milliseconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: StreamName
+          Value: !Ref ClickstreamDataStream
+      AlarmActions:
+        - !If [CreateSNSAlerts, !Ref AnomalyAlertsTopic, !Ref 'AWS::NoValue']
+      TreatMissingData: notBreaching
+
+Outputs:
+  KinesisStreamName:
+    Description: Name of the Kinesis Data Stream
+    Value: !Ref ClickstreamDataStream
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisStreamName'
+
+  KinesisStreamArn:
+    Description: ARN of the Kinesis Data Stream
+    Value: !GetAtt ClickstreamDataStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisStreamArn'
+
+  S3BucketName:
+    Description: Name of the S3 bucket for data archival
+    Value: !Ref ClickstreamArchiveBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketName'
+
+  EventProcessorFunctionName:
+    Description: Name of the event processor Lambda function
+    Value: !Ref EventProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-EventProcessorFunctionName'
+
+  EventProcessorFunctionArn:
+    Description: ARN of the event processor Lambda function
+    Value: !GetAtt EventProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventProcessorFunctionArn'
+
+  AnomalyDetectorFunctionName:
+    Description: Name of the anomaly detector Lambda function
+    Value: !Ref AnomalyDetectorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-AnomalyDetectorFunctionName'
+
+  AnomalyDetectorFunctionArn:
+    Description: ARN of the anomaly detector Lambda function
+    Value: !GetAtt AnomalyDetectorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AnomalyDetectorFunctionArn'
+
+  PageMetricsTableName:
+    Description: Name of the page metrics DynamoDB table
+    Value: !Ref PageMetricsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-PageMetricsTableName'
+
+  SessionMetricsTableName:
+    Description: Name of the session metrics DynamoDB table
+    Value: !Ref SessionMetricsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-SessionMetricsTableName'
+
+  CountersTableName:
+    Description: Name of the counters DynamoDB table
+    Value: !Ref CountersTable
+    Export:
+      Name: !Sub '${AWS::StackName}-CountersTableName'
+
+  SNSTopicArn:
+    Condition: CreateSNSAlerts
+    Description: ARN of the SNS topic for anomaly alerts
+    Value: !Ref AnomalyAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  DashboardURL:
+    Condition: CreateDashboardCondition
+    Description: URL to the CloudWatch dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-analytics-${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  TestDataGenerationCommands:
+    Description: Sample commands for testing the clickstream pipeline
+    Value: !Sub |
+      # Install Node.js dependencies and generate test events:
+      # 1. Create test directory: mkdir test-client && cd test-client
+      # 2. Install AWS SDK: npm install aws-sdk
+      # 3. Set environment: export STREAM_NAME=${ClickstreamDataStream}
+      # 4. Create test script and run: node generate-events.js
+      # 5. Monitor dashboard: ${AWS::Region}.console.aws.amazon.com/cloudwatch/home#dashboards:name=${ProjectName}-analytics-${Environment}
+
+  DeploymentInstructions:
+    Description: Next steps after stack deployment
+    Value: !Sub |
+      1. Verify all resources are created successfully
+      2. Test the pipeline using the test data generation commands
+      3. Monitor the CloudWatch dashboard for real-time metrics
+      4. Check DynamoDB tables for processed data
+      5. Review CloudWatch logs for any processing errors
+      6. Configure additional alerts if needed based on your SLA requirements

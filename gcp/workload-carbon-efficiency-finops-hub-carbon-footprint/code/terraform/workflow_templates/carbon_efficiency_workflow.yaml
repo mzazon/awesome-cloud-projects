@@ -1,0 +1,244 @@
+main:
+  params: [args]
+  steps:
+    - initialize:
+        assign:
+          - project_id: "${project_id}"
+          - function_url: "${function_url}"
+          - region: "${region}"
+          - correlation_id: $${sys.now()}
+    
+    - log_workflow_start:
+        call: sys.log
+        args:
+          data:
+            message: "Starting carbon efficiency analysis workflow"
+            project_id: $${project_id}
+            correlation_id: $${correlation_id}
+          severity: "INFO"
+    
+    - collect_efficiency_data:
+        try:
+          call: http.post
+          args:
+            url: $${function_url}
+            headers:
+              Content-Type: "application/json"
+            body:
+              action: "analyze_efficiency"
+              timestamp: $${sys.now()}
+              correlation_id: $${correlation_id}
+            timeout: 300
+          result: efficiency_result
+        except:
+          as: e
+          steps:
+            - log_function_error:
+                call: sys.log
+                args:
+                  data:
+                    message: "Error calling carbon efficiency function"
+                    error: $${e}
+                    correlation_id: $${correlation_id}
+                  severity: "ERROR"
+            - return_error:
+                return:
+                  status: "error"
+                  message: "Failed to collect efficiency data"
+                  correlation_id: $${correlation_id}
+    
+    - parse_efficiency_result:
+        assign:
+          - efficiency_score: $${efficiency_result.body.efficiency_score}
+          - recommendations_count: $${efficiency_result.body.recommendations_count}
+          - utilization_summary: $${efficiency_result.body.utilization_summary}
+          - finops_insights: $${efficiency_result.body.finops_insights}
+    
+    - check_efficiency_score:
+        switch:
+          - condition: $${efficiency_score < 50}
+            next: critical_efficiency_alert
+          - condition: $${efficiency_score < 70}
+            next: generate_optimization_report
+          - condition: $${efficiency_score >= 70}
+            next: log_healthy_status
+    
+    - critical_efficiency_alert:
+        steps:
+          - log_critical_alert:
+              call: sys.log
+              args:
+                data:
+                  message: "CRITICAL: Carbon efficiency score below 50%"
+                  efficiency_score: $${efficiency_score}
+                  recommendations_count: $${recommendations_count}
+                  correlation_id: $${correlation_id}
+                severity: "ERROR"
+          - trigger_immediate_analysis:
+              call: googleapis.pubsub.v1.projects.topics.publish
+              args:
+                topic: $${"projects/" + project_id + "/topics/carbon-optimization"}
+                body:
+                  messages:
+                    - data: $${base64.encode(json.encode({
+                        "optimization_type": "immediate_review",
+                        "efficiency_score": efficiency_score,
+                        "priority": "HIGH",
+                        "correlation_id": correlation_id
+                      }))}
+              result: publish_result
+        next: generate_optimization_report
+    
+    - generate_optimization_report:
+        assign:
+          - optimization_priority: $${efficiency_score < 50 ? "HIGH" : "MEDIUM"}
+          - carbon_reduction_potential: $${finops_insights.optimization_potential.estimated_carbon_reduction_kg}
+          - cost_savings_potential: $${finops_insights.optimization_potential.monthly_cost_savings_usd}
+          - report_data:
+              score: $${efficiency_score}
+              recommendations_count: $${recommendations_count}
+              utilization_summary: $${utilization_summary}
+              finops_insights: $${finops_insights}
+              optimization_priority: $${optimization_priority}
+              carbon_reduction_potential: $${carbon_reduction_potential}
+              cost_savings_potential: $${cost_savings_potential}
+              status: "optimization_needed"
+              generated_at: $${sys.now()}
+              correlation_id: $${correlation_id}
+        next: trigger_optimization_actions
+    
+    - trigger_optimization_actions:
+        try:
+          parallel:
+            branches:
+              - rightsizing_optimization:
+                  call: googleapis.pubsub.v1.projects.topics.publish
+                  args:
+                    topic: $${"projects/" + project_id + "/topics/carbon-optimization"}
+                    body:
+                      messages:
+                        - data: $${base64.encode(json.encode({
+                            "optimization_type": "rightsizing",
+                            "priority": optimization_priority,
+                            "correlation_id": correlation_id
+                          }))}
+              - idle_cleanup_optimization:
+                  call: googleapis.pubsub.v1.projects.topics.publish
+                  args:
+                    topic: $${"projects/" + project_id + "/topics/carbon-optimization"}
+                    body:
+                      messages:
+                        - data: $${base64.encode(json.encode({
+                            "optimization_type": "idle_cleanup",
+                            "priority": optimization_priority,
+                            "correlation_id": correlation_id
+                          }))}
+        except:
+          as: e
+          steps:
+            - log_optimization_error:
+                call: sys.log
+                args:
+                  data:
+                    message: "Error triggering optimization actions"
+                    error: $${e}
+                    correlation_id: $${correlation_id}
+                  severity: "WARNING"
+        next: store_report
+    
+    - log_healthy_status:
+        assign:
+          - report_data:
+              score: $${efficiency_score}
+              recommendations_count: $${recommendations_count}
+              utilization_summary: $${utilization_summary}
+              finops_insights: $${finops_insights}
+              status: "healthy"
+              generated_at: $${sys.now()}
+              correlation_id: $${correlation_id}
+        next: store_report
+    
+    - store_report:
+        try:
+          call: googleapis.logging.v2.entries.write
+          args:
+            body:
+              entries:
+                - logName: $${"projects/" + project_id + "/logs/carbon-efficiency-reports"}
+                  resource:
+                    type: "global"
+                  jsonPayload: $${report_data}
+                  severity: "INFO"
+                  labels:
+                    source: "finops-hub"
+                    event_type: "carbon_efficiency_report"
+                    efficiency_status: $${report_data.status}
+          result: log_result
+        except:
+          as: e
+          steps:
+            - log_storage_error:
+                call: sys.log
+                args:
+                  data:
+                    message: "Error storing efficiency report"
+                    error: $${e}
+                    correlation_id: $${correlation_id}
+                  severity: "WARNING"
+    
+    - create_monitoring_metrics:
+        try:
+          call: googleapis.monitoring.v3.projects.timeSeries.create
+          args:
+            name: $${"projects/" + project_id}
+            body:
+              timeSeries:
+                - resource:
+                    type: "global"
+                  metric:
+                    type: "custom.googleapis.com/workflows/carbon_efficiency_analysis"
+                    labels:
+                      workflow_status: $${report_data.status}
+                      efficiency_category: $${efficiency_score >= 80 ? "excellent" : (efficiency_score >= 70 ? "good" : (efficiency_score >= 50 ? "needs_improvement" : "critical"))}
+                  points:
+                    - interval:
+                        endTime: $${time.format(sys.now())}
+                      value:
+                        doubleValue: $${efficiency_score}
+        except:
+          as: e
+          steps:
+            - log_metrics_error:
+                call: sys.log
+                args:
+                  data:
+                    message: "Error creating monitoring metrics"
+                    error: $${e}
+                    correlation_id: $${correlation_id}
+                  severity: "WARNING"
+    
+    - generate_finops_summary:
+        assign:
+          - finops_summary:
+              workflow_execution_id: $${correlation_id}
+              carbon_efficiency_score: $${efficiency_score}
+              total_recommendations: $${recommendations_count}
+              optimization_potential:
+                cost_savings_usd: $${finops_insights.optimization_potential.monthly_cost_savings_usd}
+                carbon_reduction_kg: $${finops_insights.optimization_potential.estimated_carbon_reduction_kg}
+              waste_categories: $${finops_insights.waste_categories}
+              priority_actions: $${finops_insights.priority_actions}
+              gemini_integration_status: $${finops_insights.gemini_integration_ready}
+              next_analysis_scheduled: $${time.format(time.parse(sys.now()) + 86400)}
+    
+    - log_workflow_completion:
+        call: sys.log
+        args:
+          data:
+            message: "Carbon efficiency analysis workflow completed successfully"
+            finops_summary: $${finops_summary}
+            correlation_id: $${correlation_id}
+          severity: "INFO"
+    
+    - return_result:
+        return: $${finops_summary}

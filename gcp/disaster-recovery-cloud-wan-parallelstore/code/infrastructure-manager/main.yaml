@@ -1,0 +1,859 @@
+# Infrastructure Manager configuration for Disaster Recovery Orchestration
+# with Cloud WAN and Parallelstore
+#
+# This configuration deploys a complete high-performance computing (HPC) disaster
+# recovery solution using Google Cloud's Network Connectivity Center, Parallelstore,
+# and Cloud Workflows for automated orchestration across multiple regions.
+
+# Import required modules
+imports:
+  - path: modules/networking.jinja
+  - path: modules/storage.jinja
+  - path: modules/monitoring.jinja
+  - path: modules/orchestration.jinja
+
+# Global configuration parameters
+parameters:
+  # Project and location configuration
+  project_id:
+    type: string
+    description: Google Cloud Project ID
+    required: true
+  
+  primary_region:
+    type: string
+    description: Primary region for HPC workloads
+    default: us-central1
+  
+  secondary_region:
+    type: string
+    description: Secondary region for disaster recovery
+    default: us-east1
+  
+  primary_zone:
+    type: string
+    description: Primary zone for resource deployment
+    default: us-central1-a
+  
+  secondary_zone:
+    type: string
+    description: Secondary zone for disaster recovery
+    default: us-east1-a
+  
+  # Resource naming configuration
+  deployment_name:
+    type: string
+    description: Deployment name prefix for all resources
+    default: hpc-dr
+  
+  random_suffix:
+    type: string
+    description: Random suffix for unique resource naming
+    pattern: '^[a-f0-9]{6}$'
+    required: true
+  
+  # Parallelstore configuration
+  parallelstore_capacity:
+    type: integer
+    description: Parallelstore capacity in TiB
+    default: 100
+    minimum: 12
+    maximum: 1024
+  
+  # VPN configuration
+  vpn_shared_secret:
+    type: string
+    description: Shared secret for VPN tunnel authentication
+    required: true
+    minLength: 20
+  
+  # Monitoring configuration
+  enable_advanced_monitoring:
+    type: boolean
+    description: Enable advanced monitoring and alerting
+    default: true
+  
+  # Cloud Functions configuration
+  function_memory:
+    type: string
+    description: Memory allocation for Cloud Functions
+    default: 512MB
+    enum: [256MB, 512MB, 1GB, 2GB]
+
+# Resource definitions
+resources:
+  # =============================================================================
+  # NETWORKING INFRASTRUCTURE
+  # =============================================================================
+  
+  # Primary region VPC network
+  primary-vpc:
+    type: gcp-types/compute-v1:networks
+    properties:
+      name: $(ref.deployment_name)-$(ref.random_suffix)-primary-vpc
+      description: Primary region VPC for HPC disaster recovery
+      autoCreateSubnetworks: false
+      routingConfig:
+        routingMode: REGIONAL
+    metadata:
+      dependsOn: []
+
+  # Primary region subnet
+  primary-subnet:
+    type: gcp-types/compute-v1:subnetworks
+    properties:
+      name: $(ref.deployment_name)-$(ref.random_suffix)-primary-subnet
+      description: Primary subnet for HPC workloads
+      network: $(ref.primary-vpc.selfLink)
+      ipCidrRange: 10.1.0.0/16
+      region: $(ref.primary_region)
+      enableFlowLogs: true
+      logConfig:
+        enable: true
+        flowSampling: 0.5
+        aggregationInterval: INTERVAL_10_MIN
+    metadata:
+      dependsOn:
+        - primary-vpc
+
+  # Secondary region VPC network
+  secondary-vpc:
+    type: gcp-types/compute-v1:networks
+    properties:
+      name: $(ref.deployment_name)-$(ref.random_suffix)-secondary-vpc
+      description: Secondary region VPC for HPC disaster recovery
+      autoCreateSubnetworks: false
+      routingConfig:
+        routingMode: REGIONAL
+    metadata:
+      dependsOn: []
+
+  # Secondary region subnet
+  secondary-subnet:
+    type: gcp-types/compute-v1:subnetworks
+    properties:
+      name: $(ref.deployment_name)-$(ref.random_suffix)-secondary-subnet
+      description: Secondary subnet for HPC workloads
+      network: $(ref.secondary-vpc.selfLink)
+      ipCidrRange: 10.2.0.0/16
+      region: $(ref.secondary_region)
+      enableFlowLogs: true
+      logConfig:
+        enable: true
+        flowSampling: 0.5
+        aggregationInterval: INTERVAL_10_MIN
+    metadata:
+      dependsOn:
+        - secondary-vpc
+
+  # Network Connectivity Center hub
+  wan-hub:
+    type: gcp-types/networkconnectivity-v1:projects.locations.global.hubs
+    properties:
+      name: projects/$(ref.project_id)/locations/global/hubs/$(ref.deployment_name)-$(ref.random_suffix)-wan-hub
+      description: Global WAN hub for HPC disaster recovery
+      labels:
+        environment: production
+        purpose: disaster-recovery
+        component: network-hub
+    metadata:
+      dependsOn: []
+
+  # Primary region spoke
+  primary-spoke:
+    type: gcp-types/networkconnectivity-v1:projects.locations.spokes
+    properties:
+      name: projects/$(ref.project_id)/locations/$(ref.primary_region)/spokes/$(ref.deployment_name)-$(ref.random_suffix)-primary-spoke
+      hub: $(ref.wan-hub.name)
+      description: Primary region spoke for WAN connectivity
+      linkedVpcNetwork:
+        uri: $(ref.primary-vpc.selfLink)
+        excludeExportRanges:
+          - 169.254.0.0/16
+      labels:
+        environment: production
+        region: primary
+        component: network-spoke
+    metadata:
+      dependsOn:
+        - wan-hub
+        - primary-vpc
+
+  # Secondary region spoke
+  secondary-spoke:
+    type: gcp-types/networkconnectivity-v1:projects.locations.spokes
+    properties:
+      name: projects/$(ref.project_id)/locations/$(ref.secondary_region)/spokes/$(ref.deployment_name)-$(ref.random_suffix)-secondary-spoke
+      hub: $(ref.wan-hub.name)
+      description: Secondary region spoke for WAN connectivity
+      linkedVpcNetwork:
+        uri: $(ref.secondary-vpc.selfLink)
+        excludeExportRanges:
+          - 169.254.0.0/16
+      labels:
+        environment: production
+        region: secondary
+        component: network-spoke
+    metadata:
+      dependsOn:
+        - wan-hub
+        - secondary-vpc
+
+  # =============================================================================
+  # VPN INFRASTRUCTURE FOR SECURE CONNECTIVITY
+  # =============================================================================
+
+  # Primary region VPN gateway
+  primary-vpn-gateway:
+    type: gcp-types/compute-v1:vpnGateways
+    properties:
+      name: $(ref.deployment_name)-$(ref.random_suffix)-primary-vpn-gw
+      description: Primary region HA VPN gateway
+      network: $(ref.primary-vpc.selfLink)
+      region: $(ref.primary_region)
+    metadata:
+      dependsOn:
+        - primary-vpc
+
+  # Secondary region VPN gateway
+  secondary-vpn-gateway:
+    type: gcp-types/compute-v1:vpnGateways
+    properties:
+      name: $(ref.deployment_name)-$(ref.random_suffix)-secondary-vpn-gw
+      description: Secondary region HA VPN gateway
+      network: $(ref.secondary-vpc.selfLink)
+      region: $(ref.secondary_region)
+    metadata:
+      dependsOn:
+        - secondary-vpc
+
+  # Primary region Cloud Router
+  primary-router:
+    type: gcp-types/compute-v1:routers
+    properties:
+      name: $(ref.deployment_name)-$(ref.random_suffix)-primary-router
+      description: Primary region BGP router for VPN connectivity
+      network: $(ref.primary-vpc.selfLink)
+      region: $(ref.primary_region)
+      bgp:
+        asn: 64512
+        advertiseMode: DEFAULT
+        keepaliveInterval: 20
+    metadata:
+      dependsOn:
+        - primary-vpc
+
+  # Secondary region Cloud Router
+  secondary-router:
+    type: gcp-types/compute-v1:routers
+    properties:
+      name: $(ref.deployment_name)-$(ref.random_suffix)-secondary-router
+      description: Secondary region BGP router for VPN connectivity
+      network: $(ref.secondary-vpc.selfLink)
+      region: $(ref.secondary_region)
+      bgp:
+        asn: 64513
+        advertiseMode: DEFAULT
+        keepaliveInterval: 20
+    metadata:
+      dependsOn:
+        - secondary-vpc
+
+  # VPN tunnel from primary to secondary region
+  primary-to-secondary-tunnel:
+    type: gcp-types/compute-v1:vpnTunnels
+    properties:
+      name: $(ref.deployment_name)-$(ref.random_suffix)-primary-to-secondary
+      description: VPN tunnel from primary to secondary region
+      region: $(ref.primary_region)
+      vpnGateway: $(ref.primary-vpn-gateway.selfLink)
+      peerGcpGateway: $(ref.secondary-vpn-gateway.selfLink)
+      sharedSecret: $(ref.vpn_shared_secret)
+      router: $(ref.primary-router.selfLink)
+      vpnGatewayInterface: 0
+      peerGcpGatewayInterface: 0
+      ikeVersion: 2
+    metadata:
+      dependsOn:
+        - primary-vpn-gateway
+        - secondary-vpn-gateway
+        - primary-router
+
+  # VPN tunnel from secondary to primary region
+  secondary-to-primary-tunnel:
+    type: gcp-types/compute-v1:vpnTunnels
+    properties:
+      name: $(ref.deployment_name)-$(ref.random_suffix)-secondary-to-primary
+      description: VPN tunnel from secondary to primary region
+      region: $(ref.secondary_region)
+      vpnGateway: $(ref.secondary-vpn-gateway.selfLink)
+      peerGcpGateway: $(ref.primary-vpn-gateway.selfLink)
+      sharedSecret: $(ref.vpn_shared_secret)
+      router: $(ref.secondary-router.selfLink)
+      vpnGatewayInterface: 0
+      peerGcpGatewayInterface: 0
+      ikeVersion: 2
+    metadata:
+      dependsOn:
+        - primary-vpn-gateway
+        - secondary-vpn-gateway
+        - secondary-router
+
+  # =============================================================================
+  # PARALLELSTORE HIGH-PERFORMANCE STORAGE
+  # =============================================================================
+
+  # Primary Parallelstore instance
+  primary-parallelstore:
+    type: gcp-types/parallelstore-v1beta:projects.locations.instances
+    properties:
+      name: projects/$(ref.project_id)/locations/$(ref.primary_zone)/instances/$(ref.deployment_name)-$(ref.random_suffix)-primary-pfs
+      description: Primary Parallelstore instance for HPC workloads
+      capacityGib: $(ref.parallelstore_capacity * 1024)
+      network: $(ref.primary-vpc.selfLink)
+      dasdVolumeConfigs:
+        - volumeType: SSD
+          capacityGib: $(ref.parallelstore_capacity * 1024)
+      labels:
+        environment: production
+        region: primary
+        component: storage
+        purpose: hpc-workloads
+    metadata:
+      dependsOn:
+        - primary-vpc
+        - primary-subnet
+
+  # Secondary Parallelstore instance
+  secondary-parallelstore:
+    type: gcp-types/parallelstore-v1beta:projects.locations.instances
+    properties:
+      name: projects/$(ref.project_id)/locations/$(ref.secondary_zone)/instances/$(ref.deployment_name)-$(ref.random_suffix)-secondary-pfs
+      description: Secondary Parallelstore instance for disaster recovery
+      capacityGib: $(ref.parallelstore_capacity * 1024)
+      network: $(ref.secondary-vpc.selfLink)
+      dasdVolumeConfigs:
+        - volumeType: SSD
+          capacityGib: $(ref.parallelstore_capacity * 1024)
+      labels:
+        environment: production
+        region: secondary
+        component: storage
+        purpose: disaster-recovery
+    metadata:
+      dependsOn:
+        - secondary-vpc
+        - secondary-subnet
+
+  # =============================================================================
+  # PUB/SUB MESSAGING INFRASTRUCTURE
+  # =============================================================================
+
+  # Health alerts topic
+  health-alerts-topic:
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project_id)/topics/$(ref.deployment_name)-$(ref.random_suffix)-health-alerts
+      labels:
+        environment: production
+        component: messaging
+        purpose: health-monitoring
+    metadata:
+      dependsOn: []
+
+  # Failover commands topic
+  failover-commands-topic:
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project_id)/topics/$(ref.deployment_name)-$(ref.random_suffix)-failover-commands
+      labels:
+        environment: production
+        component: messaging
+        purpose: failover-orchestration
+    metadata:
+      dependsOn: []
+
+  # Replication status topic
+  replication-status-topic:
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project_id)/topics/$(ref.deployment_name)-$(ref.random_suffix)-replication-status
+      labels:
+        environment: production
+        component: messaging
+        purpose: replication-monitoring
+    metadata:
+      dependsOn: []
+
+  # Health alerts subscription
+  health-alerts-subscription:
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(ref.project_id)/subscriptions/$(ref.deployment_name)-$(ref.random_suffix)-health-subscription
+      topic: $(ref.health-alerts-topic.name)
+      ackDeadlineSeconds: 600
+      retainAckedMessages: false
+      messageRetentionDuration: 604800s
+      expirationPolicy:
+        ttl: 2678400s
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+    metadata:
+      dependsOn:
+        - health-alerts-topic
+
+  # Failover commands subscription
+  failover-commands-subscription:
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(ref.project_id)/subscriptions/$(ref.deployment_name)-$(ref.random_suffix)-failover-subscription
+      topic: $(ref.failover-commands-topic.name)
+      ackDeadlineSeconds: 600
+      retainAckedMessages: false
+      messageRetentionDuration: 604800s
+      expirationPolicy:
+        ttl: 2678400s
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+    metadata:
+      dependsOn:
+        - failover-commands-topic
+
+  # Replication status subscription
+  replication-status-subscription:
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(ref.project_id)/subscriptions/$(ref.deployment_name)-$(ref.random_suffix)-replication-subscription
+      topic: $(ref.replication-status-topic.name)
+      ackDeadlineSeconds: 600
+      retainAckedMessages: false
+      messageRetentionDuration: 604800s
+      expirationPolicy:
+        ttl: 2678400s
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+    metadata:
+      dependsOn:
+        - replication-status-topic
+
+  # =============================================================================
+  # CLOUD STORAGE FOR REPLICATION STAGING
+  # =============================================================================
+
+  # Replication staging bucket
+  replication-staging-bucket:
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(ref.deployment_name)-$(ref.random_suffix)-replication-staging
+      location: $(ref.primary_region)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              numNewerVersions: 5
+      encryption:
+        defaultKmsKeyName: projects/$(ref.project_id)/locations/$(ref.primary_region)/keyRings/$(ref.deployment_name)-$(ref.random_suffix)-keyring/cryptoKeys/$(ref.deployment_name)-$(ref.random_suffix)-key
+      labels:
+        environment: production
+        component: storage
+        purpose: replication-staging
+    metadata:
+      dependsOn: []
+
+  # =============================================================================
+  # IAM SERVICE ACCOUNTS AND ROLES
+  # =============================================================================
+
+  # Service account for health monitoring
+  health-monitor-service-account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: $(ref.deployment_name)-$(ref.random_suffix)-health-monitor
+      displayName: HPC DR Health Monitor Service Account
+      description: Service account for health monitoring Cloud Function
+    metadata:
+      dependsOn: []
+
+  # Service account for replication automation
+  replication-service-account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: $(ref.deployment_name)-$(ref.random_suffix)-replication
+      displayName: HPC DR Replication Service Account
+      description: Service account for data replication automation
+    metadata:
+      dependsOn: []
+
+  # Service account for workflow orchestration
+  workflow-service-account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: $(ref.deployment_name)-$(ref.random_suffix)-workflow
+      displayName: HPC DR Workflow Service Account
+      description: Service account for disaster recovery workflow orchestration
+    metadata:
+      dependsOn: []
+
+  # =============================================================================
+  # CLOUD FUNCTIONS FOR AUTOMATION
+  # =============================================================================
+
+  # Health monitoring Cloud Function
+  health-monitor-function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      name: projects/$(ref.project_id)/locations/$(ref.primary_region)/functions/$(ref.deployment_name)-$(ref.random_suffix)-health-monitor
+      description: HPC infrastructure health monitoring function
+      sourceArchiveUrl: gs://$(ref.replication-staging-bucket.name)/health-monitor-source.zip
+      entryPoint: monitor_hpc_health
+      runtime: python312
+      timeout: 300s
+      availableMemoryMb: $(ref.function_memory)
+      serviceAccountEmail: $(ref.health-monitor-service-account.email)
+      httpsTrigger: {}
+      environmentVariables:
+        PROJECT_ID: $(ref.project_id)
+        DR_PREFIX: $(ref.deployment_name)-$(ref.random_suffix)
+        PRIMARY_REGION: $(ref.primary_region)
+        SECONDARY_REGION: $(ref.secondary_region)
+      labels:
+        environment: production
+        component: monitoring
+        purpose: health-checks
+    metadata:
+      dependsOn:
+        - health-monitor-service-account
+        - replication-staging-bucket
+
+  # Data replication Cloud Function
+  replication-function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      name: projects/$(ref.project_id)/locations/$(ref.primary_region)/functions/$(ref.deployment_name)-$(ref.random_suffix)-replication-scheduler
+      description: Automated data replication between Parallelstore instances
+      sourceArchiveUrl: gs://$(ref.replication-staging-bucket.name)/replication-source.zip
+      entryPoint: replicate_hpc_data
+      runtime: python312
+      timeout: 900s
+      availableMemoryMb: 1024
+      serviceAccountEmail: $(ref.replication-service-account.email)
+      eventTrigger:
+        eventType: providers/cloud.pubsub/eventTypes/topic.publish
+        resource: $(ref.replication-status-topic.name)
+      environmentVariables:
+        PROJECT_ID: $(ref.project_id)
+        DR_PREFIX: $(ref.deployment_name)-$(ref.random_suffix)
+        PRIMARY_REGION: $(ref.primary_region)
+        SECONDARY_REGION: $(ref.secondary_region)
+      labels:
+        environment: production
+        component: replication
+        purpose: data-sync
+    metadata:
+      dependsOn:
+        - replication-service-account
+        - replication-staging-bucket
+        - replication-status-topic
+
+  # =============================================================================
+  # CLOUD WORKFLOWS FOR ORCHESTRATION
+  # =============================================================================
+
+  # Disaster recovery orchestration workflow
+  dr-orchestration-workflow:
+    type: gcp-types/workflows-v1:projects.locations.workflows
+    properties:
+      name: projects/$(ref.project_id)/locations/$(ref.primary_region)/workflows/$(ref.deployment_name)-$(ref.random_suffix)-dr-orchestrator
+      description: HPC disaster recovery orchestration workflow
+      serviceAccount: $(ref.workflow-service-account.email)
+      sourceContents: |
+        main:
+          params: [event]
+          steps:
+            - init:
+                assign:
+                  - project_id: $(ref.project_id)
+                  - dr_prefix: $(ref.deployment_name)-$(ref.random_suffix)
+                  - primary_region: $(ref.primary_region)
+                  - secondary_region: $(ref.secondary_region)
+                  - failover_start_time: ${sys.now}
+            
+            - validate_trigger:
+                switch:
+                  - condition: ${event.trigger == "automatic_failover"}
+                    next: assess_primary_region
+                  - condition: ${event.trigger == "manual_failover"}
+                    next: assess_primary_region
+                next: invalid_trigger
+            
+            - assess_primary_region:
+                call: http.get
+                args:
+                  url: ${"https://" + primary_region + "-" + project_id + ".cloudfunctions.net/" + dr_prefix + "-health-monitor"}
+                  auth:
+                    type: OAuth2
+                result: primary_health
+                next: determine_failover_strategy
+            
+            - determine_failover_strategy:
+                switch:
+                  - condition: ${primary_health.body.health.parallelstore_primary.status == "unhealthy"}
+                    assign:
+                      - strategy: "full_regional_failover"
+                    next: initiate_data_sync
+                  - condition: ${primary_health.body.health.replication_lag.lag_minutes > 15}
+                    assign:
+                      - strategy: "data_resync_required"
+                    next: force_data_sync
+                next: partial_failover
+            
+            - initiate_data_sync:
+                parallel:
+                  shared: [sync_status]
+                  branches:
+                    - sync_parallelstore:
+                        steps:
+                          - log_sync_start:
+                              call: sys.log
+                              args:
+                                text: "Starting Parallelstore data synchronization"
+                                severity: "INFO"
+                          - assign_sync_status:
+                              assign:
+                                - sync_status: "initiated"
+                    - update_dns:
+                        steps:
+                          - log_dns_update:
+                              call: sys.log
+                              args:
+                                text: "Updating DNS records for failover"
+                                severity: "INFO"
+            
+            - activate_secondary_region:
+                parallel:
+                  branches:
+                    - log_activation:
+                        call: sys.log
+                        args:
+                          text: "Activating secondary region resources"
+                          severity: "INFO"
+                    - notify_operators:
+                        call: sys.log
+                        args:
+                          text: "Notifying operators of failover activation"
+                          severity: "WARNING"
+            
+            - notify_completion:
+                call: http.post
+                args:
+                  url: ${"https://pubsub.googleapis.com/v1/projects/" + project_id + "/topics/" + dr_prefix + "-failover-commands:publish"}
+                  auth:
+                    type: OAuth2
+                  body:
+                    messages:
+                      - data: ${base64.encode(json.encode({"status": "failover_complete", "strategy": strategy, "duration_seconds": sys.now - failover_start_time}))}
+                result: notification_result
+            
+            - return_success:
+                return:
+                  status: "success"
+                  strategy: ${strategy}
+                  duration: ${sys.now - failover_start_time}
+            
+            - invalid_trigger:
+                raise: "Invalid trigger type provided"
+            
+            - partial_failover:
+                return:
+                  status: "partial_failover_required"
+                  recommendation: "Manual intervention needed"
+            
+            - force_data_sync:
+                call: sys.log
+                args:
+                  text: "Forcing data synchronization due to replication lag"
+                  severity: "WARNING"
+                next: initiate_data_sync
+      labels:
+        environment: production
+        component: orchestration
+        purpose: disaster-recovery
+    metadata:
+      dependsOn:
+        - workflow-service-account
+
+  # =============================================================================
+  # CLOUD SCHEDULER FOR AUTOMATION
+  # =============================================================================
+
+  # Replication scheduler job
+  replication-scheduler-job:
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      name: projects/$(ref.project_id)/locations/$(ref.primary_region)/jobs/$(ref.deployment_name)-$(ref.random_suffix)-replication-job
+      description: Automated HPC data replication every 15 minutes
+      schedule: "*/15 * * * *"
+      timeZone: UTC
+      pubsubTarget:
+        topicName: $(ref.replication-status-topic.name)
+        data: eyJ0cmlnZ2VyIjoic2NoZWR1bGVkX3JlcGxpY2F0aW9uIn0=  # Base64 encoded: {"trigger":"scheduled_replication"}
+    metadata:
+      dependsOn:
+        - replication-status-topic
+
+  # =============================================================================
+  # CLOUD MONITORING RESOURCES
+  # =============================================================================
+
+  # Notification channel for Pub/Sub integration
+  pubsub-notification-channel:
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      type: pubsub
+      displayName: $(ref.deployment_name)-$(ref.random_suffix) DR Trigger Channel
+      description: Pub/Sub notification channel for DR workflow triggering
+      labels:
+        topic: projects/$(ref.project_id)/topics/$(ref.deployment_name)-$(ref.random_suffix)-health-alerts
+      enabled: true
+    metadata:
+      dependsOn:
+        - health-alerts-topic
+
+  # Alert policy for HPC infrastructure health
+  hpc-health-alert-policy:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: $(ref.deployment_name)-$(ref.random_suffix) HPC Infrastructure Health Alert
+      documentation:
+        content: Monitors critical HPC infrastructure components for disaster recovery triggering
+        mimeType: text/markdown
+      conditions:
+        - displayName: Parallelstore Instance Unavailable
+          conditionThreshold:
+            filter: resource.type="gce_instance" AND resource.labels.instance_name~"$(ref.deployment_name)-$(ref.random_suffix)-primary-pfs"
+            comparison: COMPARISON_EQUAL
+            thresholdValue: 0
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_MEAN
+        - displayName: High Replication Lag
+          conditionThreshold:
+            filter: metric.type="custom.googleapis.com/hpc/replication_lag_minutes"
+            comparison: COMPARISON_GREATER
+            thresholdValue: 15
+            duration: 180s
+      alertStrategy:
+        autoClose: 86400s
+      combiner: OR
+      enabled: true
+      notificationChannels:
+        - $(ref.pubsub-notification-channel.name)
+      severity: CRITICAL
+    metadata:
+      dependsOn:
+        - pubsub-notification-channel
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+
+outputs:
+  # Network infrastructure outputs
+  primary_vpc_name:
+    description: Name of the primary VPC network
+    value: $(ref.primary-vpc.name)
+  
+  secondary_vpc_name:
+    description: Name of the secondary VPC network
+    value: $(ref.secondary-vpc.name)
+  
+  wan_hub_name:
+    description: Network Connectivity Center hub name
+    value: $(ref.wan-hub.name)
+  
+  # Storage infrastructure outputs
+  primary_parallelstore_name:
+    description: Name of the primary Parallelstore instance
+    value: $(ref.primary-parallelstore.name)
+  
+  secondary_parallelstore_name:
+    description: Name of the secondary Parallelstore instance
+    value: $(ref.secondary-parallelstore.name)
+  
+  parallelstore_capacity:
+    description: Parallelstore capacity in TiB
+    value: $(ref.parallelstore_capacity)
+  
+  # Messaging infrastructure outputs
+  health_alerts_topic:
+    description: Pub/Sub topic for health alerts
+    value: $(ref.health-alerts-topic.name)
+  
+  failover_commands_topic:
+    description: Pub/Sub topic for failover commands
+    value: $(ref.failover-commands-topic.name)
+  
+  replication_status_topic:
+    description: Pub/Sub topic for replication status
+    value: $(ref.replication-status-topic.name)
+  
+  # Function and workflow outputs
+  health_monitor_function_url:
+    description: Health monitoring function trigger URL
+    value: $(ref.health-monitor-function.httpsTrigger.url)
+  
+  dr_workflow_name:
+    description: Disaster recovery workflow name
+    value: $(ref.dr-orchestration-workflow.name)
+  
+  # Service account outputs
+  health_monitor_service_account_email:
+    description: Health monitor service account email
+    value: $(ref.health-monitor-service-account.email)
+  
+  replication_service_account_email:
+    description: Replication service account email
+    value: $(ref.replication-service-account.email)
+  
+  workflow_service_account_email:
+    description: Workflow service account email
+    value: $(ref.workflow-service-account.email)
+  
+  # Storage outputs
+  replication_staging_bucket:
+    description: Cloud Storage bucket for replication staging
+    value: $(ref.replication-staging-bucket.name)
+  
+  # Monitoring outputs
+  alert_policy_name:
+    description: HPC health alert policy name
+    value: $(ref.hpc-health-alert-policy.name)
+  
+  notification_channel_name:
+    description: Pub/Sub notification channel name
+    value: $(ref.pubsub-notification-channel.name)
+  
+  # Deployment information
+  deployment_name:
+    description: Deployment name prefix
+    value: $(ref.deployment_name)
+  
+  random_suffix:
+    description: Random suffix used for resource naming
+    value: $(ref.random_suffix)
+  
+  deployment_regions:
+    description: Regions used for deployment
+    value:
+      primary: $(ref.primary_region)
+      secondary: $(ref.secondary_region)

@@ -1,0 +1,395 @@
+# Infrastructure Manager configuration for Secure CI/CD Authentication
+# with Workload Identity Federation and GitHub Actions
+#
+# This configuration deploys:
+# - Workload Identity Pool for GitHub Actions
+# - OIDC Provider for GitHub token validation
+# - Service Account with CI/CD permissions
+# - Artifact Registry repository for container images
+# - IAM bindings for keyless authentication
+#
+# Author: Infrastructure as Code Generator
+# Version: 1.0
+# Last Updated: 2025-07-12
+
+# Input variables for customization
+variables:
+  # Project configuration
+  project_id:
+    type: string
+    description: "Google Cloud project ID"
+    validation:
+      pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+  
+  region:
+    type: string
+    description: "Primary region for resources"
+    default: "us-central1"
+    validation:
+      pattern: "^[a-z]+-[a-z]+[0-9]+$"
+  
+  # GitHub repository configuration
+  github_repo_owner:
+    type: string
+    description: "GitHub repository owner (username or organization)"
+    validation:
+      pattern: "^[a-zA-Z0-9-]+$"
+  
+  github_repo_name:
+    type: string
+    description: "GitHub repository name"
+    validation:
+      pattern: "^[a-zA-Z0-9-_.]+$"
+  
+  # Resource naming configuration
+  resource_suffix:
+    type: string
+    description: "Suffix for resource names to ensure uniqueness"
+    default: "wif"
+    validation:
+      pattern: "^[a-z0-9-]{2,6}$"
+  
+  # Service configuration
+  enable_vulnerability_scanning:
+    type: boolean
+    description: "Enable vulnerability scanning for Artifact Registry"
+    default: true
+  
+  cloud_run_min_instances:
+    type: integer
+    description: "Minimum Cloud Run instances"
+    default: 0
+    validation:
+      minimum: 0
+      maximum: 10
+  
+  cloud_run_max_instances:
+    type: integer
+    description: "Maximum Cloud Run instances"
+    default: 10
+    validation:
+      minimum: 1
+      maximum: 100
+
+# Required APIs for the solution
+resources:
+  # Enable required Google Cloud APIs
+  - name: iam-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/iam.googleapis.com
+      
+  - name: sts-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/sts.googleapis.com
+      
+  - name: iamcredentials-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/iamcredentials.googleapis.com
+      
+  - name: cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/cloudbuild.googleapis.com
+      
+  - name: artifactregistry-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/artifactregistry.googleapis.com
+      
+  - name: run-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/run.googleapis.com
+
+  # Workload Identity Pool for GitHub Actions
+  - name: github-workload-identity-pool
+    type: gcp-types/iam-v1:projects.locations.workloadIdentityPools
+    properties:
+      parent: projects/${var.project_id}/locations/global
+      workloadIdentityPoolId: github-pool-${var.resource_suffix}
+      workloadIdentityPool:
+        displayName: "GitHub Actions Workload Identity Pool"
+        description: "Workload Identity Pool for GitHub Actions CI/CD workflows"
+        state: ACTIVE
+        disabled: false
+    metadata:
+      dependsOn:
+        - iam-api
+        - sts-api
+
+  # GitHub OIDC Provider configuration
+  - name: github-oidc-provider
+    type: gcp-types/iam-v1:projects.locations.workloadIdentityPools.providers
+    properties:
+      parent: $(ref.github-workload-identity-pool.name)
+      workloadIdentityPoolProviderId: github-provider-${var.resource_suffix}
+      workloadIdentityPoolProvider:
+        displayName: "GitHub OIDC Provider"
+        description: "OpenID Connect provider for GitHub Actions"
+        state: ACTIVE
+        disabled: false
+        # GitHub's OIDC issuer URL
+        oidc:
+          issuerUri: "https://token.actions.githubusercontent.com"
+          # No audience restriction - GitHub Actions will provide the audience
+        # Attribute mapping from GitHub OIDC token claims to Google Cloud attributes
+        attributeMapping:
+          google.subject: assertion.sub
+          attribute.actor: assertion.actor
+          attribute.repository: assertion.repository
+          attribute.repository_owner: assertion.repository_owner
+          attribute.workflow: assertion.workflow
+          attribute.ref: assertion.ref
+        # Conditional access - only allow workflows from specified repository owner
+        attributeCondition: >-
+          assertion.repository_owner == '${var.github_repo_owner}'
+    metadata:
+      dependsOn:
+        - github-workload-identity-pool
+
+  # Service Account for GitHub Actions CI/CD operations
+  - name: github-actions-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: github-actions-sa-${var.resource_suffix}
+      serviceAccount:
+        displayName: "GitHub Actions CI/CD Service Account"
+        description: "Service account for GitHub Actions workflows with minimal required permissions"
+        disabled: false
+    metadata:
+      dependsOn:
+        - iamcredentials-api
+
+  # Cloud Build Builder role for service account
+  - name: cloudbuild-builder-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/${var.project_id}
+      role: roles/cloudbuild.builds.builder
+      member: serviceAccount:$(ref.github-actions-service-account.email)
+    metadata:
+      dependsOn:
+        - github-actions-service-account
+        - cloudbuild-api
+
+  # Artifact Registry Writer role for service account
+  - name: artifactregistry-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/${var.project_id}
+      role: roles/artifactregistry.writer
+      member: serviceAccount:$(ref.github-actions-service-account.email)
+    metadata:
+      dependsOn:
+        - github-actions-service-account
+        - artifactregistry-api
+
+  # Cloud Run Developer role for service account
+  - name: cloudrun-developer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/${var.project_id}
+      role: roles/run.developer
+      member: serviceAccount:$(ref.github-actions-service-account.email)
+    metadata:
+      dependsOn:
+        - github-actions-service-account
+        - run-api
+
+  # Workload Identity User binding for GitHub repository
+  - name: workload-identity-binding
+    type: gcp-types/iam-v1:projects.serviceAccounts.iamPolicy
+    properties:
+      resource: $(ref.github-actions-service-account.name)
+      policy:
+        bindings:
+          - role: roles/iam.workloadIdentityUser
+            members:
+              # Allow specific GitHub repository to impersonate the service account
+              - principalSet://iam.googleapis.com/$(ref.github-workload-identity-pool.name)/attribute.repository/${var.github_repo_owner}/${var.github_repo_name}
+    metadata:
+      dependsOn:
+        - github-actions-service-account
+        - github-oidc-provider
+
+  # Artifact Registry repository for container images
+  - name: container-registry
+    type: gcp-types/artifactregistry-v1:projects.locations.repositories
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      repositoryId: apps-${var.resource_suffix}
+      repository:
+        displayName: "CI/CD Container Registry"
+        description: "Container image repository for GitHub Actions CI/CD workflows"
+        format: DOCKER
+        mode: STANDARD_REPOSITORY
+        # Configure vulnerability scanning if enabled
+        dockerConfig:
+          immutableTags: false
+        # Enable vulnerability scanning
+        vulnerabilityScanningConfig:
+          enablement: ${{ var.enable_vulnerability_scanning and "ENABLED" or "DISABLED" }}
+    metadata:
+      dependsOn:
+        - artifactregistry-api
+
+  # Optional: Cloud Run service for demonstration (commented out by default)
+  # Users can uncomment and customize as needed
+  # - name: demo-cloud-run-service
+  #   type: gcp-types/run-v1:namespaces.services
+  #   properties:
+  #     parent: namespaces/${var.project_id}
+  #     location: ${var.region}
+  #     body:
+  #       apiVersion: serving.knative.dev/v1
+  #       kind: Service
+  #       metadata:
+  #         name: demo-app-${var.resource_suffix}
+  #         namespace: ${var.project_id}
+  #         annotations:
+  #           run.googleapis.com/ingress: all
+  #           run.googleapis.com/execution-environment: gen2
+  #       spec:
+  #         template:
+  #           metadata:
+  #             annotations:
+  #               autoscaling.knative.dev/minScale: "${var.cloud_run_min_instances}"
+  #               autoscaling.knative.dev/maxScale: "${var.cloud_run_max_instances}"
+  #               run.googleapis.com/cpu-throttling: "true"
+  #               run.googleapis.com/memory: "512Mi"
+  #               run.googleapis.com/cpu: "1000m"
+  #           spec:
+  #             containerConcurrency: 100
+  #             timeoutSeconds: 300
+  #             serviceAccountName: $(ref.github-actions-service-account.email)
+  #             containers:
+  #               - name: app-container
+  #                 # Placeholder image - will be replaced by CI/CD pipeline
+  #                 image: gcr.io/cloudrun/hello
+  #                 ports:
+  #                   - containerPort: 8080
+  #                     protocol: TCP
+  #                 env:
+  #                   - name: PORT
+  #                     value: "8080"
+  #                   - name: ENVIRONMENT
+  #                     value: "production"
+  #                 resources:
+  #                   limits:
+  #                     cpu: "1000m"
+  #                     memory: "512Mi"
+  #                   requests:
+  #                     cpu: "500m"
+  #                     memory: "256Mi"
+  #         traffic:
+  #           - percent: 100
+  #             latestRevision: true
+  #   metadata:
+  #     dependsOn:
+  #       - run-api
+  #       - github-actions-service-account
+
+# Output values for GitHub Actions configuration
+outputs:
+  # Workload Identity Federation configuration
+  workload_identity_provider:
+    description: "Workload Identity Provider name for GitHub Actions authentication"
+    value: $(ref.github-oidc-provider.name)
+    
+  service_account_email:
+    description: "Service account email for GitHub Actions impersonation"
+    value: $(ref.github-actions-service-account.email)
+    
+  # Project and location information
+  project_id:
+    description: "Google Cloud project ID"
+    value: ${var.project_id}
+    
+  region:
+    description: "Primary region for resources"
+    value: ${var.region}
+    
+  # Artifact Registry information
+  artifact_registry_repository:
+    description: "Artifact Registry repository for container images"
+    value: ${var.region}-docker.pkg.dev/${var.project_id}/apps-${var.resource_suffix}
+    
+  artifact_registry_location:
+    description: "Artifact Registry repository location"
+    value: ${var.region}
+    
+  # GitHub repository configuration
+  github_repository_full:
+    description: "Full GitHub repository path (owner/repo)"
+    value: ${var.github_repo_owner}/${var.github_repo_name}
+    
+  # Resource identifiers
+  workload_identity_pool_id:
+    description: "Workload Identity Pool ID"
+    value: github-pool-${var.resource_suffix}
+    
+  workload_identity_provider_id:
+    description: "Workload Identity Provider ID"
+    value: github-provider-${var.resource_suffix}
+    
+  service_account_id:
+    description: "Service Account ID"
+    value: github-actions-sa-${var.resource_suffix}
+    
+  # Security and configuration information
+  attribute_condition:
+    description: "Attribute condition applied to the OIDC provider"
+    value: assertion.repository_owner == '${var.github_repo_owner}'
+    
+  # Sample GitHub Actions workflow configuration
+  github_actions_auth_step:
+    description: "Sample authentication step for GitHub Actions workflow"
+    value: |
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: '$(ref.github-oidc-provider.name)'
+          service_account: '$(ref.github-actions-service-account.email)'
+          
+  # Docker authentication command
+  docker_auth_command:
+    description: "Command to configure Docker for Artifact Registry"
+    value: gcloud auth configure-docker ${var.region}-docker.pkg.dev
+
+# Metadata for Infrastructure Manager
+metadata:
+  version: "1.0"
+  description: "Secure CI/CD Authentication with Workload Identity Federation and GitHub Actions"
+  author: "Infrastructure as Code Generator"
+  tags:
+    - workload-identity-federation
+    - github-actions
+    - cicd
+    - security
+    - keyless-authentication
+  documentation: |
+    This Infrastructure Manager configuration deploys a complete Workload Identity Federation
+    setup for GitHub Actions to authenticate with Google Cloud without service account keys.
+    
+    Key features:
+    - Keyless authentication using OIDC tokens
+    - Least privilege service account permissions
+    - Repository-specific access controls
+    - Artifact Registry for container images
+    - Support for CI/CD workflows
+    
+    Security considerations:
+    - Attribute conditions restrict access to specified repository owner
+    - Service account has minimal required permissions
+    - No long-lived credentials stored in GitHub
+    - Short-lived tokens automatically managed by Google Cloud
+    
+    Usage:
+    1. Deploy this configuration with appropriate variables
+    2. Use the output values to configure GitHub Actions workflows
+    3. Implement CI/CD pipeline with keyless authentication
+    
+    For detailed implementation guidance, refer to the accompanying recipe documentation.

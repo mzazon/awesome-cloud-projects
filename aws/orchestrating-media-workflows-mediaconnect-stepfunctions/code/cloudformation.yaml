@@ -1,0 +1,933 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Orchestrating Media Workflows with MediaConnect and Step Functions.
+  This template creates a complete media monitoring solution with MediaConnect flow,
+  Step Functions workflow, Lambda functions, CloudWatch monitoring, and SNS alerting.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Media Flow Configuration"
+        Parameters:
+          - FlowName
+          - SourceProtocol
+          - SourceWhitelistCidr
+          - IngestPort
+          - PrimaryOutputDestination
+          - BackupOutputDestination
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - PacketLossThreshold
+          - JitterThreshold
+          - NotificationEmail
+      - Label:
+          default: "Deployment Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+    ParameterLabels:
+      FlowName:
+        default: "MediaConnect Flow Name"
+      SourceProtocol:
+        default: "Source Protocol"
+      SourceWhitelistCidr:
+        default: "Source IP Whitelist (CIDR)"
+      IngestPort:
+        default: "Ingest Port"
+      PrimaryOutputDestination:
+        default: "Primary Output Destination IP"
+      BackupOutputDestination:
+        default: "Backup Output Destination IP"
+      PacketLossThreshold:
+        default: "Packet Loss Alarm Threshold (%)"
+      JitterThreshold:
+        default: "Jitter Alarm Threshold (ms)"
+      NotificationEmail:
+        default: "Alert Notification Email"
+      Environment:
+        default: "Environment Name"
+      ProjectName:
+        default: "Project Name"
+
+Parameters:
+  FlowName:
+    Type: String
+    Default: live-stream-flow
+    Description: Name for the MediaConnect flow
+    AllowedPattern: '^[a-zA-Z0-9-_]{1,128}$'
+    ConstraintDescription: Must be 1-128 characters, alphanumeric, hyphens, and underscores only
+
+  SourceProtocol:
+    Type: String
+    Default: rtp
+    AllowedValues:
+      - rtp
+      - rtp-fec
+      - zixi-push
+      - zixi-pull
+      - rist
+      - srt-listener
+      - srt-caller
+    Description: Protocol for MediaConnect source
+
+  SourceWhitelistCidr:
+    Type: String
+    Default: 10.0.0.0/8
+    Description: CIDR block for source IP whitelist (avoid 0.0.0.0/0 for production)
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a valid CIDR block (e.g., 10.0.0.0/8)
+
+  IngestPort:
+    Type: Number
+    Default: 5000
+    MinValue: 1024
+    MaxValue: 65535
+    Description: Port for MediaConnect flow ingestion
+
+  PrimaryOutputDestination:
+    Type: String
+    Default: 10.0.1.100
+    Description: IP address for primary output destination
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}$'
+    ConstraintDescription: Must be a valid IP address
+
+  BackupOutputDestination:
+    Type: String
+    Default: 10.0.1.101
+    Description: IP address for backup output destination
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}$'
+    ConstraintDescription: Must be a valid IP address
+
+  PacketLossThreshold:
+    Type: Number
+    Default: 0.1
+    MinValue: 0.01
+    MaxValue: 10.0
+    Description: Packet loss percentage threshold for alarms
+
+  JitterThreshold:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    MaxValue: 1000
+    Description: Jitter threshold in milliseconds for alarms
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for alert notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+
+  Environment:
+    Type: String
+    Default: Production
+    AllowedValues:
+      - Development
+      - Staging
+      - Production
+    Description: Environment for resource tagging and configuration
+
+  ProjectName:
+    Type: String
+    Default: MediaWorkflow
+    Description: Project name for resource tagging
+    AllowedPattern: '^[a-zA-Z0-9-_]{1,64}$'
+    ConstraintDescription: Must be 1-64 characters, alphanumeric, hyphens, and underscores only
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, Production]
+  IsNotProduction: !Not [!Equals [!Ref Environment, Production]]
+
+Resources:
+  # S3 Bucket for Lambda deployment packages
+  LambdaCodeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-lambda-code-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: LambdaDeployment
+
+  # SNS Topic for alerts
+  MediaAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-media-alerts-${Environment}'
+      DisplayName: Media Workflow Alerts
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: MediaAlerts
+
+  # SNS Topic Policy
+  MediaAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref MediaAlertsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudWatchAlarmsToPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref MediaAlertsTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+
+  # SNS Subscription for email notifications
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref MediaAlertsTopic
+      Endpoint: !Ref NotificationEmail
+
+  # IAM Role for Lambda functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: MediaConnectAndCloudWatchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - mediaconnect:DescribeFlow
+                  - mediaconnect:ListFlows
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:GetMetricData
+                  - sns:Publish
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for Step Functions
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-stepfunctions-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt StreamMonitorFunction.Arn
+                  - !GetAtt AlertHandlerFunction.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for EventBridge
+  EventBridgeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-eventbridge-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeStepFunctions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref MediaWorkflowStateMachine
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda function for stream monitoring
+  StreamMonitorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-stream-monitor-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref MediaAlertsTopic
+          PACKET_LOSS_THRESHOLD: !Ref PacketLossThreshold
+          JITTER_THRESHOLD: !Ref JitterThreshold
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+
+          cloudwatch = boto3.client('cloudwatch')
+          mediaconnect = boto3.client('mediaconnect')
+
+          def lambda_handler(event, context):
+              flow_arn = event['flow_arn']
+              packet_loss_threshold = float(os.environ.get('PACKET_LOSS_THRESHOLD', '0.1'))
+              jitter_threshold = float(os.environ.get('JITTER_THRESHOLD', '50'))
+              
+              try:
+                  # Get flow details
+                  flow = mediaconnect.describe_flow(FlowArn=flow_arn)
+                  flow_name = flow['Flow']['Name']
+                  
+                  # Query CloudWatch metrics for the last 5 minutes
+                  end_time = datetime.utcnow()
+                  start_time = end_time - timedelta(minutes=5)
+                  
+                  issues = []
+                  
+                  # Check source packet loss
+                  try:
+                      response = cloudwatch.get_metric_statistics(
+                          Namespace='AWS/MediaConnect',
+                          MetricName='SourcePacketLossPercent',
+                          Dimensions=[
+                              {'Name': 'FlowARN', 'Value': flow_arn}
+                          ],
+                          StartTime=start_time,
+                          EndTime=end_time,
+                          Period=300,
+                          Statistics=['Average', 'Maximum']
+                      )
+                      
+                      if response['Datapoints']:
+                          latest = sorted(response['Datapoints'], 
+                                         key=lambda x: x['Timestamp'])[-1]
+                          if latest['Maximum'] > packet_loss_threshold:
+                              issues.append({
+                                  'metric': 'PacketLoss',
+                                  'value': latest['Maximum'],
+                                  'threshold': packet_loss_threshold,
+                                  'severity': 'HIGH'
+                              })
+                  except Exception as e:
+                      print(f"Error checking packet loss: {str(e)}")
+                  
+                  # Check source jitter
+                  try:
+                      jitter_response = cloudwatch.get_metric_statistics(
+                          Namespace='AWS/MediaConnect',
+                          MetricName='SourceJitter',
+                          Dimensions=[
+                              {'Name': 'FlowARN', 'Value': flow_arn}
+                          ],
+                          StartTime=start_time,
+                          EndTime=end_time,
+                          Period=300,
+                          Statistics=['Average', 'Maximum']
+                      )
+                      
+                      if jitter_response['Datapoints']:
+                          latest_jitter = sorted(jitter_response['Datapoints'], 
+                                               key=lambda x: x['Timestamp'])[-1]
+                          if latest_jitter['Maximum'] > jitter_threshold:
+                              issues.append({
+                                  'metric': 'Jitter',
+                                  'value': latest_jitter['Maximum'],
+                                  'threshold': jitter_threshold,
+                                  'severity': 'MEDIUM'
+                              })
+                  except Exception as e:
+                      print(f"Error checking jitter: {str(e)}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'flow_name': flow_name,
+                      'flow_arn': flow_arn,
+                      'timestamp': end_time.isoformat(),
+                      'issues': issues,
+                      'healthy': len(issues) == 0
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in stream monitor: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'error': str(e),
+                      'flow_arn': flow_arn,
+                      'healthy': False
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: StreamMonitoring
+
+  # Lambda function for alert handling
+  AlertHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-alert-handler-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref MediaAlertsTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          sns = boto3.client('sns')
+
+          def lambda_handler(event, context):
+              sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+              
+              try:
+                  # Extract monitoring results
+                  monitoring_result = event
+                  
+                  if not monitoring_result.get('healthy', True):
+                      # Construct alert message
+                      subject = f"MediaConnect Alert: {monitoring_result.get('flow_name', 'Unknown Flow')}"
+                      
+                      message_lines = [
+                          f"Flow: {monitoring_result.get('flow_name', 'Unknown')}",
+                          f"Time: {monitoring_result.get('timestamp', 'Unknown')}",
+                          f"Status: UNHEALTHY",
+                          "",
+                          "Issues Detected:"
+                      ]
+                      
+                      for issue in monitoring_result.get('issues', []):
+                          message_lines.append(
+                              f"- {issue['metric']}: {issue['value']:.2f} "
+                              f"(threshold: {issue['threshold']}) "
+                              f"[{issue['severity']}]"
+                          )
+                      
+                      # Extract region from context ARN
+                      region = context.invoked_function_arn.split(':')[3]
+                      flow_id = monitoring_result.get('flow_arn', '').split('/')[-1] if monitoring_result.get('flow_arn') else 'unknown'
+                      
+                      message_lines.extend([
+                          "",
+                          "Recommended Actions:",
+                          "1. Check source encoder stability",
+                          "2. Verify network connectivity",
+                          "3. Review CloudWatch dashboard for detailed metrics",
+                          f"4. Access flow in console: https://console.aws.amazon.com/mediaconnect/home?region={region}#/flows/{flow_id}"
+                      ])
+                      
+                      message = "\n".join(message_lines)
+                      
+                      # Send SNS notification
+                      response = sns.publish(
+                          TopicArn=sns_topic_arn,
+                          Subject=subject,
+                          Message=message
+                      )
+                      
+                      return {
+                          'statusCode': 200,
+                          'notification_sent': True,
+                          'message_id': response['MessageId']
+                      }
+                  
+                  return {
+                      'statusCode': 200,
+                      'notification_sent': False,
+                      'reason': 'Flow is healthy'
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in alert handler: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'error': str(e),
+                      'notification_sent': False
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: AlertHandling
+
+  # Step Functions State Machine
+  MediaWorkflowStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-media-workflow-${Environment}'
+      StateMachineType: EXPRESS
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: false
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StepFunctionsLogGroup.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Media workflow for monitoring MediaConnect flows",
+          "StartAt": "MonitorStream",
+          "States": {
+            "MonitorStream": {
+              "Type": "Task",
+              "Resource": "${StreamMonitorFunction.Arn}",
+              "Parameters": {
+                "flow_arn.$": "$.flow_arn",
+                "sns_topic_arn": "${MediaAlertsTopic}"
+              },
+              "ResultPath": "$.monitoring_result",
+              "Next": "EvaluateHealth",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "ErrorHandler"
+                }
+              ]
+            },
+            "EvaluateHealth": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.monitoring_result.healthy",
+                  "BooleanEquals": false,
+                  "Next": "SendAlert"
+                }
+              ],
+              "Default": "HealthyFlow"
+            },
+            "SendAlert": {
+              "Type": "Task",
+              "Resource": "${AlertHandlerFunction.Arn}",
+              "Parameters": {
+                "flow_name.$": "$.monitoring_result.flow_name",
+                "flow_arn.$": "$.monitoring_result.flow_arn",
+                "timestamp.$": "$.monitoring_result.timestamp",
+                "issues.$": "$.monitoring_result.issues",
+                "healthy.$": "$.monitoring_result.healthy",
+                "sns_topic_arn": "${MediaAlertsTopic}"
+              },
+              "End": true,
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 3,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ]
+            },
+            "HealthyFlow": {
+              "Type": "Pass",
+              "Result": "Flow is healthy - no action required",
+              "End": true
+            },
+            "ErrorHandler": {
+              "Type": "Pass",
+              "Result": "Error occurred during monitoring",
+              "End": true
+            }
+          }
+        }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: MediaWorkflowOrchestration
+
+  # CloudWatch Log Group for Step Functions
+  StepFunctionsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/stepfunctions/${ProjectName}-media-workflow-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  # MediaConnect Flow
+  MediaConnectFlow:
+    Type: AWS::MediaConnect::Flow
+    Properties:
+      Name: !Sub '${FlowName}-${Environment}'
+      AvailabilityZone: !Sub '${AWS::Region}a'
+      Source:
+        Name: PrimarySource
+        Description: Primary live stream source
+        Protocol: !Ref SourceProtocol
+        WhitelistCidr: !Ref SourceWhitelistCidr
+        IngestPort: !Ref IngestPort
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        Purpose: LiveStreaming
+
+  # MediaConnect Flow Outputs
+  MediaConnectPrimaryOutput:
+    Type: AWS::MediaConnect::FlowOutput
+    Properties:
+      FlowArn: !Ref MediaConnectFlow
+      Name: PrimaryOutput
+      Description: Primary stream output
+      Protocol: rtp
+      Destination: !Ref PrimaryOutputDestination
+      Port: 5001
+
+  MediaConnectBackupOutput:
+    Type: AWS::MediaConnect::FlowOutput
+    Properties:
+      FlowArn: !Ref MediaConnectFlow
+      Name: BackupOutput
+      Description: Backup stream output
+      Protocol: rtp
+      Destination: !Ref BackupOutputDestination
+      Port: 5002
+
+  # CloudWatch Alarms
+  PacketLossAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${FlowName}-${Environment}-packet-loss'
+      AlarmDescription: Triggers when packet loss exceeds threshold
+      MetricName: SourcePacketLossPercent
+      Namespace: AWS/MediaConnect
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: !Ref PacketLossThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FlowARN
+          Value: !Ref MediaConnectFlow
+      AlarmActions:
+        - !Ref MediaAlertsTopic
+      OKActions:
+        - !Ref MediaAlertsTopic
+      TreatMissingData: breaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  JitterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${FlowName}-${Environment}-jitter'
+      AlarmDescription: Triggers when jitter exceeds threshold
+      MetricName: SourceJitter
+      Namespace: AWS/MediaConnect
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: !Ref JitterThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FlowARN
+          Value: !Ref MediaConnectFlow
+      AlarmActions:
+        - !Ref MediaAlertsTopic
+      OKActions:
+        - !Ref MediaAlertsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  WorkflowTriggerAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${FlowName}-${Environment}-workflow-trigger'
+      AlarmDescription: Triggers media monitoring workflow
+      MetricName: SourcePacketLossPercent
+      Namespace: AWS/MediaConnect
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: !Ref PacketLossThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FlowARN
+          Value: !Ref MediaConnectFlow
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # EventBridge Rule for automated workflow execution
+  MediaAlarmRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${FlowName}-${Environment}-alarm-rule'
+      Description: Triggers workflow on MediaConnect alarm
+      EventPattern:
+        source:
+          - aws.cloudwatch
+        detail-type:
+          - CloudWatch Alarm State Change
+        detail:
+          alarmName:
+            - !Ref WorkflowTriggerAlarm
+          state:
+            value:
+              - ALARM
+      State: ENABLED
+      Targets:
+        - Arn: !Ref MediaWorkflowStateMachine
+          Id: StepFunctionsTarget
+          RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+          Input: !Sub |
+            {
+              "flow_arn": "${MediaConnectFlow}"
+            }
+
+  # CloudWatch Dashboard
+  MediaMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${FlowName}-${Environment}-monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/MediaConnect", "SourcePacketLossPercent", "FlowARN", "${MediaConnectFlow}", { "stat": "Maximum" } ],
+                  [ ".", "SourceJitter", ".", ".", { "stat": "Average", "yAxis": "right" } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Stream Health Metrics",
+                "period": 300,
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 1
+                  },
+                  "right": {
+                    "min": 0
+                  }
+                },
+                "annotations": {
+                  "horizontal": [
+                    {
+                      "label": "Packet Loss Threshold",
+                      "value": ${PacketLossThreshold}
+                    },
+                    {
+                      "label": "Jitter Threshold",
+                      "value": ${JitterThreshold},
+                      "yAxis": "right"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/MediaConnect", "SourceBitrate", "FlowARN", "${MediaConnectFlow}", { "stat": "Average" } ],
+                  [ ".", "SourceUptime", ".", ".", { "stat": "Maximum", "yAxis": "right" } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Stream Performance",
+                "period": 300,
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  },
+                  "right": {
+                    "min": 0,
+                    "max": 100
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/StepFunctions", "ExecutionSucceeded", "StateMachineArn", "${MediaWorkflowStateMachine}" ],
+                  [ ".", "ExecutionFailed", ".", "." ],
+                  [ ".", "ExecutionsStarted", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Workflow Execution Metrics",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+Outputs:
+  MediaConnectFlowArn:
+    Description: ARN of the MediaConnect flow
+    Value: !Ref MediaConnectFlow
+    Export:
+      Name: !Sub '${AWS::StackName}-MediaConnectFlowArn'
+
+  MediaConnectIngestEndpoint:
+    Description: MediaConnect flow ingest endpoint
+    Value: !GetAtt MediaConnectFlow.Source.IngestIp
+    Export:
+      Name: !Sub '${AWS::StackName}-IngestEndpoint'
+
+  MediaConnectIngestPort:
+    Description: MediaConnect flow ingest port
+    Value: !Ref IngestPort
+    Export:
+      Name: !Sub '${AWS::StackName}-IngestPort'
+
+  StepFunctionsStateMachineArn:
+    Description: ARN of the Step Functions state machine
+    Value: !Ref MediaWorkflowStateMachine
+    Export:
+      Name: !Sub '${AWS::StackName}-StateMachineArn'
+
+  SNSTopicArn:
+    Description: ARN of the SNS topic for alerts
+    Value: !Ref MediaAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  StreamMonitorFunctionArn:
+    Description: ARN of the stream monitor Lambda function
+    Value: !GetAtt StreamMonitorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-StreamMonitorFunctionArn'
+
+  AlertHandlerFunctionArn:
+    Description: ARN of the alert handler Lambda function
+    Value: !GetAtt AlertHandlerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertHandlerFunctionArn'
+
+  DashboardURL:
+    Description: URL to the CloudWatch dashboard
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${FlowName}-${Environment}-monitoring'
+
+  MediaConnectConsoleURL:
+    Description: URL to the MediaConnect flow in AWS Console
+    Value: !Sub 'https://console.aws.amazon.com/mediaconnect/home?region=${AWS::Region}#/flows/${MediaConnectFlow}'
+
+  StepFunctionsConsoleURL:
+    Description: URL to the Step Functions state machine in AWS Console
+    Value: !Sub 'https://console.aws.amazon.com/states/home?region=${AWS::Region}#/statemachines/view/${MediaWorkflowStateMachine}'
+
+  DeploymentInstructions:
+    Description: Next steps after deployment
+    Value: !Sub |
+      1. Confirm SNS email subscription sent to ${NotificationEmail}
+      2. Start streaming to ${MediaConnectFlow.Source.IngestIp}:${IngestPort} using ${SourceProtocol} protocol
+      3. Monitor dashboard at: https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${FlowName}-${Environment}-monitoring
+      4. Test workflow by manually executing: aws stepfunctions start-execution --state-machine-arn ${MediaWorkflowStateMachine} --input '{"flow_arn": "${MediaConnectFlow}"}'

@@ -1,0 +1,760 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Data Catalog Governance with AWS Glue - Automated data classification, PII detection, and access control'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'data-governance'
+    Description: 'Project name used for resource naming and tagging'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    Description: 'Environment for deployment (dev, staging, prod)'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  DataBucketName:
+    Type: String
+    Default: ''
+    Description: 'Name for the data S3 bucket (leave empty for auto-generated name)'
+    AllowedPattern: '^[a-z0-9.-]*$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, dots, and hyphens'
+
+  AuditBucketName:
+    Type: String
+    Default: ''
+    Description: 'Name for the audit S3 bucket (leave empty for auto-generated name)'
+    AllowedPattern: '^[a-z0-9.-]*$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, dots, and hyphens'
+
+  EnableCloudTrail:
+    Type: String
+    Default: 'true'
+    Description: 'Enable CloudTrail for audit logging'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableDashboard:
+    Type: String
+    Default: 'true'
+    Description: 'Enable CloudWatch dashboard for monitoring'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  PIIDetectionThreshold:
+    Type: Number
+    Default: 0.5
+    Description: 'Threshold for PII detection (0.0 to 1.0)'
+    MinValue: 0.0
+    MaxValue: 1.0
+
+  DatabaseName:
+    Type: String
+    Default: 'governance_catalog'
+    Description: 'Name for the Glue Data Catalog database'
+    MinLength: 3
+    MaxLength: 64
+    AllowedPattern: '^[a-z0-9_]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and underscores'
+
+Conditions:
+  # Create auto-generated bucket names if not provided
+  CreateDataBucketName: !Equals [!Ref DataBucketName, '']
+  CreateAuditBucketName: !Equals [!Ref AuditBucketName, '']
+  
+  # Feature flags
+  EnableCloudTrailCondition: !Equals [!Ref EnableCloudTrail, 'true']
+  EnableDashboardCondition: !Equals [!Ref EnableDashboard, 'true']
+  
+  # Environment-specific conditions
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # S3 Bucket for Data Storage
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - CreateDataBucketName
+        - !Sub '${ProjectName}-data-${Environment}-${AWS::AccountId}-${AWS::Region}'
+        - !Ref DataBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: !If [IsProduction, Enabled, Suspended]
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt DataCatalogTriggerFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: 'data/'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-data-bucket-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Data Lake Storage'
+
+  # S3 Bucket for Audit Logs
+  AuditBucket:
+    Type: AWS::S3::Bucket
+    Condition: EnableCloudTrailCondition
+    Properties:
+      BucketName: !If
+        - CreateAuditBucketName
+        - !Sub '${ProjectName}-audit-${Environment}-${AWS::AccountId}-${AWS::Region}'
+        - !Ref AuditBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldAuditLogs
+            Status: Enabled
+            ExpirationInDays: !If [IsProduction, 2557, 365] # 7 years for prod, 1 year for dev
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-audit-bucket-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Audit Trail Storage'
+
+  # S3 Bucket Policy for CloudTrail
+  AuditBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: EnableCloudTrailCondition
+    Properties:
+      Bucket: !Ref AuditBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub '${AuditBucket}'
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${AuditBucket}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': 'bucket-owner-full-control'
+
+  # Glue Database
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${DatabaseName}_${Environment}'
+        Description: 'Data governance catalog database for PII detection and classification'
+        Parameters:
+          classification: 'governance'
+          environment: !Ref Environment
+          project: !Ref ProjectName
+
+  # IAM Role for Glue Crawler
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-glue-crawler-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueS3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${DataBucket}'
+                  - !Sub '${DataBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub '${DataBucket}/scripts/*'
+                  - !Sub '${DataBucket}/temp/*'
+        - PolicyName: GlueDataCatalogAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:DeleteTable
+                  - glue:CreatePartition
+                  - glue:UpdatePartition
+                  - glue:DeletePartition
+                  - glue:BatchCreatePartition
+                  - glue:BatchDeletePartition
+                  - glue:BatchUpdatePartition
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${DatabaseName}_${Environment}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${DatabaseName}_${Environment}/*'
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/glue/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-glue-crawler-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # PII Classifier for Customer Data
+  PIIClassifier:
+    Type: AWS::Glue::Classifier
+    Properties:
+      CsvClassifier:
+        Name: !Sub '${ProjectName}-pii-classifier-${Environment}'
+        Delimiter: ','
+        QuoteSymbol: '"'
+        ContainsHeader: PRESENT
+        Header: 'customer_id,first_name,last_name,email,ssn,phone,address,city,state,zip'
+        DisableValueTrimming: false
+        AllowSingleColumn: false
+
+  # Glue Crawler for Data Discovery
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ProjectName}-governance-crawler-${Environment}'
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Description: 'Governance crawler with PII classification capabilities'
+      Targets:
+        S3Targets:
+          - Path: !Sub '${DataBucket}/data/'
+            Exclusions:
+              - '**/_SUCCESS'
+              - '**/_started'
+              - '**/_temporary/**'
+      Classifiers:
+        - !Ref PIIClassifier
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      RecrawlPolicy:
+        RecrawlBehavior: CRAWL_EVERYTHING
+      Schedule:
+        ScheduleExpression: 'cron(0 6 * * ? *)' # Daily at 6 AM UTC
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  # IAM Role for Data Analysts
+  DataAnalystRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-data-analyst-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Sub '${ProjectName}-${Environment}'
+      Policies:
+        - PolicyName: DataAnalystPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - lakeformation:GetDataAccess
+                  - lakeformation:GetResourceLFTags
+                  - lakeformation:ListLFTags
+                  - lakeformation:SearchTablesByLFTags
+                  - lakeformation:SearchDatabasesByLFTags
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${DataBucket}'
+                  - !Sub '${DataBucket}/*'
+              - Effect: Allow
+                Action:
+                  - athena:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::aws-athena-query-results-${AWS::AccountId}-${AWS::Region}'
+                  - !Sub 'arn:aws:s3:::aws-athena-query-results-${AWS::AccountId}-${AWS::Region}/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-data-analyst-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function for Automated Crawler Triggering
+  DataCatalogTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-catalog-trigger-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          CRAWLER_NAME: !Ref GlueCrawler
+          DATABASE_NAME: !Ref GlueDatabase
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          glue = boto3.client('glue')
+          
+          def lambda_handler(event, context):
+              """
+              Trigger Glue crawler when new data is uploaded to S3
+              """
+              try:
+                  crawler_name = os.environ['CRAWLER_NAME']
+                  
+                  # Check if crawler is already running
+                  response = glue.get_crawler(Name=crawler_name)
+                  crawler_state = response['Crawler']['State']
+                  
+                  if crawler_state == 'RUNNING':
+                      logger.info(f"Crawler {crawler_name} is already running")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps('Crawler already running')
+                      }
+                  
+                  # Start the crawler
+                  glue.start_crawler(Name=crawler_name)
+                  logger.info(f"Started crawler {crawler_name}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Crawler started successfully')
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error triggering crawler: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-catalog-trigger-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GlueCrawlerControl
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetCrawler
+                  - glue:StartCrawler
+                  - glue:StopCrawler
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:crawler/${GlueCrawler}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Permission for S3 Trigger
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataCatalogTriggerFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub '${DataBucket}'
+
+  # CloudTrail for Audit Logging
+  DataCatalogCloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Condition: EnableCloudTrailCondition
+    Properties:
+      TrailName: !Sub '${ProjectName}-data-catalog-trail-${Environment}'
+      S3BucketName: !Ref AuditBucket
+      S3KeyPrefix: 'data-catalog-logs/'
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: 'AWS::Glue::Table'
+              Values:
+                - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${DatabaseName}_${Environment}/*'
+            - Type: 'AWS::S3::Object'
+              Values:
+                - !Sub '${DataBucket}/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-data-catalog-trail-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group for Glue Crawler
+  GlueCrawlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/glue/crawlers/${GlueCrawler}'
+      RetentionInDays: !If [IsProduction, 365, 30]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-glue-crawler-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Dashboard for Governance Monitoring
+  GovernanceDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableDashboardCondition
+    Properties:
+      DashboardName: !Sub '${ProjectName}-governance-dashboard-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Glue", "glue.driver.aggregate.numCompletedTasks", "JobName", "${GlueCrawler}"],
+                  ["AWS/Glue", "glue.driver.aggregate.numFailedTasks", "JobName", "${GlueCrawler}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Data Catalog Crawler Metrics",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/S3", "BucketSizeBytes", "BucketName", "${DataBucket}", "StorageType", "StandardStorage"],
+                  ["AWS/S3", "NumberOfObjects", "BucketName", "${DataBucket}", "StorageType", "AllStorageTypes"]
+                ],
+                "period": 86400,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Data Lake Storage Metrics",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/glue/crawlers/${GlueCrawler}' | fields @timestamp, @message\n| filter @message like /PII/ or @message like /classification/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "PII Detection and Classification Events",
+                "view": "table"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${DataCatalogTriggerFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${DataCatalogTriggerFunction}"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${DataCatalogTriggerFunction}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Catalog Trigger Function Metrics",
+                "view": "timeSeries"
+              }
+            }
+          ]
+        }
+
+  # Lake Formation Data Lake Location
+  DataLakeLocation:
+    Type: AWS::LakeFormation::Resource
+    Properties:
+      ResourceArn: !Sub '${DataBucket}/data/'
+      UseServiceLinkedRole: true
+      RoleArn: !GetAtt LakeFormationServiceRole.Arn
+
+  # Lake Formation Service Role
+  LakeFormationServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lakeformation-service-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lakeformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LakeFormationDataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource:
+                  - !Sub '${DataBucket}'
+                  - !Sub '${DataBucket}/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lakeformation-service-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lake Formation Permissions for Data Analysts
+  DataAnalystLakeFormationPermissions:
+    Type: AWS::LakeFormation::Permissions
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt DataAnalystRole.Arn
+      Resource:
+        DatabaseResource:
+          CatalogId: !Ref AWS::AccountId
+          Name: !Ref GlueDatabase
+      Permissions:
+        - DESCRIBE
+      PermissionsWithGrantOption:
+        - DESCRIBE
+
+Outputs:
+  # S3 Bucket Information
+  DataBucketName:
+    Description: 'Name of the S3 bucket for data storage'
+    Value: !Ref DataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBucket'
+
+  DataBucketArn:
+    Description: 'ARN of the S3 bucket for data storage'
+    Value: !GetAtt DataBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBucketArn'
+
+  AuditBucketName:
+    Condition: EnableCloudTrailCondition
+    Description: 'Name of the S3 bucket for audit logs'
+    Value: !Ref AuditBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AuditBucket'
+
+  # Glue Resources
+  GlueDatabaseName:
+    Description: 'Name of the Glue Data Catalog database'
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabase'
+
+  GlueCrawlerName:
+    Description: 'Name of the Glue crawler'
+    Value: !Ref GlueCrawler
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueCrawler'
+
+  PIIClassifierName:
+    Description: 'Name of the PII classifier'
+    Value: !Ref PIIClassifier
+    Export:
+      Name: !Sub '${AWS::StackName}-PIIClassifier'
+
+  # IAM Roles
+  GlueCrawlerRoleArn:
+    Description: 'ARN of the Glue crawler IAM role'
+    Value: !GetAtt GlueCrawlerRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueCrawlerRole'
+
+  DataAnalystRoleArn:
+    Description: 'ARN of the data analyst IAM role'
+    Value: !GetAtt DataAnalystRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataAnalystRole'
+
+  LakeFormationServiceRoleArn:
+    Description: 'ARN of the Lake Formation service role'
+    Value: !GetAtt LakeFormationServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LakeFormationServiceRole'
+
+  # Lambda Function
+  DataCatalogTriggerFunctionArn:
+    Description: 'ARN of the data catalog trigger Lambda function'
+    Value: !GetAtt DataCatalogTriggerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataCatalogTriggerFunction'
+
+  # CloudTrail
+  CloudTrailArn:
+    Condition: EnableCloudTrailCondition
+    Description: 'ARN of the CloudTrail for audit logging'
+    Value: !GetAtt DataCatalogCloudTrail.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrail'
+
+  # CloudWatch Dashboard
+  DashboardURL:
+    Condition: EnableDashboardCondition
+    Description: 'URL of the CloudWatch dashboard'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-governance-dashboard-${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  # Lake Formation
+  DataLakeLocationArn:
+    Description: 'ARN of the Lake Formation data lake location'
+    Value: !Sub 'arn:aws:lakeformation:${AWS::Region}:${AWS::AccountId}:data-location/${DataBucket}/data/'
+    Export:
+      Name: !Sub '${AWS::StackName}-DataLakeLocation'
+
+  # Usage Instructions
+  SampleDataUploadCommand:
+    Description: 'AWS CLI command to upload sample data'
+    Value: !Sub 'aws s3 cp your-data.csv s3://${DataBucket}/data/'
+
+  CrawlerStartCommand:
+    Description: 'AWS CLI command to start the crawler manually'
+    Value: !Sub 'aws glue start-crawler --name ${GlueCrawler}'
+
+  TableQueryCommand:
+    Description: 'AWS CLI command to query tables in the database'
+    Value: !Sub 'aws glue get-tables --database-name ${GlueDatabase}'

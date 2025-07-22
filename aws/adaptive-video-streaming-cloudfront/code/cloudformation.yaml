@@ -1,0 +1,1528 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Adaptive Bitrate Streaming solution with AWS Elemental MediaConvert and CloudFront.
+  Creates automated video transcoding pipeline for multi-bitrate streaming with HLS and DASH outputs.
+  Includes Lambda processing triggers, S3 storage, and global content delivery.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - SourceBucketName
+          - OutputBucketName
+          - EnableVersioning
+          - EnableCors
+      - Label:
+          default: "MediaConvert Configuration" 
+        Parameters:
+          - VideoFormats
+          - QualityLevels
+          - SegmentLength
+          - EnableThumbnails
+      - Label:
+          default: "CloudFront Configuration"
+        Parameters:
+          - PriceClass
+          - EnableLogging
+          - CustomDomainName
+          - CertificateArn
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaRuntime
+          - LambdaTimeout
+          - LambdaMemorySize
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - EnableS3AccessLogs
+          - KMSKeyId
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      SourceBucketName:
+        default: "Source Bucket Name"
+      OutputBucketName:
+        default: "Output Bucket Name"
+      EnableVersioning:
+        default: "Enable S3 Versioning"
+      EnableCors:
+        default: "Enable CORS for Streaming"
+      VideoFormats:
+        default: "Supported Video Formats"
+      QualityLevels:
+        default: "Quality Levels"
+      SegmentLength:
+        default: "HLS Segment Length (seconds)"
+      EnableThumbnails:
+        default: "Generate Thumbnails"
+      PriceClass:
+        default: "CloudFront Price Class"
+      EnableLogging:
+        default: "Enable CloudFront Logging"
+      CustomDomainName:
+        default: "Custom Domain Name (optional)"
+      CertificateArn:
+        default: "SSL Certificate ARN (optional)"
+      LambdaRuntime:
+        default: "Lambda Runtime"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      EnableS3AccessLogs:
+        default: "Enable S3 Access Logs"
+      KMSKeyId:
+        default: "KMS Key ID (optional)"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'adaptive-streaming'
+    MinLength: 3
+    MaxLength: 30
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    Description: 'Project name for resource naming (lowercase, alphanumeric, hyphens only)'
+    ConstraintDescription: 'Must be 3-30 characters, lowercase alphanumeric with hyphens'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - 'dev'
+      - 'staging'
+      - 'prod'
+    Description: 'Environment for deployment (affects resource naming and configuration)'
+
+  SourceBucketName:
+    Type: String
+    Default: ''
+    Description: 'Name for source video bucket (leave empty for auto-generated name)'
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9.-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be a valid S3 bucket name or empty for auto-generation'
+
+  OutputBucketName:
+    Type: String
+    Default: ''
+    Description: 'Name for output video bucket (leave empty for auto-generated name)'
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9.-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be a valid S3 bucket name or empty for auto-generation'
+
+  EnableVersioning:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable S3 bucket versioning for source and output buckets'
+
+  EnableCors:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable CORS configuration on output bucket for web video playback'
+
+  VideoFormats:
+    Type: CommaDelimitedList
+    Default: '.mp4,.mov,.avi,.mkv,.mxf,.mts,.m2ts'
+    Description: 'Supported video file extensions for processing (comma-separated)'
+
+  QualityLevels:
+    Type: String
+    Default: '4'
+    AllowedValues:
+      - '3'
+      - '4'
+      - '5'
+      - '6'
+    Description: 'Number of quality levels for adaptive bitrate ladder'
+
+  SegmentLength:
+    Type: Number
+    Default: 6
+    MinValue: 2
+    MaxValue: 10
+    Description: 'HLS segment length in seconds (2-10 seconds)'
+
+  EnableThumbnails:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Generate thumbnail images during video processing'
+
+  PriceClass:
+    Type: String
+    Default: 'PriceClass_100'
+    AllowedValues:
+      - 'PriceClass_All'
+      - 'PriceClass_200'
+      - 'PriceClass_100'
+    Description: 'CloudFront price class (PriceClass_100 = US/Europe, PriceClass_200 = + Asia, PriceClass_All = Global)'
+
+  EnableLogging:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable CloudFront access logging'
+
+  CustomDomainName:
+    Type: String
+    Default: ''
+    Description: 'Custom domain name for CloudFront distribution (optional)'
+    AllowedPattern: '^$|^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$'
+    ConstraintDescription: 'Must be a valid domain name or empty'
+
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: 'ACM certificate ARN for custom domain (required if custom domain specified)'
+    AllowedPattern: '^$|^arn:aws:acm:[a-z0-9-]+:[0-9]{12}:certificate/[a-f0-9-]+$'
+    ConstraintDescription: 'Must be a valid ACM certificate ARN or empty'
+
+  LambdaRuntime:
+    Type: String
+    Default: 'python3.11'
+    AllowedValues:
+      - 'python3.9'
+      - 'python3.10'
+      - 'python3.11'
+      - 'python3.12'
+    Description: 'Lambda function runtime version'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+    Description: 'Lambda function timeout in seconds (60-900)'
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues:
+      - 128
+      - 256
+      - 512
+      - 1024
+      - 2048
+      - 3008
+    Description: 'Lambda function memory allocation in MB'
+
+  EnableS3AccessLogs:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable S3 access logging for buckets'
+
+  KMSKeyId:
+    Type: String
+    Default: ''
+    Description: 'KMS Key ID for S3 bucket encryption (leave empty for SSE-S3)'
+    AllowedPattern: '^$|^[a-f0-9-]+$|^arn:aws:kms:[a-z0-9-]+:[0-9]{12}:key/[a-f0-9-]+$'
+    ConstraintDescription: 'Must be a valid KMS key ID, ARN, or empty for default encryption'
+
+Conditions:
+  # Bucket naming conditions
+  UseDefaultSourceBucket: !Equals [!Ref SourceBucketName, '']
+  UseDefaultOutputBucket: !Equals [!Ref OutputBucketName, '']
+  
+  # Feature conditions
+  EnableVersioningCondition: !Equals [!Ref EnableVersioning, 'true']
+  EnableCorsCondition: !Equals [!Ref EnableCors, 'true']
+  EnableThumbnailsCondition: !Equals [!Ref EnableThumbnails, 'true']
+  EnableLoggingCondition: !Equals [!Ref EnableLogging, 'true']
+  EnableS3AccessLogsCondition: !Equals [!Ref EnableS3AccessLogs, 'true']
+  
+  # Custom domain conditions
+  HasCustomDomain: !Not [!Equals [!Ref CustomDomainName, '']]
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, '']]
+  UseCustomSSL: !And [!Condition HasCustomDomain, !Condition HasCertificate]
+  
+  # KMS encryption condition
+  UseKMSEncryption: !Not [!Equals [!Ref KMSKeyId, '']]
+  
+  # Environment conditions
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+Mappings:
+  QualityLevelMapping:
+    '3':
+      Levels: ['720p', '480p', '360p']
+      MaxBitrates: ['3000000', '1500000', '800000']
+      QvbrLevels: ['7', '6', '5']
+    '4':
+      Levels: ['1080p', '720p', '480p', '360p']
+      MaxBitrates: ['5000000', '3000000', '1500000', '800000']
+      QvbrLevels: ['8', '7', '6', '5']
+    '5':
+      Levels: ['1080p', '720p', '540p', '480p', '360p']
+      MaxBitrates: ['5000000', '3000000', '2000000', '1500000', '800000']
+      QvbrLevels: ['8', '7', '6', '6', '5']
+    '6':
+      Levels: ['1440p', '1080p', '720p', '540p', '480p', '360p']
+      MaxBitrates: ['8000000', '5000000', '3000000', '2000000', '1500000', '800000']
+      QvbrLevels: ['9', '8', '7', '6', '6', '5']
+
+  EnvironmentMapping:
+    dev:
+      InstanceClass: 'dev'
+      RetentionDays: 7
+      BackupRetention: 1
+    staging:
+      InstanceClass: 'staging'
+      RetentionDays: 14
+      BackupRetention: 7
+    prod:
+      InstanceClass: 'prod'
+      RetentionDays: 30
+      BackupRetention: 30
+
+Resources:
+  # ===================================
+  # S3 BUCKETS FOR VIDEO STORAGE
+  # ===================================
+  
+  # Source video uploads bucket
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - UseDefaultSourceBucket
+        - !Sub '${ProjectName}-source-${Environment}-${AWS::Region}-${AWS::AccountId}'
+        - !Ref SourceBucketName
+      VersioningConfiguration: !If
+        - EnableVersioningCondition
+        - Status: Enabled
+        - !Ref AWS::NoValue
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If
+                - UseKMSEncryption
+                - aws:kms
+                - AES256
+              KMSMasterKeyID: !If
+                - UseKMSEncryption
+                - !Ref KMSKeyId
+                - !Ref AWS::NoValue
+            BucketKeyEnabled: !If
+              - UseKMSEncryption
+              - true
+              - !Ref AWS::NoValue
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: SourceVideoRetention
+            Status: Enabled
+            ExpirationInDays: !FindInMap [EnvironmentMapping, !Ref Environment, RetentionDays]
+      LoggingConfiguration: !If
+        - EnableS3AccessLogsCondition
+        - DestinationBucketName: !Ref AccessLogsBucket
+          LogFilePrefix: 'source-bucket-logs/'
+        - !Ref AWS::NoValue
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt VideoProcessingFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .mp4
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt VideoProcessingFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .mov
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt VideoProcessingFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .avi
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt VideoProcessingFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .mkv
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Video Source Storage'
+
+  # Processed video outputs bucket
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - UseDefaultOutputBucket
+        - !Sub '${ProjectName}-output-${Environment}-${AWS::Region}-${AWS::AccountId}'
+        - !Ref OutputBucketName
+      VersioningConfiguration: !If
+        - EnableVersioningCondition
+        - Status: Enabled
+        - !Ref AWS::NoValue
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If
+                - UseKMSEncryption
+                - aws:kms
+                - AES256
+              KMSMasterKeyID: !If
+                - UseKMSEncryption
+                - !Ref KMSKeyId
+                - !Ref AWS::NoValue
+            BucketKeyEnabled: !If
+              - UseKMSEncryption
+              - true
+              - !Ref AWS::NoValue
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration: !If
+        - EnableCorsCondition
+        - CorsRules:
+            - AllowedHeaders:
+                - '*'
+              AllowedMethods:
+                - GET
+                - HEAD
+              AllowedOrigins:
+                - '*'
+              MaxAge: 3000
+        - !Ref AWS::NoValue
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: IntelligentTiering
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+      LoggingConfiguration: !If
+        - EnableS3AccessLogsCondition
+        - DestinationBucketName: !Ref AccessLogsBucket
+          LogFilePrefix: 'output-bucket-logs/'
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Video Output Storage'
+
+  # Access logs bucket (conditional)
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: EnableS3AccessLogsCondition
+    Properties:
+      BucketName: !Sub '${ProjectName}-access-logs-${Environment}-${AWS::Region}-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteLogs
+            Status: Enabled
+            ExpirationInDays: !FindInMap [EnvironmentMapping, !Ref Environment, RetentionDays]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Access Logs Storage'
+
+  # ===================================
+  # IAM ROLES AND POLICIES
+  # ===================================
+
+  # MediaConvert service role
+  MediaConvertRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-MediaConvert-Role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: mediaconvert.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub '${SourceBucket}'
+                  - !Sub '${SourceBucket}/*'
+                  - !Sub '${OutputBucket}'
+                  - !Sub '${OutputBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListAllMyBuckets
+                Resource: '*'
+        - PolicyName: KMSAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !If
+                  - UseKMSEncryption
+                  - !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/${KMSKeyId}'
+                  - !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda execution role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-Lambda-Role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: MediaConvertAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - mediaconvert:CreateJob
+                  - mediaconvert:GetJob
+                  - mediaconvert:ListJobs
+                  - mediaconvert:GetJobTemplate
+                  - mediaconvert:DescribeEndpoints
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt MediaConvertRole.Arn
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource:
+                  - !Sub '${SourceBucket}/*'
+                  - !Sub '${OutputBucket}/*'
+        - PolicyName: LogsAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ===================================
+  # MEDIACONVERT JOB TEMPLATE
+  # ===================================
+
+  # Custom resource to create MediaConvert job template
+  MediaConvertJobTemplate:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt JobTemplateCreatorFunction.Arn
+      TemplateName: !Sub '${ProjectName}-ABR-Template-${Environment}'
+      OutputBucket: !Ref OutputBucket
+      QualityLevels: !Ref QualityLevels
+      SegmentLength: !Ref SegmentLength
+      EnableThumbnails: !Ref EnableThumbnails
+
+  # Lambda function to create job template
+  JobTemplateCreatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-JobTemplateCreator-${Environment}'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt JobTemplateCreatorRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import os
+          import logging
+          from urllib.parse import urljoin
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              try:
+                  # Get MediaConvert endpoint
+                  mediaconvert = boto3.client('mediaconvert')
+                  endpoints = mediaconvert.describe_endpoints()
+                  endpoint_url = endpoints['Endpoints'][0]['Url']
+                  
+                  # Create MediaConvert client with endpoint
+                  mc_client = boto3.client('mediaconvert', endpoint_url=endpoint_url)
+                  
+                  template_name = event['ResourceProperties']['TemplateName']
+                  output_bucket = event['ResourceProperties']['OutputBucket']
+                  quality_levels = int(event['ResourceProperties']['QualityLevels'])
+                  segment_length = int(event['ResourceProperties']['SegmentLength'])
+                  enable_thumbnails = event['ResourceProperties']['EnableThumbnails'] == 'true'
+                  
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      # Quality level mappings
+                      quality_configs = {
+                          3: [
+                              {'name': '720p', 'width': 1280, 'height': 720, 'bitrate': 3000000, 'qvbr': 7},
+                              {'name': '480p', 'width': 854, 'height': 480, 'bitrate': 1500000, 'qvbr': 6},
+                              {'name': '360p', 'width': 640, 'height': 360, 'bitrate': 800000, 'qvbr': 5}
+                          ],
+                          4: [
+                              {'name': '1080p', 'width': 1920, 'height': 1080, 'bitrate': 5000000, 'qvbr': 8},
+                              {'name': '720p', 'width': 1280, 'height': 720, 'bitrate': 3000000, 'qvbr': 7},
+                              {'name': '480p', 'width': 854, 'height': 480, 'bitrate': 1500000, 'qvbr': 6},
+                              {'name': '360p', 'width': 640, 'height': 360, 'bitrate': 800000, 'qvbr': 5}
+                          ],
+                          5: [
+                              {'name': '1080p', 'width': 1920, 'height': 1080, 'bitrate': 5000000, 'qvbr': 8},
+                              {'name': '720p', 'width': 1280, 'height': 720, 'bitrate': 3000000, 'qvbr': 7},
+                              {'name': '540p', 'width': 960, 'height': 540, 'bitrate': 2000000, 'qvbr': 6},
+                              {'name': '480p', 'width': 854, 'height': 480, 'bitrate': 1500000, 'qvbr': 6},
+                              {'name': '360p', 'width': 640, 'height': 360, 'bitrate': 800000, 'qvbr': 5}
+                          ],
+                          6: [
+                              {'name': '1440p', 'width': 2560, 'height': 1440, 'bitrate': 8000000, 'qvbr': 9},
+                              {'name': '1080p', 'width': 1920, 'height': 1080, 'bitrate': 5000000, 'qvbr': 8},
+                              {'name': '720p', 'width': 1280, 'height': 720, 'bitrate': 3000000, 'qvbr': 7},
+                              {'name': '540p', 'width': 960, 'height': 540, 'bitrate': 2000000, 'qvbr': 6},
+                              {'name': '480p', 'width': 854, 'height': 480, 'bitrate': 1500000, 'qvbr': 6},
+                              {'name': '360p', 'width': 640, 'height': 360, 'bitrate': 800000, 'qvbr': 5}
+                          ]
+                      }
+                      
+                      configs = quality_configs[quality_levels]
+                      
+                      # Build HLS outputs
+                      hls_outputs = []
+                      for config in configs:
+                          hls_outputs.append({
+                              "NameModifier": f"_{config['name']}",
+                              "ContainerSettings": {
+                                  "Container": "M3U8",
+                                  "M3u8Settings": {
+                                      "PcrControl": "PCR_EVERY_PES_PACKET",
+                                      "PmtPid": 480,
+                                      "PrivateMetadataPid": 503,
+                                      "ProgramNumber": 1,
+                                      "PatInterval": 0,
+                                      "PmtInterval": 0,
+                                      "VideoPid": 481,
+                                      "AudioPids": [482, 483, 484, 485, 486, 487, 488, 489, 490, 491, 492]
+                                  }
+                              },
+                              "VideoDescription": {
+                                  "Width": config['width'],
+                                  "Height": config['height'],
+                                  "CodecSettings": {
+                                      "Codec": "H_264",
+                                      "H264Settings": {
+                                          "RateControlMode": "QVBR",
+                                          "QvbrSettings": {
+                                              "QvbrQualityLevel": config['qvbr']
+                                          },
+                                          "MaxBitrate": config['bitrate'],
+                                          "FramerateControl": "INITIALIZE_FROM_SOURCE",
+                                          "GopClosedCadence": 1,
+                                          "GopSize": 90,
+                                          "GopSizeUnits": "FRAMES",
+                                          "ParControl": "INITIALIZE_FROM_SOURCE",
+                                          "QualityTuningLevel": "SINGLE_PASS",
+                                          "SceneChangeDetect": "ENABLED"
+                                      }
+                                  }
+                              },
+                              "AudioDescriptions": [
+                                  {
+                                      "AudioTypeControl": "FOLLOW_INPUT",
+                                      "CodecSettings": {
+                                          "Codec": "AAC",
+                                          "AacSettings": {
+                                              "Bitrate": 128000 if config['bitrate'] >= 3000000 else (96000 if config['bitrate'] >= 1500000 else 64000),
+                                              "CodingMode": "CODING_MODE_2_0",
+                                              "SampleRate": 48000
+                                          }
+                                      }
+                                  }
+                              ]
+                          })
+                      
+                      # Build DASH outputs (subset of HLS for DASH)
+                      dash_outputs = []
+                      for config in configs[:3]:  # Use top 3 qualities for DASH
+                          dash_outputs.append({
+                              "NameModifier": f"_dash_{config['name']}",
+                              "ContainerSettings": {
+                                  "Container": "MP4",
+                                  "Mp4Settings": {
+                                      "CslgAtom": "INCLUDE",
+                                      "FreeSpaceBox": "EXCLUDE",
+                                      "MoovPlacement": "PROGRESSIVE_DOWNLOAD"
+                                  }
+                              },
+                              "VideoDescription": {
+                                  "Width": config['width'],
+                                  "Height": config['height'],
+                                  "CodecSettings": {
+                                      "Codec": "H_264",
+                                      "H264Settings": {
+                                          "RateControlMode": "QVBR",
+                                          "QvbrSettings": {
+                                              "QvbrQualityLevel": config['qvbr']
+                                          },
+                                          "MaxBitrate": config['bitrate'],
+                                          "FramerateControl": "INITIALIZE_FROM_SOURCE",
+                                          "GopClosedCadence": 1,
+                                          "GopSize": 90,
+                                          "GopSizeUnits": "FRAMES",
+                                          "ParControl": "INITIALIZE_FROM_SOURCE",
+                                          "QualityTuningLevel": "SINGLE_PASS",
+                                          "SceneChangeDetect": "ENABLED"
+                                      }
+                                  }
+                              },
+                              "AudioDescriptions": [
+                                  {
+                                      "AudioTypeControl": "FOLLOW_INPUT",
+                                      "CodecSettings": {
+                                          "Codec": "AAC",
+                                          "AacSettings": {
+                                              "Bitrate": 128000 if config['bitrate'] >= 3000000 else (96000 if config['bitrate'] >= 1500000 else 64000),
+                                              "CodingMode": "CODING_MODE_2_0",
+                                              "SampleRate": 48000
+                                          }
+                                      }
+                                  }
+                              ]
+                          })
+                      
+                      # Build output groups
+                      output_groups = [
+                          {
+                              "Name": "HLS_ABR_Package",
+                              "OutputGroupSettings": {
+                                  "Type": "HLS_GROUP_SETTINGS",
+                                  "HlsGroupSettings": {
+                                      "Destination": f"s3://{output_bucket}/hls/",
+                                      "HlsCdnSettings": {
+                                          "HlsBasicPutSettings": {
+                                              "ConnectionRetryInterval": 1,
+                                              "FilecacheDuration": 300,
+                                              "NumRetries": 10
+                                          }
+                                      },
+                                      "ManifestDurationFormat": "FLOATING_POINT",
+                                      "OutputSelection": "MANIFESTS_AND_SEGMENTS",
+                                      "SegmentControl": "SEGMENTED_FILES",
+                                      "SegmentLength": segment_length,
+                                      "TimedMetadataId3Frame": "PRIV",
+                                      "TimedMetadataId3Period": 10,
+                                      "MinSegmentLength": 0,
+                                      "DirectoryStructure": "SINGLE_DIRECTORY"
+                                  }
+                              },
+                              "Outputs": hls_outputs
+                          },
+                          {
+                              "Name": "DASH_ABR_Package",
+                              "OutputGroupSettings": {
+                                  "Type": "DASH_ISO_GROUP_SETTINGS",
+                                  "DashIsoGroupSettings": {
+                                      "Destination": f"s3://{output_bucket}/dash/",
+                                      "FragmentLength": 2,
+                                      "SegmentControl": "SEGMENTED_FILES",
+                                      "SegmentLength": 30,
+                                      "MpdProfile": "ON_DEMAND_PROFILE",
+                                      "HbbtvCompliance": "NONE"
+                                  }
+                              },
+                              "Outputs": dash_outputs
+                          }
+                      ]
+                      
+                      # Add thumbnail output group if enabled
+                      if enable_thumbnails:
+                          output_groups.append({
+                              "Name": "Thumbnail_Output",
+                              "OutputGroupSettings": {
+                                  "Type": "FILE_GROUP_SETTINGS",
+                                  "FileGroupSettings": {
+                                      "Destination": f"s3://{output_bucket}/thumbnails/"
+                                  }
+                              },
+                              "Outputs": [
+                                  {
+                                      "NameModifier": "_thumb_%04d",
+                                      "ContainerSettings": {
+                                          "Container": "RAW"
+                                      },
+                                      "VideoDescription": {
+                                          "Width": 1280,
+                                          "Height": 720,
+                                          "CodecSettings": {
+                                              "Codec": "FRAME_CAPTURE",
+                                              "FrameCaptureSettings": {
+                                                  "FramerateNumerator": 1,
+                                                  "FramerateDenominator": 10,
+                                                  "MaxCaptures": 10,
+                                                  "Quality": 80
+                                              }
+                                          }
+                                      }
+                                  }
+                              ]
+                          })
+                      
+                      template_body = {
+                          "Name": template_name,
+                          "Description": f"Adaptive bitrate streaming template with {quality_levels} quality levels",
+                          "Settings": {
+                              "OutputGroups": output_groups,
+                              "Inputs": [
+                                  {
+                                      "FileInput": f"s3://{output_bucket}/",
+                                      "AudioSelectors": {
+                                          "Audio Selector 1": {
+                                              "Tracks": [1],
+                                              "DefaultSelection": "DEFAULT"
+                                          }
+                                      },
+                                      "VideoSelector": {
+                                          "ColorSpace": "FOLLOW"
+                                      },
+                                      "TimecodeSource": "EMBEDDED"
+                                  }
+                              ]
+                          }
+                      }
+                      
+                      try:
+                          # Try to delete existing template first
+                          mc_client.delete_job_template(Name=template_name)
+                      except:
+                          pass
+                      
+                      response = mc_client.create_job_template(**template_body)
+                      template_arn = response['JobTemplate']['Arn']
+                      
+                      logger.info(f"Created job template: {template_arn}")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                     {'TemplateArn': template_arn, 'TemplateName': template_name})
+                  
+                  elif event['RequestType'] == 'Delete':
+                      try:
+                          mc_client.delete_job_template(Name=template_name)
+                          logger.info(f"Deleted job template: {template_name}")
+                      except Exception as e:
+                          logger.warning(f"Could not delete template: {e}")
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+              except Exception as e:
+                  logger.error(f"Error: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Role for job template creator function
+  JobTemplateCreatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-JobTemplateCreator-Role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: MediaConvertTemplatePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - mediaconvert:CreateJobTemplate
+                  - mediaconvert:DeleteJobTemplate
+                  - mediaconvert:GetJobTemplate
+                  - mediaconvert:DescribeEndpoints
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ===================================
+  # LAMBDA FUNCTION FOR VIDEO PROCESSING
+  # ===================================
+
+  # Main video processing function
+  VideoProcessingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-VideoProcessor-${Environment}'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          MEDIACONVERT_ROLE_ARN: !GetAtt MediaConvertRole.Arn
+          JOB_TEMPLATE: !GetAtt MediaConvertJobTemplate.TemplateName
+          OUTPUT_BUCKET: !Ref OutputBucket
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from urllib.parse import unquote_plus
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              try:
+                  # Get MediaConvert endpoint
+                  mediaconvert = boto3.client('mediaconvert')
+                  endpoints = mediaconvert.describe_endpoints()
+                  endpoint_url = endpoints['Endpoints'][0]['Url']
+                  
+                  # Create MediaConvert client with endpoint
+                  mc_client = boto3.client('mediaconvert', endpoint_url=endpoint_url)
+                  
+                  # Process S3 event
+                  for record in event['Records']:
+                      bucket = record['s3']['bucket']['name']
+                      key = unquote_plus(record['s3']['object']['key'])
+                      
+                      # Only process video files
+                      video_extensions = ('.mp4', '.mov', '.avi', '.mkv', '.mxf', '.mts', '.m2ts')
+                      if not key.lower().endswith(video_extensions):
+                          logger.info(f"Skipping non-video file: {key}")
+                          continue
+                      
+                      # Extract filename without extension for output naming
+                      file_name = key.split('/')[-1].split('.')[0]
+                      
+                      # Create MediaConvert job for ABR processing
+                      job_settings = {
+                          "JobTemplate": os.environ['JOB_TEMPLATE'],
+                          "Role": os.environ['MEDIACONVERT_ROLE_ARN'],
+                          "Settings": {
+                              "Inputs": [
+                                  {
+                                      "FileInput": f"s3://{bucket}/{key}",
+                                      "AudioSelectors": {
+                                          "Audio Selector 1": {
+                                              "Tracks": [1],
+                                              "DefaultSelection": "DEFAULT"
+                                          }
+                                      },
+                                      "VideoSelector": {
+                                          "ColorSpace": "FOLLOW"
+                                      },
+                                      "TimecodeSource": "EMBEDDED"
+                                  }
+                              ],
+                              "OutputGroups": [
+                                  {
+                                      "OutputGroupSettings": {
+                                          "Type": "HLS_GROUP_SETTINGS",
+                                          "HlsGroupSettings": {
+                                              "Destination": f"s3://{os.environ['OUTPUT_BUCKET']}/hls/{file_name}/"
+                                          }
+                                      }
+                                  },
+                                  {
+                                      "OutputGroupSettings": {
+                                          "Type": "DASH_ISO_GROUP_SETTINGS", 
+                                          "DashIsoGroupSettings": {
+                                              "Destination": f"s3://{os.environ['OUTPUT_BUCKET']}/dash/{file_name}/"
+                                          }
+                                      }
+                                  },
+                                  {
+                                      "OutputGroupSettings": {
+                                          "Type": "FILE_GROUP_SETTINGS",
+                                          "FileGroupSettings": {
+                                              "Destination": f"s3://{os.environ['OUTPUT_BUCKET']}/thumbnails/{file_name}/"
+                                          }
+                                      }
+                                  }
+                              ]
+                          },
+                          "StatusUpdateInterval": "SECONDS_60",
+                          "UserMetadata": {
+                              "SourceFile": key,
+                              "ProcessingType": "ABR_Streaming",
+                              "Environment": os.environ['ENVIRONMENT']
+                          }
+                      }
+                      
+                      response = mc_client.create_job(**job_settings)
+                      job_id = response['Job']['Id']
+                      
+                      logger.info(f"Created ABR processing job {job_id} for {key}")
+                      
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': f'Successfully started ABR processing job {job_id}',
+                              'jobId': job_id,
+                              'sourceFile': key,
+                              'hlsOutput': f"s3://{os.environ['OUTPUT_BUCKET']}/hls/{file_name}/",
+                              'dashOutput': f"s3://{os.environ['OUTPUT_BUCKET']}/dash/{file_name}/"
+                          })
+                      }
+                      
+              except Exception as e:
+                  logger.error(f"Error processing video: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'sourceFile': key if 'key' in locals() else 'unknown'
+                      })
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda permission for S3 to invoke function
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref VideoProcessingFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub '${SourceBucket}'
+
+  # ===================================
+  # CLOUDFRONT DISTRIBUTION
+  # ===================================
+
+  # Origin Access Control for S3
+  CloudFrontOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-OAC-${Environment}'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+        Description: 'Origin Access Control for adaptive bitrate streaming'
+
+  # CloudFront distribution
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub 'Adaptive Bitrate Streaming Distribution - ${ProjectName} ${Environment}'
+        Enabled: true
+        HttpVersion: http2
+        IPV6Enabled: true
+        PriceClass: !Ref PriceClass
+        
+        # Origins configuration
+        Origins:
+          - Id: S3-ABR-Output
+            DomainName: !GetAtt OutputBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !Ref CloudFrontOriginAccessControl
+            
+        # Default cache behavior
+        DefaultCacheBehavior:
+          TargetOriginId: S3-ABR-Output
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: '4135ea2d-6df8-44a3-9df3-4b5a84be39ad'  # Managed-CachingOptimized
+          Compress: false
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          TrustedSigners:
+            - self
+        
+        # Cache behaviors for different file types
+        CacheBehaviors:
+          # HLS manifests (short TTL for frequent updates)
+          - PathPattern: '*.m3u8'
+            TargetOriginId: S3-ABR-Output
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: '4135ea2d-6df8-44a3-9df3-4b5a84be39ad'
+            Compress: false
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            DefaultTTL: 5
+            MaxTTL: 60
+            MinTTL: 0
+            
+          # DASH manifests (short TTL for frequent updates)
+          - PathPattern: '*.mpd'
+            TargetOriginId: S3-ABR-Output
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: '4135ea2d-6df8-44a3-9df3-4b5a84be39ad'
+            Compress: false
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            DefaultTTL: 5
+            MaxTTL: 60
+            MinTTL: 0
+            
+          # Video segments (long TTL for caching efficiency)
+          - PathPattern: '*.ts'
+            TargetOriginId: S3-ABR-Output
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: '4135ea2d-6df8-44a3-9df3-4b5a84be39ad'
+            Compress: false
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            DefaultTTL: 86400
+            MaxTTL: 86400
+            MinTTL: 0
+            
+          # MP4 segments for DASH
+          - PathPattern: '*.mp4'
+            TargetOriginId: S3-ABR-Output
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: '4135ea2d-6df8-44a3-9df3-4b5a84be39ad'
+            Compress: false
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            DefaultTTL: 86400
+            MaxTTL: 86400
+            MinTTL: 0
+            
+          # Thumbnail images
+          - PathPattern: '/thumbnails/*'
+            TargetOriginId: S3-ABR-Output
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: '4135ea2d-6df8-44a3-9df3-4b5a84be39ad'
+            Compress: true
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            DefaultTTL: 86400
+            MaxTTL: 86400
+            MinTTL: 0
+        
+        # Custom domain configuration (conditional)
+        Aliases: !If
+          - HasCustomDomain
+          - [!Ref CustomDomainName]
+          - !Ref AWS::NoValue
+          
+        # SSL certificate configuration (conditional)
+        ViewerCertificate: !If
+          - UseCustomSSL
+          - AcmCertificateArn: !Ref CertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+            MinimumProtocolVersion: TLSv1.2_2021
+        
+        # Logging configuration (conditional)
+        Logging: !If
+          - EnableLoggingCondition
+          - Bucket: !If
+              - EnableS3AccessLogsCondition
+              - !GetAtt AccessLogsBucket.DomainName
+              - !Sub '${ProjectName}-cloudfront-logs-${Environment}-${AWS::Region}-${AWS::AccountId}.s3.amazonaws.com'
+            Prefix: 'cloudfront-logs/'
+            IncludeCookies: false
+          - !Ref AWS::NoValue
+        
+        # Custom error pages
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 404
+            ResponsePagePath: '/404.html'
+            ErrorCachingMinTTL: 300
+          - ErrorCode: 404
+            ResponseCode: 404
+            ResponsePagePath: '/404.html'
+            ErrorCachingMinTTL: 300
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # S3 bucket policy to allow CloudFront access
+  OutputBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref OutputBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${OutputBucket}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  # ===================================
+  # CLOUDWATCH MONITORING
+  # ===================================
+
+  # CloudWatch Log Groups
+  VideoProcessingLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${VideoProcessingFunction}'
+      RetentionInDays: !FindInMap [EnvironmentMapping, !Ref Environment, RetentionDays]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarms
+  VideoProcessingErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-VideoProcessing-Errors-${Environment}'
+      AlarmDescription: 'Alarm for video processing Lambda function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref VideoProcessingFunction
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  MediaConvertJobFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-MediaConvert-Failures-${Environment}'
+      AlarmDescription: 'Alarm for MediaConvert job failures'
+      MetricName: JobsErroredCount
+      Namespace: AWS/MediaConvert
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  CloudFrontErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-CloudFront-ErrorRate-${Environment}'
+      AlarmDescription: 'Alarm for high CloudFront error rate'
+      MetricName: 4xxErrorRate
+      Namespace: AWS/CloudFront
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DistributionId
+          Value: !Ref CloudFrontDistribution
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+# ===================================
+# OUTPUTS
+# ===================================
+
+Outputs:
+  # Infrastructure Information
+  StackName:
+    Description: 'CloudFormation stack name'
+    Value: !Ref AWS::StackName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-StackName'
+
+  ProjectName:
+    Description: 'Project name used for resource naming'
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ProjectName'
+
+  Environment:
+    Description: 'Environment (dev/staging/prod)'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-Environment'
+
+  # S3 Bucket Information
+  SourceBucketName:
+    Description: 'S3 bucket for video source uploads'
+    Value: !Ref SourceBucket
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-SourceBucket'
+
+  SourceBucketConsoleUrl:
+    Description: 'AWS Console URL for source bucket'
+    Value: !Sub 'https://s3.console.aws.amazon.com/s3/buckets/${SourceBucket}'
+
+  OutputBucketName:
+    Description: 'S3 bucket for processed video outputs'
+    Value: !Ref OutputBucket
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-OutputBucket'
+
+  OutputBucketConsoleUrl:
+    Description: 'AWS Console URL for output bucket'
+    Value: !Sub 'https://s3.console.aws.amazon.com/s3/buckets/${OutputBucket}'
+
+  # CloudFront Information
+  CloudFrontDistributionId:
+    Description: 'CloudFront distribution ID'
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-CloudFrontDistributionId'
+
+  CloudFrontDomainName:
+    Description: 'CloudFront distribution domain name'
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-CloudFrontDomain'
+
+  CloudFrontDistributionUrl:
+    Description: 'CloudFront distribution HTTPS URL'
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+
+  CloudFrontConsoleUrl:
+    Description: 'AWS Console URL for CloudFront distribution'
+    Value: !Sub 'https://console.aws.amazon.com/cloudfront/home#distribution-settings:${CloudFrontDistribution}'
+
+  # Custom Domain Information (conditional)
+  CustomDomainUrl:
+    Condition: HasCustomDomain
+    Description: 'Custom domain HTTPS URL'
+    Value: !Sub 'https://${CustomDomainName}'
+
+  # MediaConvert Information
+  MediaConvertJobTemplate:
+    Description: 'MediaConvert job template name'
+    Value: !GetAtt MediaConvertJobTemplate.TemplateName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-JobTemplate'
+
+  MediaConvertConsoleUrl:
+    Description: 'AWS Console URL for MediaConvert'
+    Value: !Sub 'https://console.aws.amazon.com/mediaconvert/home?region=${AWS::Region}#/jobs'
+
+  # Lambda Information
+  VideoProcessingFunctionName:
+    Description: 'Lambda function name for video processing'
+    Value: !Ref VideoProcessingFunction
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-VideoProcessorFunction'
+
+  VideoProcessingFunctionArn:
+    Description: 'Lambda function ARN for video processing'
+    Value: !GetAtt VideoProcessingFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-VideoProcessorFunctionArn'
+
+  LambdaConsoleUrl:
+    Description: 'AWS Console URL for Lambda function'
+    Value: !Sub 'https://console.aws.amazon.com/lambda/home?region=${AWS::Region}#/functions/${VideoProcessingFunction}'
+
+  # IAM Role Information
+  MediaConvertRoleArn:
+    Description: 'MediaConvert service role ARN'
+    Value: !GetAtt MediaConvertRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-MediaConvertRoleArn'
+
+  LambdaExecutionRoleArn:
+    Description: 'Lambda execution role ARN'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-LambdaExecutionRoleArn'
+
+  # Streaming URLs Examples
+  HLSStreamingUrlExample:
+    Description: 'Example HLS streaming URL pattern'
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}/hls/[video-name]/index.m3u8'
+
+  DASHStreamingUrlExample:
+    Description: 'Example DASH streaming URL pattern'
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}/dash/[video-name]/index.mpd'
+
+  ThumbnailUrlExample:
+    Description: 'Example thumbnail URL pattern'
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}/thumbnails/[video-name]/[filename]_thumb_0001.jpg'
+
+  # Upload Instructions
+  UploadInstructions:
+    Description: 'Instructions for uploading videos'
+    Value: !Sub |
+      Upload video files (.mp4, .mov, .avi, .mkv, .mxf, .mts, .m2ts) to: 
+      s3://${SourceBucket}/
+      
+      Processing will start automatically and outputs will be available at:
+      HLS: s3://${OutputBucket}/hls/[video-name]/
+      DASH: s3://${OutputBucket}/dash/[video-name]/
+      Thumbnails: s3://${OutputBucket}/thumbnails/[video-name]/
+
+  # CloudWatch Information
+  VideoProcessingLogGroup:
+    Description: 'CloudWatch log group for video processing function'
+    Value: !Ref VideoProcessingLogGroup
+
+  CloudWatchConsoleUrl:
+    Description: 'AWS Console URL for CloudWatch logs'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/${VideoProcessingLogGroup}'
+
+  # Configuration Summary
+  ConfigurationSummary:
+    Description: 'Deployment configuration summary'
+    Value: !Sub |
+      Project: ${ProjectName}
+      Environment: ${Environment}
+      Quality Levels: ${QualityLevels}
+      HLS Segment Length: ${SegmentLength}s
+      Thumbnails: ${EnableThumbnails}
+      CloudFront Price Class: ${PriceClass}
+      Custom Domain: ${CustomDomainName}

@@ -1,0 +1,605 @@
+# Google Cloud Infrastructure Manager Configuration
+# VMware Workload Migration and Modernization with Google Cloud VMware Engine and Migrate to Containers
+# This configuration creates the complete infrastructure for migrating VMware workloads to Google Cloud
+# and modernizing selected applications using containerization
+
+# Variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud project ID"
+    default: "vmware-migration-project"
+  
+  region:
+    type: string
+    description: "Google Cloud region for resources"
+    default: "us-central1"
+  
+  zone:
+    type: string
+    description: "Google Cloud zone for zonal resources"
+    default: "us-central1-a"
+  
+  vmware_engine_region:
+    type: string
+    description: "Google Cloud VMware Engine region"
+    default: "us-central1"
+  
+  private_cloud_name:
+    type: string
+    description: "Name for VMware Engine private cloud"
+    default: "vmware-migration-cloud"
+  
+  gke_cluster_name:
+    type: string
+    description: "Name for GKE cluster for modernized apps"
+    default: "modernized-apps-cluster"
+  
+  network_name:
+    type: string
+    description: "Name for VPC network"
+    default: "vmware-migration-network"
+  
+  artifact_registry_name:
+    type: string
+    description: "Name for Artifact Registry repository"
+    default: "modernized-apps"
+  
+  node_count:
+    type: number
+    description: "Number of VMware Engine nodes (minimum 3)"
+    default: 3
+  
+  node_type:
+    type: string
+    description: "VMware Engine node type"
+    default: "standard-72"
+  
+  gke_node_count:
+    type: number
+    description: "Initial number of GKE nodes"
+    default: 2
+  
+  enable_monitoring:
+    type: boolean
+    description: "Enable enhanced monitoring and logging"
+    default: true
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: "enable-vmware-engine-api"
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: "projects/{{ .project_id }}/services/vmwareengine.googleapis.com"
+      parent: "projects/{{ .project_id }}"
+  
+  - name: "enable-container-api"
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: "projects/{{ .project_id }}/services/container.googleapis.com"
+      parent: "projects/{{ .project_id }}"
+  
+  - name: "enable-artifact-registry-api"
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: "projects/{{ .project_id }}/services/artifactregistry.googleapis.com"
+      parent: "projects/{{ .project_id }}"
+  
+  - name: "enable-monitoring-api"
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: "projects/{{ .project_id }}/services/monitoring.googleapis.com"
+      parent: "projects/{{ .project_id }}"
+  
+  - name: "enable-logging-api"
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: "projects/{{ .project_id }}/services/logging.googleapis.com"
+      parent: "projects/{{ .project_id }}"
+  
+  - name: "enable-compute-api"
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: "projects/{{ .project_id }}/services/compute.googleapis.com"
+      parent: "projects/{{ .project_id }}"
+
+  # VPC Network for VMware Engine connectivity
+  - name: "vmware-migration-network"
+    type: compute.v1.network
+    properties:
+      name: "{{ .network_name }}"
+      autoCreateSubnetworks: false
+      routingConfig:
+        routingMode: REGIONAL
+    metadata:
+      dependsOn:
+        - "enable-compute-api"
+
+  # Management subnet for VMware Engine
+  - name: "vmware-mgmt-subnet"
+    type: compute.v1.subnetwork
+    properties:
+      name: "vmware-mgmt-subnet"
+      network: "$(ref.vmware-migration-network.selfLink)"
+      ipCidrRange: "10.10.0.0/24"
+      region: "{{ .region }}"
+      enableFlowLogs: true
+      privateIpGoogleAccess: true
+    metadata:
+      dependsOn:
+        - "vmware-migration-network"
+
+  # GKE subnet for modernized applications
+  - name: "gke-subnet"
+    type: compute.v1.subnetwork
+    properties:
+      name: "gke-subnet"
+      network: "$(ref.vmware-migration-network.selfLink)"
+      ipCidrRange: "10.20.0.0/24"
+      region: "{{ .region }}"
+      enableFlowLogs: true
+      privateIpGoogleAccess: true
+      secondaryIpRanges:
+        - rangeName: "gke-pods"
+          ipCidrRange: "10.21.0.0/16"
+        - rangeName: "gke-services"
+          ipCidrRange: "10.22.0.0/16"
+    metadata:
+      dependsOn:
+        - "vmware-migration-network"
+
+  # Firewall rules for VMware HCX traffic
+  - name: "allow-vmware-hcx-traffic"
+    type: compute.v1.firewall
+    properties:
+      name: "allow-vmware-hcx-traffic"
+      network: "$(ref.vmware-migration-network.selfLink)"
+      description: "Allow VMware HCX and vCenter traffic"
+      priority: 1000
+      direction: INGRESS
+      sourceRanges:
+        - "10.0.0.0/8"
+        - "192.168.0.0/16"
+        - "172.16.0.0/12"
+      allowed:
+        - IPProtocol: "tcp"
+          ports: ["443", "8043", "9443", "80", "22", "902", "903"]
+        - IPProtocol: "udp"
+          ports: ["500", "4500"]
+        - IPProtocol: "icmp"
+    metadata:
+      dependsOn:
+        - "vmware-migration-network"
+
+  # Firewall rules for GKE cluster
+  - name: "allow-gke-traffic"
+    type: compute.v1.firewall
+    properties:
+      name: "allow-gke-traffic"
+      network: "$(ref.vmware-migration-network.selfLink)"
+      description: "Allow GKE cluster traffic"
+      priority: 1000
+      direction: INGRESS
+      sourceRanges:
+        - "10.20.0.0/24"
+        - "10.21.0.0/16"
+        - "10.22.0.0/16"
+      targetTags:
+        - "gke-node"
+      allowed:
+        - IPProtocol: "tcp"
+          ports: ["80", "443", "8080", "10250", "10255"]
+        - IPProtocol: "udp"
+          ports: ["53"]
+        - IPProtocol: "icmp"
+    metadata:
+      dependsOn:
+        - "vmware-migration-network"
+
+  # VMware Engine Network for private cloud
+  - name: "vmware-engine-network"
+    type: gcp-types/vmwareengine-v1:projects.locations.vmwareEngineNetworks
+    properties:
+      parent: "projects/{{ .project_id }}/locations/{{ .vmware_engine_region }}"
+      vmwareEngineNetworkId: "{{ .private_cloud_name }}-network"
+      type: LEGACY
+      description: "VMware Engine network for private cloud connectivity"
+    metadata:
+      dependsOn:
+        - "enable-vmware-engine-api"
+        - "vmware-migration-network"
+
+  # VMware Engine Private Cloud
+  - name: "vmware-private-cloud"
+    type: gcp-types/vmwareengine-v1:projects.locations.privateClouds
+    properties:
+      parent: "projects/{{ .project_id }}/locations/{{ .vmware_engine_region }}"
+      privateCloudId: "{{ .private_cloud_name }}"
+      description: "VMware Engine private cloud for workload migration"
+      networkConfig:
+        managementCidr: "10.10.0.0/24"
+        vmwareEngineNetwork: "$(ref.vmware-engine-network.name)"
+        vmwareEngineNetworkCanonical: "$(ref.vmware-engine-network.name)"
+      managementCluster:
+        clusterId: "initial-cluster"
+        nodeTypeConfigs:
+          "{{ .node_type }}":
+            nodeCount: "{{ .node_count }}"
+            customCoreCount: 32
+    metadata:
+      dependsOn:
+        - "vmware-engine-network"
+        - "vmware-mgmt-subnet"
+
+  # Artifact Registry for container images
+  - name: "artifact-registry"
+    type: gcp-types/artifactregistry-v1:projects.locations.repositories
+    properties:
+      parent: "projects/{{ .project_id }}/locations/{{ .region }}"
+      repositoryId: "{{ .artifact_registry_name }}"
+      format: DOCKER
+      description: "Repository for modernized application containers"
+      labels:
+        environment: "migration"
+        purpose: "modernization"
+    metadata:
+      dependsOn:
+        - "enable-artifact-registry-api"
+
+  # GKE Cluster for modernized applications
+  - name: "gke-cluster"
+    type: gcp-types/container-v1:projects.zones.clusters
+    properties:
+      parent: "projects/{{ .project_id }}/locations/{{ .region }}"
+      cluster:
+        name: "{{ .gke_cluster_name }}"
+        description: "GKE cluster for modernized VMware applications"
+        location: "{{ .region }}"
+        initialClusterVersion: "1.29"
+        network: "$(ref.vmware-migration-network.selfLink)"
+        subnetwork: "$(ref.gke-subnet.selfLink)"
+        ipAllocationPolicy:
+          useIpAliases: true
+          clusterSecondaryRangeName: "gke-pods"
+          servicesSecondaryRangeName: "gke-services"
+        addonsConfig:
+          httpLoadBalancing:
+            disabled: false
+          horizontalPodAutoscaling:
+            disabled: false
+          networkPolicyConfig:
+            disabled: false
+        networkPolicy:
+          enabled: true
+        workloadIdentityConfig:
+          workloadPool: "{{ .project_id }}.svc.id.goog"
+        releaseChannel:
+          channel: REGULAR
+        shieldedNodes:
+          enabled: true
+        nodePools:
+          - name: "default-pool"
+            initialNodeCount: "{{ .gke_node_count }}"
+            config:
+              machineType: "e2-standard-4"
+              diskSizeGb: 100
+              diskType: "pd-standard"
+              imageType: "COS_CONTAINERD"
+              oauthScopes:
+                - "https://www.googleapis.com/auth/cloud-platform"
+              metadata:
+                disable-legacy-endpoints: "true"
+              shieldedInstanceConfig:
+                enableSecureBoot: true
+                enableIntegrityMonitoring: true
+              tags:
+                - "gke-node"
+                - "modernized-apps"
+            management:
+              autoUpgrade: true
+              autoRepair: true
+            autoscaling:
+              enabled: true
+              minNodeCount: 1
+              maxNodeCount: 10
+        masterAuth:
+          clientCertificateConfig:
+            issueClientCertificate: false
+        privateClusterConfig:
+          enablePrivateNodes: true
+          enablePrivateEndpoint: false
+          masterIpv4CidrBlock: "10.23.0.0/28"
+        logging:
+          enable: true
+        monitoring:
+          enable: true
+    metadata:
+      dependsOn:
+        - "enable-container-api"
+        - "gke-subnet"
+        - "allow-gke-traffic"
+
+  # Cloud Monitoring Dashboard for hybrid infrastructure
+  - name: "monitoring-dashboard"
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      parent: "projects/{{ .project_id }}"
+      displayName: "VMware Migration and Modernization Dashboard"
+      mosaicLayout:
+        tiles:
+          - width: 6
+            height: 4
+            widget:
+              title: "VMware Engine Resource Utilization"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="vmware_vcenter"'
+                        aggregation:
+                          alignmentPeriod: "60s"
+                          perSeriesAligner: "ALIGN_MEAN"
+                          crossSeriesReducer: "REDUCE_MEAN"
+                          groupByFields:
+                            - "resource.label.location"
+                yAxis:
+                  label: "Utilization %"
+                  scale: "LINEAR"
+                timeshiftDuration: "0s"
+          - width: 6
+            height: 4
+            widget:
+              title: "GKE Container Performance"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="k8s_container" AND resource.label.cluster_name="{{ .gke_cluster_name }}"'
+                        aggregation:
+                          alignmentPeriod: "60s"
+                          perSeriesAligner: "ALIGN_MEAN"
+                          crossSeriesReducer: "REDUCE_MEAN"
+                          groupByFields:
+                            - "resource.label.namespace_name"
+                yAxis:
+                  label: "CPU Usage"
+                  scale: "LINEAR"
+                timeshiftDuration: "0s"
+          - width: 12
+            height: 4
+            widget:
+              title: "Migration Progress Overview"
+              scorecard:
+                timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'resource.type="global"'
+                    aggregation:
+                      alignmentPeriod: "300s"
+                      perSeriesAligner: "ALIGN_MEAN"
+                gaugeView:
+                  lowerBound: 0
+                  upperBound: 100
+                sparkChartView:
+                  sparkChartType: "SPARK_LINE"
+    metadata:
+      dependsOn:
+        - "enable-monitoring-api"
+        - "vmware-private-cloud"
+        - "gke-cluster"
+
+  # Alerting policy for VMware Engine high CPU usage
+  - name: "vmware-cpu-alert"
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: "projects/{{ .project_id }}"
+      displayName: "VMware Engine High CPU Usage"
+      documentation:
+        content: "VMware Engine nodes are experiencing high CPU utilization"
+        mimeType: "text/markdown"
+      conditions:
+        - displayName: "High VMware CPU Usage"
+          conditionThreshold:
+            filter: 'resource.type="vmware_vcenter" AND metric.type="compute.googleapis.com/instance/cpu/utilization"'
+            comparison: "COMPARISON_GREATER_THAN"
+            thresholdValue: 0.8
+            duration: "300s"
+            aggregations:
+              - alignmentPeriod: "60s"
+                perSeriesAligner: "ALIGN_MEAN"
+                crossSeriesReducer: "REDUCE_MEAN"
+                groupByFields:
+                  - "resource.label.location"
+      enabled: true
+      alertStrategy:
+        autoClose: "1800s"
+    metadata:
+      dependsOn:
+        - "enable-monitoring-api"
+        - "vmware-private-cloud"
+
+  # Alerting policy for GKE pod failures
+  - name: "gke-pod-failure-alert"
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: "projects/{{ .project_id }}"
+      displayName: "GKE Pod Failures"
+      documentation:
+        content: "GKE pods are experiencing frequent restarts"
+        mimeType: "text/markdown"
+      conditions:
+        - displayName: "High Pod Restart Count"
+          conditionThreshold:
+            filter: 'resource.type="k8s_container" AND metric.type="kubernetes.io/container/restart_count" AND resource.label.cluster_name="{{ .gke_cluster_name }}"'
+            comparison: "COMPARISON_GREATER_THAN"
+            thresholdValue: 5
+            duration: "300s"
+            aggregations:
+              - alignmentPeriod: "60s"
+                perSeriesAligner: "ALIGN_RATE"
+                crossSeriesReducer: "REDUCE_SUM"
+                groupByFields:
+                  - "resource.label.namespace_name"
+      enabled: true
+      alertStrategy:
+        autoClose: "1800s"
+    metadata:
+      dependsOn:
+        - "enable-monitoring-api"
+        - "gke-cluster"
+
+  # Log sink for VMware Engine events
+  - name: "vmware-log-sink"
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      parent: "projects/{{ .project_id }}"
+      uniqueWriterIdentity: true
+      name: "vmware-engine-logs"
+      description: "Log sink for VMware Engine events and activities"
+      destination: "bigquery.googleapis.com/projects/{{ .project_id }}/datasets/vmware_migration_logs"
+      filter: 'resource.type="vmware_vcenter" OR resource.type="vmware_cluster"'
+      includeChildren: true
+    metadata:
+      dependsOn:
+        - "enable-logging-api"
+        - "vmware-private-cloud"
+
+  # BigQuery dataset for migration logs
+  - name: "migration-logs-dataset"
+    type: bigquery.v2.dataset
+    properties:
+      datasetReference:
+        datasetId: "vmware_migration_logs"
+        projectId: "{{ .project_id }}"
+      location: "{{ .region }}"
+      description: "Dataset for storing VMware migration and modernization logs"
+      defaultTableExpirationMs: 2592000000  # 30 days
+      labels:
+        environment: "migration"
+        purpose: "logging"
+    metadata:
+      dependsOn:
+        - "enable-logging-api"
+
+  # IAM binding for VMware Engine access
+  - name: "vmware-engine-iam-binding"
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: "{{ .project_id }}"
+      role: "roles/vmwareengine.vmwareengineAdmin"
+      member: "serviceAccount:{{ .project_id }}@{{ .project_id }}.iam.gserviceaccount.com"
+    metadata:
+      dependsOn:
+        - "vmware-private-cloud"
+
+  # IAM binding for GKE access
+  - name: "gke-iam-binding"
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: "{{ .project_id }}"
+      role: "roles/container.admin"
+      member: "serviceAccount:{{ .project_id }}@{{ .project_id }}.iam.gserviceaccount.com"
+    metadata:
+      dependsOn:
+        - "gke-cluster"
+
+  # Service account for migration operations
+  - name: "migration-service-account"
+    type: iam.v1.serviceAccount
+    properties:
+      accountId: "migration-operator"
+      displayName: "VMware Migration Operator"
+      description: "Service account for VMware migration and modernization operations"
+    metadata:
+      dependsOn:
+        - "vmware-private-cloud"
+        - "gke-cluster"
+
+  # IAM binding for migration service account
+  - name: "migration-sa-binding"
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: "{{ .project_id }}"
+      role: "roles/editor"
+      member: "serviceAccount:$(ref.migration-service-account.email)"
+    metadata:
+      dependsOn:
+        - "migration-service-account"
+
+# Outputs for reference and integration
+outputs:
+  - name: "vmware_private_cloud_name"
+    value: "$(ref.vmware-private-cloud.name)"
+    description: "Name of the VMware Engine private cloud"
+  
+  - name: "vmware_vcenter_ip"
+    value: "$(ref.vmware-private-cloud.vcenter.internalIp)"
+    description: "Internal IP address of vCenter Server"
+  
+  - name: "gke_cluster_name"
+    value: "$(ref.gke-cluster.name)"
+    description: "Name of the GKE cluster for modernized applications"
+  
+  - name: "gke_cluster_endpoint"
+    value: "$(ref.gke-cluster.endpoint)"
+    description: "Endpoint of the GKE cluster"
+  
+  - name: "artifact_registry_url"
+    value: "{{ .region }}-docker.pkg.dev/{{ .project_id }}/{{ .artifact_registry_name }}"
+    description: "URL of the Artifact Registry for container images"
+  
+  - name: "network_name"
+    value: "$(ref.vmware-migration-network.name)"
+    description: "Name of the VPC network"
+  
+  - name: "monitoring_dashboard_url"
+    value: "https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.monitoring-dashboard.name)"
+    description: "URL of the monitoring dashboard"
+  
+  - name: "migration_service_account_email"
+    value: "$(ref.migration-service-account.email)"
+    description: "Email of the migration service account"
+  
+  - name: "setup_instructions"
+    value: |
+      VMware Migration and Modernization Infrastructure Setup Complete!
+      
+      Next Steps:
+      1. Configure HCX in your on-premises environment using vCenter IP: $(ref.vmware-private-cloud.vcenter.internalIp)
+      2. Set up network connectivity between on-premises and Google Cloud
+      3. Install Migrate to Containers CLI on your local workstation
+      4. Configure kubectl to connect to GKE cluster: $(ref.gke-cluster.name)
+      5. Use Artifact Registry URL for container images: {{ .region }}-docker.pkg.dev/{{ .project_id }}/{{ .artifact_registry_name }}
+      
+      Important Notes:
+      - VMware Engine private cloud provisioning takes 30-45 minutes
+      - Ensure proper network connectivity for HCX operations
+      - Use the migration service account for automated operations
+      - Monitor progress through the custom dashboard
+    description: "Setup instructions and important information"
+
+# Metadata for the Infrastructure Manager configuration
+metadata:
+  version: "1.0"
+  description: "Complete infrastructure for VMware workload migration and modernization"
+  author: "Cloud Recipe Generator"
+  tags:
+    - "vmware"
+    - "migration"
+    - "modernization"
+    - "containers"
+    - "hybrid-cloud"
+  estimated_deployment_time: "45-60 minutes"
+  estimated_cost: "$2000-5000/month"
+  dependencies:
+    - "Google Cloud VMware Engine API"
+    - "Google Kubernetes Engine API"
+    - "Artifact Registry API"
+    - "Cloud Monitoring API"
+    - "Cloud Logging API"
+    - "Compute Engine API"
+  prerequisites:
+    - "Google Cloud project with billing enabled"
+    - "Appropriate IAM permissions"
+    - "Network connectivity planning"
+    - "On-premises VMware environment access"

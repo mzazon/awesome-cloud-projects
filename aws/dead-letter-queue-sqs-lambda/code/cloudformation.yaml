@@ -1,0 +1,808 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Dead Letter Queue Processing with SQS - Comprehensive error handling
+  system that captures failed messages, analyzes error patterns, and provides 
+  automated retry mechanisms for e-commerce order processing.
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Queue Configuration"
+        Parameters:
+          - QueueName
+          - DLQName
+          - MaxReceiveCount
+          - MessageRetentionPeriod
+          - VisibilityTimeoutSeconds
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - ProcessorFunctionName
+          - MonitorFunctionName
+          - LambdaRuntime
+          - ProcessorTimeout
+          - MonitorTimeout
+          - ProcessorMemorySize
+          - MonitorMemorySize
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableCloudWatchAlarms
+          - DLQAlarmThreshold
+          - ErrorRateAlarmThreshold
+          - AlarmEvaluationPeriods
+      - Label:
+          default: "Processing Configuration"
+        Parameters:
+          - MainQueueBatchSize
+          - DLQBatchSize
+          - MainQueueBatchingWindow
+          - DLQBatchingWindow
+          - FailureSimulationRate
+    ParameterLabels:
+      QueueName:
+        default: "Main Queue Name"
+      DLQName:
+        default: "Dead Letter Queue Name"
+      MaxReceiveCount:
+        default: "Maximum Receive Count"
+      MessageRetentionPeriod:
+        default: "Message Retention Period (seconds)"
+      VisibilityTimeoutSeconds:
+        default: "Visibility Timeout (seconds)"
+      ProcessorFunctionName:
+        default: "Main Processor Function Name"
+      MonitorFunctionName:
+        default: "DLQ Monitor Function Name"
+      LambdaRuntime:
+        default: "Lambda Runtime"
+      ProcessorTimeout:
+        default: "Processor Function Timeout (seconds)"
+      MonitorTimeout:
+        default: "Monitor Function Timeout (seconds)"
+      ProcessorMemorySize:
+        default: "Processor Function Memory (MB)"
+      MonitorMemorySize:
+        default: "Monitor Function Memory (MB)"
+      EnableCloudWatchAlarms:
+        default: "Enable CloudWatch Alarms"
+      DLQAlarmThreshold:
+        default: "DLQ Message Count Alarm Threshold"
+      ErrorRateAlarmThreshold:
+        default: "Error Rate Alarm Threshold"
+      AlarmEvaluationPeriods:
+        default: "Alarm Evaluation Periods"
+      MainQueueBatchSize:
+        default: "Main Queue Batch Size"
+      DLQBatchSize:
+        default: "DLQ Batch Size"
+      MainQueueBatchingWindow:
+        default: "Main Queue Batching Window (seconds)"
+      DLQBatchingWindow:
+        default: "DLQ Batching Window (seconds)"
+      FailureSimulationRate:
+        default: "Failure Simulation Rate (0.0-1.0)"
+
+# Input Parameters
+Parameters:
+  # Queue Configuration Parameters
+  QueueName:
+    Type: String
+    Default: order-processing
+    Description: Name for the main processing queue
+    MinLength: 1
+    MaxLength: 80
+    ConstraintDescription: Queue name must be between 1 and 80 characters
+    
+  DLQName:
+    Type: String
+    Default: order-processing-dlq
+    Description: Name for the dead letter queue
+    MinLength: 1
+    MaxLength: 80
+    ConstraintDescription: DLQ name must be between 1 and 80 characters
+    
+  MaxReceiveCount:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 1000
+    Description: Maximum number of times a message can be received before moving to DLQ
+    
+  MessageRetentionPeriod:
+    Type: Number
+    Default: 1209600
+    MinValue: 60
+    MaxValue: 1209600
+    Description: Message retention period in seconds (14 days max)
+    
+  VisibilityTimeoutSeconds:
+    Type: Number
+    Default: 300
+    MinValue: 0
+    MaxValue: 43200
+    Description: Visibility timeout for SQS messages in seconds
+    
+  # Lambda Configuration Parameters
+  ProcessorFunctionName:
+    Type: String
+    Default: order-processor
+    Description: Name for the main processing Lambda function
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: ^[a-zA-Z0-9-_]+$
+    ConstraintDescription: Function name must contain only alphanumeric characters, hyphens, and underscores
+    
+  MonitorFunctionName:
+    Type: String
+    Default: dlq-monitor
+    Description: Name for the DLQ monitoring Lambda function
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: ^[a-zA-Z0-9-_]+$
+    ConstraintDescription: Function name must contain only alphanumeric characters, hyphens, and underscores
+    
+  LambdaRuntime:
+    Type: String
+    Default: python3.9
+    AllowedValues:
+      - python3.8
+      - python3.9
+      - python3.10
+      - python3.11
+    Description: Python runtime version for Lambda functions
+    
+  ProcessorTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    Description: Timeout for main processor function in seconds
+    
+  MonitorTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 3
+    MaxValue: 900
+    Description: Timeout for DLQ monitor function in seconds
+    
+  ProcessorMemorySize:
+    Type: Number
+    Default: 128
+    AllowedValues: [128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768, 832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536, 1600, 1664, 1728, 1792, 1856, 1920, 1984, 2048, 2112, 2176, 2240, 2304, 2368, 2432, 2496, 2560, 2624, 2688, 2752, 2816, 2880, 2944, 3008]
+    Description: Memory allocation for main processor function in MB
+    
+  MonitorMemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768, 832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536, 1600, 1664, 1728, 1792, 1856, 1920, 1984, 2048, 2112, 2176, 2240, 2304, 2368, 2432, 2496, 2560, 2624, 2688, 2752, 2816, 2880, 2944, 3008]
+    Description: Memory allocation for DLQ monitor function in MB
+    
+  # Monitoring Configuration Parameters
+  EnableCloudWatchAlarms:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable CloudWatch alarms for monitoring
+    
+  DLQAlarmThreshold:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Number of messages in DLQ to trigger alarm
+    
+  ErrorRateAlarmThreshold:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    Description: Number of failed messages to trigger error rate alarm
+    
+  AlarmEvaluationPeriods:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 5
+    Description: Number of evaluation periods for alarms
+    
+  # Processing Configuration Parameters
+  MainQueueBatchSize:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 10
+    Description: Batch size for main queue event source mapping
+    
+  DLQBatchSize:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 10
+    Description: Batch size for DLQ event source mapping
+    
+  MainQueueBatchingWindow:
+    Type: Number
+    Default: 5
+    MinValue: 0
+    MaxValue: 300
+    Description: Batching window for main queue in seconds
+    
+  DLQBatchingWindow:
+    Type: Number
+    Default: 10
+    MinValue: 0
+    MaxValue: 300
+    Description: Batching window for DLQ in seconds
+    
+  FailureSimulationRate:
+    Type: Number
+    Default: 0.3
+    MinValue: 0.0
+    MaxValue: 1.0
+    Description: Failure simulation rate for testing (0.0 = no failures, 1.0 = all failures)
+
+# Conditional Resource Creation
+Conditions:
+  EnableAlarmsCondition: !Equals [!Ref EnableCloudWatchAlarms, 'true']
+
+# AWS Resources
+Resources:
+  # Dead Letter Queue - Must be created first
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${DLQName}-${AWS::StackName}"
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      VisibilityTimeoutSeconds: !Ref VisibilityTimeoutSeconds
+      Tags:
+        - Key: Name
+          Value: !Sub "${DLQName}-${AWS::StackName}"
+        - Key: Purpose
+          Value: Dead Letter Queue for failed message processing
+        - Key: Environment
+          Value: !Ref AWS::StackName
+        - Key: Application
+          Value: DLQ-Processing-System
+
+  # Main Processing Queue with DLQ Configuration
+  MainProcessingQueue:
+    Type: AWS::SQS::Queue
+    DependsOn: DeadLetterQueue
+    Properties:
+      QueueName: !Sub "${QueueName}-${AWS::StackName}"
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      VisibilityTimeoutSeconds: !Ref VisibilityTimeoutSeconds
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+      Tags:
+        - Key: Name
+          Value: !Sub "${QueueName}-${AWS::StackName}"
+        - Key: Purpose
+          Value: Main queue for order processing
+        - Key: Environment
+          Value: !Ref AWS::StackName
+        - Key: Application
+          Value: DLQ-Processing-System
+
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "DLQProcessingRole-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SQSAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt MainProcessingQueue.Arn
+                  - !GetAtt DeadLetterQueue.Arn
+              - Effect: Allow
+                Action:
+                  - sqs:ListQueues
+                Resource: !Sub "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:*"
+        - PolicyName: CloudWatchMetricsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    "cloudwatch:namespace": "DLQ/Processing"
+      Tags:
+        - Key: Name
+          Value: !Sub "DLQProcessingRole-${AWS::StackName}"
+        - Key: Purpose
+          Value: Execution role for DLQ processing Lambda functions
+        - Key: Environment
+          Value: !Ref AWS::StackName
+        - Key: Application
+          Value: DLQ-Processing-System
+
+  # Main Order Processing Lambda Function
+  OrderProcessorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaExecutionRole
+    Properties:
+      FunctionName: !Sub "${ProcessorFunctionName}-${AWS::StackName}"
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref ProcessorTimeout
+      MemorySize: !Ref ProcessorMemorySize
+      Description: Main order processing function with configurable failure simulation
+      Environment:
+        Variables:
+          FAILURE_SIMULATION_RATE: !Ref FailureSimulationRate
+          STACK_NAME: !Ref AWS::StackName
+      Code:
+        ZipFile: !Sub |
+          import json
+          import logging
+          import random
+          import os
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          # Get failure simulation rate from environment
+          FAILURE_RATE = float(os.environ.get('FAILURE_SIMULATION_RATE', '0.3'))
+          STACK_NAME = os.environ.get('STACK_NAME', 'unknown')
+          
+          def lambda_handler(event, context):
+              """
+              Main order processing function that simulates processing failures
+              """
+              processed_count = 0
+              failed_count = 0
+              
+              for record in event['Records']:
+                  try:
+                      # Parse the message
+                      message_body = json.loads(record['body'])
+                      order_id = message_body.get('orderId', 'unknown')
+                      order_value = message_body.get('orderValue', 0)
+                      
+                      logger.info(f"Processing order: {order_id} (value: ${order_value})")
+                      
+                      # Check for forced failure in test messages
+                      force_failure = message_body.get('forceFailure', False)
+                      
+                      # Simulate processing logic with configurable failure rate
+                      if force_failure or random.random() < FAILURE_RATE:
+                          failed_count += 1
+                          error_msg = f"Simulated processing failure for order {order_id}"
+                          logger.error(error_msg)
+                          raise Exception(error_msg)
+                      
+                      # Simulate successful processing
+                      processed_count += 1
+                      logger.info(f"Successfully processed order: {order_id}")
+                      
+                      # In real scenarios, you would:
+                      # - Validate order data
+                      # - Update inventory
+                      # - Process payment
+                      # - Send confirmation email
+                      # - Update order status in database
+                      
+                  except Exception as e:
+                      logger.error(f"Error processing message: {str(e)}")
+                      # Let SQS handle the retry mechanism
+                      raise e
+              
+              logger.info(f"Batch processing complete. Processed: {processed_count}, Failed: {failed_count}")
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': 'Processing completed',
+                      'processed': processed_count,
+                      'failed': failed_count,
+                      'stack': STACK_NAME
+                  })
+              }
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProcessorFunctionName}-${AWS::StackName}"
+        - Key: Purpose
+          Value: Main order processing function
+        - Key: Environment
+          Value: !Ref AWS::StackName
+        - Key: Application
+          Value: DLQ-Processing-System
+
+  # DLQ Monitor Lambda Function
+  DLQMonitorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaExecutionRole
+    Properties:
+      FunctionName: !Sub "${MonitorFunctionName}-${AWS::StackName}"
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref MonitorTimeout
+      MemorySize: !Ref MonitorMemorySize
+      Description: DLQ monitoring function for error analysis and automated recovery
+      Environment:
+        Variables:
+          MAIN_QUEUE_URL: !Ref MainProcessingQueue
+          STACK_NAME: !Ref AWS::StackName
+          DLQ_NAME: !Sub "${DLQName}-${AWS::StackName}"
+      Code:
+        ZipFile: !Sub |
+          import json
+          import logging
+          import boto3
+          import os
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          sqs = boto3.client('sqs')
+          cloudwatch = boto3.client('cloudwatch')
+          
+          # Environment variables
+          MAIN_QUEUE_URL = os.environ.get('MAIN_QUEUE_URL')
+          STACK_NAME = os.environ.get('STACK_NAME', 'unknown')
+          DLQ_NAME = os.environ.get('DLQ_NAME', 'unknown')
+          
+          def lambda_handler(event, context):
+              """
+              Monitor and analyze messages in the dead letter queue
+              """
+              analyzed_count = 0
+              retry_count = 0
+              permanent_failure_count = 0
+              
+              for record in event['Records']:
+                  try:
+                      # Parse the failed message
+                      message_body = json.loads(record['body'])
+                      receipt_handle = record['receiptHandle']
+                      
+                      # Extract error information
+                      order_id = message_body.get('orderId', 'unknown')
+                      order_value = message_body.get('orderValue', 0)
+                      error_count = int(record.get('attributes', {}).get('ApproximateReceiveCount', '1'))
+                      
+                      logger.info(f"Analyzing failed message for order: {order_id}")
+                      logger.info(f"Order value: ${order_value}, Error count: {error_count}")
+                      
+                      # Categorize error types
+                      error_category = categorize_error(message_body)
+                      
+                      # Log detailed error information
+                      logger.info(f"Error category: {error_category}")
+                      logger.info(f"Message attributes: {record.get('messageAttributes', {})}")
+                      
+                      # Create error metrics
+                      put_custom_metric('FailedMessages', 1, error_category)
+                      put_custom_metric('ErrorsByOrderValue', 1, get_order_value_category(order_value))
+                      
+                      # Determine if message should be retried
+                      if should_retry(message_body, error_count):
+                          logger.info(f"Message will be retried for order: {order_id}")
+                          send_to_retry_queue(message_body)
+                          retry_count += 1
+                      else:
+                          logger.warning(f"Message permanently failed for order: {order_id}")
+                          # In production, you might:
+                          # - Send to manual review queue
+                          # - Trigger alert for manual investigation
+                          # - Store in failure database for analysis
+                          permanent_failure_count += 1
+                      
+                      analyzed_count += 1
+                          
+                  except Exception as e:
+                      logger.error(f"Error processing DLQ message: {str(e)}")
+                      raise e
+              
+              logger.info(f"DLQ analysis complete. Analyzed: {analyzed_count}, Retried: {retry_count}, Permanent failures: {permanent_failure_count}")
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': 'DLQ monitoring completed',
+                      'analyzed': analyzed_count,
+                      'retried': retry_count,
+                      'permanent_failures': permanent_failure_count,
+                      'stack': STACK_NAME
+                  })
+              }
+          
+          def categorize_error(message_body):
+              """Categorize the type of error for better analysis"""
+              # In real scenarios, this would analyze the actual error
+              # For demo purposes, we'll categorize based on order value
+              order_value = message_body.get('orderValue', 0)
+              
+              if order_value > 1000:
+                  return 'HighValueOrder'
+              elif order_value > 100:
+                  return 'MediumValueOrder'
+              else:
+                  return 'LowValueOrder'
+          
+          def get_order_value_category(order_value):
+              """Get order value category for metrics"""
+              if order_value > 1000:
+                  return 'High'
+              elif order_value > 100:
+                  return 'Medium'
+              else:
+                  return 'Low'
+          
+          def should_retry(message_body, error_count):
+              """Determine if a message should be retried"""
+              # Retry logic based on error count and order characteristics
+              max_retries = 2
+              order_value = message_body.get('orderValue', 0)
+              
+              # High-value orders get more retry attempts
+              if order_value > 1000:
+                  max_retries = 5
+              elif order_value > 500:
+                  max_retries = 3
+              
+              # Don't retry messages that are forced to fail
+              if message_body.get('forceFailure', False):
+                  return False
+              
+              return error_count < max_retries
+          
+          def send_to_retry_queue(message_body):
+              """Send message back to main queue for retry"""
+              if MAIN_QUEUE_URL:
+                  try:
+                      # Add retry metadata
+                      message_body['retryTimestamp'] = datetime.utcnow().isoformat()
+                      
+                      sqs.send_message(
+                          QueueUrl=MAIN_QUEUE_URL,
+                          MessageBody=json.dumps(message_body),
+                          MessageAttributes={
+                              'RetryAttempt': {
+                                  'StringValue': 'true',
+                                  'DataType': 'String'
+                              },
+                              'OriginalFailureTime': {
+                                  'StringValue': datetime.utcnow().isoformat(),
+                                  'DataType': 'String'
+                              }
+                          }
+                      )
+                      logger.info("Message sent to retry queue")
+                  except Exception as e:
+                      logger.error(f"Failed to send message to retry queue: {str(e)}")
+          
+          def put_custom_metric(metric_name, value, dimension_value):
+              """Put custom CloudWatch metric"""
+              try:
+                  cloudwatch.put_metric_data(
+                      Namespace='DLQ/Processing',
+                      MetricData=[
+                          {
+                              'MetricName': metric_name,
+                              'Value': value,
+                              'Unit': 'Count',
+                              'Dimensions': [
+                                  {
+                                      'Name': 'ErrorCategory',
+                                      'Value': dimension_value
+                                  },
+                                  {
+                                      'Name': 'Stack',
+                                      'Value': STACK_NAME
+                                  }
+                              ]
+                          }
+                      ]
+                  )
+              except Exception as e:
+                  logger.error(f"Failed to put CloudWatch metric: {str(e)}")
+      Tags:
+        - Key: Name
+          Value: !Sub "${MonitorFunctionName}-${AWS::StackName}"
+        - Key: Purpose
+          Value: DLQ monitoring and error analysis function
+        - Key: Environment
+          Value: !Ref AWS::StackName
+        - Key: Application
+          Value: DLQ-Processing-System
+
+  # Event Source Mapping for Main Queue
+  MainQueueEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    DependsOn:
+      - OrderProcessorFunction
+      - MainProcessingQueue
+    Properties:
+      EventSourceArn: !GetAtt MainProcessingQueue.Arn
+      FunctionName: !GetAtt OrderProcessorFunction.Arn
+      BatchSize: !Ref MainQueueBatchSize
+      MaximumBatchingWindowInSeconds: !Ref MainQueueBatchingWindow
+      Enabled: true
+
+  # Event Source Mapping for DLQ
+  DLQEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    DependsOn:
+      - DLQMonitorFunction
+      - DeadLetterQueue
+    Properties:
+      EventSourceArn: !GetAtt DeadLetterQueue.Arn
+      FunctionName: !GetAtt DLQMonitorFunction.Arn
+      BatchSize: !Ref DLQBatchSize
+      MaximumBatchingWindowInSeconds: !Ref DLQBatchingWindow
+      Enabled: true
+
+  # CloudWatch Alarm for DLQ Message Count
+  DLQMessageCountAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlarmsCondition
+    Properties:
+      AlarmName: !Sub "DLQ-Messages-${AWS::StackName}"
+      AlarmDescription: Alert when messages appear in the dead letter queue
+      MetricName: ApproximateNumberOfVisibleMessages
+      Namespace: AWS/SQS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: !Ref DLQAlarmThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+      AlarmActions: []
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for High Error Rate
+  ErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlarmsCondition
+    Properties:
+      AlarmName: !Sub "DLQ-ErrorRate-${AWS::StackName}"
+      AlarmDescription: Alert on high error rate based on custom metrics
+      MetricName: FailedMessages
+      Namespace: DLQ/Processing
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref ErrorRateAlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: []
+      TreatMissingData: notBreaching
+
+  # CloudWatch Log Groups with retention
+  OrderProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProcessorFunctionName}-${AWS::StackName}"
+      RetentionInDays: 14
+
+  DLQMonitorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${MonitorFunctionName}-${AWS::StackName}"
+      RetentionInDays: 14
+
+# Template Outputs
+Outputs:
+  # Queue Information
+  MainQueueUrl:
+    Description: URL of the main processing queue
+    Value: !Ref MainProcessingQueue
+    Export:
+      Name: !Sub "${AWS::StackName}-MainQueueUrl"
+
+  MainQueueArn:
+    Description: ARN of the main processing queue
+    Value: !GetAtt MainProcessingQueue.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-MainQueueArn"
+
+  DeadLetterQueueUrl:
+    Description: URL of the dead letter queue
+    Value: !Ref DeadLetterQueue
+    Export:
+      Name: !Sub "${AWS::StackName}-DeadLetterQueueUrl"
+
+  DeadLetterQueueArn:
+    Description: ARN of the dead letter queue
+    Value: !GetAtt DeadLetterQueue.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-DeadLetterQueueArn"
+
+  # Lambda Function Information
+  OrderProcessorFunctionArn:
+    Description: ARN of the main order processing function
+    Value: !GetAtt OrderProcessorFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-OrderProcessorFunctionArn"
+
+  OrderProcessorFunctionName:
+    Description: Name of the main order processing function
+    Value: !Ref OrderProcessorFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-OrderProcessorFunctionName"
+
+  DLQMonitorFunctionArn:
+    Description: ARN of the DLQ monitoring function
+    Value: !GetAtt DLQMonitorFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-DLQMonitorFunctionArn"
+
+  DLQMonitorFunctionName:
+    Description: Name of the DLQ monitoring function
+    Value: !Ref DLQMonitorFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-DLQMonitorFunctionName"
+
+  # IAM Role Information
+  LambdaExecutionRoleArn:
+    Description: ARN of the Lambda execution role
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaExecutionRoleArn"
+
+  # CloudWatch Information
+  DLQMessageCountAlarmName:
+    Condition: EnableAlarmsCondition
+    Description: Name of the DLQ message count alarm
+    Value: !Ref DLQMessageCountAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-DLQMessageCountAlarmName"
+
+  ErrorRateAlarmName:
+    Condition: EnableAlarmsCondition
+    Description: Name of the error rate alarm
+    Value: !Ref ErrorRateAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-ErrorRateAlarmName"
+
+  # Testing Information
+  TestingInstructions:
+    Description: Instructions for testing the DLQ processing system
+    Value: !Sub |
+      To test the system:
+      1. Send test messages: aws sqs send-message --queue-url ${MainProcessingQueue} --message-body '{"orderId":"TEST-001","orderValue":500}'
+      2. Monitor logs: aws logs filter-log-events --log-group-name /aws/lambda/${ProcessorFunctionName}-${AWS::StackName}
+      3. Check DLQ: aws sqs get-queue-attributes --queue-url ${DeadLetterQueue} --attribute-names ApproximateNumberOfMessages
+      4. View metrics: CloudWatch console > Metrics > DLQ/Processing namespace
+
+  # Configuration Summary
+  ConfigurationSummary:
+    Description: Summary of key configuration parameters
+    Value: !Sub |
+      Stack: ${AWS::StackName}
+      Main Queue: ${QueueName}-${AWS::StackName}
+      DLQ: ${DLQName}-${AWS::StackName}
+      Max Receive Count: ${MaxReceiveCount}
+      Failure Simulation Rate: ${FailureSimulationRate}
+      Processor Timeout: ${ProcessorTimeout}s
+      Monitor Timeout: ${MonitorTimeout}s
+      CloudWatch Alarms: ${EnableCloudWatchAlarms}

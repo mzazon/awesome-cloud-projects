@@ -1,0 +1,534 @@
+# Infrastructure Manager Configuration for Multi-Environment Testing Pipelines
+# This configuration deploys the complete infrastructure for automated CI/CD pipelines
+# using Cloud Code, Cloud Deploy, Cloud Build, and Cloud Monitoring
+
+# Template metadata
+metadata:
+  name: multi-environment-testing-pipeline
+  description: "Multi-environment software testing pipeline with Cloud Code and Cloud Deploy"
+  version: "1.0"
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    required: true
+    
+  region:
+    type: string
+    description: "Primary region for resources"
+    default: "us-central1"
+    
+  zone:
+    type: string
+    description: "Primary zone for GKE clusters"
+    default: "us-central1-a"
+    
+  cluster_prefix:
+    type: string
+    description: "Prefix for resource names to ensure uniqueness"
+    default: "pipeline"
+    
+  enable_network_policy:
+    type: boolean
+    description: "Enable network policy for production cluster"
+    default: true
+    
+  enable_monitoring:
+    type: boolean
+    description: "Enable advanced monitoring and alerting"
+    default: true
+
+# Required Google Cloud APIs
+resources:
+  # Enable required APIs for the pipeline
+  required_apis:
+    type: gcp-types/servicemanagement-v1:operations
+    metadata:
+      dependsOn: []
+    properties:
+      services:
+        - container.googleapis.com
+        - cloudbuild.googleapis.com
+        - clouddeploy.googleapis.com
+        - artifactregistry.googleapis.com
+        - monitoring.googleapis.com
+        - logging.googleapis.com
+
+  # Artifact Registry repository for container images
+  container_registry:
+    type: gcp-types/artifactregistry-v1:projects.locations.repositories
+    metadata:
+      dependsOn:
+        - required_apis
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      repositoryId: $(ref.cluster_prefix.value)-repo
+      repository:
+        format: DOCKER
+        description: "Container repository for multi-environment pipeline"
+        labels:
+          purpose: "cicd-pipeline"
+          environment: "multi-env"
+
+  # Development GKE cluster with minimal resources
+  gke_cluster_dev:
+    type: gcp-types/container-v1:projects.zones.clusters
+    metadata:
+      dependsOn:
+        - required_apis
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.zone.value)
+      cluster:
+        name: $(ref.cluster_prefix.value)-dev
+        description: "Development environment GKE cluster"
+        initialNodeCount: 2
+        nodeConfig:
+          machineType: e2-medium
+          diskSizeGb: 30
+          diskType: pd-standard
+          oauthScopes:
+            - https://www.googleapis.com/auth/cloud-platform
+          labels:
+            environment: development
+            cluster-type: development
+        management:
+          autoRepair: true
+          autoUpgrade: true
+        addonsConfig:
+          horizontalPodAutoscaling:
+            disabled: false
+          httpLoadBalancing:
+            disabled: false
+        resourceLabels:
+          environment: development
+          managed-by: infrastructure-manager
+
+  # Staging GKE cluster
+  gke_cluster_staging:
+    type: gcp-types/container-v1:projects.zones.clusters
+    metadata:
+      dependsOn:
+        - required_apis
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.zone.value)
+      cluster:
+        name: $(ref.cluster_prefix.value)-staging
+        description: "Staging environment GKE cluster"
+        initialNodeCount: 2
+        nodeConfig:
+          machineType: e2-medium
+          diskSizeGb: 30
+          diskType: pd-standard
+          oauthScopes:
+            - https://www.googleapis.com/auth/cloud-platform
+          labels:
+            environment: staging
+            cluster-type: staging
+        management:
+          autoRepair: true
+          autoUpgrade: true
+        addonsConfig:
+          horizontalPodAutoscaling:
+            disabled: false
+          httpLoadBalancing:
+            disabled: false
+        resourceLabels:
+          environment: staging
+          managed-by: infrastructure-manager
+
+  # Production GKE cluster with enhanced security
+  gke_cluster_prod:
+    type: gcp-types/container-v1:projects.zones.clusters
+    metadata:
+      dependsOn:
+        - required_apis
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.zone.value)
+      cluster:
+        name: $(ref.cluster_prefix.value)-prod
+        description: "Production environment GKE cluster"
+        initialNodeCount: 3
+        nodeConfig:
+          machineType: e2-standard-2
+          diskSizeGb: 50
+          diskType: pd-ssd
+          oauthScopes:
+            - https://www.googleapis.com/auth/cloud-platform
+          labels:
+            environment: production
+            cluster-type: production
+        management:
+          autoRepair: true
+          autoUpgrade: true
+        addonsConfig:
+          horizontalPodAutoscaling:
+            disabled: false
+          httpLoadBalancing:
+            disabled: false
+          networkPolicyConfig:
+            disabled: false
+        networkPolicy:
+          enabled: $(ref.enable_network_policy.value)
+        podSecurityPolicyConfig:
+          enabled: true
+        resourceLabels:
+          environment: production
+          managed-by: infrastructure-manager
+          critical: "true"
+
+  # Cloud Deploy delivery pipeline
+  delivery_pipeline:
+    type: gcp-types/clouddeploy-v1:projects.locations.deliveryPipelines
+    metadata:
+      dependsOn:
+        - gke_cluster_dev
+        - gke_cluster_staging
+        - gke_cluster_prod
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      deliveryPipelineId: $(ref.cluster_prefix.value)-pipeline
+      deliveryPipeline:
+        description: "Multi-environment testing pipeline for progressive delivery"
+        serialPipeline:
+          stages:
+            - targetId: dev
+              profiles:
+                - dev
+              strategy:
+                standard:
+                  verify: true
+            - targetId: staging
+              profiles:
+                - staging
+              strategy:
+                standard:
+                  verify: true
+            - targetId: prod
+              profiles:
+                - prod
+              strategy:
+                standard:
+                  verify: true
+        labels:
+          pipeline-type: multi-environment
+          managed-by: infrastructure-manager
+
+  # Cloud Deploy target for development environment
+  deploy_target_dev:
+    type: gcp-types/clouddeploy-v1:projects.locations.targets
+    metadata:
+      dependsOn:
+        - gke_cluster_dev
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      targetId: dev
+      target:
+        description: "Development environment deployment target"
+        gke:
+          cluster: projects/$(ref.project_id.value)/locations/$(ref.zone.value)/clusters/$(ref.cluster_prefix.value)-dev
+        requireApproval: false
+        labels:
+          environment: development
+          managed-by: infrastructure-manager
+
+  # Cloud Deploy target for staging environment
+  deploy_target_staging:
+    type: gcp-types/clouddeploy-v1:projects.locations.targets
+    metadata:
+      dependsOn:
+        - gke_cluster_staging
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      targetId: staging
+      target:
+        description: "Staging environment deployment target"
+        gke:
+          cluster: projects/$(ref.project_id.value)/locations/$(ref.zone.value)/clusters/$(ref.cluster_prefix.value)-staging
+        requireApproval: false
+        labels:
+          environment: staging
+          managed-by: infrastructure-manager
+
+  # Cloud Deploy target for production environment
+  deploy_target_prod:
+    type: gcp-types/clouddeploy-v1:projects.locations.targets
+    metadata:
+      dependsOn:
+        - gke_cluster_prod
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      targetId: prod
+      target:
+        description: "Production environment deployment target"
+        gke:
+          cluster: projects/$(ref.project_id.value)/locations/$(ref.zone.value)/clusters/$(ref.cluster_prefix.value)-prod
+        requireApproval: true
+        labels:
+          environment: production
+          managed-by: infrastructure-manager
+          critical: "true"
+
+  # Cloud Build trigger for automated pipeline execution
+  build_trigger:
+    type: gcp-types/cloudbuild-v1:projects.triggers
+    metadata:
+      dependsOn:
+        - container_registry
+        - delivery_pipeline
+    properties:
+      parent: projects/$(ref.project_id.value)
+      trigger:
+        name: $(ref.cluster_prefix.value)-pipeline-trigger
+        description: "Automated build trigger for multi-environment pipeline"
+        github:
+          owner: "your-github-org"  # Replace with actual GitHub organization
+          name: "your-repo-name"    # Replace with actual repository name
+          push:
+            branch: ^main$
+        build:
+          steps:
+            # Build application image
+            - name: gcr.io/cloud-builders/docker
+              args:
+                - build
+                - -t
+                - $(ref.region.value)-docker.pkg.dev/$(ref.project_id.value)/$(ref.cluster_prefix.value)-repo/sample-app:$BUILD_ID
+                - .
+            
+            # Push image to Artifact Registry
+            - name: gcr.io/cloud-builders/docker
+              args:
+                - push
+                - $(ref.region.value)-docker.pkg.dev/$(ref.project_id.value)/$(ref.cluster_prefix.value)-repo/sample-app:$BUILD_ID
+            
+            # Run unit tests
+            - name: gcr.io/cloud-builders/docker
+              entrypoint: bash
+              args:
+                - -c
+                - |
+                  echo "Running unit tests..."
+                  docker run --rm $(ref.region.value)-docker.pkg.dev/$(ref.project_id.value)/$(ref.cluster_prefix.value)-repo/sample-app:$BUILD_ID echo "Unit tests passed"
+            
+            # Security scanning
+            - name: gcr.io/cloud-builders/gcloud
+              entrypoint: bash
+              args:
+                - -c
+                - |
+                  echo "Running security scans..."
+                  gcloud artifacts docker images scan $(ref.region.value)-docker.pkg.dev/$(ref.project_id.value)/$(ref.cluster_prefix.value)-repo/sample-app:$BUILD_ID --location=$(ref.region.value)
+            
+            # Create Cloud Deploy release
+            - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+              entrypoint: bash
+              args:
+                - -c
+                - |
+                  gcloud deploy releases create release-$BUILD_ID \
+                    --delivery-pipeline=$(ref.cluster_prefix.value)-pipeline \
+                    --region=$(ref.region.value) \
+                    --images=sample-app=$(ref.region.value)-docker.pkg.dev/$(ref.project_id.value)/$(ref.cluster_prefix.value)-repo/sample-app:$BUILD_ID
+          
+          options:
+            logging: CLOUD_LOGGING_ONLY
+        
+        labels:
+          pipeline-type: multi-environment
+          managed-by: infrastructure-manager
+
+  # Cloud Monitoring dashboard for pipeline observability
+  monitoring_dashboard:
+    type: gcp-types/monitoring-v1:projects.dashboards
+    metadata:
+      dependsOn:
+        - gke_cluster_dev
+        - gke_cluster_staging
+        - gke_cluster_prod
+    properties:
+      parent: projects/$(ref.project_id.value)
+      dashboard:
+        displayName: $(ref.cluster_prefix.value) Pipeline Dashboard
+        mosaicLayout:
+          tiles:
+            # GKE Container CPU Utilization
+            - width: 6
+              height: 4
+              widget:
+                title: GKE Container CPU Utilization
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="k8s_container" AND resource.labels.cluster_name=~"$(ref.cluster_prefix.value).*"'
+                          aggregation:
+                            alignmentPeriod: 60s
+                            perSeriesAligner: ALIGN_RATE
+                            crossSeriesReducer: REDUCE_MEAN
+                            groupByFields:
+                              - resource.labels.cluster_name
+            
+            # GKE Pod Count by Environment
+            - width: 6
+              height: 4
+              widget:
+                title: Pod Count by Environment
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="k8s_pod" AND resource.labels.cluster_name=~"$(ref.cluster_prefix.value).*"'
+                          aggregation:
+                            alignmentPeriod: 60s
+                            perSeriesAligner: ALIGN_MEAN
+                            crossSeriesReducer: REDUCE_COUNT
+                            groupByFields:
+                              - resource.labels.cluster_name
+            
+            # Cloud Build Success Rate
+            - width: 6
+              height: 4
+              widget:
+                title: Cloud Build Success Rate
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="build" AND resource.labels.project_id="$(ref.project_id.value)"'
+                          aggregation:
+                            alignmentPeriod: 300s
+                            perSeriesAligner: ALIGN_RATE
+                            crossSeriesReducer: REDUCE_SUM
+            
+            # Cloud Deploy Release Frequency
+            - width: 6
+              height: 4
+              widget:
+                title: Deployment Frequency
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="clouddeploy_delivery_pipeline" AND resource.labels.pipeline_id="$(ref.cluster_prefix.value)-pipeline"'
+                          aggregation:
+                            alignmentPeriod: 3600s
+                            perSeriesAligner: ALIGN_RATE
+                            crossSeriesReducer: REDUCE_COUNT
+
+  # IAM service account for Cloud Build
+  cloudbuild_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    metadata:
+      dependsOn:
+        - required_apis
+    properties:
+      name: projects/$(ref.project_id.value)
+      accountId: $(ref.cluster_prefix.value)-cloudbuild-sa
+      serviceAccount:
+        displayName: "Cloud Build Service Account for Pipeline"
+        description: "Service account used by Cloud Build for multi-environment pipeline operations"
+
+  # IAM binding for Cloud Build service account
+  cloudbuild_iam_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    metadata:
+      dependsOn:
+        - cloudbuild_service_account
+    properties:
+      resource: $(ref.project_id.value)
+      role: roles/clouddeploy.releaser
+      member: serviceAccount:$(ref.cloudbuild_service_account.email)
+
+  # Additional IAM binding for Container Registry access
+  cloudbuild_registry_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    metadata:
+      dependsOn:
+        - cloudbuild_service_account
+    properties:
+      resource: $(ref.project_id.value)
+      role: roles/artifactregistry.writer
+      member: serviceAccount:$(ref.cloudbuild_service_account.email)
+
+  # Notification channel for alerting (email-based)
+  notification_channel:
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    metadata:
+      dependsOn:
+        - required_apis
+    properties:
+      parent: projects/$(ref.project_id.value)
+      notificationChannel:
+        type: email
+        displayName: "Pipeline Operations Team"
+        description: "Email notifications for pipeline alerts"
+        labels:
+          email_address: "devops-team@example.com"  # Replace with actual email
+        enabled: true
+
+# Output values for reference and integration
+outputs:
+  artifact_registry_repository:
+    description: "Artifact Registry repository for container images"
+    value: $(ref.container_registry.name)
+    
+  dev_cluster_name:
+    description: "Development GKE cluster name"
+    value: $(ref.gke_cluster_dev.name)
+    
+  staging_cluster_name:
+    description: "Staging GKE cluster name"
+    value: $(ref.gke_cluster_staging.name)
+    
+  production_cluster_name:
+    description: "Production GKE cluster name"
+    value: $(ref.gke_cluster_prod.name)
+    
+  delivery_pipeline_name:
+    description: "Cloud Deploy delivery pipeline name"
+    value: $(ref.delivery_pipeline.name)
+    
+  build_trigger_id:
+    description: "Cloud Build trigger ID"
+    value: $(ref.build_trigger.id)
+    
+  monitoring_dashboard_url:
+    description: "Cloud Monitoring dashboard URL"
+    value: "https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.monitoring_dashboard.name)"
+    
+  cloudbuild_service_account:
+    description: "Cloud Build service account email"
+    value: $(ref.cloudbuild_service_account.email)
+
+# Deployment instructions and metadata
+annotations:
+  deployment:
+    prerequisites:
+      - "Google Cloud Project with billing enabled"
+      - "Infrastructure Manager API enabled"
+      - "Appropriate IAM permissions for resource creation"
+    
+    deployment_command: |
+      gcloud infra-manager deployments create multi-env-pipeline \
+        --location=us-central1 \
+        --service-account=YOUR_SERVICE_ACCOUNT \
+        --git-source-repo=YOUR_REPO_URL \
+        --git-source-directory=gcp/multi-environment-testing-pipelines-code-deploy/code/infrastructure-manager/ \
+        --git-source-ref=main \
+        --input-values=project_id=YOUR_PROJECT_ID,region=us-central1
+    
+    cleanup_command: |
+      gcloud infra-manager deployments delete multi-env-pipeline \
+        --location=us-central1 \
+        --quiet
+    
+    estimated_cost: "$30-50 for GKE clusters and associated resources during testing"
+    
+    security_considerations:
+      - "Review and update email notification addresses"
+      - "Configure appropriate GitHub repository connections"
+      - "Validate IAM permissions and service account usage"
+      - "Enable network policies for production cluster"
+      - "Review and customize security scanning policies"

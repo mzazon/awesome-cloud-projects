@@ -1,0 +1,490 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Operational Analytics with CloudWatch Insights - Complete infrastructure for log analysis, monitoring, and alerting'
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+Parameters:
+  Environment:
+    Type: String
+    Default: 'demo'
+    Description: 'Environment name for resource naming and tagging'
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+
+  EmailAddress:
+    Type: String
+    Description: 'Email address for operational alerts'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    Description: 'Number of days to retain CloudWatch logs'
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+  ErrorRateThreshold:
+    Type: Number
+    Default: 5
+    Description: 'Error count threshold for alarm (errors per 5-minute period)'
+    MinValue: 1
+    MaxValue: 100
+
+  LogVolumeThreshold:
+    Type: Number
+    Default: 10000
+    Description: 'Log volume threshold for cost alarm (logs per hour)'
+    MinValue: 1000
+    MaxValue: 100000
+
+  CreateDashboard:
+    Type: String
+    Default: 'true'
+    Description: 'Whether to create CloudWatch dashboard'
+    AllowedValues: ['true', 'false']
+
+  EnableAnomalyDetection:
+    Type: String
+    Default: 'true'
+    Description: 'Whether to enable CloudWatch anomaly detection'
+    AllowedValues: ['true', 'false']
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+Conditions:
+  ShouldCreateDashboard: !Equals [!Ref CreateDashboard, 'true']
+  ShouldEnableAnomalyDetection: !Equals [!Ref EnableAnomalyDetection, 'true']
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+
+  # ============================================================================
+  # IAM ROLES AND POLICIES
+  # ============================================================================
+  
+  # Lambda execution role for log generator
+  LogGeneratorExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'LogGeneratorRole-${Environment}-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Operational Analytics'
+
+  # ============================================================================
+  # CLOUDWATCH LOGS
+  # ============================================================================
+  
+  # Main log group for operational analytics
+  OperationalLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/operational-analytics-demo-${Environment}'
+      LogGroupClass: 'STANDARD'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Operational Analytics'
+
+  # Metric filter for error rate monitoring
+  ErrorRateMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref OperationalLogGroup
+      FilterName: 'ErrorRateFilter'
+      FilterPattern: '[timestamp, requestId, level="ERROR", ...]'
+      MetricTransformations:
+        - MetricNamespace: 'OperationalAnalytics'
+          MetricName: 'ErrorRate'
+          MetricValue: '1'
+          DefaultValue: 0
+
+  # Metric filter for log volume monitoring
+  LogVolumeMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref OperationalLogGroup
+      FilterName: 'LogVolumeFilter'
+      FilterPattern: ''
+      MetricTransformations:
+        - MetricNamespace: 'OperationalAnalytics'
+          MetricName: 'LogVolume'
+          MetricValue: '1'
+          DefaultValue: 0
+
+  # ============================================================================
+  # LAMBDA FUNCTION
+  # ============================================================================
+  
+  # Lambda function for generating sample log data
+  LogGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'log-generator-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LogGeneratorExecutionRole.Arn
+      Timeout: 30
+      Description: 'Generates sample log data for operational analytics demonstration'
+      Code:
+        ZipFile: |
+          import json
+          import random
+          import time
+          import logging
+          from datetime import datetime
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              # Generate various log patterns for analytics
+              log_patterns = [
+                  {"level": "INFO", "message": "User authentication successful", "user_id": f"user_{random.randint(1000, 9999)}", "response_time": random.randint(100, 500)},
+                  {"level": "ERROR", "message": "Database connection failed", "error_code": "DB_CONN_ERR", "retry_count": random.randint(1, 3)},
+                  {"level": "WARN", "message": "High memory usage detected", "memory_usage": random.randint(70, 95), "threshold": 80},
+                  {"level": "INFO", "message": "API request processed", "endpoint": f"/api/v1/users/{random.randint(1, 100)}", "method": random.choice(["GET", "POST", "PUT"])},
+                  {"level": "ERROR", "message": "Payment processing failed", "transaction_id": f"txn_{random.randint(100000, 999999)}", "amount": random.randint(10, 1000)},
+                  {"level": "INFO", "message": "Cache hit", "cache_key": f"user_profile_{random.randint(1, 1000)}", "hit_rate": random.uniform(0.7, 0.95)},
+                  {"level": "DEBUG", "message": "SQL query executed", "query_time": random.randint(50, 2000), "table": random.choice(["users", "orders", "products"])},
+                  {"level": "WARN", "message": "Rate limit approaching", "current_rate": random.randint(80, 99), "limit": 100}
+              ]
+              
+              # Generate 5-10 random log entries
+              for i in range(random.randint(5, 10)):
+                  log_entry = random.choice(log_patterns)
+                  log_entry["timestamp"] = datetime.utcnow().isoformat()
+                  log_entry["request_id"] = f"req_{random.randint(1000000, 9999999)}"
+                  
+                  # Log with different levels
+                  if log_entry["level"] == "ERROR":
+                      logger.error(json.dumps(log_entry))
+                  elif log_entry["level"] == "WARN":
+                      logger.warning(json.dumps(log_entry))
+                  elif log_entry["level"] == "DEBUG":
+                      logger.debug(json.dumps(log_entry))
+                  else:
+                      logger.info(json.dumps(log_entry))
+                  
+                  # Small delay to spread timestamps
+                  time.sleep(0.1)
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Log generation completed')
+              }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Operational Analytics'
+
+  # ============================================================================
+  # SNS TOPIC AND SUBSCRIPTION
+  # ============================================================================
+  
+  # SNS topic for operational alerts
+  OperationalAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'operational-alerts-${Environment}'
+      DisplayName: 'Operational Analytics Alerts'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Operational Analytics'
+
+  # Email subscription for alerts
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref OperationalAlertsTopic
+      Protocol: email
+      Endpoint: !Ref EmailAddress
+
+  # ============================================================================
+  # CLOUDWATCH ALARMS
+  # ============================================================================
+  
+  # Alarm for high error rate
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'HighErrorRate-${Environment}'
+      AlarmDescription: 'Alert when error rate exceeds threshold'
+      MetricName: 'ErrorRate'
+      Namespace: 'OperationalAnalytics'
+      Statistic: 'Sum'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref ErrorRateThreshold
+      ComparisonOperator: 'GreaterThanThreshold'
+      AlarmActions:
+        - !Ref OperationalAlertsTopic
+      OKActions:
+        - !Ref OperationalAlertsTopic
+      TreatMissingData: 'notBreaching'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Operational Analytics'
+
+  # Alarm for excessive log volume (cost protection)
+  HighLogVolumeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'HighLogVolume-${Environment}'
+      AlarmDescription: 'Alert when log volume exceeds budget threshold'
+      MetricName: 'LogVolume'
+      Namespace: 'OperationalAnalytics'
+      Statistic: 'Sum'
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: !Ref LogVolumeThreshold
+      ComparisonOperator: 'GreaterThanThreshold'
+      AlarmActions:
+        - !Ref OperationalAlertsTopic
+      TreatMissingData: 'notBreaching'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Cost Protection'
+
+  # ============================================================================
+  # ANOMALY DETECTION
+  # ============================================================================
+  
+  # Anomaly detector for log ingestion patterns
+  LogIngestionAnomalyDetector:
+    Type: AWS::CloudWatch::AnomalyDetector
+    Condition: ShouldEnableAnomalyDetection
+    Properties:
+      MetricName: 'IncomingBytes'
+      Namespace: 'AWS/Logs'
+      Stat: 'Average'
+      Dimensions:
+        - Name: LogGroupName
+          Value: !Ref OperationalLogGroup
+
+  # Alarm for log ingestion anomalies
+  LogIngestionAnomalyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldEnableAnomalyDetection
+    Properties:
+      AlarmName: !Sub 'LogIngestionAnomaly-${Environment}'
+      AlarmDescription: 'Detect anomalies in log ingestion patterns'
+      ComparisonOperator: 'LessThanLowerOrGreaterThanUpperThreshold'
+      EvaluationPeriods: 2
+      Metrics:
+        - Id: m1
+          MetricStat:
+            Metric:
+              Namespace: 'AWS/Logs'
+              MetricName: 'IncomingBytes'
+              Dimensions:
+                - Name: LogGroupName
+                  Value: !Ref OperationalLogGroup
+            Period: 300
+            Stat: 'Average'
+        - Id: ad1
+          Expression: 'ANOMALY_DETECTION_FUNCTION(m1, 2)'
+      ThresholdMetricId: ad1
+      AlarmActions:
+        - !Ref OperationalAlertsTopic
+      TreatMissingData: 'breaching'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Anomaly Detection'
+
+  # ============================================================================
+  # CLOUDWATCH DASHBOARD
+  # ============================================================================
+  
+  # Operational analytics dashboard
+  OperationalAnalyticsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: ShouldCreateDashboard
+    Properties:
+      DashboardName: !Sub 'OperationalAnalytics-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "log",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "Error Analysis",
+                "query": "SOURCE '${OperationalLogGroup}' | fields @timestamp, @message\n| filter @message like /ERROR/\n| stats count() as error_count by bin(5m)\n| sort @timestamp desc\n| limit 50",
+                "region": "${AWS::Region}",
+                "view": "table",
+                "stacked": false
+              }
+            },
+            {
+              "type": "log",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "Performance Metrics",
+                "query": "SOURCE '${OperationalLogGroup}' | fields @timestamp, @message\n| filter @message like /response_time/\n| parse @message '\"response_time\": *' as response_time\n| stats avg(response_time) as avg_response_time, max(response_time) as max_response_time by bin(1m)\n| sort @timestamp desc",
+                "region": "${AWS::Region}",
+                "view": "table",
+                "stacked": false
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "title": "Top Active Users",
+                "query": "SOURCE '${OperationalLogGroup}' | fields @timestamp, @message\n| filter @message like /user_id/\n| parse @message '\"user_id\": \"*\"' as user_id\n| stats count() as activity_count by user_id\n| sort activity_count desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "view": "table",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["OperationalAnalytics", "ErrorRate"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Error Rate Trend",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Logs", "IncomingBytes", "LogGroupName", "${OperationalLogGroup}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Log Ingestion Volume",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            }
+          ]
+        }
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+Outputs:
+  LogGroupName:
+    Description: 'Name of the CloudWatch log group'
+    Value: !Ref OperationalLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupName'
+
+  LogGroupArn:
+    Description: 'ARN of the CloudWatch log group'
+    Value: !GetAtt OperationalLogGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupArn'
+
+  LambdaFunctionName:
+    Description: 'Name of the log generator Lambda function'
+    Value: !Ref LogGeneratorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the log generator Lambda function'
+    Value: !GetAtt LogGeneratorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for alerts'
+    Value: !Ref OperationalAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  DashboardURL:
+    Condition: ShouldCreateDashboard
+    Description: 'URL to the CloudWatch dashboard'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${OperationalAnalyticsDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  ErrorRateAlarmName:
+    Description: 'Name of the error rate alarm'
+    Value: !Ref HighErrorRateAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-ErrorRateAlarmName'
+
+  LogVolumeAlarmName:
+    Description: 'Name of the log volume alarm'
+    Value: !Ref HighLogVolumeAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-LogVolumeAlarmName'
+
+  AnomalyAlarmName:
+    Condition: ShouldEnableAnomalyDetection
+    Description: 'Name of the anomaly detection alarm'
+    Value: !Ref LogIngestionAnomalyAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-AnomalyAlarmName'
+
+  SampleInsightsQueries:
+    Description: 'Sample CloudWatch Insights queries for operational analytics'
+    Value: !Sub |
+      Error Analysis: fields @timestamp, @message | filter @message like /ERROR/ | stats count() as error_count by bin(5m) | sort @timestamp desc | limit 50
+      Performance: fields @timestamp, @message | filter @message like /response_time/ | parse @message '"response_time": *' as response_time | stats avg(response_time) as avg_response_time by bin(1m)
+      User Activity: fields @timestamp, @message | filter @message like /user_id/ | parse @message '"user_id": "*"' as user_id | stats count() by user_id | sort count desc | limit 20
+
+  DeploymentInstructions:
+    Description: 'Next steps after deployment'
+    Value: !Sub |
+      1. Confirm email subscription in your inbox
+      2. Generate sample data: aws lambda invoke --function-name ${LogGeneratorFunction} --payload '{}' output.txt
+      3. Access dashboard: https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${OperationalAnalyticsDashboard}
+      4. View logs: https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/${OperationalLogGroup}
+      5. Test Insights: https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:logs-insights

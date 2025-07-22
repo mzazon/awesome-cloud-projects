@@ -1,0 +1,473 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS IoT Device Shadows for State Management
+  This template creates the complete infrastructure for managing IoT device state
+  using AWS IoT Device Shadows, including IoT Thing, certificates, policies,
+  Lambda function for processing shadow updates, DynamoDB for state history,
+  and IoT Rules Engine for event-driven processing.
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'smart-thermostat'
+    Description: 'Name prefix for all resources'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+
+  ThingTypeName:
+    Type: String
+    Default: 'Thermostat'
+    Description: 'IoT Thing Type for device categorization'
+    MinLength: 1
+    MaxLength: 128
+
+  DeviceManufacturer:
+    Type: String
+    Default: 'SmartHome'
+    Description: 'Device manufacturer name for Thing attributes'
+    MinLength: 1
+    MaxLength: 50
+
+  DeviceModel:
+    Type: String
+    Default: 'TH-2024'
+    Description: 'Device model name for Thing attributes'
+    MinLength: 1
+    MaxLength: 50
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 128
+    Description: 'Memory allocation for Lambda function (MB)'
+    MinValue: 128
+    MaxValue: 3008
+    ConstraintDescription: 'Must be between 128 and 3008 MB'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    Description: 'Timeout for Lambda function (seconds)'
+    MinValue: 3
+    MaxValue: 900
+    ConstraintDescription: 'Must be between 3 and 900 seconds'
+
+  EnableDynamoDBPointInTimeRecovery:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable Point-in-Time Recovery for DynamoDB table'
+
+  DynamoDBBillingMode:
+    Type: String
+    Default: 'PAY_PER_REQUEST'
+    AllowedValues: ['PAY_PER_REQUEST', 'PROVISIONED']
+    Description: 'DynamoDB billing mode'
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+Conditions:
+  EnablePointInTimeRecovery: !Equals [!Ref EnableDynamoDBPointInTimeRecovery, 'true']
+  IsProvisionedBilling: !Equals [!Ref DynamoDBBillingMode, 'PROVISIONED']
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+  # IoT Thing for device representation
+  IoTThing:
+    Type: AWS::IoT::Thing
+    Properties:
+      ThingName: !Sub '${ProjectName}-${AWS::AccountId}'
+      ThingTypeName: !Ref ThingTypeName
+      AttributePayload:
+        Attributes:
+          manufacturer: !Ref DeviceManufacturer
+          model: !Ref DeviceModel
+          projectName: !Ref ProjectName
+          deploymentDate: !Sub '${AWS::Timestamp}'
+
+  # Certificate and keys for device authentication
+  IoTCertificate:
+    Type: AWS::IoT::Certificate
+    Properties:
+      Status: ACTIVE
+      CertificateSigningRequest: !Sub |
+        -----BEGIN CERTIFICATE REQUEST-----
+        MIICWjCCAUICAQAwFTETMBEGA1UEAwwK${ProjectName}1eTAJBgUrDgMCGgUAA4GBAD
+        -----END CERTIFICATE REQUEST-----
+
+  # IoT Policy for device permissions
+  IoTPolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-device-policy-${AWS::AccountId}'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow device to connect using its Thing name as client ID
+          - Effect: Allow
+            Action:
+              - 'iot:Connect'
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/${iot:Connection.Thing.ThingName}'
+          # Allow device to subscribe and receive shadow topic messages
+          - Effect: Allow
+            Action:
+              - 'iot:Subscribe'
+              - 'iot:Receive'
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/$aws/things/${iot:Connection.Thing.ThingName}/shadow/*'
+          # Allow device to publish to shadow topics
+          - Effect: Allow
+            Action:
+              - 'iot:Publish'
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/things/${iot:Connection.Thing.ThingName}/shadow/*'
+
+  # Attach policy to certificate
+  PolicyCertificateAttachment:
+    Type: AWS::IoT::PolicyPrincipalAttachment
+    Properties:
+      PolicyName: !Ref IoTPolicy
+      Principal: !GetAtt IoTCertificate.Arn
+
+  # Attach certificate to Thing
+  ThingCertificateAttachment:
+    Type: AWS::IoT::ThingPrincipalAttachment
+    Properties:
+      ThingName: !Ref IoTThing
+      Principal: !GetAtt IoTCertificate.Arn
+
+  # DynamoDB table for device state history
+  DeviceStateHistoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-state-history-${AWS::AccountId}'
+      BillingMode: !Ref DynamoDBBillingMode
+      AttributeDefinitions:
+        - AttributeName: 'ThingName'
+          AttributeType: 'S'
+        - AttributeName: 'Timestamp'
+          AttributeType: 'N'
+      KeySchema:
+        - AttributeName: 'ThingName'
+          KeyType: 'HASH'
+        - AttributeName: 'Timestamp'
+          KeyType: 'RANGE'
+      # Optional provisioned throughput for PROVISIONED billing mode
+      ProvisionedThroughput: !If
+        - IsProvisionedBilling
+        - ReadCapacityUnits: 5
+          WriteCapacityUnits: 5
+        - !Ref 'AWS::NoValue'
+      # Point-in-time recovery configuration
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnablePointInTimeRecovery, true, false]
+      # Time To Live configuration for automatic data cleanup (optional)
+      TimeToLiveSpecification:
+        AttributeName: 'ttl'
+        Enabled: false
+      # Tags for resource management
+      Tags:
+        - Key: 'Application'
+          Value: 'IoTShadowDemo'
+        - Key: 'ProjectName'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: 'Demo'
+
+  # IAM role for Lambda execution
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${AWS::AccountId}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: 'DynamoDBWriteAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                Resource: !GetAtt DeviceStateHistoryTable.Arn
+      Tags:
+        - Key: 'Application'
+          Value: 'IoTShadowDemo'
+        - Key: 'ProjectName'
+          Value: !Ref ProjectName
+
+  # Lambda function for processing shadow updates
+  ShadowProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-shadow-processor-${AWS::AccountId}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DeviceStateHistoryTable
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import time
+          import os
+          from decimal import Decimal
+          
+          # Initialize DynamoDB resource
+          dynamodb = boto3.resource('dynamodb')
+          
+          def lambda_handler(event, context):
+              """
+              Process IoT Device Shadow update events and store state history in DynamoDB.
+              
+              Args:
+                  event: IoT Shadow update event containing thingName and state data
+                  context: Lambda execution context
+              
+              Returns:
+                  dict: Response with statusCode and message
+              """
+              try:
+                  print(f"Received shadow update event: {json.dumps(event)}")
+                  
+                  # Extract thing name and shadow data from event
+                  thing_name = event.get('thingName')
+                  shadow_data = event.get('state', {})
+                  
+                  if not thing_name:
+                      raise ValueError("Missing thingName in event")
+                  
+                  # Get DynamoDB table
+                  table = dynamodb.Table(os.environ['TABLE_NAME'])
+                  
+                  # Convert float values to Decimal for DynamoDB compatibility
+                  def convert_floats(obj):
+                      if isinstance(obj, float):
+                          return Decimal(str(obj))
+                      elif isinstance(obj, dict):
+                          return {k: convert_floats(v) for k, v in obj.items()}
+                      elif isinstance(obj, list):
+                          return [convert_floats(v) for v in obj]
+                      return obj
+                  
+                  # Prepare DynamoDB item
+                  timestamp = int(time.time())
+                  item = {
+                      'ThingName': thing_name,
+                      'Timestamp': timestamp,
+                      'ShadowState': convert_floats(shadow_data),
+                      'EventType': 'shadow_update',
+                      'ProjectName': os.environ.get('PROJECT_NAME', 'unknown'),
+                      'ProcessedAt': int(time.time())
+                  }
+                  
+                  # Store item in DynamoDB
+                  table.put_item(Item=item)
+                  
+                  print(f"Successfully processed shadow update for {thing_name} at timestamp {timestamp}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Successfully processed shadow update',
+                          'thingName': thing_name,
+                          'timestamp': timestamp
+                      })
+                  }
+                  
+              except Exception as e:
+                  error_message = f"Error processing shadow update: {str(e)}"
+                  print(error_message)
+                  
+                  # Return error response
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': error_message
+                      })
+                  }
+      Description: 'Processes IoT Device Shadow updates and stores state history'
+      Tags:
+        - Key: 'Application'
+          Value: 'IoTShadowDemo'
+        - Key: 'ProjectName'
+          Value: !Ref ProjectName
+
+  # Lambda permission for IoT to invoke the function
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ShadowProcessorFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'iot.amazonaws.com'
+      SourceArn: !GetAtt ShadowUpdateRule.Arn
+
+  # IoT Rule for processing shadow updates
+  ShadowUpdateRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub '${ProjectName}ShadowUpdateRule${AWS::AccountId}'
+      TopicRulePayload:
+        Description: 'Process Device Shadow updates and trigger Lambda function'
+        Sql: "SELECT * FROM '$aws/things/+/shadow/update/accepted'"
+        RuleDisabled: false
+        Actions:
+          - Lambda:
+              FunctionArn: !GetAtt ShadowProcessorFunction.Arn
+        # Error handling action (optional)
+        ErrorAction:
+          CloudwatchLogs:
+            LogGroupName: !Sub '/aws/iot/rules/${ProjectName}-shadow-errors'
+            RoleArn: !GetAtt IoTRuleErrorRole.Arn
+
+  # IAM role for IoT Rule error logging
+  IoTRuleErrorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-iot-rule-error-role-${AWS::AccountId}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'CloudWatchLogsAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/iot/rules/${ProjectName}-shadow-errors*'
+
+  # CloudWatch Log Group for IoT Rule errors
+  IoTRuleErrorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/iot/rules/${ProjectName}-shadow-errors'
+      RetentionInDays: 7
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+Outputs:
+  IoTThingName:
+    Description: 'Name of the created IoT Thing'
+    Value: !Ref IoTThing
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTThingName'
+
+  IoTThingArn:
+    Description: 'ARN of the created IoT Thing'
+    Value: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:thing/${IoTThing}'
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTThingArn'
+
+  IoTCertificateId:
+    Description: 'Certificate ID for the IoT Thing'
+    Value: !Ref IoTCertificate
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTCertificateId'
+
+  IoTCertificateArn:
+    Description: 'ARN of the IoT Certificate'
+    Value: !GetAtt IoTCertificate.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTCertificateArn'
+
+  IoTPolicyName:
+    Description: 'Name of the IoT Policy'
+    Value: !Ref IoTPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTPolicyName'
+
+  DynamoDBTableName:
+    Description: 'Name of the DynamoDB table for state history'
+    Value: !Ref DeviceStateHistoryTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableName'
+
+  DynamoDBTableArn:
+    Description: 'ARN of the DynamoDB table'
+    Value: !GetAtt DeviceStateHistoryTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableArn'
+
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function processing shadow updates'
+    Value: !Ref ShadowProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function'
+    Value: !GetAtt ShadowProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  IoTRuleName:
+    Description: 'Name of the IoT Rule for shadow processing'
+    Value: !Ref ShadowUpdateRule
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTRuleName'
+
+  IoTRuleArn:
+    Description: 'ARN of the IoT Rule'
+    Value: !GetAtt ShadowUpdateRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTRuleArn'
+
+  IoTEndpoint:
+    Description: 'IoT Core endpoint for device connections'
+    Value: !Sub '${AWS::AccountId}.iot.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTEndpoint'
+
+  ShadowTopicPrefix:
+    Description: 'MQTT topic prefix for device shadow operations'
+    Value: !Sub '$aws/things/${IoTThing}/shadow'
+    Export:
+      Name: !Sub '${AWS::StackName}-ShadowTopicPrefix'
+
+  SampleShadowUpdateCommand:
+    Description: 'Sample AWS CLI command to update device shadow'
+    Value: !Sub |
+      aws iot-data update-thing-shadow \
+        --thing-name ${IoTThing} \
+        --payload '{"state":{"reported":{"temperature":22.5,"humidity":45}}}' \
+        /tmp/shadow-response.json
+
+  SampleShadowGetCommand:
+    Description: 'Sample AWS CLI command to get device shadow'
+    Value: !Sub |
+      aws iot-data get-thing-shadow \
+        --thing-name ${IoTThing} \
+        /tmp/shadow-current.json
+
+  DeploymentTimestamp:
+    Description: 'Timestamp when the stack was deployed'
+    Value: !Sub '${AWS::Timestamp}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentTimestamp'

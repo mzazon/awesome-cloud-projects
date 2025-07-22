@@ -1,0 +1,1161 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Database Query Caching with ElastiCache Redis - Production-ready template that deploys
+  a highly available Redis cluster with RDS MySQL database, EC2 test instance, and 
+  supporting network infrastructure for implementing cache-aside patterns.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Environment Configuration
+        Parameters:
+          - Environment
+          - ProjectName
+          - OwnerEmail
+      - Label:
+          default: Network Configuration
+        Parameters:
+          - VpcId
+          - PrivateSubnetIds
+          - PublicSubnetIds
+          - AllowedCIDR
+      - Label:
+          default: ElastiCache Configuration
+        Parameters:
+          - CacheNodeType
+          - NumCacheNodes
+          - CacheParameterGroupFamily
+          - EvictionPolicy
+      - Label:
+          default: RDS Configuration
+        Parameters:
+          - DBInstanceClass
+          - DBAllocatedStorage
+          - DBUsername
+          - DBPassword
+          - DBBackupRetentionPeriod
+      - Label:
+          default: EC2 Configuration
+        Parameters:
+          - EC2InstanceType
+          - LatestAmiId
+          - KeyPairName
+    ParameterLabels:
+      Environment:
+        default: Environment Name
+      ProjectName:
+        default: Project Name
+      OwnerEmail:
+        default: Owner Email
+      VpcId:
+        default: VPC ID
+      PrivateSubnetIds:
+        default: Private Subnet IDs
+      PublicSubnetIds:
+        default: Public Subnet IDs
+      AllowedCIDR:
+        default: Allowed CIDR Block
+      CacheNodeType:
+        default: Cache Node Type
+      NumCacheNodes:
+        default: Number of Cache Nodes
+      CacheParameterGroupFamily:
+        default: Cache Parameter Group Family
+      EvictionPolicy:
+        default: Memory Eviction Policy
+      DBInstanceClass:
+        default: Database Instance Class
+      DBAllocatedStorage:
+        default: Database Storage (GB)
+      DBUsername:
+        default: Database Username
+      DBPassword:
+        default: Database Password
+      DBBackupRetentionPeriod:
+        default: Backup Retention (Days)
+      EC2InstanceType:
+        default: EC2 Instance Type
+      LatestAmiId:
+        default: Latest AMI ID
+      KeyPairName:
+        default: EC2 Key Pair Name
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name for resource tagging and configuration
+
+  ProjectName:
+    Type: String
+    Default: database-caching
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9-]*$
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters and hyphens
+    Description: Project name used for resource naming and tagging
+
+  OwnerEmail:
+    Type: String
+    Default: admin@example.com
+    AllowedPattern: ^[^\s@]+@[^\s@]+\.[^\s@]+$
+    ConstraintDescription: Must be a valid email address
+    Description: Email address of the resource owner for tagging and notifications
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where resources will be deployed
+
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of private subnet IDs for ElastiCache and RDS deployment (minimum 2 required)
+
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of public subnet IDs for EC2 instance deployment
+
+  AllowedCIDR:
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$
+    ConstraintDescription: Must be a valid CIDR block (e.g., 10.0.0.0/16)
+    Description: CIDR block allowed to access the cache and database
+
+  CacheNodeType:
+    Type: String
+    Default: cache.t3.micro
+    AllowedValues:
+      - cache.t3.micro
+      - cache.t3.small
+      - cache.t3.medium
+      - cache.m6g.large
+      - cache.m6g.xlarge
+      - cache.r6g.large
+      - cache.r6g.xlarge
+    Description: ElastiCache node type for Redis cluster
+
+  NumCacheNodes:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    MaxValue: 6
+    Description: Number of cache nodes in the replication group (minimum 2 for high availability)
+
+  CacheParameterGroupFamily:
+    Type: String
+    Default: redis7.x
+    AllowedValues:
+      - redis6.x
+      - redis7.x
+    Description: Redis parameter group family version
+
+  EvictionPolicy:
+    Type: String
+    Default: allkeys-lru
+    AllowedValues:
+      - allkeys-lru
+      - allkeys-lfu
+      - allkeys-random
+      - volatile-lru
+      - volatile-lfu
+      - volatile-random
+      - volatile-ttl
+      - noeviction
+    Description: Memory eviction policy for Redis when memory limit is reached
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+      - db.t3.large
+      - db.m5.large
+      - db.m5.xlarge
+    Description: RDS instance type for MySQL database
+
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 1000
+    Description: Database storage size in GB
+
+  DBUsername:
+    Type: String
+    Default: admin
+    MinLength: 3
+    MaxLength: 16
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9]*$
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters
+    Description: Master username for the database
+
+  DBPassword:
+    Type: String
+    Default: TempPassword123!
+    MinLength: 8
+    MaxLength: 41
+    NoEcho: true
+    AllowedPattern: ^[a-zA-Z0-9!@#$%^&*()_+-=]*$
+    ConstraintDescription: Must be 8-41 characters with letters, numbers, and special characters
+    Description: Master password for the database (change after deployment)
+
+  DBBackupRetentionPeriod:
+    Type: Number
+    Default: 7
+    MinValue: 0
+    MaxValue: 35
+    Description: Number of days to retain database backups
+
+  EC2InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+    Description: EC2 instance type for testing cache integration
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: Latest Amazon Linux 2 AMI ID (automatically resolved)
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access to test instance
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+  IsDevEnvironment: !Equals [!Ref Environment, dev]
+  EnableBackups: !Not [!Equals [!Ref DBBackupRetentionPeriod, 0]]
+
+Resources:
+  # Security Groups
+  CacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectName}-cache-security-group-${Environment}
+      GroupDescription: Security group for ElastiCache Redis cluster
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          CidrIp: !Ref AllowedCIDR
+          Description: Redis access from allowed CIDR
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+          Description: Redis access from EC2 instances
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-cache-sg-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Owner
+          Value: !Ref OwnerEmail
+        - Key: Purpose
+          Value: ElastiCache Redis Security
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectName}-database-security-group-${Environment}
+      GroupDescription: Security group for RDS MySQL database
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: !Ref AllowedCIDR
+          Description: MySQL access from allowed CIDR
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+          Description: MySQL access from EC2 instances
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-database-sg-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Owner
+          Value: !Ref OwnerEmail
+        - Key: Purpose
+          Value: RDS MySQL Security
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectName}-ec2-security-group-${Environment}
+      GroupDescription: Security group for EC2 test instances
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedCIDR
+          Description: SSH access from allowed CIDR
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AllowedCIDR
+          Description: HTTP access for testing
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref AllowedCIDR
+          Description: HTTPS access for testing
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-ec2-sg-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Owner
+          Value: !Ref OwnerEmail
+        - Key: Purpose
+          Value: EC2 Test Instance Security
+
+  # ElastiCache Resources
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      CacheSubnetGroupName: !Sub ${ProjectName}-cache-subnet-group-${Environment}
+      Description: Subnet group for ElastiCache Redis cluster
+      SubnetIds: !Ref PrivateSubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-cache-subnet-group-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Owner
+          Value: !Ref OwnerEmail
+
+  CacheParameterGroup:
+    Type: AWS::ElastiCache::ParameterGroup
+    Properties:
+      CacheParameterGroupName: !Sub ${ProjectName}-cache-params-${Environment}
+      CacheParameterGroupFamily: !Ref CacheParameterGroupFamily
+      Description: Custom parameter group for database caching optimization
+      Properties:
+        maxmemory-policy: !Ref EvictionPolicy
+        timeout: '300'
+        tcp-keepalive: '60'
+        maxclients: '1000'
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-cache-params-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Owner
+          Value: !Ref OwnerEmail
+
+  RedisReplicationGroup:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: !Sub ${ProjectName}-redis-${Environment}
+      Description: Redis replication group for database query caching
+      Engine: redis
+      EngineVersion: !If
+        - IsProduction
+        - '7.0'
+        - '7.0'
+      CacheNodeType: !Ref CacheNodeType
+      NumCacheClusters: !Ref NumCacheNodes
+      Port: 6379
+      CacheParameterGroupName: !Ref CacheParameterGroup
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      SecurityGroupIds:
+        - !Ref CacheSecurityGroup
+      AutomaticFailoverEnabled: true
+      MultiAZEnabled: true
+      PreferredMaintenanceWindow: sun:03:00-sun:04:00
+      SnapshotRetentionLimit: !If
+        - IsProduction
+        - 7
+        - 1
+      SnapshotWindow: 02:00-03:00
+      TransitEncryptionEnabled: !If
+        - IsProduction
+        - true
+        - false
+      AtRestEncryptionEnabled: !If
+        - IsProduction
+        - true
+        - false
+      NotificationTopicArn: !If
+        - IsProduction
+        - !Ref CacheNotificationTopic
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-redis-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Owner
+          Value: !Ref OwnerEmail
+        - Key: Purpose
+          Value: Database Query Caching
+
+  # RDS Resources
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub ${ProjectName}-db-subnet-group-${Environment}
+      DBSubnetGroupDescription: Subnet group for RDS MySQL database
+      SubnetIds: !Ref PrivateSubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-db-subnet-group-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Owner
+          Value: !Ref OwnerEmail
+
+  DBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      DBParameterGroupName: !Sub ${ProjectName}-db-params-${Environment}
+      Family: mysql8.0
+      Description: Custom parameter group for MySQL database optimization
+      Parameters:
+        innodb_buffer_pool_size: '{DBInstanceClassMemory*3/4}'
+        query_cache_size: '268435456'
+        query_cache_type: '1'
+        slow_query_log: '1'
+        long_query_time: '2'
+        log_queries_not_using_indexes: '1'
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-db-params-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Owner
+          Value: !Ref OwnerEmail
+
+  MySQLDatabase:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: !If
+      - IsProduction
+      - Snapshot
+      - Delete
+    Properties:
+      DBInstanceIdentifier: !Sub ${ProjectName}-mysql-${Environment}
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: mysql
+      EngineVersion: '8.0.35'
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      AllocatedStorage: !Ref DBAllocatedStorage
+      StorageType: gp2
+      StorageEncrypted: !If
+        - IsProduction
+        - true
+        - false
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      DBParameterGroupName: !Ref DBParameterGroup
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      BackupRetentionPeriod: !Ref DBBackupRetentionPeriod
+      PreferredBackupWindow: 04:00-05:00
+      PreferredMaintenanceWindow: sun:05:00-sun:06:00
+      MultiAZ: !If
+        - IsProduction
+        - true
+        - false
+      PubliclyAccessible: false
+      AutoMinorVersionUpgrade: true
+      DeletionProtection: !If
+        - IsProduction
+        - true
+        - false
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: !If
+        - IsProduction
+        - 731
+        - 7
+      MonitoringInterval: !If
+        - IsProduction
+        - 60
+        - 0
+      MonitoringRoleArn: !If
+        - IsProduction
+        - !GetAtt RDSMonitoringRole.Arn
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-mysql-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Owner
+          Value: !Ref OwnerEmail
+        - Key: Purpose
+          Value: Primary Database for Caching Demo
+
+  # EC2 Resources
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-ec2-role-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ElastiCacheAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticache:DescribeCacheClusters
+                  - elasticache:DescribeReplicationGroups
+                  - elasticache:DescribeCacheParameters
+                Resource: '*'
+        - PolicyName: RDSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBClusters
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-ec2-role-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Owner
+          Value: !Ref OwnerEmail
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${ProjectName}-ec2-profile-${Environment}
+      Roles:
+        - !Ref EC2InstanceRole
+
+  TestEC2Instance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT15M
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          setup:
+            - install_packages
+            - configure_environment
+            - install_clients
+            - create_demo_script
+        install_packages:
+          packages:
+            yum:
+              python3: []
+              python3-pip: []
+              mysql: []
+              redis: []
+              gcc: []
+              python3-devel: []
+              mysql-devel: []
+        configure_environment:
+          files:
+            /etc/environment:
+              content: !Sub |
+                REDIS_ENDPOINT=${RedisReplicationGroup.RedisEndpoint.Address}
+                MYSQL_ENDPOINT=${MySQLDatabase.Endpoint.Address}
+                MYSQL_USERNAME=${DBUsername}
+                MYSQL_PASSWORD=${DBPassword}
+                ENVIRONMENT=${Environment}
+                PROJECT_NAME=${ProjectName}
+              mode: '000644'
+              owner: root
+              group: root
+        install_clients:
+          commands:
+            01_install_redis_python:
+              command: pip3 install redis
+            02_install_mysql_python:
+              command: pip3 install PyMySQL
+            03_install_boto3:
+              command: pip3 install boto3
+        create_demo_script:
+          files:
+            /home/ec2-user/cache_demo.py:
+              content: !Sub |
+                #!/usr/bin/env python3
+                import redis
+                import pymysql
+                import json
+                import time
+                import sys
+                import os
+                import boto3
+                
+                # Configuration from environment
+                REDIS_HOST = '${RedisReplicationGroup.RedisEndpoint.Address}'
+                MYSQL_HOST = '${MySQLDatabase.Endpoint.Address}'
+                MYSQL_USER = '${DBUsername}'
+                MYSQL_PASSWORD = '${DBPassword}'
+                MYSQL_DB = 'testdb'
+                
+                def setup_database():
+                    """Create test database and sample data"""
+                    try:
+                        # Connect without database to create it
+                        conn = pymysql.connect(
+                            host=MYSQL_HOST,
+                            user=MYSQL_USER,
+                            password=MYSQL_PASSWORD,
+                            autocommit=True
+                        )
+                        cursor = conn.cursor()
+                        
+                        # Create database and table
+                        cursor.execute(f"CREATE DATABASE IF NOT EXISTS {MYSQL_DB}")
+                        cursor.execute(f"USE {MYSQL_DB}")
+                        cursor.execute("""
+                            CREATE TABLE IF NOT EXISTS products (
+                                id INT AUTO_INCREMENT PRIMARY KEY,
+                                name VARCHAR(255) NOT NULL,
+                                price DECIMAL(10,2) NOT NULL,
+                                description TEXT,
+                                category VARCHAR(100),
+                                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                            )
+                        """)
+                        
+                        # Insert sample data
+                        sample_products = [
+                            ('Laptop Computer', 999.99, 'High-performance laptop for business use', 'Electronics'),
+                            ('Wireless Mouse', 29.99, 'Ergonomic wireless mouse with USB receiver', 'Electronics'),
+                            ('Office Chair', 249.99, 'Comfortable ergonomic office chair', 'Furniture'),
+                            ('Coffee Mug', 12.99, 'Ceramic coffee mug with company logo', 'Office Supplies'),
+                            ('Notebook', 8.99, 'Spiral-bound notebook for meetings', 'Office Supplies')
+                        ]
+                        
+                        cursor.execute("SELECT COUNT(*) FROM products")
+                        if cursor.fetchone()[0] == 0:
+                            cursor.executemany(
+                                "INSERT INTO products (name, price, description, category) VALUES (%s, %s, %s, %s)",
+                                sample_products
+                            )
+                            print("Sample data inserted successfully")
+                        
+                        cursor.close()
+                        conn.close()
+                        return True
+                        
+                    except Exception as e:
+                        print(f"Database setup error: {e}")
+                        return False
+                
+                def initialize_redis():
+                    """Initialize Redis connection"""
+                    try:
+                        redis_client = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
+                        redis_client.ping()
+                        print(f"✅ Connected to Redis at {REDIS_HOST}")
+                        return redis_client
+                    except Exception as e:
+                        print(f"❌ Redis connection error: {e}")
+                        return None
+                
+                def get_mysql_connection():
+                    """Get MySQL connection"""
+                    try:
+                        conn = pymysql.connect(
+                            host=MYSQL_HOST,
+                            user=MYSQL_USER,
+                            password=MYSQL_PASSWORD,
+                            database=MYSQL_DB,
+                            autocommit=True
+                        )
+                        return conn
+                    except Exception as e:
+                        print(f"❌ MySQL connection error: {e}")
+                        return None
+                
+                def cache_aside_get(redis_client, key, db_query_func, ttl=300):
+                    """Cache-aside pattern implementation"""
+                    # Try to get from cache first
+                    cached_data = redis_client.get(key)
+                    if cached_data:
+                        print(f"🎯 Cache HIT for key: {key}")
+                        return json.loads(cached_data), True
+                    
+                    # Cache miss - get from database
+                    print(f"💾 Cache MISS for key: {key}")
+                    data = db_query_func()
+                    
+                    if data:
+                        # Store in cache with TTL
+                        redis_client.setex(key, ttl, json.dumps(data, default=str))
+                    
+                    return data, False
+                
+                def get_product_by_id(product_id):
+                    """Database query function"""
+                    conn = get_mysql_connection()
+                    if not conn:
+                        return None
+                        
+                    cursor = conn.cursor(pymysql.cursors.DictCursor)
+                    cursor.execute(
+                        "SELECT id, name, price, description, category FROM products WHERE id = %s",
+                        (product_id,)
+                    )
+                    result = cursor.fetchone()
+                    cursor.close()
+                    conn.close()
+                    return result
+                
+                def get_products_by_category(category):
+                    """Database query function for category search"""
+                    conn = get_mysql_connection()
+                    if not conn:
+                        return None
+                        
+                    cursor = conn.cursor(pymysql.cursors.DictCursor)
+                    cursor.execute(
+                        "SELECT id, name, price, description FROM products WHERE category = %s",
+                        (category,)
+                    )
+                    results = cursor.fetchall()
+                    cursor.close()
+                    conn.close()
+                    return results
+                
+                def demo_cache_performance():
+                    """Demonstrate cache performance improvement"""
+                    redis_client = initialize_redis()
+                    if not redis_client:
+                        return
+                    
+                    if not setup_database():
+                        return
+                    
+                    print("\n" + "="*60)
+                    print("🚀 CACHE PERFORMANCE DEMONSTRATION")
+                    print("="*60)
+                    
+                    # Test single product lookup
+                    product_id = 1
+                    cache_key = f"product:{product_id}"
+                    
+                    print(f"\n📊 Testing product lookup (ID: {product_id})")
+                    print("-" * 40)
+                    
+                    # First call - cache miss
+                    start_time = time.time()
+                    result1, was_cached = cache_aside_get(
+                        redis_client, 
+                        cache_key, 
+                        lambda: get_product_by_id(product_id)
+                    )
+                    db_time = time.time() - start_time
+                    
+                    # Second call - cache hit
+                    start_time = time.time()
+                    result2, was_cached = cache_aside_get(
+                        redis_client, 
+                        cache_key, 
+                        lambda: get_product_by_id(product_id)
+                    )
+                    cache_time = time.time() - start_time
+                    
+                    print(f"\n📈 Performance Results:")
+                    print(f"   Database query time: {db_time:.4f} seconds")
+                    print(f"   Cache query time:    {cache_time:.4f} seconds")
+                    print(f"   Speed improvement:   {db_time/cache_time:.1f}x faster")
+                    
+                    # Test category search
+                    print(f"\n📊 Testing category search")
+                    print("-" * 40)
+                    
+                    category = "Electronics"
+                    cache_key = f"category:{category}"
+                    
+                    start_time = time.time()
+                    category_results, was_cached = cache_aside_get(
+                        redis_client,
+                        cache_key,
+                        lambda: get_products_by_category(category)
+                    )
+                    category_time = time.time() - start_time
+                    
+                    print(f"   Found {len(category_results) if category_results else 0} products in category '{category}'")
+                    print(f"   Query time: {category_time:.4f} seconds")
+                    
+                    # Display cache statistics
+                    print(f"\n📊 Cache Statistics:")
+                    print("-" * 40)
+                    info = redis_client.info('stats')
+                    keyspace_hits = info.get('keyspace_hits', 0)
+                    keyspace_misses = info.get('keyspace_misses', 0)
+                    total_commands = keyspace_hits + keyspace_misses
+                    hit_ratio = (keyspace_hits / total_commands * 100) if total_commands > 0 else 0
+                    
+                    print(f"   Cache hits:     {keyspace_hits}")
+                    print(f"   Cache misses:   {keyspace_misses}")
+                    print(f"   Hit ratio:      {hit_ratio:.1f}%")
+                    
+                    memory_info = redis_client.info('memory')
+                    used_memory = memory_info.get('used_memory_human', 'N/A')
+                    print(f"   Memory used:    {used_memory}")
+                    
+                    print(f"\n✅ Cache demonstration completed successfully!")
+                    return result1, result2
+                
+                if __name__ == "__main__":
+                    demo_cache_performance()
+              mode: '000755'
+              owner: ec2-user
+              group: ec2-user
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref EC2InstanceType
+      KeyName: !Ref KeyPairName
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      SubnetId: !Select [0, !Ref PublicSubnetIds]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y aws-cfn-bootstrap
+          
+          # Install CloudFormation helper scripts
+          /opt/aws/bin/cfn-init -v \
+            --stack ${AWS::StackName} \
+            --resource TestEC2Instance \
+            --configsets setup \
+            --region ${AWS::Region}
+          
+          # Signal successful completion
+          /opt/aws/bin/cfn-signal -e $? \
+            --stack ${AWS::StackName} \
+            --resource TestEC2Instance \
+            --region ${AWS::Region}
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-test-instance-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Owner
+          Value: !Ref OwnerEmail
+        - Key: Purpose
+          Value: Cache Integration Testing
+
+  # Monitoring and Notification Resources (Production only)
+  CacheNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: IsProduction
+    Properties:
+      TopicName: !Sub ${ProjectName}-cache-notifications-${Environment}
+      DisplayName: ElastiCache Notifications
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref OwnerEmail
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-cache-notifications-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Owner
+          Value: !Ref OwnerEmail
+
+  RDSMonitoringRole:
+    Type: AWS::IAM::Role
+    Condition: IsProduction
+    Properties:
+      RoleName: !Sub ${ProjectName}-rds-monitoring-role-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-rds-monitoring-role-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Owner
+          Value: !Ref OwnerEmail
+
+  # CloudWatch Alarms
+  CacheHighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-cache-high-cpu-${Environment}
+      AlarmDescription: ElastiCache CPU utilization is too high
+      MetricName: CPUUtilization
+      Namespace: AWS/ElastiCache
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: CacheClusterId
+          Value: !Sub ${ProjectName}-redis-${Environment}-001
+      AlarmActions: !If
+        - IsProduction
+        - [!Ref CacheNotificationTopic]
+        - []
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-cache-high-cpu-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Owner
+          Value: !Ref OwnerEmail
+
+  CacheHighMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-cache-high-memory-${Environment}
+      AlarmDescription: ElastiCache memory utilization is too high
+      MetricName: DatabaseMemoryUsagePercentage
+      Namespace: AWS/ElastiCache
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 90
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: CacheClusterId
+          Value: !Sub ${ProjectName}-redis-${Environment}-001
+      AlarmActions: !If
+        - IsProduction
+        - [!Ref CacheNotificationTopic]
+        - []
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-cache-high-memory-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Owner
+          Value: !Ref OwnerEmail
+
+  DBHighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-db-high-cpu-${Environment}
+      AlarmDescription: RDS CPU utilization is too high
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref MySQLDatabase
+      AlarmActions: !If
+        - IsProduction
+        - [!Ref CacheNotificationTopic]
+        - []
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-db-high-cpu-${Environment}
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Owner
+          Value: !Ref OwnerEmail
+
+Outputs:
+  # Network Information
+  VpcId:
+    Description: VPC ID where resources are deployed
+    Value: !Ref VpcId
+    Export:
+      Name: !Sub ${AWS::StackName}-VpcId
+
+  # ElastiCache Information
+  RedisEndpoint:
+    Description: Redis cluster primary endpoint for write operations
+    Value: !GetAtt RedisReplicationGroup.RedisEndpoint.Address
+    Export:
+      Name: !Sub ${AWS::StackName}-RedisEndpoint
+
+  RedisPort:
+    Description: Redis cluster port number
+    Value: !GetAtt RedisReplicationGroup.RedisEndpoint.Port
+    Export:
+      Name: !Sub ${AWS::StackName}-RedisPort
+
+  RedisReaderEndpoint:
+    Description: Redis cluster reader endpoint for read operations
+    Value: !GetAtt RedisReplicationGroup.ReaderEndpoint.Address
+    Export:
+      Name: !Sub ${AWS::StackName}-RedisReaderEndpoint
+
+  # Database Information
+  DatabaseEndpoint:
+    Description: RDS MySQL database endpoint
+    Value: !GetAtt MySQLDatabase.Endpoint.Address
+    Export:
+      Name: !Sub ${AWS::StackName}-DatabaseEndpoint
+
+  DatabasePort:
+    Description: RDS MySQL database port
+    Value: !GetAtt MySQLDatabase.Endpoint.Port
+    Export:
+      Name: !Sub ${AWS::StackName}-DatabasePort
+
+  DatabaseName:
+    Description: MySQL database name
+    Value: testdb
+    Export:
+      Name: !Sub ${AWS::StackName}-DatabaseName
+
+  # EC2 Information
+  TestInstanceId:
+    Description: EC2 test instance ID
+    Value: !Ref TestEC2Instance
+    Export:
+      Name: !Sub ${AWS::StackName}-TestInstanceId
+
+  TestInstancePublicIP:
+    Description: EC2 test instance public IP address
+    Value: !GetAtt TestEC2Instance.PublicIp
+    Export:
+      Name: !Sub ${AWS::StackName}-TestInstancePublicIP
+
+  TestInstancePrivateIP:
+    Description: EC2 test instance private IP address
+    Value: !GetAtt TestEC2Instance.PrivateIp
+    Export:
+      Name: !Sub ${AWS::StackName}-TestInstancePrivateIP
+
+  # Security Group Information
+  CacheSecurityGroupId:
+    Description: Security group ID for ElastiCache access
+    Value: !Ref CacheSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-CacheSecurityGroupId
+
+  DatabaseSecurityGroupId:
+    Description: Security group ID for database access
+    Value: !Ref DatabaseSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-DatabaseSecurityGroupId
+
+  # Connection Information
+  SSHCommand:
+    Description: SSH command to connect to test instance
+    Value: !Sub ssh -i ~/.ssh/${KeyPairName}.pem ec2-user@${TestEC2Instance.PublicIp}
+
+  CacheTestCommand:
+    Description: Command to test Redis connectivity from EC2 instance
+    Value: !Sub redis-cli -h ${RedisReplicationGroup.RedisEndpoint.Address} ping
+
+  DatabaseTestCommand:
+    Description: Command to test MySQL connectivity from EC2 instance
+    Value: !Sub mysql -h ${MySQLDatabase.Endpoint.Address} -u ${DBUsername} -p
+
+  DemoScriptPath:
+    Description: Path to cache demonstration script on EC2 instance
+    Value: /home/ec2-user/cache_demo.py
+
+  # Monitoring Information
+  CacheCloudWatchURL:
+    Description: CloudWatch dashboard URL for ElastiCache monitoring
+    Value: !Sub https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#metricsV2:graph=~();query=AWS%2FElastiCache
+
+  DatabaseCloudWatchURL:
+    Description: CloudWatch dashboard URL for RDS monitoring
+    Value: !Sub https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#metricsV2:graph=~();query=AWS%2FRDS
+
+  # Cost Estimation
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for this infrastructure (USD)
+    Value: !Sub
+      - ${CacheCost} + ${DBCost} + ${EC2Cost} = $${TotalCost} (estimated)
+      - CacheCost: !If
+          - IsDevEnvironment
+          - '15'
+          - '30'
+        DBCost: !If
+          - IsDevEnvironment
+          - '20'
+          - '40'
+        EC2Cost: !If
+          - IsDevEnvironment
+          - '8'
+          - '15'
+        TotalCost: !If
+          - IsDevEnvironment
+          - '43'
+          - '85'

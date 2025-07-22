@@ -1,0 +1,607 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Comprehensive API Gateway throttling and rate limiting solution with usage plans,
+  API keys, and CloudWatch monitoring. This template creates a complete infrastructure
+  for implementing tiered API access controls with different throttling limits for
+  Basic, Standard, and Premium customer tiers.
+
+Parameters:
+  ApiName:
+    Type: String
+    Default: throttling-demo-api
+    Description: Name for the API Gateway REST API
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: ^[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9]$
+    ConstraintDescription: Must be a valid API name (alphanumeric and hyphens only)
+
+  StageName:
+    Type: String
+    Default: prod
+    Description: Name for the API Gateway deployment stage
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    ConstraintDescription: Must be a valid stage name
+
+  Environment:
+    Type: String
+    Default: production
+    Description: Environment name for resource tagging
+    AllowedValues:
+      - development
+      - testing
+      - staging
+      - production
+
+  # Stage-level throttling configuration
+  StageRateLimit:
+    Type: Number
+    Default: 1000
+    Description: Stage-level rate limit (requests per second)
+    MinValue: 1
+    MaxValue: 10000
+
+  StageBurstLimit:
+    Type: Number
+    Default: 2000
+    Description: Stage-level burst limit (concurrent requests)
+    MinValue: 1
+    MaxValue: 20000
+
+  # Premium tier configuration
+  PremiumRateLimit:
+    Type: Number
+    Default: 2000
+    Description: Premium tier rate limit (requests per second)
+    MinValue: 1
+    MaxValue: 10000
+
+  PremiumBurstLimit:
+    Type: Number
+    Default: 5000
+    Description: Premium tier burst limit (concurrent requests)
+    MinValue: 1
+    MaxValue: 20000
+
+  PremiumQuotaLimit:
+    Type: Number
+    Default: 1000000
+    Description: Premium tier monthly quota (requests per month)
+    MinValue: 1
+    MaxValue: 10000000
+
+  # Standard tier configuration
+  StandardRateLimit:
+    Type: Number
+    Default: 500
+    Description: Standard tier rate limit (requests per second)
+    MinValue: 1
+    MaxValue: 5000
+
+  StandardBurstLimit:
+    Type: Number
+    Default: 1000
+    Description: Standard tier burst limit (concurrent requests)
+    MinValue: 1
+    MaxValue: 10000
+
+  StandardQuotaLimit:
+    Type: Number
+    Default: 100000
+    Description: Standard tier monthly quota (requests per month)
+    MinValue: 1
+    MaxValue: 1000000
+
+  # Basic tier configuration
+  BasicRateLimit:
+    Type: Number
+    Default: 100
+    Description: Basic tier rate limit (requests per second)
+    MinValue: 1
+    MaxValue: 1000
+
+  BasicBurstLimit:
+    Type: Number
+    Default: 200
+    Description: Basic tier burst limit (concurrent requests)
+    MinValue: 1
+    MaxValue: 2000
+
+  BasicQuotaLimit:
+    Type: Number
+    Default: 10000
+    Description: Basic tier monthly quota (requests per month)
+    MinValue: 1
+    MaxValue: 100000
+
+  # CloudWatch alarm configuration
+  EnableCloudWatchAlarms:
+    Type: String
+    Default: 'true'
+    Description: Enable CloudWatch alarms for monitoring
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  ThrottlingAlarmThreshold:
+    Type: Number
+    Default: 100
+    Description: Threshold for throttling alarm (throttled requests per 5 minutes)
+    MinValue: 1
+    MaxValue: 1000
+
+  ErrorAlarmThreshold:
+    Type: Number
+    Default: 50
+    Description: Threshold for 4xx error alarm (errors per 5 minutes)
+    MinValue: 1
+    MaxValue: 500
+
+Conditions:
+  CreateCloudWatchAlarms: !Equals [!Ref EnableCloudWatchAlarms, 'true']
+
+Resources:
+  # Lambda execution role for backend function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApiName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ApiName
+        - Key: Purpose
+          Value: API throttling demo
+
+  # Lambda function for API backend
+  ApiBackendFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ApiName}-backend-function'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Description: Backend Lambda function for API throttling demonstration
+      Code:
+        ZipFile: |
+          import json
+          import time
+          import os
+          
+          def lambda_handler(event, context):
+              # Simulate some processing time
+              time.sleep(0.1)
+              
+              return {
+                  'statusCode': 200,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  'body': json.dumps({
+                      'message': 'Hello from throttled API!',
+                      'timestamp': int(time.time()),
+                      'requestId': context.aws_request_id,
+                      'region': os.environ.get('AWS_REGION', 'unknown'),
+                      'apiName': os.environ.get('API_NAME', 'unknown')
+                  })
+              }
+      Environment:
+        Variables:
+          API_NAME: !Ref ApiName
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ApiName
+        - Key: Purpose
+          Value: API backend
+
+  # Lambda permission for API Gateway to invoke the function
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiBackendFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:apigateway:${AWS::Region}::/restapis/${ThrottlingApi}/*/*'
+
+  # REST API Gateway
+  ThrottlingApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Ref ApiName
+      Description: !Sub 'API Gateway with comprehensive throttling and rate limiting - ${Environment}'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      ApiKeySourceType: HEADER
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ApiName
+        - Key: Purpose
+          Value: Throttling demonstration
+
+  # Resource for /data endpoint
+  DataResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ThrottlingApi
+      ParentId: !GetAtt ThrottlingApi.RootResourceId
+      PathPart: data
+
+  # GET method for /data endpoint
+  DataGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ThrottlingApi
+      ResourceId: !Ref DataResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiBackendFunction.Arn}/invocations'
+        IntegrationResponses:
+          - StatusCode: 200
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+
+  # API Gateway deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - DataGetMethod
+    Properties:
+      RestApiId: !Ref ThrottlingApi
+      Description: !Sub 'Initial deployment for ${ApiName}'
+
+  # API Gateway stage with throttling configuration
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref ThrottlingApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref StageName
+      Description: !Sub 'Production stage for ${ApiName} with throttling controls'
+      ThrottleSettings:
+        RateLimit: !Ref StageRateLimit
+        BurstLimit: !Ref StageBurstLimit
+      MethodSettings:
+        - ResourcePath: '/*/*'
+          HttpMethod: '*'
+          ThrottlingRateLimit: !Ref StageRateLimit
+          ThrottlingBurstLimit: !Ref StageBurstLimit
+          LoggingLevel: INFO
+          DataTraceEnabled: false
+          MetricsEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ApiName
+
+  # Premium Usage Plan
+  PremiumUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      UsagePlanName: !Sub '${ApiName}-premium-plan'
+      Description: Premium tier with high rate limits and large quota
+      ApiStages:
+        - ApiId: !Ref ThrottlingApi
+          Stage: !Ref StageName
+      Throttle:
+        RateLimit: !Ref PremiumRateLimit
+        BurstLimit: !Ref PremiumBurstLimit
+      Quota:
+        Limit: !Ref PremiumQuotaLimit
+        Period: MONTH
+        Offset: 0
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ApiName
+        - Key: Tier
+          Value: Premium
+
+  # Standard Usage Plan
+  StandardUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      UsagePlanName: !Sub '${ApiName}-standard-plan'
+      Description: Standard tier with moderate rate limits and quota
+      ApiStages:
+        - ApiId: !Ref ThrottlingApi
+          Stage: !Ref StageName
+      Throttle:
+        RateLimit: !Ref StandardRateLimit
+        BurstLimit: !Ref StandardBurstLimit
+      Quota:
+        Limit: !Ref StandardQuotaLimit
+        Period: MONTH
+        Offset: 0
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ApiName
+        - Key: Tier
+          Value: Standard
+
+  # Basic Usage Plan
+  BasicUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      UsagePlanName: !Sub '${ApiName}-basic-plan'
+      Description: Basic tier with low rate limits and small quota
+      ApiStages:
+        - ApiId: !Ref ThrottlingApi
+          Stage: !Ref StageName
+      Throttle:
+        RateLimit: !Ref BasicRateLimit
+        BurstLimit: !Ref BasicBurstLimit
+      Quota:
+        Limit: !Ref BasicQuotaLimit
+        Period: MONTH
+        Offset: 0
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ApiName
+        - Key: Tier
+          Value: Basic
+
+  # API Keys for different customer tiers
+  PremiumApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub '${ApiName}-premium-customer-key'
+      Description: Premium tier customer API key with high rate limits
+      Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ApiName
+        - Key: Tier
+          Value: Premium
+
+  StandardApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub '${ApiName}-standard-customer-key'
+      Description: Standard tier customer API key with moderate rate limits
+      Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ApiName
+        - Key: Tier
+          Value: Standard
+
+  BasicApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub '${ApiName}-basic-customer-key'
+      Description: Basic tier customer API key with low rate limits
+      Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ApiName
+        - Key: Tier
+          Value: Basic
+
+  # Usage plan key associations
+  PremiumUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref PremiumApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref PremiumUsagePlan
+
+  StandardUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref StandardApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref StandardUsagePlan
+
+  BasicUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref BasicApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref BasicUsagePlan
+
+  # CloudWatch Alarms for monitoring
+  HighThrottlingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${ApiName}-high-throttling-alarm'
+      AlarmDescription: Alert when API throttling exceeds threshold
+      MetricName: Count
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref ThrottlingAlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref ApiName
+        - Name: Stage
+          Value: !Ref StageName
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ApiName
+        - Key: Purpose
+          Value: Throttling monitoring
+
+  High4xxErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${ApiName}-high-4xx-errors-alarm'
+      AlarmDescription: Alert when 4xx errors exceed threshold
+      MetricName: 4XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref ErrorAlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref ApiName
+        - Name: Stage
+          Value: !Ref StageName
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ApiName
+        - Key: Purpose
+          Value: Error monitoring
+
+  # CloudWatch Log Group for API Gateway access logs
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ApiName}'
+      RetentionInDays: 14
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ApiName
+        - Key: Purpose
+          Value: API access logs
+
+Outputs:
+  # API Gateway outputs
+  ApiId:
+    Description: ID of the API Gateway REST API
+    Value: !Ref ThrottlingApi
+    Export:
+      Name: !Sub '${AWS::StackName}-api-id'
+
+  ApiUrl:
+    Description: URL of the deployed API Gateway stage
+    Value: !Sub 'https://${ThrottlingApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/data'
+    Export:
+      Name: !Sub '${AWS::StackName}-api-url'
+
+  ApiStage:
+    Description: Name of the API Gateway stage
+    Value: !Ref StageName
+    Export:
+      Name: !Sub '${AWS::StackName}-api-stage'
+
+  # Lambda function outputs
+  LambdaFunctionArn:
+    Description: ARN of the backend Lambda function
+    Value: !GetAtt ApiBackendFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-lambda-arn'
+
+  # Usage plan outputs
+  PremiumUsagePlanId:
+    Description: ID of the Premium usage plan
+    Value: !Ref PremiumUsagePlan
+    Export:
+      Name: !Sub '${AWS::StackName}-premium-plan-id'
+
+  StandardUsagePlanId:
+    Description: ID of the Standard usage plan
+    Value: !Ref StandardUsagePlan
+    Export:
+      Name: !Sub '${AWS::StackName}-standard-plan-id'
+
+  BasicUsagePlanId:
+    Description: ID of the Basic usage plan
+    Value: !Ref BasicUsagePlan
+    Export:
+      Name: !Sub '${AWS::StackName}-basic-plan-id'
+
+  # API Key outputs (IDs only for security)
+  PremiumApiKeyId:
+    Description: ID of the Premium tier API key
+    Value: !Ref PremiumApiKey
+    Export:
+      Name: !Sub '${AWS::StackName}-premium-key-id'
+
+  StandardApiKeyId:
+    Description: ID of the Standard tier API key
+    Value: !Ref StandardApiKey
+    Export:
+      Name: !Sub '${AWS::StackName}-standard-key-id'
+
+  BasicApiKeyId:
+    Description: ID of the Basic tier API key
+    Value: !Ref BasicApiKey
+    Export:
+      Name: !Sub '${AWS::StackName}-basic-key-id'
+
+  # CloudWatch monitoring outputs
+  ThrottlingAlarmArn:
+    Condition: CreateCloudWatchAlarms
+    Description: ARN of the high throttling CloudWatch alarm
+    Value: !GetAtt HighThrottlingAlarm.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-throttling-alarm-arn'
+
+  ErrorAlarmArn:
+    Condition: CreateCloudWatchAlarms
+    Description: ARN of the high 4xx error CloudWatch alarm
+    Value: !GetAtt High4xxErrorAlarm.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-error-alarm-arn'
+
+  # Testing instructions
+  TestingInstructions:
+    Description: Instructions for testing the API with different tiers
+    Value: !Sub |
+      1. Get API key values using: aws apigateway get-api-key --api-key <KEY_ID> --include-value
+      2. Test without key: curl -X GET ${ThrottlingApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/data
+      3. Test with key: curl -X GET -H "X-API-Key: <API_KEY_VALUE>" ${ThrottlingApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/data
+      4. Load test: ab -n 1000 -c 10 -H "X-API-Key: <API_KEY_VALUE>" ${ThrottlingApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/data
+
+  # Deployment summary
+  DeploymentSummary:
+    Description: Summary of deployed resources and configuration
+    Value: !Sub |
+      API Gateway: ${ThrottlingApi} (${StageName} stage)
+      Backend: Lambda function with ${ApiBackendFunction}
+      Usage Plans: Premium (${PremiumRateLimit} RPS), Standard (${StandardRateLimit} RPS), Basic (${BasicRateLimit} RPS)
+      Monitoring: CloudWatch alarms ${EnableCloudWatchAlarms}
+      Environment: ${Environment}

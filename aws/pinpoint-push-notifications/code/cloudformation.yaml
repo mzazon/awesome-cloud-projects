@@ -1,0 +1,538 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Mobile Push Notifications with AWS End User Messaging Push (formerly Amazon Pinpoint) - Complete infrastructure for targeted mobile engagement'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Application Configuration"
+        Parameters:
+          - ApplicationName
+          - Environment
+      - Label:
+          default: "Push Notification Configuration"
+        Parameters:
+          - EnableAPNSChannel
+          - EnableGCMChannel
+          - APNSCertificateData
+          - FCMServerKey
+      - Label:
+          default: "Analytics and Monitoring"
+        Parameters:
+          - EnableEventStreaming
+          - EnableCloudWatchAlarms
+          - NotificationEmail
+      - Label:
+          default: "Resource Tagging"
+        Parameters:
+          - ProjectName
+          - CostCenter
+    ParameterLabels:
+      ApplicationName:
+        default: "Pinpoint Application Name"
+      Environment:
+        default: "Environment Type"
+      EnableAPNSChannel:
+        default: "Enable iOS Push Notifications"
+      EnableGCMChannel:
+        default: "Enable Android Push Notifications"
+      APNSCertificateData:
+        default: "APNs Certificate (Base64)"
+      FCMServerKey:
+        default: "Firebase Server Key"
+      EnableEventStreaming:
+        default: "Enable Event Streaming"
+      EnableCloudWatchAlarms:
+        default: "Enable CloudWatch Monitoring"
+      NotificationEmail:
+        default: "Alarm Notification Email"
+      ProjectName:
+        default: "Project Name"
+      CostCenter:
+        default: "Cost Center"
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Description: Name for the Pinpoint application
+    Default: ecommerce-mobile-app
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: ^[a-zA-Z0-9-_]+$
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, and underscores
+
+  Environment:
+    Type: String
+    Description: Environment type for resource tagging and naming
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    ConstraintDescription: Must be one of dev, test, staging, or prod
+
+  EnableAPNSChannel:
+    Type: String
+    Description: Enable Apple Push Notification Service (APNs) for iOS devices
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableGCMChannel:
+    Type: String
+    Description: Enable Firebase Cloud Messaging (FCM) for Android devices
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  APNSCertificateData:
+    Type: String
+    Description: Base64-encoded APNs certificate data (optional, leave empty to configure later)
+    Default: ''
+    NoEcho: true
+
+  FCMServerKey:
+    Type: String
+    Description: Firebase Cloud Messaging server key (optional, leave empty to configure later)
+    Default: ''
+    NoEcho: true
+
+  EnableEventStreaming:
+    Type: String
+    Description: Enable event streaming to Kinesis for advanced analytics
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableCloudWatchAlarms:
+    Type: String
+    Description: Enable CloudWatch alarms for monitoring push notification performance
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for CloudWatch alarm notifications (optional)
+    Default: ''
+    AllowedPattern: ^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address or empty
+
+  ProjectName:
+    Type: String
+    Description: Project name for resource tagging
+    Default: mobile-engagement
+    MinLength: 1
+    MaxLength: 50
+
+  CostCenter:
+    Type: String
+    Description: Cost center for billing allocation
+    Default: marketing
+    MinLength: 1
+    MaxLength: 50
+
+Conditions:
+  CreateAPNSChannel: !Equals [!Ref EnableAPNSChannel, 'true']
+  CreateGCMChannel: !Equals [!Ref EnableGCMChannel, 'true']
+  HasAPNSCertificate: !And
+    - !Condition CreateAPNSChannel
+    - !Not [!Equals [!Ref APNSCertificateData, '']]
+  HasFCMServerKey: !And
+    - !Condition CreateGCMChannel
+    - !Not [!Equals [!Ref FCMServerKey, '']]
+  CreateEventStreaming: !Equals [!Ref EnableEventStreaming, 'true']
+  CreateCloudWatchAlarms: !Equals [!Ref EnableCloudWatchAlarms, 'true']
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  CreateSNSTopic: !And
+    - !Condition CreateCloudWatchAlarms
+    - !Condition HasNotificationEmail
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # IAM Role for Pinpoint to access other AWS services
+  PinpointServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-${Environment}-pinpoint-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - pinpoint.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonPinpointServiceRole
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-pinpoint-service-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Additional IAM policy for Kinesis event streaming
+  PinpointKinesisPolicy:
+    Type: AWS::IAM::Policy
+    Condition: CreateEventStreaming
+    Properties:
+      PolicyName: PinpointKinesisStreamingPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - kinesis:PutRecord
+              - kinesis:PutRecords
+              - kinesis:DescribeStream
+            Resource: !GetAtt EventStream.Arn
+      Roles:
+        - !Ref PinpointServiceRole
+
+  # Pinpoint Application - Main container for mobile engagement
+  PinpointApplication:
+    Type: AWS::Pinpoint::App
+    Properties:
+      Name: !Sub '${ApplicationName}-${Environment}'
+      Tags:
+        Name: !Sub '${ApplicationName}-${Environment}'
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        CostCenter: !Ref CostCenter
+
+  # APNs Channel Configuration for iOS Push Notifications
+  APNSChannel:
+    Type: AWS::Pinpoint::APNSChannel
+    Condition: HasAPNSCertificate
+    Properties:
+      ApplicationId: !Ref PinpointApplication
+      Enabled: true
+      DefaultAuthenticationMethod: CERTIFICATE
+      Certificate: !Ref APNSCertificateData
+      # Note: For production, consider using token-based authentication with:
+      # DefaultAuthenticationMethod: TOKEN
+      # TokenKey: !Ref APNSTokenKey
+      # TokenKeyId: !Ref APNSTokenKeyId
+      # TeamId: !Ref APNSTeamId
+
+  # GCM (Firebase) Channel Configuration for Android Push Notifications
+  GCMChannel:
+    Type: AWS::Pinpoint::GCMChannel
+    Condition: HasFCMServerKey
+    Properties:
+      ApplicationId: !Ref PinpointApplication
+      Enabled: true
+      ApiKey: !Ref FCMServerKey
+
+  # Kinesis Stream for Event Streaming and Analytics
+  EventStream:
+    Type: AWS::Kinesis::Stream
+    Condition: CreateEventStreaming
+    Properties:
+      Name: !Sub '${ApplicationName}-${Environment}-events'
+      ShardCount: !If
+        - IsProduction
+        - 2
+        - 1
+      RetentionPeriodHours: 24
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-events'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Pinpoint Event Stream Configuration
+  PinpointEventStream:
+    Type: AWS::Pinpoint::EventStream
+    Condition: CreateEventStreaming
+    DependsOn: PinpointKinesisPolicy
+    Properties:
+      ApplicationId: !Ref PinpointApplication
+      DestinationStreamArn: !GetAtt EventStream.Arn
+      RoleArn: !GetAtt PinpointServiceRole.Arn
+
+  # User Segment for High-Value Customers
+  HighValueCustomerSegment:
+    Type: AWS::Pinpoint::Segment
+    Properties:
+      ApplicationId: !Ref PinpointApplication
+      Name: high-value-customers
+      Dimensions:
+        UserAttributes:
+          PurchaseHistory:
+            AttributeType: INCLUSIVE
+            Values:
+              - high-value
+        Demographic:
+          Platform:
+            DimensionType: INCLUSIVE
+            Values:
+              - iOS
+              - Android
+      Tags:
+        Name: high-value-customers
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  # Push Notification Template for Reusable Messages
+  FlashSaleTemplate:
+    Type: AWS::Pinpoint::PushTemplate
+    Properties:
+      TemplateName: flash-sale-template
+      DefaultSubstitutions: |
+        {
+          "User.FirstName": "Valued Customer"
+        }
+      TemplateDescription: Reusable template for flash sale notifications
+      ADM:
+        Action: OPEN_APP
+        Body: "Don't miss out! {{User.FirstName}}, exclusive flash sale ends in 2 hours!"
+        Title: "🔥 Flash Sale Alert"
+        Sound: default
+      APNS:
+        Action: OPEN_APP
+        Body: "Don't miss out! {{User.FirstName}}, exclusive flash sale ends in 2 hours!"
+        Title: "🔥 Flash Sale Alert"
+        Sound: default
+      GCM:
+        Action: OPEN_APP
+        Body: "Don't miss out! {{User.FirstName}}, exclusive flash sale ends in 2 hours!"
+        Title: "🔥 Flash Sale Alert"
+        Sound: default
+      Default:
+        Action: OPEN_APP
+        Body: "Don't miss out! Exclusive flash sale ends in 2 hours!"
+        Title: "🔥 Flash Sale Alert"
+      Tags:
+        Name: flash-sale-template
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  # SNS Topic for CloudWatch Alarm Notifications
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSNSTopic
+    Properties:
+      TopicName: !Sub '${ApplicationName}-${Environment}-pinpoint-alarms'
+      DisplayName: Pinpoint Push Notification Alarms
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-pinpoint-alarms'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SNS Subscription for Email Notifications
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateSNSTopic
+    Properties:
+      TopicArn: !Ref AlarmNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Alarm for Push Notification Failures
+  PushNotificationFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-push-failures'
+      AlarmDescription: Alert when push notification failures exceed threshold
+      MetricName: DirectSendMessagePermanentFailure
+      Namespace: AWS/Pinpoint
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApplicationId
+          Value: !Ref PinpointApplication
+      AlarmActions:
+        - !If
+          - CreateSNSTopic
+          - !Ref AlarmNotificationTopic
+          - !Ref AWS::NoValue
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-push-failures'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarm for Low Delivery Rate
+  PushNotificationDeliveryRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-delivery-rate'
+      AlarmDescription: Alert when push notification delivery rate falls below 90%
+      MetricName: DirectSendMessageDeliveryRate
+      Namespace: AWS/Pinpoint
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0.9
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: ApplicationId
+          Value: !Ref PinpointApplication
+      AlarmActions:
+        - !If
+          - CreateSNSTopic
+          - !Ref AlarmNotificationTopic
+          - !Ref AWS::NoValue
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-delivery-rate'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarm for High Message Volume (Cost Control)
+  MessageVolumeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-message-volume'
+      AlarmDescription: Alert when daily message volume exceeds expected threshold
+      MetricName: DirectSendMessageDelivered
+      Namespace: AWS/Pinpoint
+      Statistic: Sum
+      Period: 86400  # 24 hours
+      EvaluationPeriods: 1
+      Threshold: !If
+        - IsProduction
+        - 100000
+        - 10000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApplicationId
+          Value: !Ref PinpointApplication
+      AlarmActions:
+        - !If
+          - CreateSNSTopic
+          - !Ref AlarmNotificationTopic
+          - !Ref AWS::NoValue
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-message-volume'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  PinpointApplicationId:
+    Description: The ID of the Pinpoint application for mobile push notifications
+    Value: !Ref PinpointApplication
+    Export:
+      Name: !Sub '${AWS::StackName}-PinpointApplicationId'
+
+  PinpointApplicationArn:
+    Description: The ARN of the Pinpoint application
+    Value: !Sub 'arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:app/${PinpointApplication}'
+    Export:
+      Name: !Sub '${AWS::StackName}-PinpointApplicationArn'
+
+  PinpointServiceRoleArn:
+    Description: The ARN of the IAM role used by Pinpoint service
+    Value: !GetAtt PinpointServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PinpointServiceRoleArn'
+
+  APNSChannelStatus:
+    Condition: CreateAPNSChannel
+    Description: Status of the APNs channel configuration
+    Value: !If
+      - HasAPNSCertificate
+      - 'Configured with Certificate'
+      - 'Enabled (Certificate Required)'
+
+  GCMChannelStatus:
+    Condition: CreateGCMChannel
+    Description: Status of the GCM (Firebase) channel configuration
+    Value: !If
+      - HasFCMServerKey
+      - 'Configured with Server Key'
+      - 'Enabled (Server Key Required)'
+
+  EventStreamArn:
+    Condition: CreateEventStreaming
+    Description: The ARN of the Kinesis stream for event streaming
+    Value: !GetAtt EventStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventStreamArn'
+
+  HighValueCustomerSegmentId:
+    Description: The ID of the high-value customer segment
+    Value: !Ref HighValueCustomerSegment
+    Export:
+      Name: !Sub '${AWS::StackName}-HighValueCustomerSegmentId'
+
+  FlashSaleTemplateArn:
+    Description: The ARN of the flash sale push notification template
+    Value: !Sub 'arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:templates/${FlashSaleTemplate}/PUSH'
+    Export:
+      Name: !Sub '${AWS::StackName}-FlashSaleTemplateArn'
+
+  AlarmNotificationTopicArn:
+    Condition: CreateSNSTopic
+    Description: The ARN of the SNS topic for alarm notifications
+    Value: !Ref AlarmNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlarmNotificationTopicArn'
+
+  PinpointConsoleUrl:
+    Description: URL to access the Pinpoint application in AWS Console
+    Value: !Sub 'https://console.aws.amazon.com/pinpoint/home?region=${AWS::Region}#/apps/${PinpointApplication}/analytics/overview'
+
+  NextSteps:
+    Description: Next steps for completing the mobile push notification setup
+    Value: |
+      1. Configure APNs certificates or authentication tokens in the Pinpoint console
+      2. Add Firebase server key for Android notifications
+      3. Integrate Pinpoint SDK in your mobile applications
+      4. Create user endpoints by registering device tokens
+      5. Test push notifications using the Pinpoint console
+      6. Create and schedule campaigns for targeted user engagement
+
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for push notifications (excluding AWS support)
+    Value: !Sub |
+      Based on configuration:
+      - Pinpoint: ~$1.00 per 1M push notifications
+      - Kinesis: ~$0.014 per shard hour (${!If [IsProduction, '2 shards', '1 shard']})
+      - CloudWatch: ~$0.30 per alarm (${!If [CreateCloudWatchAlarms, '3 alarms', '0 alarms']})
+      - SNS: ~$0.50 per 1M notifications
+      Estimated total: $10-50/month for 100K push notifications
+
+  SecurityConsiderations:
+    Description: Important security considerations for production deployment
+    Value: |
+      1. Use AWS Secrets Manager to store APNs certificates and FCM server keys
+      2. Implement least privilege IAM policies for application access
+      3. Enable CloudTrail logging for Pinpoint API calls
+      4. Use VPC endpoints for private network communication
+      5. Regularly rotate APNs certificates and FCM server keys
+      6. Monitor for unusual activity patterns in push notification metrics

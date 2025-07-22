@@ -1,0 +1,960 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Intelligent Content Moderation System using Amazon Bedrock and EventBridge - A scalable, event-driven solution for automated content analysis and workflow orchestration'
+
+# Template Parameters for customization
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'content-moderation'
+    Description: 'Name prefix for all resources created by this template'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for moderation notifications'
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  BedrockModelId:
+    Type: String
+    Default: 'anthropic.claude-3-sonnet-20240229-v1:0'
+    Description: 'Amazon Bedrock model ID for content analysis'
+    AllowedValues:
+      - 'anthropic.claude-3-sonnet-20240229-v1:0'
+      - 'anthropic.claude-3-haiku-20240307-v1:0'
+      - 'anthropic.claude-instant-v1'
+
+  ContentAnalysisTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 30
+    MaxValue: 900
+    Description: 'Timeout in seconds for content analysis Lambda function'
+
+  WorkflowFunctionTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 15
+    MaxValue: 300
+    Description: 'Timeout in seconds for workflow Lambda functions'
+
+  EnableVersioning:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable versioning on S3 buckets'
+
+  Environment:
+    Type: String
+    Default: 'development'
+    AllowedValues: ['development', 'staging', 'production']
+    Description: 'Environment for resource tagging and configuration'
+
+# Conditions for optional features
+Conditions:
+  EnableS3Versioning: !Equals [!Ref EnableVersioning, 'true']
+  IsProduction: !Equals [!Ref Environment, 'production']
+
+# Template Resources
+Resources:
+  # S3 Buckets for content storage with security best practices
+  ContentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-content-bucket-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [EnableS3Versioning, 'Enabled', 'Suspended']
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt ContentAnalysisFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: '.txt'
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Content Upload Storage'
+
+  ApprovedContentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-approved-content-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [EnableS3Versioning, 'Enabled', 'Suspended']
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ApprovedContentRetention
+            Status: Enabled
+            ExpirationInDays: !If [IsProduction, 2555, 365] # 7 years for production, 1 year for dev/staging
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Approved Content Storage'
+
+  RejectedContentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-rejected-content-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [EnableS3Versioning, 'Enabled', 'Suspended']
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: RejectedContentRetention
+            Status: Enabled
+            ExpirationInDays: !If [IsProduction, 2555, 90] # 7 years for production, 90 days for dev/staging
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Rejected Content Storage'
+
+  # SNS Topic for notifications with encryption
+  ModerationNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-moderation-notifications'
+      DisplayName: 'Content Moderation Notifications'
+      KmsMasterKeyId: !Ref SNSEncryptionKey
+      Subscription:
+        - Endpoint: !Ref NotificationEmail
+          Protocol: email
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # KMS Key for SNS encryption
+  SNSEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'KMS key for encrypting SNS notifications'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow SNS service
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+            Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  SNSEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-sns-encryption-key'
+      TargetKeyId: !Ref SNSEncryptionKey
+
+  # Custom EventBridge Bus for content moderation events
+  ContentModerationEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${ProjectName}-moderation-bus'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for Content Analysis Lambda with least privilege
+  ContentAnalysisLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-content-analysis-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ContentAnalysisPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModel'
+                  - 'bedrock:InvokeModelWithResponseStream'
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.*'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                Resource: !Sub '${ContentBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 'events:PutEvents'
+                Resource: !GetAtt ContentModerationEventBus.Arn
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:CopyObject'
+                Resource:
+                  - !Sub '${ApprovedContentBucket}/*'
+                  - !Sub '${RejectedContentBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref ModerationNotificationsTopic
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:GenerateDataKey'
+                Resource: !GetAtt SNSEncryptionKey.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for Workflow Lambda Functions
+  WorkflowLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-workflow-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: WorkflowPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                Resource: !Sub '${ContentBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:CopyObject'
+                Resource:
+                  - !Sub '${ApprovedContentBucket}/*'
+                  - !Sub '${RejectedContentBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref ModerationNotificationsTopic
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:GenerateDataKey'
+                Resource: !GetAtt SNSEncryptionKey.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Functions for content processing
+  ContentAnalysisFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-content-analysis-function'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ContentAnalysisLambdaRole.Arn
+      Timeout: !Ref ContentAnalysisTimeout
+      MemorySize: 512
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          CUSTOM_BUS_NAME: !Ref ContentModerationEventBus
+          APPROVED_BUCKET: !Ref ApprovedContentBucket
+          REJECTED_BUCKET: !Ref RejectedContentBucket
+          SNS_TOPIC_ARN: !Ref ModerationNotificationsTopic
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib.parse
+          import os
+          from datetime import datetime
+          
+          # Initialize AWS clients
+          bedrock = boto3.client('bedrock-runtime')
+          s3 = boto3.client('s3')
+          eventbridge = boto3.client('events')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Parse S3 event
+                  bucket = event['Records'][0]['s3']['bucket']['name']
+                  key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'])
+                  
+                  print(f"Processing content: s3://{bucket}/{key}")
+                  
+                  # Get content from S3
+                  response = s3.get_object(Bucket=bucket, Key=key)
+                  content = response['Body'].read().decode('utf-8')
+                  
+                  # Prepare moderation prompt with structured output
+                  prompt = f"""
+                  Human: Please analyze the following content for policy violations. 
+                  Consider harmful content including hate speech, violence, harassment, 
+                  inappropriate sexual content, misinformation, and spam.
+                  
+                  Content to analyze:
+                  {content[:2000]}
+                  
+                  Respond with a JSON object containing:
+                  - "decision": "approved", "rejected", or "review"
+                  - "confidence": score from 0.0 to 1.0
+                  - "reason": brief explanation
+                  - "categories": array of policy categories if violations found
+                  
+                  Assistant: """
+                  
+                  # Invoke Bedrock Claude model
+                  body = json.dumps({
+                      "anthropic_version": "bedrock-2023-05-31",
+                      "max_tokens": 1000,
+                      "messages": [
+                          {"role": "user", "content": prompt}
+                      ]
+                  })
+                  
+                  bedrock_response = bedrock.invoke_model(
+                      modelId=os.environ.get('BEDROCK_MODEL_ID', 'anthropic.claude-3-sonnet-20240229-v1:0'),
+                      body=body,
+                      contentType='application/json'
+                  )
+                  
+                  response_body = json.loads(bedrock_response['body'].read())
+                  
+                  # Parse AI response and handle potential JSON parsing errors
+                  try:
+                      moderation_result = json.loads(response_body['content'][0]['text'])
+                  except json.JSONDecodeError:
+                      # Fallback for unparseable responses
+                      moderation_result = {
+                          "decision": "review",
+                          "confidence": 0.5,
+                          "reason": "Unable to parse AI response",
+                          "categories": ["parsing_error"]
+                      }
+                  
+                  # Publish event to EventBridge
+                  event_detail = {
+                      'bucket': bucket,
+                      'key': key,
+                      'decision': moderation_result['decision'],
+                      'confidence': moderation_result['confidence'],
+                      'reason': moderation_result['reason'],
+                      'categories': moderation_result.get('categories', []),
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'content_size': len(content),
+                      'environment': os.environ.get('ENVIRONMENT', 'development')
+                  }
+                  
+                  eventbridge.put_events(
+                      Entries=[
+                          {
+                              'Source': 'content.moderation',
+                              'DetailType': f"Content {moderation_result['decision'].title()}",
+                              'Detail': json.dumps(event_detail),
+                              'EventBusName': os.environ.get('CUSTOM_BUS_NAME')
+                          }
+                      ]
+                  )
+                  
+                  print(f"Content analysis complete. Decision: {moderation_result['decision']}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Content analyzed successfully',
+                          'decision': moderation_result['decision'],
+                          'confidence': moderation_result['confidence']
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in content analysis: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda permission for S3 to invoke content analysis function
+  ContentAnalysisLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ContentAnalysisFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub '${ContentBucket}'
+
+  # Workflow Lambda Functions for each decision type
+  ApprovedHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-approved-handler-function'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt WorkflowLambdaRole.Arn
+      Timeout: !Ref WorkflowFunctionTimeout
+      MemorySize: 256
+      Environment:
+        Variables:
+          APPROVED_BUCKET: !Ref ApprovedContentBucket
+          REJECTED_BUCKET: !Ref RejectedContentBucket
+          SNS_TOPIC_ARN: !Ref ModerationNotificationsTopic
+          WORKFLOW_TYPE: 'approved'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              try:
+                  detail = event['detail']
+                  source_bucket = detail['bucket']
+                  source_key = detail['key']
+                  workflow_type = os.environ.get('WORKFLOW_TYPE', 'approved')
+                  
+                  # Determine target bucket based on workflow
+                  target_bucket = os.environ.get('APPROVED_BUCKET')
+                  target_key = f"{workflow_type}/{datetime.utcnow().strftime('%Y/%m/%d')}/{source_key}"
+                  
+                  print(f"Processing {workflow_type} content: {source_key}")
+                  
+                  # Copy content to appropriate bucket with metadata
+                  copy_source = {'Bucket': source_bucket, 'Key': source_key}
+                  s3.copy_object(
+                      CopySource=copy_source,
+                      Bucket=target_bucket,
+                      Key=target_key,
+                      MetadataDirective='REPLACE',
+                      Metadata={
+                          'moderation-decision': detail['decision'],
+                          'moderation-confidence': str(detail['confidence']),
+                          'moderation-reason': detail['reason'],
+                          'processed-timestamp': datetime.utcnow().isoformat(),
+                          'workflow-type': workflow_type
+                      }
+                  )
+                  
+                  # Send notification with comprehensive details
+                  message = f"""
+          Content Moderation Result: {detail['decision'].upper()}
+          
+          File: {source_key}
+          Confidence: {detail['confidence']:.2f}
+          Reason: {detail['reason']}
+          Categories: {', '.join(detail.get('categories', []))}
+          Timestamp: {detail['timestamp']}
+          Environment: {detail.get('environment', 'unknown')}
+          
+          Target Location: s3://{target_bucket}/{target_key}
+          
+          This content has been approved and is ready for publication.
+                  """
+                  
+                  sns.publish(
+                      TopicArn=os.environ.get('SNS_TOPIC_ARN'),
+                      Subject=f'Content Approved: {source_key}',
+                      Message=message
+                  )
+                  
+                  print(f"Approved content processed successfully: {target_key}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Content processed for {workflow_type}',
+                          'target_location': f's3://{target_bucket}/{target_key}'
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in approved handler: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  RejectedHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-rejected-handler-function'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt WorkflowLambdaRole.Arn
+      Timeout: !Ref WorkflowFunctionTimeout
+      MemorySize: 256
+      Environment:
+        Variables:
+          APPROVED_BUCKET: !Ref ApprovedContentBucket
+          REJECTED_BUCKET: !Ref RejectedContentBucket
+          SNS_TOPIC_ARN: !Ref ModerationNotificationsTopic
+          WORKFLOW_TYPE: 'rejected'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              try:
+                  detail = event['detail']
+                  source_bucket = detail['bucket']
+                  source_key = detail['key']
+                  workflow_type = os.environ.get('WORKFLOW_TYPE', 'rejected')
+                  
+                  # Determine target bucket based on workflow
+                  target_bucket = os.environ.get('REJECTED_BUCKET')
+                  target_key = f"{workflow_type}/{datetime.utcnow().strftime('%Y/%m/%d')}/{source_key}"
+                  
+                  print(f"Processing {workflow_type} content: {source_key}")
+                  
+                  # Copy content to appropriate bucket with metadata
+                  copy_source = {'Bucket': source_bucket, 'Key': source_key}
+                  s3.copy_object(
+                      CopySource=copy_source,
+                      Bucket=target_bucket,
+                      Key=target_key,
+                      MetadataDirective='REPLACE',
+                      Metadata={
+                          'moderation-decision': detail['decision'],
+                          'moderation-confidence': str(detail['confidence']),
+                          'moderation-reason': detail['reason'],
+                          'processed-timestamp': datetime.utcnow().isoformat(),
+                          'workflow-type': workflow_type
+                      }
+                  )
+                  
+                  # Send notification with comprehensive details
+                  message = f"""
+          Content Moderation Result: {detail['decision'].upper()}
+          
+          File: {source_key}
+          Confidence: {detail['confidence']:.2f}
+          Reason: {detail['reason']}
+          Categories: {', '.join(detail.get('categories', []))}
+          Timestamp: {detail['timestamp']}
+          Environment: {detail.get('environment', 'unknown')}
+          
+          Target Location: s3://{target_bucket}/{target_key}
+          
+          This content has been rejected due to policy violations and has been quarantined.
+                  """
+                  
+                  sns.publish(
+                      TopicArn=os.environ.get('SNS_TOPIC_ARN'),
+                      Subject=f'Content Rejected: {source_key}',
+                      Message=message
+                  )
+                  
+                  print(f"Rejected content processed successfully: {target_key}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Content processed for {workflow_type}',
+                          'target_location': f's3://{target_bucket}/{target_key}'
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in rejected handler: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  ReviewHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-review-handler-function'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt WorkflowLambdaRole.Arn
+      Timeout: !Ref WorkflowFunctionTimeout
+      MemorySize: 256
+      Environment:
+        Variables:
+          APPROVED_BUCKET: !Ref ApprovedContentBucket
+          REJECTED_BUCKET: !Ref RejectedContentBucket
+          SNS_TOPIC_ARN: !Ref ModerationNotificationsTopic
+          WORKFLOW_TYPE: 'review'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              try:
+                  detail = event['detail']
+                  source_bucket = detail['bucket']
+                  source_key = detail['key']
+                  workflow_type = os.environ.get('WORKFLOW_TYPE', 'review')
+                  
+                  # Review items go to rejected bucket with special prefix
+                  target_bucket = os.environ.get('REJECTED_BUCKET')
+                  target_key = f"{workflow_type}/{datetime.utcnow().strftime('%Y/%m/%d')}/{source_key}"
+                  
+                  print(f"Processing {workflow_type} content: {source_key}")
+                  
+                  # Copy content to appropriate bucket with metadata
+                  copy_source = {'Bucket': source_bucket, 'Key': source_key}
+                  s3.copy_object(
+                      CopySource=copy_source,
+                      Bucket=target_bucket,
+                      Key=target_key,
+                      MetadataDirective='REPLACE',
+                      Metadata={
+                          'moderation-decision': detail['decision'],
+                          'moderation-confidence': str(detail['confidence']),
+                          'moderation-reason': detail['reason'],
+                          'processed-timestamp': datetime.utcnow().isoformat(),
+                          'workflow-type': workflow_type,
+                          'requires-human-review': 'true'
+                      }
+                  )
+                  
+                  # Send notification with comprehensive details
+                  message = f"""
+          Content Moderation Result: {detail['decision'].upper()}
+          
+          File: {source_key}
+          Confidence: {detail['confidence']:.2f}
+          Reason: {detail['reason']}
+          Categories: {', '.join(detail.get('categories', []))}
+          Timestamp: {detail['timestamp']}
+          Environment: {detail.get('environment', 'unknown')}
+          
+          Target Location: s3://{target_bucket}/{target_key}
+          
+          This content requires human review before final decision. 
+          Please review and take appropriate action.
+                  """
+                  
+                  sns.publish(
+                      TopicArn=os.environ.get('SNS_TOPIC_ARN'),
+                      Subject=f'Content Needs Review: {source_key}',
+                      Message=message
+                  )
+                  
+                  print(f"Review content processed successfully: {target_key}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Content processed for {workflow_type}',
+                          'target_location': f's3://{target_bucket}/{target_key}'
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in review handler: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # EventBridge Rules for workflow routing
+  ApprovedContentRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-approved-content-rule'
+      Description: 'Route approved content to processing workflow'
+      EventBusName: !Ref ContentModerationEventBus
+      EventPattern:
+        source:
+          - 'content.moderation'
+        detail-type:
+          - 'Content Approved'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ApprovedHandlerFunction.Arn
+          Id: 'ApprovedHandlerTarget'
+
+  RejectedContentRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-rejected-content-rule'
+      Description: 'Route rejected content to processing workflow'
+      EventBusName: !Ref ContentModerationEventBus
+      EventPattern:
+        source:
+          - 'content.moderation'
+        detail-type:
+          - 'Content Rejected'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt RejectedHandlerFunction.Arn
+          Id: 'RejectedHandlerTarget'
+
+  ReviewContentRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-review-content-rule'
+      Description: 'Route content needing review to processing workflow'
+      EventBusName: !Ref ContentModerationEventBus
+      EventPattern:
+        source:
+          - 'content.moderation'
+        detail-type:
+          - 'Content Review'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ReviewHandlerFunction.Arn
+          Id: 'ReviewHandlerTarget'
+
+  # Lambda permissions for EventBridge to invoke workflow functions
+  ApprovedHandlerEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApprovedHandlerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ApprovedContentRule.Arn
+
+  RejectedHandlerEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RejectedHandlerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RejectedContentRule.Arn
+
+  ReviewHandlerEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ReviewHandlerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ReviewContentRule.Arn
+
+  # CloudWatch Log Groups for Lambda functions with retention
+  ContentAnalysisLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ContentAnalysisFunction}'
+      RetentionInDays: !If [IsProduction, 365, 30]
+
+  ApprovedHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ApprovedHandlerFunction}'
+      RetentionInDays: !If [IsProduction, 365, 30]
+
+  RejectedHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${RejectedHandlerFunction}'
+      RetentionInDays: !If [IsProduction, 365, 30]
+
+  ReviewHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ReviewHandlerFunction}'
+      RetentionInDays: !If [IsProduction, 365, 30]
+
+  # CloudWatch Alarms for monitoring
+  ContentAnalysisErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-content-analysis-errors'
+      AlarmDescription: 'Monitor errors in content analysis Lambda function'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ContentAnalysisFunction
+      AlarmActions:
+        - !Ref ModerationNotificationsTopic
+
+  HighVolumeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-high-volume-processing'
+      AlarmDescription: 'Monitor high volume of content processing'
+      MetricName: Invocations
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ContentAnalysisFunction
+      AlarmActions:
+        - !Ref ModerationNotificationsTopic
+
+# Template Outputs
+Outputs:
+  ContentBucketName:
+    Description: 'Name of the S3 bucket for content uploads'
+    Value: !Ref ContentBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ContentBucket'
+
+  ApprovedContentBucketName:
+    Description: 'Name of the S3 bucket for approved content'
+    Value: !Ref ApprovedContentBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ApprovedContentBucket'
+
+  RejectedContentBucketName:
+    Description: 'Name of the S3 bucket for rejected content'
+    Value: !Ref RejectedContentBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-RejectedContentBucket'
+
+  ModerationNotificationsTopicArn:
+    Description: 'ARN of the SNS topic for moderation notifications'
+    Value: !Ref ModerationNotificationsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-ModerationNotificationsTopic'
+
+  ContentModerationEventBusArn:
+    Description: 'ARN of the custom EventBridge bus for content moderation'
+    Value: !GetAtt ContentModerationEventBus.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ContentModerationEventBus'
+
+  ContentAnalysisFunctionArn:
+    Description: 'ARN of the content analysis Lambda function'
+    Value: !GetAtt ContentAnalysisFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ContentAnalysisFunction'
+
+  ContentUploadCommand:
+    Description: 'AWS CLI command to upload content for testing'
+    Value: !Sub 'aws s3 cp your-content.txt s3://${ContentBucket}/'
+
+  MonitoringDashboardUrl:
+    Description: 'URL to CloudWatch dashboard for monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-monitoring'
+
+  BedrockConsoleUrl:
+    Description: 'URL to Amazon Bedrock console for model configuration'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/bedrock/home?region=${AWS::Region}'
+
+  EventBridgeRulesUrl:
+    Description: 'URL to EventBridge rules in AWS Console'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/events/home?region=${AWS::Region}#/eventbus/${ContentModerationEventBus}/rules'
+
+  SystemHealthCheckCommand:
+    Description: 'AWS CLI command to check system health'
+    Value: !Sub 'aws logs describe-log-groups --log-group-name-prefix "/aws/lambda/${ProjectName}"'

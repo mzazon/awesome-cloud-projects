@@ -1,0 +1,679 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure automation platform using AWS Proton and CDK for standardized, self-service infrastructure provisioning'
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+
+Parameters:
+  # Basic Configuration
+  ProjectName:
+    Type: String
+    Description: 'Name of the project for resource naming and tagging'
+    Default: 'proton-automation'
+    MinLength: 3
+    MaxLength: 30
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must start with lowercase letter, contain only lowercase letters, numbers, and hyphens'
+
+  Environment:
+    Type: String
+    Description: 'Environment type for resource tagging and configuration'
+    Default: 'dev'
+    AllowedValues:
+      - 'dev'
+      - 'staging'
+      - 'prod'
+
+  # S3 Configuration
+  TemplateBucketName:
+    Type: String
+    Description: 'S3 bucket name for storing Proton template bundles (leave empty for auto-generation)'
+    Default: ''
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be empty or valid S3 bucket name (lowercase letters, numbers, hyphens)'
+
+  EnableVersioning:
+    Type: String
+    Description: 'Enable S3 bucket versioning for template bundles'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  # CDK Configuration
+  CDKBootstrapRequired:
+    Type: String
+    Description: 'Whether CDK bootstrapping is required in this account/region'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  # Environment Template Configuration
+  EnvironmentTemplateName:
+    Type: String
+    Description: 'Name for the Proton environment template'
+    Default: 'vpc-ecs-environment'
+    MinLength: 1
+    MaxLength: 100
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$'
+
+  EnvironmentTemplateDisplayName:
+    Type: String
+    Description: 'Display name for the environment template'
+    Default: 'VPC with ECS Cluster'
+    MinLength: 1
+    MaxLength: 100
+
+  # Service Template Configuration
+  ServiceTemplateName:
+    Type: String
+    Description: 'Name for the Proton service template'
+    Default: 'fargate-web-service'
+    MinLength: 1
+    MaxLength: 100
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$'
+
+  ServiceTemplateDisplayName:
+    Type: String
+    Description: 'Display name for the service template'
+    Default: 'Fargate Web Service'
+    MinLength: 1
+    MaxLength: 100
+
+  # Security Configuration
+  EnableProtonServiceRole:
+    Type: String
+    Description: 'Create IAM service role for AWS Proton'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  # Notification Configuration
+  EnableNotifications:
+    Type: String
+    Description: 'Enable SNS notifications for Proton events'
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for notifications (required if notifications enabled)'
+    Default: ''
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+
+Conditions:
+  # S3 Conditions
+  CreateTemplateBucket: !Equals [!Ref TemplateBucketName, '']
+  EnableS3Versioning: !Equals [!Ref EnableVersioning, 'true']
+  
+  # CDK Conditions
+  RequireCDKBootstrap: !Equals [!Ref CDKBootstrapRequired, 'true']
+  
+  # IAM Conditions
+  CreateProtonServiceRole: !Equals [!Ref EnableProtonServiceRole, 'true']
+  
+  # Notification Conditions
+  CreateNotifications: !Equals [!Ref EnableNotifications, 'true']
+  ValidNotificationEmail: !And
+    - !Condition CreateNotifications
+    - !Not [!Equals [!Ref NotificationEmail, '']]
+
+  # Environment Conditions
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  IsNotProduction: !Not [!Condition IsProduction]
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+
+Resources:
+
+  # ------------------------------------------------------------------------------
+  # S3 BUCKET FOR TEMPLATE STORAGE
+  # ------------------------------------------------------------------------------
+
+  ProtonTemplateBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateTemplateBucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-proton-templates-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [EnableS3Versioning, 'Enabled', 'Suspended']
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: TransitionToGlacier
+            Status: !If [IsProduction, 'Enabled', 'Disabled']
+            Transition:
+              StorageClass: GLACIER
+              TransitionInDays: 90
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref ProtonTemplateBucketLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-proton-templates'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Proton template storage'
+
+  # S3 Bucket Policy for Proton Access
+  ProtonTemplateBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateTemplateBucket
+    Properties:
+      Bucket: !Ref ProtonTemplateBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowProtonServiceAccess
+            Effect: Allow
+            Principal:
+              Service: proton.amazonaws.com
+            Action:
+              - 's3:GetObject'
+              - 's3:GetObjectVersion'
+            Resource: !Sub '${ProtonTemplateBucket}/*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${ProtonTemplateBucket}/*'
+              - !Ref ProtonTemplateBucket
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # ------------------------------------------------------------------------------
+  # CLOUDWATCH LOGS
+  # ------------------------------------------------------------------------------
+
+  ProtonTemplateBucketLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-proton-templates'
+      RetentionInDays: !If [IsProduction, 90, 30]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-proton-s3-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ProtonServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/proton/${ProjectName}'
+      RetentionInDays: !If [IsProduction, 90, 30]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-proton-service-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ------------------------------------------------------------------------------
+  # IAM ROLES AND POLICIES
+  # ------------------------------------------------------------------------------
+
+  # IAM Service Role for AWS Proton
+  ProtonServiceRole:
+    Type: AWS::IAM::Role
+    Condition: CreateProtonServiceRole
+    Properties:
+      RoleName: !Sub '${ProjectName}-ProtonServiceRole-${AWS::Region}'
+      Description: 'Service role for AWS Proton to manage infrastructure'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: proton.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSProtonServiceRole
+      Policies:
+        - PolicyName: ProtonAdditionalPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Additional permissions for CDK deployments
+              - Effect: Allow
+                Action:
+                  - 'cloudformation:CreateChangeSet'
+                  - 'cloudformation:DeleteChangeSet'
+                  - 'cloudformation:DescribeChangeSet'
+                  - 'cloudformation:ExecuteChangeSet'
+                  - 'cloudformation:GetTemplate'
+                  - 'cloudformation:ListChangeSets'
+                Resource: '*'
+              # S3 permissions for template access
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                Resource: !If
+                  - CreateTemplateBucket
+                  - !Sub '${ProtonTemplateBucket}/*'
+                  - !Sub 'arn:aws:s3:::${TemplateBucketName}/*'
+              # CloudWatch Logs permissions
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                Resource: 
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/proton/*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/ecs/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-proton-service-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for CDK Bootstrap
+  CDKBootstrapRole:
+    Type: AWS::IAM::Role
+    Condition: RequireCDKBootstrap
+    Properties:
+      RoleName: !Sub '${ProjectName}-CDKBootstrapRole-${AWS::Region}'
+      Description: 'Bootstrap role for CDK deployments'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/PowerUserAccess
+      Policies:
+        - PolicyName: CDKBootstrapPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'iam:CreateRole'
+                  - 'iam:AttachRolePolicy'
+                  - 'iam:DetachRolePolicy'
+                  - 'iam:DeleteRole'
+                  - 'iam:GetRole'
+                  - 'iam:PassRole'
+                  - 'iam:TagRole'
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cdk-bootstrap-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ------------------------------------------------------------------------------
+  # SNS NOTIFICATIONS (OPTIONAL)
+  # ------------------------------------------------------------------------------
+
+  ProtonNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateNotifications
+    Properties:
+      TopicName: !Sub '${ProjectName}-proton-notifications'
+      DisplayName: 'AWS Proton Infrastructure Notifications'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-proton-notifications'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ProtonNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: ValidNotificationEmail
+    Properties:
+      Protocol: email
+      TopicArn: !Ref ProtonNotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # ------------------------------------------------------------------------------
+  # LAMBDA FUNCTION FOR PROTON WEBHOOK PROCESSING
+  # ------------------------------------------------------------------------------
+
+  ProtonWebhookFunction:
+    Type: AWS::Lambda::Function
+    Condition: CreateNotifications
+    Properties:
+      FunctionName: !Sub '${ProjectName}-proton-webhook-processor'
+      Description: 'Process AWS Proton webhooks and send notifications'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: 30
+      MemorySize: 128
+      Role: !GetAtt ProtonWebhookRole.Arn
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref ProtonNotificationTopic
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Parse the Proton webhook event
+                  proton_event = json.loads(event['body'])
+                  
+                  # Extract relevant information
+                  event_type = proton_event.get('eventType', 'Unknown')
+                  resource_type = proton_event.get('resourceType', 'Unknown')
+                  resource_name = proton_event.get('resourceName', 'Unknown')
+                  status = proton_event.get('status', 'Unknown')
+                  timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
+                  
+                  # Format notification message
+                  subject = f"AWS Proton {event_type} - {resource_type}"
+                  message = f"""
+          AWS Proton Event Notification
+          
+          Project: {os.environ['PROJECT_NAME']}
+          Event Type: {event_type}
+          Resource Type: {resource_type}
+          Resource Name: {resource_name}
+          Status: {status}
+          Timestamp: {timestamp}
+          
+          Event Details:
+          {json.dumps(proton_event, indent=2)}
+          """
+                  
+                  # Send notification
+                  response = sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=subject,
+                      Message=message
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Notification sent successfully',
+                          'messageId': response['MessageId']
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error processing webhook: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-proton-webhook'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ProtonWebhookRole:
+    Type: AWS::IAM::Role
+    Condition: CreateNotifications
+    Properties:
+      RoleName: !Sub '${ProjectName}-ProtonWebhookRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref ProtonNotificationTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-proton-webhook-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ------------------------------------------------------------------------------
+  # CUSTOM RESOURCE FOR CDK BOOTSTRAP
+  # ------------------------------------------------------------------------------
+
+  CDKBootstrapCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: RequireCDKBootstrap
+    Properties:
+      ServiceToken: !GetAtt CDKBootstrapFunction.Arn
+      BootstrapRoleArn: !GetAtt CDKBootstrapRole.Arn
+      ProjectName: !Ref ProjectName
+
+  CDKBootstrapFunction:
+    Type: AWS::Lambda::Function
+    Condition: RequireCDKBootstrap
+    Properties:
+      FunctionName: !Sub '${ProjectName}-cdk-bootstrap'
+      Description: 'Bootstrap CDK in the current account and region'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: 900  # 15 minutes
+      MemorySize: 256
+      Role: !GetAtt CDKBootstrapFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import subprocess
+          import os
+          import cfnresponse
+          
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Create':
+                      # CDK bootstrap would typically be done outside CloudFormation
+                      # This is a placeholder for the actual bootstrap process
+                      print("CDK bootstrap should be performed manually or via CI/CD")
+                      print("Run: cdk bootstrap aws://<account>/<region>")
+                      
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'Message': 'CDK bootstrap placeholder completed'
+                  })
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      'Error': str(e)
+                  })
+
+  CDKBootstrapFunctionRole:
+    Type: AWS::IAM::Role
+    Condition: RequireCDKBootstrap
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+
+Outputs:
+
+  # S3 Bucket Information
+  TemplateBucketName:
+    Description: 'Name of the S3 bucket for storing Proton template bundles'
+    Value: !If
+      - CreateTemplateBucket
+      - !Ref ProtonTemplateBucket
+      - !Ref TemplateBucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-TemplateBucketName'
+
+  TemplateBucketArn:
+    Condition: CreateTemplateBucket
+    Description: 'ARN of the S3 bucket for storing Proton template bundles'
+    Value: !GetAtt ProtonTemplateBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TemplateBucketArn'
+
+  # IAM Role Information
+  ProtonServiceRoleArn:
+    Condition: CreateProtonServiceRole
+    Description: 'ARN of the AWS Proton service role'
+    Value: !GetAtt ProtonServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ProtonServiceRoleArn'
+
+  CDKBootstrapRoleArn:
+    Condition: RequireCDKBootstrap
+    Description: 'ARN of the CDK bootstrap role'
+    Value: !GetAtt CDKBootstrapRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CDKBootstrapRoleArn'
+
+  # Template Configuration
+  EnvironmentTemplateName:
+    Description: 'Name of the Proton environment template'
+    Value: !Ref EnvironmentTemplateName
+    Export:
+      Name: !Sub '${AWS::StackName}-EnvironmentTemplateName'
+
+  ServiceTemplateName:
+    Description: 'Name of the Proton service template'
+    Value: !Ref ServiceTemplateName
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceTemplateName'
+
+  # Notification Information
+  NotificationTopicArn:
+    Condition: CreateNotifications
+    Description: 'ARN of the SNS topic for Proton notifications'
+    Value: !Ref ProtonNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopicArn'
+
+  WebhookFunctionArn:
+    Condition: CreateNotifications
+    Description: 'ARN of the Lambda function for processing Proton webhooks'
+    Value: !GetAtt ProtonWebhookFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-WebhookFunctionArn'
+
+  # Log Groups
+  ServiceLogGroupName:
+    Description: 'Name of the CloudWatch log group for Proton services'
+    Value: !Ref ProtonServiceLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceLogGroupName'
+
+  # Deployment Commands
+  ProtonServiceRoleCommand:
+    Condition: CreateProtonServiceRole
+    Description: 'AWS CLI command to use this service role with Proton'
+    Value: !Sub |
+      aws proton create-environment \
+        --name "your-environment-name" \
+        --template-name "${EnvironmentTemplateName}" \
+        --template-major-version "1" \
+        --proton-service-role-arn "${ProtonServiceRole.Arn}" \
+        --spec "your-environment-spec.json"
+
+  TemplateUploadCommand:
+    Description: 'AWS CLI command to upload templates to S3'
+    Value: !Sub |
+      # Upload environment template
+      aws s3 cp environment-template-v1.tar.gz s3://${!If [CreateTemplateBucket, !Ref ProtonTemplateBucket, !Ref TemplateBucketName]}/
+      
+      # Upload service template  
+      aws s3 cp service-template-v1.tar.gz s3://${!If [CreateTemplateBucket, !Ref ProtonTemplateBucket, !Ref TemplateBucketName]}/
+
+  CDKBootstrapCommand:
+    Description: 'CDK bootstrap command for this account and region'
+    Value: !Sub 'cdk bootstrap aws://${AWS::AccountId}/${AWS::Region}'
+
+  # Stack Information
+  StackName:
+    Description: 'Name of this CloudFormation stack'
+    Value: !Ref AWS::StackName
+
+  Region:
+    Description: 'AWS Region where resources are deployed'
+    Value: !Ref AWS::Region
+
+  AccountId:
+    Description: 'AWS Account ID'
+    Value: !Ref AWS::AccountId

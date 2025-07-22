@@ -1,0 +1,1050 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Infrastructure Management Automation with CloudShell PowerShell
+  This template creates a complete serverless automation solution using
+  AWS CloudShell PowerShell scripts, Systems Manager Automation, Lambda functions,
+  and CloudWatch monitoring for infrastructure management tasks.
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Basic Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+          - OwnerEmail
+      - Label:
+          default: "Automation Configuration"
+        Parameters:
+          - ScheduleExpression
+          - AutomationTimeout
+          - LogRetentionDays
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableCloudWatchDashboard
+          - EnableSNSNotifications
+          - NotificationEmail
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      OwnerEmail:
+        default: "Owner Email"
+      ScheduleExpression:
+        default: "Automation Schedule"
+      AutomationTimeout:
+        default: "Automation Timeout (seconds)"
+      LogRetentionDays:
+        default: "Log Retention Period (days)"
+      EnableCloudWatchDashboard:
+        default: "Enable CloudWatch Dashboard"
+      EnableSNSNotifications:
+        default: "Enable SNS Notifications"
+      NotificationEmail:
+        default: "Notification Email Address"
+
+# Template Parameters
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Name of the project for resource tagging and identification
+    Default: infrastructure-automation
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: ^[a-z0-9-]+$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+
+  Environment:
+    Type: String
+    Description: Environment name for resource tagging
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    ConstraintDescription: Must be one of dev, test, staging, or prod
+
+  OwnerEmail:
+    Type: String
+    Description: Email address of the resource owner for tagging purposes
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address
+
+  ScheduleExpression:
+    Type: String
+    Description: Cron expression for automation schedule (UTC timezone)
+    Default: "cron(0 6 * * ? *)"
+    AllowedPattern: ^cron\(.+\)$
+    ConstraintDescription: Must be a valid cron expression in the format cron(...)
+
+  AutomationTimeout:
+    Type: Number
+    Description: Maximum execution time for automation workflows in seconds
+    Default: 300
+    MinValue: 60
+    MaxValue: 3600
+    ConstraintDescription: Must be between 60 and 3600 seconds
+
+  LogRetentionDays:
+    Type: Number
+    Description: Number of days to retain CloudWatch logs
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    ConstraintDescription: Must be a valid CloudWatch log retention period
+
+  EnableCloudWatchDashboard:
+    Type: String
+    Description: Whether to create a CloudWatch dashboard for monitoring
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+  EnableSNSNotifications:
+    Type: String
+    Description: Whether to enable SNS notifications for automation events
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for automation notifications (required if SNS notifications enabled)
+    Default: ""
+    AllowedPattern: ^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be empty or a valid email address
+
+# Template Conditions
+Conditions:
+  CreateCloudWatchDashboard: !Equals [!Ref EnableCloudWatchDashboard, "true"]
+  CreateSNSNotifications: !Equals [!Ref EnableSNSNotifications, "true"]
+  HasNotificationEmail: !And
+    - !Condition CreateSNSNotifications
+    - !Not [!Equals [!Ref NotificationEmail, ""]]
+
+# Template Resources
+Resources:
+  # =====================================================
+  # IAM Role for Infrastructure Automation
+  # =====================================================
+  InfrastructureAutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-automation-role"
+      Description: IAM role for infrastructure automation workflows
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - ssm.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref 'AWS::Region'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InfrastructureAutomationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Systems Manager permissions
+              - Effect: Allow
+                Action:
+                  - ssm:StartAutomationExecution
+                  - ssm:DescribeAutomationExecutions
+                  - ssm:DescribeAutomationStepExecutions
+                  - ssm:StopAutomationExecution
+                  - ssm:GetAutomationExecution
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${ProjectName}-*"
+              # CloudWatch permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: 
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/automation/${ProjectName}-*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/automation/${ProjectName}-*:*"
+              # CloudWatch Metrics permissions
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': 'Infrastructure/Automation'
+              # Read-only permissions for infrastructure health checks
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceStatus
+                  - ec2:DescribeSecurityGroups
+                  - s3:ListAllMyBuckets
+                  - s3:GetBucketEncryption
+                  - s3:GetBucketVersioning
+                  - s3:GetBucketLogging
+                  - s3:GetBucketLocation
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBClusters
+                  - elasticache:DescribeCacheClusters
+                  - elasticache:DescribeReplicationGroups
+                Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-automation-role"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref OwnerEmail
+        - Key: Purpose
+          Value: "Infrastructure automation workflows"
+
+  # =====================================================
+  # CloudWatch Log Group for Automation Logs
+  # =====================================================
+  AutomationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/automation/${ProjectName}-infrastructure-health"
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-automation-logs"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref OwnerEmail
+        - Key: Purpose
+          Value: "Infrastructure automation log storage"
+
+  # =====================================================
+  # Systems Manager Automation Document
+  # =====================================================
+  InfrastructureHealthCheckDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-InfrastructureHealthCheck"
+      DocumentType: Automation
+      DocumentFormat: YAML
+      Content:
+        schemaVersion: '0.3'
+        description: 'Infrastructure Health Check Automation with PowerShell'
+        assumeRole: !GetAtt InfrastructureAutomationRole.Arn
+        parameters:
+          Region:
+            type: String
+            description: AWS Region for health check execution
+            default: !Ref 'AWS::Region'
+          LogGroupName:
+            type: String
+            description: CloudWatch Log Group for automation logs
+            default: !Ref AutomationLogGroup
+        mainSteps:
+          - name: CreateLogGroup
+            action: 'aws:executeAwsApi'
+            description: Ensure CloudWatch Log Group exists
+            inputs:
+              Service: logs
+              Api: CreateLogGroup
+              logGroupName: '{{ LogGroupName }}'
+            onFailure: Continue
+            timeoutSeconds: 60
+          - name: ExecuteHealthCheck
+            action: 'aws:executeScript'
+            description: Execute PowerShell infrastructure health check
+            inputs:
+              Runtime: 'PowerShell Core 6.0'
+              Handler: 'Invoke-InfrastructureHealthCheck'
+              Script: |
+                param(
+                    [string]$Region,
+                    [string]$LogGroup
+                )
+                
+                # Import required modules
+                Import-Module AWS.Tools.EC2
+                Import-Module AWS.Tools.S3
+                Import-Module AWS.Tools.CloudWatch
+                
+                # Function to write structured logs
+                function Write-AutomationLog {
+                    param([string]$Message, [string]$Level = "INFO")
+                    $timestamp = Get-Date -Format "yyyy-MM-ddTHH:mm:ss.fffZ"
+                    $logEntry = @{
+                        timestamp = $timestamp
+                        level = $Level
+                        message = $Message
+                        region = $Region
+                        automation_execution_id = $env:AWS_SSM_AUTOMATION_EXECUTION_ID
+                    } | ConvertTo-Json -Compress
+                    
+                    Write-Host $logEntry
+                    
+                    # Send to CloudWatch Logs
+                    try {
+                        Write-CWLLogEvent -LogGroupName $LogGroup -LogStreamName "health-check-$(Get-Date -Format 'yyyy-MM-dd')" -LogEvent @{
+                            Message = $logEntry
+                            Timestamp = [DateTimeOffset]::UtcNow
+                        } -Region $Region
+                    } catch {
+                        Write-Host "Failed to write to CloudWatch Logs: $($_.Exception.Message)"
+                    }
+                }
+                
+                # Function to check EC2 instance health
+                function Test-EC2Health {
+                    Write-AutomationLog "Starting EC2 health assessment"
+                    try {
+                        $reservations = Get-EC2Instance -Region $Region
+                        $healthReport = @()
+                        
+                        foreach ($reservation in $reservations) {
+                            foreach ($instance in $reservation.Instances) {
+                                $healthStatus = @{
+                                    InstanceId = $instance.InstanceId
+                                    State = $instance.State.Name
+                                    Type = $instance.InstanceType
+                                    LaunchTime = $instance.LaunchTime
+                                    AZ = $instance.Placement.AvailabilityZone
+                                    PublicIP = $instance.PublicIpAddress
+                                    PrivateIP = $instance.PrivateIpAddress
+                                    SecurityGroups = ($instance.SecurityGroups | ForEach-Object { $_.GroupName }) -join ","
+                                    Tags = ($instance.Tags | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ";"
+                                }
+                                $healthReport += $healthStatus
+                            }
+                        }
+                        
+                        Write-AutomationLog "Found $($healthReport.Count) EC2 instances"
+                        return $healthReport
+                    } catch {
+                        Write-AutomationLog "Error in EC2 health check: $($_.Exception.Message)" "ERROR"
+                        return @()
+                    }
+                }
+                
+                # Function to check S3 bucket compliance
+                function Test-S3Compliance {
+                    Write-AutomationLog "Starting S3 compliance assessment"
+                    try {
+                        $buckets = Get-S3Bucket -Region $Region
+                        $complianceReport = @()
+                        
+                        foreach ($bucket in $buckets) {
+                            try {
+                                $encryption = Get-S3BucketEncryption -BucketName $bucket.BucketName -Region $Region -ErrorAction SilentlyContinue
+                                $versioning = Get-S3BucketVersioning -BucketName $bucket.BucketName -Region $Region -ErrorAction SilentlyContinue
+                                $logging = Get-S3BucketLogging -BucketName $bucket.BucketName -Region $Region -ErrorAction SilentlyContinue
+                                
+                                $complianceStatus = @{
+                                    BucketName = $bucket.BucketName
+                                    CreationDate = $bucket.CreationDate
+                                    Region = (Get-S3BucketLocation -BucketName $bucket.BucketName).Value
+                                    EncryptionEnabled = $null -ne $encryption
+                                    VersioningEnabled = $versioning.Status -eq "Enabled"
+                                    LoggingEnabled = $null -ne $logging.LoggingEnabled -and $logging.LoggingEnabled.ToString() -eq "True"
+                                    PublicAccessBlocked = $true  # Assume blocked for safety
+                                }
+                                $complianceReport += $complianceStatus
+                            } catch {
+                                Write-AutomationLog "Error checking bucket $($bucket.BucketName): $($_.Exception.Message)" "WARN"
+                            }
+                        }
+                        
+                        Write-AutomationLog "Assessed $($complianceReport.Count) S3 buckets"
+                        return $complianceReport
+                    } catch {
+                        Write-AutomationLog "Error in S3 compliance check: $($_.Exception.Message)" "ERROR"
+                        return @()
+                    }
+                }
+                
+                # Function to send custom metrics
+                function Send-CustomMetrics {
+                    param($EC2Count, $S3Count, $HealthyInstances, $CompliantBuckets)
+                    
+                    try {
+                        # Send EC2 metrics
+                        Write-CWMetricData -Namespace "Infrastructure/Automation" -MetricData @{
+                            MetricName = "EC2InstanceCount"
+                            Value = $EC2Count
+                            Unit = "Count"
+                            Timestamp = (Get-Date)
+                        } -Region $Region
+                        
+                        # Send S3 metrics
+                        Write-CWMetricData -Namespace "Infrastructure/Automation" -MetricData @{
+                            MetricName = "S3BucketCount"
+                            Value = $S3Count
+                            Unit = "Count"
+                            Timestamp = (Get-Date)
+                        } -Region $Region
+                        
+                        # Send health metrics
+                        Write-CWMetricData -Namespace "Infrastructure/Automation" -MetricData @{
+                            MetricName = "HealthyInstanceCount"
+                            Value = $HealthyInstances
+                            Unit = "Count"
+                            Timestamp = (Get-Date)
+                        } -Region $Region
+                        
+                        # Send compliance metrics
+                        Write-CWMetricData -Namespace "Infrastructure/Automation" -MetricData @{
+                            MetricName = "CompliantBucketCount"
+                            Value = $CompliantBuckets
+                            Unit = "Count"
+                            Timestamp = (Get-Date)
+                        } -Region $Region
+                        
+                        Write-AutomationLog "Custom metrics sent to CloudWatch"
+                    } catch {
+                        Write-AutomationLog "Error sending custom metrics: $($_.Exception.Message)" "ERROR"
+                    }
+                }
+                
+                # Main execution function
+                function Invoke-InfrastructureHealthCheck {
+                    try {
+                        Write-AutomationLog "Infrastructure health check started"
+                        
+                        # Perform health checks
+                        $ec2Health = Test-EC2Health
+                        $s3Compliance = Test-S3Compliance
+                        
+                        # Calculate summary statistics
+                        $healthyInstances = ($ec2Health | Where-Object { $_.State -eq "running" }).Count
+                        $compliantBuckets = ($s3Compliance | Where-Object { $_.EncryptionEnabled -and $_.VersioningEnabled }).Count
+                        
+                        # Create comprehensive report
+                        $report = @{
+                            Timestamp = Get-Date -Format "yyyy-MM-ddTHH:mm:ss.fffZ"
+                            Region = $Region
+                            ExecutionId = $env:AWS_SSM_AUTOMATION_EXECUTION_ID
+                            Summary = @{
+                                EC2InstanceCount = $ec2Health.Count
+                                S3BucketCount = $s3Compliance.Count
+                                HealthyInstances = $healthyInstances
+                                CompliantBuckets = $compliantBuckets
+                                HealthPercentage = if ($ec2Health.Count -gt 0) { [math]::Round(($healthyInstances / $ec2Health.Count) * 100, 2) } else { 100 }
+                                CompliancePercentage = if ($s3Compliance.Count -gt 0) { [math]::Round(($compliantBuckets / $s3Compliance.Count) * 100, 2) } else { 100 }
+                            }
+                            EC2Health = $ec2Health
+                            S3Compliance = $s3Compliance
+                        }
+                        
+                        # Send custom metrics to CloudWatch
+                        Send-CustomMetrics -EC2Count $ec2Health.Count -S3Count $s3Compliance.Count -HealthyInstances $healthyInstances -CompliantBuckets $compliantBuckets
+                        
+                        # Log summary
+                        Write-AutomationLog "Health check completed successfully"
+                        Write-AutomationLog ($report.Summary | ConvertTo-Json)
+                        
+                        # Return results for Systems Manager
+                        return @{
+                            Status = "SUCCESS"
+                            Summary = $report.Summary
+                            Details = "Infrastructure health check completed successfully"
+                        }
+                        
+                    } catch {
+                        $errorMsg = "Health check failed: $($_.Exception.Message)"
+                        Write-AutomationLog $errorMsg "ERROR"
+                        
+                        # Send error metric
+                        try {
+                            Write-CWMetricData -Namespace "Infrastructure/Automation" -MetricData @{
+                                MetricName = "AutomationErrors"
+                                Value = 1
+                                Unit = "Count"
+                                Timestamp = (Get-Date)
+                            } -Region $Region
+                        } catch {}
+                        
+                        throw $errorMsg
+                    }
+                }
+                
+                # Execute the main function
+                Invoke-InfrastructureHealthCheck
+              InputPayload:
+                Region: '{{ Region }}'
+                LogGroup: '{{ LogGroupName }}'
+            timeoutSeconds: !Ref AutomationTimeout
+        outputs:
+          - ExecuteHealthCheck.Payload
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-automation-document"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref OwnerEmail
+        - Key: Purpose
+          Value: "Infrastructure health check automation"
+
+  # =====================================================
+  # Lambda Function for Automation Orchestration
+  # =====================================================
+  InfrastructureAutomationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-automation-orchestrator"
+      Description: Lambda function to orchestrate infrastructure automation workflows
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt InfrastructureAutomationRole.Arn
+      Timeout: !Ref AutomationTimeout
+      MemorySize: 256
+      Environment:
+        Variables:
+          AUTOMATION_DOCUMENT_NAME: !Ref InfrastructureHealthCheckDocument
+          LOG_GROUP_NAME: !Ref AutomationLogGroup
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          SNS_TOPIC_ARN: !If [CreateSNSNotifications, !Ref AutomationNotificationTopic, ""]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from datetime import datetime
+          from botocore.exceptions import ClientError, BotoCoreError
+          
+          # Configure logging
+          logging.basicConfig(level=logging.INFO)
+          logger = logging.getLogger(__name__)
+          
+          def lambda_handler(event, context):
+              """
+              Lambda function to orchestrate infrastructure automation workflows
+              """
+              # Initialize AWS clients
+              ssm = boto3.client('ssm')
+              cloudwatch = boto3.client('cloudwatch')
+              sns = boto3.client('sns') if os.environ.get('SNS_TOPIC_ARN') else None
+              
+              # Get configuration from environment variables
+              automation_document = os.environ['AUTOMATION_DOCUMENT_NAME']
+              log_group_name = os.environ['LOG_GROUP_NAME']
+              project_name = os.environ['PROJECT_NAME']
+              environment = os.environ['ENVIRONMENT']
+              sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
+              region = os.environ['AWS_REGION']
+              
+              execution_id = None
+              
+              try:
+                  logger.info(f"Starting automation orchestration for project: {project_name}")
+                  
+                  # Execute Systems Manager automation document
+                  response = ssm.start_automation_execution(
+                      DocumentName=automation_document,
+                      Parameters={
+                          'Region': [region],
+                          'LogGroupName': [log_group_name]
+                      }
+                  )
+                  
+                  execution_id = response['AutomationExecutionId']
+                  logger.info(f"Automation execution started: {execution_id}")
+                  
+                  # Send success metric to CloudWatch
+                  cloudwatch.put_metric_data(
+                      Namespace='Infrastructure/Automation',
+                      MetricData=[
+                          {
+                              'MetricName': 'AutomationExecutions',
+                              'Value': 1,
+                              'Unit': 'Count',
+                              'Dimensions': [
+                                  {
+                                      'Name': 'DocumentName',
+                                      'Value': automation_document
+                                  },
+                                  {
+                                      'Name': 'Project',
+                                      'Value': project_name
+                                  },
+                                  {
+                                      'Name': 'Environment',
+                                      'Value': environment
+                                  }
+                              ],
+                              'Timestamp': datetime.utcnow()
+                          }
+                      ]
+                  )
+                  
+                  # Send SNS notification if configured
+                  if sns and sns_topic_arn:
+                      try:
+                          message = {
+                              "project": project_name,
+                              "environment": environment,
+                              "execution_id": execution_id,
+                              "status": "STARTED",
+                              "timestamp": datetime.utcnow().isoformat(),
+                              "message": "Infrastructure automation workflow started successfully"
+                          }
+                          
+                          sns.publish(
+                              TopicArn=sns_topic_arn,
+                              Subject=f"[{project_name.upper()}] Infrastructure Automation Started",
+                              Message=json.dumps(message, indent=2)
+                          )
+                          logger.info("SNS notification sent successfully")
+                      except Exception as e:
+                          logger.warning(f"Failed to send SNS notification: {str(e)}")
+                  
+                  # Return success response
+                  response_body = {
+                      'statusCode': 200,
+                      'body': {
+                          'message': 'Automation started successfully',
+                          'executionId': execution_id,
+                          'documentName': automation_document,
+                          'timestamp': datetime.utcnow().isoformat(),
+                          'project': project_name,
+                          'environment': environment
+                      }
+                  }
+                  
+                  logger.info("Automation orchestration completed successfully")
+                  return response_body
+                  
+              except ClientError as e:
+                  error_code = e.response['Error']['Code']
+                  error_message = e.response['Error']['Message']
+                  logger.error(f"AWS API error ({error_code}): {error_message}")
+                  
+                  # Send error metric
+                  try:
+                      cloudwatch.put_metric_data(
+                          Namespace='Infrastructure/Automation',
+                          MetricData=[
+                              {
+                                  'MetricName': 'AutomationErrors',
+                                  'Value': 1,
+                                  'Unit': 'Count',
+                                  'Dimensions': [
+                                      {
+                                          'Name': 'ErrorType',
+                                          'Value': error_code
+                                      },
+                                      {
+                                          'Name': 'Project',
+                                          'Value': project_name
+                                      },
+                                      {
+                                          'Name': 'Environment',
+                                          'Value': environment
+                                      }
+                                  ],
+                                  'Timestamp': datetime.utcnow()
+                              }
+                          ]
+                      )
+                  except Exception as metric_error:
+                      logger.error(f"Failed to send error metric: {str(metric_error)}")
+                  
+                  # Send error notification if SNS is configured
+                  if sns and sns_topic_arn:
+                      try:
+                          error_message_body = {
+                              "project": project_name,
+                              "environment": environment,
+                              "execution_id": execution_id,
+                              "status": "FAILED",
+                              "timestamp": datetime.utcnow().isoformat(),
+                              "error_code": error_code,
+                              "error_message": error_message,
+                              "message": f"Infrastructure automation workflow failed: {error_message}"
+                          }
+                          
+                          sns.publish(
+                              TopicArn=sns_topic_arn,
+                              Subject=f"[{project_name.upper()}] Infrastructure Automation FAILED",
+                              Message=json.dumps(error_message_body, indent=2)
+                          )
+                      except Exception as sns_error:
+                          logger.error(f"Failed to send error notification: {str(sns_error)}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': {
+                          'error': f"AWS API Error: {error_message}",
+                          'errorCode': error_code,
+                          'timestamp': datetime.utcnow().isoformat(),
+                          'project': project_name,
+                          'environment': environment
+                      }
+                  }
+                  
+              except Exception as e:
+                  error_message = str(e)
+                  logger.error(f"Unexpected error: {error_message}")
+                  
+                  # Send generic error metric
+                  try:
+                      cloudwatch.put_metric_data(
+                          Namespace='Infrastructure/Automation',
+                          MetricData=[
+                              {
+                                  'MetricName': 'AutomationErrors',
+                                  'Value': 1,
+                                  'Unit': 'Count',
+                                  'Dimensions': [
+                                      {
+                                          'Name': 'ErrorType',
+                                          'Value': 'UnexpectedError'
+                                      },
+                                      {
+                                          'Name': 'Project',
+                                          'Value': project_name
+                                      },
+                                      {
+                                          'Name': 'Environment',
+                                          'Value': environment
+                                      }
+                                  ],
+                                  'Timestamp': datetime.utcnow()
+                              }
+                          ]
+                      )
+                  except Exception as metric_error:
+                      logger.error(f"Failed to send error metric: {str(metric_error)}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': {
+                          'error': f"Unexpected error: {error_message}",
+                          'timestamp': datetime.utcnow().isoformat(),
+                          'project': project_name,
+                          'environment': environment
+                      }
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-automation-function"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref OwnerEmail
+        - Key: Purpose
+          Value: "Infrastructure automation orchestration"
+
+  # =====================================================
+  # EventBridge Rule for Scheduled Automation
+  # =====================================================
+  InfrastructureHealthScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-health-schedule"
+      Description: Scheduled rule for infrastructure health check automation
+      State: ENABLED
+      ScheduleExpression: !Ref ScheduleExpression
+      Targets:
+        - Arn: !GetAtt InfrastructureAutomationFunction.Arn
+          Id: !Sub "${ProjectName}AutomationTarget"
+          InputTransformer:
+            InputPathsMap:
+              timestamp: "$.time"
+            InputTemplate: !Sub |
+              {
+                "source": "aws.events",
+                "detail-type": "Scheduled Event",
+                "detail": {
+                  "project": "${ProjectName}",
+                  "environment": "${Environment}",
+                  "scheduledTime": "<timestamp>",
+                  "triggerType": "scheduled"
+                }
+              }
+
+  # Lambda Permission for EventBridge
+  InfrastructureAutomationFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref InfrastructureAutomationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt InfrastructureHealthScheduleRule.Arn
+
+  # =====================================================
+  # SNS Topic for Notifications (Conditional)
+  # =====================================================
+  AutomationNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSNSNotifications
+    Properties:
+      TopicName: !Sub "${ProjectName}-${Environment}-automation-notifications"
+      DisplayName: !Sub "Infrastructure Automation Notifications - ${ProjectName}"
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-notifications"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref OwnerEmail
+        - Key: Purpose
+          Value: "Infrastructure automation notifications"
+
+  # SNS Subscription for Email Notifications
+  AutomationNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref AutomationNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # =====================================================
+  # CloudWatch Alarms for Monitoring
+  # =====================================================
+  AutomationErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-automation-errors"
+      AlarmDescription: Alert when infrastructure automation errors occur
+      MetricName: AutomationErrors
+      Namespace: Infrastructure/Automation
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !If [CreateSNSNotifications, !Ref AutomationNotificationTopic, !Ref "AWS::NoValue"]
+      Dimensions:
+        - Name: Project
+          Value: !Ref ProjectName
+        - Name: Environment
+          Value: !Ref Environment
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-errors-alarm"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref OwnerEmail
+
+  AutomationSuccessAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-automation-success"
+      AlarmDescription: Alert when infrastructure automation hasn't run successfully recently
+      MetricName: AutomationExecutions
+      Namespace: Infrastructure/Automation
+      Statistic: Sum
+      Period: 86400  # 24 hours
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !If [CreateSNSNotifications, !Ref AutomationNotificationTopic, !Ref "AWS::NoValue"]
+      Dimensions:
+        - Name: Project
+          Value: !Ref ProjectName
+        - Name: Environment
+          Value: !Ref Environment
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-success-alarm"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref OwnerEmail
+
+  # =====================================================
+  # CloudWatch Dashboard (Conditional)
+  # =====================================================
+  InfrastructureAutomationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateCloudWatchDashboard
+    Properties:
+      DashboardName: !Sub "${ProjectName}-${Environment}-automation-dashboard"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["Infrastructure/Automation", "AutomationExecutions", "Project", "${ProjectName}", "Environment", "${Environment}"],
+                  [".", "AutomationErrors", ".", ".", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Infrastructure Automation Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["Infrastructure/Automation", "EC2InstanceCount"],
+                  [".", "S3BucketCount"],
+                  [".", "HealthyInstanceCount"],
+                  [".", "CompliantBucketCount"]
+                ],
+                "period": 3600,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Infrastructure Health Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${AutomationLogGroup}'\n| fields @timestamp, level, message, region\n| filter level != \"INFO\" or message like /ERROR/ or message like /WARN/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Automation Logs (Errors & Warnings)",
+                "view": "table"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${AutomationLogGroup}'\n| fields @timestamp, level, message\n| filter message like /Summary/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Automation Summaries",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+# =====================================================
+# Template Outputs
+# =====================================================
+Outputs:
+  InfrastructureAutomationRoleArn:
+    Description: ARN of the IAM role used for infrastructure automation
+    Value: !GetAtt InfrastructureAutomationRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-automation-role-arn"
+
+  AutomationDocumentName:
+    Description: Name of the Systems Manager automation document
+    Value: !Ref InfrastructureHealthCheckDocument
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-automation-document"
+
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function for automation orchestration
+    Value: !GetAtt InfrastructureAutomationFunction.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-automation-function-arn"
+
+  LambdaFunctionName:
+    Description: Name of the Lambda function for automation orchestration
+    Value: !Ref InfrastructureAutomationFunction
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-automation-function-name"
+
+  LogGroupName:
+    Description: CloudWatch Log Group for automation logs
+    Value: !Ref AutomationLogGroup
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-automation-logs"
+
+  EventBridgeRuleArn:
+    Description: ARN of the EventBridge rule for scheduled automation
+    Value: !GetAtt InfrastructureHealthScheduleRule.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-schedule-rule-arn"
+
+  SNSTopicArn:
+    Description: ARN of the SNS topic for notifications (if created)
+    Value: !If [CreateSNSNotifications, !Ref AutomationNotificationTopic, "Not Created"]
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-sns-topic-arn"
+
+  CloudWatchDashboardURL:
+    Description: URL to the CloudWatch dashboard (if created)
+    Value: !If 
+      - CreateCloudWatchDashboard
+      - !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-automation-dashboard"
+      - "Dashboard not created"
+
+  AutomationSchedule:
+    Description: Cron expression for the automation schedule
+    Value: !Ref ScheduleExpression
+
+  DeploymentSummary:
+    Description: Summary of deployed resources
+    Value: !Sub |
+      Infrastructure Automation Stack Deployed Successfully!
+      
+      Project: ${ProjectName}
+      Environment: ${Environment}
+      Region: ${AWS::Region}
+      Schedule: ${ScheduleExpression}
+      
+      Key Resources:
+      - IAM Role: ${InfrastructureAutomationRole}
+      - Automation Document: ${InfrastructureHealthCheckDocument}
+      - Lambda Function: ${InfrastructureAutomationFunction}
+      - Log Group: ${AutomationLogGroup}
+      - EventBridge Rule: ${InfrastructureHealthScheduleRule}
+      
+      Next Steps:
+      1. Verify the automation runs successfully
+      2. Review CloudWatch logs for execution details
+      3. Monitor CloudWatch dashboard for infrastructure health
+      4. Configure additional notification recipients if needed

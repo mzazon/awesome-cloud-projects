@@ -1,0 +1,754 @@
+# Infrastructure Manager configuration for AlloyDB AI Performance Monitoring
+# This configuration deploys the complete infrastructure for automating database
+# performance optimization using AlloyDB AI, Cloud Monitoring, Vertex AI, and Cloud Functions
+
+# API Services - Enable required Google Cloud APIs
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: alloydb-api
+spec:
+  serviceId: alloydb.googleapis.com
+  projectRef:
+    external: ${PROJECT_ID}
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: compute-api
+spec:
+  serviceId: compute.googleapis.com
+  projectRef:
+    external: ${PROJECT_ID}
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: monitoring-api
+spec:
+  serviceId: monitoring.googleapis.com
+  projectRef:
+    external: ${PROJECT_ID}
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: aiplatform-api
+spec:
+  serviceId: aiplatform.googleapis.com
+  projectRef:
+    external: ${PROJECT_ID}
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: cloudfunctions-api
+spec:
+  serviceId: cloudfunctions.googleapis.com
+  projectRef:
+    external: ${PROJECT_ID}
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: cloudscheduler-api
+spec:
+  serviceId: cloudscheduler.googleapis.com
+  projectRef:
+    external: ${PROJECT_ID}
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: servicenetworking-api
+spec:
+  serviceId: servicenetworking.googleapis.com
+  projectRef:
+    external: ${PROJECT_ID}
+---
+apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1
+kind: Service
+metadata:
+  name: pubsub-api
+spec:
+  serviceId: pubsub.googleapis.com
+  projectRef:
+    external: ${PROJECT_ID}
+---
+
+# VPC Network - Custom network for AlloyDB with proper isolation
+apiVersion: compute.cnrm.cloud.google.com/v1beta1
+kind: ComputeNetwork
+metadata:
+  name: alloydb-perf-vpc
+spec:
+  autoCreateSubnetworks: false
+  routingMode: REGIONAL
+  description: "VPC network for AlloyDB AI performance monitoring system"
+---
+
+# Subnet - Regional subnet with sufficient IP range for AlloyDB
+apiVersion: compute.cnrm.cloud.google.com/v1beta1
+kind: ComputeSubnetwork
+metadata:
+  name: alloydb-perf-subnet
+spec:
+  region: ${REGION}
+  ipCidrRange: "10.0.0.0/24"
+  networkRef:
+    name: alloydb-perf-vpc
+  description: "Subnet for AlloyDB AI cluster and associated resources"
+  enableFlowLogs: true
+  logConfig:
+    aggregationInterval: "INTERVAL_10_MIN"
+    flowSampling: 0.5
+    metadata: "INCLUDE_ALL_METADATA"
+---
+
+# Global Address - Reserved IP range for private service connection
+apiVersion: compute.cnrm.cloud.google.com/v1beta1
+kind: ComputeGlobalAddress
+metadata:
+  name: alloydb-range
+spec:
+  purpose: VPC_PEERING
+  addressType: INTERNAL
+  prefixLength: 16
+  networkRef:
+    name: alloydb-perf-vpc
+  description: "IP range reserved for AlloyDB private service connection"
+---
+
+# Service Networking Connection - Private connection for AlloyDB
+apiVersion: servicenetworking.cnrm.cloud.google.com/v1beta1
+kind: ServiceNetworkingConnection
+metadata:
+  name: alloydb-private-connection
+spec:
+  networkRef:
+    name: alloydb-perf-vpc
+  reservedPeeringRanges:
+    - name: alloydb-range
+  service: servicenetworking.googleapis.com
+---
+
+# Cloud Storage Bucket - For Cloud Functions source code
+apiVersion: storage.cnrm.cloud.google.com/v1beta1
+kind: StorageBucket
+metadata:
+  name: alloydb-functions-source-${RANDOM_SUFFIX}
+spec:
+  location: ${REGION}
+  storageClass: REGIONAL
+  versioning:
+    enabled: true
+  uniformBucketLevelAccess: true
+  lifecycleRule:
+    - action:
+        type: Delete
+      condition:
+        age: 30
+  encryption:
+    defaultKmsKeyName: projects/${PROJECT_ID}/locations/${REGION}/keyRings/alloydb-perf-keyring/cryptoKeys/alloydb-perf-key
+---
+
+# Cloud KMS Key Ring - For encryption of AlloyDB and related resources
+apiVersion: kms.cnrm.cloud.google.com/v1beta1
+kind: KMSKeyRing
+metadata:
+  name: alloydb-perf-keyring
+spec:
+  location: ${REGION}
+---
+
+# Cloud KMS Crypto Key - For AlloyDB encryption
+apiVersion: kms.cnrm.cloud.google.com/v1beta1
+kind: KMSCryptoKey
+metadata:
+  name: alloydb-perf-key
+spec:
+  keyRingRef:
+    name: alloydb-perf-keyring
+  purpose: ENCRYPT_DECRYPT
+  rotationPeriod: "7776000s" # 90 days
+  versionTemplate:
+    algorithm: GOOGLE_SYMMETRIC_ENCRYPTION
+    protectionLevel: SOFTWARE
+---
+
+# IAM Service Account - For AlloyDB cluster
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMServiceAccount
+metadata:
+  name: alloydb-service-account
+spec:
+  displayName: "AlloyDB AI Performance Service Account"
+  description: "Service account for AlloyDB AI cluster with minimal required permissions"
+---
+
+# IAM Service Account - For Cloud Functions
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMServiceAccount
+metadata:
+  name: alloydb-functions-sa
+spec:
+  displayName: "AlloyDB Functions Service Account"
+  description: "Service account for Cloud Functions performing AlloyDB optimization"
+---
+
+# IAM Policy Binding - AlloyDB service account permissions
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: alloydb-sa-monitoring-writer
+spec:
+  member: serviceAccount:alloydb-service-account@${PROJECT_ID}.iam.gserviceaccount.com
+  role: roles/monitoring.metricWriter
+  resourceRef:
+    apiVersion: resourcemanager.cnrm.cloud.google.com/v1beta1
+    kind: Project
+    external: ${PROJECT_ID}
+---
+
+# IAM Policy Binding - Functions service account AlloyDB admin
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: functions-sa-alloydb-admin
+spec:
+  member: serviceAccount:alloydb-functions-sa@${PROJECT_ID}.iam.gserviceaccount.com
+  role: roles/alloydb.admin
+  resourceRef:
+    apiVersion: resourcemanager.cnrm.cloud.google.com/v1beta1
+    kind: Project
+    external: ${PROJECT_ID}
+---
+
+# IAM Policy Binding - Functions service account monitoring permissions
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: functions-sa-monitoring-admin
+spec:
+  member: serviceAccount:alloydb-functions-sa@${PROJECT_ID}.iam.gserviceaccount.com
+  role: roles/monitoring.admin
+  resourceRef:
+    apiVersion: resourcemanager.cnrm.cloud.google.com/v1beta1
+    kind: Project
+    external: ${PROJECT_ID}
+---
+
+# IAM Policy Binding - Functions service account Vertex AI permissions
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: functions-sa-aiplatform-user
+spec:
+  member: serviceAccount:alloydb-functions-sa@${PROJECT_ID}.iam.gserviceaccount.com
+  role: roles/aiplatform.user
+  resourceRef:
+    apiVersion: resourcemanager.cnrm.cloud.google.com/v1beta1
+    kind: Project
+    external: ${PROJECT_ID}
+---
+
+# Pub/Sub Topic - For performance optimization events
+apiVersion: pubsub.cnrm.cloud.google.com/v1beta1
+kind: PubSubTopic
+metadata:
+  name: alloydb-performance-events
+spec:
+  messageRetentionDuration: "604800s" # 7 days
+  messageStoragePolicy:
+    allowedPersistenceRegions:
+      - ${REGION}
+---
+
+# Pub/Sub Subscription - For Cloud Functions trigger
+apiVersion: pubsub.cnrm.cloud.google.com/v1beta1
+kind: PubSubSubscription
+metadata:
+  name: alloydb-performance-subscription
+spec:
+  topicRef:
+    name: alloydb-performance-events
+  ackDeadlineSeconds: 600
+  messageRetentionDuration: "604800s"
+  retryPolicy:
+    minimumBackoff: "10s"
+    maximumBackoff: "600s"
+  deadLetterPolicy:
+    maxDeliveryAttempts: 5
+---
+
+# AlloyDB Cluster - Main database cluster with AI capabilities
+apiVersion: alloydb.cnrm.cloud.google.com/v1beta1
+kind: AlloyDBCluster
+metadata:
+  name: alloydb-perf-cluster
+spec:
+  location: ${REGION}
+  networkRef:
+    name: alloydb-perf-vpc
+  clusterType: PRIMARY
+  databaseVersion: POSTGRES_15
+  displayName: "AlloyDB AI Performance Cluster"
+  
+  # Enable AI and vector capabilities
+  databaseFlags:
+    "cloudsql.iam_authentication": "on"
+    "shared_preload_libraries": "vector"
+    "max_connections": "1000"
+    "shared_buffers": "256MB"
+    "effective_cache_size": "1GB"
+    "maintenance_work_mem": "64MB"
+    "checkpoint_completion_target": "0.9"
+    "wal_buffers": "16MB"
+    "default_statistics_target": "100"
+    "random_page_cost": "1.1"
+    "effective_io_concurrency": "200"
+  
+  # Backup and maintenance configuration
+  automatedBackupPolicy:
+    enabled: true
+    backupWindow: "23:00"
+    location: ${REGION}
+    weeklySchedule:
+      startTimes:
+        - hours: 23
+          minutes: 0
+    retentionCount: 7
+    encryptionConfig:
+      kmsKeyNameRef:
+        name: alloydb-perf-key
+  
+  # Security and encryption
+  encryptionConfig:
+    kmsKeyNameRef:
+      name: alloydb-perf-key
+  
+  # Network security
+  networkConfig:
+    networkRef:
+      name: alloydb-perf-vpc
+    allocatedIpRange: alloydb-range
+---
+
+# AlloyDB Instance - Primary instance with optimal configuration for AI workloads
+apiVersion: alloydb.cnrm.cloud.google.com/v1beta1
+kind: AlloyDBInstance
+metadata:
+  name: alloydb-perf-primary
+spec:
+  location: ${REGION}
+  clusterRef:
+    name: alloydb-perf-cluster
+  instanceType: PRIMARY
+  machineConfig:
+    cpuCount: 4
+  displayName: "AlloyDB AI Primary Instance"
+  
+  # Instance configuration optimized for AI workloads
+  databaseFlags:
+    "max_worker_processes": "8"
+    "max_parallel_workers": "4"
+    "max_parallel_workers_per_gather": "2"
+    "work_mem": "4MB"
+    "hash_mem_multiplier": "1.0"
+  
+  # Availability and maintenance
+  availabilityType: ZONAL
+  
+  # Monitoring and logging
+  labels:
+    environment: "production"
+    purpose: "ai-performance-monitoring"
+    cost-center: "database-optimization"
+---
+
+# Cloud Function - Performance optimization function (Gen 2)
+apiVersion: cloudfunctions.cnrm.cloud.google.com/v1beta1
+kind: CloudFunctionsFunction
+metadata:
+  name: alloydb-performance-optimizer
+spec:
+  location: ${REGION}
+  description: "Automated AlloyDB performance optimization using AI insights"
+  
+  # Runtime configuration
+  buildConfig:
+    runtime: python311
+    entryPoint: optimize_alloydb_performance
+    source:
+      storageSource:
+        bucketRef:
+          name: alloydb-functions-source-${RANDOM_SUFFIX}
+        object: function-source.zip
+  
+  # Service configuration
+  serviceConfig:
+    maxInstanceCount: 10
+    minInstanceCount: 0
+    availableMemory: "512Mi"
+    timeoutSeconds: 540
+    maxInstanceRequestConcurrency: 1
+    
+    # Environment variables
+    environmentVariables:
+      PROJECT_ID: ${PROJECT_ID}
+      REGION: ${REGION}
+      CLUSTER_NAME: alloydb-perf-cluster
+      INSTANCE_NAME: alloydb-perf-primary
+    
+    # Service account
+    serviceAccountEmailRef:
+      name: alloydb-functions-sa
+    
+    # Security
+    ingressSettings: ALLOW_INTERNAL_ONLY
+    vpcConnector: alloydb-perf-connector
+  
+  # Event trigger
+  eventTrigger:
+    eventType: google.cloud.pubsub.topic.v1.messagePublished
+    pubsubTopicRef:
+      name: alloydb-performance-events
+    retryPolicy: RETRY_POLICY_RETRY
+---
+
+# VPC Connector - For Cloud Functions to access AlloyDB
+apiVersion: vpcaccess.cnrm.cloud.google.com/v1beta1
+kind: VPCAccessConnector
+metadata:
+  name: alloydb-perf-connector
+spec:
+  location: ${REGION}
+  ipCidrRange: "10.8.0.0/28"
+  networkRef:
+    name: alloydb-perf-vpc
+  minThroughput: 200
+  maxThroughput: 1000
+  machineType: e2-micro
+---
+
+# Cloud Scheduler Job - Regular performance analysis
+apiVersion: cloudscheduler.cnrm.cloud.google.com/v1beta1
+kind: CloudSchedulerJob
+metadata:
+  name: performance-analyzer
+spec:
+  region: ${REGION}
+  description: "Trigger AlloyDB performance analysis every 15 minutes"
+  schedule: "*/15 * * * *"
+  timeZone: "America/New_York"
+  
+  # Pub/Sub target
+  pubsubTarget:
+    topicName: projects/${PROJECT_ID}/topics/alloydb-performance-events
+    data: |
+      {
+        "action": "analyze_performance",
+        "cluster": "alloydb-perf-cluster",
+        "instance": "alloydb-perf-primary",
+        "timestamp": "{{ .ScheduleTime }}"
+      }
+  
+  # Retry configuration
+  retryConfig:
+    retryCount: 3
+    maxRetryDuration: "300s"
+    minBackoffDuration: "5s"
+    maxBackoffDuration: "60s"
+    maxDoublings: 3
+---
+
+# Cloud Scheduler Job - Daily performance report
+apiVersion: cloudscheduler.cnrm.cloud.google.com/v1beta1
+kind: CloudSchedulerJob
+metadata:
+  name: daily-performance-report
+spec:
+  region: ${REGION}
+  description: "Generate daily AlloyDB performance optimization report"
+  schedule: "0 9 * * *"
+  timeZone: "America/New_York"
+  
+  # Pub/Sub target
+  pubsubTarget:
+    topicName: projects/${PROJECT_ID}/topics/alloydb-performance-events
+    data: |
+      {
+        "action": "generate_report",
+        "cluster": "alloydb-perf-cluster",
+        "instance": "alloydb-perf-primary",
+        "report_type": "daily_summary",
+        "timestamp": "{{ .ScheduleTime }}"
+      }
+  
+  # Retry configuration
+  retryConfig:
+    retryCount: 3
+    maxRetryDuration: "300s"
+    minBackoffDuration: "5s"
+    maxBackoffDuration: "60s"
+    maxDoublings: 3
+---
+
+# Monitoring Dashboard - Performance analytics dashboard
+apiVersion: monitoring.cnrm.cloud.google.com/v1beta1
+kind: MonitoringDashboard
+metadata:
+  name: alloydb-ai-performance-dashboard
+spec:
+  displayName: "AlloyDB AI Performance Dashboard"
+  
+  # Dashboard layout with performance metrics
+  mosaicLayout:
+    tiles:
+      # Query Performance Score
+      - width: 6
+        height: 4
+        widget:
+          title: "Query Performance Score"
+          xyChart:
+            dataSets:
+              - timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'resource.type="alloydb_database" AND metric.type="alloydb.googleapis.com/database/postgresql/queries"'
+                    aggregation:
+                      alignmentPeriod: "300s"
+                      perSeriesAligner: "ALIGN_RATE"
+                      crossSeriesReducer: "REDUCE_SUM"
+            yAxis:
+              label: "Queries per second"
+              scale: "LINEAR"
+            timeshiftDuration: "0s"
+      
+      # CPU Utilization
+      - width: 6
+        height: 4
+        xPos: 6
+        widget:
+          title: "AlloyDB CPU Utilization"
+          xyChart:
+            dataSets:
+              - timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'resource.type="alloydb_database" AND metric.type="alloydb.googleapis.com/database/cpu/utilization"'
+                    aggregation:
+                      alignmentPeriod: "300s"
+                      perSeriesAligner: "ALIGN_MEAN"
+            yAxis:
+              label: "CPU Utilization (%)"
+              scale: "LINEAR"
+      
+      # Memory Usage
+      - width: 6
+        height: 4
+        yPos: 4
+        widget:
+          title: "Memory Usage"
+          xyChart:
+            dataSets:
+              - timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'resource.type="alloydb_database" AND metric.type="alloydb.googleapis.com/database/memory/utilization"'
+                    aggregation:
+                      alignmentPeriod: "300s"
+                      perSeriesAligner: "ALIGN_MEAN"
+            yAxis:
+              label: "Memory Utilization (%)"
+              scale: "LINEAR"
+      
+      # AI Optimization Actions
+      - width: 6
+        height: 4
+        xPos: 6
+        yPos: 4
+        widget:
+          title: "AI Optimization Actions"
+          scorecard:
+            timeSeriesQuery:
+              timeSeriesFilter:
+                filter: 'resource.type="cloud_function" AND resource.label.function_name="alloydb-performance-optimizer"'
+                aggregation:
+                  alignmentPeriod: "3600s"
+                  perSeriesAligner: "ALIGN_SUM"
+                  crossSeriesReducer: "REDUCE_SUM"
+            sparkChartView:
+              sparkChartType: "SPARK_LINE"
+---
+
+# Monitoring Alert Policy - High query latency detection
+apiVersion: monitoring.cnrm.cloud.google.com/v1beta1
+kind: MonitoringAlertPolicy
+metadata:
+  name: alloydb-high-latency-alert
+spec:
+  displayName: "AlloyDB High Query Latency Alert"
+  documentation:
+    content: "Alert triggered when AlloyDB query latency exceeds threshold, indicating potential performance issues requiring AI-driven optimization."
+    mimeType: "text/markdown"
+  
+  # Alert conditions
+  conditions:
+    - displayName: "High query latency detected"
+      conditionThreshold:
+        filter: 'resource.type="alloydb_database" AND metric.type="alloydb.googleapis.com/database/postgresql/query_time"'
+        comparison: "COMPARISON_GREATER_THAN"
+        thresholdValue: 1000.0  # 1 second
+        duration: "300s"
+        aggregations:
+          - alignmentPeriod: "300s"
+            perSeriesAligner: "ALIGN_MEAN"
+            crossSeriesReducer: "REDUCE_MEAN"
+            groupByFields:
+              - "resource.label.database_id"
+  
+  # Notification settings
+  enabled: true
+  combiner: "OR"
+  
+  # Alert strategy
+  alertStrategy:
+    autoClose: "1800s"  # 30 minutes
+---
+
+# Monitoring Alert Policy - Resource utilization monitoring
+apiVersion: monitoring.cnrm.cloud.google.com/v1beta1
+kind: MonitoringAlertPolicy
+metadata:
+  name: alloydb-resource-utilization-alert
+spec:
+  displayName: "AlloyDB Resource Utilization Alert"
+  documentation:
+    content: "Alert for high CPU or memory utilization on AlloyDB instances, triggering automatic scaling recommendations."
+    mimeType: "text/markdown"
+  
+  # CPU utilization condition
+  conditions:
+    - displayName: "High CPU utilization"
+      conditionThreshold:
+        filter: 'resource.type="alloydb_database" AND metric.type="alloydb.googleapis.com/database/cpu/utilization"'
+        comparison: "COMPARISON_GREATER_THAN"
+        thresholdValue: 0.8  # 80%
+        duration: "600s"
+        aggregations:
+          - alignmentPeriod: "300s"
+            perSeriesAligner: "ALIGN_MEAN"
+            crossSeriesReducer: "REDUCE_MEAN"
+    
+    # Memory utilization condition
+    - displayName: "High memory utilization"
+      conditionThreshold:
+        filter: 'resource.type="alloydb_database" AND metric.type="alloydb.googleapis.com/database/memory/utilization"'
+        comparison: "COMPARISON_GREATER_THAN"
+        thresholdValue: 0.85  # 85%
+        duration: "600s"
+        aggregations:
+          - alignmentPeriod: "300s"
+            perSeriesAligner: "ALIGN_MEAN"
+            crossSeriesReducer: "REDUCE_MEAN"
+  
+  enabled: true
+  combiner: "OR"
+  
+  # Alert strategy with longer auto-close for resource alerts
+  alertStrategy:
+    autoClose: "3600s"  # 1 hour
+---
+
+# Vertex AI Dataset - For performance metrics training
+apiVersion: aiplatform.cnrm.cloud.google.com/v1beta1
+kind: VertexAIDataset
+metadata:
+  name: alloydb-performance-dataset
+spec:
+  location: ${REGION}
+  displayName: "AlloyDB Performance Metrics Dataset"
+  metadataSchemaUri: "gs://google-cloud-aiplatform/schema/dataset/metadata/tabular_1.0.0.yaml"
+  
+  # Dataset encryption
+  encryptionSpec:
+    kmsKeyNameRef:
+      name: alloydb-perf-key
+---
+
+# BigQuery Dataset - For long-term performance analytics
+apiVersion: bigquery.cnrm.cloud.google.com/v1beta1
+kind: BigQueryDataset
+metadata:
+  name: alloydb_performance_analytics
+spec:
+  location: ${REGION}
+  description: "Dataset for AlloyDB performance metrics and AI optimization results"
+  
+  # Dataset access controls
+  access:
+    - role: "OWNER"
+      userByEmail: "alloydb-functions-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+    - role: "READER"
+      specialGroup: "projectReaders"
+  
+  # Default table expiration (90 days)
+  defaultTableExpirationMs: 7776000000
+  
+  # Labels for cost tracking
+  labels:
+    environment: "production"
+    purpose: "performance-analytics"
+    cost-center: "database-optimization"
+---
+
+# Log Router Sink - Export AlloyDB logs to BigQuery
+apiVersion: logging.cnrm.cloud.google.com/v1beta1
+kind: LoggingLogSink
+metadata:
+  name: alloydb-performance-logs
+spec:
+  description: "Export AlloyDB performance logs to BigQuery for analysis"
+  destination: "bigquery.googleapis.com/projects/${PROJECT_ID}/datasets/alloydb_performance_analytics"
+  
+  # Filter for AlloyDB-related logs
+  filter: |
+    resource.type="alloydb_database" OR
+    resource.type="cloud_function" AND resource.labels.function_name="alloydb-performance-optimizer" OR
+    protoPayload.serviceName="alloydb.googleapis.com"
+  
+  # Include children resources
+  includeChildren: true
+  
+  # Unique writer identity for BigQuery access
+  uniqueWriterIdentity: true
+---
+
+# Firewall Rule - Allow internal traffic for AlloyDB
+apiVersion: compute.cnrm.cloud.google.com/v1beta1
+kind: ComputeFirewall
+metadata:
+  name: alloydb-internal-access
+spec:
+  networkRef:
+    name: alloydb-perf-vpc
+  description: "Allow internal access to AlloyDB cluster"
+  direction: "INGRESS"
+  priority: 1000
+  
+  # Allow PostgreSQL traffic from internal sources
+  allowed:
+    - protocol: "tcp"
+      ports: ["5432"]
+  
+  # Source ranges for internal traffic
+  sourceRanges:
+    - "10.0.0.0/24"    # Subnet range
+    - "10.8.0.0/28"    # VPC Connector range
+  
+  # Target tags
+  targetTags:
+    - "alloydb-cluster"
+---
+
+# Output values for verification and integration
+# Note: Infrastructure Manager doesn't support outputs in the same way as Terraform
+# These would be available through the Google Cloud Console or CLI after deployment

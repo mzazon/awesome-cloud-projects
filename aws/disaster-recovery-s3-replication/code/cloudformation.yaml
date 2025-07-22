@@ -1,0 +1,660 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Disaster Recovery S3 Cross-Region Replication Infrastructure - Implements automatic replication between S3 buckets across AWS regions for business continuity'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Regional Configuration"
+        Parameters:
+          - PrimaryRegion
+          - DisasterRecoveryRegion
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - SourceBucketName
+          - DestinationBucketName
+          - DestinationStorageClass
+          - ReplicationPrefix
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableCloudTrail
+          - EnableCloudWatchAlarms
+          - NotificationEmail
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - ReplicationRoleName
+          - DeleteMarkerReplication
+    ParameterLabels:
+      PrimaryRegion:
+        default: "Primary AWS Region"
+      DisasterRecoveryRegion:
+        default: "Disaster Recovery Region"
+      SourceBucketName:
+        default: "Source Bucket Name"
+      DestinationBucketName:
+        default: "Destination Bucket Name"
+      DestinationStorageClass:
+        default: "Destination Storage Class"
+      ReplicationPrefix:
+        default: "Object Prefix Filter"
+      EnableCloudTrail:
+        default: "Enable CloudTrail Logging"
+      EnableCloudWatchAlarms:
+        default: "Enable CloudWatch Monitoring"
+      NotificationEmail:
+        default: "Notification Email Address"
+      ReplicationRoleName:
+        default: "Replication IAM Role Name"
+      DeleteMarkerReplication:
+        default: "Replicate Delete Markers"
+
+# Input Parameters
+Parameters:
+  PrimaryRegion:
+    Type: String
+    Default: !Ref 'AWS::Region'
+    Description: 'Primary region where source bucket will be created'
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must be a valid AWS region identifier'
+
+  DisasterRecoveryRegion:
+    Type: String
+    Default: 'us-west-2'
+    Description: 'Disaster recovery region for destination bucket (must be different from primary region)'
+    AllowedValues:
+      - us-east-1
+      - us-east-2
+      - us-west-1
+      - us-west-2
+      - eu-west-1
+      - eu-west-2
+      - eu-central-1
+      - ap-southeast-1
+      - ap-southeast-2
+      - ap-northeast-1
+    ConstraintDescription: 'Must select a supported AWS region different from primary region'
+
+  SourceBucketName:
+    Type: String
+    Description: 'Name for the source S3 bucket (leave empty for auto-generated name)'
+    Default: ''
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be empty or follow S3 bucket naming conventions (lowercase, numbers, hyphens)'
+    MaxLength: 63
+
+  DestinationBucketName:
+    Type: String
+    Description: 'Name for the destination S3 bucket (leave empty for auto-generated name)'
+    Default: ''
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be empty or follow S3 bucket naming conventions (lowercase, numbers, hyphens)'
+    MaxLength: 63
+
+  DestinationStorageClass:
+    Type: String
+    Default: 'STANDARD_IA'
+    Description: 'Storage class for replicated objects in destination bucket'
+    AllowedValues:
+      - STANDARD
+      - STANDARD_IA
+      - ONEZONE_IA
+      - REDUCED_REDUNDANCY
+      - GLACIER
+      - DEEP_ARCHIVE
+    ConstraintDescription: 'Must be a valid S3 storage class'
+
+  ReplicationPrefix:
+    Type: String
+    Default: ''
+    Description: 'Object key prefix filter for replication (empty for all objects)'
+    MaxLength: 1024
+
+  EnableCloudTrail:
+    Type: String
+    Default: 'true'
+    Description: 'Enable CloudTrail logging for S3 API calls'
+    AllowedValues: ['true', 'false']
+
+  EnableCloudWatchAlarms:
+    Type: String
+    Default: 'true'
+    Description: 'Enable CloudWatch alarms for monitoring replication'
+    AllowedValues: ['true', 'false']
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for CloudWatch alarm notifications (required if alarms enabled)'
+    Default: ''
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be empty or a valid email address'
+
+  ReplicationRoleName:
+    Type: String
+    Description: 'Name for the IAM role used for replication (leave empty for auto-generated name)'
+    Default: ''
+    AllowedPattern: '^$|^[a-zA-Z][a-zA-Z0-9_+=,.@-]*$'
+    ConstraintDescription: 'Must be empty or follow IAM role naming conventions'
+    MaxLength: 64
+
+  DeleteMarkerReplication:
+    Type: String
+    Default: 'Enabled'
+    Description: 'Whether to replicate delete markers to destination bucket'
+    AllowedValues: ['Enabled', 'Disabled']
+
+# Conditional Logic
+Conditions:
+  CreateSourceBucketName: !Equals [!Ref SourceBucketName, '']
+  CreateDestinationBucketName: !Equals [!Ref DestinationBucketName, '']
+  CreateReplicationRoleName: !Equals [!Ref ReplicationRoleName, '']
+  EnableCloudTrailCondition: !Equals [!Ref EnableCloudTrail, 'true']
+  EnableCloudWatchCondition: !Equals [!Ref EnableCloudWatchAlarms, 'true']
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  CreateSNSTopic: !And [!Condition EnableCloudWatchCondition, !Condition HasNotificationEmail]
+  HasReplicationPrefix: !Not [!Equals [!Ref ReplicationPrefix, '']]
+  DifferentRegions: !Not [!Equals [!Ref PrimaryRegion, !Ref DisasterRecoveryRegion]]
+
+# Resources
+Resources:
+
+  # Random string generation for unique naming
+  RandomStringLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  RandomStringFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt RandomStringLambdaRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import random
+          import string
+          import cfnresponse
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  length = int(event['ResourceProperties'].get('Length', 6))
+                  random_string = ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'RandomString': random_string
+                  })
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  RandomSuffix:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt RandomStringFunction.Arn
+      Length: 6
+
+  # Source S3 Bucket (Primary Region)
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - CreateSourceBucketName
+        - !Sub 'dr-source-${RandomSuffix.RandomString}'
+        - !Ref SourceBucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration: !If
+        - EnableCloudTrailCondition
+        - DestinationBucketName: !Ref SourceBucket
+          LogFilePrefix: 'access-logs/'
+        - !Ref 'AWS::NoValue'
+      LifecycleConfiguration:
+        Rules:
+          - Id: 'DeleteIncompleteMultipartUploads'
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: 'TransitionOldVersions'
+            Status: Enabled
+            NoncurrentVersionTransitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      NotificationConfiguration: !If
+        - EnableCloudWatchCondition
+        - CloudWatchConfigurations:
+            - Event: 's3:Replication:*'
+              CloudWatchConfiguration:
+                LogGroupName: !Ref S3ReplicationLogGroup
+        - !Ref 'AWS::NoValue'
+      ReplicationConfiguration:
+        Role: !GetAtt ReplicationRole.Arn
+        Rules:
+          - Id: 'disaster-recovery-replication'
+            Status: Enabled
+            Priority: 1
+            DeleteMarkerReplication:
+              Status: !Ref DeleteMarkerReplication
+            Filter: !If
+              - HasReplicationPrefix
+              - Prefix: !Ref ReplicationPrefix
+              - Prefix: ''
+            Destination:
+              Bucket: !Sub 
+                - 'arn:aws:s3:::${BucketName}'
+                - BucketName: !If
+                    - CreateDestinationBucketName
+                    - !Sub 'dr-destination-${RandomSuffix.RandomString}'
+                    - !Ref DestinationBucketName
+              StorageClass: !Ref DestinationStorageClass
+              ReplicationTime:
+                Status: Enabled
+                Time:
+                  Minutes: 15
+              Metrics:
+                Status: Enabled
+                EventThreshold:
+                  Minutes: 15
+      Tags:
+        - Key: 'Purpose'
+          Value: 'Disaster Recovery Source'
+        - Key: 'Environment'
+          Value: 'Production'
+        - Key: 'BackupStrategy'
+          Value: 'Cross-Region-Replication'
+
+  # IAM Role for Cross-Region Replication
+  ReplicationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !If
+        - CreateReplicationRoleName
+        - !Sub 's3-replication-role-${RandomSuffix.RandomString}'
+        - !Ref ReplicationRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      Policies:
+        - PolicyName: 'S3ReplicationPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Source bucket permissions
+              - Effect: Allow
+                Action:
+                  - s3:GetObjectVersionForReplication
+                  - s3:GetObjectVersionAcl
+                  - s3:GetObjectVersionTagging
+                  - s3:ListBucket
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !Sub '${SourceBucket}'
+                  - !Sub '${SourceBucket}/*'
+              # Destination bucket permissions
+              - Effect: Allow
+                Action:
+                  - s3:ReplicateObject
+                  - s3:ReplicateDelete
+                  - s3:ReplicateTags
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !Sub 
+                    - 'arn:aws:s3:::${BucketName}'
+                    - BucketName: !If
+                        - CreateDestinationBucketName
+                        - !Sub 'dr-destination-${RandomSuffix.RandomString}'
+                        - !Ref DestinationBucketName
+                  - !Sub 
+                    - 'arn:aws:s3:::${BucketName}/*'
+                    - BucketName: !If
+                        - CreateDestinationBucketName
+                        - !Sub 'dr-destination-${RandomSuffix.RandomString}'
+                        - !Ref DestinationBucketName
+              # CloudWatch permissions for replication metrics
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': 'AWS/S3'
+      Tags:
+        - Key: 'Purpose'
+          Value: 'S3 Cross-Region Replication'
+        - Key: 'Environment'
+          Value: 'Production'
+
+  # CloudTrail for API Logging
+  S3ReplicationCloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Condition: EnableCloudTrailCondition
+    Properties:
+      TrailName: !Sub 's3-replication-trail-${RandomSuffix.RandomString}'
+      S3BucketName: !Ref SourceBucket
+      S3KeyPrefix: 'cloudtrail-logs/'
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: false
+          DataResources:
+            - Type: 'AWS::S3::Object'
+              Values:
+                - !Sub '${SourceBucket}/*'
+            - Type: 'AWS::S3::Bucket'
+              Values:
+                - !Ref SourceBucket
+      InsightSelectors:
+        - InsightType: ApiCallRateInsight
+      Tags:
+        - Key: 'Purpose'
+          Value: 'S3 Replication Audit Trail'
+        - Key: 'Environment'
+          Value: 'Production'
+
+  # CloudWatch Log Group for S3 Replication Events
+  S3ReplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableCloudWatchCondition
+    Properties:
+      LogGroupName: !Sub '/aws/s3/replication/${RandomSuffix.RandomString}'
+      RetentionInDays: 30
+      Tags:
+        - Key: 'Purpose'
+          Value: 'S3 Replication Monitoring'
+        - Key: 'Environment'
+          Value: 'Production'
+
+  # SNS Topic for Alarm Notifications
+  ReplicationAlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSNSTopic
+    Properties:
+      TopicName: !Sub 's3-replication-alerts-${RandomSuffix.RandomString}'
+      DisplayName: 'S3 Cross-Region Replication Alerts'
+      Subscription:
+        - Endpoint: !Ref NotificationEmail
+          Protocol: email
+      Tags:
+        - Key: 'Purpose'
+          Value: 'S3 Replication Alerts'
+        - Key: 'Environment'
+          Value: 'Production'
+
+  # CloudWatch Alarm for Replication Latency
+  ReplicationLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableCloudWatchCondition
+    Properties:
+      AlarmName: !Sub 'S3-Replication-Latency-${RandomSuffix.RandomString}'
+      AlarmDescription: 'Monitor S3 cross-region replication latency'
+      MetricName: ReplicationLatency
+      Namespace: AWS/S3
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 900
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: SourceBucket
+          Value: !Ref SourceBucket
+        - Name: DestinationBucket
+          Value: !If
+            - CreateDestinationBucketName
+            - !Sub 'dr-destination-${RandomSuffix.RandomString}'
+            - !Ref DestinationBucketName
+      AlarmActions: !If
+        - CreateSNSTopic
+        - [!Ref ReplicationAlarmTopic]
+        - []
+      OKActions: !If
+        - CreateSNSTopic
+        - [!Ref ReplicationAlarmTopic]
+        - []
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: 'Purpose'
+          Value: 'S3 Replication Monitoring'
+        - Key: 'Environment'
+          Value: 'Production'
+
+  # CloudWatch Alarm for Replication Failures
+  ReplicationFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableCloudWatchCondition
+    Properties:
+      AlarmName: !Sub 'S3-Replication-Failures-${RandomSuffix.RandomString}'
+      AlarmDescription: 'Monitor S3 cross-region replication failures'
+      MetricName: ReplicationFailures
+      Namespace: AWS/S3
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: SourceBucket
+          Value: !Ref SourceBucket
+        - Name: DestinationBucket
+          Value: !If
+            - CreateDestinationBucketName
+            - !Sub 'dr-destination-${RandomSuffix.RandomString}'
+            - !Ref DestinationBucketName
+      AlarmActions: !If
+        - CreateSNSTopic
+        - [!Ref ReplicationAlarmTopic]
+        - []
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: 'Purpose'
+          Value: 'S3 Replication Monitoring'
+        - Key: 'Environment'
+          Value: 'Production'
+
+  # CloudWatch Dashboard for Replication Monitoring
+  ReplicationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableCloudWatchCondition
+    Properties:
+      DashboardName: !Sub 'S3-Replication-${RandomSuffix.RandomString}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "ReplicationLatency", "SourceBucket", "${SourceBucket}", "DestinationBucket", "${DestinationBucketName}" ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Replication Latency",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "ReplicationFailures", "SourceBucket", "${SourceBucket}", "DestinationBucket", "${DestinationBucketName}" ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Replication Failures",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "NumberOfObjects", "BucketName", "${SourceBucket}", "StorageType", "AllStorageTypes" ],
+                  [ "...", "${DestinationBucketName}", ".", "." ]
+                ],
+                "period": 86400,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Object Count Comparison",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+# Outputs
+Outputs:
+  SourceBucketName:
+    Description: 'Name of the source S3 bucket in primary region'
+    Value: !Ref SourceBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-SourceBucket'
+
+  SourceBucketArn:
+    Description: 'ARN of the source S3 bucket'
+    Value: !GetAtt SourceBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SourceBucketArn'
+
+  DestinationBucketName:
+    Description: 'Name of the destination S3 bucket in DR region'
+    Value: !If
+      - CreateDestinationBucketName
+      - !Sub 'dr-destination-${RandomSuffix.RandomString}'
+      - !Ref DestinationBucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-DestinationBucket'
+
+  DestinationBucketArn:
+    Description: 'ARN of the destination S3 bucket'
+    Value: !Sub 
+      - 'arn:aws:s3:::${BucketName}'
+      - BucketName: !If
+          - CreateDestinationBucketName
+          - !Sub 'dr-destination-${RandomSuffix.RandomString}'
+          - !Ref DestinationBucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-DestinationBucketArn'
+
+  ReplicationRoleArn:
+    Description: 'ARN of the IAM role used for cross-region replication'
+    Value: !GetAtt ReplicationRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ReplicationRole'
+
+  ReplicationRoleName:
+    Description: 'Name of the IAM role used for cross-region replication'
+    Value: !Ref ReplicationRole
+    Export:
+      Name: !Sub '${AWS::StackName}-ReplicationRoleName'
+
+  CloudTrailArn:
+    Condition: EnableCloudTrailCondition
+    Description: 'ARN of the CloudTrail for S3 API logging'
+    Value: !GetAtt S3ReplicationCloudTrail.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrail'
+
+  SNSTopicArn:
+    Condition: CreateSNSTopic
+    Description: 'ARN of SNS topic for replication alerts'
+    Value: !Ref ReplicationAlarmTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopic'
+
+  CloudWatchDashboardURL:
+    Condition: EnableCloudWatchCondition
+    Description: 'URL to CloudWatch dashboard for replication monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ReplicationDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  PrimaryRegion:
+    Description: 'Primary AWS region for source bucket'
+    Value: !Ref PrimaryRegion
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryRegion'
+
+  DisasterRecoveryRegion:
+    Description: 'Disaster recovery region for destination bucket'
+    Value: !Ref DisasterRecoveryRegion
+    Export:
+      Name: !Sub '${AWS::StackName}-DRRegion'
+
+  ReplicationConfigurationStatus:
+    Description: 'Status of cross-region replication configuration'
+    Value: 'Enabled'
+    Export:
+      Name: !Sub '${AWS::StackName}-ReplicationStatus'
+
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost breakdown (excluding data transfer)'
+    Value: !Sub |
+      Source Bucket Storage: $0.023/GB + $0.0004/1000 requests
+      Destination Bucket Storage (${DestinationStorageClass}): Variable based on storage class
+      Cross-Region Transfer: $0.02/GB
+      CloudWatch/CloudTrail: ~$5-15/month
+      Total varies based on data volume and access patterns
+    Export:
+      Name: !Sub '${AWS::StackName}-CostEstimate'

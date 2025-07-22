@@ -1,0 +1,1077 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Machine Learning Model Deployment Pipeline with SageMaker and CodePipeline - Comprehensive MLOps infrastructure for automated model training, testing, and deployment'
+
+# Parameters for customization
+Parameters:
+  ProjectName:
+    Type: String
+    Default: mlops-pipeline
+    Description: Name for the MLOps project (will be suffixed with random identifier)
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+    MinLength: 3
+    MaxLength: 20
+
+  ModelPackageGroupName:
+    Type: String
+    Default: fraud-detection-models
+    Description: Name for the SageMaker Model Package Group
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: Must contain only alphanumeric characters and hyphens
+    MinLength: 1
+    MaxLength: 63
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for pipeline notifications (optional)
+    Default: ''
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address or empty
+
+  TrainingInstanceType:
+    Type: String
+    Default: ml.m5.large
+    Description: SageMaker training instance type
+    AllowedValues:
+      - ml.m5.large
+      - ml.m5.xlarge
+      - ml.m5.2xlarge
+      - ml.c5.xlarge
+      - ml.c5.2xlarge
+    ConstraintDescription: Must be a valid SageMaker training instance type
+
+  EndpointInstanceType:
+    Type: String
+    Default: ml.t2.medium
+    Description: SageMaker endpoint instance type for testing
+    AllowedValues:
+      - ml.t2.medium
+      - ml.t2.large
+      - ml.m5.large
+      - ml.m5.xlarge
+    ConstraintDescription: Must be a valid SageMaker endpoint instance type
+
+  EnableNotifications:
+    Type: String
+    Default: 'false'
+    Description: Enable SNS notifications for pipeline events
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+# Conditions for optional resources
+Conditions:
+  CreateNotifications: !Equals [!Ref EnableNotifications, 'true']
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  CreateSNSTopic: !And [!Condition CreateNotifications, !Condition HasNotificationEmail]
+
+# Metadata for parameter grouping
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Project Configuration
+        Parameters:
+          - ProjectName
+          - ModelPackageGroupName
+      - Label:
+          default: Instance Configuration
+        Parameters:
+          - TrainingInstanceType
+          - EndpointInstanceType
+      - Label:
+          default: Notification Configuration
+        Parameters:
+          - EnableNotifications
+          - NotificationEmail
+    ParameterLabels:
+      ProjectName:
+        default: Project Name
+      ModelPackageGroupName:
+        default: Model Package Group
+      TrainingInstanceType:
+        default: Training Instance Type
+      EndpointInstanceType:
+        default: Endpoint Instance Type
+      EnableNotifications:
+        default: Enable Notifications
+      NotificationEmail:
+        default: Notification Email
+
+Resources:
+  # Random suffix for unique resource naming
+  RandomSuffix:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt RandomSuffixFunction.Arn
+
+  # Lambda function to generate random suffix
+  RandomSuffixFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-random-suffix-generator'
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt RandomSuffixLambdaRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import random
+          import string
+          import cfnresponse
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Create':
+                      # Generate 6-character random suffix
+                      suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Suffix': suffix})
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  # IAM role for random suffix Lambda
+  RandomSuffixLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-random-suffix-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # S3 bucket for artifacts and data
+  MLOpsS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'sagemaker-mlops-${AWS::Region}-${RandomSuffix.Suffix}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: MLOps Artifacts Storage
+
+  # CloudWatch log group for S3 access
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-access-logs'
+      RetentionInDays: 30
+
+  # SageMaker Execution Role
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'SageMakerExecutionRole-${RandomSuffix.Suffix}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${MLOpsS3Bucket}/*'
+                  - !GetAtt MLOpsS3Bucket.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/sagemaker/*'
+        - PolicyName: ECRAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SageMaker Model Package Group
+  ModelPackageGroup:
+    Type: AWS::SageMaker::ModelPackageGroup
+    Properties:
+      ModelPackageGroupName: !Ref ModelPackageGroupName
+      ModelPackageGroupDescription: 'Fraud detection model packages for MLOps pipeline'
+      ModelPackageGroupPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt SageMakerExecutionRole.Arn
+            Action:
+              - sagemaker:CreateModelPackage
+              - sagemaker:UpdateModelPackage
+              - sagemaker:DescribeModelPackage
+              - sagemaker:ListModelPackages
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CodeBuild Service Role
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'CodeBuildServiceRole-${RandomSuffix.Suffix}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildServicePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${MLOpsS3Bucket}/*'
+                  - !GetAtt MLOpsS3Bucket.Arn
+              - Effect: Allow
+                Action:
+                  - sagemaker:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt SageMakerExecutionRole.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CodeBuild Project for Model Training
+  ModelTrainingProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-train-${RandomSuffix.Suffix}'
+      Description: 'ML model training project with SageMaker integration'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:5.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: SAGEMAKER_ROLE_ARN
+            Value: !GetAtt SageMakerExecutionRole.Arn
+          - Name: BUCKET_NAME
+            Value: !Ref MLOpsS3Bucket
+          - Name: MODEL_PACKAGE_GROUP_NAME
+            Value: !Ref ModelPackageGroupName
+          - Name: TRAINING_INSTANCE_TYPE
+            Value: !Ref TrainingInstanceType
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                python: 3.9
+              commands:
+                - pip install boto3 scikit-learn pandas numpy sagemaker joblib
+            build:
+              commands:
+                - echo "Starting model training..."
+                - |
+                  python << 'PYTHON_EOF'
+                  import boto3
+                  import sagemaker
+                  import json
+                  import os
+                  import time
+                  from sagemaker.sklearn.estimator import SKLearn
+                  from sagemaker.model_package import ModelPackage
+                  
+                  # Initialize SageMaker session
+                  session = sagemaker.Session()
+                  role = os.environ['SAGEMAKER_ROLE_ARN']
+                  bucket = os.environ['BUCKET_NAME']
+                  instance_type = os.environ['TRAINING_INSTANCE_TYPE']
+                  
+                  # Create training job
+                  sklearn_estimator = SKLearn(
+                      entry_point='train.py',
+                      source_dir='.',
+                      role=role,
+                      instance_type=instance_type,
+                      framework_version='1.0-1',
+                      py_version='py3',
+                      hyperparameters={
+                          'n_estimators': 100,
+                          'max_depth': 10,
+                          'random_state': 42
+                      },
+                      output_path=f's3://{bucket}/model-artifacts/',
+                      code_location=f's3://{bucket}/code/',
+                      sagemaker_session=session
+                  )
+                  
+                  # Submit training job
+                  training_job_name = f"fraud-detection-{os.environ.get('CODEBUILD_BUILD_NUMBER', int(time.time()))}"
+                  
+                  sklearn_estimator.fit(
+                      inputs={'training': f"s3://{bucket}/training-data/"},
+                      job_name=training_job_name,
+                      wait=True
+                  )
+                  
+                  # Register model in Model Registry
+                  model_package = sklearn_estimator.create_model_package(
+                      model_package_group_name=os.environ['MODEL_PACKAGE_GROUP_NAME'],
+                      approval_status='PendingManualApproval',
+                      description=f"Fraud detection model trained from build {os.environ.get('CODEBUILD_BUILD_NUMBER', 'manual')}",
+                      model_metrics={
+                          'ModelQuality': {
+                              'Statistics': {
+                                  'ContentType': 'application/json',
+                                  'S3Uri': f's3://{bucket}/model-artifacts/{training_job_name}/evaluation.json'
+                              }
+                          }
+                      }
+                  )
+                  
+                  # Save model package ARN for next stage
+                  with open('model_package_arn.txt', 'w') as f:
+                      f.write(model_package.model_package_arn)
+                  
+                  print(f"Model package created: {model_package.model_package_arn}")
+                  print(f"Training job completed: {training_job_name}")
+                  PYTHON_EOF
+          artifacts:
+            files:
+              - model_package_arn.txt
+              - '**/*'
+      TimeoutInMinutes: 60
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CodeBuild Project for Model Testing
+  ModelTestingProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-test-${RandomSuffix.Suffix}'
+      Description: 'ML model testing and validation project'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:5.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: ENDPOINT_INSTANCE_TYPE
+            Value: !Ref EndpointInstanceType
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                python: 3.9
+              commands:
+                - pip install boto3 sagemaker pandas numpy scikit-learn
+            build:
+              commands:
+                - echo "Starting model testing..."
+                - |
+                  python << 'PYTHON_EOF'
+                  import boto3
+                  import sagemaker
+                  import json
+                  import os
+                  import time
+                  import numpy as np
+                  from sagemaker.model_package import ModelPackage
+                  
+                  # Read model package ARN from previous stage
+                  with open('model_package_arn.txt', 'r') as f:
+                      model_package_arn = f.read().strip()
+                  
+                  print(f"Testing model package: {model_package_arn}")
+                  
+                  # Initialize SageMaker session
+                  session = sagemaker.Session()
+                  
+                  # Create model package object
+                  model_package = ModelPackage(
+                      model_package_arn=model_package_arn,
+                      sagemaker_session=session
+                  )
+                  
+                  # Create test endpoint configuration
+                  endpoint_name = f"test-endpoint-{int(time.time())}"
+                  instance_type = os.environ.get('ENDPOINT_INSTANCE_TYPE', 'ml.t2.medium')
+                  
+                  # Deploy model to test endpoint
+                  predictor = model_package.deploy(
+                      initial_instance_count=1,
+                      instance_type=instance_type,
+                      endpoint_name=endpoint_name,
+                      wait=True
+                  )
+                  
+                  # Perform model testing
+                  test_data = np.random.randn(10, 20).tolist()
+                  
+                  try:
+                      # Test predictions
+                      predictions = predictor.predict(test_data)
+                      print(f"Test predictions successful: {len(predictions)} predictions made")
+                      
+                      # Basic validation - check if predictions are within expected range
+                      if all(isinstance(p, (int, float)) for p in predictions):
+                          print("✅ Model test passed - predictions are valid")
+                          test_result = "PASSED"
+                          
+                          # Performance tests
+                          import time
+                          start_time = time.time()
+                          for _ in range(10):
+                              predictor.predict(test_data[:1])
+                          avg_latency = (time.time() - start_time) / 10
+                          
+                          print(f"Average prediction latency: {avg_latency:.3f} seconds")
+                          
+                          # Check latency requirement (should be under 1 second)
+                          if avg_latency < 1.0:
+                              print("✅ Latency test passed")
+                          else:
+                              print("⚠️ Latency test warning: predictions taking longer than expected")
+                      else:
+                          print("❌ Model test failed - invalid predictions")
+                          test_result = "FAILED"
+                          
+                  except Exception as e:
+                      print(f"❌ Model test failed with error: {str(e)}")
+                      test_result = "FAILED"
+                  
+                  finally:
+                      # Clean up test endpoint
+                      predictor.delete_endpoint()
+                      print("✅ Cleaned up test endpoint")
+                  
+                  # Save test results
+                  test_results = {
+                      'test_status': test_result,
+                      'model_package_arn': model_package_arn,
+                      'timestamp': time.time(),
+                      'latency': avg_latency if 'avg_latency' in locals() else None
+                  }
+                  
+                  with open('test_results.json', 'w') as f:
+                      json.dump(test_results, f, indent=2)
+                  
+                  # If tests passed, approve the model
+                  if test_result == "PASSED":
+                      client = boto3.client('sagemaker')
+                      client.update_model_package(
+                          ModelPackageArn=model_package_arn,
+                          ModelApprovalStatus='Approved'
+                      )
+                      print("✅ Model approved for deployment")
+                  else:
+                      raise Exception("Model failed testing - deployment blocked")
+                  PYTHON_EOF
+          artifacts:
+            files:
+              - test_results.json
+              - model_package_arn.txt
+      TimeoutInMinutes: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda Execution Role for Deployment
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'LambdaExecutionRole-${RandomSuffix.Suffix}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SageMakerDeploymentPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sagemaker:CreateModel
+                  - sagemaker:CreateEndpointConfig
+                  - sagemaker:CreateEndpoint
+                  - sagemaker:UpdateEndpoint
+                  - sagemaker:DeleteEndpoint
+                  - sagemaker:DeleteEndpointConfig
+                  - sagemaker:DeleteModel
+                  - sagemaker:DescribeEndpoint
+                  - sagemaker:DescribeEndpointConfig
+                  - sagemaker:DescribeModel
+                  - sagemaker:DescribeModelPackage
+                  - sagemaker:ListEndpoints
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - codepipeline:PutJobSuccessResult
+                  - codepipeline:PutJobFailureResult
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt SageMakerExecutionRole.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${MLOpsS3Bucket}/*'
+                  - !GetAtt MLOpsS3Bucket.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda function for model deployment
+  ModelDeploymentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-deploy-${RandomSuffix.Suffix}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      Environment:
+        Variables:
+          SAGEMAKER_ROLE_ARN: !GetAtt SageMakerExecutionRole.Arn
+          PROJECT_NAME: !Ref ProjectName
+          ENDPOINT_INSTANCE_TYPE: !Ref EndpointInstanceType
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import time
+          import zipfile
+          import tempfile
+          
+          def lambda_handler(event, context):
+              codepipeline = boto3.client('codepipeline')
+              sagemaker = boto3.client('sagemaker')
+              s3 = boto3.client('s3')
+              
+              # Get job details from CodePipeline
+              job_id = event['CodePipeline.job']['id']
+              
+              try:
+                  # Get input artifacts
+                  input_artifacts = event['CodePipeline.job']['data']['inputArtifacts']
+                  
+                  # Extract model package ARN from artifacts
+                  s3_bucket = input_artifacts[0]['location']['s3Location']['bucketName']
+                  s3_key = input_artifacts[0]['location']['s3Location']['objectKey']
+                  
+                  # Download and extract artifacts
+                  with tempfile.TemporaryDirectory() as temp_dir:
+                      artifact_path = os.path.join(temp_dir, 'artifacts.zip')
+                      s3.download_file(s3_bucket, s3_key, artifact_path)
+                      
+                      with zipfile.ZipFile(artifact_path, 'r') as zip_ref:
+                          zip_ref.extractall(temp_dir)
+                      
+                      # Read model package ARN
+                      model_package_arn_file = os.path.join(temp_dir, 'model_package_arn.txt')
+                      if os.path.exists(model_package_arn_file):
+                          with open(model_package_arn_file, 'r') as f:
+                              model_package_arn = f.read().strip()
+                      else:
+                          raise Exception("Model package ARN file not found in artifacts")
+                  
+                  print(f"Deploying model package: {model_package_arn}")
+                  
+                  # Get model package details
+                  model_package_response = sagemaker.describe_model_package(
+                      ModelPackageName=model_package_arn
+                  )
+                  
+                  # Extract container information
+                  inference_specification = model_package_response['InferenceSpecification']
+                  container_def = inference_specification['Containers'][0]
+                  
+                  # Create unique names for deployment resources
+                  timestamp = str(int(time.time()))
+                  model_name = f"{os.environ['PROJECT_NAME']}-model-{timestamp}"
+                  endpoint_config_name = f"{os.environ['PROJECT_NAME']}-config-{timestamp}"
+                  endpoint_name = f"{os.environ['PROJECT_NAME']}-endpoint-{timestamp}"
+                  
+                  # Create SageMaker model
+                  sagemaker.create_model(
+                      ModelName=model_name,
+                      PrimaryContainer={
+                          'Image': container_def['Image'],
+                          'ModelDataUrl': container_def['ModelDataUrl'],
+                          'Environment': container_def.get('Environment', {})
+                      },
+                      ExecutionRoleArn=os.environ['SAGEMAKER_ROLE_ARN'],
+                      Tags=[
+                          {'Key': 'Project', 'Value': os.environ['PROJECT_NAME']},
+                          {'Key': 'ModelPackageArn', 'Value': model_package_arn},
+                          {'Key': 'DeploymentTime', 'Value': timestamp}
+                      ]
+                  )
+                  
+                  # Create endpoint configuration
+                  sagemaker.create_endpoint_config(
+                      EndpointConfigName=endpoint_config_name,
+                      ProductionVariants=[
+                          {
+                              'VariantName': 'primary',
+                              'ModelName': model_name,
+                              'InitialInstanceCount': 1,
+                              'InstanceType': os.environ['ENDPOINT_INSTANCE_TYPE'],
+                              'InitialVariantWeight': 1.0
+                          }
+                      ],
+                      Tags=[
+                          {'Key': 'Project', 'Value': os.environ['PROJECT_NAME']},
+                          {'Key': 'ModelPackageArn', 'Value': model_package_arn}
+                      ]
+                  )
+                  
+                  # Check if production endpoint already exists
+                  existing_endpoints = sagemaker.list_endpoints(
+                      NameContains=f"{os.environ['PROJECT_NAME']}-endpoint"
+                  )
+                  
+                  if existing_endpoints['Endpoints']:
+                      # Update existing endpoint
+                      production_endpoint = existing_endpoints['Endpoints'][0]['EndpointName']
+                      print(f"Updating existing endpoint: {production_endpoint}")
+                      
+                      sagemaker.update_endpoint(
+                          EndpointName=production_endpoint,
+                          EndpointConfigName=endpoint_config_name
+                      )
+                      
+                      # Wait for update to complete
+                      waiter = sagemaker.get_waiter('endpoint_in_service')
+                      waiter.wait(
+                          EndpointName=production_endpoint,
+                          WaiterConfig={'Delay': 30, 'MaxAttempts': 20}
+                      )
+                      
+                      deployment_endpoint = production_endpoint
+                  else:
+                      # Create new endpoint
+                      print(f"Creating new endpoint: {endpoint_name}")
+                      
+                      sagemaker.create_endpoint(
+                          EndpointName=endpoint_name,
+                          EndpointConfigName=endpoint_config_name,
+                          Tags=[
+                              {'Key': 'Project', 'Value': os.environ['PROJECT_NAME']},
+                              {'Key': 'ModelPackageArn', 'Value': model_package_arn}
+                          ]
+                      )
+                      
+                      # Wait for endpoint to be in service
+                      waiter = sagemaker.get_waiter('endpoint_in_service')
+                      waiter.wait(
+                          EndpointName=endpoint_name,
+                          WaiterConfig={'Delay': 30, 'MaxAttempts': 20}
+                      )
+                      
+                      deployment_endpoint = endpoint_name
+                  
+                  print(f"✅ Model deployed successfully to endpoint: {deployment_endpoint}")
+                  
+                  # Signal success to CodePipeline
+                  codepipeline.put_job_success_result(
+                      jobId=job_id,
+                      outputVariables={
+                          'EndpointName': deployment_endpoint,
+                          'ModelPackageArn': model_package_arn
+                      }
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Deployment successful',
+                          'endpoint_name': deployment_endpoint,
+                          'model_package_arn': model_package_arn
+                      })
+                  }
+                  
+              except Exception as e:
+                  error_message = f"Deployment failed: {str(e)}"
+                  print(error_message)
+                  
+                  # Signal failure to CodePipeline
+                  codepipeline.put_job_failure_result(
+                      jobId=job_id,
+                      failureDetails={'message': error_message}
+                  )
+                  
+                  raise e
+      Description: 'Deploy ML model to SageMaker endpoint'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CodePipeline Service Role
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'CodePipelineServiceRole-${RandomSuffix.Suffix}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelineServicePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${MLOpsS3Bucket}/*'
+                  - !GetAtt MLOpsS3Bucket.Arn
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource:
+                  - !GetAtt ModelTrainingProject.Arn
+                  - !GetAtt ModelTestingProject.Arn
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt ModelDeploymentFunction.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !If [CreateSNSTopic, !Ref PipelineNotificationTopic, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SNS Topic for Pipeline Notifications (Optional)
+  PipelineNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSNSTopic
+    Properties:
+      TopicName: !Sub '${ProjectName}-pipeline-notifications-${RandomSuffix.Suffix}'
+      DisplayName: 'ML Pipeline Notifications'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Event Rule for Pipeline State Changes
+  PipelineEventRule:
+    Type: AWS::Events::Rule
+    Condition: CreateNotifications
+    Properties:
+      Name: !Sub '${ProjectName}-pipeline-events-${RandomSuffix.Suffix}'
+      Description: 'Capture CodePipeline state changes'
+      EventPattern:
+        source:
+          - aws.codepipeline
+        detail-type:
+          - CodePipeline Pipeline Execution State Change
+          - CodePipeline Stage Execution State Change
+        detail:
+          pipeline:
+            - !Ref MLOpsPipeline
+      State: ENABLED
+      Targets:
+        - Arn: !If [CreateSNSTopic, !Ref PipelineNotificationTopic, !Ref 'AWS::NoValue']
+          Id: PipelineNotificationTarget
+
+  # CodePipeline for MLOps workflow
+  MLOpsPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub '${ProjectName}-pipeline-${RandomSuffix.Suffix}'
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref MLOpsS3Bucket
+        EncryptionKey:
+          Type: KMS
+          Id: alias/aws/s3
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: '1'
+              Configuration:
+                S3Bucket: !Ref MLOpsS3Bucket
+                S3ObjectKey: source/ml-source-code.zip
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceOutput
+        - Name: Build
+          Actions:
+            - Name: TrainModel
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref ModelTrainingProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+        - Name: Test
+          Actions:
+            - Name: TestModel
+              ActionTypeId:
+                Category: Test
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref ModelTestingProject
+              InputArtifacts:
+                - Name: BuildOutput
+              OutputArtifacts:
+                - Name: TestOutput
+              RunOrder: 1
+        - Name: Deploy
+          Actions:
+            - Name: DeployModel
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: '1'
+              Configuration:
+                FunctionName: !Ref ModelDeploymentFunction
+              InputArtifacts:
+                - Name: TestOutput
+              RunOrder: 1
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Dashboard for Monitoring
+  MLOpsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-mlops-dashboard-${RandomSuffix.Suffix}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/CodePipeline", "PipelineExecutionSuccess", "PipelineName", "${MLOpsPipeline}" ],
+                  [ ".", "PipelineExecutionFailure", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Pipeline Execution Status",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/CodeBuild", "Duration", "ProjectName", "${ModelTrainingProject}" ],
+                  [ ".", ".", ".", "${ModelTestingProject}" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Build Duration",
+                "period": 300
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/codebuild/${ModelTrainingProject}' | fields @timestamp, @message\n| filter @message like /Model package created/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Model Training Events",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+# Outputs for reference and integration
+Outputs:
+  S3BucketName:
+    Description: 'S3 bucket for MLOps artifacts and data'
+    Value: !Ref MLOpsS3Bucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3Bucket'
+
+  SageMakerExecutionRoleArn:
+    Description: 'ARN of the SageMaker execution role'
+    Value: !GetAtt SageMakerExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SageMakerRole'
+
+  ModelPackageGroupName:
+    Description: 'Name of the SageMaker Model Package Group'
+    Value: !Ref ModelPackageGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ModelPackageGroup'
+
+  PipelineName:
+    Description: 'Name of the CodePipeline'
+    Value: !Ref MLOpsPipeline
+    Export:
+      Name: !Sub '${AWS::StackName}-Pipeline'
+
+  PipelineConsoleURL:
+    Description: 'AWS Console URL for the CodePipeline'
+    Value: !Sub 'https://console.aws.amazon.com/codesuite/codepipeline/pipelines/${MLOpsPipeline}/view'
+
+  TrainingProjectName:
+    Description: 'Name of the CodeBuild training project'
+    Value: !Ref ModelTrainingProject
+    Export:
+      Name: !Sub '${AWS::StackName}-TrainingProject'
+
+  TestingProjectName:
+    Description: 'Name of the CodeBuild testing project'
+    Value: !Ref ModelTestingProject
+    Export:
+      Name: !Sub '${AWS::StackName}-TestingProject'
+
+  DeploymentFunctionName:
+    Description: 'Name of the Lambda deployment function'
+    Value: !Ref ModelDeploymentFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentFunction'
+
+  DashboardURL:
+    Description: 'CloudWatch Dashboard URL for monitoring'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${MLOpsDashboard}'
+
+  NotificationTopicArn:
+    Condition: CreateSNSTopic
+    Description: 'ARN of the SNS notification topic'
+    Value: !Ref PipelineNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopic'
+
+  RandomSuffix:
+    Description: 'Random suffix used for resource naming'
+    Value: !GetAtt RandomSuffix.Suffix
+    Export:
+      Name: !Sub '${AWS::StackName}-RandomSuffix'

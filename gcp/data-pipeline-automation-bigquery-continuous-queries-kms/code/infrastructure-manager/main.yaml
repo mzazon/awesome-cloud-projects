@@ -1,0 +1,586 @@
+# Infrastructure Manager Configuration for Data Pipeline Automation
+# This configuration deploys a complete data pipeline with BigQuery Continuous Queries,
+# Cloud KMS encryption, automated security operations, and comprehensive monitoring.
+
+# Configuration metadata
+name: data-pipeline-automation-bigquery-continuous-queries-kms
+description: "Automated data pipeline with BigQuery Continuous Queries and Cloud KMS encryption"
+labels:
+  component: data-pipeline
+  security: kms-encrypted
+  automation: continuous-queries
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    required: true
+  region:
+    type: string
+    description: "Primary region for resource deployment"
+    default: "us-central1"
+  dataset_id:
+    type: string
+    description: "BigQuery dataset identifier"
+    default: "streaming_analytics"
+  keyring_name:
+    type: string
+    description: "Cloud KMS key ring name"
+    default: "pipeline-keyring"
+  key_name:
+    type: string
+    description: "Cloud KMS encryption key name"
+    default: "data-encryption-key"
+  random_suffix:
+    type: string
+    description: "Random suffix for unique resource names"
+    default: "$(gcp.random.hex(3))"
+  enable_monitoring:
+    type: boolean
+    description: "Enable comprehensive monitoring and alerting"
+    default: true
+  enable_audit_logging:
+    type: boolean
+    description: "Enable security audit logging"
+    default: true
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  required_apis:
+    type: gcp:projects:Service
+    properties:
+      project: ${var.project_id}
+      services:
+        - bigquery.googleapis.com
+        - cloudkms.googleapis.com
+        - cloudscheduler.googleapis.com
+        - logging.googleapis.com
+        - pubsub.googleapis.com
+        - storage.googleapis.com
+        - cloudfunctions.googleapis.com
+        - monitoring.googleapis.com
+
+  # Cloud KMS Key Ring for centralized encryption key management
+  kms_keyring:
+    type: gcp:kms:KeyRing
+    properties:
+      name: ${var.keyring_name}
+      location: ${var.region}
+      project: ${var.project_id}
+    depends_on:
+      - required_apis
+    metadata:
+      description: "Central key ring for data pipeline encryption keys"
+
+  # Primary encryption key with automatic rotation for table-level encryption
+  primary_encryption_key:
+    type: gcp:kms:CryptoKey
+    properties:
+      name: ${var.key_name}
+      key_ring: ${kms_keyring.id}
+      purpose: "ENCRYPT_DECRYPT"
+      rotation_period: "7776000s"  # 90 days
+      version_template:
+        algorithm: "GOOGLE_SYMMETRIC_ENCRYPTION"
+        protection_level: "SOFTWARE"
+    metadata:
+      description: "Primary encryption key for BigQuery datasets and Cloud Storage"
+
+  # Column-level encryption key for sensitive data fields
+  column_encryption_key:
+    type: gcp:kms:CryptoKey
+    properties:
+      name: "${var.key_name}-column"
+      key_ring: ${kms_keyring.id}
+      purpose: "ENCRYPT_DECRYPT"
+      version_template:
+        algorithm: "GOOGLE_SYMMETRIC_ENCRYPTION"
+        protection_level: "SOFTWARE"
+    metadata:
+      description: "Dedicated key for column-level encryption of sensitive fields"
+
+  # BigQuery dataset with customer-managed encryption (CMEK)
+  analytics_dataset:
+    type: gcp:bigquery:Dataset
+    properties:
+      dataset_id: ${var.dataset_id}
+      project: ${var.project_id}
+      location: ${var.region}
+      description: "Streaming analytics dataset with CMEK encryption and real-time processing"
+      default_encryption_configuration:
+        kms_key_name: ${primary_encryption_key.id}
+      delete_contents_on_destroy: true
+      labels:
+        environment: "production"
+        security: "cmek-encrypted"
+        component: "data-pipeline"
+    depends_on:
+      - primary_encryption_key
+    metadata:
+      description: "Main BigQuery dataset for streaming analytics with CMEK encryption"
+
+  # Raw events table for streaming data ingestion
+  raw_events_table:
+    type: gcp:bigquery:Table
+    properties:
+      dataset_id: ${analytics_dataset.dataset_id}
+      project: ${var.project_id}
+      table_id: "raw_events"
+      description: "Raw streaming events table with automatic schema detection"
+      schema: |
+        [
+          {
+            "name": "event_id",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Unique identifier for each event"
+          },
+          {
+            "name": "timestamp",
+            "type": "TIMESTAMP",
+            "mode": "REQUIRED",
+            "description": "Event occurrence timestamp"
+          },
+          {
+            "name": "user_id",
+            "type": "STRING",
+            "mode": "NULLABLE",
+            "description": "User identifier associated with the event"
+          },
+          {
+            "name": "event_type",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Category or type of the event"
+          },
+          {
+            "name": "metadata",
+            "type": "JSON",
+            "mode": "NULLABLE",
+            "description": "Additional event metadata in JSON format"
+          }
+        ]
+      deletion_protection: false
+    depends_on:
+      - analytics_dataset
+
+  # Processed events table for enriched data output
+  processed_events_table:
+    type: gcp:bigquery:Table
+    properties:
+      dataset_id: ${analytics_dataset.dataset_id}
+      project: ${var.project_id}
+      table_id: "processed_events"
+      description: "Processed and enriched events with risk scoring"
+      schema: |
+        [
+          {
+            "name": "event_id",
+            "type": "STRING",
+            "mode": "REQUIRED"
+          },
+          {
+            "name": "processed_timestamp",
+            "type": "TIMESTAMP",
+            "mode": "REQUIRED"
+          },
+          {
+            "name": "user_id",
+            "type": "STRING",
+            "mode": "NULLABLE"
+          },
+          {
+            "name": "event_type",
+            "type": "STRING",
+            "mode": "REQUIRED"
+          },
+          {
+            "name": "enriched_data",
+            "type": "JSON",
+            "mode": "NULLABLE"
+          },
+          {
+            "name": "risk_score",
+            "type": "FLOAT",
+            "mode": "NULLABLE"
+          }
+        ]
+      deletion_protection: false
+    depends_on:
+      - analytics_dataset
+
+  # Encrypted user data table for sensitive information
+  encrypted_user_data_table:
+    type: gcp:bigquery:Table
+    properties:
+      dataset_id: ${analytics_dataset.dataset_id}
+      project: ${var.project_id}
+      table_id: "encrypted_user_data"
+      description: "User data with column-level encryption for sensitive fields"
+      schema: |
+        [
+          {
+            "name": "user_id",
+            "type": "STRING",
+            "mode": "REQUIRED"
+          },
+          {
+            "name": "email_encrypted",
+            "type": "BYTES",
+            "mode": "NULLABLE"
+          },
+          {
+            "name": "phone_encrypted",
+            "type": "BYTES",
+            "mode": "NULLABLE"
+          },
+          {
+            "name": "created_timestamp",
+            "type": "TIMESTAMP",
+            "mode": "NULLABLE"
+          },
+          {
+            "name": "last_updated",
+            "type": "TIMESTAMP",
+            "mode": "NULLABLE"
+          }
+        ]
+      deletion_protection: false
+    depends_on:
+      - analytics_dataset
+
+  # Cloud Pub/Sub topic for real-time event streaming with encryption
+  streaming_events_topic:
+    type: gcp:pubsub:Topic
+    properties:
+      name: "streaming-events-${var.random_suffix}"
+      project: ${var.project_id}
+      kms_key_name: ${primary_encryption_key.id}
+      message_retention_duration: "604800s"  # 7 days
+      labels:
+        component: "data-pipeline"
+        security: "cmek-encrypted"
+    depends_on:
+      - primary_encryption_key
+    metadata:
+      description: "Main Pub/Sub topic for streaming events with CMEK encryption"
+
+  # BigQuery subscription for streaming data
+  bigquery_subscription:
+    type: gcp:pubsub:Subscription
+    properties:
+      name: "streaming-events-${var.random_suffix}-bq-sub"
+      project: ${var.project_id}
+      topic: ${streaming_events_topic.name}
+      ack_deadline_seconds: 600
+      message_retention_duration: "604800s"  # 7 days
+      retry_policy:
+        minimum_backoff: "10s"
+        maximum_backoff: "600s"
+    metadata:
+      description: "Subscription for BigQuery streaming ingestion"
+
+  # Dead letter topic for failed message handling
+  dead_letter_topic:
+    type: gcp:pubsub:Topic
+    properties:
+      name: "streaming-events-${var.random_suffix}-dlq"
+      project: ${var.project_id}
+      kms_key_name: ${primary_encryption_key.id}
+      labels:
+        component: "data-pipeline"
+        purpose: "dead-letter-queue"
+    depends_on:
+      - primary_encryption_key
+
+  # Cloud Storage bucket for data lake with CMEK encryption
+  data_lake_bucket:
+    type: gcp:storage:Bucket
+    properties:
+      name: "pipeline-data-${var.random_suffix}"
+      project: ${var.project_id}
+      location: ${var.region}
+      storage_class: "STANDARD"
+      versioning:
+        enabled: true
+      encryption:
+        default_kms_key_name: ${primary_encryption_key.id}
+      uniform_bucket_level_access: true
+      labels:
+        component: "data-pipeline"
+        security: "cmek-encrypted"
+        purpose: "data-lake"
+    depends_on:
+      - primary_encryption_key
+    metadata:
+      description: "Primary data lake storage with CMEK encryption and versioning"
+
+  # Service account for Cloud Functions with minimal required permissions
+  function_service_account:
+    type: gcp:serviceaccount:Account
+    properties:
+      account_id: "pipeline-functions-sa"
+      project: ${var.project_id}
+      display_name: "Data Pipeline Functions Service Account"
+      description: "Service account for Cloud Functions in the data pipeline"
+
+  # IAM binding for KMS access
+  kms_crypto_key_iam:
+    type: gcp:kms:CryptoKeyIAMBinding
+    properties:
+      crypto_key_id: ${primary_encryption_key.id}
+      role: "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+      members:
+        - "serviceAccount:${function_service_account.email}"
+        - "serviceAccount:bq-${var.project_id}@bigquery-encryption.iam.gserviceaccount.com"
+
+  # IAM binding for column encryption key
+  column_key_iam:
+    type: gcp:kms:CryptoKeyIAMBinding
+    properties:
+      crypto_key_id: ${column_encryption_key.id}
+      role: "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+      members:
+        - "serviceAccount:${function_service_account.email}"
+
+  # Cloud Function for security audit operations
+  security_audit_function:
+    type: gcp:cloudfunctions:Function
+    properties:
+      name: "security-audit-${var.random_suffix}"
+      project: ${var.project_id}
+      region: ${var.region}
+      runtime: "python311"
+      available_memory_mb: 256
+      timeout: 60
+      entry_point: "security_audit"
+      service_account_email: ${function_service_account.email}
+      source_archive_bucket: ${data_lake_bucket.name}
+      source_archive_object: "functions/security-audit.zip"
+      trigger:
+        http_trigger: {}
+      environment_variables:
+        PROJECT_ID: ${var.project_id}
+        KEYRING_NAME: ${var.keyring_name}
+        REGION: ${var.region}
+    depends_on:
+      - function_service_account
+      - data_lake_bucket
+    metadata:
+      description: "Automated security audit function for KMS and data access monitoring"
+
+  # Cloud Function for data encryption/decryption operations
+  encryption_function:
+    type: gcp:cloudfunctions:Function
+    properties:
+      name: "encrypt-sensitive-data-${var.random_suffix}"
+      project: ${var.project_id}
+      region: ${var.region}
+      runtime: "python311"
+      available_memory_mb: 256
+      timeout: 60
+      entry_point: "encrypt_sensitive_data"
+      service_account_email: ${function_service_account.email}
+      source_archive_bucket: ${data_lake_bucket.name}
+      source_archive_object: "functions/encryption.zip"
+      trigger:
+        http_trigger: {}
+      environment_variables:
+        PROJECT_ID: ${var.project_id}
+        COLUMN_KEY_NAME: ${column_encryption_key.id}
+    depends_on:
+      - function_service_account
+      - column_encryption_key
+
+  # Cloud Scheduler job for automated security audits
+  security_audit_scheduler:
+    type: gcp:cloudscheduler:Job
+    properties:
+      name: "security-audit-daily-${var.random_suffix}"
+      project: ${var.project_id}
+      region: ${var.region}
+      description: "Daily automated security audit of data pipeline"
+      schedule: "0 2 * * *"  # Daily at 2 AM
+      time_zone: "UTC"
+      http_target:
+        uri: "https://${var.region}-${var.project_id}.cloudfunctions.net/security-audit-${var.random_suffix}"
+        http_method: "POST"
+        headers:
+          Content-Type: "application/json"
+        body: |
+          {
+            "project_id": "${var.project_id}",
+            "location": "${var.region}",
+            "keyring_name": "${var.keyring_name}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+    depends_on:
+      - security_audit_function
+    condition: ${var.enable_monitoring}
+
+  # Log-based metric for KMS key usage monitoring
+  kms_usage_metric:
+    type: gcp:logging:Metric
+    properties:
+      name: "kms_key_usage_${replace(var.random_suffix, '-', '_')}"
+      project: ${var.project_id}
+      description: "Tracks KMS key usage across the data pipeline"
+      filter: |
+        resource.type="cloudkms_cryptokey"
+        AND (protoPayload.methodName="Encrypt" OR protoPayload.methodName="Decrypt")
+      metric_descriptor:
+        metric_kind: "GAUGE"
+        value_type: "INT64"
+        display_name: "KMS Key Usage"
+    condition: ${var.enable_monitoring}
+
+  # Log-based metric for continuous query performance
+  continuous_query_metric:
+    type: gcp:logging:Metric
+    properties:
+      name: "continuous_query_performance_${replace(var.random_suffix, '-', '_')}"
+      project: ${var.project_id}
+      description: "Monitors BigQuery continuous query execution metrics"
+      filter: |
+        resource.type="bigquery_resource"
+        AND protoPayload.methodName="jobservice.jobcompleted"
+        AND protoPayload.serviceData.jobCompletedEvent.job.jobConfiguration.query.continuous=true
+      metric_descriptor:
+        metric_kind: "GAUGE"
+        value_type: "DOUBLE"
+        display_name: "Continuous Query Performance"
+    condition: ${var.enable_monitoring}
+
+  # Log sink for security audit trail
+  security_audit_sink:
+    type: gcp:logging:ProjectSink
+    properties:
+      name: "security-audit-sink-${var.random_suffix}"
+      project: ${var.project_id}
+      destination: "storage.googleapis.com/${data_lake_bucket.name}/audit-logs"
+      description: "Security audit trail for compliance monitoring"
+      filter: |
+        protoPayload.authenticationInfo.principalEmail!=""
+        AND (resource.type="cloudkms_cryptokey"
+        OR resource.type="bigquery_resource"
+        OR resource.type="pubsub_topic")
+      unique_writer_identity: true
+    depends_on:
+      - data_lake_bucket
+    condition: ${var.enable_audit_logging}
+
+  # IAM binding for log sink to write to storage bucket
+  audit_sink_iam:
+    type: gcp:storage:BucketIAMBinding
+    properties:
+      bucket: ${data_lake_bucket.name}
+      role: "roles/storage.objectCreator"
+      members:
+        - ${security_audit_sink.writer_identity}
+    depends_on:
+      - security_audit_sink
+    condition: ${var.enable_audit_logging}
+
+# Output values for verification and integration
+outputs:
+  # KMS Infrastructure
+  kms_keyring_id:
+    description: "Cloud KMS key ring resource ID"
+    value: ${kms_keyring.id}
+  
+  primary_key_id:
+    description: "Primary encryption key resource ID"
+    value: ${primary_encryption_key.id}
+  
+  column_key_id:
+    description: "Column-level encryption key resource ID"
+    value: ${column_encryption_key.id}
+
+  # BigQuery Resources
+  dataset_id:
+    description: "BigQuery dataset ID for analytics"
+    value: ${analytics_dataset.dataset_id}
+  
+  raw_events_table_id:
+    description: "Raw events table fully qualified ID"
+    value: "${var.project_id}.${analytics_dataset.dataset_id}.${raw_events_table.table_id}"
+  
+  processed_events_table_id:
+    description: "Processed events table fully qualified ID"
+    value: "${var.project_id}.${analytics_dataset.dataset_id}.${processed_events_table.table_id}"
+
+  # Pub/Sub Resources
+  pubsub_topic_name:
+    description: "Pub/Sub topic name for streaming events"
+    value: ${streaming_events_topic.name}
+  
+  pubsub_subscription_name:
+    description: "BigQuery subscription name"
+    value: ${bigquery_subscription.name}
+
+  # Storage Resources
+  data_lake_bucket_name:
+    description: "Cloud Storage bucket name for data lake"
+    value: ${data_lake_bucket.name}
+
+  # Cloud Functions
+  security_audit_function_url:
+    description: "Security audit Cloud Function trigger URL"
+    value: "https://${var.region}-${var.project_id}.cloudfunctions.net/security-audit-${var.random_suffix}"
+  
+  encryption_function_url:
+    description: "Data encryption Cloud Function trigger URL"
+    value: "https://${var.region}-${var.project_id}.cloudfunctions.net/encrypt-sensitive-data-${var.random_suffix}"
+
+  # Service Account
+  function_service_account_email:
+    description: "Service account email for Cloud Functions"
+    value: ${function_service_account.email}
+
+  # Monitoring Resources (conditional)
+  kms_usage_metric_name:
+    description: "KMS usage monitoring metric name"
+    value: ${kms_usage_metric.name}
+    condition: ${var.enable_monitoring}
+  
+  audit_sink_name:
+    description: "Security audit log sink name"
+    value: ${security_audit_sink.name}
+    condition: ${var.enable_audit_logging}
+
+# Deployment instructions and validation commands
+deployment_notes: |
+  ## Post-Deployment Steps:
+  
+  1. Upload Cloud Function source code:
+     - Create function source archives and upload to the data lake bucket
+     - Update function configurations if needed
+  
+  2. Create BigQuery Continuous Query:
+     - Use the BigQuery console or CLI to create continuous queries
+     - Configure SQL transformations for real-time processing
+  
+  3. Configure monitoring dashboards:
+     - Set up Cloud Monitoring dashboards for pipeline metrics
+     - Configure alerting policies for security and performance
+  
+  4. Test the pipeline:
+     - Send test events to the Pub/Sub topic
+     - Verify data processing and encryption
+     - Validate security audit functionality
+  
+  ## Verification Commands:
+  
+  # Verify KMS keys
+  gcloud kms keys list --location=${var.region} --keyring=${var.keyring_name}
+  
+  # Check BigQuery dataset encryption
+  bq show --format=prettyjson ${var.project_id}:${var.dataset_id}
+  
+  # Test Pub/Sub topic
+  gcloud pubsub topics describe ${streaming_events_topic.name}
+  
+  # Verify Cloud Functions deployment
+  gcloud functions describe security-audit-${var.random_suffix} --region=${var.region}

@@ -1,0 +1,742 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Business Intelligence Dashboards with Amazon QuickSight
+  Creates a complete BI solution with QuickSight, S3 data sources, IAM roles, and sample data.
+  Based on the recipe: Business Intelligence Dashboards with QuickSight
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "QuickSight Configuration"
+        Parameters:
+          - QuickSightAccountName
+          - QuickSightEdition
+          - QuickSightNotificationEmail
+      - Label:
+          default: "Data Source Configuration"
+        Parameters:
+          - DataBucketName
+          - CreateSampleData
+          - SampleDataKey
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - QuickSightRoleName
+          - CrossAccountAccessRole
+      - Label:
+          default: "Dashboard Configuration"
+        Parameters:
+          - DashboardName
+          - AnalysisName
+          - DatasetName
+    ParameterLabels:
+      QuickSightAccountName:
+        default: "QuickSight Account Name"
+      QuickSightEdition:
+        default: "QuickSight Edition"
+      QuickSightNotificationEmail:
+        default: "Notification Email"
+      DataBucketName:
+        default: "S3 Data Bucket Name"
+      CreateSampleData:
+        default: "Create Sample Data"
+      SampleDataKey:
+        default: "Sample Data File Key"
+      QuickSightRoleName:
+        default: "QuickSight IAM Role Name"
+      CrossAccountAccessRole:
+        default: "Cross-Account Access Role ARN"
+      DashboardName:
+        default: "Dashboard Name"
+      AnalysisName:
+        default: "Analysis Name"
+      DatasetName:
+        default: "Dataset Name"
+
+# Input Parameters
+Parameters:
+  QuickSightAccountName:
+    Type: String
+    Description: "Name for your QuickSight account (must be unique within your AWS account)"
+    Default: "quicksight-demo"
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: "^[a-zA-Z0-9]([a-zA-Z0-9\\-]*[a-zA-Z0-9])?$"
+    ConstraintDescription: "Must be a valid QuickSight account name (alphanumeric and hyphens only)"
+
+  QuickSightEdition:
+    Type: String
+    Description: "QuickSight edition to use"
+    Default: "STANDARD"
+    AllowedValues:
+      - "STANDARD"
+      - "ENTERPRISE"
+    ConstraintDescription: "Must be either STANDARD or ENTERPRISE"
+
+  QuickSightNotificationEmail:
+    Type: String
+    Description: "Email address for QuickSight notifications"
+    AllowedPattern: "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
+    ConstraintDescription: "Must be a valid email address"
+
+  DataBucketName:
+    Type: String
+    Description: "Name for the S3 bucket to store analytics data (will be created with random suffix for uniqueness)"
+    Default: "quicksight-data"
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: "^[a-z0-9]([a-z0-9\\-]*[a-z0-9])?$"
+    ConstraintDescription: "Must be a valid S3 bucket name prefix (lowercase alphanumeric and hyphens only)"
+
+  CreateSampleData:
+    Type: String
+    Description: "Whether to create sample sales data for demonstration"
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  SampleDataKey:
+    Type: String
+    Description: "S3 key (path) for the sample data file"
+    Default: "data/sales_data.csv"
+
+  QuickSightRoleName:
+    Type: String
+    Description: "Name for the IAM role that QuickSight will use to access data sources"
+    Default: "QuickSight-DataSource-Role"
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: "^[a-zA-Z0-9+=,.@_-]+$"
+    ConstraintDescription: "Must be a valid IAM role name"
+
+  CrossAccountAccessRole:
+    Type: String
+    Description: "Optional: ARN of cross-account role for accessing external data sources"
+    Default: ""
+
+  DashboardName:
+    Type: String
+    Description: "Name for the QuickSight dashboard"
+    Default: "Sales Dashboard"
+    MinLength: 1
+    MaxLength: 2048
+
+  AnalysisName:
+    Type: String
+    Description: "Name for the QuickSight analysis"
+    Default: "Sales Analysis"
+    MinLength: 1
+    MaxLength: 2048
+
+  DatasetName:
+    Type: String
+    Description: "Name for the QuickSight dataset"
+    Default: "Sales Dataset"
+    MinLength: 1
+    MaxLength: 128
+
+# Conditional Logic
+Conditions:
+  CreateSampleDataCondition: !Equals [!Ref CreateSampleData, "true"]
+  HasCrossAccountRole: !Not [!Equals [!Ref CrossAccountAccessRole, ""]]
+  IsEnterpriseEdition: !Equals [!Ref QuickSightEdition, "ENTERPRISE"]
+
+# Template Resources
+Resources:
+  # S3 Bucket for storing analytics data
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${DataBucketName}-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: "DeleteIncompleteMultipartUploads"
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: "TransitionToIA"
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: "TransitionToGlacier"
+            Status: Enabled
+            Transition:
+              StorageClass: GLACIER
+              TransitionInDays: 90
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Function: !GetAtt DataProcessingFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: ".csv"
+      Tags:
+        - Key: "Purpose"
+          Value: "QuickSight Data Source"
+        - Key: "Environment"
+          Value: "Demo"
+        - Key: "CostCenter"
+          Value: "Analytics"
+
+  # S3 Bucket Policy for QuickSight access
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: "AllowQuickSightAccess"
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt QuickSightRole.Arn
+            Action:
+              - "s3:GetObject"
+              - "s3:GetObjectVersion"
+              - "s3:ListBucket"
+            Resource:
+              - !Sub "${DataBucket}/*"
+              - !GetAtt DataBucket.Arn
+          - Sid: "AllowQuickSightServiceAccess"
+            Effect: Allow
+            Principal:
+              Service: "quicksight.amazonaws.com"
+            Action:
+              - "s3:GetObject"
+              - "s3:GetObjectVersion"
+              - "s3:ListBucket"
+            Resource:
+              - !Sub "${DataBucket}/*"
+              - !GetAtt DataBucket.Arn
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+
+  # Lambda function for data processing and validation
+  DataProcessingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-data-processor"
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt DataProcessingRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref DataBucket
+          QUICKSIGHT_ACCOUNT_ID: !Ref AWS::AccountId
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import csv
+          import io
+          import logging
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          s3 = boto3.client('s3')
+          quicksight = boto3.client('quicksight')
+          
+          def lambda_handler(event, context):
+              """
+              Process uploaded CSV files and validate data quality for QuickSight
+              """
+              try:
+                  for record in event['Records']:
+                      bucket = record['s3']['bucket']['name']
+                      key = record['s3']['object']['key']
+                      
+                      logger.info(f"Processing file: {key} in bucket: {bucket}")
+                      
+                      # Validate CSV format
+                      if not validate_csv_format(bucket, key):
+                          logger.error(f"Invalid CSV format for file: {key}")
+                          continue
+                      
+                      # Log successful processing
+                      logger.info(f"Successfully processed file: {key}")
+                      
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Data processing completed successfully')
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing data: {str(e)}")
+                  raise e
+          
+          def validate_csv_format(bucket, key):
+              """
+              Validate CSV file format and basic data quality
+              """
+              try:
+                  response = s3.get_object(Bucket=bucket, Key=key)
+                  content = response['Body'].read().decode('utf-8')
+                  
+                  # Parse CSV
+                  csv_reader = csv.DictReader(io.StringIO(content))
+                  
+                  # Check for required columns (example for sales data)
+                  required_columns = ['date', 'region', 'product', 'sales_amount', 'quantity']
+                  fieldnames = csv_reader.fieldnames
+                  
+                  if not fieldnames:
+                      logger.error("CSV file has no headers")
+                      return False
+                  
+                  missing_columns = [col for col in required_columns if col not in fieldnames]
+                  if missing_columns:
+                      logger.warning(f"Missing columns: {missing_columns}")
+                  
+                  # Validate data rows
+                  row_count = 0
+                  for row in csv_reader:
+                      row_count += 1
+                      if row_count > 1000:  # Limit validation to first 1000 rows
+                          break
+                  
+                  logger.info(f"Validated {row_count} rows in CSV file")
+                  return True
+                  
+              except Exception as e:
+                  logger.error(f"Error validating CSV: {str(e)}")
+                  return False
+
+      Tags:
+        - Key: "Purpose"
+          Value: "Data Processing for QuickSight"
+
+  # IAM Role for Lambda data processing function
+  DataProcessingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-DataProcessingRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource: !Sub "${DataBucket}/*"
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt DataBucket.Arn
+        - PolicyName: QuickSightAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - quicksight:DescribeDataSet
+                  - quicksight:DescribeDataSource
+                  - quicksight:CreateIngestion
+                Resource: "*"
+
+  # Lambda permission for S3 to invoke the function
+  DataProcessingFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt DataProcessingFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt DataBucket.Arn
+
+  # IAM Role for QuickSight to access data sources
+  QuickSightRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${QuickSightRoleName}-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: quicksight.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+          - !If
+            - HasCrossAccountRole
+            - Effect: Allow
+              Principal:
+                AWS: !Ref CrossAccountAccessRole
+              Action: sts:AssumeRole
+            - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: S3DataAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub "${DataBucket}/*"
+              - Effect: Allow
+                Action:
+                  - s3:ListAllMyBuckets
+                Resource: "*"
+        - PolicyName: QuickSightServicePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - quicksight:CreateUser
+                  - quicksight:DescribeUser
+                  - quicksight:CreateGroup
+                  - quicksight:DescribeGroup
+                  - quicksight:CreateDataSource
+                  - quicksight:DescribeDataSource
+                  - quicksight:CreateDataSet
+                  - quicksight:DescribeDataSet
+                  - quicksight:PassDataSource
+                  - quicksight:PassDataSet
+                Resource: "*"
+        - !If
+          - IsEnterpriseEdition
+          - PolicyName: EnterpriseFeaturePolicy
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - quicksight:CreateTemplate
+                    - quicksight:DescribeTemplate
+                    - quicksight:CreateTheme
+                    - quicksight:DescribeTheme
+                    - quicksight:CreateFolder
+                    - quicksight:DescribeFolder
+                  Resource: "*"
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: "Purpose"
+          Value: "QuickSight Data Access"
+
+  # Custom resource to create sample data
+  SampleDataCreator:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: CreateSampleDataCondition
+    Properties:
+      ServiceToken: !GetAtt SampleDataFunction.Arn
+      BucketName: !Ref DataBucket
+      DataKey: !Ref SampleDataKey
+      ForceUpdate: !Ref AWS::StackId  # Force update on stack updates
+
+  # Lambda function to create sample data
+  SampleDataFunction:
+    Type: AWS::Lambda::Function
+    Condition: CreateSampleDataCondition
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-sample-data-creator"
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt SampleDataRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import csv
+          import io
+          import cfnresponse
+          from datetime import datetime, timedelta
+          import random
+          
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              try:
+                  bucket_name = event['ResourceProperties']['BucketName']
+                  data_key = event['ResourceProperties']['DataKey']
+                  
+                  if event['RequestType'] == 'Delete':
+                      # Clean up sample data on stack deletion
+                      try:
+                          s3.delete_object(Bucket=bucket_name, Key=data_key)
+                      except:
+                          pass  # Ignore errors during cleanup
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  # Generate sample sales data
+                  sample_data = generate_sample_data()
+                  
+                  # Convert to CSV
+                  csv_buffer = io.StringIO()
+                  writer = csv.DictWriter(csv_buffer, fieldnames=['date', 'region', 'product', 'sales_amount', 'quantity'])
+                  writer.writeheader()
+                  writer.writerows(sample_data)
+                  
+                  # Upload to S3
+                  s3.put_object(
+                      Bucket=bucket_name,
+                      Key=data_key,
+                      Body=csv_buffer.getvalue(),
+                      ContentType='text/csv',
+                      ServerSideEncryption='AES256'
+                  )
+                  
+                  response_data = {
+                      'Message': f'Successfully created sample data at s3://{bucket_name}/{data_key}',
+                      'RecordCount': len(sample_data)
+                  }
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+          
+          def generate_sample_data():
+              """Generate sample sales data for demonstration"""
+              regions = ['North', 'South', 'East', 'West', 'Central']
+              products = ['Widget A', 'Widget B', 'Widget C', 'Gadget X', 'Gadget Y', 'Tool Z']
+              
+              data = []
+              base_date = datetime.now() - timedelta(days=90)
+              
+              for day in range(90):
+                  current_date = base_date + timedelta(days=day)
+                  
+                  # Generate 3-8 sales records per day
+                  daily_records = random.randint(3, 8)
+                  
+                  for _ in range(daily_records):
+                      region = random.choice(regions)
+                      product = random.choice(products)
+                      
+                      # Generate realistic sales amounts
+                      base_amount = random.randint(800, 2000)
+                      quantity = random.randint(5, 25)
+                      sales_amount = base_amount + (quantity * random.randint(10, 50))
+                      
+                      data.append({
+                          'date': current_date.strftime('%Y-%m-%d'),
+                          'region': region,
+                          'product': product,
+                          'sales_amount': sales_amount,
+                          'quantity': quantity
+                      })
+              
+              return data
+
+  # IAM Role for sample data creation function
+  SampleDataRole:
+    Type: AWS::IAM::Role
+    Condition: CreateSampleDataCondition
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3WritePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:GetObject
+                Resource: !Sub "${DataBucket}/*"
+
+  # CloudWatch Log Group for data processing
+  DataProcessingLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${DataProcessingFunction}"
+      RetentionInDays: 14
+
+  # CloudWatch Log Group for sample data creation
+  SampleDataLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateSampleDataCondition
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${SampleDataFunction}"
+      RetentionInDays: 7
+
+  # SNS Topic for notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-notifications"
+      DisplayName: "QuickSight Demo Notifications"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref QuickSightNotificationEmail
+
+  # CloudWatch Alarm for data processing errors
+  DataProcessingErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-DataProcessingErrors"
+      AlarmDescription: "Alarm for data processing function errors"
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DataProcessingFunction
+      AlarmActions:
+        - !Ref NotificationTopic
+
+  # Systems Manager Parameter for QuickSight configuration
+  QuickSightConfigParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/quicksight/config"
+      Type: String
+      Value: !Sub |
+        {
+          "AccountName": "${QuickSightAccountName}",
+          "Edition": "${QuickSightEdition}",
+          "DataBucket": "${DataBucket}",
+          "RoleArn": "${QuickSightRole.Arn}",
+          "Region": "${AWS::Region}",
+          "AccountId": "${AWS::AccountId}"
+        }
+      Description: "QuickSight configuration parameters for this stack"
+      Tags:
+        Purpose: "QuickSight Configuration"
+
+# Template Outputs
+Outputs:
+  # S3 Bucket Information
+  DataBucketName:
+    Description: "Name of the S3 bucket containing analytics data"
+    Value: !Ref DataBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-DataBucket"
+
+  DataBucketArn:
+    Description: "ARN of the S3 bucket containing analytics data"
+    Value: !GetAtt DataBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-DataBucketArn"
+
+  # IAM Role Information
+  QuickSightRoleArn:
+    Description: "ARN of the IAM role for QuickSight data access"
+    Value: !GetAtt QuickSightRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-QuickSightRole"
+
+  # Lambda Function Information
+  DataProcessingFunctionArn:
+    Description: "ARN of the data processing Lambda function"
+    Value: !GetAtt DataProcessingFunction.Arn
+
+  # QuickSight Setup Information
+  QuickSightConsoleURL:
+    Description: "URL to access the QuickSight console"
+    Value: !Sub "https://quicksight.aws.amazon.com/sn/start/data-sets?region=${AWS::Region}"
+
+  QuickSightAccountInfo:
+    Description: "Information for setting up QuickSight account"
+    Value: !Sub |
+      Account Name: ${QuickSightAccountName}
+      Edition: ${QuickSightEdition}
+      Region: ${AWS::Region}
+      Notification Email: ${QuickSightNotificationEmail}
+
+  # Sample Data Information
+  SampleDataLocation:
+    Condition: CreateSampleDataCondition
+    Description: "Location of the sample data file"
+    Value: !Sub "s3://${DataBucket}/${SampleDataKey}"
+
+  SampleDataRecordCount:
+    Condition: CreateSampleDataCondition
+    Description: "Number of sample records created"
+    Value: !GetAtt SampleDataCreator.RecordCount
+
+  # Configuration Parameter
+  ConfigurationParameter:
+    Description: "Systems Manager parameter containing QuickSight configuration"
+    Value: !Ref QuickSightConfigParameter
+
+  # Next Steps
+  NextSteps:
+    Description: "Next steps to complete the QuickSight setup"
+    Value: !Sub |
+      1. Access QuickSight Console: https://quicksight.aws.amazon.com/sn/start
+      2. Sign up for QuickSight if not already done
+      3. Create data source pointing to S3 bucket: ${DataBucket}
+      4. Use IAM role: ${QuickSightRole.Arn}
+      5. Create dataset from data source
+      6. Build analysis and dashboard
+      
+      For detailed instructions, refer to the recipe documentation.
+
+  # Cost Estimation
+  EstimatedMonthlyCost:
+    Description: "Estimated monthly cost breakdown"
+    Value: !Sub |
+      QuickSight ${QuickSightEdition}: $${QuickSightEdition == 'STANDARD' ? '9' : '18'} per user/month${QuickSightEdition == 'ENTERPRISE' ? ' + $250 account fee' : ''}
+      S3 Storage: ~$0.50/month (for sample data)
+      Lambda: ~$1-5/month (depending on usage)
+      CloudWatch: ~$1-3/month (logs and metrics)
+      
+      Total estimated: $${QuickSightEdition == 'STANDARD' ? '11.50-17.50' : '270.50-276.50'}/month
+
+  # Support Information
+  SupportResources:
+    Description: "Links to supporting documentation and resources"
+    Value: |
+      - QuickSight User Guide: https://docs.aws.amazon.com/quicksight/latest/user/
+      - QuickSight API Reference: https://docs.aws.amazon.com/quicksight/latest/APIReference/
+      - Sample Datasets: https://docs.aws.amazon.com/quicksight/latest/user/sample-data-sets.html
+      - Community Forum: https://repost.aws/tags/TA_uK7qJTOTGe8jF7kDbCr5A/amazon-quicksight

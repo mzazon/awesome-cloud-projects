@@ -1,0 +1,581 @@
+# Data Migration Workflows with Cloud Storage Bucket Relocation and Eventarc
+# Infrastructure Manager Configuration
+# 
+# This configuration deploys a comprehensive data migration and governance system
+# that leverages Google Cloud's bucket relocation feature with automated workflows
+# triggered by Eventarc for seamless data migration across regions.
+#
+# Architecture Components:
+# - Cloud Storage buckets with versioning and lifecycle policies
+# - Eventarc triggers for bucket administrative and object events
+# - Cloud Functions for pre-migration validation, progress monitoring, and post-migration validation
+# - Service accounts with appropriate IAM permissions
+# - Cloud Audit Logs configuration for comprehensive tracking
+# - BigQuery dataset for audit log analytics
+# - Cloud Monitoring alert policies for migration events
+# - Pub/Sub topics for function triggers
+
+imports:
+  - path: ../../../templates/gcp-storage-bucket.yaml
+    name: storage-bucket-template
+  - path: ../../../templates/gcp-cloud-function.yaml
+    name: cloud-function-template
+  - path: ../../../templates/gcp-eventarc-trigger.yaml
+    name: eventarc-trigger-template
+  - path: ../../../templates/gcp-iam-service-account.yaml
+    name: iam-service-account-template
+
+resources:
+  # Enable Required APIs
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/storage.googleapis.com
+      
+  - name: enable-cloudfunctions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/cloudfunctions.googleapis.com
+      
+  - name: enable-eventarc-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/eventarc.googleapis.com
+      
+  - name: enable-logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/logging.googleapis.com
+      
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/monitoring.googleapis.com
+
+  - name: enable-bigquery-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/bigquery.googleapis.com
+
+  - name: enable-pubsub-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/pubsub.googleapis.com
+
+  # Service Account for Migration Automation
+  - name: migration-automation-sa
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: migration-automation
+      displayName: Migration Automation Service Account
+      description: Service account for automated data migration workflows
+    metadata:
+      dependsOn:
+        - enable-storage-api
+        - enable-cloudfunctions-api
+        - enable-eventarc-api
+        - enable-logging-api
+
+  # IAM Bindings for Migration Automation Service Account
+  - name: migration-sa-storage-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/{{ env["project"] }}
+      member: serviceAccount:migration-automation@{{ env["project"] }}.iam.gserviceaccount.com
+      role: roles/storage.admin
+    metadata:
+      dependsOn:
+        - migration-automation-sa
+
+  - name: migration-sa-logging-viewer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/{{ env["project"] }}
+      member: serviceAccount:migration-automation@{{ env["project"] }}.iam.gserviceaccount.com
+      role: roles/logging.viewer
+    metadata:
+      dependsOn:
+        - migration-automation-sa
+
+  - name: migration-sa-monitoring-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/{{ env["project"] }}
+      member: serviceAccount:migration-automation@{{ env["project"] }}.iam.gserviceaccount.com
+      role: roles/monitoring.metricWriter
+    metadata:
+      dependsOn:
+        - migration-automation-sa
+
+  - name: migration-sa-bigquery-user-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/{{ env["project"] }}
+      member: serviceAccount:migration-automation@{{ env["project"] }}.iam.gserviceaccount.com
+      role: roles/bigquery.user
+    metadata:
+      dependsOn:
+        - migration-automation-sa
+
+  # Source Storage Bucket for Migration
+  - name: migration-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: migration-source-{{ properties["random_suffix"] }}
+      location: {{ properties["source_region"] }}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - condition:
+              age: 30
+            action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+          - condition:
+              age: 90
+            action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+          - condition:
+              age: 365
+            action:
+              type: SetStorageClass
+              storageClass: ARCHIVE
+      labels:
+        purpose: data-migration-source
+        environment: {{ properties["environment"] }}
+        managed-by: infrastructure-manager
+      uniformBucketLevelAccess:
+        enabled: true
+      publicAccessPrevention: enforced
+      retentionPolicy:
+        retentionPeriod: 2592000  # 30 days
+      encryption:
+        defaultKmsKeyName: projects/{{ env["project"] }}/locations/{{ properties["source_region"] }}/keyRings/migration-keyring/cryptoKeys/migration-key
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # BigQuery Dataset for Audit Logs
+  - name: migration-audit-dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      datasetId: migration_audit
+      location: {{ properties["region"] }}
+      description: Dataset for storing migration audit logs and analytics
+      labels:
+        purpose: migration-audit
+        environment: {{ properties["environment"] }}
+        managed-by: infrastructure-manager
+      access:
+        - role: WRITER
+          userByEmail: migration-automation@{{ env["project"] }}.iam.gserviceaccount.com
+        - role: READER
+          userByEmail: migration-automation@{{ env["project"] }}.iam.gserviceaccount.com
+      defaultTableExpirationMs: 7776000000  # 90 days
+    metadata:
+      dependsOn:
+        - enable-bigquery-api
+        - migration-automation-sa
+
+  # Cloud Logging Sink for Migration Audit
+  - name: migration-audit-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      name: migration-audit-sink
+      destination: bigquery.googleapis.com/projects/{{ env["project"] }}/datasets/migration_audit
+      filter: >
+        protoPayload.serviceName="storage.googleapis.com" AND 
+        (protoPayload.methodName:"storage.buckets" OR protoPayload.methodName:"storage.objects")
+      description: Sink for capturing storage audit logs during migration
+    metadata:
+      dependsOn:
+        - migration-audit-dataset
+
+  # Grant Sink Service Account BigQuery Data Editor permissions
+  - name: sink-sa-bigquery-editor-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: projects/{{ env["project"] }}
+      member: $(ref.migration-audit-sink.writerIdentity)
+      role: roles/bigquery.dataEditor
+    metadata:
+      dependsOn:
+        - migration-audit-sink
+
+  # Pub/Sub Topic for Pre-Migration Validation
+  - name: pre-migration-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/{{ env["project"] }}/topics/pre-migration-topic
+      labels:
+        purpose: pre-migration-validation
+        environment: {{ properties["environment"] }}
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable-pubsub-api
+
+  # Cloud Function for Pre-Migration Validation
+  - name: pre-migration-validator-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      name: projects/{{ env["project"] }}/locations/{{ properties["region"] }}/functions/pre-migration-validator
+      sourceArchiveUrl: gs://{{ properties["function_source_bucket"] }}/pre-migration-validator.zip
+      entryPoint: validate_pre_migration
+      runtime: python39
+      timeout: 60s
+      availableMemoryMb: 256
+      serviceAccountEmail: migration-automation@{{ env["project"] }}.iam.gserviceaccount.com
+      eventTrigger:
+        eventType: google.pubsub.topic.publish
+        resource: projects/{{ env["project"] }}/topics/pre-migration-topic
+      environmentVariables:
+        PROJECT_ID: {{ env["project"] }}
+        SOURCE_BUCKET: migration-source-{{ properties["random_suffix"] }}
+        REGION: {{ properties["region"] }}
+      labels:
+        purpose: pre-migration-validation
+        environment: {{ properties["environment"] }}
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable-cloudfunctions-api
+        - migration-automation-sa
+        - pre-migration-topic
+
+  # Cloud Function for Migration Progress Monitoring
+  - name: migration-progress-monitor-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      name: projects/{{ env["project"] }}/locations/{{ properties["region"] }}/functions/migration-progress-monitor
+      sourceArchiveUrl: gs://{{ properties["function_source_bucket"] }}/migration-progress-monitor.zip
+      entryPoint: monitor_migration_progress
+      runtime: python39
+      timeout: 120s
+      availableMemoryMb: 512
+      serviceAccountEmail: migration-automation@{{ env["project"] }}.iam.gserviceaccount.com
+      eventTrigger:
+        eventType: google.cloud.audit.log.v1.written
+        resource: projects/{{ env["project"] }}
+        eventFilter:
+          - attribute: serviceName
+            value: storage.googleapis.com
+          - attribute: methodName
+            value: storage.buckets.patch
+      environmentVariables:
+        PROJECT_ID: {{ env["project"] }}
+        REGION: {{ properties["region"] }}
+      labels:
+        purpose: migration-progress-monitoring
+        environment: {{ properties["environment"] }}
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable-cloudfunctions-api
+        - migration-automation-sa
+
+  # Cloud Function for Post-Migration Validation
+  - name: post-migration-validator-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      name: projects/{{ env["project"] }}/locations/{{ properties["region"] }}/functions/post-migration-validator
+      sourceArchiveUrl: gs://{{ properties["function_source_bucket"] }}/post-migration-validator.zip
+      entryPoint: validate_post_migration
+      runtime: python39
+      timeout: 180s
+      availableMemoryMb: 512
+      serviceAccountEmail: migration-automation@{{ env["project"] }}.iam.gserviceaccount.com
+      eventTrigger:
+        eventType: google.cloud.audit.log.v1.written
+        resource: projects/{{ env["project"] }}
+        eventFilter:
+          - attribute: serviceName
+            value: storage.googleapis.com
+          - attribute: methodName
+            value: storage.buckets.patch
+      environmentVariables:
+        PROJECT_ID: {{ env["project"] }}
+        REGION: {{ properties["region"] }}
+      labels:
+        purpose: post-migration-validation
+        environment: {{ properties["environment"] }}
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable-cloudfunctions-api
+        - migration-automation-sa
+
+  # Eventarc Trigger for Bucket Administrative Events
+  - name: bucket-admin-eventarc-trigger
+    type: gcp-types/eventarc-v1:projects.locations.triggers
+    properties:
+      name: bucket-admin-trigger
+      location: {{ properties["region"] }}
+      eventFilters:
+        - attribute: type
+          value: google.cloud.audit.log.v1.written
+        - attribute: serviceName
+          value: storage.googleapis.com
+        - attribute: methodName
+          value: storage.buckets.patch
+      destination:
+        cloudFunction: projects/{{ env["project"] }}/locations/{{ properties["region"] }}/functions/migration-progress-monitor
+        cloudFunction.serviceAccountEmail: migration-automation@{{ env["project"] }}.iam.gserviceaccount.com
+      labels:
+        purpose: bucket-admin-monitoring
+        environment: {{ properties["environment"] }}
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable-eventarc-api
+        - migration-progress-monitor-function
+        - migration-automation-sa
+
+  # Eventarc Trigger for Object-Level Events
+  - name: object-event-eventarc-trigger
+    type: gcp-types/eventarc-v1:projects.locations.triggers
+    properties:
+      name: object-event-trigger
+      location: {{ properties["region"] }}
+      eventFilters:
+        - attribute: type
+          value: google.cloud.audit.log.v1.written
+        - attribute: serviceName
+          value: storage.googleapis.com
+        - attribute: methodName
+          value: storage.objects.create
+      destination:
+        cloudFunction: projects/{{ env["project"] }}/locations/{{ properties["region"] }}/functions/post-migration-validator
+        cloudFunction.serviceAccountEmail: migration-automation@{{ env["project"] }}.iam.gserviceaccount.com
+      labels:
+        purpose: object-level-monitoring
+        environment: {{ properties["environment"] }}
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable-eventarc-api
+        - post-migration-validator-function
+        - migration-automation-sa
+
+  # Cloud Monitoring Alert Policy for Migration Events
+  - name: migration-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: Bucket Migration Alert Policy
+      documentation:
+        content: Alert policy for monitoring bucket migration operations and errors
+        mimeType: text/markdown
+      conditions:
+        - displayName: Storage bucket operation errors
+          conditionThreshold:
+            filter: >
+              resource.type="gcs_bucket" AND 
+              log_name="projects/{{ env["project"] }}/logs/cloudaudit.googleapis.com%2Factivity" AND 
+              protoPayload.methodName:"storage.buckets"
+            comparison: COMPARISON_COUNT_GREATER_THAN
+            thresholdValue: 0
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_COUNT
+                crossSeriesReducer: REDUCE_SUM
+                groupByFields:
+                  - resource.label.bucket_name
+                  - resource.label.project_id
+      alertStrategy:
+        autoClose: 604800s  # 7 days
+      enabled: true
+      notificationChannels: []  # Add notification channels as needed
+      labels:
+        purpose: migration-monitoring
+        environment: {{ properties["environment"] }}
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+
+  # Cloud KMS Key Ring for Encryption
+  - name: migration-key-ring
+    type: gcp-types/cloudkms-v1:projects.locations.keyRings
+    properties:
+      name: migration-keyring
+      location: {{ properties["source_region"] }}
+      labels:
+        purpose: migration-encryption
+        environment: {{ properties["environment"] }}
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # Cloud KMS Crypto Key for Bucket Encryption
+  - name: migration-crypto-key
+    type: gcp-types/cloudkms-v1:projects.locations.keyRings.cryptoKeys
+    properties:
+      name: migration-key
+      parent: $(ref.migration-key-ring.name)
+      purpose: ENCRYPT_DECRYPT
+      versionTemplate:
+        algorithm: GOOGLE_SYMMETRIC_ENCRYPTION
+        protectionLevel: SOFTWARE
+      rotationPeriod: 7776000s  # 90 days
+      labels:
+        purpose: migration-encryption
+        environment: {{ properties["environment"] }}
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - migration-key-ring
+
+  # IAM Policy for KMS Key Access
+  - name: migration-key-iam-policy
+    type: gcp-types/cloudkms-v1:projects.locations.keyRings.cryptoKeys.setIamPolicy
+    properties:
+      resource: $(ref.migration-crypto-key.name)
+      policy:
+        bindings:
+          - role: roles/cloudkms.cryptoKeyEncrypterDecrypter
+            members:
+              - serviceAccount:migration-automation@{{ env["project"] }}.iam.gserviceaccount.com
+              - serviceAccount:service-{{ env["project_number"] }}@gs-project-accounts.iam.gserviceaccount.com
+          - role: roles/cloudkms.cryptoKeyViewer
+            members:
+              - serviceAccount:migration-automation@{{ env["project"] }}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - migration-crypto-key
+        - migration-automation-sa
+
+  # Cloud Monitoring Dashboard for Migration Analytics
+  - name: migration-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      displayName: Data Migration Analytics Dashboard
+      mosaicLayout:
+        tiles:
+          - width: 6
+            height: 4
+            widget:
+              title: Bucket Relocation Operations
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: >
+                          resource.type="gcs_bucket" AND 
+                          log_name="projects/{{ env["project"] }}/logs/cloudaudit.googleapis.com%2Factivity" AND 
+                          protoPayload.methodName:"storage.buckets.patch"
+                        aggregation:
+                          alignmentPeriod: 300s
+                          perSeriesAligner: ALIGN_COUNT
+                          crossSeriesReducer: REDUCE_SUM
+                          groupByFields:
+                            - resource.label.bucket_name
+                yAxis:
+                  label: Operations Count
+                  scale: LINEAR
+          - width: 6
+            height: 4
+            widget:
+              title: Migration Function Executions
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: >
+                          resource.type="cloud_function" AND 
+                          resource.label.function_name=~".*migration.*"
+                        aggregation:
+                          alignmentPeriod: 300s
+                          perSeriesAligner: ALIGN_COUNT
+                          crossSeriesReducer: REDUCE_SUM
+                          groupByFields:
+                            - resource.label.function_name
+                yAxis:
+                  label: Execution Count
+                  scale: LINEAR
+          - width: 12
+            height: 4
+            widget:
+              title: Migration Audit Log Analysis
+              scorecard:
+                timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: >
+                      resource.type="gcs_bucket" AND 
+                      protoPayload.serviceName="storage.googleapis.com"
+                    aggregation:
+                      alignmentPeriod: 3600s
+                      perSeriesAligner: ALIGN_COUNT
+                      crossSeriesReducer: REDUCE_SUM
+                sparkChartView:
+                  sparkChartType: SPARK_LINE
+      labels:
+        purpose: migration-analytics
+        environment: {{ properties["environment"] }}
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+        - migration-audit-dataset
+
+outputs:
+  - name: migration-source-bucket-name
+    value: $(ref.migration-source-bucket.name)
+    
+  - name: migration-automation-service-account
+    value: $(ref.migration-automation-sa.email)
+    
+  - name: migration-audit-dataset-id
+    value: $(ref.migration-audit-dataset.id)
+    
+  - name: pre-migration-validator-function-name
+    value: $(ref.pre-migration-validator-function.name)
+    
+  - name: migration-progress-monitor-function-name
+    value: $(ref.migration-progress-monitor-function.name)
+    
+  - name: post-migration-validator-function-name
+    value: $(ref.post-migration-validator-function.name)
+    
+  - name: bucket-admin-eventarc-trigger-name
+    value: $(ref.bucket-admin-eventarc-trigger.name)
+    
+  - name: object-event-eventarc-trigger-name
+    value: $(ref.object-event-eventarc-trigger.name)
+    
+  - name: migration-alert-policy-name
+    value: $(ref.migration-alert-policy.name)
+    
+  - name: migration-dashboard-name
+    value: $(ref.migration-dashboard.name)
+    
+  - name: migration-crypto-key-name
+    value: $(ref.migration-crypto-key.name)
+    
+  - name: migration-audit-sink-name
+    value: $(ref.migration-audit-sink.name)
+
+  - name: deployment-summary
+    value: |
+      Data Migration Workflows Infrastructure Deployed Successfully
+      
+      Key Components:
+      - Source Bucket: $(ref.migration-source-bucket.name)
+      - Service Account: $(ref.migration-automation-sa.email)
+      - Audit Dataset: $(ref.migration-audit-dataset.id)
+      - Cloud Functions: 3 functions for validation and monitoring
+      - Eventarc Triggers: 2 triggers for automated event processing
+      - Monitoring: Alert policy and dashboard configured
+      - Security: KMS encryption and IAM bindings applied
+      
+      Next Steps:
+      1. Upload Cloud Function source code to the specified bucket
+      2. Configure notification channels for alert policy
+      3. Test bucket relocation workflow
+      4. Monitor migration progress through the dashboard
+      
+      For detailed usage instructions, refer to the recipe documentation.

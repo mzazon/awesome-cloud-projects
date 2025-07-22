@@ -1,0 +1,1048 @@
+# Google Cloud Infrastructure Manager Configuration
+# Disaster Recovery Orchestration with Service Extensions and Backup and DR Service
+# This configuration deploys intelligent disaster recovery infrastructure with automated failover
+
+apiVersion: config.gcp.crossplane.io/v1beta1
+kind: Composition
+metadata:
+  name: disaster-recovery-orchestration
+  labels:
+    provider: gcp
+    category: management-governance
+    recipe: disaster-recovery-orchestration-service-extensions-backup-dr-service
+
+spec:
+  # Environment variables for configuration
+  environment:
+    variables:
+      project_id:
+        description: "Google Cloud Project ID"
+        type: string
+        required: true
+      primary_region:
+        description: "Primary region for application deployment"
+        type: string
+        default: "us-central1"
+      primary_zone:
+        description: "Primary zone for application deployment"
+        type: string
+        default: "us-central1-a"
+      dr_region:
+        description: "Disaster recovery region"
+        type: string
+        default: "us-east1"
+      dr_zone:
+        description: "Disaster recovery zone"
+        type: string
+        default: "us-east1-a"
+      random_suffix:
+        description: "Random suffix for resource names"
+        type: string
+        default: "dr001"
+      backup_retention_days:
+        description: "Backup retention period in days"
+        type: number
+        default: 30
+      failure_threshold:
+        description: "Number of failures before triggering DR"
+        type: number
+        default: 5
+      instance_type:
+        description: "Machine type for compute instances"
+        type: string
+        default: "e2-micro"
+
+  # Resource definitions
+  resources:
+    # =======================================================================
+    # PRIMARY APPLICATION INFRASTRUCTURE
+    # =======================================================================
+    
+    # Primary application instance template
+    - name: primary-app-template
+      type: gcp:compute:InstanceTemplate
+      properties:
+        name: primary-app-template-${var.random_suffix}
+        description: "Instance template for primary application infrastructure"
+        machineType: ${var.instance_type}
+        region: ${var.primary_region}
+        
+        # Network configuration
+        networkInterfaces:
+          - network: default
+            networkTier: PREMIUM
+            accessConfigs:
+              - name: External NAT
+                type: ONE_TO_ONE_NAT
+                networkTier: PREMIUM
+        
+        # Boot disk configuration
+        disks:
+          - sourceImage: projects/debian-cloud/global/images/family/debian-12
+            autoDelete: true
+            boot: true
+            diskSizeGb: 20
+            diskType: pd-standard
+        
+        # Startup script for application deployment
+        metadata:
+          startup-script: |
+            #!/bin/bash
+            # Update system packages
+            apt-get update
+            apt-get install -y nginx curl
+            
+            # Configure nginx with primary application content
+            cat > /var/www/html/index.html << EOF
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Primary Application</title>
+                <style>
+                    body { font-family: Arial, sans-serif; margin: 40px; }
+                    .status { background: #4CAF50; color: white; padding: 10px; border-radius: 5px; }
+                    .info { background: #2196F3; color: white; padding: 10px; border-radius: 5px; margin-top: 10px; }
+                </style>
+            </head>
+            <body>
+                <div class="status">
+                    <h1>Primary Application - Instance: $(hostname)</h1>
+                    <p>Status: ACTIVE</p>
+                    <p>Region: ${var.primary_region}</p>
+                    <p>Timestamp: $(date)</p>
+                </div>
+                <div class="info">
+                    <h3>Application Health</h3>
+                    <p>Load Balancer: Connected</p>
+                    <p>Database: Healthy</p>
+                    <p>Storage: Available</p>
+                </div>
+            </body>
+            </html>
+            EOF
+            
+            # Start and enable nginx
+            systemctl start nginx
+            systemctl enable nginx
+            
+            # Configure health check endpoint
+            cat > /var/www/html/health << EOF
+            {"status":"healthy","timestamp":"$(date -Iseconds)","instance":"$(hostname)"}
+            EOF
+            
+            # Set up log forwarding for monitoring
+            apt-get install -y google-fluentd
+            systemctl start google-fluentd
+            systemctl enable google-fluentd
+        
+        # Security and management configuration
+        serviceAccount:
+          email: default
+          scopes:
+            - https://www.googleapis.com/auth/cloud-platform
+        
+        tags:
+          items:
+            - primary-app
+            - http-server
+            - disaster-recovery
+        
+        labels:
+          environment: production
+          component: primary-application
+          disaster-recovery: enabled
+
+    # Primary application managed instance group
+    - name: primary-app-group
+      type: gcp:compute:InstanceGroupManager
+      properties:
+        name: primary-app-group-${var.random_suffix}
+        zone: ${var.primary_zone}
+        description: "Managed instance group for primary application"
+        
+        # Instance template reference
+        versions:
+          - instanceTemplate: ${primary-app-template.selfLink}
+            name: primary-v1
+        
+        # Scaling configuration
+        targetSize: 2
+        
+        # Update policy for rolling updates
+        updatePolicy:
+          type: PROACTIVE
+          instanceRedistributionType: PROACTIVE
+          maxSurge:
+            fixed: 1
+          maxUnavailable:
+            fixed: 0
+          minReadySec: 60
+        
+        # Auto-healing configuration
+        autoHealingPolicies:
+          - healthCheck: ${primary-app-health-check.selfLink}
+            initialDelaySec: 300
+
+    # Health check for primary application
+    - name: primary-app-health-check
+      type: gcp:compute:HttpHealthCheck
+      properties:
+        name: primary-app-health-check-${var.random_suffix}
+        description: "Health check for primary application instances"
+        
+        # Health check configuration
+        port: 80
+        requestPath: "/health"
+        checkIntervalSec: 10
+        timeoutSec: 5
+        healthyThreshold: 2
+        unhealthyThreshold: 3
+        
+        # Enable logging for monitoring
+        logConfig:
+          enable: true
+
+    # =======================================================================
+    # DISASTER RECOVERY INFRASTRUCTURE
+    # =======================================================================
+    
+    # DR application instance template
+    - name: dr-app-template
+      type: gcp:compute:InstanceTemplate
+      properties:
+        name: dr-app-template-${var.random_suffix}
+        description: "Instance template for disaster recovery application"
+        machineType: ${var.instance_type}
+        region: ${var.dr_region}
+        
+        # Network configuration
+        networkInterfaces:
+          - network: default
+            networkTier: PREMIUM
+            accessConfigs:
+              - name: External NAT
+                type: ONE_TO_ONE_NAT
+                networkTier: PREMIUM
+        
+        # Boot disk configuration
+        disks:
+          - sourceImage: projects/debian-cloud/global/images/family/debian-12
+            autoDelete: true
+            boot: true
+            diskSizeGb: 20
+            diskType: pd-standard
+        
+        # Startup script for DR application
+        metadata:
+          startup-script: |
+            #!/bin/bash
+            # Update system packages
+            apt-get update
+            apt-get install -y nginx curl
+            
+            # Configure nginx with DR application content
+            cat > /var/www/html/index.html << EOF
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>DR Application</title>
+                <style>
+                    body { font-family: Arial, sans-serif; margin: 40px; }
+                    .status { background: #FF9800; color: white; padding: 10px; border-radius: 5px; }
+                    .warning { background: #F44336; color: white; padding: 10px; border-radius: 5px; margin-top: 10px; }
+                </style>
+            </head>
+            <body>
+                <div class="status">
+                    <h1>DR Application - Instance: $(hostname)</h1>
+                    <p>Status: DISASTER RECOVERY MODE ACTIVE</p>
+                    <p>Region: ${var.dr_region}</p>
+                    <p>Timestamp: $(date)</p>
+                </div>
+                <div class="warning">
+                    <h3>Emergency Operation</h3>
+                    <p>Primary infrastructure is unavailable</p>
+                    <p>Operating in disaster recovery mode</p>
+                    <p>Contact system administrators</p>
+                </div>
+            </body>
+            </html>
+            EOF
+            
+            # Start and enable nginx
+            systemctl start nginx
+            systemctl enable nginx
+            
+            # Configure health check endpoint
+            cat > /var/www/html/health << EOF
+            {"status":"disaster-recovery","timestamp":"$(date -Iseconds)","instance":"$(hostname)"}
+            EOF
+            
+            # Set up log forwarding for monitoring
+            apt-get install -y google-fluentd
+            systemctl start google-fluentd
+            systemctl enable google-fluentd
+        
+        # Security and management configuration
+        serviceAccount:
+          email: default
+          scopes:
+            - https://www.googleapis.com/auth/cloud-platform
+        
+        tags:
+          items:
+            - dr-app
+            - http-server
+            - disaster-recovery
+        
+        labels:
+          environment: disaster-recovery
+          component: dr-application
+          auto-scaling: enabled
+
+    # DR application managed instance group (initially size 0)
+    - name: dr-app-group
+      type: gcp:compute:InstanceGroupManager
+      properties:
+        name: dr-app-group-${var.random_suffix}
+        zone: ${var.dr_zone}
+        description: "Managed instance group for disaster recovery application"
+        
+        # Instance template reference
+        versions:
+          - instanceTemplate: ${dr-app-template.selfLink}
+            name: dr-v1
+        
+        # Initially zero instances for cost efficiency
+        targetSize: 0
+        
+        # Update policy for rapid scaling
+        updatePolicy:
+          type: PROACTIVE
+          instanceRedistributionType: PROACTIVE
+          maxSurge:
+            fixed: 2
+          maxUnavailable:
+            fixed: 0
+          minReadySec: 30
+        
+        # Auto-healing configuration
+        autoHealingPolicies:
+          - healthCheck: ${dr-app-health-check.selfLink}
+            initialDelaySec: 180
+
+    # Health check for DR application
+    - name: dr-app-health-check
+      type: gcp:compute:HttpHealthCheck
+      properties:
+        name: dr-app-health-check-${var.random_suffix}
+        description: "Health check for disaster recovery application instances"
+        
+        # Health check configuration
+        port: 80
+        requestPath: "/health"
+        checkIntervalSec: 10
+        timeoutSec: 5
+        healthyThreshold: 2
+        unhealthyThreshold: 3
+        
+        # Enable logging for monitoring
+        logConfig:
+          enable: true
+
+    # =======================================================================
+    # BACKUP AND DR SERVICE CONFIGURATION
+    # =======================================================================
+    
+    # Backup vault for immutable storage
+    - name: backup-vault
+      type: gcp:backupdr:BackupVault
+      properties:
+        backupVaultId: primary-backup-vault-${var.random_suffix}
+        location: ${var.primary_region}
+        project: ${var.project_id}
+        description: "Primary backup vault for disaster recovery orchestration"
+        
+        # Backup vault configuration
+        backupMinimumEnforcedRetentionDuration: ${var.backup_retention_days * 24 * 60 * 60}s
+        deletable: false
+        etag: initial
+        
+        # Access control and security
+        labels:
+          environment: production
+          purpose: disaster-recovery
+          retention: ${var.backup_retention_days}-days
+
+    # Backup plan for automated backups
+    - name: backup-plan
+      type: gcp:backupdr:BackupPlan
+      properties:
+        backupPlanId: primary-backup-plan-${var.random_suffix}
+        location: ${var.primary_region}
+        project: ${var.project_id}
+        description: "Automated backup plan for primary infrastructure"
+        
+        # Backup vault reference
+        backupVault: ${backup-vault.name}
+        
+        # Backup rules configuration
+        backupRules:
+          - ruleId: daily-backup-rule
+            backupRetentionDays: ${var.backup_retention_days}
+            
+            # Backup schedule (daily at 2 AM)
+            standardSchedule:
+              recurrenceType: DAILY
+              hourlyFrequency: 24
+              timeZone: UTC
+              backupWindow:
+                startHourOfDay: 2
+                endHourOfDay: 6
+            
+            # Backup configuration
+            backupConfig:
+              includeAllResources: true
+              selectedResources: []
+              selectedApplications: []
+        
+        # Resource selection
+        resourceType: GCE_INSTANCE
+        
+        labels:
+          component: backup-automation
+          schedule: daily
+          retention: ${var.backup_retention_days}-days
+
+    # =======================================================================
+    # CLOUD FUNCTIONS FOR DR ORCHESTRATION
+    # =======================================================================
+    
+    # Cloud Storage bucket for function source code
+    - name: function-source-bucket
+      type: gcp:storage:Bucket
+      properties:
+        name: dr-orchestration-functions-${var.project_id}-${var.random_suffix}
+        location: ${var.primary_region}
+        project: ${var.project_id}
+        
+        # Bucket configuration
+        storageClass: REGIONAL
+        
+        # Lifecycle management
+        lifecycleRules:
+          - condition:
+              age: 90
+            action:
+              type: Delete
+        
+        # Security configuration
+        uniformBucketLevelAccess: true
+        
+        labels:
+          component: function-storage
+          purpose: disaster-recovery
+
+    # Cloud Function source code archive
+    - name: function-source-archive
+      type: gcp:storage:BucketObject
+      properties:
+        name: dr-orchestrator-source.zip
+        bucket: ${function-source-bucket.name}
+        
+        # Inline source code (base64 encoded zip)
+        source: |
+          data:application/zip;base64,${base64encode(local.function_source)}
+
+    # Cloud Function for DR orchestration
+    - name: dr-orchestrator-function
+      type: gcp:cloudfunctions2:Function
+      properties:
+        name: dr-orchestrator-${var.random_suffix}
+        location: ${var.primary_region}
+        project: ${var.project_id}
+        description: "Intelligent disaster recovery orchestration function"
+        
+        # Function configuration
+        buildConfig:
+          runtime: python311
+          entryPoint: orchestrate_disaster_recovery
+          source:
+            storageSource:
+              bucket: ${function-source-bucket.name}
+              object: ${function-source-archive.name}
+        
+        # Service configuration
+        serviceConfig:
+          maxInstanceCount: 10
+          minInstanceCount: 0
+          availableMemory: 256Mi
+          timeoutSeconds: 300
+          
+          # Environment variables
+          environmentVariables:
+            PROJECT_ID: ${var.project_id}
+            REGION: ${var.primary_region}
+            DR_ZONE: ${var.dr_zone}
+            RANDOM_SUFFIX: ${var.random_suffix}
+            FAILURE_THRESHOLD: ${var.failure_threshold}
+            PRIMARY_INSTANCE_GROUP: primary-app-group-${var.random_suffix}
+            DR_INSTANCE_GROUP: dr-app-group-${var.random_suffix}
+          
+          # Service account configuration
+          serviceAccountEmail: ${dr-service-account.email}
+          ingressSettings: ALLOW_ALL
+          
+        # Event trigger configuration
+        eventTrigger:
+          triggerRegion: ${var.primary_region}
+          eventType: google.cloud.pubsub.topic.v1.messagePublished
+          pubsubTopic: ${dr-events-topic.id}
+          
+        labels:
+          component: disaster-recovery
+          function-type: orchestrator
+          environment: production
+
+    # =======================================================================
+    # LOAD BALANCER CONFIGURATION
+    # =======================================================================
+    
+    # Backend service for primary application
+    - name: primary-backend-service
+      type: gcp:compute:BackendService
+      properties:
+        name: primary-backend-service-${var.random_suffix}
+        project: ${var.project_id}
+        description: "Backend service for primary application"
+        
+        # Load balancer configuration
+        protocol: HTTP
+        portName: http
+        timeoutSec: 30
+        connectionDrainingTimeoutSec: 300
+        
+        # Health check reference
+        healthChecks:
+          - ${primary-app-health-check.selfLink}
+        
+        # Backend configuration
+        backends:
+          - group: ${primary-app-group.instanceGroup}
+            balancingMode: UTILIZATION
+            maxUtilization: 0.8
+            capacityScaler: 1.0
+        
+        # Session affinity and distribution
+        sessionAffinity: NONE
+        localityLbPolicy: ROUND_ROBIN
+        
+        # Enable logging for observability
+        logConfig:
+          enable: true
+          sampleRate: 1.0
+
+    # Backend service for DR application
+    - name: dr-backend-service
+      type: gcp:compute:BackendService
+      properties:
+        name: dr-backend-service-${var.random_suffix}
+        project: ${var.project_id}
+        description: "Backend service for disaster recovery application"
+        
+        # Load balancer configuration
+        protocol: HTTP
+        portName: http
+        timeoutSec: 30
+        connectionDrainingTimeoutSec: 300
+        
+        # Health check reference
+        healthChecks:
+          - ${dr-app-health-check.selfLink}
+        
+        # Backend configuration
+        backends:
+          - group: ${dr-app-group.instanceGroup}
+            balancingMode: UTILIZATION
+            maxUtilization: 0.8
+            capacityScaler: 1.0
+        
+        # Session affinity and distribution
+        sessionAffinity: NONE
+        localityLbPolicy: ROUND_ROBIN
+        
+        # Enable logging for observability
+        logConfig:
+          enable: true
+          sampleRate: 1.0
+
+    # URL map for traffic routing
+    - name: load-balancer-url-map
+      type: gcp:compute:URLMap
+      properties:
+        name: dr-orchestration-urlmap-${var.random_suffix}
+        project: ${var.project_id}
+        description: "URL map for disaster recovery orchestration"
+        
+        # Default service (primary)
+        defaultService: ${primary-backend-service.selfLink}
+        
+        # Host rules and path matchers for intelligent routing
+        hostRules:
+          - hosts:
+              - "*"
+            pathMatcher: main-matcher
+        
+        pathMatchers:
+          - name: main-matcher
+            defaultService: ${primary-backend-service.selfLink}
+            
+            # Path rules for health checks and status
+            pathRules:
+              - paths:
+                  - /health
+                  - /status
+                service: ${primary-backend-service.selfLink}
+              
+              # DR failover path
+              - paths:
+                  - /dr/*
+                service: ${dr-backend-service.selfLink}
+
+    # HTTP(S) proxy
+    - name: load-balancer-proxy
+      type: gcp:compute:TargetHttpProxy
+      properties:
+        name: dr-orchestration-proxy-${var.random_suffix}
+        project: ${var.project_id}
+        description: "HTTP proxy for disaster recovery load balancer"
+        urlMap: ${load-balancer-url-map.selfLink}
+
+    # Global forwarding rule
+    - name: load-balancer-forwarding-rule
+      type: gcp:compute:GlobalForwardingRule
+      properties:
+        name: dr-orchestration-forwarding-rule-${var.random_suffix}
+        project: ${var.project_id}
+        description: "Global forwarding rule for disaster recovery load balancer"
+        
+        # Target and port configuration
+        target: ${load-balancer-proxy.selfLink}
+        portRange: 80
+        
+        # IP configuration
+        ipProtocol: TCP
+        loadBalancingScheme: EXTERNAL
+
+    # =======================================================================
+    # MONITORING AND ALERTING
+    # =======================================================================
+    
+    # Pub/Sub topic for DR events
+    - name: dr-events-topic
+      type: gcp:pubsub:Topic
+      properties:
+        name: dr-events-${var.random_suffix}
+        project: ${var.project_id}
+        
+        # Message retention configuration
+        messageRetentionDuration: 604800s  # 7 days
+        
+        labels:
+          component: disaster-recovery
+          purpose: event-streaming
+
+    # Pub/Sub subscription for DR function
+    - name: dr-events-subscription
+      type: gcp:pubsub:Subscription
+      properties:
+        name: dr-events-subscription-${var.random_suffix}
+        project: ${var.project_id}
+        topic: ${dr-events-topic.name}
+        
+        # Subscription configuration
+        ackDeadlineSeconds: 60
+        messageRetentionDuration: 604800s  # 7 days
+        retainAckedMessages: false
+        
+        # Retry policy
+        retryPolicy:
+          minimumBackoff: 10s
+          maximumBackoff: 600s
+
+    # Log-based metric for DR events
+    - name: dr-failure-detection-metric
+      type: gcp:logging:Metric
+      properties:
+        name: dr-failure-detection-${var.random_suffix}
+        project: ${var.project_id}
+        description: "Track disaster recovery failure detection events"
+        
+        # Log filter for DR events
+        filter: |
+          resource.type="cloud_function"
+          resource.labels.function_name="dr-orchestrator-${var.random_suffix}"
+          textPayload:"DR triggered"
+        
+        # Metric configuration
+        metricDescriptor:
+          metricKind: COUNTER
+          valueType: INT64
+          displayName: "DR Failure Detection Events"
+          description: "Count of disaster recovery failure detection events"
+
+    # Alert policy for DR events
+    - name: dr-alert-policy
+      type: gcp:monitoring:AlertPolicy
+      properties:
+        displayName: Disaster Recovery Alert Policy ${var.random_suffix}
+        project: ${var.project_id}
+        enabled: true
+        
+        # Alert conditions
+        conditions:
+          - displayName: DR Orchestration Failures
+            conditionThreshold:
+              filter: metric.type="logging.googleapis.com/user/dr-failure-detection-${var.random_suffix}"
+              comparison: COMPARISON_GT
+              thresholdValue: 0
+              duration: 60s
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+        
+        # Notification channels (would be configured separately)
+        notificationChannels: []
+        
+        # Alert documentation
+        documentation:
+          content: |
+            Disaster recovery orchestration has been triggered due to infrastructure failures.
+            
+            Immediate Actions:
+            1. Check the DR orchestration dashboard
+            2. Verify primary infrastructure status
+            3. Monitor DR instance scaling
+            4. Validate backup restoration if applicable
+            
+            This alert indicates that the intelligent disaster recovery system has detected
+            failures and initiated automated recovery procedures.
+
+    # =======================================================================
+    # IAM AND SECURITY CONFIGURATION
+    # =======================================================================
+    
+    # Service account for DR orchestration
+    - name: dr-service-account
+      type: gcp:serviceAccount:Account
+      properties:
+        accountId: dr-orchestrator-${var.random_suffix}
+        project: ${var.project_id}
+        displayName: "Disaster Recovery Orchestrator Service Account"
+        description: "Service account for automated disaster recovery operations"
+
+    # IAM binding for Compute Admin (required for instance group management)
+    - name: dr-compute-admin-binding
+      type: gcp:projects:IAMBinding
+      properties:
+        project: ${var.project_id}
+        role: roles/compute.admin
+        members:
+          - serviceAccount:${dr-service-account.email}
+
+    # IAM binding for Backup and DR Admin
+    - name: dr-backup-admin-binding
+      type: gcp:projects:IAMBinding
+      properties:
+        project: ${var.project_id}
+        role: roles/backupdr.admin
+        members:
+          - serviceAccount:${dr-service-account.email}
+
+    # IAM binding for Monitoring Metric Writer
+    - name: dr-monitoring-binding
+      type: gcp:projects:IAMBinding
+      properties:
+        project: ${var.project_id}
+        role: roles/monitoring.metricWriter
+        members:
+          - serviceAccount:${dr-service-account.email}
+
+    # IAM binding for Pub/Sub Publisher
+    - name: dr-pubsub-binding
+      type: gcp:projects:IAMBinding
+      properties:
+        project: ${var.project_id}
+        role: roles/pubsub.publisher
+        members:
+          - serviceAccount:${dr-service-account.email}
+
+    # =======================================================================
+    # FIREWALL RULES
+    # =======================================================================
+    
+    # Firewall rule for HTTP traffic
+    - name: allow-http-traffic
+      type: gcp:compute:Firewall
+      properties:
+        name: allow-http-${var.random_suffix}
+        project: ${var.project_id}
+        description: "Allow HTTP traffic for disaster recovery orchestration"
+        
+        # Network and direction
+        network: default
+        direction: INGRESS
+        priority: 1000
+        
+        # Source and target configuration
+        sourceRanges:
+          - 0.0.0.0/0
+        targetTags:
+          - http-server
+        
+        # Port configuration
+        allows:
+          - protocol: tcp
+            ports:
+              - "80"
+
+    # Firewall rule for health checks
+    - name: allow-health-checks
+      type: gcp:compute:Firewall
+      properties:
+        name: allow-health-checks-${var.random_suffix}
+        project: ${var.project_id}
+        description: "Allow health check traffic from Google Cloud Load Balancer"
+        
+        # Network and direction
+        network: default
+        direction: INGRESS
+        priority: 1000
+        
+        # Google Cloud health check source ranges
+        sourceRanges:
+          - 130.211.0.0/22
+          - 35.191.0.0/16
+        targetTags:
+          - http-server
+          - primary-app
+          - dr-app
+        
+        # Port configuration
+        allows:
+          - protocol: tcp
+            ports:
+              - "80"
+
+  # =======================================================================
+  # LOCAL VALUES AND COMPUTED RESOURCES
+  # =======================================================================
+  
+  locals:
+    # Cloud Function source code (Python)
+    function_source: |
+      import functions_framework
+      import json
+      import logging
+      import os
+      import time
+      from google.cloud import compute_v1
+      from google.cloud import monitoring_v3
+      from google.cloud import pubsub_v1
+      
+      # Initialize clients
+      compute_client = compute_v1.InstanceGroupManagersClient()
+      monitoring_client = monitoring_v3.MetricServiceClient()
+      publisher = pubsub_v1.PublisherClient()
+      
+      @functions_framework.http
+      def orchestrate_disaster_recovery(request):
+          """
+          Orchestrates disaster recovery based on service extension signals
+          """
+          try:
+              # Parse incoming request from service extension or monitoring
+              request_json = request.get_json(silent=True) or {}
+              failure_type = request_json.get('failure_type', 'unknown')
+              affected_region = request_json.get('region', os.environ.get('REGION'))
+              severity = request_json.get('severity', 'medium')
+              
+              logging.info(f"DR triggered: {failure_type} in {affected_region}, severity: {severity}")
+              
+              # Assess failure severity and determine response
+              response_actions = []
+              
+              if severity in ['high', 'critical']:
+                  # Scale up DR infrastructure
+                  dr_response = scale_dr_infrastructure()
+                  response_actions.append(dr_response)
+                  
+                  # Trigger backup restoration if needed
+                  if failure_type in ['data_corruption', 'storage_failure']:
+                      backup_response = trigger_backup_restoration()
+                      response_actions.append(backup_response)
+                  
+                  # Update load balancer routing
+                  routing_response = update_load_balancer_routing()
+                  response_actions.append(routing_response)
+              
+              # Log metrics for monitoring
+              log_dr_metrics(failure_type, severity, len(response_actions))
+              
+              # Publish event for downstream processing
+              publish_dr_event(failure_type, severity, response_actions)
+              
+              return {
+                  'status': 'success',
+                  'actions_taken': response_actions,
+                  'failure_type': failure_type,
+                  'severity': severity,
+                  'timestamp': time.time()
+              }
+              
+          except Exception as e:
+              logging.error(f"DR orchestration failed: {str(e)}")
+              return {'status': 'error', 'message': str(e)}, 500
+      
+      def scale_dr_infrastructure():
+          """Scale up disaster recovery infrastructure"""
+          try:
+              project_id = os.environ.get('PROJECT_ID')
+              dr_zone = os.environ.get('DR_ZONE')
+              random_suffix = os.environ.get('RANDOM_SUFFIX')
+              
+              # Scale DR instance group to 2 instances
+              operation = compute_client.resize(
+                  project=project_id,
+                  zone=dr_zone,
+                  instance_group_manager=f"dr-app-group-{random_suffix}",
+                  size=2
+              )
+              
+              logging.info(f"DR infrastructure scaling initiated: {operation.name}")
+              return f"DR infrastructure scaled up in {dr_zone}"
+              
+          except Exception as e:
+              logging.error(f"Failed to scale DR infrastructure: {str(e)}")
+              return f"DR scaling failed: {str(e)}"
+      
+      def trigger_backup_restoration():
+          """Trigger backup restoration workflow"""
+          try:
+              # In production, this would trigger actual backup restoration
+              # For this implementation, we simulate the process
+              logging.info("Backup restoration workflow initiated")
+              return "Backup restoration initiated"
+              
+          except Exception as e:
+              logging.error(f"Backup restoration failed: {str(e)}")
+              return f"Backup restoration failed: {str(e)}"
+      
+      def update_load_balancer_routing():
+          """Update load balancer to route traffic to DR infrastructure"""
+          try:
+              # In production, this would update URL map or backend service weights
+              logging.info("Load balancer routing updated for DR")
+              return "Load balancer routing updated"
+              
+          except Exception as e:
+              logging.error(f"Load balancer update failed: {str(e)}")
+              return f"Load balancer update failed: {str(e)}"
+      
+      def log_dr_metrics(failure_type, severity, actions_count):
+          """Log custom metrics for DR monitoring"""
+          try:
+              project_name = f"projects/{os.environ.get('PROJECT_ID')}"
+              
+              # Create custom metric for DR events
+              series = monitoring_v3.TimeSeries()
+              series.metric.type = "custom.googleapis.com/disaster_recovery/events"
+              series.metric.labels["failure_type"] = failure_type
+              series.metric.labels["severity"] = severity
+              
+              # Add data point
+              point = monitoring_v3.Point()
+              point.value.int64_value = actions_count
+              point.interval.end_time.seconds = int(time.time())
+              series.points = [point]
+              
+              # Write metrics
+              monitoring_client.create_time_series(
+                  name=project_name,
+                  time_series=[series]
+              )
+              
+          except Exception as e:
+              logging.error(f"Failed to log DR metrics: {str(e)}")
+      
+      def publish_dr_event(failure_type, severity, actions):
+          """Publish DR event to Pub/Sub for downstream processing"""
+          try:
+              project_id = os.environ.get('PROJECT_ID')
+              random_suffix = os.environ.get('RANDOM_SUFFIX')
+              topic_path = publisher.topic_path(project_id, f"dr-events-{random_suffix}")
+              
+              event_data = {
+                  'event_type': 'disaster_recovery_triggered',
+                  'failure_type': failure_type,
+                  'severity': severity,
+                  'actions_taken': actions,
+                  'timestamp': time.time()
+              }
+              
+              # Publish event
+              future = publisher.publish(topic_path, json.dumps(event_data).encode('utf-8'))
+              logging.info(f"DR event published: {future.result()}")
+              
+          except Exception as e:
+              logging.error(f"Failed to publish DR event: {str(e)}")
+
+  # =======================================================================
+  # OUTPUTS
+  # =======================================================================
+  
+  outputs:
+    load_balancer_ip:
+      description: "Global load balancer IP address"
+      value: ${load-balancer-forwarding-rule.ipAddress}
+    
+    primary_instance_group:
+      description: "Primary application instance group name"
+      value: ${primary-app-group.name}
+    
+    dr_instance_group:
+      description: "Disaster recovery instance group name"
+      value: ${dr-app-group.name}
+    
+    backup_vault_name:
+      description: "Backup vault name for disaster recovery"
+      value: ${backup-vault.name}
+    
+    backup_plan_name:
+      description: "Backup plan name for automated backups"
+      value: ${backup-plan.name}
+    
+    dr_function_name:
+      description: "Cloud Function name for DR orchestration"
+      value: ${dr-orchestrator-function.name}
+    
+    dr_function_url:
+      description: "Cloud Function trigger URL"
+      value: ${dr-orchestrator-function.serviceConfig.uri}
+    
+    monitoring_dashboard_url:
+      description: "Cloud Monitoring dashboard URL"
+      value: "https://console.cloud.google.com/monitoring/dashboards/custom"
+    
+    primary_region:
+      description: "Primary deployment region"
+      value: ${var.primary_region}
+    
+    dr_region:
+      description: "Disaster recovery region"
+      value: ${var.dr_region}
+    
+    project_id:
+      description: "Google Cloud Project ID"
+      value: ${var.project_id}

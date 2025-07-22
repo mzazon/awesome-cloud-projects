@@ -1,0 +1,1302 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Complete AWS Database Migration Service (DMS) infrastructure for implementing 
+  database migration strategies with comprehensive monitoring and logging capabilities.
+  This template deploys DMS replication instances, endpoints, migration tasks, and 
+  supporting infrastructure for both homogeneous and heterogeneous database migrations.
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - SubnetIds
+          - CreatePublicSubnetGroup
+          - AllowedCidrBlocks
+      - Label:
+          default: "DMS Replication Instance Configuration"
+        Parameters:
+          - ReplicationInstanceClass
+          - AllocatedStorage
+          - MultiAZ
+          - EngineVersion
+          - AutoMinorVersionUpgrade
+      - Label:
+          default: "Source Database Configuration"
+        Parameters:
+          - SourceEngine
+          - SourceServerName
+          - SourcePort
+          - SourceDatabaseName
+          - SourceUsername
+          - SourcePassword
+          - SourceExtraConnectionAttributes
+          - SourceSslMode
+      - Label:
+          default: "Target Database Configuration"
+        Parameters:
+          - TargetEngine
+          - TargetServerName
+          - TargetPort
+          - TargetDatabaseName
+          - TargetUsername
+          - TargetPassword
+          - TargetExtraConnectionAttributes
+          - TargetSslMode
+      - Label:
+          default: "Migration Task Configuration"
+        Parameters:
+          - MigrationType
+          - CdcStartPosition
+          - TableMappingRules
+          - EnableValidation
+          - EnableCloudWatchLogs
+      - Label:
+          default: "Monitoring and Alerting"
+        Parameters:
+          - SNSTopicArn
+          - CloudWatchLogRetentionDays
+          - CreateCloudWatchAlarms
+      - Label:
+          default: "Resource Naming and Tagging"
+        Parameters:
+          - ProjectName
+          - Environment
+          - ResourcePrefix
+    ParameterLabels:
+      VpcId:
+        default: "VPC ID"
+      SubnetIds:
+        default: "Subnet IDs"
+      ReplicationInstanceClass:
+        default: "Replication Instance Size"
+      AllocatedStorage:
+        default: "Storage Size (GB)"
+      MultiAZ:
+        default: "Multi-AZ Deployment"
+      SourceEngine:
+        default: "Source Database Engine"
+      TargetEngine:
+        default: "Target Database Engine"
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  # Network Configuration
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where DMS resources will be deployed
+    ConstraintDescription: Must be a valid VPC ID
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of subnet IDs for DMS subnet group (minimum 2 subnets in different AZs)
+    ConstraintDescription: Must contain at least 2 subnets in different Availability Zones
+
+  CreatePublicSubnetGroup:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to create publicly accessible replication instance
+
+  AllowedCidrBlocks:
+    Type: CommaDelimitedList
+    Default: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+    Description: CIDR blocks allowed to access DMS replication instance
+    ConstraintDescription: Must be valid CIDR notation
+
+  # DMS Replication Instance Configuration
+  ReplicationInstanceClass:
+    Type: String
+    Default: dms.t3.medium
+    AllowedValues:
+      - dms.t3.micro
+      - dms.t3.small
+      - dms.t3.medium
+      - dms.t3.large
+      - dms.c5.large
+      - dms.c5.xlarge
+      - dms.c5.2xlarge
+      - dms.c5.4xlarge
+      - dms.r5.large
+      - dms.r5.xlarge
+      - dms.r5.2xlarge
+      - dms.r5.4xlarge
+    Description: DMS replication instance class
+    ConstraintDescription: Must be a valid DMS instance class
+
+  AllocatedStorage:
+    Type: Number
+    Default: 100
+    MinValue: 20
+    MaxValue: 6144
+    Description: Storage allocated to replication instance in GB
+    ConstraintDescription: Must be between 20 and 6144 GB
+
+  MultiAZ:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable Multi-AZ deployment for high availability
+
+  EngineVersion:
+    Type: String
+    Default: "3.5.2"
+    AllowedValues: ["3.4.7", "3.5.0", "3.5.1", "3.5.2"]
+    Description: DMS engine version
+    ConstraintDescription: Must be a supported DMS engine version
+
+  AutoMinorVersionUpgrade:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable automatic minor version upgrades
+
+  # Source Database Configuration
+  SourceEngine:
+    Type: String
+    Default: mysql
+    AllowedValues:
+      - mysql
+      - postgres
+      - oracle-ee
+      - oracle-se2
+      - oracle-se1
+      - oracle-se
+      - sqlserver
+      - aurora
+      - aurora-postgresql
+      - mariadb
+      - mongodb
+      - sybase
+      - db2
+    Description: Source database engine type
+
+  SourceServerName:
+    Type: String
+    Description: Source database server hostname or IP address
+    ConstraintDescription: Must be a valid hostname or IP address
+
+  SourcePort:
+    Type: Number
+    Default: 3306
+    MinValue: 1
+    MaxValue: 65535
+    Description: Source database port number
+
+  SourceDatabaseName:
+    Type: String
+    Description: Source database name
+    ConstraintDescription: Must be a valid database name
+
+  SourceUsername:
+    Type: String
+    Description: Source database username
+    MinLength: 1
+    MaxLength: 63
+    ConstraintDescription: Must be 1-63 characters
+
+  SourcePassword:
+    Type: String
+    NoEcho: true
+    Description: Source database password
+    MinLength: 8
+    MaxLength: 128
+    ConstraintDescription: Must be 8-128 characters
+
+  SourceExtraConnectionAttributes:
+    Type: String
+    Default: ""
+    Description: Additional connection attributes for source database (optional)
+
+  SourceSslMode:
+    Type: String
+    Default: none
+    AllowedValues: [none, require, verify-ca, verify-full]
+    Description: SSL mode for source database connection
+
+  # Target Database Configuration
+  TargetEngine:
+    Type: String
+    Default: mysql
+    AllowedValues:
+      - mysql
+      - postgres
+      - oracle-ee
+      - oracle-se2
+      - oracle-se1
+      - oracle-se
+      - sqlserver
+      - aurora
+      - aurora-postgresql
+      - mariadb
+      - redshift
+      - s3
+      - dynamodb
+      - kinesis
+      - opensearch
+    Description: Target database engine type
+
+  TargetServerName:
+    Type: String
+    Description: Target database server hostname or IP address
+    ConstraintDescription: Must be a valid hostname or IP address
+
+  TargetPort:
+    Type: Number
+    Default: 3306
+    MinValue: 1
+    MaxValue: 65535
+    Description: Target database port number
+
+  TargetDatabaseName:
+    Type: String
+    Description: Target database name
+    ConstraintDescription: Must be a valid database name
+
+  TargetUsername:
+    Type: String
+    Description: Target database username
+    MinLength: 1
+    MaxLength: 63
+    ConstraintDescription: Must be 1-63 characters
+
+  TargetPassword:
+    Type: String
+    NoEcho: true
+    Description: Target database password
+    MinLength: 8
+    MaxLength: 128
+    ConstraintDescription: Must be 8-128 characters
+
+  TargetExtraConnectionAttributes:
+    Type: String
+    Default: ""
+    Description: Additional connection attributes for target database (optional)
+
+  TargetSslMode:
+    Type: String
+    Default: none
+    AllowedValues: [none, require, verify-ca, verify-full]
+    Description: SSL mode for target database connection
+
+  # Migration Task Configuration
+  MigrationType:
+    Type: String
+    Default: full-load-and-cdc
+    AllowedValues: [full-load, cdc, full-load-and-cdc]
+    Description: Type of migration task to create
+
+  CdcStartPosition:
+    Type: String
+    Default: ""
+    Description: CDC start position (leave empty for current timestamp)
+
+  TableMappingRules:
+    Type: String
+    Default: |
+      {
+        "rules": [
+          {
+            "rule-type": "selection",
+            "rule-id": "1",
+            "rule-name": "1",
+            "object-locator": {
+              "schema-name": "%",
+              "table-name": "%"
+            },
+            "rule-action": "include",
+            "filters": []
+          }
+        ]
+      }
+    Description: JSON table mapping rules for migration
+
+  EnableValidation:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable data validation during migration
+
+  EnableCloudWatchLogs:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable CloudWatch logging for DMS tasks
+
+  # Monitoring and Alerting
+  SNSTopicArn:
+    Type: String
+    Default: ""
+    Description: SNS topic ARN for DMS notifications (optional)
+
+  CloudWatchLogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: CloudWatch log retention period in days
+
+  CreateCloudWatchAlarms:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Create CloudWatch alarms for monitoring
+
+  # Resource Naming and Tagging
+  ProjectName:
+    Type: String
+    Default: "dms-migration"
+    Description: Project name for resource naming and tagging
+    AllowedPattern: "^[a-zA-Z0-9-]+$"
+    ConstraintDescription: Must contain only alphanumeric characters and hyphens
+
+  Environment:
+    Type: String
+    Default: "dev"
+    AllowedValues: [dev, test, staging, prod]
+    Description: Environment designation
+
+  ResourcePrefix:
+    Type: String
+    Default: ""
+    Description: Optional prefix for resource names
+    AllowedPattern: "^[a-zA-Z0-9-]*$"
+    ConstraintDescription: Must contain only alphanumeric characters and hyphens
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  # Environment and naming conditions
+  HasResourcePrefix: !Not [!Equals [!Ref ResourcePrefix, ""]]
+  IsProductionEnvironment: !Equals [!Ref Environment, "prod"]
+  
+  # Network conditions
+  CreatePublicAccess: !Equals [!Ref CreatePublicSubnetGroup, 'true']
+  
+  # SSL conditions
+  SourceRequiresSsl: !Not [!Equals [!Ref SourceSslMode, "none"]]
+  TargetRequiresSsl: !Not [!Equals [!Ref TargetSslMode, "none"]]
+  
+  # Migration conditions
+  IsCdcMigration: !Or 
+    - !Equals [!Ref MigrationType, "cdc"]
+    - !Equals [!Ref MigrationType, "full-load-and-cdc"]
+  IsFullLoadMigration: !Or
+    - !Equals [!Ref MigrationType, "full-load"]
+    - !Equals [!Ref MigrationType, "full-load-and-cdc"]
+  
+  # Monitoring conditions
+  EnableValidationCondition: !Equals [!Ref EnableValidation, 'true']
+  EnableLogging: !Equals [!Ref EnableCloudWatchLogs, 'true']
+  CreateAlarms: !Equals [!Ref CreateCloudWatchAlarms, 'true']
+  HasSNSTopic: !Not [!Equals [!Ref SNSTopicArn, ""]]
+  
+  # High availability conditions
+  EnableMultiAZ: !Equals [!Ref MultiAZ, 'true']
+  
+  # Database engine conditions
+  SourceIsRds: !Or
+    - !Equals [!Ref SourceEngine, "mysql"]
+    - !Equals [!Ref SourceEngine, "postgres"]
+    - !Equals [!Ref SourceEngine, "oracle-ee"]
+    - !Equals [!Ref SourceEngine, "sqlserver"]
+  TargetIsRds: !Or
+    - !Equals [!Ref TargetEngine, "mysql"]
+    - !Equals [!Ref TargetEngine, "postgres"]
+    - !Equals [!Ref TargetEngine, "oracle-ee"]
+    - !Equals [!Ref TargetEngine, "sqlserver"]
+
+# =============================================================================
+# MAPPINGS
+# =============================================================================
+Mappings:
+  # Default ports for database engines
+  DatabasePorts:
+    mysql:
+      DefaultPort: 3306
+    postgres:
+      DefaultPort: 5432
+    oracle-ee:
+      DefaultPort: 1521
+    oracle-se2:
+      DefaultPort: 1521
+    oracle-se1:
+      DefaultPort: 1521
+    oracle-se:
+      DefaultPort: 1521
+    sqlserver:
+      DefaultPort: 1433
+    aurora:
+      DefaultPort: 3306
+    aurora-postgresql:
+      DefaultPort: 5432
+    mariadb:
+      DefaultPort: 3306
+    mongodb:
+      DefaultPort: 27017
+    redshift:
+      DefaultPort: 5439
+
+  # SSL configuration by engine
+  SslConfiguration:
+    mysql:
+      SslCertificate: "mysql-ca-cert.pem"
+    postgres:
+      SslCertificate: "postgres-ca-cert.pem"
+    oracle-ee:
+      SslCertificate: "oracle-ca-cert.pem"
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # ============================================================================
+  # S3 BUCKET FOR MIGRATION LOGS AND ARTIFACTS
+  # ============================================================================
+  MigrationLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 
+        - "${Prefix}${ProjectName}-migration-logs-${AWS::AccountId}-${AWS::Region}"
+        - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: ArchiveOldLogs
+            Status: Enabled
+            ExpirationInDays: !If [IsProductionEnvironment, 365, 90]
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref DMSCloudWatchLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub 
+            - "${Prefix}${ProjectName}-migration-logs"
+            - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: "DMS Migration Logs"
+
+  # S3 Bucket Policy for DMS access
+  MigrationLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MigrationLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DMSReplicationInstanceAccess
+            Effect: Allow
+            Principal:
+              Service: dms.amazonaws.com
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+            Resource: !Sub "${MigrationLogsBucket}/*"
+          - Sid: DMSReplicationInstanceListAccess
+            Effect: Allow
+            Principal:
+              Service: dms.amazonaws.com
+            Action: s3:ListBucket
+            Resource: !Ref MigrationLogsBucket
+
+  # ============================================================================
+  # IAM ROLES AND POLICIES
+  # ============================================================================
+  DMSVPCRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 
+        - "${Prefix}${ProjectName}-dms-vpc-role"
+        - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: dms.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonDMSVPCManagementRole
+      Tags:
+        - Key: Name
+          Value: !Sub 
+            - "${Prefix}${ProjectName}-dms-vpc-role"
+            - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DMSCloudWatchLogsRole:
+    Type: AWS::IAM::Role
+    Condition: EnableLogging
+    Properties:
+      RoleName: !Sub 
+        - "${Prefix}${ProjectName}-dms-cloudwatch-logs-role"
+        - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: dms.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonDMSCloudWatchLogsRole
+      Tags:
+        - Key: Name
+          Value: !Sub 
+            - "${Prefix}${ProjectName}-dms-cloudwatch-logs-role"
+            - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Enhanced IAM role for DMS with additional permissions
+  DMSEnhancedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 
+        - "${Prefix}${ProjectName}-dms-enhanced-role"
+        - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: dms.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DMSEnhancedPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "${MigrationLogsBucket}/*"
+                  - !Ref MigrationLogsBucket
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/dms/*"
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub 
+            - "${Prefix}${ProjectName}-dms-enhanced-role"
+            - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # SECURITY GROUPS
+  # ============================================================================
+  DMSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub 
+        - "${Prefix}${ProjectName}-dms-sg"
+        - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+      GroupDescription: Security group for DMS replication instance
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref SourcePort
+          ToPort: !Ref SourcePort
+          CidrIp: !Select [0, !Ref AllowedCidrBlocks]
+          Description: "Source database access"
+        - IpProtocol: tcp
+          FromPort: !Ref TargetPort
+          ToPort: !Ref TargetPort
+          CidrIp: !Select [0, !Ref AllowedCidrBlocks]
+          Description: "Target database access"
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: "All outbound traffic"
+      Tags:
+        - Key: Name
+          Value: !Sub 
+            - "${Prefix}${ProjectName}-dms-sg"
+            - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: "DMS Replication Instance Security"
+
+  # Additional ingress rules for other CIDR blocks
+  DMSSecurityGroupIngressRule2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: !Not [!Equals [!Select [1, !Ref AllowedCidrBlocks], ""]]
+    Properties:
+      GroupId: !Ref DMSSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref SourcePort
+      ToPort: !Ref SourcePort
+      CidrIp: !Select [1, !Ref AllowedCidrBlocks]
+      Description: "Additional source database access"
+
+  DMSSecurityGroupIngressRule3:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: !Not [!Equals [!Select [2, !Ref AllowedCidrBlocks], ""]]
+    Properties:
+      GroupId: !Ref DMSSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref SourcePort
+      ToPort: !Ref SourcePort
+      CidrIp: !Select [2, !Ref AllowedCidrBlocks]
+      Description: "Additional source database access"
+
+  # ============================================================================
+  # CLOUDWATCH LOG GROUP
+  # ============================================================================
+  DMSCloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: !Sub 
+        - "/aws/dms/${Prefix}${ProjectName}-tasks"
+        - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+      RetentionInDays: !Ref CloudWatchLogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub 
+            - "${Prefix}${ProjectName}-dms-logs"
+            - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: "DMS Task Logging"
+
+  # ============================================================================
+  # DMS SUBNET GROUP
+  # ============================================================================
+  DMSSubnetGroup:
+    Type: AWS::DMS::ReplicationSubnetGroup
+    Properties:
+      ReplicationSubnetGroupIdentifier: !Sub 
+        - "${Prefix}${ProjectName}-subnet-group"
+        - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+      ReplicationSubnetGroupDescription: !Sub "DMS subnet group for ${ProjectName} migration"
+      SubnetIds: !Ref SubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub 
+            - "${Prefix}${ProjectName}-subnet-group"
+            - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: "DMS Replication Subnet Group"
+
+  # ============================================================================
+  # DMS REPLICATION INSTANCE
+  # ============================================================================
+  DMSReplicationInstance:
+    Type: AWS::DMS::ReplicationInstance
+    Properties:
+      ReplicationInstanceIdentifier: !Sub 
+        - "${Prefix}${ProjectName}-replication-instance"
+        - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+      ReplicationInstanceClass: !Ref ReplicationInstanceClass
+      AllocatedStorage: !Ref AllocatedStorage
+      MultiAZ: !If [EnableMultiAZ, true, false]
+      EngineVersion: !Ref EngineVersion
+      AutoMinorVersionUpgrade: !If [IsProductionEnvironment, false, !Ref AutoMinorVersionUpgrade]
+      PreferredMaintenanceWindow: !If [IsProductionEnvironment, "sun:03:00-sun:04:00", "sun:03:00-sun:04:00"]
+      PubliclyAccessible: !If [CreatePublicAccess, true, false]
+      ReplicationSubnetGroupIdentifier: !Ref DMSSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DMSSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub 
+            - "${Prefix}${ProjectName}-replication-instance"
+            - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: "DMS Replication Instance"
+        - Key: MultiAZ
+          Value: !If [EnableMultiAZ, "true", "false"]
+
+  # ============================================================================
+  # DMS ENDPOINTS
+  # ============================================================================
+  DMSSourceEndpoint:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointIdentifier: !Sub 
+        - "${Prefix}${ProjectName}-source-endpoint"
+        - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+      EndpointType: source
+      EngineName: !Ref SourceEngine
+      ServerName: !Ref SourceServerName
+      Port: !Ref SourcePort
+      DatabaseName: !Ref SourceDatabaseName
+      Username: !Ref SourceUsername
+      Password: !Ref SourcePassword
+      ExtraConnectionAttributes: !If 
+        - SourceRequiresSsl
+        - !Sub "${SourceExtraConnectionAttributes};sslMode=${SourceSslMode}"
+        - !Ref SourceExtraConnectionAttributes
+      SslMode: !If [SourceRequiresSsl, !Ref SourceSslMode, "none"]
+      Tags:
+        - Key: Name
+          Value: !Sub 
+            - "${Prefix}${ProjectName}-source-endpoint"
+            - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: "DMS Source Endpoint"
+        - Key: Engine
+          Value: !Ref SourceEngine
+
+  DMSTargetEndpoint:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointIdentifier: !Sub 
+        - "${Prefix}${ProjectName}-target-endpoint"
+        - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+      EndpointType: target
+      EngineName: !Ref TargetEngine
+      ServerName: !Ref TargetServerName
+      Port: !Ref TargetPort
+      DatabaseName: !Ref TargetDatabaseName
+      Username: !Ref TargetUsername
+      Password: !Ref TargetPassword
+      ExtraConnectionAttributes: !If 
+        - TargetRequiresSsl
+        - !Sub "${TargetExtraConnectionAttributes};sslMode=${TargetSslMode}"
+        - !Ref TargetExtraConnectionAttributes
+      SslMode: !If [TargetRequiresSsl, !Ref TargetSslMode, "none"]
+      Tags:
+        - Key: Name
+          Value: !Sub 
+            - "${Prefix}${ProjectName}-target-endpoint"
+            - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: "DMS Target Endpoint"
+        - Key: Engine
+          Value: !Ref TargetEngine
+
+  # ============================================================================
+  # DMS REPLICATION TASK
+  # ============================================================================
+  DMSReplicationTask:
+    Type: AWS::DMS::ReplicationTask
+    Properties:
+      ReplicationTaskIdentifier: !Sub 
+        - "${Prefix}${ProjectName}-migration-task"
+        - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+      MigrationType: !Ref MigrationType
+      ReplicationInstanceArn: !Ref DMSReplicationInstance
+      SourceEndpointArn: !Ref DMSSourceEndpoint
+      TargetEndpointArn: !Ref DMSTargetEndpoint
+      TableMappings: !Ref TableMappingRules
+      CdcStartPosition: !If [IsCdcMigration, !Ref CdcStartPosition, !Ref "AWS::NoValue"]
+      ReplicationTaskSettings: !Sub |
+        {
+          "TargetMetadata": {
+            "TargetSchema": "",
+            "SupportLobs": true,
+            "FullLobMode": false,
+            "LobChunkSize": 0,
+            "LimitedSizeLobMode": true,
+            "LobMaxSize": 32,
+            "InlineLobMaxSize": 0,
+            "LoadMaxFileSize": 0,
+            "ParallelLoadThreads": 0,
+            "ParallelLoadBufferSize": 0,
+            "BatchApplyEnabled": ${IsProductionEnvironment},
+            "TaskRecoveryTableEnabled": false,
+            "ParallelApplyThreads": 0,
+            "ParallelApplyBufferSize": 0,
+            "ParallelApplyQueuesPerThread": 0
+          },
+          "FullLoadSettings": {
+            "TargetTablePrepMode": "DROP_AND_CREATE",
+            "CreatePkAfterFullLoad": false,
+            "StopTaskCachedChangesApplied": false,
+            "StopTaskCachedChangesNotApplied": false,
+            "MaxFullLoadSubTasks": 8,
+            "TransactionConsistencyTimeout": 600,
+            "CommitRate": 10000
+          },
+          "Logging": {
+            "EnableLogging": ${EnableCloudWatchLogs},
+            "LogComponents": [
+              {
+                "Id": "SOURCE_UNLOAD",
+                "Severity": "${IsProductionEnvironment ? 'LOGGER_SEVERITY_INFO' : 'LOGGER_SEVERITY_DEFAULT'}"
+              },
+              {
+                "Id": "TARGET_LOAD",
+                "Severity": "${IsProductionEnvironment ? 'LOGGER_SEVERITY_INFO' : 'LOGGER_SEVERITY_DEFAULT'}"
+              },
+              {
+                "Id": "SOURCE_CAPTURE",
+                "Severity": "${IsProductionEnvironment ? 'LOGGER_SEVERITY_INFO' : 'LOGGER_SEVERITY_DEFAULT'}"
+              },
+              {
+                "Id": "TARGET_APPLY",
+                "Severity": "${IsProductionEnvironment ? 'LOGGER_SEVERITY_INFO' : 'LOGGER_SEVERITY_DEFAULT'}"
+              }
+            ],
+            "CloudWatchLogGroup": "${EnableLogging ? DMSCloudWatchLogGroup : ''}",
+            "CloudWatchLogStream": "${Prefix}${ProjectName}-migration-task"
+          },
+          "ControlTablesSettings": {
+            "historyTimeslotInMinutes": 5,
+            "ControlSchema": "",
+            "HistoryTimeslotInMinutes": 5,
+            "HistoryTableEnabled": false,
+            "SuspendedTablesTableEnabled": false,
+            "StatusTableEnabled": false,
+            "FullLoadExceptionTableEnabled": false
+          },
+          "StreamBufferSettings": {
+            "StreamBufferCount": 3,
+            "StreamBufferSizeInMB": 8,
+            "CtrlStreamBufferSizeInMB": 5
+          },
+          "ChangeProcessingDdlHandlingPolicy": {
+            "HandleSourceTableDropped": true,
+            "HandleSourceTableTruncated": true,
+            "HandleSourceTableAltered": true
+          },
+          "ErrorBehavior": {
+            "DataErrorPolicy": "LOG_ERROR",
+            "DataTruncationErrorPolicy": "LOG_ERROR",
+            "DataErrorEscalationPolicy": "SUSPEND_TABLE",
+            "DataErrorEscalationCount": 0,
+            "TableErrorPolicy": "SUSPEND_TABLE",
+            "TableErrorEscalationPolicy": "STOP_TASK",
+            "TableErrorEscalationCount": 0,
+            "RecoverableErrorCount": -1,
+            "RecoverableErrorInterval": 5,
+            "RecoverableErrorThrottling": true,
+            "RecoverableErrorThrottlingMax": 1800,
+            "RecoverableErrorStopRetryAfterThrottlingMax": true,
+            "ApplyErrorDeletePolicy": "IGNORE_RECORD",
+            "ApplyErrorInsertPolicy": "LOG_ERROR",
+            "ApplyErrorUpdatePolicy": "LOG_ERROR",
+            "ApplyErrorEscalationPolicy": "LOG_ERROR",
+            "ApplyErrorEscalationCount": 0,
+            "ApplyErrorFailOnTruncationDdl": false,
+            "FullLoadIgnoreConflicts": true,
+            "FailOnTransactionConsistencyBreached": false,
+            "FailOnNoTablesCaptured": true
+          },
+          "ChangeProcessingTuning": {
+            "BatchApplyPreserveTransaction": true,
+            "BatchApplyTimeoutMin": 1,
+            "BatchApplyTimeoutMax": 30,
+            "BatchApplyMemoryLimit": 500,
+            "BatchSplitSize": 0,
+            "MinTransactionSize": 1000,
+            "CommitTimeout": 1,
+            "MemoryLimitTotal": 1024,
+            "MemoryKeepTime": 60,
+            "StatementCacheSize": 50
+          },
+          "ValidationSettings": {
+            "EnableValidation": ${EnableValidation},
+            "ValidationMode": "ROW_LEVEL",
+            "ThreadCount": 5,
+            "PartitionSize": 10000,
+            "FailureMaxCount": 10000,
+            "RecordFailureDelayLimitInMinutes": 0,
+            "RecordSuspendDelayInMinutes": 30,
+            "MaxKeyColumnSize": 8096,
+            "TableFailureMaxCount": 1000,
+            "ValidationOnly": false,
+            "HandleCollationDiff": false,
+            "RecordFailureDelayInMinutes": 5,
+            "SkipLobColumns": false,
+            "ValidationPartialLobSize": 0,
+            "ValidationQueryCdcDelaySeconds": 0
+          }
+        }
+      Tags:
+        - Key: Name
+          Value: !Sub 
+            - "${Prefix}${ProjectName}-migration-task"
+            - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: "DMS Migration Task"
+        - Key: MigrationType
+          Value: !Ref MigrationType
+
+  # ============================================================================
+  # CLOUDWATCH ALARMS
+  # ============================================================================
+  DMSReplicationInstanceCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlarms
+    Properties:
+      AlarmName: !Sub 
+        - "${Prefix}${ProjectName}-DMS-HighCPU"
+        - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+      AlarmDescription: "High CPU utilization on DMS replication instance"
+      MetricName: CPUUtilization
+      Namespace: AWS/DMS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !If [IsProductionEnvironment, 70, 80]
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ReplicationInstanceIdentifier
+          Value: !Ref DMSReplicationInstance
+      AlarmActions: !If 
+        - HasSNSTopic
+        - [!Ref SNSTopicArn]
+        - []
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub 
+            - "${Prefix}${ProjectName}-DMS-HighCPU"
+            - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DMSReplicationInstanceMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlarms
+    Properties:
+      AlarmName: !Sub 
+        - "${Prefix}${ProjectName}-DMS-HighMemory"
+        - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+      AlarmDescription: "High memory utilization on DMS replication instance"
+      MetricName: FreeableMemory
+      Namespace: AWS/DMS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 268435456  # 256MB in bytes
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: ReplicationInstanceIdentifier
+          Value: !Ref DMSReplicationInstance
+      AlarmActions: !If 
+        - HasSNSTopic
+        - [!Ref SNSTopicArn]
+        - []
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub 
+            - "${Prefix}${ProjectName}-DMS-HighMemory"
+            - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DMSReplicationTaskStateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlarms
+    Properties:
+      AlarmName: !Sub 
+        - "${Prefix}${ProjectName}-DMS-TaskFailure"
+        - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+      AlarmDescription: "DMS replication task failure detected"
+      MetricName: ReplicationTasksState
+      Namespace: AWS/DMS
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: ReplicationTaskIdentifier
+          Value: !Ref DMSReplicationTask
+      AlarmActions: !If 
+        - HasSNSTopic
+        - [!Ref SNSTopicArn]
+        - []
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub 
+            - "${Prefix}${ProjectName}-DMS-TaskFailure"
+            - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DMSReplicationLagAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: !And [CreateAlarms, IsCdcMigration]
+    Properties:
+      AlarmName: !Sub 
+        - "${Prefix}${ProjectName}-DMS-HighLag"
+        - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+      AlarmDescription: "High replication lag detected"
+      MetricName: CDCLatencyTarget
+      Namespace: AWS/DMS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !If [IsProductionEnvironment, 300, 600]  # 5 or 10 minutes
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ReplicationTaskIdentifier
+          Value: !Ref DMSReplicationTask
+      AlarmActions: !If 
+        - HasSNSTopic
+        - [!Ref SNSTopicArn]
+        - []
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub 
+            - "${Prefix}${ProjectName}-DMS-HighLag"
+            - Prefix: !If [HasResourcePrefix, !Sub "${ResourcePrefix}-", ""]
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  # DMS Infrastructure Outputs
+  DMSReplicationInstanceIdentifier:
+    Description: DMS replication instance identifier
+    Value: !Ref DMSReplicationInstance
+    Export:
+      Name: !Sub "${AWS::StackName}-ReplicationInstance"
+
+  DMSReplicationInstanceArn:
+    Description: DMS replication instance ARN
+    Value: !Ref DMSReplicationInstance
+    Export:
+      Name: !Sub "${AWS::StackName}-ReplicationInstanceArn"
+
+  DMSReplicationInstanceEndpoint:
+    Description: DMS replication instance endpoint
+    Value: !GetAtt DMSReplicationInstance.ReplicationInstancePublicIpAddress
+    Export:
+      Name: !Sub "${AWS::StackName}-ReplicationInstanceEndpoint"
+
+  # Endpoint Outputs
+  DMSSourceEndpointIdentifier:
+    Description: DMS source endpoint identifier
+    Value: !Ref DMSSourceEndpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-SourceEndpoint"
+
+  DMSSourceEndpointArn:
+    Description: DMS source endpoint ARN
+    Value: !Ref DMSSourceEndpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-SourceEndpointArn"
+
+  DMSTargetEndpointIdentifier:
+    Description: DMS target endpoint identifier
+    Value: !Ref DMSTargetEndpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-TargetEndpoint"
+
+  DMSTargetEndpointArn:
+    Description: DMS target endpoint ARN
+    Value: !Ref DMSTargetEndpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-TargetEndpointArn"
+
+  # Migration Task Outputs
+  DMSReplicationTaskIdentifier:
+    Description: DMS replication task identifier
+    Value: !Ref DMSReplicationTask
+    Export:
+      Name: !Sub "${AWS::StackName}-ReplicationTask"
+
+  DMSReplicationTaskArn:
+    Description: DMS replication task ARN
+    Value: !Ref DMSReplicationTask
+    Export:
+      Name: !Sub "${AWS::StackName}-ReplicationTaskArn"
+
+  # Storage and Logging Outputs
+  MigrationLogsBucketName:
+    Description: S3 bucket for migration logs and artifacts
+    Value: !Ref MigrationLogsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-LogsBucket"
+
+  MigrationLogsBucketArn:
+    Description: S3 bucket ARN for migration logs
+    Value: !GetAtt MigrationLogsBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LogsBucketArn"
+
+  DMSCloudWatchLogGroupName:
+    Condition: EnableLogging
+    Description: CloudWatch log group for DMS tasks
+    Value: !Ref DMSCloudWatchLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-LogGroup"
+
+  DMSCloudWatchLogGroupArn:
+    Condition: EnableLogging
+    Description: CloudWatch log group ARN for DMS tasks
+    Value: !GetAtt DMSCloudWatchLogGroup.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LogGroupArn"
+
+  # Security Outputs
+  DMSSecurityGroupId:
+    Description: Security group ID for DMS replication instance
+    Value: !Ref DMSSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-SecurityGroup"
+
+  DMSSubnetGroupIdentifier:
+    Description: DMS subnet group identifier
+    Value: !Ref DMSSubnetGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-SubnetGroup"
+
+  # Configuration Outputs
+  MigrationType:
+    Description: Type of migration configured
+    Value: !Ref MigrationType
+    Export:
+      Name: !Sub "${AWS::StackName}-MigrationType"
+
+  SourceDatabaseEngine:
+    Description: Source database engine type
+    Value: !Ref SourceEngine
+    Export:
+      Name: !Sub "${AWS::StackName}-SourceEngine"
+
+  TargetDatabaseEngine:
+    Description: Target database engine type
+    Value: !Ref TargetEngine
+    Export:
+      Name: !Sub "${AWS::StackName}-TargetEngine"
+
+  # Monitoring Outputs
+  DMSMonitoringEnabled:
+    Description: Whether CloudWatch monitoring is enabled
+    Value: !If [CreateAlarms, "true", "false"]
+    Export:
+      Name: !Sub "${AWS::StackName}-MonitoringEnabled"
+
+  DMSValidationEnabled:
+    Description: Whether data validation is enabled
+    Value: !Ref EnableValidation
+    Export:
+      Name: !Sub "${AWS::StackName}-ValidationEnabled"
+
+  # Cost Optimization Outputs
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for DMS infrastructure (USD)
+    Value: !Sub 
+      - "Replication Instance: $${InstanceCost}/month, Storage: $${StorageCost}/month, Data Transfer: Variable"
+      - InstanceCost: !If
+          - IsProductionEnvironment
+          - !If [!Equals [!Ref ReplicationInstanceClass, "dms.t3.micro"], "15", 
+                !If [!Equals [!Ref ReplicationInstanceClass, "dms.t3.small"], "30",
+                    !If [!Equals [!Ref ReplicationInstanceClass, "dms.t3.medium"], "60", "120+"]]]
+          - "30"
+        StorageCost: !Sub "${AllocatedStorage} * 0.115"
+    Export:
+      Name: !Sub "${AWS::StackName}-EstimatedCost"
+
+  # Quick Start Commands
+  StartMigrationCommand:
+    Description: AWS CLI command to start the migration task
+    Value: !Sub 
+      - "aws dms start-replication-task --replication-task-arn ${TaskArn} --start-replication-task-type start-replication"
+      - TaskArn: !Ref DMSReplicationTask
+    Export:
+      Name: !Sub "${AWS::StackName}-StartCommand"
+
+  StopMigrationCommand:
+    Description: AWS CLI command to stop the migration task
+    Value: !Sub 
+      - "aws dms stop-replication-task --replication-task-arn ${TaskArn}"
+      - TaskArn: !Ref DMSReplicationTask
+    Export:
+      Name: !Sub "${AWS::StackName}-StopCommand"
+
+  MonitorMigrationCommand:
+    Description: AWS CLI command to monitor migration progress
+    Value: !Sub 
+      - "aws dms describe-replication-tasks --replication-task-identifier ${TaskId}"
+      - TaskId: !Ref DMSReplicationTask
+    Export:
+      Name: !Sub "${AWS::StackName}-MonitorCommand"

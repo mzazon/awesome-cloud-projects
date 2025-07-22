@@ -1,0 +1,725 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Streaming Data Enrichment Pipeline with Amazon Kinesis Data Streams and AWS Lambda'
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Stream Configuration"
+        Parameters:
+          - StreamName
+          - ShardCount
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - FunctionName
+          - LambdaRuntime
+          - LambdaTimeout
+          - LambdaMemory
+          - BatchSize
+          - MaxBatchingWindow
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - BucketName
+          - TableName
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableEnhancedMonitoring
+          - CreateCloudWatchAlarms
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  # Stream Configuration
+  StreamName:
+    Type: String
+    Default: data-enrichment-stream
+    Description: Name for the Kinesis Data Stream
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: '[a-zA-Z0-9_.-]+'
+    ConstraintDescription: Stream name must contain only alphanumeric characters, hyphens, underscores, and periods
+
+  ShardCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 100
+    Description: Number of shards for the Kinesis stream (1000 records/sec per shard)
+
+  # Lambda Configuration
+  FunctionName:
+    Type: String
+    Default: data-enrichment-function
+    Description: Name for the Lambda function
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '[a-zA-Z0-9_-]+'
+    ConstraintDescription: Function name must contain only alphanumeric characters, hyphens, and underscores
+
+  LambdaRuntime:
+    Type: String
+    Default: python3.9
+    AllowedValues:
+      - python3.8
+      - python3.9
+      - python3.10
+      - python3.11
+    Description: Python runtime version for Lambda function
+
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 3
+    MaxValue: 900
+    Description: Lambda function timeout in seconds
+
+  LambdaMemory:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 10240
+    Description: Lambda function memory allocation in MB
+
+  BatchSize:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 10000
+    Description: Maximum number of records to process in a single Lambda invocation
+
+  MaxBatchingWindow:
+    Type: Number
+    Default: 5
+    MinValue: 0
+    MaxValue: 300
+    Description: Maximum time to wait (in seconds) before invoking Lambda
+
+  # Storage Configuration
+  BucketName:
+    Type: String
+    Default: ''
+    Description: S3 bucket name for enriched data (leave empty for auto-generated name)
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: Bucket name must follow S3 naming conventions (lowercase, no underscores)
+
+  TableName:
+    Type: String
+    Default: enrichment-lookup-table
+    Description: DynamoDB table name for lookup data
+    MinLength: 3
+    MaxLength: 255
+    AllowedPattern: '[a-zA-Z0-9_.-]+'
+    ConstraintDescription: Table name must contain only alphanumeric characters, hyphens, underscores, and periods
+
+  # Monitoring Configuration
+  EnableEnhancedMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable enhanced monitoring for Kinesis stream
+
+  CreateCloudWatchAlarms:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Create CloudWatch alarms for monitoring
+
+  # General Configuration
+  Environment:
+    Type: String
+    Default: development
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: Environment tag for resources
+
+  ProjectName:
+    Type: String
+    Default: data-enrichment-pipeline
+    Description: Project name for resource tagging
+    MinLength: 1
+    MaxLength: 64
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  CreateBucketName: !Equals [!Ref BucketName, '']
+  EnableEnhancedMonitoringCondition: !Equals [!Ref EnableEnhancedMonitoring, 'true']
+  CreateAlarmsCondition: !Equals [!Ref CreateCloudWatchAlarms, 'true']
+  IsProduction: !Equals [!Ref Environment, 'production']
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # -------------------------------------------------------------------------
+  # DynamoDB Table for Lookup Data
+  # -------------------------------------------------------------------------
+  LookupTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      DeletionProtectionEnabled: !If [IsProduction, true, false]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lookup-table'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: DataEnrichment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # -------------------------------------------------------------------------
+  # S3 Bucket for Enriched Data Storage
+  # -------------------------------------------------------------------------
+  EnrichedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - CreateBucketName
+        - !Sub '${ProjectName}-enriched-data-${AWS::AccountId}-${AWS::Region}'
+        - !Ref BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 365
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3LogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-enriched-data-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: DataStorage
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # -------------------------------------------------------------------------
+  # CloudWatch Log Group for S3 Events
+  # -------------------------------------------------------------------------
+  S3LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-enriched-data'
+      RetentionInDays: !If [IsProduction, 90, 30]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-s3-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # -------------------------------------------------------------------------
+  # IAM Role for Lambda Execution
+  # -------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DataEnrichmentPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Kinesis permissions
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:ListShards
+                  - kinesis:SubscribeToShard
+                Resource: !GetAtt KinesisStream.Arn
+              # DynamoDB permissions
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt LookupTable.Arn
+              # S3 permissions
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub '${EnrichedDataBucket}/*'
+              # CloudWatch Logs permissions (enhanced)
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # -------------------------------------------------------------------------
+  # Lambda Function for Data Enrichment
+  # -------------------------------------------------------------------------
+  DataEnrichmentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemory
+      ReservedConcurrencyLimit: !If [IsProduction, 100, 10]
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref LookupTable
+          BUCKET_NAME: !Ref EnrichedDataBucket
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: !If [IsProduction, 'INFO', 'DEBUG']
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import base64
+          import datetime
+          import os
+          import logging
+          from typing import Dict, Any, List
+          
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger = logging.getLogger()
+          logger.setLevel(getattr(logging, log_level))
+          
+          # Initialize AWS clients
+          dynamodb = boto3.resource('dynamodb')
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              Lambda function to enrich streaming data from Kinesis.
+              
+              Args:
+                  event: Kinesis event containing records
+                  context: Lambda runtime context
+                  
+              Returns:
+                  Processing result summary
+              """
+              # Get environment variables
+              table_name = os.environ['TABLE_NAME']
+              bucket_name = os.environ['BUCKET_NAME']
+              
+              table = dynamodb.Table(table_name)
+              
+              processed_records = 0
+              failed_records = 0
+              
+              logger.info(f"Processing {len(event['Records'])} records")
+              
+              for record in event['Records']:
+                  try:
+                      # Decode Kinesis data
+                      payload = base64.b64decode(record['kinesis']['data'])
+                      data = json.loads(payload)
+                      
+                      logger.debug(f"Processing record: {data}")
+                      
+                      # Enrich data with user profile
+                      user_id = data.get('user_id')
+                      if user_id:
+                          try:
+                              response = table.get_item(Key={'user_id': user_id})
+                              if 'Item' in response:
+                                  # Add user profile data to event
+                                  user_profile = response['Item']
+                                  data['user_name'] = user_profile.get('name', 'Unknown')
+                                  data['user_email'] = user_profile.get('email', 'Unknown')
+                                  data['user_segment'] = user_profile.get('segment', 'Unknown')
+                                  data['user_location'] = user_profile.get('location', 'Unknown')
+                                  logger.debug(f"Enriched data for user {user_id}")
+                              else:
+                                  data['user_name'] = 'Unknown'
+                                  data['user_segment'] = 'Unknown'
+                                  data['user_location'] = 'Unknown'
+                                  logger.warning(f"No profile found for user {user_id}")
+                          except Exception as e:
+                              logger.error(f"Error enriching user data for {user_id}: {e}")
+                              data['enrichment_error'] = str(e)
+                      
+                      # Add processing metadata
+                      data['processing_timestamp'] = datetime.datetime.utcnow().isoformat()
+                      data['enriched'] = True
+                      data['processor_version'] = '1.0'
+                      data['lambda_request_id'] = context.aws_request_id
+                      
+                      # Store enriched data in S3 with time-based partitioning
+                      timestamp = datetime.datetime.utcnow()
+                      partition_path = timestamp.strftime('%Y/%m/%d/%H')
+                      key = f"enriched-data/{partition_path}/{record['kinesis']['sequenceNumber']}.json"
+                      
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key=key,
+                          Body=json.dumps(data, default=str),
+                          ContentType='application/json',
+                          Metadata={
+                              'source': 'kinesis-lambda-enrichment',
+                              'processing_time': timestamp.isoformat(),
+                              'sequence_number': record['kinesis']['sequenceNumber']
+                          }
+                      )
+                      
+                      processed_records += 1
+                      logger.debug(f"Successfully processed record: {record['kinesis']['sequenceNumber']}")
+                      
+                  except Exception as e:
+                      failed_records += 1
+                      logger.error(f"Error processing record {record.get('kinesis', {}).get('sequenceNumber', 'unknown')}: {e}")
+                      # Continue processing other records
+                      continue
+              
+              result = {
+                  'statusCode': 200,
+                  'processedRecords': processed_records,
+                  'failedRecords': failed_records,
+                  'totalRecords': len(event['Records'])
+              }
+              
+              logger.info(f"Processing complete: {result}")
+              return result
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-enrichment-function'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: DataEnrichment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # -------------------------------------------------------------------------
+  # Kinesis Data Stream
+  # -------------------------------------------------------------------------
+  KinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Ref StreamName
+      ShardCount: !Ref ShardCount
+      RetentionPeriodHours: !If [IsProduction, 168, 24]  # 7 days for prod, 1 day for dev
+      ShardLevelMetrics: !If
+        - EnableEnhancedMonitoringCondition
+        - - IncomingRecords
+          - OutgoingRecords
+          - IncomingBytes
+          - OutgoingBytes
+          - WriteProvisionedThroughputExceeded
+          - ReadProvisionedThroughputExceeded
+          - IteratorAgeMilliseconds
+        - !Ref 'AWS::NoValue'
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-data-stream'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: DataIngestion
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # -------------------------------------------------------------------------
+  # Event Source Mapping (Kinesis to Lambda)
+  # -------------------------------------------------------------------------
+  KinesisEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt KinesisStream.Arn
+      FunctionName: !GetAtt DataEnrichmentFunction.Arn
+      StartingPosition: LATEST
+      BatchSize: !Ref BatchSize
+      MaximumBatchingWindowInSeconds: !Ref MaxBatchingWindow
+      ParallelizationFactor: !If [IsProduction, 10, 2]
+      MaximumRecordAgeInSeconds: 3600  # 1 hour
+      BisectBatchOnFunctionError: true
+      MaximumRetryAttempts: 3
+      TumblingWindowInSeconds: 60  # For aggregate processing
+
+  # -------------------------------------------------------------------------
+  # CloudWatch Log Group for Lambda
+  # -------------------------------------------------------------------------
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${FunctionName}'
+      RetentionInDays: !If [IsProduction, 90, 30]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # -------------------------------------------------------------------------
+  # CloudWatch Alarms (Conditional)
+  # -------------------------------------------------------------------------
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlarmsCondition
+    Properties:
+      AlarmName: !Sub '${FunctionName}-Errors'
+      AlarmDescription: 'Lambda function errors detected'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DataEnrichmentFunction
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-error-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlarmsCondition
+    Properties:
+      AlarmName: !Sub '${FunctionName}-Duration'
+      AlarmDescription: 'Lambda function duration exceeds threshold'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref LambdaTimeout
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DataEnrichmentFunction
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-duration-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  KinesisIncomingRecordsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlarmsCondition
+    Properties:
+      AlarmName: !Sub '${StreamName}-IncomingRecords'
+      AlarmDescription: 'No incoming records to Kinesis stream'
+      MetricName: IncomingRecords
+      Namespace: AWS/Kinesis
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: StreamName
+          Value: !Ref KinesisStream
+      TreatMissingData: breaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-kinesis-records-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  IteratorAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlarmsCondition
+    Properties:
+      AlarmName: !Sub '${StreamName}-IteratorAge'
+      AlarmDescription: 'Kinesis stream iterator age is too high'
+      MetricName: IteratorAgeMilliseconds
+      Namespace: AWS/Kinesis
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 60000  # 1 minute in milliseconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: StreamName
+          Value: !Ref KinesisStream
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-iterator-age-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  # Stream Information
+  KinesisStreamName:
+    Description: 'Name of the Kinesis Data Stream'
+    Value: !Ref KinesisStream
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisStreamName'
+
+  KinesisStreamArn:
+    Description: 'ARN of the Kinesis Data Stream'
+    Value: !GetAtt KinesisStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisStreamArn'
+
+  # Lambda Information
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function'
+    Value: !Ref DataEnrichmentFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function'
+    Value: !GetAtt DataEnrichmentFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  # Storage Information
+  S3BucketName:
+    Description: 'Name of the S3 bucket for enriched data'
+    Value: !Ref EnrichedDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketName'
+
+  S3BucketArn:
+    Description: 'ARN of the S3 bucket for enriched data'
+    Value: !GetAtt EnrichedDataBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketArn'
+
+  DynamoDBTableName:
+    Description: 'Name of the DynamoDB lookup table'
+    Value: !Ref LookupTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableName'
+
+  DynamoDBTableArn:
+    Description: 'ARN of the DynamoDB lookup table'
+    Value: !GetAtt LookupTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableArn'
+
+  # Configuration Information
+  EventSourceMappingId:
+    Description: 'ID of the Kinesis-Lambda event source mapping'
+    Value: !Ref KinesisEventSourceMapping
+    Export:
+      Name: !Sub '${AWS::StackName}-EventSourceMappingId'
+
+  # Monitoring Information
+  LambdaLogGroupName:
+    Description: 'CloudWatch Log Group for Lambda function'
+    Value: !Ref LambdaLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaLogGroupName'
+
+  # Sample Commands
+  TestDataCommand:
+    Description: 'AWS CLI command to send test data to the stream'
+    Value: !Sub |
+      aws kinesis put-record \
+        --stream-name ${KinesisStream} \
+        --partition-key "test-user" \
+        --data '{"event_type":"page_view","user_id":"user123","page":"/test","timestamp":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}'
+
+  MonitoringCommand:
+    Description: 'AWS CLI command to monitor stream metrics'
+    Value: !Sub |
+      aws cloudwatch get-metric-statistics \
+        --namespace AWS/Kinesis \
+        --metric-name IncomingRecords \
+        --dimensions Name=StreamName,Value=${KinesisStream} \
+        --start-time $(date -d '1 hour ago' -u +%Y-%m-%dT%H:%M:%SZ) \
+        --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
+        --period 300 \
+        --statistics Sum

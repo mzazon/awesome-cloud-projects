@@ -1,0 +1,549 @@
+# Infrastructure Manager Configuration for Smart City Data Processing
+# This configuration deploys a complete smart city IoT data processing pipeline
+# using Cloud Dataprep, BigQuery DataCanvas, Pub/Sub, and Cloud Storage
+
+metadata:
+  name: smart-city-data-processing
+  description: "Smart City IoT data processing pipeline with Cloud Dataprep and BigQuery DataCanvas"
+  version: "1.0"
+
+# Input variables for customizing the deployment
+inputs:
+  - name: project_id
+    description: "Google Cloud Project ID"
+    type: string
+    required: true
+
+  - name: region
+    description: "Google Cloud region for resources"
+    type: string
+    default: "us-central1"
+    
+  - name: zone
+    description: "Google Cloud zone for zonal resources"
+    type: string
+    default: "us-central1-a"
+
+  - name: random_suffix
+    description: "Random suffix for unique resource names"
+    type: string
+    default: "$(randstr 6)"
+
+  - name: environment
+    description: "Environment name (dev, staging, prod)"
+    type: string
+    default: "dev"
+
+# Template imports for resource definitions
+imports:
+  - path: templates/storage.jinja
+  - path: templates/pubsub.jinja
+  - path: templates/bigquery.jinja
+  - path: templates/iam.jinja
+  - path: templates/monitoring.jinja
+
+# Resource definitions
+resources:
+  # Cloud Storage Data Lake Infrastructure
+  - name: smart-city-data-lake
+    type: templates/storage.jinja
+    properties:
+      project_id: $(ref.project_id)
+      bucket_name: smart-city-data-lake-$(ref.random_suffix)
+      region: $(ref.region)
+      storage_class: STANDARD
+      versioning_enabled: true
+      lifecycle_rules:
+        - action:
+            type: SetStorageClass
+            storage_class: NEARLINE
+          condition:
+            age: 30
+        - action:
+            type: SetStorageClass
+            storage_class: COLDLINE
+          condition:
+            age: 90
+        - action:
+            type: Delete
+          condition:
+            age: 2555  # 7 years retention
+      labels:
+        environment: $(ref.environment)
+        purpose: smart-city-analytics
+        component: data-lake
+
+  # Pub/Sub Topics and Subscriptions for IoT Data Ingestion
+  - name: traffic-sensor-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      topic: traffic-sensor-data
+      name: projects/$(ref.project_id)/topics/traffic-sensor-data
+      messageRetentionDuration: 604800s  # 7 days
+      labels:
+        environment: $(ref.environment)
+        sensor-type: traffic
+        component: data-ingestion
+
+  - name: air-quality-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      topic: air-quality-data
+      name: projects/$(ref.project_id)/topics/air-quality-data
+      messageRetentionDuration: 604800s  # 7 days
+      labels:
+        environment: $(ref.environment)
+        sensor-type: air-quality
+        component: data-ingestion
+
+  - name: energy-consumption-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      topic: energy-consumption-data
+      name: projects/$(ref.project_id)/topics/energy-consumption-data
+      messageRetentionDuration: 604800s  # 7 days
+      labels:
+        environment: $(ref.environment)
+        sensor-type: energy
+        component: data-ingestion
+
+  # Pub/Sub Subscriptions for data processing
+  - name: traffic-processing-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      subscription: traffic-processing-sub
+      name: projects/$(ref.project_id)/subscriptions/traffic-processing-sub
+      topic: $(ref.traffic-sensor-topic.name)
+      ackDeadlineSeconds: 600
+      messageRetentionDuration: 604800s
+      labels:
+        environment: $(ref.environment)
+        sensor-type: traffic
+        component: data-processing
+    metadata:
+      dependsOn:
+        - traffic-sensor-topic
+
+  - name: air-quality-processing-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      subscription: air-quality-processing-sub
+      name: projects/$(ref.project_id)/subscriptions/air-quality-processing-sub
+      topic: $(ref.air-quality-topic.name)
+      ackDeadlineSeconds: 600
+      messageRetentionDuration: 604800s
+      labels:
+        environment: $(ref.environment)
+        sensor-type: air-quality
+        component: data-processing
+    metadata:
+      dependsOn:
+        - air-quality-topic
+
+  - name: energy-processing-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      subscription: energy-processing-sub
+      name: projects/$(ref.project_id)/subscriptions/energy-processing-sub
+      topic: $(ref.energy-consumption-topic.name)
+      ackDeadlineSeconds: 600
+      messageRetentionDuration: 604800s
+      labels:
+        environment: $(ref.environment)
+        sensor-type: energy
+        component: data-processing
+    metadata:
+      dependsOn:
+        - energy-consumption-topic
+
+  # BigQuery Dataset and Tables for Analytics Warehouse
+  - name: smart-city-analytics-dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      datasetId: smart_city_analytics
+      projectId: $(ref.project_id)
+      location: $(ref.region)
+      description: "Smart City Analytics Data Warehouse"
+      labels:
+        environment: $(ref.environment)
+        component: analytics
+        purpose: smart-city-data
+      access:
+        - role: OWNER
+          userByEmail: $(ref.project_id)@$(ref.project_id).iam.gserviceaccount.com
+        - role: READER
+          specialGroup: projectReaders
+        - role: WRITER
+          specialGroup: projectWriters
+
+  # Traffic Sensors Table
+  - name: traffic-sensors-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      tableId: traffic_sensors
+      projectId: $(ref.project_id)
+      datasetId: $(ref.smart-city-analytics-dataset.datasetId)
+      description: "Traffic sensor data from smart city infrastructure"
+      schema:
+        fields:
+          - name: sensor_id
+            type: STRING
+            mode: REQUIRED
+            description: "Unique identifier for traffic sensor"
+          - name: timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "UTC timestamp of sensor reading"
+          - name: location
+            type: GEOGRAPHY
+            mode: NULLABLE
+            description: "Geographic location of sensor"
+          - name: vehicle_count
+            type: INTEGER
+            mode: NULLABLE
+            description: "Number of vehicles detected"
+          - name: avg_speed
+            type: FLOAT
+            mode: NULLABLE
+            description: "Average vehicle speed in km/h"
+          - name: congestion_level
+            type: STRING
+            mode: NULLABLE
+            description: "Traffic congestion level (light, moderate, heavy)"
+          - name: weather_conditions
+            type: STRING
+            mode: NULLABLE
+            description: "Weather conditions during measurement"
+      timePartitioning:
+        type: DAY
+        field: timestamp
+      clustering:
+        fields:
+          - sensor_id
+          - congestion_level
+      labels:
+        environment: $(ref.environment)
+        sensor-type: traffic
+        table-type: raw-data
+    metadata:
+      dependsOn:
+        - smart-city-analytics-dataset
+
+  # Air Quality Sensors Table
+  - name: air-quality-sensors-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      tableId: air_quality_sensors
+      projectId: $(ref.project_id)
+      datasetId: $(ref.smart-city-analytics-dataset.datasetId)
+      description: "Air quality sensor data from environmental monitoring network"
+      schema:
+        fields:
+          - name: sensor_id
+            type: STRING
+            mode: REQUIRED
+            description: "Unique identifier for air quality sensor"
+          - name: timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "UTC timestamp of sensor reading"
+          - name: location
+            type: GEOGRAPHY
+            mode: NULLABLE
+            description: "Geographic location of sensor"
+          - name: pm25
+            type: FLOAT
+            mode: NULLABLE
+            description: "PM2.5 particulate matter concentration (μg/m³)"
+          - name: pm10
+            type: FLOAT
+            mode: NULLABLE
+            description: "PM10 particulate matter concentration (μg/m³)"
+          - name: ozone
+            type: FLOAT
+            mode: NULLABLE
+            description: "Ozone concentration (ppm)"
+          - name: no2
+            type: FLOAT
+            mode: NULLABLE
+            description: "Nitrogen dioxide concentration (ppb)"
+          - name: air_quality_index
+            type: INTEGER
+            mode: NULLABLE
+            description: "Calculated air quality index (0-500)"
+      timePartitioning:
+        type: DAY
+        field: timestamp
+      clustering:
+        fields:
+          - sensor_id
+          - air_quality_index
+      labels:
+        environment: $(ref.environment)
+        sensor-type: air-quality
+        table-type: raw-data
+    metadata:
+      dependsOn:
+        - smart-city-analytics-dataset
+
+  # Energy Consumption Table
+  - name: energy-consumption-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      tableId: energy_consumption
+      projectId: $(ref.project_id)
+      datasetId: $(ref.smart-city-analytics-dataset.datasetId)
+      description: "Energy consumption data from smart meters and building systems"
+      schema:
+        fields:
+          - name: meter_id
+            type: STRING
+            mode: REQUIRED
+            description: "Unique identifier for energy meter"
+          - name: timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "UTC timestamp of meter reading"
+          - name: location
+            type: GEOGRAPHY
+            mode: NULLABLE
+            description: "Geographic location of meter"
+          - name: energy_usage_kwh
+            type: FLOAT
+            mode: NULLABLE
+            description: "Energy usage in kilowatt hours"
+          - name: peak_demand
+            type: FLOAT
+            mode: NULLABLE
+            description: "Peak demand in kilowatts"
+          - name: building_type
+            type: STRING
+            mode: NULLABLE
+            description: "Type of building (residential, commercial, industrial)"
+          - name: occupancy_rate
+            type: FLOAT
+            mode: NULLABLE
+            description: "Building occupancy rate percentage"
+      timePartitioning:
+        type: DAY
+        field: timestamp
+      clustering:
+        fields:
+          - meter_id
+          - building_type
+      labels:
+        environment: $(ref.environment)
+        sensor-type: energy
+        table-type: raw-data
+    metadata:
+      dependsOn:
+        - smart-city-analytics-dataset
+
+  # Hourly City Metrics Aggregation Table
+  - name: hourly-city-metrics-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      tableId: hourly_city_metrics
+      projectId: $(ref.project_id)
+      datasetId: $(ref.smart-city-analytics-dataset.datasetId)
+      description: "Aggregated hourly metrics for city-wide dashboard"
+      schema:
+        fields:
+          - name: hour
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "Hour timestamp for aggregated data"
+          - name: avg_traffic_flow
+            type: FLOAT
+            mode: NULLABLE
+            description: "Average traffic flow across all sensors"
+          - name: avg_air_quality
+            type: FLOAT
+            mode: NULLABLE
+            description: "Average air quality index"
+          - name: total_energy_consumption
+            type: FLOAT
+            mode: NULLABLE
+            description: "Total energy consumption in kWh"
+          - name: city_zone
+            type: STRING
+            mode: NULLABLE
+            description: "City zone identifier"
+      timePartitioning:
+        type: DAY
+        field: hour
+      clustering:
+        fields:
+          - city_zone
+      labels:
+        environment: $(ref.environment)
+        table-type: aggregated-data
+        purpose: dashboard
+    metadata:
+      dependsOn:
+        - smart-city-analytics-dataset
+
+  # Service Account for Dataprep Operations
+  - name: dataprep-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      projectId: $(ref.project_id)
+      accountId: dataprep-service-account-$(ref.random_suffix)
+      serviceAccount:
+        displayName: "Dataprep Service Account"
+        description: "Service account for Cloud Dataprep data processing operations"
+
+  # IAM Policy Bindings for Dataprep Service Account
+  - name: dataprep-storage-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      projectId: $(ref.project_id)
+      role: roles/storage.admin
+      member: serviceAccount:$(ref.dataprep-service-account.email)
+    metadata:
+      dependsOn:
+        - dataprep-service-account
+
+  - name: dataprep-bigquery-editor-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      projectId: $(ref.project_id)
+      role: roles/bigquery.dataEditor
+      member: serviceAccount:$(ref.dataprep-service-account.email)
+    metadata:
+      dependsOn:
+        - dataprep-service-account
+
+  - name: dataprep-dataflow-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      projectId: $(ref.project_id)
+      role: roles/dataflow.admin
+      member: serviceAccount:$(ref.dataprep-service-account.email)
+    metadata:
+      dependsOn:
+        - dataprep-service-account
+
+  # Cloud Function for Triggering Dataprep Flows
+  - name: dataprep-trigger-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: $(ref.region)
+      function: dataprep-flow-trigger-$(ref.random_suffix)
+      sourceArchiveUrl: gs://$(ref.smart-city-data-lake.name)/functions/dataprep-trigger.zip
+      entryPoint: trigger_dataprep_flow
+      runtime: python39
+      timeout: 540s
+      availableMemoryMb: 256
+      serviceAccountEmail: $(ref.dataprep-service-account.email)
+      environmentVariables:
+        PROJECT_ID: $(ref.project_id)
+        BUCKET_NAME: $(ref.smart-city-data-lake.name)
+      eventTrigger:
+        eventType: google.storage.object.finalize
+        resource: projects/_/buckets/$(ref.smart-city-data-lake.name)
+      labels:
+        environment: $(ref.environment)
+        component: data-processing
+        purpose: automation
+    metadata:
+      dependsOn:
+        - smart-city-data-lake
+        - dataprep-service-account
+
+  # Log-based Metrics for Data Quality Monitoring
+  - name: data-quality-errors-metric
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      projectId: $(ref.project_id)
+      metricId: data_quality_errors
+      logMetric:
+        name: data_quality_errors
+        description: "Count of data quality errors in processing pipeline"
+        filter: 'resource.type="cloud_function" AND severity="ERROR" AND textPayload:"data_quality"'
+        metricDescriptor:
+          metricKind: GAUGE
+          valueType: INT64
+        labelExtractors:
+          sensor_type: 'EXTRACT(textPayload, "sensor_type:([a-zA-Z-]+)")'
+
+  - name: bigquery-job-failures-metric
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      projectId: $(ref.project_id)
+      metricId: bigquery_job_failures
+      logMetric:
+        name: bigquery_job_failures
+        description: "Count of BigQuery job failures"
+        filter: 'resource.type="bigquery_project" AND severity="ERROR"'
+        metricDescriptor:
+          metricKind: GAUGE
+          valueType: INT64
+
+  # Monitoring Alert Policy for Data Pipeline Health
+  - name: pipeline-health-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      projectName: projects/$(ref.project_id)
+      alertPolicy:
+        displayName: "Smart City Data Pipeline Health"
+        documentation:
+          content: "Alert when smart city data pipeline shows signs of degradation"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "Low data ingestion rate"
+            conditionThreshold:
+              filter: 'resource.type="pubsub_topic" AND metric.type="pubsub.googleapis.com/topic/send_message_operation_count"'
+              comparison: COMPARISON_LT
+              thresholdValue: 100
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+        enabled: true
+        alertStrategy:
+          autoClose: 1800s
+        combiner: OR
+
+# Output values for verification and integration
+outputs:
+  - name: data_lake_bucket_name
+    description: "Name of the Cloud Storage data lake bucket"
+    value: $(ref.smart-city-data-lake.name)
+
+  - name: bigquery_dataset_id
+    description: "BigQuery dataset ID for analytics"
+    value: $(ref.smart-city-analytics-dataset.datasetId)
+
+  - name: pubsub_topics
+    description: "Pub/Sub topic names for data ingestion"
+    value:
+      traffic: $(ref.traffic-sensor-topic.name)
+      air_quality: $(ref.air-quality-topic.name)
+      energy: $(ref.energy-consumption-topic.name)
+
+  - name: service_account_email
+    description: "Service account email for Dataprep operations"
+    value: $(ref.dataprep-service-account.email)
+
+  - name: cloud_function_name
+    description: "Cloud Function name for Dataprep automation"
+    value: $(ref.dataprep-trigger-function.name)
+
+  - name: monitoring_metrics
+    description: "Log-based metrics for monitoring"
+    value:
+      data_quality_errors: $(ref.data-quality-errors-metric.name)
+      bigquery_job_failures: $(ref.bigquery-job-failures-metric.name)
+
+  - name: project_region
+    description: "Google Cloud region used for resources"
+    value: $(ref.region)
+
+  - name: deployment_labels
+    description: "Common labels applied to resources"
+    value:
+      environment: $(ref.environment)
+      purpose: smart-city-analytics
+      managed-by: infrastructure-manager

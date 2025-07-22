@@ -1,0 +1,878 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Advanced Cross-Account IAM Role Federation with AWS
+  This template creates a comprehensive cross-account IAM federation architecture
+  with master roles, target account roles, audit trails, and automated validation.
+  
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Account Configuration"
+        Parameters:
+          - SecurityAccountId
+          - ProductionAccountId
+          - DevelopmentAccountId
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - ProductionExternalId
+          - DevelopmentExternalId
+          - MaxSessionDuration
+          - RequireMFA
+      - Label:
+          default: "Audit Configuration"
+        Parameters:
+          - EnableCloudTrail
+          - CloudTrailRetentionDays
+          - EnableAutomatedValidation
+      - Label:
+          default: "Network Security"
+        Parameters:
+          - AllowedIPCIDRBlocks
+          - RestrictIPAccess
+      - Label:
+          default: "Tagging and Naming"
+        Parameters:
+          - ResourcePrefix
+          - Environment
+          - Department
+
+Parameters:
+  SecurityAccountId:
+    Type: String
+    Description: AWS Account ID for the central security account (where master roles are created)
+    AllowedPattern: '[0-9]{12}'
+    ConstraintDescription: Must be a valid 12-digit AWS Account ID
+    
+  ProductionAccountId:
+    Type: String
+    Description: AWS Account ID for the production account
+    AllowedPattern: '[0-9]{12}'
+    ConstraintDescription: Must be a valid 12-digit AWS Account ID
+    
+  DevelopmentAccountId:
+    Type: String
+    Description: AWS Account ID for the development account
+    AllowedPattern: '[0-9]{12}'
+    ConstraintDescription: Must be a valid 12-digit AWS Account ID
+    
+  ProductionExternalId:
+    Type: String
+    Description: External ID for production account role (32 character hex string)
+    AllowedPattern: '[a-f0-9]{32}'
+    ConstraintDescription: Must be a 32-character hexadecimal string
+    NoEcho: true
+    
+  DevelopmentExternalId:
+    Type: String
+    Description: External ID for development account role (32 character hex string)
+    AllowedPattern: '[a-f0-9]{32}'
+    ConstraintDescription: Must be a 32-character hexadecimal string
+    NoEcho: true
+    
+  MaxSessionDuration:
+    Type: Number
+    Description: Maximum session duration in seconds for cross-account roles
+    Default: 3600
+    MinValue: 900
+    MaxValue: 43200
+    ConstraintDescription: Must be between 900 (15 minutes) and 43200 (12 hours)
+    
+  RequireMFA:
+    Type: String
+    Description: Require Multi-Factor Authentication for role assumption
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    
+  EnableCloudTrail:
+    Type: String
+    Description: Enable CloudTrail for cross-account audit logging
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    
+  CloudTrailRetentionDays:
+    Type: Number
+    Description: Number of days to retain CloudTrail logs
+    Default: 90
+    MinValue: 1
+    MaxValue: 2557
+    ConstraintDescription: Must be between 1 and 2557 days
+    
+  EnableAutomatedValidation:
+    Type: String
+    Description: Enable automated role configuration validation
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    
+  AllowedIPCIDRBlocks:
+    Type: CommaDelimitedList
+    Description: Comma-delimited list of CIDR blocks allowed for development account access
+    Default: "203.0.113.0/24,198.51.100.0/24"
+    
+  RestrictIPAccess:
+    Type: String
+    Description: Apply IP address restrictions to development account access
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    
+  ResourcePrefix:
+    Type: String
+    Description: Prefix for all resource names
+    Default: "CrossAccount"
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9-]*'
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+    
+  Environment:
+    Type: String
+    Description: Environment designation for resource tagging
+    Default: "Production"
+    AllowedValues: ["Production", "Staging", "Development", "Test"]
+    
+  Department:
+    Type: String
+    Description: Department for resource tagging and access control
+    Default: "Security"
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9-]*'
+
+Conditions:
+  CreateCloudTrail: !Equals [!Ref EnableCloudTrail, 'true']
+  CreateAutomatedValidation: !Equals [!Ref EnableAutomatedValidation, 'true']
+  RequireMFACondition: !Equals [!Ref RequireMFA, 'true']
+  RestrictIPCondition: !Equals [!Ref RestrictIPAccess, 'true']
+  IsSecurityAccount: !Equals [!Ref 'AWS::AccountId', !Ref SecurityAccountId]
+  IsProductionAccount: !Equals [!Ref 'AWS::AccountId', !Ref ProductionAccountId]
+  IsDevelopmentAccount: !Equals [!Ref 'AWS::AccountId', !Ref DevelopmentAccountId]
+
+Resources:
+  # ============================================================================
+  # Master Cross-Account Role (Security Account Only)
+  # ============================================================================
+  
+  MasterCrossAccountRole:
+    Type: AWS::IAM::Role
+    Condition: IsSecurityAccount
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-MasterRole-${AWS::StackName}"
+      Description: "Master role for federated cross-account access with comprehensive security controls"
+      MaxSessionDuration: !Ref MaxSessionDuration
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # SAML Federation Trust
+          - Effect: Allow
+            Principal:
+              Federated: !Sub "arn:aws:iam::${SecurityAccountId}:saml-provider/CorporateIdP"
+            Action: sts:AssumeRoleWithSAML
+            Condition:
+              StringEquals:
+                'SAML:aud': 'https://signin.aws.amazon.com/saml'
+              ForAllValues:StringLike:
+                'SAML:department': 
+                  - "Engineering"
+                  - "Security" 
+                  - "DevOps"
+          # Direct Role Assumption with MFA
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${SecurityAccountId}:root"
+            Action: sts:AssumeRole
+            Condition: !If
+              - RequireMFACondition
+              - Bool:
+                  'aws:MultiFactorAuthPresent': 'true'
+                NumericLessThan:
+                  'aws:MultiFactorAuthAge': '3600'
+              - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-MasterRole"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Department
+          Value: !Ref Department
+        - Key: Purpose
+          Value: "CrossAccountFederation"
+        - Key: ManagedBy
+          Value: "CloudFormation"
+
+  MasterCrossAccountPolicy:
+    Type: AWS::IAM::Policy
+    Condition: IsSecurityAccount
+    Properties:
+      PolicyName: "CrossAccountAssumePolicy"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+            Resource:
+              - !Sub "arn:aws:iam::${ProductionAccountId}:role/${ResourcePrefix}-*"
+              - !Sub "arn:aws:iam::${DevelopmentAccountId}:role/${ResourcePrefix}-*"
+            Condition:
+              StringEquals:
+                'sts:ExternalId': 
+                  - !Ref ProductionExternalId
+                  - !Ref DevelopmentExternalId
+                'aws:RequestedRegion': !Ref 'AWS::Region'
+              ForAllValues:StringEquals:
+                'sts:TransitiveTagKeys': 
+                  - "Department"
+                  - "Project" 
+                  - "Environment"
+          - Effect: Allow
+            Action:
+              - iam:ListRoles
+              - iam:GetRole
+              - sts:GetCallerIdentity
+            Resource: "*"
+      Roles:
+        - !Ref MasterCrossAccountRole
+
+  # ============================================================================
+  # Production Account Cross-Account Role
+  # ============================================================================
+  
+  ProductionCrossAccountRole:
+    Type: AWS::IAM::Role
+    Condition: IsProductionAccount
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-ProductionAccess-${AWS::StackName}"
+      Description: "Cross-account role for production resource access with strict security controls"
+      MaxSessionDuration: !Ref MaxSessionDuration
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${SecurityAccountId}:role/${ResourcePrefix}-MasterRole-${AWS::StackName}"
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref ProductionExternalId
+              Bool: !If
+                - RequireMFACondition
+                - 'aws:MultiFactorAuthPresent': 'true'
+                - !Ref 'AWS::NoValue'
+              StringLike:
+                'aws:userid': !Sub "*:${SecurityAccountId}:*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-ProductionAccess"
+        - Key: Environment
+          Value: "Production"
+        - Key: Department
+          Value: !Ref Department
+        - Key: Purpose
+          Value: "CrossAccountAccess"
+        - Key: ManagedBy
+          Value: "CloudFormation"
+
+  ProductionCrossAccountPolicy:
+    Type: AWS::IAM::Policy
+    Condition: IsProductionAccount
+    Properties:
+      PolicyName: "ProductionResourceAccess"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # S3 Access for production data
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:ListBucket
+            Resource:
+              - !Sub "arn:aws:s3:::prod-shared-data-${AWS::StackName}"
+              - !Sub "arn:aws:s3:::prod-shared-data-${AWS::StackName}/*"
+          # CloudWatch Logs access
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogGroups
+              - logs:DescribeLogStreams
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${ProductionAccountId}:*"
+          # CloudWatch Metrics access
+          - Effect: Allow
+            Action:
+              - cloudwatch:PutMetricData
+              - cloudwatch:GetMetricStatistics
+              - cloudwatch:ListMetrics
+            Resource: "*"
+      Roles:
+        - !Ref ProductionCrossAccountRole
+
+  # ============================================================================
+  # Development Account Cross-Account Role
+  # ============================================================================
+  
+  DevelopmentCrossAccountRole:
+    Type: AWS::IAM::Role
+    Condition: IsDevelopmentAccount
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-DevelopmentAccess-${AWS::StackName}"
+      Description: "Cross-account role for development resource access with IP restrictions"
+      MaxSessionDuration: !Ref MaxSessionDuration
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${SecurityAccountId}:role/${ResourcePrefix}-MasterRole-${AWS::StackName}"
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref DevelopmentExternalId
+              StringLike:
+                'aws:userid': !Sub "*:${SecurityAccountId}:*"
+              IpAddress: !If
+                - RestrictIPCondition
+                - 'aws:SourceIp': !Ref AllowedIPCIDRBlocks
+                - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-DevelopmentAccess"
+        - Key: Environment
+          Value: "Development"
+        - Key: Department
+          Value: !Ref Department
+        - Key: Purpose
+          Value: "CrossAccountAccess"
+        - Key: ManagedBy
+          Value: "CloudFormation"
+
+  DevelopmentCrossAccountPolicy:
+    Type: AWS::IAM::Policy
+    Condition: IsDevelopmentAccount
+    Properties:
+      PolicyName: "DevelopmentResourceAccess"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # S3 Full access for development data
+          - Effect: Allow
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:aws:s3:::dev-shared-data-${AWS::StackName}"
+              - !Sub "arn:aws:s3:::dev-shared-data-${AWS::StackName}/*"
+          # EC2 Read-only access
+          - Effect: Allow
+            Action:
+              - ec2:DescribeInstances
+              - ec2:DescribeSecurityGroups
+              - ec2:DescribeVpcs
+              - ec2:DescribeSubnets
+            Resource: "*"
+          # Lambda access for development functions
+          - Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+              - lambda:GetFunction
+              - lambda:ListFunctions
+            Resource: !Sub "arn:aws:lambda:${AWS::Region}:${DevelopmentAccountId}:function:dev-*"
+          # CloudWatch Logs full access
+          - Effect: Allow
+            Action: "logs:*"
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${DevelopmentAccountId}:*"
+      Roles:
+        - !Ref DevelopmentCrossAccountRole
+
+  # ============================================================================
+  # CloudTrail for Audit Logging (Security Account Only)
+  # ============================================================================
+  
+  CrossAccountAuditBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateCloudTrail
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub "${ResourcePrefix}-audit-trail-${AWS::AccountId}-${AWS::StackName}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: "DeleteOldLogs"
+            Status: Enabled
+            ExpirationInDays: !Ref CloudTrailRetentionDays
+          - Id: "TransitionToIA"
+            Status: Enabled
+            TransitionInDays: 30
+            StorageClass: STANDARD_IA
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            CloudWatchConfiguration:
+              LogGroupName: !Ref CloudTrailLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-AuditTrail-Bucket"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Department
+          Value: !Ref Department
+        - Key: Purpose
+          Value: "AuditLogging"
+
+  CrossAccountAuditBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateCloudTrail
+    Properties:
+      Bucket: !Ref CrossAccountAuditBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - s3:PutObject
+              - s3:GetBucketAcl
+            Resource:
+              - !GetAtt CrossAccountAuditBucket.Arn
+              - !Sub "${CrossAccountAuditBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': 'bucket-owner-full-control'
+          - Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt CrossAccountAuditBucket.Arn
+              - !Sub "${CrossAccountAuditBucket.Arn}/*"
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  CloudTrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateCloudTrail
+    Properties:
+      LogGroupName: !Sub "/aws/cloudtrail/${ResourcePrefix}-${AWS::StackName}"
+      RetentionInDays: !Ref CloudTrailRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-CloudTrail-LogGroup"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Department
+          Value: !Ref Department
+
+  CloudTrailLogRole:
+    Type: AWS::IAM::Role
+    Condition: CreateCloudTrail
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudTrailLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt CloudTrailLogGroup.Arn
+
+  CrossAccountAuditTrail:
+    Type: AWS::CloudTrail::Trail
+    Condition: CreateCloudTrail
+    DependsOn: CrossAccountAuditBucketPolicy
+    Properties:
+      TrailName: !Sub "${ResourcePrefix}-AuditTrail-${AWS::StackName}"
+      S3BucketName: !Ref CrossAccountAuditBucket
+      S3KeyPrefix: "cross-account-logs/"
+      CloudWatchLogsLogGroupArn: !GetAtt CloudTrailLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailLogRole.Arn
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: "AWS::IAM::Role"
+              Values: 
+                - !Sub "arn:aws:iam::*:role/${ResourcePrefix}-*"
+            - Type: "AWS::STS::AssumeRole"
+              Values: 
+                - "*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-AuditTrail"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Department
+          Value: !Ref Department
+        - Key: Purpose
+          Value: "CrossAccountAudit"
+
+  # ============================================================================
+  # Automated Role Validation (Security Account Only)
+  # ============================================================================
+  
+  RoleValidatorExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: CreateAutomatedValidation
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/IAMReadOnlyAccess
+      Policies:
+        - PolicyName: ConfigRuleAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - config:PutConfigRule
+                  - config:DeleteConfigRule
+                  - config:DescribeConfigRules
+                Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-RoleValidator-ExecutionRole"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Department
+          Value: !Ref Department
+
+  RoleValidatorFunction:
+    Type: AWS::Lambda::Function
+    Condition: CreateAutomatedValidation
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-RoleValidator-${AWS::StackName}"
+      Description: "Automated validation of cross-account role configurations"
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt RoleValidatorExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          RESOURCE_PREFIX: !Ref ResourcePrefix
+          SECURITY_ACCOUNT_ID: !Ref SecurityAccountId
+          PRODUCTION_ACCOUNT_ID: !Ref ProductionAccountId
+          DEVELOPMENT_ACCOUNT_ID: !Ref DevelopmentAccountId
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          iam = boto3.client('iam')
+          config_client = boto3.client('config')
+          
+          def lambda_handler(event, context):
+              """
+              Validate cross-account role configurations and trust policies
+              """
+              try:
+                  resource_prefix = os.environ.get('RESOURCE_PREFIX', 'CrossAccount')
+                  
+                  # Get all cross-account roles
+                  paginator = iam.get_paginator('list_roles')
+                  
+                  validation_results = []
+                  
+                  for page in paginator.paginate():
+                      for role in page['Roles']:
+                          if resource_prefix in role['RoleName']:
+                              validation_result = validate_role(role)
+                              validation_results.append(validation_result)
+                  
+                  # Count compliant roles
+                  compliant_count = sum(1 for r in validation_results if r['compliant'])
+                  
+                  # Log non-compliant roles
+                  for result in validation_results:
+                      if not result['compliant']:
+                          logger.warning(f"Non-compliant role found: {result}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'validated_roles': len(validation_results),
+                          'compliant_roles': compliant_count,
+                          'compliance_percentage': (compliant_count / len(validation_results) * 100) if validation_results else 0
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error validating roles: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def validate_role(role):
+              """
+              Validate individual role configuration
+              """
+              role_name = role['RoleName']
+              
+              try:
+                  # Get role details
+                  role_details = iam.get_role(RoleName=role_name)
+                  assume_role_policy = role_details['Role']['AssumeRolePolicyDocument']
+                  
+                  validation_checks = {
+                      'has_external_id': check_external_id(assume_role_policy),
+                      'has_proper_principal': check_principal(assume_role_policy),
+                      'max_session_duration_ok': role['MaxSessionDuration'] <= 7200,
+                      'has_proper_tags': check_tags(role_details['Role'])
+                  }
+                  
+                  compliant = all(validation_checks.values())
+                  
+                  return {
+                      'role_name': role_name,
+                      'compliant': compliant,
+                      'checks': validation_checks
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error validating role {role_name}: {str(e)}")
+                  return {
+                      'role_name': role_name,
+                      'compliant': False,
+                      'error': str(e)
+                  }
+          
+          def check_external_id(policy):
+              """Check if policy requires ExternalId"""
+              for statement in policy.get('Statement', []):
+                  conditions = statement.get('Condition', {})
+                  if 'StringEquals' in conditions and 'sts:ExternalId' in conditions['StringEquals']:
+                      return True
+              return False
+          
+          def check_principal(policy):
+              """Check if policy has proper principal configuration"""
+              for statement in policy.get('Statement', []):
+                  principal = statement.get('Principal', {})
+                  if 'AWS' in principal:
+                      return True
+                  if 'Federated' in principal:
+                      return True
+              return False
+          
+          def check_tags(role):
+              """Check if role has required tags"""
+              tags = role.get('Tags', [])
+              tag_keys = [tag['Key'] for tag in tags]
+              required_tags = ['Environment', 'Department', 'Purpose']
+              return all(tag in tag_keys for tag in required_tags)
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-RoleValidator"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Department
+          Value: !Ref Department
+        - Key: Purpose
+          Value: "SecurityValidation"
+
+  # Scheduled execution of role validator
+  RoleValidatorScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: CreateAutomatedValidation
+    Properties:
+      Name: !Sub "${ResourcePrefix}-RoleValidation-Schedule"
+      Description: "Scheduled execution of cross-account role validation"
+      ScheduleExpression: "rate(24 hours)"  # Daily validation
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt RoleValidatorFunction.Arn
+          Id: "RoleValidatorTarget"
+
+  RoleValidatorSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: CreateAutomatedValidation
+    Properties:
+      FunctionName: !Ref RoleValidatorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RoleValidatorScheduleRule.Arn
+
+  # ============================================================================
+  # CloudWatch Alarms for Monitoring
+  # ============================================================================
+  
+  UnauthorizedRoleAssumptionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudTrail
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-UnauthorizedRoleAssumption-${AWS::StackName}"
+      AlarmDescription: "Alert on unauthorized cross-account role assumption attempts"
+      MetricName: "ErrorCount"
+      Namespace: "CloudTrail"
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  RoleValidationFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAutomatedValidation
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-RoleValidationFailure-${AWS::StackName}"
+      AlarmDescription: "Alert on role validation function failures"
+      MetricName: "Errors"
+      Namespace: "AWS/Lambda"
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RoleValidatorFunction
+      TreatMissingData: notBreaching
+
+Outputs:
+  # ============================================================================
+  # Role ARNs and Configuration
+  # ============================================================================
+  
+  MasterRoleArn:
+    Description: "ARN of the master cross-account role (Security Account)"
+    Value: !If 
+      - IsSecurityAccount
+      - !GetAtt MasterCrossAccountRole.Arn
+      - !Sub "arn:aws:iam::${SecurityAccountId}:role/${ResourcePrefix}-MasterRole-${AWS::StackName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-MasterRoleArn"
+
+  ProductionRoleArn:
+    Description: "ARN of the production cross-account role"
+    Value: !If
+      - IsProductionAccount
+      - !GetAtt ProductionCrossAccountRole.Arn
+      - !Sub "arn:aws:iam::${ProductionAccountId}:role/${ResourcePrefix}-ProductionAccess-${AWS::StackName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-ProductionRoleArn"
+
+  DevelopmentRoleArn:
+    Description: "ARN of the development cross-account role"
+    Value: !If
+      - IsDevelopmentAccount
+      - !GetAtt DevelopmentCrossAccountRole.Arn
+      - !Sub "arn:aws:iam::${DevelopmentAccountId}:role/${ResourcePrefix}-DevelopmentAccess-${AWS::StackName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-DevelopmentRoleArn"
+
+  # ============================================================================
+  # Security Configuration
+  # ============================================================================
+  
+  ExternalIdConfiguration:
+    Description: "External ID configuration for cross-account access"
+    Value: !Sub |
+      Production External ID: ${ProductionExternalId}
+      Development External ID: ${DevelopmentExternalId}
+      Note: Store these securely and rotate regularly
+    
+  MaxSessionDurationSetting:
+    Description: "Maximum session duration for cross-account roles"
+    Value: !Sub "${MaxSessionDuration} seconds"
+
+  # ============================================================================
+  # Audit and Monitoring
+  # ============================================================================
+  
+  CloudTrailArn:
+    Condition: CreateCloudTrail
+    Description: "ARN of the cross-account audit CloudTrail"
+    Value: !GetAtt CrossAccountAuditTrail.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudTrailArn"
+
+  AuditBucketName:
+    Condition: CreateCloudTrail
+    Description: "S3 bucket name for audit trail logs"
+    Value: !Ref CrossAccountAuditBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-AuditBucket"
+
+  RoleValidatorFunctionArn:
+    Condition: CreateAutomatedValidation
+    Description: "ARN of the role validator Lambda function"
+    Value: !GetAtt RoleValidatorFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-RoleValidatorArn"
+
+  # ============================================================================
+  # Usage Instructions
+  # ============================================================================
+  
+  RoleAssumptionCommand:
+    Description: "AWS CLI command to assume the production role"
+    Value: !Sub |
+      aws sts assume-role \
+        --role-arn arn:aws:iam::${ProductionAccountId}:role/${ResourcePrefix}-ProductionAccess-${AWS::StackName} \
+        --role-session-name MySession \
+        --external-id ${ProductionExternalId} \
+        --duration-seconds ${MaxSessionDuration}
+
+  ValidationTestCommand:
+    Condition: CreateAutomatedValidation
+    Description: "AWS CLI command to test role validation"
+    Value: !Sub |
+      aws lambda invoke \
+        --function-name ${ResourcePrefix}-RoleValidator-${AWS::StackName} \
+        --payload '{}' \
+        response.json && cat response.json
+
+  # ============================================================================
+  # Compliance and Security
+  # ============================================================================
+  
+  SecurityCompliance:
+    Description: "Security compliance features enabled"
+    Value: !Sub |
+      MFA Required: ${RequireMFA}
+      IP Restrictions: ${RestrictIPAccess}
+      CloudTrail Enabled: ${EnableCloudTrail}
+      Automated Validation: ${EnableAutomatedValidation}
+      Log Retention: ${CloudTrailRetentionDays} days
+
+  TaggingStrategy:
+    Description: "Resource tagging strategy applied"
+    Value: !Sub |
+      Environment: ${Environment}
+      Department: ${Department}
+      Resource Prefix: ${ResourcePrefix}
+      All resources tagged for compliance and cost allocation

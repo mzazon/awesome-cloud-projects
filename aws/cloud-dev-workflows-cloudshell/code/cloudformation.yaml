@@ -1,0 +1,414 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Infrastructure for Cloud Development Workflows with CloudShell.
+  This template creates a secure CodeCommit repository with IAM roles and policies for cloud-based development.
+  Note: AWS CodeCommit is no longer available to new customers as of July 2024.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Repository Configuration
+        Parameters:
+          - RepositoryName
+          - RepositoryDescription
+      - Label:
+          default: Access Control Configuration
+        Parameters:
+          - DeveloperGroupName
+          - CreateDeveloperRole
+      - Label:
+          default: Security Configuration
+        Parameters:
+          - EnableEncryption
+          - KMSKeyId
+      - Label:
+          default: Tagging Configuration
+        Parameters:
+          - Environment
+          - ProjectName
+    ParameterLabels:
+      RepositoryName:
+        default: Repository Name
+      RepositoryDescription:
+        default: Repository Description
+      DeveloperGroupName:
+        default: Developer IAM Group Name
+      CreateDeveloperRole:
+        default: Create Developer Role
+      EnableEncryption:
+        default: Enable Repository Encryption
+      KMSKeyId:
+        default: KMS Key ID
+      Environment:
+        default: Environment Tag
+      ProjectName:
+        default: Project Name Tag
+
+Parameters:
+  RepositoryName:
+    Type: String
+    Description: Name of the CodeCommit repository
+    Default: dev-workflow-demo
+    MinLength: 1
+    MaxLength: 100
+    AllowedPattern: '^[a-zA-Z0-9._-]+$'
+    ConstraintDescription: Repository name must be 1-100 characters and contain only letters, numbers, periods, hyphens, and underscores
+
+  RepositoryDescription:
+    Type: String
+    Description: Description for the CodeCommit repository
+    Default: Demo repository for cloud-based development workflows using AWS CloudShell and CodeCommit
+    MaxLength: 1000
+
+  DeveloperGroupName:
+    Type: String
+    Description: Name of the IAM group for developers (leave empty to skip group creation)
+    Default: CloudShell-CodeCommit-Developers
+    AllowedPattern: '^[a-zA-Z0-9+=,.@_-]*$'
+    ConstraintDescription: Group name must contain only alphanumeric characters and +=,.@_- characters
+
+  CreateDeveloperRole:
+    Type: String
+    Description: Create an IAM role for developers to assume for CodeCommit access
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableEncryption:
+    Type: String
+    Description: Enable encryption for the CodeCommit repository using AWS managed keys
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  KMSKeyId:
+    Type: String
+    Description: KMS Key ID for repository encryption (leave empty to use AWS managed key)
+    Default: ''
+
+  Environment:
+    Type: String
+    Description: Environment tag for resources
+    Default: development
+    AllowedValues:
+      - development
+      - staging
+      - production
+
+  ProjectName:
+    Type: String
+    Description: Project name for resource tagging
+    Default: cloud-development-workflow
+    MinLength: 1
+    MaxLength: 50
+
+Conditions:
+  CreateDeveloperGroup: !Not [!Equals [!Ref DeveloperGroupName, '']]
+  CreateRole: !Equals [!Ref CreateDeveloperRole, 'true']
+  UseEncryption: !Equals [!Ref EnableEncryption, 'true']
+  UseCustomKMSKey: !And
+    - !Condition UseEncryption
+    - !Not [!Equals [!Ref KMSKeyId, '']]
+
+Resources:
+  # CodeCommit Repository
+  CodeCommitRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      RepositoryDescription: !Ref RepositoryDescription
+      KmsKeyId: !If
+        - UseCustomKMSKey
+        - !Ref KMSKeyId
+        - !If
+          - UseEncryption
+          - alias/aws/codecommit
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Ref RepositoryName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: CloudShell Development Workflow
+        - Key: CreatedBy
+          Value: CloudFormation
+
+  # IAM Policy for CodeCommit access
+  CodeCommitDeveloperPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${RepositoryName}-CodeCommit-Developer-Policy'
+      Description: Policy for developers to access CodeCommit repository from CloudShell
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # CodeCommit repository access
+          - Sid: CodeCommitRepositoryAccess
+            Effect: Allow
+            Action:
+              - codecommit:GitPull
+              - codecommit:GitPush
+              - codecommit:GetBranch
+              - codecommit:GetCommit
+              - codecommit:GetRepository
+              - codecommit:ListBranches
+              - codecommit:ListRepositories
+              - codecommit:CreateBranch
+              - codecommit:GetDifferences
+              - codecommit:GetReferences
+              - codecommit:BatchGetRepositories
+              - codecommit:GetObjectIdentifier
+              - codecommit:GetTree
+              - codecommit:GetBlob
+              - codecommit:BatchGetCommits
+              - codecommit:GetComment
+              - codecommit:GetCommentsForComparedCommit
+              - codecommit:GetCommentsForPullRequest
+              - codecommit:GetMergeConflicts
+              - codecommit:GetMergeOptions
+              - codecommit:DescribeMergeConflicts
+            Resource: !GetAtt CodeCommitRepository.Arn
+          
+          # CodeCommit credential helper access
+          - Sid: CodeCommitCredentialHelper
+            Effect: Allow
+            Action:
+              - codecommit:GetRepository
+            Resource: !GetAtt CodeCommitRepository.Arn
+          
+          # CloudShell access permissions
+          - Sid: CloudShellAccess
+            Effect: Allow
+            Action:
+              - cloudshell:*
+            Resource: '*'
+          
+          # Basic AWS CLI permissions for development
+          - Sid: BasicAWSAccess
+            Effect: Allow
+            Action:
+              - sts:GetCallerIdentity
+              - iam:GetUser
+              - iam:ListMFADevices
+            Resource: '*'
+
+  # IAM Group for developers (optional)
+  DeveloperGroup:
+    Type: AWS::IAM::Group
+    Condition: CreateDeveloperGroup
+    Properties:
+      GroupName: !Ref DeveloperGroupName
+      ManagedPolicyArns:
+        - !Ref CodeCommitDeveloperPolicy
+        - arn:aws:iam::aws:policy/AWSCloudShellFullAccess
+      Tags:
+        - Key: Name
+          Value: !Ref DeveloperGroupName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: CloudShell CodeCommit Development Access
+
+  # IAM Role for developers (optional)
+  DeveloperRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRole
+    Properties:
+      RoleName: !Sub '${RepositoryName}-Developer-Role'
+      Description: Role for developers to access CodeCommit repository from CloudShell
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              Bool:
+                aws:MultiFactorAuthPresent: 'true'
+      ManagedPolicyArns:
+        - !Ref CodeCommitDeveloperPolicy
+        - arn:aws:iam::aws:policy/AWSCloudShellFullAccess
+      MaxSessionDuration: 3600
+      Tags:
+        - Key: Name
+          Value: !Sub '${RepositoryName}-Developer-Role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: CloudShell CodeCommit Development Access
+
+  # CloudWatch Log Group for monitoring (optional)
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/codecommit/${RepositoryName}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${RepositoryName}-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: CodeCommit Repository Logs
+
+  # EventBridge Rule for repository events (optional)
+  RepositoryEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${RepositoryName}-events'
+      Description: EventBridge rule to capture CodeCommit repository events
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail:
+          repositoryName:
+            - !Ref RepositoryName
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CloudWatchLogGroup.Arn
+          Id: LogGroupTarget
+
+  # CloudFormation Custom Resource for Git initialization (example)
+  GitInitializationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CodeCommitAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codecommit:GetRepository
+                  - codecommit:GitPush
+                  - codecommit:CreateBranch
+                Resource: !GetAtt CodeCommitRepository.Arn
+
+Outputs:
+  RepositoryName:
+    Description: Name of the created CodeCommit repository
+    Value: !Ref RepositoryName
+    Export:
+      Name: !Sub '${AWS::StackName}-RepositoryName'
+
+  RepositoryArn:
+    Description: ARN of the created CodeCommit repository
+    Value: !GetAtt CodeCommitRepository.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RepositoryArn'
+
+  RepositoryCloneUrlHttp:
+    Description: HTTP clone URL for the CodeCommit repository
+    Value: !GetAtt CodeCommitRepository.CloneUrlHttp
+    Export:
+      Name: !Sub '${AWS::StackName}-CloneUrlHttp'
+
+  RepositoryCloneUrlSsh:
+    Description: SSH clone URL for the CodeCommit repository
+    Value: !GetAtt CodeCommitRepository.CloneUrlSsh
+    Export:
+      Name: !Sub '${AWS::StackName}-CloneUrlSsh'
+
+  DeveloperPolicyArn:
+    Description: ARN of the IAM policy for CodeCommit developers
+    Value: !Ref CodeCommitDeveloperPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-DeveloperPolicyArn'
+
+  DeveloperGroupName:
+    Condition: CreateDeveloperGroup
+    Description: Name of the IAM group for developers
+    Value: !Ref DeveloperGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-DeveloperGroupName'
+
+  DeveloperRoleArn:
+    Condition: CreateRole
+    Description: ARN of the IAM role for developers
+    Value: !GetAtt DeveloperRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DeveloperRoleArn'
+
+  CloudShellUrl:
+    Description: URL to access AWS CloudShell
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudshell/home?region=${AWS::Region}'
+
+  SetupCommands:
+    Description: Commands to run in CloudShell to get started
+    Value: !Sub |
+      # Configure Git
+      git config --global user.name "CloudShell Developer"
+      git config --global user.email "developer@example.com"
+      git config --global credential.helper '!aws codecommit credential-helper $@'
+      git config --global credential.UseHttpPath true
+      
+      # Clone repository
+      git clone ${CodeCommitRepository.CloneUrlHttp}
+      cd ${RepositoryName}
+      
+      # Create initial commit
+      echo "# ${RepositoryName}" > README.md
+      git add README.md
+      git commit -m "Initial commit"
+      git push origin main
+
+  QuickStartGuide:
+    Description: Quick start guide for using the development workflow
+    Value: !Sub |
+      1. Access CloudShell: ${AWS::Region}.console.aws.amazon.com/cloudshell
+      2. Run the setup commands shown in SetupCommands output
+      3. Start developing with pre-configured tools: git, aws-cli, python3, node
+      4. Use feature branches: git checkout -b feature/your-feature
+      5. Commit and push: git add ., git commit -m "message", git push
+
+  SecurityNote:
+    Description: Important security information
+    Value: !Sub |
+      Security Notes:
+      - CodeCommit uses IAM credentials for authentication
+      - CloudShell sessions timeout after inactivity
+      - Repository encryption is ${EnableEncryption}
+      - MFA is required for assuming the developer role (if created)
+      - Monitor repository access through CloudTrail logs
+
+  CostEstimate:
+    Description: Estimated monthly costs for this infrastructure
+    Value: !Sub |
+      Estimated Monthly Costs:
+      - CodeCommit: Free tier (5 users, unlimited repositories)
+      - CloudShell: Free tier (10 hours/month per user)
+      - CloudWatch Logs: ~$0.50/GB ingested
+      - EventBridge: First 1M events free
+      Total: $0-5/month depending on usage
+
+  ImportantNote:
+    Description: Important information about CodeCommit availability
+    Value: |
+      IMPORTANT: AWS CodeCommit is no longer available to new customers as of July 2024.
+      Existing customers can continue using the service. For new implementations, consider:
+      - GitHub with AWS CodeStar Connections
+      - GitLab with AWS CodeStar Connections
+      - AWS CodeArtifact for package repositories
+      - Self-hosted Git solutions on EC2

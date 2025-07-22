@@ -1,0 +1,485 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Website Uptime Monitoring with Route 53 Health Checks
+  
+  This template creates a comprehensive website uptime monitoring system using:
+  - Route 53 Health Checks for global monitoring
+  - CloudWatch Alarms for automated alerting
+  - SNS Topic for email notifications
+  - CloudWatch Dashboard for visualization
+  
+  The solution monitors website availability from multiple AWS edge locations
+  and sends notifications when downtime is detected.
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Website Configuration"
+        Parameters:
+          - WebsiteURL
+          - MonitoringPath
+          - Port
+          - Protocol
+      - Label:
+          default: "Health Check Settings"
+        Parameters:
+          - RequestInterval
+          - FailureThreshold
+          - MeasureLatency
+          - EnableSNI
+      - Label:
+          default: "Notification Settings"
+        Parameters:
+          - NotificationEmail
+          - AlarmEvaluationPeriods
+      - Label:
+          default: "Resource Naming"
+        Parameters:
+          - ResourcePrefix
+          - Environment
+    ParameterLabels:
+      WebsiteURL:
+        default: "Website URL to Monitor"
+      MonitoringPath:
+        default: "Path to Monitor"
+      NotificationEmail:
+        default: "Email for Notifications"
+      ResourcePrefix:
+        default: "Resource Name Prefix"
+
+# Input Parameters
+Parameters:
+  WebsiteURL:
+    Type: String
+    Description: |
+      The fully qualified domain name of the website to monitor 
+      (e.g., example.com or www.example.com)
+    Default: httpbin.org
+    AllowedPattern: ^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$
+    ConstraintDescription: Must be a valid domain name
+
+  MonitoringPath:
+    Type: String
+    Description: |
+      The path on the website to monitor (e.g., /health, /status/200)
+      Use / for the root path
+    Default: /status/200
+    AllowedPattern: ^\/.*$
+    ConstraintDescription: Must start with a forward slash (/)
+
+  Port:
+    Type: Number
+    Description: Port number for the health check (80 for HTTP, 443 for HTTPS)
+    Default: 443
+    MinValue: 1
+    MaxValue: 65535
+    ConstraintDescription: Must be a valid port number between 1 and 65535
+
+  Protocol:
+    Type: String
+    Description: Protocol to use for health checks
+    Default: HTTPS
+    AllowedValues:
+      - HTTP
+      - HTTPS
+      - HTTP_STR_MATCH
+      - HTTPS_STR_MATCH
+      - TCP
+    ConstraintDescription: Must be a valid health check protocol
+
+  RequestInterval:
+    Type: Number
+    Description: |
+      Interval between health check requests in seconds
+      (30 for standard checks, 10 for fast checks - additional cost)
+    Default: 30
+    AllowedValues:
+      - 10
+      - 30
+    ConstraintDescription: Must be either 10 or 30 seconds
+
+  FailureThreshold:
+    Type: Number
+    Description: |
+      Number of consecutive failures before marking endpoint as unhealthy
+      (1-10, recommended: 3 for balance between responsiveness and false positives)
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+    ConstraintDescription: Must be between 1 and 10
+
+  MeasureLatency:
+    Type: String
+    Description: Enable latency measurements for performance monitoring
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    ConstraintDescription: Must be true or false
+
+  EnableSNI:
+    Type: String
+    Description: |
+      Enable Server Name Indication for HTTPS health checks
+      (Required for websites using SSL/TLS certificates with SNI)
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    ConstraintDescription: Must be true or false
+
+  NotificationEmail:
+    Type: String
+    Description: |
+      Email address to receive uptime notifications
+      (Must be a valid email address that you have access to)
+    Default: your-email@example.com
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address
+
+  AlarmEvaluationPeriods:
+    Type: Number
+    Description: |
+      Number of consecutive periods for alarm evaluation
+      (Higher values reduce false positives but increase detection time)
+    Default: 2
+    MinValue: 1
+    MaxValue: 5
+    ConstraintDescription: Must be between 1 and 5
+
+  ResourcePrefix:
+    Type: String
+    Description: |
+      Prefix for resource names to ensure uniqueness
+      (Use lowercase letters, numbers, and hyphens only)
+    Default: website-uptime
+    AllowedPattern: ^[a-z0-9-]+$
+    MaxLength: 20
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+
+  Environment:
+    Type: String
+    Description: Environment designation for resource tagging
+    Default: production
+    AllowedValues:
+      - development
+      - staging
+      - production
+      - testing
+    ConstraintDescription: Must be a valid environment designation
+
+# Conditional Logic
+Conditions:
+  # Enable SNI only for HTTPS protocols
+  EnableSNICondition: !And
+    - !Or
+        - !Equals [!Ref Protocol, HTTPS]
+        - !Equals [!Ref Protocol, HTTPS_STR_MATCH]
+    - !Equals [!Ref EnableSNI, 'true']
+
+  # Enable latency measurements
+  MeasureLatencyCondition: !Equals [!Ref MeasureLatency, 'true']
+
+  # Check if using standard request interval (30 seconds)
+  StandardIntervalCondition: !Equals [!Ref RequestInterval, 30]
+
+  # Check if using HTTPS protocols
+  HTTPSProtocolCondition: !Or
+    - !Equals [!Ref Protocol, HTTPS]
+    - !Equals [!Ref Protocol, HTTPS_STR_MATCH]
+
+# AWS Resources
+Resources:
+  # SNS Topic for Email Notifications
+  UptimeAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ResourcePrefix}-alerts-${AWS::AccountId}"
+      DisplayName: !Sub "${ResourcePrefix} Website Uptime Alerts"
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-alerts"
+        - Key: Purpose
+          Value: UptimeMonitoring
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Email Subscription to SNS Topic
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref UptimeAlertsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # Route 53 Health Check
+  WebsiteHealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Properties:
+      Type: !Ref Protocol
+      ResourcePath: !Ref MonitoringPath
+      FullyQualifiedDomainName: !Ref WebsiteURL
+      Port: !Ref Port
+      RequestInterval: !Ref RequestInterval
+      FailureThreshold: !Ref FailureThreshold
+      MeasureLatency: !If [MeasureLatencyCondition, true, false]
+      EnableSNI: !If [EnableSNICondition, true, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-health-check"
+        - Key: Purpose
+          Value: UptimeMonitoring
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: MonitoredURL
+          Value: !Sub "${Protocol}://${WebsiteURL}:${Port}${MonitoringPath}"
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudWatch Alarm for Health Check Failures
+  WebsiteDownAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-website-down-alarm"
+      AlarmDescription: !Sub |
+        Alarm triggered when ${WebsiteURL} is detected as down by Route 53 health checks.
+        This alarm monitors the HealthCheckStatus metric and triggers when the website
+        becomes unavailable from multiple AWS edge locations.
+      MetricName: HealthCheckStatus
+      Namespace: AWS/Route53
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref UptimeAlertsTopic
+      OKActions:
+        - !Ref UptimeAlertsTopic
+      Dimensions:
+        - Name: HealthCheckId
+          Value: !Ref WebsiteHealthCheck
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-down-alarm"
+        - Key: Purpose
+          Value: UptimeMonitoring
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Severity
+          Value: High
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudWatch Alarm for Health Check Percentage
+  WebsiteHealthPercentageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-health-percentage-alarm"
+      AlarmDescription: !Sub |
+        Alarm triggered when ${WebsiteURL} health check percentage drops below 80%.
+        This provides early warning of potential issues before complete failure.
+      MetricName: HealthCheckPercentHealthy
+      Namespace: AWS/Route53
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref UptimeAlertsTopic
+      OKActions:
+        - !Ref UptimeAlertsTopic
+      Dimensions:
+        - Name: HealthCheckId
+          Value: !Ref WebsiteHealthCheck
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-health-percentage-alarm"
+        - Key: Purpose
+          Value: UptimeMonitoring
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Severity
+          Value: Medium
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudWatch Dashboard for Monitoring Visualization
+  UptimeDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${ResourcePrefix}-uptime-dashboard"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Route53", "HealthCheckStatus", "HealthCheckId", "${WebsiteHealthCheck}", {"label": "Health Status (1=Healthy, 0=Unhealthy)"}]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "us-east-1",
+                "title": "Website Health Status - ${WebsiteURL}",
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 1
+                  }
+                },
+                "annotations": {
+                  "horizontal": [
+                    {
+                      "value": 0.5,
+                      "label": "Unhealthy Threshold"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Route53", "HealthCheckPercentHealthy", "HealthCheckId", "${WebsiteHealthCheck}", {"label": "Percentage of Healthy Checkers"}]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "us-east-1",
+                "title": "Health Check Percentage - ${WebsiteURL}",
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 100
+                  }
+                },
+                "annotations": {
+                  "horizontal": [
+                    {
+                      "value": 80,
+                      "label": "Warning Threshold"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Route53", "ConnectionTime", "HealthCheckId", "${WebsiteHealthCheck}", {"label": "Connection Time (ms)", "visible": ${MeasureLatency}}]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "us-east-1",
+                "title": "Response Time Metrics - ${WebsiteURL}",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/events/rule/${ResourcePrefix}' | fields @timestamp, detail.state.value, detail.state.reason\n| filter detail.state.value = \"ALARM\" or detail.state.value = \"OK\"\n| sort @timestamp desc\n| limit 20",
+                "region": "us-east-1",
+                "title": "Recent Alarm State Changes",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+# Stack Outputs
+Outputs:
+  HealthCheckId:
+    Description: Route 53 Health Check ID for monitoring
+    Value: !Ref WebsiteHealthCheck
+    Export:
+      Name: !Sub "${AWS::StackName}-HealthCheckId"
+
+  HealthCheckURL:
+    Description: URL being monitored by the health check
+    Value: !Sub "${Protocol}://${WebsiteURL}:${Port}${MonitoringPath}"
+    Export:
+      Name: !Sub "${AWS::StackName}-MonitoredURL"
+
+  SNSTopicArn:
+    Description: SNS Topic ARN for uptime notifications
+    Value: !Ref UptimeAlertsTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-SNSTopicArn"
+
+  CloudWatchAlarmName:
+    Description: CloudWatch Alarm name for website down detection
+    Value: !Ref WebsiteDownAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-AlarmName"
+
+  HealthPercentageAlarmName:
+    Description: CloudWatch Alarm name for health percentage monitoring
+    Value: !Ref WebsiteHealthPercentageAlarm
+    Export:
+      Name: !Sub "${AWS::StackName}-HealthPercentageAlarmName"
+
+  DashboardName:
+    Description: CloudWatch Dashboard name for monitoring visualization
+    Value: !Ref UptimeDashboard
+    Export:
+      Name: !Sub "${AWS::StackName}-DashboardName"
+
+  DashboardURL:
+    Description: CloudWatch Dashboard URL for easy access
+    Value: !Sub "https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${UptimeDashboard}"
+
+  MonitoringConfiguration:
+    Description: Summary of monitoring configuration
+    Value: !Sub |
+      Monitoring ${WebsiteURL}${MonitoringPath} via ${Protocol} on port ${Port}
+      Check interval: ${RequestInterval}s, Failure threshold: ${FailureThreshold}
+      Notifications sent to: ${NotificationEmail}
+
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for this monitoring setup
+    Value: !Sub |
+      Health Check: $${RequestInterval == 30 ? '0.50' : '2.00'}/month
+      SNS: $0.50/month (first 1M requests free)
+      CloudWatch: $0.30/month (first 10 metrics free)
+      Total: ~$${RequestInterval == 30 ? '1.30' : '2.80'}/month
+
+  DeploymentRegion:
+    Description: AWS Region where resources are deployed
+    Value: !Ref 'AWS::Region'
+    Export:
+      Name: !Sub "${AWS::StackName}-Region"
+
+  StackCreationTime:
+    Description: Timestamp when the stack was created
+    Value: !Sub "${AWS::StackName} created at ${AWS::StackId}"

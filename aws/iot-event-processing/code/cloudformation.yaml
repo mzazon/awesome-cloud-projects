@@ -1,0 +1,751 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'IoT Rules Engine for Event Processing - Complete infrastructure for processing IoT sensor data with automated alerting and storage'
+
+# ====================
+# PARAMETERS
+# ====================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'factory-iot'
+    Description: 'Project name used for resource naming and tagging'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must begin with a letter and contain only alphanumeric characters and hyphens'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name for resource tagging and naming'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for receiving IoT alert notifications'
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  TemperatureThreshold:
+    Type: Number
+    Default: 70
+    MinValue: 0
+    MaxValue: 200
+    Description: 'Temperature threshold (°C) for triggering alerts'
+
+  VibrationThreshold:
+    Type: Number
+    Default: 5.0
+    MinValue: 0
+    MaxValue: 100
+    Description: 'Vibration threshold for motor monitoring alerts'
+
+  DataRetentionDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    MaxValue: 365
+    Description: 'Number of days to retain IoT data in DynamoDB'
+
+  EnableCloudWatchLogging:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable CloudWatch logging for IoT Rules Engine'
+
+# ====================
+# CONDITIONS
+# ====================
+Conditions:
+  CreateCloudWatchLogging: !Equals [!Ref EnableCloudWatchLogging, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+# ====================
+# RESOURCES
+# ====================
+Resources:
+  # DynamoDB Table for IoT Telemetry Data
+  IoTTelemetryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-telemetry-${Environment}'
+      AttributeDefinitions:
+        - AttributeName: 'deviceId'
+          AttributeType: 'S'
+        - AttributeName: 'timestamp'
+          AttributeType: 'N'
+      KeySchema:
+        - AttributeName: 'deviceId'
+          KeyType: 'HASH'
+        - AttributeName: 'timestamp'
+          KeyType: 'RANGE'
+      BillingMode: 'PAY_PER_REQUEST'
+      StreamSpecification:
+        StreamViewType: 'NEW_AND_OLD_IMAGES'
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      TimeToLiveSpecification:
+        AttributeName: 'ttl'
+        Enabled: true
+      BackupPolicy:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Component'
+          Value: 'Data Storage'
+
+  # SNS Topic for IoT Alerts
+  IoTAlertsSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-alerts-${Environment}'
+      DisplayName: !Sub '${ProjectName} IoT Factory Alerts'
+      KmsMasterKeyId: 'alias/aws/sns'
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Component'
+          Value: 'Notifications'
+
+  # SNS Topic Subscription for Email Alerts
+  IoTAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: 'email'
+      TopicArn: !Ref IoTAlertsSnsTopic
+      Endpoint: !Ref NotificationEmail
+
+  # IAM Role for Lambda Function
+  IoTLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: 'IoTProcessingPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:Query'
+                Resource: !GetAtt IoTTelemetryTable.Arn
+              - Effect: 'Allow'
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref IoTAlertsSnsTopic
+              - Effect: 'Allow'
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Component'
+          Value: 'Lambda Execution'
+
+  # Lambda Function for IoT Event Processing
+  IoTEventProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-event-processor-${Environment}'
+      Runtime: 'python3.9'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt IoTLambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref IoTTelemetryTable
+          SNS_TOPIC_ARN: !Ref IoTAlertsSnsTopic
+          TEMPERATURE_THRESHOLD: !Ref TemperatureThreshold
+          VIBRATION_THRESHOLD: !Ref VibrationThreshold
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          
+          # Initialize AWS clients
+          dynamodb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+          
+          # Environment variables
+          TABLE_NAME = os.environ['DYNAMODB_TABLE']
+          SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
+          TEMP_THRESHOLD = float(os.environ['TEMPERATURE_THRESHOLD'])
+          VIBRATION_THRESHOLD = float(os.environ['VIBRATION_THRESHOLD'])
+          
+          def lambda_handler(event, context):
+              """
+              Process IoT events and perform custom business logic
+              """
+              try:
+                  # Parse the incoming IoT message
+                  device_id = event.get('deviceId', 'unknown')
+                  timestamp = event.get('timestamp', int(datetime.now().timestamp()))
+                  
+                  # Process different event types
+                  if 'temperature' in event:
+                      return process_temperature_event(event, device_id, timestamp)
+                  elif 'motorStatus' in event or 'vibration' in event:
+                      return process_motor_event(event, device_id, timestamp)
+                  elif 'eventType' in event:
+                      return process_security_event(event, device_id, timestamp)
+                  else:
+                      return process_general_event(event, device_id, timestamp)
+                      
+              except Exception as e:
+                  print(f"Error processing event: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def process_temperature_event(event, device_id, timestamp):
+              """Process temperature sensor events"""
+              temperature = event.get('temperature', 0)
+              location = event.get('location', 'unknown')
+              
+              # Determine severity based on temperature
+              if temperature > 85:
+                  severity = 'critical'
+              elif temperature > TEMP_THRESHOLD:
+                  severity = 'warning'
+              else:
+                  severity = 'normal'
+              
+              # Store enriched data in DynamoDB
+              table = dynamodb.Table(TABLE_NAME)
+              enriched_data = {
+                  'deviceId': device_id,
+                  'timestamp': timestamp,
+                  'temperature': temperature,
+                  'location': location,
+                  'severity': severity,
+                  'eventType': 'temperature',
+                  'ttl': int((datetime.now() + timedelta(days=90)).timestamp())
+              }
+              
+              table.put_item(Item=enriched_data)
+              
+              # Send alert if critical
+              if severity == 'critical':
+                  send_alert(f"CRITICAL: High temperature detected at {location}: {temperature}°C", device_id)
+              
+              print(f"Processed temperature event from {device_id}: {temperature}°C, severity={severity}")
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': f'Temperature {temperature}°C processed with severity {severity}',
+                      'severity': severity,
+                      'deviceId': device_id
+                  })
+              }
+          
+          def process_motor_event(event, device_id, timestamp):
+              """Process motor controller events"""
+              motor_status = event.get('motorStatus', 'unknown')
+              vibration = event.get('vibration', 0)
+              location = event.get('location', 'unknown')
+              
+              # Determine severity
+              if motor_status == 'error' or vibration > VIBRATION_THRESHOLD:
+                  severity = 'critical'
+              elif motor_status == 'warning' or vibration > (VIBRATION_THRESHOLD * 0.8):
+                  severity = 'warning'
+              else:
+                  severity = 'normal'
+              
+              # Store enriched data
+              table = dynamodb.Table(TABLE_NAME)
+              enriched_data = {
+                  'deviceId': device_id,
+                  'timestamp': timestamp,
+                  'motorStatus': motor_status,
+                  'vibration': vibration,
+                  'location': location,
+                  'severity': severity,
+                  'eventType': 'motor',
+                  'ttl': int((datetime.now() + timedelta(days=90)).timestamp())
+              }
+              
+              table.put_item(Item=enriched_data)
+              
+              # Send alert if critical
+              if severity == 'critical':
+                  send_alert(f"CRITICAL: Motor issue detected at {location}: Status={motor_status}, Vibration={vibration}", device_id)
+              
+              print(f"Processed motor event from {device_id}: status={motor_status}, vibration={vibration}, severity={severity}")
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': f'Motor event processed with severity {severity}',
+                      'severity': severity,
+                      'deviceId': device_id
+                  })
+              }
+          
+          def process_security_event(event, device_id, timestamp):
+              """Process security events"""
+              event_type = event.get('eventType', 'unknown')
+              severity = event.get('severity', 'normal')
+              location = event.get('location', 'unknown')
+              
+              # Store security event
+              table = dynamodb.Table(TABLE_NAME)
+              security_data = {
+                  'deviceId': device_id,
+                  'timestamp': timestamp,
+                  'eventType': event_type,
+                  'severity': severity,
+                  'location': location,
+                  'category': 'security',
+                  'ttl': int((datetime.now() + timedelta(days=365)).timestamp())  # Keep security events longer
+              }
+              
+              table.put_item(Item=security_data)
+              
+              # Always send alert for security events
+              send_alert(f"SECURITY: {event_type} detected at {location}", device_id)
+              
+              print(f"Processed security event from {device_id}: {event_type} at {location}")
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': f'Security event {event_type} processed',
+                      'severity': severity,
+                      'deviceId': device_id
+                  })
+              }
+          
+          def process_general_event(event, device_id, timestamp):
+              """Process general IoT events"""
+              # Store general event data
+              table = dynamodb.Table(TABLE_NAME)
+              general_data = {
+                  'deviceId': device_id,
+                  'timestamp': timestamp,
+                  'data': json.dumps(event),
+                  'eventType': 'general',
+                  'ttl': int((datetime.now() + timedelta(days=30)).timestamp())
+              }
+              
+              table.put_item(Item=general_data)
+              
+              print(f"Processed general event from {device_id}")
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': 'General event processed',
+                      'deviceId': device_id
+                  })
+              }
+          
+          def send_alert(message, device_id):
+              """Send SNS alert notification"""
+              try:
+                  sns.publish(
+                      TopicArn=SNS_TOPIC_ARN,
+                      Message=message,
+                      Subject=f"IoT Alert from {device_id}"
+                  )
+                  print(f"Alert sent: {message}")
+              except Exception as e:
+                  print(f"Error sending alert: {str(e)}")
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Component'
+          Value: 'Event Processing'
+
+  # IAM Role for IoT Rules Engine
+  IoTRulesEngineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-iot-rules-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'iot.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'IoTRulesPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:Query'
+                Resource: !GetAtt IoTTelemetryTable.Arn
+              - Effect: 'Allow'
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref IoTAlertsSnsTopic
+              - Effect: 'Allow'
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: !GetAtt IoTEventProcessorFunction.Arn
+              - Effect: 'Allow'
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/iot/*'
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Component'
+          Value: 'IoT Rules Engine'
+
+  # Lambda Permission for IoT Rules Engine
+  IoTRulesLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IoTEventProcessorFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'iot.amazonaws.com'
+      SourceArn: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:rule/*'
+
+  # CloudWatch Log Group for IoT Rules (Conditional)
+  IoTRulesLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateCloudWatchLogging
+    Properties:
+      LogGroupName: '/aws/iot/rules'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Component'
+          Value: 'IoT Logging'
+
+  # IoT Topic Rule: Temperature Monitoring
+  TemperatureAlertRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub '${ProjectName}TemperatureAlertRule${Environment}'
+      TopicRulePayload:
+        Description: 'Monitor temperature sensors and trigger alerts for high temperatures'
+        Sql: !Sub 'SELECT deviceId, temperature, timestamp() as timestamp FROM "factory/temperature" WHERE temperature > ${TemperatureThreshold}'
+        RuleDisabled: false
+        AwsIotSqlVersion: '2016-03-23'
+        Actions:
+          - DynamoDb:
+              TableName: !Ref IoTTelemetryTable
+              RoleArn: !GetAtt IoTRulesEngineRole.Arn
+              HashKeyField: 'deviceId'
+              HashKeyValue: '${deviceId}'
+              RangeKeyField: 'timestamp'
+              RangeKeyValue: '${timestamp}'
+              PayloadField: 'data'
+          - Sns:
+              TopicArn: !Ref IoTAlertsSnsTopic
+              RoleArn: !GetAtt IoTRulesEngineRole.Arn
+              MessageFormat: 'JSON'
+          - Lambda:
+              FunctionArn: !GetAtt IoTEventProcessorFunction.Arn
+        ErrorAction:
+          CloudwatchMetric:
+            MetricName: 'TemperatureRuleError'
+            MetricNamespace: 'IoTRules'
+            MetricUnit: 'Count'
+            MetricValue: '1'
+            RoleArn: !GetAtt IoTRulesEngineRole.Arn
+
+  # IoT Topic Rule: Motor Status Monitoring
+  MotorStatusRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub '${ProjectName}MotorStatusRule${Environment}'
+      TopicRulePayload:
+        Description: 'Monitor motor controllers for errors and excessive vibration'
+        Sql: !Sub 'SELECT deviceId, motorStatus, vibration, timestamp() as timestamp FROM "factory/motors" WHERE motorStatus = "error" OR vibration > ${VibrationThreshold}'
+        RuleDisabled: false
+        AwsIotSqlVersion: '2016-03-23'
+        Actions:
+          - DynamoDb:
+              TableName: !Ref IoTTelemetryTable
+              RoleArn: !GetAtt IoTRulesEngineRole.Arn
+              HashKeyField: 'deviceId'
+              HashKeyValue: '${deviceId}'
+              RangeKeyField: 'timestamp'
+              RangeKeyValue: '${timestamp}'
+              PayloadField: 'data'
+          - Lambda:
+              FunctionArn: !GetAtt IoTEventProcessorFunction.Arn
+        ErrorAction:
+          CloudwatchMetric:
+            MetricName: 'MotorRuleError'
+            MetricNamespace: 'IoTRules'
+            MetricUnit: 'Count'
+            MetricValue: '1'
+            RoleArn: !GetAtt IoTRulesEngineRole.Arn
+
+  # IoT Topic Rule: Security Event Monitoring
+  SecurityEventRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub '${ProjectName}SecurityEventRule${Environment}'
+      TopicRulePayload:
+        Description: 'Process security events and trigger immediate alerts'
+        Sql: 'SELECT deviceId, eventType, severity, location, timestamp() as timestamp FROM "factory/security" WHERE eventType IN ("intrusion", "unauthorized_access", "door_breach")'
+        RuleDisabled: false
+        AwsIotSqlVersion: '2016-03-23'
+        Actions:
+          - Sns:
+              TopicArn: !Ref IoTAlertsSnsTopic
+              RoleArn: !GetAtt IoTRulesEngineRole.Arn
+              MessageFormat: 'JSON'
+          - DynamoDb:
+              TableName: !Ref IoTTelemetryTable
+              RoleArn: !GetAtt IoTRulesEngineRole.Arn
+              HashKeyField: 'deviceId'
+              HashKeyValue: '${deviceId}'
+              RangeKeyField: 'timestamp'
+              RangeKeyValue: '${timestamp}'
+              PayloadField: 'data'
+          - Lambda:
+              FunctionArn: !GetAtt IoTEventProcessorFunction.Arn
+        ErrorAction:
+          CloudwatchMetric:
+            MetricName: 'SecurityRuleError'
+            MetricNamespace: 'IoTRules'
+            MetricUnit: 'Count'
+            MetricValue: '1'
+            RoleArn: !GetAtt IoTRulesEngineRole.Arn
+
+  # IoT Topic Rule: Data Archival
+  DataArchivalRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub '${ProjectName}DataArchivalRule${Environment}'
+      TopicRulePayload:
+        Description: 'Archive all factory data every 5 minutes for historical analysis'
+        Sql: 'SELECT *, timestamp() as timestamp FROM "factory/+" WHERE timestamp() % 300 = 0'
+        RuleDisabled: false
+        AwsIotSqlVersion: '2016-03-23'
+        Actions:
+          - DynamoDb:
+              TableName: !Ref IoTTelemetryTable
+              RoleArn: !GetAtt IoTRulesEngineRole.Arn
+              HashKeyField: 'deviceId'
+              HashKeyValue: '${deviceId}'
+              RangeKeyField: 'timestamp'
+              RangeKeyValue: '${timestamp}'
+              PayloadField: 'data'
+        ErrorAction:
+          CloudwatchMetric:
+            MetricName: 'ArchivalRuleError'
+            MetricNamespace: 'IoTRules'
+            MetricUnit: 'Count'
+            MetricValue: '1'
+            RoleArn: !GetAtt IoTRulesEngineRole.Arn
+
+  # CloudWatch Alarms for Monitoring
+  HighTemperatureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-high-temperature-${Environment}'
+      AlarmDescription: 'Alert when temperature rule triggers frequently'
+      MetricName: 'RuleMessageMatched'
+      Namespace: 'AWS/IoT'
+      Statistic: 'Sum'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: 'GreaterThanThreshold'
+      Dimensions:
+        - Name: 'RuleName'
+          Value: !Ref TemperatureAlertRule
+      AlarmActions:
+        - !Ref IoTAlertsSnsTopic
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+
+  # CloudWatch Dashboard for IoT Monitoring
+  IoTDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-iot-dashboard-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/IoT", "RuleMessageMatched", "RuleName", "${TemperatureAlertRule}" ],
+                  [ ".", ".", ".", "${MotorStatusRule}" ],
+                  [ ".", ".", ".", "${SecurityEventRule}" ],
+                  [ ".", ".", ".", "${DataArchivalRule}" ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "IoT Rule Message Matches"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${IoTEventProcessorFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${IoTTelemetryTable}" ],
+                  [ ".", "ConsumedWriteCapacityUnits", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "DynamoDB Capacity Usage"
+              }
+            }
+          ]
+        }
+
+# ====================
+# OUTPUTS
+# ====================
+Outputs:
+  IoTTelemetryTableName:
+    Description: 'Name of the DynamoDB table storing IoT telemetry data'
+    Value: !Ref IoTTelemetryTable
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTTelemetryTable'
+
+  IoTTelemetryTableArn:
+    Description: 'ARN of the DynamoDB table'
+    Value: !GetAtt IoTTelemetryTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTTelemetryTableArn'
+
+  IoTAlertsTopicArn:
+    Description: 'ARN of the SNS topic for IoT alerts'
+    Value: !Ref IoTAlertsSnsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTAlertsTopic'
+
+  IoTEventProcessorFunctionName:
+    Description: 'Name of the Lambda function processing IoT events'
+    Value: !Ref IoTEventProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTEventProcessorFunction'
+
+  IoTEventProcessorFunctionArn:
+    Description: 'ARN of the Lambda function'
+    Value: !GetAtt IoTEventProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTEventProcessorFunctionArn'
+
+  IoTRulesEngineRoleArn:
+    Description: 'ARN of the IAM role used by IoT Rules Engine'
+    Value: !GetAtt IoTRulesEngineRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTRulesEngineRole'
+
+  TemperatureRuleName:
+    Description: 'Name of the temperature monitoring rule'
+    Value: !Ref TemperatureAlertRule
+    Export:
+      Name: !Sub '${AWS::StackName}-TemperatureRule'
+
+  MotorStatusRuleName:
+    Description: 'Name of the motor status monitoring rule'
+    Value: !Ref MotorStatusRule
+    Export:
+      Name: !Sub '${AWS::StackName}-MotorStatusRule'
+
+  SecurityEventRuleName:
+    Description: 'Name of the security event monitoring rule'
+    Value: !Ref SecurityEventRule
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityEventRule'
+
+  DataArchivalRuleName:
+    Description: 'Name of the data archival rule'
+    Value: !Ref DataArchivalRule
+    Export:
+      Name: !Sub '${AWS::StackName}-DataArchivalRule'
+
+  DashboardUrl:
+    Description: 'URL to the CloudWatch dashboard'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-iot-dashboard-${Environment}'
+
+  TestCommands:
+    Description: 'Example AWS CLI commands to test the IoT Rules Engine'
+    Value: !Sub |
+      # Test temperature rule:
+      aws iot-data publish --topic "factory/temperature" --payload '{"deviceId":"temp-sensor-01","temperature":80,"location":"production-floor"}'
+      
+      # Test motor rule:
+      aws iot-data publish --topic "factory/motors" --payload '{"deviceId":"motor-ctrl-02","motorStatus":"error","vibration":6.5,"location":"assembly-line"}'
+      
+      # Test security rule:
+      aws iot-data publish --topic "factory/security" --payload '{"deviceId":"security-cam-03","eventType":"intrusion","severity":"high","location":"entrance-door"}'
+      
+      # Query telemetry data:
+      aws dynamodb scan --table-name ${IoTTelemetryTable} --max-items 5

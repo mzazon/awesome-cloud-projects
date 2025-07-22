@@ -1,0 +1,489 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'EC2 Image Builder Pipeline for automated AMI creation with web server setup and security hardening'
+
+Parameters:
+  PipelineName:
+    Type: String
+    Default: 'web-server-pipeline'
+    Description: 'Name for the Image Builder pipeline'
+    AllowedPattern: '^[a-zA-Z0-9-_]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, hyphens, and underscores'
+    
+  InstanceType:
+    Type: String
+    Default: 't3.medium'
+    Description: 'EC2 instance type for build instances'
+    AllowedValues:
+      - 't3.medium'
+      - 't3.large'
+      - 'm5.large'
+      - 'm5.xlarge'
+    ConstraintDescription: 'Must be a valid EC2 instance type'
+    
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC ID where build instances will be launched'
+    
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: 'Subnet ID for build instances (must be in selected VPC)'
+    
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for build notifications (optional)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+    
+  ScheduleEnabled:
+    Type: String
+    Default: 'true'
+    Description: 'Enable weekly scheduled builds'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    
+  DistributionRegions:
+    Type: CommaDelimitedList
+    Default: !Ref AWS::Region
+    Description: 'Comma-delimited list of regions for AMI distribution'
+
+Conditions:
+  EnableNotifications: !Not [!Equals [!Ref NotificationEmail, '']]
+  EnableSchedule: !Equals [!Ref ScheduleEnabled, 'true']
+  MultiRegionDistribution: !Not [!Equals [!Join [',', !Ref DistributionRegions], !Ref AWS::Region]]
+
+Resources:
+  # S3 Bucket for component storage and build logs
+  ImageBuilderS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'image-builder-logs-${AWS::AccountId}-${AWS::Region}-${AWS::StackName}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 30
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${PipelineName}-logs'
+        - Key: Purpose
+          Value: 'Image Builder Logs'
+        - Key: Environment
+          Value: 'Production'
+
+  # IAM Role for EC2 Image Builder instances
+  ImageBuilderInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'ImageBuilderInstanceRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/EC2InstanceProfileForImageBuilder
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: S3LogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub '${ImageBuilderS3Bucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Ref ImageBuilderS3Bucket
+      Tags:
+        - Key: Name
+          Value: !Sub '${PipelineName}-instance-role'
+        - Key: Purpose
+          Value: 'Image Builder Instance'
+
+  # Instance Profile for the IAM Role
+  ImageBuilderInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub 'ImageBuilderInstanceProfile-${AWS::StackName}'
+      Roles:
+        - !Ref ImageBuilderInstanceRole
+
+  # Security Group for Image Builder instances
+  ImageBuilderSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub 'ImageBuilder-SG-${AWS::StackName}'
+      GroupDescription: 'Security group for EC2 Image Builder instances'
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTPS outbound for package downloads'
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTP outbound for package downloads'
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: 'DNS TCP'
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: 'DNS UDP'
+      Tags:
+        - Key: Name
+          Value: !Sub '${PipelineName}-sg'
+        - Key: Purpose
+          Value: 'Image Builder Security'
+
+  # SNS Topic for notifications (conditional)
+  ImageBuilderSNSTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnableNotifications
+    Properties:
+      TopicName: !Sub 'ImageBuilder-Notifications-${AWS::StackName}'
+      DisplayName: 'EC2 Image Builder Notifications'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${PipelineName}-notifications'
+        - Key: Purpose
+          Value: 'Image Builder Notifications'
+
+  # SNS Subscription for email notifications (conditional)
+  ImageBuilderSNSSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: EnableNotifications
+    Properties:
+      Protocol: email
+      TopicArn: !Ref ImageBuilderSNSTopic
+      Endpoint: !Ref NotificationEmail
+
+  # Build Component for Web Server Setup
+  WebServerBuildComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: !Sub '${PipelineName}-web-server-component'
+      Version: '1.0.0'
+      Description: 'Install and configure Apache web server with security hardening'
+      Platform: Linux
+      Data: |
+        name: WebServerSetup
+        description: Install and configure Apache web server with security hardening
+        schemaVersion: 1.0
+        
+        phases:
+          - name: build
+            steps:
+              - name: UpdateSystem
+                action: UpdateOS
+              - name: InstallApache
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - yum update -y
+                    - yum install -y httpd
+                    - systemctl enable httpd
+              - name: ConfigureApache
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - echo '<html><body><h1>Custom Web Server</h1><p>Built with EC2 Image Builder</p></body></html>' > /var/www/html/index.html
+                    - chown apache:apache /var/www/html/index.html
+                    - chmod 644 /var/www/html/index.html
+              - name: SecurityHardening
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - sed -i 's/^#ServerTokens OS/ServerTokens Prod/' /etc/httpd/conf/httpd.conf
+                    - sed -i 's/^#ServerSignature On/ServerSignature Off/' /etc/httpd/conf/httpd.conf
+                    - systemctl start httpd
+          - name: validate
+            steps:
+              - name: ValidateApache
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - systemctl is-active httpd
+                    - curl -f http://localhost/ || exit 1
+          - name: test
+            steps:
+              - name: TestWebServer
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - systemctl status httpd
+                    - curl -s http://localhost/ | grep -q "Custom Web Server" || exit 1
+                    - netstat -tlnp | grep :80 || exit 1
+      Tags:
+        Environment: Production
+        Purpose: WebServer
+        ComponentType: Build
+
+  # Test Component for Validation
+  WebServerTestComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: !Sub '${PipelineName}-web-server-test'
+      Version: '1.0.0'
+      Description: 'Comprehensive testing of web server setup'
+      Platform: Linux
+      Data: |
+        name: WebServerTest
+        description: Comprehensive testing of web server setup
+        schemaVersion: 1.0
+        
+        phases:
+          - name: test
+            steps:
+              - name: ServiceTest
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - echo "Testing Apache service status..."
+                    - systemctl is-enabled httpd
+                    - systemctl is-active httpd
+              - name: ConfigurationTest
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - echo "Testing Apache configuration..."
+                    - httpd -t
+                    - grep -q "ServerTokens Prod" /etc/httpd/conf/httpd.conf || exit 1
+                    - grep -q "ServerSignature Off" /etc/httpd/conf/httpd.conf || exit 1
+              - name: SecurityTest
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - echo "Testing security configurations..."
+                    - curl -I http://localhost/ | grep -q "Apache" && exit 1 || echo "Server signature hidden"
+                    - ss -tlnp | grep :80 | grep -q httpd || exit 1
+              - name: ContentTest
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - echo "Testing web content..."
+                    - curl -s http://localhost/ | grep -q "Custom Web Server" || exit 1
+                    - test -f /var/www/html/index.html || exit 1
+      Tags:
+        Environment: Production
+        Purpose: Testing
+        ComponentType: Test
+
+  # Image Recipe combining base image with components
+  WebServerImageRecipe:
+    Type: AWS::ImageBuilder::ImageRecipe
+    Properties:
+      Name: !Sub '${PipelineName}-web-server-recipe'
+      Version: '1.0.0'
+      Description: 'Web server recipe with security hardening'
+      ParentImage: !Sub 'arn:aws:imagebuilder:${AWS::Region}:aws:image/amazon-linux-2-x86/x.x.x'
+      Components:
+        - ComponentArn: !Ref WebServerBuildComponent
+        - ComponentArn: !Ref WebServerTestComponent
+      BlockDeviceMappings:
+        - DeviceName: '/dev/xvda'
+          Ebs:
+            DeleteOnTermination: true
+            Encrypted: true
+            VolumeSize: 20
+            VolumeType: gp3
+      Tags:
+        Environment: Production
+        Purpose: WebServer
+        RecipeVersion: '1.0.0'
+
+  # Infrastructure Configuration
+  ImageBuilderInfrastructureConfiguration:
+    Type: AWS::ImageBuilder::InfrastructureConfiguration
+    Properties:
+      Name: !Sub '${PipelineName}-infrastructure'
+      Description: 'Infrastructure configuration for web server image builds'
+      InstanceProfileName: !Ref ImageBuilderInstanceProfile
+      InstanceTypes:
+        - !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref ImageBuilderSecurityGroup
+      TerminateInstanceOnFailure: true
+      SnsTopicArn: !If [EnableNotifications, !Ref ImageBuilderSNSTopic, !Ref 'AWS::NoValue']
+      Logging:
+        S3Logs:
+          S3BucketName: !Ref ImageBuilderS3Bucket
+          S3KeyPrefix: 'build-logs/'
+      Tags:
+        Environment: Production
+        Purpose: WebServer
+        InfrastructureType: Build
+
+  # Distribution Configuration
+  ImageBuilderDistributionConfiguration:
+    Type: AWS::ImageBuilder::DistributionConfiguration
+    Properties:
+      Name: !Sub '${PipelineName}-distribution'
+      Description: 'Multi-region distribution for web server AMIs'
+      Distributions: !Split
+        - '|'
+        - !Sub
+          - |
+            ${inner}
+          - inner: !Join
+            - '|'
+            - !Split
+              - ','
+              - !Sub
+                - |
+                  {
+                    "Region": "${region}",
+                    "AmiDistributionConfiguration": {
+                      "Name": "WebServer-{{imagebuilder:buildDate}}-{{imagebuilder:buildVersion}}",
+                      "Description": "Custom web server AMI built with Image Builder",
+                      "AmiTags": {
+                        "Name": "WebServer-AMI",
+                        "Environment": "Production",
+                        "BuildDate": "{{imagebuilder:buildDate}}",
+                        "BuildVersion": "{{imagebuilder:buildVersion}}",
+                        "Recipe": "${PipelineName}-web-server-recipe",
+                        "StackName": "${AWS::StackName}"
+                      }
+                    }
+                  }
+                - region: !Join [',', !Ref DistributionRegions]
+      Tags:
+        Environment: Production
+        Purpose: WebServer
+        DistributionType: MultiRegion
+
+  # Image Pipeline
+  ImageBuilderPipeline:
+    Type: AWS::ImageBuilder::ImagePipeline
+    Properties:
+      Name: !Sub '${PipelineName}'
+      Description: 'Automated web server image building pipeline'
+      ImageRecipeArn: !Ref WebServerImageRecipe
+      InfrastructureConfigurationArn: !Ref ImageBuilderInfrastructureConfiguration
+      DistributionConfigurationArn: !Ref ImageBuilderDistributionConfiguration
+      ImageTestsConfiguration:
+        ImageTestsEnabled: true
+        TimeoutMinutes: 90
+      Schedule: !If
+        - EnableSchedule
+        - ScheduleExpression: 'cron(0 2 * * SUN)'
+          PipelineExecutionStartCondition: 'EXPRESSION_MATCH_AND_DEPENDENCY_UPDATES_AVAILABLE'
+        - !Ref 'AWS::NoValue'
+      Status: ENABLED
+      Tags:
+        Environment: Production
+        Purpose: WebServer
+        PipelineType: Automated
+
+  # CloudWatch Log Group for build logs
+  ImageBuilderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/imagebuilder/${PipelineName}'
+      RetentionInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub '${PipelineName}-logs'
+        - Key: Purpose
+          Value: 'Image Builder Logs'
+
+Outputs:
+  PipelineArn:
+    Description: 'ARN of the created Image Builder pipeline'
+    Value: !Ref ImageBuilderPipeline
+    Export:
+      Name: !Sub '${AWS::StackName}-PipelineArn'
+      
+  PipelineName:
+    Description: 'Name of the created Image Builder pipeline'
+    Value: !Ref ImageBuilderPipeline
+    Export:
+      Name: !Sub '${AWS::StackName}-PipelineName'
+      
+  S3BucketName:
+    Description: 'S3 bucket name for build logs and components'
+    Value: !Ref ImageBuilderS3Bucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3Bucket'
+      
+  SecurityGroupId:
+    Description: 'Security Group ID for Image Builder instances'
+    Value: !Ref ImageBuilderSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroup'
+      
+  InstanceRoleArn:
+    Description: 'ARN of the IAM role for Image Builder instances'
+    Value: !GetAtt ImageBuilderInstanceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceRole'
+      
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for notifications'
+    Value: !If [EnableNotifications, !Ref ImageBuilderSNSTopic, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopic'
+      
+  LogGroupName:
+    Description: 'CloudWatch Log Group name for Image Builder logs'
+    Value: !Ref ImageBuilderLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+      
+  BuildComponentArn:
+    Description: 'ARN of the web server build component'
+    Value: !Ref WebServerBuildComponent
+    Export:
+      Name: !Sub '${AWS::StackName}-BuildComponent'
+      
+  TestComponentArn:
+    Description: 'ARN of the web server test component'
+    Value: !Ref WebServerTestComponent
+    Export:
+      Name: !Sub '${AWS::StackName}-TestComponent'
+      
+  ImageRecipeArn:
+    Description: 'ARN of the image recipe'
+    Value: !Ref WebServerImageRecipe
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageRecipe'
+      
+  InfrastructureConfigurationArn:
+    Description: 'ARN of the infrastructure configuration'
+    Value: !Ref ImageBuilderInfrastructureConfiguration
+    Export:
+      Name: !Sub '${AWS::StackName}-InfrastructureConfig'
+      
+  DistributionConfigurationArn:
+    Description: 'ARN of the distribution configuration'
+    Value: !Ref ImageBuilderDistributionConfiguration
+    Export:
+      Name: !Sub '${AWS::StackName}-DistributionConfig'

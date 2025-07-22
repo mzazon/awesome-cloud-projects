@@ -1,0 +1,466 @@
+# Infrastructure Manager Configuration for Multi-Environment Application Deployment
+# This configuration deploys a complete CI/CD pipeline with Cloud Deploy and Cloud Build
+# for progressive delivery across development, staging, and production environments
+
+# Define imports for Terraform modules
+imports:
+  - path: ../terraform/main.tf
+    name: terraform-config
+
+# Define the deployment configuration
+resources:
+  # Google Cloud Storage bucket for build artifacts
+  - name: build-artifacts-bucket
+    type: gcp-types/storage-v1:bucket
+    properties:
+      name: ${PROJECT_ID}-build-artifacts-${RANDOM_SUFFIX}
+      location: ${REGION}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      labels:
+        environment: cicd
+        component: build-artifacts
+        managed-by: infrastructure-manager
+
+  # Development GKE Autopilot cluster
+  - name: gke-dev-cluster
+    type: gcp-types/container-v1:cluster
+    properties:
+      name: deploy-demo-${RANDOM_SUFFIX}-dev
+      location: ${REGION}
+      # Autopilot configuration for simplified cluster management
+      autopilot:
+        enabled: true
+      # Release channel for automatic updates
+      releaseChannel:
+        channel: REGULAR
+      # Network configuration
+      network: projects/${PROJECT_ID}/global/networks/default
+      subnetwork: projects/${PROJECT_ID}/regions/${REGION}/subnetworks/default
+      # IP allocation policy for pods and services
+      ipAllocationPolicy:
+        useIpAliases: true
+      # Workload Identity for secure service account binding
+      workloadIdentityConfig:
+        workloadPool: ${PROJECT_ID}.svc.id.goog
+      # Resource labels for organization
+      resourceLabels:
+        env: development
+        app: sample-webapp
+        managed-by: infrastructure-manager
+      # Cluster description
+      description: Development environment GKE Autopilot cluster for CI/CD pipeline
+
+  # Staging GKE Autopilot cluster  
+  - name: gke-staging-cluster
+    type: gcp-types/container-v1:cluster
+    properties:
+      name: deploy-demo-${RANDOM_SUFFIX}-staging
+      location: ${REGION}
+      # Autopilot configuration
+      autopilot:
+        enabled: true
+      # Release channel
+      releaseChannel:
+        channel: REGULAR
+      # Network configuration
+      network: projects/${PROJECT_ID}/global/networks/default
+      subnetwork: projects/${PROJECT_ID}/regions/${REGION}/subnetworks/default
+      # IP allocation policy
+      ipAllocationPolicy:
+        useIpAliases: true
+      # Workload Identity
+      workloadIdentityConfig:
+        workloadPool: ${PROJECT_ID}.svc.id.goog
+      # Resource labels
+      resourceLabels:
+        env: staging
+        app: sample-webapp
+        managed-by: infrastructure-manager
+      # Cluster description
+      description: Staging environment GKE Autopilot cluster for CI/CD pipeline
+
+  # Production GKE Autopilot cluster
+  - name: gke-prod-cluster
+    type: gcp-types/container-v1:cluster
+    properties:
+      name: deploy-demo-${RANDOM_SUFFIX}-prod
+      location: ${REGION}
+      # Autopilot configuration
+      autopilot:
+        enabled: true
+      # Release channel
+      releaseChannel:
+        channel: REGULAR
+      # Network configuration
+      network: projects/${PROJECT_ID}/global/networks/default
+      subnetwork: projects/${PROJECT_ID}/regions/${REGION}/subnetworks/default
+      # IP allocation policy
+      ipAllocationPolicy:
+        useIpAliases: true
+      # Workload Identity
+      workloadIdentityConfig:
+        workloadPool: ${PROJECT_ID}.svc.id.goog
+      # Resource labels
+      resourceLabels:
+        env: production
+        app: sample-webapp
+        managed-by: infrastructure-manager
+      # Cluster description
+      description: Production environment GKE Autopilot cluster for CI/CD pipeline
+
+  # Cloud Deploy service account with proper IAM permissions
+  - name: clouddeploy-service-account
+    type: gcp-types/iam-v1:serviceAccount
+    properties:
+      accountId: clouddeploy-sa-${RANDOM_SUFFIX}
+      displayName: Cloud Deploy Service Account
+      description: Service account for Cloud Deploy operations across environments
+      project: ${PROJECT_ID}
+
+  # IAM policy binding for Cloud Deploy service account - Container Admin
+  - name: clouddeploy-sa-container-admin
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${PROJECT_ID}
+      role: roles/container.clusterAdmin
+      member: serviceAccount:$(ref.clouddeploy-service-account.email)
+    metadata:
+      dependsOn:
+        - clouddeploy-service-account
+
+  # IAM policy binding for Cloud Deploy service account - Deploy Job Runner
+  - name: clouddeploy-sa-job-runner
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${PROJECT_ID}
+      role: roles/clouddeploy.jobRunner
+      member: serviceAccount:$(ref.clouddeploy-service-account.email)
+    metadata:
+      dependsOn:
+        - clouddeploy-service-account
+
+  # Cloud Deploy delivery pipeline configuration
+  - name: clouddeploy-pipeline
+    type: gcp-types/clouddeploy-v1:deliveryPipeline
+    properties:
+      name: sample-app-pipeline
+      location: ${REGION}
+      project: ${PROJECT_ID}
+      description: Multi-environment deployment pipeline for sample web application
+      # Serial pipeline progression through environments
+      serialPipeline:
+        stages:
+          # Development stage - no verification, immediate deployment
+          - targetId: dev-target
+            profiles: []
+            strategy:
+              standard:
+                verify: false
+          # Staging stage - with verification enabled
+          - targetId: staging-target
+            profiles: []
+            strategy:
+              standard:
+                verify: true
+          # Production stage - canary deployment with verification
+          - targetId: prod-target
+            profiles: []
+            strategy:
+              canary:
+                runtimeConfig:
+                  kubernetes:
+                    serviceNetworking:
+                      service: prod-sample-webapp-service
+                      deployment: prod-sample-webapp
+                canaryDeployment:
+                  percentages: [25, 50, 100]
+                  verify: true
+      # Suspend pipeline initially (can be resumed after setup)
+      suspended: false
+    metadata:
+      dependsOn:
+        - gke-dev-cluster
+        - gke-staging-cluster
+        - gke-prod-cluster
+        - clouddeploy-service-account
+
+  # Cloud Deploy target for development environment
+  - name: clouddeploy-dev-target
+    type: gcp-types/clouddeploy-v1:target
+    properties:
+      name: dev-target
+      location: ${REGION}
+      project: ${PROJECT_ID}
+      description: Development environment deployment target
+      # GKE cluster reference
+      gke:
+        cluster: projects/${PROJECT_ID}/locations/${REGION}/clusters/$(ref.gke-dev-cluster.name)
+      # Execution configuration
+      executionConfigs:
+        - usages:
+            - RENDER
+            - DEPLOY
+          defaultPool:
+            serviceAccount: $(ref.clouddeploy-service-account.email)
+      # No approval required for development
+      requireApproval: false
+    metadata:
+      dependsOn:
+        - gke-dev-cluster
+        - clouddeploy-service-account
+
+  # Cloud Deploy target for staging environment
+  - name: clouddeploy-staging-target
+    type: gcp-types/clouddeploy-v1:target
+    properties:
+      name: staging-target
+      location: ${REGION}
+      project: ${PROJECT_ID}
+      description: Staging environment deployment target
+      # GKE cluster reference
+      gke:
+        cluster: projects/${PROJECT_ID}/locations/${REGION}/clusters/$(ref.gke-staging-cluster.name)
+      # Execution configuration
+      executionConfigs:
+        - usages:
+            - RENDER
+            - DEPLOY
+          defaultPool:
+            serviceAccount: $(ref.clouddeploy-service-account.email)
+      # Require approval for staging deployments
+      requireApproval: true
+    metadata:
+      dependsOn:
+        - gke-staging-cluster
+        - clouddeploy-service-account
+
+  # Cloud Deploy target for production environment
+  - name: clouddeploy-prod-target
+    type: gcp-types/clouddeploy-v1:target
+    properties:
+      name: prod-target
+      location: ${REGION}
+      project: ${PROJECT_ID}
+      description: Production environment deployment target
+      # GKE cluster reference
+      gke:
+        cluster: projects/${PROJECT_ID}/locations/${REGION}/clusters/$(ref.gke-prod-cluster.name)
+      # Execution configuration
+      executionConfigs:
+        - usages:
+            - RENDER
+            - DEPLOY
+          defaultPool:
+            serviceAccount: $(ref.clouddeploy-service-account.email)
+      # Require approval for production deployments
+      requireApproval: true
+    metadata:
+      dependsOn:
+        - gke-prod-cluster
+        - clouddeploy-service-account
+
+  # Cloud Build trigger for automated builds
+  - name: cloudbuild-trigger
+    type: gcp-types/cloudbuild-v1:trigger
+    properties:
+      name: sample-webapp-trigger
+      project: ${PROJECT_ID}
+      description: Automated build trigger for sample web application
+      # Manual trigger configuration (can be modified for GitHub/Cloud Source Repositories)
+      triggerTemplate:
+        projectId: ${PROJECT_ID}
+        branchName: main
+        repoName: sample-webapp
+      # Build configuration
+      build:
+        # Build steps for container image creation and deployment
+        steps:
+          # Build the container image
+          - name: gcr.io/cloud-builders/docker
+            args:
+              - build
+              - -t
+              - gcr.io/${PROJECT_ID}/sample-webapp:$SHORT_SHA
+              - .
+          # Push the image to Container Registry
+          - name: gcr.io/cloud-builders/docker
+            args:
+              - push
+              - gcr.io/${PROJECT_ID}/sample-webapp:$SHORT_SHA
+          # Prepare deployment manifests
+          - name: gcr.io/cloud-builders/gke-deploy
+            args:
+              - prepare
+              - --filename=k8s/overlays/dev
+              - --image=gcr.io/${PROJECT_ID}/sample-webapp:$SHORT_SHA
+              - --app=sample-webapp
+              - --version=$SHORT_SHA
+              - --namespace=default
+              - --output=output
+          # Create Cloud Deploy release
+          - name: gcr.io/cloud-builders/gcloud
+            args:
+              - deploy
+              - releases
+              - create
+              - release-$SHORT_SHA
+              - --delivery-pipeline=sample-app-pipeline
+              - --region=${REGION}
+              - --source=output
+        # Container images produced by the build
+        images:
+          - gcr.io/${PROJECT_ID}/sample-webapp:$SHORT_SHA
+        # Build options
+        options:
+          logging: CLOUD_LOGGING_ONLY
+          machineType: E2_HIGHCPU_8
+        # Build timeout
+        timeout: 1200s
+      # Substitutions for variable replacement
+      substitutions:
+        _CLOUDDEPLOY_SA_EMAIL: $(ref.clouddeploy-service-account.email)
+      # Disable trigger initially
+      disabled: false
+    metadata:
+      dependsOn:
+        - clouddeploy-pipeline
+        - clouddeploy-service-account
+
+  # IAM policy binding for Cloud Build service account
+  - name: cloudbuild-sa-permissions
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${PROJECT_ID}
+      role: roles/clouddeploy.releaser
+      member: serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com
+
+  # Additional IAM binding for Cloud Build - Container Admin
+  - name: cloudbuild-sa-container-admin
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${PROJECT_ID}
+      role: roles/container.admin
+      member: serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com
+
+# Template variables for customization
+variables:
+  # Project configuration
+  PROJECT_ID:
+    description: Google Cloud Project ID
+    type: string
+    default: my-cicd-project
+    
+  PROJECT_NUMBER:
+    description: Google Cloud Project Number
+    type: string
+    
+  REGION:
+    description: Google Cloud Region for resources
+    type: string
+    default: us-central1
+    
+  ZONE:
+    description: Google Cloud Zone for zonal resources
+    type: string
+    default: us-central1-a
+    
+  # Resource naming
+  RANDOM_SUFFIX:
+    description: Random suffix for unique resource names
+    type: string
+    default: "$(openssl rand -hex 3)"
+    
+  # Application configuration
+  APP_NAME:
+    description: Application name for labeling and identification
+    type: string
+    default: sample-webapp
+    
+  PIPELINE_NAME:
+    description: Cloud Deploy pipeline name
+    type: string
+    default: sample-app-pipeline
+
+# Outputs for verification and integration
+outputs:
+  # Cloud Storage bucket information
+  build_artifacts_bucket:
+    description: Cloud Storage bucket for build artifacts
+    value: $(ref.build-artifacts-bucket.name)
+    
+  # GKE cluster information
+  dev_cluster_name:
+    description: Development GKE cluster name
+    value: $(ref.gke-dev-cluster.name)
+    
+  dev_cluster_endpoint:
+    description: Development GKE cluster endpoint
+    value: $(ref.gke-dev-cluster.endpoint)
+    
+  staging_cluster_name:
+    description: Staging GKE cluster name
+    value: $(ref.gke-staging-cluster.name)
+    
+  staging_cluster_endpoint:
+    description: Staging GKE cluster endpoint
+    value: $(ref.gke-staging-cluster.endpoint)
+    
+  prod_cluster_name:
+    description: Production GKE cluster name
+    value: $(ref.gke-prod-cluster.name)
+    
+  prod_cluster_endpoint:
+    description: Production GKE cluster endpoint
+    value: $(ref.gke-prod-cluster.endpoint)
+    
+  # Cloud Deploy configuration
+  clouddeploy_pipeline:
+    description: Cloud Deploy delivery pipeline name
+    value: $(ref.clouddeploy-pipeline.name)
+    
+  clouddeploy_service_account:
+    description: Cloud Deploy service account email
+    value: $(ref.clouddeploy-service-account.email)
+    
+  # Cloud Build configuration
+  cloudbuild_trigger:
+    description: Cloud Build trigger name
+    value: $(ref.cloudbuild-trigger.name)
+    
+  # Target information
+  dev_target:
+    description: Development deployment target
+    value: $(ref.clouddeploy-dev-target.name)
+    
+  staging_target:
+    description: Staging deployment target
+    value: $(ref.clouddeploy-staging-target.name)
+    
+  prod_target:
+    description: Production deployment target
+    value: $(ref.clouddeploy-prod-target.name)
+
+# Metadata for Infrastructure Manager
+metadata:
+  version: "1.0"
+  description: "Infrastructure Manager configuration for multi-environment CI/CD pipeline with Cloud Deploy and Cloud Build"
+  author: "Google Cloud Infrastructure Manager"
+  created: "2025-07-12"
+  tags:
+    - cicd
+    - clouddeploy
+    - cloudbuild
+    - gke
+    - multi-environment
+    - progressive-delivery

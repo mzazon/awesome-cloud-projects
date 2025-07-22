@@ -1,0 +1,957 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Blockchain-based Voting System using Amazon Managed Blockchain, Lambda, DynamoDB, and EventBridge'
+
+Parameters:
+  VotingSystemName:
+    Type: String
+    Default: 'voting-system'
+    Description: 'Name prefix for all voting system resources'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+
+  BlockchainInstanceType:
+    Type: String
+    Default: 'bc.t3.medium'
+    Description: 'Instance type for the Ethereum blockchain node'
+    AllowedValues:
+      - 'bc.t3.small'
+      - 'bc.t3.medium'
+      - 'bc.t3.large'
+      - 'bc.m5.large'
+      - 'bc.m5.xlarge'
+
+  LambdaRuntime:
+    Type: String
+    Default: 'nodejs18.x'
+    Description: 'Runtime for Lambda functions'
+    AllowedValues:
+      - 'nodejs18.x'
+      - 'nodejs20.x'
+      - 'python3.9'
+      - 'python3.10'
+      - 'python3.11'
+
+  DynamoDBReadCapacity:
+    Type: Number
+    Default: 5
+    Description: 'Read capacity units for DynamoDB tables'
+    MinValue: 1
+    MaxValue: 40000
+
+  DynamoDBWriteCapacity:
+    Type: Number
+    Default: 5
+    Description: 'Write capacity units for DynamoDB tables'
+    MinValue: 1
+    MaxValue: 40000
+
+  NotificationEmail:
+    Type: String
+    Default: 'admin@example.com'
+    Description: 'Email address for voting system notifications'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  EnableEncryption:
+    Type: String
+    Default: 'true'
+    Description: 'Enable encryption for S3 bucket and DynamoDB tables'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  VotingTokenExpirationHours:
+    Type: Number
+    Default: 1
+    Description: 'Expiration time for voting tokens in hours'
+    MinValue: 1
+    MaxValue: 24
+
+Conditions:
+  EnableEncryptionCondition: !Equals [!Ref EnableEncryption, 'true']
+
+Resources:
+  # S3 Bucket for voting data and DApp hosting
+  VotingSystemBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${VotingSystemName}-data-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: VotingDataLifecycle
+            Status: Enabled
+            ExpirationInDays: 2555  # 7 years retention for election records
+            NoncurrentVersionExpirationInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub '${VotingSystemName}-data-bucket'
+        - Key: Purpose
+          Value: 'Blockchain voting system data storage'
+
+  # KMS Key for encryption
+  VotingSystemKMSKey:
+    Type: AWS::KMS::Key
+    Condition: EnableEncryptionCondition
+    Properties:
+      Description: 'KMS key for voting system encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow Lambda functions to use the key
+            Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt VoterAuthLambdaRole.Arn
+                - !GetAtt VoteMonitorLambdaRole.Arn
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:DescribeKey'
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${VotingSystemName}-kms-key'
+        - Key: Purpose
+          Value: 'Voting system encryption'
+
+  # KMS Key Alias
+  VotingSystemKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: EnableEncryptionCondition
+    Properties:
+      AliasName: !Sub 'alias/${VotingSystemName}-key'
+      TargetKeyId: !Ref VotingSystemKMSKey
+
+  # DynamoDB Table for Voter Registry
+  VoterRegistryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${VotingSystemName}-VoterRegistry'
+      AttributeDefinitions:
+        - AttributeName: VoterId
+          AttributeType: S
+        - AttributeName: ElectionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: VoterId
+          KeyType: HASH
+        - AttributeName: ElectionId
+          KeyType: RANGE
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref DynamoDBReadCapacity
+        WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      SSESpecification:
+        SSEEnabled: !If [EnableEncryptionCondition, true, false]
+        KMSMasterKeyId: !If [EnableEncryptionCondition, !Ref VotingSystemKMSKey, !Ref 'AWS::NoValue']
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Name
+          Value: !Sub '${VotingSystemName}-voter-registry'
+        - Key: Purpose
+          Value: 'Voter registration and verification data'
+
+  # DynamoDB Table for Elections
+  ElectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${VotingSystemName}-Elections'
+      AttributeDefinitions:
+        - AttributeName: ElectionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ElectionId
+          KeyType: HASH
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref DynamoDBReadCapacity
+        WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      SSESpecification:
+        SSEEnabled: !If [EnableEncryptionCondition, true, false]
+        KMSMasterKeyId: !If [EnableEncryptionCondition, !Ref VotingSystemKMSKey, !Ref 'AWS::NoValue']
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Name
+          Value: !Sub '${VotingSystemName}-elections'
+        - Key: Purpose
+          Value: 'Election management and status tracking'
+
+  # IAM Role for Voter Authentication Lambda
+  VoterAuthLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${VotingSystemName}-VoterAuthLambdaRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: VoterAuthPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt VoterRegistryTable.Arn
+                  - !GetAtt ElectionsTable.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:DescribeKey
+                Resource: !If [EnableEncryptionCondition, !GetAtt VotingSystemKMSKey.Arn, !Ref 'AWS::NoValue']
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${VotingSystemBucket}/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${VotingSystemName}-voter-auth-role'
+        - Key: Purpose
+          Value: 'Voter authentication Lambda execution role'
+
+  # IAM Role for Vote Monitor Lambda
+  VoteMonitorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${VotingSystemName}-VoteMonitorLambdaRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: VoteMonitorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt VoterRegistryTable.Arn
+                  - !GetAtt ElectionsTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${VotingSystemBucket}/*'
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${VotingSystemName}-vote-monitor-role'
+        - Key: Purpose
+          Value: 'Vote monitoring Lambda execution role'
+
+  # Lambda Function for Voter Authentication
+  VoterAuthLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${VotingSystemName}-VoterAuthentication'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.handler
+      Role: !GetAtt VoterAuthLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          KMS_KEY_ID: !If [EnableEncryptionCondition, !Ref VotingSystemKMSKey, 'default']
+          VOTER_REGISTRY_TABLE: !Ref VoterRegistryTable
+          ELECTIONS_TABLE: !Ref ElectionsTable
+          BUCKET_NAME: !Ref VotingSystemBucket
+          TOKEN_EXPIRATION_HOURS: !Ref VotingTokenExpirationHours
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const crypto = require('crypto');
+
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          const kms = new AWS.KMS();
+
+          exports.handler = async (event) => {
+              try {
+                  const action = event.action;
+                  
+                  switch (action) {
+                      case 'registerVoter':
+                          return await registerVoter(event);
+                      case 'verifyVoter':
+                          return await verifyVoter(event);
+                      case 'generateVotingToken':
+                          return await generateVotingToken(event);
+                      default:
+                          throw new Error(`Unknown action: ${action}`);
+                  }
+                  
+              } catch (error) {
+                  console.error('Error in voter authentication:', error);
+                  return {
+                      statusCode: 400,
+                      body: JSON.stringify({
+                          error: error.message
+                      })
+                  };
+              }
+          };
+
+          async function registerVoter(event) {
+              const { voterId, electionId, identityDocument, publicKey } = event;
+              
+              if (!voterId || !electionId || !identityDocument || !publicKey) {
+                  throw new Error('Missing required fields for voter registration');
+              }
+              
+              const voterIdHash = crypto.createHash('sha256').update(voterId).digest('hex');
+              
+              let encryptedIdentity;
+              if (process.env.KMS_KEY_ID && process.env.KMS_KEY_ID !== 'default') {
+                  const encryptionParams = {
+                      KeyId: process.env.KMS_KEY_ID,
+                      Plaintext: JSON.stringify(identityDocument)
+                  };
+                  
+                  encryptedIdentity = await kms.encrypt(encryptionParams).promise();
+              } else {
+                  encryptedIdentity = { CiphertextBlob: Buffer.from(JSON.stringify(identityDocument)) };
+              }
+              
+              const voterRecord = {
+                  VoterId: voterIdHash,
+                  ElectionId: electionId,
+                  PublicKey: publicKey,
+                  EncryptedIdentity: encryptedIdentity.CiphertextBlob.toString('base64'),
+                  RegistrationTimestamp: Date.now(),
+                  IsVerified: false,
+                  IsActive: true
+              };
+              
+              await dynamodb.put({
+                  TableName: process.env.VOTER_REGISTRY_TABLE,
+                  Item: voterRecord,
+                  ConditionExpression: 'attribute_not_exists(VoterId)'
+              }).promise();
+              
+              return {
+                  statusCode: 200,
+                  body: JSON.stringify({
+                      message: 'Voter registered successfully',
+                      voterIdHash: voterIdHash,
+                      requiresVerification: true
+                  })
+              };
+          }
+
+          async function verifyVoter(event) {
+              const { voterIdHash, electionId, verificationCode } = event;
+              
+              const voterRecord = await dynamodb.get({
+                  TableName: process.env.VOTER_REGISTRY_TABLE,
+                  Key: {
+                      VoterId: voterIdHash,
+                      ElectionId: electionId
+                  }
+              }).promise();
+              
+              if (!voterRecord.Item) {
+                  throw new Error('Voter not found');
+              }
+              
+              const isValidVerification = await validateVerificationCode(verificationCode);
+              
+              if (!isValidVerification) {
+                  throw new Error('Invalid verification code');
+              }
+              
+              await dynamodb.update({
+                  TableName: process.env.VOTER_REGISTRY_TABLE,
+                  Key: {
+                      VoterId: voterIdHash,
+                      ElectionId: electionId
+                  },
+                  UpdateExpression: 'SET IsVerified = :verified, VerificationTimestamp = :timestamp',
+                  ExpressionAttributeValues: {
+                      ':verified': true,
+                      ':timestamp': Date.now()
+                  }
+              }).promise();
+              
+              return {
+                  statusCode: 200,
+                  body: JSON.stringify({
+                      message: 'Voter verified successfully',
+                      isVerified: true
+                  })
+              };
+          }
+
+          async function generateVotingToken(event) {
+              const { voterIdHash, electionId } = event;
+              
+              const voterRecord = await dynamodb.get({
+                  TableName: process.env.VOTER_REGISTRY_TABLE,
+                  Key: {
+                      VoterId: voterIdHash,
+                      ElectionId: electionId
+                  }
+              }).promise();
+              
+              if (!voterRecord.Item || !voterRecord.Item.IsVerified) {
+                  throw new Error('Voter not verified');
+              }
+              
+              const expirationHours = parseInt(process.env.TOKEN_EXPIRATION_HOURS) || 1;
+              const tokenPayload = {
+                  voterIdHash: voterIdHash,
+                  electionId: electionId,
+                  timestamp: Date.now(),
+                  expiresAt: Date.now() + (expirationHours * 60 * 60 * 1000)
+              };
+              
+              let encryptedToken;
+              if (process.env.KMS_KEY_ID && process.env.KMS_KEY_ID !== 'default') {
+                  encryptedToken = await kms.encrypt({
+                      KeyId: process.env.KMS_KEY_ID,
+                      Plaintext: JSON.stringify(tokenPayload)
+                  }).promise();
+              } else {
+                  encryptedToken = { CiphertextBlob: Buffer.from(JSON.stringify(tokenPayload)) };
+              }
+              
+              return {
+                  statusCode: 200,
+                  body: JSON.stringify({
+                      message: 'Voting token generated successfully',
+                      token: encryptedToken.CiphertextBlob.toString('base64'),
+                      expiresAt: tokenPayload.expiresAt
+                  })
+              };
+          }
+
+          async function validateVerificationCode(code) {
+              return code && code.length >= 6;
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub '${VotingSystemName}-voter-auth-lambda'
+        - Key: Purpose
+          Value: 'Voter authentication and verification'
+
+  # Lambda Function for Vote Monitoring
+  VoteMonitorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${VotingSystemName}-VoteMonitoring'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.handler
+      Role: !GetAtt VoteMonitorLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          VOTER_REGISTRY_TABLE: !Ref VoterRegistryTable
+          ELECTIONS_TABLE: !Ref ElectionsTable
+          BUCKET_NAME: !Ref VotingSystemBucket
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          const eventbridge = new AWS.EventBridge();
+          const s3 = new AWS.S3();
+
+          exports.handler = async (event) => {
+              try {
+                  console.log('Processing voting event:', JSON.stringify(event, null, 2));
+                  
+                  const votingEvent = {
+                      eventType: event.eventType || 'UNKNOWN',
+                      electionId: event.electionId,
+                      candidateId: event.candidateId,
+                      voterAddress: event.voterAddress,
+                      transactionHash: event.transactionHash,
+                      blockNumber: event.blockNumber,
+                      timestamp: event.timestamp || Date.now()
+                  };
+                  
+                  switch (votingEvent.eventType) {
+                      case 'VoteCast':
+                          await processVoteCast(votingEvent);
+                          break;
+                      case 'ElectionCreated':
+                          await processElectionCreated(votingEvent);
+                          break;
+                      case 'ElectionEnded':
+                          await processElectionEnded(votingEvent);
+                          break;
+                      case 'CandidateRegistered':
+                          await processCandidateRegistered(votingEvent);
+                          break;
+                      default:
+                          console.log(`Unknown event type: ${votingEvent.eventType}`);
+                  }
+                  
+                  await storeAuditEvent(votingEvent);
+                  
+                  await eventbridge.putEvents({
+                      Entries: [{
+                          Source: 'voting.blockchain',
+                          DetailType: votingEvent.eventType,
+                          Detail: JSON.stringify(votingEvent)
+                      }]
+                  }).promise();
+                  
+                  return {
+                      statusCode: 200,
+                      body: JSON.stringify({
+                          message: 'Voting event processed successfully',
+                          eventType: votingEvent.eventType,
+                          electionId: votingEvent.electionId
+                      })
+                  };
+                  
+              } catch (error) {
+                  console.error('Error processing voting event:', error);
+                  throw error;
+              }
+          };
+
+          async function processVoteCast(event) {
+              console.log(`Processing vote cast: Election ${event.electionId}, Candidate ${event.candidateId}`);
+              
+              await dynamodb.update({
+                  TableName: process.env.ELECTIONS_TABLE,
+                  Key: { ElectionId: event.electionId },
+                  UpdateExpression: 'ADD TotalVotes :increment',
+                  ExpressionAttributeValues: {
+                      ':increment': 1
+                  }
+              }).promise();
+              
+              const voteRecord = {
+                  electionId: event.electionId,
+                  candidateId: event.candidateId,
+                  transactionHash: event.transactionHash,
+                  blockNumber: event.blockNumber,
+                  timestamp: event.timestamp,
+                  voterAddressHash: hashAddress(event.voterAddress)
+              };
+              
+              await s3.putObject({
+                  Bucket: process.env.BUCKET_NAME,
+                  Key: `votes/${event.electionId}/${event.transactionHash}.json`,
+                  Body: JSON.stringify(voteRecord),
+                  ServerSideEncryption: 'AES256'
+              }).promise();
+          }
+
+          async function processElectionCreated(event) {
+              console.log(`Processing election creation: ${event.electionId}`);
+              
+              const electionRecord = {
+                  ElectionId: event.electionId,
+                  CreatedAt: event.timestamp,
+                  Status: 'ACTIVE',
+                  TotalVotes: 0,
+                  LastUpdated: event.timestamp
+              };
+              
+              await dynamodb.put({
+                  TableName: process.env.ELECTIONS_TABLE,
+                  Item: electionRecord
+              }).promise();
+          }
+
+          async function processElectionEnded(event) {
+              console.log(`Processing election end: ${event.electionId}`);
+              
+              await dynamodb.update({
+                  TableName: process.env.ELECTIONS_TABLE,
+                  Key: { ElectionId: event.electionId },
+                  UpdateExpression: 'SET #status = :status, EndedAt = :timestamp',
+                  ExpressionAttributeNames: {
+                      '#status': 'Status'
+                  },
+                  ExpressionAttributeValues: {
+                      ':status': 'ENDED',
+                      ':timestamp': event.timestamp
+                  }
+              }).promise();
+              
+              await generateResultsReport(event.electionId);
+          }
+
+          async function processCandidateRegistered(event) {
+              console.log(`Processing candidate registration: Election ${event.electionId}, Candidate ${event.candidateId}`);
+          }
+
+          async function storeAuditEvent(event) {
+              console.log('AUDIT_EVENT:', JSON.stringify(event));
+          }
+
+          async function generateResultsReport(electionId) {
+              console.log(`Generating results report for election: ${electionId}`);
+              
+              const reportData = {
+                  electionId: electionId,
+                  generatedAt: new Date().toISOString(),
+                  status: 'FINAL',
+                  note: 'Results report generated from blockchain data'
+              };
+              
+              await s3.putObject({
+                  Bucket: process.env.BUCKET_NAME,
+                  Key: `results/${electionId}/final-report.json`,
+                  Body: JSON.stringify(reportData, null, 2),
+                  ContentType: 'application/json'
+              }).promise();
+          }
+
+          function hashAddress(address) {
+              const crypto = require('crypto');
+              return crypto.createHash('sha256').update(address).digest('hex');
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub '${VotingSystemName}-vote-monitor-lambda'
+        - Key: Purpose
+          Value: 'Vote monitoring and event processing'
+
+  # SNS Topic for Voting System Notifications
+  VotingSystemTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${VotingSystemName}-notifications'
+      DisplayName: 'Blockchain Voting System Notifications'
+      KmsMasterKeyId: !If [EnableEncryptionCondition, !Ref VotingSystemKMSKey, 'alias/aws/sns']
+      Tags:
+        - Key: Name
+          Value: !Sub '${VotingSystemName}-notifications'
+        - Key: Purpose
+          Value: 'Voting system event notifications'
+
+  # SNS Subscription for Email Notifications
+  VotingSystemEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref VotingSystemTopic
+      Endpoint: !Ref NotificationEmail
+
+  # EventBridge Rule for Voting Events
+  VotingSystemEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${VotingSystemName}-events'
+      Description: 'Rule for blockchain voting system events'
+      EventPattern:
+        source:
+          - 'voting.blockchain'
+        detail-type:
+          - 'VoteCast'
+          - 'ElectionCreated'
+          - 'ElectionEnded'
+          - 'CandidateRegistered'
+      State: ENABLED
+      Targets:
+        - Arn: !Ref VotingSystemTopic
+          Id: 'VotingSystemSNSTarget'
+
+  # EventBridge Permission for SNS
+  VotingSystemEventBridgePermission:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref VotingSystemTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref VotingSystemTopic
+
+  # CloudWatch Log Group for Voter Auth Lambda
+  VoterAuthLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${VotingSystemName}-VoterAuthentication'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${VotingSystemName}-voter-auth-logs'
+        - Key: Purpose
+          Value: 'Voter authentication Lambda logs'
+
+  # CloudWatch Log Group for Vote Monitor Lambda
+  VoteMonitorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${VotingSystemName}-VoteMonitoring'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${VotingSystemName}-vote-monitor-logs'
+        - Key: Purpose
+          Value: 'Vote monitoring Lambda logs'
+
+  # CloudWatch Alarm for Voter Auth Errors
+  VoterAuthErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${VotingSystemName}-Auth-Errors'
+      AlarmDescription: 'Alert on voter authentication errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref VoterAuthLambda
+      AlarmActions:
+        - !Ref VotingSystemTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${VotingSystemName}-auth-error-alarm'
+        - Key: Purpose
+          Value: 'Monitor voter authentication errors'
+
+  # CloudWatch Alarm for Vote Monitor Errors
+  VoteMonitorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${VotingSystemName}-Monitor-Errors'
+      AlarmDescription: 'Alert on vote monitoring errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref VoteMonitorLambda
+      AlarmActions:
+        - !Ref VotingSystemTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${VotingSystemName}-monitor-error-alarm'
+        - Key: Purpose
+          Value: 'Monitor vote monitoring errors'
+
+  # CloudWatch Dashboard
+  VotingSystemDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${VotingSystemName}-Dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${VoterAuthLambda}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${VoterAuthLambda}"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${VoterAuthLambda}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Voter Authentication Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${VoteMonitorLambda}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${VoteMonitorLambda}"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${VoteMonitorLambda}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Vote Monitoring Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Events", "MatchedEvents", "RuleName", "${VotingSystemEventRule}"],
+                  ["AWS/Events", "InvocationsCount", "RuleName", "${VotingSystemEventRule}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Voting Event Processing"
+              }
+            },
+            {
+              "type": "metric",
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${VoterRegistryTable}"],
+                  ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "${VoterRegistryTable}"],
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${ElectionsTable}"],
+                  ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "${ElectionsTable}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Database Activity"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  VotingSystemBucket:
+    Description: 'S3 bucket for voting system data and DApp hosting'
+    Value: !Ref VotingSystemBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-VotingSystemBucket'
+
+  VoterRegistryTable:
+    Description: 'DynamoDB table for voter registry'
+    Value: !Ref VoterRegistryTable
+    Export:
+      Name: !Sub '${AWS::StackName}-VoterRegistryTable'
+
+  ElectionsTable:
+    Description: 'DynamoDB table for election management'
+    Value: !Ref ElectionsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ElectionsTable'
+
+  VoterAuthLambda:
+    Description: 'Lambda function for voter authentication'
+    Value: !Ref VoterAuthLambda
+    Export:
+      Name: !Sub '${AWS::StackName}-VoterAuthLambda'
+
+  VoteMonitorLambda:
+    Description: 'Lambda function for vote monitoring'
+    Value: !Ref VoteMonitorLambda
+    Export:
+      Name: !Sub '${AWS::StackName}-VoteMonitorLambda'
+
+  VotingSystemKMSKey:
+    Description: 'KMS key for voting system encryption'
+    Value: !If [EnableEncryptionCondition, !Ref VotingSystemKMSKey, 'N/A - Encryption disabled']
+    Export:
+      Name: !Sub '${AWS::StackName}-VotingSystemKMSKey'
+
+  VotingSystemTopic:
+    Description: 'SNS topic for voting system notifications'
+    Value: !Ref VotingSystemTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-VotingSystemTopic'
+
+  VotingSystemEventRule:
+    Description: 'EventBridge rule for voting events'
+    Value: !Ref VotingSystemEventRule
+    Export:
+      Name: !Sub '${AWS::StackName}-VotingSystemEventRule'
+
+  DAppURL:
+    Description: 'URL for the voting DApp interface'
+    Value: !Sub 'https://${VotingSystemBucket}.s3.${AWS::Region}.amazonaws.com/dapp/index.html'
+    Export:
+      Name: !Sub '${AWS::StackName}-DAppURL'
+
+  CloudWatchDashboard:
+    Description: 'CloudWatch dashboard for voting system monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${VotingSystemName}-Dashboard'
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchDashboard'
+
+  DeploymentInstructions:
+    Description: 'Instructions for completing the deployment'
+    Value: !Sub |
+      1. Deploy this CloudFormation stack
+      2. Create blockchain node separately using AWS Managed Blockchain console
+      3. Deploy smart contracts to the blockchain node
+      4. Upload voting DApp files to S3 bucket: ${VotingSystemBucket}
+      5. Configure API Gateway for Lambda function integration
+      6. Test the complete voting system
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentInstructions'

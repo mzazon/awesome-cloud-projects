@@ -1,0 +1,788 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Batch Processing Workloads with AWS Batch
+  This template creates a complete AWS Batch environment for running containerized
+  batch processing workloads including compute environments, job queues, job definitions,
+  ECR repository, IAM roles, S3 storage, and comprehensive CloudWatch monitoring.
+
+# =============================================================================
+# METADATA
+# =============================================================================
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - EnvironmentName
+          - VpcId
+          - SubnetIds
+      - Label:
+          default: "Compute Configuration"
+        Parameters:
+          - MinVCpus
+          - MaxVCpus
+          - DesiredVCpus
+          - InstanceTypes
+          - SpotBidPercentage
+      - Label:
+          default: "Job Configuration"
+        Parameters:
+          - JobTimeoutSeconds
+          - JobLogRetentionDays
+          - ContainerMemory
+          - ContainerVCpus
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableCloudWatchAlarms
+          - AlarmEmail
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - EnableVpcEndpoints
+    ParameterLabels:
+      EnvironmentName:
+        default: "Environment Name"
+      VpcId:
+        default: "VPC ID"
+      SubnetIds:
+        default: "Subnet IDs"
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Description: Name prefix for all resources created by this template
+    Default: batch-processing
+    MinLength: 3
+    MaxLength: 32
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9-]*$
+    ConstraintDescription: Must start with a letter and contain only letters, numbers, and hyphens
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where the compute environment will be created
+    ConstraintDescription: Must be a valid VPC ID
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of subnet IDs for the compute environment (recommend private subnets)
+    ConstraintDescription: Must be valid subnet IDs within the specified VPC
+
+  MinVCpus:
+    Type: Number
+    Description: Minimum number of vCPUs in the compute environment
+    Default: 0
+    MinValue: 0
+    MaxValue: 256
+    ConstraintDescription: Must be between 0 and 256
+
+  MaxVCpus:
+    Type: Number
+    Description: Maximum number of vCPUs in the compute environment
+    Default: 100
+    MinValue: 1
+    MaxValue: 1000
+    ConstraintDescription: Must be between 1 and 1000
+
+  DesiredVCpus:
+    Type: Number
+    Description: Desired number of vCPUs in the compute environment
+    Default: 0
+    MinValue: 0
+    MaxValue: 256
+    ConstraintDescription: Must be between 0 and 256
+
+  InstanceTypes:
+    Type: CommaDelimitedList
+    Description: List of EC2 instance types for the compute environment
+    Default: optimal
+    AllowedValues:
+      - optimal
+      - m5.large,m5.xlarge,m5.2xlarge
+      - c5.large,c5.xlarge,c5.2xlarge
+      - r5.large,r5.xlarge,r5.2xlarge
+
+  SpotBidPercentage:
+    Type: Number
+    Description: Percentage of On-Demand pricing to bid for Spot instances (0 = On-Demand only)
+    Default: 50
+    MinValue: 0
+    MaxValue: 100
+    ConstraintDescription: Must be between 0 and 100
+
+  JobTimeoutSeconds:
+    Type: Number
+    Description: Maximum time in seconds that jobs can run before being terminated
+    Default: 3600
+    MinValue: 60
+    MaxValue: 86400
+    ConstraintDescription: Must be between 60 seconds (1 minute) and 86400 seconds (24 hours)
+
+  JobLogRetentionDays:
+    Type: Number
+    Description: Number of days to retain CloudWatch logs for batch jobs
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    ConstraintDescription: Must be a valid CloudWatch log retention period
+
+  ContainerMemory:
+    Type: Number
+    Description: Memory (in MB) allocated to each container
+    Default: 512
+    MinValue: 128
+    MaxValue: 8192
+    ConstraintDescription: Must be between 128 MB and 8192 MB
+
+  ContainerVCpus:
+    Type: Number
+    Description: Number of vCPUs allocated to each container
+    Default: 1
+    MinValue: 1
+    MaxValue: 8
+    ConstraintDescription: Must be between 1 and 8 vCPUs
+
+  EnableCloudWatchAlarms:
+    Type: String
+    Description: Enable CloudWatch alarms for monitoring batch jobs
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  AlarmEmail:
+    Type: String
+    Description: Email address for CloudWatch alarm notifications (optional)
+    Default: ''
+    AllowedPattern: ^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address or empty
+
+  EnableVpcEndpoints:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Create VPC endpoints for private subnet access
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+
+Conditions:
+  UseSpotInstances: !Not [!Equals [!Ref SpotBidPercentage, 0]]
+  EnableAlarmsCondition: !Equals [!Ref EnableCloudWatchAlarms, 'true']
+  CreateSNSTopicCondition: !And
+    - !Condition EnableAlarmsCondition
+    - !Not [!Equals [!Ref AlarmEmail, '']]
+  CreateVpcEndpoints: !Equals [!Ref EnableVpcEndpoints, 'true']
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # IAM ROLES AND POLICIES
+  # ---------------------------------------------------------------------------
+
+  # AWS Batch Service Role - Allows AWS Batch to call other AWS services
+  BatchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-batch-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: batch.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-batch-service-role'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ECS Instance Role - Role assumed by EC2 instances in the compute environment
+  ECSInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-ecs-instance-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-ecs-instance-role'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ECS Instance Profile - Instance profile for EC2 instances
+  ECSInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${EnvironmentName}-ecs-instance-profile'
+      Roles:
+        - !Ref ECSInstanceRole
+
+  # Job Execution Role - Role for containers to access AWS services
+  JobExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-job-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-job-execution-role'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Job Role - Role for job containers to access AWS services (S3, DynamoDB, etc.)
+  JobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-job-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BatchJobPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: 
+                  - !Sub '${BatchDataBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: 
+                  - !Ref BatchDataBucket
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-job-role'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ---------------------------------------------------------------------------
+  # SECURITY GROUP
+  # ---------------------------------------------------------------------------
+
+  # Security Group for Batch Compute Environment
+  BatchSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EnvironmentName}-batch-sg'
+      GroupDescription: Security group for AWS Batch compute environment
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-batch-sg'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ---------------------------------------------------------------------------
+  # ECR REPOSITORY
+  # ---------------------------------------------------------------------------
+
+  # ECR Repository for storing container images
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${EnvironmentName}-batch-processing'
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: MUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 7
+                },
+                "action": {
+                  "type": "expire"
+                }
+              },
+              {
+                "rulePriority": 2,
+                "selection": {
+                  "tagStatus": "tagged",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-batch-processing'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ---------------------------------------------------------------------------
+  # S3 BUCKET FOR DATA STORAGE
+  # ---------------------------------------------------------------------------
+
+  # S3 Bucket for storing batch job input/output data
+  BatchDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${EnvironmentName}-batch-data-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transition:
+              StorageClass: GLACIER
+              TransitionInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-batch-data'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ---------------------------------------------------------------------------
+  # CLOUDWATCH LOG GROUP
+  # ---------------------------------------------------------------------------
+
+  # CloudWatch Log Group for Batch job logs
+  BatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/batch/${EnvironmentName}'
+      RetentionInDays: !Ref JobLogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-batch-logs'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ---------------------------------------------------------------------------
+  # AWS BATCH RESOURCES
+  # ---------------------------------------------------------------------------
+
+  # Batch Compute Environment - Defines the compute resources for running jobs
+  BatchComputeEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    DependsOn: 
+      - ECSInstanceProfile
+      - BatchServiceRole
+    Properties:
+      ComputeEnvironmentName: !Sub '${EnvironmentName}-compute-env'
+      Type: MANAGED
+      State: ENABLED
+      ServiceRole: !GetAtt BatchServiceRole.Arn
+      ComputeResources:
+        Type: EC2
+        MinvCpus: !Ref MinVCpus
+        MaxvCpus: !Ref MaxVCpus
+        DesiredvCpus: !Ref DesiredVCpus
+        InstanceTypes: !Ref InstanceTypes
+        Subnets: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref BatchSecurityGroup
+        InstanceRole: !GetAtt ECSInstanceProfile.Arn
+        BidPercentage: !If
+          - UseSpotInstances
+          - !Ref SpotBidPercentage
+          - !Ref AWS::NoValue
+        Ec2Configuration:
+          - ImageType: ECS_AL2
+        Tags:
+          Name: !Sub '${EnvironmentName}-batch-instance'
+          Environment: !Ref EnvironmentName
+      Tags:
+        Name: !Sub '${EnvironmentName}-compute-env'
+        Environment: !Ref EnvironmentName
+
+  # Batch Job Queue - Routes jobs to compute environments
+  BatchJobQueue:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      JobQueueName: !Sub '${EnvironmentName}-job-queue'
+      State: ENABLED
+      Priority: 1
+      ComputeEnvironmentOrder:
+        - Order: 1
+          ComputeEnvironment: !Ref BatchComputeEnvironment
+      Tags:
+        Name: !Sub '${EnvironmentName}-job-queue'
+        Environment: !Ref EnvironmentName
+
+  # Batch Job Definition - Template for job execution
+  BatchJobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      JobDefinitionName: !Sub '${EnvironmentName}-job-definition'
+      Type: container
+      ContainerProperties:
+        Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}:latest'
+        Vcpus: !Ref ContainerVCpus
+        Memory: !Ref ContainerMemory
+        JobRoleArn: !GetAtt JobRole.Arn
+        ExecutionRoleArn: !GetAtt JobExecutionRole.Arn
+        Environment:
+          - Name: DATA_SIZE
+            Value: '5000'
+          - Name: PROCESSING_TIME
+            Value: '120'
+          - Name: S3_BUCKET
+            Value: !Ref BatchDataBucket
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref BatchLogGroup
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: batch-job
+      Timeout:
+        AttemptDurationSeconds: !Ref JobTimeoutSeconds
+      Tags:
+        Name: !Sub '${EnvironmentName}-job-definition'
+        Environment: !Ref EnvironmentName
+
+  # ---------------------------------------------------------------------------
+  # SNS TOPIC FOR NOTIFICATIONS (CONDITIONAL)
+  # ---------------------------------------------------------------------------
+
+  # SNS Topic for CloudWatch alarm notifications
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSNSTopicCondition
+    Properties:
+      TopicName: !Sub '${EnvironmentName}-batch-alarms'
+      DisplayName: !Sub 'AWS Batch Alarms - ${EnvironmentName}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-batch-alarms'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # SNS Subscription for email notifications
+  AlarmNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateSNSTopicCondition
+    Properties:
+      TopicArn: !Ref AlarmNotificationTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  # ---------------------------------------------------------------------------
+  # CLOUDWATCH ALARMS (CONDITIONAL)
+  # ---------------------------------------------------------------------------
+
+  # CloudWatch Alarm for failed jobs
+  FailedJobsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlarmsCondition
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-batch-failed-jobs'
+      AlarmDescription: Alert when batch jobs fail
+      MetricName: FailedJobs
+      Namespace: AWS/Batch
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: JobQueue
+          Value: !Ref BatchJobQueue
+      AlarmActions: !If
+        - CreateSNSTopicCondition
+        - [!Ref AlarmNotificationTopic]
+        - []
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for high job queue utilization
+  QueueUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlarmsCondition
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-batch-queue-utilization'
+      AlarmDescription: Alert when job queue has high utilization
+      MetricName: RunnableJobs
+      Namespace: AWS/Batch
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: JobQueue
+          Value: !Ref BatchJobQueue
+      AlarmActions: !If
+        - CreateSNSTopicCondition
+        - [!Ref AlarmNotificationTopic]
+        - []
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for compute environment scaling
+  ComputeEnvironmentScalingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlarmsCondition
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-batch-compute-scaling'
+      AlarmDescription: Alert when compute environment is at maximum capacity
+      MetricName: RunningJobs
+      Namespace: AWS/Batch
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref MaxVCpus
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: JobQueue
+          Value: !Ref BatchJobQueue
+      AlarmActions: !If
+        - CreateSNSTopicCondition
+        - [!Ref AlarmNotificationTopic]
+        - []
+      TreatMissingData: notBreaching
+
+  # VPC Endpoints (Conditional) - For private subnet deployments
+  S3VpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVpcEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+
+  EcrApiVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVpcEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.api'
+      VpcEndpointType: Interface
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref BatchSecurityGroup
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - ecr:GetAuthorizationToken
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+            Resource: '*'
+
+  EcrDkrVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVpcEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.dkr'
+      VpcEndpointType: Interface
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref BatchSecurityGroup
+
+  CloudWatchLogsVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVpcEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.logs'
+      VpcEndpointType: Interface
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref BatchSecurityGroup
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+
+Outputs:
+  # Environment Information
+  EnvironmentName:
+    Description: Name of the batch processing environment
+    Value: !Ref EnvironmentName
+    Export:
+      Name: !Sub '${AWS::StackName}-EnvironmentName'
+
+  # AWS Batch Resources
+  ComputeEnvironmentName:
+    Description: Name of the AWS Batch compute environment
+    Value: !Ref BatchComputeEnvironment
+    Export:
+      Name: !Sub '${AWS::StackName}-ComputeEnvironment'
+
+  ComputeEnvironmentArn:
+    Description: ARN of the AWS Batch compute environment
+    Value: !Ref BatchComputeEnvironment
+    Export:
+      Name: !Sub '${AWS::StackName}-ComputeEnvironmentArn'
+
+  JobQueueName:
+    Description: Name of the AWS Batch job queue
+    Value: !Ref BatchJobQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-JobQueue'
+
+  JobQueueArn:
+    Description: ARN of the AWS Batch job queue
+    Value: !Ref BatchJobQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-JobQueueArn'
+
+  JobDefinitionName:
+    Description: Name of the AWS Batch job definition
+    Value: !Ref BatchJobDefinition
+    Export:
+      Name: !Sub '${AWS::StackName}-JobDefinition'
+
+  JobDefinitionArn:
+    Description: ARN of the AWS Batch job definition
+    Value: !Ref BatchJobDefinition
+    Export:
+      Name: !Sub '${AWS::StackName}-JobDefinitionArn'
+
+  # ECR Repository
+  ECRRepositoryName:
+    Description: Name of the ECR repository
+    Value: !Ref ECRRepository
+    Export:
+      Name: !Sub '${AWS::StackName}-ECRRepository'
+
+  ECRRepositoryUri:
+    Description: URI of the ECR repository
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ECRRepositoryUri'
+
+  # Storage
+  BatchDataBucket:
+    Description: Name of the S3 bucket for batch data
+    Value: !Ref BatchDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBucket'
+
+  # Logging
+  LogGroupName:
+    Description: Name of the CloudWatch log group for batch jobs
+    Value: !Ref BatchLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  LogGroupArn:
+    Description: ARN of the CloudWatch log group for batch jobs
+    Value: !GetAtt BatchLogGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupArn'
+
+  # IAM Roles
+  BatchServiceRoleArn:
+    Description: ARN of the AWS Batch service role
+    Value: !GetAtt BatchServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceRoleArn'
+
+  JobRoleArn:
+    Description: ARN of the job execution role
+    Value: !GetAtt JobRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-JobRoleArn'
+
+  # Monitoring
+  SNSTopicArn:
+    Description: ARN of the SNS topic for alarm notifications
+    Value: !If
+      - CreateSNSTopicCondition
+      - !Ref AlarmNotificationTopic
+      - 'Not Created'
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+    Condition: CreateSNSTopicCondition
+
+  # Usage Instructions
+  SubmitJobCommand:
+    Description: AWS CLI command to submit a job to the queue
+    Value: !Sub |
+      aws batch submit-job \
+        --job-name sample-batch-job \
+        --job-queue ${BatchJobQueue} \
+        --job-definition ${BatchJobDefinition} \
+        --parameters DATA_SIZE=1000,PROCESSING_TIME=60
+
+  MonitorJobsCommand:
+    Description: AWS CLI command to monitor jobs in the queue
+    Value: !Sub |
+      aws batch list-jobs --job-queue ${BatchJobQueue} --job-status RUNNING
+
+  ViewLogsCommand:
+    Description: AWS CLI command to view job logs
+    Value: !Sub |
+      aws logs describe-log-streams --log-group-name ${BatchLogGroup}
+

@@ -1,0 +1,1150 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure for EKS Ingress Controllers with AWS Load Balancer Controller recipe'
+
+# This CloudFormation template creates the complete infrastructure for demonstrating
+# AWS Load Balancer Controller capabilities with EKS, including VPC, EKS cluster,
+# node groups, IAM roles, IRSA setup, and supporting resources for advanced ingress patterns.
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: eks-ingress-demo
+    Description: Name for the EKS cluster
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9\-]*'
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters and hyphens
+    MinLength: 1
+    MaxLength: 100
+
+  KubernetesVersion:
+    Type: String
+    Default: '1.29'
+    Description: Kubernetes version for the EKS cluster
+    AllowedValues:
+      - '1.27'
+      - '1.28'
+      - '1.29'
+      - '1.30'
+
+  NodeGroupInstanceType:
+    Type: String
+    Default: t3.medium
+    Description: EC2 instance type for EKS worker nodes
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - m5.large
+      - m5.xlarge
+      - m5.2xlarge
+      - c5.large
+      - c5.xlarge
+      - c5.2xlarge
+
+  NodeGroupDesiredSize:
+    Type: Number
+    Default: 3
+    Description: Desired number of worker nodes in the node group
+    MinValue: 1
+    MaxValue: 20
+
+  NodeGroupMaxSize:
+    Type: Number
+    Default: 6
+    Description: Maximum number of worker nodes in the node group
+    MinValue: 1
+    MaxValue: 50
+
+  NodeGroupMinSize:
+    Type: Number
+    Default: 1
+    Description: Minimum number of worker nodes in the node group
+    MinValue: 0
+    MaxValue: 10
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: Must be a valid IPv4 CIDR range
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR block for public subnet 1
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: Must be a valid IPv4 CIDR range
+
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR block for public subnet 2
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: Must be a valid IPv4 CIDR range
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.0.10.0/24
+    Description: CIDR block for private subnet 1
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: Must be a valid IPv4 CIDR range
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.0.20.0/24
+    Description: CIDR block for private subnet 2
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: Must be a valid IPv4 CIDR range
+
+  EnableAccessLogging:
+    Type: String
+    Default: 'true'
+    Description: Enable ALB access logging to S3
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableClusterLogging:
+    Type: String
+    Default: 'true'
+    Description: Enable EKS cluster logging
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableNodeGroupSpotInstances:
+    Type: String
+    Default: 'false'
+    Description: Use Spot instances for the node group to reduce costs
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  Environment:
+    Type: String
+    Default: demo
+    Description: Environment tag for resources
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+      - demo
+
+  Team:
+    Type: String
+    Default: platform
+    Description: Team responsible for the resources
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9\-]*'
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters and hyphens
+
+  LoadBalancerControllerVersion:
+    Type: String
+    Default: 'v2.7.2'
+    Description: Version of the AWS Load Balancer Controller to install
+    AllowedPattern: 'v[0-9]+\.[0-9]+\.[0-9]+'
+    ConstraintDescription: Must be in the format vX.Y.Z
+
+Conditions:
+  CreateAccessLogsBucket: !Equals [!Ref EnableAccessLogging, 'true']
+  EnableClusterLoggingCondition: !Equals [!Ref EnableClusterLogging, 'true']
+  UseSpotInstances: !Equals [!Ref EnableNodeGroupSpotInstances, 'true']
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: EKS Cluster Configuration
+        Parameters:
+          - ClusterName
+          - KubernetesVersion
+          - EnableClusterLogging
+      - Label:
+          default: Node Group Configuration
+        Parameters:
+          - NodeGroupInstanceType
+          - NodeGroupDesiredSize
+          - NodeGroupMaxSize
+          - NodeGroupMinSize
+          - EnableNodeGroupSpotInstances
+      - Label:
+          default: Network Configuration
+        Parameters:
+          - VpcCidr
+          - PublicSubnet1Cidr
+          - PublicSubnet2Cidr
+          - PrivateSubnet1Cidr
+          - PrivateSubnet2Cidr
+      - Label:
+          default: Load Balancer Controller Configuration
+        Parameters:
+          - LoadBalancerControllerVersion
+          - EnableAccessLogging
+      - Label:
+          default: Tagging and Environment
+        Parameters:
+          - Environment
+          - Team
+    ParameterLabels:
+      ClusterName:
+        default: EKS Cluster Name
+      KubernetesVersion:
+        default: Kubernetes Version
+      NodeGroupInstanceType:
+        default: Worker Node Instance Type
+      VpcCidr:
+        default: VPC CIDR Block
+      LoadBalancerControllerVersion:
+        default: Load Balancer Controller Version
+
+Resources:
+  # VPC and Networking Resources
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref Team
+        - Key: !Sub 'kubernetes.io/cluster/${ClusterName}'
+          Value: shared
+        - Key: Purpose
+          Value: EKS-LoadBalancer-Demo
+
+  # Internet Gateway for public subnet connectivity
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-igw'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref Team
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # Public Subnets for ALB/NLB placement
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet1Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref Team
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+        - Key: !Sub 'kubernetes.io/cluster/${ClusterName}'
+          Value: shared
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet2Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref Team
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+        - Key: !Sub 'kubernetes.io/cluster/${ClusterName}'
+          Value: shared
+
+  # Private Subnets for EKS worker nodes
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref Team
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+        - Key: !Sub 'kubernetes.io/cluster/${ClusterName}'
+          Value: owned
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref Team
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+        - Key: !Sub 'kubernetes.io/cluster/${ClusterName}'
+          Value: owned
+
+  # NAT Gateways for private subnet internet access
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat-eip-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref Team
+
+  NatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat-eip-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref Team
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref Team
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref Team
+
+  # Route Tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-routes'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref Team
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-routes-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref Team
+
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-routes-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref Team
+
+  DefaultPrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet2
+
+  # Security Groups
+  EKSControlPlaneSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EKS control plane
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-control-plane-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref Team
+
+  # Additional security group for worker nodes
+  EKSNodeGroupSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EKS node group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 1025
+          ToPort: 65535
+          SourceSecurityGroupId: !Ref EKSControlPlaneSecurityGroup
+          Description: Allow inbound traffic from control plane
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref EKSControlPlaneSecurityGroup
+          Description: Allow HTTPS from control plane
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nodegroup-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref Team
+
+  # IAM Roles and Policies
+  EKSClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-cluster-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref Team
+
+  EKSNodeGroupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-nodegroup-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref Team
+
+  # AWS Load Balancer Controller IAM Policy (enhanced with latest permissions)
+  AWSLoadBalancerControllerPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ClusterName}-alb-controller-policy-${AWS::Region}'
+      Description: IAM policy for AWS Load Balancer Controller with enhanced permissions
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - iam:CreateServiceLinkedRole
+            Resource: "*"
+            Condition:
+              StringEquals:
+                "iam:AWSServiceName": elasticloadbalancing.amazonaws.com
+          - Effect: Allow
+            Action:
+              - ec2:DescribeAccountAttributes
+              - ec2:DescribeAddresses
+              - ec2:DescribeAvailabilityZones
+              - ec2:DescribeInternetGateways
+              - ec2:DescribeVpcs
+              - ec2:DescribeVpcPeeringConnections
+              - ec2:DescribeSubnets
+              - ec2:DescribeSecurityGroups
+              - ec2:DescribeInstances
+              - ec2:DescribeNetworkInterfaces
+              - ec2:DescribeTags
+              - ec2:GetCoipPoolUsage
+              - ec2:DescribeCoipPools
+              - elasticloadbalancing:DescribeLoadBalancers
+              - elasticloadbalancing:DescribeLoadBalancerAttributes
+              - elasticloadbalancing:DescribeListeners
+              - elasticloadbalancing:DescribeListenerCertificates
+              - elasticloadbalancing:DescribeSSLPolicies
+              - elasticloadbalancing:DescribeRules
+              - elasticloadbalancing:DescribeTargetGroups
+              - elasticloadbalancing:DescribeTargetGroupAttributes
+              - elasticloadbalancing:DescribeTargetHealth
+              - elasticloadbalancing:DescribeTags
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - cognito-idp:DescribeUserPoolClient
+              - acm:ListCertificates
+              - acm:DescribeCertificate
+              - iam:ListServerCertificates
+              - iam:GetServerCertificate
+              - waf-regional:GetWebACL
+              - waf-regional:GetWebACLForResource
+              - waf-regional:AssociateWebACL
+              - waf-regional:DisassociateWebACL
+              - wafv2:GetWebACL
+              - wafv2:GetWebACLForResource
+              - wafv2:AssociateWebACL
+              - wafv2:DisassociateWebACL
+              - shield:DescribeProtection
+              - shield:CreateProtection
+              - shield:DescribeSubscription
+              - shield:ListProtections
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - ec2:AuthorizeSecurityGroupIngress
+              - ec2:RevokeSecurityGroupIngress
+              - ec2:DeleteSecurityGroup
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - ec2:CreateSecurityGroup
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - ec2:CreateTags
+            Resource: "arn:aws:ec2:*:*:security-group/*"
+            Condition:
+              StringEquals:
+                "ec2:CreateAction": CreateSecurityGroup
+              "Null":
+                "aws:RequestedRegion": "false"
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:CreateLoadBalancer
+              - elasticloadbalancing:CreateTargetGroup
+            Resource: "*"
+            Condition:
+              "Null":
+                "aws:RequestedRegion": "false"
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:CreateListener
+              - elasticloadbalancing:DeleteListener
+              - elasticloadbalancing:CreateRule
+              - elasticloadbalancing:DeleteRule
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:AddTags
+              - elasticloadbalancing:RemoveTags
+            Resource:
+              - "arn:aws:elasticloadbalancing:*:*:targetgroup/*/*"
+              - "arn:aws:elasticloadbalancing:*:*:loadbalancer/net/*/*"
+              - "arn:aws:elasticloadbalancing:*:*:loadbalancer/app/*/*"
+            Condition:
+              "Null":
+                "aws:RequestedRegion": "false"
+                "aws:ResourceTag/elbv2.k8s.aws/cluster": "false"
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:AddTags
+              - elasticloadbalancing:RemoveTags
+            Resource:
+              - "arn:aws:elasticloadbalancing:*:*:listener/net/*/*/*"
+              - "arn:aws:elasticloadbalancing:*:*:listener/app/*/*/*"
+              - "arn:aws:elasticloadbalancing:*:*:listener-rule/net/*/*/*"
+              - "arn:aws:elasticloadbalancing:*:*:listener-rule/app/*/*/*"
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:ModifyLoadBalancerAttributes
+              - elasticloadbalancing:SetIpAddressType
+              - elasticloadbalancing:SetSecurityGroups
+              - elasticloadbalancing:SetSubnets
+              - elasticloadbalancing:DeleteLoadBalancer
+              - elasticloadbalancing:ModifyTargetGroup
+              - elasticloadbalancing:ModifyTargetGroupAttributes
+              - elasticloadbalancing:DeleteTargetGroup
+            Resource: "*"
+            Condition:
+              "Null":
+                "aws:ResourceTag/elbv2.k8s.aws/cluster": "false"
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:RegisterTargets
+              - elasticloadbalancing:DeregisterTargets
+            Resource: "arn:aws:elasticloadbalancing:*:*:targetgroup/*/*"
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:SetWebAcl
+              - elasticloadbalancing:ModifyListener
+              - elasticloadbalancing:AddListenerCertificates
+              - elasticloadbalancing:RemoveListenerCertificates
+              - elasticloadbalancing:ModifyRule
+            Resource: "*"
+
+  # IAM Role for AWS Load Balancer Controller Service Account (IRSA)
+  AWSLoadBalancerControllerRole:
+    Type: AWS::IAM::Role
+    DependsOn: EKSClusterOIDCIdentityProvider
+    Properties:
+      RoleName: !Sub '${ClusterName}-alb-controller-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/${EKSClusterOIDCIssuer}'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                !Sub '${EKSClusterOIDCIssuer}:sub': 'system:serviceaccount:kube-system:aws-load-balancer-controller'
+                !Sub '${EKSClusterOIDCIssuer}:aud': 'sts.amazonaws.com'
+      ManagedPolicyArns:
+        - !Ref AWSLoadBalancerControllerPolicy
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref Team
+
+  # EKS Cluster
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt EKSClusterRole.Arn
+      ResourcesVpcConfig:
+        SecurityGroupIds:
+          - !Ref EKSControlPlaneSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+          - !Ref PublicSubnet1
+          - !Ref PublicSubnet2
+        EndpointConfigPrivate: false
+        EndpointConfigPublic: true
+        PublicAccessCidrs:
+          - 0.0.0.0/0
+      Logging:
+        ClusterLogging:
+          EnabledTypes: !If
+            - EnableClusterLoggingCondition
+            - - Type: api
+              - Type: audit
+              - Type: authenticator
+              - Type: controllerManager
+              - Type: scheduler
+            - !Ref 'AWS::NoValue'
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP
+        BootstrapClusterCreatorAdminPermissions: true
+      Tags:
+        - Key: Name
+          Value: !Ref ClusterName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref Team
+
+  # EKS Node Group
+  EKSNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref ClusterName
+      NodegroupName: !Sub '${ClusterName}-nodegroup'
+      NodeRole: !GetAtt EKSNodeGroupRole.Arn
+      InstanceTypes:
+        - !Ref NodeGroupInstanceType
+      AmiType: AL2_x86_64
+      CapacityType: !If [UseSpotInstances, SPOT, ON_DEMAND]
+      DiskSize: 20
+      ScalingConfig:
+        MinSize: !Ref NodeGroupMinSize
+        MaxSize: !Ref NodeGroupMaxSize
+        DesiredSize: !Ref NodeGroupDesiredSize
+      UpdateConfig:
+        MaxUnavailable: 1
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      RemoteAccess:
+        Ec2SshKey: !Ref 'AWS::NoValue'
+      Labels:
+        Environment: !Ref Environment
+        Team: !Ref Team
+        NodeGroup: !Sub '${ClusterName}-nodegroup'
+      Tags:
+        Environment: !Ref Environment
+        Team: !Ref Team
+        Name: !Sub '${ClusterName}-nodegroup'
+
+  # OIDC Identity Provider for the EKS cluster
+  EKSClusterOIDCIdentityProvider:
+    Type: AWS::IAM::OIDCIdentityProvider
+    Properties:
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 9e99a48a9960b14926bb7f3b02e22da2b0ab7280
+        - a9d53002e97e00e043244f3d170d6f4c414104fd
+      Url: !GetAtt EKSCluster.OpenIdConnectIssuerUrl
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref Team
+
+  # S3 Bucket for ALB Access Logs (conditional)
+  ALBAccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateAccessLogsBucket
+    Properties:
+      BucketName: !Sub '${ClusterName}-alb-access-logs-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 30
+          - Id: TransitionToIA
+            Status: Enabled
+            TransitionInDays: 7
+            StorageClass: STANDARD_IA
+      VersioningConfiguration:
+        Status: Enabled
+      NotificationConfiguration:
+        CloudWatchConfigurations: []
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-alb-access-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Team
+          Value: !Ref Team
+
+  # S3 Bucket Policy for ALB Access Logs
+  ALBAccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateAccessLogsBucket
+    Properties:
+      Bucket: !Ref ALBAccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowALBAccessLogs
+            Effect: Allow
+            Principal:
+              AWS: !Sub
+                - 'arn:aws:iam::${ElbAccountId}:root'
+                - ElbAccountId: !FindInMap
+                  - ELBAccountIdMap
+                  - !Ref 'AWS::Region'
+                  - AccountId
+            Action: s3:PutObject
+            Resource: !Sub '${ALBAccessLogsBucket}/alb-logs/*'
+          - Sid: AllowALBAccessLogsAclCheck
+            Effect: Allow
+            Principal:
+              AWS: !Sub
+                - 'arn:aws:iam::${ElbAccountId}:root'
+                - ElbAccountId: !FindInMap
+                  - ELBAccountIdMap
+                  - !Ref 'AWS::Region'
+                  - AccountId
+            Action: s3:GetBucketAcl
+            Resource: !Ref ALBAccessLogsBucket
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !Sub '${ALBAccessLogsBucket}/*'
+              - !Ref ALBAccessLogsBucket
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+# Custom resource to extract OIDC issuer without https://
+  OIDCIssuerExtractor:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt OIDCIssuerFunction.Arn
+      OIDCIssuerURL: !GetAtt EKSCluster.OpenIdConnectIssuerUrl
+
+  OIDCIssuerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ClusterName}-oidc-issuer-extractor'
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt OIDCIssuerFunctionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import urllib3
+          import boto3
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      return send_response(event, context, 'SUCCESS', {})
+                  
+                  oidc_url = event['ResourceProperties']['OIDCIssuerURL']
+                  # Remove https:// prefix
+                  oidc_issuer = oidc_url.replace('https://', '')
+                  
+                  response_data = {
+                      'OIDCIssuer': oidc_issuer
+                  }
+                  
+                  return send_response(event, context, 'SUCCESS', response_data)
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return send_response(event, context, 'FAILED', {})
+          
+          def send_response(event, context, status, response_data):
+              response_url = event['ResponseURL']
+              response_body = {
+                  'Status': status,
+                  'Reason': f'See CloudWatch Log Stream: {context.log_stream_name}',
+                  'PhysicalResourceId': context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': response_data
+              }
+              
+              json_response_body = json.dumps(response_body)
+              headers = {'content-type': '', 'content-length': str(len(json_response_body))}
+              
+              http = urllib3.PoolManager()
+              response = http.request('PUT', response_url, body=json_response_body, headers=headers)
+              return response
+
+  OIDCIssuerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+# Mapping for ELB service account IDs by region
+Mappings:
+  ELBAccountIdMap:
+    us-east-1:
+      AccountId: 127311923021
+    us-east-2:
+      AccountId: 033677994240
+    us-west-1:
+      AccountId: 027434742980
+    us-west-2:
+      AccountId: 797873946194
+    eu-west-1:
+      AccountId: 156460612806
+    eu-west-2:
+      AccountId: 652711504416
+    eu-west-3:
+      AccountId: 009996457667
+    eu-central-1:
+      AccountId: 054676820928
+    eu-central-2:
+      AccountId: 635631232127
+    eu-north-1:
+      AccountId: 897822967062
+    eu-south-1:
+      AccountId: 635631232127
+    ap-northeast-1:
+      AccountId: 582318560864
+    ap-northeast-2:
+      AccountId: 600734575887
+    ap-northeast-3:
+      AccountId: 383597477331
+    ap-southeast-1:
+      AccountId: 114774131450
+    ap-southeast-2:
+      AccountId: 783225319266
+    ap-southeast-3:
+      AccountId: 589379963580
+    ap-south-1:
+      AccountId: 718504428378
+    ap-south-2:
+      AccountId: 835444307806
+    ap-east-1:
+      AccountId: 754344448648
+    sa-east-1:
+      AccountId: 507241528517
+    ca-central-1:
+      AccountId: 985666609251
+    ca-west-1:
+      AccountId: 761377655179
+    af-south-1:
+      AccountId: 098369216593
+    me-south-1:
+      AccountId: 076674570225
+    me-central-1:
+      AccountId: 582318560864
+
+Outputs:
+  ClusterName:
+    Description: Name of the EKS cluster
+    Value: !Ref EKSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterName'
+
+  ClusterEndpoint:
+    Description: EKS cluster endpoint
+    Value: !GetAtt EKSCluster.Endpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterEndpoint'
+
+  ClusterArn:
+    Description: EKS cluster ARN
+    Value: !GetAtt EKSCluster.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterArn'
+
+  ClusterSecurityGroupId:
+    Description: Security group ID for the EKS cluster
+    Value: !GetAtt EKSCluster.ClusterSecurityGroupId
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterSecurityGroupId'
+
+  ClusterOIDCIssuerURL:
+    Description: OIDC issuer URL for the EKS cluster
+    Value: !GetAtt EKSCluster.OpenIdConnectIssuerUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-OIDCIssuerURL'
+
+  EKSClusterOIDCIssuer:
+    Description: OIDC issuer for the EKS cluster (without https://)
+    Value: !GetAtt OIDCIssuerExtractor.OIDCIssuer
+    Export:
+      Name: !Sub '${AWS::StackName}-OIDCIssuer'
+
+  NodeGroupArn:
+    Description: EKS node group ARN
+    Value: !GetAtt EKSNodeGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-NodeGroupArn'
+
+  VpcId:
+    Description: VPC ID where the EKS cluster is deployed
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+
+  PrivateSubnet1Id:
+    Description: Private subnet 1 ID
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet1'
+
+  PrivateSubnet2Id:
+    Description: Private subnet 2 ID
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet2'
+
+  PublicSubnet1Id:
+    Description: Public subnet 1 ID
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet1'
+
+  PublicSubnet2Id:
+    Description: Public subnet 2 ID
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet2'
+
+  AWSLoadBalancerControllerPolicyArn:
+    Description: ARN of the AWS Load Balancer Controller IAM policy
+    Value: !Ref AWSLoadBalancerControllerPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-ALBControllerPolicyArn'
+
+  AWSLoadBalancerControllerRoleArn:
+    Description: ARN of the AWS Load Balancer Controller IAM role for IRSA
+    Value: !GetAtt AWSLoadBalancerControllerRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ALBControllerRoleArn'
+
+  ALBAccessLogsBucketName:
+    Condition: CreateAccessLogsBucket
+    Description: Name of the S3 bucket for ALB access logs
+    Value: !Ref ALBAccessLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ALBAccessLogsBucket'
+
+  KubectlCommand:
+    Description: Command to configure kubectl for this cluster
+    Value: !Sub 'aws eks update-kubeconfig --region ${AWS::Region} --name ${ClusterName}'
+
+  ServiceAccountManifest:
+    Description: Kubernetes manifest for AWS Load Balancer Controller service account
+    Value: !Sub |
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        labels:
+          app.kubernetes.io/component: controller
+          app.kubernetes.io/name: aws-load-balancer-controller
+        name: aws-load-balancer-controller
+        namespace: kube-system
+        annotations:
+          eks.amazonaws.com/role-arn: ${AWSLoadBalancerControllerRole.Arn}
+
+  HelmInstallCommand:
+    Description: Command to install AWS Load Balancer Controller using Helm
+    Value: !Sub |
+      # Apply the service account manifest first:
+      kubectl apply -f - <<EOF
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        labels:
+          app.kubernetes.io/component: controller
+          app.kubernetes.io/name: aws-load-balancer-controller
+        name: aws-load-balancer-controller
+        namespace: kube-system
+        annotations:
+          eks.amazonaws.com/role-arn: ${AWSLoadBalancerControllerRole.Arn}
+      EOF
+      
+      # Install the controller using Helm:
+      helm repo add eks https://aws.github.io/eks-charts
+      helm repo update
+      helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+        -n kube-system \
+        --set clusterName=${ClusterName} \
+        --set serviceAccount.create=false \
+        --set serviceAccount.name=aws-load-balancer-controller \
+        --set region=${AWS::Region} \
+        --set vpcId=${VPC} \
+        --set image.tag=${LoadBalancerControllerVersion}
+
+  PostDeploymentSteps:
+    Description: Steps to complete after CloudFormation deployment
+    Value: !Sub |
+      1. Configure kubectl: aws eks update-kubeconfig --region ${AWS::Region} --name ${ClusterName}
+      2. Install AWS Load Balancer Controller using the Helm command in the HelmInstallCommand output
+      3. Verify installation: kubectl get deployment -n kube-system aws-load-balancer-controller
+      4. Test with sample ingress resources as shown in the recipe
+      5. Monitor logs: kubectl logs -n kube-system deployment/aws-load-balancer-controller

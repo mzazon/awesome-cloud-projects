@@ -1,0 +1,578 @@
+# Infrastructure Manager Configuration for Personalized Recommendation APIs with Vertex AI and Cloud Run
+# This configuration deploys a complete recommendation system using Google Cloud managed services
+
+# Define metadata for the deployment
+metadata:
+  name: personalized-recommendation-system
+  description: "Serverless recommendation engine with Vertex AI and Cloud Run"
+  version: "1.0"
+  labels:
+    environment: "production"
+    use-case: "recommendation-system"
+    framework: "vertex-ai"
+
+# Define input variables for customization
+variables:
+  # Project configuration
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    required: true
+  
+  # Regional configuration
+  region:
+    description: "Primary region for resource deployment"
+    type: string
+    default: "us-central1"
+  
+  # Naming configuration
+  resource_prefix:
+    description: "Prefix for resource names to ensure uniqueness"
+    type: string
+    default: "rec-system"
+  
+  # Storage configuration
+  bucket_location:
+    description: "Cloud Storage bucket location"
+    type: string
+    default: "US"
+  
+  # Cloud Run configuration
+  service_name:
+    description: "Cloud Run service name"
+    type: string
+    default: "recommendation-api"
+  
+  # Vertex AI configuration
+  model_name:
+    description: "Vertex AI model name"
+    type: string
+    default: "product-recommendations"
+  
+  # BigQuery configuration
+  dataset_name:
+    description: "BigQuery dataset name"
+    type: string
+    default: "user_interactions"
+  
+  # Container configuration
+  container_image:
+    description: "Container image for Cloud Run service"
+    type: string
+    default: "gcr.io/cloudrun/hello"  # Default image, will be updated during deployment
+
+# Define the infrastructure resources
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-aiplatform-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/aiplatform.googleapis.com
+      disableDependentServices: false
+    metadata:
+      dependsOn: []
+  
+  - name: enable-run-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/run.googleapis.com
+      disableDependentServices: false
+    metadata:
+      dependsOn: []
+  
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/storage.googleapis.com
+      disableDependentServices: false
+    metadata:
+      dependsOn: []
+  
+  - name: enable-bigquery-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/bigquery.googleapis.com
+      disableDependentServices: false
+    metadata:
+      dependsOn: []
+  
+  - name: enable-cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/cloudbuild.googleapis.com
+      disableDependentServices: false
+    metadata:
+      dependsOn: []
+
+  # Create Cloud Storage bucket for ML artifacts and data
+  - name: ml-data-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${resource_prefix}-data-${project_id}
+      location: ${bucket_location}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 365
+              matchesStorageClass: ["STANDARD"]
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+              matchesStorageClass: ["STANDARD"]
+      labels:
+        purpose: "machine-learning"
+        component: "data-storage"
+        managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # Create BigQuery dataset for user interaction data
+  - name: user-interactions-dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      datasetId: ${dataset_name}
+      projectId: ${project_id}
+      location: ${region}
+      description: "User interaction data for recommendation system"
+      labels:
+        purpose: "user-analytics"
+        component: "data-warehouse"
+        managed-by: "infrastructure-manager"
+      access:
+        - role: "OWNER"
+          userByEmail: "serviceAccount:${project_id}@appspot.gserviceaccount.com"
+        - role: "READER"
+          specialGroup: "projectReaders"
+        - role: "WRITER"
+          specialGroup: "projectWriters"
+    metadata:
+      dependsOn:
+        - enable-bigquery-api
+
+  # Create BigQuery table for user interactions
+  - name: user-interactions-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      datasetId: ${dataset_name}
+      projectId: ${project_id}
+      tableId: "interactions"
+      description: "User interaction tracking table"
+      labels:
+        purpose: "user-tracking"
+        component: "data-table"
+        managed-by: "infrastructure-manager"
+      schema:
+        fields:
+          - name: "user_id"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Unique identifier for users"
+          - name: "item_id"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Unique identifier for items"
+          - name: "interaction_type"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Type of interaction (view, purchase, rating, etc.)"
+          - name: "rating"
+            type: "FLOAT"
+            mode: "NULLABLE"
+            description: "User rating for the item (1-5 scale)"
+          - name: "timestamp"
+            type: "TIMESTAMP"
+            mode: "REQUIRED"
+            description: "When the interaction occurred"
+          - name: "category"
+            type: "STRING"
+            mode: "NULLABLE"
+            description: "Item category"
+          - name: "features"
+            type: "JSON"
+            mode: "NULLABLE"
+            description: "Additional interaction features"
+      timePartitioning:
+        type: "DAY"
+        field: "timestamp"
+        requirePartitionFilter: false
+      clustering:
+        fields:
+          - "user_id"
+          - "item_id"
+          - "interaction_type"
+    metadata:
+      dependsOn:
+        - user-interactions-dataset
+
+  # Create service account for Vertex AI operations
+  - name: vertex-ai-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: ${resource_prefix}-vertex-ai-sa
+      displayName: "Vertex AI Service Account for Recommendation System"
+      description: "Service account for Vertex AI training and serving operations"
+      project: ${project_id}
+    metadata:
+      dependsOn:
+        - enable-aiplatform-api
+
+  # Grant necessary permissions to Vertex AI service account
+  - name: vertex-ai-sa-aiplatform-user
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: ${project_id}
+      policy:
+        bindings:
+          - role: "roles/aiplatform.user"
+            members:
+              - serviceAccount:${resource_prefix}-vertex-ai-sa@${project_id}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - vertex-ai-service-account
+
+  - name: vertex-ai-sa-storage-objectadmin
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: ${project_id}
+      policy:
+        bindings:
+          - role: "roles/storage.objectAdmin"
+            members:
+              - serviceAccount:${resource_prefix}-vertex-ai-sa@${project_id}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - vertex-ai-service-account
+
+  - name: vertex-ai-sa-bigquery-dataviewer
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: ${project_id}
+      policy:
+        bindings:
+          - role: "roles/bigquery.dataViewer"
+            members:
+              - serviceAccount:${resource_prefix}-vertex-ai-sa@${project_id}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - vertex-ai-service-account
+
+  # Create service account for Cloud Run operations
+  - name: cloud-run-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: ${resource_prefix}-cloudrun-sa
+      displayName: "Cloud Run Service Account for Recommendation API"
+      description: "Service account for Cloud Run recommendation API service"
+      project: ${project_id}
+    metadata:
+      dependsOn:
+        - enable-run-api
+
+  # Grant necessary permissions to Cloud Run service account
+  - name: cloud-run-sa-aiplatform-user
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: ${project_id}
+      policy:
+        bindings:
+          - role: "roles/aiplatform.user"
+            members:
+              - serviceAccount:${resource_prefix}-cloudrun-sa@${project_id}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - cloud-run-service-account
+
+  - name: cloud-run-sa-bigquery-dataeditor
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: ${project_id}
+      policy:
+        bindings:
+          - role: "roles/bigquery.dataEditor"
+            members:
+              - serviceAccount:${resource_prefix}-cloudrun-sa@${project_id}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - cloud-run-service-account
+
+  # Create Vertex AI Endpoint for model serving
+  - name: recommendation-endpoint
+    type: gcp-types/aiplatform-v1:projects.locations.endpoints
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      displayName: ${resource_prefix}-endpoint
+      description: "Vertex AI endpoint for serving recommendation models"
+      labels:
+        purpose: "model-serving"
+        component: "inference-endpoint"
+        managed-by: "infrastructure-manager"
+      encryptionSpec:
+        kmsKeyName: ""  # Use Google-managed encryption
+    metadata:
+      dependsOn:
+        - enable-aiplatform-api
+        - vertex-ai-service-account
+
+  # Create Cloud Run service for the recommendation API
+  - name: recommendation-api-service
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/${project_id}
+      location: ${region}
+      body:
+        apiVersion: serving.knative.dev/v1
+        kind: Service
+        metadata:
+          name: ${service_name}
+          namespace: ${project_id}
+          labels:
+            purpose: "recommendation-api"
+            component: "web-service"
+            managed-by: "infrastructure-manager"
+          annotations:
+            run.googleapis.com/ingress: "all"
+            run.googleapis.com/ingress-status: "all"
+        spec:
+          template:
+            metadata:
+              annotations:
+                # Resource limits and scaling configuration
+                run.googleapis.com/memory: "2Gi"
+                run.googleapis.com/cpu: "2"
+                run.googleapis.com/execution-environment: "gen2"
+                run.googleapis.com/max-scale: "100"
+                run.googleapis.com/min-scale: "0"
+                # Timeout and concurrency settings
+                run.googleapis.com/timeout: "300s"
+                run.googleapis.com/container-concurrency: "80"
+                # Service account configuration
+                run.googleapis.com/service-account: ${resource_prefix}-cloudrun-sa@${project_id}.iam.gserviceaccount.com
+            spec:
+              containers:
+                - name: recommendation-api
+                  image: ${container_image}
+                  ports:
+                    - containerPort: 8080
+                      name: http1
+                  env:
+                    - name: PROJECT_ID
+                      value: ${project_id}
+                    - name: REGION
+                      value: ${region}
+                    - name: ENDPOINT_NAME
+                      value: ${resource_prefix}-endpoint
+                    - name: BUCKET_NAME
+                      value: ${resource_prefix}-data-${project_id}
+                    - name: DATASET_NAME
+                      value: ${dataset_name}
+                  resources:
+                    limits:
+                      memory: "2Gi"
+                      cpu: "2"
+                  # Health checks
+                  livenessProbe:
+                    httpGet:
+                      path: /
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 10
+                    timeoutSeconds: 5
+                    failureThreshold: 3
+                  readinessProbe:
+                    httpGet:
+                      path: /
+                      port: 8080
+                    initialDelaySeconds: 10
+                    periodSeconds: 5
+                    timeoutSeconds: 3
+                    failureThreshold: 2
+    metadata:
+      dependsOn:
+        - enable-run-api
+        - cloud-run-service-account
+
+  # Create IAM policy for Cloud Run service to allow unauthenticated access
+  - name: cloud-run-invoker-policy
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: ${project_id}
+      policy:
+        bindings:
+          - role: "roles/run.invoker"
+            members:
+              - "allUsers"
+    metadata:
+      dependsOn:
+        - recommendation-api-service
+
+  # Create Cloud Monitoring notification channel for alerts
+  - name: monitoring-notification-channel
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      name: projects/${project_id}/notificationChannels/recommendation-system-alerts
+      displayName: "Recommendation System Alerts"
+      description: "Notification channel for recommendation system monitoring"
+      type: "email"
+      labels:
+        email_address: "admin@example.com"  # Replace with actual email
+      enabled: true
+    metadata:
+      dependsOn:
+        - recommendation-api-service
+
+  # Create alerting policy for Cloud Run service
+  - name: cloud-run-error-rate-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: "Cloud Run Error Rate Alert"
+      documentation:
+        content: "Alert when Cloud Run service error rate exceeds 5%"
+        mimeType: "text/markdown"
+      conditions:
+        - displayName: "Error rate condition"
+          conditionThreshold:
+            filter: resource.type="cloud_run_revision" AND resource.label.service_name="${service_name}"
+            comparison: "COMPARISON_GREATER_THAN"
+            thresholdValue: 0.05
+            duration: "300s"
+            aggregations:
+              - alignmentPeriod: "300s"
+                perSeriesAligner: "ALIGN_RATE"
+                crossSeriesReducer: "REDUCE_MEAN"
+                groupByFields:
+                  - "resource.label.service_name"
+      combiner: "OR"
+      enabled: true
+      notificationChannels:
+        - projects/${project_id}/notificationChannels/recommendation-system-alerts
+    metadata:
+      dependsOn:
+        - monitoring-notification-channel
+
+  # Create Cloud Storage bucket for storing deployment artifacts
+  - name: deployment-artifacts-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${resource_prefix}-artifacts-${project_id}
+      location: ${bucket_location}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90
+              matchesStorageClass: ["STANDARD"]
+      labels:
+        purpose: "deployment-artifacts"
+        component: "build-storage"
+        managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+# Define outputs for accessing deployed resources
+outputs:
+  # Project and region information
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${project_id}
+  
+  region:
+    description: "Deployment region"
+    value: ${region}
+  
+  # Storage resources
+  ml_data_bucket_name:
+    description: "Cloud Storage bucket name for ML data"
+    value: ${resource_prefix}-data-${project_id}
+  
+  ml_data_bucket_url:
+    description: "Cloud Storage bucket URL for ML data"
+    value: gs://${resource_prefix}-data-${project_id}
+  
+  artifacts_bucket_name:
+    description: "Cloud Storage bucket name for deployment artifacts"
+    value: ${resource_prefix}-artifacts-${project_id}
+  
+  # BigQuery resources
+  bigquery_dataset_id:
+    description: "BigQuery dataset ID"
+    value: ${dataset_name}
+  
+  bigquery_table_id:
+    description: "BigQuery interactions table ID"
+    value: ${dataset_name}.interactions
+  
+  # Vertex AI resources
+  vertex_ai_endpoint_name:
+    description: "Vertex AI endpoint name"
+    value: ${resource_prefix}-endpoint
+  
+  vertex_ai_endpoint_id:
+    description: "Vertex AI endpoint resource ID"
+    value: $(ref.recommendation-endpoint.name)
+  
+  vertex_ai_service_account:
+    description: "Vertex AI service account email"
+    value: ${resource_prefix}-vertex-ai-sa@${project_id}.iam.gserviceaccount.com
+  
+  # Cloud Run resources
+  cloud_run_service_name:
+    description: "Cloud Run service name"
+    value: ${service_name}
+  
+  cloud_run_service_url:
+    description: "Cloud Run service URL"
+    value: $(ref.recommendation-api-service.status.url)
+  
+  cloud_run_service_account:
+    description: "Cloud Run service account email"
+    value: ${resource_prefix}-cloudrun-sa@${project_id}.iam.gserviceaccount.com
+  
+  # Deployment information
+  deployment_timestamp:
+    description: "Timestamp of deployment"
+    value: $(ref.deployment.timestamp)
+  
+  # Resource labels
+  resource_labels:
+    description: "Common labels applied to resources"
+    value:
+      environment: "production"
+      use-case: "recommendation-system"
+      framework: "vertex-ai"
+      managed-by: "infrastructure-manager"
+
+# Define deployment configuration
+deployment:
+  # Deployment metadata
+  name: personalized-recommendation-system
+  description: "Complete serverless recommendation system deployment"
+  
+  # Resource creation order and dependencies
+  create_policy: "CREATE_OR_ACQUIRE"
+  delete_policy: "DELETE"
+  
+  # Deployment timeout
+  timeout: "1200s"
+  
+  # Preview mode configuration
+  preview: false
+  
+  # Labels for deployment tracking
+  labels:
+    deployment-type: "recommendation-system"
+    deployment-method: "infrastructure-manager"
+    environment: "production"
+    version: "1.0"

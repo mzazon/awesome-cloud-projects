@@ -1,0 +1,584 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Real-time Analytics Dashboard with Kinesis Data Streams, Managed Service for Apache Flink, S3, and QuickSight'
+
+# Template Parameters for customization
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'realtime-analytics'
+    Description: 'Project name used as prefix for resource names'
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+    MinLength: 3
+    MaxLength: 30
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name for resource tagging and configuration'
+
+  KinesisShardCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: 'Number of shards for Kinesis Data Stream (each shard supports 1MB/s or 1000 records/s)'
+
+  FlinkParallelism:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: 'Parallelism setting for Flink application (number of parallel tasks)'
+
+  EnableAutoScaling:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable auto-scaling for Flink application'
+
+  LogLevel:
+    Type: String
+    Default: 'INFO'
+    AllowedValues: ['ERROR', 'WARN', 'INFO', 'DEBUG']
+    Description: 'Log level for Flink application monitoring'
+
+  S3DataRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: 'Number of days to retain processed data in S3 before transitioning to cheaper storage'
+
+# Conditions for conditional resource creation
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  EnableAutoScalingCondition: !Equals [!Ref EnableAutoScaling, 'true']
+
+# Infrastructure Resources
+Resources:
+  # S3 Bucket for storing processed analytics data
+  AnalyticsDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-analytics-data-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: AnalyticsDataLifecycle
+            Status: Enabled
+            Prefix: 'analytics-results/'
+            Transitions:
+              - TransitionInDays: !Ref S3DataRetentionDays
+                StorageClass: STANDARD_IA
+              - TransitionInDays: !If [IsProduction, 90, 60]
+                StorageClass: GLACIER
+              - TransitionInDays: !If [IsProduction, 365, 180]
+                StorageClass: DEEP_ARCHIVE
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: 'analytics-results/'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Real-time analytics data storage'
+
+  # S3 Bucket for Flink application code
+  FlinkCodeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-flink-code-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Flink application code storage'
+
+  # Kinesis Data Stream for real-time data ingestion
+  AnalyticsDataStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${ProjectName}-stream-${Environment}'
+      ShardCount: !Ref KinesisShardCount
+      RetentionPeriodHours: !If [IsProduction, 168, 24]  # 7 days for prod, 1 day for dev/staging
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Real-time data ingestion'
+
+  # IAM Role for Managed Service for Apache Flink application
+  FlinkExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-flink-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: kinesisanalytics.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Policies:
+        - PolicyName: FlinkStreamProcessingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Kinesis Data Stream permissions for reading streaming data
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                  - kinesis:ListStreams
+                Resource: !GetAtt AnalyticsDataStream.Arn
+              # S3 permissions for reading application code and writing processed data
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListMultipartUploadParts
+                  - s3:AbortMultipartUpload
+                Resource:
+                  - !Sub '${AnalyticsDataBucket}/*'
+                  - !Sub '${FlinkCodeBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt AnalyticsDataBucket.Arn
+                  - !GetAtt FlinkCodeBucket.Arn
+              # CloudWatch permissions for monitoring and logging
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: '*'
+              # KMS permissions for encrypted resources
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': 
+                      - !Sub 'kinesis.${AWS::Region}.amazonaws.com'
+                      - !Sub 's3.${AWS::Region}.amazonaws.com'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Flink application execution role'
+
+  # Managed Service for Apache Flink Application
+  FlinkAnalyticsApplication:
+    Type: AWS::KinesisAnalyticsV2::Application
+    Properties:
+      ApplicationName: !Sub '${ProjectName}-flink-app-${Environment}'
+      ApplicationDescription: !Sub 'Real-time analytics application for ${ProjectName} ${Environment} environment'
+      RuntimeEnvironment: FLINK-1_18
+      ServiceExecutionRole: !GetAtt FlinkExecutionRole.Arn
+      ApplicationConfiguration:
+        # Application code configuration pointing to S3 JAR file
+        ApplicationCodeConfiguration:
+          CodeContent:
+            S3ContentLocation:
+              BucketARN: !GetAtt FlinkCodeBucket.Arn
+              FileKey: 'flink-analytics-app-1.0.jar'
+          CodeContentType: ZIPFILE
+        # Environment properties passed to the Flink application
+        EnvironmentProperties:
+          PropertyGroups:
+            - PropertyGroupId: 'kinesis.analytics.flink.run.options'
+              PropertyMap:
+                'input.stream.name': !Ref AnalyticsDataStream
+                'aws.region': !Ref AWS::Region
+                's3.path': !Sub 's3://${AnalyticsDataBucket}/analytics-results/'
+                'checkpoint.interval': '60000'  # 1 minute checkpoint interval
+                'parallelism.default': !Ref FlinkParallelism
+        # Flink-specific application configuration
+        FlinkApplicationConfiguration:
+          CheckpointConfiguration:
+            ConfigurationType: CUSTOM
+            CheckpointingEnabled: true
+            CheckpointInterval: 60000  # 1 minute
+            MinPauseBetweenCheckpoints: 5000
+            CheckpointingMode: EXACTLY_ONCE
+          MonitoringConfiguration:
+            ConfigurationType: CUSTOM
+            LogLevel: !Ref LogLevel
+            MetricsLevel: APPLICATION
+          ParallelismConfiguration:
+            ConfigurationType: CUSTOM
+            Parallelism: !Ref FlinkParallelism
+            ParallelismPerKPU: 1
+            AutoScalingEnabled: !If [EnableAutoScalingCondition, true, false]
+        # Application snapshots for state recovery
+        ApplicationSnapshotConfiguration:
+          SnapshotsEnabled: !If [IsProduction, true, false]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Real-time stream processing application'
+
+  # CloudWatch Log Group for Flink application logs
+  FlinkLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/kinesisanalytics/${ProjectName}-flink-app-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Flink application logs'
+
+  # CloudWatch Dashboard for monitoring real-time analytics
+  AnalyticsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-analytics-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Kinesis", "IncomingRecords", "StreamName", "${AnalyticsDataStream}" ],
+                  [ ".", "IncomingBytes", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "period": 300,
+                "title": "Kinesis Stream Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/KinesisAnalytics", "numRecordsInPerSecond", "Application", "${ProjectName}-flink-app-${Environment}" ],
+                  [ ".", "numRecordsOutPerSecond", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "period": 300,
+                "title": "Flink Application Throughput"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/kinesisanalytics/${ProjectName}-flink-app-${Environment}'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Flink Application Logs"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms for monitoring application health
+  HighKinesisIncomingRecordsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-high-kinesis-records-${Environment}'
+      AlarmDescription: 'High number of incoming records to Kinesis stream'
+      MetricName: IncomingRecords
+      Namespace: AWS/Kinesis
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: StreamName
+          Value: !Ref AnalyticsDataStream
+      TreatMissingData: notBreaching
+
+  FlinkApplicationDowntimeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-flink-downtime-${Environment}'
+      AlarmDescription: 'Flink application experiencing downtime'
+      MetricName: downtime
+      Namespace: AWS/KinesisAnalytics
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Application
+          Value: !Sub '${ProjectName}-flink-app-${Environment}'
+      TreatMissingData: breaching
+
+  # QuickSight Data Source IAM Role
+  QuickSightServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-quicksight-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: quicksight.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: QuickSightS3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt AnalyticsDataBucket.Arn
+                  - !Sub '${AnalyticsDataBucket}/analytics-results/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'QuickSight data access role'
+
+  # Lambda function for QuickSight manifest file creation
+  CreateQuickSightManifestFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-create-manifest-${Environment}'
+      Description: 'Creates QuickSight manifest file for S3 data source'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt QuickSightManifestLambdaRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref AnalyticsDataBucket
+          MANIFEST_KEY: 'quicksight-manifest.json'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          
+          def lambda_handler(event, context):
+              try:
+                  bucket_name = event['ResourceProperties']['BucketName']
+                  manifest_key = event['ResourceProperties']['ManifestKey']
+                  
+                  manifest_content = {
+                      "fileLocations": [
+                          {
+                              "URIPrefixes": [
+                                  f"s3://{bucket_name}/analytics-results/"
+                              ]
+                          }
+                      ],
+                      "globalUploadSettings": {
+                          "format": "JSON",
+                          "delimiter": ","
+                      }
+                  }
+                  
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      s3 = boto3.client('s3')
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key=manifest_key,
+                          Body=json.dumps(manifest_content, indent=2),
+                          ContentType='application/json'
+                      )
+                      print(f"Created manifest file at s3://{bucket_name}/{manifest_key}")
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'ManifestLocation': f's3://{bucket_name}/{manifest_key}'
+                  })
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for QuickSight manifest Lambda function
+  QuickSightManifestLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3ManifestWritePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub '${AnalyticsDataBucket}/*'
+
+  # Custom resource to trigger manifest creation
+  QuickSightManifestCreation:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt CreateQuickSightManifestFunction.Arn
+      BucketName: !Ref AnalyticsDataBucket
+      ManifestKey: 'quicksight-manifest.json'
+
+# Stack Outputs providing important resource information
+Outputs:
+  KinesisDataStreamName:
+    Description: 'Name of the Kinesis Data Stream for data ingestion'
+    Value: !Ref AnalyticsDataStream
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisStreamName'
+
+  KinesisDataStreamArn:
+    Description: 'ARN of the Kinesis Data Stream'
+    Value: !GetAtt AnalyticsDataStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisStreamArn'
+
+  FlinkApplicationName:
+    Description: 'Name of the Managed Service for Apache Flink application'
+    Value: !Ref FlinkAnalyticsApplication
+    Export:
+      Name: !Sub '${AWS::StackName}-FlinkAppName'
+
+  AnalyticsDataBucketName:
+    Description: 'S3 bucket name for storing processed analytics data'
+    Value: !Ref AnalyticsDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AnalyticsBucket'
+
+  FlinkCodeBucketName:
+    Description: 'S3 bucket name for Flink application code'
+    Value: !Ref FlinkCodeBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-FlinkCodeBucket'
+
+  FlinkExecutionRoleArn:
+    Description: 'ARN of the IAM role used by Flink application'
+    Value: !GetAtt FlinkExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FlinkRoleArn'
+
+  CloudWatchDashboardURL:
+    Description: 'URL to the CloudWatch dashboard for monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-analytics-${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  QuickSightManifestLocation:
+    Description: 'S3 location of the QuickSight manifest file'
+    Value: !GetAtt QuickSightManifestCreation.ManifestLocation
+    Export:
+      Name: !Sub '${AWS::StackName}-QuickSightManifest'
+
+  SampleDataGeneratorCommand:
+    Description: 'AWS CLI command to put sample data into the Kinesis stream'
+    Value: !Sub |
+      aws kinesis put-record \
+        --stream-name ${AnalyticsDataStream} \
+        --partition-key "test-key" \
+        --data '{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","event_type":"page_view","user_id":"user_123","value":42}' \
+        --region ${AWS::Region}
+
+  NextSteps:
+    Description: 'Next steps to complete the setup'
+    Value: !Sub |
+      1. Upload your Flink application JAR to s3://${FlinkCodeBucket}/flink-analytics-app-1.0.jar
+      2. Start the Flink application: aws kinesisanalyticsv2 start-application --application-name ${FlinkAnalyticsApplication}
+      3. Set up QuickSight data source using S3 bucket: ${AnalyticsDataBucket}
+      4. Use manifest file: s3://${AnalyticsDataBucket}/quicksight-manifest.json
+      5. Generate test data using the sample command provided in outputs

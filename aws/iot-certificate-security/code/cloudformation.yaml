@@ -1,0 +1,899 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure as Code for IoT Security with Device Certificates and Policies'
+
+# This CloudFormation template deploys a comprehensive IoT security framework using
+# AWS IoT Core's X.509 certificate-based authentication with fine-grained security policies.
+# It includes Device Defender monitoring, CloudWatch alerting, and automated compliance checking.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'iot-security-demo'
+    Description: 'Name prefix for all resources'
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+
+  ThingTypeName:
+    Type: String
+    Default: 'IndustrialSensor'
+    Description: 'Name for the IoT Thing Type'
+    AllowedPattern: '^[a-zA-Z0-9_-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, underscores, and hyphens'
+
+  DevicePrefix:
+    Type: String
+    Default: 'sensor'
+    Description: 'Prefix for device names'
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+
+  NumberOfDevices:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 100
+    Description: 'Number of IoT devices to create (1-100)'
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: 'CloudWatch log retention period in days'
+
+  SecurityProfileName:
+    Type: String
+    Default: 'IndustrialSensorSecurity'
+    Description: 'Name for the Device Defender security profile'
+    AllowedPattern: '^[a-zA-Z0-9_-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, underscores, and hyphens'
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for security alerts (optional)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+Conditions:
+  CreateEmailNotification: !Not [!Equals [!Ref NotificationEmail, '']]
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Project Configuration'
+        Parameters:
+          - ProjectName
+          - ThingTypeName
+          - DevicePrefix
+          - NumberOfDevices
+      - Label:
+          default: 'Security Configuration'
+        Parameters:
+          - SecurityProfileName
+          - LogRetentionDays
+      - Label:
+          default: 'Notification Configuration'
+        Parameters:
+          - NotificationEmail
+    ParameterLabels:
+      ProjectName:
+        default: 'Project Name'
+      ThingTypeName:
+        default: 'Thing Type Name'
+      DevicePrefix:
+        default: 'Device Name Prefix'
+      NumberOfDevices:
+        default: 'Number of Devices'
+      SecurityProfileName:
+        default: 'Security Profile Name'
+      LogRetentionDays:
+        default: 'Log Retention (Days)'
+      NotificationEmail:
+        default: 'Alert Email Address'
+
+Resources:
+  # ========================================
+  # IAM Roles and Policies
+  # ========================================
+
+  # IAM role for IoT logging
+  IoTLoggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-IoTLoggingRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/IoTLogsDeliveryRolePolicy
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'IoT Logging'
+
+  # IAM role for Lambda security processor
+  SecurityProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-SecurityProcessorRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt SecurityEventsTable.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Security Processing'
+
+  # IAM role for Lambda quarantine processor
+  QuarantineProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-QuarantineProcessorRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: IoTManagement
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iot:ListThingPrincipals
+                  - iot:ListAttachedPolicies
+                  - iot:DetachPolicy
+                  - iot:AttachPolicy
+                  - iot:CreatePolicy
+                  - iot:GetPolicy
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Device Quarantine'
+
+  # IAM role for certificate rotation
+  CertificateRotationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-CertificateRotationRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CertificateManagement
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iot:ListCertificates
+                  - iot:DescribeCertificate
+                  - iot:UpdateCertificate
+                  - iot:CreateKeysAndCertificate
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Certificate Rotation'
+
+  # ========================================
+  # IoT Core Resources
+  # ========================================
+
+  # Thing Type for industrial sensors
+  IndustrialSensorThingType:
+    Type: AWS::IoT::ThingType
+    Properties:
+      ThingTypeName: !Ref ThingTypeName
+      ThingTypeDescription: 'Industrial IoT sensors with security controls'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: DeviceType
+          Value: 'IndustrialSensor'
+
+  # Thing Group for organizing devices
+  IndustrialSensorsThingGroup:
+    Type: AWS::IoT::ThingGroup
+    Properties:
+      ThingGroupName: 'IndustrialSensors'
+      ThingGroupProperties:
+        ThingGroupDescription: 'Industrial sensor devices'
+        AttributePayload:
+          Attributes:
+            deviceCategory: 'industrial'
+            securityLevel: 'high'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Device Organization'
+
+  # Restrictive IoT Policy for sensors
+  RestrictiveSensorPolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: 'RestrictiveSensorPolicy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow connection only if thing is attached to certificate
+          - Effect: Allow
+            Action: 'iot:Connect'
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/${iot:Connection.Thing.ThingName}'
+            Condition:
+              Bool:
+                'iot:Connection.Thing.IsAttached': 'true'
+          # Allow publishing to device-specific telemetry and status topics
+          - Effect: Allow
+            Action: 'iot:Publish'
+            Resource:
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/sensors/${iot:Connection.Thing.ThingName}/telemetry'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/sensors/${iot:Connection.Thing.ThingName}/status'
+          # Allow subscription to device-specific command and config topics
+          - Effect: Allow
+            Action: 'iot:Subscribe'
+            Resource:
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/sensors/${iot:Connection.Thing.ThingName}/commands'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/sensors/${iot:Connection.Thing.ThingName}/config'
+          # Allow receiving messages on subscribed topics
+          - Effect: Allow
+            Action: 'iot:Receive'
+            Resource:
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/sensors/${iot:Connection.Thing.ThingName}/commands'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/sensors/${iot:Connection.Thing.ThingName}/config'
+          # Allow device shadow operations
+          - Effect: Allow
+            Action:
+              - 'iot:UpdateThingShadow'
+              - 'iot:GetThingShadow'
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:thing/${iot:Connection.Thing.ThingName}'
+
+  # Time-based access policy
+  TimeBasedAccessPolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: 'TimeBasedAccessPolicy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow connection only during business hours (8 AM to 6 PM UTC)
+          - Effect: Allow
+            Action: 'iot:Connect'
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/${iot:Connection.Thing.ThingName}'
+            Condition:
+              Bool:
+                'iot:Connection.Thing.IsAttached': 'true'
+              DateGreaterThan:
+                'aws:CurrentTime': '08:00:00Z'
+              DateLessThan:
+                'aws:CurrentTime': '18:00:00Z'
+          # Allow publishing for industrial sensors only
+          - Effect: Allow
+            Action: 'iot:Publish'
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/sensors/${iot:Connection.Thing.ThingName}/telemetry'
+            Condition:
+              StringEquals:
+                'iot:Connection.Thing.ThingTypeName': !Ref ThingTypeName
+
+  # Location-based access policy
+  LocationBasedAccessPolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: 'LocationBasedAccessPolicy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow connection only from authorized factory locations
+          - Effect: Allow
+            Action: 'iot:Connect'
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/${iot:Connection.Thing.ThingName}'
+            Condition:
+              Bool:
+                'iot:Connection.Thing.IsAttached': 'true'
+              StringEquals:
+                'iot:Connection.Thing.Attributes[location]':
+                  - 'factory-001'
+                  - 'factory-002'
+                  - 'factory-003'
+          # Allow publishing from factory locations only
+          - Effect: Allow
+            Action: 'iot:Publish'
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/sensors/${iot:Connection.Thing.ThingName}/*'
+            Condition:
+              StringLike:
+                'iot:Connection.Thing.Attributes[location]': 'factory-*'
+
+  # Device quarantine policy (deny all access)
+  DeviceQuarantinePolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: 'DeviceQuarantinePolicy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Deny all IoT actions for quarantined devices
+          - Effect: Deny
+            Action: '*'
+            Resource: '*'
+
+  # ========================================
+  # Device Defender Security Profile
+  # ========================================
+
+  # Security profile for anomaly detection
+  DeviceDefenderSecurityProfile:
+    Type: AWS::IoT::SecurityProfile
+    Properties:
+      SecurityProfileName: !Ref SecurityProfileName
+      SecurityProfileDescription: 'Security monitoring for industrial IoT sensors'
+      Behaviors:
+        # Monitor for excessive connections
+        - Name: 'ExcessiveConnections'
+          Metric: 'aws:num-connections'
+          Criteria:
+            ComparisonOperator: 'greater-than'
+            Value:
+              Count: 3
+            ConsecutiveDatapointsToAlarm: 2
+            ConsecutiveDatapointsToClear: 2
+        # Monitor for unauthorized operations
+        - Name: 'UnauthorizedOperations'
+          Metric: 'aws:num-authorization-failures'
+          Criteria:
+            ComparisonOperator: 'greater-than'
+            Value:
+              Count: 5
+            DurationSeconds: 300
+            ConsecutiveDatapointsToAlarm: 1
+            ConsecutiveDatapointsToClear: 1
+        # Monitor for message size anomalies
+        - Name: 'MessageSizeAnomaly'
+          Metric: 'aws:message-byte-size'
+          Criteria:
+            ComparisonOperator: 'greater-than'
+            Value:
+              Count: 1024
+            ConsecutiveDatapointsToAlarm: 3
+            ConsecutiveDatapointsToClear: 3
+      TargetArns:
+        - !GetAtt IndustrialSensorsThingGroup.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Security Monitoring'
+
+  # ========================================
+  # CloudWatch Resources
+  # ========================================
+
+  # CloudWatch log group for IoT security events
+  IoTSecurityLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: '/aws/iot/security-events'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Security Logging'
+
+  # SNS topic for security alerts
+  SecurityAlertsTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateEmailNotification
+    Properties:
+      TopicName: !Sub '${ProjectName}-iot-security-alerts'
+      DisplayName: 'IoT Security Alerts'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Security Notifications'
+
+  # SNS subscription for email notifications
+  SecurityAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateEmailNotification
+    Properties:
+      TopicArn: !Ref SecurityAlertsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch alarm for unauthorized connections
+  UnauthorizedConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateEmailNotification
+    Properties:
+      AlarmName: !Sub '${ProjectName}-IoT-Unauthorized-Connections'
+      AlarmDescription: 'Alert on unauthorized IoT connection attempts'
+      MetricName: 'Connect.AuthError'
+      Namespace: 'AWS/IoT'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref SecurityAlertsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Security Monitoring'
+
+  # ========================================
+  # DynamoDB Table for Security Events
+  # ========================================
+
+  # DynamoDB table to store security events
+  SecurityEventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-IoTSecurityEvents'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: eventId
+          AttributeType: S
+        - AttributeName: deviceId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: eventId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: DeviceIndex
+          KeySchema:
+            - AttributeName: deviceId
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Security Event Storage'
+
+  # ========================================
+  # Lambda Functions
+  # ========================================
+
+  # Lambda function for processing security events
+  SecurityProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-security-processor'
+      Description: 'Process IoT security events and take appropriate actions'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt SecurityProcessorRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          SECURITY_EVENTS_TABLE: !Ref SecurityEventsTable
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          dynamodb = boto3.resource('dynamodb')
+          table_name = os.environ['SECURITY_EVENTS_TABLE']
+          table = dynamodb.Table(table_name)
+          
+          def lambda_handler(event, context):
+              """Process IoT security events and take appropriate actions"""
+              
+              try:
+                  # Log the security event
+                  logger.info(f"Security event received: {json.dumps(event)}")
+                  
+                  # Extract device information
+                  device_id = event.get('clientId', 'unknown')
+                  event_type = event.get('eventType', 'unknown')
+                  
+                  # Example security actions
+                  if event_type == 'Connect.AuthError':
+                      logger.warning(f"Authentication failure for device: {device_id}")
+                      # Could trigger device quarantine or alert
+                  
+                  elif event_type == 'Publish.AuthError':
+                      logger.warning(f"Unauthorized publish attempt from device: {device_id}")
+                      # Could update device policy or disable device
+                  
+                  # Store event for analysis
+                  table.put_item(
+                      Item={
+                          'eventId': context.aws_request_id,
+                          'deviceId': device_id,
+                          'eventType': event_type,
+                          'timestamp': datetime.utcnow().isoformat(),
+                          'eventData': json.dumps(event)
+                      }
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Security event processed')
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Failed to process security event: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Security Processing'
+
+  # Lambda function for device quarantine
+  QuarantineProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-device-quarantine'
+      Description: 'Quarantine suspicious IoT devices'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt QuarantineProcessorRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          QUARANTINE_POLICY_NAME: !Ref DeviceQuarantinePolicy
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          iot_client = boto3.client('iot')
+          quarantine_policy_name = os.environ['QUARANTINE_POLICY_NAME']
+          
+          def lambda_handler(event, context):
+              """Quarantine suspicious IoT devices"""
+              
+              try:
+                  device_id = event['deviceId']
+                  reason = event.get('reason', 'Security violation')
+                  
+                  # Get device certificates
+                  principals = iot_client.list_thing_principals(thingName=device_id)
+                  
+                  for principal in principals['principals']:
+                      # Detach existing policies
+                      attached_policies = iot_client.list_attached_policies(target=principal)
+                      
+                      for policy in attached_policies['policies']:
+                          iot_client.detach_policy(
+                              policyName=policy['policyName'],
+                              target=principal
+                          )
+                      
+                      # Attach quarantine policy
+                      iot_client.attach_policy(
+                          policyName=quarantine_policy_name,
+                          target=principal
+                      )
+                  
+                  logger.info(f"Device {device_id} quarantined: {reason}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(f'Device {device_id} quarantined successfully')
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Device quarantine failed: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Device Quarantine'
+
+  # Lambda function for certificate rotation monitoring
+  CertificateRotationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-certificate-rotation'
+      Description: 'Monitor and rotate certificates for IoT devices'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt CertificateRotationRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime, timedelta
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          iot_client = boto3.client('iot')
+          
+          def lambda_handler(event, context):
+              """Monitor certificates for expiration and rotation needs"""
+              
+              try:
+                  # List all certificates
+                  certificates = iot_client.list_certificates(pageSize=100)
+                  
+                  rotation_actions = []
+                  
+                  for cert in certificates['certificates']:
+                      cert_id = cert['certificateId']
+                      cert_arn = cert['certificateArn']
+                      
+                      # Get certificate details
+                      cert_details = iot_client.describe_certificate(
+                          certificateId=cert_id
+                      )
+                      
+                      # Check certificate status and creation date
+                      creation_date = cert_details['certificateDescription']['creationDate']
+                      status = cert_details['certificateDescription']['status']
+                      
+                      # Log certificate status
+                      logger.info(f"Certificate {cert_id} created on {creation_date}, status: {status}")
+                      
+                      # In production, implement actual certificate rotation logic
+                      rotation_actions.append({
+                          'certificateId': cert_id,
+                          'certificateArn': cert_arn,
+                          'action': 'monitor',
+                          'creationDate': creation_date.isoformat(),
+                          'status': status
+                      })
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Certificate rotation check completed',
+                          'actions': rotation_actions
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Certificate rotation failed: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Certificate Management'
+
+  # ========================================
+  # EventBridge Rules
+  # ========================================
+
+  # EventBridge rule for certificate rotation checks
+  CertificateRotationScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-Certificate-Rotation-Check'
+      Description: 'Weekly check for certificate rotation needs'
+      ScheduleExpression: 'rate(7 days)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CertificateRotationFunction.Arn
+          Id: 'CertificateRotationTarget'
+
+  # Permission for EventBridge to invoke Lambda
+  CertificateRotationInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CertificateRotationFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CertificateRotationScheduleRule.Arn
+
+  # ========================================
+  # IoT Rules for Event Processing
+  # ========================================
+
+  # IoT Rule for processing security events
+  SecurityEventProcessingRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub '${ProjectName}SecurityEventProcessing'
+      TopicRulePayload:
+        Description: 'Process IoT security events and route to Lambda'
+        Sql: "SELECT * FROM '$aws/events/presence/connected/+''"
+        RuleDisabled: false
+        Actions:
+          - Lambda:
+              FunctionArn: !GetAtt SecurityProcessorFunction.Arn
+
+  # Permission for IoT Rule to invoke Lambda
+  SecurityEventProcessingPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SecurityProcessorFunction
+      Principal: iot.amazonaws.com
+      SourceArn: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:rule/${ProjectName}SecurityEventProcessing'
+
+Outputs:
+  # IoT Core Information
+  ThingTypeName:
+    Description: 'Name of the created Thing Type'
+    Value: !Ref IndustrialSensorThingType
+    Export:
+      Name: !Sub '${AWS::StackName}-ThingTypeName'
+
+  ThingGroupArn:
+    Description: 'ARN of the Industrial Sensors Thing Group'
+    Value: !GetAtt IndustrialSensorsThingGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ThingGroupArn'
+
+  SecurityProfileName:
+    Description: 'Name of the Device Defender Security Profile'
+    Value: !Ref DeviceDefenderSecurityProfile
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityProfileName'
+
+  # Policy Information
+  RestrictiveSensorPolicyName:
+    Description: 'Name of the Restrictive Sensor Policy'
+    Value: !Ref RestrictiveSensorPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-RestrictiveSensorPolicyName'
+
+  TimeBasedAccessPolicyName:
+    Description: 'Name of the Time-Based Access Policy'
+    Value: !Ref TimeBasedAccessPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-TimeBasedAccessPolicyName'
+
+  LocationBasedAccessPolicyName:
+    Description: 'Name of the Location-Based Access Policy'
+    Value: !Ref LocationBasedAccessPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-LocationBasedAccessPolicyName'
+
+  DeviceQuarantinePolicyName:
+    Description: 'Name of the Device Quarantine Policy'
+    Value: !Ref DeviceQuarantinePolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-DeviceQuarantinePolicyName'
+
+  # Lambda Functions
+  SecurityProcessorFunctionArn:
+    Description: 'ARN of the Security Processor Lambda Function'
+    Value: !GetAtt SecurityProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityProcessorFunctionArn'
+
+  QuarantineProcessorFunctionArn:
+    Description: 'ARN of the Device Quarantine Lambda Function'
+    Value: !GetAtt QuarantineProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-QuarantineProcessorFunctionArn'
+
+  CertificateRotationFunctionArn:
+    Description: 'ARN of the Certificate Rotation Lambda Function'
+    Value: !GetAtt CertificateRotationFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CertificateRotationFunctionArn'
+
+  # Storage and Monitoring
+  SecurityEventsTableName:
+    Description: 'Name of the DynamoDB table for security events'
+    Value: !Ref SecurityEventsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityEventsTableName'
+
+  SecurityEventsTableArn:
+    Description: 'ARN of the DynamoDB table for security events'
+    Value: !GetAtt SecurityEventsTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityEventsTableArn'
+
+  IoTSecurityLogGroupName:
+    Description: 'Name of the CloudWatch log group for IoT security events'
+    Value: !Ref IoTSecurityLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTSecurityLogGroupName'
+
+  # Notification Resources
+  SecurityAlertsTopicArn:
+    Condition: CreateEmailNotification
+    Description: 'ARN of the SNS topic for security alerts'
+    Value: !Ref SecurityAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityAlertsTopicArn'
+
+  # IoT Endpoint
+  IoTDataEndpoint:
+    Description: 'IoT data endpoint for device connections'
+    Value: !Sub '${AWS::AccountId}.iot.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTDataEndpoint'
+
+  # Next Steps
+  NextSteps:
+    Description: 'Instructions for completing the setup'
+    Value: !Sub |
+      1. Create IoT devices manually using AWS CLI or console
+      2. Generate certificates for each device
+      3. Attach certificates to the RestrictiveSensorPolicy
+      4. Add devices to the IndustrialSensors thing group
+      5. Test device connections and monitor security events
+      6. Review CloudWatch dashboard at: https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:

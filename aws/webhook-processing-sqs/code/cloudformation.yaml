@@ -1,0 +1,551 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for webhook processing system with API Gateway, SQS, Lambda, and DynamoDB'
+
+# Parameters section for customizable values
+Parameters:
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: 'Environment name for resource naming and tagging'
+  
+  WebhookAPIName:
+    Type: String
+    Default: 'webhook-processing-api'
+    Description: 'Name for the API Gateway REST API'
+    MinLength: 1
+    MaxLength: 128
+  
+  QueueVisibilityTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 0
+    MaxValue: 43200
+    Description: 'Visibility timeout for SQS queue in seconds'
+  
+  MessageRetentionPeriod:
+    Type: Number
+    Default: 1209600
+    MinValue: 60
+    MaxValue: 1209600
+    Description: 'Message retention period in seconds (default: 14 days)'
+  
+  MaxReceiveCount:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 1000
+    Description: 'Maximum number of receives before message goes to DLQ'
+  
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 900
+    Description: 'Lambda function timeout in seconds'
+  
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 10240
+    Description: 'Lambda function memory allocation in MB'
+  
+  DynamoDBReadCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 1000
+    Description: 'DynamoDB table read capacity units'
+  
+  DynamoDBWriteCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 1000
+    Description: 'DynamoDB table write capacity units'
+
+# Conditions for conditional resource creation
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  IsNotProduction: !Not [!Condition IsProduction]
+
+# Resources section
+Resources:
+  # Dead Letter Queue for failed webhook processing
+  WebhookDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${WebhookAPIName}-dlq-${Environment}'
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      VisibilityTimeout: 60
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'webhook-processing-dlq'
+        - Key: Application
+          Value: 'webhook-processor'
+
+  # Primary SQS Queue with dead letter queue redrive policy
+  WebhookQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${WebhookAPIName}-queue-${Environment}'
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      VisibilityTimeout: !Ref QueueVisibilityTimeout
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt WebhookDeadLetterQueue.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'webhook-processing'
+        - Key: Application
+          Value: 'webhook-processor'
+
+  # DynamoDB table for webhook history and audit trail
+  WebhookHistoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${WebhookAPIName}-history-${Environment}'
+      AttributeDefinitions:
+        - AttributeName: webhook_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: webhook_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref DynamoDBReadCapacity
+        WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      # Enable point-in-time recovery for production
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      # Enable encryption at rest
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'webhook-history'
+        - Key: Application
+          Value: 'webhook-processor'
+
+  # IAM Role for API Gateway to access SQS
+  APIGatewaySQSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${WebhookAPIName}-apigw-sqs-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SQSAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt WebhookQueue.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'api-gateway-sqs-integration'
+        - Key: Application
+          Value: 'webhook-processor'
+
+  # IAM Role for Lambda function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${WebhookAPIName}-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource: !GetAtt WebhookHistoryTable.Arn
+        - PolicyName: SQSAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt WebhookQueue.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'lambda-execution'
+        - Key: Application
+          Value: 'webhook-processor'
+
+  # Lambda function for webhook processing
+  WebhookProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${WebhookAPIName}-processor-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          WEBHOOK_TABLE_NAME: !Ref WebhookHistoryTable
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          from datetime import datetime
+          import logging
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['WEBHOOK_TABLE_NAME'])
+          
+          def lambda_handler(event, context):
+              try:
+                  # Process each SQS record
+                  for record in event['Records']:
+                      # Parse the webhook payload
+                      webhook_body = json.loads(record['body'])
+                      
+                      # Generate unique webhook ID
+                      webhook_id = str(uuid.uuid4())
+                      timestamp = datetime.utcnow().isoformat()
+                      
+                      # Extract webhook metadata
+                      source_ip = webhook_body.get('source_ip', 'unknown')
+                      webhook_type = webhook_body.get('body', {}).get('type', 'unknown')
+                      
+                      # Process the webhook (customize based on your needs)
+                      processed_data = process_webhook(webhook_body)
+                      
+                      # Store in DynamoDB
+                      table.put_item(
+                          Item={
+                              'webhook_id': webhook_id,
+                              'timestamp': timestamp,
+                              'source_ip': source_ip,
+                              'webhook_type': webhook_type,
+                              'raw_payload': json.dumps(webhook_body),
+                              'processed_data': json.dumps(processed_data),
+                              'status': 'processed',
+                              'environment': os.environ.get('ENVIRONMENT', 'unknown')
+                          }
+                      )
+                      
+                      logger.info(f"Processed webhook {webhook_id} of type {webhook_type}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Webhooks processed successfully')
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing webhook: {str(e)}")
+                  raise
+          
+          def process_webhook(payload):
+              """
+              Customize this function based on your webhook processing needs
+              """
+              # Example processing logic
+              processed = {
+                  'processed_at': datetime.utcnow().isoformat(),
+                  'payload_size': len(json.dumps(payload)),
+                  'contains_sensitive_data': check_sensitive_data(payload)
+              }
+              
+              # Add your specific processing logic here
+              return processed
+          
+          def check_sensitive_data(payload):
+              """
+              Example function to check for sensitive data
+              """
+              sensitive_keys = ['credit_card', 'ssn', 'password', 'secret']
+              payload_str = json.dumps(payload).lower()
+              
+              return any(key in payload_str for key in sensitive_keys)
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'webhook-processing'
+        - Key: Application
+          Value: 'webhook-processor'
+
+  # Event source mapping to connect SQS to Lambda
+  WebhookEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt WebhookQueue.Arn
+      FunctionName: !Ref WebhookProcessorFunction
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      Enabled: true
+
+  # API Gateway REST API
+  WebhookAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${WebhookAPIName}-${Environment}'
+      Description: 'REST API for webhook processing with SQS integration'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'webhook-ingestion'
+        - Key: Application
+          Value: 'webhook-processor'
+
+  # API Gateway resource for webhooks endpoint
+  WebhookResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref WebhookAPI
+      ParentId: !GetAtt WebhookAPI.RootResourceId
+      PathPart: 'webhooks'
+
+  # API Gateway POST method with SQS integration
+  WebhookPOSTMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref WebhookAPI
+      ResourceId: !Ref WebhookResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/${WebhookAPIName}-queue-${Environment}'
+        Credentials: !GetAtt APIGatewaySQSRole.Arn
+        RequestParameters:
+          'integration.request.header.Content-Type': "'application/x-www-form-urlencoded'"
+        RequestTemplates:
+          'application/json': !Sub |
+            Action=SendMessage&MessageBody=$util.urlEncode("{\"source_ip\":\"$context.identity.sourceIp\",\"timestamp\":\"$context.requestTime\",\"body\":$input.json('$')}")
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              'application/json': |
+                {
+                  "message": "Webhook received and queued for processing",
+                  "requestId": "$context.requestId"
+                }
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            'application/json': 'Empty'
+
+  # API Gateway deployment
+  WebhookAPIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: WebhookPOSTMethod
+    Properties:
+      RestApiId: !Ref WebhookAPI
+      StageName: !Ref Environment
+      StageDescription: !Sub 'Deployment for ${Environment} environment'
+
+  # CloudWatch Log Group for API Gateway
+  APIGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${WebhookAPIName}-${Environment}'
+      RetentionInDays: !If [IsProduction, 90, 14]
+
+  # CloudWatch Log Group for Lambda
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${WebhookAPIName}-processor-${Environment}'
+      RetentionInDays: !If [IsProduction, 90, 14]
+
+  # CloudWatch Alarm for Dead Letter Queue
+  DeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${WebhookAPIName}-dlq-messages-${Environment}'
+      AlarmDescription: 'Alert when messages appear in webhook dead letter queue'
+      MetricName: ApproximateNumberOfVisibleMessages
+      Namespace: AWS/SQS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt WebhookDeadLetterQueue.QueueName
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for Lambda errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${WebhookAPIName}-lambda-errors-${Environment}'
+      AlarmDescription: 'Alert on Lambda function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WebhookProcessorFunction
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for API Gateway 4xx errors
+  APIGateway4xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${WebhookAPIName}-4xx-errors-${Environment}'
+      AlarmDescription: 'Alert on API Gateway 4xx errors'
+      MetricName: 4XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub '${WebhookAPIName}-${Environment}'
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for API Gateway 5xx errors
+  APIGateway5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${WebhookAPIName}-5xx-errors-${Environment}'
+      AlarmDescription: 'Alert on API Gateway 5xx errors'
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub '${WebhookAPIName}-${Environment}'
+      TreatMissingData: notBreaching
+
+# Outputs section for important resource information
+Outputs:
+  WebhookAPIEndpoint:
+    Description: 'URL of the webhook API endpoint'
+    Value: !Sub 'https://${WebhookAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/webhooks'
+    Export:
+      Name: !Sub '${AWS::StackName}-WebhookEndpoint'
+
+  WebhookQueueArn:
+    Description: 'ARN of the webhook processing queue'
+    Value: !GetAtt WebhookQueue.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-QueueArn'
+
+  WebhookQueueUrl:
+    Description: 'URL of the webhook processing queue'
+    Value: !Ref WebhookQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-QueueUrl'
+
+  DeadLetterQueueArn:
+    Description: 'ARN of the dead letter queue'
+    Value: !GetAtt WebhookDeadLetterQueue.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueueArn'
+
+  DeadLetterQueueUrl:
+    Description: 'URL of the dead letter queue'
+    Value: !Ref WebhookDeadLetterQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueueUrl'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the webhook processor Lambda function'
+    Value: !GetAtt WebhookProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  DynamoDBTableName:
+    Description: 'Name of the webhook history DynamoDB table'
+    Value: !Ref WebhookHistoryTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableName'
+
+  DynamoDBTableArn:
+    Description: 'ARN of the webhook history DynamoDB table'
+    Value: !GetAtt WebhookHistoryTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableArn'
+
+  APIGatewayId:
+    Description: 'ID of the API Gateway REST API'
+    Value: !Ref WebhookAPI
+    Export:
+      Name: !Sub '${AWS::StackName}-APIGatewayId'
+
+  Environment:
+    Description: 'Environment name used for this deployment'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+  CloudWatchAlarms:
+    Description: 'List of CloudWatch alarms created'
+    Value: !Join
+      - ', '
+      - - !Ref DeadLetterQueueAlarm
+        - !Ref LambdaErrorAlarm
+        - !Ref APIGateway4xxAlarm
+        - !Ref APIGateway5xxAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchAlarms'

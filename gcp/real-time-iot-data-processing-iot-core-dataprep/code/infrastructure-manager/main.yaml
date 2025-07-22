@@ -1,0 +1,624 @@
+# Infrastructure Manager Configuration for Real-Time IoT Data Processing
+# This configuration deploys a complete IoT data processing pipeline using:
+# - Cloud IoT Core for device management and authentication
+# - Cloud Pub/Sub for messaging and event streaming
+# - BigQuery for data warehousing and analytics
+# - Cloud Storage for Dataprep staging
+# - Cloud Monitoring for observability
+
+# Template metadata
+info:
+  title: Real-Time IoT Data Processing Pipeline
+  description: Complete IoT data processing infrastructure with device management, messaging, and analytics
+  author: Google Cloud Infrastructure Manager
+  version: 1.0
+
+# Input variables for customization
+variables:
+  # Project configuration
+  project_id:
+    type: string
+    description: Google Cloud Project ID
+    default: "iot-pipeline-demo"
+  
+  region:
+    type: string
+    description: Google Cloud region for resources
+    default: "us-central1"
+  
+  zone:
+    type: string
+    description: Google Cloud zone within the region
+    default: "us-central1-a"
+  
+  # Resource naming
+  resource_prefix:
+    type: string
+    description: Prefix for all resource names
+    default: "iot-pipeline"
+  
+  # IoT Core configuration
+  iot_registry_id:
+    type: string
+    description: IoT Core device registry identifier
+    default: "sensor-registry"
+  
+  device_id:
+    type: string
+    description: Sample IoT device identifier
+    default: "temperature-sensor-001"
+  
+  # Pub/Sub configuration
+  pubsub_topic_name:
+    type: string
+    description: Pub/Sub topic for IoT telemetry
+    default: "iot-telemetry"
+  
+  pubsub_subscription_name:
+    type: string
+    description: Pub/Sub subscription for data processing
+    default: "iot-data-subscription"
+  
+  # BigQuery configuration
+  bigquery_dataset_id:
+    type: string
+    description: BigQuery dataset for IoT analytics
+    default: "iot_analytics"
+  
+  bigquery_table_id:
+    type: string
+    description: BigQuery table for sensor readings
+    default: "sensor_readings"
+  
+  # Storage configuration
+  storage_bucket_name:
+    type: string
+    description: Cloud Storage bucket for Dataprep staging
+    default: "dataprep-staging"
+  
+  # Monitoring configuration
+  enable_monitoring:
+    type: boolean
+    description: Enable Cloud Monitoring dashboard and alerts
+    default: true
+  
+  # Data retention settings
+  message_retention_days:
+    type: number
+    description: Pub/Sub message retention in days
+    default: 7
+  
+  bigquery_partition_expiration_days:
+    type: number
+    description: BigQuery partition expiration in days
+    default: 365
+
+# Required Google Cloud APIs
+# These must be enabled before deploying this configuration
+apis:
+  - name: cloudiot.googleapis.com
+    title: Cloud IoT Core API
+  - name: pubsub.googleapis.com
+    title: Cloud Pub/Sub API
+  - name: bigquery.googleapis.com
+    title: BigQuery API
+  - name: storage.googleapis.com
+    title: Cloud Storage API
+  - name: dataprep.googleapis.com
+    title: Cloud Dataprep API
+  - name: dataflow.googleapis.com
+    title: Cloud Dataflow API
+  - name: monitoring.googleapis.com
+    title: Cloud Monitoring API
+
+# Cloud resources configuration
+resources:
+  # Cloud Pub/Sub Topic for IoT telemetry data
+  # This topic receives all device telemetry messages from IoT Core
+  iot_telemetry_topic:
+    type: gcp-types/pubsub-v1:projects.topics
+    name: $(ref.project_id.value)-$(ref.pubsub_topic_name.value)
+    properties:
+      name: projects/$(ref.project_id.value)/topics/$(ref.pubsub_topic_name.value)
+      messageRetentionDuration: $(ref.message_retention_days.value)d
+      messageStoragePolicy:
+        allowedPersistenceRegions:
+          - $(ref.region.value)
+    metadata:
+      description: "Pub/Sub topic for IoT device telemetry data"
+      dependsOn: []
+
+  # Cloud Pub/Sub Subscription for data processing
+  # This subscription enables Dataprep to consume IoT messages
+  iot_data_subscription:
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    name: $(ref.project_id.value)-$(ref.pubsub_subscription_name.value)
+    properties:
+      name: projects/$(ref.project_id.value)/subscriptions/$(ref.pubsub_subscription_name.value)
+      topic: $(ref.iot_telemetry_topic.name)
+      ackDeadlineSeconds: 60
+      retainAckedMessages: true
+      messageRetentionDuration: $(ref.message_retention_days.value)d
+      expirationPolicy:
+        ttl: 2678400s  # 31 days
+      deadLetterPolicy:
+        deadLetterTopic: $(ref.iot_telemetry_topic.name)
+        maxDeliveryAttempts: 5
+    metadata:
+      description: "Pub/Sub subscription for IoT data processing"
+      dependsOn:
+        - iot_telemetry_topic
+
+  # Cloud IoT Core Device Registry
+  # Central management point for IoT devices with secure authentication
+  iot_device_registry:
+    type: gcp-types/cloudiot-v1:projects.locations.registries
+    name: $(ref.iot_registry_id.value)
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      id: $(ref.iot_registry_id.value)
+      eventNotificationConfigs:
+        - pubsubTopicName: $(ref.iot_telemetry_topic.name)
+          subfolderMatches: ""
+      stateNotificationConfig:
+        pubsubTopicName: $(ref.iot_telemetry_topic.name)
+      mqttConfig:
+        mqttEnabledState: MQTT_ENABLED
+      httpConfig:
+        httpEnabledState: HTTP_ENABLED
+      logLevel: INFO
+      credentials:
+        - publicKeyCertificate:
+            format: X509_CERTIFICATE_PEM
+            certificate: |
+              -----BEGIN CERTIFICATE-----
+              # Sample certificate - replace with actual device certificate
+              -----END CERTIFICATE-----
+    metadata:
+      description: "IoT Core device registry for secure device management"
+      dependsOn:
+        - iot_telemetry_topic
+
+  # BigQuery Dataset for IoT Analytics
+  # Serverless data warehouse for IoT sensor data analysis
+  iot_analytics_dataset:
+    type: gcp-types/bigquery-v2:datasets
+    name: $(ref.bigquery_dataset_id.value)
+    properties:
+      datasetReference:
+        projectId: $(ref.project_id.value)
+        datasetId: $(ref.bigquery_dataset_id.value)
+      friendlyName: "IoT Analytics Dataset"
+      description: "Dataset for IoT sensor data analytics and machine learning"
+      location: $(ref.region.value)
+      defaultTableExpirationMs: null
+      defaultPartitionExpirationMs: $(ref.bigquery_partition_expiration_days.value * 86400000)
+      access:
+        - role: OWNER
+          userByEmail: "$(ref.project_id.value)@$(ref.project_id.value).iam.gserviceaccount.com"
+        - role: READER
+          specialGroup: projectReaders
+        - role: WRITER
+          specialGroup: projectWriters
+      labels:
+        purpose: iot-analytics
+        environment: production
+    metadata:
+      description: "BigQuery dataset for IoT sensor data storage and analytics"
+      dependsOn: []
+
+  # BigQuery Table for Sensor Readings
+  # Optimized table schema for IoT time-series data with automatic partitioning
+  sensor_readings_table:
+    type: gcp-types/bigquery-v2:tables
+    name: $(ref.bigquery_table_id.value)
+    properties:
+      tableReference:
+        projectId: $(ref.project_id.value)
+        datasetId: $(ref.iot_analytics_dataset.datasetReference.datasetId)
+        tableId: $(ref.bigquery_table_id.value)
+      friendlyName: "IoT Sensor Readings"
+      description: "Time-series data from IoT sensors with automatic partitioning"
+      schema:
+        fields:
+          - name: device_id
+            type: STRING
+            mode: REQUIRED
+            description: "Unique identifier for the IoT device"
+          - name: timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "Timestamp when the sensor reading was taken"
+          - name: temperature
+            type: FLOAT
+            mode: NULLABLE
+            description: "Temperature reading in Celsius"
+          - name: humidity
+            type: FLOAT
+            mode: NULLABLE
+            description: "Humidity reading as percentage"
+          - name: pressure
+            type: FLOAT
+            mode: NULLABLE
+            description: "Atmospheric pressure in hPa"
+          - name: location
+            type: STRING
+            mode: NULLABLE
+            description: "Physical location of the sensor"
+          - name: data_quality_score
+            type: FLOAT
+            mode: NULLABLE
+            description: "Data quality score from 0.0 to 1.0"
+          - name: processing_timestamp
+            type: TIMESTAMP
+            mode: NULLABLE
+            description: "Timestamp when the data was processed"
+      timePartitioning:
+        type: DAY
+        field: timestamp
+        requirePartitionFilter: false
+        expirationMs: $(ref.bigquery_partition_expiration_days.value * 86400000)
+      clustering:
+        fields:
+          - device_id
+          - location
+      labels:
+        purpose: iot-sensor-data
+        data_type: time-series
+    metadata:
+      description: "BigQuery table for IoT sensor readings with optimized schema"
+      dependsOn:
+        - iot_analytics_dataset
+
+  # Cloud Storage Bucket for Dataprep Staging
+  # Staging area for Dataprep data transformation workflows
+  dataprep_staging_bucket:
+    type: gcp-types/storage-v1:buckets
+    name: $(ref.project_id.value)-$(ref.storage_bucket_name.value)
+    properties:
+      name: $(ref.project_id.value)-$(ref.storage_bucket_name.value)
+      location: $(ref.region.value)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              matchesStorageClass:
+                - STANDARD
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 7
+              matchesStorageClass:
+                - STANDARD
+      encryption:
+        defaultKmsKeyName: ""
+      uniformBucketLevelAccess:
+        enabled: true
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      labels:
+        purpose: dataprep-staging
+        environment: production
+    metadata:
+      description: "Cloud Storage bucket for Dataprep staging and temporary files"
+      dependsOn: []
+
+  # Service Account for Dataprep Operations
+  # Dedicated service account with minimal required permissions
+  dataprep_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    name: dataprep-pipeline-sa
+    properties:
+      accountId: dataprep-pipeline-sa
+      serviceAccount:
+        displayName: "Dataprep Pipeline Service Account"
+        description: "Service account for Dataprep data processing operations"
+        disabled: false
+    metadata:
+      description: "Service account for Dataprep data processing operations"
+      dependsOn: []
+
+  # IAM Policy Binding for Dataprep Service Account - BigQuery Data Editor
+  dataprep_bigquery_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    name: dataprep-bigquery-editor-binding
+    properties:
+      resource: $(ref.project_id.value)
+      role: roles/bigquery.dataEditor
+      member: serviceAccount:$(ref.dataprep_service_account.email)
+    metadata:
+      description: "Grant BigQuery Data Editor role to Dataprep service account"
+      dependsOn:
+        - dataprep_service_account
+
+  # IAM Policy Binding for Dataprep Service Account - Pub/Sub Subscriber
+  dataprep_pubsub_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    name: dataprep-pubsub-subscriber-binding
+    properties:
+      resource: $(ref.project_id.value)
+      role: roles/pubsub.subscriber
+      member: serviceAccount:$(ref.dataprep_service_account.email)
+    metadata:
+      description: "Grant Pub/Sub Subscriber role to Dataprep service account"
+      dependsOn:
+        - dataprep_service_account
+
+  # IAM Policy Binding for Dataprep Service Account - Storage Object Admin
+  dataprep_storage_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    name: dataprep-storage-admin-binding
+    properties:
+      resource: $(ref.project_id.value)
+      role: roles/storage.objectAdmin
+      member: serviceAccount:$(ref.dataprep_service_account.email)
+    metadata:
+      description: "Grant Storage Object Admin role to Dataprep service account"
+      dependsOn:
+        - dataprep_service_account
+        - dataprep_staging_bucket
+
+  # Cloud Monitoring Dashboard for IoT Pipeline
+  # Comprehensive monitoring dashboard for pipeline health and performance
+  iot_monitoring_dashboard:
+    type: gcp-types/monitoring-v1:projects.dashboards
+    name: iot-pipeline-dashboard
+    properties:
+      displayName: "IoT Data Pipeline Dashboard"
+      mosaicLayout:
+        tiles:
+          - width: 6
+            height: 4
+            widget:
+              title: "Pub/Sub Message Rate"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="pubsub_topic" AND resource.labels.topic_id="$(ref.pubsub_topic_name.value)"'
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_RATE
+                          crossSeriesReducer: REDUCE_SUM
+                      plotType: LINE
+                yAxis:
+                  label: "Messages per second"
+                  scale: LINEAR
+          - width: 6
+            height: 4
+            widget:
+              title: "BigQuery Table Size"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="bigquery_table" AND resource.labels.table_id="$(ref.bigquery_table_id.value)"'
+                        aggregation:
+                          alignmentPeriod: 300s
+                          perSeriesAligner: ALIGN_MEAN
+                      plotType: LINE
+                yAxis:
+                  label: "Table size (bytes)"
+                  scale: LINEAR
+          - width: 6
+            height: 4
+            widget:
+              title: "IoT Core Device Activity"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="iot_device"'
+                        aggregation:
+                          alignmentPeriod: 300s
+                          perSeriesAligner: ALIGN_MEAN
+                      plotType: LINE
+                yAxis:
+                  label: "Active devices"
+                  scale: LINEAR
+          - width: 6
+            height: 4
+            widget:
+              title: "Data Quality Score Distribution"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="bigquery_table"'
+                        aggregation:
+                          alignmentPeriod: 300s
+                          perSeriesAligner: ALIGN_MEAN
+                      plotType: STACKED_BAR
+                yAxis:
+                  label: "Quality score"
+                  scale: LINEAR
+      labels:
+        purpose: iot-monitoring
+        environment: production
+    metadata:
+      description: "Cloud Monitoring dashboard for IoT pipeline observability"
+      dependsOn: []
+
+  # Cloud Monitoring Alert Policy for Low Message Throughput
+  # Proactive alerting for pipeline health issues
+  low_throughput_alert:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    name: iot-low-throughput-alert
+    properties:
+      displayName: "IoT Pipeline Low Throughput Alert"
+      documentation:
+        content: "Alert when IoT message throughput drops below expected levels"
+        mimeType: "text/markdown"
+      conditions:
+        - displayName: "Low message rate condition"
+          conditionThreshold:
+            filter: 'resource.type="pubsub_topic" AND resource.labels.topic_id="$(ref.pubsub_topic_name.value)"'
+            comparison: COMPARISON_LESS_THAN
+            thresholdValue: 10
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_SUM
+      alertStrategy:
+        autoClose: 86400s  # 24 hours
+      enabled: $(ref.enable_monitoring.value)
+      notificationChannels: []
+    metadata:
+      description: "Alert policy for detecting low IoT message throughput"
+      dependsOn: []
+
+# Output values for verification and integration
+outputs:
+  # Project information
+  project_id:
+    description: "Google Cloud Project ID"
+    value: $(ref.project_id.value)
+  
+  region:
+    description: "Google Cloud region"
+    value: $(ref.region.value)
+  
+  # IoT Core resources
+  iot_registry_name:
+    description: "IoT Core device registry name"
+    value: $(ref.iot_device_registry.name)
+  
+  iot_registry_id:
+    description: "IoT Core device registry ID"
+    value: $(ref.iot_registry_id.value)
+  
+  # Pub/Sub resources
+  pubsub_topic_name:
+    description: "Pub/Sub topic name for IoT telemetry"
+    value: $(ref.iot_telemetry_topic.name)
+  
+  pubsub_subscription_name:
+    description: "Pub/Sub subscription name for data processing"
+    value: $(ref.iot_data_subscription.name)
+  
+  # BigQuery resources
+  bigquery_dataset_id:
+    description: "BigQuery dataset ID for IoT analytics"
+    value: $(ref.iot_analytics_dataset.datasetReference.datasetId)
+  
+  bigquery_table_id:
+    description: "BigQuery table ID for sensor readings"
+    value: $(ref.sensor_readings_table.tableReference.tableId)
+  
+  bigquery_table_full_name:
+    description: "Full BigQuery table name"
+    value: "$(ref.project_id.value).$(ref.bigquery_dataset_id.value).$(ref.bigquery_table_id.value)"
+  
+  # Storage resources
+  storage_bucket_name:
+    description: "Cloud Storage bucket name for Dataprep staging"
+    value: $(ref.dataprep_staging_bucket.name)
+  
+  storage_bucket_url:
+    description: "Cloud Storage bucket URL"
+    value: "gs://$(ref.dataprep_staging_bucket.name)"
+  
+  # Service account
+  dataprep_service_account_email:
+    description: "Dataprep service account email"
+    value: $(ref.dataprep_service_account.email)
+  
+  # Monitoring resources
+  monitoring_dashboard_name:
+    description: "Cloud Monitoring dashboard name"
+    value: $(ref.iot_monitoring_dashboard.name)
+  
+  alert_policy_name:
+    description: "Cloud Monitoring alert policy name"
+    value: $(ref.low_throughput_alert.name)
+  
+  # Connection information
+  mqtt_bridge_hostname:
+    description: "MQTT bridge hostname for device connections"
+    value: "mqtt.googleapis.com"
+  
+  mqtt_bridge_port:
+    description: "MQTT bridge port for secure connections"
+    value: 8883
+  
+  # Deployment verification
+  deployment_status:
+    description: "Deployment status and next steps"
+    value: |
+      IoT Data Processing Pipeline deployed successfully!
+      
+      Next steps:
+      1. Create IoT devices in the registry: $(ref.iot_device_registry.name)
+      2. Configure device certificates for secure authentication
+      3. Set up Dataprep flows to process data from: $(ref.iot_data_subscription.name)
+      4. Monitor pipeline health via dashboard: $(ref.iot_monitoring_dashboard.name)
+      5. Query processed data in BigQuery: $(ref.bigquery_table_full_name.value)
+      
+      For detailed setup instructions, refer to the recipe documentation.
+
+# Security and compliance considerations
+security:
+  # Data encryption
+  encryption_at_rest: true
+  encryption_in_transit: true
+  
+  # Access controls
+  iam_bindings: minimal_required_permissions
+  service_accounts: dedicated_per_service
+  
+  # Network security
+  private_google_access: recommended
+  vpc_firewall_rules: default_deny_all
+  
+  # Monitoring and logging
+  audit_logging: enabled
+  monitoring_alerts: configured
+  
+  # Compliance
+  data_residency: configurable_region
+  retention_policies: configurable_duration
+
+# Cost optimization features
+cost_optimization:
+  # Storage lifecycle management
+  storage_lifecycle: automatic_tiering
+  
+  # BigQuery optimization
+  bigquery_partitioning: date_based
+  bigquery_clustering: device_location
+  
+  # Pub/Sub optimization
+  message_retention: configurable_duration
+  
+  # Resource cleanup
+  automatic_cleanup: lifecycle_policies
+  
+  # Monitoring cost controls
+  budget_alerts: recommended
+  cost_attribution: resource_labeling
+
+# Scalability considerations
+scalability:
+  # Horizontal scaling
+  pubsub_throughput: millions_messages_per_second
+  bigquery_storage: petabyte_scale
+  
+  # Global distribution
+  multi_region_deployment: supported
+  global_iot_core: available
+  
+  # Performance optimization
+  bigquery_slots: auto_scaling
+  dataflow_workers: auto_scaling
+  
+  # Monitoring scalability
+  dashboard_refresh: real_time
+  alert_channels: multiple_notification_types

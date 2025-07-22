@@ -1,0 +1,1236 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Real-Time Vehicle Telemetry Analytics with AWS IoT FleetWise and Timestream - Production-ready infrastructure for collecting, processing, and visualizing vehicle telemetry data at scale'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Fleet Configuration"
+        Parameters:
+          - FleetName
+          - VehiclePrefix
+          - NumberOfVehicles
+      - Label:
+          default: "Data Storage Configuration"
+        Parameters:
+          - TimestreamDatabaseName
+          - TimestreamTableName
+          - MemoryStoreRetentionHours
+          - MagneticStoreRetentionDays
+      - Label:
+          default: "Data Collection Configuration"
+        Parameters:
+          - CampaignName
+          - CollectionPeriodMs
+          - EnableDiagnosticsMode
+          - CompressionType
+      - Label:
+          default: "Visualization Configuration"
+        Parameters:
+          - CreateGrafanaWorkspace
+          - GrafanaWorkspaceName
+          - GrafanaAuthenticationProvider
+      - Label:
+          default: "Security and Compliance"
+        Parameters:
+          - S3BucketName
+          - EnableS3Versioning
+          - KMSKeyId
+    ParameterLabels:
+      FleetName:
+        default: "Fleet Name"
+      VehiclePrefix:
+        default: "Vehicle Name Prefix"
+      NumberOfVehicles:
+        default: "Number of Vehicles"
+      TimestreamDatabaseName:
+        default: "Timestream Database Name"
+      TimestreamTableName:
+        default: "Timestream Table Name"
+      MemoryStoreRetentionHours:
+        default: "Memory Store Retention (Hours)"
+      MagneticStoreRetentionDays:
+        default: "Magnetic Store Retention (Days)"
+      CampaignName:
+        default: "Data Collection Campaign Name"
+      CollectionPeriodMs:
+        default: "Collection Period (Milliseconds)"
+      EnableDiagnosticsMode:
+        default: "Enable Diagnostics Mode"
+      CompressionType:
+        default: "Data Compression Type"
+      CreateGrafanaWorkspace:
+        default: "Create Grafana Workspace"
+      GrafanaWorkspaceName:
+        default: "Grafana Workspace Name"
+      GrafanaAuthenticationProvider:
+        default: "Grafana Authentication Provider"
+      S3BucketName:
+        default: "S3 Bucket for Data Archival"
+      EnableS3Versioning:
+        default: "Enable S3 Versioning"
+      KMSKeyId:
+        default: "KMS Key ID for Encryption"
+
+Parameters:
+  FleetName:
+    Type: String
+    Default: !Sub 'vehicle-fleet-${AWS::StackName}'
+    Description: 'Name for the IoT FleetWise fleet that will group vehicles for management'
+    AllowedPattern: '^[a-zA-Z0-9_-]+$'
+    ConstraintDescription: 'Fleet name must contain only alphanumeric characters, hyphens, and underscores'
+    MaxLength: 100
+
+  VehiclePrefix:
+    Type: String
+    Default: 'vehicle'
+    Description: 'Prefix for vehicle names (vehicles will be named: {prefix}-001, {prefix}-002, etc.)'
+    AllowedPattern: '^[a-zA-Z0-9_-]+$'
+    ConstraintDescription: 'Vehicle prefix must contain only alphanumeric characters, hyphens, and underscores'
+    MaxLength: 50
+
+  NumberOfVehicles:
+    Type: Number
+    Default: 1
+    Description: 'Number of vehicles to register in the fleet (IoT Things will be created for each)'
+    MinValue: 1
+    MaxValue: 100
+    ConstraintDescription: 'Number of vehicles must be between 1 and 100'
+
+  TimestreamDatabaseName:
+    Type: String
+    Default: !Sub 'telemetry_db_${AWS::StackName}'
+    Description: 'Name for the Amazon Timestream database that will store vehicle telemetry data'
+    AllowedPattern: '^[a-zA-Z0-9_-]+$'
+    ConstraintDescription: 'Database name must contain only alphanumeric characters, hyphens, and underscores'
+    MaxLength: 64
+
+  TimestreamTableName:
+    Type: String
+    Default: 'vehicle_metrics'
+    Description: 'Name for the Timestream table within the database'
+    AllowedPattern: '^[a-zA-Z0-9_-]+$'
+    ConstraintDescription: 'Table name must contain only alphanumeric characters, hyphens, and underscores'
+    MaxLength: 64
+
+  MemoryStoreRetentionHours:
+    Type: Number
+    Default: 24
+    Description: 'Hours to retain data in memory store for fast queries (recent data)'
+    MinValue: 1
+    MaxValue: 8766
+    ConstraintDescription: 'Memory store retention must be between 1 hour and 1 year'
+
+  MagneticStoreRetentionDays:
+    Type: Number
+    Default: 30
+    Description: 'Days to retain data in magnetic store for cost-effective long-term storage'
+    MinValue: 1
+    MaxValue: 73000
+    ConstraintDescription: 'Magnetic store retention must be between 1 day and 200 years'
+
+  CampaignName:
+    Type: String
+    Default: !Sub 'telemetry-campaign-${AWS::StackName}'
+    Description: 'Name for the data collection campaign that defines what telemetry to collect'
+    AllowedPattern: '^[a-zA-Z0-9_-]+$'
+    ConstraintDescription: 'Campaign name must contain only alphanumeric characters, hyphens, and underscores'
+    MaxLength: 100
+
+  CollectionPeriodMs:
+    Type: Number
+    Default: 10000
+    Description: 'Data collection interval in milliseconds (10000ms = 10 seconds)'
+    MinValue: 1000
+    MaxValue: 3600000
+    ConstraintDescription: 'Collection period must be between 1 second and 1 hour'
+
+  EnableDiagnosticsMode:
+    Type: String
+    Default: 'OFF'
+    Description: 'Enable diagnostics mode for troubleshooting data collection issues'
+    AllowedValues:
+      - 'OFF'
+      - 'SEND_ACTIVE_DTCS'
+    ConstraintDescription: 'Diagnostics mode must be OFF or SEND_ACTIVE_DTCS'
+
+  CompressionType:
+    Type: String
+    Default: 'SNAPPY'
+    Description: 'Compression algorithm for telemetry data to reduce storage costs'
+    AllowedValues:
+      - 'OFF'
+      - 'SNAPPY'
+    ConstraintDescription: 'Compression must be OFF or SNAPPY'
+
+  CreateGrafanaWorkspace:
+    Type: String
+    Default: 'true'
+    Description: 'Create Amazon Managed Grafana workspace for data visualization'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    ConstraintDescription: 'Must be true or false'
+
+  GrafanaWorkspaceName:
+    Type: String
+    Default: !Sub 'fleet-telemetry-${AWS::StackName}'
+    Description: 'Name for the Grafana workspace (only used if CreateGrafanaWorkspace is true)'
+    AllowedPattern: '^[a-zA-Z0-9_-]+$'
+    ConstraintDescription: 'Workspace name must contain only alphanumeric characters, hyphens, and underscores'
+    MaxLength: 100
+
+  GrafanaAuthenticationProvider:
+    Type: String
+    Default: 'AWS_SSO'
+    Description: 'Authentication provider for Grafana workspace access'
+    AllowedValues:
+      - 'AWS_SSO'
+      - 'SAML'
+    ConstraintDescription: 'Authentication provider must be AWS_SSO or SAML'
+
+  S3BucketName:
+    Type: String
+    Default: !Sub 'fleetwise-data-${AWS::StackName}-${AWS::AccountId}'
+    Description: 'S3 bucket name for archiving raw telemetry data (must be globally unique)'
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'S3 bucket name must be lowercase, start and end with alphanumeric, and contain only lowercase letters, numbers, and hyphens'
+    MaxLength: 63
+
+  EnableS3Versioning:
+    Type: String
+    Default: 'true'
+    Description: 'Enable versioning on S3 bucket for data protection'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    ConstraintDescription: 'Must be true or false'
+
+  KMSKeyId:
+    Type: String
+    Default: 'alias/aws/s3'
+    Description: 'KMS Key ID for encrypting S3 data (use default AWS managed key or specify custom key ARN)'
+    ConstraintDescription: 'Must be a valid KMS key ID, ARN, or alias'
+
+Conditions:
+  CreateGrafana: !Equals [!Ref CreateGrafanaWorkspace, 'true']
+  EnableVersioning: !Equals [!Ref EnableS3Versioning, 'true']
+  UseCustomKMSKey: !Not [!Equals [!Ref KMSKeyId, 'alias/aws/s3']]
+
+Resources:
+  # ============================================================================
+  # S3 RESOURCES - Data Archival and Storage
+  # ============================================================================
+
+  TelemetryDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref KMSKeyId
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [EnableVersioning, 'Enabled', 'Suspended']
+      LifecycleConfiguration:
+        Rules:
+          - Id: TelemetryDataLifecycle
+            Status: Enabled
+            ExpirationInDays: 2555  # 7 years retention for compliance
+            NoncurrentVersionExpirationInDays: 30
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      LoggingConfiguration:
+        DestinationBucketName: !Ref S3AccessLogsBucket
+        LogFilePrefix: telemetry-data-access-logs/
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-telemetry-data'
+        - Key: Purpose
+          Value: 'Vehicle telemetry data archival'
+        - Key: Compliance
+          Value: 'Automotive data retention'
+
+  S3AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${S3BucketName}-access-logs'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: AccessLogsLifecycle
+            Status: Enabled
+            ExpirationInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-s3-access-logs'
+        - Key: Purpose
+          Value: 'S3 access logging for security monitoring'
+
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${AWS::StackName}/telemetry-data'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-s3-logs'
+        - Key: Purpose
+          Value: 'S3 access monitoring'
+
+  # ============================================================================
+  # TIMESTREAM RESOURCES - Time-Series Database
+  # ============================================================================
+
+  TimestreamDatabase:
+    Type: AWS::Timestream::Database
+    Properties:
+      DatabaseName: !Ref TimestreamDatabaseName
+      KmsKeyId: !If [UseCustomKMSKey, !Ref KMSKeyId, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-timestream-db'
+        - Key: Purpose
+          Value: 'Vehicle telemetry time-series storage'
+        - Key: DataType
+          Value: 'IoT telemetry'
+
+  TimestreamTable:
+    Type: AWS::Timestream::Table
+    Properties:
+      DatabaseName: !Ref TimestreamDatabase
+      TableName: !Ref TimestreamTableName
+      RetentionProperties:
+        MemoryStoreRetentionPeriodInHours: !Ref MemoryStoreRetentionHours
+        MagneticStoreRetentionPeriodInDays: !Ref MagneticStoreRetentionDays
+      MagneticStoreWriteProperties:
+        EnableMagneticStoreWrites: true
+        MagneticStoreRejectedDataLocation:
+          S3Configuration:
+            BucketName: !Ref TelemetryDataBucket
+            ObjectKeyPrefix: 'rejected-data/'
+            EncryptionOption: SSE_KMS
+            KmsKeyId: !Ref KMSKeyId
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-timestream-table'
+        - Key: Purpose
+          Value: 'Vehicle metrics storage'
+        - Key: RetentionPolicy
+          Value: !Sub 'Memory:${MemoryStoreRetentionHours}h,Magnetic:${MagneticStoreRetentionDays}d'
+
+  # ============================================================================
+  # IAM RESOURCES - Security and Access Control
+  # ============================================================================
+
+  FleetWiseServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'FleetWiseServiceRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iotfleetwise.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/IoTFleetWiseServiceRolePolicy
+      Policies:
+        - PolicyName: TimestreamWritePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - timestream:WriteRecords
+                  - timestream:DescribeEndpoints
+                Resource: 
+                  - !GetAtt TimestreamTable.Arn
+                  - !Sub '${TimestreamTable.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - timestream:DescribeEndpoints
+                Resource: '*'
+        - PolicyName: S3ArchivePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: 
+                  - !Sub '${TelemetryDataBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource: 
+                  - !GetAtt TelemetryDataBucket.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:DescribeKey
+                Resource: !If [UseCustomKMSKey, !Ref KMSKeyId, !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-fleetwise-role'
+        - Key: Purpose
+          Value: 'Service role for AWS IoT FleetWise operations'
+
+  GrafanaServiceRole:
+    Type: AWS::IAM::Role
+    Condition: CreateGrafana
+    Properties:
+      RoleName: !Sub 'GrafanaServiceRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: grafana.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      Policies:
+        - PolicyName: TimestreamReadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - timestream:DescribeEndpoints
+                  - timestream:DescribeDatabase
+                  - timestream:DescribeTable
+                  - timestream:ListDatabases
+                  - timestream:ListTables
+                  - timestream:ListTagsForResource
+                  - timestream:Select
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - timestream:Select
+                Resource: 
+                  - !GetAtt TimestreamTable.Arn
+                  - !Sub '${TimestreamTable.Arn}/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-grafana-role'
+        - Key: Purpose
+          Value: 'Service role for Grafana Timestream access'
+
+  # ============================================================================
+  # IOT FLEETWISE RESOURCES - Vehicle Fleet Management
+  # ============================================================================
+
+  SignalCatalog:
+    Type: AWS::IoTFleetWise::SignalCatalog
+    Properties:
+      Name: !Sub 'VehicleSignalCatalog-${AWS::StackName}'
+      Description: 'Standard vehicle telemetry signals for fleet monitoring and analytics'
+      Nodes:
+        # Root vehicle branch
+        - Branch:
+            FullyQualifiedName: 'Vehicle'
+            Description: 'Root node for all vehicle signals'
+        # Engine branch
+        - Branch:
+            FullyQualifiedName: 'Vehicle.Engine'
+            Description: 'Engine-related telemetry signals'
+        # Powertrain branch
+        - Branch:
+            FullyQualifiedName: 'Vehicle.Powertrain'
+            Description: 'Powertrain and transmission signals'
+        # Body branch
+        - Branch:
+            FullyQualifiedName: 'Vehicle.Body'
+            Description: 'Vehicle body and cabin signals'
+        # Engine RPM sensor
+        - Sensor:
+            FullyQualifiedName: 'Vehicle.Engine.RPM'
+            DataType: 'DOUBLE'
+            Unit: 'rpm'
+            Min: 0
+            Max: 8000
+            Description: 'Engine revolutions per minute'
+        # Vehicle speed sensor
+        - Sensor:
+            FullyQualifiedName: 'Vehicle.Speed'
+            DataType: 'DOUBLE'
+            Unit: 'km/h'
+            Min: 0
+            Max: 300
+            Description: 'Vehicle speed in kilometers per hour'
+        # Engine temperature sensor
+        - Sensor:
+            FullyQualifiedName: 'Vehicle.Engine.Temperature'
+            DataType: 'DOUBLE'
+            Unit: 'Celsius'
+            Min: -40
+            Max: 200
+            Description: 'Engine coolant temperature'
+        # Fuel level sensor
+        - Sensor:
+            FullyQualifiedName: 'Vehicle.FuelLevel'
+            DataType: 'DOUBLE'
+            Unit: 'Percentage'
+            Min: 0
+            Max: 100
+            Description: 'Fuel tank level as percentage of capacity'
+        # Battery voltage sensor
+        - Sensor:
+            FullyQualifiedName: 'Vehicle.Battery.Voltage'
+            DataType: 'DOUBLE'
+            Unit: 'Volts'
+            Min: 9
+            Max: 16
+            Description: 'Vehicle battery voltage'
+        # Odometer reading
+        - Sensor:
+            FullyQualifiedName: 'Vehicle.Odometer'
+            DataType: 'DOUBLE'
+            Unit: 'Kilometers'
+            Min: 0
+            Max: 1000000
+            Description: 'Total distance traveled'
+        # Throttle position
+        - Sensor:
+            FullyQualifiedName: 'Vehicle.Engine.ThrottlePosition'
+            DataType: 'DOUBLE'
+            Unit: 'Percentage'
+            Min: 0
+            Max: 100
+            Description: 'Throttle pedal position percentage'
+        # Brake pressure
+        - Sensor:
+            FullyQualifiedName: 'Vehicle.Brake.Pressure'
+            DataType: 'DOUBLE'
+            Unit: 'PSI'
+            Min: 0
+            Max: 3000
+            Description: 'Brake system pressure'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-signal-catalog'
+        - Key: Purpose
+          Value: 'Vehicle signal standardization'
+        - Key: Version
+          Value: '1.0'
+
+  ModelManifest:
+    Type: AWS::IoTFleetWise::ModelManifest
+    Properties:
+      Name: !Sub 'StandardVehicleModel-${AWS::StackName}'
+      Description: 'Model manifest for standard fleet vehicles with comprehensive telemetry'
+      SignalCatalogArn: !Ref SignalCatalog
+      Status: 'ACTIVE'
+      Nodes:
+        - 'Vehicle.Engine.RPM'
+        - 'Vehicle.Speed'
+        - 'Vehicle.Engine.Temperature'
+        - 'Vehicle.FuelLevel'
+        - 'Vehicle.Battery.Voltage'
+        - 'Vehicle.Odometer'
+        - 'Vehicle.Engine.ThrottlePosition'
+        - 'Vehicle.Brake.Pressure'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-model-manifest'
+        - Key: Purpose
+          Value: 'Vehicle model definition'
+        - Key: VehicleType
+          Value: 'Standard fleet vehicle'
+
+  DecoderManifest:
+    Type: AWS::IoTFleetWise::DecoderManifest
+    Properties:
+      Name: !Sub 'StandardDecoder-${AWS::StackName}'
+      Description: 'Decoder manifest for translating CAN bus signals to standardized telemetry'
+      ModelManifestArn: !Ref ModelManifest
+      Status: 'ACTIVE'
+      SignalDecoders:
+        # Engine RPM from CAN bus
+        - FullyQualifiedName: 'Vehicle.Engine.RPM'
+          Type: 'CAN_SIGNAL'
+          CanSignal:
+            MessageId: 419364097  # 0x18F00401 - Engine data message
+            IsBigEndian: false
+            IsSigned: false
+            StartBit: 24
+            Offset: 0.0
+            Factor: 0.25
+            Length: 16
+        # Vehicle speed from CAN bus
+        - FullyQualifiedName: 'Vehicle.Speed'
+          Type: 'CAN_SIGNAL'
+          CanSignal:
+            MessageId: 419364352  # 0x18F00500 - Vehicle speed message
+            IsBigEndian: false
+            IsSigned: false
+            StartBit: 0
+            Offset: 0.0
+            Factor: 0.01
+            Length: 16
+        # Engine temperature from CAN bus
+        - FullyQualifiedName: 'Vehicle.Engine.Temperature'
+          Type: 'CAN_SIGNAL'
+          CanSignal:
+            MessageId: 419364097  # Same message as RPM
+            IsBigEndian: false
+            IsSigned: false
+            StartBit: 8
+            Offset: -40.0
+            Factor: 1.0
+            Length: 8
+        # Fuel level from CAN bus
+        - FullyQualifiedName: 'Vehicle.FuelLevel'
+          Type: 'CAN_SIGNAL'
+          CanSignal:
+            MessageId: 419364353  # 0x18F00501 - Fuel data message
+            IsBigEndian: false
+            IsSigned: false
+            StartBit: 0
+            Offset: 0.0
+            Factor: 0.4
+            Length: 8
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-decoder-manifest'
+        - Key: Purpose
+          Value: 'CAN bus signal decoding'
+        - Key: Protocol
+          Value: 'CAN 2.0B'
+
+  Fleet:
+    Type: AWS::IoTFleetWise::Fleet
+    Properties:
+      Id: !Ref FleetName
+      Description: !Sub 'Production vehicle fleet for ${AWS::StackName} telemetry collection'
+      SignalCatalogArn: !Ref SignalCatalog
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-fleet'
+        - Key: Purpose
+          Value: 'Vehicle fleet management'
+        - Key: Environment
+          Value: 'Production'
+
+  # Vehicle creation is handled by custom resource due to CloudFormation limitations
+  VehicleCreationCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt VehicleCreationFunction.Arn
+      FleetId: !Ref Fleet
+      VehiclePrefix: !Ref VehiclePrefix
+      NumberOfVehicles: !Ref NumberOfVehicles
+      ModelManifestArn: !Ref ModelManifest
+      DecoderManifestArn: !Ref DecoderManifest
+      StackName: !Ref 'AWS::StackName'
+
+  VehicleCreationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-vehicle-creator'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt VehicleCreationLambdaRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          REGION: !Ref 'AWS::Region'
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              try:
+                  request_type = event['RequestType']
+                  properties = event['ResourceProperties']
+                  
+                  fleetwise = boto3.client('iotfleetwise')
+                  iot = boto3.client('iot')
+                  
+                  fleet_id = properties['FleetId']
+                  vehicle_prefix = properties['VehiclePrefix']
+                  num_vehicles = int(properties['NumberOfVehicles'])
+                  model_manifest_arn = properties['ModelManifestArn']
+                  decoder_manifest_arn = properties['DecoderManifestArn']
+                  stack_name = properties['StackName']
+                  
+                  if request_type == 'Create' or request_type == 'Update':
+                      created_vehicles = []
+                      created_things = []
+                      
+                      for i in range(1, num_vehicles + 1):
+                          vehicle_name = f"{vehicle_prefix}-{i:03d}-{stack_name}"
+                          
+                          # Create IoT Thing
+                          try:
+                              iot.create_thing(
+                                  thingName=vehicle_name,
+                                  thingTypeName='FleetWiseVehicle',
+                                  attributePayload={
+                                      'attributes': {
+                                          'VehicleId': vehicle_name,
+                                          'FleetId': fleet_id,
+                                          'StackName': stack_name
+                                      }
+                                  }
+                              )
+                              created_things.append(vehicle_name)
+                              logger.info(f"Created IoT Thing: {vehicle_name}")
+                          except Exception as e:
+                              logger.warning(f"IoT Thing creation failed for {vehicle_name}: {str(e)}")
+                          
+                          # Create Vehicle
+                          try:
+                              fleetwise.create_vehicle(
+                                  vehicleName=vehicle_name,
+                                  modelManifestArn=model_manifest_arn,
+                                  decoderManifestArn=decoder_manifest_arn,
+                                  tags={
+                                      'Name': vehicle_name,
+                                      'Fleet': fleet_id,
+                                      'StackName': stack_name,
+                                      'VehicleIndex': str(i)
+                                  }
+                              )
+                              created_vehicles.append(vehicle_name)
+                              logger.info(f"Created vehicle: {vehicle_name}")
+                              
+                              # Associate with fleet
+                              fleetwise.associate_vehicle_fleet(
+                                  vehicleName=vehicle_name,
+                                  fleetId=fleet_id
+                              )
+                              logger.info(f"Associated vehicle {vehicle_name} with fleet {fleet_id}")
+                              
+                          except Exception as e:
+                              logger.error(f"Vehicle creation/association failed for {vehicle_name}: {str(e)}")
+                      
+                      response_data = {
+                          'VehicleNames': created_vehicles,
+                          'IoTThingNames': created_things,
+                          'VehicleCount': len(created_vehicles)
+                      }
+                      
+                  elif request_type == 'Delete':
+                      # Clean up vehicles and IoT things
+                      try:
+                          for i in range(1, num_vehicles + 1):
+                              vehicle_name = f"{vehicle_prefix}-{i:03d}-{stack_name}"
+                              
+                              try:
+                                  # Disassociate from fleet
+                                  fleetwise.disassociate_vehicle_fleet(
+                                      vehicleName=vehicle_name,
+                                      fleetId=fleet_id
+                                  )
+                                  logger.info(f"Disassociated vehicle {vehicle_name} from fleet")
+                              except Exception as e:
+                                  logger.warning(f"Failed to disassociate vehicle {vehicle_name}: {str(e)}")
+                              
+                              try:
+                                  # Delete vehicle
+                                  fleetwise.delete_vehicle(vehicleName=vehicle_name)
+                                  logger.info(f"Deleted vehicle: {vehicle_name}")
+                              except Exception as e:
+                                  logger.warning(f"Failed to delete vehicle {vehicle_name}: {str(e)}")
+                              
+                              try:
+                                  # Delete IoT thing
+                                  iot.delete_thing(thingName=vehicle_name)
+                                  logger.info(f"Deleted IoT Thing: {vehicle_name}")
+                              except Exception as e:
+                                  logger.warning(f"Failed to delete IoT Thing {vehicle_name}: {str(e)}")
+                      
+                      except Exception as e:
+                          logger.error(f"Error during cleanup: {str(e)}")
+                      
+                      response_data = {'Status': 'Cleanup completed'}
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  
+              except Exception as e:
+                  logger.error(f"Lambda execution failed: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vehicle-creator'
+        - Key: Purpose
+          Value: 'Custom resource for vehicle creation'
+
+  VehicleCreationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'VehicleCreationLambdaRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: FleetWiseVehicleManagement
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iotfleetwise:CreateVehicle
+                  - iotfleetwise:DeleteVehicle
+                  - iotfleetwise:AssociateVehicleFleet
+                  - iotfleetwise:DisassociateVehicleFleet
+                  - iotfleetwise:GetVehicle
+                  - iotfleetwise:ListVehicles
+                  - iotfleetwise:TagResource
+                  - iotfleetwise:UntagResource
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iot:CreateThing
+                  - iot:DeleteThing
+                  - iot:DescribeThing
+                  - iot:ListThings
+                  - iot:UpdateThing
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vehicle-lambda-role'
+        - Key: Purpose
+          Value: 'Lambda execution role for vehicle management'
+
+  Campaign:
+    Type: AWS::IoTFleetWise::Campaign
+    DependsOn: VehicleCreationCustomResource
+    Properties:
+      Name: !Ref CampaignName
+      Description: !Sub 'Telemetry collection campaign for ${AWS::StackName} fleet - collecting comprehensive vehicle metrics'
+      SignalCatalogArn: !Ref SignalCatalog
+      TargetArn: !Ref Fleet
+      Status: 'CREATING'
+      CollectionScheme:
+        TimeBasedCollectionScheme:
+          PeriodMs: !Ref CollectionPeriodMs
+      PostTriggerCollectionDuration: 0
+      DiagnosticsMode: !Ref EnableDiagnosticsMode
+      SpoolingMode: 'TO_DISK'
+      Compression: !Ref CompressionType
+      DataDestinationConfigs:
+        - TimestreamConfig:
+            TimestreamTableArn: !GetAtt TimestreamTable.Arn
+            ExecutionRoleArn: !GetAtt FleetWiseServiceRole.Arn
+        - S3Config:
+            BucketArn: !GetAtt TelemetryDataBucket.Arn
+            Prefix: 'telemetry-data/'
+            DataFormat: 'JSON'
+            StorageCompressionFormat: 'GZIP'
+      SignalsToCollect:
+        - Name: 'Vehicle.Engine.RPM'
+          MaxSampleCount: 1000
+        - Name: 'Vehicle.Speed'
+          MaxSampleCount: 1000
+        - Name: 'Vehicle.Engine.Temperature'
+          MaxSampleCount: 1000
+        - Name: 'Vehicle.FuelLevel'
+          MaxSampleCount: 1000
+        - Name: 'Vehicle.Battery.Voltage'
+          MaxSampleCount: 1000
+        - Name: 'Vehicle.Odometer'
+          MaxSampleCount: 100
+        - Name: 'Vehicle.Engine.ThrottlePosition'
+          MaxSampleCount: 1000
+        - Name: 'Vehicle.Brake.Pressure'
+          MaxSampleCount: 1000
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-campaign'
+        - Key: Purpose
+          Value: 'Vehicle telemetry collection'
+        - Key: DataFrequency
+          Value: !Sub '${CollectionPeriodMs}ms'
+
+  # ============================================================================
+  # GRAFANA RESOURCES - Data Visualization and Monitoring
+  # ============================================================================
+
+  GrafanaWorkspace:
+    Type: AWS::Grafana::Workspace
+    Condition: CreateGrafana
+    Properties:
+      Name: !Ref GrafanaWorkspaceName
+      Description: !Sub 'Vehicle telemetry dashboards and monitoring for ${AWS::StackName}'
+      AccountAccessType: 'CURRENT_ACCOUNT'
+      AuthenticationProviders:
+        - !Ref GrafanaAuthenticationProvider
+      PermissionType: 'SERVICE_MANAGED'
+      RoleArn: !GetAtt GrafanaServiceRole.Arn
+      DataSources:
+        - 'TIMESTREAM'
+        - 'CLOUDWATCH'
+      NotificationDestinations:
+        - 'SNS'
+      OrganizationRoleName: 'ADMIN'
+      StackSetName: !Sub '${AWS::StackName}-grafana-stack'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-grafana'
+        - Key: Purpose
+          Value: 'Vehicle telemetry visualization'
+        - Key: DataSource
+          Value: 'Timestream'
+
+  # ============================================================================
+  # CLOUDWATCH RESOURCES - Monitoring and Alerting
+  # ============================================================================
+
+  FleetWiseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/iotfleetwise/${AWS::StackName}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-fleetwise-logs'
+        - Key: Purpose
+          Value: 'FleetWise service logging'
+
+  TimestreamLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/timestream/${AWS::StackName}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-timestream-logs'
+        - Key: Purpose
+          Value: 'Timestream query and error logging'
+
+  # CloudWatch Alarms for monitoring campaign health
+  CampaignDataIngestionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-campaign-data-ingestion'
+      AlarmDescription: 'Monitor data ingestion rate from FleetWise campaign'
+      MetricName: 'RecordsIngested'
+      Namespace: 'AWS/IoTFleetWise'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: CampaignName
+          Value: !Ref Campaign
+      TreatMissingData: breaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-data-ingestion-alarm'
+        - Key: Purpose
+          Value: 'Monitor telemetry data flow'
+
+  TimestreamWriteErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-timestream-write-errors'
+      AlarmDescription: 'Monitor Timestream write errors and rejected records'
+      MetricName: 'UserErrors'
+      Namespace: 'AWS/Timestream'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DatabaseName
+          Value: !Ref TimestreamDatabase
+        - Name: TableName
+          Value: !Ref TimestreamTable
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-timestream-errors-alarm'
+        - Key: Purpose
+          Value: 'Monitor data ingestion errors'
+
+Outputs:
+  # ============================================================================
+  # INFRASTRUCTURE OUTPUTS
+  # ============================================================================
+
+  StackName:
+    Description: 'CloudFormation stack name for resource identification'
+    Value: !Ref 'AWS::StackName'
+    Export:
+      Name: !Sub '${AWS::StackName}-StackName'
+
+  Region:
+    Description: 'AWS region where resources are deployed'
+    Value: !Ref 'AWS::Region'
+    Export:
+      Name: !Sub '${AWS::StackName}-Region'
+
+  # ============================================================================
+  # S3 OUTPUTS
+  # ============================================================================
+
+  TelemetryDataBucketName:
+    Description: 'S3 bucket name for telemetry data archival and rejected records'
+    Value: !Ref TelemetryDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-TelemetryBucket'
+
+  TelemetryDataBucketArn:
+    Description: 'S3 bucket ARN for policy references and cross-stack access'
+    Value: !GetAtt TelemetryDataBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TelemetryBucketArn'
+
+  S3AccessLogsBucketName:
+    Description: 'S3 bucket for access logs and security monitoring'
+    Value: !Ref S3AccessLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AccessLogsBucket'
+
+  # ============================================================================
+  # TIMESTREAM OUTPUTS
+  # ============================================================================
+
+  TimestreamDatabaseName:
+    Description: 'Timestream database name for telemetry data storage'
+    Value: !Ref TimestreamDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-TimestreamDatabase'
+
+  TimestreamTableName:
+    Description: 'Timestream table name for vehicle metrics'
+    Value: !Ref TimestreamTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TimestreamTable'
+
+  TimestreamTableArn:
+    Description: 'Timestream table ARN for IAM policies and data access'
+    Value: !GetAtt TimestreamTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TimestreamTableArn'
+
+  TimestreamQueryEndpoint:
+    Description: 'Timestream query endpoint for direct data access'
+    Value: !Sub 'https://query-timestream.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-TimestreamQueryEndpoint'
+
+  TimestreamRetentionPolicy:
+    Description: 'Data retention policy configuration for cost optimization'
+    Value: !Sub 'Memory: ${MemoryStoreRetentionHours} hours, Magnetic: ${MagneticStoreRetentionDays} days'
+    Export:
+      Name: !Sub '${AWS::StackName}-RetentionPolicy'
+
+  # ============================================================================
+  # IOT FLEETWISE OUTPUTS
+  # ============================================================================
+
+  SignalCatalogArn:
+    Description: 'Signal catalog ARN for vehicle data standardization'
+    Value: !Ref SignalCatalog
+    Export:
+      Name: !Sub '${AWS::StackName}-SignalCatalog'
+
+  ModelManifestArn:
+    Description: 'Model manifest ARN for vehicle configuration'
+    Value: !Ref ModelManifest
+    Export:
+      Name: !Sub '${AWS::StackName}-ModelManifest'
+
+  DecoderManifestArn:
+    Description: 'Decoder manifest ARN for CAN bus signal translation'
+    Value: !Ref DecoderManifest
+    Export:
+      Name: !Sub '${AWS::StackName}-DecoderManifest'
+
+  FleetId:
+    Description: 'Fleet ID for vehicle management and campaign targeting'
+    Value: !Ref Fleet
+    Export:
+      Name: !Sub '${AWS::StackName}-FleetId'
+
+  FleetArn:
+    Description: 'Fleet ARN for cross-service integration'
+    Value: !Ref Fleet
+    Export:
+      Name: !Sub '${AWS::StackName}-FleetArn'
+
+  CampaignName:
+    Description: 'Data collection campaign name for monitoring and management'
+    Value: !Ref Campaign
+    Export:
+      Name: !Sub '${AWS::StackName}-CampaignName'
+
+  CampaignArn:
+    Description: 'Campaign ARN for monitoring and policy references'
+    Value: !Ref Campaign
+    Export:
+      Name: !Sub '${AWS::StackName}-CampaignArn'
+
+  VehicleCount:
+    Description: 'Number of vehicles created and registered in the fleet'
+    Value: !GetAtt VehicleCreationCustomResource.VehicleCount
+    Export:
+      Name: !Sub '${AWS::StackName}-VehicleCount'
+
+  CollectionPeriod:
+    Description: 'Data collection frequency in milliseconds'
+    Value: !Sub '${CollectionPeriodMs} ms'
+    Export:
+      Name: !Sub '${AWS::StackName}-CollectionPeriod'
+
+  # ============================================================================
+  # IAM OUTPUTS
+  # ============================================================================
+
+  FleetWiseServiceRoleArn:
+    Description: 'IAM role ARN for FleetWise service operations'
+    Value: !GetAtt FleetWiseServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FleetWiseRole'
+
+  GrafanaServiceRoleArn:
+    Description: 'IAM role ARN for Grafana Timestream access'
+    Value: !If [CreateGrafana, !GetAtt GrafanaServiceRole.Arn, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-GrafanaRole'
+
+  # ============================================================================
+  # GRAFANA OUTPUTS
+  # ============================================================================
+
+  GrafanaWorkspaceId:
+    Description: 'Grafana workspace ID for dashboard configuration'
+    Value: !If [CreateGrafana, !Ref GrafanaWorkspace, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-GrafanaWorkspaceId'
+
+  GrafanaWorkspaceEndpoint:
+    Description: 'Grafana workspace URL for accessing dashboards'
+    Value: !If [CreateGrafana, !GetAtt GrafanaWorkspace.Endpoint, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-GrafanaEndpoint'
+
+  GrafanaWorkspaceStatus:
+    Description: 'Grafana workspace deployment status'
+    Value: !If [CreateGrafana, !GetAtt GrafanaWorkspace.Status, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-GrafanaStatus'
+
+  # ============================================================================
+  # MONITORING OUTPUTS
+  # ============================================================================
+
+  FleetWiseLogGroupName:
+    Description: 'CloudWatch log group for FleetWise service logs'
+    Value: !Ref FleetWiseLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-FleetWiseLogGroup'
+
+  TimestreamLogGroupName:
+    Description: 'CloudWatch log group for Timestream query logs'
+    Value: !Ref TimestreamLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-TimestreamLogGroup'
+
+  DataIngestionAlarmName:
+    Description: 'CloudWatch alarm for monitoring data ingestion health'
+    Value: !Ref CampaignDataIngestionAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-DataIngestionAlarm'
+
+  TimestreamErrorsAlarmName:
+    Description: 'CloudWatch alarm for monitoring Timestream write errors'
+    Value: !Ref TimestreamWriteErrorsAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-TimestreamErrorsAlarm'
+
+  # ============================================================================
+  # CONFIGURATION OUTPUTS
+  # ============================================================================
+
+  DeploymentSummary:
+    Description: 'Summary of deployed infrastructure components'
+    Value: !Sub |
+      Vehicle Telemetry Infrastructure Deployed:
+      - Fleet: ${Fleet} with ${NumberOfVehicles} vehicles
+      - Database: ${TimestreamDatabase}.${TimestreamTable}
+      - Campaign: ${Campaign} (${CollectionPeriodMs}ms intervals)
+      - Storage: ${TelemetryDataBucket}
+      - Monitoring: ${GrafanaWorkspaceName} (${CreateGrafanaWorkspace})
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentSummary'
+
+  NextSteps:
+    Description: 'Post-deployment configuration steps'
+    Value: !Sub |
+      1. Deploy FleetWise Edge Agent to vehicles
+      2. Configure Grafana dashboards at: ${GrafanaWorkspace.Endpoint}
+      3. Set up alerts in CloudWatch for production monitoring
+      4. Review data in Timestream: ${TimestreamDatabase}.${TimestreamTable}
+      5. Monitor campaign status in IoT FleetWise console
+    Export:
+      Name: !Sub '${AWS::StackName}-NextSteps'
+
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for this infrastructure (excluding data transfer)'
+    Value: !Sub |
+      Estimated Monthly Costs (${NumberOfVehicles} vehicles):
+      - Timestream: $25-50/month (depends on data volume)
+      - S3 Storage: $5-15/month (depends on retention)
+      - Grafana Workspace: $9/month per active user
+      - IoT FleetWise: $0.20 per vehicle per month
+      - CloudWatch: $5-10/month (logs and metrics)
+      Total Estimate: $50-100/month
+    Export:
+      Name: !Sub '${AWS::StackName}-EstimatedCost'

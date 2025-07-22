@@ -1,0 +1,933 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Infrastructure as Code for Securing APIs with Lambda Authorizers and API Gateway.
+  This template creates a comprehensive serverless API with multiple authorization patterns including
+  token-based and request-based Lambda authorizers, demonstrating flexible authentication and 
+  authorization patterns for REST APIs.
+
+Parameters:
+  ApiName:
+    Type: String
+    Default: secure-api
+    Description: Name for the API Gateway REST API
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+
+  StageName:
+    Type: String
+    Default: prod
+    Description: API Gateway deployment stage name
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    ConstraintDescription: Must be one of dev, test, staging, or prod
+
+  AuthorizerCacheTTL:
+    Type: Number
+    Default: 300
+    Description: Authorizer result cache TTL in seconds (0-3600)
+    MinValue: 0
+    MaxValue: 3600
+    ConstraintDescription: Must be between 0 and 3600 seconds
+
+  EnableCORSHeaders:
+    Type: String
+    Default: 'true'
+    Description: Enable CORS headers in Lambda function responses
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    Description: Lambda function log level
+    AllowedValues:
+      - DEBUG
+      - INFO
+      - WARN
+      - ERROR
+
+Conditions:
+  IsCORSEnabled: !Equals [!Ref EnableCORSHeaders, 'true']
+  IsDebugMode: !Equals [!Ref LogLevel, 'DEBUG']
+
+Resources:
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApiName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaCloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ApiName
+        - Key: Purpose
+          Value: Lambda execution role for API authorization patterns
+
+  # Token-Based Lambda Authorizer Function
+  TokenAuthorizerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ApiName}-token-authorizer'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          LOG_LEVEL: !Ref LogLevel
+      Description: Token-based Lambda authorizer for API Gateway
+      Code:
+        ZipFile: |
+          import json
+          import re
+          import os
+          import logging
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger = logging.getLogger()
+          logger.setLevel(getattr(logging, log_level))
+
+          def lambda_handler(event, context):
+              """
+              Token-based authorizer that validates Bearer tokens
+              """
+              logger.info(f"Token Authorizer Event: {json.dumps(event, default=str)}")
+              
+              try:
+                  # Extract token from event
+                  token = event.get('authorizationToken', '')
+                  method_arn = event.get('methodArn', '')
+                  
+                  # Validate token format (Bearer <token>)
+                  if not token.startswith('Bearer '):
+                      logger.warning('Invalid token format - missing Bearer prefix')
+                      raise Exception('Unauthorized')
+                  
+                  # Extract actual token
+                  actual_token = token.replace('Bearer ', '')
+                  
+                  # Validate token (simplified validation for demo)
+                  # In production, validate JWT signature, expiration, etc.
+                  valid_tokens = {
+                      'admin-token': {
+                          'principalId': 'admin-user',
+                          'effect': 'Allow',
+                          'context': {
+                              'role': 'admin',
+                              'permissions': 'read,write,delete',
+                              'authType': 'token'
+                          }
+                      },
+                      'user-token': {
+                          'principalId': 'regular-user', 
+                          'effect': 'Allow',
+                          'context': {
+                              'role': 'user',
+                              'permissions': 'read',
+                              'authType': 'token'
+                          }
+                      }
+                  }
+                  
+                  # Check if token is valid
+                  if actual_token not in valid_tokens:
+                      logger.warning(f'Invalid token: {actual_token[:10]}...')
+                      raise Exception('Unauthorized')
+                  
+                  token_info = valid_tokens[actual_token]
+                  logger.info(f'Token validation successful for principal: {token_info["principalId"]}')
+                  
+                  # Generate policy
+                  policy = generate_policy(
+                      token_info['principalId'],
+                      token_info['effect'],
+                      method_arn,
+                      token_info['context']
+                  )
+                  
+                  logger.debug(f"Generated Policy: {json.dumps(policy, default=str)}")
+                  return policy
+                  
+              except Exception as e:
+                  logger.error(f'Authorization failed: {str(e)}')
+                  raise Exception('Unauthorized')
+
+          def generate_policy(principal_id, effect, resource, context=None):
+              """Generate IAM policy for API Gateway"""
+              policy = {
+                  'principalId': principal_id,
+                  'policyDocument': {
+                      'Version': '2012-10-17',
+                      'Statement': [
+                          {
+                              'Action': 'execute-api:Invoke',
+                              'Effect': effect,
+                              'Resource': resource
+                          }
+                      ]
+                  }
+              }
+              
+              # Add context for passing additional information
+              if context:
+                  policy['context'] = context
+                  
+              return policy
+      Tags:
+        - Key: Project
+          Value: !Ref ApiName
+        - Key: Purpose
+          Value: Token-based API authorizer
+
+  # Request-Based Lambda Authorizer Function
+  RequestAuthorizerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ApiName}-request-authorizer'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          LOG_LEVEL: !Ref LogLevel
+      Description: Request-based Lambda authorizer for API Gateway
+      Code:
+        ZipFile: |
+          import json
+          import base64
+          import os
+          import logging
+          from urllib.parse import parse_qs
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger = logging.getLogger()
+          logger.setLevel(getattr(logging, log_level))
+
+          def lambda_handler(event, context):
+              """
+              Request-based authorizer that validates based on request context
+              """
+              logger.info(f"Request Authorizer Event: {json.dumps(event, default=str)}")
+              
+              try:
+                  # Extract request details
+                  headers = event.get('headers', {})
+                  query_params = event.get('queryStringParameters', {}) or {}
+                  method_arn = event.get('methodArn', '')
+                  request_context = event.get('requestContext', {})
+                  identity = request_context.get('identity', {})
+                  source_ip = identity.get('sourceIp', 'unknown')
+                  user_agent = identity.get('userAgent', 'unknown')
+                  
+                  logger.info(f'Authorization request from IP: {source_ip}')
+                  
+                  # Check for API key in query parameters
+                  api_key = query_params.get('api_key', '')
+                  
+                  # Check for custom authentication header
+                  custom_auth = headers.get('X-Custom-Auth', '')
+                  
+                  # Validate based on multiple criteria
+                  principal_id = 'unknown'
+                  effect = 'Deny'
+                  context = {}
+                  
+                  # API Key validation
+                  if api_key == 'secret-api-key-123':
+                      principal_id = 'api-key-user'
+                      effect = 'Allow'
+                      context = {
+                          'authType': 'api-key',
+                          'sourceIp': source_ip,
+                          'permissions': 'read,write',
+                          'userAgent': user_agent
+                      }
+                      logger.info('API key authentication successful')
+                  # Custom header validation
+                  elif custom_auth == 'custom-auth-value':
+                      principal_id = 'custom-user'
+                      effect = 'Allow'
+                      context = {
+                          'authType': 'custom-header',
+                          'sourceIp': source_ip,
+                          'permissions': 'read',
+                          'userAgent': user_agent
+                      }
+                      logger.info('Custom header authentication successful')
+                  # IP-based validation (example for internal networks)
+                  elif source_ip.startswith('10.') or source_ip.startswith('172.') or source_ip.startswith('192.168.'):
+                      principal_id = 'internal-user'
+                      effect = 'Allow'
+                      context = {
+                          'authType': 'ip-whitelist',
+                          'sourceIp': source_ip,
+                          'permissions': 'read,write,delete',
+                          'userAgent': user_agent
+                      }
+                      logger.info('IP whitelist authentication successful')
+                  else:
+                      logger.warning(f'Authorization failed for IP: {source_ip}')
+                  
+                  # Generate policy
+                  policy = generate_policy(principal_id, effect, method_arn, context)
+                  
+                  logger.debug(f"Generated Policy: {json.dumps(policy, default=str)}")
+                  return policy
+                  
+              except Exception as e:
+                  logger.error(f'Authorization failed: {str(e)}')
+                  raise Exception('Unauthorized')
+
+          def generate_policy(principal_id, effect, resource, context=None):
+              """Generate IAM policy for API Gateway"""
+              policy = {
+                  'principalId': principal_id,
+                  'policyDocument': {
+                      'Version': '2012-10-17',
+                      'Statement': [
+                          {
+                              'Action': 'execute-api:Invoke',
+                              'Effect': effect,
+                              'Resource': resource
+                          }
+                      ]
+                  }
+              }
+              
+              if context:
+                  policy['context'] = context
+                  
+              return policy
+      Tags:
+        - Key: Project
+          Value: !Ref ApiName
+        - Key: Purpose
+          Value: Request-based API authorizer
+
+  # Protected API Lambda Function
+  ProtectedApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ApiName}-protected-api'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          LOG_LEVEL: !Ref LogLevel
+          ENABLE_CORS: !Ref EnableCORSHeaders
+      Description: Protected API function requiring authorization
+      Code:
+        ZipFile: !Sub |
+          import json
+          import os
+          import logging
+          import time
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger = logging.getLogger()
+          logger.setLevel(getattr(logging, log_level))
+
+          def lambda_handler(event, context):
+              """Protected API that requires authorization"""
+              
+              logger.info(f"Protected API invoked by: {event.get('requestContext', {}).get('authorizer', {}).get('principalId', 'unknown')}")
+              
+              try:
+                  # Extract authorization context
+                  auth_context = event.get('requestContext', {}).get('authorizer', {})
+                  principal_id = auth_context.get('principalId', 'unknown')
+                  
+                  # Get additional context passed from authorizer
+                  role = auth_context.get('role', 'unknown')
+                  permissions = auth_context.get('permissions', 'none')
+                  auth_type = auth_context.get('authType', 'unknown')
+                  source_ip = auth_context.get('sourceIp', 'unknown')
+                  user_agent = auth_context.get('userAgent', 'unknown')
+                  
+                  response_data = {
+                      'message': 'Access granted to protected resource',
+                      'timestamp': int(time.time()),
+                      'requestId': context.aws_request_id,
+                      'user': {
+                          'principalId': principal_id,
+                          'role': role,
+                          'permissions': permissions.split(',') if permissions != 'none' else [],
+                          'authType': auth_type,
+                          'sourceIp': source_ip,
+                          'userAgent': user_agent
+                      },
+                      'protected_data': {
+                          'secret_value': 'This is confidential information',
+                          'access_level': role,
+                          'data_classification': 'RESTRICTED'
+                      }
+                  }
+                  
+                  # Prepare CORS headers if enabled
+                  headers = {'Content-Type': 'application/json'}
+                  if os.environ.get('ENABLE_CORS', 'false').lower() == 'true':
+                      headers.update({
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,X-Custom-Auth',
+                          'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                      })
+                  
+                  logger.info(f'Protected resource accessed successfully by {principal_id}')
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps(response_data, indent=2)
+                  }
+                  
+              except Exception as e:
+                  logger.error(f'Error processing protected API request: {str(e)}')
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({
+                          'error': 'Internal server error',
+                          'requestId': context.aws_request_id
+                      })
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ApiName
+        - Key: Purpose
+          Value: Protected API with authorization context
+
+  # Public API Lambda Function
+  PublicApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ApiName}-public-api'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          LOG_LEVEL: !Ref LogLevel
+          ENABLE_CORS: !Ref EnableCORSHeaders
+          API_NAME: !Ref ApiName
+      Description: Public API function without authorization requirements
+      Code:
+        ZipFile: !Sub |
+          import json
+          import os
+          import logging
+          import time
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger = logging.getLogger()
+          logger.setLevel(getattr(logging, log_level))
+
+          def lambda_handler(event, context):
+              """Public API that doesn't require authorization"""
+              
+              logger.info('Public API endpoint accessed')
+              
+              try:
+                  api_name = os.environ.get('API_NAME', 'secure-api')
+                  
+                  response_data = {
+                      'message': 'Welcome to the public API',
+                      'api_name': api_name,
+                      'status': 'operational',
+                      'timestamp': int(time.time()),
+                      'requestId': context.aws_request_id,
+                      'version': '1.0.0',
+                      'public_data': {
+                          'description': 'Serverless API with Lambda authorizers demonstration',
+                          'available_endpoints': [
+                              {
+                                  'path': '/public',
+                                  'method': 'GET',
+                                  'description': 'Public endpoint (no auth required)',
+                                  'authorization': 'none'
+                              },
+                              {
+                                  'path': '/protected',
+                                  'method': 'GET', 
+                                  'description': 'Protected endpoint requiring token auth',
+                                  'authorization': 'Bearer token required'
+                              },
+                              {
+                                  'path': '/protected/admin',
+                                  'method': 'GET',
+                                  'description': 'Admin endpoint with request-based auth',
+                                  'authorization': 'API key or custom header required'
+                              }
+                          ]
+                      }
+                  }
+                  
+                  # Prepare CORS headers if enabled
+                  headers = {'Content-Type': 'application/json'}
+                  if os.environ.get('ENABLE_CORS', 'false').lower() == 'true':
+                      headers.update({
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,X-Custom-Auth',
+                          'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                      })
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps(response_data, indent=2)
+                  }
+                  
+              except Exception as e:
+                  logger.error(f'Error processing public API request: {str(e)}')
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({
+                          'error': 'Internal server error',
+                          'requestId': context.aws_request_id
+                      })
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ApiName
+        - Key: Purpose
+          Value: Public API without authorization
+
+  # CloudWatch Log Groups for Lambda Functions
+  TokenAuthorizerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${TokenAuthorizerFunction}'
+      RetentionInDays: 14
+
+  RequestAuthorizerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${RequestAuthorizerFunction}'
+      RetentionInDays: 14
+
+  ProtectedApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProtectedApiFunction}'
+      RetentionInDays: 14
+
+  PublicApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${PublicApiFunction}'
+      RetentionInDays: 14
+
+  # API Gateway REST API
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Ref ApiName
+      Description: !Sub 'Serverless API with Lambda authorizers - ${ApiName}'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: execute-api:Invoke
+            Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ApiName
+        - Key: Purpose
+          Value: REST API with multiple authorization patterns
+
+  # API Gateway Authorizers
+  TokenAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: TokenAuthorizer
+      Type: TOKEN
+      RestApiId: !Ref RestApi
+      AuthorizerUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TokenAuthorizerFunction.Arn}/invocations'
+      IdentitySource: method.request.header.Authorization
+      AuthorizerResultTtlInSeconds: !Ref AuthorizerCacheTTL
+      AuthorizerCredentials: !GetAtt ApiGatewayAuthorizerRole.Arn
+
+  RequestAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: RequestAuthorizer
+      Type: REQUEST
+      RestApiId: !Ref RestApi
+      AuthorizerUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RequestAuthorizerFunction.Arn}/invocations'
+      IdentitySource: method.request.header.X-Custom-Auth,method.request.querystring.api_key
+      AuthorizerResultTtlInSeconds: !Ref AuthorizerCacheTTL
+      AuthorizerCredentials: !GetAtt ApiGatewayAuthorizerRole.Arn
+
+  # IAM Role for API Gateway to invoke authorizer functions
+  ApiGatewayAuthorizerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApiName}-apigateway-authorizer-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt TokenAuthorizerFunction.Arn
+                  - !GetAtt RequestAuthorizerFunction.Arn
+
+  # API Gateway Resources
+  PublicResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: public
+
+  ProtectedResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: protected
+
+  AdminResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref ProtectedResource
+      PathPart: admin
+
+  # API Gateway Methods
+  PublicGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PublicResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PublicApiFunction.Arn}/invocations'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: !If [IsCORSEnabled, "'*'", !Ref 'AWS::NoValue']
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: !If [IsCORSEnabled, true, !Ref 'AWS::NoValue']
+
+  # OPTIONS method for CORS preflight (Public)
+  PublicOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Condition: IsCORSEnabled
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PublicResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,X-Custom-Auth'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  ProtectedGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ProtectedResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref TokenAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProtectedApiFunction.Arn}/invocations'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: !If [IsCORSEnabled, "'*'", !Ref 'AWS::NoValue']
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: !If [IsCORSEnabled, true, !Ref 'AWS::NoValue']
+
+  # OPTIONS method for CORS preflight (Protected)
+  ProtectedOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Condition: IsCORSEnabled
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ProtectedResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,X-Custom-Auth'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  AdminGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AdminResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref RequestAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProtectedApiFunction.Arn}/invocations'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: !If [IsCORSEnabled, "'*'", !Ref 'AWS::NoValue']
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: !If [IsCORSEnabled, true, !Ref 'AWS::NoValue']
+
+  # OPTIONS method for CORS preflight (Admin)
+  AdminOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Condition: IsCORSEnabled
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref AdminResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,X-Custom-Auth'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  # Lambda Permissions for API Gateway
+  PublicApiLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PublicApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*'
+
+  ProtectedApiLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProtectedApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*'
+
+  TokenAuthorizerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TokenAuthorizerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/authorizers/${TokenAuthorizer}'
+
+  RequestAuthorizerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RequestAuthorizerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/authorizers/${RequestAuthorizer}'
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - PublicGetMethod
+      - ProtectedGetMethod
+      - AdminGetMethod
+    Properties:
+      RestApiId: !Ref RestApi
+      StageName: !Ref StageName
+      StageDescription: !Sub 'Deployment stage ${StageName} for ${ApiName}'
+
+  # API Gateway Stage
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref StageName
+      Description: !Sub 'API stage for ${ApiName}'
+      Variables:
+        authorizerCacheTTL: !Ref AuthorizerCacheTTL
+        logLevel: !Ref LogLevel
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: !If [IsDebugMode, 'INFO', 'ERROR']
+          DataTraceEnabled: !If [IsDebugMode, true, false]
+          MetricsEnabled: true
+          ThrottlingRateLimit: 1000
+          ThrottlingBurstLimit: 2000
+      Tags:
+        - Key: Project
+          Value: !Ref ApiName
+        - Key: Purpose
+          Value: API Gateway stage with authorizer patterns
+
+Outputs:
+  ApiId:
+    Description: API Gateway REST API ID
+    Value: !Ref RestApi
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiId'
+
+  ApiUrl:
+    Description: API Gateway endpoint URL for the stage
+    Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiUrl'
+
+  PublicEndpoint:
+    Description: Public endpoint URL (no authorization required)
+    Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/public'
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicEndpoint'
+
+  ProtectedEndpoint:
+    Description: Protected endpoint URL (requires Bearer token)
+    Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/protected'
+    Export:
+      Name: !Sub '${AWS::StackName}-ProtectedEndpoint'
+
+  AdminEndpoint:
+    Description: Admin endpoint URL (requires API key or custom header)
+    Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/protected/admin'
+    Export:
+      Name: !Sub '${AWS::StackName}-AdminEndpoint'
+
+  TokenAuthorizerArn:
+    Description: ARN of the token-based Lambda authorizer
+    Value: !GetAtt TokenAuthorizerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TokenAuthorizerArn'
+
+  RequestAuthorizerArn:
+    Description: ARN of the request-based Lambda authorizer
+    Value: !GetAtt RequestAuthorizerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RequestAuthorizerArn'
+
+  LambdaExecutionRoleArn:
+    Description: ARN of the Lambda execution role
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  TestCommands:
+    Description: Sample curl commands for testing the API
+    Value: !Sub |
+      # Test public endpoint (no auth)
+      curl "${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/public"
+      
+      # Test protected endpoint with user token
+      curl -H "Authorization: Bearer user-token" "${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/protected"
+      
+      # Test protected endpoint with admin token
+      curl -H "Authorization: Bearer admin-token" "${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/protected"
+      
+      # Test admin endpoint with API key
+      curl "${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/protected/admin?api_key=secret-api-key-123"
+      
+      # Test admin endpoint with custom header
+      curl -H "X-Custom-Auth: custom-auth-value" "${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/protected/admin"
+
+  AuthorizerCacheConfiguration:
+    Description: Authorizer cache TTL configuration
+    Value: !Sub '${AuthorizerCacheTTL} seconds'
+    Export:
+      Name: !Sub '${AWS::StackName}-AuthorizerCacheTTL'
+
+  CloudWatchLogGroups:
+    Description: CloudWatch Log Groups for monitoring
+    Value: !Sub |
+      Token Authorizer: /aws/lambda/${TokenAuthorizerFunction}
+      Request Authorizer: /aws/lambda/${RequestAuthorizerFunction}
+      Protected API: /aws/lambda/${ProtectedApiFunction}
+      Public API: /aws/lambda/${PublicApiFunction}

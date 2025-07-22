@@ -1,0 +1,622 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Cost-Optimized Batch Processing with AWS Batch and Spot Instances - Infrastructure as Code template for deploying a complete batch processing solution using Spot instances for up to 90% cost savings.'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "Batch Configuration"
+        Parameters:
+          - MaxvCpus
+          - MinvCpus
+          - DesiredvCpus
+          - SpotBidPercentage
+          - JobRetryAttempts
+          - JobTimeoutSeconds
+      - Label:
+          default: "Container Configuration"
+        Parameters:
+          - ContainerImage
+          - ContainerVCpus
+          - ContainerMemory
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - SubnetIds
+          - CreateSecurityGroup
+    ParameterLabels:
+      Environment:
+        default: "Environment Name"
+      ProjectName:
+        default: "Project Name"
+      MaxvCpus:
+        default: "Maximum vCPUs"
+      MinvCpus:
+        default: "Minimum vCPUs"
+      DesiredvCpus:
+        default: "Desired vCPUs"
+      SpotBidPercentage:
+        default: "Spot Instance Bid Percentage"
+      JobRetryAttempts:
+        default: "Job Retry Attempts"
+      JobTimeoutSeconds:
+        default: "Job Timeout (seconds)"
+      ContainerImage:
+        default: "Container Image URI"
+      ContainerVCpus:
+        default: "Container vCPUs"
+      ContainerMemory:
+        default: "Container Memory (MB)"
+      VpcId:
+        default: "VPC ID"
+      SubnetIds:
+        default: "Subnet IDs"
+      CreateSecurityGroup:
+        default: "Create Security Group"
+
+# Input Parameters
+Parameters:
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - 'dev'
+      - 'staging'
+      - 'prod'
+    Description: 'Environment name for resource tagging and naming'
+
+  ProjectName:
+    Type: String
+    Default: 'batch-processing'
+    Description: 'Project name used for resource naming and tagging'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must begin with a letter and contain only alphanumeric characters and hyphens'
+
+  MaxvCpus:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 1000
+    Description: 'Maximum number of vCPUs for the compute environment'
+
+  MinvCpus:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 100
+    Description: 'Minimum number of vCPUs for the compute environment'
+
+  DesiredvCpus:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 100
+    Description: 'Desired number of vCPUs for the compute environment'
+
+  SpotBidPercentage:
+    Type: Number
+    Default: 80
+    MinValue: 1
+    MaxValue: 100
+    Description: 'Percentage of On-Demand price to bid for Spot instances'
+
+  JobRetryAttempts:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+    Description: 'Number of retry attempts for failed jobs'
+
+  JobTimeoutSeconds:
+    Type: Number
+    Default: 3600
+    MinValue: 60
+    MaxValue: 86400
+    Description: 'Maximum time in seconds for job execution'
+
+  ContainerImage:
+    Type: String
+    Default: 'public.ecr.aws/docker/library/python:3.9-slim'
+    Description: 'Container image URI for batch jobs (will be updated after ECR repository creation)'
+
+  ContainerVCpus:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 8
+    Description: 'Number of vCPUs allocated to each container'
+
+  ContainerMemory:
+    Type: Number
+    Default: 512
+    MinValue: 128
+    MaxValue: 8192
+    Description: 'Amount of memory (MB) allocated to each container'
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC ID where batch resources will be deployed'
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: 'List of subnet IDs for batch compute instances (recommend using multiple AZs)'
+
+  CreateSecurityGroup:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Whether to create a new security group or use existing'
+
+# Conditions
+Conditions:
+  ShouldCreateSecurityGroup: !Equals [!Ref CreateSecurityGroup, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+# Resources
+Resources:
+  # ECR Repository for container images
+  BatchECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}-batch-${Environment}'
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["latest"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Delete untagged images older than 1 day",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 1
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-batch-ecr-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: CostCenter
+          Value: 'batch-processing'
+
+  # Security Group for Batch compute instances
+  BatchSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: ShouldCreateSecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-batch-sg-${Environment}'
+      GroupDescription: 'Security group for AWS Batch compute instances'
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+          Description: 'HTTPS outbound for ECR and AWS services'
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: '0.0.0.0/0'
+          Description: 'HTTP outbound for package downloads'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-batch-sg-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for AWS Batch service
+  BatchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-batch-service-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: batch.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-batch-service-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for EC2 instances in compute environment
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-batch-instance-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-batch-instance-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Instance Profile for EC2 instances
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ProjectName}-batch-instance-profile-${Environment}'
+      Roles:
+        - !Ref InstanceRole
+
+  # IAM Role for job execution
+  JobExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-batch-job-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+      Policies:
+        - PolicyName: ECRAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ecr:GetAuthorizationToken'
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:BatchGetImage'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/batch/job*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-batch-job-execution-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Group for batch jobs
+  BatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/batch/job/${ProjectName}-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-batch-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Batch Compute Environment with Spot instances
+  BatchComputeEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      ComputeEnvironmentName: !Sub '${ProjectName}-spot-compute-env-${Environment}'
+      Type: MANAGED
+      State: ENABLED
+      ServiceRole: !GetAtt BatchServiceRole.Arn
+      ComputeResources:
+        Type: EC2
+        AllocationStrategy: SPOT_CAPACITY_OPTIMIZED
+        MinvCpus: !Ref MinvCpus
+        MaxvCpus: !Ref MaxvCpus
+        DesiredvCpus: !Ref DesiredvCpus
+        InstanceTypes:
+          - c5.large
+          - c5.xlarge
+          - c5.2xlarge
+          - m5.large
+          - m5.xlarge
+          - m5.2xlarge
+          - c5n.large
+          - c5n.xlarge
+          - c5n.2xlarge
+          - m5n.large
+          - m5n.xlarge
+          - m5n.2xlarge
+        BidPercentage: !Ref SpotBidPercentage
+        Ec2Configuration:
+          - ImageType: ECS_AL2
+        Subnets: !Ref SubnetIds
+        SecurityGroupIds:
+          - !If [ShouldCreateSecurityGroup, !Ref BatchSecurityGroup, !Ref 'AWS::NoValue']
+        InstanceRole: !GetAtt InstanceProfile.Arn
+        Tags:
+          Environment: !Ref Environment
+          Project: !Ref ProjectName
+          CostCenter: 'batch-processing'
+          ComputeType: 'spot'
+      Tags:
+        Name: !Sub '${ProjectName}-spot-compute-env-${Environment}'
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  # Batch Job Queue
+  BatchJobQueue:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      JobQueueName: !Sub '${ProjectName}-spot-job-queue-${Environment}'
+      State: ENABLED
+      Priority: 1
+      ComputeEnvironmentOrder:
+        - Order: 1
+          ComputeEnvironment: !Ref BatchComputeEnvironment
+      Tags:
+        Name: !Sub '${ProjectName}-spot-job-queue-${Environment}'
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  # Batch Job Definition
+  BatchJobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      JobDefinitionName: !Sub '${ProjectName}-job-definition-${Environment}'
+      Type: container
+      ContainerProperties:
+        Image: !Ref ContainerImage
+        Vcpus: !Ref ContainerVCpus
+        Memory: !Ref ContainerMemory
+        JobRoleArn: !GetAtt JobExecutionRole.Arn
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref BatchLogGroup
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: 'batch-job'
+        Environment:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+          - Name: PROJECT_NAME
+            Value: !Ref ProjectName
+      RetryStrategy:
+        Attempts: !Ref JobRetryAttempts
+        EvaluateOnExit:
+          - Action: RETRY
+            OnStatusReason: 'Host EC2*'
+          - Action: EXIT
+            OnReason: '*'
+      Timeout:
+        AttemptDurationSeconds: !Ref JobTimeoutSeconds
+      Tags:
+        Name: !Sub '${ProjectName}-job-definition-${Environment}'
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  # CloudWatch Alarms for monitoring
+  SpotInterruptionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-spot-interruption-${Environment}'
+      AlarmDescription: 'Monitor Spot instance interruptions in batch compute environment'
+      MetricName: RunningJobs
+      Namespace: AWS/Batch
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: JobQueue
+          Value: !Ref BatchJobQueue
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref BatchNotificationTopic
+
+  FailedJobsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-failed-jobs-${Environment}'
+      AlarmDescription: 'Monitor failed batch jobs'
+      MetricName: FailedJobs
+      Namespace: AWS/Batch
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: JobQueue
+          Value: !Ref BatchJobQueue
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref BatchNotificationTopic
+
+  # SNS Topic for notifications
+  BatchNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-batch-notifications-${Environment}'
+      DisplayName: !Sub 'Batch Processing Notifications - ${Environment}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-batch-notifications-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # EventBridge Rule for Batch job state changes
+  BatchJobStateChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-batch-job-state-change-${Environment}'
+      Description: 'Capture batch job state changes'
+      EventPattern:
+        source:
+          - 'aws.batch'
+        detail-type:
+          - 'Batch Job State Change'
+        detail:
+          jobQueue:
+            - !Ref BatchJobQueue
+          jobStatus:
+            - 'FAILED'
+            - 'SUCCEEDED'
+      State: ENABLED
+      Targets:
+        - Arn: !Ref BatchNotificationTopic
+          Id: 'BatchJobStateChangeTarget'
+          InputTransformer:
+            InputPathsMap:
+              jobName: '$.detail.jobName'
+              jobStatus: '$.detail.jobStatus'
+              jobQueue: '$.detail.jobQueue'
+            InputTemplate: |
+              {
+                "jobName": "<jobName>",
+                "jobStatus": "<jobStatus>",
+                "jobQueue": "<jobQueue>",
+                "message": "Batch job <jobName> in queue <jobQueue> has changed state to <jobStatus>"
+              }
+
+# Outputs
+Outputs:
+  ECRRepositoryURI:
+    Description: 'URI of the ECR repository for batch container images'
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${BatchECRRepository}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ECR-Repository-URI'
+
+  ComputeEnvironmentName:
+    Description: 'Name of the batch compute environment'
+    Value: !Ref BatchComputeEnvironment
+    Export:
+      Name: !Sub '${AWS::StackName}-Compute-Environment-Name'
+
+  JobQueueName:
+    Description: 'Name of the batch job queue'
+    Value: !Ref BatchJobQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-Job-Queue-Name'
+
+  JobDefinitionName:
+    Description: 'Name of the batch job definition'
+    Value: !Ref BatchJobDefinition
+    Export:
+      Name: !Sub '${AWS::StackName}-Job-Definition-Name'
+
+  JobDefinitionArn:
+    Description: 'ARN of the batch job definition'
+    Value: !Ref BatchJobDefinition
+    Export:
+      Name: !Sub '${AWS::StackName}-Job-Definition-ARN'
+
+  BatchServiceRoleArn:
+    Description: 'ARN of the batch service role'
+    Value: !GetAtt BatchServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-Batch-Service-Role-ARN'
+
+  JobExecutionRoleArn:
+    Description: 'ARN of the job execution role'
+    Value: !GetAtt JobExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-Job-Execution-Role-ARN'
+
+  SecurityGroupId:
+    Description: 'ID of the security group (if created)'
+    Value: !If [ShouldCreateSecurityGroup, !Ref BatchSecurityGroup, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-Security-Group-ID'
+
+  LogGroupName:
+    Description: 'Name of the CloudWatch log group for batch jobs'
+    Value: !Ref BatchLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-Log-Group-Name'
+
+  NotificationTopicArn:
+    Description: 'ARN of the SNS topic for batch notifications'
+    Value: !Ref BatchNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-Notification-Topic-ARN'
+
+  # Commands for easy access
+  ECRLoginCommand:
+    Description: 'Command to login to ECR'
+    Value: !Sub 'aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'
+
+  SubmitJobCommand:
+    Description: 'Example command to submit a batch job'
+    Value: !Sub |
+      aws batch submit-job \
+        --job-name my-batch-job-$(date +%s) \
+        --job-queue ${BatchJobQueue} \
+        --job-definition ${BatchJobDefinition}
+
+  MonitorJobCommand:
+    Description: 'Command to monitor batch jobs'
+    Value: !Sub |
+      aws batch list-jobs \
+        --job-queue ${BatchJobQueue} \
+        --job-status RUNNING \
+        --output table
+
+  ViewLogsCommand:
+    Description: 'Command to view batch job logs'
+    Value: !Sub |
+      aws logs describe-log-streams \
+        --log-group-name ${BatchLogGroup} \
+        --order-by LastEventTime \
+        --descending \
+        --output table

@@ -1,0 +1,792 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'S3 Inventory and Storage Analytics Reporting - Creates comprehensive storage analytics pipeline with S3 Inventory, Storage Class Analysis, Athena querying, and automated reporting'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - SourceBucketName
+          - DestinationBucketName
+          - InventoryPrefix
+          - AnalyticsPrefix
+      - Label:
+          default: "Analytics Configuration"
+        Parameters:
+          - AthenaDatabaseName
+          - AthenaTableName
+          - InventoryFrequency
+      - Label:
+          default: "Automation Configuration"
+        Parameters:
+          - ReportingSchedule
+          - EnableAutomatedReporting
+          - NotificationEmail
+      - Label:
+          default: "Tagging and Naming"
+        Parameters:
+          - ProjectName
+          - Environment
+          - CostCenter
+    ParameterLabels:
+      SourceBucketName:
+        default: "Source S3 Bucket Name"
+      DestinationBucketName:
+        default: "Destination S3 Bucket Name"
+      InventoryPrefix:
+        default: "Inventory Reports Prefix"
+      AnalyticsPrefix:
+        default: "Analytics Reports Prefix"
+      AthenaDatabaseName:
+        default: "Athena Database Name"
+      AthenaTableName:
+        default: "Athena Table Name"
+      InventoryFrequency:
+        default: "Inventory Report Frequency"
+      ReportingSchedule:
+        default: "Automated Reporting Schedule"
+      EnableAutomatedReporting:
+        default: "Enable Automated Reporting"
+      NotificationEmail:
+        default: "Notification Email Address"
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      CostCenter:
+        default: "Cost Center"
+
+Parameters:
+  SourceBucketName:
+    Type: String
+    Description: Name of the S3 bucket to analyze (will be created if it doesn't exist)
+    Default: !Sub 'storage-analytics-source-${AWS::AccountId}'
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: Bucket name must be lowercase, contain only letters, numbers, and hyphens
+
+  DestinationBucketName:
+    Type: String
+    Description: Name of the S3 bucket for storing inventory and analytics reports
+    Default: !Sub 'storage-analytics-reports-${AWS::AccountId}'
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: Bucket name must be lowercase, contain only letters, numbers, and hyphens
+
+  InventoryPrefix:
+    Type: String
+    Description: Prefix for S3 inventory reports
+    Default: 'inventory-reports/'
+    AllowedPattern: '^[a-zA-Z0-9/_-]*/$'
+    ConstraintDescription: Must end with a forward slash
+
+  AnalyticsPrefix:
+    Type: String
+    Description: Prefix for storage analytics reports
+    Default: 'analytics-reports/'
+    AllowedPattern: '^[a-zA-Z0-9/_-]*/$'
+    ConstraintDescription: Must end with a forward slash
+
+  AthenaDatabaseName:
+    Type: String
+    Description: Name for the Athena database
+    Default: 's3_inventory_db'
+    AllowedPattern: '^[a-z][a-z0-9_]*$'
+    ConstraintDescription: Must start with a letter and contain only lowercase letters, numbers, and underscores
+
+  AthenaTableName:
+    Type: String
+    Description: Name for the Athena table
+    Default: 'inventory_table'
+    AllowedPattern: '^[a-z][a-z0-9_]*$'
+    ConstraintDescription: Must start with a letter and contain only lowercase letters, numbers, and underscores
+
+  InventoryFrequency:
+    Type: String
+    Description: Frequency for S3 inventory reports
+    Default: 'Daily'
+    AllowedValues:
+      - 'Daily'
+      - 'Weekly'
+
+  ReportingSchedule:
+    Type: String
+    Description: Schedule expression for automated reporting (EventBridge rate expression)
+    Default: 'rate(1 day)'
+    AllowedPattern: '^rate\([0-9]+ (minute|minutes|hour|hours|day|days)\)$'
+    ConstraintDescription: Must be a valid EventBridge rate expression
+
+  EnableAutomatedReporting:
+    Type: String
+    Description: Enable automated reporting with Lambda and EventBridge
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for notifications (optional)
+    Default: ''
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address or empty
+
+  ProjectName:
+    Type: String
+    Description: Project name for resource tagging
+    Default: 'S3-Storage-Analytics'
+    AllowedPattern: '^[a-zA-Z0-9-_]+$'
+    ConstraintDescription: Must contain only letters, numbers, hyphens, and underscores
+
+  Environment:
+    Type: String
+    Description: Environment for resource tagging
+    Default: 'Production'
+    AllowedValues:
+      - 'Development'
+      - 'Staging'
+      - 'Production'
+
+  CostCenter:
+    Type: String
+    Description: Cost center for resource tagging
+    Default: 'IT-Operations'
+    AllowedPattern: '^[a-zA-Z0-9-_]+$'
+    ConstraintDescription: Must contain only letters, numbers, hyphens, and underscores
+
+Conditions:
+  CreateSourceBucket: !Not [!Equals [!Ref SourceBucketName, '']]
+  EnableReporting: !Equals [!Ref EnableAutomatedReporting, 'true']
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  IsDailyInventory: !Equals [!Ref InventoryFrequency, 'Daily']
+
+Resources:
+  # S3 Source Bucket for demonstration/testing
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateSourceBucket
+    Properties:
+      BucketName: !Ref SourceBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref DestinationBucket
+        LogFilePrefix: 'access-logs/source-bucket/'
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-source-bucket'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: 'Storage Analytics Source'
+
+  # S3 Destination Bucket for reports and analytics
+  DestinationBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref DestinationBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: 'InventoryReportsLifecycle'
+            Status: Enabled
+            Prefix: !Ref InventoryPrefix
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+          - Id: 'AnalyticsReportsLifecycle'
+            Status: Enabled
+            Prefix: !Ref AnalyticsPrefix
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+          - Id: 'AthenaResultsLifecycle'
+            Status: Enabled
+            Prefix: 'athena-results/'
+            ExpirationInDays: 365
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-destination-bucket'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: 'Storage Analytics Destination'
+
+  # Bucket Policy for S3 Inventory Service
+  DestinationBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DestinationBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: 'InventoryDestinationBucketPolicy'
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - 's3:PutObject'
+              - 's3:GetBucketAcl'
+            Resource:
+              - !Sub '${DestinationBucket}/*'
+              - !Sub '${DestinationBucket}'
+            Condition:
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:aws:s3:::${SourceBucketName}'
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+                's3:x-amz-acl': 'bucket-owner-full-control'
+          - Sid: 'AllowAthenaAccess'
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt LambdaExecutionRole.Arn
+            Action:
+              - 's3:GetObject'
+              - 's3:ListBucket'
+              - 's3:PutObject'
+            Resource:
+              - !Sub '${DestinationBucket}/*'
+              - !Sub '${DestinationBucket}'
+
+  # CloudWatch Log Group for S3 Access Logs
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}/access-logs'
+      RetentionInDays: 90
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Glue Database for Athena
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseInput:
+        Name: !Ref AthenaDatabaseName
+        Description: 'Database for S3 inventory analytics and reporting'
+        Parameters:
+          classification: 'inventory'
+          project: !Ref ProjectName
+
+  # Glue Table for S3 Inventory Data
+  GlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: !Ref AthenaTableName
+        Description: 'Table for S3 inventory data analysis'
+        StorageDescriptor:
+          Columns:
+            - Name: bucket
+              Type: string
+              Comment: 'Bucket name'
+            - Name: key
+              Type: string
+              Comment: 'Object key'
+            - Name: version_id
+              Type: string
+              Comment: 'Object version ID'
+            - Name: is_latest
+              Type: boolean
+              Comment: 'Is latest version'
+            - Name: is_delete_marker
+              Type: boolean
+              Comment: 'Is delete marker'
+            - Name: size
+              Type: bigint
+              Comment: 'Object size in bytes'
+            - Name: last_modified_date
+              Type: string
+              Comment: 'Last modified date'
+            - Name: e_tag
+              Type: string
+              Comment: 'Object ETag'
+            - Name: storage_class
+              Type: string
+              Comment: 'Storage class'
+            - Name: is_multipart_uploaded
+              Type: boolean
+              Comment: 'Is multipart uploaded'
+            - Name: replication_status
+              Type: string
+              Comment: 'Replication status'
+            - Name: encryption_status
+              Type: string
+              Comment: 'Encryption status'
+          Location: !Sub 's3://${DestinationBucket}/${InventoryPrefix}'
+          InputFormat: 'org.apache.hadoop.mapred.TextInputFormat'
+          OutputFormat: 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+          SerdeInfo:
+            SerializationLibrary: 'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe'
+            Parameters:
+              field.delim: ','
+              skip.header.line.count: '1'
+        Parameters:
+          has_encrypted_data: 'false'
+          classification: 'csv'
+          delimiter: ','
+          skip.header.line.count: '1'
+
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-LambdaExecutionRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: 'StorageAnalyticsPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'athena:StartQueryExecution'
+                  - 'athena:GetQueryExecution'
+                  - 'athena:GetQueryResults'
+                  - 'athena:StopQueryExecution'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:ListBucket'
+                  - 's3:GetBucketLocation'
+                Resource:
+                  - !Sub '${DestinationBucket}/*'
+                  - !Sub '${DestinationBucket}'
+                  - !Sub '${SourceBucket}/*'
+                  - !Sub '${SourceBucket}'
+              - Effect: Allow
+                Action:
+                  - 'glue:GetDatabase'
+                  - 'glue:GetTable'
+                  - 'glue:GetPartitions'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !If
+                  - HasNotificationEmail
+                  - !Ref NotificationTopic
+                  - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Lambda Function for Automated Reporting
+  StorageAnalyticsFunction:
+    Type: AWS::Lambda::Function
+    Condition: EnableReporting
+    Properties:
+      FunctionName: !Sub '${ProjectName}-StorageAnalyticsFunction'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          ATHENA_DATABASE: !Ref AthenaDatabaseName
+          ATHENA_TABLE: !Ref AthenaTableName
+          DEST_BUCKET: !Ref DestinationBucket
+          SOURCE_BUCKET: !Ref SourceBucketName
+          SNS_TOPIC_ARN: !If
+            - HasNotificationEmail
+            - !Ref NotificationTopic
+            - ''
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          import time
+          
+          def lambda_handler(event, context):
+              athena = boto3.client('athena')
+              s3 = boto3.client('s3')
+              sns = boto3.client('sns') if os.environ.get('SNS_TOPIC_ARN') else None
+              
+              # Configuration
+              database = os.environ['ATHENA_DATABASE']
+              table = os.environ['ATHENA_TABLE']
+              output_bucket = os.environ['DEST_BUCKET']
+              source_bucket = os.environ['SOURCE_BUCKET']
+              sns_topic = os.environ.get('SNS_TOPIC_ARN')
+              
+              # Storage optimization insights query
+              query = f"""
+              SELECT 
+                  storage_class,
+                  COUNT(*) as object_count,
+                  SUM(size) as total_size_bytes,
+                  ROUND(SUM(size) / 1024.0 / 1024.0 / 1024.0, 2) as total_size_gb,
+                  ROUND(AVG(size) / 1024.0 / 1024.0, 2) as avg_size_mb,
+                  MIN(last_modified_date) as oldest_object,
+                  MAX(last_modified_date) as newest_object
+              FROM {database}.{table}
+              WHERE bucket = '{source_bucket}'
+              GROUP BY storage_class
+              ORDER BY total_size_bytes DESC;
+              """
+              
+              try:
+                  # Execute query
+                  response = athena.start_query_execution(
+                      QueryString=query,
+                      ResultConfiguration={
+                          'OutputLocation': f's3://{output_bucket}/athena-results/'
+                      },
+                      WorkGroup='primary'
+                  )
+                  
+                  query_execution_id = response['QueryExecutionId']
+                  
+                  # Wait for query completion
+                  max_execution = 60  # seconds
+                  poll_interval = 2
+                  
+                  for _ in range(max_execution // poll_interval):
+                      result = athena.get_query_execution(QueryExecutionId=query_execution_id)
+                      status = result['QueryExecution']['Status']['State']
+                      
+                      if status in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+                          break
+                      
+                      time.sleep(poll_interval)
+                  
+                  # Send notification if SNS topic is configured
+                  if sns and sns_topic and status == 'SUCCEEDED':
+                      message = f"""
+                      Storage Analytics Report Generated Successfully
+                      
+                      Query Execution ID: {query_execution_id}
+                      Source Bucket: {source_bucket}
+                      Report Time: {datetime.now().isoformat()}
+                      
+                      View results in S3: s3://{output_bucket}/athena-results/
+                      """
+                      
+                      sns.publish(
+                          TopicArn=sns_topic,
+                          Subject='Storage Analytics Report - Success',
+                          Message=message
+                      )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Storage analytics query executed successfully',
+                          'queryExecutionId': query_execution_id,
+                          'status': status
+                      })
+                  }
+                  
+              except Exception as e:
+                  error_message = str(e)
+                  
+                  # Send error notification if SNS topic is configured
+                  if sns and sns_topic:
+                      sns.publish(
+                          TopicArn=sns_topic,
+                          Subject='Storage Analytics Report - Error',
+                          Message=f'Error executing storage analytics query: {error_message}'
+                      )
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': error_message
+                      })
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # EventBridge Rule for Scheduled Reporting
+  ReportingScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: EnableReporting
+    Properties:
+      Name: !Sub '${ProjectName}-StorageAnalyticsSchedule'
+      Description: 'Scheduled execution of storage analytics reporting'
+      ScheduleExpression: !Ref ReportingSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt StorageAnalyticsFunction.Arn
+          Id: 'StorageAnalyticsTarget'
+          Input: !Sub |
+            {
+              "source": "eventbridge",
+              "timestamp": "${AWS::StackName}",
+              "detail": {
+                "scheduled": true
+              }
+            }
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableReporting
+    Properties:
+      FunctionName: !Ref StorageAnalyticsFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ReportingScheduleRule.Arn
+
+  # SNS Topic for Notifications (optional)
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasNotificationEmail
+    Properties:
+      TopicName: !Sub '${ProjectName}-StorageAnalyticsNotifications'
+      DisplayName: 'Storage Analytics Notifications'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # SNS Subscription for Email Notifications
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Dashboard
+  StorageAnalyticsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-StorageAnalytics'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/S3", "BucketSizeBytes", "BucketName", "${SourceBucketName}", "StorageType", "StandardStorage"],
+                  [".", ".", ".", ".", ".", "StandardIAStorage"],
+                  [".", ".", ".", ".", ".", "GlacierStorage"],
+                  [".", "NumberOfObjects", ".", ".", ".", "AllStorageTypes"]
+                ],
+                "period": 86400,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "S3 Storage Metrics - ${SourceBucketName}",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/S3", "AllRequests", "BucketName", "${SourceBucketName}"],
+                  [".", "GetRequests", ".", "."],
+                  [".", "PutRequests", ".", "."]
+                ],
+                "period": 3600,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "S3 Request Metrics - ${SourceBucketName}"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${ProjectName}-StorageAnalyticsFunction' | fields @timestamp, @message\n| filter @message like /statusCode/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Logs",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+# Outputs for reference and integration
+Outputs:
+  SourceBucketName:
+    Description: 'Name of the source S3 bucket for analysis'
+    Value: !Ref SourceBucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-SourceBucket'
+
+  DestinationBucketName:
+    Description: 'Name of the destination S3 bucket for reports'
+    Value: !Ref DestinationBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DestinationBucket'
+
+  DestinationBucketArn:
+    Description: 'ARN of the destination S3 bucket'
+    Value: !GetAtt DestinationBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DestinationBucketArn'
+
+  AthenaDatabaseName:
+    Description: 'Name of the Athena database for inventory queries'
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaDatabase'
+
+  AthenaTableName:
+    Description: 'Name of the Athena table for inventory data'
+    Value: !Ref GlueTable
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaTable'
+
+  LambdaFunctionArn:
+    Condition: EnableReporting
+    Description: 'ARN of the Lambda function for automated reporting'
+    Value: !GetAtt StorageAnalyticsFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
+
+  CloudWatchDashboardURL:
+    Description: 'URL to the CloudWatch dashboard'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-StorageAnalytics'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  NotificationTopicArn:
+    Condition: HasNotificationEmail
+    Description: 'ARN of the SNS topic for notifications'
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopic'
+
+  SampleInventoryConfiguration:
+    Description: 'Sample CLI command to configure S3 inventory'
+    Value: !Sub |
+      aws s3api put-bucket-inventory-configuration --bucket ${SourceBucketName} --id daily-inventory --inventory-configuration '{
+        "Id": "daily-inventory",
+        "IsEnabled": true,
+        "IncludedObjectVersions": "Current",
+        "Schedule": {"Frequency": "${InventoryFrequency}"},
+        "OptionalFields": ["Size", "LastModifiedDate", "StorageClass", "ETag", "ReplicationStatus", "EncryptionStatus"],
+        "Destination": {
+          "S3BucketDestination": {
+            "AccountId": "${AWS::AccountId}",
+            "Bucket": "arn:aws:s3:::${DestinationBucket}",
+            "Format": "CSV",
+            "Prefix": "${InventoryPrefix}"
+          }
+        }
+      }'
+
+  SampleAnalyticsConfiguration:
+    Description: 'Sample CLI command to configure storage analytics'
+    Value: !Sub |
+      aws s3api put-bucket-analytics-configuration --bucket ${SourceBucketName} --id storage-analytics --analytics-configuration '{
+        "Id": "storage-analytics",
+        "StorageClassAnalysis": {
+          "DataExport": {
+            "OutputSchemaVersion": "V_1",
+            "Destination": {
+              "S3BucketDestination": {
+                "Format": "CSV",
+                "BucketAccountId": "${AWS::AccountId}",
+                "Bucket": "arn:aws:s3:::${DestinationBucket}",
+                "Prefix": "${AnalyticsPrefix}"
+              }
+            }
+          }
+        }
+      }'
+
+  AthenaQueryExample:
+    Description: 'Sample Athena query for storage analysis'
+    Value: !Sub |
+      SELECT storage_class, COUNT(*) as object_count, SUM(size) as total_size_bytes 
+      FROM ${AthenaDatabaseName}.${AthenaTableName} 
+      GROUP BY storage_class 
+      ORDER BY total_size_bytes DESC;
+
+  SetupInstructions:
+    Description: 'Next steps to complete the setup'
+    Value: !Sub |
+      1. Configure S3 Inventory using the SampleInventoryConfiguration output
+      2. Configure Storage Analytics using the SampleAnalyticsConfiguration output  
+      3. Wait 24-48 hours for first inventory report
+      4. Query data using Athena with the provided database and table
+      5. View metrics in CloudWatch dashboard: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-StorageAnalytics

@@ -1,0 +1,433 @@
+# Infrastructure Manager Configuration for Log-Driven Automation
+# This configuration deploys the complete log-driven automation solution
+# including Pub/Sub topics, Cloud Functions, log sinks, and monitoring policies
+
+metadata:
+  version: 1.0
+  author: Google Cloud Infrastructure Manager
+  description: "Log-driven automation with Cloud Logging, Pub/Sub, and Cloud Functions"
+
+# Input parameters for customization
+inputs:
+  - name: project_id
+    description: "Google Cloud Project ID"
+    type: string
+    required: true
+  
+  - name: region
+    description: "Google Cloud region for resources"
+    type: string
+    default: "us-central1"
+  
+  - name: zone
+    description: "Google Cloud zone for compute resources"
+    type: string
+    default: "us-central1-a"
+  
+  - name: topic_name
+    description: "Pub/Sub topic name for incident automation"
+    type: string
+    default: "incident-automation"
+  
+  - name: alert_function_name
+    description: "Name for the alert processing Cloud Function"
+    type: string
+    default: "alert-processor"
+  
+  - name: remediation_function_name
+    description: "Name for the auto-remediation Cloud Function"
+    type: string
+    default: "auto-remediate"
+  
+  - name: log_sink_name
+    description: "Name for the Cloud Logging sink"
+    type: string
+    default: "automation-sink"
+  
+  - name: slack_webhook_url
+    description: "Slack webhook URL for notifications (optional)"
+    type: string
+    default: ""
+  
+  - name: enable_monitoring_policies
+    description: "Enable Cloud Monitoring alerting policies"
+    type: boolean
+    default: true
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/logging.googleapis.com
+    metadata:
+      runtimePolicy:
+        - CREATE
+
+  - name: enable-pubsub-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/pubsub.googleapis.com
+    metadata:
+      runtimePolicy:
+        - CREATE
+
+  - name: enable-functions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/cloudfunctions.googleapis.com
+    metadata:
+      runtimePolicy:
+        - CREATE
+
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/monitoring.googleapis.com
+    metadata:
+      runtimePolicy:
+        - CREATE
+
+  # Pub/Sub Topic for incident automation
+  - name: incident-automation-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project_id.projectId)/topics/$(inputs.topic_name)
+      labels:
+        purpose: log-automation
+        environment: production
+    depends_on:
+      - enable-pubsub-api
+
+  # Pub/Sub Subscription for alert processing
+  - name: alert-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(ref.project_id.projectId)/subscriptions/alert-subscription
+      topic: $(ref.incident-automation-topic.name)
+      ackDeadlineSeconds: 60
+      labels:
+        purpose: alert-processing
+        environment: production
+    depends_on:
+      - incident-automation-topic
+
+  # Pub/Sub Subscription for remediation with message filtering
+  - name: remediation-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(ref.project_id.projectId)/subscriptions/remediation-subscription
+      topic: $(ref.incident-automation-topic.name)
+      ackDeadlineSeconds: 300
+      filter: 'attributes.severity="HIGH" OR attributes.type="ERROR"'
+      labels:
+        purpose: auto-remediation
+        environment: production
+    depends_on:
+      - incident-automation-topic
+
+  # Cloud Storage bucket for Cloud Function source code
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:bucket
+    properties:
+      name: $(ref.project_id.projectId)-function-source
+      location: $(inputs.region)
+      storageClass: STANDARD
+      labels:
+        purpose: function-source
+        environment: production
+    depends_on:
+      - enable-functions-api
+
+  # Alert Processing Cloud Function
+  - name: alert-processor-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      name: projects/$(ref.project_id.projectId)/locations/$(inputs.region)/functions/$(inputs.alert_function_name)
+      sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/alert-function.zip
+      entryPoint: processAlert
+      runtime: nodejs20
+      eventTrigger:
+        eventType: providers/cloud.pubsub/eventTypes/topic.publish
+        resource: $(ref.incident-automation-topic.name)
+      environmentVariables:
+        PROJECT_ID: $(ref.project_id.projectId)
+        SLACK_WEBHOOK_URL: $(inputs.slack_webhook_url)
+      availableMemoryMb: 256
+      timeout: 60s
+      labels:
+        purpose: alert-processing
+        environment: production
+    depends_on:
+      - incident-automation-topic
+      - function-source-bucket
+
+  # Auto-Remediation Cloud Function
+  - name: auto-remediation-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      name: projects/$(ref.project_id.projectId)/locations/$(inputs.region)/functions/$(inputs.remediation_function_name)
+      sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/remediation-function.zip
+      entryPoint: autoRemediate
+      runtime: nodejs20
+      eventTrigger:
+        eventType: providers/cloud.pubsub/eventTypes/topic.publish
+        resource: $(ref.incident-automation-topic.name)
+      environmentVariables:
+        PROJECT_ID: $(ref.project_id.projectId)
+        ZONE: $(inputs.zone)
+        TOPIC_NAME: $(inputs.topic_name)
+      availableMemoryMb: 512
+      timeout: 300s
+      labels:
+        purpose: auto-remediation
+        environment: production
+    depends_on:
+      - incident-automation-topic
+      - function-source-bucket
+
+  # Service Account for Log Sink
+  - name: log-sink-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: log-sink-sa
+      serviceAccount:
+        displayName: "Log Sink Service Account"
+        description: "Service account for Cloud Logging sink to Pub/Sub"
+    depends_on:
+      - enable-logging-api
+
+  # IAM binding for Log Sink Service Account
+  - name: log-sink-pubsub-publisher-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id.projectId)
+      role: roles/pubsub.publisher
+      member: serviceAccount:$(ref.log-sink-service-account.email)
+    depends_on:
+      - log-sink-service-account
+      - incident-automation-topic
+
+  # Cloud Logging Sink
+  - name: automation-log-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      name: $(inputs.log_sink_name)
+      destination: pubsub.googleapis.com/$(ref.incident-automation-topic.name)
+      filter: 'severity>=ERROR OR jsonPayload.level="ERROR" OR textPayload:"Exception"'
+      uniqueWriterIdentity: true
+      description: "Log sink for automated incident response"
+    depends_on:
+      - incident-automation-topic
+      - log-sink-pubsub-publisher-binding
+
+  # Log-based Metrics for Error Rate Monitoring
+  - name: error-rate-metric
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      name: error_rate_metric
+      description: "Tracks application error rates over time"
+      filter: 'severity>=ERROR'
+      metricDescriptor:
+        metricKind: GAUGE
+        valueType: INT64
+        labels:
+          - key: service
+            valueType: STRING
+            description: "Service name from log"
+      labelExtractors:
+        service: 'EXTRACT(jsonPayload.service)'
+    depends_on:
+      - enable-logging-api
+
+  # Log-based Metrics for Exception Patterns
+  - name: exception-pattern-metric
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      name: exception_pattern_metric
+      description: "Counts specific exception patterns"
+      filter: 'textPayload:"Exception" OR jsonPayload.exception_type!=""'
+      metricDescriptor:
+        metricKind: GAUGE
+        valueType: INT64
+        labels:
+          - key: exception_type
+            valueType: STRING
+            description: "Exception type from log"
+      labelExtractors:
+        exception_type: 'EXTRACT(jsonPayload.exception_type)'
+    depends_on:
+      - enable-logging-api
+
+  # Log-based Metrics for Latency Anomalies
+  - name: latency-anomaly-metric
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      name: latency_anomaly_metric
+      description: "Tracks request latency spikes"
+      filter: 'jsonPayload.response_time>5000'
+      metricDescriptor:
+        metricKind: GAUGE
+        valueType: DOUBLE
+      valueExtractor: 'EXTRACT(jsonPayload.response_time)'
+    depends_on:
+      - enable-logging-api
+
+  # Cloud Monitoring Alerting Policy for Error Rate
+  - name: error-rate-alerting-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: "High Error Rate Alert"
+      documentation:
+        content: "Alert when error rate exceeds normal thresholds"
+        mimeType: "text/markdown"
+      conditions:
+        - displayName: "Error rate condition"
+          conditionThreshold:
+            filter: 'resource.type="global" AND metric.type="logging.googleapis.com/user/error_rate_metric"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 10.0
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_SUM
+      alertStrategy:
+        autoClose: 1800s
+      enabled: true
+    depends_on:
+      - error-rate-metric
+      - enable-monitoring-api
+    metadata:
+      runtimePolicy:
+        - CREATE
+      dependsOn:
+        - $(inputs.enable_monitoring_policies)
+
+  # Cloud Monitoring Alerting Policy for Latency
+  - name: latency-alerting-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: "High Latency Alert"
+      documentation:
+        content: "Alert when response times indicate performance degradation"
+        mimeType: "text/markdown"
+      conditions:
+        - displayName: "Latency anomaly condition"
+          conditionThreshold:
+            filter: 'resource.type="global" AND metric.type="logging.googleapis.com/user/latency_anomaly_metric"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 5000.0
+            duration: 180s
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_MEAN
+      alertStrategy:
+        autoClose: 1200s
+      enabled: true
+    depends_on:
+      - latency-anomaly-metric
+      - enable-monitoring-api
+    metadata:
+      runtimePolicy:
+        - CREATE
+      dependsOn:
+        - $(inputs.enable_monitoring_policies)
+
+  # Log-based Alerting Policy for Critical Patterns
+  - name: critical-log-pattern-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: "Critical Log Pattern Alert"
+      documentation:
+        content: "Immediate alert for critical log patterns requiring urgent attention"
+        mimeType: "text/markdown"
+      conditions:
+        - displayName: "Critical error pattern"
+          conditionMatchedLog:
+            filter: 'severity=CRITICAL OR textPayload:("FATAL" OR "OutOfMemoryError" OR "StackOverflowError")'
+            labelExtractors:
+              service: 'EXTRACT(jsonPayload.service)'
+              instance: 'EXTRACT(resource.labels.instance_id)'
+      alertStrategy:
+        autoClose: 86400s
+      enabled: true
+    depends_on:
+      - enable-monitoring-api
+    metadata:
+      runtimePolicy:
+        - CREATE
+      dependsOn:
+        - $(inputs.enable_monitoring_policies)
+
+# Output values for reference and integration
+outputs:
+  - name: project_id
+    description: "Google Cloud Project ID"
+    value: $(ref.project_id.projectId)
+
+  - name: pubsub_topic_name
+    description: "Pub/Sub topic name for incident automation"
+    value: $(ref.incident-automation-topic.name)
+
+  - name: alert_function_name
+    description: "Alert processing Cloud Function name"
+    value: $(ref.alert-processor-function.name)
+
+  - name: remediation_function_name
+    description: "Auto-remediation Cloud Function name"
+    value: $(ref.auto-remediation-function.name)
+
+  - name: log_sink_name
+    description: "Cloud Logging sink name"
+    value: $(ref.automation-log-sink.name)
+
+  - name: function_source_bucket
+    description: "Cloud Storage bucket for function source code"
+    value: $(ref.function-source-bucket.name)
+
+  - name: alert_subscription_name
+    description: "Alert processing Pub/Sub subscription"
+    value: $(ref.alert-subscription.name)
+
+  - name: remediation_subscription_name
+    description: "Remediation Pub/Sub subscription"
+    value: $(ref.remediation-subscription.name)
+
+  - name: error_rate_metric_name
+    description: "Error rate log-based metric"
+    value: $(ref.error-rate-metric.name)
+
+  - name: exception_pattern_metric_name
+    description: "Exception pattern log-based metric"
+    value: $(ref.exception-pattern-metric.name)
+
+  - name: latency_anomaly_metric_name
+    description: "Latency anomaly log-based metric"
+    value: $(ref.latency-anomaly-metric.name)
+
+  - name: deployment_instructions
+    description: "Instructions for completing the deployment"
+    value: |
+      1. Upload Cloud Function source code to: gs://$(ref.function-source-bucket.name)/
+         - alert-function.zip: Contains alert processing function code
+         - remediation-function.zip: Contains auto-remediation function code
+      
+      2. Configure Slack webhook URL if notifications are required
+      
+      3. Test the automation pipeline by generating test log entries:
+         gcloud logging write test-logs "Test ERROR message" --severity=ERROR
+      
+      4. Monitor function execution in Cloud Functions console
+      
+      5. Review alerting policies in Cloud Monitoring console
+      
+      For detailed implementation, refer to the recipe documentation.
+
+# Deployment metadata
+deployment:
+  preview: true
+  create_policy: CREATE_OR_ACQUIRE
+  delete_policy: DELETE

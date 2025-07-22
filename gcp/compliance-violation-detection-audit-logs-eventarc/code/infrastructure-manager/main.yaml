@@ -1,0 +1,664 @@
+# Google Cloud Infrastructure Manager Configuration
+# Compliance Violation Detection with Cloud Audit Logs and Eventarc
+# This configuration deploys an automated compliance monitoring system
+# that processes audit logs in real-time and triggers alerts for violations
+
+# Import required modules and define global configuration
+imports:
+  - name: project-services
+    path: modules/project-services.yaml
+  - name: iam-bindings
+    path: modules/iam-bindings.yaml
+
+# Global configuration and metadata
+info:
+  title: "Compliance Violation Detection Infrastructure"
+  description: "Event-driven compliance monitoring system using Cloud Audit Logs and Eventarc"
+  version: "1.0"
+
+# Input parameters for customization
+properties:
+  # Project and region configuration
+  project_id:
+    type: string
+    description: "Google Cloud project ID"
+    pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+  
+  region:
+    type: string
+    description: "Primary region for deployments"
+    default: "us-central1"
+    enum:
+      - "us-central1"
+      - "us-east1"
+      - "us-west1"
+      - "europe-west1"
+      - "asia-southeast1"
+  
+  zone:
+    type: string
+    description: "Primary zone for zonal resources"
+    default: "us-central1-a"
+  
+  # Resource naming configuration
+  resource_prefix:
+    type: string
+    description: "Prefix for all resource names"
+    default: "compliance"
+    pattern: "^[a-z][a-z0-9-]{2,20}$"
+  
+  random_suffix:
+    type: string
+    description: "Random suffix for unique resource names"
+    default: "{{ env['deployment'] | replace('-', '') | truncate(6, True, '') }}"
+  
+  # Notification configuration
+  notification_email:
+    type: string
+    description: "Email address for compliance violation notifications"
+    pattern: "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
+  
+  # BigQuery configuration
+  bigquery_location:
+    type: string
+    description: "Location for BigQuery dataset"
+    default: "US"
+    enum: ["US", "EU", "asia-southeast1"]
+  
+  # Function configuration
+  function_memory:
+    type: integer
+    description: "Memory allocation for Cloud Function (MB)"
+    default: 512
+    minimum: 128
+    maximum: 8192
+  
+  function_timeout:
+    type: integer
+    description: "Timeout for Cloud Function (seconds)"
+    default: 540
+    minimum: 60
+    maximum: 3600
+
+# Infrastructure resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  enable-apis:
+    type: gcp-types/servicemanagement-v1:operations
+    properties:
+      # Cloud Functions API
+      - serviceName: cloudfunctions.googleapis.com
+        projectId: $(ref.project_id)
+      # Eventarc API for event routing
+      - serviceName: eventarc.googleapis.com
+        projectId: $(ref.project_id)
+      # Cloud Logging API for audit logs
+      - serviceName: logging.googleapis.com
+        projectId: $(ref.project_id)
+      # Pub/Sub API for messaging
+      - serviceName: pubsub.googleapis.com
+        projectId: $(ref.project_id)
+      # BigQuery API for data warehousing
+      - serviceName: bigquery.googleapis.com
+        projectId: $(ref.project_id)
+      # Cloud Monitoring API for alerts
+      - serviceName: monitoring.googleapis.com
+        projectId: $(ref.project_id)
+      # Cloud Run API (required for Eventarc)
+      - serviceName: run.googleapis.com
+        projectId: $(ref.project_id)
+      # Cloud Build API (for function deployment)
+      - serviceName: cloudbuild.googleapis.com
+        projectId: $(ref.project_id)
+    metadata:
+      dependsOn:
+        - project_id
+
+  # Pub/Sub topic for compliance violation alerts
+  compliance-alerts-topic:
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project_id)/topics/$(ref.resource_prefix)-alerts-$(ref.random_suffix)
+      labels:
+        purpose: compliance-monitoring
+        component: alerting
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # Pub/Sub subscription for alert processing
+  compliance-alerts-subscription:
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(ref.project_id)/subscriptions/$(ref.resource_prefix)-alerts-$(ref.random_suffix)-sub
+      topic: $(ref.compliance-alerts-topic.name)
+      ackDeadlineSeconds: 60
+      messageRetentionDuration: 604800s  # 7 days
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+      deadLetterPolicy:
+        deadLetterTopic: $(ref.compliance-dead-letter-topic.name)
+        maxDeliveryAttempts: 5
+      labels:
+        purpose: compliance-monitoring
+        component: alerting
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - compliance-alerts-topic
+        - compliance-dead-letter-topic
+
+  # Dead letter topic for failed message processing
+  compliance-dead-letter-topic:
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project_id)/topics/$(ref.resource_prefix)-dead-letter-$(ref.random_suffix)
+      labels:
+        purpose: compliance-monitoring
+        component: dead-letter
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # BigQuery dataset for compliance violation storage and analysis
+  compliance-dataset:
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      datasetId: $(ref.resource_prefix)_logs_$(ref.random_suffix)
+      projectId: $(ref.project_id)
+      location: $(ref.bigquery_location)
+      description: "Compliance violation logs and analysis data"
+      defaultTableExpirationMs: "7776000000"  # 90 days
+      labels:
+        purpose: compliance-monitoring
+        component: data-warehouse
+        managed-by: infrastructure-manager
+      access:
+        - role: OWNER
+          userByEmail: $(ref.project_id)@appspot.gserviceaccount.com
+        - role: WRITER
+          userByEmail: $(ref.compliance-function-sa.email)
+    metadata:
+      dependsOn:
+        - enable-apis
+        - compliance-function-sa
+
+  # BigQuery table for violation records
+  violations-table:
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: $(ref.project_id)
+      datasetId: $(ref.compliance-dataset.datasetReference.datasetId)
+      tableId: violations
+      description: "Detailed compliance violation records"
+      schema:
+        fields:
+          - name: timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "When the violation occurred"
+          - name: violation_type
+            type: STRING
+            mode: REQUIRED
+            description: "Type of compliance violation"
+          - name: severity
+            type: STRING
+            mode: REQUIRED
+            description: "Severity level (LOW, MEDIUM, HIGH, CRITICAL)"
+          - name: resource
+            type: STRING
+            mode: NULLABLE
+            description: "Affected resource identifier"
+          - name: principal
+            type: STRING
+            mode: NULLABLE
+            description: "User or service account that triggered the violation"
+          - name: details
+            type: STRING
+            mode: NULLABLE
+            description: "Detailed violation information"
+          - name: remediation_status
+            type: STRING
+            mode: REQUIRED
+            description: "Current remediation status"
+          - name: project_id
+            type: STRING
+            mode: REQUIRED
+            description: "Google Cloud project where violation occurred"
+          - name: audit_log_entry
+            type: JSON
+            mode: NULLABLE
+            description: "Original audit log entry for forensic analysis"
+      timePartitioning:
+        type: DAY
+        field: timestamp
+        expirationMs: "7776000000"  # 90 days
+      labels:
+        purpose: compliance-monitoring
+        component: violations-table
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - compliance-dataset
+
+  # Service account for Cloud Function
+  compliance-function-sa:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: $(ref.resource_prefix)-detector-$(ref.random_suffix)
+      projectId: $(ref.project_id)
+      displayName: "Compliance Detection Function Service Account"
+      description: "Service account for processing audit logs and detecting violations"
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # IAM binding for BigQuery data editor role
+  bigquery-data-editor-binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/bigquery.dataEditor
+      member: serviceAccount:$(ref.compliance-function-sa.email)
+    metadata:
+      dependsOn:
+        - compliance-function-sa
+
+  # IAM binding for Pub/Sub publisher role
+  pubsub-publisher-binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/pubsub.publisher
+      member: serviceAccount:$(ref.compliance-function-sa.email)
+    metadata:
+      dependsOn:
+        - compliance-function-sa
+
+  # IAM binding for Cloud Monitoring metric writer role
+  monitoring-writer-binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/monitoring.metricWriter
+      member: serviceAccount:$(ref.compliance-function-sa.email)
+    metadata:
+      dependsOn:
+        - compliance-function-sa
+
+  # IAM binding for Cloud Logging writer role
+  logging-writer-binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/logging.logWriter
+      member: serviceAccount:$(ref.compliance-function-sa.email)
+    metadata:
+      dependsOn:
+        - compliance-function-sa
+
+  # Cloud Storage bucket for function source code
+  function-source-bucket:
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(ref.project_id)-$(ref.resource_prefix)-functions-$(ref.random_suffix)
+      location: $(ref.region)
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              numNewerVersions: 3
+      labels:
+        purpose: compliance-monitoring
+        component: function-source
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # Cloud Function for compliance detection
+  compliance-detection-function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project_id)/locations/$(ref.region)
+      functionId: $(ref.resource_prefix)-detector-$(ref.random_suffix)
+      function:
+        name: projects/$(ref.project_id)/locations/$(ref.region)/functions/$(ref.resource_prefix)-detector-$(ref.random_suffix)
+        description: "Analyzes audit logs for compliance violations and triggers alerts"
+        sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/compliance-function.zip
+        entryPoint: analyzeAuditLog
+        runtime: nodejs20
+        timeout: $(ref.function_timeout)s
+        availableMemoryMb: $(ref.function_memory)
+        serviceAccountEmail: $(ref.compliance-function-sa.email)
+        environmentVariables:
+          TOPIC_NAME: $(ref.compliance-alerts-topic.name)
+          DATASET_NAME: $(ref.compliance-dataset.datasetReference.datasetId)
+          PROJECT_ID: $(ref.project_id)
+          NOTIFICATION_EMAIL: $(ref.notification_email)
+        labels:
+          purpose: compliance-monitoring
+          component: detection-function
+          managed-by: infrastructure-manager
+        httpsTrigger: {}
+    metadata:
+      dependsOn:
+        - compliance-function-sa
+        - compliance-alerts-topic
+        - compliance-dataset
+        - function-source-bucket
+        - bigquery-data-editor-binding
+        - pubsub-publisher-binding
+        - monitoring-writer-binding
+
+  # Eventarc trigger for Cloud Audit Logs
+  audit-log-trigger:
+    type: gcp-types/eventarc-v1:projects.locations.triggers
+    properties:
+      parent: projects/$(ref.project_id)/locations/$(ref.region)
+      triggerId: $(ref.resource_prefix)-audit-trigger-$(ref.random_suffix)
+      trigger:
+        name: projects/$(ref.project_id)/locations/$(ref.region)/triggers/$(ref.resource_prefix)-audit-trigger-$(ref.random_suffix)
+        eventFilters:
+          - attribute: type
+            value: google.cloud.audit.log.v1.written
+        destination:
+          cloudFunction:
+            function: $(ref.compliance-detection-function.name)
+            region: $(ref.region)
+        serviceAccount: $(ref.eventarc-sa.email)
+        labels:
+          purpose: compliance-monitoring
+          component: event-trigger
+          managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - compliance-detection-function
+        - eventarc-sa
+        - eventarc-invoker-binding
+
+  # Service account for Eventarc
+  eventarc-sa:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: $(ref.resource_prefix)-eventarc-$(ref.random_suffix)
+      projectId: $(ref.project_id)
+      displayName: "Eventarc Service Account for Compliance Monitoring"
+      description: "Service account for Eventarc to invoke Cloud Functions"
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # IAM binding for Eventarc to invoke Cloud Functions
+  eventarc-invoker-binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/cloudfunctions.invoker
+      member: serviceAccount:$(ref.eventarc-sa.email)
+    metadata:
+      dependsOn:
+        - eventarc-sa
+
+  # Log sink for enhanced audit log routing to BigQuery
+  compliance-audit-sink:
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      sinkId: $(ref.resource_prefix)-audit-sink-$(ref.random_suffix)
+      parent: projects/$(ref.project_id)
+      destination: bigquery.googleapis.com/projects/$(ref.project_id)/datasets/$(ref.compliance-dataset.datasetReference.datasetId)
+      filter: 'protoPayload.@type="type.googleapis.com/google.cloud.audit.AuditLog"'
+      description: "Routes audit logs to BigQuery for compliance analysis"
+      includeChildren: true
+    metadata:
+      dependsOn:
+        - compliance-dataset
+        - enable-apis
+
+  # Log-based metric for compliance violations
+  compliance-violations-metric:
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      metricId: compliance_violations
+      parent: projects/$(ref.project_id)
+      description: "Count of compliance violations detected by the monitoring system"
+      filter: 'resource.type="cloud_function" AND resource.labels.function_name="$(ref.resource_prefix)-detector-$(ref.random_suffix)" AND textPayload:"violation"'
+      metricDescriptor:
+        metricKind: COUNTER
+        valueType: INT64
+        displayName: "Compliance Violations"
+        description: "Number of compliance violations detected"
+        labels:
+          - key: violation_type
+            valueType: STRING
+            description: "Type of compliance violation"
+          - key: severity
+            valueType: STRING
+            description: "Severity level of the violation"
+    metadata:
+      dependsOn:
+        - compliance-detection-function
+
+  # Cloud Monitoring alert policy for high-severity violations
+  high-severity-alert-policy:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(ref.project_id)
+      displayName: "High Severity Compliance Violations"
+      documentation:
+        content: "Alert triggered when high-severity compliance violations are detected"
+        mimeType: text/markdown
+      conditions:
+        - displayName: "High severity violations detected"
+          conditionThreshold:
+            filter: 'metric.type="logging.googleapis.com/user/compliance_violations" AND metric.labels.severity="HIGH"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 0
+            duration: 60s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_SUM
+      alertStrategy:
+        autoClose: 1800s  # 30 minutes
+      enabled: true
+      combiner: OR
+    metadata:
+      dependsOn:
+        - compliance-violations-metric
+
+  # Cloud Monitoring notification channel for email alerts
+  email-notification-channel:
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      parent: projects/$(ref.project_id)
+      type: email
+      displayName: "Compliance Team Email Notifications"
+      description: "Email notifications for compliance violations"
+      labels:
+        email_address: $(ref.notification_email)
+      enabled: true
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # Update alert policy to include notification channel
+  high-severity-alert-policy-with-notifications:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(ref.project_id)
+      displayName: "High Severity Compliance Violations with Notifications"
+      documentation:
+        content: |
+          # High Severity Compliance Violations
+          
+          This alert is triggered when high-severity compliance violations are detected in the system.
+          
+          ## Response Actions
+          1. Review the violation details in the BigQuery dataset
+          2. Investigate the root cause
+          3. Implement appropriate remediation
+          4. Update compliance policies if necessary
+        mimeType: text/markdown
+      conditions:
+        - displayName: "High severity violations detected"
+          conditionThreshold:
+            filter: 'metric.type="logging.googleapis.com/user/compliance_violations" AND metric.labels.severity="HIGH"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 0
+            duration: 60s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_SUM
+      alertStrategy:
+        autoClose: 1800s  # 30 minutes
+      enabled: true
+      combiner: OR
+      notificationChannels:
+        - $(ref.email-notification-channel.name)
+    metadata:
+      dependsOn:
+        - compliance-violations-metric
+        - email-notification-channel
+
+# Output values for verification and integration
+outputs:
+  # Project and deployment information
+  project_id:
+    description: "Google Cloud project ID"
+    value: $(ref.project_id)
+  
+  region:
+    description: "Deployment region"
+    value: $(ref.region)
+  
+  deployment_name:
+    description: "Deployment identifier"
+    value: "$(ref.resource_prefix)-$(ref.random_suffix)"
+  
+  # Pub/Sub resources
+  alerts_topic_name:
+    description: "Pub/Sub topic name for compliance alerts"
+    value: $(ref.compliance-alerts-topic.name)
+  
+  alerts_subscription_name:
+    description: "Pub/Sub subscription name for alert processing"
+    value: $(ref.compliance-alerts-subscription.name)
+  
+  # BigQuery resources
+  dataset_id:
+    description: "BigQuery dataset ID for compliance data"
+    value: $(ref.compliance-dataset.datasetReference.datasetId)
+  
+  violations_table_id:
+    description: "BigQuery table ID for violation records"
+    value: $(ref.violations-table.tableReference.tableId)
+  
+  dataset_location:
+    description: "BigQuery dataset location"
+    value: $(ref.compliance-dataset.location)
+  
+  # Cloud Function resources
+  function_name:
+    description: "Cloud Function name for compliance detection"
+    value: $(ref.compliance-detection-function.name)
+  
+  function_url:
+    description: "Cloud Function HTTPS trigger URL"
+    value: $(ref.compliance-detection-function.httpsTrigger.url)
+  
+  function_service_account:
+    description: "Service account email for the Cloud Function"
+    value: $(ref.compliance-function-sa.email)
+  
+  # Eventarc resources
+  trigger_name:
+    description: "Eventarc trigger name for audit logs"
+    value: $(ref.audit-log-trigger.name)
+  
+  trigger_service_account:
+    description: "Service account email for Eventarc trigger"
+    value: $(ref.eventarc-sa.email)
+  
+  # Monitoring resources
+  log_sink_name:
+    description: "Cloud Logging sink name for audit logs"
+    value: $(ref.compliance-audit-sink.name)
+  
+  metric_name:
+    description: "Log-based metric name for violations"
+    value: $(ref.compliance-violations-metric.name)
+  
+  alert_policy_name:
+    description: "Alert policy name for high-severity violations"
+    value: $(ref.high-severity-alert-policy-with-notifications.name)
+  
+  notification_channel:
+    description: "Email notification channel for alerts"
+    value: $(ref.email-notification-channel.name)
+  
+  # Storage resources
+  source_bucket_name:
+    description: "Cloud Storage bucket for function source code"
+    value: $(ref.function-source-bucket.name)
+  
+  # Verification commands
+  verification_commands:
+    description: "Commands to verify the deployment"
+    value: |
+      # Check BigQuery dataset
+      bq ls $(ref.project_id):$(ref.compliance-dataset.datasetReference.datasetId)
+      
+      # Check Pub/Sub topic
+      gcloud pubsub topics describe $(ref.compliance-alerts-topic.name)
+      
+      # Check Cloud Function
+      gcloud functions describe $(ref.resource_prefix)-detector-$(ref.random_suffix) --region=$(ref.region)
+      
+      # Check Eventarc trigger
+      gcloud eventarc triggers describe $(ref.resource_prefix)-audit-trigger-$(ref.random_suffix) --location=$(ref.region)
+      
+      # Query recent violations
+      bq query --use_legacy_sql=false "SELECT * FROM \`$(ref.project_id).$(ref.compliance-dataset.datasetReference.datasetId).violations\` ORDER BY timestamp DESC LIMIT 10"
+  
+  # Integration endpoints
+  integration_info:
+    description: "Integration information for external systems"
+    value:
+      pubsub_topic: $(ref.compliance-alerts-topic.name)
+      bigquery_dataset: "$(ref.project_id).$(ref.compliance-dataset.datasetReference.datasetId)"
+      function_url: $(ref.compliance-detection-function.httpsTrigger.url)
+      monitoring_workspace: "projects/$(ref.project_id)"
+
+# Metadata for Infrastructure Manager
+metadata:
+  version: "1.0"
+  author: "Google Cloud Infrastructure Manager"
+  created: "2025-07-12"
+  description: "Automated compliance violation detection system using Cloud Audit Logs and Eventarc"
+  tags:
+    - security
+    - compliance
+    - audit
+    - event-driven
+    - monitoring
+    - automation
+  estimated_cost: "$5-15/month for typical workloads"
+  prerequisites:
+    - "Google Cloud project with billing enabled"
+    - "IAM permissions for all included services"
+    - "Valid email address for notifications"
+  support:
+    documentation: "https://cloud.google.com/infrastructure-manager/docs"
+    community: "https://cloud.google.com/support"

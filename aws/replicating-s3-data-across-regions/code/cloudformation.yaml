@@ -1,0 +1,709 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'S3 Cross-Region Replication with KMS Encryption and Access Controls - Production-ready template implementing secure data replication across AWS regions'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Regional Configuration"
+        Parameters:
+          - PrimaryRegion
+          - SecondaryRegion
+      - Label:
+          default: "S3 Configuration"
+        Parameters:
+          - SourceBucketName
+          - DestinationBucketName
+          - ReplicationStorageClass
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - EnableReplicationTimeControl
+          - KMSKeyRotationEnabled
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableCloudWatchAlarms
+          - ReplicationLatencyThreshold
+    ParameterLabels:
+      PrimaryRegion:
+        default: "Primary AWS Region"
+      SecondaryRegion:
+        default: "Secondary AWS Region"
+      SourceBucketName:
+        default: "Source S3 Bucket Name"
+      DestinationBucketName:
+        default: "Destination S3 Bucket Name"
+      ReplicationStorageClass:
+        default: "Replication Storage Class"
+      EnableReplicationTimeControl:
+        default: "Enable Replication Time Control"
+      KMSKeyRotationEnabled:
+        default: "Enable KMS Key Rotation"
+      EnableCloudWatchAlarms:
+        default: "Enable CloudWatch Alarms"
+      ReplicationLatencyThreshold:
+        default: "Replication Latency Threshold (seconds)"
+
+# Input Parameters
+Parameters:
+  PrimaryRegion:
+    Type: String
+    Default: us-east-1
+    Description: Primary AWS region for source bucket
+    AllowedValues:
+      - us-east-1
+      - us-east-2
+      - us-west-1
+      - us-west-2
+      - eu-west-1
+      - eu-west-2
+      - eu-central-1
+      - ap-southeast-1
+      - ap-southeast-2
+      - ap-northeast-1
+    ConstraintDescription: Must be a valid AWS region
+
+  SecondaryRegion:
+    Type: String
+    Default: us-west-2
+    Description: Secondary AWS region for destination bucket
+    AllowedValues:
+      - us-east-1
+      - us-east-2
+      - us-west-1
+      - us-west-2
+      - eu-west-1
+      - eu-west-2
+      - eu-central-1
+      - ap-southeast-1
+      - ap-southeast-2
+      - ap-northeast-1
+    ConstraintDescription: Must be a valid AWS region different from primary region
+
+  SourceBucketName:
+    Type: String
+    Default: !Sub 'crr-source-${AWS::AccountId}-${AWS::Region}'
+    Description: Name for the source S3 bucket (must be globally unique)
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: Must be 3-63 characters, lowercase letters, numbers, and hyphens only
+
+  DestinationBucketName:
+    Type: String
+    Default: !Sub 'crr-dest-${AWS::AccountId}-${AWS::Region}'
+    Description: Name for the destination S3 bucket (must be globally unique)
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: Must be 3-63 characters, lowercase letters, numbers, and hyphens only
+
+  ReplicationStorageClass:
+    Type: String
+    Default: STANDARD_IA
+    Description: Storage class for replicated objects
+    AllowedValues:
+      - STANDARD
+      - STANDARD_IA
+      - ONEZONE_IA
+      - REDUCED_REDUNDANCY
+      - GLACIER
+      - DEEP_ARCHIVE
+      - INTELLIGENT_TIERING
+    ConstraintDescription: Must be a valid S3 storage class
+
+  EnableReplicationTimeControl:
+    Type: String
+    Default: 'false'
+    Description: Enable S3 Replication Time Control (RTC) for 15-minute replication SLA
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  KMSKeyRotationEnabled:
+    Type: String
+    Default: 'true'
+    Description: Enable automatic rotation for KMS keys
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableCloudWatchAlarms:
+    Type: String
+    Default: 'true'
+    Description: Create CloudWatch alarms for monitoring replication
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  ReplicationLatencyThreshold:
+    Type: Number
+    Default: 900
+    MinValue: 300
+    MaxValue: 3600
+    Description: Threshold in seconds for replication latency alarm
+
+# Conditional Resource Creation
+Conditions:
+  CreateReplicationTimeControl: !Equals [!Ref EnableReplicationTimeControl, 'true']
+  EnableKeyRotation: !Equals [!Ref KMSKeyRotationEnabled, 'true']
+  CreateCloudWatchAlarms: !Equals [!Ref EnableCloudWatchAlarms, 'true']
+  RegionsAreDifferent: !Not [!Equals [!Ref PrimaryRegion, !Ref SecondaryRegion]]
+
+# AWS Resources
+Resources:
+
+  # =====================================================
+  # KMS Keys for Encryption
+  # =====================================================
+
+  # Source region KMS key for S3 encryption
+  SourceKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'S3 Cross-Region Replication Source Key for ${SourceBucketName}'
+      EnableKeyRotation: !Ref KMSKeyRotationEnabled
+      KeyUsage: ENCRYPT_DECRYPT
+      KeySpec: SYMMETRIC_DEFAULT
+      MultiRegion: false
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow S3 Service
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:CreateGrant
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:ViaService': !Sub 's3.${AWS::Region}.amazonaws.com'
+          - Sid: Allow Replication Role
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt ReplicationRole.Arn
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${SourceBucketName}-source-key'
+        - Key: Purpose
+          Value: S3-Cross-Region-Replication
+        - Key: Environment
+          Value: Production
+
+  # Source KMS key alias
+  SourceKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/s3-crr-source-${SourceBucketName}'
+      TargetKeyId: !Ref SourceKMSKey
+
+  # =====================================================
+  # IAM Role for Cross-Region Replication
+  # =====================================================
+
+  # IAM role for S3 replication service
+  ReplicationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'S3ReplicationRole-${SourceBucketName}'
+      Description: Service role for S3 Cross-Region Replication
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+      Path: /service-role/
+      Tags:
+        - Key: Name
+          Value: !Sub 'S3ReplicationRole-${SourceBucketName}'
+        - Key: Purpose
+          Value: S3-Cross-Region-Replication
+
+  # IAM policy for replication role with least privilege permissions
+  ReplicationRolePolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Ref ReplicationRole
+      PolicyName: S3ReplicationPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Permissions to read from source bucket
+          - Sid: SourceBucketGetPermissions
+            Effect: Allow
+            Action:
+              - s3:GetObjectVersion
+              - s3:GetObjectVersionAcl
+              - s3:GetObjectVersionForReplication
+              - s3:GetObjectVersionTagging
+              - s3:GetObjectRetention
+              - s3:GetObjectLegalHold
+            Resource: !Sub '${SourceBucket}/*'
+          - Sid: SourceBucketListPermissions
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+              - s3:GetBucketVersioning
+              - s3:GetBucketLocation
+            Resource: !Ref SourceBucket
+          # Permissions to write to destination bucket
+          - Sid: DestinationBucketPutPermissions
+            Effect: Allow
+            Action:
+              - s3:ReplicateObject
+              - s3:ReplicateDelete
+              - s3:ReplicateTags
+              - s3:GetObjectVersionTagging
+              - s3:ObjectOwnerOverrideToBucketOwner
+            Resource: !Sub 'arn:aws:s3:::${DestinationBucketName}/*'
+          # KMS permissions for source region
+          - Sid: SourceKMSPermissions
+            Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: !GetAtt SourceKMSKey.Arn
+            Condition:
+              StringEquals:
+                'kms:ViaService': !Sub 's3.${AWS::Region}.amazonaws.com'
+          # KMS permissions for destination region
+          - Sid: DestinationKMSPermissions
+            Effect: Allow
+            Action:
+              - kms:GenerateDataKey
+              - kms:Encrypt
+            Resource: !Sub 'arn:aws:kms:${SecondaryRegion}:${AWS::AccountId}:key/*'
+            Condition:
+              StringEquals:
+                'kms:ViaService': !Sub 's3.${SecondaryRegion}.amazonaws.com'
+
+  # =====================================================
+  # S3 Source Bucket Configuration
+  # =====================================================
+
+  # Source S3 bucket with versioning and encryption
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref SourceBucketName
+      AccessControl: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt SourceKMSKey.Arn
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: source-bucket-logs/
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3ReplicationLogGroup
+      Tags:
+        - Key: Name
+          Value: !Ref SourceBucketName
+        - Key: Purpose
+          Value: S3-Cross-Region-Replication-Source
+        - Key: Environment
+          Value: Production
+
+  # Source bucket policy with security controls
+  SourceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SourceBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Deny unencrypted object uploads
+          - Sid: DenyUnencryptedObjectUploads
+            Effect: Deny
+            Principal: '*'
+            Action: s3:PutObject
+            Resource: !Sub '${SourceBucket}/*'
+            Condition:
+              StringNotEquals:
+                's3:x-amz-server-side-encryption': aws:kms
+          # Deny uploads without correct KMS key
+          - Sid: DenyIncorrectEncryptionKey
+            Effect: Deny
+            Principal: '*'
+            Action: s3:PutObject
+            Resource: !Sub '${SourceBucket}/*'
+            Condition:
+              StringNotEquals:
+                's3:x-amz-server-side-encryption-aws-kms-key-id': !GetAtt SourceKMSKey.Arn
+          # Require HTTPS for all requests
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${SourceBucket}'
+              - !Sub '${SourceBucket}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          # Allow replication role access
+          - Sid: AllowReplicationRole
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt ReplicationRole.Arn
+            Action:
+              - s3:GetObjectVersion
+              - s3:GetObjectVersionAcl
+              - s3:GetObjectVersionForReplication
+              - s3:GetObjectVersionTagging
+            Resource: !Sub '${SourceBucket}/*'
+
+  # Cross-region replication configuration
+  SourceBucketReplication:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref SourceBucketName
+      ReplicationConfiguration:
+        Role: !GetAtt ReplicationRole.Arn
+        Rules:
+          - Id: ReplicateEncryptedObjects
+            Status: Enabled
+            Priority: 1
+            DeleteMarkerReplication:
+              Status: Enabled
+            Filter:
+              Prefix: ''
+            Destination:
+              Bucket: !Sub 'arn:aws:s3:::${DestinationBucketName}'
+              StorageClass: !Ref ReplicationStorageClass
+              EncryptionConfiguration:
+                ReplicaKmsKeyID: !Sub 'arn:aws:kms:${SecondaryRegion}:${AWS::AccountId}:alias/s3-crr-dest-${DestinationBucketName}'
+              ReplicationTime: !If
+                - CreateReplicationTimeControl
+                - Status: Enabled
+                  Time:
+                    Minutes: 15
+                - !Ref AWS::NoValue
+              Metrics: !If
+                - CreateReplicationTimeControl
+                - Status: Enabled
+                  EventThreshold:
+                    Minutes: 15
+                - !Ref AWS::NoValue
+            SourceSelectionCriteria:
+              SseKmsEncryptedObjects:
+                Status: Enabled
+              ReplicaModifications:
+                Status: Enabled
+    DependsOn:
+      - ReplicationRolePolicy
+
+  # =====================================================
+  # S3 Metrics and Monitoring
+  # =====================================================
+
+  # S3 bucket metrics configuration for replication monitoring
+  SourceBucketMetrics:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref SourceBucketName
+      MetricsConfigurations:
+        - Id: ReplicationMetrics
+          Status: Enabled
+          Prefix: ''
+
+  # =====================================================
+  # CloudWatch Logging and Monitoring
+  # =====================================================
+
+  # CloudWatch log group for S3 replication events
+  S3ReplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/replication/${SourceBucketName}'
+      RetentionInDays: 90
+      KmsKeyId: !GetAtt CloudWatchLogsKMSKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub 'S3-Replication-Logs-${SourceBucketName}'
+        - Key: Purpose
+          Value: S3-Cross-Region-Replication-Monitoring
+
+  # KMS key for CloudWatch Logs encryption
+  CloudWatchLogsKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'KMS key for CloudWatch Logs encryption'
+      EnableKeyRotation: !Ref KMSKeyRotationEnabled
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/s3/replication/${SourceBucketName}'
+
+  # CloudWatch alarm for replication failures
+  ReplicationFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub 'S3-Replication-Failures-${SourceBucketName}'
+      AlarmDescription: !Sub 'Alert when S3 replication fails for ${SourceBucketName}'
+      MetricName: ReplicationLatency
+      Namespace: AWS/S3
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref ReplicationLatencyThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: SourceBucket
+          Value: !Ref SourceBucketName
+        - Name: DestinationBucket
+          Value: !Ref DestinationBucketName
+      Tags:
+        - Key: Name
+          Value: !Sub 'S3-Replication-Alarm-${SourceBucketName}'
+        - Key: Purpose
+          Value: S3-Cross-Region-Replication-Monitoring
+
+  # CloudWatch alarm for pending replication objects
+  PendingReplicationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub 'S3-Pending-Replication-${SourceBucketName}'
+      AlarmDescription: !Sub 'Alert when objects are pending replication for ${SourceBucketName}'
+      MetricName: NumberOfObjectsPendingReplication
+      Namespace: AWS/S3
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: SourceBucket
+          Value: !Ref SourceBucketName
+        - Name: DestinationBucket
+          Value: !Ref DestinationBucketName
+      Tags:
+        - Key: Name
+          Value: !Sub 'S3-Pending-Replication-Alarm-${SourceBucketName}'
+        - Key: Purpose
+          Value: S3-Cross-Region-Replication-Monitoring
+
+  # =====================================================
+  # Access Logging Infrastructure
+  # =====================================================
+
+  # S3 bucket for access logs
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${SourceBucketName}-access-logs'
+      AccessControl: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteAccessLogsAfter90Days
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub '${SourceBucketName}-access-logs'
+        - Key: Purpose
+          Value: S3-Access-Logging
+
+  # Access logs bucket policy
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow S3 log delivery service to write logs
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${AccessLogsBucket}/*'
+            Condition:
+              ArnEquals:
+                'aws:SourceArn': !GetAtt SourceBucket.Arn
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+          # Require HTTPS for all requests
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${AccessLogsBucket}'
+              - !Sub '${AccessLogsBucket}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+# Stack Outputs
+Outputs:
+  SourceBucketName:
+    Description: Name of the source S3 bucket
+    Value: !Ref SourceBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-SourceBucket'
+
+  SourceBucketArn:
+    Description: ARN of the source S3 bucket
+    Value: !GetAtt SourceBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SourceBucketArn'
+
+  DestinationBucketName:
+    Description: Name of the destination S3 bucket (to be created in secondary region)
+    Value: !Ref DestinationBucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-DestinationBucketName'
+
+  SourceKMSKeyId:
+    Description: ID of the source region KMS key
+    Value: !Ref SourceKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-SourceKMSKey'
+
+  SourceKMSKeyArn:
+    Description: ARN of the source region KMS key
+    Value: !GetAtt SourceKMSKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SourceKMSKeyArn'
+
+  SourceKMSKeyAlias:
+    Description: Alias of the source region KMS key
+    Value: !Ref SourceKMSKeyAlias
+    Export:
+      Name: !Sub '${AWS::StackName}-SourceKMSKeyAlias'
+
+  ReplicationRoleArn:
+    Description: ARN of the replication IAM role
+    Value: !GetAtt ReplicationRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ReplicationRoleArn'
+
+  AccessLogsBucketName:
+    Description: Name of the access logs bucket
+    Value: !Ref AccessLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AccessLogsBucket'
+
+  ReplicationConfiguration:
+    Description: Cross-region replication configuration details
+    Value: !Sub |
+      Source Bucket: ${SourceBucket}
+      Destination Bucket: ${DestinationBucketName} (${SecondaryRegion})
+      Storage Class: ${ReplicationStorageClass}
+      Replication Time Control: ${EnableReplicationTimeControl}
+    Export:
+      Name: !Sub '${AWS::StackName}-ReplicationConfig'
+
+  CloudWatchLogGroup:
+    Description: CloudWatch log group for replication monitoring
+    Value: !Ref S3ReplicationLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchLogGroup'
+
+  ReplicationFailureAlarm:
+    Condition: CreateCloudWatchAlarms
+    Description: CloudWatch alarm for replication failures
+    Value: !Ref ReplicationFailureAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-ReplicationFailureAlarm'
+
+  SecurityFeatures:
+    Description: Security features enabled in this template
+    Value: |
+      ✅ KMS encryption for source bucket
+      ✅ Bucket policies enforcing HTTPS and encryption
+      ✅ Public access blocked on all buckets
+      ✅ IAM role with least privilege permissions
+      ✅ CloudWatch logging with encryption
+      ✅ Access logging enabled
+      ✅ Lifecycle policies for cost optimization
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityFeatures'
+
+  NextSteps:
+    Description: Next steps after deploying this template
+    Value: |
+      1. Deploy companion template in secondary region for destination bucket
+      2. Configure destination bucket KMS key permissions
+      3. Test replication by uploading objects to source bucket
+      4. Monitor CloudWatch alarms and metrics
+      5. Review access logs for security auditing
+    Export:
+      Name: !Sub '${AWS::StackName}-NextSteps'

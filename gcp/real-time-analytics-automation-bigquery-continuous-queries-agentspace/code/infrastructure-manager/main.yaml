@@ -1,0 +1,578 @@
+# Infrastructure Manager Configuration for Real-Time Analytics Automation
+# This configuration deploys BigQuery continuous queries, Agentspace AI agents,
+# Cloud Workflows, and Pub/Sub infrastructure for real-time analytics automation
+
+# Define the blueprint metadata
+blueprint_name: real-time-analytics-automation
+description: "Deploy real-time analytics automation with BigQuery continuous queries and Agentspace"
+terraform_version: "1.5.0"
+
+# Input variables for customization
+variables:
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    required: true
+  
+  region:
+    description: "Google Cloud region for regional resources"
+    type: string
+    default: "us-central1"
+  
+  dataset_name:
+    description: "BigQuery dataset name for analytics"
+    type: string
+    default: "realtime_analytics"
+  
+  environment:
+    description: "Environment name (dev, staging, prod)"
+    type: string
+    default: "dev"
+    validation:
+      condition: "contains(['dev', 'staging', 'prod'], var.environment)"
+      error_message: "Environment must be one of: dev, staging, prod"
+  
+  enable_continuous_query:
+    description: "Enable BigQuery continuous query deployment"
+    type: bool
+    default: true
+  
+  agentspace_enabled:
+    description: "Enable Agentspace AI agent configuration"
+    type: bool
+    default: true
+
+# Local values for resource naming and configuration
+locals:
+  # Generate random suffix for unique resource names
+  random_suffix: "${random_id.suffix.hex}"
+  
+  # Resource naming convention
+  resource_prefix: "${var.environment}-analytics"
+  
+  # Pub/Sub topic names
+  pubsub_topic_raw: "raw-events-${local.random_suffix}"
+  pubsub_topic_insights: "insights-${local.random_suffix}"
+  
+  # BigQuery table names
+  table_name: "processed_events"
+  insights_table: "insights"
+  
+  # Workflow name
+  workflow_name: "analytics-automation-${local.random_suffix}"
+  
+  # Labels for all resources
+  common_labels:
+    environment: "${var.environment}"
+    project: "real-time-analytics"
+    managed-by: "infrastructure-manager"
+    recipe: "bigquery-continuous-queries-agentspace"
+
+# Resources section
+resources:
+  # Random ID for unique resource naming
+  - name: suffix
+    type: random_id
+    properties:
+      byte_length: 3
+
+  # Enable required Google Cloud APIs
+  - name: bigquery_api
+    type: google_project_service
+    properties:
+      project: "${var.project_id}"
+      service: "bigquery.googleapis.com"
+      disable_on_destroy: false
+
+  - name: pubsub_api
+    type: google_project_service
+    properties:
+      project: "${var.project_id}"
+      service: "pubsub.googleapis.com"
+      disable_on_destroy: false
+
+  - name: workflows_api
+    type: google_project_service
+    properties:
+      project: "${var.project_id}"
+      service: "workflows.googleapis.com"
+      disable_on_destroy: false
+
+  - name: aiplatform_api
+    type: google_project_service
+    properties:
+      project: "${var.project_id}"
+      service: "aiplatform.googleapis.com"
+      disable_on_destroy: false
+
+  - name: cloudbuild_api
+    type: google_project_service
+    properties:
+      project: "${var.project_id}"
+      service: "cloudbuild.googleapis.com"
+      disable_on_destroy: false
+
+  # Pub/Sub Topics for event streaming
+  - name: raw_events_topic
+    type: google_pubsub_topic
+    properties:
+      name: "${local.pubsub_topic_raw}"
+      project: "${var.project_id}"
+      labels: "${local.common_labels}"
+      # Enable message retention for reliability
+      message_retention_duration: "86400s"  # 24 hours
+    depends_on:
+      - pubsub_api
+
+  - name: insights_topic
+    type: google_pubsub_topic
+    properties:
+      name: "${local.pubsub_topic_insights}"
+      project: "${var.project_id}"
+      labels: "${local.common_labels}"
+      message_retention_duration: "86400s"  # 24 hours
+    depends_on:
+      - pubsub_api
+
+  # Pub/Sub Subscriptions for BigQuery and Agentspace consumption
+  - name: raw_events_bq_subscription
+    type: google_pubsub_subscription
+    properties:
+      name: "${local.pubsub_topic_raw}-bq-sub"
+      project: "${var.project_id}"
+      topic: "${google_pubsub_topic.raw_events_topic.name}"
+      labels: "${local.common_labels}"
+      # Configure for BigQuery integration
+      ack_deadline_seconds: 60
+      message_retention_duration: "604800s"  # 7 days
+      retain_acked_messages: false
+      # Enable exactly-once delivery for data consistency
+      enable_exactly_once_delivery: true
+    depends_on:
+      - raw_events_topic
+
+  - name: insights_agentspace_subscription
+    type: google_pubsub_subscription
+    properties:
+      name: "${local.pubsub_topic_insights}-agentspace-sub"
+      project: "${var.project_id}"
+      topic: "${google_pubsub_topic.insights_topic.name}"
+      labels: "${local.common_labels}"
+      ack_deadline_seconds: 300  # Longer timeout for AI processing
+      message_retention_duration: "604800s"
+      retain_acked_messages: false
+      enable_exactly_once_delivery: true
+    depends_on:
+      - insights_topic
+
+  # BigQuery Dataset for analytics data
+  - name: analytics_dataset
+    type: google_bigquery_dataset
+    properties:
+      dataset_id: "${var.dataset_name}"
+      project: "${var.project_id}"
+      location: "${var.region}"
+      friendly_name: "Real-time Analytics Dataset"
+      description: "Dataset for real-time analytics automation with continuous queries"
+      labels: "${local.common_labels}"
+      # Configure access controls
+      access:
+        - role: "OWNER"
+          user_by_email: "bigquery-admin@${var.project_id}.iam.gserviceaccount.com"
+        - role: "READER"
+          special_group: "projectReaders"
+        - role: "WRITER"
+          special_group: "projectWriters"
+      # Set default table expiration to 90 days for cost optimization
+      default_table_expiration_ms: 7776000000  # 90 days in milliseconds
+    depends_on:
+      - bigquery_api
+
+  # BigQuery Table for processed events
+  - name: processed_events_table
+    type: google_bigquery_table
+    properties:
+      table_id: "${local.table_name}"
+      project: "${var.project_id}"
+      dataset_id: "${google_bigquery_dataset.analytics_dataset.dataset_id}"
+      friendly_name: "Processed Events Table"
+      description: "Table storing processed streaming events for real-time analytics"
+      labels: "${local.common_labels}"
+      # Define optimized schema for streaming analytics
+      schema: |
+        [
+          {
+            "name": "event_id",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Unique identifier for the event"
+          },
+          {
+            "name": "timestamp",
+            "type": "TIMESTAMP",
+            "mode": "REQUIRED",
+            "description": "Event timestamp in UTC"
+          },
+          {
+            "name": "user_id",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "User identifier associated with the event"
+          },
+          {
+            "name": "event_type",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Type of event (purchase, view, click, etc.)"
+          },
+          {
+            "name": "value",
+            "type": "FLOAT64",
+            "mode": "REQUIRED",
+            "description": "Numeric value associated with the event"
+          },
+          {
+            "name": "metadata",
+            "type": "JSON",
+            "mode": "NULLABLE",
+            "description": "Additional event metadata in JSON format"
+          }
+        ]
+      # Configure time partitioning for performance
+      time_partitioning:
+        type: "DAY"
+        field: "timestamp"
+        expiration_ms: 7776000000  # 90 days
+      # Configure clustering for query optimization
+      clustering:
+        - "user_id"
+        - "event_type"
+    depends_on:
+      - analytics_dataset
+
+  # BigQuery Table for AI-generated insights
+  - name: insights_table
+    type: google_bigquery_table
+    properties:
+      table_id: "${local.insights_table}"
+      project: "${var.project_id}"
+      dataset_id: "${google_bigquery_dataset.analytics_dataset.dataset_id}"
+      friendly_name: "AI Insights Table"
+      description: "Table storing AI-generated insights from real-time analytics"
+      labels: "${local.common_labels}"
+      schema: |
+        [
+          {
+            "name": "insight_id",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Unique identifier for the insight"
+          },
+          {
+            "name": "generated_at",
+            "type": "TIMESTAMP",
+            "mode": "REQUIRED",
+            "description": "Timestamp when insight was generated"
+          },
+          {
+            "name": "insight_type",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Type of insight generated"
+          },
+          {
+            "name": "confidence",
+            "type": "FLOAT64",
+            "mode": "REQUIRED",
+            "description": "Confidence score of the insight (0.0 to 1.0)"
+          },
+          {
+            "name": "recommendation",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Human-readable recommendation text"
+          },
+          {
+            "name": "data_points",
+            "type": "JSON",
+            "mode": "NULLABLE",
+            "description": "Supporting data points for the insight"
+          }
+        ]
+      time_partitioning:
+        type: "DAY"
+        field: "generated_at"
+        expiration_ms: 2592000000  # 30 days
+      clustering:
+        - "insight_type"
+        - "confidence"
+    depends_on:
+      - analytics_dataset
+
+  # Service Account for Agentspace integration
+  - name: agentspace_service_account
+    type: google_service_account
+    properties:
+      account_id: "agentspace-analytics-${local.random_suffix}"
+      project: "${var.project_id}"
+      display_name: "Agentspace Analytics Service Account"
+      description: "Service account for Agentspace AI agent integration"
+
+  # IAM bindings for Agentspace service account
+  - name: agentspace_pubsub_subscriber
+    type: google_project_iam_member
+    properties:
+      project: "${var.project_id}"
+      role: "roles/pubsub.subscriber"
+      member: "serviceAccount:${google_service_account.agentspace_service_account.email}"
+    depends_on:
+      - agentspace_service_account
+
+  - name: agentspace_bigquery_viewer
+    type: google_project_iam_member
+    properties:
+      project: "${var.project_id}"
+      role: "roles/bigquery.dataViewer"
+      member: "serviceAccount:${google_service_account.agentspace_service_account.email}"
+    depends_on:
+      - agentspace_service_account
+
+  - name: agentspace_bigquery_editor
+    type: google_project_iam_member
+    properties:
+      project: "${var.project_id}"
+      role: "roles/bigquery.dataEditor"
+      member: "serviceAccount:${google_service_account.agentspace_service_account.email}"
+    depends_on:
+      - agentspace_service_account
+
+  # Service Account for Cloud Workflows
+  - name: workflows_service_account
+    type: google_service_account
+    properties:
+      account_id: "workflows-analytics-${local.random_suffix}"
+      project: "${var.project_id}"
+      display_name: "Workflows Analytics Service Account"
+      description: "Service account for Cloud Workflows automation"
+
+  # IAM bindings for Workflows service account
+  - name: workflows_pubsub_publisher
+    type: google_project_iam_member
+    properties:
+      project: "${var.project_id}"
+      role: "roles/pubsub.publisher"
+      member: "serviceAccount:${google_service_account.workflows_service_account.email}"
+    depends_on:
+      - workflows_service_account
+
+  - name: workflows_logging_writer
+    type: google_project_iam_member
+    properties:
+      project: "${var.project_id}"
+      role: "roles/logging.logWriter"
+      member: "serviceAccount:${google_service_account.workflows_service_account.email}"
+    depends_on:
+      - workflows_service_account
+
+  # Cloud Workflows for business process automation
+  - name: analytics_workflow
+    type: google_workflows_workflow
+    properties:
+      name: "${local.workflow_name}"
+      project: "${var.project_id}"
+      region: "${var.region}"
+      description: "Automated business process workflow for real-time analytics insights"
+      labels: "${local.common_labels}"
+      service_account: "${google_service_account.workflows_service_account.email}"
+      # Define the workflow logic for processing insights
+      source_contents: |
+        main:
+          params: [input]
+          steps:
+            - extract_insight:
+                assign:
+                  - insight_data: $${input.insight}
+                  - confidence: $${insight_data.confidence}
+                  - insight_type: $${insight_data.insight_type}
+            
+            - evaluate_confidence:
+                switch:
+                  - condition: $${confidence > 0.9}
+                    next: high_priority_action
+                  - condition: $${confidence > 0.7}
+                    next: medium_priority_action
+                  - condition: true
+                    next: low_priority_action
+            
+            - high_priority_action:
+                call: execute_immediate_response
+                args:
+                  action_type: "immediate"
+                  insight: $${insight_data}
+                next: log_action
+            
+            - medium_priority_action:
+                call: execute_scheduled_response
+                args:
+                  action_type: "scheduled"
+                  insight: $${insight_data}
+                next: log_action
+            
+            - low_priority_action:
+                call: execute_monitoring_response
+                args:
+                  action_type: "monitoring"
+                  insight: $${insight_data}
+                next: log_action
+            
+            - log_action:
+                call: http.post
+                args:
+                  url: "https://logging.googleapis.com/v2/entries:write"
+                  headers:
+                    Authorization: $${"Bearer " + sys.get_env("GOOGLE_CLOUD_ACCESS_TOKEN")}
+                  body:
+                    entries:
+                      - logName: $${"projects/" + sys.get_env("GOOGLE_CLOUD_PROJECT_ID") + "/logs/analytics-automation"}
+                        resource:
+                          type: "workflow"
+                        jsonPayload:
+                          insight_id: $${insight_data.insight_id}
+                          action_taken: "processed"
+                          confidence: $${confidence}
+                result: log_result
+        
+        execute_immediate_response:
+          params: [action_type, insight]
+          steps:
+            - send_alert:
+                call: http.post
+                args:
+                  url: $${"https://pubsub.googleapis.com/v1/projects/${var.project_id}/topics/alerts:publish"}
+                  headers:
+                    Authorization: $${"Bearer " + sys.get_env("GOOGLE_CLOUD_ACCESS_TOKEN")}
+                  body:
+                    messages:
+                      - data: $${base64.encode(json.encode(insight))}
+                        attributes:
+                          priority: "high"
+                          action_type: $${action_type}
+        
+        execute_scheduled_response:
+          params: [action_type, insight]
+          steps:
+            - schedule_review:
+                call: sys.log
+                args:
+                  data: $${"Scheduled review for insight: " + insight.insight_id}
+        
+        execute_monitoring_response:
+          params: [action_type, insight]
+          steps:
+            - add_to_monitoring:
+                call: sys.log
+                args:
+                  data: $${"Added to monitoring: " + insight.insight_id}
+    depends_on:
+      - workflows_api
+      - workflows_service_account
+
+  # Cloud Storage bucket for temporary files and configurations
+  - name: analytics_storage_bucket
+    type: google_storage_bucket
+    properties:
+      name: "${var.project_id}-analytics-config-${local.random_suffix}"
+      project: "${var.project_id}"
+      location: "${var.region}"
+      labels: "${local.common_labels}"
+      # Configure lifecycle management for cost optimization
+      lifecycle_rule:
+        - condition:
+            age: 30
+          action:
+            type: "Delete"
+      # Enable versioning for configuration files
+      versioning:
+        enabled: true
+      # Configure uniform bucket-level access
+      uniform_bucket_level_access: true
+
+# Outputs for verification and integration
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: "${var.project_id}"
+  
+  region:
+    description: "Deployment region"
+    value: "${var.region}"
+  
+  dataset_id:
+    description: "BigQuery dataset ID"
+    value: "${google_bigquery_dataset.analytics_dataset.dataset_id}"
+  
+  dataset_location:
+    description: "BigQuery dataset location"
+    value: "${google_bigquery_dataset.analytics_dataset.location}"
+  
+  processed_events_table_id:
+    description: "Processed events table ID"
+    value: "${google_bigquery_table.processed_events_table.table_id}"
+  
+  insights_table_id:
+    description: "Insights table ID"
+    value: "${google_bigquery_table.insights_table.table_id}"
+  
+  raw_events_topic:
+    description: "Pub/Sub topic for raw events"
+    value: "${google_pubsub_topic.raw_events_topic.name}"
+  
+  insights_topic:
+    description: "Pub/Sub topic for insights"
+    value: "${google_pubsub_topic.insights_topic.name}"
+  
+  raw_events_subscription:
+    description: "Pub/Sub subscription for BigQuery integration"
+    value: "${google_pubsub_subscription.raw_events_bq_subscription.name}"
+  
+  insights_subscription:
+    description: "Pub/Sub subscription for Agentspace integration"
+    value: "${google_pubsub_subscription.insights_agentspace_subscription.name}"
+  
+  workflow_name:
+    description: "Cloud Workflows workflow name"
+    value: "${google_workflows_workflow.analytics_workflow.name}"
+  
+  agentspace_service_account:
+    description: "Service account email for Agentspace integration"
+    value: "${google_service_account.agentspace_service_account.email}"
+  
+  workflows_service_account:
+    description: "Service account email for Cloud Workflows"
+    value: "${google_service_account.workflows_service_account.email}"
+  
+  storage_bucket:
+    description: "Cloud Storage bucket for configurations"
+    value: "${google_storage_bucket.analytics_storage_bucket.name}"
+  
+  continuous_query_command:
+    description: "Command to deploy BigQuery continuous query"
+    value: "bq query --use_legacy_sql=false --job_timeout=0 --continuous --job_id=continuous-analytics-${local.random_suffix} '[CONTINUOUS_QUERY_SQL]'"
+  
+  deployment_summary:
+    description: "Summary of deployed resources"
+    value: |
+      Real-Time Analytics Automation Infrastructure Deployed:
+      - BigQuery Dataset: ${google_bigquery_dataset.analytics_dataset.dataset_id}
+      - Processed Events Table: ${google_bigquery_table.processed_events_table.table_id}
+      - Insights Table: ${google_bigquery_table.insights_table.table_id}
+      - Raw Events Topic: ${google_pubsub_topic.raw_events_topic.name}
+      - Insights Topic: ${google_pubsub_topic.insights_topic.name}
+      - Analytics Workflow: ${google_workflows_workflow.analytics_workflow.name}
+      - Storage Bucket: ${google_storage_bucket.analytics_storage_bucket.name}
+      
+      Next Steps:
+      1. Deploy BigQuery continuous query using the provided command
+      2. Configure Agentspace agent with service account: ${google_service_account.agentspace_service_account.email}
+      3. Test the pipeline with sample data
+      4. Monitor workflow executions and insights generation

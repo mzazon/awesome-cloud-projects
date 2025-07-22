@@ -1,0 +1,787 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Event-Driven Data Processing with S3 Event Notifications - Complete serverless architecture for automatic data processing triggered by S3 events'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Resource Configuration"
+        Parameters:
+          - ResourcePrefix
+          - Environment
+          - NotificationEmail
+      - Label:
+          default: "Processing Configuration"
+        Parameters:
+          - ProcessingTimeout
+          - ProcessingMemorySize
+          - ErrorHandlerTimeout
+          - ProcessingPrefix
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableDetailedMonitoring
+          - ErrorThreshold
+          - DLQThreshold
+    ParameterLabels:
+      ResourcePrefix:
+        default: "Resource Name Prefix"
+      Environment:
+        default: "Environment Name"
+      NotificationEmail:
+        default: "Alert Email Address"
+      ProcessingTimeout:
+        default: "Processing Function Timeout"
+      ProcessingMemorySize:
+        default: "Processing Function Memory"
+      ErrorHandlerTimeout:
+        default: "Error Handler Timeout"
+      ProcessingPrefix:
+        default: "S3 Processing Prefix"
+      EnableDetailedMonitoring:
+        default: "Enable Detailed Monitoring"
+      ErrorThreshold:
+        default: "Error Alarm Threshold"
+      DLQThreshold:
+        default: "DLQ Message Threshold"
+
+# Input Parameters
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Description: 'Prefix for all resource names to ensure uniqueness'
+    Default: 'data-processing'
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+    MinLength: 3
+    MaxLength: 20
+
+  Environment:
+    Type: String
+    Description: 'Environment designation for resource tagging'
+    Default: 'dev'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    ConstraintDescription: 'Must be dev, staging, or prod'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for error notifications and alerts'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  ProcessingTimeout:
+    Type: Number
+    Description: 'Lambda function timeout in seconds for data processing'
+    Default: 300
+    MinValue: 30
+    MaxValue: 900
+    ConstraintDescription: 'Must be between 30 and 900 seconds'
+
+  ProcessingMemorySize:
+    Type: Number
+    Description: 'Memory allocation for data processing Lambda function in MB'
+    Default: 512
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+    ConstraintDescription: 'Must be a valid Lambda memory size'
+
+  ErrorHandlerTimeout:
+    Type: Number
+    Description: 'Lambda function timeout in seconds for error handling'
+    Default: 60
+    MinValue: 15
+    MaxValue: 300
+    ConstraintDescription: 'Must be between 15 and 300 seconds'
+
+  ProcessingPrefix:
+    Type: String
+    Description: 'S3 prefix filter for triggering processing (e.g., data/)'
+    Default: 'data/'
+    AllowedPattern: '^[a-zA-Z0-9-_/]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, hyphens, underscores, and forward slashes'
+
+  EnableDetailedMonitoring:
+    Type: String
+    Description: 'Enable detailed CloudWatch monitoring and additional alarms'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  ErrorThreshold:
+    Type: Number
+    Description: 'Number of errors before triggering alarm'
+    Default: 1
+    MinValue: 1
+    MaxValue: 100
+
+  DLQThreshold:
+    Type: Number
+    Description: 'Number of messages in DLQ before triggering alarm'
+    Default: 5
+    MinValue: 1
+    MaxValue: 1000
+
+# Conditional Resources
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  EnableDetailedMonitoringCondition: !Equals [!Ref EnableDetailedMonitoring, 'true']
+
+# AWS Resources
+Resources:
+  # ================================
+  # S3 Bucket for Data Processing
+  # ================================
+  DataProcessingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ResourcePrefix}-bucket-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 90
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt DataProcessingFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: !Ref ProcessingPrefix
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: DataProcessing
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ================================
+  # SNS Topic for Alerts
+  # ================================
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ResourcePrefix}-alerts-${Environment}'
+      DisplayName: 'Data Processing Alerts'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: DataProcessing
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # SNS Topic Subscription for Email Alerts
+  AlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AlertsTopic
+      Endpoint: !Ref NotificationEmail
+
+  # ================================
+  # SQS Dead Letter Queue
+  # ================================
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ResourcePrefix}-dlq-${Environment}'
+      VisibilityTimeoutSeconds: 300
+      MessageRetentionPeriod: 1209600  # 14 days
+      ReceiveMessageWaitTimeSeconds: 20  # Enable long polling
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: DataProcessing
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ================================
+  # IAM Role for Lambda Functions
+  # ================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:GetObjectVersion
+                Resource: !Sub '${DataProcessingBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Ref DataProcessingBucket
+        - PolicyName: SQSAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueUrl
+                Resource: !GetAtt DeadLetterQueue.Arn
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AlertsTopic
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: DataProcessing
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ================================
+  # Lambda Layer for Common Dependencies
+  # ================================
+  CommonDependenciesLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub '${ResourcePrefix}-dependencies-${Environment}'
+      Description: 'Common dependencies for data processing functions'
+      Content:
+        ZipFile: |
+          # This is a placeholder for the Lambda layer
+          # In a real deployment, this would contain boto3 and other dependencies
+          import json
+          def lambda_handler(event, context):
+              return {"statusCode": 200}
+      CompatibleRuntimes:
+        - python3.9
+        - python3.10
+        - python3.11
+
+  # ================================
+  # Data Processing Lambda Function
+  # ================================
+  DataProcessingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-processor-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref ProcessingTimeout
+      MemorySize: !Ref ProcessingMemorySize
+      ReservedConcurrencyLimit: !If [IsProduction, 100, 10]
+      Environment:
+        Variables:
+          DLQ_URL: !Ref DeadLetterQueue
+          SNS_TOPIC_ARN: !Ref AlertsTopic
+          ENVIRONMENT: !Ref Environment
+          BUCKET_NAME: !Ref DataProcessingBucket
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Layers:
+        - !Ref CommonDependenciesLayer
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib.parse
+          from datetime import datetime
+          import os
+          
+          s3 = boto3.client('s3')
+          sqs = boto3.client('sqs')
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Process each S3 event record
+                  for record in event['Records']:
+                      bucket = record['s3']['bucket']['name']
+                      key = urllib.parse.unquote_plus(record['s3']['object']['key'])
+                      
+                      print(f"Processing object: {key} from bucket: {bucket}")
+                      
+                      # Get object metadata
+                      response = s3.head_object(Bucket=bucket, Key=key)
+                      file_size = response['ContentLength']
+                      
+                      # Example processing logic based on file type
+                      if key.endswith('.csv'):
+                          process_csv_file(bucket, key, file_size)
+                      elif key.endswith('.json'):
+                          process_json_file(bucket, key, file_size)
+                      else:
+                          print(f"Unsupported file type: {key}")
+                          continue
+                      
+                      # Create processing report
+                      create_processing_report(bucket, key, file_size)
+                      
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Successfully processed S3 events')
+                  }
+                  
+              except Exception as e:
+                  print(f"Error processing S3 event: {str(e)}")
+                  # Send to DLQ for retry logic
+                  send_to_dlq(event, str(e))
+                  raise e
+          
+          def process_csv_file(bucket, key, file_size):
+              """Process CSV files - add your business logic here"""
+              print(f"Processing CSV file: {key} (Size: {file_size} bytes)")
+              # Add your CSV processing logic here
+              
+          def process_json_file(bucket, key, file_size):
+              """Process JSON files - add your business logic here"""
+              print(f"Processing JSON file: {key} (Size: {file_size} bytes)")
+              # Add your JSON processing logic here
+          
+          def create_processing_report(bucket, key, file_size):
+              """Create a processing report and store it in S3"""
+              report_key = f"reports/{key}-report-{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
+              
+              report = {
+                  'file_processed': key,
+                  'file_size': file_size,
+                  'processing_time': datetime.now().isoformat(),
+                  'status': 'completed',
+                  'environment': os.environ.get('ENVIRONMENT', 'unknown')
+              }
+              
+              s3.put_object(
+                  Bucket=bucket,
+                  Key=report_key,
+                  Body=json.dumps(report, indent=2),
+                  ContentType='application/json'
+              )
+              
+              print(f"Processing report created: {report_key}")
+          
+          def send_to_dlq(event, error_message):
+              """Send failed event to DLQ for retry"""
+              dlq_url = os.environ.get('DLQ_URL')
+              
+              if dlq_url:
+                  message = {
+                      'original_event': event,
+                      'error_message': error_message,
+                      'timestamp': datetime.now().isoformat(),
+                      'environment': os.environ.get('ENVIRONMENT', 'unknown')
+                  }
+                  
+                  try:
+                      sqs.send_message(
+                          QueueUrl=dlq_url,
+                          MessageBody=json.dumps(message, indent=2)
+                      )
+                      print(f"Sent failed event to DLQ: {error_message}")
+                  except Exception as dlq_error:
+                      print(f"Failed to send to DLQ: {str(dlq_error)}")
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: DataProcessing
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ================================
+  # Error Handler Lambda Function
+  # ================================
+  ErrorHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-error-handler-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref ErrorHandlerTimeout
+      MemorySize: 256
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref AlertsTopic
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime
+          import os
+          
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Process SQS messages from DLQ
+                  for record in event['Records']:
+                      message_body = json.loads(record['body'])
+                      
+                      # Extract error details
+                      error_message = message_body.get('error_message', 'Unknown error')
+                      timestamp = message_body.get('timestamp', datetime.now().isoformat())
+                      environment = message_body.get('environment', 'unknown')
+                      
+                      # Send alert via SNS
+                      alert_message = f"""
+          Data Processing Error Alert
+          
+          Environment: {environment}
+          Error: {error_message}
+          Timestamp: {timestamp}
+          
+          Please investigate the failed processing job.
+          
+          This alert was generated automatically by the error handler function.
+          """
+                      
+                      sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
+                      
+                      if sns_topic_arn:
+                          sns.publish(
+                              TopicArn=sns_topic_arn,
+                              Message=alert_message,
+                              Subject=f'Data Processing Error Alert - {environment.upper()}'
+                          )
+                      
+                      print(f"Error alert sent for: {error_message}")
+                      
+              except Exception as e:
+                  print(f"Error in error handler: {str(e)}")
+                  raise e
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Error handling completed')
+              }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: DataProcessing
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ================================
+  # Lambda Permissions for S3
+  # ================================
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataProcessingFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub '${DataProcessingBucket}/*'
+
+  # ================================
+  # SQS Event Source Mapping
+  # ================================
+  ErrorHandlerEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt DeadLetterQueue.Arn
+      FunctionName: !Ref ErrorHandlerFunction
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      Enabled: true
+
+  # ================================
+  # CloudWatch Alarms for Monitoring
+  # ================================
+  
+  # Lambda Function Error Alarm
+  ProcessingFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-processing-errors-${Environment}'
+      AlarmDescription: 'Monitors Lambda function errors for data processing'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref ErrorThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlertsTopic
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DataProcessingFunction
+      TreatMissingData: notBreaching
+
+  # Lambda Function Duration Alarm (only for production)
+  ProcessingFunctionDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-processing-duration-${Environment}'
+      AlarmDescription: 'Monitors Lambda function duration for performance issues'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 240000  # 4 minutes in milliseconds
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertsTopic
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DataProcessingFunction
+      TreatMissingData: notBreaching
+
+  # DLQ Message Count Alarm
+  DeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-dlq-messages-${Environment}'
+      AlarmDescription: 'Monitors DLQ message count for processing failures'
+      MetricName: ApproximateNumberOfVisibleMessages
+      Namespace: AWS/SQS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref DLQThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertsTopic
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+      TreatMissingData: notBreaching
+
+  # Lambda Throttle Alarm (detailed monitoring)
+  ProcessingFunctionThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-processing-throttles-${Environment}'
+      AlarmDescription: 'Monitors Lambda function throttles indicating capacity issues'
+      MetricName: Throttles
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlertsTopic
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DataProcessingFunction
+      TreatMissingData: notBreaching
+
+  # ================================
+  # CloudWatch Dashboard
+  # ================================
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      DashboardName: !Sub '${ResourcePrefix}-monitoring-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${DataProcessingFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/SQS", "ApproximateNumberOfVisibleMessages", "QueueName", "${DeadLetterQueue}" ],
+                  [ ".", "NumberOfMessagesSent", ".", "." ],
+                  [ ".", "NumberOfMessagesReceived", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Dead Letter Queue Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "BucketSizeBytes", "BucketName", "${DataProcessingBucket}", "StorageType", "StandardStorage" ],
+                  [ ".", "NumberOfObjects", ".", ".", ".", "AllStorageTypes" ]
+                ],
+                "period": 86400,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "S3 Bucket Metrics"
+              }
+            }
+          ]
+        }
+
+# ================================
+# Stack Outputs
+# ================================
+Outputs:
+  BucketName:
+    Description: 'Name of the S3 bucket for data processing'
+    Value: !Ref DataProcessingBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketName'
+
+  BucketArn:
+    Description: 'ARN of the S3 bucket for data processing'
+    Value: !GetAtt DataProcessingBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketArn'
+
+  ProcessingFunctionName:
+    Description: 'Name of the data processing Lambda function'
+    Value: !Ref DataProcessingFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessingFunctionName'
+
+  ProcessingFunctionArn:
+    Description: 'ARN of the data processing Lambda function'
+    Value: !GetAtt DataProcessingFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessingFunctionArn'
+
+  ErrorHandlerFunctionName:
+    Description: 'Name of the error handler Lambda function'
+    Value: !Ref ErrorHandlerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-ErrorHandlerFunctionName'
+
+  ErrorHandlerFunctionArn:
+    Description: 'ARN of the error handler Lambda function'
+    Value: !GetAtt ErrorHandlerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ErrorHandlerFunctionArn'
+
+  DeadLetterQueueUrl:
+    Description: 'URL of the Dead Letter Queue'
+    Value: !Ref DeadLetterQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueueUrl'
+
+  DeadLetterQueueArn:
+    Description: 'ARN of the Dead Letter Queue'
+    Value: !GetAtt DeadLetterQueue.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueueArn'
+
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for alerts'
+    Value: !Ref AlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  MonitoringDashboardUrl:
+    Description: 'URL of the CloudWatch monitoring dashboard'
+    Condition: EnableDetailedMonitoringCondition
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ResourcePrefix}-monitoring-${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-MonitoringDashboardUrl'
+
+  TestCommand:
+    Description: 'AWS CLI command to test the solution by uploading a file'
+    Value: !Sub 'aws s3 cp test-file.csv s3://${DataProcessingBucket}/${ProcessingPrefix}test-file.csv'
+
+  ValidationCommands:
+    Description: 'Commands to validate the deployment'
+    Value: !Sub |
+      # Check Lambda function status
+      aws lambda get-function --function-name ${DataProcessingFunction}
+      
+      # Check S3 bucket notification configuration
+      aws s3api get-bucket-notification-configuration --bucket ${DataProcessingBucket}
+      
+      # Check CloudWatch alarms
+      aws cloudwatch describe-alarms --alarm-names ${ProcessingFunctionErrorAlarm} ${DeadLetterQueueAlarm}
+      
+      # Upload test file to trigger processing
+      echo "name,age,city" > test-data.csv && echo "John,30,New York" >> test-data.csv
+      aws s3 cp test-data.csv s3://${DataProcessingBucket}/${ProcessingPrefix}test-data.csv

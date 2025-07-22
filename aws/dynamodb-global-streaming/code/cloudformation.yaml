@@ -1,0 +1,986 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Advanced DynamoDB Streaming Architecture with Global Tables for E-commerce Platform.
+  This template creates a multi-region setup with DynamoDB Global Tables, 
+  Kinesis Data Streams, Lambda processors, and comprehensive monitoring.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ecommerce-global
+    Description: Name prefix for all resources
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must start with a letter and contain only letters, numbers, and hyphens
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: Environment name for resource tagging
+
+  PrimaryRegion:
+    Type: String
+    Default: us-east-1
+    AllowedValues:
+      - us-east-1
+      - us-west-2
+      - eu-west-1
+      - ap-southeast-1
+    Description: Primary region for the Global Table
+
+  SecondaryRegions:
+    Type: CommaDelimitedList
+    Default: "eu-west-1,ap-southeast-1"
+    Description: Comma-delimited list of secondary regions for Global Table replicas
+
+  KinesisShardCount:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+    Description: Number of shards for Kinesis Data Streams
+
+  EnableEnhancedMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable enhanced monitoring for Kinesis streams
+
+  LambdaReservedConcurrency:
+    Type: Number
+    Default: 50
+    MinValue: 0
+    MaxValue: 1000
+    Description: Reserved concurrency for Lambda functions
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: Email address for CloudWatch alarms (optional)
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
+Conditions:
+  CreateNotificationTopic: !Not [!Equals [!Ref NotificationEmail, '']]
+  EnableEnhancedMonitoringCondition: !Equals [!Ref EnableEnhancedMonitoring, 'true']
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      RegionName: "Virginia"
+    us-west-2:
+      RegionName: "Oregon"
+    eu-west-1:
+      RegionName: "Ireland"
+    ap-southeast-1:
+      RegionName: "Singapore"
+
+Resources:
+  # ================================
+  # IAM ROLES AND POLICIES
+  # ================================
+  
+  # Lambda execution role for stream processing
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: DynamoDBStreamAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:ListStreams
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt ECommerceTable.Arn
+                  - !Sub '${ECommerceTable.Arn}/stream/*'
+                  - !Sub '${ECommerceTable.Arn}/index/*'
+        - PolicyName: KinesisAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:ListStreams
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource:
+                  - !GetAtt ECommerceKinesisStream.Arn
+        - PolicyName: EventBridgeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default'
+        - PolicyName: CloudWatchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # ================================
+  # DYNAMODB TABLE AND CONFIGURATION
+  # ================================
+  
+  # Primary DynamoDB table with Global Tables capability
+  ECommerceTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-table-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        KMSMasterKeyId: alias/aws/dynamodb
+      Tags:
+        - Key: Application
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: database
+        - Key: GlobalTable
+          Value: 'true'
+
+  # ================================
+  # KINESIS DATA STREAMS
+  # ================================
+  
+  # Kinesis Data Stream for advanced analytics
+  ECommerceKinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${ProjectName}-events-${Environment}'
+      ShardCount: !Ref KinesisShardCount
+      RetentionPeriodHours: 168  # 7 days
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      Tags:
+        - Key: Application
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: streaming
+
+  # Enable Kinesis Data Streams integration for DynamoDB
+  KinesisStreamingDestination:
+    Type: AWS::DynamoDB::KinesisStreamingDestination
+    Properties:
+      TableName: !Ref ECommerceTable
+      StreamArn: !GetAtt ECommerceKinesisStream.Arn
+    DependsOn: ECommerceTable
+
+  # ================================
+  # LAMBDA FUNCTIONS
+  # ================================
+  
+  # Lambda function for DynamoDB Streams processing
+  DynamoDBStreamProcessor:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-stream-processor-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      ReservedConcurrencyLimit: !Ref LambdaReservedConcurrency
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ECommerceTable
+          REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+      DeadLetterConfig:
+        TargetArn: !GetAtt ProcessorDeadLetterQueue.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from decimal import Decimal
+          import logging
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          dynamodb = boto3.resource('dynamodb')
+          eventbridge = boto3.client('events')
+          
+          def decimal_default(obj):
+              if isinstance(obj, Decimal):
+                  return float(obj)
+              raise TypeError
+          
+          def lambda_handler(event, context):
+              try:
+                  processed_count = 0
+                  for record in event['Records']:
+                      if record['eventName'] in ['INSERT', 'MODIFY', 'REMOVE']:
+                          process_record(record)
+                          processed_count += 1
+                  
+                  logger.info(f"Successfully processed {processed_count} records")
+                  return {'statusCode': 200, 'recordsProcessed': processed_count}
+              
+              except Exception as e:
+                  logger.error(f"Error processing records: {str(e)}")
+                  raise
+          
+          def process_record(record):
+              event_name = record['eventName']
+              table_name = record['eventSourceARN'].split('/')[-3]
+              
+              # Extract item data
+              if 'NewImage' in record['dynamodb']:
+                  new_image = record['dynamodb']['NewImage']
+                  pk = new_image.get('PK', {}).get('S', '')
+                  
+                  # Process different entity types
+                  if pk.startswith('PRODUCT#'):
+                      process_product_event(event_name, new_image, record.get('dynamodb', {}).get('OldImage'))
+                  elif pk.startswith('ORDER#'):
+                      process_order_event(event_name, new_image, record.get('dynamodb', {}).get('OldImage'))
+                  elif pk.startswith('USER#'):
+                      process_user_event(event_name, new_image, record.get('dynamodb', {}).get('OldImage'))
+          
+          def process_product_event(event_name, new_image, old_image):
+              # Inventory management logic
+              if event_name == 'MODIFY' and old_image:
+                  old_stock = int(old_image.get('Stock', {}).get('N', '0'))
+                  new_stock = int(new_image.get('Stock', {}).get('N', '0'))
+                  
+                  if old_stock != new_stock:
+                      send_inventory_alert(new_image, old_stock, new_stock)
+          
+          def process_order_event(event_name, new_image, old_image):
+              # Order processing logic
+              if event_name == 'INSERT':
+                  send_order_notification(new_image)
+              elif event_name == 'MODIFY':
+                  status_changed = check_order_status_change(new_image, old_image)
+                  if status_changed:
+                      send_status_update(new_image)
+          
+          def process_user_event(event_name, new_image, old_image):
+              # User activity tracking
+              if event_name == 'MODIFY':
+                  send_user_activity_event(new_image)
+          
+          def send_inventory_alert(product, old_stock, new_stock):
+              try:
+                  eventbridge.put_events(
+                      Entries=[{
+                          'Source': 'ecommerce.inventory',
+                          'DetailType': 'Inventory Change',
+                          'Detail': json.dumps({
+                              'productId': product.get('PK', {}).get('S', ''),
+                              'oldStock': old_stock,
+                              'newStock': new_stock,
+                              'timestamp': product.get('UpdatedAt', {}).get('S', ''),
+                              'region': os.environ.get('REGION', 'unknown')
+                          })
+                      }]
+                  )
+              except Exception as e:
+                  logger.error(f"Failed to send inventory alert: {str(e)}")
+          
+          def send_order_notification(order):
+              try:
+                  eventbridge.put_events(
+                      Entries=[{
+                          'Source': 'ecommerce.orders',
+                          'DetailType': 'New Order',
+                          'Detail': json.dumps({
+                              'orderId': order.get('PK', {}).get('S', ''),
+                              'customerId': order.get('CustomerId', {}).get('S', ''),
+                              'amount': order.get('TotalAmount', {}).get('N', ''),
+                              'timestamp': order.get('CreatedAt', {}).get('S', ''),
+                              'region': os.environ.get('REGION', 'unknown')
+                          })
+                      }]
+                  )
+              except Exception as e:
+                  logger.error(f"Failed to send order notification: {str(e)}")
+          
+          def send_status_update(order):
+              try:
+                  eventbridge.put_events(
+                      Entries=[{
+                          'Source': 'ecommerce.orders',
+                          'DetailType': 'Order Status Update',
+                          'Detail': json.dumps({
+                              'orderId': order.get('PK', {}).get('S', ''),
+                              'status': order.get('Status', {}).get('S', ''),
+                              'timestamp': order.get('UpdatedAt', {}).get('S', ''),
+                              'region': os.environ.get('REGION', 'unknown')
+                          })
+                      }]
+                  )
+              except Exception as e:
+                  logger.error(f"Failed to send status update: {str(e)}")
+          
+          def send_user_activity_event(user):
+              try:
+                  eventbridge.put_events(
+                      Entries=[{
+                          'Source': 'ecommerce.users',
+                          'DetailType': 'User Activity',
+                          'Detail': json.dumps({
+                              'userId': user.get('PK', {}).get('S', ''),
+                              'lastActive': user.get('LastActiveAt', {}).get('S', ''),
+                              'timestamp': user.get('UpdatedAt', {}).get('S', ''),
+                              'region': os.environ.get('REGION', 'unknown')
+                          })
+                      }]
+                  )
+              except Exception as e:
+                  logger.error(f"Failed to send user activity event: {str(e)}")
+          
+          def check_order_status_change(new_image, old_image):
+              if not old_image:
+                  return False
+              old_status = old_image.get('Status', {}).get('S', '')
+              new_status = new_image.get('Status', {}).get('S', '')
+              return old_status != new_status
+      Tags:
+        - Key: Application
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: processing
+
+  # Lambda function for Kinesis Data Streams processing
+  KinesisStreamProcessor:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-kinesis-processor-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      ReservedConcurrencyLimit: !Ref LambdaReservedConcurrency
+      Environment:
+        Variables:
+          STREAM_NAME: !Ref ECommerceKinesisStream
+          REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+      DeadLetterConfig:
+        TargetArn: !GetAtt AnalyticsDeadLetterQueue.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import base64
+          from datetime import datetime
+          import logging
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          cloudwatch = boto3.client('cloudwatch')
+          
+          def lambda_handler(event, context):
+              try:
+                  metrics_data = []
+                  processed_count = 0
+                  
+                  for record in event['Records']:
+                      # Decode Kinesis data
+                      payload = json.loads(base64.b64decode(record['kinesis']['data']))
+                      
+                      # Extract metrics based on event type
+                      if payload.get('eventName') == 'INSERT':
+                          process_insert_metrics(payload, metrics_data)
+                      elif payload.get('eventName') == 'MODIFY':
+                          process_modify_metrics(payload, metrics_data)
+                      elif payload.get('eventName') == 'REMOVE':
+                          process_remove_metrics(payload, metrics_data)
+                      
+                      processed_count += 1
+                  
+                  # Send metrics to CloudWatch
+                  if metrics_data:
+                      send_metrics(metrics_data)
+                  
+                  logger.info(f"Successfully processed {processed_count} Kinesis records")
+                  return {'statusCode': 200, 'body': f'Processed {processed_count} records'}
+              
+              except Exception as e:
+                  logger.error(f"Error processing Kinesis records: {str(e)}")
+                  raise
+          
+          def process_insert_metrics(payload, metrics_data):
+              dynamodb_data = payload.get('dynamodb', {})
+              new_image = dynamodb_data.get('NewImage', {})
+              pk = new_image.get('PK', {}).get('S', '')
+              
+              if pk.startswith('ORDER#'):
+                  amount = float(new_image.get('TotalAmount', {}).get('N', '0'))
+                  metrics_data.append({
+                      'MetricName': 'NewOrders',
+                      'Value': 1,
+                      'Unit': 'Count',
+                      'Dimensions': [{'Name': 'EntityType', 'Value': 'Order'}]
+                  })
+                  metrics_data.append({
+                      'MetricName': 'OrderValue',
+                      'Value': amount,
+                      'Unit': 'None',
+                      'Dimensions': [{'Name': 'EntityType', 'Value': 'Order'}]
+                  })
+              elif pk.startswith('PRODUCT#'):
+                  metrics_data.append({
+                      'MetricName': 'NewProducts',
+                      'Value': 1,
+                      'Unit': 'Count',
+                      'Dimensions': [{'Name': 'EntityType', 'Value': 'Product'}]
+                  })
+          
+          def process_modify_metrics(payload, metrics_data):
+              dynamodb_data = payload.get('dynamodb', {})
+              new_image = dynamodb_data.get('NewImage', {})
+              old_image = dynamodb_data.get('OldImage', {})
+              pk = new_image.get('PK', {}).get('S', '')
+              
+              if pk.startswith('PRODUCT#'):
+                  old_stock = int(old_image.get('Stock', {}).get('N', '0'))
+                  new_stock = int(new_image.get('Stock', {}).get('N', '0'))
+                  stock_change = new_stock - old_stock
+                  
+                  if stock_change != 0:
+                      metrics_data.append({
+                          'MetricName': 'InventoryChange',
+                          'Value': abs(stock_change),
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {'Name': 'EntityType', 'Value': 'Product'},
+                              {'Name': 'ChangeType', 'Value': 'Increase' if stock_change > 0 else 'Decrease'}
+                          ]
+                      })
+          
+          def process_remove_metrics(payload, metrics_data):
+              dynamodb_data = payload.get('dynamodb', {})
+              old_image = dynamodb_data.get('OldImage', {})
+              pk = old_image.get('PK', {}).get('S', '')
+              
+              if pk.startswith('ORDER#'):
+                  metrics_data.append({
+                      'MetricName': 'CancelledOrders',
+                      'Value': 1,
+                      'Unit': 'Count',
+                      'Dimensions': [{'Name': 'EntityType', 'Value': 'Order'}]
+                  })
+          
+          def send_metrics(metrics_data):
+              try:
+                  cloudwatch.put_metric_data(
+                      Namespace='ECommerce/Global',
+                      MetricData=[{
+                          **metric,
+                          'Timestamp': datetime.utcnow()
+                      } for metric in metrics_data]
+                  )
+              except Exception as e:
+                  logger.error(f"Failed to send metrics: {str(e)}")
+      Tags:
+        - Key: Application
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: analytics
+
+  # ================================
+  # EVENT SOURCE MAPPINGS
+  # ================================
+  
+  # DynamoDB Streams to Lambda mapping
+  DynamoDBStreamEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ECommerceTable.StreamArn
+      FunctionName: !GetAtt DynamoDBStreamProcessor.Arn
+      StartingPosition: LATEST
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      ParallelizationFactor: 2
+      MaximumRetryAttempts: 3
+      BisectBatchOnFunctionError: true
+      MaximumRecordAgeInSeconds: 3600
+
+  # Kinesis Data Streams to Lambda mapping
+  KinesisStreamEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ECommerceKinesisStream.Arn
+      FunctionName: !GetAtt KinesisStreamProcessor.Arn
+      StartingPosition: LATEST
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 10
+      ParallelizationFactor: 2
+      MaximumRetryAttempts: 3
+      BisectBatchOnFunctionError: true
+      MaximumRecordAgeInSeconds: 3600
+
+  # ================================
+  # SQS DEAD LETTER QUEUES
+  # ================================
+  
+  # Dead letter queue for stream processor
+  ProcessorDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-processor-dlq-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Application
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: processing
+
+  # Dead letter queue for analytics processor
+  AnalyticsDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-analytics-dlq-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Application
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: analytics
+
+  # ================================
+  # CLOUDWATCH MONITORING
+  # ================================
+  
+  # SNS topic for notifications (conditional)
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateNotificationTopic
+    Properties:
+      TopicName: !Sub '${ProjectName}-notifications-${Environment}'
+      KmsMasterKeyId: alias/aws/sns
+
+  # SNS subscription for email notifications
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateNotificationTopic
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch alarm for DynamoDB throttling
+  DynamoDBThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-dynamodb-throttle-${Environment}'
+      AlarmDescription: DynamoDB read/write throttling detected
+      MetricName: UserErrors
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref ECommerceTable
+      AlarmActions:
+        - !If [CreateNotificationTopic, !Ref NotificationTopic, !Ref 'AWS::NoValue']
+
+  # CloudWatch alarm for Lambda errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors-${Environment}'
+      AlarmDescription: Lambda function errors detected
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DynamoDBStreamProcessor
+      AlarmActions:
+        - !If [CreateNotificationTopic, !Ref NotificationTopic, !Ref 'AWS::NoValue']
+
+  # CloudWatch alarm for Kinesis stream age
+  KinesisIteratorAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-kinesis-age-${Environment}'
+      AlarmDescription: Kinesis iterator age is too high
+      MetricName: IncomingRecords.IteratorAgeMilliseconds
+      Namespace: AWS/Kinesis
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 60000  # 1 minute in milliseconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: StreamName
+          Value: !Ref ECommerceKinesisStream
+      AlarmActions:
+        - !If [CreateNotificationTopic, !Ref NotificationTopic, !Ref 'AWS::NoValue']
+
+  # CloudWatch dashboard for global monitoring
+  ECommerceDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-global-monitoring-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["ECommerce/Global", "NewOrders", "EntityType", "Order"],
+                  [".", "OrderValue", ".", "."],
+                  [".", "CancelledOrders", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Order Metrics - Global",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["ECommerce/Global", "InventoryChange", "EntityType", "Product", "ChangeType", "Increase"],
+                  ["...", "Decrease"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Inventory Changes - Global",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${ECommerceTable}"],
+                  [".", "ConsumedWriteCapacityUnits", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "DynamoDB Capacity - Primary Region",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Kinesis", "IncomingRecords", "StreamName", "${ECommerceKinesisStream}"],
+                  [".", "OutgoingRecords", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Kinesis Stream Metrics - Primary Region",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${DynamoDBStreamProcessor}"],
+                  [".", "Errors", ".", "."],
+                  [".", "Invocations", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Lambda Performance - Stream Processor",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${KinesisStreamProcessor}"],
+                  [".", "Errors", ".", "."],
+                  [".", "Invocations", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Lambda Performance - Kinesis Processor",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+  # ================================
+  # LOG GROUPS
+  # ================================
+  
+  # CloudWatch Log Group for DynamoDB Stream Processor
+  DynamoDBProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DynamoDBStreamProcessor}'
+      RetentionInDays: 14
+
+  # CloudWatch Log Group for Kinesis Stream Processor
+  KinesisProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${KinesisStreamProcessor}'
+      RetentionInDays: 14
+
+Outputs:
+  # ================================
+  # TABLE AND STREAM OUTPUTS
+  # ================================
+  
+  TableName:
+    Description: Name of the DynamoDB table
+    Value: !Ref ECommerceTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TableName'
+
+  TableArn:
+    Description: ARN of the DynamoDB table
+    Value: !GetAtt ECommerceTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TableArn'
+
+  TableStreamArn:
+    Description: ARN of the DynamoDB table stream
+    Value: !GetAtt ECommerceTable.StreamArn
+    Export:
+      Name: !Sub '${AWS::StackName}-TableStreamArn'
+
+  KinesisStreamName:
+    Description: Name of the Kinesis Data Stream
+    Value: !Ref ECommerceKinesisStream
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisStreamName'
+
+  KinesisStreamArn:
+    Description: ARN of the Kinesis Data Stream
+    Value: !GetAtt ECommerceKinesisStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisStreamArn'
+
+  # ================================
+  # LAMBDA FUNCTION OUTPUTS
+  # ================================
+  
+  DynamoDBProcessorArn:
+    Description: ARN of the DynamoDB Stream processor Lambda function
+    Value: !GetAtt DynamoDBStreamProcessor.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBProcessorArn'
+
+  KinesisProcessorArn:
+    Description: ARN of the Kinesis Stream processor Lambda function
+    Value: !GetAtt KinesisStreamProcessor.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisProcessorArn'
+
+  # ================================
+  # IAM ROLE OUTPUTS
+  # ================================
+  
+  LambdaExecutionRoleArn:
+    Description: ARN of the Lambda execution role
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  # ================================
+  # MONITORING OUTPUTS
+  # ================================
+  
+  DashboardURL:
+    Description: URL to the CloudWatch dashboard
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-global-monitoring-${Environment}'
+
+  NotificationTopicArn:
+    Condition: CreateNotificationTopic
+    Description: ARN of the SNS notification topic
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopicArn'
+
+  # ================================
+  # CONFIGURATION OUTPUTS
+  # ================================
+  
+  PrimaryRegion:
+    Description: Primary region for the Global Table setup
+    Value: !Ref PrimaryRegion
+
+  SecondaryRegions:
+    Description: Secondary regions for Global Table replicas
+    Value: !Join [',', !Ref SecondaryRegions]
+
+  # ================================
+  # DEAD LETTER QUEUE OUTPUTS
+  # ================================
+  
+  ProcessorDLQArn:
+    Description: ARN of the processor dead letter queue
+    Value: !GetAtt ProcessorDeadLetterQueue.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessorDLQArn'
+
+  AnalyticsDLQArn:
+    Description: ARN of the analytics dead letter queue
+    Value: !GetAtt AnalyticsDeadLetterQueue.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AnalyticsDLQArn'
+
+  # ================================
+  # DEPLOYMENT INSTRUCTIONS
+  # ================================
+  
+  GlobalTableSetupInstructions:
+    Description: Instructions for setting up Global Tables in other regions
+    Value: !Sub |
+      To complete the Global Tables setup:
+      1. Deploy this template in secondary regions: ${SecondaryRegions}
+      2. Create Global Table using AWS CLI:
+         aws dynamodb create-global-table --global-table-name ${ECommerceTable} --replication-group RegionName=${PrimaryRegion} RegionName=${SecondaryRegions}
+      3. Enable Kinesis Data Streams integration in each region
+      4. Configure cross-region monitoring and alerting

@@ -1,0 +1,646 @@
+# Infrastructure Manager Configuration for Fleet Operations with Fleet Engine and Cloud Run Jobs
+# This configuration deploys a complete fleet management solution using Google Fleet Engine
+# and Cloud Run Jobs for serverless batch processing of fleet analytics
+
+# Configuration metadata
+metadata:
+  name: fleet-operations-platform
+  description: Complete fleet management solution with Fleet Engine and Cloud Run Jobs
+  labels:
+    solution: fleet-operations
+    category: logistics
+    difficulty: intermediate
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: Google Cloud project ID where resources will be created
+    required: true
+  
+  region:
+    type: string
+    description: Google Cloud region for resource deployment
+    default: us-central1
+    validation:
+      constraint: contains(["us-central1", "us-east1", "us-west1", "europe-west1", "asia-southeast1"], var.region)
+  
+  zone:
+    type: string
+    description: Google Cloud zone for zonal resources
+    default: us-central1-a
+  
+  fleet_name_prefix:
+    type: string
+    description: Prefix for fleet-related resource names
+    default: fleet-ops
+    validation:
+      constraint: length(var.fleet_name_prefix) <= 20
+  
+  analytics_schedule:
+    type: string
+    description: Cron schedule for analytics processing
+    default: "0 2 * * *"
+  
+  bucket_lifecycle_days:
+    type: number
+    description: Days after which to move data to nearline storage
+    default: 30
+    validation:
+      constraint: var.bucket_lifecycle_days > 0 && var.bucket_lifecycle_days <= 365
+
+# Local values for computed resource names
+locals:
+  # Generate unique suffix for resource names
+  resource_suffix: substr(sha256("${var.project_id}-${var.fleet_name_prefix}"), 0, 8)
+  
+  # Computed resource names
+  service_account_name: "${var.fleet_name_prefix}-sa-${local.resource_suffix}"
+  bucket_name: "${var.fleet_name_prefix}-data-${local.resource_suffix}"
+  dataset_name: "${replace(var.fleet_name_prefix, "-", "_")}_analytics"
+  job_name: "${var.fleet_name_prefix}-analytics-${local.resource_suffix}"
+  
+  # Required APIs for the solution
+  required_apis:
+    - fleetengine.googleapis.com
+    - run.googleapis.com
+    - cloudscheduler.googleapis.com
+    - bigquery.googleapis.com
+    - storage.googleapis.com
+    - firestore.googleapis.com
+    - maps-backend.googleapis.com
+    - routes.googleapis.com
+    - monitoring.googleapis.com
+    - cloudbuild.googleapis.com
+    - containerregistry.googleapis.com
+    - logging.googleapis.com
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/fleetengine.googleapis.com
+      requestId: enable-fleet-engine-${local.resource_suffix}
+    metadata:
+      dependsOn: []
+  
+  # Additional API enablement (using array iteration would be ideal, but using explicit resources)
+  - name: enable-run-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/run.googleapis.com
+      requestId: enable-run-${local.resource_suffix}
+  
+  - name: enable-scheduler-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/cloudscheduler.googleapis.com
+      requestId: enable-scheduler-${local.resource_suffix}
+  
+  - name: enable-bigquery-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/bigquery.googleapis.com
+      requestId: enable-bigquery-${local.resource_suffix}
+  
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/storage.googleapis.com
+      requestId: enable-storage-${local.resource_suffix}
+  
+  - name: enable-firestore-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/firestore.googleapis.com
+      requestId: enable-firestore-${local.resource_suffix}
+  
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/monitoring.googleapis.com
+      requestId: enable-monitoring-${local.resource_suffix}
+
+  # Service Account for Fleet Engine and Cloud Run Jobs
+  - name: fleet-engine-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: ${local.service_account_name}
+      displayName: Fleet Engine Service Account
+      description: Service account for Fleet Engine operations and Cloud Run Jobs
+      serviceAccount:
+        displayName: Fleet Engine Service Account
+        description: Manages Fleet Engine API access and Cloud Run Jobs execution
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # IAM Policy Bindings for Fleet Engine Service Account
+  - name: fleet-engine-iam-binding-fleet-reader
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: ${var.project_id}
+      policy:
+        bindings:
+          - role: roles/fleetengine.deliveryFleetReader
+            members:
+              - serviceAccount:${local.service_account_name}@${var.project_id}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - fleet-engine-service-account
+
+  - name: fleet-engine-iam-binding-consumer
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: ${var.project_id}
+      policy:
+        bindings:
+          - role: roles/fleetengine.deliveryConsumer
+            members:
+              - serviceAccount:${local.service_account_name}@${var.project_id}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - fleet-engine-service-account
+
+  - name: bigquery-data-editor-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: ${var.project_id}
+      policy:
+        bindings:
+          - role: roles/bigquery.dataEditor
+            members:
+              - serviceAccount:${local.service_account_name}@${var.project_id}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - fleet-engine-service-account
+
+  - name: storage-object-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: ${var.project_id}
+      policy:
+        bindings:
+          - role: roles/storage.objectAdmin
+            members:
+              - serviceAccount:${local.service_account_name}@${var.project_id}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - fleet-engine-service-account
+
+  - name: datastore-user-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: ${var.project_id}
+      policy:
+        bindings:
+          - role: roles/datastore.user
+            members:
+              - serviceAccount:${local.service_account_name}@${var.project_id}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - fleet-engine-service-account
+
+  # Cloud Storage Bucket for Fleet Data
+  - name: fleet-data-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${local.bucket_name}
+      location: ${var.region}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: ${var.bucket_lifecycle_days}
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90
+      labels:
+        purpose: fleet-data
+        environment: production
+        solution: fleet-operations
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # BigQuery Dataset for Fleet Analytics
+  - name: fleet-analytics-dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      datasetId: ${local.dataset_name}
+      description: Fleet operations analytics dataset
+      location: ${var.region}
+      labels:
+        purpose: fleet-analytics
+        solution: fleet-operations
+      access:
+        - role: OWNER
+          userByEmail: ${local.service_account_name}@${var.project_id}.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - enable-bigquery-api
+        - fleet-engine-service-account
+
+  # BigQuery Tables for Fleet Data
+  - name: vehicle-telemetry-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      datasetId: ${local.dataset_name}
+      tableId: vehicle_telemetry
+      description: Vehicle telemetry and location data
+      schema:
+        fields:
+          - name: vehicle_id
+            type: STRING
+            description: Unique identifier for the vehicle
+          - name: timestamp
+            type: TIMESTAMP
+            description: Timestamp of the telemetry data
+          - name: latitude
+            type: FLOAT
+            description: Vehicle latitude coordinate
+          - name: longitude
+            type: FLOAT
+            description: Vehicle longitude coordinate
+          - name: speed
+            type: FLOAT
+            description: Vehicle speed in km/h
+          - name: fuel_level
+            type: FLOAT
+            description: Fuel level as percentage (0.0 to 1.0)
+          - name: engine_status
+            type: STRING
+            description: Engine status (running, stopped, idle)
+          - name: driver_id
+            type: STRING
+            description: Unique identifier for the driver
+      labels:
+        table_type: telemetry
+        solution: fleet-operations
+    metadata:
+      dependsOn:
+        - fleet-analytics-dataset
+
+  - name: route-performance-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      datasetId: ${local.dataset_name}
+      tableId: route_performance
+      description: Route performance and optimization metrics
+      schema:
+        fields:
+          - name: route_id
+            type: STRING
+            description: Unique identifier for the route
+          - name: vehicle_id
+            type: STRING
+            description: Vehicle that completed the route
+          - name: start_time
+            type: TIMESTAMP
+            description: Route start timestamp
+          - name: end_time
+            type: TIMESTAMP
+            description: Route completion timestamp
+          - name: distance_km
+            type: FLOAT
+            description: Total distance in kilometers
+          - name: fuel_consumed
+            type: FLOAT
+            description: Fuel consumed in liters
+          - name: average_speed
+            type: FLOAT
+            description: Average speed in km/h
+          - name: stops_count
+            type: INTEGER
+            description: Number of stops made
+          - name: efficiency_score
+            type: FLOAT
+            description: Route efficiency score (0.0 to 1.0)
+      labels:
+        table_type: performance
+        solution: fleet-operations
+    metadata:
+      dependsOn:
+        - fleet-analytics-dataset
+
+  - name: delivery-tasks-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      datasetId: ${local.dataset_name}
+      tableId: delivery_tasks
+      description: Delivery task tracking and completion data
+      schema:
+        fields:
+          - name: task_id
+            type: STRING
+            description: Unique identifier for the delivery task
+          - name: vehicle_id
+            type: STRING
+            description: Assigned vehicle identifier
+          - name: driver_id
+            type: STRING
+            description: Assigned driver identifier
+          - name: pickup_location
+            type: STRING
+            description: Pickup location address
+          - name: delivery_location
+            type: STRING
+            description: Delivery location address
+          - name: scheduled_time
+            type: TIMESTAMP
+            description: Scheduled delivery time
+          - name: completed_time
+            type: TIMESTAMP
+            description: Actual completion time
+          - name: status
+            type: STRING
+            description: Task status (pending, in_progress, completed, failed)
+          - name: customer_rating
+            type: INTEGER
+            description: Customer rating (1-5)
+      labels:
+        table_type: tasks
+        solution: fleet-operations
+    metadata:
+      dependsOn:
+        - fleet-analytics-dataset
+
+  # Firestore Database for Real-time Fleet State
+  - name: firestore-database
+    type: gcp-types/firestore-v1:projects.databases
+    properties:
+      name: projects/${var.project_id}/databases/(default)
+      locationId: ${var.region}
+      type: FIRESTORE_NATIVE
+      concurrencyMode: OPTIMISTIC
+      appEngineIntegrationMode: DISABLED
+    metadata:
+      dependsOn:
+        - enable-firestore-api
+
+  # Cloud Run Job for Fleet Analytics Processing
+  - name: fleet-analytics-job
+    type: gcp-types/run-v1:namespaces.jobs
+    properties:
+      apiVersion: run.googleapis.com/v1
+      kind: Job
+      metadata:
+        name: ${local.job_name}
+        namespace: ${var.project_id}
+        annotations:
+          run.googleapis.com/execution-environment: gen2
+          run.googleapis.com/cpu-throttling: "false"
+        labels:
+          solution: fleet-operations
+          component: analytics
+      spec:
+        template:
+          metadata:
+            annotations:
+              run.googleapis.com/execution-environment: gen2
+              run.googleapis.com/cpu-throttling: "false"
+          spec:
+            template:
+              spec:
+                taskCount: 1
+                parallelism: 1
+                taskTimeoutSeconds: 3600
+                restartPolicy: OnFailure
+                serviceAccountName: ${local.service_account_name}@${var.project_id}.iam.gserviceaccount.com
+                containers:
+                  - name: analytics-processor
+                    image: gcr.io/cloudrun/hello # Placeholder image - replace with actual analytics container
+                    resources:
+                      limits:
+                        cpu: 1000m
+                        memory: 2Gi
+                    env:
+                      - name: PROJECT_ID
+                        value: ${var.project_id}
+                      - name: DATASET_NAME
+                        value: ${local.dataset_name}
+                      - name: BUCKET_NAME
+                        value: ${local.bucket_name}
+                      - name: REGION
+                        value: ${var.region}
+    metadata:
+      dependsOn:
+        - enable-run-api
+        - fleet-engine-service-account
+        - fleet-data-bucket
+        - fleet-analytics-dataset
+
+  # Cloud Scheduler Job for Daily Analytics Processing
+  - name: daily-analytics-scheduler
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      name: projects/${var.project_id}/locations/${var.region}/jobs/${local.job_name}-daily
+      description: Daily fleet analytics processing
+      schedule: ${var.analytics_schedule}
+      timeZone: America/New_York
+      httpTarget:
+        uri: https://${var.region}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${var.project_id}/jobs/${local.job_name}:run
+        httpMethod: POST
+        oidcToken:
+          serviceAccountEmail: ${local.service_account_name}@${var.project_id}.iam.gserviceaccount.com
+          audience: https://${var.region}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${var.project_id}/jobs/${local.job_name}:run
+      retryConfig:
+        maxRetryAttempts: 3
+        maxRetryDuration: 300s
+        maxBackoffDuration: 300s
+        minBackoffDuration: 5s
+        maxDoublings: 5
+    metadata:
+      dependsOn:
+        - enable-scheduler-api
+        - fleet-analytics-job
+
+  # Cloud Scheduler Job for Hourly Insights Processing
+  - name: hourly-insights-scheduler
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      name: projects/${var.project_id}/locations/${var.region}/jobs/${local.job_name}-hourly
+      description: Hourly fleet insights processing
+      schedule: "0 * * * *"
+      timeZone: America/New_York
+      httpTarget:
+        uri: https://${var.region}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${var.project_id}/jobs/${local.job_name}:run
+        httpMethod: POST
+        oidcToken:
+          serviceAccountEmail: ${local.service_account_name}@${var.project_id}.iam.gserviceaccount.com
+          audience: https://${var.region}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${var.project_id}/jobs/${local.job_name}:run
+      retryConfig:
+        maxRetryAttempts: 3
+        maxRetryDuration: 300s
+        maxBackoffDuration: 300s
+        minBackoffDuration: 5s
+        maxDoublings: 5
+    metadata:
+      dependsOn:
+        - enable-scheduler-api
+        - fleet-analytics-job
+
+  # Cloud Monitoring Dashboard for Fleet Operations
+  - name: fleet-operations-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      displayName: Fleet Operations Dashboard
+      mosaicLayout:
+        tiles:
+          - width: 6
+            height: 4
+            widget:
+              title: Fleet Engine API Requests
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="consumed_api" AND resource.label.service="fleetengine.googleapis.com"'
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_RATE
+                          crossSeriesReducer: REDUCE_SUM
+                          groupByFields:
+                            - resource.label.method
+                yAxis:
+                  label: Requests per second
+                  scale: LINEAR
+          - width: 6
+            height: 4
+            xPos: 6
+            widget:
+              title: Cloud Run Job Executions
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="cloud_run_job" AND resource.label.job_name="${local.job_name}"'
+                        aggregation:
+                          alignmentPeriod: 300s
+                          perSeriesAligner: ALIGN_RATE
+                          crossSeriesReducer: REDUCE_SUM
+                yAxis:
+                  label: Executions per minute
+                  scale: LINEAR
+          - width: 12
+            height: 4
+            yPos: 4
+            widget:
+              title: Fleet Analytics Processing Status
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="cloud_run_job" AND resource.label.job_name="${local.job_name}" AND metric.type="run.googleapis.com/job/completed_execution_count"'
+                        aggregation:
+                          alignmentPeriod: 3600s
+                          perSeriesAligner: ALIGN_DELTA
+                          crossSeriesReducer: REDUCE_SUM
+                          groupByFields:
+                            - metric.label.result
+                yAxis:
+                  label: Completed executions
+                  scale: LINEAR
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+        - fleet-analytics-job
+
+  # Cloud Monitoring Alert Policy for Job Failures
+  - name: fleet-analytics-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: Fleet Analytics Job Failures
+      documentation:
+        content: Alert when fleet analytics jobs fail to complete successfully
+        mimeType: text/markdown
+      conditions:
+        - displayName: Analytics Job Failure Rate
+          conditionThreshold:
+            filter: 'resource.type="cloud_run_job" AND resource.label.job_name="${local.job_name}" AND metric.type="run.googleapis.com/job/completed_execution_count" AND metric.label.result="failed"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 0
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_SUM
+      combiner: OR
+      enabled: true
+      alertStrategy:
+        autoClose: 604800s # 7 days
+      notificationChannels: []
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+        - fleet-analytics-job
+
+# Output values for reference and integration
+outputs:
+  fleet_engine_service_account_email:
+    description: Email address of the Fleet Engine service account
+    value: ${local.service_account_name}@${var.project_id}.iam.gserviceaccount.com
+  
+  fleet_data_bucket_name:
+    description: Name of the Cloud Storage bucket for fleet data
+    value: ${local.bucket_name}
+  
+  fleet_data_bucket_url:
+    description: URL of the Cloud Storage bucket for fleet data
+    value: gs://${local.bucket_name}
+  
+  bigquery_dataset_id:
+    description: BigQuery dataset ID for fleet analytics
+    value: ${local.dataset_name}
+  
+  bigquery_dataset_location:
+    description: Location of the BigQuery dataset
+    value: ${var.region}
+  
+  analytics_job_name:
+    description: Name of the Cloud Run Job for analytics processing
+    value: ${local.job_name}
+  
+  analytics_job_url:
+    description: URL to manually trigger the analytics job
+    value: https://${var.region}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${var.project_id}/jobs/${local.job_name}:run
+  
+  daily_scheduler_job_name:
+    description: Name of the daily analytics scheduler job
+    value: ${local.job_name}-daily
+  
+  hourly_scheduler_job_name:
+    description: Name of the hourly insights scheduler job
+    value: ${local.job_name}-hourly
+  
+  firestore_database_name:
+    description: Name of the Firestore database
+    value: projects/${var.project_id}/databases/(default)
+  
+  dashboard_url:
+    description: URL to the Cloud Monitoring dashboard
+    value: https://console.cloud.google.com/monitoring/dashboards/custom/${reference('fleet-operations-dashboard').name}?project=${var.project_id}
+  
+  fleet_engine_project_id:
+    description: Project ID configured for Fleet Engine
+    value: ${var.project_id}
+  
+  deployment_region:
+    description: Google Cloud region where resources are deployed
+    value: ${var.region}
+  
+  resource_labels:
+    description: Common labels applied to resources
+    value:
+      solution: fleet-operations
+      category: logistics
+      managed_by: infrastructure-manager

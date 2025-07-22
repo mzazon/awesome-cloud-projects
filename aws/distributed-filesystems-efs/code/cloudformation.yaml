@@ -1,0 +1,838 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for Building Distributed File Systems with Amazon EFS - Creates EFS file system with multi-AZ mount targets, access points, EC2 instances, and monitoring'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - SubnetIds
+          - AvailabilityZones
+      - Label:
+          default: "EFS Configuration"
+        Parameters:
+          - EFSName
+          - PerformanceMode
+          - ThroughputMode
+          - EnableEncryption
+          - EnableBackup
+      - Label:
+          default: "EC2 Configuration"
+        Parameters:
+          - InstanceType
+          - KeyPairName
+          - SSHAccessCidr
+          - NumberOfInstances
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableCloudWatchLogs
+          - LogRetentionDays
+          - EnableDashboard
+    ParameterLabels:
+      VpcId:
+        default: "VPC ID"
+      SubnetIds:
+        default: "Subnet IDs"
+      EFSName:
+        default: "EFS File System Name"
+      PerformanceMode:
+        default: "EFS Performance Mode"
+      ThroughputMode:
+        default: "EFS Throughput Mode"
+      EnableEncryption:
+        default: "Enable EFS Encryption"
+      EnableBackup:
+        default: "Enable AWS Backup"
+      InstanceType:
+        default: "EC2 Instance Type"
+      KeyPairName:
+        default: "EC2 Key Pair"
+      SSHAccessCidr:
+        default: "SSH Access CIDR"
+      NumberOfInstances:
+        default: "Number of EC2 Instances"
+      EnableCloudWatchLogs:
+        default: "Enable CloudWatch Logs"
+      LogRetentionDays:
+        default: "Log Retention (Days)"
+      EnableDashboard:
+        default: "Enable CloudWatch Dashboard"
+
+# Input Parameters
+Parameters:
+  # Network Configuration
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where EFS and EC2 instances will be deployed
+    
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of subnet IDs across multiple AZs for EFS mount targets and EC2 instances
+    
+  AvailabilityZones:
+    Type: List<AWS::EC2::AvailabilityZone::Name>
+    Description: List of Availability Zones for multi-AZ deployment
+    
+  # EFS Configuration
+  EFSName:
+    Type: String
+    Description: Name for the EFS file system and related resources
+    Default: distributed-efs-demo
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: Must contain only alphanumeric characters and hyphens
+    
+  PerformanceMode:
+    Type: String
+    Description: EFS performance mode
+    Default: generalPurpose
+    AllowedValues:
+      - generalPurpose
+      - maxIO
+    ConstraintDescription: Must be either generalPurpose or maxIO
+    
+  ThroughputMode:
+    Type: String
+    Description: EFS throughput mode
+    Default: elastic
+    AllowedValues:
+      - bursting
+      - provisioned
+      - elastic
+    ConstraintDescription: Must be bursting, provisioned, or elastic
+    
+  EnableEncryption:
+    Type: String
+    Description: Enable encryption for EFS file system
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    ConstraintDescription: Must be true or false
+    
+  EnableBackup:
+    Type: String
+    Description: Enable AWS Backup for EFS file system
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    ConstraintDescription: Must be true or false
+    
+  # EC2 Configuration
+  InstanceType:
+    Type: String
+    Description: EC2 instance type for EFS clients
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - m5.large
+      - m5.xlarge
+    ConstraintDescription: Must be a valid EC2 instance type
+    
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access to instances
+    
+  SSHAccessCidr:
+    Type: String
+    Description: CIDR block for SSH access to EC2 instances
+    Default: 0.0.0.0/0
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a valid CIDR block (e.g., 10.0.0.0/16)
+    
+  NumberOfInstances:
+    Type: Number
+    Description: Number of EC2 instances to launch across AZs
+    Default: 2
+    MinValue: 1
+    MaxValue: 6
+    ConstraintDescription: Must be between 1 and 6 instances
+    
+  # Monitoring Configuration
+  EnableCloudWatchLogs:
+    Type: String
+    Description: Enable CloudWatch Logs for EC2 instances
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    ConstraintDescription: Must be true or false
+    
+  LogRetentionDays:
+    Type: Number
+    Description: CloudWatch Logs retention period in days
+    Default: 7
+    AllowedValues:
+      - 1
+      - 3
+      - 5
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+      - 120
+      - 150
+      - 180
+      - 365
+      - 400
+      - 545
+      - 731
+      - 1827
+      - 3653
+    ConstraintDescription: Must be a valid CloudWatch Logs retention period
+    
+  EnableDashboard:
+    Type: String
+    Description: Create CloudWatch Dashboard for EFS monitoring
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    ConstraintDescription: Must be true or false
+
+# Conditional Resource Creation
+Conditions:
+  # Check if encryption is enabled
+  EncryptionEnabled: !Equals [!Ref EnableEncryption, 'true']
+  
+  # Check if backup is enabled
+  BackupEnabled: !Equals [!Ref EnableBackup, 'true']
+  
+  # Check if CloudWatch logs are enabled
+  LogsEnabled: !Equals [!Ref EnableCloudWatchLogs, 'true']
+  
+  # Check if dashboard is enabled
+  DashboardEnabled: !Equals [!Ref EnableDashboard, 'true']
+  
+  # Check if we have multiple subnets for multi-AZ deployment
+  HasMultipleSubnets: !Not [!Equals [!Select [1, !Ref SubnetIds], '']]
+  
+  # Check if we have three or more subnets
+  HasThreeSubnets: !Not [!Equals [!Select [2, !Ref SubnetIds], '']]
+  
+  # Check number of instances conditions
+  CreateSecondInstance: !Not [!Equals [!Ref NumberOfInstances, 1]]
+  CreateThirdInstance: !Not [!Or [!Equals [!Ref NumberOfInstances, 1], !Equals [!Ref NumberOfInstances, 2]]]
+
+# Template Resources
+Resources:
+  # Security Groups
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EFSName}-efs-sg'
+      GroupDescription: Security group for EFS mount targets
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+          Description: Allow NFS traffic from EC2 instances
+      Tags:
+        - Key: Name
+          Value: !Sub '${EFSName}-efs-sg'
+        - Key: Purpose
+          Value: EFS Mount Target Security Group
+        - Key: Recipe
+          Value: distributed-file-systems-efs
+  
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EFSName}-ec2-sg'
+      GroupDescription: Security group for EFS client instances
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHAccessCidr
+          Description: SSH access
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP access
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS access
+      Tags:
+        - Key: Name
+          Value: !Sub '${EFSName}-ec2-sg'
+        - Key: Purpose
+          Value: EC2 Instance Security Group
+        - Key: Recipe
+          Value: distributed-file-systems-efs
+
+  # IAM Role for EC2 Instances
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EFSName}-ec2-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonElasticFileSystemClientFullAccess
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: EFSAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientRootAccess
+                  - elasticfilesystem:ClientWrite
+                Resource: !Sub 'arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EFSName}-ec2-role'
+        - Key: Recipe
+          Value: distributed-file-systems-efs
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${EFSName}-ec2-profile'
+      Roles:
+        - !Ref EC2Role
+
+  # EFS File System
+  EFSFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      CreationToken: !Sub '${EFSName}-token'
+      PerformanceMode: !Ref PerformanceMode
+      ThroughputMode: !Ref ThroughputMode
+      Encrypted: !If [EncryptionEnabled, true, false]
+      FileSystemTags:
+        - Key: Name
+          Value: !Ref EFSName
+        - Key: Recipe
+          Value: distributed-file-systems-efs
+        - Key: Purpose
+          Value: Distributed File System Demo
+      LifecyclePolicies:
+        - TransitionToIA: AFTER_30_DAYS
+        - TransitionToPrimaryStorageClass: AFTER_1_ACCESS
+      FileSystemPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - elasticfilesystem:ClientMount
+              - elasticfilesystem:ClientWrite
+              - elasticfilesystem:ClientRootAccess
+            Resource: !Sub 'arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'true'
+
+  # EFS Mount Targets
+  EFSMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Select [0, !Ref SubnetIds]
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  EFSMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Condition: HasMultipleSubnets
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Select [1, !Ref SubnetIds]
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  EFSMountTarget3:
+    Type: AWS::EFS::MountTarget
+    Condition: HasThreeSubnets
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Select [2, !Ref SubnetIds]
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  # EFS Access Points
+  WebContentAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      PosixUser:
+        Uid: 1000
+        Gid: 1000
+      RootDirectory:
+        Path: /web-content
+        CreationInfo:
+          OwnerUid: 1000
+          OwnerGid: 1000
+          Permissions: '755'
+      AccessPointTags:
+        - Key: Name
+          Value: !Sub '${EFSName}-web-content'
+        - Key: Recipe
+          Value: distributed-file-systems-efs
+        - Key: Purpose
+          Value: Web Content Access Point
+
+  SharedDataAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      PosixUser:
+        Uid: 1001
+        Gid: 1001
+      RootDirectory:
+        Path: /shared-data
+        CreationInfo:
+          OwnerUid: 1001
+          OwnerGid: 1001
+          Permissions: '750'
+      AccessPointTags:
+        - Key: Name
+          Value: !Sub '${EFSName}-shared-data'
+        - Key: Recipe
+          Value: distributed-file-systems-efs
+        - Key: Purpose
+          Value: Shared Data Access Point
+
+  # CloudWatch Log Group
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: LogsEnabled
+    Properties:
+      LogGroupName: !Sub '/aws/ec2/${EFSName}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${EFSName}-log-group'
+        - Key: Recipe
+          Value: distributed-file-systems-efs
+
+  # EC2 Launch Template
+  EC2LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${EFSName}-launch-template'
+      LaunchTemplateData:
+        ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyPairName
+        SecurityGroupIds:
+          - !Ref EC2SecurityGroup
+        IamInstanceProfile:
+          Name: !Ref EC2InstanceProfile
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y amazon-efs-utils fio
+            
+            # Create mount points
+            mkdir -p /mnt/efs
+            mkdir -p /mnt/web-content
+            mkdir -p /mnt/shared-data
+            
+            # Install and configure CloudWatch agent
+            yum install -y amazon-cloudwatch-agent
+            cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'EOF'
+            {
+                "logs": {
+                    "logs_collected": {
+                        "files": {
+                            "collect_list": [
+                                {
+                                    "file_path": "/var/log/messages",
+                                    "log_group_name": "/aws/ec2/${EFSName}",
+                                    "log_stream_name": "{instance_id}/var/log/messages"
+                                },
+                                {
+                                    "file_path": "/var/log/efs-utils.log",
+                                    "log_group_name": "/aws/ec2/${EFSName}",
+                                    "log_stream_name": "{instance_id}/var/log/efs-utils"
+                                }
+                            ]
+                        }
+                    }
+                },
+                "metrics": {
+                    "namespace": "CWAgent",
+                    "metrics_collected": {
+                        "disk": {
+                            "measurement": [
+                                "used_percent"
+                            ],
+                            "metrics_collection_interval": 60,
+                            "resources": [
+                                "*"
+                            ]
+                        },
+                        "mem": {
+                            "measurement": [
+                                "mem_used_percent"
+                            ],
+                            "metrics_collection_interval": 60
+                        }
+                    }
+                }
+            }
+            EOF
+            
+            # Start CloudWatch agent
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+                -a fetch-config -m ec2 -s \
+                -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+            
+            # Wait for EFS mount targets to be available
+            sleep 60
+            
+            # Mount EFS file system
+            mount -t efs -o tls,iam ${EFSFileSystem}:/ /mnt/efs
+            
+            # Mount access points
+            mount -t efs -o tls,iam,accesspoint=${WebContentAccessPoint} ${EFSFileSystem}:/ /mnt/web-content
+            mount -t efs -o tls,iam,accesspoint=${SharedDataAccessPoint} ${EFSFileSystem}:/ /mnt/shared-data
+            
+            # Add to fstab for persistent mounting
+            echo "${EFSFileSystem}:/ /mnt/efs efs defaults,_netdev,tls,iam" >> /etc/fstab
+            echo "${EFSFileSystem}:/ /mnt/web-content efs defaults,_netdev,tls,iam,accesspoint=${WebContentAccessPoint}" >> /etc/fstab
+            echo "${EFSFileSystem}:/ /mnt/shared-data efs defaults,_netdev,tls,iam,accesspoint=${SharedDataAccessPoint}" >> /etc/fstab
+            
+            # Create test files
+            echo "Hello from $(hostname) - $(date)" > /mnt/efs/test-$(hostname).txt
+            echo "Web content from $(hostname) - $(date)" > /mnt/web-content/web-$(hostname).txt
+            echo "Shared data from $(hostname) - $(date)" > /mnt/shared-data/data-$(hostname).txt
+            
+            # Signal CloudFormation
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${EFSName}-instance'
+              - Key: Recipe
+                Value: distributed-file-systems-efs
+              - Key: Purpose
+                Value: EFS Client Instance
+
+  # Auto Scaling Group for EC2 Instances
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${EFSName}-asg'
+      VPCZoneIdentifier: !Ref SubnetIds
+      LaunchTemplate:
+        LaunchTemplateId: !Ref EC2LaunchTemplate
+        Version: !GetAtt EC2LaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 6
+      DesiredCapacity: !Ref NumberOfInstances
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub '${EFSName}-asg'
+          PropagateAtLaunch: false
+        - Key: Recipe
+          Value: distributed-file-systems-efs
+          PropagateAtLaunch: true
+        - Key: Purpose
+          Value: EFS Client Auto Scaling Group
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref NumberOfInstances
+        Timeout: PT10M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT5M
+        WaitOnResourceSignals: true
+
+  # AWS Backup Resources
+  BackupVault:
+    Type: AWS::Backup::BackupVault
+    Condition: BackupEnabled
+    Properties:
+      BackupVaultName: !Sub '${EFSName}-backup-vault'
+      EncryptionKeyArn: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/backup'
+      BackupVaultTags:
+        Name: !Sub '${EFSName}-backup-vault'
+        Recipe: distributed-file-systems-efs
+        Purpose: EFS Backup Vault
+
+  BackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Condition: BackupEnabled
+    Properties:
+      BackupPlan:
+        BackupPlanName: !Sub '${EFSName}-backup-plan'
+        BackupPlanRule:
+          - RuleName: Daily-Backup
+            TargetBackupVault: !Ref BackupVault
+            ScheduleExpression: 'cron(0 2 ? * * *)'
+            StartWindowMinutes: 60
+            Lifecycle:
+              DeleteAfterDays: 30
+            RecoveryPointTags:
+              EFS: !Ref EFSName
+              Recipe: distributed-file-systems-efs
+      BackupPlanTags:
+        Name: !Sub '${EFSName}-backup-plan'
+        Recipe: distributed-file-systems-efs
+        Purpose: EFS Backup Plan
+
+  BackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Condition: BackupEnabled
+    Properties:
+      BackupPlanId: !Ref BackupPlan
+      BackupSelection:
+        SelectionName: !Sub '${EFSName}-selection'
+        IamRoleArn: !Sub 'arn:aws:iam::${AWS::AccountId}:role/service-role/AWSBackupDefaultServiceRole'
+        Resources:
+          - !Sub 'arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/${EFSFileSystem}'
+
+  # CloudWatch Dashboard
+  EFSDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: DashboardEnabled
+    Properties:
+      DashboardName: !Sub 'EFS-${EFSName}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/EFS", "TotalIOBytes", "FileSystemId", "${EFSFileSystem}"],
+                  [".", "DataReadIOBytes", ".", "."],
+                  [".", "DataWriteIOBytes", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "EFS Data Transfer",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/EFS", "ClientConnections", "FileSystemId", "${EFSFileSystem}"],
+                  [".", "TotalIOTime", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "EFS Performance",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/EFS", "PercentIOLimit", "FileSystemId", "${EFSFileSystem}"],
+                  [".", "BurstCreditBalance", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "EFS Capacity and Burst Credits",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["CWAgent", "disk_used_percent", "InstanceId", "*", "device", "/dev/xvda1", "fstype", "xfs", "path", "/"],
+                  [".", "mem_used_percent", "InstanceId", "*"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "EC2 Instance Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 100
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+# Template Outputs
+Outputs:
+  # EFS Outputs
+  EFSFileSystemId:
+    Description: EFS File System ID
+    Value: !Ref EFSFileSystem
+    Export:
+      Name: !Sub '${AWS::StackName}-EFS-FileSystemId'
+
+  EFSFileSystemDNS:
+    Description: EFS File System DNS name
+    Value: !Sub '${EFSFileSystem}.efs.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-EFS-DNS'
+
+  # Access Point Outputs
+  WebContentAccessPointId:
+    Description: Web Content Access Point ID
+    Value: !Ref WebContentAccessPoint
+    Export:
+      Name: !Sub '${AWS::StackName}-WebContentAccessPoint'
+
+  SharedDataAccessPointId:
+    Description: Shared Data Access Point ID
+    Value: !Ref SharedDataAccessPoint
+    Export:
+      Name: !Sub '${AWS::StackName}-SharedDataAccessPoint'
+
+  # Security Group Outputs
+  EFSSecurityGroupId:
+    Description: EFS Security Group ID
+    Value: !Ref EFSSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-EFS-SecurityGroup'
+
+  EC2SecurityGroupId:
+    Description: EC2 Security Group ID
+    Value: !Ref EC2SecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-EC2-SecurityGroup'
+
+  # Mount Commands
+  EFSMountCommand:
+    Description: Command to mount EFS on EC2 instances
+    Value: !Sub 'sudo mount -t efs -o tls,iam ${EFSFileSystem}:/ /mnt/efs'
+
+  WebContentMountCommand:
+    Description: Command to mount web content access point
+    Value: !Sub 'sudo mount -t efs -o tls,iam,accesspoint=${WebContentAccessPoint} ${EFSFileSystem}:/ /mnt/web-content'
+
+  SharedDataMountCommand:
+    Description: Command to mount shared data access point
+    Value: !Sub 'sudo mount -t efs -o tls,iam,accesspoint=${SharedDataAccessPoint} ${EFSFileSystem}:/ /mnt/shared-data'
+
+  # Monitoring Outputs
+  CloudWatchLogGroup:
+    Condition: LogsEnabled
+    Description: CloudWatch Log Group for EC2 instances
+    Value: !Ref CloudWatchLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  CloudWatchDashboard:
+    Condition: DashboardEnabled
+    Description: CloudWatch Dashboard for EFS monitoring
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=EFS-${EFSName}'
+
+  # Backup Outputs
+  BackupVaultName:
+    Condition: BackupEnabled
+    Description: AWS Backup Vault Name
+    Value: !Ref BackupVault
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupVault'
+
+  BackupPlanId:
+    Condition: BackupEnabled
+    Description: AWS Backup Plan ID
+    Value: !Ref BackupPlan
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupPlan'
+
+  # Performance Testing Commands
+  PerformanceTestCommands:
+    Description: Commands for performance testing with fio
+    Value: !Sub |
+      # Write test: sudo fio --name=write-test --directory=/mnt/efs --rw=write --bs=1M --size=100M --numjobs=4 --time_based --runtime=30 --group_reporting
+      # Read test: sudo fio --name=read-test --directory=/mnt/efs --rw=read --bs=1M --size=100M --numjobs=4 --time_based --runtime=30 --group_reporting
+
+  # Stack Information
+  StackName:
+    Description: Name of this CloudFormation stack
+    Value: !Ref AWS::StackName
+
+  Region:
+    Description: AWS Region where resources are deployed
+    Value: !Ref AWS::Region
+
+  # Resource Summary
+  ResourceSummary:
+    Description: Summary of created resources
+    Value: !Sub |
+      EFS File System: ${EFSFileSystem}
+      Mount Targets: ${!If [HasThreeSubnets, 3, !If [HasMultipleSubnets, 2, 1]]}
+      Access Points: 2 (Web Content, Shared Data)
+      EC2 Instances: ${NumberOfInstances}
+      Security Groups: 2 (EFS, EC2)
+      Backup: ${!If [BackupEnabled, 'Enabled', 'Disabled']}
+      Monitoring: ${!If [DashboardEnabled, 'Enabled', 'Disabled']}

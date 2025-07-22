@@ -1,0 +1,362 @@
+# Medium-severity security findings workflow
+# Handles medium-severity security findings with notification and tracking
+main:
+  params: [input]
+  steps:
+    - init:
+        assign:
+          - finding: $${input.finding}
+          - metadata: $${input.metadata}
+          - severity: $${metadata.severity}
+          - project_id: "${project_id}"
+          - finding_id: $${finding.name}
+          - resource_name: $${finding.resourceName}
+          - category: $${finding.category}
+    
+    - log_finding:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: projects/$${project_id}/logs/security-compliance
+                severity: WARNING
+                jsonPayload:
+                  workflow: "medium_severity_workflow"
+                  finding_id: $${finding_id}
+                  severity: $${severity}
+                  category: $${category}
+                  resource: $${resource_name}
+                  action: "workflow_triggered"
+                  timestamp: $${metadata.timestamp}
+    
+    - assess_risk:
+        assign:
+          - requires_notification: true
+          - requires_tracking: true
+          - requires_manual_review: true
+          - auto_remediation_enabled: false
+          - escalation_threshold: 24  # hours
+    
+    - evaluate_category_risk:
+        switch:
+          - condition: $${category == "VULNERABILITY"}
+            assign:
+              - priority_level: "medium-high"
+              - sla_hours: 8
+          - condition: $${category == "SUSPICIOUS_ACTIVITY"}
+            assign:
+              - priority_level: "medium"
+              - sla_hours: 12
+          - condition: $${category == "POLICY_VIOLATION"}
+            assign:
+              - priority_level: "medium-low"
+              - sla_hours: 24
+          - condition: true
+            assign:
+              - priority_level: "medium"
+              - sla_hours: 16
+    
+    - create_remediation_ticket:
+        call: create_tracking_entry
+        args:
+          finding: $${finding}
+          priority: $${priority_level}
+          sla_hours: $${sla_hours}
+          requires_manual_review: $${requires_manual_review}
+        result: ticket_result
+    
+    - analyze_finding_context:
+        call: analyze_security_context
+        args:
+          finding: $${finding}
+          severity: $${severity}
+          category: $${category}
+        result: context_analysis
+    
+    - determine_response_actions:
+        assign:
+          - response_actions: []
+          - monitoring_actions: []
+    
+    - vulnerability_actions:
+        switch:
+          - condition: $${category == "VULNERABILITY"}
+            steps:
+              - add_vulnerability_actions:
+                  assign:
+                    - response_actions: ["schedule_patch_assessment", "update_vulnerability_database"]
+                    - monitoring_actions: ["monitor_exploit_attempts", "track_patch_status"]
+    
+    - suspicious_activity_actions:
+        switch:
+          - condition: $${category == "SUSPICIOUS_ACTIVITY"}
+            steps:
+              - add_monitoring_actions:
+                  assign:
+                    - response_actions: ["enhance_monitoring", "review_access_patterns"]
+                    - monitoring_actions: ["increased_log_analysis", "behavior_baseline_update"]
+    
+    - policy_violation_actions:
+        switch:
+          - condition: $${category == "POLICY_VIOLATION"}
+            steps:
+              - add_policy_actions:
+                  assign:
+                    - response_actions: ["notify_resource_owner", "schedule_compliance_review"]
+                    - monitoring_actions: ["track_policy_compliance", "audit_similar_resources"]
+    
+    - notify_security_team:
+        call: send_notification
+        args:
+          finding: $${finding}
+          severity: $${severity}
+          priority: $${priority_level}
+          action_taken: "ticket_created_manual_review_required"
+          ticket_id: $${ticket_result.ticket_id}
+          sla_hours: $${sla_hours}
+          context_analysis: $${context_analysis}
+        result: notification_result
+    
+    - schedule_follow_up:
+        call: create_follow_up_task
+        args:
+          finding: $${finding}
+          follow_up_hours: 24
+          escalation_hours: $${escalation_threshold}
+          priority: $${priority_level}
+          ticket_id: $${ticket_result.ticket_id}
+        result: follow_up_result
+    
+    - implement_monitoring_enhancements:
+        call: enhance_monitoring
+        args:
+          finding: $${finding}
+          monitoring_actions: $${monitoring_actions}
+          duration_hours: 72
+    
+    - final_logging:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: projects/$${project_id}/logs/security-compliance
+                severity: INFO
+                jsonPayload:
+                  workflow: "medium_severity_workflow"
+                  finding_id: $${finding_id}
+                  action: "workflow_completed"
+                  processing_summary:
+                    ticket_created: true
+                    priority: $${priority_level}
+                    sla_hours: $${sla_hours}
+                    follow_up_scheduled: true
+                    monitoring_enhanced: true
+                  ticket_id: $${ticket_result.ticket_id}
+                  follow_up_id: $${follow_up_result.task_id}
+                  timestamp: $${metadata.timestamp}
+
+# Subworkflow for creating tracking entries
+create_tracking_entry:
+  params: [finding, priority, sla_hours, requires_manual_review]
+  steps:
+    - generate_ticket:
+        assign:
+          - ticket_id: $${finding.name + "_ticket_" + string(int(sys.now()))}
+          - ticket_title: "Security Finding Review: " + $${finding.category}
+          - ticket_description: "Medium severity security finding requiring manual review and remediation planning"
+    
+    - log_tracking:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: projects/${project_id}/logs/security-tracking
+                severity: INFO
+                jsonPayload:
+                  tracking_type: "remediation_ticket"
+                  ticket_id: $${ticket_id}
+                  finding_id: $${finding.name}
+                  title: $${ticket_title}
+                  description: $${ticket_description}
+                  priority: $${priority}
+                  sla_hours: $${sla_hours}
+                  requires_manual_review: $${requires_manual_review}
+                  status: "created"
+                  category: $${finding.category}
+                  resource: $${finding.resourceName}
+    
+    - return_ticket_result:
+        return:
+          ticket_id: $${ticket_id}
+          title: $${ticket_title}
+          priority: $${priority}
+          sla_hours: $${sla_hours}
+          status: "created"
+
+# Subworkflow for analyzing security context
+analyze_security_context:
+  params: [finding, severity, category]
+  steps:
+    - gather_context:
+        assign:
+          - resource_type: $${finding.resourceName}
+          - finding_source: $${finding.parent}
+          - event_time: $${finding.eventTime}
+          - analysis_timestamp: $${int(sys.now())}
+    
+    - assess_impact:
+        assign:
+          - potential_impact: $${category == "VULNERABILITY" ? "data_exposure" : "service_disruption"}
+          - affected_systems: ["primary_resource"]
+          - business_impact: $${severity == "MEDIUM" ? "moderate" : "low"}
+    
+    - check_related_findings:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: projects/${project_id}/logs/security-analysis
+                severity: INFO
+                jsonPayload:
+                  analysis_type: "context_analysis"
+                  finding_id: $${finding.name}
+                  resource_type: $${resource_type}
+                  potential_impact: $${potential_impact}
+                  business_impact: $${business_impact}
+                  analysis_timestamp: $${analysis_timestamp}
+    
+    - return_analysis:
+        return:
+          resource_type: $${resource_type}
+          potential_impact: $${potential_impact}
+          business_impact: $${business_impact}
+          affected_systems: $${affected_systems}
+          analysis_timestamp: $${analysis_timestamp}
+
+# Subworkflow for sending notifications
+send_notification:
+  params: [finding, severity, priority, action_taken, ticket_id, sla_hours, context_analysis]
+  steps:
+    - prepare_notification:
+        assign:
+          - notification_channels: ["email", "slack"]
+          - requires_acknowledgment: true
+          - notification_message: "Medium severity security finding requires review within " + string($${sla_hours}) + " hours"
+    
+    - send_alert:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: projects/${project_id}/logs/security-notifications
+                severity: WARNING
+                jsonPayload:
+                  alert_type: "security_finding"
+                  notification_type: "medium_severity"
+                  finding_id: $${finding.name}
+                  severity: $${severity}
+                  priority: $${priority}
+                  action_taken: $${action_taken}
+                  ticket_id: $${ticket_id}
+                  sla_hours: $${sla_hours}
+                  context_analysis: $${context_analysis}
+                  message: $${notification_message}
+                  requires_acknowledgment: $${requires_acknowledgment}
+                  channels: $${notification_channels}
+    
+    - return_notification_result:
+        return:
+          notification_id: $${finding.name + "_notification"}
+          channels_notified: $${notification_channels}
+          requires_acknowledgment: $${requires_acknowledgment}
+          message: $${notification_message}
+
+# Subworkflow for creating follow-up tasks
+create_follow_up_task:
+  params: [finding, follow_up_hours, escalation_hours, priority, ticket_id]
+  steps:
+    - create_task:
+        assign:
+          - task_id: $${finding.name + "_follow_up"}
+          - follow_up_time: $${int(sys.now()) + (follow_up_hours * 3600)}
+          - escalation_time: $${int(sys.now()) + (escalation_hours * 3600)}
+          - task_type: "follow_up_review"
+    
+    - schedule_task:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: projects/${project_id}/logs/security-tasks
+                severity: INFO
+                jsonPayload:
+                  task_type: $${task_type}
+                  task_id: $${task_id}
+                  finding_id: $${finding.name}
+                  ticket_id: $${ticket_id}
+                  follow_up_time: $${follow_up_time}
+                  escalation_time: $${escalation_time}
+                  priority: $${priority}
+                  status: "scheduled"
+                  description: "Follow-up review for medium severity security finding"
+    
+    - return_task_result:
+        return:
+          task_id: $${task_id}
+          follow_up_time: $${follow_up_time}
+          escalation_time: $${escalation_time}
+          status: "scheduled"
+
+# Subworkflow for enhancing monitoring
+enhance_monitoring:
+  params: [finding, monitoring_actions, duration_hours]
+  steps:
+    - implement_enhancements:
+        assign:
+          - monitoring_id: $${finding.name + "_monitoring"}
+          - enhancement_duration: $${duration_hours}
+          - monitoring_end_time: $${int(sys.now()) + (duration_hours * 3600)}
+    
+    - log_monitoring_enhancement:
+        call: http.post
+        args:
+          url: https://logging.googleapis.com/v2/entries:write
+          auth:
+            type: OAuth2
+          body:
+            entries:
+              - logName: projects/${project_id}/logs/security-monitoring
+                severity: INFO
+                jsonPayload:
+                  enhancement_type: "temporary_monitoring_increase"
+                  monitoring_id: $${monitoring_id}
+                  finding_id: $${finding.name}
+                  actions: $${monitoring_actions}
+                  duration_hours: $${enhancement_duration}
+                  end_time: $${monitoring_end_time}
+                  status: "active"
+    
+    - return_monitoring_result:
+        return:
+          monitoring_id: $${monitoring_id}
+          actions: $${monitoring_actions}
+          duration_hours: $${enhancement_duration}
+          end_time: $${monitoring_end_time}

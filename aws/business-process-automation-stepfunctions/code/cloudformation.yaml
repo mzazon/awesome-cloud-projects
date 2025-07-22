@@ -1,0 +1,1030 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Business Process Automation with Step Functions - Implements automated workflows with human approval, Lambda processing, and notification systems'
+
+# ================================
+# PARAMETERS
+# ================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'business-process'
+    Description: 'Name prefix for all resources'
+    AllowedPattern: '^[a-z][a-z0-9\-]*[a-z0-9]$'
+    ConstraintDescription: 'Must start with a letter, contain only lowercase letters, numbers, and hyphens'
+    MinLength: 3
+    MaxLength: 20
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: [dev, test, staging, prod]
+    Description: 'Environment name for resource tagging and configuration'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for process notifications and approvals'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  ProcessTimeout:
+    Type: Number
+    Default: 86400
+    MinValue: 3600
+    MaxValue: 604800
+    Description: 'Timeout for human approval process in seconds (1 hour to 7 days)'
+
+  LambdaRuntime:
+    Type: String
+    Default: 'python3.9'
+    AllowedValues: [python3.8, python3.9, python3.10, python3.11]
+    Description: 'Lambda runtime version for business logic processor'
+
+  EnableXRayTracing:
+    Type: String
+    Default: 'true'
+    AllowedValues: [true, false]
+    Description: 'Enable X-Ray tracing for Step Functions and Lambda'
+
+# ================================
+# CONDITIONS
+# ================================
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  EnableXRay: !Equals [!Ref EnableXRayTracing, 'true']
+
+# ================================
+# MAPPINGS
+# ================================
+Mappings:
+  EnvironmentConfig:
+    dev:
+      LogRetentionDays: 7
+      ReservedConcurrency: 5
+    test:
+      LogRetentionDays: 14
+      ReservedConcurrency: 10
+    staging:
+      LogRetentionDays: 30
+      ReservedConcurrency: 20
+    prod:
+      LogRetentionDays: 90
+      ReservedConcurrency: 50
+
+# ================================
+# RESOURCES
+# ================================
+Resources:
+
+  # ================================
+  # IAM ROLES AND POLICIES
+  # ================================
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - !If
+          - EnableXRay
+          - 'arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess'
+          - !Ref 'AWS::NoValue'
+      Policies:
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: 'lambda-execution'
+
+  # Step Functions Execution Role
+  StepFunctionsExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-stepfunctions-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: StepFunctionsExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Lambda invocation permissions
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: !GetAtt BusinessProcessorFunction.Arn
+              # SNS publishing permissions
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref ProcessNotificationsTopic
+              # SQS sending permissions
+              - Effect: Allow
+                Action:
+                  - 'sqs:SendMessage'
+                Resource: !GetAtt ProcessCompletionQueue.Arn
+              # CloudWatch Logs permissions
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                Resource: '*'
+              # X-Ray tracing permissions (conditional)
+              - !If
+                - EnableXRay
+                - Effect: Allow
+                  Action:
+                    - 'xray:PutTraceSegments'
+                    - 'xray:PutTelemetryRecords'
+                  Resource: '*'
+                - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: 'step-functions-execution'
+
+  # API Gateway Execution Role for callback handling
+  ApiGatewayExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-apigateway-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: StepFunctionsTaskTokenPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'states:SendTaskSuccess'
+                  - 'states:SendTaskFailure'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: 'api-gateway-execution'
+
+  # ================================
+  # LAMBDA FUNCTIONS
+  # ================================
+
+  # Business Logic Processor Function
+  BusinessProcessorFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-processor'
+      Runtime: !Ref LambdaRuntime
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      ReservedConcurrencyLimit: !FindInMap [EnvironmentConfig, !Ref Environment, ReservedConcurrency]
+      TracingConfig:
+        Mode: !If [EnableXRay, 'Active', 'PassThrough']
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: !If [IsProduction, 'INFO', 'DEBUG']
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import time
+          import os
+          from datetime import datetime, timezone
+          import logging
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+
+          def lambda_handler(event, context):
+              """
+              Business Process Logic Processor
+              
+              Processes business data, applies business rules, and returns structured results
+              for Step Functions workflow orchestration.
+              """
+              logger.info(f"Processing business logic for event: {json.dumps(event, default=str)}")
+              
+              try:
+                  # Extract business process data
+                  process_data = event.get('processData', {})
+                  process_type = process_data.get('type', 'unknown')
+                  process_id = process_data.get('processId', f"proc-{int(time.time())}")
+                  
+                  # Validate required fields
+                  if not process_type or process_type == 'unknown':
+                      raise ValueError("Process type is required and cannot be 'unknown'")
+                  
+                  # Simulate business logic processing time
+                  processing_time = min(process_data.get('processingTime', 2), 25)  # Cap at 25 seconds
+                  logger.info(f"Simulating business processing for {processing_time} seconds")
+                  time.sleep(processing_time)
+                  
+                  # Apply business rules based on process type
+                  result = apply_business_rules(process_data)
+                  
+                  # Generate comprehensive processing result
+                  processing_result = {
+                      'processId': process_id,
+                      'processType': process_type,
+                      'status': 'processed',
+                      'timestamp': datetime.now(timezone.utc).isoformat(),
+                      'businessRuleResult': result,
+                      'processingDuration': processing_time,
+                      'environment': os.environ.get('ENVIRONMENT', 'unknown'),
+                      'functionVersion': context.function_version if context else 'unknown'
+                  }
+                  
+                  logger.info(f"Business processing completed successfully: {processing_result}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(processing_result),
+                      'processResult': processing_result
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Business processing failed: {str(e)}")
+                  error_result = {
+                      'processId': process_data.get('processId', 'unknown'),
+                      'status': 'failed',
+                      'error': str(e),
+                      'timestamp': datetime.now(timezone.utc).isoformat()
+                  }
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(error_result),
+                      'processResult': error_result
+                  }
+
+          def apply_business_rules(process_data):
+              """Apply business-specific processing rules"""
+              process_type = process_data.get('type')
+              amount = process_data.get('amount', 0)
+              
+              rules_result = {
+                  'rulesApplied': [],
+                  'approvalRequired': False,
+                  'riskLevel': 'low'
+              }
+              
+              # Expense approval rules
+              if process_type == 'expense-approval':
+                  rules_result['rulesApplied'].append('expense-validation')
+                  if amount > 1000:
+                      rules_result['approvalRequired'] = True
+                      rules_result['riskLevel'] = 'medium'
+                  if amount > 10000:
+                      rules_result['riskLevel'] = 'high'
+              
+              # Purchase order rules
+              elif process_type == 'purchase-order':
+                  rules_result['rulesApplied'].append('po-validation')
+                  rules_result['approvalRequired'] = True
+                  if amount > 5000:
+                      rules_result['riskLevel'] = 'high'
+              
+              # Default rules for unknown types
+              else:
+                  rules_result['rulesApplied'].append('default-validation')
+                  rules_result['approvalRequired'] = True
+              
+              return rules_result
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: 'business-processor'
+
+  # CloudWatch Log Group for Lambda
+  BusinessProcessorLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${BusinessProcessorFunction}'
+      RetentionInDays: !FindInMap [EnvironmentConfig, !Ref Environment, LogRetentionDays]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ================================
+  # MESSAGING SERVICES
+  # ================================
+
+  # SNS Topic for Process Notifications
+  ProcessNotificationsTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-notifications'
+      DisplayName: 'Business Process Notifications'
+      KmsMasterKeyId: 'alias/aws/sns'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: 'notifications'
+
+  # SNS Subscription for Email Notifications
+  ProcessNotificationsEmailSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      Protocol: email
+      TopicArn: !Ref ProcessNotificationsTopic
+      Endpoint: !Ref NotificationEmail
+      FilterPolicy:
+        MessageType: 
+          - 'approval-required'
+          - 'process-completed'
+          - 'process-failed'
+
+  # SQS Queue for Process Completion Logging
+  ProcessCompletionQueue:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-completion-queue'
+      VisibilityTimeoutSeconds: 300
+      MessageRetentionPeriod: 1209600  # 14 days
+      ReceiveMessageWaitTimeSeconds: 10  # Enable long polling
+      KmsMasterKeyId: 'alias/aws/sqs'
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ProcessCompletionDeadLetterQueue.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: 'completion-logging'
+
+  # Dead Letter Queue for Failed Messages
+  ProcessCompletionDeadLetterQueue:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-completion-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: 'alias/aws/sqs'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: 'dead-letter-queue'
+
+  # ================================
+  # STEP FUNCTIONS STATE MACHINE
+  # ================================
+
+  # CloudWatch Log Group for Step Functions
+  StepFunctionsLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/stepfunctions/${ProjectName}-${Environment}-workflow'
+      RetentionInDays: !FindInMap [EnvironmentConfig, !Ref Environment, LogRetentionDays]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Main Business Process State Machine
+  BusinessProcessStateMachine:
+    Type: 'AWS::StepFunctions::StateMachine'
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-${Environment}-workflow'
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      TracingConfiguration:
+        Enabled: !If [EnableXRay, true, false]
+      LoggingConfiguration:
+        Level: !If [IsProduction, 'ERROR', 'ALL']
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StepFunctionsLogGroup.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Business Process Automation Workflow with Human Approval",
+          "StartAt": "ValidateInput",
+          "States": {
+            "ValidateInput": {
+              "Type": "Pass",
+              "Comment": "Validate and prepare input data for processing",
+              "Parameters": {
+                "processData.$": "$.processData",
+                "validationResult": "Input validated successfully",
+                "validationTimestamp.$": "$$.State.EnteredTime",
+                "executionName.$": "$$.Execution.Name"
+              },
+              "ResultPath": "$.validationOutput",
+              "Next": "ProcessBusinessLogic"
+            },
+            "ProcessBusinessLogic": {
+              "Type": "Task",
+              "Comment": "Execute business logic using Lambda function",
+              "Resource": "${BusinessProcessorFunction.Arn}",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                },
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 10,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "ProcessingFailed",
+                  "ResultPath": "$.errorInfo"
+                }
+              ],
+              "Next": "EvaluateApprovalRequirement"
+            },
+            "EvaluateApprovalRequirement": {
+              "Type": "Choice",
+              "Comment": "Determine if human approval is required based on business rules",
+              "Choices": [
+                {
+                  "Variable": "$.processResult.businessRuleResult.approvalRequired",
+                  "BooleanEquals": true,
+                  "Next": "HumanApprovalRequired"
+                }
+              ],
+              "Default": "SendCompletionNotification"
+            },
+            "HumanApprovalRequired": {
+              "Type": "Task",
+              "Comment": "Send approval request and wait for human decision",
+              "Resource": "arn:aws:states:::sns:publish.waitForTaskToken",
+              "Parameters": {
+                "TopicArn": "${ProcessNotificationsTopic}",
+                "Message": {
+                  "MessageType": "approval-required",
+                  "processId.$": "$.processResult.processId",
+                  "processType.$": "$.processResult.processType",
+                  "amount.$": "$.processData.amount",
+                  "requestor.$": "$.processData.requestor",
+                  "description.$": "$.processData.description",
+                  "riskLevel.$": "$.processResult.businessRuleResult.riskLevel",
+                  "approvalRequired": "Please review and approve this business process",
+                  "taskToken.$": "$$.Task.Token",
+                  "approvalUrl": "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/approval",
+                  "executionArn.$": "$$.Execution.Name"
+                },
+                "Subject": {
+                  "MessageType": "approval-required",
+                  "ProcessType.$": "$.processResult.processType",
+                  "Subject": "Business Process Approval Required"
+                },
+                "MessageAttributes": {
+                  "MessageType": {
+                    "DataType": "String",
+                    "StringValue": "approval-required"
+                  }
+                }
+              },
+              "HeartbeatSeconds": 3600,
+              "TimeoutSeconds": ${ProcessTimeout},
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.Timeout"],
+                  "Next": "ApprovalTimeout",
+                  "ResultPath": "$.timeoutInfo"
+                }
+              ],
+              "Next": "SendCompletionNotification"
+            },
+            "ApprovalTimeout": {
+              "Type": "Task",
+              "Comment": "Handle approval timeout scenario",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${ProcessNotificationsTopic}",
+                "Message": {
+                  "MessageType": "approval-timeout",
+                  "processId.$": "$.processResult.processId",
+                  "processType.$": "$.processResult.processType",
+                  "error": "Approval timeout - process requires manual intervention",
+                  "timeoutDuration": "${ProcessTimeout}",
+                  "timestamp.$": "$$.State.EnteredTime"
+                },
+                "Subject": "Business Process Approval Timeout",
+                "MessageAttributes": {
+                  "MessageType": {
+                    "DataType": "String",
+                    "StringValue": "approval-timeout"
+                  }
+                }
+              },
+              "End": true
+            },
+            "SendCompletionNotification": {
+              "Type": "Task",
+              "Comment": "Notify stakeholders of successful process completion",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${ProcessNotificationsTopic}",
+                "Message": {
+                  "MessageType": "process-completed",
+                  "processId.$": "$.processResult.processId",
+                  "processType.$": "$.processResult.processType",
+                  "status": "completed",
+                  "completionTime.$": "$$.State.EnteredTime",
+                  "processingDuration.$": "$.processResult.processingDuration",
+                  "environment": "${Environment}"
+                },
+                "Subject": "Business Process Completed Successfully",
+                "MessageAttributes": {
+                  "MessageType": {
+                    "DataType": "String",
+                    "StringValue": "process-completed"
+                  }
+                }
+              },
+              "Next": "LogToQueue"
+            },
+            "LogToQueue": {
+              "Type": "Task",
+              "Comment": "Log completion details to SQS for audit and downstream processing",
+              "Resource": "arn:aws:states:::sqs:sendMessage",
+              "Parameters": {
+                "QueueUrl": "${ProcessCompletionQueue}",
+                "MessageBody": {
+                  "processId.$": "$.processResult.processId",
+                  "processType.$": "$.processResult.processType",
+                  "completionTime.$": "$$.State.EnteredTime",
+                  "executionArn.$": "$$.Execution.Name",
+                  "status": "completed",
+                  "environment": "${Environment}",
+                  "businessRuleResult.$": "$.processResult.businessRuleResult"
+                },
+                "MessageAttributes": {
+                  "ProcessType": {
+                    "DataType": "String",
+                    "StringValue.$": "$.processResult.processType"
+                  },
+                  "Environment": {
+                    "DataType": "String",
+                    "StringValue": "${Environment}"
+                  }
+                }
+              },
+              "End": true
+            },
+            "ProcessingFailed": {
+              "Type": "Task",
+              "Comment": "Handle business logic processing failures",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${ProcessNotificationsTopic}",
+                "Message": {
+                  "MessageType": "process-failed",
+                  "processId.$": "$.processData.processId",
+                  "processType.$": "$.processData.type",
+                  "error": "Business process failed during execution",
+                  "errorDetails.$": "$.errorInfo",
+                  "timestamp.$": "$$.State.EnteredTime",
+                  "executionArn.$": "$$.Execution.Name"
+                },
+                "Subject": "Business Process Execution Failed",
+                "MessageAttributes": {
+                  "MessageType": {
+                    "DataType": "String",
+                    "StringValue": "process-failed"
+                  }
+                }
+              },
+              "End": true
+            }
+          }
+        }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: 'workflow-orchestration'
+
+  # ================================
+  # API GATEWAY FOR CALLBACKS
+  # ================================
+
+  # REST API for Human Approval Callbacks
+  ApiGateway:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-approval-api'
+      Description: 'API for business process human approval callbacks'
+      EndpointConfiguration:
+        Types: [REGIONAL]
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 'execute-api:Invoke'
+            Resource: '*'
+            Condition:
+              IpAddress:
+                'aws:SourceIp': 
+                  - '0.0.0.0/0'  # In production, restrict to specific IP ranges
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # API Gateway Deployment
+  ApiGatewayDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    DependsOn: 
+      - ApprovalOptionsMethod
+      - ApprovalPostMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: !Ref Environment
+      StageDescription: !Sub 'Deployment stage for ${Environment} environment'
+
+  # Approval Resource
+  ApprovalResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: 'approval'
+
+  # OPTIONS Method for CORS
+  ApprovalOptionsMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ApprovalResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+
+  # POST Method for Approval Submissions
+  ApprovalPostMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ApprovalResource
+      HttpMethod: POST
+      AuthorizationType: NONE  # In production, consider using IAM, Cognito, or API Keys
+      RequestValidatorId: !Ref ApprovalRequestValidator
+      RequestModels:
+        application/json: !Ref ApprovalRequestModel
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:states:action/SendTaskSuccess'
+        Credentials: !GetAtt ApiGatewayExecutionRole.Arn
+        RequestTemplates:
+          application/json: |
+            {
+              "taskToken": "$input.json('$.taskToken')",
+              "output": "{\"approved\": $input.json('$.approved'), \"approver\": \"$input.json('$.approver')\", \"comments\": \"$input.json('$.comments')\", \"approvalTimestamp\": \"$context.requestTime\"}"
+            }
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: |
+                {
+                  "message": "Approval submitted successfully",
+                  "timestamp": "$context.requestTime"
+                }
+          - StatusCode: 400
+            SelectionPattern: '4\d{2}'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: |
+                {
+                  "error": "Bad Request",
+                  "message": "Invalid approval request format"
+                }
+          - StatusCode: 500
+            SelectionPattern: '5\d{2}'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: |
+                {
+                  "error": "Internal Server Error",
+                  "message": "Failed to process approval"
+                }
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: !Ref ApprovalResponseModel
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: false
+        - StatusCode: 400
+          ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: false
+        - StatusCode: 500
+          ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: false
+
+  # Request Validator
+  ApprovalRequestValidator:
+    Type: 'AWS::ApiGateway::RequestValidator'
+    Properties:
+      RestApiId: !Ref ApiGateway
+      Name: 'approval-request-validator'
+      ValidateRequestBody: true
+      ValidateRequestParameters: false
+
+  # Request Model
+  ApprovalRequestModel:
+    Type: 'AWS::ApiGateway::Model'
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ContentType: 'application/json'
+      Name: 'ApprovalRequest'
+      Schema:
+        $schema: 'http://json-schema.org/draft-04/schema#'
+        title: 'Approval Request Schema'
+        type: object
+        required: [taskToken, approved, approver]
+        properties:
+          taskToken:
+            type: string
+            description: 'Step Functions task token'
+          approved:
+            type: boolean
+            description: 'Approval decision (true/false)'
+          approver:
+            type: string
+            format: email
+            description: 'Email of the approver'
+          comments:
+            type: string
+            maxLength: 1000
+            description: 'Optional approval comments'
+
+  # Response Model
+  ApprovalResponseModel:
+    Type: 'AWS::ApiGateway::Model'
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ContentType: 'application/json'
+      Name: 'ApprovalResponse'
+      Schema:
+        $schema: 'http://json-schema.org/draft-04/schema#'
+        title: 'Approval Response Schema'
+        type: object
+        properties:
+          message:
+            type: string
+          timestamp:
+            type: string
+
+  # ================================
+  # CLOUDWATCH ALARMS AND MONITORING
+  # ================================
+
+  # Step Functions Execution Failures Alarm
+  StepFunctionsFailureAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-stepfunctions-failures'
+      AlarmDescription: 'Monitor Step Functions execution failures'
+      MetricName: 'ExecutionsFailed'
+      Namespace: 'AWS/States'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref BusinessProcessStateMachine
+      AlarmActions:
+        - !Ref ProcessNotificationsTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function Error Rate Alarm
+  LambdaErrorRateAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-lambda-error-rate'
+      AlarmDescription: 'Monitor Lambda function error rate'
+      MetricName: 'Errors'
+      Namespace: 'AWS/Lambda'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref BusinessProcessorFunction
+      AlarmActions:
+        - !Ref ProcessNotificationsTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SQS Dead Letter Queue Messages Alarm
+  SQSDeadLetterQueueAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-sqs-dlq-messages'
+      AlarmDescription: 'Monitor messages in dead letter queue'
+      MetricName: 'ApproximateNumberOfVisibleMessages'
+      Namespace: 'AWS/SQS'
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ProcessCompletionDeadLetterQueue.QueueName
+      AlarmActions:
+        - !Ref ProcessNotificationsTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+# ================================
+# OUTPUTS
+# ================================
+Outputs:
+  StateMachineArn:
+    Description: 'ARN of the Business Process Automation State Machine'
+    Value: !Ref BusinessProcessStateMachine
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-statemachine-arn'
+
+  StateMachineName:
+    Description: 'Name of the Business Process Automation State Machine'
+    Value: !Sub '${ProjectName}-${Environment}-workflow'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-statemachine-name'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Business Processor Lambda Function'
+    Value: !GetAtt BusinessProcessorFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-lambda-arn'
+
+  SNSTopicArn:
+    Description: 'ARN of the Process Notifications SNS Topic'
+    Value: !Ref ProcessNotificationsTopic
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-sns-topic-arn'
+
+  SQSQueueUrl:
+    Description: 'URL of the Process Completion SQS Queue'
+    Value: !Ref ProcessCompletionQueue
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-sqs-queue-url'
+
+  SQSQueueArn:
+    Description: 'ARN of the Process Completion SQS Queue'
+    Value: !GetAtt ProcessCompletionQueue.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-sqs-queue-arn'
+
+  ApiGatewayUrl:
+    Description: 'URL of the Approval API Gateway'
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-api-gateway-url'
+
+  ApprovalEndpoint:
+    Description: 'Full URL for the approval endpoint'
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/approval'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-approval-endpoint'
+
+  ExecutionStartCommand:
+    Description: 'AWS CLI command to start a workflow execution'
+    Value: !Sub |
+      aws stepfunctions start-execution \
+        --state-machine-arn ${BusinessProcessStateMachine} \
+        --name "execution-$(date +%s)" \
+        --input '{"processData":{"processId":"BP-001","type":"expense-approval","amount":5000,"requestor":"user@example.com","description":"Software licensing renewal","processingTime":1}}'
+
+  MonitoringDashboard:
+    Description: 'CloudWatch Console URL for monitoring the workflow'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/states/home?region=${AWS::Region}#/statemachines/view/${BusinessProcessStateMachine}'
+
+  LogGroups:
+    Description: 'CloudWatch Log Groups for troubleshooting'
+    Value: !Sub |
+      Step Functions: /aws/stepfunctions/${ProjectName}-${Environment}-workflow
+      Lambda: /aws/lambda/${BusinessProcessorFunction}
+
+  DeploymentInformation:
+    Description: 'Deployment details and next steps'
+    Value: !Sub |
+      Stack: ${AWS::StackName}
+      Environment: ${Environment}
+      Region: ${AWS::Region}
+      
+      Next Steps:
+      1. Confirm SNS email subscription
+      2. Test workflow execution using the provided CLI command
+      3. Monitor execution in Step Functions console
+      4. Review CloudWatch logs for debugging

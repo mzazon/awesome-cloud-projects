@@ -1,0 +1,689 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'IoT Fleet Management and Over-the-Air Updates - Complete infrastructure for managing IoT device fleets with automated firmware updates using AWS IoT Core, IoT Device Management, and S3'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Fleet Configuration"
+        Parameters:
+          - FleetName
+          - DeviceCount
+          - FirmwareVersion
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - S3BucketName
+          - EnableVersioning
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - IoTPolicyName
+          - EnableCloudWatchLogs
+      - Label:
+          default: "Deployment Configuration"
+        Parameters:
+          - MaximumPerMinute
+          - AbortThresholdPercentage
+          - TimeoutInMinutes
+    ParameterLabels:
+      FleetName:
+        default: "Fleet Name"
+      DeviceCount:
+        default: "Number of IoT Devices"
+      FirmwareVersion:
+        default: "Target Firmware Version"
+      S3BucketName:
+        default: "S3 Bucket Name"
+      EnableVersioning:
+        default: "Enable S3 Versioning"
+      IoTPolicyName:
+        default: "IoT Policy Name"
+      EnableCloudWatchLogs:
+        default: "Enable CloudWatch Logs"
+      MaximumPerMinute:
+        default: "Maximum Deployments Per Minute"
+      AbortThresholdPercentage:
+        default: "Abort Threshold Percentage"
+      TimeoutInMinutes:
+        default: "Job Timeout (Minutes)"
+
+Parameters:
+  FleetName:
+    Type: String
+    Default: 'ProductionDevices'
+    Description: 'Name for the IoT device fleet and thing group'
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: '^[a-zA-Z0-9:_-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, colons, underscores, and hyphens'
+
+  DeviceCount:
+    Type: Number
+    Default: 3
+    Description: 'Number of IoT devices to create in the fleet'
+    MinValue: 1
+    MaxValue: 100
+    ConstraintDescription: 'Must be between 1 and 100 devices'
+
+  FirmwareVersion:
+    Type: String
+    Default: 'v2.1.0'
+    Description: 'Target firmware version for OTA updates'
+    MinLength: 1
+    MaxLength: 32
+    AllowedPattern: '^[a-zA-Z0-9\.\-_]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, dots, hyphens, and underscores'
+
+  S3BucketName:
+    Type: String
+    Default: ''
+    Description: 'S3 bucket name for firmware storage (leave empty for auto-generated name)'
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]*$|^$'
+    ConstraintDescription: 'Must be a valid S3 bucket name or empty for auto-generation'
+
+  EnableVersioning:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable S3 bucket versioning for firmware files'
+
+  IoTPolicyName:
+    Type: String
+    Default: 'IoTDeviceFleetPolicy'
+    Description: 'Name for the IoT device policy'
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: '^[a-zA-Z0-9:_-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, colons, underscores, and hyphens'
+
+  EnableCloudWatchLogs:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable CloudWatch logging for IoT Core'
+
+  MaximumPerMinute:
+    Type: Number
+    Default: 10
+    Description: 'Maximum number of job executions per minute during rollout'
+    MinValue: 1
+    MaxValue: 1000
+    ConstraintDescription: 'Must be between 1 and 1000'
+
+  AbortThresholdPercentage:
+    Type: Number
+    Default: 25
+    Description: 'Percentage of failed executions that will trigger job abort'
+    MinValue: 1
+    MaxValue: 100
+    ConstraintDescription: 'Must be between 1 and 100'
+
+  TimeoutInMinutes:
+    Type: Number
+    Default: 60
+    Description: 'Job execution timeout in minutes'
+    MinValue: 1
+    MaxValue: 10080
+    ConstraintDescription: 'Must be between 1 and 10080 minutes (1 week)'
+
+Conditions:
+  CreateBucketName: !Equals [!Ref S3BucketName, '']
+  EnableS3Versioning: !Equals [!Ref EnableVersioning, 'true']
+  EnableLogging: !Equals [!Ref EnableCloudWatchLogs, 'true']
+
+Resources:
+  # S3 Bucket for Firmware Storage
+  FirmwareStorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - CreateBucketName
+        - !Sub '${AWS::StackName}-firmware-${AWS::AccountId}-${AWS::Region}'
+        - !Ref S3BucketName
+      VersioningConfiguration:
+        Status: !If [EnableS3Versioning, 'Enabled', 'Suspended']
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !If [EnableLogging, !Ref IoTLogGroup, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-firmware-storage'
+        - Key: Purpose
+          Value: 'IoT Firmware Storage'
+        - Key: Environment
+          Value: 'Production'
+
+  # S3 Bucket Policy for IoT Device Access
+  FirmwareStorageBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FirmwareStorageBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: 'AllowIoTDeviceAccess'
+            Effect: Allow
+            Principal:
+              Service: 'iot.amazonaws.com'
+            Action:
+              - 's3:GetObject'
+              - 's3:GetObjectVersion'
+            Resource: !Sub '${FirmwareStorageBucket}/*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+          - Sid: 'AllowIoTListBucket'
+            Effect: Allow
+            Principal:
+              Service: 'iot.amazonaws.com'
+            Action:
+              - 's3:ListBucket'
+              - 's3:ListBucketVersions'
+            Resource: !Ref FirmwareStorageBucket
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+
+  # CloudWatch Log Group for IoT Core
+  IoTLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: !Sub '/aws/iot/${AWS::StackName}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-iot-logs'
+        - Key: Purpose
+          Value: 'IoT Core Logging'
+
+  # IoT Device Policy
+  IoTDevicePolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub '${IoTPolicyName}-${AWS::StackName}'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'iot:Connect'
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/${iot:Connection.Thing.ThingName}'
+          - Effect: Allow
+            Action:
+              - 'iot:Publish'
+              - 'iot:Subscribe'
+              - 'iot:Receive'
+            Resource:
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/things/${iot:Connection.Thing.ThingName}/jobs/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/$aws/things/${iot:Connection.Thing.ThingName}/jobs/*'
+          - Effect: Allow
+            Action:
+              - 'iot:GetThingShadow'
+              - 'iot:UpdateThingShadow'
+              - 'iot:DeleteThingShadow'
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:thing/${iot:Connection.Thing.ThingName}'
+          - Effect: Allow
+            Action:
+              - 'iot:DescribeJobExecution'
+              - 'iot:GetPendingJobExecutions'
+              - 'iot:StartNextPendingJobExecution'
+              - 'iot:UpdateJobExecution'
+            Resource:
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:job/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:thing/${iot:Connection.Thing.ThingName}'
+
+  # IoT Thing Group for Fleet Management
+  IoTThingGroup:
+    Type: AWS::IoT::ThingGroup
+    Properties:
+      ThingGroupName: !Sub '${FleetName}-${AWS::StackName}'
+      ThingGroupProperties:
+        ThingGroupDescription: !Sub 'Production IoT device fleet for ${AWS::StackName}'
+        AttributePayload:
+          Attributes:
+            environment: 'production'
+            updatePolicy: 'automatic'
+            firmwareVersion: !Ref FirmwareVersion
+            stackName: !Ref 'AWS::StackName'
+            createdDate: !Sub '${AWS::Timestamp}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-device-fleet'
+        - Key: Purpose
+          Value: 'IoT Device Fleet Management'
+        - Key: Environment
+          Value: 'Production'
+
+  # IAM Role for IoT Job Execution
+  IoTJobExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-IoTJobExecutionRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 'iot.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSIoTLogging'
+      Policies:
+        - PolicyName: 'IoTJobExecutionPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                Resource: !Sub '${FirmwareStorageBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !If 
+                  - EnableLogging
+                  - !Sub '${IoTLogGroup}:*'
+                  - !Ref 'AWS::NoValue'
+              - Effect: Allow
+                Action:
+                  - 'iot:UpdateThingShadow'
+                  - 'iot:GetThingShadow'
+                Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:thing/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-job-execution-role'
+        - Key: Purpose
+          Value: 'IoT Job Execution Role'
+
+  # Lambda Function for Device Registration
+  DeviceRegistrationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-DeviceRegistration'
+      Runtime: 'python3.9'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt DeviceRegistrationRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          THING_GROUP_NAME: !Ref IoTThingGroup
+          IOT_POLICY_NAME: !Ref IoTDevicePolicy
+          STACK_NAME: !Ref 'AWS::StackName'
+          FIRMWARE_VERSION: !Ref FirmwareVersion
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          import os
+          import cfnresponse
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          iot = boto3.client('iot')
+          
+          def lambda_handler(event, context):
+              try:
+                  logger.info(f"Event: {json.dumps(event)}")
+                  
+                  thing_group_name = os.environ['THING_GROUP_NAME']
+                  policy_name = os.environ['IOT_POLICY_NAME']
+                  stack_name = os.environ['STACK_NAME']
+                  firmware_version = os.environ['FIRMWARE_VERSION']
+                  
+                  if event['RequestType'] == 'Create':
+                      device_count = int(event['ResourceProperties']['DeviceCount'])
+                      created_devices = []
+                      
+                      for i in range(1, device_count + 1):
+                          thing_name = f"IoTDevice-{stack_name}-{i}"
+                          
+                          # Create thing
+                          iot.create_thing(
+                              thingName=thing_name,
+                              attributePayload={
+                                  'attributes': {
+                                      'deviceType': 'sensor',
+                                      'firmwareVersion': firmware_version,
+                                      'location': f'factory-floor-{i}',
+                                      'stackName': stack_name
+                                  }
+                              }
+                          )
+                          
+                          # Add to thing group
+                          iot.add_thing_to_thing_group(
+                              thingGroupName=thing_group_name,
+                              thingName=thing_name
+                          )
+                          
+                          # Create certificate
+                          cert_response = iot.create_keys_and_certificate(setAsActive=True)
+                          cert_arn = cert_response['certificateArn']
+                          
+                          # Attach policy to certificate
+                          iot.attach_policy(
+                              policyName=policy_name,
+                              target=cert_arn
+                          )
+                          
+                          # Attach certificate to thing
+                          iot.attach_thing_principal(
+                              thingName=thing_name,
+                              principal=cert_arn
+                          )
+                          
+                          created_devices.append({
+                              'thingName': thing_name,
+                              'certificateArn': cert_arn,
+                              'certificateId': cert_response['certificateId']
+                          })
+                          
+                          logger.info(f"Created device: {thing_name}")
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'DeviceCount': device_count,
+                          'CreatedDevices': created_devices
+                      })
+                      
+                  elif event['RequestType'] == 'Delete':
+                      # Get all things in the group
+                      things_response = iot.list_things_in_thing_group(
+                          thingGroupName=thing_group_name
+                      )
+                      
+                      for thing_name in things_response.get('things', []):
+                          try:
+                              # Get principals (certificates)
+                              principals_response = iot.list_thing_principals(
+                                  thingName=thing_name
+                              )
+                              
+                              for principal in principals_response.get('principals', []):
+                                  # Detach from thing
+                                  iot.detach_thing_principal(
+                                      thingName=thing_name,
+                                      principal=principal
+                                  )
+                                  
+                                  # Detach policy
+                                  iot.detach_policy(
+                                      policyName=policy_name,
+                                      target=principal
+                                  )
+                                  
+                                  # Delete certificate
+                                  cert_id = principal.split('/')[-1]
+                                  iot.update_certificate(
+                                      certificateId=cert_id,
+                                      newStatus='INACTIVE'
+                                  )
+                                  iot.delete_certificate(certificateId=cert_id)
+                              
+                              # Remove from group
+                              iot.remove_thing_from_thing_group(
+                                  thingGroupName=thing_group_name,
+                                  thingName=thing_name
+                              )
+                              
+                              # Delete thing
+                              iot.delete_thing(thingName=thing_name)
+                              
+                              logger.info(f"Deleted device: {thing_name}")
+                              
+                          except Exception as e:
+                              logger.error(f"Error deleting device {thing_name}: {str(e)}")
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      'Error': str(e)
+                  })
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-device-registration'
+        - Key: Purpose
+          Value: 'Device Registration Lambda'
+
+  # IAM Role for Device Registration Lambda
+  DeviceRegistrationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-DeviceRegistrationRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: 'DeviceRegistrationPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'iot:CreateThing'
+                  - 'iot:DeleteThing'
+                  - 'iot:UpdateThing'
+                  - 'iot:DescribeThing'
+                  - 'iot:ListThings'
+                  - 'iot:AddThingToThingGroup'
+                  - 'iot:RemoveThingFromThingGroup'
+                  - 'iot:ListThingsInThingGroup'
+                  - 'iot:CreateKeysAndCertificate'
+                  - 'iot:UpdateCertificate'
+                  - 'iot:DeleteCertificate'
+                  - 'iot:AttachPolicy'
+                  - 'iot:DetachPolicy'
+                  - 'iot:AttachThingPrincipal'
+                  - 'iot:DetachThingPrincipal'
+                  - 'iot:ListThingPrincipals'
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-device-registration-role'
+        - Key: Purpose
+          Value: 'Device Registration Lambda Role'
+
+  # Custom Resource for Device Registration
+  DeviceRegistrationCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt DeviceRegistrationFunction.Arn
+      DeviceCount: !Ref DeviceCount
+      ThingGroupName: !Ref IoTThingGroup
+      PolicyName: !Ref IoTDevicePolicy
+      FirmwareVersion: !Ref FirmwareVersion
+
+  # CloudWatch Dashboard for Monitoring
+  IoTFleetDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-IoTFleetDashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/IoT", "NumOfDevicesConnected", "Protocol", "MQTT" ],
+                  [ ".", "NumOfDevicesDisconnected", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "IoT Device Connection Status",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/IoT", "PublishIn.Success", "Protocol", "MQTT" ],
+                  [ ".", "PublishIn.Failure", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "IoT Message Publishing",
+                "period": 300
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/iot/${AWS::StackName}' | fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "IoT Core Error Logs",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms for Monitoring
+  DeviceConnectionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-DeviceConnection'
+      AlarmDescription: 'Alarm when device connection count drops below threshold'
+      MetricName: 'NumOfDevicesConnected'
+      Namespace: 'AWS/IoT'
+      Statistic: 'Average'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: 'LessThanThreshold'
+      Dimensions:
+        - Name: 'Protocol'
+          Value: 'MQTT'
+      AlarmActions:
+        - !Ref IoTAlarmTopic
+      TreatMissingData: 'breaching'
+
+  # SNS Topic for Alarms
+  IoTAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-IoTAlarms'
+      DisplayName: 'IoT Fleet Management Alarms'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alarm-topic'
+        - Key: Purpose
+          Value: 'IoT Alarm Notifications'
+
+Outputs:
+  S3BucketName:
+    Description: 'S3 bucket for firmware storage'
+    Value: !Ref FirmwareStorageBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-FirmwareBucket'
+
+  S3BucketArn:
+    Description: 'S3 bucket ARN for firmware storage'
+    Value: !GetAtt FirmwareStorageBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FirmwareBucketArn'
+
+  IoTThingGroupName:
+    Description: 'IoT Thing Group name for device fleet'
+    Value: !Ref IoTThingGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ThingGroup'
+
+  IoTThingGroupArn:
+    Description: 'IoT Thing Group ARN for device fleet'
+    Value: !GetAtt IoTThingGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ThingGroupArn'
+
+  IoTDevicePolicyName:
+    Description: 'IoT device policy name'
+    Value: !Ref IoTDevicePolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-DevicePolicy'
+
+  DeviceRegistrationFunctionArn:
+    Description: 'Device registration Lambda function ARN'
+    Value: !GetAtt DeviceRegistrationFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DeviceRegistrationFunction'
+
+  CloudWatchDashboardURL:
+    Description: 'CloudWatch dashboard URL for monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-IoTFleetDashboard'
+
+  IoTCoreConsoleURL:
+    Description: 'AWS IoT Core console URL'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/iot/home?region=${AWS::Region}#/thinghub'
+
+  JobCreationCommand:
+    Description: 'AWS CLI command to create firmware update job'
+    Value: !Sub |
+      aws iot create-job \
+        --job-id "firmware-update-${FirmwareVersion}-$(date +%s)" \
+        --targets "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:thinggroup/${IoTThingGroup}" \
+        --document '{"operation":"firmwareUpdate","firmwareVersion":"${FirmwareVersion}","downloadUrl":"https://${FirmwareStorageBucket}.s3.${AWS::Region}.amazonaws.com/firmware/firmware-${FirmwareVersion}.bin"}' \
+        --description "Deploy firmware version ${FirmwareVersion} to production devices" \
+        --job-executions-rollout-config "maximumPerMinute=${MaximumPerMinute}" \
+        --abort-config "criteriaList=[{failureType=FAILED,action=CANCEL,thresholdPercentage=${AbortThresholdPercentage},minNumberOfExecutedThings=1}]" \
+        --timeout-config "inProgressTimeoutInMinutes=${TimeoutInMinutes}"
+
+  SNSTopicArn:
+    Description: 'SNS topic ARN for IoT alarms'
+    Value: !Ref IoTAlarmTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlarmTopic'
+
+  FirmwareUploadCommand:
+    Description: 'AWS CLI command to upload firmware to S3'
+    Value: !Sub 'aws s3 cp firmware-${FirmwareVersion}.bin s3://${FirmwareStorageBucket}/firmware/'
+
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for this infrastructure'
+    Value: !Sub |
+      IoT Core: ~$0.08 per 1M messages
+      S3 Storage: ~$0.023 per GB
+      CloudWatch Logs: ~$0.50 per GB ingested
+      Lambda: ~$0.20 per 1M requests
+      Total estimated: $2-5 per month for testing workloads

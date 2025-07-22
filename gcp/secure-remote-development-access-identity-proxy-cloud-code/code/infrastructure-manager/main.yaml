@@ -1,0 +1,500 @@
+# Infrastructure Manager Configuration for Secure Remote Development Access
+# Recipe: Secure Remote Development Access with Cloud Identity-Aware Proxy and Cloud Code
+# This configuration deploys a zero-trust development environment using IAP and Cloud Code
+
+# Copyright 2025 Google Cloud. This software is provided as-is, without warranty or representation for any use or purpose.
+
+imports:
+  - path: modules/compute.yaml
+  - path: modules/artifact-registry.yaml
+  - path: modules/networking.yaml
+  - path: modules/iam.yaml
+  - path: modules/monitoring.yaml
+
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/iap.googleapis.com
+      parent: projects/{{ env["project"] }}
+    metadata:
+      dependsOn:
+        - enable-compute-api
+        - enable-artifactregistry-api
+        - enable-cloudbuild-api
+        - enable-cloudresourcemanager-api
+
+  - name: enable-compute-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/compute.googleapis.com
+      parent: projects/{{ env["project"] }}
+
+  - name: enable-artifactregistry-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/artifactregistry.googleapis.com
+      parent: projects/{{ env["project"] }}
+
+  - name: enable-cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/cloudbuild.googleapis.com
+      parent: projects/{{ env["project"] }}
+
+  - name: enable-cloudresourcemanager-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/cloudresourcemanager.googleapis.com
+      parent: projects/{{ env["project"] }}
+
+  # Artifact Registry repository for secure container storage
+  - name: secure-dev-repository
+    type: gcp-types/artifactregistry-v1:projects.locations.repositories
+    properties:
+      parent: projects/{{ env["project"] }}/locations/{{ properties["region"] }}
+      repositoryId: {{ properties["repositoryName"] }}
+      repository:
+        format: DOCKER
+        description: "Secure development container registry with vulnerability scanning"
+        dockerConfig:
+          immutableTags: false
+        vulnerabilityScanningConfig:
+          enablementState: ENABLED
+          enablementConfig:
+            vulnerabilityType: VULNERABILITY
+        labels:
+          environment: development
+          security: iap-protected
+          purpose: container-development
+    metadata:
+      dependsOn:
+        - enable-artifactregistry-api
+
+  # VPC firewall rule allowing IAP access to SSH
+  - name: allow-iap-ssh-firewall
+    type: gcp-types/compute-v1:firewalls
+    properties:
+      name: allow-iap-ssh-{{ properties["resourceSuffix"] }}
+      network: projects/{{ env["project"] }}/global/networks/default
+      direction: INGRESS
+      priority: 1000
+      sourceRanges:
+        - "35.235.240.0/20"  # Google Cloud IAP IP range
+      targetTags:
+        - iap-access
+        - dev-environment
+      allowed:
+        - IPProtocol: tcp
+          ports:
+            - "22"
+      description: "Allow IAP access to SSH on development VMs"
+      logConfig:
+        enable: true
+        metadata: INCLUDE_ALL_METADATA
+    metadata:
+      dependsOn:
+        - enable-compute-api
+
+  # Development Virtual Machine without external IP
+  - name: development-vm
+    type: gcp-types/compute-v1:instances
+    properties:
+      name: dev-vm-{{ properties["resourceSuffix"] }}
+      zone: {{ properties["zone"] }}
+      machineType: zones/{{ properties["zone"] }}/machineTypes/{{ properties["machineType"] }}
+      
+      # Boot disk configuration
+      disks:
+        - boot: true
+          autoDelete: true
+          initializeParams:
+            sourceImage: projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts
+            diskSizeGb: "50"
+            diskType: zones/{{ properties["zone"] }}/diskTypes/pd-standard
+            labels:
+              environment: development
+              security: iap-protected
+
+      # Network configuration without external IP for security
+      networkInterfaces:
+        - network: projects/{{ env["project"] }}/global/networks/default
+          subnetwork: projects/{{ env["project"] }}/regions/{{ properties["region"] }}/subnetworks/default
+          # No accessConfigs means no external IP
+
+      # Security and access configuration
+      tags:
+        items:
+          - iap-access
+          - dev-environment
+          - secure-development
+
+      # Service account and OAuth scopes
+      serviceAccounts:
+        - email: default
+          scopes:
+            - https://www.googleapis.com/auth/cloud-platform
+            - https://www.googleapis.com/auth/compute
+            - https://www.googleapis.com/auth/devstorage.read_write
+            - https://www.googleapis.com/auth/logging.write
+            - https://www.googleapis.com/auth/monitoring.write
+
+      # Metadata for OS Login and startup configuration
+      metadata:
+        items:
+          - key: enable-oslogin
+            value: "TRUE"
+          - key: startup-script
+            value: |
+              #!/bin/bash
+              # Log startup script execution
+              exec > >(tee -a /var/log/startup-script.log)
+              exec 2>&1
+              
+              echo "Starting secure development environment setup..."
+              
+              # Update system packages
+              apt-get update
+              apt-get upgrade -y
+              
+              # Install Docker for container development
+              curl -fsSL https://get.docker.com -o get-docker.sh
+              sh get-docker.sh
+              usermod -aG docker $(getent passwd 1000 | cut -d: -f1)
+              
+              # Install Google Cloud CLI
+              curl https://sdk.cloud.google.com | bash
+              
+              # Install development tools
+              apt-get install -y git vim curl wget unzip python3 python3-pip nodejs npm
+              
+              # Configure Git (placeholder - users should update)
+              sudo -u $(getent passwd 1000 | cut -d: -f1) git config --global user.name "Developer"
+              sudo -u $(getent passwd 1000 | cut -d: -f1) git config --global user.email "developer@company.com"
+              
+              # Create development workspace
+              sudo -u $(getent passwd 1000 | cut -d: -f1) mkdir -p /home/$(getent passwd 1000 | cut -d: -f1)/workspace
+              
+              echo "Development environment setup complete"
+
+      # Resource labels for organization and billing
+      labels:
+        environment: development
+        security: iap-protected
+        purpose: remote-development
+        cost-center: engineering
+
+      # Enable deletion protection for production environments
+      deletionProtection: false
+
+      # Scheduling configuration for cost optimization
+      scheduling:
+        automaticRestart: true
+        onHostMaintenance: MIGRATE
+        preemptible: false
+
+    metadata:
+      dependsOn:
+        - allow-iap-ssh-firewall
+        - secure-dev-repository
+
+  # IAM policy binding for IAP tunnel access
+  - name: iap-tunnel-access-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ env["project"] }}
+      role: roles/iap.tunnelResourceAccessor
+      member: user:{{ properties["developerEmail"] }}
+    metadata:
+      dependsOn:
+        - development-vm
+
+  # IAM policy binding for Compute Instance Admin access
+  - name: compute-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ env["project"] }}
+      role: roles/compute.instanceAdmin
+      member: user:{{ properties["developerEmail"] }}
+    metadata:
+      dependsOn:
+        - development-vm
+
+  # IAM policy binding for Artifact Registry Writer access
+  - name: artifact-registry-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ env["project"] }}
+      role: roles/artifactregistry.writer
+      member: user:{{ properties["developerEmail"] }}
+    metadata:
+      dependsOn:
+        - secure-dev-repository
+
+  # IAM policy binding for OS Login access
+  - name: os-login-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ env["project"] }}
+      role: roles/compute.osLogin
+      member: user:{{ properties["developerEmail"] }}
+    metadata:
+      dependsOn:
+        - development-vm
+
+  # Log sink for IAP audit events
+  - name: iap-audit-log-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      parent: projects/{{ env["project"] }}
+      sink:
+        name: iap-audit-sink-{{ properties["resourceSuffix"] }}
+        description: "Audit logs for IAP and Compute Engine access"
+        destination: storage.googleapis.com/{{ properties["auditLogsBucket"] }}
+        filter: |
+          protoPayload.serviceName="iap.googleapis.com" OR 
+          protoPayload.serviceName="compute.googleapis.com"
+        includeChildren: true
+        disabled: false
+    metadata:
+      dependsOn:
+        - development-vm
+
+  # Cloud Storage bucket for audit logs
+  - name: audit-logs-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: {{ properties["auditLogsBucket"] }}
+      project: {{ env["project"] }}
+      location: {{ properties["region"] }}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 365  # Retain audit logs for 1 year
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30   # Move to cheaper storage after 30 days
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      labels:
+        purpose: audit-logs
+        security: compliance
+        environment: development
+
+  # Monitoring notification channel for security alerts
+  - name: security-notification-channel
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      parent: projects/{{ env["project"] }}
+      notificationChannel:
+        type: email
+        displayName: "Security Alerts - Development Environment"
+        description: "Email notifications for IAP security events"
+        labels:
+          email_address: {{ properties["securityEmail"] }}
+        enabled: true
+
+  # Monitoring alert policy for failed IAP access attempts
+  - name: iap-access-failure-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/{{ env["project"] }}
+      alertPolicy:
+        displayName: "IAP Access Failures - Development Environment"
+        documentation:
+          content: "Alert triggered when IAP access attempts fail repeatedly"
+          mimeType: text/markdown
+        conditions:
+          - displayName: "Failed IAP access attempts"
+            conditionThreshold:
+              filter: |
+                resource.type="iap_tunnel"
+                protoPayload.authenticationInfo.principalEmail!=""
+                severity>=ERROR
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 5
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+        combiner: OR
+        enabled: true
+        notificationChannels:
+          - $(ref.security-notification-channel.name)
+        alertStrategy:
+          autoClose: 86400s  # Auto-close after 24 hours
+    metadata:
+      dependsOn:
+        - security-notification-channel
+        - development-vm
+
+# Configuration schema and validation
+schema:
+  info:
+    title: Secure Remote Development Environment
+    description: Infrastructure Manager configuration for IAP-protected development environment
+    version: "1.0"
+
+  properties:
+    region:
+      type: string
+      description: "Google Cloud region for resource deployment"
+      default: "us-central1"
+      pattern: "^[a-z]+-[a-z]+[0-9]$"
+
+    zone:
+      type: string
+      description: "Google Cloud zone for Compute Engine resources"
+      default: "us-central1-a"
+      pattern: "^[a-z]+-[a-z]+[0-9]-[a-z]$"
+
+    machineType:
+      type: string
+      description: "Compute Engine machine type for development VM"
+      default: "e2-standard-4"
+      enum:
+        - "e2-standard-2"
+        - "e2-standard-4"
+        - "e2-standard-8"
+        - "n2-standard-2"
+        - "n2-standard-4"
+        - "n2-standard-8"
+
+    repositoryName:
+      type: string
+      description: "Name for the Artifact Registry repository"
+      pattern: "^[a-z][a-z0-9-]*[a-z0-9]$"
+      minLength: 1
+      maxLength: 63
+
+    resourceSuffix:
+      type: string
+      description: "Suffix for resource names to ensure uniqueness"
+      pattern: "^[a-z0-9]{6}$"
+      minLength: 6
+      maxLength: 6
+
+    developerEmail:
+      type: string
+      description: "Email address of the developer for IAM bindings"
+      format: email
+
+    securityEmail:
+      type: string
+      description: "Email address for security notifications"
+      format: email
+
+    auditLogsBucket:
+      type: string
+      description: "Cloud Storage bucket name for audit logs"
+      pattern: "^[a-z0-9][a-z0-9-._]*[a-z0-9]$"
+      minLength: 3
+      maxLength: 63
+
+  required:
+    - region
+    - zone
+    - repositoryName
+    - resourceSuffix
+    - developerEmail
+    - securityEmail
+    - auditLogsBucket
+
+# Output values for validation and integration
+outputs:
+  - name: project-id
+    value: $(env.project)
+
+  - name: development-vm-name
+    value: $(ref.development-vm.name)
+
+  - name: development-vm-zone
+    value: $(ref.development-vm.zone)
+
+  - name: artifact-registry-repository
+    value: $(ref.secure-dev-repository.name)
+
+  - name: artifact-registry-url
+    value: ${{ properties["region"] }}-docker.pkg.dev/${{ env["project"] }}/${{ properties["repositoryName"] }}
+
+  - name: iap-ssh-command
+    value: gcloud compute ssh $(ref.development-vm.name) --zone=$(ref.development-vm.zone) --tunnel-through-iap
+
+  - name: docker-auth-command
+    value: gcloud auth configure-docker ${{ properties["region"] }}-docker.pkg.dev
+
+  - name: audit-logs-bucket
+    value: $(ref.audit-logs-bucket.name)
+
+  - name: firewall-rule-name
+    value: $(ref.allow-iap-ssh-firewall.name)
+
+  - name: cloud-code-settings
+    value: |
+      {
+        "cloudcode.gcp.project": "${{ env["project"] }}",
+        "cloudcode.gcp.region": "${{ properties["region"] }}",
+        "cloudcode.artifactRegistry.repository": "${{ properties["region"] }}-docker.pkg.dev/${{ env["project"] }}/${{ properties["repositoryName"] }}"
+      }
+
+# Metadata for deployment tracking and management
+metadata:
+  version: "1.0"
+  description: "Secure Remote Development Environment with IAP and Cloud Code"
+  author: "Google Cloud Recipe Generator"
+  created: "2025-07-12"
+  last-updated: "2025-07-12"
+  tags:
+    - security
+    - remote-development
+    - zero-trust
+    - cloud-identity
+    - container-security
+    - iap
+    - cloud-code
+  
+  # Cost estimation (approximate monthly costs in USD)
+  cost-estimate:
+    compute-engine: "$50-100/month (e2-standard-4, 730 hours)"
+    artifact-registry: "$5-15/month (storage and data transfer)"
+    cloud-storage: "$1-5/month (audit logs)"
+    networking: "$0-10/month (data transfer)"
+    monitoring: "$0-5/month (logs and metrics)"
+    total-estimate: "$56-135/month"
+
+  # Security considerations and compliance
+  security:
+    - "Zero external IP addresses on development VM"
+    - "IAP-based authentication and authorization"
+    - "Comprehensive audit logging enabled"
+    - "Container vulnerability scanning enabled"
+    - "OS Login enabled for centralized SSH key management"
+    - "Least privilege IAM roles assigned"
+    - "Monitoring and alerting for security events"
+
+  # Prerequisites for deployment
+  prerequisites:
+    - "Google Cloud project with billing enabled"
+    - "Owner or Project Admin permissions"
+    - "OAuth consent screen configured (if using external users)"
+    - "Developer email addresses for IAM bindings"
+    - "Unique resource names to avoid conflicts"
+
+  # Deployment validation steps
+  validation:
+    - "Verify development VM has no external IP"
+    - "Test IAP SSH connection successfully"
+    - "Confirm Artifact Registry repository created"
+    - "Validate IAM permissions granted correctly"
+    - "Check audit logs are being generated"
+    - "Verify monitoring alerts are configured"

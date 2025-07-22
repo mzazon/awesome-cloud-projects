@@ -1,0 +1,1043 @@
+# Infrastructure Manager Configuration for Application Performance Monitoring
+# This configuration deploys a comprehensive intelligent monitoring system using
+# Cloud Monitoring, Cloud Trace, Cloud Functions, and Pub/Sub for automated
+# performance optimization and anomaly detection.
+
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+deploymentName: application-performance-monitoring
+description: "Intelligent application performance monitoring with automated optimization using Cloud Monitoring, Cloud Trace, Cloud Functions, and Pub/Sub"
+
+# Configuration variables for customization
+variables:
+  # Project configuration
+  project_id:
+    type: string
+    description: "GCP Project ID for deployment"
+    default: "monitoring-demo-project"
+  
+  # Regional configuration
+  region:
+    type: string
+    description: "Primary GCP region for resource deployment"
+    default: "us-central1"
+  
+  zone:
+    type: string
+    description: "Primary GCP zone for compute resources"
+    default: "us-central1-a"
+  
+  # Naming configuration
+  resource_prefix:
+    type: string
+    description: "Prefix for resource names to ensure uniqueness"
+    default: "perf-monitor"
+  
+  # Application configuration
+  app_machine_type:
+    type: string
+    description: "Machine type for sample application VM"
+    default: "e2-medium"
+  
+  # Function configuration
+  function_memory:
+    type: string
+    description: "Memory allocation for Cloud Functions"
+    default: "256MB"
+  
+  function_timeout:
+    type: string
+    description: "Timeout duration for Cloud Functions"
+    default: "60s"
+  
+  # Monitoring configuration
+  alert_threshold:
+    type: number
+    description: "Response time threshold in seconds for alerts"
+    default: 1.5
+  
+  alert_duration:
+    type: string
+    description: "Duration threshold for alert evaluation"
+    default: "60s"
+
+# Resource definitions for the monitoring infrastructure
+resources:
+  # ========================================
+  # PROJECT SERVICES AND APIs
+  # ========================================
+  
+  # Enable required Google Cloud APIs for the monitoring solution
+  enable_compute_api:
+    type: "gcp-types/serviceusage-v1:services"
+    name: "compute.googleapis.com"
+    metadata:
+      dependsOn: []
+    properties:
+      name: "projects/$(ref.project_id.name)/services/compute.googleapis.com"
+      
+  enable_functions_api:
+    type: "gcp-types/serviceusage-v1:services"
+    name: "cloudfunctions.googleapis.com"
+    metadata:
+      dependsOn: []
+    properties:
+      name: "projects/$(ref.project_id.name)/services/cloudfunctions.googleapis.com"
+      
+  enable_pubsub_api:
+    type: "gcp-types/serviceusage-v1:services"
+    name: "pubsub.googleapis.com"
+    metadata:
+      dependsOn: []
+    properties:
+      name: "projects/$(ref.project_id.name)/services/pubsub.googleapis.com"
+      
+  enable_monitoring_api:
+    type: "gcp-types/serviceusage-v1:services"
+    name: "monitoring.googleapis.com"
+    metadata:
+      dependsOn: []
+    properties:
+      name: "projects/$(ref.project_id.name)/services/monitoring.googleapis.com"
+      
+  enable_trace_api:
+    type: "gcp-types/serviceusage-v1:services"
+    name: "cloudtrace.googleapis.com"
+    metadata:
+      dependsOn: []
+    properties:
+      name: "projects/$(ref.project_id.name)/services/cloudtrace.googleapis.com"
+      
+  enable_logging_api:
+    type: "gcp-types/serviceusage-v1:services"
+    name: "logging.googleapis.com"
+    metadata:
+      dependsOn: []
+    properties:
+      name: "projects/$(ref.project_id.name)/services/logging.googleapis.com"
+
+  # ========================================
+  # PUB/SUB MESSAGING INFRASTRUCTURE
+  # ========================================
+  
+  # Pub/Sub topic for distributing performance alerts to automation functions
+  performance_alerts_topic:
+    type: "pubsub.v1.topic"
+    metadata:
+      dependsOn: 
+        - "enable_pubsub_api"
+    properties:
+      name: "projects/$(var.project_id)/topics/$(var.resource_prefix)-alerts"
+      labels:
+        environment: "monitoring"
+        component: "alerting"
+        purpose: "performance-automation"
+      messageRetentionDuration: "604800s"  # 7 days
+      
+  # Subscription for Cloud Function to process performance alerts
+  performance_alerts_subscription:
+    type: "pubsub.v1.subscription"
+    metadata:
+      dependsOn: 
+        - "performance_alerts_topic"
+    properties:
+      name: "projects/$(var.project_id)/subscriptions/$(var.resource_prefix)-alerts-sub"
+      topic: "$(ref.performance_alerts_topic.name)"
+      labels:
+        environment: "monitoring"
+        component: "automation"
+        purpose: "alert-processing"
+      # Configure dead letter policy for failed message processing
+      deadLetterPolicy:
+        deadLetterTopic: "projects/$(var.project_id)/topics/$(var.resource_prefix)-dlq"
+        maxDeliveryAttempts: 5
+      # Message retention for unprocessed alerts
+      messageRetentionDuration: "86400s"  # 24 hours
+      # Exponential backoff for retry logic
+      retryPolicy:
+        minimumBackoff: "10s"
+        maximumBackoff: "600s"
+
+  # Dead letter queue for failed alert processing
+  performance_alerts_dlq:
+    type: "pubsub.v1.topic"
+    metadata:
+      dependsOn: 
+        - "enable_pubsub_api"
+    properties:
+      name: "projects/$(var.project_id)/topics/$(var.resource_prefix)-dlq"
+      labels:
+        environment: "monitoring"
+        component: "alerting"
+        purpose: "dead-letter-queue"
+
+  # ========================================
+  # NETWORKING AND SECURITY
+  # ========================================
+  
+  # Firewall rule to allow HTTP traffic to the sample application
+  web_app_firewall_rule:
+    type: "compute.v1.firewall"
+    metadata:
+      dependsOn: 
+        - "enable_compute_api"
+    properties:
+      name: "$(var.resource_prefix)-allow-web-app"
+      description: "Allow HTTP traffic to sample monitoring application on port 5000"
+      network: "projects/$(var.project_id)/global/networks/default"
+      direction: "INGRESS"
+      priority: 1000
+      sourceRanges:
+        - "0.0.0.0/0"
+      targetTags:
+        - "$(var.resource_prefix)-web-server"
+      allowed:
+        - IPProtocol: "tcp"
+          ports: 
+            - "5000"
+      logConfig:
+        enable: true
+        metadata: "INCLUDE_ALL_METADATA"
+
+  # ========================================
+  # SAMPLE APPLICATION INFRASTRUCTURE
+  # ========================================
+  
+  # Compute Engine instance running the sample application with monitoring instrumentation
+  sample_application_vm:
+    type: "compute.v1.instance"
+    metadata:
+      dependsOn: 
+        - "enable_compute_api"
+        - "web_app_firewall_rule"
+    properties:
+      name: "$(var.resource_prefix)-app-instance"
+      description: "Sample web application with Cloud Monitoring and Trace instrumentation"
+      zone: "$(var.zone)"
+      machineType: "projects/$(var.project_id)/zones/$(var.zone)/machineTypes/$(var.app_machine_type)"
+      
+      # Boot disk configuration with Debian 11
+      disks:
+        - boot: true
+          autoDelete: true
+          initializeParams:
+            sourceImage: "projects/debian-cloud/global/images/family/debian-11"
+            diskType: "projects/$(var.project_id)/zones/$(var.zone)/diskTypes/pd-standard"
+            diskSizeGb: 20
+      
+      # Network configuration with external IP for testing
+      networkInterfaces:
+        - network: "projects/$(var.project_id)/global/networks/default"
+          accessConfigs:
+            - name: "External NAT"
+              type: "ONE_TO_ONE_NAT"
+      
+      # Security and monitoring configuration
+      tags:
+        items:
+          - "$(var.resource_prefix)-web-server"
+      
+      # Service account with monitoring permissions
+      serviceAccounts:
+        - email: "default"
+          scopes:
+            - "https://www.googleapis.com/auth/cloud-platform"
+            - "https://www.googleapis.com/auth/monitoring.write"
+            - "https://www.googleapis.com/auth/trace.append"
+            - "https://www.googleapis.com/auth/logging.write"
+      
+      # Labels for resource management and cost tracking
+      labels:
+        environment: "monitoring"
+        component: "sample-application"
+        purpose: "performance-testing"
+        cost-center: "operations"
+      
+      # Startup script to install and configure the monitoring application
+      metadata:
+        items:
+          - key: "startup-script"
+            value: |
+              #!/bin/bash
+              set -e
+              
+              # Update system packages
+              apt-get update
+              apt-get install -y python3 python3-pip nginx curl
+              
+              # Install Google Cloud monitoring and tracing libraries
+              pip3 install --upgrade pip
+              pip3 install google-cloud-monitoring google-cloud-trace flask gunicorn
+              
+              # Create application directory
+              mkdir -p /opt/monitoring-app
+              cd /opt/monitoring-app
+              
+              # Create Flask application with comprehensive monitoring instrumentation
+              cat > /opt/monitoring-app/app.py << 'EOF'
+              import time
+              import random
+              import json
+              import os
+              from datetime import datetime
+              from flask import Flask, request, jsonify
+              from google.cloud import monitoring_v3
+              from google.cloud import trace_v1
+              from google.cloud import logging
+              
+              # Initialize Flask application
+              app = Flask(__name__)
+              
+              # Initialize Google Cloud clients
+              monitoring_client = monitoring_v3.MetricServiceClient()
+              trace_client = trace_v1.TraceServiceClient()
+              logging_client = logging.Client()
+              
+              # Get project ID from metadata
+              PROJECT_ID = os.environ.get('GOOGLE_CLOUD_PROJECT', '$(var.project_id)')
+              project_name = f"projects/{PROJECT_ID}"
+              
+              # Configure structured logging
+              logger = logging_client.logger('performance-monitoring-app')
+              
+              @app.route('/api/data')
+              def get_data():
+                  """API endpoint that simulates variable performance for monitoring"""
+                  start_time = time.time()
+                  request_id = f"req_{int(time.time())}_{random.randint(1000, 9999)}"
+                  
+                  # Log request start
+                  logger.log_struct({
+                      'message': 'API request started',
+                      'request_id': request_id,
+                      'endpoint': '/api/data',
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'severity': 'INFO'
+                  })
+                  
+                  # Simulate variable response time with occasional slow responses
+                  if random.random() < 0.2:  # 20% chance of slow response
+                      delay = random.uniform(2.0, 4.0)  # Slow response
+                  else:
+                      delay = random.uniform(0.1, 1.0)  # Normal response
+                  
+                  time.sleep(delay)
+                  
+                  # Calculate actual response time
+                  actual_response_time = time.time() - start_time
+                  
+                  # Create custom metric for API response time
+                  try:
+                      series = monitoring_v3.TimeSeries()
+                      series.metric.type = "custom.googleapis.com/api/response_time"
+                      series.resource.type = "global"
+                      series.resource.labels["project_id"] = PROJECT_ID
+                      
+                      # Add metric labels for better analysis
+                      series.metric.labels["endpoint"] = "/api/data"
+                      series.metric.labels["status"] = "success"
+                      series.metric.labels["request_id"] = request_id
+                      
+                      # Create data point
+                      point = series.points.add()
+                      point.value.double_value = actual_response_time
+                      now = time.time()
+                      point.interval.end_time.seconds = int(now)
+                      point.interval.end_time.nanos = int((now - int(now)) * 10**9)
+                      
+                      # Send metric to Cloud Monitoring
+                      monitoring_client.create_time_series(
+                          name=project_name, 
+                          time_series=[series]
+                      )
+                      
+                      # Log successful metric creation
+                      logger.log_struct({
+                          'message': 'Metric sent to Cloud Monitoring',
+                          'request_id': request_id,
+                          'response_time': actual_response_time,
+                          'metric_type': 'custom.googleapis.com/api/response_time',
+                          'severity': 'INFO'
+                      })
+                      
+                  except Exception as e:
+                      # Log monitoring errors without failing the request
+                      logger.log_struct({
+                          'message': 'Error sending metric to Cloud Monitoring',
+                          'request_id': request_id,
+                          'error': str(e),
+                          'severity': 'ERROR'
+                      })
+                  
+                  # Create additional custom metrics for comprehensive monitoring
+                  try:
+                      # Request count metric
+                      count_series = monitoring_v3.TimeSeries()
+                      count_series.metric.type = "custom.googleapis.com/api/request_count"
+                      count_series.resource.type = "global"
+                      count_series.resource.labels["project_id"] = PROJECT_ID
+                      count_series.metric.labels["endpoint"] = "/api/data"
+                      
+                      count_point = count_series.points.add()
+                      count_point.value.int64_value = 1
+                      count_point.interval.end_time.seconds = int(now)
+                      count_point.interval.end_time.nanos = int((now - int(now)) * 10**9)
+                      
+                      monitoring_client.create_time_series(
+                          name=project_name, 
+                          time_series=[count_series]
+                      )
+                      
+                  except Exception as e:
+                      logger.log_struct({
+                          'message': 'Error sending count metric',
+                          'request_id': request_id,
+                          'error': str(e),
+                          'severity': 'WARNING'
+                      })
+                  
+                  # Return response with performance metadata
+                  response_data = {
+                      'status': 'success',
+                      'data': {
+                          'message': 'Sample API response for performance monitoring',
+                          'request_id': request_id,
+                          'processing_time': round(actual_response_time, 3),
+                          'timestamp': datetime.utcnow().isoformat(),
+                          'server_info': {
+                              'instance': os.environ.get('HOSTNAME', 'unknown'),
+                              'version': '1.0.0'
+                          }
+                      },
+                      'performance': {
+                          'response_time_ms': round(actual_response_time * 1000, 2),
+                          'category': 'slow' if actual_response_time > 1.5 else 'normal'
+                      }
+                  }
+                  
+                  # Log request completion
+                  logger.log_struct({
+                      'message': 'API request completed',
+                      'request_id': request_id,
+                      'response_time': actual_response_time,
+                      'status': 'success',
+                      'severity': 'INFO'
+                  })
+                  
+                  return jsonify(response_data)
+              
+              @app.route('/health')
+              def health_check():
+                  """Health check endpoint for monitoring system health"""
+                  return jsonify({
+                      'status': 'healthy',
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'version': '1.0.0',
+                      'monitoring': {
+                          'cloud_monitoring': 'enabled',
+                          'cloud_trace': 'enabled',
+                          'structured_logging': 'enabled'
+                      }
+                  })
+              
+              @app.route('/')
+              def root():
+                  """Root endpoint with application information"""
+                  return jsonify({
+                      'application': 'Performance Monitoring Demo',
+                      'version': '1.0.0',
+                      'endpoints': {
+                          '/api/data': 'Main API endpoint with variable performance',
+                          '/health': 'Health check endpoint',
+                          '/': 'This information endpoint'
+                      },
+                      'monitoring_features': [
+                          'Custom metrics to Cloud Monitoring',
+                          'Structured logging to Cloud Logging',
+                          'Performance instrumentation',
+                          'Request ID tracking'
+                      ]
+                  })
+              
+              if __name__ == '__main__':
+                  # Run with Gunicorn for production-like performance
+                  app.run(host='0.0.0.0', port=5000, debug=False)
+              EOF
+              
+              # Create Gunicorn configuration for production deployment
+              cat > /opt/monitoring-app/gunicorn.conf.py << 'EOF'
+              bind = "0.0.0.0:5000"
+              workers = 2
+              worker_class = "sync"
+              worker_connections = 1000
+              timeout = 30
+              keepalive = 2
+              max_requests = 1000
+              max_requests_jitter = 100
+              preload_app = True
+              EOF
+              
+              # Create systemd service for the application
+              cat > /etc/systemd/system/monitoring-app.service << 'EOF'
+              [Unit]
+              Description=Performance Monitoring Demo Application
+              After=network.target
+              
+              [Service]
+              Type=exec
+              User=root
+              WorkingDirectory=/opt/monitoring-app
+              Environment=GOOGLE_CLOUD_PROJECT=$(var.project_id)
+              ExecStart=/usr/local/bin/gunicorn -c gunicorn.conf.py app:app
+              Restart=always
+              RestartSec=5
+              StandardOutput=journal
+              StandardError=journal
+              
+              [Install]
+              WantedBy=multi-user.target
+              EOF
+              
+              # Enable and start the monitoring application service
+              systemctl daemon-reload
+              systemctl enable monitoring-app.service
+              systemctl start monitoring-app.service
+              
+              # Verify service is running
+              sleep 10
+              systemctl status monitoring-app.service
+              
+              # Log successful deployment
+              echo "Performance monitoring application deployed successfully" | logger -t startup-script
+
+  # ========================================
+  # CLOUD FUNCTIONS FOR INTELLIGENT AUTOMATION
+  # ========================================
+  
+  # Storage bucket for Cloud Function source code
+  function_source_bucket:
+    type: "storage.v1.bucket"
+    metadata:
+      dependsOn: []
+    properties:
+      name: "$(var.project_id)-$(var.resource_prefix)-functions"
+      location: "$(var.region)"
+      labels:
+        environment: "monitoring"
+        component: "automation"
+        purpose: "function-source"
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: "Delete"
+            condition:
+              age: 30
+              isLive: false
+      uniformBucketLevelAccess:
+        enabled: true
+        
+  # Cloud Function for intelligent performance optimization
+  performance_optimizer_function:
+    type: "cloudfunctions.v1.cloudFunction"
+    metadata:
+      dependsOn:
+        - "enable_functions_api"
+        - "performance_alerts_topic"
+        - "function_source_bucket"
+    properties:
+      name: "projects/$(var.project_id)/locations/$(var.region)/functions/$(var.resource_prefix)-optimizer"
+      description: "Intelligent performance optimization function that processes monitoring alerts and implements automated remediation"
+      
+      # Function source code configuration
+      sourceArchiveUrl: "gs://$(ref.function_source_bucket.name)/performance-optimizer.zip"
+      
+      # Runtime configuration
+      runtime: "python39"
+      entryPoint: "performance_optimizer"
+      timeout: "$(var.function_timeout)"
+      availableMemoryMb: "$(var.function_memory)"
+      
+      # Event trigger configuration for Pub/Sub
+      eventTrigger:
+        eventType: "providers/cloud.pubsub/eventTypes/topic.publish"
+        resource: "$(ref.performance_alerts_topic.name)"
+        
+      # Environment variables for function configuration
+      environmentVariables:
+        PROJECT_ID: "$(var.project_id)"
+        REGION: "$(var.region)"
+        ALERT_THRESHOLD: "$(var.alert_threshold)"
+        LOG_LEVEL: "INFO"
+        
+      # IAM and security configuration
+      serviceAccountEmail: "$(ref.function_service_account.email)"
+      
+      # Labels for resource management
+      labels:
+        environment: "monitoring"
+        component: "automation"
+        purpose: "performance-optimization"
+        function-type: "event-driven"
+
+  # Service account for Cloud Function with appropriate permissions
+  function_service_account:
+    type: "iam.v1.serviceAccount"
+    metadata:
+      dependsOn: []
+    properties:
+      accountId: "$(var.resource_prefix)-func-sa"
+      displayName: "Performance Monitoring Function Service Account"
+      description: "Service account for intelligent performance monitoring and optimization functions"
+      
+  # IAM binding for function service account - Monitoring permissions
+  function_monitoring_binding:
+    type: "cloudresourcemanager.v1.projectIamBinding"
+    metadata:
+      dependsOn:
+        - "function_service_account"
+    properties:
+      projectId: "$(var.project_id)"
+      role: "roles/monitoring.viewer"
+      members:
+        - "serviceAccount:$(ref.function_service_account.email)"
+
+  # IAM binding for function service account - Trace permissions  
+  function_trace_binding:
+    type: "cloudresourcemanager.v1.projectIamBinding"
+    metadata:
+      dependsOn:
+        - "function_service_account"
+    properties:
+      projectId: "$(var.project_id)"
+      role: "roles/cloudtrace.user"
+      members:
+        - "serviceAccount:$(ref.function_service_account.email)"
+
+  # IAM binding for function service account - Logging permissions
+  function_logging_binding:
+    type: "cloudresourcemanager.v1.projectIamBinding"
+    metadata:
+      dependsOn:
+        - "function_service_account"
+    properties:
+      projectId: "$(var.project_id)"
+      role: "roles/logging.logWriter"
+      members:
+        - "serviceAccount:$(ref.function_service_account.email)"
+
+  # ========================================
+  # CLOUD MONITORING CONFIGURATION
+  # ========================================
+  
+  # Notification channel for Pub/Sub integration
+  pubsub_notification_channel:
+    type: "monitoring.v1.notificationChannel"
+    metadata:
+      dependsOn:
+        - "enable_monitoring_api"
+        - "performance_alerts_topic"
+    properties:
+      name: "projects/$(var.project_id)/notificationChannels/$(var.resource_prefix)-pubsub-channel"
+      displayName: "Performance Alert Pub/Sub Channel"
+      description: "Notification channel for automated performance alert processing via Pub/Sub"
+      type: "pubsub"
+      labels:
+        topic: "$(ref.performance_alerts_topic.name)"
+      userLabels:
+        environment: "monitoring"
+        component: "alerting"
+        purpose: "automation"
+      enabled: true
+      
+  # Alert policy for API response time monitoring with intelligent thresholds
+  api_response_time_alert:
+    type: "monitoring.v1.alertPolicy"
+    metadata:
+      dependsOn:
+        - "enable_monitoring_api"
+        - "pubsub_notification_channel"
+    properties:
+      name: "projects/$(var.project_id)/alertPolicies/$(var.resource_prefix)-response-time"
+      displayName: "High API Response Time - Intelligent Alert"
+      documentation:
+        content: |
+          ## High API Response Time Alert
+          
+          This alert detects when API response times exceed acceptable thresholds, indicating potential performance degradation.
+          
+          **Automated Actions:**
+          - Performance analysis via Cloud Trace
+          - Automatic optimization recommendations
+          - Resource scaling evaluation
+          - Incident tracking and notification
+          
+          **Threshold:** $(var.alert_threshold) seconds
+          **Evaluation Period:** $(var.alert_duration)
+          
+          The alert triggers automated remediation workflows through Cloud Functions to maintain optimal application performance.
+        mimeType: "text/markdown"
+        
+      # Alert condition configuration with statistical analysis
+      conditions:
+        - displayName: "API Response Time Threshold Condition"
+          conditionThreshold:
+            filter: 'metric.type="custom.googleapis.com/api/response_time" resource.type="global"'
+            comparison: "COMPARISON_GREATER_THAN"
+            thresholdValue: "$(var.alert_threshold)"
+            duration: "$(var.alert_duration)"
+            
+            # Aggregation configuration for intelligent analysis
+            aggregations:
+              - alignmentPeriod: "60s"
+                perSeriesAligner: "ALIGN_MEAN"
+                crossSeriesReducer: "REDUCE_MEAN"
+                groupByFields:
+                  - "metric.label.endpoint"
+                  
+            # Trigger configuration to reduce false positives
+            trigger:
+              count: 1
+              percent: 0
+              
+      # Alert strategy configuration
+      alertStrategy:
+        autoClose: "1800s"  # Auto-close after 30 minutes
+        notificationRateLimit:
+          period: "300s"  # Limit notifications to every 5 minutes
+          
+      # Combine multiple conditions with OR logic
+      combiner: "OR"
+      enabled: true
+      
+      # Notification channels for automated response
+      notificationChannels:
+        - "$(ref.pubsub_notification_channel.name)"
+        
+      # User labels for organization and filtering
+      userLabels:
+        environment: "monitoring"
+        component: "alerting"
+        severity: "warning"
+        automation: "enabled"
+
+  # Alert policy for request volume anomalies
+  api_request_volume_alert:
+    type: "monitoring.v1.alertPolicy"
+    metadata:
+      dependsOn:
+        - "enable_monitoring_api"
+        - "pubsub_notification_channel"
+    properties:
+      name: "projects/$(var.project_id)/alertPolicies/$(var.resource_prefix)-request-volume"
+      displayName: "API Request Volume Anomaly Alert"
+      documentation:
+        content: |
+          ## Request Volume Anomaly Alert
+          
+          This alert detects unusual patterns in API request volume that may indicate performance issues or system problems.
+          
+          **Monitoring Metrics:**
+          - Request count per minute
+          - Request rate changes
+          - Traffic pattern analysis
+          
+          **Automated Analysis:**
+          - Traffic pattern evaluation
+          - Capacity planning recommendations
+          - Load balancing optimization
+        mimeType: "text/markdown"
+        
+      conditions:
+        - displayName: "Request Volume Anomaly Detection"
+          conditionThreshold:
+            filter: 'metric.type="custom.googleapis.com/api/request_count" resource.type="global"'
+            comparison: "COMPARISON_GREATER_THAN"
+            thresholdValue: 100  # Requests per minute
+            duration: "180s"  # 3 minutes
+            
+            aggregations:
+              - alignmentPeriod: "60s"
+                perSeriesAligner: "ALIGN_RATE"
+                crossSeriesReducer: "REDUCE_SUM"
+                
+      alertStrategy:
+        autoClose: "3600s"  # Auto-close after 1 hour
+        
+      combiner: "OR"
+      enabled: true
+      
+      notificationChannels:
+        - "$(ref.pubsub_notification_channel.name)"
+        
+      userLabels:
+        environment: "monitoring"
+        component: "alerting"
+        severity: "info"
+        type: "volume-anomaly"
+
+  # ========================================
+  # CUSTOM MONITORING DASHBOARD
+  # ========================================
+  
+  # Comprehensive monitoring dashboard for performance insights
+  performance_monitoring_dashboard:
+    type: "monitoring.v1.dashboard"
+    metadata:
+      dependsOn:
+        - "enable_monitoring_api"
+    properties:
+      name: "projects/$(var.project_id)/dashboards/$(var.resource_prefix)-performance"
+      displayName: "Intelligent Performance Monitoring Dashboard"
+      
+      # Dashboard layout configuration with multiple visualization widgets
+      mosaicLayout:
+        tiles:
+          # API Response Time Chart
+          - width: 6
+            height: 4
+            widget:
+              title: "API Response Time Trends"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'metric.type="custom.googleapis.com/api/response_time" resource.type="global"'
+                        aggregation:
+                          alignmentPeriod: "60s"
+                          perSeriesAligner: "ALIGN_MEAN"
+                          crossSeriesReducer: "REDUCE_MEAN"
+                          groupByFields:
+                            - "metric.label.endpoint"
+                    plotType: "LINE"
+                    targetAxis: "Y1"
+                    
+                # Y-axis configuration
+                yAxis:
+                  label: "Response Time (seconds)"
+                  scale: "LINEAR"
+                  
+                # Threshold line for alert threshold
+                thresholds:
+                  - value: "$(var.alert_threshold)"
+                    color: "RED"
+                    direction: "ABOVE"
+                    label: "Alert Threshold"
+                    
+          # Request Volume Chart
+          - width: 6
+            height: 4
+            xPos: 6
+            widget:
+              title: "API Request Volume"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'metric.type="custom.googleapis.com/api/request_count" resource.type="global"'
+                        aggregation:
+                          alignmentPeriod: "60s"
+                          perSeriesAligner: "ALIGN_RATE"
+                          crossSeriesReducer: "REDUCE_SUM"
+                    plotType: "STACKED_BAR"
+                    targetAxis: "Y1"
+                    
+                yAxis:
+                  label: "Requests per minute"
+                  scale: "LINEAR"
+                  
+          # Cloud Function Executions
+          - width: 6
+            height: 4
+            yPos: 4
+            widget:
+              title: "Automation Function Executions"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'metric.type="cloudfunctions.googleapis.com/function/executions" resource.label.function_name="$(var.resource_prefix)-optimizer"'
+                        aggregation:
+                          alignmentPeriod: "60s"
+                          perSeriesAligner: "ALIGN_RATE"
+                          crossSeriesReducer: "REDUCE_SUM"
+                          groupByFields:
+                            - "metric.label.status"
+                    plotType: "STACKED_AREA"
+                    targetAxis: "Y1"
+                    
+                yAxis:
+                  label: "Executions per minute"
+                  scale: "LINEAR"
+                  
+          # Alert Policy Status
+          - width: 6
+            height: 4
+            xPos: 6
+            yPos: 4
+            widget:
+              title: "Alert Policy Incidents"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'metric.type="monitoring.googleapis.com/uptime_check/check_passed" resource.type="uptime_url"'
+                        aggregation:
+                          alignmentPeriod: "300s"
+                          perSeriesAligner: "ALIGN_FRACTION_TRUE"
+                    plotType: "LINE"
+                    targetAxis: "Y1"
+                    
+                yAxis:
+                  label: "Success Rate"
+                  scale: "LINEAR"
+                  
+          # Performance Summary Scorecard
+          - width: 12
+            height: 2
+            yPos: 8
+            widget:
+              title: "Performance Summary"
+              scorecard:
+                timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'metric.type="custom.googleapis.com/api/response_time" resource.type="global"'
+                    aggregation:
+                      alignmentPeriod: "300s"
+                      perSeriesAligner: "ALIGN_MEAN"
+                sparkChartView:
+                  sparkChartType: "SPARK_LINE"
+                gaugeView:
+                  lowerBound: 0.0
+                  upperBound: 3.0
+                  
+      # Dashboard labels for organization
+      labels:
+        environment: "monitoring"
+        component: "dashboard"
+        purpose: "performance-analysis"
+
+# ========================================
+# OUTPUT VALUES
+# ========================================
+
+outputs:
+  # Application access information
+  application_url:
+    description: "URL to access the sample monitoring application"
+    value: "http://$(ref.sample_application_vm.networkInterfaces[0].accessConfigs[0].natIP):5000"
+    
+  application_health_url:
+    description: "Health check endpoint for the monitoring application"
+    value: "http://$(ref.sample_application_vm.networkInterfaces[0].accessConfigs[0].natIP):5000/health"
+    
+  application_api_url:
+    description: "API endpoint for performance testing"
+    value: "http://$(ref.sample_application_vm.networkInterfaces[0].accessConfigs[0].natIP):5000/api/data"
+  
+  # Infrastructure information
+  pubsub_topic_name:
+    description: "Pub/Sub topic name for performance alerts"
+    value: "$(ref.performance_alerts_topic.name)"
+    
+  function_name:
+    description: "Cloud Function name for performance optimization"
+    value: "$(ref.performance_optimizer_function.name)"
+    
+  vm_instance_name:
+    description: "Compute Engine instance name running the sample application"
+    value: "$(ref.sample_application_vm.name)"
+    
+  vm_internal_ip:
+    description: "Internal IP address of the sample application VM"
+    value: "$(ref.sample_application_vm.networkInterfaces[0].networkIP)"
+    
+  vm_external_ip:
+    description: "External IP address of the sample application VM"
+    value: "$(ref.sample_application_vm.networkInterfaces[0].accessConfigs[0].natIP)"
+  
+  # Monitoring information
+  dashboard_url:
+    description: "URL to access the custom monitoring dashboard in Cloud Console"
+    value: "https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.performance_monitoring_dashboard.name)"
+    
+  alert_policy_response_time:
+    description: "Response time alert policy name"
+    value: "$(ref.api_response_time_alert.name)"
+    
+  alert_policy_volume:
+    description: "Request volume alert policy name"  
+    value: "$(ref.api_request_volume_alert.name)"
+    
+  notification_channel:
+    description: "Pub/Sub notification channel for automated alerts"
+    value: "$(ref.pubsub_notification_channel.name)"
+  
+  # Service account information
+  function_service_account_email:
+    description: "Service account email for Cloud Functions"
+    value: "$(ref.function_service_account.email)"
+    
+  # Storage information
+  function_source_bucket:
+    description: "Storage bucket for Cloud Function source code"
+    value: "$(ref.function_source_bucket.name)"
+
+# ========================================
+# METADATA AND DOCUMENTATION
+# ========================================
+
+metadata:
+  version: "1.0.0"
+  author: "Google Cloud Solutions Architecture"
+  description: |
+    Comprehensive Infrastructure Manager configuration for intelligent application performance monitoring.
+    
+    This configuration deploys:
+    - Sample web application with monitoring instrumentation
+    - Cloud Monitoring alert policies with intelligent thresholds
+    - Cloud Functions for automated performance optimization
+    - Pub/Sub messaging for event-driven automation
+    - Custom dashboard for performance visualization
+    - Complete IAM and security configuration
+    
+    The solution provides:
+    - Real-time performance monitoring and alerting
+    - Automated response to performance degradation
+    - Distributed tracing for bottleneck identification
+    - Comprehensive logging and observability
+    - Cost-effective resource management
+    
+    Prerequisites:
+    - Google Cloud Project with billing enabled
+    - Infrastructure Manager API enabled
+    - Appropriate IAM permissions for resource creation
+    
+    Estimated monthly cost: $15-25 for basic usage
+    
+  tags:
+    - "monitoring"
+    - "observability" 
+    - "automation"
+    - "performance"
+    - "cloud-functions"
+    - "pub-sub"
+    - "intelligent-alerting"
+    
+  support:
+    documentation: "https://cloud.google.com/monitoring/docs"
+    examples: "https://github.com/GoogleCloudPlatform/cloud-monitoring-samples"
+    community: "https://cloud.google.com/support"

@@ -1,0 +1,439 @@
+# Infrastructure Manager configuration for HPC workloads with Cloud Filestore and Cloud Batch
+# This configuration creates a complete HPC environment with:
+# - VPC network for secure communication
+# - Cloud Filestore for high-performance shared storage
+# - Cloud Batch jobs for scalable compute workloads
+# - Auto-scaling instance groups for dynamic resource provisioning
+# - Cloud Monitoring for observability and performance tracking
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hpc-filestore-batch-config
+  annotations:
+    cnrm.cloud.google.com/blueprint: 'kpt-pkg'
+    
+data:
+  # Configuration values that can be customized for different deployments
+  project_id: "${PROJECT_ID}"
+  region: "us-central1"
+  zone: "us-central1-a"
+  vpc_name: "hpc-network"
+  subnet_name: "hpc-subnet"
+  filestore_name: "hpc-storage"
+  filestore_capacity: "2560"  # GB
+  filestore_tier: "ENTERPRISE"
+  batch_job_name: "hpc-simulation"
+  monitoring_workspace_name: "HPC Monitoring Workspace"
+
+---
+# VPC Network for HPC infrastructure
+# Provides secure, high-performance networking for compute nodes and storage
+apiVersion: compute.cnrm.cloud.google.com/v1beta1
+kind: ComputeNetwork
+metadata:
+  name: hpc-network
+  annotations:
+    cnrm.cloud.google.com/project-id: "${PROJECT_ID}"
+spec:
+  description: "VPC network for HPC workloads with Cloud Filestore and Batch"
+  routingMode: "REGIONAL"
+  autoCreateSubnetworks: false
+
+---
+# Subnet for HPC compute nodes and storage
+# Configured with sufficient IP range for scaling compute resources
+apiVersion: compute.cnrm.cloud.google.com/v1beta1
+kind: ComputeSubnetwork
+metadata:
+  name: hpc-subnet
+  annotations:
+    cnrm.cloud.google.com/project-id: "${PROJECT_ID}"
+spec:
+  description: "Subnet for HPC compute nodes with access to shared storage"
+  ipCidrRange: "10.0.0.0/16"
+  region: "us-central1"
+  networkRef:
+    name: hpc-network
+  enableFlowLogs: true
+  logConfig:
+    aggregationInterval: "INTERVAL_10_MIN"
+    flowSampling: 0.5
+    metadata: "INCLUDE_ALL_METADATA"
+
+---
+# Firewall rule for internal communication
+# Allows secure communication between compute nodes and storage systems
+apiVersion: compute.cnrm.cloud.google.com/v1beta1
+kind: ComputeFirewall
+metadata:
+  name: hpc-network-allow-internal
+  annotations:
+    cnrm.cloud.google.com/project-id: "${PROJECT_ID}"
+spec:
+  description: "Allow internal communication for HPC workloads"
+  direction: "INGRESS"
+  networkRef:
+    name: hpc-network
+  sourceRanges:
+    - "10.0.0.0/16"
+  allow:
+    - protocol: "tcp"
+    - protocol: "udp"
+    - protocol: "icmp"
+
+---
+# Firewall rule for SSH access (for debugging and management)
+# Allows secure SSH access to compute nodes for troubleshooting
+apiVersion: compute.cnrm.cloud.google.com/v1beta1
+kind: ComputeFirewall
+metadata:
+  name: hpc-network-allow-ssh
+  annotations:
+    cnrm.cloud.google.com/project-id: "${PROJECT_ID}"
+spec:
+  description: "Allow SSH access for HPC node management"
+  direction: "INGRESS"
+  networkRef:
+    name: hpc-network
+  sourceRanges:
+    - "0.0.0.0/0"  # Restrict this in production to specific IP ranges
+  allow:
+    - protocol: "tcp"
+      ports: ["22"]
+  targetTags: ["hpc-compute-node"]
+
+---
+# Cloud Filestore instance for high-performance shared storage
+# Enterprise tier provides optimal performance for HPC workloads
+apiVersion: filestore.cnrm.cloud.google.com/v1beta1
+kind: FilestoreInstance
+metadata:
+  name: hpc-storage
+  annotations:
+    cnrm.cloud.google.com/project-id: "${PROJECT_ID}"
+spec:
+  description: "High-performance NFS storage for HPC workloads"
+  location: "us-central1-a"
+  tier: "ENTERPRISE"
+  fileShares:
+    - name: "hpc_data"
+      capacityGb: 2560
+  networks:
+    - networkRef:
+        name: hpc-network
+      modes: ["MODE_IPV4"]
+
+---
+# Instance template for HPC compute nodes
+# Pre-configured with NFS client and Filestore mounting
+apiVersion: compute.cnrm.cloud.google.com/v1beta1
+kind: ComputeInstanceTemplate
+metadata:
+  name: hpc-node-template
+  annotations:
+    cnrm.cloud.google.com/project-id: "${PROJECT_ID}"
+spec:
+  description: "Instance template for HPC compute nodes with NFS mounting"
+  machineType: "e2-standard-4"
+  tags: ["hpc-compute-node"]
+  disk:
+    - sourceImageRef:
+        external: "projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts"
+      autoDelete: true
+      boot: true
+      diskType: "pd-standard"
+      diskSizeGb: 50
+  networkInterface:
+    - subnetworkRef:
+        name: hpc-subnet
+      accessConfig:
+        - type: "ONE_TO_ONE_NAT"
+  metadata:
+    startup-script: |
+      #!/bin/bash
+      # Install NFS client for Cloud Filestore mounting
+      apt-get update
+      apt-get install -y nfs-common
+      
+      # Create mount point for shared storage
+      mkdir -p /mnt/hpc_data
+      
+      # Wait for Filestore instance to be ready and get IP
+      FILESTORE_IP=$(gcloud filestore instances describe hpc-storage \
+        --location=us-central1-a \
+        --format="value(networks[0].ipAddresses[0])" 2>/dev/null || echo "")
+      
+      # Mount Filestore if IP is available
+      if [ ! -z "$FILESTORE_IP" ]; then
+        mount -t nfs ${FILESTORE_IP}:/hpc_data /mnt/hpc_data
+        echo "${FILESTORE_IP}:/hpc_data /mnt/hpc_data nfs defaults 0 0" >> /etc/fstab
+        
+        # Create results directory
+        mkdir -p /mnt/hpc_data/results
+        chmod 755 /mnt/hpc_data/results
+      fi
+      
+      # Install additional HPC tools (customize as needed)
+      apt-get install -y python3 python3-pip htop
+      
+      # Log startup completion
+      echo "HPC node startup completed at $(date)" >> /var/log/hpc-startup.log
+  serviceAccount:
+    - email: "default"
+      scopes:
+        - "https://www.googleapis.com/auth/cloud-platform"
+
+---
+# Managed instance group for auto-scaling compute nodes
+# Provides dynamic scaling based on workload demands
+apiVersion: compute.cnrm.cloud.google.com/v1beta1
+kind: ComputeInstanceGroupManager
+metadata:
+  name: hpc-compute-group
+  annotations:
+    cnrm.cloud.google.com/project-id: "${PROJECT_ID}"
+spec:
+  description: "Managed instance group for HPC compute nodes"
+  zone: "us-central1-a"
+  baseInstanceName: "hpc-node"
+  instanceTemplateRef:
+    name: hpc-node-template
+  targetSize: 0  # Start with 0 instances, scale based on demand
+
+---
+# Autoscaler for dynamic compute resource provisioning
+# Automatically scales compute nodes based on CPU utilization
+apiVersion: compute.cnrm.cloud.google.com/v1beta1
+kind: ComputeAutoscaler
+metadata:
+  name: hpc-compute-autoscaler
+  annotations:
+    cnrm.cloud.google.com/project-id: "${PROJECT_ID}"
+spec:
+  description: "Autoscaler for HPC compute nodes based on utilization"
+  zone: "us-central1-a"
+  targetRef:
+    name: hpc-compute-group
+  autoscalingPolicy:
+    minReplicas: 0
+    maxReplicas: 10
+    cpuUtilization:
+      target: 0.7
+    coolDownPeriodSec: 300
+    scaleInControl:
+      maxScaledInReplicas:
+        fixed: 2
+      timeWindowSec: 300
+
+---
+# Service account for Cloud Batch jobs
+# Provides necessary permissions for job execution and resource access
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMServiceAccount
+metadata:
+  name: hpc-batch-service-account
+  annotations:
+    cnrm.cloud.google.com/project-id: "${PROJECT_ID}"
+spec:
+  description: "Service account for HPC Cloud Batch jobs"
+  displayName: "HPC Batch Service Account"
+
+---
+# IAM policy binding for Batch service account
+# Grants necessary permissions for compute and storage access
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: hpc-batch-compute-admin
+  annotations:
+    cnrm.cloud.google.com/project-id: "${PROJECT_ID}"
+spec:
+  member: "serviceAccount:hpc-batch-service-account@${PROJECT_ID}.iam.gserviceaccount.com"
+  role: "roles/compute.instanceAdmin.v1"
+  resourceRef:
+    apiVersion: resourcemanager.cnrm.cloud.google.com/v1beta1
+    kind: Project
+    external: "projects/${PROJECT_ID}"
+
+---
+# Additional IAM binding for Batch operations
+apiVersion: iam.cnrm.cloud.google.com/v1beta1
+kind: IAMPolicyMember
+metadata:
+  name: hpc-batch-editor
+  annotations:
+    cnrm.cloud.google.com/project-id: "${PROJECT_ID}"
+spec:
+  member: "serviceAccount:hpc-batch-service-account@${PROJECT_ID}.iam.gserviceaccount.com"
+  role: "roles/batch.jobsEditor"
+  resourceRef:
+    apiVersion: resourcemanager.cnrm.cloud.google.com/v1beta1
+    kind: Project
+    external: "projects/${PROJECT_ID}"
+
+---
+# Cloud Monitoring workspace for HPC observability
+# Provides comprehensive monitoring for performance optimization
+apiVersion: monitoring.cnrm.cloud.google.com/v1beta1
+kind: MonitoringDashboard
+metadata:
+  name: hpc-performance-dashboard
+  annotations:
+    cnrm.cloud.google.com/project-id: "${PROJECT_ID}"
+spec:
+  displayName: "HPC Performance Dashboard"
+  mosaicLayout:
+    tiles:
+      - width: 6
+        height: 4
+        widget:
+          title: "Filestore IOPS"
+          xyChart:
+            dataSets:
+              - timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'resource.type="filestore_instance"'
+                    aggregation:
+                      alignmentPeriod: "60s"
+                      perSeriesAligner: "ALIGN_RATE"
+                      crossSeriesReducer: "REDUCE_SUM"
+                plotType: "LINE"
+      - width: 6
+        height: 4
+        xPos: 6
+        widget:
+          title: "Batch Job Status"
+          xyChart:
+            dataSets:
+              - timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'resource.type="batch_job"'
+                    aggregation:
+                      alignmentPeriod: "300s"
+                      perSeriesAligner: "ALIGN_COUNT"
+                      crossSeriesReducer: "REDUCE_SUM"
+                plotType: "STACKED_BAR"
+      - width: 12
+        height: 4
+        yPos: 4
+        widget:
+          title: "Compute Instance CPU Utilization"
+          xyChart:
+            dataSets:
+              - timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'resource.type="gce_instance" AND metric.type="compute.googleapis.com/instance/cpu/utilization"'
+                    aggregation:
+                      alignmentPeriod: "60s"
+                      perSeriesAligner: "ALIGN_MEAN"
+                      crossSeriesReducer: "REDUCE_MEAN"
+                      groupByFields: ["resource.label.instance_name"]
+                plotType: "LINE"
+
+---
+# Alert policy for failed batch jobs
+# Provides proactive monitoring and notification for job failures
+apiVersion: monitoring.cnrm.cloud.google.com/v1beta1
+kind: MonitoringAlertPolicy
+metadata:
+  name: hpc-job-failure-alert
+  annotations:
+    cnrm.cloud.google.com/project-id: "${PROJECT_ID}"
+spec:
+  displayName: "HPC Batch Job Failure Alert"
+  documentation:
+    content: "Alert triggered when HPC batch jobs fail"
+    mimeType: "text/markdown"
+  enabled: true
+  conditions:
+    - displayName: "Batch job failure condition"
+      conditionThreshold:
+        filter: 'resource.type="batch_job" AND metric.type="batch.googleapis.com/job/failed_task_count"'
+        comparison: "COMPARISON_GT"
+        thresholdValue: 0
+        duration: "60s"
+        aggregations:
+          - alignmentPeriod: "60s"
+            perSeriesAligner: "ALIGN_RATE"
+            crossSeriesReducer: "REDUCE_SUM"
+  combiner: "OR"
+
+---
+# Alert policy for high Filestore latency
+# Monitors storage performance for optimization opportunities
+apiVersion: monitoring.cnrm.cloud.google.com/v1beta1
+kind: MonitoringAlertPolicy
+metadata:
+  name: hpc-filestore-latency-alert
+  annotations:
+    cnrm.cloud.google.com/project-id: "${PROJECT_ID}"
+spec:
+  displayName: "HPC Filestore High Latency Alert"
+  documentation:
+    content: "Alert triggered when Filestore latency exceeds acceptable thresholds"
+    mimeType: "text/markdown"
+  enabled: true
+  conditions:
+    - displayName: "High Filestore latency condition"
+      conditionThreshold:
+        filter: 'resource.type="filestore_instance" AND metric.type="file.googleapis.com/nfs/server/read_latencies"'
+        comparison: "COMPARISON_GT"
+        thresholdValue: 10.0  # milliseconds
+        duration: "300s"
+        aggregations:
+          - alignmentPeriod: "60s"
+            perSeriesAligner: "ALIGN_MEAN"
+            crossSeriesReducer: "REDUCE_MEAN"
+  combiner: "OR"
+
+---
+# Log-based metric for job completion tracking
+# Enables custom metrics for HPC job performance analysis
+apiVersion: logging.cnrm.cloud.google.com/v1beta1
+kind: LoggingMetric
+metadata:
+  name: hpc-job-completion-rate
+  annotations:
+    cnrm.cloud.google.com/project-id: "${PROJECT_ID}"
+spec:
+  description: "Metric tracking HPC job completion rates"
+  filter: 'resource.type="batch_job" AND textPayload:"HPC job finished"'
+  metricDescriptor:
+    metricKind: "COUNTER"
+    valueType: "INT64"
+    displayName: "HPC Job Completion Rate"
+  labelExtractors:
+    job_name: 'EXTRACT(textPayload, "Job ID: (\\w+)")'
+
+---
+# Budget alert for cost monitoring
+# Helps control HPC infrastructure costs and optimize resource allocation
+apiVersion: billing.cnrm.cloud.google.com/v1beta1
+kind: BillingBudget
+metadata:
+  name: hpc-infrastructure-budget
+  annotations:
+    cnrm.cloud.google.com/project-id: "${PROJECT_ID}"
+spec:
+  billingAccount: "${BILLING_ACCOUNT_ID}"  # Replace with actual billing account ID
+  displayName: "HPC Infrastructure Budget"
+  budgetFilter:
+    projects: ["projects/${PROJECT_ID}"]
+    services: 
+      - "services/95FF2659-6EA5-4B8C-9567-28513F84C3B8"  # Compute Engine
+      - "services/F2DA2C52-5B87-4D08-8C9E-88C2B0D88C36"  # Cloud Filestore
+      - "services/A1E8782A-9943-4D25-9BC2-C4B2E5857B4E"  # Cloud Batch
+  amount:
+    specifiedAmount:
+      currencyCode: "USD"
+      units: "500"  # $500 monthly budget
+  thresholdRules:
+    - thresholdPercent: 0.5
+      spendBasis: "CURRENT_SPEND"
+    - thresholdPercent: 0.8
+      spendBasis: "CURRENT_SPEND"
+    - thresholdPercent: 1.0
+      spendBasis: "CURRENT_SPEND"
+  allUpdatesRule:
+    enableProjectLevelRecipients: true

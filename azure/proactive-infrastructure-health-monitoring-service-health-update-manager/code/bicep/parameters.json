@@ -1,0 +1,206 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "value": "eastus"
+    },
+    "resourcePrefix": {
+      "value": "health-monitor"
+    },
+    "environment": {
+      "value": "production"
+    },
+    "alertEmail": {
+      "value": "admin@company.com"
+    },
+    "logAnalyticsSkuName": {
+      "value": "PerGB2018"
+    },
+    "logicAppDefinition": {
+      "value": {
+        "$schema": "https://schema.management.azure.com/schemas/2016-06-01/workflowdefinition.json#",
+        "contentVersion": "1.0.0.0",
+        "parameters": {
+          "automationWebhookUrl": {
+            "type": "string",
+            "defaultValue": ""
+          }
+        },
+        "triggers": {
+          "service_health_webhook": {
+            "type": "Request",
+            "kind": "Http",
+            "inputs": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "schemaId": {
+                    "type": "string"
+                  },
+                  "data": {
+                    "type": "object",
+                    "properties": {
+                      "status": {
+                        "type": "string"
+                      },
+                      "context": {
+                        "type": "object"
+                      },
+                      "properties": {
+                        "type": "object"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "actions": {
+          "parse_service_health": {
+            "type": "ParseJson",
+            "inputs": {
+              "content": "@triggerBody()",
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "schemaId": {
+                    "type": "string"
+                  },
+                  "data": {
+                    "type": "object",
+                    "properties": {
+                      "status": {
+                        "type": "string"
+                      },
+                      "context": {
+                        "type": "object"
+                      },
+                      "properties": {
+                        "type": "object"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "check_patch_compliance": {
+            "type": "Http",
+            "inputs": {
+              "method": "GET",
+              "uri": "https://management.azure.com/subscriptions/@{subscription().subscriptionId}/providers/Microsoft.Maintenance/updates?api-version=2021-09-01-preview",
+              "authentication": {
+                "type": "ManagedServiceIdentity"
+              }
+            },
+            "runAfter": {
+              "parse_service_health": [
+                "Succeeded"
+              ]
+            }
+          },
+          "evaluate_remediation_need": {
+            "type": "Condition",
+            "expression": {
+              "and": [
+                {
+                  "greater": [
+                    "@length(body('check_patch_compliance')?.value)",
+                    0
+                  ]
+                },
+                {
+                  "equals": [
+                    "@body('parse_service_health')?.data?.status",
+                    "Active"
+                  ]
+                }
+              ]
+            },
+            "actions": {
+              "trigger_remediation": {
+                "type": "Http",
+                "inputs": {
+                  "method": "POST",
+                  "uri": "@parameters('automationWebhookUrl')",
+                  "body": {
+                    "serviceHealthEvent": "@body('parse_service_health')",
+                    "patchCompliance": "@body('check_patch_compliance')",
+                    "correlationId": "@workflow().run.name",
+                    "timestamp": "@utcnow()"
+                  }
+                }
+              },
+              "log_remediation_trigger": {
+                "type": "Http",
+                "inputs": {
+                  "method": "POST",
+                  "uri": "https://management.azure.com/subscriptions/@{subscription().subscriptionId}/resourceGroups/@{resourceGroup().name}/providers/Microsoft.OperationalInsights/workspaces/@{parameters('logAnalyticsWorkspaceName')}/api/logs?api-version=2020-08-01",
+                  "authentication": {
+                    "type": "ManagedServiceIdentity"
+                  },
+                  "body": [
+                    {
+                      "TimeGenerated": "@utcnow()",
+                      "CorrelationId": "@workflow().run.name",
+                      "ServiceHealthEvent": "@body('parse_service_health')",
+                      "PatchComplianceStatus": "@body('check_patch_compliance')",
+                      "RemediationTriggered": true,
+                      "EventType": "ProactiveRemediation"
+                    }
+                  ],
+                  "headers": {
+                    "Log-Type": "HealthMonitoring"
+                  }
+                }
+              }
+            },
+            "else": {
+              "actions": {
+                "log_no_remediation_needed": {
+                  "type": "Http",
+                  "inputs": {
+                    "method": "POST",
+                    "uri": "https://management.azure.com/subscriptions/@{subscription().subscriptionId}/resourceGroups/@{resourceGroup().name}/providers/Microsoft.OperationalInsights/workspaces/@{parameters('logAnalyticsWorkspaceName')}/api/logs?api-version=2020-08-01",
+                    "authentication": {
+                      "type": "ManagedServiceIdentity"
+                    },
+                    "body": [
+                      {
+                        "TimeGenerated": "@utcnow()",
+                        "CorrelationId": "@workflow().run.name",
+                        "ServiceHealthEvent": "@body('parse_service_health')",
+                        "PatchComplianceStatus": "@body('check_patch_compliance')",
+                        "RemediationTriggered": false,
+                        "EventType": "HealthMonitoring"
+                      }
+                    ],
+                    "headers": {
+                      "Log-Type": "HealthMonitoring"
+                    }
+                  }
+                }
+              }
+            },
+            "runAfter": {
+              "check_patch_compliance": [
+                "Succeeded"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "maintenanceStartDateTime": {
+      "value": "2025-01-15T02:00:00Z"
+    },
+    "maintenanceDurationHours": {
+      "value": 4
+    },
+    "maintenanceRecurrence": {
+      "value": "Weekly"
+    }
+  }
+}

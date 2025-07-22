@@ -1,0 +1,772 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Blockchain-Based Supply Chain Tracking System using Amazon Managed Blockchain, IoT Core, Lambda, and EventBridge'
+
+# Parameters section for customization
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'supply-chain-tracking'
+    Description: 'Name prefix for all resources'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+
+  BlockchainNetworkName:
+    Type: String
+    Default: 'supply-chain-network'
+    Description: 'Name for the Hyperledger Fabric blockchain network'
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+
+  BlockchainMemberName:
+    Type: String
+    Default: 'manufacturer-member'
+    Description: 'Name for the initial blockchain network member'
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+
+  BlockchainAdminPassword:
+    Type: String
+    Default: 'TempPassword123!'
+    Description: 'Password for blockchain network admin user'
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 32
+    AllowedPattern: '^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]+$'
+    ConstraintDescription: 'Must contain uppercase, lowercase, number and special character'
+
+  BlockchainEdition:
+    Type: String
+    Default: 'STARTER'
+    AllowedValues: ['STARTER', 'STANDARD']
+    Description: 'Amazon Managed Blockchain network edition'
+
+  InstanceType:
+    Type: String
+    Default: 'bc.t3.small'
+    AllowedValues: 
+      - 'bc.t3.small'
+      - 'bc.t3.medium'
+      - 'bc.t3.large'
+      - 'bc.m5.large'
+      - 'bc.m5.xlarge'
+    Description: 'Instance type for blockchain peer nodes'
+
+  Environment:
+    Type: String
+    Default: 'development'
+    AllowedValues: ['development', 'staging', 'production']
+    Description: 'Environment type for resource tagging and configuration'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for supply chain notifications'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+# Conditions for conditional resource creation
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'production']
+  IsStandardEdition: !Equals [!Ref BlockchainEdition, 'STANDARD']
+
+# Resources section
+Resources:
+  # S3 Bucket for chaincode and data storage
+  SupplyChainDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-data-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3LogGroup
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Blockchain supply chain data storage'
+
+  # CloudWatch Log Group for S3 events
+  S3LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-bucket-logs'
+      RetentionInDays: !If [IsProduction, 365, 30]
+
+  # DynamoDB table for supply chain metadata
+  SupplyChainMetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-metadata'
+      AttributeDefinitions:
+        - AttributeName: ProductId
+          AttributeType: S
+        - AttributeName: Timestamp
+          AttributeType: N
+        - AttributeName: Location
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ProductId
+          KeyType: HASH
+        - AttributeName: Timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: LocationIndex
+          KeySchema:
+            - AttributeName: Location
+              KeyType: HASH
+            - AttributeName: Timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !If [IsProduction, 10, 5]
+            WriteCapacityUnits: !If [IsProduction, 10, 5]
+      ProvisionedThroughput:
+        ReadCapacityUnits: !If [IsProduction, 10, 5]
+        WriteCapacityUnits: !If [IsProduction, 10, 5]
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Supply chain metadata storage'
+
+  # Amazon Managed Blockchain Network
+  BlockchainNetwork:
+    Type: AWS::ManagedBlockchain::Network
+    Properties:
+      Name: !Ref BlockchainNetworkName
+      Description: 'Blockchain network for supply chain tracking with immutable audit trails'
+      Framework: HYPERLEDGER_FABRIC
+      FrameworkVersion: '2.2'
+      FrameworkConfiguration:
+        NetworkFabricConfiguration:
+          Edition: !Ref BlockchainEdition
+      VotingPolicy:
+        ApprovalThresholdPolicy:
+          ThresholdPercentage: 50
+          ProposalDurationInHours: 24
+          ThresholdComparator: GREATER_THAN
+      MemberConfiguration:
+        Name: !Ref BlockchainMemberName
+        Description: 'Initial manufacturer member of the supply chain network'
+        MemberFabricConfiguration:
+          AdminUsername: 'admin'
+          AdminPassword: !Ref BlockchainAdminPassword
+
+  # Blockchain Network Member (created as part of network)
+  BlockchainMember:
+    Type: AWS::ManagedBlockchain::Member
+    Properties:
+      NetworkId: !Ref BlockchainNetwork
+      MemberConfiguration:
+        Name: !Sub '${BlockchainMemberName}-additional'
+        Description: 'Additional member for supply chain network'
+        MemberFabricConfiguration:
+          AdminUsername: 'admin'
+          AdminPassword: !Ref BlockchainAdminPassword
+
+  # Blockchain Peer Node
+  BlockchainPeerNode:
+    Type: AWS::ManagedBlockchain::Node
+    Properties:
+      NetworkId: !Ref BlockchainNetwork
+      MemberId: !GetAtt BlockchainNetwork.MemberId
+      NodeConfiguration:
+        InstanceType: !Ref InstanceType
+        AvailabilityZone: !Sub '${AWS::Region}a'
+
+  # IAM Role for Lambda execution
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SupplyChainLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: 
+                  - !GetAtt SupplyChainMetadataTable.Arn
+                  - !Sub '${SupplyChainMetadataTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default'
+              - Effect: Allow
+                Action:
+                  - managedblockchain:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${SupplyChainDataBucket}/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda function for processing sensor data
+  ProcessSupplyChainDataFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-process-sensor-data'
+      Description: 'Processes IoT sensor data and updates blockchain records'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref SupplyChainMetadataTable
+          BLOCKCHAIN_NETWORK_ID: !Ref BlockchainNetwork
+          BLOCKCHAIN_MEMBER_ID: !GetAtt BlockchainNetwork.MemberId
+          S3_BUCKET: !Ref SupplyChainDataBucket
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          const eventbridge = new AWS.EventBridge();
+          const s3 = new AWS.S3();
+          
+          exports.handler = async (event) => {
+              console.log('Processing sensor data:', JSON.stringify(event, null, 2));
+              
+              try {
+                  // Extract sensor data from event
+                  const sensorData = {
+                      productId: event.productId || `PROD-${Date.now()}`,
+                      location: event.location || 'Unknown',
+                      temperature: event.temperature || 0,
+                      humidity: event.humidity || 0,
+                      timestamp: event.timestamp || Date.now()
+                  };
+                  
+                  // Validate sensor data
+                  if (!sensorData.productId) {
+                      throw new Error('Product ID is required');
+                  }
+                  
+                  // Store metadata in DynamoDB
+                  await dynamodb.put({
+                      TableName: process.env.DYNAMODB_TABLE,
+                      Item: {
+                          ProductId: sensorData.productId,
+                          Timestamp: sensorData.timestamp,
+                          Location: sensorData.location,
+                          SensorData: {
+                              temperature: sensorData.temperature,
+                              humidity: sensorData.humidity
+                          },
+                          ProcessedAt: new Date().toISOString(),
+                          TTL: Math.floor(Date.now() / 1000) + (365 * 24 * 60 * 60) // 1 year TTL
+                      }
+                  }).promise();
+                  
+                  // Send event to EventBridge for further processing
+                  await eventbridge.putEvents({
+                      Entries: [{
+                          Source: 'supply-chain.sensor',
+                          DetailType: 'Product Location Update',
+                          Detail: JSON.stringify(sensorData),
+                          EventBusName: 'default'
+                      }]
+                  }).promise();
+                  
+                  // Store raw sensor data in S3 for analytics
+                  const s3Key = `sensor-data/${sensorData.productId}/${new Date().toISOString()}.json`;
+                  await s3.putObject({
+                      Bucket: process.env.S3_BUCKET,
+                      Key: s3Key,
+                      Body: JSON.stringify(event),
+                      ContentType: 'application/json',
+                      ServerSideEncryption: 'AES256'
+                  }).promise();
+                  
+                  console.log(`Successfully processed sensor data for product ${sensorData.productId}`);
+                  
+                  return {
+                      statusCode: 200,
+                      body: JSON.stringify({
+                          message: 'Sensor data processed successfully',
+                          productId: sensorData.productId,
+                          timestamp: sensorData.timestamp,
+                          s3Key: s3Key
+                      })
+                  };
+                  
+              } catch (error) {
+                  console.error('Error processing sensor data:', error);
+                  throw error;
+              }
+          };
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'IoT sensor data processing'
+
+  # Lambda function log group
+  ProcessSupplyChainDataLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProcessSupplyChainDataFunction}'
+      RetentionInDays: !If [IsProduction, 365, 30]
+
+  # IoT Core resources
+  IoTPolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-iot-policy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - iot:Publish
+              - iot:Subscribe
+              - iot:Connect
+              - iot:Receive
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - iot:GetThingShadow
+              - iot:UpdateThingShadow
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:thing/${ProjectName}-*'
+
+  # IoT Thing Type for supply chain trackers
+  IoTThingType:
+    Type: AWS::IoT::ThingType
+    Properties:
+      ThingTypeName: !Sub '${ProjectName}-tracker'
+      ThingTypeDescription: 'Supply chain tracking device type'
+      ThingTypeProperties:
+        Description: 'IoT devices for tracking products through supply chain'
+
+  # IoT Topic Rule for processing sensor data
+  IoTTopicRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub '${ProjectName}SensorRule'
+      TopicRulePayload:
+        Sql: !Sub 'SELECT * FROM "supply-chain/sensor-data"'
+        Description: 'Route supply chain sensor data to Lambda for processing'
+        RuleDisabled: false
+        Actions:
+          - Lambda:
+              FunctionArn: !GetAtt ProcessSupplyChainDataFunction.Arn
+
+  # Permission for IoT to invoke Lambda
+  IoTLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProcessSupplyChainDataFunction
+      Action: lambda:InvokeFunction
+      Principal: iot.amazonaws.com
+      SourceArn: !GetAtt IoTTopicRule.Arn
+
+  # SNS Topic for notifications
+  SupplyChainNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-notifications'
+      DisplayName: 'Supply Chain Tracking Notifications'
+      KmsMasterKeyId: alias/aws/sns
+
+  # SNS Subscription for email notifications
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref SupplyChainNotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # EventBridge Rule for supply chain events
+  SupplyChainEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-tracking-rule'
+      Description: 'Route supply chain tracking events to appropriate targets'
+      EventPattern:
+        source:
+          - 'supply-chain.sensor'
+        detail-type:
+          - 'Product Location Update'
+      State: ENABLED
+      Targets:
+        - Arn: !Ref SupplyChainNotificationTopic
+          Id: 'SNSTarget'
+        - Arn: !GetAtt AnalyticsLambdaFunction.Arn
+          Id: 'AnalyticsTarget'
+
+  # Permission for EventBridge to publish to SNS
+  EventBridgeSNSPermission:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref SupplyChainNotificationTopic
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref SupplyChainNotificationTopic
+
+  # Additional Lambda function for analytics processing
+  AnalyticsLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-analytics-processor'
+      Description: 'Processes supply chain events for analytics and reporting'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref SupplyChainMetadataTable
+          S3_BUCKET: !Ref SupplyChainDataBucket
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          const s3 = new AWS.S3();
+          
+          exports.handler = async (event) => {
+              console.log('Processing analytics event:', JSON.stringify(event, null, 2));
+              
+              try {
+                  const detail = event.detail;
+                  
+                  // Perform analytics calculations
+                  const analytics = {
+                      productId: detail.productId,
+                      location: detail.location,
+                      temperature: detail.temperature,
+                      humidity: detail.humidity,
+                      processedAt: new Date().toISOString(),
+                      // Add analytics calculations here
+                      temperatureStatus: detail.temperature > 25 ? 'HIGH' : 'NORMAL',
+                      humidityStatus: detail.humidity > 60 ? 'HIGH' : 'NORMAL'
+                  };
+                  
+                  // Store analytics results in S3
+                  const analyticsKey = `analytics/${detail.productId}/${Date.now()}.json`;
+                  await s3.putObject({
+                      Bucket: process.env.S3_BUCKET,
+                      Key: analyticsKey,
+                      Body: JSON.stringify(analytics),
+                      ContentType: 'application/json',
+                      ServerSideEncryption: 'AES256'
+                  }).promise();
+                  
+                  console.log('Analytics processing completed');
+                  
+                  return {
+                      statusCode: 200,
+                      body: JSON.stringify({
+                          message: 'Analytics processed successfully',
+                          analyticsKey: analyticsKey
+                      })
+                  };
+                  
+              } catch (error) {
+                  console.error('Error processing analytics:', error);
+                  throw error;
+              }
+          };
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Permission for EventBridge to invoke analytics Lambda
+  EventBridgeAnalyticsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AnalyticsLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SupplyChainEventRule.Arn
+
+  # CloudWatch Dashboard for monitoring
+  SupplyChainDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${ProcessSupplyChainDataFunction}"],
+                  [".", "Errors", ".", "."],
+                  [".", "Duration", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${SupplyChainMetadataTable}"],
+                  [".", "ConsumedWriteCapacityUnits", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "DynamoDB Capacity Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Events", "MatchedEvents", "RuleName", "${SupplyChainEventRule}"]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "EventBridge Rule Matches",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms for monitoring
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors'
+      AlarmDescription: 'Alert when Lambda function errors occur'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProcessSupplyChainDataFunction
+      AlarmActions:
+        - !Ref SupplyChainNotificationTopic
+
+  DynamoDBThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-dynamodb-throttles'
+      AlarmDescription: 'Alert when DynamoDB throttling occurs'
+      MetricName: ThrottledRequests
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref SupplyChainMetadataTable
+      AlarmActions:
+        - !Ref SupplyChainNotificationTopic
+
+# Outputs section
+Outputs:
+  BlockchainNetworkId:
+    Description: 'ID of the Amazon Managed Blockchain network'
+    Value: !Ref BlockchainNetwork
+    Export:
+      Name: !Sub '${AWS::StackName}-BlockchainNetworkId'
+
+  BlockchainMemberId:
+    Description: 'ID of the blockchain network member'
+    Value: !GetAtt BlockchainNetwork.MemberId
+    Export:
+      Name: !Sub '${AWS::StackName}-BlockchainMemberId'
+
+  BlockchainPeerNodeId:
+    Description: 'ID of the blockchain peer node'
+    Value: !Ref BlockchainPeerNode
+    Export:
+      Name: !Sub '${AWS::StackName}-BlockchainPeerNodeId'
+
+  S3BucketName:
+    Description: 'Name of the S3 bucket for data storage'
+    Value: !Ref SupplyChainDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketName'
+
+  DynamoDBTableName:
+    Description: 'Name of the DynamoDB table for metadata'
+    Value: !Ref SupplyChainMetadataTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableName'
+
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function for processing sensor data'
+    Value: !Ref ProcessSupplyChainDataFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  IoTTopicRuleArn:
+    Description: 'ARN of the IoT topic rule'
+    Value: !GetAtt IoTTopicRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTTopicRuleArn'
+
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for notifications'
+    Value: !Ref SupplyChainNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  EventBridgeRuleName:
+    Description: 'Name of the EventBridge rule'
+    Value: !Ref SupplyChainEventRule
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeRuleName'
+
+  CloudWatchDashboardURL:
+    Description: 'URL to the CloudWatch dashboard'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${SupplyChainDashboard}'
+
+  IoTEndpoint:
+    Description: 'IoT endpoint for device connections (retrieve using AWS CLI)'
+    Value: 'Use "aws iot describe-endpoint --endpoint-type iot:Data-ATS" to get the endpoint'
+
+  DeploymentGuide:
+    Description: 'Next steps for deployment'
+    Value: !Sub |
+      1. Subscribe to SNS topic: ${SupplyChainNotificationTopic}
+      2. Configure IoT devices to publish to topic: supply-chain/sensor-data
+      3. Monitor dashboard: ${SupplyChainDashboard}
+      4. Deploy chaincode to blockchain network: ${BlockchainNetwork}
+
+# Metadata section for template information
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Project Configuration'
+        Parameters:
+          - ProjectName
+          - Environment
+          - NotificationEmail
+      - Label:
+          default: 'Blockchain Configuration'
+        Parameters:
+          - BlockchainNetworkName
+          - BlockchainMemberName
+          - BlockchainAdminPassword
+          - BlockchainEdition
+          - InstanceType
+    ParameterLabels:
+      ProjectName:
+        default: 'Project Name'
+      Environment:
+        default: 'Environment Type'
+      NotificationEmail:
+        default: 'Notification Email'
+      BlockchainNetworkName:
+        default: 'Blockchain Network Name'
+      BlockchainMemberName:
+        default: 'Blockchain Member Name'
+      BlockchainAdminPassword:
+        default: 'Admin Password'
+      BlockchainEdition:
+        default: 'Network Edition'
+      InstanceType:
+        default: 'Peer Node Instance Type'
+
+  AWS::CloudFormation::Designer:
+    description: 'CloudFormation template for blockchain-based supply chain tracking system'

@@ -1,0 +1,912 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Privacy-Preserving Data Analytics with AWS Clean Rooms and QuickSight
+  This template creates a complete infrastructure for privacy-preserving cross-organizational
+  data analytics using AWS Clean Rooms, QuickSight, S3, and Glue services.
+  
+  Features:
+  - S3 buckets for organizational data with encryption
+  - Glue Data Catalog and crawlers for schema discovery
+  - IAM roles with least privilege access
+  - Clean Rooms collaboration setup
+  - QuickSight integration for visualization
+  - Differential privacy configurations
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Data Configuration"
+        Parameters:
+          - OrganizationAName
+          - OrganizationBName
+          - EnableSampleData
+      - Label:
+          default: "Clean Rooms Configuration"
+        Parameters:
+          - CollaborationName
+          - EnableQueryLogging
+          - EnableDifferentialPrivacy
+      - Label:
+          default: "QuickSight Configuration"
+        Parameters:
+          - QuickSightUsername
+          - QuickSightUserEmail
+          - QuickSightEdition
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - EnableS3Encryption
+          - S3EncryptionType
+          - VPCId
+          - SubnetIds
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      CollaborationName:
+        default: "Clean Rooms Collaboration Name"
+      QuickSightUsername:
+        default: "QuickSight User Name"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: "privacy-analytics"
+    Description: "Name for the project - used as prefix for resource names"
+    AllowedPattern: ^[a-z0-9-]+$
+    ConstraintDescription: "Must contain only lowercase letters, numbers, and hyphens"
+    MinLength: 3
+    MaxLength: 30
+
+  Environment:
+    Type: String
+    Default: "dev"
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    Description: "Environment name for resource tagging and naming"
+
+  OrganizationAName:
+    Type: String
+    Default: "org-a"
+    Description: "Name for Organization A (data provider)"
+    AllowedPattern: ^[a-z0-9-]+$
+    ConstraintDescription: "Must contain only lowercase letters, numbers, and hyphens"
+    MinLength: 2
+    MaxLength: 20
+
+  OrganizationBName:
+    Type: String
+    Default: "org-b"
+    Description: "Name for Organization B (data provider)"
+    AllowedPattern: ^[a-z0-9-]+$
+    ConstraintDescription: "Must contain only lowercase letters, numbers, and hyphens"
+    MinLength: 2
+    MaxLength: 20
+
+  EnableSampleData:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Whether to upload sample datasets for testing"
+
+  CollaborationName:
+    Type: String
+    Default: "analytics-collaboration"
+    Description: "Name for the Clean Rooms collaboration"
+    AllowedPattern: ^[a-zA-Z0-9-_]+$
+    ConstraintDescription: "Must contain only letters, numbers, hyphens, and underscores"
+    MinLength: 3
+    MaxLength: 50
+
+  EnableQueryLogging:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Enable query logging for Clean Rooms collaboration"
+
+  EnableDifferentialPrivacy:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Enable differential privacy protections"
+
+  QuickSightUsername:
+    Type: String
+    Default: "analytics-admin"
+    Description: "Username for QuickSight user"
+    AllowedPattern: ^[a-zA-Z0-9-_]+$
+    ConstraintDescription: "Must contain only letters, numbers, hyphens, and underscores"
+    MinLength: 3
+    MaxLength: 50
+
+  QuickSightUserEmail:
+    Type: String
+    Default: "admin@example.com"
+    Description: "Email address for QuickSight user (change to valid email)"
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: "Must be a valid email address"
+
+  QuickSightEdition:
+    Type: String
+    Default: "STANDARD"
+    AllowedValues:
+      - "STANDARD"
+      - "ENTERPRISE"
+    Description: "QuickSight edition to use"
+
+  EnableS3Encryption:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Enable S3 bucket encryption"
+
+  S3EncryptionType:
+    Type: String
+    Default: "AES256"
+    AllowedValues:
+      - "AES256"
+      - "aws:kms"
+    Description: "S3 encryption type (AES256 or KMS)"
+
+  VPCId:
+    Type: String
+    Default: ""
+    Description: "Optional VPC ID for enhanced security (leave empty for default VPC)"
+
+  SubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: "Optional subnet IDs for VPC deployment (comma-separated)"
+
+Conditions:
+  HasVPC: !Not [!Equals [!Ref VPCId, ""]]
+  HasSubnets: !Not [!Equals [!Join ["", !Ref SubnetIds], ""]]
+  UseKMSEncryption: !Equals [!Ref S3EncryptionType, "aws:kms"]
+  EnableS3EncryptionCondition: !Equals [!Ref EnableS3Encryption, "true"]
+  EnableSampleDataCondition: !Equals [!Ref EnableSampleData, "true"]
+  IsProduction: !Equals [!Ref Environment, "prod"]
+
+Resources:
+  # =============================================================================
+  # KMS Key for Encryption (if KMS encryption is enabled)
+  # =============================================================================
+  
+  PrivacyAnalyticsKMSKey:
+    Type: AWS::KMS::Key
+    Condition: UseKMSEncryption
+    Properties:
+      Description: !Sub "KMS key for ${ProjectName} privacy analytics infrastructure"
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: Allow Clean Rooms Service
+            Effect: Allow
+            Principal:
+              Service: cleanrooms.amazonaws.com
+            Action:
+              - "kms:Decrypt"
+              - "kms:GenerateDataKey"
+            Resource: "*"
+          - Sid: Allow Glue Service
+            Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action:
+              - "kms:Decrypt"
+              - "kms:GenerateDataKey"
+            Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-privacy-analytics-key"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PrivacyAnalyticsKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: UseKMSEncryption
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}-${Environment}-privacy-analytics"
+      TargetKeyId: !Ref PrivacyAnalyticsKMSKey
+
+  # =============================================================================
+  # S3 Buckets for Data Storage
+  # =============================================================================
+
+  OrganizationADataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${OrganizationAName}-data-${Environment}-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [UseKMSEncryption, "aws:kms", "AES256"]
+              KMSMasterKeyID: !If [UseKMSEncryption, !Ref PrivacyAnalyticsKMSKey, !Ref "AWS::NoValue"]
+            BucketKeyEnabled: !If [UseKMSEncryption, true, !Ref "AWS::NoValue"]
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transition:
+              StorageClass: GLACIER
+              TransitionInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${OrganizationAName}-data-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Organization
+          Value: !Ref OrganizationAName
+
+  OrganizationBDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${OrganizationBName}-data-${Environment}-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [UseKMSEncryption, "aws:kms", "AES256"]
+              KMSMasterKeyID: !If [UseKMSEncryption, !Ref PrivacyAnalyticsKMSKey, !Ref "AWS::NoValue"]
+            BucketKeyEnabled: !If [UseKMSEncryption, true, !Ref "AWS::NoValue"]
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transition:
+              StorageClass: GLACIER
+              TransitionInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${OrganizationBName}-data-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Organization
+          Value: !Ref OrganizationBName
+
+  CleanRoomsResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-clean-rooms-results-${Environment}-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [UseKMSEncryption, "aws:kms", "AES256"]
+              KMSMasterKeyID: !If [UseKMSEncryption, !Ref PrivacyAnalyticsKMSKey, !Ref "AWS::NoValue"]
+            BucketKeyEnabled: !If [UseKMSEncryption, true, !Ref "AWS::NoValue"]
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldQueryResults
+            Status: Enabled
+            ExpirationInDays: !If [IsProduction, 365, 30]
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-clean-rooms-results-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: "Clean Rooms Query Results"
+
+  # =============================================================================
+  # CloudWatch Log Groups
+  # =============================================================================
+
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/s3/${ProjectName}-${Environment}"
+      RetentionInDays: !If [IsProduction, 90, 14]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-s3-logs-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  GlueLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/glue/${ProjectName}-${Environment}"
+      RetentionInDays: !If [IsProduction, 90, 14]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-glue-logs-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  CleanRoomsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/cleanrooms/${ProjectName}-${Environment}"
+      RetentionInDays: !If [IsProduction, 365, 30]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-cleanrooms-logs-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =============================================================================
+  # IAM Roles and Policies
+  # =============================================================================
+
+  CleanRoomsServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-CleanRoomsServiceRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cleanrooms.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref "AWS::AccountId"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCleanRoomsService
+      Policies:
+        - PolicyName: S3DataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "${OrganizationADataBucket}/*"
+                  - !Sub "${OrganizationBDataBucket}/*"
+                  - !Sub "${CleanRoomsResultsBucket}/*"
+                  - !GetAtt OrganizationADataBucket.Arn
+                  - !GetAtt OrganizationBDataBucket.Arn
+                  - !GetAtt CleanRoomsResultsBucket.Arn
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                Resource:
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${CleanRoomsLogGroup}:*"
+              - !If
+                - UseKMSEncryption
+                - Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                    - kms:GenerateDataKey
+                  Resource: !GetAtt PrivacyAnalyticsKMSKey.Arn
+                - !Ref "AWS::NoValue"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-CleanRoomsServiceRole-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-GlueServiceRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3DataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "${OrganizationADataBucket}/*"
+                  - !Sub "${OrganizationBDataBucket}/*"
+                  - !GetAtt OrganizationADataBucket.Arn
+                  - !GetAtt OrganizationBDataBucket.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${GlueLogGroup}:*"
+              - !If
+                - UseKMSEncryption
+                - Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                    - kms:GenerateDataKey
+                  Resource: !GetAtt PrivacyAnalyticsKMSKey.Arn
+                - !Ref "AWS::NoValue"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-GlueServiceRole-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  QuickSightServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-QuickSightServiceRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: quicksight.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3ResultsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "${CleanRoomsResultsBucket}/*"
+                  - !GetAtt CleanRoomsResultsBucket.Arn
+              - !If
+                - UseKMSEncryption
+                - Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                  Resource: !GetAtt PrivacyAnalyticsKMSKey.Arn
+                - !Ref "AWS::NoValue"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-QuickSightServiceRole-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =============================================================================
+  # AWS Glue Resources
+  # =============================================================================
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref "AWS::AccountId"
+      DatabaseInput:
+        Name: !Sub "${ProjectName}_analytics_${Environment}"
+        Description: !Sub "Glue database for ${ProjectName} privacy-preserving analytics"
+        Parameters:
+          classification: "privacy-analytics"
+          environment: !Ref Environment
+          project: !Ref ProjectName
+
+  OrganizationACrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "${ProjectName}-${OrganizationAName}-crawler-${Environment}"
+      Description: !Sub "Crawler for ${OrganizationAName} customer data"
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "${OrganizationADataBucket}/data/"
+            Exclusions: []
+      TablePrefix: !Sub "${OrganizationAName}_"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": {
+              "AddOrUpdateBehavior": "InheritFromTable"
+            }
+          }
+        }
+      Tags:
+        Name: !Sub "${ProjectName}-${OrganizationAName}-crawler-${Environment}"
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        Organization: !Ref OrganizationAName
+
+  OrganizationBCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "${ProjectName}-${OrganizationBName}-crawler-${Environment}"
+      Description: !Sub "Crawler for ${OrganizationBName} customer data"
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "${OrganizationBDataBucket}/data/"
+            Exclusions: []
+      TablePrefix: !Sub "${OrganizationBName}_"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": {
+              "AddOrUpdateBehavior": "InheritFromTable"
+            }
+          }
+        }
+      Tags:
+        Name: !Sub "${ProjectName}-${OrganizationBName}-crawler-${Environment}"
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        Organization: !Ref OrganizationBName
+
+  # =============================================================================
+  # Lambda Function for Sample Data Upload
+  # =============================================================================
+
+  SampleDataUploadFunction:
+    Type: AWS::Lambda::Function
+    Condition: EnableSampleDataCondition
+    Properties:
+      FunctionName: !Sub "${ProjectName}-sample-data-upload-${Environment}"
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt SampleDataUploadRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          ORG_A_BUCKET: !Ref OrganizationADataBucket
+          ORG_B_BUCKET: !Ref OrganizationBDataBucket
+      Code:
+        ZipFile: |
+          import boto3
+          import csv
+          import io
+          import os
+          import json
+          import cfnresponse
+          
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      s3 = boto3.client('s3')
+                      
+                      # Organization A sample data
+                      org_a_data = [
+                          ['customer_id', 'age_group', 'region', 'purchase_amount', 'product_category', 'registration_date'],
+                          ['1001', '25-34', 'east', '250.00', 'electronics', '2023-01-15'],
+                          ['1002', '35-44', 'west', '180.50', 'clothing', '2023-02-20'],
+                          ['1003', '45-54', 'central', '320.75', 'home', '2023-01-10'],
+                          ['1004', '25-34', 'east', '95.25', 'books', '2023-03-05'],
+                          ['1005', '55-64', 'west', '450.00', 'electronics', '2023-02-28'],
+                          ['1006', '25-34', 'central', '180.00', 'electronics', '2023-01-25'],
+                          ['1007', '35-44', 'east', '275.50', 'clothing', '2023-02-15'],
+                          ['1008', '45-54', 'west', '395.25', 'home', '2023-03-01'],
+                          ['1009', '25-34', 'central', '125.75', 'books', '2023-02-10'],
+                          ['1010', '55-64', 'east', '520.00', 'electronics', '2023-03-12']
+                      ]
+                      
+                      # Organization B sample data
+                      org_b_data = [
+                          ['customer_id', 'age_group', 'region', 'engagement_score', 'channel_preference', 'last_interaction'],
+                          ['2001', '25-34', 'east', '85', 'email', '2023-03-15'],
+                          ['2002', '35-44', 'west', '72', 'social', '2023-03-20'],
+                          ['2003', '45-54', 'central', '91', 'email', '2023-03-10'],
+                          ['2004', '25-34', 'east', '68', 'mobile', '2023-03-25'],
+                          ['2005', '55-64', 'west', '88', 'email', '2023-03-18'],
+                          ['2006', '25-34', 'central', '76', 'mobile', '2023-03-08'],
+                          ['2007', '35-44', 'east', '82', 'email', '2023-03-22'],
+                          ['2008', '45-54', 'west', '94', 'social', '2023-03-05'],
+                          ['2009', '25-34', 'central', '69', 'mobile', '2023-03-14'],
+                          ['2010', '55-64', 'east', '87', 'email', '2023-03-20']
+                      ]
+                      
+                      # Upload Organization A data
+                      org_a_csv = io.StringIO()
+                      writer = csv.writer(org_a_csv)
+                      writer.writerows(org_a_data)
+                      s3.put_object(
+                          Bucket=os.environ['ORG_A_BUCKET'],
+                          Key='data/customer_data_org_a.csv',
+                          Body=org_a_csv.getvalue(),
+                          ContentType='text/csv'
+                      )
+                      
+                      # Upload Organization B data
+                      org_b_csv = io.StringIO()
+                      writer = csv.writer(org_b_csv)
+                      writer.writerows(org_b_data)
+                      s3.put_object(
+                          Bucket=os.environ['ORG_B_BUCKET'],
+                          Key='data/customer_data_org_b.csv',
+                          Body=org_b_csv.getvalue(),
+                          ContentType='text/csv'
+                      )
+                      
+                      print("Sample data uploaded successfully")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  
+                  elif event['RequestType'] == 'Delete':
+                      # Optional: Clean up sample data on stack deletion
+                      print("Stack deletion - sample data cleanup skipped")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  SampleDataUploadRole:
+    Type: AWS::IAM::Role
+    Condition: EnableSampleDataCondition
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3UploadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource:
+                  - !Sub "${OrganizationADataBucket}/*"
+                  - !Sub "${OrganizationBDataBucket}/*"
+
+  SampleDataUploadCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: EnableSampleDataCondition
+    Properties:
+      ServiceToken: !GetAtt SampleDataUploadFunction.Arn
+    DependsOn:
+      - OrganizationADataBucket
+      - OrganizationBDataBucket
+
+# =============================================================================
+# Outputs
+# =============================================================================
+
+Outputs:
+  ProjectName:
+    Description: "Project name used for resource naming"
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub "${AWS::StackName}-ProjectName"
+
+  Environment:
+    Description: "Environment name"
+    Value: !Ref Environment
+    Export:
+      Name: !Sub "${AWS::StackName}-Environment"
+
+  OrganizationADataBucket:
+    Description: "S3 bucket for Organization A data"
+    Value: !Ref OrganizationADataBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-OrgADataBucket"
+
+  OrganizationBDataBucket:
+    Description: "S3 bucket for Organization B data"
+    Value: !Ref OrganizationBDataBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-OrgBDataBucket"
+
+  CleanRoomsResultsBucket:
+    Description: "S3 bucket for Clean Rooms query results"
+    Value: !Ref CleanRoomsResultsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-ResultsBucket"
+
+  GlueDatabase:
+    Description: "Glue database for analytics"
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub "${AWS::StackName}-GlueDatabase"
+
+  OrganizationACrawler:
+    Description: "Glue crawler for Organization A data"
+    Value: !Ref OrganizationACrawler
+    Export:
+      Name: !Sub "${AWS::StackName}-OrgACrawler"
+
+  OrganizationBCrawler:
+    Description: "Glue crawler for Organization B data"
+    Value: !Ref OrganizationBCrawler
+    Export:
+      Name: !Sub "${AWS::StackName}-OrgBCrawler"
+
+  CleanRoomsServiceRoleArn:
+    Description: "ARN of the Clean Rooms service role"
+    Value: !GetAtt CleanRoomsServiceRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CleanRoomsRoleArn"
+
+  GlueServiceRoleArn:
+    Description: "ARN of the Glue service role"
+    Value: !GetAtt GlueServiceRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-GlueRoleArn"
+
+  QuickSightServiceRoleArn:
+    Description: "ARN of the QuickSight service role"
+    Value: !GetAtt QuickSightServiceRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-QuickSightRoleArn"
+
+  KMSKeyId:
+    Condition: UseKMSEncryption
+    Description: "KMS key ID for encryption"
+    Value: !Ref PrivacyAnalyticsKMSKey
+    Export:
+      Name: !Sub "${AWS::StackName}-KMSKeyId"
+
+  KMSKeyAlias:
+    Condition: UseKMSEncryption
+    Description: "KMS key alias for encryption"
+    Value: !Ref PrivacyAnalyticsKMSKeyAlias
+    Export:
+      Name: !Sub "${AWS::StackName}-KMSKeyAlias"
+
+  CleanRoomsLogGroup:
+    Description: "CloudWatch log group for Clean Rooms"
+    Value: !Ref CleanRoomsLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-CleanRoomsLogGroup"
+
+  PostDeploymentInstructions:
+    Description: "Next steps to complete the setup"
+    Value: !Sub |
+      1. Run Glue crawlers to discover data schemas:
+         aws glue start-crawler --name ${OrganizationACrawler}
+         aws glue start-crawler --name ${OrganizationBCrawler}
+      
+      2. Create Clean Rooms collaboration (use AWS Console or CLI):
+         - Navigate to AWS Clean Rooms console
+         - Create new collaboration named: ${CollaborationName}
+         - Use service role: ${CleanRoomsServiceRole}
+      
+      3. Configure Clean Rooms tables and associations
+      
+      4. Set up QuickSight:
+         - Subscribe to QuickSight if not already done
+         - Create data source pointing to: ${CleanRoomsResultsBucket}
+         - Use service role: ${QuickSightServiceRole}
+      
+      5. Execute privacy-preserving queries through Clean Rooms
+      
+      6. Create QuickSight dashboards for visualization
+
+  ManagementConsoleLinks:
+    Description: "Direct links to AWS management consoles"
+    Value: !Sub |
+      S3 Console: https://console.aws.amazon.com/s3/
+      Glue Console: https://console.aws.amazon.com/glue/
+      Clean Rooms Console: https://console.aws.amazon.com/cleanrooms/
+      QuickSight Console: https://quicksight.aws.amazon.com/
+      CloudWatch Logs: https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:
+
+  SecurityRecommendations:
+    Description: "Important security considerations"
+    Value: |
+      1. Rotate IAM role credentials regularly
+      2. Monitor CloudWatch logs for unusual activity
+      3. Implement network-level security if using VPC
+      4. Regular review of Clean Rooms query patterns
+      5. Ensure differential privacy settings meet compliance requirements
+      6. Regular backup of important query results
+      7. Implement least privilege access for QuickSight users

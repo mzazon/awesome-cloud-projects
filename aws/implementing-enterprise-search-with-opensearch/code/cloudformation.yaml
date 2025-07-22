@@ -1,0 +1,951 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Implementing Enterprise Search with OpenSearch Service - Complete infrastructure deployment'
+
+# ==========================================
+# PARAMETERS
+# ==========================================
+
+Parameters:
+  DomainName:
+    Type: String
+    Default: 'search-demo'
+    Description: 'Name for the OpenSearch domain (will have random suffix appended)'
+    AllowedPattern: '^[a-z][a-z0-9\-]{2,27}$'
+    ConstraintDescription: 'Domain name must be 3-28 characters, start with lowercase letter, and contain only lowercase letters, numbers, and hyphens'
+
+  OpenSearchVersion:
+    Type: String
+    Default: 'OpenSearch_2.11'
+    Description: 'OpenSearch version to deploy'
+    AllowedValues:
+      - 'OpenSearch_2.11'
+      - 'OpenSearch_2.9'
+      - 'OpenSearch_2.7'
+
+  InstanceType:
+    Type: String
+    Default: 'm6g.large.search'
+    Description: 'Instance type for OpenSearch data nodes'
+    AllowedValues:
+      - 't3.small.search'
+      - 't3.medium.search'
+      - 'm6g.large.search'
+      - 'm6g.xlarge.search'
+      - 'r6g.large.search'
+      - 'r6g.xlarge.search'
+
+  MasterInstanceType:
+    Type: String
+    Default: 'm6g.medium.search'
+    Description: 'Instance type for OpenSearch dedicated master nodes'
+    AllowedValues:
+      - 't3.small.search'
+      - 't3.medium.search'
+      - 'm6g.medium.search'
+      - 'm6g.large.search'
+      - 'r6g.medium.search'
+      - 'r6g.large.search'
+
+  InstanceCount:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 20
+    Description: 'Number of data nodes in the OpenSearch cluster'
+
+  MasterInstanceCount:
+    Type: Number
+    Default: 3
+    AllowedValues: [1, 3, 5]
+    Description: 'Number of dedicated master nodes (must be odd number)'
+
+  VolumeSize:
+    Type: Number
+    Default: 100
+    MinValue: 10
+    MaxValue: 3000
+    Description: 'EBS volume size in GB for each OpenSearch instance'
+
+  VolumeType:
+    Type: String
+    Default: 'gp3'
+    AllowedValues: ['gp2', 'gp3', 'io1', 'io2']
+    Description: 'EBS volume type for OpenSearch instances'
+
+  IOPS:
+    Type: Number
+    Default: 3000
+    MinValue: 3000
+    MaxValue: 16000
+    Description: 'IOPS for gp3/io1/io2 volumes'
+
+  Throughput:
+    Type: Number
+    Default: 125
+    MinValue: 125
+    MaxValue: 1000
+    Description: 'Throughput for gp3 volumes (MB/s)'
+
+  EnableDedicatedMaster:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable dedicated master nodes for better cluster stability'
+
+  EnableZoneAwareness:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable multi-AZ deployment for high availability'
+
+  AvailabilityZoneCount:
+    Type: Number
+    Default: 3
+    AllowedValues: [2, 3]
+    Description: 'Number of Availability Zones (must match or be less than instance count)'
+
+  MasterUserName:
+    Type: String
+    Default: 'admin'
+    MinLength: 1
+    MaxLength: 64
+    Description: 'Master username for OpenSearch fine-grained access control'
+
+  MasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 128
+    Description: 'Master password for OpenSearch (minimum 8 characters, must contain uppercase, lowercase, number, and special character)'
+    AllowedPattern: '^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$'
+    ConstraintDescription: 'Password must contain at least 8 characters with uppercase, lowercase, number, and special character'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'test', 'staging', 'prod']
+    Description: 'Environment name for resource tagging'
+
+  ProjectName:
+    Type: String
+    Default: 'opensearch-search-solution'
+    Description: 'Project name for resource tagging'
+
+  EnableSlowLogs:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable slow log publishing to CloudWatch'
+
+  EnableApplicationLogs:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable application log publishing to CloudWatch'
+
+  EnableAuditLogs:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable audit log publishing to CloudWatch'
+
+# ==========================================
+# CONDITIONS
+# ==========================================
+
+Conditions:
+  EnableDedicatedMasterCondition: !Equals [!Ref EnableDedicatedMaster, 'true']
+  EnableZoneAwarenessCondition: !Equals [!Ref EnableZoneAwareness, 'true']
+  EnableSlowLogsCondition: !Equals [!Ref EnableSlowLogs, 'true']
+  EnableApplicationLogsCondition: !Equals [!Ref EnableApplicationLogs, 'true']
+  EnableAuditLogsCondition: !Equals [!Ref EnableAuditLogs, 'true']
+  IsGP3Volume: !Equals [!Ref VolumeType, 'gp3']
+  IsIOPSVolume: !Or 
+    - !Equals [!Ref VolumeType, 'gp3']
+    - !Equals [!Ref VolumeType, 'io1']
+    - !Equals [!Ref VolumeType, 'io2']
+
+# ==========================================
+# RESOURCES
+# ==========================================
+
+Resources:
+
+  # Random suffix for unique resource naming
+  RandomSuffix:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt RandomSuffixFunction.Arn
+
+  RandomSuffixFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-random-suffix-${AWS::StackName}'
+      Runtime: python3.9
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt RandomSuffixFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import random
+          import string
+          import cfnresponse
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  # Generate 6-character random suffix
+                  suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+                  
+                  response_data = {'RandomSuffix': suffix}
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  RandomSuffixFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-random-suffix-role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # S3 Bucket for sample data and indexing
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-data-${RandomSuffix.RandomSuffix}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-data-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Groups for OpenSearch
+  IndexSlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableSlowLogsCondition
+    Properties:
+      LogGroupName: !Sub '/aws/opensearch/domains/${DomainName}-${RandomSuffix.RandomSuffix}/index-slow-logs'
+      RetentionInDays: 14
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-index-slow-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  SearchSlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableSlowLogsCondition
+    Properties:
+      LogGroupName: !Sub '/aws/opensearch/domains/${DomainName}-${RandomSuffix.RandomSuffix}/search-slow-logs'
+      RetentionInDays: 14
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-search-slow-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableApplicationLogsCondition
+    Properties:
+      LogGroupName: !Sub '/aws/opensearch/domains/${DomainName}-${RandomSuffix.RandomSuffix}/application-logs'
+      RetentionInDays: 14
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-application-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  AuditLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableAuditLogsCondition
+    Properties:
+      LogGroupName: !Sub '/aws/opensearch/domains/${DomainName}-${RandomSuffix.RandomSuffix}/audit-logs'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-audit-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Service Role for OpenSearch
+  OpenSearchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-opensearch-service-role-${RandomSuffix.RandomSuffix}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: opensearch.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: OpenSearchCloudWatchLogPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/opensearch/domains/${DomainName}-${RandomSuffix.RandomSuffix}/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-opensearch-service-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # OpenSearch Domain
+  OpenSearchDomain:
+    Type: AWS::OpenSearch::Domain
+    Properties:
+      DomainName: !Sub '${DomainName}-${RandomSuffix.RandomSuffix}'
+      EngineVersion: !Ref OpenSearchVersion
+      
+      # Cluster Configuration
+      ClusterConfig:
+        InstanceType: !Ref InstanceType
+        InstanceCount: !Ref InstanceCount
+        DedicatedMasterEnabled: !If [EnableDedicatedMasterCondition, true, false]
+        DedicatedMasterType: !If [EnableDedicatedMasterCondition, !Ref MasterInstanceType, !Ref 'AWS::NoValue']
+        DedicatedMasterCount: !If [EnableDedicatedMasterCondition, !Ref MasterInstanceCount, !Ref 'AWS::NoValue']
+        ZoneAwarenessEnabled: !If [EnableZoneAwarenessCondition, true, false]
+        ZoneAwarenessConfig: !If 
+          - EnableZoneAwarenessCondition
+          - AvailabilityZoneCount: !Ref AvailabilityZoneCount
+          - !Ref 'AWS::NoValue'
+        WarmEnabled: false
+
+      # EBS Configuration
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: !Ref VolumeType
+        VolumeSize: !Ref VolumeSize
+        Iops: !If [IsIOPSVolume, !Ref IOPS, !Ref 'AWS::NoValue']
+        Throughput: !If [IsGP3Volume, !Ref Throughput, !Ref 'AWS::NoValue']
+
+      # Security Configuration
+      EncryptionAtRestOptions:
+        Enabled: true
+
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+        TLSSecurityPolicy: Policy-Min-TLS-1-2-2019-07
+
+      # Fine-grained Access Control
+      AdvancedSecurityOptions:
+        Enabled: true
+        InternalUserDatabaseEnabled: true
+        MasterUserOptions:
+          MasterUserName: !Ref MasterUserName
+          MasterUserPassword: !Ref MasterPassword
+
+      # Access Policy - Restrictive by default
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'es:*'
+            Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${DomainName}-${RandomSuffix.RandomSuffix}/*'
+
+      # Log Publishing Options
+      LogPublishingOptions:
+        INDEX_SLOW_LOGS: !If
+          - EnableSlowLogsCondition
+          - CloudWatchLogsLogGroupArn: !GetAtt IndexSlowLogGroup.Arn
+            Enabled: true
+          - !Ref 'AWS::NoValue'
+        SEARCH_SLOW_LOGS: !If
+          - EnableSlowLogsCondition
+          - CloudWatchLogsLogGroupArn: !GetAtt SearchSlowLogGroup.Arn
+            Enabled: true
+          - !Ref 'AWS::NoValue'
+        ES_APPLICATION_LOGS: !If
+          - EnableApplicationLogsCondition
+          - CloudWatchLogsLogGroupArn: !GetAtt ApplicationLogGroup.Arn
+            Enabled: true
+          - !Ref 'AWS::NoValue'
+        AUDIT_LOGS: !If
+          - EnableAuditLogsCondition
+          - CloudWatchLogsLogGroupArn: !GetAtt AuditLogGroup.Arn
+            Enabled: true
+          - !Ref 'AWS::NoValue'
+
+      # Advanced Options
+      AdvancedOptions:
+        'rest.action.multi.allow_explicit_index': 'true'
+        'indices.fielddata.cache.size': '20'
+        'indices.query.bool.max_clause_count': '1024'
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-opensearch-domain'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for Lambda Indexer Function
+  LambdaIndexerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-indexer-role-${RandomSuffix.RandomSuffix}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub '${DataBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt DataBucket.Arn
+        - PolicyName: OpenSearchAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - es:ESHttpPost
+                  - es:ESHttpPut
+                  - es:ESHttpGet
+                  - es:ESHttpDelete
+                Resource: !GetAtt OpenSearchDomain.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-indexer-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda Function for Data Indexing
+  LambdaIndexerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-indexer-${RandomSuffix.RandomSuffix}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: 300
+      MemorySize: 512
+      Role: !GetAtt LambdaIndexerRole.Arn
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !GetAtt OpenSearchDomain.DomainEndpoint
+          OPENSEARCH_USERNAME: !Ref MasterUserName
+          OPENSEARCH_PASSWORD: !Ref MasterPassword
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import requests
+          from requests.auth import HTTPBasicAuth
+          import os
+          import logging
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Lambda function to index data from S3 into OpenSearch
+              Supports both S3 events and direct invocation
+              """
+              try:
+                  # Get OpenSearch configuration from environment
+                  os_endpoint = os.environ['OPENSEARCH_ENDPOINT']
+                  os_username = os.environ['OPENSEARCH_USERNAME']
+                  os_password = os.environ['OPENSEARCH_PASSWORD']
+                  
+                  s3_client = boto3.client('s3')
+                  indexed_count = 0
+                  
+                  # Process S3 event or direct invocation
+                  if 'Records' in event:
+                      # S3 Event triggered
+                      for record in event['Records']:
+                          bucket = record['s3']['bucket']['name']
+                          key = record['s3']['object']['key']
+                          logger.info(f"Processing S3 object: s3://{bucket}/{key}")
+                          
+                          indexed_count += process_s3_object(s3_client, bucket, key, os_endpoint, os_username, os_password)
+                  
+                  elif 'bucket' in event and 'key' in event:
+                      # Direct invocation with bucket and key
+                      bucket = event['bucket']
+                      key = event['key']
+                      logger.info(f"Processing direct invocation: s3://{bucket}/{key}")
+                      
+                      indexed_count += process_s3_object(s3_client, bucket, key, os_endpoint, os_username, os_password)
+                  
+                  else:
+                      # Default behavior - process sample data if available
+                      logger.info("No specific S3 object specified, processing default sample data")
+                      sample_products = get_sample_products()
+                      indexed_count = index_products(sample_products, os_endpoint, os_username, os_password)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Successfully indexed {indexed_count} documents',
+                          'indexed_count': indexed_count
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in lambda_handler: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def process_s3_object(s3_client, bucket, key, os_endpoint, os_username, os_password):
+              """Process a single S3 object"""
+              try:
+                  # Download file from S3
+                  response = s3_client.get_object(Bucket=bucket, Key=key)
+                  content = response['Body'].read().decode('utf-8')
+                  
+                  # Parse JSON data
+                  if key.endswith('.json'):
+                      products = json.loads(content)
+                      if isinstance(products, list):
+                          return index_products(products, os_endpoint, os_username, os_password)
+                      else:
+                          return index_products([products], os_endpoint, os_username, os_password)
+                  else:
+                      logger.warning(f"Unsupported file type: {key}")
+                      return 0
+                      
+              except Exception as e:
+                  logger.error(f"Error processing S3 object {bucket}/{key}: {str(e)}")
+                  return 0
+          
+          def index_products(products, os_endpoint, os_username, os_password):
+              """Index products into OpenSearch"""
+              indexed_count = 0
+              
+              for product in products:
+                  try:
+                      doc_id = product.get('id', f"doc-{indexed_count}")
+                      index_url = f"https://{os_endpoint}/products/_doc/{doc_id}"
+                      
+                      response = requests.put(
+                          index_url,
+                          headers={'Content-Type': 'application/json'},
+                          data=json.dumps(product),
+                          auth=HTTPBasicAuth(os_username, os_password),
+                          verify=True,
+                          timeout=30
+                      )
+                      
+                      if response.status_code in [200, 201]:
+                          logger.info(f"Successfully indexed product {doc_id}")
+                          indexed_count += 1
+                      else:
+                          logger.error(f"Failed to index product {doc_id}: {response.status_code} - {response.text}")
+                          
+                  except Exception as e:
+                      logger.error(f"Error indexing product: {str(e)}")
+              
+              # Refresh index to make documents searchable
+              try:
+                  refresh_url = f"https://{os_endpoint}/products/_refresh"
+                  requests.post(
+                      refresh_url,
+                      auth=HTTPBasicAuth(os_username, os_password),
+                      verify=True,
+                      timeout=30
+                  )
+                  logger.info("Index refreshed successfully")
+              except Exception as e:
+                  logger.error(f"Error refreshing index: {str(e)}")
+              
+              return indexed_count
+          
+          def get_sample_products():
+              """Return sample product data for testing"""
+              return [
+                  {
+                      "id": "prod-001",
+                      "title": "Wireless Bluetooth Headphones",
+                      "description": "High-quality wireless headphones with noise cancellation and 30-hour battery life",
+                      "category": "Electronics",
+                      "brand": "TechSound",
+                      "price": 199.99,
+                      "rating": 4.5,
+                      "tags": ["wireless", "bluetooth", "noise-cancelling", "headphones"],
+                      "stock": 150,
+                      "created_date": "2024-01-15"
+                  },
+                  {
+                      "id": "prod-002",
+                      "title": "Organic Cotton T-Shirt", 
+                      "description": "Comfortable organic cotton t-shirt available in multiple colors and sizes",
+                      "category": "Clothing",
+                      "brand": "EcoWear",
+                      "price": 29.99,
+                      "rating": 4.2,
+                      "tags": ["organic", "cotton", "t-shirt", "eco-friendly"],
+                      "stock": 75,
+                      "created_date": "2024-01-10"
+                  },
+                  {
+                      "id": "prod-003",
+                      "title": "Smart Fitness Watch",
+                      "description": "Advanced fitness tracking watch with heart rate monitor and GPS",
+                      "category": "Electronics",
+                      "brand": "FitTech",
+                      "price": 299.99,
+                      "rating": 4.7,
+                      "tags": ["smartwatch", "fitness", "GPS", "heart-rate"],
+                      "stock": 89,
+                      "created_date": "2024-01-12"
+                  }
+              ]
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-indexer'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # S3 Bucket Notification Configuration
+  S3BucketNotification:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref DataBucket
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt LambdaIndexerFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .json
+
+  # Lambda Permission for S3 to invoke the function
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaIndexerFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !GetAtt DataBucket.Arn
+
+  # CloudWatch Dashboard for OpenSearch Monitoring
+  OpenSearchDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-opensearch-${RandomSuffix.RandomSuffix}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ES", "SearchLatency", "DomainName", "${DomainName}-${RandomSuffix.RandomSuffix}", "ClientId", "${AWS::AccountId}"],
+                  [".", "IndexingLatency", ".", ".", ".", "."],
+                  [".", "SearchRate", ".", ".", ".", "."],
+                  [".", "IndexingRate", ".", ".", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "OpenSearch Performance Metrics",
+                "period": 300,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ES", "ClusterStatus.yellow", "DomainName", "${DomainName}-${RandomSuffix.RandomSuffix}", "ClientId", "${AWS::AccountId}"],
+                  [".", "ClusterStatus.red", ".", ".", ".", "."],
+                  [".", "StorageUtilization", ".", ".", ".", "."],
+                  [".", "CPUUtilization", ".", ".", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "OpenSearch Cluster Health",
+                "period": 300,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ES", "JVMMemoryPressure", "DomainName", "${DomainName}-${RandomSuffix.RandomSuffix}", "ClientId", "${AWS::AccountId}"],
+                  [".", "MasterCPUUtilization", ".", ".", ".", "."],
+                  [".", "MasterJVMMemoryPressure", ".", ".", ".", "."],
+                  [".", "AutomatedSnapshotFailure", ".", ".", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "OpenSearch Advanced Metrics",
+                "period": 300,
+                "stat": "Average"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms for OpenSearch Monitoring
+  HighSearchLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-high-search-latency-${RandomSuffix.RandomSuffix}'
+      AlarmDescription: 'Alert when OpenSearch search latency exceeds 1000ms'
+      MetricName: SearchLatency
+      Namespace: AWS/ES
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DomainName
+          Value: !Sub '${DomainName}-${RandomSuffix.RandomSuffix}'
+        - Name: ClientId
+          Value: !Ref 'AWS::AccountId'
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-high-search-latency-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ClusterStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-cluster-status-red-${RandomSuffix.RandomSuffix}'
+      AlarmDescription: 'Alert when OpenSearch cluster status is red'
+      MetricName: 'ClusterStatus.red'
+      Namespace: AWS/ES
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DomainName
+          Value: !Sub '${DomainName}-${RandomSuffix.RandomSuffix}'
+        - Name: ClientId
+          Value: !Ref 'AWS::AccountId'
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cluster-status-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  HighJVMMemoryPressureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-high-jvm-memory-pressure-${RandomSuffix.RandomSuffix}'
+      AlarmDescription: 'Alert when OpenSearch JVM memory pressure exceeds 80%'
+      MetricName: JVMMemoryPressure
+      Namespace: AWS/ES
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DomainName
+          Value: !Sub '${DomainName}-${RandomSuffix.RandomSuffix}'
+        - Name: ClientId
+          Value: !Ref 'AWS::AccountId'
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-high-jvm-memory-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+# ==========================================
+# OUTPUTS
+# ==========================================
+
+Outputs:
+  OpenSearchDomainName:
+    Description: 'Name of the OpenSearch domain'
+    Value: !Ref OpenSearchDomain
+    Export:
+      Name: !Sub '${AWS::StackName}-OpenSearchDomainName'
+
+  OpenSearchDomainEndpoint:
+    Description: 'Endpoint URL of the OpenSearch domain'
+    Value: !GetAtt OpenSearchDomain.DomainEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-OpenSearchDomainEndpoint'
+
+  OpenSearchDashboardsURL:
+    Description: 'URL for OpenSearch Dashboards'
+    Value: !Sub 'https://${OpenSearchDomain.DomainEndpoint}/_dashboards/'
+    Export:
+      Name: !Sub '${AWS::StackName}-OpenSearchDashboardsURL'
+
+  OpenSearchDomainArn:
+    Description: 'ARN of the OpenSearch domain'
+    Value: !GetAtt OpenSearchDomain.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OpenSearchDomainArn'
+
+  DataBucketName:
+    Description: 'Name of the S3 bucket for data storage'
+    Value: !Ref DataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBucketName'
+
+  DataBucketArn:
+    Description: 'ARN of the S3 bucket for data storage'
+    Value: !GetAtt DataBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBucketArn'
+
+  LambdaIndexerFunctionName:
+    Description: 'Name of the Lambda indexer function'
+    Value: !Ref LambdaIndexerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaIndexerFunctionName'
+
+  LambdaIndexerFunctionArn:
+    Description: 'ARN of the Lambda indexer function'
+    Value: !GetAtt LambdaIndexerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaIndexerFunctionArn'
+
+  CloudWatchDashboardURL:
+    Description: 'URL for the CloudWatch dashboard'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-opensearch-${RandomSuffix.RandomSuffix}'
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchDashboardURL'
+
+  MasterUserName:
+    Description: 'Master username for OpenSearch'
+    Value: !Ref MasterUserName
+    Export:
+      Name: !Sub '${AWS::StackName}-MasterUserName'
+
+  RandomSuffix:
+    Description: 'Random suffix used for resource naming'
+    Value: !GetAtt RandomSuffix.RandomSuffix
+    Export:
+      Name: !Sub '${AWS::StackName}-RandomSuffix'
+
+  # Sample curl commands for testing
+  SampleSearchCommand:
+    Description: 'Sample curl command to test search functionality'
+    Value: !Sub |
+      curl -X GET "https://${OpenSearchDomain.DomainEndpoint}/products/_search" \
+        -H "Content-Type: application/json" \
+        -u ${MasterUserName}:YOUR_PASSWORD \
+        -d '{"query": {"match": {"title": "wireless"}}}'
+
+  SampleIndexCommand:
+    Description: 'Sample curl command to manually invoke the indexer Lambda'
+    Value: !Sub |
+      aws lambda invoke --function-name ${LambdaIndexerFunction} \
+        --payload '{}' response.json && cat response.json
+
+  DeploymentInstructions:
+    Description: 'Instructions for using this template'
+    Value: |
+      1. Deploy this template with a secure master password
+      2. Wait for OpenSearch domain to be available (20-30 minutes)
+      3. Use the Lambda function to index sample data
+      4. Access OpenSearch Dashboards to explore data
+      5. Monitor performance using CloudWatch dashboard
+      6. Use sample curl commands to test search functionality

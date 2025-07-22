@@ -1,0 +1,810 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS IoT Device Management solution with fleet indexing, thing groups, dynamic groups, and comprehensive monitoring'
+
+Parameters:
+  # Basic Configuration
+  ProjectName:
+    Type: String
+    Default: 'iot-device-mgmt'
+    Description: 'Project name used for resource naming and tagging'
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+    MinLength: 3
+    MaxLength: 20
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    Description: 'Environment (dev, staging, prod)'
+    AllowedValues:
+      - 'dev'
+      - 'staging'
+      - 'prod'
+
+  # Fleet Configuration
+  FleetName:
+    Type: String
+    Default: 'sensor-fleet'
+    Description: 'Name for the IoT device fleet'
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+    MinLength: 3
+    MaxLength: 50
+
+  ThingTypeName:
+    Type: String
+    Default: 'temperature-sensor'
+    Description: 'Name for the IoT thing type'
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+    MinLength: 3
+    MaxLength: 50
+
+  # Device Configuration
+  DeviceCount:
+    Type: Number
+    Default: 4
+    Description: 'Number of IoT devices to create'
+    MinValue: 1
+    MaxValue: 100
+
+  FirmwareVersion:
+    Type: String
+    Default: '1.0.0'
+    Description: 'Initial firmware version for devices'
+    AllowedPattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
+    ConstraintDescription: 'Must be in semantic versioning format (x.y.z)'
+
+  # Monitoring Configuration
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    Description: 'CloudWatch log retention period in days'
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+  FleetIndexingEnabled:
+    Type: String
+    Default: 'true'
+    Description: 'Enable fleet indexing for device search and monitoring'
+    AllowedValues: ['true', 'false']
+
+  # Job Configuration
+  MaxConcurrentJobs:
+    Type: Number
+    Default: 5
+    Description: 'Maximum number of concurrent job executions'
+    MinValue: 1
+    MaxValue: 1000
+
+  JobTimeoutMinutes:
+    Type: Number
+    Default: 30
+    Description: 'Job execution timeout in minutes'
+    MinValue: 1
+    MaxValue: 1440
+
+Conditions:
+  EnableFleetIndexing: !Equals [!Ref FleetIndexingEnabled, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  CreateMultipleDevices: !Not [!Equals [!Ref DeviceCount, 1]]
+
+Resources:
+  # ========================================
+  # IAM Roles and Policies
+  # ========================================
+  
+  # IoT Device Policy for secure device communication
+  IoTDevicePolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-${Environment}-device-policy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow device connection with thing name as client ID
+          - Effect: Allow
+            Action:
+              - 'iot:Connect'
+            Resource:
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/${iot:Connection.Thing.ThingName}'
+          # Allow publishing to device-specific topics
+          - Effect: Allow
+            Action:
+              - 'iot:Publish'
+            Resource:
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/device/${iot:Connection.Thing.ThingName}/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/things/${iot:Connection.Thing.ThingName}/shadow/*'
+          # Allow subscribing to device-specific topics
+          - Effect: Allow
+            Action:
+              - 'iot:Subscribe'
+            Resource:
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/device/${iot:Connection.Thing.ThingName}/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/$aws/things/${iot:Connection.Thing.ThingName}/shadow/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/$aws/things/${iot:Connection.Thing.ThingName}/jobs/*'
+          # Allow receiving messages on subscribed topics
+          - Effect: Allow
+            Action:
+              - 'iot:Receive'
+            Resource:
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/device/${iot:Connection.Thing.ThingName}/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/things/${iot:Connection.Thing.ThingName}/shadow/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/things/${iot:Connection.Thing.ThingName}/jobs/*'
+          # Allow device shadow operations
+          - Effect: Allow
+            Action:
+              - 'iot:GetThingShadow'
+              - 'iot:UpdateThingShadow'
+              - 'iot:DeleteThingShadow'
+            Resource:
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:thing/${iot:Connection.Thing.ThingName}'
+          # Allow job operations
+          - Effect: Allow
+            Action:
+              - 'iot:DescribeJobExecution'
+              - 'iot:GetPendingJobExecutions'
+              - 'iot:UpdateJobExecution'
+              - 'iot:StartNextPendingJobExecution'
+            Resource:
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/things/${iot:Connection.Thing.ThingName}/jobs/*'
+
+  # ========================================
+  # IoT Core Resources
+  # ========================================
+
+  # IoT Thing Type - Template for device characteristics
+  IoTThingType:
+    Type: AWS::IoT::ThingType
+    Properties:
+      ThingTypeName: !Sub '${ProjectName}-${Environment}-${ThingTypeName}'
+      ThingTypeProperties:
+        ThingTypeDescription: !Sub 'Temperature sensor device type for ${ProjectName} ${Environment} environment'
+        SearchableAttributes:
+          - 'location'
+          - 'firmwareVersion'
+          - 'manufacturer'
+          - 'deviceType'
+          - 'installationDate'
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'ResourceType'
+          Value: 'IoTThingType'
+
+  # Static Thing Group for device organization
+  StaticThingGroup:
+    Type: AWS::IoT::ThingGroup
+    Properties:
+      ThingGroupName: !Sub '${ProjectName}-${Environment}-${FleetName}'
+      ThingGroupProperties:
+        ThingGroupDescription: !Sub 'Static thing group for ${ProjectName} ${Environment} sensors'
+        AttributePayload:
+          Attributes:
+            Environment: !Ref Environment
+            FleetName: !Ref FleetName
+            DeviceType: 'temperature-sensor'
+            ManagedBy: 'CloudFormation'
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'ResourceType'
+          Value: 'StaticThingGroup'
+
+  # Dynamic Thing Group for firmware management
+  DynamicThingGroupOutdatedFirmware:
+    Type: AWS::IoT::ThingGroup
+    Properties:
+      ThingGroupName: !Sub '${ProjectName}-${Environment}-outdated-firmware'
+      ThingGroupProperties:
+        ThingGroupDescription: 'Dynamic group for devices with outdated firmware'
+        AttributePayload:
+          Attributes:
+            GroupType: 'dynamic'
+            Purpose: 'firmware-management'
+            ManagedBy: 'CloudFormation'
+      QueryString: !Sub 'attributes.firmwareVersion:${FirmwareVersion}'
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'ResourceType'
+          Value: 'DynamicThingGroup'
+
+  # Dynamic Thing Group for location-based management
+  DynamicThingGroupBuildingA:
+    Type: AWS::IoT::ThingGroup
+    Properties:
+      ThingGroupName: !Sub '${ProjectName}-${Environment}-building-a-sensors'
+      ThingGroupProperties:
+        ThingGroupDescription: 'Dynamic group for all sensors in Building A'
+        AttributePayload:
+          Attributes:
+            GroupType: 'dynamic'
+            Purpose: 'location-management'
+            Location: 'Building-A'
+            ManagedBy: 'CloudFormation'
+      QueryString: 'attributes.location:Building-A'
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'ResourceType'
+          Value: 'DynamicThingGroup'
+
+  # IoT Things (Devices) - Creating multiple devices
+  IoTDevice01:
+    Type: AWS::IoT::Thing
+    Properties:
+      ThingName: !Sub '${ProjectName}-${Environment}-temp-sensor-01'
+      ThingTypeName: !Ref IoTThingType
+      AttributePayload:
+        Attributes:
+          location: 'Building-A'
+          firmwareVersion: !Ref FirmwareVersion
+          manufacturer: 'AcmeSensors'
+          deviceType: 'temperature-sensor'
+          installationDate: !Sub '${AWS::StackName}-creation'
+          floor: '1'
+          room: 'A101'
+
+  IoTDevice02:
+    Type: AWS::IoT::Thing
+    Condition: CreateMultipleDevices
+    Properties:
+      ThingName: !Sub '${ProjectName}-${Environment}-temp-sensor-02'
+      ThingTypeName: !Ref IoTThingType
+      AttributePayload:
+        Attributes:
+          location: 'Building-B'
+          firmwareVersion: !Ref FirmwareVersion
+          manufacturer: 'AcmeSensors'
+          deviceType: 'temperature-sensor'
+          installationDate: !Sub '${AWS::StackName}-creation'
+          floor: '2'
+          room: 'B201'
+
+  IoTDevice03:
+    Type: AWS::IoT::Thing
+    Condition: CreateMultipleDevices
+    Properties:
+      ThingName: !Sub '${ProjectName}-${Environment}-temp-sensor-03'
+      ThingTypeName: !Ref IoTThingType
+      AttributePayload:
+        Attributes:
+          location: 'Building-C'
+          firmwareVersion: !Ref FirmwareVersion
+          manufacturer: 'AcmeSensors'
+          deviceType: 'temperature-sensor'
+          installationDate: !Sub '${AWS::StackName}-creation'
+          floor: '1'
+          room: 'C102'
+
+  IoTDevice04:
+    Type: AWS::IoT::Thing
+    Condition: CreateMultipleDevices
+    Properties:
+      ThingName: !Sub '${ProjectName}-${Environment}-temp-sensor-04'
+      ThingTypeName: !Ref IoTThingType
+      AttributePayload:
+        Attributes:
+          location: 'Building-D'
+          firmwareVersion: !Ref FirmwareVersion
+          manufacturer: 'AcmeSensors'
+          deviceType: 'temperature-sensor'
+          installationDate: !Sub '${AWS::StackName}-creation'
+          floor: '3'
+          room: 'D301'
+
+  # ========================================
+  # Device Certificates and Security
+  # ========================================
+
+  # Device Certificate for Device 01
+  DeviceCertificate01:
+    Type: AWS::IoT::Certificate
+    Properties:
+      Status: ACTIVE
+      CertificateSigningRequest: !Sub |
+        -----BEGIN CERTIFICATE REQUEST-----
+        # This is a placeholder CSR for CloudFormation deployment
+        # In production, generate actual CSRs for each device
+        -----END CERTIFICATE REQUEST-----
+
+  # Certificate Policy Attachment for Device 01
+  CertificatePolicyAttachment01:
+    Type: AWS::IoT::PolicyPrincipalAttachment
+    Properties:
+      PolicyName: !Ref IoTDevicePolicy
+      Principal: !GetAtt DeviceCertificate01.Arn
+
+  # Certificate Thing Attachment for Device 01
+  CertificateThingAttachment01:
+    Type: AWS::IoT::ThingPrincipalAttachment
+    Properties:
+      ThingName: !Ref IoTDevice01
+      Principal: !GetAtt DeviceCertificate01.Arn
+
+  # Add devices to static thing group
+  ThingGroupMembership01:
+    Type: AWS::IoT::ThingGroupMembership
+    Properties:
+      ThingGroupName: !Ref StaticThingGroup
+      ThingName: !Ref IoTDevice01
+
+  ThingGroupMembership02:
+    Type: AWS::IoT::ThingGroupMembership
+    Condition: CreateMultipleDevices
+    Properties:
+      ThingGroupName: !Ref StaticThingGroup
+      ThingName: !Ref IoTDevice02
+
+  ThingGroupMembership03:
+    Type: AWS::IoT::ThingGroupMembership
+    Condition: CreateMultipleDevices
+    Properties:
+      ThingGroupName: !Ref StaticThingGroup
+      ThingName: !Ref IoTDevice03
+
+  ThingGroupMembership04:
+    Type: AWS::IoT::ThingGroupMembership
+    Condition: CreateMultipleDevices
+    Properties:
+      ThingGroupName: !Ref StaticThingGroup
+      ThingName: !Ref IoTDevice04
+
+  # ========================================
+  # Fleet Management and Jobs
+  # ========================================
+
+  # Firmware Update Job
+  FirmwareUpdateJob:
+    Type: AWS::IoT::Job
+    DependsOn: 
+      - StaticThingGroup
+      - ThingGroupMembership01
+    Properties:
+      JobId: !Sub '${ProjectName}-${Environment}-firmware-update-job'
+      Description: !Sub 'Firmware update job for ${ProjectName} ${Environment} fleet'
+      Targets:
+        - !GetAtt StaticThingGroup.Arn
+      Document: !Sub |
+        {
+          "operation": "firmwareUpdate",
+          "firmwareVersion": "1.1.0",
+          "downloadUrl": "https://example-firmware-bucket.s3.amazonaws.com/firmware-v1.1.0.bin",
+          "checksum": "abc123def456",
+          "rebootRequired": true,
+          "timeout": 300,
+          "environment": "${Environment}",
+          "stackName": "${AWS::StackName}"
+        }
+      TargetSelection: CONTINUOUS
+      JobExecutionsConfig:
+        MaxConcurrentExecutions: !Ref MaxConcurrentJobs
+      TimeoutConfig:
+        InProgressTimeoutInMinutes: !Ref JobTimeoutMinutes
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'ResourceType'
+          Value: 'IoTJob'
+
+  # ========================================
+  # Monitoring and Logging
+  # ========================================
+
+  # CloudWatch Log Group for IoT device logs
+  IoTDeviceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/iot/${ProjectName}-${Environment}-device-management'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'ResourceType'
+          Value: 'LogGroup'
+
+  # CloudWatch Log Group for IoT job logs
+  IoTJobLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/iot/${ProjectName}-${Environment}-job-logs'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'ResourceType'
+          Value: 'JobLogGroup'
+
+  # IoT Logging Configuration
+  IoTLoggingConfiguration:
+    Type: AWS::IoT::LoggingConfiguration
+    Properties:
+      AccountId: !Ref AWS::AccountId
+      DefaultLogLevel: INFO
+      RoleArn: !GetAtt IoTLoggingRole.Arn
+
+  # IAM Role for IoT Logging
+  IoTLoggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-iot-logging-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/IoTLogsPolicy'
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'ResourceType'
+          Value: 'IAMRole'
+
+  # ========================================
+  # Fleet Metrics and Monitoring
+  # ========================================
+
+  # Fleet Metric for Connected Devices
+  FleetMetricConnectedDevices:
+    Type: AWS::IoT::FleetMetric
+    Condition: EnableFleetIndexing
+    Properties:
+      MetricName: !Sub '${ProjectName}-${Environment}-connected-devices'
+      Description: 'Count of connected devices in the fleet'
+      QueryString: 'connectivity.connected:true'
+      AggregationType:
+        Name: 'Statistics'
+        Values:
+          - 'count'
+      Period: 300  # 5 minutes
+      AggregationField: 'connectivity.connected'
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'ResourceType'
+          Value: 'FleetMetric'
+
+  # Fleet Metric for Firmware Versions
+  FleetMetricFirmwareVersions:
+    Type: AWS::IoT::FleetMetric
+    Condition: EnableFleetIndexing
+    Properties:
+      MetricName: !Sub '${ProjectName}-${Environment}-firmware-versions'
+      Description: 'Distribution of firmware versions across the fleet'
+      QueryString: 'attributes.firmwareVersion:*'
+      AggregationType:
+        Name: 'Statistics'
+        Values:
+          - 'count'
+      Period: 300  # 5 minutes
+      AggregationField: 'attributes.firmwareVersion'
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'ResourceType'
+          Value: 'FleetMetric'
+
+  # Fleet Metric for Device Locations
+  FleetMetricDeviceLocations:
+    Type: AWS::IoT::FleetMetric
+    Condition: EnableFleetIndexing
+    Properties:
+      MetricName: !Sub '${ProjectName}-${Environment}-device-locations'
+      Description: 'Distribution of devices by location'
+      QueryString: 'attributes.location:*'
+      AggregationType:
+        Name: 'Statistics'
+        Values:
+          - 'count'
+      Period: 300  # 5 minutes
+      AggregationField: 'attributes.location'
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'ResourceType'
+          Value: 'FleetMetric'
+
+  # ========================================
+  # CloudWatch Alarms for Monitoring
+  # ========================================
+
+  # Alarm for low device connectivity
+  DeviceConnectivityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableFleetIndexing
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-low-device-connectivity'
+      AlarmDescription: 'Alarm when device connectivity drops below threshold'
+      MetricName: !Sub '${ProjectName}-${Environment}-connected-devices'
+      Namespace: 'AWS/IoTFleetMetrics'
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !If [IsProduction, 3, 1]  # Higher threshold for production
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'ResourceType'
+          Value: 'CloudWatchAlarm'
+
+  # Alarm for job failures
+  JobFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-job-failures'
+      AlarmDescription: 'Alarm when IoT jobs fail'
+      MetricName: 'FailedJobs'
+      Namespace: 'AWS/IoT'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'ResourceType'
+          Value: 'CloudWatchAlarm'
+
+# ========================================
+# Outputs
+# ========================================
+
+Outputs:
+  # IoT Core Resources
+  IoTThingTypeArn:
+    Description: 'ARN of the IoT Thing Type'
+    Value: !GetAtt IoTThingType.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTThingTypeArn'
+
+  StaticThingGroupArn:
+    Description: 'ARN of the static thing group'
+    Value: !GetAtt StaticThingGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-StaticThingGroupArn'
+
+  DynamicThingGroupOutdatedFirmwareArn:
+    Description: 'ARN of the dynamic thing group for outdated firmware'
+    Value: !GetAtt DynamicThingGroupOutdatedFirmware.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamicThingGroupOutdatedFirmwareArn'
+
+  DynamicThingGroupBuildingAArn:
+    Description: 'ARN of the dynamic thing group for Building A sensors'
+    Value: !GetAtt DynamicThingGroupBuildingA.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamicThingGroupBuildingAArn'
+
+  # Device Information
+  Device01Name:
+    Description: 'Name of IoT Device 01'
+    Value: !Ref IoTDevice01
+    Export:
+      Name: !Sub '${AWS::StackName}-Device01Name'
+
+  Device01CertificateArn:
+    Description: 'Certificate ARN for Device 01'
+    Value: !GetAtt DeviceCertificate01.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-Device01CertificateArn'
+
+  # Additional device outputs (conditional)
+  Device02Name:
+    Condition: CreateMultipleDevices
+    Description: 'Name of IoT Device 02'
+    Value: !Ref IoTDevice02
+    Export:
+      Name: !Sub '${AWS::StackName}-Device02Name'
+
+  Device03Name:
+    Condition: CreateMultipleDevices
+    Description: 'Name of IoT Device 03'
+    Value: !Ref IoTDevice03
+    Export:
+      Name: !Sub '${AWS::StackName}-Device03Name'
+
+  Device04Name:
+    Condition: CreateMultipleDevices
+    Description: 'Name of IoT Device 04'
+    Value: !Ref IoTDevice04
+    Export:
+      Name: !Sub '${AWS::StackName}-Device04Name'
+
+  # Job Information
+  FirmwareUpdateJobId:
+    Description: 'ID of the firmware update job'
+    Value: !Ref FirmwareUpdateJob
+    Export:
+      Name: !Sub '${AWS::StackName}-FirmwareUpdateJobId'
+
+  FirmwareUpdateJobArn:
+    Description: 'ARN of the firmware update job'
+    Value: !GetAtt FirmwareUpdateJob.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FirmwareUpdateJobArn'
+
+  # Policy Information
+  IoTDevicePolicyName:
+    Description: 'Name of the IoT device policy'
+    Value: !Ref IoTDevicePolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTDevicePolicyName'
+
+  # Logging Information
+  IoTDeviceLogGroupName:
+    Description: 'Name of the IoT device log group'
+    Value: !Ref IoTDeviceLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTDeviceLogGroupName'
+
+  IoTJobLogGroupName:
+    Description: 'Name of the IoT job log group'
+    Value: !Ref IoTJobLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTJobLogGroupName'
+
+  # Fleet Metrics (conditional)
+  FleetMetricConnectedDevicesName:
+    Condition: EnableFleetIndexing
+    Description: 'Name of the connected devices fleet metric'
+    Value: !Ref FleetMetricConnectedDevices
+    Export:
+      Name: !Sub '${AWS::StackName}-FleetMetricConnectedDevicesName'
+
+  FleetMetricFirmwareVersionsName:
+    Condition: EnableFleetIndexing
+    Description: 'Name of the firmware versions fleet metric'
+    Value: !Ref FleetMetricFirmwareVersions
+    Export:
+      Name: !Sub '${AWS::StackName}-FleetMetricFirmwareVersionsName'
+
+  FleetMetricDeviceLocationsName:
+    Condition: EnableFleetIndexing
+    Description: 'Name of the device locations fleet metric'
+    Value: !Ref FleetMetricDeviceLocations
+    Export:
+      Name: !Sub '${AWS::StackName}-FleetMetricDeviceLocationsName'
+
+  # CloudWatch Alarms
+  DeviceConnectivityAlarmName:
+    Condition: EnableFleetIndexing
+    Description: 'Name of the device connectivity alarm'
+    Value: !Ref DeviceConnectivityAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-DeviceConnectivityAlarmName'
+
+  JobFailureAlarmName:
+    Description: 'Name of the job failure alarm'
+    Value: !Ref JobFailureAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-JobFailureAlarmName'
+
+  # Management Information
+  IoTConsoleURL:
+    Description: 'URL to access IoT Core console for this fleet'
+    Value: !Sub 'https://console.aws.amazon.com/iot/home?region=${AWS::Region}#/thinghub'
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTConsoleURL'
+
+  CloudWatchLogsURL:
+    Description: 'URL to access CloudWatch logs for IoT devices'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/%2Faws%2Fiot%2F${ProjectName}-${Environment}-device-management'
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchLogsURL'
+
+  # Stack Information
+  StackName:
+    Description: 'Name of this CloudFormation stack'
+    Value: !Ref AWS::StackName
+    Export:
+      Name: !Sub '${AWS::StackName}-StackName'
+
+  CreatedResources:
+    Description: 'Summary of created resources'
+    Value: !Sub |
+      IoT Thing Type: ${IoTThingType}
+      Static Thing Group: ${StaticThingGroup}
+      Dynamic Thing Groups: 2
+      IoT Devices: ${DeviceCount}
+      IoT Jobs: 1
+      Fleet Metrics: ${FleetIndexingEnabled}
+      CloudWatch Alarms: 2
+      Log Groups: 2
+    Export:
+      Name: !Sub '${AWS::StackName}-CreatedResources'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Fleet Configuration"
+        Parameters:
+          - FleetName
+          - ThingTypeName
+          - DeviceCount
+          - FirmwareVersion
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - LogRetentionDays
+          - FleetIndexingEnabled
+      - Label:
+          default: "Job Configuration"
+        Parameters:
+          - MaxConcurrentJobs
+          - JobTimeoutMinutes
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      FleetName:
+        default: "Fleet Name"
+      ThingTypeName:
+        default: "Thing Type Name"
+      DeviceCount:
+        default: "Number of Devices"
+      FirmwareVersion:
+        default: "Firmware Version"
+      LogRetentionDays:
+        default: "Log Retention (Days)"
+      FleetIndexingEnabled:
+        default: "Enable Fleet Indexing"
+      MaxConcurrentJobs:
+        default: "Max Concurrent Jobs"
+      JobTimeoutMinutes:
+        default: "Job Timeout (Minutes)"
+
+  # Template metadata
+  Template:
+    Description: 'AWS IoT Device Management CloudFormation template'
+    Version: '1.0'
+    Author: 'AWS CloudFormation Generator'
+    CreatedFor: 'IoT Device Management Recipe'
+    LastModified: '2025-01-27'
+    
+  # Documentation links
+  Documentation:
+    IoTCore: 'https://docs.aws.amazon.com/iot/latest/developerguide/'
+    DeviceManagement: 'https://docs.aws.amazon.com/iot/latest/developerguide/device-management.html'
+    FleetIndexing: 'https://docs.aws.amazon.com/iot/latest/developerguide/fleet-indexing.html'
+    IoTJobs: 'https://docs.aws.amazon.com/iot/latest/developerguide/iot-jobs.html'
+    IoTSecurity: 'https://docs.aws.amazon.com/iot/latest/developerguide/security.html'

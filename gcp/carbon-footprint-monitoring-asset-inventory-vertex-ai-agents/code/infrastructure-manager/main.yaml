@@ -1,0 +1,662 @@
+# Google Cloud Infrastructure Manager Configuration
+# Carbon Footprint Monitoring with Cloud Asset Inventory and Vertex AI Agents
+#
+# This Infrastructure Manager configuration deploys a comprehensive carbon footprint
+# monitoring solution that combines Cloud Asset Inventory, BigQuery analytics,
+# Vertex AI agents, and Cloud Monitoring for intelligent sustainability insights.
+
+apiVersion: 1
+kind: Infrastructure
+metadata:
+  name: carbon-footprint-monitoring
+  labels:
+    solution: sustainability-monitoring
+    category: analytics
+    environment: demo
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID for deployment"
+    required: true
+  
+  region:
+    type: string
+    description: "Primary deployment region"
+    default: "us-central1"
+    validation:
+      pattern: "^[a-z]+-[a-z]+[0-9]$"
+  
+  dataset_name:
+    type: string
+    description: "BigQuery dataset name for carbon analytics"
+    default: "carbon_footprint_analytics"
+    validation:
+      pattern: "^[a-zA-Z_][a-zA-Z0-9_]*$"
+  
+  agent_name:
+    type: string
+    description: "Name for the Vertex AI sustainability agent"
+    default: "sustainability-advisor"
+    validation:
+      pattern: "^[a-z0-9-]+$"
+  
+  monitoring_threshold:
+    type: number
+    description: "Carbon emission threshold for alerts (kgCO2e)"
+    default: 10.0
+    validation:
+      minimum: 0.1
+      maximum: 1000.0
+  
+  environment:
+    type: string
+    description: "Environment label for resource tagging"
+    default: "demo"
+    validation:
+      enum: ["dev", "test", "staging", "prod", "demo"]
+
+# Resource deployments
+deployments:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/cloudasset.googleapis.com
+    metadata:
+      dependsOn: []
+  
+  - name: enable-bigquery-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/bigquery.googleapis.com
+    metadata:
+      dependsOn: []
+  
+  - name: enable-pubsub-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/pubsub.googleapis.com
+    metadata:
+      dependsOn: []
+  
+  - name: enable-aiplatform-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/aiplatform.googleapis.com
+    metadata:
+      dependsOn: []
+  
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/monitoring.googleapis.com
+    metadata:
+      dependsOn: []
+  
+  - name: enable-carbonfootprint-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/carbonfootprint.googleapis.com
+    metadata:
+      dependsOn: []
+  
+  # Create Cloud Storage bucket for AI agent data and reports
+  - name: carbon-data-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: carbon-data-$(ref.random-suffix.value)
+      project: $(var.project_id)
+      location: $(var.region)
+      storageClass: STANDARD
+      # Implement sustainability best practices with lifecycle management
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90
+          - action:
+              type: Delete
+            condition:
+              age: 365
+      # Security and compliance settings
+      versioning:
+        enabled: true
+      uniformBucketLevelAccess:
+        enabled: true
+      labels:
+        purpose: carbon-monitoring
+        environment: $(var.environment)
+        solution: sustainability-analytics
+    metadata:
+      dependsOn:
+        - random-suffix
+
+  # Generate random suffix for unique resource naming
+  - name: random-suffix
+    type: gcp-types/compute-v1:instances
+    properties:
+      name: temp-random-generator
+      zone: $(var.region)-a
+      machineType: zones/$(var.region)-a/machineTypes/e2-micro
+      # This is a temporary resource just to generate randomness
+      disks:
+        - boot: true
+          initializeParams:
+            sourceImage: projects/debian-cloud/global/images/family/debian-11
+      metadata:
+        items:
+          - key: startup-script
+            value: |
+              #!/bin/bash
+              echo $(openssl rand -hex 3) > /tmp/random_suffix
+              gcloud compute instances delete $(hostname) --zone=$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/zone" -H "Metadata-Flavor: Google" | cut -d/ -f4) --quiet
+      serviceAccounts:
+        - email: default
+          scopes:
+            - https://www.googleapis.com/auth/compute
+    metadata:
+      dependsOn: []
+
+  # Create BigQuery dataset for carbon footprint analytics
+  - name: carbon-analytics-dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      datasetId: $(var.dataset_name)
+      projectId: $(var.project_id)
+      location: $(var.region)
+      description: "Carbon footprint and sustainability analytics data warehouse"
+      # Data governance and security settings
+      access:
+        - role: OWNER
+          userByEmail: $(ref.project_id.projectId)@appspot.gserviceaccount.com
+        - role: READER
+          specialGroup: projectReaders
+        - role: WRITER
+          specialGroup: projectWriters
+      labels:
+        purpose: carbon-analytics
+        environment: $(var.environment)
+        data-classification: internal
+    metadata:
+      dependsOn:
+        - enable-bigquery-api
+
+  # Create BigQuery table for asset inventory tracking
+  - name: asset-inventory-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: $(var.project_id)
+      datasetId: $(ref.carbon-analytics-dataset.datasetId)
+      tableId: asset_inventory
+      description: "Cloud Asset Inventory data for carbon footprint correlation"
+      schema:
+        fields:
+          - name: timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "When the asset change occurred"
+          - name: asset_type
+            type: STRING
+            mode: REQUIRED
+            description: "Type of Google Cloud asset"
+          - name: name
+            type: STRING
+            mode: REQUIRED
+            description: "Asset resource name"
+          - name: location
+            type: STRING
+            mode: NULLABLE
+            description: "Geographic location of the asset"
+          - name: resource_data
+            type: JSON
+            mode: NULLABLE
+            description: "Complete asset configuration data"
+          - name: project_id
+            type: STRING
+            mode: REQUIRED
+            description: "Project containing the asset"
+          - name: change_type
+            type: STRING
+            mode: NULLABLE
+            description: "Type of change (CREATE, UPDATE, DELETE)"
+      # Optimize for time-series analytics
+      timePartitioning:
+        type: DAY
+        field: timestamp
+      clustering:
+        fields:
+          - asset_type
+          - project_id
+          - location
+      labels:
+        table-purpose: asset-tracking
+        data-retention: "30-days"
+    metadata:
+      dependsOn:
+        - carbon-analytics-dataset
+
+  # Create BigQuery table for carbon emissions data
+  - name: carbon-emissions-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: $(var.project_id)
+      datasetId: $(ref.carbon-analytics-dataset.datasetId)
+      tableId: carbon_emissions
+      description: "Google Cloud Carbon Footprint service emissions data"
+      schema:
+        fields:
+          - name: billing_account_id
+            type: STRING
+            mode: REQUIRED
+            description: "Billing account identifier"
+          - name: project_id
+            type: STRING
+            mode: REQUIRED
+            description: "Google Cloud project identifier"
+          - name: service
+            type: STRING
+            mode: REQUIRED
+            description: "Google Cloud service name"
+          - name: location
+            type: STRING
+            mode: REQUIRED
+            description: "Geographic location of resource usage"
+          - name: carbon_footprint_kgCO2e
+            type: FLOAT64
+            mode: REQUIRED
+            description: "Carbon emissions in kilograms CO2 equivalent"
+          - name: carbon_footprint_total_kgCO2e
+            type: FLOAT64
+            mode: REQUIRED
+            description: "Total carbon emissions including scope 2 and 3"
+          - name: usage_month
+            type: DATE
+            mode: REQUIRED
+            description: "Month of resource usage"
+          - name: region
+            type: STRING
+            mode: NULLABLE
+            description: "Cloud region for location-based analysis"
+      # Optimize for monthly reporting and service analysis
+      timePartitioning:
+        type: MONTH
+        field: usage_month
+      clustering:
+        fields:
+          - service
+          - location
+          - project_id
+      labels:
+        table-purpose: emissions-tracking
+        data-source: carbon-footprint-api
+    metadata:
+      dependsOn:
+        - carbon-analytics-dataset
+
+  # Create BigQuery view for monthly carbon trends analysis
+  - name: monthly-carbon-trends-view
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: $(var.project_id)
+      datasetId: $(ref.carbon-analytics-dataset.datasetId)
+      tableId: monthly_carbon_trends
+      description: "Aggregated monthly carbon emissions trends by service and location"
+      view:
+        query: |
+          SELECT 
+            usage_month,
+            service,
+            location,
+            project_id,
+            SUM(carbon_footprint_total_kgCO2e) as total_emissions,
+            AVG(carbon_footprint_total_kgCO2e) as avg_emissions,
+            COUNT(*) as resource_count,
+            MIN(carbon_footprint_total_kgCO2e) as min_emissions,
+            MAX(carbon_footprint_total_kgCO2e) as max_emissions
+          FROM `$(var.project_id).$(var.dataset_name).carbon_emissions`
+          GROUP BY usage_month, service, location, project_id
+          ORDER BY usage_month DESC, total_emissions DESC
+        useLegacySql: false
+      labels:
+        view-purpose: trend-analysis
+        aggregation-level: monthly
+    metadata:
+      dependsOn:
+        - carbon-emissions-table
+
+  # Create Pub/Sub topic for real-time asset change notifications
+  - name: asset-changes-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(var.project_id)/topics/asset-changes-$(ref.random-suffix.value)
+      labels:
+        purpose: asset-monitoring
+        environment: $(var.environment)
+        data-flow: real-time
+      # Message retention for reliability
+      messageRetentionDuration: 604800s  # 7 days
+    metadata:
+      dependsOn:
+        - enable-pubsub-api
+        - random-suffix
+
+  # Create Pub/Sub subscription for BigQuery streaming
+  - name: asset-changes-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(var.project_id)/subscriptions/asset-changes-bq-$(ref.random-suffix.value)
+      topic: $(ref.asset-changes-topic.name)
+      # Configure for BigQuery streaming insert
+      bigqueryConfig:
+        table: projects/$(var.project_id)/datasets/$(var.dataset_name)/tables/asset_inventory
+        useTopicSchema: false
+        writeMetadata: true
+      # Delivery and retry configuration
+      ackDeadlineSeconds: 600
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+      # Dead letter policy for failed messages
+      deadLetterPolicy:
+        deadLetterTopic: projects/$(var.project_id)/topics/asset-changes-dlq-$(ref.random-suffix.value)
+        maxDeliveryAttempts: 5
+      labels:
+        subscription-purpose: bigquery-streaming
+        data-destination: asset-inventory
+    metadata:
+      dependsOn:
+        - asset-changes-topic
+        - asset-inventory-table
+
+  # Create dead letter queue for failed message processing
+  - name: asset-changes-dlq
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(var.project_id)/topics/asset-changes-dlq-$(ref.random-suffix.value)
+      labels:
+        purpose: dead-letter-queue
+        data-flow: error-handling
+      messageRetentionDuration: 604800s  # 7 days
+    metadata:
+      dependsOn:
+        - enable-pubsub-api
+        - random-suffix
+
+  # Configure Cloud Asset Inventory feed for real-time monitoring
+  - name: carbon-monitoring-feed
+    type: gcp-types/cloudasset-v1:feeds
+    properties:
+      parent: projects/$(var.project_id)
+      feedId: carbon-monitoring-feed
+      # Monitor key resource types that impact carbon footprint
+      assetTypes:
+        - compute.googleapis.com/Instance
+        - storage.googleapis.com/Bucket
+        - container.googleapis.com/Cluster
+        - sqladmin.googleapis.com/Instance
+        - dataflow.googleapis.com/Job
+        - bigquery.googleapis.com/Dataset
+        - bigquery.googleapis.com/Table
+      contentType: RESOURCE
+      # Stream changes to Pub/Sub for real-time processing
+      feedOutputConfig:
+        pubsubDestination:
+          topic: $(ref.asset-changes-topic.name)
+      # Condition to filter relevant asset changes
+      condition:
+        expression: |
+          temporal_asset.deleted == false &&
+          (temporal_asset.asset.asset_type.contains("Instance") ||
+           temporal_asset.asset.asset_type.contains("Bucket") ||
+           temporal_asset.asset.asset_type.contains("Cluster"))
+    metadata:
+      dependsOn:
+        - enable-apis
+        - asset-changes-topic
+
+  # IAM binding for Cloud Asset Inventory to publish to Pub/Sub
+  - name: asset-inventory-pubsub-iam
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: $(var.project_id)
+      policy:
+        bindings:
+          - role: roles/pubsub.publisher
+            members:
+              - serviceAccount:service-$(ref.project-number.value)@gcp-sa-cloudasset.iam.gserviceaccount.com
+      setIamPolicyRequest:
+        updateMask: bindings
+    metadata:
+      dependsOn:
+        - project-number
+        - asset-changes-topic
+
+  # Get project number for IAM configuration
+  - name: project-number
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: $(var.project_id)
+    metadata:
+      dependsOn: []
+
+  # Create custom metrics for carbon footprint monitoring
+  - name: carbon-emissions-metric
+    type: gcp-types/monitoring-v1:projects.metricDescriptors
+    properties:
+      name: projects/$(var.project_id)/metricDescriptors/custom.googleapis.com/carbon/emissions_per_service
+      type: custom.googleapis.com/carbon/emissions_per_service
+      metricKind: GAUGE
+      valueType: DOUBLE
+      unit: "kgCO2e"
+      description: "Carbon emissions per Google Cloud service in kilograms CO2 equivalent"
+      displayName: "Service Carbon Emissions"
+      # Metric labels for detailed analysis
+      labels:
+        - key: service_name
+          valueType: STRING
+          description: "Google Cloud service name"
+        - key: location
+          valueType: STRING
+          description: "Geographic location"
+        - key: project_id
+          valueType: STRING
+          description: "Project identifier"
+        - key: billing_account
+          valueType: STRING
+          description: "Billing account"
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+
+  # Create alerting policy for carbon emission threshold monitoring
+  - name: high-carbon-emissions-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      name: projects/$(var.project_id)/alertPolicies/high-carbon-emissions
+      displayName: "High Carbon Emissions Alert"
+      documentation:
+        content: |
+          This alert triggers when carbon emissions for any service exceed the configured threshold.
+          This may indicate inefficient resource usage or unexpected workload scaling that impacts
+          sustainability goals. Review the affected service and consider optimization measures.
+        mimeType: text/markdown
+      # Alert condition configuration
+      conditions:
+        - displayName: "Carbon emissions threshold exceeded"
+          conditionThreshold:
+            filter: 'metric.type="custom.googleapis.com/carbon/emissions_per_service"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: $(var.monitoring_threshold)
+            duration: 300s  # 5 minutes
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_MAX
+                groupByFields:
+                  - metric.label.service_name
+                  - metric.label.location
+      # Notification and incident management
+      alertStrategy:
+        autoClose: 1800s  # 30 minutes
+        notificationRateLimit:
+          period: 300s  # 5 minutes
+      # Severity and incident classification
+      severity: WARNING
+      enabled: true
+      # Combine multiple conditions if needed
+      combiner: OR
+    metadata:
+      dependsOn:
+        - carbon-emissions-metric
+
+  # Create notification channel for carbon emission alerts
+  - name: carbon-alert-email-channel
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      name: projects/$(var.project_id)/notificationChannels/carbon-alerts-email
+      type: email
+      displayName: "Carbon Footprint Alerts"
+      description: "Email notifications for carbon emission threshold violations"
+      labels:
+        email_address: admin@example.com  # Replace with actual email
+      # Channel verification and management
+      enabled: true
+      userLabels:
+        alert_type: sustainability
+        severity: medium
+        team: platform-engineering
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+
+  # Create service account for Vertex AI agent operations
+  - name: vertex-ai-agent-sa
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: vertex-ai-carbon-agent
+      projectId: $(var.project_id)
+      serviceAccount:
+        displayName: "Vertex AI Carbon Footprint Agent"
+        description: "Service account for AI-powered sustainability analysis and recommendations"
+    metadata:
+      dependsOn: []
+
+  # Grant BigQuery access to Vertex AI service account
+  - name: vertex-ai-bigquery-access
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: $(var.project_id)
+      policy:
+        bindings:
+          - role: roles/bigquery.dataViewer
+            members:
+              - serviceAccount:$(ref.vertex-ai-agent-sa.email)
+          - role: roles/bigquery.jobUser
+            members:
+              - serviceAccount:$(ref.vertex-ai-agent-sa.email)
+          - role: roles/storage.objectViewer
+            members:
+              - serviceAccount:$(ref.vertex-ai-agent-sa.email)
+      setIamPolicyRequest:
+        updateMask: bindings
+    metadata:
+      dependsOn:
+        - vertex-ai-agent-sa
+        - carbon-data-bucket
+
+# Output values for verification and integration
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: $(var.project_id)
+  
+  region:
+    description: "Deployment region"
+    value: $(var.region)
+  
+  bigquery_dataset:
+    description: "BigQuery dataset for carbon analytics"
+    value: $(ref.carbon-analytics-dataset.datasetId)
+  
+  carbon_data_bucket:
+    description: "Cloud Storage bucket for AI agent data"
+    value: $(ref.carbon-data-bucket.name)
+  
+  asset_changes_topic:
+    description: "Pub/Sub topic for asset change notifications"
+    value: $(ref.asset-changes-topic.name)
+  
+  monitoring_dashboard_url:
+    description: "URL for carbon footprint monitoring dashboard"
+    value: "https://console.cloud.google.com/monitoring/dashboards/custom?project=$(var.project_id)"
+  
+  bigquery_console_url:
+    description: "URL for BigQuery carbon analytics dataset"
+    value: "https://console.cloud.google.com/bigquery?project=$(var.project_id)&ws=!1m4!1m3!3m2!1s$(var.project_id)!2s$(var.dataset_name)"
+  
+  vertex_ai_agent_email:
+    description: "Service account email for Vertex AI agent"
+    value: $(ref.vertex-ai-agent-sa.email)
+  
+  deployment_timestamp:
+    description: "Infrastructure deployment timestamp"
+    value: $(timestamp())
+  
+  carbon_monitoring_feed:
+    description: "Cloud Asset Inventory feed name"
+    value: $(ref.carbon-monitoring-feed.name)
+
+# Resource dependencies and deployment validation
+validation:
+  # Ensure all required APIs are enabled before resource creation
+  - name: api-enablement-check
+    condition: |
+      refs.enable-apis.status == "ENABLED" &&
+      refs.enable-bigquery-api.status == "ENABLED" &&
+      refs.enable-pubsub-api.status == "ENABLED" &&
+      refs.enable-aiplatform-api.status == "ENABLED" &&
+      refs.enable-monitoring-api.status == "ENABLED"
+    
+  # Validate BigQuery dataset and tables are successfully created
+  - name: bigquery-resources-check
+    condition: |
+      refs.carbon-analytics-dataset.datasetId != null &&
+      refs.asset-inventory-table.tableId != null &&
+      refs.carbon-emissions-table.tableId != null
+    
+  # Ensure Pub/Sub topic and subscription are properly configured
+  - name: pubsub-configuration-check
+    condition: |
+      refs.asset-changes-topic.name != null &&
+      refs.asset-changes-subscription.name != null
+    
+  # Verify monitoring infrastructure is properly set up
+  - name: monitoring-setup-check
+    condition: |
+      refs.carbon-emissions-metric.type != null &&
+      refs.high-carbon-emissions-alert.name != null
+
+# Metadata for infrastructure management
+metadata:
+  annotations:
+    infrastructure.google.com/generated-by: "carbon-footprint-monitoring-recipe"
+    infrastructure.google.com/version: "1.0"
+    sustainability.google.com/carbon-aware: "true"
+    compliance.google.com/esg-ready: "true"
+  
+  labels:
+    solution-category: sustainability
+    data-classification: internal
+    cost-center: platform-engineering
+    environment: $(var.environment)
+    carbon-monitoring: enabled
+    ai-powered: vertex-ai-agents

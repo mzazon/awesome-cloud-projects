@@ -1,0 +1,637 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Automated Email Notification System with SES, Lambda, and EventBridge - Production-ready serverless email automation with event-driven architecture'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: email-automation
+    Description: Name prefix for all resources
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: ^[a-z0-9-]+$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+
+  SenderEmail:
+    Type: String
+    Description: Verified sender email address for SES
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name for resource tagging and configuration
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    Description: Lambda function timeout in seconds
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+    Description: Lambda function memory allocation in MB
+
+  EnableCloudWatchAlarms:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable CloudWatch alarms for monitoring
+
+  DailyReportSchedule:
+    Type: String
+    Default: 'cron(0 9 * * ? *)'
+    Description: Cron expression for daily report schedule (default 9 AM UTC)
+    AllowedPattern: ^cron\(.+\)$
+    ConstraintDescription: Must be a valid cron expression
+
+Conditions:
+  CreateCloudWatchAlarms: !Equals [!Ref EnableCloudWatchAlarms, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # S3 Bucket for Lambda deployment packages
+  LambdaDeploymentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-lambda-deployment-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-deployment'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Lambda deployment packages
+
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SESEmailSendingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                  - ses:SendTemplatedEmail
+                  - ses:GetTemplate
+                Resource: '*'
+        - PolicyName: CloudWatchMetricsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SES Email Template
+  EmailTemplate:
+    Type: AWS::SES::Template
+    Properties:
+      Template:
+        TemplateName: !Sub '${ProjectName}-notification-template'
+        SubjectPart: '{{subject}}'
+        HtmlPart: |
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>{{subject}}</title>
+              <style>
+                  body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px; }
+                  .header { background-color: #f8f9fa; padding: 20px; border-radius: 5px; margin-bottom: 20px; }
+                  .content { background-color: #ffffff; padding: 20px; border: 1px solid #dee2e6; border-radius: 5px; }
+                  .footer { margin-top: 20px; padding: 15px; background-color: #e9ecef; border-radius: 5px; font-size: 12px; color: #6c757d; }
+                  .title { color: #495057; margin-bottom: 15px; }
+                  .timestamp { font-weight: bold; color: #007bff; }
+              </style>
+          </head>
+          <body>
+              <div class="header">
+                  <h2 class="title">{{title}}</h2>
+              </div>
+              <div class="content">
+                  <p>{{message}}</p>
+                  <p><strong>Event Source:</strong> {{source}}</p>
+                  <p class="timestamp"><strong>Timestamp:</strong> {{timestamp}}</p>
+              </div>
+              <div class="footer">
+                  <p>This is an automated notification from your system. Please do not reply to this email.</p>
+              </div>
+          </body>
+          </html>
+        TextPart: |
+          {{title}}
+          
+          {{message}}
+          
+          Event Source: {{source}}
+          Timestamp: {{timestamp}}
+          
+          ---
+          This is an automated notification from your system.
+
+  # Lambda Function for Email Processing
+  EmailProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-email-processor'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          SENDER_EMAIL: !Ref SenderEmail
+          TEMPLATE_NAME: !Ref EmailTemplate
+          ENVIRONMENT: !Ref Environment
+      ReservedConcurrencyLimit: !If [IsProduction, 100, 10]
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          from typing import Dict, Any
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          # Initialize AWS clients
+          ses_client = boto3.client('ses')
+          cloudwatch = boto3.client('cloudwatch')
+          
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              Process email notification events from EventBridge
+              
+              Args:
+                  event: EventBridge event containing email notification details
+                  context: Lambda runtime context
+                  
+              Returns:
+                  Dict containing processing results
+              """
+              try:
+                  logger.info(f"Processing event: {json.dumps(event)}")
+                  
+                  # Extract event details
+                  event_detail = event.get('detail', {})
+                  event_source = event.get('source', 'unknown')
+                  event_type = event.get('detail-type', 'Unknown Event')
+                  
+                  # Extract email configuration from event
+                  email_config = event_detail.get('emailConfig', {})
+                  recipient = email_config.get('recipient')
+                  subject = email_config.get('subject', f'Notification: {event_type}')
+                  message = event_detail.get('message', 'No message provided')
+                  title = event_detail.get('title', event_type)
+                  priority = event_detail.get('priority', 'normal')
+                  
+                  # Validate required fields
+                  if not recipient:
+                      logger.error("No recipient specified in event")
+                      raise ValueError("Recipient email address is required")
+                  
+                  # Prepare template data
+                  template_data = {
+                      'subject': subject,
+                      'title': title,
+                      'message': message,
+                      'timestamp': datetime.now().isoformat(),
+                      'source': event_source,
+                      'priority': priority
+                  }
+                  
+                  # Send templated email
+                  response = ses_client.send_templated_email(
+                      Source=os.environ['SENDER_EMAIL'],
+                      Destination={'ToAddresses': [recipient]},
+                      Template=os.environ['TEMPLATE_NAME'],
+                      TemplateData=json.dumps(template_data)
+                  )
+                  
+                  # Send custom metrics to CloudWatch
+                  try:
+                      cloudwatch.put_metric_data(
+                          Namespace='EmailAutomation',
+                          MetricData=[
+                              {
+                                  'MetricName': 'EmailsSent',
+                                  'Value': 1,
+                                  'Unit': 'Count',
+                                  'Dimensions': [
+                                      {'Name': 'Environment', 'Value': os.environ['ENVIRONMENT']},
+                                      {'Name': 'Priority', 'Value': priority}
+                                  ]
+                              }
+                          ]
+                      )
+                  except Exception as metric_error:
+                      logger.warning(f"Failed to send metrics: {str(metric_error)}")
+                  
+                  logger.info(f"Email sent successfully: {response['MessageId']} to {recipient}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Email sent successfully',
+                          'messageId': response['MessageId'],
+                          'recipient': recipient,
+                          'priority': priority
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing email: {str(e)}")
+                  
+                  # Send error metrics to CloudWatch
+                  try:
+                      cloudwatch.put_metric_data(
+                          Namespace='EmailAutomation',
+                          MetricData=[
+                              {
+                                  'MetricName': 'EmailErrors',
+                                  'Value': 1,
+                                  'Unit': 'Count',
+                                  'Dimensions': [
+                                      {'Name': 'Environment', 'Value': os.environ.get('ENVIRONMENT', 'unknown')},
+                                      {'Name': 'ErrorType', 'Value': type(e).__name__}
+                                  ]
+                              }
+                          ]
+                      )
+                  except Exception as metric_error:
+                      logger.warning(f"Failed to send error metrics: {str(metric_error)}")
+                  
+                  # Re-raise to trigger EventBridge retry mechanism
+                  raise e
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-email-processor'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Dead Letter Queue for failed Lambda executions
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dlq'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Custom EventBridge Bus
+  CustomEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${ProjectName}-event-bus'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-event-bus'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # EventBridge Rule for Email Notifications
+  EmailNotificationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-email-rule'
+      Description: Route email notification requests to Lambda processor
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        source: ["custom.application"]
+        detail-type: ["Email Notification Request"]
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt EmailProcessorFunction.Arn
+          Id: EmailProcessorTarget
+          RetryPolicy:
+            MaximumRetryAttempts: 3
+            MaximumEventAge: 3600  # 1 hour
+          DeadLetterConfig:
+            Arn: !GetAtt DeadLetterQueue.Arn
+
+  # EventBridge Rule for Priority Alerts
+  PriorityAlertRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-priority-rule'
+      Description: Handle high priority alerts with expedited processing
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        source: ["custom.application"]
+        detail-type: ["Priority Alert"]
+        detail:
+          priority: ["high", "critical"]
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt EmailProcessorFunction.Arn
+          Id: PriorityProcessorTarget
+          RetryPolicy:
+            MaximumRetryAttempts: 5
+            MaximumEventAge: 1800  # 30 minutes
+
+  # Scheduled Rule for Daily Reports
+  DailyReportRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-daily-report'
+      Description: Send daily email reports on schedule
+      ScheduleExpression: !Ref DailyReportSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt EmailProcessorFunction.Arn
+          Id: DailyReportTarget
+          Input: !Sub |
+            {
+              "source": "scheduled.reports",
+              "detail-type": "Daily Report",
+              "detail": {
+                "emailConfig": {
+                  "recipient": "${SenderEmail}",
+                  "subject": "Daily System Report"
+                },
+                "title": "Daily System Summary",
+                "message": "Your daily system report is ready. Check the dashboard for detailed metrics and performance data."
+              }
+            }
+
+  # Lambda Permissions for EventBridge Rules
+  EmailRuleLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EmailProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EmailNotificationRule.Arn
+
+  PriorityRuleLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EmailProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PriorityAlertRule.Arn
+
+  DailyReportLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EmailProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyReportRule.Arn
+
+  # CloudWatch Alarms for Monitoring
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors'
+      AlarmDescription: Monitor Lambda function errors for email processing
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EmailProcessorFunction
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref ErrorNotificationTopic
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-duration'
+      AlarmDescription: Monitor Lambda function duration
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !If [IsProduction, 20000, 25000]  # 20s for prod, 25s for dev/staging
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EmailProcessorFunction
+      TreatMissingData: notBreaching
+
+  SESBounceAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-ses-bounces'
+      AlarmDescription: Monitor SES bounce rate
+      MetricName: Bounce
+      Namespace: AWS/SES
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref ErrorNotificationTopic
+
+  # SNS Topic for Error Notifications
+  ErrorNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      TopicName: !Sub '${ProjectName}-error-notifications'
+      DisplayName: Email Automation System Error Notifications
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-error-notifications'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group with Retention
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-email-processor'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Custom Metric Filter for Error Tracking
+  EmailProcessingErrorsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref LambdaLogGroup
+      FilterPattern: 'ERROR'
+      MetricTransformations:
+        - MetricNamespace: EmailAutomation
+          MetricName: ProcessingErrors
+          MetricValue: '1'
+          DefaultValue: 0
+
+Outputs:
+  EventBusName:
+    Description: Name of the custom EventBridge event bus
+    Value: !Ref CustomEventBus
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBusName'
+
+  EventBusArn:
+    Description: ARN of the custom EventBridge event bus
+    Value: !GetAtt CustomEventBus.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBusArn'
+
+  LambdaFunctionName:
+    Description: Name of the email processing Lambda function
+    Value: !Ref EmailProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  LambdaFunctionArn:
+    Description: ARN of the email processing Lambda function
+    Value: !GetAtt EmailProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  EmailTemplateName:
+    Description: Name of the SES email template
+    Value: !Ref EmailTemplate
+    Export:
+      Name: !Sub '${AWS::StackName}-EmailTemplateName'
+
+  DeploymentBucketName:
+    Description: Name of the S3 bucket for Lambda deployment packages
+    Value: !Ref LambdaDeploymentBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentBucketName'
+
+  DeadLetterQueueUrl:
+    Description: URL of the dead letter queue for failed events
+    Value: !Ref DeadLetterQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueueUrl'
+
+  ErrorNotificationTopicArn:
+    Description: ARN of the SNS topic for error notifications
+    Value: !If [CreateCloudWatchAlarms, !Ref ErrorNotificationTopic, 'Not created']
+    Export:
+      Name: !Sub '${AWS::StackName}-ErrorNotificationTopicArn'
+
+  SampleEventCommand:
+    Description: Sample AWS CLI command to send a test event
+    Value: !Sub |
+      aws events put-events --entries '[{
+        "Source": "custom.application",
+        "DetailType": "Email Notification Request",
+        "Detail": "{\"emailConfig\":{\"recipient\":\"${SenderEmail}\",\"subject\":\"Test Notification\"},\"title\":\"System Alert\",\"message\":\"This is a test notification from the automated email system.\"}",
+        "EventBusName": "${CustomEventBus}"
+      }]'
+
+  PriorityEventCommand:
+    Description: Sample AWS CLI command to send a priority alert
+    Value: !Sub |
+      aws events put-events --entries '[{
+        "Source": "custom.application",
+        "DetailType": "Priority Alert",
+        "Detail": "{\"priority\":\"high\",\"emailConfig\":{\"recipient\":\"${SenderEmail}\",\"subject\":\"High Priority Alert\"},\"title\":\"Critical System Issue\",\"message\":\"Immediate attention required for system component failure.\"}",
+        "EventBusName": "${CustomEventBus}"
+      }]'
+
+  MonitoringDashboardUrl:
+    Description: URL to CloudWatch dashboard for monitoring the email system
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-email-automation'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Basic Configuration
+        Parameters:
+          - ProjectName
+          - SenderEmail
+          - Environment
+      - Label:
+          default: Lambda Configuration
+        Parameters:
+          - LambdaTimeout
+          - LambdaMemorySize
+      - Label:
+          default: Monitoring and Scheduling
+        Parameters:
+          - EnableCloudWatchAlarms
+          - DailyReportSchedule
+    ParameterLabels:
+      ProjectName:
+        default: Project Name
+      SenderEmail:
+        default: Sender Email Address
+      Environment:
+        default: Environment
+      LambdaTimeout:
+        default: Lambda Timeout (seconds)
+      LambdaMemorySize:
+        default: Lambda Memory Size (MB)
+      EnableCloudWatchAlarms:
+        default: Enable CloudWatch Alarms
+      DailyReportSchedule:
+        default: Daily Report Schedule

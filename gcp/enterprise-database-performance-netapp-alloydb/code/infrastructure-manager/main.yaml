@@ -1,0 +1,741 @@
+# Infrastructure Manager Configuration for Enterprise Database Performance with NetApp Volumes and AlloyDB
+# This configuration deploys a complete enterprise-grade database architecture combining
+# Google Cloud NetApp Volumes with AlloyDB for high-performance PostgreSQL workloads
+
+apiVersion: v1
+kind: Configuration
+metadata:
+  name: enterprise-database-performance
+  labels:
+    recipe: enterprise-database-performance-netapp-alloydb
+    category: database
+    difficulty: "400"
+    version: "1.2"
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    validation:
+      pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+  
+  region:
+    type: string
+    description: "Google Cloud region for deployment"
+    default: "us-central1"
+    validation:
+      allowed_values: ["us-central1", "us-east1", "us-west1", "europe-west1", "asia-southeast1"]
+  
+  zone:
+    type: string
+    description: "Google Cloud zone for deployment"
+    default: "us-central1-a"
+  
+  vpc_name:
+    type: string
+    description: "Name for the enterprise VPC network"
+    default: "enterprise-db-vpc"
+  
+  subnet_name:
+    type: string
+    description: "Name for the database subnet"
+    default: "enterprise-db-subnet"
+  
+  subnet_cidr:
+    type: string
+    description: "CIDR range for the database subnet"
+    default: "10.0.0.0/24"
+    validation:
+      pattern: "^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2}$"
+  
+  alloydb_cluster_id:
+    type: string
+    description: "AlloyDB cluster identifier"
+    default: "enterprise-alloydb"
+  
+  alloydb_password:
+    type: string
+    description: "AlloyDB database password"
+    sensitive: true
+    validation:
+      min_length: 12
+  
+  netapp_storage_pool_name:
+    type: string
+    description: "NetApp storage pool name"
+    default: "enterprise-storage-pool"
+  
+  netapp_volume_name:
+    type: string
+    description: "NetApp volume name"
+    default: "enterprise-db-volume"
+  
+  storage_pool_capacity:
+    type: string
+    description: "Storage pool capacity in TiB"
+    default: "20TiB"
+  
+  volume_capacity:
+    type: string
+    description: "Volume capacity in TiB"
+    default: "10TiB"
+  
+  primary_cpu_count:
+    type: number
+    description: "CPU count for AlloyDB primary instance"
+    default: 16
+    validation:
+      minimum: 2
+      maximum: 128
+  
+  primary_memory_size:
+    type: string
+    description: "Memory size for AlloyDB primary instance"
+    default: "64GiB"
+  
+  replica_cpu_count:
+    type: number
+    description: "CPU count for AlloyDB read replica"
+    default: 8
+    validation:
+      minimum: 2
+      maximum: 128
+  
+  replica_memory_size:
+    type: string
+    description: "Memory size for AlloyDB read replica"
+    default: "32GiB"
+  
+  replica_node_count:
+    type: number
+    description: "Number of nodes in read replica pool"
+    default: 3
+    validation:
+      minimum: 1
+      maximum: 20
+  
+  enable_monitoring:
+    type: boolean
+    description: "Enable comprehensive monitoring and alerting"
+    default: true
+  
+  enable_encryption:
+    type: boolean
+    description: "Enable customer-managed encryption"
+    default: true
+  
+  backup_retention_days:
+    type: number
+    description: "Backup retention period in days"
+    default: 30
+    validation:
+      minimum: 7
+      maximum: 365
+
+# Required APIs
+apis:
+  - alloydb.googleapis.com
+  - netapp.googleapis.com
+  - compute.googleapis.com
+  - monitoring.googleapis.com
+  - cloudbuild.googleapis.com
+  - servicenetworking.googleapis.com
+  - cloudkms.googleapis.com
+  - logging.googleapis.com
+
+# Main infrastructure resources
+resources:
+  # VPC Network Infrastructure
+  vpc_network:
+    type: gcp-types/compute-v1:networks
+    name: ${vpc_name}
+    properties:
+      name: ${vpc_name}
+      description: "Enterprise database VPC network"
+      routingConfig:
+        routingMode: GLOBAL
+      autoCreateSubnetworks: false
+    metadata:
+      dependsOn: []
+
+  # Database subnet with appropriate IP range
+  database_subnet:
+    type: gcp-types/compute-v1:subnetworks
+    name: ${subnet_name}
+    properties:
+      name: ${subnet_name}
+      description: "Enterprise database subnet"
+      network: $(ref.vpc_network.selfLink)
+      ipCidrRange: ${subnet_cidr}
+      region: ${region}
+      enableFlowLogs: true
+      logConfig:
+        enable: true
+        aggregationInterval: INTERVAL_5_SEC
+        flowSampling: 0.5
+        metadata: INCLUDE_ALL_METADATA
+    metadata:
+      dependsOn:
+        - vpc_network
+
+  # Private IP range allocation for AlloyDB
+  private_ip_range:
+    type: gcp-types/compute-v1:globalAddresses
+    name: alloydb-private-range
+    properties:
+      name: alloydb-private-range
+      description: "Private IP range for AlloyDB services"
+      purpose: VPC_PEERING
+      addressType: INTERNAL
+      prefixLength: 16
+      network: $(ref.vpc_network.selfLink)
+    metadata:
+      dependsOn:
+        - vpc_network
+
+  # Private service connection for AlloyDB
+  private_service_connection:
+    type: gcp-types/servicenetworking-v1:services.connections
+    name: alloydb-connection
+    properties:
+      parent: services/servicenetworking.googleapis.com
+      network: projects/${project_id}/global/networks/${vpc_name}
+      reservedPeeringRanges:
+        - alloydb-private-range
+    metadata:
+      dependsOn:
+        - private_ip_range
+
+  # Customer-managed encryption key (if enabled)
+  kms_keyring:
+    type: gcp-types/cloudkms-v1:projects.locations.keyRings
+    name: alloydb-keyring
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      keyRingId: alloydb-keyring-$(ref.random_suffix.hex)
+    metadata:
+      condition: ${enable_encryption}
+      dependsOn: []
+
+  kms_key:
+    type: gcp-types/cloudkms-v1:projects.locations.keyRings.cryptoKeys
+    name: alloydb-key
+    properties:
+      parent: $(ref.kms_keyring.name)
+      cryptoKeyId: alloydb-key
+      purpose: ENCRYPT_DECRYPT
+      versionTemplate:
+        algorithm: GOOGLE_SYMMETRIC_ENCRYPTION
+        protectionLevel: SOFTWARE
+    metadata:
+      condition: ${enable_encryption}
+      dependsOn:
+        - kms_keyring
+
+  # NetApp Volumes Storage Pool
+  netapp_storage_pool:
+    type: gcp-types/netapp-v1:projects.locations.storagePools
+    name: ${netapp_storage_pool_name}
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      storagePoolId: ${netapp_storage_pool_name}-$(ref.random_suffix.hex)
+      serviceLevel: FLEX
+      capacityGib: 21474836480  # 20TiB in GiB
+      network: projects/${project_id}/global/networks/${vpc_name}
+      description: "Enterprise database storage pool with high-performance configuration"
+      labels:
+        environment: enterprise
+        workload: database
+        recipe: enterprise-database-performance
+    metadata:
+      dependsOn:
+        - vpc_network
+
+  # NetApp Volume for database storage
+  netapp_volume:
+    type: gcp-types/netapp-v1:projects.locations.volumes
+    name: ${netapp_volume_name}
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      volumeId: ${netapp_volume_name}-$(ref.random_suffix.hex)
+      storagePool: $(ref.netapp_storage_pool.name)
+      capacityGib: 10737418240  # 10TiB in GiB
+      shareName: enterprise-db-data
+      protocols:
+        - NFSV4
+      description: "High-performance volume for enterprise database workloads"
+      snapshotPolicy:
+        enabled: true
+        hourlySnapshot:
+          snapshotsToKeep: 24
+        dailySnapshot:
+          snapshotsToKeep: 7
+          hour: 2
+          minute: 0
+        weeklySnapshot:
+          snapshotsToKeep: 4
+          day: SUNDAY
+          hour: 2
+          minute: 0
+        monthlySnapshot:
+          snapshotsToKeep: 12
+          daysOfMonth: 1
+          hour: 2
+          minute: 0
+      labels:
+        environment: enterprise
+        workload: database
+        recipe: enterprise-database-performance
+    metadata:
+      dependsOn:
+        - netapp_storage_pool
+
+  # AlloyDB Cluster with enterprise configuration
+  alloydb_cluster:
+    type: gcp-types/alloydb-v1:projects.locations.clusters
+    name: ${alloydb_cluster_id}
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      clusterId: ${alloydb_cluster_id}-$(ref.random_suffix.hex)
+      databaseVersion: POSTGRES_15
+      network: projects/${project_id}/global/networks/${vpc_name}
+      initialUser:
+        user: postgres
+        password: ${alloydb_password}
+      continuousBackupConfig:
+        enabled: true
+        recoveryWindowDays: ${backup_retention_days}
+        encryptionConfig:
+          kmsKeyName: $(ref.kms_key.name)
+      automatedBackupPolicy:
+        enabled: true
+        backupWindow: 7200s  # 2 hours
+        timeBasedRetention:
+          retentionPeriod: ${backup_retention_days * 24 * 3600}s
+        weeklySchedule:
+          startTimes:
+            - hours: 2
+              minutes: 0
+          daysOfWeek:
+            - MONDAY
+            - TUESDAY
+            - WEDNESDAY
+            - THURSDAY
+            - FRIDAY
+            - SATURDAY
+            - SUNDAY
+        encryptionConfig:
+          kmsKeyName: $(ref.kms_key.name)
+      encryptionConfig:
+        kmsKeyName: $(ref.kms_key.name)
+      labels:
+        environment: enterprise
+        workload: database
+        recipe: enterprise-database-performance
+    metadata:
+      dependsOn:
+        - private_service_connection
+        - kms_key
+
+  # AlloyDB Primary Instance
+  alloydb_primary_instance:
+    type: gcp-types/alloydb-v1:projects.locations.clusters.instances
+    name: ${alloydb_cluster_id}-primary
+    properties:
+      parent: $(ref.alloydb_cluster.name)
+      instanceId: primary
+      instanceType: PRIMARY
+      machineConfig:
+        cpuCount: ${primary_cpu_count}
+      databaseFlags:
+        shared_preload_libraries: "pg_stat_statements,pg_hint_plan"
+        work_mem: "256MB"
+        effective_cache_size: "48GB"
+        random_page_cost: "1.1"
+        effective_io_concurrency: "200"
+        wal_buffers: "16MB"
+        checkpoint_completion_target: "0.9"
+        max_wal_size: "2GB"
+        min_wal_size: "80MB"
+      labels:
+        environment: enterprise
+        workload: database
+        instance-type: primary
+        recipe: enterprise-database-performance
+    metadata:
+      dependsOn:
+        - alloydb_cluster
+
+  # AlloyDB Read Replica Pool
+  alloydb_read_replica:
+    type: gcp-types/alloydb-v1:projects.locations.clusters.instances
+    name: ${alloydb_cluster_id}-replica
+    properties:
+      parent: $(ref.alloydb_cluster.name)
+      instanceId: replica-pool
+      instanceType: READ_POOL
+      machineConfig:
+        cpuCount: ${replica_cpu_count}
+      readPoolConfig:
+        nodeCount: ${replica_node_count}
+      databaseFlags:
+        shared_preload_libraries: "pg_stat_statements"
+        effective_cache_size: "24GB"
+        random_page_cost: "1.1"
+      labels:
+        environment: enterprise
+        workload: analytics
+        instance-type: replica
+        recipe: enterprise-database-performance
+    metadata:
+      dependsOn:
+        - alloydb_primary_instance
+
+  # Health check for load balancer
+  health_check:
+    type: gcp-types/compute-v1:healthChecks
+    name: alloydb-health-check
+    properties:
+      name: alloydb-health-check
+      description: "Health check for AlloyDB instances"
+      type: TCP
+      tcpHealthCheck:
+        port: 5432
+        proxyHeader: NONE
+      checkIntervalSec: 10
+      timeoutSec: 5
+      healthyThreshold: 2
+      unhealthyThreshold: 3
+    metadata:
+      dependsOn: []
+
+  # Internal load balancer backend service
+  backend_service:
+    type: gcp-types/compute-v1:regionBackendServices
+    name: alloydb-backend
+    properties:
+      name: alloydb-backend
+      description: "Backend service for AlloyDB cluster"
+      region: ${region}
+      protocol: TCP
+      loadBalancingScheme: INTERNAL
+      healthChecks:
+        - $(ref.health_check.selfLink)
+      sessionAffinity: CLIENT_IP
+    metadata:
+      dependsOn:
+        - health_check
+
+  # Internal load balancer forwarding rule
+  forwarding_rule:
+    type: gcp-types/compute-v1:forwardingRules
+    name: alloydb-forwarding-rule
+    properties:
+      name: alloydb-forwarding-rule
+      description: "Forwarding rule for AlloyDB access"
+      region: ${region}
+      loadBalancingScheme: INTERNAL
+      network: $(ref.vpc_network.selfLink)
+      subnetwork: $(ref.database_subnet.selfLink)
+      IPAddress: 10.0.0.100
+      ports:
+        - "5432"
+      backendService: $(ref.backend_service.selfLink)
+    metadata:
+      dependsOn:
+        - backend_service
+        - database_subnet
+
+  # Monitoring Dashboard (if enabled)
+  monitoring_dashboard:
+    type: gcp-types/monitoring-v1:projects.dashboards
+    name: enterprise-db-dashboard
+    properties:
+      parent: projects/${project_id}
+      displayName: "Enterprise Database Performance Dashboard"
+      mosaicLayout:
+        tiles:
+          - width: 6
+            height: 4
+            widget:
+              title: "AlloyDB CPU Utilization"
+              scorecard:
+                timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'resource.type="alloydb_instance"'
+                    aggregation:
+                      alignmentPeriod: 300s
+                      perSeriesAligner: ALIGN_MEAN
+                      crossSeriesReducer: REDUCE_MEAN
+                      groupByFields:
+                        - resource.label.instance_id
+          - width: 6
+            height: 4
+            widget:
+              title: "AlloyDB Memory Utilization"
+              scorecard:
+                timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'resource.type="alloydb_instance" AND metric.type="alloydb.googleapis.com/instance/memory/utilization"'
+                    aggregation:
+                      alignmentPeriod: 300s
+                      perSeriesAligner: ALIGN_MEAN
+                      crossSeriesReducer: REDUCE_MEAN
+          - width: 6
+            height: 4
+            widget:
+              title: "NetApp Volume IOPS"
+              scorecard:
+                timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'resource.type="netapp_volume"'
+                    aggregation:
+                      alignmentPeriod: 300s
+                      perSeriesAligner: ALIGN_RATE
+          - width: 6
+            height: 4
+            widget:
+              title: "NetApp Volume Throughput"
+              scorecard:
+                timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'resource.type="netapp_volume"'
+                    aggregation:
+                      alignmentPeriod: 300s
+                      perSeriesAligner: ALIGN_MEAN
+    metadata:
+      condition: ${enable_monitoring}
+      dependsOn: []
+
+  # Alert policy for high CPU usage
+  cpu_alert_policy:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    name: alloydb-high-cpu-alert
+    properties:
+      parent: projects/${project_id}
+      displayName: "AlloyDB High CPU Alert"
+      documentation:
+        content: "AlloyDB instance CPU utilization is above 80% for more than 5 minutes"
+        mimeType: text/markdown
+      conditions:
+        - displayName: "AlloyDB CPU > 80%"
+          conditionThreshold:
+            filter: 'resource.type="alloydb_instance" AND metric.type="alloydb.googleapis.com/instance/cpu/utilization"'
+            comparison: COMPARISON_GT
+            thresholdValue: 0.8
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_MEAN
+                groupByFields:
+                  - resource.label.instance_id
+      alertStrategy:
+        autoClose: 86400s
+      enabled: true
+    metadata:
+      condition: ${enable_monitoring}
+      dependsOn: []
+
+  # Alert policy for storage capacity
+  storage_alert_policy:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    name: netapp-storage-capacity-alert
+    properties:
+      parent: projects/${project_id}
+      displayName: "NetApp Storage Capacity Alert"
+      documentation:
+        content: "NetApp volume storage utilization is above 85%"
+        mimeType: text/markdown
+      conditions:
+        - displayName: "Storage Utilization > 85%"
+          conditionThreshold:
+            filter: 'resource.type="netapp_volume"'
+            comparison: COMPARISON_GT
+            thresholdValue: 0.85
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_MEAN
+      alertStrategy:
+        autoClose: 86400s
+      enabled: true
+    metadata:
+      condition: ${enable_monitoring}
+      dependsOn: []
+
+  # Random suffix generator for unique resource naming
+  random_suffix:
+    type: gcp-types/random:random_id
+    name: resource-suffix
+    properties:
+      byte_length: 3
+
+# Output values for verification and integration
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${project_id}
+  
+  region:
+    description: "Deployment region"
+    value: ${region}
+  
+  vpc_network_id:
+    description: "VPC network ID"
+    value: $(ref.vpc_network.id)
+  
+  vpc_network_self_link:
+    description: "VPC network self link"
+    value: $(ref.vpc_network.selfLink)
+  
+  database_subnet_id:
+    description: "Database subnet ID"
+    value: $(ref.database_subnet.id)
+  
+  alloydb_cluster_name:
+    description: "AlloyDB cluster name"
+    value: $(ref.alloydb_cluster.name)
+  
+  alloydb_primary_ip:
+    description: "AlloyDB primary instance IP address"
+    value: $(ref.alloydb_primary_instance.ipAddress)
+  
+  alloydb_replica_ip:
+    description: "AlloyDB read replica IP address"
+    value: $(ref.alloydb_read_replica.ipAddress)
+  
+  load_balancer_ip:
+    description: "Internal load balancer IP address"
+    value: $(ref.forwarding_rule.IPAddress)
+  
+  netapp_storage_pool_name:
+    description: "NetApp storage pool name"
+    value: $(ref.netapp_storage_pool.name)
+  
+  netapp_volume_name:
+    description: "NetApp volume name"
+    value: $(ref.netapp_volume.name)
+  
+  netapp_volume_mount_path:
+    description: "NetApp volume mount path"
+    value: $(ref.netapp_volume.mountOptions.exportPath)
+  
+  kms_key_name:
+    description: "Customer-managed encryption key name"
+    value: $(ref.kms_key.name)
+    condition: ${enable_encryption}
+  
+  monitoring_dashboard_url:
+    description: "Monitoring dashboard URL"
+    value: "https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.monitoring_dashboard.name)?project=${project_id}"
+    condition: ${enable_monitoring}
+  
+  connection_string_primary:
+    description: "Primary database connection string"
+    value: "postgresql://postgres:${alloydb_password}@$(ref.alloydb_primary_instance.ipAddress):5432/postgres"
+    sensitive: true
+  
+  connection_string_replica:
+    description: "Read replica connection string"
+    value: "postgresql://postgres:${alloydb_password}@$(ref.alloydb_read_replica.ipAddress):5432/postgres"
+    sensitive: true
+  
+  connection_string_load_balancer:
+    description: "Load balancer connection string"
+    value: "postgresql://postgres:${alloydb_password}@$(ref.forwarding_rule.IPAddress):5432/postgres"
+    sensitive: true
+
+# Resource dependencies and metadata
+metadata:
+  version: "1.2"
+  description: "Enterprise-grade database architecture with NetApp Volumes and AlloyDB"
+  author: "Google Cloud Recipe Generator"
+  recipe_id: "a7f3b8e2"
+  estimated_deployment_time: "45-60 minutes"
+  estimated_cost_per_month: "$1200-2500 USD"
+  tags:
+    - enterprise-database
+    - high-performance
+    - postgresql
+    - alloydb
+    - netapp-volumes
+    - monitoring
+    - automation
+  
+  # Deployment order and dependencies
+  deployment_phases:
+    phase_1:
+      description: "Network and security foundation"
+      resources:
+        - vpc_network
+        - database_subnet
+        - private_ip_range
+        - kms_keyring
+        - kms_key
+    
+    phase_2:
+      description: "Storage infrastructure"
+      resources:
+        - netapp_storage_pool
+        - netapp_volume
+      depends_on:
+        - phase_1
+    
+    phase_3:
+      description: "Database cluster and instances"
+      resources:
+        - private_service_connection
+        - alloydb_cluster
+        - alloydb_primary_instance
+        - alloydb_read_replica
+      depends_on:
+        - phase_1
+    
+    phase_4:
+      description: "Load balancing and monitoring"
+      resources:
+        - health_check
+        - backend_service
+        - forwarding_rule
+        - monitoring_dashboard
+        - cpu_alert_policy
+        - storage_alert_policy
+      depends_on:
+        - phase_3
+
+# Security and compliance configurations
+security:
+  encryption_at_rest: true
+  encryption_in_transit: true
+  network_isolation: true
+  iam_best_practices: true
+  audit_logging: true
+  backup_encryption: true
+  
+  # Required IAM roles for deployment
+  required_roles:
+    - roles/alloydb.admin
+    - roles/netapp.admin
+    - roles/compute.networkAdmin
+    - roles/monitoring.admin
+    - roles/cloudkms.admin
+    - roles/cloudsql.admin
+    - roles/servicenetworking.networksAdmin
+
+# Cost optimization settings
+cost_optimization:
+  auto_scaling: true
+  storage_tiering: true
+  backup_lifecycle: true
+  monitoring_retention: "30 days"
+  
+  # Estimated monthly costs (USD)
+  cost_breakdown:
+    alloydb_primary: "$800-1200"
+    alloydb_replica: "$400-600"
+    netapp_storage: "$300-500"
+    networking: "$50-100"
+    monitoring: "$50-100"
+    total: "$1600-2500"

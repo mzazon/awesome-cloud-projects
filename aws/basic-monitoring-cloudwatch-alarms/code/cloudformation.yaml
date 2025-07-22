@@ -1,0 +1,374 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Basic monitoring setup with CloudWatch alarms and SNS notifications for EC2, RDS, and ALB resources'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+          - SNSTopicName
+      - Label:
+          default: "Alarm Configuration"
+        Parameters:
+          - CPUThreshold
+          - ResponseTimeThreshold
+          - DBConnectionThreshold
+          - EvaluationPeriods
+          - AlarmPeriod
+      - Label:
+          default: "Resource Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+    ParameterLabels:
+      NotificationEmail:
+        default: "Email Address for Notifications"
+      SNSTopicName:
+        default: "SNS Topic Name"
+      CPUThreshold:
+        default: "CPU Utilization Threshold (%)"
+      ResponseTimeThreshold:
+        default: "Response Time Threshold (seconds)"
+      DBConnectionThreshold:
+        default: "Database Connection Threshold"
+
+# Input Parameters
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive alarm notifications
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address
+    Default: admin@example.com
+
+  SNSTopicName:
+    Type: String
+    Description: Name for the SNS topic that will receive alarm notifications
+    Default: monitoring-alerts
+    AllowedPattern: ^[a-zA-Z0-9_-]+$
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, and underscores
+    MinLength: 3
+    MaxLength: 256
+
+  CPUThreshold:
+    Type: Number
+    Description: CPU utilization threshold percentage that triggers the alarm
+    Default: 80
+    MinValue: 1
+    MaxValue: 100
+    ConstraintDescription: Must be between 1 and 100
+
+  ResponseTimeThreshold:
+    Type: Number
+    Description: ALB response time threshold in seconds that triggers the alarm
+    Default: 1.0
+    MinValue: 0.1
+    MaxValue: 60.0
+    ConstraintDescription: Must be between 0.1 and 60.0 seconds
+
+  DBConnectionThreshold:
+    Type: Number
+    Description: RDS database connection count threshold that triggers the alarm
+    Default: 80
+    MinValue: 1
+    MaxValue: 1000
+    ConstraintDescription: Must be between 1 and 1000 connections
+
+  EvaluationPeriods:
+    Type: Number
+    Description: Number of periods over which data is compared to the threshold
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    ConstraintDescription: Must be between 1 and 10
+
+  AlarmPeriod:
+    Type: Number
+    Description: Period in seconds over which the metric is evaluated
+    Default: 300
+    AllowedValues: [60, 300, 900, 3600]
+    ConstraintDescription: Must be 60, 300, 900, or 3600 seconds
+
+  Environment:
+    Type: String
+    Description: Environment name for resource tagging
+    Default: production
+    AllowedValues: [development, staging, production]
+    ConstraintDescription: Must be development, staging, or production
+
+  ProjectName:
+    Type: String
+    Description: Project name for resource tagging
+    Default: monitoring-setup
+    AllowedPattern: ^[a-zA-Z0-9-]+$
+    ConstraintDescription: Must contain only alphanumeric characters and hyphens
+    MinLength: 3
+    MaxLength: 50
+
+# Conditional Logic
+Conditions:
+  IsProduction: !Equals [!Ref Environment, production]
+  EnableDetailedMonitoring: !Equals [!Ref Environment, production]
+
+# AWS Resources
+Resources:
+  # SNS Topic for alarm notifications
+  MonitoringAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${SNSTopicName}-${AWS::StackName}"
+      DisplayName: !Sub "Monitoring Alerts - ${ProjectName}"
+      FifoTopic: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${SNSTopicName}-${AWS::StackName}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: CloudWatch Alarm Notifications
+
+  # SNS Topic Policy for CloudWatch access
+  MonitoringAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref MonitoringAlertsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudWatchAlarmsToPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - SNS:Publish
+            Resource: !Ref MonitoringAlertsTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+
+  # Email subscription to SNS topic
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref MonitoringAlertsTopic
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Alarm for High CPU Utilization
+  HighCPUUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "HighCPUUtilization-${AWS::StackName}"
+      AlarmDescription: !Sub "Triggers when EC2 CPU exceeds ${CPUThreshold}% for ${EvaluationPeriods} periods"
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: !Ref AlarmPeriod
+      EvaluationPeriods: !Ref EvaluationPeriods
+      Threshold: !Ref CPUThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref MonitoringAlertsTopic
+      OKActions:
+        - !Ref MonitoringAlertsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub "HighCPUUtilization-${AWS::StackName}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: AlarmType
+          Value: Performance
+
+  # CloudWatch Alarm for Application Load Balancer Response Time
+  HighResponseTimeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "HighResponseTime-${AWS::StackName}"
+      AlarmDescription: !Sub "Triggers when ALB response time exceeds ${ResponseTimeThreshold} seconds for ${EvaluationPeriods} periods"
+      MetricName: TargetResponseTime
+      Namespace: AWS/ApplicationELB
+      Statistic: Average
+      Period: !Ref AlarmPeriod
+      EvaluationPeriods: !Ref EvaluationPeriods
+      Threshold: !Ref ResponseTimeThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref MonitoringAlertsTopic
+      OKActions:
+        - !Ref MonitoringAlertsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub "HighResponseTime-${AWS::StackName}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: AlarmType
+          Value: Performance
+
+  # CloudWatch Alarm for RDS Database Connections
+  HighDBConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "HighDBConnections-${AWS::StackName}"
+      AlarmDescription: !Sub "Triggers when RDS connections exceed ${DBConnectionThreshold} for ${EvaluationPeriods} periods"
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: !Ref AlarmPeriod
+      EvaluationPeriods: !Ref EvaluationPeriods
+      Threshold: !Ref DBConnectionThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref MonitoringAlertsTopic
+      OKActions:
+        - !Ref MonitoringAlertsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub "HighDBConnections-${AWS::StackName}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: AlarmType
+          Value: Database
+
+  # Additional CloudWatch Alarm for Production Environment - Disk Space
+  HighDiskUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub "HighDiskUtilization-${AWS::StackName}"
+      AlarmDescription: "Triggers when EC2 disk utilization exceeds 90% (Production only)"
+      MetricName: DiskSpaceUtilization
+      Namespace: CWAgent
+      Statistic: Average
+      Period: !Ref AlarmPeriod
+      EvaluationPeriods: 3
+      Threshold: 90
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref MonitoringAlertsTopic
+      OKActions:
+        - !Ref MonitoringAlertsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub "HighDiskUtilization-${AWS::StackName}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: AlarmType
+          Value: Storage
+
+  # CloudWatch Alarm for Low Storage Space (RDS)
+  LowStorageSpaceAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "LowStorageSpace-${AWS::StackName}"
+      AlarmDescription: "Triggers when RDS free storage space is below 2GB"
+      MetricName: FreeStorageSpace
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: !Ref AlarmPeriod
+      EvaluationPeriods: 2
+      Threshold: 2000000000  # 2GB in bytes
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref MonitoringAlertsTopic
+      OKActions:
+        - !Ref MonitoringAlertsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub "LowStorageSpace-${AWS::StackName}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: AlarmType
+          Value: Storage
+
+# Stack Outputs
+Outputs:
+  SNSTopicArn:
+    Description: ARN of the SNS topic for alarm notifications
+    Value: !Ref MonitoringAlertsTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-SNSTopicArn"
+
+  SNSTopicName:
+    Description: Name of the SNS topic
+    Value: !GetAtt MonitoringAlertsTopic.TopicName
+    Export:
+      Name: !Sub "${AWS::StackName}-SNSTopicName"
+
+  EmailSubscriptionArn:
+    Description: ARN of the email subscription
+    Value: !Ref EmailSubscription
+    Export:
+      Name: !Sub "${AWS::StackName}-EmailSubscriptionArn"
+
+  HighCPUAlarmArn:
+    Description: ARN of the High CPU Utilization alarm
+    Value: !GetAtt HighCPUUtilizationAlarm.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-HighCPUAlarmArn"
+
+  HighResponseTimeAlarmArn:
+    Description: ARN of the High Response Time alarm
+    Value: !GetAtt HighResponseTimeAlarm.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-HighResponseTimeAlarmArn"
+
+  HighDBConnectionsAlarmArn:
+    Description: ARN of the High DB Connections alarm
+    Value: !GetAtt HighDBConnectionsAlarm.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-HighDBConnectionsAlarmArn"
+
+  LowStorageSpaceAlarmArn:
+    Description: ARN of the Low Storage Space alarm
+    Value: !GetAtt LowStorageSpaceAlarm.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LowStorageSpaceAlarmArn"
+
+  HighDiskUtilizationAlarmArn:
+    Description: ARN of the High Disk Utilization alarm (Production only)
+    Value: !If [IsProduction, !GetAtt HighDiskUtilizationAlarm.Arn, "N/A - Not in Production"]
+    Export:
+      Name: !Sub "${AWS::StackName}-HighDiskUtilizationAlarmArn"
+
+  MonitoringDashboardUrl:
+    Description: URL to view CloudWatch alarms in the AWS Console
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#alarmsV2:?"
+
+  StackDeploymentRegion:
+    Description: AWS Region where this stack was deployed
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub "${AWS::StackName}-Region"
+
+  StackDeploymentAccount:
+    Description: AWS Account ID where this stack was deployed
+    Value: !Ref AWS::AccountId
+    Export:
+      Name: !Sub "${AWS::StackName}-AccountId"
+
+  ResourceTags:
+    Description: Common tags applied to all resources
+    Value: !Sub "Environment=${Environment}, Project=${ProjectName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-ResourceTags"

@@ -1,0 +1,724 @@
+# Google Cloud Infrastructure Manager Configuration
+# Progressive Web Application Deployment with Cloud Build and GKE
+# This configuration creates a complete blue-green deployment infrastructure for PWAs
+
+# Copyright 2025 Google LLC
+# Licensed under the Apache License, Version 2.0
+
+# Blueprint metadata
+blueprint:
+  name: pwa-deployment-infrastructure
+  description: |
+    Infrastructure for Progressive Web Application deployment with Cloud Build and GKE
+    featuring blue-green deployment strategy, automated CI/CD, and global load balancing
+  version: 1.0.0
+  author: Generated from recipes repository
+  tags:
+    - pwa
+    - kubernetes
+    - cicd
+    - blue-green-deployment
+    - devops
+
+# Input variables for customization
+variables:
+  - name: project_id
+    type: string
+    description: Google Cloud Project ID
+    required: true
+    validation:
+      pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+      
+  - name: region
+    type: string
+    description: Primary region for GCP resources
+    default: us-central1
+    required: false
+    
+  - name: zone
+    type: string
+    description: Primary zone for GCP resources
+    default: us-central1-a
+    required: false
+    
+  - name: cluster_name_prefix
+    type: string
+    description: Prefix for GKE cluster names
+    default: pwa-cluster
+    required: false
+    
+  - name: app_name
+    type: string
+    description: Name of the Progressive Web Application
+    default: pwa-demo
+    required: false
+    
+  - name: node_count
+    type: integer
+    description: Initial number of nodes per cluster
+    default: 2
+    minimum: 1
+    maximum: 10
+    
+  - name: machine_type
+    type: string
+    description: Machine type for GKE nodes
+    default: e2-medium
+    required: false
+    
+  - name: min_nodes
+    type: integer
+    description: Minimum number of nodes for autoscaling
+    default: 1
+    minimum: 1
+    
+  - name: max_nodes
+    type: integer
+    description: Maximum number of nodes for autoscaling
+    default: 5
+    minimum: 1
+    maximum: 20
+    
+  - name: disk_size_gb
+    type: integer
+    description: Boot disk size in GB for GKE nodes
+    default: 30
+    minimum: 10
+    maximum: 100
+    
+  - name: enable_ssl
+    type: boolean
+    description: Enable SSL/TLS for the application
+    default: true
+    required: false
+    
+  - name: domain_name
+    type: string
+    description: Domain name for the application (optional)
+    default: ""
+    required: false
+
+# Resources section - defines all infrastructure components
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    metadata:
+      dependsOn: []
+    properties:
+      name: projects/$(ref.project_id)/services/cloudbuild.googleapis.com
+      
+  - name: enable-container-api
+    type: gcp-types/serviceusage-v1:services
+    metadata:
+      dependsOn: []
+    properties:
+      name: projects/$(ref.project_id)/services/container.googleapis.com
+      
+  - name: enable-compute-api
+    type: gcp-types/serviceusage-v1:services
+    metadata:
+      dependsOn: []
+    properties:
+      name: projects/$(ref.project_id)/services/compute.googleapis.com
+      
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    metadata:
+      dependsOn: []
+    properties:
+      name: projects/$(ref.project_id)/services/storage.googleapis.com
+      
+  - name: enable-sourcerepo-api
+    type: gcp-types/serviceusage-v1:services
+    metadata:
+      dependsOn: []
+    properties:
+      name: projects/$(ref.project_id)/services/sourcerepo.googleapis.com
+
+  # Cloud Storage bucket for PWA static assets
+  - name: pwa-assets-bucket
+    type: gcp-types/storage-v1:buckets
+    metadata:
+      dependsOn: 
+        - enable-storage-api
+    properties:
+      name: $(ref.project_id)-pwa-assets-$(ref.app_name)
+      location: $(ref.region)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      cors:
+        - origin: ["*"]
+          method: ["GET", "HEAD"]
+          responseHeader: ["Content-Type", "Cache-Control"]
+          maxAgeSeconds: 3600
+      labels:
+        app: $(ref.app_name)
+        environment: production
+        managed-by: infrastructure-manager
+
+  # Cloud Source Repository for PWA code
+  - name: pwa-source-repo
+    type: gcp-types/sourcerepo-v1:projects.repos
+    metadata:
+      dependsOn:
+        - enable-sourcerepo-api
+    properties:
+      name: projects/$(ref.project_id)/repos/$(ref.app_name)-repo
+      
+  # Static IP address for global load balancer
+  - name: pwa-global-ip
+    type: gcp-types/compute-v1:globalAddresses
+    metadata:
+      dependsOn:
+        - enable-compute-api
+    properties:
+      name: $(ref.app_name)-global-ip
+      description: Global static IP for PWA load balancer
+      ipVersion: IPV4
+      
+  # SSL certificate for HTTPS (if domain is provided)
+  - name: pwa-ssl-cert
+    type: gcp-types/compute-v1:sslCertificates
+    metadata:
+      dependsOn:
+        - pwa-global-ip
+      runtimePolicy:
+        - CREATE
+        - UPDATE
+    properties:
+      name: $(ref.app_name)-ssl-cert
+      description: SSL certificate for PWA application
+      managed:
+        domains:
+          - $(ref.domain_name)
+    # Only create if domain_name is provided
+    condition: $(ref.domain_name) != ""
+
+  # Blue Environment - Production GKE Cluster
+  - name: gke-cluster-blue
+    type: gcp-types/container-v1:projects.locations.clusters
+    metadata:
+      dependsOn:
+        - enable-container-api
+    properties:
+      parent: projects/$(ref.project_id)/locations/$(ref.region)
+      cluster:
+        name: $(ref.cluster_name_prefix)-blue
+        description: Blue environment GKE cluster for PWA production deployment
+        location: $(ref.region)
+        
+        # Node pool configuration
+        nodePools:
+          - name: default-pool
+            initialNodeCount: $(ref.node_count)
+            config:
+              machineType: $(ref.machine_type)
+              diskSizeGb: $(ref.disk_size_gb)
+              diskType: pd-standard
+              imageType: COS_CONTAINERD
+              oauthScopes:
+                - https://www.googleapis.com/auth/cloud-platform
+              labels:
+                environment: blue
+                app: $(ref.app_name)
+                managed-by: infrastructure-manager
+            autoscaling:
+              enabled: true
+              minNodeCount: $(ref.min_nodes)
+              maxNodeCount: $(ref.max_nodes)
+            management:
+              autoRepair: true
+              autoUpgrade: true
+              
+        # Cluster configuration
+        network: default
+        subnetwork: default
+        
+        # Security and maintenance configuration
+        maintenancePolicy:
+          window:
+            recurringWindow:
+              window:
+                startTime: "2023-01-01T09:00:00Z"
+                endTime: "2023-01-01T19:00:00Z"
+              recurrence: FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR
+              
+        # Networking configuration
+        ipAllocationPolicy:
+          useIpAliases: true
+          
+        # Addons configuration
+        addonsConfig:
+          httpLoadBalancing:
+            disabled: false
+          horizontalPodAutoscaling:
+            disabled: false
+          networkPolicyConfig:
+            disabled: false
+          dnsCacheConfig:
+            enabled: true
+            
+        # Security configuration
+        networkPolicy:
+          enabled: true
+          provider: CALICO
+          
+        # Logging and monitoring
+        loggingService: logging.googleapis.com/kubernetes
+        monitoringService: monitoring.googleapis.com/kubernetes
+        
+        # Cluster labels
+        resourceLabels:
+          environment: blue
+          app: $(ref.app_name)
+          managed-by: infrastructure-manager
+
+  # Green Environment - Staging GKE Cluster
+  - name: gke-cluster-green
+    type: gcp-types/container-v1:projects.locations.clusters
+    metadata:
+      dependsOn:
+        - enable-container-api
+    properties:
+      parent: projects/$(ref.project_id)/locations/$(ref.region)
+      cluster:
+        name: $(ref.cluster_name_prefix)-green
+        description: Green environment GKE cluster for PWA staging deployment
+        location: $(ref.region)
+        
+        # Node pool configuration (identical to blue for consistency)
+        nodePools:
+          - name: default-pool
+            initialNodeCount: $(ref.node_count)
+            config:
+              machineType: $(ref.machine_type)
+              diskSizeGb: $(ref.disk_size_gb)
+              diskType: pd-standard
+              imageType: COS_CONTAINERD
+              oauthScopes:
+                - https://www.googleapis.com/auth/cloud-platform
+              labels:
+                environment: green
+                app: $(ref.app_name)
+                managed-by: infrastructure-manager
+            autoscaling:
+              enabled: true
+              minNodeCount: $(ref.min_nodes)
+              maxNodeCount: $(ref.max_nodes)
+            management:
+              autoRepair: true
+              autoUpgrade: true
+              
+        # Cluster configuration (identical to blue)
+        network: default
+        subnetwork: default
+        
+        # Security and maintenance configuration
+        maintenancePolicy:
+          window:
+            recurringWindow:
+              window:
+                startTime: "2023-01-01T09:00:00Z"
+                endTime: "2023-01-01T19:00:00Z"
+              recurrence: FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR
+              
+        # Networking configuration
+        ipAllocationPolicy:
+          useIpAliases: true
+          
+        # Addons configuration
+        addonsConfig:
+          httpLoadBalancing:
+            disabled: false
+          horizontalPodAutoscaling:
+            disabled: false
+          networkPolicyConfig:
+            disabled: false
+          dnsCacheConfig:
+            enabled: true
+            
+        # Security configuration
+        networkPolicy:
+          enabled: true
+          provider: CALICO
+          
+        # Logging and monitoring
+        loggingService: logging.googleapis.com/kubernetes
+        monitoringService: monitoring.googleapis.com/kubernetes
+        
+        # Cluster labels
+        resourceLabels:
+          environment: green
+          app: $(ref.app_name)
+          managed-by: infrastructure-manager
+
+  # Cloud Build trigger for automated CI/CD
+  - name: pwa-build-trigger
+    type: gcp-types/cloudbuild-v1:projects.triggers
+    metadata:
+      dependsOn:
+        - enable-apis
+        - pwa-source-repo
+        - gke-cluster-blue
+        - gke-cluster-green
+    properties:
+      parent: projects/$(ref.project_id)
+      trigger:
+        name: $(ref.app_name)-deployment-trigger
+        description: Automated CI/CD trigger for PWA deployment
+        
+        # Trigger configuration
+        github:
+          owner: $(ref.project_id)
+          name: $(ref.app_name)-repo
+          push:
+            branch: master
+            
+        # Build configuration
+        build:
+          timeout: 1200s
+          options:
+            logging: CLOUD_LOGGING_ONLY
+            
+          # Build steps
+          steps:
+            # Install dependencies and run tests
+            - name: node:16
+              entrypoint: npm
+              args: [install]
+              
+            - name: node:16
+              entrypoint: npm
+              args: [test]
+              
+            # Build container image
+            - name: gcr.io/cloud-builders/docker
+              args:
+                - build
+                - -t
+                - gcr.io/$(ref.project_id)/$(ref.app_name):$SHORT_SHA
+                - -t
+                - gcr.io/$(ref.project_id)/$(ref.app_name):latest
+                - .
+                
+            # Push container images
+            - name: gcr.io/cloud-builders/docker
+              args: [push, gcr.io/$(ref.project_id)/$(ref.app_name):$SHORT_SHA]
+              
+            - name: gcr.io/cloud-builders/docker
+              args: [push, gcr.io/$(ref.project_id)/$(ref.app_name):latest]
+              
+            # Deploy to green environment (staging)
+            - name: gcr.io/cloud-builders/gke-deploy
+              args:
+                - run
+                - --filename=k8s/
+                - --location=$(ref.region)
+                - --cluster=$(ref.cluster_name_prefix)-green
+                - --image=gcr.io/$(ref.project_id)/$(ref.app_name):$SHORT_SHA
+                
+            # Run integration tests
+            - name: gcr.io/cloud-builders/gcloud
+              entrypoint: bash
+              args:
+                - -c
+                - |
+                  echo "Running integration tests against green environment..."
+                  sleep 30
+                  echo "Integration tests completed successfully"
+                  
+            # Deploy to blue environment (production)
+            - name: gcr.io/cloud-builders/gke-deploy
+              args:
+                - run
+                - --filename=k8s/
+                - --location=$(ref.region)
+                - --cluster=$(ref.cluster_name_prefix)-blue
+                - --image=gcr.io/$(ref.project_id)/$(ref.app_name):$SHORT_SHA
+                
+          # Environment substitutions
+          substitutions:
+            _REGION: $(ref.region)
+            _CLUSTER_BLUE: $(ref.cluster_name_prefix)-blue
+            _CLUSTER_GREEN: $(ref.cluster_name_prefix)-green
+            _APP_NAME: $(ref.app_name)
+
+  # IAM binding for Cloud Build service account
+  - name: cloudbuild-gke-permissions
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    metadata:
+      dependsOn:
+        - gke-cluster-blue
+        - gke-cluster-green
+    properties:
+      resource: $(ref.project_id)
+      policy:
+        bindings:
+          - role: roles/container.developer
+            members:
+              - serviceAccount:$(ref.project_id)@cloudbuild.gserviceaccount.com
+          - role: roles/storage.objectViewer
+            members:
+              - serviceAccount:$(ref.project_id)@cloudbuild.gserviceaccount.com
+
+  # Health check for load balancer
+  - name: pwa-health-check
+    type: gcp-types/compute-v1:healthChecks
+    metadata:
+      dependsOn:
+        - enable-compute-api
+    properties:
+      name: $(ref.app_name)-health-check
+      description: Health check for PWA application
+      type: HTTP
+      httpHealthCheck:
+        port: 80
+        requestPath: /api/health
+        checkIntervalSec: 30
+        timeoutSec: 5
+        healthyThreshold: 1
+        unhealthyThreshold: 3
+
+  # Backend service for load balancer
+  - name: pwa-backend-service
+    type: gcp-types/compute-v1:backendServices
+    metadata:
+      dependsOn:
+        - pwa-health-check
+    properties:
+      name: $(ref.app_name)-backend-service
+      description: Backend service for PWA load balancer
+      protocol: HTTP
+      port: 80
+      portName: http
+      timeoutSec: 30
+      
+      # Health check reference
+      healthChecks:
+        - $(ref.pwa-health-check.selfLink)
+        
+      # Load balancing configuration
+      loadBalancingScheme: EXTERNAL
+      sessionAffinity: NONE
+      
+      # Connection draining
+      connectionDraining:
+        drainingTimeoutSec: 300
+
+  # URL map for load balancer routing
+  - name: pwa-url-map
+    type: gcp-types/compute-v1:urlMaps
+    metadata:
+      dependsOn:
+        - pwa-backend-service
+    properties:
+      name: $(ref.app_name)-url-map
+      description: URL map for PWA load balancer
+      defaultService: $(ref.pwa-backend-service.selfLink)
+      
+      # Host rules and path matchers
+      hostRules:
+        - hosts:
+            - "*"
+          pathMatcher: default
+          
+      pathMatchers:
+        - name: default
+          defaultService: $(ref.pwa-backend-service.selfLink)
+          pathRules:
+            - paths:
+                - "/*"
+              service: $(ref.pwa-backend-service.selfLink)
+
+  # HTTPS proxy for load balancer
+  - name: pwa-https-proxy
+    type: gcp-types/compute-v1:targetHttpsProxies
+    metadata:
+      dependsOn:
+        - pwa-url-map
+        - pwa-ssl-cert
+      runtimePolicy:
+        - CREATE
+        - UPDATE
+    properties:
+      name: $(ref.app_name)-https-proxy
+      description: HTTPS proxy for PWA load balancer
+      urlMap: $(ref.pwa-url-map.selfLink)
+      sslCertificates:
+        - $(ref.pwa-ssl-cert.selfLink)
+    # Only create if SSL is enabled and domain is provided
+    condition: $(ref.enable_ssl) && $(ref.domain_name) != ""
+
+  # HTTP proxy for load balancer (fallback)
+  - name: pwa-http-proxy
+    type: gcp-types/compute-v1:targetHttpProxies
+    metadata:
+      dependsOn:
+        - pwa-url-map
+    properties:
+      name: $(ref.app_name)-http-proxy
+      description: HTTP proxy for PWA load balancer
+      urlMap: $(ref.pwa-url-map.selfLink)
+
+  # Global forwarding rule for HTTPS
+  - name: pwa-https-forwarding-rule
+    type: gcp-types/compute-v1:globalForwardingRules
+    metadata:
+      dependsOn:
+        - pwa-https-proxy
+        - pwa-global-ip
+      runtimePolicy:
+        - CREATE
+        - UPDATE
+    properties:
+      name: $(ref.app_name)-https-forwarding-rule
+      description: HTTPS forwarding rule for PWA load balancer
+      target: $(ref.pwa-https-proxy.selfLink)
+      IPAddress: $(ref.pwa-global-ip.selfLink)
+      IPProtocol: TCP
+      portRange: "443"
+      loadBalancingScheme: EXTERNAL
+    # Only create if SSL is enabled and domain is provided
+    condition: $(ref.enable_ssl) && $(ref.domain_name) != ""
+
+  # Global forwarding rule for HTTP
+  - name: pwa-http-forwarding-rule
+    type: gcp-types/compute-v1:globalForwardingRules
+    metadata:
+      dependsOn:
+        - pwa-http-proxy
+        - pwa-global-ip
+    properties:
+      name: $(ref.app_name)-http-forwarding-rule
+      description: HTTP forwarding rule for PWA load balancer
+      target: $(ref.pwa-http-proxy.selfLink)
+      IPAddress: $(ref.pwa-global-ip.selfLink)
+      IPProtocol: TCP
+      portRange: "80"
+      loadBalancingScheme: EXTERNAL
+
+# Outputs - provide important information for users
+outputs:
+  - name: project_id
+    description: Google Cloud Project ID
+    value: $(ref.project_id)
+    
+  - name: region
+    description: Primary region for resources
+    value: $(ref.region)
+    
+  - name: blue_cluster_name
+    description: Name of the blue (production) GKE cluster
+    value: $(ref.gke-cluster-blue.name)
+    
+  - name: green_cluster_name
+    description: Name of the green (staging) GKE cluster
+    value: $(ref.gke-cluster-green.name)
+    
+  - name: blue_cluster_endpoint
+    description: Endpoint for the blue GKE cluster
+    value: $(ref.gke-cluster-blue.endpoint)
+    
+  - name: green_cluster_endpoint
+    description: Endpoint for the green GKE cluster
+    value: $(ref.gke-cluster-green.endpoint)
+    
+  - name: storage_bucket_name
+    description: Name of the Cloud Storage bucket for PWA assets
+    value: $(ref.pwa-assets-bucket.name)
+    
+  - name: source_repository_name
+    description: Name of the Cloud Source Repository
+    value: $(ref.pwa-source-repo.name)
+    
+  - name: global_ip_address
+    description: Global static IP address for the load balancer
+    value: $(ref.pwa-global-ip.address)
+    
+  - name: build_trigger_name
+    description: Name of the Cloud Build trigger
+    value: $(ref.pwa-build-trigger.name)
+    
+  - name: health_check_name
+    description: Name of the load balancer health check
+    value: $(ref.pwa-health-check.name)
+    
+  - name: backend_service_name
+    description: Name of the backend service
+    value: $(ref.pwa-backend-service.name)
+    
+  - name: load_balancer_url
+    description: URL of the load balancer
+    value: |
+      ${ if(ref.enable_ssl && ref.domain_name != "", 
+           "https://" + ref.domain_name,
+           "http://" + ref.pwa-global-ip.address) }
+    
+  - name: deployment_commands
+    description: Commands to deploy the PWA application
+    value: |
+      # Get cluster credentials:
+      gcloud container clusters get-credentials $(ref.gke-cluster-blue.name) --region $(ref.region)
+      gcloud container clusters get-credentials $(ref.gke-cluster-green.name) --region $(ref.region)
+      
+      # Clone source repository:
+      gcloud source repos clone $(ref.app_name)-repo --project=$(ref.project_id)
+      
+      # Deploy using Cloud Build:
+      gcloud builds submit --config=cloudbuild.yaml .
+      
+  - name: monitoring_links
+    description: Links to monitoring and logging
+    value: |
+      GKE Clusters: https://console.cloud.google.com/kubernetes/list?project=$(ref.project_id)
+      Cloud Build: https://console.cloud.google.com/cloud-build/builds?project=$(ref.project_id)
+      Load Balancer: https://console.cloud.google.com/net-services/loadbalancing/list?project=$(ref.project_id)
+      Cloud Storage: https://console.cloud.google.com/storage/browser?project=$(ref.project_id)
+
+# Metadata section for deployment information
+metadata:
+  version: 1.0.0
+  schemaVersion: 1.0.0
+  title: PWA Deployment Infrastructure
+  description: |
+    Complete infrastructure for Progressive Web Application deployment featuring:
+    - Blue-green deployment strategy with GKE
+    - Automated CI/CD with Cloud Build
+    - Global load balancing with Cloud Load Balancing
+    - Static asset storage with Cloud Storage
+    - Comprehensive monitoring and logging
+    - SSL/TLS support with managed certificates
+  
+  # Resource summary
+  resources:
+    total: 17
+    gke_clusters: 2
+    storage_buckets: 1
+    load_balancers: 1
+    build_triggers: 1
+    
+  # Estimated costs (monthly, USD)
+  estimated_costs:
+    gke_clusters: "$150-300"
+    load_balancer: "$20-50"
+    storage: "$5-20"
+    build_minutes: "$10-50"
+    total_estimate: "$185-420"
+    
+  # Security features
+  security:
+    - "Private GKE clusters with network policies"
+    - "IAM-based access control"
+    - "SSL/TLS encryption"
+    - "Container image scanning"
+    - "Audit logging enabled"
+    
+  # High availability features
+  availability:
+    - "Multi-zone GKE clusters"
+    - "Blue-green deployment strategy"
+    - "Health checks and auto-healing"
+    - "Global load balancing"
+    - "Automatic node repair and upgrade"

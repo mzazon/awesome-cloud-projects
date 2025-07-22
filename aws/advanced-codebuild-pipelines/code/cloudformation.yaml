@@ -1,0 +1,1487 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Advanced CodeBuild Pipelines with Multi-Stage Builds, Caching, and Artifacts Management'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'advanced-build'
+    Description: 'Base name for all resources in this stack'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+    MaxLength: 32
+    MinLength: 3
+
+  CacheBucketName:
+    Type: String
+    Default: ''
+    Description: 'Name for S3 cache bucket (leave empty for auto-generated name)'
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be a valid S3 bucket name or empty for auto-generation'
+
+  ArtifactBucketName:
+    Type: String
+    Default: ''
+    Description: 'Name for S3 artifact bucket (leave empty for auto-generated name)'
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be a valid S3 bucket name or empty for auto-generation'
+
+  ECRRepositoryName:
+    Type: String
+    Default: ''
+    Description: 'Name for ECR repository (leave empty for auto-generated name)'
+    AllowedPattern: '^$|^[a-z0-9]+(?:[._-][a-z0-9]+)*$'
+    ConstraintDescription: 'Must be a valid ECR repository name or empty for auto-generation'
+
+  BuildEnvironmentImage:
+    Type: String
+    Default: 'aws/codebuild/amazonlinux2-x86_64-standard:4.0'
+    Description: 'CodeBuild environment image to use for builds'
+    AllowedValues:
+      - 'aws/codebuild/amazonlinux2-x86_64-standard:4.0'
+      - 'aws/codebuild/amazonlinux2-x86_64-standard:5.0'
+      - 'aws/codebuild/ubuntu-base:20.04'
+      - 'aws/codebuild/ubuntu-base:22.04'
+
+  DependencyBuildComputeType:
+    Type: String
+    Default: 'BUILD_GENERAL1_MEDIUM'
+    Description: 'Compute type for dependency build stage'
+    AllowedValues:
+      - 'BUILD_GENERAL1_SMALL'
+      - 'BUILD_GENERAL1_MEDIUM'
+      - 'BUILD_GENERAL1_LARGE'
+      - 'BUILD_GENERAL1_2XLARGE'
+
+  MainBuildComputeType:
+    Type: String
+    Default: 'BUILD_GENERAL1_LARGE'
+    Description: 'Compute type for main build stage'
+    AllowedValues:
+      - 'BUILD_GENERAL1_SMALL'
+      - 'BUILD_GENERAL1_MEDIUM'
+      - 'BUILD_GENERAL1_LARGE'
+      - 'BUILD_GENERAL1_2XLARGE'
+
+  ParallelBuildComputeType:
+    Type: String
+    Default: 'BUILD_GENERAL1_MEDIUM'
+    Description: 'Compute type for parallel build stage'
+    AllowedValues:
+      - 'BUILD_GENERAL1_SMALL'
+      - 'BUILD_GENERAL1_MEDIUM'
+      - 'BUILD_GENERAL1_LARGE'
+      - 'BUILD_GENERAL1_2XLARGE'
+
+  CacheLifecycleDays:
+    Type: Number
+    Default: 30
+    Description: 'Number of days to retain cache objects'
+    MinValue: 1
+    MaxValue: 365
+
+  DependencyLifecycleDays:
+    Type: Number
+    Default: 90
+    Description: 'Number of days to retain dependency cache objects'
+    MinValue: 1
+    MaxValue: 365
+
+  EnableVpcConfig:
+    Type: String
+    Default: 'false'
+    Description: 'Enable VPC configuration for CodeBuild projects'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  VpcId:
+    Type: String
+    Default: ''
+    Description: 'VPC ID for CodeBuild projects (required if EnableVpcConfig is true)'
+
+  PrivateSubnetIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: 'Private subnet IDs for CodeBuild projects (required if EnableVpcConfig is true)'
+
+  EnableCloudWatchDashboard:
+    Type: String
+    Default: 'true'
+    Description: 'Create CloudWatch dashboard for monitoring'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Conditions:
+  # Condition for auto-generating bucket names
+  CreateCacheBucketName: !Equals [!Ref CacheBucketName, '']
+  CreateArtifactBucketName: !Equals [!Ref ArtifactBucketName, '']
+  CreateECRRepositoryName: !Equals [!Ref ECRRepositoryName, '']
+  
+  # Condition for VPC configuration
+  UseVpcConfig: !Equals [!Ref EnableVpcConfig, 'true']
+  
+  # Condition for CloudWatch dashboard
+  CreateDashboard: !Equals [!Ref EnableCloudWatchDashboard, 'true']
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - CacheBucketName
+          - ArtifactBucketName
+          - ECRRepositoryName
+      - Label:
+          default: "Build Environment Configuration"
+        Parameters:
+          - BuildEnvironmentImage
+          - DependencyBuildComputeType
+          - MainBuildComputeType
+          - ParallelBuildComputeType
+      - Label:
+          default: "Cache and Lifecycle Configuration"
+        Parameters:
+          - CacheLifecycleDays
+          - DependencyLifecycleDays
+      - Label:
+          default: "Network Configuration (Optional)"
+        Parameters:
+          - EnableVpcConfig
+          - VpcId
+          - PrivateSubnetIds
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableCloudWatchDashboard
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      CacheBucketName:
+        default: "Cache Bucket Name"
+      ArtifactBucketName:
+        default: "Artifact Bucket Name"
+      ECRRepositoryName:
+        default: "ECR Repository Name"
+      BuildEnvironmentImage:
+        default: "Build Environment Image"
+      DependencyBuildComputeType:
+        default: "Dependency Build Compute Type"
+      MainBuildComputeType:
+        default: "Main Build Compute Type"
+      ParallelBuildComputeType:
+        default: "Parallel Build Compute Type"
+      CacheLifecycleDays:
+        default: "Cache Lifecycle (Days)"
+      DependencyLifecycleDays:
+        default: "Dependency Lifecycle (Days)"
+      EnableVpcConfig:
+        default: "Enable VPC Configuration"
+      VpcId:
+        default: "VPC ID"
+      PrivateSubnetIds:
+        default: "Private Subnet IDs"
+      EnableCloudWatchDashboard:
+        default: "Enable CloudWatch Dashboard"
+
+Resources:
+  # S3 Bucket for Build Caching
+  CacheBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - CreateCacheBucketName
+        - !Sub '${ProjectName}-cache-${AWS::AccountId}-${AWS::Region}'
+        - !Ref CacheBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: CacheCleanup
+            Status: Enabled
+            Prefix: cache/
+            ExpirationInDays: !Ref CacheLifecycleDays
+            NoncurrentVersionExpirationInDays: 7
+          - Id: DependencyCache
+            Status: Enabled
+            Prefix: deps/
+            ExpirationInDays: !Ref DependencyLifecycleDays
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref CacheLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cache-bucket'
+        - Key: Purpose
+          Value: 'CodeBuild Cache Storage'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # S3 Bucket for Build Artifacts
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - CreateArtifactBucketName
+        - !Sub '${ProjectName}-artifacts-${AWS::AccountId}-${AWS::Region}'
+        - !Ref ArtifactBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArtifactCleanup
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-artifact-bucket'
+        - Key: Purpose
+          Value: 'CodeBuild Artifact Storage'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ECR Repository for Container Images
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !If
+        - CreateECRRepositoryName
+        - !Sub '${ProjectName}-repository'
+        - !Ref ECRRepositoryName
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 tagged images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep untagged images for 1 day",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 1
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ecr-repository'
+        - Key: Purpose
+          Value: 'Container Image Registry'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Groups
+  CacheLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-cache'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cache-logs'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DependencyBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectName}-dependencies'
+      RetentionInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dependency-build-logs'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  MainBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectName}-main'
+      RetentionInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-main-build-logs'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ParallelBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectName}-parallel'
+      RetentionInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-parallel-build-logs'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for CodeBuild Projects
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-codebuild-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Policies:
+        - PolicyName: CodeBuildBasePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CloudWatch Logs permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}-*'
+              
+              # S3 permissions for cache and artifacts
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub '${CacheBucket}'
+                  - !Sub '${CacheBucket}/*'
+                  - !Sub '${ArtifactBucket}'
+                  - !Sub '${ArtifactBucket}/*'
+              
+              # ECR permissions
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:GetAuthorizationToken
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeRepositories
+                  - ecr:ListImages
+                Resource: '*'
+              
+              # CodeBuild permissions for build reports
+              - Effect: Allow
+                Action:
+                  - codebuild:CreateReportGroup
+                  - codebuild:CreateReport
+                  - codebuild:UpdateReport
+                  - codebuild:BatchPutTestCases
+                  - codebuild:BatchPutCodeCoverages
+                Resource: !Sub 'arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/${ProjectName}-*'
+              
+              # CloudWatch metrics permissions
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              
+              # CodeBuild project permissions for orchestration
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - codebuild:ListBuildsForProject
+                Resource: !Sub 'arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/${ProjectName}-*'
+              
+              # VPC permissions (if VPC is enabled)
+              - !If
+                - UseVpcConfig
+                - Effect: Allow
+                  Action:
+                    - ec2:CreateNetworkInterface
+                    - ec2:DescribeDhcpOptions
+                    - ec2:DescribeNetworkInterfaces
+                    - ec2:DeleteNetworkInterface
+                    - ec2:DescribeSubnets
+                    - ec2:DescribeSecurityGroups
+                    - ec2:DescribeVpcs
+                  Resource: '*'
+                - !Ref 'AWS::NoValue'
+              
+              # Additional VPC attachment permissions
+              - !If
+                - UseVpcConfig
+                - Effect: Allow
+                  Action:
+                    - ec2:CreateNetworkInterfacePermission
+                  Resource: !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*'
+                  Condition:
+                    StringEquals:
+                      'ec2:Subnet':
+                        - !Split
+                          - ','
+                          - !Join
+                            - ','
+                            - !Ref PrivateSubnetIds
+                      'ec2:AuthorizedService': 'codebuild.amazonaws.com'
+                - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-codebuild-role'
+        - Key: Purpose
+          Value: 'CodeBuild Service Role'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Security Group for CodeBuild (if VPC is enabled)
+  CodeBuildSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: UseVpcConfig
+    Properties:
+      GroupName: !Sub '${ProjectName}-codebuild-sg'
+      GroupDescription: 'Security group for CodeBuild projects'
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTPS outbound for AWS services'
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTP outbound for package downloads'
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: 'SSH outbound for git operations'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-codebuild-sg'
+        - Key: Purpose
+          Value: 'CodeBuild Security Group'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CodeBuild Project for Dependency Stage
+  DependencyBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-dependencies'
+      Description: 'Dependency installation and caching stage'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: S3
+        Location: !Sub '${ArtifactBucket}/dependencies'
+        Name: 'dependencies'
+        NamespaceType: BUILD_ID
+        Packaging: ZIP
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: !Ref DependencyBuildComputeType
+        Image: !Ref BuildEnvironmentImage
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: CACHE_BUCKET
+            Value: !Ref CacheBucket
+          - Name: ARTIFACT_BUCKET
+            Value: !Ref ArtifactBucket
+          - Name: AWS_REGION
+            Value: !Ref 'AWS::Region'
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref 'AWS::AccountId'
+      Source:
+        Type: S3
+        BuildSpec: |
+          version: 0.2
+          
+          env:
+            variables:
+              CACHE_BUCKET: ""
+              NODE_VERSION: "18"
+              PYTHON_VERSION: "3.11"
+          
+          phases:
+            install:
+              runtime-versions:
+                nodejs: $NODE_VERSION
+                python: $PYTHON_VERSION
+              commands:
+                - echo "Installing build dependencies..."
+                - apt-get update && apt-get install -y jq curl
+                - pip install --upgrade pip
+                - npm install -g npm@latest
+          
+            pre_build:
+              commands:
+                - echo "Dependency stage started on $(date)"
+                - echo "Checking for cached dependencies..."
+                - |
+                  if aws s3 ls s3://$CACHE_BUCKET/deps/package-lock.json; then
+                    echo "Found cached package-lock.json"
+                    aws s3 cp s3://$CACHE_BUCKET/deps/package-lock.json ./package-lock.json || true
+                  fi
+                - |
+                  if aws s3 ls s3://$CACHE_BUCKET/deps/requirements.txt; then
+                    echo "Found cached requirements.txt"
+                    aws s3 cp s3://$CACHE_BUCKET/deps/requirements.txt ./requirements.txt || true
+                  fi
+          
+            build:
+              commands:
+                - echo "Installing Node.js dependencies..."
+                - |
+                  if [ -f "package.json" ]; then
+                    npm ci --cache /tmp/npm-cache
+                    echo "Caching node_modules..."
+                    tar -czf node_modules.tar.gz node_modules/
+                    aws s3 cp node_modules.tar.gz s3://$CACHE_BUCKET/deps/node_modules-$(date +%Y%m%d).tar.gz
+                  fi
+                - echo "Installing Python dependencies..."
+                - |
+                  if [ -f "requirements.txt" ]; then
+                    pip install -r requirements.txt --cache-dir /tmp/pip-cache
+                    echo "Caching Python packages..."
+                    tar -czf python_packages.tar.gz $(python -c "import site; print(site.getsitepackages()[0])")
+                    aws s3 cp python_packages.tar.gz s3://$CACHE_BUCKET/deps/python-packages-$(date +%Y%m%d).tar.gz
+                  fi
+          
+            post_build:
+              commands:
+                - echo "Dependency installation completed"
+                - echo "Updating dependency cache..."
+                - |
+                  if [ -f "package-lock.json" ]; then
+                    aws s3 cp package-lock.json s3://$CACHE_BUCKET/deps/package-lock.json
+                  fi
+                - |
+                  if [ -f "requirements.txt" ]; then
+                    aws s3 cp requirements.txt s3://$CACHE_BUCKET/deps/requirements.txt
+                  fi
+          
+          cache:
+            paths:
+              - '/tmp/npm-cache/**/*'
+              - '/tmp/pip-cache/**/*'
+              - 'node_modules/**/*'
+          
+          artifacts:
+            files:
+              - '**/*'
+            name: dependencies-$(date +%Y-%m-%d)
+      Cache:
+        Type: S3
+        Location: !Sub '${CacheBucket}/dependency-cache'
+      TimeoutInMinutes: 30
+      VpcConfig: !If
+        - UseVpcConfig
+        - VpcId: !Ref VpcId
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroupIds:
+            - !Ref CodeBuildSecurityGroup
+        - !Ref 'AWS::NoValue'
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref DependencyBuildLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dependency-build'
+        - Key: Stage
+          Value: 'Dependencies'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CodeBuild Project for Main Build Stage
+  MainBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-main'
+      Description: 'Main build stage with testing and quality checks'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: S3
+        Location: !Sub '${ArtifactBucket}/main-build'
+        Name: 'main-build'
+        NamespaceType: BUILD_ID
+        Packaging: ZIP
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: !Ref MainBuildComputeType
+        Image: !Ref BuildEnvironmentImage
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: CACHE_BUCKET
+            Value: !Ref CacheBucket
+          - Name: ARTIFACT_BUCKET
+            Value: !Ref ArtifactBucket
+          - Name: ECR_URI
+            Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}'
+          - Name: AWS_REGION
+            Value: !Ref 'AWS::Region'
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref 'AWS::AccountId'
+          - Name: IMAGE_TAG
+            Value: 'latest'
+          - Name: DOCKER_BUILDKIT
+            Value: '1'
+      Source:
+        Type: S3
+        BuildSpec: |
+          version: 0.2
+          
+          env:
+            variables:
+              CACHE_BUCKET: ""
+              ARTIFACT_BUCKET: ""
+              ECR_URI: ""
+              IMAGE_TAG: "latest"
+              DOCKER_BUILDKIT: "1"
+          
+          phases:
+            install:
+              runtime-versions:
+                docker: 20
+                nodejs: 18
+                python: 3.11
+              commands:
+                - echo "Installing build tools..."
+                - apt-get update && apt-get install -y jq curl git
+                - pip install --upgrade pip pytest pytest-cov black pylint bandit
+                - npm install -g eslint prettier jest
+          
+            pre_build:
+              commands:
+                - echo "Main build stage started on $(date)"
+                - echo "Logging in to Amazon ECR..."
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_URI
+                - export COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+                - export IMAGE_TAG=${COMMIT_HASH:-latest}
+                - echo "Image will be tagged as $IMAGE_TAG"
+                
+                # Restore cached dependencies
+                - echo "Restoring cached dependencies..."
+                - |
+                  if aws s3 ls s3://$CACHE_BUCKET/deps/node_modules-$(date +%Y%m%d).tar.gz; then
+                    echo "Restoring Node.js dependencies from cache..."
+                    aws s3 cp s3://$CACHE_BUCKET/deps/node_modules-$(date +%Y%m%d).tar.gz ./node_modules.tar.gz
+                    tar -xzf node_modules.tar.gz
+                  fi
+          
+            build:
+              commands:
+                - echo "Build started on $(date)"
+                
+                # Code quality checks
+                - echo "Running code quality checks..."
+                - |
+                  if [ -f "package.json" ]; then
+                    echo "Running ESLint..."
+                    npx eslint src/ --ext .js,.jsx,.ts,.tsx --format json > eslint-report.json || true
+                    echo "Running Prettier check..."
+                    npx prettier --check src/ || true
+                  fi
+                - |
+                  if [ -f "requirements.txt" ]; then
+                    echo "Running Python linting..."
+                    find . -name "*.py" -exec pylint {} \; > pylint-report.txt || true
+                    echo "Running Black formatting check..."
+                    black --check . || true
+                    echo "Running Bandit security scan..."
+                    bandit -r . -f json -o bandit-report.json || true
+                  fi
+                
+                # Run tests
+                - echo "Running tests..."
+                - |
+                  if [ -f "package.json" ] && grep -q '"test"' package.json; then
+                    echo "Running Node.js tests..."
+                    npm test -- --coverage --coverageReporters=json > test-results.json
+                  fi
+                - |
+                  if [ -f "requirements.txt" ] && find . -name "test_*.py" | head -1; then
+                    echo "Running Python tests..."
+                    pytest --cov=. --cov-report=json --cov-report=xml --junit-xml=test-results.xml
+                  fi
+                
+                # Build application
+                - echo "Building application..."
+                - |
+                  if [ -f "Dockerfile" ]; then
+                    echo "Building Docker image..."
+                    docker build --cache-from $ECR_URI:latest \
+                      --build-arg BUILDKIT_INLINE_CACHE=1 \
+                      -t $ECR_URI:$IMAGE_TAG \
+                      -t $ECR_URI:latest .
+                  fi
+                - |
+                  if [ -f "package.json" ] && grep -q '"build"' package.json; then
+                    echo "Building Node.js application..."
+                    npm run build
+                  fi
+                - |
+                  if [ -f "setup.py" ]; then
+                    echo "Building Python package..."
+                    python setup.py bdist_wheel
+                  fi
+          
+            post_build:
+              commands:
+                - echo "Build completed on $(date)"
+                
+                # Push Docker image
+                - |
+                  if [ -f "Dockerfile" ]; then
+                    echo "Pushing Docker image to ECR..."
+                    docker push $ECR_URI:$IMAGE_TAG
+                    docker push $ECR_URI:latest
+                    echo "Docker image pushed successfully"
+                  fi
+                
+                # Upload artifacts
+                - echo "Uploading build artifacts..."
+                - |
+                  if [ -d "build" ] || [ -d "dist" ]; then
+                    echo "Uploading application artifacts..."
+                    tar -czf app-artifacts-$IMAGE_TAG.tar.gz build/ dist/ || tar -czf app-artifacts-$IMAGE_TAG.tar.gz build/ || tar -czf app-artifacts-$IMAGE_TAG.tar.gz dist/
+                    aws s3 cp app-artifacts-$IMAGE_TAG.tar.gz s3://$ARTIFACT_BUCKET/artifacts/
+                  fi
+                
+                # Upload reports
+                - echo "Uploading test and quality reports..."
+                - |
+                  if [ -f "test-results.json" ] || [ -f "test-results.xml" ]; then
+                    aws s3 cp test-results.* s3://$ARTIFACT_BUCKET/reports/tests/ || true
+                  fi
+                - |
+                  if [ -f "coverage.json" ] || [ -f "coverage.xml" ]; then
+                    aws s3 cp coverage.* s3://$ARTIFACT_BUCKET/reports/coverage/ || true
+                  fi
+                - |
+                  if [ -f "eslint-report.json" ] || [ -f "pylint-report.txt" ]; then
+                    aws s3 cp *lint-report.* s3://$ARTIFACT_BUCKET/reports/quality/ || true
+                  fi
+                - |
+                  if [ -f "bandit-report.json" ]; then
+                    aws s3 cp *-report.json s3://$ARTIFACT_BUCKET/reports/security/ || true
+                  fi
+                
+                # Create build manifest
+                - |
+                  cat > build-manifest.json << EOF
+                  {
+                    "buildId": "$CODEBUILD_BUILD_ID",
+                    "commitHash": "$COMMIT_HASH",
+                    "imageTag": "$IMAGE_TAG",
+                    "ecrUri": "$ECR_URI",
+                    "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+                    "artifacts": {
+                      "image": "$ECR_URI:$IMAGE_TAG",
+                      "reports": "s3://$ARTIFACT_BUCKET/reports/",
+                      "artifacts": "s3://$ARTIFACT_BUCKET/artifacts/"
+                    }
+                  }
+                  EOF
+                - aws s3 cp build-manifest.json s3://$ARTIFACT_BUCKET/manifests/build-manifest-$IMAGE_TAG.json
+          
+          reports:
+            test_reports:
+              files:
+                - 'test-results.xml'
+                - 'test-results.json'
+              file-format: 'JUNITXML'
+            code_coverage:
+              files:
+                - 'coverage.xml'
+                - 'coverage.json'
+              file-format: 'COBERTURAXML'
+          
+          cache:
+            paths:
+              - '/root/.npm/**/*'
+              - '/root/.cache/**/*'
+              - 'node_modules/**/*'
+              - '/var/lib/docker/**/*'
+          
+          artifacts:
+            files:
+              - 'build-manifest.json'
+              - '**/*'
+            name: main-build-$(date +%Y-%m-%d)
+      Cache:
+        Type: S3
+        Location: !Sub '${CacheBucket}/main-cache'
+      TimeoutInMinutes: 60
+      VpcConfig: !If
+        - UseVpcConfig
+        - VpcId: !Ref VpcId
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroupIds:
+            - !Ref CodeBuildSecurityGroup
+        - !Ref 'AWS::NoValue'
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref MainBuildLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-main-build'
+        - Key: Stage
+          Value: 'MainBuild'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CodeBuild Project for Parallel Build Stage
+  ParallelBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-parallel'
+      Description: 'Parallel build for multiple architectures'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: S3
+        Location: !Sub '${ArtifactBucket}/parallel-build'
+        Name: 'parallel-build'
+        NamespaceType: BUILD_ID
+        Packaging: ZIP
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: !Ref ParallelBuildComputeType
+        Image: !Ref BuildEnvironmentImage
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: CACHE_BUCKET
+            Value: !Ref CacheBucket
+          - Name: ECR_URI
+            Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}'
+          - Name: TARGET_ARCH
+            Value: 'amd64'
+          - Name: AWS_REGION
+            Value: !Ref 'AWS::Region'
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref 'AWS::AccountId'
+      Source:
+        Type: S3
+        BuildSpec: |
+          version: 0.2
+          
+          env:
+            variables:
+              CACHE_BUCKET: ""
+              ECR_URI: ""
+              TARGET_ARCH: "amd64"
+          
+          phases:
+            install:
+              runtime-versions:
+                docker: 20
+              commands:
+                - echo "Installing Docker buildx for multi-architecture builds..."
+                - docker buildx create --use --name multiarch-builder
+                - docker buildx inspect --bootstrap
+          
+            pre_build:
+              commands:
+                - echo "Parallel build for $TARGET_ARCH started on $(date)"
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_URI
+                - export COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+                - export IMAGE_TAG=${COMMIT_HASH:-latest}-$TARGET_ARCH
+          
+            build:
+              commands:
+                - echo "Building for architecture: $TARGET_ARCH"
+                - |
+                  if [ -f "Dockerfile" ]; then
+                    docker buildx build --platform linux/$TARGET_ARCH \
+                      --cache-from $ECR_URI:cache-$TARGET_ARCH \
+                      --cache-to type=registry,ref=$ECR_URI:cache-$TARGET_ARCH,mode=max \
+                      -t $ECR_URI:$IMAGE_TAG \
+                      --push .
+                  fi
+          
+            post_build:
+              commands:
+                - echo "Parallel build for $TARGET_ARCH completed on $(date)"
+                - echo "Image: $ECR_URI:$IMAGE_TAG"
+          
+          artifacts:
+            files:
+              - '**/*'
+            name: parallel-build-$TARGET_ARCH-$(date +%Y-%m-%d)
+      Cache:
+        Type: S3
+        Location: !Sub '${CacheBucket}/parallel-cache'
+      TimeoutInMinutes: 45
+      VpcConfig: !If
+        - UseVpcConfig
+        - VpcId: !Ref VpcId
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroupIds:
+            - !Ref CodeBuildSecurityGroup
+        - !Ref 'AWS::NoValue'
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref ParallelBuildLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-parallel-build'
+        - Key: Stage
+          Value: 'ParallelBuild'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for Lambda Orchestrator
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-orchestrator-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CodeBuildOrchestrationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CodeBuild permissions
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - codebuild:ListBuildsForProject
+                Resource: !Sub 'arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/${ProjectName}-*'
+              
+              # S3 permissions for storing pipeline results
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${ArtifactBucket}'
+                  - !Sub '${ArtifactBucket}/*'
+              
+              # CloudWatch metrics permissions
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-orchestrator-role'
+        - Key: Purpose
+          Value: 'Lambda Orchestrator Service Role'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda Function for Build Orchestration
+  BuildOrchestratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-orchestrator'
+      Description: 'Orchestrate multi-stage CodeBuild pipeline'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      Environment:
+        Variables:
+          DEPENDENCY_BUILD_PROJECT: !Ref DependencyBuildProject
+          MAIN_BUILD_PROJECT: !Ref MainBuildProject
+          PARALLEL_BUILD_PROJECT: !Ref ParallelBuildProject
+          CACHE_BUCKET: !Ref CacheBucket
+          ARTIFACT_BUCKET: !Ref ArtifactBucket
+          ECR_URI: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          from datetime import datetime
+          import time
+          import os
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          codebuild = boto3.client('codebuild')
+          s3 = boto3.client('s3')
+          cloudwatch = boto3.client('cloudwatch')
+          
+          def lambda_handler(event, context):
+              """
+              Orchestrate multi-stage CodeBuild pipeline
+              """
+              try:
+                  logger.info(f"Build orchestration started: {json.dumps(event)}")
+                  
+                  # Extract build parameters
+                  build_config = event.get('buildConfig', {})
+                  source_location = build_config.get('sourceLocation')
+                  parallel_builds = build_config.get('parallelBuilds', ['amd64'])
+                  
+                  if not source_location:
+                      return {'statusCode': 400, 'body': 'Source location required'}
+                  
+                  # Execute build pipeline stages
+                  pipeline_result = execute_build_pipeline(source_location, parallel_builds)
+                  
+                  # Record pipeline metrics
+                  record_pipeline_metrics(pipeline_result)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(pipeline_result, default=str)
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in build orchestration: {str(e)}")
+                  return {'statusCode': 500, 'body': f'Error: {str(e)}'}
+          
+          def execute_build_pipeline(source_location, parallel_builds):
+              """Execute the complete build pipeline"""
+              
+              pipeline_id = f"pipeline-{int(time.time())}"
+              results = {
+                  'pipelineId': pipeline_id,
+                  'startTime': datetime.utcnow().isoformat(),
+                  'stages': {}
+              }
+              
+              try:
+                  # Stage 1: Dependencies
+                  logger.info("Starting dependency stage...")
+                  dep_result = start_build_stage('dependencies', source_location)
+                  results['stages']['dependencies'] = dep_result
+                  
+                  if dep_result['status'] != 'SUCCEEDED':
+                      raise Exception(f"Dependency stage failed: {dep_result}")
+                  
+                  # Stage 2: Main Build
+                  logger.info("Starting main build stage...")
+                  main_result = start_build_stage('main', source_location)
+                  results['stages']['main'] = main_result
+                  
+                  if main_result['status'] != 'SUCCEEDED':
+                      raise Exception(f"Main build stage failed: {main_result}")
+                  
+                  # Stage 3: Parallel Builds
+                  logger.info("Starting parallel build stages...")
+                  parallel_results = []
+                  
+                  for arch in parallel_builds:
+                      parallel_result = start_build_stage('parallel', source_location, {'TARGET_ARCH': arch})
+                      parallel_results.append(parallel_result)
+                  
+                  results['stages']['parallel'] = parallel_results
+                  
+                  # Overall pipeline result
+                  all_succeeded = (dep_result['status'] == 'SUCCEEDED' and 
+                                  main_result['status'] == 'SUCCEEDED' and 
+                                  all(r['status'] == 'SUCCEEDED' for r in parallel_results))
+                  
+                  results['overallStatus'] = 'SUCCEEDED' if all_succeeded else 'FAILED'
+                  results['endTime'] = datetime.utcnow().isoformat()
+                  
+                  # Store pipeline results
+                  store_pipeline_results(results)
+                  
+                  return results
+                  
+              except Exception as e:
+                  logger.error(f"Pipeline execution failed: {str(e)}")
+                  results['overallStatus'] = 'FAILED'
+                  results['error'] = str(e)
+                  results['endTime'] = datetime.utcnow().isoformat()
+                  return results
+          
+          def start_build_stage(stage, source_location, env_overrides=None):
+              """Start a specific build stage"""
+              
+              project_mapping = {
+                  'dependencies': os.environ['DEPENDENCY_BUILD_PROJECT'],
+                  'main': os.environ['MAIN_BUILD_PROJECT'],
+                  'parallel': os.environ['PARALLEL_BUILD_PROJECT']
+              }
+              
+              project_name = project_mapping.get(stage)
+              if not project_name:
+                  raise ValueError(f"Unknown build stage: {stage}")
+              
+              try:
+                  # Prepare environment variables
+                  env_vars = [
+                      {'name': 'CACHE_BUCKET', 'value': os.environ['CACHE_BUCKET']},
+                      {'name': 'ARTIFACT_BUCKET', 'value': os.environ['ARTIFACT_BUCKET']},
+                      {'name': 'ECR_URI', 'value': os.environ['ECR_URI']}
+                  ]
+                  
+                  # Add stage-specific overrides
+                  if env_overrides:
+                      for key, value in env_overrides.items():
+                          env_vars.append({'name': key, 'value': value})
+                  
+                  # Start build
+                  response = codebuild.start_build(
+                      projectName=project_name,
+                      sourceLocationOverride=source_location,
+                      environmentVariablesOverride=env_vars
+                  )
+                  
+                  build_id = response['build']['id']
+                  logger.info(f"Started {stage} build: {build_id}")
+                  
+                  return {
+                      'stage': stage,
+                      'buildId': build_id,
+                      'status': 'IN_PROGRESS',
+                      'startTime': datetime.utcnow().isoformat()
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error starting {stage} build: {str(e)}")
+                  return {
+                      'stage': stage,
+                      'status': 'FAILED',
+                      'error': str(e)
+                  }
+          
+          def store_pipeline_results(results):
+              """Store pipeline results in S3"""
+              try:
+                  bucket = os.environ['ARTIFACT_BUCKET']
+                  key = f"pipeline-results/{results['pipelineId']}.json"
+                  
+                  s3.put_object(
+                      Bucket=bucket,
+                      Key=key,
+                      Body=json.dumps(results, indent=2, default=str),
+                      ContentType='application/json'
+                  )
+                  
+                  logger.info(f"Pipeline results stored: s3://{bucket}/{key}")
+                  
+              except Exception as e:
+                  logger.error(f"Error storing pipeline results: {str(e)}")
+          
+          def record_pipeline_metrics(results):
+              """Record pipeline metrics to CloudWatch"""
+              try:
+                  metrics = [{
+                      'MetricName': 'PipelineExecutions',
+                      'Value': 1,
+                      'Unit': 'Count',
+                      'Dimensions': [
+                          {'Name': 'Status', 'Value': results['overallStatus']}
+                      ]
+                  }]
+                  
+                  # Send metrics to CloudWatch
+                  cloudwatch.put_metric_data(
+                      Namespace='CodeBuild/AdvancedPipeline',
+                      MetricData=metrics
+                  )
+                  
+              except Exception as e:
+                  logger.error(f"Error recording metrics: {str(e)}")
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-orchestrator'
+        - Key: Purpose
+          Value: 'Build Pipeline Orchestrator'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Dashboard for Build Monitoring
+  BuildMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateDashboard
+    Properties:
+      DashboardName: !Sub 'Advanced-CodeBuild-${ProjectName}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["CodeBuild/AdvancedPipeline", "PipelineExecutions", "Status", "SUCCEEDED"],
+                  [".", ".", ".", "FAILED"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Pipeline Execution Results"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/CodeBuild", "Duration", "ProjectName", "${DependencyBuildProject}"],
+                  [".", ".", ".", "${MainBuildProject}"],
+                  [".", ".", ".", "${ParallelBuildProject}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Average Build Duration by Project"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/CodeBuild", "Builds", "ProjectName", "${DependencyBuildProject}"],
+                  [".", ".", ".", "${MainBuildProject}"],
+                  [".", ".", ".", "${ParallelBuildProject}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Build Count by Project"
+              }
+            },
+            {
+              "type": "log",
+              "x": 8,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${MainBuildLogGroup}'\n| fields @timestamp, @message\n| filter @message like /ERROR/ or @message like /FAILED/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Build Errors"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/S3", "BucketSizeBytes", "BucketName", "${CacheBucket}", "StorageType", "StandardStorage"],
+                  [".", ".", "${ArtifactBucket}", ".", "."]
+                ],
+                "period": 86400,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Storage Usage (Cache and Artifacts)"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${BuildOrchestratorFunction}"],
+                  [".", "Invocations", ".", "."],
+                  [".", "Errors", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Build Orchestrator Performance"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  # Bucket Outputs
+  CacheBucketName:
+    Description: 'Name of the S3 bucket used for build caching'
+    Value: !Ref CacheBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-CacheBucket'
+
+  ArtifactBucketName:
+    Description: 'Name of the S3 bucket used for build artifacts'
+    Value: !Ref ArtifactBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ArtifactBucket'
+
+  # ECR Outputs
+  ECRRepositoryName:
+    Description: 'Name of the ECR repository for container images'
+    Value: !Ref ECRRepository
+    Export:
+      Name: !Sub '${AWS::StackName}-ECRRepository'
+
+  ECRRepositoryURI:
+    Description: 'URI of the ECR repository for container images'
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ECRRepositoryURI'
+
+  # CodeBuild Project Outputs
+  DependencyBuildProjectName:
+    Description: 'Name of the dependency build project'
+    Value: !Ref DependencyBuildProject
+    Export:
+      Name: !Sub '${AWS::StackName}-DependencyBuildProject'
+
+  MainBuildProjectName:
+    Description: 'Name of the main build project'
+    Value: !Ref MainBuildProject
+    Export:
+      Name: !Sub '${AWS::StackName}-MainBuildProject'
+
+  ParallelBuildProjectName:
+    Description: 'Name of the parallel build project'
+    Value: !Ref ParallelBuildProject
+    Export:
+      Name: !Sub '${AWS::StackName}-ParallelBuildProject'
+
+  # IAM Role Outputs
+  CodeBuildServiceRoleArn:
+    Description: 'ARN of the CodeBuild service role'
+    Value: !GetAtt CodeBuildServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeBuildServiceRole'
+
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRole'
+
+  # Lambda Function Outputs
+  BuildOrchestratorFunctionName:
+    Description: 'Name of the build orchestrator Lambda function'
+    Value: !Ref BuildOrchestratorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-BuildOrchestratorFunction'
+
+  BuildOrchestratorFunctionArn:
+    Description: 'ARN of the build orchestrator Lambda function'
+    Value: !GetAtt BuildOrchestratorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BuildOrchestratorFunctionArn'
+
+  # CloudWatch Outputs
+  DashboardURL:
+    Condition: CreateDashboard
+    Description: 'URL of the CloudWatch dashboard for build monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=Advanced-CodeBuild-${ProjectName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  # Log Group Outputs
+  DependencyBuildLogGroup:
+    Description: 'CloudWatch log group for dependency builds'
+    Value: !Ref DependencyBuildLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-DependencyBuildLogGroup'
+
+  MainBuildLogGroup:
+    Description: 'CloudWatch log group for main builds'
+    Value: !Ref MainBuildLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-MainBuildLogGroup'
+
+  ParallelBuildLogGroup:
+    Description: 'CloudWatch log group for parallel builds'
+    Value: !Ref ParallelBuildLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ParallelBuildLogGroup'
+
+  # Usage Instructions
+  QuickStartInstructions:
+    Description: 'Quick start instructions for using the advanced build pipeline'
+    Value: !Sub |
+      1. Upload your source code to: s3://${ArtifactBucket}/source/source.zip
+      2. Invoke the orchestrator: aws lambda invoke --function-name ${BuildOrchestratorFunction} --payload '{"buildConfig":{"sourceLocation":"s3://${ArtifactBucket}/source/source.zip","parallelBuilds":["amd64","arm64"]}}' result.json
+      3. Monitor builds in CloudWatch dashboard: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=Advanced-CodeBuild-${ProjectName}
+      4. View artifacts in: s3://${ArtifactBucket}/
+      5. View container images in: ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}
+
+  # Security and Networking Outputs
+  SecurityGroupId:
+    Condition: UseVpcConfig
+    Description: 'Security Group ID for CodeBuild projects (if VPC is enabled)'
+    Value: !Ref CodeBuildSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroup'
+
+  # Cost Estimation
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for moderate usage (reference only)'
+    Value: 'S3: $5-20, ECR: $1-10, CodeBuild: $10-100, Lambda: $1-5, CloudWatch: $5-15. Total: ~$25-150/month depending on usage patterns'

@@ -1,0 +1,585 @@
+# Infrastructure Manager Configuration for Development Workflow Automation
+# This configuration deploys a complete AI-powered development workflow system
+# using Firebase Studio, Gemini Code Assist, Cloud Storage, and Eventarc
+
+metadata:
+  name: development-workflow-automation
+  description: "AI-powered development workflow automation with Firebase Studio and Gemini Code Assist"
+  labels:
+    recipe: "development-workflow-automation-firebase-studio-gemini-code-assist"
+    category: "devops"
+    ai-powered: "true"
+
+# Input variables for customization
+inputs:
+  - name: project_id
+    description: "Google Cloud Project ID"
+    type: string
+    required: true
+  
+  - name: region
+    description: "Google Cloud region for resources"
+    type: string
+    default: "us-central1"
+    
+  - name: zone
+    description: "Google Cloud zone for resources"
+    type: string
+    default: "us-central1-a"
+    
+  - name: random_suffix
+    description: "Random suffix for unique resource names"
+    type: string
+    default: "$(randStr(6))"
+    
+  - name: enable_monitoring
+    description: "Enable comprehensive monitoring and alerting"
+    type: boolean
+    default: true
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.name)/services/cloudbuild.googleapis.com
+      consumerId: projects/$(ref.project_id.name)
+    metadata:
+      dependsOn:
+        - project_id
+
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.name)/services/storage.googleapis.com
+      consumerId: projects/$(ref.project_id.name)
+    metadata:
+      dependsOn:
+        - project_id
+
+  - name: enable-functions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.name)/services/cloudfunctions.googleapis.com
+      consumerId: projects/$(ref.project_id.name)
+    metadata:
+      dependsOn:
+        - project_id
+
+  - name: enable-eventarc-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.name)/services/eventarc.googleapis.com
+      consumerId: projects/$(ref.project_id.name)
+    metadata:
+      dependsOn:
+        - project_id
+
+  - name: enable-firebase-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.name)/services/firebase.googleapis.com
+      consumerId: projects/$(ref.project_id.name)
+    metadata:
+      dependsOn:
+        - project_id
+
+  - name: enable-run-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.name)/services/run.googleapis.com
+      consumerId: projects/$(ref.project_id.name)
+    metadata:
+      dependsOn:
+        - project_id
+
+  - name: enable-aiplatform-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.name)/services/aiplatform.googleapis.com
+      consumerId: projects/$(ref.project_id.name)
+    metadata:
+      dependsOn:
+        - project_id
+
+  - name: enable-pubsub-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.name)/services/pubsub.googleapis.com
+      consumerId: projects/$(ref.project_id.name)
+    metadata:
+      dependsOn:
+        - project_id
+
+  # Cloud Storage bucket for development artifacts
+  - name: dev-artifacts-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: dev-artifacts-$(ref.random_suffix)
+      project: $(ref.project_id.name)
+      location: $(ref.region)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              isLive: false
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 7
+              isLive: true
+      labels:
+        purpose: "development-artifacts"
+        managed-by: "infrastructure-manager"
+        recipe: "dev-workflow-automation"
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # IAM binding for Cloud Storage bucket
+  - name: bucket-iam-binding
+    type: gcp-types/storage-v1:buckets/setIamPolicy
+    properties:
+      bucket: $(ref.dev-artifacts-bucket.name)
+      policy:
+        bindings:
+          - role: roles/storage.objectAdmin
+            members:
+              - serviceAccount:$(ref.project_id.name)@appspot.gserviceaccount.com
+          - role: roles/storage.objectViewer
+            members:
+              - serviceAccount:$(ref.code-review-function-sa.email)
+    metadata:
+      dependsOn:
+        - dev-artifacts-bucket
+        - code-review-function-sa
+
+  # Pub/Sub topic for development events
+  - name: code-events-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project_id.name)/topics/code-events-$(ref.random_suffix)
+      labels:
+        purpose: "development-events"
+        managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - enable-pubsub-api
+
+  # Pub/Sub subscription for event processing
+  - name: code-events-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(ref.project_id.name)/subscriptions/code-events-$(ref.random_suffix)-sub
+      topic: $(ref.code-events-topic.name)
+      ackDeadlineSeconds: 60
+      messageRetentionDuration: 604800s
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+      deadLetterPolicy:
+        deadLetterTopic: $(ref.code-events-topic.name)
+        maxDeliveryAttempts: 5
+      labels:
+        purpose: "development-events"
+        managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - code-events-topic
+
+  # Service Account for Cloud Function
+  - name: code-review-function-sa
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: code-review-sa-$(ref.random_suffix)
+      displayName: "Code Review Automation Service Account"
+      description: "Service account for AI-powered code review automation"
+      project: $(ref.project_id.name)
+    metadata:
+      dependsOn:
+        - project_id
+
+  # IAM binding for service account - Storage Admin
+  - name: sa-storage-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:projects/setIamPolicy
+    properties:
+      resource: $(ref.project_id.name)
+      policy:
+        bindings:
+          - role: roles/storage.admin
+            members:
+              - serviceAccount:$(ref.code-review-function-sa.email)
+          - role: roles/pubsub.publisher
+            members:
+              - serviceAccount:$(ref.code-review-function-sa.email)
+          - role: roles/logging.logWriter
+            members:
+              - serviceAccount:$(ref.code-review-function-sa.email)
+          - role: roles/aiplatform.user
+            members:
+              - serviceAccount:$(ref.code-review-function-sa.email)
+    metadata:
+      dependsOn:
+        - code-review-function-sa
+
+  # Cloud Function for intelligent code review
+  - name: code-review-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      name: projects/$(ref.project_id.name)/locations/$(ref.region)/functions/code-review-automation-$(ref.random_suffix)
+      description: "AI-powered code review automation with Gemini integration"
+      runtime: nodejs20
+      availableMemoryMb: 512
+      timeout: 300s
+      entryPoint: codeReviewAutomation
+      serviceAccountEmail: $(ref.code-review-function-sa.email)
+      environmentVariables:
+        TOPIC_NAME: code-events-$(ref.random_suffix)
+        PROJECT_ID: $(ref.project_id.name)
+        BUCKET_NAME: $(ref.dev-artifacts-bucket.name)
+      eventTrigger:
+        eventType: google.storage.object.finalize
+        resource: projects/_/buckets/$(ref.dev-artifacts-bucket.name)
+        failurePolicy:
+          retry: {}
+      sourceArchiveUrl: gs://gcf-sources-$(ref.project_id.name)-$(ref.region)/code-review-function.zip
+      labels:
+        purpose: "code-review-automation"
+        managed-by: "infrastructure-manager"
+        ai-powered: "true"
+    metadata:
+      dependsOn:
+        - enable-functions-api
+        - dev-artifacts-bucket
+        - code-review-function-sa
+        - code-events-topic
+
+  # Eventarc trigger for development workflow
+  - name: code-review-trigger
+    type: gcp-types/eventarc-v1:projects.locations.triggers
+    properties:
+      name: projects/$(ref.project_id.name)/locations/$(ref.region)/triggers/code-review-trigger-$(ref.random_suffix)
+      destination:
+        cloudFunction:
+          function: $(ref.code-review-function.name)
+          region: $(ref.region)
+      eventFilters:
+        - attribute: type
+          value: google.cloud.storage.object.v1.finalized
+        - attribute: bucket
+          value: $(ref.dev-artifacts-bucket.name)
+      serviceAccount: $(ref.code-review-function-sa.email)
+      labels:
+        purpose: "workflow-automation"
+        managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - enable-eventarc-api
+        - code-review-function
+        - dev-artifacts-bucket
+
+  # Firebase project configuration
+  - name: firebase-project
+    type: gcp-types/firebase-v1beta1:projects
+    properties:
+      projectId: $(ref.project_id.name)
+      displayName: "AI Development Workflow"
+      resources:
+        hostingSite: dev-workflow-$(ref.random_suffix)
+      labels:
+        purpose: "ai-development"
+        managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - enable-firebase-api
+
+  # Firebase Hosting site
+  - name: firebase-hosting-site
+    type: gcp-types/firebasehosting-v1beta1:projects.sites
+    properties:
+      parent: projects/$(ref.project_id.name)
+      siteId: dev-workflow-$(ref.random_suffix)
+      config:
+        maxVersions: 10
+      labels:
+        purpose: "development-hosting"
+        managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - firebase-project
+
+  # Cloud Run service for development API
+  - name: dev-api-service
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      apiVersion: serving.knative.dev/v1
+      kind: Service
+      metadata:
+        name: dev-api-$(ref.random_suffix)
+        namespace: $(ref.project_id.name)
+        labels:
+          purpose: "development-api"
+          managed-by: "infrastructure-manager"
+        annotations:
+          run.googleapis.com/ingress: all
+          run.googleapis.com/cpu-throttling: "false"
+      spec:
+        template:
+          metadata:
+            annotations:
+              autoscaling.knative.dev/maxScale: "10"
+              autoscaling.knative.dev/minScale: "0"
+              run.googleapis.com/execution-environment: gen2
+              run.googleapis.com/cpu-throttling: "false"
+          spec:
+            serviceAccountName: $(ref.code-review-function-sa.email)
+            containerConcurrency: 80
+            timeoutSeconds: 300
+            containers:
+              - image: gcr.io/cloudrun/hello
+                ports:
+                  - name: http1
+                    containerPort: 8080
+                resources:
+                  limits:
+                    cpu: 1000m
+                    memory: 512Mi
+                env:
+                  - name: PROJECT_ID
+                    value: $(ref.project_id.name)
+                  - name: BUCKET_NAME
+                    value: $(ref.dev-artifacts-bucket.name)
+                  - name: TOPIC_NAME
+                    value: code-events-$(ref.random_suffix)
+    metadata:
+      dependsOn:
+        - enable-run-api
+        - code-review-function-sa
+        - dev-artifacts-bucket
+
+  # IAM policy for Cloud Run service (allow unauthenticated access)
+  - name: run-service-iam-policy
+    type: gcp-types/run-v1:projects.locations.services/setIamPolicy
+    properties:
+      resource: projects/$(ref.project_id.name)/locations/$(ref.region)/services/dev-api-$(ref.random_suffix)
+      policy:
+        bindings:
+          - role: roles/run.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - dev-api-service
+
+  # Cloud Monitoring workspace (conditional)
+  - name: monitoring-workspace
+    type: gcp-types/monitoring-v1:projects
+    properties:
+      name: projects/$(ref.project_id.name)
+      displayName: "Development Workflow Monitoring"
+    metadata:
+      dependsOn:
+        - project_id
+      condition: $(ref.enable_monitoring)
+
+  # Custom monitoring dashboard for development workflow
+  - name: workflow-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      parent: projects/$(ref.project_id.name)
+      dashboard:
+        displayName: "AI Development Workflow Dashboard"
+        mosaicLayout:
+          tiles:
+            - width: 6
+              height: 4
+              widget:
+                title: "Code Generation Rate"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="cloud_function" AND resource.labels.function_name=~"code-review-automation.*"'
+                          aggregation:
+                            alignmentPeriod: 300s
+                            perSeriesAligner: ALIGN_RATE
+                            crossSeriesReducer: REDUCE_SUM
+            - width: 6
+              height: 4
+              widget:
+                title: "Storage Bucket Objects"
+                scorecard:
+                  timeSeriesQuery:
+                    timeSeriesFilter:
+                      filter: 'resource.type="gcs_bucket" AND resource.labels.bucket_name=~"dev-artifacts.*"'
+                      aggregation:
+                        alignmentPeriod: 300s
+                        perSeriesAligner: ALIGN_MEAN
+                        crossSeriesReducer: REDUCE_SUM
+            - width: 12
+              height: 4
+              widget:
+                title: "Function Execution Errors"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="cloud_function" AND resource.labels.function_name=~"code-review-automation.*" AND metric.type="cloudfunctions.googleapis.com/function/execution_count"'
+                          aggregation:
+                            alignmentPeriod: 300s
+                            perSeriesAligner: ALIGN_RATE
+                            crossSeriesReducer: REDUCE_SUM
+                            groupByFields:
+                              - metric.labels.status
+    metadata:
+      dependsOn:
+        - monitoring-workspace
+        - code-review-function
+      condition: $(ref.enable_monitoring)
+
+  # Alert policy for function failures
+  - name: function-failure-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(ref.project_id.name)
+      alertPolicy:
+        displayName: "Development Workflow Function Failures"
+        conditions:
+          - displayName: "Code Review Function Errors"
+            conditionThreshold:
+              filter: 'resource.type="cloud_function" AND resource.labels.function_name=~"code-review-automation.*" AND metric.type="cloudfunctions.googleapis.com/function/execution_count"'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 5.0
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+                  groupByFields:
+                    - metric.labels.status
+        alertStrategy:
+          autoClose: 1800s
+        enabled: true
+        severity: ERROR
+    metadata:
+      dependsOn:
+        - monitoring-workspace
+        - code-review-function
+      condition: $(ref.enable_monitoring)
+
+# Output values for reference and integration
+outputs:
+  - name: project_id
+    description: "Google Cloud Project ID"
+    value: $(ref.project_id.name)
+    
+  - name: region
+    description: "Deployment region"
+    value: $(ref.region)
+    
+  - name: storage_bucket_name
+    description: "Cloud Storage bucket for development artifacts"
+    value: $(ref.dev-artifacts-bucket.name)
+    
+  - name: storage_bucket_url
+    description: "Cloud Storage bucket URL"
+    value: gs://$(ref.dev-artifacts-bucket.name)
+    
+  - name: pubsub_topic_name
+    description: "Pub/Sub topic for development events"
+    value: $(ref.code-events-topic.name)
+    
+  - name: function_name
+    description: "Cloud Function name for code review automation"
+    value: $(ref.code-review-function.name)
+    
+  - name: function_url
+    description: "Cloud Function trigger URL"
+    value: https://$(ref.region)-$(ref.project_id.name).cloudfunctions.net/code-review-automation-$(ref.random_suffix)
+    
+  - name: eventarc_trigger_name
+    description: "Eventarc trigger name"
+    value: $(ref.code-review-trigger.name)
+    
+  - name: firebase_project_id
+    description: "Firebase project identifier"
+    value: $(ref.firebase-project.projectId)
+    
+  - name: firebase_hosting_site
+    description: "Firebase Hosting site identifier"
+    value: $(ref.firebase-hosting-site.name)
+    
+  - name: cloud_run_service_name
+    description: "Cloud Run service name"
+    value: dev-api-$(ref.random_suffix)
+    
+  - name: cloud_run_service_url
+    description: "Cloud Run service URL"
+    value: https://dev-api-$(ref.random_suffix)-$(ref.project_id.name).a.run.app
+    
+  - name: service_account_email
+    description: "Service account email for automation"
+    value: $(ref.code-review-function-sa.email)
+    
+  - name: monitoring_workspace_name
+    description: "Cloud Monitoring workspace name"
+    value: $(ref.monitoring-workspace.name)
+    condition: $(ref.enable_monitoring)
+    
+  - name: dashboard_url
+    description: "Cloud Monitoring dashboard URL"
+    value: https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.workflow-dashboard.name)?project=$(ref.project_id.name)
+    condition: $(ref.enable_monitoring)
+
+# Deployment metadata
+metadata:
+  version: "1.0"
+  author: "Infrastructure Manager Recipe Generator"
+  description: |
+    This Infrastructure Manager configuration deploys a complete AI-powered development 
+    workflow automation system using Firebase Studio, Gemini Code Assist, Cloud Storage, 
+    and Eventarc. The infrastructure includes:
+    
+    - Cloud Storage bucket with versioning and lifecycle policies for development artifacts
+    - Pub/Sub topic and subscription for event-driven workflow automation
+    - Cloud Function with AI-powered code review capabilities
+    - Eventarc trigger for automatic workflow execution
+    - Firebase project with hosting for development applications
+    - Cloud Run service for development API endpoints
+    - Service accounts with appropriate IAM permissions
+    - Cloud Monitoring dashboard and alerting (optional)
+    
+    The system automatically triggers code reviews, generates AI-powered feedback,
+    and manages deployment workflows based on storage events and development activities.
+  
+  tags:
+    - "ai-development"
+    - "automation" 
+    - "firebase"
+    - "gemini"
+    - "eventarc"
+    - "cloud-storage"
+    - "devops"
+    - "serverless"
+    
+  estimated_cost_per_month: "$10-50 USD (depending on usage)"
+  
+  prerequisites:
+    - "Google Cloud Project with billing enabled"
+    - "Infrastructure Manager API enabled"
+    - "Appropriate IAM permissions (Project Owner or equivalent)"
+    - "Firebase CLI for workspace configuration"
+    
+  post_deployment:
+    - "Configure Firebase Studio workspace with custom templates"
+    - "Set up Gemini Code Assist integration and API keys"
+    - "Upload initial code generation templates to Cloud Storage"
+    - "Test workflow automation with sample development artifacts"
+    - "Configure monitoring alerts and notification channels"

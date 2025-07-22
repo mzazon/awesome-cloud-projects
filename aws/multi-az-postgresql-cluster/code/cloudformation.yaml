@@ -1,0 +1,797 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  High-Availability PostgreSQL Clusters with Amazon RDS
+  Creates a production-grade PostgreSQL cluster with Multi-AZ deployment,
+  read replicas, cross-region disaster recovery, comprehensive monitoring,
+  and automated backup strategies.
+
+# ===================================
+# METADATA
+# ===================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Database Configuration"
+        Parameters:
+          - DBInstanceClass
+          - DBName
+          - MasterUsername
+          - MasterUserPassword
+          - AllocatedStorage
+          - StorageType
+          - BackupRetentionPeriod
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - PrivateSubnetIds
+          - DatabaseAccessCidr
+      - Label:
+          default: "High Availability Configuration"
+        Parameters:
+          - MultiAZ
+          - CreateReadReplica
+          - CreateCrossRegionReplica
+          - DisasterRecoveryRegion
+          - ReadReplicaInstanceClass
+      - Label:
+          default: "Monitoring & Alerts"
+        Parameters:
+          - AlertEmail
+          - EnableEnhancedMonitoring
+          - EnablePerformanceInsights
+          - MonitoringInterval
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - StorageEncrypted
+          - KmsKeyId
+          - EnableDeletionProtection
+          - EnableCloudWatchLogs
+      - Label:
+          default: "RDS Proxy Configuration"
+        Parameters:
+          - CreateRDSProxy
+          - ProxyIdleClientTimeout
+          - ProxyMaxConnectionsPercent
+    ParameterLabels:
+      DBInstanceClass:
+        default: "Primary DB Instance Class"
+      DBName:
+        default: "Database Name"
+      MasterUsername:
+        default: "Master Username"
+      MasterUserPassword:
+        default: "Master Password"
+
+# ===================================
+# PARAMETERS
+# ===================================
+Parameters:
+  # Database Configuration
+  DBInstanceClass:
+    Type: String
+    Default: db.r6g.large
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+      - db.t3.large
+      - db.r6g.large
+      - db.r6g.xlarge
+      - db.r6g.2xlarge
+      - db.r6g.4xlarge
+    Description: "The compute and memory capacity of the primary DB instance"
+
+  DBName:
+    Type: String
+    Default: productiondb
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9]*$"
+    Description: "The name of the database to create when the DB instance is created"
+
+  MasterUsername:
+    Type: String
+    Default: dbadmin
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9]*$"
+    Description: "The master username for the DB instance"
+
+  MasterUserPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 128
+    AllowedPattern: "^[a-zA-Z0-9!@#$%^&*()_+=-]*$"
+    ConstraintDescription: "Must contain 8-128 characters and can include alphanumeric and special characters"
+    Description: "The master password for the DB instance (8-128 characters)"
+
+  AllocatedStorage:
+    Type: Number
+    Default: 200
+    MinValue: 20
+    MaxValue: 65536
+    Description: "The allocated storage size in GB (20-65536)"
+
+  StorageType:
+    Type: String
+    Default: gp3
+    AllowedValues:
+      - gp2
+      - gp3
+      - io1
+      - io2
+    Description: "The storage type for the DB instance"
+
+  BackupRetentionPeriod:
+    Type: Number
+    Default: 35
+    MinValue: 7
+    MaxValue: 35
+    Description: "The number of days to retain automated backups (7-35)"
+
+  # Network Configuration
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: "The VPC ID where the DB subnet group will be created"
+
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: "List of private subnet IDs for the DB subnet group (minimum 2 subnets in different AZs)"
+
+  DatabaseAccessCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: "^([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2}$"
+    Description: "CIDR block for database access (e.g., 10.0.0.0/16)"
+
+  # High Availability Configuration
+  MultiAZ:
+    Type: String
+    Default: true
+    AllowedValues:
+      - true
+      - false
+    Description: "Enable Multi-AZ deployment for high availability"
+
+  CreateReadReplica:
+    Type: String
+    Default: true
+    AllowedValues:
+      - true
+      - false
+    Description: "Create a read replica for read scaling"
+
+  CreateCrossRegionReplica:
+    Type: String
+    Default: false
+    AllowedValues:
+      - true
+      - false
+    Description: "Create a cross-region read replica for disaster recovery"
+
+  DisasterRecoveryRegion:
+    Type: String
+    Default: us-west-2
+    AllowedValues:
+      - us-west-2
+      - us-east-2
+      - eu-west-1
+      - eu-central-1
+      - ap-southeast-1
+      - ap-northeast-1
+    Description: "AWS region for disaster recovery replica (only used if CreateCrossRegionReplica is true)"
+
+  ReadReplicaInstanceClass:
+    Type: String
+    Default: db.r6g.large
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+      - db.t3.large
+      - db.r6g.large
+      - db.r6g.xlarge
+      - db.r6g.2xlarge
+    Description: "The compute and memory capacity of the read replica instances"
+
+  # Monitoring & Alerts
+  AlertEmail:
+    Type: String
+    AllowedPattern: "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
+    Description: "Email address for CloudWatch alarms and RDS event notifications"
+
+  EnableEnhancedMonitoring:
+    Type: String
+    Default: true
+    AllowedValues:
+      - true
+      - false
+    Description: "Enable enhanced monitoring for the DB instance"
+
+  EnablePerformanceInsights:
+    Type: String
+    Default: true
+    AllowedValues:
+      - true
+      - false
+    Description: "Enable Performance Insights for the DB instance"
+
+  MonitoringInterval:
+    Type: Number
+    Default: 60
+    AllowedValues:
+      - 0
+      - 1
+      - 5
+      - 10
+      - 15
+      - 30
+      - 60
+    Description: "The interval for collecting enhanced monitoring metrics (seconds)"
+
+  # Security Configuration
+  StorageEncrypted:
+    Type: String
+    Default: true
+    AllowedValues:
+      - true
+      - false
+    Description: "Enable storage encryption for the DB instance"
+
+  KmsKeyId:
+    Type: String
+    Default: ""
+    Description: "The KMS key ID for encryption (leave empty to use default AWS managed key)"
+
+  EnableDeletionProtection:
+    Type: String
+    Default: true
+    AllowedValues:
+      - true
+      - false
+    Description: "Enable deletion protection for the DB instance"
+
+  EnableCloudWatchLogs:
+    Type: String
+    Default: true
+    AllowedValues:
+      - true
+      - false
+    Description: "Enable CloudWatch logs exports for PostgreSQL"
+
+  # RDS Proxy Configuration
+  CreateRDSProxy:
+    Type: String
+    Default: true
+    AllowedValues:
+      - true
+      - false
+    Description: "Create RDS Proxy for connection pooling"
+
+  ProxyIdleClientTimeout:
+    Type: Number
+    Default: 1800
+    MinValue: 1
+    MaxValue: 28800
+    Description: "The number of seconds a connection can be idle before being closed (1-28800)"
+
+  ProxyMaxConnectionsPercent:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 100
+    Description: "The maximum percentage of connections that the proxy can use (1-100)"
+
+# ===================================
+# CONDITIONS
+# ===================================
+Conditions:
+  CreateReadReplicaCondition: !Equals [!Ref CreateReadReplica, 'true']
+  CreateCrossRegionReplicaCondition: !Equals [!Ref CreateCrossRegionReplica, 'true']
+  EnableEnhancedMonitoringCondition: !Equals [!Ref EnableEnhancedMonitoring, 'true']
+  EnablePerformanceInsightsCondition: !Equals [!Ref EnablePerformanceInsights, 'true']
+  UseCustomKmsKey: !Not [!Equals [!Ref KmsKeyId, '']]
+  EnableDeletionProtectionCondition: !Equals [!Ref EnableDeletionProtection, 'true']
+  EnableCloudWatchLogsCondition: !Equals [!Ref EnableCloudWatchLogs, 'true']
+  CreateRDSProxyCondition: !Equals [!Ref CreateRDSProxy, 'true']
+
+# ===================================
+# RESOURCES
+# ===================================
+Resources:
+  # ===================================
+  # NETWORKING & SECURITY
+  # ===================================
+  
+  # DB Subnet Group
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub "${AWS::StackName}-subnet-group"
+      DBSubnetGroupDescription: "Subnet group for PostgreSQL HA cluster"
+      SubnetIds: !Ref PrivateSubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-subnet-group"
+        - Key: Purpose
+          Value: "PostgreSQL HA"
+
+  # Security Group for Database
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${AWS::StackName}-db-sg"
+      GroupDescription: "Security group for PostgreSQL HA cluster"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: !Ref DatabaseAccessCidr
+          Description: "PostgreSQL access from application tier"
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref DatabaseSecurityGroup
+          Description: "PostgreSQL access from same security group"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-db-sg"
+        - Key: Purpose
+          Value: "PostgreSQL HA"
+
+  # ===================================
+  # DATABASE CONFIGURATION
+  # ===================================
+  
+  # Custom Parameter Group
+  PostgreSQLParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      DBParameterGroupName: !Sub "${AWS::StackName}-postgres-params"
+      Description: "Optimized PostgreSQL parameters for HA cluster"
+      Family: postgres15
+      Parameters:
+        log_statement: "all"
+        log_min_duration_statement: "1000"
+        shared_preload_libraries: "pg_stat_statements"
+        track_activity_query_size: "2048"
+        max_connections: "200"
+        # Performance tuning parameters
+        effective_cache_size: "1GB"
+        maintenance_work_mem: "256MB"
+        checkpoint_completion_target: "0.9"
+        wal_buffers: "16MB"
+        default_statistics_target: "100"
+        random_page_cost: "1.1"
+        effective_io_concurrency: "200"
+        # Logging parameters for better monitoring
+        log_checkpoints: "on"
+        log_connections: "on"
+        log_disconnections: "on"
+        log_lock_waits: "on"
+        log_temp_files: "0"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-postgres-params"
+        - Key: Purpose
+          Value: "PostgreSQL HA"
+
+  # ===================================
+  # IAM ROLES FOR MONITORING
+  # ===================================
+  
+  # Enhanced Monitoring Role
+  RDSEnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Condition: EnableEnhancedMonitoringCondition
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-enhanced-monitoring-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole'
+      Path: /
+
+  # RDS Proxy IAM Role
+  RDSProxyRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRDSProxyCondition
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-rds-proxy-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Ref DatabaseCredentialsSecret
+
+  # ===================================
+  # SECRETS MANAGER
+  # ===================================
+  
+  # Database Credentials Secret
+  DatabaseCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: CreateRDSProxyCondition
+    Properties:
+      Name: !Sub "${AWS::StackName}-db-credentials"
+      Description: "PostgreSQL master credentials for RDS Proxy"
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "${MasterUsername}"}'
+        GenerateStringKey: 'password'
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'
+
+  # ===================================
+  # RDS INSTANCES
+  # ===================================
+  
+  # Primary PostgreSQL Instance
+  PrimaryDBInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub "${AWS::StackName}-primary"
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: postgres
+      EngineVersion: '15.4'
+      MasterUsername: !Ref MasterUsername
+      MasterUserPassword: !Ref MasterUserPassword
+      DBName: !Ref DBName
+      AllocatedStorage: !Ref AllocatedStorage
+      StorageType: !Ref StorageType
+      StorageEncrypted: !Ref StorageEncrypted
+      KmsKeyId: !If [UseCustomKmsKey, !Ref KmsKeyId, !Ref 'AWS::NoValue']
+      MultiAZ: !Ref MultiAZ
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      DBParameterGroupName: !Ref PostgreSQLParameterGroup
+      BackupRetentionPeriod: !Ref BackupRetentionPeriod
+      PreferredBackupWindow: "03:00-04:00"
+      PreferredMaintenanceWindow: "sun:04:00-sun:05:00"
+      EnablePerformanceInsights: !Ref EnablePerformanceInsights
+      PerformanceInsightsRetentionPeriod: !If [EnablePerformanceInsightsCondition, 7, !Ref 'AWS::NoValue']
+      MonitoringInterval: !If [EnableEnhancedMonitoringCondition, !Ref MonitoringInterval, 0]
+      MonitoringRoleArn: !If [EnableEnhancedMonitoringCondition, !GetAtt RDSEnhancedMonitoringRole.Arn, !Ref 'AWS::NoValue']
+      EnableCloudwatchLogsExports: !If [EnableCloudWatchLogsCondition, ['postgresql'], !Ref 'AWS::NoValue']
+      DeletionProtection: !Ref EnableDeletionProtection
+      CopyTagsToSnapshot: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-primary"
+        - Key: Purpose
+          Value: "PostgreSQL HA Primary"
+        - Key: Environment
+          Value: "Production"
+
+  # Read Replica
+  ReadReplicaDBInstance:
+    Type: AWS::RDS::DBInstance
+    Condition: CreateReadReplicaCondition
+    DependsOn: PrimaryDBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "${AWS::StackName}-read-replica"
+      DBInstanceClass: !Ref ReadReplicaInstanceClass
+      SourceDBInstanceIdentifier: !Ref PrimaryDBInstance
+      PubliclyAccessible: false
+      EnablePerformanceInsights: !Ref EnablePerformanceInsights
+      PerformanceInsightsRetentionPeriod: !If [EnablePerformanceInsightsCondition, 7, !Ref 'AWS::NoValue']
+      MonitoringInterval: !If [EnableEnhancedMonitoringCondition, !Ref MonitoringInterval, 0]
+      MonitoringRoleArn: !If [EnableEnhancedMonitoringCondition, !GetAtt RDSEnhancedMonitoringRole.Arn, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-read-replica"
+        - Key: Purpose
+          Value: "PostgreSQL HA Read Replica"
+        - Key: Environment
+          Value: "Production"
+
+  # ===================================
+  # RDS PROXY
+  # ===================================
+  
+  # RDS Proxy
+  RDSProxy:
+    Type: AWS::RDS::DBProxy
+    Condition: CreateRDSProxyCondition
+    DependsOn: PrimaryDBInstance
+    Properties:
+      DBProxyName: !Sub "${AWS::StackName}-proxy"
+      EngineFamily: POSTGRESQL
+      Auth:
+        - AuthScheme: SECRETS
+          SecretArn: !Ref DatabaseCredentialsSecret
+          Description: "PostgreSQL authentication via Secrets Manager"
+      RoleArn: !GetAtt RDSProxyRole.Arn
+      VpcSubnetIds: !Ref PrivateSubnetIds
+      VpcSecurityGroupIds:
+        - !Ref DatabaseSecurityGroup
+      RequireTLS: true
+      IdleClientTimeout: !Ref ProxyIdleClientTimeout
+      MaxConnectionsPercent: !Ref ProxyMaxConnectionsPercent
+      MaxIdleConnectionsPercent: 50
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-proxy"
+        - Key: Purpose
+          Value: "PostgreSQL HA Connection Pooling"
+
+  # RDS Proxy Target Group
+  RDSProxyTargetGroup:
+    Type: AWS::RDS::DBProxyTargetGroup
+    Condition: CreateRDSProxyCondition
+    Properties:
+      DBProxyName: !Ref RDSProxy
+      TargetGroupName: default
+      DBInstanceIdentifiers:
+        - !Ref PrimaryDBInstance
+
+  # ===================================
+  # MONITORING & ALERTING
+  # ===================================
+  
+  # SNS Topic for Alerts
+  DatabaseAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-database-alerts"
+      DisplayName: "PostgreSQL HA Database Alerts"
+
+  # SNS Subscription
+  DatabaseAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref DatabaseAlertsTopic
+      Endpoint: !Ref AlertEmail
+
+  # CloudWatch Alarms
+  
+  # CPU Utilization Alarm
+  CPUUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-cpu-high"
+      AlarmDescription: "PostgreSQL CPU utilization is high"
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DatabaseAlertsTopic
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref PrimaryDBInstance
+
+  # Database Connections Alarm
+  DatabaseConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-connections-high"
+      AlarmDescription: "PostgreSQL connection count is high"
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 150
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DatabaseAlertsTopic
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref PrimaryDBInstance
+
+  # Read Replica Lag Alarm
+  ReplicaLagAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateReadReplicaCondition
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-replica-lag-high"
+      AlarmDescription: "PostgreSQL read replica lag is high"
+      MetricName: ReplicaLag
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 30
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DatabaseAlertsTopic
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref ReadReplicaDBInstance
+
+  # Free Storage Space Alarm
+  FreeStorageSpaceAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-free-storage-low"
+      AlarmDescription: "PostgreSQL free storage space is low"
+      MetricName: FreeStorageSpace
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5368709120  # 5 GB in bytes
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DatabaseAlertsTopic
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref PrimaryDBInstance
+
+  # RDS Event Subscription
+  RDSEventSubscription:
+    Type: AWS::RDS::EventSubscription
+    Properties:
+      SnsTopicArn: !Ref DatabaseAlertsTopic
+      SourceType: db-instance
+      SourceIds:
+        - !Ref PrimaryDBInstance
+        - !If [CreateReadReplicaCondition, !Ref ReadReplicaDBInstance, !Ref 'AWS::NoValue']
+      EventCategories:
+        - availability
+        - backup
+        - configuration change
+        - creation
+        - deletion
+        - failover
+        - failure
+        - low storage
+        - maintenance
+        - notification
+        - recovery
+        - restoration
+      Enabled: true
+
+# ===================================
+# OUTPUTS
+# ===================================
+Outputs:
+  # Database Connection Information
+  PrimaryDBInstanceEndpoint:
+    Description: "Primary PostgreSQL database endpoint"
+    Value: !GetAtt PrimaryDBInstance.Endpoint.Address
+    Export:
+      Name: !Sub "${AWS::StackName}-primary-endpoint"
+
+  PrimaryDBInstancePort:
+    Description: "Primary PostgreSQL database port"
+    Value: !GetAtt PrimaryDBInstance.Endpoint.Port
+    Export:
+      Name: !Sub "${AWS::StackName}-primary-port"
+
+  ReadReplicaEndpoint:
+    Description: "Read replica PostgreSQL database endpoint"
+    Value: !If [CreateReadReplicaCondition, !GetAtt ReadReplicaDBInstance.Endpoint.Address, "Not Created"]
+    Condition: CreateReadReplicaCondition
+    Export:
+      Name: !Sub "${AWS::StackName}-replica-endpoint"
+
+  RDSProxyEndpoint:
+    Description: "RDS Proxy endpoint for connection pooling"
+    Value: !If [CreateRDSProxyCondition, !GetAtt RDSProxy.Endpoint, "Not Created"]
+    Condition: CreateRDSProxyCondition
+    Export:
+      Name: !Sub "${AWS::StackName}-proxy-endpoint"
+
+  # Database Configuration
+  DatabaseName:
+    Description: "Name of the PostgreSQL database"
+    Value: !Ref DBName
+    Export:
+      Name: !Sub "${AWS::StackName}-database-name"
+
+  MasterUsername:
+    Description: "Master username for the PostgreSQL database"
+    Value: !Ref MasterUsername
+    Export:
+      Name: !Sub "${AWS::StackName}-master-username"
+
+  # Security Information
+  DatabaseSecurityGroupId:
+    Description: "Security Group ID for the PostgreSQL database"
+    Value: !Ref DatabaseSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-security-group-id"
+
+  DBSubnetGroupName:
+    Description: "DB Subnet Group name"
+    Value: !Ref DBSubnetGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-subnet-group-name"
+
+  # Monitoring Information
+  SNSTopicArn:
+    Description: "SNS Topic ARN for database alerts"
+    Value: !Ref DatabaseAlertsTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-sns-topic-arn"
+
+  # High Availability Status
+  MultiAZStatus:
+    Description: "Multi-AZ deployment status"
+    Value: !Ref MultiAZ
+    Export:
+      Name: !Sub "${AWS::StackName}-multi-az-status"
+
+  ReadReplicaStatus:
+    Description: "Read replica creation status"
+    Value: !Ref CreateReadReplica
+    Export:
+      Name: !Sub "${AWS::StackName}-read-replica-status"
+
+  # Connection Examples
+  PostgreSQLConnectionString:
+    Description: "Example PostgreSQL connection string"
+    Value: !Sub "postgresql://${MasterUsername}:${MasterUserPassword}@${PrimaryDBInstance.Endpoint.Address}:${PrimaryDBInstance.Endpoint.Port}/${DBName}"
+
+  ProxyConnectionString:
+    Description: "Example PostgreSQL connection string via RDS Proxy"
+    Value: !If 
+      - CreateRDSProxyCondition
+      - !Sub "postgresql://${MasterUsername}:${MasterUserPassword}@${RDSProxy.Endpoint}:${PrimaryDBInstance.Endpoint.Port}/${DBName}"
+      - "RDS Proxy not created"
+    Condition: CreateRDSProxyCondition
+
+  # Disaster Recovery Information
+  CrossRegionReplicaRegion:
+    Description: "Region configured for cross-region disaster recovery"
+    Value: !Ref DisasterRecoveryRegion
+    Condition: CreateCrossRegionReplicaCondition
+
+  # Cost Optimization Notes
+  EstimatedMonthlyCost:
+    Description: "Estimated monthly cost range (USD)"
+    Value: "$200-500 depending on instance types and storage usage"
+
+  # Backup Information
+  BackupRetentionDays:
+    Description: "Automated backup retention period in days"
+    Value: !Ref BackupRetentionPeriod
+    Export:
+      Name: !Sub "${AWS::StackName}-backup-retention"
+
+  # Security Features
+  EncryptionStatus:
+    Description: "Database encryption status"
+    Value: !Ref StorageEncrypted
+    Export:
+      Name: !Sub "${AWS::StackName}-encryption-status"
+
+  DeletionProtectionStatus:
+    Description: "Deletion protection status"
+    Value: !Ref EnableDeletionProtection
+    Export:
+      Name: !Sub "${AWS::StackName}-deletion-protection"

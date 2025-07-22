@@ -1,0 +1,612 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Automated Data Ingestion Pipelines with OpenSearch Ingestion and EventBridge Scheduler.
+  This template creates a complete solution for automated data processing including S3 storage,
+  OpenSearch Service domain, OpenSearch Ingestion pipeline, and EventBridge Scheduler for automation.
+
+# CloudFormation Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - EnvironmentName
+          - ProjectName
+      - Label:
+          default: "OpenSearch Configuration"
+        Parameters:
+          - OpenSearchInstanceType
+          - OpenSearchVolumeSize
+          - OpenSearchVolumeType
+      - Label:
+          default: "Ingestion Pipeline Configuration"
+        Parameters:
+          - PipelineMinUnits
+          - PipelineMaxUnits
+      - Label:
+          default: "Scheduling Configuration"
+        Parameters:
+          - PipelineStartTime
+          - PipelineStopTime
+          - ScheduleTimeZone
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - TrustedAccountId
+          - EnableEncryption
+    ParameterLabels:
+      EnvironmentName:
+        default: "Environment Name"
+      ProjectName:
+        default: "Project Name"
+      OpenSearchInstanceType:
+        default: "OpenSearch Instance Type"
+      OpenSearchVolumeSize:
+        default: "OpenSearch Volume Size (GB)"
+      OpenSearchVolumeType:
+        default: "OpenSearch Volume Type"
+      PipelineMinUnits:
+        default: "Pipeline Minimum Units"
+      PipelineMaxUnits:
+        default: "Pipeline Maximum Units"
+      PipelineStartTime:
+        default: "Pipeline Start Time (UTC)"
+      PipelineStopTime:
+        default: "Pipeline Stop Time (UTC)"
+      ScheduleTimeZone:
+        default: "Schedule Time Zone"
+      TrustedAccountId:
+        default: "Trusted AWS Account ID"
+      EnableEncryption:
+        default: "Enable Encryption"
+
+# Input Parameters
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: Development
+    Description: Name of the environment (e.g., Development, Staging, Production)
+    AllowedValues:
+      - Development
+      - Staging
+      - Production
+
+  ProjectName:
+    Type: String
+    Default: DataIngestion
+    Description: Name of the project for resource naming and tagging
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9]*$
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters
+
+  OpenSearchInstanceType:
+    Type: String
+    Default: t3.small.search
+    Description: Instance type for OpenSearch Service domain
+    AllowedValues:
+      - t3.small.search
+      - t3.medium.search
+      - m6g.large.search
+      - m6g.xlarge.search
+      - r6g.large.search
+      - r6g.xlarge.search
+
+  OpenSearchVolumeSize:
+    Type: Number
+    Default: 20
+    MinValue: 10
+    MaxValue: 100
+    Description: EBS volume size in GB for OpenSearch domain
+
+  OpenSearchVolumeType:
+    Type: String
+    Default: gp3
+    Description: EBS volume type for OpenSearch domain
+    AllowedValues:
+      - gp2
+      - gp3
+      - io1
+
+  PipelineMinUnits:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 8
+    Description: Minimum units for OpenSearch Ingestion pipeline
+
+  PipelineMaxUnits:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    MaxValue: 24
+    Description: Maximum units for OpenSearch Ingestion pipeline
+
+  PipelineStartTime:
+    Type: String
+    Default: "0 8 * * ? *"
+    Description: Cron expression for pipeline start time (default 8 AM UTC daily)
+    AllowedPattern: ^[0-9*/,-]+ [0-9*/,-]+ [0-9*/,-]+ [0-9*/,-]+ [?*] [0-9*/,-]+$
+
+  PipelineStopTime:
+    Type: String
+    Default: "0 18 * * ? *"
+    Description: Cron expression for pipeline stop time (default 6 PM UTC daily)
+    AllowedPattern: ^[0-9*/,-]+ [0-9*/,-]+ [0-9*/,-]+ [0-9*/,-]+ [?*] [0-9*/,-]+$
+
+  ScheduleTimeZone:
+    Type: String
+    Default: UTC
+    Description: Time zone for EventBridge Scheduler
+    AllowedValues:
+      - UTC
+      - US/Eastern
+      - US/Central
+      - US/Mountain
+      - US/Pacific
+      - Europe/London
+      - Europe/Paris
+      - Asia/Tokyo
+
+  TrustedAccountId:
+    Type: String
+    Description: AWS Account ID that will have access to OpenSearch domain (leave empty to use current account)
+    Default: ""
+    AllowedPattern: ^$|^[0-9]{12}$
+    ConstraintDescription: Must be a valid 12-digit AWS Account ID or empty
+
+  EnableEncryption:
+    Type: String
+    Default: "true"
+    Description: Enable encryption at rest and in transit
+    AllowedValues:
+      - "true"
+      - "false"
+
+# Conditional Logic
+Conditions:
+  UseCurrentAccount: !Equals [!Ref TrustedAccountId, ""]
+  EnableEncryptionAtRest: !Equals [!Ref EnableEncryption, "true"]
+  IsProduction: !Equals [!Ref EnvironmentName, "Production"]
+
+# AWS Resources
+Resources:
+  # S3 Bucket for Data Storage
+  DataIngestionBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-data-ingestion-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: IntelligentTieringRule
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref DataIngestionLogGroup
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: DataStorage
+
+  # CloudWatch Log Group for monitoring
+  DataIngestionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/s3/${ProjectName}-data-ingestion"
+      RetentionInDays: !If [IsProduction, 365, 30]
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for OpenSearch Ingestion Pipeline
+  OpenSearchIngestionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-OpenSearchIngestionRole-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: osis-pipelines.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DataIngestionBucket.Arn
+                  - !Sub "${DataIngestionBucket.Arn}/*"
+        - PolicyName: OpenSearchAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - es:ESHttpPost
+                  - es:ESHttpPut
+                  - es:ESHttpGet
+                Resource: !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${OpenSearchDomain}/*"
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: IngestionPipeline
+
+  # OpenSearch Service Domain
+  OpenSearchDomain:
+    Type: AWS::OpenSearch::Domain
+    Properties:
+      DomainName: !Sub "${ProjectName}-analytics-domain"
+      EngineVersion: "OpenSearch_2.3"
+      ClusterConfig:
+        InstanceType: !Ref OpenSearchInstanceType
+        InstanceCount: 1
+        DedicatedMasterEnabled: false
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: !Ref OpenSearchVolumeType
+        VolumeSize: !Ref OpenSearchVolumeSize
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !If
+                - UseCurrentAccount
+                - !Sub "arn:aws:iam::${AWS::AccountId}:root"
+                - !Sub "arn:aws:iam::${TrustedAccountId}:root"
+            Action: "es:*"
+            Resource: !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ProjectName}-analytics-domain/*"
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt OpenSearchIngestionRole.Arn
+            Action:
+              - "es:ESHttpPost"
+              - "es:ESHttpPut"
+              - "es:ESHttpGet"
+            Resource: !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ProjectName}-analytics-domain/*"
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+        TLSSecurityPolicy: "Policy-Min-TLS-1-2-2019-07"
+      EncryptionAtRestOptions:
+        Enabled: !Ref EnableEncryption
+      NodeToNodeEncryptionOptions:
+        Enabled: !Ref EnableEncryption
+      LogPublishingOptions:
+        SEARCH_SLOW_LOGS:
+          CloudWatchLogsLogGroupArn: !GetAtt OpenSearchLogGroup.Arn
+          Enabled: true
+        INDEX_SLOW_LOGS:
+          CloudWatchLogsLogGroupArn: !GetAtt OpenSearchLogGroup.Arn
+          Enabled: true
+        ES_APPLICATION_LOGS:
+          CloudWatchLogsLogGroupArn: !GetAtt OpenSearchLogGroup.Arn
+          Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: SearchEngine
+
+  # CloudWatch Log Group for OpenSearch
+  OpenSearchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/opensearch/${ProjectName}-analytics-domain"
+      RetentionInDays: !If [IsProduction, 365, 30]
+
+  # OpenSearch Ingestion Pipeline
+  OpenSearchIngestionPipeline:
+    Type: AWS::OSIS::Pipeline
+    DependsOn: 
+      - OpenSearchDomain
+      - OpenSearchIngestionRole
+    Properties:
+      PipelineName: !Sub "${ProjectName}-data-pipeline"
+      MinUnits: !Ref PipelineMinUnits
+      MaxUnits: !Ref PipelineMaxUnits
+      PipelineConfigurationBody: !Sub |
+        data-ingestion-pipeline:
+          source:
+            s3:
+              notification_type: "sqs"
+              codec:
+                newline: null
+              compression: "none"
+              bucket: "${DataIngestionBucket}"
+              object_key:
+                include_keys:
+                  - "logs/**"
+                  - "metrics/**"
+                  - "events/**"
+          processor:
+            - date:
+                from_time_received: true
+                destination: "@timestamp"
+            - mutate:
+                rename_keys:
+                  message: "raw_message"
+            - grok:
+                match:
+                  raw_message: ['%{TIMESTAMP_ISO8601:timestamp} %{LOGLEVEL:level} %{GREEDYDATA:message}']
+                break_on_match: false
+                keep_empty_captures: false
+                named_captures_only: true
+                patterns_directories:
+                  - "/usr/share/logstash/vendor/grok/patterns"
+          sink:
+            - opensearch:
+                hosts: ["https://${OpenSearchDomain.DomainEndpoint}"]
+                index: "application-logs-%{yyyy.MM.dd}"
+                aws:
+                  region: "${AWS::Region}"
+                  sts_role_arn: "${OpenSearchIngestionRole.Arn}"
+                  serverless: false
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: IngestionPipeline
+
+  # IAM Role for EventBridge Scheduler
+  EventBridgeSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-EventBridgeSchedulerRole-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PipelineControlPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - osis:StartPipeline
+                  - osis:StopPipeline
+                  - osis:GetPipeline
+                Resource: !GetAtt OpenSearchIngestionPipeline.PipelineArn
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: Scheduler
+
+  # EventBridge Scheduler Schedule Group
+  IngestionScheduleGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: !Sub "${ProjectName}-ingestion-schedules"
+      Tags:
+        Environment: !Ref EnvironmentName
+        Project: !Ref ProjectName
+        Component: ScheduleGroup
+
+  # EventBridge Schedule to Start Pipeline
+  StartPipelineSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${ProjectName}-start-ingestion-pipeline"
+      GroupName: !Ref IngestionScheduleGroup
+      Description: "Daily start of data ingestion pipeline"
+      ScheduleExpression: !Sub "cron(${PipelineStartTime})"
+      ScheduleExpressionTimezone: !Ref ScheduleTimeZone
+      FlexibleTimeWindow:
+        Mode: "FLEXIBLE"
+        MaximumWindowInMinutes: 15
+      Target:
+        Arn: !GetAtt OpenSearchIngestionPipeline.PipelineArn
+        RoleArn: !GetAtt EventBridgeSchedulerRole.Arn
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAge: 3600
+        Input: '{"action": "start"}'
+
+  # EventBridge Schedule to Stop Pipeline
+  StopPipelineSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${ProjectName}-stop-ingestion-pipeline"
+      GroupName: !Ref IngestionScheduleGroup
+      Description: "Daily stop of data ingestion pipeline"
+      ScheduleExpression: !Sub "cron(${PipelineStopTime})"
+      ScheduleExpressionTimezone: !Ref ScheduleTimeZone
+      FlexibleTimeWindow:
+        Mode: "FLEXIBLE"
+        MaximumWindowInMinutes: 15
+      Target:
+        Arn: !GetAtt OpenSearchIngestionPipeline.PipelineArn
+        RoleArn: !GetAtt EventBridgeSchedulerRole.Arn
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAge: 3600
+        Input: '{"action": "stop"}'
+
+  # CloudWatch Alarm for Pipeline Monitoring
+  PipelineFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-pipeline-failure-alarm"
+      AlarmDescription: "Alarm for OpenSearch Ingestion Pipeline failures"
+      MetricName: "PipelineErrors"
+      Namespace: "AWS/OSIS"
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: PipelineName
+          Value: !Ref OpenSearchIngestionPipeline
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref PipelineAlarmTopic
+
+  # SNS Topic for Alarm Notifications
+  PipelineAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-pipeline-alarms"
+      DisplayName: "Data Ingestion Pipeline Alarms"
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+# Stack Outputs
+Outputs:
+  S3BucketName:
+    Description: "Name of the S3 bucket for data storage"
+    Value: !Ref DataIngestionBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-S3Bucket"
+
+  S3BucketArn:
+    Description: "ARN of the S3 bucket for data storage"
+    Value: !GetAtt DataIngestionBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-S3BucketArn"
+
+  OpenSearchDomainEndpoint:
+    Description: "OpenSearch domain endpoint"
+    Value: !GetAtt OpenSearchDomain.DomainEndpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-OpenSearchEndpoint"
+
+  OpenSearchDomainArn:
+    Description: "OpenSearch domain ARN"
+    Value: !GetAtt OpenSearchDomain.DomainArn
+    Export:
+      Name: !Sub "${AWS::StackName}-OpenSearchDomainArn"
+
+  OpenSearchDashboardsURL:
+    Description: "URL for OpenSearch Dashboards"
+    Value: !Sub "https://${OpenSearchDomain.DomainEndpoint}/_dashboards/"
+    Export:
+      Name: !Sub "${AWS::StackName}-DashboardsURL"
+
+  IngestionPipelineName:
+    Description: "Name of the OpenSearch Ingestion Pipeline"
+    Value: !Ref OpenSearchIngestionPipeline
+    Export:
+      Name: !Sub "${AWS::StackName}-PipelineName"
+
+  IngestionPipelineArn:
+    Description: "ARN of the OpenSearch Ingestion Pipeline"
+    Value: !GetAtt OpenSearchIngestionPipeline.PipelineArn
+    Export:
+      Name: !Sub "${AWS::StackName}-PipelineArn"
+
+  ScheduleGroupName:
+    Description: "Name of the EventBridge Scheduler Schedule Group"
+    Value: !Ref IngestionScheduleGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-ScheduleGroup"
+
+  StartScheduleName:
+    Description: "Name of the pipeline start schedule"
+    Value: !Ref StartPipelineSchedule
+    Export:
+      Name: !Sub "${AWS::StackName}-StartSchedule"
+
+  StopScheduleName:
+    Description: "Name of the pipeline stop schedule"
+    Value: !Ref StopPipelineSchedule
+    Export:
+      Name: !Sub "${AWS::StackName}-StopSchedule"
+
+  CloudWatchLogGroupName:
+    Description: "CloudWatch Log Group for monitoring"
+    Value: !Ref DataIngestionLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-LogGroup"
+
+  SNSTopicArn:
+    Description: "SNS Topic ARN for pipeline alarms"
+    Value: !Ref PipelineAlarmTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-AlarmTopic"
+
+  SampleDataUploadCommand:
+    Description: "AWS CLI command to upload sample data for testing"
+    Value: !Sub "aws s3 cp sample-data.log s3://${DataIngestionBucket}/logs/$(date +%Y/%m/%d)/"
+
+  OpenSearchIngestionRoleArn:
+    Description: "ARN of the IAM role for OpenSearch Ingestion"
+    Value: !GetAtt OpenSearchIngestionRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-IngestionRoleArn"
+
+  EventBridgeSchedulerRoleArn:
+    Description: "ARN of the IAM role for EventBridge Scheduler"
+    Value: !GetAtt EventBridgeSchedulerRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-SchedulerRoleArn"
+
+  EstimatedMonthlyCost:
+    Description: "Estimated monthly cost for this infrastructure (USD)"
+    Value: !Sub
+      - "OpenSearch: $${OpenSearchCost}, Ingestion: $${IngestionCost}, S3: $${S3Cost}, Total: ~$${TotalCost}"
+      - OpenSearchCost: !If [IsProduction, "150", "50"]
+        IngestionCost: !If [IsProduction, "100", "30"]
+        S3Cost: "5-20"
+        TotalCost: !If [IsProduction, "255-270", "85-100"]

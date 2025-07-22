@@ -1,0 +1,555 @@
+# Infrastructure Manager Configuration for AI-Powered Cost Analytics
+# This configuration deploys BigQuery Analytics Hub, Vertex AI, and Cloud Monitoring
+# for intelligent cost analytics and prediction capabilities
+
+# Import required modules
+imports:
+  - path: modules/bigquery.yaml
+    name: bigquery
+  - path: modules/vertex-ai.yaml
+    name: vertex_ai
+  - path: modules/analytics-hub.yaml
+    name: analytics_hub
+  - path: modules/monitoring.yaml
+    name: monitoring
+  - path: modules/storage.yaml
+    name: storage
+
+# Configuration parameters
+config:
+  # Project and location settings
+  project_id: ${PROJECT_ID}
+  region: us-central1
+  zone: us-central1-a
+  
+  # Resource naming configuration
+  resource_prefix: cost-analytics
+  random_suffix: ${RANDOM(6)}
+  
+  # BigQuery configuration
+  dataset_id: cost_analytics
+  dataset_location: ${region}
+  
+  # Analytics Hub configuration
+  exchange_id: cost_data_exchange
+  listing_id: billing_feed
+  
+  # Vertex AI configuration
+  model_name: cost-prediction-model
+  endpoint_name: cost-prediction-endpoint
+  machine_type: n1-standard-2
+  min_replicas: 1
+  max_replicas: 3
+  
+  # Storage configuration
+  bucket_name: ${resource_prefix}-data-${random_suffix}
+  storage_class: STANDARD
+  
+  # Monitoring configuration
+  alert_policy_name: high-cost-anomaly-alert
+  notification_channels: []
+
+# Main infrastructure deployment
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      parent: projects/${PROJECT_ID}
+      serviceName: bigquery.googleapis.com
+    metadata:
+      dependsOn: []
+      
+  - name: enable-aiplatform-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      parent: projects/${PROJECT_ID}
+      serviceName: aiplatform.googleapis.com
+    metadata:
+      dependsOn: [enable-apis]
+      
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      parent: projects/${PROJECT_ID}
+      serviceName: storage.googleapis.com
+    metadata:
+      dependsOn: [enable-aiplatform-api]
+      
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      parent: projects/${PROJECT_ID}
+      serviceName: monitoring.googleapis.com
+    metadata:
+      dependsOn: [enable-storage-api]
+      
+  - name: enable-datacatalog-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      parent: projects/${PROJECT_ID}
+      serviceName: datacatalog.googleapis.com
+    metadata:
+      dependsOn: [enable-monitoring-api]
+
+  # Cloud Storage bucket for model artifacts
+  - name: model-artifacts-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${bucket_name}
+      project: ${PROJECT_ID}
+      location: ${region}
+      storageClass: ${storage_class}
+      versioning:
+        enabled: true
+      encryption:
+        defaultKmsKeyName: ""
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      lifecycle:
+        rule:
+          - condition:
+              age: 30
+            action:
+              type: Delete
+    metadata:
+      dependsOn: [enable-storage-api]
+
+  # BigQuery dataset for cost analytics
+  - name: cost-analytics-dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      datasetId: ${dataset_id}
+      projectId: ${PROJECT_ID}
+      location: ${dataset_location}
+      description: "Cost analytics and ML models dataset"
+      access:
+        - role: OWNER
+          userByEmail: ""
+        - role: READER
+          specialGroup: projectReaders
+        - role: WRITER
+          specialGroup: projectWriters
+      defaultTableExpirationMs: null
+      defaultPartitionExpirationMs: null
+    metadata:
+      dependsOn: [enable-apis]
+
+  # BigQuery table for billing data with partitioning
+  - name: billing-data-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: ${PROJECT_ID}
+      datasetId: ${dataset_id}
+      tableId: billing_data
+      description: "Daily cost and usage data with time partitioning"
+      timePartitioning:
+        type: DAY
+        field: usage_start_time
+        requirePartitionFilter: false
+      schema:
+        fields:
+          - name: usage_start_time
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "Timestamp when resource usage started"
+          - name: service_description
+            type: STRING
+            mode: REQUIRED
+            description: "Name of the Google Cloud service"
+          - name: sku_description
+            type: STRING
+            mode: REQUIRED
+            description: "Description of the SKU used"
+          - name: project_id
+            type: STRING
+            mode: REQUIRED
+            description: "Project ID where usage occurred"
+          - name: cost
+            type: FLOAT64
+            mode: REQUIRED
+            description: "Cost amount in specified currency"
+          - name: currency
+            type: STRING
+            mode: REQUIRED
+            description: "Currency code (e.g., USD)"
+          - name: usage_amount
+            type: FLOAT64
+            mode: NULLABLE
+            description: "Amount of usage"
+          - name: usage_unit
+            type: STRING
+            mode: NULLABLE
+            description: "Unit of measurement for usage"
+          - name: location
+            type: STRING
+            mode: NULLABLE
+            description: "Geographic location of resource usage"
+          - name: labels
+            type: JSON
+            mode: NULLABLE
+            description: "Resource labels in JSON format"
+    metadata:
+      dependsOn: [cost-analytics-dataset]
+
+  # Analytics Hub data exchange
+  - name: cost-data-exchange
+    type: gcp-types/analyticshub-v1:projects.locations.dataExchanges
+    properties:
+      parent: projects/${PROJECT_ID}/locations/${region}
+      dataExchangeId: ${exchange_id}
+      displayName: "Cost Analytics Exchange"
+      description: "Shared cost data and optimization insights"
+      primaryContact: ""
+      documentation: "Exchange for sharing cost analytics datasets across teams"
+    metadata:
+      dependsOn: [enable-datacatalog-api]
+
+  # Analytics Hub listing for billing dataset
+  - name: billing-data-listing
+    type: gcp-types/analyticshub-v1:projects.locations.dataExchanges.listings
+    properties:
+      parent: projects/${PROJECT_ID}/locations/${region}/dataExchanges/${exchange_id}
+      listingId: ${listing_id}
+      displayName: "Billing Data Feed"
+      description: "Real-time billing and usage data"
+      primaryContact: ""
+      bigqueryDataset:
+        dataset: projects/${PROJECT_ID}/datasets/${dataset_id}
+      categories:
+        - CATEGORY_ANALYTICS
+      dataProvider:
+        name: "Cost Analytics Team"
+        primaryContact: ""
+    metadata:
+      dependsOn: [cost-data-exchange, billing-data-table]
+
+  # BigQuery views for analytics
+  - name: daily-cost-summary-view
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: ${PROJECT_ID}
+      datasetId: ${dataset_id}
+      tableId: daily_cost_summary
+      description: "Daily cost aggregations by service and project"
+      view:
+        query: |
+          SELECT
+            DATE(usage_start_time) as usage_date,
+            service_description,
+            project_id,
+            location,
+            SUM(cost) as total_cost,
+            SUM(usage_amount) as total_usage,
+            COUNT(*) as transaction_count,
+            AVG(cost) as avg_cost_per_transaction
+          FROM `${PROJECT_ID}.${dataset_id}.billing_data`
+          GROUP BY usage_date, service_description, project_id, location
+          ORDER BY usage_date DESC, total_cost DESC
+        useLegacySql: false
+    metadata:
+      dependsOn: [billing-data-table]
+
+  - name: cost-trends-view
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: ${PROJECT_ID}
+      datasetId: ${dataset_id}
+      tableId: cost_trends
+      description: "7-day rolling cost trends with growth rates"
+      view:
+        query: |
+          WITH daily_costs AS (
+            SELECT
+              DATE(usage_start_time) as usage_date,
+              service_description,
+              SUM(cost) as daily_cost
+            FROM `${PROJECT_ID}.${dataset_id}.billing_data`
+            GROUP BY usage_date, service_description
+          )
+          SELECT
+            usage_date,
+            service_description,
+            daily_cost,
+            AVG(daily_cost) OVER (
+              PARTITION BY service_description 
+              ORDER BY usage_date 
+              ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+            ) as seven_day_avg,
+            LAG(daily_cost, 7) OVER (
+              PARTITION BY service_description 
+              ORDER BY usage_date
+            ) as cost_7_days_ago,
+            SAFE_DIVIDE(
+              daily_cost - LAG(daily_cost, 7) OVER (
+                PARTITION BY service_description 
+                ORDER BY usage_date
+              ),
+              LAG(daily_cost, 7) OVER (
+                PARTITION BY service_description 
+                ORDER BY usage_date
+              )
+            ) * 100 as growth_rate_pct
+          FROM daily_costs
+          ORDER BY usage_date DESC, daily_cost DESC
+        useLegacySql: false
+    metadata:
+      dependsOn: [billing-data-table]
+
+  # BigQuery ML model for cost prediction
+  - name: cost-prediction-bqml-model
+    type: gcp-types/bigquery-v2:models
+    properties:
+      projectId: ${PROJECT_ID}
+      datasetId: ${dataset_id}
+      modelId: cost_prediction_bqml
+      description: "Linear regression model for cost prediction"
+      trainingRuns:
+        - trainingOptions:
+            modelType: LINEAR_REG
+            inputLabelCols: [cost]
+            maxIterations: 50
+            learnRate: 0.1
+            l1Regularization: 0.0
+            l2Regularization: 0.0
+    metadata:
+      dependsOn: [cost-trends-view]
+
+  # BigQuery ML model for anomaly detection
+  - name: cost-anomaly-detection-model
+    type: gcp-types/bigquery-v2:models
+    properties:
+      projectId: ${PROJECT_ID}
+      datasetId: ${dataset_id}
+      modelId: cost_anomaly_detection
+      description: "K-means clustering model for cost anomaly detection"
+      trainingRuns:
+        - trainingOptions:
+            modelType: KMEANS
+            numClusters: 3
+            standardizeFeatures: true
+            kmeansInitMethod: KMEANS_PLUS_PLUS
+    metadata:
+      dependsOn: [cost-trends-view]
+
+  # Cost anomalies view using ML model
+  - name: cost-anomalies-view
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: ${PROJECT_ID}
+      datasetId: ${dataset_id}
+      tableId: cost_anomalies
+      description: "Cost anomalies with severity scores"
+      view:
+        query: |
+          WITH anomaly_scores AS (
+            SELECT
+              usage_date,
+              service_description,
+              daily_cost,
+              seven_day_avg,
+              growth_rate_pct,
+              ML.DISTANCE_TO_CENTROID(
+                MODEL `${PROJECT_ID}.${dataset_id}.cost_anomaly_detection`,
+                (SELECT AS STRUCT daily_cost, seven_day_avg, growth_rate_pct, service_description)
+              ) as anomaly_score
+            FROM `${PROJECT_ID}.${dataset_id}.cost_trends`
+            WHERE growth_rate_pct IS NOT NULL
+          )
+          SELECT
+            *,
+            CASE
+              WHEN anomaly_score > 2.0 THEN 'HIGH'
+              WHEN anomaly_score > 1.0 THEN 'MEDIUM'
+              ELSE 'LOW'
+            END as severity
+          FROM anomaly_scores
+          WHERE anomaly_score > 0.5
+          ORDER BY anomaly_score DESC, usage_date DESC
+        useLegacySql: false
+    metadata:
+      dependsOn: [cost-anomaly-detection-model]
+
+  # Monitoring metrics view for Cloud Monitoring integration
+  - name: monitoring-metrics-view
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: ${PROJECT_ID}
+      datasetId: ${dataset_id}
+      tableId: monitoring_metrics
+      description: "Real-time metrics for Cloud Monitoring integration"
+      view:
+        query: |
+          SELECT
+            CURRENT_TIMESTAMP() as timestamp,
+            service_description,
+            daily_cost,
+            growth_rate_pct,
+            CASE
+              WHEN growth_rate_pct > 50 THEN 1
+              ELSE 0
+            END as high_growth_alert
+          FROM `${PROJECT_ID}.${dataset_id}.cost_trends`
+          WHERE usage_date = CURRENT_DATE() - 1
+        useLegacySql: false
+    metadata:
+      dependsOn: [cost-trends-view]
+
+  # Cloud Monitoring alert policy for high cost anomalies
+  - name: high-cost-anomaly-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/${PROJECT_ID}
+      displayName: ${alert_policy_name}
+      documentation:
+        content: "Alert when cost anomalies exceed threshold indicating unusual spending patterns"
+        mimeType: "text/markdown"
+      conditions:
+        - displayName: "High Anomaly Score Detection"
+          conditionThreshold:
+            filter: 'resource.type="bigquery_dataset" AND resource.labels.dataset_id="${dataset_id}"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 2.0
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_MEAN
+                groupByFields:
+                  - resource.labels.dataset_id
+      alertStrategy:
+        autoClose: 1800s
+      enabled: true
+      notificationChannels: ${notification_channels}
+    metadata:
+      dependsOn: [enable-monitoring-api, cost-anomalies-view]
+
+  # IAM service account for Vertex AI operations
+  - name: vertex-ai-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: vertex-ai-cost-analytics
+      displayName: "Vertex AI Cost Analytics Service Account"
+      description: "Service account for Vertex AI model training and prediction"
+      projectId: ${PROJECT_ID}
+    metadata:
+      dependsOn: [enable-aiplatform-api]
+
+  # IAM bindings for service account
+  - name: vertex-ai-sa-bigquery-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${PROJECT_ID}
+      role: roles/bigquery.dataEditor
+      member: serviceAccount:vertex-ai-cost-analytics@${PROJECT_ID}.iam.gserviceaccount.com
+    metadata:
+      dependsOn: [vertex-ai-service-account]
+
+  - name: vertex-ai-sa-storage-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${PROJECT_ID}
+      role: roles/storage.objectAdmin
+      member: serviceAccount:vertex-ai-cost-analytics@${PROJECT_ID}.iam.gserviceaccount.com
+    metadata:
+      dependsOn: [vertex-ai-service-account]
+
+  - name: vertex-ai-sa-aiplatform-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${PROJECT_ID}
+      role: roles/aiplatform.user
+      member: serviceAccount:vertex-ai-cost-analytics@${PROJECT_ID}.iam.gserviceaccount.com
+    metadata:
+      dependsOn: [vertex-ai-service-account]
+
+# Output values for verification and integration
+outputs:
+  - name: project-id
+    value: ${PROJECT_ID}
+    description: "Google Cloud Project ID"
+    
+  - name: dataset-id
+    value: ${dataset_id}
+    description: "BigQuery dataset ID for cost analytics"
+    
+  - name: dataset-location
+    value: ${dataset_location}
+    description: "BigQuery dataset location"
+    
+  - name: exchange-id
+    value: ${exchange_id}
+    description: "Analytics Hub data exchange ID"
+    
+  - name: listing-id
+    value: ${listing_id}
+    description: "Analytics Hub listing ID for billing data"
+    
+  - name: bucket-name
+    value: ${bucket_name}
+    description: "Cloud Storage bucket for model artifacts"
+    
+  - name: service-account-email
+    value: vertex-ai-cost-analytics@${PROJECT_ID}.iam.gserviceaccount.com
+    description: "Vertex AI service account email"
+    
+  - name: bigquery-tables
+    value:
+      - billing_data
+      - daily_cost_summary
+      - cost_trends
+      - cost_anomalies
+      - monitoring_metrics
+    description: "List of BigQuery tables and views created"
+    
+  - name: ml-models
+    value:
+      - cost_prediction_bqml
+      - cost_anomaly_detection
+    description: "List of BigQuery ML models created"
+    
+  - name: alert-policy-name
+    value: ${alert_policy_name}
+    description: "Cloud Monitoring alert policy for cost anomalies"
+    
+  - name: apis-enabled
+    value:
+      - bigquery.googleapis.com
+      - aiplatform.googleapis.com
+      - storage.googleapis.com
+      - monitoring.googleapis.com
+      - datacatalog.googleapis.com
+    description: "List of Google Cloud APIs enabled"
+
+# Metadata for Infrastructure Manager
+metadata:
+  version: "1.0"
+  description: "AI-Powered Cost Analytics infrastructure with BigQuery Analytics Hub and Vertex AI"
+  author: "Cloud Recipe Generator"
+  created: "2025-07-12"
+  provider: "Google Cloud Platform"
+  category: "analytics"
+  tags:
+    - cost-optimization
+    - machine-learning
+    - data-analytics
+    - bigquery
+    - vertex-ai
+    - analytics-hub
+    - cloud-monitoring
+  estimated-cost: "$50-100 USD per month"
+  prerequisites:
+    - "Google Cloud project with billing enabled"
+    - "Appropriate IAM permissions for resource creation"
+    - "Cloud Billing Export configured"
+  security-considerations:
+    - "Uses IAM service accounts with least privilege access"
+    - "Implements uniform bucket-level access for Cloud Storage"
+    - "Enables data encryption at rest and in transit"
+    - "Follows Google Cloud security best practices"
+  scalability:
+    - "BigQuery automatically scales for query workloads"
+    - "Cloud Storage provides unlimited scalability"
+    - "Analytics Hub supports enterprise-scale data sharing"
+    - "Cloud Monitoring handles high-volume metrics"

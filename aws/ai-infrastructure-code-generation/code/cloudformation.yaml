@@ -1,0 +1,688 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AI-Powered Infrastructure Code Generation with Amazon Q Developer and AWS Infrastructure Composer - Complete automation pipeline for template processing and validation'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Application Configuration"
+        Parameters:
+          - ApplicationName
+          - Environment
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaTimeout
+          - LambdaMemorySize
+          - PythonRuntime
+      - Label:
+          default: "S3 Configuration"
+        Parameters:
+          - EnableVersioning
+          - TemplatePrefix
+          - AutoDeployPrefix
+    ParameterLabels:
+      ApplicationName:
+        default: "Application Name"
+      Environment:
+        default: "Deployment Environment"
+      LambdaTimeout:
+        default: "Lambda Function Timeout"
+      LambdaMemorySize:
+        default: "Lambda Function Memory Size"
+      PythonRuntime:
+        default: "Python Runtime Version"
+      EnableVersioning:
+        default: "Enable S3 Bucket Versioning"
+      TemplatePrefix:
+        default: "Template Storage Prefix"
+      AutoDeployPrefix:
+        default: "Auto-Deploy Prefix"
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: QDeveloperAutomation
+    Description: Name prefix for all resources created by this template
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+    MinLength: 3
+    MaxLength: 32
+
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment name for resource tagging and naming
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    ConstraintDescription: Must be one of dev, test, staging, or prod
+
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    Description: Lambda function timeout in seconds
+    MinValue: 30
+    MaxValue: 900
+    ConstraintDescription: Must be between 30 and 900 seconds
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    Description: Lambda function memory allocation in MB
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+    ConstraintDescription: Must be a valid Lambda memory size
+
+  PythonRuntime:
+    Type: String
+    Default: python3.11
+    Description: Python runtime version for Lambda function
+    AllowedValues:
+      - python3.9
+      - python3.10
+      - python3.11
+      - python3.12
+    ConstraintDescription: Must be a supported Python runtime version
+
+  EnableVersioning:
+    Type: String
+    Default: 'true'
+    Description: Enable versioning on S3 bucket for template history
+    AllowedValues: ['true', 'false']
+    ConstraintDescription: Must be true or false
+
+  TemplatePrefix:
+    Type: String
+    Default: templates/
+    Description: S3 prefix for storing infrastructure templates
+    AllowedPattern: '^[a-zA-Z0-9-_/]*/$'
+    ConstraintDescription: Must end with a forward slash and contain only valid S3 prefix characters
+
+  AutoDeployPrefix:
+    Type: String
+    Default: auto-deploy/
+    Description: S3 prefix for templates that should be automatically deployed
+    AllowedPattern: '^[a-zA-Z0-9-_/]*/$'
+    ConstraintDescription: Must end with a forward slash and contain only valid S3 prefix characters
+
+Conditions:
+  EnableS3Versioning: !Equals [!Ref EnableVersioning, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # S3 Bucket for Template Storage
+  TemplateStorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ApplicationName}-${Environment}-templates-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: !If [EnableS3Versioning, Enabled, Suspended]
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt TemplateProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: !Ref TemplatePrefix
+                  - Name: suffix
+                    Value: .json
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-template-storage'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Q Developer Template Storage'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudWatch Log Group for Lambda Function
+  TemplateProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ApplicationName}-${Environment}-template-processor'
+      RetentionInDays: !If [IsProduction, 30, 14]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-lambda-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Lambda Function Logs'
+
+  # IAM Role for Lambda Function
+  TemplateProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-${Environment}-template-processor-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3TemplateAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${TemplateStorageBucket}'
+                  - !Sub '${TemplateStorageBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:GetBucketNotification
+                Resource: !Sub '${TemplateStorageBucket}'
+        - PolicyName: CloudFormationAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:CreateStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:ListStacks
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                Resource: '*'
+        - PolicyName: IAMPassRoleAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                  - iam:CreateRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:GetRole
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'iam:PassedToService': 
+                      - lambda.amazonaws.com
+                      - cloudformation.amazonaws.com
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ApplicationName}-${Environment}-template-processor:*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-lambda-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Lambda Execution Role'
+
+  # Lambda Function for Template Processing
+  TemplateProcessorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: TemplateProcessorLogGroup
+    Properties:
+      FunctionName: !Sub '${ApplicationName}-${Environment}-template-processor'
+      Runtime: !Ref PythonRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt TemplateProcessorRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref TemplateStorageBucket
+          APPLICATION_NAME: !Ref ApplicationName
+          ENVIRONMENT: !Ref Environment
+          AUTO_DEPLOY_PREFIX: !Ref AutoDeployPrefix
+          LOG_LEVEL: !If [IsProduction, 'INFO', 'DEBUG']
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          import yaml
+          from urllib.parse import unquote_plus
+          from datetime import datetime
+          
+          # Configure logging
+          logger = logging.getLogger()
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger.setLevel(getattr(logging, log_level))
+          
+          # Initialize AWS clients
+          s3_client = boto3.client('s3')
+          cfn_client = boto3.client('cloudformation')
+          
+          def lambda_handler(event, context):
+              """
+              Process CloudFormation templates uploaded to S3
+              Validates templates and optionally deploys infrastructure
+              """
+              try:
+                  bucket_name = os.environ['BUCKET_NAME']
+                  app_name = os.environ['APPLICATION_NAME']
+                  env_name = os.environ['ENVIRONMENT']
+                  auto_deploy_prefix = os.environ['AUTO_DEPLOY_PREFIX']
+                  
+                  results = []
+                  
+                  # Process each S3 event record
+                  for record in event.get('Records', []):
+                      try:
+                          bucket = record['s3']['bucket']['name']
+                          key = unquote_plus(record['s3']['object']['key'])
+                          
+                          logger.info(f"Processing template: {key} from bucket: {bucket}")
+                          
+                          # Download template from S3
+                          response = s3_client.get_object(Bucket=bucket, Key=key)
+                          template_body = response['Body'].read().decode('utf-8')
+                          
+                          # Determine template format (JSON or YAML)
+                          template_format = 'json' if key.endswith('.json') else 'yaml'
+                          
+                          # Parse template to extract metadata
+                          try:
+                              if template_format == 'json':
+                                  template_data = json.loads(template_body)
+                              else:
+                                  template_data = yaml.safe_load(template_body)
+                          except Exception as parse_error:
+                              logger.error(f"Failed to parse template {key}: {parse_error}")
+                              continue
+                          
+                          # Validate CloudFormation template
+                          try:
+                              validation_response = cfn_client.validate_template(
+                                  TemplateBody=template_body
+                              )
+                              logger.info(f"Template validation successful for {key}")
+                              
+                              # Extract stack name from template metadata or generate one
+                              stack_name = None
+                              if 'Metadata' in template_data and 'StackName' in template_data['Metadata']:
+                                  stack_name = template_data['Metadata']['StackName']
+                              else:
+                                  # Generate stack name from file path
+                                  stack_name = f"{app_name}-{env_name}-{key.replace('/', '-').replace('.json', '').replace('.yaml', '').replace('.yml', '')}"
+                              
+                              # Check if this should be auto-deployed
+                              should_auto_deploy = key.startswith(auto_deploy_prefix)
+                              
+                              # Create validation result
+                              validation_result = {
+                                  'timestamp': datetime.utcnow().isoformat(),
+                                  'template_file': key,
+                                  'template_format': template_format,
+                                  'validation_status': 'VALID',
+                                  'description': validation_response.get('Description', ''),
+                                  'parameters': validation_response.get('Parameters', []),
+                                  'capabilities': validation_response.get('Capabilities', []),
+                                  'stack_name': stack_name,
+                                  'auto_deploy_attempted': False,
+                                  'deployment_status': None
+                              }
+                              
+                              # Auto-deploy if in auto-deploy directory
+                              if should_auto_deploy:
+                                  try:
+                                      logger.info(f"Auto-deploying stack: {stack_name}")
+                                      
+                                      # Check if stack already exists
+                                      try:
+                                          cfn_client.describe_stacks(StackName=stack_name)
+                                          stack_exists = True
+                                      except cfn_client.exceptions.ClientError:
+                                          stack_exists = False
+                                      
+                                      if stack_exists:
+                                          # Update existing stack
+                                          cfn_client.update_stack(
+                                              StackName=stack_name,
+                                              TemplateBody=template_body,
+                                              Capabilities=['CAPABILITY_IAM', 'CAPABILITY_NAMED_IAM'],
+                                              Tags=[
+                                                  {'Key': 'Source', 'Value': 'QDeveloperAutomation'},
+                                                  {'Key': 'TemplateFile', 'Value': key},
+                                                  {'Key': 'Environment', 'Value': env_name},
+                                                  {'Key': 'LastUpdated', 'Value': datetime.utcnow().isoformat()}
+                                              ]
+                                          )
+                                          validation_result['deployment_status'] = 'UPDATE_INITIATED'
+                                      else:
+                                          # Create new stack
+                                          cfn_client.create_stack(
+                                              StackName=stack_name,
+                                              TemplateBody=template_body,
+                                              Capabilities=['CAPABILITY_IAM', 'CAPABILITY_NAMED_IAM'],
+                                              Tags=[
+                                                  {'Key': 'Source', 'Value': 'QDeveloperAutomation'},
+                                                  {'Key': 'TemplateFile', 'Value': key},
+                                                  {'Key': 'Environment', 'Value': env_name},
+                                                  {'Key': 'CreatedAt', 'Value': datetime.utcnow().isoformat()}
+                                              ]
+                                          )
+                                          validation_result['deployment_status'] = 'CREATE_INITIATED'
+                                      
+                                      validation_result['auto_deploy_attempted'] = True
+                                      logger.info(f"Auto-deployment initiated for stack: {stack_name}")
+                                      
+                                  except Exception as deploy_error:
+                                      logger.error(f"Auto-deployment failed for {stack_name}: {deploy_error}")
+                                      validation_result['deployment_status'] = f'DEPLOYMENT_FAILED: {str(deploy_error)}'
+                                      validation_result['auto_deploy_attempted'] = True
+                              
+                              # Store validation results
+                              result_key = f"validation-results/{key.replace('.json', '').replace('.yaml', '').replace('.yml', '')}-validation.json"
+                              s3_client.put_object(
+                                  Bucket=bucket,
+                                  Key=result_key,
+                                  Body=json.dumps(validation_result, indent=2),
+                                  ContentType='application/json',
+                                  ServerSideEncryption='AES256'
+                              )
+                              
+                              results.append({
+                                  'file': key,
+                                  'status': 'success',
+                                  'validation': 'valid',
+                                  'result_file': result_key
+                              })
+                              
+                          except Exception as validation_error:
+                              logger.error(f"Template validation failed for {key}: {validation_error}")
+                              
+                              # Store validation error
+                              error_result = {
+                                  'timestamp': datetime.utcnow().isoformat(),
+                                  'template_file': key,
+                                  'template_format': template_format,
+                                  'validation_status': 'INVALID',
+                                  'error': str(validation_error),
+                                  'error_type': type(validation_error).__name__
+                              }
+                              
+                              result_key = f"validation-results/{key.replace('.json', '').replace('.yaml', '').replace('.yml', '')}-error.json"
+                              s3_client.put_object(
+                                  Bucket=bucket,
+                                  Key=result_key,
+                                  Body=json.dumps(error_result, indent=2),
+                                  ContentType='application/json',
+                                  ServerSideEncryption='AES256'
+                              )
+                              
+                              results.append({
+                                  'file': key,
+                                  'status': 'error',
+                                  'validation': 'invalid',
+                                  'error': str(validation_error),
+                                  'result_file': result_key
+                              })
+                      
+                      except Exception as record_error:
+                          logger.error(f"Failed to process record: {record_error}")
+                          results.append({
+                              'status': 'error',
+                              'error': str(record_error)
+                          })
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Template processing completed',
+                          'processed_count': len(results),
+                          'results': results
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Lambda execution error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': f'Error processing templates: {str(e)}',
+                          'error_type': type(e).__name__
+                      })
+                  }
+      ReservedConcurrencyLimit: !If [IsProduction, 10, 5]
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-template-processor'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Template Processing and Validation'
+
+  # Dead Letter Queue for Failed Lambda Executions
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ApplicationName}-${Environment}-template-processor-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeoutSeconds: 60
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-dlq'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Dead Letter Queue for Lambda'
+
+  # Lambda Permission for S3 to Invoke Function
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TemplateProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub '${TemplateStorageBucket}'
+      SourceAccount: !Ref AWS::AccountId
+
+  # CloudWatch Alarm for Lambda Errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-lambda-errors'
+      AlarmDescription: 'Alert when Lambda function encounters errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TemplateProcessorFunction
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-lambda-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarm for Lambda Duration
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-lambda-duration'
+      AlarmDescription: 'Alert when Lambda function execution duration is high'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref LambdaTimeout
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TemplateProcessorFunction
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-duration-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SSM Parameter for Application Configuration
+  ApplicationConfigParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ApplicationName}/${Environment}/config'
+      Type: String
+      Value: !Sub |
+        {
+          "bucket_name": "${TemplateStorageBucket}",
+          "lambda_function": "${TemplateProcessorFunction}",
+          "lambda_role": "${TemplateProcessorRole}",
+          "template_prefix": "${TemplatePrefix}",
+          "auto_deploy_prefix": "${AutoDeployPrefix}",
+          "environment": "${Environment}",
+          "region": "${AWS::Region}",
+          "account_id": "${AWS::AccountId}"
+        }
+      Description: !Sub 'Configuration parameters for ${ApplicationName} in ${Environment} environment'
+      Tags:
+        Name: !Sub '${ApplicationName}-${Environment}-config'
+        Environment: !Ref Environment
+        Purpose: 'Application Configuration'
+
+Outputs:
+  TemplateStorageBucketName:
+    Description: 'Name of the S3 bucket for storing infrastructure templates'
+    Value: !Ref TemplateStorageBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-TemplateStorageBucket'
+
+  TemplateStorageBucketArn:
+    Description: 'ARN of the S3 bucket for storing infrastructure templates'
+    Value: !Sub '${TemplateStorageBucket}'
+    Export:
+      Name: !Sub '${AWS::StackName}-TemplateStorageBucketArn'
+
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function for template processing'
+    Value: !Ref TemplateProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function for template processing'
+    Value: !GetAtt TemplateProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  LambdaRoleArn:
+    Description: 'ARN of the IAM role used by the Lambda function'
+    Value: !GetAtt TemplateProcessorRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaRole'
+
+  CloudWatchLogGroup:
+    Description: 'CloudWatch Log Group for Lambda function logs'
+    Value: !Ref TemplateProcessorLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  DeadLetterQueueUrl:
+    Description: 'URL of the Dead Letter Queue for failed Lambda executions'
+    Value: !Ref DeadLetterQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueue'
+
+  DeadLetterQueueArn:
+    Description: 'ARN of the Dead Letter Queue for failed Lambda executions'
+    Value: !GetAtt DeadLetterQueue.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueueArn'
+
+  TemplateUploadCommand:
+    Description: 'AWS CLI command to upload templates to the bucket'
+    Value: !Sub 'aws s3 cp your-template.json s3://${TemplateStorageBucket}/${TemplatePrefix}'
+
+  AutoDeployUploadCommand:
+    Description: 'AWS CLI command to upload templates for auto-deployment'
+    Value: !Sub 'aws s3 cp your-template.json s3://${TemplateStorageBucket}/${AutoDeployPrefix}'
+
+  ValidationResultsLocation:
+    Description: 'S3 location where validation results are stored'
+    Value: !Sub 's3://${TemplateStorageBucket}/validation-results/'
+
+  ApplicationConfigParameter:
+    Description: 'SSM Parameter containing application configuration'
+    Value: !Ref ApplicationConfigParameter
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigParameter'
+
+  MonitoringDashboardUrl:
+    Description: 'CloudWatch Dashboard URL for monitoring the application'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ApplicationName}-${Environment}'
+
+  LambdaErrorAlarmArn:
+    Description: 'ARN of the CloudWatch alarm for Lambda errors'
+    Value: !Sub '${LambdaErrorAlarm}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ErrorAlarm'

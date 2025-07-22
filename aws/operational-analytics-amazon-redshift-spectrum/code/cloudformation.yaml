@@ -1,0 +1,830 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Infrastructure as Code for Enabling Operational Analytics with Amazon Redshift Spectrum.
+  This template creates a complete operational analytics solution using Amazon Redshift, 
+  S3 data lake, AWS Glue Data Catalog, and Redshift Spectrum for hybrid analytics.
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "Redshift Cluster Configuration"
+        Parameters:
+          - ClusterNodeType
+          - ClusterType
+          - DatabaseName
+          - MasterUsername
+          - MasterUserPassword
+      - Label:
+          default: "Data Lake Configuration"
+        Parameters:
+          - DataLakeBucketName
+          - EnableS3Versioning
+          - EnableS3Encryption
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - SubnetIds
+          - AllowedCidrBlocks
+    ParameterLabels:
+      Environment:
+        default: "Environment Name"
+      ProjectName:
+        default: "Project Name"
+      ClusterNodeType:
+        default: "Redshift Node Type"
+      ClusterType:
+        default: "Cluster Type"
+      DatabaseName:
+        default: "Database Name"
+      MasterUsername:
+        default: "Master Username"
+      MasterUserPassword:
+        default: "Master Password"
+      DataLakeBucketName:
+        default: "Data Lake Bucket Name"
+      EnableS3Versioning:
+        default: "Enable S3 Versioning"
+      EnableS3Encryption:
+        default: "Enable S3 Encryption"
+      VpcId:
+        default: "VPC ID"
+      SubnetIds:
+        default: "Subnet IDs"
+      AllowedCidrBlocks:
+        default: "Allowed CIDR Blocks"
+
+# Template Parameters
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, prod]
+    Description: Environment name for resource tagging and naming
+    
+  ProjectName:
+    Type: String
+    Default: operational-analytics
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    Description: Project name for resource naming (lowercase, alphanumeric, hyphens allowed)
+    
+  ClusterNodeType:
+    Type: String
+    Default: dc2.large
+    AllowedValues: 
+      - dc2.large
+      - dc2.8xlarge
+      - ds2.xlarge
+      - ds2.8xlarge
+      - ra3.xlplus
+      - ra3.4xlarge
+      - ra3.16xlarge
+    Description: Amazon Redshift cluster node type
+    
+  ClusterType:
+    Type: String
+    Default: single-node
+    AllowedValues: [single-node, multi-node]
+    Description: Redshift cluster type (single-node for dev/test, multi-node for production)
+    
+  DatabaseName:
+    Type: String
+    Default: analytics
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[a-z][a-z0-9_]*$'
+    Description: Name of the Redshift database
+    
+  MasterUsername:
+    Type: String
+    Default: admin
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: '^[a-z][a-z0-9_]*$'
+    Description: Master username for Redshift cluster
+    
+  MasterUserPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z0-9!@#$%^&*()_+=-]*$'
+    Description: Master password for Redshift cluster (8-64 characters, alphanumeric and special chars)
+    
+  DataLakeBucketName:
+    Type: String
+    Default: ''
+    Description: >
+      S3 bucket name for data lake storage. Leave empty to auto-generate a unique name.
+      Must be globally unique if specified.
+      
+  EnableS3Versioning:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable S3 bucket versioning for data protection
+    
+  EnableS3Encryption:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable S3 bucket encryption at rest
+    
+  VpcId:
+    Type: String
+    Default: ''
+    Description: >
+      VPC ID for Redshift cluster placement. Leave empty to use default VPC.
+      Required for production deployments.
+      
+  SubnetIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: >
+      Comma-delimited list of subnet IDs for Redshift cluster.
+      Leave empty to use default subnets. Required if VpcId is specified.
+      
+  AllowedCidrBlocks:
+    Type: CommaDelimitedList
+    Default: '0.0.0.0/0'
+    Description: Comma-delimited list of CIDR blocks allowed to connect to Redshift
+
+# Template Conditions
+Conditions:
+  # Environment-based conditions
+  IsProduction: !Equals [!Ref Environment, prod]
+  IsMultiNode: !Equals [!Ref ClusterType, multi-node]
+  
+  # Resource configuration conditions
+  CreateBucketName: !Equals [!Ref DataLakeBucketName, '']
+  EnableVersioning: !Equals [!Ref EnableS3Versioning, 'true']
+  EnableEncryption: !Equals [!Ref EnableS3Encryption, 'true']
+  
+  # Network configuration conditions
+  UseCustomVpc: !Not [!Equals [!Ref VpcId, '']]
+  UseCustomSubnets: !Not [!Equals [!Join ['', !Ref SubnetIds], '']]
+  
+  # Security conditions
+  RestrictAccess: !Not [!Equals [!Join ['', !Ref AllowedCidrBlocks], '0.0.0.0/0']]
+
+# Template Resources
+Resources:
+  
+  # ===== S3 DATA LAKE INFRASTRUCTURE =====
+  
+  # S3 Bucket for Data Lake Storage
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If 
+        - CreateBucketName
+        - !Sub '${ProjectName}-spectrum-data-lake-${Environment}-${AWS::AccountId}'
+        - !Ref DataLakeBucketName
+      VersioningConfiguration: !If
+        - EnableVersioning
+        - Status: Enabled
+        - Status: Suspended
+      BucketEncryption: !If
+        - EnableEncryption
+        - ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+              BucketKeyEnabled: true
+        - !Ref AWS::NoValue
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldData
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref DataLakeLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-spectrum-data-lake-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Redshift Spectrum Data Lake'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Group for S3 Events
+  DataLakeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-spectrum-data-lake-${Environment}'
+      RetentionInDays: !If [IsProduction, 90, 30]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-data-lake-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ===== IAM ROLES AND POLICIES =====
+  
+  # IAM Role for Redshift Spectrum
+  RedshiftSpectrumRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-redshift-spectrum-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - redshift.amazonaws.com
+            Action: 
+              - sts:AssumeRole
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: RedshiftSpectrumS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:ListBucketMultipartUploads
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                Resource:
+                  - !GetAtt DataLakeBucket.Arn
+                  - !Sub '${DataLakeBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:CreateDatabase
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:DeleteTable
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-redshift-spectrum-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for Glue Crawlers
+  GlueSpectrumRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-glue-spectrum-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueSpectrumS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt DataLakeBucket.Arn
+                  - !Sub '${DataLakeBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-glue-spectrum-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ===== AWS GLUE DATA CATALOG =====
+  
+  # Glue Database for Spectrum
+  GlueSpectrumDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectName}_spectrum_db_${Environment}'
+        Description: !Sub 'Glue database for ${ProjectName} Redshift Spectrum operational analytics'
+        Parameters:
+          'classification': 'spectrum'
+          'environment': !Ref Environment
+          'project': !Ref ProjectName
+
+  # Glue Crawler for Sales Data
+  SalesDataCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ProjectName}-sales-crawler-${Environment}'
+      Description: 'Crawler for sales transaction data in S3 data lake'
+      Role: !GetAtt GlueSpectrumRole.Arn
+      DatabaseName: !Ref GlueSpectrumDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub '${DataLakeBucket}/operational-data/sales/'
+            Exclusions: []
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": {
+              "AddOrUpdateBehavior": "InheritFromTable"
+            }
+          },
+          "Grouping": {
+            "TableGroupingPolicy": "CombineCompatibleSchemas"
+          }
+        }
+      Schedule:
+        ScheduleExpression: 'cron(0 6 * * ? *)'  # Daily at 6 AM UTC
+      Tags:
+        Name: !Sub '${ProjectName}-sales-crawler-${Environment}'
+        Environment: !Ref Environment
+        Purpose: 'Sales Data Discovery'
+
+  # Glue Crawler for Customer Data
+  CustomerDataCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ProjectName}-customers-crawler-${Environment}'
+      Description: 'Crawler for customer profile data in S3 data lake'
+      Role: !GetAtt GlueSpectrumRole.Arn
+      DatabaseName: !Ref GlueSpectrumDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub '${DataLakeBucket}/operational-data/customers/'
+            Exclusions: []
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Schedule:
+        ScheduleExpression: 'cron(0 7 * * ? *)'  # Daily at 7 AM UTC
+      Tags:
+        Name: !Sub '${ProjectName}-customers-crawler-${Environment}'
+        Environment: !Ref Environment
+        Purpose: 'Customer Data Discovery'
+
+  # Glue Crawler for Product Data
+  ProductDataCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ProjectName}-products-crawler-${Environment}'
+      Description: 'Crawler for product catalog data in S3 data lake'
+      Role: !GetAtt GlueSpectrumRole.Arn
+      DatabaseName: !Ref GlueSpectrumDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub '${DataLakeBucket}/operational-data/products/'
+            Exclusions: []
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Schedule:
+        ScheduleExpression: 'cron(0 8 * * ? *)'  # Daily at 8 AM UTC
+      Tags:
+        Name: !Sub '${ProjectName}-products-crawler-${Environment}'
+        Environment: !Ref Environment
+        Purpose: 'Product Data Discovery'
+
+  # ===== REDSHIFT CLUSTER INFRASTRUCTURE =====
+  
+  # Redshift Subnet Group (only if custom VPC is specified)
+  RedshiftSubnetGroup:
+    Type: AWS::Redshift::SubnetGroup
+    Condition: UseCustomVpc
+    Properties:
+      Description: !Sub 'Subnet group for ${ProjectName} Redshift cluster'
+      SubnetIds: !Ref SubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-redshift-subnet-group-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Redshift Security Group
+  RedshiftSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'Security group for ${ProjectName} Redshift cluster'
+      VpcId: !If [UseCustomVpc, !Ref VpcId, !Ref 'AWS::NoValue']
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5439
+          ToPort: 5439
+          CidrIp: !Select [0, !Ref AllowedCidrBlocks]
+          Description: 'Redshift access from primary CIDR block'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-redshift-sg-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Additional Security Group Rules for multiple CIDR blocks
+  RedshiftSecurityGroupRule1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: RestrictAccess
+    Properties:
+      GroupId: !Ref RedshiftSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5439
+      ToPort: 5439
+      CidrIp: !If
+        - RestrictAccess
+        - !Select [1, !Split [',', !Join [',', !Ref AllowedCidrBlocks]]]
+        - !Ref 'AWS::NoValue'
+      Description: 'Additional Redshift access CIDR block'
+
+  # Redshift Parameter Group
+  RedshiftParameterGroup:
+    Type: AWS::Redshift::ClusterParameterGroup
+    Properties:
+      Description: !Sub 'Parameter group for ${ProjectName} Redshift cluster optimized for Spectrum'
+      ParameterGroupFamily: redshift-1.0
+      Parameters:
+        - ParameterName: enable_user_activity_logging
+          ParameterValue: 'true'
+        - ParameterName: log_statement
+          ParameterValue: 'all'
+        - ParameterName: max_concurrency_scaling_clusters
+          ParameterValue: !If [IsProduction, '10', '1']
+        - ParameterName: enable_case_sensitive_identifier
+          ParameterValue: 'false'
+        - ParameterName: datestyle
+          ParameterValue: 'ISO, MDY'
+        - ParameterName: search_path
+          ParameterValue: '"$user", public'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-redshift-params-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Redshift Cluster
+  RedshiftCluster:
+    Type: AWS::Redshift::Cluster
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      ClusterIdentifier: !Sub '${ProjectName}-spectrum-cluster-${Environment}'
+      ClusterType: !Ref ClusterType
+      NodeType: !Ref ClusterNodeType
+      NumberOfNodes: !If [IsMultiNode, 2, !Ref 'AWS::NoValue']
+      DBName: !Ref DatabaseName
+      MasterUsername: !Ref MasterUsername
+      MasterUserPassword: !Ref MasterUserPassword
+      ClusterParameterGroupName: !Ref RedshiftParameterGroup
+      ClusterSubnetGroupName: !If [UseCustomVpc, !Ref RedshiftSubnetGroup, !Ref 'AWS::NoValue']
+      VpcSecurityGroupIds:
+        - !Ref RedshiftSecurityGroup
+      IamRoles:
+        - !GetAtt RedshiftSpectrumRole.Arn
+      PubliclyAccessible: !If [UseCustomVpc, false, true]
+      Encrypted: true
+      Port: 5439
+      AutomatedSnapshotRetentionPeriod: !If [IsProduction, 7, 1]
+      PreferredMaintenanceWindow: 'sun:05:00-sun:06:00'
+      AllowVersionUpgrade: true
+      EnhancedVpcRouting: !If [UseCustomVpc, true, false]
+      LoggingProperties:
+        BucketName: !Ref DataLakeBucket
+        S3KeyPrefix: 'redshift-logs/'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-spectrum-cluster-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Operational Analytics with Spectrum'
+        - Key: NodeType
+          Value: !Ref ClusterNodeType
+        - Key: ClusterType
+          Value: !Ref ClusterType
+
+  # ===== MONITORING AND ALERTING =====
+  
+  # CloudWatch Log Group for Redshift
+  RedshiftLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/redshift/${ProjectName}-spectrum-cluster-${Environment}'
+      RetentionInDays: !If [IsProduction, 90, 30]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-redshift-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarm for Redshift CPU Utilization
+  RedshiftCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-redshift-high-cpu-${Environment}'
+      AlarmDescription: 'Redshift cluster CPU utilization is high'
+      MetricName: CPUUtilization
+      Namespace: AWS/Redshift
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ClusterIdentifier
+          Value: !Ref RedshiftCluster
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-redshift-cpu-alarm-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarm for Redshift Connection Count
+  RedshiftConnectionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-redshift-high-connections-${Environment}'
+      AlarmDescription: 'Redshift cluster connection count is high'
+      MetricName: DatabaseConnections
+      Namespace: AWS/Redshift
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !If [IsProduction, 200, 50]
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ClusterIdentifier
+          Value: !Ref RedshiftCluster
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-redshift-connection-alarm-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ===== SAMPLE DATA INITIALIZATION =====
+  
+  # Lambda Role for S3 Data Initialization
+  S3DataInitializerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3WriteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DataLakeBucket.Arn
+                  - !Sub '${DataLakeBucket.Arn}/*'
+
+  # Lambda Function for Sample Data Initialization
+  S3DataInitializerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-s3-data-initializer-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt S3DataInitializerRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+          
+          def lambda_handler(event, context):
+              s3 = boto3.client('s3')
+              bucket_name = event['ResourceProperties']['BucketName']
+              
+              try:
+                  if event['RequestType'] == 'Create':
+                      # Sample sales data
+                      sales_data = """transaction_id,customer_id,product_id,quantity,unit_price,transaction_date,store_id,region,payment_method
+          TXN001,CUST001,PROD001,2,29.99,2024-01-15,STORE001,North,credit_card
+          TXN002,CUST002,PROD002,1,199.99,2024-01-15,STORE002,South,debit_card
+          TXN003,CUST003,PROD003,3,15.50,2024-01-16,STORE001,North,cash
+          TXN004,CUST001,PROD004,1,89.99,2024-01-16,STORE003,East,credit_card
+          TXN005,CUST004,PROD001,2,29.99,2024-01-17,STORE002,South,credit_card"""
+                      
+                      # Sample customer data
+                      customer_data = """customer_id,first_name,last_name,email,phone,registration_date,tier,city,state
+          CUST001,John,Doe,john.doe@email.com,555-0101,2023-01-15,premium,New York,NY
+          CUST002,Jane,Smith,jane.smith@email.com,555-0102,2023-02-20,standard,Los Angeles,CA
+          CUST003,Bob,Johnson,bob.johnson@email.com,555-0103,2023-03-10,standard,Chicago,IL
+          CUST004,Alice,Brown,alice.brown@email.com,555-0104,2023-04-05,premium,Miami,FL"""
+                      
+                      # Sample product data
+                      product_data = """product_id,product_name,category,brand,cost,retail_price,supplier_id
+          PROD001,Wireless Headphones,Electronics,TechBrand,20.00,29.99,SUP001
+          PROD002,Smart Watch,Electronics,TechBrand,120.00,199.99,SUP001
+          PROD003,Coffee Mug,Home,HomeBrand,8.00,15.50,SUP002
+          PROD004,Bluetooth Speaker,Electronics,AudioMax,50.00,89.99,SUP003"""
+                      
+                      # Upload sample data files
+                      s3.put_object(Bucket=bucket_name, Key='operational-data/sales/year=2024/month=01/sales_transactions.csv', Body=sales_data)
+                      s3.put_object(Bucket=bucket_name, Key='operational-data/customers/customers.csv', Body=customer_data)
+                      s3.put_object(Bucket=bucket_name, Key='operational-data/products/products.csv', Body=product_data)
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': 'Sample data uploaded successfully'})
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': 'No action required'})
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  # Custom Resource to Initialize Sample Data
+  S3DataInitializer:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt S3DataInitializerFunction.Arn
+      BucketName: !Ref DataLakeBucket
+
+# Template Outputs
+Outputs:
+  
+  # S3 Data Lake Outputs
+  DataLakeBucketName:
+    Description: Name of the S3 bucket used for data lake storage
+    Value: !Ref DataLakeBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataLakeBucketName'
+      
+  DataLakeBucketArn:
+    Description: ARN of the S3 bucket used for data lake storage
+    Value: !GetAtt DataLakeBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataLakeBucketArn'
+      
+  DataLakeURL:
+    Description: S3 console URL for the data lake bucket
+    Value: !Sub 'https://s3.console.aws.amazon.com/s3/buckets/${DataLakeBucket}?region=${AWS::Region}'
+  
+  # Redshift Cluster Outputs
+  RedshiftClusterIdentifier:
+    Description: Identifier of the Redshift cluster
+    Value: !Ref RedshiftCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-RedshiftClusterIdentifier'
+      
+  RedshiftClusterEndpoint:
+    Description: Endpoint address of the Redshift cluster
+    Value: !GetAtt RedshiftCluster.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-RedshiftClusterEndpoint'
+      
+  RedshiftClusterPort:
+    Description: Port number of the Redshift cluster
+    Value: !GetAtt RedshiftCluster.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-RedshiftClusterPort'
+      
+  RedshiftJDBCURL:
+    Description: JDBC connection string for the Redshift cluster
+    Value: !Sub 'jdbc:redshift://${RedshiftCluster.Endpoint.Address}:${RedshiftCluster.Endpoint.Port}/${DatabaseName}'
+    
+  RedshiftODBCURL:
+    Description: ODBC connection string for the Redshift cluster
+    Value: !Sub 'Driver={Amazon Redshift (x64)}; Server=${RedshiftCluster.Endpoint.Address}; Database=${DatabaseName}; UID=${MasterUsername}; PWD=<password>; Port=${RedshiftCluster.Endpoint.Port}'
+
+  # AWS Glue Outputs
+  GlueDatabaseName:
+    Description: Name of the Glue database for Spectrum
+    Value: !Ref GlueSpectrumDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabaseName'
+      
+  SalesDataCrawlerName:
+    Description: Name of the Glue crawler for sales data
+    Value: !Ref SalesDataCrawler
+    Export:
+      Name: !Sub '${AWS::StackName}-SalesDataCrawlerName'
+      
+  CustomerDataCrawlerName:
+    Description: Name of the Glue crawler for customer data
+    Value: !Ref CustomerDataCrawler
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomerDataCrawlerName'
+
+  # IAM Role Outputs
+  RedshiftSpectrumRoleArn:
+    Description: ARN of the IAM role for Redshift Spectrum
+    Value: !GetAtt RedshiftSpectrumRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RedshiftSpectrumRoleArn'
+      
+  GlueSpectrumRoleArn:
+    Description: ARN of the IAM role for Glue crawlers
+    Value: !GetAtt GlueSpectrumRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueSpectrumRoleArn'
+
+  # Connection and Setup Outputs
+  RedshiftConsoleURL:
+    Description: AWS Console URL for the Redshift cluster
+    Value: !Sub 'https://console.aws.amazon.com/redshiftv2/home?region=${AWS::Region}#cluster-details?cluster=${RedshiftCluster}'
+    
+  GlueConsoleURL:
+    Description: AWS Console URL for the Glue database
+    Value: !Sub 'https://console.aws.amazon.com/glue/home?region=${AWS::Region}#catalog:tab=databases'
+    
+  QuickStartGuide:
+    Description: Quick start guide for using the operational analytics solution
+    Value: !Sub |
+      1. Wait for Glue crawlers to complete (check status in Glue console)
+      2. Connect to Redshift using: psql -h ${RedshiftCluster.Endpoint.Address} -p ${RedshiftCluster.Endpoint.Port} -U ${MasterUsername} -d ${DatabaseName}
+      3. Create external schema: CREATE EXTERNAL SCHEMA spectrum_schema FROM DATA CATALOG DATABASE '${GlueSpectrumDatabase}' IAM_ROLE '${RedshiftSpectrumRole.Arn}';
+      4. Query external tables: SELECT * FROM spectrum_schema.sales LIMIT 10;
+      5. For detailed setup instructions, refer to the recipe documentation
+      
+  # Security and Monitoring Outputs
+  RedshiftSecurityGroupId:
+    Description: ID of the security group for the Redshift cluster
+    Value: !Ref RedshiftSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-RedshiftSecurityGroupId'
+      
+  CloudWatchDashboardURL:
+    Description: CloudWatch dashboard URL for monitoring Redshift metrics
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}'
+
+  # Cost Optimization Outputs
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for this infrastructure (approximate)
+    Value: !Sub |
+      Redshift ${ClusterType} cluster (${ClusterNodeType}): $200-800/month
+      S3 Storage (first 50TB): $23/TB/month
+      Glue Crawlers: $0.44/hour when running
+      Data Transfer: Variable based on query volume
+      Total estimated: $250-1000/month depending on usage

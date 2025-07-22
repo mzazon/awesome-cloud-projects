@@ -1,0 +1,683 @@
+# Google Cloud Infrastructure Manager Configuration
+# Data Privacy Compliance with Cloud DLP and BigQuery
+# This configuration deploys a complete privacy compliance solution with automated
+# sensitive data detection, analytics, and remediation capabilities
+
+metadata:
+  name: data-privacy-compliance-solution
+  description: "Automated data privacy compliance system using Cloud DLP, BigQuery, and Cloud Functions"
+  labels:
+    solution: "data-privacy-compliance"
+    recipe: "dlp-bigquery"
+    compliance: "gdpr-ccpa-hipaa"
+
+# Input parameters for customization
+variables:
+  project_id:
+    type: string
+    description: "GCP Project ID where resources will be created"
+    required: true
+
+  region:
+    type: string
+    description: "Primary region for resource deployment"
+    default: "us-central1"
+
+  zone:
+    type: string
+    description: "Compute zone within the region"
+    default: "us-central1-a"
+
+  bucket_name_suffix:
+    type: string
+    description: "Suffix for unique bucket naming"
+    default: ""
+
+  dataset_name:
+    type: string
+    description: "BigQuery dataset name for compliance data"
+    default: "privacy_compliance"
+
+  function_name:
+    type: string
+    description: "Cloud Function name for remediation"
+    default: "dlp-remediation"
+
+  enable_monitoring:
+    type: boolean
+    description: "Enable advanced monitoring and alerting"
+    default: true
+
+  data_retention_days:
+    type: number
+    description: "Data retention period in days for compliance"
+    default: 365
+
+  dlp_min_likelihood:
+    type: string
+    description: "Minimum likelihood threshold for DLP detection"
+    default: "POSSIBLE"
+    enum: ["VERY_UNLIKELY", "UNLIKELY", "POSSIBLE", "LIKELY", "VERY_LIKELY"]
+
+# Resource definitions
+resources:
+  # Enable required APIs for the solution
+  apis:
+    type: gcp-types/serviceusage-v1:projects.services
+    metadata:
+      dependsOn: []
+    properties:
+      name: projects/$(ref.project_info.projectId)/services/dlp.googleapis.com
+    action: enable
+
+  bigquery_api:
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_info.projectId)/services/bigquery.googleapis.com
+    action: enable
+
+  storage_api:
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_info.projectId)/services/storage.googleapis.com
+    action: enable
+
+  cloudfunctions_api:
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_info.projectId)/services/cloudfunctions.googleapis.com
+    action: enable
+
+  logging_api:
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_info.projectId)/services/logging.googleapis.com
+    action: enable
+
+  monitoring_api:
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_info.projectId)/services/monitoring.googleapis.com
+    action: enable
+
+  pubsub_api:
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_info.projectId)/services/pubsub.googleapis.com
+    action: enable
+
+  # Project information for reference
+  project_info:
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: $(var.project_id)
+    accessControl:
+      gcpIamPolicy:
+        bindings: []
+
+  # Cloud Storage bucket for data sources
+  compliance_data_bucket:
+    type: gcp-types/storage-v1:buckets
+    metadata:
+      dependsOn:
+        - storage_api
+    properties:
+      name: dlp-compliance-data-$(var.bucket_name_suffix)
+      location: $(var.region)
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: true
+      encryption:
+        defaultKmsKeyName: $(ref.kms_key.name)
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: $(var.data_retention_days)
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 30
+      logging:
+        logBucket: $(ref.access_logs_bucket.name)
+        logObjectPrefix: data-access-logs/
+      labels:
+        purpose: "privacy-compliance"
+        data-classification: "sensitive"
+
+  # Separate bucket for access logs
+  access_logs_bucket:
+    type: gcp-types/storage-v1:buckets
+    metadata:
+      dependsOn:
+        - storage_api
+    properties:
+      name: dlp-compliance-logs-$(var.bucket_name_suffix)
+      location: $(var.region)
+      storageClass: COLDLINE
+      uniformBucketLevelAccess:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: $(var.data_retention_days)
+      labels:
+        purpose: "access-logging"
+
+  # KMS key for encryption
+  kms_keyring:
+    type: gcp-types/cloudkms-v1:projects.locations.keyRings
+    metadata:
+      dependsOn:
+        - cloudkms_api
+    properties:
+      parent: projects/$(var.project_id)/locations/$(var.region)
+      keyRingId: privacy-compliance-keyring
+
+  kms_key:
+    type: gcp-types/cloudkms-v1:projects.locations.keyRings.cryptoKeys
+    metadata:
+      dependsOn:
+        - kms_keyring
+    properties:
+      parent: $(ref.kms_keyring.name)
+      cryptoKeyId: privacy-compliance-key
+      purpose: ENCRYPT_DECRYPT
+      versionTemplate:
+        algorithm: GOOGLE_SYMMETRIC_ENCRYPTION
+
+  cloudkms_api:
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      name: projects/$(ref.project_info.projectId)/services/cloudkms.googleapis.com
+    action: enable
+
+  # BigQuery dataset for compliance analytics
+  compliance_dataset:
+    type: gcp-types/bigquery-v2:datasets
+    metadata:
+      dependsOn:
+        - bigquery_api
+    properties:
+      datasetId: $(var.dataset_name)
+      projectId: $(var.project_id)
+      location: $(var.region)
+      description: "Privacy compliance and DLP scan results analytics"
+      defaultEncryptionConfiguration:
+        kmsKeyName: $(ref.kms_key.name)
+      defaultTableExpirationMs: 31536000000  # 365 days in milliseconds
+      labels:
+        purpose: "privacy-compliance"
+        data-type: "analytics"
+      access:
+        - role: "OWNER"
+          userByEmail: "$(ref.dlp_service_account.email)"
+        - role: "READER"
+          specialGroup: "projectReaders"
+
+  # BigQuery table for DLP scan results
+  dlp_scan_results_table:
+    type: gcp-types/bigquery-v2:tables
+    metadata:
+      dependsOn:
+        - compliance_dataset
+    properties:
+      projectId: $(var.project_id)
+      datasetId: $(ref.compliance_dataset.datasetId)
+      tableId: dlp_scan_results
+      description: "Detailed DLP scan findings and compliance status"
+      schema:
+        fields:
+          - name: scan_id
+            type: STRING
+            mode: REQUIRED
+            description: "Unique identifier for the scan job"
+          - name: file_path
+            type: STRING
+            mode: REQUIRED
+            description: "Path to the scanned file"
+          - name: scan_timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "When the scan was performed"
+          - name: info_type
+            type: STRING
+            mode: REQUIRED
+            description: "Type of sensitive information detected"
+          - name: likelihood
+            type: STRING
+            mode: REQUIRED
+            description: "Confidence level of the detection"
+          - name: quote
+            type: STRING
+            mode: NULLABLE
+            description: "Sample of detected sensitive data (truncated)"
+          - name: byte_offset_start
+            type: INTEGER
+            mode: NULLABLE
+            description: "Start position of finding in file"
+          - name: byte_offset_end
+            type: INTEGER
+            mode: NULLABLE
+            description: "End position of finding in file"
+          - name: finding_count
+            type: INTEGER
+            mode: REQUIRED
+            description: "Number of findings of this type"
+          - name: compliance_status
+            type: STRING
+            mode: REQUIRED
+            description: "Compliance assessment status"
+      timePartitioning:
+        type: DAY
+        field: scan_timestamp
+      clustering:
+        fields: ["info_type", "likelihood", "compliance_status"]
+
+  # BigQuery table for compliance summary metrics
+  compliance_summary_table:
+    type: gcp-types/bigquery-v2:tables
+    metadata:
+      dependsOn:
+        - compliance_dataset
+    properties:
+      projectId: $(var.project_id)
+      datasetId: $(ref.compliance_dataset.datasetId)
+      tableId: compliance_summary
+      description: "Daily compliance summary and metrics"
+      schema:
+        fields:
+          - name: date
+            type: DATE
+            mode: REQUIRED
+            description: "Date of compliance summary"
+          - name: total_files_scanned
+            type: INTEGER
+            mode: REQUIRED
+            description: "Total number of files scanned"
+          - name: files_with_pii
+            type: INTEGER
+            mode: REQUIRED
+            description: "Files containing PII"
+          - name: high_risk_findings
+            type: INTEGER
+            mode: REQUIRED
+            description: "High-confidence PII findings"
+          - name: medium_risk_findings
+            type: INTEGER
+            mode: REQUIRED
+            description: "Medium-confidence PII findings"
+          - name: low_risk_findings
+            type: INTEGER
+            mode: REQUIRED
+            description: "Low-confidence PII findings"
+          - name: compliance_score
+            type: FLOAT
+            mode: REQUIRED
+            description: "Overall compliance score (0-100)"
+      timePartitioning:
+        type: DAY
+        field: date
+
+  # Pub/Sub topic for DLP notifications
+  dlp_notifications_topic:
+    type: gcp-types/pubsub-v1:projects.topics
+    metadata:
+      dependsOn:
+        - pubsub_api
+    properties:
+      name: projects/$(var.project_id)/topics/dlp-notifications
+      labels:
+        purpose: "dlp-results"
+
+  # Service account for DLP operations
+  dlp_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: dlp-compliance-sa
+      displayName: "DLP Compliance Service Account"
+      description: "Service account for DLP scanning and compliance operations"
+      projectId: $(var.project_id)
+
+  # IAM bindings for DLP service account
+  dlp_sa_dlp_admin:
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    metadata:
+      dependsOn:
+        - dlp_service_account
+    properties:
+      resource: $(var.project_id)
+      policy:
+        bindings:
+          - role: roles/dlp.admin
+            members:
+              - serviceAccount:$(ref.dlp_service_account.email)
+
+  dlp_sa_storage_admin:
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    metadata:
+      dependsOn:
+        - dlp_service_account
+    properties:
+      resource: $(var.project_id)
+      policy:
+        bindings:
+          - role: roles/storage.objectAdmin
+            members:
+              - serviceAccount:$(ref.dlp_service_account.email)
+
+  dlp_sa_bigquery_admin:
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    metadata:
+      dependsOn:
+        - dlp_service_account
+    properties:
+      resource: $(var.project_id)
+      policy:
+        bindings:
+          - role: roles/bigquery.dataEditor
+            members:
+              - serviceAccount:$(ref.dlp_service_account.email)
+
+  # Cloud Function for automated remediation
+  remediation_function_source:
+    type: gcp-types/storage-v1:objects
+    metadata:
+      dependsOn:
+        - compliance_data_bucket
+    properties:
+      bucket: $(ref.compliance_data_bucket.name)
+      name: function-source.zip
+      # Note: In practice, this would reference actual function source code
+      # For this template, we're creating a placeholder
+
+  remediation_function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    metadata:
+      dependsOn:
+        - cloudfunctions_api
+        - dlp_service_account
+        - dlp_notifications_topic
+        - remediation_function_source
+    properties:
+      location: projects/$(var.project_id)/locations/$(var.region)
+      functionId: $(var.function_name)
+      function:
+        name: projects/$(var.project_id)/locations/$(var.region)/functions/$(var.function_name)
+        description: "Automated DLP scan result processing and remediation"
+        sourceArchiveUrl: gs://$(ref.compliance_data_bucket.name)/function-source.zip
+        entryPoint: process_dlp_results
+        runtime: python39
+        timeout: 60s
+        availableMemoryMb: 256
+        serviceAccountEmail: $(ref.dlp_service_account.email)
+        environmentVariables:
+          PROJECT_ID: $(var.project_id)
+          DATASET_NAME: $(var.dataset_name)
+          BUCKET_NAME: $(ref.compliance_data_bucket.name)
+        eventTrigger:
+          eventType: providers/cloud.pubsub/eventTypes/topic.publish
+          resource: $(ref.dlp_notifications_topic.name)
+        labels:
+          purpose: "compliance-automation"
+
+  # DLP inspection template for privacy compliance
+  dlp_inspection_template:
+    type: gcp-types/dlp-v2:projects.inspectTemplates
+    metadata:
+      dependsOn:
+        - apis
+        - dlp_service_account
+    properties:
+      parent: projects/$(var.project_id)
+      inspectTemplate:
+        displayName: "Privacy Compliance Scanner"
+        description: "Template for detecting PII and sensitive data for privacy compliance"
+        inspectConfig:
+          infoTypes:
+            - name: EMAIL_ADDRESS
+            - name: PHONE_NUMBER
+            - name: US_SOCIAL_SECURITY_NUMBER
+            - name: CREDIT_CARD_NUMBER
+            - name: PERSON_NAME
+            - name: US_DRIVERS_LICENSE_NUMBER
+            - name: DATE_OF_BIRTH
+            - name: IP_ADDRESS
+            - name: MEDICAL_RECORD_NUMBER
+            - name: US_PASSPORT
+          minLikelihood: $(var.dlp_min_likelihood)
+          limits:
+            maxFindingsPerRequest: 1000
+            maxFindingsPerInfoType:
+              - infoType:
+                  name: EMAIL_ADDRESS
+                maxFindings: 100
+              - infoType:
+                  name: PHONE_NUMBER
+                maxFindings: 100
+          includeQuote: true
+          excludeInfoTypes: false
+
+  # Log sink for DLP operations
+  dlp_log_sink:
+    type: gcp-types/logging-v2:projects.sinks
+    metadata:
+      dependsOn:
+        - logging_api
+        - compliance_dataset
+    properties:
+      parent: projects/$(var.project_id)
+      sinkId: dlp-compliance-sink
+      destination: bigquery.googleapis.com/projects/$(var.project_id)/datasets/$(var.dataset_name)
+      filter: 'resource.type="dlp_job" OR resource.type="cloud_function" AND resource.labels.function_name="$(var.function_name)"'
+      description: "Export DLP and compliance logs to BigQuery for analysis"
+
+# Conditional monitoring resources
+  # Monitoring dashboard (if monitoring enabled)
+  compliance_dashboard:
+    type: gcp-types/monitoring-v1:projects.dashboards
+    metadata:
+      dependsOn:
+        - monitoring_api
+      condition: $(var.enable_monitoring)
+    properties:
+      parent: projects/$(var.project_id)
+      dashboard:
+        displayName: "Privacy Compliance Dashboard"
+        mosaicLayout:
+          tiles:
+            - width: 6
+              height: 4
+              widget:
+                title: "DLP Findings by Type"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="dlp_job"'
+                          aggregation:
+                            alignmentPeriod: 3600s
+                            perSeriesAligner: ALIGN_COUNT
+                  timeshiftDuration: 0s
+            - width: 6
+              height: 4
+              widget:
+                title: "Compliance Score Trend"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="bigquery_table"'
+                          aggregation:
+                            alignmentPeriod: 86400s
+                            perSeriesAligner: ALIGN_MEAN
+
+  # Alert policy for high-risk findings
+  high_risk_alert_policy:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    metadata:
+      dependsOn:
+        - monitoring_api
+      condition: $(var.enable_monitoring)
+    properties:
+      parent: projects/$(var.project_id)
+      alertPolicy:
+        displayName: "High-Risk PII Detection Alert"
+        documentation:
+          content: "Alert triggered when DLP detects high-confidence PII findings"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "High-risk DLP findings"
+            conditionThreshold:
+              filter: 'resource.type="dlp_job" AND metric.type="logging.googleapis.com/user/dlp_high_risk_findings"'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 5
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_COUNT
+        enabled: true
+        severity: ERROR
+
+# Output values for reference and integration
+outputs:
+  storage_bucket_name:
+    description: "Name of the Cloud Storage bucket for data sources"
+    value: $(ref.compliance_data_bucket.name)
+
+  bigquery_dataset_id:
+    description: "BigQuery dataset ID for compliance analytics"
+    value: $(ref.compliance_dataset.datasetId)
+
+  bigquery_table_scan_results:
+    description: "BigQuery table for DLP scan results"
+    value: "$(var.project_id).$(ref.compliance_dataset.datasetId).$(ref.dlp_scan_results_table.tableId)"
+
+  bigquery_table_compliance_summary:
+    description: "BigQuery table for compliance summary metrics"
+    value: "$(var.project_id).$(ref.compliance_dataset.datasetId).$(ref.compliance_summary_table.tableId)"
+
+  cloud_function_name:
+    description: "Name of the Cloud Function for automated remediation"
+    value: $(ref.remediation_function.function.name)
+
+  pubsub_topic_name:
+    description: "Pub/Sub topic for DLP notifications"
+    value: $(ref.dlp_notifications_topic.name)
+
+  dlp_service_account_email:
+    description: "Service account email for DLP operations"
+    value: $(ref.dlp_service_account.email)
+
+  dlp_inspection_template_name:
+    description: "DLP inspection template for privacy compliance scanning"
+    value: $(ref.dlp_inspection_template.name)
+
+  kms_key_name:
+    description: "KMS key for data encryption"
+    value: $(ref.kms_key.name)
+
+  project_id:
+    description: "GCP Project ID where resources are deployed"
+    value: $(var.project_id)
+
+  region:
+    description: "Primary region for resource deployment"
+    value: $(var.region)
+
+  compliance_dashboard_url:
+    description: "URL to the compliance monitoring dashboard (if enabled)"
+    value: "https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.compliance_dashboard.dashboard.name)"
+    condition: $(var.enable_monitoring)
+
+# Deployment configuration and notes
+deployment:
+  # Deployment order dependencies
+  stages:
+    - name: "apis-and-iam"
+      resources: 
+        - apis
+        - bigquery_api
+        - storage_api
+        - cloudfunctions_api
+        - logging_api
+        - monitoring_api
+        - pubsub_api
+        - cloudkms_api
+        - project_info
+        - dlp_service_account
+    
+    - name: "security-and-storage"
+      depends_on: ["apis-and-iam"]
+      resources:
+        - kms_keyring
+        - kms_key
+        - compliance_data_bucket
+        - access_logs_bucket
+        - dlp_sa_dlp_admin
+        - dlp_sa_storage_admin
+        - dlp_sa_bigquery_admin
+
+    - name: "analytics-and-messaging"
+      depends_on: ["security-and-storage"]
+      resources:
+        - compliance_dataset
+        - dlp_scan_results_table
+        - compliance_summary_table
+        - dlp_notifications_topic
+        - dlp_inspection_template
+
+    - name: "automation-and-monitoring"
+      depends_on: ["analytics-and-messaging"]
+      resources:
+        - remediation_function_source
+        - remediation_function
+        - dlp_log_sink
+        - compliance_dashboard
+        - high_risk_alert_policy
+
+  # Post-deployment configuration steps
+  post_deployment:
+    - description: "Upload sample data for testing DLP scanning"
+      action: "manual"
+      details: "Use gsutil to upload test files with PII to the data bucket"
+    
+    - description: "Create and run DLP scan job"
+      action: "manual"
+      details: "Configure DLP job to scan the Cloud Storage bucket using the inspection template"
+    
+    - description: "Verify compliance dashboard and alerts"
+      action: "manual"
+      details: "Check that monitoring dashboard displays compliance metrics and alerts are configured"
+
+# Security and compliance notes
+security:
+  encryption:
+    - "All data encrypted at rest using customer-managed KMS keys"
+    - "Cloud Storage buckets use uniform bucket-level access"
+    - "BigQuery datasets encrypted with KMS keys"
+  
+  access_control:
+    - "Dedicated service account with least-privilege IAM roles"
+    - "Bucket access logging enabled for audit trails"
+    - "Pub/Sub topic secured with IAM permissions"
+  
+  compliance_features:
+    - "Data retention policies configured for GDPR compliance"
+    - "Audit logging enabled for all data access"
+    - "Automated detection of multiple PII types"
+    - "Configurable remediation workflows"
+
+# Cost optimization features
+cost_optimization:
+  - "Cloud Storage lifecycle policies for automatic archival"
+  - "BigQuery partitioning and clustering for query efficiency"
+  - "Function timeout and memory limits optimized"
+  - "Coldline storage for access logs"
+  - "Automatic data expiration based on retention policies"

@@ -1,0 +1,1146 @@
+# CloudFormation Template for Microservices on EKS with AWS App Mesh
+# This template deploys a complete microservices architecture with service mesh capabilities
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Deploys microservices on Amazon EKS with AWS App Mesh service mesh for 
+  service-to-service communication, observability, and traffic management.
+  Includes ECR repositories, EKS cluster with managed node groups, App Mesh,
+  and comprehensive monitoring with CloudWatch and X-Ray.
+
+# ======================================================================
+# PARAMETERS
+# ======================================================================
+Parameters:
+  # Cluster Configuration
+  ClusterName:
+    Type: String
+    Default: microservices-mesh-cluster
+    Description: Name for the EKS cluster
+    MinLength: 1
+    MaxLength: 100
+    AllowedPattern: ^[a-zA-Z][-a-zA-Z0-9]*$
+    ConstraintDescription: Must be a valid EKS cluster name
+
+  KubernetesVersion:
+    Type: String
+    Default: '1.28'
+    Description: Kubernetes version for the EKS cluster
+    AllowedValues:
+      - '1.28'
+      - '1.29'
+      - '1.30'
+
+  # Node Group Configuration
+  NodeInstanceType:
+    Type: String
+    Default: t3.medium
+    Description: EC2 instance type for the EKS worker nodes
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - m5.large
+      - m5.xlarge
+      - m5.2xlarge
+    ConstraintDescription: Must be a valid EC2 instance type
+
+  NodeGroupMinSize:
+    Type: Number
+    Default: 3
+    Description: Minimum number of nodes in the EKS node group
+    MinValue: 1
+    MaxValue: 10
+
+  NodeGroupMaxSize:
+    Type: Number
+    Default: 6
+    Description: Maximum number of nodes in the EKS node group
+    MinValue: 1
+    MaxValue: 20
+
+  NodeGroupDesiredSize:
+    Type: Number
+    Default: 3
+    Description: Desired number of nodes in the EKS node group
+    MinValue: 1
+    MaxValue: 20
+
+  # App Mesh Configuration
+  AppMeshName:
+    Type: String
+    Default: microservices-mesh
+    Description: Name for the AWS App Mesh
+    MinLength: 1
+    MaxLength: 255
+    AllowedPattern: ^[a-zA-Z][-a-zA-Z0-9]*$
+
+  # Application Configuration
+  ApplicationNamespace:
+    Type: String
+    Default: production
+    Description: Kubernetes namespace for the microservices
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: ^[a-z][-a-z0-9]*$
+
+  ECRRepositoryPrefix:
+    Type: String
+    Default: microservices-demo
+    Description: Prefix for ECR repository names
+    MinLength: 1
+    MaxLength: 256
+
+  # Network Configuration
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+
+  # Observability Configuration
+  EnableCloudWatchInsights:
+    Type: String
+    Default: 'true'
+    Description: Enable CloudWatch Container Insights for monitoring
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableXRayTracing:
+    Type: String
+    Default: 'true'
+    Description: Enable AWS X-Ray distributed tracing
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+# ======================================================================
+# CONDITIONS
+# ======================================================================
+Conditions:
+  EnableInsights: !Equals [!Ref EnableCloudWatchInsights, 'true']
+  EnableTracing: !Equals [!Ref EnableXRayTracing, 'true']
+  CreateMultiAZ: !Not [!Equals [!Ref 'AWS::Region', 'us-west-1']]
+
+# ======================================================================
+# MAPPINGS
+# ======================================================================
+Mappings:
+  # EKS Optimized AMI IDs by region and Kubernetes version
+  EKSAMIMapping:
+    us-east-1:
+      '1.28': ami-0abcdef1234567890
+      '1.29': ami-0abcdef1234567891
+      '1.30': ami-0abcdef1234567892
+    us-west-2:
+      '1.28': ami-0fedcba0987654321
+      '1.29': ami-0fedcba0987654322
+      '1.30': ami-0fedcba0987654323
+
+# ======================================================================
+# RESOURCES
+# ======================================================================
+Resources:
+  # ====================
+  # NETWORKING
+  # ====================
+  
+  # VPC for the EKS cluster
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-vpc'
+        - Key: kubernetes.io/cluster/!Ref ClusterName
+          Value: shared
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-igw'
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # Public Subnets (for Load Balancers and NAT Gateways)
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 6, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-subnet-1'
+        - Key: kubernetes.io/role/elb
+          Value: 1
+        - Key: kubernetes.io/cluster/!Ref ClusterName
+          Value: shared
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 6, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-subnet-2'
+        - Key: kubernetes.io/role/elb
+          Value: 1
+        - Key: kubernetes.io/cluster/!Ref ClusterName
+          Value: shared
+
+  PublicSubnet3:
+    Type: AWS::EC2::Subnet
+    Condition: CreateMultiAZ
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [2, !GetAZs '']
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 6, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-subnet-3'
+        - Key: kubernetes.io/role/elb
+          Value: 1
+        - Key: kubernetes.io/cluster/!Ref ClusterName
+          Value: shared
+
+  # Private Subnets (for Worker Nodes)
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-subnet-1'
+        - Key: kubernetes.io/role/internal-elb
+          Value: 1
+        - Key: kubernetes.io/cluster/!Ref ClusterName
+          Value: owned
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [4, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-subnet-2'
+        - Key: kubernetes.io/role/internal-elb
+          Value: 1
+        - Key: kubernetes.io/cluster/!Ref ClusterName
+          Value: owned
+
+  PrivateSubnet3:
+    Type: AWS::EC2::Subnet
+    Condition: CreateMultiAZ
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [2, !GetAZs '']
+      CidrBlock: !Select [5, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-subnet-3'
+        - Key: kubernetes.io/role/internal-elb
+          Value: 1
+        - Key: kubernetes.io/cluster/!Ref ClusterName
+          Value: owned
+
+  # NAT Gateways for private subnet internet access
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat-eip-1'
+
+  NatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat-eip-2'
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat-1'
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat-2'
+
+  # Route Tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-routes'
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  PublicSubnet3RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateMultiAZ
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet3
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-routes-1'
+
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-routes-2'
+
+  DefaultPrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet2
+
+  PrivateSubnet3RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateMultiAZ
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet3
+
+  # ====================
+  # CONTAINER REGISTRY
+  # ====================
+  
+  # ECR Repositories for microservices
+  ServiceARepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ECRRepositoryPrefix}-service-a'
+      ImageTagMutability: MUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["v"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Service
+          Value: service-a
+        - Key: Application
+          Value: microservices-demo
+
+  ServiceBRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ECRRepositoryPrefix}-service-b'
+      ImageTagMutability: MUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["v"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Service
+          Value: service-b
+        - Key: Application
+          Value: microservices-demo
+
+  ServiceCRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ECRRepositoryPrefix}-service-c'
+      ImageTagMutability: MUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["v"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Service
+          Value: service-c
+        - Key: Application
+          Value: microservices-demo
+
+  # ====================
+  # IAM ROLES AND POLICIES
+  # ====================
+  
+  # EKS Cluster Service Role
+  EKSClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-cluster-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-cluster-role'
+
+  # EKS Node Group Role
+  EKSNodeGroupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-nodegroup-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AWSAppMeshEnvoyAccess
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nodegroup-role'
+
+  # App Mesh Controller Role (for IRSA)
+  AppMeshControllerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-appmesh-controller-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/${EKSCluster.OpenIdConnectIssuerUrl}'
+            Action: 'sts:AssumeRoleWithWebIdentity'
+            Condition:
+              StringEquals:
+                !Sub '${EKSCluster.OpenIdConnectIssuerUrl}:sub': 'system:serviceaccount:appmesh-system:appmesh-controller'
+                !Sub '${EKSCluster.OpenIdConnectIssuerUrl}:aud': 'sts.amazonaws.com'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCloudMapFullAccess
+        - arn:aws:iam::aws:policy/AWSAppMeshFullAccess
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-appmesh-controller-role'
+
+  # Load Balancer Controller Role (for IRSA)
+  LoadBalancerControllerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-loadbalancer-controller-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/${EKSCluster.OpenIdConnectIssuerUrl}'
+            Action: 'sts:AssumeRoleWithWebIdentity'
+            Condition:
+              StringEquals:
+                !Sub '${EKSCluster.OpenIdConnectIssuerUrl}:sub': 'system:serviceaccount:kube-system:aws-load-balancer-controller'
+                !Sub '${EKSCluster.OpenIdConnectIssuerUrl}:aud': 'sts.amazonaws.com'
+      Policies:
+        - PolicyName: AWSLoadBalancerControllerIAMPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:CreateServiceLinkedRole
+                  - ec2:DescribeAccountAttributes
+                  - ec2:DescribeAddresses
+                  - ec2:DescribeAvailabilityZones
+                  - ec2:DescribeInternetGateways
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeInstances
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeTags
+                  - ec2:GetCoipPoolUsage
+                  - ec2:DescribeCoipPools
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - elasticloadbalancing:DescribeLoadBalancerAttributes
+                  - elasticloadbalancing:DescribeListeners
+                  - elasticloadbalancing:DescribeListenerCertificates
+                  - elasticloadbalancing:DescribeSSLPolicies
+                  - elasticloadbalancing:DescribeRules
+                  - elasticloadbalancing:DescribeTargetGroups
+                  - elasticloadbalancing:DescribeTargetGroupAttributes
+                  - elasticloadbalancing:DescribeTargetHealth
+                  - elasticloadbalancing:DescribeTags
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cognito-idp:DescribeUserPoolClient
+                  - acm:ListCertificates
+                  - acm:DescribeCertificate
+                  - iam:ListServerCertificates
+                  - iam:GetServerCertificate
+                  - waf-regional:GetWebACL
+                  - waf-regional:GetWebACLForResource
+                  - waf-regional:AssociateWebACL
+                  - waf-regional:DisassociateWebACL
+                  - wafv2:GetWebACL
+                  - wafv2:GetWebACLForResource
+                  - wafv2:AssociateWebACL
+                  - wafv2:DisassociateWebACL
+                  - shield:DescribeProtection
+                  - shield:GetSubscriptionState
+                  - shield:DescribeSubscription
+                  - shield:CreateProtection
+                  - shield:DeleteProtection
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupIngress
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ec2:CreateSecurityGroup
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ec2:CreateTags
+                Resource: 'arn:aws:ec2:*:*:security-group/*'
+                Condition:
+                  StringEquals:
+                    'ec2:CreateAction': CreateSecurityGroup
+                  'Null':
+                    'aws:RequestedRegion': 'false'
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:CreateLoadBalancer
+                  - elasticloadbalancing:CreateTargetGroup
+                Resource: '*'
+                Condition:
+                  'Null':
+                    'aws:RequestedRegion': 'false'
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:CreateListener
+                  - elasticloadbalancing:DeleteListener
+                  - elasticloadbalancing:CreateRule
+                  - elasticloadbalancing:DeleteRule
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:AddTags
+                  - elasticloadbalancing:RemoveTags
+                Resource:
+                  - 'arn:aws:elasticloadbalancing:*:*:targetgroup/*/*'
+                  - 'arn:aws:elasticloadbalancing:*:*:loadbalancer/net/*/*'
+                  - 'arn:aws:elasticloadbalancing:*:*:loadbalancer/app/*/*'
+                Condition:
+                  'Null':
+                    'aws:RequestedRegion': 'false'
+                    'aws:ResourceTag/elbv2.k8s.aws/cluster': 'false'
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:RegisterTargets
+                  - elasticloadbalancing:DeregisterTargets
+                Resource: 'arn:aws:elasticloadbalancing:*:*:targetgroup/*/*'
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:SetWebAcl
+                  - elasticloadbalancing:ModifyListener
+                  - elasticloadbalancing:AddListenerCertificates
+                  - elasticloadbalancing:RemoveListenerCertificates
+                  - elasticloadbalancing:ModifyRule
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-loadbalancer-controller-role'
+
+  # CloudWatch Agent Role for X-Ray
+  XRayDaemonRole:
+    Type: AWS::IAM::Role
+    Condition: EnableTracing
+    Properties:
+      RoleName: !Sub '${ClusterName}-xray-daemon-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/${EKSCluster.OpenIdConnectIssuerUrl}'
+            Action: 'sts:AssumeRoleWithWebIdentity'
+            Condition:
+              StringEquals:
+                !Sub '${EKSCluster.OpenIdConnectIssuerUrl}:sub': !Sub 'system:serviceaccount:${ApplicationNamespace}:xray-daemon'
+                !Sub '${EKSCluster.OpenIdConnectIssuerUrl}:aud': 'sts.amazonaws.com'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-xray-daemon-role'
+
+  # ====================
+  # SECURITY GROUPS
+  # ====================
+  
+  # Additional Security Group for EKS Cluster
+  EKSClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EKS cluster control plane
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref EKSNodeSecurityGroup
+          Description: Allow worker nodes to communicate with cluster API Server
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-cluster-sg'
+
+  # Security Group for EKS Worker Nodes
+  EKSNodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EKS worker nodes
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 1025
+          ToPort: 65535
+          SourceSecurityGroupId: !Ref EKSClusterSecurityGroup
+          Description: Allow cluster control plane to communicate with worker nodes
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref EKSClusterSecurityGroup
+          Description: Allow cluster control plane to communicate with worker node kubelet
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-node-sg'
+
+  # Self-referencing rule for worker node communication
+  EKSNodeSecurityGroupSelfReference:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EKSNodeSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref EKSNodeSecurityGroup
+      Description: Allow worker nodes to communicate with each other
+
+  # ====================
+  # EKS CLUSTER
+  # ====================
+  
+  # EKS Cluster
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt EKSClusterRole.Arn
+      ResourcesVpcConfig:
+        SecurityGroupIds:
+          - !Ref EKSClusterSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+          - !If [CreateMultiAZ, !Ref PrivateSubnet3, !Ref 'AWS::NoValue']
+          - !Ref PublicSubnet1
+          - !Ref PublicSubnet2
+          - !If [CreateMultiAZ, !Ref PublicSubnet3, !Ref 'AWS::NoValue']
+        EndpointConfigPrivate: false
+        EndpointConfigPublic: true
+        PublicAccessCidrs: 
+          - 0.0.0.0/0
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+            - Type: controllerManager
+            - Type: scheduler
+      EncryptionConfig:
+        - Resources: ['secrets']
+          Provider:
+            KeyId: alias/aws/eks
+      Tags:
+        - Key: Name
+          Value: !Ref ClusterName
+        - Key: Environment
+          Value: !Ref ApplicationNamespace
+
+  # EKS Node Group
+  EKSNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref ClusterName
+      NodegroupName: !Sub '${ClusterName}-nodes'
+      NodeRole: !GetAtt EKSNodeGroupRole.Arn
+      InstanceTypes:
+        - !Ref NodeInstanceType
+      ScalingConfig:
+        MinSize: !Ref NodeGroupMinSize
+        MaxSize: !Ref NodeGroupMaxSize
+        DesiredSize: !Ref NodeGroupDesiredSize
+      UpdateConfig:
+        MaxUnavailablePercentage: 25
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+        - !If [CreateMultiAZ, !Ref PrivateSubnet3, !Ref 'AWS::NoValue']
+      DiskSize: 20
+      AmiType: AL2_x86_64
+      CapacityType: ON_DEMAND
+      RemoteAccess:
+        Ec2SshKey: !Ref 'AWS::NoValue'
+      Labels:
+        Environment: !Ref ApplicationNamespace
+        NodeGroup: primary
+      Tags:
+        Name: !Sub '${ClusterName}-worker-node'
+        Environment: !Ref ApplicationNamespace
+        'k8s.io/cluster-autoscaler/enabled': 'true'
+        !Sub 'k8s.io/cluster-autoscaler/${ClusterName}': 'owned'
+
+  # ====================
+  # EKS ADD-ONS
+  # ====================
+  
+  # VPC CNI Add-on
+  VPCCNIAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: EKSNodeGroup
+    Properties:
+      ClusterName: !Ref ClusterName
+      AddonName: vpc-cni
+      AddonVersion: v1.15.1-eksbuild.1
+      ResolveConflicts: OVERWRITE
+      ServiceAccountRoleArn: !GetAtt EKSNodeGroupRole.Arn
+      Tags:
+        - Key: Name
+          Value: vpc-cni
+
+  # CoreDNS Add-on
+  CoreDNSAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: EKSNodeGroup
+    Properties:
+      ClusterName: !Ref ClusterName
+      AddonName: coredns
+      AddonVersion: v1.10.1-eksbuild.5
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - Key: Name
+          Value: coredns
+
+  # kube-proxy Add-on
+  KubeProxyAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: EKSNodeGroup
+    Properties:
+      ClusterName: !Ref ClusterName
+      AddonName: kube-proxy
+      AddonVersion: v1.28.2-eksbuild.2
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - Key: Name
+          Value: kube-proxy
+
+  # EBS CSI Driver Add-on
+  EBSCSIAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: EKSNodeGroup
+    Properties:
+      ClusterName: !Ref ClusterName
+      AddonName: aws-ebs-csi-driver
+      AddonVersion: v1.24.0-eksbuild.1
+      ResolveConflicts: OVERWRITE
+      ServiceAccountRoleArn: !GetAtt EKSNodeGroupRole.Arn
+      Tags:
+        - Key: Name
+          Value: aws-ebs-csi-driver
+
+  # ====================
+  # APP MESH
+  # ====================
+  
+  # AWS App Mesh
+  AppMesh:
+    Type: AWS::AppMesh::Mesh
+    Properties:
+      MeshName: !Ref AppMeshName
+      Spec:
+        EgressFilter:
+          Type: ALLOW_ALL
+      Tags:
+        - Key: Name
+          Value: !Ref AppMeshName
+        - Key: Environment
+          Value: !Ref ApplicationNamespace
+
+  # Virtual Gateway for external traffic entry
+  AppMeshVirtualGateway:
+    Type: AWS::AppMesh::VirtualGateway
+    Properties:
+      MeshName: !Ref AppMeshName
+      VirtualGatewayName: microservices-gateway
+      Spec:
+        Listeners:
+          - PortMapping:
+              Port: 8080
+              Protocol: http
+            HealthCheck:
+              Protocol: http
+              Path: /health
+              HealthyThreshold: 2
+              UnhealthyThreshold: 3
+              TimeoutMillis: 2000
+              IntervalMillis: 5000
+        Logging:
+          AccessLog:
+            File:
+              Path: /dev/stdout
+      Tags:
+        - Key: Name
+          Value: microservices-gateway
+
+  # ====================
+  # CLOUDWATCH LOG GROUPS
+  # ====================
+  
+  # Log Group for EKS Cluster
+  EKSClusterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/eks/${ClusterName}/cluster'
+      RetentionInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-cluster-logs'
+
+  # Log Group for Application Logs
+  ApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/containerinsights/${ClusterName}/application'
+      RetentionInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-application-logs'
+
+  # Log Group for Performance Monitoring
+  PerformanceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableInsights
+    Properties:
+      LogGroupName: !Sub '/aws/containerinsights/${ClusterName}/performance'
+      RetentionInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-performance-logs'
+
+  # ====================
+  # OPENID CONNECT IDENTITY PROVIDER
+  # ====================
+  
+  # OIDC Identity Provider for IRSA
+  OIDCProvider:
+    Type: AWS::IAM::OIDCIdentityProvider
+    Properties:
+      Url: !GetAtt EKSCluster.OpenIdConnectIssuerUrl
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 9e99a48a9960b14926bb7f3b02e22da2b0ab7280
+        - a9d53002e97e00e043244f3d170d6f4c414104fd
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-oidc-provider'
+
+# ======================================================================
+# OUTPUTS
+# ======================================================================
+Outputs:
+  # Cluster Information
+  ClusterName:
+    Description: Name of the EKS cluster
+    Value: !Ref ClusterName
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterName'
+
+  ClusterEndpoint:
+    Description: Endpoint URL of the EKS cluster
+    Value: !GetAtt EKSCluster.Endpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterEndpoint'
+
+  ClusterArn:
+    Description: ARN of the EKS cluster
+    Value: !GetAtt EKSCluster.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterArn'
+
+  ClusterSecurityGroupId:
+    Description: Security group ID for the EKS cluster
+    Value: !GetAtt EKSCluster.ClusterSecurityGroupId
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterSecurityGroupId'
+
+  OIDCIssuerURL:
+    Description: OIDC issuer URL for the EKS cluster (for IRSA setup)
+    Value: !GetAtt EKSCluster.OpenIdConnectIssuerUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-OIDCIssuerURL'
+
+  # Network Information
+  VpcId:
+    Description: ID of the VPC
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+
+  PrivateSubnetIds:
+    Description: List of private subnet IDs
+    Value: !If 
+      - CreateMultiAZ
+      - !Join [',', [!Ref PrivateSubnet1, !Ref PrivateSubnet2, !Ref PrivateSubnet3]]
+      - !Join [',', [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnetIds'
+
+  PublicSubnetIds:
+    Description: List of public subnet IDs
+    Value: !If 
+      - CreateMultiAZ
+      - !Join [',', [!Ref PublicSubnet1, !Ref PublicSubnet2, !Ref PublicSubnet3]]
+      - !Join [',', [!Ref PublicSubnet1, !Ref PublicSubnet2]]
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnetIds'
+
+  # IAM Roles
+  NodeGroupRoleArn:
+    Description: ARN of the EKS node group role
+    Value: !GetAtt EKSNodeGroupRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-NodeGroupRoleArn'
+
+  AppMeshControllerRoleArn:
+    Description: ARN of the App Mesh controller role (for IRSA)
+    Value: !GetAtt AppMeshControllerRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AppMeshControllerRoleArn'
+
+  LoadBalancerControllerRoleArn:
+    Description: ARN of the Load Balancer controller role (for IRSA)
+    Value: !GetAtt LoadBalancerControllerRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LoadBalancerControllerRoleArn'
+
+  XRayDaemonRoleArn:
+    Description: ARN of the X-Ray daemon role (for IRSA)
+    Value: !If [EnableTracing, !GetAtt XRayDaemonRole.Arn, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-XRayDaemonRoleArn'
+
+  # Container Registry
+  ServiceARepositoryURI:
+    Description: URI of the Service A ECR repository
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ServiceARepository}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceARepositoryURI'
+
+  ServiceBRepositoryURI:
+    Description: URI of the Service B ECR repository
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ServiceBRepository}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceBRepositoryURI'
+
+  ServiceCRepositoryURI:
+    Description: URI of the Service C ECR repository
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ServiceCRepository}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceCRepositoryURI'
+
+  # App Mesh
+  AppMeshName:
+    Description: Name of the AWS App Mesh
+    Value: !Ref AppMeshName
+    Export:
+      Name: !Sub '${AWS::StackName}-AppMeshName'
+
+  AppMeshArn:
+    Description: ARN of the AWS App Mesh
+    Value: !Ref AppMesh
+    Export:
+      Name: !Sub '${AWS::StackName}-AppMeshArn'
+
+  VirtualGatewayName:
+    Description: Name of the App Mesh Virtual Gateway
+    Value: !GetAtt AppMeshVirtualGateway.VirtualGatewayName
+    Export:
+      Name: !Sub '${AWS::StackName}-VirtualGatewayName'
+
+  # Configuration Information
+  ApplicationNamespace:
+    Description: Kubernetes namespace for applications
+    Value: !Ref ApplicationNamespace
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationNamespace'
+
+  # kubectl Configuration Command
+  KubectlConfigCommand:
+    Description: Command to configure kubectl for this cluster
+    Value: !Sub 'aws eks update-kubeconfig --region ${AWS::Region} --name ${ClusterName}'
+
+  # Next Steps
+  NextSteps:
+    Description: Next steps to complete the setup
+    Value: |
+      1. Configure kubectl: aws eks update-kubeconfig --region <region> --name <cluster-name>
+      2. Install App Mesh Controller using Helm
+      3. Install AWS Load Balancer Controller using Helm
+      4. Deploy microservices with App Mesh annotations
+      5. Configure observability with CloudWatch and X-Ray

@@ -1,0 +1,770 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Complete time-series data solution using Amazon Timestream, Lambda, IoT Core, and CloudWatch for IoT sensor data analytics'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Timestream Configuration"
+        Parameters:
+          - DatabaseName
+          - TableName
+          - MemoryStoreRetentionHours
+          - MagneticStoreRetentionDays
+      - Label:
+          default: "Data Ingestion Configuration"
+        Parameters:
+          - LambdaFunctionName
+          - IoTRuleName
+          - IoTTopicName
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableCloudWatchAlarms
+          - IngestionLatencyThreshold
+          - QueryLatencyThreshold
+      - Label:
+          default: "Resource Naming"
+        Parameters:
+          - ProjectName
+          - Environment
+    ParameterLabels:
+      DatabaseName:
+        default: "Timestream Database Name"
+      TableName:
+        default: "Timestream Table Name"
+      LambdaFunctionName:
+        default: "Lambda Function Name"
+      IoTRuleName:
+        default: "IoT Core Rule Name"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'iot-timeseries'
+    Description: 'Project name for resource naming and tagging'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$'
+    ConstraintDescription: 'Must begin with a letter, contain only alphanumeric characters and hyphens, and end with an alphanumeric character'
+
+  Environment:
+    Type: String
+    Default: 'production'
+    AllowedValues:
+      - 'development'
+      - 'staging'
+      - 'production'
+    Description: 'Environment name for resource tagging and configuration'
+
+  DatabaseName:
+    Type: String
+    Default: 'iot-timeseries-db'
+    Description: 'Name for the Timestream database'
+    MinLength: 3
+    MaxLength: 256
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_-]*[a-zA-Z0-9]$'
+    ConstraintDescription: 'Must begin with a letter, contain only alphanumeric characters, underscores, and hyphens'
+
+  TableName:
+    Type: String
+    Default: 'sensor-data'
+    Description: 'Name for the Timestream table'
+    MinLength: 3
+    MaxLength: 256
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_-]*[a-zA-Z0-9]$'
+    ConstraintDescription: 'Must begin with a letter, contain only alphanumeric characters, underscores, and hyphens'
+
+  MemoryStoreRetentionHours:
+    Type: Number
+    Default: 24
+    MinValue: 1
+    MaxValue: 8766
+    Description: 'Memory store retention period in hours (1 hour to 1 year)'
+
+  MagneticStoreRetentionDays:
+    Type: Number
+    Default: 365
+    MinValue: 1
+    MaxValue: 73000
+    Description: 'Magnetic store retention period in days (1 day to 200 years)'
+
+  LambdaFunctionName:
+    Type: String
+    Default: 'timestream-data-ingestion'
+    Description: 'Name for the Lambda function that ingests data into Timestream'
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-_]*[a-zA-Z0-9]$'
+
+  IoTRuleName:
+    Type: String
+    Default: 'timestream-iot-rule'
+    Description: 'Name for the IoT Core rule that routes data to Timestream'
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-_]*[a-zA-Z0-9]$'
+
+  IoTTopicName:
+    Type: String
+    Default: 'topic/sensors'
+    Description: 'MQTT topic name for IoT sensor data'
+    MinLength: 1
+    MaxLength: 256
+
+  EnableCloudWatchAlarms:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable CloudWatch alarms for monitoring Timestream performance'
+
+  IngestionLatencyThreshold:
+    Type: Number
+    Default: 1000
+    MinValue: 100
+    MaxValue: 10000
+    Description: 'Threshold in milliseconds for ingestion latency alarm'
+
+  QueryLatencyThreshold:
+    Type: Number
+    Default: 5000
+    MinValue: 1000
+    MaxValue: 30000
+    Description: 'Threshold in milliseconds for query latency alarm'
+
+Conditions:
+  CreateCloudWatchAlarms: !Equals [!Ref EnableCloudWatchAlarms, 'true']
+
+Resources:
+  # ==================== TIMESTREAM DATABASE AND TABLE ====================
+  
+  TimestreamDatabase:
+    Type: AWS::Timestream::Database
+    Properties:
+      DatabaseName: !Sub '${DatabaseName}-${AWS::AccountId}-${AWS::Region}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-timestream-database'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  TimestreamTable:
+    Type: AWS::Timestream::Table
+    Properties:
+      DatabaseName: !Ref TimestreamDatabase
+      TableName: !Ref TableName
+      RetentionProperties:
+        MemoryStoreRetentionPeriodInHours: !Ref MemoryStoreRetentionHours
+        MagneticStoreRetentionPeriodInDays: !Ref MagneticStoreRetentionDays
+      MagneticStoreWriteProperties:
+        EnableMagneticStoreWrites: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-timestream-table'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ==================== IAM ROLES AND POLICIES ====================
+
+  # IAM Role for Lambda function to write to Timestream
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${LambdaFunctionName}-execution-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: TimestreamWritePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - timestream:WriteRecords
+                  - timestream:DescribeEndpoints
+                Resource:
+                  - !GetAtt TimestreamDatabase.Arn
+                  - !GetAtt TimestreamTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${LambdaFunctionName}*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-execution-role'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # IAM Role for IoT Core to write to Timestream
+  IoTTimestreamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${IoTRuleName}-timestream-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TimestreamWritePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - timestream:WriteRecords
+                  - timestream:DescribeEndpoints
+                Resource:
+                  - !GetAtt TimestreamDatabase.Arn
+                  - !GetAtt TimestreamTable.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-iot-timestream-role'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ==================== LAMBDA FUNCTION ====================
+
+  # Lambda function for custom data ingestion and transformation
+  DataIngestionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${LambdaFunctionName}-${AWS::Region}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          DATABASE_NAME: !Ref TimestreamDatabase
+          TABLE_NAME: !Ref TableName
+          LOG_LEVEL: INFO
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import time
+          import logging
+          from datetime import datetime, timezone
+          from typing import Dict, List, Any
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+
+          # Initialize Timestream client
+          timestream = boto3.client('timestream-write')
+
+          def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
+              """
+              Lambda function to ingest IoT sensor data into Amazon Timestream.
+              
+              Supports multiple input formats:
+              - Direct invocation with sensor data
+              - SQS/SNS records
+              - IoT Core message format
+              """
+              try:
+                  database_name = os.environ['DATABASE_NAME']
+                  table_name = os.environ['TABLE_NAME']
+                  
+                  logger.info(f"Processing event for database: {database_name}, table: {table_name}")
+                  
+                  # Parse different event types
+                  if 'Records' in event:
+                      # Handle SQS/SNS records
+                      logger.info(f"Processing {len(event['Records'])} records")
+                      for record in event['Records']:
+                          if 'body' in record:
+                              body = json.loads(record['body'])
+                              write_to_timestream(database_name, table_name, body)
+                          elif 'Sns' in record and 'Message' in record['Sns']:
+                              message = json.loads(record['Sns']['Message'])
+                              write_to_timestream(database_name, table_name, message)
+                  else:
+                      # Direct invocation
+                      logger.info("Processing direct invocation")
+                      write_to_timestream(database_name, table_name, event)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Data written to Timestream successfully',
+                          'database': database_name,
+                          'table': table_name
+                      })
+                  }
+              except Exception as e:
+                  logger.error(f"Error processing event: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'message': 'Failed to write data to Timestream'
+                      })
+                  }
+
+          def write_to_timestream(database_name: str, table_name: str, data: Dict[str, Any]) -> None:
+              """Write sensor data to Timestream with proper error handling."""
+              current_time = str(int(time.time() * 1000))
+              
+              try:
+                  records = []
+                  
+                  # Handle different data structures
+                  if isinstance(data, list):
+                      for item in data:
+                          records.extend(create_records(item, current_time))
+                  else:
+                      records.extend(create_records(data, current_time))
+                  
+                  if records:
+                      result = timestream.write_records(
+                          DatabaseName=database_name,
+                          TableName=table_name,
+                          Records=records
+                      )
+                      logger.info(f"Successfully wrote {len(records)} records to Timestream")
+                      return result
+                  else:
+                      logger.warning("No records to write to Timestream")
+                      
+              except Exception as e:
+                  logger.error(f"Error writing to Timestream: {str(e)}")
+                  raise
+
+          def create_records(data: Dict[str, Any], current_time: str) -> List[Dict[str, Any]]:
+              """Create Timestream records from sensor data."""
+              records = []
+              
+              # Extract metadata dimensions
+              device_id = str(data.get('device_id', 'unknown'))
+              location = str(data.get('location', 'unknown'))
+              
+              # Create dimensions (metadata)
+              dimensions = [
+                  {'Name': 'device_id', 'Value': device_id},
+                  {'Name': 'location', 'Value': location}
+              ]
+              
+              # Add additional dimensions if present
+              if 'device_type' in data:
+                  dimensions.append({'Name': 'device_type', 'Value': str(data['device_type'])})
+              if 'manufacturer' in data:
+                  dimensions.append({'Name': 'manufacturer', 'Value': str(data['manufacturer'])})
+              
+              # Handle multiple sensor readings
+              if 'sensors' in data:
+                  for sensor_type, value in data['sensors'].items():
+                      if isinstance(value, (int, float)):
+                          records.append({
+                              'Dimensions': dimensions,
+                              'MeasureName': sensor_type,
+                              'MeasureValue': str(value),
+                              'MeasureValueType': 'DOUBLE',
+                              'Time': current_time,
+                              'TimeUnit': 'MILLISECONDS'
+                          })
+              
+              # Handle single measurement
+              if 'measurement' in data:
+                  measure_name = data.get('metric_name', 'value')
+                  if isinstance(data['measurement'], (int, float)):
+                      records.append({
+                          'Dimensions': dimensions,
+                          'MeasureName': measure_name,
+                          'MeasureValue': str(data['measurement']),
+                          'MeasureValueType': 'DOUBLE',
+                          'Time': current_time,
+                          'TimeUnit': 'MILLISECONDS'
+                      })
+              
+              # Handle individual sensor fields (for IoT Core direct integration)
+              sensor_fields = ['temperature', 'humidity', 'pressure', 'vibration']
+              for field in sensor_fields:
+                  if field in data and isinstance(data[field], (int, float)):
+                      records.append({
+                          'Dimensions': dimensions,
+                          'MeasureName': field,
+                          'MeasureValue': str(data[field]),
+                          'MeasureValueType': 'DOUBLE',
+                          'Time': current_time,
+                          'TimeUnit': 'MILLISECONDS'
+                      })
+              
+              logger.info(f"Created {len(records)} Timestream records for device {device_id}")
+              return records
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-data-ingestion-lambda'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudWatch Log Group for Lambda function
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LambdaFunctionName}-${AWS::Region}'
+      RetentionInDays: 14
+
+  # ==================== IOT CORE RULE ====================
+
+  # IoT Core rule for direct Timestream integration
+  IoTTimestreamRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub '${IoTRuleName}-${AWS::AccountId}-${AWS::Region}'
+      TopicRulePayload:
+        Description: 'Route IoT sensor data directly to Amazon Timestream'
+        Sql: !Sub "SELECT device_id, location, timestamp, temperature, humidity, pressure, vibration FROM '${IoTTopicName}'"
+        AwsIotSqlVersion: '2016-03-23'
+        RuleDisabled: false
+        Actions:
+          - Timestream:
+              RoleArn: !GetAtt IoTTimestreamRole.Arn
+              DatabaseName: !Ref TimestreamDatabase
+              TableName: !Ref TableName
+              Dimensions:
+                - Name: device_id
+                  Value: '${device_id}'
+                - Name: location
+                  Value: '${location}'
+
+  # ==================== CLOUDWATCH MONITORING ====================
+
+  # CloudWatch alarm for Timestream ingestion latency
+  IngestionLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-Timestream-IngestionLatency-${Environment}'
+      AlarmDescription: 'Monitor Amazon Timestream data ingestion latency'
+      MetricName: SuccessfulRequestLatency
+      Namespace: AWS/Timestream
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref IngestionLatencyThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DatabaseName
+          Value: !Ref TimestreamDatabase
+        - Name: TableName
+          Value: !Ref TableName
+        - Name: Operation
+          Value: WriteRecords
+      AlarmActions:
+        - !Ref TimestreamAlertsSnsTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch alarm for Timestream query latency
+  QueryLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-Timestream-QueryLatency-${Environment}'
+      AlarmDescription: 'Monitor Amazon Timestream query latency'
+      MetricName: QueryLatency
+      Namespace: AWS/Timestream
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref QueryLatencyThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DatabaseName
+          Value: !Ref TimestreamDatabase
+      AlarmActions:
+        - !Ref TimestreamAlertsSnsTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch alarm for Lambda function errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-Lambda-Errors-${Environment}'
+      AlarmDescription: 'Monitor Lambda function errors for data ingestion'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DataIngestionLambda
+      AlarmActions:
+        - !Ref TimestreamAlertsSnsTopic
+      TreatMissingData: notBreaching
+
+  # SNS topic for CloudWatch alarms
+  TimestreamAlertsSnsTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      TopicName: !Sub '${ProjectName}-timestream-alerts-${Environment}'
+      DisplayName: !Sub '${ProjectName} Timestream Alerts'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-timestream-alerts'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ==================== CUSTOM RESOURCE FOR DATA GENERATION ====================
+
+  # Lambda function for generating sample IoT data (for testing)
+  DataGeneratorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-data-generator-${AWS::Region}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          INGESTION_LAMBDA_NAME: !Ref DataIngestionLambda
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import random
+          import time
+          import os
+          from datetime import datetime, timezone
+
+          lambda_client = boto3.client('lambda')
+
+          def lambda_handler(event, context):
+              """Generate sample IoT sensor data for testing purposes."""
+              try:
+                  function_name = os.environ['INGESTION_LAMBDA_NAME']
+                  
+                  devices = [
+                      ("sensor-001", "factory-floor-1"),
+                      ("sensor-002", "factory-floor-1"),
+                      ("sensor-003", "factory-floor-2"),
+                      ("sensor-004", "warehouse-1"),
+                      ("sensor-005", "warehouse-2")
+                  ]
+                  
+                  results = []
+                  
+                  for device_id, location in devices:
+                      data = generate_sensor_data(device_id, location)
+                      
+                      response = lambda_client.invoke(
+                          FunctionName=function_name,
+                          Payload=json.dumps(data)
+                      )
+                      
+                      if response['StatusCode'] == 200:
+                          results.append(f"✅ Generated data for {device_id}")
+                      else:
+                          results.append(f"❌ Failed to generate data for {device_id}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Sample data generation completed',
+                          'results': results
+                      })
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'message': 'Failed to generate sample data'
+                      })
+                  }
+
+          def generate_sensor_data(device_id, location):
+              """Generate realistic sensor data"""
+              base_temp = 22.0
+              base_humidity = 50.0
+              base_pressure = 1013.25
+              
+              return {
+                  "device_id": device_id,
+                  "location": location,
+                  "timestamp": datetime.now(timezone.utc).isoformat(),
+                  "device_type": "environmental_sensor",
+                  "manufacturer": "AcmeSensors",
+                  "sensors": {
+                      "temperature": round(base_temp + random.uniform(-5, 8), 2),
+                      "humidity": round(base_humidity + random.uniform(-10, 20), 2),
+                      "pressure": round(base_pressure + random.uniform(-50, 50), 2),
+                      "vibration": round(random.uniform(0.01, 0.1), 3)
+                  }
+              }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-data-generator'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Outputs:
+  # ==================== TIMESTREAM OUTPUTS ====================
+  
+  TimestreamDatabaseName:
+    Description: 'Name of the created Timestream database'
+    Value: !Ref TimestreamDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-TimestreamDatabase'
+
+  TimestreamDatabaseArn:
+    Description: 'ARN of the created Timestream database'
+    Value: !GetAtt TimestreamDatabase.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TimestreamDatabaseArn'
+
+  TimestreamTableName:
+    Description: 'Name of the created Timestream table'
+    Value: !Ref TableName
+    Export:
+      Name: !Sub '${AWS::StackName}-TimestreamTable'
+
+  TimestreamTableArn:
+    Description: 'ARN of the created Timestream table'
+    Value: !GetAtt TimestreamTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TimestreamTableArn'
+
+  # ==================== LAMBDA OUTPUTS ====================
+
+  DataIngestionLambdaArn:
+    Description: 'ARN of the data ingestion Lambda function'
+    Value: !GetAtt DataIngestionLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataIngestionLambdaArn'
+
+  DataIngestionLambdaName:
+    Description: 'Name of the data ingestion Lambda function'
+    Value: !Ref DataIngestionLambda
+    Export:
+      Name: !Sub '${AWS::StackName}-DataIngestionLambdaName'
+
+  DataGeneratorLambdaArn:
+    Description: 'ARN of the data generator Lambda function'
+    Value: !GetAtt DataGeneratorLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataGeneratorLambdaArn'
+
+  # ==================== IOT OUTPUTS ====================
+
+  IoTRuleArn:
+    Description: 'ARN of the IoT Core rule for Timestream integration'
+    Value: !GetAtt IoTTimestreamRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTRuleArn'
+
+  IoTTopicName:
+    Description: 'MQTT topic name for publishing sensor data'
+    Value: !Ref IoTTopicName
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTTopicName'
+
+  # ==================== MONITORING OUTPUTS ====================
+
+  CloudWatchAlarmsEnabled:
+    Description: 'Indicates whether CloudWatch alarms are enabled'
+    Value: !Ref EnableCloudWatchAlarms
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchAlarmsEnabled'
+
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for alerts (if CloudWatch alarms are enabled)'
+    Value: !If [CreateCloudWatchAlarms, !Ref TimestreamAlertsSnsTopic, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  # ==================== SAMPLE QUERIES ====================
+
+  SampleQueryLatestReadings:
+    Description: 'Sample SQL query to get latest sensor readings'
+    Value: !Sub |
+      SELECT device_id, location, measure_name, measure_value::double, time
+      FROM "${TimestreamDatabase}"."${TableName}"
+      WHERE time >= ago(1h)
+      ORDER BY time DESC
+      LIMIT 20
+
+  SampleQueryTemperatureTrends:
+    Description: 'Sample SQL query for temperature trend analysis'
+    Value: !Sub |
+      SELECT device_id, 
+             bin(time, 10m) as time_bucket,
+             AVG(measure_value::double) as avg_temperature,
+             MIN(measure_value::double) as min_temperature,
+             MAX(measure_value::double) as max_temperature
+      FROM "${TimestreamDatabase}"."${TableName}"
+      WHERE measure_name = 'temperature'
+        AND time >= ago(1d)
+      GROUP BY device_id, bin(time, 10m)
+      ORDER BY time_bucket DESC
+
+  # ==================== TESTING INSTRUCTIONS ====================
+
+  TestingInstructions:
+    Description: 'Instructions for testing the time-series data solution'
+    Value: !Sub |
+      1. Invoke data generator: aws lambda invoke --function-name ${DataGeneratorLambda} response.json
+      2. Publish to IoT topic: aws iot-data publish --topic "${IoTTopicName}" --payload '{"device_id":"test-001","location":"test","temperature":25.5}'
+      3. Query data: aws timestream-query query --query-string "SELECT * FROM \"${TimestreamDatabase}\".\"${TableName}\" ORDER BY time DESC LIMIT 10"
+      4. Monitor CloudWatch metrics: AWS Console > CloudWatch > Metrics > AWS/Timestream
+
+  # ==================== CLEANUP INSTRUCTIONS ====================
+
+  CleanupInstructions:
+    Description: 'Instructions for cleaning up resources to avoid ongoing charges'
+    Value: !Sub |
+      1. Delete CloudFormation stack: aws cloudformation delete-stack --stack-name ${AWS::StackName}
+      2. Verify all resources are deleted in the AWS Console
+      3. Check for any remaining CloudWatch log groups and delete manually if needed
+      4. Monitor billing dashboard to ensure charges have stopped

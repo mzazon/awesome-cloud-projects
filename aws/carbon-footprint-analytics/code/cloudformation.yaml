@@ -1,0 +1,861 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Intelligent Sustainability Dashboards with AWS Customer Carbon Footprint Tool and QuickSight - Creates comprehensive sustainability analytics platform for tracking carbon emissions and cost optimization opportunities'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Basic Configuration"
+        Parameters:
+          - Environment
+          - ResourcePrefix
+      - Label:
+          default: "Data Processing Configuration"
+        Parameters:
+          - LambdaMemorySize
+          - LambdaTimeout
+          - DataRetentionDays
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - NotificationEmail
+          - EnableDetailedMonitoring
+      - Label:
+          default: "QuickSight Configuration"
+        Parameters:
+          - QuickSightUserArn
+          - EnableQuickSightIntegration
+    ParameterLabels:
+      Environment:
+        default: "Deployment Environment"
+      ResourcePrefix:
+        default: "Resource Naming Prefix"
+      LambdaMemorySize:
+        default: "Lambda Function Memory (MB)"
+      LambdaTimeout:
+        default: "Lambda Function Timeout (seconds)"
+      NotificationEmail:
+        default: "Email for Sustainability Alerts"
+
+Parameters:
+  Environment:
+    Description: 'Environment name for resource tagging and naming (dev, staging, prod)'
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    ConstraintDescription: 'Must be dev, staging, or prod'
+
+  ResourcePrefix:
+    Description: 'Prefix for all resource names to ensure uniqueness'
+    Type: String
+    Default: 'sustainability'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z][a-z0-9-]*$'
+    ConstraintDescription: 'Must start with lowercase letter, contain only lowercase letters, numbers, and hyphens'
+
+  LambdaMemorySize:
+    Description: 'Memory size for the Lambda data processing function'
+    Type: Number
+    Default: 512
+    MinValue: 128
+    MaxValue: 3008
+    ConstraintDescription: 'Must be between 128 and 3008 MB'
+
+  LambdaTimeout:
+    Description: 'Timeout for the Lambda data processing function in seconds'
+    Type: Number
+    Default: 300
+    MinValue: 30
+    MaxValue: 900
+    ConstraintDescription: 'Must be between 30 and 900 seconds'
+
+  DataRetentionDays:
+    Description: 'Number of days to retain sustainability analytics data in S3'
+    Type: Number
+    Default: 2555  # ~7 years for compliance
+    MinValue: 30
+    MaxValue: 3650
+    ConstraintDescription: 'Must be between 30 and 3650 days'
+
+  NotificationEmail:
+    Description: 'Email address for sustainability monitoring alerts (optional)'
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+  EnableDetailedMonitoring:
+    Description: 'Enable detailed CloudWatch monitoring and custom metrics'
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  QuickSightUserArn:
+    Description: 'QuickSight user ARN for dashboard permissions (optional - requires existing QuickSight account)'
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:aws:quicksight:[a-z0-9-]+:[0-9]+:user/[a-zA-Z0-9/_+=,.@-]+$'
+    ConstraintDescription: 'Must be a valid QuickSight user ARN or empty'
+
+  EnableQuickSightIntegration:
+    Description: 'Create QuickSight data source and manifest files'
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  EnableDetailedMonitoringCondition: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  HasQuickSightUser: !Not [!Equals [!Ref QuickSightUserArn, '']]
+  EnableQuickSightCondition: !Equals [!Ref EnableQuickSightIntegration, 'true']
+  CreateQuickSightResources: !And [!Condition EnableQuickSightCondition, !Condition HasQuickSightUser]
+
+Resources:
+  # S3 Data Lake for Sustainability Analytics
+  SustainabilityDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ResourcePrefix}-analytics-${Environment}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: SustainabilityDataRetention
+            Status: Enabled
+            ExpirationInDays: !Ref DataRetentionDays
+            NoncurrentVersionExpirationInDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: IntelligentTiering
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 180
+                StorageClass: DEEP_ARCHIVE
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: SustainabilityAnalytics
+        - Key: DataType
+          Value: CarbonFootprintAndCostData
+
+  # S3 Bucket Policy for Lambda Access
+  SustainabilityDataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SustainabilityDataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowLambdaAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt SustainabilityAnalyticsRole.Arn
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:ListBucket
+            Resource:
+              - !Sub '${SustainabilityDataBucket}/*'
+              - !Sub '${SustainabilityDataBucket}'
+          - Sid: AllowQuickSightAccess
+            Effect: Allow
+            Principal:
+              Service: quicksight.amazonaws.com
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !Sub '${SustainabilityDataBucket}/*'
+              - !Sub '${SustainabilityDataBucket}'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+
+  # IAM Role for Lambda Function
+  SustainabilityAnalyticsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-analytics-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SustainabilityAnalyticsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ce:GetCostAndUsage
+                  - ce:GetUsageForecast
+                  - ce:GetCostCategories
+                  - ce:GetDimensionValues
+                  - ce:GetRightsizingRecommendation
+                  - ce:ListCostCategoryDefinitions
+                  - ce:GetReservationCoverage
+                  - ce:GetReservationPurchaseRecommendation
+                  - ce:GetReservationUtilization
+                  - ce:GetSavingsPlansUtilization
+                  - ce:GetSavingsPlansUtilizationDetails
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cur:DescribeReportDefinitions
+                  - cur:GetClassicReport
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${SustainabilityDataBucket}/*'
+                  - !Sub '${SustainabilityDataBucket}'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - quicksight:CreateDataSet
+                  - quicksight:UpdateDataSet
+                  - quicksight:CreateDashboard
+                  - quicksight:UpdateDashboard
+                  - quicksight:DescribeDataSet
+                  - quicksight:CreateDataSource
+                  - quicksight:UpdateDataSource
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'aws:RequestedRegion': !Ref AWS::Region
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: SustainabilityAnalytics
+
+  # Lambda Function for Data Processing
+  SustainabilityDataProcessor:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-data-processor-${Environment}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt SustainabilityAnalyticsRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref SustainabilityDataBucket
+          ENVIRONMENT: !Ref Environment
+          AWS_REGION: !Ref AWS::Region
+          DETAILED_MONITORING: !Ref EnableDetailedMonitoring
+      ReservedConcurrencyLimit: 5
+      DeadLetterQueue:
+        TargetArn: !GetAtt ProcessingDeadLetterQueue.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          import logging
+          from decimal import Decimal
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Process sustainability and cost data to create integrated analytics.
+              AWS Customer Carbon Footprint Tool data is retrieved monthly with a 3-month delay.
+              This function correlates cost data with carbon footprint insights.
+              """
+              
+              try:
+                  # Initialize AWS clients
+                  ce_client = boto3.client('ce')
+                  s3_client = boto3.client('s3')
+                  cloudwatch = boto3.client('cloudwatch')
+                  
+                  # Get environment variables
+                  bucket_name = event.get('bucket_name', os.environ.get('BUCKET_NAME'))
+                  environment = os.environ.get('ENVIRONMENT', 'dev')
+                  detailed_monitoring = os.environ.get('DETAILED_MONITORING', 'false').lower() == 'true'
+                  
+                  # Calculate date range (last 6 months for comprehensive analysis)
+                  end_date = datetime.now()
+                  start_date = end_date - timedelta(days=180)
+                  
+                  logger.info(f"Processing sustainability data from {start_date.date()} to {end_date.date()}")
+                  
+                  # Fetch cost data from Cost Explorer with service and region grouping
+                  try:
+                      cost_response = ce_client.get_cost_and_usage(
+                          TimePeriod={
+                              'Start': start_date.strftime('%Y-%m-%d'),
+                              'End': end_date.strftime('%Y-%m-%d')
+                          },
+                          Granularity='MONTHLY',
+                          Metrics=['UnblendedCost', 'UsageQuantity'],
+                          GroupBy=[
+                              {'Type': 'DIMENSION', 'Key': 'SERVICE'},
+                              {'Type': 'DIMENSION', 'Key': 'REGION'}
+                          ]
+                      )
+                  except Exception as ce_error:
+                      logger.warning(f"Cost Explorer API error: {str(ce_error)}")
+                      cost_response = {'ResultsByTime': []}
+                  
+                  # Get cost optimization recommendations
+                  try:
+                      rightsizing_response = ce_client.get_rightsizing_recommendation(
+                          Service='AmazonEC2',
+                          Configuration={
+                              'BenefitsConsidered': True,
+                              'RecommendationTarget': 'CROSS_INSTANCE_FAMILY'
+                          }
+                      )
+                  except Exception as rs_error:
+                      logger.warning(f"Rightsizing API error: {str(rs_error)}")
+                      rightsizing_response = {'RightsizingRecommendations': []}
+                  
+                  # Calculate sustainability metrics
+                  total_cost = Decimal('0')
+                  service_count = set()
+                  region_count = set()
+                  
+                  for result in cost_response.get('ResultsByTime', []):
+                      for group in result.get('Groups', []):
+                          cost_str = group.get('Metrics', {}).get('UnblendedCost', {}).get('Amount', '0')
+                          total_cost += Decimal(cost_str)
+                          
+                          if len(group.get('Keys', [])) >= 2:
+                              service_count.add(group['Keys'][0])
+                              region_count.add(group['Keys'][1])
+                  
+                  # Process cost data for sustainability correlation
+                  processed_data = {
+                      'timestamp': datetime.now().isoformat(),
+                      'data_collection_metadata': {
+                          'environment': environment,
+                          'aws_region': os.environ.get('AWS_DEFAULT_REGION', 'us-east-1'),
+                          'processing_date': datetime.now().isoformat(),
+                          'analysis_period_days': 180,
+                          'data_source': 'AWS Cost Explorer API',
+                          'function_name': context.function_name,
+                          'request_id': context.aws_request_id
+                      },
+                      'cost_data': cost_response.get('ResultsByTime', []),
+                      'optimization_recommendations': rightsizing_response,
+                      'sustainability_metrics': {
+                          'total_cost_analyzed': float(total_cost),
+                          'cost_optimization_opportunities': len(rightsizing_response.get('RightsizingRecommendations', [])),
+                          'unique_services_count': len(service_count),
+                          'unique_regions_count': len(region_count),
+                          'carbon_footprint_notes': 'AWS Customer Carbon Footprint Tool data available with 3-month delay via billing console',
+                          'sustainability_recommendations': {
+                              'consider_region_optimization': len(region_count) > 5,
+                              'evaluate_unused_resources': len(rightsizing_response.get('RightsizingRecommendations', [])) > 0,
+                              'implement_intelligent_tiering': True
+                          }
+                      },
+                      'carbon_correlation_insights': {
+                          'high_carbon_regions': ['us-east-1', 'us-west-1'],  # Example regions with higher carbon intensity
+                          'low_carbon_regions': ['eu-north-1', 'ca-central-1'],  # Example regions with lower carbon intensity
+                          'optimization_potential': 'Move workloads to low-carbon regions when possible'
+                      }
+                  }
+                  
+                  # Save processed data to S3 with date partitioning
+                  s3_key = f"sustainability-analytics/{datetime.now().strftime('%Y/%m/%d')}/processed_data_{datetime.now().strftime('%H%M%S')}.json"
+                  
+                  s3_client.put_object(
+                      Bucket=bucket_name,
+                      Key=s3_key,
+                      Body=json.dumps(processed_data, default=str, indent=2),
+                      ContentType='application/json',
+                      Metadata={
+                          'processing-date': datetime.now().isoformat(),
+                          'data-type': 'sustainability-analytics',
+                          'environment': environment
+                      },
+                      ServerSideEncryption='AES256'
+                  )
+                  
+                  # Send custom metrics to CloudWatch if detailed monitoring is enabled
+                  if detailed_monitoring:
+                      metric_data = [
+                          {
+                              'MetricName': 'DataProcessingSuccess',
+                              'Value': 1,
+                              'Unit': 'Count',
+                              'Dimensions': [
+                                  {'Name': 'Environment', 'Value': environment},
+                                  {'Name': 'FunctionName', 'Value': context.function_name}
+                              ]
+                          },
+                          {
+                              'MetricName': 'TotalCostAnalyzed',
+                              'Value': float(total_cost),
+                              'Unit': 'None',
+                              'Dimensions': [
+                                  {'Name': 'Environment', 'Value': environment}
+                              ]
+                          },
+                          {
+                              'MetricName': 'OptimizationOpportunities',
+                              'Value': len(rightsizing_response.get('RightsizingRecommendations', [])),
+                              'Unit': 'Count',
+                              'Dimensions': [
+                                  {'Name': 'Environment', 'Value': environment}
+                              ]
+                          }
+                      ]
+                      
+                      cloudwatch.put_metric_data(
+                          Namespace='SustainabilityAnalytics',
+                          MetricData=metric_data
+                      )
+                  
+                  logger.info(f"Successfully processed sustainability data and saved to {s3_key}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Sustainability data processed successfully',
+                          's3_location': f's3://{bucket_name}/{s3_key}',
+                          'metrics': processed_data['sustainability_metrics'],
+                          'processing_metadata': {
+                              'request_id': context.aws_request_id,
+                              'remaining_time': context.get_remaining_time_in_millis()
+                          }
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing sustainability data: {str(e)}")
+                  
+                  # Send error metric to CloudWatch
+                  try:
+                      cloudwatch = boto3.client('cloudwatch')
+                      cloudwatch.put_metric_data(
+                          Namespace='SustainabilityAnalytics',
+                          MetricData=[
+                              {
+                                  'MetricName': 'DataProcessingError',
+                                  'Value': 1,
+                                  'Unit': 'Count',
+                                  'Dimensions': [
+                                      {'Name': 'Environment', 'Value': os.environ.get('ENVIRONMENT', 'unknown')},
+                                      {'Name': 'ErrorType', 'Value': type(e).__name__}
+                                  ]
+                              }
+                          ]
+                      )
+                  except Exception as cw_error:
+                      logger.error(f"Error sending CloudWatch metric: {str(cw_error)}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'request_id': context.aws_request_id if context else 'unknown'
+                      })
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: SustainabilityAnalytics
+
+  # Dead Letter Queue for Failed Processing
+  ProcessingDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ResourcePrefix}-dlq-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: DeadLetterQueue
+
+  # EventBridge Rule for Scheduled Data Collection
+  SustainabilityDataCollectionRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ResourcePrefix}-data-collection-${Environment}'
+      Description: 'Monthly sustainability data collection and processing'
+      ScheduleExpression: 'rate(30 days)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SustainabilityDataProcessor.Arn
+          Id: 'SustainabilityDataProcessorTarget'
+          Input: !Sub |
+            {
+              "bucket_name": "${SustainabilityDataBucket}",
+              "trigger_source": "eventbridge",
+              "environment": "${Environment}"
+            }
+
+  # Permission for EventBridge to invoke Lambda
+  EventBridgeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SustainabilityDataProcessor
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SustainabilityDataCollectionRule.Arn
+
+  # CloudWatch Log Group for Lambda
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${SustainabilityDataProcessor}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: SustainabilityAnalytics
+
+  # CloudWatch Log Group for S3 Access Logs
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ResourcePrefix}-access-logs-${Environment}'
+      RetentionInDays: 90
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: S3AccessLogs
+
+  # SNS Topic for Sustainability Alerts
+  SustainabilityAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ResourcePrefix}-alerts-${Environment}'
+      DisplayName: 'Sustainability Analytics Alerts'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: SustainabilityAlerts
+
+  # SNS Email Subscription (only if email provided)
+  SustainabilityAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref SustainabilityAlertsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Alarm for Lambda Processing Failures
+  LambdaProcessingFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-processing-failure-${Environment}'
+      AlarmDescription: 'Alert when sustainability data processing fails'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref SustainabilityAlertsTopic
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SustainabilityDataProcessor
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: SustainabilityMonitoring
+
+  # CloudWatch Alarm for Data Processing Success (Custom Metric)
+  DataProcessingSuccessAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-processing-success-${Environment}'
+      AlarmDescription: 'Monitor successful sustainability data processing'
+      MetricName: DataProcessingSuccess
+      Namespace: SustainabilityAnalytics
+      Statistic: Sum
+      Period: 86400  # 24 hours
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref SustainabilityAlertsTopic
+      Dimensions:
+        - Name: Environment
+          Value: !Ref Environment
+      TreatMissingData: breaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: SustainabilityMonitoring
+
+  # CloudWatch Dashboard for Sustainability Analytics
+  SustainabilityDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      DashboardName: !Sub '${ResourcePrefix}-sustainability-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "SustainabilityAnalytics", "DataProcessingSuccess", "Environment", "${Environment}" ],
+                  [ ".", "DataProcessingError", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Data Processing Status"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${SustainabilityDataProcessor}" ],
+                  [ ".", "Invocations", ".", "." ],
+                  [ ".", "Errors", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Performance"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "SustainabilityAnalytics", "TotalCostAnalyzed", "Environment", "${Environment}" ],
+                  [ ".", "OptimizationOpportunities", ".", "." ]
+                ],
+                "period": 3600,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Cost and Optimization Metrics"
+              }
+            }
+          ]
+        }
+
+  # QuickSight Data Source Manifest (stored in S3)
+  QuickSightManifestFile:
+    Type: AWS::S3::Object
+    Condition: EnableQuickSightCondition
+    Properties:
+      Bucket: !Ref SustainabilityDataBucket
+      Key: 'manifests/sustainability-manifest.json'
+      Body: !Sub |
+        {
+          "fileLocations": [
+            {
+              "URIPrefixes": [
+                "s3://${SustainabilityDataBucket}/sustainability-analytics/"
+              ]
+            }
+          ],
+          "globalUploadSettings": {
+            "format": "JSON",
+            "delimiter": ",",
+            "textqualifier": "\"",
+            "containsHeader": "true"
+          }
+        }
+      ContentType: application/json
+      Metadata:
+        purpose: quicksight-manifest
+        data-type: sustainability-analytics
+        environment: !Ref Environment
+
+  # QuickSight Data Source (requires existing QuickSight account)
+  QuickSightDataSource:
+    Type: AWS::QuickSight::DataSource
+    Condition: CreateQuickSightResources
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSourceId: !Sub 'sustainability-analytics-${Environment}-${AWS::AccountId}'
+      Name: !Sub 'Sustainability Analytics Data Source - ${Environment}'
+      Type: S3
+      DataSourceParameters:
+        S3Parameters:
+          ManifestFileLocation:
+            Bucket: !Ref SustainabilityDataBucket
+            Key: 'manifests/sustainability-manifest.json'
+      Permissions:
+        - Principal: !Ref QuickSightUserArn
+          Actions:
+            - quicksight:DescribeDataSource
+            - quicksight:DescribeDataSourcePermissions
+            - quicksight:PassDataSource
+            - quicksight:UpdateDataSource
+            - quicksight:DeleteDataSource
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: SustainabilityAnalytics
+
+  # Custom Resource to Trigger Initial Data Collection
+  InitialDataCollection:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt SustainabilityDataProcessor.Arn
+      InitialRun: 'true'
+      Environment: !Ref Environment
+      BucketName: !Ref SustainabilityDataBucket
+
+Outputs:
+  SustainabilityDataBucket:
+    Description: 'S3 bucket for sustainability analytics data'
+    Value: !Ref SustainabilityDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBucket'
+
+  SustainabilityDataBucketArn:
+    Description: 'ARN of the S3 bucket for sustainability analytics data'
+    Value: !GetAtt SustainabilityDataBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBucketArn'
+
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function for data processing'
+    Value: !Ref SustainabilityDataProcessor
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function for data processing'
+    Value: !GetAtt SustainabilityDataProcessor.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  IAMRoleArn:
+    Description: 'ARN of the IAM role for Lambda function'
+    Value: !GetAtt SustainabilityAnalyticsRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IAMRoleArn'
+
+  EventBridgeRuleName:
+    Description: 'Name of the EventBridge rule for scheduled data collection'
+    Value: !Ref SustainabilityDataCollectionRule
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeRule'
+
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for sustainability alerts'
+    Value: !Ref SustainabilityAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopic'
+
+  CloudWatchDashboardURL:
+    Description: 'URL to the CloudWatch dashboard (if detailed monitoring is enabled)'
+    Condition: EnableDetailedMonitoringCondition
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ResourcePrefix}-sustainability-${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  QuickSightDataSourceId:
+    Description: 'QuickSight data source ID for sustainability analytics'
+    Condition: CreateQuickSightResources
+    Value: !Ref QuickSightDataSource
+    Export:
+      Name: !Sub '${AWS::StackName}-QuickSightDataSource'
+
+  QuickSightManifestLocation:
+    Description: 'S3 location of QuickSight manifest file'
+    Condition: EnableQuickSightCondition
+    Value: !Sub 's3://${SustainabilityDataBucket}/manifests/sustainability-manifest.json'
+    Export:
+      Name: !Sub '${AWS::StackName}-QuickSightManifest'
+
+  QuickSightConsoleURL:
+    Description: 'URL to QuickSight console for dashboard creation'
+    Value: !Sub 'https://${AWS::Region}.quicksight.aws.amazon.com/'
+    Export:
+      Name: !Sub '${AWS::StackName}-QuickSightConsole'
+
+  DataProcessingSchedule:
+    Description: 'Schedule for automated data collection (EventBridge rule)'
+    Value: 'rate(30 days) - Monthly data collection aligned with AWS carbon footprint data availability'
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessingSchedule'
+
+  NextSteps:
+    Description: 'Next steps for completing the sustainability dashboard setup'
+    Value: !Sub |
+      1. Configure QuickSight account at: https://${AWS::Region}.quicksight.aws.amazon.com/
+      2. Create dataset using manifest: s3://${SustainabilityDataBucket}/manifests/sustainability-manifest.json
+      3. Build visualizations for carbon footprint trends and cost correlations
+      4. Set up email subscription to SNS topic: ${SustainabilityAlertsTopic}
+      5. Review CloudWatch dashboard: https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ResourcePrefix}-sustainability-${Environment}

@@ -1,0 +1,459 @@
+# Infrastructure Manager Configuration for Interactive Data Pipeline Prototypes
+# Recipe: Interactive Data Pipeline Prototypes with Cloud Data Fusion and Colab Enterprise
+# Services: Cloud Data Fusion, Colab Enterprise, BigQuery, Cloud Storage
+# Estimated Time: 120 minutes
+
+metadata:
+  name: interactive-data-pipeline-prototypes
+  description: "Infrastructure for building interactive data pipeline prototypes using Cloud Data Fusion and Colab Enterprise"
+  labels:
+    environment: development
+    recipe-id: f7e9c4a1
+    category: analytics
+    difficulty: "200"
+
+# Input parameters for customization
+inputs:
+  - name: project_id
+    description: "Google Cloud Project ID"
+    type: string
+    required: true
+  
+  - name: region
+    description: "Primary region for resources"
+    type: string
+    default: "us-central1"
+  
+  - name: zone
+    description: "Primary zone for compute resources"
+    type: string
+    default: "us-central1-a"
+  
+  - name: random_suffix
+    description: "Random suffix for unique resource naming"
+    type: string
+    default: "abc123"
+  
+  - name: enable_deletion_protection
+    description: "Enable deletion protection for critical resources"
+    type: bool
+    default: false
+
+# Resource definitions
+resources:
+  # Enable required APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      parent: projects/$(ref.project_id.value)
+      consumerId: projects/$(ref.project_id.value)
+      serviceName: datafusion.googleapis.com
+    metadata:
+      dependsOn:
+        - project_id
+  
+  - name: enable-notebooks-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      parent: projects/$(ref.project_id.value)
+      consumerId: projects/$(ref.project_id.value)
+      serviceName: notebooks.googleapis.com
+    metadata:
+      dependsOn:
+        - project_id
+  
+  - name: enable-bigquery-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      parent: projects/$(ref.project_id.value)
+      consumerId: projects/$(ref.project_id.value)
+      serviceName: bigquery.googleapis.com
+    metadata:
+      dependsOn:
+        - project_id
+  
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      parent: projects/$(ref.project_id.value)
+      consumerId: projects/$(ref.project_id.value)
+      serviceName: storage.googleapis.com
+    metadata:
+      dependsOn:
+        - project_id
+  
+  - name: enable-compute-api
+    type: gcp-types/serviceusage-v1:projects.services
+    properties:
+      parent: projects/$(ref.project_id.value)
+      consumerId: projects/$(ref.project_id.value)
+      serviceName: compute.googleapis.com
+    metadata:
+      dependsOn:
+        - project_id
+
+  # Cloud Storage Buckets for Data Lake
+  - name: pipeline-data-bucket
+    type: gcp-types/storage-v1:bucket
+    properties:
+      name: pipeline-data-$(ref.random_suffix.value)
+      project: $(ref.project_id.value)
+      location: $(ref.region.value)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      uniformBucketLevelAccess:
+        enabled: true
+      publicAccessPrevention: enforced
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90
+              isLive: false
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+              isLive: true
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # Staging bucket for pipeline artifacts
+  - name: pipeline-staging-bucket
+    type: gcp-types/storage-v1:bucket
+    properties:
+      name: pipeline-data-$(ref.random_suffix.value)-staging
+      project: $(ref.project_id.value)
+      location: $(ref.region.value)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      uniformBucketLevelAccess:
+        enabled: true
+      publicAccessPrevention: enforced
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # BigQuery Dataset for Analytics
+  - name: pipeline-analytics-dataset
+    type: gcp-types/bigquery-v2:dataset
+    properties:
+      datasetId: pipeline_analytics_$(ref.random_suffix.value)
+      projectId: $(ref.project_id.value)
+      location: $(ref.region.value)
+      description: "Analytics dataset for pipeline prototyping and development"
+      defaultTableExpirationMs: 7776000000  # 90 days
+      access:
+        - role: OWNER
+          userByEmail: $(ref.project_id.value)@appspot.gserviceaccount.com
+        - role: READER
+          specialGroup: projectReaders
+        - role: WRITER
+          specialGroup: projectWriters
+      labels:
+        environment: development
+        purpose: pipeline-analytics
+    metadata:
+      dependsOn:
+        - enable-bigquery-api
+
+  # Customer transactions table schema
+  - name: customer-transactions-table
+    type: gcp-types/bigquery-v2:table
+    properties:
+      projectId: $(ref.project_id.value)
+      datasetId: $(ref.pipeline-analytics-dataset.datasetId)
+      tableId: customer_transactions
+      description: "Table for storing joined customer and transaction data from pipeline"
+      schema:
+        fields:
+          - name: customer_id
+            type: INTEGER
+            mode: REQUIRED
+            description: "Unique customer identifier"
+          - name: name
+            type: STRING
+            mode: REQUIRED
+            description: "Customer name"
+          - name: email
+            type: STRING
+            mode: REQUIRED
+            description: "Customer email address"
+          - name: signup_date
+            type: STRING
+            mode: REQUIRED
+            description: "Customer signup date"
+          - name: region
+            type: STRING
+            mode: REQUIRED
+            description: "Customer region"
+          - name: transaction_id
+            type: STRING
+            mode: REQUIRED
+            description: "Unique transaction identifier"
+          - name: amount
+            type: FLOAT
+            mode: REQUIRED
+            description: "Transaction amount"
+          - name: timestamp
+            type: STRING
+            mode: REQUIRED
+            description: "Transaction timestamp"
+          - name: product
+            type: STRING
+            mode: REQUIRED
+            description: "Product purchased"
+      timePartitioning:
+        type: DAY
+        field: timestamp
+      clustering:
+        fields:
+          - customer_id
+          - region
+      labels:
+        source: pipeline
+        type: fact-table
+    metadata:
+      dependsOn:
+        - pipeline-analytics-dataset
+
+  # Service Account for Data Fusion and Colab Enterprise
+  - name: pipeline-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: pipeline-sa-$(ref.random_suffix.value)
+      projectId: $(ref.project_id.value)
+      displayName: "Service Account for Pipeline Development"
+      description: "Service account with permissions for Data Fusion, Colab Enterprise, BigQuery, and Cloud Storage"
+
+  # IAM Bindings for Service Account
+  - name: pipeline-sa-datafusion-admin
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: $(ref.project_id.value)
+      policy:
+        bindings:
+          - role: roles/datafusion.admin
+            members:
+              - serviceAccount:$(ref.pipeline-service-account.email)
+    metadata:
+      dependsOn:
+        - pipeline-service-account
+
+  - name: pipeline-sa-bigquery-admin
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: $(ref.project_id.value)
+      policy:
+        bindings:
+          - role: roles/bigquery.admin
+            members:
+              - serviceAccount:$(ref.pipeline-service-account.email)
+    metadata:
+      dependsOn:
+        - pipeline-service-account
+
+  - name: pipeline-sa-storage-admin
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: $(ref.project_id.value)
+      policy:
+        bindings:
+          - role: roles/storage.admin
+            members:
+              - serviceAccount:$(ref.pipeline-service-account.email)
+    metadata:
+      dependsOn:
+        - pipeline-service-account
+
+  - name: pipeline-sa-notebooks-admin
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    properties:
+      resource: $(ref.project_id.value)
+      policy:
+        bindings:
+          - role: roles/notebooks.admin
+            members:
+              - serviceAccount:$(ref.pipeline-service-account.email)
+    metadata:
+      dependsOn:
+        - pipeline-service-account
+
+  # Cloud Data Fusion Instance (Developer Edition)
+  - name: data-fusion-instance
+    type: gcp-types/datafusion-v1:projects.locations.instances
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      instanceId: data-fusion-$(ref.random_suffix.value)
+      instance:
+        type: DEVELOPER
+        displayName: "Interactive Pipeline Development Instance"
+        description: "Cloud Data Fusion instance for interactive pipeline development and prototyping"
+        enableStackdriverLogging: true
+        enableStackdriverMonitoring: true
+        dataprocServiceAccount: $(ref.pipeline-service-account.email)
+        options:
+          ENABLE_STACKDRIVER_LOGGING: "true"
+          ENABLE_STACKDRIVER_MONITORING: "true"
+        labels:
+          environment: development
+          purpose: pipeline-prototyping
+    metadata:
+      dependsOn:
+        - enable-apis
+        - pipeline-service-account
+        - pipeline-sa-datafusion-admin
+
+  # Colab Enterprise Runtime Template Configuration
+  # Note: Colab Enterprise instances are created through the UI or programmatically
+  # This provides the configuration structure for reference
+  - name: colab-runtime-config
+    type: gcp-types/compute-v1:instanceTemplate
+    properties:
+      name: colab-runtime-template-$(ref.random_suffix.value)
+      project: $(ref.project_id.value)
+      description: "Instance template for Colab Enterprise runtime configuration"
+      properties:
+        machineType: n1-standard-4
+        disks:
+          - boot: true
+            autoDelete: true
+            initializeParams:
+              sourceImage: projects/deeplearning-platform-release/global/images/family/common-cpu-notebooks
+              diskSizeGb: "100"
+              diskType: pd-standard
+        networkInterfaces:
+          - network: projects/$(ref.project_id.value)/global/networks/default
+            accessConfigs:
+              - name: External NAT
+                type: ONE_TO_ONE_NAT
+        serviceAccounts:
+          - email: $(ref.pipeline-service-account.email)
+            scopes:
+              - https://www.googleapis.com/auth/cloud-platform
+        metadata:
+          items:
+            - key: framework
+              value: TensorFlow
+            - key: install-nvidia-driver
+              value: "True"
+            - key: enable-oslogin
+              value: "TRUE"
+        tags:
+          items:
+            - colab-enterprise
+            - pipeline-development
+        labels:
+          environment: development
+          purpose: notebook-runtime
+    metadata:
+      dependsOn:
+        - enable-compute-api
+        - pipeline-service-account
+
+  # VPC Firewall Rules for Secure Access
+  - name: allow-notebook-access
+    type: gcp-types/compute-v1:firewall
+    properties:
+      name: allow-notebook-access-$(ref.random_suffix.value)
+      project: $(ref.project_id.value)
+      description: "Allow secure access to notebook instances"
+      network: projects/$(ref.project_id.value)/global/networks/default
+      direction: INGRESS
+      priority: 1000
+      sourceRanges:
+        - 0.0.0.0/0
+      targetTags:
+        - colab-enterprise
+      allowed:
+        - IPProtocol: tcp
+          ports:
+            - "8080"
+            - "8888"
+            - "443"
+    metadata:
+      dependsOn:
+        - enable-compute-api
+
+# Outputs for reference and integration
+outputs:
+  - name: data_fusion_instance_name
+    description: "Name of the created Data Fusion instance"
+    value: $(ref.data-fusion-instance.name)
+  
+  - name: data_fusion_api_endpoint
+    description: "API endpoint for the Data Fusion instance"
+    value: $(ref.data-fusion-instance.apiEndpoint)
+  
+  - name: pipeline_data_bucket
+    description: "Name of the primary data bucket"
+    value: $(ref.pipeline-data-bucket.name)
+  
+  - name: pipeline_staging_bucket
+    description: "Name of the staging bucket"
+    value: $(ref.pipeline-staging-bucket.name)
+  
+  - name: bigquery_dataset_id
+    description: "BigQuery dataset ID for analytics"
+    value: $(ref.pipeline-analytics-dataset.datasetId)
+  
+  - name: service_account_email
+    description: "Email of the service account for pipeline operations"
+    value: $(ref.pipeline-service-account.email)
+  
+  - name: colab_runtime_template
+    description: "Instance template name for Colab Enterprise runtime"
+    value: $(ref.colab-runtime-config.name)
+  
+  - name: project_id
+    description: "Google Cloud Project ID"
+    value: $(ref.project_id.value)
+  
+  - name: region
+    description: "Primary region for resources"
+    value: $(ref.region.value)
+
+# Deployment instructions and notes
+deployment:
+  description: |
+    This Infrastructure Manager configuration deploys a complete environment for 
+    interactive data pipeline prototyping using Cloud Data Fusion and Colab Enterprise.
+    
+    The deployment includes:
+    - Cloud Data Fusion Developer instance for visual pipeline development
+    - Cloud Storage buckets for data lake and staging
+    - BigQuery dataset and tables for analytics
+    - Service account with appropriate permissions
+    - Instance template for Colab Enterprise runtime configuration
+    - Security configurations and firewall rules
+    
+    After deployment, users can:
+    1. Access Cloud Data Fusion UI for visual pipeline development
+    2. Create Colab Enterprise notebooks for interactive data exploration
+    3. Use BigQuery for analytics and validation
+    4. Store and process data through Cloud Storage
+    
+    Estimated deployment time: 15-20 minutes
+    Estimated monthly cost: $150-300 (depending on usage patterns)
+  
+  prerequisites:
+    - Google Cloud Project with billing enabled
+    - Project Owner or Editor permissions
+    - APIs enabled: Data Fusion, Notebooks, BigQuery, Storage, Compute
+  
+  post_deployment:
+    - Configure Colab Enterprise through Google Cloud Console
+    - Upload sample data to Cloud Storage buckets
+    - Create and test initial pipeline templates
+    - Set up monitoring and alerting for production usage

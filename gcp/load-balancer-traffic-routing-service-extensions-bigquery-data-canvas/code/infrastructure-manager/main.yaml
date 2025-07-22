@@ -1,0 +1,788 @@
+# Infrastructure Manager Configuration for Load Balancer Traffic Routing
+# with Service Extensions and BigQuery Data Canvas
+#
+# This configuration deploys an intelligent traffic routing system using:
+# - Application Load Balancer with Service Extensions
+# - Cloud Run services as backend targets
+# - BigQuery Data Canvas for AI-powered analytics
+# - Cloud Functions for intelligent routing logic
+# - Cloud Workflows for automated analytics
+
+# Define input variables for customization
+inputs:
+  - name: project_id
+    description: "Google Cloud Project ID"
+    type: string
+    required: true
+  
+  - name: region
+    description: "Primary region for deployments"
+    type: string
+    default: "us-central1"
+  
+  - name: zone
+    description: "Primary zone for deployments"
+    type: string
+    default: "us-central1-a"
+  
+  - name: random_suffix
+    description: "Random suffix for unique resource names"
+    type: string
+    default: "{{ rand.AlphaNum 6 | lower }}"
+  
+  - name: dataset_name
+    description: "BigQuery dataset name for traffic analytics"
+    type: string
+    default: "traffic_analytics"
+  
+  - name: extension_name
+    description: "Service Extension name for intelligent routing"
+    type: string
+    default: "intelligent-router"
+
+# Define resource deployments
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ $.inputs.project_id }}/services/compute.googleapis.com
+      consumerId: project:{{ $.inputs.project_id }}
+
+  - name: enable-run-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ $.inputs.project_id }}/services/run.googleapis.com
+      consumerId: project:{{ $.inputs.project_id }}
+
+  - name: enable-bigquery-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ $.inputs.project_id }}/services/bigquery.googleapis.com
+      consumerId: project:{{ $.inputs.project_id }}
+
+  - name: enable-logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ $.inputs.project_id }}/services/logging.googleapis.com
+      consumerId: project:{{ $.inputs.project_id }}
+
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ $.inputs.project_id }}/services/monitoring.googleapis.com
+      consumerId: project:{{ $.inputs.project_id }}
+
+  - name: enable-service-extensions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ $.inputs.project_id }}/services/serviceextensions.googleapis.com
+      consumerId: project:{{ $.inputs.project_id }}
+
+  - name: enable-workflows-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ $.inputs.project_id }}/services/workflows.googleapis.com
+      consumerId: project:{{ $.inputs.project_id }}
+
+  - name: enable-cloudfunctions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ $.inputs.project_id }}/services/cloudfunctions.googleapis.com
+      consumerId: project:{{ $.inputs.project_id }}
+
+  # BigQuery Dataset and Tables for Traffic Analytics
+  - name: traffic-analytics-dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      datasetReference:
+        datasetId: {{ $.inputs.dataset_name }}_{{ $.inputs.random_suffix }}
+        projectId: {{ $.inputs.project_id }}
+      location: {{ $.inputs.region }}
+      description: "Traffic analytics for intelligent routing system"
+      defaultTableExpirationMs: "2592000000"  # 30 days
+      access:
+        - role: OWNER
+          userByEmail: "{{ gcp.project.service_account_email }}"
+        - role: READER
+          specialGroup: projectReaders
+        - role: WRITER
+          specialGroup: projectWriters
+    metadata:
+      dependsOn:
+        - enable-bigquery-api
+
+  # Load Balancer Metrics Table
+  - name: lb-metrics-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      datasetId: {{ $.inputs.dataset_name }}_{{ $.inputs.random_suffix }}
+      projectId: {{ $.inputs.project_id }}
+      tableReference:
+        tableId: lb_metrics
+        datasetId: {{ $.inputs.dataset_name }}_{{ $.inputs.random_suffix }}
+        projectId: {{ $.inputs.project_id }}
+      schema:
+        fields:
+          - name: timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "Request timestamp"
+          - name: request_id
+            type: STRING
+            mode: REQUIRED
+            description: "Unique request identifier"
+          - name: source_ip
+            type: STRING
+            mode: NULLABLE
+            description: "Client source IP address"
+          - name: target_service
+            type: STRING
+            mode: REQUIRED
+            description: "Target backend service"
+          - name: response_time
+            type: FLOAT
+            mode: NULLABLE
+            description: "Response time in seconds"
+          - name: status_code
+            type: INTEGER
+            mode: NULLABLE
+            description: "HTTP status code"
+          - name: user_agent
+            type: STRING
+            mode: NULLABLE
+            description: "Client user agent"
+          - name: request_size
+            type: INTEGER
+            mode: NULLABLE
+            description: "Request size in bytes"
+          - name: response_size
+            type: INTEGER
+            mode: NULLABLE
+            description: "Response size in bytes"
+      description: "Load balancer traffic metrics for analytics"
+    metadata:
+      dependsOn:
+        - traffic-analytics-dataset
+
+  # Routing Decisions Table
+  - name: routing-decisions-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      datasetId: {{ $.inputs.dataset_name }}_{{ $.inputs.random_suffix }}
+      projectId: {{ $.inputs.project_id }}
+      tableReference:
+        tableId: routing_decisions
+        datasetId: {{ $.inputs.dataset_name }}_{{ $.inputs.random_suffix }}
+        projectId: {{ $.inputs.project_id }}
+      schema:
+        fields:
+          - name: timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "Decision timestamp"
+          - name: decision_id
+            type: STRING
+            mode: REQUIRED
+            description: "Unique decision identifier"
+          - name: source_criteria
+            type: STRING
+            mode: NULLABLE
+            description: "Decision input criteria"
+          - name: target_service
+            type: STRING
+            mode: REQUIRED
+            description: "Selected target service"
+          - name: confidence_score
+            type: FLOAT
+            mode: NULLABLE
+            description: "AI confidence score (0-1)"
+          - name: ai_reasoning
+            type: STRING
+            mode: NULLABLE
+            description: "AI decision reasoning"
+      description: "AI-driven routing decisions for analysis"
+    metadata:
+      dependsOn:
+        - traffic-analytics-dataset
+
+  # Cloud Run Service A (Fast Response)
+  - name: cloud-run-service-a
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/{{ $.inputs.project_id }}
+      location: {{ $.inputs.region }}
+      apiVersion: serving.knative.dev/v1
+      kind: Service
+      metadata:
+        name: service-a-{{ $.inputs.random_suffix }}
+        namespace: {{ $.inputs.project_id }}
+        annotations:
+          run.googleapis.com/ingress: all
+          run.googleapis.com/ingress-status: all
+        labels:
+          service-type: fast-response
+          routing-tier: premium
+      spec:
+        template:
+          metadata:
+            annotations:
+              autoscaling.knative.dev/maxScale: "10"
+              run.googleapis.com/memory: "512Mi"
+              run.googleapis.com/cpu: "1000m"
+          spec:
+            containerConcurrency: 100
+            timeoutSeconds: 300
+            containers:
+              - image: gcr.io/cloudrun/hello:latest
+                ports:
+                  - containerPort: 8080
+                    protocol: TCP
+                env:
+                  - name: SERVICE_TYPE
+                    value: "fast"
+                  - name: RESPONSE_DELAY
+                    value: "100"
+                resources:
+                  limits:
+                    memory: "512Mi"
+                    cpu: "1000m"
+        traffic:
+          - percent: 100
+            latestRevision: true
+    metadata:
+      dependsOn:
+        - enable-run-api
+
+  # IAM policy for Cloud Run Service A
+  - name: cloud-run-service-a-iam
+    type: gcp-types/run-v1:projects.locations.services.setIamPolicy
+    properties:
+      resource: projects/{{ $.inputs.project_id }}/locations/{{ $.inputs.region }}/services/service-a-{{ $.inputs.random_suffix }}
+      policy:
+        bindings:
+          - role: roles/run.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - cloud-run-service-a
+
+  # Cloud Run Service B (Standard Response)
+  - name: cloud-run-service-b
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/{{ $.inputs.project_id }}
+      location: {{ $.inputs.region }}
+      apiVersion: serving.knative.dev/v1
+      kind: Service
+      metadata:
+        name: service-b-{{ $.inputs.random_suffix }}
+        namespace: {{ $.inputs.project_id }}
+        annotations:
+          run.googleapis.com/ingress: all
+          run.googleapis.com/ingress-status: all
+        labels:
+          service-type: standard-response
+          routing-tier: standard
+      spec:
+        template:
+          metadata:
+            annotations:
+              autoscaling.knative.dev/maxScale: "10"
+              run.googleapis.com/memory: "1Gi"
+              run.googleapis.com/cpu: "1000m"
+          spec:
+            containerConcurrency: 80
+            timeoutSeconds: 300
+            containers:
+              - image: gcr.io/cloudrun/hello:latest
+                ports:
+                  - containerPort: 8080
+                    protocol: TCP
+                env:
+                  - name: SERVICE_TYPE
+                    value: "standard"
+                  - name: RESPONSE_DELAY
+                    value: "500"
+                resources:
+                  limits:
+                    memory: "1Gi"
+                    cpu: "1000m"
+        traffic:
+          - percent: 100
+            latestRevision: true
+    metadata:
+      dependsOn:
+        - enable-run-api
+
+  # IAM policy for Cloud Run Service B
+  - name: cloud-run-service-b-iam
+    type: gcp-types/run-v1:projects.locations.services.setIamPolicy
+    properties:
+      resource: projects/{{ $.inputs.project_id }}/locations/{{ $.inputs.region }}/services/service-b-{{ $.inputs.random_suffix }}
+      policy:
+        bindings:
+          - role: roles/run.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - cloud-run-service-b
+
+  # Cloud Run Service C (Resource Intensive)
+  - name: cloud-run-service-c
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/{{ $.inputs.project_id }}
+      location: {{ $.inputs.region }}
+      apiVersion: serving.knative.dev/v1
+      kind: Service
+      metadata:
+        name: service-c-{{ $.inputs.random_suffix }}
+        namespace: {{ $.inputs.project_id }}
+        annotations:
+          run.googleapis.com/ingress: all
+          run.googleapis.com/ingress-status: all
+        labels:
+          service-type: intensive-response
+          routing-tier: high-performance
+      spec:
+        template:
+          metadata:
+            annotations:
+              autoscaling.knative.dev/maxScale: "5"
+              run.googleapis.com/memory: "2Gi"
+              run.googleapis.com/cpu: "2000m"
+          spec:
+            containerConcurrency: 50
+            timeoutSeconds: 600
+            containers:
+              - image: gcr.io/cloudrun/hello:latest
+                ports:
+                  - containerPort: 8080
+                    protocol: TCP
+                env:
+                  - name: SERVICE_TYPE
+                    value: "intensive"
+                  - name: RESPONSE_DELAY
+                    value: "1000"
+                resources:
+                  limits:
+                    memory: "2Gi"
+                    cpu: "2000m"
+        traffic:
+          - percent: 100
+            latestRevision: true
+    metadata:
+      dependsOn:
+        - enable-run-api
+
+  # IAM policy for Cloud Run Service C
+  - name: cloud-run-service-c-iam
+    type: gcp-types/run-v1:projects.locations.services.setIamPolicy
+    properties:
+      resource: projects/{{ $.inputs.project_id }}/locations/{{ $.inputs.region }}/services/service-c-{{ $.inputs.random_suffix }}
+      policy:
+        bindings:
+          - role: roles/run.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - cloud-run-service-c
+
+  # Health Check for Cloud Run Services
+  - name: cloud-run-health-check
+    type: compute.v1.healthCheck
+    properties:
+      name: cr-health-check-{{ $.inputs.random_suffix }}
+      description: "Health check for Cloud Run services"
+      type: HTTP
+      httpHealthCheck:
+        port: 8080
+        requestPath: "/health"
+        proxyHeader: NONE
+      checkIntervalSec: 30
+      timeoutSec: 10
+      healthyThreshold: 2
+      unhealthyThreshold: 3
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # Network Endpoint Group for Service A
+  - name: service-a-neg
+    type: compute.v1.networkEndpointGroup
+    properties:
+      name: service-a-neg-{{ $.inputs.random_suffix }}
+      description: "Network Endpoint Group for Cloud Run Service A"
+      networkEndpointType: SERVERLESS
+      region: {{ $.inputs.region }}
+      cloudRun:
+        service: service-a-{{ $.inputs.random_suffix }}
+    metadata:
+      dependsOn:
+        - cloud-run-service-a
+
+  # Network Endpoint Group for Service B
+  - name: service-b-neg
+    type: compute.v1.networkEndpointGroup
+    properties:
+      name: service-b-neg-{{ $.inputs.random_suffix }}
+      description: "Network Endpoint Group for Cloud Run Service B"
+      networkEndpointType: SERVERLESS
+      region: {{ $.inputs.region }}
+      cloudRun:
+        service: service-b-{{ $.inputs.random_suffix }}
+    metadata:
+      dependsOn:
+        - cloud-run-service-b
+
+  # Network Endpoint Group for Service C
+  - name: service-c-neg
+    type: compute.v1.networkEndpointGroup
+    properties:
+      name: service-c-neg-{{ $.inputs.random_suffix }}
+      description: "Network Endpoint Group for Cloud Run Service C"
+      networkEndpointType: SERVERLESS
+      region: {{ $.inputs.region }}
+      cloudRun:
+        service: service-c-{{ $.inputs.random_suffix }}
+    metadata:
+      dependsOn:
+        - cloud-run-service-c
+
+  # Backend Service for Service A
+  - name: service-a-backend
+    type: compute.v1.backendService
+    properties:
+      name: service-a-backend-{{ $.inputs.random_suffix }}
+      description: "Backend service for Cloud Run Service A"
+      protocol: HTTP
+      loadBalancingScheme: EXTERNAL_MANAGED
+      healthChecks:
+        - $(ref.cloud-run-health-check.selfLink)
+      backends:
+        - group: $(ref.service-a-neg.selfLink)
+          balancingMode: UTILIZATION
+          maxUtilization: 0.8
+          capacityScaler: 1.0
+      timeoutSec: 30
+      connectionDraining:
+        drainingTimeoutSec: 300
+    metadata:
+      dependsOn:
+        - service-a-neg
+        - cloud-run-health-check
+
+  # Backend Service for Service B
+  - name: service-b-backend
+    type: compute.v1.backendService
+    properties:
+      name: service-b-backend-{{ $.inputs.random_suffix }}
+      description: "Backend service for Cloud Run Service B"
+      protocol: HTTP
+      loadBalancingScheme: EXTERNAL_MANAGED
+      healthChecks:
+        - $(ref.cloud-run-health-check.selfLink)
+      backends:
+        - group: $(ref.service-b-neg.selfLink)
+          balancingMode: UTILIZATION
+          maxUtilization: 0.8
+          capacityScaler: 1.0
+      timeoutSec: 30
+      connectionDraining:
+        drainingTimeoutSec: 300
+    metadata:
+      dependsOn:
+        - service-b-neg
+        - cloud-run-health-check
+
+  # Backend Service for Service C
+  - name: service-c-backend
+    type: compute.v1.backendService
+    properties:
+      name: service-c-backend-{{ $.inputs.random_suffix }}
+      description: "Backend service for Cloud Run Service C"
+      protocol: HTTP
+      loadBalancingScheme: EXTERNAL_MANAGED
+      healthChecks:
+        - $(ref.cloud-run-health-check.selfLink)
+      backends:
+        - group: $(ref.service-c-neg.selfLink)
+          balancingMode: UTILIZATION
+          maxUtilization: 0.8
+          capacityScaler: 1.0
+      timeoutSec: 60
+      connectionDraining:
+        drainingTimeoutSec: 300
+    metadata:
+      dependsOn:
+        - service-c-neg
+        - cloud-run-health-check
+
+  # Cloud Function for Intelligent Traffic Routing
+  - name: traffic-router-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/{{ $.inputs.project_id }}/locations/{{ $.inputs.region }}
+      function:
+        name: projects/{{ $.inputs.project_id }}/locations/{{ $.inputs.region }}/functions/traffic-router-{{ $.inputs.random_suffix }}
+        description: "Intelligent traffic routing based on BigQuery analytics"
+        sourceArchiveUrl: gs://gcf-sources-{{ $.inputs.project_id }}/traffic-router.zip
+        httpsTrigger: {}
+        entryPoint: "route_traffic"
+        runtime: "python39"
+        timeout: "60s"
+        availableMemoryMb: 256
+        maxInstances: 10
+        environmentVariables:
+          PROJECT_ID: {{ $.inputs.project_id }}
+          DATASET_NAME: {{ $.inputs.dataset_name }}_{{ $.inputs.random_suffix }}
+          REGION: {{ $.inputs.region }}
+        labels:
+          component: intelligent-routing
+          purpose: traffic-analysis
+    metadata:
+      dependsOn:
+        - enable-cloudfunctions-api
+        - traffic-analytics-dataset
+
+  # IAM binding for Cloud Function
+  - name: traffic-router-function-iam
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions.setIamPolicy
+    properties:
+      resource: projects/{{ $.inputs.project_id }}/locations/{{ $.inputs.region }}/functions/traffic-router-{{ $.inputs.random_suffix }}
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - traffic-router-function
+
+  # Service Extension for Intelligent Routing
+  - name: intelligent-routing-extension
+    type: gcp-types/serviceextensions-v1beta1:projects.locations.extensions
+    properties:
+      parent: projects/{{ $.inputs.project_id }}/locations/{{ $.inputs.region }}
+      extensionId: {{ $.inputs.extension_name }}-{{ $.inputs.random_suffix }}
+      extension:
+        name: projects/{{ $.inputs.project_id }}/locations/{{ $.inputs.region }}/extensions/{{ $.inputs.extension_name }}-{{ $.inputs.random_suffix }}
+        description: "Intelligent traffic routing with BigQuery analytics"
+        extensionChain:
+          - name: traffic-analysis-chain
+            matchCondition:
+              celExpression: "true"  # Apply to all traffic
+            extensions:
+              - name: intelligent-router
+                service: $(ref.traffic-router-function.name)
+                timeout: "30s"
+                failOpen: true
+                forwardHeaders:
+                  - "user-agent"
+                  - "x-forwarded-for"
+                  - "content-length"
+        labels:
+          purpose: intelligent-routing
+          analytics: bigquery-powered
+    metadata:
+      dependsOn:
+        - enable-service-extensions-api
+        - traffic-router-function
+
+  # URL Map with Intelligent Routing
+  - name: intelligent-url-map
+    type: compute.v1.urlMap
+    properties:
+      name: intelligent-lb-{{ $.inputs.random_suffix }}
+      description: "URL map for intelligent load balancer with Service Extensions"
+      defaultService: $(ref.service-a-backend.selfLink)
+      pathMatchers:
+        - name: intelligent-matcher
+          description: "Path matcher for intelligent routing"
+          defaultService: $(ref.service-a-backend.selfLink)
+          pathRules:
+            - paths:
+                - "/api/fast/*"
+              service: $(ref.service-a-backend.selfLink)
+            - paths:
+                - "/api/standard/*"
+              service: $(ref.service-b-backend.selfLink)
+            - paths:
+                - "/api/intensive/*"
+              service: $(ref.service-c-backend.selfLink)
+      hostRules:
+        - hosts:
+            - "*"
+          pathMatcher: intelligent-matcher
+    metadata:
+      dependsOn:
+        - service-a-backend
+        - service-b-backend
+        - service-c-backend
+
+  # HTTP(S) Target Proxy
+  - name: intelligent-target-proxy
+    type: compute.v1.targetHttpProxy
+    properties:
+      name: intelligent-proxy-{{ $.inputs.random_suffix }}
+      description: "Target HTTP proxy for intelligent load balancer"
+      urlMap: $(ref.intelligent-url-map.selfLink)
+    metadata:
+      dependsOn:
+        - intelligent-url-map
+
+  # Global Forwarding Rule
+  - name: intelligent-forwarding-rule
+    type: compute.v1.globalForwardingRule
+    properties:
+      name: intelligent-lb-rule-{{ $.inputs.random_suffix }}
+      description: "Global forwarding rule for intelligent load balancer"
+      target: $(ref.intelligent-target-proxy.selfLink)
+      portRange: "80"
+      IPProtocol: TCP
+      loadBalancingScheme: EXTERNAL_MANAGED
+    metadata:
+      dependsOn:
+        - intelligent-target-proxy
+
+  # Cloud Logging Sink for Traffic Analytics
+  - name: traffic-analytics-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      parent: projects/{{ $.inputs.project_id }}
+      sinkId: traffic-analytics-sink-{{ $.inputs.random_suffix }}
+      sink:
+        name: traffic-analytics-sink-{{ $.inputs.random_suffix }}
+        description: "Export traffic logs to BigQuery for analytics"
+        destination: bigquery.googleapis.com/projects/{{ $.inputs.project_id }}/datasets/{{ $.inputs.dataset_name }}_{{ $.inputs.random_suffix }}
+        filter: |
+          resource.type="gce_instance" OR 
+          resource.type="http_load_balancer" OR
+          jsonPayload.source_ip!=""
+        bigqueryOptions:
+          usePartitionedTables: true
+    metadata:
+      dependsOn:
+        - enable-logging-api
+        - traffic-analytics-dataset
+
+  # Cloud Workflow for Automated Analytics
+  - name: analytics-workflow
+    type: gcp-types/workflows-v1:projects.locations.workflows
+    properties:
+      parent: projects/{{ $.inputs.project_id }}/locations/{{ $.inputs.region }}
+      workflowId: analytics-processor-{{ $.inputs.random_suffix }}
+      workflow:
+        name: projects/{{ $.inputs.project_id }}/locations/{{ $.inputs.region }}/workflows/analytics-processor-{{ $.inputs.random_suffix }}
+        description: "Automated analytics for intelligent routing optimization"
+        sourceContents: |
+          main:
+            params: [args]
+            steps:
+              - analyze_traffic:
+                  call: googleapis.bigquery.v2.jobs.query
+                  args:
+                    projectId: {{ $.inputs.project_id }}
+                    body:
+                      query: |
+                        SELECT 
+                          target_service,
+                          AVG(response_time) as avg_response_time,
+                          COUNT(*) as request_count,
+                          STDDEV(response_time) as response_time_stddev,
+                          AVG(CASE WHEN status_code >= 200 AND status_code < 300 THEN 1 ELSE 0 END) as success_rate
+                        FROM `{{ $.inputs.project_id }}.{{ $.inputs.dataset_name }}_{{ $.inputs.random_suffix }}.lb_metrics`
+                        WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 15 MINUTE)
+                        GROUP BY target_service
+                        ORDER BY avg_response_time ASC
+                      useLegacySql: false
+                  result: query_result
+              
+              - generate_insights:
+                  call: sys.log
+                  args:
+                    text: ${"Analytics complete. Performance data: " + string(query_result)}
+                    severity: INFO
+              
+              - return_recommendations:
+                  return:
+                    best_service: ${query_result.rows[0].f[0].v}
+                    performance_metrics: ${query_result}
+                    timestamp: ${sys.now()}
+        labels:
+          purpose: traffic-analytics
+          automation: bigquery-integration
+    metadata:
+      dependsOn:
+        - enable-workflows-api
+        - traffic-analytics-dataset
+
+# Define outputs for verification and integration
+outputs:
+  - name: load_balancer_ip
+    description: "Global IP address of the intelligent load balancer"
+    value: $(ref.intelligent-forwarding-rule.IPAddress)
+  
+  - name: bigquery_dataset
+    description: "BigQuery dataset for traffic analytics"
+    value: {{ $.inputs.dataset_name }}_{{ $.inputs.random_suffix }}
+  
+  - name: service_extension_name
+    description: "Name of the Service Extension for intelligent routing"
+    value: $(ref.intelligent-routing-extension.name)
+  
+  - name: cloud_run_services
+    description: "URLs of deployed Cloud Run services"
+    value:
+      service_a: $(ref.cloud-run-service-a.status.url)
+      service_b: $(ref.cloud-run-service-b.status.url)
+      service_c: $(ref.cloud-run-service-c.status.url)
+  
+  - name: traffic_router_function
+    description: "URL of the intelligent traffic routing Cloud Function"
+    value: $(ref.traffic-router-function.httpsTrigger.url)
+  
+  - name: analytics_workflow
+    description: "Name of the automated analytics workflow"
+    value: $(ref.analytics-workflow.name)
+  
+  - name: project_configuration
+    description: "Project configuration summary"
+    value:
+      project_id: {{ $.inputs.project_id }}
+      region: {{ $.inputs.region }}
+      random_suffix: {{ $.inputs.random_suffix }}
+  
+  - name: validation_commands
+    description: "Commands to validate the deployment"
+    value:
+      test_load_balancer: "curl -s -o /dev/null -w 'Status: %{http_code}, Time: %{time_total}s' http://$(ref.intelligent-forwarding-rule.IPAddress)/"
+      check_bigquery_data: "bq query --use_legacy_sql=false 'SELECT COUNT(*) FROM `{{ $.inputs.project_id }}.{{ $.inputs.dataset_name }}_{{ $.inputs.random_suffix }}.lb_metrics`'"
+      execute_analytics: "gcloud workflows execute analytics-processor-{{ $.inputs.random_suffix }} --location={{ $.inputs.region }}"
+
+# Resource metadata for deployment orchestration
+metadata:
+  version: "1.0"
+  description: "Intelligent Load Balancer Traffic Routing with Service Extensions and BigQuery Data Canvas"
+  author: "Google Cloud Infrastructure Manager"
+  tags:
+    - load-balancing
+    - service-extensions
+    - bigquery-analytics
+    - intelligent-routing
+    - ai-powered-infrastructure
+  dependencies:
+    - compute.googleapis.com
+    - run.googleapis.com
+    - bigquery.googleapis.com
+    - logging.googleapis.com
+    - monitoring.googleapis.com
+    - serviceextensions.googleapis.com
+    - workflows.googleapis.com
+    - cloudfunctions.googleapis.com
+  estimated_deployment_time: "15-20 minutes"
+  estimated_cost: "$25-50 per day for active usage"

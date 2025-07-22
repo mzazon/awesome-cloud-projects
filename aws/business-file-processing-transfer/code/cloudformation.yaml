@@ -1,0 +1,1048 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Automated business file processing pipeline using AWS Transfer Family and Step Functions'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'file-processing'
+    Description: 'Base name for all resources'
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must start with lowercase letter, contain only lowercase letters, numbers, and hyphens'
+    MinLength: 3
+    MaxLength: 30
+
+  SftpUserName:
+    Type: String
+    Default: 'businesspartner'
+    Description: 'Username for SFTP access'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$'
+    ConstraintDescription: 'Must start with letter, contain only letters, numbers, and hyphens'
+    MinLength: 3
+    MaxLength: 32
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for processing notifications and alerts'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  EnableDataEncryption:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable S3 bucket encryption with KMS'
+
+  RetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: 'Number of days to retain files in archive bucket'
+
+Conditions:
+  UseEncryption: !Equals [!Ref EnableDataEncryption, 'true']
+
+Resources:
+  # ===========================================
+  # KMS Key for Encryption (Optional)
+  # ===========================================
+  FileProcessingKMSKey:
+    Type: AWS::KMS::Key
+    Condition: UseEncryption
+    Properties:
+      Description: 'KMS key for file processing pipeline encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow S3 Service
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: FileProcessingEncryption
+
+  FileProcessingKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: UseEncryption
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-file-processing'
+      TargetKeyId: !Ref FileProcessingKMSKey
+
+  # ===========================================
+  # S3 Buckets for File Storage
+  # ===========================================
+  LandingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-landing-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [UseEncryption, 'aws:kms', 'AES256']
+              KMSMasterKeyID: !If [UseEncryption, !Ref FileProcessingKMSKey, !Ref 'AWS::NoValue']
+            BucketKeyEnabled: !If [UseEncryption, true, false]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: FileIngestion
+
+  ProcessedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-processed-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [UseEncryption, 'aws:kms', 'AES256']
+              KMSMasterKeyID: !If [UseEncryption, !Ref FileProcessingKMSKey, !Ref 'AWS::NoValue']
+            BucketKeyEnabled: !If [UseEncryption, true, false]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: ProcessedFiles
+
+  ArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-archive-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [UseEncryption, 'aws:kms', 'AES256']
+              KMSMasterKeyID: !If [UseEncryption, !Ref FileProcessingKMSKey, !Ref 'AWS::NoValue']
+            BucketKeyEnabled: !If [UseEncryption, true, false]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldFiles
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: !Ref RetentionDays
+                StorageClass: GLACIER
+              - TransitionInDays: !Ref RetentionDays
+                StorageClass: DEEP_ARCHIVE
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: LongTermArchive
+
+  # ===========================================
+  # IAM Roles and Policies
+  # ===========================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:CopyObject
+                  - s3:DeleteObject
+                  - s3:GetObjectVersion
+                Resource:
+                  - !Sub '${LandingBucket}/*'
+                  - !Sub '${ProcessedBucket}/*'
+                  - !Sub '${ArchiveBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Ref LandingBucket
+                  - !Ref ProcessedBucket
+                  - !Ref ArchiveBucket
+        - PolicyName: KMSAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:CreateGrant
+                Resource: !If 
+                  - UseEncryption
+                  - !GetAtt FileProcessingKMSKey.Arn
+                  - '*'
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref ProcessingNotificationTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  TransferFamilyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-transfer-family-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: transfer.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                Resource: !Sub '${LandingBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource: !Ref LandingBucket
+        - PolicyName: KMSAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !If 
+                  - UseEncryption
+                  - !GetAtt FileProcessingKMSKey.Arn
+                  - '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-stepfunctions-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt FileValidatorFunction.Arn
+                  - !GetAtt DataProcessorFunction.Arn
+                  - !GetAtt DataRouterFunction.Arn
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  EventBridgeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-eventbridge-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref FileProcessingStateMachine
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ===========================================
+  # Lambda Functions
+  # ===========================================
+  FileValidatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-file-validator'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          LANDING_BUCKET: !Ref LandingBucket
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          ARCHIVE_BUCKET: !Ref ArchiveBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import csv
+          from io import StringIO
+          import os
+
+          def lambda_handler(event, context):
+              s3 = boto3.client('s3')
+              
+              # Extract S3 information from EventBridge or direct input
+              if 'detail' in event:
+                  bucket = event['detail']['bucket']['name']
+                  key = event['detail']['object']['key']
+              else:
+                  bucket = event['bucket']
+                  key = event['key']
+              
+              try:
+                  # Download and validate file format
+                  response = s3.get_object(Bucket=bucket, Key=key)
+                  content = response['Body'].read().decode('utf-8')
+                  
+                  # Validate CSV format
+                  csv_reader = csv.reader(StringIO(content))
+                  rows = list(csv_reader)
+                  
+                  if len(rows) < 2:  # Header + at least one data row
+                      raise ValueError("File must contain header and data rows")
+                  
+                  # Additional validation checks
+                  header = rows[0]
+                  if not header:
+                      raise ValueError("File must contain a valid header row")
+                  
+                  # Check for minimum required columns (customize as needed)
+                  required_columns = ['transaction_id', 'amount', 'date']
+                  missing_columns = [col for col in required_columns if col not in header]
+                  if missing_columns:
+                      raise ValueError(f"Missing required columns: {missing_columns}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'isValid': True,
+                      'rowCount': len(rows) - 1,
+                      'columnCount': len(header),
+                      'bucket': bucket,
+                      'key': key,
+                      'fileSize': response['ContentLength']
+                  }
+              except Exception as e:
+                  print(f"Validation error for {bucket}/{key}: {str(e)}")
+                  return {
+                      'statusCode': 400,
+                      'isValid': False,
+                      'error': str(e),
+                      'bucket': bucket,
+                      'key': key
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Function
+          Value: FileValidation
+
+  DataProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-data-processor'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          LANDING_BUCKET: !Ref LandingBucket
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          ARCHIVE_BUCKET: !Ref ArchiveBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import csv
+          import io
+          from datetime import datetime
+          import uuid
+          import os
+
+          def lambda_handler(event, context):
+              s3 = boto3.client('s3')
+              bucket = event['bucket']
+              key = event['key']
+              
+              try:
+                  # Download original file
+                  response = s3.get_object(Bucket=bucket, Key=key)
+                  content = response['Body'].read().decode('utf-8')
+                  
+                  # Process CSV data
+                  csv_reader = csv.DictReader(io.StringIO(content))
+                  processed_rows = []
+                  
+                  for row in csv_reader:
+                      # Add processing metadata
+                      row['processed_timestamp'] = datetime.utcnow().isoformat()
+                      row['processing_id'] = str(uuid.uuid4())
+                      row['source_file'] = key
+                      
+                      # Add business logic transformations here
+                      # Example: standardize currency codes, validate amounts, etc.
+                      if 'amount' in row:
+                          try:
+                              # Ensure amount is properly formatted
+                              amount = float(row['amount'])
+                              row['amount_validated'] = f"{amount:.2f}"
+                          except (ValueError, TypeError):
+                              row['amount_validated'] = "INVALID"
+                      
+                      processed_rows.append(row)
+                  
+                  # Convert back to CSV
+                  output = io.StringIO()
+                  if processed_rows:
+                      writer = csv.DictWriter(output, fieldnames=processed_rows[0].keys())
+                      writer.writeheader()
+                      writer.writerows(processed_rows)
+                  
+                  # Upload processed file
+                  processed_bucket = os.environ['PROCESSED_BUCKET']
+                  processed_key = f"processed/{key}"
+                  s3.put_object(
+                      Bucket=processed_bucket,
+                      Key=processed_key,
+                      Body=output.getvalue(),
+                      ContentType='text/csv',
+                      Metadata={
+                          'original-file': key,
+                          'processing-timestamp': datetime.utcnow().isoformat(),
+                          'record-count': str(len(processed_rows))
+                      }
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'processedKey': processed_key,
+                      'processedBucket': processed_bucket,
+                      'recordCount': len(processed_rows),
+                      'bucket': bucket,
+                      'originalKey': key
+                  }
+                  
+              except Exception as e:
+                  print(f"Processing error for {bucket}/{key}: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'error': str(e),
+                      'bucket': bucket,
+                      'key': key
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Function
+          Value: DataProcessing
+
+  DataRouterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-data-router'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 180
+      MemorySize: 256
+      Environment:
+        Variables:
+          LANDING_BUCKET: !Ref LandingBucket
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          ARCHIVE_BUCKET: !Ref ArchiveBucket
+          SNS_TOPIC_ARN: !Ref ProcessingNotificationTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              s3 = boto3.client('s3')
+              sns = boto3.client('sns')
+              
+              bucket = event['bucket']
+              processed_key = event['processedKey']
+              processed_bucket = event['processedBucket']
+              record_count = event['recordCount']
+              original_key = event['originalKey']
+              
+              try:
+                  # Determine routing destination based on file content
+                  if 'financial' in original_key.lower():
+                      destination = 'financial-data/'
+                      routing_type = 'Financial Data'
+                  elif 'inventory' in original_key.lower():
+                      destination = 'inventory-data/'
+                      routing_type = 'Inventory Data'
+                  elif 'customer' in original_key.lower():
+                      destination = 'customer-data/'
+                      routing_type = 'Customer Data'
+                  else:
+                      destination = 'general-data/'
+                      routing_type = 'General Data'
+                  
+                  # Copy to archive with organized structure
+                  archive_bucket = os.environ['ARCHIVE_BUCKET']
+                  archive_key = f"{destination}{datetime.utcnow().strftime('%Y/%m/%d/')}{original_key}"
+                  
+                  s3.copy_object(
+                      CopySource={'Bucket': processed_bucket, 'Key': processed_key},
+                      Bucket=archive_bucket,
+                      Key=archive_key,
+                      MetadataDirective='COPY'
+                  )
+                  
+                  # Send notification
+                  message = {
+                      'processing_status': 'SUCCESS',
+                      'original_file': original_key,
+                      'processed_file': processed_key,
+                      'archive_location': f"{archive_bucket}/{archive_key}",
+                      'routing_type': routing_type,
+                      'record_count': record_count,
+                      'processing_timestamp': datetime.utcnow().isoformat()
+                  }
+                  
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=f'File Processing Complete: {original_key}',
+                      Message=json.dumps(message, indent=2)
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'destination': destination,
+                      'routingType': routing_type,
+                      'archiveKey': archive_key,
+                      'archiveBucket': archive_bucket,
+                      'recordCount': record_count,
+                      'notificationSent': True
+                  }
+                  
+              except Exception as e:
+                  print(f"Routing error for {processed_bucket}/{processed_key}: {str(e)}")
+                  
+                  # Send failure notification
+                  try:
+                      sns.publish(
+                          TopicArn=os.environ['SNS_TOPIC_ARN'],
+                          Subject=f'File Processing Error: {original_key}',
+                          Message=f"Error routing file {original_key}: {str(e)}"
+                      )
+                  except:
+                      pass
+                  
+                  return {
+                      'statusCode': 500,
+                      'error': str(e),
+                      'notificationSent': False
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Function
+          Value: DataRouting
+
+  # ===========================================
+  # Step Functions State Machine
+  # ===========================================
+  FileProcessingStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-file-processing-workflow'
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Automated file processing workflow with comprehensive error handling",
+          "StartAt": "ValidateFile",
+          "States": {
+            "ValidateFile": {
+              "Type": "Task",
+              "Resource": "${FileValidatorFunction.Arn}",
+              "Next": "CheckValidation",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "ValidationFailed",
+                  "ResultPath": "$.error"
+                }
+              ]
+            },
+            "CheckValidation": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.isValid",
+                  "BooleanEquals": true,
+                  "Next": "ProcessFile"
+                }
+              ],
+              "Default": "ValidationFailed"
+            },
+            "ProcessFile": {
+              "Type": "Task",
+              "Resource": "${DataProcessorFunction.Arn}",
+              "Next": "CheckProcessing",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+                  "IntervalSeconds": 3,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "ProcessingFailed",
+                  "ResultPath": "$.error"
+                }
+              ]
+            },
+            "CheckProcessing": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.statusCode",
+                  "NumericEquals": 200,
+                  "Next": "RouteFile"
+                }
+              ],
+              "Default": "ProcessingFailed"
+            },
+            "RouteFile": {
+              "Type": "Task",
+              "Resource": "${DataRouterFunction.Arn}",
+              "Next": "ProcessingComplete",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "RoutingFailed",
+                  "ResultPath": "$.error"
+                }
+              ]
+            },
+            "ProcessingComplete": {
+              "Type": "Succeed"
+            },
+            "ValidationFailed": {
+              "Type": "Fail",
+              "Cause": "File validation failed - file does not meet required format or quality standards"
+            },
+            "ProcessingFailed": {
+              "Type": "Fail",
+              "Cause": "File processing failed - unable to transform or enhance file data"
+            },
+            "RoutingFailed": {
+              "Type": "Fail",
+              "Cause": "File routing failed - unable to move processed file to final destination"
+            }
+          }
+        }
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StepFunctionsLogGroup.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: FileProcessingOrchestration
+
+  # ===========================================
+  # CloudWatch Log Groups
+  # ===========================================
+  StepFunctionsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/stepfunctions/${ProjectName}-workflow'
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ===========================================
+  # AWS Transfer Family
+  # ===========================================
+  TransferFamilyServer:
+    Type: AWS::Transfer::Server
+    Properties:
+      IdentityProviderType: SERVICE_MANAGED
+      Protocols:
+        - SFTP
+      EndpointType: PUBLIC
+      LoggingRole: !GetAtt TransferFamilyLoggingRole.Arn
+      SecurityPolicyName: TransferSecurityPolicy-2020-06
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: SecureFileIngestion
+
+  TransferFamilyUser:
+    Type: AWS::Transfer::User
+    Properties:
+      ServerId: !GetAtt TransferFamilyServer.ServerId
+      UserName: !Ref SftpUserName
+      Role: !GetAtt TransferFamilyRole.Arn
+      HomeDirectory: !Sub '/${LandingBucket}'
+      HomeDirectoryType: PATH
+      Policy: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:PutObject",
+                "s3:PutObjectAcl"
+              ],
+              "Resource": "arn:aws:s3:::${LandingBucket}/*"
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:ListBucket"
+              ],
+              "Resource": "arn:aws:s3:::${LandingBucket}",
+              "Condition": {
+                "StringLike": {
+                  "s3:prefix": "*"
+                }
+              }
+            }
+          ]
+        }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: UserType
+          Value: BusinessPartner
+
+  TransferFamilyLoggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: transfer.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSTransferLoggingAccess
+
+  # ===========================================
+  # EventBridge Rule for S3 Events
+  # ===========================================
+  FileProcessingEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-file-processing-trigger'
+      Description: 'Trigger Step Functions workflow when files arrive in landing bucket'
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref LandingBucket
+      State: ENABLED
+      Targets:
+        - Arn: !Ref FileProcessingStateMachine
+          Id: FileProcessingTarget
+          RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              bucket: $.detail.bucket.name
+              key: $.detail.object.key
+            InputTemplate: |
+              {
+                "bucket": "<bucket>",
+                "key": "<key>"
+              }
+
+  # ===========================================
+  # SNS Topic for Notifications
+  # ===========================================
+  ProcessingNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-processing-notifications'
+      DisplayName: 'File Processing Notifications'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ProcessingNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+      TopicArn: !Ref ProcessingNotificationTopic
+
+  # ===========================================
+  # CloudWatch Alarms for Monitoring
+  # ===========================================
+  FailedExecutionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-failed-executions'
+      AlarmDescription: 'Alert when Step Functions executions fail'
+      MetricName: ExecutionsFailed
+      Namespace: AWS/States
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref ProcessingNotificationTopic
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref FileProcessingStateMachine
+      TreatMissingData: notBreaching
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors'
+      AlarmDescription: 'Alert when Lambda functions encounter errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref ProcessingNotificationTopic
+      TreatMissingData: notBreaching
+
+  TransferFamilyErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-transfer-errors'
+      AlarmDescription: 'Alert when Transfer Family encounters errors'
+      MetricName: UserConfigurationErrors
+      Namespace: AWS/Transfer
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref ProcessingNotificationTopic
+      Dimensions:
+        - Name: ServerId
+          Value: !GetAtt TransferFamilyServer.ServerId
+      TreatMissingData: notBreaching
+
+# ===========================================
+# Outputs
+# ===========================================
+Outputs:
+  ProjectName:
+    Description: 'Project name used for resource naming'
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectName'
+
+  SftpServerEndpoint:
+    Description: 'SFTP server endpoint for file uploads'
+    Value: !GetAtt TransferFamilyServer.ServerId
+    Export:
+      Name: !Sub '${AWS::StackName}-SftpServerEndpoint'
+
+  SftpServerHostname:
+    Description: 'SFTP server hostname'
+    Value: !Sub '${TransferFamilyServer.ServerId}.server.transfer.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-SftpServerHostname'
+
+  SftpUserName:
+    Description: 'SFTP username for authentication'
+    Value: !Ref SftpUserName
+    Export:
+      Name: !Sub '${AWS::StackName}-SftpUserName'
+
+  LandingBucketName:
+    Description: 'S3 bucket name for incoming files'
+    Value: !Ref LandingBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-LandingBucket'
+
+  ProcessedBucketName:
+    Description: 'S3 bucket name for processed files'
+    Value: !Ref ProcessedBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessedBucket'
+
+  ArchiveBucketName:
+    Description: 'S3 bucket name for archived files'
+    Value: !Ref ArchiveBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ArchiveBucket'
+
+  StepFunctionsStateMachineArn:
+    Description: 'ARN of the Step Functions state machine'
+    Value: !Ref FileProcessingStateMachine
+    Export:
+      Name: !Sub '${AWS::StackName}-StateMachineArn'
+
+  FileValidatorFunctionArn:
+    Description: 'ARN of the file validator Lambda function'
+    Value: !GetAtt FileValidatorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ValidatorFunction'
+
+  DataProcessorFunctionArn:
+    Description: 'ARN of the data processor Lambda function'
+    Value: !GetAtt DataProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessorFunction'
+
+  DataRouterFunctionArn:
+    Description: 'ARN of the data router Lambda function'
+    Value: !GetAtt DataRouterFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RouterFunction'
+
+  NotificationTopicArn:
+    Description: 'ARN of the SNS topic for notifications'
+    Value: !Ref ProcessingNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopic'
+
+  KmsKeyId:
+    Condition: UseEncryption
+    Description: 'KMS key ID for encryption (if enabled)'
+    Value: !Ref FileProcessingKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-KmsKeyId'
+
+  EventBridgeRuleArn:
+    Description: 'ARN of the EventBridge rule triggering file processing'
+    Value: !GetAtt FileProcessingEventRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeRule'
+
+  DeploymentInstructions:
+    Description: 'Instructions for accessing the deployed infrastructure'
+    Value: !Sub |
+      1. SFTP Connection: sftp ${SftpUserName}@${TransferFamilyServer.ServerId}.server.transfer.${AWS::Region}.amazonaws.com
+      2. Landing Bucket: s3://${LandingBucket}
+      3. Step Functions Console: https://${AWS::Region}.console.aws.amazon.com/states/home?region=${AWS::Region}#/statemachines/view/${FileProcessingStateMachine}
+      4. CloudWatch Logs: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups
+      5. SNS Notifications: Check your email for processing notifications

@@ -1,0 +1,1002 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Infrastructure as Code for Document Analysis with Amazon Textract.
+  Deploys a complete document processing pipeline including S3 buckets, Lambda functions,
+  Step Functions workflow, DynamoDB table, and SNS topic for automated document analysis.
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Name for the project (used as prefix for all resources)
+    Default: textract-analysis
+    AllowedPattern: ^[a-z][a-z0-9-]*[a-z0-9]$
+    ConstraintDescription: Must start with lowercase letter, contain only lowercase letters, numbers, and hyphens
+
+  Environment:
+    Type: String
+    Description: Environment name
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for processing notifications (optional)
+    Default: ""
+    AllowedPattern: ^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address or empty
+
+  RetentionDays:
+    Type: Number
+    Description: Number of days to retain processed documents in S3
+    Default: 90
+    MinValue: 1
+    MaxValue: 2555
+
+  DynamoDBReadCapacity:
+    Type: Number
+    Description: DynamoDB read capacity units
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+
+  DynamoDBWriteCapacity:
+    Type: Number
+    Description: DynamoDB write capacity units
+    Default: 5
+    MinValue: 1
+    MaxValue: 40000
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+Conditions:
+  CreateEmailNotification: !Not [!Equals [!Ref NotificationEmail, ""]]
+  IsProdEnvironment: !Equals [!Ref Environment, "prod"]
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+
+  # ------------------------------------------------------------------------------
+  # S3 BUCKETS
+  # ------------------------------------------------------------------------------
+
+  # Input bucket for document uploads
+  InputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${Environment}-input-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref RetentionDays
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt DocumentClassifierFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: documents/
+                  - Name: suffix
+                    Value: .pdf
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Document input storage
+
+  # Output bucket for processed results
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${Environment}-output-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: DeleteOldFiles
+            Status: Enabled
+            ExpirationInDays: !Ref RetentionDays
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Document analysis results storage
+
+  # ------------------------------------------------------------------------------
+  # DYNAMODB TABLE
+  # ------------------------------------------------------------------------------
+
+  # Metadata table for document processing information
+  MetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-${Environment}-metadata"
+      AttributeDefinitions:
+        - AttributeName: documentId
+          AttributeType: S
+        - AttributeName: documentType
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: documentId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: DocumentTypeIndex
+          KeySchema:
+            - AttributeName: documentType
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !Ref DynamoDBReadCapacity
+            WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref DynamoDBReadCapacity
+        WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProdEnvironment, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Document metadata storage
+
+  # ------------------------------------------------------------------------------
+  # SNS TOPIC
+  # ------------------------------------------------------------------------------
+
+  # SNS topic for processing notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-${Environment}-notifications"
+      DisplayName: Document Processing Notifications
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Document processing notifications
+
+  # Email subscription for notifications (conditional)
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateEmailNotification
+    Properties:
+      Protocol: email
+      TopicArn: !Ref NotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # ------------------------------------------------------------------------------
+  # IAM ROLES AND POLICIES
+  # ------------------------------------------------------------------------------
+
+  # Execution role for Lambda functions and Step Functions
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-execution-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - states.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: TextractDocumentProcessingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Textract permissions
+              - Effect: Allow
+                Action:
+                  - textract:DetectDocumentText
+                  - textract:AnalyzeDocument
+                  - textract:StartDocumentAnalysis
+                  - textract:GetDocumentAnalysis
+                Resource: "*"
+              # S3 permissions
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub "${InputBucket}/*"
+                  - !Sub "${OutputBucket}/*"
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Ref InputBucket
+                  - !Ref OutputBucket
+              # DynamoDB permissions
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt MetadataTable.Arn
+                  - !Sub "${MetadataTable.Arn}/index/*"
+              # SNS permissions
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+              # Step Functions permissions
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                  - states:DescribeExecution
+                  - states:StopExecution
+                Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-${Environment}-workflow"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Lambda and Step Functions execution role
+
+  # ------------------------------------------------------------------------------
+  # LAMBDA FUNCTIONS
+  # ------------------------------------------------------------------------------
+
+  # Document classifier Lambda function
+  DocumentClassifierFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-document-classifier"
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !Ref OutputBucket
+          METADATA_TABLE: !Ref MetadataTable
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from urllib.parse import unquote_plus
+          
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Parse S3 event
+                  bucket = event['Records'][0]['s3']['bucket']['name']
+                  key = unquote_plus(event['Records'][0]['s3']['object']['key'])
+                  
+                  # Get object metadata
+                  response = s3.head_object(Bucket=bucket, Key=key)
+                  file_size = response['ContentLength']
+                  
+                  # Determine processing type based on file size and type
+                  # Files under 5MB for synchronous, larger for asynchronous
+                  processing_type = 'sync' if file_size < 5 * 1024 * 1024 else 'async'
+                  
+                  # Determine document type based on filename
+                  doc_type = 'invoice' if 'invoice' in key.lower() else 'form' if 'form' in key.lower() else 'general'
+                  
+                  print(f"Classified document: {key}, type: {doc_type}, processing: {processing_type}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': {
+                          'bucket': bucket,
+                          'key': key,
+                          'processingType': processing_type,
+                          'documentType': doc_type,
+                          'fileSize': file_size
+                      }
+                  }
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Document classification and routing
+
+  # Permission for S3 to invoke document classifier
+  DocumentClassifierInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DocumentClassifierFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "${InputBucket}"
+
+  # Textract processor Lambda function
+  TextractProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-textract-processor"
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !Ref OutputBucket
+          METADATA_TABLE: !Ref MetadataTable
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+          EXECUTION_ROLE_ARN: !GetAtt ExecutionRole.Arn
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          from datetime import datetime
+          
+          textract = boto3.client('textract')
+          s3 = boto3.client('s3')
+          dynamodb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Get input parameters
+                  bucket = event['bucket']
+                  key = event['key']
+                  processing_type = event['processingType']
+                  document_type = event['documentType']
+                  
+                  document_id = str(uuid.uuid4())
+                  
+                  # Process document based on type
+                  if processing_type == 'sync':
+                      result = process_sync_document(bucket, key, document_type)
+                  else:
+                      result = process_async_document(bucket, key, document_type)
+                  
+                  # Store metadata in DynamoDB
+                  store_metadata(document_id, bucket, key, document_type, result)
+                  
+                  # Send notification
+                  send_notification(document_id, document_type, result.get('status', 'completed'))
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': {
+                          'documentId': document_id,
+                          'processingType': processing_type,
+                          'result': result
+                      }
+                  }
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def process_sync_document(bucket, key, document_type):
+              """Process single-page document synchronously"""
+              try:
+                  # Determine features based on document type
+                  features = ['TABLES', 'FORMS'] if document_type in ['invoice', 'form'] else ['TABLES']
+                  
+                  response = textract.analyze_document(
+                      Document={'S3Object': {'Bucket': bucket, 'Name': key}},
+                      FeatureTypes=features
+                  )
+                  
+                  # Extract and structure data
+                  extracted_data = extract_structured_data(response)
+                  
+                  # Save results to S3
+                  output_key = f"results/{key.split('/')[-1]}-analysis.json"
+                  s3.put_object(
+                      Bucket=os.environ['OUTPUT_BUCKET'],
+                      Key=output_key,
+                      Body=json.dumps(extracted_data, indent=2),
+                      ContentType='application/json'
+                  )
+                  
+                  return {
+                      'status': 'completed',
+                      'outputLocation': f"s3://{os.environ['OUTPUT_BUCKET']}/{output_key}",
+                      'extractedData': extracted_data
+                  }
+              except Exception as e:
+                  print(f"Sync processing error: {str(e)}")
+                  raise
+          
+          def process_async_document(bucket, key, document_type):
+              """Start asynchronous document processing"""
+              try:
+                  features = ['TABLES', 'FORMS'] if document_type in ['invoice', 'form'] else ['TABLES']
+                  
+                  response = textract.start_document_analysis(
+                      DocumentLocation={'S3Object': {'Bucket': bucket, 'Name': key}},
+                      FeatureTypes=features,
+                      NotificationChannel={
+                          'SNSTopicArn': os.environ['SNS_TOPIC_ARN'],
+                          'RoleArn': os.environ['EXECUTION_ROLE_ARN']
+                      }
+                  )
+                  
+                  return {
+                      'status': 'in_progress',
+                      'jobId': response['JobId']
+                  }
+              except Exception as e:
+                  print(f"Async processing error: {str(e)}")
+                  raise
+          
+          def extract_structured_data(response):
+              """Extract structured data from Textract response"""
+              blocks = response['Blocks']
+              
+              # Extract text lines
+              lines = []
+              tables = []
+              forms = []
+              
+              for block in blocks:
+                  if block['BlockType'] == 'LINE':
+                      lines.append({
+                          'text': block.get('Text', ''),
+                          'confidence': block.get('Confidence', 0)
+                      })
+                  elif block['BlockType'] == 'TABLE':
+                      tables.append({
+                          'id': block['Id'],
+                          'confidence': block.get('Confidence', 0)
+                      })
+                  elif block['BlockType'] == 'KEY_VALUE_SET':
+                      forms.append({
+                          'id': block['Id'],
+                          'confidence': block.get('Confidence', 0)
+                      })
+              
+              return {
+                  'text_lines': lines,
+                  'tables': tables,
+                  'forms': forms,
+                  'document_metadata': response.get('DocumentMetadata', {})
+              }
+          
+          def store_metadata(document_id, bucket, key, document_type, result):
+              """Store document metadata in DynamoDB"""
+              table = dynamodb.Table(os.environ['METADATA_TABLE'])
+              
+              table.put_item(
+                  Item={
+                      'documentId': document_id,
+                      'bucket': bucket,
+                      'key': key,
+                      'documentType': document_type,
+                      'processingStatus': result.get('status', 'completed'),
+                      'jobId': result.get('jobId'),
+                      'outputLocation': result.get('outputLocation'),
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'ttl': int((datetime.utcnow().timestamp() + (90 * 24 * 60 * 60)))  # 90 days TTL
+                  }
+              )
+          
+          def send_notification(document_id, document_type, status):
+              """Send processing notification"""
+              message = {
+                  'documentId': document_id,
+                  'documentType': document_type,
+                  'status': status,
+                  'timestamp': datetime.utcnow().isoformat()
+              }
+              
+              sns.publish(
+                  TopicArn=os.environ['SNS_TOPIC_ARN'],
+                  Message=json.dumps(message),
+                  Subject=f'Document Processing {status.title()}'
+              )
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Textract document processing
+
+  # Async results processor Lambda function
+  AsyncResultsProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-async-results-processor"
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !Ref OutputBucket
+          METADATA_TABLE: !Ref MetadataTable
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          textract = boto3.client('textract')
+          s3 = boto3.client('s3')
+          dynamodb = boto3.resource('dynamodb')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Parse SNS message
+                  sns_message = json.loads(event['Records'][0]['Sns']['Message'])
+                  job_id = sns_message['JobId']
+                  status = sns_message['Status']
+                  
+                  if status == 'SUCCEEDED':
+                      # Get results from Textract
+                      response = textract.get_document_analysis(JobId=job_id)
+                      
+                      # Process results
+                      extracted_data = extract_structured_data(response)
+                      
+                      # Save to S3
+                      output_key = f"async-results/{job_id}-analysis.json"
+                      s3.put_object(
+                          Bucket=os.environ['OUTPUT_BUCKET'],
+                          Key=output_key,
+                          Body=json.dumps(extracted_data, indent=2),
+                          ContentType='application/json'
+                      )
+                      
+                      # Update DynamoDB
+                      update_document_metadata(job_id, 'completed', output_key)
+                      
+                      print(f"Successfully processed job {job_id}")
+                  else:
+                      # Update DynamoDB with failed status
+                      update_document_metadata(job_id, 'failed', None)
+                      print(f"Job {job_id} failed")
+                      
+                  return {'statusCode': 200}
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {'statusCode': 500}
+          
+          def extract_structured_data(response):
+              """Extract structured data from Textract response"""
+              blocks = response['Blocks']
+              
+              lines = []
+              tables = []
+              forms = []
+              
+              for block in blocks:
+                  if block['BlockType'] == 'LINE':
+                      lines.append({
+                          'text': block.get('Text', ''),
+                          'confidence': block.get('Confidence', 0)
+                      })
+                  elif block['BlockType'] == 'TABLE':
+                      tables.append({
+                          'id': block['Id'],
+                          'confidence': block.get('Confidence', 0)
+                      })
+                  elif block['BlockType'] == 'KEY_VALUE_SET':
+                      forms.append({
+                          'id': block['Id'],
+                          'confidence': block.get('Confidence', 0)
+                      })
+              
+              return {
+                  'text_lines': lines,
+                  'tables': tables,
+                  'forms': forms,
+                  'document_metadata': response.get('DocumentMetadata', {})
+              }
+          
+          def update_document_metadata(job_id, status, output_location):
+              """Update document metadata in DynamoDB"""
+              table = dynamodb.Table(os.environ['METADATA_TABLE'])
+              
+              # Find document by job ID
+              response = table.scan(
+                  FilterExpression='jobId = :jid',
+                  ExpressionAttributeValues={':jid': job_id}
+              )
+              
+              if response['Items']:
+                  document_id = response['Items'][0]['documentId']
+                  
+                  update_expression = 'SET processingStatus = :status, completedAt = :timestamp'
+                  expression_values = {
+                      ':status': status,
+                      ':timestamp': datetime.utcnow().isoformat()
+                  }
+                  
+                  if output_location:
+                      update_expression += ', outputLocation = :location'
+                      expression_values[':location'] = output_location
+                  
+                  table.update_item(
+                      Key={'documentId': document_id},
+                      UpdateExpression=update_expression,
+                      ExpressionAttributeValues=expression_values
+                  )
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Async Textract results processing
+
+  # SNS subscription for async results processor
+  AsyncResultsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref NotificationTopic
+      Endpoint: !GetAtt AsyncResultsProcessorFunction.Arn
+
+  # Permission for SNS to invoke async results processor
+  AsyncResultsInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AsyncResultsProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref NotificationTopic
+
+  # Document query Lambda function
+  DocumentQueryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-document-query"
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          METADATA_TABLE: !Ref MetadataTable
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime
+          
+          dynamodb = boto3.resource('dynamodb')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Get query parameters
+                  document_id = event.get('documentId')
+                  document_type = event.get('documentType')
+                  
+                  table = dynamodb.Table(os.environ['METADATA_TABLE'])
+                  
+                  if document_id:
+                      # Query specific document
+                      response = table.get_item(Key={'documentId': document_id})
+                      if 'Item' in response:
+                          return {
+                              'statusCode': 200,
+                              'body': json.dumps(response['Item'], default=str)
+                          }
+                      else:
+                          return {
+                              'statusCode': 404,
+                              'body': json.dumps({'error': 'Document not found'})
+                          }
+                  
+                  elif document_type:
+                      # Query by document type using GSI
+                      response = table.query(
+                          IndexName='DocumentTypeIndex',
+                          KeyConditionExpression='documentType = :dt',
+                          ExpressionAttributeValues={':dt': document_type}
+                      )
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps(response['Items'], default=str)
+                      }
+                  
+                  else:
+                      # Return all documents (with pagination)
+                      response = table.scan(Limit=50)
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'items': response['Items'],
+                              'lastEvaluatedKey': response.get('LastEvaluatedKey')
+                          }, default=str)
+                      }
+                      
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Document metadata query API
+
+  # ------------------------------------------------------------------------------
+  # STEP FUNCTIONS STATE MACHINE
+  # ------------------------------------------------------------------------------
+
+  # Document processing workflow
+  DocumentWorkflowStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${ProjectName}-${Environment}-workflow"
+      RoleArn: !GetAtt ExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Document Analysis Workflow with Amazon Textract",
+          "StartAt": "ClassifyDocument",
+          "States": {
+            "ClassifyDocument": {
+              "Type": "Task",
+              "Resource": "${DocumentClassifierFunction.Arn}",
+              "Next": "ProcessDocument",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "ProcessingFailed"
+                }
+              ]
+            },
+            "ProcessDocument": {
+              "Type": "Task",
+              "Resource": "${TextractProcessorFunction.Arn}",
+              "Next": "CheckProcessingType",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "ProcessingFailed"
+                }
+              ]
+            },
+            "CheckProcessingType": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.body.processingType",
+                  "StringEquals": "async",
+                  "Next": "WaitForAsyncCompletion"
+                }
+              ],
+              "Default": "ProcessingComplete"
+            },
+            "WaitForAsyncCompletion": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "CheckAsyncStatus"
+            },
+            "CheckAsyncStatus": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:textract:getDocumentAnalysis",
+              "Parameters": {
+                "JobId.$": "$.body.result.jobId"
+              },
+              "Next": "IsAsyncComplete",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "ProcessingFailed"
+                }
+              ]
+            },
+            "IsAsyncComplete": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.JobStatus",
+                  "StringEquals": "SUCCEEDED",
+                  "Next": "ProcessingComplete"
+                },
+                {
+                  "Variable": "$.JobStatus",
+                  "StringEquals": "FAILED",
+                  "Next": "ProcessingFailed"
+                }
+              ],
+              "Default": "WaitForAsyncCompletion"
+            },
+            "ProcessingComplete": {
+              "Type": "Pass",
+              "Result": "Document processing completed successfully",
+              "End": true
+            },
+            "ProcessingFailed": {
+              "Type": "Fail",
+              "Error": "DocumentProcessingFailed",
+              "Cause": "Textract processing failed"
+            }
+          }
+        }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Document processing workflow orchestration
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+Outputs:
+  InputBucketName:
+    Description: Name of the S3 bucket for document uploads
+    Value: !Ref InputBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-InputBucket"
+
+  OutputBucketName:
+    Description: Name of the S3 bucket for processed results
+    Value: !Ref OutputBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-OutputBucket"
+
+  MetadataTableName:
+    Description: Name of the DynamoDB table for document metadata
+    Value: !Ref MetadataTable
+    Export:
+      Name: !Sub "${AWS::StackName}-MetadataTable"
+
+  NotificationTopicArn:
+    Description: ARN of the SNS topic for processing notifications
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-NotificationTopic"
+
+  DocumentClassifierFunctionArn:
+    Description: ARN of the document classifier Lambda function
+    Value: !GetAtt DocumentClassifierFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-DocumentClassifierFunction"
+
+  TextractProcessorFunctionArn:
+    Description: ARN of the Textract processor Lambda function
+    Value: !GetAtt TextractProcessorFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-TextractProcessorFunction"
+
+  AsyncResultsProcessorFunctionArn:
+    Description: ARN of the async results processor Lambda function
+    Value: !GetAtt AsyncResultsProcessorFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-AsyncResultsProcessorFunction"
+
+  DocumentQueryFunctionArn:
+    Description: ARN of the document query Lambda function
+    Value: !GetAtt DocumentQueryFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-DocumentQueryFunction"
+
+  WorkflowStateMachineArn:
+    Description: ARN of the Step Functions state machine
+    Value: !Ref DocumentWorkflowStateMachine
+    Export:
+      Name: !Sub "${AWS::StackName}-WorkflowStateMachine"
+
+  ExecutionRoleArn:
+    Description: ARN of the execution role for Lambda functions and Step Functions
+    Value: !GetAtt ExecutionRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ExecutionRole"
+
+  DocumentUploadURL:
+    Description: URL for uploading documents (prefix with documents/)
+    Value: !Sub "s3://${InputBucket}/documents/"
+
+  TestCommand:
+    Description: AWS CLI command to test document upload
+    Value: !Sub "aws s3 cp your-document.pdf s3://${InputBucket}/documents/"

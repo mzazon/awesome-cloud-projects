@@ -1,0 +1,601 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Multi-Region Distributed Applications with Aurora DSQL
+  Creates Aurora DSQL clusters in primary and secondary regions with Lambda functions
+  and EventBridge for event-driven coordination across regions.
+  
+Parameters:
+  PrimaryRegion:
+    Type: String
+    Default: us-east-1
+    Description: Primary region for Aurora DSQL cluster
+    AllowedValues:
+      - us-east-1
+      - us-west-2
+      - eu-west-1
+      - ap-northeast-1
+
+  SecondaryRegion:
+    Type: String
+    Default: us-west-2
+    Description: Secondary region for Aurora DSQL cluster
+    AllowedValues:
+      - us-east-1
+      - us-west-2
+      - eu-west-1
+      - ap-northeast-1
+
+  WitnessRegion:
+    Type: String
+    Default: eu-west-1
+    Description: Witness region for Aurora DSQL multi-region configuration
+    AllowedValues:
+      - us-east-1
+      - us-west-2
+      - eu-west-1
+      - ap-northeast-1
+
+  Environment:
+    Type: String
+    Default: Production
+    Description: Environment name for resource tagging
+    AllowedValues:
+      - Development
+      - Testing
+      - Staging
+      - Production
+
+  ApplicationName:
+    Type: String
+    Default: DistributedApp
+    Description: Name of the application for resource tagging
+    MinLength: 1
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    Description: Lambda function timeout in seconds
+
+  EnableCrossRegionReplication:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable cross-region event replication via EventBridge
+
+Conditions:
+  EnableReplication: !Equals [!Ref EnableCrossRegionReplication, 'true']
+  IsProduction: !Equals [!Ref Environment, 'Production']
+
+Resources:
+  # =============================================
+  # IAM ROLES AND POLICIES
+  # =============================================
+  
+  DSQLLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'DSQLLambdaRole-${AWS::StackName}-${AWS::AccountId}'
+      Description: 'Execution role for Lambda functions accessing Aurora DSQL and EventBridge'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AuroraDSQLEventBridgeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dsql:Connect
+                  - dsql:DbConnect
+                  - dsql:ExecuteStatement
+                  - dsql:BatchExecuteStatement
+                  - dsql:BeginTransaction
+                  - dsql:CommitTransaction
+                  - dsql:RollbackTransaction
+                Resource: !Sub 'arn:aws:dsql:*:${AWS::AccountId}:cluster/*'
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: 
+                  - !Sub 'arn:aws:events:${PrimaryRegion}:${AWS::AccountId}:event-bus/${EventBridgeBusName}'
+                  - !Sub 'arn:aws:events:${SecondaryRegion}:${AWS::AccountId}:event-bus/${EventBridgeBusName}'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:*:${AWS::AccountId}:*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # =============================================
+  # AURORA DSQL CLUSTERS
+  # =============================================
+  
+  PrimaryAuroraDSQLCluster:
+    Type: AWS::DSQL::Cluster
+    Properties:
+      ClusterName: !Sub '${ApplicationName}-primary-cluster-${AWS::StackName}'
+      WitnessRegion: !Ref WitnessRegion
+      EngineVersion: postgres
+      DeletionProtection: !If [IsProduction, true, false]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Region
+          Value: !Ref PrimaryRegion
+        - Key: ClusterType
+          Value: Primary
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Note: Secondary cluster would be created in a separate stack in the secondary region
+  # This template demonstrates the primary region resources
+  
+  # =============================================
+  # EVENTBRIDGE RESOURCES
+  # =============================================
+  
+  CustomEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Ref EventBridgeBusName
+      Description: 'Custom event bus for Aurora DSQL distributed application events'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  EventBridgeBusName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/dsql/${ApplicationName}/${AWS::StackName}/eventbridge-bus-name'
+      Type: String
+      Value: !Sub 'dsql-events-${ApplicationName}-${AWS::StackName}'
+      Description: 'Name of the EventBridge custom bus for Aurora DSQL events'
+
+  CrossRegionReplicationRule:
+    Type: AWS::Events::Rule
+    Condition: EnableReplication
+    Properties:
+      Name: !Sub 'CrossRegionReplication-${AWS::StackName}'
+      Description: 'Rule for cross-region event replication'
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        source:
+          - dsql.application
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt PrimaryLambdaFunction.Arn
+          Id: PrimaryLambdaTarget
+          InputTransformer:
+            InputPathsMap:
+              region: '$.detail.region'
+              transaction_id: '$.detail.transaction_id'
+              amount: '$.detail.amount'
+            InputTemplate: |
+              {
+                "operation": "cross_region_sync",
+                "source_region": "<region>",
+                "transaction_id": "<transaction_id>",
+                "amount": "<amount>"
+              }
+
+  # =============================================
+  # LAMBDA FUNCTIONS
+  # =============================================
+  
+  PrimaryLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ApplicationName}-dsql-processor-primary-${AWS::StackName}'
+      Description: 'Lambda function for Aurora DSQL operations in primary region'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt DSQLLambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: 256
+      ReservedConcurrencyLimit: 100
+      Environment:
+        Variables:
+          DSQL_CLUSTER_ID: !Ref PrimaryAuroraDSQLCluster
+          EVENT_BUS_NAME: !GetAtt EventBridgeBusName.Value
+          REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+          APPLICATION_NAME: !Ref ApplicationName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          from datetime import datetime
+          from typing import Dict, Any
+          
+          def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
+              """
+              Lambda handler for Aurora DSQL operations and EventBridge coordination
+              Supports read, write, and cross-region synchronization operations
+              """
+              # Initialize AWS service clients
+              dsql_client = boto3.client('dsql')
+              eventbridge = boto3.client('events')
+              
+              # Get configuration from environment variables
+              cluster_id = os.environ.get('DSQL_CLUSTER_ID')
+              event_bus_name = os.environ.get('EVENT_BUS_NAME')
+              region = os.environ.get('REGION', context.invoked_function_arn.split(':')[3])
+              
+              try:
+                  operation = event.get('operation', 'read')
+                  
+                  if operation == 'write':
+                      return handle_write_operation(dsql_client, eventbridge, event, context, 
+                                                   cluster_id, event_bus_name, region)
+                  elif operation == 'read':
+                      return handle_read_operation(dsql_client, cluster_id, region)
+                  elif operation == 'cross_region_sync':
+                      return handle_cross_region_sync(event, region)
+                  else:
+                      return create_response(400, {'error': f'Invalid operation: {operation}'})
+              
+              except Exception as e:
+                  print(f"Error processing request: {str(e)}")
+                  return create_response(500, {'error': f'Internal server error: {str(e)}'})
+          
+          def handle_write_operation(dsql_client, eventbridge, event, context, 
+                                   cluster_id, event_bus_name, region):
+              """Handle database write operations and publish events"""
+              transaction_id = event.get('transaction_id', str(uuid.uuid4()))
+              amount = float(event.get('amount', 0))
+              
+              # Execute write operation using Aurora DSQL Data API
+              response = dsql_client.execute_statement(
+                  ClusterIdentifier=cluster_id,
+                  Sql="""
+                      INSERT INTO transactions (id, amount, timestamp, region, status)
+                      VALUES (?, ?, ?, ?, ?)
+                  """,
+                  Parameters=[
+                      {'StringValue': transaction_id},
+                      {'DoubleValue': amount},
+                      {'StringValue': datetime.now().isoformat()},
+                      {'StringValue': region},
+                      {'StringValue': 'completed'}
+                  ]
+              )
+              
+              # Publish event to EventBridge for cross-region coordination
+              eventbridge.put_events(
+                  Entries=[
+                      {
+                          'Source': 'dsql.application',
+                          'DetailType': 'Transaction Created',
+                          'Detail': json.dumps({
+                              'transaction_id': transaction_id,
+                              'amount': amount,
+                              'region': region,
+                              'timestamp': datetime.now().isoformat(),
+                              'status': 'completed'
+                          }),
+                          'EventBusName': event_bus_name
+                      }
+                  ]
+              )
+              
+              return create_response(200, {
+                  'message': 'Transaction created successfully',
+                  'transaction_id': transaction_id,
+                  'amount': amount,
+                  'region': region
+              })
+          
+          def handle_read_operation(dsql_client, cluster_id, region):
+              """Handle database read operations"""
+              # Execute read operation
+              response = dsql_client.execute_statement(
+                  ClusterIdentifier=cluster_id,
+                  Sql="""
+                      SELECT 
+                          COUNT(*) as total_count,
+                          SUM(amount) as total_amount,
+                          MAX(timestamp) as latest_transaction
+                      FROM transactions
+                  """
+              )
+              
+              # Extract results
+              if response.get('Records') and len(response['Records']) > 0:
+                  record = response['Records'][0]['Values']
+                  total_count = record[0].get('LongValue', 0)
+                  total_amount = record[1].get('DoubleValue', 0.0) if record[1].get('DoubleValue') else 0.0
+                  latest_transaction = record[2].get('StringValue', 'No transactions')
+              else:
+                  total_count = 0
+                  total_amount = 0.0
+                  latest_transaction = 'No transactions'
+              
+              return create_response(200, {
+                  'transaction_count': total_count,
+                  'total_amount': total_amount,
+                  'latest_transaction': latest_transaction,
+                  'region': region
+              })
+          
+          def handle_cross_region_sync(event, region):
+              """Handle cross-region synchronization events"""
+              source_region = event.get('source_region', 'unknown')
+              transaction_id = event.get('transaction_id', 'unknown')
+              
+              return create_response(200, {
+                  'message': 'Cross-region sync processed',
+                  'source_region': source_region,
+                  'target_region': region,
+                  'transaction_id': transaction_id
+              })
+          
+          def create_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
+              """Create standardized API response"""
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                      'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+                  },
+                  'body': json.dumps(body, default=str)
+              }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Region
+          Value: !Ref PrimaryRegion
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Lambda permission for EventBridge to invoke the function
+  LambdaEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PrimaryLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CrossRegionReplicationRule.Arn
+
+  # =============================================
+  # DATABASE SCHEMA INITIALIZATION
+  # =============================================
+  
+  DatabaseSchemaInitializer:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ApplicationName}-schema-initializer-${AWS::StackName}'
+      Description: 'One-time function to initialize Aurora DSQL database schema'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt DSQLLambdaExecutionRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          DSQL_CLUSTER_ID: !Ref PrimaryAuroraDSQLCluster
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+          
+          def lambda_handler(event, context):
+              """Initialize database schema for Aurora DSQL cluster"""
+              try:
+                  if event['RequestType'] == 'Create':
+                      dsql_client = boto3.client('dsql')
+                      cluster_id = os.environ.get('DSQL_CLUSTER_ID')
+                      
+                      # Create transactions table
+                      schema_sql = """
+                      CREATE TABLE IF NOT EXISTS transactions (
+                          id VARCHAR(255) PRIMARY KEY,
+                          amount DECIMAL(10,2) NOT NULL,
+                          timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                          region VARCHAR(50) NOT NULL,
+                          status VARCHAR(50) DEFAULT 'pending'
+                      );
+                      
+                      CREATE INDEX IF NOT EXISTS idx_transactions_timestamp ON transactions(timestamp);
+                      CREATE INDEX IF NOT EXISTS idx_transactions_region ON transactions(region);
+                      CREATE INDEX IF NOT EXISTS idx_transactions_status ON transactions(status);
+                      
+                      CREATE SEQUENCE IF NOT EXISTS transaction_seq START 1;
+                      """
+                      
+                      # Execute schema creation
+                      response = dsql_client.execute_statement(
+                          ClusterIdentifier=cluster_id,
+                          Sql=schema_sql
+                      )
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                     {'Message': 'Schema created successfully'})
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                     {'Message': 'No action required'})
+              
+              except Exception as e:
+                  print(f"Error initializing schema: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, 
+                                 {'Error': str(e)})
+
+  # Custom resource to trigger schema initialization
+  SchemaInitializerTrigger:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: PrimaryAuroraDSQLCluster
+    Properties:
+      ServiceToken: !GetAtt DatabaseSchemaInitializer.Arn
+      ClusterId: !Ref PrimaryAuroraDSQLCluster
+
+  # =============================================
+  # MONITORING AND LOGGING
+  # =============================================
+  
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${PrimaryLambdaFunction}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  SchemaInitializerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DatabaseSchemaInitializer}'
+      RetentionInDays: 7
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # CloudWatch Alarms for monitoring
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-Lambda-Errors-${AWS::StackName}'
+      AlarmDescription: 'Alarm for Lambda function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PrimaryLambdaFunction
+      TreatMissingData: notBreaching
+
+  LambdaThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-Lambda-Throttles-${AWS::StackName}'
+      AlarmDescription: 'Alarm for Lambda function throttles'
+      MetricName: Throttles
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PrimaryLambdaFunction
+      TreatMissingData: notBreaching
+
+# =============================================
+# OUTPUTS
+# =============================================
+
+Outputs:
+  PrimaryClusterId:
+    Description: 'Aurora DSQL Primary Cluster Identifier'
+    Value: !Ref PrimaryAuroraDSQLCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryClusterId'
+
+  PrimaryClusterEndpoint:
+    Description: 'Aurora DSQL Primary Cluster Endpoint'
+    Value: !GetAtt PrimaryAuroraDSQLCluster.Endpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryClusterEndpoint'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the primary Lambda function'
+    Value: !GetAtt PrimaryLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  LambdaFunctionName:
+    Description: 'Name of the primary Lambda function'
+    Value: !Ref PrimaryLambdaFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  EventBridgeBusName:
+    Description: 'Name of the custom EventBridge bus'
+    Value: !GetAtt EventBridgeBusName.Value
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeBusName'
+
+  EventBridgeBusArn:
+    Description: 'ARN of the custom EventBridge bus'
+    Value: !GetAtt CustomEventBus.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeBusArn'
+
+  IAMRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt DSQLLambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IAMRoleArn'
+
+  PrimaryRegion:
+    Description: 'Primary deployment region'
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryRegion'
+
+  WitnessRegion:
+    Description: 'Witness region for multi-region configuration'
+    Value: !Ref WitnessRegion
+    Export:
+      Name: !Sub '${AWS::StackName}-WitnessRegion'
+
+  StackName:
+    Description: 'CloudFormation stack name'
+    Value: !Ref AWS::StackName
+    Export:
+      Name: !Sub '${AWS::StackName}-StackName'
+
+  DeploymentInstructions:
+    Description: 'Instructions for completing multi-region deployment'
+    Value: !Sub |
+      1. Deploy this template in the primary region (${PrimaryRegion})
+      2. Deploy a similar template in the secondary region (${SecondaryRegion})
+      3. Create multi-region cluster link using AWS CLI:
+         aws dsql create-multi-region-clusters \
+           --region ${PrimaryRegion} \
+           --primary-cluster-identifier ${PrimaryAuroraDSQLCluster} \
+           --secondary-cluster-identifier SECONDARY_CLUSTER_ID \
+           --secondary-cluster-region ${SecondaryRegion} \
+           --witness-region ${WitnessRegion}
+      4. Test Lambda functions in both regions
+      5. Verify EventBridge cross-region replication

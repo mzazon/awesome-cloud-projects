@@ -1,0 +1,641 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Fine-Grained Access Control with IAM Policies and Conditions
+  This template creates comprehensive IAM policies demonstrating advanced conditional access control
+  patterns including time-based, IP-based, tag-based, MFA-required, and session-based controls.
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: finegrained-access
+    Description: Name prefix for all resources created by this stack
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    MinLength: 3
+    MaxLength: 20
+
+  Environment:
+    Type: String
+    Default: test
+    Description: Environment name for tagging and resource naming
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    ConstraintDescription: Must be one of dev, test, staging, or prod
+
+  AllowedIpRanges:
+    Type: CommaDelimitedList
+    Default: "203.0.113.0/24,198.51.100.0/24"
+    Description: Comma-delimited list of IP CIDR blocks allowed for restricted access
+    ConstraintDescription: Must be valid CIDR blocks (e.g., 203.0.113.0/24)
+
+  BusinessHoursStart:
+    Type: String
+    Default: "09:00Z"
+    Description: Business hours start time in UTC (HH:MMZ format)
+    AllowedPattern: '^([0-1][0-9]|2[0-3]):[0-5][0-9]Z$'
+    ConstraintDescription: Must be in HH:MMZ format (e.g., 09:00Z)
+
+  BusinessHoursEnd:
+    Type: String
+    Default: "17:00Z"
+    Description: Business hours end time in UTC (HH:MMZ format)
+    AllowedPattern: '^([0-1][0-9]|2[0-3]):[0-5][0-9]Z$'
+    ConstraintDescription: Must be in HH:MMZ format (e.g., 17:00Z)
+
+  MaxSessionDuration:
+    Type: Number
+    Default: 3600
+    Description: Maximum session duration in seconds for temporary credentials
+    MinValue: 900
+    MaxValue: 43200
+    ConstraintDescription: Must be between 900 (15 minutes) and 43200 (12 hours)
+
+  MfaMaxAge:
+    Type: Number
+    Default: 3600
+    Description: Maximum age of MFA authentication in seconds
+    MinValue: 300
+    MaxValue: 86400
+    ConstraintDescription: Must be between 300 (5 minutes) and 86400 (24 hours)
+
+  CreateTestResources:
+    Type: String
+    Default: 'true'
+    Description: Whether to create test S3 bucket and CloudWatch log group
+    AllowedValues:
+      - 'true'
+      - 'false'
+    ConstraintDescription: Must be true or false
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+Conditions:
+  ShouldCreateTestResources: !Equals [!Ref CreateTestResources, 'true']
+  IsProductionEnvironment: !Equals [!Ref Environment, 'prod']
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+  # ------------------------------------------------------------------------------
+  # Test Resources (S3 Bucket and CloudWatch Log Group)
+  # ------------------------------------------------------------------------------
+  TestS3Bucket:
+    Type: AWS::S3::Bucket
+    Condition: ShouldCreateTestResources
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-test-bucket-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref TestLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-test-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: IAM Policy Testing
+        - Key: Department
+          Value: Engineering
+
+  TestS3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: ShouldCreateTestResources
+    Properties:
+      Bucket: !Ref TestS3Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow access from test role with encryption requirements
+          - Sid: AllowTestRoleAccessWithEncryption
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt TestRole.Arn
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Resource: !Sub '${TestS3Bucket}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-server-side-encryption': 'AES256'
+              StringLike:
+                's3:x-amz-meta-project': !Sub '${ProjectName}*'
+          # Deny insecure transport
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${TestS3Bucket}'
+              - !Sub '${TestS3Bucket}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  TestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ShouldCreateTestResources
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}'
+      RetentionInDays: 14
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-test-log-group'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: IAM Policy Testing
+
+  # ------------------------------------------------------------------------------
+  # IAM Policies - Time-Based Access Control
+  # ------------------------------------------------------------------------------
+  BusinessHoursPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ProjectName}-${Environment}-business-hours-policy'
+      Description: S3 access restricted to business hours only
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3AccessDuringBusinessHours
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:ListBucket
+            Resource:
+              - !If
+                - ShouldCreateTestResources
+                - !Sub '${TestS3Bucket}'
+                - !Sub 'arn:aws:s3:::${ProjectName}-*'
+              - !If
+                - ShouldCreateTestResources
+                - !Sub '${TestS3Bucket}/*'
+                - !Sub 'arn:aws:s3:::${ProjectName}-*/*'
+            Condition:
+              DateGreaterThan:
+                'aws:CurrentTime': !Ref BusinessHoursStart
+              DateLessThan:
+                'aws:CurrentTime': !Ref BusinessHoursEnd
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-business-hours-policy'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: PolicyType
+          Value: Time-Based Access Control
+
+  # ------------------------------------------------------------------------------
+  # IAM Policies - IP-Based Access Control
+  # ------------------------------------------------------------------------------
+  IpRestrictionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ProjectName}-${Environment}-ip-restriction-policy'
+      Description: CloudWatch Logs access from specific IP ranges only
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow CloudWatch Logs access from specific IPs
+          - Sid: AllowLogsAccessFromSpecificIPs
+            Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogGroups
+              - logs:DescribeLogStreams
+            Resource: !Sub 'arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}*'
+            Condition:
+              IpAddress:
+                'aws:SourceIp': !Ref AllowedIpRanges
+          # Deny all actions from unauthorized IPs (except AWS service calls)
+          - Sid: DenyAccessFromUnauthorizedIPs
+            Effect: Deny
+            Action: '*'
+            Resource: '*'
+            Condition:
+              Bool:
+                'aws:ViaAWSService': 'false'
+              NotIpAddress:
+                'aws:SourceIp': !Ref AllowedIpRanges
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ip-restriction-policy'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: PolicyType
+          Value: IP-Based Access Control
+
+  # ------------------------------------------------------------------------------
+  # IAM Policies - Tag-Based Access Control (ABAC)
+  # ------------------------------------------------------------------------------
+  TagBasedPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ProjectName}-${Environment}-tag-based-policy'
+      Description: S3 access based on user and resource tags (ABAC)
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow access to objects where principal and resource departments match
+          - Sid: AllowAccessToMatchingDepartmentObjects
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Resource: !If
+              - ShouldCreateTestResources
+              - !Sub '${TestS3Bucket}/*'
+              - !Sub 'arn:aws:s3:::${ProjectName}-*/*'
+            Condition:
+              StringEquals:
+                'aws:PrincipalTag/Department': '${s3:ExistingObjectTag/Department}'
+          # Allow access to shared resources for all authenticated users
+          - Sid: AllowAccessToSharedResources
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Resource: !If
+              - ShouldCreateTestResources
+              - !Sub '${TestS3Bucket}/shared/*'
+              - !Sub 'arn:aws:s3:::${ProjectName}-*/shared/*'
+          # Allow listing with department-based prefix filtering
+          - Sid: AllowListingWithDepartmentFilter
+            Effect: Allow
+            Action: s3:ListBucket
+            Resource: !If
+              - ShouldCreateTestResources
+              - !Ref TestS3Bucket
+              - !Sub 'arn:aws:s3:::${ProjectName}-*'
+            Condition:
+              StringLike:
+                's3:prefix':
+                  - 'shared/*'
+                  - '${aws:PrincipalTag/Department}/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-tag-based-policy'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: PolicyType
+          Value: Tag-Based Access Control
+
+  # ------------------------------------------------------------------------------
+  # IAM Policies - MFA Required for Sensitive Operations
+  # ------------------------------------------------------------------------------
+  MfaRequiredPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ProjectName}-${Environment}-mfa-required-policy'
+      Description: S3 write operations require MFA authentication
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow read operations without MFA
+          - Sid: AllowReadOperationsWithoutMFA
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !If
+                - ShouldCreateTestResources
+                - !Ref TestS3Bucket
+                - !Sub 'arn:aws:s3:::${ProjectName}-*'
+              - !If
+                - ShouldCreateTestResources
+                - !Sub '${TestS3Bucket}/*'
+                - !Sub 'arn:aws:s3:::${ProjectName}-*/*'
+          # Require MFA for write operations
+          - Sid: RequireMFAForWriteOperations
+            Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:PutObjectAcl
+            Resource: !If
+              - ShouldCreateTestResources
+              - !Sub '${TestS3Bucket}/*'
+              - !Sub 'arn:aws:s3:::${ProjectName}-*/*'
+            Condition:
+              Bool:
+                'aws:MultiFactorAuthPresent': 'true'
+              NumericLessThan:
+                'aws:MultiFactorAuthAge': !Ref MfaMaxAge
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-mfa-required-policy'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: PolicyType
+          Value: MFA Required Access Control
+
+  # ------------------------------------------------------------------------------
+  # IAM Policies - Session-Based Access Control
+  # ------------------------------------------------------------------------------
+  SessionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ProjectName}-${Environment}-session-policy'
+      Description: Session-based access control with duration limits
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow CloudWatch Logs access with session constraints
+          - Sid: AllowLogsAccessWithSessionConstraints
+            Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub 'arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}*'
+            Condition:
+              StringEquals:
+                'aws:userid': '${aws:userid}'
+              StringLike:
+                'aws:rolename': !Sub '${ProjectName}*'
+              NumericLessThan:
+                'aws:TokenIssueTime': '${aws:CurrentTime}'
+          # Allow getting session tokens with duration limits
+          - Sid: AllowSessionTokensWithDurationLimit
+            Effect: Allow
+            Action: sts:GetSessionToken
+            Resource: '*'
+            Condition:
+              NumericLessThan:
+                'aws:RequestedDuration': !Ref MaxSessionDuration
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-session-policy'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: PolicyType
+          Value: Session-Based Access Control
+
+  # ------------------------------------------------------------------------------
+  # Test IAM User with Department Tags
+  # ------------------------------------------------------------------------------
+  TestUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub '${ProjectName}-${Environment}-test-user'
+      ManagedPolicyArns:
+        - !Ref TagBasedPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-test-user'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Department
+          Value: Engineering
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ------------------------------------------------------------------------------
+  # Test IAM Role with Conditional Trust Policy
+  # ------------------------------------------------------------------------------
+  TestRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-test-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowAssumeRoleWithConditions
+            Effect: Allow
+            Principal:
+              AWS: !Sub '${TestUser.Arn}'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref 'AWS::Region'
+              IpAddress:
+                'aws:SourceIp': !Ref AllowedIpRanges
+      ManagedPolicyArns:
+        - !Ref BusinessHoursPolicy
+        - !Ref SessionPolicy
+      MaxSessionDuration: !Ref MaxSessionDuration
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-test-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Department
+          Value: Engineering
+
+  # ------------------------------------------------------------------------------
+  # Administrative Role for Testing and Management
+  # ------------------------------------------------------------------------------
+  AdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-admin-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              Bool:
+                'aws:MultiFactorAuthPresent': !If [IsProductionEnvironment, 'true', 'false']
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+        - !Ref IpRestrictionPolicy
+        - !Ref MfaRequiredPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-admin-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Administrative Access
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+Outputs:
+  # Policy ARNs
+  BusinessHoursPolicyArn:
+    Description: ARN of the business hours access policy
+    Value: !Ref BusinessHoursPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-BusinessHoursPolicyArn'
+
+  IpRestrictionPolicyArn:
+    Description: ARN of the IP restriction access policy
+    Value: !Ref IpRestrictionPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-IpRestrictionPolicyArn'
+
+  TagBasedPolicyArn:
+    Description: ARN of the tag-based access policy
+    Value: !Ref TagBasedPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-TagBasedPolicyArn'
+
+  MfaRequiredPolicyArn:
+    Description: ARN of the MFA required access policy
+    Value: !Ref MfaRequiredPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-MfaRequiredPolicyArn'
+
+  SessionPolicyArn:
+    Description: ARN of the session-based access policy
+    Value: !Ref SessionPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-SessionPolicyArn'
+
+  # IAM Principal ARNs
+  TestUserArn:
+    Description: ARN of the test user
+    Value: !GetAtt TestUser.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TestUserArn'
+
+  TestRoleArn:
+    Description: ARN of the test role
+    Value: !GetAtt TestRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TestRoleArn'
+
+  AdminRoleArn:
+    Description: ARN of the admin role
+    Value: !GetAtt AdminRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AdminRoleArn'
+
+  # Test Resource Information
+  TestS3BucketName:
+    Condition: ShouldCreateTestResources
+    Description: Name of the test S3 bucket
+    Value: !Ref TestS3Bucket
+    Export:
+      Name: !Sub '${AWS::StackName}-TestS3BucketName'
+
+  TestS3BucketArn:
+    Condition: ShouldCreateTestResources
+    Description: ARN of the test S3 bucket
+    Value: !GetAtt TestS3Bucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TestS3BucketArn'
+
+  TestLogGroupName:
+    Condition: ShouldCreateTestResources
+    Description: Name of the test CloudWatch log group
+    Value: !Ref TestLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-TestLogGroupName'
+
+  TestLogGroupArn:
+    Condition: ShouldCreateTestResources
+    Description: ARN of the test CloudWatch log group
+    Value: !GetAtt TestLogGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TestLogGroupArn'
+
+  # Configuration Values
+  ProjectName:
+    Description: Project name used for resource naming
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectName'
+
+  Environment:
+    Description: Environment name for this deployment
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+  # Policy Testing Commands
+  PolicySimulatorCommand:
+    Description: Sample command to test policies using IAM Policy Simulator
+    Value: !Sub |
+      aws iam simulate-principal-policy \
+        --policy-source-arn "${TestRole.Arn}" \
+        --action-names "s3:GetObject" \
+        --resource-arns "${TestS3Bucket}/test-file.txt" \
+        --context-entries ContextKeyName=aws:CurrentTime,ContextKeyValues="14:00:00Z",ContextKeyType=date
+
+  AssumeRoleCommand:
+    Description: Sample command to assume the test role
+    Value: !Sub |
+      aws sts assume-role \
+        --role-arn "${TestRole.Arn}" \
+        --role-session-name "test-session"
+
+# ==============================================================================
+# METADATA
+# ==============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Access Control Configuration"
+        Parameters:
+          - AllowedIpRanges
+          - BusinessHoursStart
+          - BusinessHoursEnd
+          - MaxSessionDuration
+          - MfaMaxAge
+      - Label:
+          default: "Resource Creation Options"
+        Parameters:
+          - CreateTestResources
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      AllowedIpRanges:
+        default: "Allowed IP Ranges"
+      BusinessHoursStart:
+        default: "Business Hours Start"
+      BusinessHoursEnd:
+        default: "Business Hours End"
+      MaxSessionDuration:
+        default: "Maximum Session Duration"
+      MfaMaxAge:
+        default: "MFA Maximum Age"
+      CreateTestResources:
+        default: "Create Test Resources"
+
+  AWS::CloudFormation::Designer:
+    ResourceTypes:
+      - AWS::IAM::ManagedPolicy
+      - AWS::IAM::User
+      - AWS::IAM::Role
+      - AWS::S3::Bucket
+      - AWS::S3::BucketPolicy
+      - AWS::Logs::LogGroup

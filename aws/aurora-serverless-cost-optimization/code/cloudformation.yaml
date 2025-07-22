@@ -1,0 +1,1021 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Aurora Serverless v2 Auto-Scaling Patterns for Cost Optimization
+  This template creates an Aurora Serverless v2 cluster with intelligent auto-scaling patterns,
+  cost-aware Lambda functions, EventBridge scheduling, and comprehensive monitoring.
+
+Parameters:
+  # Environment Configuration
+  Environment:
+    Type: String
+    Default: development
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: Environment type for auto-pause/resume scheduling
+
+  # Database Configuration
+  DatabaseMasterUsername:
+    Type: String
+    Default: postgres
+    Description: Master username for Aurora cluster
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9]*$'
+
+  DatabaseMasterPassword:
+    Type: String
+    NoEcho: true
+    Description: Master password for Aurora cluster (minimum 8 characters)
+    MinLength: 8
+    MaxLength: 128
+    AllowedPattern: '^[a-zA-Z0-9!@#$%^&*()_+\-=\[\]{};:"\\|,.<>\/?]*$'
+
+  # Scaling Configuration
+  MinServerlessCapacity:
+    Type: Number
+    Default: 0.5
+    MinValue: 0.5
+    MaxValue: 384
+    Description: Minimum Aurora Capacity Units (ACUs) for serverless scaling
+
+  MaxServerlessCapacity:
+    Type: Number
+    Default: 16
+    MinValue: 1
+    MaxValue: 384
+    Description: Maximum Aurora Capacity Units (ACUs) for serverless scaling
+
+  ReaderMinCapacity:
+    Type: Number
+    Default: 0.5
+    MinValue: 0.5
+    MaxValue: 384
+    Description: Minimum ACUs for read replica instances
+
+  ReaderMaxCapacity:
+    Type: Number
+    Default: 8
+    MinValue: 1
+    MaxValue: 384
+    Description: Maximum ACUs for read replica instances
+
+  # Monitoring Configuration
+  EnableEnhancedMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable enhanced monitoring for Aurora instances
+
+  MonitoringInterval:
+    Type: Number
+    Default: 60
+    AllowedValues: [0, 1, 5, 10, 15, 30, 60]
+    Description: Enhanced monitoring interval in seconds
+
+  # Cost Management
+  MonthlyCostBudget:
+    Type: Number
+    Default: 200
+    MinValue: 10
+    MaxValue: 10000
+    Description: Monthly cost budget for Aurora cluster in USD
+
+  CostAlertThreshold:
+    Type: Number
+    Default: 80
+    MinValue: 1
+    MaxValue: 100
+    Description: Budget threshold percentage for cost alerts
+
+  # Network Configuration
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where Aurora cluster will be deployed
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of subnet IDs for Aurora cluster (minimum 2 in different AZs)
+
+  AllowedCidrBlocks:
+    Type: CommaDelimitedList
+    Default: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+    Description: CIDR blocks allowed to access Aurora cluster
+
+Conditions:
+  # Environment-based conditions
+  IsProduction: !Equals [!Ref Environment, 'production']
+  IsDevelopment: !Equals [!Ref Environment, 'development']
+  EnableEnhancedMonitoringCondition: !Equals [!Ref EnableEnhancedMonitoring, 'true']
+  
+  # Scaling conditions
+  EnableAutoPause: !Not [!Condition IsProduction]
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+      - Label:
+          default: "Database Configuration"
+        Parameters:
+          - DatabaseMasterUsername
+          - DatabaseMasterPassword
+      - Label:
+          default: "Scaling Configuration"
+        Parameters:
+          - MinServerlessCapacity
+          - MaxServerlessCapacity
+          - ReaderMinCapacity
+          - ReaderMaxCapacity
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableEnhancedMonitoring
+          - MonitoringInterval
+      - Label:
+          default: "Cost Management"
+        Parameters:
+          - MonthlyCostBudget
+          - CostAlertThreshold
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - SubnetIds
+          - AllowedCidrBlocks
+    ParameterLabels:
+      Environment:
+        default: "Environment Type"
+      DatabaseMasterUsername:
+        default: "Master Username"
+      DatabaseMasterPassword:
+        default: "Master Password"
+
+Resources:
+  # =============================================================================
+  # IAM ROLES AND POLICIES
+  # =============================================================================
+  
+  # Enhanced Monitoring Role for RDS
+  EnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Condition: EnableEnhancedMonitoringCondition
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-rds-monitoring-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-rds-monitoring-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Execution Role for Aurora Management
+  AuroraLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-aurora-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AuroraManagementPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBClusters
+                  - rds:DescribeDBInstances
+                  - rds:ModifyDBCluster
+                  - rds:ModifyDBInstance
+                  - rds:StartDBCluster
+                  - rds:StopDBCluster
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:PutMetricData
+                  - ce:GetUsageAndCosts
+                  - budgets:ViewBudget
+                  - sns:Publish
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-aurora-lambda-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # =============================================================================
+  # NETWORK SECURITY
+  # =============================================================================
+
+  # Security Group for Aurora Cluster
+  AuroraSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-aurora-sg'
+      GroupDescription: Security group for Aurora Serverless v2 cluster
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: !Select [0, !Ref AllowedCidrBlocks]
+          Description: PostgreSQL access from primary CIDR
+        - !If
+          - IsProduction
+          - IpProtocol: tcp
+            FromPort: 5432
+            ToPort: 5432
+            CidrIp: !Select [1, !Ref AllowedCidrBlocks]
+            Description: PostgreSQL access from secondary CIDR
+          - !Ref AWS::NoValue
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-aurora-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # =============================================================================
+  # AURORA SERVERLESS V2 CLUSTER
+  # =============================================================================
+
+  # DB Subnet Group
+  AuroraSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${AWS::StackName}-subnet-group'
+      DBSubnetGroupDescription: Subnet group for Aurora Serverless v2 cluster
+      SubnetIds: !Ref SubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-subnet-group'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Custom Cluster Parameter Group for Cost Optimization
+  AuroraClusterParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      DBClusterParameterGroupName: !Sub '${AWS::StackName}-cluster-params'
+      Description: Aurora cluster parameters optimized for cost and performance
+      Family: aurora-postgresql15
+      Parameters:
+        shared_preload_libraries: 'pg_stat_statements'
+        track_activity_query_size: '2048'
+        log_statement: 'ddl'
+        log_min_duration_statement: '1000'
+        log_rotation_age: '1440'
+        log_rotation_size: '100000'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-cluster-params'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Aurora Serverless v2 Cluster
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBClusterIdentifier: !Sub '${AWS::StackName}-aurora-cluster'
+      Engine: aurora-postgresql
+      EngineVersion: '15.4'
+      MasterUsername: !Ref DatabaseMasterUsername
+      MasterUserPassword: !Ref DatabaseMasterPassword
+      DatabaseName: postgres
+      DBClusterParameterGroupName: !Ref AuroraClusterParameterGroup
+      DBSubnetGroupName: !Ref AuroraSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref AuroraSecurityGroup
+      StorageEncrypted: true
+      KmsKeyId: alias/aws/rds
+      BackupRetentionPeriod: !If [IsProduction, 7, 3]
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'sun:04:00-sun:05:00'
+      EnableCloudwatchLogsExports:
+        - postgresql
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: !If [IsProduction, 31, 7]
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref MinServerlessCapacity
+        MaxCapacity: !Ref MaxServerlessCapacity
+      DeletionProtection: !If [IsProduction, true, false]
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-aurora-cluster'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: AuroraServerlessV2
+        - Key: CostCenter
+          Value: Database
+
+  # Writer Instance
+  AuroraWriterInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${AWS::StackName}-writer'
+      DBClusterIdentifier: !Ref AuroraCluster
+      Engine: aurora-postgresql
+      DBInstanceClass: db.serverless
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: !If [IsProduction, 31, 7]
+      MonitoringInterval: !If [EnableEnhancedMonitoringCondition, !Ref MonitoringInterval, 0]
+      MonitoringRoleArn: !If 
+        - EnableEnhancedMonitoringCondition
+        - !GetAtt EnhancedMonitoringRole.Arn
+        - !Ref AWS::NoValue
+      PromotionTier: 1
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-writer'
+        - Key: InstanceType
+          Value: Writer
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Read Replica 1 (Standard Scaling)
+  AuroraReaderInstance1:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${AWS::StackName}-reader-1'
+      DBClusterIdentifier: !Ref AuroraCluster
+      Engine: aurora-postgresql
+      DBInstanceClass: db.serverless
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: !If [IsProduction, 31, 7]
+      MonitoringInterval: !If [EnableEnhancedMonitoringCondition, !Ref MonitoringInterval, 0]
+      MonitoringRoleArn: !If 
+        - EnableEnhancedMonitoringCondition
+        - !GetAtt EnhancedMonitoringRole.Arn
+        - !Ref AWS::NoValue
+      PromotionTier: 2
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-reader-1'
+        - Key: InstanceType
+          Value: Reader
+        - Key: ScalingTier
+          Value: Standard
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Read Replica 2 (Aggressive Scaling)
+  AuroraReaderInstance2:
+    Type: AWS::RDS::DBInstance
+    Condition: EnableAutoPause
+    Properties:
+      DBInstanceIdentifier: !Sub '${AWS::StackName}-reader-2'
+      DBClusterIdentifier: !Ref AuroraCluster
+      Engine: aurora-postgresql
+      DBInstanceClass: db.serverless
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      MonitoringInterval: !If [EnableEnhancedMonitoringCondition, !Ref MonitoringInterval, 0]
+      MonitoringRoleArn: !If 
+        - EnableEnhancedMonitoringCondition
+        - !GetAtt EnhancedMonitoringRole.Arn
+        - !Ref AWS::NoValue
+      PromotionTier: 3
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-reader-2'
+        - Key: InstanceType
+          Value: Reader
+        - Key: ScalingTier
+          Value: Aggressive
+        - Key: Environment
+          Value: !Ref Environment
+
+  # =============================================================================
+  # LAMBDA FUNCTIONS FOR INTELLIGENT SCALING
+  # =============================================================================
+
+  # Cost-Aware Scaling Lambda Function
+  CostAwareScalerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-cost-aware-scaler'
+      Description: Intelligent Aurora Serverless v2 scaling based on cost and performance metrics
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt AuroraLambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          CLUSTER_ID: !Ref AuroraCluster
+          ENVIRONMENT: !Ref Environment
+          COST_BUDGET: !Ref MonthlyCostBudget
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime, timedelta
+          import os
+          
+          rds = boto3.client('rds')
+          cloudwatch = boto3.client('cloudwatch')
+          
+          def lambda_handler(event, context):
+              cluster_id = os.environ['CLUSTER_ID']
+              
+              try:
+                  # Get current cluster configuration
+                  cluster_response = rds.describe_db_clusters(DBClusterIdentifier=cluster_id)
+                  cluster = cluster_response['DBClusters'][0]
+                  
+                  current_min = cluster['ServerlessV2ScalingConfiguration']['MinCapacity']
+                  current_max = cluster['ServerlessV2ScalingConfiguration']['MaxCapacity']
+                  
+                  # Get CPU utilization metrics
+                  cpu_metrics = get_cpu_utilization(cluster_id)
+                  connection_metrics = get_connection_count(cluster_id)
+                  
+                  # Determine optimal scaling based on patterns
+                  new_min, new_max = calculate_optimal_scaling(
+                      cpu_metrics, connection_metrics, current_min, current_max
+                  )
+                  
+                  # Apply scaling if needed
+                  if new_min != current_min or new_max != current_max:
+                      update_scaling_configuration(cluster_id, new_min, new_max)
+                      send_scaling_notification(cluster_id, current_min, current_max, new_min, new_max)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'cluster': cluster_id,
+                          'previous_scaling': {'min': current_min, 'max': current_max},
+                          'new_scaling': {'min': new_min, 'max': new_max},
+                          'cpu_avg': cpu_metrics['average'],
+                          'connections_avg': connection_metrics['average']
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
+          
+          def get_cpu_utilization(cluster_id):
+              end_time = datetime.utcnow()
+              start_time = end_time - timedelta(hours=1)
+              
+              response = cloudwatch.get_metric_statistics(
+                  Namespace='AWS/RDS',
+                  MetricName='CPUUtilization',
+                  Dimensions=[{'Name': 'DBClusterIdentifier', 'Value': cluster_id}],
+                  StartTime=start_time,
+                  EndTime=end_time,
+                  Period=300,
+                  Statistics=['Average', 'Maximum']
+              )
+              
+              if response['Datapoints']:
+                  avg_cpu = sum(dp['Average'] for dp in response['Datapoints']) / len(response['Datapoints'])
+                  max_cpu = max(dp['Maximum'] for dp in response['Datapoints'])
+                  return {'average': avg_cpu, 'maximum': max_cpu}
+              return {'average': 0, 'maximum': 0}
+          
+          def get_connection_count(cluster_id):
+              end_time = datetime.utcnow()
+              start_time = end_time - timedelta(hours=1)
+              
+              response = cloudwatch.get_metric_statistics(
+                  Namespace='AWS/RDS',
+                  MetricName='DatabaseConnections',
+                  Dimensions=[{'Name': 'DBClusterIdentifier', 'Value': cluster_id}],
+                  StartTime=start_time,
+                  EndTime=end_time,
+                  Period=300,
+                  Statistics=['Average', 'Maximum']
+              )
+              
+              if response['Datapoints']:
+                  avg_conn = sum(dp['Average'] for dp in response['Datapoints']) / len(response['Datapoints'])
+                  max_conn = max(dp['Maximum'] for dp in response['Datapoints'])
+                  return {'average': avg_conn, 'maximum': max_conn}
+              return {'average': 0, 'maximum': 0}
+          
+          def calculate_optimal_scaling(cpu_metrics, conn_metrics, current_min, current_max):
+              cpu_avg = cpu_metrics['average']
+              cpu_max = cpu_metrics['maximum']
+              conn_avg = conn_metrics['average']
+              
+              # Determine optimal minimum capacity
+              if cpu_avg < 20 and conn_avg < 5:
+                  new_min = 0.5  # Aggressive scale down
+              elif cpu_avg < 40 and conn_avg < 20:
+                  new_min = max(0.5, current_min - 0.5)  # Moderate scale down
+              elif cpu_avg > 70 or conn_avg > 50:
+                  new_min = min(8, current_min + 1)  # Scale up minimum
+              else:
+                  new_min = current_min  # Maintain current
+              
+              # Determine optimal maximum capacity
+              if cpu_max > 80 or conn_avg > 80:
+                  new_max = min(32, current_max + 4)  # Increase max capacity
+              elif cpu_max < 50 and conn_avg < 30:
+                  new_max = max(4, current_max - 2)  # Reduce max for cost savings
+              else:
+                  new_max = current_max  # Maintain current
+              
+              # Ensure minimum <= maximum
+              new_min = min(new_min, new_max)
+              
+              return new_min, new_max
+          
+          def update_scaling_configuration(cluster_id, min_capacity, max_capacity):
+              rds.modify_db_cluster(
+                  DBClusterIdentifier=cluster_id,
+                  ServerlessV2ScalingConfiguration={
+                      'MinCapacity': min_capacity,
+                      'MaxCapacity': max_capacity
+                  },
+                  ApplyImmediately=True
+              )
+          
+          def send_scaling_notification(cluster_id, old_min, old_max, new_min, new_max):
+              # Calculate cost impact
+              cost_impact = calculate_cost_impact(old_min, old_max, new_min, new_max)
+              
+              # Send to CloudWatch as custom metric
+              cloudwatch.put_metric_data(
+                  Namespace='Aurora/CostOptimization',
+                  MetricData=[
+                      {
+                          'MetricName': 'ScalingAdjustment',
+                          'Dimensions': [
+                              {'Name': 'ClusterIdentifier', 'Value': cluster_id},
+                              {'Name': 'ScalingType', 'Value': 'MinCapacity'}
+                          ],
+                          'Value': new_min - old_min,
+                          'Unit': 'Count'
+                      },
+                      {
+                          'MetricName': 'EstimatedCostImpact',
+                          'Dimensions': [{'Name': 'ClusterIdentifier', 'Value': cluster_id}],
+                          'Value': cost_impact,
+                          'Unit': 'None'
+                      }
+                  ]
+              )
+          
+          def calculate_cost_impact(old_min, old_max, new_min, new_max):
+              # Simplified cost calculation
+              hours_per_month = 730
+              cost_per_acu_hour = 0.12
+              
+              old_avg_usage = (old_min + old_max) / 2
+              new_avg_usage = (new_min + new_max) / 2
+              
+              old_cost = old_avg_usage * hours_per_month * cost_per_acu_hour
+              new_cost = new_avg_usage * hours_per_month * cost_per_acu_hour
+              
+              return new_cost - old_cost
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-cost-aware-scaler'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Auto-Pause/Resume Lambda Function
+  AutoPauseResumeFunction:
+    Type: AWS::Lambda::Function
+    Condition: EnableAutoPause
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-auto-pause-resume'
+      Description: Auto-pause/resume Aurora Serverless v2 for development environments
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt AuroraLambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          CLUSTER_ID: !Ref AuroraCluster
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime, time
+          import os
+          
+          rds = boto3.client('rds')
+          cloudwatch = boto3.client('cloudwatch')
+          
+          def lambda_handler(event, context):
+              cluster_id = os.environ['CLUSTER_ID']
+              environment = os.environ.get('ENVIRONMENT', 'development')
+              
+              try:
+                  # Get current time and determine action
+                  current_time = datetime.utcnow().time()
+                  action = determine_action(current_time, environment)
+                  
+                  if action == 'pause':
+                      result = pause_cluster_if_idle(cluster_id)
+                  elif action == 'resume':
+                      result = resume_cluster_if_needed(cluster_id)
+                  else:
+                      result = {'action': 'no_action', 'reason': 'Outside operating hours'}
+                  
+                  # Record action in CloudWatch
+                  record_pause_resume_metrics(cluster_id, action, result)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'cluster': cluster_id,
+                          'environment': environment,
+                          'action': action,
+                          'result': result,
+                          'timestamp': datetime.utcnow().isoformat()
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
+          
+          def determine_action(current_time, environment):
+              if environment == 'development':
+                  start_hour = time(8, 0)
+                  end_hour = time(20, 0)
+              elif environment == 'staging':
+                  start_hour = time(6, 0)
+                  end_hour = time(22, 0)
+              else:
+                  return 'monitor'
+              
+              if start_hour <= current_time <= end_hour:
+                  return 'resume'
+              else:
+                  return 'pause'
+          
+          def pause_cluster_if_idle(cluster_id):
+              if is_cluster_idle(cluster_id):
+                  rds.modify_db_cluster(
+                      DBClusterIdentifier=cluster_id,
+                      ServerlessV2ScalingConfiguration={
+                          'MinCapacity': 0.5,
+                          'MaxCapacity': 1
+                      },
+                      ApplyImmediately=True
+                  )
+                  return {'action': 'paused', 'reason': 'Low activity detected during off-hours'}
+              else:
+                  return {'action': 'not_paused', 'reason': 'Active connections detected'}
+          
+          def resume_cluster_if_needed(cluster_id):
+              cluster_response = rds.describe_db_clusters(DBClusterIdentifier=cluster_id)
+              cluster = cluster_response['DBClusters'][0]
+              
+              current_min = cluster['ServerlessV2ScalingConfiguration']['MinCapacity']
+              current_max = cluster['ServerlessV2ScalingConfiguration']['MaxCapacity']
+              
+              if current_min <= 0.5 and current_max <= 1:
+                  rds.modify_db_cluster(
+                      DBClusterIdentifier=cluster_id,
+                      ServerlessV2ScalingConfiguration={
+                          'MinCapacity': 0.5,
+                          'MaxCapacity': 8
+                      },
+                      ApplyImmediately=True
+                  )
+                  return {'action': 'resumed', 'reason': 'Operating hours started'}
+              else:
+                  return {'action': 'already_active', 'reason': 'Cluster already in active state'}
+          
+          def is_cluster_idle(cluster_id):
+              from datetime import timedelta
+              
+              end_time = datetime.utcnow()
+              start_time = end_time - timedelta(minutes=30)
+              
+              response = cloudwatch.get_metric_statistics(
+                  Namespace='AWS/RDS',
+                  MetricName='DatabaseConnections',
+                  Dimensions=[{'Name': 'DBClusterIdentifier', 'Value': cluster_id}],
+                  StartTime=start_time,
+                  EndTime=end_time,
+                  Period=300,
+                  Statistics=['Maximum']
+              )
+              
+              if response['Datapoints']:
+                  max_connections = max(dp['Maximum'] for dp in response['Datapoints'])
+                  return max_connections <= 1
+              
+              return True
+          
+          def record_pause_resume_metrics(cluster_id, action, result):
+              metric_value = 1 if result.get('action') in ['paused', 'resumed'] else 0
+              
+              cloudwatch.put_metric_data(
+                  Namespace='Aurora/CostOptimization',
+                  MetricData=[
+                      {
+                          'MetricName': 'AutoPauseResumeActions',
+                          'Dimensions': [
+                              {'Name': 'ClusterIdentifier', 'Value': cluster_id},
+                              {'Name': 'Action', 'Value': action}
+                          ],
+                          'Value': metric_value,
+                          'Unit': 'Count'
+                      }
+                  ]
+              )
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-auto-pause-resume'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # =============================================================================
+  # EVENTBRIDGE SCHEDULING
+  # =============================================================================
+
+  # EventBridge Rule for Cost-Aware Scaling (every 15 minutes)
+  CostAwareScalingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-cost-aware-scaling'
+      Description: Trigger cost-aware scaling for Aurora Serverless v2
+      ScheduleExpression: 'rate(15 minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CostAwareScalerFunction.Arn
+          Id: CostAwareScalerTarget
+
+  # Permission for EventBridge to invoke Cost-Aware Scaler
+  CostAwareScalerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CostAwareScalerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CostAwareScalingRule.Arn
+
+  # EventBridge Rule for Auto-Pause/Resume (every hour)
+  AutoPauseResumeRule:
+    Type: AWS::Events::Rule
+    Condition: EnableAutoPause
+    Properties:
+      Name: !Sub '${AWS::StackName}-auto-pause-resume'
+      Description: Trigger auto-pause/resume for Aurora Serverless v2
+      ScheduleExpression: 'rate(1 hour)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AutoPauseResumeFunction.Arn
+          Id: AutoPauseResumeTarget
+
+  # Permission for EventBridge to invoke Auto-Pause/Resume
+  AutoPauseResumePermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableAutoPause
+    Properties:
+      FunctionName: !Ref AutoPauseResumeFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AutoPauseResumeRule.Arn
+
+  # =============================================================================
+  # MONITORING AND ALERTING
+  # =============================================================================
+
+  # SNS Topic for Cost Alerts
+  CostAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-cost-alerts'
+      DisplayName: Aurora Serverless v2 Cost Alerts
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-cost-alerts'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarm for High ACU Usage
+  HighACUUsageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-high-acu-usage'
+      AlarmDescription: Alert when Aurora Serverless v2 ACU usage is high
+      MetricName: ServerlessDatabaseCapacity
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 12
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref CostAlertsTopic
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref AuroraCluster
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-high-acu-usage'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarm for Sustained High Capacity
+  SustainedHighCapacityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-sustained-high-capacity'
+      AlarmDescription: Alert when capacity remains high for extended period
+      MetricName: ServerlessDatabaseCapacity
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 1800
+      EvaluationPeriods: 4
+      Threshold: 8
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref CostAlertsTopic
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref AuroraCluster
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-sustained-high-capacity'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # =============================================================================
+  # COST MANAGEMENT
+  # =============================================================================
+
+  # AWS Budget for Aurora Costs
+  AuroraCostBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub '${AWS::StackName}-Aurora-Monthly-Budget'
+        BudgetLimit:
+          Amount: !Ref MonthlyCostBudget
+          Unit: USD
+        TimeUnit: MONTHLY
+        BudgetType: COST
+        CostFilters:
+          Service:
+            - Amazon Relational Database Service
+          TagKey:
+            - Application
+          TagValue:
+            - AuroraServerlessV2
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: !Ref CostAlertThreshold
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref CostAlertsTopic
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref CostAlertsTopic
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+
+Outputs:
+  # Cluster Information
+  ClusterIdentifier:
+    Description: Aurora Serverless v2 cluster identifier
+    Value: !Ref AuroraCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterIdentifier'
+
+  ClusterEndpoint:
+    Description: Aurora Serverless v2 cluster endpoint
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterEndpoint'
+
+  ClusterPort:
+    Description: Aurora Serverless v2 cluster port
+    Value: !GetAtt AuroraCluster.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterPort'
+
+  ReaderEndpoint:
+    Description: Aurora Serverless v2 reader endpoint
+    Value: !GetAtt AuroraCluster.ReadEndpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-ReaderEndpoint'
+
+  # Instance Information
+  WriterInstanceId:
+    Description: Writer instance identifier
+    Value: !Ref AuroraWriterInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-WriterInstanceId'
+
+  ReaderInstance1Id:
+    Description: Reader instance 1 identifier
+    Value: !Ref AuroraReaderInstance1
+    Export:
+      Name: !Sub '${AWS::StackName}-ReaderInstance1Id'
+
+  ReaderInstance2Id:
+    Condition: EnableAutoPause
+    Description: Reader instance 2 identifier
+    Value: !Ref AuroraReaderInstance2
+    Export:
+      Name: !Sub '${AWS::StackName}-ReaderInstance2Id'
+
+  # Lambda Functions
+  CostAwareScalerFunctionArn:
+    Description: Cost-aware scaler Lambda function ARN
+    Value: !GetAtt CostAwareScalerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CostAwareScalerArn'
+
+  AutoPauseResumeFunctionArn:
+    Condition: EnableAutoPause
+    Description: Auto-pause/resume Lambda function ARN
+    Value: !GetAtt AutoPauseResumeFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AutoPauseResumeArn'
+
+  # Monitoring
+  CostAlertsTopicArn:
+    Description: SNS topic ARN for cost alerts
+    Value: !Ref CostAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-CostAlertsTopicArn'
+
+  # Security
+  SecurityGroupId:
+    Description: Security group ID for Aurora cluster
+    Value: !Ref AuroraSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroupId'
+
+  # Connection Information
+  DatabaseName:
+    Description: Default database name
+    Value: postgres
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseName'
+
+  MasterUsername:
+    Description: Master username for Aurora cluster
+    Value: !Ref DatabaseMasterUsername
+    Export:
+      Name: !Sub '${AWS::StackName}-MasterUsername'
+
+  # Cost Management
+  BudgetName:
+    Description: AWS Budget name for cost monitoring
+    Value: !Sub '${AWS::StackName}-Aurora-Monthly-Budget'
+    Export:
+      Name: !Sub '${AWS::StackName}-BudgetName'
+
+  # Scaling Configuration
+  CurrentMinCapacity:
+    Description: Current minimum serverless capacity (ACUs)
+    Value: !Ref MinServerlessCapacity
+    Export:
+      Name: !Sub '${AWS::StackName}-MinCapacity'
+
+  CurrentMaxCapacity:
+    Description: Current maximum serverless capacity (ACUs)
+    Value: !Ref MaxServerlessCapacity
+    Export:
+      Name: !Sub '${AWS::StackName}-MaxCapacity'

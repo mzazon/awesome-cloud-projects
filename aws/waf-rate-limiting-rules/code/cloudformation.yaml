@@ -1,0 +1,570 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS WAF Web Application Firewall with Rate Limiting Rules
+  
+  This template creates a comprehensive AWS WAF setup including:
+  - Web Access Control List (ACL) with rate limiting protection
+  - IP reputation blocking using AWS managed rule groups
+  - CloudWatch logging and monitoring dashboard
+  - Rate-based rules to prevent DDoS attacks
+  
+  Compatible with CloudFront distributions and Application Load Balancers.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "WAF Configuration"
+        Parameters:
+          - WebACLName
+          - WAFScope
+          - RateLimitThreshold
+          - EnableIPReputationList
+      - Label:
+          default: "Logging Configuration"
+        Parameters:
+          - EnableWAFLogging
+          - LogRetentionDays
+          - RedactSensitiveHeaders
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - CreateCloudWatchDashboard
+          - EnableSampledRequests
+          - EnableCloudWatchMetrics
+      - Label:
+          default: "Resource Naming"
+        Parameters:
+          - ResourcePrefix
+          - Environment
+    ParameterLabels:
+      WebACLName:
+        default: "Web ACL Name"
+      WAFScope:
+        default: "WAF Scope"
+      RateLimitThreshold:
+        default: "Rate Limit Threshold"
+      EnableIPReputationList:
+        default: "Enable IP Reputation Blocking"
+      EnableWAFLogging:
+        default: "Enable WAF Logging"
+      LogRetentionDays:
+        default: "Log Retention Period"
+      RedactSensitiveHeaders:
+        default: "Redact Sensitive Headers"
+      CreateCloudWatchDashboard:
+        default: "Create CloudWatch Dashboard"
+      EnableSampledRequests:
+        default: "Enable Sampled Requests"
+      EnableCloudWatchMetrics:
+        default: "Enable CloudWatch Metrics"
+      ResourcePrefix:
+        default: "Resource Prefix"
+      Environment:
+        default: "Environment"
+
+Parameters:
+  WebACLName:
+    Type: String
+    Default: "waf-protection-acl"
+    Description: "Name for the WAF Web Access Control List"
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: "^[a-zA-Z0-9-_]+$"
+    ConstraintDescription: "Must contain only alphanumeric characters, hyphens, and underscores"
+
+  WAFScope:
+    Type: String
+    Default: "CLOUDFRONT"
+    AllowedValues:
+      - "CLOUDFRONT"
+      - "REGIONAL"
+    Description: >
+      Scope of the WAF Web ACL. 
+      CLOUDFRONT: For use with CloudFront distributions (must be deployed in us-east-1)
+      REGIONAL: For use with Application Load Balancers, API Gateway, and other regional resources
+
+  RateLimitThreshold:
+    Type: Number
+    Default: 2000
+    MinValue: 100
+    MaxValue: 2000000000
+    Description: "Maximum number of requests allowed from a single IP address within a 5-minute period"
+    ConstraintDescription: "Must be between 100 and 2,000,000,000"
+
+  EnableIPReputationList:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Enable AWS managed IP reputation list to block known malicious IP addresses"
+
+  EnableWAFLogging:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Enable detailed logging of WAF decisions to CloudWatch Logs"
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: "Number of days to retain WAF logs in CloudWatch Logs"
+
+  RedactSensitiveHeaders:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Redact sensitive headers (authorization, cookie) from WAF logs for security"
+
+  CreateCloudWatchDashboard:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Create a CloudWatch dashboard for monitoring WAF metrics and performance"
+
+  EnableSampledRequests:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Enable sampling of requests for detailed analysis in WAF console"
+
+  EnableCloudWatchMetrics:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Enable CloudWatch metrics collection for WAF rules and overall performance"
+
+  ResourcePrefix:
+    Type: String
+    Default: "waf"
+    Description: "Prefix for naming AWS resources created by this template"
+    MinLength: 1
+    MaxLength: 20
+    AllowedPattern: "^[a-zA-Z0-9-]+$"
+    ConstraintDescription: "Must contain only alphanumeric characters and hyphens"
+
+  Environment:
+    Type: String
+    Default: "dev"
+    AllowedValues:
+      - "dev"
+      - "test"
+      - "staging"
+      - "prod"
+    Description: "Environment designation for resource tagging and naming"
+
+Conditions:
+  # Condition to determine if IP reputation rule should be created
+  CreateIPReputationRule: !Equals [!Ref EnableIPReputationList, "true"]
+  
+  # Condition to determine if WAF logging should be enabled
+  EnableLogging: !Equals [!Ref EnableWAFLogging, "true"]
+  
+  # Condition to determine if sensitive headers should be redacted
+  RedactHeaders: !Equals [!Ref RedactSensitiveHeaders, "true"]
+  
+  # Condition to determine if CloudWatch dashboard should be created
+  CreateDashboard: !Equals [!Ref CreateCloudWatchDashboard, "true"]
+  
+  # Condition to check if WAF scope is CloudFront (affects region requirements)
+  IsCloudFrontScope: !Equals [!Ref WAFScope, "CLOUDFRONT"]
+
+Resources:
+  # CloudWatch Log Group for WAF Logs
+  WAFLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: !Sub "/aws/wafv2/${ResourcePrefix}-${Environment}-security-logs"
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-${Environment}-waf-logs"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "WAF Security Logging"
+        - Key: ManagedBy
+          Value: "CloudFormation"
+
+  # IAM Role for WAF Logging (if needed for future enhancements)
+  WAFLoggingRole:
+    Type: AWS::IAM::Role
+    Condition: EnableLogging
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-${Environment}-waf-logging-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: wafv2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSWAFLoggingServiceRolePolicy
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-${Environment}-waf-logging-role"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "WAF Logging Permissions"
+        - Key: ManagedBy
+          Value: "CloudFormation"
+
+  # AWS WAF Web Access Control List (ACL)
+  WebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "${ResourcePrefix}-${Environment}-${WebACLName}"
+      Scope: !Ref WAFScope
+      Description: !Sub "WAF Web ACL for ${Environment} environment with rate limiting and security protection"
+      DefaultAction:
+        Allow: {}
+      
+      # WAF Rules Configuration
+      Rules:
+        # Rate-based rule for DDoS protection
+        - Name: !Sub "${ResourcePrefix}-${Environment}-rate-limit-rule"
+          Priority: 1
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref RateLimitThreshold
+              AggregateKeyType: IP
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: !Ref EnableSampledRequests
+            CloudWatchMetricsEnabled: !Ref EnableCloudWatchMetrics
+            MetricName: !Sub "${ResourcePrefix}RateLimitRule"
+        
+        # AWS Managed IP Reputation List (conditional)
+        - !If
+          - CreateIPReputationRule
+          - Name: !Sub "${ResourcePrefix}-${Environment}-ip-reputation-rule"
+            Priority: 2
+            Statement:
+              ManagedRuleGroupStatement:
+                VendorName: AWS
+                Name: AWSManagedRulesAmazonIpReputationList
+            OverrideAction:
+              None: {}
+            VisibilityConfig:
+              SampledRequestsEnabled: !Ref EnableSampledRequests
+              CloudWatchMetricsEnabled: !Ref EnableCloudWatchMetrics
+              MetricName: !Sub "${ResourcePrefix}IPReputationRule"
+          - !Ref "AWS::NoValue"
+
+      # Visibility configuration for the entire Web ACL
+      VisibilityConfig:
+        SampledRequestsEnabled: !Ref EnableSampledRequests
+        CloudWatchMetricsEnabled: !Ref EnableCloudWatchMetrics
+        MetricName: !Sub "${ResourcePrefix}WebACL"
+      
+      # Resource tags
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-${Environment}-${WebACLName}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "Web Application Firewall Protection"
+        - Key: ManagedBy
+          Value: "CloudFormation"
+        - Key: RateLimit
+          Value: !Ref RateLimitThreshold
+        - Key: IPReputationEnabled
+          Value: !Ref EnableIPReputationList
+
+  # WAF Logging Configuration
+  WAFLoggingConfiguration:
+    Type: AWS::WAFv2::LoggingConfiguration
+    Condition: EnableLogging
+    Properties:
+      ResourceArn: !GetAtt WebACL.Arn
+      LogDestinationConfigs:
+        - !GetAtt WAFLogGroup.Arn
+      RedactedFields: !If
+        - RedactHeaders
+        - - SingleHeader:
+              Name: authorization
+          - SingleHeader:
+              Name: cookie
+          - SingleHeader:
+              Name: x-api-key
+        - []
+      LoggingFilter:
+        DefaultBehavior: KEEP
+        Filters:
+          - Behavior: KEEP
+            Requirement: MEETS_ANY
+            Conditions:
+              - ActionCondition:
+                  Action: BLOCK
+              - LabelNameCondition:
+                  LabelName: "awswaf:managed:aws:amazon-ip-list"
+
+  # CloudWatch Dashboard for WAF Monitoring
+  WAFDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateDashboard
+    Properties:
+      DashboardName: !Sub "${ResourcePrefix}-${Environment}-WAF-Security-Dashboard"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/WAFV2", "AllowedRequests", "WebACL", "${WebACL}", "Region", "${WAFScope}", "Rule", "ALL" ],
+                  [ ".", "BlockedRequests", ".", ".", ".", ".", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Sum",
+                "title": "WAF Allowed vs Blocked Requests",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/WAFV2", "BlockedRequests", "WebACL", "${WebACL}", "Region", "${WAFScope}", "Rule", "${ResourcePrefix}-${Environment}-rate-limit-rule" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Sum",
+                "title": "Rate Limit Rule - Blocked Requests",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/WAFV2", "BlockedRequests", "WebACL", "${WebACL}", "Region", "${WAFScope}", "Rule", "${ResourcePrefix}-${Environment}-ip-reputation-rule" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Sum",
+                "title": "IP Reputation Rule - Blocked Requests",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/WAFV2", "WebACLEvaluationTime", "WebACL", "${WebACL}", "Region", "${WAFScope}" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Average",
+                "title": "WAF Evaluation Time (Performance)",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/wafv2/${ResourcePrefix}-${Environment}-security-logs'\n| fields @timestamp, action, httpRequest.clientIp, httpRequest.uri, terminatingRuleId\n| filter action = \"BLOCK\"\n| stats count() by httpRequest.clientIp\n| sort count desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Top Blocked IP Addresses",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms for Security Monitoring
+  HighBlockedRequestsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateDashboard
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-${Environment}-WAF-High-Blocked-Requests"
+      AlarmDescription: "Alert when WAF blocks an unusually high number of requests"
+      MetricName: BlockedRequests
+      Namespace: AWS/WAFV2
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: WebACL
+          Value: !Ref WebACL
+        - Name: Region
+          Value: !Ref WAFScope
+        - Name: Rule
+          Value: ALL
+      TreatMissingData: notBreaching
+      AlarmActions: []
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-${Environment}-WAF-High-Blocked-Requests"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "WAF Security Monitoring"
+        - Key: ManagedBy
+          Value: "CloudFormation"
+
+  RateLimitTriggeredAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-${Environment}-WAF-Rate-Limit-Triggered"
+      AlarmDescription: "Alert when rate limiting rule is actively blocking requests"
+      MetricName: BlockedRequests
+      Namespace: AWS/WAFV2
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: WebACL
+          Value: !Ref WebACL
+        - Name: Region
+          Value: !Ref WAFScope
+        - Name: Rule
+          Value: !Sub "${ResourcePrefix}-${Environment}-rate-limit-rule"
+      TreatMissingData: notBreaching
+      AlarmActions: []
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-${Environment}-WAF-Rate-Limit-Triggered"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: "WAF Rate Limiting Monitoring"
+        - Key: ManagedBy
+          Value: "CloudFormation"
+
+Outputs:
+  WebACLArn:
+    Description: "ARN of the created WAF Web Access Control List"
+    Value: !GetAtt WebACL.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-WebACL-Arn"
+
+  WebACLId:
+    Description: "ID of the created WAF Web Access Control List"
+    Value: !Ref WebACL
+    Export:
+      Name: !Sub "${AWS::StackName}-WebACL-Id"
+
+  WebACLName:
+    Description: "Name of the created WAF Web Access Control List"
+    Value: !Ref WebACL
+    Export:
+      Name: !Sub "${AWS::StackName}-WebACL-Name"
+
+  RateLimitThreshold:
+    Description: "Configured rate limit threshold (requests per 5 minutes)"
+    Value: !Ref RateLimitThreshold
+
+  WAFScope:
+    Description: "Scope of the WAF Web ACL (CLOUDFRONT or REGIONAL)"
+    Value: !Ref WAFScope
+
+  LogGroupArn:
+    Condition: EnableLogging
+    Description: "ARN of the CloudWatch Log Group for WAF logs"
+    Value: !GetAtt WAFLogGroup.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LogGroup-Arn"
+
+  LogGroupName:
+    Condition: EnableLogging
+    Description: "Name of the CloudWatch Log Group for WAF logs"
+    Value: !Ref WAFLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-LogGroup-Name"
+
+  DashboardURL:
+    Condition: CreateDashboard
+    Description: "URL to the CloudWatch Dashboard for WAF monitoring"
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ResourcePrefix}-${Environment}-WAF-Security-Dashboard"
+
+  CloudFrontAssociationCommand:
+    Condition: IsCloudFrontScope
+    Description: "AWS CLI command to associate this Web ACL with a CloudFront distribution"
+    Value: !Sub |
+      aws cloudfront update-distribution --id YOUR_DISTRIBUTION_ID --distribution-config '{
+        "WebACLId": "${WebACL.Arn}",
+        ... (include your existing distribution configuration)
+      }'
+
+  ALBAssociationCommand:
+    Description: "AWS CLI command to associate this Web ACL with an Application Load Balancer"
+    Value: !Sub |
+      aws wafv2 associate-web-acl --web-acl-arn ${WebACL.Arn} --resource-arn YOUR_ALB_ARN
+
+  SecurityRecommendations:
+    Description: "Security recommendations for WAF configuration"
+    Value: !Sub |
+      1. Monitor the CloudWatch dashboard at: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ResourcePrefix}-${Environment}-WAF-Security-Dashboard
+      2. Review WAF logs regularly in CloudWatch Logs: /aws/wafv2/${ResourcePrefix}-${Environment}-security-logs
+      3. Adjust rate limit threshold (${RateLimitThreshold}) based on your application's traffic patterns
+      4. Consider adding geographic blocking rules if your application serves specific regions
+      5. Implement additional managed rule groups like Core Rule Set for OWASP Top 10 protection
+      6. Set up SNS notifications for the created CloudWatch alarms
+      7. Regularly review and update WAF rules based on threat intelligence

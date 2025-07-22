@@ -1,0 +1,605 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS IAM Identity Center (SSO) with External Identity Provider Integration.
+  This template sets up IAM Identity Center with permission sets, user management,
+  and external identity provider configuration for centralized workforce access.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Identity Provider Configuration"
+        Parameters:
+          - ExternalIdPName
+          - SAMLMetadataDocument
+          - EnableSCIM
+      - Label:
+          default: "Permission Set Configuration"
+        Parameters:
+          - CreateDeveloperPermissionSet
+          - CreateAdminPermissionSet
+          - CreateReadOnlyPermissionSet
+          - DeveloperSessionDuration
+          - AdminSessionDuration
+          - ReadOnlySessionDuration
+      - Label:
+          default: "User and Group Management"
+        Parameters:
+          - CreateTestUser
+          - TestUserEmail
+          - TestUserDisplayName
+          - CreateTestGroup
+          - TestGroupName
+      - Label:
+          default: "Account Assignment Configuration"
+        Parameters:
+          - TargetAccountIds
+          - EnableMultiAccountAccess
+      - Label:
+          default: "Resource Tagging"
+        Parameters:
+          - Environment
+          - CostCenter
+          - Project
+    ParameterLabels:
+      ExternalIdPName:
+        default: "External Identity Provider Name"
+      SAMLMetadataDocument:
+        default: "SAML Metadata Document"
+      EnableSCIM:
+        default: "Enable SCIM Provisioning"
+      CreateDeveloperPermissionSet:
+        default: "Create Developer Permission Set"
+      CreateAdminPermissionSet:
+        default: "Create Administrator Permission Set"
+      CreateReadOnlyPermissionSet:
+        default: "Create Read-Only Permission Set"
+
+Parameters:
+  # Identity Provider Configuration
+  ExternalIdPName:
+    Type: String
+    Default: "ExternalIdentityProvider"
+    Description: "Name for the external identity provider configuration"
+    MinLength: 1
+    MaxLength: 32
+    AllowedPattern: "^[a-zA-Z0-9+=,.@\\-_]+$"
+
+  SAMLMetadataDocument:
+    Type: String
+    Description: "Base64 encoded SAML metadata document from your identity provider (optional for this template)"
+    Default: ""
+
+  EnableSCIM:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: "Enable SCIM for automated user provisioning"
+
+  # Permission Set Configuration
+  CreateDeveloperPermissionSet:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "Create Developer permission set with PowerUser access"
+
+  CreateAdminPermissionSet:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "Create Administrator permission set with full access"
+
+  CreateReadOnlyPermissionSet:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "Create Read-Only permission set"
+
+  DeveloperSessionDuration:
+    Type: String
+    Default: "PT8H"
+    Description: "Session duration for Developer permission set (ISO 8601 format)"
+    AllowedPattern: "^PT([0-9]|1[0-2])H$"
+
+  AdminSessionDuration:
+    Type: String
+    Default: "PT4H"
+    Description: "Session duration for Administrator permission set (ISO 8601 format)"
+    AllowedPattern: "^PT([0-9]|1[0-2])H$"
+
+  ReadOnlySessionDuration:
+    Type: String
+    Default: "PT12H"
+    Description: "Session duration for Read-Only permission set (ISO 8601 format)"
+    AllowedPattern: "^PT([0-9]|1[0-2])H$"
+
+  # User and Group Management
+  CreateTestUser:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: "Create a test user for demonstration purposes"
+
+  TestUserEmail:
+    Type: String
+    Default: "testuser@example.com"
+    Description: "Email address for the test user"
+    AllowedPattern: "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
+
+  TestUserDisplayName:
+    Type: String
+    Default: "Test User"
+    Description: "Display name for the test user"
+    MinLength: 1
+    MaxLength: 64
+
+  CreateTestGroup:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: "Create a test group for demonstration purposes"
+
+  TestGroupName:
+    Type: String
+    Default: "Developers"
+    Description: "Name for the test group"
+    MinLength: 1
+    MaxLength: 64
+
+  # Account Assignment Configuration
+  TargetAccountIds:
+    Type: CommaDelimitedList
+    Description: "List of AWS account IDs for permission set assignments (leave empty to use current account)"
+    Default: ""
+
+  EnableMultiAccountAccess:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: "Enable multi-account access across the organization"
+
+  # Resource Tagging
+  Environment:
+    Type: String
+    Default: "development"
+    AllowedValues: ["development", "staging", "production"]
+    Description: "Environment designation for resource tagging"
+
+  CostCenter:
+    Type: String
+    Default: "IT"
+    Description: "Cost center for billing allocation"
+    MinLength: 1
+    MaxLength: 32
+
+  Project:
+    Type: String
+    Default: "IdentityManagement"
+    Description: "Project name for resource organization"
+    MinLength: 1
+    MaxLength: 32
+
+Conditions:
+  # Permission Set Conditions
+  ShouldCreateDeveloperPS: !Equals [!Ref CreateDeveloperPermissionSet, "true"]
+  ShouldCreateAdminPS: !Equals [!Ref CreateAdminPermissionSet, "true"]
+  ShouldCreateReadOnlyPS: !Equals [!Ref CreateReadOnlyPermissionSet, "true"]
+
+  # User/Group Conditions
+  ShouldCreateTestUser: !Equals [!Ref CreateTestUser, "true"]
+  ShouldCreateTestGroup: !Equals [!Ref CreateTestGroup, "true"]
+
+  # SCIM Condition
+  ShouldEnableSCIM: !Equals [!Ref EnableSCIM, "true"]
+
+  # Account Assignment Conditions
+  ShouldUseCurrentAccount: !Equals [!Join ["", !Ref TargetAccountIds], ""]
+  ShouldCreateAccountAssignments: !And
+    - !Or [!Condition ShouldCreateTestUser, !Condition ShouldCreateTestGroup]
+    - !Or [!Condition ShouldCreateDeveloperPS, !Condition ShouldCreateReadOnlyPS]
+
+Resources:
+  # IAM Identity Center Instance (Note: Only one instance per organization is allowed)
+  # This resource represents the IAM Identity Center instance configuration
+  IdentityCenterInstanceAccessControlAttribute:
+    Type: AWS::SSO::InstanceAccessControlAttributeConfiguration
+    Properties:
+      InstanceArn: !Sub 
+        - "arn:aws:sso:::instance/${InstanceId}"
+        - InstanceId: !Ref IdentityCenterInstance
+      AccessControlAttributes:
+        - Key: "Department"
+          Value:
+            Source: 
+              - "${path:enterprise.department}"
+        - Key: "CostCenter"
+          Value:
+            Source:
+              - "${path:enterprise.costCenter}"
+        - Key: "Project"
+          Value:
+            Source:
+              - "${path:enterprise.project}"
+
+  # Note: AWS::SSO::Instance resource is not available in CloudFormation
+  # as only one instance per organization is allowed and must be created manually
+  # This is a reference to the existing instance
+  IdentityCenterInstance:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt IdentityCenterInstanceFunction.Arn
+
+  # Lambda function to get IAM Identity Center instance information
+  IdentityCenterInstanceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-get-sso-instance"
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt IdentityCenterInstanceFunctionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  sso_admin = boto3.client('sso-admin')
+                  response = sso_admin.list_instances()
+                  
+                  if response['Instances']:
+                      instance = response['Instances'][0]
+                      response_data = {
+                          'InstanceArn': instance['InstanceArn'],
+                          'IdentityStoreId': instance['IdentityStoreId']
+                      }
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {}, "No IAM Identity Center instance found")
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, str(e))
+
+  # IAM role for the Lambda function
+  IdentityCenterInstanceFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SSOInstanceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sso:ListInstances
+                  - sso-admin:ListInstances
+                Resource: "*"
+
+  # Developer Permission Set
+  DeveloperPermissionSet:
+    Type: AWS::SSO::PermissionSet
+    Condition: ShouldCreateDeveloperPS
+    Properties:
+      Name: !Sub "${ExternalIdPName}-DeveloperAccess"
+      Description: "Developer access with PowerUser permissions and custom S3 access"
+      InstanceArn: !GetAtt IdentityCenterInstance.InstanceArn
+      SessionDuration: !Ref DeveloperSessionDuration
+      ManagedPolicies:
+        - "arn:aws:iam::aws:policy/PowerUserAccess"
+      InlinePolicy: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:DeleteObject"
+              ],
+              "Resource": "arn:aws:s3:::company-data-*/*"
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:ListBucket"
+              ],
+              "Resource": "arn:aws:s3:::company-data-*"
+            }
+          ]
+        }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Project
+          Value: !Ref Project
+
+  # Administrator Permission Set
+  AdministratorPermissionSet:
+    Type: AWS::SSO::PermissionSet
+    Condition: ShouldCreateAdminPS
+    Properties:
+      Name: !Sub "${ExternalIdPName}-AdministratorAccess"
+      Description: "Full administrator access to AWS resources"
+      InstanceArn: !GetAtt IdentityCenterInstance.InstanceArn
+      SessionDuration: !Ref AdminSessionDuration
+      ManagedPolicies:
+        - "arn:aws:iam::aws:policy/AdministratorAccess"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Project
+          Value: !Ref Project
+
+  # Read-Only Permission Set
+  ReadOnlyPermissionSet:
+    Type: AWS::SSO::PermissionSet
+    Condition: ShouldCreateReadOnlyPS
+    Properties:
+      Name: !Sub "${ExternalIdPName}-ReadOnlyAccess"
+      Description: "Read-only access to AWS resources"
+      InstanceArn: !GetAtt IdentityCenterInstance.InstanceArn
+      SessionDuration: !Ref ReadOnlySessionDuration
+      ManagedPolicies:
+        - "arn:aws:iam::aws:policy/ReadOnlyAccess"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Project
+          Value: !Ref Project
+
+  # Test User (for demonstration purposes)
+  TestUser:
+    Type: AWS::IdentityStore::User
+    Condition: ShouldCreateTestUser
+    Properties:
+      IdentityStoreId: !GetAtt IdentityCenterInstance.IdentityStoreId
+      UserName: !Ref TestUserEmail
+      DisplayName: !Ref TestUserDisplayName
+      Name:
+        GivenName: !Select [0, !Split [" ", !Ref TestUserDisplayName]]
+        FamilyName: !Select [1, !Split [" ", !Ref TestUserDisplayName]]
+      Emails:
+        - Value: !Ref TestUserEmail
+          Type: "Work"
+          Primary: true
+
+  # Test Group (for demonstration purposes)
+  TestGroup:
+    Type: AWS::IdentityStore::Group
+    Condition: ShouldCreateTestGroup
+    Properties:
+      IdentityStoreId: !GetAtt IdentityCenterInstance.IdentityStoreId
+      DisplayName: !Ref TestGroupName
+      Description: !Sub "Test group for ${ExternalIdPName} integration"
+
+  # Group Membership (add test user to test group)
+  TestGroupMembership:
+    Type: AWS::IdentityStore::GroupMembership
+    Condition: !And [!Condition ShouldCreateTestUser, !Condition ShouldCreateTestGroup]
+    Properties:
+      IdentityStoreId: !GetAtt IdentityCenterInstance.IdentityStoreId
+      GroupId: !GetAtt TestGroup.GroupId
+      MemberId:
+        UserId: !GetAtt TestUser.UserId
+
+  # Account Assignment - Developer Permission Set to Test Group
+  DeveloperGroupAssignment:
+    Type: AWS::SSO::Assignment
+    Condition: !And 
+      - !Condition ShouldCreateTestGroup
+      - !Condition ShouldCreateDeveloperPS
+      - !Condition ShouldCreateAccountAssignments
+    Properties:
+      InstanceArn: !GetAtt IdentityCenterInstance.InstanceArn
+      PermissionSetArn: !GetAtt DeveloperPermissionSet.PermissionSetArn
+      PrincipalId: !GetAtt TestGroup.GroupId
+      PrincipalType: "GROUP"
+      TargetId: !If 
+        - ShouldUseCurrentAccount
+        - !Ref AWS::AccountId
+        - !Select [0, !Ref TargetAccountIds]
+      TargetType: "AWS_ACCOUNT"
+
+  # Account Assignment - Read-Only Permission Set to Test User
+  ReadOnlyUserAssignment:
+    Type: AWS::SSO::Assignment
+    Condition: !And 
+      - !Condition ShouldCreateTestUser
+      - !Condition ShouldCreateReadOnlyPS
+      - !Condition ShouldCreateAccountAssignments
+    Properties:
+      InstanceArn: !GetAtt IdentityCenterInstance.InstanceArn
+      PermissionSetArn: !GetAtt ReadOnlyPermissionSet.PermissionSetArn
+      PrincipalId: !GetAtt TestUser.UserId
+      PrincipalType: "USER"
+      TargetId: !If 
+        - ShouldUseCurrentAccount
+        - !Ref AWS::AccountId
+        - !Select [0, !Ref TargetAccountIds]
+      TargetType: "AWS_ACCOUNT"
+
+  # CloudTrail for SSO activity logging
+  SSOCloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      TrailName: !Sub "${AWS::StackName}-sso-audit-trail"
+      S3BucketName: !Ref SSOAuditLogsBucket
+      S3KeyPrefix: "sso-logs/"
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      EventSelectors:
+        - ReadWriteType: "All"
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: "AWS::SSO::*"
+              Values: ["arn:aws:sso:*"]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Project
+          Value: !Ref Project
+
+  # S3 Bucket for SSO audit logs
+  SSOAuditLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-sso-audit-logs-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: LogRetentionRule
+            Status: Enabled
+            ExpirationInDays: 90
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 60
+                StorageClass: GLACIER
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Project
+          Value: !Ref Project
+
+  # S3 Bucket Policy for CloudTrail
+  SSOAuditLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SSOAuditLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt SSOAuditLogsBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${SSOAuditLogsBucket.Arn}/sso-logs/*"
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+
+Outputs:
+  # Identity Center Information
+  IdentityCenterInstanceArn:
+    Description: "ARN of the IAM Identity Center instance"
+    Value: !GetAtt IdentityCenterInstance.InstanceArn
+    Export:
+      Name: !Sub "${AWS::StackName}-InstanceArn"
+
+  IdentityStoreId:
+    Description: "Identity Store ID for user and group management"
+    Value: !GetAtt IdentityCenterInstance.IdentityStoreId
+    Export:
+      Name: !Sub "${AWS::StackName}-IdentityStoreId"
+
+  AccessPortalUrl:
+    Description: "AWS Access Portal URL for users"
+    Value: !Sub "https://${AWS::Region}.awsapps.com/start"
+
+  # Permission Set Information
+  DeveloperPermissionSetArn:
+    Condition: ShouldCreateDeveloperPS
+    Description: "ARN of the Developer permission set"
+    Value: !GetAtt DeveloperPermissionSet.PermissionSetArn
+    Export:
+      Name: !Sub "${AWS::StackName}-DeveloperPS-Arn"
+
+  AdministratorPermissionSetArn:
+    Condition: ShouldCreateAdminPS
+    Description: "ARN of the Administrator permission set"
+    Value: !GetAtt AdministratorPermissionSet.PermissionSetArn
+    Export:
+      Name: !Sub "${AWS::StackName}-AdminPS-Arn"
+
+  ReadOnlyPermissionSetArn:
+    Condition: ShouldCreateReadOnlyPS
+    Description: "ARN of the Read-Only permission set"
+    Value: !GetAtt ReadOnlyPermissionSet.PermissionSetArn
+    Export:
+      Name: !Sub "${AWS::StackName}-ReadOnlyPS-Arn"
+
+  # User and Group Information
+  TestUserId:
+    Condition: ShouldCreateTestUser
+    Description: "ID of the test user"
+    Value: !GetAtt TestUser.UserId
+
+  TestGroupId:
+    Condition: ShouldCreateTestGroup
+    Description: "ID of the test group"
+    Value: !GetAtt TestGroup.GroupId
+
+  # SCIM Information
+  SCIMEndpoint:
+    Description: "SCIM endpoint for external identity provider configuration"
+    Value: !Sub "https://scim.${AWS::Region}.amazonaws.com/${AWS::AccountId}/scim/v2/"
+
+  # Audit and Compliance
+  AuditLogsBucket:
+    Description: "S3 bucket containing SSO audit logs"
+    Value: !Ref SSOAuditLogsBucket
+
+  CloudTrailArn:
+    Description: "CloudTrail ARN for SSO activity monitoring"
+    Value: !GetAtt SSOCloudTrail.Arn
+
+  # Next Steps Instructions
+  PostDeploymentInstructions:
+    Description: "Next steps after CloudFormation deployment"
+    Value: !Sub |
+      1. Configure your external identity provider with SAML metadata
+      2. If SCIM is enabled, generate SCIM access token in AWS Console
+      3. Configure attribute mappings in your identity provider
+      4. Test authentication through the Access Portal: https://${AWS::Region}.awsapps.com/start
+      5. Review CloudTrail logs in S3 bucket: ${SSOAuditLogsBucket}
+
+  # Cost and Resource Information
+  EstimatedMonthlyCost:
+    Description: "Estimated monthly cost for this configuration"
+    Value: "IAM Identity Center: Free for workforce users. S3 storage: ~$0.50-2.00/month. CloudTrail: ~$2.00/month."
+
+  ResourceTags:
+    Description: "Applied resource tags"
+    Value: !Sub "Environment: ${Environment}, CostCenter: ${CostCenter}, Project: ${Project}"

@@ -1,0 +1,643 @@
+# Infrastructure Manager Configuration for Compliance Reporting with Cloud Audit Logs and Vertex AI Document Extraction
+# This configuration deploys a comprehensive compliance reporting system with automated document processing,
+# audit log analysis, and intelligent compliance monitoring capabilities
+
+apiVersion: v1
+kind: Blueprint
+metadata:
+  name: compliance-reporting-system
+  labels:
+    purpose: compliance-automation
+    environment: production
+    framework: soc2-iso27001
+
+# Input variables for customizable deployment
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID for compliance infrastructure deployment"
+    validation:
+      pattern: "^[a-z][a-z0-9-]{5,29}$"
+
+  region:
+    type: string
+    description: "Primary region for compliance infrastructure deployment"
+    default: "us-central1"
+    validation:
+      enum: ["us-central1", "us-east1", "us-west1", "europe-west1", "asia-southeast1"]
+
+  zone:
+    type: string
+    description: "Availability zone for compute resources"
+    default: "us-central1-a"
+
+  environment:
+    type: string
+    description: "Environment designation for resource naming and configuration"
+    default: "prod"
+    validation:
+      enum: ["dev", "staging", "prod"]
+
+  compliance_frameworks:
+    type: array
+    description: "List of compliance frameworks to support"
+    default: ["SOC2", "ISO27001", "HIPAA"]
+
+  audit_retention_days:
+    type: number
+    description: "Number of days to retain audit logs for compliance requirements"
+    default: 2555  # 7 years for regulatory compliance
+    validation:
+      minimum: 365
+      maximum: 3650
+
+  notification_email:
+    type: string
+    description: "Email address for compliance alerts and notifications"
+    validation:
+      pattern: "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
+
+# Resource definitions for comprehensive compliance reporting infrastructure
+resources:
+  # Random suffix generator for unique resource naming
+  random_suffix:
+    type: gcp-types/cloudresourcemanager-v1:Project
+    metadata:
+      runtimePolicy: ["CREATE"]
+    properties:
+      projectId: $(ref.project_id.value)
+    outputs:
+      - name: suffix
+        value: $(substr(ref.random_suffix.projectNumber, -6))
+
+  # Enable required Google Cloud APIs for compliance infrastructure
+  enable_apis:
+    type: deploymentmanager.v2.collection
+    properties:
+      resources:
+        - name: logging-api
+          type: gcp-types/serviceusage-v1:services
+          properties:
+            name: projects/$(ref.project_id.value)/services/logging.googleapis.com
+            
+        - name: documentai-api
+          type: gcp-types/serviceusage-v1:services
+          properties:
+            name: projects/$(ref.project_id.value)/services/documentai.googleapis.com
+            
+        - name: storage-api
+          type: gcp-types/serviceusage-v1:services
+          properties:
+            name: projects/$(ref.project_id.value)/services/storage.googleapis.com
+            
+        - name: scheduler-api
+          type: gcp-types/serviceusage-v1:services
+          properties:
+            name: projects/$(ref.project_id.value)/services/cloudscheduler.googleapis.com
+            
+        - name: functions-api
+          type: gcp-types/serviceusage-v1:services
+          properties:
+            name: projects/$(ref.project_id.value)/services/cloudfunctions.googleapis.com
+            
+        - name: monitoring-api
+          type: gcp-types/serviceusage-v1:services
+          properties:
+            name: projects/$(ref.project_id.value)/services/monitoring.googleapis.com
+
+  # Cloud Storage bucket for audit logs with compliance-grade security
+  audit_logs_bucket:
+    type: gcp-types/storage-v1:bucket
+    properties:
+      name: audit-logs-$(ref.random_suffix.suffix)
+      location: $(ref.region.value)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          # Move to Nearline storage after 30 days for cost optimization
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+          # Move to Coldline storage after 90 days for long-term retention
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90
+          # Archive after 1 year for regulatory compliance
+          - action:
+              type: SetStorageClass
+              storageClass: ARCHIVE
+            condition:
+              age: 365
+      encryption:
+        defaultKmsKeyName: $(ref.audit_kms_key.selfLink)
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      retentionPolicy:
+        retentionPeriod: $(mul(ref.audit_retention_days.value, 86400))  # Convert days to seconds
+      logging:
+        logBucket: $(ref.access_logs_bucket.name)
+        logObjectPrefix: "audit-access-logs/"
+    metadata:
+      dependsOn:
+        - enable_apis
+        - audit_kms_key
+
+  # Cloud Storage bucket for compliance documents with enhanced security
+  compliance_documents_bucket:
+    type: gcp-types/storage-v1:bucket
+    properties:
+      name: compliance-docs-$(ref.random_suffix.suffix)
+      location: $(ref.region.value)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90
+      encryption:
+        defaultKmsKeyName: $(ref.compliance_kms_key.selfLink)
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      cors:
+        - origin: ["https://*.googleapis.com"]
+          method: ["GET", "POST"]
+          responseHeader: ["Content-Type"]
+          maxAgeSeconds: 3600
+    metadata:
+      dependsOn:
+        - enable_apis
+        - compliance_kms_key
+
+  # Access logs bucket for audit trail of storage operations
+  access_logs_bucket:
+    type: gcp-types/storage-v1:bucket
+    properties:
+      name: access-logs-$(ref.random_suffix.suffix)
+      location: $(ref.region.value)
+      storageClass: COLDLINE
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 365  # Delete access logs after 1 year
+    metadata:
+      dependsOn:
+        - enable_apis
+
+  # KMS encryption keys for data protection and compliance
+  audit_kms_key:
+    type: gcp-types/cloudkms-v1:projects.locations.keyRings.cryptoKeys
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)/keyRings/$(ref.compliance_key_ring.name)
+      cryptoKeyId: audit-logs-key
+      purpose: ENCRYPT_DECRYPT
+      versionTemplate:
+        algorithm: GOOGLE_SYMMETRIC_ENCRYPTION
+        protectionLevel: SOFTWARE
+      rotationPeriod: 7776000s  # 90 days rotation for enhanced security
+    metadata:
+      dependsOn:
+        - compliance_key_ring
+
+  compliance_kms_key:
+    type: gcp-types/cloudkms-v1:projects.locations.keyRings.cryptoKeys
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)/keyRings/$(ref.compliance_key_ring.name)
+      cryptoKeyId: compliance-docs-key
+      purpose: ENCRYPT_DECRYPT
+      versionTemplate:
+        algorithm: GOOGLE_SYMMETRIC_ENCRYPTION
+        protectionLevel: SOFTWARE
+      rotationPeriod: 7776000s  # 90 days rotation
+    metadata:
+      dependsOn:
+        - compliance_key_ring
+
+  # KMS Key Ring for organizing encryption keys
+  compliance_key_ring:
+    type: gcp-types/cloudkms-v1:projects.locations.keyRings
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      keyRingId: compliance-key-ring-$(ref.random_suffix.suffix)
+    metadata:
+      dependsOn:
+        - enable_apis
+
+  # Document AI processors for intelligent document analysis
+  form_parser_processor:
+    type: gcp-types/documentai-v1:projects.locations.processors
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      type: FORM_PARSER_PROCESSOR
+      displayName: compliance-form-parser-$(ref.random_suffix.suffix)
+      defaultProcessorVersion: projects/$(ref.project_id.value)/locations/$(ref.region.value)/processors/PROCESSOR_ID/processorVersions/pretrained-form-parser-v1.0-2020-09-23
+    metadata:
+      dependsOn:
+        - enable_apis
+
+  contract_processor:
+    type: gcp-types/documentai-v1:projects.locations.processors
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      type: CONTRACT_PROCESSOR
+      displayName: contract-analyzer-$(ref.random_suffix.suffix)
+      defaultProcessorVersion: projects/$(ref.project_id.value)/locations/$(ref.region.value)/processors/PROCESSOR_ID/processorVersions/pretrained-contract-v1.0-2021-06-15
+    metadata:
+      dependsOn:
+        - enable_apis
+
+  # IAM service account for Cloud Functions with least privilege access
+  compliance_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: compliance-processor-$(ref.random_suffix.suffix)
+      serviceAccount:
+        displayName: "Compliance Processing Service Account"
+        description: "Service account for automated compliance document processing and reporting"
+    metadata:
+      dependsOn:
+        - enable_apis
+
+  # IAM bindings for service account with minimal required permissions
+  storage_object_admin_binding:
+    type: gcp-types/cloudresourcemanager-v1:projects.setIamPolicy
+    properties:
+      resource: $(ref.project_id.value)
+      policy:
+        bindings:
+          - role: roles/storage.objectAdmin
+            members:
+              - serviceAccount:$(ref.compliance_service_account.email)
+          - role: roles/documentai.apiUser
+            members:
+              - serviceAccount:$(ref.compliance_service_account.email)
+          - role: roles/logging.viewer
+            members:
+              - serviceAccount:$(ref.compliance_service_account.email)
+          - role: roles/monitoring.metricWriter
+            members:
+              - serviceAccount:$(ref.compliance_service_account.email)
+    metadata:
+      dependsOn:
+        - compliance_service_account
+
+  # Cloud Function for automated document processing
+  document_processor_function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      function:
+        name: compliance-document-processor-$(ref.random_suffix.suffix)
+        description: "Automated processing of compliance documents using Document AI"
+        sourceArchiveUrl: gs://$(ref.compliance_documents_bucket.name)/function-source/document-processor.zip
+        eventTrigger:
+          eventType: google.storage.object.finalize
+          resource: projects/_/buckets/$(ref.compliance_documents_bucket.name)
+          failurePolicy:
+            retry: {}
+        runtime: python311
+        entryPoint: process_compliance_document
+        timeout: 300s
+        availableMemoryMb: 512
+        serviceAccountEmail: $(ref.compliance_service_account.email)
+        environmentVariables:
+          PROJECT_ID: $(ref.project_id.value)
+          REGION: $(ref.region.value)
+          FORM_PROCESSOR_ID: $(ref.form_parser_processor.name)
+          CONTRACT_PROCESSOR_ID: $(ref.contract_processor.name)
+          COMPLIANCE_BUCKET: $(ref.compliance_documents_bucket.name)
+        labels:
+          purpose: compliance-automation
+          environment: $(ref.environment.value)
+    metadata:
+      dependsOn:
+        - compliance_documents_bucket
+        - form_parser_processor
+        - contract_processor
+        - compliance_service_account
+
+  # Cloud Function for automated report generation
+  report_generator_function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      function:
+        name: compliance-report-generator-$(ref.random_suffix.suffix)
+        description: "Automated generation of compliance reports from processed data"
+        sourceArchiveUrl: gs://$(ref.compliance_documents_bucket.name)/function-source/report-generator.zip
+        httpsTrigger:
+          securityLevel: SECURE_ALWAYS
+        runtime: python311
+        entryPoint: generate_compliance_report
+        timeout: 180s
+        availableMemoryMb: 256
+        serviceAccountEmail: $(ref.compliance_service_account.email)
+        environmentVariables:
+          PROJECT_ID: $(ref.project_id.value)
+          COMPLIANCE_BUCKET: $(ref.compliance_documents_bucket.name)
+          FRAMEWORKS: $(join(",", ref.compliance_frameworks.value))
+        labels:
+          purpose: compliance-reporting
+          environment: $(ref.environment.value)
+    metadata:
+      dependsOn:
+        - compliance_documents_bucket
+        - compliance_service_account
+
+  # Cloud Function for log analytics and compliance intelligence
+  log_analytics_function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      function:
+        name: compliance-log-analytics-$(ref.random_suffix.suffix)
+        description: "Advanced analytics for audit logs and compliance intelligence"
+        sourceArchiveUrl: gs://$(ref.compliance_documents_bucket.name)/function-source/log-analytics.zip
+        httpsTrigger:
+          securityLevel: SECURE_ALWAYS
+        runtime: python311
+        entryPoint: analyze_compliance_logs
+        timeout: 300s
+        availableMemoryMb: 512
+        serviceAccountEmail: $(ref.compliance_service_account.email)
+        environmentVariables:
+          PROJECT_ID: $(ref.project_id.value)
+          COMPLIANCE_BUCKET: $(ref.compliance_documents_bucket.name)
+          AUDIT_BUCKET: $(ref.audit_logs_bucket.name)
+        labels:
+          purpose: compliance-analytics
+          environment: $(ref.environment.value)
+    metadata:
+      dependsOn:
+        - audit_logs_bucket
+        - compliance_documents_bucket
+        - compliance_service_account
+
+  # Cloud Scheduler job for automated weekly compliance reporting
+  weekly_compliance_report_job:
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      job:
+        name: weekly-compliance-report-$(ref.random_suffix.suffix)
+        description: "Automated weekly compliance report generation"
+        schedule: "0 9 * * MON"  # Every Monday at 9:00 AM
+        timeZone: "UTC"
+        httpTarget:
+          uri: $(ref.report_generator_function.httpsTrigger.url)
+          httpMethod: POST
+          headers:
+            Content-Type: "application/json"
+          body: |
+            {
+              "report_type": "weekly",
+              "frameworks": $(ref.compliance_frameworks.value),
+              "automated": true
+            }
+          oidcToken:
+            serviceAccountEmail: $(ref.compliance_service_account.email)
+        retryConfig:
+          retryCount: 3
+          minBackoffDuration: 5s
+          maxBackoffDuration: 300s
+    metadata:
+      dependsOn:
+        - report_generator_function
+        - compliance_service_account
+
+  # Cloud Scheduler job for daily compliance analytics
+  daily_analytics_job:
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      job:
+        name: daily-compliance-analytics-$(ref.random_suffix.suffix)
+        description: "Daily analysis of audit logs for compliance intelligence"
+        schedule: "0 6 * * *"  # Every day at 6:00 AM
+        timeZone: "UTC"
+        httpTarget:
+          uri: $(ref.log_analytics_function.httpsTrigger.url)
+          httpMethod: POST
+          headers:
+            Content-Type: "application/json"
+          body: |
+            {
+              "analysis_type": "daily",
+              "include_trends": true
+            }
+          oidcToken:
+            serviceAccountEmail: $(ref.compliance_service_account.email)
+        retryConfig:
+          retryCount: 2
+          minBackoffDuration: 10s
+          maxBackoffDuration: 120s
+    metadata:
+      dependsOn:
+        - log_analytics_function
+        - compliance_service_account
+
+  # Audit log sink for comprehensive compliance tracking
+  compliance_audit_sink:
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      parent: projects/$(ref.project_id.value)
+      sink:
+        name: compliance-audit-sink
+        description: "Comprehensive audit log sink for compliance monitoring"
+        destination: storage.googleapis.com/$(ref.audit_logs_bucket.name)
+        filter: |
+          protoPayload.serviceName="storage.googleapis.com" OR
+          protoPayload.serviceName="compute.googleapis.com" OR  
+          protoPayload.serviceName="iam.googleapis.com" OR
+          protoPayload.serviceName="documentai.googleapis.com" OR
+          protoPayload.serviceName="cloudscheduler.googleapis.com"
+        includeChildren: true
+        writerIdentity: true
+    metadata:
+      dependsOn:
+        - audit_logs_bucket
+
+  # Log-based metrics for compliance monitoring
+  compliance_violations_metric:
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      parent: projects/$(ref.project_id.value)
+      metric:
+        name: compliance_violations
+        description: "Track compliance violations from audit logs"
+        filter: 'protoPayload.authenticationInfo.principalEmail!="" AND httpRequest.status>=400'
+        metricDescriptor:
+          metricKind: COUNTER
+          valueType: INT64
+          displayName: "Compliance Violations"
+    metadata:
+      dependsOn:
+        - enable_apis
+
+  document_processing_success_metric:
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      parent: projects/$(ref.project_id.value)
+      metric:
+        name: document_processing_success
+        description: "Track successful document processing events"
+        filter: 'resource.type="cloud_function" AND textPayload:"Successfully processed compliance document"'
+        metricDescriptor:
+          metricKind: COUNTER
+          valueType: INT64
+          displayName: "Document Processing Success"
+    metadata:
+      dependsOn:
+        - enable_apis
+
+  # Notification channel for compliance alerts
+  compliance_notification_channel:
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      parent: projects/$(ref.project_id.value)
+      notificationChannel:
+        type: email
+        displayName: "Compliance Team Email"
+        description: "Email notifications for compliance alerts and violations"
+        labels:
+          email_address: $(ref.notification_email.value)
+        enabled: true
+    metadata:
+      dependsOn:
+        - enable_apis
+
+  # Alert policy for compliance violations
+  compliance_violation_alert:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(ref.project_id.value)
+      alertPolicy:
+        displayName: "Compliance Violation Alert"
+        documentation:
+          content: "This alert fires when there are excessive failed access attempts indicating potential compliance violations"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "High volume of failed access attempts"
+            conditionThreshold:
+              filter: 'resource.type="audited_resource" AND protoPayload.authenticationInfo.principalEmail!="" AND httpRequest.status>=400'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 10
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+        notificationChannels:
+          - $(ref.compliance_notification_channel.name)
+        alertStrategy:
+          autoClose: 1800s
+        enabled: true
+    metadata:
+      dependsOn:
+        - compliance_notification_channel
+
+  # Alert policy for document processing failures
+  document_processing_failure_alert:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(ref.project_id.value)
+      alertPolicy:
+        displayName: "Document Processing Failure Alert"
+        documentation:
+          content: "This alert fires when document processing fails, potentially impacting compliance reporting"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "Cloud Function execution failures"
+            conditionThreshold:
+              filter: 'resource.type="cloud_function" AND resource.labels.function_name=~"compliance-.*" AND severity>=ERROR'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 5
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+        notificationChannels:
+          - $(ref.compliance_notification_channel.name)
+        alertStrategy:
+          autoClose: 3600s
+        enabled: true
+    metadata:
+      dependsOn:
+        - compliance_notification_channel
+
+# Output values for verification and integration
+outputs:
+  audit_logs_bucket_name:
+    description: "Name of the Cloud Storage bucket for audit logs"
+    value: $(ref.audit_logs_bucket.name)
+
+  compliance_documents_bucket_name:
+    description: "Name of the Cloud Storage bucket for compliance documents"
+    value: $(ref.compliance_documents_bucket.name)
+
+  form_parser_processor_id:
+    description: "ID of the Document AI form parser processor"
+    value: $(ref.form_parser_processor.name)
+
+  contract_processor_id:
+    description: "ID of the Document AI contract processor"
+    value: $(ref.contract_processor.name)
+
+  document_processor_function_url:
+    description: "URL of the document processing Cloud Function"
+    value: $(ref.document_processor_function.httpsTrigger.url)
+
+  report_generator_function_url:
+    description: "URL of the report generation Cloud Function"
+    value: $(ref.report_generator_function.httpsTrigger.url)
+
+  log_analytics_function_url:
+    description: "URL of the log analytics Cloud Function"
+    value: $(ref.log_analytics_function.httpsTrigger.url)
+
+  compliance_service_account_email:
+    description: "Email address of the compliance service account"
+    value: $(ref.compliance_service_account.email)
+
+  weekly_report_schedule:
+    description: "Schedule for automated weekly compliance reports"
+    value: "Every Monday at 9:00 AM UTC"
+
+  daily_analytics_schedule:
+    description: "Schedule for automated daily compliance analytics"
+    value: "Daily at 6:00 AM UTC"
+
+  kms_key_ring_name:
+    description: "Name of the KMS key ring for encryption"
+    value: $(ref.compliance_key_ring.name)
+
+  notification_channel_name:
+    description: "Name of the monitoring notification channel"
+    value: $(ref.compliance_notification_channel.name)
+
+  deployment_region:
+    description: "Region where compliance infrastructure is deployed"
+    value: $(ref.region.value)
+
+  supported_frameworks:
+    description: "List of supported compliance frameworks"
+    value: $(ref.compliance_frameworks.value)

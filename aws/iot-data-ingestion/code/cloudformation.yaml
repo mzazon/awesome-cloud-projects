@@ -1,0 +1,737 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'IoT Data Ingestion Pipeline with AWS IoT Core, Lambda, DynamoDB, and SNS - Complete infrastructure for secure device connectivity and real-time data processing'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "IoT Configuration"
+        Parameters:
+          - IoTThingName
+          - IoTPolicyName
+          - IoTTopicFilter
+      - Label:
+          default: "Data Processing"
+        Parameters:
+          - LambdaFunctionName
+          - DynamoDBTableName
+          - SNSTopicName
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - EnableDeviceCertificateAutoRegistration
+          - TemperatureAlertThreshold
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - CloudWatchNamespace
+          - LogRetentionDays
+    ParameterLabels:
+      IoTThingName:
+        default: "IoT Thing Name"
+      IoTPolicyName:
+        default: "IoT Security Policy Name"
+      LambdaFunctionName:
+        default: "Lambda Function Name"
+      DynamoDBTableName:
+        default: "DynamoDB Table Name"
+
+# Template Parameters
+Parameters:
+  IoTThingName:
+    Type: String
+    Default: sensor-device
+    Description: 'Name for the IoT Thing (device identity)'
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: '[a-zA-Z0-9:_-]+'
+    ConstraintDescription: 'Must contain only alphanumeric characters, colons, underscores, and hyphens'
+
+  IoTPolicyName:
+    Type: String
+    Default: SensorDevicePolicy
+    Description: 'Name for the IoT security policy'
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: '[a-zA-Z0-9:_-]+'
+    ConstraintDescription: 'Must contain only alphanumeric characters, colons, underscores, and hyphens'
+
+  IoTTopicFilter:
+    Type: String
+    Default: 'topic/sensor/data'
+    Description: 'MQTT topic filter for sensor data'
+    MinLength: 1
+    MaxLength: 256
+
+  LambdaFunctionName:
+    Type: String
+    Default: iot-data-processor
+    Description: 'Name for the Lambda function that processes IoT data'
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '[a-zA-Z0-9-_]+'
+
+  DynamoDBTableName:
+    Type: String
+    Default: SensorData
+    Description: 'Name for the DynamoDB table storing sensor data'
+    MinLength: 3
+    MaxLength: 255
+    AllowedPattern: '[a-zA-Z0-9_.-]+'
+
+  SNSTopicName:
+    Type: String
+    Default: IoTAlerts
+    Description: 'Name for the SNS topic for temperature alerts'
+    MinLength: 1
+    MaxLength: 256
+
+  EnableDeviceCertificateAutoRegistration:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable automatic device certificate registration'
+
+  TemperatureAlertThreshold:
+    Type: Number
+    Default: 30
+    MinValue: 0
+    MaxValue: 100
+    Description: 'Temperature threshold for alerts (Celsius)'
+
+  CloudWatchNamespace:
+    Type: String
+    Default: 'IoT/Sensors'
+    Description: 'CloudWatch namespace for IoT metrics'
+    MinLength: 1
+    MaxLength: 255
+
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: 'CloudWatch logs retention period in days'
+
+# Conditions
+Conditions:
+  EnableAutoRegistration: !Equals [!Ref EnableDeviceCertificateAutoRegistration, 'true']
+
+# Resources
+Resources:
+  # ============================================================================
+  # DynamoDB Table for Sensor Data Storage
+  # ============================================================================
+  SensorDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref DynamoDBTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: deviceId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: deviceId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Purpose
+          Value: IoT-Data-Storage
+        - Key: Component
+          Value: Database
+        - Key: Environment
+          Value: Production
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+
+  # ============================================================================
+  # SNS Topic for Temperature Alerts
+  # ============================================================================
+  IoTAlertsTopicKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'KMS key for encrypting IoT alerts SNS topic'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM policies
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow SNS service
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+
+  IoTAlertsTopicKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${SNSTopicName}-key'
+      TargetKeyId: !Ref IoTAlertsTopicKey
+
+  IoTAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Ref SNSTopicName
+      DisplayName: 'IoT Temperature Alerts'
+      KmsMasterKeyId: !Ref IoTAlertsTopicKey
+      Tags:
+        - Key: Purpose
+          Value: IoT-Alerts
+        - Key: Component
+          Value: Notification
+        - Key: Environment
+          Value: Production
+
+  # ============================================================================
+  # IAM Role for Lambda Function
+  # ============================================================================
+  IoTProcessorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${LambdaFunctionName}-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: IoTProcessorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # DynamoDB permissions
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt SensorDataTable.Arn
+              # CloudWatch metrics permissions
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': !Ref CloudWatchNamespace
+              # SNS permissions
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref IoTAlertsTopic
+              # KMS permissions for SNS encryption
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt IoTAlertsTopicKey.Arn
+      Tags:
+        - Key: Purpose
+          Value: IoT-Data-Processing
+        - Key: Component
+          Value: Lambda-Execution-Role
+
+  # ============================================================================
+  # CloudWatch Log Group for Lambda Function
+  # ============================================================================
+  IoTProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LambdaFunctionName}'
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt CloudWatchLogsKey.Arn
+
+  CloudWatchLogsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'KMS key for encrypting CloudWatch logs'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM policies
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+
+  # ============================================================================
+  # Lambda Function for IoT Data Processing
+  # ============================================================================
+  IoTProcessorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: IoTProcessorLogGroup
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt IoTProcessorLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      ReservedConcurrencyLimit: 100
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref SensorDataTable
+          SNS_TOPIC_ARN: !Ref IoTAlertsTopic
+          TEMPERATURE_THRESHOLD: !Ref TemperatureAlertThreshold
+          CLOUDWATCH_NAMESPACE: !Ref CloudWatchNamespace
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          from decimal import Decimal
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize AWS clients
+          dynamodb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+          cloudwatch = boto3.client('cloudwatch')
+
+          def lambda_handler(event, context):
+              """
+              Process IoT sensor data and store in DynamoDB.
+              Send alerts for temperature threshold violations.
+              """
+              try:
+                  logger.info(f"Processing IoT event: {json.dumps(event)}")
+                  
+                  # Extract data from IoT message
+                  device_id = event.get('deviceId', 'unknown-device')
+                  timestamp = event.get('timestamp', int(datetime.now().timestamp()))
+                  temperature = event.get('temperature')
+                  humidity = event.get('humidity')
+                  location = event.get('location', 'unknown')
+                  
+                  # Validate required fields
+                  if temperature is None or humidity is None:
+                      raise ValueError("Missing required sensor data: temperature or humidity")
+                  
+                  # Convert to Decimal for DynamoDB
+                  temperature_decimal = Decimal(str(temperature))
+                  humidity_decimal = Decimal(str(humidity))
+                  timestamp_decimal = Decimal(str(timestamp))
+                  
+                  logger.info(f"Processing data from device: {device_id}, temp: {temperature}°C, humidity: {humidity}%")
+                  
+                  # Store data in DynamoDB
+                  table = dynamodb.Table(os.environ['DYNAMODB_TABLE'])
+                  table.put_item(
+                      Item={
+                          'deviceId': device_id,
+                          'timestamp': timestamp_decimal,
+                          'temperature': temperature_decimal,
+                          'humidity': humidity_decimal,
+                          'location': location,
+                          'processed_at': Decimal(str(int(datetime.now().timestamp()))),
+                          'status': 'processed'
+                      }
+                  )
+                  
+                  # Send custom metrics to CloudWatch
+                  cloudwatch.put_metric_data(
+                      Namespace=os.environ['CLOUDWATCH_NAMESPACE'],
+                      MetricData=[
+                          {
+                              'MetricName': 'Temperature',
+                              'Dimensions': [
+                                  {'Name': 'DeviceId', 'Value': device_id},
+                                  {'Name': 'Location', 'Value': location}
+                              ],
+                              'Value': float(temperature),
+                              'Unit': 'None',
+                              'Timestamp': datetime.now()
+                          },
+                          {
+                              'MetricName': 'Humidity',
+                              'Dimensions': [
+                                  {'Name': 'DeviceId', 'Value': device_id},
+                                  {'Name': 'Location', 'Value': location}
+                              ],
+                              'Value': float(humidity),
+                              'Unit': 'Percent',
+                              'Timestamp': datetime.now()
+                          }
+                      ]
+                  )
+                  
+                  # Check for temperature alerts
+                  threshold = float(os.environ['TEMPERATURE_THRESHOLD'])
+                  if float(temperature) > threshold:
+                      alert_message = {
+                          'deviceId': device_id,
+                          'location': location,
+                          'temperature': float(temperature),
+                          'threshold': threshold,
+                          'timestamp': datetime.now().isoformat(),
+                          'severity': 'HIGH' if float(temperature) > threshold + 10 else 'MEDIUM'
+                      }
+                      
+                      sns.publish(
+                          TopicArn=os.environ['SNS_TOPIC_ARN'],
+                          Subject=f'🌡️ High Temperature Alert - Device {device_id}',
+                          Message=json.dumps(alert_message, indent=2),
+                          MessageAttributes={
+                              'deviceId': {'DataType': 'String', 'StringValue': device_id},
+                              'severity': {'DataType': 'String', 'StringValue': alert_message['severity']},
+                              'temperature': {'DataType': 'Number', 'StringValue': str(temperature)}
+                          }
+                      )
+                      
+                      logger.warning(f"Temperature alert sent for device {device_id}: {temperature}°C > {threshold}°C")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Data processed successfully',
+                          'deviceId': device_id,
+                          'timestamp': timestamp,
+                          'alertSent': float(temperature) > threshold
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing IoT data: {str(e)}", exc_info=True)
+                  
+                  # Send error metric to CloudWatch
+                  try:
+                      cloudwatch.put_metric_data(
+                          Namespace=os.environ['CLOUDWATCH_NAMESPACE'],
+                          MetricData=[{
+                              'MetricName': 'ProcessingErrors',
+                              'Value': 1,
+                              'Unit': 'Count',
+                              'Timestamp': datetime.now()
+                          }]
+                      )
+                  except:
+                      pass  # Don't fail on metric error
+                  
+                  raise  # Re-raise for Lambda error handling
+      Tags:
+        - Key: Purpose
+          Value: IoT-Data-Processing
+        - Key: Component
+          Value: Lambda-Function
+
+  # ============================================================================
+  # Dead Letter Queue for Failed Lambda Executions
+  # ============================================================================
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${LambdaFunctionName}-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Purpose
+          Value: IoT-Error-Handling
+        - Key: Component
+          Value: Dead-Letter-Queue
+
+  # ============================================================================
+  # IoT Thing and Security Policy
+  # ============================================================================
+  IoTThing:
+    Type: AWS::IoT::Thing
+    Properties:
+      ThingName: !Ref IoTThingName
+      ThingTypeName: !Ref IoTThingType
+      AttributePayload:
+        Attributes:
+          deviceType: sensor
+          location: default
+          firmware: v1.0
+          deploymentDate: !Sub '${AWS::StackName}-${AWS::Region}'
+
+  IoTThingType:
+    Type: AWS::IoT::ThingType
+    Properties:
+      ThingTypeName: !Sub '${IoTThingName}-type'
+      ThingTypeDescription: 'Sensor device type for IoT data collection'
+      ThingTypeProperties:
+        DeviceDefenderIndexingMode: 'VIOLATIONS'
+        SearchableAttributes:
+          - deviceType
+          - location
+          - firmware
+
+  IoTPolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Ref IoTPolicyName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow device connection
+          - Effect: Allow
+            Action: iot:Connect
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/${IoTThingName}'
+          # Allow publishing sensor data
+          - Effect: Allow
+            Action: iot:Publish
+            Resource: 
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/sensor/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/things/${IoTThingName}/shadow/update'
+          # Allow subscribing to device shadow updates
+          - Effect: Allow
+            Action: 
+              - iot:Subscribe
+              - iot:Receive
+            Resource:
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/sensor/*'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/$aws/things/${IoTThingName}/shadow/update/accepted'
+              - !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/$aws/things/${IoTThingName}/shadow/update/rejected'
+
+  # ============================================================================
+  # IoT Topic Rule for Message Routing
+  # ============================================================================
+  IoTTopicRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub 'ProcessSensorData${LambdaFunctionName}'
+      TopicRulePayload:
+        Description: 'Route sensor data to Lambda for processing and storage'
+        Sql: !Sub 'SELECT * FROM "${IoTTopicFilter}"'
+        RuleDisabled: false
+        Actions:
+          - Lambda:
+              FunctionArn: !GetAtt IoTProcessorFunction.Arn
+        ErrorAction:
+          Republish:
+            RoleArn: !GetAtt IoTRuleRole.Arn
+            Topic: !Sub 'error/${IoTTopicFilter}'
+
+  # ============================================================================
+  # IAM Role for IoT Topic Rule
+  # ============================================================================
+  IoTRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${IoTThingName}-topic-rule-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: IoTRulePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iot:Publish
+                Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/error/*'
+
+  # ============================================================================
+  # Lambda Permission for IoT Rule
+  # ============================================================================
+  IoTLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IoTProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: iot.amazonaws.com
+      SourceArn: !GetAtt IoTTopicRule.Arn
+
+  # ============================================================================
+  # CloudWatch Alarms for Monitoring
+  # ============================================================================
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${LambdaFunctionName}-errors'
+      AlarmDescription: 'Monitor Lambda function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IoTProcessorFunction
+      AlarmActions:
+        - !Ref IoTAlertsTopic
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${LambdaFunctionName}-duration'
+      AlarmDescription: 'Monitor Lambda function duration'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 30000  # 30 seconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IoTProcessorFunction
+      AlarmActions:
+        - !Ref IoTAlertsTopic
+
+  DynamoDBThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${DynamoDBTableName}-throttles'
+      AlarmDescription: 'Monitor DynamoDB throttling events'
+      MetricName: ThrottledRequests
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref SensorDataTable
+      AlarmActions:
+        - !Ref IoTAlertsTopic
+
+# ============================================================================
+# Outputs
+# ============================================================================
+Outputs:
+  IoTEndpoint:
+    Description: 'AWS IoT Core endpoint for device connections'
+    Value: !Sub '${AWS::AccountId}.iot.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTEndpoint'
+
+  IoTThingName:
+    Description: 'Name of the created IoT Thing'
+    Value: !Ref IoTThing
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTThingName'
+
+  IoTPolicyName:
+    Description: 'Name of the IoT security policy'
+    Value: !Ref IoTPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTPolicyName'
+
+  MQTTTopicFilter:
+    Description: 'MQTT topic filter for publishing sensor data'
+    Value: !Ref IoTTopicFilter
+    Export:
+      Name: !Sub '${AWS::StackName}-MQTTTopic'
+
+  DynamoDBTableName:
+    Description: 'Name of the DynamoDB table storing sensor data'
+    Value: !Ref SensorDataTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTable'
+
+  DynamoDBTableArn:
+    Description: 'ARN of the DynamoDB table'
+    Value: !GetAtt SensorDataTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableArn'
+
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function processing IoT data'
+    Value: !Ref IoTProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function'
+    Value: !GetAtt IoTProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for alerts'
+    Value: !Ref IoTAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopic'
+
+  IoTRuleName:
+    Description: 'Name of the IoT topic rule'
+    Value: !Ref IoTTopicRule
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTRule'
+
+  CloudWatchNamespace:
+    Description: 'CloudWatch namespace for IoT metrics'
+    Value: !Ref CloudWatchNamespace
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchNamespace'
+
+  DeploymentRegion:
+    Description: 'AWS region where resources are deployed'
+    Value: !Ref 'AWS::Region'
+    Export:
+      Name: !Sub '${AWS::StackName}-Region'
+
+  StackName:
+    Description: 'Name of this CloudFormation stack'
+    Value: !Ref 'AWS::StackName'
+    Export:
+      Name: !Sub '${AWS::StackName}-StackName'
+
+  # Connection Instructions
+  DeviceConnectionInstructions:
+    Description: 'Instructions for connecting IoT devices'
+    Value: !Sub |
+      To connect your IoT device:
+      1. Use endpoint: ${AWS::AccountId}.iot.${AWS::Region}.amazonaws.com
+      2. Use port 8883 for MQTT over TLS
+      3. Publish sensor data to topic: ${IoTTopicFilter}
+      4. Use the generated device certificates for authentication
+      5. Ensure your device uses the IoT policy: ${IoTPolicy}
+
+  AlertSubscriptionInstructions:
+    Description: 'Instructions for subscribing to temperature alerts'
+    Value: !Sub |
+      To receive temperature alerts:
+      1. Subscribe to SNS topic: ${IoTAlertsTopic}
+      2. Supported protocols: Email, SMS, HTTP/HTTPS, SQS, Lambda
+      3. Alert threshold: ${TemperatureAlertThreshold}°C
+      4. Use AWS CLI: aws sns subscribe --topic-arn ${IoTAlertsTopic} --protocol email --notification-endpoint your-email@example.com

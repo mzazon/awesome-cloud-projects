@@ -1,0 +1,1515 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Reserved Instance Management Automation with AWS Cost Explorer and Lambda - Automates RI utilization monitoring, purchase recommendations, and expiration tracking'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+          - SlackWebhookUrl
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - UtilizationThreshold
+          - ExpirationWarningDays
+          - RecommendationLookbackDays
+      - Label:
+          default: "Scheduling Configuration"
+        Parameters:
+          - UtilizationSchedule
+          - RecommendationSchedule
+          - MonitoringSchedule
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      NotificationEmail:
+        default: "Notification Email"
+      SlackWebhookUrl:
+        default: "Slack Webhook URL (Optional)"
+      UtilizationThreshold:
+        default: "Utilization Alert Threshold (%)"
+      ExpirationWarningDays:
+        default: "Expiration Warning Days"
+      RecommendationLookbackDays:
+        default: "Recommendation Lookback Period"
+      UtilizationSchedule:
+        default: "Utilization Analysis Schedule"
+      RecommendationSchedule:
+        default: "Recommendation Analysis Schedule"
+      MonitoringSchedule:
+        default: "RI Monitoring Schedule"
+
+# Input Parameters
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ri-management
+    Description: Name prefix for all resources created by this template
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: Must start with lowercase letter, contain only lowercase letters, numbers, and hyphens, and end with alphanumeric character
+    MinLength: 3
+    MaxLength: 30
+
+  Environment:
+    Type: String
+    Default: prod
+    Description: Environment name for resource tagging
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    ConstraintDescription: Must be one of dev, test, staging, or prod
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for RI alerts and recommendations
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+
+  SlackWebhookUrl:
+    Type: String
+    Default: ''
+    Description: Optional Slack webhook URL for notifications
+    NoEcho: true
+
+  UtilizationThreshold:
+    Type: Number
+    Default: 80
+    Description: Threshold percentage below which utilization alerts are triggered
+    MinValue: 50
+    MaxValue: 95
+    ConstraintDescription: Must be between 50 and 95
+
+  ExpirationWarningDays:
+    Type: Number
+    Default: 90
+    Description: Number of days before expiration to trigger warning alerts
+    MinValue: 30
+    MaxValue: 365
+    ConstraintDescription: Must be between 30 and 365 days
+
+  RecommendationLookbackDays:
+    Type: String
+    Default: SIXTY_DAYS
+    Description: Historical period to analyze for purchase recommendations
+    AllowedValues:
+      - SEVEN_DAYS
+      - THIRTY_DAYS
+      - SIXTY_DAYS
+    ConstraintDescription: Must be one of SEVEN_DAYS, THIRTY_DAYS, or SIXTY_DAYS
+
+  UtilizationSchedule:
+    Type: String
+    Default: 'cron(0 8 * * ? *)'
+    Description: CloudWatch Events schedule expression for utilization analysis (daily at 8 AM UTC)
+    AllowedPattern: '^cron\([0-9\*\,\-\/\?\s]+\)$|^rate\([0-9]+\s+(minute|minutes|hour|hours|day|days)\)$'
+    ConstraintDescription: Must be a valid CloudWatch Events schedule expression
+
+  RecommendationSchedule:
+    Type: String
+    Default: 'cron(0 9 ? * MON *)'
+    Description: CloudWatch Events schedule expression for recommendation analysis (weekly on Monday at 9 AM UTC)
+    AllowedPattern: '^cron\([0-9\*\,\-\/\?\s]+\)$|^rate\([0-9]+\s+(minute|minutes|hour|hours|day|days)\)$'
+    ConstraintDescription: Must be a valid CloudWatch Events schedule expression
+
+  MonitoringSchedule:
+    Type: String
+    Default: 'cron(0 10 ? * MON *)'
+    Description: CloudWatch Events schedule expression for RI monitoring (weekly on Monday at 10 AM UTC)
+    AllowedPattern: '^cron\([0-9\*\,\-\/\?\s]+\)$|^rate\([0-9]+\s+(minute|minutes|hour|hours|day|days)\)$'
+    ConstraintDescription: Must be a valid CloudWatch Events schedule expression
+
+# Conditional Resources
+Conditions:
+  HasSlackWebhook: !Not [!Equals [!Ref SlackWebhookUrl, '']]
+
+# Resources
+Resources:
+  # S3 Bucket for storing RI reports and analysis data
+  RIReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-ri-reports-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldReports
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref RIReportsLogGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: RI-Reports-Storage
+
+  # DynamoDB Table for RI tracking and historical data
+  RITrackingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-ri-tracking'
+      AttributeDefinitions:
+        - AttributeName: ReservationId
+          AttributeType: S
+        - AttributeName: Timestamp
+          AttributeType: N
+        - AttributeName: Region
+          AttributeType: S
+        - AttributeName: ExpirationDate
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ReservationId
+          KeyType: HASH
+        - AttributeName: Timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: RegionIndex
+          KeySchema:
+            - AttributeName: Region
+              KeyType: HASH
+            - AttributeName: Timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: ExpirationIndex
+          KeySchema:
+            - AttributeName: ExpirationDate
+              KeyType: HASH
+            - AttributeName: ReservationId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: RI-Tracking-Data
+
+  # SNS Topic for notifications
+  RINotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-ri-alerts'
+      DisplayName: Reserved Instance Management Alerts
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: RI-Notifications
+
+  # Email subscription to SNS topic
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref RINotificationsTopic
+      Endpoint: !Ref NotificationEmail
+
+  # Slack subscription (conditional)
+  SlackSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasSlackWebhook
+    Properties:
+      Protocol: https
+      TopicArn: !Ref RINotificationsTopic
+      Endpoint: !Ref SlackWebhookUrl
+
+  # CloudWatch Log Group for Lambda functions
+  RIManagementLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-ri-management'
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group for S3 reports
+  RIReportsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-ri-reports'
+      RetentionInDays: 14
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for Lambda functions
+  RILambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RICostExplorerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ce:GetDimensionValues
+                  - ce:GetUsageAndCosts
+                  - ce:GetReservationCoverage
+                  - ce:GetReservationPurchaseRecommendation
+                  - ce:GetReservationUtilization
+                  - ce:GetRightsizingRecommendation
+                  - ce:GetCostAndUsage
+                Resource: '*'
+        - PolicyName: RIEC2Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeReservedInstances
+                  - ec2:DescribeReservedInstancesListings
+                  - ec2:DescribeReservedInstancesModifications
+                  - ec2:DescribeAvailabilityZones
+                  - ec2:DescribeRegions
+                  - rds:DescribeReservedDBInstances
+                Resource: '*'
+        - PolicyName: RIS3Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${RIReportsBucket}/*'
+                  - !GetAtt RIReportsBucket.Arn
+        - PolicyName: RIDynamoDBPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt RITrackingTable.Arn
+                  - !Sub '${RITrackingTable.Arn}/index/*'
+        - PolicyName: RISNSPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref RINotificationsTopic
+        - PolicyName: RICloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:DescribeLogGroups
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}*:*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Layer for common dependencies
+  RICommonLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub '${ProjectName}-common-layer'
+      Description: Common dependencies for RI management Lambda functions
+      Content:
+        ZipFile: |
+          # This is a placeholder for the Lambda Layer
+          # In a real deployment, this would contain the actual layer code
+          # For this template, dependencies are included directly in function code
+      CompatibleRuntimes:
+        - python3.9
+        - python3.10
+        - python3.11
+      CompatibleArchitectures:
+        - x86_64
+
+  # Lambda Function for RI Utilization Analysis
+  RIUtilizationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-ri-utilization'
+      Description: Analyzes Reserved Instance utilization and generates alerts for underperforming RIs
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt RILambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      ReservedConcurrencyLimit: 5
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref RIReportsBucket
+          SNS_TOPIC_ARN: !Ref RINotificationsTopic
+          DYNAMODB_TABLE_NAME: !Ref RITrackingTable
+          UTILIZATION_THRESHOLD: !Ref UtilizationThreshold
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import datetime
+          import os
+          import logging
+          from decimal import Decimal
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Analyzes Reserved Instance utilization and sends alerts for low utilization.
+              """
+              ce = boto3.client('ce')
+              s3 = boto3.client('s3')
+              sns = boto3.client('sns')
+              
+              # Get environment variables
+              bucket_name = os.environ['S3_BUCKET_NAME']
+              sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+              utilization_threshold = float(os.environ.get('UTILIZATION_THRESHOLD', '80'))
+              project_name = os.environ.get('PROJECT_NAME', 'ri-management')
+              environment = os.environ.get('ENVIRONMENT', 'prod')
+              
+              # Calculate date range (last 30 days)
+              end_date = datetime.date.today()
+              start_date = end_date - datetime.timedelta(days=30)
+              
+              try:
+                  logger.info(f"Analyzing RI utilization from {start_date} to {end_date}")
+                  
+                  # Get RI utilization data
+                  response = ce.get_reservation_utilization(
+                      TimePeriod={
+                          'Start': start_date.strftime('%Y-%m-%d'),
+                          'End': end_date.strftime('%Y-%m-%d')
+                      },
+                      Granularity='MONTHLY',
+                      GroupBy=[
+                          {
+                              'Type': 'DIMENSION',
+                              'Key': 'SERVICE'
+                          }
+                      ]
+                  )
+                  
+                  # Process utilization data
+                  utilization_data = []
+                  alerts = []
+                  total_unused_hours = 0
+                  total_actual_hours = 0
+                  
+                  for result in response['UtilizationsByTime']:
+                      time_period = result['TimePeriod']['Start']
+                      logger.info(f"Processing utilization data for period: {time_period}")
+                      
+                      for group in result['Groups']:
+                          service = group['Keys'][0]
+                          utilization = float(group['Attributes']['UtilizationPercentage'])
+                          actual_hours = float(group['Attributes']['TotalActualHours'])
+                          unused_hours = float(group['Attributes']['UnusedHours'])
+                          
+                          total_actual_hours += actual_hours
+                          total_unused_hours += unused_hours
+                          
+                          utilization_record = {
+                              'service': service,
+                              'utilization_percentage': utilization,
+                              'period': time_period,
+                              'total_actual_hours': actual_hours,
+                              'unused_hours': unused_hours,
+                              'purchased_hours': float(group['Attributes']['PurchasedHours']),
+                              'total_actual_units': float(group['Attributes']['TotalActualUnits']),
+                              'unused_units': float(group['Attributes']['UnusedUnits'])
+                          }
+                          utilization_data.append(utilization_record)
+                          
+                          # Check for low utilization
+                          if utilization < utilization_threshold:
+                              alert = {
+                                  'service': service,
+                                  'utilization': utilization,
+                                  'unused_hours': unused_hours,
+                                  'period': time_period,
+                                  'type': 'LOW_UTILIZATION',
+                                  'severity': 'HIGH' if utilization < 60 else 'MEDIUM',
+                                  'message': f'Low RI utilization for {service}: {utilization:.1f}% (threshold: {utilization_threshold}%)'
+                              }
+                              alerts.append(alert)
+                              logger.warning(f"Low utilization alert: {alert['message']}")
+                  
+                  # Calculate overall metrics
+                  overall_utilization = (total_actual_hours / (total_actual_hours + total_unused_hours)) * 100 if (total_actual_hours + total_unused_hours) > 0 else 0
+                  
+                  # Prepare comprehensive report
+                  report_data = {
+                      'report_metadata': {
+                          'report_date': end_date.strftime('%Y-%m-%d'),
+                          'period': f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}",
+                          'generated_by': f'{project_name}-utilization-function',
+                          'environment': environment,
+                          'utilization_threshold': utilization_threshold
+                      },
+                      'summary': {
+                          'overall_utilization_percentage': round(overall_utilization, 2),
+                          'total_actual_hours': total_actual_hours,
+                          'total_unused_hours': total_unused_hours,
+                          'services_analyzed': len(set([item['service'] for item in utilization_data])),
+                          'alerts_generated': len(alerts),
+                          'high_severity_alerts': len([a for a in alerts if a.get('severity') == 'HIGH']),
+                          'medium_severity_alerts': len([a for a in alerts if a.get('severity') == 'MEDIUM'])
+                      },
+                      'utilization_data': utilization_data,
+                      'alerts': alerts,
+                      'recommendations': []
+                  }
+                  
+                  # Add recommendations based on analysis
+                  if overall_utilization < utilization_threshold:
+                      report_data['recommendations'].append({
+                          'type': 'OPTIMIZATION',
+                          'priority': 'HIGH',
+                          'description': f'Overall RI utilization ({overall_utilization:.1f}%) is below threshold. Consider rightsizing or selling unused reservations.',
+                          'potential_savings': f'${(total_unused_hours * 0.10):.2f}/month estimated'  # Rough estimate
+                      })
+                  
+                  # Save report to S3
+                  report_key = f"ri-utilization-reports/{end_date.strftime('%Y/%m')}/{end_date.strftime('%Y-%m-%d')}-utilization-report.json"
+                  s3.put_object(
+                      Bucket=bucket_name,
+                      Key=report_key,
+                      Body=json.dumps(report_data, indent=2, default=str),
+                      ContentType='application/json',
+                      Metadata={
+                          'project': project_name,
+                          'environment': environment,
+                          'report-type': 'utilization',
+                          'period': f"{start_date.strftime('%Y-%m-%d')}-to-{end_date.strftime('%Y-%m-%d')}"
+                      }
+                  )
+                  
+                  logger.info(f"Report saved to S3: s3://{bucket_name}/{report_key}")
+                  
+                  # Send alerts if any critical issues found
+                  if alerts:
+                      subject = f"[{environment.upper()}] RI Utilization Alert - {len(alerts)} Issues Found"
+                      message = f"Reserved Instance Utilization Alert Report\n"
+                      message += f"Environment: {environment}\n"
+                      message += f"Report Period: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}\n"
+                      message += f"Overall Utilization: {overall_utilization:.1f}%\n\n"
+                      
+                      # Group alerts by severity
+                      high_severity = [a for a in alerts if a.get('severity') == 'HIGH']
+                      medium_severity = [a for a in alerts if a.get('severity') == 'MEDIUM']
+                      
+                      if high_severity:
+                          message += "🔴 HIGH SEVERITY ALERTS:\n"
+                          for alert in high_severity:
+                              message += f"  • {alert['message']} (Unused: {alert['unused_hours']:.1f} hours)\n"
+                          message += "\n"
+                      
+                      if medium_severity:
+                          message += "🟡 MEDIUM SEVERITY ALERTS:\n"
+                          for alert in medium_severity:
+                              message += f"  • {alert['message']} (Unused: {alert['unused_hours']:.1f} hours)\n"
+                          message += "\n"
+                      
+                      message += f"💾 Full Report: s3://{bucket_name}/{report_key}\n"
+                      message += f"📊 Total Unused Hours: {total_unused_hours:.1f}\n"
+                      message += f"💰 Estimated Monthly Waste: ${(total_unused_hours * 0.10):.2f}\n"
+                      
+                      sns.publish(
+                          TopicArn=sns_topic_arn,
+                          Subject=subject,
+                          Message=message
+                      )
+                      
+                      logger.info(f"Alert notification sent for {len(alerts)} utilization issues")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'RI utilization analysis completed successfully',
+                          'report_location': f"s3://{bucket_name}/{report_key}",
+                          'summary': report_data['summary'],
+                          'alerts_generated': len(alerts)
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in RI utilization analysis: {str(e)}", exc_info=True)
+                  
+                  # Send error notification
+                  sns.publish(
+                      TopicArn=sns_topic_arn,
+                      Subject=f"[{environment.upper()}] RI Utilization Analysis Failed",
+                      Message=f"RI utilization analysis failed with error: {str(e)}\n\nPlease check CloudWatch logs for details."
+                  )
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': 'RI utilization analysis failed',
+                          'message': str(e)
+                      })
+                  }
+      Layers:
+        - !Ref RICommonLayer
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Function
+          Value: RI-Utilization-Analysis
+
+  # Lambda Function for RI Recommendations
+  RIRecommendationsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-ri-recommendations'
+      Description: Generates Reserved Instance purchase recommendations using Cost Explorer ML algorithms
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt RILambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      ReservedConcurrencyLimit: 3
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref RIReportsBucket
+          SNS_TOPIC_ARN: !Ref RINotificationsTopic
+          DYNAMODB_TABLE_NAME: !Ref RITrackingTable
+          LOOKBACK_PERIOD: !Ref RecommendationLookbackDays
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import datetime
+          import os
+          import logging
+          from decimal import Decimal
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Generates Reserved Instance purchase recommendations for cost optimization.
+              """
+              ce = boto3.client('ce')
+              s3 = boto3.client('s3')
+              sns = boto3.client('sns')
+              
+              # Get environment variables
+              bucket_name = os.environ['S3_BUCKET_NAME']
+              sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+              lookback_period = os.environ.get('LOOKBACK_PERIOD', 'SIXTY_DAYS')
+              project_name = os.environ.get('PROJECT_NAME', 'ri-management')
+              environment = os.environ.get('ENVIRONMENT', 'prod')
+              
+              try:
+                  logger.info(f"Generating RI recommendations with {lookback_period} lookback period")
+                  
+                  recommendations = []
+                  total_estimated_savings = 0
+                  services_analyzed = []
+                  
+                  # Define services to analyze
+                  services_to_analyze = [
+                      'Amazon Elastic Compute Cloud - Compute',
+                      'Amazon Relational Database Service',
+                      'Amazon ElastiCache',
+                      'Amazon Redshift',
+                      'Amazon Elasticsearch Service'
+                  ]
+                  
+                  for service in services_to_analyze:
+                      try:
+                          logger.info(f"Getting RI recommendations for {service}")
+                          
+                          # Get RI recommendations
+                          response = ce.get_reservation_purchase_recommendation(
+                              Service=service,
+                              LookbackPeriodInDays=lookback_period,
+                              TermInYears='ONE_YEAR',
+                              PaymentOption='PARTIAL_UPFRONT'
+                          )
+                          
+                          services_analyzed.append(service)
+                          
+                          # Process recommendations for this service
+                          for recommendation in response.get('Recommendations', []):
+                              rec_details = recommendation['RecommendationDetails']
+                              instance_details = recommendation['InstanceDetails']
+                              
+                              # Extract service-specific details
+                              if service == 'Amazon Elastic Compute Cloud - Compute':
+                                  service_details = instance_details.get('EC2InstanceDetails', {})
+                                  instance_type = service_details.get('InstanceType', 'Unknown')
+                                  region = service_details.get('Region', 'Unknown')
+                                  platform = service_details.get('Platform', 'Unknown')
+                                  availability_zone = service_details.get('AvailabilityZone', 'Unknown')
+                              elif service == 'Amazon Relational Database Service':
+                                  service_details = instance_details.get('RDSInstanceDetails', {})
+                                  instance_type = service_details.get('InstanceType', 'Unknown')
+                                  region = service_details.get('Region', 'Unknown')
+                                  platform = service_details.get('DatabaseEngine', 'Unknown')
+                                  availability_zone = service_details.get('AvailabilityZone', 'Unknown')
+                              else:
+                                  # Generic handling for other services
+                                  service_details = {}
+                                  instance_type = 'Unknown'
+                                  region = 'Unknown'
+                                  platform = 'Unknown'
+                                  availability_zone = 'Unknown'
+                              
+                              # Calculate savings metrics
+                              estimated_monthly_savings = float(rec_details['EstimatedMonthlySavingsAmount'])
+                              estimated_monthly_on_demand = float(rec_details['EstimatedMonthlyOnDemandCost'])
+                              upfront_cost = float(rec_details['UpfrontCost'])
+                              recurring_cost = float(rec_details['RecurringStandardMonthlyCost'])
+                              recommended_instances = int(rec_details['RecommendedNumberOfInstancesToPurchase'])
+                              
+                              # Calculate additional metrics
+                              total_first_year_cost = upfront_cost + (recurring_cost * 12)
+                              total_first_year_savings = estimated_monthly_savings * 12
+                              savings_percentage = (estimated_monthly_savings / estimated_monthly_on_demand * 100) if estimated_monthly_on_demand > 0 else 0
+                              payback_months = upfront_cost / estimated_monthly_savings if estimated_monthly_savings > 0 else 0
+                              
+                              rec_data = {
+                                  'service': service,
+                                  'service_short_name': service.split(' - ')[0].replace('Amazon ', ''),
+                                  'instance_type': instance_type,
+                                  'region': region,
+                                  'platform': platform,
+                                  'availability_zone': availability_zone,
+                                  'recommended_instances': recommended_instances,
+                                  'estimated_monthly_savings': estimated_monthly_savings,
+                                  'estimated_monthly_on_demand_cost': estimated_monthly_on_demand,
+                                  'upfront_cost': upfront_cost,
+                                  'recurring_monthly_cost': recurring_cost,
+                                  'total_first_year_cost': total_first_year_cost,
+                                  'total_first_year_savings': total_first_year_savings,
+                                  'savings_percentage': round(savings_percentage, 2),
+                                  'payback_months': round(payback_months, 1),
+                                  'term': 'ONE_YEAR',
+                                  'payment_option': 'PARTIAL_UPFRONT',
+                                  'lookback_period': lookback_period,
+                                  'recommendation_date': datetime.date.today().strftime('%Y-%m-%d'),
+                                  'priority': 'HIGH' if estimated_monthly_savings > 100 else 'MEDIUM' if estimated_monthly_savings > 50 else 'LOW'
+                              }
+                              
+                              recommendations.append(rec_data)
+                              total_estimated_savings += estimated_monthly_savings
+                              
+                              logger.info(f"Found recommendation: {service} {instance_type} - ${estimated_monthly_savings:.2f}/month savings")
+                      
+                      except Exception as service_error:
+                          logger.warning(f"Failed to get recommendations for {service}: {str(service_error)}")
+                          continue
+                  
+                  # Sort recommendations by savings amount (descending)
+                  recommendations.sort(key=lambda x: x['estimated_monthly_savings'], reverse=True)
+                  
+                  # Prepare comprehensive report
+                  today = datetime.date.today()
+                  report_data = {
+                      'report_metadata': {
+                          'report_date': today.strftime('%Y-%m-%d'),
+                          'lookback_period': lookback_period,
+                          'generated_by': f'{project_name}-recommendations-function',
+                          'environment': environment,
+                          'analysis_scope': services_analyzed
+                      },
+                      'summary': {
+                          'total_recommendations': len(recommendations),
+                          'total_estimated_monthly_savings': round(total_estimated_savings, 2),
+                          'total_estimated_annual_savings': round(total_estimated_savings * 12, 2),
+                          'services_analyzed': len(services_analyzed),
+                          'high_priority_recommendations': len([r for r in recommendations if r['priority'] == 'HIGH']),
+                          'medium_priority_recommendations': len([r for r in recommendations if r['priority'] == 'MEDIUM']),
+                          'low_priority_recommendations': len([r for r in recommendations if r['priority'] == 'LOW']),
+                          'total_upfront_investment': round(sum([r['upfront_cost'] for r in recommendations]), 2),
+                          'average_payback_months': round(sum([r['payback_months'] for r in recommendations if r['payback_months'] > 0]) / len([r for r in recommendations if r['payback_months'] > 0]), 1) if recommendations else 0
+                      },
+                      'recommendations': recommendations,
+                      'top_opportunities': recommendations[:10]  # Top 10 savings opportunities
+                  }
+                  
+                  # Save recommendations to S3
+                  report_key = f"ri-recommendations/{today.strftime('%Y/%m')}/{today.strftime('%Y-%m-%d')}-recommendations-report.json"
+                  s3.put_object(
+                      Bucket=bucket_name,
+                      Key=report_key,
+                      Body=json.dumps(report_data, indent=2, default=str),
+                      ContentType='application/json',
+                      Metadata={
+                          'project': project_name,
+                          'environment': environment,
+                          'report-type': 'recommendations',
+                          'lookback-period': lookback_period,
+                          'total-savings': str(total_estimated_savings)
+                      }
+                  )
+                  
+                  logger.info(f"Recommendations report saved to S3: s3://{bucket_name}/{report_key}")
+                  
+                  # Send notification if there are significant recommendations
+                  if recommendations and total_estimated_savings > 10:  # Only notify if savings > $10/month
+                      subject = f"[{environment.upper()}] RI Purchase Recommendations - ${total_estimated_savings:.0f}/month potential savings"
+                      message = f"Reserved Instance Purchase Recommendations Report\n"
+                      message += f"Environment: {environment}\n"
+                      message += f"Analysis Period: {lookback_period}\n"
+                      message += f"Report Date: {today.strftime('%Y-%m-%d')}\n\n"
+                      
+                      message += f"📊 SUMMARY:\n"
+                      message += f"  • Total Recommendations: {len(recommendations)}\n"
+                      message += f"  • Estimated Monthly Savings: ${total_estimated_savings:.2f}\n"
+                      message += f"  • Estimated Annual Savings: ${total_estimated_savings * 12:.2f}\n"
+                      message += f"  • Total Upfront Investment: ${report_data['summary']['total_upfront_investment']:.2f}\n"
+                      message += f"  • Average Payback Period: {report_data['summary']['average_payback_months']:.1f} months\n\n"
+                      
+                      # Show top 5 recommendations
+                      message += f"🏆 TOP SAVINGS OPPORTUNITIES:\n"
+                      for i, rec in enumerate(recommendations[:5], 1):
+                          message += f"  {i}. {rec['service_short_name']} {rec['instance_type']} in {rec['region']}\n"
+                          message += f"     💰 ${rec['estimated_monthly_savings']:.2f}/month savings ({rec['savings_percentage']:.1f}%)\n"
+                          message += f"     📈 {rec['recommended_instances']} instance(s), ${rec['upfront_cost']:.2f} upfront\n"
+                          message += f"     ⏱️  {rec['payback_months']:.1f} month payback period\n\n"
+                      
+                      if len(recommendations) > 5:
+                          message += f"  ... and {len(recommendations) - 5} more recommendations\n\n"
+                      
+                      message += f"📄 Full Report: s3://{bucket_name}/{report_key}\n"
+                      message += f"🔧 Next Steps: Review recommendations and consider purchasing high-priority RIs\n"
+                      
+                      sns.publish(
+                          TopicArn=sns_topic_arn,
+                          Subject=subject,
+                          Message=message
+                      )
+                      
+                      logger.info(f"Recommendations notification sent for ${total_estimated_savings:.2f}/month potential savings")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'RI recommendations analysis completed successfully',
+                          'report_location': f"s3://{bucket_name}/{report_key}",
+                          'summary': report_data['summary'],
+                          'recommendations_count': len(recommendations),
+                          'estimated_monthly_savings': total_estimated_savings
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in RI recommendations analysis: {str(e)}", exc_info=True)
+                  
+                  # Send error notification
+                  sns.publish(
+                      TopicArn=sns_topic_arn,
+                      Subject=f"[{environment.upper()}] RI Recommendations Analysis Failed",
+                      Message=f"RI recommendations analysis failed with error: {str(e)}\n\nPlease check CloudWatch logs for details."
+                  )
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': 'RI recommendations analysis failed',
+                          'message': str(e)
+                      })
+                  }
+      Layers:
+        - !Ref RICommonLayer
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Function
+          Value: RI-Recommendations-Analysis
+
+  # Lambda Function for RI Monitoring
+  RIMonitoringFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-ri-monitoring'
+      Description: Monitors Reserved Instance expirations and tracks RI lifecycle data
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt RILambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      ReservedConcurrencyLimit: 5
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref RIReportsBucket
+          SNS_TOPIC_ARN: !Ref RINotificationsTopic
+          DYNAMODB_TABLE_NAME: !Ref RITrackingTable
+          EXPIRATION_WARNING_DAYS: !Ref ExpirationWarningDays
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import datetime
+          import os
+          import logging
+          from decimal import Decimal
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Monitors Reserved Instance expirations and maintains tracking data.
+              """
+              ce = boto3.client('ce')
+              ec2 = boto3.client('ec2')
+              rds = boto3.client('rds')
+              dynamodb = boto3.resource('dynamodb')
+              sns = boto3.client('sns')
+              
+              # Get environment variables
+              table_name = os.environ['DYNAMODB_TABLE_NAME']
+              sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+              expiration_warning_days = int(os.environ.get('EXPIRATION_WARNING_DAYS', '90'))
+              project_name = os.environ.get('PROJECT_NAME', 'ri-management')
+              environment = os.environ.get('ENVIRONMENT', 'prod')
+              
+              table = dynamodb.Table(table_name)
+              current_time = datetime.datetime.utcnow()
+              
+              try:
+                  logger.info(f"Starting RI monitoring with {expiration_warning_days} days expiration warning")
+                  
+                  alerts = []
+                  total_reservations = 0
+                  reservations_by_service = {}
+                  
+                  # Monitor EC2 Reserved Instances
+                  try:
+                      logger.info("Checking EC2 Reserved Instances")
+                      ec2_response = ec2.describe_reserved_instances(
+                          Filters=[
+                              {
+                                  'Name': 'state',
+                                  'Values': ['active']
+                              }
+                          ]
+                      )
+                      
+                      for ri in ec2_response['ReservedInstances']:
+                          total_reservations += 1
+                          service = 'EC2'
+                          
+                          if service not in reservations_by_service:
+                              reservations_by_service[service] = 0
+                          reservations_by_service[service] += 1
+                          
+                          ri_id = ri['ReservedInstancesId']
+                          start_date = ri['Start']
+                          end_date = ri['End']
+                          
+                          # Calculate days until expiration
+                          days_until_expiration = (end_date.replace(tzinfo=None) - current_time).days
+                          
+                          # Store RI data in DynamoDB
+                          table.put_item(
+                              Item={
+                                  'ReservationId': ri_id,
+                                  'Timestamp': int(current_time.timestamp()),
+                                  'Service': service,
+                                  'InstanceType': ri['InstanceType'],
+                                  'InstanceCount': ri['InstanceCount'],
+                                  'State': ri['State'],
+                                  'Start': start_date.isoformat(),
+                                  'End': end_date.isoformat(),
+                                  'ExpirationDate': end_date.strftime('%Y-%m-%d'),
+                                  'Duration': ri['Duration'],
+                                  'OfferingClass': ri['OfferingClass'],
+                                  'OfferingType': ri['OfferingType'],
+                                  'DaysUntilExpiration': days_until_expiration,
+                                  'AvailabilityZone': ri.get('AvailabilityZone', 'Multiple'),
+                                  'Region': ri['AvailabilityZone'][:-1] if ri.get('AvailabilityZone') else 'Multiple',
+                                  'Platform': ri.get('ProductDescription', 'Unknown'),
+                                  'TenancyType': ri.get('InstanceTenancy', 'default'),
+                                  'LastUpdated': current_time.isoformat(),
+                                  'ProjectName': project_name,
+                                  'Environment': environment
+                              }
+                          )
+                          
+                          # Check for expiration alerts
+                          alert = self.check_expiration_alert(ri_id, ri['InstanceType'], ri['InstanceCount'], 
+                                                            end_date, days_until_expiration, expiration_warning_days, service)
+                          if alert:
+                              alerts.append(alert)
+                              logger.warning(f"Expiration alert for {ri_id}: {days_until_expiration} days remaining")
+                      
+                      logger.info(f"Processed {len(ec2_response['ReservedInstances'])} EC2 Reserved Instances")
+                  
+                  except Exception as ec2_error:
+                      logger.error(f"Error processing EC2 Reserved Instances: {str(ec2_error)}")
+                  
+                  # Monitor RDS Reserved Instances
+                  try:
+                      logger.info("Checking RDS Reserved Instances")
+                      rds_response = rds.describe_reserved_db_instances(
+                          # Only get active reservations
+                      )
+                      
+                      for ri in rds_response['ReservedDBInstances']:
+                          if ri['State'] != 'active':
+                              continue
+                              
+                          total_reservations += 1
+                          service = 'RDS'
+                          
+                          if service not in reservations_by_service:
+                              reservations_by_service[service] = 0
+                          reservations_by_service[service] += 1
+                          
+                          ri_id = ri['ReservedDBInstanceId']
+                          start_date = ri['StartTime']
+                          
+                          # Calculate end date for RDS (start + duration)
+                          duration_seconds = ri['Duration']
+                          end_date = start_date + datetime.timedelta(seconds=duration_seconds)
+                          
+                          # Calculate days until expiration
+                          days_until_expiration = (end_date.replace(tzinfo=None) - current_time).days
+                          
+                          # Store RI data in DynamoDB
+                          table.put_item(
+                              Item={
+                                  'ReservationId': ri_id,
+                                  'Timestamp': int(current_time.timestamp()),
+                                  'Service': service,
+                                  'InstanceType': ri['DBInstanceClass'],
+                                  'InstanceCount': ri['DBInstanceCount'],
+                                  'State': ri['State'],
+                                  'Start': start_date.isoformat(),
+                                  'End': end_date.isoformat(),
+                                  'ExpirationDate': end_date.strftime('%Y-%m-%d'),
+                                  'Duration': duration_seconds,
+                                  'OfferingClass': ri.get('OfferingType', 'Unknown'),
+                                  'OfferingType': ri.get('OfferingType', 'Unknown'),
+                                  'DaysUntilExpiration': days_until_expiration,
+                                  'AvailabilityZone': ri.get('MultiAZ', False),
+                                  'Region': 'Multiple',  # RDS doesn't specify region in this API
+                                  'Platform': ri.get('ProductDescription', 'Unknown'),
+                                  'DatabaseEngine': ri.get('ProductDescription', 'Unknown'),
+                                  'MultiAZ': ri.get('MultiAZ', False),
+                                  'LastUpdated': current_time.isoformat(),
+                                  'ProjectName': project_name,
+                                  'Environment': environment
+                              }
+                          )
+                          
+                          # Check for expiration alerts
+                          alert = self.check_expiration_alert(ri_id, ri['DBInstanceClass'], ri['DBInstanceCount'],
+                                                            end_date, days_until_expiration, expiration_warning_days, service)
+                          if alert:
+                              alerts.append(alert)
+                              logger.warning(f"Expiration alert for {ri_id}: {days_until_expiration} days remaining")
+                      
+                      logger.info(f"Processed {len([ri for ri in rds_response['ReservedDBInstances'] if ri['State'] == 'active'])} RDS Reserved Instances")
+                  
+                  except Exception as rds_error:
+                      logger.error(f"Error processing RDS Reserved Instances: {str(rds_error)}")
+                  
+                  # Prepare monitoring summary
+                  monitoring_summary = {
+                      'monitoring_date': current_time.strftime('%Y-%m-%d %H:%M:%S UTC'),
+                      'total_reservations_monitored': total_reservations,
+                      'reservations_by_service': reservations_by_service,
+                      'expiration_alerts': len(alerts),
+                      'urgent_alerts': len([a for a in alerts if a.get('urgency') == 'URGENT']),
+                      'warning_alerts': len([a for a in alerts if a.get('urgency') == 'WARNING']),
+                      'expiration_warning_threshold_days': expiration_warning_days,
+                      'project_name': project_name,
+                      'environment': environment
+                  }
+                  
+                  logger.info(f"Monitoring completed: {total_reservations} reservations, {len(alerts)} alerts")
+                  
+                  # Send alerts if any critical expirations found
+                  if alerts:
+                      subject = f"[{environment.upper()}] RI Expiration Alert - {len(alerts)} Reservations Expiring Soon"
+                      message = f"Reserved Instance Expiration Alert\n"
+                      message += f"Environment: {environment}\n"
+                      message += f"Monitoring Date: {current_time.strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+                      message += f"Alert Threshold: {expiration_warning_days} days\n\n"
+                      
+                      # Group alerts by urgency
+                      urgent_alerts = [a for a in alerts if a.get('urgency') == 'URGENT']
+                      warning_alerts = [a for a in alerts if a.get('urgency') == 'WARNING']
+                      
+                      if urgent_alerts:
+                          message += "🚨 URGENT - EXPIRING WITHIN 30 DAYS:\n"
+                          for alert in urgent_alerts:
+                              message += f"  • {alert['service']} {alert['reservation_id']} ({alert['instance_type']})\n"
+                              message += f"    Count: {alert['instance_count']}, Expires: {alert['end_date']} ({alert['days_until_expiration']} days)\n"
+                          message += "\n"
+                      
+                      if warning_alerts:
+                          message += "⚠️  WARNING - EXPIRING SOON:\n"
+                          for alert in warning_alerts:
+                              message += f"  • {alert['service']} {alert['reservation_id']} ({alert['instance_type']})\n"
+                              message += f"    Count: {alert['instance_count']}, Expires: {alert['end_date']} ({alert['days_until_expiration']} days)\n"
+                          message += "\n"
+                      
+                      message += f"📊 Total Reservations Monitored: {total_reservations}\n"
+                      for service, count in reservations_by_service.items():
+                          message += f"  • {service}: {count} reservations\n"
+                      
+                      message += f"\n🔧 Recommended Actions:\n"
+                      message += f"  • Review expiring reservations for renewal opportunities\n"
+                      message += f"  • Check current usage patterns to determine renewal needs\n"
+                      message += f"  • Consider modifying reservation configurations if usage has changed\n"
+                      
+                      sns.publish(
+                          TopicArn=sns_topic_arn,
+                          Subject=subject,
+                          Message=message
+                      )
+                      
+                      logger.info(f"Expiration alert notification sent for {len(alerts)} reservations")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'RI monitoring completed successfully',
+                          'summary': monitoring_summary,
+                          'total_reservations': total_reservations,
+                          'expiration_alerts': len(alerts)
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in RI monitoring: {str(e)}", exc_info=True)
+                  
+                  # Send error notification
+                  sns.publish(
+                      TopicArn=sns_topic_arn,
+                      Subject=f"[{environment.upper()}] RI Monitoring Failed",
+                      Message=f"RI monitoring failed with error: {str(e)}\n\nPlease check CloudWatch logs for details."
+                  )
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': 'RI monitoring failed',
+                          'message': str(e)
+                      })
+                  }
+          
+          def check_expiration_alert(self, ri_id, instance_type, instance_count, end_date, days_until_expiration, warning_threshold, service):
+              """
+              Check if a reservation requires an expiration alert.
+              """
+              if days_until_expiration <= warning_threshold:
+                  urgency = 'URGENT' if days_until_expiration <= 30 else 'WARNING'
+                  
+                  return {
+                      'service': service,
+                      'reservation_id': ri_id,
+                      'instance_type': instance_type,
+                      'instance_count': instance_count,
+                      'days_until_expiration': days_until_expiration,
+                      'end_date': end_date.strftime('%Y-%m-%d'),
+                      'urgency': urgency,
+                      'alert_type': 'EXPIRING_SOON',
+                      'message': f'{service} RI {ri_id} ({instance_type}) expires in {days_until_expiration} days'
+                  }
+              
+              return None
+      Layers:
+        - !Ref RICommonLayer
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Function
+          Value: RI-Monitoring
+
+  # EventBridge Rule for Daily Utilization Analysis
+  UtilizationScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-daily-utilization'
+      Description: Triggers daily RI utilization analysis
+      ScheduleExpression: !Ref UtilizationSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt RIUtilizationFunction.Arn
+          Id: UtilizationTarget
+          Input: !Sub |
+            {
+              "source": "eventbridge-schedule",
+              "schedule_type": "utilization",
+              "project_name": "${ProjectName}",
+              "environment": "${Environment}"
+            }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # EventBridge Rule for Weekly Recommendations
+  RecommendationScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-weekly-recommendations'
+      Description: Triggers weekly RI purchase recommendations analysis
+      ScheduleExpression: !Ref RecommendationSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt RIRecommendationsFunction.Arn
+          Id: RecommendationTarget
+          Input: !Sub |
+            {
+              "source": "eventbridge-schedule",
+              "schedule_type": "recommendations",
+              "project_name": "${ProjectName}",
+              "environment": "${Environment}"
+            }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # EventBridge Rule for Weekly RI Monitoring
+  MonitoringScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-weekly-monitoring'
+      Description: Triggers weekly RI expiration monitoring
+      ScheduleExpression: !Ref MonitoringSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt RIMonitoringFunction.Arn
+          Id: MonitoringTarget
+          Input: !Sub |
+            {
+              "source": "eventbridge-schedule",
+              "schedule_type": "monitoring",
+              "project_name": "${ProjectName}",
+              "environment": "${Environment}"
+            }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Permissions for EventBridge
+  UtilizationLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RIUtilizationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt UtilizationScheduleRule.Arn
+
+  RecommendationLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RIRecommendationsFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RecommendationScheduleRule.Arn
+
+  MonitoringLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RIMonitoringFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MonitoringScheduleRule.Arn
+
+  # CloudWatch Dashboard for RI Management
+  RIManagementDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-ri-management-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${RIUtilizationFunction}" ],
+                  [ ".", "Invocations", ".", "." ],
+                  [ ".", "Errors", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "RI Utilization Function Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${RIRecommendationsFunction}" ],
+                  [ ".", "Invocations", ".", "." ],
+                  [ ".", "Errors", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "RI Recommendations Function Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${RIMonitoringFunction}" ],
+                  [ ".", "Invocations", ".", "." ],
+                  [ ".", "Errors", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "RI Monitoring Function Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${RITrackingTable}" ],
+                  [ ".", "ConsumedWriteCapacityUnits", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "DynamoDB Table Metrics",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+# Outputs
+Outputs:
+  ProjectName:
+    Description: Name of the RI management project
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectName'
+
+  S3BucketName:
+    Description: Name of the S3 bucket storing RI reports
+    Value: !Ref RIReportsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketName'
+
+  S3BucketArn:
+    Description: ARN of the S3 bucket storing RI reports
+    Value: !GetAtt RIReportsBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketArn'
+
+  DynamoDBTableName:
+    Description: Name of the DynamoDB table for RI tracking
+    Value: !Ref RITrackingTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableName'
+
+  DynamoDBTableArn:
+    Description: ARN of the DynamoDB table for RI tracking
+    Value: !GetAtt RITrackingTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableArn'
+
+  SNSTopicArn:
+    Description: ARN of the SNS topic for RI notifications
+    Value: !Ref RINotificationsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  UtilizationFunctionName:
+    Description: Name of the RI utilization analysis Lambda function
+    Value: !Ref RIUtilizationFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-UtilizationFunctionName'
+
+  UtilizationFunctionArn:
+    Description: ARN of the RI utilization analysis Lambda function
+    Value: !GetAtt RIUtilizationFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-UtilizationFunctionArn'
+
+  RecommendationsFunctionName:
+    Description: Name of the RI recommendations Lambda function
+    Value: !Ref RIRecommendationsFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-RecommendationsFunctionName'
+
+  RecommendationsFunctionArn:
+    Description: ARN of the RI recommendations Lambda function
+    Value: !GetAtt RIRecommendationsFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RecommendationsFunctionArn'
+
+  MonitoringFunctionName:
+    Description: Name of the RI monitoring Lambda function
+    Value: !Ref RIMonitoringFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-MonitoringFunctionName'
+
+  MonitoringFunctionArn:
+    Description: ARN of the RI monitoring Lambda function
+    Value: !GetAtt RIMonitoringFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-MonitoringFunctionArn'
+
+  IAMRoleName:
+    Description: Name of the IAM role for Lambda functions
+    Value: !Ref RILambdaExecutionRole
+    Export:
+      Name: !Sub '${AWS::StackName}-IAMRoleName'
+
+  IAMRoleArn:
+    Description: ARN of the IAM role for Lambda functions
+    Value: !GetAtt RILambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IAMRoleArn'
+
+  DashboardURL:
+    Description: URL of the CloudWatch dashboard for RI management
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-ri-management-dashboard'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  UtilizationSchedule:
+    Description: Schedule expression for utilization analysis
+    Value: !Ref UtilizationSchedule
+    Export:
+      Name: !Sub '${AWS::StackName}-UtilizationSchedule'
+
+  RecommendationSchedule:
+    Description: Schedule expression for recommendations analysis
+    Value: !Ref RecommendationSchedule
+    Export:
+      Name: !Sub '${AWS::StackName}-RecommendationSchedule'
+
+  MonitoringSchedule:
+    Description: Schedule expression for RI monitoring
+    Value: !Ref MonitoringSchedule
+    Export:
+      Name: !Sub '${AWS::StackName}-MonitoringSchedule'
+
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for running this RI management solution
+    Value: '$15-25 USD (depending on execution frequency and data volume)'
+    Export:
+      Name: !Sub '${AWS::StackName}-EstimatedMonthlyCost'

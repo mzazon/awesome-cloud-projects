@@ -1,0 +1,951 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Auto Scaling with Application Load Balancers and Target Groups - Production-ready infrastructure for web applications with intelligent scaling policies'
+
+# ================================
+# METADATA
+# ================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - PublicSubnetIds
+          - PrivateSubnetIds
+      - Label:
+          default: "Auto Scaling Configuration"
+        Parameters:
+          - InstanceType
+          - KeyPairName
+          - MinSize
+          - MaxSize
+          - DesiredCapacity
+          - CPUTargetValue
+          - RequestCountTargetValue
+      - Label:
+          default: "Load Balancer Configuration"
+        Parameters:
+          - HealthCheckPath
+          - HealthCheckIntervalSeconds
+          - HealthyThresholdCount
+          - UnhealthyThresholdCount
+      - Label:
+          default: "Scheduled Scaling Configuration"
+        Parameters:
+          - EnableScheduledScaling
+          - BusinessHoursMinSize
+          - BusinessHoursDesiredCapacity
+          - AfterHoursMinSize
+          - AfterHoursDesiredCapacity
+    ParameterLabels:
+      Environment:
+        default: "Environment"
+      ProjectName:
+        default: "Project Name"
+      VpcId:
+        default: "VPC ID"
+      PublicSubnetIds:
+        default: "Public Subnet IDs"
+      PrivateSubnetIds:
+        default: "Private Subnet IDs"
+      InstanceType:
+        default: "EC2 Instance Type"
+      KeyPairName:
+        default: "EC2 Key Pair"
+      MinSize:
+        default: "Minimum Instance Count"
+      MaxSize:
+        default: "Maximum Instance Count"
+      DesiredCapacity:
+        default: "Desired Instance Count"
+      CPUTargetValue:
+        default: "CPU Target Utilization (%)"
+      RequestCountTargetValue:
+        default: "Requests per Target per Minute"
+      HealthCheckPath:
+        default: "Health Check Path"
+      HealthCheckIntervalSeconds:
+        default: "Health Check Interval (seconds)"
+      HealthyThresholdCount:
+        default: "Healthy Threshold Count"
+      UnhealthyThresholdCount:
+        default: "Unhealthy Threshold Count"
+      EnableScheduledScaling:
+        default: "Enable Scheduled Scaling"
+      BusinessHoursMinSize:
+        default: "Business Hours - Minimum Size"
+      BusinessHoursDesiredCapacity:
+        default: "Business Hours - Desired Capacity"
+      AfterHoursMinSize:
+        default: "After Hours - Minimum Size"
+      AfterHoursDesiredCapacity:
+        default: "After Hours - Desired Capacity"
+
+# ================================
+# PARAMETERS
+# ================================
+Parameters:
+  # Environment Configuration
+  Environment:
+    Type: String
+    Default: 'demo'
+    AllowedValues:
+      - 'dev'
+      - 'test'
+      - 'staging'
+      - 'demo'
+      - 'prod'
+    Description: 'Environment name for resource tagging and configuration'
+
+  ProjectName:
+    Type: String
+    Default: 'web-app-autoscaling'
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    Description: 'Project name used for resource naming (3-50 chars, alphanumeric and hyphens)'
+
+  # Network Configuration
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC ID where resources will be created'
+
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: 'Public subnet IDs for Application Load Balancer (minimum 2 AZs required)'
+
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: 'Private subnet IDs for EC2 instances (should match ALB subnets for AZ coverage)'
+
+  # EC2 Configuration
+  InstanceType:
+    Type: String
+    Default: 't3.micro'
+    AllowedValues:
+      - 't3.micro'
+      - 't3.small'
+      - 't3.medium'
+      - 't3.large'
+      - 't3.xlarge'
+      - 'm5.large'
+      - 'm5.xlarge'
+      - 'c5.large'
+      - 'c5.xlarge'
+    Description: 'EC2 instance type for web servers'
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: 'EC2 Key Pair for SSH access to instances'
+
+  # Auto Scaling Configuration
+  MinSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 20
+    Description: 'Minimum number of instances in Auto Scaling Group'
+
+  MaxSize:
+    Type: Number
+    Default: 8
+    MinValue: 2
+    MaxValue: 100
+    Description: 'Maximum number of instances in Auto Scaling Group'
+
+  DesiredCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 50
+    Description: 'Initial desired number of instances'
+
+  CPUTargetValue:
+    Type: Number
+    Default: 70
+    MinValue: 20
+    MaxValue: 90
+    Description: 'Target CPU utilization percentage for scaling'
+
+  RequestCountTargetValue:
+    Type: Number
+    Default: 1000
+    MinValue: 100
+    MaxValue: 5000
+    Description: 'Target requests per minute per instance for ALB-based scaling'
+
+  # Health Check Configuration
+  HealthCheckPath:
+    Type: String
+    Default: '/'
+    MinLength: 1
+    MaxLength: 1024
+    Description: 'Health check path for target group'
+
+  HealthCheckIntervalSeconds:
+    Type: Number
+    Default: 30
+    MinValue: 5
+    MaxValue: 300
+    Description: 'Health check interval in seconds'
+
+  HealthyThresholdCount:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    MaxValue: 10
+    Description: 'Number of consecutive successful health checks before marking healthy'
+
+  UnhealthyThresholdCount:
+    Type: Number
+    Default: 3
+    MinValue: 2
+    MaxValue: 10
+    Description: 'Number of consecutive failed health checks before marking unhealthy'
+
+  # Scheduled Scaling Configuration
+  EnableScheduledScaling:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable scheduled scaling for business hours optimization'
+
+  BusinessHoursMinSize:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 20
+    Description: 'Minimum size during business hours (if scheduled scaling enabled)'
+
+  BusinessHoursDesiredCapacity:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    MaxValue: 50
+    Description: 'Desired capacity during business hours (if scheduled scaling enabled)'
+
+  AfterHoursMinSize:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 20
+    Description: 'Minimum size after business hours (if scheduled scaling enabled)'
+
+  AfterHoursDesiredCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 50
+    Description: 'Desired capacity after business hours (if scheduled scaling enabled)'
+
+# ================================
+# CONDITIONS
+# ================================
+Conditions:
+  # Enable scheduled scaling actions
+  EnableScheduledScalingCondition: !Equals [!Ref EnableScheduledScaling, 'true']
+  
+  # Production environment conditions for enhanced monitoring
+  IsProductionEnvironment: !Equals [!Ref Environment, 'prod']
+
+# ================================
+# MAPPINGS
+# ================================
+Mappings:
+  # Latest Amazon Linux 2 AMI IDs by region
+  RegionMap:
+    us-east-1:
+      AMI: 'ami-0c02fb55956c7d316'
+    us-east-2:
+      AMI: 'ami-0f924dc71d44d23e2'
+    us-west-1:
+      AMI: 'ami-0d382e80be7ffdae5'
+    us-west-2:
+      AMI: 'ami-0c2d3e23f757b5d84'
+    eu-west-1:
+      AMI: 'ami-04dd4500af104442f'
+    eu-west-2:
+      AMI: 'ami-0b2ed2e3df8d8746e'
+    eu-central-1:
+      AMI: 'ami-0a02ee601d742e89f'
+    ap-southeast-1:
+      AMI: 'ami-0c802847a7dd848c0'
+    ap-southeast-2:
+      AMI: 'ami-0b7dcd6e6fd797935'
+    ap-northeast-1:
+      AMI: 'ami-09d28faae2e9e7138'
+
+# ================================
+# RESOURCES
+# ================================
+Resources:
+  # ================================
+  # SECURITY GROUP
+  # ================================
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-web-sg-${Environment}'
+      GroupDescription: !Sub 'Security group for ${ProjectName} web servers in ${Environment}'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        # HTTP access from load balancer
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: '0.0.0.0/0'
+          Description: 'HTTP access for web traffic'
+        # HTTPS access from load balancer
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+          Description: 'HTTPS access for secure web traffic'
+        # SSH access for administration
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: '0.0.0.0/0'
+          Description: 'SSH access for administration'
+      SecurityGroupEgress:
+        # Allow all outbound traffic
+        - IpProtocol: -1
+          CidrIp: '0.0.0.0/0'
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-web-sg-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
+  # APPLICATION LOAD BALANCER
+  # ================================
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-alb-${Environment}'
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups:
+        - !Ref WebServerSecurityGroup
+      LoadBalancerAttributes:
+        # Enable access logs for production
+        - Key: access_logs.s3.enabled
+          Value: !If [IsProductionEnvironment, 'true', 'false']
+        # Idle timeout configuration
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+        # Enable deletion protection for production
+        - Key: deletion_protection.enabled
+          Value: !If [IsProductionEnvironment, 'true', 'false']
+        # Enable HTTP/2 for better performance
+        - Key: routing.http2.enabled
+          Value: 'true'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alb-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
+  # TARGET GROUP
+  # ================================
+  WebServerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-targets-${Environment}'
+      Protocol: HTTP
+      Port: 80
+      VpcId: !Ref VpcId
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckIntervalSeconds: !Ref HealthCheckIntervalSeconds
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: !Ref HealthyThresholdCount
+      UnhealthyThresholdCount: !Ref UnhealthyThresholdCount
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        # Reduce deregistration delay for faster scaling
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+        # Disable stickiness for better load distribution
+        - Key: stickiness.enabled
+          Value: 'false'
+        # Enable slow start for new instances
+        - Key: slow_start.duration_seconds
+          Value: '60'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-targets-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
+  # LOAD BALANCER LISTENER
+  # ================================
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebServerTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # ================================
+  # IAM ROLE FOR EC2 INSTANCES
+  # ================================
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ec2-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # CloudWatch agent permissions
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        # Systems Manager permissions for session management
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ec2-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ProjectName}-ec2-profile-${Environment}'
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # ================================
+  # LAUNCH TEMPLATE
+  # ================================
+  WebServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ProjectName}-lt-${Environment}'
+      LaunchTemplateData:
+        ImageId: !FindInMap [RegionMap, !Ref 'AWS::Region', AMI]
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyPairName
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref WebServerSecurityGroup
+        # Enhanced monitoring for production
+        Monitoring:
+          Enabled: !If [IsProductionEnvironment, true, false]
+        # User data script for web server setup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd
+            systemctl start httpd
+            systemctl enable httpd
+            
+            # Create demo web page with instance metadata
+            cat > /var/www/html/index.html << 'EOF'
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Auto Scaling Demo - ${ProjectName}</title>
+                <style>
+                    body { font-family: Arial, sans-serif; margin: 40px; background-color: #f5f5f5; }
+                    .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+                    .header { background: #232f3e; color: white; padding: 20px; margin: -30px -30px 30px -30px; border-radius: 10px 10px 0 0; }
+                    .metric { background: #f0f0f0; padding: 20px; margin: 10px 0; border-radius: 5px; border-left: 4px solid #ff9900; }
+                    .status { padding: 10px; border-radius: 5px; margin: 10px 0; }
+                    .ready { background-color: #d4edda; border: 1px solid #c3e6cb; color: #155724; }
+                    .loading { background-color: #fff3cd; border: 1px solid #ffeaa7; color: #856404; }
+                    button { background: #ff9900; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-size: 16px; }
+                    button:hover { background: #cc7a00; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <div class="header">
+                        <h1>${ProjectName} Auto Scaling Demo</h1>
+                        <p>Environment: ${Environment} | Load Balancer: ${ApplicationLoadBalancer}</p>
+                    </div>
+                    
+                    <div class="metric">
+                        <h3>🖥️ Instance Information</h3>
+                        <p><strong>Instance ID:</strong> <span id="instance-id">Loading...</span></p>
+                        <p><strong>Availability Zone:</strong> <span id="az">Loading...</span></p>
+                        <p><strong>Instance Type:</strong> <span id="instance-type">Loading...</span></p>
+                        <p><strong>Private IP:</strong> <span id="local-ip">Loading...</span></p>
+                        <p><strong>Server Time:</strong> <span id="server-time"></span></p>
+                    </div>
+                    
+                    <div class="metric">
+                        <h3>⚡ Load Testing</h3>
+                        <p>Generate CPU load to test auto scaling policies:</p>
+                        <button onclick="generateLoad()">Generate CPU Load (30 seconds)</button>
+                        <div id="load-status" class="status ready">Ready to generate load</div>
+                        <p><small>This will create high CPU utilization to trigger scaling policies.</small></p>
+                    </div>
+                    
+                    <div class="metric">
+                        <h3>📊 Auto Scaling Configuration</h3>
+                        <p><strong>Min Instances:</strong> ${MinSize}</p>
+                        <p><strong>Max Instances:</strong> ${MaxSize}</p>
+                        <p><strong>CPU Target:</strong> ${CPUTargetValue}%</p>
+                        <p><strong>Request Target:</strong> ${RequestCountTargetValue} req/min/instance</p>
+                    </div>
+                </div>
+                
+                <script>
+                    // Fetch instance metadata using IMDSv2
+                    async function fetchMetadata() {
+                        try {
+                            // Get session token
+                            const tokenResponse = await fetch('http://169.254.169.254/latest/api/token', {
+                                method: 'PUT',
+                                headers: {
+                                    'X-aws-ec2-metadata-token-ttl-seconds': '21600'
+                                }
+                            });
+                            const token = await tokenResponse.text();
+                            
+                            const headers = {
+                                'X-aws-ec2-metadata-token': token
+                            };
+                            
+                            // Fetch metadata
+                            const [instanceId, az, instanceType, localIp] = await Promise.all([
+                                fetch('http://169.254.169.254/latest/meta-data/instance-id', {headers}).then(r => r.text()),
+                                fetch('http://169.254.169.254/latest/meta-data/placement/availability-zone', {headers}).then(r => r.text()),
+                                fetch('http://169.254.169.254/latest/meta-data/instance-type', {headers}).then(r => r.text()),
+                                fetch('http://169.254.169.254/latest/meta-data/local-ipv4', {headers}).then(r => r.text())
+                            ]);
+                            
+                            document.getElementById('instance-id').textContent = instanceId;
+                            document.getElementById('az').textContent = az;
+                            document.getElementById('instance-type').textContent = instanceType;
+                            document.getElementById('local-ip').textContent = localIp;
+                        } catch (error) {
+                            console.error('Error fetching metadata:', error);
+                            document.getElementById('instance-id').textContent = 'Error loading metadata';
+                        }
+                    }
+                    
+                    // Generate CPU load for testing auto scaling
+                    function generateLoad() {
+                        const statusElement = document.getElementById('load-status');
+                        statusElement.className = 'status loading';
+                        statusElement.textContent = 'Generating high CPU load for 30 seconds...';
+                        
+                        // Create multiple Web Workers for CPU-intensive tasks
+                        const workers = [];
+                        const numWorkers = navigator.hardwareConcurrency || 4;
+                        
+                        for (let i = 0; i < numWorkers; i++) {
+                            const worker = new Worker('data:application/javascript,' + 
+                                'const start = Date.now(); while (Date.now() - start < 30000) { Math.random(); }'
+                            );
+                            workers.push(worker);
+                        }
+                        
+                        setTimeout(() => {
+                            workers.forEach(worker => worker.terminate());
+                            statusElement.className = 'status ready';
+                            statusElement.textContent = 'Load test completed. Check CloudWatch for scaling activity.';
+                        }, 30000);
+                    }
+                    
+                    // Update server time every second
+                    function updateTime() {
+                        document.getElementById('server-time').textContent = new Date().toLocaleString();
+                    }
+                    
+                    // Initialize page
+                    fetchMetadata();
+                    updateTime();
+                    setInterval(updateTime, 1000);
+                </script>
+            </body>
+            </html>
+            EOF
+            
+            # Install CloudWatch agent for enhanced monitoring
+            if [ "${Environment}" = "prod" ]; then
+                yum install -y amazon-cloudwatch-agent
+                
+                # Create CloudWatch agent configuration
+                cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'CWEOF'
+                {
+                    "metrics": {
+                        "namespace": "AutoScaling/${ProjectName}",
+                        "metrics_collected": {
+                            "cpu": {
+                                "measurement": [
+                                    "cpu_usage_idle",
+                                    "cpu_usage_iowait",
+                                    "cpu_usage_user",
+                                    "cpu_usage_system"
+                                ],
+                                "metrics_collection_interval": 60
+                            },
+                            "disk": {
+                                "measurement": [
+                                    "used_percent"
+                                ],
+                                "metrics_collection_interval": 60,
+                                "resources": [
+                                    "*"
+                                ]
+                            },
+                            "mem": {
+                                "measurement": [
+                                    "mem_used_percent"
+                                ],
+                                "metrics_collection_interval": 60
+                            }
+                        }
+                    }
+                }
+            CWEOF
+                
+                systemctl enable amazon-cloudwatch-agent
+                systemctl start amazon-cloudwatch-agent
+            fi
+        # Metadata options for enhanced security (IMDSv2)
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+          HttpEndpoint: enabled
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${ProjectName}-web-server-${Environment}'
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: Project
+                Value: !Ref ProjectName
+              - Key: AutoScaling
+                Value: 'true'
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub '${ProjectName}-web-server-volume-${Environment}'
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: Project
+                Value: !Ref ProjectName
+
+  # ================================
+  # AUTO SCALING GROUP
+  # ================================
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${ProjectName}-asg-${Environment}'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebServerLaunchTemplate
+        Version: !GetAtt WebServerLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      TargetGroupARNs:
+        - !Ref WebServerTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      DefaultCooldown: 300
+      VPCZoneIdentifier: !Ref PrivateSubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-asg-${Environment}'
+          PropagateAtLaunch: false
+        - Key: Environment
+          Value: !Ref Environment
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: !Ref ProjectName
+          PropagateAtLaunch: true
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 2
+        PauseTime: PT5M
+        SuspendProcesses:
+          - HealthCheck
+          - ReplaceUnhealthy
+          - AZRebalance
+          - AlarmNotification
+          - ScheduledActions
+        WaitOnResourceSignals: false
+
+  # ================================
+  # AUTO SCALING POLICIES
+  # ================================
+  # CPU Target Tracking Scaling Policy
+  CPUTargetTrackingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: !Ref CPUTargetValue
+        ScaleOutCooldown: 300
+        ScaleInCooldown: 300
+        DisableScaleIn: false
+
+  # ALB Request Count Target Tracking Policy
+  ALBRequestCountPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ALBRequestCountPerTarget
+          ResourceLabel: !Sub 
+            - '${LoadBalancerFullName}/${TargetGroupFullName}'
+            - LoadBalancerFullName: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+              TargetGroupFullName: !GetAtt WebServerTargetGroup.TargetGroupFullName
+        TargetValue: !Ref RequestCountTargetValue
+        ScaleOutCooldown: 300
+        ScaleInCooldown: 300
+        DisableScaleIn: false
+
+  # ================================
+  # SCHEDULED SCALING ACTIONS
+  # ================================
+  # Scale up during business hours (9 AM UTC Monday-Friday)
+  ScaleUpBusinessHours:
+    Type: AWS::AutoScaling::ScheduledAction
+    Condition: EnableScheduledScalingCondition
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      ScheduledActionName: !Sub '${ProjectName}-scale-up-business-hours'
+      Recurrence: '0 9 * * MON-FRI'
+      MinSize: !Ref BusinessHoursMinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref BusinessHoursDesiredCapacity
+
+  # Scale down after business hours (6 PM UTC Monday-Friday)
+  ScaleDownAfterHours:
+    Type: AWS::AutoScaling::ScheduledAction
+    Condition: EnableScheduledScalingCondition
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      ScheduledActionName: !Sub '${ProjectName}-scale-down-after-hours'
+      Recurrence: '0 18 * * MON-FRI'
+      MinSize: !Ref AfterHoursMinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref AfterHoursDesiredCapacity
+
+  # ================================
+  # CLOUDWATCH ALARMS
+  # ================================
+  # High CPU Utilization Alarm
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-high-cpu-${Environment}'
+      AlarmDescription: !Sub 'High CPU utilization across ${ProjectName} Auto Scaling Group'
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      TreatMissingData: notBreaching
+
+  # Unhealthy Target Alarm
+  UnhealthyTargetAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-unhealthy-targets-${Environment}'
+      AlarmDescription: !Sub 'Unhealthy targets detected in ${ProjectName} target group'
+      MetricName: UnHealthyHostCount
+      Namespace: AWS/ApplicationELB
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt WebServerTargetGroup.TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+      TreatMissingData: notBreaching
+
+  # Low Request Count Alarm (for cost optimization)
+  LowRequestCountAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-low-requests-${Environment}'
+      AlarmDescription: !Sub 'Low request count in ${ProjectName} - potential for cost optimization'
+      MetricName: RequestCount
+      Namespace: AWS/ApplicationELB
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 3
+      Threshold: 100
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+      TreatMissingData: notBreaching
+
+# ================================
+# OUTPUTS
+# ================================
+Outputs:
+  # Load Balancer Information
+  LoadBalancerDNS:
+    Description: 'DNS name of the Application Load Balancer'
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${ProjectName}-alb-dns-${Environment}'
+
+  LoadBalancerURL:
+    Description: 'URL of the Application Load Balancer'
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+
+  LoadBalancerArn:
+    Description: 'ARN of the Application Load Balancer'
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: !Sub '${ProjectName}-alb-arn-${Environment}'
+
+  LoadBalancerHostedZoneId:
+    Description: 'Hosted Zone ID of the Application Load Balancer'
+    Value: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
+    Export:
+      Name: !Sub '${ProjectName}-alb-zone-id-${Environment}'
+
+  # Target Group Information
+  TargetGroupArn:
+    Description: 'ARN of the Target Group'
+    Value: !Ref WebServerTargetGroup
+    Export:
+      Name: !Sub '${ProjectName}-tg-arn-${Environment}'
+
+  TargetGroupFullName:
+    Description: 'Full name of the Target Group'
+    Value: !GetAtt WebServerTargetGroup.TargetGroupFullName
+
+  # Auto Scaling Group Information
+  AutoScalingGroupName:
+    Description: 'Name of the Auto Scaling Group'
+    Value: !Ref AutoScalingGroup
+    Export:
+      Name: !Sub '${ProjectName}-asg-name-${Environment}'
+
+  AutoScalingGroupArn:
+    Description: 'ARN of the Auto Scaling Group'
+    Value: !Sub 'arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${AutoScalingGroup}'
+
+  # Security Group Information
+  SecurityGroupId:
+    Description: 'ID of the Web Server Security Group'
+    Value: !Ref WebServerSecurityGroup
+    Export:
+      Name: !Sub '${ProjectName}-sg-id-${Environment}'
+
+  # Launch Template Information
+  LaunchTemplateId:
+    Description: 'ID of the Launch Template'
+    Value: !Ref WebServerLaunchTemplate
+    Export:
+      Name: !Sub '${ProjectName}-lt-id-${Environment}'
+
+  LaunchTemplateVersion:
+    Description: 'Latest version of the Launch Template'
+    Value: !GetAtt WebServerLaunchTemplate.LatestVersionNumber
+
+  # Scaling Policy Information
+  CPUScalingPolicyArn:
+    Description: 'ARN of the CPU Target Tracking Scaling Policy'
+    Value: !Ref CPUTargetTrackingPolicy
+
+  ALBScalingPolicyArn:
+    Description: 'ARN of the ALB Request Count Scaling Policy'
+    Value: !Ref ALBRequestCountPolicy
+
+  # CloudWatch Alarms
+  HighCPUAlarmArn:
+    Description: 'ARN of the High CPU Utilization Alarm'
+    Value: !Sub 'arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${HighCPUAlarm}'
+
+  UnhealthyTargetAlarmArn:
+    Description: 'ARN of the Unhealthy Target Alarm'
+    Value: !Sub 'arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${UnhealthyTargetAlarm}'
+
+  # Configuration Summary
+  ScalingConfiguration:
+    Description: 'Summary of Auto Scaling configuration'
+    Value: !Sub 'Min: ${MinSize}, Max: ${MaxSize}, Desired: ${DesiredCapacity}, CPU Target: ${CPUTargetValue}%, Request Target: ${RequestCountTargetValue}/min'
+
+  # Environment Information
+  Environment:
+    Description: 'Environment name'
+    Value: !Ref Environment
+
+  ProjectName:
+    Description: 'Project name'
+    Value: !Ref ProjectName
+
+  Region:
+    Description: 'AWS Region where resources are deployed'
+    Value: !Ref 'AWS::Region'
+
+  # Cost Monitoring
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost (USD) - varies by region and usage'
+    Value: !Sub 
+      - 'ALB: $16-25, EC2 (${InstanceType} x ${DesiredCapacity}): $${InstanceCost}-${MaxInstanceCost}, Data Transfer: $10-50'
+      - InstanceCost: !If 
+          - !Equals [!Ref InstanceType, 't3.micro']
+          - !Sub '${DesiredCapacity}0'
+          - !If 
+            - !Equals [!Ref InstanceType, 't3.small']  
+            - !Sub '${DesiredCapacity}8'
+            - '40+'
+        MaxInstanceCost: !If 
+          - !Equals [!Ref InstanceType, 't3.micro']
+          - !Sub '${MaxSize}0'
+          - !If 
+            - !Equals [!Ref InstanceType, 't3.small']
+            - !Sub '${MaxSize}8'
+            - '200+'

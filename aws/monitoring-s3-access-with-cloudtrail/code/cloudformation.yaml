@@ -1,0 +1,996 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for S3 Access Logging and Security Monitoring with CloudTrail - Implements comprehensive audit trails and real-time security monitoring for S3 buckets'
+
+Parameters:
+  # Naming and Identification Parameters
+  ResourcePrefix:
+    Type: String
+    Default: 's3-security-monitor'
+    Description: 'Prefix for all resources created by this template'
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+    MinLength: 3
+    MaxLength: 20
+
+  # S3 Configuration Parameters
+  SourceBucketName:
+    Type: String
+    Description: 'Name of the source S3 bucket to monitor (leave empty to create new bucket)'
+    Default: ''
+    AllowedPattern: '^[a-z0-9.-]*$'
+    ConstraintDescription: 'Must be a valid S3 bucket name (lowercase, numbers, dots, hyphens)'
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    Description: 'Number of days to retain CloudWatch logs'
+    MinValue: 1
+    MaxValue: 365
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365]
+
+  # Monitoring Configuration Parameters
+  EnableRealTimeMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable real-time monitoring with EventBridge and Lambda'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for security alerts (optional)'
+    Default: ''
+    AllowedPattern: '^[a-zA-Z0-9._%+-]*@[a-zA-Z0-9.-]*\.[a-zA-Z]{2,}$|^$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+  # CloudTrail Configuration Parameters
+  EnableCloudTrailInsights:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable CloudTrail Insights for anomaly detection (additional cost)'
+
+  CloudTrailS3KeyPrefix:
+    Type: String
+    Default: 'cloudtrail-logs/'
+    Description: 'S3 key prefix for CloudTrail logs'
+    AllowedPattern: '^[a-zA-Z0-9!_.*\'()-/]*$'
+
+  # Security Configuration Parameters
+  EnableMFA:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Require MFA for sensitive operations'
+
+  AllowedIPRanges:
+    Type: CommaDelimitedList
+    Default: '0.0.0.0/0'
+    Description: 'Comma-separated list of IP ranges allowed to access S3 buckets'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Resource Configuration'
+        Parameters:
+          - ResourcePrefix
+          - SourceBucketName
+      - Label:
+          default: 'Monitoring Configuration'
+        Parameters:
+          - EnableRealTimeMonitoring
+          - NotificationEmail
+          - LogRetentionDays
+      - Label:
+          default: 'CloudTrail Configuration'
+        Parameters:
+          - EnableCloudTrailInsights
+          - CloudTrailS3KeyPrefix
+      - Label:
+          default: 'Security Configuration'
+        Parameters:
+          - EnableMFA
+          - AllowedIPRanges
+    ParameterLabels:
+      ResourcePrefix:
+        default: 'Resource Name Prefix'
+      SourceBucketName:
+        default: 'Source S3 Bucket Name'
+      EnableRealTimeMonitoring:
+        default: 'Enable Real-time Monitoring'
+      NotificationEmail:
+        default: 'Security Alert Email'
+      LogRetentionDays:
+        default: 'Log Retention Period'
+      EnableCloudTrailInsights:
+        default: 'Enable CloudTrail Insights'
+      CloudTrailS3KeyPrefix:
+        default: 'CloudTrail S3 Key Prefix'
+      EnableMFA:
+        default: 'Require MFA'
+      AllowedIPRanges:
+        default: 'Allowed IP Ranges'
+
+Conditions:
+  CreateSourceBucket: !Equals [!Ref SourceBucketName, '']
+  EnableNotifications: !And
+    - !Equals [!Ref EnableRealTimeMonitoring, 'true']
+    - !Not [!Equals [!Ref NotificationEmail, '']]
+  EnableInsights: !Equals [!Ref EnableCloudTrailInsights, 'true']
+  EnableLambdaMonitoring: !Equals [!Ref EnableRealTimeMonitoring, 'true']
+
+Resources:
+  # ==================== S3 RESOURCES ====================
+  
+  # Source S3 Bucket (conditionally created)
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateSourceBucket
+    Properties:
+      BucketName: !Sub '${ResourcePrefix}-source-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: 'access-logs/'
+        TargetObjectKeyFormat:
+          PartitionedPrefix:
+            PartitionDateSource: EventTime
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      Tags:
+        - Key: Purpose
+          Value: 'Source bucket for security monitoring'
+        - Key: Environment
+          Value: 'Production'
+        - Key: SecurityLevel
+          Value: 'High'
+
+  # S3 Access Logs Bucket
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ResourcePrefix}-access-logs-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: 'TransitionToIA'
+            Status: Enabled
+            TransitionInDays: 30
+            StorageClass: STANDARD_IA
+          - Id: 'TransitionToGlacier'
+            Status: Enabled
+            TransitionInDays: 90
+            StorageClass: GLACIER
+          - Id: 'DeleteOldLogs'
+            Status: Enabled
+            ExpirationInDays: 2555  # 7 years for compliance
+      Tags:
+        - Key: Purpose
+          Value: 'S3 server access logs storage'
+        - Key: Environment
+          Value: 'Production'
+
+  # S3 Access Logs Bucket Policy
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: 'S3ServerAccessLogsPolicy'
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: 's3:PutObject'
+            Resource: !Sub '${AccessLogsBucket.Arn}/access-logs/*'
+            Condition:
+              ArnLike:
+                'aws:SourceArn': !If
+                  - CreateSourceBucket
+                  - !Sub '${SourceBucket.Arn}'
+                  - !Sub 'arn:aws:s3:::${SourceBucketName}'
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+          - Sid: 'S3ServerAccessLogsDelivery'
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: 's3:GetBucketAcl'
+            Resource: !Sub '${AccessLogsBucket.Arn}'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+
+  # CloudTrail S3 Bucket
+  CloudTrailLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ResourcePrefix}-cloudtrail-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: 'TransitionToIA'
+            Status: Enabled
+            TransitionInDays: 30
+            StorageClass: STANDARD_IA
+          - Id: 'TransitionToGlacier'
+            Status: Enabled
+            TransitionInDays: 90
+            StorageClass: GLACIER
+          - Id: 'DeleteOldLogs'
+            Status: Enabled
+            ExpirationInDays: 2555  # 7 years for compliance
+      Tags:
+        - Key: Purpose
+          Value: 'CloudTrail logs storage'
+        - Key: Environment
+          Value: 'Production'
+
+  # CloudTrail S3 Bucket Policy
+  CloudTrailLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: 'AWSCloudTrailAclCheck'
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: 's3:GetBucketAcl'
+            Resource: !Sub '${CloudTrailLogsBucket.Arn}'
+            Condition:
+              StringEquals:
+                'aws:SourceArn': !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${ResourcePrefix}-security-trail'
+          - Sid: 'AWSCloudTrailWrite'
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: 's3:PutObject'
+            Resource: !Sub '${CloudTrailLogsBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': 'bucket-owner-full-control'
+                'aws:SourceArn': !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${ResourcePrefix}-security-trail'
+
+  # ==================== CLOUDWATCH RESOURCES ====================
+
+  # CloudWatch Log Group for CloudTrail
+  CloudTrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/cloudtrail/${ResourcePrefix}-security-monitoring'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Purpose
+          Value: 'CloudTrail logs for security monitoring'
+        - Key: Environment
+          Value: 'Production'
+
+  # CloudWatch Log Group for S3 Access Logs Analysis
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ResourcePrefix}-access-monitoring'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Purpose
+          Value: 'S3 access logs analysis'
+        - Key: Environment
+          Value: 'Production'
+
+  # CloudWatch Dashboard
+  SecurityMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ResourcePrefix}-Security-Monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/S3", "BucketSizeBytes", "BucketName", "${SourceBucket}", "StorageType", "StandardStorage"],
+                  ["AWS/S3", "NumberOfObjects", "BucketName", "${SourceBucket}", "StorageType", "AllStorageTypes"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "S3 Bucket Metrics",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "log",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${CloudTrailLogGroup}' | fields @timestamp, eventName, sourceIPAddress, userIdentity.type, errorCode\n| filter eventName like /GetObject|PutObject|DeleteObject/\n| stats count() by eventName\n| sort count desc",
+                "region": "${AWS::Region}",
+                "title": "Top S3 API Calls",
+                "view": "table"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${CloudTrailLogGroup}' | fields @timestamp, eventName, sourceIPAddress, errorCode, errorMessage\n| filter errorCode = \"AccessDenied\"\n| stats count() by sourceIPAddress\n| sort count desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Failed Access Attempts by IP",
+                "view": "table"
+              }
+            },
+            {
+              "type": "log",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${CloudTrailLogGroup}' | fields @timestamp, eventName, sourceIPAddress, userIdentity.arn\n| filter eventName like /PutBucket|DeleteBucket|PutBucketPolicy|PutBucketAcl/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Administrative Actions",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # ==================== IAM RESOURCES ====================
+
+  # IAM Role for CloudTrail CloudWatch Logs
+  CloudTrailLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-CloudTrail-Logs-Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'CloudTrailLogsPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                Resource: !Sub '${CloudTrailLogGroup.Arn}*'
+      Tags:
+        - Key: Purpose
+          Value: 'CloudTrail CloudWatch Logs integration'
+        - Key: Environment
+          Value: 'Production'
+
+  # IAM Role for Lambda Security Monitor
+  LambdaSecurityMonitorRole:
+    Type: AWS::IAM::Role
+    Condition: EnableLambdaMonitoring
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-Lambda-Security-Monitor-Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: 'SecurityMonitoringPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !If [EnableNotifications, !Ref SecurityAlertsTopic, !Ref 'AWS::NoValue']
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ResourcePrefix}-security-monitor*'
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                Resource: '*'
+      Tags:
+        - Key: Purpose
+          Value: 'Lambda security monitoring function'
+        - Key: Environment
+          Value: 'Production'
+
+  # ==================== CLOUDTRAIL RESOURCES ====================
+
+  # CloudTrail Trail for S3 Security Monitoring
+  SecurityMonitoringTrail:
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      TrailName: !Sub '${ResourcePrefix}-security-trail'
+      S3BucketName: !Ref CloudTrailLogsBucket
+      S3KeyPrefix: !Ref CloudTrailS3KeyPrefix
+      CloudWatchLogsLogGroupArn: !Sub '${CloudTrailLogGroup.Arn}'
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailLogsRole.Arn
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      InsightSelectors: !If
+        - EnableInsights
+        - - InsightType: 'ApiCallRateInsight'
+        - !Ref 'AWS::NoValue'
+      EventSelectors:
+        - ReadWriteType: 'All'
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: 'AWS::S3::Object'
+              Values:
+                - !If
+                  - CreateSourceBucket
+                  - !Sub '${SourceBucket}/*'
+                  - !Sub '${SourceBucketName}/*'
+            - Type: 'AWS::S3::Bucket'
+              Values:
+                - !If
+                  - CreateSourceBucket
+                  - !Sub '${SourceBucket}'
+                  - !Sub '${SourceBucketName}'
+      Tags:
+        - Key: Purpose
+          Value: 'S3 security monitoring and audit trail'
+        - Key: Environment
+          Value: 'Production'
+
+  # ==================== SNS RESOURCES ====================
+
+  # SNS Topic for Security Alerts
+  SecurityAlertsTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnableNotifications
+    Properties:
+      TopicName: !Sub '${ResourcePrefix}-security-alerts'
+      DisplayName: 'S3 Security Alerts'
+      KmsMasterKeyId: 'alias/aws/sns'
+      Tags:
+        - Key: Purpose
+          Value: 'Security alerts and notifications'
+        - Key: Environment
+          Value: 'Production'
+
+  # SNS Topic Policy
+  SecurityAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: EnableNotifications
+    Properties:
+      Topics:
+        - !Ref SecurityAlertsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: 'AllowEventBridgePublish'
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sns:Publish'
+            Resource: !Ref SecurityAlertsTopic
+          - Sid: 'AllowLambdaPublish'
+            Effect: Allow
+            Principal:
+              AWS: !If [EnableLambdaMonitoring, !GetAtt LambdaSecurityMonitorRole.Arn, !Ref 'AWS::NoValue']
+            Action: 'sns:Publish'
+            Resource: !Ref SecurityAlertsTopic
+
+  # SNS Email Subscription
+  SecurityAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: EnableNotifications
+    Properties:
+      TopicArn: !Ref SecurityAlertsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ==================== EVENTBRIDGE RESOURCES ====================
+
+  # EventBridge Rule for Unauthorized Access Detection
+  UnauthorizedAccessRule:
+    Type: AWS::Events::Rule
+    Condition: EnableRealTimeMonitoring
+    Properties:
+      Name: !Sub '${ResourcePrefix}-unauthorized-access'
+      Description: 'Detect unauthorized S3 access attempts'
+      EventPattern:
+        source:
+          - 'aws.s3'
+        detail-type:
+          - 'AWS API Call via CloudTrail'
+        detail:
+          eventName:
+            - 'GetObject'
+            - 'PutObject'
+            - 'DeleteObject'
+            - 'GetBucketAcl'
+            - 'PutBucketAcl'
+            - 'PutBucketPolicy'
+          errorCode:
+            - 'AccessDenied'
+            - 'SignatureDoesNotMatch'
+            - 'InvalidUserID.NotFound'
+          resources:
+            ARN:
+              - !If
+                - CreateSourceBucket
+                - !Sub '${SourceBucket.Arn}'
+                - !Sub 'arn:aws:s3:::${SourceBucketName}'
+              - !If
+                - CreateSourceBucket
+                - !Sub '${SourceBucket.Arn}/*'
+                - !Sub 'arn:aws:s3:::${SourceBucketName}/*'
+      State: 'ENABLED'
+      Targets:
+        - Arn: !If [EnableNotifications, !Ref SecurityAlertsTopic, !Ref 'AWS::NoValue']
+          Id: 'SecurityAlertsSNSTopic'
+          InputTransformer:
+            InputPathsMap:
+              eventName: '$.detail.eventName'
+              sourceIP: '$.detail.sourceIPAddress'
+              errorCode: '$.detail.errorCode'
+              eventTime: '$.detail.eventTime'
+              userIdentity: '$.detail.userIdentity'
+            InputTemplate: |
+              {
+                "alertType": "Unauthorized S3 Access Attempt",
+                "severity": "HIGH",
+                "eventName": "<eventName>",
+                "sourceIP": "<sourceIP>",
+                "errorCode": "<errorCode>",
+                "eventTime": "<eventTime>",
+                "userIdentity": "<userIdentity>",
+                "message": "Unauthorized access attempt detected on S3 bucket. Event: <eventName> from IP: <sourceIP> with error: <errorCode>"
+              }
+        - !If
+          - EnableLambdaMonitoring
+          - Arn: !GetAtt SecurityMonitorLambda.Arn
+            Id: 'SecurityMonitorLambda'
+          - !Ref 'AWS::NoValue'
+
+  # EventBridge Rule for Administrative Actions
+  AdminActionsRule:
+    Type: AWS::Events::Rule
+    Condition: EnableRealTimeMonitoring
+    Properties:
+      Name: !Sub '${ResourcePrefix}-admin-actions'
+      Description: 'Monitor administrative S3 actions'
+      EventPattern:
+        source:
+          - 'aws.s3'
+        detail-type:
+          - 'AWS API Call via CloudTrail'
+        detail:
+          eventName:
+            - 'PutBucketPolicy'
+            - 'DeleteBucketPolicy'
+            - 'PutBucketAcl'
+            - 'CreateBucket'
+            - 'DeleteBucket'
+            - 'PutBucketEncryption'
+            - 'DeleteBucketEncryption'
+          resources:
+            ARN:
+              - !If
+                - CreateSourceBucket
+                - !Sub '${SourceBucket.Arn}'
+                - !Sub 'arn:aws:s3:::${SourceBucketName}'
+      State: 'ENABLED'
+      Targets:
+        - Arn: !If [EnableNotifications, !Ref SecurityAlertsTopic, !Ref 'AWS::NoValue']
+          Id: 'AdminActionsSNSTopic'
+          InputTransformer:
+            InputPathsMap:
+              eventName: '$.detail.eventName'
+              sourceIP: '$.detail.sourceIPAddress'
+              eventTime: '$.detail.eventTime'
+              userIdentity: '$.detail.userIdentity'
+            InputTemplate: |
+              {
+                "alertType": "S3 Administrative Action",
+                "severity": "MEDIUM",
+                "eventName": "<eventName>",
+                "sourceIP": "<sourceIP>",
+                "eventTime": "<eventTime>",
+                "userIdentity": "<userIdentity>",
+                "message": "Administrative action performed on S3 bucket. Event: <eventName> from IP: <sourceIP>"
+              }
+
+  # ==================== LAMBDA RESOURCES ====================
+
+  # Lambda Function for Advanced Security Monitoring
+  SecurityMonitorLambda:
+    Type: AWS::Lambda::Function
+    Condition: EnableLambdaMonitoring
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-security-monitor'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaSecurityMonitorRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !If [EnableNotifications, !Ref SecurityAlertsTopic, '']
+          ALLOWED_IP_RANGES: !Join [',', !Ref AllowedIPRanges]
+          SOURCE_BUCKET: !If
+            - CreateSourceBucket
+            - !Ref SourceBucket
+            - !Ref SourceBucketName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          import ipaddress
+          from datetime import datetime
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              try:
+                  # Parse EventBridge event
+                  detail = event.get('detail', {})
+                  
+                  if detail.get('eventSource') == 'aws.s3':
+                      analyze_s3_event(detail)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Security monitoring completed')
+                  }
+              except Exception as e:
+                  logger.error(f"Error processing event: {str(e)}")
+                  logger.error(f"Event: {json.dumps(event)}")
+                  raise
+
+          def analyze_s3_event(event):
+              event_name = event.get('eventName', '')
+              source_ip = event.get('sourceIPAddress', '')
+              user_identity = event.get('userIdentity', {})
+              error_code = event.get('errorCode', '')
+              event_time = event.get('eventTime', '')
+              
+              # Check for suspicious patterns
+              if is_suspicious_activity(event_name, source_ip, user_identity, error_code):
+                  send_alert(event, 'HIGH', 'Advanced threat detected')
+              elif is_unusual_activity(event_name, source_ip, user_identity):
+                  send_alert(event, 'MEDIUM', 'Unusual activity detected')
+
+          def is_suspicious_activity(event_name, source_ip, user_identity, error_code):
+              # High-severity security checks
+              suspicious_actions = [
+                  'DeleteBucket', 'PutBucketPolicy', 'PutBucketAcl',
+                  'DeleteBucketPolicy', 'PutBucketEncryption', 'DeleteBucketEncryption'
+              ]
+              
+              if event_name in suspicious_actions:
+                  return True
+              
+              # Multiple failed access attempts
+              if error_code in ['AccessDenied', 'SignatureDoesNotMatch']:
+                  return True
+              
+              # Check for access from disallowed IP ranges
+              if source_ip and not is_allowed_ip(source_ip):
+                  return True
+              
+              return False
+
+          def is_unusual_activity(event_name, source_ip, user_identity):
+              # Medium-severity checks for unusual patterns
+              
+              # Root account usage
+              if user_identity.get('type') == 'Root':
+                  return True
+              
+              # API calls from unusual user agents
+              user_agent = user_identity.get('userAgent', '')
+              if 'boto3' not in user_agent and 'aws-cli' not in user_agent:
+                  return True
+              
+              return False
+
+          def is_allowed_ip(ip_address):
+              try:
+                  allowed_ranges = os.environ.get('ALLOWED_IP_RANGES', '0.0.0.0/0').split(',')
+                  ip = ipaddress.ip_address(ip_address)
+                  
+                  for range_str in allowed_ranges:
+                      if '/' in range_str:
+                          network = ipaddress.ip_network(range_str.strip(), strict=False)
+                          if ip in network:
+                              return True
+                      else:
+                          if str(ip) == range_str.strip():
+                              return True
+                  
+                  return False
+              except Exception as e:
+                  logger.error(f"Error checking IP address: {str(e)}")
+                  return True  # Default to allow if error
+
+          def send_alert(event, severity, message):
+              try:
+                  sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
+                  if not sns_topic_arn:
+                      logger.info("No SNS topic configured, skipping alert")
+                      return
+                  
+                  sns = boto3.client('sns')
+                  
+                  alert_message = {
+                      'alertType': 'Advanced S3 Security Alert',
+                      'severity': severity,
+                      'message': message,
+                      'eventName': event.get('eventName', 'Unknown'),
+                      'sourceIP': event.get('sourceIPAddress', 'Unknown'),
+                      'eventTime': event.get('eventTime', 'Unknown'),
+                      'userIdentity': event.get('userIdentity', {}),
+                      'errorCode': event.get('errorCode', ''),
+                      'resources': event.get('resources', [])
+                  }
+                  
+                  sns.publish(
+                      TopicArn=sns_topic_arn,
+                      Message=json.dumps(alert_message, indent=2),
+                      Subject=f'S3 Security Alert - {severity} Severity'
+                  )
+                  
+                  logger.info(f"Alert sent for {severity} severity event: {event.get('eventName')}")
+                  
+              except Exception as e:
+                  logger.error(f"Error sending alert: {str(e)}")
+
+      Tags:
+        - Key: Purpose
+          Value: 'Advanced S3 security monitoring'
+        - Key: Environment
+          Value: 'Production'
+
+  # Lambda Permission for EventBridge
+  SecurityMonitorLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableLambdaMonitoring
+    Properties:
+      FunctionName: !Ref SecurityMonitorLambda
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt UnauthorizedAccessRule.Arn
+
+  # ==================== CLOUDWATCH ALARMS ====================
+
+  # CloudWatch Alarm for CloudTrail Errors
+  CloudTrailErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-cloudtrail-errors'
+      AlarmDescription: 'Monitor CloudTrail for delivery errors'
+      MetricName: ErrorCount
+      Namespace: AWS/CloudTrail
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: TrailName
+          Value: !Ref SecurityMonitoringTrail
+      AlarmActions:
+        - !If [EnableNotifications, !Ref SecurityAlertsTopic, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Purpose
+          Value: 'CloudTrail error monitoring'
+        - Key: Environment
+          Value: 'Production'
+
+  # CloudWatch Alarm for Lambda Errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableLambdaMonitoring
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-lambda-errors'
+      AlarmDescription: 'Monitor Lambda function for errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SecurityMonitorLambda
+      AlarmActions:
+        - !If [EnableNotifications, !Ref SecurityAlertsTopic, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Purpose
+          Value: 'Lambda error monitoring'
+        - Key: Environment
+          Value: 'Production'
+
+Outputs:
+  # S3 Bucket Outputs
+  SourceBucketName:
+    Description: 'Name of the source S3 bucket being monitored'
+    Value: !If
+      - CreateSourceBucket
+      - !Ref SourceBucket
+      - !Ref SourceBucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-SourceBucketName'
+
+  SourceBucketArn:
+    Description: 'ARN of the source S3 bucket being monitored'
+    Value: !If
+      - CreateSourceBucket
+      - !GetAtt SourceBucket.Arn
+      - !Sub 'arn:aws:s3:::${SourceBucketName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-SourceBucketArn'
+
+  AccessLogsBucketName:
+    Description: 'Name of the S3 access logs bucket'
+    Value: !Ref AccessLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AccessLogsBucketName'
+
+  AccessLogsBucketArn:
+    Description: 'ARN of the S3 access logs bucket'
+    Value: !GetAtt AccessLogsBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AccessLogsBucketArn'
+
+  CloudTrailLogsBucketName:
+    Description: 'Name of the CloudTrail logs bucket'
+    Value: !Ref CloudTrailLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrailLogsBucketName'
+
+  # CloudTrail Outputs
+  CloudTrailArn:
+    Description: 'ARN of the CloudTrail trail'
+    Value: !GetAtt SecurityMonitoringTrail.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrailArn'
+
+  CloudTrailName:
+    Description: 'Name of the CloudTrail trail'
+    Value: !Ref SecurityMonitoringTrail
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrailName'
+
+  # CloudWatch Outputs
+  CloudTrailLogGroupName:
+    Description: 'Name of the CloudTrail log group'
+    Value: !Ref CloudTrailLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrailLogGroupName'
+
+  CloudTrailLogGroupArn:
+    Description: 'ARN of the CloudTrail log group'
+    Value: !GetAtt CloudTrailLogGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrailLogGroupArn'
+
+  S3AccessLogGroupName:
+    Description: 'Name of the S3 access log group'
+    Value: !Ref S3AccessLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-S3AccessLogGroupName'
+
+  DashboardURL:
+    Description: 'URL to the CloudWatch dashboard'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ResourcePrefix}-Security-Monitoring'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  # Monitoring Outputs
+  SecurityAlertsTopicArn:
+    Condition: EnableNotifications
+    Description: 'ARN of the SNS topic for security alerts'
+    Value: !Ref SecurityAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityAlertsTopicArn'
+
+  SecurityMonitorLambdaArn:
+    Condition: EnableLambdaMonitoring
+    Description: 'ARN of the Lambda security monitoring function'
+    Value: !GetAtt SecurityMonitorLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityMonitorLambdaArn'
+
+  # Security Insights
+  SecurityInsightsQueries:
+    Description: 'CloudWatch Insights queries for security analysis'
+    Value: !Sub |
+      1. Failed Access Attempts:
+      SOURCE '${CloudTrailLogGroup}' | fields @timestamp, eventName, sourceIPAddress, errorCode, errorMessage | filter errorCode = "AccessDenied" | stats count() by sourceIPAddress | sort count desc
+      
+      2. Unusual Access Patterns:
+      SOURCE '${CloudTrailLogGroup}' | fields @timestamp, eventName, sourceIPAddress, userIdentity.type | filter eventName like /GetObject|PutObject|DeleteObject/ | stats count() by sourceIPAddress, userIdentity.type | sort count desc
+      
+      3. Administrative Actions:
+      SOURCE '${CloudTrailLogGroup}' | fields @timestamp, eventName, sourceIPAddress, userIdentity.arn | filter eventName like /PutBucket|DeleteBucket|PutBucketPolicy/ | sort @timestamp desc
+
+  # Cost Optimization Information
+  CostOptimizationTips:
+    Description: 'Tips for optimizing costs of this security monitoring solution'
+    Value: |
+      1. Use S3 Lifecycle policies to transition old access logs to cheaper storage classes
+      2. Adjust CloudWatch log retention periods based on compliance requirements
+      3. Use CloudTrail Insights selectively for high-value resources
+      4. Configure S3 request metrics only for monitored buckets
+      5. Use EventBridge filtering to reduce Lambda invocations
+      6. Consider using S3 Access Analyzer for additional cost-effective insights
+
+  # Compliance Information
+  ComplianceFrameworks:
+    Description: 'Compliance frameworks supported by this solution'
+    Value: |
+      - SOX (Sarbanes-Oxley): Detailed audit trails for financial data access
+      - HIPAA: Access logging and monitoring for healthcare data
+      - PCI-DSS: Security monitoring for payment card data
+      - GDPR: Data access auditing for personal information
+      - ISO 27001: Information security management controls
+      - NIST: Cybersecurity framework compliance

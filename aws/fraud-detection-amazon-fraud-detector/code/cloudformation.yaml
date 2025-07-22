@@ -1,0 +1,1192 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Real-Time Fraud Detection Platform with Amazon Fraud Detector - Complete enterprise-grade fraud detection system with ML models, real-time processing, and automated alerting'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'development'
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: 'Environment name for resource naming and configuration'
+  
+  RandomSuffix:
+    Type: String
+    Default: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref 'AWS::StackId']]]]
+    Description: 'Random suffix for unique resource naming'
+  
+  AlertEmailAddress:
+    Type: String
+    Description: 'Email address for fraud alerts'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+  
+  KinesisShardCount:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+    Description: 'Number of shards for Kinesis stream'
+  
+  DynamoDBReadCapacity:
+    Type: Number
+    Default: 100
+    MinValue: 5
+    MaxValue: 1000
+    Description: 'DynamoDB read capacity units'
+  
+  DynamoDBWriteCapacity:
+    Type: Number
+    Default: 100
+    MinValue: 5
+    MaxValue: 1000
+    Description: 'DynamoDB write capacity units'
+  
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 30
+    MaxValue: 900
+    Description: 'Lambda function timeout in seconds'
+  
+  TrainingDataS3Path:
+    Type: String
+    Default: 'training-data/enhanced_training_data.csv'
+    Description: 'S3 path to training data CSV file'
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'production']
+  IsNotProduction: !Not [!Equals [!Ref Environment, 'production']]
+
+Resources:
+  # ============================================================================
+  # S3 BUCKET FOR TRAINING DATA AND ARTIFACTS
+  # ============================================================================
+  FraudDetectionS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'fraud-detection-platform-${RandomSuffix}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: DeleteIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt TrainingDataProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: training-data/
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: FraudDetection
+        - Key: Purpose
+          Value: TrainingDataStorage
+
+  # S3 Bucket Policy for secure access
+  FraudDetectionS3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FraudDetectionS3Bucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${FraudDetectionS3Bucket}/*'
+              - !Ref FraudDetectionS3Bucket
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+          - Sid: AllowFraudDetectorAccess
+            Effect: Allow
+            Principal:
+              Service: frauddetector.amazonaws.com
+            Action:
+              - 's3:GetObject'
+              - 's3:ListBucket'
+            Resource:
+              - !Sub '${FraudDetectionS3Bucket}/*'
+              - !Ref FraudDetectionS3Bucket
+
+  # ============================================================================
+  # KINESIS STREAM FOR REAL-TIME TRANSACTION PROCESSING
+  # ============================================================================
+  TransactionStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub 'fraud-transaction-stream-${RandomSuffix}'
+      ShardCount: !Ref KinesisShardCount
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      RetentionPeriodHours: 24
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: FraudDetection
+        - Key: Purpose
+          Value: TransactionStreaming
+
+  # ============================================================================
+  # DYNAMODB TABLE FOR DECISION LOGGING
+  # ============================================================================
+  FraudDecisionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'fraud-decisions-${RandomSuffix}'
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref DynamoDBReadCapacity
+        WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      AttributeDefinitions:
+        - AttributeName: transaction_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+        - AttributeName: customer_id
+          AttributeType: S
+        - AttributeName: risk_level
+          AttributeType: S
+      KeySchema:
+        - AttributeName: transaction_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: customer-index
+          KeySchema:
+            - AttributeName: customer_id
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !If [IsProduction, 50, 25]
+            WriteCapacityUnits: !If [IsProduction, 50, 25]
+        - IndexName: risk-level-index
+          KeySchema:
+            - AttributeName: risk_level
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !If [IsProduction, 25, 10]
+            WriteCapacityUnits: !If [IsProduction, 25, 10]
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: FraudDetection
+        - Key: Purpose
+          Value: DecisionLogging
+
+  # ============================================================================
+  # SNS TOPIC FOR FRAUD ALERTS
+  # ============================================================================
+  FraudAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'fraud-detection-alerts-${RandomSuffix}'
+      DisplayName: 'Fraud Detection Alerts'
+      KmsMasterKeyId: alias/aws/sns
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmailAddress
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: FraudDetection
+        - Key: Purpose
+          Value: AlertNotifications
+
+  # SNS Topic Policy for secure publishing
+  FraudAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref FraudAlertsTopic
+      PolicyDocument:
+        Statement:
+          - Sid: AllowLambdaPublish
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - sns:Publish
+            Resource: !Ref FraudAlertsTopic
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 'sns:*'
+            Resource: !Ref FraudAlertsTopic
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+  # ============================================================================
+  # IAM ROLES AND POLICIES
+  # ============================================================================
+  
+  # Enhanced IAM Role for Amazon Fraud Detector
+  FraudDetectorEnhancedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'FraudDetectorEnhancedRole-${RandomSuffix}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: frauddetector.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonFraudDetectorFullAccessPolicy
+      Policies:
+        - PolicyName: FraudDetectorEnhancedPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                Resource:
+                  - !Sub '${FraudDetectionS3Bucket}/*'
+                  - !Ref FraudDetectionS3Bucket
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource: !GetAtt TransactionStream.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource: !GetAtt FraudDecisionsTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: FraudDetection
+        - Key: Purpose
+          Value: FraudDetectorService
+
+  # Lambda Execution Role with comprehensive permissions
+  FraudDetectionLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'FraudDetectionLambdaRole-${RandomSuffix}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaKinesisExecutionRole
+      Policies:
+        - PolicyName: FraudDetectionLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - frauddetector:GetEventPrediction
+                  - frauddetector:GetDetectors
+                  - frauddetector:GetModels
+                  - frauddetector:GetRules
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt FraudDecisionsTable.Arn
+                  - !Sub '${FraudDecisionsTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref FraudAlertsTopic
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:ListStreams
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource: !GetAtt TransactionStream.Arn
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*'
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: FraudDetection
+        - Key: Purpose
+          Value: LambdaExecution
+
+  # ============================================================================
+  # LAMBDA FUNCTIONS FOR REAL-TIME PROCESSING
+  # ============================================================================
+  
+  # Event Enrichment Lambda Function
+  EventEnrichmentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'event-enrichment-processor-${RandomSuffix}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt FraudDetectionLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: 256
+      Environment:
+        Variables:
+          DECISIONS_TABLE: !Ref FraudDecisionsTable
+          FRAUD_PROCESSOR_FUNCTION: !Ref FraudDetectionProcessorFunction
+          ENVIRONMENT: !Ref Environment
+      TracingConfig:
+        Mode: Active
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import hashlib
+          import os
+          from datetime import datetime, timedelta
+          import base64
+          import logging
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          lambda_client = boto3.client('lambda')
+          dynamodb = boto3.resource('dynamodb')
+          
+          def lambda_handler(event, context):
+              """
+              Enriches incoming transaction events with behavioral features
+              """
+              try:
+                  for record in event['Records']:
+                      # Decode Kinesis data
+                      payload = base64.b64decode(record['kinesis']['data']).decode('utf-8')
+                      transaction_data = json.loads(payload)
+                      
+                      # Enrich transaction data
+                      enriched_data = enrich_transaction_data(transaction_data)
+                      
+                      # Forward to fraud detection Lambda
+                      forward_to_fraud_detection(enriched_data)
+                      
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Successfully processed events')
+                  }
+              except Exception as e:
+                  logger.error(f"Error processing events: {str(e)}")
+                  raise
+          
+          def enrich_transaction_data(transaction_data):
+              """
+              Add behavioral and historical features to transaction data
+              """
+              customer_id = transaction_data.get('customer_id')
+              current_time = datetime.now()
+              
+              # Add enrichment features
+              transaction_data['transaction_frequency'] = get_transaction_frequency(customer_id)
+              transaction_data['velocity_score'] = calculate_velocity_score(customer_id)
+              transaction_data['processing_timestamp'] = current_time.isoformat()
+              
+              return transaction_data
+          
+          def get_transaction_frequency(customer_id):
+              """Calculate transaction frequency from historical data"""
+              try:
+                  table = dynamodb.Table(os.environ['DECISIONS_TABLE'])
+                  response = table.query(
+                      IndexName='customer-index',
+                      KeyConditionExpression='customer_id = :customer_id',
+                      ExpressionAttributeValues={':customer_id': customer_id},
+                      ScanIndexForward=False,
+                      Limit=100
+                  )
+                  return len(response.get('Items', []))
+              except Exception as e:
+                  logger.warning(f"Error calculating frequency: {str(e)}")
+                  return 1
+          
+          def calculate_velocity_score(customer_id):
+              """Calculate velocity-based risk score"""
+              # Simplified velocity calculation
+              return 0.1
+          
+          def forward_to_fraud_detection(enriched_data):
+              """Forward enriched data to fraud detection Lambda"""
+              try:
+                  lambda_client.invoke(
+                      FunctionName=os.environ['FRAUD_PROCESSOR_FUNCTION'],
+                      InvocationType='Event',
+                      Payload=json.dumps(enriched_data)
+                  )
+              except Exception as e:
+                  logger.error(f"Error forwarding to fraud detection: {str(e)}")
+                  raise
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: FraudDetection
+        - Key: Purpose
+          Value: EventEnrichment
+
+  # Fraud Detection Processor Lambda Function
+  FraudDetectionProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'fraud-detection-processor-${RandomSuffix}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt FraudDetectionLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          DETECTOR_NAME: !Sub 'realtime-fraud-detector-${RandomSuffix}'
+          EVENT_TYPE_NAME: !Sub 'transaction-fraud-detection-${RandomSuffix}'
+          ENTITY_TYPE_NAME: !Sub 'customer-entity-${RandomSuffix}'
+          DECISIONS_TABLE: !Ref FraudDecisionsTable
+          SNS_TOPIC_ARN: !Ref FraudAlertsTopic
+          ENVIRONMENT: !Ref Environment
+      TracingConfig:
+        Mode: Active
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          import uuid
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          frauddetector = boto3.client('frauddetector')
+          dynamodb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              """Process fraud detection for enriched transaction data"""
+              try:
+                  transaction_data = event
+                  event_id = f"txn_{uuid.uuid4().hex[:16]}"
+                  
+                  # Prepare variables for fraud detection
+                  variables = prepare_fraud_variables(transaction_data)
+                  
+                  # Get fraud prediction
+                  fraud_response = get_fraud_prediction(event_id, variables)
+                  
+                  # Process and log decision
+                  decision = process_fraud_decision(transaction_data, fraud_response)
+                  
+                  # Send alerts if necessary
+                  if decision['risk_level'] in ['HIGH', 'CRITICAL']:
+                      send_fraud_alert(decision)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'transaction_id': transaction_data.get('transaction_id'),
+                          'decision': decision['action'],
+                          'risk_score': decision['risk_score'],
+                          'risk_level': decision['risk_level']
+                      })
+                  }
+              except Exception as e:
+                  logger.error(f"Error processing fraud detection: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def prepare_fraud_variables(transaction_data):
+              """Prepare variables for fraud detection API call"""
+              return {
+                  'customer_id': str(transaction_data.get('customer_id', 'unknown')),
+                  'email_address': str(transaction_data.get('email_address', 'unknown')),
+                  'ip_address': str(transaction_data.get('ip_address', 'unknown')),
+                  'customer_name': str(transaction_data.get('customer_name', 'unknown')),
+                  'phone_number': str(transaction_data.get('phone_number', 'unknown')),
+                  'billing_address': str(transaction_data.get('billing_address', 'unknown')),
+                  'billing_city': str(transaction_data.get('billing_city', 'unknown')),
+                  'billing_state': str(transaction_data.get('billing_state', 'unknown')),
+                  'billing_zip': str(transaction_data.get('billing_zip', 'unknown')),
+                  'shipping_address': str(transaction_data.get('shipping_address', 'unknown')),
+                  'shipping_city': str(transaction_data.get('shipping_city', 'unknown')),
+                  'shipping_state': str(transaction_data.get('shipping_state', 'unknown')),
+                  'shipping_zip': str(transaction_data.get('shipping_zip', 'unknown')),
+                  'payment_method': str(transaction_data.get('payment_method', 'unknown')),
+                  'card_bin': str(transaction_data.get('card_bin', 'unknown')),
+                  'order_price': str(transaction_data.get('order_price', 0.0)),
+                  'product_category': str(transaction_data.get('product_category', 'unknown')),
+                  'transaction_amount': str(transaction_data.get('transaction_amount', 0.0)),
+                  'currency': str(transaction_data.get('currency', 'USD')),
+                  'merchant_category': str(transaction_data.get('merchant_category', 'unknown'))
+              }
+          
+          def get_fraud_prediction(event_id, variables):
+              """Get fraud prediction from Amazon Fraud Detector"""
+              return frauddetector.get_event_prediction(
+                  detectorId=os.environ['DETECTOR_NAME'],
+                  eventId=event_id,
+                  eventTypeName=os.environ['EVENT_TYPE_NAME'],
+                  entities=[{
+                      'entityType': os.environ['ENTITY_TYPE_NAME'],
+                      'entityId': variables['customer_id']
+                  }],
+                  eventTimestamp=datetime.now().isoformat(),
+                  eventVariables=variables
+              )
+          
+          def process_fraud_decision(transaction_data, fraud_response):
+              """Process fraud detection response and make decision"""
+              model_scores = fraud_response.get('modelScores', [])
+              rule_results = fraud_response.get('ruleResults', [])
+              
+              primary_outcome = None
+              if rule_results:
+                  primary_outcome = rule_results[0]['outcomes'][0] if rule_results[0]['outcomes'] else None
+              
+              risk_score = 0
+              if model_scores:
+                  risk_score = model_scores[0]['scores'].get('TRANSACTION_FRAUD_INSIGHTS', 0)
+              
+              risk_level = determine_risk_level(risk_score, primary_outcome)
+              
+              decision = {
+                  'transaction_id': transaction_data.get('transaction_id'),
+                  'customer_id': transaction_data.get('customer_id'),
+                  'timestamp': datetime.now().isoformat(),
+                  'risk_score': risk_score,
+                  'risk_level': risk_level,
+                  'action': primary_outcome or 'approve_transaction',
+                  'model_scores': model_scores,
+                  'rule_results': rule_results,
+                  'processing_time': datetime.now().isoformat()
+              }
+              
+              log_decision(decision)
+              return decision
+          
+          def determine_risk_level(risk_score, outcome):
+              """Determine risk level based on score and outcome"""
+              if outcome == 'immediate_block' or risk_score > 900:
+                  return 'CRITICAL'
+              elif outcome == 'manual_review' or risk_score > 600:
+                  return 'HIGH'
+              elif outcome == 'challenge_authentication' or risk_score > 400:
+                  return 'MEDIUM'
+              else:
+                  return 'LOW'
+          
+          def log_decision(decision):
+              """Log fraud decision to DynamoDB"""
+              table = dynamodb.Table(os.environ['DECISIONS_TABLE'])
+              table.put_item(
+                  Item={
+                      'transaction_id': decision['transaction_id'],
+                      'timestamp': int(datetime.now().timestamp()),
+                      'customer_id': decision['customer_id'],
+                      'risk_score': decision['risk_score'],
+                      'risk_level': decision['risk_level'],
+                      'action': decision['action'],
+                      'processing_time': decision['processing_time'],
+                      'ttl': int(datetime.now().timestamp()) + (90 * 24 * 60 * 60)  # 90 days TTL
+                  }
+              )
+          
+          def send_fraud_alert(decision):
+              """Send fraud alert for high-risk transactions"""
+              message = {
+                  'alert_type': 'HIGH_RISK_TRANSACTION',
+                  'transaction_id': decision['transaction_id'],
+                  'customer_id': decision['customer_id'],
+                  'risk_score': decision['risk_score'],
+                  'risk_level': decision['risk_level'],
+                  'action': decision['action'],
+                  'timestamp': decision['timestamp']
+              }
+              
+              sns.publish(
+                  TopicArn=os.environ['SNS_TOPIC_ARN'],
+                  Message=json.dumps(message, indent=2),
+                  Subject=f"Fraud Alert: {decision['risk_level']} Risk Transaction"
+              )
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: FraudDetection
+        - Key: Purpose
+          Value: FraudDetectionProcessor
+
+  # Training Data Processor Lambda Function
+  TrainingDataProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'training-data-processor-${RandomSuffix}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt FraudDetectionLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          FRAUD_DETECTOR_ROLE_ARN: !GetAtt FraudDetectorEnhancedRole.Arn
+          MODEL_NAME: !Sub 'transaction-fraud-insights-${RandomSuffix}'
+          EVENT_TYPE_NAME: !Sub 'transaction-fraud-detection-${RandomSuffix}'
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from urllib.parse import unquote_plus
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          frauddetector = boto3.client('frauddetector')
+          
+          def lambda_handler(event, context):
+              """Process training data upload and trigger model training"""
+              try:
+                  for record in event['Records']:
+                      bucket = record['s3']['bucket']['name']
+                      key = unquote_plus(record['s3']['object']['key'])
+                      
+                      if key.startswith('training-data/') and key.endswith('.csv'):
+                          logger.info(f"Processing training data: {key}")
+                          
+                          # Trigger model training
+                          trigger_model_training(bucket, key)
+                          
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Training data processed successfully')
+                  }
+              except Exception as e:
+                  logger.error(f"Error processing training data: {str(e)}")
+                  raise
+          
+          def trigger_model_training(bucket, key):
+              """Trigger fraud detection model training"""
+              try:
+                  # Note: This is a simplified example. In production, you would
+                  # implement more sophisticated training orchestration
+                  logger.info(f"Training data available at s3://{bucket}/{key}")
+                  
+                  # Here you could trigger a Step Functions workflow or
+                  # send a message to SQS for model training orchestration
+                  
+              except Exception as e:
+                  logger.error(f"Error triggering model training: {str(e)}")
+                  raise
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: FraudDetection
+        - Key: Purpose
+          Value: TrainingDataProcessor
+
+  # ============================================================================
+  # EVENT SOURCE MAPPINGS
+  # ============================================================================
+  
+  # Kinesis Event Source Mapping for Event Enrichment
+  KinesisEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt TransactionStream.Arn
+      FunctionName: !Ref EventEnrichmentFunction
+      StartingPosition: LATEST
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      ParallelizationFactor: 2
+      MaximumRecordAgeInSeconds: 3600
+      BisectBatchOnFunctionError: true
+      MaximumRetryAttempts: 3
+
+  # S3 Event Permission for Training Data Processor
+  S3InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TrainingDataProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub '${FraudDetectionS3Bucket}/*'
+
+  # ============================================================================
+  # CLOUDWATCH RESOURCES FOR MONITORING
+  # ============================================================================
+  
+  # CloudWatch Dashboard for Fraud Detection Monitoring
+  FraudDetectionDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'FraudDetectionPlatform-${RandomSuffix}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${FraudDetectionProcessorFunction}"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${FraudDetectionProcessorFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${FraudDetectionProcessorFunction}"],
+                  ["AWS/Lambda", "Throttles", "FunctionName", "${FraudDetectionProcessorFunction}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Fraud Detection Lambda Metrics",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Kinesis", "IncomingRecords", "StreamName", "${TransactionStream}"],
+                  ["AWS/Kinesis", "OutgoingRecords", "StreamName", "${TransactionStream}"],
+                  ["AWS/Kinesis", "WriteProvisionedThroughputExceeded", "StreamName", "${TransactionStream}"],
+                  ["AWS/Kinesis", "ReadProvisionedThroughputExceeded", "StreamName", "${TransactionStream}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Transaction Stream Metrics",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${FraudDecisionsTable}"],
+                  ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "${FraudDecisionsTable}"],
+                  ["AWS/DynamoDB", "ReadThrottles", "TableName", "${FraudDecisionsTable}"],
+                  ["AWS/DynamoDB", "WriteThrottles", "TableName", "${FraudDecisionsTable}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Decision Storage Metrics",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/SNS", "NumberOfMessagesPublished", "TopicName", "${FraudAlertsTopic}"],
+                  ["AWS/SNS", "NumberOfNotificationsDelivered", "TopicName", "${FraudAlertsTopic}"],
+                  ["AWS/SNS", "NumberOfNotificationsFailed", "TopicName", "${FraudAlertsTopic}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Alert System Metrics",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms for Critical Metrics
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'FraudDetection-HighErrorRate-${RandomSuffix}'
+      AlarmDescription: 'High error rate in fraud detection processing'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FraudDetectionProcessorFunction
+      AlarmActions:
+        - !Ref FraudAlertsTopic
+      TreatMissingData: notBreaching
+
+  HighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'FraudDetection-HighLatency-${RandomSuffix}'
+      AlarmDescription: 'High latency in fraud detection processing'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 10000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FraudDetectionProcessorFunction
+      AlarmActions:
+        - !Ref FraudAlertsTopic
+      TreatMissingData: notBreaching
+
+  DynamoDBThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'FraudDetection-DynamoDBThrottle-${RandomSuffix}'
+      AlarmDescription: 'DynamoDB throttling detected'
+      MetricName: WriteThrottles
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref FraudDecisionsTable
+      AlarmActions:
+        - !Ref FraudAlertsTopic
+      TreatMissingData: notBreaching
+
+  # ============================================================================
+  # CUSTOM RESOURCES FOR ADVANCED CONFIGURATION
+  # ============================================================================
+  
+  # Custom Resource for Fraud Detector Setup
+  FraudDetectorSetupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'fraud-detector-setup-${RandomSuffix}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt FraudDetectionLambdaRole.Arn
+      Timeout: 900
+      MemorySize: 256
+      Environment:
+        Variables:
+          FRAUD_DETECTOR_ROLE_ARN: !GetAtt FraudDetectorEnhancedRole.Arn
+          S3_BUCKET: !Ref FraudDetectionS3Bucket
+          TRAINING_DATA_PATH: !Ref TrainingDataS3Path
+          RANDOM_SUFFIX: !Ref RandomSuffix
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import logging
+          import os
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          frauddetector = boto3.client('frauddetector')
+          
+          def lambda_handler(event, context):
+              """Custom resource handler for Fraud Detector setup"""
+              try:
+                  request_type = event['RequestType']
+                  
+                  if request_type == 'Create':
+                      setup_fraud_detector()
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  elif request_type == 'Update':
+                      # Handle updates if needed
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  elif request_type == 'Delete':
+                      cleanup_fraud_detector()
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {})
+                      
+              except Exception as e:
+                  logger.error(f"Error in custom resource: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+          
+          def setup_fraud_detector():
+              """Set up Fraud Detector components"""
+              suffix = os.environ['RANDOM_SUFFIX']
+              
+              # Create entity type
+              try:
+                  frauddetector.create_entity_type(
+                      name=f'customer-entity-{suffix}',
+                      description='Customer entity for fraud detection'
+                  )
+                  logger.info("Entity type created successfully")
+              except Exception as e:
+                  logger.warning(f"Entity type creation failed: {str(e)}")
+              
+              # Create event type
+              try:
+                  frauddetector.create_event_type(
+                      name=f'transaction-fraud-detection-{suffix}',
+                      description='Transaction fraud detection event type',
+                      eventVariables=[
+                          {'name': 'customer_id', 'dataType': 'STRING', 'dataSource': 'EVENT', 'defaultValue': 'unknown'},
+                          {'name': 'email_address', 'dataType': 'STRING', 'dataSource': 'EVENT', 'defaultValue': 'unknown'},
+                          {'name': 'ip_address', 'dataType': 'STRING', 'dataSource': 'EVENT', 'defaultValue': 'unknown'},
+                          {'name': 'order_price', 'dataType': 'FLOAT', 'dataSource': 'EVENT', 'defaultValue': '0.0'},
+                          {'name': 'transaction_amount', 'dataType': 'FLOAT', 'dataSource': 'EVENT', 'defaultValue': '0.0'}
+                      ],
+                      entityTypes=[f'customer-entity-{suffix}'],
+                      eventIngestion='ENABLED'
+                  )
+                  logger.info("Event type created successfully")
+              except Exception as e:
+                  logger.warning(f"Event type creation failed: {str(e)}")
+              
+              # Create labels
+              try:
+                  frauddetector.create_label(
+                      name='fraud',
+                      description='Confirmed fraudulent transaction'
+                  )
+                  frauddetector.create_label(
+                      name='legit',
+                      description='Legitimate verified transaction'
+                  )
+                  logger.info("Labels created successfully")
+              except Exception as e:
+                  logger.warning(f"Label creation failed: {str(e)}")
+          
+          def cleanup_fraud_detector():
+              """Clean up Fraud Detector components"""
+              suffix = os.environ['RANDOM_SUFFIX']
+              
+              # Note: In production, you would implement proper cleanup
+              # This is a simplified example
+              logger.info("Cleanup initiated")
+
+  # Custom Resource for Fraud Detector Setup
+  FraudDetectorSetup:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt FraudDetectorSetupFunction.Arn
+      Version: '1.0'
+    DependsOn:
+      - FraudDetectionS3Bucket
+      - FraudDetectorEnhancedRole
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+Outputs:
+  FraudDetectionS3Bucket:
+    Description: 'S3 bucket for training data and artifacts'
+    Value: !Ref FraudDetectionS3Bucket
+    Export:
+      Name: !Sub '${AWS::StackName}-FraudDetectionS3Bucket'
+
+  TransactionStreamName:
+    Description: 'Kinesis stream for real-time transaction processing'
+    Value: !Ref TransactionStream
+    Export:
+      Name: !Sub '${AWS::StackName}-TransactionStreamName'
+
+  TransactionStreamArn:
+    Description: 'ARN of the Kinesis stream'
+    Value: !GetAtt TransactionStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TransactionStreamArn'
+
+  FraudDecisionsTableName:
+    Description: 'DynamoDB table for fraud decisions'
+    Value: !Ref FraudDecisionsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-FraudDecisionsTableName'
+
+  FraudDecisionsTableArn:
+    Description: 'ARN of the DynamoDB table'
+    Value: !GetAtt FraudDecisionsTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FraudDecisionsTableArn'
+
+  FraudAlertsTopicArn:
+    Description: 'SNS topic for fraud alerts'
+    Value: !Ref FraudAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-FraudAlertsTopicArn'
+
+  EventEnrichmentFunctionName:
+    Description: 'Lambda function for event enrichment'
+    Value: !Ref EventEnrichmentFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-EventEnrichmentFunctionName'
+
+  EventEnrichmentFunctionArn:
+    Description: 'ARN of the event enrichment Lambda function'
+    Value: !GetAtt EventEnrichmentFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventEnrichmentFunctionArn'
+
+  FraudDetectionProcessorFunctionName:
+    Description: 'Lambda function for fraud detection processing'
+    Value: !Ref FraudDetectionProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-FraudDetectionProcessorFunctionName'
+
+  FraudDetectionProcessorFunctionArn:
+    Description: 'ARN of the fraud detection processor Lambda function'
+    Value: !GetAtt FraudDetectionProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FraudDetectionProcessorFunctionArn'
+
+  FraudDetectorRoleArn:
+    Description: 'IAM role for Amazon Fraud Detector'
+    Value: !GetAtt FraudDetectorEnhancedRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FraudDetectorRoleArn'
+
+  LambdaExecutionRoleArn:
+    Description: 'IAM role for Lambda execution'
+    Value: !GetAtt FraudDetectionLambdaRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  DashboardURL:
+    Description: 'URL to the CloudWatch dashboard'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${FraudDetectionDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  ModelNames:
+    Description: 'Names for Fraud Detector models (use these in manual setup)'
+    Value: !Sub 'transaction-fraud-insights-${RandomSuffix}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ModelNames'
+
+  DetectorName:
+    Description: 'Name for the fraud detector (use this in manual setup)'
+    Value: !Sub 'realtime-fraud-detector-${RandomSuffix}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DetectorName'
+
+  EventTypeName:
+    Description: 'Name of the event type (use this in manual setup)'
+    Value: !Sub 'transaction-fraud-detection-${RandomSuffix}'
+    Export:
+      Name: !Sub '${AWS::StackName}-EventTypeName'
+
+  EntityTypeName:
+    Description: 'Name of the entity type (use this in manual setup)'
+    Value: !Sub 'customer-entity-${RandomSuffix}'
+    Export:
+      Name: !Sub '${AWS::StackName}-EntityTypeName'
+
+  TrainingDataPath:
+    Description: 'S3 path for training data upload'
+    Value: !Sub 's3://${FraudDetectionS3Bucket}/${TrainingDataS3Path}'
+    Export:
+      Name: !Sub '${AWS::StackName}-TrainingDataPath'
+
+  DeploymentInstructions:
+    Description: 'Next steps for completing the fraud detection setup'
+    Value: |
+      1. Upload training data to the S3 bucket using the provided path
+      2. Use the AWS CLI or console to create and train the Transaction Fraud Insights model
+      3. Create fraud detection rules and outcomes
+      4. Create and activate the detector version
+      5. Test the system by sending sample transactions to the Kinesis stream
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentInstructions'

@@ -1,0 +1,709 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ECS Service Discovery with Route 53 and Application Load Balancer - Creates a microservices architecture with automatic service discovery using AWS Cloud Map and external access via ALB'
+
+# Parameters for customizable deployment
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where resources will be deployed
+    ConstraintDescription: Must be a valid VPC ID
+
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnet IDs for the Application Load Balancer (must be in at least 2 AZs)
+    ConstraintDescription: Must specify at least 2 public subnets in different AZs
+
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnet IDs for ECS tasks (must be in at least 2 AZs)
+    ConstraintDescription: Must specify at least 2 private subnets in different AZs
+
+  ClusterName:
+    Type: String
+    Default: microservices-cluster
+    Description: Name for the ECS cluster
+    MinLength: 1
+    MaxLength: 255
+    AllowedPattern: '[a-zA-Z][-a-zA-Z0-9]*'
+    ConstraintDescription: Must be a valid ECS cluster name
+
+  ServiceDiscoveryNamespace:
+    Type: String
+    Default: internal.local
+    Description: Private DNS namespace for service discovery
+    MinLength: 1
+    MaxLength: 253
+    AllowedPattern: '^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*$'
+    ConstraintDescription: Must be a valid DNS namespace
+
+  WebServiceDesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Desired number of web service tasks
+
+  ApiServiceDesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Desired number of API service tasks
+
+  TaskCpu:
+    Type: Number
+    Default: 256
+    AllowedValues: [256, 512, 1024, 2048, 4096]
+    Description: CPU units for ECS tasks (1024 = 1 vCPU)
+
+  TaskMemory:
+    Type: Number
+    Default: 512
+    AllowedValues: [512, 1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192]
+    Description: Memory in MB for ECS tasks
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name for resource tagging
+
+# Conditions for conditional resource creation
+Conditions:
+  IsProdEnvironment: !Equals [!Ref Environment, prod]
+
+# Resources section - all infrastructure components
+Resources:
+  # ===========================================
+  # Cloud Map Service Discovery Resources
+  # ===========================================
+  
+  # Private DNS namespace for service discovery
+  ServiceDiscoveryNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: !Ref ServiceDiscoveryNamespace
+      Vpc: !Ref VpcId
+      Description: !Sub 'Private DNS namespace for ${ClusterName} microservices'
+      Properties:
+        DnsProperties:
+          SOA:
+            TTL: 300
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-namespace'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: ServiceDiscovery
+
+  # Service discovery service for web application
+  WebServiceDiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: web
+      NamespaceId: !Ref ServiceDiscoveryNamespace
+      Description: Service discovery for web application
+      DnsConfig:
+        DnsRecords:
+          - Type: A
+            TTL: 300
+        RoutingPolicy: MULTIVALUE
+      HealthCheckCustomConfig:
+        FailureThreshold: 3
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-web-discovery'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Service discovery service for API
+  ApiServiceDiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: api
+      NamespaceId: !Ref ServiceDiscoveryNamespace
+      Description: Service discovery for API service
+      DnsConfig:
+        DnsRecords:
+          - Type: A
+            TTL: 300
+        RoutingPolicy: MULTIVALUE
+      HealthCheckCustomConfig:
+        FailureThreshold: 3
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-api-discovery'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Service discovery service for database (for future use)
+  DatabaseServiceDiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: database
+      NamespaceId: !Ref ServiceDiscoveryNamespace
+      Description: Service discovery for database service
+      DnsConfig:
+        DnsRecords:
+          - Type: A
+            TTL: 300
+        RoutingPolicy: MULTIVALUE
+      HealthCheckCustomConfig:
+        FailureThreshold: 3
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-database-discovery'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ===========================================
+  # Security Groups
+  # ===========================================
+
+  # Security group for Application Load Balancer
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ClusterName}-alb-sg'
+      GroupDescription: Security group for Application Load Balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTP traffic from internet
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTPS traffic from internet
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-alb-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Security group for ECS tasks
+  ECSTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ClusterName}-ecs-tasks-sg'
+      GroupDescription: Security group for ECS tasks
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Allow web service traffic from ALB
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Allow API service traffic from ALB
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-ecs-tasks-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Allow internal communication between ECS tasks
+  ECSTaskInternalTrafficRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ECSTaskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref ECSTaskSecurityGroup
+      Description: Allow internal communication between services
+
+  # ===========================================
+  # Application Load Balancer Resources
+  # ===========================================
+
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ClusterName}-alb'
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+        - Key: routing.http2.enabled
+          Value: 'true'
+        - Key: access_logs.s3.enabled
+          Value: 'false'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-alb'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Target group for web service
+  WebServiceTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ClusterName}-web-tg'
+      Port: 3000
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VpcId
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+        - Key: stickiness.enabled
+          Value: 'false'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-web-tg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Target group for API service
+  ApiServiceTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ClusterName}-api-tg'
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VpcId
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+        - Key: stickiness.enabled
+          Value: 'false'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-api-tg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ALB Listener for HTTP traffic
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebServiceTargetGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-alb-listener'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Listener rule for API service routing
+  ApiListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 100
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - '/api/*'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref ApiServiceTargetGroup
+
+  # ===========================================
+  # IAM Roles and Policies
+  # ===========================================
+
+  # ECS Task Execution Role
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ECS Task Role (for application-level permissions)
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ServiceDiscoveryPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - servicediscovery:DiscoverInstances
+                  - servicediscovery:GetService
+                  - servicediscovery:ListServices
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-task-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ===========================================
+  # CloudWatch Log Groups
+  # ===========================================
+
+  # Log group for web service
+  WebServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ClusterName}/web-service'
+      RetentionInDays: !If [IsProdEnvironment, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-web-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Log group for API service
+  ApiServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ClusterName}/api-service'
+      RetentionInDays: !If [IsProdEnvironment, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-api-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ===========================================
+  # ECS Cluster and Services
+  # ===========================================
+
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ClusterName
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+      ClusterSettings:
+        - Name: containerInsights
+          Value: !If [IsProdEnvironment, enabled, disabled]
+      Tags:
+        - Key: Name
+          Value: !Ref ClusterName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Task definition for web service
+  WebServiceTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ClusterName}-web-service'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: web-container
+          Image: nginx:alpine
+          Essential: true
+          PortMappings:
+            - ContainerPort: 80
+              HostPort: 3000
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref WebServiceLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - 'curl -f http://localhost:80/ || exit 1'
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+          Environment:
+            - Name: SERVICE_NAME
+              Value: web
+            - Name: NAMESPACE
+              Value: !Ref ServiceDiscoveryNamespace
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-web-task'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Task definition for API service
+  ApiServiceTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ClusterName}-api-service'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: api-container
+          Image: httpd:alpine
+          Essential: true
+          PortMappings:
+            - ContainerPort: 80
+              HostPort: 8080
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ApiServiceLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - 'curl -f http://localhost:80/ || exit 1'
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+          Environment:
+            - Name: SERVICE_NAME
+              Value: api
+            - Name: NAMESPACE
+              Value: !Ref ServiceDiscoveryNamespace
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-api-task'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ECS Service for web application
+  WebService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListener
+    Properties:
+      ServiceName: web-service
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref WebServiceTaskDefinition
+      DesiredCount: !Ref WebServiceDesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroups:
+            - !Ref ECSTaskSecurityGroup
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - TargetGroupArn: !Ref WebServiceTargetGroup
+          ContainerName: web-container
+          ContainerPort: 80
+      ServiceRegistries:
+        - RegistryArn: !GetAtt WebServiceDiscoveryService.Arn
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      EnableExecuteCommand: !If [IsProdEnvironment, false, true]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-web-service'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ECS Service for API
+  ApiService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListener
+    Properties:
+      ServiceName: api-service
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ApiServiceTaskDefinition
+      DesiredCount: !Ref ApiServiceDesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroups:
+            - !Ref ECSTaskSecurityGroup
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - TargetGroupArn: !Ref ApiServiceTargetGroup
+          ContainerName: api-container
+          ContainerPort: 80
+      ServiceRegistries:
+        - RegistryArn: !GetAtt ApiServiceDiscoveryService.Arn
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      EnableExecuteCommand: !If [IsProdEnvironment, false, true]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-api-service'
+        - Key: Environment
+          Value: !Ref Environment
+
+# Outputs section - important values for verification and integration
+Outputs:
+  ClusterName:
+    Description: Name of the ECS cluster
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterName'
+
+  ClusterArn:
+    Description: ARN of the ECS cluster
+    Value: !GetAtt ECSCluster.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterArn'
+
+  LoadBalancerDNS:
+    Description: DNS name of the Application Load Balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-LoadBalancerDNS'
+
+  LoadBalancerArn:
+    Description: ARN of the Application Load Balancer
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: !Sub '${AWS::StackName}-LoadBalancerArn'
+
+  LoadBalancerURL:
+    Description: URL to access the web application
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+
+  ApiURL:
+    Description: URL to access the API service
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}/api/'
+
+  ServiceDiscoveryNamespaceId:
+    Description: ID of the service discovery namespace
+    Value: !Ref ServiceDiscoveryNamespace
+    Export:
+      Name: !Sub '${AWS::StackName}-NamespaceId'
+
+  ServiceDiscoveryNamespaceName:
+    Description: Name of the service discovery namespace
+    Value: !Ref ServiceDiscoveryNamespace
+    Export:
+      Name: !Sub '${AWS::StackName}-NamespaceName'
+
+  WebServiceDiscoveryDNS:
+    Description: DNS name for web service discovery
+    Value: !Sub 'web.${ServiceDiscoveryNamespace}'
+
+  ApiServiceDiscoveryDNS:
+    Description: DNS name for API service discovery
+    Value: !Sub 'api.${ServiceDiscoveryNamespace}'
+
+  DatabaseServiceDiscoveryDNS:
+    Description: DNS name for database service discovery
+    Value: !Sub 'database.${ServiceDiscoveryNamespace}'
+
+  WebServiceName:
+    Description: Name of the web ECS service
+    Value: !Ref WebService
+    Export:
+      Name: !Sub '${AWS::StackName}-WebServiceName'
+
+  ApiServiceName:
+    Description: Name of the API ECS service
+    Value: !Ref ApiService
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiServiceName'
+
+  ECSTaskSecurityGroupId:
+    Description: Security group ID for ECS tasks
+    Value: !Ref ECSTaskSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSTaskSecurityGroupId'
+
+  ALBSecurityGroupId:
+    Description: Security group ID for Application Load Balancer
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ALBSecurityGroupId'
+
+  WebServiceLogGroup:
+    Description: CloudWatch log group for web service
+    Value: !Ref WebServiceLogGroup
+
+  ApiServiceLogGroup:
+    Description: CloudWatch log group for API service
+    Value: !Ref ApiServiceLogGroup

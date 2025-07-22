@@ -1,0 +1,693 @@
+# Infrastructure Manager Configuration for Multi-Region Traffic Optimization
+# This configuration deploys a global load balancer with CDN, multi-region backends,
+# and comprehensive monitoring across US, Europe, and Asia-Pacific regions.
+
+# Import required modules and configure metadata
+imports:
+  - path: network.yaml
+  - path: compute.yaml
+  - path: loadbalancer.yaml
+  - path: monitoring.yaml
+
+# Global configuration variables
+variables:
+  # Project configuration
+  project_id:
+    type: string
+    description: "Google Cloud project ID"
+    default: "traffic-optimization-project"
+  
+  # Regional configuration
+  regions:
+    type: object
+    description: "Regional configuration for multi-region deployment"
+    default:
+      us:
+        region: "us-central1"
+        zone: "us-central1-a"
+        subnet_cidr: "10.1.0.0/24"
+      eu:
+        region: "europe-west1"
+        zone: "europe-west1-b"
+        subnet_cidr: "10.2.0.0/24"
+      apac:
+        region: "asia-southeast1"
+        zone: "asia-southeast1-a"
+        subnet_cidr: "10.3.0.0/24"
+  
+  # Resource naming configuration
+  resource_prefix:
+    type: string
+    description: "Prefix for all resource names"
+    default: "global-app"
+  
+  # Instance configuration
+  instance_config:
+    type: object
+    description: "Configuration for compute instances"
+    default:
+      machine_type: "e2-medium"
+      image_family: "debian-11"
+      image_project: "debian-cloud"
+      instances_per_region: 2
+      disk_size_gb: 20
+  
+  # Load balancer configuration
+  lb_config:
+    type: object
+    description: "Load balancer configuration settings"
+    default:
+      enable_cdn: true
+      cache_mode: "CACHE_ALL_STATIC"
+      default_ttl: 3600
+      max_ttl: 86400
+      client_ttl: 3600
+      enable_compression: true
+  
+  # Monitoring configuration
+  monitoring_config:
+    type: object
+    description: "Monitoring and alerting configuration"
+    default:
+      uptime_check_period: "60s"
+      uptime_check_timeout: "10s"
+      latency_threshold_seconds: 1.0
+      alert_duration: "120s"
+
+# Resource definitions
+resources:
+  # ============================================================================
+  # NETWORKING RESOURCES
+  # Global VPC network for multi-region connectivity
+  # ============================================================================
+  
+  global-vpc-network:
+    type: gcp-types/compute-v1:networks
+    properties:
+      name: $(ref.resource_prefix)-vpc
+      description: "Global VPC network for multi-region application"
+      autoCreateSubnetworks: false
+      routingConfig:
+        routingMode: GLOBAL
+    metadata:
+      dependsOn: []
+
+  # Regional subnets for each deployment region
+  us-subnet:
+    type: gcp-types/compute-v1:subnetworks
+    properties:
+      name: $(ref.resource_prefix)-us-subnet
+      description: "US Central subnet for application deployment"
+      network: $(ref.global-vpc-network.selfLink)
+      ipCidrRange: $(ref.regions.us.subnet_cidr)
+      region: $(ref.regions.us.region)
+      enableFlowLogs: true
+      logConfig:
+        enable: true
+        flowSampling: 0.5
+        aggregationInterval: "INTERVAL_10_SEC"
+    metadata:
+      dependsOn:
+        - global-vpc-network
+
+  eu-subnet:
+    type: gcp-types/compute-v1:subnetworks
+    properties:
+      name: $(ref.resource_prefix)-eu-subnet
+      description: "Europe West subnet for application deployment"
+      network: $(ref.global-vpc-network.selfLink)
+      ipCidrRange: $(ref.regions.eu.subnet_cidr)
+      region: $(ref.regions.eu.region)
+      enableFlowLogs: true
+      logConfig:
+        enable: true
+        flowSampling: 0.5
+        aggregationInterval: "INTERVAL_10_SEC"
+    metadata:
+      dependsOn:
+        - global-vpc-network
+
+  apac-subnet:
+    type: gcp-types/compute-v1:subnetworks
+    properties:
+      name: $(ref.resource_prefix)-apac-subnet
+      description: "Asia Southeast subnet for application deployment"
+      network: $(ref.global-vpc-network.selfLink)
+      ipCidrRange: $(ref.regions.apac.subnet_cidr)
+      region: $(ref.regions.apac.region)
+      enableFlowLogs: true
+      logConfig:
+        enable: true
+        flowSampling: 0.5
+        aggregationInterval: "INTERVAL_10_SEC"
+    metadata:
+      dependsOn:
+        - global-vpc-network
+
+  # Firewall rules for HTTP/HTTPS traffic and health checks
+  allow-http-https-firewall:
+    type: gcp-types/compute-v1:firewalls
+    properties:
+      name: $(ref.resource_prefix)-allow-http-https
+      description: "Allow HTTP and HTTPS traffic to application instances"
+      network: $(ref.global-vpc-network.selfLink)
+      direction: INGRESS
+      priority: 1000
+      sourceRanges:
+        - "0.0.0.0/0"
+      allowed:
+        - IPProtocol: tcp
+          ports:
+            - "80"
+            - "443"
+            - "8080"
+      targetTags:
+        - "http-server"
+    metadata:
+      dependsOn:
+        - global-vpc-network
+
+  allow-health-checks-firewall:
+    type: gcp-types/compute-v1:firewalls
+    properties:
+      name: $(ref.resource_prefix)-allow-health-checks
+      description: "Allow Google Cloud health check traffic"
+      network: $(ref.global-vpc-network.selfLink)
+      direction: INGRESS
+      priority: 1000
+      sourceRanges:
+        - "130.211.0.0/22"
+        - "35.191.0.0/16"
+      allowed:
+        - IPProtocol: tcp
+          ports:
+            - "8080"
+      targetTags:
+        - "http-server"
+    metadata:
+      dependsOn:
+        - global-vpc-network
+
+  # ============================================================================
+  # COMPUTE RESOURCES
+  # Instance templates and managed instance groups for each region
+  # ============================================================================
+
+  # Instance template for application servers
+  app-instance-template:
+    type: gcp-types/compute-v1:instanceTemplates
+    properties:
+      name: $(ref.resource_prefix)-template
+      description: "Instance template for multi-region application deployment"
+      properties:
+        machineType: $(ref.instance_config.machine_type)
+        disks:
+          - boot: true
+            autoDelete: true
+            initializeParams:
+              sourceImage: "projects/$(ref.instance_config.image_project)/global/images/family/$(ref.instance_config.image_family)"
+              diskSizeGb: $(ref.instance_config.disk_size_gb)
+              diskType: "pd-standard"
+        networkInterfaces:
+          - subnetwork: $(ref.us-subnet.selfLink)
+            accessConfigs: []  # No external IP for security
+        tags:
+          items:
+            - "http-server"
+        metadata:
+          items:
+            - key: "startup-script"
+              value: |
+                #!/bin/bash
+                # Update system packages
+                apt-get update
+                apt-get install -y nginx curl
+                
+                # Get instance metadata for identification
+                INSTANCE_NAME=$(curl -H "Metadata-Flavor: Google" \
+                    http://metadata.google.internal/computeMetadata/v1/instance/name)
+                ZONE=$(curl -H "Metadata-Flavor: Google" \
+                    http://metadata.google.internal/computeMetadata/v1/instance/zone | cut -d'/' -f4)
+                REGION=$(echo $ZONE | sed 's/-[a-z]$//')
+                
+                # Create custom index page with region information
+                cat > /var/www/html/index.html << EOF
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Global App - $ZONE</title>
+                    <style>
+                        body { font-family: Arial, sans-serif; margin: 40px; background: #f0f0f0; }
+                        .container { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+                        .region { color: #4285f4; font-weight: bold; }
+                        .timestamp { color: #666; font-size: 0.9em; }
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <h1>🌍 Global Application</h1>
+                        <p><strong>Instance:</strong> $INSTANCE_NAME</p>
+                        <p><strong>Serving from:</strong> <span class="region">$ZONE ($REGION)</span></p>
+                        <p><strong>Server time:</strong> <span class="timestamp">$(date)</span></p>
+                        <p>✅ Global load balancer is working correctly!</p>
+                        <hr>
+                        <p><em>This response is being served from the closest available region based on your location.</em></p>
+                    </div>
+                </body>
+                </html>
+                EOF
+                
+                # Configure nginx to listen on port 8080
+                sed -i 's/listen 80/listen 8080/' /etc/nginx/sites-available/default
+                sed -i 's/listen \[::\]:80/listen [::]:8080/' /etc/nginx/sites-available/default
+                
+                # Enable and start nginx
+                systemctl enable nginx
+                systemctl restart nginx
+                
+                # Create simple health check endpoint
+                echo "OK" > /var/www/html/health
+        serviceAccounts:
+          - email: "default"
+            scopes:
+              - "https://www.googleapis.com/auth/cloud-platform"
+
+  # Managed instance groups for each region
+  us-instance-group:
+    type: gcp-types/compute-v1:instanceGroupManagers
+    properties:
+      name: $(ref.resource_prefix)-us-ig
+      description: "US region managed instance group"
+      zone: $(ref.regions.us.zone)
+      instanceTemplate: $(ref.app-instance-template.selfLink)
+      targetSize: $(ref.instance_config.instances_per_region)
+      namedPorts:
+        - name: "http"
+          port: 8080
+      autoHealingPolicies:
+        - healthCheck: $(ref.global-health-check.selfLink)
+          initialDelaySec: 300
+    metadata:
+      dependsOn:
+        - app-instance-template
+        - us-subnet
+
+  eu-instance-group:
+    type: gcp-types/compute-v1:instanceGroupManagers
+    properties:
+      name: $(ref.resource_prefix)-eu-ig
+      description: "Europe region managed instance group"
+      zone: $(ref.regions.eu.zone)
+      instanceTemplate: $(ref.app-instance-template.selfLink)
+      targetSize: $(ref.instance_config.instances_per_region)
+      namedPorts:
+        - name: "http"
+          port: 8080
+      autoHealingPolicies:
+        - healthCheck: $(ref.global-health-check.selfLink)
+          initialDelaySec: 300
+    metadata:
+      dependsOn:
+        - app-instance-template
+        - eu-subnet
+
+  apac-instance-group:
+    type: gcp-types/compute-v1:instanceGroupManagers
+    properties:
+      name: $(ref.resource_prefix)-apac-ig
+      description: "Asia-Pacific region managed instance group"
+      zone: $(ref.regions.apac.zone)
+      instanceTemplate: $(ref.app-instance-template.selfLink)
+      targetSize: $(ref.instance_config.instances_per_region)
+      namedPorts:
+        - name: "http"
+          port: 8080
+      autoHealingPolicies:
+        - healthCheck: $(ref.global-health-check.selfLink)
+          initialDelaySec: 300
+    metadata:
+      dependsOn:
+        - app-instance-template
+        - apac-subnet
+
+  # ============================================================================
+  # LOAD BALANCING RESOURCES
+  # Global HTTP(S) load balancer with CDN and intelligent routing
+  # ============================================================================
+
+  # Health check for backend instances
+  global-health-check:
+    type: gcp-types/compute-v1:healthChecks
+    properties:
+      name: $(ref.resource_prefix)-health-check
+      description: "Global health check for multi-region application"
+      type: HTTP
+      httpHealthCheck:
+        port: 8080
+        requestPath: "/health"
+        proxyHeader: "NONE"
+      checkIntervalSec: 10
+      timeoutSec: 5
+      healthyThreshold: 2
+      unhealthyThreshold: 3
+      logConfig:
+        enable: true
+
+  # Backend service with CDN and advanced policies
+  global-backend-service:
+    type: gcp-types/compute-v1:backendServices
+    properties:
+      name: $(ref.resource_prefix)-backend-service
+      description: "Global backend service with CDN and intelligent routing"
+      protocol: HTTP
+      portName: "http"
+      timeoutSec: 30
+      connectionDraining:
+        drainingTimeoutSec: 300
+      healthChecks:
+        - $(ref.global-health-check.selfLink)
+      backends:
+        - group: $(ref.us-instance-group.instanceGroup)
+          balancingMode: UTILIZATION
+          maxUtilization: 0.8
+          capacityScaler: 1.0
+        - group: $(ref.eu-instance-group.instanceGroup)
+          balancingMode: UTILIZATION
+          maxUtilization: 0.8
+          capacityScaler: 1.0
+        - group: $(ref.apac-instance-group.instanceGroup)
+          balancingMode: UTILIZATION
+          maxUtilization: 0.8
+          capacityScaler: 1.0
+      # CDN configuration for optimal content delivery
+      enableCDN: $(ref.lb_config.enable_cdn)
+      cdnPolicy:
+        cacheMode: $(ref.lb_config.cache_mode)
+        defaultTtl: $(ref.lb_config.default_ttl)
+        maxTtl: $(ref.lb_config.max_ttl)
+        clientTtl: $(ref.lb_config.client_ttl)
+        negativeCaching: true
+        negativeCachingPolicy:
+          - code: 404
+            ttl: 300
+          - code: 500
+            ttl: 60
+        cacheKeyPolicy:
+          includeProtocol: true
+          includeHost: true
+          includeQueryString: true
+        serveWhileStale: 86400
+      # Advanced load balancing and resilience settings
+      loadBalancingScheme: "EXTERNAL"
+      localityLbPolicy: "ROUND_ROBIN"
+      outlierDetection:
+        consecutiveErrors: 5
+        consecutiveGatewayFailure: 3
+        interval:
+          seconds: 30
+        baseEjectionTime:
+          seconds: 30
+        maxEjectionPercent: 10
+      circuitBreakers:
+        maxRequests: 1000
+        maxPendingRequests: 100
+        maxRetries: 3
+        maxConnections: 1000
+      # Custom headers for traffic optimization
+      customRequestHeaders:
+        - "X-Load-Balancer: Google-Global-LB"
+        - "X-CDN-Cache: {cdn_cache_status}"
+    metadata:
+      dependsOn:
+        - global-health-check
+        - us-instance-group
+        - eu-instance-group
+        - apac-instance-group
+
+  # URL map for routing configuration
+  global-url-map:
+    type: gcp-types/compute-v1:urlMaps
+    properties:
+      name: $(ref.resource_prefix)-url-map
+      description: "Global URL map for intelligent traffic routing"
+      defaultService: $(ref.global-backend-service.selfLink)
+      # Optional: Add path-based routing rules here
+      pathMatchers: []
+      hostRules: []
+    metadata:
+      dependsOn:
+        - global-backend-service
+
+  # Target HTTP proxy
+  global-target-http-proxy:
+    type: gcp-types/compute-v1:targetHttpProxies
+    properties:
+      name: $(ref.resource_prefix)-http-proxy
+      description: "Global HTTP proxy for load balancer"
+      urlMap: $(ref.global-url-map.selfLink)
+    metadata:
+      dependsOn:
+        - global-url-map
+
+  # Global forwarding rule (creates the anycast IP address)
+  global-forwarding-rule:
+    type: gcp-types/compute-v1:globalForwardingRules
+    properties:
+      name: $(ref.resource_prefix)-http-rule
+      description: "Global forwarding rule for HTTP traffic"
+      target: $(ref.global-target-http-proxy.selfLink)
+      portRange: "80"
+      IPProtocol: "TCP"
+      loadBalancingScheme: "EXTERNAL"
+    metadata:
+      dependsOn:
+        - global-target-http-proxy
+
+  # ============================================================================
+  # MONITORING AND ALERTING RESOURCES
+  # Comprehensive monitoring setup with Network Intelligence Center integration
+  # ============================================================================
+
+  # Uptime check for global availability monitoring
+  global-uptime-check:
+    type: gcp-types/monitoring-v1:projects.uptimeCheckConfigs
+    properties:
+      parent: "projects/$(ref.project_id)"
+      displayName: "Global App Availability Check"
+      monitoredResource:
+        type: "uptime_url"
+        labels:
+          project_id: $(ref.project_id)
+          host: $(ref.global-forwarding-rule.IPAddress)
+      httpCheck:
+        path: "/"
+        port: 80
+        useSsl: false
+        validateSsl: false
+      timeout: $(ref.monitoring_config.uptime_check_timeout)
+      period: $(ref.monitoring_config.uptime_check_period)
+      selectedRegions:
+        - "USA"
+        - "EUROPE"
+        - "ASIA_PACIFIC"
+    metadata:
+      dependsOn:
+        - global-forwarding-rule
+
+  # Alerting policy for high latency
+  high-latency-alert-policy:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: "projects/$(ref.project_id)"
+      displayName: "High Latency Alert - Global Load Balancer"
+      documentation:
+        content: "Alert triggered when load balancer latency exceeds threshold"
+        mimeType: "text/markdown"
+      conditions:
+        - displayName: "Load balancer latency > $(ref.monitoring_config.latency_threshold_seconds)s"
+          conditionThreshold:
+            filter: 'resource.type="https_lb_rule" AND metric.type="loadbalancing.googleapis.com/https/request_duration"'
+            comparison: "COMPARISON_GREATER_THAN"
+            thresholdValue: $(ref.monitoring_config.latency_threshold_seconds)
+            duration: $(ref.monitoring_config.alert_duration)
+            aggregations:
+              - alignmentPeriod: "60s"
+                perSeriesAligner: "ALIGN_MEAN"
+                crossSeriesReducer: "REDUCE_MEAN"
+                groupByFields:
+                  - "resource.label.backend_service_name"
+      combiner: "OR"
+      enabled: true
+      alertStrategy:
+        autoClose: "1800s"
+    metadata:
+      dependsOn:
+        - global-backend-service
+
+  # Network connectivity test for inter-region monitoring
+  us-to-eu-connectivity-test:
+    type: gcp-types/networkmanagement-v1:projects.locations.global.connectivityTests
+    properties:
+      parent: "projects/$(ref.project_id)/locations/global"
+      testId: "us-to-eu-connectivity"
+      resource:
+        displayName: "US to EU Connectivity Test"
+        description: "Test connectivity between US and EU regions"
+        source:
+          instance: "projects/$(ref.project_id)/zones/$(ref.regions.us.zone)/instances/$(ref.us-instance-group.name)-*"
+        destination:
+          instance: "projects/$(ref.project_id)/zones/$(ref.regions.eu.zone)/instances/$(ref.eu-instance-group.name)-*"
+          port: 8080
+        protocol: "TCP"
+    metadata:
+      dependsOn:
+        - us-instance-group
+        - eu-instance-group
+
+  us-to-apac-connectivity-test:
+    type: gcp-types/networkmanagement-v1:projects.locations.global.connectivityTests
+    properties:
+      parent: "projects/$(ref.project_id)/locations/global"
+      testId: "us-to-apac-connectivity"
+      resource:
+        displayName: "US to APAC Connectivity Test"
+        description: "Test connectivity between US and APAC regions"
+        source:
+          instance: "projects/$(ref.project_id)/zones/$(ref.regions.us.zone)/instances/$(ref.us-instance-group.name)-*"
+        destination:
+          instance: "projects/$(ref.project_id)/zones/$(ref.regions.apac.zone)/instances/$(ref.apac-instance-group.name)-*"
+          port: 8080
+        protocol: "TCP"
+    metadata:
+      dependsOn:
+        - us-instance-group
+        - apac-instance-group
+
+# ============================================================================
+# OUTPUTS
+# Key information for deployment verification and integration
+# ============================================================================
+
+outputs:
+  # Network information
+  vpc_network_name:
+    description: "Name of the global VPC network"
+    value: $(ref.global-vpc-network.name)
+
+  vpc_network_selflink:
+    description: "Self-link of the global VPC network"
+    value: $(ref.global-vpc-network.selfLink)
+
+  # Subnet information
+  us_subnet_name:
+    description: "Name of the US subnet"
+    value: $(ref.us-subnet.name)
+
+  eu_subnet_name:
+    description: "Name of the EU subnet"
+    value: $(ref.eu-subnet.name)
+
+  apac_subnet_name:
+    description: "Name of the APAC subnet"
+    value: $(ref.apac-subnet.name)
+
+  # Load balancer information
+  global_ip_address:
+    description: "Global anycast IP address for the load balancer"
+    value: $(ref.global-forwarding-rule.IPAddress)
+
+  load_balancer_url:
+    description: "URL to access the global application"
+    value: "http://$(ref.global-forwarding-rule.IPAddress)"
+
+  backend_service_name:
+    description: "Name of the global backend service"
+    value: $(ref.global-backend-service.name)
+
+  # Instance group information
+  us_instance_group_name:
+    description: "Name of the US instance group"
+    value: $(ref.us-instance-group.name)
+
+  eu_instance_group_name:
+    description: "Name of the EU instance group"
+    value: $(ref.eu-instance-group.name)
+
+  apac_instance_group_name:
+    description: "Name of the APAC instance group"
+    value: $(ref.apac-instance-group.name)
+
+  # Monitoring information
+  uptime_check_name:
+    description: "Name of the global uptime check"
+    value: $(ref.global-uptime-check.name)
+
+  monitoring_dashboard_url:
+    description: "URL to view monitoring dashboard"
+    value: "https://console.cloud.google.com/monitoring/dashboards"
+
+  # Health check information
+  health_check_name:
+    description: "Name of the global health check"
+    value: $(ref.global-health-check.name)
+
+  # CDN information
+  cdn_enabled:
+    description: "Whether CDN is enabled"
+    value: $(ref.lb_config.enable_cdn)
+
+  cache_mode:
+    description: "CDN cache mode configuration"
+    value: $(ref.lb_config.cache_mode)
+
+  # Network Intelligence Center information
+  network_topology_url:
+    description: "URL to view Network Intelligence Center topology"
+    value: "https://console.cloud.google.com/net-intelligence/topology"
+
+  connectivity_tests:
+    description: "Names of connectivity tests for inter-region monitoring"
+    value:
+      - $(ref.us-to-eu-connectivity-test.name)
+      - $(ref.us-to-apac-connectivity-test.name)
+
+# ============================================================================
+# METADATA AND DOCUMENTATION
+# Additional information for deployment and maintenance
+# ============================================================================
+
+metadata:
+  version: "1.0"
+  description: "Multi-region traffic optimization with global load balancing, CDN, and performance monitoring"
+  author: "Cloud Infrastructure Team"
+  deployment_regions:
+    - "us-central1"
+    - "europe-west1"
+    - "asia-southeast1"
+  services_used:
+    - "Compute Engine"
+    - "Cloud Load Balancing"
+    - "Cloud CDN"
+    - "Cloud Monitoring"
+    - "Network Intelligence Center"
+  estimated_monthly_cost: "$50-150 USD (varies by traffic volume)"
+  deployment_time: "10-15 minutes"
+  security_features:
+    - "Private instance connectivity (no external IPs)"
+    - "Firewall rules for controlled access"
+    - "Health check-based auto-healing"
+    - "DDoS protection via Google's global network"
+  performance_features:
+    - "Global anycast IP for optimal routing"
+    - "CDN caching at 80+ edge locations"
+    - "Intelligent load balancing with outlier detection"
+    - "Circuit breaker patterns for resilience"
+    - "Automatic compression for bandwidth optimization"
+  monitoring_features:
+    - "Global uptime monitoring"
+    - "Latency and error rate alerting"
+    - "Inter-region connectivity testing"
+    - "Network topology visualization"
+    - "Performance metrics and dashboards"

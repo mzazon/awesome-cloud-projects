@@ -1,0 +1,654 @@
+# Infrastructure Manager Configuration for Legacy Application Modernization
+# This configuration deploys the complete infrastructure for legacy application
+# assessment, design, and modernization using Google Cloud services.
+
+# Copyright 2025 Google LLC
+# Licensed under the Apache License, Version 2.0
+
+terraform:
+  required_version: ">= 1.5"
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 5.0"
+    random:
+      source: "hashicorp/random"
+      version: "~> 3.4"
+
+# Variables for customizing the deployment
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID for the deployment"
+    
+  region:
+    type: string
+    description: "Primary region for resource deployment"
+    default: "us-central1"
+    
+  zone:
+    type: string
+    description: "Primary zone for zonal resources"
+    default: "us-central1-a"
+    
+  app_name:
+    type: string
+    description: "Name prefix for application resources"
+    default: "legacy-modernization"
+    
+  repository_name:
+    type: string
+    description: "Name for the Cloud Source Repository"
+    default: "modernized-apps"
+    
+  service_name:
+    type: string
+    description: "Name for the Cloud Run service"
+    default: "modernized-service"
+    
+  enable_apis:
+    type: bool
+    description: "Whether to enable required Google Cloud APIs"
+    default: true
+    
+  create_vpc:
+    type: bool
+    description: "Whether to create a custom VPC for the deployment"
+    default: false
+    
+  labels:
+    type: map(string)
+    description: "Labels to apply to all resources"
+    default:
+      environment: "development"
+      project: "legacy-modernization"
+      managed-by: "infrastructure-manager"
+
+# Random suffix for unique resource naming
+resources:
+  random_suffix:
+    type: random_id
+    properties:
+      byte_length: 3
+    
+  # Enable required Google Cloud APIs
+  apis:
+    type: google_project_service
+    count: ${{ var.enable_apis ? 1 : 0 }}
+    properties:
+      project: ${{ var.project_id }}
+      service: migrationcenter.googleapis.com
+      disable_on_destroy: false
+    
+  apis_adc:
+    type: google_project_service
+    count: ${{ var.enable_apis ? 1 : 0 }}
+    properties:
+      project: ${{ var.project_id }}
+      service: applicationdesigncenter.googleapis.com
+      disable_on_destroy: false
+      
+  apis_build:
+    type: google_project_service
+    count: ${{ var.enable_apis ? 1 : 0 }}
+    properties:
+      project: ${{ var.project_id }}
+      service: cloudbuild.googleapis.com
+      disable_on_destroy: false
+      
+  apis_deploy:
+    type: google_project_service
+    count: ${{ var.enable_apis ? 1 : 0 }}
+    properties:
+      project: ${{ var.project_id }}
+      service: clouddeploy.googleapis.com
+      disable_on_destroy: false
+      
+  apis_run:
+    type: google_project_service
+    count: ${{ var.enable_apis ? 1 : 0 }}
+    properties:
+      project: ${{ var.project_id }}
+      service: run.googleapis.com
+      disable_on_destroy: false
+      
+  apis_source:
+    type: google_project_service
+    count: ${{ var.enable_apis ? 1 : 0 }}
+    properties:
+      project: ${{ var.project_id }}
+      service: sourcerepo.googleapis.com
+      disable_on_destroy: false
+      
+  apis_monitoring:
+    type: google_project_service
+    count: ${{ var.enable_apis ? 1 : 0 }}
+    properties:
+      project: ${{ var.project_id }}
+      service: monitoring.googleapis.com
+      disable_on_destroy: false
+      
+  apis_container:
+    type: google_project_service
+    count: ${{ var.enable_apis ? 1 : 0 }}
+    properties:
+      project: ${{ var.project_id }}
+      service: container.googleapis.com
+      disable_on_destroy: false
+
+  # Custom VPC for secure resource deployment (optional)
+  vpc_network:
+    type: google_compute_network
+    count: ${{ var.create_vpc ? 1 : 0 }}
+    properties:
+      name: "${{ var.app_name }}-vpc-${{ random_suffix.hex }}"
+      project: ${{ var.project_id }}
+      auto_create_subnetworks: false
+      description: "VPC network for legacy application modernization"
+      
+  vpc_subnet:
+    type: google_compute_subnetwork
+    count: ${{ var.create_vpc ? 1 : 0 }}
+    properties:
+      name: "${{ var.app_name }}-subnet-${{ random_suffix.hex }}"
+      project: ${{ var.project_id }}
+      region: ${{ var.region }}
+      network: ${{ vpc_network.0.self_link }}
+      ip_cidr_range: "10.0.0.0/24"
+      description: "Subnet for legacy application modernization resources"
+      
+  # Cloud NAT for private resource internet access (if using custom VPC)
+  nat_router:
+    type: google_compute_router
+    count: ${{ var.create_vpc ? 1 : 0 }}
+    properties:
+      name: "${{ var.app_name }}-router-${{ random_suffix.hex }}"
+      project: ${{ var.project_id }}
+      region: ${{ var.region }}
+      network: ${{ vpc_network.0.id }}
+      description: "Router for NAT gateway"
+      
+  nat_gateway:
+    type: google_compute_router_nat
+    count: ${{ var.create_vpc ? 1 : 0 }}
+    properties:
+      name: "${{ var.app_name }}-nat-${{ random_suffix.hex }}"
+      project: ${{ var.project_id }}
+      region: ${{ var.region }}
+      router: ${{ nat_router.0.name }}
+      nat_ip_allocate_option: "AUTO_ONLY"
+      source_subnetwork_ip_ranges_to_nat: "ALL_SUBNETWORKS_ALL_IP_RANGES"
+
+  # Migration Center Source for Discovery
+  migration_center_source:
+    type: google_migration_center_source
+    properties:
+      source_id: "legacy-discovery-${{ random_suffix.hex }}"
+      location: ${{ var.region }}
+      project: ${{ var.project_id }}
+      display_name: "Legacy Application Discovery"
+      description: "Automated discovery of legacy applications and infrastructure"
+      type: "DISCOVERY_CLIENT"
+    depends_on:
+      - apis
+      
+  # Service Account for Migration Center Discovery Client
+  migration_service_account:
+    type: google_service_account
+    properties:
+      account_id: "migration-discovery-${{ random_suffix.hex }}"
+      project: ${{ var.project_id }}
+      display_name: "Migration Center Discovery Service Account"
+      description: "Service account for Migration Center discovery operations"
+      
+  # IAM binding for Migration Center service account
+  migration_sa_binding:
+    type: google_project_iam_member
+    properties:
+      project: ${{ var.project_id }}
+      role: "roles/migrationcenter.discoveryCollector"
+      member: "serviceAccount:${{ migration_service_account.email }}"
+
+  # Cloud Source Repository for application code
+  source_repository:
+    type: google_sourcerepo_repository
+    properties:
+      name: "${{ var.repository_name }}-${{ random_suffix.hex }}"
+      project: ${{ var.project_id }}
+    depends_on:
+      - apis_source
+
+  # Service Account for Cloud Build
+  build_service_account:
+    type: google_service_account
+    properties:
+      account_id: "cloud-build-${{ random_suffix.hex }}"
+      project: ${{ var.project_id }}
+      display_name: "Cloud Build Service Account"
+      description: "Service account for Cloud Build operations"
+      
+  # IAM bindings for Cloud Build service account
+  build_sa_run_admin:
+    type: google_project_iam_member
+    properties:
+      project: ${{ var.project_id }}
+      role: "roles/run.admin"
+      member: "serviceAccount:${{ build_service_account.email }}"
+      
+  build_sa_storage_admin:
+    type: google_project_iam_member
+    properties:
+      project: ${{ var.project_id }}
+      role: "roles/storage.admin"
+      member: "serviceAccount:${{ build_service_account.email }}"
+      
+  build_sa_iam_sa_user:
+    type: google_project_iam_member
+    properties:
+      project: ${{ var.project_id }}
+      role: "roles/iam.serviceAccountUser"
+      member: "serviceAccount:${{ build_service_account.email }}"
+
+  # Cloud Build Trigger for automated CI/CD
+  build_trigger:
+    type: google_cloudbuild_trigger
+    properties:
+      project: ${{ var.project_id }}
+      name: "modernized-app-trigger-${{ random_suffix.hex }}"
+      description: "Automated build trigger for modernized application"
+      service_account: ${{ build_service_account.id }}
+      
+      # Trigger on source repository changes
+      source_to_build:
+        uri: ${{ source_repository.url }}
+        ref: "refs/heads/main"
+        repo_type: "CLOUD_SOURCE_REPOSITORIES"
+        
+      # Build configuration
+      build:
+        steps:
+          # Build Maven application
+          - name: "maven:3.8.1-openjdk-11"
+            entrypoint: "mvn"
+            args:
+              - "clean"
+              - "package"
+              - "-DskipTests"
+              
+          # Build Docker image
+          - name: "gcr.io/cloud-builders/docker"
+            args:
+              - "build"
+              - "-t"
+              - "gcr.io/$PROJECT_ID/modernized-app:$BUILD_ID"
+              - "."
+              
+          # Push to Container Registry
+          - name: "gcr.io/cloud-builders/docker"
+            args:
+              - "push"
+              - "gcr.io/$PROJECT_ID/modernized-app:$BUILD_ID"
+              
+          # Deploy to Cloud Run
+          - name: "gcr.io/cloud-builders/gcloud"
+            args:
+              - "run"
+              - "deploy"
+              - "${{ var.service_name }}-${{ random_suffix.hex }}"
+              - "--image"
+              - "gcr.io/$PROJECT_ID/modernized-app:$BUILD_ID"
+              - "--region"
+              - "${{ var.region }}"
+              - "--platform"
+              - "managed"
+              - "--allow-unauthenticated"
+              - "--memory"
+              - "1Gi"
+              - "--cpu"
+              - "1"
+              - "--max-instances"
+              - "10"
+              
+        images:
+          - "gcr.io/$PROJECT_ID/modernized-app:$BUILD_ID"
+          
+        options:
+          logging: "CLOUD_LOGGING_ONLY"
+          
+    depends_on:
+      - apis_build
+      - source_repository
+      - build_service_account
+
+  # Service Account for Cloud Run
+  run_service_account:
+    type: google_service_account
+    properties:
+      account_id: "cloud-run-${{ random_suffix.hex }}"
+      project: ${{ var.project_id }}
+      display_name: "Cloud Run Service Account"
+      description: "Service account for Cloud Run service execution"
+
+  # Cloud Deploy Delivery Pipeline
+  deploy_pipeline:
+    type: google_clouddeploy_delivery_pipeline
+    properties:
+      project: ${{ var.project_id }}
+      location: ${{ var.region }}
+      name: "modernized-app-pipeline-${{ random_suffix.hex }}"
+      description: "Deployment pipeline for modernized application"
+      
+      serial_pipeline:
+        stages:
+          - target_id: "development-${{ random_suffix.hex }}"
+            profiles: []
+            
+          - target_id: "staging-${{ random_suffix.hex }}"
+            profiles: []
+            strategy:
+              canary:
+                canary_deployment:
+                  percentages: [25, 50, 100]
+                runtime_config:
+                  cloud_run:
+                    automatic_traffic_control: true
+                    
+          - target_id: "production-${{ random_suffix.hex }}"
+            profiles: []
+            strategy:
+              canary:
+                canary_deployment:
+                  percentages: [10, 25, 50, 100]
+                runtime_config:
+                  cloud_run:
+                    automatic_traffic_control: true
+                    
+    depends_on:
+      - apis_deploy
+
+  # Cloud Deploy Targets
+  deploy_target_dev:
+    type: google_clouddeploy_target
+    properties:
+      project: ${{ var.project_id }}
+      location: ${{ var.region }}
+      name: "development-${{ random_suffix.hex }}"
+      description: "Development environment target"
+      
+      run:
+        location: "projects/${{ var.project_id }}/locations/${{ var.region }}"
+        
+    depends_on:
+      - apis_deploy
+      
+  deploy_target_staging:
+    type: google_clouddeploy_target
+    properties:
+      project: ${{ var.project_id }}
+      location: ${{ var.region }}
+      name: "staging-${{ random_suffix.hex }}"
+      description: "Staging environment target"
+      
+      run:
+        location: "projects/${{ var.project_id }}/locations/${{ var.region }}"
+        
+    depends_on:
+      - apis_deploy
+      
+  deploy_target_prod:
+    type: google_clouddeploy_target
+    properties:
+      project: ${{ var.project_id }}
+      location: ${{ var.region }}
+      name: "production-${{ random_suffix.hex }}"
+      description: "Production environment target"
+      
+      run:
+        location: "projects/${{ var.project_id }}/locations/${{ var.region }}"
+        
+    depends_on:
+      - apis_deploy
+
+  # Cloud Storage Bucket for build artifacts
+  build_artifacts_bucket:
+    type: google_storage_bucket
+    properties:
+      name: "${{ var.app_name }}-artifacts-${{ random_suffix.hex }}"
+      project: ${{ var.project_id }}
+      location: ${{ var.region }}
+      
+      # Security and lifecycle configuration
+      uniform_bucket_level_access: true
+      
+      lifecycle_rule:
+        - condition:
+            age: 30
+          action:
+            type: "Delete"
+            
+      versioning:
+        enabled: true
+        
+      # Labels for resource management
+      labels: ${{ var.labels }}
+
+  # Cloud Storage Bucket for migration assessment data
+  migration_data_bucket:
+    type: google_storage_bucket
+    properties:
+      name: "${{ var.app_name }}-migration-data-${{ random_suffix.hex }}"
+      project: ${{ var.project_id }}
+      location: ${{ var.region }}
+      
+      uniform_bucket_level_access: true
+      
+      # Encryption configuration
+      encryption:
+        default_kms_key_name: ${{ kms_key.id }}
+        
+      lifecycle_rule:
+        - condition:
+            age: 90
+          action:
+            type: "SetStorageClass"
+            storage_class: "COLDLINE"
+            
+        - condition:
+            age: 365
+          action:
+            type: "Delete"
+            
+      labels: ${{ var.labels }}
+
+  # Cloud KMS Key for encryption
+  kms_keyring:
+    type: google_kms_key_ring
+    properties:
+      name: "${{ var.app_name }}-keyring-${{ random_suffix.hex }}"
+      project: ${{ var.project_id }}
+      location: ${{ var.region }}
+      
+  kms_key:
+    type: google_kms_crypto_key
+    properties:
+      name: "migration-data-key"
+      key_ring: ${{ kms_keyring.id }}
+      
+      # Key rotation policy
+      rotation_period: "7776000s"  # 90 days
+      
+      # Labels for management
+      labels: ${{ var.labels }}
+
+  # Cloud Monitoring Dashboard
+  monitoring_dashboard:
+    type: google_monitoring_dashboard
+    properties:
+      project: ${{ var.project_id }}
+      display_name: "Legacy Modernization Dashboard"
+      
+      # Dashboard configuration in JSON format
+      dashboard_json: |
+        {
+          "displayName": "Legacy Modernization Dashboard",
+          "mosaicLayout": {
+            "tiles": [
+              {
+                "width": 6,
+                "height": 4,
+                "widget": {
+                  "title": "Cloud Run Request Count",
+                  "xyChart": {
+                    "dataSets": [
+                      {
+                        "timeSeriesQuery": {
+                          "timeSeriesFilter": {
+                            "filter": "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"${{ var.service_name }}-${{ random_suffix.hex }}\""
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              {
+                "width": 6,
+                "height": 4,
+                "yPos": 4,
+                "widget": {
+                  "title": "Cloud Build Success Rate",
+                  "xyChart": {
+                    "dataSets": [
+                      {
+                        "timeSeriesQuery": {
+                          "timeSeriesFilter": {
+                            "filter": "resource.type=\"build\" AND metric.type=\"cloudbuild.googleapis.com/build/count\""
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              {
+                "width": 6,
+                "height": 4,
+                "xPos": 6,
+                "widget": {
+                  "title": "Migration Center Assets",
+                  "scorecard": {
+                    "timeSeriesQuery": {
+                      "timeSeriesFilter": {
+                        "filter": "resource.type=\"migration_center_source\""
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+        
+    depends_on:
+      - apis_monitoring
+
+  # Cloud Monitoring Alert Policy
+  alert_policy:
+    type: google_monitoring_alert_policy
+    properties:
+      project: ${{ var.project_id }}
+      display_name: "High Error Rate Alert - Legacy Modernization"
+      
+      conditions:
+        - display_name: "Cloud Run error rate too high"
+          condition_threshold:
+            filter: "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"${{ var.service_name }}-${{ random_suffix.hex }}\""
+            comparison: "COMPARISON_GREATER_THAN"
+            threshold_value: 0.05
+            duration: "300s"
+            
+      alert_strategy:
+        auto_close: "1800s"
+        
+      notification_channels: []
+      
+      enabled: true
+      
+    depends_on:
+      - apis_monitoring
+
+  # IAM binding for Cloud Run service account
+  run_sa_logging:
+    type: google_project_iam_member
+    properties:
+      project: ${{ var.project_id }}
+      role: "roles/logging.logWriter"
+      member: "serviceAccount:${{ run_service_account.email }}"
+      
+  run_sa_monitoring:
+    type: google_project_iam_member
+    properties:
+      project: ${{ var.project_id }}
+      role: "roles/monitoring.metricWriter"
+      member: "serviceAccount:${{ run_service_account.email }}"
+
+# Outputs for reference and integration
+outputs:
+  project_id:
+    description: "The Google Cloud Project ID"
+    value: ${{ var.project_id }}
+    
+  region:
+    description: "The primary region for resource deployment"
+    value: ${{ var.region }}
+    
+  random_suffix:
+    description: "Random suffix used for resource naming"
+    value: ${{ random_suffix.hex }}
+    
+  migration_center_source_id:
+    description: "Migration Center source ID for discovery"
+    value: ${{ migration_center_source.source_id }}
+    
+  source_repository_url:
+    description: "Cloud Source Repository URL"
+    value: ${{ source_repository.url }}
+    
+  build_trigger_id:
+    description: "Cloud Build trigger ID"
+    value: ${{ build_trigger.trigger_id }}
+    
+  delivery_pipeline_name:
+    description: "Cloud Deploy delivery pipeline name"
+    value: ${{ deploy_pipeline.name }}
+    
+  artifacts_bucket_name:
+    description: "Cloud Storage bucket for build artifacts"
+    value: ${{ build_artifacts_bucket.name }}
+    
+  migration_data_bucket_name:
+    description: "Cloud Storage bucket for migration data"
+    value: ${{ migration_data_bucket.name }}
+    
+  kms_key_id:
+    description: "Cloud KMS key for encryption"
+    value: ${{ kms_key.id }}
+    
+  monitoring_dashboard_id:
+    description: "Cloud Monitoring dashboard ID"
+    value: ${{ monitoring_dashboard.id }}
+    
+  build_service_account_email:
+    description: "Cloud Build service account email"
+    value: ${{ build_service_account.email }}
+    
+  run_service_account_email:
+    description: "Cloud Run service account email"
+    value: ${{ run_service_account.email }}
+    
+  migration_service_account_email:
+    description: "Migration Center service account email"
+    value: ${{ migration_service_account.email }}

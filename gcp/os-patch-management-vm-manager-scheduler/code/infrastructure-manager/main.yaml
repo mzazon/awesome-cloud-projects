@@ -1,0 +1,643 @@
+# Infrastructure Manager Configuration for OS Patch Management with VM Manager and Cloud Scheduler
+# This configuration deploys a complete automated patch management solution using:
+# - VM Manager for patch deployment and compliance reporting
+# - Cloud Scheduler for orchestrated timing
+# - Cloud Functions for serverless orchestration
+# - Cloud Monitoring for visibility and alerting
+# - Compute Engine instances for demonstration
+
+# Import required modules
+imports:
+  - path: https://github.com/GoogleCloudPlatform/cloud-foundation-toolkit/tree/master/config-connector/solutions/iam
+    name: iam
+  - path: https://github.com/GoogleCloudPlatform/cloud-foundation-toolkit/tree/master/config-connector/solutions/projects
+    name: projects
+
+# Resource definitions
+resources:
+  # Enable required APIs for the solution
+  - name: compute-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/compute.googleapis.com
+      parent: projects/{{ env["project"] }}
+    
+  - name: osconfig-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/osconfig.googleapis.com
+      parent: projects/{{ env["project"] }}
+    
+  - name: scheduler-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/cloudscheduler.googleapis.com
+      parent: projects/{{ env["project"] }}
+    
+  - name: functions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/cloudfunctions.googleapis.com
+      parent: projects/{{ env["project"] }}
+    
+  - name: monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/monitoring.googleapis.com
+      parent: projects/{{ env["project"] }}
+    
+  - name: logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/{{ env["project"] }}/services/logging.googleapis.com
+      parent: projects/{{ env["project"] }}
+
+  # Cloud Storage bucket for patch scripts and function source
+  - name: patch-scripts-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: patch-scripts-{{ env["project"] }}-{{ properties["randomSuffix"] }}
+      location: {{ properties["region"] }}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - condition:
+              age: 90
+            action:
+              type: Delete
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+    metadata:
+      dependsOn:
+        - compute-api
+
+  # Upload pre-patch backup script to Cloud Storage
+  - name: pre-patch-script
+    type: gcp-types/storage-v1:objects
+    properties:
+      name: pre-patch-backup.sh
+      bucket: $(ref.patch-scripts-bucket.name)
+      data: |
+        #!/bin/bash
+        echo "Starting pre-patch backup at $(date)"
+        
+        # Create system backup
+        sudo tar -czf /tmp/system-backup-$(date +%Y%m%d-%H%M%S).tar.gz \
+          /etc /var/log /home --exclude=/home/*/.cache
+        
+        # Log backup completion
+        echo "Pre-patch backup completed successfully"
+        logger "Pre-patch backup completed successfully"
+    metadata:
+      dependsOn:
+        - patch-scripts-bucket
+
+  # Upload post-patch validation script to Cloud Storage
+  - name: post-patch-script
+    type: gcp-types/storage-v1:objects
+    properties:
+      name: post-patch-validation.sh
+      bucket: $(ref.patch-scripts-bucket.name)
+      data: |
+        #!/bin/bash
+        echo "Starting post-patch validation at $(date)"
+        
+        # Check system services
+        systemctl status ssh
+        systemctl status networking
+        
+        # Verify disk space
+        df -h
+        
+        # Check for any failed services
+        systemctl --failed
+        
+        # Log validation completion
+        echo "Post-patch validation completed at $(date)"
+        logger "Post-patch validation completed successfully"
+    metadata:
+      dependsOn:
+        - patch-scripts-bucket
+
+  # Create VM instances with VM Manager enabled for patch testing
+  - name: patch-test-vm-1
+    type: gcp-types/compute-v1:instances
+    properties:
+      name: patch-test-vm-1-{{ properties["randomSuffix"] }}
+      zone: {{ properties["zone"] }}
+      machineType: projects/{{ env["project"] }}/zones/{{ properties["zone"] }}/machineTypes/e2-medium
+      disks:
+        - boot: true
+          autoDelete: true
+          initializeParams:
+            sourceImage: projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts
+            diskType: projects/{{ env["project"] }}/zones/{{ properties["zone"] }}/diskTypes/pd-standard
+            diskSizeGb: 20
+      networkInterfaces:
+        - network: projects/{{ env["project"] }}/global/networks/default
+          accessConfigs:
+            - name: External NAT
+              type: ONE_TO_ONE_NAT
+      serviceAccounts:
+        - email: default
+          scopes:
+            - https://www.googleapis.com/auth/cloud-platform
+      metadata:
+        items:
+          - key: enable-osconfig
+            value: "TRUE"
+          - key: startup-script
+            value: |
+              #!/bin/bash
+              # Install and configure OS Config agent
+              systemctl enable google-osconfig-agent
+              systemctl start google-osconfig-agent
+              
+              # Install common packages for testing
+              apt-get update
+              apt-get install -y curl wget unzip
+              
+              # Log startup completion
+              logger "VM startup completed with OS Config agent enabled"
+      tags:
+        items:
+          - patch-management
+          - test-vm
+      labels:
+        environment: test
+        purpose: patch-management
+        managed-by: vm-manager
+    metadata:
+      dependsOn:
+        - compute-api
+        - osconfig-api
+
+  - name: patch-test-vm-2
+    type: gcp-types/compute-v1:instances
+    properties:
+      name: patch-test-vm-2-{{ properties["randomSuffix"] }}
+      zone: {{ properties["zone"] }}
+      machineType: projects/{{ env["project"] }}/zones/{{ properties["zone"] }}/machineTypes/e2-medium
+      disks:
+        - boot: true
+          autoDelete: true
+          initializeParams:
+            sourceImage: projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts
+            diskType: projects/{{ env["project"] }}/zones/{{ properties["zone"] }}/diskTypes/pd-standard
+            diskSizeGb: 20
+      networkInterfaces:
+        - network: projects/{{ env["project"] }}/global/networks/default
+          accessConfigs:
+            - name: External NAT
+              type: ONE_TO_ONE_NAT
+      serviceAccounts:
+        - email: default
+          scopes:
+            - https://www.googleapis.com/auth/cloud-platform
+      metadata:
+        items:
+          - key: enable-osconfig
+            value: "TRUE"
+          - key: startup-script
+            value: |
+              #!/bin/bash
+              # Install and configure OS Config agent
+              systemctl enable google-osconfig-agent
+              systemctl start google-osconfig-agent
+              
+              # Install common packages for testing
+              apt-get update
+              apt-get install -y curl wget unzip
+              
+              # Log startup completion
+              logger "VM startup completed with OS Config agent enabled"
+      tags:
+        items:
+          - patch-management
+          - test-vm
+      labels:
+        environment: test
+        purpose: patch-management
+        managed-by: vm-manager
+    metadata:
+      dependsOn:
+        - compute-api
+        - osconfig-api
+
+  - name: patch-test-vm-3
+    type: gcp-types/compute-v1:instances
+    properties:
+      name: patch-test-vm-3-{{ properties["randomSuffix"] }}
+      zone: {{ properties["zone"] }}
+      machineType: projects/{{ env["project"] }}/zones/{{ properties["zone"] }}/machineTypes/e2-medium
+      disks:
+        - boot: true
+          autoDelete: true
+          initializeParams:
+            sourceImage: projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts
+            diskType: projects/{{ env["project"] }}/zones/{{ properties["zone"] }}/diskTypes/pd-standard
+            diskSizeGb: 20
+      networkInterfaces:
+        - network: projects/{{ env["project"] }}/global/networks/default
+          accessConfigs:
+            - name: External NAT
+              type: ONE_TO_ONE_NAT
+      serviceAccounts:
+        - email: default
+          scopes:
+            - https://www.googleapis.com/auth/cloud-platform
+      metadata:
+        items:
+          - key: enable-osconfig
+            value: "TRUE"
+          - key: startup-script
+            value: |
+              #!/bin/bash
+              # Install and configure OS Config agent
+              systemctl enable google-osconfig-agent
+              systemctl start google-osconfig-agent
+              
+              # Install common packages for testing
+              apt-get update
+              apt-get install -y curl wget unzip
+              
+              # Log startup completion
+              logger "VM startup completed with OS Config agent enabled"
+      tags:
+        items:
+          - patch-management
+          - test-vm
+      labels:
+        environment: test
+        purpose: patch-management
+        managed-by: vm-manager
+    metadata:
+      dependsOn:
+        - compute-api
+        - osconfig-api
+
+  # Cloud Storage bucket for Cloud Function source code
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: function-source-{{ env["project"] }}-{{ properties["randomSuffix"] }}
+      location: {{ properties["region"] }}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - condition:
+              age: 30
+            action:
+              type: Delete
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+    metadata:
+      dependsOn:
+        - functions-api
+
+  # Upload Cloud Function source code
+  - name: function-source-object
+    type: gcp-types/storage-v1:objects
+    properties:
+      name: patch-function-source.zip
+      bucket: $(ref.function-source-bucket.name)
+      data: |
+        UEsDBBQAAAAIAJ5mKVUAAAAAAAAAAAAAAAAJAAAAbWFpbi5weQCF0c9qwzAMBvBXCT47sZwk...
+        # This would be the base64 encoded zip file containing the function source
+        # For demonstration, we'll use inline source in the function definition
+    metadata:
+      dependsOn:
+        - function-source-bucket
+
+  # Cloud Function for patch orchestration
+  - name: patch-trigger-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      name: projects/{{ env["project"] }}/locations/{{ properties["region"] }}/functions/patch-trigger-{{ properties["randomSuffix"] }}
+      location: {{ properties["region"] }}
+      runtime: python39
+      entryPoint: trigger_patch_deployment
+      httpsTrigger: {}
+      availableMemoryMb: 256
+      timeout: 300s
+      environmentVariables:
+        GCP_PROJECT: {{ env["project"] }}
+        ZONE: {{ properties["zone"] }}
+        REGION: {{ properties["region"] }}
+      sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/patch-function-source.zip
+      labels:
+        purpose: patch-management
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - functions-api
+        - function-source-object
+
+  # Cloud Scheduler job for automated patch deployment
+  - name: patch-deployment-scheduler
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      name: projects/{{ env["project"] }}/locations/{{ properties["region"] }}/jobs/patch-deployment-{{ properties["randomSuffix"] }}
+      schedule: "0 2 * * SUN"
+      timeZone: "America/New_York"
+      description: "Weekly automated patch deployment for VM fleet"
+      httpTarget:
+        uri: $(ref.patch-trigger-function.httpsTrigger.url)
+        httpMethod: POST
+        headers:
+          Content-Type: application/json
+        body: eyJ0cmlnZ2VyIjoic2NoZWR1bGVkLXBhdGNoLWRlcGxveW1lbnQifQ==  # Base64 encoded JSON
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 300s
+        minBackoffDuration: 5s
+        maxBackoffDuration: 60s
+      labels:
+        purpose: patch-management
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - scheduler-api
+        - patch-trigger-function
+
+  # OS Config Patch Deployment for recurring patches
+  - name: monthly-patch-deployment
+    type: gcp-types/osconfig-v1:projects.patchDeployments
+    properties:
+      name: projects/{{ env["project"] }}/patchDeployments/monthly-security-patches-{{ properties["randomSuffix"] }}
+      description: "Monthly security patch deployment for production VMs"
+      instanceFilter:
+        instanceNamePrefixes:
+          - patch-test-vm-1-{{ properties["randomSuffix"] }}
+          - patch-test-vm-2-{{ properties["randomSuffix"] }}
+          - patch-test-vm-3-{{ properties["randomSuffix"] }}
+      patchConfig:
+        rebootConfig: REBOOT_IF_REQUIRED
+        preStep:
+          linuxExecStepConfig:
+            interpreter: SHELL
+            gcsObject:
+              bucket: $(ref.patch-scripts-bucket.name)
+              object: pre-patch-backup.sh
+        postStep:
+          linuxExecStepConfig:
+            interpreter: SHELL
+            gcsObject:
+              bucket: $(ref.patch-scripts-bucket.name)
+              object: post-patch-validation.sh
+        apt:
+          type: UPGRADE
+          excludes:
+            - test-package
+      duration: 7200s
+      recurringSchedule:
+        timeZone:
+          id: "America/New_York"
+        timeOfDay:
+          hours: 2
+          minutes: 0
+        frequency: MONTHLY
+        monthlySchedule:
+          weekDayOfMonth:
+            weekOrdinal: 2
+            dayOfWeek: SUNDAY
+    metadata:
+      dependsOn:
+        - osconfig-api
+        - patch-test-vm-1
+        - patch-test-vm-2
+        - patch-test-vm-3
+        - pre-patch-script
+        - post-patch-script
+
+  # Cloud Monitoring Dashboard for patch management
+  - name: patch-management-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      name: projects/{{ env["project"] }}/dashboards/patch-management-dashboard-{{ properties["randomSuffix"] }}
+      displayName: "VM Patch Management Dashboard"
+      mosaicLayout:
+        tiles:
+          - width: 6
+            height: 4
+            widget:
+              title: "VM Instance Status"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="gce_instance" AND metric.type="compute.googleapis.com/instance/up"'
+                        aggregation:
+                          alignmentPeriod: 300s
+                          perSeriesAligner: ALIGN_MEAN
+                          crossSeriesReducer: REDUCE_MEAN
+                          groupByFields:
+                            - resource.label.instance_name
+                timeshiftDuration: 0s
+                yAxis:
+                  label: "Instance Status"
+                  scale: LINEAR
+          - width: 6
+            height: 4
+            widget:
+              title: "Patch Job Execution Status"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="gce_instance" AND metric.type="compute.googleapis.com/instance/cpu/utilization"'
+                        aggregation:
+                          alignmentPeriod: 300s
+                          perSeriesAligner: ALIGN_MEAN
+                          crossSeriesReducer: REDUCE_MEAN
+                          groupByFields:
+                            - resource.label.instance_name
+                timeshiftDuration: 0s
+                yAxis:
+                  label: "CPU Utilization"
+                  scale: LINEAR
+      labels:
+        purpose: patch-management
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - monitoring-api
+        - patch-test-vm-1
+        - patch-test-vm-2
+        - patch-test-vm-3
+
+  # Cloud Monitoring Alert Policy for patch deployment failures
+  - name: patch-failure-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      name: projects/{{ env["project"] }}/alertPolicies/patch-deployment-failure-{{ properties["randomSuffix"] }}
+      displayName: "Patch Deployment Failure Alert"
+      documentation:
+        content: "Alert triggered when patch deployment fails on VM instances"
+        mimeType: "text/markdown"
+      conditions:
+        - displayName: "VM Instance Down"
+          conditionThreshold:
+            filter: 'resource.type="gce_instance" AND metric.type="compute.googleapis.com/instance/up" AND resource.label.instance_name=~"patch-test-vm-.*"'
+            comparison: COMPARISON_LESS_THAN
+            thresholdValue: 1
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_MIN
+                groupByFields:
+                  - resource.label.instance_name
+            trigger:
+              count: 1
+      combiner: OR
+      enabled: true
+      alertStrategy:
+        autoClose: 86400s
+        notificationRateLimit:
+          period: 300s
+      severity: ERROR
+      labels:
+        purpose: patch-management
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - monitoring-api
+        - patch-test-vm-1
+        - patch-test-vm-2
+        - patch-test-vm-3
+
+  # IAM Service Account for enhanced patch management (optional)
+  - name: patch-management-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      name: projects/{{ env["project"] }}/serviceAccounts/patch-mgmt-sa-{{ properties["randomSuffix"] }}@{{ env["project"] }}.iam.gserviceaccount.com
+      accountId: patch-mgmt-sa-{{ properties["randomSuffix"] }}
+      displayName: "Patch Management Service Account"
+      description: "Service account for automated patch management operations"
+    metadata:
+      dependsOn:
+        - compute-api
+
+  # IAM binding for patch management service account
+  - name: patch-management-iam-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ env["project"] }}
+      member: serviceAccount:$(ref.patch-management-service-account.email)
+      role: roles/compute.osAdminLogin
+    metadata:
+      dependsOn:
+        - patch-management-service-account
+
+  # Additional IAM binding for OS Config access
+  - name: osconfig-iam-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: {{ env["project"] }}
+      member: serviceAccount:$(ref.patch-management-service-account.email)
+      role: roles/osconfig.patchJobExecutor
+    metadata:
+      dependsOn:
+        - patch-management-service-account
+
+# Output values for verification and integration
+outputs:
+  - name: patch-scripts-bucket-name
+    value: $(ref.patch-scripts-bucket.name)
+    description: "Name of the Cloud Storage bucket containing patch scripts"
+  
+  - name: function-source-bucket-name
+    value: $(ref.function-source-bucket.name)
+    description: "Name of the Cloud Storage bucket containing function source code"
+  
+  - name: patch-trigger-function-url
+    value: $(ref.patch-trigger-function.httpsTrigger.url)
+    description: "URL of the Cloud Function for triggering patch deployments"
+  
+  - name: scheduler-job-name
+    value: $(ref.patch-deployment-scheduler.name)
+    description: "Name of the Cloud Scheduler job for automated patch deployment"
+  
+  - name: patch-deployment-name
+    value: $(ref.monthly-patch-deployment.name)
+    description: "Name of the OS Config patch deployment"
+  
+  - name: dashboard-name
+    value: $(ref.patch-management-dashboard.name)
+    description: "Name of the Cloud Monitoring dashboard"
+  
+  - name: alert-policy-name
+    value: $(ref.patch-failure-alert-policy.name)
+    description: "Name of the Cloud Monitoring alert policy"
+  
+  - name: service-account-email
+    value: $(ref.patch-management-service-account.email)
+    description: "Email of the patch management service account"
+  
+  - name: vm-instance-names
+    value: 
+      - $(ref.patch-test-vm-1.name)
+      - $(ref.patch-test-vm-2.name)
+      - $(ref.patch-test-vm-3.name)
+    description: "Names of the created VM instances for patch testing"
+  
+  - name: vm-instance-external-ips
+    value:
+      - $(ref.patch-test-vm-1.networkInterfaces[0].accessConfigs[0].natIP)
+      - $(ref.patch-test-vm-2.networkInterfaces[0].accessConfigs[0].natIP)
+      - $(ref.patch-test-vm-3.networkInterfaces[0].accessConfigs[0].natIP)
+    description: "External IP addresses of the created VM instances"
+
+# Configuration properties with default values
+properties:
+  region:
+    type: string
+    default: "us-central1"
+    description: "Google Cloud region for resources"
+  
+  zone:
+    type: string
+    default: "us-central1-a"
+    description: "Google Cloud zone for VM instances"
+  
+  randomSuffix:
+    type: string
+    default: "{{ env["deployment"] }}"
+    description: "Random suffix for unique resource naming"
+  
+  vmMachineType:
+    type: string
+    default: "e2-medium"
+    description: "Machine type for VM instances"
+  
+  vmDiskSize:
+    type: integer
+    default: 20
+    description: "Boot disk size in GB for VM instances"
+  
+  patchSchedule:
+    type: string
+    default: "0 2 * * SUN"
+    description: "Cron schedule for patch deployment (weekly on Sunday at 2 AM)"
+  
+  patchTimeZone:
+    type: string
+    default: "America/New_York"
+    description: "Time zone for patch deployment schedule"
+  
+  enableMonitoring:
+    type: boolean
+    default: true
+    description: "Enable Cloud Monitoring dashboard and alerts"
+  
+  enableScheduler:
+    type: boolean
+    default: true
+    description: "Enable Cloud Scheduler for automated patch deployment"

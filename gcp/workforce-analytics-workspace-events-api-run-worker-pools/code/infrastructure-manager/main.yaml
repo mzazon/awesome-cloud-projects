@@ -1,0 +1,782 @@
+# Google Cloud Infrastructure Manager Configuration
+# Workforce Analytics with Workspace Events API and Cloud Run Worker Pools
+# This configuration deploys a complete workforce analytics solution that captures
+# real-time Google Workspace events and processes them for business intelligence.
+
+metadata:
+  name: workforce-analytics-infrastructure
+  description: Complete workforce analytics solution with Workspace Events API, Cloud Run Worker Pools, and BigQuery
+  version: "1.0"
+
+# Input variables for customization
+variables:
+  # Project and location configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID for resource deployment"
+    validation:
+      pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+  
+  region:
+    type: string
+    description: "Google Cloud region for resource deployment"
+    default: "us-central1"
+    validation:
+      enum:
+        - "us-central1"
+        - "us-east1"
+        - "us-west1"
+        - "europe-west1"
+        - "asia-southeast1"
+  
+  # Resource naming configuration
+  environment:
+    type: string
+    description: "Environment name (dev, staging, prod)"
+    default: "dev"
+    validation:
+      enum: ["dev", "staging", "prod"]
+  
+  # Worker pool configuration
+  min_instances:
+    type: integer
+    description: "Minimum number of worker pool instances"
+    default: 1
+    validation:
+      minimum: 1
+      maximum: 5
+  
+  max_instances:
+    type: integer
+    description: "Maximum number of worker pool instances"
+    default: 10
+    validation:
+      minimum: 2
+      maximum: 100
+  
+  # Resource limits
+  worker_memory:
+    type: string
+    description: "Memory allocation for worker pool instances"
+    default: "1Gi"
+    validation:
+      enum: ["512Mi", "1Gi", "2Gi", "4Gi"]
+  
+  worker_cpu:
+    type: string
+    description: "CPU allocation for worker pool instances"
+    default: "1"
+    validation:
+      enum: ["0.5", "1", "2", "4"]
+
+# Local values for resource naming and configuration
+locals:
+  # Generate unique resource names with environment prefix
+  resource_prefix: "${var.environment}-workforce-analytics"
+  dataset_name: "workforce_analytics_${var.environment}"
+  
+  # Pub/Sub configuration
+  topic_name: "${local.resource_prefix}-workspace-events"
+  subscription_name: "${local.resource_prefix}-events-processor"
+  
+  # Storage configuration
+  bucket_name: "${local.resource_prefix}-data-${var.project_id}"
+  
+  # Worker pool configuration
+  worker_pool_name: "${local.resource_prefix}-processor"
+  container_image: "gcr.io/${var.project_id}/${local.resource_prefix}-app"
+  
+  # BigQuery configuration
+  tables:
+    meeting_events: "meeting_events"
+    file_events: "file_events"
+  
+  # Required APIs for the solution
+  required_apis:
+    - "run.googleapis.com"
+    - "pubsub.googleapis.com"
+    - "bigquery.googleapis.com"
+    - "monitoring.googleapis.com"
+    - "cloudbuild.googleapis.com"
+    - "workspaceevents.googleapis.com"
+    - "storage.googleapis.com"
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  enable_apis:
+    type: gcp-types/serviceusage-v1:services
+    for_each: ${local.required_apis}
+    properties:
+      name: "projects/${var.project_id}/services/${each.value}"
+    metadata:
+      dependsOn: []
+
+  # Cloud Storage bucket for application code and temporary data
+  storage_bucket:
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${local.bucket_name}
+      location: ${var.region}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      uniformBucketLevelAccess:
+        enabled: true
+      encryption:
+        defaultKmsKeyName: ""
+      lifecycle:
+        rule:
+          - action:
+              type: "Delete"
+            condition:
+              age: 30
+              matchesStorageClass: ["STANDARD"]
+          - action:
+              type: "SetStorageClass"
+              storageClass: "NEARLINE"
+            condition:
+              age: 7
+              matchesStorageClass: ["STANDARD"]
+    metadata:
+      dependsOn:
+        - enable_apis
+
+  # BigQuery dataset for workforce analytics data
+  bigquery_dataset:
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      datasetId: ${local.dataset_name}
+      projectId: ${var.project_id}
+      location: ${var.region}
+      description: "Workforce Analytics Data Warehouse - Real-time workspace events and analytics"
+      defaultTableExpirationMs: "2592000000"  # 30 days
+      access:
+        - role: "OWNER"
+          userByEmail: "serviceAccount:${google_service_account.worker_pool_sa.email}"
+        - role: "WRITER"
+          userByEmail: "serviceAccount:${google_service_account.worker_pool_sa.email}"
+      labels:
+        environment: ${var.environment}
+        purpose: "workforce-analytics"
+    metadata:
+      dependsOn:
+        - enable_apis
+
+  # BigQuery table for meeting events
+  meeting_events_table:
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      datasetId: ${local.dataset_name}
+      projectId: ${var.project_id}
+      tableId: ${local.tables.meeting_events}
+      description: "Meeting events from Google Workspace Calendar and Meet"
+      schema:
+        fields:
+          - name: "event_id"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Unique identifier for the workspace event"
+          - name: "event_type"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Type of workspace event (calendar, meet, etc.)"
+          - name: "meeting_id"
+            type: "STRING"
+            mode: "NULLABLE"
+            description: "Unique identifier for the meeting"
+          - name: "organizer_email"
+            type: "STRING"
+            mode: "NULLABLE"
+            description: "Email address of the meeting organizer"
+          - name: "participant_count"
+            type: "INTEGER"
+            mode: "NULLABLE"
+            description: "Number of participants in the meeting"
+          - name: "start_time"
+            type: "TIMESTAMP"
+            mode: "NULLABLE"
+            description: "Meeting start time"
+          - name: "end_time"
+            type: "TIMESTAMP"
+            mode: "NULLABLE"
+            description: "Meeting end time"
+          - name: "duration_minutes"
+            type: "INTEGER"
+            mode: "NULLABLE"
+            description: "Meeting duration in minutes"
+          - name: "meeting_title"
+            type: "STRING"
+            mode: "NULLABLE"
+            description: "Meeting title or subject"
+          - name: "calendar_id"
+            type: "STRING"
+            mode: "NULLABLE"
+            description: "Calendar identifier"
+          - name: "created_time"
+            type: "TIMESTAMP"
+            mode: "REQUIRED"
+            description: "Timestamp when the record was created"
+      timePartitioning:
+        type: "DAY"
+        field: "created_time"
+        expirationMs: "2592000000"  # 30 days
+      clustering:
+        fields: ["organizer_email", "event_type"]
+      labels:
+        table_type: "meeting_events"
+        environment: ${var.environment}
+    metadata:
+      dependsOn:
+        - bigquery_dataset
+
+  # BigQuery table for file collaboration events
+  file_events_table:
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      datasetId: ${local.dataset_name}
+      projectId: ${var.project_id}
+      tableId: ${local.tables.file_events}
+      description: "File collaboration events from Google Drive and Docs"
+      schema:
+        fields:
+          - name: "event_id"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Unique identifier for the workspace event"
+          - name: "event_type"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Type of file event (created, updated, shared, etc.)"
+          - name: "file_id"
+            type: "STRING"
+            mode: "NULLABLE"
+            description: "Unique identifier for the file"
+          - name: "user_email"
+            type: "STRING"
+            mode: "NULLABLE"
+            description: "Email address of the user performing the action"
+          - name: "file_name"
+            type: "STRING"
+            mode: "NULLABLE"
+            description: "Name of the file"
+          - name: "file_type"
+            type: "STRING"
+            mode: "NULLABLE"
+            description: "Type of file (document, spreadsheet, presentation, etc.)"
+          - name: "action"
+            type: "STRING"
+            mode: "NULLABLE"
+            description: "Action performed on the file"
+          - name: "shared_with_count"
+            type: "INTEGER"
+            mode: "NULLABLE"
+            description: "Number of users the file is shared with"
+          - name: "folder_id"
+            type: "STRING"
+            mode: "NULLABLE"
+            description: "Parent folder identifier"
+          - name: "drive_id"
+            type: "STRING"
+            mode: "NULLABLE"
+            description: "Drive identifier"
+          - name: "created_time"
+            type: "TIMESTAMP"
+            mode: "REQUIRED"
+            description: "Timestamp when the record was created"
+      timePartitioning:
+        type: "DAY"
+        field: "created_time"
+        expirationMs: "2592000000"  # 30 days
+      clustering:
+        fields: ["user_email", "event_type", "file_type"]
+      labels:
+        table_type: "file_events"
+        environment: ${var.environment}
+    metadata:
+      dependsOn:
+        - bigquery_dataset
+
+  # Pub/Sub topic for workspace events streaming
+  pubsub_topic:
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: "projects/${var.project_id}/topics/${local.topic_name}"
+      messageRetentionDuration: "604800s"  # 7 days
+      labels:
+        environment: ${var.environment}
+        purpose: "workspace-events"
+    metadata:
+      dependsOn:
+        - enable_apis
+
+  # Pub/Sub subscription for worker pool processing
+  pubsub_subscription:
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: "projects/${var.project_id}/subscriptions/${local.subscription_name}"
+      topic: ${pubsub_topic.name}
+      ackDeadlineSeconds: 600
+      messageRetentionDuration: "604800s"  # 7 days
+      enableMessageOrdering: true
+      deadLetterPolicy:
+        deadLetterTopic: "projects/${var.project_id}/topics/${local.topic_name}-dlq"
+        maxDeliveryAttempts: 5
+      retryPolicy:
+        minimumBackoff: "10s"
+        maximumBackoff: "600s"
+      labels:
+        environment: ${var.environment}
+        purpose: "event-processing"
+    metadata:
+      dependsOn:
+        - pubsub_topic
+
+  # Dead letter topic for failed message processing
+  pubsub_dlq_topic:
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: "projects/${var.project_id}/topics/${local.topic_name}-dlq"
+      messageRetentionDuration: "604800s"  # 7 days
+      labels:
+        environment: ${var.environment}
+        purpose: "dead-letter-queue"
+    metadata:
+      dependsOn:
+        - enable_apis
+
+  # Service account for Cloud Run Worker Pool
+  worker_pool_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: "${local.resource_prefix}-worker-sa"
+      displayName: "Workforce Analytics Worker Pool Service Account"
+      description: "Service account for Cloud Run Worker Pool processing workspace events"
+      projectId: ${var.project_id}
+    metadata:
+      dependsOn:
+        - enable_apis
+
+  # IAM binding for BigQuery Data Editor role
+  worker_sa_bigquery_binding:
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: "roles/bigquery.dataEditor"
+      member: "serviceAccount:${worker_pool_service_account.email}"
+    metadata:
+      dependsOn:
+        - worker_pool_service_account
+
+  # IAM binding for Pub/Sub Subscriber role
+  worker_sa_pubsub_binding:
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: "roles/pubsub.subscriber"
+      member: "serviceAccount:${worker_pool_service_account.email}"
+    metadata:
+      dependsOn:
+        - worker_pool_service_account
+
+  # IAM binding for Cloud Monitoring Metric Writer role
+  worker_sa_monitoring_binding:
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: "roles/monitoring.metricWriter"
+      member: "serviceAccount:${worker_pool_service_account.email}"
+    metadata:
+      dependsOn:
+        - worker_pool_service_account
+
+  # IAM binding for Cloud Storage Object Admin role
+  worker_sa_storage_binding:
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: "roles/storage.objectAdmin"
+      member: "serviceAccount:${worker_pool_service_account.email}"
+    metadata:
+      dependsOn:
+        - worker_pool_service_account
+
+  # Cloud Run Worker Pool for event processing
+  # Note: Worker Pools are deployed using gcloud CLI as they're not yet fully supported in Infrastructure Manager
+  # This configuration provides the template that would be used
+  worker_pool_deployment_config:
+    type: gcp-types/compute-v1:instances
+    properties:
+      # This is a placeholder - actual Worker Pool deployment requires gcloud CLI
+      # The configuration below represents the intended Worker Pool specification
+      name: "${local.worker_pool_name}-config"
+      description: |
+        Worker Pool Configuration Template:
+        - Name: ${local.worker_pool_name}
+        - Image: ${local.container_image}
+        - Region: ${var.region}
+        - Min Instances: ${var.min_instances}
+        - Max Instances: ${var.max_instances}
+        - Memory: ${var.worker_memory}
+        - CPU: ${var.worker_cpu}
+        - Service Account: ${worker_pool_service_account.email}
+        - Environment Variables:
+          - PROJECT_ID: ${var.project_id}
+          - SUBSCRIPTION_NAME: ${local.subscription_name}
+          - DATASET_NAME: ${local.dataset_name}
+          - BUCKET_NAME: ${local.bucket_name}
+      zone: "${var.region}-a"
+      machineType: "projects/${var.project_id}/zones/${var.region}-a/machineTypes/e2-micro"
+      disks:
+        - boot: true
+          initializeParams:
+            sourceImage: "projects/debian-cloud/global/images/family/debian-11"
+      networkInterfaces:
+        - network: "projects/${var.project_id}/global/networks/default"
+          accessConfigs:
+            - type: "ONE_TO_ONE_NAT"
+      serviceAccounts:
+        - email: ${worker_pool_service_account.email}
+          scopes:
+            - "https://www.googleapis.com/auth/cloud-platform"
+      metadata:
+        items:
+          - key: "startup-script"
+            value: |
+              #!/bin/bash
+              echo "This instance represents Worker Pool configuration."
+              echo "Actual Worker Pool deployment requires gcloud CLI:"
+              echo "gcloud beta run worker-pools create ${local.worker_pool_name} \\"
+              echo "  --image=${local.container_image} \\"
+              echo "  --region=${var.region} \\"
+              echo "  --min-instances=${var.min_instances} \\"
+              echo "  --max-instances=${var.max_instances} \\"
+              echo "  --memory=${var.worker_memory} \\"
+              echo "  --cpu=${var.worker_cpu} \\"
+              echo "  --service-account=${worker_pool_service_account.email} \\"
+              echo "  --env-vars=PROJECT_ID=${var.project_id},SUBSCRIPTION_NAME=${local.subscription_name},DATASET_NAME=${local.dataset_name}"
+      labels:
+        purpose: "worker-pool-config"
+        environment: ${var.environment}
+    metadata:
+      dependsOn:
+        - worker_pool_service_account
+        - pubsub_subscription
+        - bigquery_dataset
+
+  # Cloud Monitoring notification channel for alerts
+  monitoring_notification_channel:
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      displayName: "Workforce Analytics Email Alerts"
+      description: "Email notifications for workforce analytics system alerts"
+      type: "email"
+      labels:
+        email_address: "admin@example.com"  # Update with actual email
+      enabled: true
+      userLabels:
+        environment: ${var.environment}
+        system: "workforce-analytics"
+    metadata:
+      dependsOn:
+        - enable_apis
+
+  # Cloud Monitoring alert policy for high processing latency
+  monitoring_alert_policy:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: "High Event Processing Latency"
+      documentation:
+        content: "Alert triggered when workspace event processing latency exceeds 5 seconds"
+        mimeType: "text/markdown"
+      conditions:
+        - displayName: "Processing latency too high"
+          conditionThreshold:
+            filter: 'resource.type="cloud_run_revision" AND resource.labels.service_name="${local.worker_pool_name}"'
+            comparison: "COMPARISON_GREATER_THAN"
+            thresholdValue: 5000  # 5 seconds in milliseconds
+            duration: "300s"  # 5 minutes
+            aggregations:
+              - alignmentPeriod: "60s"
+                perSeriesAligner: "ALIGN_MEAN"
+                crossSeriesReducer: "REDUCE_MEAN"
+                groupByFields:
+                  - "resource.label.service_name"
+      combiner: "OR"
+      enabled: true
+      notificationChannels:
+        - ${monitoring_notification_channel.name}
+      alertStrategy:
+        autoClose: "86400s"  # 24 hours
+      severity: "WARNING"
+      userLabels:
+        environment: ${var.environment}
+        system: "workforce-analytics"
+    metadata:
+      dependsOn:
+        - monitoring_notification_channel
+
+  # BigQuery view for meeting analytics
+  meeting_analytics_view:
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      datasetId: ${local.dataset_name}
+      projectId: ${var.project_id}
+      tableId: "meeting_analytics"
+      view:
+        query: |
+          SELECT 
+            DATE(start_time) as meeting_date,
+            organizer_email,
+            COUNT(*) as total_meetings,
+            AVG(duration_minutes) as avg_duration,
+            AVG(participant_count) as avg_participants,
+            SUM(duration_minutes * participant_count) as total_person_minutes
+          FROM `${var.project_id}.${local.dataset_name}.${local.tables.meeting_events}`
+          WHERE start_time >= DATETIME_SUB(CURRENT_DATETIME(), INTERVAL 30 DAY)
+          GROUP BY meeting_date, organizer_email
+          ORDER BY meeting_date DESC
+        useLegacySql: false
+      description: "Analytics view for meeting patterns and productivity metrics"
+      labels:
+        view_type: "meeting_analytics"
+        environment: ${var.environment}
+    metadata:
+      dependsOn:
+        - meeting_events_table
+
+  # BigQuery view for collaboration analytics
+  collaboration_analytics_view:
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      datasetId: ${local.dataset_name}
+      projectId: ${var.project_id}
+      tableId: "collaboration_analytics"
+      view:
+        query: |
+          SELECT 
+            DATE(created_time) as activity_date,
+            user_email,
+            file_type,
+            action,
+            COUNT(*) as action_count,
+            COUNT(DISTINCT file_id) as unique_files,
+            AVG(shared_with_count) as avg_sharing
+          FROM `${var.project_id}.${local.dataset_name}.${local.tables.file_events}`
+          WHERE created_time >= DATETIME_SUB(CURRENT_DATETIME(), INTERVAL 30 DAY)
+          GROUP BY activity_date, user_email, file_type, action
+          ORDER BY activity_date DESC
+        useLegacySql: false
+      description: "Analytics view for file collaboration patterns and sharing behaviors"
+      labels:
+        view_type: "collaboration_analytics"
+        environment: ${var.environment}
+    metadata:
+      dependsOn:
+        - file_events_table
+
+  # BigQuery view for productivity insights
+  productivity_insights_view:
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      datasetId: ${local.dataset_name}
+      projectId: ${var.project_id}
+      tableId: "productivity_insights"
+      view:
+        query: |
+          WITH meeting_stats AS (
+            SELECT 
+              organizer_email as email,
+              COUNT(*) as meetings_organized,
+              SUM(duration_minutes) as total_meeting_time
+            FROM `${var.project_id}.${local.dataset_name}.${local.tables.meeting_events}`
+            WHERE start_time >= DATETIME_SUB(CURRENT_DATETIME(), INTERVAL 7 DAY)
+            GROUP BY organizer_email
+          ),
+          collaboration_stats AS (
+            SELECT 
+              user_email as email,
+              COUNT(*) as file_actions,
+              COUNT(DISTINCT file_id) as files_touched
+            FROM `${var.project_id}.${local.dataset_name}.${local.tables.file_events}`
+            WHERE created_time >= DATETIME_SUB(CURRENT_DATETIME(), INTERVAL 7 DAY)
+            GROUP BY user_email
+          )
+          SELECT 
+            COALESCE(m.email, c.email) as user_email,
+            COALESCE(meetings_organized, 0) as meetings_organized,
+            COALESCE(total_meeting_time, 0) as total_meeting_time,
+            COALESCE(file_actions, 0) as file_actions,
+            COALESCE(files_touched, 0) as files_touched,
+            ROUND((COALESCE(file_actions, 0) + COALESCE(meetings_organized, 0) * 2) / 7, 2) as activity_score
+          FROM meeting_stats m
+          FULL OUTER JOIN collaboration_stats c ON m.email = c.email
+          ORDER BY activity_score DESC
+        useLegacySql: false
+      description: "Comprehensive productivity insights combining meeting and collaboration data"
+      labels:
+        view_type: "productivity_insights"
+        environment: ${var.environment}
+    metadata:
+      dependsOn:
+        - meeting_events_table
+        - file_events_table
+
+# Output values for verification and integration
+outputs:
+  # Project and location information
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${var.project_id}
+  
+  region:
+    description: "Deployment region"
+    value: ${var.region}
+  
+  # BigQuery resources
+  dataset_name:
+    description: "BigQuery dataset name for workforce analytics"
+    value: ${bigquery_dataset.datasetId}
+  
+  dataset_location:
+    description: "BigQuery dataset location"
+    value: ${bigquery_dataset.location}
+  
+  meeting_events_table:
+    description: "BigQuery table for meeting events"
+    value: "${var.project_id}.${local.dataset_name}.${local.tables.meeting_events}"
+  
+  file_events_table:
+    description: "BigQuery table for file events"
+    value: "${var.project_id}.${local.dataset_name}.${local.tables.file_events}"
+  
+  # Analytics views
+  meeting_analytics_view:
+    description: "BigQuery view for meeting analytics"
+    value: "${var.project_id}.${local.dataset_name}.meeting_analytics"
+  
+  collaboration_analytics_view:
+    description: "BigQuery view for collaboration analytics"
+    value: "${var.project_id}.${local.dataset_name}.collaboration_analytics"
+  
+  productivity_insights_view:
+    description: "BigQuery view for productivity insights"
+    value: "${var.project_id}.${local.dataset_name}.productivity_insights"
+  
+  # Pub/Sub resources
+  pubsub_topic:
+    description: "Pub/Sub topic for workspace events"
+    value: ${pubsub_topic.name}
+  
+  pubsub_subscription:
+    description: "Pub/Sub subscription for event processing"
+    value: ${pubsub_subscription.name}
+  
+  # Storage resources
+  storage_bucket:
+    description: "Cloud Storage bucket for application data"
+    value: ${storage_bucket.name}
+  
+  # Service account
+  worker_service_account:
+    description: "Service account for worker pool"
+    value: ${worker_pool_service_account.email}
+  
+  # Worker Pool information (for manual deployment)
+  worker_pool_name:
+    description: "Cloud Run Worker Pool name"
+    value: ${local.worker_pool_name}
+  
+  container_image:
+    description: "Container image name for worker pool"
+    value: ${local.container_image}
+  
+  worker_pool_deploy_command:
+    description: "Command to deploy Cloud Run Worker Pool"
+    value: |
+      gcloud beta run worker-pools create ${local.worker_pool_name} \
+        --image=${local.container_image} \
+        --region=${var.region} \
+        --min-instances=${var.min_instances} \
+        --max-instances=${var.max_instances} \
+        --memory=${var.worker_memory} \
+        --cpu=${var.worker_cpu} \
+        --service-account=${worker_pool_service_account.email} \
+        --env-vars=PROJECT_ID=${var.project_id},SUBSCRIPTION_NAME=${local.subscription_name},DATASET_NAME=${local.dataset_name},BUCKET_NAME=${local.bucket_name}
+  
+  # Monitoring resources
+  monitoring_notification_channel:
+    description: "Cloud Monitoring notification channel"
+    value: ${monitoring_notification_channel.name}
+  
+  monitoring_alert_policy:
+    description: "Cloud Monitoring alert policy for high latency"
+    value: ${monitoring_alert_policy.name}
+  
+  # Workspace Events API configuration
+  workspace_events_subscription_config:
+    description: "Configuration for Workspace Events API subscription"
+    value: |
+      {
+        "name": "projects/${var.project_id}/subscriptions/workforce-analytics",
+        "targetResource": "//workspace.googleapis.com/users/*",
+        "eventTypes": [
+          "google.workspace.calendar.event.v1.created",
+          "google.workspace.calendar.event.v1.updated",
+          "google.workspace.drive.file.v1.created",
+          "google.workspace.drive.file.v1.updated",
+          "google.workspace.meet.participant.v1.joined",
+          "google.workspace.meet.participant.v1.left",
+          "google.workspace.meet.recording.v1.fileGenerated"
+        ],
+        "notificationEndpoint": {
+          "pubsubTopic": "${pubsub_topic.name}"
+        },
+        "payloadOptions": {
+          "includeResource": true,
+          "fieldMask": "eventType,eventTime,resource"
+        }
+      }
+
+# Configuration validation and deployment notes
+validation:
+  # Ensure project ID is provided
+  - condition: "var.project_id != ''"
+    message: "Project ID must be specified"
+  
+  # Validate worker pool instance configuration
+  - condition: "var.min_instances <= var.max_instances"
+    message: "Minimum instances must be less than or equal to maximum instances"
+  
+  # Validate region selection
+  - condition: "contains(['us-central1', 'us-east1', 'us-west1', 'europe-west1', 'asia-southeast1'], var.region)"
+    message: "Region must be one of the supported regions"
+
+# Deployment notes and manual steps required
+deployment_notes: |
+  This Infrastructure Manager configuration deploys the core infrastructure for the workforce analytics solution.
+  
+  Manual steps required after deployment:
+  
+  1. Build and deploy the worker pool container:
+     - Create the Python application code as shown in the recipe
+     - Build container: gcloud builds submit --tag ${local.container_image}
+     - Deploy worker pool using the output command: worker_pool_deploy_command
+  
+  2. Configure Workspace Events API:
+     - Visit Google Workspace Admin Console
+     - Navigate to Security > API Reference > Events API
+     - Create subscription using the configuration from: workspace_events_subscription_config
+  
+  3. Verify deployment:
+     - Check BigQuery dataset and tables are created
+     - Verify Pub/Sub topic and subscription are active
+     - Test worker pool processing with sample events
+     - Validate monitoring alerts are configured
+  
+  4. Customize monitoring notification:
+     - Update the email address in monitoring_notification_channel
+     - Configure additional notification channels as needed
+  
+  The infrastructure provides a complete foundation for workforce analytics with automatic scaling,
+  comprehensive monitoring, and optimized data storage for business intelligence workflows.

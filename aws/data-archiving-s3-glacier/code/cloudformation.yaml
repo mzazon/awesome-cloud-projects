@@ -1,0 +1,581 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Automated Data Archiving with S3 Glacier - Creates S3 bucket with lifecycle policies, SNS notifications, and monitoring for cost-optimized long-term data storage'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Bucket Configuration"
+        Parameters:
+          - BucketName
+          - DataPrefix
+          - EnableVersioning
+          - EnableIntelligentTiering
+      - Label:
+          default: "Lifecycle Configuration"
+        Parameters:
+          - GlacierTransitionDays
+          - DeepArchiveTransitionDays
+          - IncompleteMultipartUploadDays
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+          - EnableSNSNotifications
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableCloudWatchMetrics
+          - EnableCostOptimizationAlerts
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - EnablePublicAccessBlock
+          - EnableSSEByDefault
+          - KMSKeyId
+    ParameterLabels:
+      BucketName:
+        default: "S3 Bucket Name"
+      DataPrefix:
+        default: "Data Objects Prefix"
+      EnableVersioning:
+        default: "Enable S3 Versioning"
+      EnableIntelligentTiering:
+        default: "Enable S3 Intelligent Tiering"
+      GlacierTransitionDays:
+        default: "Days until Glacier Flexible Retrieval"
+      DeepArchiveTransitionDays:
+        default: "Days until Glacier Deep Archive"
+      IncompleteMultipartUploadDays:
+        default: "Delete Incomplete Multipart Uploads After"
+      NotificationEmail:
+        default: "Email Address for Notifications"
+      EnableSNSNotifications:
+        default: "Enable SNS Notifications"
+      EnableCloudWatchMetrics:
+        default: "Enable CloudWatch Metrics"
+      EnableCostOptimizationAlerts:
+        default: "Enable Cost Optimization Alerts"
+      EnablePublicAccessBlock:
+        default: "Block Public Access"
+      EnableSSEByDefault:
+        default: "Enable Server-Side Encryption"
+      KMSKeyId:
+        default: "KMS Key ID (optional)"
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: 'Name for the S3 bucket (leave empty for auto-generated name)'
+    Default: ''
+    MaxLength: 63
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Bucket name must be lowercase, contain only letters, numbers, and hyphens, and be between 3-63 characters long'
+
+  DataPrefix:
+    Type: String
+    Description: 'Prefix for objects to be archived (e.g., data/, logs/, backups/)'
+    Default: 'data/'
+    MaxLength: 1024
+    AllowedPattern: '^[a-zA-Z0-9!_.*\'()/\\-]*[/]?$'
+    ConstraintDescription: 'Prefix must be a valid S3 object key prefix'
+
+  EnableVersioning:
+    Type: String
+    Description: 'Enable S3 versioning for the bucket'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  EnableIntelligentTiering:
+    Type: String
+    Description: 'Enable S3 Intelligent Tiering for automatic cost optimization'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  GlacierTransitionDays:
+    Type: Number
+    Description: 'Number of days after which objects transition to Glacier Flexible Retrieval'
+    Default: 90
+    MinValue: 1
+    MaxValue: 365
+    ConstraintDescription: 'Must be between 1 and 365 days'
+
+  DeepArchiveTransitionDays:
+    Type: Number
+    Description: 'Number of days after which objects transition to Glacier Deep Archive'
+    Default: 365
+    MinValue: 1
+    MaxValue: 3650
+    ConstraintDescription: 'Must be between 1 and 3650 days'
+
+  IncompleteMultipartUploadDays:
+    Type: Number
+    Description: 'Delete incomplete multipart uploads after this many days'
+    Default: 7
+    MinValue: 1
+    MaxValue: 30
+    ConstraintDescription: 'Must be between 1 and 30 days'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for archive notifications (leave empty to skip notifications)'
+    Default: ''
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  EnableSNSNotifications:
+    Type: String
+    Description: 'Enable SNS notifications for restore operations'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  EnableCloudWatchMetrics:
+    Type: String
+    Description: 'Enable CloudWatch metrics for monitoring'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  EnableCostOptimizationAlerts:
+    Type: String
+    Description: 'Enable cost optimization alerts'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  EnablePublicAccessBlock:
+    Type: String
+    Description: 'Block all public access to the bucket'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  EnableSSEByDefault:
+    Type: String
+    Description: 'Enable server-side encryption by default'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  KMSKeyId:
+    Type: String
+    Description: 'KMS Key ID for encryption (leave empty for S3 managed keys)'
+    Default: ''
+
+Conditions:
+  HasBucketName: !Not [!Equals [!Ref BucketName, '']]
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  EnableSNS: !Equals [!Ref EnableSNSNotifications, 'true']
+  EnableMetrics: !Equals [!Ref EnableCloudWatchMetrics, 'true']
+  EnableCostAlerts: !Equals [!Ref EnableCostOptimizationAlerts, 'true']
+  EnableVersioningCondition: !Equals [!Ref EnableVersioning, 'true']
+  EnableIntelligentTieringCondition: !Equals [!Ref EnableIntelligentTiering, 'true']
+  EnablePublicAccessBlockCondition: !Equals [!Ref EnablePublicAccessBlock, 'true']
+  EnableSSECondition: !Equals [!Ref EnableSSEByDefault, 'true']
+  HasKMSKey: !Not [!Equals [!Ref KMSKeyId, '']]
+  UseKMSEncryption: !And [!Condition EnableSSECondition, !Condition HasKMSKey]
+  CreateNotifications: !And [!Condition EnableSNS, !Condition HasNotificationEmail]
+  ValidateTransitionDays: !And 
+    - !Condition EnableSNS
+    - !Not [!Equals [!Ref GlacierTransitionDays, !Ref DeepArchiveTransitionDays]]
+
+Resources:
+  # S3 Bucket for data archiving
+  ArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If 
+        - HasBucketName
+        - !Ref BucketName
+        - !Sub '${AWS::StackName}-archive-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: !If [EnableVersioningCondition, 'Enabled', 'Suspended']
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: !Ref EnablePublicAccessBlock
+        BlockPublicPolicy: !Ref EnablePublicAccessBlock
+        IgnorePublicAcls: !Ref EnablePublicAccessBlock
+        RestrictPublicBuckets: !Ref EnablePublicAccessBlock
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [UseKMSEncryption, 'aws:kms', 'AES256']
+              KMSMasterKeyID: !If [UseKMSEncryption, !Ref KMSKeyId, !Ref 'AWS::NoValue']
+            BucketKeyEnabled: !If [UseKMSEncryption, true, !Ref 'AWS::NoValue']
+      LifecycleConfiguration:
+        Rules:
+          # Main archiving rule for data prefix
+          - Id: ArchiveRule
+            Status: Enabled
+            Filter:
+              Prefix: !Ref DataPrefix
+            Transitions:
+              - TransitionInDays: !Ref GlacierTransitionDays
+                StorageClass: GLACIER
+              - TransitionInDays: !Ref DeepArchiveTransitionDays
+                StorageClass: DEEP_ARCHIVE
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: !Ref IncompleteMultipartUploadDays
+          # Intelligent Tiering rule (if enabled)
+          - !If
+            - EnableIntelligentTieringCondition
+            - Id: IntelligentTieringRule
+              Status: Enabled
+              Filter:
+                Prefix: !Ref DataPrefix
+              Transitions:
+                - TransitionInDays: 1
+                  StorageClass: INTELLIGENT_TIERING
+            - !Ref 'AWS::NoValue'
+          # Cleanup rule for incomplete multipart uploads
+          - Id: CleanupIncompleteMultipartUploads
+            Status: Enabled
+            Filter:
+              Prefix: ''
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: !Ref IncompleteMultipartUploadDays
+      NotificationConfiguration: !If
+        - CreateNotifications
+        - TopicConfigurations:
+            - Topic: !Ref ArchiveNotificationTopic
+              Event: s3:ObjectRestore:Completed
+              Filter:
+                S3Key:
+                  Rules:
+                    - Name: prefix
+                      Value: !Ref DataPrefix
+        - !Ref 'AWS::NoValue'
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: access-logs/
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-archive-bucket'
+        - Key: Purpose
+          Value: 'Automated Data Archiving'
+        - Key: Environment
+          Value: !Ref 'AWS::StackName'
+        - Key: CostCenter
+          Value: 'DataArchiving'
+
+  # Separate bucket for access logs
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-access-logs-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteAccessLogsAfter90Days
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-access-logs-bucket'
+        - Key: Purpose
+          Value: 'S3 Access Logs'
+
+  # SNS Topic for archive notifications
+  ArchiveNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnableSNS
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-archive-notifications'
+      DisplayName: 'S3 Archive Notifications'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-archive-notifications'
+        - Key: Purpose
+          Value: 'Archive Notifications'
+
+  # SNS Topic Policy
+  ArchiveNotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: EnableSNS
+    Properties:
+      Topics:
+        - !Ref ArchiveNotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3Publish
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref ArchiveNotificationTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+              StringLike:
+                'aws:SourceArn': !Sub '${ArchiveBucket}/*'
+
+  # Email subscription to SNS topic
+  ArchiveNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateNotifications
+    Properties:
+      Protocol: email
+      TopicArn: !Ref ArchiveNotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Dashboard for monitoring
+  ArchiveMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableMetrics
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-archive-monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "BucketSizeBytes", "BucketName", "${ArchiveBucket}", "StorageType", "StandardStorage" ],
+                  [ "...", "GlacierStorage" ],
+                  [ "...", "DeepArchiveStorage" ],
+                  [ "...", "IntelligentTieringStorage" ]
+                ],
+                "period": 86400,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Storage Usage by Class",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "NumberOfObjects", "BucketName", "${ArchiveBucket}", "StorageType", "AllStorageTypes" ]
+                ],
+                "period": 86400,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Total Object Count",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "AllRequests", "BucketName", "${ArchiveBucket}" ],
+                  [ ".", "GetRequests", ".", "." ],
+                  [ ".", "PutRequests", ".", "." ]
+                ],
+                "period": 3600,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "API Request Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarm for cost optimization
+  HighStorageCostAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableCostAlerts
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-high-storage-cost'
+      AlarmDescription: 'Alert when S3 storage costs exceed threshold'
+      MetricName: BucketSizeBytes
+      Namespace: AWS/S3
+      Statistic: Average
+      Period: 86400
+      EvaluationPeriods: 2
+      Threshold: 1073741824000  # 1TB in bytes
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: BucketName
+          Value: !Ref ArchiveBucket
+        - Name: StorageType
+          Value: StandardStorage
+      AlarmActions:
+        - !If [EnableSNS, !Ref ArchiveNotificationTopic, !Ref 'AWS::NoValue']
+      TreatMissingData: notBreaching
+
+  # IAM Role for Lambda functions (if needed for custom processing)
+  ArchiveProcessingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-archive-processing-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ArchiveProcessingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetObjectVersion
+                  - s3:RestoreObject
+                Resource:
+                  - !Sub '${ArchiveBucket}/*'
+                  - !Ref ArchiveBucket
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !If [EnableSNS, !Ref ArchiveNotificationTopic, !Ref 'AWS::NoValue']
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-archive-processing-role'
+        - Key: Purpose
+          Value: 'Lambda execution role for archive processing'
+
+  # Bucket Policy for secure access
+  ArchiveBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArchiveBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyUnSecureCommunications
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${ArchiveBucket}/*'
+              - !Ref ArchiveBucket
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+          - Sid: DenyDirectPublicAccess
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${ArchiveBucket}/*'
+              - !Ref ArchiveBucket
+            Condition:
+              StringNotEquals:
+                'aws:userid': 
+                  - !Sub '${AWS::AccountId}'
+                  - !Sub '${ArchiveProcessingRole.Arn}'
+            # Allow access from within the same account only
+
+Outputs:
+  BucketName:
+    Description: 'Name of the S3 bucket created for data archiving'
+    Value: !Ref ArchiveBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-bucket-name'
+
+  BucketArn:
+    Description: 'ARN of the S3 bucket created for data archiving'
+    Value: !GetAtt ArchiveBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-bucket-arn'
+
+  BucketDomainName:
+    Description: 'Domain name of the S3 bucket'
+    Value: !GetAtt ArchiveBucket.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-bucket-domain-name'
+
+  BucketRegionalDomainName:
+    Description: 'Regional domain name of the S3 bucket'
+    Value: !GetAtt ArchiveBucket.RegionalDomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-bucket-regional-domain-name'
+
+  BucketWebsiteURL:
+    Description: 'Website URL of the S3 bucket'
+    Value: !GetAtt ArchiveBucket.WebsiteURL
+    Export:
+      Name: !Sub '${AWS::StackName}-bucket-website-url'
+
+  AccessLogsBucketName:
+    Description: 'Name of the S3 bucket for access logs'
+    Value: !Ref AccessLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-access-logs-bucket-name'
+
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for archive notifications'
+    Value: !If [EnableSNS, !Ref ArchiveNotificationTopic, 'SNS notifications disabled']
+    Export:
+      Name: !Sub '${AWS::StackName}-sns-topic-arn'
+
+  IAMRoleArn:
+    Description: 'ARN of the IAM role for archive processing'
+    Value: !GetAtt ArchiveProcessingRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-processing-role-arn'
+
+  CloudWatchDashboardURL:
+    Description: 'URL to the CloudWatch dashboard for monitoring'
+    Value: !If 
+      - EnableMetrics
+      - !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-archive-monitoring'
+      - 'CloudWatch monitoring disabled'
+    Export:
+      Name: !Sub '${AWS::StackName}-dashboard-url'
+
+  LifecycleConfiguration:
+    Description: 'Summary of lifecycle configuration'
+    Value: !Sub 'Glacier after ${GlacierTransitionDays} days, Deep Archive after ${DeepArchiveTransitionDays} days'
+    Export:
+      Name: !Sub '${AWS::StackName}-lifecycle-summary'
+
+  CostOptimizationEstimate:
+    Description: 'Estimated cost savings compared to S3 Standard storage'
+    Value: !Sub 'Glacier: ~68% savings after ${GlacierTransitionDays} days, Deep Archive: ~95% savings after ${DeepArchiveTransitionDays} days'
+    Export:
+      Name: !Sub '${AWS::StackName}-cost-optimization-estimate'
+
+  UsageInstructions:
+    Description: 'Instructions for using the archive bucket'
+    Value: !Sub 'Upload files to s3://${ArchiveBucket}/${DataPrefix} - they will be automatically archived according to lifecycle policy'
+    Export:
+      Name: !Sub '${AWS::StackName}-usage-instructions'
+
+  RestoreInstructions:
+    Description: 'Instructions for restoring archived objects'
+    Value: 'Use AWS CLI: aws s3api restore-object --bucket BUCKET --key KEY --restore-request Days=7,GlacierJobParameters={"Tier":"Standard"}'
+    Export:
+      Name: !Sub '${AWS::StackName}-restore-instructions'

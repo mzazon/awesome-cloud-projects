@@ -1,0 +1,1054 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Enterprise Video Streaming Platform with AWS Elemental MediaLive
+  Creates a comprehensive streaming infrastructure with adaptive bitrate streaming,
+  multiple protocols (HLS/DASH/CMAF), global CDN distribution, and monitoring.
+
+# ==========================================
+# PARAMETERS
+# ==========================================
+Parameters:
+  PlatformName:
+    Type: String
+    Default: video-streaming-platform
+    Description: Name for the streaming platform (used as prefix for resources)
+    MinLength: 3
+    MaxLength: 30
+    AllowedPattern: ^[a-z0-9-]+$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: Environment for the streaming platform
+
+  EnableDRM:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable DRM protection for content
+
+  EnableLowLatency:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable low-latency CMAF streaming
+
+  Enable4KStreaming:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable 4K UHD streaming output
+
+  StreamingBitrates:
+    Type: CommaDelimitedList
+    Default: '240p,480p,720p,1080p,2160p'
+    Description: List of streaming quality levels to generate
+
+  ArchiveRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: Number of days to retain archived content in S3
+
+  MonitoringEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable CloudWatch monitoring and alarms
+
+  InputSecurityCIDR:
+    Type: String
+    Default: '0.0.0.0/0'
+    Description: CIDR block for MediaLive input security (0.0.0.0/0 for public access)
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$
+
+  InternalNetworkCIDR:
+    Type: String
+    Default: '10.0.0.0/8'
+    Description: CIDR block for internal network access
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$
+
+# ==========================================
+# CONDITIONS
+# ==========================================
+Conditions:
+  EnableDRMCondition: !Equals [!Ref EnableDRM, 'true']
+  EnableLowLatencyCondition: !Equals [!Ref EnableLowLatency, 'true']
+  Enable4KCondition: !Equals [!Ref Enable4KStreaming, 'true']
+  EnableMonitoringCondition: !Equals [!Ref MonitoringEnabled, 'true']
+
+# ==========================================
+# RESOURCES
+# ==========================================
+Resources:
+
+  # ==========================================
+  # IAM ROLES AND POLICIES
+  # ==========================================
+  
+  MediaLiveServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${PlatformName}-medialive-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: medialive.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Policies:
+        - PolicyName: MediaLivePlatformPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - mediapackage:*
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:CreateSecret
+                  - cloudwatch:PutMetricData
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - !Sub '${StreamingContentBucket}/*'
+                  - !Sub '${StreamingContentBucket}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${PlatformName}-medialive-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: MediaLive
+
+  # ==========================================
+  # S3 STORAGE
+  # ==========================================
+  
+  StreamingContentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${PlatformName}-content-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveContentLifecycle
+            Status: Enabled
+            Prefix: archives/
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+          - Id: LogsLifecycle
+            Status: Enabled
+            Prefix: logs/
+            ExpirationInDays: 90
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref StreamingPlatformLogGroup
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Name
+          Value: !Sub '${PlatformName}-content-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: Storage
+
+  StreamingContentBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StreamingContentBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: MediaLiveAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt MediaLiveServiceRole.Arn
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:ListBucket
+            Resource:
+              - !Sub '${StreamingContentBucket}/*'
+              - !Sub '${StreamingContentBucket}'
+          - Sid: CloudFrontAccess
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${StreamingContentBucket}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${StreamingDistribution}'
+
+  # ==========================================
+  # SECRETS MANAGER (DRM KEYS)
+  # ==========================================
+  
+  DRMEncryptionKey:
+    Type: AWS::SecretsManager::Secret
+    Condition: EnableDRMCondition
+    Properties:
+      Name: !Sub '${PlatformName}-drm-key'
+      Description: DRM encryption key for streaming platform content protection
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: 'key'
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'
+      Tags:
+        - Key: Name
+          Value: !Sub '${PlatformName}-drm-key'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: DRM
+
+  # ==========================================
+  # CLOUDWATCH LOGS
+  # ==========================================
+  
+  StreamingPlatformLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/streaming-platform/${PlatformName}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${PlatformName}-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==========================================
+  # MEDIALIVE INPUT SECURITY GROUPS
+  # ==========================================
+  
+  PublicInputSecurityGroup:
+    Type: AWS::MediaLive::InputSecurityGroup
+    Properties:
+      WhitelistRules:
+        - Cidr: !Ref InputSecurityCIDR
+      Tags:
+        Name: !Sub '${PlatformName}-public-sg'
+        Environment: !Ref Environment
+        Type: Public
+
+  InternalInputSecurityGroup:
+    Type: AWS::MediaLive::InputSecurityGroup
+    Properties:
+      WhitelistRules:
+        - Cidr: !Ref InternalNetworkCIDR
+        - Cidr: '172.16.0.0/12'
+        - Cidr: '192.168.0.0/16'
+      Tags:
+        Name: !Sub '${PlatformName}-internal-sg'
+        Environment: !Ref Environment
+        Type: Internal
+
+  # ==========================================
+  # MEDIALIVE INPUTS
+  # ==========================================
+  
+  RTMPPrimaryInput:
+    Type: AWS::MediaLive::Input
+    Properties:
+      Name: !Sub '${PlatformName}-rtmp-primary'
+      Type: RTMP_PUSH
+      InputSecurityGroups:
+        - !Ref PublicInputSecurityGroup
+      Destinations:
+        - StreamName: live
+      Tags:
+        Name: !Sub '${PlatformName}-rtmp-primary'
+        Environment: !Ref Environment
+        Type: RTMP
+
+  HLSBackupInput:
+    Type: AWS::MediaLive::Input
+    Properties:
+      Name: !Sub '${PlatformName}-hls-backup'
+      Type: URL_PULL
+      Sources:
+        - Url: https://example.com/backup-stream.m3u8
+      Tags:
+        Name: !Sub '${PlatformName}-hls-backup'
+        Environment: !Ref Environment
+        Type: HLS
+
+  RTPProfessionalInput:
+    Type: AWS::MediaLive::Input
+    Properties:
+      Name: !Sub '${PlatformName}-rtp-professional'
+      Type: RTP_PUSH
+      InputSecurityGroups:
+        - !Ref InternalInputSecurityGroup
+      Tags:
+        Name: !Sub '${PlatformName}-rtp-professional'
+        Environment: !Ref Environment
+        Type: RTP
+
+  # ==========================================
+  # MEDIAPACKAGE CHANNEL
+  # ==========================================
+  
+  MediaPackageChannel:
+    Type: AWS::MediaPackage::Channel
+    Properties:
+      Id: !Sub '${PlatformName}-package-channel'
+      Description: Enterprise streaming platform MediaPackage channel
+      Tags:
+        - Key: Name
+          Value: !Sub '${PlatformName}-package-channel'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: MediaPackage
+
+  # ==========================================
+  # MEDIAPACKAGE ORIGIN ENDPOINTS
+  # ==========================================
+  
+  HLSOriginEndpoint:
+    Type: AWS::MediaPackage::OriginEndpoint
+    Properties:
+      Id: !Sub '${PlatformName}-hls-endpoint'
+      ChannelId: !Ref MediaPackageChannel
+      ManifestName: master.m3u8
+      StartoverWindowSeconds: 3600
+      TimeDelaySeconds: 10
+      HlsPackage:
+        SegmentDurationSeconds: 4
+        PlaylistType: EVENT
+        PlaylistWindowSeconds: 300
+        ProgramDateTimeIntervalSeconds: 60
+        AdMarkers: SCTE35_ENHANCED
+        IncludeIframeOnlyStream: true
+        UseAudioRenditionGroup: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${PlatformName}-hls-endpoint'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Type
+          Value: HLS
+
+  DASHOriginEndpoint:
+    Type: AWS::MediaPackage::OriginEndpoint
+    Condition: EnableDRMCondition
+    Properties:
+      Id: !Sub '${PlatformName}-dash-endpoint'
+      ChannelId: !Ref MediaPackageChannel
+      ManifestName: manifest.mpd
+      StartoverWindowSeconds: 3600
+      TimeDelaySeconds: 10
+      DashPackage:
+        SegmentDurationSeconds: 4
+        MinBufferTimeSeconds: 20
+        MinUpdatePeriodSeconds: 10
+        SuggestedPresentationDelaySeconds: 30
+        Profile: NONE
+        PeriodTriggers:
+          - ADS
+      Tags:
+        - Key: Name
+          Value: !Sub '${PlatformName}-dash-endpoint'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Type
+          Value: DASH
+
+  CMAFOriginEndpoint:
+    Type: AWS::MediaPackage::OriginEndpoint
+    Condition: EnableLowLatencyCondition
+    Properties:
+      Id: !Sub '${PlatformName}-cmaf-endpoint'
+      ChannelId: !Ref MediaPackageChannel
+      ManifestName: index.m3u8
+      StartoverWindowSeconds: 1800
+      TimeDelaySeconds: 2
+      CmafPackage:
+        SegmentDurationSeconds: 2
+        SegmentPrefix: segment
+        HlsManifests:
+          - Id: low-latency
+            ManifestName: ll.m3u8
+            PlaylistType: EVENT
+            PlaylistWindowSeconds: 60
+            ProgramDateTimeIntervalSeconds: 60
+            AdMarkers: SCTE35_ENHANCED
+      Tags:
+        - Key: Name
+          Value: !Sub '${PlatformName}-cmaf-endpoint'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Type
+          Value: CMAF
+
+  # ==========================================
+  # MEDIALIVE CHANNEL
+  # ==========================================
+  
+  MediaLiveChannel:
+    Type: AWS::MediaLive::Channel
+    Properties:
+      Name: !Sub '${PlatformName}-live-channel'
+      RoleArn: !GetAtt MediaLiveServiceRole.Arn
+      InputSpecification:
+        Codec: AVC
+        Resolution: HD
+        MaximumBitrate: MAX_50_MBPS
+      InputAttachments:
+        - InputId: !Ref RTMPPrimaryInput
+          InputAttachmentName: primary-rtmp
+          InputSettings:
+            SourceEndBehavior: CONTINUE
+            InputFilter: AUTO
+            FilterStrength: 1
+            DeblockFilter: ENABLED
+            DenoiseFilter: ENABLED
+        - InputId: !Ref HLSBackupInput
+          InputAttachmentName: backup-hls
+          InputSettings:
+            SourceEndBehavior: CONTINUE
+            InputFilter: AUTO
+            FilterStrength: 1
+      Destinations:
+        - Id: mediapackage-destination
+          MediaPackageSettings:
+            - ChannelId: !Ref MediaPackageChannel
+        - Id: s3-archive-destination
+          S3Settings:
+            - BucketName: !Ref StreamingContentBucket
+              FileNamePrefix: archives/
+              RoleArn: !GetAtt MediaLiveServiceRole.Arn
+      EncoderSettings:
+        AudioDescriptions:
+          - Name: audio_stereo
+            AudioSelectorName: default
+            AudioTypeControl: FOLLOW_INPUT
+            LanguageCodeControl: FOLLOW_INPUT
+            CodecSettings:
+              AacSettings:
+                Bitrate: 128000
+                CodingMode: CODING_MODE_2_0
+                SampleRate: 48000
+                Spec: MPEG4
+          - Name: audio_surround
+            AudioSelectorName: default
+            AudioTypeControl: FOLLOW_INPUT
+            LanguageCodeControl: FOLLOW_INPUT
+            CodecSettings:
+              AacSettings:
+                Bitrate: 256000
+                CodingMode: CODING_MODE_5_1
+                SampleRate: 48000
+                Spec: MPEG4
+        VideoDescriptions:
+          - !If
+            - Enable4KCondition
+            - Name: video_2160p
+              Width: 3840
+              Height: 2160
+              CodecSettings:
+                H264Settings:
+                  Bitrate: 15000000
+                  FramerateControl: SPECIFIED
+                  FramerateNumerator: 30
+                  FramerateDenominator: 1
+                  GopBReference: ENABLED
+                  GopClosedCadence: 1
+                  GopNumBFrames: 3
+                  GopSize: 90
+                  GopSizeUnits: FRAMES
+                  Profile: HIGH
+                  Level: H264_LEVEL_5_1
+                  RateControlMode: CBR
+                  Syntax: DEFAULT
+                  AdaptiveQuantization: HIGH
+                  AfdSignaling: NONE
+                  ColorMetadata: INSERT
+                  EntropyEncoding: CABAC
+                  FlickerAq: ENABLED
+                  ForceFieldPictures: DISABLED
+                  TemporalAq: ENABLED
+                  SpatialAq: ENABLED
+              RespondToAfd: RESPOND
+              ScalingBehavior: DEFAULT
+              Sharpness: 50
+            - !Ref AWS::NoValue
+          - Name: video_1080p
+            Width: 1920
+            Height: 1080
+            CodecSettings:
+              H264Settings:
+                Bitrate: 6000000
+                FramerateControl: SPECIFIED
+                FramerateNumerator: 30
+                FramerateDenominator: 1
+                GopBReference: ENABLED
+                GopClosedCadence: 1
+                GopNumBFrames: 3
+                GopSize: 90
+                GopSizeUnits: FRAMES
+                Profile: HIGH
+                Level: H264_LEVEL_4_1
+                RateControlMode: CBR
+                Syntax: DEFAULT
+                AdaptiveQuantization: HIGH
+                TemporalAq: ENABLED
+                SpatialAq: ENABLED
+            RespondToAfd: RESPOND
+            ScalingBehavior: DEFAULT
+            Sharpness: 50
+          - Name: video_720p
+            Width: 1280
+            Height: 720
+            CodecSettings:
+              H264Settings:
+                Bitrate: 3000000
+                FramerateControl: SPECIFIED
+                FramerateNumerator: 30
+                FramerateDenominator: 1
+                GopBReference: ENABLED
+                GopClosedCadence: 1
+                GopNumBFrames: 2
+                GopSize: 90
+                GopSizeUnits: FRAMES
+                Profile: HIGH
+                Level: H264_LEVEL_3_1
+                RateControlMode: CBR
+                Syntax: DEFAULT
+                AdaptiveQuantization: MEDIUM
+                TemporalAq: ENABLED
+                SpatialAq: ENABLED
+            RespondToAfd: RESPOND
+            ScalingBehavior: DEFAULT
+            Sharpness: 50
+          - Name: video_480p
+            Width: 854
+            Height: 480
+            CodecSettings:
+              H264Settings:
+                Bitrate: 1500000
+                FramerateControl: SPECIFIED
+                FramerateNumerator: 30
+                FramerateDenominator: 1
+                GopBReference: DISABLED
+                GopClosedCadence: 1
+                GopNumBFrames: 2
+                GopSize: 90
+                GopSizeUnits: FRAMES
+                Profile: MAIN
+                Level: H264_LEVEL_3_0
+                RateControlMode: CBR
+                Syntax: DEFAULT
+                AdaptiveQuantization: MEDIUM
+            RespondToAfd: RESPOND
+            ScalingBehavior: DEFAULT
+            Sharpness: 50
+          - Name: video_240p
+            Width: 426
+            Height: 240
+            CodecSettings:
+              H264Settings:
+                Bitrate: 500000
+                FramerateControl: SPECIFIED
+                FramerateNumerator: 30
+                FramerateDenominator: 1
+                GopBReference: DISABLED
+                GopClosedCadence: 1
+                GopNumBFrames: 1
+                GopSize: 90
+                GopSizeUnits: FRAMES
+                Profile: BASELINE
+                Level: H264_LEVEL_2_0
+                RateControlMode: CBR
+                Syntax: DEFAULT
+            RespondToAfd: RESPOND
+            ScalingBehavior: DEFAULT
+            Sharpness: 50
+        OutputGroups:
+          - Name: MediaPackage-ABR
+            OutputGroupSettings:
+              MediaPackageGroupSettings:
+                Destination:
+                  DestinationRefId: mediapackage-destination
+            Outputs:
+              - !If
+                - Enable4KCondition
+                - OutputName: 4K-UHD
+                  VideoDescriptionName: video_2160p
+                  AudioDescriptionNames:
+                    - audio_surround
+                  OutputSettings:
+                    MediaPackageOutputSettings: {}
+                - !Ref AWS::NoValue
+              - OutputName: 1080p-HD
+                VideoDescriptionName: video_1080p
+                AudioDescriptionNames:
+                  - audio_stereo
+                OutputSettings:
+                  MediaPackageOutputSettings: {}
+              - OutputName: 720p-HD
+                VideoDescriptionName: video_720p
+                AudioDescriptionNames:
+                  - audio_stereo
+                OutputSettings:
+                  MediaPackageOutputSettings: {}
+              - OutputName: 480p-SD
+                VideoDescriptionName: video_480p
+                AudioDescriptionNames:
+                  - audio_stereo
+                OutputSettings:
+                  MediaPackageOutputSettings: {}
+              - OutputName: 240p-Mobile
+                VideoDescriptionName: video_240p
+                AudioDescriptionNames:
+                  - audio_stereo
+                OutputSettings:
+                  MediaPackageOutputSettings: {}
+          - Name: S3-Archive
+            OutputGroupSettings:
+              ArchiveGroupSettings:
+                Destination:
+                  DestinationRefId: s3-archive-destination
+                RolloverInterval: 3600
+            Outputs:
+              - OutputName: archive-source
+                VideoDescriptionName: video_1080p
+                AudioDescriptionNames:
+                  - audio_stereo
+                OutputSettings:
+                  ArchiveOutputSettings:
+                    NameModifier: -archive
+                    Extension: m2ts
+        TimecodeConfig:
+          Source: EMBEDDED
+        CaptionDescriptions:
+          - CaptionSelectorName: default
+            Name: captions
+            LanguageCode: en
+            LanguageDescription: English
+      Tags:
+        Name: !Sub '${PlatformName}-live-channel'
+        Environment: !Ref Environment
+        Service: MediaLive
+
+  # ==========================================
+  # CLOUDFRONT DISTRIBUTION
+  # ==========================================
+  
+  StreamingDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub 'Enterprise Video Streaming Platform - ${PlatformName}'
+        Enabled: true
+        HttpVersion: http2
+        IPV6Enabled: true
+        PriceClass: PriceClass_All
+        DefaultCacheBehavior:
+          TargetOriginId: MediaPackage-HLS-Primary
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # CachingOptimized
+          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf  # CORS-S3Origin
+          Compress: true
+          AllowedMethods:
+            - DELETE
+            - GET
+            - HEAD
+            - OPTIONS
+            - PATCH
+            - POST
+            - PUT
+          CachedMethods:
+            - GET
+            - HEAD
+          DefaultTTL: 5
+          MaxTTL: 31536000
+          MinTTL: 0
+        Origins:
+          - Id: MediaPackage-HLS-Primary
+            DomainName: !Sub
+              - '${Domain}'
+              - Domain: !Select [2, !Split ['/', !GetAtt HLSOriginEndpoint.Url]]
+            OriginPath: !Sub
+              - '/${Path}'
+              - Path: !Select [3, !Split ['/', !GetAtt HLSOriginEndpoint.Url]]
+            CustomOriginConfig:
+              HTTPPort: 443
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+            OriginCustomHeaders:
+              - HeaderName: X-MediaPackage-CDNIdentifier
+                HeaderValue: !Sub '${PlatformName}-${AWS::AccountId}'
+          - !If
+            - EnableDRMCondition
+            - Id: MediaPackage-DASH-DRM
+              DomainName: !Sub
+                - '${Domain}'
+                - Domain: !Select [2, !Split ['/', !GetAtt DASHOriginEndpoint.Url]]
+              OriginPath: !Sub
+                - '/${Path}'
+                - Path: !Select [3, !Split ['/', !GetAtt DASHOriginEndpoint.Url]]
+              CustomOriginConfig:
+                HTTPPort: 443
+                HTTPSPort: 443
+                OriginProtocolPolicy: https-only
+                OriginSSLProtocols:
+                  - TLSv1.2
+              OriginCustomHeaders:
+                - HeaderName: X-MediaPackage-CDNIdentifier
+                  HeaderValue: !Sub '${PlatformName}-${AWS::AccountId}'
+            - !Ref AWS::NoValue
+          - !If
+            - EnableLowLatencyCondition
+            - Id: MediaPackage-CMAF-LowLatency
+              DomainName: !Sub
+                - '${Domain}'
+                - Domain: !Select [2, !Split ['/', !GetAtt CMAFOriginEndpoint.Url]]
+              OriginPath: !Sub
+                - '/${Path}'
+                - Path: !Select [3, !Split ['/', !GetAtt CMAFOriginEndpoint.Url]]
+              CustomOriginConfig:
+                HTTPPort: 443
+                HTTPSPort: 443
+                OriginProtocolPolicy: https-only
+                OriginSSLProtocols:
+                  - TLSv1.2
+              OriginCustomHeaders:
+                - HeaderName: X-MediaPackage-CDNIdentifier
+                  HeaderValue: !Sub '${PlatformName}-${AWS::AccountId}'
+            - !Ref AWS::NoValue
+        CacheBehaviors:
+          - !If
+            - EnableDRMCondition
+            - PathPattern: '*.mpd'
+              TargetOriginId: MediaPackage-DASH-DRM
+              ViewerProtocolPolicy: redirect-to-https
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+              OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf
+              Compress: true
+              AllowedMethods:
+                - GET
+                - HEAD
+              CachedMethods:
+                - GET
+                - HEAD
+              DefaultTTL: 5
+              MaxTTL: 60
+              MinTTL: 0
+            - !Ref AWS::NoValue
+          - !If
+            - EnableLowLatencyCondition
+            - PathPattern: '*/ll.m3u8'
+              TargetOriginId: MediaPackage-CMAF-LowLatency
+              ViewerProtocolPolicy: redirect-to-https
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+              OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf
+              Compress: true
+              AllowedMethods:
+                - GET
+                - HEAD
+              CachedMethods:
+                - GET
+                - HEAD
+              DefaultTTL: 2
+              MaxTTL: 10
+              MinTTL: 0
+            - !Ref AWS::NoValue
+          - PathPattern: '*.ts'
+            TargetOriginId: MediaPackage-HLS-Primary
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf
+            Compress: false
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            DefaultTTL: 86400
+            MaxTTL: 86400
+            MinTTL: 0
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          MinimumProtocolVersion: TLSv1.2_2021
+        Restrictions:
+          GeoRestriction:
+            RestrictionType: none
+      Tags:
+        - Key: Name
+          Value: !Sub '${PlatformName}-distribution'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: CloudFront
+
+  # ==========================================
+  # CLOUDWATCH ALARMS (MONITORING)
+  # ==========================================
+  
+  MediaLiveInputLossAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoringCondition
+    Properties:
+      AlarmName: !Sub 'MediaLive-${PlatformName}-InputLoss'
+      AlarmDescription: MediaLive channel input loss detection
+      MetricName: InputVideoFreeze
+      Namespace: AWS/MediaLive
+      Statistic: Maximum
+      Period: 60
+      Threshold: 0.5
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 2
+      TreatMissingData: breaching
+      Dimensions:
+        - Name: ChannelId
+          Value: !Ref MediaLiveChannel
+      Tags:
+        - Key: Name
+          Value: !Sub '${PlatformName}-input-loss-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+  MediaPackageEgressErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoringCondition
+    Properties:
+      AlarmName: !Sub 'MediaPackage-${PlatformName}-EgressErrors'
+      AlarmDescription: MediaPackage egress error detection
+      MetricName: EgressRequestCount
+      Namespace: AWS/MediaPackage
+      Statistic: Sum
+      Period: 300
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 2
+      Dimensions:
+        - Name: Channel
+          Value: !Ref MediaPackageChannel
+      Tags:
+        - Key: Name
+          Value: !Sub '${PlatformName}-egress-error-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+  CloudFrontErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoringCondition
+    Properties:
+      AlarmName: !Sub 'CloudFront-${PlatformName}-ErrorRate'
+      AlarmDescription: CloudFront 4xx/5xx error rate monitoring
+      MetricName: 4xxErrorRate
+      Namespace: AWS/CloudFront
+      Statistic: Average
+      Period: 300
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 2
+      Dimensions:
+        - Name: DistributionId
+          Value: !Ref StreamingDistribution
+      Tags:
+        - Key: Name
+          Value: !Sub '${PlatformName}-error-rate-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+# ==========================================
+# OUTPUTS
+# ==========================================
+Outputs:
+  
+  # Platform Information
+  PlatformName:
+    Description: Name of the streaming platform
+    Value: !Ref PlatformName
+    Export:
+      Name: !Sub '${AWS::StackName}-PlatformName'
+
+  Environment:
+    Description: Environment of the streaming platform
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+  # MediaLive Resources
+  MediaLiveChannelId:
+    Description: MediaLive Channel ID
+    Value: !Ref MediaLiveChannel
+    Export:
+      Name: !Sub '${AWS::StackName}-ChannelId'
+
+  MediaLiveChannelState:
+    Description: MediaLive Channel State
+    Value: !GetAtt MediaLiveChannel.State
+    Export:
+      Name: !Sub '${AWS::StackName}-ChannelState'
+
+  RTMPPrimaryEndpoint:
+    Description: Primary RTMP ingest endpoint
+    Value: !Sub
+      - '${Url}/live'
+      - Url: !Select [0, !GetAtt RTMPPrimaryInput.Destinations]
+    Export:
+      Name: !Sub '${AWS::StackName}-RTMPPrimaryEndpoint'
+
+  RTMPBackupEndpoint:
+    Description: Backup RTMP ingest endpoint
+    Value: !Sub
+      - '${Url}/live'
+      - Url: !Select [1, !GetAtt RTMPPrimaryInput.Destinations]
+    Export:
+      Name: !Sub '${AWS::StackName}-RTMPBackupEndpoint'
+
+  # MediaPackage Resources
+  MediaPackageChannelId:
+    Description: MediaPackage Channel ID
+    Value: !Ref MediaPackageChannel
+    Export:
+      Name: !Sub '${AWS::StackName}-PackageChannelId'
+
+  HLSEndpointURL:
+    Description: HLS streaming endpoint URL
+    Value: !GetAtt HLSOriginEndpoint.Url
+    Export:
+      Name: !Sub '${AWS::StackName}-HLSEndpoint'
+
+  DASHEndpointURL:
+    Description: DASH streaming endpoint URL (with DRM support)
+    Value: !If [EnableDRMCondition, !GetAtt DASHOriginEndpoint.Url, 'DRM not enabled']
+    Export:
+      Name: !Sub '${AWS::StackName}-DASHEndpoint'
+
+  CMAFEndpointURL:
+    Description: CMAF low-latency streaming endpoint URL
+    Value: !If [EnableLowLatencyCondition, !GetAtt CMAFOriginEndpoint.Url, 'Low latency not enabled']
+    Export:
+      Name: !Sub '${AWS::StackName}-CMAFEndpoint'
+
+  # CloudFront Distribution
+  CloudFrontDistributionId:
+    Description: CloudFront Distribution ID
+    Value: !Ref StreamingDistribution
+    Export:
+      Name: !Sub '${AWS::StackName}-DistributionId'
+
+  CloudFrontDomainName:
+    Description: CloudFront Distribution Domain Name
+    Value: !GetAtt StreamingDistribution.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-DistributionDomain'
+
+  # Playback URLs (via CloudFront)
+  HLSPlaybackURL:
+    Description: HLS playback URL via CloudFront
+    Value: !Sub 'https://${StreamingDistribution.DomainName}/out/v1/master.m3u8'
+    Export:
+      Name: !Sub '${AWS::StackName}-HLSPlaybackURL'
+
+  DASHPlaybackURL:
+    Description: DASH playback URL via CloudFront
+    Value: !If 
+      - EnableDRMCondition
+      - !Sub 'https://${StreamingDistribution.DomainName}/out/v1/manifest.mpd'
+      - 'DRM not enabled'
+    Export:
+      Name: !Sub '${AWS::StackName}-DASHPlaybackURL'
+
+  CMAFPlaybackURL:
+    Description: CMAF low-latency playback URL via CloudFront
+    Value: !If 
+      - EnableLowLatencyCondition
+      - !Sub 'https://${StreamingDistribution.DomainName}/out/v1/ll.m3u8'
+      - 'Low latency not enabled'
+    Export:
+      Name: !Sub '${AWS::StackName}-CMAFPlaybackURL'
+
+  # Storage
+  ContentBucketName:
+    Description: S3 bucket for content storage and archives
+    Value: !Ref StreamingContentBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ContentBucket'
+
+  # Security
+  DRMKeyARN:
+    Description: DRM encryption key ARN in Secrets Manager
+    Value: !If [EnableDRMCondition, !Ref DRMEncryptionKey, 'DRM not enabled']
+    Export:
+      Name: !Sub '${AWS::StackName}-DRMKeyARN'
+
+  # Service Role
+  MediaLiveServiceRoleArn:
+    Description: MediaLive service role ARN
+    Value: !GetAtt MediaLiveServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceRoleArn'
+
+  # Platform Features
+  FeaturesEnabled:
+    Description: List of enabled platform features
+    Value: !Sub
+      - 'ABR Streaming, ${DRMStatus}, ${LowLatencyStatus}, ${4KStatus}, ${MonitoringStatus}'
+      - DRMStatus: !If [EnableDRMCondition, 'DRM Protection', 'No DRM']
+        LowLatencyStatus: !If [EnableLowLatencyCondition, 'Low Latency', 'Standard Latency']
+        4KStatus: !If [Enable4KCondition, '4K Support', 'HD Max']
+        MonitoringStatus: !If [EnableMonitoringCondition, 'Monitoring', 'No Monitoring']
+    Export:
+      Name: !Sub '${AWS::StackName}-Features'
+
+  # Deployment Instructions
+  DeploymentInstructions:
+    Description: Next steps to start streaming
+    Value: !Sub |
+      1. Start MediaLive Channel: aws medialive start-channel --channel-id ${MediaLiveChannel}
+      2. Configure encoder to stream to: ${RTMPPrimaryInput.Destinations[0]}/live
+      3. Access streams via CloudFront: https://${StreamingDistribution.DomainName}/out/v1/master.m3u8
+      4. Monitor via CloudWatch dashboard for MediaLive, MediaPackage, and CloudFront metrics

@@ -1,0 +1,943 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Secure Remote Access with AWS Systems Manager Session Manager - Complete Infrastructure Solution'
+
+# ============================================================================
+# METADATA
+# ============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ResourcePrefix
+      - Label:
+          default: "EC2 Instance Configuration"
+        Parameters:
+          - InstanceType
+          - VpcId
+          - SubnetId
+          - LatestAmiId
+          - KeyPairName
+      - Label:
+          default: "Session Manager Configuration"
+        Parameters:
+          - EnableSessionLogging
+          - EnableSessionEncryption
+          - EnablePortForwarding
+          - SessionTimeout
+      - Label:
+          default: "Logging and Monitoring"
+        Parameters:
+          - LogRetentionInDays
+          - EnableCloudTrailLogging
+          - EnableCloudWatchAlarms
+    ParameterLabels:
+      Environment:
+        default: "Environment Name"
+      ResourcePrefix:
+        default: "Resource Naming Prefix"
+      InstanceType:
+        default: "EC2 Instance Type"
+      VpcId:
+        default: "VPC ID"
+      SubnetId:
+        default: "Subnet ID"
+      LatestAmiId:
+        default: "Latest Amazon Linux AMI ID"
+      KeyPairName:
+        default: "EC2 Key Pair (Optional)"
+      EnableSessionLogging:
+        default: "Enable Session Logging"
+      EnableSessionEncryption:
+        default: "Enable Session Encryption"
+      EnablePortForwarding:
+        default: "Enable Port Forwarding"
+      SessionTimeout:
+        default: "Session Timeout (Minutes)"
+      LogRetentionInDays:
+        default: "Log Retention Period (Days)"
+      EnableCloudTrailLogging:
+        default: "Enable CloudTrail Logging"
+      EnableCloudWatchAlarms:
+        default: "Enable CloudWatch Alarms"
+
+# ============================================================================
+# PARAMETERS
+# ============================================================================
+Parameters:
+  # Environment Configuration
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: 'Environment name for resource tagging and configuration'
+
+  ResourcePrefix:
+    Type: String
+    Default: 'session-manager'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+    Description: 'Prefix for all resource names to ensure uniqueness'
+
+  # EC2 Instance Configuration
+  InstanceType:
+    Type: String
+    Default: 't3.micro'
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - m5.large
+      - m5.xlarge
+    Description: 'EC2 instance type for the Session Manager demo instance'
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC ID where resources will be deployed'
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: 'Subnet ID for EC2 instance deployment (private subnet recommended)'
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+    Description: 'Latest Amazon Linux 2 AMI ID from Systems Manager Parameter Store'
+
+  KeyPairName:
+    Type: String
+    Default: ''
+    Description: 'Optional EC2 Key Pair name for emergency access (not required for Session Manager)'
+
+  # Session Manager Configuration
+  EnableSessionLogging:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable comprehensive session logging to CloudWatch and S3'
+
+  EnableSessionEncryption:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable encryption for session data using AWS KMS'
+
+  EnablePortForwarding:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable port forwarding capabilities in Session Manager'
+
+  SessionTimeout:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    MaxValue: 60
+    Description: 'Session timeout in minutes (1-60)'
+
+  # Logging and Monitoring
+  LogRetentionInDays:
+    Type: Number
+    Default: 30
+    AllowedValues:
+      - 1
+      - 3
+      - 5
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+      - 120
+      - 150
+      - 180
+      - 365
+      - 400
+      - 545
+      - 731
+      - 1827
+      - 3653
+    Description: 'CloudWatch log retention period in days'
+
+  EnableCloudTrailLogging:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable CloudTrail logging for Session Manager API calls'
+
+  EnableCloudWatchAlarms:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable CloudWatch alarms for monitoring session activity'
+
+# ============================================================================
+# CONDITIONS
+# ============================================================================
+Conditions:
+  # Configuration Conditions
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  
+  # Feature Conditions
+  EnableLogging: !Equals [!Ref EnableSessionLogging, 'true']
+  EnableEncryption: !Equals [!Ref EnableSessionEncryption, 'true']
+  EnablePortForwardingFeature: !Equals [!Ref EnablePortForwarding, 'true']
+  EnableCloudTrail: !Equals [!Ref EnableCloudTrailLogging, 'true']
+  EnableAlarms: !Equals [!Ref EnableCloudWatchAlarms, 'true']
+  
+  # Combined Conditions
+  EnableS3Logging: !And [!Condition EnableLogging, !Condition IsProduction]
+  EnableKMSEncryption: !And [!Condition EnableEncryption, !Condition IsProduction]
+
+# ============================================================================
+# RESOURCES
+# ============================================================================
+Resources:
+
+  # ============================================================================
+  # IAM ROLES AND POLICIES
+  # ============================================================================
+
+  # KMS Key for Session Manager Encryption
+  SessionManagerKMSKey:
+    Type: AWS::KMS::Key
+    Condition: EnableKMSEncryption
+    Properties:
+      Description: !Sub 'KMS Key for ${ResourcePrefix} Session Manager encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: !Sub '${ResourcePrefix}-session-manager-key-policy'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow Session Manager Service
+            Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-session-manager-key'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Session Manager Encryption'
+
+  # KMS Key Alias
+  SessionManagerKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: EnableKMSEncryption
+    Properties:
+      AliasName: !Sub 'alias/${ResourcePrefix}-session-manager-key'
+      TargetKeyId: !Ref SessionManagerKMSKey
+
+  # IAM Role for EC2 Instance (Session Manager Access)
+  SessionManagerInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-instance-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - !If
+          - EnableEncryption
+          - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+          - !Ref AWS::NoValue
+      Policies:
+        - !If
+          - EnableKMSEncryption
+          - PolicyName: SessionManagerKMSAccess
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                    - kms:GenerateDataKey
+                  Resource: !GetAtt SessionManagerKMSKey.Arn
+          - !Ref AWS::NoValue
+        - !If
+          - EnableLogging
+          - PolicyName: SessionManagerLoggingAccess
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                    - logs:DescribeLogStreams
+                  Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/sessionmanager/*'
+                - !If
+                  - EnableS3Logging
+                  - Effect: Allow
+                    Action:
+                      - s3:PutObject
+                      - s3:GetEncryptionConfiguration
+                    Resource: !Sub '${SessionLogsBucket}/session-logs/*'
+                  - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-instance-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Session Manager EC2 Instance Role'
+
+  # Instance Profile for EC2 Instance
+  SessionManagerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ResourcePrefix}-instance-profile'
+      Roles:
+        - !Ref SessionManagerInstanceRole
+
+  # IAM Policy for Session Manager Users
+  SessionManagerUserPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ResourcePrefix}-user-policy'
+      Description: 'Policy for users to access Session Manager sessions'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow starting sessions on tagged instances
+          - Sid: AllowStartSession
+            Effect: Allow
+            Action:
+              - ssm:StartSession
+            Resource:
+              - !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+            Condition:
+              StringEquals:
+                'ssm:resourceTag/SessionManagerAccess': 'true'
+          # Allow describing instances for Session Manager
+          - Sid: AllowDescribeInstances
+            Effect: Allow
+            Action:
+              - ssm:DescribeInstanceInformation
+              - ssm:DescribeInstanceAssociationsStatus
+              - ssm:GetConnectionStatus
+            Resource: '*'
+          # Allow accessing Session Manager documents
+          - Sid: AllowSessionManagerDocuments
+            Effect: Allow
+            Action:
+              - ssm:DescribeDocumentParameters
+              - ssm:DescribeDocument
+              - ssm:GetDocument
+            Resource: 'arn:aws:ssm:*:*:document/*'
+          # Allow managing own sessions
+          - Sid: AllowManageOwnSessions
+            Effect: Allow
+            Action:
+              - ssm:TerminateSession
+              - ssm:ResumeSession
+            Resource: !Sub 'arn:aws:ssm:*:*:session/${!aws:username}-*'
+          # Port forwarding permissions (conditional)
+          - !If
+            - EnablePortForwardingFeature
+            - Sid: AllowPortForwarding
+              Effect: Allow
+              Action:
+                - ssm:StartSession
+              Resource:
+                - 'arn:aws:ssm:*:*:document/AWS-StartPortForwardingSession'
+                - 'arn:aws:ssm:*:*:document/AWS-StartPortForwardingSessionToRemoteHost'
+            - !Ref AWS::NoValue
+
+  # ============================================================================
+  # SECURITY GROUP
+  # ============================================================================
+
+  # Security Group for EC2 Instance (No inbound rules - Session Manager only)
+  SessionManagerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ResourcePrefix}-sg'
+      GroupDescription: 'Security group for Session Manager demo instance - no inbound access required'
+      VpcId: !Ref VpcId
+      # No ingress rules - Session Manager doesn't require inbound access
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTPS outbound for Systems Manager endpoints'
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTP outbound for package updates'
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: 'DNS TCP'
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: 'DNS UDP'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-security-group'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Session Manager EC2 Security Group'
+
+  # ============================================================================
+  # EC2 INSTANCE
+  # ============================================================================
+
+  # EC2 Instance with Session Manager Configuration
+  SessionManagerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: !Ref SessionManagerInstanceProfile
+      SecurityGroupIds:
+        - !Ref SessionManagerSecurityGroup
+      SubnetId: !Ref SubnetId
+      KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref 'AWS::NoValue']
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          
+          # Install and configure SSM Agent (should be pre-installed on Amazon Linux 2)
+          yum install -y amazon-ssm-agent
+          systemctl enable amazon-ssm-agent
+          systemctl start amazon-ssm-agent
+          
+          # Install CloudWatch Agent if encryption is enabled
+          if [[ "${EnableSessionEncryption}" == "true" ]]; then
+            yum install -y amazon-cloudwatch-agent
+          fi
+          
+          # Create a sample application for testing port forwarding
+          if [[ "${EnablePortForwarding}" == "true" ]]; then
+            yum install -y python3
+            cat > /home/ec2-user/sample_app.py << 'EOF'
+          #!/usr/bin/env python3
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+          import json
+          
+          class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  self.send_response(200)
+                  self.send_header('Content-type', 'application/json')
+                  self.end_headers()
+                  response = {
+                      'message': 'Hello from Session Manager Port Forwarding!',
+                      'path': self.path,
+                      'method': self.command
+                  }
+                  self.wfile.write(json.dumps(response, indent=2).encode())
+          
+          if __name__ == '__main__':
+              server = HTTPServer(('localhost', 8080), SimpleHTTPRequestHandler)
+              print("Server running on port 8080...")
+              server.serve_forever()
+          EOF
+            chmod +x /home/ec2-user/sample_app.py
+            chown ec2-user:ec2-user /home/ec2-user/sample_app.py
+          fi
+          
+          # Signal successful completion
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource SessionManagerInstance --region ${AWS::Region}
+      CreationPolicy:
+        ResourceSignal:
+          Count: 1
+          Timeout: PT10M
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-instance'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Session Manager Demo Instance'
+        - Key: SessionManagerAccess
+          Value: 'true'
+
+  # ============================================================================
+  # S3 BUCKET FOR SESSION LOGS
+  # ============================================================================
+
+  # S3 Bucket for Session Manager Logs (Production only)
+  SessionLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: EnableS3Logging
+    Properties:
+      BucketName: !Sub '${ResourcePrefix}-session-logs-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If
+                - EnableKMSEncryption
+                - aws:kms
+                - AES256
+              KMSMasterKeyID: !If
+                - EnableKMSEncryption
+                - !Ref SessionManagerKMSKey
+                - !Ref AWS::NoValue
+            BucketKeyEnabled: !If [EnableKMSEncryption, true, false]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: SessionLogsLifecycle
+            Status: Enabled
+            ExpirationInDays: !If [IsProduction, 2555, 90] # 7 years for prod, 90 days for dev
+            NoncurrentVersionExpirationInDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref SessionLogsLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-session-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Session Manager Logs Storage'
+
+  # S3 Bucket Policy for Session Manager
+  SessionLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: EnableS3Logging
+    Properties:
+      Bucket: !Ref SessionLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${SessionLogsBucket}/*'
+              - !Ref SessionLogsBucket
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: AllowSessionManagerService
+            Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action:
+              - s3:PutObject
+              - s3:GetEncryptionConfiguration
+            Resource: !Sub '${SessionLogsBucket}/session-logs/*'
+
+  # ============================================================================
+  # CLOUDWATCH LOGS
+  # ============================================================================
+
+  # CloudWatch Log Group for Session Manager
+  SessionLogsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: !Sub '/aws/sessionmanager/${ResourcePrefix}'
+      RetentionInDays: !Ref LogRetentionInDays
+      KmsKeyId: !If
+        - EnableKMSEncryption
+        - !GetAtt SessionManagerKMSKey.Arn
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-session-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Session Manager Logs'
+
+  # ============================================================================
+  # CLOUDTRAIL LOGGING
+  # ============================================================================
+
+  # CloudTrail S3 Bucket for API Logging
+  CloudTrailLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: EnableCloudTrail
+    Properties:
+      BucketName: !Sub '${ResourcePrefix}-cloudtrail-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-cloudtrail-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudTrail S3 Bucket Policy
+  CloudTrailLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: EnableCloudTrail
+    Properties:
+      Bucket: !Ref CloudTrailLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Ref CloudTrailLogsBucket
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CloudTrailLogsBucket}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+
+  # CloudTrail for Session Manager API Logging
+  SessionManagerCloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Condition: EnableCloudTrail
+    Properties:
+      TrailName: !Sub '${ResourcePrefix}-session-manager-trail'
+      S3BucketName: !Ref CloudTrailLogsBucket
+      S3KeyPrefix: 'session-manager-logs/'
+      IncludeGlobalServiceEvents: true
+      IsLogging: true
+      IsMultiRegionTrail: false
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: 'AWS::SSM::ManagedInstanceInventory'
+              Values: 
+                - 'arn:aws:ssm:*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-cloudtrail'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================================
+  # SYSTEMS MANAGER PREFERENCES
+  # ============================================================================
+
+  # Session Manager Preferences (using Custom Resource)
+  SessionManagerPreferences:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: EnableLogging
+    Properties:
+      ServiceToken: !GetAtt SessionManagerPreferencesLambda.Arn
+      SessionManagerPreferences:
+        sessionType: Standard_Stream
+        inputs:
+          s3BucketName: !If
+            - EnableS3Logging
+            - !Ref SessionLogsBucket
+            - !Ref AWS::NoValue
+          s3KeyPrefix: 'session-logs/'
+          s3EncryptionEnabled: !If [EnableKMSEncryption, true, false]
+          cloudWatchLogGroupName: !Ref SessionLogsLogGroup
+          cloudWatchEncryptionEnabled: !If [EnableKMSEncryption, true, false]
+          cloudWatchStreamingEnabled: true
+          kmsKeyId: !If
+            - EnableKMSEncryption
+            - !Ref SessionManagerKMSKey
+            - !Ref AWS::NoValue
+          runAsEnabled: false
+          runAsDefaultUser: 'ssm-user'
+          idleSessionTimeout: !Ref SessionTimeout
+          maxSessionDuration: 60
+          shellProfile:
+            linux: 'cd /home/ssm-user'
+
+  # Lambda Function for Session Manager Preferences Custom Resource
+  SessionManagerPreferencesLambda:
+    Type: AWS::Lambda::Function
+    Condition: EnableLogging
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-preferences-lambda'
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt SessionManagerPreferencesLambdaRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+          
+          def handler(event, context):
+              ssm = boto3.client('ssm')
+              
+              try:
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      preferences = event['ResourceProperties']['SessionManagerPreferences']
+                      
+                      # Create the preferences document
+                      response = ssm.put_preference(
+                          Name='SessionManagerPreferences',
+                          Value=json.dumps(preferences),
+                          Description='Session Manager preferences configured via CloudFormation'
+                      )
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+                  elif event['RequestType'] == 'Delete':
+                      try:
+                          ssm.delete_preference(
+                              Name='SessionManagerPreferences',
+                              PreferenceType='Custom'
+                          )
+                      except ssm.exceptions.PreferenceNotFoundError:
+                          pass  # Preference already deleted
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  # IAM Role for Session Manager Preferences Lambda
+  SessionManagerPreferencesLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: EnableLogging
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SessionManagerPreferencesPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:PutPreference
+                  - ssm:DeletePreference
+                  - ssm:GetPreference
+                Resource: '*'
+
+  # ============================================================================
+  # CLOUDWATCH ALARMS
+  # ============================================================================
+
+  # CloudWatch Alarm for Session Manager Activity
+  SessionManagerActivityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlarms
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-session-activity'
+      AlarmDescription: 'Monitor Session Manager session activity'
+      MetricName: SessionCount
+      Namespace: AWS/SSM
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DocumentName
+          Value: SSM-SessionManagerRunShell
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-session-activity-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Topic for Alerts (Optional)
+  SessionManagerAlertsSnsTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnableAlarms
+    Properties:
+      TopicName: !Sub '${ResourcePrefix}-session-manager-alerts'
+      DisplayName: 'Session Manager Alerts'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-alerts-topic'
+        - Key: Environment
+          Value: !Ref Environment
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+Outputs:
+  # Instance Information
+  InstanceId:
+    Description: 'ID of the EC2 instance configured for Session Manager access'
+    Value: !Ref SessionManagerInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceId'
+
+  InstancePrivateIp:
+    Description: 'Private IP address of the EC2 instance'
+    Value: !GetAtt SessionManagerInstance.PrivateIp
+    Export:
+      Name: !Sub '${AWS::StackName}-InstancePrivateIp'
+
+  InstanceArn:
+    Description: 'ARN of the EC2 instance'
+    Value: !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${SessionManagerInstance}'
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceArn'
+
+  # IAM Resources
+  InstanceRoleArn:
+    Description: 'ARN of the IAM role attached to the EC2 instance'
+    Value: !GetAtt SessionManagerInstanceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceRoleArn'
+
+  UserPolicyArn:
+    Description: 'ARN of the IAM policy for Session Manager users'
+    Value: !Ref SessionManagerUserPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPolicyArn'
+
+  # Security Configuration
+  SecurityGroupId:
+    Description: 'ID of the security group (no inbound rules - Session Manager only)'
+    Value: !Ref SessionManagerSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroupId'
+
+  KMSKeyId:
+    Condition: EnableKMSEncryption
+    Description: 'ID of the KMS key for Session Manager encryption'
+    Value: !Ref SessionManagerKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyId'
+
+  KMSKeyArn:
+    Condition: EnableKMSEncryption
+    Description: 'ARN of the KMS key for Session Manager encryption'
+    Value: !GetAtt SessionManagerKMSKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyArn'
+
+  # Logging Resources
+  CloudWatchLogGroupName:
+    Condition: EnableLogging
+    Description: 'Name of the CloudWatch log group for session logs'
+    Value: !Ref SessionLogsLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupName'
+
+  S3BucketName:
+    Condition: EnableS3Logging
+    Description: 'Name of the S3 bucket for session logs'
+    Value: !Ref SessionLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketName'
+
+  CloudTrailArn:
+    Condition: EnableCloudTrail
+    Description: 'ARN of the CloudTrail for Session Manager API logging'
+    Value: !GetAtt SessionManagerCloudTrail.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrailArn'
+
+  # Session Manager Commands
+  SessionManagerStartCommand:
+    Description: 'AWS CLI command to start a Session Manager session'
+    Value: !Sub 'aws ssm start-session --target ${SessionManagerInstance}'
+
+  SessionManagerPortForwardCommand:
+    Condition: EnablePortForwardingFeature
+    Description: 'AWS CLI command for port forwarding (example for port 8080)'
+    Value: !Sub 'aws ssm start-session --target ${SessionManagerInstance} --document-name AWS-StartPortForwardingSession --parameters "portNumber=8080,localPortNumber=8080"'
+
+  # Monitoring and Alerting
+  CloudWatchAlarmName:
+    Condition: EnableAlarms
+    Description: 'Name of the CloudWatch alarm for session activity monitoring'
+    Value: !Ref SessionManagerActivityAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchAlarmName'
+
+  SNSTopicArn:
+    Condition: EnableAlarms
+    Description: 'ARN of the SNS topic for Session Manager alerts'
+    Value: !Ref SessionManagerAlertsSnsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  # Configuration Summary
+  ConfigurationSummary:
+    Description: 'Summary of Session Manager configuration'
+    Value: !Sub 
+      - 'Environment: ${Environment} | Logging: ${LoggingStatus} | Encryption: ${EncryptionStatus} | Port Forwarding: ${PortForwardingStatus} | CloudTrail: ${CloudTrailStatus}'
+      - LoggingStatus: !If [EnableLogging, 'Enabled', 'Disabled']
+        EncryptionStatus: !If [EnableEncryption, 'Enabled', 'Disabled'] 
+        PortForwardingStatus: !If [EnablePortForwardingFeature, 'Enabled', 'Disabled']
+        CloudTrailStatus: !If [EnableCloudTrail, 'Enabled', 'Disabled']

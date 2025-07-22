@@ -1,0 +1,697 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Data Lake Ingestion Pipelines with Glue - Complete infrastructure for automated ETL pipelines with medallion architecture (Bronze/Silver/Gold layers)'
+
+# ================================
+# PARAMETERS
+# ================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'datalake-pipeline'
+    Description: 'Project name used for resource naming and tagging'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+    
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'test', 'staging', 'prod']
+    Description: 'Environment name for resource tagging and naming'
+    
+  AlertEmail:
+    Type: String
+    Default: 'admin@example.com'
+    Description: 'Email address for CloudWatch alerts and notifications'
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    ConstraintDescription: 'Must be a valid email address'
+    
+  GlueJobWorkerType:
+    Type: String
+    Default: 'G.1X'
+    AllowedValues: ['Standard', 'G.1X', 'G.2X', 'G.025X']
+    Description: 'Glue job worker type for ETL processing'
+    
+  GlueJobMaxCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 2
+    MaxValue: 100
+    Description: 'Maximum number of workers for Glue ETL job'
+    
+  CrawlerSchedule:
+    Type: String
+    Default: 'cron(0 6 * * ? *)'
+    Description: 'Cron expression for crawler schedule (default: daily at 6 AM UTC)'
+    
+  EnableVPCConfiguration:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable VPC configuration for Glue jobs (requires existing VPC)'
+    
+  ExistingVPCId:
+    Type: String
+    Default: ''
+    Description: 'Existing VPC ID for Glue jobs (required if VPC configuration is enabled)'
+    
+  ExistingSubnetIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: 'Comma-delimited list of existing subnet IDs for Glue jobs'
+
+# ================================
+# CONDITIONS
+# ================================
+Conditions:
+  EnableVPC: !Equals [!Ref EnableVPCConfiguration, 'true']
+  HasVPCId: !Not [!Equals [!Ref ExistingVPCId, '']]
+  HasSubnets: !Not [!Equals [!Join ['', !Ref ExistingSubnetIds], '']]
+  VPCConfigurationValid: !And [!Condition EnableVPC, !Condition HasVPCId, !Condition HasSubnets]
+
+# ================================
+# RESOURCES
+# ================================
+Resources:
+
+  # ================================
+  # S3 BUCKET FOR DATA LAKE
+  # ================================
+  DataLakeS3Bucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+              - StorageClass: DEEP_ARCHIVE
+                TransitionInDays: 365
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: 'access-logs/'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-data-lake'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Data Lake Storage'
+
+  # S3 Bucket for Access Logs
+  AccessLogsBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-access-logs-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteAccessLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-access-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
+  # IAM ROLES AND POLICIES
+  # ================================
+  GlueServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-glue-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole'
+      Policies:
+        - PolicyName: GlueDataLakeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetBucketLocation'
+                  - 's3:ListBucket'
+                  - 's3:GetBucketAcl'
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                  - 's3:GetObjectVersion'
+                Resource:
+                  - !Sub '${DataLakeS3Bucket}'
+                  - !Sub '${DataLakeS3Bucket}/*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*'
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-glue-service-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # VPC Security Group for Glue (conditional)
+  GlueSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Condition: VPCConfigurationValid
+    Properties:
+      GroupName: !Sub '${ProjectName}-${Environment}-glue-sg'
+      GroupDescription: 'Security group for AWS Glue jobs'
+      VpcId: !Ref ExistingVPCId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+          Description: 'HTTPS outbound for AWS API calls'
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          SourceSecurityGroupId: !Ref GlueSecurityGroup
+          Description: 'All TCP traffic within security group'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-glue-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
+  # GLUE DATA CATALOG
+  # ================================
+  GlueDatabase:
+    Type: 'AWS::Glue::Database'
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseInput:
+        Name: !Sub '${ProjectName}-${Environment}-catalog'
+        Description: 'Data lake catalog for analytics pipeline'
+        Parameters:
+          'created_by': 'CloudFormation'
+          'project': !Ref ProjectName
+          'environment': !Ref Environment
+
+  # ================================
+  # GLUE CRAWLER
+  # ================================
+  DataLakeCrawler:
+    Type: 'AWS::Glue::Crawler'
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-data-lake-crawler'
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Description: 'Crawler for data lake raw data sources'
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${DataLakeS3Bucket}/raw-data/'
+      TablePrefix: 'raw_'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      RecrawlPolicy:
+        RecrawlBehavior: CRAWL_EVERYTHING
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": { "AddOrUpdateBehavior": "InheritFromTable" }
+          },
+          "Grouping": {
+            "TableGroupingPolicy": "CombineCompatibleSchemas"
+          }
+        }
+      Tags:
+        'Name': !Sub '${ProjectName}-${Environment}-data-lake-crawler'
+        'Environment': !Ref Environment
+        'Project': !Ref ProjectName
+
+  # ================================
+  # GLUE ETL JOB
+  # ================================
+  DataLakeETLJob:
+    Type: 'AWS::Glue::Job'
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-etl-job'
+      Description: 'Data lake ETL pipeline for multi-layer architecture'
+      Role: !GetAtt GlueServiceRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 's3://${DataLakeS3Bucket}/scripts/etl-script.py'
+        PythonVersion: '3'
+      DefaultArguments:
+        '--job-bookmark-option': 'job-bookmark-enable'
+        '--enable-metrics': ''
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--DATABASE_NAME': !Ref GlueDatabase
+        '--S3_BUCKET_NAME': !Ref DataLakeS3Bucket
+        '--extra-py-files': !Sub 's3://${DataLakeS3Bucket}/scripts/modules.zip'
+        '--TempDir': !Sub 's3://${DataLakeS3Bucket}/temp/'
+      MaxRetries: 1
+      Timeout: 60
+      GlueVersion: '3.0'
+      WorkerType: !Ref GlueJobWorkerType
+      NumberOfWorkers: !Ref GlueJobMaxCapacity
+      Connections: !If
+        - VPCConfigurationValid
+        - Connections:
+            - !Ref GlueConnection
+        - !Ref 'AWS::NoValue'
+      Tags:
+        'Name': !Sub '${ProjectName}-${Environment}-etl-job'
+        'Environment': !Ref Environment
+        'Project': !Ref ProjectName
+
+  # Glue Connection for VPC (conditional)
+  GlueConnection:
+    Type: 'AWS::Glue::Connection'
+    Condition: VPCConfigurationValid
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      ConnectionInput:
+        Name: !Sub '${ProjectName}-${Environment}-vpc-connection'
+        Description: 'VPC connection for Glue jobs'
+        ConnectionType: NETWORK
+        PhysicalConnectionRequirements:
+          AvailabilityZone: !Select [0, !GetAZs '']
+          SecurityGroupIdList:
+            - !Ref GlueSecurityGroup
+          SubnetId: !Select [0, !Ref ExistingSubnetIds]
+
+  # ================================
+  # GLUE WORKFLOW
+  # ================================
+  DataLakeWorkflow:
+    Type: 'AWS::Glue::Workflow'
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-workflow'
+      Description: 'Data lake ingestion workflow with crawler and ETL'
+      Tags:
+        'Name': !Sub '${ProjectName}-${Environment}-workflow'
+        'Environment': !Ref Environment
+        'Project': !Ref ProjectName
+
+  # Crawler Trigger (Scheduled)
+  CrawlerScheduleTrigger:
+    Type: 'AWS::Glue::Trigger'
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-crawler-trigger'
+      Type: SCHEDULED
+      Schedule: !Ref CrawlerSchedule
+      WorkflowName: !Ref DataLakeWorkflow
+      Actions:
+        - CrawlerName: !Ref DataLakeCrawler
+      StartOnCreation: true
+      Tags:
+        'Name': !Sub '${ProjectName}-${Environment}-crawler-trigger'
+        'Environment': !Ref Environment
+        'Project': !Ref ProjectName
+
+  # ETL Job Trigger (Conditional on Crawler Success)
+  ETLJobTrigger:
+    Type: 'AWS::Glue::Trigger'
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-etl-trigger'
+      Type: CONDITIONAL
+      Predicate:
+        Conditions:
+          - LogicalOperator: EQUALS
+            CrawlerName: !Ref DataLakeCrawler
+            CrawlState: SUCCEEDED
+      WorkflowName: !Ref DataLakeWorkflow
+      Actions:
+        - JobName: !Ref DataLakeETLJob
+      Tags:
+        'Name': !Sub '${ProjectName}-${Environment}-etl-trigger'
+        'Environment': !Ref Environment
+        'Project': !Ref ProjectName
+
+  # ================================
+  # DATA QUALITY
+  # ================================
+  DataQualityRuleset:
+    Type: 'AWS::Glue::DataQualityRuleset'
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-quality-rules'
+      Description: 'Data quality rules for data lake pipeline'
+      Ruleset: 'Rules = [ColumnCount > 5, IsComplete "user_id", IsComplete "event_type", IsComplete "timestamp", ColumnValues "amount" >= 0]'
+      TargetTable:
+        TableName: 'silver_events'
+        DatabaseName: !Ref GlueDatabase
+      Tags:
+        'Name': !Sub '${ProjectName}-${Environment}-quality-rules'
+        'Environment': !Ref Environment
+        'Project': !Ref ProjectName
+
+  # ================================
+  # CLOUDWATCH MONITORING
+  # ================================
+  S3AccessLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-${Environment}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-s3-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  GlueJobLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws-glue/jobs/${ProjectName}-${Environment}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-glue-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SNS Topic for Alerts
+  AlertTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-alerts'
+      DisplayName: 'Data Lake Pipeline Alerts'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-alerts'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SNS Subscription
+  AlertSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AlertTopic
+      Endpoint: !Ref AlertEmail
+
+  # CloudWatch Alarm for Glue Job Failures
+  GlueJobFailureAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-glue-job-failure'
+      AlarmDescription: 'Alert when Glue ETL job fails'
+      MetricName: 'glue.driver.aggregate.numFailedTasks'
+      Namespace: 'AWS/Glue'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      Dimensions:
+        - Name: JobName
+          Value: !Ref DataLakeETLJob
+        - Name: JobRunId
+          Value: ALL
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-glue-job-failure'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarm for Crawler Failures
+  CrawlerFailureAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-crawler-failure'
+      AlarmDescription: 'Alert when Glue crawler fails'
+      MetricName: 'glue.driver.aggregate.numFailedTasks'
+      Namespace: 'AWS/Glue'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      Dimensions:
+        - Name: CrawlerName
+          Value: !Ref DataLakeCrawler
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-crawler-failure'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarm for High S3 Costs
+  S3CostAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-s3-high-cost'
+      AlarmDescription: 'Alert when S3 storage costs are high'
+      MetricName: 'NumberOfObjects'
+      Namespace: 'AWS/S3'
+      Statistic: Maximum
+      Period: 86400  # 24 hours
+      EvaluationPeriods: 1
+      Threshold: 1000000  # 1 million objects
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      Dimensions:
+        - Name: BucketName
+          Value: !Ref DataLakeS3Bucket
+        - Name: StorageType
+          Value: AllStorageTypes
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-s3-high-cost'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
+  # ATHENA INTEGRATION
+  # ================================
+  AthenaWorkGroup:
+    Type: 'AWS::Athena::WorkGroup'
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-workgroup'
+      Description: 'Workgroup for data lake analytics'
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${DataLakeS3Bucket}/athena-results/'
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetrics: true
+        BytesScannedCutoffPerQuery: 100000000  # 100 MB limit
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-workgroup'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+# ================================
+# OUTPUTS
+# ================================
+Outputs:
+  DataLakeS3BucketName:
+    Description: 'Name of the S3 bucket for data lake storage'
+    Value: !Ref DataLakeS3Bucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataLakeS3Bucket'
+
+  DataLakeS3BucketArn:
+    Description: 'ARN of the S3 bucket for data lake storage'
+    Value: !GetAtt DataLakeS3Bucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataLakeS3BucketArn'
+
+  GlueDatabaseName:
+    Description: 'Name of the Glue database'
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabase'
+
+  GlueServiceRoleArn:
+    Description: 'ARN of the Glue service role'
+    Value: !GetAtt GlueServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueServiceRole'
+
+  CrawlerName:
+    Description: 'Name of the Glue crawler'
+    Value: !Ref DataLakeCrawler
+    Export:
+      Name: !Sub '${AWS::StackName}-Crawler'
+
+  ETLJobName:
+    Description: 'Name of the Glue ETL job'
+    Value: !Ref DataLakeETLJob
+    Export:
+      Name: !Sub '${AWS::StackName}-ETLJob'
+
+  WorkflowName:
+    Description: 'Name of the Glue workflow'
+    Value: !Ref DataLakeWorkflow
+    Export:
+      Name: !Sub '${AWS::StackName}-Workflow'
+
+  AthenaWorkGroupName:
+    Description: 'Name of the Athena workgroup'
+    Value: !Ref AthenaWorkGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaWorkGroup'
+
+  AlertTopicArn:
+    Description: 'ARN of the SNS topic for alerts'
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertTopic'
+
+  DataQualityRulesetName:
+    Description: 'Name of the data quality ruleset'
+    Value: !Ref DataQualityRuleset
+    Export:
+      Name: !Sub '${AWS::StackName}-DataQualityRuleset'
+
+  SampleDataPaths:
+    Description: 'S3 paths for sample data upload'
+    Value: !Sub |
+      Raw Events: s3://${DataLakeS3Bucket}/raw-data/events/
+      Raw Customers: s3://${DataLakeS3Bucket}/raw-data/customers/
+      ETL Scripts: s3://${DataLakeS3Bucket}/scripts/
+      Bronze Layer: s3://${DataLakeS3Bucket}/processed-data/bronze/
+      Silver Layer: s3://${DataLakeS3Bucket}/processed-data/silver/
+      Gold Layer: s3://${DataLakeS3Bucket}/processed-data/gold/
+
+  AthenaQueryLocation:
+    Description: 'S3 location for Athena query results'
+    Value: !Sub 's3://${DataLakeS3Bucket}/athena-results/'
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaQueryLocation'
+
+  GlueConsoleURL:
+    Description: 'URL to access AWS Glue console for this setup'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/glue/home?region=${AWS::Region}#catalog:tab=databases;database=${GlueDatabase}'
+
+  CloudWatchDashboardURL:
+    Description: 'URL to create CloudWatch dashboard for monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:'
+
+  SecurityGroupId:
+    Condition: VPCConfigurationValid
+    Description: 'Security Group ID for Glue jobs (when VPC is enabled)'
+    Value: !Ref GlueSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueSecurityGroup'
+
+# ================================
+# METADATA
+# ================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Project Configuration'
+        Parameters:
+          - ProjectName
+          - Environment
+          - AlertEmail
+      - Label:
+          default: 'Glue Job Configuration'
+        Parameters:
+          - GlueJobWorkerType
+          - GlueJobMaxCapacity
+          - CrawlerSchedule
+      - Label:
+          default: 'VPC Configuration (Optional)'
+        Parameters:
+          - EnableVPCConfiguration
+          - ExistingVPCId
+          - ExistingSubnetIds
+    ParameterLabels:
+      ProjectName:
+        default: 'Project Name'
+      Environment:
+        default: 'Environment'
+      AlertEmail:
+        default: 'Alert Email Address'
+      GlueJobWorkerType:
+        default: 'Glue Worker Type'
+      GlueJobMaxCapacity:
+        default: 'Maximum Workers'
+      CrawlerSchedule:
+        default: 'Crawler Schedule'
+      EnableVPCConfiguration:
+        default: 'Enable VPC Configuration'
+      ExistingVPCId:
+        default: 'Existing VPC ID'
+      ExistingSubnetIds:
+        default: 'Existing Subnet IDs'
+
+  AWS::CloudFormation::Designer:
+    Description: 'Data Lake Ingestion Pipeline with AWS Glue - Medallion Architecture Implementation'

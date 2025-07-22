@@ -1,0 +1,631 @@
+# Google Cloud Infrastructure Manager Configuration
+# Performance Testing Pipelines with Cloud Load Balancing and Cloud Monitoring
+# This configuration deploys a complete automated performance testing infrastructure
+
+metadata:
+  name: performance-testing-pipelines
+  description: "Automated performance testing infrastructure with load balancing and monitoring"
+  labels:
+    environment: "development"
+    application: "performance-testing"
+    managed-by: "infrastructure-manager"
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    
+  region:
+    type: string
+    description: "Primary region for resource deployment"
+    default: "us-central1"
+    
+  zone:
+    type: string
+    description: "Primary zone for compute resources"
+    default: "us-central1-a"
+    
+  environment:
+    type: string
+    description: "Environment identifier (dev, staging, prod)"
+    default: "dev"
+    
+  instance_count:
+    type: number
+    description: "Initial number of application instances"
+    default: 3
+    
+  max_instances:
+    type: number
+    description: "Maximum number of instances for autoscaling"
+    default: 10
+    
+  min_instances:
+    type: number
+    description: "Minimum number of instances for autoscaling"
+    default: 2
+    
+  function_memory:
+    type: string
+    description: "Memory allocation for Cloud Functions"
+    default: "512MB"
+    
+  function_timeout:
+    type: string
+    description: "Timeout for Cloud Functions"
+    default: "540s"
+
+# Resource definitions
+resources:
+  # Service Account for Performance Testing Functions
+  performance_test_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: perf-test-sa-${var.environment}
+      displayName: "Performance Testing Service Account"
+      description: "Service account for automated performance testing pipeline"
+
+  # IAM bindings for service account
+  storage_admin_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/storage.objectAdmin
+      member: serviceAccount:$(ref.performance_test_service_account.email)
+
+  monitoring_writer_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/monitoring.metricWriter
+      member: serviceAccount:$(ref.performance_test_service_account.email)
+
+  logging_writer_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/logging.logWriter
+      member: serviceAccount:$(ref.performance_test_service_account.email)
+
+  # Cloud Storage bucket for test results
+  test_results_bucket:
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${var.project_id}-test-results-${var.environment}
+      location: ${var.region}
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90 # Delete test results after 90 days
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 30 # Move to coldline storage after 30 days
+      labels:
+        environment: ${var.environment}
+        application: performance-testing
+
+  # Instance template for application servers
+  app_instance_template:
+    type: gcp-types/compute-v1:instanceTemplates
+    properties:
+      name: app-template-${var.environment}
+      description: "Instance template for performance testing target application"
+      properties:
+        machineType: e2-medium
+        disks:
+          - deviceName: boot
+            type: PERSISTENT
+            boot: true
+            autoDelete: true
+            initializeParams:
+              sourceImage: projects/debian-cloud/global/images/family/debian-11
+              diskType: pd-standard
+              diskSizeGb: 20
+        networkInterfaces:
+          - network: global/networks/default
+            accessConfigs:
+              - name: External NAT
+                type: ONE_TO_ONE_NAT
+        serviceAccounts:
+          - email: $(ref.performance_test_service_account.email)
+            scopes:
+              - https://www.googleapis.com/auth/monitoring.write
+              - https://www.googleapis.com/auth/logging.write
+        tags:
+          items:
+            - http-server
+            - performance-test-target
+        metadata:
+          items:
+            - key: startup-script
+              value: |
+                #!/bin/bash
+                apt-get update
+                apt-get install -y nginx
+                
+                # Create custom application page
+                cat > /var/www/html/index.html << 'EOF'
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>Performance Test Target Application</title>
+                    <style>
+                        body { font-family: Arial, sans-serif; margin: 40px; }
+                        .container { max-width: 800px; margin: 0 auto; }
+                        .info { background: #f0f0f0; padding: 20px; border-radius: 8px; }
+                        .timestamp { color: #666; font-size: 0.9em; }
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <h1>Performance Testing Target Application</h1>
+                        <div class="info">
+                            <p><strong>Instance:</strong> $(hostname)</p>
+                            <p><strong>Timestamp:</strong> <span class="timestamp">$(date)</span></p>
+                            <p><strong>Status:</strong> Request processed successfully</p>
+                            <p><strong>Environment:</strong> ${var.environment}</p>
+                        </div>
+                        <p>This application is designed for performance testing and load validation.</p>
+                    </div>
+                </body>
+                </html>
+                EOF
+                
+                # Start and enable nginx
+                systemctl enable nginx
+                systemctl start nginx
+                
+                # Configure basic monitoring
+                curl -sSO https://dl.google.com/cloudagents/add-logging-agent-repo.sh
+                sudo bash add-logging-agent-repo.sh --also-install
+      labels:
+        environment: ${var.environment}
+        application: performance-testing
+
+  # Managed instance group for application servers
+  app_instance_group:
+    type: gcp-types/compute-v1:instanceGroupManagers
+    properties:
+      name: app-group-${var.environment}
+      description: "Managed instance group for performance testing target application"
+      zone: ${var.zone}
+      baseInstanceName: app-instance
+      instanceTemplate: $(ref.app_instance_template.selfLink)
+      targetSize: ${var.instance_count}
+      namedPorts:
+        - name: http
+          port: 80
+      autoHealingPolicies:
+        - healthCheck: $(ref.app_health_check.selfLink)
+          initialDelaySec: 300
+      updatePolicy:
+        type: PROACTIVE
+        instanceRedistributionType: PROACTIVE
+        maxSurge:
+          fixed: 2
+        maxUnavailable:
+          fixed: 0
+        minReadySec: 60
+    metadata:
+      dependsOn:
+        - app_instance_template
+        - app_health_check
+
+  # Autoscaler for instance group
+  app_autoscaler:
+    type: gcp-types/compute-v1:autoscalers
+    properties:
+      name: app-autoscaler-${var.environment}
+      description: "Autoscaler for performance testing application instances"
+      zone: ${var.zone}
+      target: $(ref.app_instance_group.selfLink)
+      autoscalingPolicy:
+        minNumReplicas: ${var.min_instances}
+        maxNumReplicas: ${var.max_instances}
+        cpuUtilization:
+          utilizationTarget: 0.7
+        coolDownPeriodSec: 90
+        mode: "ON"
+    metadata:
+      dependsOn:
+        - app_instance_group
+
+  # Firewall rule for load balancer health checks
+  health_check_firewall:
+    type: gcp-types/compute-v1:firewalls
+    properties:
+      name: allow-health-check-${var.environment}
+      description: "Allow health check access to application servers"
+      network: global/networks/default
+      allowed:
+        - IPProtocol: tcp
+          ports:
+            - "80"
+      sourceRanges:
+        - "130.211.0.0/22"  # Google Cloud health check ranges
+        - "35.191.0.0/16"
+      targetTags:
+        - http-server
+      direction: INGRESS
+      priority: 1000
+
+  # HTTP health check for application instances
+  app_health_check:
+    type: gcp-types/compute-v1:httpHealthChecks
+    properties:
+      name: app-health-check-${var.environment}
+      description: "Health check for performance testing application"
+      port: 80
+      requestPath: "/"
+      checkIntervalSec: 10
+      timeoutSec: 5
+      healthyThreshold: 2
+      unhealthyThreshold: 3
+
+  # Backend service for load balancer
+  app_backend_service:
+    type: gcp-types/compute-v1:backendServices
+    properties:
+      name: app-backend-service-${var.environment}
+      description: "Backend service for performance testing application"
+      protocol: HTTP
+      timeoutSec: 30
+      healthChecks:
+        - $(ref.app_health_check.selfLink)
+      backends:
+        - group: $(ref.app_instance_group.instanceGroup)
+          balancingMode: UTILIZATION
+          maxUtilization: 0.8
+          capacityScaler: 1.0
+      loadBalancingScheme: EXTERNAL
+      sessionAffinity: NONE
+      enableCDN: false
+    metadata:
+      dependsOn:
+        - app_instance_group
+        - app_health_check
+
+  # URL map for load balancer
+  app_url_map:
+    type: gcp-types/compute-v1:urlMaps
+    properties:
+      name: app-url-map-${var.environment}
+      description: "URL map for performance testing application"
+      defaultService: $(ref.app_backend_service.selfLink)
+    metadata:
+      dependsOn:
+        - app_backend_service
+
+  # HTTP proxy for load balancer
+  app_http_proxy:
+    type: gcp-types/compute-v1:targetHttpProxies
+    properties:
+      name: app-http-proxy-${var.environment}
+      description: "HTTP proxy for performance testing application"
+      urlMap: $(ref.app_url_map.selfLink)
+    metadata:
+      dependsOn:
+        - app_url_map
+
+  # Global forwarding rule (load balancer frontend)
+  app_forwarding_rule:
+    type: gcp-types/compute-v1:globalForwardingRules
+    properties:
+      name: app-forwarding-rule-${var.environment}
+      description: "Global forwarding rule for performance testing application"
+      target: $(ref.app_http_proxy.selfLink)
+      portRange: "80"
+      IPProtocol: TCP
+      loadBalancingScheme: EXTERNAL
+    metadata:
+      dependsOn:
+        - app_http_proxy
+
+  # Cloud Function for load generation (archive)
+  load_generator_archive:
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: ${var.project_id}-function-source-${var.environment}
+      name: load-generator-source.zip
+      contentType: application/zip
+    metadata:
+      dependsOn:
+        - function_source_bucket
+
+  # Source bucket for Cloud Function
+  function_source_bucket:
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${var.project_id}-function-source-${var.environment}
+      location: ${var.region}
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      labels:
+        environment: ${var.environment}
+        application: performance-testing
+
+  # Cloud Function for load generation
+  load_generator_function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: ${var.region}
+      function: load-generator-${var.environment}
+      description: "Cloud Function for executing performance load tests"
+      runtime: python311
+      availableMemoryMb: 512
+      timeout: ${var.function_timeout}
+      maxInstances: 10
+      entryPoint: load_test_function
+      serviceAccountEmail: $(ref.performance_test_service_account.email)
+      httpsTrigger: {}
+      sourceArchiveUrl: gs://${var.project_id}-function-source-${var.environment}/load-generator-source.zip
+      environmentVariables:
+        PROJECT_ID: ${var.project_id}
+        BUCKET_NAME: $(ref.test_results_bucket.name)
+        ENVIRONMENT: ${var.environment}
+      labels:
+        environment: ${var.environment}
+        application: performance-testing
+    metadata:
+      dependsOn:
+        - performance_test_service_account
+        - test_results_bucket
+        - function_source_bucket
+
+  # Cloud Scheduler job for daily comprehensive tests
+  daily_performance_test:
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      name: daily-perf-test-${var.environment}
+      parent: projects/${var.project_id}/locations/${var.region}
+      description: "Daily comprehensive performance test"
+      schedule: "0 2 * * *"  # Daily at 2:00 AM UTC
+      timeZone: "UTC"
+      httpTarget:
+        uri: $(ref.load_generator_function.httpsTrigger.url)
+        httpMethod: POST
+        headers:
+          Content-Type: application/json
+        body: |
+          {
+            "target_url": "http://$(ref.app_forwarding_rule.IPAddress)",
+            "duration_seconds": 300,
+            "concurrent_users": 20,
+            "requests_per_second": 10,
+            "project_id": "${var.project_id}",
+            "bucket_name": "$(ref.test_results_bucket.name)",
+            "test_type": "daily_comprehensive"
+          }
+      retryConfig:
+        retryCount: 3
+        maxRetryDelay: 3600s
+        minBackoffDelay: 60s
+        maxBackoffDelay: 300s
+        maxDoublings: 3
+    metadata:
+      dependsOn:
+        - load_generator_function
+        - app_forwarding_rule
+
+  # Cloud Scheduler job for hourly light tests
+  hourly_performance_test:
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      name: hourly-perf-test-${var.environment}
+      parent: projects/${var.project_id}/locations/${var.region}
+      description: "Hourly light performance validation"
+      schedule: "0 * * * *"  # Every hour
+      timeZone: "UTC"
+      httpTarget:
+        uri: $(ref.load_generator_function.httpsTrigger.url)
+        httpMethod: POST
+        headers:
+          Content-Type: application/json
+        body: |
+          {
+            "target_url": "http://$(ref.app_forwarding_rule.IPAddress)",
+            "duration_seconds": 60,
+            "concurrent_users": 5,
+            "requests_per_second": 5,
+            "project_id": "${var.project_id}",
+            "bucket_name": "$(ref.test_results_bucket.name)",
+            "test_type": "hourly_validation"
+          }
+      retryConfig:
+        retryCount: 2
+        maxRetryDelay: 1800s
+        minBackoffDelay: 30s
+        maxBackoffDelay: 120s
+        maxDoublings: 2
+    metadata:
+      dependsOn:
+        - load_generator_function
+        - app_forwarding_rule
+
+  # Monitoring dashboard for performance metrics
+  performance_dashboard:
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      displayName: "Performance Testing Dashboard - ${var.environment}"
+      mosaicLayout:
+        tiles:
+          - width: 6
+            height: 4
+            widget:
+              title: "HTTP Load Balancer Request Rate"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="gce_backend_service" resource.label.backend_service_name="app-backend-service-${var.environment}"'
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_RATE
+                          crossSeriesReducer: REDUCE_SUM
+                    plotType: LINE
+                yAxis:
+                  label: "Requests/second"
+                  scale: LINEAR
+          - width: 6
+            height: 4
+            xPos: 6
+            widget:
+              title: "Backend Response Latency"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="gce_backend_service" resource.label.backend_service_name="app-backend-service-${var.environment}"'
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_MEAN
+                          crossSeriesReducer: REDUCE_MEAN
+                    plotType: LINE
+                yAxis:
+                  label: "Latency (ms)"
+                  scale: LINEAR
+          - width: 6
+            height: 4
+            yPos: 4
+            widget:
+              title: "Performance Test Response Time"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'metric.type="custom.googleapis.com/performance_test/response_time"'
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_MEAN
+                    plotType: LINE
+                yAxis:
+                  label: "Response Time (seconds)"
+                  scale: LINEAR
+          - width: 6
+            height: 4
+            xPos: 6
+            yPos: 4
+            widget:
+              title: "Instance Group Size"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="gce_instance_group" resource.label.instance_group_name="app-group-${var.environment}"'
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_MEAN
+                    plotType: LINE
+                yAxis:
+                  label: "Number of Instances"
+                  scale: LINEAR
+
+  # Alert policy for high response times
+  high_response_time_alert:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: "Performance Test - High Response Time (${var.environment})"
+      conditions:
+        - displayName: "Response time exceeds threshold"
+          conditionThreshold:
+            filter: 'metric.type="custom.googleapis.com/performance_test/response_time"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 2.0
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_MEAN
+      alertStrategy:
+        autoClose: 1800s
+      combiner: OR
+      enabled: true
+      notificationChannels: []
+
+  # Alert policy for high error rate
+  high_error_rate_alert:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: "Performance Test - High Error Rate (${var.environment})"
+      conditions:
+        - displayName: "Error rate exceeds 5%"
+          conditionThreshold:
+            filter: 'resource.type="gce_backend_service" resource.label.backend_service_name="app-backend-service-${var.environment}"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 0.05
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_MEAN
+      alertStrategy:
+        autoClose: 1800s
+      combiner: OR
+      enabled: true
+      notificationChannels: []
+
+  # Log sink for performance test results
+  performance_log_sink:
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      name: performance-test-sink-${var.environment}
+      description: "Log sink for performance test execution logs"
+      destination: storage.googleapis.com/$(ref.test_results_bucket.name)
+      filter: 'resource.type="cloud_function" resource.labels.function_name="load-generator-${var.environment}"'
+      uniqueWriterIdentity: true
+    metadata:
+      dependsOn:
+        - test_results_bucket
+        - load_generator_function
+
+# Output values for reference and integration
+outputs:
+  load_balancer_ip:
+    description: "External IP address of the load balancer"
+    value: $(ref.app_forwarding_rule.IPAddress)
+    
+  load_generator_function_url:
+    description: "URL of the load generation Cloud Function"
+    value: $(ref.load_generator_function.httpsTrigger.url)
+    
+  test_results_bucket:
+    description: "Cloud Storage bucket for test results"
+    value: $(ref.test_results_bucket.name)
+    
+  service_account_email:
+    description: "Email of the performance testing service account"
+    value: $(ref.performance_test_service_account.email)
+    
+  dashboard_url:
+    description: "URL to the performance monitoring dashboard"
+    value: https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.performance_dashboard.name)
+    
+  instance_group_url:
+    description: "URL to the managed instance group"
+    value: https://console.cloud.google.com/compute/instanceGroups/details/${var.zone}/app-group-${var.environment}
+    
+  backend_service_url:
+    description: "URL to the backend service configuration"
+    value: https://console.cloud.google.com/net-services/loadbalancing/backends/details/app-backend-service-${var.environment}
+    
+  scheduler_jobs:
+    description: "Information about scheduled performance tests"
+    value:
+      daily_test: "Runs daily at 2:00 AM UTC (comprehensive 5-minute test)"
+      hourly_test: "Runs hourly (light 1-minute validation)"
+      
+  monitoring_links:
+    description: "Links to monitoring and logging resources"
+    value:
+      alerts: "https://console.cloud.google.com/monitoring/alerting/policies"
+      logs: "https://console.cloud.google.com/logs/query"
+      metrics: "https://console.cloud.google.com/monitoring/metrics-explorer"

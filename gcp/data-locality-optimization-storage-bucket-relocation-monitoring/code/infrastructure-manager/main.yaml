@@ -1,0 +1,463 @@
+# Infrastructure Manager Configuration for Data Locality Optimization
+# This configuration deploys Cloud Storage bucket relocation monitoring system
+# with automated optimization based on access patterns
+
+metadata:
+  name: data-locality-optimization
+  description: "Automated data locality optimization system with bucket relocation monitoring"
+  labels:
+    environment: "production"
+    purpose: "data-locality-optimization"
+    managed-by: "infrastructure-manager"
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    
+  primary_region:
+    type: string
+    description: "Primary region for initial bucket placement"
+    default: "us-central1"
+    
+  secondary_region:
+    type: string
+    description: "Secondary region for potential relocation"
+    default: "europe-west1"
+    
+  bucket_name_prefix:
+    type: string
+    description: "Prefix for bucket name (will be suffixed with random value)"
+    default: "data-locality-demo"
+    
+  function_memory:
+    type: string
+    description: "Memory allocation for Cloud Function"
+    default: "512Mi"
+    
+  function_timeout:
+    type: string
+    description: "Timeout for Cloud Function execution"
+    default: "300s"
+    
+  notification_email:
+    type: string
+    description: "Email address for relocation notifications"
+    default: ""
+
+# Required Google Cloud APIs
+resources:
+  # Enable required APIs
+  - name: storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/storage.googleapis.com
+      
+  - name: monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/monitoring.googleapis.com
+      
+  - name: functions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/cloudfunctions.googleapis.com
+      
+  - name: scheduler-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/cloudscheduler.googleapis.com
+      
+  - name: pubsub-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/pubsub.googleapis.com
+      
+  - name: storage-transfer-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/storagetransfer.googleapis.com
+
+  # Generate unique suffix for resource names
+  - name: random-suffix
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: ${var.project_id}
+    metadata:
+      runtimePolicy:
+        - UPDATE_ON_CHANGE
+    
+  # Primary Cloud Storage bucket with monitoring configuration
+  - name: data-locality-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${var.bucket_name_prefix}-${random-suffix.projectNumber}
+      project: ${var.project_id}
+      location: ${var.primary_region}
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      labels:
+        environment: production
+        purpose: data-locality-optimization
+        managed-by: infrastructure-manager
+        initial-region: ${var.primary_region}
+      logging:
+        logBucket: ${var.bucket_name_prefix}-${random-suffix.projectNumber}-logs
+        logObjectPrefix: access-logs/
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90
+              isLive: false
+    depends_on:
+      - storage-api
+
+  # Log bucket for access pattern analysis
+  - name: access-logs-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${var.bucket_name_prefix}-${random-suffix.projectNumber}-logs
+      project: ${var.project_id}
+      location: ${var.primary_region}
+      storageClass: NEARLINE
+      uniformBucketLevelAccess:
+        enabled: true
+      labels:
+        environment: production
+        purpose: access-logs
+        managed-by: infrastructure-manager
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 30
+          - action:
+              type: Delete
+            condition:
+              age: 365
+    depends_on:
+      - storage-api
+
+  # Pub/Sub topic for relocation notifications
+  - name: relocation-notifications-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/${var.project_id}/topics/relocation-alerts-${random-suffix.projectNumber}
+      labels:
+        environment: production
+        purpose: relocation-notifications
+        managed-by: infrastructure-manager
+    depends_on:
+      - pubsub-api
+
+  # Pub/Sub subscription for monitoring
+  - name: relocation-monitoring-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/${var.project_id}/subscriptions/relocation-alerts-${random-suffix.projectNumber}-monitor
+      topic: ${relocation-notifications-topic.name}
+      ackDeadlineSeconds: 60
+      messageRetentionDuration: 604800s  # 7 days
+      labels:
+        environment: production
+        purpose: relocation-monitoring
+        managed-by: infrastructure-manager
+    depends_on:
+      - relocation-notifications-topic
+
+  # Custom metric descriptor for access pattern analysis
+  - name: regional-access-latency-metric
+    type: gcp-types/monitoring-v1:projects.metricDescriptors
+    properties:
+      name: projects/${var.project_id}/metricDescriptors/custom.googleapis.com/storage/regional_access_latency
+      type: custom.googleapis.com/storage/regional_access_latency
+      metricKind: GAUGE
+      valueType: DOUBLE
+      unit: ms
+      description: "Average access latency by region for storage optimization"
+      displayName: "Storage Regional Access Latency"
+      labels:
+        - key: bucket_name
+          valueType: STRING
+          description: "Name of the storage bucket"
+        - key: source_region
+          valueType: STRING
+          description: "Region where the access originates"
+    depends_on:
+      - monitoring-api
+
+  # Service account for Cloud Function
+  - name: bucket-relocator-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: bucket-relocator-${random-suffix.projectNumber}
+      serviceAccount:
+        displayName: "Bucket Relocator Service Account"
+        description: "Service account for automated bucket relocation functions"
+      project: ${var.project_id}
+
+  # IAM binding for Cloud Function service account - Storage Admin
+  - name: function-storage-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/storage.admin
+      member: serviceAccount:${bucket-relocator-service-account.email}
+    depends_on:
+      - bucket-relocator-service-account
+
+  # IAM binding for Cloud Function service account - Monitoring Editor
+  - name: function-monitoring-editor-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/monitoring.editor
+      member: serviceAccount:${bucket-relocator-service-account.email}
+    depends_on:
+      - bucket-relocator-service-account
+
+  # IAM binding for Cloud Function service account - Pub/Sub Publisher
+  - name: function-pubsub-publisher-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/pubsub.publisher
+      member: serviceAccount:${bucket-relocator-service-account.email}
+    depends_on:
+      - bucket-relocator-service-account
+
+  # IAM binding for Cloud Function service account - Storage Transfer Admin
+  - name: function-transfer-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/storagetransfer.admin
+      member: serviceAccount:${bucket-relocator-service-account.email}
+    depends_on:
+      - bucket-relocator-service-account
+
+  # Cloud Function source code bucket
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${var.bucket_name_prefix}-function-source-${random-suffix.projectNumber}
+      project: ${var.project_id}
+      location: ${var.primary_region}
+      storageClass: REGIONAL
+      uniformBucketLevelAccess:
+        enabled: true
+      labels:
+        environment: production
+        purpose: function-source
+        managed-by: infrastructure-manager
+    depends_on:
+      - storage-api
+
+  # Cloud Function for bucket relocation logic
+  - name: bucket-relocator-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      name: projects/${var.project_id}/locations/${var.primary_region}/functions/bucket-relocator-${random-suffix.projectNumber}
+      sourceArchiveUrl: gs://${function-source-bucket.name}/function-source.zip
+      entryPoint: bucket_relocator
+      runtime: python39
+      timeout: ${var.function_timeout}
+      availableMemoryMb: 512
+      serviceAccountEmail: ${bucket-relocator-service-account.email}
+      environmentVariables:
+        GCP_PROJECT: ${var.project_id}
+        BUCKET_NAME: ${data-locality-bucket.name}
+        PUBSUB_TOPIC: relocation-alerts-${random-suffix.projectNumber}
+        PRIMARY_REGION: ${var.primary_region}
+        SECONDARY_REGION: ${var.secondary_region}
+      httpsTrigger: {}
+      labels:
+        environment: production
+        purpose: bucket-relocation
+        managed-by: infrastructure-manager
+    depends_on:
+      - functions-api
+      - bucket-relocator-service-account
+      - function-source-bucket
+      - data-locality-bucket
+      - relocation-notifications-topic
+
+  # Alert policy for high storage access latency
+  - name: storage-latency-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: "Storage Access Latency Alert - ${data-locality-bucket.name}"
+      documentation:
+        content: "Alert triggered when storage access latency exceeds threshold, indicating need for bucket relocation"
+        mimeType: text/markdown
+      conditions:
+        - displayName: "High storage access latency"
+          conditionThreshold:
+            filter: 'resource.type="gcs_bucket" AND resource.label.bucket_name="${data-locality-bucket.name}"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 100.0
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_MEAN
+                groupByFields:
+                  - resource.label.bucket_name
+                  - resource.label.location
+      alertStrategy:
+        notificationRateLimit:
+          period: 300s
+        autoClose: 86400s  # 24 hours
+      enabled: true
+      project: ${var.project_id}
+    depends_on:
+      - monitoring-api
+      - regional-access-latency-metric
+      - data-locality-bucket
+
+  # Cloud Scheduler job for periodic analysis
+  - name: locality-analyzer-scheduler
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      name: projects/${var.project_id}/locations/${var.primary_region}/jobs/locality-analyzer-${random-suffix.projectNumber}
+      description: "Daily data locality analysis and optimization trigger"
+      schedule: "0 2 * * *"  # Daily at 2 AM
+      timeZone: "America/New_York"
+      httpTarget:
+        uri: ${bucket-relocator-function.httpsTrigger.url}
+        httpMethod: GET
+        oidcToken:
+          serviceAccountEmail: ${bucket-relocator-service-account.email}
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 300s
+        minBackoffDuration: 5s
+        maxBackoffDuration: 60s
+        maxDoublings: 3
+    depends_on:
+      - scheduler-api
+      - bucket-relocator-function
+      - bucket-relocator-service-account
+
+  # Notification channel for email alerts (if email provided)
+  - name: email-notification-channel
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      type: email
+      displayName: "Bucket Relocation Alerts"
+      description: "Email notifications for bucket relocation events"
+      labels:
+        email_address: ${var.notification_email}
+      enabled: true
+      project: ${var.project_id}
+    condition: ${var.notification_email != ""}
+    depends_on:
+      - monitoring-api
+
+  # Update alert policy with notification channel
+  - name: storage-latency-alert-policy-with-notification
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      name: ${storage-latency-alert-policy.name}
+      displayName: "Storage Access Latency Alert - ${data-locality-bucket.name}"
+      documentation:
+        content: "Alert triggered when storage access latency exceeds threshold, indicating need for bucket relocation"
+        mimeType: text/markdown
+      conditions:
+        - displayName: "High storage access latency"
+          conditionThreshold:
+            filter: 'resource.type="gcs_bucket" AND resource.label.bucket_name="${data-locality-bucket.name}"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 100.0
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_MEAN
+                groupByFields:
+                  - resource.label.bucket_name
+                  - resource.label.location
+      notificationChannels:
+        - ${email-notification-channel.name}
+      alertStrategy:
+        notificationRateLimit:
+          period: 300s
+        autoClose: 86400s  # 24 hours
+      enabled: true
+      project: ${var.project_id}
+    condition: ${var.notification_email != ""}
+    depends_on:
+      - storage-latency-alert-policy
+      - email-notification-channel
+
+# Output values for verification and integration
+outputs:
+  bucket_name:
+    description: "Name of the primary data storage bucket"
+    value: ${data-locality-bucket.name}
+    
+  bucket_location:
+    description: "Current location of the primary storage bucket"
+    value: ${data-locality-bucket.location}
+    
+  logs_bucket_name:
+    description: "Name of the access logs storage bucket"
+    value: ${access-logs-bucket.name}
+    
+  function_url:
+    description: "HTTPS trigger URL for the bucket relocator function"
+    value: ${bucket-relocator-function.httpsTrigger.url}
+    
+  function_name:
+    description: "Name of the Cloud Function for bucket relocation"
+    value: ${bucket-relocator-function.name}
+    
+  pubsub_topic:
+    description: "Pub/Sub topic for relocation notifications"
+    value: ${relocation-notifications-topic.name}
+    
+  subscription_name:
+    description: "Pub/Sub subscription for monitoring relocation events"
+    value: ${relocation-monitoring-subscription.name}
+    
+  scheduler_job_name:
+    description: "Cloud Scheduler job for periodic analysis"
+    value: ${locality-analyzer-scheduler.name}
+    
+  service_account_email:
+    description: "Service account email for the bucket relocator function"
+    value: ${bucket-relocator-service-account.email}
+    
+  alert_policy_name:
+    description: "Name of the storage latency alert policy"
+    value: ${storage-latency-alert-policy.name}
+    
+  custom_metric_type:
+    description: "Type of the custom metric for regional access latency"
+    value: ${regional-access-latency-metric.type}
+    
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${var.project_id}
+    
+  primary_region:
+    description: "Primary region for bucket placement"
+    value: ${var.primary_region}
+    
+  secondary_region:
+    description: "Secondary region for potential relocation"
+    value: ${var.secondary_region}
+
+# Deployment metadata
+deployment:
+  preview: false
+  createPolicy: CREATE_OR_ACQUIRE
+  deletePolicy: DELETE

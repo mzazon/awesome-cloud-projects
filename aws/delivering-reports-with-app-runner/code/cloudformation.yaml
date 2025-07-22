@@ -1,0 +1,592 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure for Delivering Scheduled Reports with App Runner and SES - A serverless email reporting system using AWS App Runner, Amazon SES, and EventBridge Scheduler'
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'email-reports'
+    Description: 'Project name used as prefix for all resources'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment for deployment'
+
+  GitHubRepositoryUrl:
+    Type: String
+    Description: 'GitHub repository URL for the App Runner service (e.g., https://github.com/username/email-reports-app)'
+    AllowedPattern: '^https://github\.com/[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$'
+    ConstraintDescription: 'Must be a valid GitHub repository URL'
+
+  GitHubBranch:
+    Type: String
+    Default: 'main'
+    Description: 'GitHub branch to deploy from'
+    AllowedPattern: '^[a-zA-Z0-9_.-]+$'
+
+  SenderEmailAddress:
+    Type: String
+    Description: 'Verified email address for sending reports (must be verified in SES)'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  RecipientEmailAddress:
+    Type: String
+    Description: 'Email address to receive reports'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  AppRunnerCpu:
+    Type: String
+    Default: '0.25 vCPU'
+    AllowedValues: ['0.25 vCPU', '0.5 vCPU', '1 vCPU', '2 vCPU', '4 vCPU']
+    Description: 'CPU allocation for App Runner service'
+
+  AppRunnerMemory:
+    Type: String
+    Default: '0.5 GB'
+    AllowedValues: ['0.5 GB', '1 GB', '2 GB', '3 GB', '4 GB', '6 GB', '8 GB', '10 GB', '12 GB']
+    Description: 'Memory allocation for App Runner service'
+
+  ScheduleExpression:
+    Type: String
+    Default: 'cron(0 9 * * ? *)'
+    Description: 'EventBridge Scheduler cron expression for report generation (default: daily at 9 AM UTC)'
+    AllowedPattern: '^(rate|cron)\([^)]+\)$'
+    ConstraintDescription: 'Must be a valid EventBridge schedule expression'
+
+  EnableAutoDeployment:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable automatic deployments from GitHub repository'
+
+  EnableCloudWatchDashboard:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Create CloudWatch dashboard for monitoring'
+
+  AlertingEmailAddress:
+    Type: String
+    Default: ''
+    Description: 'Email address for CloudWatch alarms (optional)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  CreateSNSForAlerting: !Not [!Equals [!Ref AlertingEmailAddress, '']]
+  CreateCloudWatchDashboard: !Equals [!Ref EnableCloudWatchDashboard, 'true']
+  EnableAutoDeployments: !Equals [!Ref EnableAutoDeployment, 'true']
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # -------------------------------------------------------------------------
+  # IAM ROLES AND POLICIES
+  # -------------------------------------------------------------------------
+  
+  # IAM Role for App Runner Service
+  AppRunnerInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-apprunner-instance-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: tasks.apprunner.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Policies:
+        - PolicyName: EmailReportsServicePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                  - ses:GetSendQuota
+                  - ses:GetSendStatistics
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:GetMetricStatistics
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-apprunner-instance-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for App Runner Access (for GitHub integration)
+  AppRunnerAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-apprunner-access-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: build.apprunner.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-apprunner-access-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for EventBridge Scheduler
+  EventBridgeSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-scheduler-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: HttpInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:InvokeFunction
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-scheduler-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # -------------------------------------------------------------------------
+  # APP RUNNER SERVICE
+  # -------------------------------------------------------------------------
+  
+  EmailReportsAppRunnerService:
+    Type: AWS::AppRunner::Service
+    Properties:
+      ServiceName: !Sub '${ProjectName}-${Environment}-service'
+      SourceConfiguration:
+        CodeRepository:
+          RepositoryUrl: !Ref GitHubRepositoryUrl
+          SourceCodeVersion:
+            Type: BRANCH
+            Value: !Ref GitHubBranch
+          CodeConfiguration:
+            ConfigurationSource: REPOSITORY
+            CodeConfigurationValues:
+              Runtime: PYTHON_3
+              BuildCommand: 'pip install -r requirements.txt'
+              StartCommand: 'python app.py'
+              RuntimeEnvironmentVariables:
+                - Name: SES_VERIFIED_EMAIL
+                  Value: !Ref SenderEmailAddress
+                - Name: RECIPIENT_EMAIL
+                  Value: !Ref RecipientEmailAddress
+                - Name: AWS_DEFAULT_REGION
+                  Value: !Ref AWS::Region
+        AutoDeploymentsEnabled: !If [EnableAutoDeployments, true, false]
+        ImageRepository:
+          ImageIdentifier: !Sub 'public.ecr.aws/aws-containers/hello-app-runner:latest'
+          ImageConfiguration:
+            Port: '8000'
+          ImageRepositoryType: ECR_PUBLIC
+      InstanceConfiguration:
+        Cpu: !Ref AppRunnerCpu
+        Memory: !Ref AppRunnerMemory
+        InstanceRoleArn: !GetAtt AppRunnerInstanceRole.Arn
+      HealthCheckConfiguration:
+        Protocol: HTTP
+        Path: '/health'
+        Interval: 10
+        Timeout: 5
+        HealthyThreshold: 1
+        UnhealthyThreshold: 5
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-apprunner-service'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # -------------------------------------------------------------------------
+  # EVENTBRIDGE SCHEDULER
+  # -------------------------------------------------------------------------
+  
+  DailyReportSchedule:
+    Type: AWS::Scheduler::Schedule
+    DependsOn: EmailReportsAppRunnerService
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-daily-reports'
+      Description: 'Scheduled email report generation'
+      State: ENABLED
+      ScheduleExpression: !Ref ScheduleExpression
+      ScheduleExpressionTimezone: 'UTC'
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: 'arn:aws:scheduler:::http-invoke'
+        RoleArn: !GetAtt EventBridgeSchedulerRole.Arn
+        HttpParameters:
+          HttpMethod: POST
+          Url: !Sub
+            - 'https://${ServiceUrl}/generate-report'
+            - ServiceUrl: !GetAtt EmailReportsAppRunnerService.ServiceUrl
+          HeaderParameters:
+            Content-Type: 'application/json'
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAge: 86400
+
+  # -------------------------------------------------------------------------
+  # CLOUDWATCH MONITORING
+  # -------------------------------------------------------------------------
+  
+  # SNS Topic for Alerts (conditional)
+  AlertingTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSNSForAlerting
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-alerts'
+      DisplayName: 'Email Reports Alerts'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-alerts'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SNS Subscription for Email Alerts
+  AlertingEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateSNSForAlerting
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AlertingTopic
+      Endpoint: !Ref AlertingEmailAddress
+
+  # CloudWatch Alarm for App Runner Service Health
+  AppRunnerHealthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-apprunner-health'
+      AlarmDescription: 'App Runner service health check failures'
+      MetricName: 2xxStatusCount
+      Namespace: AWS/AppRunner
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      Dimensions:
+        - Name: ServiceName
+          Value: !Sub '${ProjectName}-${Environment}-service'
+      AlarmActions: !If
+        - CreateSNSForAlerting
+        - [!Ref AlertingTopic]
+        - []
+      OKActions: !If
+        - CreateSNSForAlerting
+        - [!Ref AlertingTopic]
+        - []
+
+  # CloudWatch Alarm for Custom Metrics (Report Generation Failures)
+  ReportGenerationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-report-failures'
+      AlarmDescription: 'Email report generation failures detected'
+      MetricName: ReportsGenerated
+      Namespace: EmailReports
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - CreateSNSForAlerting
+        - [!Ref AlertingTopic]
+        - []
+
+  # CloudWatch Dashboard (conditional)
+  EmailReportsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateCloudWatchDashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/AppRunner", "RequestCount", "ServiceName", "${ProjectName}-${Environment}-service"],
+                  [".", "2xxStatusCount", ".", "."],
+                  [".", "4xxStatusCount", ".", "."],
+                  [".", "5xxStatusCount", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "App Runner Request Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/AppRunner", "ResponseTime", "ServiceName", "${ProjectName}-${Environment}-service"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "App Runner Response Time"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["EmailReports", "ReportsGenerated"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Email Reports Generated"
+              }
+            },
+            {
+              "type": "log",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/apprunner/${ProjectName}-${Environment}-service' | fields @timestamp, @message | filter @message like /Report sent successfully/ | sort @timestamp desc | limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Successful Reports"
+              }
+            }
+          ]
+        }
+
+  # -------------------------------------------------------------------------
+  # SES CONFIGURATION
+  # -------------------------------------------------------------------------
+  
+  # SES Configuration Set for tracking
+  SESConfigurationSet:
+    Type: AWS::SES::ConfigurationSet
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-config-set'
+      ReputationOptions:
+        ReputationMetricsEnabled: true
+      DeliveryOptions:
+        TlsPolicy: Require
+      SuppressionOptions:
+        SuppressedReasons:
+          - BOUNCE
+          - COMPLAINT
+
+  # SES Event Destination for CloudWatch
+  SESEventDestination:
+    Type: AWS::SES::ConfigurationSetEventDestination
+    Properties:
+      ConfigurationSetName: !Ref SESConfigurationSet
+      EventDestination:
+        Name: cloudwatch-destination
+        Enabled: true
+        MatchingEventTypes:
+          - send
+          - bounce
+          - complaint
+          - delivery
+        CloudWatchDestination:
+          DimensionConfigurations:
+            - DimensionName: MessageTag
+              DimensionValueSource: messageTag
+              DefaultDimensionValue: default
+            - DimensionName: EmailAddress
+              DimensionValueSource: emailAddress
+              DefaultDimensionValue: default
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  AppRunnerServiceUrl:
+    Description: 'URL of the App Runner service'
+    Value: !Sub 'https://${EmailReportsAppRunnerService.ServiceUrl}'
+    Export:
+      Name: !Sub '${AWS::StackName}-AppRunnerServiceUrl'
+
+  AppRunnerServiceArn:
+    Description: 'ARN of the App Runner service'
+    Value: !Ref EmailReportsAppRunnerService
+    Export:
+      Name: !Sub '${AWS::StackName}-AppRunnerServiceArn'
+
+  ScheduleName:
+    Description: 'Name of the EventBridge Schedule'
+    Value: !Ref DailyReportSchedule
+    Export:
+      Name: !Sub '${AWS::StackName}-ScheduleName'
+
+  SESConfigurationSetName:
+    Description: 'Name of the SES Configuration Set'
+    Value: !Ref SESConfigurationSet
+    Export:
+      Name: !Sub '${AWS::StackName}-SESConfigurationSet'
+
+  CloudWatchDashboardUrl:
+    Condition: CreateCloudWatchDashboard
+    Description: 'URL to the CloudWatch Dashboard'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-dashboard'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardUrl'
+
+  AppRunnerInstanceRoleArn:
+    Description: 'ARN of the App Runner instance role'
+    Value: !GetAtt AppRunnerInstanceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceRoleArn'
+
+  EventBridgeSchedulerRoleArn:
+    Description: 'ARN of the EventBridge Scheduler role'
+    Value: !GetAtt EventBridgeSchedulerRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SchedulerRoleArn'
+
+  AlertingTopicArn:
+    Condition: CreateSNSForAlerting
+    Description: 'ARN of the SNS topic for alerts'
+    Value: !Ref AlertingTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertingTopicArn'
+
+  ManualTriggerCommand:
+    Description: 'CLI command to manually trigger report generation'
+    Value: !Sub 'curl -X POST https://${EmailReportsAppRunnerService.ServiceUrl}/generate-report -H "Content-Type: application/json" -d "{}"'
+
+  DeploymentInstructions:
+    Description: 'Next steps for deployment'
+    Value: !Sub |
+      1. Verify your email address in SES: aws ses verify-email-identity --email-address ${SenderEmailAddress}
+      2. Push your application code to: ${GitHubRepositoryUrl}
+      3. Test the service: curl https://${EmailReportsAppRunnerService.ServiceUrl}/health
+      4. Monitor logs: aws logs describe-log-groups --log-group-name-prefix /aws/apprunner/${ProjectName}-${Environment}-service
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Project Configuration'
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: 'App Runner Configuration'
+        Parameters:
+          - GitHubRepositoryUrl
+          - GitHubBranch
+          - AppRunnerCpu
+          - AppRunnerMemory
+          - EnableAutoDeployment
+      - Label:
+          default: 'Email Configuration'
+        Parameters:
+          - SenderEmailAddress
+          - RecipientEmailAddress
+      - Label:
+          default: 'Scheduling Configuration'
+        Parameters:
+          - ScheduleExpression
+      - Label:
+          default: 'Monitoring Configuration'
+        Parameters:
+          - EnableCloudWatchDashboard
+          - AlertingEmailAddress
+    ParameterLabels:
+      ProjectName:
+        default: 'Project Name'
+      Environment:
+        default: 'Environment'
+      GitHubRepositoryUrl:
+        default: 'GitHub Repository URL'
+      GitHubBranch:
+        default: 'GitHub Branch'
+      SenderEmailAddress:
+        default: 'Sender Email Address'
+      RecipientEmailAddress:
+        default: 'Recipient Email Address'
+      AppRunnerCpu:
+        default: 'App Runner CPU'
+      AppRunnerMemory:
+        default: 'App Runner Memory'
+      ScheduleExpression:
+        default: 'Schedule Expression'
+      EnableAutoDeployment:
+        default: 'Enable Auto Deployment'
+      EnableCloudWatchDashboard:
+        default: 'Enable CloudWatch Dashboard'
+      AlertingEmailAddress:
+        default: 'Alerting Email Address'
+
+  AWS::CloudFormation::Designer:
+    # Visual designer metadata for AWS Console
+    EmailReportsAppRunnerService:
+      id: apprunner-service
+      source: 'AWS::AppRunner::Service'
+    DailyReportSchedule:
+      id: eventbridge-schedule
+      source: 'AWS::Scheduler::Schedule'
+    AppRunnerInstanceRole:
+      id: instance-role
+      source: 'AWS::IAM::Role'

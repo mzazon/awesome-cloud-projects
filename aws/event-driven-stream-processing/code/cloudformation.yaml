@@ -1,0 +1,748 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Real-Time Data Processing Pipeline with Amazon Kinesis and Lambda - Complete infrastructure for processing streaming retail events with DynamoDB storage and CloudWatch monitoring'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Stream Configuration"
+        Parameters:
+          - StreamName
+          - ShardCount
+          - RetentionPeriod
+      - Label:
+          default: "Processing Configuration"
+        Parameters:
+          - LambdaFunctionName
+          - LambdaMemorySize
+          - LambdaTimeout
+          - BatchSize
+          - MaximumBatchingWindow
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - DynamoDBTableName
+          - BillingMode
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableAlarms
+          - AlarmEmail
+          - ErrorThreshold
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+    ParameterLabels:
+      StreamName:
+        default: "Kinesis Stream Name"
+      ShardCount:
+        default: "Number of Shards"
+      RetentionPeriod:
+        default: "Data Retention Period (hours)"
+      LambdaFunctionName:
+        default: "Lambda Function Name"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      BatchSize:
+        default: "Lambda Batch Size"
+      MaximumBatchingWindow:
+        default: "Maximum Batching Window (seconds)"
+      DynamoDBTableName:
+        default: "DynamoDB Table Name"
+      BillingMode:
+        default: "DynamoDB Billing Mode"
+      EnableAlarms:
+        default: "Enable CloudWatch Alarms"
+      AlarmEmail:
+        default: "Email for Alarm Notifications"
+      ErrorThreshold:
+        default: "Error Threshold for Alarms"
+      Environment:
+        default: "Environment"
+      ProjectName:
+        default: "Project Name"
+
+# Input Parameters
+Parameters:
+  # Stream Configuration
+  StreamName:
+    Type: String
+    Default: retail-events-stream
+    Description: Name for the Kinesis Data Stream
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: '^[a-zA-Z0-9_.-]+$'
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, underscores, and periods
+
+  ShardCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: Number of shards for the Kinesis stream (1 shard = 1MB/sec write, 2MB/sec read)
+
+  RetentionPeriod:
+    Type: Number
+    Default: 24
+    MinValue: 24
+    MaxValue: 8760
+    Description: Data retention period in hours (24 hours to 365 days)
+
+  # Processing Configuration
+  LambdaFunctionName:
+    Type: String
+    Default: retail-event-processor
+    Description: Name for the Lambda function
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z0-9_-]+$'
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, and underscores
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+    Description: Amount of memory available to Lambda function (MB)
+
+  LambdaTimeout:
+    Type: Number
+    Default: 120
+    MinValue: 30
+    MaxValue: 900
+    Description: Lambda function timeout in seconds
+
+  BatchSize:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 10000
+    Description: Number of records to process in each Lambda invocation
+
+  MaximumBatchingWindow:
+    Type: Number
+    Default: 5
+    MinValue: 0
+    MaxValue: 300
+    Description: Maximum time to wait for collecting records before invoking Lambda (seconds)
+
+  # Storage Configuration
+  DynamoDBTableName:
+    Type: String
+    Default: retail-events-data
+    Description: Name for the DynamoDB table
+    MinLength: 3
+    MaxLength: 255
+    AllowedPattern: '^[a-zA-Z0-9_.-]+$'
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, underscores, and periods
+
+  BillingMode:
+    Type: String
+    Default: PAY_PER_REQUEST
+    AllowedValues: [PAY_PER_REQUEST, PROVISIONED]
+    Description: DynamoDB billing mode
+
+  # Monitoring Configuration
+  EnableAlarms:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable CloudWatch alarms for monitoring
+
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: Email address for alarm notifications (optional)
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address or empty
+
+  ErrorThreshold:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 1000
+    Description: Number of failed events to trigger alarm
+
+  # General Configuration
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, staging, prod]
+    Description: Environment name for resource tagging
+
+  ProjectName:
+    Type: String
+    Default: retail-analytics
+    Description: Project name for resource tagging
+    MinLength: 1
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z0-9_-]+$'
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, and underscores
+
+# Conditional Resources
+Conditions:
+  CreateAlarms: !Equals [!Ref EnableAlarms, 'true']
+  CreateSNSNotifications: !And
+    - !Condition CreateAlarms
+    - !Not [!Equals [!Ref AlarmEmail, '']]
+  IsProvisionedBilling: !Equals [!Ref BillingMode, 'PROVISIONED']
+
+# Template Resources
+Resources:
+  # Kinesis Data Stream
+  KinesisDataStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${StreamName}-${Environment}'
+      ShardCount: !Ref ShardCount
+      RetentionPeriodHours: !Ref RetentionPeriod
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+      Tags:
+        - Key: Name
+          Value: !Sub '${StreamName}-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Real-time event streaming
+
+  # DynamoDB Table for Processed Events
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${DynamoDBTableName}-${Environment}'
+      BillingMode: !Ref BillingMode
+      # Define the schema for retail events
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: eventTimestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: eventTimestamp
+          KeyType: RANGE
+      # Conditional provisioned throughput for PROVISIONED billing mode
+      ProvisionedThroughput: !If
+        - IsProvisionedBilling
+        - ReadCapacityUnits: 5
+          WriteCapacityUnits: 5
+        - !Ref AWS::NoValue
+      # Enable point-in-time recovery for data protection
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      # Server-side encryption
+      SSESpecification:
+        SSEEnabled: true
+        KMSMasterKeyId: alias/aws/dynamodb
+      # TTL configuration (optional - records expire after 30 days)
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${DynamoDBTableName}-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Processed event storage
+
+  # SQS Dead Letter Queue for Failed Processing
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'failed-events-dlq-${Environment}'
+      # Retain messages for 14 days for investigation
+      MessageRetentionPeriod: 1209600
+      VisibilityTimeout: 30
+      # Enable server-side encryption
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Name
+          Value: !Sub 'failed-events-dlq-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Dead letter queue for failed events
+
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${LambdaFunctionName}-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Basic Lambda execution permissions
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: KinesisStreamAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:ListShards
+                  - kinesis:ListStreams
+                Resource: !GetAtt KinesisDataStream.Arn
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt DynamoDBTable.Arn
+        - PolicyName: SQSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+        - PolicyName: CloudWatchMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${LambdaFunctionName}-execution-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda Function for Stream Processing
+  StreamProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${LambdaFunctionName}-${Environment}'
+      Runtime: python3.8
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      # Enable AWS X-Ray tracing for monitoring
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref DynamoDBTable
+          DLQ_URL: !Ref DeadLetterQueue
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import base64
+          import boto3
+          import time
+          import os
+          import uuid
+          from datetime import datetime
+
+          # Initialize AWS clients
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['DYNAMODB_TABLE'])
+          cloudwatch = boto3.client('cloudwatch')
+          sqs = boto3.client('sqs')
+
+          def process_event(event_data):
+              """Process a single event and return results"""
+              try:
+                  # Extract required fields with defaults
+                  user_id = event_data.get('userId', 'unknown')
+                  event_type = event_data.get('eventType', 'unknown')
+                  product_id = event_data.get('productId', 'unknown')
+                  timestamp = int(event_data.get('timestamp', int(time.time() * 1000)))
+                  
+                  # Business logic based on event type
+                  if event_type == 'view':
+                      action = 'viewed'
+                      event_score = 1
+                  elif event_type == 'add_to_cart':
+                      action = 'added to cart'
+                      event_score = 5
+                  elif event_type == 'purchase':
+                      action = 'purchased'
+                      event_score = 10
+                  else:
+                      action = 'interacted with'
+                      event_score = 1
+                  
+                  # Generate insight
+                  insight = f"User {user_id} {action} product {product_id}"
+                  
+                  # Calculate TTL (30 days from now)
+                  ttl = int(time.time()) + (30 * 24 * 60 * 60)
+                  
+                  # Prepare processed data
+                  processed_data = {
+                      'userId': user_id,
+                      'eventTimestamp': timestamp,
+                      'eventType': event_type,
+                      'productId': product_id,
+                      'eventScore': event_score,
+                      'insight': insight,
+                      'processedAt': int(time.time() * 1000),
+                      'recordId': str(uuid.uuid4()),
+                      'ttl': ttl
+                  }
+                  
+                  return processed_data
+              except Exception as e:
+                  print(f"Error processing event data: {str(e)}")
+                  raise
+
+          def lambda_handler(event, context):
+              """Process records from Kinesis stream"""
+              processed_count = 0
+              failed_count = 0
+              
+              print(f"Processing batch of {len(event['Records'])} records")
+              
+              # Process each record in the batch
+              for record in event['Records']:
+                  try:
+                      # Decode Kinesis data (base64 encoded)
+                      payload = base64.b64decode(record['kinesis']['data']).decode('utf-8')
+                      event_data = json.loads(payload)
+                      
+                      # Process the event
+                      processed_data = process_event(event_data)
+                      
+                      # Store result in DynamoDB
+                      table.put_item(Item=processed_data)
+                      
+                      processed_count += 1
+                      
+                  except Exception as e:
+                      failed_count += 1
+                      error_msg = f"Error processing record: {str(e)}"
+                      print(error_msg)
+                      
+                      # Send failed record to DLQ
+                      try:
+                          sqs.send_message(
+                              QueueUrl=os.environ['DLQ_URL'],
+                              MessageBody=json.dumps({
+                                  'error': str(e),
+                                  'record': record['kinesis']['data'],
+                                  'timestamp': datetime.utcnow().isoformat(),
+                                  'functionName': context.function_name,
+                                  'requestId': context.aws_request_id
+                              })
+                          )
+                      except Exception as dlq_error:
+                          print(f"Error sending to DLQ: {str(dlq_error)}")
+              
+              # Publish custom metrics to CloudWatch
+              try:
+                  cloudwatch.put_metric_data(
+                      Namespace='RetailEventProcessing',
+                      MetricData=[
+                          {
+                              'MetricName': 'ProcessedEvents',
+                              'Value': processed_count,
+                              'Unit': 'Count',
+                              'Dimensions': [
+                                  {
+                                      'Name': 'Environment',
+                                      'Value': os.environ.get('ENVIRONMENT', 'unknown')
+                                  }
+                              ]
+                          },
+                          {
+                              'MetricName': 'FailedEvents',
+                              'Value': failed_count,
+                              'Unit': 'Count',
+                              'Dimensions': [
+                                  {
+                                      'Name': 'Environment',
+                                      'Value': os.environ.get('ENVIRONMENT', 'unknown')
+                                  }
+                              ]
+                          }
+                      ]
+                  )
+              except Exception as metric_error:
+                  print(f"Error publishing metrics: {str(metric_error)}")
+              
+              # Log processing summary
+              print(f"Batch processing complete: {processed_count} processed, {failed_count} failed")
+              
+              # Return processing summary
+              return {
+                  'statusCode': 200,
+                  'processed': processed_count,
+                  'failed': failed_count,
+                  'total': processed_count + failed_count
+              }
+      Tags:
+        - Key: Name
+          Value: !Sub '${LambdaFunctionName}-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Stream processing function
+
+  # Event Source Mapping for Kinesis to Lambda
+  KinesisEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt KinesisDataStream.Arn
+      FunctionName: !Ref StreamProcessorFunction
+      BatchSize: !Ref BatchSize
+      MaximumBatchingWindowInSeconds: !Ref MaximumBatchingWindow
+      StartingPosition: LATEST
+      # Enable parallelization for higher throughput
+      ParallelizationFactor: 1
+      # Configure retry behavior
+      MaximumRetryAttempts: 3
+      # Configure destination for failed records
+      DestinationConfig:
+        OnFailure:
+          Destination: !GetAtt DeadLetterQueue.Arn
+
+  # SNS Topic for Alarm Notifications (conditional)
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSNSNotifications
+    Properties:
+      TopicName: !Sub 'retail-event-alerts-${Environment}'
+      DisplayName: 'Retail Event Processing Alerts'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub 'retail-event-alerts-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SNS Subscription for Email Notifications (conditional)
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateSNSNotifications
+    Properties:
+      TopicArn: !Ref AlarmNotificationTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  # CloudWatch Alarm for Failed Events (conditional)
+  FailedEventsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlarms
+    Properties:
+      AlarmName: !Sub 'stream-processing-errors-${Environment}'
+      AlarmDescription: 'Alert when too many events fail processing'
+      MetricName: FailedEvents
+      Namespace: RetailEventProcessing
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: !Ref ErrorThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: Environment
+          Value: !Ref Environment
+      AlarmActions: !If
+        - CreateSNSNotifications
+        - [!Ref AlarmNotificationTopic]
+        - []
+      Tags:
+        - Key: Name
+          Value: !Sub 'stream-processing-errors-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarm for Lambda Function Errors (conditional)
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlarms
+    Properties:
+      AlarmName: !Sub 'lambda-function-errors-${Environment}'
+      AlarmDescription: 'Alert when Lambda function encounters errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref StreamProcessorFunction
+      AlarmActions: !If
+        - CreateSNSNotifications
+        - [!Ref AlarmNotificationTopic]
+        - []
+      Tags:
+        - Key: Name
+          Value: !Sub 'lambda-function-errors-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarm for Lambda Function Duration (conditional)
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlarms
+    Properties:
+      AlarmName: !Sub 'lambda-function-duration-${Environment}'
+      AlarmDescription: 'Alert when Lambda function duration is high'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref LambdaTimeout
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref StreamProcessorFunction
+      AlarmActions: !If
+        - CreateSNSNotifications
+        - [!Ref AlarmNotificationTopic]
+        - []
+      Tags:
+        - Key: Name
+          Value: !Sub 'lambda-function-duration-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+# Template Outputs
+Outputs:
+  # Kinesis Stream Information
+  KinesisStreamName:
+    Description: 'Name of the created Kinesis Data Stream'
+    Value: !Ref KinesisDataStream
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisStreamName'
+
+  KinesisStreamArn:
+    Description: 'ARN of the created Kinesis Data Stream'
+    Value: !GetAtt KinesisDataStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisStreamArn'
+
+  # Lambda Function Information
+  LambdaFunctionName:
+    Description: 'Name of the stream processing Lambda function'
+    Value: !Ref StreamProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the stream processing Lambda function'
+    Value: !GetAtt StreamProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  # DynamoDB Table Information
+  DynamoDBTableName:
+    Description: 'Name of the DynamoDB table for processed events'
+    Value: !Ref DynamoDBTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableName'
+
+  DynamoDBTableArn:
+    Description: 'ARN of the DynamoDB table for processed events'
+    Value: !GetAtt DynamoDBTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableArn'
+
+  # SQS Dead Letter Queue Information
+  DeadLetterQueueName:
+    Description: 'Name of the SQS Dead Letter Queue'
+    Value: !GetAtt DeadLetterQueue.QueueName
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueueName'
+
+  DeadLetterQueueUrl:
+    Description: 'URL of the SQS Dead Letter Queue'
+    Value: !Ref DeadLetterQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueueUrl'
+
+  DeadLetterQueueArn:
+    Description: 'ARN of the SQS Dead Letter Queue'
+    Value: !GetAtt DeadLetterQueue.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueueArn'
+
+  # IAM Role Information
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  # SNS Topic Information (conditional)
+  SNSTopicArn:
+    Condition: CreateSNSNotifications
+    Description: 'ARN of the SNS topic for alarm notifications'
+    Value: !Ref AlarmNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  # Testing Information
+  TestDataProducerCommand:
+    Description: 'AWS CLI command to send test data to the Kinesis stream'
+    Value: !Sub |
+      aws kinesis put-record --stream-name ${KinesisDataStream} --data '{"userId":"test-user-001","eventType":"view","productId":"P0001","timestamp":${AWS::CurrentTimeInSeconds}000}' --partition-key test-user-001
+
+  # Monitoring URLs
+  CloudWatchDashboardUrl:
+    Description: 'URL to CloudWatch dashboard for monitoring the pipeline'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}'
+
+  DynamoDBConsoleUrl:
+    Description: 'URL to DynamoDB console for viewing processed events'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/dynamodb/home?region=${AWS::Region}#tables:selected=${DynamoDBTable}'
+
+  LambdaLogsUrl:
+    Description: 'URL to Lambda function CloudWatch logs'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logStream:group=/aws/lambda/${StreamProcessorFunction}'
+
+  # Cost Estimation
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for moderate traffic (1MB/sec, 1M events/hour)'
+    Value: 'Kinesis: $15, Lambda: $5-10, DynamoDB: $5-25, CloudWatch: $1-5. Total: $25-50/month'

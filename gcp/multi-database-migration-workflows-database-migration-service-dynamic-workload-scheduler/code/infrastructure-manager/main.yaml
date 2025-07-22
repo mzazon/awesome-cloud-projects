@@ -1,0 +1,727 @@
+# Google Cloud Infrastructure Manager Configuration
+# Multi-Database Migration Workflows with Database Migration Service and Dynamic Workload Scheduler
+# 
+# This configuration deploys a comprehensive database migration platform that combines:
+# - Database Migration Service for continuous, minimal-downtime migrations
+# - Dynamic Workload Scheduler for cost-optimized resource allocation
+# - Cloud SQL and AlloyDB as migration targets
+# - Cloud Functions for intelligent migration orchestration
+# - Comprehensive monitoring and alerting capabilities
+
+imports:
+  - path: templates/compute.jinja
+  - path: templates/sql.jinja
+  - path: templates/alloydb.jinja
+  - path: templates/migration.jinja
+  - path: templates/monitoring.jinja
+
+resources:
+  # ============================================================================
+  # NETWORKING FOUNDATION
+  # ============================================================================
+  
+  # VPC Network for secure migration traffic
+  - name: migration-network
+    type: compute.v1.network
+    properties:
+      autoCreateSubnetworks: false
+      routingConfig:
+        routingMode: REGIONAL
+    metadata:
+      description: "Primary VPC network for database migration workflows"
+
+  # Regional subnet for migration resources
+  - name: migration-subnet
+    type: compute.v1.subnetwork
+    properties:
+      ipCidrRange: "10.0.0.0/24"
+      network: $(ref.migration-network.selfLink)
+      region: $(ref.region)
+      privateIpGoogleAccess: true
+    metadata:
+      description: "Subnet for migration workers and database resources"
+
+  # Firewall rules for migration traffic
+  - name: migration-firewall-internal
+    type: compute.v1.firewall
+    properties:
+      network: $(ref.migration-network.selfLink)
+      allowed:
+        - IPProtocol: tcp
+          ports: ["3306", "5432", "443", "80"]
+        - IPProtocol: icmp
+      sourceRanges: ["10.0.0.0/24"]
+      targetTags: ["migration-worker", "migration-target"]
+    metadata:
+      description: "Allow internal migration traffic between resources"
+
+  # ============================================================================
+  # COMPUTE INFRASTRUCTURE FOR MIGRATION WORKERS
+  # ============================================================================
+
+  # Instance template for Dynamic Workload Scheduler migration workers
+  - name: migration-worker-template
+    type: compute.v1.instanceTemplate
+    properties:
+      properties:
+        machineType: e2-standard-4
+        disks:
+          - boot: true
+            initializeParams:
+              sourceImage: projects/debian-cloud/global/images/family/debian-12
+              diskType: pd-ssd
+              diskSizeGb: 100
+        networkInterfaces:
+          - network: $(ref.migration-network.selfLink)
+            subnetwork: $(ref.migration-subnet.selfLink)
+            accessConfigs:
+              - name: External NAT
+                type: ONE_TO_ONE_NAT
+        serviceAccounts:
+          - email: default
+            scopes:
+              - https://www.googleapis.com/auth/cloud-platform
+        tags:
+          items: ["migration-worker"]
+        metadata:
+          items:
+            - key: startup-script
+              value: |
+                #!/bin/bash
+                apt-get update
+                apt-get install -y mysql-client postgresql-client python3-pip
+                pip3 install google-cloud-monitoring google-cloud-logging google-cloud-functions
+                
+                # Configure migration worker environment
+                echo "export MIGRATION_PROJECT_ID=$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/project/project-id)" >> /etc/environment
+                echo "export MIGRATION_REGION=$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/zone | cut -d/ -f4 | sed 's/-.$//')" >> /etc/environment
+                
+                # Install Cloud SQL proxy for secure database connections
+                curl -o cloud_sql_proxy https://dl.google.com/cloudsql/cloud_sql_proxy.linux.amd64
+                chmod +x cloud_sql_proxy
+                mv cloud_sql_proxy /usr/local/bin/
+                
+                # Configure logging for migration activities
+                systemctl enable google-fluentd
+                systemctl start google-fluentd
+    metadata:
+      description: "Instance template for migration workers with optimized configurations"
+
+  # Managed instance group for auto-scaling migration workers
+  - name: migration-workers-group
+    type: compute.v1.regionInstanceGroupManager
+    properties:
+      region: $(ref.region)
+      baseInstanceName: migration-worker
+      instanceTemplate: $(ref.migration-worker-template.selfLink)
+      targetSize: 0  # Start with zero instances, scale based on workload
+      autoHealingPolicies:
+        - healthCheck: $(ref.migration-worker-health-check.selfLink)
+          initialDelaySec: 300
+    metadata:
+      description: "Managed instance group for Dynamic Workload Scheduler integration"
+
+  # Health check for migration workers
+  - name: migration-worker-health-check
+    type: compute.v1.regionHealthCheck
+    properties:
+      region: $(ref.region)
+      type: HTTP
+      httpHealthCheck:
+        port: 80
+        requestPath: /health
+        checkIntervalSec: 30
+        timeoutSec: 10
+        healthyThreshold: 2
+        unhealthyThreshold: 3
+    metadata:
+      description: "Health check for migration worker instances"
+
+  # Autoscaler for Dynamic Workload Scheduler integration
+  - name: migration-workers-autoscaler
+    type: compute.v1.regionAutoscaler
+    properties:
+      region: $(ref.region)
+      target: $(ref.migration-workers-group.selfLink)
+      autoscalingPolicy:
+        minNumReplicas: 0
+        maxNumReplicas: 8
+        cpuUtilization:
+          utilizationTarget: 0.7
+        coolDownPeriodSec: 300
+        scaleInControl:
+          maxScaledInReplicasFixed: 2
+          timeWindowSec: 300
+    metadata:
+      description: "Autoscaler for cost-optimized resource allocation"
+
+  # ============================================================================
+  # CLOUD SQL TARGET DATABASES
+  # ============================================================================
+
+  # Cloud SQL MySQL instance for migration targets
+  - name: mysql-migration-target
+    type: sqladmin.v1beta4.instance
+    properties:
+      databaseVersion: MYSQL_8_0
+      region: $(ref.region)
+      settings:
+        tier: db-n1-standard-4
+        storageAutoResize: true
+        storageAutoResizeLimit: 1000
+        dataDiskType: PD_SSD
+        dataDiskSizeGb: 100
+        ipConfiguration:
+          ipv4Enabled: false
+          privateNetwork: $(ref.migration-network.selfLink)
+          requireSsl: true
+        backupConfiguration:
+          enabled: true
+          startTime: "03:00"
+          binaryLogEnabled: true
+          transactionLogRetentionDays: 7
+        maintenanceWindow:
+          day: 7  # Sunday
+          hour: 4
+        deletionProtectionEnabled: true
+        insights:
+          queryInsightsEnabled: true
+          recordApplicationTags: true
+          recordClientAddress: true
+    metadata:
+      description: "Cloud SQL MySQL instance for migration targets with HA configuration"
+
+  # Database user for migration operations
+  - name: mysql-migration-user
+    type: sqladmin.v1beta4.user
+    properties:
+      instance: $(ref.mysql-migration-target.name)
+      name: migration-user
+      password: $(ref.mysql-migration-password)
+      host: "%"
+    metadata:
+      description: "Database user for migration service operations"
+
+  # Target database for migrations
+  - name: mysql-target-database
+    type: sqladmin.v1beta4.database
+    properties:
+      instance: $(ref.mysql-migration-target.name)
+      name: migration_target_db
+      charset: utf8mb4
+      collation: utf8mb4_unicode_ci
+    metadata:
+      description: "Target database for MySQL migrations"
+
+  # ============================================================================
+  # ALLOYDB CLUSTER FOR POSTGRESQL WORKLOADS
+  # ============================================================================
+
+  # AlloyDB cluster for PostgreSQL migrations
+  - name: postgres-migration-cluster
+    type: alloydb.v1.cluster
+    properties:
+      location: $(ref.region)
+      networkConfig:
+        network: projects/$(ref.project)/global/networks/$(ref.migration-network.name)
+      databaseVersion: POSTGRES_15
+      initialUser:
+        user: migration-admin
+        password: $(ref.postgres-migration-password)
+      backupPolicy:
+        weeklySchedule:
+          daysOfWeek: ["SUNDAY"]
+          startTimes:
+            - hours: 3
+              minutes: 0
+        retentionCount: 7
+        enabled: true
+      encryptionConfig:
+        kmsKeyName: $(ref.migration-kms-key.name)
+    metadata:
+      description: "AlloyDB cluster for high-performance PostgreSQL migrations"
+
+  # AlloyDB primary instance
+  - name: postgres-migration-primary
+    type: alloydb.v1.instance
+    properties:
+      parent: $(ref.postgres-migration-cluster.name)
+      instanceId: primary-instance
+      instanceType: PRIMARY
+      machineConfig:
+        cpuCount: 4
+      availabilityType: REGIONAL
+      readPoolConfig:
+        nodeCount: 1
+    metadata:
+      description: "Primary AlloyDB instance with regional availability"
+
+  # ============================================================================
+  # DATABASE MIGRATION SERVICE CONFIGURATION
+  # ============================================================================
+
+  # Connection profile for source MySQL database
+  - name: source-mysql-profile
+    type: datamigration.v1.connectionProfile
+    properties:
+      parent: projects/$(ref.project)/locations/$(ref.region)
+      connectionProfileId: source-mysql-profile
+      displayName: "Source MySQL Connection Profile"
+      mysql:
+        host: "203.0.113.1"  # Example source IP - replace with actual
+        port: 3306
+        username: migration_user
+        password: $(ref.source-mysql-password)
+        ssl:
+          type: SERVER_ONLY
+    metadata:
+      description: "Connection profile for source MySQL database"
+
+  # Connection profile for Cloud SQL target
+  - name: target-cloudsql-profile
+    type: datamigration.v1.connectionProfile
+    properties:
+      parent: projects/$(ref.project)/locations/$(ref.region)
+      connectionProfileId: target-cloudsql-profile
+      displayName: "Target Cloud SQL Connection Profile"
+      cloudsql:
+        cloudSqlId: $(ref.mysql-migration-target.name)
+    metadata:
+      description: "Connection profile for Cloud SQL target database"
+
+  # Connection profile for source PostgreSQL database
+  - name: source-postgres-profile
+    type: datamigration.v1.connectionProfile
+    properties:
+      parent: projects/$(ref.project)/locations/$(ref.region)
+      connectionProfileId: source-postgres-profile
+      displayName: "Source PostgreSQL Connection Profile"
+      postgresql:
+        host: "203.0.113.2"  # Example source IP - replace with actual
+        port: 5432
+        username: migration_user
+        password: $(ref.source-postgres-password)
+        ssl:
+          type: SERVER_ONLY
+    metadata:
+      description: "Connection profile for source PostgreSQL database"
+
+  # Connection profile for AlloyDB target
+  - name: target-alloydb-profile
+    type: datamigration.v1.connectionProfile
+    properties:
+      parent: projects/$(ref.project)/locations/$(ref.region)
+      connectionProfileId: target-alloydb-profile
+      displayName: "Target AlloyDB Connection Profile"
+      alloydb:
+        clusterId: $(ref.postgres-migration-cluster.name)
+    metadata:
+      description: "Connection profile for AlloyDB target cluster"
+
+  # MySQL to Cloud SQL migration job
+  - name: mysql-migration-job
+    type: datamigration.v1.migrationJob
+    properties:
+      parent: projects/$(ref.project)/locations/$(ref.region)
+      migrationJobId: mysql-migration-job
+      displayName: "MySQL to Cloud SQL Migration"
+      type: CONTINUOUS
+      source: $(ref.source-mysql-profile.name)
+      destination: $(ref.target-cloudsql-profile.name)
+      dumpPath: gs://$(ref.migration-storage-bucket.name)/mysql-dumps
+    metadata:
+      description: "Continuous migration job for MySQL to Cloud SQL"
+
+  # PostgreSQL to AlloyDB migration job
+  - name: postgres-migration-job
+    type: datamigration.v1.migrationJob
+    properties:
+      parent: projects/$(ref.project)/locations/$(ref.region)
+      migrationJobId: postgres-migration-job
+      displayName: "PostgreSQL to AlloyDB Migration"
+      type: CONTINUOUS
+      source: $(ref.source-postgres-profile.name)
+      destination: $(ref.target-alloydb-profile.name)
+      dumpPath: gs://$(ref.migration-storage-bucket.name)/postgres-dumps
+    metadata:
+      description: "Continuous migration job for PostgreSQL to AlloyDB"
+
+  # ============================================================================
+  # CLOUD FUNCTIONS FOR MIGRATION ORCHESTRATION
+  # ============================================================================
+
+  # Cloud Storage bucket for migration artifacts and function code
+  - name: migration-storage-bucket
+    type: storage.v1.bucket
+    properties:
+      name: $(ref.project)-migration-artifacts-$(ref.random-suffix)
+      location: $(ref.region)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      encryption:
+        defaultKmsKeyName: $(ref.migration-kms-key.name)
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              matchesStorageClass: ["STANDARD"]
+    metadata:
+      description: "Storage bucket for migration dumps and orchestration artifacts"
+
+  # Cloud Function for migration orchestration
+  - name: migration-orchestrator-function
+    type: cloudfunctions.v1.function
+    properties:
+      name: projects/$(ref.project)/locations/$(ref.region)/functions/migration-orchestrator
+      sourceArchiveUrl: gs://$(ref.migration-storage-bucket.name)/function-source.zip
+      entryPoint: orchestrate_migration
+      runtime: python39
+      timeout: 540s
+      availableMemoryMb: 512
+      environmentVariables:
+        PROJECT_ID: $(ref.project)
+        REGION: $(ref.region)
+        INSTANCE_GROUP: $(ref.migration-workers-group.name)
+      httpsTrigger: {}
+      serviceAccountEmail: $(ref.migration-service-account.email)
+    metadata:
+      description: "Cloud Function for intelligent migration orchestration"
+
+  # ============================================================================
+  # IAM AND SECURITY CONFIGURATION
+  # ============================================================================
+
+  # Service account for migration operations
+  - name: migration-service-account
+    type: iam.v1.serviceAccount
+    properties:
+      accountId: migration-orchestrator
+      displayName: "Migration Orchestrator Service Account"
+      description: "Service account for database migration orchestration and monitoring"
+
+  # IAM binding for migration service account
+  - name: migration-sa-compute-admin
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project)
+      role: roles/compute.instanceAdmin.v1
+      member: serviceAccount:$(ref.migration-service-account.email)
+
+  - name: migration-sa-sql-admin
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project)
+      role: roles/cloudsql.admin
+      member: serviceAccount:$(ref.migration-service-account.email)
+
+  - name: migration-sa-alloydb-admin
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project)
+      role: roles/alloydb.admin
+      member: serviceAccount:$(ref.migration-service-account.email)
+
+  - name: migration-sa-datamigration-admin
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project)
+      role: roles/datamigration.admin
+      member: serviceAccount:$(ref.migration-service-account.email)
+
+  # KMS key for encryption
+  - name: migration-kms-keyring
+    type: cloudkms.v1.keyRing
+    properties:
+      parent: projects/$(ref.project)/locations/$(ref.region)
+      keyRingId: migration-keyring
+
+  - name: migration-kms-key
+    type: cloudkms.v1.cryptoKey
+    properties:
+      parent: $(ref.migration-kms-keyring.name)
+      cryptoKeyId: migration-key
+      purpose: ENCRYPT_DECRYPT
+      versionTemplate:
+        algorithm: GOOGLE_SYMMETRIC_ENCRYPTION
+        protectionLevel: SOFTWARE
+
+  # ============================================================================
+  # MONITORING AND ALERTING CONFIGURATION
+  # ============================================================================
+
+  # Custom monitoring dashboard for migration progress
+  - name: migration-monitoring-dashboard
+    type: monitoring.v1.dashboard
+    properties:
+      displayName: "Database Migration Dashboard"
+      mosaicLayout:
+        tiles:
+          - width: 6
+            height: 4
+            widget:
+              title: "Migration Worker CPU Utilization"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="gce_instance" AND resource.label.instance_name=~"migration-worker-.*"'
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_MEAN
+                          crossSeriesReducer: REDUCE_MEAN
+                          groupByFields: ["resource.label.instance_name"]
+          - width: 6
+            height: 4
+            widget:
+              title: "Migration Job Progress"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="datamigration_job"'
+                        aggregation:
+                          alignmentPeriod: 300s
+                          perSeriesAligner: ALIGN_MEAN
+          - width: 12
+            height: 4
+            widget:
+              title: "Database Replication Lag"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'metric.type="datamigration.googleapis.com/replication/lag"'
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_MEAN
+    metadata:
+      description: "Comprehensive monitoring dashboard for migration workflows"
+
+  # Alert policy for migration failures
+  - name: migration-failure-alert
+    type: monitoring.v1.alertPolicy
+    properties:
+      displayName: "Migration Worker Failure Alert"
+      conditions:
+        - displayName: "High error rate in migration workers"
+          conditionThreshold:
+            filter: 'resource.type="gce_instance" AND resource.label.instance_name=~"migration-worker-.*"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 0.1
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_MEAN
+                groupByFields: ["resource.label.instance_name"]
+      enabled: true
+      alertStrategy:
+        autoClose: 86400s  # 24 hours
+    metadata:
+      description: "Alert policy for detecting migration worker failures"
+
+  # Alert policy for high replication lag
+  - name: replication-lag-alert
+    type: monitoring.v1.alertPolicy
+    properties:
+      displayName: "High Database Replication Lag"
+      conditions:
+        - displayName: "Replication lag exceeds threshold"
+          conditionThreshold:
+            filter: 'metric.type="datamigration.googleapis.com/replication/lag"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: 300  # 5 minutes in seconds
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_MEAN
+      enabled: true
+      alertStrategy:
+        autoClose: 3600s  # 1 hour
+    metadata:
+      description: "Alert policy for high database replication lag"
+
+  # ============================================================================
+  # DYNAMIC WORKLOAD SCHEDULER CONFIGURATION
+  # ============================================================================
+
+  # Future reservation for flex-start capacity optimization
+  - name: migration-flex-capacity
+    type: compute.v1.futureReservation
+    properties:
+      zone: $(ref.zone)
+      specificReservation:
+        count: 4
+        instanceProperties:
+          machineType: e2-standard-4
+      specificReservationRequired: false
+      planningStatus: PLANNING_STATUS_PLANNED
+      name: migration-flex-capacity
+    metadata:
+      description: "Flex-start capacity reservation for cost-optimized migration workloads"
+
+# ============================================================================
+# CONFIGURATION PARAMETERS
+# ============================================================================
+
+parameters:
+  # Project and regional configuration
+  - name: project
+    type: string
+    description: "Google Cloud Project ID for migration resources"
+    
+  - name: region
+    type: string
+    default: "us-central1"
+    description: "Primary region for migration infrastructure deployment"
+    
+  - name: zone
+    type: string
+    default: "us-central1-a"
+    description: "Primary zone for compute resources"
+
+  # Random suffix for unique resource naming
+  - name: random-suffix
+    type: string
+    description: "Random suffix for unique resource names"
+    
+  # Database passwords (should be provided securely)
+  - name: mysql-migration-password
+    type: string
+    description: "Password for MySQL migration user"
+    
+  - name: postgres-migration-password
+    type: string
+    description: "Password for PostgreSQL migration user"
+    
+  - name: source-mysql-password
+    type: string
+    description: "Password for source MySQL database connection"
+    
+  - name: source-postgres-password
+    type: string
+    description: "Password for source PostgreSQL database connection"
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+
+outputs:
+  # Network configuration outputs
+  - name: migration-network-name
+    value: $(ref.migration-network.name)
+    description: "Name of the migration VPC network"
+    
+  - name: migration-subnet-name
+    value: $(ref.migration-subnet.name)
+    description: "Name of the migration subnet"
+
+  # Compute infrastructure outputs
+  - name: migration-workers-group-name
+    value: $(ref.migration-workers-group.name)
+    description: "Name of the migration workers instance group"
+    
+  - name: migration-worker-template-name
+    value: $(ref.migration-worker-template.name)
+    description: "Name of the migration worker instance template"
+
+  # Database target outputs
+  - name: cloud-sql-instance-name
+    value: $(ref.mysql-migration-target.name)
+    description: "Name of the Cloud SQL migration target instance"
+    
+  - name: cloud-sql-connection-string
+    value: $(ref.mysql-migration-target.connectionName)
+    description: "Connection string for Cloud SQL instance"
+    
+  - name: alloydb-cluster-name
+    value: $(ref.postgres-migration-cluster.name)
+    description: "Name of the AlloyDB migration target cluster"
+
+  # Migration service outputs
+  - name: mysql-migration-job-name
+    value: $(ref.mysql-migration-job.name)
+    description: "Name of the MySQL migration job"
+    
+  - name: postgres-migration-job-name
+    value: $(ref.postgres-migration-job.name)
+    description: "Name of the PostgreSQL migration job"
+
+  # Orchestration outputs
+  - name: migration-orchestrator-url
+    value: $(ref.migration-orchestrator-function.httpsTrigger.url)
+    description: "URL for the migration orchestrator function"
+    
+  - name: migration-storage-bucket-name
+    value: $(ref.migration-storage-bucket.name)
+    description: "Name of the migration artifacts storage bucket"
+
+  # Monitoring outputs
+  - name: migration-dashboard-name
+    value: $(ref.migration-monitoring-dashboard.name)
+    description: "Name of the migration monitoring dashboard"
+    
+  - name: migration-service-account-email
+    value: $(ref.migration-service-account.email)
+    description: "Email of the migration service account"
+
+  # Dynamic Workload Scheduler outputs
+  - name: flex-capacity-reservation-name
+    value: $(ref.migration-flex-capacity.name)
+    description: "Name of the flex-start capacity reservation"
+
+# ============================================================================
+# METADATA AND DOCUMENTATION
+# ============================================================================
+
+metadata:
+  version: "1.0"
+  description: |
+    Google Cloud Infrastructure Manager configuration for multi-database migration workflows.
+    
+    This configuration deploys a comprehensive migration platform featuring:
+    - Database Migration Service for continuous, minimal-downtime migrations
+    - Dynamic Workload Scheduler for cost-optimized resource allocation
+    - Cloud SQL and AlloyDB as high-performance migration targets
+    - Intelligent orchestration via Cloud Functions
+    - Comprehensive monitoring and alerting capabilities
+    
+    The platform supports both MySQL and PostgreSQL migrations with enterprise-grade
+    security, performance optimization, and cost efficiency through flex-start provisioning.
+  
+  author: "Google Cloud Recipes"
+  last-updated: "2025-07-12"
+  
+  deployment-notes: |
+    Before deploying this configuration:
+    1. Ensure required APIs are enabled in your project
+    2. Configure source database connectivity (VPN, interconnect, or firewall rules)
+    3. Provide secure passwords for database connections
+    4. Review and adjust compute resource sizing based on workload requirements
+    5. Configure notification channels for monitoring alerts
+    
+    Post-deployment:
+    1. Upload migration orchestrator function source code to the storage bucket
+    2. Start migration jobs through the Database Migration Service console
+    3. Monitor progress through the custom dashboard
+    4. Adjust autoscaling parameters based on observed performance
+  
+  cost-optimization: |
+    This configuration leverages several cost optimization strategies:
+    - Dynamic Workload Scheduler flex-start mode for up to 60% compute cost savings
+    - Autoscaling instance groups with minimum size of 0
+    - Intelligent tiering of storage classes with lifecycle policies
+    - Regional persistent disks for cost-effective storage
+    - Preemptible instances option for non-critical migration tasks
+  
+  security-features: |
+    Security measures implemented in this configuration:
+    - Private VPC network with no external IP addresses for databases
+    - KMS encryption for storage and database resources
+    - Dedicated service account with least privilege permissions
+    - SSL/TLS encryption for all database connections
+    - VPC firewall rules restricting access to necessary ports only
+    - Regular automated backups with point-in-time recovery

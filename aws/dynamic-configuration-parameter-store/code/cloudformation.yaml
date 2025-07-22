@@ -1,0 +1,735 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Dynamic Configuration with Parameter Store
+  This template creates a serverless configuration management system using AWS Systems Manager 
+  Parameter Store for centralized parameter storage, Lambda functions with the AWS Parameters 
+  and Secrets Extension for cached parameter retrieval, and EventBridge for automatic 
+  configuration invalidation.
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Application Configuration"
+        Parameters:
+          - ApplicationName
+          - Environment
+          - ParameterPrefix
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaTimeout
+          - LambdaMemorySize
+          - ParameterCacheTTL
+      - Label:
+          default: "Sample Configuration Parameters"
+        Parameters:
+          - DatabaseHost
+          - DatabasePort
+          - APITimeout
+          - FeatureToggleNewUI
+          - DatabasePassword
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableDetailedMonitoring
+          - AlarmNotificationEmail
+    ParameterLabels:
+      ApplicationName:
+        default: "Application Name"
+      Environment:
+        default: "Environment"
+      ParameterPrefix:
+        default: "Parameter Store Prefix"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      ParameterCacheTTL:
+        default: "Parameter Cache TTL (seconds)"
+      DatabaseHost:
+        default: "Database Host"
+      DatabasePort:
+        default: "Database Port"
+      APITimeout:
+        default: "API Timeout (seconds)"
+      FeatureToggleNewUI:
+        default: "Feature Toggle: New UI"
+      DatabasePassword:
+        default: "Database Password"
+      EnableDetailedMonitoring:
+        default: "Enable Detailed Monitoring"
+      AlarmNotificationEmail:
+        default: "Alarm Notification Email"
+
+# Template Parameters
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: myapp
+    Description: Name of the application for resource naming
+    AllowedPattern: '^[a-z][a-z0-9-]*$'
+    ConstraintDescription: Must start with lowercase letter and contain only lowercase letters, numbers, and hyphens
+    MinLength: 3
+    MaxLength: 20
+
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment name for resource tagging
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    ConstraintDescription: Must be one of dev, staging, or prod
+
+  ParameterPrefix:
+    Type: String
+    Default: /myapp/config
+    Description: Parameter Store hierarchy prefix for configuration parameters
+    AllowedPattern: '^/[a-zA-Z0-9/_-]+$'
+    ConstraintDescription: Must start with / and contain only alphanumeric characters, forward slashes, underscores, and hyphens
+    MinLength: 5
+    MaxLength: 50
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    Description: Lambda function timeout in seconds
+    MinValue: 3
+    MaxValue: 900
+    ConstraintDescription: Must be between 3 and 900 seconds
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    Description: Lambda function memory allocation in MB
+    AllowedValues: [128, 256, 512, 1024, 1536, 3008]
+    ConstraintDescription: Must be a valid Lambda memory size
+
+  ParameterCacheTTL:
+    Type: Number
+    Default: 300
+    Description: Parameter cache time-to-live in seconds (for Parameters and Secrets Extension)
+    MinValue: 60
+    MaxValue: 3600
+    ConstraintDescription: Must be between 60 and 3600 seconds
+
+  DatabaseHost:
+    Type: String
+    Default: myapp-db.cluster-xyz.us-east-1.rds.amazonaws.com
+    Description: Database host endpoint for sample configuration
+    MinLength: 5
+    MaxLength: 100
+
+  DatabasePort:
+    Type: String
+    Default: '5432'
+    Description: Database port number for sample configuration
+    AllowedPattern: '^[0-9]+$'
+    ConstraintDescription: Must be a valid port number
+
+  APITimeout:
+    Type: String
+    Default: '30'
+    Description: API timeout in seconds for sample configuration
+    AllowedPattern: '^[0-9]+$'
+    ConstraintDescription: Must be a positive integer
+
+  FeatureToggleNewUI:
+    Type: String
+    Default: 'true'
+    Description: Feature flag for new UI (true/false)
+    AllowedValues: ['true', 'false']
+    ConstraintDescription: Must be true or false
+
+  DatabasePassword:
+    Type: String
+    Default: supersecretpassword123
+    Description: Database password for sample configuration (will be stored as SecureString)
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 128
+
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    Description: Enable detailed CloudWatch monitoring and alarms
+    AllowedValues: ['true', 'false']
+    ConstraintDescription: Must be true or false
+
+  AlarmNotificationEmail:
+    Type: String
+    Default: ''
+    Description: Email address for alarm notifications (optional)
+    AllowedPattern: '^$|^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'
+    ConstraintDescription: Must be a valid email address or empty
+
+# Conditions
+Conditions:
+  EnableMonitoring: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  HasNotificationEmail: !And
+    - !Condition EnableMonitoring
+    - !Not [!Equals [!Ref AlarmNotificationEmail, '']]
+
+# Resources
+Resources:
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-config-manager-role-${Environment}'
+      Description: IAM role for Lambda function with Parameter Store access
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ParameterStoreAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ParameterPrefix}/*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 'ssm.${AWS::Region}.amazonaws.com'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: IAM
+
+  # Lambda Function
+  ConfigManagerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ApplicationName}-config-manager-${Environment}'
+      Description: Dynamic configuration management function with Parameter Store integration
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Layers:
+        - !Sub 'arn:aws:lambda:${AWS::Region}:177933569100:layer:AWS-Parameters-and-Secrets-Lambda-Extension:11'
+      Environment:
+        Variables:
+          PARAMETER_PREFIX: !Ref ParameterPrefix
+          SSM_PARAMETER_STORE_TTL: !Ref ParameterCacheTTL
+          APPLICATION_NAME: !Ref ApplicationName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import urllib3
+          import boto3
+          from datetime import datetime
+          
+          # Initialize HTTP client for extension
+          http = urllib3.PoolManager()
+          
+          # Initialize CloudWatch client for custom metrics
+          cloudwatch = boto3.client('cloudwatch')
+          
+          def get_parameter_from_extension(parameter_name):
+              """Retrieve parameter using the Parameters and Secrets Extension"""
+              try:
+                  # Use localhost endpoint provided by the extension
+                  port = os.environ.get('PARAMETERS_SECRETS_EXTENSION_HTTP_PORT', '2773')
+                  url = f'http://localhost:{port}/systemsmanager/parameters/get/?name={parameter_name}'
+                  
+                  response = http.request('GET', url)
+                  
+                  if response.status == 200:
+                      data = json.loads(response.data.decode('utf-8'))
+                      return data['Parameter']['Value']
+                  else:
+                      raise Exception(f"Failed to retrieve parameter: {response.status}")
+                      
+              except Exception as e:
+                  print(f"Error retrieving parameter {parameter_name}: {str(e)}")
+                  # Fallback to direct SSM call if extension fails
+                  return get_parameter_direct(parameter_name)
+          
+          def get_parameter_direct(parameter_name):
+              """Fallback method using direct SSM API call"""
+              try:
+                  ssm = boto3.client('ssm')
+                  response = ssm.get_parameter(Name=parameter_name, WithDecryption=True)
+                  return response['Parameter']['Value']
+              except Exception as e:
+                  print(f"Error with direct SSM call: {str(e)}")
+                  return None
+          
+          def send_custom_metric(metric_name, value, unit='Count'):
+              """Send custom metric to CloudWatch"""
+              try:
+                  cloudwatch.put_metric_data(
+                      Namespace='ConfigManager',
+                      MetricData=[
+                          {
+                              'MetricName': metric_name,
+                              'Value': value,
+                              'Unit': unit,
+                              'Timestamp': datetime.utcnow(),
+                              'Dimensions': [
+                                  {
+                                      'Name': 'FunctionName',
+                                      'Value': os.environ.get('AWS_LAMBDA_FUNCTION_NAME')
+                                  },
+                                  {
+                                      'Name': 'Environment',
+                                      'Value': os.environ.get('ENVIRONMENT', 'unknown')
+                                  }
+                              ]
+                          }
+                      ]
+                  )
+              except Exception as e:
+                  print(f"Error sending metric: {str(e)}")
+          
+          def lambda_handler(event, context):
+              """Main Lambda handler function"""
+              try:
+                  # Define parameter prefix
+                  parameter_prefix = os.environ.get('PARAMETER_PREFIX', '/myapp/config')
+                  
+                  # Retrieve configuration parameters
+                  config = {}
+                  parameters = [
+                      f"{parameter_prefix}/database/host",
+                      f"{parameter_prefix}/database/port",
+                      f"{parameter_prefix}/api/timeout",
+                      f"{parameter_prefix}/features/new-ui"
+                  ]
+                  
+                  # Track configuration retrieval metrics
+                  successful_retrievals = 0
+                  failed_retrievals = 0
+                  
+                  for param in parameters:
+                      value = get_parameter_from_extension(param)
+                      if value is not None:
+                          config[param.split('/')[-1]] = value
+                          successful_retrievals += 1
+                      else:
+                          failed_retrievals += 1
+                  
+                  # Send custom metrics
+                  send_custom_metric('SuccessfulParameterRetrievals', successful_retrievals)
+                  send_custom_metric('FailedParameterRetrievals', failed_retrievals)
+                  
+                  # Log configuration status
+                  print(f"Configuration loaded: {len(config)} parameters")
+                  print(f"Configuration: {json.dumps(config, indent=2)}")
+                  
+                  # Return response
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json'
+                      },
+                      'body': json.dumps({
+                          'message': 'Configuration loaded successfully',
+                          'config': config,
+                          'timestamp': datetime.utcnow().isoformat(),
+                          'function_name': context.function_name,
+                          'request_id': context.aws_request_id
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in lambda_handler: {str(e)}")
+                  send_custom_metric('ConfigurationErrors', 1)
+                  
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json'
+                      },
+                      'body': json.dumps({
+                          'error': 'Configuration retrieval failed',
+                          'message': str(e),
+                          'request_id': context.aws_request_id
+                      })
+                  }
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: Lambda
+
+  # Lambda Function Log Group
+  ConfigManagerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ConfigManagerFunction}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: CloudWatch
+
+  # Sample Configuration Parameters in Parameter Store
+  DatabaseHostParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '${ParameterPrefix}/database/host'
+      Type: String
+      Value: !Ref DatabaseHost
+      Description: Database host endpoint for application configuration
+      Tags:
+        Application: !Ref ApplicationName
+        Environment: !Ref Environment
+        Component: Configuration
+
+  DatabasePortParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '${ParameterPrefix}/database/port'
+      Type: String
+      Value: !Ref DatabasePort
+      Description: Database port number for application configuration
+      Tags:
+        Application: !Ref ApplicationName
+        Environment: !Ref Environment
+        Component: Configuration
+
+  APITimeoutParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '${ParameterPrefix}/api/timeout'
+      Type: String
+      Value: !Ref APITimeout
+      Description: API timeout in seconds for application configuration
+      Tags:
+        Application: !Ref ApplicationName
+        Environment: !Ref Environment
+        Component: Configuration
+
+  FeatureToggleParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '${ParameterPrefix}/features/new-ui'
+      Type: String
+      Value: !Ref FeatureToggleNewUI
+      Description: Feature flag for new UI functionality
+      Tags:
+        Application: !Ref ApplicationName
+        Environment: !Ref Environment
+        Component: Configuration
+
+  DatabasePasswordParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '${ParameterPrefix}/database/password'
+      Type: SecureString
+      Value: !Ref DatabasePassword
+      Description: Database password (encrypted with default KMS key)
+      Tags:
+        Application: !Ref ApplicationName
+        Environment: !Ref Environment
+        Component: Configuration
+
+  # EventBridge Rule for Parameter Store Changes
+  ParameterChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ApplicationName}-parameter-change-rule-${Environment}'
+      Description: Trigger Lambda function on Parameter Store changes
+      EventPattern:
+        source:
+          - aws.ssm
+        detail-type:
+          - Parameter Store Change
+        detail:
+          name:
+            - prefix: !Ref ParameterPrefix
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ConfigManagerFunction.Arn
+          Id: ConfigManagerTarget
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: EventBridge
+
+  # Lambda Permission for EventBridge
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ConfigManagerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ParameterChangeRule.Arn
+
+  # SNS Topic for Alarm Notifications (conditional)
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasNotificationEmail
+    Properties:
+      TopicName: !Sub '${ApplicationName}-config-manager-alarms-${Environment}'
+      DisplayName: Configuration Manager Alarms
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: SNS
+
+  # SNS Topic Subscription (conditional)
+  AlarmTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmNotificationEmail
+
+  # CloudWatch Alarms (conditional)
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-ConfigManager-Errors-${Environment}'
+      AlarmDescription: Monitor Lambda function errors for configuration manager
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ConfigManagerFunction
+      AlarmActions: !If
+        - HasNotificationEmail
+        - [!Ref AlarmTopic]
+        - []
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: CloudWatch
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-ConfigManager-Duration-${Environment}'
+      AlarmDescription: Monitor Lambda function duration for configuration manager
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 10000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ConfigManagerFunction
+      AlarmActions: !If
+        - HasNotificationEmail
+        - [!Ref AlarmTopic]
+        - []
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: CloudWatch
+
+  ConfigRetrievalFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-ConfigManager-RetrievalFailures-${Environment}'
+      AlarmDescription: Monitor configuration retrieval failures
+      MetricName: FailedParameterRetrievals
+      Namespace: ConfigManager
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasNotificationEmail
+        - [!Ref AlarmTopic]
+        - []
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: CloudWatch
+
+  # CloudWatch Dashboard (conditional)
+  ConfigManagerDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableMonitoring
+    Properties:
+      DashboardName: !Sub '${ApplicationName}-ConfigManager-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${ConfigManagerFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics",
+                "period": 300,
+                "stat": "Sum",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "ConfigManager", "SuccessfulParameterRetrievals", "FunctionName", "${ConfigManagerFunction}", "Environment", "${Environment}" ],
+                  [ ".", "FailedParameterRetrievals", ".", ".", ".", "." ],
+                  [ ".", "ConfigurationErrors", ".", ".", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Configuration Management Metrics",
+                "period": 300,
+                "stat": "Sum",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${ConfigManagerFunction}' | fields @timestamp, @message\n| filter @message like /Configuration loaded/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Configuration Load Events"
+              }
+            }
+          ]
+        }
+
+# Stack Outputs
+Outputs:
+  LambdaFunctionName:
+    Description: Name of the Lambda function for configuration management
+    Value: !Ref ConfigManagerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function for configuration management
+    Value: !GetAtt ConfigManagerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  ParameterStorePrefix:
+    Description: Parameter Store prefix for configuration parameters
+    Value: !Ref ParameterPrefix
+    Export:
+      Name: !Sub '${AWS::StackName}-ParameterStorePrefix'
+
+  EventBridgeRuleName:
+    Description: Name of the EventBridge rule for parameter changes
+    Value: !Ref ParameterChangeRule
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeRuleName'
+
+  IAMRoleArn:
+    Description: ARN of the IAM role used by the Lambda function
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IAMRoleArn'
+
+  CloudWatchLogGroup:
+    Description: CloudWatch Log Group for the Lambda function
+    Value: !Ref ConfigManagerLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchLogGroup'
+
+  DashboardURL:
+    Condition: EnableMonitoring
+    Description: URL to the CloudWatch Dashboard for monitoring
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ConfigManagerDashboard}'
+
+  SampleParameters:
+    Description: List of sample parameters created in Parameter Store
+    Value: !Sub |
+      ${ParameterPrefix}/database/host
+      ${ParameterPrefix}/database/port
+      ${ParameterPrefix}/api/timeout
+      ${ParameterPrefix}/features/new-ui
+      ${ParameterPrefix}/database/password
+
+  TestCommand:
+    Description: AWS CLI command to test the Lambda function
+    Value: !Sub 'aws lambda invoke --function-name ${ConfigManagerFunction} --payload "{}" response.json && cat response.json'
+
+  UpdateParameterCommand:
+    Description: Example AWS CLI command to update a parameter (triggers EventBridge)
+    Value: !Sub 'aws ssm put-parameter --name "${ParameterPrefix}/api/timeout" --value "45" --type "String" --overwrite'

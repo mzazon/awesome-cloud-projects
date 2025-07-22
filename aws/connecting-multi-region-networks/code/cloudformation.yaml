@@ -1,0 +1,655 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Multi-Region VPC Connectivity with Transit Gateway
+  Creates a scalable hub-and-spoke network architecture using AWS Transit Gateway
+  with cross-region peering for secure, centralized connectivity between VPCs.
+  
+  This template deploys the primary region infrastructure including:
+  - Multiple VPCs with subnets
+  - Transit Gateway with custom route tables
+  - VPC attachments and routing configuration
+  - Security groups and monitoring resources
+  
+  Note: This template must be deployed in both regions with appropriate parameters.
+  Cross-region peering requires manual configuration or separate stack deployment.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - ProjectName
+          - PrimaryRegion
+          - SecondaryRegion
+          - VpcACidr
+          - VpcBCidr
+          - RemoteVpcACidr
+          - RemoteVpcBCidr
+      - Label:
+          default: "Transit Gateway Configuration"
+        Parameters:
+          - TransitGatewayAsn
+          - EnableDefaultRouteTableAssociation
+          - EnableDefaultRouteTablePropagation
+      - Label:
+          default: "Monitoring and Security"
+        Parameters:
+          - EnableCloudWatchDashboard
+          - EnableFlowLogs
+          - CrossRegionSecurityGroupAccess
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      PrimaryRegion:
+        default: "Primary AWS Region"
+      SecondaryRegion:
+        default: "Secondary AWS Region"
+      VpcACidr:
+        default: "VPC A CIDR Block"
+      VpcBCidr:
+        default: "VPC B CIDR Block"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Name prefix for all resources
+    Default: multi-region-tgw
+    AllowedPattern: ^[a-z0-9\-]+$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    
+  PrimaryRegion:
+    Type: String
+    Description: Primary AWS region for this deployment
+    Default: us-east-1
+    AllowedValues:
+      - us-east-1
+      - us-west-2
+      - eu-west-1
+      - eu-central-1
+      - ap-southeast-1
+      - ap-northeast-1
+    
+  SecondaryRegion:
+    Type: String
+    Description: Secondary AWS region for cross-region peering
+    Default: us-west-2
+    AllowedValues:
+      - us-east-1
+      - us-west-2
+      - eu-west-1
+      - eu-central-1
+      - ap-southeast-1
+      - ap-northeast-1
+    
+  VpcACidr:
+    Type: String
+    Description: CIDR block for VPC A in this region
+    Default: 10.1.0.0/16
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    ConstraintDescription: Must be a valid IP CIDR range between /16 and /28
+    
+  VpcBCidr:
+    Type: String
+    Description: CIDR block for VPC B in this region
+    Default: 10.2.0.0/16
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    ConstraintDescription: Must be a valid IP CIDR range between /16 and /28
+    
+  RemoteVpcACidr:
+    Type: String
+    Description: CIDR block for VPC A in the remote region (for routing)
+    Default: 10.3.0.0/16
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    ConstraintDescription: Must be a valid IP CIDR range between /16 and /28
+    
+  RemoteVpcBCidr:
+    Type: String
+    Description: CIDR block for VPC B in the remote region (for routing)
+    Default: 10.4.0.0/16
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    ConstraintDescription: Must be a valid IP CIDR range between /16 and /28
+    
+  TransitGatewayAsn:
+    Type: Number
+    Description: BGP ASN for the Transit Gateway
+    Default: 64512
+    MinValue: 64512
+    MaxValue: 65534
+    ConstraintDescription: Must be a private ASN between 64512 and 65534
+    
+  EnableDefaultRouteTableAssociation:
+    Type: String
+    Description: Enable default route table association for Transit Gateway
+    Default: enable
+    AllowedValues:
+      - enable
+      - disable
+    
+  EnableDefaultRouteTablePropagation:
+    Type: String
+    Description: Enable default route table propagation for Transit Gateway
+    Default: enable
+    AllowedValues:
+      - enable
+      - disable
+    
+  EnableCloudWatchDashboard:
+    Type: String
+    Description: Create CloudWatch dashboard for monitoring
+    Default: true
+    AllowedValues:
+      - true
+      - false
+    
+  EnableFlowLogs:
+    Type: String
+    Description: Enable VPC Flow Logs for network monitoring
+    Default: true
+    AllowedValues:
+      - true
+      - false
+    
+  CrossRegionSecurityGroupAccess:
+    Type: String
+    Description: Enable ICMP access between regions for testing
+    Default: true
+    AllowedValues:
+      - true
+      - false
+
+Conditions:
+  CreateCloudWatchDashboard: !Equals [!Ref EnableCloudWatchDashboard, true]
+  CreateFlowLogs: !Equals [!Ref EnableFlowLogs, true]
+  CreateCrossRegionSecurityGroups: !Equals [!Ref CrossRegionSecurityGroupAccess, true]
+  IsPrimaryRegion: !Equals [!Ref 'AWS::Region', !Ref PrimaryRegion]
+
+Resources:
+  # VPC A - Primary network segment
+  VpcA:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcACidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-vpc-a"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: production
+        - Key: Region
+          Value: !Ref 'AWS::Region'
+  
+  # VPC B - Secondary network segment
+  VpcB:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcBCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-vpc-b"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: production
+        - Key: Region
+          Value: !Ref 'AWS::Region'
+  
+  # Subnet for VPC A - Required for Transit Gateway attachment
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcA
+      CidrBlock: !Select [0, !Cidr [!Ref VpcACidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-subnet-a"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: VPC
+          Value: !Ref VpcA
+  
+  # Subnet for VPC B - Required for Transit Gateway attachment
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcB
+      CidrBlock: !Select [0, !Cidr [!Ref VpcBCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-subnet-b"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: VPC
+          Value: !Ref VpcB
+  
+  # Transit Gateway - Regional networking hub
+  TransitGateway:
+    Type: AWS::EC2::TransitGateway
+    Properties:
+      Description: !Sub "Transit Gateway for ${ProjectName} multi-region connectivity"
+      DefaultRouteTableAssociation: !Ref EnableDefaultRouteTableAssociation
+      DefaultRouteTablePropagation: !Ref EnableDefaultRouteTablePropagation
+      AmazonSideAsn: !Ref TransitGatewayAsn
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-tgw"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: production
+        - Key: Region
+          Value: !Ref 'AWS::Region'
+  
+  # Custom Route Table for granular routing control
+  CustomRouteTable:
+    Type: AWS::EC2::TransitGatewayRouteTable
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-custom-rt"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: "Custom routing for cross-region connectivity"
+  
+  # VPC A attachment to Transit Gateway
+  VpcAAttachment:
+    Type: AWS::EC2::TransitGatewayVpcAttachment
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref VpcA
+      SubnetIds:
+        - !Ref SubnetA
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-vpc-a-attachment"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: VPC
+          Value: !Ref VpcA
+  
+  # VPC B attachment to Transit Gateway
+  VpcBAttachment:
+    Type: AWS::EC2::TransitGatewayVpcAttachment
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref VpcB
+      SubnetIds:
+        - !Ref SubnetB
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-vpc-b-attachment"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: VPC
+          Value: !Ref VpcB
+  
+  # Route Table Association for VPC A
+  VpcARouteTableAssociation:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties:
+      TransitGatewayAttachmentId: !Ref VpcAAttachment
+      TransitGatewayRouteTableId: !Ref CustomRouteTable
+  
+  # Route Table Association for VPC B
+  VpcBRouteTableAssociation:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties:
+      TransitGatewayAttachmentId: !Ref VpcBAttachment
+      TransitGatewayRouteTableId: !Ref CustomRouteTable
+  
+  # Security Group for VPC A (Cross-region access)
+  VpcASecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateCrossRegionSecurityGroups
+    Properties:
+      GroupDescription: Security group for cross-region connectivity testing
+      VpcId: !Ref VpcA
+      SecurityGroupIngress:
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: !Ref RemoteVpcACidr
+          Description: "ICMP from remote region VPC A"
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: !Ref RemoteVpcBCidr
+          Description: "ICMP from remote region VPC B"
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref RemoteVpcACidr
+          Description: "HTTP from remote region VPC A"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref RemoteVpcACidr
+          Description: "HTTPS from remote region VPC A"
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: "All outbound traffic"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-vpc-a-sg"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: "Cross-region connectivity testing"
+  
+  # Security Group for VPC B (Cross-region access)
+  VpcBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateCrossRegionSecurityGroups
+    Properties:
+      GroupDescription: Security group for cross-region connectivity testing
+      VpcId: !Ref VpcB
+      SecurityGroupIngress:
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: !Ref RemoteVpcACidr
+          Description: "ICMP from remote region VPC A"
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: !Ref RemoteVpcBCidr
+          Description: "ICMP from remote region VPC B"
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref RemoteVpcBCidr
+          Description: "HTTP from remote region VPC B"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref RemoteVpcBCidr
+          Description: "HTTPS from remote region VPC B"
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: "All outbound traffic"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-vpc-b-sg"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: "Cross-region connectivity testing"
+  
+  # IAM Role for VPC Flow Logs
+  FlowLogsRole:
+    Type: AWS::IAM::Role
+    Condition: CreateFlowLogs
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/VPCFlowLogsDeliveryRolePolicy
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-flowlogs-role"
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # CloudWatch Log Group for VPC Flow Logs
+  FlowLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateFlowLogs
+    Properties:
+      LogGroupName: !Sub "/aws/vpc/flowlogs/${ProjectName}"
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-flowlogs"
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # VPC Flow Logs for VPC A
+  VpcAFlowLogs:
+    Type: AWS::EC2::FlowLog
+    Condition: CreateFlowLogs
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref VpcA
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref FlowLogsGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogsRole.Arn
+      LogFormat: '${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${windowstart} ${windowend} ${action}'
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-vpc-a-flowlogs"
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # VPC Flow Logs for VPC B
+  VpcBFlowLogs:
+    Type: AWS::EC2::FlowLog
+    Condition: CreateFlowLogs
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref VpcB
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref FlowLogsGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogsRole.Arn
+      LogFormat: '${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${windowstart} ${windowend} ${action}'
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-vpc-b-flowlogs"
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # CloudWatch Dashboard for Transit Gateway monitoring
+  TransitGatewayDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateCloudWatchDashboard
+    Properties:
+      DashboardName: !Sub "${ProjectName}-tgw-dashboard"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/TransitGateway", "BytesIn", "TransitGateway", "${TransitGateway}" ],
+                  [ ".", "BytesOut", ".", "." ],
+                  [ ".", "PacketDropCount", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Transit Gateway Traffic Metrics",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/TransitGateway", "BytesIn", "TransitGateway", "${TransitGateway}", { "stat": "Average" } ],
+                  [ ".", "BytesOut", ".", ".", { "stat": "Average" } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Transit Gateway Average Throughput",
+                "period": 300,
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/vpc/flowlogs/${ProjectName}' | fields @timestamp, srcaddr, dstaddr, srcport, dstport, protocol, action\n| filter action = \"REJECT\"\n| stats count() by srcaddr, dstaddr\n| sort count desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Top Rejected Connections (Flow Logs)",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  # VPC Information
+  VpcAId:
+    Description: VPC A ID
+    Value: !Ref VpcA
+    Export:
+      Name: !Sub "${ProjectName}-vpc-a-id"
+  
+  VpcBId:
+    Description: VPC B ID
+    Value: !Ref VpcB
+    Export:
+      Name: !Sub "${ProjectName}-vpc-b-id"
+  
+  VpcACidr:
+    Description: VPC A CIDR Block
+    Value: !Ref VpcACidr
+    Export:
+      Name: !Sub "${ProjectName}-vpc-a-cidr"
+  
+  VpcBCidr:
+    Description: VPC B CIDR Block
+    Value: !Ref VpcBCidr
+    Export:
+      Name: !Sub "${ProjectName}-vpc-b-cidr"
+  
+  # Subnet Information
+  SubnetAId:
+    Description: Subnet A ID
+    Value: !Ref SubnetA
+    Export:
+      Name: !Sub "${ProjectName}-subnet-a-id"
+  
+  SubnetBId:
+    Description: Subnet B ID
+    Value: !Ref SubnetB
+    Export:
+      Name: !Sub "${ProjectName}-subnet-b-id"
+  
+  # Transit Gateway Information
+  TransitGatewayId:
+    Description: Transit Gateway ID
+    Value: !Ref TransitGateway
+    Export:
+      Name: !Sub "${ProjectName}-tgw-id"
+  
+  TransitGatewayAsn:
+    Description: Transit Gateway ASN
+    Value: !Ref TransitGatewayAsn
+    Export:
+      Name: !Sub "${ProjectName}-tgw-asn"
+  
+  CustomRouteTableId:
+    Description: Custom Route Table ID
+    Value: !Ref CustomRouteTable
+    Export:
+      Name: !Sub "${ProjectName}-custom-rt-id"
+  
+  # Attachment Information
+  VpcAAttachmentId:
+    Description: VPC A Transit Gateway Attachment ID
+    Value: !Ref VpcAAttachment
+    Export:
+      Name: !Sub "${ProjectName}-vpc-a-attachment-id"
+  
+  VpcBAttachmentId:
+    Description: VPC B Transit Gateway Attachment ID
+    Value: !Ref VpcBAttachment
+    Export:
+      Name: !Sub "${ProjectName}-vpc-b-attachment-id"
+  
+  # Security Group Information
+  VpcASecurityGroupId:
+    Condition: CreateCrossRegionSecurityGroups
+    Description: VPC A Security Group ID
+    Value: !Ref VpcASecurityGroup
+    Export:
+      Name: !Sub "${ProjectName}-vpc-a-sg-id"
+  
+  VpcBSecurityGroupId:
+    Condition: CreateCrossRegionSecurityGroups
+    Description: VPC B Security Group ID
+    Value: !Ref VpcBSecurityGroup
+    Export:
+      Name: !Sub "${ProjectName}-vpc-b-sg-id"
+  
+  # Monitoring Information
+  CloudWatchDashboardUrl:
+    Condition: CreateCloudWatchDashboard
+    Description: CloudWatch Dashboard URL
+    Value: !Sub "https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-tgw-dashboard"
+  
+  FlowLogsGroupName:
+    Condition: CreateFlowLogs
+    Description: VPC Flow Logs CloudWatch Log Group
+    Value: !Ref FlowLogsGroup
+    Export:
+      Name: !Sub "${ProjectName}-flowlogs-group"
+  
+  # Cross-Region Peering Information
+  PeeringInstructions:
+    Description: Instructions for setting up cross-region peering
+    Value: !Sub |
+      To complete cross-region setup:
+      1. Deploy this template in ${SecondaryRegion}
+      2. Create peering attachment from ${AWS::Region} to ${SecondaryRegion}
+      3. Accept peering attachment in ${SecondaryRegion}
+      4. Create routes for remote VPC CIDRs (${RemoteVpcACidr}, ${RemoteVpcBCidr})
+      5. Associate peering attachment with custom route tables
+  
+  # Region and Project Information
+  DeployedRegion:
+    Description: AWS Region where this stack was deployed
+    Value: !Ref 'AWS::Region'
+    Export:
+      Name: !Sub "${ProjectName}-deployed-region"
+  
+  ProjectName:
+    Description: Project name used for resource naming
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub "${ProjectName}-project-name"
+  
+  StackName:
+    Description: CloudFormation stack name
+    Value: !Ref 'AWS::StackName'
+    Export:
+      Name: !Sub "${ProjectName}-stack-name"

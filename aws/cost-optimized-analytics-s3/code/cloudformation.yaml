@@ -1,0 +1,508 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Cost-Optimized Analytics with S3 Tiering - Deploy S3, Athena, Glue, and CloudWatch resources for automated storage optimization and analytics'
+
+Parameters:
+  BucketPrefix:
+    Type: String
+    Default: 'cost-optimized-analytics'
+    Description: 'Prefix for the S3 bucket name (random suffix will be added)'
+    AllowedPattern: '^[a-z0-9-]*$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+    MinLength: 3
+    MaxLength: 50
+
+  DataPrefix:
+    Type: String
+    Default: 'analytics-data'
+    Description: 'Prefix for data objects in S3 bucket'
+    AllowedPattern: '^[a-zA-Z0-9-_/]*$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, hyphens, underscores, and forward slashes'
+
+  ArchiveTierDays:
+    Type: Number
+    Default: 90
+    Description: 'Number of days before transitioning to Archive Instant Access tier'
+    MinValue: 1
+    MaxValue: 365
+
+  DeepArchiveTierDays:
+    Type: Number
+    Default: 180
+    Description: 'Number of days before transitioning to Deep Archive Access tier'
+    MinValue: 1
+    MaxValue: 730
+
+  AthenaBytesScannedLimit:
+    Type: Number
+    Default: 1073741824
+    Description: 'Athena query bytes scanned cutoff limit (1GB = 1073741824 bytes)'
+    MinValue: 104857600
+    MaxValue: 10737418240
+
+  EnableCostAnomalyDetection:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable Cost Anomaly Detection for S3 costs'
+
+Conditions:
+  CreateCostAnomalyDetection: !Equals [!Ref EnableCostAnomalyDetection, 'true']
+
+Resources:
+  # S3 Bucket with Intelligent-Tiering
+  AnalyticsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${BucketPrefix}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      LifecycleConfiguration:
+        Rules:
+          - Id: 'IntelligentTieringTransition'
+            Status: Enabled
+            Filter:
+              Prefix: !Sub '${DataPrefix}/'
+            Transitions:
+              - TransitionInDays: 0
+                StorageClass: INTELLIGENT_TIERING
+      IntelligentTieringConfigurations:
+        - Id: 'CostOptimizationConfig'
+          Status: Enabled
+          Prefix: !Sub '${DataPrefix}/'
+          OptionalFields:
+            - BucketKeyStatus
+          Tierings:
+            - Days: !Ref ArchiveTierDays
+              AccessTier: ARCHIVE_ACCESS
+            - Days: !Ref DeepArchiveTierDays
+              AccessTier: DEEP_ARCHIVE_ACCESS
+      Tags:
+        - Key: 'Purpose'
+          Value: 'Cost-Optimized Analytics'
+        - Key: 'StorageClass'
+          Value: 'IntelligentTiering'
+
+  # S3 Bucket Policy for Secure Access
+  AnalyticsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AnalyticsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: 'DenyInsecureConnections'
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${AnalyticsBucket}/*'
+              - !Ref AnalyticsBucket
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: 'AllowAthenaAccess'
+            Effect: Allow
+            Principal:
+              Service: 'athena.amazonaws.com'
+            Action:
+              - 's3:GetObject'
+              - 's3:ListBucket'
+              - 's3:GetBucketLocation'
+            Resource:
+              - !Sub '${AnalyticsBucket}/*'
+              - !Ref AnalyticsBucket
+
+  # AWS Glue Database
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub 'analytics_database_${AWS::AccountId}'
+        Description: 'Cost-optimized analytics database for S3 Intelligent-Tiering'
+
+  # AWS Glue Table for Transaction Logs
+  GlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: 'transaction_logs'
+        Description: 'Transaction logs table for cost-optimized analytics'
+        TableType: 'EXTERNAL_TABLE'
+        Parameters:
+          'classification': 'csv'
+          'compressionType': 'none'
+          'delimiter': ','
+          'typeOfData': 'file'
+        StorageDescriptor:
+          Columns:
+            - Name: 'timestamp'
+              Type: 'string'
+              Comment: 'Transaction timestamp'
+            - Name: 'user_id'
+              Type: 'string'
+              Comment: 'User identifier'
+            - Name: 'transaction_id'
+              Type: 'string'
+              Comment: 'Transaction identifier'
+            - Name: 'amount'
+              Type: 'string'
+              Comment: 'Transaction amount'
+          Location: !Sub 's3://${AnalyticsBucket}/${DataPrefix}/'
+          InputFormat: 'org.apache.hadoop.mapred.TextInputFormat'
+          OutputFormat: 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+          SerdeInfo:
+            SerializationLibrary: 'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe'
+            Parameters:
+              'field.delim': ','
+              'serialization.format': ','
+          StoredAsSubDirectories: false
+          Compressed: false
+
+  # Athena Workgroup with Cost Controls
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub 'cost-optimized-workgroup-${AWS::AccountId}'
+      Description: 'Cost-optimized workgroup for analytics with S3 Intelligent-Tiering'
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetrics: true
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${AnalyticsBucket}/athena-results/'
+          EncryptionConfiguration:
+            EncryptionOption: 'SSE_S3'
+        BytesScannedCutoffPerQuery: !Ref AthenaBytesScannedLimit
+      Tags:
+        - Key: 'Purpose'
+          Value: 'Cost-Optimized Analytics'
+
+  # CloudWatch Log Group for S3 Access Logs
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/access-logs/${AnalyticsBucket}'
+      RetentionInDays: 30
+
+  # CloudWatch Dashboard for Cost Monitoring
+  CostMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'S3-Cost-Optimization-${AWS::AccountId}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/S3", "BucketSizeBytes", "BucketName", "${AnalyticsBucket}", "StorageType", "IntelligentTieringFAStorage"],
+                  [".", ".", ".", ".", ".", "IntelligentTieringIAStorage"],
+                  [".", ".", ".", ".", ".", "IntelligentTieringAAStorage"],
+                  [".", ".", ".", ".", ".", "IntelligentTieringAIAStorage"],
+                  [".", ".", ".", ".", ".", "IntelligentTieringDAAStorage"]
+                ],
+                "view": "timeSeries",
+                "stacked": true,
+                "region": "${AWS::Region}",
+                "title": "S3 Intelligent-Tiering Storage Distribution",
+                "period": 86400,
+                "stat": "Average",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/S3", "NumberOfObjects", "BucketName", "${AnalyticsBucket}", "StorageType", "AllStorageTypes"]
+                ],
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "title": "Total Objects in Bucket",
+                "period": 86400,
+                "stat": "Average",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Athena", "DataScannedInBytes", "WorkGroup", "${AthenaWorkgroup}"],
+                  [".", "QueryExecutionTime", ".", "."],
+                  [".", "ProcessedBytes", ".", "."]
+                ],
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "title": "Athena Query Performance",
+                "period": 300,
+                "stat": "Sum",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/S3", "BucketSizeBytes", "BucketName", "${AnalyticsBucket}", "StorageType", "StandardStorage"],
+                  [".", ".", ".", ".", ".", "StandardIAStorage"],
+                  [".", ".", ".", ".", ".", "GlacierInstantRetrievalStorage"],
+                  [".", ".", ".", ".", ".", "DeepArchiveStorage"]
+                ],
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "title": "Storage Class Distribution",
+                "period": 86400,
+                "stat": "Average",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+  # Cost Anomaly Detection for S3
+  S3CostAnomalyDetector:
+    Type: AWS::CE::AnomalyDetector
+    Condition: CreateCostAnomalyDetection
+    Properties:
+      DetectorName: !Sub 'S3-Cost-Anomaly-${AWS::AccountId}'
+      MonitorType: 'DIMENSIONAL'
+      MonitorSpecification:
+        DimensionKey: 'SERVICE'
+        MatchOptions: ['EQUALS']
+        Values: ['Amazon Simple Storage Service']
+
+  # Cost Anomaly Subscription for Notifications
+  CostAnomalySubscription:
+    Type: AWS::CE::AnomalySubscription
+    Condition: CreateCostAnomalyDetection
+    Properties:
+      SubscriptionName: !Sub 'S3-Cost-Anomaly-Subscription-${AWS::AccountId}'
+      MonitorArnList:
+        - !GetAtt S3CostAnomalyDetector.DetectorArn
+      Subscribers:
+        - Type: 'EMAIL'
+          Address: !Sub '${AWS::AccountId}@example.com'  # Replace with actual email
+      Frequency: 'DAILY'
+
+  # IAM Role for Athena Query Execution
+  AthenaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'AthenaExecutionRole-${AWS::AccountId}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 'athena.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonAthenaFullAccess'
+      Policies:
+        - PolicyName: 'S3AccessPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                  - 's3:GetBucketLocation'
+                  - 's3:ListBucketMultipartUploads'
+                  - 's3:ListMultipartUploadParts'
+                  - 's3:AbortMultipartUpload'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                Resource:
+                  - !Sub '${AnalyticsBucket}/*'
+                  - !Ref AnalyticsBucket
+              - Effect: Allow
+                Action:
+                  - 'glue:GetDatabase'
+                  - 'glue:GetTable'
+                  - 'glue:GetPartition'
+                  - 'glue:GetPartitions'
+                  - 'glue:BatchCreatePartition'
+                  - 'glue:BatchDeletePartition'
+                  - 'glue:BatchUpdatePartition'
+                Resource: '*'
+
+  # CloudWatch Alarm for High Query Costs
+  HighQueryCostAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'HighAthenaQueryCost-${AWS::AccountId}'
+      AlarmDescription: 'Alarm when Athena queries scan more than 10GB in an hour'
+      MetricName: 'DataScannedInBytes'
+      Namespace: 'AWS/Athena'
+      Statistic: 'Sum'
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 10737418240  # 10GB in bytes
+      ComparisonOperator: 'GreaterThanThreshold'
+      Dimensions:
+        - Name: 'WorkGroup'
+          Value: !Ref AthenaWorkgroup
+      TreatMissingData: 'notBreaching'
+
+  # CloudWatch Alarm for Storage Cost Optimization
+  StorageOptimizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'S3StorageOptimization-${AWS::AccountId}'
+      AlarmDescription: 'Monitor S3 Intelligent-Tiering effectiveness'
+      MetricName: 'BucketSizeBytes'
+      Namespace: 'AWS/S3'
+      Statistic: 'Average'
+      Period: 86400
+      EvaluationPeriods: 7
+      Threshold: 0
+      ComparisonOperator: 'GreaterThanThreshold'
+      Dimensions:
+        - Name: 'BucketName'
+          Value: !Ref AnalyticsBucket
+        - Name: 'StorageType'
+          Value: 'IntelligentTieringIAStorage'
+      TreatMissingData: 'notBreaching'
+
+Outputs:
+  BucketName:
+    Description: 'Name of the S3 bucket created for analytics data'
+    Value: !Ref AnalyticsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketName'
+
+  BucketArn:
+    Description: 'ARN of the S3 bucket'
+    Value: !GetAtt AnalyticsBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketArn'
+
+  GlueDatabaseName:
+    Description: 'Name of the Glue database'
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabaseName'
+
+  GlueTableName:
+    Description: 'Name of the Glue table for transaction logs'
+    Value: !Ref GlueTable
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueTableName'
+
+  AthenaWorkgroupName:
+    Description: 'Name of the Athena workgroup'
+    Value: !Ref AthenaWorkgroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaWorkgroupName'
+
+  DashboardURL:
+    Description: 'URL to the CloudWatch dashboard for cost monitoring'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${CostMonitoringDashboard}'
+
+  DataLocation:
+    Description: 'S3 location for uploading analytics data'
+    Value: !Sub 's3://${AnalyticsBucket}/${DataPrefix}/'
+
+  QueryResultsLocation:
+    Description: 'S3 location for Athena query results'
+    Value: !Sub 's3://${AnalyticsBucket}/athena-results/'
+
+  IntelligentTieringConfiguration:
+    Description: 'S3 Intelligent-Tiering configuration details'
+    Value: !Sub 'Archive after ${ArchiveTierDays} days, Deep Archive after ${DeepArchiveTierDays} days'
+
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for 100GB with mixed access patterns'
+    Value: '$15-25 (varies based on access patterns and data growth)'
+
+  CostOptimizationTips:
+    Description: 'Key tips for maximizing cost savings'
+    Value: 'Use columnar formats like Parquet, partition data by date, enable query result caching, monitor access patterns via Storage Class Analysis'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'S3 Configuration'
+        Parameters:
+          - BucketPrefix
+          - DataPrefix
+      - Label:
+          default: 'Intelligent-Tiering Settings'
+        Parameters:
+          - ArchiveTierDays
+          - DeepArchiveTierDays
+      - Label:
+          default: 'Athena Configuration'
+        Parameters:
+          - AthenaBytesScannedLimit
+      - Label:
+          default: 'Cost Monitoring'
+        Parameters:
+          - EnableCostAnomalyDetection
+    ParameterLabels:
+      BucketPrefix:
+        default: 'S3 Bucket Prefix'
+      DataPrefix:
+        default: 'Data Object Prefix'
+      ArchiveTierDays:
+        default: 'Days to Archive Tier'
+      DeepArchiveTierDays:
+        default: 'Days to Deep Archive'
+      AthenaBytesScannedLimit:
+        default: 'Athena Query Limit (Bytes)'
+      EnableCostAnomalyDetection:
+        default: 'Enable Cost Anomaly Detection'

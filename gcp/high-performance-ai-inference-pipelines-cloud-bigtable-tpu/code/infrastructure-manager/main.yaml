@@ -1,0 +1,565 @@
+# Infrastructure Manager Configuration for High-Performance AI Inference Pipelines
+# This configuration deploys a complete AI inference pipeline with:
+# - Cloud Bigtable for ultra-low latency feature storage
+# - Memorystore Redis for intelligent caching
+# - Vertex AI TPU endpoints for high-performance inference
+# - Cloud Functions for serverless orchestration
+# - Comprehensive monitoring and alerting
+
+# Input variables for customization
+variables:
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    
+  region:
+    description: "Primary deployment region"
+    type: string
+    default: "us-central1"
+    
+  zone:
+    description: "Deployment zone for zonal resources"
+    type: string
+    default: "us-central1-a"
+    
+  bigtable_instance_id:
+    description: "Cloud Bigtable instance identifier"
+    type: string
+    default: "feature-store-bt"
+    
+  bigtable_cluster_id:
+    description: "Cloud Bigtable cluster identifier"
+    type: string
+    default: "feature-cluster"
+    
+  bigtable_node_count:
+    description: "Number of Bigtable nodes for performance scaling"
+    type: number
+    default: 3
+    
+  redis_memory_size:
+    description: "Redis cache memory size in GB"
+    type: number
+    default: 5
+    
+  tpu_endpoint_name:
+    description: "Vertex AI TPU endpoint name"
+    type: string
+    default: "high-perf-inference"
+    
+  function_memory:
+    description: "Cloud Function memory allocation"
+    type: string
+    default: "2Gi"
+    
+  function_timeout:
+    description: "Cloud Function timeout in seconds"
+    type: number
+    default: 60
+    
+  function_min_instances:
+    description: "Minimum Cloud Function instances"
+    type: number
+    default: 2
+    
+  function_max_instances:
+    description: "Maximum Cloud Function instances"
+    type: number
+    default: 100
+    
+  enable_monitoring:
+    description: "Enable comprehensive monitoring and alerting"
+    type: bool
+    default: true
+    
+  environment:
+    description: "Environment tag for resource organization"
+    type: string
+    default: "production"
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-bigtable-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(var.project_id)/services/bigtable.googleapis.com
+      
+  - name: enable-aiplatform-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(var.project_id)/services/aiplatform.googleapis.com
+      
+  - name: enable-cloudfunctions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(var.project_id)/services/cloudfunctions.googleapis.com
+      
+  - name: enable-redis-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(var.project_id)/services/redis.googleapis.com
+      
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(var.project_id)/services/monitoring.googleapis.com
+      
+  - name: enable-logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(var.project_id)/services/logging.googleapis.com
+      
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(var.project_id)/services/storage.googleapis.com
+
+  # Cloud Storage bucket for model artifacts
+  - name: model-artifacts-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ai-inference-models-$(var.project_id)
+      location: $(var.region)
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90
+      labels:
+        environment: $(var.environment)
+        component: model-storage
+        recipe: ai-inference-pipeline
+    depends_on:
+      - enable-storage-api
+
+  # Cloud Bigtable instance for ultra-low latency feature storage
+  - name: feature-store-bigtable
+    type: gcp-types/bigtableadmin-v2:projects.instances
+    properties:
+      parent: projects/$(var.project_id)
+      instanceId: $(var.bigtable_instance_id)
+      instance:
+        displayName: AI Feature Store Instance
+        type: PRODUCTION
+        labels:
+          environment: $(var.environment)
+          component: feature-store
+          recipe: ai-inference-pipeline
+    depends_on:
+      - enable-bigtable-api
+
+  # Bigtable cluster with SSD storage for optimal performance
+  - name: feature-store-cluster
+    type: gcp-types/bigtableadmin-v2:projects.instances.clusters
+    properties:
+      parent: projects/$(var.project_id)/instances/$(var.bigtable_instance_id)
+      clusterId: $(var.bigtable_cluster_id)
+      cluster:
+        location: projects/$(var.project_id)/locations/$(var.zone)
+        serveNodes: $(var.bigtable_node_count)
+        defaultStorageType: SSD
+        encryptionConfig:
+          kmsKeyName: ""  # Use Google-managed encryption
+    depends_on:
+      - feature-store-bigtable
+
+  # Memorystore Redis instance for intelligent caching
+  - name: feature-cache-redis
+    type: gcp-types/redis-v1:projects.locations.instances
+    properties:
+      parent: projects/$(var.project_id)/locations/$(var.region)
+      instanceId: feature-cache-redis
+      instance:
+        displayName: Feature Cache Redis
+        tier: STANDARD_HA
+        memorySizeGb: $(var.redis_memory_size)
+        redisVersion: REDIS_7_0
+        redisConfigs:
+          maxmemory-policy: allkeys-lru
+          notify-keyspace-events: Ex
+        transitEncryptionMode: SERVER_AUTHENTICATION
+        authEnabled: true
+        locationId: $(var.zone)
+        alternativeLocationId: us-central1-b
+        labels:
+          environment: $(var.environment)
+          component: caching
+          recipe: ai-inference-pipeline
+    depends_on:
+      - enable-redis-api
+
+  # Service account for Cloud Functions with appropriate permissions
+  - name: inference-function-sa
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      name: projects/$(var.project_id)
+      accountId: inference-function-sa
+      serviceAccount:
+        displayName: AI Inference Function Service Account
+        description: Service account for AI inference orchestration function
+
+  # IAM bindings for the service account
+  - name: bigtable-user-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(var.project_id)
+      role: roles/bigtable.user
+      member: serviceAccount:inference-function-sa@$(var.project_id).iam.gserviceaccount.com
+    depends_on:
+      - inference-function-sa
+
+  - name: redis-editor-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(var.project_id)
+      role: roles/redis.editor
+      member: serviceAccount:inference-function-sa@$(var.project_id).iam.gserviceaccount.com
+    depends_on:
+      - inference-function-sa
+
+  - name: aiplatform-user-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(var.project_id)
+      role: roles/aiplatform.user
+      member: serviceAccount:inference-function-sa@$(var.project_id).iam.gserviceaccount.com
+    depends_on:
+      - inference-function-sa
+
+  - name: storage-object-viewer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(var.project_id)
+      role: roles/storage.objectViewer
+      member: serviceAccount:inference-function-sa@$(var.project_id).iam.gserviceaccount.com
+    depends_on:
+      - inference-function-sa
+
+  - name: monitoring-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(var.project_id)
+      role: roles/monitoring.metricWriter
+      member: serviceAccount:inference-function-sa@$(var.project_id).iam.gserviceaccount.com
+    depends_on:
+      - inference-function-sa
+
+  # Vertex AI model for high-performance inference
+  - name: inference-model
+    type: gcp-types/aiplatform-v1:projects.locations.models
+    properties:
+      parent: projects/$(var.project_id)/locations/$(var.region)
+      model:
+        displayName: high-performance-recommendation-model
+        description: Optimized recommendation model for TPU inference
+        metadataSchemaUri: gs://google-cloud-aiplatform/schema/model/metadata/tabular_1.0.0.yaml
+        artifactUri: gs://ai-inference-models-$(var.project_id)/models/recommendation_model
+        containerSpec:
+          imageUri: us-docker.pkg.dev/vertex-ai-restricted/prediction/tf_opt-tpu.2-15:latest
+          args:
+            - --model_name=recommendation_model
+          env:
+            - name: MODEL_NAME
+              value: recommendation_model
+        labels:
+          environment: $(var.environment)
+          component: ml-model
+          recipe: ai-inference-pipeline
+    depends_on:
+      - enable-aiplatform-api
+      - model-artifacts-bucket
+
+  # Vertex AI endpoint for TPU-optimized inference
+  - name: tpu-inference-endpoint
+    type: gcp-types/aiplatform-v1:projects.locations.endpoints
+    properties:
+      parent: projects/$(var.project_id)/locations/$(var.region)
+      endpoint:
+        displayName: $(var.tpu_endpoint_name)
+        description: TPU-optimized endpoint for high-performance AI inference
+        labels:
+          environment: $(var.environment)
+          component: inference-endpoint
+          recipe: ai-inference-pipeline
+    depends_on:
+      - inference-model
+
+  # Cloud Function for inference orchestration
+  - name: inference-orchestration-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(var.project_id)/locations/$(var.region)
+      function:
+        name: projects/$(var.project_id)/locations/$(var.region)/functions/inference-pipeline
+        description: High-performance inference pipeline orchestration
+        sourceArchiveUrl: gs://ai-inference-models-$(var.project_id)/functions/inference-function.zip
+        entryPoint: inference_pipeline
+        runtime: python311
+        timeout: $(var.function_timeout)s
+        availableMemoryMb: $(var.function_memory)
+        serviceAccountEmail: inference-function-sa@$(var.project_id).iam.gserviceaccount.com
+        httpsTrigger:
+          securityLevel: SECURE_ALWAYS
+        environmentVariables:
+          PROJECT_ID: $(var.project_id)
+          REGION: $(var.region)
+          BIGTABLE_INSTANCE_ID: $(var.bigtable_instance_id)
+          REDIS_HOST: $(ref.feature-cache-redis.host)
+          REDIS_PORT: $(ref.feature-cache-redis.port)
+          ENDPOINT_ID: $(ref.tpu-inference-endpoint.name)
+          ENVIRONMENT: $(var.environment)
+        labels:
+          environment: $(var.environment)
+          component: orchestration
+          recipe: ai-inference-pipeline
+    depends_on:
+      - enable-cloudfunctions-api
+      - inference-function-sa
+      - feature-cache-redis
+      - tpu-inference-endpoint
+      - model-artifacts-bucket
+
+  # Monitoring alert policy for high latency
+  - name: high-latency-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      name: projects/$(var.project_id)
+      alertPolicy:
+        displayName: AI Inference Pipeline - High Latency Alert
+        documentation:
+          content: Alert triggered when inference pipeline latency exceeds 500ms
+          mimeType: text/markdown
+        conditions:
+          - displayName: High Latency Condition
+            conditionThreshold:
+              filter: >
+                resource.type="cloud_function" AND
+                resource.labels.function_name="inference-pipeline" AND
+                metric.type="cloudfunctions.googleapis.com/function/execution_time"
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 500
+              duration: 60s
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_MEAN
+                  crossSeriesReducer: REDUCE_MEAN
+                  groupByFields:
+                    - resource.labels.function_name
+        enabled: $(var.enable_monitoring)
+        alertStrategy:
+          autoClose: 86400s
+        labels:
+          environment: $(var.environment)
+          component: monitoring
+          recipe: ai-inference-pipeline
+    depends_on:
+      - enable-monitoring-api
+      - inference-orchestration-function
+
+  # Monitoring alert policy for error rate
+  - name: error-rate-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      name: projects/$(var.project_id)
+      alertPolicy:
+        displayName: AI Inference Pipeline - Error Rate Alert
+        documentation:
+          content: Alert triggered when inference pipeline error rate exceeds 5%
+          mimeType: text/markdown
+        conditions:
+          - displayName: High Error Rate Condition
+            conditionThreshold:
+              filter: >
+                resource.type="cloud_function" AND
+                resource.labels.function_name="inference-pipeline" AND
+                metric.type="cloudfunctions.googleapis.com/function/execution_count"
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 0.05
+              duration: 120s
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_MEAN
+                  groupByFields:
+                    - resource.labels.function_name
+                    - metric.labels.status
+        enabled: $(var.enable_monitoring)
+        alertStrategy:
+          autoClose: 86400s
+        labels:
+          environment: $(var.environment)
+          component: monitoring
+          recipe: ai-inference-pipeline
+    depends_on:
+      - enable-monitoring-api
+      - inference-orchestration-function
+
+  # Log-based metric for inference latency tracking
+  - name: inference-latency-metric
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      parent: projects/$(var.project_id)
+      metric:
+        name: inference_latency
+        description: Track inference pipeline latency from function logs
+        filter: >
+          resource.type="cloud_function" AND
+          resource.labels.function_name="inference-pipeline" AND
+          jsonPayload.latency_ms>0
+        metricDescriptor:
+          metricKind: GAUGE
+          valueType: DOUBLE
+          unit: ms
+        valueExtractor: EXTRACT(jsonPayload.latency_ms)
+        labels:
+          environment: $(var.environment)
+          component: metrics
+          recipe: ai-inference-pipeline
+    depends_on:
+      - enable-logging-api
+      - inference-orchestration-function
+
+  # Log-based metric for cache hit ratio tracking
+  - name: cache-hit-ratio-metric
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      parent: projects/$(var.project_id)
+      metric:
+        name: cache_hit_ratio
+        description: Track Redis cache hit ratio from function logs
+        filter: >
+          resource.type="cloud_function" AND
+          resource.labels.function_name="inference-pipeline" AND
+          jsonPayload.message:"Cache hit"
+        metricDescriptor:
+          metricKind: CUMULATIVE
+          valueType: INT64
+          unit: 1
+        labels:
+          environment: $(var.environment)
+          component: metrics
+          recipe: ai-inference-pipeline
+    depends_on:
+      - enable-logging-api
+      - inference-orchestration-function
+
+  # Network security: VPC connector for serverless access (optional)
+  - name: serverless-vpc-connector
+    type: gcp-types/vpcaccess-v1:projects.locations.connectors
+    properties:
+      parent: projects/$(var.project_id)/locations/$(var.region)
+      connectorId: ai-inference-connector
+      connector:
+        name: projects/$(var.project_id)/locations/$(var.region)/connectors/ai-inference-connector
+        ipCidrRange: 10.8.0.0/28
+        minThroughput: 200
+        maxThroughput: 1000
+        machineType: e2-micro
+        labels:
+          environment: $(var.environment)
+          component: networking
+          recipe: ai-inference-pipeline
+
+# Outputs for integration and verification
+outputs:
+  - name: bigtable_instance_id
+    description: Cloud Bigtable instance ID for feature storage
+    value: $(ref.feature-store-bigtable.name)
+    
+  - name: bigtable_cluster_id
+    description: Cloud Bigtable cluster ID
+    value: $(ref.feature-store-cluster.name)
+    
+  - name: redis_host
+    description: Redis cache host address
+    value: $(ref.feature-cache-redis.host)
+    
+  - name: redis_port
+    description: Redis cache port
+    value: $(ref.feature-cache-redis.port)
+    
+  - name: redis_auth_string
+    description: Redis authentication string
+    value: $(ref.feature-cache-redis.authString)
+    
+  - name: model_id
+    description: Vertex AI model resource ID
+    value: $(ref.inference-model.name)
+    
+  - name: endpoint_id
+    description: Vertex AI TPU endpoint resource ID
+    value: $(ref.tpu-inference-endpoint.name)
+    
+  - name: function_url
+    description: Cloud Function trigger URL for inference requests
+    value: $(ref.inference-orchestration-function.httpsTrigger.url)
+    
+  - name: function_service_account
+    description: Service account email for the inference function
+    value: $(ref.inference-function-sa.email)
+    
+  - name: storage_bucket
+    description: Cloud Storage bucket for model artifacts
+    value: $(ref.model-artifacts-bucket.name)
+    
+  - name: vpc_connector_name
+    description: VPC connector for serverless networking
+    value: $(ref.serverless-vpc-connector.name)
+    
+  - name: monitoring_enabled
+    description: Whether monitoring and alerting is enabled
+    value: $(var.enable_monitoring)
+    
+  - name: deployment_region
+    description: Primary deployment region
+    value: $(var.region)
+    
+  - name: deployment_zone
+    description: Primary deployment zone
+    value: $(var.zone)
+
+# Metadata for Infrastructure Manager
+metadata:
+  version: "1.0"
+  description: "High-Performance AI Inference Pipeline with Cloud Bigtable and TPU"
+  author: "Google Cloud Recipe Generator"
+  created: "2025-07-12"
+  updated: "2025-07-12"
+  recipe_version: "1.0"
+  components:
+    - "Cloud Bigtable"
+    - "Vertex AI TPU"
+    - "Cloud Functions"
+    - "Memorystore Redis"
+    - "Cloud Monitoring"
+    - "Cloud Logging"
+  estimated_cost: "$150-300 for TPU resources during deployment"
+  deployment_time: "15-20 minutes"
+  complexity: "Advanced (400 level)"
+  use_cases:
+    - "Real-time AI inference at scale"
+    - "High-performance recommendation systems"
+    - "Ultra-low latency feature serving"
+    - "Enterprise AI applications"
+  security_features:
+    - "Service account with least privilege access"
+    - "Encrypted data at rest and in transit"
+    - "VPC connector for secure networking"
+    - "Redis authentication enabled"
+  performance_features:
+    - "TPU v7 acceleration"
+    - "Multi-level caching strategy"
+    - "Optimized Bigtable schema"
+    - "Auto-scaling Cloud Functions"
+  monitoring_features:
+    - "Latency and error rate alerting"
+    - "Custom log-based metrics"
+    - "Comprehensive resource monitoring"
+    - "Performance dashboards"

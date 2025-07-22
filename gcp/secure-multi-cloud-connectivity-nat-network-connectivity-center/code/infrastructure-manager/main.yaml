@@ -1,0 +1,618 @@
+# Infrastructure Manager Configuration for Secure Multi-Cloud Connectivity
+# This configuration deploys a complete multi-cloud networking architecture using
+# Google Cloud Network Connectivity Center, Cloud NAT, and VPN Gateway
+
+imports: []
+
+variables:
+  # Project and location configuration
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    
+  region:
+    description: "Primary region for resource deployment"
+    type: string
+    default: "us-central1"
+    
+  zone:
+    description: "Primary zone for resource deployment"
+    type: string
+    default: "us-central1-a"
+    
+  # Network configuration
+  hub_name:
+    description: "Name for the Network Connectivity Center hub"
+    type: string
+    default: "multi-cloud-hub"
+    
+  random_suffix:
+    description: "Random suffix for unique resource naming"
+    type: string
+    default: "a8f5d3"
+    
+  # External network configuration for VPN
+  external_cloud_gateway_ip:
+    description: "External cloud provider VPN gateway IP address"
+    type: string
+    default: "172.16.1.1"
+    
+  shared_secret:
+    description: "Shared secret for VPN tunnel (use Secret Manager in production)"
+    type: string
+    default: "your-shared-secret-here"
+    
+  external_peer_asn:
+    description: "BGP ASN for external cloud provider"
+    type: integer
+    default: 65001
+
+resources:
+  # VPC Networks
+  hub_vpc:
+    type: gcp-types/compute-v1:networks
+    properties:
+      name: hub-vpc-${random_suffix}
+      description: "Hub VPC for Network Connectivity Center"
+      autoCreateSubnetworks: false
+      routingConfig:
+        routingMode: REGIONAL
+    metadata:
+      dependsOn: []
+
+  prod_vpc:
+    type: gcp-types/compute-v1:networks
+    properties:
+      name: prod-vpc-${random_suffix}
+      description: "Production workloads VPC"
+      autoCreateSubnetworks: false
+      routingConfig:
+        routingMode: REGIONAL
+
+  dev_vpc:
+    type: gcp-types/compute-v1:networks
+    properties:
+      name: dev-vpc-${random_suffix}
+      description: "Development workloads VPC"
+      autoCreateSubnetworks: false
+      routingConfig:
+        routingMode: REGIONAL
+
+  shared_vpc:
+    type: gcp-types/compute-v1:networks
+    properties:
+      name: shared-vpc-${random_suffix}
+      description: "Shared services VPC"
+      autoCreateSubnetworks: false
+      routingConfig:
+        routingMode: REGIONAL
+
+  # Subnets
+  hub_subnet:
+    type: gcp-types/compute-v1:subnetworks
+    properties:
+      name: hub-subnet
+      description: "Hub subnet for central connectivity"
+      network: $(ref.hub_vpc.selfLink)
+      ipCidrRange: "10.1.0.0/24"
+      region: ${region}
+      privateIpGoogleAccess: true
+    metadata:
+      dependsOn:
+        - hub_vpc
+
+  prod_subnet:
+    type: gcp-types/compute-v1:subnetworks
+    properties:
+      name: prod-subnet
+      description: "Production workloads subnet"
+      network: $(ref.prod_vpc.selfLink)
+      ipCidrRange: "192.168.1.0/24"
+      region: ${region}
+      privateIpGoogleAccess: true
+    metadata:
+      dependsOn:
+        - prod_vpc
+
+  dev_subnet:
+    type: gcp-types/compute-v1:subnetworks
+    properties:
+      name: dev-subnet
+      description: "Development workloads subnet"
+      network: $(ref.dev_vpc.selfLink)
+      ipCidrRange: "192.168.2.0/24"
+      region: ${region}
+      privateIpGoogleAccess: true
+    metadata:
+      dependsOn:
+        - dev_vpc
+
+  shared_subnet:
+    type: gcp-types/compute-v1:subnetworks
+    properties:
+      name: shared-subnet
+      description: "Shared services subnet"
+      network: $(ref.shared_vpc.selfLink)
+      ipCidrRange: "192.168.3.0/24"
+      region: ${region}
+      privateIpGoogleAccess: true
+    metadata:
+      dependsOn:
+        - shared_vpc
+
+  # Network Connectivity Center Hub
+  ncc_hub:
+    type: gcp-types/networkconnectivity-v1:projects.locations.global.hubs
+    properties:
+      parent: projects/${project_id}/locations/global
+      hubId: ${hub_name}
+      description: "Multi-cloud connectivity hub for enterprise workloads"
+      labels:
+        environment: production
+        purpose: multi-cloud-connectivity
+
+  # Cloud Routers for BGP management
+  hub_router:
+    type: gcp-types/compute-v1:routers
+    properties:
+      name: hub-router
+      description: "BGP router for hybrid connectivity"
+      network: $(ref.hub_vpc.selfLink)
+      region: ${region}
+      bgp:
+        asn: 64512
+        advertiseMode: DEFAULT
+    metadata:
+      dependsOn:
+        - hub_vpc
+
+  prod_router:
+    type: gcp-types/compute-v1:routers
+    properties:
+      name: prod-router
+      description: "BGP router for production VPC"
+      network: $(ref.prod_vpc.selfLink)
+      region: ${region}
+      bgp:
+        asn: 64513
+        advertiseMode: DEFAULT
+    metadata:
+      dependsOn:
+        - prod_vpc
+
+  dev_router:
+    type: gcp-types/compute-v1:routers
+    properties:
+      name: dev-router
+      description: "BGP router for development VPC"
+      network: $(ref.dev_vpc.selfLink)
+      region: ${region}
+      bgp:
+        asn: 64514
+        advertiseMode: DEFAULT
+    metadata:
+      dependsOn:
+        - dev_vpc
+
+  shared_router:
+    type: gcp-types/compute-v1:routers
+    properties:
+      name: shared-router
+      description: "BGP router for shared services VPC"
+      network: $(ref.shared_vpc.selfLink)
+      region: ${region}
+      bgp:
+        asn: 64515
+        advertiseMode: DEFAULT
+    metadata:
+      dependsOn:
+        - shared_vpc
+
+  # HA VPN Gateway
+  hub_vpn_gateway:
+    type: gcp-types/compute-v1:vpnGateways
+    properties:
+      name: hub-vpn-gateway
+      description: "HA VPN gateway for multi-cloud connectivity"
+      network: $(ref.hub_vpc.selfLink)
+      region: ${region}
+    metadata:
+      dependsOn:
+        - hub_vpc
+
+  # External VPN Gateway (represents external cloud provider)
+  external_cloud_gateway:
+    type: gcp-types/compute-v1:externalVpnGateways
+    properties:
+      name: external-cloud-gateway
+      description: "External cloud provider VPN gateway"
+      interfaces:
+        - id: 0
+          ipAddress: ${external_cloud_gateway_ip}
+
+  # VPN Tunnel to external cloud provider
+  tunnel_to_external_cloud:
+    type: gcp-types/compute-v1:vpnTunnels
+    properties:
+      name: tunnel-to-external-cloud
+      description: "VPN tunnel to external cloud provider"
+      region: ${region}
+      vpnGateway: $(ref.hub_vpn_gateway.selfLink)
+      vpnGatewayInterface: 0
+      peerExternalGateway: $(ref.external_cloud_gateway.selfLink)
+      peerExternalGatewayInterface: 0
+      sharedSecret: ${shared_secret}
+      router: $(ref.hub_router.selfLink)
+      ikeVersion: 2
+    metadata:
+      dependsOn:
+        - hub_vpn_gateway
+        - external_cloud_gateway
+        - hub_router
+
+  # BGP Peer for external cloud provider
+  external_cloud_bgp_peer:
+    type: gcp-types/compute-v1:routers.patch
+    properties:
+      project: ${project_id}
+      region: ${region}
+      router: hub-router
+      bgpPeers:
+        - name: external-cloud-peer
+          interface: tunnel-to-external-cloud
+          ipAddress: "169.254.1.1"
+          peerIpAddress: "169.254.1.2"
+          peerAsn: ${external_peer_asn}
+          advertiseMode: DEFAULT
+    metadata:
+      dependsOn:
+        - hub_router
+        - tunnel_to_external_cloud
+
+  # Cloud NAT Gateways
+  hub_nat_gateway:
+    type: gcp-types/compute-v1:routers.nats
+    properties:
+      project: ${project_id}
+      region: ${region}
+      router: hub-router
+      name: hub-nat-gateway
+      natIpAllocateOption: AUTO_ONLY
+      sourceSubnetworkIpRangesToNat: ALL_SUBNETWORKS_ALL_IP_RANGES
+      logConfig:
+        enable: true
+        filter: ALL
+    metadata:
+      dependsOn:
+        - hub_router
+
+  prod_nat_gateway:
+    type: gcp-types/compute-v1:routers.nats
+    properties:
+      project: ${project_id}
+      region: ${region}
+      router: prod-router
+      name: prod-nat-gateway
+      natIpAllocateOption: AUTO_ONLY
+      sourceSubnetworkIpRangesToNat: ALL_SUBNETWORKS_ALL_IP_RANGES
+      logConfig:
+        enable: true
+        filter: ALL
+    metadata:
+      dependsOn:
+        - prod_router
+
+  dev_nat_gateway:
+    type: gcp-types/compute-v1:routers.nats
+    properties:
+      project: ${project_id}
+      region: ${region}
+      router: dev-router
+      name: dev-nat-gateway
+      natIpAllocateOption: AUTO_ONLY
+      sourceSubnetworkIpRangesToNat: ALL_SUBNETWORKS_ALL_IP_RANGES
+      logConfig:
+        enable: true
+        filter: ALL
+    metadata:
+      dependsOn:
+        - dev_router
+
+  shared_nat_gateway:
+    type: gcp-types/compute-v1:routers.nats
+    properties:
+      project: ${project_id}
+      region: ${region}
+      router: shared-router
+      name: shared-nat-gateway
+      natIpAllocateOption: AUTO_ONLY
+      sourceSubnetworkIpRangesToNat: ALL_SUBNETWORKS_ALL_IP_RANGES
+      logConfig:
+        enable: true
+        filter: ALL
+    metadata:
+      dependsOn:
+        - shared_router
+
+  # Network Connectivity Center Spokes
+  prod_spoke:
+    type: gcp-types/networkconnectivity-v1:projects.locations.global.spokes
+    properties:
+      parent: projects/${project_id}/locations/global
+      spokeId: prod-spoke
+      hub: $(ref.ncc_hub.name)
+      description: "Production VPC spoke"
+      linkedVpcNetwork:
+        uri: $(ref.prod_vpc.selfLink)
+      labels:
+        environment: production
+        network-type: workload
+    metadata:
+      dependsOn:
+        - ncc_hub
+        - prod_vpc
+
+  dev_spoke:
+    type: gcp-types/networkconnectivity-v1:projects.locations.global.spokes
+    properties:
+      parent: projects/${project_id}/locations/global
+      spokeId: dev-spoke
+      hub: $(ref.ncc_hub.name)
+      description: "Development VPC spoke"
+      linkedVpcNetwork:
+        uri: $(ref.dev_vpc.selfLink)
+      labels:
+        environment: development
+        network-type: workload
+    metadata:
+      dependsOn:
+        - ncc_hub
+        - dev_vpc
+
+  shared_spoke:
+    type: gcp-types/networkconnectivity-v1:projects.locations.global.spokes
+    properties:
+      parent: projects/${project_id}/locations/global
+      spokeId: shared-spoke
+      hub: $(ref.ncc_hub.name)
+      description: "Shared services VPC spoke"
+      linkedVpcNetwork:
+        uri: $(ref.shared_vpc.selfLink)
+      labels:
+        environment: shared
+        network-type: services
+    metadata:
+      dependsOn:
+        - ncc_hub
+        - shared_vpc
+
+  external_cloud_spoke:
+    type: gcp-types/networkconnectivity-v1:projects.locations.global.spokes
+    properties:
+      parent: projects/${project_id}/locations/global
+      spokeId: external-cloud-spoke
+      hub: $(ref.ncc_hub.name)
+      description: "Hybrid spoke for external cloud connectivity"
+      linkedVpnTunnels:
+        uris:
+          - $(ref.tunnel_to_external_cloud.selfLink)
+      labels:
+        environment: hybrid
+        network-type: external
+    metadata:
+      dependsOn:
+        - ncc_hub
+        - tunnel_to_external_cloud
+
+  # Firewall Rules
+  hub_allow_vpn:
+    type: gcp-types/compute-v1:firewalls
+    properties:
+      name: hub-allow-vpn
+      description: "Allow VPN and BGP traffic in hub VPC"
+      network: $(ref.hub_vpc.selfLink)
+      direction: INGRESS
+      priority: 1000
+      sourceRanges:
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+      allowed:
+        - IPProtocol: tcp
+          ports:
+            - "22"
+            - "179"
+        - IPProtocol: udp
+          ports:
+            - "500"
+            - "4500"
+        - IPProtocol: esp
+    metadata:
+      dependsOn:
+        - hub_vpc
+
+  prod_allow_internal:
+    type: gcp-types/compute-v1:firewalls
+    properties:
+      name: prod-allow-internal
+      description: "Allow internal communication and management in production VPC"
+      network: $(ref.prod_vpc.selfLink)
+      direction: INGRESS
+      priority: 1000
+      sourceRanges:
+        - "192.168.0.0/16"
+        - "10.1.0.0/24"
+      allowed:
+        - IPProtocol: tcp
+          ports:
+            - "22"
+            - "80"
+            - "443"
+        - IPProtocol: icmp
+    metadata:
+      dependsOn:
+        - prod_vpc
+
+  dev_allow_internal:
+    type: gcp-types/compute-v1:firewalls
+    properties:
+      name: dev-allow-internal
+      description: "Allow internal communication and development traffic"
+      network: $(ref.dev_vpc.selfLink)
+      direction: INGRESS
+      priority: 1000
+      sourceRanges:
+        - "192.168.0.0/16"
+        - "10.1.0.0/24"
+      allowed:
+        - IPProtocol: tcp
+          ports:
+            - "22"
+            - "80"
+            - "443"
+            - "8080"
+        - IPProtocol: icmp
+    metadata:
+      dependsOn:
+        - dev_vpc
+
+  shared_allow_internal:
+    type: gcp-types/compute-v1:firewalls
+    properties:
+      name: shared-allow-internal
+      description: "Allow shared services access"
+      network: $(ref.shared_vpc.selfLink)
+      direction: INGRESS
+      priority: 1000
+      sourceRanges:
+        - "192.168.0.0/16"
+        - "10.1.0.0/24"
+        - "10.0.0.0/16"
+      allowed:
+        - IPProtocol: tcp
+          ports:
+            - "22"
+            - "53"
+            - "80"
+            - "443"
+        - IPProtocol: udp
+          ports:
+            - "53"
+        - IPProtocol: icmp
+    metadata:
+      dependsOn:
+        - shared_vpc
+
+  prod_allow_egress:
+    type: gcp-types/compute-v1:firewalls
+    properties:
+      name: prod-allow-egress
+      description: "Allow outbound internet access for production"
+      network: $(ref.prod_vpc.selfLink)
+      direction: EGRESS
+      priority: 1000
+      destinationRanges:
+        - "0.0.0.0/0"
+      allowed:
+        - IPProtocol: tcp
+          ports:
+            - "80"
+            - "443"
+            - "53"
+        - IPProtocol: udp
+          ports:
+            - "53"
+    metadata:
+      dependsOn:
+        - prod_vpc
+
+outputs:
+  # Network Connectivity Center outputs
+  ncc_hub_name:
+    description: "Name of the Network Connectivity Center hub"
+    value: $(ref.ncc_hub.name)
+
+  ncc_hub_uri:
+    description: "URI of the Network Connectivity Center hub"
+    value: $(ref.ncc_hub.name)
+
+  # VPC Network outputs
+  hub_vpc_name:
+    description: "Name of the hub VPC network"
+    value: $(ref.hub_vpc.name)
+
+  prod_vpc_name:
+    description: "Name of the production VPC network"
+    value: $(ref.prod_vpc.name)
+
+  dev_vpc_name:
+    description: "Name of the development VPC network"
+    value: $(ref.dev_vpc.name)
+
+  shared_vpc_name:
+    description: "Name of the shared services VPC network"
+    value: $(ref.shared_vpc.name)
+
+  # VPN Gateway outputs
+  vpn_gateway_name:
+    description: "Name of the VPN gateway"
+    value: $(ref.hub_vpn_gateway.name)
+
+  vpn_gateway_ip1:
+    description: "First IP address of the HA VPN gateway"
+    value: $(ref.hub_vpn_gateway.vpnInterfaces[0].ipAddress)
+
+  vpn_gateway_ip2:
+    description: "Second IP address of the HA VPN gateway"
+    value: $(ref.hub_vpn_gateway.vpnInterfaces[1].ipAddress)
+
+  # Subnet outputs
+  hub_subnet_cidr:
+    description: "CIDR range of the hub subnet"
+    value: $(ref.hub_subnet.ipCidrRange)
+
+  prod_subnet_cidr:
+    description: "CIDR range of the production subnet"
+    value: $(ref.prod_subnet.ipCidrRange)
+
+  dev_subnet_cidr:
+    description: "CIDR range of the development subnet"
+    value: $(ref.dev_subnet.ipCidrRange)
+
+  shared_subnet_cidr:
+    description: "CIDR range of the shared services subnet"
+    value: $(ref.shared_subnet.ipCidrRange)
+
+  # Cloud Router outputs
+  hub_router_name:
+    description: "Name of the hub Cloud Router"
+    value: $(ref.hub_router.name)
+
+  prod_router_name:
+    description: "Name of the production Cloud Router"
+    value: $(ref.prod_router.name)
+
+  dev_router_name:
+    description: "Name of the development Cloud Router"
+    value: $(ref.dev_router.name)
+
+  shared_router_name:
+    description: "Name of the shared services Cloud Router"
+    value: $(ref.shared_router.name)
+
+  # Spoke outputs
+  spoke_names:
+    description: "Names of all Network Connectivity Center spokes"
+    value:
+      - $(ref.prod_spoke.name)
+      - $(ref.dev_spoke.name)
+      - $(ref.shared_spoke.name)
+      - $(ref.external_cloud_spoke.name)
+
+  # Deployment information
+  deployment_region:
+    description: "Primary deployment region"
+    value: ${region}
+
+  deployment_zone:
+    description: "Primary deployment zone"
+    value: ${zone}

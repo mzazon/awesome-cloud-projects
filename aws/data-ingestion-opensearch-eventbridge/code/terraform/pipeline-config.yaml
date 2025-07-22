@@ -1,0 +1,119 @@
+# OpenSearch Ingestion Data Prepper Pipeline Configuration
+# This configuration defines the data processing pipeline from S3 to OpenSearch
+version: "2"
+
+data-ingestion-pipeline:
+  # Source configuration - reads data from S3 bucket
+  source:
+    s3:
+      # S3 bucket configuration
+      bucket: "${bucket_name}"
+      
+      # Object key patterns to include in processing
+      object_key:
+        include_keys:
+%{ for prefix in data_source_prefixes ~}
+          - "${prefix}**"
+%{ endfor ~}
+      
+      # Data format and compression settings
+      codec:
+        newline: null
+      compression: "none"
+      
+      # AWS region for S3 access
+      region: "${aws_region}"
+      
+      # IAM role for S3 access
+      aws:
+        region: "${aws_region}"
+        sts_role_arn: "${pipeline_role_arn}"
+
+  # Processing pipeline - transforms and enriches data
+  processor:
+    # Add timestamp from ingestion time
+    - date:
+        from_time_received: true
+        destination: "@timestamp"
+        
+    # Rename fields for consistency
+    - mutate:
+        rename_keys:
+          message: "raw_message"
+          
+    # Parse structured log entries
+    - grok:
+        match:
+          raw_message: 
+            - '%{TIMESTAMP_ISO8601:timestamp} %{LOGLEVEL:level} %{GREEDYDATA:message}'
+            - '%{COMBINEDAPACHELOG}'
+            - '.*'
+        break_on_match: true
+        
+    # Add metadata fields
+    - mutate:
+        add_entries:
+          pipeline_name: "data-ingestion-pipeline"
+          ingestion_timestamp: "<%{+yyyy-MM-dd'T'HH:mm:ss.SSSZ}>"
+          
+    # Handle JSON parsing for structured data
+    - json:
+        source: "raw_message"
+        target: "parsed_data"
+        
+    # Drop temporary fields
+    - mutate:
+        remove_keys:
+          - "raw_message"
+
+  # Destination configuration - writes processed data to OpenSearch
+  sink:
+    - opensearch:
+        # OpenSearch cluster endpoint
+        hosts: 
+          - "https://${opensearch_endpoint}"
+          
+        # Index configuration with date-based naming
+        index: "${index_template}"
+        
+        # Document ID generation (optional)
+        document_id: "<%{+yyyy-MM-dd-HH-mm-ss-SSS}>-<%{getMetadata(\"s3_key\")}>"
+        
+        # AWS configuration for authentication
+        aws:
+          region: "${aws_region}"
+          sts_role_arn: "${pipeline_role_arn}"
+          serverless: false
+          
+        # Index template and mapping configuration
+        index_template:
+          name: "data-ingestion-template"
+          patterns:
+            - "application-logs-*"
+            - "system-metrics-*"
+            - "events-*"
+          template:
+            settings:
+              number_of_shards: 1
+              number_of_replicas: 0
+              refresh_interval: "5s"
+            mappings:
+              properties:
+                "@timestamp":
+                  type: "date"
+                  format: "strict_date_optional_time||epoch_millis"
+                timestamp:
+                  type: "date"
+                  format: "strict_date_optional_time||epoch_millis"
+                level:
+                  type: "keyword"
+                message:
+                  type: "text"
+                  analyzer: "standard"
+                parsed_data:
+                  type: "object"
+                pipeline_name:
+                  type: "keyword"
+                ingestion_timestamp:
+                  type: "date"
+                  format: "strict_date_optional_time||epoch_millis"

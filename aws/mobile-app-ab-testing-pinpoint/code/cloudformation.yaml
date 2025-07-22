@@ -1,0 +1,730 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure for Mobile App A/B Testing with Pinpoint Analytics'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: 'Name for the Pinpoint project'
+    Default: 'mobile-ab-testing'
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z0-9-_]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, hyphens, and underscores'
+  
+  S3BucketName:
+    Type: String
+    Description: 'Name for the S3 bucket to store analytics exports'
+    Default: 'pinpoint-analytics-exports'
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be a valid S3 bucket name'
+  
+  FirebaseServerKey:
+    Type: String
+    Description: 'Firebase Cloud Messaging server key for Android push notifications'
+    NoEcho: true
+    Default: 'YOUR_FIREBASE_SERVER_KEY'
+    MinLength: 1
+    ConstraintDescription: 'Must provide a valid Firebase server key'
+  
+  AppleCertificateArn:
+    Type: String
+    Description: 'ARN of the Apple Push Notification certificate (optional)'
+    Default: ''
+    AllowedPattern: '^(arn:aws:acm:.*)?$'
+    ConstraintDescription: 'Must be a valid ACM certificate ARN or empty'
+  
+  EnableApnsChannel:
+    Type: String
+    Description: 'Enable Apple Push Notification Service channel'
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  
+  KinesisStreamName:
+    Type: String
+    Description: 'Name for the Kinesis stream for real-time event processing'
+    Default: 'pinpoint-events'
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: '^[a-zA-Z0-9_.-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, hyphens, underscores, and periods'
+  
+  DailyMessageLimit:
+    Type: Number
+    Description: 'Daily message limit for campaign delivery'
+    Default: 1000
+    MinValue: 1
+    MaxValue: 100000
+    ConstraintDescription: 'Must be between 1 and 100000'
+  
+  MessagesPerSecond:
+    Type: Number
+    Description: 'Maximum messages per second for campaign delivery'
+    Default: 100
+    MinValue: 1
+    MaxValue: 1000
+    ConstraintDescription: 'Must be between 1 and 1000'
+  
+  TotalMessageLimit:
+    Type: Number
+    Description: 'Total message limit for campaign delivery'
+    Default: 10000
+    MinValue: 1
+    MaxValue: 1000000
+    ConstraintDescription: 'Must be between 1 and 1000000'
+
+Conditions:
+  CreateApnsChannel: !Equals [!Ref EnableApnsChannel, 'true']
+  HasAppleCertificate: !Not [!Equals [!Ref AppleCertificateArn, '']]
+  EnableApns: !And [!Condition CreateApnsChannel, !Condition HasAppleCertificate]
+
+Resources:
+  # S3 Bucket for Analytics Export
+  AnalyticsExportBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${S3BucketName}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldAnalyticsData
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 30
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref AnalyticsLogGroup
+      Tags:
+        - Key: Purpose
+          Value: PinpointAnalyticsExport
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Group for Analytics
+  AnalyticsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/pinpoint/${ProjectName}/analytics'
+      RetentionInDays: 30
+
+  # IAM Role for Pinpoint S3 Export
+  PinpointS3ExportRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'PinpointS3ExportRole-${ProjectName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: pinpoint.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonPinpointExportRole
+      Policies:
+        - PolicyName: S3AnalyticsExportPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${AnalyticsExportBucket}/*'
+                  - !GetAtt AnalyticsExportBucket.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt AnalyticsLogGroup.Arn
+      Tags:
+        - Key: Purpose
+          Value: PinpointAnalyticsExport
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for Kinesis Event Stream
+  PinpointKinesisRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'PinpointKinesisRole-${ProjectName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: pinpoint.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: KinesisEventStreamPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource: !GetAtt EventStream.Arn
+      Tags:
+        - Key: Purpose
+          Value: PinpointKinesisAccess
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Kinesis Stream for Real-time Event Processing
+  EventStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${KinesisStreamName}-${ProjectName}'
+      ShardCount: 1
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+      Tags:
+        - Key: Purpose
+          Value: PinpointEventProcessing
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Pinpoint Application (Project)
+  PinpointApplication:
+    Type: AWS::Pinpoint::App
+    Properties:
+      Name: !Ref ProjectName
+      Tags:
+        Purpose: MobileABTesting
+        Project: !Ref ProjectName
+
+  # Pinpoint Application Settings
+  PinpointApplicationSettings:
+    Type: AWS::Pinpoint::ApplicationSettings
+    Properties:
+      ApplicationId: !Ref PinpointApplication
+      CampaignHook:
+        Mode: DELIVERY
+        WebUrl: !Sub 'https://webhook.example.com/campaign-hook'
+      CloudWatchMetricsEnabled: true
+      EventTaggingEnabled: true
+      Limits:
+        Daily: !Ref DailyMessageLimit
+        MaximumDuration: 86400
+        MessagesPerSecond: !Ref MessagesPerSecond
+        Total: !Ref TotalMessageLimit
+
+  # GCM/FCM Channel for Android Push Notifications
+  GcmChannel:
+    Type: AWS::Pinpoint::GCMChannel
+    Properties:
+      ApplicationId: !Ref PinpointApplication
+      ApiKey: !Ref FirebaseServerKey
+      Enabled: true
+
+  # APNS Channel for iOS Push Notifications (Conditional)
+  ApnsChannel:
+    Type: AWS::Pinpoint::APNSChannel
+    Condition: EnableApns
+    Properties:
+      ApplicationId: !Ref PinpointApplication
+      Certificate: !Ref AppleCertificateArn
+      Enabled: true
+
+  # APNS Sandbox Channel for iOS Development (Conditional)
+  ApnsSandboxChannel:
+    Type: AWS::Pinpoint::APNSSandboxChannel
+    Condition: EnableApns
+    Properties:
+      ApplicationId: !Ref PinpointApplication
+      Certificate: !Ref AppleCertificateArn
+      Enabled: true
+
+  # Email Channel for Email Campaigns
+  EmailChannel:
+    Type: AWS::Pinpoint::EmailChannel
+    Properties:
+      ApplicationId: !Ref PinpointApplication
+      FromAddress: !Sub 'noreply@${ProjectName}.example.com'
+      Identity: !Sub 'noreply@${ProjectName}.example.com'
+      Enabled: true
+
+  # Event Stream Configuration
+  EventStreamConfiguration:
+    Type: AWS::Pinpoint::EventStream
+    Properties:
+      ApplicationId: !Ref PinpointApplication
+      DestinationStreamArn: !GetAtt EventStream.Arn
+      RoleArn: !GetAtt PinpointKinesisRole.Arn
+
+  # User Segment for Active Users
+  ActiveUsersSegment:
+    Type: AWS::Pinpoint::Segment
+    Properties:
+      ApplicationId: !Ref PinpointApplication
+      Name: ActiveUsers
+      SegmentGroups:
+        Groups:
+          - Type: ALL
+            SourceType: ALL
+            Dimensions:
+              Demographic:
+                AppVersion:
+                  DimensionType: INCLUSIVE
+                  Values:
+                    - '1.0.0'
+                    - '1.1.0'
+                    - '1.2.0'
+      Tags:
+        Purpose: ABTestingSegment
+        SegmentType: ActiveUsers
+
+  # User Segment for High-Value Users
+  HighValueUsersSegment:
+    Type: AWS::Pinpoint::Segment
+    Properties:
+      ApplicationId: !Ref PinpointApplication
+      Name: HighValueUsers
+      SegmentGroups:
+        Groups:
+          - Type: ALL
+            SourceType: ALL
+            Dimensions:
+              Behavior:
+                Recency:
+                  Duration: DAY_7
+                  RecencyType: ACTIVE
+              Metrics:
+                session_count:
+                  ComparisonOperator: GREATER_THAN
+                  Value: 5.0
+      Tags:
+        Purpose: ABTestingSegment
+        SegmentType: HighValueUsers
+
+  # A/B Test Campaign
+  ABTestCampaign:
+    Type: AWS::Pinpoint::Campaign
+    Properties:
+      ApplicationId: !Ref PinpointApplication
+      Name: Push Notification A/B Test
+      Description: Testing different push notification messages for user engagement
+      Schedule:
+        StartTime: !Sub '${AWS::StackName}-START-TIME'
+        IsLocalTime: false
+        Timezone: UTC
+      SegmentId: !Ref ActiveUsersSegment
+      MessageConfiguration:
+        GCMMessage:
+          Body: '🎯 Control Message: Check out our new features!'
+          Title: 'New Updates Available'
+          Action: OPEN_APP
+          SilentPush: false
+        APNSMessage:
+          Body: '🎯 Control Message: Check out our new features!'
+          Title: 'New Updates Available'
+          Action: OPEN_APP
+          SilentPush: false
+      AdditionalTreatments:
+        - TreatmentName: Personalized
+          TreatmentDescription: Personalized message variant
+          SizePercent: 45
+          MessageConfiguration:
+            GCMMessage:
+              Body: '🚀 Hi {{User.FirstName}}, discover features made just for you!'
+              Title: 'Personalized Updates'
+              Action: OPEN_APP
+              SilentPush: false
+            APNSMessage:
+              Body: '🚀 Hi {{User.FirstName}}, discover features made just for you!'
+              Title: 'Personalized Updates'
+              Action: OPEN_APP
+              SilentPush: false
+        - TreatmentName: Urgent
+          TreatmentDescription: Urgent tone message variant
+          SizePercent: 45
+          MessageConfiguration:
+            GCMMessage:
+              Body: '⚡ Don''t miss out! Limited time features available now!'
+              Title: 'Limited Time Offer'
+              Action: OPEN_APP
+              SilentPush: false
+            APNSMessage:
+              Body: '⚡ Don''t miss out! Limited time features available now!'
+              Title: 'Limited Time Offer'
+              Action: OPEN_APP
+              SilentPush: false
+      HoldoutPercent: 10
+      IsPaused: true
+      Tags:
+        Purpose: ABTestCampaign
+        CampaignType: PushNotification
+
+  # CloudWatch Dashboard for Campaign Monitoring
+  ABTestDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'Pinpoint-AB-Testing-${ProjectName}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Pinpoint", "DirectMessagesSent", "ApplicationId", "${PinpointApplication}"],
+                  [".", "DirectMessagesDelivered", ".", "."],
+                  [".", "DirectMessagesBounced", ".", "."],
+                  [".", "DirectMessagesOpened", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Campaign Delivery Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Pinpoint", "CustomEvents", "ApplicationId", "${PinpointApplication}", "EventType", "conversion"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Conversion Events",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Kinesis", "IncomingRecords", "StreamName", "${EventStream}"],
+                  [".", "IncomingBytes", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Event Stream Activity",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms for Campaign Monitoring
+  HighBounceRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'Pinpoint-HighBounceRate-${ProjectName}'
+      AlarmDescription: 'Alert when bounce rate exceeds 5%'
+      MetricName: DirectMessagesBounced
+      Namespace: AWS/Pinpoint
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApplicationId
+          Value: !Ref PinpointApplication
+      AlarmActions:
+        - !Ref SNSAlarmTopic
+
+  LowDeliveryRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'Pinpoint-LowDeliveryRate-${ProjectName}'
+      AlarmDescription: 'Alert when delivery rate drops below 95%'
+      MetricName: DirectMessagesDelivered
+      Namespace: AWS/Pinpoint
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 95
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: ApplicationId
+          Value: !Ref PinpointApplication
+      AlarmActions:
+        - !Ref SNSAlarmTopic
+
+  # SNS Topic for Alarm Notifications
+  SNSAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'pinpoint-alarms-${ProjectName}'
+      DisplayName: 'Pinpoint A/B Testing Alarms'
+      KmsMasterKeyId: alias/aws/sns
+
+  # Lambda Function for Automated Winner Selection
+  WinnerSelectionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'PinpointWinnerSelection-${ProjectName}'
+      Description: 'Automated A/B test winner selection based on conversion rates'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt WinnerSelectionRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          PINPOINT_APPLICATION_ID: !Ref PinpointApplication
+          CAMPAIGN_ID: !Ref ABTestCampaign
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          
+          def lambda_handler(event, context):
+              pinpoint = boto3.client('pinpoint')
+              
+              application_id = os.environ['PINPOINT_APPLICATION_ID']
+              campaign_id = os.environ['CAMPAIGN_ID']
+              
+              try:
+                  # Get campaign analytics
+                  response = pinpoint.get_campaign_activities(
+                      ApplicationId=application_id,
+                      CampaignId=campaign_id
+                  )
+                  
+                  # Analyze conversion rates for each treatment
+                  activities = response['ActivitiesResponse']['Item']
+                  
+                  best_treatment = None
+                  best_conversion_rate = 0
+                  
+                  for activity in activities:
+                      delivered = activity.get('DeliveredCount', 0)
+                      conversions = activity.get('ConversionsCount', 0)
+                      
+                      if delivered > 0:
+                          conversion_rate = conversions / delivered
+                          if conversion_rate > best_conversion_rate:
+                              best_conversion_rate = conversion_rate
+                              best_treatment = activity
+                  
+                  # Log results
+                  print(f"Best treatment: {best_treatment}")
+                  print(f"Conversion rate: {best_conversion_rate:.2%}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'best_treatment': best_treatment,
+                          'conversion_rate': best_conversion_rate
+                      })
+                  }
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+      Tags:
+        - Key: Purpose
+          Value: ABTestWinnerSelection
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for Winner Selection Lambda
+  WinnerSelectionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'PinpointWinnerSelectionRole-${ProjectName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PinpointAnalyticsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - pinpoint:GetCampaign
+                  - pinpoint:GetCampaignActivities
+                  - pinpoint:GetCampaignVersions
+                  - pinpoint:GetApplicationSettings
+                Resource: !Sub 'arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:apps/${PinpointApplication}/*'
+      Tags:
+        - Key: Purpose
+          Value: ABTestWinnerSelection
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # EventBridge Rule for Scheduled Winner Selection
+  WinnerSelectionSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'PinpointWinnerSelection-${ProjectName}'
+      Description: 'Scheduled execution of winner selection analysis'
+      ScheduleExpression: 'rate(1 day)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt WinnerSelectionFunction.Arn
+          Id: WinnerSelectionTarget
+          Input: !Sub |
+            {
+              "application_id": "${PinpointApplication}",
+              "campaign_id": "${ABTestCampaign}"
+            }
+
+  # Permission for EventBridge to invoke Lambda
+  WinnerSelectionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WinnerSelectionFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WinnerSelectionSchedule.Arn
+
+Outputs:
+  PinpointApplicationId:
+    Description: 'Pinpoint Application ID for mobile A/B testing'
+    Value: !Ref PinpointApplication
+    Export:
+      Name: !Sub '${AWS::StackName}-PinpointApplicationId'
+
+  PinpointApplicationArn:
+    Description: 'Pinpoint Application ARN'
+    Value: !Sub 'arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:apps/${PinpointApplication}'
+    Export:
+      Name: !Sub '${AWS::StackName}-PinpointApplicationArn'
+
+  AnalyticsExportBucket:
+    Description: 'S3 bucket for analytics exports'
+    Value: !Ref AnalyticsExportBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AnalyticsExportBucket'
+
+  AnalyticsExportBucketArn:
+    Description: 'S3 bucket ARN for analytics exports'
+    Value: !GetAtt AnalyticsExportBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AnalyticsExportBucketArn'
+
+  EventStreamArn:
+    Description: 'Kinesis stream ARN for real-time event processing'
+    Value: !GetAtt EventStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventStreamArn'
+
+  EventStreamName:
+    Description: 'Kinesis stream name for real-time event processing'
+    Value: !Ref EventStream
+    Export:
+      Name: !Sub '${AWS::StackName}-EventStreamName'
+
+  ActiveUsersSegmentId:
+    Description: 'Segment ID for active users'
+    Value: !Ref ActiveUsersSegment
+    Export:
+      Name: !Sub '${AWS::StackName}-ActiveUsersSegmentId'
+
+  HighValueUsersSegmentId:
+    Description: 'Segment ID for high-value users'
+    Value: !Ref HighValueUsersSegment
+    Export:
+      Name: !Sub '${AWS::StackName}-HighValueUsersSegmentId'
+
+  ABTestCampaignId:
+    Description: 'Campaign ID for A/B testing'
+    Value: !Ref ABTestCampaign
+    Export:
+      Name: !Sub '${AWS::StackName}-ABTestCampaignId'
+
+  ABTestCampaignArn:
+    Description: 'Campaign ARN for A/B testing'
+    Value: !Sub 'arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:apps/${PinpointApplication}/campaigns/${ABTestCampaign}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ABTestCampaignArn'
+
+  CloudWatchDashboardURL:
+    Description: 'URL to CloudWatch dashboard for monitoring'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ABTestDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchDashboardURL'
+
+  WinnerSelectionFunctionArn:
+    Description: 'Lambda function ARN for automated winner selection'
+    Value: !GetAtt WinnerSelectionFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-WinnerSelectionFunctionArn'
+
+  SNSAlarmTopicArn:
+    Description: 'SNS topic ARN for alarm notifications'
+    Value: !Ref SNSAlarmTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSAlarmTopicArn'
+
+  PinpointConsoleURL:
+    Description: 'URL to Pinpoint console for managing campaigns'
+    Value: !Sub 'https://console.aws.amazon.com/pinpoint/home?region=${AWS::Region}#/apps/${PinpointApplication}/campaigns'
+    Export:
+      Name: !Sub '${AWS::StackName}-PinpointConsoleURL'
+
+  DeploymentGuide:
+    Description: 'Next steps for completing the A/B testing setup'
+    Value: !Sub |
+      1. Update Firebase server key in parameter: ${FirebaseServerKey}
+      2. Configure Apple Push certificate ARN if using iOS: ${AppleCertificateArn}
+      3. Verify email identity for email channel: noreply@${ProjectName}.example.com
+      4. Start campaign: aws pinpoint update-campaign --application-id ${PinpointApplication} --campaign-id ${ABTestCampaign} --write-campaign-request '{"IsPaused": false}'
+      5. Monitor results in CloudWatch dashboard: https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ABTestDashboard}
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentGuide'

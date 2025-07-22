@@ -1,0 +1,406 @@
+# Infrastructure Manager Configuration for Interactive Data Storytelling
+# Recipe: Interactive Data Storytelling with BigQuery Data Canvas and Looker Studio
+# This configuration deploys a complete data storytelling pipeline using Google Cloud services
+
+metadata:
+  name: interactive-data-storytelling
+  description: "Infrastructure for automated data storytelling with BigQuery, Vertex AI, and Looker Studio"
+  labels:
+    recipe: "interactive-data-storytelling"
+    category: "analytics"
+    difficulty: "200"
+    version: "1.0"
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    required: true
+  
+  region:
+    type: string
+    description: "Google Cloud region for resources"
+    default: "us-central1"
+    
+  dataset_name:
+    type: string
+    description: "BigQuery dataset name for analytics"
+    default: "retail_analytics"
+    
+  function_name:
+    type: string
+    description: "Cloud Function name for automation"
+    default: "data-storytelling-automation"
+    
+  job_name:
+    type: string
+    description: "Cloud Scheduler job name"
+    default: "storytelling-job"
+    
+  bucket_suffix:
+    type: string
+    description: "Suffix for Cloud Storage bucket (must be globally unique)"
+    required: true
+
+# Enable required Google Cloud APIs
+resources:
+  # API Services - Enable all required APIs first
+  bigquery_api:
+    type: gcp-types/serviceusage-v1:services
+    name: bigquery.googleapis.com
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/bigquery.googleapis.com
+    metadata:
+      dependsOn:
+        - project_id
+        
+  cloudfunctions_api:
+    type: gcp-types/serviceusage-v1:services
+    name: cloudfunctions.googleapis.com
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/cloudfunctions.googleapis.com
+    metadata:
+      dependsOn:
+        - project_id
+        
+  cloudscheduler_api:
+    type: gcp-types/serviceusage-v1:services
+    name: cloudscheduler.googleapis.com
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/cloudscheduler.googleapis.com
+    metadata:
+      dependsOn:
+        - project_id
+        
+  aiplatform_api:
+    type: gcp-types/serviceusage-v1:services
+    name: aiplatform.googleapis.com
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/aiplatform.googleapis.com
+    metadata:
+      dependsOn:
+        - project_id
+        
+  storage_api:
+    type: gcp-types/serviceusage-v1:services
+    name: storage.googleapis.com
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/storage.googleapis.com
+    metadata:
+      dependsOn:
+        - project_id
+
+  # Project reference for dependency management
+  project_id:
+    type: gcp-types/cloudresourcemanager-v1:projects
+    name: $(var.project_id)
+    properties:
+      projectId: $(var.project_id)
+    accessControl:
+      gcpIamPolicy:
+        bindings: []
+
+  # Service Account for Vertex AI and BigQuery operations
+  vertex_ai_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    name: vertex-ai-storytelling
+    properties:
+      accountId: vertex-ai-storytelling
+      displayName: "Vertex AI Data Storytelling Service Account"
+      description: "Service account for automated data storytelling with Vertex AI and BigQuery"
+    metadata:
+      dependsOn:
+        - project_id
+
+  # IAM bindings for service account
+  bigquery_data_viewer_binding:
+    type: gcp-types/cloudresourcemanager-v1:projects
+    name: bigquery-data-viewer
+    properties:
+      projectId: $(var.project_id)
+      policy:
+        bindings:
+          - role: roles/bigquery.dataViewer
+            members:
+              - serviceAccount:$(ref.vertex_ai_service_account.email)
+    metadata:
+      dependsOn:
+        - vertex_ai_service_account
+
+  aiplatform_user_binding:
+    type: gcp-types/cloudresourcemanager-v1:projects
+    name: aiplatform-user
+    properties:
+      projectId: $(var.project_id)
+      policy:
+        bindings:
+          - role: roles/aiplatform.user
+            members:
+              - serviceAccount:$(ref.vertex_ai_service_account.email)
+    metadata:
+      dependsOn:
+        - vertex_ai_service_account
+
+  # Cloud Storage bucket for Cloud Function deployment
+  storage_bucket:
+    type: gcp-types/storage-v1:buckets
+    name: $(var.project_id)-storytelling-$(var.bucket_suffix)
+    properties:
+      name: $(var.project_id)-storytelling-$(var.bucket_suffix)
+      location: $(var.region)
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      encryption:
+        defaultKmsKeyName: null
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              matchesStorageClass:
+                - STANDARD
+      labels:
+        purpose: function-deployment
+        recipe: interactive-data-storytelling
+    metadata:
+      dependsOn:
+        - storage_api
+
+  # BigQuery Dataset for analytics
+  bigquery_dataset:
+    type: gcp-types/bigquery-v2:datasets
+    name: $(var.dataset_name)
+    properties:
+      datasetId: $(var.dataset_name)
+      location: $(var.region)
+      description: "Dataset for interactive data storytelling analytics"
+      access:
+        - role: OWNER
+          userByEmail: $(ref.vertex_ai_service_account.email)
+        - role: READER
+          specialGroup: projectReaders
+        - role: WRITER
+          specialGroup: projectWriters
+      labels:
+        purpose: analytics
+        recipe: interactive-data-storytelling
+    metadata:
+      dependsOn:
+        - bigquery_api
+        - vertex_ai_service_account
+
+  # BigQuery Table for sales data
+  sales_data_table:
+    type: gcp-types/bigquery-v2:tables
+    name: sales_data
+    properties:
+      datasetId: $(ref.bigquery_dataset.datasetId)
+      tableId: sales_data
+      description: "Sample retail sales data for storytelling analysis"
+      schema:
+        fields:
+          - name: product_id
+            type: STRING
+            mode: REQUIRED
+            description: "Unique product identifier"
+          - name: product_name
+            type: STRING
+            mode: REQUIRED
+            description: "Product display name"
+          - name: category
+            type: STRING
+            mode: REQUIRED
+            description: "Product category"
+          - name: sales_date
+            type: DATE
+            mode: REQUIRED
+            description: "Date of sale"
+          - name: quantity
+            type: INTEGER
+            mode: REQUIRED
+            description: "Quantity sold"
+          - name: unit_price
+            type: FLOAT
+            mode: REQUIRED
+            description: "Price per unit"
+          - name: customer_segment
+            type: STRING
+            mode: REQUIRED
+            description: "Customer segment classification"
+          - name: region
+            type: STRING
+            mode: REQUIRED
+            description: "Geographic region"
+          - name: revenue
+            type: FLOAT
+            mode: REQUIRED
+            description: "Total revenue for transaction"
+      labels:
+        purpose: sample-data
+        recipe: interactive-data-storytelling
+    metadata:
+      dependsOn:
+        - bigquery_dataset
+
+  # Materialized View for Looker Studio optimization
+  dashboard_materialized_view:
+    type: gcp-types/bigquery-v2:tables
+    name: dashboard_data
+    properties:
+      datasetId: $(ref.bigquery_dataset.datasetId)
+      tableId: dashboard_data
+      description: "Optimized materialized view for Looker Studio dashboards"
+      materializedView:
+        query: |
+          SELECT 
+            category,
+            customer_segment,
+            region,
+            sales_date,
+            SUM(revenue) as daily_revenue,
+            SUM(quantity) as daily_quantity,
+            COUNT(DISTINCT product_id) as products_sold,
+            AVG(unit_price) as avg_price
+          FROM `$(var.project_id).$(var.dataset_name).sales_data`
+          GROUP BY category, customer_segment, region, sales_date
+        enableRefresh: true
+        refreshIntervalMs: 3600000  # Refresh every hour
+      labels:
+        purpose: dashboard-optimization
+        recipe: interactive-data-storytelling
+    metadata:
+      dependsOn:
+        - sales_data_table
+
+  # Cloud Function for automated data storytelling
+  storytelling_function:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    name: $(var.function_name)
+    properties:
+      location: projects/$(var.project_id)/locations/$(var.region)
+      sourceArchiveUrl: gs://$(ref.storage_bucket.name)/function-source.zip
+      name: projects/$(var.project_id)/locations/$(var.region)/functions/$(var.function_name)
+      description: "Automated data storytelling function with AI insights"
+      entryPoint: generate_data_story
+      runtime: python39
+      timeout: 300s
+      availableMemoryMb: 512
+      environmentVariables:
+        PROJECT_ID: $(var.project_id)
+        DATASET_NAME: $(var.dataset_name)
+        REGION: $(var.region)
+      serviceAccountEmail: $(ref.vertex_ai_service_account.email)
+      httpsTrigger:
+        url: null
+        securityLevel: SECURE_ALWAYS
+      labels:
+        purpose: automation
+        recipe: interactive-data-storytelling
+    metadata:
+      dependsOn:
+        - cloudfunctions_api
+        - storage_bucket
+        - vertex_ai_service_account
+        - bigquery_dataset
+
+  # IAM binding to allow unauthenticated access to function
+  function_invoker_binding:
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    name: function-invoker-policy
+    properties:
+      resource: $(ref.storytelling_function.name)
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - storytelling_function
+
+  # Cloud Scheduler job for automated execution
+  scheduler_job:
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    name: $(var.job_name)
+    properties:
+      parent: projects/$(var.project_id)/locations/$(var.region)
+      name: projects/$(var.project_id)/locations/$(var.region)/jobs/$(var.job_name)
+      description: "Automated data storytelling report generation"
+      schedule: "0 9 * * 1-5"  # Weekdays at 9 AM
+      timeZone: "America/New_York"
+      httpTarget:
+        uri: $(ref.storytelling_function.httpsTrigger.url)
+        httpMethod: POST
+        headers:
+          Content-Type: application/json
+        body: |
+          {
+            "automated": true,
+            "source": "scheduler"
+          }
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 300s
+        minBackoffDuration: 5s
+        maxBackoffDuration: 60s
+        maxDoublings: 3
+    metadata:
+      dependsOn:
+        - cloudscheduler_api
+        - storytelling_function
+
+# Output values for verification and integration
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: $(var.project_id)
+    
+  bigquery_dataset_id:
+    description: "BigQuery dataset ID for analytics"
+    value: $(ref.bigquery_dataset.datasetId)
+    
+  bigquery_table_id:
+    description: "BigQuery sales data table ID"
+    value: $(ref.sales_data_table.tableId)
+    
+  materialized_view_id:
+    description: "BigQuery materialized view ID for dashboards"
+    value: $(ref.dashboard_materialized_view.tableId)
+    
+  function_name:
+    description: "Cloud Function name for automation"
+    value: $(ref.storytelling_function.name)
+    
+  function_url:
+    description: "Cloud Function HTTPS trigger URL"
+    value: $(ref.storytelling_function.httpsTrigger.url)
+    
+  service_account_email:
+    description: "Service account email for Vertex AI operations"
+    value: $(ref.vertex_ai_service_account.email)
+    
+  storage_bucket_name:
+    description: "Cloud Storage bucket name for function deployment"
+    value: $(ref.storage_bucket.name)
+    
+  scheduler_job_name:
+    description: "Cloud Scheduler job name"
+    value: $(ref.scheduler_job.name)
+    
+  looker_studio_data_source:
+    description: "BigQuery data source for Looker Studio"
+    value: "$(var.project_id).$(var.dataset_name).dashboard_data"
+
+# Deployment configuration
+imports: []
+
+# Resource creation order and dependencies are managed through metadata.dependsOn
+# This ensures proper sequencing of resource creation:
+# 1. APIs and project setup
+# 2. Service accounts and IAM
+# 3. Storage and BigQuery resources
+# 4. Cloud Function deployment
+# 5. Scheduler configuration

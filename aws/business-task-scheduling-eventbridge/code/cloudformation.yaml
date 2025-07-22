@@ -1,0 +1,936 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Automated Business Task Scheduling with EventBridge Scheduler and Lambda
+  Creates a comprehensive serverless automation system that eliminates manual execution
+  of recurring business tasks through scheduled Lambda functions triggered by
+  EventBridge Scheduler with flexible cron and rate expressions.
+
+# Template metadata for documentation and organization
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Environment Configuration'
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: 'S3 Configuration'
+        Parameters:
+          - EnableS3Versioning
+          - S3BucketRetentionDays
+      - Label:
+          default: 'Notification Configuration'
+        Parameters:
+          - NotificationEmail
+          - EnableSMSNotifications
+          - SMSPhoneNumber
+      - Label:
+          default: 'Lambda Configuration'
+        Parameters:
+          - LambdaMemorySize
+          - LambdaTimeout
+          - LambdaRuntime
+      - Label:
+          default: 'EventBridge Scheduler Configuration'
+        Parameters:
+          - DailyReportSchedule
+          - HourlyProcessingSchedule
+          - WeeklyNotificationSchedule
+          - ScheduleTimezone
+    ParameterLabels:
+      Environment:
+        default: 'Deployment Environment'
+      ProjectName:
+        default: 'Project Name'
+      NotificationEmail:
+        default: 'Notification Email Address'
+      EnableSMSNotifications:
+        default: 'Enable SMS Notifications'
+      SMSPhoneNumber:
+        default: 'SMS Phone Number'
+      EnableS3Versioning:
+        default: 'Enable S3 Bucket Versioning'
+      S3BucketRetentionDays:
+        default: 'S3 Object Retention Days'
+      LambdaMemorySize:
+        default: 'Lambda Memory Size (MB)'
+      LambdaTimeout:
+        default: 'Lambda Timeout (seconds)'
+      LambdaRuntime:
+        default: 'Lambda Runtime Version'
+      DailyReportSchedule:
+        default: 'Daily Report Cron Schedule'
+      HourlyProcessingSchedule:
+        default: 'Hourly Processing Rate Schedule'
+      WeeklyNotificationSchedule:
+        default: 'Weekly Notification Cron Schedule'
+      ScheduleTimezone:
+        default: 'Schedule Timezone'
+
+# Input parameters for customization
+Parameters:
+  # Environment and Project Configuration
+  Environment:
+    Type: String
+    Default: 'production'
+    AllowedValues:
+      - 'development'
+      - 'staging'
+      - 'production'
+    Description: 'Deployment environment for resource tagging and configuration'
+
+  ProjectName:
+    Type: String
+    Default: 'business-automation'
+    Description: 'Project name used for resource naming and tagging'
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+    MinLength: 3
+    MaxLength: 30
+
+  # S3 Configuration
+  EnableS3Versioning:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable versioning on S3 bucket for data protection'
+
+  S3BucketRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: 'Number of days to retain objects in S3 bucket before deletion'
+
+  # Notification Configuration
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for receiving business automation notifications'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  EnableSMSNotifications:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable SMS notifications in addition to email'
+
+  SMSPhoneNumber:
+    Type: String
+    Default: ''
+    Description: 'Phone number for SMS notifications (format: +1234567890)'
+    AllowedPattern: '^(\+[1-9]\d{1,14})?$'
+    ConstraintDescription: 'Must be a valid international phone number format or empty'
+
+  # Lambda Configuration
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+    Description: 'Memory allocated to Lambda function in MB'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 3
+    MaxValue: 900
+    Description: 'Lambda function timeout in seconds'
+
+  LambdaRuntime:
+    Type: String
+    Default: 'python3.11'
+    AllowedValues:
+      - 'python3.9'
+      - 'python3.10'
+      - 'python3.11'
+      - 'python3.12'
+    Description: 'Python runtime version for Lambda function'
+
+  # EventBridge Scheduler Configuration
+  DailyReportSchedule:
+    Type: String
+    Default: 'cron(0 9 * * ? *)'
+    Description: 'Cron expression for daily report generation (default: 9 AM daily)'
+
+  HourlyProcessingSchedule:
+    Type: String
+    Default: 'rate(1 hour)'
+    Description: 'Rate expression for hourly data processing'
+
+  WeeklyNotificationSchedule:
+    Type: String
+    Default: 'cron(0 10 ? * MON *)'
+    Description: 'Cron expression for weekly notifications (default: 10 AM every Monday)'
+
+  ScheduleTimezone:
+    Type: String
+    Default: 'America/New_York'
+    Description: 'Timezone for schedule expressions'
+    AllowedValues:
+      - 'America/New_York'
+      - 'America/Chicago'
+      - 'America/Denver'
+      - 'America/Los_Angeles'
+      - 'Europe/London'
+      - 'Europe/Paris'
+      - 'Europe/Berlin'
+      - 'Asia/Tokyo'
+      - 'Asia/Singapore'
+      - 'UTC'
+
+# Conditional resource creation based on parameters
+Conditions:
+  EnableVersioning: !Equals [!Ref EnableS3Versioning, 'true']
+  EnableSMS: !Equals [!Ref EnableSMSNotifications, 'true']
+  HasSMSPhoneNumber: !Not [!Equals [!Ref SMSPhoneNumber, '']]
+  CreateSMSSubscription: !And [!Condition EnableSMS, !Condition HasSMSPhoneNumber]
+  IsProduction: !Equals [!Ref Environment, 'production']
+
+# AWS Resources
+Resources:
+  # S3 Bucket for storing reports and processed data
+  BusinessAutomationBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ProjectName}-automation-${AWS::AccountId}-${Environment}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [EnableVersioning, 'Enabled', 'Suspended']
+      LifecycleConfiguration:
+        Rules:
+          - Id: 'DeleteOldVersions'
+            Status: 'Enabled'
+            NoncurrentVersionExpirationInDays: !Ref S3BucketRetentionDays
+          - Id: 'DeleteIncompleteMultipartUploads'
+            Status: 'Enabled'
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          - Id: 'TransitionToIA'
+            Status: 'Enabled'
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3LogGroup
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Business Automation Storage'
+
+  # CloudWatch Log Group for S3 events
+  S3LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-automation-bucket'
+      RetentionInDays: !If [IsProduction, 90, 30]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SNS Topic for business notifications
+  BusinessNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-business-notifications-${Environment}'
+      DisplayName: 'Business Automation Notifications'
+      KmsMasterKeyId: 'alias/aws/sns'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Business Automation Notifications'
+
+  # Email subscription to SNS topic
+  EmailNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref BusinessNotificationTopic
+      Protocol: 'email'
+      Endpoint: !Ref NotificationEmail
+
+  # Conditional SMS subscription to SNS topic
+  SMSNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateSMSSubscription
+    Properties:
+      TopicArn: !Ref BusinessNotificationTopic
+      Protocol: 'sms'
+      Endpoint: !Ref SMSPhoneNumber
+
+  # CloudWatch Log Group for Lambda function
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-business-task-processor-${Environment}'
+      RetentionInDays: !If [IsProduction, 90, 30]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for Lambda execution
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3BucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt BusinessAutomationBucket.Arn
+                  - !Sub '${BusinessAutomationBucket.Arn}/*'
+        - PolicyName: SNSPublishAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref BusinessNotificationTopic
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${LambdaLogGroup.Arn}:*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda function for business task processing
+  BusinessTaskProcessorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-business-task-processor-${Environment}'
+      Description: 'Processes automated business tasks including report generation, data processing, and notifications'
+      Runtime: !Ref LambdaRuntime
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref BusinessAutomationBucket
+          TOPIC_ARN: !Ref BusinessNotificationTopic
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import datetime
+          import os
+          from io import StringIO
+          import csv
+          import logging
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize AWS clients
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+
+          def lambda_handler(event, context):
+              """
+              Main Lambda handler for processing business automation tasks
+              """
+              try:
+                  # Extract configuration from environment
+                  bucket_name = os.environ['BUCKET_NAME']
+                  topic_arn = os.environ['TOPIC_ARN']
+                  environment = os.environ.get('ENVIRONMENT', 'development')
+                  project_name = os.environ.get('PROJECT_NAME', 'business-automation')
+                  
+                  # Get task type from event (default to report generation)
+                  task_type = event.get('task_type', 'report')
+                  
+                  logger.info(f"Processing {task_type} task in {environment} environment")
+                  
+                  # Process the requested task
+                  if task_type == 'report':
+                      result = generate_daily_report(bucket_name, project_name)
+                  elif task_type == 'data_processing':
+                      result = process_business_data(bucket_name, project_name)
+                  elif task_type == 'notification':
+                      result = send_business_notification(topic_arn, project_name)
+                  else:
+                      raise ValueError(f"Unknown task type: {task_type}")
+                  
+                  # Send success notification
+                  success_message = f"Business task completed successfully in {environment}: {result}"
+                  sns.publish(
+                      TopicArn=topic_arn,
+                      Message=success_message,
+                      Subject=f"{project_name.title()} - Task Completion ({task_type})"
+                  )
+                  
+                  logger.info(f"Task completed successfully: {result}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Task completed successfully',
+                          'task_type': task_type,
+                          'result': result,
+                          'environment': environment,
+                          'timestamp': datetime.datetime.utcnow().isoformat() + 'Z'
+                      })
+                  }
+                  
+              except Exception as e:
+                  error_message = f"Business task failed: {str(e)}"
+                  logger.error(error_message, exc_info=True)
+                  
+                  # Send failure notification
+                  try:
+                      sns.publish(
+                          TopicArn=topic_arn,
+                          Message=f"{error_message}\n\nEvent: {json.dumps(event, indent=2)}",
+                          Subject=f"{project_name.title()} - Task Failure ({task_type})"
+                      )
+                  except Exception as sns_error:
+                      logger.error(f"Failed to send failure notification: {str(sns_error)}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'task_type': task_type,
+                          'environment': environment,
+                          'timestamp': datetime.datetime.utcnow().isoformat() + 'Z'
+                      })
+                  }
+
+          def generate_daily_report(bucket_name, project_name):
+              """
+              Generate and store daily business report
+              """
+              try:
+                  current_date = datetime.datetime.utcnow()
+                  
+                  # Generate sample business metrics
+                  report_data = [
+                      ['Date', 'Revenue', 'Orders', 'Customers', 'Conversion_Rate'],
+                      [
+                          current_date.strftime('%Y-%m-%d'),
+                          f"${12500 + (current_date.day * 100):.2f}",
+                          str(45 + current_date.day),
+                          str(38 + current_date.day),
+                          f"{2.5 + (current_date.day * 0.1):.2f}%"
+                      ]
+                  ]
+                  
+                  # Convert to CSV format
+                  csv_buffer = StringIO()
+                  writer = csv.writer(csv_buffer)
+                  writer.writerows(report_data)
+                  
+                  # Generate S3 key with hierarchical structure
+                  report_key = f"reports/{current_date.strftime('%Y/%m')}/daily-report-{current_date.strftime('%Y%m%d')}.csv"
+                  
+                  # Upload to S3 with metadata
+                  s3.put_object(
+                      Bucket=bucket_name,
+                      Key=report_key,
+                      Body=csv_buffer.getvalue(),
+                      ContentType='text/csv',
+                      Metadata={
+                          'project': project_name,
+                          'report_type': 'daily_business_report',
+                          'generated_by': 'lambda_automation',
+                          'generation_date': current_date.strftime('%Y-%m-%d'),
+                          'record_count': str(len(report_data) - 1)
+                      },
+                      ServerSideEncryption='AES256'
+                  )
+                  
+                  return f"Daily report generated and stored: s3://{bucket_name}/{report_key}"
+                  
+              except Exception as e:
+                  raise Exception(f"Report generation failed: {str(e)}")
+
+          def process_business_data(bucket_name, project_name):
+              """
+              Process business data and store results
+              """
+              try:
+                  current_time = datetime.datetime.utcnow()
+                  
+                  # Simulate data processing with realistic business metrics
+                  processed_data = {
+                      'processing_id': f"batch_{current_time.strftime('%Y%m%d_%H%M%S')}",
+                      'processed_at': current_time.isoformat() + 'Z',
+                      'records_processed': 150 + (current_time.hour * 10),
+                      'success_rate': round(96.5 + (current_time.minute * 0.05), 2),
+                      'errors': max(0, 5 - current_time.hour),
+                      'processing_time_seconds': 45 + (current_time.second % 30),
+                      'data_quality_score': round(92.0 + (current_time.day * 0.2), 1),
+                      'anomalies_detected': current_time.minute % 3
+                  }
+                  
+                  # Generate S3 key with hierarchical structure
+                  data_key = f"processed-data/{current_time.strftime('%Y/%m/%d')}/batch-{current_time.strftime('%Y%m%d-%H%M%S')}.json"
+                  
+                  # Upload processed data to S3
+                  s3.put_object(
+                      Bucket=bucket_name,
+                      Key=data_key,
+                      Body=json.dumps(processed_data, indent=2),
+                      ContentType='application/json',
+                      Metadata={
+                          'project': project_name,
+                          'data_type': 'processed_business_data',
+                          'processing_engine': 'lambda_automation',
+                          'batch_id': processed_data['processing_id']
+                      },
+                      ServerSideEncryption='AES256'
+                  )
+                  
+                  return f"Data processing completed: {processed_data['records_processed']} records processed with {processed_data['success_rate']}% success rate. Results stored at s3://{bucket_name}/{data_key}"
+                  
+              except Exception as e:
+                  raise Exception(f"Data processing failed: {str(e)}")
+
+          def send_business_notification(topic_arn, project_name):
+              """
+              Send business status notification
+              """
+              try:
+                  current_time = datetime.datetime.utcnow()
+                  
+                  # Create comprehensive status message
+                  status_message = f"""
+Business Automation System Status Report
+Generated: {current_time.strftime('%Y-%m-%d %H:%M:%S')} UTC
+
+System Health: ✅ OPERATIONAL
+Last Automated Tasks: ✅ COMPLETED
+
+Weekly Summary:
+- Daily reports generated: 7/7
+- Data processing jobs: Completed successfully
+- System uptime: 99.9%
+- No critical alerts
+
+Next Scheduled Tasks:
+- Daily report generation: Tomorrow at 9:00 AM
+- Data processing: Every hour
+- Weekly status: Next Monday at 10:00 AM
+
+For questions or issues, please contact the operations team.
+
+Generated by {project_name} automation system.
+                  """.strip()
+                  
+                  sns.publish(
+                      TopicArn=topic_arn,
+                      Message=status_message,
+                      Subject=f"{project_name.title()} - Weekly Business Automation Status"
+                  )
+                  
+                  return f"Business status notification sent successfully at {current_time.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+                  
+              except Exception as e:
+                  raise Exception(f"Notification sending failed: {str(e)}")
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Business Task Processing'
+
+  # IAM Role for EventBridge Scheduler
+  EventBridgeSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-scheduler-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaInvokeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt BusinessTaskProcessorFunction.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Schedule Group for organizing related schedules
+  BusinessAutomationScheduleGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: !Sub '${ProjectName}-automation-schedules-${Environment}'
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        Purpose: 'Business Automation Scheduling'
+
+  # Daily Report Generation Schedule
+  DailyReportSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${ProjectName}-daily-report-${Environment}'
+      Description: 'Automated daily business report generation'
+      GroupName: !Ref BusinessAutomationScheduleGroup
+      ScheduleExpression: !Ref DailyReportSchedule
+      ScheduleExpressionTimezone: !Ref ScheduleTimezone
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      State: 'ENABLED'
+      Target:
+        Arn: !GetAtt BusinessTaskProcessorFunction.Arn
+        RoleArn: !GetAtt EventBridgeSchedulerRole.Arn
+        Input: !Sub |
+          {
+            "task_type": "report",
+            "source": "eventbridge_scheduler",
+            "schedule_name": "${ProjectName}-daily-report-${Environment}",
+            "environment": "${Environment}"
+          }
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+        DeadLetterConfig:
+          Arn: !GetAtt DeadLetterQueue.Arn
+
+  # Hourly Data Processing Schedule
+  HourlyDataProcessingSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${ProjectName}-hourly-processing-${Environment}'
+      Description: 'Automated hourly business data processing'
+      GroupName: !Ref BusinessAutomationScheduleGroup
+      ScheduleExpression: !Ref HourlyProcessingSchedule
+      FlexibleTimeWindow:
+        Mode: 'FLEXIBLE'
+        MaximumWindowInMinutes: 15
+      State: 'ENABLED'
+      Target:
+        Arn: !GetAtt BusinessTaskProcessorFunction.Arn
+        RoleArn: !GetAtt EventBridgeSchedulerRole.Arn
+        Input: !Sub |
+          {
+            "task_type": "data_processing",
+            "source": "eventbridge_scheduler",
+            "schedule_name": "${ProjectName}-hourly-processing-${Environment}",
+            "environment": "${Environment}"
+          }
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+        DeadLetterConfig:
+          Arn: !GetAtt DeadLetterQueue.Arn
+
+  # Weekly Notification Schedule
+  WeeklyNotificationSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${ProjectName}-weekly-notification-${Environment}'
+      Description: 'Weekly business automation status notifications'
+      GroupName: !Ref BusinessAutomationScheduleGroup
+      ScheduleExpression: !Ref WeeklyNotificationSchedule
+      ScheduleExpressionTimezone: !Ref ScheduleTimezone
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      State: 'ENABLED'
+      Target:
+        Arn: !GetAtt BusinessTaskProcessorFunction.Arn
+        RoleArn: !GetAtt EventBridgeSchedulerRole.Arn
+        Input: !Sub |
+          {
+            "task_type": "notification",
+            "source": "eventbridge_scheduler",
+            "schedule_name": "${ProjectName}-weekly-notification-${Environment}",
+            "environment": "${Environment}"
+          }
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+        DeadLetterConfig:
+          Arn: !GetAtt DeadLetterQueue.Arn
+
+  # Dead Letter Queue for failed schedule executions
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-scheduler-dlq-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: 'alias/aws/sqs'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'EventBridge Scheduler Dead Letter Queue'
+
+  # CloudWatch Dashboard for monitoring
+  BusinessAutomationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-automation-dashboard-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${BusinessTaskProcessorFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "BucketSizeBytes", "BucketName", "${BusinessAutomationBucket}", "StorageType", "StandardStorage" ],
+                  [ ".", "NumberOfObjects", ".", ".", ".", "AllStorageTypes" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "S3 Bucket Metrics",
+                "period": 86400,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${LambdaLogGroup}'\n| fields @timestamp, @message\n| filter @message like /Task completed successfully/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Successful Task Executions",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms for monitoring
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors-${Environment}'
+      AlarmDescription: 'Alert when Lambda function has errors'
+      MetricName: 'Errors'
+      Namespace: 'AWS/Lambda'
+      Statistic: 'Sum'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: 'GreaterThanOrEqualToThreshold'
+      Dimensions:
+        - Name: 'FunctionName'
+          Value: !Ref BusinessTaskProcessorFunction
+      AlarmActions:
+        - !Ref BusinessNotificationTopic
+      TreatMissingData: 'notBreaching'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-duration-${Environment}'
+      AlarmDescription: 'Alert when Lambda function duration is high'
+      MetricName: 'Duration'
+      Namespace: 'AWS/Lambda'
+      Statistic: 'Average'
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref LambdaTimeout
+      ComparisonOperator: 'GreaterThanThreshold'
+      Dimensions:
+        - Name: 'FunctionName'
+          Value: !Ref BusinessTaskProcessorFunction
+      AlarmActions:
+        - !Ref BusinessNotificationTopic
+      TreatMissingData: 'notBreaching'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+# Template outputs for reference and integration
+Outputs:
+  # S3 Bucket Information
+  S3BucketName:
+    Description: 'Name of the S3 bucket for business automation storage'
+    Value: !Ref BusinessAutomationBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketName'
+
+  S3BucketArn:
+    Description: 'ARN of the S3 bucket for business automation storage'
+    Value: !GetAtt BusinessAutomationBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketArn'
+
+  # SNS Topic Information
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for business notifications'
+    Value: !Ref BusinessNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  SNSTopicName:
+    Description: 'Name of the SNS topic for business notifications'
+    Value: !GetAtt BusinessNotificationTopic.TopicName
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicName'
+
+  # Lambda Function Information
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function for business task processing'
+    Value: !Ref BusinessTaskProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function for business task processing'
+    Value: !GetAtt BusinessTaskProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  # EventBridge Scheduler Information
+  ScheduleGroupName:
+    Description: 'Name of the EventBridge Scheduler group'
+    Value: !Ref BusinessAutomationScheduleGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ScheduleGroupName'
+
+  DailyReportScheduleName:
+    Description: 'Name of the daily report schedule'
+    Value: !Ref DailyReportSchedule
+    Export:
+      Name: !Sub '${AWS::StackName}-DailyReportScheduleName'
+
+  HourlyProcessingScheduleName:
+    Description: 'Name of the hourly processing schedule'
+    Value: !Ref HourlyDataProcessingSchedule
+    Export:
+      Name: !Sub '${AWS::StackName}-HourlyProcessingScheduleName'
+
+  WeeklyNotificationScheduleName:
+    Description: 'Name of the weekly notification schedule'
+    Value: !Ref WeeklyNotificationSchedule
+    Export:
+      Name: !Sub '${AWS::StackName}-WeeklyNotificationScheduleName'
+
+  # Monitoring Information
+  CloudWatchDashboardURL:
+    Description: 'URL to the CloudWatch dashboard for monitoring business automation'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-automation-dashboard-${Environment}'
+
+  DeadLetterQueueURL:
+    Description: 'URL of the dead letter queue for failed schedule executions'
+    Value: !Ref DeadLetterQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueueURL'
+
+  # Cost and Usage Information
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for typical business automation workloads'
+    Value: '$5-15 USD (based on 720 hourly executions, 30 daily reports, 4 weekly notifications)'
+
+  # Documentation and Support
+  DocumentationLink:
+    Description: 'Link to AWS EventBridge Scheduler documentation'
+    Value: 'https://docs.aws.amazon.com/scheduler/latest/UserGuide/what-is-scheduler.html'
+
+  # Template Information
+  TemplateVersion:
+    Description: 'Version of this CloudFormation template'
+    Value: '1.0.0'
+
+  DeploymentTimestamp:
+    Description: 'Timestamp when this stack was deployed'
+    Value: !Sub '${AWS::Timestamp}'

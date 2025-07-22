@@ -1,0 +1,675 @@
+# Google Cloud Infrastructure Manager Configuration
+# Recipe: Code Review and Documentation Workflows with Google Workspace APIs and Cloud Run
+# This configuration deploys a complete serverless automation system for code review workflows
+
+metadata:
+  name: code-review-automation
+  description: "Automated code review and documentation workflow using Google Workspace APIs and Cloud Run"
+  version: "1.0"
+  labels:
+    environment: "production"
+    application: "code-review-automation"
+    category: "devops"
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    validation:
+      pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+  
+  region:
+    type: string
+    description: "GCP region for resource deployment"
+    default: "us-central1"
+    validation:
+      enum: ["us-central1", "us-east1", "us-west1", "europe-west1", "asia-east1"]
+  
+  zone:
+    type: string
+    description: "GCP zone for resource deployment"
+    default: "us-central1-a"
+  
+  environment:
+    type: string
+    description: "Environment name (dev, staging, prod)"
+    default: "prod"
+    validation:
+      enum: ["dev", "staging", "prod"]
+  
+  notification_emails:
+    type: array
+    description: "List of email addresses for notifications"
+    default: ["admin@example.com"]
+  
+  max_instances:
+    type: integer
+    description: "Maximum number of Cloud Run instances"
+    default: 10
+    validation:
+      min: 1
+      max: 100
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      parent: projects/$(ref.project_id.value)
+      services:
+        - run.googleapis.com
+        - pubsub.googleapis.com
+        - cloudscheduler.googleapis.com
+        - secretmanager.googleapis.com
+        - storage.googleapis.com
+        - monitoring.googleapis.com
+        - gmail.googleapis.com
+        - docs.googleapis.com
+        - drive.googleapis.com
+        - admin.googleapis.com
+    metadata:
+      dependsOn:
+        - project_id
+
+  # Generate unique suffix for resource names
+  - name: random-suffix
+    type: gcp-types/random-v1:id
+    properties:
+      byte_length: 3
+    metadata:
+      description: "Generate unique suffix for resource naming"
+
+  # Create Pub/Sub topic for event processing
+  - name: code-events-topic
+    type: gcp-types/pubsub-v1:topics
+    properties:
+      name: projects/$(ref.project_id.value)/topics/code-events-$(ref.random-suffix.hex)
+      labels:
+        environment: $(ref.environment.value)
+        component: "messaging"
+    metadata:
+      dependsOn:
+        - enable-apis
+        - random-suffix
+      description: "Pub/Sub topic for code review event processing"
+
+  # Create Pub/Sub subscription for Cloud Run services
+  - name: code-processing-subscription
+    type: gcp-types/pubsub-v1:subscriptions
+    properties:
+      name: projects/$(ref.project_id.value)/subscriptions/code-processing-$(ref.random-suffix.hex)
+      topic: $(ref.code-events-topic.name)
+      ackDeadlineSeconds: 600
+      messageRetentionDuration: "604800s"  # 7 days
+      retryPolicy:
+        minimumBackoff: "10s"
+        maximumBackoff: "600s"
+      deadLetterPolicy:
+        deadLetterTopic: $(ref.dead-letter-topic.name)
+        maxDeliveryAttempts: 5
+      labels:
+        environment: $(ref.environment.value)
+        component: "messaging"
+    metadata:
+      dependsOn:
+        - code-events-topic
+        - dead-letter-topic
+      description: "Subscription for processing code review events"
+
+  # Create dead letter topic for failed messages
+  - name: dead-letter-topic
+    type: gcp-types/pubsub-v1:topics
+    properties:
+      name: projects/$(ref.project_id.value)/topics/dead-letter-$(ref.random-suffix.hex)
+      labels:
+        environment: $(ref.environment.value)
+        component: "messaging"
+    metadata:
+      dependsOn:
+        - enable-apis
+        - random-suffix
+      description: "Dead letter topic for failed message processing"
+
+  # Create Cloud Storage bucket for artifacts and logs
+  - name: artifacts-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: code-artifacts-$(ref.random-suffix.hex)
+      project: $(ref.project_id.value)
+      location: $(ref.region.value)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+          - action:
+              type: Delete
+            condition:
+              age: 365
+      uniformBucketLevelAccess:
+        enabled: true
+      labels:
+        environment: $(ref.environment.value)
+        component: "storage"
+    metadata:
+      dependsOn:
+        - enable-apis
+        - random-suffix
+      description: "Storage bucket for code review artifacts and logs"
+
+  # Create service account for Google Workspace API access
+  - name: workspace-service-account
+    type: gcp-types/iam-v1:serviceAccounts
+    properties:
+      accountId: workspace-automation-$(ref.random-suffix.hex)
+      serviceAccount:
+        displayName: "Workspace Automation Service Account"
+        description: "Service account for automated code review workflows with Google Workspace APIs"
+        labels:
+          environment: $(ref.environment.value)
+          component: "authentication"
+    metadata:
+      dependsOn:
+        - enable-apis
+        - random-suffix
+      description: "Service account for Google Workspace API authentication"
+
+  # Generate service account key
+  - name: workspace-service-account-key
+    type: gcp-types/iam-v1:serviceAccountKeys
+    properties:
+      parent: $(ref.workspace-service-account.name)
+      privateKeyType: TYPE_GOOGLE_CREDENTIALS_FILE
+    metadata:
+      dependsOn:
+        - workspace-service-account
+      description: "Service account key for API authentication"
+
+  # Store service account credentials in Secret Manager
+  - name: workspace-credentials-secret
+    type: gcp-types/secretmanager-v1:secrets
+    properties:
+      parent: projects/$(ref.project_id.value)
+      secretId: workspace-credentials
+      secret:
+        labels:
+          environment: $(ref.environment.value)
+          component: "authentication"
+        replication:
+          automatic: {}
+    metadata:
+      dependsOn:
+        - enable-apis
+      description: "Secret Manager secret for Workspace API credentials"
+
+  # Store the service account key as a secret version
+  - name: workspace-credentials-version
+    type: gcp-types/secretmanager-v1:versions
+    properties:
+      parent: $(ref.workspace-credentials-secret.name)
+      payload:
+        data: $(ref.workspace-service-account-key.privateKeyData)
+    metadata:
+      dependsOn:
+        - workspace-credentials-secret
+        - workspace-service-account-key
+      description: "Secret version containing service account credentials"
+
+  # Grant IAM roles to service account
+  - name: workspace-sa-secret-accessor
+    type: gcp-types/cloudresourcemanager-v1:bindings
+    properties:
+      resource: projects/$(ref.project_id.value)
+      role: roles/secretmanager.secretAccessor
+      members:
+        - serviceAccount:$(ref.workspace-service-account.email)
+    metadata:
+      dependsOn:
+        - workspace-service-account
+      description: "Grant Secret Manager access to service account"
+
+  - name: workspace-sa-storage-admin
+    type: gcp-types/cloudresourcemanager-v1:bindings
+    properties:
+      resource: projects/$(ref.project_id.value)
+      role: roles/storage.objectAdmin
+      members:
+        - serviceAccount:$(ref.workspace-service-account.email)
+    metadata:
+      dependsOn:
+        - workspace-service-account
+      description: "Grant Storage Object Admin access to service account"
+
+  - name: workspace-sa-pubsub-publisher
+    type: gcp-types/cloudresourcemanager-v1:bindings
+    properties:
+      resource: projects/$(ref.project_id.value)
+      role: roles/pubsub.publisher
+      members:
+        - serviceAccount:$(ref.workspace-service-account.email)
+    metadata:
+      dependsOn:
+        - workspace-service-account
+      description: "Grant Pub/Sub Publisher access to service account"
+
+  # Deploy Code Review Analysis Cloud Run Service
+  - name: code-review-service
+    type: gcp-types/run-v1:services
+    properties:
+      apiVersion: serving.knative.dev/v1
+      kind: Service
+      metadata:
+        name: code-review-$(ref.random-suffix.hex)
+        namespace: $(ref.project_id.value)
+        labels:
+          environment: $(ref.environment.value)
+          component: "code-analysis"
+        annotations:
+          run.googleapis.com/ingress: all
+          run.googleapis.com/execution-environment: gen2
+      spec:
+        template:
+          metadata:
+            annotations:
+              autoscaling.knative.dev/maxScale: "$(ref.max_instances.value)"
+              autoscaling.knative.dev/minScale: "0"
+              run.googleapis.com/cpu-throttling: "false"
+              run.googleapis.com/memory: "1Gi"
+              run.googleapis.com/cpu: "1"
+              run.googleapis.com/timeout: "300s"
+          spec:
+            serviceAccountName: $(ref.workspace-service-account.email)
+            containerConcurrency: 1000
+            timeoutSeconds: 300
+            containers:
+              - image: gcr.io/cloudrun/hello  # Placeholder - replace with actual image
+                ports:
+                  - containerPort: 8080
+                    protocol: TCP
+                env:
+                  - name: GOOGLE_CLOUD_PROJECT
+                    value: $(ref.project_id.value)
+                  - name: BUCKET_NAME
+                    value: $(ref.artifacts-bucket.name)
+                  - name: TOPIC_NAME
+                    value: code-events-$(ref.random-suffix.hex)
+                  - name: ENVIRONMENT
+                    value: $(ref.environment.value)
+                resources:
+                  limits:
+                    cpu: "1"
+                    memory: "1Gi"
+                  requests:
+                    cpu: "0.5"
+                    memory: "512Mi"
+        traffic:
+          - percent: 100
+            latestRevision: true
+    metadata:
+      dependsOn:
+        - enable-apis
+        - workspace-service-account
+        - artifacts-bucket
+        - code-events-topic
+        - random-suffix
+      description: "Cloud Run service for code review analysis"
+
+  # Deploy Documentation Update Service
+  - name: docs-service
+    type: gcp-types/run-v1:services
+    properties:
+      apiVersion: serving.knative.dev/v1
+      kind: Service
+      metadata:
+        name: docs-service-$(ref.random-suffix.hex)
+        namespace: $(ref.project_id.value)
+        labels:
+          environment: $(ref.environment.value)
+          component: "documentation"
+        annotations:
+          run.googleapis.com/ingress: all
+          run.googleapis.com/execution-environment: gen2
+      spec:
+        template:
+          metadata:
+            annotations:
+              autoscaling.knative.dev/maxScale: "5"
+              autoscaling.knative.dev/minScale: "0"
+              run.googleapis.com/cpu-throttling: "false"
+              run.googleapis.com/memory: "512Mi"
+              run.googleapis.com/cpu: "1"
+              run.googleapis.com/timeout: "300s"
+          spec:
+            serviceAccountName: $(ref.workspace-service-account.email)
+            containerConcurrency: 1000
+            timeoutSeconds: 300
+            containers:
+              - image: gcr.io/cloudrun/hello  # Placeholder - replace with actual image
+                ports:
+                  - containerPort: 8080
+                    protocol: TCP
+                env:
+                  - name: GOOGLE_CLOUD_PROJECT
+                    value: $(ref.project_id.value)
+                  - name: BUCKET_NAME
+                    value: $(ref.artifacts-bucket.name)
+                  - name: ENVIRONMENT
+                    value: $(ref.environment.value)
+                resources:
+                  limits:
+                    cpu: "1"
+                    memory: "512Mi"
+                  requests:
+                    cpu: "0.5"
+                    memory: "256Mi"
+        traffic:
+          - percent: 100
+            latestRevision: true
+    metadata:
+      dependsOn:
+        - enable-apis
+        - workspace-service-account
+        - artifacts-bucket
+        - random-suffix
+      description: "Cloud Run service for documentation updates"
+
+  # Deploy Email Notification Service
+  - name: notification-service
+    type: gcp-types/run-v1:services
+    properties:
+      apiVersion: serving.knative.dev/v1
+      kind: Service
+      metadata:
+        name: notification-service-$(ref.random-suffix.hex)
+        namespace: $(ref.project_id.value)
+        labels:
+          environment: $(ref.environment.value)
+          component: "notifications"
+        annotations:
+          run.googleapis.com/ingress: all
+          run.googleapis.com/execution-environment: gen2
+      spec:
+        template:
+          metadata:
+            annotations:
+              autoscaling.knative.dev/maxScale: "5"
+              autoscaling.knative.dev/minScale: "0"
+              run.googleapis.com/cpu-throttling: "false"
+              run.googleapis.com/memory: "512Mi"
+              run.googleapis.com/cpu: "1"
+              run.googleapis.com/timeout: "180s"
+          spec:
+            serviceAccountName: $(ref.workspace-service-account.email)
+            containerConcurrency: 1000
+            timeoutSeconds: 180
+            containers:
+              - image: gcr.io/cloudrun/hello  # Placeholder - replace with actual image
+                ports:
+                  - containerPort: 8080
+                    protocol: TCP
+                env:
+                  - name: GOOGLE_CLOUD_PROJECT
+                    value: $(ref.project_id.value)
+                  - name: ENVIRONMENT
+                    value: $(ref.environment.value)
+                  - name: NOTIFICATION_EMAILS
+                    value: "$(join(ref.notification_emails.value, ','))"
+                resources:
+                  limits:
+                    cpu: "1"
+                    memory: "512Mi"
+                  requests:
+                    cpu: "0.5"
+                    memory: "256Mi"
+        traffic:
+          - percent: 100
+            latestRevision: true
+    metadata:
+      dependsOn:
+        - enable-apis
+        - workspace-service-account
+        - random-suffix
+      description: "Cloud Run service for email notifications"
+
+  # Configure IAM policy for Cloud Run services to allow unauthenticated access
+  - name: code-review-service-iam
+    type: gcp-types/run-v1:bindings
+    properties:
+      parent: $(ref.code-review-service.status.url)
+      role: roles/run.invoker
+      members:
+        - allUsers
+    metadata:
+      dependsOn:
+        - code-review-service
+      description: "Allow unauthenticated access to code review service"
+
+  - name: docs-service-iam
+    type: gcp-types/run-v1:bindings
+    properties:
+      parent: $(ref.docs-service.status.url)
+      role: roles/run.invoker
+      members:
+        - allUsers
+    metadata:
+      dependsOn:
+        - docs-service
+      description: "Allow unauthenticated access to documentation service"
+
+  - name: notification-service-iam
+    type: gcp-types/run-v1:bindings
+    properties:
+      parent: $(ref.notification-service.status.url)
+      role: roles/run.invoker
+      members:
+        - allUsers
+    metadata:
+      dependsOn:
+        - notification-service
+      description: "Allow unauthenticated access to notification service"
+
+  # Create Cloud Scheduler jobs for periodic maintenance
+  - name: weekly-doc-review-job
+    type: gcp-types/cloudscheduler-v1:jobs
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      job:
+        name: projects/$(ref.project_id.value)/locations/$(ref.region.value)/jobs/weekly-doc-review
+        description: "Weekly documentation review trigger"
+        schedule: "0 9 * * 1"  # Monday at 9 AM
+        timeZone: "UTC"
+        httpTarget:
+          uri: $(ref.docs-service.status.url)/health
+          httpMethod: GET
+        retryConfig:
+          retryCount: 3
+          maxRetryDuration: "300s"
+          minBackoffDuration: "5s"
+          maxBackoffDuration: "60s"
+    metadata:
+      dependsOn:
+        - enable-apis
+        - docs-service
+      description: "Scheduled job for weekly documentation review"
+
+  - name: monthly-cleanup-job
+    type: gcp-types/cloudscheduler-v1:jobs
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      job:
+        name: projects/$(ref.project_id.value)/locations/$(ref.region.value)/jobs/monthly-cleanup
+        description: "Monthly cleanup and maintenance"
+        schedule: "0 2 1 * *"  # First day of month at 2 AM
+        timeZone: "UTC"
+        httpTarget:
+          uri: $(ref.code-review-service.status.url)/health
+          httpMethod: GET
+        retryConfig:
+          retryCount: 3
+          maxRetryDuration: "300s"
+          minBackoffDuration: "5s"
+          maxBackoffDuration: "60s"
+    metadata:
+      dependsOn:
+        - enable-apis
+        - code-review-service
+      description: "Scheduled job for monthly cleanup and maintenance"
+
+  - name: maintenance-trigger-job
+    type: gcp-types/cloudscheduler-v1:jobs
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      job:
+        name: projects/$(ref.project_id.value)/locations/$(ref.region.value)/jobs/maintenance-trigger
+        description: "Weekly maintenance trigger via Pub/Sub"
+        schedule: "0 3 * * 0"  # Sunday at 3 AM
+        timeZone: "UTC"
+        pubsubTarget:
+          topicName: $(ref.code-events-topic.name)
+          data: eyJ0eXBlIjoibWFpbnRlbmFuY2UiLCJhY3Rpb24iOiJ3ZWVrbHlfc3VtbWFyeSJ9  # Base64 encoded JSON
+        retryConfig:
+          retryCount: 3
+          maxRetryDuration: "300s"
+          minBackoffDuration: "5s"
+          maxBackoffDuration: "60s"
+    metadata:
+      dependsOn:
+        - enable-apis
+        - code-events-topic
+      description: "Scheduled job for weekly maintenance via Pub/Sub"
+
+  # Create monitoring dashboard
+  - name: monitoring-dashboard
+    type: gcp-types/monitoring-v1:dashboards
+    properties:
+      parent: projects/$(ref.project_id.value)
+      dashboard:
+        displayName: "Code Review Automation Dashboard"
+        labels:
+          environment: $(ref.environment.value)
+          component: "monitoring"
+        mosaicLayout:
+          tiles:
+            - width: 6
+              height: 4
+              widget:
+                title: "Cloud Run Request Count"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="cloud_run_revision"'
+                          aggregation:
+                            alignmentPeriod: "60s"
+                            perSeriesAligner: "ALIGN_RATE"
+                            crossSeriesReducer: "REDUCE_SUM"
+                            groupByFields:
+                              - "resource.label.service_name"
+            - width: 6
+              height: 4
+              widget:
+                title: "Pub/Sub Message Count"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="pubsub_topic"'
+                          aggregation:
+                            alignmentPeriod: "60s"
+                            perSeriesAligner: "ALIGN_RATE"
+                            crossSeriesReducer: "REDUCE_SUM"
+    metadata:
+      dependsOn:
+        - enable-apis
+      description: "Monitoring dashboard for code review automation system"
+
+  # Create alerting policy for service errors
+  - name: service-error-alert
+    type: gcp-types/monitoring-v1:alertPolicies
+    properties:
+      parent: projects/$(ref.project_id.value)
+      alertPolicy:
+        displayName: "Code Review Service Errors"
+        enabled: true
+        conditions:
+          - displayName: "Cloud Run Error Rate"
+            conditionThreshold:
+              filter: 'resource.type="cloud_run_revision"'
+              comparison: "COMPARISON_GREATER_THAN"
+              thresholdValue: 0.1
+              duration: "300s"
+              aggregations:
+                - alignmentPeriod: "60s"
+                  perSeriesAligner: "ALIGN_RATE"
+                  crossSeriesReducer: "REDUCE_MEAN"
+        alertStrategy:
+          autoClose: "1800s"
+        combiner: "OR"
+        documentation:
+          content: "Alert triggered when Cloud Run service error rate exceeds 10% for 5 minutes"
+          mimeType: "text/markdown"
+    metadata:
+      dependsOn:
+        - enable-apis
+      description: "Alert policy for monitoring service errors"
+
+# Output values for verification and integration
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: $(ref.project_id.value)
+  
+  region:
+    description: "Deployment region"
+    value: $(ref.region.value)
+  
+  environment:
+    description: "Environment name"
+    value: $(ref.environment.value)
+  
+  unique_suffix:
+    description: "Unique suffix for resource names"
+    value: $(ref.random-suffix.hex)
+  
+  pubsub_topic:
+    description: "Pub/Sub topic for code events"
+    value: $(ref.code-events-topic.name)
+  
+  pubsub_subscription:
+    description: "Pub/Sub subscription for processing"
+    value: $(ref.code-processing-subscription.name)
+  
+  storage_bucket:
+    description: "Cloud Storage bucket for artifacts"
+    value: $(ref.artifacts-bucket.name)
+  
+  service_account_email:
+    description: "Service account email for Workspace APIs"
+    value: $(ref.workspace-service-account.email)
+  
+  code_review_service_url:
+    description: "Code review service URL"
+    value: $(ref.code-review-service.status.url)
+  
+  docs_service_url:
+    description: "Documentation service URL"
+    value: $(ref.docs-service.status.url)
+  
+  notification_service_url:
+    description: "Notification service URL"
+    value: $(ref.notification-service.status.url)
+  
+  webhook_endpoint:
+    description: "Webhook endpoint for code repository integration"
+    value: "$(ref.code-review-service.status.url)/webhook"
+  
+  dashboard_url:
+    description: "Monitoring dashboard URL"
+    value: "https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.monitoring-dashboard.name)?project=$(ref.project_id.value)"

@@ -1,0 +1,446 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Secure static website hosting with AWS Certificate Manager, CloudFront, and S3. This template creates a complete infrastructure for hosting static websites with SSL/TLS certificates, global content delivery, and secure access controls.'
+
+# Template Parameters - Allows customization of the deployment
+Parameters:
+  DomainName:
+    Type: String
+    Description: 'Primary domain name for the website (e.g., example.com)'
+    AllowedPattern: '^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]?\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid domain name format'
+  
+  SubdomainName:
+    Type: String
+    Description: 'Subdomain name for the website (e.g., www)'
+    Default: 'www'
+    AllowedPattern: '^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]?$'
+    ConstraintDescription: 'Must be a valid subdomain format'
+  
+  BucketPrefix:
+    Type: String
+    Description: 'Prefix for S3 bucket name (bucket will be created as prefix-randomsuffix)'
+    Default: 'static-website'
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+  
+  Environment:
+    Type: String
+    Description: 'Environment name for resource tagging'
+    Default: 'production'
+    AllowedValues:
+      - 'development'
+      - 'staging'
+      - 'production'
+  
+  EnableLogging:
+    Type: String
+    Description: 'Enable CloudFront access logging'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+  
+  PriceClass:
+    Type: String
+    Description: 'CloudFront price class for geographic distribution'
+    Default: 'PriceClass_100'
+    AllowedValues:
+      - 'PriceClass_100'  # US, Canada, Europe
+      - 'PriceClass_200'  # US, Canada, Europe, Asia, Middle East, Africa
+      - 'PriceClass_All'  # All edge locations
+    ConstraintDescription: 'Must be a valid CloudFront price class'
+
+# Conditions for conditional resource creation
+Conditions:
+  EnableCloudFrontLogging: !Equals [!Ref EnableLogging, 'true']
+  IsProduction: !Equals [!Ref Environment, 'production']
+
+# Template Resources
+Resources:
+  # S3 Bucket for static website hosting
+  StaticWebsiteBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${BucketPrefix}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: 'Enabled'
+      WebsiteConfiguration:
+        IndexDocument: 'index.html'
+        ErrorDocument: 'error.html'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3LogGroup
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'Static Website Hosting'
+        - Key: 'ManagedBy'
+          Value: 'CloudFormation'
+
+  # CloudWatch Log Group for S3 events
+  S3LogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${BucketPrefix}-${AWS::AccountId}-${AWS::Region}'
+      RetentionInDays: !If [IsProduction, 90, 30]
+
+  # S3 Bucket for CloudFront access logs (conditional)
+  CloudFrontLogsBucket:
+    Type: 'AWS::S3::Bucket'
+    Condition: EnableCloudFrontLogging
+    Properties:
+      BucketName: !Sub '${BucketPrefix}-logs-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+            BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: 'DeleteOldLogs'
+            Status: 'Enabled'
+            ExpirationInDays: !If [IsProduction, 365, 90]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'CloudFront Access Logs'
+        - Key: 'ManagedBy'
+          Value: 'CloudFormation'
+
+  # SSL/TLS Certificate from AWS Certificate Manager
+  # Note: Certificate must be created in us-east-1 for CloudFront
+  SSLCertificate:
+    Type: 'AWS::CertificateManager::Certificate'
+    Properties:
+      DomainName: !Ref DomainName
+      SubjectAlternativeNames:
+        - !Sub '${SubdomainName}.${DomainName}'
+      ValidationMethod: 'DNS'
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZone
+        - DomainName: !Sub '${SubdomainName}.${DomainName}'
+          HostedZoneId: !Ref HostedZone
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'Static Website SSL'
+        - Key: 'ManagedBy'
+          Value: 'CloudFormation'
+
+  # Route 53 Hosted Zone for domain management
+  HostedZone:
+    Type: 'AWS::Route53::HostedZone'
+    Properties:
+      Name: !Ref DomainName
+      HostedZoneConfig:
+        Comment: !Sub 'Hosted zone for ${DomainName} static website'
+      HostedZoneTags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'Static Website DNS'
+        - Key: 'ManagedBy'
+          Value: 'CloudFormation'
+
+  # Origin Access Control for secure S3 access
+  OriginAccessControl:
+    Type: 'AWS::CloudFront::OriginAccessControl'
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub 'OAC-${StaticWebsiteBucket}'
+        OriginAccessControlOriginType: 's3'
+        SigningBehavior: 'always'
+        SigningProtocol: 'sigv4'
+        Description: !Sub 'Origin Access Control for ${StaticWebsiteBucket}'
+
+  # CloudFront Distribution for global content delivery
+  CloudFrontDistribution:
+    Type: 'AWS::CloudFront::Distribution'
+    Properties:
+      DistributionConfig:
+        Aliases:
+          - !Ref DomainName
+          - !Sub '${SubdomainName}.${DomainName}'
+        Comment: !Sub 'CloudFront distribution for ${DomainName}'
+        DefaultCacheBehavior:
+          TargetOriginId: !Sub 'S3-${StaticWebsiteBucket}'
+          ViewerProtocolPolicy: 'redirect-to-https'
+          CachePolicyId: '658327ea-f89d-4fab-a63d-7e88639e58f6'  # Managed-CachingOptimized
+          OriginRequestPolicyId: '88a5eaf4-2fd4-4709-b370-b4c650ea3fcf'  # Managed-CORS-S3Origin
+          ResponseHeadersPolicyId: '5cc3b908-e619-4b99-88e5-2cf7f45965bd'  # Managed-SecurityHeadersPolicy
+          Compress: true
+          FunctionAssociations:
+            - EventType: 'viewer-request'
+              FunctionARN: !GetAtt SecurityHeadersFunction.FunctionMetadata.FunctionARN
+        DefaultRootObject: 'index.html'
+        Enabled: true
+        HttpVersion: 'http2and3'
+        IPV6Enabled: true
+        Logging: !If
+          - EnableCloudFrontLogging
+          - Bucket: !GetAtt CloudFrontLogsBucket.RegionalDomainName
+            IncludeCookies: false
+            Prefix: 'cloudfront-logs/'
+          - !Ref 'AWS::NoValue'
+        Origins:
+          - Id: !Sub 'S3-${StaticWebsiteBucket}'
+            DomainName: !GetAtt StaticWebsiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        PriceClass: !Ref PriceClass
+        ViewerCertificate:
+          AcmCertificateArn: !Ref SSLCertificate
+          SslSupportMethod: 'sni-only'
+          MinimumProtocolVersion: 'TLSv1.2_2021'
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 404
+            ResponsePagePath: '/error.html'
+            ErrorCachingMinTTL: 300
+          - ErrorCode: 404
+            ResponseCode: 404
+            ResponsePagePath: '/error.html'
+            ErrorCachingMinTTL: 300
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'Static Website CDN'
+        - Key: 'ManagedBy'
+          Value: 'CloudFormation'
+
+  # CloudFront Function for security headers
+  SecurityHeadersFunction:
+    Type: 'AWS::CloudFront::Function'
+    Properties:
+      Name: !Sub '${AWS::StackName}-security-headers'
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var headers = request.headers;
+          
+          // Add security headers for enhanced protection
+          headers['strict-transport-security'] = {
+            value: 'max-age=31536000; includeSubDomains; preload'
+          };
+          headers['x-content-type-options'] = {
+            value: 'nosniff'
+          };
+          headers['x-frame-options'] = {
+            value: 'DENY'
+          };
+          headers['x-xss-protection'] = {
+            value: '1; mode=block'
+          };
+          headers['referrer-policy'] = {
+            value: 'strict-origin-when-cross-origin'
+          };
+          
+          return request;
+        }
+      FunctionConfig:
+        Comment: 'Add security headers to all requests'
+        Runtime: 'cloudfront-js-1.0'
+
+  # S3 Bucket Policy for CloudFront access
+  BucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref StaticWebsiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: 'AllowCloudFrontServicePrincipal'
+            Effect: 'Allow'
+            Principal:
+              Service: 'cloudfront.amazonaws.com'
+            Action: 's3:GetObject'
+            Resource: !Sub '${StaticWebsiteBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  # Route 53 DNS Records
+  DNSRecordRoot:
+    Type: 'AWS::Route53::RecordSet'
+    Properties:
+      HostedZoneId: !Ref HostedZone
+      Name: !Ref DomainName
+      Type: 'A'
+      AliasTarget:
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        HostedZoneId: 'Z2FDTNDATAQYW2'  # CloudFront hosted zone ID
+        EvaluateTargetHealth: false
+
+  DNSRecordSubdomain:
+    Type: 'AWS::Route53::RecordSet'
+    Properties:
+      HostedZoneId: !Ref HostedZone
+      Name: !Sub '${SubdomainName}.${DomainName}'
+      Type: 'A'
+      AliasTarget:
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        HostedZoneId: 'Z2FDTNDATAQYW2'  # CloudFront hosted zone ID
+        EvaluateTargetHealth: false
+
+  # CloudWatch Alarms for monitoring
+  CloudFrontErrorRateAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-CloudFront-ErrorRate'
+      AlarmDescription: 'Monitor CloudFront 4xx/5xx error rates'
+      MetricName: '4xxErrorRate'
+      Namespace: 'AWS/CloudFront'
+      Statistic: 'Average'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: 'GreaterThanThreshold'
+      Dimensions:
+        - Name: 'DistributionId'
+          Value: !Ref CloudFrontDistribution
+      TreatMissingData: 'notBreaching'
+
+  # SNS Topic for alerts (production only)
+  AlertsTopic:
+    Type: 'AWS::SNS::Topic'
+    Condition: IsProduction
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-alerts'
+      DisplayName: 'Static Website Alerts'
+
+# Template Outputs
+Outputs:
+  WebsiteURL:
+    Description: 'Primary website URL with HTTPS'
+    Value: !Sub 'https://${DomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-WebsiteURL'
+
+  SubdomainURL:
+    Description: 'Subdomain website URL with HTTPS'
+    Value: !Sub 'https://${SubdomainName}.${DomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-SubdomainURL'
+
+  CloudFrontDistributionId:
+    Description: 'CloudFront Distribution ID'
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub '${AWS::StackName}-DistributionId'
+
+  CloudFrontDomainName:
+    Description: 'CloudFront distribution domain name'
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFrontDomain'
+
+  S3BucketName:
+    Description: 'S3 bucket name for website content'
+    Value: !Ref StaticWebsiteBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3Bucket'
+
+  S3BucketURL:
+    Description: 'S3 bucket website endpoint URL'
+    Value: !GetAtt StaticWebsiteBucket.WebsiteURL
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketURL'
+
+  CertificateArn:
+    Description: 'SSL Certificate ARN'
+    Value: !Ref SSLCertificate
+    Export:
+      Name: !Sub '${AWS::StackName}-CertificateArn'
+
+  HostedZoneId:
+    Description: 'Route 53 Hosted Zone ID'
+    Value: !Ref HostedZone
+    Export:
+      Name: !Sub '${AWS::StackName}-HostedZoneId'
+
+  HostedZoneNameServers:
+    Description: 'Route 53 Hosted Zone Name Servers'
+    Value: !Join [', ', !GetAtt HostedZone.NameServers]
+    Export:
+      Name: !Sub '${AWS::StackName}-NameServers'
+
+  OriginAccessControlId:
+    Description: 'Origin Access Control ID'
+    Value: !Ref OriginAccessControl
+    Export:
+      Name: !Sub '${AWS::StackName}-OACId'
+
+  LogsBucketName:
+    Condition: EnableCloudFrontLogging
+    Description: 'S3 bucket name for CloudFront access logs'
+    Value: !Ref CloudFrontLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-LogsBucket'
+
+  SecurityHeadersFunctionArn:
+    Description: 'CloudFront Function ARN for security headers'
+    Value: !GetAtt SecurityHeadersFunction.FunctionMetadata.FunctionARN
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityFunctionArn'
+
+# Metadata for AWS CloudFormation Designer and documentation
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Domain Configuration'
+        Parameters:
+          - DomainName
+          - SubdomainName
+      - Label:
+          default: 'Infrastructure Configuration'
+        Parameters:
+          - BucketPrefix
+          - Environment
+          - PriceClass
+      - Label:
+          default: 'Logging and Monitoring'
+        Parameters:
+          - EnableLogging
+    ParameterLabels:
+      DomainName:
+        default: 'Primary Domain Name'
+      SubdomainName:
+        default: 'Subdomain Prefix'
+      BucketPrefix:
+        default: 'S3 Bucket Prefix'
+      Environment:
+        default: 'Environment Type'
+      EnableLogging:
+        default: 'Enable CloudFront Logging'
+      PriceClass:
+        default: 'CloudFront Price Class'
+  
+  Purpose: 'Complete infrastructure for secure static website hosting with SSL/TLS certificates'
+  Author: 'AWS CloudFormation Recipe Generator'
+  Version: '1.0'
+  LastUpdated: '2025-07-12'

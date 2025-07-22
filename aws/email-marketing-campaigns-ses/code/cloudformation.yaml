@@ -1,0 +1,960 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Email Marketing Campaign infrastructure using Amazon SES, S3, SNS, and CloudWatch'
+
+Parameters:
+  # Domain and Email Configuration
+  SenderDomain:
+    Type: String
+    Description: 'Domain name for sending emails (e.g., yourdomain.com)'
+    Default: 'yourdomain.com'
+    AllowedPattern: '^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid domain name'
+  
+  SenderEmail:
+    Type: String
+    Description: 'Email address for sending campaigns (e.g., marketing@yourdomain.com)'
+    Default: 'marketing@yourdomain.com'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+  
+  NotificationEmail:
+    Type: String
+    Description: 'Email address to receive bounce and complaint notifications'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+  
+  # Resource Naming
+  ProjectName:
+    Type: String
+    Description: 'Project name for resource naming'
+    Default: 'email-marketing'
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+  
+  Environment:
+    Type: String
+    Description: 'Environment name (dev, staging, prod)'
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+  
+  # Monitoring Configuration
+  BounceRateThreshold:
+    Type: Number
+    Description: 'Bounce rate threshold percentage to trigger alarm'
+    Default: 5
+    MinValue: 1
+    MaxValue: 20
+  
+  ComplaintRateThreshold:
+    Type: Number
+    Description: 'Complaint rate threshold percentage to trigger alarm'
+    Default: 1
+    MinValue: 0.1
+    MaxValue: 5
+
+Conditions:
+  # Create production-specific resources only in prod environment
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # S3 Bucket for storing email templates and subscriber lists
+  EmailMarketingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt SubscriberListProcessor.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: subscribers/
+                  - Name: suffix
+                    Value: .json
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Email marketing templates and subscriber storage'
+
+  # S3 Bucket Policy for secure access
+  EmailMarketingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref EmailMarketingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${EmailMarketingBucket}/*'
+              - !GetAtt EmailMarketingBucket.Arn
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # SNS Topic for email event notifications
+  EmailEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-email-events'
+      DisplayName: 'Email Marketing Events Topic'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Email bounce and complaint notifications'
+
+  # SNS Topic Policy
+  EmailEventsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref EmailEventsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSESPublish
+            Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action: 'sns:Publish'
+            Resource: !Ref EmailEventsTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+
+  # Email notification subscription
+  EmailEventsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref EmailEventsTopic
+      Endpoint: !Ref NotificationEmail
+
+  # SES Configuration Set for email tracking
+  EmailConfigurationSet:
+    Type: AWS::SES::ConfigurationSet
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-config-set'
+      DeliveryOptions:
+        TlsPolicy: Require
+      ReputationOptions:
+        ReputationMetricsEnabled: true
+      SendingOptions:
+        SendingEnabled: true
+      SuppressionOptions:
+        SuppressedReasons:
+          - BOUNCE
+          - COMPLAINT
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Email campaign tracking and analytics'
+
+  # CloudWatch Event Destination for SES
+  CloudWatchEventDestination:
+    Type: AWS::SES::ConfigurationSetEventDestination
+    Properties:
+      ConfigurationSetName: !Ref EmailConfigurationSet
+      EventDestination:
+        Name: 'cloudwatch-events'
+        Enabled: true
+        MatchingEventTypes:
+          - send
+          - bounce
+          - complaint
+          - delivery
+          - reject
+          - open
+          - click
+          - renderingFailure
+          - deliveryDelay
+        CloudWatchDestination:
+          DefaultDimensionValue: 'default'
+          DimensionConfigurations:
+            - DimensionName: 'MessageTag'
+              DimensionValueSource: 'messageTag'
+              DefaultDimensionValue: 'campaign'
+            - DimensionName: 'ConfigurationSet'
+              DimensionValueSource: 'configurationSet'
+              DefaultDimensionValue: !Ref EmailConfigurationSet
+
+  # SNS Event Destination for SES
+  SNSEventDestination:
+    Type: AWS::SES::ConfigurationSetEventDestination
+    Properties:
+      ConfigurationSetName: !Ref EmailConfigurationSet
+      EventDestination:
+        Name: 'sns-events'
+        Enabled: true
+        MatchingEventTypes:
+          - bounce
+          - complaint
+          - delivery
+          - reject
+        SnsDestination:
+          TopicArn: !Ref EmailEventsTopic
+
+  # Email Templates
+  WelcomeCampaignTemplate:
+    Type: AWS::SES::Template
+    Properties:
+      Template:
+        TemplateName: !Sub '${ProjectName}-${Environment}-welcome-campaign'
+        SubjectPart: 'Welcome to Our Community, {{name}}!'
+        HtmlPart: |
+          <html>
+          <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+            <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+              <h2 style="color: #2c3e50;">Welcome {{name}}!</h2>
+              <p>Thank you for joining our community. We are excited to have you aboard!</p>
+              <p>As a welcome gift, use code <strong style="color: #e74c3c;">WELCOME10</strong> for 10% off your first purchase.</p>
+              <div style="margin: 30px 0;">
+                <a href="{{shop_url}}" style="background-color: #3498db; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; display: inline-block;">Start Shopping</a>
+              </div>
+              <p>Best regards,<br/>The Marketing Team</p>
+              <hr style="border: 1px solid #eee; margin: 20px 0;">
+              <p style="font-size: 12px; color: #666;">
+                <a href="{{unsubscribe_url}}" style="color: #666;">Unsubscribe</a> | 
+                <a href="{{preferences_url}}" style="color: #666;">Update Preferences</a>
+              </p>
+            </div>
+          </body>
+          </html>
+        TextPart: |
+          Welcome {{name}}!
+          
+          Thank you for joining our community. We are excited to have you aboard!
+          
+          As a welcome gift, use code WELCOME10 for 10% off your first purchase.
+          
+          Start shopping: {{shop_url}}
+          
+          Best regards,
+          The Marketing Team
+          
+          ---
+          Unsubscribe: {{unsubscribe_url}}
+          Update Preferences: {{preferences_url}}
+
+  ProductPromotionTemplate:
+    Type: AWS::SES::Template
+    Properties:
+      Template:
+        TemplateName: !Sub '${ProjectName}-${Environment}-product-promotion'
+        SubjectPart: 'Exclusive Offer: {{discount}}% Off {{product_name}}'
+        HtmlPart: |
+          <html>
+          <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+            <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+              <h2 style="color: #2c3e50;">Special Offer for {{name}}!</h2>
+              <div style="background-color: #f8f9fa; padding: 20px; border-radius: 5px; margin: 20px 0;">
+                <h3 style="color: #e74c3c; margin-top: 0;">{{discount}}% OFF</h3>
+                <p style="font-size: 18px; margin-bottom: 0;">{{product_name}}</p>
+              </div>
+              <p>Limited time offer - expires <strong>{{expiry_date}}</strong></p>
+              <div style="margin: 30px 0;">
+                <a href="{{product_url}}" style="background-color: #e74c3c; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; display: inline-block; font-size: 16px;">Shop Now</a>
+              </div>
+              <p>Best regards,<br/>The Marketing Team</p>
+              <hr style="border: 1px solid #eee; margin: 20px 0;">
+              <p style="font-size: 12px; color: #666;">
+                <a href="{{unsubscribe_url}}" style="color: #666;">Unsubscribe</a> | 
+                <a href="{{preferences_url}}" style="color: #666;">Update Preferences</a>
+              </p>
+            </div>
+          </body>
+          </html>
+        TextPart: |
+          Special Offer for {{name}}!
+          
+          Get {{discount}}% off our popular {{product_name}}!
+          
+          Limited time offer - expires {{expiry_date}}
+          
+          Shop now: {{product_url}}
+          
+          Best regards,
+          The Marketing Team
+          
+          ---
+          Unsubscribe: {{unsubscribe_url}}
+          Update Preferences: {{preferences_url}}
+
+  # IAM Role for Lambda bounce handler
+  BounceHandlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-bounce-handler-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BounceHandlerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ses:PutSuppressedDestination
+                  - ses:DeleteSuppressedDestination
+                  - ses:GetSuppressedDestination
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${EmailMarketingBucket}/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda function for bounce and complaint handling
+  BounceHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-bounce-handler'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt BounceHandlerRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref EmailMarketingBucket
+          CONFIGURATION_SET: !Ref EmailConfigurationSet
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          from datetime import datetime
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              ses_client = boto3.client('sesv2')
+              s3_client = boto3.client('s3')
+              
+              try:
+                  # Process each SNS message
+                  for record in event['Records']:
+                      message = json.loads(record['Sns']['Message'])
+                      
+                      # Handle bounce events
+                      if message.get('eventType') == 'bounce':
+                          handle_bounce(ses_client, s3_client, message)
+                      
+                      # Handle complaint events
+                      elif message.get('eventType') == 'complaint':
+                          handle_complaint(ses_client, s3_client, message)
+                      
+                      # Log other events for monitoring
+                      else:
+                          logger.info(f"Received event: {message.get('eventType')}")
+                  
+                  return {'statusCode': 200, 'body': json.dumps('Successfully processed events')}
+                  
+              except Exception as e:
+                  logger.error(f"Error processing events: {str(e)}")
+                  raise
+
+          def handle_bounce(ses_client, s3_client, message):
+              """Handle bounce events by adding email to suppression list"""
+              try:
+                  bounce_type = message.get('bounce', {}).get('bounceType', '')
+                  
+                  # Only suppress permanent bounces
+                  if bounce_type == 'Permanent':
+                      bounced_recipients = message.get('bounce', {}).get('bouncedRecipients', [])
+                      
+                      for recipient in bounced_recipients:
+                          email = recipient.get('emailAddress')
+                          if email:
+                              # Add to SES suppression list
+                              ses_client.put_suppressed_destination(
+                                  EmailAddress=email,
+                                  Reason='BOUNCE'
+                              )
+                              logger.info(f"Added {email} to suppression list for bounce")
+                              
+                              # Log to S3 for audit trail
+                              log_suppression(s3_client, email, 'BOUNCE', message)
+                              
+              except Exception as e:
+                  logger.error(f"Error handling bounce: {str(e)}")
+
+          def handle_complaint(ses_client, s3_client, message):
+              """Handle complaint events by adding email to suppression list"""
+              try:
+                  complained_recipients = message.get('complaint', {}).get('complainedRecipients', [])
+                  
+                  for recipient in complained_recipients:
+                      email = recipient.get('emailAddress')
+                      if email:
+                          # Add to SES suppression list
+                          ses_client.put_suppressed_destination(
+                              EmailAddress=email,
+                              Reason='COMPLAINT'
+                          )
+                          logger.info(f"Added {email} to suppression list for complaint")
+                          
+                          # Log to S3 for audit trail
+                          log_suppression(s3_client, email, 'COMPLAINT', message)
+                          
+              except Exception as e:
+                  logger.error(f"Error handling complaint: {str(e)}")
+
+          def log_suppression(s3_client, email, reason, message):
+              """Log suppression event to S3 for audit trail"""
+              try:
+                  bucket_name = os.environ['BUCKET_NAME']
+                  timestamp = datetime.utcnow().isoformat()
+                  
+                  log_entry = {
+                      'timestamp': timestamp,
+                      'email': email,
+                      'reason': reason,
+                      'message_id': message.get('mail', {}).get('messageId'),
+                      'source': message.get('mail', {}).get('source')
+                  }
+                  
+                  key = f"suppression-logs/{timestamp[:10]}/{email}-{reason}.json"
+                  
+                  s3_client.put_object(
+                      Bucket=bucket_name,
+                      Key=key,
+                      Body=json.dumps(log_entry),
+                      ContentType='application/json'
+                  )
+                  
+              except Exception as e:
+                  logger.error(f"Error logging suppression: {str(e)}")
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Permission for SNS to invoke Lambda
+  BounceHandlerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BounceHandlerFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref EmailEventsTopic
+
+  # SNS subscription for Lambda bounce handler
+  BounceHandlerSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref EmailEventsTopic
+      Endpoint: !GetAtt BounceHandlerFunction.Arn
+
+  # IAM Role for subscriber list processor
+  SubscriberListProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-subscriber-processor-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SubscriberProcessorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${EmailMarketingBucket}/*'
+              - Effect: Allow
+                Action:
+                  - ses:SendBulkEmail
+                  - ses:SendEmail
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda function for processing subscriber lists
+  SubscriberListProcessor:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-subscriber-processor'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt SubscriberListProcessorRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref EmailMarketingBucket
+          CONFIGURATION_SET: !Ref EmailConfigurationSet
+          SENDER_EMAIL: !Ref SenderEmail
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          from urllib.parse import unquote_plus
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              s3_client = boto3.client('s3')
+              ses_client = boto3.client('sesv2')
+              
+              try:
+                  # Process S3 event
+                  for record in event['Records']:
+                      bucket = record['s3']['bucket']['name']
+                      key = unquote_plus(record['s3']['object']['key'])
+                      
+                      logger.info(f"Processing subscriber list: {key}")
+                      
+                      # Get the subscriber list from S3
+                      response = s3_client.get_object(Bucket=bucket, Key=key)
+                      subscribers = json.loads(response['Body'].read())
+                      
+                      # Validate and process subscriber list
+                      validated_subscribers = validate_subscribers(subscribers)
+                      
+                      # Update processed list back to S3
+                      processed_key = key.replace('subscribers/', 'processed/')
+                      s3_client.put_object(
+                          Bucket=bucket,
+                          Key=processed_key,
+                          Body=json.dumps(validated_subscribers, indent=2),
+                          ContentType='application/json'
+                      )
+                      
+                      logger.info(f"Processed {len(validated_subscribers)} subscribers")
+                  
+                  return {'statusCode': 200, 'body': json.dumps('Successfully processed subscriber list')}
+                  
+              except Exception as e:
+                  logger.error(f"Error processing subscriber list: {str(e)}")
+                  raise
+
+          def validate_subscribers(subscribers):
+              """Validate subscriber data and format for campaigns"""
+              validated = []
+              
+              for subscriber in subscribers:
+                  if validate_email(subscriber.get('email', '')):
+                      validated.append({
+                          'email': subscriber['email'],
+                          'name': subscriber.get('name', 'Valued Customer'),
+                          'segment': subscriber.get('segment', 'general'),
+                          'preferences': subscriber.get('preferences', []),
+                          'status': 'active'
+                      })
+              
+              return validated
+
+          def validate_email(email):
+              """Basic email validation"""
+              import re
+              pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+              return re.match(pattern, email) is not None
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Permission for S3 to invoke Lambda
+  SubscriberListProcessorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SubscriberListProcessor
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt EmailMarketingBucket.Arn
+
+  # CloudWatch Dashboard for email marketing metrics
+  EmailMarketingDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}-email-marketing'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/SES", "Send", "ConfigurationSet", "${EmailConfigurationSet}" ],
+                  [ ".", "Bounce", ".", "." ],
+                  [ ".", "Complaint", ".", "." ],
+                  [ ".", "Delivery", ".", "." ],
+                  [ ".", "Open", ".", "." ],
+                  [ ".", "Click", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Email Campaign Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/SES", "Bounce", "ConfigurationSet", "${EmailConfigurationSet}" ],
+                  [ ".", "Complaint", ".", "." ]
+                ],
+                "period": 3600,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Bounce and Complaint Rates",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${BounceHandlerFunction}'\n| fields @timestamp, @message\n| filter @message like /Added.*to suppression list/\n| sort @timestamp desc\n| limit 50",
+                "region": "${AWS::Region}",
+                "title": "Recent Suppression Events"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms
+  HighBounceRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-high-bounce-rate'
+      AlarmDescription: 'Alert when bounce rate exceeds threshold'
+      MetricName: Bounce
+      Namespace: AWS/SES
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: !Ref BounceRateThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref EmailEventsTopic
+      Dimensions:
+        - Name: ConfigurationSet
+          Value: !Ref EmailConfigurationSet
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  HighComplaintRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-high-complaint-rate'
+      AlarmDescription: 'Alert when complaint rate exceeds threshold'
+      MetricName: Complaint
+      Namespace: AWS/SES
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: !Ref ComplaintRateThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref EmailEventsTopic
+      Dimensions:
+        - Name: ConfigurationSet
+          Value: !Ref EmailConfigurationSet
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # EventBridge rule for automated campaigns (production only)
+  WeeklyEmailCampaignRule:
+    Type: AWS::Events::Rule
+    Condition: IsProduction
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-weekly-campaign'
+      Description: 'Trigger weekly email campaigns'
+      ScheduleExpression: 'rate(7 days)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CampaignSchedulerFunction.Arn
+          Id: 'CampaignSchedulerTarget'
+
+  # IAM Role for campaign scheduler
+  CampaignSchedulerRole:
+    Type: AWS::IAM::Role
+    Condition: IsProduction
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-campaign-scheduler-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CampaignSchedulerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ses:SendBulkEmail
+                  - ses:SendEmail
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: 
+                  - !Sub '${EmailMarketingBucket}/*'
+                  - !GetAtt EmailMarketingBucket.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda function for campaign scheduling
+  CampaignSchedulerFunction:
+    Type: AWS::Lambda::Function
+    Condition: IsProduction
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-campaign-scheduler'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt CampaignSchedulerRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref EmailMarketingBucket
+          CONFIGURATION_SET: !Ref EmailConfigurationSet
+          SENDER_EMAIL: !Ref SenderEmail
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          from datetime import datetime, timedelta
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              """Scheduled campaign handler"""
+              s3_client = boto3.client('s3')
+              ses_client = boto3.client('sesv2')
+              
+              try:
+                  # Get active subscriber list
+                  bucket_name = os.environ['BUCKET_NAME']
+                  response = s3_client.get_object(
+                      Bucket=bucket_name,
+                      Key='processed/subscribers.json'
+                  )
+                  subscribers = json.loads(response['Body'].read())
+                  
+                  # Filter active subscribers
+                  active_subscribers = [s for s in subscribers if s.get('status') == 'active']
+                  
+                  logger.info(f"Found {len(active_subscribers)} active subscribers")
+                  
+                  # Trigger campaign based on segment
+                  for segment in ['new_customers', 'loyal_customers']:
+                      segment_subscribers = [s for s in active_subscribers if s.get('segment') == segment]
+                      
+                      if segment_subscribers:
+                          send_segment_campaign(ses_client, segment_subscribers, segment)
+                  
+                  return {'statusCode': 200, 'body': json.dumps('Campaign scheduled successfully')}
+                  
+              except Exception as e:
+                  logger.error(f"Error scheduling campaign: {str(e)}")
+                  raise
+
+          def send_segment_campaign(ses_client, subscribers, segment):
+              """Send targeted campaign to segment"""
+              # This would contain the actual campaign logic
+              logger.info(f"Sending campaign to {len(subscribers)} subscribers in {segment} segment")
+              
+              # Implementation would depend on specific campaign requirements
+              pass
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Permission for EventBridge to invoke Lambda
+  CampaignSchedulerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: IsProduction
+    Properties:
+      FunctionName: !Ref CampaignSchedulerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WeeklyEmailCampaignRule.Arn
+
+Outputs:
+  # S3 Bucket Information
+  EmailMarketingBucketName:
+    Description: 'Name of the S3 bucket for email marketing assets'
+    Value: !Ref EmailMarketingBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-EmailMarketingBucket'
+
+  EmailMarketingBucketArn:
+    Description: 'ARN of the S3 bucket for email marketing assets'
+    Value: !GetAtt EmailMarketingBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EmailMarketingBucketArn'
+
+  # SNS Topic Information
+  EmailEventsTopicArn:
+    Description: 'ARN of the SNS topic for email events'
+    Value: !Ref EmailEventsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-EmailEventsTopic'
+
+  # SES Configuration Set
+  EmailConfigurationSetName:
+    Description: 'Name of the SES configuration set'
+    Value: !Ref EmailConfigurationSet
+    Export:
+      Name: !Sub '${AWS::StackName}-EmailConfigurationSet'
+
+  # Email Templates
+  WelcomeCampaignTemplateName:
+    Description: 'Name of the welcome campaign email template'
+    Value: !Ref WelcomeCampaignTemplate
+    Export:
+      Name: !Sub '${AWS::StackName}-WelcomeCampaignTemplate'
+
+  ProductPromotionTemplateName:
+    Description: 'Name of the product promotion email template'
+    Value: !Ref ProductPromotionTemplate
+    Export:
+      Name: !Sub '${AWS::StackName}-ProductPromotionTemplate'
+
+  # Lambda Functions
+  BounceHandlerFunctionArn:
+    Description: 'ARN of the bounce handler Lambda function'
+    Value: !GetAtt BounceHandlerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BounceHandlerFunction'
+
+  SubscriberListProcessorArn:
+    Description: 'ARN of the subscriber list processor Lambda function'
+    Value: !GetAtt SubscriberListProcessor.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SubscriberListProcessor'
+
+  # CloudWatch Dashboard
+  EmailMarketingDashboardURL:
+    Description: 'URL to the CloudWatch dashboard for email marketing metrics'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-email-marketing'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  # Campaign Scheduler (Production only)
+  CampaignSchedulerFunctionArn:
+    Condition: IsProduction
+    Description: 'ARN of the campaign scheduler Lambda function'
+    Value: !GetAtt CampaignSchedulerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CampaignSchedulerFunction'
+
+  # Getting Started Commands
+  SampleSubscriberListCommand:
+    Description: 'Command to upload sample subscriber list to S3'
+    Value: !Sub |
+      aws s3 cp sample-subscribers.json s3://${EmailMarketingBucket}/subscribers/subscribers.json
+
+  SendTestEmailCommand:
+    Description: 'Command to send test email using template'
+    Value: !Sub |
+      aws sesv2 send-email --from-email-address ${SenderEmail} --destination ToAddresses=${NotificationEmail} --template-name ${WelcomeCampaignTemplate} --template-data '{"name":"Test User","shop_url":"https://example.com","unsubscribe_url":"https://example.com/unsubscribe","preferences_url":"https://example.com/preferences"}' --configuration-set-name ${EmailConfigurationSet}
+
+  ViewMetricsCommand:
+    Description: 'Command to view email metrics'
+    Value: !Sub |
+      aws logs filter-log-events --log-group-name /aws/ses/sending-stats --start-time $(date -d '1 hour ago' +%s)000

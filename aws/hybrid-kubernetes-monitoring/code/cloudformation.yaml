@@ -1,0 +1,835 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Hybrid Kubernetes Monitoring with Amazon EKS Hybrid Nodes and CloudWatch - Infrastructure as Code for comprehensive observability across cloud and on-premises environments'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "EKS Cluster Configuration"
+        Parameters:
+          - ClusterName
+          - KubernetesVersion
+          - RemoteNodeCIDR
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcCidr
+          - PublicSubnet1Cidr
+          - PublicSubnet2Cidr
+          - PrivateSubnet1Cidr
+          - PrivateSubnet2Cidr
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - CloudWatchNamespace
+          - EnableContainerInsights
+          - MetricsRetentionInDays
+      - Label:
+          default: "Resource Tags"
+        Parameters:
+          - Environment
+          - Project
+    ParameterLabels:
+      ClusterName:
+        default: "EKS Cluster Name"
+      KubernetesVersion:
+        default: "Kubernetes Version"
+      RemoteNodeCIDR:
+        default: "On-Premises CIDR Block"
+      VpcCidr:
+        default: "VPC CIDR Block"
+      CloudWatchNamespace:
+        default: "CloudWatch Custom Metrics Namespace"
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: hybrid-monitoring-cluster
+    Description: Name for the EKS cluster with hybrid node support
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$'
+    ConstraintDescription: Must start with a letter, contain only alphanumeric characters and hyphens, and end with an alphanumeric character
+    MinLength: 3
+    MaxLength: 100
+
+  KubernetesVersion:
+    Type: String
+    Default: '1.31'
+    Description: Kubernetes version for the EKS cluster
+    AllowedValues:
+      - '1.29'
+      - '1.30'
+      - '1.31'
+
+  RemoteNodeCIDR:
+    Type: String
+    Default: 10.100.0.0/16
+    Description: CIDR block for on-premises infrastructure that will join as hybrid nodes
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    ConstraintDescription: Must be a valid CIDR block
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    ConstraintDescription: Must be a valid CIDR block
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR block for the first public subnet
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    ConstraintDescription: Must be a valid CIDR block
+
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR block for the second public subnet
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    ConstraintDescription: Must be a valid CIDR block
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.0.3.0/24
+    Description: CIDR block for the first private subnet (for Fargate)
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    ConstraintDescription: Must be a valid CIDR block
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.0.4.0/24
+    Description: CIDR block for the second private subnet (for Fargate)
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    ConstraintDescription: Must be a valid CIDR block
+
+  CloudWatchNamespace:
+    Type: String
+    Default: EKS/HybridMonitoring
+    Description: CloudWatch namespace for custom metrics
+    AllowedPattern: '^[a-zA-Z0-9._/\-]+$'
+    ConstraintDescription: Must contain only alphanumeric characters, periods, underscores, forward slashes, and hyphens
+    MinLength: 1
+    MaxLength: 255
+
+  EnableContainerInsights:
+    Type: String
+    Default: 'true'
+    Description: Enable CloudWatch Container Insights for detailed monitoring
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  MetricsRetentionInDays:
+    Type: Number
+    Default: 14
+    Description: Number of days to retain CloudWatch metrics and logs
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+  Environment:
+    Type: String
+    Default: Production
+    Description: Environment tag for all resources
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$'
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+
+  Project:
+    Type: String
+    Default: HybridMonitoring
+    Description: Project tag for all resources
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$'
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+
+Conditions:
+  EnableInsights: !Equals [!Ref EnableContainerInsights, 'true']
+
+Resources:
+  # VPC and Networking Resources
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Purpose
+          Value: EKS Hybrid Monitoring
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-igw'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # Public Subnets
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet1Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet2Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+
+  # Private Subnets for Fargate
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+
+  # NAT Gateway for Private Subnets
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat-eip-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat-gateway-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # Route Tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-routes'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::RouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::RouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-routes-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::RouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::RouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet2
+
+  # IAM Roles for EKS
+  EKSClusterServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-cluster-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  EKSFargateExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-fargate-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks-fargate-pods.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSFargatePodExecutionRolePolicy
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # CloudWatch Observability Role
+  CloudWatchObservabilityRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-cloudwatch-observability-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/${EKSCluster.OpenIdConnectIssuerUrl}'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                !Sub '${EKSCluster.OpenIdConnectIssuerUrl}:sub': 'system:serviceaccount:amazon-cloudwatch:cloudwatch-agent'
+                !Sub '${EKSCluster.OpenIdConnectIssuerUrl}:aud': 'sts.amazonaws.com'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # Custom Metrics Collection Role
+  HybridMetricsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-hybrid-metrics-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/${EKSCluster.OpenIdConnectIssuerUrl}'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                !Sub '${EKSCluster.OpenIdConnectIssuerUrl}:sub': 'system:serviceaccount:cloud-apps:hybrid-metrics-sa'
+                !Sub '${EKSCluster.OpenIdConnectIssuerUrl}:aud': 'sts.amazonaws.com'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # EKS Cluster with Hybrid Node Support
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt EKSClusterServiceRole.Arn
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !Ref PublicSubnet1
+          - !Ref PublicSubnet2
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+        SecurityGroupIds:
+          - !Ref EKSClusterSecurityGroup
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP
+      RemoteNetworkConfig:
+        RemoteNodeNetworks:
+          - Cidrs:
+              - !Ref RemoteNodeCIDR
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+            - Type: controllerManager
+            - Type: scheduler
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Purpose
+          Value: Hybrid Kubernetes Monitoring
+
+  # EKS Cluster Security Group
+  EKSClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EKS cluster control plane
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: HTTPS access from VPC
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref RemoteNodeCIDR
+          Description: HTTPS access from on-premises hybrid nodes
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-cluster-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # Fargate Profile for Cloud Workloads
+  FargateProfile:
+    Type: AWS::EKS::FargateProfile
+    Properties:
+      ClusterName: !Ref EKSCluster
+      FargateProfileName: cloud-workloads
+      PodExecutionRoleArn: !GetAtt EKSFargateExecutionRole.Arn
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Selectors:
+        - Namespace: cloud-apps
+        - Namespace: kube-system
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+        - Key: Component
+          Value: CloudWorkloads
+
+  # CloudWatch Log Groups
+  EKSClusterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/eks/${ClusterName}/cluster'
+      RetentionInDays: !Ref MetricsRetentionInDays
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  ContainerInsightsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableInsights
+    Properties:
+      LogGroupName: !Sub '/aws/containerinsights/${ClusterName}/application'
+      RetentionInDays: !Ref MetricsRetentionInDays
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # CloudWatch Dashboard
+  HybridMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'EKS-Hybrid-Monitoring-${ClusterName}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/EKS", "cluster_node_count", "ClusterName", "${ClusterName}" ],
+                  [ "${CloudWatchNamespace}", "HybridNodeCount" ],
+                  [ ".", "FargatePodCount" ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Hybrid Cluster Capacity",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ContainerInsights", "pod_cpu_utilization", "ClusterName", "${ClusterName}" ],
+                  [ ".", "pod_memory_utilization", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Pod Resource Utilization",
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 100
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ContainerInsights", "cluster_node_count", "ClusterName", "${ClusterName}" ],
+                  [ ".", "cluster_failed_node_count", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Cluster Node Health",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "${CloudWatchNamespace}", "TotalPodCount" ],
+                  [ "AWS/ContainerInsights", "running_pod_count", "ClusterName", "${ClusterName}" ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Pod Distribution",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE \"/aws/containerinsights/${ClusterName}/application\"\n| fields @timestamp, kubernetes.pod_name, log\n| filter kubernetes.namespace_name = \"cloud-apps\"\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Application Logs from Cloud Apps",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'EKS-Hybrid-HighCPU-${ClusterName}'
+      AlarmDescription: High CPU utilization in hybrid cluster
+      MetricName: pod_cpu_utilization
+      Namespace: AWS/ContainerInsights
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ClusterName
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SNSMonitoringTopic
+
+  HighMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'EKS-Hybrid-HighMemory-${ClusterName}'
+      AlarmDescription: High memory utilization in hybrid cluster
+      MetricName: pod_memory_utilization
+      Namespace: AWS/ContainerInsights
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ClusterName
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SNSMonitoringTopic
+
+  LowHybridNodeCountAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'EKS-Hybrid-LowNodeCount-${ClusterName}'
+      AlarmDescription: Low hybrid node count detected
+      MetricName: HybridNodeCount
+      Namespace: !Ref CloudWatchNamespace
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref SNSMonitoringTopic
+
+  # SNS Topic for Monitoring Alerts
+  SNSMonitoringTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ClusterName}-monitoring-alerts'
+      DisplayName: !Sub 'EKS Hybrid Monitoring Alerts for ${ClusterName}'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+  # OIDC Identity Provider for IRSA
+  OIDCIdentityProvider:
+    Type: AWS::IAM::OIDCIdentityProvider
+    Properties:
+      Url: !GetAtt EKSCluster.OpenIdConnectIssuerUrl
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 9e99a48a9960b14926bb7f3b02e22da2b0ab7280  # EKS OIDC root CA thumbprint
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref Project
+
+Outputs:
+  ClusterName:
+    Description: Name of the EKS cluster
+    Value: !Ref EKSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterName'
+
+  ClusterEndpoint:
+    Description: EKS cluster endpoint
+    Value: !GetAtt EKSCluster.Endpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterEndpoint'
+
+  ClusterArn:
+    Description: EKS cluster ARN
+    Value: !GetAtt EKSCluster.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterArn'
+
+  OIDCIssuerURL:
+    Description: OIDC issuer URL for the EKS cluster
+    Value: !GetAtt EKSCluster.OpenIdConnectIssuerUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-OIDCIssuerURL'
+
+  VpcId:
+    Description: VPC ID for the EKS cluster
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+
+  PublicSubnets:
+    Description: Public subnet IDs
+    Value: !Join [',', [!Ref PublicSubnet1, !Ref PublicSubnet2]]
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnets'
+
+  PrivateSubnets:
+    Description: Private subnet IDs for Fargate
+    Value: !Join [',', [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnets'
+
+  FargateProfileName:
+    Description: Name of the Fargate profile
+    Value: !Ref FargateProfile
+    Export:
+      Name: !Sub '${AWS::StackName}-FargateProfileName'
+
+  CloudWatchDashboardURL:
+    Description: URL to the CloudWatch dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=EKS-Hybrid-Monitoring-${ClusterName}'
+
+  CloudWatchNamespace:
+    Description: CloudWatch namespace for custom metrics
+    Value: !Ref CloudWatchNamespace
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchNamespace'
+
+  SNSTopicArn:
+    Description: ARN of the SNS topic for monitoring alerts
+    Value: !Ref SNSMonitoringTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  ClusterSecurityGroupId:
+    Description: Security group ID for the EKS cluster
+    Value: !Ref EKSClusterSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterSecurityGroupId'
+
+  CloudWatchObservabilityRoleArn:
+    Description: ARN of the CloudWatch Observability role
+    Value: !GetAtt CloudWatchObservabilityRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchObservabilityRoleArn'
+
+  HybridMetricsRoleArn:
+    Description: ARN of the hybrid metrics collection role
+    Value: !GetAtt HybridMetricsRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-HybridMetricsRoleArn'
+
+  KubectlCommand:
+    Description: Command to configure kubectl for the cluster
+    Value: !Sub 'aws eks update-kubeconfig --region ${AWS::Region} --name ${ClusterName}'
+
+  PostDeploymentCommands:
+    Description: Commands to run after stack deployment
+    Value: !Sub |
+      # Update kubeconfig
+      aws eks update-kubeconfig --region ${AWS::Region} --name ${ClusterName}
+      
+      # Install CloudWatch Observability add-on
+      aws eks create-addon --cluster-name ${ClusterName} --addon-name amazon-cloudwatch-observability --addon-version v2.1.0-eksbuild.1 --service-account-role-arn ${CloudWatchObservabilityRole.Arn} --configuration-values '{"containerInsights":{"enabled":true}}'
+      
+      # Create cloud-apps namespace
+      kubectl create namespace cloud-apps --dry-run=client -o yaml | kubectl apply -f -
+      kubectl label namespace cloud-apps monitoring=enabled --overwrite
+      
+      # Create service account for custom metrics
+      kubectl create serviceaccount hybrid-metrics-sa -n cloud-apps --dry-run=client -o yaml | kubectl apply -f -
+      kubectl annotate serviceaccount hybrid-metrics-sa -n cloud-apps eks.amazonaws.com/role-arn=${HybridMetricsRole.Arn} --overwrite

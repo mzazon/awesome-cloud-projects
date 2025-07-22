@@ -1,0 +1,758 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS DataSync Data Transfer Automation - Complete infrastructure for automated data transfer between S3 buckets with monitoring and scheduling'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "DataSync Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+          - SourceBucketName
+          - DestinationBucketName
+          - CreateSampleBuckets
+      - Label:
+          default: "Transfer Options"
+        Parameters:
+          - VerifyMode
+          - OverwriteMode
+          - TransferMode
+          - BytesPerSecond
+      - Label:
+          default: "Scheduling"
+        Parameters:
+          - EnableScheduling
+          - ScheduleExpression
+      - Label:
+          default: "Monitoring"
+        Parameters:
+          - EnableCloudWatchDashboard
+          - LogLevel
+          - ReportLevel
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      SourceBucketName:
+        default: "Source S3 Bucket Name"
+      DestinationBucketName:
+        default: "Destination S3 Bucket Name"
+      CreateSampleBuckets:
+        default: "Create Sample S3 Buckets"
+      VerifyMode:
+        default: "Verification Mode"
+      OverwriteMode:
+        default: "Overwrite Mode"
+      TransferMode:
+        default: "Transfer Mode"
+      BytesPerSecond:
+        default: "Bandwidth Limit (Bytes/Second)"
+      EnableScheduling:
+        default: "Enable Scheduled Execution"
+      ScheduleExpression:
+        default: "Schedule Expression"
+      EnableCloudWatchDashboard:
+        default: "Enable CloudWatch Dashboard"
+      LogLevel:
+        default: "Log Level"
+      ReportLevel:
+        default: "Report Level"
+
+# Input Parameters
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'datasync-automation'
+    Description: 'Name of the project for resource naming and tagging'
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must start with a letter, contain only lowercase letters, numbers, and hyphens'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - 'dev'
+      - 'staging'
+      - 'prod'
+    Description: 'Environment for deployment'
+
+  SourceBucketName:
+    Type: String
+    Default: ''
+    Description: 'Name of the source S3 bucket (leave empty to create new bucket)'
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be a valid S3 bucket name or empty'
+
+  DestinationBucketName:
+    Type: String
+    Default: ''
+    Description: 'Name of the destination S3 bucket (leave empty to create new bucket)'
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be a valid S3 bucket name or empty'
+
+  CreateSampleBuckets:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Whether to create sample S3 buckets if bucket names are not provided'
+
+  VerifyMode:
+    Type: String
+    Default: 'POINT_IN_TIME_CONSISTENT'
+    AllowedValues:
+      - 'POINT_IN_TIME_CONSISTENT'
+      - 'ONLY_FILES_TRANSFERRED'
+      - 'NONE'
+    Description: 'Data verification mode for DataSync task'
+
+  OverwriteMode:
+    Type: String
+    Default: 'ALWAYS'
+    AllowedValues:
+      - 'ALWAYS'
+      - 'NEVER'
+    Description: 'Overwrite mode for existing files'
+
+  TransferMode:
+    Type: String
+    Default: 'CHANGED'
+    AllowedValues:
+      - 'CHANGED'
+      - 'ALL'
+    Description: 'Transfer mode - CHANGED transfers only modified files'
+
+  BytesPerSecond:
+    Type: Number
+    Default: -1
+    MinValue: -1
+    MaxValue: 1073741824
+    Description: 'Bandwidth limit in bytes per second (-1 for unlimited)'
+
+  EnableScheduling:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable scheduled execution of DataSync task'
+
+  ScheduleExpression:
+    Type: String
+    Default: 'rate(1 day)'
+    Description: 'EventBridge schedule expression for automated execution'
+    AllowedPattern: '^(rate|cron)\(.+\)$'
+    ConstraintDescription: 'Must be a valid EventBridge schedule expression'
+
+  EnableCloudWatchDashboard:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable CloudWatch dashboard for monitoring'
+
+  LogLevel:
+    Type: String
+    Default: 'TRANSFER'
+    AllowedValues:
+      - 'OFF'
+      - 'BASIC'
+      - 'TRANSFER'
+    Description: 'CloudWatch log level for DataSync task'
+
+  ReportLevel:
+    Type: String
+    Default: 'ERRORS_ONLY'
+    AllowedValues:
+      - 'ERRORS_ONLY'
+      - 'SUCCESSES_AND_ERRORS'
+    Description: 'Task report level for transferred files'
+
+# Conditions
+Conditions:
+  CreateSourceBucket: !And
+    - !Equals [!Ref SourceBucketName, '']
+    - !Equals [!Ref CreateSampleBuckets, 'true']
+  
+  CreateDestinationBucket: !And
+    - !Equals [!Ref DestinationBucketName, '']
+    - !Equals [!Ref CreateSampleBuckets, 'true']
+  
+  UseProvidedSourceBucket: !Not [!Equals [!Ref SourceBucketName, '']]
+  UseProvidedDestinationBucket: !Not [!Equals [!Ref DestinationBucketName, '']]
+  
+  EnableSchedulingCondition: !Equals [!Ref EnableScheduling, 'true']
+  EnableDashboardCondition: !Equals [!Ref EnableCloudWatchDashboard, 'true']
+  EnableLoggingCondition: !Not [!Equals [!Ref LogLevel, 'OFF']]
+
+# Resources
+Resources:
+  # ============================================================================
+  # S3 Buckets (Optional - created if bucket names not provided)
+  # ============================================================================
+  
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateSourceBucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-source-${Environment}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-source-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'DataSync Source Bucket'
+
+  DestinationBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateDestinationBucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-destination-${Environment}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionOldVersionsToIA
+            Status: Enabled
+            NoncurrentVersionTransitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-destination-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'DataSync Destination Bucket'
+
+  # ============================================================================
+  # IAM Roles and Policies
+  # ============================================================================
+  
+  # DataSync Service Role
+  DataSyncServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-datasync-service-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: datasync.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSDataSyncServiceRolePolicy
+      Policies:
+        - PolicyName: DataSyncS3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                Resource:
+                  - !Sub 
+                    - 'arn:aws:s3:::${BucketName}'
+                    - BucketName: !If 
+                        - CreateSourceBucket
+                        - !Ref SourceBucket
+                        - !Ref SourceBucketName
+                  - !Sub 
+                    - 'arn:aws:s3:::${BucketName}'
+                    - BucketName: !If 
+                        - CreateDestinationBucket
+                        - !Ref DestinationBucket
+                        - !Ref DestinationBucketName
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectTagging
+                  - s3:GetObjectVersion
+                  - s3:GetObjectVersionTagging
+                  - s3:PutObject
+                  - s3:PutObjectTagging
+                  - s3:DeleteObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                Resource:
+                  - !Sub 
+                    - 'arn:aws:s3:::${BucketName}/*'
+                    - BucketName: !If 
+                        - CreateSourceBucket
+                        - !Ref SourceBucket
+                        - !Ref SourceBucketName
+                  - !Sub 
+                    - 'arn:aws:s3:::${BucketName}/*'
+                    - BucketName: !If 
+                        - CreateDestinationBucket
+                        - !Ref DestinationBucket
+                        - !Ref DestinationBucketName
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/datasync/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-datasync-service-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # EventBridge Role for DataSync Task Execution
+  EventBridgeDataSyncRole:
+    Type: AWS::IAM::Role
+    Condition: EnableSchedulingCondition
+    Properties:
+      RoleName: !Sub '${ProjectName}-eventbridge-datasync-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DataSyncExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - datasync:StartTaskExecution
+                Resource: !Ref DataSyncTask
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-eventbridge-datasync-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # CloudWatch Resources
+  # ============================================================================
+  
+  # CloudWatch Log Group for DataSync
+  DataSyncLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLoggingCondition
+    Properties:
+      LogGroupName: !Sub '/aws/datasync/${ProjectName}-${Environment}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-datasync-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Dashboard for DataSync Monitoring
+  DataSyncDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableDashboardCondition
+    Properties:
+      DashboardName: !Sub '${ProjectName}-datasync-monitoring-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/DataSync", "BytesTransferred", "TaskArn", "${DataSyncTask}"],
+                  ["AWS/DataSync", "FilesTransferred", "TaskArn", "${DataSyncTask}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "DataSync Transfer Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/DataSync", "TaskExecutionStatus", "TaskArn", "${DataSyncTask}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Task Execution Status",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/datasync/${ProjectName}-${Environment}' | fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "DataSync Error Logs",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarm for Failed Task Executions
+  DataSyncFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-datasync-failure-alarm-${Environment}'
+      AlarmDescription: 'Alarm when DataSync task execution fails'
+      MetricName: TaskExecutionStatus
+      Namespace: AWS/DataSync
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TaskArn
+          Value: !Ref DataSyncTask
+      AlarmActions:
+        - !Ref DataSyncFailureTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-datasync-failure-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SNS Topic for DataSync Notifications
+  DataSyncFailureTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-datasync-notifications-${Environment}'
+      DisplayName: 'DataSync Task Failure Notifications'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-datasync-notifications'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # DataSync Resources
+  # ============================================================================
+  
+  # DataSync Source Location (S3)
+  DataSyncSourceLocation:
+    Type: AWS::DataSync::LocationS3
+    Properties:
+      S3BucketArn: !Sub 
+        - 'arn:aws:s3:::${BucketName}'
+        - BucketName: !If 
+            - CreateSourceBucket
+            - !Ref SourceBucket
+            - !Ref SourceBucketName
+      S3Config:
+        BucketAccessRoleArn: !GetAtt DataSyncServiceRole.Arn
+      S3StorageClass: STANDARD
+      Subdirectory: '/'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-source-location'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'DataSync Source Location'
+
+  # DataSync Destination Location (S3)
+  DataSyncDestinationLocation:
+    Type: AWS::DataSync::LocationS3
+    Properties:
+      S3BucketArn: !Sub 
+        - 'arn:aws:s3:::${BucketName}'
+        - BucketName: !If 
+            - CreateDestinationBucket
+            - !Ref DestinationBucket
+            - !Ref DestinationBucketName
+      S3Config:
+        BucketAccessRoleArn: !GetAtt DataSyncServiceRole.Arn
+      S3StorageClass: STANDARD
+      Subdirectory: '/'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-destination-location'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'DataSync Destination Location'
+
+  # DataSync Task
+  DataSyncTask:
+    Type: AWS::DataSync::Task
+    Properties:
+      Name: !Sub '${ProjectName}-datasync-task-${Environment}'
+      SourceLocationArn: !Ref DataSyncSourceLocation
+      DestinationLocationArn: !Ref DataSyncDestinationLocation
+      CloudWatchLogGroupArn: !If 
+        - EnableLoggingCondition
+        - !GetAtt DataSyncLogGroup.Arn
+        - !Ref 'AWS::NoValue'
+      Options:
+        VerifyMode: !Ref VerifyMode
+        OverwriteMode: !Ref OverwriteMode
+        PreserveDeletedFiles: PRESERVE
+        PreserveDevices: NONE
+        PosixPermissions: NONE
+        BytesPerSecond: !Ref BytesPerSecond
+        TaskQueueing: ENABLED
+        LogLevel: !Ref LogLevel
+        TransferMode: !Ref TransferMode
+        Atime: BEST_EFFORT
+        Mtime: PRESERVE
+        Uid: NONE
+        Gid: NONE
+      Schedule:
+        ScheduleExpression: !If 
+          - EnableSchedulingCondition
+          - !Ref ScheduleExpression
+          - !Ref 'AWS::NoValue'
+        Status: !If 
+          - EnableSchedulingCondition
+          - ENABLED
+          - !Ref 'AWS::NoValue'
+      TaskReportConfig:
+        Destination:
+          S3:
+            BucketAccessRoleArn: !GetAtt DataSyncServiceRole.Arn
+            S3BucketArn: !Sub 
+              - 'arn:aws:s3:::${BucketName}'
+              - BucketName: !If 
+                  - CreateDestinationBucket
+                  - !Ref DestinationBucket
+                  - !Ref DestinationBucketName
+            Subdirectory: '/datasync-reports'
+        OutputType: SUMMARY_ONLY
+        ReportLevel: !Ref ReportLevel
+        ObjectVersionIds: INCLUDE
+        Overrides:
+          Transferred:
+            ReportLevel: !Ref ReportLevel
+          Verified:
+            ReportLevel: !Ref ReportLevel
+          Deleted:
+            ReportLevel: !Ref ReportLevel
+          Skipped:
+            ReportLevel: !Ref ReportLevel
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-datasync-task'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'DataSync Task for Automated Data Transfer'
+
+  # ============================================================================
+  # EventBridge Resources (for Scheduling)
+  # ============================================================================
+  
+  # EventBridge Rule for Scheduled DataSync Execution
+  DataSyncScheduledRule:
+    Type: AWS::Events::Rule
+    Condition: EnableSchedulingCondition
+    Properties:
+      Name: !Sub '${ProjectName}-datasync-scheduled-execution-${Environment}'
+      Description: 'Scheduled execution of DataSync task'
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !Ref DataSyncTask
+          Id: 'DataSyncTaskTarget'
+          RoleArn: !GetAtt EventBridgeDataSyncRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-datasync-scheduled-rule'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+# Outputs
+Outputs:
+  # DataSync Resources
+  DataSyncTaskArn:
+    Description: 'ARN of the DataSync task'
+    Value: !Ref DataSyncTask
+    Export:
+      Name: !Sub '${AWS::StackName}-DataSyncTaskArn'
+
+  DataSyncSourceLocationArn:
+    Description: 'ARN of the DataSync source location'
+    Value: !Ref DataSyncSourceLocation
+    Export:
+      Name: !Sub '${AWS::StackName}-DataSyncSourceLocationArn'
+
+  DataSyncDestinationLocationArn:
+    Description: 'ARN of the DataSync destination location'
+    Value: !Ref DataSyncDestinationLocation
+    Export:
+      Name: !Sub '${AWS::StackName}-DataSyncDestinationLocationArn'
+
+  # S3 Bucket Information
+  SourceBucketName:
+    Description: 'Name of the source S3 bucket'
+    Value: !If 
+      - CreateSourceBucket
+      - !Ref SourceBucket
+      - !Ref SourceBucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-SourceBucketName'
+
+  DestinationBucketName:
+    Description: 'Name of the destination S3 bucket'
+    Value: !If 
+      - CreateDestinationBucket
+      - !Ref DestinationBucket
+      - !Ref DestinationBucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-DestinationBucketName'
+
+  # IAM Role Information
+  DataSyncServiceRoleArn:
+    Description: 'ARN of the DataSync service role'
+    Value: !GetAtt DataSyncServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataSyncServiceRoleArn'
+
+  # CloudWatch Information
+  DataSyncLogGroupName:
+    Condition: EnableLoggingCondition
+    Description: 'Name of the CloudWatch log group for DataSync'
+    Value: !Ref DataSyncLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-DataSyncLogGroupName'
+
+  DataSyncDashboardURL:
+    Condition: EnableDashboardCondition
+    Description: 'URL of the CloudWatch dashboard for DataSync monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-datasync-monitoring-${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DataSyncDashboardURL'
+
+  # EventBridge Information
+  DataSyncScheduledRuleArn:
+    Condition: EnableSchedulingCondition
+    Description: 'ARN of the EventBridge rule for scheduled DataSync execution'
+    Value: !GetAtt DataSyncScheduledRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataSyncScheduledRuleArn'
+
+  # SNS Topic Information
+  DataSyncFailureTopicArn:
+    Description: 'ARN of the SNS topic for DataSync failure notifications'
+    Value: !Ref DataSyncFailureTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-DataSyncFailureTopicArn'
+
+  # Configuration Information
+  TaskConfiguration:
+    Description: 'DataSync task configuration summary'
+    Value: !Sub |
+      Task Name: ${ProjectName}-datasync-task-${Environment}
+      Verify Mode: ${VerifyMode}
+      Overwrite Mode: ${OverwriteMode}
+      Transfer Mode: ${TransferMode}
+      Bandwidth Limit: ${BytesPerSecond} bytes/second
+      Scheduling: ${EnableScheduling}
+      Schedule Expression: ${ScheduleExpression}
+      Log Level: ${LogLevel}
+      Report Level: ${ReportLevel}
+
+  # Quick Start Commands
+  QuickStartCommands:
+    Description: 'Commands to get started with DataSync task'
+    Value: !Sub |
+      # Start DataSync task execution:
+      aws datasync start-task-execution --task-arn ${DataSyncTask}
+      
+      # Check task execution status:
+      aws datasync list-task-executions --task-arn ${DataSyncTask}
+      
+      # View CloudWatch logs:
+      aws logs describe-log-streams --log-group-name /aws/datasync/${ProjectName}-${Environment}
+      
+      # Subscribe to failure notifications:
+      aws sns subscribe --topic-arn ${DataSyncFailureTopic} --protocol email --notification-endpoint your-email@example.com

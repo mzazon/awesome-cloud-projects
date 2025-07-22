@@ -1,0 +1,692 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Systems Manager State Manager Configuration Management Solution - Implements automated configuration management, compliance monitoring, and drift detection for EC2 instances'
+
+Parameters:
+  # Environment Configuration
+  Environment:
+    Type: String
+    Description: 'Environment name for resource tagging and targeting'
+    Default: 'Demo'
+    AllowedValues:
+      - 'Demo'
+      - 'Development'
+      - 'Staging'
+      - 'Production'
+  
+  # Security Configuration Parameters
+  EnableFirewall:
+    Type: String
+    Description: 'Enable firewall configuration on target instances'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+  
+  DisableRootLogin:
+    Type: String
+    Description: 'Disable root SSH login on target instances'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+  
+  # Scheduling Configuration
+  SecurityConfigurationSchedule:
+    Type: String
+    Description: 'Schedule expression for security configuration enforcement'
+    Default: 'rate(1 day)'
+    AllowedPattern: '^(rate\(.+\)|cron\(.+\))$'
+    ConstraintDescription: 'Must be a valid rate() or cron() expression'
+  
+  SSMAgentUpdateSchedule:
+    Type: String
+    Description: 'Schedule expression for SSM Agent updates'
+    Default: 'rate(7 days)'
+    AllowedPattern: '^(rate\(.+\)|cron\(.+\))$'
+    ConstraintDescription: 'Must be a valid rate() or cron() expression'
+  
+  # Compliance Configuration
+  ComplianceSeverity:
+    Type: String
+    Description: 'Compliance severity level for configuration violations'
+    Default: 'CRITICAL'
+    AllowedValues:
+      - 'CRITICAL'
+      - 'HIGH'
+      - 'MEDIUM'
+      - 'LOW'
+      - 'INFORMATIONAL'
+  
+  # Notification Configuration
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for configuration drift and compliance notifications'
+    Default: 'admin@example.com'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+  
+  # S3 Configuration
+  S3BucketName:
+    Type: String
+    Description: 'S3 bucket name for State Manager output logs (leave empty for auto-generated)'
+    Default: ''
+  
+  # Resource Naming
+  ResourceNamePrefix:
+    Type: String
+    Description: 'Prefix for all created resources'
+    Default: 'SSMStateManager'
+    MaxLength: 20
+    MinLength: 1
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Environment Configuration'
+        Parameters:
+          - Environment
+          - ResourceNamePrefix
+      - Label:
+          default: 'Security Configuration'
+        Parameters:
+          - EnableFirewall
+          - DisableRootLogin
+          - ComplianceSeverity
+      - Label:
+          default: 'Scheduling Configuration'
+        Parameters:
+          - SecurityConfigurationSchedule
+          - SSMAgentUpdateSchedule
+      - Label:
+          default: 'Notification Configuration'
+        Parameters:
+          - NotificationEmail
+          - S3BucketName
+    ParameterLabels:
+      Environment:
+        default: 'Target Environment'
+      ResourceNamePrefix:
+        default: 'Resource Name Prefix'
+      EnableFirewall:
+        default: 'Enable Firewall'
+      DisableRootLogin:
+        default: 'Disable Root Login'
+      ComplianceSeverity:
+        default: 'Compliance Severity'
+      SecurityConfigurationSchedule:
+        default: 'Security Configuration Schedule'
+      SSMAgentUpdateSchedule:
+        default: 'SSM Agent Update Schedule'
+      NotificationEmail:
+        default: 'Notification Email'
+      S3BucketName:
+        default: 'S3 Bucket Name'
+
+Conditions:
+  CreateS3Bucket: !Equals [!Ref S3BucketName, '']
+
+Resources:
+  # S3 Bucket for State Manager Output Logs
+  StateManagerOutputBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateS3Bucket
+    Properties:
+      BucketName: !Sub '${ResourceNamePrefix}-output-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourceNamePrefix}-output-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'State Manager Output Logs'
+
+  # CloudWatch Log Group for State Manager
+  StateManagerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/ssm/state-manager-${ResourceNamePrefix}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourceNamePrefix}-log-group'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'State Manager Logs'
+
+  # SNS Topic for Configuration Drift Alerts
+  ConfigurationDriftTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ResourceNamePrefix}-config-drift-alerts'
+      DisplayName: 'Configuration Drift Alerts'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourceNamePrefix}-drift-alerts'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Configuration Drift Notifications'
+
+  # SNS Topic Subscription for Email Notifications
+  ConfigurationDriftSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref ConfigurationDriftTopic
+      Endpoint: !Ref NotificationEmail
+
+  # IAM Role for State Manager Operations
+  StateManagerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourceNamePrefix}-Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: StateManagerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:CreateAssociation
+                  - ssm:DescribeAssociation*
+                  - ssm:GetAutomationExecution
+                  - ssm:ListAssociations
+                  - ssm:ListDocuments
+                  - ssm:SendCommand
+                  - ssm:StartAutomationExecution
+                  - ssm:DescribeInstanceInformation
+                  - ssm:DescribeDocumentParameters
+                  - ssm:ListCommandInvocations
+                  - ssm:StartAssociationsOnce
+                  - ssm:ListComplianceItems
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceAttribute
+                  - ec2:DescribeImages
+                  - ec2:DescribeSnapshots
+                  - ec2:DescribeVolumes
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref ConfigurationDriftTopic
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                  - s3:ListBucketMultipartUploads
+                Resource:
+                  - !Sub 
+                    - '${BucketArn}/*'
+                    - BucketArn: !If 
+                        - CreateS3Bucket
+                        - !GetAtt StateManagerOutputBucket.Arn
+                        - !Sub 'arn:aws:s3:::${S3BucketName}'
+                  - !If 
+                      - CreateS3Bucket
+                      - !GetAtt StateManagerOutputBucket.Arn
+                      - !Sub 'arn:aws:s3:::${S3BucketName}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourceNamePrefix}-Role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'State Manager Operations'
+
+  # Custom Security Configuration Document
+  SecurityConfigurationDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: !Sub '${ResourceNamePrefix}-SecurityConfiguration'
+      DocumentType: Command
+      DocumentFormat: JSON
+      Content:
+        schemaVersion: '2.2'
+        description: 'Configure security settings on Linux instances'
+        parameters:
+          enableFirewall:
+            type: String
+            description: 'Enable firewall'
+            default: 'true'
+            allowedValues:
+              - 'true'
+              - 'false'
+          disableRootLogin:
+            type: String
+            description: 'Disable root SSH login'
+            default: 'true'
+            allowedValues:
+              - 'true'
+              - 'false'
+        mainSteps:
+          - action: 'aws:runShellScript'
+            name: configureFirewall
+            precondition:
+              StringEquals:
+                - platformType
+                - Linux
+            inputs:
+              runCommand:
+                - '#!/bin/bash'
+                - 'if [ "{{ enableFirewall }}" == "true" ]; then'
+                - '  if command -v ufw &> /dev/null; then'
+                - '    ufw --force enable'
+                - '    echo "UFW firewall enabled"'
+                - '  elif command -v firewall-cmd &> /dev/null; then'
+                - '    systemctl enable firewalld'
+                - '    systemctl start firewalld'
+                - '    echo "Firewalld enabled"'
+                - '  fi'
+                - 'fi'
+          - action: 'aws:runShellScript'
+            name: configureSshSecurity
+            precondition:
+              StringEquals:
+                - platformType
+                - Linux
+            inputs:
+              runCommand:
+                - '#!/bin/bash'
+                - 'if [ "{{ disableRootLogin }}" == "true" ]; then'
+                - '  sed -i "s/^#\\?PermitRootLogin.*/PermitRootLogin no/" /etc/ssh/sshd_config'
+                - '  if systemctl is-active --quiet sshd; then'
+                - '    systemctl reload sshd'
+                - '  fi'
+                - '  echo "Root SSH login disabled"'
+                - 'fi'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourceNamePrefix}-SecurityConfiguration'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Security Configuration Document'
+
+  # Automated Remediation Document
+  RemediationDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: !Sub '${ResourceNamePrefix}-AutoRemediation'
+      DocumentType: Automation
+      DocumentFormat: JSON
+      Content:
+        schemaVersion: '0.3'
+        description: 'Automated remediation for configuration drift'
+        assumeRole: !GetAtt StateManagerRole.Arn
+        parameters:
+          InstanceId:
+            type: String
+            description: 'The ID of the non-compliant instance'
+          AssociationId:
+            type: String
+            description: 'The ID of the failed association'
+        mainSteps:
+          - name: RerunAssociation
+            action: 'aws:executeAwsApi'
+            inputs:
+              Service: ssm
+              Api: StartAssociationsOnce
+              AssociationIds:
+                - '{{ AssociationId }}'
+          - name: WaitForCompletion
+            action: 'aws:waitForAwsResourceProperty'
+            inputs:
+              Service: ssm
+              Api: DescribeAssociationExecutions
+              AssociationId: '{{ AssociationId }}'
+              PropertySelector: '$.AssociationExecutions[0].Status'
+              DesiredValues:
+                - Success
+            timeoutSeconds: 300
+          - name: SendNotification
+            action: 'aws:executeAwsApi'
+            inputs:
+              Service: sns
+              Api: Publish
+              TopicArn: !Ref ConfigurationDriftTopic
+              Message: !Sub 'Configuration drift remediation completed for instance {{ InstanceId }}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourceNamePrefix}-AutoRemediation'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Automated Remediation'
+
+  # Compliance Reporting Document
+  ComplianceReportDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: !Sub '${ResourceNamePrefix}-ComplianceReport'
+      DocumentType: Automation
+      DocumentFormat: JSON
+      Content:
+        schemaVersion: '0.3'
+        description: 'Generate compliance report'
+        assumeRole: !GetAtt StateManagerRole.Arn
+        mainSteps:
+          - name: GenerateReport
+            action: 'aws:executeAwsApi'
+            inputs:
+              Service: ssm
+              Api: ListComplianceItems
+              ResourceTypes:
+                - ManagedInstance
+              Filters:
+                - Key: ComplianceType
+                  Values:
+                    - Association
+          - name: PublishReport
+            action: 'aws:executeAwsApi'
+            inputs:
+              Service: sns
+              Api: Publish
+              TopicArn: !Ref ConfigurationDriftTopic
+              Subject: !Sub 'Compliance Report - ${Environment}'
+              Message: 'Compliance report has been generated. Check CloudWatch logs for details.'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourceNamePrefix}-ComplianceReport'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Compliance Reporting'
+
+  # State Manager Association for SSM Agent Updates
+  SSMAgentUpdateAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: 'AWS-UpdateSSMAgent'
+      AssociationName: !Sub '${ResourceNamePrefix}-SSMAgent-Update'
+      Targets:
+        - Key: 'tag:Environment'
+          Values:
+            - !Ref Environment
+      ScheduleExpression: !Ref SSMAgentUpdateSchedule
+      OutputLocation:
+        S3Location:
+          OutputS3BucketName: !If 
+            - CreateS3Bucket
+            - !Ref StateManagerOutputBucket
+            - !Ref S3BucketName
+          OutputS3KeyPrefix: 'ssm-agent-updates/'
+      ComplianceSeverity: !Ref ComplianceSeverity
+      SyncCompliance: AUTO
+
+  # State Manager Association for Security Configuration
+  SecurityConfigurationAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: !Ref SecurityConfigurationDocument
+      AssociationName: !Sub '${ResourceNamePrefix}-Security-Configuration'
+      Targets:
+        - Key: 'tag:Environment'
+          Values:
+            - !Ref Environment
+      ScheduleExpression: !Ref SecurityConfigurationSchedule
+      Parameters:
+        enableFirewall:
+          - !Ref EnableFirewall
+        disableRootLogin:
+          - !Ref DisableRootLogin
+      OutputLocation:
+        S3Location:
+          OutputS3BucketName: !If 
+            - CreateS3Bucket
+            - !Ref StateManagerOutputBucket
+            - !Ref S3BucketName
+          OutputS3KeyPrefix: 'security-configuration/'
+      ComplianceSeverity: !Ref ComplianceSeverity
+      SyncCompliance: AUTO
+
+  # CloudWatch Alarm for Association Failures
+  AssociationFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourceNamePrefix}-Association-Failures'
+      AlarmDescription: 'Monitor SSM association failures'
+      MetricName: AssociationExecutionsFailed
+      Namespace: AWS/SSM
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref ConfigurationDriftTopic
+      Dimensions:
+        - Name: AssociationName
+          Value: !Sub '${ResourceNamePrefix}-Security-Configuration'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourceNamePrefix}-Association-Failures'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Association Failure Monitoring'
+
+  # CloudWatch Alarm for Compliance Violations
+  ComplianceViolationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourceNamePrefix}-Compliance-Violations'
+      AlarmDescription: 'Monitor compliance violations'
+      MetricName: ComplianceByConfigRule
+      Namespace: AWS/SSM
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref ConfigurationDriftTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourceNamePrefix}-Compliance-Violations'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Compliance Violation Monitoring'
+
+  # CloudWatch Dashboard for State Manager Monitoring
+  StateManagerDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ResourceNamePrefix}-Dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/SSM", "AssociationExecutionsSucceeded", "AssociationName", "${ResourceNamePrefix}-Security-Configuration"],
+                  [".", "AssociationExecutionsFailed", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Association Execution Status",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/SSM", "ComplianceByConfigRule", "RuleName", "${ResourceNamePrefix}-Security-Configuration", "ComplianceType", "Association"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Compliance Status",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${StateManagerLogGroup}' | fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Errors",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  # Resource ARNs and Names
+  StateManagerRoleArn:
+    Description: 'ARN of the State Manager IAM Role'
+    Value: !GetAtt StateManagerRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-StateManagerRole-Arn'
+
+  SecurityConfigurationDocumentName:
+    Description: 'Name of the Security Configuration Document'
+    Value: !Ref SecurityConfigurationDocument
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityConfigurationDocument-Name'
+
+  RemediationDocumentName:
+    Description: 'Name of the Automated Remediation Document'
+    Value: !Ref RemediationDocument
+    Export:
+      Name: !Sub '${AWS::StackName}-RemediationDocument-Name'
+
+  ComplianceReportDocumentName:
+    Description: 'Name of the Compliance Report Document'
+    Value: !Ref ComplianceReportDocument
+    Export:
+      Name: !Sub '${AWS::StackName}-ComplianceReportDocument-Name'
+
+  # Association IDs
+  SSMAgentUpdateAssociationId:
+    Description: 'ID of the SSM Agent Update Association'
+    Value: !Ref SSMAgentUpdateAssociation
+    Export:
+      Name: !Sub '${AWS::StackName}-SSMAgentUpdateAssociation-Id'
+
+  SecurityConfigurationAssociationId:
+    Description: 'ID of the Security Configuration Association'
+    Value: !Ref SecurityConfigurationAssociation
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityConfigurationAssociation-Id'
+
+  # Monitoring Resources
+  ConfigurationDriftTopicArn:
+    Description: 'ARN of the Configuration Drift SNS Topic'
+    Value: !Ref ConfigurationDriftTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigurationDriftTopic-Arn'
+
+  StateManagerLogGroupName:
+    Description: 'Name of the State Manager CloudWatch Log Group'
+    Value: !Ref StateManagerLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-StateManagerLogGroup-Name'
+
+  StateManagerDashboardURL:
+    Description: 'URL of the State Manager CloudWatch Dashboard'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ResourceNamePrefix}-Dashboard'
+    Export:
+      Name: !Sub '${AWS::StackName}-StateManagerDashboard-URL'
+
+  # S3 Bucket Information
+  OutputS3BucketName:
+    Description: 'Name of the S3 bucket for State Manager output'
+    Value: !If 
+      - CreateS3Bucket
+      - !Ref StateManagerOutputBucket
+      - !Ref S3BucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-OutputS3Bucket-Name'
+
+  # CloudWatch Alarms
+  AssociationFailureAlarmName:
+    Description: 'Name of the Association Failure CloudWatch Alarm'
+    Value: !Ref AssociationFailureAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-AssociationFailureAlarm-Name'
+
+  ComplianceViolationAlarmName:
+    Description: 'Name of the Compliance Violation CloudWatch Alarm'
+    Value: !Ref ComplianceViolationAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-ComplianceViolationAlarm-Name'
+
+  # Configuration Summary
+  ConfigurationSummary:
+    Description: 'Configuration summary for the State Manager solution'
+    Value: !Sub |
+      Environment: ${Environment}
+      Security Configuration Schedule: ${SecurityConfigurationSchedule}
+      SSM Agent Update Schedule: ${SSMAgentUpdateSchedule}
+      Compliance Severity: ${ComplianceSeverity}
+      Firewall Enabled: ${EnableFirewall}
+      Root Login Disabled: ${DisableRootLogin}
+      Notification Email: ${NotificationEmail}

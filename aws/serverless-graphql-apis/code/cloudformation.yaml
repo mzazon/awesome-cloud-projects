@@ -1,0 +1,771 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Infrastructure as Code for Serverless GraphQL APIs with AppSync and Scheduler.
+  This template creates a complete task management system with real-time GraphQL subscriptions,
+  scheduled reminders, and serverless compute capabilities.
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "AppSync Configuration"
+        Parameters:
+          - AuthenticationType
+          - ApiKeyExpirationDays
+      - Label:
+          default: "DynamoDB Configuration"
+        Parameters:
+          - BillingMode
+          - PointInTimeRecovery
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaTimeout
+          - LambdaMemorySize
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      AuthenticationType:
+        default: "API Authentication Type"
+      ApiKeyExpirationDays:
+        default: "API Key Expiration (Days)"
+      BillingMode:
+        default: "DynamoDB Billing Mode"
+      PointInTimeRecovery:
+        default: "Enable Point-in-Time Recovery"
+      LambdaTimeout:
+        default: "Lambda Function Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+
+# Input Parameters
+Parameters:
+  ProjectName:
+    Type: String
+    Default: TaskManager
+    Description: Name prefix for all resources
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+    MinLength: 3
+    MaxLength: 20
+
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment name (dev, staging, prod)
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  AuthenticationType:
+    Type: String
+    Default: AWS_IAM
+    Description: AppSync API authentication type
+    AllowedValues:
+      - AWS_IAM
+      - API_KEY
+      - AMAZON_COGNITO_USER_POOLS
+      - OPENID_CONNECT
+
+  ApiKeyExpirationDays:
+    Type: Number
+    Default: 365
+    Description: Number of days until the API key expires (only used when AuthenticationType is API_KEY)
+    MinValue: 1
+    MaxValue: 365
+
+  BillingMode:
+    Type: String
+    Default: PAY_PER_REQUEST
+    Description: DynamoDB billing mode
+    AllowedValues:
+      - PAY_PER_REQUEST
+      - PROVISIONED
+
+  PointInTimeRecovery:
+    Type: String
+    Default: 'true'
+    Description: Enable point-in-time recovery for DynamoDB table
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    Description: Lambda function timeout in seconds
+    MinValue: 3
+    MaxValue: 900
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    Description: Lambda function memory size in MB
+    AllowedValues:
+      - 128
+      - 256
+      - 512
+      - 1024
+      - 1536
+      - 2048
+      - 3008
+
+# Conditional Resources
+Conditions:
+  CreateApiKey: !Equals [!Ref AuthenticationType, 'API_KEY']
+  EnablePointInTimeRecovery: !Equals [!Ref PointInTimeRecovery, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+# Resources
+Resources:
+  # ===== DynamoDB Table =====
+  TasksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-Tasks-${Environment}'
+      BillingMode: !Ref BillingMode
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserIdIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnablePointInTimeRecovery, true, false]
+      DeletionProtection: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: TaskManagement
+
+  # ===== IAM Roles =====
+  AppSyncServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-AppSync-ServiceRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: appsync.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt TasksTable.Arn
+                  - !Sub '${TasksTable.Arn}/index/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-Lambda-ExecutionRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AppSyncAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - appsync:GraphQL
+                Resource: !Sub '${AppSyncApi.Arn}/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  EventBridgeSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-Scheduler-ServiceRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AppSyncAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: appsync:GraphQL
+                Resource: !Sub '${AppSyncApi.Arn}/*'
+        - PolicyName: LambdaInvokeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt TaskProcessorFunction.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ===== AppSync GraphQL API =====
+  AppSyncApi:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      Name: !Sub '${ProjectName}-API-${Environment}'
+      AuthenticationType: !Ref AuthenticationType
+      XrayEnabled: true
+      LogConfig:
+        CloudWatchLogsRoleArn: !GetAtt AppSyncLogsRole.Arn
+        FieldLogLevel: ALL
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # API Key (conditional based on authentication type)
+  AppSyncApiKey:
+    Type: AWS::AppSync::ApiKey
+    Condition: CreateApiKey
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      Description: !Sub 'API Key for ${ProjectName} ${Environment}'
+      Expires: !Sub
+        - '${EpochTime}'
+        - EpochTime: !Select
+          - 0
+          - !Split
+            - '.'
+            - !Ref AWS::NoValue
+
+  # CloudWatch Logs Role for AppSync
+  AppSyncLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: appsync.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AppSyncPushToCloudWatchLogs
+
+  # GraphQL Schema
+  AppSyncSchema:
+    Type: AWS::AppSync::GraphQLSchema
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      Definition: |
+        type Task {
+          id: ID!
+          userId: String!
+          title: String!
+          description: String
+          dueDate: String!
+          status: TaskStatus!
+          reminderTime: String
+          createdAt: String!
+          updatedAt: String!
+        }
+        
+        enum TaskStatus {
+          PENDING
+          IN_PROGRESS
+          COMPLETED
+          CANCELLED
+        }
+        
+        input CreateTaskInput {
+          title: String!
+          description: String
+          dueDate: String!
+          reminderTime: String
+        }
+        
+        input UpdateTaskInput {
+          id: ID!
+          title: String
+          description: String
+          status: TaskStatus
+          dueDate: String
+          reminderTime: String
+        }
+        
+        type Query {
+          getTask(id: ID!): Task
+          listUserTasks(userId: String!): [Task]
+        }
+        
+        type Mutation {
+          createTask(input: CreateTaskInput!): Task
+          updateTask(input: UpdateTaskInput!): Task
+          deleteTask(id: ID!): Task
+          sendReminder(taskId: ID!): Task
+        }
+        
+        type Subscription {
+          onTaskCreated(userId: String!): Task
+            @aws_subscribe(mutations: ["createTask"])
+          onTaskUpdated(userId: String!): Task
+            @aws_subscribe(mutations: ["updateTask", "sendReminder"])
+          onTaskDeleted(userId: String!): Task
+            @aws_subscribe(mutations: ["deleteTask"])
+        }
+        
+        schema {
+          query: Query
+          mutation: Mutation
+          subscription: Subscription
+        }
+
+  # ===== DynamoDB Data Source =====
+  TasksDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      Name: TasksDataSource
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      DynamoDBConfig:
+        TableName: !Ref TasksTable
+        AwsRegion: !Ref AWS::Region
+
+  # Lambda Data Source
+  LambdaDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      Name: LambdaDataSource
+      Type: AWS_LAMBDA
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      LambdaConfig:
+        LambdaFunctionArn: !GetAtt TaskProcessorFunction.Arn
+
+  # ===== GraphQL Resolvers =====
+  CreateTaskResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: createTask
+      DataSourceName: !GetAtt TasksDataSource.Name
+      RequestMappingTemplate: |
+        #set($id = $util.autoId())
+        {
+          "version": "2017-02-28",
+          "operation": "PutItem",
+          "key": {
+            "id": $util.dynamodb.toDynamoDBJson($id)
+          },
+          "attributeValues": {
+            "userId": $util.dynamodb.toDynamoDBJson($ctx.identity.userArn),
+            "title": $util.dynamodb.toDynamoDBJson($ctx.args.input.title),
+            "description": $util.dynamodb.toDynamoDBJson($ctx.args.input.description),
+            "dueDate": $util.dynamodb.toDynamoDBJson($ctx.args.input.dueDate),
+            "status": $util.dynamodb.toDynamoDBJson("PENDING"),
+            "reminderTime": $util.dynamodb.toDynamoDBJson($ctx.args.input.reminderTime),
+            "createdAt": $util.dynamodb.toDynamoDBJson($util.time.nowISO8601()),
+            "updatedAt": $util.dynamodb.toDynamoDBJson($util.time.nowISO8601())
+          }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result)
+
+  GetTaskResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Query
+      FieldName: getTask
+      DataSourceName: !GetAtt TasksDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2017-02-28",
+          "operation": "GetItem",
+          "key": {
+            "id": $util.dynamodb.toDynamoDBJson($ctx.args.id)
+          }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result)
+
+  ListUserTasksResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Query
+      FieldName: listUserTasks
+      DataSourceName: !GetAtt TasksDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2017-02-28",
+          "operation": "Query",
+          "index": "UserIdIndex",
+          "query": {
+            "expression": "userId = :userId",
+            "expressionValues": {
+              ":userId": $util.dynamodb.toDynamoDBJson($ctx.args.userId)
+            }
+          }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result.items)
+
+  UpdateTaskResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: updateTask
+      DataSourceName: !GetAtt TasksDataSource.Name
+      RequestMappingTemplate: |
+        #set($update = {})
+        #if($ctx.args.input.title)
+          #set($update.title = $util.dynamodb.toDynamoDBJson($ctx.args.input.title))
+        #end
+        #if($ctx.args.input.description)
+          #set($update.description = $util.dynamodb.toDynamoDBJson($ctx.args.input.description))
+        #end
+        #if($ctx.args.input.status)
+          #set($update.status = $util.dynamodb.toDynamoDBJson($ctx.args.input.status))
+        #end
+        #if($ctx.args.input.dueDate)
+          #set($update.dueDate = $util.dynamodb.toDynamoDBJson($ctx.args.input.dueDate))
+        #end
+        #if($ctx.args.input.reminderTime)
+          #set($update.reminderTime = $util.dynamodb.toDynamoDBJson($ctx.args.input.reminderTime))
+        #end
+        #set($update.updatedAt = $util.dynamodb.toDynamoDBJson($util.time.nowISO8601()))
+        
+        {
+          "version": "2017-02-28",
+          "operation": "UpdateItem",
+          "key": {
+            "id": $util.dynamodb.toDynamoDBJson($ctx.args.input.id)
+          },
+          "update": {
+            "expression": "SET #updatedAt = :updatedAt",
+            "expressionNames": {
+              "#updatedAt": "updatedAt"
+            },
+            "expressionValues": {
+              ":updatedAt": $update.updatedAt
+            }
+          }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result)
+
+  DeleteTaskResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: deleteTask
+      DataSourceName: !GetAtt TasksDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2017-02-28",
+          "operation": "DeleteItem",
+          "key": {
+            "id": $util.dynamodb.toDynamoDBJson($ctx.args.id)
+          }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result)
+
+  SendReminderResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: sendReminder
+      DataSourceName: !GetAtt LambdaDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2017-02-28",
+          "operation": "Invoke",
+          "payload": {
+            "taskId": "$ctx.args.taskId",
+            "action": "sendReminder"
+          }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result)
+
+  # ===== Lambda Function =====
+  TaskProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-TaskProcessor-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          API_ID: !GetAtt AppSyncApi.ApiId
+          API_URL: !GetAtt AppSyncApi.GraphQLUrl
+          TABLE_NAME: !Ref TasksTable
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          appsync = boto3.client('appsync')
+          dynamodb = boto3.resource('dynamodb')
+          
+          def lambda_handler(event, context):
+              """Process scheduled task reminders and other task operations"""
+              print(f"Received event: {json.dumps(event)}")
+              
+              try:
+                  # Handle different event sources
+                  if 'taskId' in event:
+                      # Direct invocation or EventBridge Scheduler
+                      task_id = event['taskId']
+                      action = event.get('action', 'sendReminder')
+                      
+                      if action == 'sendReminder':
+                          return send_reminder(task_id)
+                      else:
+                          return {'statusCode': 400, 'body': f'Unknown action: {action}'}
+                  
+                  # Handle AppSync direct resolver invocation
+                  elif 'arguments' in event:
+                      task_id = event['arguments']['taskId']
+                      return send_reminder(task_id)
+                  
+                  else:
+                      return {'statusCode': 400, 'body': 'No taskId provided in event'}
+                      
+              except Exception as e:
+                  print(f"Error processing event: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+          
+          def send_reminder(task_id):
+              """Send reminder for a specific task"""
+              try:
+                  # Get task from DynamoDB
+                  table = dynamodb.Table(os.environ['TABLE_NAME'])
+                  response = table.get_item(Key={'id': task_id})
+                  
+                  if 'Item' not in response:
+                      return {'statusCode': 404, 'body': 'Task not found'}
+                  
+                  task = response['Item']
+                  
+                  # Update task with reminder sent timestamp
+                  table.update_item(
+                      Key={'id': task_id},
+                      UpdateExpression='SET lastReminderSent = :timestamp',
+                      ExpressionAttributeValues={
+                          ':timestamp': datetime.utcnow().isoformat()
+                      }
+                  )
+                  
+                  # In a real implementation, you would send email/SMS here
+                  print(f"Reminder sent for task: {task['title']}")
+                  
+                  # Return the updated task
+                  return {
+                      'statusCode': 200,
+                      'id': task['id'],
+                      'title': task['title'],
+                      'status': task['status'],
+                      'userId': task['userId']
+                  }
+                  
+              except Exception as e:
+                  print(f"Error sending reminder: {str(e)}")
+                  raise
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Permission for AppSync
+  LambdaAppSyncPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TaskProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: appsync.amazonaws.com
+      SourceArn: !Sub '${AppSyncApi.Arn}/*'
+
+  # Lambda Permission for EventBridge Scheduler
+  LambdaSchedulerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TaskProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: scheduler.amazonaws.com
+
+  # ===== EventBridge Scheduler Group =====
+  SchedulerGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: !Sub '${ProjectName}-TaskReminders-${Environment}'
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # Sample Schedule for Testing (optional)
+  SampleSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${ProjectName}-SampleReminder-${Environment}'
+      GroupName: !Ref SchedulerGroup
+      Description: Sample schedule for testing task reminders
+      State: DISABLED  # Disabled by default
+      ScheduleExpression: 'rate(1 hours)'
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !GetAtt TaskProcessorFunction.Arn
+        RoleArn: !GetAtt EventBridgeSchedulerRole.Arn
+        Input: !Sub |
+          {
+            "taskId": "sample-task-id",
+            "action": "sendReminder"
+          }
+
+# Stack Outputs
+Outputs:
+  # API Information
+  GraphQLApiId:
+    Description: AppSync GraphQL API ID
+    Value: !GetAtt AppSyncApi.ApiId
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiId'
+
+  GraphQLApiUrl:
+    Description: AppSync GraphQL API URL
+    Value: !GetAtt AppSyncApi.GraphQLUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiUrl'
+
+  ApiKey:
+    Condition: CreateApiKey
+    Description: AppSync API Key (only when using API_KEY authentication)
+    Value: !GetAtt AppSyncApiKey.ApiKey
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiKey'
+
+  # Database Information
+  DynamoDBTableName:
+    Description: DynamoDB table name for tasks
+    Value: !Ref TasksTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TableName'
+
+  DynamoDBTableArn:
+    Description: DynamoDB table ARN
+    Value: !GetAtt TasksTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TableArn'
+
+  # Lambda Information
+  LambdaFunctionName:
+    Description: Lambda function name for task processing
+    Value: !Ref TaskProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaName'
+
+  LambdaFunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt TaskProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaArn'
+
+  # Scheduler Information
+  SchedulerGroupName:
+    Description: EventBridge Scheduler group name
+    Value: !Ref SchedulerGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SchedulerGroup'
+
+  # IAM Roles
+  AppSyncServiceRoleArn:
+    Description: AppSync service role ARN
+    Value: !GetAtt AppSyncServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AppSyncRole'
+
+  EventBridgeSchedulerRoleArn:
+    Description: EventBridge Scheduler service role ARN
+    Value: !GetAtt EventBridgeSchedulerRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SchedulerRole'
+
+  # Testing Information
+  TestCommands:
+    Description: Sample commands for testing the deployment
+    Value: !Sub |
+      # Test GraphQL API:
+      aws appsync list-graphql-apis --query 'graphqlApis[?name==`${ProjectName}-API-${Environment}`]'
+      
+      # Create a test task (requires proper authentication):
+      curl -X POST ${AppSyncApi.GraphQLUrl} \
+        -H "Content-Type: application/json" \
+        -H "Authorization: AWS4-HMAC-SHA256 ..." \
+        --data '{"query":"mutation { createTask(input: {title: \"Test Task\", dueDate: \"2024-12-31T23:59:59Z\"}) { id title status } }"}'
+      
+      # List DynamoDB items:
+      aws dynamodb scan --table-name ${TasksTable}

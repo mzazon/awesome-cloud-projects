@@ -1,0 +1,712 @@
+# Infrastructure Manager Configuration for Multi-Language Content Optimization
+# This configuration deploys a complete content optimization system using:
+# - Cloud Translation Advanced for intelligent translations
+# - Cloud Run Worker Pools for serverless background processing
+# - Cloud Storage for content management
+# - Pub/Sub for event-driven architecture
+# - BigQuery for analytics and optimization
+
+# Template metadata and configuration
+apiVersion: infra-manager.gcp.com/v1
+kind: Deployment
+metadata:
+  name: content-optimization-system
+  description: "Multi-language content optimization with Translation Advanced and Worker Pools"
+  labels:
+    environment: "production"
+    component: "content-optimization"
+    version: "1.0"
+
+# Template input variables for customization
+variables:
+  # Project and region configuration
+  project_id:
+    type: string
+    description: "Google Cloud project ID for deployment"
+    validation:
+      condition: length(var.project_id) > 0
+      error_message: "Project ID must be specified"
+
+  region:
+    type: string
+    description: "Primary deployment region"
+    default: "us-central1"
+    validation:
+      condition: contains(["us-central1", "us-east1", "us-west1", "europe-west1", "asia-southeast1"], var.region)
+      error_message: "Region must be a supported Cloud Run region"
+
+  zone:
+    type: string
+    description: "Primary deployment zone"
+    default: "us-central1-a"
+
+  # Resource naming configuration
+  resource_suffix:
+    type: string
+    description: "Unique suffix for resource names"
+    default: "001"
+    validation:
+      condition: length(var.resource_suffix) >= 3
+      error_message: "Resource suffix must be at least 3 characters"
+
+  # Storage configuration
+  storage_class:
+    type: string
+    description: "Storage class for Cloud Storage buckets"
+    default: "STANDARD"
+    validation:
+      condition: contains(["STANDARD", "NEARLINE", "COLDLINE", "ARCHIVE"], var.storage_class)
+      error_message: "Storage class must be STANDARD, NEARLINE, COLDLINE, or ARCHIVE"
+
+  # BigQuery configuration
+  bigquery_location:
+    type: string
+    description: "BigQuery dataset location"
+    default: "US"
+
+  # Worker Pool configuration
+  worker_min_instances:
+    type: number
+    description: "Minimum number of worker instances"
+    default: 1
+    validation:
+      condition: var.worker_min_instances >= 0 && var.worker_min_instances <= 10
+      error_message: "Worker min instances must be between 0 and 10"
+
+  worker_max_instances:
+    type: number
+    description: "Maximum number of worker instances"
+    default: 10
+    validation:
+      condition: var.worker_max_instances >= var.worker_min_instances && var.worker_max_instances <= 100
+      error_message: "Worker max instances must be between min instances and 100"
+
+  worker_cpu:
+    type: string
+    description: "CPU allocation for worker instances"
+    default: "2"
+    validation:
+      condition: contains(["1", "2", "4", "8"], var.worker_cpu)
+      error_message: "Worker CPU must be 1, 2, 4, or 8"
+
+  worker_memory:
+    type: string
+    description: "Memory allocation for worker instances"
+    default: "4Gi"
+    validation:
+      condition: contains(["2Gi", "4Gi", "8Gi", "16Gi"], var.worker_memory)
+      error_message: "Worker memory must be 2Gi, 4Gi, 8Gi, or 16Gi"
+
+  # Translation configuration
+  default_source_language:
+    type: string
+    description: "Default source language for translations"
+    default: "en"
+
+  default_target_languages:
+    type: list(string)
+    description: "Default target languages for translations"
+    default: ["es", "fr", "de", "ja", "zh"]
+
+# Required Google Cloud APIs
+apis:
+  - name: "translate.googleapis.com"
+    title: "Cloud Translation API"
+  - name: "run.googleapis.com"
+    title: "Cloud Run API"
+  - name: "storage.googleapis.com"
+    title: "Cloud Storage API"
+  - name: "pubsub.googleapis.com"
+    title: "Cloud Pub/Sub API"
+  - name: "bigquery.googleapis.com"
+    title: "BigQuery API"
+  - name: "cloudbuild.googleapis.com"
+    title: "Cloud Build API"
+  - name: "artifactregistry.googleapis.com"
+    title: "Artifact Registry API"
+  - name: "iam.googleapis.com"
+    title: "Identity and Access Management API"
+
+# Infrastructure resources
+resources:
+  # Service Account for Translation Workers
+  # Provides secure, least-privilege access for Cloud Run Worker Pool
+  translation_worker_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: "translation-worker-sa-${var.resource_suffix}"
+      displayName: "Translation Worker Service Account"
+      description: "Service account for Cloud Run translation workers with minimal required permissions"
+      project: ${var.project_id}
+    metadata:
+      dependsOn: []
+
+  # IAM Policy Bindings for Service Account
+  # Translation API Editor permissions
+  sa_translation_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: "roles/translate.editor"
+      member: "serviceAccount:${translation_worker_service_account.email}"
+    metadata:
+      dependsOn:
+        - translation_worker_service_account
+
+  # Storage Object Admin permissions
+  sa_storage_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: "roles/storage.objectAdmin"
+      member: "serviceAccount:${translation_worker_service_account.email}"
+    metadata:
+      dependsOn:
+        - translation_worker_service_account
+
+  # BigQuery Data Editor permissions
+  sa_bigquery_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: "roles/bigquery.dataEditor"
+      member: "serviceAccount:${translation_worker_service_account.email}"
+    metadata:
+      dependsOn:
+        - translation_worker_service_account
+
+  # Pub/Sub Subscriber permissions
+  sa_pubsub_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: "roles/pubsub.subscriber"
+      member: "serviceAccount:${translation_worker_service_account.email}"
+    metadata:
+      dependsOn:
+        - translation_worker_service_account
+
+  # Cloud Storage Buckets
+  # Source content bucket with versioning and lifecycle management
+  source_content_bucket:
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: "content-source-${var.resource_suffix}"
+      project: ${var.project_id}
+      location: ${var.region}
+      storageClass: ${var.storage_class}
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: "Delete"
+            condition:
+              age: 365
+              isLive: false
+          - action:
+              type: "SetStorageClass"
+              storageClass: "NEARLINE"
+            condition:
+              age: 30
+              isLive: true
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      encryption:
+        defaultKmsKeyName: null
+      labels:
+        environment: "production"
+        component: "content-source"
+        managed-by: "infrastructure-manager"
+
+  # Translated content bucket with optimized storage configuration
+  translated_content_bucket:
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: "content-translated-${var.resource_suffix}"
+      project: ${var.project_id}
+      location: ${var.region}
+      storageClass: ${var.storage_class}
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: "Delete"
+            condition:
+              age: 180
+              isLive: false
+          - action:
+              type: "SetStorageClass"
+              storageClass: "COLDLINE"
+            condition:
+              age: 90
+              isLive: true
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      labels:
+        environment: "production"
+        component: "content-translated"
+        managed-by: "infrastructure-manager"
+
+  # Custom translation models bucket
+  translation_models_bucket:
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: "translation-models-${var.resource_suffix}"
+      project: ${var.project_id}
+      location: ${var.region}
+      storageClass: "STANDARD"
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: "SetStorageClass"
+              storageClass: "NEARLINE"
+            condition:
+              age: 30
+              isLive: true
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      labels:
+        environment: "production"
+        component: "translation-models"
+        managed-by: "infrastructure-manager"
+
+  # Pub/Sub Topics and Subscriptions
+  # Main content processing topic
+  content_processing_topic:
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: "projects/${var.project_id}/topics/content-processing-${var.resource_suffix}"
+      messageStoragePolicy:
+        allowedPersistenceRegions:
+          - ${var.region}
+      schemaSettings:
+        encoding: "JSON"
+      labels:
+        environment: "production"
+        component: "content-processing"
+        managed-by: "infrastructure-manager"
+
+  # Worker pool subscription with optimized configuration
+  content_processing_subscription:
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: "projects/${var.project_id}/subscriptions/content-processing-${var.resource_suffix}-sub"
+      topic: ${content_processing_topic.name}
+      ackDeadlineSeconds: 600
+      messageRetentionDuration: "604800s"  # 7 days
+      retryPolicy:
+        minimumBackoff: "10s"
+        maximumBackoff: "300s"
+      deadLetterPolicy:
+        deadLetterTopic: ${content_processing_dlq_topic.name}
+        maxDeliveryAttempts: 5
+      enableMessageOrdering: false
+      filter: ""
+      labels:
+        environment: "production"
+        component: "content-processing"
+        managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - content_processing_topic
+        - content_processing_dlq_topic
+
+  # Dead letter queue for failed processing
+  content_processing_dlq_topic:
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: "projects/${var.project_id}/topics/content-processing-${var.resource_suffix}-dlq"
+      messageStoragePolicy:
+        allowedPersistenceRegions:
+          - ${var.region}
+      labels:
+        environment: "production"
+        component: "content-processing-dlq"
+        managed-by: "infrastructure-manager"
+
+  # Dead letter queue subscription for monitoring
+  content_processing_dlq_subscription:
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: "projects/${var.project_id}/subscriptions/content-processing-${var.resource_suffix}-dlq-sub"
+      topic: ${content_processing_dlq_topic.name}
+      ackDeadlineSeconds: 60
+      messageRetentionDuration: "604800s"  # 7 days
+      labels:
+        environment: "production"
+        component: "content-processing-dlq"
+        managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - content_processing_dlq_topic
+
+  # BigQuery Dataset for Analytics
+  # Content analytics dataset with optimized configuration
+  content_analytics_dataset:
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      datasetId: "content_analytics_${var.resource_suffix}"
+      projectId: ${var.project_id}
+      location: ${var.bigquery_location}
+      description: "Content optimization analytics dataset for translation performance and engagement metrics"
+      defaultTableExpirationMs: "15552000000"  # 180 days
+      defaultPartitionExpirationMs: "5184000000"  # 60 days
+      labels:
+        environment: "production"
+        component: "content-analytics"
+        managed-by: "infrastructure-manager"
+      access:
+        - role: "OWNER"
+          userByEmail: "${translation_worker_service_account.email}"
+        - role: "READER"
+          specialGroup: "projectReaders"
+        - role: "WRITER"
+          specialGroup: "projectWriters"
+    metadata:
+      dependsOn:
+        - translation_worker_service_account
+
+  # BigQuery Tables for Analytics
+  # Engagement metrics table with partitioning and clustering
+  engagement_metrics_table:
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      tableId: "engagement_metrics"
+      datasetId: ${content_analytics_dataset.datasetId}
+      projectId: ${var.project_id}
+      description: "Content engagement metrics across languages and regions"
+      timePartitioning:
+        type: "DAY"
+        field: "timestamp"
+        expirationMs: "5184000000"  # 60 days
+      clustering:
+        fields:
+          - "language"
+          - "region"
+          - "content_id"
+      schema:
+        fields:
+          - name: "content_id"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Unique identifier for content item"
+          - name: "language"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Language code for translated content"
+          - name: "region"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Geographic region for content consumption"
+          - name: "engagement_score"
+            type: "FLOAT"
+            mode: "REQUIRED"
+            description: "Normalized engagement score (0.0 to 1.0)"
+          - name: "translation_quality"
+            type: "FLOAT"
+            mode: "REQUIRED"
+            description: "Translation quality score (0.0 to 1.0)"
+          - name: "timestamp"
+            type: "TIMESTAMP"
+            mode: "REQUIRED"
+            description: "Event timestamp for partitioning"
+      labels:
+        environment: "production"
+        component: "engagement-metrics"
+        managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - content_analytics_dataset
+
+  # Translation performance table with optimization
+  translation_performance_table:
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      tableId: "translation_performance"
+      datasetId: ${content_analytics_dataset.datasetId}
+      projectId: ${var.project_id}
+      description: "Translation batch processing performance metrics"
+      timePartitioning:
+        type: "DAY"
+        field: "timestamp"
+        expirationMs: "5184000000"  # 60 days
+      clustering:
+        fields:
+          - "source_language"
+          - "target_language"
+          - "content_type"
+      schema:
+        fields:
+          - name: "batch_id"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Unique identifier for translation batch"
+          - name: "source_language"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Source language code"
+          - name: "target_language"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Target language code"
+          - name: "content_type"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Type of content (marketing, technical, legal, etc.)"
+          - name: "processing_time"
+            type: "FLOAT"
+            mode: "REQUIRED"
+            description: "Processing time in seconds"
+          - name: "quality_score"
+            type: "FLOAT"
+            mode: "REQUIRED"
+            description: "Translation quality score (0.0 to 1.0)"
+          - name: "timestamp"
+            type: "TIMESTAMP"
+            mode: "REQUIRED"
+            description: "Processing timestamp for partitioning"
+      labels:
+        environment: "production"
+        component: "translation-performance"
+        managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - content_analytics_dataset
+
+  # Artifact Registry Repository for Container Images
+  # Container registry for worker application images
+  worker_container_registry:
+    type: gcp-types/artifactregistry-v1:projects.locations.repositories
+    properties:
+      repositoryId: "translation-workers-${var.resource_suffix}"
+      parent: "projects/${var.project_id}/locations/${var.region}"
+      format: "DOCKER"
+      description: "Container registry for translation worker images"
+      labels:
+        environment: "production"
+        component: "container-registry"
+        managed-by: "infrastructure-manager"
+
+  # Cloud Run Worker Pool
+  # Serverless worker pool for background translation processing
+  translation_worker_pool:
+    type: gcp-types/run-v1:namespaces.workerPools
+    properties:
+      metadata:
+        name: "translation-workers-${var.resource_suffix}"
+        namespace: ${var.project_id}
+        region: ${var.region}
+        labels:
+          environment: "production"
+          component: "worker-pool"
+          managed-by: "infrastructure-manager"
+        annotations:
+          run.googleapis.com/cpu-throttling: "false"
+          run.googleapis.com/execution-environment: "gen2"
+      spec:
+        template:
+          metadata:
+            labels:
+              version: "v1"
+            annotations:
+              autoscaling.knative.dev/minScale: "${var.worker_min_instances}"
+              autoscaling.knative.dev/maxScale: "${var.worker_max_instances}"
+              run.googleapis.com/execution-environment: "gen2"
+              run.googleapis.com/cpu-throttling: "false"
+          spec:
+            serviceAccountName: ${translation_worker_service_account.email}
+            timeoutSeconds: 3600  # 1 hour timeout for long translation jobs
+            containerConcurrency: 1  # Process one message at a time
+            containers:
+              - image: "gcr.io/cloudrun/placeholder"  # Placeholder - will be updated during deployment
+                name: "translation-worker"
+                resources:
+                  limits:
+                    cpu: ${var.worker_cpu}
+                    memory: ${var.worker_memory}
+                  requests:
+                    cpu: ${var.worker_cpu}
+                    memory: ${var.worker_memory}
+                env:
+                  - name: "GOOGLE_CLOUD_PROJECT"
+                    value: ${var.project_id}
+                  - name: "GOOGLE_CLOUD_REGION"
+                    value: ${var.region}
+                  - name: "DATASET_NAME"
+                    value: ${content_analytics_dataset.datasetId}
+                  - name: "SOURCE_BUCKET"
+                    value: ${source_content_bucket.name}
+                  - name: "TRANSLATED_BUCKET"
+                    value: ${translated_content_bucket.name}
+                  - name: "MODELS_BUCKET"
+                    value: ${translation_models_bucket.name}
+                  - name: "DEFAULT_SOURCE_LANGUAGE"
+                    value: ${var.default_source_language}
+                  - name: "DEFAULT_TARGET_LANGUAGES"
+                    value: "${join(",", var.default_target_languages)}"
+                ports:
+                  - name: "http1"
+                    containerPort: 8080
+                    protocol: "TCP"
+                startupProbe:
+                  httpGet:
+                    path: "/health"
+                    port: 8080
+                  initialDelaySeconds: 10
+                  periodSeconds: 10
+                  timeoutSeconds: 5
+                  failureThreshold: 3
+                livenessProbe:
+                  httpGet:
+                    path: "/health"
+                    port: 8080
+                  initialDelaySeconds: 30
+                  periodSeconds: 30
+                  timeoutSeconds: 5
+                  failureThreshold: 3
+        pubsubSubscription: ${content_processing_subscription.name}
+        scaling:
+          minInstanceCount: ${var.worker_min_instances}
+          maxInstanceCount: ${var.worker_max_instances}
+        observability:
+          enabled: true
+    metadata:
+      dependsOn:
+        - translation_worker_service_account
+        - content_processing_subscription
+        - content_analytics_dataset
+        - source_content_bucket
+        - translated_content_bucket
+        - translation_models_bucket
+        - worker_container_registry
+
+# Output values for verification and integration
+outputs:
+  # Project and deployment information
+  project_id:
+    description: "Google Cloud project ID"
+    value: ${var.project_id}
+
+  region:
+    description: "Primary deployment region"
+    value: ${var.region}
+
+  deployment_name:
+    description: "Infrastructure Manager deployment name"
+    value: "content-optimization-system"
+
+  # Service Account information
+  worker_service_account_email:
+    description: "Email address of the translation worker service account"
+    value: ${translation_worker_service_account.email}
+
+  # Storage bucket information
+  source_bucket_name:
+    description: "Name of the source content storage bucket"
+    value: ${source_content_bucket.name}
+
+  source_bucket_url:
+    description: "URL of the source content storage bucket"
+    value: "gs://${source_content_bucket.name}"
+
+  translated_bucket_name:
+    description: "Name of the translated content storage bucket"
+    value: ${translated_content_bucket.name}
+
+  translated_bucket_url:
+    description: "URL of the translated content storage bucket"
+    value: "gs://${translated_content_bucket.name}"
+
+  models_bucket_name:
+    description: "Name of the translation models storage bucket"
+    value: ${translation_models_bucket.name}
+
+  models_bucket_url:
+    description: "URL of the translation models storage bucket"
+    value: "gs://${translation_models_bucket.name}"
+
+  # Pub/Sub information
+  processing_topic_name:
+    description: "Name of the content processing Pub/Sub topic"
+    value: ${content_processing_topic.name}
+
+  processing_subscription_name:
+    description: "Name of the content processing Pub/Sub subscription"
+    value: ${content_processing_subscription.name}
+
+  dlq_topic_name:
+    description: "Name of the dead letter queue topic"
+    value: ${content_processing_dlq_topic.name}
+
+  # BigQuery information
+  analytics_dataset_id:
+    description: "BigQuery dataset ID for content analytics"
+    value: "${var.project_id}:${content_analytics_dataset.datasetId}"
+
+  engagement_metrics_table:
+    description: "Full table ID for engagement metrics"
+    value: "${var.project_id}.${content_analytics_dataset.datasetId}.${engagement_metrics_table.tableId}"
+
+  translation_performance_table:
+    description: "Full table ID for translation performance metrics"
+    value: "${var.project_id}.${content_analytics_dataset.datasetId}.${translation_performance_table.tableId}"
+
+  # Container registry information
+  container_registry_url:
+    description: "URL of the Artifact Registry repository"
+    value: "${var.region}-docker.pkg.dev/${var.project_id}/${worker_container_registry.repositoryId}"
+
+  # Worker Pool information
+  worker_pool_name:
+    description: "Name of the Cloud Run Worker Pool"
+    value: ${translation_worker_pool.metadata.name}
+
+  worker_pool_url:
+    description: "URL of the Cloud Run Worker Pool"
+    value: "https://console.cloud.google.com/run/workers/detail/${var.region}/${translation_worker_pool.metadata.name}?project=${var.project_id}"
+
+  # Configuration information
+  worker_configuration:
+    description: "Worker pool configuration summary"
+    value:
+      min_instances: ${var.worker_min_instances}
+      max_instances: ${var.worker_max_instances}
+      cpu: ${var.worker_cpu}
+      memory: ${var.worker_memory}
+      subscription: ${content_processing_subscription.name}
+
+  # Quick start commands
+  upload_content_command:
+    description: "Command to upload content to source bucket"
+    value: "gsutil cp YOUR_CONTENT_FILE gs://${source_content_bucket.name}/"
+
+  trigger_translation_command:
+    description: "Command to trigger translation processing"
+    value: "gcloud pubsub topics publish ${content_processing_topic.name} --message='{\"content_id\":\"YOUR_CONTENT_ID\",\"source_language\":\"en\",\"target_languages\":[\"es\",\"fr\"],\"source_uri\":\"gs://${source_content_bucket.name}/YOUR_FILE\",\"output_uri_prefix\":\"gs://${translated_content_bucket.name}/output/\"}'"
+
+  analytics_query_command:
+    description: "Command to query engagement analytics"
+    value: "bq query --use_legacy_sql=false 'SELECT language, AVG(engagement_score) as avg_engagement FROM \\`${var.project_id}.${content_analytics_dataset.datasetId}.engagement_metrics\\` GROUP BY language ORDER BY avg_engagement DESC'"
+
+# Deployment metadata
+metadata:
+  version: "1.0"
+  created_by: "infrastructure-manager"
+  description: "Complete multi-language content optimization system with Translation Advanced and Worker Pools"
+  tags:
+    - "translation"
+    - "serverless"
+    - "content-optimization"
+    - "worker-pools"
+    - "batch-processing"
+    - "analytics"
+  documentation_url: "https://cloud.google.com/translate/docs"
+  support_level: "production"
+  estimated_monthly_cost: "50-500 USD depending on usage"

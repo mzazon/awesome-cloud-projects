@@ -1,0 +1,979 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Computer Vision Solutions with Amazon Rekognition - Automated image analysis system
+  for face detection, object recognition, text extraction, and content moderation.
+  This template creates S3 buckets, IAM roles, Lambda functions, DynamoDB tables,
+  and Rekognition face collections for a complete computer vision pipeline.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "Rekognition Configuration"
+        Parameters:
+          - FaceCollectionName
+          - MinConfidenceLevel
+          - MaxLabels
+      - Label:
+          default: "S3 Configuration"
+        Parameters:
+          - EnableVersioning
+          - EnableEncryption
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaTimeout
+          - LambdaMemorySize
+    ParameterLabels:
+      Environment:
+        default: "Deployment Environment"
+      ProjectName:
+        default: "Project Name"
+      FaceCollectionName:
+        default: "Face Collection Name"
+      MinConfidenceLevel:
+        default: "Minimum Confidence Level"
+      MaxLabels:
+        default: "Maximum Labels per Image"
+      EnableVersioning:
+        default: "Enable S3 Versioning"
+      EnableEncryption:
+        default: "Enable S3 Encryption"
+      LambdaTimeout:
+        default: "Lambda Function Timeout"
+      LambdaMemorySize:
+        default: "Lambda Memory Size"
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    Description: Environment name for resource tagging and naming
+    
+  ProjectName:
+    Type: String
+    Default: computer-vision-demo
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+    MinLength: 3
+    MaxLength: 30
+    Description: Project name used for resource naming and tagging
+    
+  FaceCollectionName:
+    Type: String
+    Default: face-collection
+    AllowedPattern: '^[a-zA-Z0-9_.\-]+$'
+    ConstraintDescription: Must contain only alphanumeric characters, underscores, periods, and hyphens
+    MinLength: 1
+    MaxLength: 255
+    Description: Name for the Rekognition face collection (will be prefixed with project name)
+    
+  MinConfidenceLevel:
+    Type: Number
+    Default: 75
+    MinValue: 0
+    MaxValue: 100
+    Description: Minimum confidence level for Rekognition analysis (0-100)
+    
+  MaxLabels:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 1000
+    Description: Maximum number of labels to return from object detection
+    
+  EnableVersioning:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable versioning on S3 buckets
+    
+  EnableEncryption:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable server-side encryption on S3 buckets
+    
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 3
+    MaxValue: 900
+    Description: Lambda function timeout in seconds
+    
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    AllowedValues: [128, 256, 512, 1024, 1536, 2048, 3008]
+    Description: Lambda function memory size in MB
+
+Conditions:
+  EnableS3Versioning: !Equals [!Ref EnableVersioning, 'true']
+  EnableS3Encryption: !Equals [!Ref EnableEncryption, 'true']
+  IsProdEnvironment: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # ============================================================================
+  # S3 BUCKETS
+  # ============================================================================
+  
+  # Primary bucket for storing uploaded images
+  ImageStorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-images-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: !If [EnableS3Versioning, 'Enabled', 'Suspended']
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [EnableS3Encryption, 'AES256', !Ref 'AWS::NoValue']
+            BucketKeyEnabled: !If [EnableS3Encryption, true, !Ref 'AWS::NoValue']
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              Days: 30
+              StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: !If [IsProdEnvironment, 'Enabled', 'Disabled']
+            Transition:
+              Days: 90
+              StorageClass: GLACIER
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ImageProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: images/
+                  - Name: suffix
+                    Value: .jpg
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ImageProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: images/
+                  - Name: suffix
+                    Value: .png
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ImageProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: images/
+                  - Name: suffix
+                    Value: .jpeg
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Image storage for computer vision analysis
+        - Key: CostCenter
+          Value: ML-Operations
+
+  # Bucket for storing analysis results and metadata
+  ResultsStorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-results-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: !If [EnableS3Versioning, 'Enabled', 'Suspended']
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [EnableS3Encryption, 'AES256', !Ref 'AWS::NoValue']
+            BucketKeyEnabled: !If [EnableS3Encryption, true, !Ref 'AWS::NoValue']
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: ArchiveResults
+            Status: !If [IsProdEnvironment, 'Enabled', 'Disabled']
+            Transition:
+              Days: 365
+              StorageClass: GLACIER
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Analysis results storage
+        - Key: CostCenter
+          Value: ML-Operations
+
+  # ============================================================================
+  # DYNAMODB TABLES
+  # ============================================================================
+  
+  # Table for storing image analysis metadata and results
+  ImageAnalysisTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-image-analysis-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: image_id
+          AttributeType: S
+        - AttributeName: created_timestamp
+          AttributeType: S
+        - AttributeName: analysis_type
+          AttributeType: S
+      KeySchema:
+        - AttributeName: image_id
+          KeyType: HASH
+        - AttributeName: created_timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: AnalysisTypeIndex
+          KeySchema:
+            - AttributeName: analysis_type
+              KeyType: HASH
+            - AttributeName: created_timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProdEnvironment, true, false]
+      SSESpecification:
+        SSEEnabled: !If [EnableS3Encryption, true, false]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Image analysis metadata storage
+        - Key: CostCenter
+          Value: ML-Operations
+
+  # Table for storing face collection metadata and search results
+  FaceMetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-face-metadata-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: face_id
+          AttributeType: S
+        - AttributeName: external_image_id
+          AttributeType: S
+        - AttributeName: collection_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: face_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ExternalImageIdIndex
+          KeySchema:
+            - AttributeName: external_image_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: CollectionIdIndex
+          KeySchema:
+            - AttributeName: collection_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProdEnvironment, true, false]
+      SSESpecification:
+        SSEEnabled: !If [EnableS3Encryption, true, false]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Face metadata and search results
+        - Key: CostCenter
+          Value: ML-Operations
+
+  # ============================================================================
+  # IAM ROLES AND POLICIES
+  # ============================================================================
+  
+  # Execution role for Lambda functions with comprehensive permissions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RekognitionFullAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rekognition:*
+                Resource: '*'
+        - PolicyName: S3BucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${ImageStorageBucket}/*'
+                  - !Sub '${ResultsStorageBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !GetAtt ImageStorageBucket.Arn
+                  - !GetAtt ResultsStorageBucket.Arn
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt ImageAnalysisTable.Arn
+                  - !GetAtt FaceMetadataTable.Arn
+                  - !Sub '${ImageAnalysisTable.Arn}/index/*'
+                  - !Sub '${FaceMetadataTable.Arn}/index/*'
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Lambda execution role for computer vision functions
+
+  # ============================================================================
+  # LAMBDA FUNCTIONS
+  # ============================================================================
+  
+  # Main image processing Lambda function
+  ImageProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-image-processor-${Environment}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          FACE_COLLECTION_ID: !Sub '${ProjectName}-${FaceCollectionName}-${Environment}'
+          RESULTS_BUCKET: !Ref ResultsStorageBucket
+          IMAGE_ANALYSIS_TABLE: !Ref ImageAnalysisTable
+          FACE_METADATA_TABLE: !Ref FaceMetadataTable
+          MIN_CONFIDENCE: !Ref MinConfidenceLevel
+          MAX_LABELS: !Ref MaxLabels
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          from datetime import datetime
+          from urllib.parse import unquote_plus
+          import logging
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize AWS clients
+          rekognition = boto3.client('rekognition')
+          s3 = boto3.client('s3')
+          dynamodb = boto3.resource('dynamodb')
+
+          # Environment variables
+          FACE_COLLECTION_ID = os.environ['FACE_COLLECTION_ID']
+          RESULTS_BUCKET = os.environ['RESULTS_BUCKET']
+          IMAGE_ANALYSIS_TABLE = os.environ['IMAGE_ANALYSIS_TABLE']
+          FACE_METADATA_TABLE = os.environ['FACE_METADATA_TABLE']
+          MIN_CONFIDENCE = float(os.environ['MIN_CONFIDENCE'])
+          MAX_LABELS = int(os.environ['MAX_LABELS'])
+
+          def lambda_handler(event, context):
+              """
+              Main Lambda handler for processing uploaded images with Rekognition
+              """
+              try:
+                  # Parse S3 event
+                  records = event.get('Records', [])
+                  
+                  results = []
+                  for record in records:
+                      if record['eventSource'] == 'aws:s3':
+                          bucket_name = record['s3']['bucket']['name']
+                          object_key = unquote_plus(record['s3']['object']['key'])
+                          
+                          logger.info(f"Processing image: s3://{bucket_name}/{object_key}")
+                          
+                          # Process the image
+                          result = process_image(bucket_name, object_key)
+                          results.append(result)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Successfully processed {len(results)} images',
+                          'results': results
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing images: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+
+          def process_image(bucket_name, object_key):
+              """
+              Process a single image with comprehensive Rekognition analysis
+              """
+              image_id = str(uuid.uuid4())
+              timestamp = datetime.utcnow().isoformat()
+              
+              image_spec = {
+                  'S3Object': {
+                      'Bucket': bucket_name,
+                      'Name': object_key
+                  }
+              }
+              
+              analysis_results = {
+                  'image_id': image_id,
+                  'image_location': f's3://{bucket_name}/{object_key}',
+                  'timestamp': timestamp,
+                  'analyses': {}
+              }
+              
+              try:
+                  # Face Detection
+                  face_response = rekognition.detect_faces(
+                      Image=image_spec,
+                      Attributes=['ALL']
+                  )
+                  analysis_results['analyses']['faces'] = {
+                      'count': len(face_response['FaceDetails']),
+                      'details': face_response['FaceDetails']
+                  }
+                  
+                  # Object and Scene Detection
+                  label_response = rekognition.detect_labels(
+                      Image=image_spec,
+                      MaxLabels=MAX_LABELS,
+                      MinConfidence=MIN_CONFIDENCE
+                  )
+                  analysis_results['analyses']['objects'] = {
+                      'count': len(label_response['Labels']),
+                      'labels': label_response['Labels']
+                  }
+                  
+                  # Text Detection
+                  text_response = rekognition.detect_text(Image=image_spec)
+                  text_lines = [t for t in text_response['TextDetections'] if t['Type'] == 'LINE']
+                  analysis_results['analyses']['text'] = {
+                      'count': len(text_lines),
+                      'lines': text_lines
+                  }
+                  
+                  # Content Moderation
+                  moderation_response = rekognition.detect_moderation_labels(
+                      Image=image_spec,
+                      MinConfidence=MIN_CONFIDENCE
+                  )
+                  analysis_results['analyses']['moderation'] = {
+                      'inappropriate_content': len(moderation_response['ModerationLabels']) > 0,
+                      'labels': moderation_response['ModerationLabels']
+                  }
+                  
+                  # Index faces if detected
+                  if face_response['FaceDetails']:
+                      try:
+                          index_response = rekognition.index_faces(
+                              CollectionId=FACE_COLLECTION_ID,
+                              Image=image_spec,
+                              ExternalImageId=image_id,
+                              DetectionAttributes=['ALL']
+                          )
+                          analysis_results['analyses']['face_indexing'] = {
+                              'indexed_faces': len(index_response['FaceRecords']),
+                              'face_records': index_response['FaceRecords']
+                          }
+                          
+                          # Store face metadata in DynamoDB
+                          store_face_metadata(index_response['FaceRecords'], image_id)
+                          
+                      except Exception as e:
+                          logger.warning(f"Face indexing failed: {str(e)}")
+                          analysis_results['analyses']['face_indexing'] = {'error': str(e)}
+                  
+                  # Store results in S3 and DynamoDB
+                  store_analysis_results(analysis_results)
+                  
+                  logger.info(f"Successfully processed image {image_id}")
+                  return analysis_results
+                  
+              except Exception as e:
+                  logger.error(f"Error processing image {object_key}: {str(e)}")
+                  analysis_results['error'] = str(e)
+                  return analysis_results
+
+          def store_analysis_results(results):
+              """
+              Store analysis results in S3 and DynamoDB
+              """
+              try:
+                  # Store detailed results in S3
+                  results_key = f"analysis/{results['image_id']}.json"
+                  s3.put_object(
+                      Bucket=RESULTS_BUCKET,
+                      Key=results_key,
+                      Body=json.dumps(results, default=str),
+                      ContentType='application/json'
+                  )
+                  
+                  # Store metadata in DynamoDB
+                  table = dynamodb.Table(IMAGE_ANALYSIS_TABLE)
+                  
+                  # Main record
+                  table.put_item(Item={
+                      'image_id': results['image_id'],
+                      'created_timestamp': results['timestamp'],
+                      'analysis_type': 'comprehensive',
+                      'image_location': results['image_location'],
+                      'results_location': f's3://{RESULTS_BUCKET}/{results_key}',
+                      'face_count': results['analyses'].get('faces', {}).get('count', 0),
+                      'object_count': results['analyses'].get('objects', {}).get('count', 0),
+                      'text_count': results['analyses'].get('text', {}).get('count', 0),
+                      'inappropriate_content': results['analyses'].get('moderation', {}).get('inappropriate_content', False),
+                      'status': 'completed' if 'error' not in results else 'failed'
+                  })
+                  
+                  logger.info(f"Stored analysis results for {results['image_id']}")
+                  
+              except Exception as e:
+                  logger.error(f"Error storing results: {str(e)}")
+
+          def store_face_metadata(face_records, image_id):
+              """
+              Store face metadata in DynamoDB
+              """
+              try:
+                  table = dynamodb.Table(FACE_METADATA_TABLE)
+                  
+                  for record in face_records:
+                      face = record['Face']
+                      table.put_item(Item={
+                          'face_id': face['FaceId'],
+                          'external_image_id': face['ExternalImageId'],
+                          'collection_id': FACE_COLLECTION_ID,
+                          'image_id': image_id,
+                          'confidence': str(face['Confidence']),
+                          'created_timestamp': datetime.utcnow().isoformat(),
+                          'bounding_box': face['BoundingBox']
+                      })
+                  
+                  logger.info(f"Stored metadata for {len(face_records)} faces")
+                  
+              except Exception as e:
+                  logger.error(f"Error storing face metadata: {str(e)}")
+      ReservedConcurrencyLimit: 10
+      DeadLetterQueue:
+        TargetArn: !GetAtt ImageProcessorDLQ.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Main image processing function
+
+  # Dead Letter Queue for failed Lambda invocations
+  ImageProcessorDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-image-processor-dlq-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeoutSeconds: 300
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Dead letter queue for image processor
+
+  # Lambda permission for S3 to invoke the function
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ImageProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !GetAtt ImageStorageBucket.Arn
+
+  # ============================================================================
+  # CLOUDWATCH RESOURCES
+  # ============================================================================
+  
+  # Log group for Lambda function with retention policy
+  ImageProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ImageProcessorFunction}'
+      RetentionInDays: !If [IsProdEnvironment, 30, 7]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarm for Lambda errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors-${Environment}'
+      AlarmDescription: Monitor Lambda function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ImageProcessorFunction
+      AlarmActions:
+        - !Ref SNSAlarmTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for Lambda duration
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-duration-${Environment}'
+      AlarmDescription: Monitor Lambda function duration
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref LambdaTimeout
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ImageProcessorFunction
+      AlarmActions:
+        - !Ref SNSAlarmTopic
+      TreatMissingData: notBreaching
+
+  # ============================================================================
+  # SNS TOPIC FOR NOTIFICATIONS
+  # ============================================================================
+  
+  # SNS topic for system alerts and notifications
+  SNSAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-alerts-${Environment}'
+      DisplayName: Computer Vision System Alerts
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # CUSTOM RESOURCES
+  # ============================================================================
+  
+  # Custom resource to create Rekognition face collection
+  CreateFaceCollectionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-create-face-collection-${Environment}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          rekognition = boto3.client('rekognition')
+
+          def lambda_handler(event, context):
+              try:
+                  collection_id = event['ResourceProperties']['CollectionId']
+                  request_type = event['RequestType']
+                  
+                  if request_type == 'Create':
+                      logger.info(f"Creating face collection: {collection_id}")
+                      
+                      try:
+                          response = rekognition.create_collection(CollectionId=collection_id)
+                          logger.info(f"Face collection created: {response['CollectionArn']}")
+                          
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                              'CollectionId': collection_id,
+                              'CollectionArn': response['CollectionArn']
+                          })
+                      except rekognition.exceptions.ResourceAlreadyExistsException:
+                          logger.info(f"Face collection {collection_id} already exists")
+                          # Get existing collection details
+                          response = rekognition.describe_collection(CollectionId=collection_id)
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                              'CollectionId': collection_id,
+                              'CollectionArn': response['CollectionARN']
+                          })
+                  
+                  elif request_type == 'Delete':
+                      logger.info(f"Deleting face collection: {collection_id}")
+                      
+                      try:
+                          rekognition.delete_collection(CollectionId=collection_id)
+                          logger.info(f"Face collection deleted: {collection_id}")
+                      except rekognition.exceptions.ResourceNotFoundException:
+                          logger.info(f"Face collection {collection_id} not found, assuming already deleted")
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  
+                  else:  # Update
+                      logger.info(f"Update request for face collection: {collection_id}")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'CollectionId': collection_id
+                      })
+                      
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  # Custom resource to manage the face collection
+  FaceCollection:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt CreateFaceCollectionFunction.Arn
+      CollectionId: !Sub '${ProjectName}-${FaceCollectionName}-${Environment}'
+
+Outputs:
+  # ============================================================================
+  # S3 BUCKET OUTPUTS
+  # ============================================================================
+  
+  ImageStorageBucketName:
+    Description: Name of the S3 bucket for storing images
+    Value: !Ref ImageStorageBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageStorageBucket'
+
+  ImageStorageBucketArn:
+    Description: ARN of the S3 bucket for storing images
+    Value: !GetAtt ImageStorageBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageStorageBucketArn'
+
+  ResultsStorageBucketName:
+    Description: Name of the S3 bucket for storing analysis results
+    Value: !Ref ResultsStorageBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ResultsStorageBucket'
+
+  ResultsStorageBucketArn:
+    Description: ARN of the S3 bucket for storing analysis results
+    Value: !GetAtt ResultsStorageBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ResultsStorageBucketArn'
+
+  # ============================================================================
+  # DYNAMODB TABLE OUTPUTS
+  # ============================================================================
+  
+  ImageAnalysisTableName:
+    Description: Name of the DynamoDB table for image analysis metadata
+    Value: !Ref ImageAnalysisTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageAnalysisTable'
+
+  ImageAnalysisTableArn:
+    Description: ARN of the DynamoDB table for image analysis metadata
+    Value: !GetAtt ImageAnalysisTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageAnalysisTableArn'
+
+  FaceMetadataTableName:
+    Description: Name of the DynamoDB table for face metadata
+    Value: !Ref FaceMetadataTable
+    Export:
+      Name: !Sub '${AWS::StackName}-FaceMetadataTable'
+
+  FaceMetadataTableArn:
+    Description: ARN of the DynamoDB table for face metadata
+    Value: !GetAtt FaceMetadataTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FaceMetadataTableArn'
+
+  # ============================================================================
+  # LAMBDA FUNCTION OUTPUTS
+  # ============================================================================
+  
+  ImageProcessorFunctionName:
+    Description: Name of the Lambda function for image processing
+    Value: !Ref ImageProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageProcessorFunction'
+
+  ImageProcessorFunctionArn:
+    Description: ARN of the Lambda function for image processing
+    Value: !GetAtt ImageProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageProcessorFunctionArn'
+
+  # ============================================================================
+  # REKOGNITION OUTPUTS
+  # ============================================================================
+  
+  FaceCollectionId:
+    Description: ID of the Rekognition face collection
+    Value: !GetAtt FaceCollection.CollectionId
+    Export:
+      Name: !Sub '${AWS::StackName}-FaceCollectionId'
+
+  FaceCollectionArn:
+    Description: ARN of the Rekognition face collection
+    Value: !GetAtt FaceCollection.CollectionArn
+    Export:
+      Name: !Sub '${AWS::StackName}-FaceCollectionArn'
+
+  # ============================================================================
+  # IAM ROLE OUTPUTS
+  # ============================================================================
+  
+  LambdaExecutionRoleName:
+    Description: Name of the Lambda execution role
+    Value: !Ref LambdaExecutionRole
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRole'
+
+  LambdaExecutionRoleArn:
+    Description: ARN of the Lambda execution role
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  # ============================================================================
+  # MONITORING OUTPUTS
+  # ============================================================================
+  
+  SNSAlarmTopicArn:
+    Description: ARN of the SNS topic for system alerts
+    Value: !Ref SNSAlarmTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSAlarmTopic'
+
+  # ============================================================================
+  # USAGE INSTRUCTIONS
+  # ============================================================================
+  
+  UploadCommand:
+    Description: AWS CLI command to upload images for processing
+    Value: !Sub 'aws s3 cp your-image.jpg s3://${ImageStorageBucket}/images/'
+
+  ViewResultsCommand:
+    Description: AWS CLI command to view analysis results
+    Value: !Sub 'aws s3 ls s3://${ResultsStorageBucket}/analysis/'
+
+  QueryAnalysisCommand:
+    Description: AWS CLI command to query analysis metadata
+    Value: !Sub 'aws dynamodb scan --table-name ${ImageAnalysisTable} --region ${AWS::Region}'

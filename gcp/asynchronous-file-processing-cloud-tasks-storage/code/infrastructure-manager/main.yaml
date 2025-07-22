@@ -1,0 +1,738 @@
+# Google Cloud Infrastructure Manager configuration for Asynchronous File Processing
+# This configuration deploys a complete serverless file processing system using:
+# - Cloud Storage for file uploads and results
+# - Cloud Tasks for reliable task queuing
+# - Cloud Pub/Sub for event-driven processing
+# - Cloud Run for containerized processing services
+# - IAM for secure service-to-service communication
+
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: blueprints.cloud.google.com/v1alpha1
+kind: Blueprint
+metadata:
+  name: asynchronous-file-processing-blueprint
+  description: "Asynchronous File Processing Workflows with Cloud Tasks and Cloud Storage"
+spec:
+  # Input variables for customization
+  variables:
+    - name: project_id
+      type: string
+      description: "Google Cloud Project ID"
+      required: true
+    - name: region
+      type: string
+      description: "Region for resource deployment"
+      default: "us-central1"
+    - name: zone
+      type: string
+      description: "Zone for resource deployment"
+      default: "us-central1-a"
+    - name: unique_suffix
+      type: string
+      description: "Unique suffix for resource names"
+      default: "dev"
+    - name: environment
+      type: string
+      description: "Environment name (dev, staging, prod)"
+      default: "dev"
+    - name: container_image_tag
+      type: string
+      description: "Container image tag for Cloud Run services"
+      default: "latest"
+    - name: upload_bucket_location
+      type: string
+      description: "Location for the upload bucket"
+      default: "US"
+    - name: results_bucket_location
+      type: string
+      description: "Location for the results bucket"
+      default: "US"
+    - name: max_task_dispatches_per_second
+      type: integer
+      description: "Maximum task dispatches per second for Cloud Tasks queue"
+      default: 10
+    - name: max_concurrent_dispatches
+      type: integer
+      description: "Maximum concurrent dispatches for Cloud Tasks queue"
+      default: 100
+    - name: max_task_attempts
+      type: integer
+      description: "Maximum retry attempts for tasks"
+      default: 3
+    - name: upload_service_memory
+      type: string
+      description: "Memory allocation for upload service"
+      default: "1Gi"
+    - name: upload_service_cpu
+      type: string
+      description: "CPU allocation for upload service"
+      default: "1000m"
+    - name: processing_service_memory
+      type: string
+      description: "Memory allocation for processing service"
+      default: "2Gi"
+    - name: processing_service_cpu
+      type: string
+      description: "CPU allocation for processing service"
+      default: "2000m"
+    - name: enable_monitoring
+      type: boolean
+      description: "Enable Cloud Monitoring for all services"
+      default: true
+    - name: enable_logging
+      type: boolean
+      description: "Enable Cloud Logging for all services"
+      default: true
+
+  # Required APIs
+  requiredApis:
+    - cloudtasks.googleapis.com
+    - storage.googleapis.com
+    - pubsub.googleapis.com
+    - run.googleapis.com
+    - cloudbuild.googleapis.com
+    - iam.googleapis.com
+    - monitoring.googleapis.com
+    - logging.googleapis.com
+    - secretmanager.googleapis.com
+
+  # Resource definitions
+  resources:
+    # ============================================================================
+    # CLOUD STORAGE RESOURCES
+    # ============================================================================
+    
+    # Upload bucket for incoming files
+    - name: upload-bucket
+      type: gcp-types/storage-v1:buckets
+      properties:
+        name: file-upload-$(var.unique_suffix)
+        location: $(var.upload_bucket_location)
+        storageClass: STANDARD
+        versioning:
+          enabled: true
+        lifecycle:
+          rule:
+            - action:
+                type: Delete
+            condition:
+              age: 30
+              numNewerVersions: 5
+        uniformBucketLevelAccess:
+          enabled: true
+        publicAccessPrevention: enforced
+        labels:
+          environment: $(var.environment)
+          component: file-processing
+          purpose: upload-storage
+      metadata:
+        dependsOn: []
+
+    # Results bucket for processed files
+    - name: results-bucket
+      type: gcp-types/storage-v1:buckets
+      properties:
+        name: file-results-$(var.unique_suffix)
+        location: $(var.results_bucket_location)
+        storageClass: STANDARD
+        versioning:
+          enabled: true
+        lifecycle:
+          rule:
+            - action:
+                type: Delete
+            condition:
+              age: 90
+              numNewerVersions: 3
+        uniformBucketLevelAccess:
+          enabled: true
+        publicAccessPrevention: enforced
+        labels:
+          environment: $(var.environment)
+          component: file-processing
+          purpose: results-storage
+      metadata:
+        dependsOn: []
+
+    # ============================================================================
+    # CLOUD PUB/SUB RESOURCES
+    # ============================================================================
+    
+    # Pub/Sub topic for file processing events
+    - name: file-processing-topic
+      type: gcp-types/pubsub-v1:projects.topics
+      properties:
+        name: projects/$(var.project_id)/topics/file-processing-$(var.unique_suffix)
+        messageStoragePolicy:
+          allowedPersistenceRegions:
+            - $(var.region)
+        labels:
+          environment: $(var.environment)
+          component: file-processing
+          purpose: event-messaging
+      metadata:
+        dependsOn: []
+
+    # Pub/Sub subscription for processing service
+    - name: file-processing-subscription
+      type: gcp-types/pubsub-v1:projects.subscriptions
+      properties:
+        name: projects/$(var.project_id)/subscriptions/file-processing-$(var.unique_suffix)-subscription
+        topic: $(ref.file-processing-topic.name)
+        ackDeadlineSeconds: 60
+        messageRetentionDuration: 604800s  # 7 days
+        retryPolicy:
+          minimumBackoff: 10s
+          maximumBackoff: 600s
+        enableMessageOrdering: false
+        labels:
+          environment: $(var.environment)
+          component: file-processing
+          purpose: event-subscription
+      metadata:
+        dependsOn:
+          - file-processing-topic
+
+    # ============================================================================
+    # CLOUD TASKS RESOURCES
+    # ============================================================================
+    
+    # Cloud Tasks queue for reliable file processing
+    - name: file-processing-queue
+      type: gcp-types/cloudtasks-v2:projects.locations.queues
+      properties:
+        name: projects/$(var.project_id)/locations/$(var.region)/queues/file-processing-queue-$(var.unique_suffix)
+        rateLimits:
+          maxDispatchesPerSecond: $(var.max_task_dispatches_per_second)
+          maxConcurrentDispatches: $(var.max_concurrent_dispatches)
+        retryConfig:
+          maxAttempts: $(var.max_task_attempts)
+          minBackoff: 2s
+          maxBackoff: 300s
+          maxDoublings: 5
+        stackdriverLoggingConfig:
+          samplingRatio: 1.0
+        labels:
+          environment: $(var.environment)
+          component: file-processing
+          purpose: task-queue
+      metadata:
+        dependsOn: []
+
+    # ============================================================================
+    # IAM SERVICE ACCOUNTS
+    # ============================================================================
+    
+    # Service account for upload service
+    - name: upload-service-account
+      type: gcp-types/iam-v1:projects.serviceAccounts
+      properties:
+        accountId: upload-service-sa-$(var.unique_suffix)
+        displayName: "Upload Service Account"
+        description: "Service account for the file upload Cloud Run service"
+        disabled: false
+      metadata:
+        dependsOn: []
+
+    # Service account for processing service
+    - name: processing-service-account
+      type: gcp-types/iam-v1:projects.serviceAccounts
+      properties:
+        accountId: processing-service-sa-$(var.unique_suffix)
+        displayName: "Processing Service Account"
+        description: "Service account for the file processing Cloud Run service"
+        disabled: false
+      metadata:
+        dependsOn: []
+
+    # ============================================================================
+    # IAM POLICY BINDINGS
+    # ============================================================================
+    
+    # Upload service permissions - Cloud Storage
+    - name: upload-service-storage-binding
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: $(var.project_id)
+        role: roles/storage.objectAdmin
+        member: serviceAccount:$(ref.upload-service-account.email)
+      metadata:
+        dependsOn:
+          - upload-service-account
+
+    # Upload service permissions - Cloud Tasks
+    - name: upload-service-tasks-binding
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: $(var.project_id)
+        role: roles/cloudtasks.enqueuer
+        member: serviceAccount:$(ref.upload-service-account.email)
+      metadata:
+        dependsOn:
+          - upload-service-account
+
+    # Processing service permissions - Cloud Storage
+    - name: processing-service-storage-binding
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: $(var.project_id)
+        role: roles/storage.objectAdmin
+        member: serviceAccount:$(ref.processing-service-account.email)
+      metadata:
+        dependsOn:
+          - processing-service-account
+
+    # Processing service permissions - Cloud Monitoring (if enabled)
+    - name: processing-service-monitoring-binding
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: $(var.project_id)
+        role: roles/monitoring.metricWriter
+        member: serviceAccount:$(ref.processing-service-account.email)
+      metadata:
+        dependsOn:
+          - processing-service-account
+
+    # Processing service permissions - Cloud Logging (if enabled)
+    - name: processing-service-logging-binding
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: $(var.project_id)
+        role: roles/logging.logWriter
+        member: serviceAccount:$(ref.processing-service-account.email)
+      metadata:
+        dependsOn:
+          - processing-service-account
+
+    # Cloud Storage service account for Pub/Sub publishing
+    - name: storage-pubsub-binding
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: $(var.project_id)
+        role: roles/pubsub.publisher
+        member: serviceAccount:service-$(var.project_id)@gs-project-accounts.iam.gserviceaccount.com
+      metadata:
+        dependsOn:
+          - file-processing-topic
+
+    # ============================================================================
+    # CLOUD RUN SERVICES
+    # ============================================================================
+    
+    # Upload service - handles file uploads and task creation
+    - name: upload-service
+      type: gcp-types/run-v1:namespaces.services
+      properties:
+        apiVersion: serving.knative.dev/v1
+        kind: Service
+        metadata:
+          name: upload-service-$(var.unique_suffix)
+          namespace: $(var.project_id)
+          region: $(var.region)
+          annotations:
+            run.googleapis.com/ingress: all
+            run.googleapis.com/execution-environment: gen2
+          labels:
+            environment: $(var.environment)
+            component: file-processing
+            purpose: upload-handler
+        spec:
+          template:
+            metadata:
+              annotations:
+                autoscaling.knative.dev/maxScale: "10"
+                autoscaling.knative.dev/minScale: "0"
+                run.googleapis.com/cpu-throttling: "false"
+                run.googleapis.com/execution-environment: gen2
+              labels:
+                environment: $(var.environment)
+                component: file-processing
+                purpose: upload-handler
+            spec:
+              serviceAccountName: $(ref.upload-service-account.email)
+              containerConcurrency: 100
+              timeoutSeconds: 300
+              containers:
+                - name: upload-service
+                  image: gcr.io/$(var.project_id)/upload-service:$(var.container_image_tag)
+                  ports:
+                    - containerPort: 8080
+                      name: http1
+                  resources:
+                    limits:
+                      cpu: $(var.upload_service_cpu)
+                      memory: $(var.upload_service_memory)
+                  env:
+                    - name: PROJECT_ID
+                      value: $(var.project_id)
+                    - name: REGION
+                      value: $(var.region)
+                    - name: UPLOAD_BUCKET
+                      value: $(ref.upload-bucket.name)
+                    - name: TASK_QUEUE
+                      value: file-processing-queue-$(var.unique_suffix)
+                    - name: PROCESSOR_URL
+                      value: "https://processing-service-$(var.unique_suffix)-hash.$(var.region).run.app/process"
+                    - name: ENVIRONMENT
+                      value: $(var.environment)
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 10
+                    timeoutSeconds: 5
+                    failureThreshold: 3
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 5
+                    periodSeconds: 5
+                    timeoutSeconds: 3
+                    failureThreshold: 3
+      metadata:
+        dependsOn:
+          - upload-service-account
+          - upload-bucket
+          - file-processing-queue
+
+    # Processing service - handles file processing tasks
+    - name: processing-service
+      type: gcp-types/run-v1:namespaces.services
+      properties:
+        apiVersion: serving.knative.dev/v1
+        kind: Service
+        metadata:
+          name: processing-service-$(var.unique_suffix)
+          namespace: $(var.project_id)
+          region: $(var.region)
+          annotations:
+            run.googleapis.com/ingress: internal
+            run.googleapis.com/execution-environment: gen2
+          labels:
+            environment: $(var.environment)
+            component: file-processing
+            purpose: file-processor
+        spec:
+          template:
+            metadata:
+              annotations:
+                autoscaling.knative.dev/maxScale: "20"
+                autoscaling.knative.dev/minScale: "0"
+                run.googleapis.com/cpu-throttling: "false"
+                run.googleapis.com/execution-environment: gen2
+              labels:
+                environment: $(var.environment)
+                component: file-processing
+                purpose: file-processor
+            spec:
+              serviceAccountName: $(ref.processing-service-account.email)
+              containerConcurrency: 50
+              timeoutSeconds: 900  # 15 minutes for processing
+              containers:
+                - name: processing-service
+                  image: gcr.io/$(var.project_id)/processing-service:$(var.container_image_tag)
+                  ports:
+                    - containerPort: 8080
+                      name: http1
+                  resources:
+                    limits:
+                      cpu: $(var.processing_service_cpu)
+                      memory: $(var.processing_service_memory)
+                  env:
+                    - name: PROJECT_ID
+                      value: $(var.project_id)
+                    - name: REGION
+                      value: $(var.region)
+                    - name: UPLOAD_BUCKET
+                      value: $(ref.upload-bucket.name)
+                    - name: RESULTS_BUCKET
+                      value: $(ref.results-bucket.name)
+                    - name: ENVIRONMENT
+                      value: $(var.environment)
+                    - name: ENABLE_MONITORING
+                      value: "$(var.enable_monitoring)"
+                    - name: ENABLE_LOGGING
+                      value: "$(var.enable_logging)"
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 10
+                    timeoutSeconds: 5
+                    failureThreshold: 3
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 5
+                    periodSeconds: 5
+                    timeoutSeconds: 3
+                    failureThreshold: 3
+      metadata:
+        dependsOn:
+          - processing-service-account
+          - upload-bucket
+          - results-bucket
+
+    # ============================================================================
+    # CLOUD STORAGE NOTIFICATIONS
+    # ============================================================================
+    
+    # Cloud Storage notification configuration for upload bucket
+    - name: upload-bucket-notification
+      type: gcp-types/storage-v1:notifications
+      properties:
+        bucket: $(ref.upload-bucket.name)
+        topic: $(ref.file-processing-topic.name)
+        payload_format: JSON_API_V1
+        event_types:
+          - OBJECT_FINALIZE
+        custom_attributes:
+          source: upload-bucket
+          environment: $(var.environment)
+      metadata:
+        dependsOn:
+          - upload-bucket
+          - file-processing-topic
+          - storage-pubsub-binding
+
+    # ============================================================================
+    # CLOUD RUN IAM POLICIES
+    # ============================================================================
+    
+    # Allow public access to upload service
+    - name: upload-service-public-access
+      type: gcp-types/run-v1:projects.locations.services.setIamPolicy
+      properties:
+        resource: projects/$(var.project_id)/locations/$(var.region)/services/upload-service-$(var.unique_suffix)
+        policy:
+          bindings:
+            - role: roles/run.invoker
+              members:
+                - allUsers
+      metadata:
+        dependsOn:
+          - upload-service
+
+    # Allow Cloud Tasks to invoke processing service
+    - name: processing-service-tasks-access
+      type: gcp-types/run-v1:projects.locations.services.setIamPolicy
+      properties:
+        resource: projects/$(var.project_id)/locations/$(var.region)/services/processing-service-$(var.unique_suffix)
+        policy:
+          bindings:
+            - role: roles/run.invoker
+              members:
+                - serviceAccount:service-$(var.project_id)@gcp-sa-cloudtasks.iam.gserviceaccount.com
+      metadata:
+        dependsOn:
+          - processing-service
+
+    # ============================================================================
+    # MONITORING AND ALERTING (Optional)
+    # ============================================================================
+    
+    # Cloud Monitoring alert policy for failed tasks
+    - name: failed-tasks-alert-policy
+      type: gcp-types/monitoring-v1:projects.alertPolicies
+      properties:
+        displayName: "File Processing Failed Tasks Alert"
+        documentation:
+          content: "Alert when file processing tasks fail repeatedly"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "High task failure rate"
+            conditionThreshold:
+              filter: 'resource.type="cloud_tasks_queue" AND resource.label.queue_id="file-processing-queue-$(var.unique_suffix)"'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 10
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+                  groupByFields:
+                    - resource.label.queue_id
+        enabled: $(var.enable_monitoring)
+        alertStrategy:
+          autoClose: 86400s  # 24 hours
+        combiner: OR
+        notificationChannels: []
+      metadata:
+        dependsOn:
+          - file-processing-queue
+
+    # Cloud Monitoring alert policy for high Cloud Storage usage
+    - name: storage-usage-alert-policy
+      type: gcp-types/monitoring-v1:projects.alertPolicies
+      properties:
+        displayName: "File Processing Storage Usage Alert"
+        documentation:
+          content: "Alert when storage usage exceeds threshold"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "High storage usage"
+            conditionThreshold:
+              filter: 'resource.type="gcs_bucket" AND (resource.label.bucket_name="$(ref.upload-bucket.name)" OR resource.label.bucket_name="$(ref.results-bucket.name)")'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 10737418240  # 10GB in bytes
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 3600s
+                  perSeriesAligner: ALIGN_MEAN
+                  crossSeriesReducer: REDUCE_SUM
+                  groupByFields:
+                    - resource.label.bucket_name
+        enabled: $(var.enable_monitoring)
+        alertStrategy:
+          autoClose: 86400s  # 24 hours
+        combiner: OR
+        notificationChannels: []
+      metadata:
+        dependsOn:
+          - upload-bucket
+          - results-bucket
+
+  # ============================================================================
+  # OUTPUTS
+  # ============================================================================
+  
+  outputs:
+    - name: upload_service_url
+      value: "https://upload-service-$(var.unique_suffix)-hash.$(var.region).run.app"
+      description: "URL of the upload service"
+    
+    - name: processing_service_url
+      value: "https://processing-service-$(var.unique_suffix)-hash.$(var.region).run.app"
+      description: "URL of the processing service (internal)"
+    
+    - name: upload_bucket_name
+      value: $(ref.upload-bucket.name)
+      description: "Name of the upload bucket"
+    
+    - name: results_bucket_name
+      value: $(ref.results-bucket.name)
+      description: "Name of the results bucket"
+    
+    - name: pubsub_topic_name
+      value: $(ref.file-processing-topic.name)
+      description: "Name of the Pub/Sub topic"
+    
+    - name: pubsub_subscription_name
+      value: $(ref.file-processing-subscription.name)
+      description: "Name of the Pub/Sub subscription"
+    
+    - name: tasks_queue_name
+      value: $(ref.file-processing-queue.name)
+      description: "Name of the Cloud Tasks queue"
+    
+    - name: upload_service_account_email
+      value: $(ref.upload-service-account.email)
+      description: "Email of the upload service account"
+    
+    - name: processing_service_account_email
+      value: $(ref.processing-service-account.email)
+      description: "Email of the processing service account"
+    
+    - name: project_id
+      value: $(var.project_id)
+      description: "Google Cloud Project ID"
+    
+    - name: region
+      value: $(var.region)
+      description: "Deployment region"
+    
+    - name: environment
+      value: $(var.environment)
+      description: "Environment name"
+
+# ============================================================================
+# DEPLOYMENT INSTRUCTIONS
+# ============================================================================
+#
+# To deploy this infrastructure:
+#
+# 1. Set up the environment:
+#    export PROJECT_ID="your-project-id"
+#    export REGION="us-central1"
+#    export UNIQUE_SUFFIX="dev"
+#
+# 2. Create the deployment:
+#    gcloud infra-manager deployments create async-file-processing \
+#      --location=$REGION \
+#      --source-blueprint=main.yaml \
+#      --input-values=project_id=$PROJECT_ID,region=$REGION,unique_suffix=$UNIQUE_SUFFIX
+#
+# 3. Apply the deployment:
+#    gcloud infra-manager deployments apply async-file-processing \
+#      --location=$REGION
+#
+# 4. Monitor the deployment:
+#    gcloud infra-manager deployments describe async-file-processing \
+#      --location=$REGION
+#
+# 5. To update the deployment:
+#    gcloud infra-manager deployments update async-file-processing \
+#      --location=$REGION \
+#      --input-values=project_id=$PROJECT_ID,region=$REGION,unique_suffix=$UNIQUE_SUFFIX
+#
+# 6. To delete the deployment:
+#    gcloud infra-manager deployments delete async-file-processing \
+#      --location=$REGION
+#
+# ============================================================================
+# CUSTOMIZATION NOTES
+# ============================================================================
+#
+# This configuration can be customized by modifying the following variables:
+#
+# - project_id: Your Google Cloud Project ID
+# - region: Target deployment region
+# - unique_suffix: Suffix for resource names (useful for multiple environments)
+# - environment: Environment name (dev, staging, prod)
+# - container_image_tag: Docker image tag for Cloud Run services
+# - max_task_dispatches_per_second: Rate limiting for Cloud Tasks
+# - max_concurrent_dispatches: Concurrency limit for Cloud Tasks
+# - upload_service_memory/cpu: Resource allocation for upload service
+# - processing_service_memory/cpu: Resource allocation for processing service
+# - enable_monitoring: Enable Cloud Monitoring features
+# - enable_logging: Enable Cloud Logging features
+#
+# ============================================================================
+# SECURITY CONSIDERATIONS
+# ============================================================================
+#
+# This configuration implements several security best practices:
+#
+# 1. Least Privilege IAM: Each service has minimal required permissions
+# 2. Service Accounts: Dedicated service accounts for each Cloud Run service
+# 3. Internal Services: Processing service is internal-only
+# 4. Uniform Bucket Access: Cloud Storage buckets use uniform bucket-level access
+# 5. Public Access Prevention: Buckets prevent public access
+# 6. Versioning: Both buckets have versioning enabled
+# 7. Lifecycle Policies: Automatic cleanup of old files
+#
+# Additional security measures to consider:
+# - Enable VPC Service Controls for additional network security
+# - Use Customer-Managed Encryption Keys (CMEK) for sensitive data
+# - Implement Cloud Armor for DDoS protection
+# - Enable audit logging for all services
+# - Set up security monitoring and alerting
+#
+# ============================================================================

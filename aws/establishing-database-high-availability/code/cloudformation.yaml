@@ -1,0 +1,792 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Multi-AZ RDS Aurora PostgreSQL cluster for high availability with automated failover, monitoring, and backup capabilities'
+
+# =========================================================================
+# METADATA
+# =========================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Database Configuration'
+        Parameters:
+          - DBClusterName
+          - MasterUsername
+          - MasterUserPassword
+          - DatabaseName
+          - EngineVersion
+      - Label:
+          default: 'Instance Configuration'
+        Parameters:
+          - DBInstanceClass
+          - NumberOfReaderInstances
+      - Label:
+          default: 'Network Configuration'
+        Parameters:
+          - VpcId
+          - SubnetIds
+          - AllowedCidrBlocks
+      - Label:
+          default: 'Backup and Maintenance'
+        Parameters:
+          - BackupRetentionPeriod
+          - PreferredBackupWindow
+          - PreferredMaintenanceWindow
+      - Label:
+          default: 'Monitoring and Alerting'
+        Parameters:
+          - EnablePerformanceInsights
+          - EnableEnhancedMonitoring
+          - SNSTopicArn
+    ParameterLabels:
+      DBClusterName:
+        default: 'Database Cluster Name'
+      MasterUsername:
+        default: 'Master Username'
+      MasterUserPassword:
+        default: 'Master Password'
+      DatabaseName:
+        default: 'Initial Database Name'
+
+# =========================================================================
+# PARAMETERS
+# =========================================================================
+Parameters:
+  DBClusterName:
+    Type: String
+    Description: 'Name for the RDS Aurora cluster'
+    Default: 'multiaz-cluster'
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+
+  MasterUsername:
+    Type: String
+    Description: 'Master username for the database'
+    Default: 'dbadmin'
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters'
+
+  MasterUserPassword:
+    Type: String
+    Description: 'Master password for the database (minimum 8 characters)'
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 128
+    AllowedPattern: '^[a-zA-Z0-9!@#$%^&*()_+=-]*$'
+    ConstraintDescription: 'Must be 8-128 characters and contain only alphanumeric and special characters'
+
+  DatabaseName:
+    Type: String
+    Description: 'Name of the initial database to create'
+    Default: 'postgres'
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters'
+
+  EngineVersion:
+    Type: String
+    Description: 'Aurora PostgreSQL engine version'
+    Default: '15.4'
+    AllowedValues:
+      - '15.4'
+      - '15.3'
+      - '14.9'
+      - '14.8'
+      - '13.13'
+      - '13.12'
+
+  DBInstanceClass:
+    Type: String
+    Description: 'Database instance class for all cluster instances'
+    Default: 'db.r6g.large'
+    AllowedValues:
+      - 'db.r6g.large'
+      - 'db.r6g.xlarge'
+      - 'db.r6g.2xlarge'
+      - 'db.r6g.4xlarge'
+      - 'db.r6g.8xlarge'
+      - 'db.r6g.12xlarge'
+      - 'db.r6g.16xlarge'
+      - 'db.r6i.large'
+      - 'db.r6i.xlarge'
+      - 'db.r6i.2xlarge'
+      - 'db.r6i.4xlarge'
+      - 'db.r6i.8xlarge'
+      - 'db.r6i.12xlarge'
+      - 'db.r6i.16xlarge'
+
+  NumberOfReaderInstances:
+    Type: Number
+    Description: 'Number of reader instances to create (0-15)'
+    Default: 2
+    MinValue: 0
+    MaxValue: 15
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC ID where the database cluster will be deployed'
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: 'List of subnet IDs across multiple AZs (minimum 2 required)'
+
+  AllowedCidrBlocks:
+    Type: CommaDelimitedList
+    Description: 'CIDR blocks allowed to access the database'
+    Default: '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'
+
+  BackupRetentionPeriod:
+    Type: Number
+    Description: 'Number of days to retain automated backups (1-35)'
+    Default: 14
+    MinValue: 1
+    MaxValue: 35
+
+  PreferredBackupWindow:
+    Type: String
+    Description: 'Preferred backup window (UTC)'
+    Default: '03:00-04:00'
+    AllowedPattern: '^([0-1][0-9]|2[0-3]):[0-5][0-9]-([0-1][0-9]|2[0-3]):[0-5][0-9]$'
+
+  PreferredMaintenanceWindow:
+    Type: String
+    Description: 'Preferred maintenance window (UTC)'
+    Default: 'sun:04:00-sun:05:00'
+    AllowedPattern: '^(mon|tue|wed|thu|fri|sat|sun):[0-2][0-9]:[0-5][0-9]-(mon|tue|wed|thu|fri|sat|sun):[0-2][0-9]:[0-5][0-9]$'
+
+  EnablePerformanceInsights:
+    Type: String
+    Description: 'Enable Performance Insights for database monitoring'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableEnhancedMonitoring:
+    Type: String
+    Description: 'Enable Enhanced Monitoring for detailed metrics'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  SNSTopicArn:
+    Type: String
+    Description: 'SNS Topic ARN for CloudWatch alarms (leave empty to create new topic)'
+    Default: ''
+
+# =========================================================================
+# CONDITIONS
+# =========================================================================
+Conditions:
+  CreateSNSTopic: !Equals [!Ref SNSTopicArn, '']
+  EnablePI: !Equals [!Ref EnablePerformanceInsights, 'true']
+  EnableEM: !Equals [!Ref EnableEnhancedMonitoring, 'true']
+  CreateReaders: !Not [!Equals [!Ref NumberOfReaderInstances, 0]]
+
+# =========================================================================
+# RESOURCES
+# =========================================================================
+Resources:
+  # -----------------------------------------------------------------------
+  # IAM ROLE FOR ENHANCED MONITORING
+  # -----------------------------------------------------------------------
+  RDSEnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Condition: EnableEM
+    Properties:
+      RoleName: !Sub '${DBClusterName}-rds-monitoring-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRDSMonitoringService
+            Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+      Tags:
+        - Key: Name
+          Value: !Sub '${DBClusterName}-rds-monitoring-role'
+        - Key: Purpose
+          Value: 'Enhanced monitoring for RDS cluster'
+
+  # -----------------------------------------------------------------------
+  # SNS TOPIC FOR ALERTS
+  # -----------------------------------------------------------------------
+  SNSAlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSNSTopic
+    Properties:
+      TopicName: !Sub '${DBClusterName}-rds-alerts'
+      DisplayName: !Sub 'RDS Alerts for ${DBClusterName}'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${DBClusterName}-rds-alerts'
+        - Key: Purpose
+          Value: 'CloudWatch alarm notifications'
+
+  # -----------------------------------------------------------------------
+  # SECURITY GROUP FOR DATABASE ACCESS
+  # -----------------------------------------------------------------------
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${DBClusterName}-database-sg'
+      GroupDescription: 'Security group for Multi-AZ RDS cluster access'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: !Select [0, !Ref AllowedCidrBlocks]
+          Description: 'PostgreSQL access from first CIDR block'
+      Tags:
+        - Key: Name
+          Value: !Sub '${DBClusterName}-database-sg'
+        - Key: Purpose
+          Value: 'Database access control'
+
+  # Additional security group rules for multiple CIDR blocks
+  DatabaseSecurityGroupIngress2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: !Not [!Equals [!Select [1, !Ref AllowedCidrBlocks], !Select [0, !Ref AllowedCidrBlocks]]]
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      CidrIp: !Select [1, !Ref AllowedCidrBlocks]
+      Description: 'PostgreSQL access from second CIDR block'
+
+  DatabaseSecurityGroupIngress3:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: !Not [!Equals [!Select [2, !Ref AllowedCidrBlocks], !Select [0, !Ref AllowedCidrBlocks]]]
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      CidrIp: !Select [2, !Ref AllowedCidrBlocks]
+      Description: 'PostgreSQL access from third CIDR block'
+
+  # -----------------------------------------------------------------------
+  # DB SUBNET GROUP
+  # -----------------------------------------------------------------------
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${DBClusterName}-subnet-group'
+      DBSubnetGroupDescription: 'Subnet group for Multi-AZ RDS cluster'
+      SubnetIds: !Ref SubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub '${DBClusterName}-subnet-group'
+        - Key: Purpose
+          Value: 'Multi-AZ database subnet group'
+
+  # -----------------------------------------------------------------------
+  # DB CLUSTER PARAMETER GROUP
+  # -----------------------------------------------------------------------
+  DBClusterParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      DBClusterParameterGroupName: !Sub '${DBClusterName}-cluster-params'
+      Description: 'Parameter group for Multi-AZ PostgreSQL cluster'
+      Family: aurora-postgresql15
+      Parameters:
+        log_statement: 'all'
+        log_min_duration_statement: '1000'
+        shared_preload_libraries: 'pg_stat_statements'
+        track_activity_query_size: '2048'
+        log_lock_waits: '1'
+        log_temp_files: '0'
+        log_checkpoints: '1'
+        log_connections: '1'
+        log_disconnections: '1'
+      Tags:
+        - Key: Name
+          Value: !Sub '${DBClusterName}-cluster-params'
+        - Key: Purpose
+          Value: 'Optimized settings for Multi-AZ cluster'
+
+  # -----------------------------------------------------------------------
+  # DB PARAMETER GROUP FOR INSTANCES
+  # -----------------------------------------------------------------------
+  DBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      DBParameterGroupName: !Sub '${DBClusterName}-instance-params'
+      Description: 'Parameter group for Multi-AZ PostgreSQL instances'
+      Family: aurora-postgresql15
+      Parameters:
+        shared_preload_libraries: 'pg_stat_statements'
+        track_io_timing: '1'
+        track_functions: 'all'
+      Tags:
+        - Key: Name
+          Value: !Sub '${DBClusterName}-instance-params'
+        - Key: Purpose
+          Value: 'Instance-level parameters for monitoring'
+
+  # -----------------------------------------------------------------------
+  # RDS AURORA CLUSTER
+  # -----------------------------------------------------------------------
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBClusterIdentifier: !Ref DBClusterName
+      Engine: aurora-postgresql
+      EngineVersion: !Ref EngineVersion
+      MasterUsername: !Ref MasterUsername
+      MasterUserPassword: !Ref MasterUserPassword
+      DatabaseName: !Ref DatabaseName
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DatabaseSecurityGroup
+      DBClusterParameterGroupName: !Ref DBClusterParameterGroup
+      BackupRetentionPeriod: !Ref BackupRetentionPeriod
+      PreferredBackupWindow: !Ref PreferredBackupWindow
+      PreferredMaintenanceWindow: !Ref PreferredMaintenanceWindow
+      StorageEncrypted: true
+      KmsKeyId: !Ref DatabaseKMSKey
+      EnableCloudwatchLogsExports:
+        - postgresql
+      DeletionProtection: true
+      Port: 5432
+      Tags:
+        - Key: Name
+          Value: !Ref DBClusterName
+        - Key: Purpose
+          Value: 'Multi-AZ high availability database cluster'
+        - Key: Environment
+          Value: 'Production'
+
+  # -----------------------------------------------------------------------
+  # KMS KEY FOR DATABASE ENCRYPTION
+  # -----------------------------------------------------------------------
+  DatabaseKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'KMS key for RDS Aurora cluster encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow RDS Service
+            Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:CreateGrant
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${DBClusterName}-encryption-key'
+        - Key: Purpose
+          Value: 'Database encryption'
+
+  DatabaseKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${DBClusterName}-database-key'
+      TargetKeyId: !Ref DatabaseKMSKey
+
+  # -----------------------------------------------------------------------
+  # WRITER INSTANCE
+  # -----------------------------------------------------------------------
+  WriterInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${DBClusterName}-writer'
+      DBClusterIdentifier: !Ref AuroraCluster
+      Engine: aurora-postgresql
+      DBInstanceClass: !Ref DBInstanceClass
+      DBParameterGroupName: !Ref DBParameterGroup
+      MonitoringInterval: !If [EnableEM, 60, 0]
+      MonitoringRoleArn: !If [EnableEM, !GetAtt RDSEnhancedMonitoringRole.Arn, !Ref 'AWS::NoValue']
+      EnablePerformanceInsights: !Ref EnablePerformanceInsights
+      PerformanceInsightsRetentionPeriod: !If [EnablePI, 7, !Ref 'AWS::NoValue']
+      PerformanceInsightsKMSKeyId: !If [EnablePI, !Ref DatabaseKMSKey, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${DBClusterName}-writer'
+        - Key: Purpose
+          Value: 'Primary writer instance'
+        - Key: Role
+          Value: 'Writer'
+
+  # -----------------------------------------------------------------------
+  # READER INSTANCES
+  # -----------------------------------------------------------------------
+  ReaderInstance1:
+    Type: AWS::RDS::DBInstance
+    Condition: CreateReaders
+    Properties:
+      DBInstanceIdentifier: !Sub '${DBClusterName}-reader-1'
+      DBClusterIdentifier: !Ref AuroraCluster
+      Engine: aurora-postgresql
+      DBInstanceClass: !Ref DBInstanceClass
+      DBParameterGroupName: !Ref DBParameterGroup
+      MonitoringInterval: !If [EnableEM, 60, 0]
+      MonitoringRoleArn: !If [EnableEM, !GetAtt RDSEnhancedMonitoringRole.Arn, !Ref 'AWS::NoValue']
+      EnablePerformanceInsights: !Ref EnablePerformanceInsights
+      PerformanceInsightsRetentionPeriod: !If [EnablePI, 7, !Ref 'AWS::NoValue']
+      PerformanceInsightsKMSKeyId: !If [EnablePI, !Ref DatabaseKMSKey, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${DBClusterName}-reader-1'
+        - Key: Purpose
+          Value: 'Read replica for high availability'
+        - Key: Role
+          Value: 'Reader'
+
+  ReaderInstance2:
+    Type: AWS::RDS::DBInstance
+    Condition: !And [CreateReaders, !Not [!Equals [!Ref NumberOfReaderInstances, 1]]]
+    Properties:
+      DBInstanceIdentifier: !Sub '${DBClusterName}-reader-2'
+      DBClusterIdentifier: !Ref AuroraCluster
+      Engine: aurora-postgresql
+      DBInstanceClass: !Ref DBInstanceClass
+      DBParameterGroupName: !Ref DBParameterGroup
+      MonitoringInterval: !If [EnableEM, 60, 0]
+      MonitoringRoleArn: !If [EnableEM, !GetAtt RDSEnhancedMonitoringRole.Arn, !Ref 'AWS::NoValue']
+      EnablePerformanceInsights: !Ref EnablePerformanceInsights
+      PerformanceInsightsRetentionPeriod: !If [EnablePI, 7, !Ref 'AWS::NoValue']
+      PerformanceInsightsKMSKeyId: !If [EnablePI, !Ref DatabaseKMSKey, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${DBClusterName}-reader-2'
+        - Key: Purpose
+          Value: 'Read replica for high availability'
+        - Key: Role
+          Value: 'Reader'
+
+  # -----------------------------------------------------------------------
+  # CLOUDWATCH ALARMS
+  # -----------------------------------------------------------------------
+  CPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${DBClusterName}-high-cpu'
+      AlarmDescription: 'High CPU utilization on Aurora cluster'
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref AuroraCluster
+      AlarmActions:
+        - !If [CreateSNSTopic, !Ref SNSAlarmTopic, !Ref SNSTopicArn]
+      OKActions:
+        - !If [CreateSNSTopic, !Ref SNSAlarmTopic, !Ref SNSTopicArn]
+      TreatMissingData: notBreaching
+
+  DatabaseConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${DBClusterName}-high-connections'
+      AlarmDescription: 'High number of database connections'
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref AuroraCluster
+      AlarmActions:
+        - !If [CreateSNSTopic, !Ref SNSAlarmTopic, !Ref SNSTopicArn]
+      OKActions:
+        - !If [CreateSNSTopic, !Ref SNSAlarmTopic, !Ref SNSTopicArn]
+      TreatMissingData: notBreaching
+
+  FreeableMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${DBClusterName}-low-memory'
+      AlarmDescription: 'Low freeable memory on Aurora cluster'
+      MetricName: FreeableMemory
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 536870912  # 512 MB in bytes
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref AuroraCluster
+      AlarmActions:
+        - !If [CreateSNSTopic, !Ref SNSAlarmTopic, !Ref SNSTopicArn]
+      OKActions:
+        - !If [CreateSNSTopic, !Ref SNSAlarmTopic, !Ref SNSTopicArn]
+      TreatMissingData: notBreaching
+
+  # -----------------------------------------------------------------------
+  # SYSTEMS MANAGER PARAMETERS
+  # -----------------------------------------------------------------------
+  WriterEndpointParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/rds/multiaz/${DBClusterName}/writer-endpoint'
+      Type: String
+      Value: !GetAtt AuroraCluster.Endpoint.Address
+      Description: 'Writer endpoint for Aurora cluster'
+      Tags:
+        Name: !Sub '${DBClusterName}-writer-endpoint'
+        Purpose: 'Database connection string'
+
+  ReaderEndpointParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/rds/multiaz/${DBClusterName}/reader-endpoint'
+      Type: String
+      Value: !GetAtt AuroraCluster.ReadEndpoint.Address
+      Description: 'Reader endpoint for Aurora cluster'
+      Tags:
+        Name: !Sub '${DBClusterName}-reader-endpoint'
+        Purpose: 'Database connection string'
+
+  DatabaseUsernameParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/rds/multiaz/${DBClusterName}/username'
+      Type: String
+      Value: !Ref MasterUsername
+      Description: 'Database master username'
+      Tags:
+        Name: !Sub '${DBClusterName}-username'
+        Purpose: 'Database credentials'
+
+  DatabasePasswordParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/rds/multiaz/${DBClusterName}/password'
+      Type: SecureString
+      Value: !Ref MasterUserPassword
+      Description: 'Database master password'
+      Tags:
+        Name: !Sub '${DBClusterName}-password'
+        Purpose: 'Database credentials'
+
+  DatabasePortParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/rds/multiaz/${DBClusterName}/port'
+      Type: String
+      Value: '5432'
+      Description: 'Database port number'
+      Tags:
+        Name: !Sub '${DBClusterName}-port'
+        Purpose: 'Database connection string'
+
+  # -----------------------------------------------------------------------
+  # CLOUDWATCH DASHBOARD
+  # -----------------------------------------------------------------------
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${DBClusterName}-monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/RDS", "CPUUtilization", "DBClusterIdentifier", "${AuroraCluster}" ],
+                  [ ".", "DatabaseConnections", ".", "." ],
+                  [ ".", "FreeableMemory", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Aurora Cluster Performance Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/RDS", "ReadLatency", "DBClusterIdentifier", "${AuroraCluster}" ],
+                  [ ".", "WriteLatency", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Database Latency Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/RDS", "ReadIOPS", "DBClusterIdentifier", "${AuroraCluster}" ],
+                  [ ".", "WriteIOPS", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Database IOPS Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+# =========================================================================
+# OUTPUTS
+# =========================================================================
+Outputs:
+  ClusterIdentifier:
+    Description: 'Aurora cluster identifier'
+    Value: !Ref AuroraCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterIdentifier'
+
+  ClusterEndpoint:
+    Description: 'Aurora cluster writer endpoint'
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-WriterEndpoint'
+
+  ClusterReaderEndpoint:
+    Description: 'Aurora cluster reader endpoint'
+    Value: !GetAtt AuroraCluster.ReadEndpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-ReaderEndpoint'
+
+  ClusterPort:
+    Description: 'Aurora cluster port'
+    Value: !GetAtt AuroraCluster.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-Port'
+
+  DatabaseName:
+    Description: 'Name of the initial database'
+    Value: !Ref DatabaseName
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseName'
+
+  MasterUsername:
+    Description: 'Master username for the database'
+    Value: !Ref MasterUsername
+    Export:
+      Name: !Sub '${AWS::StackName}-MasterUsername'
+
+  SecurityGroupId:
+    Description: 'Security group ID for database access'
+    Value: !Ref DatabaseSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroupId'
+
+  SubnetGroupName:
+    Description: 'DB subnet group name'
+    Value: !Ref DBSubnetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SubnetGroupName'
+
+  KMSKeyId:
+    Description: 'KMS key ID for database encryption'
+    Value: !Ref DatabaseKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyId'
+
+  KMSKeyAlias:
+    Description: 'KMS key alias for database encryption'
+    Value: !Ref DatabaseKMSKeyAlias
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyAlias'
+
+  SNSTopicArn:
+    Description: 'SNS topic ARN for CloudWatch alarms'
+    Value: !If [CreateSNSTopic, !Ref SNSAlarmTopic, !Ref SNSTopicArn]
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  MonitoringDashboardURL:
+    Description: 'CloudWatch dashboard URL for monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${DBClusterName}-monitoring'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  ParameterStorePrefix:
+    Description: 'Systems Manager Parameter Store prefix for connection details'
+    Value: !Sub '/rds/multiaz/${DBClusterName}/'
+    Export:
+      Name: !Sub '${AWS::StackName}-ParameterStorePrefix'
+
+  WriterInstanceId:
+    Description: 'Writer DB instance identifier'
+    Value: !Ref WriterInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-WriterInstanceId'
+
+  ReaderInstance1Id:
+    Condition: CreateReaders
+    Description: 'First reader DB instance identifier'
+    Value: !Ref ReaderInstance1
+    Export:
+      Name: !Sub '${AWS::StackName}-ReaderInstance1Id'
+
+  ReaderInstance2Id:
+    Condition: !And [CreateReaders, !Not [!Equals [!Ref NumberOfReaderInstances, 1]]]
+    Description: 'Second reader DB instance identifier'
+    Value: !Ref ReaderInstance2
+    Export:
+      Name: !Sub '${AWS::StackName}-ReaderInstance2Id'
+
+  HighAvailabilityConfiguration:
+    Description: 'High availability configuration summary'
+    Value: !Sub 'Multi-AZ Aurora PostgreSQL cluster with ${NumberOfReaderInstances} reader instances, automated failover, and ${BackupRetentionPeriod}-day backup retention'
+    Export:
+      Name: !Sub '${AWS::StackName}-HAConfiguration'

@@ -1,0 +1,771 @@
+# Infrastructure Manager Configuration for Multi-Regional Energy Consumption
+# with Cloud Carbon Footprint and Smart Analytics Hub
+#
+# This configuration deploys a comprehensive carbon optimization system that:
+# - Collects carbon footprint data across multiple regions
+# - Creates Analytics Hub for data sharing and collaboration
+# - Deploys automated Cloud Functions for data processing
+# - Sets up Cloud Scheduler for regular optimization cycles
+# - Implements monitoring and alerting for carbon metrics
+# - Provides cross-regional analytics and workload optimization
+
+terraform:
+  required_version: ">= 1.0"
+  required_providers:
+    google: 
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    google-beta:
+      source: "hashicorp/google-beta" 
+      version: "~> 5.0"
+    random:
+      source: "hashicorp/random"
+      version: "~> 3.1"
+
+# Input variables for customization
+variables:
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+  
+  primary_region:
+    description: "Primary region for core services"
+    type: string
+    default: "us-central1"
+  
+  analytics_regions:
+    description: "List of regions for carbon analytics and optimization"
+    type: list(string)
+    default: ["us-central1", "europe-west1", "asia-northeast1"]
+  
+  billing_account_id:
+    description: "Billing account ID for cost tracking"
+    type: string
+    default: ""
+  
+  enable_monitoring:
+    description: "Enable comprehensive monitoring and alerting"
+    type: bool
+    default: true
+  
+  optimization_schedule:
+    description: "Cron schedule for carbon optimization (default: every 2 hours)"
+    type: string
+    default: "0 */2 * * *"
+  
+  renewable_energy_schedule:
+    description: "Cron schedule for renewable energy optimization (default: 2 PM daily)"
+    type: string
+    default: "0 14 * * *"
+
+# Generate random suffix for unique resource names
+resources:
+  random_suffix:
+    type: random_id
+    properties:
+      byte_length: 3
+
+  # Enable required Google Cloud APIs
+  carbon_footprint_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: cloudbilling.googleapis.com
+      disable_dependent_services: true
+      disable_on_destroy: false
+
+  bigquery_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: bigquery.googleapis.com
+      disable_dependent_services: true
+      disable_on_destroy: false
+
+  functions_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: cloudfunctions.googleapis.com
+      disable_dependent_services: true
+      disable_on_destroy: false
+
+  scheduler_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: cloudscheduler.googleapis.com
+      disable_dependent_services: true
+      disable_on_destroy: false
+
+  monitoring_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: monitoring.googleapis.com
+      disable_dependent_services: true
+      disable_on_destroy: false
+
+  cloudbuild_api:
+    type: google_project_service
+    properties:
+      project: ${var.project_id}
+      service: cloudbuild.googleapis.com
+      disable_dependent_services: true
+      disable_on_destroy: false
+
+  # BigQuery Dataset for Carbon Analytics
+  carbon_analytics_dataset:
+    type: google_bigquery_dataset
+    properties:
+      project: ${var.project_id}
+      dataset_id: carbon_analytics_${random_suffix.hex}
+      friendly_name: "Carbon Footprint and Energy Optimization Analytics"
+      description: "Comprehensive dataset for tracking carbon emissions, energy consumption, and workload optimization across multiple regions"
+      location: ${var.primary_region}
+      delete_contents_on_destroy: true
+      
+      # Data governance and security settings
+      access:
+        - role: "OWNER"
+          user_by_email: ${data.google_client_openid_userinfo.me.email}
+        - role: "READER"
+          special_group: "projectReaders"
+        - role: "WRITER"
+          special_group: "projectWriters"
+      
+      # Encryption and compliance
+      default_encryption_configuration:
+        kms_key_name: ${google_kms_crypto_key.carbon_analytics_key.id}
+      
+      labels:
+        environment: "production"
+        purpose: "carbon-optimization"
+        data-classification: "internal"
+    depends_on:
+      - bigquery_api
+
+  # Carbon Footprint Data Table
+  carbon_footprint_table:
+    type: google_bigquery_table
+    properties:
+      project: ${var.project_id}
+      dataset_id: ${carbon_analytics_dataset.dataset_id}
+      table_id: "carbon_footprint"
+      description: "Stores carbon emissions data, energy consumption metrics, and carbon intensity measurements across regions"
+      
+      # Schema definition for carbon footprint data
+      schema: |
+        [
+          {
+            "name": "timestamp",
+            "type": "TIMESTAMP",
+            "mode": "REQUIRED",
+            "description": "Timestamp of the carbon footprint measurement"
+          },
+          {
+            "name": "region",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Google Cloud region where the measurement was taken"
+          },
+          {
+            "name": "service",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Google Cloud service generating the carbon emissions"
+          },
+          {
+            "name": "carbon_emissions_kg",
+            "type": "FLOAT",
+            "mode": "REQUIRED",
+            "description": "Carbon emissions in kilograms CO2 equivalent"
+          },
+          {
+            "name": "energy_kwh",
+            "type": "FLOAT",
+            "mode": "REQUIRED",
+            "description": "Energy consumption in kilowatt hours"
+          },
+          {
+            "name": "carbon_intensity",
+            "type": "FLOAT",
+            "mode": "REQUIRED",
+            "description": "Carbon intensity factor (kg CO2e per kWh)"
+          }
+        ]
+      
+      # Partitioning for performance optimization
+      time_partitioning:
+        type: "DAY"
+        field: "timestamp"
+        expiration_ms: 7776000000  # 90 days retention
+      
+      # Clustering for query optimization
+      clustering: ["region", "service"]
+      
+      labels:
+        table-type: "carbon-data"
+        retention: "90-days"
+
+  # Workload Scheduling Decisions Table
+  workload_schedules_table:
+    type: google_bigquery_table
+    properties:
+      project: ${var.project_id}
+      dataset_id: ${carbon_analytics_dataset.dataset_id}
+      table_id: "workload_schedules"
+      description: "Tracks workload migration recommendations and scheduling decisions based on carbon optimization algorithms"
+      
+      schema: |
+        [
+          {
+            "name": "timestamp",
+            "type": "TIMESTAMP",
+            "mode": "REQUIRED",
+            "description": "When the scheduling decision was made"
+          },
+          {
+            "name": "workload_id",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Unique identifier for the workload being optimized"
+          },
+          {
+            "name": "source_region",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Current region of the workload"
+          },
+          {
+            "name": "target_region",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Recommended target region for carbon optimization"
+          },
+          {
+            "name": "carbon_savings_kg",
+            "type": "FLOAT",
+            "mode": "REQUIRED",
+            "description": "Estimated carbon savings from the migration in kg CO2e"
+          },
+          {
+            "name": "reason",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Explanation for the scheduling recommendation"
+          }
+        ]
+      
+      time_partitioning:
+        type: "DAY"
+        field: "timestamp"
+        expiration_ms: 15552000000  # 180 days retention
+      
+      clustering: ["source_region", "target_region"]
+      
+      labels:
+        table-type: "optimization-data"
+        retention: "180-days"
+
+  # Migration Log Table for Audit Trail
+  migration_log_table:
+    type: google_bigquery_table
+    properties:
+      project: ${var.project_id}
+      dataset_id: ${carbon_analytics_dataset.dataset_id}
+      table_id: "migration_log"
+      description: "Audit trail of workload migrations executed for carbon optimization"
+      
+      schema: |
+        [
+          {
+            "name": "timestamp",
+            "type": "TIMESTAMP",
+            "mode": "REQUIRED",
+            "description": "When the migration was logged"
+          },
+          {
+            "name": "workload_id",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Workload that was migrated"
+          },
+          {
+            "name": "migration_status",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Status of the migration (scheduled, in_progress, completed, failed)"
+          },
+          {
+            "name": "estimated_carbon_savings",
+            "type": "FLOAT",
+            "mode": "REQUIRED",
+            "description": "Expected carbon savings from the migration"
+          }
+        ]
+      
+      time_partitioning:
+        type: "DAY"
+        field: "timestamp"
+        expiration_ms: 31536000000  # 365 days retention
+      
+      labels:
+        table-type: "audit-data"
+        retention: "365-days"
+
+  # KMS Crypto Key for BigQuery Encryption
+  carbon_analytics_keyring:
+    type: google_kms_key_ring
+    properties:
+      project: ${var.project_id}
+      name: carbon-analytics-keyring-${random_suffix.hex}
+      location: ${var.primary_region}
+
+  carbon_analytics_key:
+    type: google_kms_crypto_key
+    properties:
+      name: carbon-analytics-key
+      key_ring: ${carbon_analytics_keyring.id}
+      purpose: "ENCRYPT_DECRYPT"
+      
+      # Automatic key rotation for security
+      rotation_period: "7776000s"  # 90 days
+      
+      labels:
+        purpose: "bigquery-encryption"
+        environment: "production"
+
+  # Analytics Hub Data Exchange for Collaboration
+  energy_optimization_exchange:
+    type: google_bigquery_analytics_hub_data_exchange
+    properties:
+      project: ${var.project_id}
+      location: ${var.primary_region}
+      data_exchange_id: energy-optimization-exchange-${random_suffix.hex}
+      display_name: "Energy Optimization Exchange"
+      description: "Shared carbon footprint and energy optimization data for collaboration on sustainability initiatives"
+      
+      # Documentation for data consumers
+      documentation: |
+        This Analytics Hub exchange provides access to carbon footprint optimization data including:
+        - Regional carbon intensity measurements
+        - Workload optimization recommendations
+        - Energy consumption patterns
+        - Sustainability metrics and KPIs
+        
+        Data is updated every 2 hours and includes historical trends for strategic planning.
+      
+      # Icon for visual identification
+      icon: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+    depends_on:
+      - bigquery_api
+
+  # Analytics Hub Listing for Carbon Footprint Data
+  carbon_footprint_listing:
+    type: google_bigquery_analytics_hub_listing
+    properties:
+      project: ${var.project_id}
+      location: ${var.primary_region}
+      data_exchange_id: ${energy_optimization_exchange.data_exchange_id}
+      listing_id: "carbon-footprint-listing"
+      display_name: "Carbon Footprint Analytics"
+      description: "Regional carbon emissions and energy optimization data with real-time insights for sustainable workload scheduling"
+      
+      # Link to the BigQuery dataset
+      bigquery_dataset:
+        dataset: projects/${var.project_id}/datasets/${carbon_analytics_dataset.dataset_id}
+      
+      # Categories for discovery
+      categories: ["ENVIRONMENT", "ANALYTICS", "ENERGY"]
+      
+      # Documentation for data consumers
+      documentation: |
+        ## Carbon Footprint Analytics Dataset
+        
+        This dataset provides comprehensive carbon footprint and energy optimization data including:
+        
+        ### Tables
+        - **carbon_footprint**: Real-time carbon emissions and energy consumption data
+        - **workload_schedules**: Optimization recommendations for workload placement
+        - **migration_log**: Audit trail of sustainability-driven workload migrations
+        
+        ### Update Frequency
+        Data is refreshed every 2 hours with real-time carbon intensity measurements
+        
+        ### Usage Guidelines
+        - Use for sustainability reporting and carbon optimization
+        - Combine with your workload data for intelligent scheduling
+        - Follow data governance policies for external sharing
+      
+      # Publisher information
+      publisher:
+        name: "Carbon Optimization Team"
+        primary_contact: "sustainability@company.com"
+      
+      # Data source attribution
+      data_provider:
+        name: "Google Cloud Carbon Footprint"
+        primary_contact: "carbon-team@google.com"
+
+  # Cloud Storage Bucket for Function Source Code
+  function_source_bucket:
+    type: google_storage_bucket
+    properties:
+      project: ${var.project_id}
+      name: carbon-optimizer-functions-${random_suffix.hex}
+      location: ${var.primary_region}
+      force_destroy: true
+      
+      # Lifecycle management for cost optimization
+      lifecycle_rule:
+        - condition:
+            age: 30
+          action:
+            type: "Delete"
+      
+      # Security settings
+      uniform_bucket_level_access: true
+      
+      labels:
+        purpose: "function-source"
+        environment: "production"
+
+  # Cloud Function for Carbon Data Collection
+  carbon_data_collection_function:
+    type: google_cloudfunctions2_function
+    properties:
+      project: ${var.project_id}
+      name: carbon-data-collector-${random_suffix.hex}
+      location: ${var.primary_region}
+      description: "Collects and processes carbon footprint data for optimization algorithms"
+      
+      build_config:
+        runtime: "python39"
+        entry_point: "collect_carbon_data"
+        source:
+          storage_source:
+            bucket: ${function_source_bucket.name}
+            object: ${google_storage_bucket_object.carbon_function_source.name}
+      
+      service_config:
+        max_instance_count: 10
+        min_instance_count: 0
+        available_memory: "512M"
+        timeout_seconds: 540
+        max_instance_request_concurrency: 80
+        available_cpu: "1"
+        
+        # Environment variables for configuration
+        environment_variables:
+          PROJECT_ID: ${var.project_id}
+          DATASET_NAME: ${carbon_analytics_dataset.dataset_id}
+          ANALYTICS_REGIONS: ${join(",", var.analytics_regions)}
+        
+        # IAM service account for secure access
+        service_account_email: ${carbon_function_service_account.email}
+        
+        # VPC connector for enhanced security (optional)
+        vpc_connector_egress_settings: "PRIVATE_RANGES_ONLY"
+      
+      labels:
+        function-type: "carbon-collection"
+        environment: "production"
+    depends_on:
+      - functions_api
+
+  # Cloud Function for Workload Migration
+  workload_migration_function:
+    type: google_cloudfunctions2_function
+    properties:
+      project: ${var.project_id}
+      name: workload-migration-optimizer-${random_suffix.hex}
+      location: ${var.primary_region}
+      description: "Automates workload migration based on carbon optimization recommendations"
+      
+      build_config:
+        runtime: "python39"
+        entry_point: "migrate_workloads"
+        source:
+          storage_source:
+            bucket: ${function_source_bucket.name}
+            object: ${google_storage_bucket_object.migration_function_source.name}
+      
+      service_config:
+        max_instance_count: 5
+        min_instance_count: 0
+        available_memory: "512M"
+        timeout_seconds: 540
+        
+        environment_variables:
+          PROJECT_ID: ${var.project_id}
+          DATASET_NAME: ${carbon_analytics_dataset.dataset_id}
+        
+        service_account_email: ${carbon_function_service_account.email}
+      
+      # Event trigger for Pub/Sub topic
+      event_trigger:
+        trigger_region: ${var.primary_region}
+        event_type: "google.cloud.pubsub.topic.v1.messagePublished"
+        pubsub_topic: projects/${var.project_id}/topics/${carbon_optimization_topic.name}
+        retry_policy: "RETRY_POLICY_RETRY"
+      
+      labels:
+        function-type: "workload-migration"
+        environment: "production"
+
+  # Pub/Sub Topic for Carbon Optimization Events
+  carbon_optimization_topic:
+    type: google_pubsub_topic
+    properties:
+      project: ${var.project_id}
+      name: carbon-optimization-trigger-${random_suffix.hex}
+      
+      # Message retention for reliability
+      message_retention_duration: "604800s"  # 7 days
+      
+      labels:
+        purpose: "carbon-optimization"
+        environment: "production"
+
+  # Service Account for Cloud Functions
+  carbon_function_service_account:
+    type: google_service_account
+    properties:
+      project: ${var.project_id}
+      account_id: carbon-optimizer-sa-${random_suffix.hex}
+      display_name: "Carbon Optimization Functions Service Account"
+      description: "Service account for carbon footprint optimization Cloud Functions with least privilege access"
+
+  # IAM Binding for BigQuery Access
+  bigquery_data_editor_binding:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/bigquery.dataEditor"
+      member: serviceAccount:${carbon_function_service_account.email}
+
+  # IAM Binding for Monitoring Metrics
+  monitoring_writer_binding:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/monitoring.metricWriter"
+      member: serviceAccount:${carbon_function_service_account.email}
+
+  # Cloud Scheduler Jobs for Automated Optimization
+  carbon_optimization_scheduler:
+    type: google_cloud_scheduler_job
+    properties:
+      project: ${var.project_id}
+      region: ${var.primary_region}
+      name: carbon-optimizer-${random_suffix.hex}
+      description: "Automated carbon footprint optimization every 2 hours"
+      schedule: ${var.optimization_schedule}
+      time_zone: "UTC"
+      
+      # HTTP target to trigger Cloud Function
+      http_target:
+        uri: ${carbon_data_collection_function.service_config[0].uri}
+        http_method: "GET"
+        
+        # Authentication for secure invocation
+        oidc_token:
+          service_account_email: ${carbon_function_service_account.email}
+      
+      # Retry configuration for reliability
+      retry_config:
+        retry_count: 3
+        max_retry_duration: "3600s"
+        min_backoff_duration: "5s"
+        max_backoff_duration: "3600s"
+        max_doublings: 5
+    depends_on:
+      - scheduler_api
+
+  # Renewable Energy Optimization Scheduler
+  renewable_energy_scheduler:
+    type: google_cloud_scheduler_job
+    properties:
+      project: ${var.project_id}
+      region: ${var.primary_region}
+      name: renewable-energy-optimizer-${random_suffix.hex}
+      description: "Optimization during peak renewable energy hours"
+      schedule: ${var.renewable_energy_schedule}
+      time_zone: "UTC"
+      
+      http_target:
+        uri: ${carbon_data_collection_function.service_config[0].uri}
+        http_method: "GET"
+        oidc_token:
+          service_account_email: ${carbon_function_service_account.email}
+      
+      retry_config:
+        retry_count: 3
+        max_retry_duration: "3600s"
+        min_backoff_duration: "5s"
+        max_backoff_duration: "3600s"
+        max_doublings: 5
+
+  # Monitoring Resources (conditional based on enable_monitoring variable)
+  carbon_savings_metric:
+    type: google_monitoring_metric_descriptor
+    count: ${var.enable_monitoring ? 1 : 0}
+    properties:
+      project: ${var.project_id}
+      type: "custom.googleapis.com/carbon/savings_kg_per_hour"
+      metric_kind: "GAUGE"
+      value_type: "DOUBLE"
+      display_name: "Carbon Savings per Hour"
+      description: "Carbon emissions saved through workload optimization in kg CO2e per hour"
+      
+      # Labels for dimensional metrics
+      labels:
+        - key: "region"
+          value_type: "STRING"
+          description: "Google Cloud region"
+        - key: "optimization_type"
+          value_type: "STRING"
+          description: "Type of optimization performed"
+    depends_on:
+      - monitoring_api
+
+  # Alert Policy for High Carbon Intensity
+  high_carbon_alert_policy:
+    type: google_monitoring_alert_policy
+    count: ${var.enable_monitoring ? 1 : 0}
+    properties:
+      project: ${var.project_id}
+      display_name: "High Carbon Intensity Alert"
+      documentation:
+        content: |
+          This alert triggers when regional carbon intensity exceeds the threshold,
+          indicating that workload migration to lower-carbon regions should be considered.
+          
+          ## Response Actions
+          1. Review current workload distribution
+          2. Consider migrating non-critical workloads to lower-carbon regions
+          3. Analyze renewable energy availability in alternative regions
+          4. Update optimization algorithms if needed
+        mime_type: "text/markdown"
+      
+      # Condition for carbon intensity threshold
+      conditions:
+        - display_name: "Carbon intensity threshold exceeded"
+          condition_threshold:
+            filter: 'resource.type="cloud_function" AND metric.type="custom.googleapis.com/carbon/intensity"'
+            comparison: "COMPARISON_GREATER_THAN"
+            threshold_value: 0.5
+            duration: "300s"
+            
+            # Aggregation settings
+            aggregations:
+              - alignment_period: "300s"
+                per_series_aligner: "ALIGN_MEAN"
+                cross_series_reducer: "REDUCE_MAX"
+                group_by_fields: ["resource.labels.region"]
+      
+      # Combine conditions with AND logic
+      combiner: "AND"
+      enabled: true
+      
+      # Alert severity
+      severity: "WARNING"
+      
+      # Notification channels would be configured separately
+      # notification_channels: [${google_monitoring_notification_channel.email.name}]
+
+# Data sources for current user information
+data:
+  google_client_openid_userinfo:
+    me: {}
+
+# Source code for Cloud Functions stored in Cloud Storage
+  google_storage_bucket_object:
+    carbon_function_source:
+      type: google_storage_bucket_object
+      properties:
+        bucket: ${function_source_bucket.name}
+        name: "carbon-collector-source.zip"
+        content: |
+          # This would contain the actual function source code
+          # In a real deployment, this would be uploaded separately
+          # or generated from the recipe implementation steps
+          import json
+          import logging
+          from datetime import datetime
+          from google.cloud import bigquery
+          import functions_framework
+          
+          @functions_framework.http
+          def collect_carbon_data(request):
+              # Implementation from recipe steps
+              return json.dumps({'status': 'success'})
+    
+    migration_function_source:
+      type: google_storage_bucket_object
+      properties:
+        bucket: ${function_source_bucket.name}
+        name: "migration-optimizer-source.zip"
+        content: |
+          # Migration function source code
+          import json
+          import logging
+          from google.cloud import bigquery
+          import functions_framework
+          
+          @functions_framework.cloud_event
+          def migrate_workloads(cloud_event):
+              # Implementation from recipe steps
+              return json.dumps({'status': 'success'})
+
+# Outputs for integration and verification
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${var.project_id}
+  
+  carbon_analytics_dataset_id:
+    description: "BigQuery dataset ID for carbon analytics"
+    value: ${carbon_analytics_dataset.dataset_id}
+  
+  analytics_hub_exchange_id:
+    description: "Analytics Hub data exchange ID"
+    value: ${energy_optimization_exchange.data_exchange_id}
+  
+  carbon_data_function_url:
+    description: "URL for the carbon data collection Cloud Function"
+    value: ${carbon_data_collection_function.service_config[0].uri}
+  
+  optimization_topic_name:
+    description: "Pub/Sub topic name for carbon optimization events"
+    value: ${carbon_optimization_topic.name}
+  
+  primary_region:
+    description: "Primary region for core services"
+    value: ${var.primary_region}
+  
+  analytics_regions:
+    description: "List of regions configured for carbon analytics"
+    value: ${var.analytics_regions}
+  
+  function_service_account_email:
+    description: "Email of the service account used by Cloud Functions"
+    value: ${carbon_function_service_account.email}
+  
+  bigquery_tables:
+    description: "List of BigQuery tables created for carbon analytics"
+    value:
+      - "${var.project_id}.${carbon_analytics_dataset.dataset_id}.carbon_footprint"
+      - "${var.project_id}.${carbon_analytics_dataset.dataset_id}.workload_schedules"
+      - "${var.project_id}.${carbon_analytics_dataset.dataset_id}.migration_log"
+  
+  scheduler_jobs:
+    description: "List of Cloud Scheduler jobs for automated optimization"
+    value:
+      - ${carbon_optimization_scheduler.name}
+      - ${renewable_energy_scheduler.name}
+  
+  monitoring_enabled:
+    description: "Whether monitoring and alerting are enabled"
+    value: ${var.enable_monitoring}

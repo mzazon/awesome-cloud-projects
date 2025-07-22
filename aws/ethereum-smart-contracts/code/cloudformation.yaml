@@ -1,0 +1,936 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for Ethereum-compatible smart contracts with AWS Managed Blockchain'
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+
+Parameters:
+  # Infrastructure Parameters
+  ProjectName:
+    Type: String
+    Default: 'ethereum-contracts'
+    Description: 'Prefix for naming resources (lowercase alphanumeric and hyphens only)'
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+    MinLength: 3
+    MaxLength: 20
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment for deployment'
+
+  # Blockchain Parameters
+  EthereumNetwork:
+    Type: String
+    Default: 'mainnet'
+    AllowedValues: ['mainnet', 'goerli', 'sepolia']
+    Description: 'Ethereum network to connect to'
+
+  NodeInstanceType:
+    Type: String
+    Default: 'bc.t3.xlarge'
+    AllowedValues: 
+      - 'bc.t3.xlarge'
+      - 'bc.t3.2xlarge'
+      - 'bc.m5.xlarge'
+      - 'bc.m5.2xlarge'
+      - 'bc.m5.4xlarge'
+    Description: 'Instance type for Ethereum node'
+
+  # Lambda Parameters
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 30
+    MaxValue: 900
+    Description: 'Lambda function timeout in seconds'
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    MinValue: 128
+    MaxValue: 10240
+    Description: 'Lambda function memory size in MB'
+
+  # API Gateway Parameters
+  ApiGatewayStageName:
+    Type: String
+    Default: 'prod'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'API Gateway stage name'
+
+  EnableApiGatewayLogs:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable API Gateway access logs'
+
+  # S3 Parameters
+  S3BucketRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 365
+    Description: 'S3 bucket object retention period in days'
+
+  # CloudWatch Parameters
+  CloudWatchRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: 'CloudWatch logs retention period in days'
+
+  # Security Parameters
+  EnableXRayTracing:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable X-Ray tracing for Lambda functions'
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  IsMainnet: !Equals [!Ref EthereumNetwork, 'mainnet']
+  EnableApiLogs: !Equals [!Ref EnableApiGatewayLogs, 'true']
+  EnableXRay: !Equals [!Ref EnableXRayTracing, 'true']
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+
+Resources:
+  # S3 Bucket for Contract Artifacts
+  ContractArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-ethereum-artifacts-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: !Ref S3BucketRetentionDays
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3LogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ethereum-artifacts'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # S3 Bucket Policy
+  ContractArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ContractArtifactsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${ContractArtifactsBucket}/*'
+              - !GetAtt ContractArtifactsBucket.Arn
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: AllowLambdaAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt LambdaExecutionRole.Arn
+            Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+              - 's3:DeleteObject'
+            Resource: !Sub '${ContractArtifactsBucket}/*'
+
+  # CloudWatch Log Groups
+  S3LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-ethereum-artifacts'
+      RetentionInDays: !Ref CloudWatchRetentionDays
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-ethereum-contract-manager'
+      RetentionInDays: !Ref CloudWatchRetentionDays
+
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableApiLogs
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}-ethereum-api'
+      RetentionInDays: !Ref CloudWatchRetentionDays
+
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ethereum-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !If
+          - EnableXRay
+          - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+          - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: ManagedBlockchainAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'managedblockchain:*'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'ssm:GetParameter'
+                  - 'ssm:GetParameters'
+                  - 'ssm:GetParametersByPath'
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ethereum/${ProjectName}-*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*'
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                Resource: '*'
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                Resource: !Sub '${ContractArtifactsBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                Resource: !GetAtt ContractArtifactsBucket.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ethereum-lambda-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function
+  EthereumContractManagerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-ethereum-contract-manager'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref ContractArtifactsBucket
+          FUNCTION_NAME: !Sub '${ProjectName}-ethereum-contract-manager'
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+          ETHEREUM_NETWORK: !Ref EthereumNetwork
+      TracingConfig:
+        Mode: !If [EnableXRay, 'Active', 'PassThrough']
+      Code:
+        ZipFile: |
+          const Web3 = require('web3');
+          const { SSMClient, GetParameterCommand } = require('@aws-sdk/client-ssm');
+          const { S3Client, GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
+          
+          const ssmClient = new SSMClient({ region: process.env.AWS_REGION });
+          const s3Client = new S3Client({ region: process.env.AWS_REGION });
+          
+          async function getParameter(name) {
+              const command = new GetParameterCommand({ Name: name });
+              const response = await ssmClient.send(command);
+              return response.Parameter.Value;
+          }
+          
+          async function getContractArtifacts(bucket, key) {
+              const command = new GetObjectCommand({ Bucket: bucket, Key: key });
+              const response = await s3Client.send(command);
+              return JSON.parse(await response.Body.transformToString());
+          }
+          
+          exports.handler = async (event) => {
+              try {
+                  const httpEndpoint = await getParameter(`/ethereum/${process.env.FUNCTION_NAME}/http-endpoint`);
+                  const web3 = new Web3(httpEndpoint);
+                  
+                  const action = event.action;
+                  
+                  switch (action) {
+                      case 'getBlockNumber':
+                          const blockNumber = await web3.eth.getBlockNumber();
+                          return {
+                              statusCode: 200,
+                              body: JSON.stringify({ blockNumber: blockNumber.toString() })
+                          };
+                      
+                      case 'getBalance':
+                          const address = event.address;
+                          const balance = await web3.eth.getBalance(address);
+                          return {
+                              statusCode: 200,
+                              body: JSON.stringify({ 
+                                  address, 
+                                  balance: web3.utils.fromWei(balance, 'ether') + ' ETH'
+                              })
+                          };
+                      
+                      case 'deployContract':
+                          const contractData = await getContractArtifacts(
+                              process.env.BUCKET_NAME, 
+                              'contracts/SimpleToken.json'
+                          );
+                          
+                          const contract = new web3.eth.Contract(contractData.abi);
+                          const deployTx = contract.deploy({
+                              data: contractData.bytecode,
+                              arguments: [event.initialSupply || 1000000]
+                          });
+                          
+                          return {
+                              statusCode: 200,
+                              body: JSON.stringify({
+                                  message: 'Contract deployment initiated',
+                                  gasEstimate: await deployTx.estimateGas(),
+                                  data: deployTx.encodeABI()
+                              })
+                          };
+                      
+                      case 'callContract':
+                          const contractAbi = await getContractArtifacts(
+                              process.env.BUCKET_NAME, 
+                              'contracts/SimpleToken.json'
+                          );
+                          
+                          const contractInstance = new web3.eth.Contract(
+                              contractAbi.abi, 
+                              event.contractAddress
+                          );
+                          
+                          const result = await contractInstance.methods[event.method](...event.params).call();
+                          
+                          return {
+                              statusCode: 200,
+                              body: JSON.stringify({ result })
+                          };
+                      
+                      default:
+                          return {
+                              statusCode: 400,
+                              body: JSON.stringify({ error: 'Unknown action' })
+                          };
+                  }
+              } catch (error) {
+                  console.error('Error:', error);
+                  return {
+                      statusCode: 500,
+                      body: JSON.stringify({ error: error.message })
+                  };
+              }
+          };
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ethereum-contract-manager'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Layer for Node.js Dependencies
+  EthereumNodeDependenciesLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub '${ProjectName}-ethereum-node-dependencies'
+      Description: 'Node.js dependencies for Ethereum contract management'
+      Content:
+        S3Bucket: !Ref ContractArtifactsBucket
+        S3Key: 'layers/ethereum-dependencies.zip'
+      CompatibleRuntimes:
+        - nodejs18.x
+      CompatibleArchitectures:
+        - x86_64
+        - arm64
+
+  # API Gateway REST API
+  EthereumApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-ethereum-api'
+      Description: 'REST API for Ethereum smart contract interactions'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      BinaryMediaTypes:
+        - 'application/octet-stream'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ethereum-api'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # API Gateway Resource
+  EthereumApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref EthereumApi
+      ParentId: !GetAtt EthereumApi.RootResourceId
+      PathPart: 'ethereum'
+
+  # API Gateway Method
+  EthereumApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref EthereumApi
+      ResourceId: !Ref EthereumApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${EthereumContractManagerFunction.Arn}/invocations'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: false
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+
+  # API Gateway OPTIONS Method for CORS
+  EthereumApiOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref EthereumApi
+      ResourceId: !Ref EthereumApiResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+            ResponseTemplates:
+              application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: false
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+
+  # Lambda Permission for API Gateway
+  ApiGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EthereumContractManagerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${EthereumApi}/*/*'
+
+  # API Gateway Deployment
+  EthereumApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - EthereumApiMethod
+      - EthereumApiOptionsMethod
+    Properties:
+      RestApiId: !Ref EthereumApi
+      StageName: !Ref ApiGatewayStageName
+      StageDescription:
+        LoggingLevel: !If [EnableApiLogs, 'INFO', 'OFF']
+        DataTraceEnabled: !If [EnableApiLogs, true, false]
+        MetricsEnabled: true
+        ThrottlingBurstLimit: 1000
+        ThrottlingRateLimit: 500
+      DeploymentCanarySettings:
+        PercentTraffic: !If [IsProduction, 10, 100]
+        UseStageCache: false
+
+  # API Gateway Stage
+  EthereumApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref EthereumApi
+      DeploymentId: !Ref EthereumApiDeployment
+      StageName: !Ref ApiGatewayStageName
+      Description: !Sub 'Ethereum API stage for ${Environment}'
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: !If [EnableApiLogs, 'INFO', 'OFF']
+          DataTraceEnabled: !If [EnableApiLogs, true, false]
+          MetricsEnabled: true
+          ThrottlingBurstLimit: 1000
+          ThrottlingRateLimit: 500
+      AccessLogSetting:
+        DestinationArn: !If
+          - EnableApiLogs
+          - !GetAtt ApiGatewayLogGroup.Arn
+          - !Ref AWS::NoValue
+        Format: '$context.requestId $context.stage $context.resourcePath $context.httpMethod $context.status $context.error.message $context.error.messageString'
+      TracingEnabled: !If [EnableXRay, true, false]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ethereum-api-stage'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Systems Manager Parameters for Ethereum Node Endpoints
+  EthereumNodeHttpEndpointParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/ethereum/${ProjectName}-ethereum-contract-manager/http-endpoint'
+      Type: String
+      Value: 'https://ethereum-mainnet.amazonaws.com'  # Placeholder - will be updated post-deployment
+      Description: 'HTTP endpoint for Ethereum node'
+      Tags:
+        Name: !Sub '${ProjectName}-ethereum-http-endpoint'
+        Environment: !Ref Environment
+
+  EthereumNodeWebSocketEndpointParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/ethereum/${ProjectName}-ethereum-contract-manager/ws-endpoint'
+      Type: String
+      Value: 'wss://ethereum-mainnet.amazonaws.com'  # Placeholder - will be updated post-deployment
+      Description: 'WebSocket endpoint for Ethereum node'
+      Tags:
+        Name: !Sub '${ProjectName}-ethereum-ws-endpoint'
+        Environment: !Ref Environment
+
+  # CloudWatch Dashboard
+  EthereumDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-ethereum-blockchain-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${EthereumContractManagerFunction}"],
+                  [".", "Errors", ".", "."],
+                  [".", "Invocations", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Lambda Performance Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ApiGateway", "Count", "ApiName", "${EthereumApi}"],
+                  [".", "Latency", ".", "."],
+                  [".", "4XXError", ".", "."],
+                  [".", "5XXError", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "API Gateway Metrics"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${EthereumContractManagerFunction}' | fields @timestamp, @message | sort @timestamp desc | limit 100",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Logs"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-ethereum-lambda-errors'
+      AlarmDescription: 'Alarm for Lambda function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EthereumContractManagerFunction
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SNSAlarmTopic
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-ethereum-lambda-duration'
+      AlarmDescription: 'Alarm for Lambda function high duration'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 30000  # 30 seconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EthereumContractManagerFunction
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SNSAlarmTopic
+
+  ApiGateway4XXErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-ethereum-api-4xx-errors'
+      AlarmDescription: 'Alarm for API Gateway 4XX errors'
+      MetricName: 4XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref EthereumApi
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SNSAlarmTopic
+
+  ApiGateway5XXErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-ethereum-api-5xx-errors'
+      AlarmDescription: 'Alarm for API Gateway 5XX errors'
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref EthereumApi
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SNSAlarmTopic
+
+  # SNS Topic for Alarms
+  SNSAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-ethereum-alarms'
+      DisplayName: !Sub '${ProjectName} Ethereum Blockchain Alarms'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ethereum-alarms'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Topic Policy
+  SNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref SNSAlarmTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudWatchAlarmsToPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: SNS:Publish
+            Resource: !Ref SNSAlarmTopic
+
+  # WAF Web ACL for API Gateway (Production only)
+  WebACL:
+    Type: AWS::WAFv2::WebACL
+    Condition: IsProduction
+    Properties:
+      Name: !Sub '${ProjectName}-ethereum-api-waf'
+      Description: 'WAF for Ethereum API protection'
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      Rules:
+        - Name: RateLimitRule
+          Priority: 1
+          Statement:
+            RateBasedStatement:
+              Limit: 2000
+              AggregateKeyType: IP
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitRule
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CommonRuleSetMetric
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 3
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: KnownBadInputsRuleSetMetric
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${ProjectName}EthereumWebACL'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ethereum-api-waf'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # WAF Association with API Gateway
+  WebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Condition: IsProduction
+    Properties:
+      ResourceArn: !Sub 'arn:aws:apigateway:${AWS::Region}::/restapis/${EthereumApi}/stages/${ApiGatewayStageName}'
+      WebACLArn: !GetAtt WebACL.Arn
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+
+Outputs:
+  # API Gateway Information
+  ApiGatewayEndpoint:
+    Description: 'API Gateway endpoint URL'
+    Value: !Sub 'https://${EthereumApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiGatewayStageName}'
+    Export:
+      Name: !Sub '${ProjectName}-ethereum-api-endpoint'
+
+  EthereumApiEndpoint:
+    Description: 'Ethereum API endpoint URL'
+    Value: !Sub 'https://${EthereumApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiGatewayStageName}/ethereum'
+    Export:
+      Name: !Sub '${ProjectName}-ethereum-api-endpoint-full'
+
+  ApiGatewayId:
+    Description: 'API Gateway ID'
+    Value: !Ref EthereumApi
+    Export:
+      Name: !Sub '${ProjectName}-ethereum-api-id'
+
+  # Lambda Function Information
+  LambdaFunctionName:
+    Description: 'Lambda function name'
+    Value: !Ref EthereumContractManagerFunction
+    Export:
+      Name: !Sub '${ProjectName}-ethereum-lambda-function-name'
+
+  LambdaFunctionArn:
+    Description: 'Lambda function ARN'
+    Value: !GetAtt EthereumContractManagerFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-ethereum-lambda-function-arn'
+
+  # S3 Bucket Information
+  ContractArtifactsBucketName:
+    Description: 'S3 bucket name for contract artifacts'
+    Value: !Ref ContractArtifactsBucket
+    Export:
+      Name: !Sub '${ProjectName}-ethereum-artifacts-bucket'
+
+  ContractArtifactsBucketArn:
+    Description: 'S3 bucket ARN for contract artifacts'
+    Value: !GetAtt ContractArtifactsBucket.Arn
+    Export:
+      Name: !Sub '${ProjectName}-ethereum-artifacts-bucket-arn'
+
+  # IAM Role Information
+  LambdaExecutionRoleName:
+    Description: 'Lambda execution role name'
+    Value: !Ref LambdaExecutionRole
+    Export:
+      Name: !Sub '${ProjectName}-ethereum-lambda-role-name'
+
+  LambdaExecutionRoleArn:
+    Description: 'Lambda execution role ARN'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-ethereum-lambda-role-arn'
+
+  # CloudWatch Information
+  CloudWatchDashboardName:
+    Description: 'CloudWatch dashboard name'
+    Value: !Ref EthereumDashboard
+    Export:
+      Name: !Sub '${ProjectName}-ethereum-dashboard-name'
+
+  CloudWatchDashboardUrl:
+    Description: 'CloudWatch dashboard URL'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${EthereumDashboard}'
+    Export:
+      Name: !Sub '${ProjectName}-ethereum-dashboard-url'
+
+  # SNS Topic Information
+  SNSAlarmTopicArn:
+    Description: 'SNS topic ARN for alarms'
+    Value: !Ref SNSAlarmTopic
+    Export:
+      Name: !Sub '${ProjectName}-ethereum-alarm-topic-arn'
+
+  # Systems Manager Parameters
+  HttpEndpointParameter:
+    Description: 'SSM parameter name for HTTP endpoint'
+    Value: !Ref EthereumNodeHttpEndpointParameter
+    Export:
+      Name: !Sub '${ProjectName}-ethereum-http-endpoint-parameter'
+
+  WebSocketEndpointParameter:
+    Description: 'SSM parameter name for WebSocket endpoint'
+    Value: !Ref EthereumNodeWebSocketEndpointParameter
+    Export:
+      Name: !Sub '${ProjectName}-ethereum-ws-endpoint-parameter'
+
+  # WAF Information (Production only)
+  WebACLArn:
+    Condition: IsProduction
+    Description: 'WAF Web ACL ARN'
+    Value: !GetAtt WebACL.Arn
+    Export:
+      Name: !Sub '${ProjectName}-ethereum-waf-arn'
+
+  # Deployment Information
+  StackName:
+    Description: 'CloudFormation stack name'
+    Value: !Ref AWS::StackName
+    Export:
+      Name: !Sub '${ProjectName}-ethereum-stack-name'
+
+  Region:
+    Description: 'AWS region'
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub '${ProjectName}-ethereum-region'
+
+  Environment:
+    Description: 'Environment name'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${ProjectName}-ethereum-environment'
+
+  ProjectName:
+    Description: 'Project name'
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${ProjectName}-ethereum-project-name'
+
+  # Post-Deployment Instructions
+  PostDeploymentInstructions:
+    Description: 'Next steps after deployment'
+    Value: |
+      1. Create an Ethereum node using AWS Managed Blockchain
+      2. Update SSM parameters with actual node endpoints
+      3. Upload Lambda layer with Node.js dependencies
+      4. Upload contract artifacts to S3 bucket
+      5. Test the API endpoints
+      6. Configure SNS topic subscriptions for alerts
+      7. Review CloudWatch dashboard for monitoring
+
+  # Estimated Monthly Cost
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost breakdown'
+    Value: !Sub |
+      API Gateway: $3.50/million requests + $0.10/GB data transfer
+      Lambda: $0.20/million requests + $0.0000166667/GB-second
+      S3: $0.023/GB storage + $0.0004/1000 requests
+      CloudWatch: $0.50/metric + $0.03/GB ingested
+      Managed Blockchain Node (${NodeInstanceType}): $200-400/month
+      Total estimated: $300-500/month (varies by usage)

@@ -1,0 +1,590 @@
+# Infrastructure Manager Configuration for Workflow Automation with Google Workspace Flows and Service Extensions
+# This configuration deploys a complete intelligent document processing and approval workflow system
+# using Google Cloud services integrated with Google Workspace
+
+apiVersion: blueprints.cloud.google.com/v1alpha1
+kind: BlueprintMetadata
+metadata:
+  name: workflow-automation-workspace-flows
+  annotations:
+    config.kubernetes.io/local-config: "true"
+spec:
+  info:
+    title: Workflow Automation with Google Workspace Flows and Service Extensions
+    source:
+      repo: https://github.com/google-cloud-samples/recipes
+      sourceType: git
+    version: 1.0.0
+    actuationTool:
+      flavor: Terraform
+      version: ">= 1.0"
+    description: 
+      tagline: Intelligent document processing and approval workflows
+      detailed: |
+        This blueprint deploys an intelligent document processing and approval workflow system
+        that combines Google Workspace Flows for no-code automation with Google Cloud services
+        for serverless processing, AI analysis, and reliable message orchestration.
+    costEstimate:
+      description: Estimated monthly cost for moderate usage
+      currency: USD
+      baseline: 50
+      target: 150
+    cloudProducts:
+      - productId: functions
+        pageUrl: https://cloud.google.com/functions
+      - productId: pubsub
+        pageUrl: https://cloud.google.com/pubsub
+      - productId: storage
+        pageUrl: https://cloud.google.com/storage
+      - productId: monitoring
+        pageUrl: https://cloud.google.com/monitoring
+      - productId: service-extensions
+        pageUrl: https://cloud.google.com/service-extensions
+    deploymentDuration:
+      configurationSecs: 300
+      deploymentSecs: 900
+
+---
+
+# Infrastructure Manager Blueprint for Workflow Automation Solution
+apiVersion: blueprints.cloud.google.com/v1alpha1
+kind: Blueprint
+metadata:
+  name: workflow-automation-infrastructure
+spec:
+  # Input variables for the infrastructure deployment
+  variables:
+    - name: project_id
+      description: Google Cloud Project ID where resources will be created
+      type: string
+      required: true
+      validation:
+        pattern: "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+        
+    - name: region
+      description: Google Cloud region for resource deployment
+      type: string
+      default: "us-central1"
+      required: false
+      validation:
+        enum: ["us-central1", "us-east1", "us-west1", "europe-west1", "asia-southeast1"]
+        
+    - name: environment
+      description: Environment name (dev, staging, prod)
+      type: string
+      default: "dev"
+      required: false
+      validation:
+        enum: ["dev", "staging", "prod"]
+        
+    - name: resource_suffix
+      description: Unique suffix for resource names to avoid conflicts
+      type: string
+      default: ""
+      required: false
+      validation:
+        pattern: "^[a-z0-9-]*$"
+        
+    - name: enable_monitoring
+      description: Enable comprehensive monitoring and alerting
+      type: bool
+      default: true
+      required: false
+      
+    - name: retention_days
+      description: Number of days to retain workflow logs and messages
+      type: number
+      default: 30
+      required: false
+      validation:
+        minimum: 7
+        maximum: 365
+
+  # Google Cloud Storage bucket for document processing
+  resources:
+    - name: workflow-documents-bucket
+      type: gcp-types/storage-v1:bucket
+      properties:
+        name: workflow-docs-{{ .project_id }}-{{ .resource_suffix | default (randAlphaNum 6 | lower) }}
+        location: "{{ .region | upper }}"
+        storageClass: STANDARD
+        # Enable versioning for document protection and audit trail
+        versioning:
+          enabled: true
+        # Lifecycle management for cost optimization
+        lifecycle:
+          rule:
+            - action:
+                type: SetStorageClass
+                storageClass: NEARLINE
+              condition:
+                age: 30
+            - action:
+                type: SetStorageClass
+                storageClass: COLDLINE
+              condition:
+                age: 90
+            - action:
+                type: Delete
+              condition:
+                age: 2555  # 7 years retention for compliance
+        # Uniform bucket-level access for simplified security
+        iamConfiguration:
+          uniformBucketLevelAccess:
+            enabled: true
+        # CORS configuration for web-based document uploads
+        cors:
+          - origin: ["*.google.com", "*.googleusercontent.com"]
+            method: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+            responseHeader: ["Content-Type", "Authorization"]
+            maxAgeSeconds: 3600
+        # Enable audit logging for compliance
+        logging:
+          logBucket: "{{ .project_id }}-audit-logs"
+          logObjectPrefix: "workflow-documents/"
+      metadata:
+        dependsOn: []
+
+    # Pub/Sub topic for workflow event orchestration
+    - name: workflow-events-topic
+      type: gcp-types/pubsub-v1:projects.topics
+      properties:
+        topic: projects/{{ .project_id }}/topics/document-events-{{ .resource_suffix | default (randAlphaNum 6 | lower) }}
+        # Message retention and ordering configuration
+        messageRetentionDuration: "{{ .retention_days }}d"
+        # Enable message ordering for sequential workflow processing
+        enableMessageOrdering: true
+        # Schema enforcement for message validation
+        schemaSettings:
+          schema: projects/{{ .project_id }}/schemas/workflow-event-schema
+          encoding: JSON
+      metadata:
+        dependsOn: []
+
+    # Pub/Sub subscription for Cloud Functions processing
+    - name: workflow-events-subscription
+      type: gcp-types/pubsub-v1:projects.subscriptions
+      properties:
+        subscription: projects/{{ .project_id }}/subscriptions/doc-processing-sub-{{ .resource_suffix | default (randAlphaNum 6 | lower) }}
+        topic: $(ref.workflow-events-topic.name)
+        # Acknowledgment deadline for processing complex documents
+        ackDeadlineSeconds: 600
+        # Message retention for reprocessing failed workflows
+        messageRetentionDuration: "{{ .retention_days }}d"
+        # Dead letter queue configuration for failed processing
+        deadLetterPolicy:
+          deadLetterTopic: $(ref.workflow-deadletter-topic.name)
+          maxDeliveryAttempts: 5
+        # Retry policy for transient failures
+        retryPolicy:
+          minimumBackoff: "10s"
+          maximumBackoff: "600s"
+        # Enable exactly-once delivery for critical workflows
+        enableExactlyOnceDelivery: true
+      metadata:
+        dependsOn: 
+          - workflow-events-topic
+          - workflow-deadletter-topic
+
+    # Dead letter topic for failed message processing
+    - name: workflow-deadletter-topic
+      type: gcp-types/pubsub-v1:projects.topics
+      properties:
+        topic: projects/{{ .project_id }}/topics/document-events-deadletter-{{ .resource_suffix | default (randAlphaNum 6 | lower) }}
+        messageRetentionDuration: "{{ .retention_days }}d"
+      metadata:
+        dependsOn: []
+
+    # Dead letter subscription for manual error handling
+    - name: workflow-deadletter-subscription
+      type: gcp-types/pubsub-v1:projects.subscriptions
+      properties:
+        subscription: projects/{{ .project_id }}/subscriptions/doc-processing-deadletter-{{ .resource_suffix | default (randAlphaNum 6 | lower) }}
+        topic: $(ref.workflow-deadletter-topic.name)
+        ackDeadlineSeconds: 60
+        messageRetentionDuration: "{{ .retention_days }}d"
+      metadata:
+        dependsOn: 
+          - workflow-deadletter-topic
+
+    # Service account for Cloud Functions with least privilege access
+    - name: workflow-functions-service-account
+      type: gcp-types/iam-v1:projects.serviceAccounts
+      properties:
+        accountId: workflow-functions-sa-{{ .resource_suffix | default (randAlphaNum 6 | lower) }}
+        serviceAccount:
+          displayName: "Workflow Processing Functions Service Account"
+          description: "Service account for document processing Cloud Functions with minimal required permissions"
+      metadata:
+        dependsOn: []
+
+    # IAM binding for Storage access (read/write to workflow bucket)
+    - name: workflow-storage-iam-binding
+      type: gcp-types/storage-v1:buckets.iamMember
+      properties:
+        bucket: $(ref.workflow-documents-bucket.name)
+        role: roles/storage.objectAdmin
+        member: serviceAccount:$(ref.workflow-functions-service-account.email)
+      metadata:
+        dependsOn: 
+          - workflow-documents-bucket
+          - workflow-functions-service-account
+
+    # IAM binding for Pub/Sub publisher access
+    - name: workflow-pubsub-publisher-binding
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: {{ .project_id }}
+        role: roles/pubsub.publisher
+        member: serviceAccount:$(ref.workflow-functions-service-account.email)
+      metadata:
+        dependsOn: 
+          - workflow-functions-service-account
+
+    # IAM binding for Pub/Sub subscriber access
+    - name: workflow-pubsub-subscriber-binding
+      type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+      properties:
+        resource: {{ .project_id }}
+        role: roles/pubsub.subscriber
+        member: serviceAccount:$(ref.workflow-functions-service-account.email)
+      metadata:
+        dependsOn: 
+          - workflow-functions-service-account
+
+    # Cloud Function for document processing and analysis
+    - name: document-processor-function
+      type: gcp-types/cloudfunctions-v1:projects.locations.functions
+      properties:
+        location: projects/{{ .project_id }}/locations/{{ .region }}
+        sourceArchiveUrl: gs://{{ .project_id }}-function-source/document-processor.zip
+        function: doc-processor-{{ .resource_suffix | default (randAlphaNum 6 | lower) }}
+        # HTTP trigger for Google Workspace Flows integration
+        httpsTrigger:
+          securityLevel: SECURE_ALWAYS
+        # Runtime configuration optimized for document processing
+        runtime: nodejs20
+        entryPoint: processDocument
+        # Memory and timeout configuration for large document processing
+        availableMemoryMb: 512
+        timeout: 540s
+        # Service account with minimal required permissions
+        serviceAccountEmail: $(ref.workflow-functions-service-account.email)
+        # Environment variables for configuration
+        environmentVariables:
+          TOPIC_NAME: $(ref.workflow-events-topic.topic)
+          BUCKET_NAME: $(ref.workflow-documents-bucket.name)
+          PROJECT_ID: "{{ .project_id }}"
+          ENVIRONMENT: "{{ .environment }}"
+        # VPC connector for secure networking (if required)
+        vpcConnector: ""
+        # Ingress settings for security
+        ingressSettings: ALLOW_ALL
+        # Build environment configuration
+        buildEnvironmentVariables:
+          GOOGLE_NODE_RUN_SCRIPTS: ""
+      metadata:
+        dependsOn: 
+          - workflow-functions-service-account
+          - workflow-events-topic
+          - workflow-documents-bucket
+
+    # Cloud Function for approval webhook processing
+    - name: approval-webhook-function
+      type: gcp-types/cloudfunctions-v1:projects.locations.functions
+      properties:
+        location: projects/{{ .project_id }}/locations/{{ .region }}
+        sourceArchiveUrl: gs://{{ .project_id }}-function-source/approval-webhook.zip
+        function: approval-webhook-{{ .resource_suffix | default (randAlphaNum 6 | lower) }}
+        # HTTP trigger for approval responses
+        httpsTrigger:
+          securityLevel: SECURE_ALWAYS
+        runtime: nodejs20
+        entryPoint: handleApproval
+        availableMemoryMb: 256
+        timeout: 300s
+        serviceAccountEmail: $(ref.workflow-functions-service-account.email)
+        environmentVariables:
+          TOPIC_NAME: $(ref.workflow-events-topic.topic)
+          PROJECT_ID: "{{ .project_id }}"
+          ENVIRONMENT: "{{ .environment }}"
+        ingressSettings: ALLOW_ALL
+      metadata:
+        dependsOn: 
+          - workflow-functions-service-account
+          - workflow-events-topic
+
+    # Cloud Function for Google Chat notifications
+    - name: chat-notifications-function
+      type: gcp-types/cloudfunctions-v1:projects.locations.functions
+      properties:
+        location: projects/{{ .project_id }}/locations/{{ .region }}
+        sourceArchiveUrl: gs://{{ .project_id }}-function-source/chat-notifications.zip
+        function: chat-notifications-{{ .resource_suffix | default (randAlphaNum 6 | lower) }}
+        httpsTrigger:
+          securityLevel: SECURE_ALWAYS
+        runtime: nodejs20
+        entryPoint: sendChatNotification
+        availableMemoryMb: 256
+        timeout: 180s
+        serviceAccountEmail: $(ref.workflow-functions-service-account.email)
+        environmentVariables:
+          PROJECT_ID: "{{ .project_id }}"
+          ENVIRONMENT: "{{ .environment }}"
+        ingressSettings: ALLOW_ALL
+      metadata:
+        dependsOn: 
+          - workflow-functions-service-account
+
+    # Cloud Function for analytics collection (Pub/Sub triggered)
+    - name: analytics-collector-function
+      type: gcp-types/cloudfunctions-v1:projects.locations.functions
+      properties:
+        location: projects/{{ .project_id }}/locations/{{ .region }}
+        sourceArchiveUrl: gs://{{ .project_id }}-function-source/analytics-collector.zip
+        function: analytics-collector-{{ .resource_suffix | default (randAlphaNum 6 | lower) }}
+        # Pub/Sub trigger for event-driven analytics
+        eventTrigger:
+          eventType: providers/cloud.pubsub/eventTypes/topic.publish
+          resource: $(ref.workflow-events-topic.name)
+          failurePolicy:
+            retry: {}
+        runtime: nodejs20
+        entryPoint: collectAnalytics
+        availableMemoryMb: 256
+        timeout: 180s
+        serviceAccountEmail: $(ref.workflow-functions-service-account.email)
+        environmentVariables:
+          PROJECT_ID: "{{ .project_id }}"
+          ENVIRONMENT: "{{ .environment }}"
+      metadata:
+        dependsOn: 
+          - workflow-functions-service-account
+          - workflow-events-topic
+
+    # Cloud Monitoring notification channel for alerts
+    - name: workflow-alert-channel
+      type: gcp-types/monitoring-v1:projects.notificationChannels
+      properties:
+        type: email
+        displayName: "Workflow Monitoring Alerts"
+        description: "Email notifications for workflow processing alerts"
+        labels:
+          email_address: "admin@company.com"
+        enabled: true
+      metadata:
+        dependsOn: []
+      enabled: "{{ .enable_monitoring }}"
+
+    # Cloud Monitoring alert policy for failed document processing
+    - name: workflow-failure-alert
+      type: gcp-types/monitoring-v1:projects.alertPolicies
+      properties:
+        displayName: "Workflow Processing Failures"
+        documentation:
+          content: "Alert triggered when document processing failures exceed threshold"
+          mimeType: "text/markdown"
+        # Alert condition based on function error rate
+        conditions:
+          - displayName: "High Error Rate"
+            conditionThreshold:
+              filter: |
+                resource.type="cloud_function"
+                resource.labels.function_name=~"doc-processor-.*|approval-webhook-.*"
+                metric.type="cloudfunctions.googleapis.com/function/execution_count"
+                metric.labels.status!="ok"
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 5
+              duration: "300s"
+              aggregations:
+                - alignmentPeriod: "60s"
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+        # Notification configuration
+        notificationChannels:
+          - $(ref.workflow-alert-channel.name)
+        # Alert policy settings
+        enabled: true
+        combiner: OR
+      metadata:
+        dependsOn: 
+          - workflow-alert-channel
+          - document-processor-function
+          - approval-webhook-function
+      enabled: "{{ .enable_monitoring }}"
+
+    # Cloud Monitoring dashboard for workflow analytics
+    - name: workflow-monitoring-dashboard
+      type: gcp-types/monitoring-v1:projects.dashboards
+      properties:
+        displayName: "Intelligent Workflow Analytics"
+        # Dashboard layout configuration
+        mosaicLayout:
+          tiles:
+            # Document processing volume chart
+            - width: 6
+              height: 4
+              widget:
+                title: "Document Processing Volume"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: |
+                            resource.type="cloud_function"
+                            resource.labels.function_name=~"doc-processor-.*"
+                            metric.type="cloudfunctions.googleapis.com/function/execution_count"
+                          aggregation:
+                            alignmentPeriod: "300s"
+                            perSeriesAligner: ALIGN_RATE
+                            crossSeriesReducer: REDUCE_SUM
+                  yAxis:
+                    label: "Executions per second"
+                    scale: LINEAR
+            # Approval response times chart
+            - width: 6
+              height: 4
+              widget:
+                title: "Approval Response Times"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: |
+                            resource.type="pubsub_topic"
+                            resource.labels.topic_id=~"document-events-.*"
+                            metric.type="pubsub.googleapis.com/topic/send_message_operation_count"
+                          aggregation:
+                            alignmentPeriod: "300s"
+                            perSeriesAligner: ALIGN_MEAN
+                  yAxis:
+                    label: "Average Response Time (ms)"
+                    scale: LINEAR
+            # Error rate monitoring
+            - width: 12
+              height: 4
+              widget:
+                title: "Error Rate by Function"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: |
+                            resource.type="cloud_function"
+                            metric.type="cloudfunctions.googleapis.com/function/execution_count"
+                            metric.labels.status!="ok"
+                          aggregation:
+                            alignmentPeriod: "300s"
+                            perSeriesAligner: ALIGN_RATE
+                            crossSeriesReducer: REDUCE_SUM
+                            groupByFields: ["resource.labels.function_name"]
+                  yAxis:
+                    label: "Error Rate (%)"
+                    scale: LINEAR
+      metadata:
+        dependsOn: 
+          - document-processor-function
+          - approval-webhook-function
+          - analytics-collector-function
+      enabled: "{{ .enable_monitoring }}"
+
+  # Output values for integration and verification
+  outputs:
+    - name: storage_bucket_name
+      description: "Name of the Cloud Storage bucket for document processing"
+      value: $(ref.workflow-documents-bucket.name)
+      
+    - name: pubsub_topic_name
+      description: "Name of the Pub/Sub topic for workflow events"
+      value: $(ref.workflow-events-topic.name)
+      
+    - name: document_processor_url
+      description: "HTTPS trigger URL for the document processor function"
+      value: $(ref.document-processor-function.httpsTrigger.url)
+      
+    - name: approval_webhook_url
+      description: "HTTPS trigger URL for the approval webhook function"
+      value: $(ref.approval-webhook-function.httpsTrigger.url)
+      
+    - name: chat_notifications_url
+      description: "HTTPS trigger URL for the Chat notifications function"
+      value: $(ref.chat-notifications-function.httpsTrigger.url)
+      
+    - name: service_account_email
+      description: "Email address of the service account used by Cloud Functions"
+      value: $(ref.workflow-functions-service-account.email)
+      
+    - name: deadletter_topic_name
+      description: "Name of the dead letter topic for failed processing"
+      value: $(ref.workflow-deadletter-topic.name)
+      
+    - name: monitoring_dashboard_url
+      description: "URL to the Cloud Monitoring dashboard for workflow analytics"
+      value: "https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.workflow-monitoring-dashboard.name)"
+      enabled: "{{ .enable_monitoring }}"
+
+# Schema definition for Pub/Sub message validation
+---
+apiVersion: blueprints.cloud.google.com/v1alpha1
+kind: BlueprintMetadata
+metadata:
+  name: workflow-event-schema
+spec:
+  info:
+    title: Workflow Event Message Schema
+    description: JSON schema for validating workflow event messages
+  schema:
+    type: object
+    properties:
+      workflowId:
+        type: string
+        description: "Unique identifier for the workflow instance"
+        pattern: "^workflow-[0-9]+$"
+      documentId:
+        type: string
+        description: "Identifier for the processed document"
+      timestamp:
+        type: string
+        format: date-time
+        description: "ISO 8601 timestamp of the event"
+      metadata:
+        type: object
+        properties:
+          size:
+            type: integer
+            description: "Document size in bytes"
+          contentType:
+            type: string
+            description: "MIME type of the document"
+          document_type:
+            type: string
+            enum: ["contract", "invoice", "report", "memo", "other"]
+          department:
+            type: string
+            description: "Department that uploaded the document"
+          priority:
+            type: string
+            enum: ["low", "medium", "high", "urgent"]
+          estimated_value:
+            type: number
+            description: "Estimated monetary value if applicable"
+        required: ["document_type", "department", "priority"]
+      processingStage:
+        type: string
+        enum: ["analysis", "approval_routing", "approval_decision", "completion", "error"]
+        description: "Current stage of workflow processing"
+      approvalRule:
+        type: object
+        properties:
+          approvers:
+            type: array
+            items:
+              type: string
+              format: email
+          maxProcessingTime:
+            type: integer
+            description: "Maximum processing time in hours"
+          requiresLegalReview:
+            type: boolean
+        required: ["approvers", "maxProcessingTime"]
+    required: ["workflowId", "documentId", "timestamp", "processingStage"]

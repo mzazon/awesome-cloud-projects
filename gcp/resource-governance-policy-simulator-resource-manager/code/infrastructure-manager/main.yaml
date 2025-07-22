@@ -1,0 +1,637 @@
+# Infrastructure Manager Configuration for Resource Governance with Policy Simulator and Resource Manager
+# This configuration deploys a comprehensive governance automation system using Google Cloud services
+# for proactive policy management, cost control, and compliance monitoring.
+
+# Metadata and configuration
+apiVersion: compute.cnrm.cloud.google.com/v1beta1
+kind: InfrastructureManagerBlueprint
+metadata:
+  name: resource-governance-automation
+  annotations:
+    cnrm.cloud.google.com/blueprint: "true"
+    cnrm.cloud.google.com/version: "1.3"
+spec:
+  variables:
+    # Project configuration
+    project_id:
+      description: "Google Cloud project ID for governance automation"
+      type: string
+      required: true
+    
+    organization_id:
+      description: "Google Cloud organization ID for policy management"
+      type: string
+      required: true
+    
+    region:
+      description: "Primary region for resource deployment"
+      type: string
+      default: "us-central1"
+      validation:
+        pattern: "^[a-z]+-[a-z]+[0-9]$"
+    
+    # Environment configuration
+    environment:
+      description: "Environment name (dev, staging, prod)"
+      type: string
+      default: "prod"
+      validation:
+        enum: ["dev", "staging", "prod"]
+    
+    # Budget configuration
+    monthly_budget_amount:
+      description: "Monthly budget amount in USD for governance monitoring"
+      type: number
+      default: 100
+      validation:
+        minimum: 10
+        maximum: 10000
+    
+    # Notification configuration
+    notification_email:
+      description: "Email address for governance notifications"
+      type: string
+      required: true
+      validation:
+        pattern: "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
+    
+    # Tagging requirements
+    required_labels:
+      description: "List of required labels for resource compliance"
+      type: array
+      default: ["environment", "team", "cost-center", "project-code"]
+    
+    # Approved regions for resource deployment
+    approved_regions:
+      description: "List of approved regions for resource deployment"
+      type: array
+      default: ["us-central1", "us-east1", "us-west1"]
+
+  resources:
+    # Enable required APIs for governance automation
+    - name: enable-apis
+      type: gcp-types/servicemanagement-v1:services
+      properties:
+        serviceName: policysimulator.googleapis.com
+        project: ${project_id}
+      
+    - name: enable-resource-manager-api
+      type: gcp-types/servicemanagement-v1:services
+      properties:
+        serviceName: cloudresourcemanager.googleapis.com
+        project: ${project_id}
+    
+    - name: enable-billing-api
+      type: gcp-types/servicemanagement-v1:services
+      properties:
+        serviceName: cloudbilling.googleapis.com
+        project: ${project_id}
+    
+    - name: enable-functions-api
+      type: gcp-types/servicemanagement-v1:services
+      properties:
+        serviceName: cloudfunctions.googleapis.com
+        project: ${project_id}
+    
+    - name: enable-pubsub-api
+      type: gcp-types/servicemanagement-v1:services
+      properties:
+        serviceName: pubsub.googleapis.com
+        project: ${project_id}
+    
+    - name: enable-asset-api
+      type: gcp-types/servicemanagement-v1:services
+      properties:
+        serviceName: cloudasset.googleapis.com
+        project: ${project_id}
+    
+    - name: enable-scheduler-api
+      type: gcp-types/servicemanagement-v1:services
+      properties:
+        serviceName: cloudscheduler.googleapis.com
+        project: ${project_id}
+    
+    - name: enable-logging-api
+      type: gcp-types/servicemanagement-v1:services
+      properties:
+        serviceName: logging.googleapis.com
+        project: ${project_id}
+
+    # Service Accounts for governance automation
+    - name: policy-simulator-service-account
+      type: gcp-types/iam-v1:projects.serviceAccounts
+      properties:
+        accountId: policy-simulator-sa
+        displayName: "Policy Simulator Service Account"
+        description: "Service account for automated policy simulation and governance"
+        project: ${project_id}
+      dependsOn:
+        - enable-apis
+    
+    - name: billing-governance-service-account
+      type: gcp-types/iam-v1:projects.serviceAccounts
+      properties:
+        accountId: billing-governance-sa
+        displayName: "Billing Governance Service Account"
+        description: "Service account for billing and cost governance operations"
+        project: ${project_id}
+      dependsOn:
+        - enable-billing-api
+    
+    - name: function-service-account
+      type: gcp-types/iam-v1:projects.serviceAccounts
+      properties:
+        accountId: governance-function-sa
+        displayName: "Governance Function Service Account"
+        description: "Service account for Cloud Function governance operations"
+        project: ${project_id}
+      dependsOn:
+        - enable-functions-api
+
+    # IAM Policy Bindings for service accounts
+    - name: policy-simulator-org-bindings
+      type: gcp-types/cloudresourcemanager-v1:organizations.setIamPolicy
+      properties:
+        resource: ${organization_id}
+        policy:
+          bindings:
+            - role: roles/policysimulator.admin
+              members:
+                - serviceAccount:policy-simulator-sa@${project_id}.iam.gserviceaccount.com
+            - role: roles/iam.securityReviewer
+              members:
+                - serviceAccount:policy-simulator-sa@${project_id}.iam.gserviceaccount.com
+            - role: roles/resourcemanager.organizationViewer
+              members:
+                - serviceAccount:policy-simulator-sa@${project_id}.iam.gserviceaccount.com
+      dependsOn:
+        - policy-simulator-service-account
+    
+    - name: billing-governance-org-bindings
+      type: gcp-types/cloudresourcemanager-v1:organizations.setIamPolicy
+      properties:
+        resource: ${organization_id}
+        policy:
+          bindings:
+            - role: roles/billing.viewer
+              members:
+                - serviceAccount:billing-governance-sa@${project_id}.iam.gserviceaccount.com
+            - role: roles/billing.projectManager
+              members:
+                - serviceAccount:billing-governance-sa@${project_id}.iam.gserviceaccount.com
+      dependsOn:
+        - billing-governance-service-account
+
+    # Cloud Storage bucket for governance reports and function source
+    - name: governance-reports-bucket
+      type: gcp-types/storage-v1:buckets
+      properties:
+        name: governance-reports-${project_id}
+        project: ${project_id}
+        location: ${region}
+        storageClass: STANDARD
+        versioning:
+          enabled: true
+        lifecycle:
+          rule:
+            - action:
+                type: Delete
+              condition:
+                age: 90
+        iamConfiguration:
+          uniformBucketLevelAccess:
+            enabled: true
+        labels:
+          environment: ${environment}
+          purpose: governance-automation
+          managed-by: infrastructure-manager
+      dependsOn:
+        - enable-apis
+
+    # Pub/Sub topic for governance events
+    - name: governance-events-topic
+      type: gcp-types/pubsub-v1:projects.topics
+      properties:
+        name: projects/${project_id}/topics/governance-events
+        labels:
+          environment: ${environment}
+          purpose: governance-automation
+          managed-by: infrastructure-manager
+      dependsOn:
+        - enable-pubsub-api
+
+    # Pub/Sub subscription for governance events processing
+    - name: governance-events-subscription
+      type: gcp-types/pubsub-v1:projects.subscriptions
+      properties:
+        name: projects/${project_id}/subscriptions/governance-events-sub
+        topic: projects/${project_id}/topics/governance-events
+        pushConfig:
+          pushEndpoint: https://${region}-${project_id}.cloudfunctions.net/governance-automation
+        ackDeadlineSeconds: 600
+        labels:
+          environment: ${environment}
+          purpose: governance-automation
+          managed-by: infrastructure-manager
+      dependsOn:
+        - governance-events-topic
+
+    # BigQuery dataset for governance analytics
+    - name: governance-analytics-dataset
+      type: gcp-types/bigquery-v2:datasets
+      properties:
+        projectId: ${project_id}
+        datasetId: governance_analytics
+        friendlyName: "Governance Analytics Dataset"
+        description: "Dataset for storing governance audit results and analytics"
+        location: ${region}
+        labels:
+          environment: ${environment}
+          purpose: governance-analytics
+          managed-by: infrastructure-manager
+        access:
+          - role: OWNER
+            userByEmail: governance-function-sa@${project_id}.iam.gserviceaccount.com
+          - role: READER
+            specialGroup: projectReaders
+        defaultTableExpirationMs: 7776000000  # 90 days
+      dependsOn:
+        - function-service-account
+
+    # BigQuery table for compliance audit results
+    - name: compliance-audit-table
+      type: gcp-types/bigquery-v2:tables
+      properties:
+        projectId: ${project_id}
+        datasetId: governance_analytics
+        tableId: compliance_audits
+        friendlyName: "Compliance Audit Results"
+        description: "Table storing compliance audit results and violations"
+        schema:
+          fields:
+            - name: audit_timestamp
+              type: TIMESTAMP
+              mode: REQUIRED
+            - name: resource_name
+              type: STRING
+              mode: REQUIRED
+            - name: resource_type
+              type: STRING
+              mode: REQUIRED
+            - name: project_id
+              type: STRING
+              mode: REQUIRED
+            - name: compliance_status
+              type: STRING
+              mode: REQUIRED
+            - name: violation_type
+              type: STRING
+              mode: NULLABLE
+            - name: violation_details
+              type: STRING
+              mode: NULLABLE
+            - name: remediation_action
+              type: STRING
+              mode: NULLABLE
+            - name: cost_impact
+              type: FLOAT
+              mode: NULLABLE
+        labels:
+          environment: ${environment}
+          purpose: compliance-tracking
+          managed-by: infrastructure-manager
+      dependsOn:
+        - governance-analytics-dataset
+
+    # Cloud Function for governance automation
+    - name: governance-automation-function
+      type: gcp-types/cloudfunctions-v1:projects.locations.functions
+      properties:
+        name: projects/${project_id}/locations/${region}/functions/governance-automation
+        sourceArchiveUrl: gs://governance-reports-${project_id}/governance-function.zip
+        entryPoint: governance_automation
+        runtime: python311
+        timeout: 540s
+        availableMemoryMb: 512
+        serviceAccountEmail: governance-function-sa@${project_id}.iam.gserviceaccount.com
+        eventTrigger:
+          eventType: providers/cloud.pubsub/eventTypes/topic.publish
+          resource: projects/${project_id}/topics/governance-events
+        environmentVariables:
+          PROJECT_ID: ${project_id}
+          ORGANIZATION_ID: ${organization_id}
+          REGION: ${region}
+          DATASET_ID: governance_analytics
+          APPROVED_REGIONS: ${approved_regions}
+          REQUIRED_LABELS: ${required_labels}
+        labels:
+          environment: ${environment}
+          purpose: governance-automation
+          managed-by: infrastructure-manager
+      dependsOn:
+        - governance-events-topic
+        - function-service-account
+        - governance-reports-bucket
+        - governance-analytics-dataset
+
+    # Cloud Scheduler job for weekly governance audits
+    - name: weekly-governance-audit-job
+      type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+      properties:
+        name: projects/${project_id}/locations/${region}/jobs/weekly-governance-audit
+        description: "Weekly comprehensive governance audit across organization"
+        schedule: "0 9 * * 1"  # Every Monday at 9 AM
+        timeZone: "America/New_York"
+        pubsubTarget:
+          topicName: projects/${project_id}/topics/governance-events
+          data: ewogICJhdWRpdF90eXBlIjogImZ1bGwiLAogICJwcm9qZWN0X3Njb3BlIjogIm9yZ2FuaXphdGlvbiIsCiAgImluY2x1ZGVfY29zdF9hbmFseXNpcyI6IHRydWUsCiAgImluY2x1ZGVfY29tcGxpYW5jZV9jaGVjayI6IHRydWUKfQ==  # Base64 encoded JSON
+        labels:
+          environment: ${environment}
+          purpose: governance-automation
+          managed-by: infrastructure-manager
+      dependsOn:
+        - governance-events-topic
+        - enable-scheduler-api
+
+    # Cloud Scheduler job for daily cost monitoring
+    - name: daily-cost-monitoring-job
+      type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+      properties:
+        name: projects/${project_id}/locations/${region}/jobs/daily-cost-monitoring
+        description: "Daily cost and budget monitoring across projects"
+        schedule: "0 8 * * *"  # Every day at 8 AM
+        timeZone: "America/New_York"
+        pubsubTarget:
+          topicName: projects/${project_id}/topics/governance-events
+          data: ewogICJhdWRpdF90eXBlIjogImJpbGxpbmciLAogICJjaGVja19idWRnZXRzIjogdHJ1ZSwKICAiY29zdF90aHJlc2hvbGQiOiAwLjgKfQ==  # Base64 encoded JSON
+        labels:
+          environment: ${environment}
+          purpose: cost-monitoring
+          managed-by: infrastructure-manager
+      dependsOn:
+        - governance-events-topic
+        - enable-scheduler-api
+
+    # Organization Policy: Restrict Compute Instance Locations
+    - name: restrict-compute-locations-policy
+      type: gcp-types/orgpolicy-v2:organizations.policies
+      properties:
+        parent: organizations/${organization_id}
+        policy:
+          name: organizations/${organization_id}/policies/compute.restrictLocations
+          spec:
+            rules:
+              - values:
+                  allowedValues: ${approved_regions}
+                enforce: true
+            reset: false
+            inheritFromParent: false
+            etag: ""
+        policyId: compute.restrictLocations
+      dependsOn:
+        - enable-resource-manager-api
+
+    # Organization Policy: Require Resource Labels
+    - name: require-resource-labels-policy
+      type: gcp-types/orgpolicy-v2:organizations.policies
+      properties:
+        parent: organizations/${organization_id}
+        policy:
+          name: organizations/${organization_id}/policies/labels.requiredLabels
+          spec:
+            rules:
+              - values:
+                  requiredValues: ${required_labels}
+                enforce: true
+            reset: false
+            inheritFromParent: false
+        policyId: labels.requiredLabels
+      dependsOn:
+        - enable-resource-manager-api
+
+    # Custom Constraint for Resource Label Validation
+    - name: validate-resource-labels-constraint
+      type: gcp-types/orgpolicy-v2:organizations.customConstraints
+      properties:
+        parent: organizations/${organization_id}
+        customConstraintId: custom.validateResourceLabels
+        customConstraint:
+          name: organizations/${organization_id}/customConstraints/custom.validateResourceLabels
+          displayName: "Validate Required Resource Labels"
+          description: "Ensure all resources have required labels for cost allocation and governance"
+          condition: |
+            has(resource.labels.environment) && 
+            has(resource.labels.team) && 
+            has(resource.labels['cost-center']) &&
+            has(resource.labels['project-code']) &&
+            resource.labels.environment in ['dev', 'staging', 'prod']
+          actionType: ALLOW
+          resourceTypes:
+            - compute.googleapis.com/Instance
+            - storage.googleapis.com/Bucket
+            - container.googleapis.com/Cluster
+            - cloudsql.googleapis.com/Instance
+          methodTypes:
+            - CREATE
+            - UPDATE
+      dependsOn:
+        - enable-resource-manager-api
+
+    # Log-based metric for governance violations
+    - name: governance-violation-metric
+      type: gcp-types/logging-v2:projects.metrics
+      properties:
+        projectId: ${project_id}
+        name: governance_violations_count
+        description: "Count of governance policy violations detected"
+        filter: |
+          resource.type="cloud_function" 
+          AND resource.labels.function_name="governance-automation"
+          AND jsonPayload.violation_detected=true
+        metricDescriptor:
+          metricKind: GAUGE
+          valueType: INT64
+          displayName: "Governance Violations Count"
+        labelExtractors:
+          violation_type: EXTRACT(jsonPayload.violation_type)
+          project_id: EXTRACT(jsonPayload.project_id)
+          resource_type: EXTRACT(jsonPayload.resource_type)
+      dependsOn:
+        - enable-logging-api
+
+    # Monitoring alert policy for governance violations
+    - name: governance-violation-alert
+      type: gcp-types/monitoring-v1:projects.alertPolicies
+      properties:
+        projectId: ${project_id}
+        displayName: "Governance Policy Violations Alert"
+        documentation:
+          content: "Alert triggered when governance policy violations are detected"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "Governance violations detected"
+            conditionThreshold:
+              filter: 'metric.type="logging.googleapis.com/user/governance_violations_count"'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 0
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+        notificationChannels:
+          - projects/${project_id}/notificationChannels/email-${notification_email}
+        alertStrategy:
+          autoClose: 86400s  # 24 hours
+        enabled: true
+      dependsOn:
+        - governance-violation-metric
+
+    # Budget for governance cost monitoring
+    - name: governance-budget
+      type: gcp-types/billingbudgets-v1:billingAccounts.budgets
+      properties:
+        parent: billingAccounts/$(ref.billing-account.name)
+        budget:
+          displayName: "Governance Automation Budget"
+          budgetFilter:
+            projects:
+              - projects/${project_id}
+            labels:
+              environment: [${environment}]
+              purpose: ["governance-automation"]
+          amount:
+            specifiedAmount:
+              currencyCode: "USD"
+              units: ${monthly_budget_amount}
+          thresholdRules:
+            - thresholdPercent: 0.5
+              spendBasis: CURRENT_SPEND
+            - thresholdPercent: 0.8
+              spendBasis: CURRENT_SPEND
+            - thresholdPercent: 1.0
+              spendBasis: CURRENT_SPEND
+          notificationsRule:
+            pubsubTopic: projects/${project_id}/topics/governance-events
+            enableProjectLevelRecipients: true
+      dependsOn:
+        - governance-events-topic
+        - enable-billing-api
+
+  outputs:
+    # Service account information
+    policy_simulator_service_account:
+      description: "Email of the policy simulator service account"
+      value: policy-simulator-sa@${project_id}.iam.gserviceaccount.com
+    
+    billing_governance_service_account:
+      description: "Email of the billing governance service account"
+      value: billing-governance-sa@${project_id}.iam.gserviceaccount.com
+    
+    function_service_account:
+      description: "Email of the function service account"
+      value: governance-function-sa@${project_id}.iam.gserviceaccount.com
+    
+    # Storage and messaging resources
+    governance_reports_bucket:
+      description: "Name of the governance reports storage bucket"
+      value: governance-reports-${project_id}
+    
+    governance_events_topic:
+      description: "Full name of the governance events Pub/Sub topic"
+      value: projects/${project_id}/topics/governance-events
+    
+    # Analytics resources
+    governance_analytics_dataset:
+      description: "BigQuery dataset for governance analytics"
+      value: ${project_id}.governance_analytics
+    
+    compliance_audit_table:
+      description: "BigQuery table for compliance audit results"
+      value: ${project_id}.governance_analytics.compliance_audits
+    
+    # Function and automation resources
+    governance_automation_function:
+      description: "Name of the governance automation Cloud Function"
+      value: governance-automation
+    
+    function_url:
+      description: "URL of the governance automation Cloud Function"
+      value: https://${region}-${project_id}.cloudfunctions.net/governance-automation
+    
+    # Scheduler jobs
+    weekly_audit_job:
+      description: "Name of the weekly governance audit scheduler job"
+      value: weekly-governance-audit
+    
+    daily_cost_monitoring_job:
+      description: "Name of the daily cost monitoring scheduler job"
+      value: daily-cost-monitoring
+    
+    # Policy and constraint information
+    location_restriction_policy:
+      description: "Organization policy for location restrictions"
+      value: organizations/${organization_id}/policies/compute.restrictLocations
+    
+    resource_labels_policy:
+      description: "Organization policy for required resource labels"
+      value: organizations/${organization_id}/policies/labels.requiredLabels
+    
+    custom_constraint:
+      description: "Custom constraint for resource label validation"
+      value: organizations/${organization_id}/customConstraints/custom.validateResourceLabels
+    
+    # Monitoring and alerting
+    governance_violation_metric:
+      description: "Log-based metric for governance violations"
+      value: governance_violations_count
+    
+    governance_alert_policy:
+      description: "Alert policy for governance violations"
+      value: projects/${project_id}/alertPolicies/governance-violations
+    
+    # Budget information
+    governance_budget:
+      description: "Budget for governance automation cost monitoring"
+      value: governance-automation-budget
+    
+    # Project and organization context
+    project_id:
+      description: "Google Cloud project ID"
+      value: ${project_id}
+    
+    organization_id:
+      description: "Google Cloud organization ID"
+      value: ${organization_id}
+    
+    deployment_region:
+      description: "Primary deployment region"
+      value: ${region}
+    
+    # Configuration summary
+    approved_regions:
+      description: "List of approved regions for resource deployment"
+      value: ${approved_regions}
+    
+    required_labels:
+      description: "List of required labels for resource compliance"
+      value: ${required_labels}
+    
+    monthly_budget_amount:
+      description: "Monthly budget amount for governance monitoring"
+      value: ${monthly_budget_amount}
+
+# Additional metadata for Infrastructure Manager
+metadata:
+  labels:
+    managed-by: infrastructure-manager
+    recipe-name: resource-governance-policy-simulator-resource-manager
+    recipe-version: "1.0"
+    recipe-category: management-governance
+    cloud-provider: gcp
+  annotations:
+    description: "Comprehensive resource governance automation using Policy Simulator and Resource Manager"
+    documentation-url: "https://cloud.google.com/policy-intelligence/docs"
+    cost-estimate: "20-50 USD per month for automated governance system"
+    security-level: "enterprise"
+    compliance-frameworks: "SOC2, ISO27001, CIS"

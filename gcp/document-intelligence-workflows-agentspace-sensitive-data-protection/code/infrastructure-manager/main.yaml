@@ -1,0 +1,628 @@
+# Infrastructure Manager Configuration for Document Intelligence Workflows
+# Recipe: Document Intelligence Workflows with Agentspace and Sensitive Data Protection
+# This configuration deploys a complete enterprise document processing pipeline
+# with AI-powered analysis, sensitive data protection, and compliance monitoring
+
+# Terraform version and provider requirements
+terraform:
+  required_version: ">= 1.5"
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 5.0"
+    random:
+      source: "hashicorp/random"
+      version: "~> 3.1"
+
+# Input variables for customizable deployment
+variables:
+  project_id:
+    description: "Google Cloud Project ID for document intelligence deployment"
+    type: string
+    
+  region:
+    description: "Google Cloud region for resource deployment"
+    type: string
+    default: "us-central1"
+    
+  zone:
+    description: "Google Cloud zone for compute resources"
+    type: string
+    default: "us-central1-a"
+    
+  environment:
+    description: "Environment name (dev, staging, prod)"
+    type: string
+    default: "dev"
+    validation:
+      condition: contains(["dev", "staging", "prod"], var.environment)
+      error_message: "Environment must be one of: dev, staging, prod"
+  
+  enable_apis:
+    description: "Whether to enable required Google Cloud APIs"
+    type: bool
+    default: true
+    
+  storage_class:
+    description: "Storage class for Cloud Storage buckets"
+    type: string
+    default: "STANDARD"
+    validation:
+      condition: contains(["STANDARD", "NEARLINE", "COLDLINE", "ARCHIVE"], var.storage_class)
+      error_message: "Storage class must be one of: STANDARD, NEARLINE, COLDLINE, ARCHIVE"
+
+# Random suffix for unique resource naming
+resource "random_id" "suffix":
+  byte_length: 3
+
+# Local values for consistent naming and configuration
+locals:
+  resource_suffix = random_id.suffix.hex
+  common_labels = {
+    recipe           = "document-intelligence-workflows"
+    environment      = var.environment
+    managed_by       = "infrastructure-manager"
+    created_date     = formatdate("YYYY-MM-DD", timestamp())
+  }
+  
+  # Storage bucket names with unique suffixes
+  input_bucket_name   = "doc-input-${local.resource_suffix}"
+  output_bucket_name  = "doc-output-${local.resource_suffix}"
+  audit_bucket_name   = "doc-audit-${local.resource_suffix}"
+  
+  # Service names
+  processor_name     = "enterprise-doc-processor-${local.resource_suffix}"
+  workflow_name      = "doc-intelligence-workflow-${local.resource_suffix}"
+  service_account_id = "agentspace-doc-processor"
+
+# Enable required Google Cloud APIs for document intelligence
+resource "google_project_service" "required_apis":
+  for_each = var.enable_apis ? toset([
+    "documentai.googleapis.com",
+    "dlp.googleapis.com", 
+    "workflows.googleapis.com",
+    "storage.googleapis.com",
+    "logging.googleapis.com",
+    "monitoring.googleapis.com",
+    "bigquery.googleapis.com",
+    "cloudfunctions.googleapis.com",
+    "eventarc.googleapis.com"
+  ]) : toset([])
+  
+  project = var.project_id
+  service = each.key
+  
+  # Prevent automatic disabling of APIs when destroying
+  disable_dependent_services = false
+  disable_on_destroy         = false
+}
+
+# Cloud Storage buckets for document processing pipeline
+resource "google_storage_bucket" "input_bucket":
+  name          = local.input_bucket_name
+  location      = var.region
+  project       = var.project_id
+  storage_class = var.storage_class
+  
+  # Enable versioning for data protection and audit compliance
+  versioning {
+    enabled = true
+  }
+  
+  # Lifecycle management for cost optimization
+  lifecycle_rule {
+    condition {
+      age = 90
+    }
+    action {
+      type          = "SetStorageClass"
+      storage_class = "NEARLINE"
+    }
+  }
+  
+  # Security configuration
+  uniform_bucket_level_access = true
+  
+  # Labels for resource management
+  labels = merge(local.common_labels, {
+    bucket_type = "input"
+    data_type   = "raw_documents"
+  })
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+resource "google_storage_bucket" "output_bucket":
+  name          = local.output_bucket_name
+  location      = var.region
+  project       = var.project_id
+  storage_class = var.storage_class
+  
+  # Enable versioning for processed document tracking
+  versioning {
+    enabled = true
+  }
+  
+  # Lifecycle management for processed documents
+  lifecycle_rule {
+    condition {
+      age = 365
+    }
+    action {
+      type          = "SetStorageClass"
+      storage_class = "COLDLINE"
+    }
+  }
+  
+  # Security configuration
+  uniform_bucket_level_access = true
+  
+  # Labels for resource management
+  labels = merge(local.common_labels, {
+    bucket_type = "output"
+    data_type   = "processed_documents"
+  })
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+resource "google_storage_bucket" "audit_bucket":
+  name          = local.audit_bucket_name
+  location      = var.region
+  project       = var.project_id
+  storage_class = var.storage_class
+  
+  # Enable versioning for audit trail integrity
+  versioning {
+    enabled = true
+  }
+  
+  # Long-term retention for compliance
+  lifecycle_rule {
+    condition {
+      age = 2555  # 7 years for compliance retention
+    }
+    action {
+      type          = "SetStorageClass"
+      storage_class = "ARCHIVE"
+    }
+  }
+  
+  # Security configuration for audit data
+  uniform_bucket_level_access = true
+  
+  # Labels for resource management
+  labels = merge(local.common_labels, {
+    bucket_type = "audit"
+    data_type   = "audit_logs"
+  })
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Document AI processor for intelligent document analysis
+resource "google_document_ai_processor" "document_processor":
+  location     = var.region
+  display_name = local.processor_name
+  type         = "FORM_PARSER_PROCESSOR"
+  project      = var.project_id
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# DLP (Data Loss Prevention) inspection template for sensitive data detection
+resource "google_data_loss_prevention_inspect_template" "pii_scanner":
+  parent       = "projects/${var.project_id}"
+  description  = "Comprehensive PII detection template for enterprise documents"
+  display_name = "Enterprise Document PII Scanner"
+  
+  inspect_config {
+    # Define information types to detect
+    info_types {
+      name = "EMAIL_ADDRESS"
+    }
+    info_types {
+      name = "PERSON_NAME"
+    }
+    info_types {
+      name = "PHONE_NUMBER"
+    }
+    info_types {
+      name = "CREDIT_CARD_NUMBER"
+    }
+    info_types {
+      name = "US_SOCIAL_SECURITY_NUMBER"
+    }
+    info_types {
+      name = "IBAN_CODE"
+    }
+    info_types {
+      name = "DATE_OF_BIRTH"
+    }
+    info_types {
+      name = "PASSPORT"
+    }
+    info_types {
+      name = "MEDICAL_RECORD_NUMBER"
+    }
+    info_types {
+      name = "US_BANK_ROUTING_MICR"
+    }
+    
+    # Set minimum likelihood for detection
+    min_likelihood = "POSSIBLE"
+    include_quote  = true
+    
+    # Limits for performance optimization
+    limits {
+      max_findings_per_request = 1000
+    }
+  }
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# DLP de-identification template for data redaction
+resource "google_data_loss_prevention_deidentify_template" "redaction_template":
+  parent       = "projects/${var.project_id}"
+  description  = "Automated redaction template for sensitive data in documents"
+  display_name = "Enterprise Document Redaction"
+  
+  deidentify_config {
+    info_type_transformations {
+      # Redaction for common PII
+      transformations {
+        info_types {
+          name = "EMAIL_ADDRESS"
+        }
+        info_types {
+          name = "PERSON_NAME"
+        }
+        info_types {
+          name = "PHONE_NUMBER"
+        }
+        
+        primitive_transformation {
+          replace_config {
+            new_value {
+              string_value = "[REDACTED]"
+            }
+          }
+        }
+      }
+      
+      # Cryptographic hashing for financial data
+      transformations {
+        info_types {
+          name = "CREDIT_CARD_NUMBER"
+        }
+        info_types {
+          name = "US_SOCIAL_SECURITY_NUMBER"
+        }
+        
+        primitive_transformation {
+          crypto_hash_config {
+            crypto_key {
+              unwrapped {
+                key = "YWJjZGVmZ2hpamtsbW5vcA=="  # Base64 encoded key for hashing
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Service account for Agentspace document processing integration
+resource "google_service_account" "agentspace_processor":
+  account_id   = local.service_account_id
+  display_name = "Agentspace Document Processor"
+  description  = "Service account for Agentspace document processing integration"
+  project      = var.project_id
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# IAM roles for the service account
+resource "google_project_iam_member" "agentspace_roles":
+  for_each = toset([
+    "roles/documentai.apiUser",
+    "roles/dlp.user",
+    "roles/workflows.invoker",
+    "roles/storage.objectViewer",
+    "roles/storage.objectCreator",
+    "roles/bigquery.dataEditor",
+    "roles/bigquery.jobUser"
+  ])
+  
+  project = var.project_id
+  role    = each.key
+  member  = "serviceAccount:${google_service_account.agentspace_processor.email}"
+  
+  depends_on = [google_service_account.agentspace_processor]
+}
+
+# BigQuery dataset for document intelligence analytics
+resource "google_bigquery_dataset" "document_intelligence":
+  dataset_id  = "document_intelligence"
+  project     = var.project_id
+  location    = var.region
+  description = "Document intelligence processing analytics dataset"
+  
+  # Access controls
+  access {
+    role          = "OWNER"
+    user_by_email = google_service_account.agentspace_processor.email
+  }
+  
+  access {
+    role         = "OWNER"
+    special_group = "projectOwners"
+  }
+  
+  access {
+    role         = "READER"
+    special_group = "projectReaders"
+  }
+  
+  # Labels for resource management
+  labels = merge(local.common_labels, {
+    data_type = "analytics"
+    purpose   = "document_intelligence"
+  })
+  
+  depends_on = [
+    google_project_service.required_apis,
+    google_service_account.agentspace_processor
+  ]
+}
+
+# BigQuery table for processed document metadata
+resource "google_bigquery_table" "processed_documents":
+  dataset_id = google_bigquery_dataset.document_intelligence.dataset_id
+  table_id   = "processed_documents"
+  project    = var.project_id
+  
+  description = "Metadata table for processed documents with compliance tracking"
+  
+  schema = jsonencode([
+    {
+      name = "document_id"
+      type = "STRING"
+      mode = "REQUIRED"
+      description = "Unique identifier for the processed document"
+    },
+    {
+      name = "processing_timestamp"
+      type = "TIMESTAMP"
+      mode = "REQUIRED"
+      description = "Timestamp when document processing was completed"
+    },
+    {
+      name = "document_type"
+      type = "STRING"
+      mode = "NULLABLE"
+      description = "Classified type of the document"
+    },
+    {
+      name = "sensitive_data_found"
+      type = "BOOLEAN"
+      mode = "REQUIRED"
+      description = "Whether sensitive data was detected in the document"
+    },
+    {
+      name = "compliance_level"
+      type = "STRING"
+      mode = "REQUIRED"
+      description = "Compliance level assigned based on sensitive data findings"
+    },
+    {
+      name = "processing_status"
+      type = "STRING"
+      mode = "REQUIRED"
+      description = "Status of document processing (completed, failed, etc.)"
+    },
+    {
+      name = "file_path"
+      type = "STRING"
+      mode = "REQUIRED"
+      description = "Original file path in Cloud Storage"
+    },
+    {
+      name = "entities_extracted"
+      type = "INTEGER"
+      mode = "NULLABLE"
+      description = "Number of entities extracted by Document AI"
+    },
+    {
+      name = "redaction_applied"
+      type = "BOOLEAN"
+      mode = "REQUIRED"
+      description = "Whether redaction was applied to the document"
+    }
+  ])
+  
+  # Table expiration for data lifecycle management (5 years)
+  expiration_time = (1000 * 60 * 60 * 24 * 365 * 5) + timestamp()
+  
+  # Labels for resource management
+  labels = merge(local.common_labels, {
+    table_type = "metadata"
+    data_class = "processed_documents"
+  })
+  
+  depends_on = [google_bigquery_dataset.document_intelligence]
+}
+
+# Cloud Logging sink for audit trail
+resource "google_logging_project_sink" "audit_sink":
+  name        = "doc-intelligence-audit-sink"
+  destination = "storage.googleapis.com/${google_storage_bucket.audit_bucket.name}"
+  
+  # Filter for document processing related logs
+  filter = <<-EOT
+    protoPayload.serviceName="documentai.googleapis.com" OR 
+    protoPayload.serviceName="dlp.googleapis.com" OR
+    protoPayload.serviceName="workflows.googleapis.com"
+  EOT
+  
+  # Use a unique writer identity
+  unique_writer_identity = true
+  
+  depends_on = [
+    google_storage_bucket.audit_bucket,
+    google_project_service.required_apis
+  ]
+}
+
+# IAM binding for the logging sink
+resource "google_storage_bucket_iam_member" "audit_sink_writer":
+  bucket = google_storage_bucket.audit_bucket.name
+  role   = "roles/storage.objectCreator"
+  member = google_logging_project_sink.audit_sink.writer_identity
+  
+  depends_on = [google_logging_project_sink.audit_sink]
+}
+
+# Log-based metrics for monitoring document processing
+resource "google_logging_metric" "document_processing_volume":
+  name        = "document_processing_volume"
+  description = "Volume of documents processed by the intelligence pipeline"
+  
+  filter = <<-EOT
+    resource.type="cloud_workflow" AND 
+    jsonPayload.message:"Document processing completed"
+  EOT
+  
+  metric_descriptor {
+    metric_kind = "GAUGE"
+    value_type  = "INT64"
+    display_name = "Document Processing Volume"
+  }
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+resource "google_logging_metric" "sensitive_data_detections":
+  name        = "sensitive_data_detections"
+  description = "Count of sensitive data detections in processed documents"
+  
+  filter = <<-EOT
+    resource.type="dlp_job" AND 
+    jsonPayload.findings:*
+  EOT
+  
+  metric_descriptor {
+    metric_kind = "GAUGE"
+    value_type  = "INT64"
+    display_name = "Sensitive Data Detections"
+  }
+  
+  depends_on = [google_project_service.required_apis]
+}
+
+# Monitoring alert policy for high-risk document processing
+resource "google_monitoring_alert_policy" "high_risk_processing":
+  display_name = "High-Risk Document Processing Alert"
+  documentation {
+    content = "Alert triggered when high volume of sensitive data is detected in processed documents"
+  }
+  
+  conditions {
+    display_name = "High sensitive data detection rate"
+    
+    condition_threshold {
+      filter          = "metric.type=\"logging.googleapis.com/user/sensitive_data_detections\""
+      duration        = "300s"
+      comparison      = "COMPARISON_GT"
+      threshold_value = 10
+      
+      aggregations {
+        alignment_period   = "300s"
+        per_series_aligner = "ALIGN_RATE"
+      }
+    }
+  }
+  
+  # Auto-close alert after 30 minutes
+  alert_strategy {
+    auto_close = "1800s"
+  }
+  
+  enabled = true
+  
+  depends_on = [
+    google_logging_metric.sensitive_data_detections,
+    google_project_service.required_apis
+  ]
+}
+
+# Output values for integration and verification
+output "project_id":
+  description = "Google Cloud Project ID"
+  value       = var.project_id
+}
+
+output "region":
+  description = "Deployment region"
+  value       = var.region
+}
+
+output "input_bucket_name":
+  description = "Name of the input documents bucket"
+  value       = google_storage_bucket.input_bucket.name
+}
+
+output "output_bucket_name":
+  description = "Name of the processed documents bucket"
+  value       = google_storage_bucket.output_bucket.name
+}
+
+output "audit_bucket_name":
+  description = "Name of the audit logs bucket"
+  value       = google_storage_bucket.audit_bucket.name
+}
+
+output "document_processor_id":
+  description = "Document AI processor ID"
+  value       = google_document_ai_processor.document_processor.name
+}
+
+output "dlp_inspect_template_id":
+  description = "DLP inspection template ID"
+  value       = google_data_loss_prevention_inspect_template.pii_scanner.name
+}
+
+output "dlp_deidentify_template_id":
+  description = "DLP de-identification template ID"
+  value       = google_data_loss_prevention_deidentify_template.redaction_template.name
+}
+
+output "service_account_email":
+  description = "Service account email for Agentspace integration"
+  value       = google_service_account.agentspace_processor.email
+}
+
+output "bigquery_dataset_id":
+  description = "BigQuery dataset ID for document analytics"
+  value       = google_bigquery_dataset.document_intelligence.dataset_id
+}
+
+output "deployment_summary":
+  description = "Summary of deployed resources"
+  value = {
+    buckets_created          = 3
+    document_ai_processors  = 1
+    dlp_templates           = 2
+    bigquery_tables         = 1
+    monitoring_alerts       = 1
+    service_accounts        = 1
+    resource_suffix         = local.resource_suffix
+  }
+}

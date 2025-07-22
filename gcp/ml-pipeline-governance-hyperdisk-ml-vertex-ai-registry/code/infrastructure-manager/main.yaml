@@ -1,0 +1,758 @@
+# Infrastructure Manager Configuration for ML Pipeline Governance
+# Recipe: ML Pipeline Governance with Hyperdisk ML and Vertex AI Model Registry
+# Provider: Google Cloud Platform
+# Generated with recipe-generator-version: 1.3
+
+# Import required modules for Terraform resources
+imports:
+  - path: config.yaml
+
+resources:
+  # Enable required Google Cloud APIs
+  compute_api:
+    type: gcp-types/serviceusage-v1:services
+    name: ${var.project_id}/services/compute.googleapis.com
+    properties:
+      name: projects/${var.project_id}/services/compute.googleapis.com
+
+  aiplatform_api:
+    type: gcp-types/serviceusage-v1:services
+    name: ${var.project_id}/services/aiplatform.googleapis.com
+    properties:
+      name: projects/${var.project_id}/services/aiplatform.googleapis.com
+    metadata:
+      dependsOn:
+        - compute_api
+
+  workflows_api:
+    type: gcp-types/serviceusage-v1:services
+    name: ${var.project_id}/services/workflows.googleapis.com
+    properties:
+      name: projects/${var.project_id}/services/workflows.googleapis.com
+
+  monitoring_api:
+    type: gcp-types/serviceusage-v1:services
+    name: ${var.project_id}/services/monitoring.googleapis.com
+    properties:
+      name: projects/${var.project_id}/services/monitoring.googleapis.com
+
+  logging_api:
+    type: gcp-types/serviceusage-v1:services
+    name: ${var.project_id}/services/logging.googleapis.com
+    properties:
+      name: projects/${var.project_id}/services/logging.googleapis.com
+
+  storage_api:
+    type: gcp-types/serviceusage-v1:services
+    name: ${var.project_id}/services/storage.googleapis.com
+    properties:
+      name: projects/${var.project_id}/services/storage.googleapis.com
+
+  # Service Account for ML Governance
+  ml_governance_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: ml-governance-sa-${var.random_suffix}
+      displayName: ML Governance Service Account
+      description: Service account for ML pipeline governance automation
+      project: ${var.project_id}
+    metadata:
+      dependsOn:
+        - compute_api
+
+  # IAM bindings for ML Governance Service Account
+  ml_governance_aiplatform_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/aiplatform.user
+      member: serviceAccount:$(ref.ml_governance_service_account.email)
+    metadata:
+      dependsOn:
+        - ml_governance_service_account
+        - aiplatform_api
+
+  ml_governance_workflows_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/workflows.invoker
+      member: serviceAccount:$(ref.ml_governance_service_account.email)
+    metadata:
+      dependsOn:
+        - ml_governance_service_account
+        - workflows_api
+
+  ml_governance_monitoring_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/monitoring.metricWriter
+      member: serviceAccount:$(ref.ml_governance_service_account.email)
+    metadata:
+      dependsOn:
+        - ml_governance_service_account
+        - monitoring_api
+
+  # Cloud Storage Bucket for ML Training Data
+  ml_training_data_bucket:
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ml-training-data-${var.random_suffix}
+      project: ${var.project_id}
+      location: ${var.region}
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90
+              isLive: false
+      labels:
+        purpose: ml-training
+        governance: enabled
+        environment: ${var.environment}
+    metadata:
+      dependsOn:
+        - storage_api
+
+  # Hyperdisk ML Volume for High-Performance Training Data
+  ml_training_hyperdisk:
+    type: gcp-types/compute-v1:regionDisks
+    properties:
+      name: ml-training-hyperdisk-${var.random_suffix}
+      region: ${var.region}
+      project: ${var.project_id}
+      type: projects/${var.project_id}/regions/${var.region}/diskTypes/hyperdisk-ml
+      sizeGb: ${var.hyperdisk_size_gb}
+      provisionedThroughput: ${var.hyperdisk_throughput}
+      labels:
+        purpose: ml-training
+        storage-type: hyperdisk-ml
+        governance: enabled
+        environment: ${var.environment}
+      description: High-performance storage optimized for ML training workloads
+    metadata:
+      dependsOn:
+        - compute_api
+
+  # Compute Instance for ML Training with Hyperdisk ML Attachment
+  ml_training_instance:
+    type: gcp-types/compute-v1:instances
+    properties:
+      name: ml-training-instance-${var.random_suffix}
+      zone: ${var.zone}
+      project: ${var.project_id}
+      machineType: projects/${var.project_id}/zones/${var.zone}/machineTypes/${var.machine_type}
+      serviceAccounts:
+        - email: $(ref.ml_governance_service_account.email)
+          scopes:
+            - https://www.googleapis.com/auth/cloud-platform
+      disks:
+        - boot: true
+          autoDelete: true
+          initializeParams:
+            sourceImage: projects/debian-cloud/global/images/family/debian-11
+            diskSizeGb: 20
+            diskType: projects/${var.project_id}/zones/${var.zone}/diskTypes/pd-standard
+        - source: $(ref.ml_training_hyperdisk.selfLink)
+          mode: READ_ONLY
+          autoDelete: false
+      networkInterfaces:
+        - network: projects/${var.project_id}/global/networks/default
+          accessConfigs:
+            - type: ONE_TO_ONE_NAT
+              name: External NAT
+      metadata:
+        items:
+          - key: startup-script
+            value: |
+              #!/bin/bash
+              # Update system packages
+              apt-get update
+              apt-get install -y python3 python3-pip
+              
+              # Install Google Cloud SDK
+              curl https://sdk.cloud.google.com | bash
+              exec -l $SHELL
+              
+              # Install Python ML libraries
+              pip3 install tensorflow scikit-learn pandas numpy google-cloud-aiplatform
+              
+              # Create ML working directory
+              mkdir -p /opt/ml-governance
+              chown -R $(whoami):$(whoami) /opt/ml-governance
+              
+              # Log completion
+              echo "ML training instance setup completed" > /var/log/ml-setup.log
+      labels:
+        purpose: ml-training
+        storage-attached: hyperdisk-ml
+        governance: enabled
+        environment: ${var.environment}
+      tags:
+        items:
+          - ml-training
+          - governance-enabled
+    metadata:
+      dependsOn:
+        - ml_governance_service_account
+        - ml_training_hyperdisk
+
+  # Cloud Workflows for ML Governance Automation
+  ml_governance_workflow:
+    type: gcp-types/workflows-v1:projects.locations.workflows
+    properties:
+      name: ml-governance-workflow-${var.random_suffix}
+      parent: projects/${var.project_id}/locations/${var.region}
+      description: Automated ML governance and compliance validation workflow
+      labels:
+        purpose: ml-governance
+        automation: enabled
+        environment: ${var.environment}
+      serviceAccount: $(ref.ml_governance_service_account.email)
+      sourceContents: |
+        # ML Governance Workflow Definition
+        # Validates model quality, checks compliance, and updates registry
+        
+        main:
+          params: [args]
+          steps:
+          - init:
+              assign:
+                - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT")}
+                - region: ${var.region}
+                - model_id: ${args.model_id}
+                - workflow_start_time: ${time.format(sys.now())}
+          
+          - log_workflow_start:
+              call: sys.log
+              args:
+                text: ${"Starting ML governance workflow for model: " + model_id + " at " + workflow_start_time}
+                severity: INFO
+          
+          - validate_model_quality:
+              call: validate_model
+              args:
+                model_id: ${model_id}
+                region: ${region}
+                project_id: ${project_id}
+              result: validation_result
+          
+          - check_compliance_rules:
+              call: check_compliance
+              args:
+                model_id: ${model_id}
+                validation_result: ${validation_result}
+              result: compliance_result
+          
+          - conditional_approval:
+              switch:
+                - condition: ${validation_result.passed AND compliance_result.compliant}
+                  next: approve_model
+                - condition: true
+                  next: reject_model
+          
+          - approve_model:
+              parallel:
+                shared: [model_id, region, project_id]
+                branches:
+                  - update_registry_approved:
+                      call: update_model_registry
+                      args:
+                        model_id: ${model_id}
+                        status: approved
+                        governance_metadata:
+                          validation_passed: true
+                          compliance_status: compliant
+                          approval_timestamp: ${time.format(sys.now())}
+                  - send_approval_notification:
+                      call: send_notification
+                      args:
+                        message: ${"Model " + model_id + " approved for deployment"}
+                        severity: INFO
+                        recipients: ${var.notification_emails}
+              next: workflow_complete
+          
+          - reject_model:
+              parallel:
+                shared: [model_id, validation_result, compliance_result]
+                branches:
+                  - update_registry_rejected:
+                      call: update_model_registry
+                      args:
+                        model_id: ${model_id}
+                        status: rejected
+                        governance_metadata:
+                          validation_passed: ${validation_result.passed}
+                          compliance_status: ${compliance_result.status}
+                          rejection_reason: ${compliance_result.violations}
+                          rejection_timestamp: ${time.format(sys.now())}
+                  - send_rejection_notification:
+                      call: send_notification
+                      args:
+                        message: ${"Model " + model_id + " rejected. Violations: " + text.join(compliance_result.violations, ", ")}
+                        severity: WARNING
+                        recipients: ${var.notification_emails}
+              next: workflow_complete
+          
+          - workflow_complete:
+              call: sys.log
+              args:
+                text: ${"ML governance workflow completed for model: " + model_id}
+                severity: INFO
+              return:
+                workflow_result: success
+                model_id: ${model_id}
+                completion_time: ${time.format(sys.now())}
+        
+        # Subworkflow: Validate Model Quality
+        validate_model:
+          params: [model_id, region, project_id]
+          steps:
+          - log_validation_start:
+              call: sys.log
+              args:
+                text: ${"Starting model quality validation for: " + model_id}
+                severity: INFO
+          
+          - get_model_metadata:
+              call: http.get
+              args:
+                url: ${"https://aiplatform.googleapis.com/v1/projects/" + project_id + "/locations/" + region + "/models/" + model_id}
+                auth:
+                  type: OAuth
+                  scopes: ["https://www.googleapis.com/auth/cloud-platform"]
+              result: model_response
+          
+          - parse_model_metrics:
+              assign:
+                - model_metadata: ${model_response.body}
+                - performance_score: ${default(model_metadata.trainingPipeline.modelToUpload.artifactUri, 0.0)}
+                - validation_passed: ${performance_score >= var.performance_threshold}
+          
+          - log_validation_result:
+              call: sys.log
+              args:
+                text: ${"Model validation result - Score: " + string(performance_score) + ", Passed: " + string(validation_passed)}
+                severity: INFO
+          
+          - return_validation:
+              return:
+                passed: ${validation_passed}
+                score: ${performance_score}
+                metadata: ${model_metadata}
+        
+        # Subworkflow: Check Compliance Rules
+        check_compliance:
+          params: [model_id, validation_result]
+          steps:
+          - log_compliance_start:
+              call: sys.log
+              args:
+                text: ${"Starting compliance check for model: " + model_id}
+                severity: INFO
+          
+          - evaluate_governance_policies:
+              assign:
+                - violations: []
+                - required_labels: ["governance", "compliance"]
+                - model_labels: ${default(validation_result.metadata.labels, {})}
+          
+          - check_required_labels:
+              for:
+                value: label
+                in: ${required_labels}
+                steps:
+                  - check_label_exists:
+                      switch:
+                        - condition: ${label in keys(model_labels)}
+                          next: continue
+                        - condition: true
+                          assign:
+                            - violations: ${list.concat(violations, ["Missing required label: " + label])}
+          
+          - check_performance_threshold:
+              switch:
+                - condition: ${validation_result.score < var.performance_threshold}
+                  assign:
+                    - violations: ${list.concat(violations, ["Model performance below threshold: " + string(validation_result.score)])}
+          
+          - determine_compliance:
+              assign:
+                - compliant: ${len(violations) == 0}
+                - compliance_status: ${if(compliant, "compliant", "non-compliant")}
+          
+          - log_compliance_result:
+              call: sys.log
+              args:
+                text: ${"Compliance check result - Status: " + compliance_status + ", Violations: " + string(len(violations))}
+                severity: ${if(compliant, "INFO", "WARNING")}
+          
+          - return_compliance:
+              return:
+                compliant: ${compliant}
+                status: ${compliance_status}
+                violations: ${violations}
+        
+        # Subworkflow: Update Model Registry
+        update_model_registry:
+          params: [model_id, status, governance_metadata]
+          steps:
+          - log_registry_update:
+              call: sys.log
+              args:
+                text: ${"Updating model registry for: " + model_id + " with status: " + status}
+                severity: INFO
+          
+          - update_model_labels:
+              call: http.patch
+              args:
+                url: ${"https://aiplatform.googleapis.com/v1/projects/" + sys.get_env("GOOGLE_CLOUD_PROJECT") + "/locations/" + var.region + "/models/" + model_id}
+                auth:
+                  type: OAuth
+                  scopes: ["https://www.googleapis.com/auth/cloud-platform"]
+                body:
+                  labels:
+                    governance-status: ${status}
+                    last-validated: ${time.format(sys.now(), "%Y-%m-%d")}
+                    compliance-checked: "true"
+              result: update_response
+          
+          - log_registry_updated:
+              call: sys.log
+              args:
+                text: ${"Model registry updated successfully for: " + model_id}
+                severity: INFO
+          
+          - return_update_result:
+              return:
+                updated: true
+                model_id: ${model_id}
+                status: ${status}
+        
+        # Subworkflow: Send Notifications
+        send_notification:
+          params: [message, severity, recipients]
+          steps:
+          - log_notification:
+              call: sys.log
+              args:
+                text: ${"Notification: " + message}
+                severity: ${severity}
+          
+          - return_notification_result:
+              return:
+                sent: true
+                message: ${message}
+                timestamp: ${time.format(sys.now())}
+    metadata:
+      dependsOn:
+        - workflows_api
+        - ml_governance_service_account
+
+  # Cloud Monitoring Dashboard for ML Governance
+  ml_governance_dashboard:
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      parent: projects/${var.project_id}
+      displayName: ML Governance Metrics Dashboard
+      labels:
+        purpose: ml-governance
+        monitoring: enabled
+        environment: ${var.environment}
+      mosaicLayout:
+        tiles:
+          - width: 6
+            height: 4
+            widget:
+              title: Model Training Performance
+              scorecard:
+                timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'resource.type="gce_instance" resource.labels.instance_name=~"ml-training-instance.*"'
+                    aggregation:
+                      alignmentPeriod: 300s
+                      perSeriesAligner: ALIGN_MEAN
+                gaugeView:
+                  lowerBound: 0
+                  upperBound: 100
+          - width: 6
+            height: 4
+            xPos: 6
+            widget:
+              title: Hyperdisk ML Throughput
+              scorecard:
+                timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'resource.type="gce_disk" resource.labels.disk_name=~"ml-training-hyperdisk.*"'
+                    aggregation:
+                      alignmentPeriod: 300s
+                      perSeriesAligner: ALIGN_MEAN
+          - width: 12
+            height: 4
+            yPos: 4
+            widget:
+              title: Governance Workflow Executions
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="workflows.googleapis.com/Workflow"'
+                        aggregation:
+                          alignmentPeriod: 3600s
+                          perSeriesAligner: ALIGN_RATE
+                plotType: LINE
+          - width: 6
+            height: 4
+            yPos: 8
+            widget:
+              title: Model Registry Operations
+              scorecard:
+                timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'resource.type="aiplatform.googleapis.com/Model"'
+                    aggregation:
+                      alignmentPeriod: 300s
+                      perSeriesAligner: ALIGN_RATE
+          - width: 6
+            height: 4
+            xPos: 6
+            yPos: 8
+            widget:
+              title: Compliance Violations
+              scorecard:
+                timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'resource.type="workflows.googleapis.com/Workflow" severity="WARNING"'
+                    aggregation:
+                      alignmentPeriod: 3600s
+                      perSeriesAligner: ALIGN_SUM
+                gaugeView:
+                  lowerBound: 0
+                  upperBound: 10
+    metadata:
+      dependsOn:
+        - monitoring_api
+
+  # Log-based Metrics for ML Governance
+  ml_governance_log_metric:
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      parent: projects/${var.project_id}
+      name: ml_governance_workflow_executions
+      description: Counts ML governance workflow executions
+      filter: 'resource.type="workflows.googleapis.com/Workflow" AND "ML governance workflow"'
+      labelExtractors:
+        workflow_name: 'EXTRACT(jsonPayload.workflow_name)'
+        execution_status: 'EXTRACT(jsonPayload.execution_status)'
+      metricDescriptor:
+        metricKind: COUNTER
+        valueType: INT64
+        displayName: ML Governance Workflow Executions
+        description: Number of ML governance workflow executions
+        labels:
+          - key: workflow_name
+            valueType: STRING
+            description: Name of the governance workflow
+          - key: execution_status
+            valueType: STRING
+            description: Execution status (success/failure)
+    metadata:
+      dependsOn:
+        - logging_api
+        - ml_governance_workflow
+
+  # Alerting Policy for Governance Violations
+  ml_governance_alert_policy:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/${var.project_id}
+      displayName: ML Governance Violations Alert
+      documentation:
+        content: Alert triggered when ML governance workflow detects compliance violations
+        mimeType: text/markdown
+      conditions:
+        - displayName: High Governance Violations
+          conditionThreshold:
+            filter: 'metric.type="logging.googleapis.com/user/ml_governance_workflow_executions" resource.type="workflows.googleapis.com/Workflow"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: ${var.alert_threshold}
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_SUM
+      enabled: true
+      alertStrategy:
+        autoClose: 86400s  # 24 hours
+      notificationChannels: []  # Add notification channels as needed
+      severity: WARNING
+    metadata:
+      dependsOn:
+        - monitoring_api
+        - ml_governance_log_metric
+
+# Variables for customization
+variables:
+  project_id:
+    description: Google Cloud Project ID
+    type: string
+
+  region:
+    description: Google Cloud region for resources
+    type: string
+    default: us-central1
+
+  zone:
+    description: Google Cloud zone for compute resources
+    type: string
+    default: us-central1-a
+
+  environment:
+    description: Environment name (dev, staging, prod)
+    type: string
+    default: dev
+
+  random_suffix:
+    description: Random suffix for unique resource naming
+    type: string
+
+  hyperdisk_size_gb:
+    description: Size of Hyperdisk ML volume in GB
+    type: integer
+    default: 1000
+    constraints:
+      - range: [10, 65536]
+
+  hyperdisk_throughput:
+    description: Provisioned throughput for Hyperdisk ML in MiB/s
+    type: integer
+    default: 10000
+    constraints:
+      - range: [1000, 1200000]
+
+  machine_type:
+    description: Machine type for ML training instance
+    type: string
+    default: n1-standard-8
+
+  performance_threshold:
+    description: Minimum model performance threshold for approval
+    type: number
+    default: 0.85
+    constraints:
+      - range: [0.0, 1.0]
+
+  alert_threshold:
+    description: Threshold for governance violation alerts
+    type: integer
+    default: 5
+
+  notification_emails:
+    description: List of email addresses for governance notifications
+    type: array
+    default: []
+
+# Outputs for verification and integration
+outputs:
+  project_id:
+    description: Google Cloud Project ID
+    value: ${var.project_id}
+
+  region:
+    description: Deployment region
+    value: ${var.region}
+
+  ml_governance_service_account_email:
+    description: Email of the ML governance service account
+    value: $(ref.ml_governance_service_account.email)
+
+  ml_training_bucket_name:
+    description: Name of the ML training data bucket
+    value: $(ref.ml_training_data_bucket.name)
+
+  ml_training_bucket_url:
+    description: URL of the ML training data bucket
+    value: gs://$(ref.ml_training_data_bucket.name)
+
+  hyperdisk_ml_name:
+    description: Name of the Hyperdisk ML volume
+    value: $(ref.ml_training_hyperdisk.name)
+
+  hyperdisk_ml_self_link:
+    description: Self link of the Hyperdisk ML volume
+    value: $(ref.ml_training_hyperdisk.selfLink)
+
+  hyperdisk_throughput:
+    description: Provisioned throughput of Hyperdisk ML
+    value: ${var.hyperdisk_throughput} MiB/s
+
+  ml_training_instance_name:
+    description: Name of the ML training instance
+    value: $(ref.ml_training_instance.name)
+
+  ml_training_instance_self_link:
+    description: Self link of the ML training instance
+    value: $(ref.ml_training_instance.selfLink)
+
+  ml_training_instance_external_ip:
+    description: External IP address of the ML training instance
+    value: $(ref.ml_training_instance.networkInterfaces[0].accessConfigs[0].natIP)
+
+  governance_workflow_name:
+    description: Name of the ML governance workflow
+    value: $(ref.ml_governance_workflow.name)
+
+  governance_workflow_url:
+    description: URL to access the governance workflow
+    value: https://console.cloud.google.com/workflows/workflow/${var.region}/ml-governance-workflow-${var.random_suffix}
+
+  monitoring_dashboard_url:
+    description: URL to access the ML governance monitoring dashboard
+    value: https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.ml_governance_dashboard.name)
+
+  vertex_ai_console_url:
+    description: URL to access Vertex AI Model Registry
+    value: https://console.cloud.google.com/vertex-ai/models?project=${var.project_id}
+
+  deployment_summary:
+    description: Summary of deployed ML governance infrastructure
+    value: |
+      ML Pipeline Governance Infrastructure Deployed Successfully:
+      
+      High-Performance Storage:
+      - Hyperdisk ML Volume: $(ref.ml_training_hyperdisk.name)
+      - Throughput: ${var.hyperdisk_throughput} MiB/s
+      - Size: ${var.hyperdisk_size_gb} GB
+      
+      ML Training Infrastructure:
+      - Training Instance: $(ref.ml_training_instance.name)
+      - Machine Type: ${var.machine_type}
+      - Storage Attached: Hyperdisk ML (read-only)
+      
+      Governance Automation:
+      - Workflow: $(ref.ml_governance_workflow.name)
+      - Service Account: $(ref.ml_governance_service_account.email)
+      - Performance Threshold: ${var.performance_threshold}
+      
+      Data Management:
+      - Training Data Bucket: $(ref.ml_training_data_bucket.name)
+      - Versioning: Enabled
+      - Lifecycle Management: 90-day retention
+      
+      Monitoring & Compliance:
+      - Governance Dashboard: $(ref.ml_governance_dashboard.displayName)
+      - Log-based Metrics: ml_governance_workflow_executions
+      - Alert Policy: ML Governance Violations Alert
+      
+      Next Steps:
+      1. Upload training data to: gs://$(ref.ml_training_data_bucket.name)
+      2. Register models in Vertex AI Model Registry
+      3. Execute governance workflow for model validation
+      4. Monitor compliance through the governance dashboard

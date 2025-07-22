@@ -1,0 +1,729 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Serverless Real-Time Analytics Pipeline with Amazon Kinesis Data Streams and AWS Lambda'
+
+# Template metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Kinesis Configuration"
+        Parameters:
+          - KinesisStreamName
+          - KinesisShardCount
+          - KinesisRetentionPeriod
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaFunctionName
+          - LambdaMemorySize
+          - LambdaTimeout
+          - BatchSize
+          - MaximumBatchingWindowInSeconds
+      - Label:
+          default: "DynamoDB Configuration"
+        Parameters:
+          - DynamoDBTableName
+          - EnablePointInTimeRecovery
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableCloudWatchAlarms
+          - NotificationEmail
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+    ParameterLabels:
+      KinesisStreamName:
+        default: "Kinesis Stream Name"
+      KinesisShardCount:
+        default: "Number of Shards"
+      KinesisRetentionPeriod:
+        default: "Data Retention Period (hours)"
+      LambdaFunctionName:
+        default: "Lambda Function Name"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      BatchSize:
+        default: "Event Source Mapping Batch Size"
+      MaximumBatchingWindowInSeconds:
+        default: "Maximum Batching Window (seconds)"
+      DynamoDBTableName:
+        default: "DynamoDB Table Name"
+      EnablePointInTimeRecovery:
+        default: "Enable Point-in-Time Recovery"
+      EnableCloudWatchAlarms:
+        default: "Enable CloudWatch Alarms"
+      NotificationEmail:
+        default: "Notification Email Address"
+      Environment:
+        default: "Environment"
+      ProjectName:
+        default: "Project Name"
+
+# Template parameters
+Parameters:
+  # Kinesis parameters
+  KinesisStreamName:
+    Type: String
+    Default: 'real-time-analytics-stream'
+    Description: 'Name for the Kinesis Data Stream'
+    AllowedPattern: '^[a-zA-Z0-9_.-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, hyphens, underscores, and periods'
+    MaxLength: 128
+    MinLength: 1
+    
+  KinesisShardCount:
+    Type: Number
+    Default: 2
+    Description: 'Number of shards for the Kinesis stream'
+    MinValue: 1
+    MaxValue: 10
+    ConstraintDescription: 'Must be between 1 and 10'
+    
+  KinesisRetentionPeriod:
+    Type: Number
+    Default: 24
+    Description: 'Data retention period in hours (24-8760)'
+    MinValue: 24
+    MaxValue: 8760
+    ConstraintDescription: 'Must be between 24 hours and 365 days'
+
+  # Lambda parameters
+  LambdaFunctionName:
+    Type: String
+    Default: 'kinesis-stream-processor'
+    Description: 'Name for the Lambda function'
+    AllowedPattern: '^[a-zA-Z0-9_-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, hyphens, and underscores'
+    MaxLength: 64
+    MinLength: 1
+    
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    Description: 'Memory size for Lambda function in MB'
+    AllowedValues: [128, 256, 512, 1024, 1536, 2048, 3008]
+    
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    Description: 'Lambda function timeout in seconds'
+    MinValue: 1
+    MaxValue: 900
+    ConstraintDescription: 'Must be between 1 and 900 seconds'
+    
+  BatchSize:
+    Type: Number
+    Default: 100
+    Description: 'Maximum number of records to send to Lambda function'
+    MinValue: 1
+    MaxValue: 10000
+    ConstraintDescription: 'Must be between 1 and 10000'
+    
+  MaximumBatchingWindowInSeconds:
+    Type: Number
+    Default: 5
+    Description: 'Maximum time to wait before sending batch to Lambda'
+    MinValue: 0
+    MaxValue: 300
+    ConstraintDescription: 'Must be between 0 and 300 seconds'
+
+  # DynamoDB parameters
+  DynamoDBTableName:
+    Type: String
+    Default: 'analytics-results'
+    Description: 'Name for the DynamoDB table'
+    AllowedPattern: '^[a-zA-Z0-9_.-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, hyphens, underscores, and periods'
+    MaxLength: 255
+    MinLength: 3
+    
+  EnablePointInTimeRecovery:
+    Type: String
+    Default: 'false'
+    Description: 'Enable Point-in-Time Recovery for DynamoDB table'
+    AllowedValues: ['true', 'false']
+
+  # Monitoring parameters
+  EnableCloudWatchAlarms:
+    Type: String
+    Default: 'true'
+    Description: 'Enable CloudWatch alarms for monitoring'
+    AllowedValues: ['true', 'false']
+    
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for alarm notifications (optional)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+  # General parameters
+  Environment:
+    Type: String
+    Default: 'dev'
+    Description: 'Environment name (dev, staging, prod)'
+    AllowedValues: ['dev', 'staging', 'prod']
+    
+  ProjectName:
+    Type: String
+    Default: 'real-time-analytics'
+    Description: 'Project name for resource tagging'
+    AllowedPattern: '^[a-zA-Z0-9_-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, hyphens, and underscores'
+    MaxLength: 50
+    MinLength: 1
+
+# Conditional resource creation
+Conditions:
+  CreateCloudWatchAlarms: !Equals [!Ref EnableCloudWatchAlarms, 'true']
+  CreateSNSNotification: !And
+    - !Condition CreateCloudWatchAlarms
+    - !Not [!Equals [!Ref NotificationEmail, '']]
+  EnableDynamoDBPITR: !Equals [!Ref EnablePointInTimeRecovery, 'true']
+
+# Template resources
+Resources:
+  # DynamoDB table for storing processed analytics results
+  AnalyticsResultsTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: !Ref DynamoDBTableName
+      BillingMode: 'PAY_PER_REQUEST'
+      AttributeDefinitions:
+        - AttributeName: 'eventId'
+          AttributeType: 'S'
+        - AttributeName: 'timestamp'
+          AttributeType: 'N'
+      KeySchema:
+        - AttributeName: 'eventId'
+          KeyType: 'HASH'
+        - AttributeName: 'timestamp'
+          KeyType: 'RANGE'
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnableDynamoDBPITR, true, false]
+      StreamSpecification:
+        StreamViewType: 'NEW_AND_OLD_IMAGES'
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'ManagedBy'
+          Value: 'CloudFormation'
+    DeletionPolicy: 'Retain'
+    UpdateReplacePolicy: 'Retain'
+
+  # Kinesis Data Stream for real-time data ingestion
+  RealTimeAnalyticsStream:
+    Type: 'AWS::Kinesis::Stream'
+    Properties:
+      Name: !Ref KinesisStreamName
+      ShardCount: !Ref KinesisShardCount
+      RetentionPeriodHours: !Ref KinesisRetentionPeriod
+      StreamEncryption:
+        EncryptionType: 'KMS'
+        KeyId: 'alias/aws/kinesis'
+      StreamModeDetails:
+        StreamMode: 'PROVISIONED'
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'ManagedBy'
+          Value: 'CloudFormation'
+
+  # IAM role for Lambda function execution
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-kinesis-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: 'KinesisStreamProcessorPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Kinesis permissions
+              - Effect: 'Allow'
+                Action:
+                  - 'kinesis:DescribeStream'
+                  - 'kinesis:DescribeStreamSummary'
+                  - 'kinesis:GetRecords'
+                  - 'kinesis:GetShardIterator'
+                  - 'kinesis:ListShards'
+                  - 'kinesis:ListStreams'
+                  - 'kinesis:SubscribeToShard'
+                Resource: !GetAtt RealTimeAnalyticsStream.Arn
+              # DynamoDB permissions
+              - Effect: 'Allow'
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                Resource: !GetAtt AnalyticsResultsTable.Arn
+              # CloudWatch permissions for custom metrics
+              - Effect: 'Allow'
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': 'RealTimeAnalytics'
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'ManagedBy'
+          Value: 'CloudFormation'
+
+  # Lambda function for processing Kinesis stream records
+  KinesisStreamProcessor:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Runtime: 'python3.9'
+      Handler: 'lambda_function.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      ReservedConcurrencyLimit: 100
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref AnalyticsResultsTable
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import base64
+          import time
+          import os
+          from datetime import datetime
+          from decimal import Decimal
+
+          # Initialize AWS clients
+          dynamodb = boto3.resource('dynamodb')
+          cloudwatch = boto3.client('cloudwatch')
+
+          # Get table reference from environment variable
+          table_name = os.environ['DYNAMODB_TABLE']
+          table = dynamodb.Table(table_name)
+
+          def lambda_handler(event, context):
+              """
+              Process Kinesis stream records and store analytics in DynamoDB
+              """
+              print(f"Received {len(event['Records'])} records from Kinesis")
+              
+              processed_records = 0
+              failed_records = 0
+              
+              for record in event['Records']:
+                  try:
+                      # Decode Kinesis data
+                      payload = base64.b64decode(record['kinesis']['data'])
+                      data = json.loads(payload.decode('utf-8'))
+                      
+                      # Extract event information
+                      event_id = record['kinesis']['sequenceNumber']
+                      timestamp = int(record['kinesis']['approximateArrivalTimestamp'])
+                      
+                      # Process the data (example: calculate metrics)
+                      processed_data = process_analytics_data(data)
+                      
+                      # Store in DynamoDB
+                      store_analytics_result(event_id, timestamp, processed_data, data)
+                      
+                      # Send custom metrics to CloudWatch
+                      send_custom_metrics(processed_data)
+                      
+                      processed_records += 1
+                      
+                  except Exception as e:
+                      print(f"Error processing record: {str(e)}")
+                      failed_records += 1
+                      continue
+              
+              print(f"Successfully processed {processed_records} records, {failed_records} failed")
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'processed': processed_records,
+                      'failed': failed_records
+                  })
+              }
+
+          def process_analytics_data(data):
+              """
+              Process incoming data and calculate analytics metrics
+              """
+              processed = {
+                  'event_type': data.get('eventType', 'unknown'),
+                  'user_id': data.get('userId', 'anonymous'),
+                  'session_id': data.get('sessionId', ''),
+                  'device_type': data.get('deviceType', 'unknown'),
+                  'location': data.get('location', {}),
+                  'metrics': {}
+              }
+              
+              # Calculate custom metrics based on event type
+              if data.get('eventType') == 'page_view':
+                  processed['metrics'] = {
+                      'page_url': data.get('pageUrl', ''),
+                      'load_time': data.get('loadTime', 0),
+                      'bounce_rate': calculate_bounce_rate(data)
+                  }
+              elif data.get('eventType') == 'purchase':
+                  processed['metrics'] = {
+                      'amount': Decimal(str(data.get('amount', 0))),
+                      'currency': data.get('currency', 'USD'),
+                      'items_count': data.get('itemsCount', 0)
+                  }
+              elif data.get('eventType') == 'user_signup':
+                  processed['metrics'] = {
+                      'signup_method': data.get('signupMethod', 'email'),
+                      'campaign_source': data.get('campaignSource', 'direct')
+                  }
+              
+              return processed
+
+          def calculate_bounce_rate(data):
+              """
+              Example calculation for bounce rate analytics
+              """
+              session_length = data.get('sessionLength', 0)
+              pages_viewed = data.get('pagesViewed', 1)
+              
+              # Simple bounce rate calculation
+              if session_length < 30 and pages_viewed == 1:
+                  return 1.0  # High bounce rate
+              else:
+                  return 0.0  # Low bounce rate
+
+          def store_analytics_result(event_id, timestamp, processed_data, raw_data):
+              """
+              Store processed analytics in DynamoDB
+              """
+              try:
+                  table.put_item(
+                      Item={
+                          'eventId': event_id,
+                          'timestamp': timestamp,
+                          'processedAt': int(time.time()),
+                          'eventType': processed_data['event_type'],
+                          'userId': processed_data['user_id'],
+                          'sessionId': processed_data['session_id'],
+                          'deviceType': processed_data['device_type'],
+                          'location': processed_data['location'],
+                          'metrics': processed_data['metrics'],
+                          'rawData': raw_data
+                      }
+                  )
+              except Exception as e:
+                  print(f"Error storing data in DynamoDB: {str(e)}")
+                  raise
+
+          def send_custom_metrics(processed_data):
+              """
+              Send custom metrics to CloudWatch
+              """
+              try:
+                  # Send event type metrics
+                  cloudwatch.put_metric_data(
+                      Namespace='RealTimeAnalytics',
+                      MetricData=[
+                          {
+                              'MetricName': 'EventsProcessed',
+                              'Dimensions': [
+                                  {
+                                      'Name': 'EventType',
+                                      'Value': processed_data['event_type']
+                                  },
+                                  {
+                                      'Name': 'DeviceType',
+                                      'Value': processed_data['device_type']
+                                  }
+                              ],
+                              'Value': 1,
+                              'Unit': 'Count'
+                          }
+                      ]
+                  )
+                  
+                  # Send purchase metrics if applicable
+                  if processed_data['event_type'] == 'purchase':
+                      cloudwatch.put_metric_data(
+                          Namespace='RealTimeAnalytics',
+                          MetricData=[
+                              {
+                                  'MetricName': 'PurchaseAmount',
+                                  'Value': float(processed_data['metrics']['amount']),
+                                  'Unit': 'None'
+                              }
+                          ]
+                      )
+                      
+              except Exception as e:
+                  print(f"Error sending CloudWatch metrics: {str(e)}")
+                  # Don't raise exception to avoid processing failure
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'ManagedBy'
+          Value: 'CloudFormation'
+
+  # Event Source Mapping between Kinesis and Lambda
+  KinesisEventSourceMapping:
+    Type: 'AWS::Lambda::EventSourceMapping'
+    Properties:
+      EventSourceArn: !GetAtt RealTimeAnalyticsStream.Arn
+      FunctionName: !Ref KinesisStreamProcessor
+      StartingPosition: 'LATEST'
+      BatchSize: !Ref BatchSize
+      MaximumBatchingWindowInSeconds: !Ref MaximumBatchingWindowInSeconds
+      ParallelizationFactor: 2
+      MaximumRecordAgeInSeconds: 3600
+      BisectBatchOnFunctionError: true
+      MaximumRetryAttempts: 3
+      TumblingWindowInSeconds: 30
+
+  # SNS Topic for alarm notifications (conditional)
+  AlarmNotificationTopic:
+    Type: 'AWS::SNS::Topic'
+    Condition: CreateSNSNotification
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-alarm-notifications'
+      DisplayName: 'Real-Time Analytics Pipeline Alarms'
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'ManagedBy'
+          Value: 'CloudFormation'
+
+  # SNS Subscription for email notifications (conditional)
+  AlarmNotificationSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Condition: CreateSNSNotification
+    Properties:
+      TopicArn: !Ref AlarmNotificationTopic
+      Protocol: 'email'
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Alarm for Lambda function errors (conditional)
+  LambdaErrorAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-lambda-processor-errors'
+      AlarmDescription: 'Monitor Lambda processing errors in real-time analytics pipeline'
+      MetricName: 'Errors'
+      Namespace: 'AWS/Lambda'
+      Statistic: 'Sum'
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: 'GreaterThanOrEqualToThreshold'
+      TreatMissingData: 'notBreaching'
+      Dimensions:
+        - Name: 'FunctionName'
+          Value: !Ref KinesisStreamProcessor
+      AlarmActions:
+        - !If [CreateSNSNotification, !Ref AlarmNotificationTopic, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'ManagedBy'
+          Value: 'CloudFormation'
+
+  # CloudWatch Alarm for Lambda function duration (conditional)
+  LambdaDurationAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-lambda-processor-duration'
+      AlarmDescription: 'Monitor Lambda processing duration in real-time analytics pipeline'
+      MetricName: 'Duration'
+      Namespace: 'AWS/Lambda'
+      Statistic: 'Average'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref LambdaTimeout
+      ComparisonOperator: 'GreaterThanThreshold'
+      TreatMissingData: 'notBreaching'
+      Dimensions:
+        - Name: 'FunctionName'
+          Value: !Ref KinesisStreamProcessor
+      AlarmActions:
+        - !If [CreateSNSNotification, !Ref AlarmNotificationTopic, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'ManagedBy'
+          Value: 'CloudFormation'
+
+  # CloudWatch Alarm for DynamoDB throttling (conditional)
+  DynamoDBThrottleAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-dynamodb-throttling'
+      AlarmDescription: 'Monitor DynamoDB throttling events in real-time analytics pipeline'
+      MetricName: 'ThrottledRequests'
+      Namespace: 'AWS/DynamoDB'
+      Statistic: 'Sum'
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: 'GreaterThanOrEqualToThreshold'
+      TreatMissingData: 'notBreaching'
+      Dimensions:
+        - Name: 'TableName'
+          Value: !Ref AnalyticsResultsTable
+      AlarmActions:
+        - !If [CreateSNSNotification, !Ref AlarmNotificationTopic, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'ManagedBy'
+          Value: 'CloudFormation'
+
+  # CloudWatch Alarm for Kinesis iterator age (conditional)
+  KinesisIteratorAgeAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Condition: CreateCloudWatchAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-kinesis-iterator-age'
+      AlarmDescription: 'Monitor Kinesis iterator age for processing lag detection'
+      MetricName: 'IteratorAge'
+      Namespace: 'AWS/Kinesis'
+      Statistic: 'Maximum'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 60000
+      ComparisonOperator: 'GreaterThanThreshold'
+      TreatMissingData: 'notBreaching'
+      Dimensions:
+        - Name: 'StreamName'
+          Value: !Ref RealTimeAnalyticsStream
+      AlarmActions:
+        - !If [CreateSNSNotification, !Ref AlarmNotificationTopic, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'ManagedBy'
+          Value: 'CloudFormation'
+
+# Template outputs
+Outputs:
+  # Kinesis outputs
+  KinesisStreamName:
+    Description: 'Name of the Kinesis Data Stream'
+    Value: !Ref RealTimeAnalyticsStream
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisStreamName'
+      
+  KinesisStreamArn:
+    Description: 'ARN of the Kinesis Data Stream'
+    Value: !GetAtt RealTimeAnalyticsStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisStreamArn'
+
+  # Lambda outputs
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function'
+    Value: !Ref KinesisStreamProcessor
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+      
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function'
+    Value: !GetAtt KinesisStreamProcessor.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  # DynamoDB outputs
+  DynamoDBTableName:
+    Description: 'Name of the DynamoDB table'
+    Value: !Ref AnalyticsResultsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableName'
+      
+  DynamoDBTableArn:
+    Description: 'ARN of the DynamoDB table'
+    Value: !GetAtt AnalyticsResultsTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableArn'
+
+  # IAM outputs
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  # Event Source Mapping outputs
+  EventSourceMappingId:
+    Description: 'ID of the Kinesis-Lambda event source mapping'
+    Value: !Ref KinesisEventSourceMapping
+    Export:
+      Name: !Sub '${AWS::StackName}-EventSourceMappingId'
+
+  # SNS outputs (conditional)
+  AlarmNotificationTopicArn:
+    Condition: CreateSNSNotification
+    Description: 'ARN of the SNS topic for alarm notifications'
+    Value: !Ref AlarmNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlarmNotificationTopicArn'
+
+  # Testing outputs
+  TestDataProducerCommand:
+    Description: 'AWS CLI command to send test data to the Kinesis stream'
+    Value: !Sub |
+      aws kinesis put-record \
+        --stream-name ${RealTimeAnalyticsStream} \
+        --data '{"eventType":"page_view","userId":"user_1234","sessionId":"session_5678","deviceType":"desktop","pageUrl":"/home","loadTime":1200,"sessionLength":300,"pagesViewed":3}' \
+        --partition-key user_1234
+
+  # Monitoring outputs
+  CloudWatchDashboardUrl:
+    Description: 'URL to create a CloudWatch dashboard for monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-dashboard'
+
+  # Cost monitoring
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for the pipeline (USD, based on moderate usage)'
+    Value: 'Kinesis: $15-30, Lambda: $5-15, DynamoDB: $5-20, CloudWatch: $1-5. Total: ~$26-70/month'

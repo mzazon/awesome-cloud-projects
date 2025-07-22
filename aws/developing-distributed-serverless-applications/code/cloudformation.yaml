@@ -1,0 +1,883 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Multi-Region Applications with Aurora DSQL - Production-ready template for building globally distributed serverless applications with strong consistency'
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  PrimaryRegion:
+    Type: String
+    Default: us-east-1
+    Description: Primary AWS region for Aurora DSQL cluster
+    AllowedValues:
+      - us-east-1
+      - us-east-2
+      - us-west-2
+      - eu-west-1
+      - eu-central-1
+      - ap-southeast-1
+      - ap-northeast-1
+
+  SecondaryRegion:
+    Type: String
+    Default: us-east-2
+    Description: Secondary AWS region for Aurora DSQL cluster
+    AllowedValues:
+      - us-east-1
+      - us-east-2
+      - us-west-2
+      - eu-west-1
+      - eu-central-1
+      - ap-southeast-1
+      - ap-northeast-1
+
+  WitnessRegion:
+    Type: String
+    Default: us-west-2
+    Description: Witness region for Aurora DSQL multi-region configuration
+    AllowedValues:
+      - us-east-1
+      - us-east-2
+      - us-west-2
+      - eu-west-1
+      - eu-central-1
+      - ap-southeast-1
+      - ap-northeast-1
+
+  ResourcePrefix:
+    Type: String
+    Default: multi-region-app
+    Description: Prefix for all resource names
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '[a-z][a-z0-9-]*'
+    ConstraintDescription: Must start with lowercase letter, contain only lowercase letters, numbers, and hyphens
+
+  Environment:
+    Type: String
+    Default: Production
+    Description: Environment name for resource tagging
+    AllowedValues:
+      - Development
+      - Staging
+      - Production
+
+  EnableDeletionProtection:
+    Type: String
+    Default: 'true'
+    Description: Enable deletion protection for Aurora DSQL clusters
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    MinValue: 128
+    MaxValue: 3008
+    Description: Memory size for Lambda functions (MB)
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    Description: Timeout for Lambda functions (seconds)
+
+  ApiGatewayStage:
+    Type: String
+    Default: prod
+    Description: API Gateway deployment stage name
+    AllowedPattern: '[a-zA-Z0-9]*'
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  IsPrimaryRegion: !Equals [!Ref 'AWS::Region', !Ref PrimaryRegion]
+  IsSecondaryRegion: !Equals [!Ref 'AWS::Region', !Ref SecondaryRegion]
+  EnableDeletion: !Equals [!Ref EnableDeletionProtection, 'true']
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # IAM ROLE FOR LAMBDA FUNCTIONS
+  # ---------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-lambda-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AuroraDSQLAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dsql:DbConnect
+                  - dsql:DbConnectAdmin
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-lambda-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: MultiRegionApp
+
+  # ---------------------------------------------------------------------------
+  # AURORA DSQL CLUSTER (PRIMARY REGION)
+  # ---------------------------------------------------------------------------
+  PrimaryDSQLCluster:
+    Type: AWS::DSQL::Cluster
+    Condition: IsPrimaryRegion
+    Properties:
+      ClusterIdentifier: !Sub '${ResourcePrefix}-primary'
+      DeletionProtection: !Ref EnableDeletionProtection
+      MultiRegionProperties:
+        WitnessRegion: !Ref WitnessRegion
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-primary-cluster'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: MultiRegionApp
+        - Key: Region
+          Value: Primary
+
+  # ---------------------------------------------------------------------------
+  # AURORA DSQL CLUSTER (SECONDARY REGION)
+  # ---------------------------------------------------------------------------
+  SecondaryDSQLCluster:
+    Type: AWS::DSQL::Cluster
+    Condition: IsSecondaryRegion
+    Properties:
+      ClusterIdentifier: !Sub '${ResourcePrefix}-secondary'
+      DeletionProtection: !Ref EnableDeletionProtection
+      MultiRegionProperties:
+        WitnessRegion: !Ref WitnessRegion
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-secondary-cluster'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: MultiRegionApp
+        - Key: Region
+          Value: Secondary
+
+  # ---------------------------------------------------------------------------
+  # LAMBDA FUNCTION (PRIMARY REGION)
+  # ---------------------------------------------------------------------------
+  PrimaryLambdaFunction:
+    Type: AWS::Lambda::Function
+    Condition: IsPrimaryRegion
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-primary'
+      Runtime: python3.11
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          DSQL_ENDPOINT: !GetAtt PrimaryDSQLCluster.Endpoint
+          AWS_REGION: !Ref 'AWS::Region'
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          import logging
+          from typing import Dict, Any
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          # Aurora DSQL connection parameters
+          DSQL_ENDPOINT = os.environ.get('DSQL_ENDPOINT')
+          DSQL_REGION = os.environ.get('AWS_REGION')
+          
+          def get_dsql_client():
+              """Create Aurora DSQL client with IAM authentication"""
+              try:
+                  return boto3.client('dsql', region_name=DSQL_REGION)
+              except Exception as e:
+                  logger.error(f"Failed to create DSQL client: {str(e)}")
+                  raise
+          
+          def execute_query(query: str, parameters: list = None) -> Dict[str, Any]:
+              """Execute query against Aurora DSQL cluster"""
+              try:
+                  client = get_dsql_client()
+                  
+                  request = {
+                      'Database': 'postgres',
+                      'Sql': query
+                  }
+                  
+                  if parameters:
+                      request['Parameters'] = parameters
+                  
+                  response = client.execute_statement(**request)
+                  return response
+              except Exception as e:
+                  logger.error(f"Query execution failed: {str(e)}")
+                  raise
+          
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """Main Lambda handler for multi-region application"""
+              try:
+                  # Parse request
+                  http_method = event.get('httpMethod', 'GET')
+                  path = event.get('path', '/')
+                  body = event.get('body')
+                  
+                  logger.info(f"Processing {http_method} request to {path}")
+                  
+                  # Handle different API endpoints
+                  if path == '/health':
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({
+                              'status': 'healthy',
+                              'region': DSQL_REGION,
+                              'timestamp': context.aws_request_id
+                          })
+                      }
+                  
+                  elif path == '/users' and http_method == 'GET':
+                      # Get all users
+                      result = execute_query(
+                          "SELECT id, name, email, created_at FROM users ORDER BY created_at DESC"
+                      )
+                      
+                      users = []
+                      if 'Records' in result:
+                          for record in result['Records']:
+                              users.append({
+                                  'id': record[0]['longValue'],
+                                  'name': record[1]['stringValue'],
+                                  'email': record[2]['stringValue'],
+                                  'created_at': record[3]['stringValue']
+                              })
+                      
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({
+                              'users': users,
+                              'region': DSQL_REGION,
+                              'count': len(users)
+                          })
+                      }
+                  
+                  elif path == '/users' and http_method == 'POST':
+                      # Create new user
+                      data = json.loads(body) if body else {}
+                      name = data.get('name')
+                      email = data.get('email')
+                      
+                      if not name or not email:
+                          return {
+                              'statusCode': 400,
+                              'headers': {
+                                  'Content-Type': 'application/json',
+                                  'Access-Control-Allow-Origin': '*'
+                              },
+                              'body': json.dumps({'error': 'Name and email are required'})
+                          }
+                      
+                      result = execute_query(
+                          "INSERT INTO users (name, email) VALUES (?, ?) RETURNING id",
+                          [{'stringValue': name}, {'stringValue': email}]
+                      )
+                      
+                      user_id = result['Records'][0][0]['longValue']
+                      
+                      return {
+                          'statusCode': 201,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({
+                              'id': user_id,
+                              'name': name,
+                              'email': email,
+                              'region': DSQL_REGION
+                          })
+                      }
+                  
+                  else:
+                      return {
+                          'statusCode': 404,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({'error': 'Not found'})
+                      }
+              
+              except Exception as e:
+                  logger.error(f"Unhandled error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({'error': 'Internal server error'})
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-primary-lambda'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: MultiRegionApp
+
+  # ---------------------------------------------------------------------------
+  # LAMBDA FUNCTION (SECONDARY REGION)
+  # ---------------------------------------------------------------------------
+  SecondaryLambdaFunction:
+    Type: AWS::Lambda::Function
+    Condition: IsSecondaryRegion
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-secondary'
+      Runtime: python3.11
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          DSQL_ENDPOINT: !GetAtt SecondaryDSQLCluster.Endpoint
+          AWS_REGION: !Ref 'AWS::Region'
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          import logging
+          from typing import Dict, Any
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          # Aurora DSQL connection parameters
+          DSQL_ENDPOINT = os.environ.get('DSQL_ENDPOINT')
+          DSQL_REGION = os.environ.get('AWS_REGION')
+          
+          def get_dsql_client():
+              """Create Aurora DSQL client with IAM authentication"""
+              try:
+                  return boto3.client('dsql', region_name=DSQL_REGION)
+              except Exception as e:
+                  logger.error(f"Failed to create DSQL client: {str(e)}")
+                  raise
+          
+          def execute_query(query: str, parameters: list = None) -> Dict[str, Any]:
+              """Execute query against Aurora DSQL cluster"""
+              try:
+                  client = get_dsql_client()
+                  
+                  request = {
+                      'Database': 'postgres',
+                      'Sql': query
+                  }
+                  
+                  if parameters:
+                      request['Parameters'] = parameters
+                  
+                  response = client.execute_statement(**request)
+                  return response
+              except Exception as e:
+                  logger.error(f"Query execution failed: {str(e)}")
+                  raise
+          
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """Main Lambda handler for multi-region application"""
+              try:
+                  # Parse request
+                  http_method = event.get('httpMethod', 'GET')
+                  path = event.get('path', '/')
+                  body = event.get('body')
+                  
+                  logger.info(f"Processing {http_method} request to {path}")
+                  
+                  # Handle different API endpoints
+                  if path == '/health':
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({
+                              'status': 'healthy',
+                              'region': DSQL_REGION,
+                              'timestamp': context.aws_request_id
+                          })
+                      }
+                  
+                  elif path == '/users' and http_method == 'GET':
+                      # Get all users
+                      result = execute_query(
+                          "SELECT id, name, email, created_at FROM users ORDER BY created_at DESC"
+                      )
+                      
+                      users = []
+                      if 'Records' in result:
+                          for record in result['Records']:
+                              users.append({
+                                  'id': record[0]['longValue'],
+                                  'name': record[1]['stringValue'],
+                                  'email': record[2]['stringValue'],
+                                  'created_at': record[3]['stringValue']
+                              })
+                      
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({
+                              'users': users,
+                              'region': DSQL_REGION,
+                              'count': len(users)
+                          })
+                      }
+                  
+                  elif path == '/users' and http_method == 'POST':
+                      # Create new user
+                      data = json.loads(body) if body else {}
+                      name = data.get('name')
+                      email = data.get('email')
+                      
+                      if not name or not email:
+                          return {
+                              'statusCode': 400,
+                              'headers': {
+                                  'Content-Type': 'application/json',
+                                  'Access-Control-Allow-Origin': '*'
+                              },
+                              'body': json.dumps({'error': 'Name and email are required'})
+                          }
+                      
+                      result = execute_query(
+                          "INSERT INTO users (name, email) VALUES (?, ?) RETURNING id",
+                          [{'stringValue': name}, {'stringValue': email}]
+                      )
+                      
+                      user_id = result['Records'][0][0]['longValue']
+                      
+                      return {
+                          'statusCode': 201,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({
+                              'id': user_id,
+                              'name': name,
+                              'email': email,
+                              'region': DSQL_REGION
+                          })
+                      }
+                  
+                  else:
+                      return {
+                          'statusCode': 404,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({'error': 'Not found'})
+                      }
+              
+              except Exception as e:
+                  logger.error(f"Unhandled error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({'error': 'Internal server error'})
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-secondary-lambda'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: MultiRegionApp
+
+  # ---------------------------------------------------------------------------
+  # API GATEWAY (PRIMARY REGION)
+  # ---------------------------------------------------------------------------
+  PrimaryApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Condition: IsPrimaryRegion
+    Properties:
+      Name: !Sub '${ResourcePrefix}-api-primary'
+      Description: Multi-region API Gateway - Primary Region
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-api-primary'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: MultiRegionApp
+
+  # Health Resource (Primary)
+  PrimaryHealthResource:
+    Type: AWS::ApiGateway::Resource
+    Condition: IsPrimaryRegion
+    Properties:
+      RestApiId: !Ref PrimaryApiGateway
+      ParentId: !GetAtt PrimaryApiGateway.RootResourceId
+      PathPart: health
+
+  # Users Resource (Primary)
+  PrimaryUsersResource:
+    Type: AWS::ApiGateway::Resource
+    Condition: IsPrimaryRegion
+    Properties:
+      RestApiId: !Ref PrimaryApiGateway
+      ParentId: !GetAtt PrimaryApiGateway.RootResourceId
+      PathPart: users
+
+  # Health GET Method (Primary)
+  PrimaryHealthGetMethod:
+    Type: AWS::ApiGateway::Method
+    Condition: IsPrimaryRegion
+    Properties:
+      RestApiId: !Ref PrimaryApiGateway
+      ResourceId: !Ref PrimaryHealthResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PrimaryLambdaFunction.Arn}/invocations'
+
+  # Users GET Method (Primary)
+  PrimaryUsersGetMethod:
+    Type: AWS::ApiGateway::Method
+    Condition: IsPrimaryRegion
+    Properties:
+      RestApiId: !Ref PrimaryApiGateway
+      ResourceId: !Ref PrimaryUsersResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PrimaryLambdaFunction.Arn}/invocations'
+
+  # Users POST Method (Primary)
+  PrimaryUsersPostMethod:
+    Type: AWS::ApiGateway::Method
+    Condition: IsPrimaryRegion
+    Properties:
+      RestApiId: !Ref PrimaryApiGateway
+      ResourceId: !Ref PrimaryUsersResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PrimaryLambdaFunction.Arn}/invocations'
+
+  # API Gateway Deployment (Primary)
+  PrimaryApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Condition: IsPrimaryRegion
+    DependsOn:
+      - PrimaryHealthGetMethod
+      - PrimaryUsersGetMethod
+      - PrimaryUsersPostMethod
+    Properties:
+      RestApiId: !Ref PrimaryApiGateway
+      StageName: !Ref ApiGatewayStage
+      StageDescription: Production deployment
+
+  # Lambda Permission for API Gateway (Primary)
+  PrimaryLambdaApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Condition: IsPrimaryRegion
+    Properties:
+      FunctionName: !Ref PrimaryLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PrimaryApiGateway}/*/*/*'
+
+  # ---------------------------------------------------------------------------
+  # API GATEWAY (SECONDARY REGION)
+  # ---------------------------------------------------------------------------
+  SecondaryApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Condition: IsSecondaryRegion
+    Properties:
+      Name: !Sub '${ResourcePrefix}-api-secondary'
+      Description: Multi-region API Gateway - Secondary Region
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-api-secondary'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: MultiRegionApp
+
+  # Health Resource (Secondary)
+  SecondaryHealthResource:
+    Type: AWS::ApiGateway::Resource
+    Condition: IsSecondaryRegion
+    Properties:
+      RestApiId: !Ref SecondaryApiGateway
+      ParentId: !GetAtt SecondaryApiGateway.RootResourceId
+      PathPart: health
+
+  # Users Resource (Secondary)
+  SecondaryUsersResource:
+    Type: AWS::ApiGateway::Resource
+    Condition: IsSecondaryRegion
+    Properties:
+      RestApiId: !Ref SecondaryApiGateway
+      ParentId: !GetAtt SecondaryApiGateway.RootResourceId
+      PathPart: users
+
+  # Health GET Method (Secondary)
+  SecondaryHealthGetMethod:
+    Type: AWS::ApiGateway::Method
+    Condition: IsSecondaryRegion
+    Properties:
+      RestApiId: !Ref SecondaryApiGateway
+      ResourceId: !Ref SecondaryHealthResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SecondaryLambdaFunction.Arn}/invocations'
+
+  # Users GET Method (Secondary)
+  SecondaryUsersGetMethod:
+    Type: AWS::ApiGateway::Method
+    Condition: IsSecondaryRegion
+    Properties:
+      RestApiId: !Ref SecondaryApiGateway
+      ResourceId: !Ref SecondaryUsersResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SecondaryLambdaFunction.Arn}/invocations'
+
+  # Users POST Method (Secondary)
+  SecondaryUsersPostMethod:
+    Type: AWS::ApiGateway::Method
+    Condition: IsSecondaryRegion
+    Properties:
+      RestApiId: !Ref SecondaryApiGateway
+      ResourceId: !Ref SecondaryUsersResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SecondaryLambdaFunction.Arn}/invocations'
+
+  # API Gateway Deployment (Secondary)
+  SecondaryApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Condition: IsSecondaryRegion
+    DependsOn:
+      - SecondaryHealthGetMethod
+      - SecondaryUsersGetMethod
+      - SecondaryUsersPostMethod
+    Properties:
+      RestApiId: !Ref SecondaryApiGateway
+      StageName: !Ref ApiGatewayStage
+      StageDescription: Production deployment
+
+  # Lambda Permission for API Gateway (Secondary)
+  SecondaryLambdaApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Condition: IsSecondaryRegion
+    Properties:
+      FunctionName: !Ref SecondaryLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SecondaryApiGateway}/*/*/*'
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  # Primary Region Outputs
+  PrimaryDSQLClusterIdentifier:
+    Condition: IsPrimaryRegion
+    Description: Aurora DSQL Cluster Identifier in Primary Region
+    Value: !Ref PrimaryDSQLCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryClusterIdentifier'
+
+  PrimaryDSQLClusterEndpoint:
+    Condition: IsPrimaryRegion
+    Description: Aurora DSQL Cluster Endpoint in Primary Region
+    Value: !GetAtt PrimaryDSQLCluster.Endpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryClusterEndpoint'
+
+  PrimaryLambdaFunctionArn:
+    Condition: IsPrimaryRegion
+    Description: Primary Lambda Function ARN
+    Value: !GetAtt PrimaryLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryLambdaArn'
+
+  PrimaryApiGatewayUrl:
+    Condition: IsPrimaryRegion
+    Description: Primary API Gateway URL
+    Value: !Sub 'https://${PrimaryApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${ApiGatewayStage}'
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryApiUrl'
+
+  # Secondary Region Outputs
+  SecondaryDSQLClusterIdentifier:
+    Condition: IsSecondaryRegion
+    Description: Aurora DSQL Cluster Identifier in Secondary Region
+    Value: !Ref SecondaryDSQLCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-SecondaryClusterIdentifier'
+
+  SecondaryDSQLClusterEndpoint:
+    Condition: IsSecondaryRegion
+    Description: Aurora DSQL Cluster Endpoint in Secondary Region
+    Value: !GetAtt SecondaryDSQLCluster.Endpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-SecondaryClusterEndpoint'
+
+  SecondaryLambdaFunctionArn:
+    Condition: IsSecondaryRegion
+    Description: Secondary Lambda Function ARN
+    Value: !GetAtt SecondaryLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SecondaryLambdaArn'
+
+  SecondaryApiGatewayUrl:
+    Condition: IsSecondaryRegion
+    Description: Secondary API Gateway URL
+    Value: !Sub 'https://${SecondaryApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${ApiGatewayStage}'
+    Export:
+      Name: !Sub '${AWS::StackName}-SecondaryApiUrl'
+
+  # Shared Outputs
+  LambdaExecutionRoleArn:
+    Description: Lambda Execution Role ARN
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaRoleArn'
+
+  WitnessRegion:
+    Description: Witness Region for Aurora DSQL
+    Value: !Ref WitnessRegion
+    Export:
+      Name: !Sub '${AWS::StackName}-WitnessRegion'
+
+  Environment:
+    Description: Environment Tag
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Multi-Region Configuration
+        Parameters:
+          - PrimaryRegion
+          - SecondaryRegion
+          - WitnessRegion
+      - Label:
+          default: Resource Configuration
+        Parameters:
+          - ResourcePrefix
+          - Environment
+          - EnableDeletionProtection
+      - Label:
+          default: Lambda Configuration
+        Parameters:
+          - LambdaMemorySize
+          - LambdaTimeout
+      - Label:
+          default: API Gateway Configuration
+        Parameters:
+          - ApiGatewayStage
+    ParameterLabels:
+      PrimaryRegion:
+        default: Primary AWS Region
+      SecondaryRegion:
+        default: Secondary AWS Region
+      WitnessRegion:
+        default: Witness AWS Region
+      ResourcePrefix:
+        default: Resource Name Prefix
+      Environment:
+        default: Environment Type
+      EnableDeletionProtection:
+        default: Enable Deletion Protection
+      LambdaMemorySize:
+        default: Lambda Memory Size (MB)
+      LambdaTimeout:
+        default: Lambda Timeout (seconds)
+      ApiGatewayStage:
+        default: API Gateway Stage Name
+
+  AWS::CloudFormation::Designer:
+    Layers:
+      Infrastructure:
+        - Aurora DSQL Clusters
+        - IAM Roles and Policies
+      Compute:
+        - Lambda Functions
+      API:
+        - API Gateway
+        - REST API Resources and Methods

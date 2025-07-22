@@ -1,0 +1,646 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Cross-Account Data Access with AWS Lake Formation
+  This template sets up Lake Formation with LF-Tags for secure cross-account data sharing.
+  It creates S3 data lake, Glue Data Catalog, and Lake Formation governance infrastructure
+  for implementing tag-based access control across AWS accounts.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Cross-Account Configuration"
+        Parameters:
+          - ConsumerAccountId
+          - ResourceShareName
+      - Label:
+          default: "Data Lake Configuration"
+        Parameters:
+          - DataLakeBucketName
+          - EnableVersioning
+          - DataRetentionDays
+      - Label:
+          default: "Lake Formation Configuration"
+        Parameters:
+          - EnableLakeFormationGovernance
+          - CreateSampleData
+      - Label:
+          default: "Glue Configuration"
+        Parameters:
+          - GlueCrawlerName
+          - GlueServiceRoleName
+    ParameterLabels:
+      ConsumerAccountId:
+        default: "Consumer AWS Account ID"
+      ResourceShareName:
+        default: "RAM Resource Share Name"
+      DataLakeBucketName:
+        default: "S3 Data Lake Bucket Name"
+      EnableVersioning:
+        default: "Enable S3 Versioning"
+      DataRetentionDays:
+        default: "Data Retention Period (Days)"
+      EnableLakeFormationGovernance:
+        default: "Enable Lake Formation Governance"
+      CreateSampleData:
+        default: "Create Sample Data"
+      GlueCrawlerName:
+        default: "Glue Crawler Name"
+      GlueServiceRoleName:
+        default: "Glue Service Role Name"
+
+Parameters:
+  ConsumerAccountId:
+    Type: String
+    Description: AWS Account ID that will consume shared data lake resources
+    AllowedPattern: '^[0-9]{12}$'
+    ConstraintDescription: Must be a valid 12-digit AWS Account ID
+    
+  ResourceShareName:
+    Type: String
+    Default: lake-formation-cross-account-share
+    Description: Name for the AWS RAM resource share
+    AllowedPattern: '^[a-zA-Z0-9\-_]{1,255}$'
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, and underscores
+    
+  DataLakeBucketName:
+    Type: String
+    Description: Name for the S3 data lake bucket (must be globally unique)
+    AllowedPattern: '^[a-z0-9\-]{3,63}$'
+    ConstraintDescription: Must be 3-63 characters, lowercase letters, numbers, and hyphens only
+    
+  EnableVersioning:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable S3 bucket versioning for data governance
+    
+  DataRetentionDays:
+    Type: Number
+    Default: 2555
+    MinValue: 1
+    MaxValue: 3653
+    Description: Number of days to retain data in the data lake (1-10 years)
+    
+  EnableLakeFormationGovernance:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable Lake Formation governance features
+    
+  CreateSampleData:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Create sample datasets for testing
+    
+  GlueCrawlerName:
+    Type: String
+    Default: financial-reports-crawler
+    Description: Name for the Glue crawler
+    AllowedPattern: '^[a-zA-Z0-9\-_]{1,255}$'
+    ConstraintDescription: Must contain only alphanumeric characters, hyphens, and underscores
+    
+  GlueServiceRoleName:
+    Type: String
+    Default: AWSGlueServiceRole-LakeFormation
+    Description: Name for the Glue service role
+    AllowedPattern: '^[a-zA-Z0-9\-_]{1,64}$'
+    ConstraintDescription: Must be 1-64 characters, alphanumeric, hyphens, and underscores only
+
+Conditions:
+  ShouldEnableVersioning: !Equals [!Ref EnableVersioning, 'true']
+  ShouldEnableLakeFormation: !Equals [!Ref EnableLakeFormationGovernance, 'true']
+  ShouldCreateSampleData: !Equals [!Ref CreateSampleData, 'true']
+  HasConsumerAccount: !Not [!Equals [!Ref ConsumerAccountId, '']]
+
+Resources:
+  # S3 Data Lake Bucket
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref DataLakeBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [ShouldEnableVersioning, Enabled, Suspended]
+      LifecycleConfiguration:
+        Rules:
+          - Id: DataLakeLifecycleRule
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+            ExpirationInDays: !Ref DataRetentionDays
+            NoncurrentVersionExpirationInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref DataLakeLogGroup
+      Tags:
+        - Key: Purpose
+          Value: DataLake
+        - Key: LakeFormationManaged
+          Value: 'true'
+        - Key: Environment
+          Value: Production
+        - Key: DataClassification
+          Value: Confidential
+
+  # CloudWatch Log Group for S3 access logging
+  DataLakeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${DataLakeBucketName}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Purpose
+          Value: DataLakeLogging
+
+  # S3 Bucket Policy for Lake Formation
+  DataLakeBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataLakeBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowLakeFormationAccess
+            Effect: Allow
+            Principal:
+              Service: lakeformation.amazonaws.com
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:ListBucket
+              - s3:ListBucketVersions
+            Resource:
+              - !Sub '${DataLakeBucket}/*'
+              - !Ref DataLakeBucket
+          - Sid: AllowGlueAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt GlueServiceRole.Arn
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:ListBucket
+              - s3:ListBucketVersions
+            Resource:
+              - !Sub '${DataLakeBucket}/*'
+              - !Ref DataLakeBucket
+
+  # IAM Role for Glue Service
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref GlueServiceRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: DataLakeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${DataLakeBucket}/*'
+                  - !Ref DataLakeBucket
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                  - lakeformation:GrantPermissions
+                  - lakeformation:RevokePermissions
+                Resource: '*'
+      Tags:
+        - Key: Purpose
+          Value: GlueDataCatalog
+        - Key: LakeFormationManaged
+          Value: 'true'
+
+  # Glue Database for Financial Data
+  FinancialDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: financial_db
+        Description: Financial reporting database for cross-account sharing
+        Parameters:
+          department: finance
+          classification: confidential
+          data-category: financial
+
+  # Glue Database for Customer Data
+  CustomerDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: customer_db
+        Description: Customer information database
+        Parameters:
+          department: marketing
+          classification: internal
+          data-category: customer
+
+  # Glue Crawler for Financial Reports
+  FinancialReportsCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Ref GlueCrawlerName
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref FinancialDatabase
+      Description: Crawler for financial reports data
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${DataLakeBucket}/financial-reports/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": {
+              "AddOrUpdateBehavior": "InheritFromTable"
+            }
+          }
+        }
+      Tags:
+        Purpose: DataCatalog
+        DataSource: FinancialReports
+
+  # Lake Formation Data Lake Settings
+  LakeFormationDataLakeSettings:
+    Type: AWS::LakeFormation::DataLakeSettings
+    Condition: ShouldEnableLakeFormation
+    Properties:
+      Admins:
+        - DataLakePrincipalIdentifier: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+      CreateDatabaseDefaultPermissions: []
+      CreateTableDefaultPermissions: []
+      TrustedResourceOwners:
+        - !Ref AWS::AccountId
+
+  # Register S3 Location with Lake Formation
+  LakeFormationResource:
+    Type: AWS::LakeFormation::Resource
+    Condition: ShouldEnableLakeFormation
+    Properties:
+      ResourceArn: !Sub 'arn:aws:s3:::${DataLakeBucket}/'
+      UseServiceLinkedRole: true
+
+  # Lake Formation Tags - Department
+  LFTagDepartment:
+    Type: AWS::LakeFormation::Tag
+    Condition: ShouldEnableLakeFormation
+    Properties:
+      TagKey: department
+      TagValues:
+        - finance
+        - marketing
+        - engineering
+        - hr
+
+  # Lake Formation Tags - Classification
+  LFTagClassification:
+    Type: AWS::LakeFormation::Tag
+    Condition: ShouldEnableLakeFormation
+    Properties:
+      TagKey: classification
+      TagValues:
+        - public
+        - internal
+        - confidential
+        - restricted
+
+  # Lake Formation Tags - Data Category
+  LFTagDataCategory:
+    Type: AWS::LakeFormation::Tag
+    Condition: ShouldEnableLakeFormation
+    Properties:
+      TagKey: data-category
+      TagValues:
+        - financial
+        - customer
+        - operational
+        - analytics
+
+  # Lake Formation Tag Association - Financial Database
+  LFTagAssociationFinancialDB:
+    Type: AWS::LakeFormation::TagAssociation
+    Condition: ShouldEnableLakeFormation
+    Properties:
+      Resource:
+        Database:
+          Name: !Ref FinancialDatabase
+      LFTags:
+        - TagKey: !Ref LFTagDepartment
+          TagValues:
+            - finance
+        - TagKey: !Ref LFTagClassification
+          TagValues:
+            - confidential
+        - TagKey: !Ref LFTagDataCategory
+          TagValues:
+            - financial
+
+  # Lake Formation Tag Association - Customer Database
+  LFTagAssociationCustomerDB:
+    Type: AWS::LakeFormation::TagAssociation
+    Condition: ShouldEnableLakeFormation
+    Properties:
+      Resource:
+        Database:
+          Name: !Ref CustomerDatabase
+      LFTags:
+        - TagKey: !Ref LFTagDepartment
+          TagValues:
+            - marketing
+        - TagKey: !Ref LFTagClassification
+          TagValues:
+            - internal
+        - TagKey: !Ref LFTagDataCategory
+          TagValues:
+            - customer
+
+  # Cross-Account Permissions for Finance Department Data
+  CrossAccountFinancePermissions:
+    Type: AWS::LakeFormation::Permissions
+    Condition: HasConsumerAccount
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !Ref ConsumerAccountId
+      Resource:
+        LFTag:
+          TagKey: !Ref LFTagDepartment
+          TagValues:
+            - finance
+      Permissions:
+        - ASSOCIATE
+        - DESCRIBE
+      PermissionsWithGrantOption:
+        - ASSOCIATE
+
+  # AWS RAM Resource Share for Cross-Account Access
+  ResourceShare:
+    Type: AWS::RAM::ResourceShare
+    Condition: HasConsumerAccount
+    Properties:
+      Name: !Ref ResourceShareName
+      ResourceArns:
+        - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${FinancialDatabase}'
+      Principals:
+        - !Ref ConsumerAccountId
+      AllowExternalPrincipals: true
+      Tags:
+        - Key: Purpose
+          Value: LakeFormationCrossAccountSharing
+        - Key: TargetAccount
+          Value: !Ref ConsumerAccountId
+
+  # Lambda Function for Sample Data Creation
+  SampleDataCreatorFunction:
+    Type: AWS::Lambda::Function
+    Condition: ShouldCreateSampleData
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-sample-data-creator'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt SampleDataCreatorRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import csv
+          import io
+          import cfnresponse
+
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Create':
+                      s3_client = boto3.client('s3')
+                      bucket_name = event['ResourceProperties']['BucketName']
+                      
+                      # Create financial reports data
+                      financial_data = [
+                          ['department', 'revenue', 'expenses', 'profit', 'quarter'],
+                          ['finance', '1000000', '800000', '200000', 'Q1'],
+                          ['marketing', '500000', '450000', '50000', 'Q1'],
+                          ['engineering', '750000', '700000', '50000', 'Q1']
+                      ]
+                      
+                      # Create customer data
+                      customer_data = [
+                          ['customer_id', 'name', 'department', 'region'],
+                          ['1001', 'Acme Corp', 'finance', 'us-east'],
+                          ['1002', 'TechStart Inc', 'engineering', 'us-west'],
+                          ['1003', 'Marketing Pro', 'marketing', 'eu-west']
+                      ]
+                      
+                      # Upload financial data
+                      financial_csv = io.StringIO()
+                      writer = csv.writer(financial_csv)
+                      writer.writerows(financial_data)
+                      s3_client.put_object(
+                          Bucket=bucket_name,
+                          Key='financial-reports/2024-q1.csv',
+                          Body=financial_csv.getvalue(),
+                          ContentType='text/csv'
+                      )
+                      
+                      # Upload customer data
+                      customer_csv = io.StringIO()
+                      writer = csv.writer(customer_csv)
+                      writer.writerows(customer_data)
+                      s3_client.put_object(
+                          Bucket=bucket_name,
+                          Key='customer-data/customers.csv',
+                          Body=customer_csv.getvalue(),
+                          ContentType='text/csv'
+                      )
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'Message': 'Sample data created successfully'
+                      })
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      'Error': str(e)
+                  })
+
+  # IAM Role for Sample Data Creator Lambda
+  SampleDataCreatorRole:
+    Type: AWS::IAM::Role
+    Condition: ShouldCreateSampleData
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3DataLakeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub '${DataLakeBucket}/*'
+
+  # Custom Resource to Create Sample Data
+  SampleDataResource:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: ShouldCreateSampleData
+    Properties:
+      ServiceToken: !GetAtt SampleDataCreatorFunction.Arn
+      BucketName: !Ref DataLakeBucket
+
+Outputs:
+  DataLakeBucketName:
+    Description: Name of the S3 data lake bucket
+    Value: !Ref DataLakeBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataLakeBucket'
+
+  DataLakeBucketArn:
+    Description: ARN of the S3 data lake bucket
+    Value: !GetAtt DataLakeBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataLakeBucketArn'
+
+  FinancialDatabaseName:
+    Description: Name of the financial database in Glue Data Catalog
+    Value: !Ref FinancialDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-FinancialDatabase'
+
+  CustomerDatabaseName:
+    Description: Name of the customer database in Glue Data Catalog
+    Value: !Ref CustomerDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomerDatabase'
+
+  GlueServiceRoleArn:
+    Description: ARN of the Glue service role
+    Value: !GetAtt GlueServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueServiceRole'
+
+  GlueCrawlerName:
+    Description: Name of the Glue crawler for financial reports
+    Value: !Ref FinancialReportsCrawler
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueCrawler'
+
+  ResourceShareArn:
+    Condition: HasConsumerAccount
+    Description: ARN of the AWS RAM resource share for cross-account access
+    Value: !GetAtt ResourceShare.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ResourceShare'
+
+  ResourceShareName:
+    Condition: HasConsumerAccount
+    Description: Name of the AWS RAM resource share
+    Value: !Ref ResourceShare
+    Export:
+      Name: !Sub '${AWS::StackName}-ResourceShareName'
+
+  ProducerAccountId:
+    Description: AWS Account ID of the data producer (current account)
+    Value: !Ref AWS::AccountId
+    Export:
+      Name: !Sub '${AWS::StackName}-ProducerAccountId'
+
+  ConsumerAccountId:
+    Condition: HasConsumerAccount
+    Description: AWS Account ID of the data consumer
+    Value: !Ref ConsumerAccountId
+    Export:
+      Name: !Sub '${AWS::StackName}-ConsumerAccountId'
+
+  LakeFormationDataLakeArn:
+    Condition: ShouldEnableLakeFormation
+    Description: ARN of the Lake Formation data lake
+    Value: !Sub 'arn:aws:lakeformation:${AWS::Region}:${AWS::AccountId}:data-lake'
+    Export:
+      Name: !Sub '${AWS::StackName}-LakeFormationDataLake'
+
+  DepartmentTagKey:
+    Condition: ShouldEnableLakeFormation
+    Description: Lake Formation tag key for department classification
+    Value: !Ref LFTagDepartment
+    Export:
+      Name: !Sub '${AWS::StackName}-DepartmentTag'
+
+  ClassificationTagKey:
+    Condition: ShouldEnableLakeFormation
+    Description: Lake Formation tag key for data classification
+    Value: !Ref LFTagClassification
+    Export:
+      Name: !Sub '${AWS::StackName}-ClassificationTag'
+
+  DataCategoryTagKey:
+    Condition: ShouldEnableLakeFormation
+    Description: Lake Formation tag key for data category
+    Value: !Ref LFTagDataCategory
+    Export:
+      Name: !Sub '${AWS::StackName}-DataCategoryTag'
+
+  DeploymentRegion:
+    Description: AWS Region where resources are deployed
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub '${AWS::StackName}-Region'
+
+  StackName:
+    Description: Name of this CloudFormation stack
+    Value: !Ref AWS::StackName
+    Export:
+      Name: !Sub '${AWS::StackName}-StackName'

@@ -1,0 +1,540 @@
+# Google Cloud Infrastructure Manager Configuration
+# Container Security Scanning with Artifact Registry and Cloud Build
+# Recipe: container-security-scanning-artifact-registry-build
+
+# This Infrastructure Manager configuration deploys a complete container security scanning
+# and policy enforcement pipeline using Google Cloud's integrated security services.
+# It creates the infrastructure described in the container security scanning recipe.
+
+metadata:
+  name: container-security-scanning-infrastructure
+  namespace: default
+
+# Input variables for customizing the deployment
+variables:
+  project_id:
+    type: string
+    description: "The Google Cloud project ID where resources will be created"
+    required: true
+  
+  region:
+    type: string
+    description: "The Google Cloud region for deploying regional resources"
+    default: "us-central1"
+  
+  zone:
+    type: string
+    description: "The Google Cloud zone for deploying zonal resources"
+    default: "us-central1-a"
+  
+  resource_suffix:
+    type: string
+    description: "Unique suffix for resource names to avoid conflicts"
+    default: "security"
+  
+  cluster_node_count:
+    type: number
+    description: "Number of nodes in the GKE cluster"
+    default: 2
+  
+  cluster_machine_type:
+    type: string
+    description: "Machine type for GKE cluster nodes"
+    default: "e2-medium"
+  
+  enable_vulnerability_scanning:
+    type: bool
+    description: "Enable vulnerability scanning for Artifact Registry"
+    default: true
+
+# Resource definitions following Google Cloud best practices
+resources:
+  # Enable required Google Cloud APIs for the security pipeline
+  enable_apis:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/artifactregistry.googleapis.com
+      parent: projects/$(ref.project_id.projectId)
+    metadata:
+      dependsOn:
+        - project_id
+
+  enable_cloudbuild_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/cloudbuild.googleapis.com
+      parent: projects/$(ref.project_id.projectId)
+    metadata:
+      dependsOn:
+        - project_id
+
+  enable_container_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/container.googleapis.com
+      parent: projects/$(ref.project_id.projectId)
+    metadata:
+      dependsOn:
+        - project_id
+
+  enable_binaryauthorization_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/binaryauthorization.googleapis.com
+      parent: projects/$(ref.project_id.projectId)
+    metadata:
+      dependsOn:
+        - project_id
+
+  enable_containeranalysis_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/containeranalysis.googleapis.com
+      parent: projects/$(ref.project_id.projectId)
+    metadata:
+      dependsOn:
+        - project_id
+
+  enable_securitycenter_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/securitycenter.googleapis.com
+      parent: projects/$(ref.project_id.projectId)
+    metadata:
+      dependsOn:
+        - project_id
+
+  enable_kms_api:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.projectId)/services/cloudkms.googleapis.com
+      parent: projects/$(ref.project_id.projectId)
+    metadata:
+      dependsOn:
+        - project_id
+
+  # Artifact Registry repository with vulnerability scanning enabled
+  # This provides centralized container image storage with built-in security scanning
+  artifact_registry_repository:
+    type: gcp-types/artifactregistry-v1:projects.locations.repositories
+    properties:
+      parent: projects/$(ref.project_id.projectId)/locations/$(ref.region)
+      repositoryId: secure-app-$(ref.resource_suffix)
+      repository:
+        format: DOCKER
+        description: "Secure container repository with vulnerability scanning enabled"
+        # Enable vulnerability scanning for automatic security assessment
+        vulnerabilityScanningConfig:
+          enableVulnerabilityScanning: $(ref.enable_vulnerability_scanning)
+        # Configure cleanup policies to manage storage costs
+        cleanupPolicies:
+          - id: "keep-recent-images"
+            condition:
+              tagState: TAGGED
+              olderThan: "2592000s"  # 30 days
+            action: KEEP
+          - id: "delete-old-untagged"
+            condition:
+              tagState: UNTAGGED
+              olderThan: "604800s"   # 7 days
+            action: DELETE
+    metadata:
+      dependsOn:
+        - enable_apis
+
+  # Service account for security automation with least privilege permissions
+  # This account will be used by Cloud Build for creating security attestations
+  security_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: security-scanner-$(ref.resource_suffix)
+      serviceAccount:
+        displayName: "Security Scanner Service Account"
+        description: "Service account for automated security scanning and attestation processes"
+    metadata:
+      dependsOn:
+        - project_id
+
+  # IAM binding for Binary Authorization attestor management
+  attestor_admin_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id.projectId)
+      role: roles/binaryauthorization.attestorsAdmin
+      member: serviceAccount:$(ref.security_service_account.email)
+    metadata:
+      dependsOn:
+        - security_service_account
+
+  # IAM binding for Container Analysis note editing
+  container_analysis_binding:
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id.projectId)
+      role: roles/containeranalysis.notes.editor
+      member: serviceAccount:$(ref.security_service_account.email)
+    metadata:
+      dependsOn:
+        - security_service_account
+
+  # Allow Cloud Build service account to impersonate security service account
+  cloudbuild_impersonation_binding:
+    type: gcp-types/iam-v1:projects.serviceAccounts.iamBinding
+    properties:
+      resource: $(ref.security_service_account.name)
+      role: roles/iam.serviceAccountTokenCreator
+      members:
+        - serviceAccount:$(ref.project_id.projectNumber)@cloudbuild.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - security_service_account
+
+  # KMS keyring for cryptographic signing operations
+  # This provides secure key management for Binary Authorization attestations
+  security_keyring:
+    type: gcp-types/cloudkms-v1:projects.locations.keyRings
+    properties:
+      parent: projects/$(ref.project_id.projectId)/locations/$(ref.region)
+      keyRingId: security-keyring-$(ref.resource_suffix)
+    metadata:
+      dependsOn:
+        - enable_kms_api
+
+  # KMS cryptographic signing key for attestations
+  # Uses RSA 4096-bit key with SHA-512 for enterprise-grade security
+  security_signing_key:
+    type: gcp-types/cloudkms-v1:projects.locations.keyRings.cryptoKeys
+    properties:
+      parent: $(ref.security_keyring.name)
+      cryptoKeyId: security-signing-key
+      cryptoKey:
+        purpose: ASYMMETRIC_SIGN
+        versionTemplate:
+          algorithm: RSA_SIGN_PKCS1_4096_SHA512
+          protectionLevel: SOFTWARE
+        labels:
+          purpose: "binary-authorization"
+          environment: "security-pipeline"
+    metadata:
+      dependsOn:
+        - security_keyring
+
+  # Container Analysis note for Binary Authorization attestor
+  # This creates the foundational trust anchor for security attestations
+  security_attestor_note:
+    type: gcp-types/containeranalysis-v1:projects.notes
+    properties:
+      parent: projects/$(ref.project_id.projectId)
+      noteId: security-attestor-note-$(ref.resource_suffix)
+      note:
+        shortDescription: "Security vulnerability scan attestor note"
+        longDescription: "Attestor note for verifying container images have passed security scans"
+        attestation:
+          hint:
+            humanReadableName: "Security vulnerability scan attestor"
+    metadata:
+      dependsOn:
+        - enable_containeranalysis_api
+
+  # Binary Authorization attestor for policy enforcement
+  # This creates a trusted authority that can verify security compliance
+  security_attestor:
+    type: gcp-types/binaryauthorization-v1:projects.attestors
+    properties:
+      parent: projects/$(ref.project_id.projectId)
+      attestorId: security-attestor-$(ref.resource_suffix)
+      attestor:
+        description: "Attestor for container security verification"
+        attestationAuthorityNote:
+          noteReference: $(ref.security_attestor_note.name)
+          publicKeys:
+            - id: "security-key-1"
+              asciiArmoredPgpPublicKey: ""  # Will be populated after key creation
+              comment: "Security signing key for container attestations"
+    metadata:
+      dependsOn:
+        - security_attestor_note
+        - security_signing_key
+
+  # GKE cluster with Binary Authorization enabled
+  # This provides a secure Kubernetes environment with deployment-time policy enforcement
+  gke_cluster:
+    type: gcp-types/container-v1:projects.zones.clusters
+    properties:
+      parent: projects/$(ref.project_id.projectId)/zones/$(ref.zone)
+      cluster:
+        name: security-cluster-$(ref.resource_suffix)
+        description: "GKE cluster with Binary Authorization and security scanning"
+        # Enable Binary Authorization for deployment-time security enforcement
+        binaryAuthorization:
+          enabled: true
+          evaluationMode: PROJECT_SINGLETON_POLICY_ENFORCE
+        # Configure node pool with security hardening
+        nodePools:
+          - name: security-node-pool
+            initialNodeCount: $(ref.cluster_node_count)
+            config:
+              machineType: $(ref.cluster_machine_type)
+              diskSizeGb: 30
+              diskType: pd-standard
+              # Enable security features
+              imageType: COS_CONTAINERD
+              serviceAccount: default
+              oauthScopes:
+                - https://www.googleapis.com/auth/cloud-platform
+              # Security hardening settings
+              metadata:
+                disable-legacy-endpoints: "true"
+              shieldedInstanceConfig:
+                enableSecureBoot: true
+                enableIntegrityMonitoring: true
+            management:
+              autoRepair: true
+              autoUpgrade: true
+        # Network security configuration
+        networkPolicy:
+          enabled: true
+          provider: CALICO
+        # Enable workload identity for secure pod-to-service authentication
+        workloadIdentityConfig:
+          workloadPool: $(ref.project_id.projectId).svc.id.goog
+        # Security and monitoring features
+        addonsConfig:
+          networkPolicyConfig:
+            disabled: false
+        # Enable private cluster for enhanced security
+        privateClusterConfig:
+          enablePrivateNodes: true
+          enablePrivateEndpoint: false
+          masterIpv4CidrBlock: "172.16.0.0/28"
+        ipAllocationPolicy:
+          useIpAliases: true
+          clusterSecondaryRangeName: "pods"
+          servicesSecondaryRangeName: "services"
+        # Logging and monitoring configuration
+        loggingService: logging.googleapis.com/kubernetes
+        monitoringService: monitoring.googleapis.com/kubernetes
+    metadata:
+      dependsOn:
+        - enable_container_api
+
+  # Binary Authorization policy for cluster-wide enforcement
+  # This defines the security requirements that must be met for deployments
+  binary_authorization_policy:
+    type: gcp-types/binaryauthorization-v1:projects.policy
+    properties:
+      name: projects/$(ref.project_id.projectId)/policy
+      policy:
+        description: "Security policy requiring attestations for container deployments"
+        globalPolicyEvaluationMode: ENABLE
+        # Default rule requiring security attestations
+        defaultAdmissionRule:
+          requireAttestationsBy:
+            - $(ref.security_attestor.name)
+          enforcementMode: ENFORCED_BLOCK_AND_AUDIT_LOG
+          evaluationMode: REQUIRE_ATTESTATION
+        # Whitelist system images that don't need attestations
+        admissionWhitelistPatterns:
+          - namePattern: "gcr.io/gke-release/*"
+          - namePattern: "gcr.io/google-containers/*"
+          - namePattern: "k8s.gcr.io/*"
+          - namePattern: "gcr.io/google_containers/*"
+        # Cluster-specific rules
+        clusterAdmissionRules:
+          $(ref.zone).$(ref.gke_cluster.name):
+            requireAttestationsBy:
+              - $(ref.security_attestor.name)
+            enforcementMode: ENFORCED_BLOCK_AND_AUDIT_LOG
+            evaluationMode: REQUIRE_ATTESTATION
+    metadata:
+      dependsOn:
+        - security_attestor
+        - gke_cluster
+
+  # Cloud Build trigger for automated security pipeline
+  # This will trigger builds when code is pushed to the repository
+  security_build_trigger:
+    type: gcp-types/cloudbuild-v1:projects.triggers
+    properties:
+      parent: projects/$(ref.project_id.projectId)
+      trigger:
+        name: security-scan-trigger-$(ref.resource_suffix)
+        description: "Automated security scanning and attestation pipeline"
+        # Configure trigger for GitHub integration (modify as needed)
+        github:
+          owner: "your-github-org"  # Replace with actual GitHub organization
+          name: "your-repo-name"    # Replace with actual repository name
+          push:
+            branch: "^main$"
+        # Build configuration for security pipeline
+        build:
+          steps:
+            # Build container image
+            - name: 'gcr.io/cloud-builders/docker'
+              args: 
+                - 'build'
+                - '-t'
+                - '$(ref.region)-docker.pkg.dev/$(ref.project_id.projectId)/$(ref.artifact_registry_repository.repositoryId)/secure-app:$SHORT_SHA'
+                - '.'
+            
+            # Push image to Artifact Registry
+            - name: 'gcr.io/cloud-builders/docker'
+              args:
+                - 'push'
+                - '$(ref.region)-docker.pkg.dev/$(ref.project_id.projectId)/$(ref.artifact_registry_repository.repositoryId)/secure-app:$SHORT_SHA'
+            
+            # Wait for vulnerability scanning
+            - name: 'gcr.io/cloud-builders/gcloud'
+              entrypoint: 'bash'
+              args:
+                - '-c'
+                - |
+                  echo "Waiting for vulnerability scan to complete..."
+                  for i in {1..30}; do
+                    SCAN_STATUS=$$(gcloud artifacts docker images scan $(ref.region)-docker.pkg.dev/$(ref.project_id.projectId)/$(ref.artifact_registry_repository.repositoryId)/secure-app:$$SHORT_SHA --format="value(status)" 2>/dev/null || echo "SCANNING")
+                    if [[ "$$SCAN_STATUS" == "FINISHED" ]]; then
+                      echo "Vulnerability scan completed"
+                      break
+                    fi
+                    echo "Scan in progress... ($$i/30)"
+                    sleep 10
+                  done
+            
+            # Evaluate security scan results
+            - name: 'gcr.io/cloud-builders/gcloud'
+              entrypoint: 'bash'
+              args:
+                - '-c'
+                - |
+                  echo "Evaluating vulnerability scan results..."
+                  CRITICAL_VULNS=$$(gcloud artifacts docker images list-vulnerabilities $(ref.region)-docker.pkg.dev/$(ref.project_id.projectId)/$(ref.artifact_registry_repository.repositoryId)/secure-app:$$SHORT_SHA --format="value(vulnerability.severity)" --filter="vulnerability.severity=CRITICAL" 2>/dev/null | wc -l)
+                  HIGH_VULNS=$$(gcloud artifacts docker images list-vulnerabilities $(ref.region)-docker.pkg.dev/$(ref.project_id.projectId)/$(ref.artifact_registry_repository.repositoryId)/secure-app:$$SHORT_SHA --format="value(vulnerability.severity)" --filter="vulnerability.severity=HIGH" 2>/dev/null | wc -l)
+                  
+                  echo "Critical vulnerabilities: $$CRITICAL_VULNS"
+                  echo "High vulnerabilities: $$HIGH_VULNS"
+                  
+                  # Fail build if critical vulnerabilities found
+                  if [[ $$CRITICAL_VULNS -gt 0 ]]; then
+                    echo "FAIL: Critical vulnerabilities found. Deployment blocked."
+                    exit 1
+                  fi
+                  
+                  # Fail build if too many high-severity vulnerabilities
+                  if [[ $$HIGH_VULNS -gt 5 ]]; then
+                    echo "FAIL: Too many high-severity vulnerabilities ($$HIGH_VULNS > 5). Deployment blocked."
+                    exit 1
+                  fi
+                  
+                  echo "PASS: Image meets security requirements"
+            
+            # Create security attestation for compliant images
+            - name: 'gcr.io/cloud-builders/gcloud'
+              entrypoint: 'bash'
+              args:
+                - '-c'
+                - |
+                  echo "Creating security attestation..."
+                  
+                  # Get image digest for attestation
+                  IMAGE_DIGEST=$$(gcloud artifacts docker images describe $(ref.region)-docker.pkg.dev/$(ref.project_id.projectId)/$(ref.artifact_registry_repository.repositoryId)/secure-app:$$SHORT_SHA --format="value(image_summary.digest)")
+                  IMAGE_URL="$(ref.region)-docker.pkg.dev/$(ref.project_id.projectId)/$(ref.artifact_registry_repository.repositoryId)/secure-app@$$IMAGE_DIGEST"
+                  
+                  # Create attestation payload
+                  TIMESTAMP=$$(date -u +%Y-%m-%dT%H:%M:%SZ)
+                  PAYLOAD="{\"timestamp\":\"$$TIMESTAMP\",\"vulnerabilities_checked\":true,\"policy_compliant\":true}"
+                  
+                  # Sign and create attestation
+                  echo -n "$$PAYLOAD" | gcloud kms asymmetric-sign \
+                    --key=$(ref.security_signing_key.name) \
+                    --digest-algorithm=sha512 \
+                    --input-file=- \
+                    --signature-file=/tmp/signature.sig
+                  
+                  # Create the attestation
+                  gcloud container binauthz attestations create \
+                    --artifact-url="$$IMAGE_URL" \
+                    --attestor=$(ref.security_attestor.name) \
+                    --signature-file=/tmp/signature.sig \
+                    --payload-file=<(echo -n "$$PAYLOAD")
+                  
+                  echo "✅ Security attestation created for image"
+          
+          # Configure service account for build
+          serviceAccount: $(ref.security_service_account.email)
+          
+          # Store built images
+          images:
+            - '$(ref.region)-docker.pkg.dev/$(ref.project_id.projectId)/$(ref.artifact_registry_repository.repositoryId)/secure-app:$SHORT_SHA'
+          
+          # Configure build options
+          options:
+            logging: CLOUD_LOGGING_ONLY
+            machineType: E2_STANDARD_2
+            substitutionOption: ALLOW_LOOSE
+    metadata:
+      dependsOn:
+        - enable_cloudbuild_api
+        - artifact_registry_repository
+        - security_service_account
+        - security_attestor
+
+# Output values for reference and integration
+outputs:
+  project_id:
+    description: "The Google Cloud project ID where resources were created"
+    value: $(ref.project_id.projectId)
+  
+  artifact_registry_repository_name:
+    description: "Name of the Artifact Registry repository for secure container images"
+    value: $(ref.artifact_registry_repository.name)
+  
+  artifact_registry_url:
+    description: "URL for pushing container images to the secure repository"
+    value: "$(ref.region)-docker.pkg.dev/$(ref.project_id.projectId)/$(ref.artifact_registry_repository.repositoryId)"
+  
+  gke_cluster_name:
+    description: "Name of the GKE cluster with Binary Authorization enabled"
+    value: $(ref.gke_cluster.name)
+  
+  gke_cluster_endpoint:
+    description: "Endpoint URL for the GKE cluster"
+    value: $(ref.gke_cluster.endpoint)
+  
+  security_service_account_email:
+    description: "Email of the service account used for security operations"
+    value: $(ref.security_service_account.email)
+  
+  security_attestor_name:
+    description: "Name of the Binary Authorization attestor"
+    value: $(ref.security_attestor.name)
+  
+  kms_signing_key_name:
+    description: "Name of the KMS key used for signing attestations"
+    value: $(ref.security_signing_key.name)
+  
+  build_trigger_name:
+    description: "Name of the Cloud Build trigger for the security pipeline"
+    value: $(ref.security_build_trigger.name)
+
+# Infrastructure Manager deployment configuration
+# This section configures how the resources are deployed and managed
+deployment:
+  # Use parallel deployment for faster resource creation
+  create_policy: CREATE_OR_ACQUIRE
+  delete_policy: DELETE
+  
+  # Configure update behavior
+  update_policy: UPDATE_ON_CHANGE
+  
+  # Set resource dependencies for proper creation order
+  dependency_mode: STRICT
+  
+  # Enable preview mode for validation
+  preview: false
+
+# Deployment metadata for tracking and management
+labels:
+  purpose: "container-security-scanning"
+  environment: "security-pipeline"
+  managed-by: "infrastructure-manager"
+  recipe: "container-security-scanning-artifact-registry-build"

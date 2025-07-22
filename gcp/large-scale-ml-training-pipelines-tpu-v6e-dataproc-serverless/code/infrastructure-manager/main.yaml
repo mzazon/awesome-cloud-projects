@@ -1,0 +1,530 @@
+# Infrastructure Manager Configuration
+# Large-Scale ML Training Pipeline with Cloud TPU v6e and Dataproc Serverless
+# This configuration deploys a complete ML training infrastructure including:
+# - Cloud Storage buckets for data and model storage
+# - Cloud TPU v6e (Trillium) for high-performance training
+# - IAM roles and service accounts with least privilege access
+# - Monitoring and logging infrastructure
+
+terraform:
+  # Use the latest Google Cloud provider
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+  
+  # Backend configuration for state management
+  backend:
+    gcs:
+      bucket: "${var.terraform_state_bucket}"
+      prefix: "ml-training-pipeline"
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    
+  region:
+    type: string
+    description: "Primary region for resources"
+    default: "us-central2"
+    
+  zone:
+    type: string
+    description: "Zone for TPU deployment"
+    default: "us-central2-b"
+    
+  environment:
+    type: string
+    description: "Environment (dev, staging, prod)"
+    default: "dev"
+    validation:
+      condition: contains(["dev", "staging", "prod"], var.environment)
+      error_message: "Environment must be dev, staging, or prod."
+    
+  tpu_accelerator_type:
+    type: string
+    description: "TPU accelerator type"
+    default: "v6e-8"
+    validation:
+      condition: contains(["v6e-8", "v6e-16", "v6e-32"], var.tpu_accelerator_type)
+      error_message: "TPU type must be v6e-8, v6e-16, or v6e-32."
+    
+  bucket_storage_class:
+    type: string
+    description: "Storage class for ML data buckets"
+    default: "STANDARD"
+    
+  enable_monitoring:
+    type: bool
+    description: "Enable monitoring and logging"
+    default: true
+    
+  terraform_state_bucket:
+    type: string
+    description: "Bucket for Terraform state storage"
+
+# Local values for resource naming and configuration
+locals:
+  # Generate unique suffix for resource names
+  random_suffix: "${random_id.suffix.hex}"
+  
+  # Resource naming convention
+  name_prefix: "ml-training-${var.environment}"
+  
+  # Common labels for resource management
+  common_labels:
+    environment: "${var.environment}"
+    project: "ml-training-pipeline"
+    managed-by: "infrastructure-manager"
+    cost-center: "ml-training"
+  
+  # Storage bucket names (must be globally unique)
+  training_bucket_name: "${local.name_prefix}-data-${local.random_suffix}"
+  model_bucket_name: "${local.name_prefix}-models-${local.random_suffix}"
+  
+  # TPU configuration
+  tpu_name: "${local.name_prefix}-tpu-${local.random_suffix}"
+  
+  # Service account names
+  training_sa_name: "${local.name_prefix}-training-sa"
+  dataproc_sa_name: "${local.name_prefix}-dataproc-sa"
+
+# Random suffix for unique resource naming
+resources:
+  random_id:
+    suffix:
+      byte_length: 4
+
+  # Enable required Google Cloud APIs
+  google_project_service:
+    compute_api:
+      project: "${var.project_id}"
+      service: "compute.googleapis.com"
+      disable_on_destroy: false
+      
+    tpu_api:
+      project: "${var.project_id}"
+      service: "tpu.googleapis.com"
+      disable_on_destroy: false
+      
+    dataproc_api:
+      project: "${var.project_id}"
+      service: "dataproc.googleapis.com"
+      disable_on_destroy: false
+      
+    storage_api:
+      project: "${var.project_id}"
+      service: "storage.googleapis.com"
+      disable_on_destroy: false
+      
+    aiplatform_api:
+      project: "${var.project_id}"
+      service: "aiplatform.googleapis.com"
+      disable_on_destroy: false
+      
+    monitoring_api:
+      project: "${var.project_id}"
+      service: "monitoring.googleapis.com"
+      disable_on_destroy: false
+      condition: "${var.enable_monitoring}"
+      
+    logging_api:
+      project: "${var.project_id}"
+      service: "logging.googleapis.com"
+      disable_on_destroy: false
+      condition: "${var.enable_monitoring}"
+
+  # Service Account for TPU Training workloads
+  google_service_account:
+    training_service_account:
+      project: "${var.project_id}"
+      account_id: "${local.training_sa_name}"
+      display_name: "ML Training Service Account"
+      description: "Service account for TPU training workloads with least privilege access"
+      depends_on:
+        - "google_project_service.compute_api"
+        - "google_project_service.tpu_api"
+        - "google_project_service.aiplatform_api"
+    
+    # Service Account for Dataproc Serverless
+    dataproc_service_account:
+      project: "${var.project_id}"
+      account_id: "${local.dataproc_sa_name}"
+      display_name: "Dataproc Serverless Service Account"
+      description: "Service account for Dataproc Serverless preprocessing jobs"
+      depends_on:
+        - "google_project_service.dataproc_api"
+        - "google_project_service.storage_api"
+
+  # IAM roles for training service account
+  google_project_iam_member:
+    training_sa_tpu_admin:
+      project: "${var.project_id}"
+      role: "roles/tpu.admin"
+      member: "serviceAccount:${google_service_account.training_service_account.email}"
+      
+    training_sa_storage_admin:
+      project: "${var.project_id}"
+      role: "roles/storage.objectAdmin"
+      member: "serviceAccount:${google_service_account.training_service_account.email}"
+      
+    training_sa_ai_platform:
+      project: "${var.project_id}"
+      role: "roles/aiplatform.user"
+      member: "serviceAccount:${google_service_account.training_service_account.email}"
+      
+    training_sa_logging:
+      project: "${var.project_id}"
+      role: "roles/logging.logWriter"
+      member: "serviceAccount:${google_service_account.training_service_account.email}"
+      condition: "${var.enable_monitoring}"
+      
+    training_sa_monitoring:
+      project: "${var.project_id}"
+      role: "roles/monitoring.metricWriter"
+      member: "serviceAccount:${google_service_account.training_service_account.email}"
+      condition: "${var.enable_monitoring}"
+    
+    # IAM roles for Dataproc service account
+    dataproc_sa_dataproc_worker:
+      project: "${var.project_id}"
+      role: "roles/dataproc.worker"
+      member: "serviceAccount:${google_service_account.dataproc_service_account.email}"
+      
+    dataproc_sa_storage_admin:
+      project: "${var.project_id}"
+      role: "roles/storage.objectAdmin"
+      member: "serviceAccount:${google_service_account.dataproc_service_account.email}"
+
+  # Cloud Storage bucket for training data and preprocessing
+  google_storage_bucket:
+    training_data_bucket:
+      project: "${var.project_id}"
+      name: "${local.training_bucket_name}"
+      location: "${var.region}"
+      storage_class: "${var.bucket_storage_class}"
+      force_destroy: true
+      
+      # Enable versioning for data protection
+      versioning:
+        enabled: true
+      
+      # Lifecycle management for cost optimization
+      lifecycle_rule:
+        - condition:
+            age: 90
+          action:
+            type: "SetStorageClass"
+            storage_class: "NEARLINE"
+        - condition:
+            age: 365
+          action:
+            type: "SetStorageClass"
+            storage_class: "COLDLINE"
+      
+      # CORS configuration for web access
+      cors:
+        - origin: ["*"]
+          method: ["GET", "POST", "PUT"]
+          response_header: ["Content-Type"]
+          max_age_seconds: 3600
+      
+      labels: "${local.common_labels}"
+      depends_on:
+        - "google_project_service.storage_api"
+    
+    # Cloud Storage bucket for trained models
+    model_artifacts_bucket:
+      project: "${var.project_id}"
+      name: "${local.model_bucket_name}"
+      location: "${var.region}"
+      storage_class: "${var.bucket_storage_class}"
+      force_destroy: true
+      
+      # Enable versioning for model artifact management
+      versioning:
+        enabled: true
+      
+      # Uniform bucket-level access for security
+      uniform_bucket_level_access: true
+      
+      labels: "${local.common_labels}"
+      depends_on:
+        - "google_project_service.storage_api"
+
+  # Default VPC network for TPU (uses existing default network)
+  data:
+    google_compute_network:
+      default:
+        name: "default"
+        project: "${var.project_id}"
+
+  # Cloud TPU v6e instance for high-performance training
+  google_tpu_v2_vm:
+    training_tpu:
+      name: "${local.tpu_name}"
+      zone: "${var.zone}"
+      accelerator_type: "${var.tpu_accelerator_type}"
+      runtime_version: "tpu-ubuntu2204-base"
+      
+      # Network configuration
+      network_config:
+        network: "${data.google_compute_network.default.self_link}"
+        subnetwork: "${data.google_compute_network.default.self_link}"
+        enable_external_ips: true
+      
+      # Service account configuration
+      service_account:
+        email: "${google_service_account.training_service_account.email}"
+        scopes:
+          - "https://www.googleapis.com/auth/cloud-platform"
+      
+      # Metadata for identification and configuration
+      metadata:
+        environment: "${var.environment}"
+        training-pipeline: "ml-training-tpu-v6e"
+        
+      # Scheduling configuration for cost optimization
+      scheduling_config:
+        preemptible: false  # Set to true for development workloads
+      
+      # Network tags for firewall rules
+      tags: ["ml-training", "tpu-v6e"]
+      
+      labels: "${local.common_labels}"
+      depends_on:
+        - "google_project_service.tpu_api"
+        - "google_service_account.training_service_account"
+        - "google_project_iam_member.training_sa_tpu_admin"
+
+  # Firewall rule for TPU access (if needed for custom networking)
+  google_compute_firewall:
+    tpu_access:
+      name: "${local.name_prefix}-tpu-access"
+      project: "${var.project_id}"
+      network: "${data.google_compute_network.default.name}"
+      
+      # Allow TPU communication
+      allow:
+        - protocol: "tcp"
+          ports: ["8470-8480"]  # TPU communication ports
+      
+      # Apply to TPU instances
+      target_tags: ["ml-training", "tpu-v6e"]
+      
+      # Allow from TPU subnets and internal networks
+      source_ranges: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+      
+      description: "Firewall rule for TPU v6e training communication"
+      depends_on:
+        - "google_project_service.compute_api"
+
+  # Cloud Monitoring Dashboard for TPU training (conditional)
+  google_monitoring_dashboard:
+    tpu_training_dashboard:
+      count: "${var.enable_monitoring ? 1 : 0}"
+      display_name: "TPU v6e Training Pipeline Dashboard"
+      
+      dashboard_json: |
+        {
+          "displayName": "TPU v6e Training Dashboard",
+          "mosaicLayout": {
+            "tiles": [
+              {
+                "width": 6,
+                "height": 4,
+                "widget": {
+                  "title": "TPU Utilization",
+                  "xyChart": {
+                    "dataSets": [
+                      {
+                        "timeSeriesQuery": {
+                          "timeSeriesFilter": {
+                            "filter": "resource.type=\"tpu_worker\" AND resource.labels.project_id=\"${var.project_id}\"",
+                            "aggregation": {
+                              "alignmentPeriod": "60s",
+                              "perSeriesAligner": "ALIGN_MEAN",
+                              "crossSeriesReducer": "REDUCE_MEAN",
+                              "groupByFields": ["resource.labels.tpu_node_id"]
+                            }
+                          }
+                        },
+                        "plotType": "LINE"
+                      }
+                    ],
+                    "yAxis": {
+                      "label": "Utilization %",
+                      "scale": "LINEAR"
+                    }
+                  }
+                }
+              },
+              {
+                "width": 6,
+                "height": 4,
+                "xPos": 6,
+                "widget": {
+                  "title": "Training Job Status",
+                  "xyChart": {
+                    "dataSets": [
+                      {
+                        "timeSeriesQuery": {
+                          "timeSeriesFilter": {
+                            "filter": "resource.type=\"aiplatform.googleapis.com/CustomJob\" AND resource.labels.project_id=\"${var.project_id}\"",
+                            "aggregation": {
+                              "alignmentPeriod": "300s",
+                              "perSeriesAligner": "ALIGN_COUNT",
+                              "crossSeriesReducer": "REDUCE_SUM"
+                            }
+                          }
+                        },
+                        "plotType": "STACKED_BAR"
+                      }
+                    ]
+                  }
+                }
+              },
+              {
+                "width": 12,
+                "height": 4,
+                "yPos": 4,
+                "widget": {
+                  "title": "Storage Bucket Operations",
+                  "xyChart": {
+                    "dataSets": [
+                      {
+                        "timeSeriesQuery": {
+                          "timeSeriesFilter": {
+                            "filter": "resource.type=\"storage.googleapis.com/Bucket\" AND resource.labels.project_id=\"${var.project_id}\"",
+                            "aggregation": {
+                              "alignmentPeriod": "300s",
+                              "perSeriesAligner": "ALIGN_RATE",
+                              "crossSeriesReducer": "REDUCE_SUM",
+                              "groupByFields": ["resource.labels.bucket_name"]
+                            }
+                          }
+                        },
+                        "plotType": "LINE"
+                      }
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        }
+      
+      depends_on:
+        - "google_project_service.monitoring_api"
+
+  # Cloud Logging sink for training logs (conditional)
+  google_logging_project_sink:
+    training_logs:
+      count: "${var.enable_monitoring ? 1 : 0}"
+      name: "ml-training-logs"
+      project: "${var.project_id}"
+      
+      # Filter for TPU and training-related logs
+      filter: |
+        resource.type="tpu_worker" OR
+        resource.type="aiplatform.googleapis.com/CustomJob" OR
+        (resource.type="gce_instance" AND labels.training-pipeline="ml-training-tpu-v6e")
+      
+      # Send logs to Cloud Storage for long-term retention
+      destination: "storage.googleapis.com/${google_storage_bucket.training_data_bucket.name}/logs"
+      
+      # Create a dedicated service account for log writing
+      unique_writer_identity: true
+      
+      depends_on:
+        - "google_project_service.logging_api"
+        - "google_storage_bucket.training_data_bucket"
+
+  # Grant the logging sink service account access to the bucket
+  google_storage_bucket_iam_member:
+    logging_sink_writer:
+      count: "${var.enable_monitoring ? 1 : 0}"
+      bucket: "${google_storage_bucket.training_data_bucket.name}"
+      role: "roles/storage.objectCreator"
+      member: "${google_logging_project_sink.training_logs[0].writer_identity}"
+      
+      depends_on:
+        - "google_logging_project_sink.training_logs"
+
+# Outputs for integration and verification
+outputs:
+  # Storage bucket information
+  training_bucket_name:
+    description: "Name of the training data bucket"
+    value: "${google_storage_bucket.training_data_bucket.name}"
+    
+  training_bucket_url:
+    description: "GS URL of the training data bucket"
+    value: "gs://${google_storage_bucket.training_data_bucket.name}"
+    
+  model_bucket_name:
+    description: "Name of the model artifacts bucket"
+    value: "${google_storage_bucket.model_artifacts_bucket.name}"
+    
+  model_bucket_url:
+    description: "GS URL of the model artifacts bucket"
+    value: "gs://${google_storage_bucket.model_artifacts_bucket.name}"
+  
+  # TPU information
+  tpu_name:
+    description: "Name of the TPU v6e instance"
+    value: "${google_tpu_v2_vm.training_tpu.name}"
+    
+  tpu_zone:
+    description: "Zone where the TPU is deployed"
+    value: "${google_tpu_v2_vm.training_tpu.zone}"
+    
+  tpu_accelerator_type:
+    description: "TPU accelerator type"
+    value: "${google_tpu_v2_vm.training_tpu.accelerator_type}"
+    
+  tpu_runtime_version:
+    description: "TPU runtime version"
+    value: "${google_tpu_v2_vm.training_tpu.runtime_version}"
+    
+  tpu_network_endpoints:
+    description: "TPU network endpoints for connection"
+    value: "${google_tpu_v2_vm.training_tpu.network_endpoints}"
+  
+  # Service account information
+  training_service_account_email:
+    description: "Email of the training service account"
+    value: "${google_service_account.training_service_account.email}"
+    
+  dataproc_service_account_email:
+    description: "Email of the Dataproc service account"
+    value: "${google_service_account.dataproc_service_account.email}"
+  
+  # Project and environment information
+  project_id:
+    description: "Google Cloud Project ID"
+    value: "${var.project_id}"
+    
+  region:
+    description: "Primary deployment region"
+    value: "${var.region}"
+    
+  environment:
+    description: "Environment name"
+    value: "${var.environment}"
+  
+  # Monitoring information (conditional)
+  monitoring_dashboard_url:
+    description: "URL to the monitoring dashboard"
+    value: "${var.enable_monitoring ? \"https://console.cloud.google.com/monitoring/dashboards/custom/${google_monitoring_dashboard.tpu_training_dashboard[0].id}?project=${var.project_id}\" : \"Monitoring disabled\"}"
+  
+  # Connection commands for easy access
+  tpu_ssh_command:
+    description: "Command to SSH into the TPU"
+    value: "gcloud compute tpus tpu-vm ssh ${google_tpu_v2_vm.training_tpu.name} --zone=${google_tpu_v2_vm.training_tpu.zone}"
+    
+  dataproc_submit_command:
+    description: "Base command for submitting Dataproc Serverless jobs"
+    value: "gcloud dataproc batches submit pyspark [SCRIPT_PATH] --region=${var.region} --service-account=${google_service_account.dataproc_service_account.email}"

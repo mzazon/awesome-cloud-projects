@@ -1,0 +1,878 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'IoT Data Visualization with QuickSight - Complete infrastructure for collecting, processing, and visualizing IoT sensor data using AWS IoT Core, Kinesis, S3, and QuickSight'
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "IoT Configuration"
+        Parameters:
+          - IoTThingName
+          - IoTTopicName
+      - Label:
+          default: "Data Processing Configuration"
+        Parameters:
+          - KinesisShardCount
+          - FirehoseBufferSize
+          - FirehoseBufferInterval
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - S3BucketName
+          - DataRetentionDays
+      - Label:
+          default: "QuickSight Configuration"
+        Parameters:
+          - QuickSightEdition
+          - QuickSightUserEmail
+    ParameterLabels:
+      Environment:
+        default: "Deployment Environment"
+      ProjectName:
+        default: "Project Name"
+      IoTThingName:
+        default: "IoT Thing Name"
+      IoTTopicName:
+        default: "IoT Topic Name"
+      KinesisShardCount:
+        default: "Kinesis Stream Shard Count"
+      FirehoseBufferSize:
+        default: "Firehose Buffer Size (MB)"
+      FirehoseBufferInterval:
+        default: "Firehose Buffer Interval (seconds)"
+      S3BucketName:
+        default: "S3 Bucket Name"
+      DataRetentionDays:
+        default: "Data Retention Period (days)"
+      QuickSightEdition:
+        default: "QuickSight Edition"
+      QuickSightUserEmail:
+        default: "QuickSight User Email"
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment for resource naming and tagging
+    
+  ProjectName:
+    Type: String
+    Default: iot-analytics
+    Description: Project name used for resource naming and tagging
+    AllowedPattern: ^[a-zA-Z0-9-]+$
+    ConstraintDescription: Must contain only alphanumeric characters and hyphens
+    
+  IoTThingName:
+    Type: String
+    Default: sensor-device
+    Description: Name for the IoT Thing representing your sensor device
+    AllowedPattern: ^[a-zA-Z0-9:_-]+$
+    ConstraintDescription: Must contain only alphanumeric characters, colons, underscores, and hyphens
+    
+  IoTTopicName:
+    Type: String
+    Default: topic/sensor/data
+    Description: MQTT topic name for sensor data
+    AllowedPattern: ^[a-zA-Z0-9/_-]+$
+    ConstraintDescription: Must contain only alphanumeric characters, forward slashes, underscores, and hyphens
+    
+  KinesisShardCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: Number of shards for Kinesis Data Stream (affects throughput and cost)
+    
+  FirehoseBufferSize:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 128
+    Description: Buffer size in MB for Kinesis Data Firehose delivery
+    
+  FirehoseBufferInterval:
+    Type: Number
+    Default: 60
+    MinValue: 60
+    MaxValue: 900
+    Description: Buffer interval in seconds for Kinesis Data Firehose delivery
+    
+  S3BucketName:
+    Type: String
+    Description: Name for the S3 bucket (leave empty for auto-generated name)
+    Default: ''
+    AllowedPattern: ^[a-z0-9.-]*$
+    ConstraintDescription: Must contain only lowercase letters, numbers, dots, and hyphens
+    
+  DataRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: Number of days to retain raw IoT data in S3
+    
+  QuickSightEdition:
+    Type: String
+    Default: STANDARD
+    AllowedValues:
+      - STANDARD
+      - ENTERPRISE
+    Description: QuickSight edition (STANDARD or ENTERPRISE)
+    
+  QuickSightUserEmail:
+    Type: String
+    Description: Email address for QuickSight user creation
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  CreateS3BucketName: !Equals [!Ref S3BucketName, '']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  UseEnterpriseQuickSight: !Equals [!Ref QuickSightEdition, 'ENTERPRISE']
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # ---------------------------------------------------------------------------
+  # S3 BUCKET FOR IOT DATA STORAGE
+  # ---------------------------------------------------------------------------
+  IoTDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - CreateS3BucketName
+        - !Sub '${ProjectName}-iot-data-${AWS::AccountId}-${AWS::Region}'
+        - !Ref S3BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: IoTDataLifecycleRule
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+            ExpirationInDays: !Ref DataRetentionDays
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: IoT Data Storage
+
+  # ---------------------------------------------------------------------------
+  # KINESIS DATA STREAM FOR REAL-TIME PROCESSING
+  # ---------------------------------------------------------------------------
+  IoTKinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${ProjectName}-iot-stream-${Environment}'
+      ShardCount: !Ref KinesisShardCount
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+      RetentionPeriodHours: 24
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: IoT Data Streaming
+
+  # ---------------------------------------------------------------------------
+  # IAM ROLE FOR IOT RULES ENGINE
+  # ---------------------------------------------------------------------------
+  IoTKinesisRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-iot-kinesis-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/IoTThingsRegistration
+      Policies:
+        - PolicyName: KinesisWritePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource: !GetAtt IoTKinesisStream.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/iot/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # IOT CORE RESOURCES
+  # ---------------------------------------------------------------------------
+  IoTPolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-iot-policy-${Environment}'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - iot:Connect
+              - iot:Publish
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - iot:Subscribe
+              - iot:Receive
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/${IoTTopicName}'
+
+  IoTThing:
+    Type: AWS::IoT::Thing
+    Properties:
+      ThingName: !Sub '${ProjectName}-${IoTThingName}-${Environment}'
+      ThingTypeName: !Ref IoTThingType
+      AttributePayload:
+        Attributes:
+          Environment: !Ref Environment
+          Project: !Ref ProjectName
+          DeviceType: Sensor
+
+  IoTThingType:
+    Type: AWS::IoT::ThingType
+    Properties:
+      ThingTypeName: !Sub '${ProjectName}-SensorDevice-${Environment}'
+      ThingTypeDescription: IoT Thing Type for sensor devices
+      ThingTypeProperties:
+        Description: Multi-sensor device for temperature, humidity, and pressure monitoring
+        Searchable: true
+
+  IoTTopicRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub '${ProjectName}RouteToKinesis${Environment}'
+      TopicRulePayload:
+        Description: Route IoT sensor data to Kinesis Data Streams
+        Sql: !Sub 'SELECT *, timestamp() as event_time FROM "${IoTTopicName}"'
+        Actions:
+          - Kinesis:
+              StreamName: !Ref IoTKinesisStream
+              RoleArn: !GetAtt IoTKinesisRole.Arn
+              PartitionKey: device_id
+        ErrorAction:
+          CloudwatchLogs:
+            LogGroupName: !Ref IoTErrorLogGroup
+            RoleArn: !GetAtt IoTKinesisRole.Arn
+        RuleDisabled: false
+
+  # ---------------------------------------------------------------------------
+  # KINESIS DATA FIREHOSE FOR S3 DELIVERY
+  # ---------------------------------------------------------------------------
+  FirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-firehose-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehoseDeliveryPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt IoTDataBucket.Arn
+                  - !Sub '${IoTDataBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                Resource: !GetAtt IoTKinesisStream.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  FirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub '${ProjectName}-firehose-${Environment}'
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt IoTKinesisStream.Arn
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+      S3DestinationConfiguration:
+        BucketARN: !GetAtt IoTDataBucket.Arn
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        Prefix: 'iot-data/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/'
+        ErrorOutputPrefix: 'errors/'
+        BufferingHints:
+          SizeInMBs: !Ref FirehoseBufferSize
+          IntervalInSeconds: !Ref FirehoseBufferInterval
+        CompressionFormat: GZIP
+        EncryptionConfiguration:
+          NoEncryptionConfig: NoEncryption
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref FirehoseLogGroup
+        ProcessingConfiguration:
+          Enabled: false
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # AWS GLUE DATA CATALOG
+  # ---------------------------------------------------------------------------
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectName}_iot_analytics_${Environment}'
+        Description: Database for IoT sensor data analytics
+        Parameters:
+          Environment: !Ref Environment
+          Project: !Ref ProjectName
+
+  GlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: iot_sensor_data
+        Description: Table for IoT sensor data with partitioning
+        StorageDescriptor:
+          Columns:
+            - Name: device_id
+              Type: string
+              Comment: IoT device identifier
+            - Name: temperature
+              Type: int
+              Comment: Temperature reading in Celsius
+            - Name: humidity
+              Type: int
+              Comment: Humidity percentage
+            - Name: pressure
+              Type: int
+              Comment: Pressure reading in hPa
+            - Name: timestamp
+              Type: string
+              Comment: Device timestamp
+            - Name: event_time
+              Type: bigint
+              Comment: Server-side timestamp from IoT Rules Engine
+          Location: !Sub 's3://${IoTDataBucket}/iot-data/'
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters:
+              serialization.format: '1'
+          StoredAsSubDirectories: false
+        PartitionKeys:
+          - Name: year
+            Type: string
+            Comment: Year partition
+          - Name: month
+            Type: string
+            Comment: Month partition
+          - Name: day
+            Type: string
+            Comment: Day partition
+          - Name: hour
+            Type: string
+            Comment: Hour partition
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          EXTERNAL: 'TRUE'
+          has_encrypted_data: 'false'
+          projection.enabled: 'true'
+          projection.year.type: 'integer'
+          projection.year.range: '2023,2030'
+          projection.month.type: 'integer'
+          projection.month.range: '01,12'
+          projection.month.digits: '2'
+          projection.day.type: 'integer'
+          projection.day.range: '01,31'
+          projection.day.digits: '2'
+          projection.hour.type: 'integer'
+          projection.hour.range: '00,23'
+          projection.hour.digits: '2'
+          storage.location.template: !Sub 's3://${IoTDataBucket}/iot-data/year=${year}/month=${month}/day=${day}/hour=${hour}/'
+
+  # ---------------------------------------------------------------------------
+  # QUICKSIGHT RESOURCES
+  # ---------------------------------------------------------------------------
+  QuickSightDataSource:
+    Type: AWS::QuickSight::DataSource
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSourceId: !Sub '${ProjectName}-iot-athena-datasource-${Environment}'
+      Name: !Sub '${ProjectName} IoT Analytics Data Source'
+      Type: ATHENA
+      DataSourceParameters:
+        AthenaParameters:
+          WorkGroup: primary
+      SslProperties:
+        DisableSsl: false
+      Permissions:
+        - Principal: !Sub 'arn:aws:quicksight:${AWS::Region}:${AWS::AccountId}:user/default/${QuickSightUserEmail}'
+          Actions:
+            - quicksight:DescribeDataSource
+            - quicksight:DescribeDataSourcePermissions
+            - quicksight:PassDataSource
+            - quicksight:UpdateDataSource
+            - quicksight:DeleteDataSource
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  QuickSightDataSet:
+    Type: AWS::QuickSight::DataSet
+    DependsOn: QuickSightDataSource
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub '${ProjectName}-iot-sensor-dataset-${Environment}'
+      Name: !Sub '${ProjectName} IoT Sensor Dataset'
+      ImportMode: DIRECT_QUERY
+      PhysicalTableMap:
+        IoTSensorData:
+          RelationalTable:
+            DataSourceArn: !Sub 'arn:aws:quicksight:${AWS::Region}:${AWS::AccountId}:datasource/${QuickSightDataSource}'
+            Catalog: AwsDataCatalog
+            Schema: !Ref GlueDatabase
+            Name: !GetAtt GlueTable.Name
+            InputColumns:
+              - Name: device_id
+                Type: STRING
+              - Name: temperature
+                Type: INTEGER
+              - Name: humidity
+                Type: INTEGER
+              - Name: pressure
+                Type: INTEGER
+              - Name: timestamp
+                Type: STRING
+              - Name: event_time
+                Type: INTEGER
+              - Name: year
+                Type: STRING
+              - Name: month
+                Type: STRING
+              - Name: day
+                Type: STRING
+              - Name: hour
+                Type: STRING
+      LogicalTableMap:
+        IoTSensorAnalytics:
+          Alias: IoT Sensor Analytics
+          Source:
+            PhysicalTableId: IoTSensorData
+          DataTransforms:
+            - CreateColumnsOperation:
+                Columns:
+                  - ColumnName: event_datetime
+                    ColumnId: event_datetime
+                    Expression: 'parseDate(toString({timestamp}), "yyyy-MM-dd''T''HH:mm:ss.SSS''Z''")'
+            - CreateColumnsOperation:
+                Columns:
+                  - ColumnName: temperature_celsius
+                    ColumnId: temperature_celsius
+                    Expression: '{temperature}'
+            - CreateColumnsOperation:
+                Columns:
+                  - ColumnName: temperature_fahrenheit
+                    ColumnId: temperature_fahrenheit
+                    Expression: '({temperature} * 9/5) + 32'
+      Permissions:
+        - Principal: !Sub 'arn:aws:quicksight:${AWS::Region}:${AWS::AccountId}:user/default/${QuickSightUserEmail}'
+          Actions:
+            - quicksight:DescribeDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:PassDataSet
+            - quicksight:DescribeIngestion
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DeleteDataSet
+            - quicksight:CreateIngestion
+            - quicksight:CancelIngestion
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # CLOUDWATCH LOG GROUPS
+  # ---------------------------------------------------------------------------
+  IoTErrorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/iot/${ProjectName}-errors-${Environment}'
+      RetentionInDays: 14
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/kinesisfirehose/${ProjectName}-${Environment}'
+      RetentionInDays: 14
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-access-${Environment}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # CLOUDWATCH ALARMS FOR MONITORING
+  # ---------------------------------------------------------------------------
+  KinesisIncomingRecordsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-kinesis-no-incoming-records-${Environment}'
+      AlarmDescription: Alert when no records are received in Kinesis stream
+      MetricName: IncomingRecords
+      Namespace: AWS/Kinesis
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: StreamName
+          Value: !Ref IoTKinesisStream
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref SNSAlarmTopic
+
+  FirehoseDeliveryFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-firehose-delivery-failure-${Environment}'
+      AlarmDescription: Alert when Firehose delivery fails
+      MetricName: DeliveryToS3.Records
+      Namespace: AWS/KinesisFirehose
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: DeliveryStreamName
+          Value: !Ref FirehoseDeliveryStream
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref SNSAlarmTopic
+
+  # ---------------------------------------------------------------------------
+  # SNS TOPIC FOR ALARMS
+  # ---------------------------------------------------------------------------
+  SNSAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-iot-alerts-${Environment}'
+      DisplayName: !Sub '${ProjectName} IoT Analytics Alerts'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  SNSAlarmTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref SNSAlarmTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref SNSAlarmTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  # ---------------------------------------------------------------------------
+  # STORAGE OUTPUTS
+  # ---------------------------------------------------------------------------
+  S3BucketName:
+    Description: Name of the S3 bucket for IoT data storage
+    Value: !Ref IoTDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketName'
+
+  S3BucketArn:
+    Description: ARN of the S3 bucket for IoT data storage
+    Value: !GetAtt IoTDataBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketArn'
+
+  # ---------------------------------------------------------------------------
+  # IOT CORE OUTPUTS
+  # ---------------------------------------------------------------------------
+  IoTThingName:
+    Description: Name of the IoT Thing
+    Value: !Ref IoTThing
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTThingName'
+
+  IoTThingArn:
+    Description: ARN of the IoT Thing
+    Value: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:thing/${IoTThing}'
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTThingArn'
+
+  IoTTopicRuleName:
+    Description: Name of the IoT Topic Rule
+    Value: !Ref IoTTopicRule
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTTopicRuleName'
+
+  IoTTopicRuleArn:
+    Description: ARN of the IoT Topic Rule
+    Value: !GetAtt IoTTopicRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTTopicRuleArn'
+
+  IoTEndpoint:
+    Description: IoT Core endpoint for device connections
+    Value: !Sub '${AWS::AccountId}.iot.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTEndpoint'
+
+  # ---------------------------------------------------------------------------
+  # STREAMING OUTPUTS
+  # ---------------------------------------------------------------------------
+  KinesisStreamName:
+    Description: Name of the Kinesis Data Stream
+    Value: !Ref IoTKinesisStream
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisStreamName'
+
+  KinesisStreamArn:
+    Description: ARN of the Kinesis Data Stream
+    Value: !GetAtt IoTKinesisStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisStreamArn'
+
+  FirehoseDeliveryStreamName:
+    Description: Name of the Kinesis Data Firehose delivery stream
+    Value: !Ref FirehoseDeliveryStream
+    Export:
+      Name: !Sub '${AWS::StackName}-FirehoseDeliveryStreamName'
+
+  FirehoseDeliveryStreamArn:
+    Description: ARN of the Kinesis Data Firehose delivery stream
+    Value: !GetAtt FirehoseDeliveryStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FirehoseDeliveryStreamArn'
+
+  # ---------------------------------------------------------------------------
+  # DATA CATALOG OUTPUTS
+  # ---------------------------------------------------------------------------
+  GlueDatabaseName:
+    Description: Name of the Glue Database
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabaseName'
+
+  GlueTableName:
+    Description: Name of the Glue Table
+    Value: !Ref GlueTable
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueTableName'
+
+  # ---------------------------------------------------------------------------
+  # QUICKSIGHT OUTPUTS
+  # ---------------------------------------------------------------------------
+  QuickSightDataSourceId:
+    Description: ID of the QuickSight Data Source
+    Value: !Ref QuickSightDataSource
+    Export:
+      Name: !Sub '${AWS::StackName}-QuickSightDataSourceId'
+
+  QuickSightDataSourceArn:
+    Description: ARN of the QuickSight Data Source
+    Value: !GetAtt QuickSightDataSource.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-QuickSightDataSourceArn'
+
+  QuickSightDataSetId:
+    Description: ID of the QuickSight Data Set
+    Value: !Ref QuickSightDataSet
+    Export:
+      Name: !Sub '${AWS::StackName}-QuickSightDataSetId'
+
+  QuickSightDataSetArn:
+    Description: ARN of the QuickSight Data Set
+    Value: !GetAtt QuickSightDataSet.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-QuickSightDataSetArn'
+
+  # ---------------------------------------------------------------------------
+  # MONITORING OUTPUTS
+  # ---------------------------------------------------------------------------
+  SNSAlarmTopicArn:
+    Description: ARN of the SNS topic for alarms
+    Value: !Ref SNSAlarmTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSAlarmTopicArn'
+
+  # ---------------------------------------------------------------------------
+  # TESTING OUTPUTS
+  # ---------------------------------------------------------------------------
+  TestDataPublishCommand:
+    Description: CLI command to publish test data to IoT Core
+    Value: !Sub |
+      aws iot-data publish \
+        --topic "${IoTTopicName}" \
+        --payload '{"device_id":"${IoTThing}","temperature":25,"humidity":60,"pressure":1013,"timestamp":"2025-01-01T12:00:00.000Z"}' \
+        --region ${AWS::Region}
+    Export:
+      Name: !Sub '${AWS::StackName}-TestDataPublishCommand'
+
+  AthenaSampleQuery:
+    Description: Sample Athena query to test data retrieval
+    Value: !Sub |
+      SELECT device_id, temperature, humidity, pressure, timestamp 
+      FROM "${GlueDatabase}".iot_sensor_data 
+      WHERE year = '2025' AND month = '01' 
+      ORDER BY timestamp DESC 
+      LIMIT 100
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaSampleQuery'
+
+  # ---------------------------------------------------------------------------
+  # DEPLOYMENT INFORMATION
+  # ---------------------------------------------------------------------------
+  StackName:
+    Description: Name of this CloudFormation stack
+    Value: !Ref AWS::StackName
+    Export:
+      Name: !Sub '${AWS::StackName}-StackName'
+
+  DeploymentRegion:
+    Description: AWS Region where the stack is deployed
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentRegion'
+
+  DeploymentAccountId:
+    Description: AWS Account ID where the stack is deployed
+    Value: !Ref AWS::AccountId
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentAccountId'
+
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost in USD (approximate)
+    Value: !If
+      - IsProduction
+      - '$50-100 (Production with higher usage)'
+      - '$15-25 (Development/Testing)'
+    Export:
+      Name: !Sub '${AWS::StackName}-EstimatedMonthlyCost'

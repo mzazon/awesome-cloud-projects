@@ -1,0 +1,764 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Computer Vision Application with Amazon Rekognition - Complete infrastructure for image and video analysis with face recognition capabilities'
+
+# Parameters for customization
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'computer-vision-app'
+    Description: 'Name prefix for all resources'
+    AllowedPattern: '^[a-z0-9-]{3,20}$'
+    ConstraintDescription: 'Must be 3-20 characters, lowercase alphanumeric and hyphens only'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'test', 'prod']
+    Description: 'Environment name for resource tagging'
+
+  VideoRetentionHours:
+    Type: Number
+    Default: 24
+    MinValue: 1
+    MaxValue: 8760
+    Description: 'Kinesis Video Stream retention period in hours (1-8760)'
+
+  FaceMatchThreshold:
+    Type: Number
+    Default: 80.0
+    MinValue: 50.0
+    MaxValue: 99.0
+    Description: 'Face matching confidence threshold (50-99%)'
+
+  EnableStreamProcessing:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable real-time stream processing capabilities'
+
+  KinesisShardCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: 'Number of shards for Kinesis Data Stream'
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for notifications (optional)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
+# Conditions for optional resources
+Conditions:
+  EnableStreamProcessingCondition: !Equals [!Ref EnableStreamProcessing, 'true']
+  EnableNotificationsCondition: !Not [!Equals [!Ref NotificationEmail, '']]
+
+# Metadata for parameter grouping
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Computer Vision Settings"
+        Parameters:
+          - FaceMatchThreshold
+          - VideoRetentionHours
+      - Label:
+          default: "Streaming Configuration"
+        Parameters:
+          - EnableStreamProcessing
+          - KinesisShardCount
+      - Label:
+          default: "Notifications"
+        Parameters:
+          - NotificationEmail
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      FaceMatchThreshold:
+        default: "Face Match Threshold (%)"
+      VideoRetentionHours:
+        default: "Video Retention (Hours)"
+      EnableStreamProcessing:
+        default: "Enable Stream Processing"
+      KinesisShardCount:
+        default: "Kinesis Shard Count"
+      NotificationEmail:
+        default: "Notification Email"
+
+Resources:
+  # =======================
+  # S3 Storage Resources
+  # =======================
+  
+  # Main S3 bucket for storing images, videos, and analysis results
+  ComputerVisionBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldResults
+            Status: Enabled
+            ExpirationInDays: 90
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 60
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt ImageAnalysisFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: 'images/'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-storage-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Computer Vision Storage'
+
+  # S3 bucket policy for secure access
+  ComputerVisionBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref ComputerVisionBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRekognitionAccess
+            Effect: Allow
+            Principal:
+              Service: rekognition.amazonaws.com
+            Action:
+              - 's3:GetObject'
+              - 's3:GetObjectVersion'
+            Resource: !Sub '${ComputerVisionBucket}/*'
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${ComputerVisionBucket}/*'
+              - !Ref ComputerVisionBucket
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # =======================
+  # IAM Roles and Policies
+  # =======================
+
+  # IAM role for Amazon Rekognition video analysis
+  RekognitionVideoAnalysisRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-rekognition-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rekognition.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonRekognitionServiceRole'
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                Resource: !Sub '${ComputerVisionBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                Resource: !Ref ComputerVisionBucket
+        - PolicyName: KinesisAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kinesis:PutRecord'
+                  - 'kinesis:PutRecords'
+                Resource: !If 
+                  - EnableStreamProcessingCondition
+                  - !GetAtt RekognitionResultsStream.Arn
+                  - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rekognition-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM role for Lambda functions
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: RekognitionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'rekognition:DetectLabels'
+                  - 'rekognition:DetectFaces'
+                  - 'rekognition:SearchFacesByImage'
+                  - 'rekognition:IndexFaces'
+                  - 'rekognition:DetectText'
+                  - 'rekognition:DetectModerationLabels'
+                  - 'rekognition:ListCollections'
+                  - 'rekognition:DescribeCollection'
+                Resource: '*'
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                Resource: !Sub '${ComputerVisionBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                Resource: !Ref ComputerVisionBucket
+        - PolicyName: SNSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !If
+                  - EnableNotificationsCondition
+                  - !Ref NotificationTopic
+                  - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # =======================
+  # Amazon Rekognition Resources
+  # =======================
+
+  # Face collection for storing facial feature vectors
+  FaceCollection:
+    Type: 'AWS::Rekognition::Collection'
+    Properties:
+      CollectionId: !Sub '${ProjectName}-faces-${Environment}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-face-collection-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Face Recognition Storage'
+
+  # =======================
+  # Streaming Resources (Conditional)
+  # =======================
+
+  # Kinesis Video Stream for real-time video input
+  SecurityVideoStream:
+    Type: 'AWS::KinesisVideo::Stream'
+    Condition: EnableStreamProcessingCondition
+    Properties:
+      Name: !Sub '${ProjectName}-video-${Environment}'
+      DataRetentionInHours: !Ref VideoRetentionHours
+      DeviceSettings:
+        DeviceName: !Sub '${ProjectName}-camera-${Environment}'
+      MediaType: 'video/h264'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-video-stream-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Real-time Video Processing'
+
+  # Kinesis Data Stream for analysis results
+  RekognitionResultsStream:
+    Type: 'AWS::Kinesis::Stream'
+    Condition: EnableStreamProcessingCondition
+    Properties:
+      Name: !Sub '${ProjectName}-results-${Environment}'
+      ShardCount: !Ref KinesisShardCount
+      RetentionPeriodHours: 24
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-results-stream-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Analysis Results Distribution'
+
+  # Stream processor for real-time face search
+  FaceSearchStreamProcessor:
+    Type: 'AWS::Rekognition::StreamProcessor'
+    Condition: EnableStreamProcessingCondition
+    Properties:
+      Name: !Sub '${ProjectName}-face-search-${Environment}'
+      RoleArn: !GetAtt RekognitionVideoAnalysisRole.Arn
+      KinesisVideoStreamArn: !GetAtt SecurityVideoStream.Arn
+      KinesisDataStreamArn: !GetAtt RekognitionResultsStream.Arn
+      FaceSearchSettings:
+        CollectionId: !Ref FaceCollection
+        FaceMatchThreshold: !Ref FaceMatchThreshold
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-stream-processor-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Real-time Face Recognition'
+
+  # =======================
+  # Lambda Functions
+  # =======================
+
+  # Lambda function for automated image analysis
+  ImageAnalysisFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-image-analysis-${Environment}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          FACE_COLLECTION_ID: !Ref FaceCollection
+          RESULTS_BUCKET: !Ref ComputerVisionBucket
+          FACE_MATCH_THRESHOLD: !Ref FaceMatchThreshold
+          NOTIFICATION_TOPIC_ARN: !If
+            - EnableNotificationsCondition
+            - !Ref NotificationTopic
+            - ''
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from datetime import datetime
+          from urllib.parse import unquote_plus
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize AWS clients
+          rekognition = boto3.client('rekognition')
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+
+          def lambda_handler(event, context):
+              """
+              Automated image analysis Lambda function
+              Triggered by S3 ObjectCreated events
+              """
+              try:
+                  # Parse S3 event
+                  for record in event['Records']:
+                      bucket = record['s3']['bucket']['name']
+                      key = unquote_plus(record['s3']['object']['key'])
+                      
+                      logger.info(f"Processing image: {bucket}/{key}")
+                      
+                      # Perform comprehensive analysis
+                      results = analyze_image(bucket, key)
+                      
+                      # Store results
+                      store_results(bucket, key, results)
+                      
+                      # Send notifications if configured
+                      notify_if_needed(results, key)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Analysis completed successfully')
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing image: {str(e)}")
+                  raise
+
+          def analyze_image(bucket, key):
+              """Perform comprehensive image analysis"""
+              image = {'S3Object': {'Bucket': bucket, 'Name': key}}
+              results = {'timestamp': datetime.utcnow().isoformat()}
+              
+              try:
+                  # Label detection
+                  labels_response = rekognition.detect_labels(
+                      Image=image,
+                      Features=['GENERAL_LABELS', 'IMAGE_PROPERTIES'],
+                      Settings={
+                          'GeneralLabels': {'MaxLabels': 20},
+                          'ImageProperties': {'MaxDominantColors': 10}
+                      }
+                  )
+                  results['labels'] = labels_response.get('Labels', [])
+                  results['image_properties'] = labels_response.get('ImageProperties', {})
+                  
+                  # Face analysis
+                  faces_response = rekognition.detect_faces(
+                      Image=image,
+                      Attributes=['ALL']
+                  )
+                  results['faces'] = faces_response.get('FaceDetails', [])
+                  
+                  # Face search in collection
+                  try:
+                      face_search_response = rekognition.search_faces_by_image(
+                          Image=image,
+                          CollectionId=os.environ['FACE_COLLECTION_ID'],
+                          FaceMatchThreshold=float(os.environ['FACE_MATCH_THRESHOLD'])
+                      )
+                      results['face_matches'] = face_search_response.get('FaceMatches', [])
+                  except rekognition.exceptions.InvalidParameterException:
+                      results['face_matches'] = []
+                  
+                  # Text detection
+                  text_response = rekognition.detect_text(Image=image)
+                  results['text'] = text_response.get('TextDetections', [])
+                  
+                  # Content moderation
+                  moderation_response = rekognition.detect_moderation_labels(Image=image)
+                  results['moderation'] = moderation_response.get('ModerationLabels', [])
+                  
+              except Exception as e:
+                  logger.error(f"Error in image analysis: {str(e)}")
+                  results['error'] = str(e)
+              
+              return results
+
+          def store_results(bucket, key, results):
+              """Store analysis results in S3"""
+              try:
+                  results_key = key.replace('images/', 'results/').replace('.jpg', '.json').replace('.png', '.json').replace('.jpeg', '.json')
+                  
+                  s3.put_object(
+                      Bucket=bucket,
+                      Key=results_key,
+                      Body=json.dumps(results, indent=2),
+                      ContentType='application/json'
+                  )
+                  
+                  logger.info(f"Results stored: {bucket}/{results_key}")
+              except Exception as e:
+                  logger.error(f"Error storing results: {str(e)}")
+
+          def notify_if_needed(results, key):
+              """Send notifications for significant events"""
+              try:
+                  topic_arn = os.environ.get('NOTIFICATION_TOPIC_ARN')
+                  if not topic_arn:
+                      return
+                  
+                  # Check for face matches
+                  face_matches = results.get('face_matches', [])
+                  if face_matches:
+                      message = f"Face recognition match found in {key}:\n"
+                      for match in face_matches[:3]:  # Top 3 matches
+                          similarity = match.get('Similarity', 0)
+                          external_id = match.get('Face', {}).get('ExternalImageId', 'Unknown')
+                          message += f"- {external_id}: {similarity:.1f}% similarity\n"
+                      
+                      sns.publish(
+                          TopicArn=topic_arn,
+                          Subject='Computer Vision: Face Recognition Alert',
+                          Message=message
+                      )
+                  
+                  # Check for content moderation issues
+                  moderation_labels = results.get('moderation', [])
+                  high_confidence_issues = [label for label in moderation_labels if label.get('Confidence', 0) > 80]
+                  
+                  if high_confidence_issues:
+                      message = f"Content moderation alert for {key}:\n"
+                      for label in high_confidence_issues:
+                          message += f"- {label.get('Name', 'Unknown')}: {label.get('Confidence', 0):.1f}%\n"
+                      
+                      sns.publish(
+                          TopicArn=topic_arn,
+                          Subject='Computer Vision: Content Moderation Alert',
+                          Message=message
+                      )
+                      
+              except Exception as e:
+                  logger.error(f"Error sending notification: {str(e)}")
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-image-analysis-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Automated Image Analysis'
+
+  # Lambda permission for S3 to invoke the function
+  ImageAnalysisFunctionPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref ImageAnalysisFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub '${ComputerVisionBucket}/*'
+
+  # =======================
+  # Notification Resources (Conditional)
+  # =======================
+
+  # SNS topic for notifications
+  NotificationTopic:
+    Type: 'AWS::SNS::Topic'
+    Condition: EnableNotificationsCondition
+    Properties:
+      TopicName: !Sub '${ProjectName}-notifications-${Environment}'
+      DisplayName: 'Computer Vision Alerts'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-notifications-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Computer Vision Notifications'
+
+  # SNS subscription for email notifications
+  NotificationSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Condition: EnableNotificationsCondition
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # =======================
+  # CloudWatch Resources
+  # =======================
+
+  # CloudWatch Log Group for Lambda functions
+  ImageAnalysisLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-image-analysis-${Environment}'
+      RetentionInDays: 14
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Dashboard for monitoring
+  ComputerVisionDashboard:
+    Type: 'AWS::CloudWatch::Dashboard'
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${ImageAnalysisFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "BucketSizeBytes", "BucketName", "${ComputerVisionBucket}", "StorageType", "StandardStorage" ],
+                  [ ".", "NumberOfObjects", ".", ".", ".", "AllStorageTypes" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "S3 Storage Metrics",
+                "period": 86400
+              }
+            }
+          ]
+        }
+
+# Outputs for integration and verification
+Outputs:
+  ComputerVisionBucketName:
+    Description: 'Name of the S3 bucket for storing images and videos'
+    Value: !Ref ComputerVisionBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ComputerVisionBucket'
+
+  ComputerVisionBucketArn:
+    Description: 'ARN of the S3 bucket'
+    Value: !GetAtt ComputerVisionBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ComputerVisionBucketArn'
+
+  FaceCollectionId:
+    Description: 'ID of the Rekognition face collection'
+    Value: !Ref FaceCollection
+    Export:
+      Name: !Sub '${AWS::StackName}-FaceCollectionId'
+
+  FaceCollectionArn:
+    Description: 'ARN of the Rekognition face collection'
+    Value: !GetAtt FaceCollection.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FaceCollectionArn'
+
+  ImageAnalysisFunctionName:
+    Description: 'Name of the image analysis Lambda function'
+    Value: !Ref ImageAnalysisFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageAnalysisFunction'
+
+  ImageAnalysisFunctionArn:
+    Description: 'ARN of the image analysis Lambda function'
+    Value: !GetAtt ImageAnalysisFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageAnalysisFunctionArn'
+
+  RekognitionVideoAnalysisRoleArn:
+    Description: 'ARN of the IAM role for Rekognition video analysis'
+    Value: !GetAtt RekognitionVideoAnalysisRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RekognitionVideoRole'
+
+  SecurityVideoStreamName:
+    Condition: EnableStreamProcessingCondition
+    Description: 'Name of the Kinesis Video Stream'
+    Value: !Ref SecurityVideoStream
+    Export:
+      Name: !Sub '${AWS::StackName}-VideoStreamName'
+
+  SecurityVideoStreamArn:
+    Condition: EnableStreamProcessingCondition
+    Description: 'ARN of the Kinesis Video Stream'
+    Value: !GetAtt SecurityVideoStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-VideoStreamArn'
+
+  RekognitionResultsStreamName:
+    Condition: EnableStreamProcessingCondition
+    Description: 'Name of the Kinesis Data Stream for results'
+    Value: !Ref RekognitionResultsStream
+    Export:
+      Name: !Sub '${AWS::StackName}-ResultsStreamName'
+
+  RekognitionResultsStreamArn:
+    Condition: EnableStreamProcessingCondition
+    Description: 'ARN of the Kinesis Data Stream for results'
+    Value: !GetAtt RekognitionResultsStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ResultsStreamArn'
+
+  FaceSearchStreamProcessorName:
+    Condition: EnableStreamProcessingCondition
+    Description: 'Name of the stream processor for face search'
+    Value: !Ref FaceSearchStreamProcessor
+    Export:
+      Name: !Sub '${AWS::StackName}-StreamProcessorName'
+
+  FaceSearchStreamProcessorArn:
+    Condition: EnableStreamProcessingCondition
+    Description: 'ARN of the stream processor for face search'
+    Value: !GetAtt FaceSearchStreamProcessor.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-StreamProcessorArn'
+
+  NotificationTopicArn:
+    Condition: EnableNotificationsCondition
+    Description: 'ARN of the SNS topic for notifications'
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopicArn'
+
+  DashboardURL:
+    Description: 'URL to the CloudWatch dashboard'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  DeploymentInstructions:
+    Description: 'Next steps after deployment'
+    Value: !Sub |
+      1. Upload sample images to s3://${ComputerVisionBucket}/images/
+      2. Index known faces using: aws rekognition index-faces --collection-id ${FaceCollection}
+      3. Upload videos to s3://${ComputerVisionBucket}/videos/ for batch analysis
+      4. Start stream processor for real-time processing: aws rekognition start-stream-processor --name ${FaceSearchStreamProcessor}
+      5. Monitor analysis results in s3://${ComputerVisionBucket}/results/
+
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for typical usage'
+    Value: !Sub |
+      Base infrastructure: $5-15/month
+      + Rekognition: $1.00 per 1,000 images
+      + Video analysis: $0.10 per minute
+      + Storage: $0.023 per GB/month
+      + Streaming (if enabled): $0.014 per shard-hour
+      Total for 1,000 images + 60 minutes video: ~$25-40/month

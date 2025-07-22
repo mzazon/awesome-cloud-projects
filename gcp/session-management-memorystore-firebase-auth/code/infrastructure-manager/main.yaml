@@ -1,0 +1,532 @@
+# Google Cloud Infrastructure Manager Configuration
+# Session Management with Cloud Memorystore and Firebase Auth
+# This configuration deploys a complete session management system using:
+# - Cloud Memorystore for Redis (high-performance session storage)
+# - Firebase Authentication (user identity management)
+# - Cloud Functions (session management logic and cleanup)
+# - Secret Manager (secure credential storage)
+# - Cloud Scheduler (automated cleanup scheduling)
+
+# Import Google Cloud resource types
+imports:
+  - path: 'projects/cloud-foundation-fabric/blueprints/cloud-operations'
+
+# Infrastructure Manager deployment metadata
+info:
+  title: "Session Management Infrastructure"
+  description: "Complete session management system with Redis, Firebase Auth, and serverless functions"
+  version: "1.0.0"
+
+# Input parameters for customization
+parameters:
+  # Project configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    default: "${GOOGLE_CLOUD_PROJECT}"
+  
+  # Regional configuration  
+  region:
+    type: string
+    description: "Primary deployment region"
+    default: "us-central1"
+    
+  zone:
+    type: string
+    description: "Primary deployment zone"
+    default: "us-central1-a"
+    
+  # Redis configuration
+  redis_instance_name:
+    type: string
+    description: "Name for the Redis instance"
+    default: "session-store"
+    
+  redis_memory_size:
+    type: integer
+    description: "Redis memory size in GB"
+    default: 1
+    minimum: 1
+    maximum: 300
+    
+  redis_version:
+    type: string
+    description: "Redis version"
+    default: "REDIS_7_0"
+    enum: ["REDIS_6_X", "REDIS_7_0"]
+    
+  # Function configuration
+  session_function_memory:
+    type: string
+    description: "Memory allocation for session management function"
+    default: "512Mi"
+    
+  cleanup_function_memory:
+    type: string
+    description: "Memory allocation for cleanup function"
+    default: "256Mi"
+    
+  # Security configuration
+  enable_auth_networks:
+    type: boolean
+    description: "Enable authorized networks for Redis"
+    default: false
+    
+  # Environment labels
+  environment:
+    type: string
+    description: "Environment label (dev, staging, prod)"
+    default: "production"
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/redis.googleapis.com
+      
+  - name: enable-functions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/cloudfunctions.googleapis.com
+      
+  - name: enable-secretmanager-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/secretmanager.googleapis.com
+      
+  - name: enable-firebase-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/firebase.googleapis.com
+      
+  - name: enable-scheduler-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/cloudscheduler.googleapis.com
+      
+  - name: enable-logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/logging.googleapis.com
+      
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/monitoring.googleapis.com
+
+  # Cloud Memorystore Redis Instance
+  # Provides high-performance, managed Redis for session storage
+  - name: session-redis-instance
+    type: gcp-types/redis-v1:projects.locations.instances
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      instanceId: ${redis_instance_name}
+      body:
+        displayName: "Session Store Redis Instance"
+        tier: BASIC  # Use STANDARD_HA for production high availability
+        memorySizeGb: ${redis_memory_size}
+        redisVersion: ${redis_version}
+        redisConfigs:
+          # Optimize for session storage patterns
+          maxmemory-policy: "allkeys-lru"  # Evict least recently used keys
+          timeout: "0"  # Disable client timeout
+          tcp-keepalive: "60"  # TCP keepalive for connection health
+        labels:
+          purpose: "session-management"
+          environment: ${environment}
+          component: "cache"
+        # Enable automatic backup (requires STANDARD_HA tier)
+        # persistenceConfig:
+        #   persistenceMode: RDB
+        #   rdbSnapshotPeriod: TWENTY_FOUR_HOURS
+        
+        # Network configuration for security
+        authorizedNetwork: projects/${project_id}/global/networks/default
+        connectMode: DIRECT_PEERING
+        
+        # Maintenance window configuration
+        maintenancePolicy:
+          weeklyMaintenanceWindow:
+            - day: SUNDAY
+              startTime:
+                hours: 6
+                minutes: 0
+    depends_on:
+      - enable-apis
+
+  # Secret Manager Secret for Redis Connection String
+  # Securely stores Redis connection details for function access
+  - name: redis-connection-secret
+    type: gcp-types/secretmanager-v1:projects.secrets
+    properties:
+      parent: projects/${project_id}
+      secretId: redis-connection-${redis_instance_name}
+      secret:
+        labels:
+          purpose: "session-management"
+          component: "configuration"
+        replication:
+          automatic: {}
+    depends_on:
+      - enable-secretmanager-api
+
+  # Secret Version with Redis Connection String
+  # Populated with actual Redis connection details
+  - name: redis-connection-secret-version
+    type: gcp-types/secretmanager-v1:projects.secrets.versions
+    properties:
+      parent: $(ref.redis-connection-secret.name)
+      secretVersion:
+        payload:
+          data: redis://$(ref.session-redis-instance.host):$(ref.session-redis-instance.port)
+    depends_on:
+      - redis-connection-secret
+      - session-redis-instance
+
+  # Service Account for Cloud Functions
+  # Provides identity for functions with least privilege access
+  - name: session-function-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: session-mgmt-functions
+      serviceAccount:
+        displayName: "Session Management Functions"
+        description: "Service account for session management and cleanup functions"
+    depends_on:
+      - enable-functions-api
+
+  # IAM binding for Secret Manager access
+  # Grants functions permission to read Redis connection details
+  - name: secret-accessor-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/secretmanager.secretAccessor
+      member: serviceAccount:$(ref.session-function-service-account.email)
+    depends_on:
+      - session-function-service-account
+
+  # IAM binding for Redis access
+  # Grants functions permission to connect to Redis instance
+  - name: redis-editor-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/redis.editor
+      member: serviceAccount:$(ref.session-function-service-account.email)
+    depends_on:
+      - session-function-service-account
+
+  # IAM binding for Logging
+  # Enables functions to write structured logs
+  - name: logging-writer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/logging.logWriter
+      member: serviceAccount:$(ref.session-function-service-account.email)
+    depends_on:
+      - session-function-service-account
+
+  # Cloud Storage Bucket for Function Source Code
+  # Stores deployment packages for Cloud Functions
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      bucket: ${project_id}-session-functions-source
+      location: ${region}
+      labels:
+        purpose: "function-deployment"
+        environment: ${environment}
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30  # Delete old versions after 30 days
+
+  # Session Management Function Source Package
+  # Contains the main session management logic
+  - name: session-function-source
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: $(ref.function-source-bucket.name)
+      name: session-manager-source.zip
+      # In production, this would be populated from actual function code
+      # For now, we'll reference a placeholder that would be uploaded separately
+      metadata:
+        description: "Session management function source code"
+        version: "1.0.0"
+
+  # Main Session Management Cloud Function
+  # Handles session creation, validation, and destruction
+  - name: session-management-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      function:
+        name: projects/${project_id}/locations/${region}/functions/session-manager
+        description: "Session management function with Firebase Auth integration"
+        sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/session-manager-source.zip
+        entryPoint: "sessionManager"
+        runtime: "nodejs18"
+        timeout: "60s"
+        availableMemoryMb: ${session_function_memory}
+        
+        # Environment variables for function configuration
+        environmentVariables:
+          SECRET_NAME: $(ref.redis-connection-secret.name)
+          REDIS_INSTANCE_NAME: ${redis_instance_name}
+          ENVIRONMENT: ${environment}
+          
+        # HTTP trigger configuration
+        httpsTrigger:
+          securityLevel: SECURE_ALWAYS
+          
+        # Service account configuration
+        serviceAccountEmail: $(ref.session-function-service-account.email)
+        
+        # Labels for resource management
+        labels:
+          purpose: "session-management"
+          component: "api"
+          environment: ${environment}
+    depends_on:
+      - session-function-service-account
+      - redis-connection-secret-version
+      - function-source-bucket
+      - enable-functions-api
+
+  # Cleanup Function Source Package
+  # Contains automated session cleanup logic
+  - name: cleanup-function-source
+    type: gcp-types/storage-v1:objects
+    properties:
+      bucket: $(ref.function-source-bucket.name)
+      name: session-cleanup-source.zip
+      metadata:
+        description: "Session cleanup function source code"
+        version: "1.0.0"
+
+  # Session Cleanup Cloud Function
+  # Automated cleanup of expired sessions with analytics
+  - name: session-cleanup-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      function:
+        name: projects/${project_id}/locations/${region}/functions/session-cleanup
+        description: "Automated session cleanup with performance analytics"
+        sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/session-cleanup-source.zip
+        entryPoint: "sessionCleanup"
+        runtime: "nodejs18"
+        timeout: "300s"
+        availableMemoryMb: ${cleanup_function_memory}
+        
+        # Environment variables
+        environmentVariables:
+          SECRET_NAME: $(ref.redis-connection-secret.name)
+          REDIS_INSTANCE_NAME: ${redis_instance_name}
+          ENVIRONMENT: ${environment}
+          
+        # HTTP trigger for scheduler invocation
+        httpsTrigger:
+          securityLevel: SECURE_ALWAYS
+          
+        # Service account configuration
+        serviceAccountEmail: $(ref.session-function-service-account.email)
+        
+        # Labels
+        labels:
+          purpose: "session-cleanup"
+          component: "maintenance"
+          environment: ${environment}
+    depends_on:
+      - session-function-service-account
+      - redis-connection-secret-version
+      - cleanup-function-source
+
+  # Cloud Scheduler Job for Automated Cleanup
+  # Triggers session cleanup every 6 hours
+  - name: session-cleanup-scheduler
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      job:
+        name: projects/${project_id}/locations/${region}/jobs/session-cleanup-job
+        description: "Automated session cleanup every 6 hours"
+        schedule: "0 */6 * * *"  # Every 6 hours
+        timeZone: "UTC"
+        
+        # HTTP target configuration
+        httpTarget:
+          uri: $(ref.session-cleanup-function.httpsTrigger.url)
+          httpMethod: POST
+          headers:
+            Content-Type: "application/json"
+          body: '{"trigger":"scheduled","source":"cloud-scheduler"}'
+          
+        # Retry configuration
+        retryConfig:
+          retryCount: 3
+          maxRetryDuration: "300s"
+          minBackoffDuration: "5s"
+          maxBackoffDuration: "60s"
+          maxDoublings: 3
+          
+        # Failure handling
+        attemptDeadline: "600s"  # 10 minute timeout
+    depends_on:
+      - session-cleanup-function
+      - enable-scheduler-api
+
+  # Firebase Project Configuration
+  # Enables Firebase services for the project
+  - name: firebase-project
+    type: gcp-types/firebase-v1beta1:projects
+    properties:
+      project: ${project_id}
+      displayName: "Session Management Firebase Project"
+    depends_on:
+      - enable-firebase-api
+
+  # Monitoring Alert Policy for Redis Memory Usage
+  # Alerts when Redis memory usage exceeds 80%
+  - name: redis-memory-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/${project_id}
+      alertPolicy:
+        displayName: "Redis Memory Usage High"
+        documentation:
+          content: "Redis instance memory usage has exceeded 80%. Consider scaling or optimizing session data."
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "Redis memory usage condition"
+            conditionThreshold:
+              filter: 'resource.type="redis_instance" AND resource.labels.instance_id="${redis_instance_name}"'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 0.8
+              duration: "300s"  # 5 minutes
+              aggregations:
+                - alignmentPeriod: "60s"
+                  perSeriesAligner: ALIGN_MEAN
+                  crossSeriesReducer: REDUCE_MEAN
+        alertStrategy:
+          autoClose: "1800s"  # Auto-close after 30 minutes
+        enabled: true
+    depends_on:
+      - session-redis-instance
+      - enable-monitoring-api
+
+  # Log-based Alert for Function Errors
+  # Monitors for errors in session management functions
+  - name: function-error-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/${project_id}
+      alertPolicy:
+        displayName: "Session Function Errors"
+        documentation:
+          content: "High error rate detected in session management functions."
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "Function error rate condition"
+            conditionThreshold:
+              filter: 'resource.type="cloud_function" AND severity="ERROR"'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 5
+              duration: "300s"
+              aggregations:
+                - alignmentPeriod: "60s"
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+        alertStrategy:
+          autoClose: "1800s"
+        enabled: true
+    depends_on:
+      - session-management-function
+      - session-cleanup-function
+      - enable-monitoring-api
+
+# Output values for verification and integration
+outputs:
+  # Redis connection information
+  redis_instance_host:
+    description: "Redis instance hostname"
+    value: $(ref.session-redis-instance.host)
+    
+  redis_instance_port:
+    description: "Redis instance port"
+    value: $(ref.session-redis-instance.port)
+    
+  redis_instance_status:
+    description: "Redis instance status"
+    value: $(ref.session-redis-instance.state)
+    
+  # Function endpoints
+  session_function_url:
+    description: "Session management function HTTP endpoint"
+    value: $(ref.session-management-function.httpsTrigger.url)
+    
+  cleanup_function_url:
+    description: "Session cleanup function HTTP endpoint"
+    value: $(ref.session-cleanup-function.httpsTrigger.url)
+    
+  # Secret Manager information
+  redis_secret_name:
+    description: "Secret Manager secret name for Redis connection"
+    value: $(ref.redis-connection-secret.name)
+    
+  # Service account information
+  function_service_account:
+    description: "Service account email for functions"
+    value: $(ref.session-function-service-account.email)
+    
+  # Scheduler information
+  cleanup_schedule:
+    description: "Cleanup job schedule"
+    value: "Every 6 hours (0 */6 * * *)"
+    
+  # Monitoring information
+  redis_memory_alert:
+    description: "Redis memory usage alert policy"
+    value: $(ref.redis-memory-alert-policy.name)
+    
+  function_error_alert:
+    description: "Function error alert policy"
+    value: $(ref.function-error-alert-policy.name)
+    
+  # Firebase project information
+  firebase_project_id:
+    description: "Firebase project identifier"
+    value: $(ref.firebase-project.projectId)
+    
+  # Storage bucket for functions
+  function_source_bucket:
+    description: "Cloud Storage bucket for function source code"
+    value: $(ref.function-source-bucket.name)
+
+# Deployment metadata
+metadata:
+  version: "1.0.0"
+  description: "Complete session management infrastructure with Redis, Firebase Auth, and serverless functions"
+  author: "Cloud Infrastructure Team"
+  tags:
+    - session-management
+    - redis
+    - firebase-auth
+    - cloud-functions
+    - serverless
+    - security
+    - monitoring
+  dependencies:
+    - "Google Cloud Project with billing enabled"
+    - "Firebase project initialization"
+    - "Function source code deployment"
+  estimated_cost: "$25-50/month for basic usage"
+  deployment_time: "15-20 minutes"

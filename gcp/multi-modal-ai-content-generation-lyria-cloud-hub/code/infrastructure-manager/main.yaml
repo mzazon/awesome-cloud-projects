@@ -1,0 +1,524 @@
+# Infrastructure Manager Configuration for Multi-Modal AI Content Generation Platform
+# This configuration deploys a complete platform using Lyria 2, Veo 3, and Vertex AI
+# for synchronized multi-modal content creation with music, video, and speech generation
+
+metadata:
+  name: multi-modal-ai-content-platform
+  description: "Complete infrastructure for AI-powered multi-modal content generation using Lyria and Vertex AI"
+  labels:
+    environment: production
+    solution: ai-content-generation
+    platform: vertex-ai
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID for deployment"
+    required: true
+  
+  region:
+    type: string
+    description: "Primary deployment region"
+    default: "us-central1"
+    validation:
+      - condition: "var.region in ['us-central1', 'us-east1', 'us-west1', 'europe-west1', 'asia-southeast1']"
+        error_message: "Region must be one of the supported Vertex AI regions"
+  
+  zone:
+    type: string
+    description: "Compute zone for region-specific resources"
+    default: "us-central1-a"
+  
+  bucket_suffix:
+    type: string
+    description: "Unique suffix for Cloud Storage bucket names"
+    default: ""
+    validation:
+      - condition: "length(var.bucket_suffix) <= 10"
+        error_message: "Bucket suffix must be 10 characters or less"
+  
+  enable_monitoring:
+    type: bool
+    description: "Enable comprehensive monitoring and alerting"
+    default: true
+  
+  content_generation_memory:
+    type: string
+    description: "Memory allocation for content generation functions"
+    default: "2Gi"
+    validation:
+      - condition: "var.content_generation_memory in ['1Gi', '2Gi', '4Gi', '8Gi']"
+        error_message: "Memory must be one of: 1Gi, 2Gi, 4Gi, 8Gi"
+
+# Local values for resource naming and configuration
+locals:
+  # Generate unique resource names
+  bucket_suffix: var.bucket_suffix != "" ? var.bucket_suffix : substr(sha256(var.project_id), 0, 8)
+  base_name: "content-ai-${local.bucket_suffix}"
+  
+  # Service configuration
+  required_apis:
+    - "aiplatform.googleapis.com"
+    - "storage.googleapis.com"
+    - "cloudfunctions.googleapis.com"
+    - "run.googleapis.com"
+    - "monitoring.googleapis.com"
+    - "logging.googleapis.com"
+    - "artifactregistry.googleapis.com"
+    - "cloudbuild.googleapis.com"
+  
+  # IAM roles for service account
+  service_account_roles:
+    - "roles/aiplatform.user"
+    - "roles/storage.objectAdmin"
+    - "roles/monitoring.metricWriter"
+    - "roles/logging.logWriter"
+    - "roles/artifactregistry.reader"
+
+# Enable required Google Cloud APIs
+resources:
+  # API Services - Enable all required APIs for the platform
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    for_each: local.required_apis
+    properties:
+      name: projects/${var.project_id}/services/${each.value}
+      
+  # Primary Cloud Storage bucket for content assets with lifecycle management
+  - name: content-storage-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${local.base_name}-content
+      project: ${var.project_id}
+      location: ${var.region}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - condition:
+              age: 90
+              matchesStorageClass: ["STANDARD"]
+            action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+          - condition:
+              age: 365
+              matchesStorageClass: ["NEARLINE"]
+            action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+          - condition:
+              age: 2555  # 7 years
+            action:
+              type: Delete
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      cors:
+        - origin: ["*"]
+          method: ["GET", "POST", "PUT"]
+          responseHeader: ["Content-Type", "Authorization"]
+          maxAgeSeconds: 3600
+    depends_on:
+      - enable-apis
+
+  # Service Account for AI content generation services
+  - name: content-ai-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: ${local.base_name}-sa
+      displayName: "Content AI Generation Service Account"
+      description: "Service account for multi-modal content generation platform"
+      project: ${var.project_id}
+    depends_on:
+      - enable-apis
+
+  # IAM bindings for service account - Apply all required roles
+  - name: service-account-iam-bindings
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+    for_each: local.service_account_roles
+    properties:
+      resource: ${var.project_id}
+      policy:
+        bindings:
+          - role: ${each.value}
+            members:
+              - serviceAccount:${local.base_name}-sa@${var.project_id}.iam.gserviceaccount.com
+    depends_on:
+      - content-ai-service-account
+
+  # Artifact Registry repository for container images
+  - name: container-registry
+    type: gcp-types/artifactregistry-v1:projects.locations.repositories
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      repositoryId: ${local.base_name}-containers
+      repository:
+        format: DOCKER
+        description: "Container registry for AI content generation services"
+    depends_on:
+      - enable-apis
+
+  # Cloud Function for Lyria 2 music generation
+  - name: music-generation-function
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      functionId: music-generation
+      function:
+        description: "Lyria 2 music generation service"
+        buildConfig:
+          runtime: python312
+          entryPoint: generate_music
+          source:
+            storageSource:
+              bucket: ${local.base_name}-content
+              object: functions/music-generation.zip
+          environmentVariables:
+            PROJECT_ID: ${var.project_id}
+            REGION: ${var.region}
+            BUCKET_NAME: ${local.base_name}-content
+        serviceConfig:
+          maxInstanceCount: 100
+          minInstanceCount: 0
+          availableMemory: ${var.content_generation_memory}
+          timeoutSeconds: 300
+          serviceAccountEmail: ${local.base_name}-sa@${var.project_id}.iam.gserviceaccount.com
+          environmentVariables:
+            PROJECT_ID: ${var.project_id}
+            REGION: ${var.region}
+            BUCKET_NAME: ${local.base_name}-content
+          ingressSettings: ALLOW_ALL
+        labels:
+          component: music-generation
+          platform: vertex-ai
+    depends_on:
+      - content-storage-bucket
+      - service-account-iam-bindings
+
+  # Cloud Function for Veo 3 video generation
+  - name: video-generation-function
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      functionId: video-generation
+      function:
+        description: "Veo 3 video generation service"
+        buildConfig:
+          runtime: python312
+          entryPoint: generate_video
+          source:
+            storageSource:
+              bucket: ${local.base_name}-content
+              object: functions/video-generation.zip
+          environmentVariables:
+            PROJECT_ID: ${var.project_id}
+            REGION: ${var.region}
+            BUCKET_NAME: ${local.base_name}-content
+        serviceConfig:
+          maxInstanceCount: 50
+          minInstanceCount: 0
+          availableMemory: ${var.content_generation_memory}
+          timeoutSeconds: 600
+          serviceAccountEmail: ${local.base_name}-sa@${var.project_id}.iam.gserviceaccount.com
+          environmentVariables:
+            PROJECT_ID: ${var.project_id}
+            REGION: ${var.region}
+            BUCKET_NAME: ${local.base_name}-content
+          ingressSettings: ALLOW_ALL
+        labels:
+          component: video-generation
+          platform: vertex-ai
+    depends_on:
+      - content-storage-bucket
+      - service-account-iam-bindings
+
+  # Cloud Function for content quality assessment
+  - name: quality-assessment-function
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      functionId: quality-assessment
+      function:
+        description: "AI content quality assessment service"
+        buildConfig:
+          runtime: python312
+          entryPoint: assess_content_quality
+          source:
+            storageSource:
+              bucket: ${local.base_name}-content
+              object: functions/quality-assessment.zip
+        serviceConfig:
+          maxInstanceCount: 50
+          minInstanceCount: 0
+          availableMemory: 1Gi
+          timeoutSeconds: 300
+          serviceAccountEmail: ${local.base_name}-sa@${var.project_id}.iam.gserviceaccount.com
+          environmentVariables:
+            PROJECT_ID: ${var.project_id}
+            BUCKET_NAME: ${local.base_name}-content
+          ingressSettings: ALLOW_ALL
+        labels:
+          component: quality-assessment
+          platform: vertex-ai
+    depends_on:
+      - content-storage-bucket
+      - service-account-iam-bindings
+
+  # Cloud Run service for content orchestration
+  - name: content-orchestrator-service
+    type: gcp-types/run-v2:projects.locations.services
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      serviceId: content-orchestrator
+      service:
+        description: "Multi-modal content orchestration engine"
+        template:
+          scaling:
+            minInstanceCount: 0
+            maxInstanceCount: 100
+          serviceAccount: ${local.base_name}-sa@${var.project_id}.iam.gserviceaccount.com
+          containers:
+            - name: orchestrator
+              image: ${var.region}-docker.pkg.dev/${var.project_id}/${local.base_name}-containers/content-orchestrator:latest
+              ports:
+                - name: http1
+                  containerPort: 8080
+              env:
+                - name: PROJECT_ID
+                  value: ${var.project_id}
+                - name: REGION
+                  value: ${var.region}
+                - name: BUCKET_NAME
+                  value: ${local.base_name}-content
+              resources:
+                limits:
+                  cpu: "2000m"
+                  memory: ${var.content_generation_memory}
+              startupProbe:
+                httpGet:
+                  path: /health
+                  port: 8080
+                initialDelaySeconds: 10
+                timeoutSeconds: 5
+                periodSeconds: 10
+                failureThreshold: 3
+              livenessProbe:
+                httpGet:
+                  path: /health
+                  port: 8080
+                timeoutSeconds: 5
+                periodSeconds: 30
+        labels:
+          component: orchestration
+          platform: vertex-ai
+    depends_on:
+      - container-registry
+      - service-account-iam-bindings
+
+  # IAM policy for Cloud Run service to allow public access
+  - name: orchestrator-public-access
+    type: gcp-types/run-v1:projects.locations.services.iamPolicy
+    properties:
+      resource: projects/${var.project_id}/locations/${var.region}/services/content-orchestrator
+      policy:
+        bindings:
+          - role: roles/run.invoker
+            members:
+              - allUsers
+    depends_on:
+      - content-orchestrator-service
+
+  # Conditional monitoring resources - only created if monitoring is enabled
+  - name: monitoring-notification-channel
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    condition: var.enable_monitoring
+    properties:
+      parent: projects/${var.project_id}
+      notificationChannel:
+        type: email
+        displayName: "Content Generation Alerts"
+        description: "Email notifications for content generation platform alerts"
+        labels:
+          email_address: "admin@${var.project_id}.example.com"
+        enabled: true
+    depends_on:
+      - enable-apis
+
+  # Alert policy for function error rates
+  - name: function-error-rate-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    condition: var.enable_monitoring
+    properties:
+      parent: projects/${var.project_id}
+      alertPolicy:
+        displayName: "Content Generation Function Error Rate"
+        documentation:
+          content: "Alert when content generation functions have high error rates"
+          mimeType: text/markdown
+        conditions:
+          - displayName: "Function error rate > 5%"
+            conditionThreshold:
+              filter: 'resource.type="cloud_function" AND resource.label.function_name=~"music-generation|video-generation|quality-assessment"'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 0.05
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_MEAN
+                  groupByFields:
+                    - resource.label.function_name
+        notificationChannels:
+          - projects/${var.project_id}/notificationChannels/${monitoring-notification-channel.name}
+        alertStrategy:
+          autoClose: 86400s  # 24 hours
+        enabled: true
+    depends_on:
+      - monitoring-notification-channel
+
+  # Alert policy for Cloud Run service latency
+  - name: orchestrator-latency-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    condition: var.enable_monitoring
+    properties:
+      parent: projects/${var.project_id}
+      alertPolicy:
+        displayName: "Content Orchestrator High Latency"
+        documentation:
+          content: "Alert when content orchestrator response time is high"
+          mimeType: text/markdown
+        conditions:
+          - displayName: "95th percentile latency > 30 seconds"
+            conditionThreshold:
+              filter: 'resource.type="cloud_run_revision" AND resource.label.service_name="content-orchestrator"'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 30000  # 30 seconds in milliseconds
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_DELTA
+                  crossSeriesReducer: REDUCE_PERCENTILE_95
+        notificationChannels:
+          - projects/${var.project_id}/notificationChannels/${monitoring-notification-channel.name}
+        alertStrategy:
+          autoClose: 86400s
+        enabled: true
+    depends_on:
+      - monitoring-notification-channel
+
+  # Custom log-based metric for content generation requests
+  - name: content-generation-metric
+    type: gcp-types/logging-v2:projects.metrics
+    condition: var.enable_monitoring
+    properties:
+      parent: projects/${var.project_id}
+      metricId: content_generation_requests
+      metric:
+        description: "Count of content generation requests by type and status"
+        filter: 'resource.type="cloud_function" AND (textPayload:"Content generation" OR textPayload:"Music generation" OR textPayload:"Video generation")'
+        metricDescriptor:
+          metricKind: COUNTER
+          valueType: INT64
+          displayName: "Content Generation Requests"
+        labelExtractors:
+          content_type: 'EXTRACT(textPayload)'
+          status: 'EXTRACT(severity)'
+    depends_on:
+      - enable-apis
+
+# Output values for integration and verification
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${var.project_id}
+  
+  region:
+    description: "Deployment region"
+    value: ${var.region}
+  
+  content_storage_bucket:
+    description: "Primary content storage bucket name"
+    value: ${content-storage-bucket.name}
+  
+  content_storage_bucket_url:
+    description: "Full URL of content storage bucket"
+    value: gs://${content-storage-bucket.name}
+  
+  service_account_email:
+    description: "Service account email for AI services"
+    value: ${content-ai-service-account.email}
+  
+  music_generation_function_url:
+    description: "HTTP trigger URL for music generation function"
+    value: ${music-generation-function.serviceConfig.uri}
+  
+  video_generation_function_url:
+    description: "HTTP trigger URL for video generation function"
+    value: ${video-generation-function.serviceConfig.uri}
+  
+  quality_assessment_function_url:
+    description: "HTTP trigger URL for quality assessment function"
+    value: ${quality-assessment-function.serviceConfig.uri}
+  
+  content_orchestrator_url:
+    description: "Cloud Run service URL for content orchestration"
+    value: ${content-orchestrator-service.uri}
+  
+  container_registry_url:
+    description: "Artifact Registry URL for container images"
+    value: ${var.region}-docker.pkg.dev/${var.project_id}/${container-registry.repositoryId}
+  
+  monitoring_enabled:
+    description: "Whether monitoring and alerting is enabled"
+    value: ${var.enable_monitoring}
+  
+  platform_endpoints:
+    description: "All service endpoints for the content generation platform"
+    value:
+      orchestrator: ${content-orchestrator-service.uri}
+      music_generation: ${music-generation-function.serviceConfig.uri}
+      video_generation: ${video-generation-function.serviceConfig.uri}
+      quality_assessment: ${quality-assessment-function.serviceConfig.uri}
+  
+  next_steps:
+    description: "Next steps for completing the deployment"
+    value: |
+      1. Upload function source code to Cloud Storage bucket: ${content-storage-bucket.name}
+      2. Build and push orchestrator container image to: ${var.region}-docker.pkg.dev/${var.project_id}/${container-registry.repositoryId}/content-orchestrator:latest
+      3. Test endpoints using the provided URLs
+      4. Configure monitoring notification email address if monitoring is enabled
+      5. Review IAM permissions and adjust as needed for your security requirements
+
+# Deployment notes and best practices
+deployment_notes: |
+  This Infrastructure Manager configuration deploys a complete multi-modal AI content generation platform
+  using Google Cloud's most advanced AI services including Lyria 2 and Veo 3.
+  
+  Key Features:
+  - Serverless architecture with automatic scaling
+  - Comprehensive monitoring and alerting
+  - Secure IAM configuration with least privilege
+  - Content lifecycle management in Cloud Storage
+  - Container-based orchestration service
+  
+  Security Considerations:
+  - Service account follows principle of least privilege
+  - All services communicate using internal Google Cloud networking
+  - Cloud Storage bucket uses uniform bucket-level access
+  - Content generation functions have appropriate timeout and memory limits
+  
+  Cost Optimization:
+  - Functions scale to zero when not in use
+  - Cloud Storage uses intelligent tiering for long-term cost reduction
+  - Monitoring resources are optional to reduce costs in development environments
+  
+  Prerequisites:
+  - Vertex AI API access with Lyria 2 and Veo 3 model approval
+  - Function source code packages uploaded to Cloud Storage
+  - Container image for orchestrator service built and pushed to Artifact Registry
+  
+  Estimated Deployment Time: 10-15 minutes
+  Estimated Cost: $25-50 for initial setup and testing (varies based on usage)

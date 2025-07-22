@@ -1,0 +1,420 @@
+# Infrastructure Manager Configuration for Network Security Monitoring
+# This configuration deploys VPC Flow Logs, Cloud Security Command Center integration,
+# and monitoring infrastructure for comprehensive network security monitoring
+
+# Deployment metadata
+deploymentTemplate:
+  name: network-security-monitoring
+  description: "Deploy network security monitoring with VPC Flow Logs and Security Command Center"
+
+# Import the terraform configuration
+imports:
+- path: terraform
+
+# Template configuration
+resources:
+# VPC Network with Flow Logs enabled
+- name: security-monitoring-vpc
+  type: compute.v1.network
+  properties:
+    name: security-monitoring-vpc
+    description: "VPC network for security monitoring demonstration"
+    autoCreateSubnetworks: false
+    routingConfig:
+      routingMode: REGIONAL
+
+# Subnet with comprehensive Flow Logs configuration
+- name: monitored-subnet
+  type: compute.v1.subnetwork
+  properties:
+    name: monitored-subnet
+    network: $(ref.security-monitoring-vpc.selfLink)
+    ipCidrRange: 10.0.1.0/24
+    region: us-central1
+    description: "Subnet with VPC Flow Logs enabled for security monitoring"
+    # Enable comprehensive VPC Flow Logs
+    enableFlowLogs: true
+    logConfig:
+      # Maximum sampling rate for comprehensive monitoring
+      flowSampling: 1.0
+      # Short aggregation interval for real-time monitoring
+      aggregationInterval: INTERVAL_5_SEC
+      # Include all metadata for detailed analysis
+      metadata: INCLUDE_ALL_METADATA
+      # Store logs in Cloud Logging for analysis
+      enable: true
+
+# Firewall rules for security testing and monitoring
+- name: allow-ssh-security-test
+  type: compute.v1.firewall
+  properties:
+    name: allow-ssh-security-test
+    network: $(ref.security-monitoring-vpc.selfLink)
+    description: "Allow SSH access for security monitoring test instances"
+    direction: INGRESS
+    priority: 1000
+    sourceRanges:
+    - 0.0.0.0/0
+    targetTags:
+    - security-test
+    allowed:
+    - IPProtocol: tcp
+      ports:
+      - "22"
+
+- name: allow-http-web-server
+  type: compute.v1.firewall
+  properties:
+    name: allow-http-web-server
+    network: $(ref.security-monitoring-vpc.selfLink)
+    description: "Allow HTTP/HTTPS traffic for web service monitoring"
+    direction: INGRESS
+    priority: 1000
+    sourceRanges:
+    - 0.0.0.0/0
+    targetTags:
+    - web-server
+    allowed:
+    - IPProtocol: tcp
+      ports:
+      - "80"
+      - "443"
+
+- name: allow-internal-communication
+  type: compute.v1.firewall
+  properties:
+    name: allow-internal-communication
+    network: $(ref.security-monitoring-vpc.selfLink)
+    description: "Allow internal subnet communication for monitoring"
+    direction: INGRESS
+    priority: 1000
+    sourceRanges:
+    - 10.0.1.0/24
+    targetTags:
+    - security-test
+    allowed:
+    - IPProtocol: tcp
+      ports:
+      - "0-65535"
+    - IPProtocol: udp
+      ports:
+      - "0-65535"
+    - IPProtocol: icmp
+
+# Test VM instance for traffic generation and monitoring
+- name: security-test-vm
+  type: compute.v1.instance
+  properties:
+    name: security-test-vm
+    zone: us-central1-a
+    description: "Test VM instance for security monitoring demonstration"
+    machineType: zones/us-central1-a/machineTypes/e2-micro
+    # Boot disk configuration
+    disks:
+    - boot: true
+      autoDelete: true
+      initializeParams:
+        sourceImage: projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts
+        diskSizeGb: 10
+        diskType: zones/us-central1-a/diskTypes/pd-standard
+    # Network configuration
+    networkInterfaces:
+    - subnetwork: $(ref.monitored-subnet.selfLink)
+      # Assign external IP for testing
+      accessConfigs:
+      - name: External NAT
+        type: ONE_TO_ONE_NAT
+        networkTier: PREMIUM
+    # Instance tags for firewall rules
+    tags:
+      items:
+      - security-test
+      - web-server
+    # Startup script to install Apache and monitoring tools
+    metadata:
+      items:
+      - key: startup-script
+        value: |
+          #!/bin/bash
+          # Update system packages
+          apt-get update
+          
+          # Install Apache web server for generating HTTP traffic
+          apt-get install -y apache2 netcat
+          
+          # Start and enable Apache
+          systemctl start apache2
+          systemctl enable apache2
+          
+          # Create test web page
+          echo "<h1>Security Monitoring Test Server</h1>" > /var/www/html/index.html
+          echo "<p>This server is used for network security monitoring demonstration.</p>" >> /var/www/html/index.html
+          echo "<p>Timestamp: $(date)</p>" >> /var/www/html/index.html
+          
+          # Log startup completion
+          logger "Security monitoring test server setup completed"
+    # Service account for monitoring access
+    serviceAccounts:
+    - email: default
+      scopes:
+      - https://www.googleapis.com/auth/logging.write
+      - https://www.googleapis.com/auth/monitoring.write
+      - https://www.googleapis.com/auth/cloud-platform
+
+# BigQuery dataset for VPC Flow Logs storage and analysis
+- name: security-monitoring-dataset
+  type: bigquery.v2.dataset
+  properties:
+    datasetReference:
+      datasetId: security_monitoring
+      projectId: $(ref.projectId)
+    location: US
+    description: "Dataset for storing and analyzing VPC Flow Logs for security monitoring"
+    # Access control for security team
+    access:
+    - role: OWNER
+      userByEmail: $(ref.projectOwner)
+    - role: READER
+      specialGroup: projectReaders
+    - role: WRITER
+      specialGroup: projectWriters
+    # Data retention and compliance settings
+    defaultTableExpirationMs: 7776000000  # 90 days retention
+    labels:
+      purpose: security-monitoring
+      environment: demo
+
+# Cloud Logging sink to route VPC Flow Logs to BigQuery
+- name: vpc-flow-security-sink
+  type: logging.v2.sink
+  properties:
+    name: vpc-flow-security-sink
+    description: "Logging sink for VPC Flow Logs security monitoring"
+    # Filter for VPC Flow Logs and related network events
+    filter: |
+      resource.type="gce_subnetwork" AND 
+      (protoPayload.methodName="compute.subnetworks.insert" OR
+       logName:"compute.googleapis.com%2Fvpc_flows")
+    # Destination BigQuery dataset
+    destination: bigquery.googleapis.com/projects/$(ref.projectId)/datasets/security_monitoring
+    # Include children for comprehensive logging
+    includeChildren: true
+    # Unique writer identity for BigQuery access
+    uniqueWriterIdentity: true
+
+# Pub/Sub topic for Security Command Center findings
+- name: security-findings-topic
+  type: pubsub.v1.topic
+  properties:
+    name: security-findings-topic
+    description: "Pub/Sub topic for processing Security Command Center findings"
+    labels:
+      purpose: security-monitoring
+      component: scc-integration
+    # Message retention for reliable processing
+    messageRetentionDuration: 604800s  # 7 days
+
+# Pub/Sub subscription for findings processing
+- name: security-findings-subscription
+  type: pubsub.v1.subscription
+  properties:
+    name: security-findings-subscription
+    topic: $(ref.security-findings-topic.name)
+    description: "Subscription for processing security findings"
+    # Acknowledgment deadline for processing
+    ackDeadlineSeconds: 600
+    # Message retention
+    messageRetentionDuration: 604800s  # 7 days
+    # Dead letter policy for failed messages
+    deadLetterPolicy:
+      maxDeliveryAttempts: 5
+    # Retry policy
+    retryPolicy:
+      minimumBackoff: 10s
+      maximumBackoff: 600s
+
+# Cloud Monitoring alert policy for high traffic volume
+- name: high-traffic-alert-policy
+  type: monitoring.v1.alertPolicy
+  properties:
+    displayName: "High Network Traffic Volume Alert"
+    documentation:
+      content: "Alert triggered when network traffic exceeds normal thresholds indicating potential security threats"
+      mimeType: text/markdown
+    # Alert conditions
+    conditions:
+    - displayName: "High egress traffic condition"
+      conditionThreshold:
+        filter: 'resource.type="gce_instance"'
+        comparison: COMPARISON_GREATER_THAN
+        # Threshold for high traffic (1GB in bytes)
+        thresholdValue: 1000000000
+        duration: 300s
+        aggregations:
+        - alignmentPeriod: 60s
+          perSeriesAligner: ALIGN_RATE
+          crossSeriesReducer: REDUCE_SUM
+          groupByFields:
+          - resource.label.instance_id
+    # Alert strategy
+    alertStrategy:
+      autoClose: 86400s  # Auto-close after 24 hours
+    # Enable the policy
+    enabled: true
+    # Severity classification
+    severity: WARNING
+
+# Cloud Monitoring alert policy for suspicious connection patterns
+- name: suspicious-connections-alert-policy
+  type: monitoring.v1.alertPolicy
+  properties:
+    displayName: "Suspicious Connection Patterns Alert"
+    documentation:
+      content: "Alert for unusual connection patterns that may indicate security threats such as port scanning or brute force attacks"
+      mimeType: text/markdown
+    # Alert conditions
+    conditions:
+    - displayName: "High connection rate condition"
+      conditionThreshold:
+        filter: 'resource.type="gce_subnetwork"'
+        comparison: COMPARISON_GREATER_THAN
+        # Threshold for suspicious connection count
+        thresholdValue: 100
+        duration: 180s
+        aggregations:
+        - alignmentPeriod: 60s
+          perSeriesAligner: ALIGN_RATE
+          crossSeriesReducer: REDUCE_COUNT
+          groupByFields:
+          - resource.label.subnetwork_name
+    # Alert strategy
+    alertStrategy:
+      autoClose: 43200s  # Auto-close after 12 hours
+    # Enable the policy
+    enabled: true
+    # Severity classification
+    severity: CRITICAL
+
+# IAM binding for logging sink service account
+- name: logging-sink-bigquery-access
+  type: cloudresourcemanager.v1.binding
+  properties:
+    resource: projects/$(ref.projectId)
+    role: roles/bigquery.dataEditor
+    members:
+    - $(ref.vpc-flow-security-sink.writerIdentity)
+
+# Service account for security monitoring functions
+- name: security-monitoring-sa
+  type: iam.v1.serviceAccount
+  properties:
+    accountId: security-monitoring-sa
+    displayName: "Security Monitoring Service Account"
+    description: "Service account for security monitoring and analysis functions"
+
+# IAM bindings for security monitoring service account
+- name: security-monitoring-sa-logging-binding
+  type: cloudresourcemanager.v1.binding
+  properties:
+    resource: projects/$(ref.projectId)
+    role: roles/logging.viewer
+    members:
+    - serviceAccount:$(ref.security-monitoring-sa.email)
+
+- name: security-monitoring-sa-monitoring-binding
+  type: cloudresourcemanager.v1.binding
+  properties:
+    resource: projects/$(ref.projectId)
+    role: roles/monitoring.editor
+    members:
+    - serviceAccount:$(ref.security-monitoring-sa.email)
+
+- name: security-monitoring-sa-bigquery-binding
+  type: cloudresourcemanager.v1.binding
+  properties:
+    resource: projects/$(ref.projectId)
+    role: roles/bigquery.jobUser
+    members:
+    - serviceAccount:$(ref.security-monitoring-sa.email)
+
+# Output important resource information
+outputs:
+- name: vpc-network-name
+  value: $(ref.security-monitoring-vpc.name)
+  description: "Name of the VPC network created for security monitoring"
+
+- name: subnet-name
+  value: $(ref.monitored-subnet.name)
+  description: "Name of the subnet with VPC Flow Logs enabled"
+
+- name: test-vm-name
+  value: $(ref.security-test-vm.name)
+  description: "Name of the test VM instance for traffic generation"
+
+- name: test-vm-external-ip
+  value: $(ref.security-test-vm.networkInterfaces[0].accessConfigs[0].natIP)
+  description: "External IP address of the test VM instance"
+
+- name: bigquery-dataset-id
+  value: $(ref.security-monitoring-dataset.datasetReference.datasetId)
+  description: "BigQuery dataset ID for VPC Flow Logs analysis"
+
+- name: logging-sink-name
+  value: $(ref.vpc-flow-security-sink.name)
+  description: "Name of the Cloud Logging sink for VPC Flow Logs"
+
+- name: pubsub-topic-name
+  value: $(ref.security-findings-topic.name)
+  description: "Pub/Sub topic for Security Command Center findings"
+
+- name: high-traffic-alert-policy-name
+  value: $(ref.high-traffic-alert-policy.displayName)
+  description: "Name of the high traffic volume alert policy"
+
+- name: suspicious-connections-alert-policy-name
+  value: $(ref.suspicious-connections-alert-policy.displayName)
+  description: "Name of the suspicious connections alert policy"
+
+- name: monitoring-service-account
+  value: $(ref.security-monitoring-sa.email)
+  description: "Email of the service account for security monitoring"
+
+# Deployment parameters for customization
+parameters:
+- name: projectId
+  type: string
+  description: "Google Cloud Project ID"
+  default: ""
+
+- name: region
+  type: string
+  description: "Google Cloud region for regional resources"
+  default: "us-central1"
+
+- name: zone
+  type: string
+  description: "Google Cloud zone for zonal resources"
+  default: "us-central1-a"
+
+- name: vpcCidrRange
+  type: string
+  description: "CIDR range for the VPC subnet"
+  default: "10.0.1.0/24"
+
+- name: environment
+  type: string
+  description: "Environment tag for resource organization"
+  default: "demo"
+
+- name: projectOwner
+  type: string
+  description: "Email of the project owner for BigQuery access"
+  default: ""
+
+# Metadata and labels for resource organization
+metadata:
+  labels:
+    purpose: security-monitoring
+    recipe: network-security-monitoring
+    environment: demo
+    managed-by: infrastructure-manager

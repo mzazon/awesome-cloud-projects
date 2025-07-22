@@ -1,0 +1,1059 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CQRS and Event Sourcing implementation using EventBridge, DynamoDB, and Lambda'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "DynamoDB Configuration"
+        Parameters:
+          - EventStoreReadCapacity
+          - EventStoreWriteCapacity
+          - ReadModelCapacity
+      - Label:
+          default: "EventBridge Configuration"
+        Parameters:
+          - EventRetentionDays
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaTimeout
+          - LambdaMemorySize
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      EventStoreReadCapacity:
+        default: "Event Store Read Capacity"
+      EventStoreWriteCapacity:
+        default: "Event Store Write Capacity"
+      ReadModelCapacity:
+        default: "Read Model Capacity"
+      EventRetentionDays:
+        default: "Event Retention Days"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+
+# Input Parameters
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'cqrs-demo'
+    Description: 'Name prefix for all resources'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+    MinLength: 3
+    MaxLength: 20
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'test', 'staging', 'prod']
+    Description: 'Environment name for resource tagging and naming'
+
+  EventStoreReadCapacity:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 1000
+    Description: 'Read capacity units for the event store table'
+
+  EventStoreWriteCapacity:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 1000
+    Description: 'Write capacity units for the event store table'
+
+  ReadModelCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 1000
+    Description: 'Read and write capacity units for read model tables'
+
+  EventRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: 'Number of days to retain events in EventBridge archive'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    Description: 'Timeout for Lambda functions in seconds'
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+    Description: 'Memory allocation for Lambda functions in MB'
+
+# Conditional Logic
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  EnablePointInTimeRecovery: !Equals [!Ref Environment, 'prod']
+
+# Resources
+Resources:
+  # ==========================================
+  # DynamoDB Tables
+  # ==========================================
+  
+  # Event Store Table - Core of Event Sourcing pattern
+  EventStoreTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-event-store'
+      BillingMode: PROVISIONED
+      AttributeDefinitions:
+        - AttributeName: AggregateId
+          AttributeType: S
+        - AttributeName: Version
+          AttributeType: N
+        - AttributeName: EventType
+          AttributeType: S
+        - AttributeName: Timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: AggregateId
+          KeyType: HASH
+        - AttributeName: Version
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: EventType-Timestamp-index
+          KeySchema:
+            - AttributeName: EventType
+              KeyType: HASH
+            - AttributeName: Timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !Ref ReadModelCapacity
+            WriteCapacityUnits: !Ref ReadModelCapacity
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref EventStoreReadCapacity
+        WriteCapacityUnits: !Ref EventStoreWriteCapacity
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [EnablePointInTimeRecovery, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Event Store'
+        - Key: Pattern
+          Value: 'CQRS-EventSourcing'
+
+  # User Profiles Read Model - Optimized for user queries
+  UserProfilesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-user-profiles'
+      BillingMode: PROVISIONED
+      AttributeDefinitions:
+        - AttributeName: UserId
+          AttributeType: S
+        - AttributeName: Email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: UserId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: Email-index
+          KeySchema:
+            - AttributeName: Email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !Ref ReadModelCapacity
+            WriteCapacityUnits: !Ref ReadModelCapacity
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref ReadModelCapacity
+        WriteCapacityUnits: !Ref ReadModelCapacity
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'User Read Model'
+        - Key: Pattern
+          Value: 'CQRS-Query'
+
+  # Order Summaries Read Model - Optimized for order queries
+  OrderSummariesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-order-summaries'
+      BillingMode: PROVISIONED
+      AttributeDefinitions:
+        - AttributeName: OrderId
+          AttributeType: S
+        - AttributeName: UserId
+          AttributeType: S
+        - AttributeName: Status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: OrderId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserId-index
+          KeySchema:
+            - AttributeName: UserId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !Ref ReadModelCapacity
+            WriteCapacityUnits: !Ref ReadModelCapacity
+        - IndexName: Status-index
+          KeySchema:
+            - AttributeName: Status
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !Ref ReadModelCapacity
+            WriteCapacityUnits: !Ref ReadModelCapacity
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref ReadModelCapacity
+        WriteCapacityUnits: !Ref ReadModelCapacity
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Order Read Model'
+        - Key: Pattern
+          Value: 'CQRS-Query'
+
+  # ==========================================
+  # EventBridge Resources
+  # ==========================================
+  
+  # Custom Event Bus for domain events
+  DomainEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-events'
+      Description: 'Custom event bus for CQRS domain events'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Domain Event Distribution'
+
+  # Event Archive for replay capabilities
+  EventArchive:
+    Type: AWS::Events::Archive
+    Properties:
+      ArchiveName: !Sub '${ProjectName}-${Environment}-event-archive'
+      SourceArn: !GetAtt DomainEventBus.Arn
+      Description: 'Archive for CQRS event sourcing replay capabilities'
+      RetentionDays: !Ref EventRetentionDays
+
+  # EventBridge Rules for event routing
+  UserEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-user-events'
+      Description: 'Route user-related events to user projection handler'
+      EventBusName: !Ref DomainEventBus
+      EventPattern:
+        source: ['cqrs.demo']
+        detail-type: ['UserCreated', 'UserProfileUpdated']
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt UserProjectionFunction.Arn
+          Id: 'UserProjectionTarget'
+
+  OrderEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-order-events'
+      Description: 'Route order-related events to order projection handler'
+      EventBusName: !Ref DomainEventBus
+      EventPattern:
+        source: ['cqrs.demo']
+        detail-type: ['OrderCreated', 'OrderStatusUpdated']
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt OrderProjectionFunction.Arn
+          Id: 'OrderProjectionTarget'
+
+  # ==========================================
+  # IAM Roles and Policies
+  # ==========================================
+  
+  # Command Handler Execution Role
+  CommandHandlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-command-role'
+      Description: 'Execution role for command handler Lambda functions'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBEventStoreAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:GetItem
+                Resource:
+                  - !GetAtt EventStoreTable.Arn
+                  - !Sub '${EventStoreTable.Arn}/index/*'
+        - PolicyName: EventBridgePublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !GetAtt DomainEventBus.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Command Processing'
+
+  # Projection Handler Execution Role
+  ProjectionHandlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-projection-role'
+      Description: 'Execution role for projection handler Lambda functions'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReadModelAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt UserProfilesTable.Arn
+                  - !Sub '${UserProfilesTable.Arn}/index/*'
+                  - !GetAtt OrderSummariesTable.Arn
+                  - !Sub '${OrderSummariesTable.Arn}/index/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Read Model Projection'
+
+  # ==========================================
+  # Lambda Functions
+  # ==========================================
+  
+  # Command Handler Lambda Function
+  CommandHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-command-handler'
+      Description: 'Processes business commands and generates domain events'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Role: !GetAtt CommandHandlerRole.Arn
+      Environment:
+        Variables:
+          EVENT_STORE_TABLE: !Ref EventStoreTable
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          from datetime import datetime
+          from decimal import Decimal
+
+          dynamodb = boto3.resource('dynamodb')
+
+          def lambda_handler(event, context):
+              try:
+                  # Parse command from API Gateway or direct invocation
+                  command = json.loads(event['body']) if 'body' in event else event
+                  
+                  # Command validation
+                  command_type = command.get('commandType')
+                  aggregate_id = command.get('aggregateId', str(uuid.uuid4()))
+                  
+                  if not command_type:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'commandType is required'})
+                      }
+                  
+                  # Get current version for optimistic concurrency
+                  table = dynamodb.Table(os.environ['EVENT_STORE_TABLE'])
+                  
+                  # Query existing events for this aggregate
+                  response = table.query(
+                      KeyConditionExpression='AggregateId = :id',
+                      ExpressionAttributeValues={':id': aggregate_id},
+                      ScanIndexForward=False,
+                      Limit=1
+                  )
+                  
+                  current_version = 0
+                  if response['Items']:
+                      current_version = int(response['Items'][0]['Version'])
+                  
+                  # Create domain event
+                  event_id = str(uuid.uuid4())
+                  new_version = current_version + 1
+                  timestamp = datetime.utcnow().isoformat()
+                  
+                  # Event payload based on command type
+                  event_data = create_event_from_command(command_type, command, aggregate_id)
+                  
+                  # Store event in event store with conditional write
+                  table.put_item(
+                      Item={
+                          'AggregateId': aggregate_id,
+                          'Version': new_version,
+                          'EventId': event_id,
+                          'EventType': event_data['eventType'],
+                          'Timestamp': timestamp,
+                          'EventData': event_data['data'],
+                          'CommandId': command.get('commandId', str(uuid.uuid4())),
+                          'CorrelationId': command.get('correlationId', str(uuid.uuid4()))
+                      },
+                      ConditionExpression='attribute_not_exists(AggregateId) AND attribute_not_exists(Version)'
+                  )
+                  
+                  return {
+                      'statusCode': 201,
+                      'body': json.dumps({
+                          'aggregateId': aggregate_id,
+                          'version': new_version,
+                          'eventId': event_id
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error processing command: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': 'Internal server error'})
+                  }
+
+          def create_event_from_command(command_type, command, aggregate_id):
+              """Transform commands into domain events"""
+              
+              if command_type == 'CreateUser':
+                  return {
+                      'eventType': 'UserCreated',
+                      'data': {
+                          'userId': aggregate_id,
+                          'email': command['email'],
+                          'name': command['name'],
+                          'createdAt': datetime.utcnow().isoformat()
+                      }
+                  }
+              
+              elif command_type == 'UpdateUserProfile':
+                  return {
+                      'eventType': 'UserProfileUpdated',
+                      'data': {
+                          'userId': aggregate_id,
+                          'changes': command['changes'],
+                          'updatedAt': datetime.utcnow().isoformat()
+                      }
+                  }
+              
+              elif command_type == 'CreateOrder':
+                  return {
+                      'eventType': 'OrderCreated',
+                      'data': {
+                          'orderId': aggregate_id,
+                          'userId': command['userId'],
+                          'items': command['items'],
+                          'totalAmount': command['totalAmount'],
+                          'createdAt': datetime.utcnow().isoformat()
+                      }
+                  }
+              
+              elif command_type == 'UpdateOrderStatus':
+                  return {
+                      'eventType': 'OrderStatusUpdated',
+                      'data': {
+                          'orderId': aggregate_id,
+                          'status': command['status'],
+                          'updatedAt': datetime.utcnow().isoformat()
+                      }
+                  }
+              
+              else:
+                  raise ValueError(f"Unknown command type: {command_type}")
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Command Processing'
+
+  # Stream Processor Lambda Function
+  StreamProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-stream-processor'
+      Description: 'Processes DynamoDB streams and publishes events to EventBridge'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: 60
+      MemorySize: !Ref LambdaMemorySize
+      Role: !GetAtt CommandHandlerRole.Arn
+      Environment:
+        Variables:
+          EVENT_BUS_NAME: !Ref DomainEventBus
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from decimal import Decimal
+
+          eventbridge = boto3.client('events')
+
+          def lambda_handler(event, context):
+              try:
+                  for record in event['Records']:
+                      if record['eventName'] in ['INSERT']:
+                          # Extract event from DynamoDB stream
+                          dynamodb_event = record['dynamodb']['NewImage']
+                          
+                          # Convert DynamoDB format to normal format
+                          domain_event = {
+                              'EventId': dynamodb_event['EventId']['S'],
+                              'AggregateId': dynamodb_event['AggregateId']['S'],
+                              'EventType': dynamodb_event['EventType']['S'],
+                              'Version': int(dynamodb_event['Version']['N']),
+                              'Timestamp': dynamodb_event['Timestamp']['S'],
+                              'EventData': deserialize_dynamodb_item(dynamodb_event['EventData']['M']),
+                              'CommandId': dynamodb_event.get('CommandId', {}).get('S'),
+                              'CorrelationId': dynamodb_event.get('CorrelationId', {}).get('S')
+                          }
+                          
+                          # Publish to EventBridge
+                          eventbridge.put_events(
+                              Entries=[{
+                                  'Source': 'cqrs.demo',
+                                  'DetailType': domain_event['EventType'],
+                                  'Detail': json.dumps(domain_event, default=str),
+                                  'EventBusName': os.environ['EVENT_BUS_NAME']
+                              }]
+                          )
+                          
+                          print(f"Published event {domain_event['EventId']} to EventBridge")
+                  
+                  return {'statusCode': 200}
+                  
+              except Exception as e:
+                  print(f"Error processing stream: {str(e)}")
+                  raise
+
+          def deserialize_dynamodb_item(item):
+              """Convert DynamoDB item format to regular Python objects"""
+              if isinstance(item, dict):
+                  if len(item) == 1:
+                      key, value = next(iter(item.items()))
+                      if key == 'S':
+                          return value
+                      elif key == 'N':
+                          return Decimal(value)
+                      elif key == 'M':
+                          return {k: deserialize_dynamodb_item(v) for k, v in value.items()}
+                      elif key == 'L':
+                          return [deserialize_dynamodb_item(v) for v in value]
+                      elif key == 'NULL':
+                          return None
+                      elif key == 'BOOL':
+                          return value
+                  else:
+                      return {k: deserialize_dynamodb_item(v) for k, v in item.items()}
+              return item
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Event Stream Processing'
+
+  # User Projection Lambda Function
+  UserProjectionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-user-projection'
+      Description: 'Maintains user profile read model from domain events'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Role: !GetAtt ProjectionHandlerRole.Arn
+      Environment:
+        Variables:
+          USER_READ_MODEL_TABLE: !Ref UserProfilesTable
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          dynamodb = boto3.resource('dynamodb')
+
+          def lambda_handler(event, context):
+              try:
+                  detail = event['detail']
+                  event_type = detail['EventType']
+                  event_data = detail['EventData']
+                  
+                  table = dynamodb.Table(os.environ['USER_READ_MODEL_TABLE'])
+                  
+                  if event_type == 'UserCreated':
+                      # Create user profile projection
+                      table.put_item(
+                          Item={
+                              'UserId': event_data['userId'],
+                              'Email': event_data['email'],
+                              'Name': event_data['name'],
+                              'CreatedAt': event_data['createdAt'],
+                              'UpdatedAt': event_data['createdAt'],
+                              'Version': detail['Version']
+                          }
+                      )
+                      print(f"Created user profile for {event_data['userId']}")
+                      
+                  elif event_type == 'UserProfileUpdated':
+                      # Update user profile projection
+                      update_expression = "SET UpdatedAt = :updated, Version = :version"
+                      expression_values = {
+                          ':updated': event_data['updatedAt'],
+                          ':version': detail['Version']
+                      }
+                      
+                      # Build update expression for changes
+                      for field, value in event_data['changes'].items():
+                          if field in ['Name', 'Email']:
+                              update_expression += f", {field} = :{field.lower()}"
+                              expression_values[f":{field.lower()}"] = value
+                      
+                      table.update_item(
+                          Key={'UserId': event_data['userId']},
+                          UpdateExpression=update_expression,
+                          ExpressionAttributeValues=expression_values
+                      )
+                      print(f"Updated user profile for {event_data['userId']}")
+                  
+                  return {'statusCode': 200}
+                  
+              except Exception as e:
+                  print(f"Error in user projection: {str(e)}")
+                  raise
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'User Read Model Projection'
+
+  # Order Projection Lambda Function
+  OrderProjectionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-order-projection'
+      Description: 'Maintains order summary read model from domain events'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Role: !GetAtt ProjectionHandlerRole.Arn
+      Environment:
+        Variables:
+          ORDER_READ_MODEL_TABLE: !Ref OrderSummariesTable
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from decimal import Decimal
+
+          dynamodb = boto3.resource('dynamodb')
+
+          def lambda_handler(event, context):
+              try:
+                  detail = event['detail']
+                  event_type = detail['EventType']
+                  event_data = detail['EventData']
+                  
+                  table = dynamodb.Table(os.environ['ORDER_READ_MODEL_TABLE'])
+                  
+                  if event_type == 'OrderCreated':
+                      # Create order summary projection
+                      table.put_item(
+                          Item={
+                              'OrderId': event_data['orderId'],
+                              'UserId': event_data['userId'],
+                              'Items': event_data['items'],
+                              'TotalAmount': Decimal(str(event_data['totalAmount'])),
+                              'Status': 'Created',
+                              'CreatedAt': event_data['createdAt'],
+                              'UpdatedAt': event_data['createdAt'],
+                              'Version': detail['Version']
+                          }
+                      )
+                      print(f"Created order summary for {event_data['orderId']}")
+                      
+                  elif event_type == 'OrderStatusUpdated':
+                      # Update order status in projection
+                      table.update_item(
+                          Key={'OrderId': event_data['orderId']},
+                          UpdateExpression="SET #status = :status, UpdatedAt = :updated, Version = :version",
+                          ExpressionAttributeNames={'#status': 'Status'},
+                          ExpressionAttributeValues={
+                              ':status': event_data['status'],
+                              ':updated': event_data['updatedAt'],
+                              ':version': detail['Version']
+                          }
+                      )
+                      print(f"Updated order status for {event_data['orderId']}")
+                  
+                  return {'statusCode': 200}
+                  
+              except Exception as e:
+                  print(f"Error in order projection: {str(e)}")
+                  raise
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Order Read Model Projection'
+
+  # Query Handler Lambda Function
+  QueryHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-query-handler'
+      Description: 'Handles read queries against optimized read models'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Role: !GetAtt ProjectionHandlerRole.Arn
+      Environment:
+        Variables:
+          USER_READ_MODEL_TABLE: !Ref UserProfilesTable
+          ORDER_READ_MODEL_TABLE: !Ref OrderSummariesTable
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from boto3.dynamodb.conditions import Key
+          from decimal import Decimal
+
+          dynamodb = boto3.resource('dynamodb')
+
+          def lambda_handler(event, context):
+              try:
+                  # Parse query from API Gateway or direct invocation
+                  query = json.loads(event['body']) if 'body' in event else event
+                  query_type = query.get('queryType')
+                  
+                  if query_type == 'GetUserProfile':
+                      result = get_user_profile(query['userId'])
+                  elif query_type == 'GetUserByEmail':
+                      result = get_user_by_email(query['email'])
+                  elif query_type == 'GetOrdersByUser':
+                      result = get_orders_by_user(query['userId'])
+                  elif query_type == 'GetOrdersByStatus':
+                      result = get_orders_by_status(query['status'])
+                  else:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': f'Unknown query type: {query_type}'})
+                      }
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(result, default=decimal_encoder)
+                  }
+                  
+              except Exception as e:
+                  print(f"Error processing query: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': 'Internal server error'})
+                  }
+
+          def get_user_profile(user_id):
+              table = dynamodb.Table(os.environ['USER_READ_MODEL_TABLE'])
+              response = table.get_item(Key={'UserId': user_id})
+              return response.get('Item')
+
+          def get_user_by_email(email):
+              table = dynamodb.Table(os.environ['USER_READ_MODEL_TABLE'])
+              response = table.query(
+                  IndexName='Email-index',
+                  KeyConditionExpression=Key('Email').eq(email)
+              )
+              return response['Items'][0] if response['Items'] else None
+
+          def get_orders_by_user(user_id):
+              table = dynamodb.Table(os.environ['ORDER_READ_MODEL_TABLE'])
+              response = table.query(
+                  IndexName='UserId-index',
+                  KeyConditionExpression=Key('UserId').eq(user_id)
+              )
+              return response['Items']
+
+          def get_orders_by_status(status):
+              table = dynamodb.Table(os.environ['ORDER_READ_MODEL_TABLE'])
+              response = table.query(
+                  IndexName='Status-index',
+                  KeyConditionExpression=Key('Status').eq(status)
+              )
+              return response['Items']
+
+          def decimal_encoder(obj):
+              if isinstance(obj, Decimal):
+                  return float(obj)
+              raise TypeError
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Query Processing'
+
+  # ==========================================
+  # Event Source Mappings
+  # ==========================================
+  
+  # DynamoDB Stream Event Source Mapping
+  StreamEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt EventStoreTable.StreamArn
+      FunctionName: !Ref StreamProcessorFunction
+      StartingPosition: LATEST
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+
+  # ==========================================
+  # Lambda Permissions for EventBridge
+  # ==========================================
+  
+  # Permission for EventBridge to invoke User Projection function
+  UserProjectionEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UserProjectionFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt UserEventsRule.Arn
+
+  # Permission for EventBridge to invoke Order Projection function
+  OrderProjectionEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OrderProjectionFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt OrderEventsRule.Arn
+
+# Stack Outputs
+Outputs:
+  # Infrastructure Information
+  EventStoreTableName:
+    Description: 'Name of the Event Store DynamoDB table'
+    Value: !Ref EventStoreTable
+    Export:
+      Name: !Sub '${AWS::StackName}-EventStoreTable'
+
+  EventStoreStreamArn:
+    Description: 'ARN of the Event Store DynamoDB stream'
+    Value: !GetAtt EventStoreTable.StreamArn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventStoreStreamArn'
+
+  UserProfilesTableName:
+    Description: 'Name of the User Profiles read model table'
+    Value: !Ref UserProfilesTable
+    Export:
+      Name: !Sub '${AWS::StackName}-UserProfilesTable'
+
+  OrderSummariesTableName:
+    Description: 'Name of the Order Summaries read model table'
+    Value: !Ref OrderSummariesTable
+    Export:
+      Name: !Sub '${AWS::StackName}-OrderSummariesTable'
+
+  DomainEventBusName:
+    Description: 'Name of the custom EventBridge event bus'
+    Value: !Ref DomainEventBus
+    Export:
+      Name: !Sub '${AWS::StackName}-DomainEventBus'
+
+  DomainEventBusArn:
+    Description: 'ARN of the custom EventBridge event bus'
+    Value: !GetAtt DomainEventBus.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DomainEventBusArn'
+
+  EventArchiveName:
+    Description: 'Name of the EventBridge archive'
+    Value: !Ref EventArchive
+    Export:
+      Name: !Sub '${AWS::StackName}-EventArchive'
+
+  # Lambda Function Information
+  CommandHandlerFunctionName:
+    Description: 'Name of the Command Handler Lambda function'
+    Value: !Ref CommandHandlerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-CommandHandlerFunction'
+
+  CommandHandlerFunctionArn:
+    Description: 'ARN of the Command Handler Lambda function'
+    Value: !GetAtt CommandHandlerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CommandHandlerFunctionArn'
+
+  StreamProcessorFunctionName:
+    Description: 'Name of the Stream Processor Lambda function'
+    Value: !Ref StreamProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-StreamProcessorFunction'
+
+  UserProjectionFunctionName:
+    Description: 'Name of the User Projection Lambda function'
+    Value: !Ref UserProjectionFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-UserProjectionFunction'
+
+  OrderProjectionFunctionName:
+    Description: 'Name of the Order Projection Lambda function'
+    Value: !Ref OrderProjectionFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-OrderProjectionFunction'
+
+  QueryHandlerFunctionName:
+    Description: 'Name of the Query Handler Lambda function'
+    Value: !Ref QueryHandlerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-QueryHandlerFunction'
+
+  QueryHandlerFunctionArn:
+    Description: 'ARN of the Query Handler Lambda function'
+    Value: !GetAtt QueryHandlerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-QueryHandlerFunctionArn'
+
+  # IAM Role Information
+  CommandHandlerRoleArn:
+    Description: 'ARN of the Command Handler execution role'
+    Value: !GetAtt CommandHandlerRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CommandHandlerRole'
+
+  ProjectionHandlerRoleArn:
+    Description: 'ARN of the Projection Handler execution role'
+    Value: !GetAtt ProjectionHandlerRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectionHandlerRole'
+
+  # Testing and Validation Information
+  ProjectName:
+    Description: 'Project name used for resource naming'
+    Value: !Ref ProjectName
+
+  Environment:
+    Description: 'Environment name for this deployment'
+    Value: !Ref Environment
+
+  StackRegion:
+    Description: 'AWS Region where this stack is deployed'
+    Value: !Ref AWS::Region
+
+  # Usage Instructions
+  TestCommandExample:
+    Description: 'Example AWS CLI command to test the command handler'
+    Value: !Sub |
+      aws lambda invoke --function-name ${CommandHandlerFunction} --payload '{"commandType": "CreateUser", "email": "test@example.com", "name": "Test User"}' response.json
+
+  TestQueryExample:
+    Description: 'Example AWS CLI command to test the query handler'
+    Value: !Sub |
+      aws lambda invoke --function-name ${QueryHandlerFunction} --payload '{"queryType": "GetUserByEmail", "email": "test@example.com"}' query_response.json

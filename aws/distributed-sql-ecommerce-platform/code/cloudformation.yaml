@@ -1,0 +1,807 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Global E-commerce Platform with Aurora DSQL - Deploys a serverless, globally distributed 
+  e-commerce platform using Aurora DSQL, Lambda, API Gateway, and CloudFront for 
+  high-performance, consistent customer experiences worldwide.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "Aurora DSQL Configuration"
+        Parameters:
+          - DSQLClusterName
+          - EnableDeletionProtection
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaRuntime
+          - LambdaMemorySize
+          - LambdaTimeout
+      - Label:
+          default: "API Gateway Configuration"
+        Parameters:
+          - APIGatewayStageName
+          - EnableAPIGatewayLogging
+      - Label:
+          default: "CloudFront Configuration"
+        Parameters:
+          - CloudFrontPriceClass
+          - EnableCloudFrontLogging
+    ParameterLabels:
+      Environment:
+        default: "Environment Name"
+      ProjectName:
+        default: "Project Name"
+      DSQLClusterName:
+        default: "Aurora DSQL Cluster Name"
+      EnableDeletionProtection:
+        default: "Enable Deletion Protection"
+      LambdaRuntime:
+        default: "Lambda Runtime Version"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      APIGatewayStageName:
+        default: "API Gateway Stage Name"
+      EnableAPIGatewayLogging:
+        default: "Enable API Gateway Logging"
+      CloudFrontPriceClass:
+        default: "CloudFront Price Class"
+      EnableCloudFrontLogging:
+        default: "Enable CloudFront Logging"
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name for resource tagging and naming
+    
+  ProjectName:
+    Type: String
+    Default: global-ecommerce
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: ^[a-z0-9-]+$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    Description: Project name used for resource naming and tagging
+    
+  DSQLClusterName:
+    Type: String
+    Default: ecommerce-cluster
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9-]*$
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters and hyphens
+    Description: Name for the Aurora DSQL cluster
+    
+  EnableDeletionProtection:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable deletion protection for the Aurora DSQL cluster
+    
+  LambdaRuntime:
+    Type: String
+    Default: python3.9
+    AllowedValues: [python3.8, python3.9, python3.10, python3.11]
+    Description: Lambda function runtime version
+    
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 10240
+    Description: Lambda function memory allocation in MB
+    
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 900
+    Description: Lambda function timeout in seconds
+    
+  APIGatewayStageName:
+    Type: String
+    Default: prod
+    AllowedPattern: ^[a-zA-Z0-9]+$
+    ConstraintDescription: Must contain only alphanumeric characters
+    Description: API Gateway deployment stage name
+    
+  EnableAPIGatewayLogging:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable CloudWatch logging for API Gateway
+    
+  CloudFrontPriceClass:
+    Type: String
+    Default: PriceClass_All
+    AllowedValues: [PriceClass_100, PriceClass_200, PriceClass_All]
+    Description: CloudFront price class for global distribution
+    
+  EnableCloudFrontLogging:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable access logging for CloudFront distribution
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+  EnableDeletionProtectionCondition: !Equals [!Ref EnableDeletionProtection, 'true']
+  EnableAPIGatewayLoggingCondition: !Equals [!Ref EnableAPIGatewayLogging, 'true']
+  EnableCloudFrontLoggingCondition: !Equals [!Ref EnableCloudFrontLogging, 'true']
+
+Resources:
+  # Aurora DSQL Cluster
+  DSQLCluster:
+    Type: AWS::DSQL::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-${DSQLClusterName}-${Environment}"
+      DeletionProtectionEnabled: !If [EnableDeletionProtectionCondition, true, false]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${DSQLClusterName}-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: Database
+        - Key: Service
+          Value: Aurora DSQL
+
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-lambda-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AuroraDSQLAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dsql:DbConnect
+                  - dsql:DbConnectAdmin
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-lambda-role-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: IAM
+
+  # Lambda Function for Product Operations
+  ProductsLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-products-${Environment}"
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          DSQL_CLUSTER_NAME: !Ref DSQLCluster
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from decimal import Decimal
+          
+          # Initialize Aurora DSQL client
+          dsql_client = boto3.client('dsql')
+          
+          def lambda_handler(event, context):
+              try:
+                  http_method = event['httpMethod']
+                  
+                  if http_method == 'GET':
+                      # Get all products
+                      response = dsql_client.execute_statement(
+                          clusterName=os.environ['DSQL_CLUSTER_NAME'],
+                          database='postgres',
+                          statement="""
+                              SELECT product_id, name, description, price, stock_quantity, category
+                              FROM products
+                              ORDER BY created_at DESC
+                          """
+                      )
+                      
+                      products = []
+                      for row in response.get('records', []):
+                          products.append({
+                              'product_id': row[0]['stringValue'],
+                              'name': row[1]['stringValue'],
+                              'description': row[2]['stringValue'],
+                              'price': float(row[3]['stringValue']),
+                              'stock_quantity': int(row[4]['longValue']),
+                              'category': row[5]['stringValue']
+                          })
+                      
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps(products)
+                      }
+                  
+                  elif http_method == 'POST':
+                      # Create new product
+                      body = json.loads(event['body'])
+                      
+                      response = dsql_client.execute_statement(
+                          clusterName=os.environ['DSQL_CLUSTER_NAME'],
+                          database='postgres',
+                          statement="""
+                              INSERT INTO products (name, description, price, stock_quantity, category)
+                              VALUES ($1, $2, $3, $4, $5)
+                              RETURNING product_id
+                          """,
+                          parameters=[
+                              {'name': 'p1', 'value': {'stringValue': body['name']}},
+                              {'name': 'p2', 'value': {'stringValue': body['description']}},
+                              {'name': 'p3', 'value': {'stringValue': str(body['price'])}},
+                              {'name': 'p4', 'value': {'longValue': body['stock_quantity']}},
+                              {'name': 'p5', 'value': {'stringValue': body['category']}}
+                          ]
+                      )
+                      
+                      product_id = response['records'][0][0]['stringValue']
+                      
+                      return {
+                          'statusCode': 201,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({'product_id': product_id})
+                      }
+                      
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Access-Control-Allow-Origin': '*'},
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-products-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: Lambda
+        - Key: Service
+          Value: Products
+
+  # Lambda Function for Order Operations
+  OrdersLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-orders-${Environment}"
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          DSQL_CLUSTER_NAME: !Ref DSQLCluster
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from decimal import Decimal
+          
+          # Initialize Aurora DSQL client
+          dsql_client = boto3.client('dsql')
+          
+          def lambda_handler(event, context):
+              try:
+                  http_method = event['httpMethod']
+                  
+                  if http_method == 'POST':
+                      # Process new order
+                      body = json.loads(event['body'])
+                      customer_id = body['customer_id']
+                      items = body['items']
+                      
+                      # Start transaction
+                      transaction_id = dsql_client.begin_transaction(
+                          clusterName=os.environ['DSQL_CLUSTER_NAME'],
+                          database='postgres'
+                      )['transactionId']
+                      
+                      try:
+                          # Create order record
+                          order_response = dsql_client.execute_statement(
+                              clusterName=os.environ['DSQL_CLUSTER_NAME'],
+                              database='postgres',
+                              transactionId=transaction_id,
+                              statement="""
+                                  INSERT INTO orders (customer_id, total_amount, status)
+                                  VALUES ($1, $2, $3)
+                                  RETURNING order_id
+                              """,
+                              parameters=[
+                                  {'name': 'p1', 'value': {'stringValue': customer_id}},
+                                  {'name': 'p2', 'value': {'stringValue': '0.00'}},
+                                  {'name': 'p3', 'value': {'stringValue': 'processing'}}
+                              ]
+                          )
+                          
+                          order_id = order_response['records'][0][0]['stringValue']
+                          total_amount = Decimal('0.00')
+                          
+                          # Process each item
+                          for item in items:
+                              product_id = item['product_id']
+                              quantity = item['quantity']
+                              
+                              # Check stock and get price
+                              stock_response = dsql_client.execute_statement(
+                                  clusterName=os.environ['DSQL_CLUSTER_NAME'],
+                                  database='postgres',
+                                  transactionId=transaction_id,
+                                  statement="""
+                                      SELECT price, stock_quantity
+                                      FROM products
+                                      WHERE product_id = $1
+                                  """,
+                                  parameters=[
+                                      {'name': 'p1', 'value': {'stringValue': product_id}}
+                                  ]
+                              )
+                              
+                              if not stock_response['records']:
+                                  raise Exception(f"Product {product_id} not found")
+                              
+                              price = Decimal(stock_response['records'][0][0]['stringValue'])
+                              stock = int(stock_response['records'][0][1]['longValue'])
+                              
+                              if stock < quantity:
+                                  raise Exception(f"Insufficient stock for product {product_id}")
+                              
+                              # Update inventory
+                              dsql_client.execute_statement(
+                                  clusterName=os.environ['DSQL_CLUSTER_NAME'],
+                                  database='postgres',
+                                  transactionId=transaction_id,
+                                  statement="""
+                                      UPDATE products
+                                      SET stock_quantity = stock_quantity - $1
+                                      WHERE product_id = $2
+                                  """,
+                                  parameters=[
+                                      {'name': 'p1', 'value': {'longValue': quantity}},
+                                      {'name': 'p2', 'value': {'stringValue': product_id}}
+                                  ]
+                              )
+                              
+                              # Add order item
+                              dsql_client.execute_statement(
+                                  clusterName=os.environ['DSQL_CLUSTER_NAME'],
+                                  database='postgres',
+                                  transactionId=transaction_id,
+                                  statement="""
+                                      INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+                                      VALUES ($1, $2, $3, $4)
+                                  """,
+                                  parameters=[
+                                      {'name': 'p1', 'value': {'stringValue': order_id}},
+                                      {'name': 'p2', 'value': {'stringValue': product_id}},
+                                      {'name': 'p3', 'value': {'longValue': quantity}},
+                                      {'name': 'p4', 'value': {'stringValue': str(price)}}
+                                  ]
+                              )
+                              
+                              total_amount += price * quantity
+                          
+                          # Update order total
+                          dsql_client.execute_statement(
+                              clusterName=os.environ['DSQL_CLUSTER_NAME'],
+                              database='postgres',
+                              transactionId=transaction_id,
+                              statement="""
+                                  UPDATE orders
+                                  SET total_amount = $1, status = $2
+                                  WHERE order_id = $3
+                              """,
+                              parameters=[
+                                  {'name': 'p1', 'value': {'stringValue': str(total_amount)}},
+                                  {'name': 'p2', 'value': {'stringValue': 'completed'}},
+                                  {'name': 'p3', 'value': {'stringValue': order_id}}
+                              ]
+                          )
+                          
+                          # Commit transaction
+                          dsql_client.commit_transaction(
+                              clusterName=os.environ['DSQL_CLUSTER_NAME'],
+                              transactionId=transaction_id
+                          )
+                          
+                          return {
+                              'statusCode': 201,
+                              'headers': {
+                                  'Content-Type': 'application/json',
+                                  'Access-Control-Allow-Origin': '*'
+                              },
+                              'body': json.dumps({
+                                  'order_id': order_id,
+                                  'total_amount': float(total_amount)
+                              })
+                          }
+                          
+                      except Exception as e:
+                          # Rollback transaction
+                          dsql_client.rollback_transaction(
+                              clusterName=os.environ['DSQL_CLUSTER_NAME'],
+                              transactionId=transaction_id
+                          )
+                          raise e
+                          
+              except Exception as e:
+                  return {
+                      'statusCode': 400,
+                      'headers': {'Access-Control-Allow-Origin': '*'},
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-orders-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: Lambda
+        - Key: Service
+          Value: Orders
+
+  # API Gateway REST API
+  EcommerceAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${ProjectName}-api-${Environment}"
+      Description: !Sub "E-commerce API with Aurora DSQL for ${Environment} environment"
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-api-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: API Gateway
+
+  # API Gateway CloudWatch Logs Role (if logging enabled)
+  APIGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Condition: EnableAPIGatewayLoggingCondition
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  # API Gateway Account Configuration (if logging enabled)
+  APIGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Condition: EnableAPIGatewayLoggingCondition
+    Properties:
+      CloudWatchRoleArn: !GetAtt APIGatewayCloudWatchRole.Arn
+
+  # Products Resource
+  ProductsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref EcommerceAPI
+      ParentId: !GetAtt EcommerceAPI.RootResourceId
+      PathPart: products
+
+  # Orders Resource
+  OrdersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref EcommerceAPI
+      ParentId: !GetAtt EcommerceAPI.RootResourceId
+      PathPart: orders
+
+  # Products GET Method
+  ProductsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref EcommerceAPI
+      ResourceId: !Ref ProductsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProductsLambdaFunction.Arn}/invocations"
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+
+  # Products POST Method
+  ProductsPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref EcommerceAPI
+      ResourceId: !Ref ProductsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProductsLambdaFunction.Arn}/invocations"
+      MethodResponses:
+        - StatusCode: '201'
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+
+  # Orders POST Method
+  OrdersPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref EcommerceAPI
+      ResourceId: !Ref OrdersResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrdersLambdaFunction.Arn}/invocations"
+      MethodResponses:
+        - StatusCode: '201'
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+
+  # Lambda Permissions for API Gateway
+  ProductsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProductsLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${EcommerceAPI}/*/*"
+
+  OrdersLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OrdersLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${EcommerceAPI}/*/*"
+
+  # API Gateway Deployment
+  APIGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ProductsGetMethod
+      - ProductsPostMethod
+      - OrdersPostMethod
+    Properties:
+      RestApiId: !Ref EcommerceAPI
+      StageName: !Ref APIGatewayStageName
+      StageDescription:
+        LoggingLevel: !If [EnableAPIGatewayLoggingCondition, INFO, 'OFF']
+        DataTraceEnabled: !If [EnableAPIGatewayLoggingCondition, true, false]
+        MetricsEnabled: true
+        ThrottlingBurstLimit: 5000
+        ThrottlingRateLimit: 2000
+
+  # S3 Bucket for CloudFront Logging (if enabled)
+  CloudFrontLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: EnableCloudFrontLoggingCondition
+    Properties:
+      BucketName: !Sub "${ProjectName}-cloudfront-logs-${Environment}-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-cloudfront-logs-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: Storage
+
+  # CloudFront Distribution
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "E-commerce API distribution for ${Environment}"
+        Enabled: true
+        PriceClass: !Ref CloudFrontPriceClass
+        HttpVersion: http2
+        IPV6Enabled: true
+        DefaultCacheBehavior:
+          TargetOriginId: api-origin
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - PATCH
+            - POST
+            - DELETE
+          CachedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          ForwardedValues:
+            QueryString: true
+            Cookies:
+              Forward: all
+            Headers:
+              - Authorization
+              - Content-Type
+              - Accept
+              - Origin
+          TrustedSigners:
+            - self
+          MinTTL: 0
+          DefaultTTL: 0
+          MaxTTL: 0
+        Origins:
+          - Id: api-origin
+            DomainName: !Sub "${EcommerceAPI}.execute-api.${AWS::Region}.amazonaws.com"
+            OriginPath: !Sub "/${APIGatewayStageName}"
+            CustomOriginConfig:
+              HTTPPort: 443
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+        Logging: !If
+          - EnableCloudFrontLoggingCondition
+          - Bucket: !GetAtt CloudFrontLogsBucket.DomainName
+            Prefix: cloudfront-access-logs/
+            IncludeCookies: false
+          - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-distribution-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: CloudFront
+
+Outputs:
+  DSQLClusterEndpoint:
+    Description: Aurora DSQL cluster endpoint
+    Value: !GetAtt DSQLCluster.ClusterEndpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-DSQLClusterEndpoint"
+
+  DSQLClusterArn:
+    Description: Aurora DSQL cluster ARN
+    Value: !GetAtt DSQLCluster.ClusterArn
+    Export:
+      Name: !Sub "${AWS::StackName}-DSQLClusterArn"
+
+  ProductsLambdaFunctionArn:
+    Description: Products Lambda function ARN
+    Value: !GetAtt ProductsLambdaFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ProductsLambdaArn"
+
+  OrdersLambdaFunctionArn:
+    Description: Orders Lambda function ARN
+    Value: !GetAtt OrdersLambdaFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-OrdersLambdaArn"
+
+  APIGatewayURL:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${EcommerceAPI}.execute-api.${AWS::Region}.amazonaws.com/${APIGatewayStageName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-APIGatewayURL"
+
+  APIGatewayId:
+    Description: API Gateway ID
+    Value: !Ref EcommerceAPI
+    Export:
+      Name: !Sub "${AWS::StackName}-APIGatewayId"
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudFrontDistributionId"
+
+  CloudFrontDistributionDomainName:
+    Description: CloudFront distribution domain name
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudFrontDomainName"
+
+  CloudFrontURL:
+    Description: CloudFront distribution URL
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudFrontURL"
+
+  DatabaseInitializationCommand:
+    Description: Command to initialize the database schema
+    Value: !Sub |
+      aws dsql execute-statement \
+        --cluster-name ${DSQLCluster} \
+        --database postgres \
+        --statement "CREATE TABLE IF NOT EXISTS customers (customer_id UUID PRIMARY KEY DEFAULT gen_random_uuid(), email VARCHAR(255) UNIQUE NOT NULL, first_name VARCHAR(100) NOT NULL, last_name VARCHAR(100) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS products (product_id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name VARCHAR(255) NOT NULL, description TEXT, price DECIMAL(10,2) NOT NULL, stock_quantity INTEGER NOT NULL DEFAULT 0, category VARCHAR(100), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS orders (order_id UUID PRIMARY KEY DEFAULT gen_random_uuid(), customer_id UUID NOT NULL REFERENCES customers(customer_id), total_amount DECIMAL(10,2) NOT NULL, status VARCHAR(50) DEFAULT 'pending', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS order_items (order_item_id UUID PRIMARY KEY DEFAULT gen_random_uuid(), order_id UUID NOT NULL REFERENCES orders(order_id), product_id UUID NOT NULL REFERENCES products(product_id), quantity INTEGER NOT NULL, unit_price DECIMAL(10,2) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP); CREATE INDEX IF NOT EXISTS idx_customers_email ON customers(email); CREATE INDEX IF NOT EXISTS idx_orders_customer_id ON orders(customer_id); CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status); CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id); CREATE INDEX IF NOT EXISTS idx_order_items_product_id ON order_items(product_id); CREATE INDEX IF NOT EXISTS idx_products_category ON products(category);"
+
+  SampleDataCommand:
+    Description: Command to insert sample data
+    Value: !Sub |
+      aws dsql execute-statement \
+        --cluster-name ${DSQLCluster} \
+        --database postgres \
+        --statement "INSERT INTO customers (email, first_name, last_name) VALUES ('john.doe@example.com', 'John', 'Doe'), ('jane.smith@example.com', 'Jane', 'Smith') ON CONFLICT DO NOTHING; INSERT INTO products (name, description, price, stock_quantity, category) VALUES ('Wireless Headphones', 'High-quality wireless headphones', 199.99, 100, 'Electronics'), ('Coffee Mug', 'Ceramic coffee mug', 12.99, 500, 'Home'), ('Laptop Stand', 'Adjustable laptop stand', 49.99, 50, 'Electronics') ON CONFLICT DO NOTHING;"
+
+  TestProductsEndpoint:
+    Description: Command to test the products API endpoint
+    Value: !Sub "curl -X GET 'https://${CloudFrontDistribution.DomainName}/products'"
+
+  TestOrderEndpoint:
+    Description: Sample command to test order creation (requires customer_id and product_id)
+    Value: !Sub |
+      curl -X POST 'https://${CloudFrontDistribution.DomainName}/orders' \
+        -H 'Content-Type: application/json' \
+        -d '{"customer_id": "YOUR_CUSTOMER_ID", "items": [{"product_id": "YOUR_PRODUCT_ID", "quantity": 1}]}'

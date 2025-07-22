@@ -1,0 +1,1233 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Global Load Balancing with Route53 and CloudFront
+  This template creates a comprehensive global load balancing solution that combines 
+  Route53's intelligent DNS routing with CloudFront's global edge network for automatic 
+  failover, geolocation-based routing, and performance optimization across multiple regions.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: global-lb
+    Description: Name prefix for all resources
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+
+  DomainName:
+    Type: String
+    Description: Domain name for DNS routing (e.g., example.com)
+    AllowedPattern: '^[a-zA-Z0-9][a-zA-Z0-9-_.]*[a-zA-Z0-9]$'
+    ConstraintDescription: Must be a valid domain name
+
+  PrimaryRegion:
+    Type: String
+    Default: us-east-1
+    Description: Primary AWS region for deployment
+    AllowedValues:
+      - us-east-1
+      - us-west-2
+      - eu-west-1
+      - eu-central-1
+      - ap-southeast-1
+      - ap-northeast-1
+
+  SecondaryRegion:
+    Type: String
+    Default: eu-west-1
+    Description: Secondary AWS region for deployment
+    AllowedValues:
+      - us-east-1
+      - us-west-2
+      - eu-west-1
+      - eu-central-1
+      - ap-southeast-1
+      - ap-northeast-1
+
+  TertiaryRegion:
+    Type: String
+    Default: ap-southeast-1
+    Description: Tertiary AWS region for deployment
+    AllowedValues:
+      - us-east-1
+      - us-west-2
+      - eu-west-1
+      - eu-central-1
+      - ap-southeast-1
+      - ap-northeast-1
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type for application servers
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - m5.large
+      - m5.xlarge
+
+  MinCapacity:
+    Type: Number
+    Default: 1
+    Description: Minimum number of instances per region
+    MinValue: 1
+    MaxValue: 10
+
+  MaxCapacity:
+    Type: Number
+    Default: 3
+    Description: Maximum number of instances per region
+    MinValue: 2
+    MaxValue: 20
+
+  DesiredCapacity:
+    Type: Number
+    Default: 2
+    Description: Desired number of instances per region
+    MinValue: 1
+    MaxValue: 10
+
+  HealthCheckPath:
+    Type: String
+    Default: /health
+    Description: Path for health checks
+    AllowedPattern: '^/.*'
+    ConstraintDescription: Must start with /
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for CloudWatch alarms (optional)
+    Default: ''
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address or empty
+
+  EnableCloudWatchLogs:
+    Type: String
+    Default: 'true'
+    Description: Enable detailed CloudWatch logging
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  PriceClass:
+    Type: String
+    Default: PriceClass_100
+    Description: CloudFront price class for edge locations
+    AllowedValues:
+      - PriceClass_All
+      - PriceClass_200
+      - PriceClass_100
+
+Conditions:
+  CreateNotifications: !Not [!Equals [!Ref NotificationEmail, '']]
+  EnableLogging: !Equals [!Ref EnableCloudWatchLogs, 'true']
+  IsPrimaryRegionDifferent: !Not [!Equals [!Ref 'AWS::Region', !Ref PrimaryRegion]]
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      VpcCidr: 10.10.0.0/16
+      Subnet1Cidr: 10.10.1.0/24
+      Subnet2Cidr: 10.10.2.0/24
+      ContinentCode: NA
+    us-west-2:
+      VpcCidr: 10.20.0.0/16
+      Subnet1Cidr: 10.20.1.0/24
+      Subnet2Cidr: 10.20.2.0/24
+      ContinentCode: NA
+    eu-west-1:
+      VpcCidr: 10.30.0.0/16
+      Subnet1Cidr: 10.30.1.0/24
+      Subnet2Cidr: 10.30.2.0/24
+      ContinentCode: EU
+    eu-central-1:
+      VpcCidr: 10.40.0.0/16
+      Subnet1Cidr: 10.40.1.0/24
+      Subnet2Cidr: 10.40.2.0/24
+      ContinentCode: EU
+    ap-southeast-1:
+      VpcCidr: 10.50.0.0/16
+      Subnet1Cidr: 10.50.1.0/24
+      Subnet2Cidr: 10.50.2.0/24
+      ContinentCode: AS
+    ap-northeast-1:
+      VpcCidr: 10.60.0.0/16
+      Subnet1Cidr: 10.60.1.0/24
+      Subnet2Cidr: 10.60.2.0/24
+      ContinentCode: AS
+
+Resources:
+  # ========================================
+  # S3 Fallback Bucket for CloudFront
+  # ========================================
+  FallbackContentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-fallback-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !If
+                - EnableLogging
+                - !Ref S3LogGroup
+                - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-fallback-bucket'
+        - Key: Purpose
+          Value: 'Global Load Balancer Fallback Content'
+
+  # S3 Bucket Policy for CloudFront OAC
+  FallbackBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FallbackContentBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FallbackContentBucket}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  # ========================================
+  # VPC and Networking Infrastructure
+  # ========================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !FindInMap [RegionMap, !Ref 'AWS::Region', VpcCidr]
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+        - Key: Purpose
+          Value: 'Global Load Balancer VPC'
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-igw'
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public Subnets
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap [RegionMap, !Ref 'AWS::Region', Subnet1Cidr]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-subnet-1'
+        - Key: Type
+          Value: Public
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap [RegionMap, !Ref 'AWS::Region', Subnet2Cidr]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-subnet-2'
+        - Key: Type
+          Value: Public
+
+  # Route Table for Public Subnets
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-rt'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # ========================================
+  # Security Groups
+  # ========================================
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-alb-sg'
+      GroupDescription: Security group for Application Load Balancer
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTP traffic from internet
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTPS traffic from internet
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alb-sg'
+        - Key: Purpose
+          Value: 'ALB Security Group'
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-ec2-sg'
+      GroupDescription: Security group for EC2 instances
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Allow HTTP traffic from ALB
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 10.0.0.0/8
+          Description: Allow SSH from VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ec2-sg'
+        - Key: Purpose
+          Value: 'EC2 Security Group'
+
+  # ========================================
+  # IAM Roles and Instance Profile
+  # ========================================
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ec2-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-ec2-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceStatus
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ec2-role'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ProjectName}-ec2-profile'
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # ========================================
+  # Launch Template
+  # ========================================
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ProjectName}-launch-template'
+      LaunchTemplateData:
+        ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Name: !Ref EC2InstanceProfile
+        SecurityGroupIds:
+          - !Ref EC2SecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd awslogs
+
+            # Start and enable httpd
+            systemctl start httpd
+            systemctl enable httpd
+
+            # Create web application
+            cat > /var/www/html/index.html << 'EOF'
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Global Load Balancer Demo</title>
+                <style>
+                    body { 
+                        font-family: Arial, sans-serif; 
+                        text-align: center; 
+                        padding: 50px; 
+                        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                        color: white;
+                    }
+                    .container { 
+                        background: rgba(255,255,255,0.1); 
+                        padding: 30px; 
+                        border-radius: 10px; 
+                        margin: 20px auto; 
+                        max-width: 600px;
+                        backdrop-filter: blur(10px);
+                    }
+                    .status { 
+                        color: #4caf50; 
+                        font-weight: bold; 
+                        font-size: 18px;
+                    }
+                    .info {
+                        background: rgba(255,255,255,0.2);
+                        padding: 15px;
+                        border-radius: 5px;
+                        margin: 10px 0;
+                    }
+                </style>
+                <script>
+                    function updateTimestamp() {
+                        document.getElementById('timestamp').innerHTML = new Date().toLocaleString();
+                    }
+                    setInterval(updateTimestamp, 1000);
+                </script>
+            </head>
+            <body onload="updateTimestamp()">
+                <div class="container">
+                    <h1>Hello from ${AWS::Region}!</h1>
+                    <p class="status">Status: Healthy ✅</p>
+                    <div class="info">
+                        <p><strong>Instance ID:</strong> <span id="instance-id">Loading...</span></p>
+                        <p><strong>Availability Zone:</strong> <span id="az">Loading...</span></p>
+                        <p><strong>Region:</strong> ${AWS::Region}</p>
+                        <p><strong>Timestamp:</strong> <span id="timestamp"></span></p>
+                    </div>
+                    <p><small>Powered by AWS Global Load Balancer</small></p>
+                </div>
+                
+                <script>
+                    // Fetch instance metadata
+                    fetch('/meta/instance-id')
+                        .then(response => response.text())
+                        .then(data => document.getElementById('instance-id').innerHTML = data)
+                        .catch(err => document.getElementById('instance-id').innerHTML = 'Unable to fetch');
+                    
+                    fetch('/meta/az')
+                        .then(response => response.text())
+                        .then(data => document.getElementById('az').innerHTML = data)
+                        .catch(err => document.getElementById('az').innerHTML = 'Unable to fetch');
+                </script>
+            </body>
+            </html>
+            EOF
+
+            # Create health check endpoint
+            cat > /var/www/html${HealthCheckPath} << 'EOF'
+            {
+                "status": "healthy",
+                "region": "${AWS::Region}",
+                "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)",
+                "instance_id": "$(curl -s http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo 'unknown')",
+                "availability_zone": "$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone 2>/dev/null || echo 'unknown')",
+                "load_balancer": "active"
+            }
+            EOF
+
+            # Create metadata endpoints
+            mkdir -p /var/www/html/meta
+            
+            # Instance ID endpoint
+            cat > /var/www/html/meta/instance-id << 'EOF'
+            #!/bin/bash
+            echo "Content-Type: text/plain"
+            echo ""
+            curl -s http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo "unknown"
+            EOF
+            chmod +x /var/www/html/meta/instance-id
+
+            # Availability Zone endpoint
+            cat > /var/www/html/meta/az << 'EOF'
+            #!/bin/bash
+            echo "Content-Type: text/plain"
+            echo ""
+            curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone 2>/dev/null || echo "unknown"
+            EOF
+            chmod +x /var/www/html/meta/az
+
+            # Configure Apache for CGI
+            cat >> /etc/httpd/conf/httpd.conf << 'EOF'
+            
+            # Enable CGI for metadata endpoints
+            <Directory "/var/www/html/meta">
+                Options +ExecCGI
+                AddHandler cgi-script .cgi
+                AddHandler cgi-script ""
+            </Directory>
+            EOF
+
+            # Set proper permissions
+            chown -R apache:apache /var/www/html
+            chmod -R 755 /var/www/html
+
+            # Configure CloudWatch logs if enabled
+            if [ "${EnableCloudWatchLogs}" = "true" ]; then
+                cat > /etc/awslogs/awslogs.conf << 'EOF'
+            [general]
+            state_file = /var/lib/awslogs/agent-state
+
+            [/var/log/httpd/access_log]
+            file = /var/log/httpd/access_log
+            log_group_name = ${EC2LogGroup}
+            log_stream_name = {instance_id}/httpd/access_log
+
+            [/var/log/httpd/error_log]
+            file = /var/log/httpd/error_log
+            log_group_name = ${EC2LogGroup}
+            log_stream_name = {instance_id}/httpd/error_log
+            EOF
+
+                systemctl start awslogsd
+                systemctl enable awslogsd
+            fi
+
+            # Restart httpd to apply configuration
+            systemctl restart httpd
+
+            # Send success signal to CloudFormation
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${ProjectName}-instance'
+              - Key: Purpose
+                Value: 'Global Load Balancer Application Server'
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub '${ProjectName}-volume'
+
+  # ========================================
+  # Application Load Balancer
+  # ========================================
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-alb'
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+        - Key: deletion_protection.enabled
+          Value: 'false'
+        - Key: access_logs.s3.enabled
+          Value: 'false'
+        - Key: routing.http2.enabled
+          Value: 'true'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alb'
+        - Key: Purpose
+          Value: 'Global Load Balancer ALB'
+
+  # Target Group
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-tg'
+      Protocol: HTTP
+      Port: 80
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+        - Key: stickiness.enabled
+          Value: 'false'
+        - Key: load_balancing.algorithm.type
+          Value: round_robin
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-tg'
+
+  # ALB Listener
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # ========================================
+  # Auto Scaling Group
+  # ========================================
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${ProjectName}-asg'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinCapacity
+      MaxSize: !Ref MaxCapacity
+      DesiredCapacity: !Ref DesiredCapacity
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      DefaultCooldown: 300
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-asg'
+          PropagateAtLaunch: true
+        - Key: Purpose
+          Value: 'Global Load Balancer ASG'
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref DesiredCapacity
+        Timeout: PT10M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT5M
+        WaitOnResourceSignals: true
+
+  # ========================================
+  # CloudFront Distribution
+  # ========================================
+  # Origin Access Control for S3
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+        Description: 'OAC for fallback S3 origin'
+
+  # CloudFront Distribution
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub 'Global load balancer distribution for ${ProjectName}'
+        Enabled: true
+        HttpVersion: http2
+        IPV6Enabled: true
+        PriceClass: !Ref PriceClass
+        DefaultRootObject: index.html
+        Origins:
+          - Id: primary-alb-origin
+            DomainName: !GetAtt ApplicationLoadBalancer.DNSName
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+              OriginSSLProtocols:
+                - TLSv1.2
+              OriginReadTimeout: 30
+              OriginKeepaliveTimeout: 5
+            ConnectionAttempts: 3
+            ConnectionTimeout: 10
+          - Id: fallback-s3-origin
+            DomainName: !GetAtt FallbackContentBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !Ref OriginAccessControl
+            ConnectionAttempts: 3
+            ConnectionTimeout: 10
+        OriginGroups:
+          Quantity: 1
+          Items:
+            - Id: main-origin-group
+              FailoverCriteria:
+                StatusCodes:
+                  Quantity: 4
+                  Items: [403, 404, 500, 502]
+              Members:
+                Quantity: 2
+                Items:
+                  - OriginId: primary-alb-origin
+                  - OriginId: fallback-s3-origin
+        DefaultCacheBehavior:
+          TargetOriginId: main-origin-group
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - DELETE
+            - GET
+            - HEAD
+            - OPTIONS
+            - PATCH
+            - POST
+            - PUT
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # Managed-CachingOptimized
+        CacheBehaviors:
+          - PathPattern: !Sub '${HealthCheckPath}*'
+            TargetOriginId: main-origin-group
+            ViewerProtocolPolicy: https-only
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            TTL: 0
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          - PathPattern: '/meta/*'
+            TargetOriginId: primary-alb-origin
+            ViewerProtocolPolicy: https-only
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: false
+            TTL: 0
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+        CustomErrorResponses:
+          - ErrorCode: 500
+            ResponsePagePath: /index.html
+            ResponseCode: '200'
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 502
+            ResponsePagePath: /index.html
+            ResponseCode: '200'
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 503
+            ResponsePagePath: /index.html
+            ResponseCode: '200'
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 504
+            ResponsePagePath: /index.html
+            ResponseCode: '200'
+            ErrorCachingMinTTL: 0
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          MinimumProtocolVersion: TLSv1.2_2021
+        Restrictions:
+          GeoRestriction:
+            RestrictionType: none
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cloudfront'
+        - Key: Purpose
+          Value: 'Global Load Balancer CDN'
+
+  # ========================================
+  # Route53 Health Checks and DNS
+  # ========================================
+  # Hosted Zone (only created if DomainName is provided and we're in primary region)
+  HostedZone:
+    Type: AWS::Route53::HostedZone
+    Condition: IsPrimaryRegionDifferent
+    Properties:
+      Name: !Ref DomainName
+      HostedZoneConfig:
+        Comment: !Sub 'Global load balancer hosted zone for ${ProjectName}'
+      HostedZoneTags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-hosted-zone'
+        - Key: Purpose
+          Value: 'Global Load Balancer DNS'
+
+  # Health Check for ALB
+  HealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Properties:
+      Type: HTTP
+      ResourcePath: !Ref HealthCheckPath
+      FullyQualifiedDomainName: !GetAtt ApplicationLoadBalancer.DNSName
+      Port: 80
+      RequestInterval: 30
+      FailureThreshold: 3
+      HealthCheckTags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-health-check-${AWS::Region}'
+        - Key: Purpose
+          Value: 'Global Load Balancer Health Check'
+
+  # ========================================
+  # CloudWatch Monitoring and Alarms
+  # ========================================
+  # CloudWatch Log Groups
+  EC2LogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: !Sub '/aws/ec2/${ProjectName}'
+      RetentionInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ec2-logs'
+
+  S3LogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLogging
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}'
+      RetentionInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-s3-logs'
+
+  # SNS Topic for Alerts
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateNotifications
+    Properties:
+      TopicName: !Sub '${ProjectName}-alerts'
+      DisplayName: !Sub 'Global Load Balancer Alerts - ${ProjectName}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alerts'
+
+  # SNS Subscription
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateNotifications
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AlertTopic
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Alarms
+  HealthCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateNotifications
+    Properties:
+      AlarmName: !Sub '${ProjectName}-health-check-${AWS::Region}'
+      AlarmDescription: !Sub 'Health check alarm for ${AWS::Region}'
+      MetricName: HealthCheckStatus
+      Namespace: AWS/Route53
+      Statistic: Minimum
+      Period: 60
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      EvaluationPeriods: 2
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+      Dimensions:
+        - Name: HealthCheckId
+          Value: !Ref HealthCheck
+
+  ALBResponseTimeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateNotifications
+    Properties:
+      AlarmName: !Sub '${ProjectName}-alb-response-time-${AWS::Region}'
+      AlarmDescription: !Sub 'ALB response time alarm for ${AWS::Region}'
+      MetricName: TargetResponseTime
+      Namespace: AWS/ApplicationELB
+      Statistic: Average
+      Period: 300
+      Threshold: 1.0
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 2
+      AlarmActions:
+        - !Ref AlertTopic
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+
+  CloudFrontErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateNotifications
+    Properties:
+      AlarmName: !Sub '${ProjectName}-cloudfront-errors'
+      AlarmDescription: 'CloudFront error rate alarm'
+      MetricName: 4xxErrorRate
+      Namespace: AWS/CloudFront
+      Statistic: Average
+      Period: 300
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 2
+      AlarmActions:
+        - !Ref AlertTopic
+      Dimensions:
+        - Name: DistributionId
+          Value: !Ref CloudFrontDistribution
+
+  # ========================================
+  # Lambda Function for Fallback Content Upload
+  # ========================================
+  FallbackContentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-fallback-content'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt FallbackContentRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+          
+          def lambda_handler(event, context):
+              try:
+                  s3 = boto3.client('s3')
+                  bucket_name = event['ResourceProperties']['BucketName']
+                  region = event['ResourceProperties']['Region']
+                  
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      # Upload fallback HTML content
+                      html_content = f'''<!DOCTYPE html>
+          <html>
+          <head>
+              <title>Service Temporarily Unavailable</title>
+              <style>
+                  body {{ 
+                      font-family: Arial, sans-serif; 
+                      text-align: center; 
+                      padding: 50px; 
+                      background: linear-gradient(135deg, #ff6b6b 0%, #ee5a24 100%);
+                      color: white;
+                  }}
+                  .message {{ 
+                      background: rgba(255,255,255,0.1); 
+                      padding: 30px; 
+                      border-radius: 10px; 
+                      margin: 20px auto; 
+                      max-width: 600px;
+                      backdrop-filter: blur(10px);
+                  }}
+                  .status {{ color: #ffa726; font-size: 18px; font-weight: bold; }}
+                  .code {{ background: rgba(0,0,0,0.3); padding: 10px; border-radius: 5px; margin: 10px 0; }}
+              </style>
+          </head>
+          <body>
+              <div class="message">
+                  <h1>🚧 Service Temporarily Unavailable</h1>
+                  <p class="status">We're working to restore service as quickly as possible.</p>
+                  <p>All regions are currently experiencing issues. Our team has been notified and is working on a resolution.</p>
+                  <div class="code">
+                      <small>Error Code: GLB-FALLBACK-{region}</small><br>
+                      <small>Timestamp: {{{{ new Date().toISOString() }}}}</small>
+                  </div>
+                  <p><small>Please try again in a few minutes. If the problem persists, contact support.</small></p>
+              </div>
+              <script>
+                  // Auto-refresh every 30 seconds
+                  setTimeout(function(){{ location.reload(); }}, 30000);
+              </script>
+          </body>
+          </html>'''
+                      
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key='index.html',
+                          Body=html_content,
+                          ContentType='text/html'
+                      )
+                      
+                      # Upload health check JSON
+                      health_content = {{
+                          "status": "maintenance",
+                          "message": "All regions temporarily unavailable",
+                          "region": region,
+                          "timestamp": "auto-generated",
+                          "fallback": True
+                      }}
+                      
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key='health',
+                          Body=json.dumps(health_content),
+                          ContentType='application/json'
+                      )
+                      
+                      print(f"Successfully uploaded fallback content to {{bucket_name}}")
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {{}})
+                  
+              except Exception as e:
+                  print(f"Error: {{str(e)}}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {{}})
+
+  FallbackContentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub '${FallbackContentBucket}/*'
+
+  # Custom Resource to Upload Fallback Content
+  FallbackContentUpload:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt FallbackContentFunction.Arn
+      BucketName: !Ref FallbackContentBucket
+      Region: !Ref 'AWS::Region'
+
+Outputs:
+  # ========================================
+  # Infrastructure Outputs
+  # ========================================
+  VPCId:
+    Description: ID of the VPC
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPC-ID'
+
+  PublicSubnet1Id:
+    Description: ID of the first public subnet
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet1-ID'
+
+  PublicSubnet2Id:
+    Description: ID of the second public subnet
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet2-ID'
+
+  # ========================================
+  # Load Balancer Outputs
+  # ========================================
+  ApplicationLoadBalancerDNS:
+    Description: DNS name of the Application Load Balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-ALB-DNS'
+
+  ApplicationLoadBalancerZoneId:
+    Description: Hosted zone ID of the Application Load Balancer
+    Value: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
+    Export:
+      Name: !Sub '${AWS::StackName}-ALB-ZoneID'
+
+  TargetGroupArn:
+    Description: ARN of the target group
+    Value: !Ref TargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-TargetGroup-ARN'
+
+  # ========================================
+  # CloudFront Outputs
+  # ========================================
+  CloudFrontDistributionId:
+    Description: ID of the CloudFront distribution
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFront-ID'
+
+  CloudFrontDistributionDomainName:
+    Description: Domain name of the CloudFront distribution
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFront-Domain'
+
+  CloudFrontURL:
+    Description: URL of the CloudFront distribution
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFront-URL'
+
+  # ========================================
+  # Route53 Outputs
+  # ========================================
+  HealthCheckId:
+    Description: ID of the Route53 health check
+    Value: !Ref HealthCheck
+    Export:
+      Name: !Sub '${AWS::StackName}-HealthCheck-ID'
+
+  HostedZoneId:
+    Description: ID of the Route53 hosted zone (if created)
+    Value: !If
+      - IsPrimaryRegionDifferent
+      - !Ref HostedZone
+      - 'Not created in this region'
+    Export:
+      Name: !Sub '${AWS::StackName}-HostedZone-ID'
+
+  # ========================================
+  # Storage Outputs
+  # ========================================
+  FallbackBucketName:
+    Description: Name of the S3 fallback bucket
+    Value: !Ref FallbackContentBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-FallbackBucket-Name'
+
+  FallbackBucketDomainName:
+    Description: Regional domain name of the S3 fallback bucket
+    Value: !GetAtt FallbackContentBucket.RegionalDomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-FallbackBucket-Domain'
+
+  # ========================================
+  # Monitoring Outputs
+  # ========================================
+  AlertTopicArn:
+    Description: ARN of the SNS alert topic (if notifications enabled)
+    Value: !If
+      - CreateNotifications
+      - !Ref AlertTopic
+      - 'Notifications not enabled'
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertTopic-ARN'
+
+  # ========================================
+  # Test Endpoints
+  # ========================================
+  ApplicationURL:
+    Description: URL to test the application via ALB
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+
+  HealthCheckURL:
+    Description: URL to test the health check endpoint via ALB
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}${HealthCheckPath}'
+
+  GlobalURL:
+    Description: Global URL via CloudFront (recommended for production)
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+
+  # ========================================
+  # Configuration Summary
+  # ========================================
+  DeploymentRegion:
+    Description: AWS region where this stack is deployed
+    Value: !Ref 'AWS::Region'
+
+  StackConfiguration:
+    Description: Summary of stack configuration
+    Value: !Sub |
+      Stack: ${AWS::StackName}
+      Region: ${AWS::Region}
+      Instance Type: ${InstanceType}
+      Capacity: ${DesiredCapacity} instances (${MinCapacity}-${MaxCapacity})
+      Health Check: ${HealthCheckPath}
+      Price Class: ${PriceClass}
+      Logging: ${EnableCloudWatchLogs}
+      Notifications: ${NotificationEmail}

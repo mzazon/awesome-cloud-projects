@@ -1,0 +1,832 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure as Code for Automated Application Migration Workflows'
+
+# ==============================================================================
+# METADATA
+# ==============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Migration Configuration"
+        Parameters:
+          - MigrationProjectName
+          - SourceServersCount
+          - TargetInstanceType
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcCidr
+          - PublicSubnetCidr
+          - PrivateSubnetCidr
+          - AvailabilityZone1
+          - AvailabilityZone2
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - AllowedSourceIpRange
+          - EnableCloudWatchLogs
+      - Label:
+          default: "Resource Tagging"
+        Parameters:
+          - Environment
+          - ProjectOwner
+          - CostCenter
+    ParameterLabels:
+      MigrationProjectName:
+        default: "Migration Project Name"
+      SourceServersCount:
+        default: "Expected Source Servers Count"
+      TargetInstanceType:
+        default: "Target Instance Type"
+      VpcCidr:
+        default: "VPC CIDR Block"
+      PublicSubnetCidr:
+        default: "Public Subnet CIDR"
+      PrivateSubnetCidr:
+        default: "Private Subnet CIDR"
+      AvailabilityZone1:
+        default: "First Availability Zone"
+      AvailabilityZone2:
+        default: "Second Availability Zone"
+      AllowedSourceIpRange:
+        default: "Allowed Source IP Range"
+      EnableCloudWatchLogs:
+        default: "Enable CloudWatch Logs"
+      Environment:
+        default: "Environment"
+      ProjectOwner:
+        default: "Project Owner"
+      CostCenter:
+        default: "Cost Center"
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+Parameters:
+  MigrationProjectName:
+    Type: String
+    Description: Name for the migration project (alphanumeric and hyphens only)
+    Default: migration-project
+    AllowedPattern: ^[a-zA-Z0-9-]+$
+    ConstraintDescription: Must contain only alphanumeric characters and hyphens
+    MaxLength: 64
+    MinLength: 3
+
+  SourceServersCount:
+    Type: Number
+    Description: Expected number of source servers to migrate
+    Default: 5
+    MinValue: 1
+    MaxValue: 100
+    ConstraintDescription: Must be between 1 and 100
+
+  TargetInstanceType:
+    Type: String
+    Description: Default EC2 instance type for migrated servers
+    Default: t3.medium
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - m5.large
+      - m5.xlarge
+      - m5.2xlarge
+      - c5.large
+      - c5.xlarge
+      - c5.2xlarge
+    ConstraintDescription: Must be a valid EC2 instance type
+
+  VpcCidr:
+    Type: String
+    Description: CIDR block for the migration VPC
+    Default: 10.0.0.0/16
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    ConstraintDescription: Must be a valid CIDR range (e.g., 10.0.0.0/16)
+
+  PublicSubnetCidr:
+    Type: String
+    Description: CIDR block for the public subnet
+    Default: 10.0.1.0/24
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    ConstraintDescription: Must be a valid CIDR range (e.g., 10.0.1.0/24)
+
+  PrivateSubnetCidr:
+    Type: String
+    Description: CIDR block for the private subnet
+    Default: 10.0.2.0/24
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    ConstraintDescription: Must be a valid CIDR range (e.g., 10.0.2.0/24)
+
+  AvailabilityZone1:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: First availability zone for subnet placement
+
+  AvailabilityZone2:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Second availability zone for subnet placement
+
+  AllowedSourceIpRange:
+    Type: String
+    Description: IP range allowed for SSH access to migrated instances
+    Default: 10.0.0.0/16
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(0|[5-9]|[1-2][0-9]|3[0-2]))$
+    ConstraintDescription: Must be a valid CIDR range
+
+  EnableCloudWatchLogs:
+    Type: String
+    Description: Enable CloudWatch Logs for migration monitoring
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  Environment:
+    Type: String
+    Description: Environment designation for resource tagging
+    Default: migration
+    AllowedValues:
+      - development
+      - staging
+      - production
+      - migration
+
+  ProjectOwner:
+    Type: String
+    Description: Owner of the migration project
+    Default: migration-team
+    MinLength: 1
+    MaxLength: 64
+
+  CostCenter:
+    Type: String
+    Description: Cost center for billing allocation
+    Default: infrastructure
+    MinLength: 1
+    MaxLength: 64
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+Conditions:
+  EnableCloudWatchLogsCondition: !Equals [!Ref EnableCloudWatchLogs, 'true']
+  IsProductionEnvironment: !Equals [!Ref Environment, 'production']
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+  # VPC and Networking Resources
+  MigrationVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${MigrationProjectName}-vpc
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref MigrationProjectName
+        - Key: Owner
+          Value: !Ref ProjectOwner
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: Migration
+
+  # Internet Gateway
+  MigrationInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${MigrationProjectName}-igw
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MigrationVPC
+      InternetGatewayId: !Ref MigrationInternetGateway
+
+  # Public Subnet
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MigrationVPC
+      CidrBlock: !Ref PublicSubnetCidr
+      AvailabilityZone: !Ref AvailabilityZone1
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${MigrationProjectName}-public-subnet
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref MigrationProjectName
+        - Key: Type
+          Value: Public
+
+  # Private Subnet
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MigrationVPC
+      CidrBlock: !Ref PrivateSubnetCidr
+      AvailabilityZone: !Ref AvailabilityZone2
+      Tags:
+        - Key: Name
+          Value: !Sub ${MigrationProjectName}-private-subnet
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref MigrationProjectName
+        - Key: Type
+          Value: Private
+
+  # NAT Gateway for private subnet internet access
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${MigrationProjectName}-nat-eip
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub ${MigrationProjectName}-nat-gateway
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  # Route Tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MigrationVPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${MigrationProjectName}-public-rt
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref MigrationInternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MigrationVPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${MigrationProjectName}-private-rt
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  # Security Groups
+  MigrationSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${MigrationProjectName}-migration-sg
+      GroupDescription: Security group for migrated instances
+      VpcId: !Ref MigrationVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedSourceIpRange
+          Description: SSH access from allowed IP range
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP access from anywhere
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS access from anywhere
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: !Ref VpcCidr
+          Description: ICMP within VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub ${MigrationProjectName}-migration-sg
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  # MGN Replication Security Group
+  MGNReplicationSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${MigrationProjectName}-mgn-replication-sg
+      GroupDescription: Security group for MGN replication servers
+      VpcId: !Ref MigrationVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 1500
+          ToPort: 1500
+          CidrIp: 0.0.0.0/0
+          Description: MGN replication traffic
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS for MGN API calls
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub ${MigrationProjectName}-mgn-replication-sg
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  # IAM Roles and Policies
+  MGNServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${MigrationProjectName}-MGNServiceRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: mgn.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSApplicationMigrationServiceRolePolicy
+      Tags:
+        - Key: Name
+          Value: !Sub ${MigrationProjectName}-MGNServiceRole
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  MigrationHubOrchestratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${MigrationProjectName}-MigrationHubOrchestratorRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: migrationhub-orchestrator.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSMigrationHubOrchestratorServiceRolePolicy
+      Tags:
+        - Key: Name
+          Value: !Sub ${MigrationProjectName}-MigrationHubOrchestratorRole
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  AutomationExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${MigrationProjectName}-AutomationExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonSSMAutomationRole
+      Policies:
+        - PolicyName: MigrationAutomationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceStatus
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                  - ec2:RebootInstances
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                  - ssm:DescribeInstanceInformation
+                  - cloudwatch:PutMetricData
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub ${MigrationProjectName}-AutomationExecutionRole
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  # Systems Manager Automation Document
+  PostMigrationAutomationDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: !Sub ${MigrationProjectName}-PostMigrationAutomation
+      DocumentType: Automation
+      DocumentFormat: JSON
+      Content:
+        schemaVersion: '0.3'
+        description: 'Post-migration automation tasks for migrated instances'
+        assumeRole: !GetAtt AutomationExecutionRole.Arn
+        parameters:
+          InstanceId:
+            type: String
+            description: 'EC2 Instance ID for post-migration tasks'
+          AutomationAssumeRole:
+            type: String
+            description: 'IAM role for automation execution'
+            default: !GetAtt AutomationExecutionRole.Arn
+        mainSteps:
+          - name: WaitForInstanceReady
+            action: 'aws:waitForAwsResourceProperty'
+            inputs:
+              Service: ec2
+              Api: DescribeInstanceStatus
+              InstanceIds:
+                - '{{ InstanceId }}'
+              PropertySelector: '$.InstanceStatuses[0].InstanceStatus.Status'
+              DesiredValues:
+                - ok
+            timeoutSeconds: 600
+            description: 'Wait for instance to be ready'
+          - name: ConfigureCloudWatchAgent
+            action: 'aws:runCommand'
+            inputs:
+              DocumentName: 'AWS-ConfigureAWSPackage'
+              InstanceIds:
+                - '{{ InstanceId }}'
+              Parameters:
+                action: Install
+                name: AmazonCloudWatchAgent
+            description: 'Install CloudWatch agent on migrated instance'
+          - name: ValidateServices
+            action: 'aws:runCommand'
+            inputs:
+              DocumentName: 'AWS-RunShellScript'
+              InstanceIds:
+                - '{{ InstanceId }}'
+              Parameters:
+                commands:
+                  - '#!/bin/bash'
+                  - 'systemctl status sshd'
+                  - 'curl -f http://localhost/health || echo "Application health check failed"'
+            description: 'Validate critical services on migrated instance'
+      Tags:
+        - Key: Name
+          Value: !Sub ${MigrationProjectName}-PostMigrationAutomation
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  # CloudWatch Resources
+  MigrationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableCloudWatchLogsCondition
+    Properties:
+      LogGroupName: !Sub /aws/migration/${MigrationProjectName}
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub ${MigrationProjectName}-log-group
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  MigrationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${MigrationProjectName}-Migration-Dashboard
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/MGN", "TotalSourceServers" ],
+                  [ ".", "HealthySourceServers" ],
+                  [ ".", "ReplicationProgress" ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "MGN Migration Status"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/migration/${MigrationProjectName}' | fields @timestamp, message\n| filter message like /ERROR/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Migration Errors",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms
+  MGNReplicationHealthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${MigrationProjectName}-MGN-Replication-Health
+      AlarmDescription: 'Alert when MGN replication encounters issues'
+      MetricName: HealthySourceServers
+      Namespace: AWS/MGN
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref MigrationSNSTopic
+
+  # SNS Topic for notifications
+  MigrationSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${MigrationProjectName}-notifications
+      DisplayName: !Sub ${MigrationProjectName} Migration Notifications
+      Tags:
+        - Key: Name
+          Value: !Sub ${MigrationProjectName}-notifications
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+  # Launch Template for migrated instances
+  MigrationLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${MigrationProjectName}-launch-template
+      LaunchTemplateData:
+        ImageId: ami-0abcdef1234567890  # This will be replaced by MGN during migration
+        InstanceType: !Ref TargetInstanceType
+        SecurityGroupIds:
+          - !Ref MigrationSecurityGroup
+        IamInstanceProfile:
+          Arn: !GetAtt MigrationInstanceProfile.Arn
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y amazon-cloudwatch-agent
+            
+            # Configure CloudWatch agent
+            cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'EOF'
+            {
+              "logs": {
+                "logs_collected": {
+                  "files": {
+                    "collect_list": [
+                      {
+                        "file_path": "/var/log/messages",
+                        "log_group_name": "/aws/migration/${MigrationProjectName}",
+                        "log_stream_name": "{instance_id}/messages"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+            EOF
+            
+            # Start CloudWatch agent
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+              -a fetch-config \
+              -m ec2 \
+              -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json \
+              -s
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub ${MigrationProjectName}-migrated-instance
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: Project
+                Value: !Ref MigrationProjectName
+              - Key: MigrationStatus
+                Value: Migrated
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: Name
+              Value: !Sub ${MigrationProjectName}-launch-template
+            - Key: Environment
+              Value: !Ref Environment
+            - Key: Project
+              Value: !Ref MigrationProjectName
+
+  # IAM Instance Profile for migrated instances
+  MigrationInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${MigrationProjectName}-instance-profile
+      Roles:
+        - !Ref MigrationInstanceRole
+
+  MigrationInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${MigrationProjectName}-instance-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub ${MigrationProjectName}-instance-role
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref MigrationProjectName
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+Outputs:
+  VPCId:
+    Description: 'VPC ID for the migration environment'
+    Value: !Ref MigrationVPC
+    Export:
+      Name: !Sub ${AWS::StackName}-VPC-ID
+
+  PublicSubnetId:
+    Description: 'Public subnet ID for migration resources'
+    Value: !Ref PublicSubnet
+    Export:
+      Name: !Sub ${AWS::StackName}-PublicSubnet-ID
+
+  PrivateSubnetId:
+    Description: 'Private subnet ID for migration staging area'
+    Value: !Ref PrivateSubnet
+    Export:
+      Name: !Sub ${AWS::StackName}-PrivateSubnet-ID
+
+  MigrationSecurityGroupId:
+    Description: 'Security group ID for migrated instances'
+    Value: !Ref MigrationSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-MigrationSecurityGroup-ID
+
+  MGNReplicationSecurityGroupId:
+    Description: 'Security group ID for MGN replication servers'
+    Value: !Ref MGNReplicationSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-MGNReplicationSecurityGroup-ID
+
+  MGNServiceRoleArn:
+    Description: 'ARN of the MGN service role'
+    Value: !GetAtt MGNServiceRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-MGNServiceRole-ARN
+
+  MigrationHubOrchestratorRoleArn:
+    Description: 'ARN of the Migration Hub Orchestrator role'
+    Value: !GetAtt MigrationHubOrchestratorRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-MigrationHubOrchestratorRole-ARN
+
+  AutomationExecutionRoleArn:
+    Description: 'ARN of the automation execution role'
+    Value: !GetAtt AutomationExecutionRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-AutomationExecutionRole-ARN
+
+  PostMigrationAutomationDocument:
+    Description: 'Name of the post-migration automation document'
+    Value: !Ref PostMigrationAutomationDocument
+    Export:
+      Name: !Sub ${AWS::StackName}-PostMigrationAutomationDocument
+
+  MigrationLaunchTemplateId:
+    Description: 'ID of the launch template for migrated instances'
+    Value: !Ref MigrationLaunchTemplate
+    Export:
+      Name: !Sub ${AWS::StackName}-MigrationLaunchTemplate-ID
+
+  MigrationDashboardURL:
+    Description: 'URL to the CloudWatch dashboard for migration monitoring'
+    Value: !Sub https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${MigrationProjectName}-Migration-Dashboard
+
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for migration notifications'
+    Value: !Ref MigrationSNSTopic
+    Export:
+      Name: !Sub ${AWS::StackName}-SNSTopic-ARN
+
+  MigrationProjectName:
+    Description: 'Name of the migration project'
+    Value: !Ref MigrationProjectName
+    Export:
+      Name: !Sub ${AWS::StackName}-MigrationProjectName
+
+  # CLI Commands for next steps
+  MGNInitializationCommand:
+    Description: 'Command to initialize MGN service in this region'
+    Value: !Sub 'aws mgn initialize-service --region ${AWS::Region}'
+
+  MGNTemplateUpdateCommand:
+    Description: 'Command to update MGN replication template with created resources'
+    Value: !Sub |
+      aws mgn update-replication-configuration-template \
+        --replication-configuration-template-id $(aws mgn describe-replication-configuration-templates --region ${AWS::Region} --query 'ReplicationConfigurationTemplates[0].ReplicationConfigurationTemplateID' --output text) \
+        --replication-servers-security-groups-i-ds ${MigrationSecurityGroup} \
+        --staging-area-subnet-id ${PrivateSubnet}
+
+  MigrationHubHomeRegionCommand:
+    Description: 'Command to configure Migration Hub home region'
+    Value: !Sub 'aws migrationhub config create-home-region-control --home-region ${AWS::Region} --target ${AWS::AccountId}'
+
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for this infrastructure (excluding data transfer)'
+    Value: !Sub |
+      VPC: $0, Subnets: $0, IGW: $0, NAT Gateway: ~$45, 
+      EIP: ~$3.6, Security Groups: $0, IAM: $0, 
+      CloudWatch Logs: ~$0.50/GB, CloudWatch Dashboard: ~$3, 
+      SNS: ~$0.50/million notifications, 
+      MGN: ~$15/server/month during replication

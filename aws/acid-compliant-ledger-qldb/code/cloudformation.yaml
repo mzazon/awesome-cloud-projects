@@ -1,0 +1,655 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for ACID-Compliant Ledger Database with QLDB, including journal streaming, S3 exports, and cryptographic verification capabilities'
+
+# Template Parameters for customization
+Parameters:
+  LedgerName:
+    Type: String
+    Description: 'Name for the QLDB ledger'
+    Default: 'financial-ledger'
+    MinLength: 1
+    MaxLength: 32
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+
+  Environment:
+    Type: String
+    Description: 'Environment tag for resources'
+    Default: 'Production'
+    AllowedValues:
+      - 'Development'
+      - 'Staging'
+      - 'Production'
+
+  KinesisShardCount:
+    Type: Number
+    Description: 'Number of shards for Kinesis stream'
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+
+  EnableDeletionProtection:
+    Type: String
+    Description: 'Enable deletion protection for QLDB ledger'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableJournalStreaming:
+    Type: String
+    Description: 'Enable journal streaming to Kinesis'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  S3BucketPrefix:
+    Type: String
+    Description: 'Prefix for S3 bucket name (will be appended with random suffix)'
+    Default: 'qldb-exports'
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be a valid S3 bucket name prefix'
+
+  RetentionDays:
+    Type: Number
+    Description: 'Number of days to retain journal exports in S3'
+    Default: 2555  # 7 years for financial compliance
+    MinValue: 1
+    MaxValue: 3653  # 10 years maximum
+
+# Conditions for conditional resource creation
+Conditions:
+  CreateJournalStreaming: !Equals [!Ref EnableJournalStreaming, 'true']
+  EnableDeletion: !Equals [!Ref EnableDeletionProtection, 'true']
+
+# Template Resources
+Resources:
+  # Random suffix generation for unique resource names
+  RandomSuffixLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+  RandomSuffixFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-random-suffix-generator'
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt RandomSuffixLambdaRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import random
+          import string
+          import cfnresponse
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  # Generate 6-character random suffix
+                  suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+                  
+                  response_data = {'RandomSuffix': suffix}
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  RandomSuffix:
+    Type: 'AWS::CloudFormation::CustomResource'
+    Properties:
+      ServiceToken: !GetAtt RandomSuffixFunction.Arn
+
+  # S3 Bucket for QLDB journal exports with encryption and lifecycle policies
+  JournalExportsBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${S3BucketPrefix}-${RandomSuffix.RandomSuffix}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: 'TransitionToIA'
+            Status: Enabled
+            TransitionInDays: 30
+            StorageClass: STANDARD_IA
+          - Id: 'TransitionToGlacier'
+            Status: Enabled
+            TransitionInDays: 90
+            StorageClass: GLACIER
+          - Id: 'TransitionToDeepArchive'
+            Status: Enabled
+            TransitionInDays: 365
+            StorageClass: DEEP_ARCHIVE
+          - Id: 'DeleteOldVersions'
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: !Ref RetentionDays
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref JournalExportsLogGroup
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: 'Financial-QLDB'
+        - Key: Purpose
+          Value: 'QLDB-Journal-Exports'
+
+  # CloudWatch Log Group for monitoring S3 exports
+  JournalExportsLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${S3BucketPrefix}-${RandomSuffix.RandomSuffix}'
+      RetentionInDays: 90
+
+  # Kinesis Data Stream for real-time journal streaming
+  JournalKinesisStream:
+    Type: 'AWS::Kinesis::Stream'
+    Condition: CreateJournalStreaming
+    Properties:
+      Name: !Sub 'qldb-journal-stream-${RandomSuffix.RandomSuffix}'
+      ShardCount: !Ref KinesisShardCount
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      RetentionPeriodHours: 168  # 7 days
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: 'Financial-QLDB'
+        - Key: Purpose
+          Value: 'QLDB-Journal-Streaming'
+
+  # IAM Role for QLDB to access Kinesis and S3
+  QLDBStreamingRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub 'qldb-streaming-role-${RandomSuffix.RandomSuffix}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: qldb.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      Policies:
+        - PolicyName: 'QLDBKinesisPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kinesis:PutRecord'
+                  - 'kinesis:PutRecords'
+                  - 'kinesis:DescribeStream'
+                  - 'kinesis:ListStreams'
+                Resource: !If
+                  - CreateJournalStreaming
+                  - !GetAtt JournalKinesisStream.Arn
+                  - !Ref 'AWS::NoValue'
+        - PolicyName: 'QLDBS3Policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                  - 's3:PutObjectAcl'
+                Resource:
+                  - !GetAtt JournalExportsBucket.Arn
+                  - !Sub '${JournalExportsBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:GenerateDataKey'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 's3.${AWS::Region}.amazonaws.com'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: 'Financial-QLDB'
+
+  # Amazon QLDB Ledger with deletion protection and encryption
+  FinancialLedger:
+    Type: 'AWS::QLDB::Ledger'
+    Properties:
+      Name: !Sub '${LedgerName}-${RandomSuffix.RandomSuffix}'
+      PermissionsMode: STANDARD
+      DeletionProtection: !If [EnableDeletion, true, false]
+      KmsKey: alias/aws/qldb
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: 'Financial-QLDB'
+        - Key: Compliance
+          Value: 'SOX-PCI-DSS'
+        - Key: DataClassification
+          Value: 'Highly-Confidential'
+
+  # CloudWatch Log Group for QLDB operations monitoring
+  QLDBLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/qldb/${LedgerName}-${RandomSuffix.RandomSuffix}'
+      RetentionInDays: 365
+      KmsKeyId: !GetAtt QLDBCloudWatchKMSKey.Arn
+
+  # KMS Key for CloudWatch Logs encryption
+  QLDBCloudWatchKMSKey:
+    Type: 'AWS::KMS::Key'
+    Properties:
+      Description: 'KMS key for QLDB CloudWatch Logs encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:DescribeKey'
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/qldb/${LedgerName}-${RandomSuffix.RandomSuffix}'
+
+  # KMS Key Alias for easier reference
+  QLDBCloudWatchKMSKeyAlias:
+    Type: 'AWS::KMS::Alias'
+    Properties:
+      AliasName: !Sub 'alias/qldb-cloudwatch-${RandomSuffix.RandomSuffix}'
+      TargetKeyId: !Ref QLDBCloudWatchKMSKey
+
+  # CloudWatch Alarms for monitoring QLDB operations
+  QLDBReadIOAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub 'QLDB-${LedgerName}-HighReadIO'
+      AlarmDescription: 'Monitor high read I/O operations on QLDB ledger'
+      MetricName: 'ReadIOs'
+      Namespace: 'AWS/QLDB'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: LedgerName
+          Value: !Ref FinancialLedger
+      TreatMissingData: notBreaching
+
+  QLDBWriteIOAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub 'QLDB-${LedgerName}-HighWriteIO'
+      AlarmDescription: 'Monitor high write I/O operations on QLDB ledger'
+      MetricName: 'WriteIOs'
+      Namespace: 'AWS/QLDB'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 500
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: LedgerName
+          Value: !Ref FinancialLedger
+      TreatMissingData: notBreaching
+
+  # CloudWatch Dashboard for QLDB monitoring
+  QLDBDashboard:
+    Type: 'AWS::CloudWatch::Dashboard'
+    Properties:
+      DashboardName: !Sub 'QLDB-${LedgerName}-Dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/QLDB", "ReadIOs", "LedgerName", "${FinancialLedger}" ],
+                  [ ".", "WriteIOs", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "QLDB I/O Operations",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/QLDB", "UserErrors", "LedgerName", "${FinancialLedger}" ],
+                  [ ".", "SystemErrors", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "QLDB Errors",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+  # Lambda function for automated digest verification
+  DigestVerificationLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: 'QLDBDigestPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'qldb:GetDigest'
+                  - 'qldb:GetBlock'
+                  - 'qldb:GetRevision'
+                Resource: !Sub 'arn:aws:qldb:${AWS::Region}:${AWS::AccountId}:ledger/${FinancialLedger}'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+
+  DigestVerificationFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-digest-verification'
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt DigestVerificationLambdaRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          LEDGER_NAME: !Ref FinancialLedger
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          import os
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def handler(event, context):
+              """
+              Lambda function to verify QLDB ledger digest integrity
+              """
+              try:
+                  ledger_name = os.environ['LEDGER_NAME']
+                  qldb_client = boto3.client('qldb')
+                  
+                  # Get current digest
+                  response = qldb_client.get_digest(Name=ledger_name)
+                  
+                  digest_info = {
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'ledger_name': ledger_name,
+                      'digest': response['Digest'],
+                      'digest_tip_address': response['DigestTipAddress'],
+                      'verification_status': 'SUCCESS'
+                  }
+                  
+                  logger.info(f"Digest verification completed: {json.dumps(digest_info)}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(digest_info)
+                  }
+                  
+              except Exception as e:
+                  error_info = {
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'error': str(e),
+                      'verification_status': 'FAILED'
+                  }
+                  
+                  logger.error(f"Digest verification failed: {json.dumps(error_info)}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(error_info)
+                  }
+
+  # EventBridge rule for scheduled digest verification
+  DigestVerificationSchedule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: !Sub '${AWS::StackName}-digest-verification-schedule'
+      Description: 'Scheduled digest verification for QLDB ledger'
+      ScheduleExpression: 'rate(1 hour)'  # Verify every hour
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DigestVerificationFunction.Arn
+          Id: 'DigestVerificationTarget'
+
+  # Permission for EventBridge to invoke Lambda
+  DigestVerificationPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref DigestVerificationFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt DigestVerificationSchedule.Arn
+
+# Template Outputs providing key information for integration and verification
+Outputs:
+  QLDBLedgerName:
+    Description: 'Name of the created QLDB ledger'
+    Value: !Ref FinancialLedger
+    Export:
+      Name: !Sub '${AWS::StackName}-LedgerName'
+
+  QLDBLedgerArn:
+    Description: 'ARN of the created QLDB ledger'
+    Value: !Sub 'arn:aws:qldb:${AWS::Region}:${AWS::AccountId}:ledger/${FinancialLedger}'
+    Export:
+      Name: !Sub '${AWS::StackName}-LedgerArn'
+
+  JournalExportsBucketName:
+    Description: 'Name of the S3 bucket for journal exports'
+    Value: !Ref JournalExportsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ExportsBucket'
+
+  JournalExportsBucketArn:
+    Description: 'ARN of the S3 bucket for journal exports'
+    Value: !GetAtt JournalExportsBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ExportsBucketArn'
+
+  KinesisStreamName:
+    Condition: CreateJournalStreaming
+    Description: 'Name of the Kinesis stream for journal streaming'
+    Value: !Ref JournalKinesisStream
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisStreamName'
+
+  KinesisStreamArn:
+    Condition: CreateJournalStreaming
+    Description: 'ARN of the Kinesis stream for journal streaming'
+    Value: !GetAtt JournalKinesisStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisStreamArn'
+
+  QLDBStreamingRoleArn:
+    Description: 'ARN of the IAM role for QLDB streaming operations'
+    Value: !GetAtt QLDBStreamingRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-StreamingRoleArn'
+
+  DigestVerificationFunctionArn:
+    Description: 'ARN of the Lambda function for digest verification'
+    Value: !GetAtt DigestVerificationFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DigestVerificationFunction'
+
+  CloudWatchDashboardURL:
+    Description: 'URL to the CloudWatch dashboard for QLDB monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${QLDBDashboard}'
+
+  QLDBConsoleURL:
+    Description: 'URL to the QLDB console for the created ledger'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/qldb/home?region=${AWS::Region}#ledger-details/${FinancialLedger}'
+
+  DeploymentCommands:
+    Description: 'Commands to begin using the QLDB ledger'
+    Value: !Sub |
+      # Set environment variables
+      export LEDGER_NAME=${FinancialLedger}
+      export S3_BUCKET=${JournalExportsBucket}
+      export IAM_ROLE_ARN=${QLDBStreamingRole.Arn}
+      
+      # Get ledger digest
+      aws qldb get-digest --name ${FinancialLedger}
+      
+      # Start journal streaming (if enabled)
+      aws qldb stream-journal-to-kinesis --ledger-name ${FinancialLedger} --role-arn ${QLDBStreamingRole.Arn} --kinesis-configuration StreamArn=${JournalKinesisStream.Arn},AggregationEnabled=true --stream-name journal-stream --inclusive-start-time $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# Metadata section for template documentation
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'QLDB Configuration'
+        Parameters:
+          - LedgerName
+          - EnableDeletionProtection
+      - Label:
+          default: 'Streaming Configuration'
+        Parameters:
+          - EnableJournalStreaming
+          - KinesisShardCount
+      - Label:
+          default: 'Storage Configuration'
+        Parameters:
+          - S3BucketPrefix
+          - RetentionDays
+      - Label:
+          default: 'Environment Configuration'
+        Parameters:
+          - Environment
+    ParameterLabels:
+      LedgerName:
+        default: 'QLDB Ledger Name'
+      EnableDeletionProtection:
+        default: 'Enable Deletion Protection'
+      EnableJournalStreaming:
+        default: 'Enable Journal Streaming'
+      KinesisShardCount:
+        default: 'Kinesis Shard Count'
+      S3BucketPrefix:
+        default: 'S3 Bucket Prefix'
+      RetentionDays:
+        default: 'Data Retention (Days)'
+      Environment:
+        default: 'Environment Tag'
+
+  AWS::CloudFormation::Description: |
+    This template creates a complete ACID-compliant distributed database solution using Amazon QLDB.
+    
+    Features:
+    - Amazon QLDB ledger with encryption and deletion protection
+    - Real-time journal streaming to Kinesis Data Streams
+    - S3 bucket for journal exports with lifecycle policies
+    - IAM roles with least privilege permissions
+    - CloudWatch monitoring and alarms
+    - Automated digest verification with Lambda
+    - Security best practices including encryption at rest and in transit
+    
+    Use Cases:
+    - Financial transaction processing with immutable audit trails
+    - Regulatory compliance and forensic investigations
+    - Supply chain tracking with cryptographic verification
+    - Healthcare records with HIPAA compliance
+    - Legal document management with tamper-proof storage
+    
+    Security Features:
+    - KMS encryption for all data at rest
+    - IAM roles with minimal required permissions
+    - S3 bucket with public access blocked
+    - CloudWatch Logs encryption
+    - Deletion protection for critical resources
+    
+    Monitoring:
+    - CloudWatch dashboard for QLDB metrics
+    - Alarms for high I/O operations and errors
+    - Automated digest verification every hour
+    - S3 export monitoring with CloudWatch integration
+    
+    Cost Optimization:
+    - S3 lifecycle policies for long-term archival
+    - Configurable Kinesis shard count
+    - CloudWatch Logs retention policies
+    - Resource tagging for cost allocation

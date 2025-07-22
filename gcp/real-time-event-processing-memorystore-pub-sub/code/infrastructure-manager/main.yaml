@@ -1,0 +1,488 @@
+# Infrastructure Manager Configuration for Real-Time Event Processing
+# This configuration deploys a complete event processing pipeline using:
+# - Cloud Memorystore for Redis (in-memory caching)
+# - Pub/Sub (event messaging and queuing)
+# - Cloud Functions (serverless event processing)
+# - BigQuery (analytics and long-term storage)
+# - Cloud Monitoring (observability and alerting)
+
+metadata:
+  version: 1.0
+  description: "Real-time event processing system with Redis caching and Pub/Sub messaging"
+  labels:
+    recipe: "real-time-event-processing-memorystore-pub-sub"
+    category: "serverless"
+    difficulty: "200"
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud project ID"
+  
+  region:
+    type: string
+    description: "GCP region for resource deployment"
+    default: "us-central1"
+  
+  zone:
+    type: string
+    description: "GCP zone for compute resources"
+    default: "us-central1-a"
+  
+  resource_prefix:
+    type: string
+    description: "Prefix for resource naming to ensure uniqueness"
+    default: "event-proc"
+  
+  redis_memory_size_gb:
+    type: integer
+    description: "Redis instance memory size in GB"
+    default: 1
+    minimum: 1
+    maximum: 300
+  
+  redis_tier:
+    type: string
+    description: "Redis service tier (BASIC or STANDARD_HA)"
+    default: "BASIC"
+    enum: ["BASIC", "STANDARD_HA"]
+  
+  function_memory:
+    type: string
+    description: "Cloud Function memory allocation"
+    default: "512Mi"
+    enum: ["128Mi", "256Mi", "512Mi", "1Gi", "2Gi", "4Gi", "8Gi"]
+  
+  function_timeout:
+    type: string
+    description: "Cloud Function timeout duration"
+    default: "540s"
+  
+  max_function_instances:
+    type: integer
+    description: "Maximum number of function instances"
+    default: 100
+    minimum: 1
+    maximum: 3000
+
+# Resource definitions
+resources:
+  # Enable required APIs
+  - name: enable-apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/redis.googleapis.com
+      consumerId: project:${var.project_id}
+    metadata:
+      dependsOn: []
+  
+  - name: enable-pubsub-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/pubsub.googleapis.com
+      consumerId: project:${var.project_id}
+  
+  - name: enable-functions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/cloudfunctions.googleapis.com
+      consumerId: project:${var.project_id}
+  
+  - name: enable-build-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/cloudbuild.googleapis.com
+      consumerId: project:${var.project_id}
+  
+  - name: enable-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/monitoring.googleapis.com
+      consumerId: project:${var.project_id}
+  
+  - name: enable-bigquery-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${var.project_id}/services/bigquery.googleapis.com
+      consumerId: project:${var.project_id}
+
+  # VPC Access Connector for Cloud Functions to access Redis
+  - name: vpc-connector
+    type: gcp-types/vpcaccess-v1:projects.locations.connectors
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      connectorId: ${var.resource_prefix}-redis-connector
+      network: default
+      ipCidrRange: "10.8.0.0/28"
+      minThroughput: 200
+      maxThroughput: 1000
+      machineType: e2-micro
+    metadata:
+      dependsOn:
+        - enable-functions-api
+
+  # Cloud Memorystore Redis Instance
+  # Provides sub-millisecond in-memory caching for real-time data access
+  - name: redis-instance
+    type: gcp-types/redis-v1:projects.locations.instances
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      instanceId: ${var.resource_prefix}-cache
+      tier: ${var.redis_tier}
+      memorySizeGb: ${var.redis_memory_size_gb}
+      redisVersion: REDIS_6_X
+      authorizedNetwork: projects/${var.project_id}/global/networks/default
+      displayName: "Event Processing Redis Cache"
+      redisConfigs:
+        maxmemory-policy: "allkeys-lru"
+      labels:
+        environment: "production"
+        component: "cache"
+        recipe: "event-processing"
+    metadata:
+      dependsOn:
+        - enable-apis
+
+  # Pub/Sub Topic for Event Ingestion
+  # Handles event publishing with global scaling and durability
+  - name: events-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/${var.project_id}/topics/${var.resource_prefix}-events
+      labels:
+        environment: "production"
+        component: "messaging"
+        recipe: "event-processing"
+      messageRetentionDuration: "604800s"  # 7 days
+    metadata:
+      dependsOn:
+        - enable-pubsub-api
+
+  # Dead Letter Topic for Failed Message Handling
+  # Captures messages that fail processing for investigation and reprocessing
+  - name: deadletter-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/${var.project_id}/topics/${var.resource_prefix}-events-deadletter
+      labels:
+        environment: "production"
+        component: "messaging"
+        recipe: "event-processing"
+    metadata:
+      dependsOn:
+        - enable-pubsub-api
+
+  # Pub/Sub Subscription with Dead Letter Policy
+  # Manages message delivery with retry logic and failure handling
+  - name: events-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/${var.project_id}/subscriptions/${var.resource_prefix}-events-subscription
+      topic: $(ref.events-topic.name)
+      ackDeadlineSeconds: 60
+      messageRetentionDuration: "604800s"  # 7 days
+      deadLetterPolicy:
+        deadLetterTopic: $(ref.deadletter-topic.name)
+        maxDeliveryAttempts: 5
+      retryPolicy:
+        minimumBackoff: "10s"
+        maximumBackoff: "600s"
+      labels:
+        environment: "production"
+        component: "messaging"
+        recipe: "event-processing"
+    metadata:
+      dependsOn:
+        - events-topic
+        - deadletter-topic
+
+  # BigQuery Dataset for Analytics
+  # Stores processed events for long-term analytics and business intelligence
+  - name: analytics-dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      projectId: ${var.project_id}
+      datasetId: event_analytics
+      location: ${var.region}
+      description: "Event processing analytics dataset"
+      labels:
+        environment: "production"
+        component: "analytics"
+        recipe: "event-processing"
+      access:
+        - role: "OWNER"
+          userByEmail: "$(ref.function-service-account.email)"
+    metadata:
+      dependsOn:
+        - enable-bigquery-api
+
+  # BigQuery Table for Processed Events
+  # Partitioned table for optimal query performance on time-series data
+  - name: events-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      projectId: ${var.project_id}
+      datasetId: $(ref.analytics-dataset.datasetId)
+      tableId: processed_events
+      description: "Processed events with time partitioning"
+      timePartitioning:
+        type: "DAY"
+        field: "timestamp"
+      clustering:
+        fields: ["event_type", "user_id"]
+      schema:
+        fields:
+          - name: "event_id"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Unique event identifier"
+          - name: "user_id"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "User identifier"
+          - name: "event_type"
+            type: "STRING"
+            mode: "REQUIRED"
+            description: "Type of event"
+          - name: "timestamp"
+            type: "TIMESTAMP"
+            mode: "REQUIRED"
+            description: "Event timestamp"
+          - name: "metadata"
+            type: "STRING"
+            mode: "NULLABLE"
+            description: "Event metadata as JSON string"
+      labels:
+        environment: "production"
+        component: "analytics"
+        recipe: "event-processing"
+    metadata:
+      dependsOn:
+        - analytics-dataset
+
+  # Service Account for Cloud Function
+  # Provides secure access to Redis, BigQuery, and other services
+  - name: function-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: ${var.resource_prefix}-function-sa
+      displayName: "Event Processor Function Service Account"
+      description: "Service account for event processing Cloud Function"
+      projectId: ${var.project_id}
+    metadata:
+      dependsOn: []
+
+  # IAM Bindings for Service Account
+  # Grants minimal required permissions following least privilege principle
+  - name: function-sa-bigquery-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/bigquery.dataEditor
+      member: serviceAccount:$(ref.function-service-account.email)
+    metadata:
+      dependsOn:
+        - function-service-account
+
+  - name: function-sa-monitoring-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/monitoring.metricWriter
+      member: serviceAccount:$(ref.function-service-account.email)
+    metadata:
+      dependsOn:
+        - function-service-account
+
+  - name: function-sa-logging-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      role: roles/logging.logWriter
+      member: serviceAccount:$(ref.function-service-account.email)
+    metadata:
+      dependsOn:
+        - function-service-account
+
+  # Cloud Storage Bucket for Function Source Code
+  # Stores the Cloud Function deployment package
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: ${var.project_id}-${var.resource_prefix}-function-source
+      location: ${var.region}
+      storageClass: REGIONAL
+      versioning:
+        enabled: true
+      labels:
+        environment: "production"
+        component: "deployment"
+        recipe: "event-processing"
+    metadata:
+      dependsOn: []
+
+  # Cloud Function for Event Processing
+  # Serverless compute that processes events with Redis caching and BigQuery storage
+  - name: event-processor-function
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      functionId: ${var.resource_prefix}-processor
+      description: "Processes events with Redis caching and BigQuery analytics"
+      buildConfig:
+        runtime: "nodejs20"
+        entryPoint: "processEvent"
+        source:
+          storageSource:
+            bucket: $(ref.function-source-bucket.name)
+            object: "function-source.zip"
+        environmentVariables:
+          REDIS_HOST: $(ref.redis-instance.host)
+          REDIS_PORT: $(ref.redis-instance.port)
+          PROJECT_ID: ${var.project_id}
+          DATASET_ID: "event_analytics"
+          TABLE_ID: "processed_events"
+      serviceConfig:
+        maxInstanceCount: ${var.max_function_instances}
+        minInstanceCount: 0
+        availableMemory: ${var.function_memory}
+        timeoutSeconds: ${var.function_timeout}
+        serviceAccountEmail: $(ref.function-service-account.email)
+        environmentVariables:
+          REDIS_HOST: $(ref.redis-instance.host)
+          REDIS_PORT: $(ref.redis-instance.port)
+          PROJECT_ID: ${var.project_id}
+        vpcConnector: $(ref.vpc-connector.name)
+        vpcConnectorEgressSettings: "PRIVATE_RANGES_ONLY"
+        ingressSettings: "ALLOW_INTERNAL_ONLY"
+      eventTrigger:
+        triggerRegion: ${var.region}
+        eventType: "google.cloud.pubsub.topic.v1.messagePublished"
+        pubsubTopic: $(ref.events-topic.name)
+        retryPolicy: "RETRY_POLICY_RETRY"
+      labels:
+        environment: "production"
+        component: "compute"
+        recipe: "event-processing"
+    metadata:
+      dependsOn:
+        - redis-instance
+        - events-topic
+        - vpc-connector
+        - function-service-account
+        - function-source-bucket
+        - analytics-dataset
+
+  # Cloud Monitoring Alert Policy for Redis Memory Usage
+  # Monitors Redis memory consumption and alerts when approaching limits
+  - name: redis-memory-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: "${var.resource_prefix} Redis Memory Usage Alert"
+      documentation:
+        content: "Alert when Redis memory usage exceeds 80% of allocated capacity"
+        mimeType: "text/markdown"
+      conditions:
+        - displayName: "Redis memory usage > 80%"
+          conditionThreshold:
+            filter: 'resource.type="gce_instance" AND metric.type="redis.googleapis.com/stats/memory/usage_ratio"'
+            comparison: "COMPARISON_GREATER_THAN"
+            thresholdValue: 0.8
+            duration: "300s"
+            aggregations:
+              - alignmentPeriod: "60s"
+                perSeriesAligner: "ALIGN_MEAN"
+                crossSeriesReducer: "REDUCE_MEAN"
+                groupByFields: ["resource.label.instance_id"]
+      combiner: "OR"
+      enabled: true
+      alertStrategy:
+        autoClose: "1800s"  # 30 minutes
+      severity: "WARNING"
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+        - redis-instance
+
+  # Cloud Monitoring Alert Policy for Function Errors
+  # Monitors Cloud Function execution errors and failure rates
+  - name: function-error-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      displayName: "${var.resource_prefix} Function Error Rate Alert"
+      documentation:
+        content: "Alert when Cloud Function error rate exceeds 5% over 5 minutes"
+        mimeType: "text/markdown"
+      conditions:
+        - displayName: "Function error rate > 5%"
+          conditionThreshold:
+            filter: 'resource.type="cloud_function" AND metric.type="cloudfunctions.googleapis.com/function/execution_count" AND metric.label.status!="ok"'
+            comparison: "COMPARISON_GREATER_THAN"
+            thresholdValue: 0.05
+            duration: "300s"
+            aggregations:
+              - alignmentPeriod: "60s"
+                perSeriesAligner: "ALIGN_RATE"
+                crossSeriesReducer: "REDUCE_SUM"
+                groupByFields: ["resource.label.function_name"]
+      combiner: "OR"
+      enabled: true
+      alertStrategy:
+        autoClose: "1800s"  # 30 minutes
+      severity: "ERROR"
+    metadata:
+      dependsOn:
+        - enable-monitoring-api
+        - event-processor-function
+
+# Output values for verification and integration
+outputs:
+  redis_host:
+    description: "Redis instance host address"
+    value: $(ref.redis-instance.host)
+  
+  redis_port:
+    description: "Redis instance port"
+    value: $(ref.redis-instance.port)
+  
+  pubsub_topic:
+    description: "Pub/Sub topic name for event publishing"
+    value: $(ref.events-topic.name)
+  
+  deadletter_topic:
+    description: "Dead letter topic for failed messages"
+    value: $(ref.deadletter-topic.name)
+  
+  function_name:
+    description: "Cloud Function name"
+    value: $(ref.event-processor-function.name)
+  
+  function_url:
+    description: "Cloud Function trigger URL"
+    value: $(ref.event-processor-function.serviceConfig.uri)
+  
+  bigquery_dataset:
+    description: "BigQuery dataset for analytics"
+    value: $(ref.analytics-dataset.datasetId)
+  
+  bigquery_table:
+    description: "BigQuery table for processed events"
+    value: $(ref.events-table.tableId)
+  
+  vpc_connector:
+    description: "VPC connector for function networking"
+    value: $(ref.vpc-connector.name)
+  
+  monitoring_dashboard_url:
+    description: "Cloud Monitoring dashboard URL"
+    value: "https://console.cloud.google.com/monitoring/dashboards?project=${var.project_id}"
+
+# Deployment metadata
+deployment_info:
+  estimated_cost: "$15-25 per month for moderate usage"
+  deployment_time: "15-20 minutes"
+  complexity: "Intermediate (200 level)"
+  services_count: 6
+  monitoring_enabled: true
+  security_hardened: true

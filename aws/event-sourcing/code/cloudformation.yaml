@@ -1,0 +1,937 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Event Sourcing Architecture with EventBridge and DynamoDB - Complete infrastructure for building scalable, auditable event-driven systems'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Environment Configuration'
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: 'Event Store Configuration'
+        Parameters:
+          - EventStoreReadCapacity
+          - EventStoreWriteCapacity
+          - ReadModelReadCapacity
+          - ReadModelWriteCapacity
+          - EventRetentionDays
+      - Label:
+          default: 'Lambda Configuration'
+        Parameters:
+          - LambdaRuntime
+          - LambdaTimeout
+          - LambdaMemorySize
+      - Label:
+          default: 'Monitoring Configuration'
+        Parameters:
+          - EnableDetailedMonitoring
+          - AlertEmail
+    ParameterLabels:
+      Environment:
+        default: 'Deployment Environment'
+      ProjectName:
+        default: 'Project Name'
+      EventStoreReadCapacity:
+        default: 'Event Store Read Capacity Units'
+      EventStoreWriteCapacity:
+        default: 'Event Store Write Capacity Units'
+
+# Input Parameters
+Parameters:
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: 'Environment name for resource naming and configuration'
+    
+  ProjectName:
+    Type: String
+    Default: 'event-sourcing'
+    Description: 'Project name used for resource naming'
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+    
+  EventStoreReadCapacity:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 1000
+    Description: 'Read capacity units for event store table'
+    
+  EventStoreWriteCapacity:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 1000
+    Description: 'Write capacity units for event store table'
+    
+  ReadModelReadCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 1000
+    Description: 'Read capacity units for read model table'
+    
+  ReadModelWriteCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 1000
+    Description: 'Write capacity units for read model table'
+    
+  EventRetentionDays:
+    Type: Number
+    Default: 365
+    MinValue: 1
+    MaxValue: 3653
+    Description: 'Event archive retention period in days'
+    
+  LambdaRuntime:
+    Type: String
+    Default: 'python3.9'
+    AllowedValues:
+      - python3.9
+      - python3.10
+      - python3.11
+    Description: 'Lambda runtime version'
+    
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 900
+    Description: 'Lambda function timeout in seconds'
+    
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 10240
+    Description: 'Lambda function memory size in MB'
+    
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable detailed CloudWatch monitoring'
+    
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for CloudWatch alarms (optional)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+# Conditional Resources
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  EnableMonitoring: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+  EnableAlerts: !And [!Condition EnableMonitoring, !Condition HasAlertEmail]
+
+# Infrastructure Resources
+Resources:
+  # IAM Role for Lambda Functions
+  EventSourcingLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EventSourcingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                  - events:List*
+                  - events:Describe*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:ListStreams
+                Resource:
+                  - !Sub '${EventStoreTable}*'
+                  - !Sub '${ReadModelTable}*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Custom EventBridge Bus
+  EventSourcingBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-event-bus'
+      Description: 'Event sourcing bus for financial transactions'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Event Archive for Replay Capability
+  EventArchive:
+    Type: AWS::Events::Archive
+    Properties:
+      ArchiveName: !Sub '${ProjectName}-${Environment}-archive'
+      SourceArn: !GetAtt EventSourcingBus.Arn
+      Description: 'Archive for event replay and audit'
+      RetentionDays: !Ref EventRetentionDays
+      EventPattern:
+        source:
+          - 'event-sourcing.financial'
+
+  # DynamoDB Event Store Table
+  EventStoreTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-event-store'
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref EventStoreReadCapacity
+        WriteCapacityUnits: !Ref EventStoreWriteCapacity
+      AttributeDefinitions:
+        - AttributeName: AggregateId
+          AttributeType: S
+        - AttributeName: EventSequence
+          AttributeType: N
+        - AttributeName: EventType
+          AttributeType: S
+        - AttributeName: Timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: AggregateId
+          KeyType: HASH
+        - AttributeName: EventSequence
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: EventType-Timestamp-index
+          KeySchema:
+            - AttributeName: EventType
+              KeyType: HASH
+            - AttributeName: Timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: 5
+            WriteCapacityUnits: 5
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # DynamoDB Read Model Table
+  ReadModelTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-read-model'
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref ReadModelReadCapacity
+        WriteCapacityUnits: !Ref ReadModelWriteCapacity
+      AttributeDefinitions:
+        - AttributeName: AccountId
+          AttributeType: S
+        - AttributeName: ProjectionType
+          AttributeType: S
+      KeySchema:
+        - AttributeName: AccountId
+          KeyType: HASH
+        - AttributeName: ProjectionType
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Command Handler Lambda Function
+  CommandHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-command-handler'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt EventSourcingLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Description: 'Command handler for event sourcing architecture'
+      Environment:
+        Variables:
+          EVENT_STORE_TABLE: !Ref EventStoreTable
+          EVENT_BUS_NAME: !Ref EventSourcingBus
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          from datetime import datetime
+          import os
+          
+          events_client = boto3.client('events')
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['EVENT_STORE_TABLE'])
+          
+          def lambda_handler(event, context):
+              try:
+                  # Parse command from event
+                  command = json.loads(event['body']) if 'body' in event else event
+                  
+                  # Generate event from command
+                  event_id = str(uuid.uuid4())
+                  aggregate_id = command['aggregateId']
+                  event_type = command['eventType']
+                  event_data = command['eventData']
+                  
+                  # Get next sequence number
+                  response = table.query(
+                      KeyConditionExpression='AggregateId = :aid',
+                      ExpressionAttributeValues={':aid': aggregate_id},
+                      ScanIndexForward=False,
+                      Limit=1
+                  )
+                  
+                  next_sequence = 1
+                  if response['Items']:
+                      next_sequence = response['Items'][0]['EventSequence'] + 1
+                  
+                  # Create event record
+                  timestamp = datetime.utcnow().isoformat()
+                  event_record = {
+                      'EventId': event_id,
+                      'AggregateId': aggregate_id,
+                      'EventSequence': next_sequence,
+                      'EventType': event_type,
+                      'EventData': event_data,
+                      'Timestamp': timestamp,
+                      'Version': '1.0'
+                  }
+                  
+                  # Store event in DynamoDB
+                  table.put_item(Item=event_record)
+                  
+                  # Publish event to EventBridge
+                  events_client.put_events(
+                      Entries=[
+                          {
+                              'Source': 'event-sourcing.financial',
+                              'DetailType': event_type,
+                              'Detail': json.dumps(event_record),
+                              'EventBusName': os.environ['EVENT_BUS_NAME']
+                          }
+                      ]
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'eventId': event_id,
+                          'aggregateId': aggregate_id,
+                          'sequence': next_sequence
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Projection Handler Lambda Function
+  ProjectionHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-projection-handler'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt EventSourcingLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Description: 'Projection handler for materializing read models'
+      Environment:
+        Variables:
+          READ_MODEL_TABLE: !Ref ReadModelTable
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from decimal import Decimal
+          
+          dynamodb = boto3.resource('dynamodb')
+          read_model_table = dynamodb.Table(os.environ['READ_MODEL_TABLE'])
+          
+          def lambda_handler(event, context):
+              try:
+                  # Process EventBridge events
+                  if 'Records' in event:
+                      # Handle SQS/SNS records
+                      for record in event['Records']:
+                          detail = json.loads(record['body']) if 'body' in record else record
+                          process_event(detail)
+                  else:
+                      # Handle direct EventBridge invocation
+                      process_event(event['detail'])
+                      
+                  return {'statusCode': 200}
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
+          
+          def process_event(detail):
+              event_type = detail['EventType']
+              aggregate_id = detail['AggregateId']
+              event_data = detail['EventData']
+              
+              # Handle different event types
+              if event_type == 'AccountCreated':
+                  handle_account_created(aggregate_id, event_data)
+              elif event_type == 'TransactionProcessed':
+                  handle_transaction_processed(aggregate_id, event_data)
+              elif event_type == 'AccountClosed':
+                  handle_account_closed(aggregate_id, event_data)
+          
+          def handle_account_created(aggregate_id, event_data):
+              read_model_table.put_item(
+                  Item={
+                      'AccountId': aggregate_id,
+                      'ProjectionType': 'AccountSummary',
+                      'Balance': Decimal('0.00'),
+                      'Status': 'Active',
+                      'CreatedAt': event_data['createdAt'],
+                      'TransactionCount': 0
+                  }
+              )
+          
+          def handle_transaction_processed(aggregate_id, event_data):
+              # Update account balance
+              try:
+                  response = read_model_table.get_item(
+                      Key={'AccountId': aggregate_id, 'ProjectionType': 'AccountSummary'}
+                  )
+                  
+                  if 'Item' in response:
+                      current_balance = response['Item']['Balance']
+                      transaction_count = response['Item']['TransactionCount']
+                      
+                      new_balance = current_balance + Decimal(str(event_data['amount']))
+                      
+                      read_model_table.update_item(
+                          Key={'AccountId': aggregate_id, 'ProjectionType': 'AccountSummary'},
+                          UpdateExpression='SET Balance = :balance, TransactionCount = :count, LastTransactionAt = :timestamp',
+                          ExpressionAttributeValues={
+                              ':balance': new_balance,
+                              ':count': transaction_count + 1,
+                              ':timestamp': event_data['timestamp']
+                          }
+                      )
+              except Exception as e:
+                  print(f"Error updating balance: {str(e)}")
+          
+          def handle_account_closed(aggregate_id, event_data):
+              read_model_table.update_item(
+                  Key={'AccountId': aggregate_id, 'ProjectionType': 'AccountSummary'},
+                  UpdateExpression='SET #status = :status, ClosedAt = :timestamp',
+                  ExpressionAttributeNames={'#status': 'Status'},
+                  ExpressionAttributeValues={
+                      ':status': 'Closed',
+                      ':timestamp': event_data['closedAt']
+                  }
+              )
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Query Handler Lambda Function
+  QueryHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-query-handler'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt EventSourcingLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Description: 'Query handler for event reconstruction and read models'
+      Environment:
+        Variables:
+          EVENT_STORE_TABLE: !Ref EventStoreTable
+          READ_MODEL_TABLE: !Ref ReadModelTable
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from boto3.dynamodb.conditions import Key
+          
+          dynamodb = boto3.resource('dynamodb')
+          event_store_table = dynamodb.Table(os.environ['EVENT_STORE_TABLE'])
+          read_model_table = dynamodb.Table(os.environ['READ_MODEL_TABLE'])
+          
+          def lambda_handler(event, context):
+              try:
+                  query_type = event['queryType']
+                  
+                  if query_type == 'getAggregateEvents':
+                      return get_aggregate_events(event['aggregateId'])
+                  elif query_type == 'getAccountSummary':
+                      return get_account_summary(event['accountId'])
+                  elif query_type == 'reconstructState':
+                      return reconstruct_state(event['aggregateId'], event.get('upToSequence'))
+                  else:
+                      return {'statusCode': 400, 'body': json.dumps({'error': 'Unknown query type'})}
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
+          
+          def get_aggregate_events(aggregate_id):
+              response = event_store_table.query(
+                  KeyConditionExpression=Key('AggregateId').eq(aggregate_id),
+                  ScanIndexForward=True
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  'body': json.dumps({
+                      'aggregateId': aggregate_id,
+                      'events': response['Items']
+                  }, default=str)
+              }
+          
+          def get_account_summary(account_id):
+              response = read_model_table.get_item(
+                  Key={'AccountId': account_id, 'ProjectionType': 'AccountSummary'}
+              )
+              
+              if 'Item' in response:
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps(response['Item'], default=str)
+                  }
+              else:
+                  return {
+                      'statusCode': 404,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({'error': 'Account not found'})
+                  }
+          
+          def reconstruct_state(aggregate_id, up_to_sequence=None):
+              # Reconstruct state by replaying events
+              key_condition = Key('AggregateId').eq(aggregate_id)
+              
+              if up_to_sequence:
+                  key_condition = key_condition & Key('EventSequence').lte(up_to_sequence)
+              
+              response = event_store_table.query(
+                  KeyConditionExpression=key_condition,
+                  ScanIndexForward=True
+              )
+              
+              # Replay events to reconstruct state
+              state = {'balance': 0, 'status': 'Unknown', 'transactionCount': 0}
+              
+              for event in response['Items']:
+                  event_type = event['EventType']
+                  event_data = event['EventData']
+                  
+                  if event_type == 'AccountCreated':
+                      state['status'] = 'Active'
+                      state['createdAt'] = event_data['createdAt']
+                  elif event_type == 'TransactionProcessed':
+                      state['balance'] += float(event_data['amount'])
+                      state['transactionCount'] += 1
+                  elif event_type == 'AccountClosed':
+                      state['status'] = 'Closed'
+                      state['closedAt'] = event_data['closedAt']
+              
+              return {
+                  'statusCode': 200,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  'body': json.dumps({
+                      'aggregateId': aggregate_id,
+                      'reconstructedState': state,
+                      'eventsProcessed': len(response['Items'])
+                  }, default=str)
+              }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # EventBridge Rule for Financial Events
+  FinancialEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-financial-events-rule'
+      Description: 'Route financial events to projection handler'
+      EventBusName: !Ref EventSourcingBus
+      EventPattern:
+        source:
+          - 'event-sourcing.financial'
+        detail-type:
+          - 'AccountCreated'
+          - 'TransactionProcessed'
+          - 'AccountClosed'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ProjectionHandlerFunction.Arn
+          Id: 'ProjectionHandlerTarget'
+
+  # Permission for EventBridge to invoke Projection Handler
+  ProjectionHandlerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProjectionHandlerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt FinancialEventsRule.Arn
+
+  # Dead Letter Queue for Failed Events
+  EventDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-event-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeoutSeconds: 300
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # DLQ Policy
+  EventDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref EventDLQ
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt EventDLQ.Arn
+
+  # EventBridge Rule for Failed Events
+  FailedEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-failed-events-rule'
+      Description: 'Route failed events to dead letter queue'
+      EventBusName: !Ref EventSourcingBus
+      EventPattern:
+        source:
+          - 'aws.events'
+        detail-type:
+          - 'Event Processing Failed'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt EventDLQ.Arn
+          Id: 'EventDLQTarget'
+
+  # CloudWatch Log Groups
+  CommandHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${CommandHandlerFunction}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  ProjectionHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectionHandlerFunction}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  QueryHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${QueryHandlerFunction}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  # CloudWatch Alarms (Conditional)
+  EventStoreWriteThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlerts
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-EventStore-WriteThrottles'
+      AlarmDescription: 'DynamoDB write throttles on event store'
+      MetricName: WriteThrottleEvents
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref EventStoreTable
+      AlarmActions:
+        - !Ref AlertTopic
+
+  CommandHandlerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlerts
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-CommandHandler-Errors'
+      AlarmDescription: 'High error rate in command handler'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CommandHandlerFunction
+      AlarmActions:
+        - !Ref AlertTopic
+
+  EventBridgeFailedInvocationsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableAlerts
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-EventBridge-FailedInvocations'
+      AlarmDescription: 'High number of failed event invocations'
+      MetricName: FailedInvocations
+      Namespace: AWS/Events
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: EventBusName
+          Value: !Ref EventSourcingBus
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # SNS Topic for Alerts
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnableAlerts
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-alerts'
+      DisplayName: 'Event Sourcing Alerts'
+      KmsMasterKeyId: alias/aws/sns
+
+  # SNS Subscription for Email Alerts
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: EnableAlerts
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AlertTopic
+      Endpoint: !Ref AlertEmail
+
+# Stack Outputs
+Outputs:
+  EventBusName:
+    Description: 'Name of the EventBridge bus'
+    Value: !Ref EventSourcingBus
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBusName'
+
+  EventBusArn:
+    Description: 'ARN of the EventBridge bus'
+    Value: !GetAtt EventSourcingBus.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBusArn'
+
+  EventStoreTableName:
+    Description: 'Name of the event store DynamoDB table'
+    Value: !Ref EventStoreTable
+    Export:
+      Name: !Sub '${AWS::StackName}-EventStoreTableName'
+
+  EventStoreTableArn:
+    Description: 'ARN of the event store DynamoDB table'
+    Value: !GetAtt EventStoreTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventStoreTableArn'
+
+  ReadModelTableName:
+    Description: 'Name of the read model DynamoDB table'
+    Value: !Ref ReadModelTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ReadModelTableName'
+
+  ReadModelTableArn:
+    Description: 'ARN of the read model DynamoDB table'
+    Value: !GetAtt ReadModelTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ReadModelTableArn'
+
+  CommandHandlerFunctionName:
+    Description: 'Name of the command handler Lambda function'
+    Value: !Ref CommandHandlerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-CommandHandlerFunctionName'
+
+  CommandHandlerFunctionArn:
+    Description: 'ARN of the command handler Lambda function'
+    Value: !GetAtt CommandHandlerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CommandHandlerFunctionArn'
+
+  ProjectionHandlerFunctionName:
+    Description: 'Name of the projection handler Lambda function'
+    Value: !Ref ProjectionHandlerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectionHandlerFunctionName'
+
+  ProjectionHandlerFunctionArn:
+    Description: 'ARN of the projection handler Lambda function'
+    Value: !GetAtt ProjectionHandlerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectionHandlerFunctionArn'
+
+  QueryHandlerFunctionName:
+    Description: 'Name of the query handler Lambda function'
+    Value: !Ref QueryHandlerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-QueryHandlerFunctionName'
+
+  QueryHandlerFunctionArn:
+    Description: 'ARN of the query handler Lambda function'
+    Value: !GetAtt QueryHandlerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-QueryHandlerFunctionArn'
+
+  EventArchiveName:
+    Description: 'Name of the event archive'
+    Value: !Ref EventArchive
+    Export:
+      Name: !Sub '${AWS::StackName}-EventArchiveName'
+
+  EventDLQUrl:
+    Description: 'URL of the dead letter queue'
+    Value: !Ref EventDLQ
+    Export:
+      Name: !Sub '${AWS::StackName}-EventDLQUrl'
+
+  EventDLQArn:
+    Description: 'ARN of the dead letter queue'
+    Value: !GetAtt EventDLQ.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventDLQArn'
+
+  LambdaRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt EventSourcingLambdaRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaRoleArn'
+
+  StackEnvironment:
+    Description: 'Environment this stack was deployed to'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+  StackRegion:
+    Description: 'AWS region where this stack was deployed'
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub '${AWS::StackName}-Region'
+
+  # API Endpoints for testing
+  TestCommands:
+    Description: 'Sample commands for testing the event sourcing system'
+    Value: !Sub |
+      # Test account creation:
+      aws lambda invoke --function-name ${CommandHandlerFunction} --payload '{"aggregateId":"account-123","eventType":"AccountCreated","eventData":{"accountId":"account-123","customerId":"customer-456","accountType":"checking","createdAt":"2024-01-15T10:00:00Z"}}' response.json
+      
+      # Test transaction processing:
+      aws lambda invoke --function-name ${CommandHandlerFunction} --payload '{"aggregateId":"account-123","eventType":"TransactionProcessed","eventData":{"transactionId":"tx-789","amount":100.50,"type":"deposit","timestamp":"2024-01-15T10:30:00Z"}}' response.json
+      
+      # Query account summary:
+      aws lambda invoke --function-name ${QueryHandlerFunction} --payload '{"queryType":"getAccountSummary","accountId":"account-123"}' response.json
+      
+      # Reconstruct state:
+      aws lambda invoke --function-name ${QueryHandlerFunction} --payload '{"queryType":"reconstructState","aggregateId":"account-123"}' response.json

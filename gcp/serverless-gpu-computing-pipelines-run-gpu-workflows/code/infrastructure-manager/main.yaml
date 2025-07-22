@@ -1,0 +1,589 @@
+# Infrastructure Manager Configuration for Serverless GPU Computing Pipelines
+# This configuration deploys a complete serverless ML pipeline with GPU acceleration
+# using Cloud Run GPU, Cloud Workflows, and supporting services
+
+# Copyright 2025 Google LLC
+# Licensed under the Apache License, Version 2.0
+
+# Define deployment metadata
+metadata:
+  name: serverless-gpu-ml-pipeline
+  description: "Serverless GPU computing pipeline with Cloud Run GPU and Cloud Workflows"
+  version: "1.0"
+  labels:
+    category: "serverless"
+    use-case: "machine-learning"
+    gpu-enabled: "true"
+
+# Define template variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    default: $PROJECT_ID
+  
+  region:
+    type: string
+    description: "Google Cloud region for deployment"
+    default: "us-central1"
+  
+  service_prefix:
+    type: string
+    description: "Prefix for resource names"
+    default: "ml-pipeline"
+  
+  gpu_memory:
+    type: string
+    description: "Memory allocation for GPU service"
+    default: "16Gi"
+  
+  gpu_cpu:
+    type: string
+    description: "CPU allocation for GPU service"
+    default: "4"
+  
+  max_instances:
+    type: number
+    description: "Maximum number of instances for GPU service"
+    default: 10
+  
+  preprocess_memory:
+    type: string
+    description: "Memory allocation for preprocessing service"
+    default: "2Gi"
+  
+  postprocess_memory:
+    type: string
+    description: "Memory allocation for postprocessing service"
+    default: "1Gi"
+
+# Define the infrastructure resources
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-run-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/run.googleapis.com
+      
+  - name: enable-workflows-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/workflows.googleapis.com
+      
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/storage.googleapis.com
+      
+  - name: enable-aiplatform-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/aiplatform.googleapis.com
+      
+  - name: enable-cloudbuild-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/cloudbuild.googleapis.com
+      
+  - name: enable-eventarc-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/eventarc.googleapis.com
+
+  # Cloud Storage buckets for the ML pipeline
+  - name: input-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(ref.service_prefix.value)-input-$(ref.project_id.value)
+      location: $(ref.region.value)
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: false
+      labels:
+        purpose: "ml-pipeline-input"
+        component: "data-ingestion"
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  - name: models-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(ref.service_prefix.value)-models-$(ref.project_id.value)
+      location: $(ref.region.value)
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: true
+      labels:
+        purpose: "ml-pipeline-models"
+        component: "model-storage"
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  - name: output-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(ref.service_prefix.value)-output-$(ref.project_id.value)
+      location: $(ref.region.value)
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: false
+      labels:
+        purpose: "ml-pipeline-output"
+        component: "results-storage"
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # Service Account for Eventarc and Workflows
+  - name: pipeline-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: $(ref.service_prefix.value)-pipeline-sa
+      displayName: "ML Pipeline Service Account"
+      description: "Service account for ML pipeline workflows and event processing"
+      projectId: $(ref.project_id.value)
+
+  # IAM bindings for the service account
+  - name: workflows-invoker-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id.value)
+      role: roles/workflows.invoker
+      member: serviceAccount:$(ref.pipeline-service-account.email)
+    metadata:
+      dependsOn:
+        - pipeline-service-account
+
+  - name: eventarc-receiver-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id.value)
+      role: roles/eventarc.eventReceiver
+      member: serviceAccount:$(ref.pipeline-service-account.email)
+    metadata:
+      dependsOn:
+        - pipeline-service-account
+
+  - name: storage-object-viewer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id.value)
+      role: roles/storage.objectViewer
+      member: serviceAccount:$(ref.pipeline-service-account.email)
+    metadata:
+      dependsOn:
+        - pipeline-service-account
+
+  - name: storage-object-creator-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id.value)
+      role: roles/storage.objectCreator
+      member: serviceAccount:$(ref.pipeline-service-account.email)
+    metadata:
+      dependsOn:
+        - pipeline-service-account
+
+  # Cloud Run GPU Inference Service
+  - name: gpu-inference-service
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/$(ref.project_id.value)
+      location: $(ref.region.value)
+      metadata:
+        name: $(ref.service_prefix.value)-gpu-inference
+        namespace: $(ref.project_id.value)
+        labels:
+          service-type: "gpu-inference"
+          component: "ml-pipeline"
+        annotations:
+          run.googleapis.com/ingress: "all"
+          run.googleapis.com/cpu-throttling: "false"
+      spec:
+        template:
+          metadata:
+            annotations:
+              run.googleapis.com/gpu-type: "nvidia-l4"
+              run.googleapis.com/gpu: "1"
+              run.googleapis.com/memory: $(ref.gpu_memory.value)
+              run.googleapis.com/cpu: $(ref.gpu_cpu.value)
+              autoscaling.knative.dev/maxScale: "$(ref.max_instances.value)"
+              autoscaling.knative.dev/minScale: "0"
+              run.googleapis.com/timeout: "300s"
+              run.googleapis.com/concurrency: "4"
+          spec:
+            containerConcurrency: 4
+            timeoutSeconds: 300
+            containers:
+            - name: gpu-inference
+              image: gcr.io/$(ref.project_id.value)/$(ref.service_prefix.value)-gpu-inference:latest
+              ports:
+              - containerPort: 8080
+                protocol: TCP
+              resources:
+                limits:
+                  cpu: $(ref.gpu_cpu.value)
+                  memory: $(ref.gpu_memory.value)
+                  nvidia.com/gpu: "1"
+              env:
+              - name: MODEL_BUCKET
+                value: $(ref.models-bucket.name)
+              - name: GPU_ENABLED
+                value: "true"
+    metadata:
+      dependsOn:
+        - enable-run-api
+        - models-bucket
+
+  # Cloud Run Preprocessing Service
+  - name: preprocessing-service
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/$(ref.project_id.value)
+      location: $(ref.region.value)
+      metadata:
+        name: $(ref.service_prefix.value)-preprocess
+        namespace: $(ref.project_id.value)
+        labels:
+          service-type: "preprocessing"
+          component: "ml-pipeline"
+        annotations:
+          run.googleapis.com/ingress: "all"
+      spec:
+        template:
+          metadata:
+            annotations:
+              run.googleapis.com/memory: $(ref.preprocess_memory.value)
+              run.googleapis.com/cpu: "1"
+              autoscaling.knative.dev/maxScale: "50"
+              autoscaling.knative.dev/minScale: "0"
+              run.googleapis.com/timeout: "60s"
+          spec:
+            containerConcurrency: 10
+            timeoutSeconds: 60
+            containers:
+            - name: preprocessing
+              image: gcr.io/$(ref.project_id.value)/$(ref.service_prefix.value)-preprocess:latest
+              ports:
+              - containerPort: 8080
+                protocol: TCP
+              resources:
+                limits:
+                  cpu: "1"
+                  memory: $(ref.preprocess_memory.value)
+              env:
+              - name: INPUT_BUCKET
+                value: $(ref.input-bucket.name)
+    metadata:
+      dependsOn:
+        - enable-run-api
+        - input-bucket
+
+  # Cloud Run Postprocessing Service
+  - name: postprocessing-service
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      parent: namespaces/$(ref.project_id.value)
+      location: $(ref.region.value)
+      metadata:
+        name: $(ref.service_prefix.value)-postprocess
+        namespace: $(ref.project_id.value)
+        labels:
+          service-type: "postprocessing"
+          component: "ml-pipeline"
+        annotations:
+          run.googleapis.com/ingress: "all"
+      spec:
+        template:
+          metadata:
+            annotations:
+              run.googleapis.com/memory: $(ref.postprocess_memory.value)
+              run.googleapis.com/cpu: "1"
+              autoscaling.knative.dev/maxScale: "50"
+              autoscaling.knative.dev/minScale: "0"
+              run.googleapis.com/timeout: "60s"
+          spec:
+            containerConcurrency: 10
+            timeoutSeconds: 60
+            containers:
+            - name: postprocessing
+              image: gcr.io/$(ref.project_id.value)/$(ref.service_prefix.value)-postprocess:latest
+              ports:
+              - containerPort: 8080
+                protocol: TCP
+              resources:
+                limits:
+                  cpu: "1"
+                  memory: $(ref.postprocess_memory.value)
+              env:
+              - name: OUTPUT_BUCKET
+                value: $(ref.output-bucket.name)
+    metadata:
+      dependsOn:
+        - enable-run-api
+        - output-bucket
+
+  # IAM Policy for Cloud Run services (allow unauthenticated access)
+  - name: gpu-inference-iam-policy
+    type: gcp-types/run-v1:projects.locations.services.setIamPolicy
+    properties:
+      resource: projects/$(ref.project_id.value)/locations/$(ref.region.value)/services/$(ref.service_prefix.value)-gpu-inference
+      policy:
+        bindings:
+        - role: roles/run.invoker
+          members:
+          - allUsers
+    metadata:
+      dependsOn:
+        - gpu-inference-service
+
+  - name: preprocessing-iam-policy
+    type: gcp-types/run-v1:projects.locations.services.setIamPolicy
+    properties:
+      resource: projects/$(ref.project_id.value)/locations/$(ref.region.value)/services/$(ref.service_prefix.value)-preprocess
+      policy:
+        bindings:
+        - role: roles/run.invoker
+          members:
+          - allUsers
+    metadata:
+      dependsOn:
+        - preprocessing-service
+
+  - name: postprocessing-iam-policy
+    type: gcp-types/run-v1:projects.locations.services.setIamPolicy
+    properties:
+      resource: projects/$(ref.project_id.value)/locations/$(ref.region.value)/services/$(ref.service_prefix.value)-postprocess
+      policy:
+        bindings:
+        - role: roles/run.invoker
+          members:
+          - allUsers
+    metadata:
+      dependsOn:
+        - postprocessing-service
+
+  # Cloud Workflows Definition
+  - name: ml-pipeline-workflow
+    type: gcp-types/workflows-v1:projects.locations.workflows
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      workflowId: $(ref.service_prefix.value)-ml-pipeline
+      workflow:
+        description: "Serverless GPU ML pipeline orchestration"
+        labels:
+          component: "ml-pipeline"
+          workflow-type: "gpu-inference"
+        sourceContents: |
+          main:
+            params: [input]
+            steps:
+              - init:
+                  assign:
+                    - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+                    - input_bucket: "$(ref.input-bucket.name)"
+                    - output_bucket: "$(ref.output-bucket.name)"
+                    - input_file: ${input.input_file}
+                    - preprocess_url: "$(ref.preprocessing-service.status.url)"
+                    - inference_url: "$(ref.gpu-inference-service.status.url)"
+                    - postprocess_url: "$(ref.postprocessing-service.status.url)"
+              
+              - log_start:
+                  call: sys.log
+                  args:
+                    text: ${"Starting ML pipeline for file: " + input_file}
+                    severity: INFO
+              
+              - preprocess_step:
+                  call: http.post
+                  args:
+                    url: ${preprocess_url + "/preprocess"}
+                    headers:
+                      Content-Type: "application/json"
+                    body:
+                      input_bucket: ${input_bucket}
+                      input_file: ${input_file}
+                    timeout: 60
+                  result: preprocess_result
+              
+              - check_preprocess:
+                  switch:
+                    - condition: ${preprocess_result.body.status == "success"}
+                      next: inference_step
+                  next: preprocess_error
+              
+              - inference_step:
+                  call: http.post
+                  args:
+                    url: ${inference_url + "/predict"}
+                    headers:
+                      Content-Type: "application/json"
+                    body:
+                      text: ${preprocess_result.body.processed_data.text}
+                    timeout: 300
+                  result: inference_result
+              
+              - check_inference:
+                  switch:
+                    - condition: ${inference_result.status == 200}
+                      next: postprocess_step
+                  next: inference_error
+              
+              - postprocess_step:
+                  call: http.post
+                  args:
+                    url: ${postprocess_url + "/postprocess"}
+                    headers:
+                      Content-Type: "application/json"
+                    body:
+                      prediction_result: ${inference_result.body}
+                      input_metadata:
+                        input_file: ${input_file}
+                        input_bucket: ${input_bucket}
+                      output_bucket: ${output_bucket}
+                    timeout: 60
+                  result: postprocess_result
+              
+              - log_success:
+                  call: sys.log
+                  args:
+                    text: ${"Pipeline completed successfully. Output: " + postprocess_result.body.output_file}
+                    severity: INFO
+              
+              - return_result:
+                  return:
+                    status: "success"
+                    input_file: ${input_file}
+                    output_file: ${postprocess_result.body.output_file}
+                    output_bucket: ${output_bucket}
+                    summary: ${postprocess_result.body.summary}
+                    execution_time: ${time.format(sys.now())}
+              
+              - preprocess_error:
+                  call: sys.log
+                  args:
+                    text: ${"Preprocessing failed: " + string(preprocess_result.body)}
+                    severity: ERROR
+                  next: error_return
+              
+              - inference_error:
+                  call: sys.log
+                  args:
+                    text: ${"Inference failed: " + string(inference_result)}
+                    severity: ERROR
+                  next: error_return
+              
+              - error_return:
+                  return:
+                    status: "error"
+                    input_file: ${input_file}
+                    error: "Pipeline execution failed"
+                    execution_time: ${time.format(sys.now())}
+    metadata:
+      dependsOn:
+        - enable-workflows-api
+        - gpu-inference-service
+        - preprocessing-service
+        - postprocessing-service
+        - input-bucket
+        - output-bucket
+
+  # Eventarc Trigger for Cloud Storage
+  - name: storage-trigger
+    type: gcp-types/eventarc-v1:projects.locations.triggers
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      triggerId: $(ref.service_prefix.value)-storage-trigger
+      trigger:
+        name: $(ref.service_prefix.value)-storage-trigger
+        eventFilters:
+        - attribute: type
+          value: google.cloud.storage.object.v1.finalized
+        - attribute: bucket
+          value: $(ref.input-bucket.name)
+        destination:
+          workflow: $(ref.ml-pipeline-workflow.name)
+        serviceAccount: $(ref.pipeline-service-account.email)
+        labels:
+          component: "ml-pipeline"
+          trigger-type: "storage-event"
+    metadata:
+      dependsOn:
+        - enable-eventarc-api
+        - ml-pipeline-workflow
+        - pipeline-service-account
+        - input-bucket
+        - workflows-invoker-binding
+        - eventarc-receiver-binding
+
+# Define outputs for verification and integration
+outputs:
+  - name: project_id
+    value: $(ref.project_id.value)
+    description: "Google Cloud Project ID"
+  
+  - name: region
+    value: $(ref.region.value)
+    description: "Deployment region"
+  
+  - name: input_bucket_name
+    value: $(ref.input-bucket.name)
+    description: "Input data bucket name"
+  
+  - name: models_bucket_name
+    value: $(ref.models-bucket.name)
+    description: "Models storage bucket name"
+  
+  - name: output_bucket_name
+    value: $(ref.output-bucket.name)
+    description: "Output results bucket name"
+  
+  - name: gpu_inference_service_url
+    value: $(ref.gpu-inference-service.status.url)
+    description: "GPU inference service URL"
+  
+  - name: preprocessing_service_url
+    value: $(ref.preprocessing-service.status.url)
+    description: "Preprocessing service URL"
+  
+  - name: postprocessing_service_url
+    value: $(ref.postprocessing-service.status.url)
+    description: "Postprocessing service URL"
+  
+  - name: workflow_name
+    value: $(ref.ml-pipeline-workflow.name)
+    description: "ML pipeline workflow name"
+  
+  - name: trigger_name
+    value: $(ref.storage-trigger.name)
+    description: "Storage event trigger name"
+  
+  - name: service_account_email
+    value: $(ref.pipeline-service-account.email)
+    description: "Pipeline service account email"
+
+# Deployment configuration
+deployment:
+  preview: true
+  location: $(ref.region.value)
+  
+  # Resource creation timeouts
+  timeouts:
+    create: 30m
+    update: 20m
+    delete: 15m
+  
+  # Deployment labels for tracking
+  labels:
+    deployment-type: "infrastructure-manager"
+    recipe-name: "serverless-gpu-computing-pipelines"
+    created-by: "infrastructure-manager"
+    environment: "production"

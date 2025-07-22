@@ -1,0 +1,941 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure as Code for Governing Costs with Strategic Resource Tagging - Complete solution with AWS Config, Lambda remediation, and SNS notifications'
+
+# ====================================================================
+# PARAMETERS
+# ====================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'cost-mgmt-tagging'
+    Description: 'Name of the project for resource naming'
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '^[a-z0-9-]*$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for tag compliance notifications'
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  EnvironmentType:
+    Type: String
+    Default: 'Development'
+    AllowedValues:
+      - 'Production'
+      - 'Staging'
+      - 'Development'
+      - 'Testing'
+    Description: 'Environment type for this deployment'
+
+  CostCenter:
+    Type: String
+    Default: 'Engineering'
+    AllowedValues:
+      - 'Engineering'
+      - 'Marketing'
+      - 'Sales'
+      - 'Finance'
+      - 'Operations'
+    Description: 'Cost center for this deployment'
+
+  EnableConfigRecorder:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Whether to enable AWS Config recorder (set to false if already enabled in the region)'
+
+  EnableAutomaticRemediation:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Whether to enable automatic tag remediation via Lambda'
+
+# ====================================================================
+# METADATA
+# ====================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Project Configuration'
+        Parameters:
+          - ProjectName
+          - EnvironmentType
+          - CostCenter
+      - Label:
+          default: 'Notification Settings'
+        Parameters:
+          - NotificationEmail
+      - Label:
+          default: 'Feature Toggles'
+        Parameters:
+          - EnableConfigRecorder
+          - EnableAutomaticRemediation
+    ParameterLabels:
+      ProjectName:
+        default: 'Project Name'
+      NotificationEmail:
+        default: 'Notification Email'
+      EnvironmentType:
+        default: 'Environment Type'
+      CostCenter:
+        default: 'Cost Center'
+      EnableConfigRecorder:
+        default: 'Enable Config Recorder'
+      EnableAutomaticRemediation:
+        default: 'Enable Automatic Remediation'
+
+# ====================================================================
+# CONDITIONS
+# ====================================================================
+Conditions:
+  ShouldCreateConfigRecorder: !Equals [!Ref EnableConfigRecorder, 'true']
+  ShouldEnableRemediation: !Equals [!Ref EnableAutomaticRemediation, 'true']
+  IsProduction: !Equals [!Ref EnvironmentType, 'Production']
+
+# ====================================================================
+# RESOURCES
+# ====================================================================
+Resources:
+
+  # ----------------------------------------------------------------
+  # S3 BUCKET FOR AWS CONFIG
+  # ----------------------------------------------------------------
+  ConfigBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub 'aws-config-${ProjectName}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: 'Enabled'
+      LifecycleConfiguration:
+        Rules:
+          - Id: 'ConfigDataRetention'
+            Status: 'Enabled'
+            ExpirationInDays: !If [IsProduction, 2555, 365] # 7 years for production, 1 year for others
+            NoncurrentVersionExpirationInDays: 30
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref ConfigLogGroup
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-config-bucket'
+        - Key: 'CostCenter'
+          Value: !Ref CostCenter
+        - Key: 'Environment'
+          Value: !Ref EnvironmentType
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Owner'
+          Value: 'devops@company.com'
+        - Key: 'Application'
+          Value: 'cost-management'
+        - Key: 'Backup'
+          Value: 'true'
+
+  # S3 Bucket Policy for AWS Config
+  ConfigBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref ConfigBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: 'AWSConfigBucketPermissionsCheck'
+            Effect: 'Allow'
+            Principal:
+              Service: 'config.amazonaws.com'
+            Action: 's3:GetBucketAcl'
+            Resource: !GetAtt ConfigBucket.Arn
+            Condition:
+              StringEquals:
+                'AWS:SourceAccount': !Ref 'AWS::AccountId'
+          - Sid: 'AWSConfigBucketExistenceCheck'
+            Effect: 'Allow'
+            Principal:
+              Service: 'config.amazonaws.com'
+            Action: 's3:ListBucket'
+            Resource: !GetAtt ConfigBucket.Arn
+            Condition:
+              StringEquals:
+                'AWS:SourceAccount': !Ref 'AWS::AccountId'
+          - Sid: 'AWSConfigBucketDelivery'
+            Effect: 'Allow'
+            Principal:
+              Service: 'config.amazonaws.com'
+            Action: 's3:PutObject'
+            Resource: !Sub '${ConfigBucket.Arn}/AWSLogs/${AWS::AccountId}/Config/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': 'bucket-owner-full-control'
+                'AWS:SourceAccount': !Ref 'AWS::AccountId'
+
+  # ----------------------------------------------------------------
+  # CLOUDWATCH LOG GROUP FOR CONFIG
+  # ----------------------------------------------------------------
+  ConfigLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/config/${ProjectName}'
+      RetentionInDays: !If [IsProduction, 365, 90]
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-config-logs'
+        - Key: 'CostCenter'
+          Value: !Ref CostCenter
+        - Key: 'Environment'
+          Value: !Ref EnvironmentType
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Owner'
+          Value: 'devops@company.com'
+
+  # ----------------------------------------------------------------
+  # SNS TOPIC FOR TAG COMPLIANCE NOTIFICATIONS
+  # ----------------------------------------------------------------
+  TagComplianceTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      TopicName: !Sub '${ProjectName}-tag-compliance'
+      DisplayName: 'Tag Compliance Notifications'
+      KmsMasterKeyId: 'alias/aws/sns'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-tag-compliance-topic'
+        - Key: 'CostCenter'
+          Value: !Ref CostCenter
+        - Key: 'Environment'
+          Value: !Ref EnvironmentType
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Owner'
+          Value: 'devops@company.com'
+
+  # SNS Subscription for Email Notifications
+  TagComplianceSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      TopicArn: !Ref TagComplianceTopic
+      Protocol: 'email'
+      Endpoint: !Ref NotificationEmail
+
+  # ----------------------------------------------------------------
+  # IAM ROLE FOR AWS CONFIG
+  # ----------------------------------------------------------------
+  ConfigServiceRole:
+    Type: 'AWS::IAM::Role'
+    Condition: ShouldCreateConfigRecorder
+    Properties:
+      RoleName: !Sub '${ProjectName}-config-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'config.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/ConfigRole'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-config-service-role'
+        - Key: 'CostCenter'
+          Value: !Ref CostCenter
+        - Key: 'Environment'
+          Value: !Ref EnvironmentType
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Owner'
+          Value: 'devops@company.com'
+
+  # ----------------------------------------------------------------
+  # AWS CONFIG DELIVERY CHANNEL
+  # ----------------------------------------------------------------
+  ConfigDeliveryChannel:
+    Type: 'AWS::Config::DeliveryChannel'
+    Condition: ShouldCreateConfigRecorder
+    Properties:
+      Name: !Sub '${ProjectName}-delivery-channel'
+      S3BucketName: !Ref ConfigBucket
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: 'TwentyFour_Hours'
+
+  # ----------------------------------------------------------------
+  # AWS CONFIG CONFIGURATION RECORDER
+  # ----------------------------------------------------------------
+  ConfigRecorder:
+    Type: 'AWS::Config::ConfigurationRecorder'
+    Condition: ShouldCreateConfigRecorder
+    DependsOn: ConfigDeliveryChannel
+    Properties:
+      Name: !Sub '${ProjectName}-recorder'
+      RoleARN: !GetAtt ConfigServiceRole.Arn
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+        RecordingModeOverrides: []
+
+  # ----------------------------------------------------------------
+  # CONFIG RULES FOR TAG COMPLIANCE
+  # ----------------------------------------------------------------
+  
+  # Required CostCenter Tag Rule
+  RequiredTagCostCenterRule:
+    Type: 'AWS::Config::ConfigRule'
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ProjectName}-required-tag-costcenter'
+      Description: 'Checks if resources have required CostCenter tag with valid values'
+      Source:
+        Owner: 'AWS'
+        SourceIdentifier: 'REQUIRED_TAGS'
+      InputParameters: !Sub |
+        {
+          "tag1Key": "CostCenter",
+          "tag1Value": "Engineering,Marketing,Sales,Finance,Operations"
+        }
+
+  # Required Environment Tag Rule
+  RequiredTagEnvironmentRule:
+    Type: 'AWS::Config::ConfigRule'
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ProjectName}-required-tag-environment'
+      Description: 'Checks if resources have required Environment tag with valid values'
+      Source:
+        Owner: 'AWS'
+        SourceIdentifier: 'REQUIRED_TAGS'
+      InputParameters: !Sub |
+        {
+          "tag1Key": "Environment",
+          "tag1Value": "Production,Staging,Development,Testing"
+        }
+
+  # Required Project Tag Rule
+  RequiredTagProjectRule:
+    Type: 'AWS::Config::ConfigRule'
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ProjectName}-required-tag-project'
+      Description: 'Checks if resources have required Project tag'
+      Source:
+        Owner: 'AWS'
+        SourceIdentifier: 'REQUIRED_TAGS'
+      InputParameters: !Sub |
+        {
+          "tag1Key": "Project"
+        }
+
+  # Required Owner Tag Rule
+  RequiredTagOwnerRule:
+    Type: 'AWS::Config::ConfigRule'
+    DependsOn: ConfigRecorder
+    Properties:
+      ConfigRuleName: !Sub '${ProjectName}-required-tag-owner'
+      Description: 'Checks if resources have required Owner tag'
+      Source:
+        Owner: 'AWS'
+        SourceIdentifier: 'REQUIRED_TAGS'
+      InputParameters: !Sub |
+        {
+          "tag1Key": "Owner"
+        }
+
+  # ----------------------------------------------------------------
+  # IAM ROLE FOR LAMBDA TAG REMEDIATION
+  # ----------------------------------------------------------------
+  TagRemediationLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Condition: ShouldEnableRemediation
+    Properties:
+      RoleName: !Sub '${ProjectName}-tag-remediation-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: 'TagRemediationPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'ec2:CreateTags'
+                  - 'ec2:DescribeTags'
+                  - 'ec2:DescribeInstances'
+                  - 's3:GetBucketTagging'
+                  - 's3:PutBucketTagging'
+                  - 'rds:AddTagsToResource'
+                  - 'rds:ListTagsForResource'
+                  - 'rds:DescribeDBInstances'
+                  - 'lambda:TagResource'
+                  - 'lambda:UntagResource'
+                  - 'lambda:ListTags'
+                Resource: '*'
+              - Effect: 'Allow'
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref TagComplianceTopic
+              - Effect: 'Allow'
+                Action:
+                  - 'config:GetConfigurationItem'
+                  - 'config:GetComplianceDetailsByConfigRule'
+                Resource: '*'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-tag-remediation-lambda-role'
+        - Key: 'CostCenter'
+          Value: !Ref CostCenter
+        - Key: 'Environment'
+          Value: !Ref EnvironmentType
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Owner'
+          Value: 'devops@company.com'
+
+  # ----------------------------------------------------------------
+  # CLOUDWATCH LOG GROUP FOR LAMBDA
+  # ----------------------------------------------------------------
+  TagRemediationLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Condition: ShouldEnableRemediation
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-tag-remediation'
+      RetentionInDays: !If [IsProduction, 30, 14]
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-tag-remediation-logs'
+        - Key: 'CostCenter'
+          Value: !Ref CostCenter
+        - Key: 'Environment'
+          Value: !Ref EnvironmentType
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Owner'
+          Value: 'devops@company.com'
+
+  # ----------------------------------------------------------------
+  # LAMBDA FUNCTION FOR TAG REMEDIATION
+  # ----------------------------------------------------------------
+  TagRemediationLambda:
+    Type: 'AWS::Lambda::Function'
+    Condition: ShouldEnableRemediation
+    DependsOn: TagRemediationLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-tag-remediation'
+      Runtime: 'python3.9'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt TagRemediationLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Description: 'Automated tag remediation for cost management compliance'
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref TagComplianceTopic
+          PROJECT_NAME: !Ref ProjectName
+          DEFAULT_COST_CENTER: !Ref CostCenter
+          DEFAULT_ENVIRONMENT: !Ref EnvironmentType
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          import logging
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              """
+              Automated tag remediation function for cost management compliance
+              """
+              logger.info(f"Received event: {json.dumps(event, default=str)}")
+              
+              # Initialize AWS clients
+              ec2 = boto3.client('ec2')
+              s3 = boto3.client('s3')
+              rds = boto3.client('rds')
+              sns = boto3.client('sns')
+              
+              sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+              project_name = os.environ.get('PROJECT_NAME', 'cost-mgmt')
+              
+              try:
+                  # Parse Config rule evaluation result from event
+                  if 'configurationItem' in event:
+                      config_item = event['configurationItem']
+                  elif 'Records' in event:
+                      # Handle S3/SNS trigger format
+                      return handle_sns_trigger(event, context)
+                  else:
+                      # Handle Config Rules evaluation result
+                      return handle_config_evaluation(event, context)
+                  
+                  resource_type = config_item['resourceType']
+                  resource_id = config_item['resourceId']
+                  
+                  # Apply default tags based on resource type and current tags
+                  default_tags = get_default_tags(config_item)
+                  
+                  if not default_tags:
+                      logger.info(f"No missing required tags found for {resource_type} {resource_id}")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps(f'No remediation needed for {resource_type} {resource_id}')
+                      }
+                  
+                  # Apply tags based on resource type
+                  if resource_type == 'AWS::EC2::Instance':
+                      remediate_ec2_instance(ec2, resource_id, default_tags)
+                  elif resource_type == 'AWS::S3::Bucket':
+                      remediate_s3_bucket(s3, resource_id, default_tags)
+                  elif resource_type == 'AWS::RDS::DBInstance':
+                      remediate_rds_instance(rds, resource_id, default_tags)
+                  else:
+                      logger.warning(f"Unsupported resource type for auto-remediation: {resource_type}")
+                      send_manual_notification(sns, sns_topic_arn, resource_type, resource_id, default_tags)
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps(f'Manual remediation required for {resource_type} {resource_id}')
+                      }
+                  
+                  # Send notification about successful remediation
+                  send_notification(sns, sns_topic_arn, resource_type, resource_id, default_tags, success=True)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(f'Successfully remediated {resource_type} {resource_id}')
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing event: {str(e)}")
+                  # Send error notification
+                  send_notification(sns, sns_topic_arn, "Unknown", "Unknown", [], success=False, error=str(e))
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+
+          def handle_sns_trigger(event, context):
+              """Handle SNS triggered events"""
+              logger.info("Processing SNS trigger - manual review notification")
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('SNS trigger processed')
+              }
+
+          def handle_config_evaluation(event, context):
+              """Handle Config Rules evaluation events"""
+              logger.info("Processing Config evaluation result")
+              # This would contain logic to parse Config evaluation results
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Config evaluation processed')
+              }
+
+          def get_default_tags(config_item):
+              """Generate default tags for missing required tags"""
+              tags = []
+              current_tags = config_item.get('tags', {})
+              
+              required_tags = {
+                  'CostCenter': os.environ.get('DEFAULT_COST_CENTER', 'Unassigned'),
+                  'Environment': os.environ.get('DEFAULT_ENVIRONMENT', 'Development'),
+                  'Project': os.environ.get('PROJECT_NAME', 'UntaggedResource'),
+                  'Owner': 'unknown@company.com'
+              }
+              
+              # Check for missing required tags
+              for tag_key, default_value in required_tags.items():
+                  if not has_tag(current_tags, tag_key):
+                      tags.append({'Key': tag_key, 'Value': default_value})
+              
+              # Add compliance tracking tag
+              if tags:  # Only add if we're applying other tags
+                  tags.append({
+                      'Key': 'AutoTagged',
+                      'Value': f"true-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+                  })
+              
+              return tags
+
+          def has_tag(tags_dict, tag_key):
+              """Check if resource already has specified tag"""
+              return tag_key in tags_dict and tags_dict[tag_key] is not None
+
+          def remediate_ec2_instance(ec2, instance_id, tags):
+              """Apply tags to EC2 instance"""
+              if tags:
+                  ec2.create_tags(Resources=[instance_id], Tags=tags)
+                  logger.info(f"Applied {len(tags)} tags to EC2 instance {instance_id}")
+
+          def remediate_s3_bucket(s3, bucket_name, tags):
+              """Apply tags to S3 bucket"""
+              if tags:
+                  try:
+                      # Get existing tags
+                      existing_tags = []
+                      try:
+                          response = s3.get_bucket_tagging(Bucket=bucket_name)
+                          existing_tags = response.get('TagSet', [])
+                      except s3.exceptions.ClientError as e:
+                          if e.response['Error']['Code'] != 'NoSuchTagSet':
+                              raise
+                      
+                      # Merge with new tags (new tags take precedence)
+                      tag_dict = {tag['Key']: tag['Value'] for tag in existing_tags}
+                      for tag in tags:
+                          tag_dict[tag['Key']] = tag['Value']
+                      
+                      # Convert back to TagSet format
+                      tag_set = [{'Key': k, 'Value': v} for k, v in tag_dict.items()]
+                      
+                      s3.put_bucket_tagging(
+                          Bucket=bucket_name,
+                          Tagging={'TagSet': tag_set}
+                      )
+                      logger.info(f"Applied {len(tags)} tags to S3 bucket {bucket_name}")
+                  except Exception as e:
+                      logger.error(f"Failed to tag S3 bucket {bucket_name}: {str(e)}")
+                      raise
+
+          def remediate_rds_instance(rds, db_instance_id, tags):
+              """Apply tags to RDS instance"""
+              if tags:
+                  try:
+                      # Get the RDS instance ARN
+                      response = rds.describe_db_instances(DBInstanceIdentifier=db_instance_id)
+                      db_arn = response['DBInstances'][0]['DBInstanceArn']
+                      
+                      rds.add_tags_to_resource(
+                          ResourceName=db_arn,
+                          Tags=tags
+                      )
+                      logger.info(f"Applied {len(tags)} tags to RDS instance {db_instance_id}")
+                  except Exception as e:
+                      logger.error(f"Failed to tag RDS instance {db_instance_id}: {str(e)}")
+                      raise
+
+          def send_notification(sns, topic_arn, resource_type, resource_id, tags, success=True, error=None):
+              """Send SNS notification about tag remediation"""
+              if success:
+                  subject = f'Auto-Tag Applied: {resource_type}'
+                  message = f"""
+          Tag Remediation Notification - SUCCESS
+          
+          Resource Type: {resource_type}
+          Resource ID: {resource_id}
+          Auto-Applied Tags: {json.dumps(tags, indent=2)}
+          Timestamp: {datetime.now().isoformat()}
+          
+          The resource has been automatically tagged with default values.
+          Please review and update tags as needed in the AWS Console.
+          """
+              else:
+                  subject = f'Tag Remediation Failed: {resource_type}'
+                  message = f"""
+          Tag Remediation Notification - FAILURE
+          
+          Resource Type: {resource_type}
+          Resource ID: {resource_id}
+          Error: {error}
+          Timestamp: {datetime.now().isoformat()}
+          
+          Automatic tag remediation failed. Manual intervention required.
+          """
+              
+              try:
+                  sns.publish(
+                      TopicArn=topic_arn,
+                      Subject=subject,
+                      Message=message
+                  )
+                  logger.info(f"Sent notification for {resource_type} {resource_id}")
+              except Exception as e:
+                  logger.error(f"Failed to send notification: {str(e)}")
+
+          def send_manual_notification(sns, topic_arn, resource_type, resource_id, missing_tags):
+              """Send notification for resources requiring manual tagging"""
+              subject = f'Manual Tag Review Required: {resource_type}'
+              message = f"""
+          Tag Compliance Notification - MANUAL REVIEW REQUIRED
+          
+          Resource Type: {resource_type}
+          Resource ID: {resource_id}
+          Missing Required Tags: {json.dumps(missing_tags, indent=2)}
+          Timestamp: {datetime.now().isoformat()}
+          
+          This resource type is not supported for automatic remediation.
+          Please manually apply the required tags using the AWS Console or CLI.
+          """
+              
+              try:
+                  sns.publish(
+                      TopicArn=topic_arn,
+                      Subject=subject,
+                      Message=message
+                  )
+                  logger.info(f"Sent manual review notification for {resource_type} {resource_id}")
+              except Exception as e:
+                  logger.error(f"Failed to send manual notification: {str(e)}")
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-tag-remediation-lambda'
+        - Key: 'CostCenter'
+          Value: !Ref CostCenter
+        - Key: 'Environment'
+          Value: !Ref EnvironmentType
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Owner'
+          Value: 'devops@company.com'
+        - Key: 'Application'
+          Value: 'cost-management'
+
+  # ----------------------------------------------------------------
+  # RESOURCE GROUPS FOR TAG-BASED ORGANIZATION
+  # ----------------------------------------------------------------
+  
+  # Resource Group for Production Environment
+  ProductionResourceGroup:
+    Type: 'AWS::ResourceGroups::Group'
+    Properties:
+      Name: !Sub '${ProjectName}-production-environment'
+      Description: 'Resources tagged with Environment=Production for cost tracking'
+      ResourceQuery:
+        Type: 'TAG_FILTERS_1_0'
+        Query: !Sub |
+          {
+            "ResourceTypeFilters": ["AWS::AllSupported"],
+            "TagFilters": [
+              {
+                "Key": "Environment",
+                "Values": ["Production"]
+              }
+            ]
+          }
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-production-resource-group'
+        - Key: 'CostCenter'
+          Value: !Ref CostCenter
+        - Key: 'Environment'
+          Value: !Ref EnvironmentType
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Owner'
+          Value: 'devops@company.com'
+        - Key: 'Purpose'
+          Value: 'CostAllocation'
+
+  # Resource Group for Current Cost Center
+  CostCenterResourceGroup:
+    Type: 'AWS::ResourceGroups::Group'
+    Properties:
+      Name: !Sub '${ProjectName}-${CostCenter}-costcenter'
+      Description: !Sub 'Resources tagged with CostCenter=${CostCenter} for cost tracking'
+      ResourceQuery:
+        Type: 'TAG_FILTERS_1_0'
+        Query: !Sub |
+          {
+            "ResourceTypeFilters": ["AWS::AllSupported"],
+            "TagFilters": [
+              {
+                "Key": "CostCenter",
+                "Values": ["${CostCenter}"]
+              }
+            ]
+          }
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-${CostCenter}-resource-group'
+        - Key: 'CostCenter'
+          Value: !Ref CostCenter
+        - Key: 'Environment'
+          Value: !Ref EnvironmentType
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Owner'
+          Value: 'devops@company.com'
+        - Key: 'Purpose'
+          Value: 'CostAllocation'
+
+  # ----------------------------------------------------------------
+  # CLOUDWATCH DASHBOARD FOR TAG COMPLIANCE MONITORING
+  # ----------------------------------------------------------------
+  TagComplianceDashboard:
+    Type: 'AWS::CloudWatch::Dashboard'
+    Properties:
+      DashboardName: !Sub '${ProjectName}-tag-compliance'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Config", "ComplianceByConfigRule", "ConfigRuleName", "${ProjectName}-required-tag-costcenter", "ComplianceType", "COMPLIANT" ],
+                  [ "...", "NON_COMPLIANT" ],
+                  [ "...", "${ProjectName}-required-tag-environment", ".", "COMPLIANT" ],
+                  [ "...", "NON_COMPLIANT" ],
+                  [ "...", "${ProjectName}-required-tag-project", ".", "COMPLIANT" ],
+                  [ "...", "NON_COMPLIANT" ],
+                  [ "...", "${ProjectName}-required-tag-owner", ".", "COMPLIANT" ],
+                  [ "...", "NON_COMPLIANT" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Tag Compliance Status",
+                "period": 300,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${ProjectName}-tag-remediation" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Tag Remediation Lambda Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${ProjectName}-tag-remediation' | fields @timestamp, @message\n| filter @message like /Applied.*tags/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Tag Remediation Activities",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+# ====================================================================
+# OUTPUTS
+# ====================================================================
+Outputs:
+  ConfigBucketName:
+    Description: 'S3 bucket name for AWS Config'
+    Value: !Ref ConfigBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigBucket'
+
+  ConfigBucketArn:
+    Description: 'S3 bucket ARN for AWS Config'
+    Value: !GetAtt ConfigBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigBucketArn'
+
+  SNSTopicArn:
+    Description: 'SNS topic ARN for tag compliance notifications'
+    Value: !Ref TagComplianceTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopic'
+
+  ConfigServiceRoleArn:
+    Condition: ShouldCreateConfigRecorder
+    Description: 'IAM role ARN for AWS Config service'
+    Value: !GetAtt ConfigServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigRole'
+
+  TagRemediationLambdaArn:
+    Condition: ShouldEnableRemediation
+    Description: 'Lambda function ARN for tag remediation'
+    Value: !GetAtt TagRemediationLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
+
+  TagRemediationLambdaName:
+    Condition: ShouldEnableRemediation
+    Description: 'Lambda function name for tag remediation'
+    Value: !Ref TagRemediationLambda
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaName'
+
+  ProductionResourceGroupArn:
+    Description: 'Resource Group ARN for Production environment resources'
+    Value: !GetAtt ProductionResourceGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ProductionResourceGroup'
+
+  CostCenterResourceGroupArn:
+    Description: 'Resource Group ARN for current cost center resources'
+    Value: !GetAtt CostCenterResourceGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CostCenterResourceGroup'
+
+  CloudWatchDashboardURL:
+    Description: 'CloudWatch Dashboard URL for tag compliance monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-tag-compliance'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  ConfigRuleNames:
+    Description: 'List of created Config rule names for tag compliance'
+    Value: !Sub '${ProjectName}-required-tag-costcenter,${ProjectName}-required-tag-environment,${ProjectName}-required-tag-project,${ProjectName}-required-tag-owner'
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigRules'
+
+  TagTaxonomy:
+    Description: 'Recommended tag taxonomy for cost management'
+    Value: 'Required: CostCenter,Environment,Project,Owner | Optional: Application,Backup'
+    Export:
+      Name: !Sub '${AWS::StackName}-TagTaxonomy'
+
+  CostAllocationTagsToActivate:
+    Description: 'Cost allocation tags to activate in AWS Billing Console'
+    Value: 'CostCenter,Environment,Project,Owner,Application'
+    Export:
+      Name: !Sub '${AWS::StackName}-CostAllocationTags'
+
+  NextSteps:
+    Description: 'Next steps after deployment'
+    Value: '1. Confirm SNS subscription in email 2. Activate cost allocation tags in Billing Console 3. Review CloudWatch dashboard 4. Test with sample resources'
+    Export:
+      Name: !Sub '${AWS::StackName}-NextSteps'

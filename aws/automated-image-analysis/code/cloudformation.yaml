@@ -1,0 +1,473 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure for Image Analysis Application with Amazon Rekognition - Creates S3 bucket and IAM resources for image analysis workflow'
+
+# ============================================================================
+# PARAMETERS
+# ============================================================================
+Parameters:
+  BucketNamePrefix:
+    Type: String
+    Default: 'rekognition-images'
+    Description: 'Prefix for the S3 bucket name (random suffix will be added)'
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be a valid S3 bucket name prefix (lowercase letters, numbers, and hyphens only)'
+    MinLength: 3
+    MaxLength: 40
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    Description: 'Environment name for resource tagging'
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    ConstraintDescription: 'Must be one of: dev, test, staging, prod'
+
+  ProjectName:
+    Type: String
+    Default: 'image-analysis'
+    Description: 'Project name for resource tagging'
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters and hyphens'
+    MinLength: 3
+    MaxLength: 30
+
+  EnableVersioning:
+    Type: String
+    Default: 'true'
+    Description: 'Enable S3 bucket versioning'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnablePublicAccessBlock:
+    Type: String
+    Default: 'true'
+    Description: 'Enable S3 public access block for security'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  RetentionDays:
+    Type: Number
+    Default: 30
+    Description: 'Number of days to retain analysis results in S3'
+    MinValue: 1
+    MaxValue: 365
+
+# ============================================================================
+# CONDITIONS
+# ============================================================================
+Conditions:
+  EnableS3Versioning: !Equals [!Ref EnableVersioning, 'true']
+  EnableS3PublicAccessBlock: !Equals [!Ref EnablePublicAccessBlock, 'true']
+  IsProductionEnvironment: !Equals [!Ref Environment, 'prod']
+
+# ============================================================================
+# RESOURCES
+# ============================================================================
+Resources:
+  # ----------------------------------------------------------------------------
+  # S3 BUCKET FOR IMAGE STORAGE
+  # ----------------------------------------------------------------------------
+  ImagesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${BucketNamePrefix}-${AWS::AccountId}-${AWS::Region}'
+      # Enable versioning if specified
+      VersioningConfiguration:
+        Status: !If [EnableS3Versioning, Enabled, Suspended]
+      
+      # Lifecycle configuration to manage costs
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transition:
+              StorageClass: GLACIER
+              TransitionInDays: 90
+          - Id: DeleteOldVersions
+            Status: !If [EnableS3Versioning, Enabled, Disabled]
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref RetentionDays
+          - Id: DeleteAnalysisResults
+            Status: Enabled
+            Filter:
+              Prefix: 'results/'
+            Expiration:
+              Days: !Ref RetentionDays
+
+      # Server-side encryption
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+
+      # Notification configuration for future Lambda integration
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: 'images/'
+
+      # CORS configuration for web applications
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+              - HEAD
+            AllowedOrigins:
+              - '*'
+            ExposedHeaders:
+              - ETag
+            MaxAge: 3000
+
+      # Tags
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Image analysis with Amazon Rekognition'
+        - Key: CostCenter
+          Value: !Sub '${ProjectName}-${Environment}'
+
+  # ----------------------------------------------------------------------------
+  # S3 BUCKET PUBLIC ACCESS BLOCK
+  # ----------------------------------------------------------------------------
+  ImagesBucketPublicAccessBlock:
+    Type: AWS::S3::BucketPublicAccessBlock
+    Condition: EnableS3PublicAccessBlock
+    Properties:
+      Bucket: !Ref ImagesBucket
+      BlockPublicAcls: true
+      BlockPublicPolicy: true
+      IgnorePublicAcls: true
+      RestrictPublicBuckets: true
+
+  # ----------------------------------------------------------------------------
+  # IAM ROLE FOR REKOGNITION ACCESS
+  # ----------------------------------------------------------------------------
+  RekognitionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-rekognition-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - rekognition.amazonaws.com
+                - lambda.amazonaws.com  # For future Lambda integration
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Sub '${ProjectName}-${Environment}'
+
+      Path: '/'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'IAM role for Rekognition service access'
+
+  # ----------------------------------------------------------------------------
+  # IAM POLICY FOR S3 AND REKOGNITION ACCESS
+  # ----------------------------------------------------------------------------
+  RekognitionPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-rekognition-policy-${Environment}'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # S3 permissions for reading images and writing results
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+            Resource: 
+              - !Sub '${ImagesBucket}/images/*'
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:PutObjectAcl
+              - s3:DeleteObject
+            Resource:
+              - !Sub '${ImagesBucket}/results/*'
+          - Effect: Allow
+            Action:
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource: !GetAtt ImagesBucket.Arn
+            Condition:
+              StringLike:
+                's3:prefix':
+                  - 'images/*'
+                  - 'results/*'
+          
+          # Rekognition permissions
+          - Effect: Allow
+            Action:
+              - rekognition:DetectLabels
+              - rekognition:DetectText
+              - rekognition:DetectModerationLabels
+              - rekognition:DetectFaces
+              - rekognition:CompareFaces
+              - rekognition:SearchFacesByImage
+            Resource: '*'
+          
+          # CloudWatch Logs permissions for future Lambda integration
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*'
+
+      Roles:
+        - !Ref RekognitionExecutionRole
+
+  # ----------------------------------------------------------------------------
+  # IAM USER FOR CLI ACCESS (DEVELOPMENT)
+  # ----------------------------------------------------------------------------
+  RekognitionUser:
+    Type: AWS::IAM::User
+    Condition: !Not [!Condition IsProductionEnvironment]
+    Properties:
+      UserName: !Sub '${ProjectName}-user-${Environment}'
+      Path: '/'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'IAM user for development and testing'
+
+  # ----------------------------------------------------------------------------
+  # IAM USER POLICY FOR CLI ACCESS
+  # ----------------------------------------------------------------------------
+  RekognitionUserPolicy:
+    Type: AWS::IAM::Policy
+    Condition: !Not [!Condition IsProductionEnvironment]
+    Properties:
+      PolicyName: !Sub '${ProjectName}-user-policy-${Environment}'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # S3 permissions
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource:
+              - !GetAtt ImagesBucket.Arn
+              - !Sub '${ImagesBucket}/*'
+          
+          # Rekognition permissions
+          - Effect: Allow
+            Action:
+              - rekognition:DetectLabels
+              - rekognition:DetectText
+              - rekognition:DetectModerationLabels
+              - rekognition:DetectFaces
+            Resource: '*'
+          
+          # Minimal IAM permissions for role assumption
+          - Effect: Allow
+            Action:
+              - iam:GetRole
+              - sts:AssumeRole
+            Resource: !GetAtt RekognitionExecutionRole.Arn
+
+      Users:
+        - !Ref RekognitionUser
+
+  # ----------------------------------------------------------------------------
+  # CLOUDWATCH LOG GROUP FOR MONITORING
+  # ----------------------------------------------------------------------------
+  RekognitionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/rekognition/${ProjectName}-${Environment}'
+      RetentionInDays: !If [IsProductionEnvironment, 90, 14]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'CloudWatch logs for Rekognition application'
+
+  # ----------------------------------------------------------------------------
+  # CLOUDWATCH METRIC FILTER FOR MONITORING
+  # ----------------------------------------------------------------------------
+  RekognitionErrorMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref RekognitionLogGroup
+      FilterPattern: '[timestamp, request_id, "ERROR"]'
+      MetricTransformations:
+        - MetricNamespace: !Sub '${ProjectName}/${Environment}'
+          MetricName: 'RekognitionErrors'
+          MetricValue: '1'
+          DefaultValue: 0
+
+  # ----------------------------------------------------------------------------
+  # CLOUDWATCH ALARM FOR ERROR MONITORING
+  # ----------------------------------------------------------------------------
+  RekognitionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProductionEnvironment
+    Properties:
+      AlarmName: !Sub '${ProjectName}-rekognition-errors-${Environment}'
+      AlarmDescription: 'Monitor for Rekognition errors'
+      MetricName: 'RekognitionErrors'
+      Namespace: !Sub '${ProjectName}/${Environment}'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref ErrorNotificationTopic
+
+  # ----------------------------------------------------------------------------
+  # SNS TOPIC FOR ERROR NOTIFICATIONS
+  # ----------------------------------------------------------------------------
+  ErrorNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: IsProductionEnvironment
+    Properties:
+      TopicName: !Sub '${ProjectName}-errors-${Environment}'
+      DisplayName: !Sub '${ProjectName} Error Notifications'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Error notifications for Rekognition application'
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+Outputs:
+  BucketName:
+    Description: 'Name of the S3 bucket for storing images'
+    Value: !Ref ImagesBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketName'
+
+  BucketArn:
+    Description: 'ARN of the S3 bucket'
+    Value: !GetAtt ImagesBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketArn'
+
+  BucketDomainName:
+    Description: 'Domain name of the S3 bucket'
+    Value: !GetAtt ImagesBucket.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketDomainName'
+
+  RekognitionRoleArn:
+    Description: 'ARN of the IAM role for Rekognition access'
+    Value: !GetAtt RekognitionExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RekognitionRoleArn'
+
+  RekognitionUserArn:
+    Condition: !Not [!Condition IsProductionEnvironment]
+    Description: 'ARN of the IAM user for development access'
+    Value: !GetAtt RekognitionUser.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RekognitionUserArn'
+
+  LogGroupName:
+    Description: 'Name of the CloudWatch log group'
+    Value: !Ref RekognitionLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupName'
+
+  ErrorNotificationTopicArn:
+    Condition: IsProductionEnvironment
+    Description: 'ARN of the SNS topic for error notifications'
+    Value: !Ref ErrorNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-ErrorNotificationTopicArn'
+
+  # Instructions for CLI usage
+  CLIInstructions:
+    Description: 'Instructions for using the AWS CLI with this infrastructure'
+    Value: !Sub |
+      To use this infrastructure with the AWS CLI:
+      
+      1. Set environment variables:
+         export BUCKET_NAME=${ImagesBucket}
+         export AWS_REGION=${AWS::Region}
+         
+      2. Upload images:
+         aws s3 cp /path/to/images/ s3://${ImagesBucket}/images/ --recursive
+         
+      3. Analyze images:
+         aws rekognition detect-labels --image "{'S3Object':{'Bucket':'${ImagesBucket}','Name':'images/sample.jpg'}}" --region ${AWS::Region}
+         
+      4. For role assumption (production):
+         aws sts assume-role --role-arn ${RekognitionExecutionRole.Arn} --role-session-name rekognition-session --external-id ${ProjectName}-${Environment}
+
+  # Cost estimation
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost breakdown (USD)'
+    Value: !Sub |
+      S3 Storage (first 50TB): ~$0.023 per GB
+      S3 Requests: ~$0.0004 per 1,000 PUT requests, $0.00004 per 1,000 GET requests
+      Rekognition: $1.00 per 1,000 images processed
+      CloudWatch Logs: $0.50 per GB ingested
+      
+      Example: 1,000 images (1GB total) = ~$1.50/month
+      Note: Free tier includes 5,000 images per month for first 12 months
+
+  # Security recommendations
+  SecurityNotes:
+    Description: 'Important security considerations'
+    Value: !Sub |
+      - S3 bucket has public access blocked by default
+      - All data encrypted at rest with AES-256
+      - IAM roles follow least privilege principle
+      - CloudWatch monitoring enabled for error tracking
+      - Consider adding VPC endpoints for enhanced security
+      - Review IAM policies regularly
+      - Enable AWS CloudTrail for audit logging

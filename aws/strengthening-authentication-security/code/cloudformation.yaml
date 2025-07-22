@@ -1,0 +1,559 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Multi-Factor Authentication implementation with AWS IAM and MFA devices - enforces MFA policies, creates monitoring infrastructure, and establishes secure user access patterns'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "User Configuration"
+        Parameters:
+          - TestUserName
+          - InitialPassword
+          - RequirePasswordReset
+      - Label:
+          default: "Policy Configuration"
+        Parameters:
+          - MFAPolicyName
+          - AdminGroupName
+          - AllowSelfMFAManagement
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableCloudTrailMonitoring
+          - EnableCloudWatchDashboard
+          - AlertEmail
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - EnforceHardwareMFA
+          - SessionDuration
+          - AllowConsoleAccess
+    ParameterLabels:
+      TestUserName:
+        default: "Test User Name"
+      InitialPassword:
+        default: "Initial Password"
+      MFAPolicyName:
+        default: "MFA Policy Name"
+      AdminGroupName:
+        default: "Admin Group Name"
+      EnableCloudTrailMonitoring:
+        default: "Enable CloudTrail Monitoring"
+
+Parameters:
+  TestUserName:
+    Type: String
+    Description: 'Name for the test IAM user to demonstrate MFA functionality'
+    Default: 'test-mfa-user'
+    MinLength: 3
+    MaxLength: 64
+    AllowedPattern: '^[a-zA-Z0-9._-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, periods, underscores, and hyphens'
+
+  InitialPassword:
+    Type: String
+    Description: 'Initial password for the test user (must meet AWS password policy)'
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 128
+    AllowedPattern: '^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$'
+    ConstraintDescription: 'Must be at least 8 characters with uppercase, lowercase, number, and special character'
+
+  RequirePasswordReset:
+    Type: String
+    Description: 'Force user to reset password on first login'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  MFAPolicyName:
+    Type: String
+    Description: 'Name for the MFA enforcement policy'
+    Default: 'EnforceMFAPolicy'
+    MinLength: 1
+    MaxLength: 128
+
+  AdminGroupName:
+    Type: String
+    Description: 'Name for the administrative group with MFA requirements'
+    Default: 'MFAAdministrators'
+    MinLength: 1
+    MaxLength: 128
+
+  AllowSelfMFAManagement:
+    Type: String
+    Description: 'Allow users to manage their own MFA devices'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  EnableCloudTrailMonitoring:
+    Type: String
+    Description: 'Create CloudTrail monitoring for MFA events'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  EnableCloudWatchDashboard:
+    Type: String
+    Description: 'Create CloudWatch dashboard for MFA monitoring'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  AlertEmail:
+    Type: String
+    Description: 'Email address for MFA security alerts (optional)'
+    Default: ''
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+  EnforceHardwareMFA:
+    Type: String
+    Description: 'Require hardware MFA devices (more secure but requires physical tokens)'
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+
+  SessionDuration:
+    Type: Number
+    Description: 'Maximum session duration in seconds for MFA-authenticated sessions'
+    Default: 3600
+    MinValue: 900
+    MaxValue: 129600
+
+  AllowConsoleAccess:
+    Type: String
+    Description: 'Allow console access with MFA (disable for API-only access)'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+Conditions:
+  CreatePasswordReset: !Equals [!Ref RequirePasswordReset, 'true']
+  AllowSelfMFA: !Equals [!Ref AllowSelfMFAManagement, 'true']
+  EnableMonitoring: !Equals [!Ref EnableCloudTrailMonitoring, 'true']
+  EnableDashboard: !Equals [!Ref EnableCloudWatchDashboard, 'true']
+  CreateAlerts: !And 
+    - !Not [!Equals [!Ref AlertEmail, '']]
+    - !Condition EnableMonitoring
+  RequireHardwareMFA: !Equals [!Ref EnforceHardwareMFA, 'true']
+  AllowConsole: !Equals [!Ref AllowConsoleAccess, 'true']
+
+Resources:
+  # IAM User for Testing MFA Implementation
+  TestUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Ref TestUserName
+      LoginProfile: !If
+        - AllowConsole
+        - Password: !Ref InitialPassword
+          PasswordResetRequired: !If [CreatePasswordReset, true, false]
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Purpose
+          Value: MFA-Testing
+        - Key: Environment
+          Value: Demonstration
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Administrative Group for MFA Users
+  MFAAdminGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: !Ref AdminGroupName
+
+  # Add Test User to Administrative Group
+  AddUserToGroup:
+    Type: AWS::IAM::UserToGroupAddition
+    Properties:
+      GroupName: !Ref MFAAdminGroup
+      Users:
+        - !Ref TestUser
+
+  # Comprehensive MFA Enforcement Policy
+  MFAEnforcementPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Ref MFAPolicyName
+      Description: 'Comprehensive policy that enforces MFA authentication for all AWS services while allowing users to manage their own MFA devices'
+      Groups:
+        - !Ref MFAAdminGroup
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow viewing account information needed for MFA setup
+          - Sid: AllowViewAccountInfo
+            Effect: Allow
+            Action:
+              - iam:GetAccountPasswordPolicy
+              - iam:ListVirtualMFADevices
+              - iam:GetUser
+              - iam:ListUsers
+              - iam:GetAccountSummary
+            Resource: '*'
+          
+          # Allow users to manage their own passwords
+          - Sid: AllowManageOwnPasswords
+            Effect: Allow
+            Action:
+              - iam:ChangePassword
+              - iam:GetUser
+              - iam:GetLoginProfile
+            Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:user/${aws:username}'
+          
+          # Allow users to manage their own MFA devices
+          - !If
+            - AllowSelfMFA
+            - Sid: AllowManageOwnMFA
+              Effect: Allow
+              Action:
+                - iam:CreateVirtualMFADevice
+                - iam:DeleteVirtualMFADevice
+                - iam:EnableMFADevice
+                - iam:DeactivateMFADevice
+                - iam:ListMFADevices
+                - iam:ResyncMFADevice
+              Resource:
+                - !Sub 'arn:aws:iam::${AWS::AccountId}:mfa/${aws:username}'
+                - !Sub 'arn:aws:iam::${AWS::AccountId}:user/${aws:username}'
+            - !Ref AWS::NoValue
+          
+          # Allow STS operations for temporary credentials
+          - Sid: AllowSTSOperations
+            Effect: Allow
+            Action:
+              - sts:GetSessionToken
+              - sts:GetCallerIdentity
+            Resource: '*'
+          
+          # Deny all operations unless MFA is present
+          - Sid: DenyAllExceptUnlessMFAAuthenticated
+            Effect: Deny
+            NotAction:
+              - iam:CreateVirtualMFADevice
+              - iam:EnableMFADevice
+              - iam:GetUser
+              - iam:ListMFADevices
+              - iam:ListVirtualMFADevices
+              - iam:ResyncMFADevice
+              - sts:GetSessionToken
+              - sts:GetCallerIdentity
+              - iam:ChangePassword
+              - iam:GetAccountPasswordPolicy
+              - iam:GetLoginProfile
+              - iam:GetAccountSummary
+            Resource: '*'
+            Condition:
+              BoolIfExists:
+                aws:MultiFactorAuthPresent: 'false'
+          
+          # Allow full access with MFA present
+          - Sid: AllowFullAccessWithMFA
+            Effect: Allow
+            Action: '*'
+            Resource: '*'
+            Condition:
+              Bool:
+                aws:MultiFactorAuthPresent: 'true'
+              NumericLessThan:
+                aws:TokenIssueTime: !Sub '${SessionDuration}'
+          
+          # Additional hardware MFA requirement if enabled
+          - !If
+            - RequireHardwareMFA
+            - Sid: RequireHardwareMFADevice
+              Effect: Deny
+              Action: '*'
+              Resource: '*'
+              Condition:
+                Bool:
+                  aws:MultiFactorAuthPresent: 'true'
+                StringNotEquals:
+                  aws:RequestedRegion: 
+                    - us-east-1
+                    - us-west-2
+            - !Ref AWS::NoValue
+
+  # CloudTrail for MFA Event Monitoring
+  MFACloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Condition: EnableMonitoring
+    Properties:
+      TrailName: !Sub '${AWS::StackName}-MFA-Audit-Trail'
+      S3BucketName: !Ref CloudTrailLogsBucket
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: 'AWS::IAM::User'
+              Values: ['arn:aws:iam::*:user/*']
+            - Type: 'AWS::IAM::Role'
+              Values: ['arn:aws:iam::*:role/*']
+
+  # S3 Bucket for CloudTrail Logs
+  CloudTrailLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: EnableMonitoring
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-mfa-cloudtrail-logs-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+
+  # S3 Bucket Policy for CloudTrail
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: EnableMonitoring
+    Properties:
+      Bucket: !Ref CloudTrailLogsBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub '${CloudTrailLogsBucket}'
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CloudTrailLogsBucket}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+
+  # CloudWatch Log Group for MFA Events
+  MFALogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableMonitoring
+    Properties:
+      LogGroupName: !Sub '/aws/cloudformation/${AWS::StackName}/mfa-events'
+      RetentionInDays: 30
+
+  # CloudWatch Metric Filter for MFA Login Events
+  MFALoginMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: EnableMonitoring
+    Properties:
+      LogGroupName: !Ref MFALogGroup
+      FilterPattern: '{ ($.eventName = "ConsoleLogin") && ($.responseElements.ConsoleLogin = "Success") && ($.additionalEventData.MFAUsed = "Yes") }'
+      MetricTransformations:
+        - MetricNamespace: 'Custom/MFA'
+          MetricName: 'MFASuccessfulLogins'
+          MetricValue: '1'
+          DefaultValue: 0
+
+  # CloudWatch Metric Filter for Non-MFA Login Events
+  NonMFALoginMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: EnableMonitoring
+    Properties:
+      LogGroupName: !Ref MFALogGroup
+      FilterPattern: '{ ($.eventName = "ConsoleLogin") && ($.responseElements.ConsoleLogin = "Success") && ($.additionalEventData.MFAUsed = "No") }'
+      MetricTransformations:
+        - MetricNamespace: 'Custom/MFA'
+          MetricName: 'NonMFALogins'
+          MetricValue: '1'
+          DefaultValue: 0
+
+  # SNS Topic for MFA Alerts
+  MFAAlertsTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateAlerts
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-MFA-Security-Alerts'
+      DisplayName: 'MFA Security Alerts'
+
+  # SNS Subscription for Email Alerts
+  MFAEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateAlerts
+    Properties:
+      Protocol: email
+      TopicArn: !Ref MFAAlertsTopic
+      Endpoint: !Ref AlertEmail
+
+  # CloudWatch Alarm for Non-MFA Logins
+  NonMFALoginAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlerts
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-Non-MFA-Console-Logins'
+      AlarmDescription: 'Alert when users login to console without MFA'
+      MetricName: 'NonMFALogins'
+      Namespace: 'Custom/MFA'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref MFAAlertsTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch Dashboard for MFA Monitoring
+  MFADashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableDashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-MFA-Security-Dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["Custom/MFA", "MFASuccessfulLogins"],
+                  [".", "NonMFALogins"]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "MFA vs Non-MFA Login Attempts",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["Custom/MFA", "MFASuccessfulLogins", {"stat": "Sum"}]
+                ],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "title": "Total MFA Logins (24h)",
+                "period": 86400
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${MFALogGroup}'\n| fields @timestamp, sourceIPAddress, userIdentity.userName, additionalEventData.MFAUsed\n| filter eventName = \"ConsoleLogin\"\n| filter responseElements.ConsoleLogin = \"Success\"\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Console Login Activity",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # IAM Role for CloudWatch Cross-Account Access (if needed)
+  CloudWatchRole:
+    Type: AWS::IAM::Role
+    Condition: EnableMonitoring
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-CloudWatch-MFA-Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess
+        - arn:aws:iam::aws:policy/CloudWatchLogsReadOnlyAccess
+
+Outputs:
+  TestUserName:
+    Description: 'Name of the created test user for MFA demonstration'
+    Value: !Ref TestUser
+    Export:
+      Name: !Sub '${AWS::StackName}-TestUser'
+
+  TestUserArn:
+    Description: 'ARN of the created test user'
+    Value: !GetAtt TestUser.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TestUserArn'
+
+  MFAAdminGroupName:
+    Description: 'Name of the administrative group with MFA requirements'
+    Value: !Ref MFAAdminGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AdminGroup'
+
+  MFAPolicyArn:
+    Description: 'ARN of the MFA enforcement policy'
+    Value: !Ref MFAEnforcementPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-MFAPolicy'
+
+  ConsoleLoginURL:
+    Description: 'AWS Console login URL for testing MFA'
+    Value: !Sub 'https://${AWS::AccountId}.signin.aws.amazon.com/console'
+
+  CloudTrailArn:
+    Condition: EnableMonitoring
+    Description: 'ARN of the CloudTrail for MFA monitoring'
+    Value: !GetAtt MFACloudTrail.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrail'
+
+  CloudTrailBucket:
+    Condition: EnableMonitoring
+    Description: 'S3 bucket storing CloudTrail logs'
+    Value: !Ref CloudTrailLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-LogsBucket'
+
+  DashboardURL:
+    Condition: EnableDashboard
+    Description: 'URL to the CloudWatch dashboard for MFA monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-MFA-Security-Dashboard'
+
+  SNSTopicArn:
+    Condition: CreateAlerts
+    Description: 'ARN of the SNS topic for MFA security alerts'
+    Value: !Ref MFAAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertsTopic'
+
+  MFASetupInstructions:
+    Description: 'Next steps for MFA setup'
+    Value: !Sub |
+      1. Login to AWS Console using: https://${AWS::AccountId}.signin.aws.amazon.com/console
+      2. Username: ${TestUser}
+      3. Password: [Use the password provided during stack creation]
+      4. You will be prompted to set up MFA - follow the console instructions
+      5. Use an authenticator app (Google Authenticator, Authy, etc.) to scan the QR code
+      6. Enter two consecutive MFA codes to complete setup
+      7. After MFA setup, you will have full access to AWS services
+
+  SecurityRecommendations:
+    Description: 'Important security recommendations for MFA implementation'
+    Value: |
+      - Ensure all users have backup recovery codes stored securely
+      - Regularly audit MFA device assignments and remove unused devices
+      - Monitor the CloudWatch dashboard for suspicious login patterns
+      - Consider hardware MFA devices for high-privilege accounts
+      - Implement emergency access procedures for MFA device loss
+      - Review and update MFA policies based on security requirements
+      - Enable GuardDuty for additional security monitoring

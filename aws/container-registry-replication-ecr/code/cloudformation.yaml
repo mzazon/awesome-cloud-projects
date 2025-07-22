@@ -1,0 +1,691 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for ECR container registry replication strategies with automated lifecycle management, monitoring, and governance controls'
+
+Parameters:
+  # Repository Configuration
+  RepositoryPrefix:
+    Type: String
+    Default: 'enterprise-apps'
+    Description: 'Prefix for ECR repository names to organize container images'
+    AllowedPattern: '^[a-z0-9][a-z0-9-_]*$'
+    ConstraintDescription: 'Must start with alphanumeric character and contain only lowercase letters, numbers, hyphens, and underscores'
+  
+  ProductionRepositoryName:
+    Type: String
+    Default: 'production'
+    Description: 'Name for the production ECR repository'
+    AllowedPattern: '^[a-z0-9][a-z0-9-_]*$'
+    ConstraintDescription: 'Must start with alphanumeric character and contain only lowercase letters, numbers, hyphens, and underscores'
+  
+  TestingRepositoryName:
+    Type: String
+    Default: 'testing'
+    Description: 'Name for the testing ECR repository'
+    AllowedPattern: '^[a-z0-9][a-z0-9-_]*$'
+    ConstraintDescription: 'Must start with alphanumeric character and contain only lowercase letters, numbers, hyphens, and underscores'
+  
+  # Replication Configuration
+  DestinationRegion:
+    Type: String
+    Default: 'us-west-2'
+    Description: 'Primary destination region for ECR replication'
+    AllowedValues:
+      - 'us-east-1'
+      - 'us-east-2'
+      - 'us-west-1'
+      - 'us-west-2'
+      - 'eu-west-1'
+      - 'eu-west-2'
+      - 'eu-central-1'
+      - 'ap-southeast-1'
+      - 'ap-southeast-2'
+      - 'ap-northeast-1'
+    ConstraintDescription: 'Must be a valid AWS region'
+  
+  SecondaryRegion:
+    Type: String
+    Default: 'eu-west-1'
+    Description: 'Secondary destination region for ECR replication'
+    AllowedValues:
+      - 'us-east-1'
+      - 'us-east-2'
+      - 'us-west-1'
+      - 'us-west-2'
+      - 'eu-west-1'
+      - 'eu-west-2'
+      - 'eu-central-1'
+      - 'ap-southeast-1'
+      - 'ap-southeast-2'
+      - 'ap-northeast-1'
+    ConstraintDescription: 'Must be a valid AWS region'
+  
+  # Lifecycle Policy Configuration
+  ProductionImageRetentionCount:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+    Description: 'Number of production images to retain'
+  
+  TestingImageRetentionCount:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 50
+    Description: 'Number of testing images to retain'
+  
+  UntaggedImageRetentionDays:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 30
+    Description: 'Number of days to retain untagged images'
+  
+  TestingImageRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 30
+    Description: 'Number of days to retain testing images'
+  
+  # Monitoring Configuration
+  EnableReplicationMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable CloudWatch monitoring and alarms for replication'
+  
+  AlertEmailAddress:
+    Type: String
+    Default: ''
+    Description: 'Email address for replication alerts (optional)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+  
+  # Security Configuration
+  EnableVulnerabilityScanning:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable vulnerability scanning for pushed images'
+  
+  ProductionImageMutability:
+    Type: String
+    Default: 'IMMUTABLE'
+    AllowedValues:
+      - 'MUTABLE'
+      - 'IMMUTABLE'
+    Description: 'Image tag mutability for production repository'
+  
+  TestingImageMutability:
+    Type: String
+    Default: 'MUTABLE'
+    AllowedValues:
+      - 'MUTABLE'
+      - 'IMMUTABLE'
+    Description: 'Image tag mutability for testing repository'
+
+Conditions:
+  # Condition to check if monitoring should be enabled
+  EnableMonitoring: !Equals [!Ref EnableReplicationMonitoring, 'true']
+  
+  # Condition to check if email alerts should be configured
+  HasEmailAddress: !Not [!Equals [!Ref AlertEmailAddress, '']]
+  
+  # Condition to enable both monitoring and email alerts
+  EnableEmailAlerts: !And [!Condition EnableMonitoring, !Condition HasEmailAddress]
+  
+  # Condition to check if vulnerability scanning should be enabled
+  EnableScanning: !Equals [!Ref EnableVulnerabilityScanning, 'true']
+
+Resources:
+  # Production ECR Repository
+  ProductionECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${RepositoryPrefix}/${ProductionRepositoryName}'
+      ImageTagMutability: !Ref ProductionImageMutability
+      ImageScanningConfiguration:
+        ScanOnPush: !Ref EnableScanning
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last ${ProductionImageRetentionCount} production images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["prod", "release"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": ${ProductionImageRetentionCount}
+                },
+                "action": {
+                  "type": "expire"
+                }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Delete untagged images older than ${UntaggedImageRetentionDays} day",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": ${UntaggedImageRetentionDays}
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      RepositoryPolicyText: !Sub |
+        {
+          "Version": "2008-10-17",
+          "Statement": [
+            {
+              "Sid": "ProdReadOnlyAccess",
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": "arn:aws:iam::${AWS::AccountId}:root"
+              },
+              "Action": [
+                "ecr:GetDownloadUrlForLayer",
+                "ecr:BatchGetImage",
+                "ecr:BatchCheckLayerAvailability"
+              ]
+            },
+            {
+              "Sid": "ProdPushAccess",
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": "arn:aws:iam::${AWS::AccountId}:root"
+              },
+              "Action": [
+                "ecr:PutImage",
+                "ecr:InitiateLayerUpload",
+                "ecr:UploadLayerPart",
+                "ecr:CompleteLayerUpload"
+              ]
+            }
+          ]
+        }
+      Tags:
+        - Key: Name
+          Value: !Sub '${RepositoryPrefix}-production-repository'
+        - Key: Environment
+          Value: 'production'
+        - Key: Purpose
+          Value: 'container-registry-replication'
+        - Key: Repository
+          Value: 'production'
+
+  # Testing ECR Repository
+  TestingECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${RepositoryPrefix}/${TestingRepositoryName}'
+      ImageTagMutability: !Ref TestingImageMutability
+      ImageScanningConfiguration:
+        ScanOnPush: !Ref EnableScanning
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last ${TestingImageRetentionCount} testing images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["test", "dev", "staging"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": ${TestingImageRetentionCount}
+                },
+                "action": {
+                  "type": "expire"
+                }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Delete images older than ${TestingImageRetentionDays} days",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": ${TestingImageRetentionDays}
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub '${RepositoryPrefix}-testing-repository'
+        - Key: Environment
+          Value: 'testing'
+        - Key: Purpose
+          Value: 'container-registry-replication'
+        - Key: Repository
+          Value: 'testing'
+
+  # IAM Role for ECR Replication
+  ECRReplicationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ECRReplicationRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecr.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/ECRReplicationServiceRolePolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ECRReplicationRole'
+        - Key: Purpose
+          Value: 'container-registry-replication'
+
+  # ECR Replication Configuration
+  ECRReplicationConfiguration:
+    Type: AWS::ECR::ReplicationConfiguration
+    Properties:
+      ReplicationConfiguration:
+        Rules:
+          - Destinations:
+              - Region: !Ref DestinationRegion
+                RegistryId: !Ref AWS::AccountId
+              - Region: !Ref SecondaryRegion
+                RegistryId: !Ref AWS::AccountId
+            RepositoryFilters:
+              - Filter: !Ref RepositoryPrefix
+                FilterType: PREFIX_MATCH
+    DependsOn:
+      - ProductionECRRepository
+      - TestingECRRepository
+
+  # SNS Topic for Replication Alerts
+  ReplicationAlertsTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnableMonitoring
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-ECR-Replication-Alerts'
+      DisplayName: 'ECR Replication Monitoring Alerts'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ECR-Replication-Alerts'
+        - Key: Purpose
+          Value: 'container-registry-replication'
+
+  # SNS Topic Subscription for Email Alerts
+  EmailAlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: EnableEmailAlerts
+    Properties:
+      Protocol: email
+      TopicArn: !Ref ReplicationAlertsTopic
+      Endpoint: !Ref AlertEmailAddress
+
+  # IAM Role for Lambda Cleanup Function
+  LambdaCleanupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-LambdaCleanupRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ECRCleanupPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:DescribeRepositories
+                  - ecr:DescribeImages
+                  - ecr:BatchDeleteImage
+                  - ecr:ListImages
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-LambdaCleanupRole'
+        - Key: Purpose
+          Value: 'container-registry-replication'
+
+  # Lambda Function for Automated Cleanup
+  ECRCleanupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-ECRCleanup'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaCleanupRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          REPOSITORY_PREFIX: !Ref RepositoryPrefix
+          CLEANUP_DAYS: '30'
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from datetime import datetime, timedelta
+          
+          def lambda_handler(event, context):
+              ecr_client = boto3.client('ecr')
+              repo_prefix = os.environ['REPOSITORY_PREFIX']
+              cleanup_days = int(os.environ['CLEANUP_DAYS'])
+              
+              try:
+                  # Get all repositories with specific prefix
+                  paginator = ecr_client.get_paginator('describe_repositories')
+                  repositories = []
+                  
+                  for page in paginator.paginate():
+                      for repo in page['repositories']:
+                          if repo['repositoryName'].startswith(repo_prefix):
+                              repositories.append(repo)
+                  
+                  cleaned_count = 0
+                  
+                  for repo in repositories:
+                      repo_name = repo['repositoryName']
+                      
+                      # Get untagged images
+                      try:
+                          images_response = ecr_client.describe_images(
+                              repositoryName=repo_name,
+                              filter={'tagStatus': 'UNTAGGED'}
+                          )
+                          
+                          old_images = []
+                          cutoff_date = datetime.now(images_response['imageDetails'][0]['imagePushedAt'].tzinfo) - timedelta(days=cleanup_days)
+                          
+                          for image in images_response['imageDetails']:
+                              if image['imagePushedAt'] < cutoff_date:
+                                  old_images.append({'imageDigest': image['imageDigest']})
+                          
+                          # Delete old images
+                          if old_images:
+                              ecr_client.batch_delete_image(
+                                  repositoryName=repo_name,
+                                  imageIds=old_images
+                              )
+                              cleaned_count += len(old_images)
+                              print(f"Deleted {len(old_images)} old images from {repo_name}")
+                      
+                      except ecr_client.exceptions.ImageNotFoundException:
+                          print(f"No images found in repository {repo_name}")
+                      except Exception as e:
+                          print(f"Error processing repository {repo_name}: {str(e)}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Cleanup completed successfully. Deleted {cleaned_count} images.',
+                          'repositories_processed': len(repositories)
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in cleanup function: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'message': 'Cleanup failed'
+                      })
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ECRCleanup'
+        - Key: Purpose
+          Value: 'container-registry-replication'
+
+  # EventBridge Rule for Scheduled Cleanup
+  CleanupScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-ECRCleanupSchedule'
+      Description: 'Scheduled ECR cleanup execution'
+      ScheduleExpression: 'rate(7 days)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ECRCleanupFunction.Arn
+          Id: 'ECRCleanupTarget'
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ECRCleanupFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CleanupScheduleRule.Arn
+
+  # CloudWatch Dashboard for ECR Monitoring
+  ECRMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableMonitoring
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-ECR-Replication-Monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ECR", "RepositoryPullCount", "RepositoryName", "${RepositoryPrefix}/${ProductionRepositoryName}"],
+                  [".", "RepositoryPushCount", ".", "."],
+                  [".", "RepositoryPullCount", ".", "${RepositoryPrefix}/${TestingRepositoryName}"],
+                  [".", "RepositoryPushCount", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "ECR Repository Activity",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ECR", "RepositorySize", "RepositoryName", "${RepositoryPrefix}/${ProductionRepositoryName}"],
+                  [".", ".", ".", "${RepositoryPrefix}/${TestingRepositoryName}"]
+                ],
+                "period": 3600,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Repository Size",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${AWS::StackName}-ECRCleanup'\n| fields @timestamp, @message\n| filter @message like /Deleted/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Cleanup Activities",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarm for Replication Failures
+  ReplicationFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-ECR-Replication-Failure-Rate'
+      AlarmDescription: 'Monitor ECR replication failure rate'
+      MetricName: 'ReplicationFailureRate'
+      Namespace: 'AWS/ECR'
+      Statistic: 'Average'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0.1
+      ComparisonOperator: 'GreaterThanThreshold'
+      AlarmActions:
+        - !Ref ReplicationAlertsTopic
+      OKActions:
+        - !Ref ReplicationAlertsTopic
+      TreatMissingData: 'notBreaching'
+
+  # CloudWatch Alarm for High Repository Size
+  RepositorySizeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-ECR-Repository-Size-High'
+      AlarmDescription: 'Monitor ECR repository size growth'
+      MetricName: 'RepositorySize'
+      Namespace: 'AWS/ECR'
+      Statistic: 'Average'
+      Period: 3600
+      EvaluationPeriods: 2
+      Threshold: 10000000000  # 10GB in bytes
+      ComparisonOperator: 'GreaterThanThreshold'
+      Dimensions:
+        - Name: RepositoryName
+          Value: !Sub '${RepositoryPrefix}/${ProductionRepositoryName}'
+      AlarmActions:
+        - !Ref ReplicationAlertsTopic
+      TreatMissingData: 'notBreaching'
+
+  # CloudWatch Log Group for Lambda Function
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-ECRCleanup'
+      RetentionInDays: 14
+
+Outputs:
+  # Repository Information
+  ProductionRepositoryURI:
+    Description: 'URI of the production ECR repository'
+    Value: !GetAtt ProductionECRRepository.RepositoryUri
+    Export:
+      Name: !Sub '${AWS::StackName}-ProductionRepositoryURI'
+  
+  TestingRepositoryURI:
+    Description: 'URI of the testing ECR repository'
+    Value: !GetAtt TestingECRRepository.RepositoryUri
+    Export:
+      Name: !Sub '${AWS::StackName}-TestingRepositoryURI'
+  
+  ProductionRepositoryName:
+    Description: 'Name of the production ECR repository'
+    Value: !Ref ProductionECRRepository
+    Export:
+      Name: !Sub '${AWS::StackName}-ProductionRepositoryName'
+  
+  TestingRepositoryName:
+    Description: 'Name of the testing ECR repository'
+    Value: !Ref TestingECRRepository
+    Export:
+      Name: !Sub '${AWS::StackName}-TestingRepositoryName'
+  
+  # Replication Configuration
+  ReplicationDestinationRegion:
+    Description: 'Primary destination region for replication'
+    Value: !Ref DestinationRegion
+    Export:
+      Name: !Sub '${AWS::StackName}-ReplicationDestinationRegion'
+  
+  ReplicationSecondaryRegion:
+    Description: 'Secondary destination region for replication'
+    Value: !Ref SecondaryRegion
+    Export:
+      Name: !Sub '${AWS::StackName}-ReplicationSecondaryRegion'
+  
+  # Monitoring Resources
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for replication alerts'
+    Value: !Ref ReplicationAlertsTopic
+    Condition: EnableMonitoring
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+  
+  CloudWatchDashboard:
+    Description: 'CloudWatch Dashboard for ECR monitoring'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-ECR-Replication-Monitoring'
+    Condition: EnableMonitoring
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchDashboard'
+  
+  # Lambda Function
+  CleanupFunctionArn:
+    Description: 'ARN of the Lambda cleanup function'
+    Value: !GetAtt ECRCleanupFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CleanupFunctionArn'
+  
+  # IAM Role
+  ECRReplicationRoleArn:
+    Description: 'ARN of the ECR replication service role'
+    Value: !GetAtt ECRReplicationRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ECRReplicationRoleArn'
+  
+  # Quick Commands
+  DockerLoginCommand:
+    Description: 'Command to login to ECR for docker operations'
+    Value: !Sub 'aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-DockerLoginCommand'
+  
+  ProductionPushCommand:
+    Description: 'Example command to push to production repository'
+    Value: !Sub 'docker push ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${RepositoryPrefix}/${ProductionRepositoryName}:latest'
+    Export:
+      Name: !Sub '${AWS::StackName}-ProductionPushCommand'
+  
+  TestingPushCommand:
+    Description: 'Example command to push to testing repository'
+    Value: !Sub 'docker push ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${RepositoryPrefix}/${TestingRepositoryName}:latest'
+    Export:
+      Name: !Sub '${AWS::StackName}-TestingPushCommand'

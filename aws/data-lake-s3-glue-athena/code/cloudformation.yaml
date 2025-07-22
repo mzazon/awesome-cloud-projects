@@ -1,0 +1,768 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Data Lake Architecture with S3, Glue, and Athena
+  This template creates a complete serverless data lake solution including S3 storage zones,
+  Glue Data Catalog, crawlers, ETL jobs, and Athena workgroups for SQL analytics.
+
+# Template metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Data Lake Configuration"
+        Parameters:
+          - DataLakeName
+          - Environment
+          - DataRetentionDays
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - EnableVersioning
+          - EnableIntelligentTiering
+          - EnableServerSideEncryption
+      - Label:
+          default: "Glue Configuration"
+        Parameters:
+          - GlueMaxCapacity
+          - GlueTimeout
+          - EnableGlueJobBookmarks
+      - Label:
+          default: "Athena Configuration"
+        Parameters:
+          - EnableAthenaMetrics
+          - AthenaResultsRetentionDays
+    ParameterLabels:
+      DataLakeName:
+        default: "Data Lake Name"
+      Environment:
+        default: "Environment"
+      DataRetentionDays:
+        default: "Data Retention (Days)"
+      EnableVersioning:
+        default: "Enable S3 Versioning"
+      EnableIntelligentTiering:
+        default: "Enable S3 Intelligent Tiering"
+      EnableServerSideEncryption:
+        default: "Enable S3 Server-Side Encryption"
+      GlueMaxCapacity:
+        default: "Glue ETL Max Capacity"
+      GlueTimeout:
+        default: "Glue ETL Timeout (Minutes)"
+      EnableGlueJobBookmarks:
+        default: "Enable Glue Job Bookmarks"
+      EnableAthenaMetrics:
+        default: "Enable Athena CloudWatch Metrics"
+      AthenaResultsRetentionDays:
+        default: "Athena Results Retention (Days)"
+
+# Input parameters with validation
+Parameters:
+  DataLakeName:
+    Type: String
+    Description: Name for the data lake resources (will be used as prefix)
+    Default: datalake
+    AllowedPattern: ^[a-z0-9\-]+$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    MinLength: 3
+    MaxLength: 20
+
+  Environment:
+    Type: String
+    Description: Environment for the data lake deployment
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    ConstraintDescription: Must be one of dev, staging, or prod
+
+  DataRetentionDays:
+    Type: Number
+    Description: Number of days to retain data in standard storage before transitioning
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    ConstraintDescription: Must be between 1 and 365 days
+
+  EnableVersioning:
+    Type: String
+    Description: Enable S3 versioning for data protection
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableIntelligentTiering:
+    Type: String
+    Description: Enable S3 Intelligent Tiering for cost optimization
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableServerSideEncryption:
+    Type: String
+    Description: Enable S3 server-side encryption
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  GlueMaxCapacity:
+    Type: Number
+    Description: Maximum DPU (Data Processing Units) for Glue ETL jobs
+    Default: 2
+    MinValue: 1
+    MaxValue: 100
+    ConstraintDescription: Must be between 1 and 100 DPUs
+
+  GlueTimeout:
+    Type: Number
+    Description: Timeout for Glue ETL jobs in minutes
+    Default: 60
+    MinValue: 10
+    MaxValue: 2880
+    ConstraintDescription: Must be between 10 and 2880 minutes
+
+  EnableGlueJobBookmarks:
+    Type: String
+    Description: Enable Glue job bookmarks for incremental processing
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableAthenaMetrics:
+    Type: String
+    Description: Enable CloudWatch metrics for Athena queries
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  AthenaResultsRetentionDays:
+    Type: Number
+    Description: Number of days to retain Athena query results
+    Default: 7
+    MinValue: 1
+    MaxValue: 365
+    ConstraintDescription: Must be between 1 and 365 days
+
+# Conditions for optional features
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+  EnableVersioningCondition: !Equals [!Ref EnableVersioning, 'true']
+  EnableIntelligentTieringCondition: !Equals [!Ref EnableIntelligentTiering, 'true']
+  EnableServerSideEncryptionCondition: !Equals [!Ref EnableServerSideEncryption, 'true']
+  EnableGlueJobBookmarksCondition: !Equals [!Ref EnableGlueJobBookmarks, 'true']
+  EnableAthenaMetricsCondition: !Equals [!Ref EnableAthenaMetrics, 'true']
+
+# Resources
+Resources:
+  # ====================================================================
+  # S3 STORAGE RESOURCES
+  # ====================================================================
+  
+  # Main data lake bucket for all data zones
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${DataLakeName}-${Environment}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        !If
+          - EnableServerSideEncryptionCondition
+          - ServerSideEncryptionConfiguration:
+              - ServerSideEncryptionByDefault:
+                  SSEAlgorithm: AES256
+          - !Ref AWS::NoValue
+      VersioningConfiguration:
+        !If
+          - EnableVersioningCondition
+          - Status: Enabled
+          - !Ref AWS::NoValue
+      IntelligentTieringConfigurations:
+        !If
+          - EnableIntelligentTieringCondition
+          - - Id: EntireBucketTiering
+              Status: Enabled
+              Prefix: ''
+              OptionalFields:
+                - BucketKeyStatus
+          - !Ref AWS::NoValue
+      LifecycleConfiguration:
+        Rules:
+          - Id: RawZoneLifecycleRule
+            Status: Enabled
+            Prefix: raw-zone/
+            Transitions:
+              - TransitionInDays: !Ref DataRetentionDays
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+          - Id: ProcessedZoneLifecycleRule
+            Status: Enabled
+            Prefix: processed-zone/
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 180
+                StorageClass: GLACIER
+          - Id: ArchiveZoneLifecycleRule
+            Status: Enabled
+            Prefix: archive-zone/
+            Transitions:
+              - TransitionInDays: 1
+                StorageClass: GLACIER
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt DataProcessingTrigger.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: raw-zone/
+      Tags:
+        - Key: Name
+          Value: !Sub '${DataLakeName}-${Environment}-data-lake'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: DataLake
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Athena query results bucket
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${DataLakeName}-${Environment}-athena-results-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        !If
+          - EnableServerSideEncryptionCondition
+          - ServerSideEncryptionConfiguration:
+              - ServerSideEncryptionByDefault:
+                  SSEAlgorithm: AES256
+          - !Ref AWS::NoValue
+      LifecycleConfiguration:
+        Rules:
+          - Id: AthenaResultsLifecycleRule
+            Status: Enabled
+            ExpirationInDays: !Ref AthenaResultsRetentionDays
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${DataLakeName}-${Environment}-athena-results'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: AthenaResults
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ====================================================================
+  # IAM ROLES AND POLICIES
+  # ====================================================================
+
+  # IAM role for Glue services
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${DataLakeName}-${Environment}-GlueServiceRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: DataLakeS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${DataLakeBucket}/*'
+                  - !GetAtt DataLakeBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${AthenaResultsBucket}/*'
+                  - !GetAtt AthenaResultsBucket.Arn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${DataLakeName}-${Environment}-GlueServiceRole'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: GlueService
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # IAM role for Lambda function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${DataLakeName}-${Environment}-LambdaExecutionRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GlueAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartCrawler
+                  - glue:GetCrawler
+                  - glue:GetCrawlerMetrics
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${DataLakeName}-${Environment}-LambdaExecutionRole'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: LambdaExecution
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ====================================================================
+  # GLUE DATA CATALOG RESOURCES
+  # ====================================================================
+
+  # Glue database for data catalog
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${DataLakeName}_${Environment}_db'
+        Description: !Sub 'Data lake database for ${DataLakeName} ${Environment} environment'
+        Parameters:
+          classification: database
+          environment: !Ref Environment
+          managed_by: cloudformation
+
+  # Glue crawler for sales data
+  SalesDataCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${DataLakeName}-${Environment}-sales-data-crawler'
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Description: 'Crawler for sales data in CSV format'
+      Targets:
+        S3Targets:
+          - Path: !Sub '${DataLakeBucket}/raw-zone/sales-data/'
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": {
+              "AddOrUpdateBehavior": "InheritFromTable"
+            }
+          }
+        }
+      Schedule:
+        ScheduleExpression: 'cron(0 2 * * ? *)'  # Daily at 2 AM
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Tags:
+        Environment: !Ref Environment
+        Purpose: DataCrawling
+        ManagedBy: CloudFormation
+
+  # Glue crawler for web logs
+  WebLogsCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${DataLakeName}-${Environment}-web-logs-crawler'
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Description: 'Crawler for web logs in JSON format'
+      Targets:
+        S3Targets:
+          - Path: !Sub '${DataLakeBucket}/raw-zone/web-logs/'
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": {
+              "AddOrUpdateBehavior": "InheritFromTable"
+            }
+          }
+        }
+      Schedule:
+        ScheduleExpression: 'cron(0 3 * * ? *)'  # Daily at 3 AM
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Tags:
+        Environment: !Ref Environment
+        Purpose: DataCrawling
+        ManagedBy: CloudFormation
+
+  # ====================================================================
+  # GLUE ETL RESOURCES
+  # ====================================================================
+
+  # Glue ETL job for data transformation
+  SalesDataETLJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${DataLakeName}-${Environment}-sales-data-etl'
+      Role: !GetAtt GlueServiceRole.Arn
+      Description: 'ETL job to transform sales data from CSV to Parquet format'
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 's3://${DataLakeBucket}/scripts/glue-etl-script.py'
+        PythonVersion: '3'
+      DefaultArguments:
+        '--DATABASE_NAME': !Ref GlueDatabase
+        '--TABLE_NAME': 'sales_data'
+        '--OUTPUT_PATH': !Sub 's3://${DataLakeBucket}/processed-zone/sales-data-processed/'
+        '--enable-metrics': ''
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--enable-spark-ui': 'true'
+        '--spark-event-logs-path': !Sub 's3://${DataLakeBucket}/spark-logs/'
+        '--job-bookmark-option': !If [EnableGlueJobBookmarksCondition, 'job-bookmark-enable', 'job-bookmark-disable']
+      MaxCapacity: !Ref GlueMaxCapacity
+      Timeout: !Ref GlueTimeout
+      GlueVersion: '4.0'
+      Tags:
+        Environment: !Ref Environment
+        Purpose: DataTransformation
+        ManagedBy: CloudFormation
+
+  # ====================================================================
+  # LAMBDA FUNCTIONS
+  # ====================================================================
+
+  # Lambda function for processing trigger
+  DataProcessingTrigger:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${DataLakeName}-${Environment}-data-processing-trigger'
+      Description: 'Lambda function to trigger data processing when new data arrives'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          SALES_CRAWLER_NAME: !Ref SalesDataCrawler
+          WEB_LOGS_CRAWLER_NAME: !Ref WebLogsCrawler
+          ETL_JOB_NAME: !Ref SalesDataETLJob
+          GLUE_DATABASE: !Ref GlueDatabase
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import urllib.parse
+          
+          glue_client = boto3.client('glue')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Parse S3 event
+                  for record in event['Records']:
+                      bucket = record['s3']['bucket']['name']
+                      key = urllib.parse.unquote_plus(record['s3']['object']['key'])
+                      
+                      print(f"Processing file: s3://{bucket}/{key}")
+                      
+                      # Determine which crawler to run based on file path
+                      if key.startswith('raw-zone/sales-data/'):
+                          crawler_name = os.environ['SALES_CRAWLER_NAME']
+                          print(f"Starting sales data crawler: {crawler_name}")
+                          
+                          # Start crawler
+                          try:
+                              glue_client.start_crawler(Name=crawler_name)
+                              print(f"Successfully started crawler: {crawler_name}")
+                          except glue_client.exceptions.CrawlerRunningException:
+                              print(f"Crawler {crawler_name} is already running")
+                              
+                      elif key.startswith('raw-zone/web-logs/'):
+                          crawler_name = os.environ['WEB_LOGS_CRAWLER_NAME']
+                          print(f"Starting web logs crawler: {crawler_name}")
+                          
+                          # Start crawler
+                          try:
+                              glue_client.start_crawler(Name=crawler_name)
+                              print(f"Successfully started crawler: {crawler_name}")
+                          except glue_client.exceptions.CrawlerRunningException:
+                              print(f"Crawler {crawler_name} is already running")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Data processing triggered successfully')
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error processing data: {str(e)}')
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${DataLakeName}-${Environment}-data-processing-trigger'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: DataProcessing
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Lambda permission for S3 to invoke the function
+  DataProcessingTriggerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataProcessingTrigger
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt DataLakeBucket.Arn
+
+  # ====================================================================
+  # ATHENA RESOURCES
+  # ====================================================================
+
+  # Athena workgroup for data lake analytics
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub '${DataLakeName}-${Environment}-workgroup'
+      Description: !Sub 'Athena workgroup for ${DataLakeName} data lake analytics'
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${AthenaResultsBucket}/query-results/'
+          EncryptionConfiguration:
+            !If
+              - EnableServerSideEncryptionCondition
+              - EncryptionOption: SSE_S3
+              - !Ref AWS::NoValue
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: !If [EnableAthenaMetricsCondition, true, false]
+        BytesScannedCutoffPerQuery: 100000000  # 100MB limit
+        RequesterPaysEnabled: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${DataLakeName}-${Environment}-workgroup'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Analytics
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ====================================================================
+  # CLOUDWATCH RESOURCES
+  # ====================================================================
+
+  # CloudWatch log group for Glue jobs
+  GlueJobLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws-glue/jobs/${DataLakeName}-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${DataLakeName}-${Environment}-glue-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: GlueLogs
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudWatch alarm for failed Glue jobs
+  GlueJobFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${DataLakeName}-${Environment}-glue-job-failures'
+      AlarmDescription: 'Alarm for failed Glue ETL jobs'
+      MetricName: glue.driver.aggregate.numFailedTasks
+      Namespace: Glue
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: JobName
+          Value: !Ref SalesDataETLJob
+        - Name: JobRunId
+          Value: ALL
+
+  # CloudWatch alarm for high Athena query costs
+  AthenaHighCostAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${DataLakeName}-${Environment}-athena-high-cost'
+      AlarmDescription: 'Alarm for high Athena query costs'
+      MetricName: DataScannedInBytes
+      Namespace: AWS/Athena
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1000000000  # 1GB
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: WorkGroup
+          Value: !Ref AthenaWorkgroup
+
+# ====================================================================
+# OUTPUTS
+# ====================================================================
+
+Outputs:
+  DataLakeBucketName:
+    Description: 'Name of the main data lake S3 bucket'
+    Value: !Ref DataLakeBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataLakeBucket'
+
+  DataLakeBucketArn:
+    Description: 'ARN of the main data lake S3 bucket'
+    Value: !GetAtt DataLakeBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataLakeBucketArn'
+
+  AthenaResultsBucketName:
+    Description: 'Name of the Athena results S3 bucket'
+    Value: !Ref AthenaResultsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaResultsBucket'
+
+  GlueDatabaseName:
+    Description: 'Name of the Glue database'
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabase'
+
+  GlueServiceRoleArn:
+    Description: 'ARN of the Glue service role'
+    Value: !GetAtt GlueServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueServiceRole'
+
+  SalesDataCrawlerName:
+    Description: 'Name of the sales data crawler'
+    Value: !Ref SalesDataCrawler
+    Export:
+      Name: !Sub '${AWS::StackName}-SalesDataCrawler'
+
+  WebLogsCrawlerName:
+    Description: 'Name of the web logs crawler'
+    Value: !Ref WebLogsCrawler
+    Export:
+      Name: !Sub '${AWS::StackName}-WebLogsCrawler'
+
+  SalesDataETLJobName:
+    Description: 'Name of the sales data ETL job'
+    Value: !Ref SalesDataETLJob
+    Export:
+      Name: !Sub '${AWS::StackName}-SalesDataETLJob'
+
+  AthenaWorkgroupName:
+    Description: 'Name of the Athena workgroup'
+    Value: !Ref AthenaWorkgroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaWorkgroup'
+
+  DataProcessingTriggerFunctionName:
+    Description: 'Name of the data processing trigger Lambda function'
+    Value: !Ref DataProcessingTrigger
+    Export:
+      Name: !Sub '${AWS::StackName}-DataProcessingTrigger'
+
+  # Data Lake Endpoints
+  DataLakeRawZonePrefix:
+    Description: 'S3 prefix for raw zone data'
+    Value: !Sub 's3://${DataLakeBucket}/raw-zone/'
+    Export:
+      Name: !Sub '${AWS::StackName}-RawZonePrefix'
+
+  DataLakeProcessedZonePrefix:
+    Description: 'S3 prefix for processed zone data'
+    Value: !Sub 's3://${DataLakeBucket}/processed-zone/'
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessedZonePrefix'
+
+  DataLakeArchiveZonePrefix:
+    Description: 'S3 prefix for archive zone data'
+    Value: !Sub 's3://${DataLakeBucket}/archive-zone/'
+    Export:
+      Name: !Sub '${AWS::StackName}-ArchiveZonePrefix'
+
+  # Athena Console URL
+  AthenaConsoleUrl:
+    Description: 'URL to access Athena console with configured workgroup'
+    Value: !Sub 'https://console.aws.amazon.com/athena/home?region=${AWS::Region}#query/workgroup/${AthenaWorkgroup}'
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaConsoleUrl'
+
+  # Glue Console URL
+  GlueConsoleUrl:
+    Description: 'URL to access Glue console for database management'
+    Value: !Sub 'https://console.aws.amazon.com/glue/home?region=${AWS::Region}#catalog:tab=databases'
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueConsoleUrl'
+
+  # CloudWatch Logs URL
+  CloudWatchLogsUrl:
+    Description: 'URL to access CloudWatch logs for Glue jobs'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/${GlueJobLogGroup}'
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchLogsUrl'

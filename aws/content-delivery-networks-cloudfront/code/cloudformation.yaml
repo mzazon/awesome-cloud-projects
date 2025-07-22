@@ -1,0 +1,695 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Advanced CloudFront CDN with Lambda@Edge, CloudFront Functions, WAF, and comprehensive monitoring'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'advanced-cdn'
+    Description: 'Project name used for resource naming'
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+    
+  S3BucketName:
+    Type: String
+    Description: 'Name for the S3 bucket (leave empty for auto-generated name)'
+    Default: ''
+    
+  EnableWAF:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable AWS WAF protection for the CloudFront distribution'
+    
+  EnableRealTimeLogs:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable CloudFront real-time logging to Kinesis'
+    
+  PriceClass:
+    Type: String
+    Default: 'PriceClass_All'
+    AllowedValues: 
+      - 'PriceClass_100'
+      - 'PriceClass_200'
+      - 'PriceClass_All'
+    Description: 'CloudFront price class for edge location usage'
+    
+  CustomOriginDomain:
+    Type: String
+    Default: 'httpbin.org'
+    Description: 'Custom origin domain for API requests'
+    
+  RateLimitPerIP:
+    Type: Number
+    Default: 2000
+    MinValue: 100
+    MaxValue: 20000
+    Description: 'WAF rate limit per IP address (requests per 5 minutes)'
+
+Conditions:
+  CreateS3BucketName: !Equals [!Ref S3BucketName, '']
+  EnableWAFCondition: !Equals [!Ref EnableWAF, 'true']
+  EnableRealTimeLogsCondition: !Equals [!Ref EnableRealTimeLogs, 'true']
+
+Resources:
+  # S3 Bucket for static content
+  ContentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If 
+        - CreateS3BucketName
+        - !Sub '${ProjectName}-content-${AWS::AccountId}-${AWS::Region}'
+        - !Ref S3BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'CloudFront Origin Content'
+
+  # IAM Role for Lambda@Edge
+  LambdaEdgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-edge-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - edgelambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda@Edge Function for response processing
+  LambdaEdgeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-edge-processor'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaEdgeRole.Arn
+      Timeout: 5
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          const aws = require('aws-sdk');
+          
+          exports.handler = async (event, context) => {
+              const response = event.Records[0].cf.response;
+              const request = event.Records[0].cf.request;
+              const headers = response.headers;
+              
+              // Add comprehensive security headers
+              headers['strict-transport-security'] = [{
+                  key: 'Strict-Transport-Security',
+                  value: 'max-age=31536000; includeSubDomains; preload'
+              }];
+              
+              headers['x-content-type-options'] = [{
+                  key: 'X-Content-Type-Options',
+                  value: 'nosniff'
+              }];
+              
+              headers['x-frame-options'] = [{
+                  key: 'X-Frame-Options',
+                  value: 'SAMEORIGIN'
+              }];
+              
+              headers['x-xss-protection'] = [{
+                  key: 'X-XSS-Protection',
+                  value: '1; mode=block'
+              }];
+              
+              headers['referrer-policy'] = [{
+                  key: 'Referrer-Policy',
+                  value: 'strict-origin-when-cross-origin'
+              }];
+              
+              headers['content-security-policy'] = [{
+                  key: 'Content-Security-Policy',
+                  value: "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
+              }];
+              
+              // Add custom headers for API requests
+              if (request.uri.startsWith('/api/')) {
+                  headers['access-control-allow-origin'] = [{
+                      key: 'Access-Control-Allow-Origin',
+                      value: '*'
+                  }];
+                  headers['access-control-allow-methods'] = [{
+                      key: 'Access-Control-Allow-Methods',
+                      value: 'GET, POST, OPTIONS, PUT, DELETE'
+                  }];
+                  headers['access-control-allow-headers'] = [{
+                      key: 'Access-Control-Allow-Headers',
+                      value: 'Content-Type, Authorization, X-Requested-With'
+                  }];
+              }
+              
+              // Add performance headers
+              headers['x-edge-location'] = [{
+                  key: 'X-Edge-Location',
+                  value: event.Records[0].cf.config.distributionId
+              }];
+              
+              headers['x-cache-status'] = [{
+                  key: 'X-Cache-Status',
+                  value: 'PROCESSED'
+              }];
+              
+              return response;
+          };
+      Description: 'Lambda@Edge function for advanced response processing'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda@Edge Version (required for CloudFront association)
+  LambdaEdgeVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref LambdaEdgeFunction
+      Description: 'Published version for CloudFront association'
+
+  # CloudFront Function for request processing
+  CloudFrontFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${ProjectName}-request-processor'
+      FunctionConfig:
+        Comment: 'Request processing function for cache optimization and redirects'
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+            var request = event.request;
+            var headers = request.headers;
+            
+            // Add security headers
+            headers['x-forwarded-proto'] = {value: 'https'};
+            headers['x-request-id'] = {value: generateRequestId()};
+            
+            // Normalize cache key by removing tracking parameters
+            var uri = request.uri;
+            var querystring = request.querystring;
+            
+            // Remove tracking parameters to improve cache hit ratio
+            delete querystring.utm_source;
+            delete querystring.utm_medium;
+            delete querystring.utm_campaign;
+            delete querystring.fbclid;
+            
+            // Redirect old paths to new structure
+            if (uri.startsWith('/old-api/')) {
+                uri = uri.replace('/old-api/', '/api/');
+                request.uri = uri;
+            }
+            
+            return request;
+        }
+        
+        function generateRequestId() {
+            return 'req-' + Math.random().toString(36).substr(2, 9);
+        }
+
+  # Origin Access Control for S3
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+        Description: 'Origin Access Control for S3 bucket'
+
+  # WAF Web ACL (conditional)
+  WebACL:
+    Type: AWS::WAFv2::WebACL
+    Condition: EnableWAFCondition
+    Properties:
+      Name: !Sub '${ProjectName}-webacl'
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      Rules:
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CommonRuleSetMetric
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: KnownBadInputsRuleSetMetric
+        - Name: RateLimitRule
+          Priority: 3
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref RateLimitPerIP
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitRuleMetric
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${ProjectName}-webacl'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Kinesis Stream for real-time logs (conditional)
+  RealTimeLogsStream:
+    Type: AWS::Kinesis::Stream
+    Condition: EnableRealTimeLogsCondition
+    Properties:
+      Name: !Sub '${ProjectName}-realtime-logs'
+      ShardCount: 1
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for CloudFront Real-time Logs (conditional)
+  RealTimeLogsRole:
+    Type: AWS::IAM::Role
+    Condition: EnableRealTimeLogsCondition
+    Properties:
+      RoleName: !Sub '${ProjectName}-realtime-logs-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: KinesisAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecords
+                  - kinesis:PutRecord
+                Resource: !GetAtt RealTimeLogsStream.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudFront Real-time Log Configuration (conditional)
+  RealTimeLogConfig:
+    Type: AWS::CloudFront::RealtimeLogConfig
+    Condition: EnableRealTimeLogsCondition
+    Properties:
+      Name: !Sub '${ProjectName}-realtime-logs'
+      EndPoints:
+        - StreamType: Kinesis
+          KinesisStreamConfig:
+            RoleArn: !GetAtt RealTimeLogsRole.Arn
+            StreamArn: !GetAtt RealTimeLogsStream.Arn
+      Fields:
+        - timestamp
+        - c-ip
+        - sc-status
+        - cs-method
+        - cs-uri-stem
+        - cs-uri-query
+        - cs-referer
+        - cs-user-agent
+
+  # CloudFront KeyValueStore
+  KeyValueStore:
+    Type: AWS::CloudFront::KeyValueStore
+    Properties:
+      Name: !Sub '${ProjectName}-config'
+      Comment: 'Dynamic configuration store for CDN'
+
+  # CloudFront Distribution
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub 'Advanced CDN distribution for ${ProjectName}'
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: !Ref PriceClass
+        DefaultRootObject: index.html
+        
+        # Origins configuration
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt ContentBucket.RegionalDomainName
+            OriginPath: ''
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            ConnectionAttempts: 3
+            ConnectionTimeout: 10
+          - Id: CustomOrigin
+            DomainName: !Ref CustomOriginDomain
+            OriginPath: ''
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+                - TLSv1.1
+                - TLSv1
+              OriginReadTimeout: 30
+              OriginKeepaliveTimeout: 5
+            ConnectionAttempts: 3
+            ConnectionTimeout: 10
+
+        # Default cache behavior
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - DELETE
+            - GET
+            - HEAD
+            - OPTIONS
+            - PATCH
+            - POST
+            - PUT
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          CachePolicyId: '4135ea2d-6df8-44a3-9df3-4b5a84be39ad'  # AWS Managed-CachingOptimized
+          OriginRequestPolicyId: '88a5eaf4-2fd4-4709-b370-b4c650ea3fcf'  # AWS Managed-CORS-S3Origin
+          LambdaFunctionAssociations:
+            - EventType: origin-response
+              LambdaFunctionARN: !Ref LambdaEdgeVersion
+              IncludeBody: false
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt CloudFrontFunction.FunctionMetadata.FunctionARN
+          RealtimeLogConfigArn: !If
+            - EnableRealTimeLogsCondition
+            - !GetAtt RealTimeLogConfig.Arn
+            - !Ref AWS::NoValue
+
+        # Cache behaviors for different content types
+        CacheBehaviors:
+          - PathPattern: '/api/*'
+            TargetOriginId: CustomOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - DELETE
+              - GET
+              - HEAD
+              - OPTIONS
+              - PATCH
+              - POST
+              - PUT
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            CachePolicyId: '4135ea2d-6df8-44a3-9df3-4b5a84be39ad'  # AWS Managed-CachingOptimized
+            OriginRequestPolicyId: '88a5eaf4-2fd4-4709-b370-b4c650ea3fcf'  # AWS Managed-CORS-S3Origin
+            LambdaFunctionAssociations:
+              - EventType: origin-response
+                LambdaFunctionARN: !Ref LambdaEdgeVersion
+                IncludeBody: false
+          - PathPattern: '/static/*'
+            TargetOriginId: S3Origin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            CachePolicyId: '658327ea-f89d-4fab-a63d-7e88639e58f6'  # AWS Managed-CachingOptimizedForUncompressedObjects
+
+        # Custom error responses
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 404
+            ResponsePagePath: '/404.html'
+            ErrorCachingMinTTL: 300
+          - ErrorCode: 500
+            ResponseCode: 500
+            ResponsePagePath: '/500.html'
+            ErrorCachingMinTTL: 0
+
+        # Logging configuration
+        Logging:
+          Bucket: !GetAtt ContentBucket.RegionalDomainName
+          IncludeCookies: false
+          Prefix: 'cloudfront-logs/'
+
+        # Viewer certificate
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          MinimumProtocolVersion: TLSv1.2_2021
+
+        # Geographic restrictions
+        Restrictions:
+          GeoRestriction:
+            RestrictionType: none
+
+        # WAF association (conditional)
+        WebACLId: !If
+          - EnableWAFCondition
+          - !GetAtt WebACL.Arn
+          - !Ref AWS::NoValue
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # S3 Bucket Policy for CloudFront OAC
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ContentBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${ContentBucket}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  # CloudWatch Log Group for monitoring
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/cloudfront/realtime-logs/${ProjectName}'
+      RetentionInDays: 14
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Dashboard for monitoring
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'CloudFront-${ProjectName}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/CloudFront", "Requests", "DistributionId", "${CloudFrontDistribution}"],
+                  [".", "BytesDownloaded", ".", "."],
+                  [".", "BytesUploaded", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "us-east-1",
+                "title": "CloudFront Traffic"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/CloudFront", "4xxErrorRate", "DistributionId", "${CloudFrontDistribution}"],
+                  [".", "5xxErrorRate", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "us-east-1",
+                "title": "Error Rates"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/CloudFront", "CacheHitRate", "DistributionId", "${CloudFrontDistribution}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "us-east-1",
+                "title": "Cache Hit Rate"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  DistributionId:
+    Description: 'CloudFront Distribution ID'
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub '${AWS::StackName}-DistributionId'
+
+  DistributionDomainName:
+    Description: 'CloudFront Distribution Domain Name'
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-DistributionDomainName'
+
+  DistributionURL:
+    Description: 'CloudFront Distribution URL'
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DistributionURL'
+
+  S3BucketName:
+    Description: 'S3 Bucket Name for content storage'
+    Value: !Ref ContentBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketName'
+
+  S3BucketURL:
+    Description: 'S3 Bucket URL'
+    Value: !Sub 'https://${ContentBucket.RegionalDomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketURL'
+
+  LambdaEdgeFunctionArn:
+    Description: 'Lambda@Edge Function ARN'
+    Value: !Ref LambdaEdgeVersion
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaEdgeFunctionArn'
+
+  CloudFrontFunctionArn:
+    Description: 'CloudFront Function ARN'
+    Value: !GetAtt CloudFrontFunction.FunctionMetadata.FunctionARN
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFrontFunctionArn'
+
+  WebACLId:
+    Condition: EnableWAFCondition
+    Description: 'WAF Web ACL ID'
+    Value: !Ref WebACL
+    Export:
+      Name: !Sub '${AWS::StackName}-WebACLId'
+
+  WebACLArn:
+    Condition: EnableWAFCondition
+    Description: 'WAF Web ACL ARN'
+    Value: !GetAtt WebACL.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-WebACLArn'
+
+  KinesisStreamName:
+    Condition: EnableRealTimeLogsCondition
+    Description: 'Kinesis Stream Name for real-time logs'
+    Value: !Ref RealTimeLogsStream
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisStreamName'
+
+  KinesisStreamArn:
+    Condition: EnableRealTimeLogsCondition
+    Description: 'Kinesis Stream ARN for real-time logs'
+    Value: !GetAtt RealTimeLogsStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KinesisStreamArn'
+
+  KeyValueStoreId:
+    Description: 'CloudFront KeyValueStore ID'
+    Value: !Ref KeyValueStore
+    Export:
+      Name: !Sub '${AWS::StackName}-KeyValueStoreId'
+
+  KeyValueStoreArn:
+    Description: 'CloudFront KeyValueStore ARN'
+    Value: !GetAtt KeyValueStore.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KeyValueStoreArn'
+
+  DashboardURL:
+    Description: 'CloudWatch Dashboard URL'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${MonitoringDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  LogGroupName:
+    Description: 'CloudWatch Log Group Name'
+    Value: !Ref CloudWatchLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupName'

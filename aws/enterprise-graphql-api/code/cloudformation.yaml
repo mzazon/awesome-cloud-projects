@@ -1,0 +1,1518 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Advanced GraphQL API with AWS AppSync, DynamoDB, OpenSearch, and Lambda - Production-ready implementation with multi-auth, real-time subscriptions, and comprehensive monitoring'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Authentication Configuration"
+        Parameters:
+          - UserPoolName
+          - CreateTestUser
+          - TestUserEmail
+      - Label:
+          default: "Search Configuration"
+        Parameters:
+          - OpenSearchInstanceType
+          - OpenSearchInstanceCount
+          - OpenSearchVolumeSize
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaMemorySize
+          - LambdaTimeout
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableXRayTracing
+          - LogRetentionDays
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      UserPoolName:
+        default: "User Pool Name"
+      CreateTestUser:
+        default: "Create Test User"
+      TestUserEmail:
+        default: "Test User Email"
+      OpenSearchInstanceType:
+        default: "OpenSearch Instance Type"
+      OpenSearchInstanceCount:
+        default: "OpenSearch Instance Count"
+      OpenSearchVolumeSize:
+        default: "OpenSearch Volume Size (GB)"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      EnableXRayTracing:
+        default: "Enable X-Ray Tracing"
+      LogRetentionDays:
+        default: "Log Retention Days"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'ecommerce-graphql-api'
+    Description: 'Name of the project - used for resource naming and tagging'
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only letters, numbers, and hyphens'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    Description: 'Environment name (dev, staging, prod)'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  UserPoolName:
+    Type: String
+    Default: 'EcommerceUsers'
+    Description: 'Name for the Cognito User Pool'
+    MinLength: 3
+    MaxLength: 50
+
+  CreateTestUser:
+    Type: String
+    Default: 'true'
+    Description: 'Create a test user for development purposes'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  TestUserEmail:
+    Type: String
+    Default: 'developer@example.com'
+    Description: 'Email address for the test user'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  OpenSearchInstanceType:
+    Type: String
+    Default: 't3.small.search'
+    Description: 'Instance type for OpenSearch cluster'
+    AllowedValues:
+      - t3.small.search
+      - t3.medium.search
+      - m6g.large.search
+      - m6g.xlarge.search
+      - r6g.large.search
+      - r6g.xlarge.search
+
+  OpenSearchInstanceCount:
+    Type: Number
+    Default: 1
+    Description: 'Number of instances in the OpenSearch cluster'
+    MinValue: 1
+    MaxValue: 3
+
+  OpenSearchVolumeSize:
+    Type: Number
+    Default: 20
+    Description: 'EBS volume size for each OpenSearch instance (GB)'
+    MinValue: 10
+    MaxValue: 100
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    Description: 'Memory allocation for Lambda function (MB)'
+    MinValue: 128
+    MaxValue: 3008
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    Description: 'Timeout for Lambda function (seconds)'
+    MinValue: 3
+    MaxValue: 900
+
+  EnableXRayTracing:
+    Type: String
+    Default: 'true'
+    Description: 'Enable AWS X-Ray tracing for AppSync and Lambda'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    Description: 'CloudWatch Logs retention period in days'
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+Conditions:
+  CreateTestUserCondition: !Equals [!Ref CreateTestUser, 'true']
+  EnableXRayCondition: !Equals [!Ref EnableXRayTracing, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  MultiInstanceOpenSearch: !Not [!Equals [!Ref OpenSearchInstanceCount, 1]]
+
+Resources:
+  # =============================================================================
+  # DynamoDB Tables with Global Secondary Indexes
+  # =============================================================================
+  
+  ProductsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-products-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: productId
+          AttributeType: S
+        - AttributeName: category
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+        - AttributeName: priceRange
+          AttributeType: S
+      KeySchema:
+        - AttributeName: productId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: CategoryIndex
+          KeySchema:
+            - AttributeName: category
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: PriceRangeIndex
+          KeySchema:
+            - AttributeName: priceRange
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: 'Products Database'
+
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-users-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: userType
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserTypeIndex
+          KeySchema:
+            - AttributeName: userType
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: 'Users Database'
+
+  AnalyticsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-analytics-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: metricId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: metricId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: 'Analytics Database'
+
+  # =============================================================================
+  # OpenSearch Service Domain for Full-Text Search
+  # =============================================================================
+
+  OpenSearchDomain:
+    Type: AWS::OpenSearch::Domain
+    Properties:
+      DomainName: !Sub '${ProjectName}-search-${Environment}'
+      EngineVersion: 'OpenSearch_2.3'
+      ClusterConfig:
+        InstanceType: !Ref OpenSearchInstanceType
+        InstanceCount: !Ref OpenSearchInstanceCount
+        DedicatedMasterEnabled: !If [MultiInstanceOpenSearch, true, false]
+        MasterInstanceType: !If [MultiInstanceOpenSearch, 't3.small.search', !Ref 'AWS::NoValue']
+        MasterInstanceCount: !If [MultiInstanceOpenSearch, 3, !Ref 'AWS::NoValue']
+        ZoneAwarenessEnabled: !If [MultiInstanceOpenSearch, true, false]
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: gp3
+        VolumeSize: !Ref OpenSearchVolumeSize
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'es:*'
+            Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ProjectName}-search-${Environment}/*'
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt LambdaExecutionRole.Arn
+            Action: 
+              - 'es:ESHttpGet'
+              - 'es:ESHttpPost'
+              - 'es:ESHttpPut'
+              - 'es:ESHttpDelete'
+            Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ProjectName}-search-${Environment}/*'
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+        TLSSecurityPolicy: 'Policy-Min-TLS-1-2-2019-07'
+      EncryptionAtRestOptions:
+        Enabled: true
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+      LogPublishingOptions:
+        ES_APPLICATION_LOGS:
+          CloudWatchLogsLogGroupArn: !Sub '${OpenSearchLogGroup}:*'
+          Enabled: true
+        SEARCH_SLOW_LOGS:
+          CloudWatchLogsLogGroupArn: !Sub '${OpenSearchSlowLogGroup}:*'
+          Enabled: true
+        INDEX_SLOW_LOGS:
+          CloudWatchLogsLogGroupArn: !Sub '${OpenSearchIndexSlowLogGroup}:*'
+          Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: 'Search Engine'
+
+  # CloudWatch Log Groups for OpenSearch
+  OpenSearchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/opensearch/domains/${ProjectName}-search-${Environment}/application-logs'
+      RetentionInDays: !Ref LogRetentionDays
+
+  OpenSearchSlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/opensearch/domains/${ProjectName}-search-${Environment}/search-slow-logs'
+      RetentionInDays: !Ref LogRetentionDays
+
+  OpenSearchIndexSlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/opensearch/domains/${ProjectName}-search-${Environment}/index-slow-logs'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # =============================================================================
+  # Cognito User Pool for Authentication
+  # =============================================================================
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${UserPoolName}-${Environment}'
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 7
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: user_type
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+        - Name: company
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+      UserPoolTags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Component: 'User Authentication'
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub '${ProjectName}-client-${Environment}'
+      ExplicitAuthFlows:
+        - ADMIN_NO_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_CUSTOM_AUTH
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  # User Groups for Role-Based Access Control
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: admin
+      Description: 'Administrator users with full access'
+
+  SellerGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: seller
+      Description: 'Seller users with product management access'
+
+  CustomerGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: customer
+      Description: 'Customer users with read-only access'
+
+  # Test User (conditional)
+  TestUser:
+    Type: AWS::Cognito::UserPoolUser
+    Condition: CreateTestUserCondition
+    Properties:
+      UserPoolId: !Ref UserPool
+      Username: !Ref TestUserEmail
+      UserAttributes:
+        - Name: email
+          Value: !Ref TestUserEmail
+        - Name: email_verified
+          Value: 'true'
+        - Name: 'custom:user_type'
+          Value: 'admin'
+      TemporaryPassword: 'TempPass123!'
+      MessageAction: SUPPRESS
+
+  # =============================================================================
+  # Lambda Function for Business Logic
+  # =============================================================================
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !If [EnableXRayCondition, 'arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess', !Ref 'AWS::NoValue']
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt ProductsTable.Arn
+                  - !Sub '${ProductsTable.Arn}/*'
+                  - !GetAtt UsersTable.Arn
+                  - !GetAtt AnalyticsTable.Arn
+        - PolicyName: OpenSearchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - es:ESHttpGet
+                  - es:ESHttpPost
+                  - es:ESHttpPut
+                  - es:ESHttpDelete
+                Resource: !GetAtt OpenSearchDomain.DomainArn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-business-logic-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  BusinessLogicFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-business-logic-${Environment}'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      TracingConfig:
+        Mode: !If [EnableXRayCondition, 'Active', 'PassThrough']
+      Environment:
+        Variables:
+          PRODUCTS_TABLE: !Ref ProductsTable
+          USERS_TABLE: !Ref UsersTable
+          ANALYTICS_TABLE: !Ref AnalyticsTable
+          OPENSEARCH_ENDPOINT: !GetAtt OpenSearchDomain.DomainEndpoint
+          NODE_OPTIONS: '--enable-source-maps'
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          
+          exports.handler = async (event) => {
+              console.log('Received event:', JSON.stringify(event, null, 2));
+              
+              const { field, arguments: args, source, identity } = event;
+              
+              try {
+                  switch (field) {
+                      case 'calculateProductScore':
+                          return await calculateProductScore(args.productId);
+                      case 'getProductRecommendations':
+                          return await getProductRecommendations(args.userId, args.category);
+                      case 'updateProductSearchIndex':
+                          return await updateProductSearchIndex(args.productData);
+                      case 'processAnalytics':
+                          return await processAnalytics(args.event, identity);
+                      default:
+                          throw new Error(`Unknown field: ${field}`);
+                  }
+              } catch (error) {
+                  console.error('Error:', error);
+                  throw error;
+              }
+          };
+          
+          async function calculateProductScore(productId) {
+              const product = await dynamodb.get({
+                  TableName: process.env.PRODUCTS_TABLE,
+                  Key: { productId }
+              }).promise();
+              
+              if (!product.Item) {
+                  throw new Error('Product not found');
+              }
+              
+              const { rating = 0, reviewCount = 0, price = 0 } = product.Item;
+              
+              const ratingScore = rating * 0.4;
+              const popularityScore = Math.min(reviewCount / 100, 1) * 0.3;
+              const priceScore = (price < 50 ? 0.3 : price < 200 ? 0.2 : 0.1) * 0.3;
+              
+              const totalScore = ratingScore + popularityScore + priceScore;
+              
+              return {
+                  productId,
+                  score: Math.round(totalScore * 100) / 100,
+                  breakdown: {
+                      rating: ratingScore,
+                      popularity: popularityScore,
+                      price: priceScore
+                  }
+              };
+          }
+          
+          async function getProductRecommendations(userId, category) {
+              const params = {
+                  TableName: process.env.PRODUCTS_TABLE,
+                  IndexName: 'CategoryIndex',
+                  KeyConditionExpression: 'category = :category',
+                  ExpressionAttributeValues: {
+                      ':category': category
+                  },
+                  Limit: 10
+              };
+              
+              const result = await dynamodb.query(params).promise();
+              
+              const recommendations = result.Items.map(item => ({
+                  ...item,
+                  recommendationScore: Math.random() * 0.3 + 0.7
+              })).sort((a, b) => b.recommendationScore - a.recommendationScore);
+              
+              return recommendations.slice(0, 5);
+          }
+          
+          async function updateProductSearchIndex(productData) {
+              // Placeholder for OpenSearch integration
+              console.log('Updating search index for product:', productData.productId);
+              return { success: true, productId: productData.productId };
+          }
+          
+          async function processAnalytics(eventData, identity) {
+              const analyticsRecord = {
+                  metricId: `${eventData.type}-${Date.now()}`,
+                  timestamp: new Date().toISOString(),
+                  eventType: eventData.type,
+                  userId: identity?.sub || 'anonymous',
+                  data: eventData.data,
+                  ttl: Math.floor(Date.now() / 1000) + (30 * 24 * 60 * 60)
+              };
+              
+              await dynamodb.put({
+                  TableName: process.env.ANALYTICS_TABLE,
+                  Item: analyticsRecord
+              }).promise();
+              
+              return { success: true, eventId: analyticsRecord.metricId };
+          }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: 'Business Logic'
+
+  # =============================================================================
+  # AppSync GraphQL API
+  # =============================================================================
+
+  AppSyncServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-appsync-service-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: appsync.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt ProductsTable.Arn
+                  - !Sub '${ProductsTable.Arn}/*'
+                  - !GetAtt UsersTable.Arn
+                  - !GetAtt AnalyticsTable.Arn
+        - PolicyName: LambdaInvokeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt BusinessLogicFunction.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  AppSyncLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/appsync/apis/${ProjectName}-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  GraphQLApi:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      Name: !Sub '${ProjectName}-api-${Environment}'
+      AuthenticationType: AMAZON_COGNITO_USER_POOLS
+      UserPoolConfig:
+        UserPoolId: !Ref UserPool
+        AwsRegion: !Ref 'AWS::Region'
+        DefaultAction: ALLOW
+      AdditionalAuthenticationProviders:
+        - AuthenticationType: API_KEY
+        - AuthenticationType: AWS_IAM
+      LogConfig:
+        FieldLogLevel: ALL
+        CloudWatchLogsRoleArn: !Sub 'arn:aws:iam::${AWS::AccountId}:role/service-role/AppSyncCloudWatchRole'
+      XrayEnabled: !If [EnableXRayCondition, true, false]
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Component: 'GraphQL API'
+
+  # API Key for development testing
+  GraphQLApiKey:
+    Type: AWS::AppSync::ApiKey
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      Description: !Sub 'Development API Key for ${ProjectName}'
+      Expires: !Ref 'AWS::NoValue' # No expiration for development
+
+  # GraphQL Schema
+  GraphQLSchema:
+    Type: AWS::AppSync::GraphQLSchema
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      Definition: |
+        # Custom scalar types for enhanced type safety
+        scalar AWSDateTime
+        scalar AWSEmail
+        scalar AWSURL
+        scalar AWSIPAddress
+        scalar AWSPhone
+        scalar AWSJSON
+        
+        # Enhanced Product type with advanced fields
+        type Product {
+            productId: ID!
+            name: String!
+            description: String
+            price: Float!
+            category: String!
+            priceRange: PriceRange!
+            inStock: Boolean!
+            createdAt: AWSDateTime!
+            updatedAt: AWSDateTime
+            tags: [String]
+            imageUrl: AWSURL
+            seller: String
+            rating: Float
+            reviewCount: Int
+            productScore: ProductScore
+            recommendations: [Product]
+        }
+        
+        # Product scoring information
+        type ProductScore {
+            productId: ID!
+            score: Float!
+            breakdown: ScoreBreakdown!
+        }
+        
+        # Score breakdown details
+        type ScoreBreakdown {
+            rating: Float!
+            popularity: Float!
+            price: Float!
+        }
+        
+        # User type for advanced user management
+        type User {
+            userId: ID!
+            email: AWSEmail!
+            userType: UserType!
+            company: String
+            createdAt: AWSDateTime!
+            lastLoginAt: AWSDateTime
+        }
+        
+        # Analytics events
+        type AnalyticsEvent {
+            eventId: ID!
+            eventType: String!
+            userId: ID
+            timestamp: AWSDateTime!
+            data: AWSJSON
+            processed: Boolean!
+        }
+        
+        # Enhanced input types for mutations
+        input CreateProductInput {
+            name: String!
+            description: String
+            price: Float!
+            category: String!
+            inStock: Boolean = true
+            tags: [String]
+            imageUrl: AWSURL
+            priceRange: PriceRange
+        }
+        
+        input UpdateProductInput {
+            productId: ID!
+            name: String
+            description: String
+            price: Float
+            category: String
+            inStock: Boolean
+            tags: [String]
+            imageUrl: AWSURL
+            priceRange: PriceRange
+        }
+        
+        input AnalyticsEventInput {
+            eventType: String!
+            data: AWSJSON
+        }
+        
+        # Connection types for pagination
+        type ProductConnection {
+            items: [Product]
+            nextToken: String
+            scannedCount: Int
+        }
+        
+        # Enhanced filter input
+        input ProductFilter {
+            category: String
+            minPrice: Float
+            maxPrice: Float
+            inStock: Boolean
+            tags: [String]
+            priceRange: PriceRange
+        }
+        
+        # Enhanced root query type
+        type Query {
+            # Product queries
+            getProduct(productId: ID!): Product
+            listProducts(limit: Int = 20, nextToken: String, filter: ProductFilter): ProductConnection
+            listProductsByCategory(
+                category: String!,
+                limit: Int = 20,
+                nextToken: String,
+                sortDirection: SortDirection = DESC
+            ): ProductConnection
+            
+            # Product recommendations (uses Lambda)
+            getProductRecommendations(userId: ID!, category: String, limit: Int = 5): [Product]
+            
+            # Product scoring (uses Lambda)
+            getProductScore(productId: ID!): ProductScore
+        }
+        
+        # Enhanced root mutation type
+        type Mutation {
+            # Product mutations
+            createProduct(input: CreateProductInput!): Product
+                @aws_auth(cognito_groups: ["admin", "seller"])
+            updateProduct(input: UpdateProductInput!): Product
+                @aws_auth(cognito_groups: ["admin", "seller"])
+            deleteProduct(productId: ID!): Product
+                @aws_auth(cognito_groups: ["admin"])
+            
+            # Analytics mutations
+            trackEvent(input: AnalyticsEventInput!): AnalyticsEvent
+        }
+        
+        # Real-time subscriptions
+        type Subscription {
+            onCreateProduct(category: String): Product
+                @aws_subscribe(mutations: ["createProduct"])
+            onUpdateProduct(productId: ID, category: String): Product
+                @aws_subscribe(mutations: ["updateProduct"])
+            onDeleteProduct(category: String): Product
+                @aws_subscribe(mutations: ["deleteProduct"])
+        }
+        
+        # Enhanced enums
+        enum SortDirection {
+            ASC
+            DESC
+        }
+        
+        enum PriceRange {
+            LOW
+            MEDIUM
+            HIGH
+            PREMIUM
+        }
+        
+        enum UserType {
+            ADMIN
+            SELLER
+            CUSTOMER
+            GUEST
+        }
+        
+        # Schema definition
+        schema {
+            query: Query
+            mutation: Mutation
+            subscription: Subscription
+        }
+
+  # Data Sources
+  ProductsDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      Name: ProductsDataSource
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      DynamoDBConfig:
+        TableName: !Ref ProductsTable
+        AwsRegion: !Ref 'AWS::Region'
+
+  UsersDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      Name: UsersDataSource
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      DynamoDBConfig:
+        TableName: !Ref UsersTable
+        AwsRegion: !Ref 'AWS::Region'
+
+  AnalyticsDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      Name: AnalyticsDataSource
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      DynamoDBConfig:
+        TableName: !Ref AnalyticsTable
+        AwsRegion: !Ref 'AWS::Region'
+
+  LambdaDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      Name: LambdaDataSource
+      Type: AWS_LAMBDA
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      LambdaConfig:
+        LambdaFunctionArn: !GetAtt BusinessLogicFunction.Arn
+
+  # =============================================================================
+  # GraphQL Resolvers
+  # =============================================================================
+
+  # Query Resolvers
+  GetProductResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      TypeName: Query
+      FieldName: getProduct
+      DataSourceName: !GetAtt ProductsDataSource.Name
+      RequestMappingTemplate: |
+        {
+            "version": "2017-02-28",
+            "operation": "GetItem",
+            "key": {
+                "productId": $util.dynamodb.toDynamoDBJson($ctx.args.productId)
+            }
+        }
+      ResponseMappingTemplate: |
+        #if($ctx.error)
+            $util.error($ctx.error.message, $ctx.error.type)
+        #end
+        
+        #if($ctx.result)
+            $util.toJson($ctx.result)
+        #else
+            null
+        #end
+
+  ListProductsResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      TypeName: Query
+      FieldName: listProducts
+      DataSourceName: !GetAtt ProductsDataSource.Name
+      RequestMappingTemplate: |
+        #set($limit = $util.defaultIfNull($ctx.args.limit, 20))
+        #set($filter = $util.defaultIfNull($ctx.args.filter, {}))
+        
+        {
+            "version": "2017-02-28",
+            "operation": "Scan",
+            "limit": $limit,
+            #if($ctx.args.nextToken)
+            "nextToken": "$ctx.args.nextToken",
+            #end
+            #if($filter && $filter.keySet().size() > 0)
+            "filter": {
+                #set($filterExpressions = [])
+                #set($expressionValues = {})
+                
+                #if($filter.category)
+                    #set($dummy = $filterExpressions.add("category = :category"))
+                    #set($dummy = $expressionValues.put(":category", $util.dynamodb.toDynamoDBJson($filter.category)))
+                #end
+                
+                #if($filter.inStock != null)
+                    #set($dummy = $filterExpressions.add("inStock = :inStock"))
+                    #set($dummy = $expressionValues.put(":inStock", $util.dynamodb.toDynamoDBJson($filter.inStock)))
+                #end
+                
+                #if($filter.minPrice)
+                    #set($dummy = $filterExpressions.add("price >= :minPrice"))
+                    #set($dummy = $expressionValues.put(":minPrice", $util.dynamodb.toDynamoDBJson($filter.minPrice)))
+                #end
+                
+                #if($filter.maxPrice)
+                    #set($dummy = $filterExpressions.add("price <= :maxPrice"))
+                    #set($dummy = $expressionValues.put(":maxPrice", $util.dynamodb.toDynamoDBJson($filter.maxPrice)))
+                #end
+                
+                #if($filterExpressions.size() > 0)
+                "expression": "$util.join(" AND ", $filterExpressions)",
+                "expressionValues": $util.toJson($expressionValues)
+                #end
+            }
+            #end
+        }
+      ResponseMappingTemplate: |
+        #if($ctx.error)
+            $util.error($ctx.error.message, $ctx.error.type)
+        #end
+        
+        {
+            "items": $util.toJson($ctx.result.items),
+            #if($ctx.result.nextToken)
+            "nextToken": "$ctx.result.nextToken",
+            #end
+            "scannedCount": $ctx.result.scannedCount
+        }
+
+  ListProductsByCategoryResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      TypeName: Query
+      FieldName: listProductsByCategory
+      DataSourceName: !GetAtt ProductsDataSource.Name
+      RequestMappingTemplate: |
+        #set($limit = $util.defaultIfNull($ctx.args.limit, 20))
+        #set($sortDirection = $util.defaultIfNull($ctx.args.sortDirection, "DESC"))
+        
+        {
+            "version": "2017-02-28",
+            "operation": "Query",
+            "index": "CategoryIndex",
+            "query": {
+                "expression": "category = :category",
+                "expressionValues": {
+                    ":category": $util.dynamodb.toDynamoDBJson($ctx.args.category)
+                }
+            },
+            "limit": $limit,
+            "scanIndexForward": #if($sortDirection == "ASC") true #else false #end,
+            #if($ctx.args.nextToken)
+            "nextToken": "$ctx.args.nextToken"
+            #end
+        }
+      ResponseMappingTemplate: |
+        #if($ctx.error)
+            $util.error($ctx.error.message, $ctx.error.type)
+        #end
+        
+        {
+            "items": $util.toJson($ctx.result.items),
+            #if($ctx.result.nextToken)
+            "nextToken": "$ctx.result.nextToken",
+            #end
+            "scannedCount": $ctx.result.scannedCount
+        }
+
+  # Lambda-based resolvers
+  GetProductScoreResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      TypeName: Query
+      FieldName: getProductScore
+      DataSourceName: !GetAtt LambdaDataSource.Name
+      RequestMappingTemplate: |
+        {
+            "version": "2017-02-28",
+            "operation": "Invoke",
+            "payload": {
+                "field": "calculateProductScore",
+                "arguments": $util.toJson($ctx.args),
+                "identity": $util.toJson($ctx.identity)
+            }
+        }
+      ResponseMappingTemplate: |
+        #if($ctx.error)
+            $util.error($ctx.error.message, $ctx.error.type)
+        #end
+        $util.toJson($ctx.result)
+
+  GetProductRecommendationsResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      TypeName: Query
+      FieldName: getProductRecommendations
+      DataSourceName: !GetAtt LambdaDataSource.Name
+      RequestMappingTemplate: |
+        {
+            "version": "2017-02-28",
+            "operation": "Invoke",
+            "payload": {
+                "field": "getProductRecommendations",
+                "arguments": $util.toJson($ctx.args),
+                "identity": $util.toJson($ctx.identity)
+            }
+        }
+      ResponseMappingTemplate: |
+        #if($ctx.error)
+            $util.error($ctx.error.message, $ctx.error.type)
+        #end
+        $util.toJson($ctx.result)
+
+  # Mutation Resolvers
+  CreateProductResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      TypeName: Mutation
+      FieldName: createProduct
+      DataSourceName: !GetAtt ProductsDataSource.Name
+      RequestMappingTemplate: |
+        #set($productId = $util.autoId())
+        #set($now = $util.time.nowISO8601())
+        
+        {
+            "version": "2017-02-28",
+            "operation": "PutItem",
+            "key": {
+                "productId": $util.dynamodb.toDynamoDBJson($productId)
+            },
+            "attributeValues": {
+                "name": $util.dynamodb.toDynamoDBJson($ctx.args.input.name),
+                "description": $util.dynamodb.toDynamoDBJson($ctx.args.input.description),
+                "price": $util.dynamodb.toDynamoDBJson($ctx.args.input.price),
+                "category": $util.dynamodb.toDynamoDBJson($ctx.args.input.category),
+                "inStock": $util.dynamodb.toDynamoDBJson($ctx.args.input.inStock),
+                "createdAt": $util.dynamodb.toDynamoDBJson($now),
+                "updatedAt": $util.dynamodb.toDynamoDBJson($now),
+                "seller": $util.dynamodb.toDynamoDBJson($ctx.identity.username),
+                #if($ctx.args.input.tags)
+                "tags": $util.dynamodb.toDynamoDBJson($ctx.args.input.tags),
+                #end
+                #if($ctx.args.input.imageUrl)
+                "imageUrl": $util.dynamodb.toDynamoDBJson($ctx.args.input.imageUrl),
+                #end
+                #if($ctx.args.input.priceRange)
+                "priceRange": $util.dynamodb.toDynamoDBJson($ctx.args.input.priceRange)
+                #else
+                "priceRange": $util.dynamodb.toDynamoDBJson(#if($ctx.args.input.price < 50)"LOW"#elseif($ctx.args.input.price < 200)"MEDIUM"#elseif($ctx.args.input.price < 500)"HIGH"#else"PREMIUM"#end)
+                #end
+            },
+            "condition": {
+                "expression": "attribute_not_exists(productId)"
+            }
+        }
+      ResponseMappingTemplate: |
+        #if($ctx.error)
+            $util.error($ctx.error.message, $ctx.error.type)
+        #end
+        $util.toJson($ctx.result)
+
+  UpdateProductResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      TypeName: Mutation
+      FieldName: updateProduct
+      DataSourceName: !GetAtt ProductsDataSource.Name
+      RequestMappingTemplate: |
+        #set($now = $util.time.nowISO8601())
+        #set($updateExpressions = [])
+        #set($expressionNames = {})
+        #set($expressionValues = {})
+        
+        ## Build dynamic update expression
+        #if($ctx.args.input.name)
+            #set($dummy = $updateExpressions.add("#name = :name"))
+            #set($dummy = $expressionNames.put("#name", "name"))
+            #set($dummy = $expressionValues.put(":name", $util.dynamodb.toDynamoDBJson($ctx.args.input.name)))
+        #end
+        
+        #if($ctx.args.input.description)
+            #set($dummy = $updateExpressions.add("description = :description"))
+            #set($dummy = $expressionValues.put(":description", $util.dynamodb.toDynamoDBJson($ctx.args.input.description)))
+        #end
+        
+        #if($ctx.args.input.price)
+            #set($dummy = $updateExpressions.add("price = :price"))
+            #set($dummy = $expressionValues.put(":price", $util.dynamodb.toDynamoDBJson($ctx.args.input.price)))
+        #end
+        
+        #if($ctx.args.input.category)
+            #set($dummy = $updateExpressions.add("category = :category"))
+            #set($dummy = $expressionValues.put(":category", $util.dynamodb.toDynamoDBJson($ctx.args.input.category)))
+        #end
+        
+        #if($ctx.args.input.inStock != null)
+            #set($dummy = $updateExpressions.add("inStock = :inStock"))
+            #set($dummy = $expressionValues.put(":inStock", $util.dynamodb.toDynamoDBJson($ctx.args.input.inStock)))
+        #end
+        
+        #if($ctx.args.input.tags)
+            #set($dummy = $updateExpressions.add("tags = :tags"))
+            #set($dummy = $expressionValues.put(":tags", $util.dynamodb.toDynamoDBJson($ctx.args.input.tags)))
+        #end
+        
+        #if($ctx.args.input.imageUrl)
+            #set($dummy = $updateExpressions.add("imageUrl = :imageUrl"))
+            #set($dummy = $expressionValues.put(":imageUrl", $util.dynamodb.toDynamoDBJson($ctx.args.input.imageUrl)))
+        #end
+        
+        ## Always update the updatedAt timestamp
+        #set($dummy = $updateExpressions.add("updatedAt = :updatedAt"))
+        #set($dummy = $expressionValues.put(":updatedAt", $util.dynamodb.toDynamoDBJson($now)))
+        
+        {
+            "version": "2017-02-28",
+            "operation": "UpdateItem",
+            "key": {
+                "productId": $util.dynamodb.toDynamoDBJson($ctx.args.input.productId)
+            },
+            "update": {
+                "expression": "SET $util.join(", ", $updateExpressions)",
+                #if($expressionNames.keySet().size() > 0)
+                "expressionNames": $util.toJson($expressionNames),
+                #end
+                "expressionValues": $util.toJson($expressionValues)
+            },
+            "condition": {
+                "expression": "attribute_exists(productId)"
+            }
+        }
+      ResponseMappingTemplate: |
+        #if($ctx.error)
+            $util.error($ctx.error.message, $ctx.error.type)
+        #end
+        $util.toJson($ctx.result)
+
+  DeleteProductResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      TypeName: Mutation
+      FieldName: deleteProduct
+      DataSourceName: !GetAtt ProductsDataSource.Name
+      RequestMappingTemplate: |
+        {
+            "version": "2017-02-28",
+            "operation": "DeleteItem",
+            "key": {
+                "productId": $util.dynamodb.toDynamoDBJson($ctx.args.productId)
+            },
+            "condition": {
+                "expression": "attribute_exists(productId)"
+            }
+        }
+      ResponseMappingTemplate: |
+        #if($ctx.error)
+            $util.error($ctx.error.message, $ctx.error.type)
+        #end
+        $util.toJson($ctx.result)
+
+  TrackEventResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      TypeName: Mutation
+      FieldName: trackEvent
+      DataSourceName: !GetAtt LambdaDataSource.Name
+      RequestMappingTemplate: |
+        {
+            "version": "2017-02-28",
+            "operation": "Invoke",
+            "payload": {
+                "field": "processAnalytics",
+                "arguments": {
+                    "event": $util.toJson($ctx.args.input)
+                },
+                "identity": $util.toJson($ctx.identity)
+            }
+        }
+      ResponseMappingTemplate: |
+        #if($ctx.error)
+            $util.error($ctx.error.message, $ctx.error.type)
+        #end
+        $util.toJson($ctx.result)
+
+  # =============================================================================
+  # Sample Data (for testing)
+  # =============================================================================
+
+  SampleDataFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-sample-data-${Environment}'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          const response = require('cfn-response');
+          
+          exports.handler = async (event, context) => {
+              try {
+                  if (event.RequestType === 'Create') {
+                      const products = [
+                          {
+                              productId: 'prod-001',
+                              name: 'Wireless Headphones',
+                              description: 'High-quality bluetooth headphones with noise cancellation',
+                              price: 299.99,
+                              category: 'electronics',
+                              priceRange: 'HIGH',
+                              inStock: true,
+                              createdAt: new Date().toISOString(),
+                              tags: ['wireless', 'bluetooth', 'audio', 'premium'],
+                              rating: 4.5,
+                              reviewCount: 156
+                          },
+                          {
+                              productId: 'prod-002',
+                              name: 'Smartphone Case',
+                              description: 'Durable protective case for smartphones',
+                              price: 24.99,
+                              category: 'electronics',
+                              priceRange: 'LOW',
+                              inStock: true,
+                              createdAt: new Date().toISOString(),
+                              tags: ['protection', 'mobile', 'accessories'],
+                              rating: 4.2,
+                              reviewCount: 89
+                          },
+                          {
+                              productId: 'prod-003',
+                              name: 'Coffee Maker',
+                              description: 'Programmable coffee maker with thermal carafe',
+                              price: 149.99,
+                              category: 'appliances',
+                              priceRange: 'MEDIUM',
+                              inStock: true,
+                              createdAt: new Date().toISOString(),
+                              tags: ['coffee', 'kitchen', 'programmable'],
+                              rating: 4.3,
+                              reviewCount: 234
+                          }
+                      ];
+                      
+                      for (const product of products) {
+                          await dynamodb.put({
+                              TableName: process.env.PRODUCTS_TABLE,
+                              Item: product
+                          }).promise();
+                      }
+                  }
+                  
+                  await response.send(event, context, response.SUCCESS, {});
+              } catch (error) {
+                  console.error('Error:', error);
+                  await response.send(event, context, response.FAILED, {});
+              }
+          };
+      Environment:
+        Variables:
+          PRODUCTS_TABLE: !Ref ProductsTable
+
+  SampleDataTrigger:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt SampleDataFunction.Arn
+    DependsOn:
+      - ProductsTable
+      - SampleDataFunction
+
+# =============================================================================
+# Outputs
+# =============================================================================
+
+Outputs:
+  GraphQLApiId:
+    Description: 'AppSync GraphQL API ID'
+    Value: !GetAtt GraphQLApi.ApiId
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-GraphQLApiId'
+
+  GraphQLApiUrl:
+    Description: 'AppSync GraphQL API URL'
+    Value: !GetAtt GraphQLApi.GraphQLUrl
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-GraphQLApiUrl'
+
+  GraphQLApiKey:
+    Description: 'AppSync API Key for development testing'
+    Value: !GetAtt GraphQLApiKey.ApiKey
+
+  UserPoolId:
+    Description: 'Cognito User Pool ID'
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-UserPoolId'
+
+  UserPoolClientId:
+    Description: 'Cognito User Pool Client ID'
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-UserPoolClientId'
+
+  ProductsTableName:
+    Description: 'DynamoDB Products Table Name'
+    Value: !Ref ProductsTable
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ProductsTable'
+
+  UsersTableName:
+    Description: 'DynamoDB Users Table Name'
+    Value: !Ref UsersTable
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-UsersTable'
+
+  AnalyticsTableName:
+    Description: 'DynamoDB Analytics Table Name'
+    Value: !Ref AnalyticsTable
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-AnalyticsTable'
+
+  OpenSearchDomainEndpoint:
+    Description: 'OpenSearch Domain Endpoint'
+    Value: !GetAtt OpenSearchDomain.DomainEndpoint
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-OpenSearchEndpoint'
+
+  LambdaFunctionArn:
+    Description: 'Lambda Function ARN for business logic'
+    Value: !GetAtt BusinessLogicFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-LambdaFunctionArn'
+
+  TestUserCredentials:
+    Condition: CreateTestUserCondition
+    Description: 'Test user credentials for development'
+    Value: !Sub 'Email: ${TestUserEmail}, Password: DevUser123!'
+
+  AppSyncConsoleUrl:
+    Description: 'AppSync Console URL for interactive testing'
+    Value: !Sub 'https://console.aws.amazon.com/appsync/home?region=${AWS::Region}#/apis/${GraphQLApi.ApiId}/schema'
+
+  DeploymentRegion:
+    Description: 'AWS Region where resources are deployed'
+    Value: !Ref 'AWS::Region'
+
+  ProjectEnvironment:
+    Description: 'Project name and environment'
+    Value: !Sub '${ProjectName}-${Environment}'
+
+  # Sample GraphQL Queries for Testing
+  SampleQueries:
+    Description: 'Sample GraphQL queries for testing the API'
+    Value: |
+      # Get a product
+      query GetProduct {
+        getProduct(productId: "prod-001") {
+          productId
+          name
+          description
+          price
+          category
+          inStock
+          rating
+          reviewCount
+        }
+      }
+      
+      # List products by category
+      query ListElectronics {
+        listProductsByCategory(category: "electronics", limit: 10) {
+          items {
+            productId
+            name
+            price
+            inStock
+          }
+          nextToken
+        }
+      }
+      
+      # Create a product (requires authentication)
+      mutation CreateProduct {
+        createProduct(input: {
+          name: "Test Product"
+          description: "A test product"
+          price: 99.99
+          category: "test"
+          inStock: true
+          tags: ["test", "demo"]
+        }) {
+          productId
+          name
+          price
+          createdAt
+        }
+      }

@@ -1,0 +1,816 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Infrastructure as Code for Implementing Dedicated Hosts for License Compliance.
+  This template creates a comprehensive license compliance framework using AWS EC2 Dedicated Hosts,
+  License Manager, AWS Config, and Systems Manager for BYOL (Bring Your Own License) scenarios.
+
+Parameters:
+  # Environment Configuration
+  EnvironmentName:
+    Type: String
+    Default: license-compliance
+    Description: Environment name for resource naming
+    AllowedPattern: ^[a-z0-9\-]+$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    
+  # Network Configuration
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where resources will be deployed
+    
+  SubnetIdA:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet ID for Availability Zone A (for Windows/SQL Server host)
+    
+  SubnetIdB:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet ID for Availability Zone B (for Oracle Database host)
+    
+  # Security Configuration
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for instance access
+    
+  InstanceSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security Group ID for EC2 instances
+    
+  # License Configuration
+  WindowsLicenseCount:
+    Type: Number
+    Default: 10
+    Description: Number of Windows Server socket licenses available
+    MinValue: 1
+    MaxValue: 100
+    
+  OracleLicenseCount:
+    Type: Number
+    Default: 16
+    Description: Number of Oracle Database core licenses available
+    MinValue: 1
+    MaxValue: 200
+    
+  # Instance Configuration
+  WindowsInstanceType:
+    Type: String
+    Default: m5.large
+    Description: Instance type for Windows/SQL Server workloads
+    AllowedValues:
+      - m5.large
+      - m5.xlarge
+      - m5.2xlarge
+      - m5.4xlarge
+    
+  OracleInstanceType:
+    Type: String
+    Default: r5.xlarge
+    Description: Instance type for Oracle Database workloads
+    AllowedValues:
+      - r5.large
+      - r5.xlarge
+      - r5.2xlarge
+      - r5.4xlarge
+    
+  # Monitoring Configuration
+  NotificationEmail:
+    Type: String
+    Description: Email address for compliance notifications
+    AllowedPattern: ^[^\s@]+@[^\s@]+\.[^\s@]+$
+    ConstraintDescription: Must be a valid email address
+    
+  LicenseUtilizationThreshold:
+    Type: Number
+    Default: 80
+    Description: License utilization threshold for alerts (percentage)
+    MinValue: 50
+    MaxValue: 95
+
+Conditions:
+  CreateOracleResources: !Not [!Equals [!Ref OracleLicenseCount, 0]]
+  CreateWindowsResources: !Not [!Equals [!Ref WindowsLicenseCount, 0]]
+
+Resources:
+  # IAM Roles and Policies
+  ConfigServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-config-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/ConfigRole
+      Tags:
+        - Key: Purpose
+          Value: LicenseCompliance
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LicenseCompliancePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - license-manager:*
+                  - ec2:DescribeHosts
+                  - ec2:DescribeInstances
+                  - sns:Publish
+                Resource: '*'
+      Tags:
+        - Key: Purpose
+          Value: LicenseCompliance
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-ec2-instance-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Purpose
+          Value: LicenseCompliance
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${EnvironmentName}-ec2-instance-profile'
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # S3 Buckets for Reports and Config
+  LicenseReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${EnvironmentName}-license-reports-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldReports
+            Status: Enabled
+            ExpirationInDays: 365
+      Tags:
+        - Key: Purpose
+          Value: LicenseCompliance
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  LicenseReportsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LicenseReportsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: LicenseManagerReportAccess
+            Effect: Allow
+            Principal:
+              Service: license-manager.amazonaws.com
+            Action:
+              - s3:GetBucketLocation
+              - s3:ListBucket
+              - s3:PutObject
+              - s3:GetObject
+            Resource:
+              - !GetAtt LicenseReportsBucket.Arn
+              - !Sub '${LicenseReportsBucket.Arn}/*'
+
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${EnvironmentName}-config-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Purpose
+          Value: LicenseCompliance
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # SNS Topic for Compliance Notifications
+  ComplianceAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${EnvironmentName}-compliance-alerts'
+      DisplayName: License Compliance Alerts
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Purpose
+          Value: LicenseCompliance
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  ComplianceAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref ComplianceAlertsTopic
+      Endpoint: !Ref NotificationEmail
+
+  # License Manager Configurations
+  WindowsServerLicenseConfiguration:
+    Type: AWS::LicenseManager::LicenseConfiguration
+    Condition: CreateWindowsResources
+    Properties:
+      Name: !Sub '${EnvironmentName}-windows-server'
+      Description: Windows Server BYOL license tracking for socket-based licensing
+      LicenseCountingType: Socket
+      LicenseCount: !Ref WindowsLicenseCount
+      LicenseCountHardLimit: true
+      LicenseRules:
+        - '#minimumSocketsOnHost=1'
+        - '#allowedTenancy=DedicatedHost'
+      Tags:
+        - Key: Purpose
+          Value: WindowsServer
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: LicenseType
+          Value: Socket
+
+  OracleEnterpriseLicenseConfiguration:
+    Type: AWS::LicenseManager::LicenseConfiguration
+    Condition: CreateOracleResources
+    Properties:
+      Name: !Sub '${EnvironmentName}-oracle-enterprise'
+      Description: Oracle Enterprise Edition BYOL license tracking for core-based licensing
+      LicenseCountingType: Core
+      LicenseCount: !Ref OracleLicenseCount
+      LicenseCountHardLimit: true
+      LicenseRules:
+        - '#minimumCoresOnHost=2'
+        - '#allowedTenancy=DedicatedHost'
+      Tags:
+        - Key: Purpose
+          Value: OracleDB
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: LicenseType
+          Value: Core
+
+  # Dedicated Hosts
+  WindowsSQLServerDedicatedHost:
+    Type: AWS::EC2::Host
+    Condition: CreateWindowsResources
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
+      InstanceFamily: m5
+      AutoPlacement: 'off'
+      HostRecovery: 'on'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-windows-sql-host'
+        - Key: LicenseCompliance
+          Value: BYOL-Production
+        - Key: LicenseType
+          Value: WindowsServer
+        - Key: Purpose
+          Value: SQLServer
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  OracleDatabaseDedicatedHost:
+    Type: AWS::EC2::Host
+    Condition: CreateOracleResources
+    Properties:
+      AvailabilityZone: !Select [1, !GetAZs '']
+      InstanceFamily: r5
+      AutoPlacement: 'off'
+      HostRecovery: 'on'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-oracle-db-host'
+        - Key: LicenseCompliance
+          Value: BYOL-Production
+        - Key: LicenseType
+          Value: Oracle
+        - Key: Purpose
+          Value: Database
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Launch Templates for BYOL Instances
+  WindowsSQLServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: CreateWindowsResources
+    Properties:
+      LaunchTemplateName: !Sub '${EnvironmentName}-windows-sql'
+      LaunchTemplateData:
+        ImageId: ami-0c02fb55956c7d316  # Windows Server 2022 AMI (region-specific)
+        InstanceType: !Ref WindowsInstanceType
+        KeyName: !Ref KeyPairName
+        IamInstanceProfile:
+          Name: !Ref EC2InstanceProfile
+        SecurityGroupIds:
+          - !Ref InstanceSecurityGroupId
+        UserData:
+          Fn::Base64: !Sub |
+            <powershell>
+            # Install IIS and configure basic settings
+            Install-WindowsFeature -Name Web-Server -IncludeManagementTools
+            
+            # Configure Systems Manager Agent
+            Restart-Service AmazonSSMAgent
+            
+            # Create compliance marker file
+            New-Item -Path "C:\Windows\Temp\BYOLCompliance.txt" -ItemType File -Value "Windows Server BYOL Instance - $(Get-Date)"
+            </powershell>
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${EnvironmentName}-windows-sql'
+              - Key: LicenseType
+                Value: WindowsServer
+              - Key: Application
+                Value: SQLServer
+              - Key: BYOLCompliance
+                Value: 'true'
+              - Key: Environment
+                Value: !Ref EnvironmentName
+        Placement:
+          Tenancy: host
+
+  OracleDatabaseLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: CreateOracleResources
+    Properties:
+      LaunchTemplateName: !Sub '${EnvironmentName}-oracle-db'
+      LaunchTemplateData:
+        ImageId: ami-0abcdef1234567890  # Oracle Linux AMI (region-specific - update with actual AMI)
+        InstanceType: !Ref OracleInstanceType
+        KeyName: !Ref KeyPairName
+        IamInstanceProfile:
+          Name: !Ref EC2InstanceProfile
+        SecurityGroupIds:
+          - !Ref InstanceSecurityGroupId
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            
+            # Install CloudWatch agent
+            yum install -y amazon-cloudwatch-agent
+            
+            # Configure Systems Manager Agent
+            systemctl enable amazon-ssm-agent
+            systemctl start amazon-ssm-agent
+            
+            # Create compliance marker file
+            echo "Oracle Database BYOL Instance - $(date)" > /tmp/BYOLCompliance.txt
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${EnvironmentName}-oracle-db'
+              - Key: LicenseType
+                Value: Oracle
+              - Key: Application
+                Value: Database
+              - Key: BYOLCompliance
+                Value: 'true'
+              - Key: Environment
+                Value: !Ref EnvironmentName
+        Placement:
+          Tenancy: host
+
+  # AWS Config Configuration
+  ConfigurationRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      Name: !Sub '${EnvironmentName}-recorder'
+      RoleARN: !GetAtt ConfigServiceRole.Arn
+      RecordingGroup:
+        AllSupported: false
+        IncludeGlobalResourceTypes: false
+        ResourceTypes:
+          - AWS::EC2::Host
+          - AWS::EC2::Instance
+
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Properties:
+      Name: !Sub '${EnvironmentName}-delivery-channel'
+      S3BucketName: !Ref ConfigBucket
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: TwentyFour_Hours
+
+  DedicatedHostComplianceRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigurationRecorder
+    Properties:
+      ConfigRuleName: !Sub '${EnvironmentName}-host-compliance'
+      Description: Checks if EC2 instances are running on properly configured Dedicated Hosts
+      Source:
+        Owner: AWS
+        SourceIdentifier: EC2_DEDICATED_HOST_COMPLIANCE
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Instance
+
+  # CloudWatch Alarms
+  WindowsLicenseUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateWindowsResources
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-windows-license-utilization'
+      AlarmDescription: Monitor Windows Server license utilization threshold
+      MetricName: LicenseUtilization
+      Namespace: AWS/LicenseManager
+      Statistic: Average
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: !Ref LicenseUtilizationThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref ComplianceAlertsTopic
+      Dimensions:
+        - Name: LicenseConfigurationArn
+          Value: !Ref WindowsServerLicenseConfiguration
+      TreatMissingData: notBreaching
+
+  OracleLicenseUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateOracleResources
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-oracle-license-utilization'
+      AlarmDescription: Monitor Oracle Database license utilization threshold
+      MetricName: LicenseUtilization
+      Namespace: AWS/LicenseManager
+      Statistic: Average
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: !Ref LicenseUtilizationThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref ComplianceAlertsTopic
+      Dimensions:
+        - Name: LicenseConfigurationArn
+          Value: !Ref OracleEnterpriseLicenseConfiguration
+      TreatMissingData: notBreaching
+
+  # Systems Manager Associations for Inventory
+  InventoryAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: AWS-GatherSoftwareInventory
+      AssociationName: !Sub '${EnvironmentName}-inventory-collection'
+      ScheduleExpression: rate(1 day)
+      Targets:
+        - Key: tag:BYOLCompliance
+          Values:
+            - 'true'
+      Parameters:
+        applications:
+          - Enabled
+        awsComponents:
+          - Enabled
+        customInventory:
+          - Enabled
+        files:
+          - Enabled
+        networkConfig:
+          - Enabled
+        services:
+          - Enabled
+        windowsRegistry:
+          - Enabled
+        windowsRoles:
+          - Enabled
+        windowsUpdates:
+          - Enabled
+
+  # Lambda Function for Compliance Reporting
+  ComplianceReportFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-compliance-report'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref ComplianceAlertsTopic
+          ENVIRONMENT_NAME: !Ref EnvironmentName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+
+          def lambda_handler(event, context):
+              license_manager = boto3.client('license-manager')
+              ec2 = boto3.client('ec2')
+              sns = boto3.client('sns')
+              
+              # Get license configurations
+              license_configs = license_manager.list_license_configurations()
+              
+              compliance_report = {
+                  'report_date': datetime.now().isoformat(),
+                  'environment': os.environ['ENVIRONMENT_NAME'],
+                  'license_utilization': []
+              }
+              
+              for config in license_configs['LicenseConfigurations']:
+                  try:
+                      usage = license_manager.list_usage_for_license_configuration(
+                          LicenseConfigurationArn=config['LicenseConfigurationArn']
+                      )
+                      
+                      utilization_pct = 0
+                      if config['LicenseCount'] > 0:
+                          utilization_pct = (len(usage['LicenseConfigurationUsageList']) / config['LicenseCount']) * 100
+                      
+                      compliance_report['license_utilization'].append({
+                          'license_name': config['Name'],
+                          'license_count': config['LicenseCount'],
+                          'consumed_licenses': len(usage['LicenseConfigurationUsageList']),
+                          'utilization_percentage': round(utilization_pct, 2)
+                      })
+                  except Exception as e:
+                      print(f"Error processing license config {config['Name']}: {str(e)}")
+              
+              # Send compliance report via SNS
+              sns.publish(
+                  TopicArn=os.environ['SNS_TOPIC_ARN'],
+                  Message=json.dumps(compliance_report, indent=2),
+                  Subject=f'Weekly License Compliance Report - {os.environ["ENVIRONMENT_NAME"]}'
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Compliance report generated successfully')
+              }
+      Tags:
+        - Key: Purpose
+          Value: LicenseCompliance
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # EventBridge Rule for Weekly Compliance Reports
+  ComplianceReportSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${EnvironmentName}-compliance-report-schedule'
+      Description: Weekly schedule for license compliance reporting
+      ScheduleExpression: rate(7 days)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ComplianceReportFunction.Arn
+          Id: ComplianceReportTarget
+
+  ComplianceReportFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ComplianceReportFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ComplianceReportSchedule.Arn
+
+  # CloudWatch Dashboard
+  ComplianceDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${EnvironmentName}-compliance-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ${WindowsServerLicenseConfiguration.Condition}
+                  ["AWS/LicenseManager", "LicenseUtilization", "LicenseConfigurationArn", "${WindowsServerLicenseConfiguration}"],
+                  ${WindowsServerLicenseConfiguration.Condition}
+                  ${OracleEnterpriseLicenseConfiguration.Condition}
+                  ["AWS/LicenseManager", "LicenseUtilization", "LicenseConfigurationArn", "${OracleEnterpriseLicenseConfiguration}"]
+                  ${OracleEnterpriseLicenseConfiguration.Condition}
+                ],
+                "period": 3600,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "License Utilization"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/EC2", "CPUUtilization", "InstanceId", "placeholder"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Instance CPU Utilization"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  # Environment Information
+  EnvironmentName:
+    Description: Environment name used for resource naming
+    Value: !Ref EnvironmentName
+    Export:
+      Name: !Sub '${AWS::StackName}-EnvironmentName'
+
+  # License Manager Outputs
+  WindowsServerLicenseConfigurationArn:
+    Condition: CreateWindowsResources
+    Description: ARN of the Windows Server license configuration
+    Value: !Ref WindowsServerLicenseConfiguration
+    Export:
+      Name: !Sub '${AWS::StackName}-WindowsLicenseArn'
+
+  OracleEnterpriseLicenseConfigurationArn:
+    Condition: CreateOracleResources
+    Description: ARN of the Oracle Enterprise license configuration
+    Value: !Ref OracleEnterpriseLicenseConfiguration
+    Export:
+      Name: !Sub '${AWS::StackName}-OracleLicenseArn'
+
+  # Dedicated Host Information
+  WindowsSQLServerHostId:
+    Condition: CreateWindowsResources
+    Description: ID of the Windows/SQL Server Dedicated Host
+    Value: !Ref WindowsSQLServerDedicatedHost
+    Export:
+      Name: !Sub '${AWS::StackName}-WindowsHostId'
+
+  OracleDatabaseHostId:
+    Condition: CreateOracleResources
+    Description: ID of the Oracle Database Dedicated Host
+    Value: !Ref OracleDatabaseDedicatedHost
+    Export:
+      Name: !Sub '${AWS::StackName}-OracleHostId'
+
+  # Launch Template Information
+  WindowsSQLServerLaunchTemplateId:
+    Condition: CreateWindowsResources
+    Description: ID of the Windows/SQL Server launch template
+    Value: !Ref WindowsSQLServerLaunchTemplate
+    Export:
+      Name: !Sub '${AWS::StackName}-WindowsLaunchTemplate'
+
+  OracleDatabaseLaunchTemplateId:
+    Condition: CreateOracleResources
+    Description: ID of the Oracle Database launch template
+    Value: !Ref OracleDatabaseLaunchTemplate
+    Export:
+      Name: !Sub '${AWS::StackName}-OracleLaunchTemplate'
+
+  # Monitoring and Compliance
+  ComplianceAlertsTopicArn:
+    Description: ARN of the SNS topic for compliance alerts
+    Value: !Ref ComplianceAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-ComplianceAlertsTopicArn'
+
+  ComplianceDashboardUrl:
+    Description: URL to the CloudWatch compliance dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${EnvironmentName}-compliance-dashboard'
+
+  LicenseReportsBucketName:
+    Description: S3 bucket name for license compliance reports
+    Value: !Ref LicenseReportsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-LicenseReportsBucket'
+
+  ConfigBucketName:
+    Description: S3 bucket name for AWS Config
+    Value: !Ref ConfigBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigBucket'
+
+  # IAM Resources
+  EC2InstanceProfileArn:
+    Description: ARN of the EC2 instance profile for BYOL instances
+    Value: !GetAtt EC2InstanceProfile.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EC2InstanceProfile'
+
+  # Next Steps
+  NextSteps:
+    Description: Instructions for launching BYOL instances
+    Value: !Sub |
+      1. Launch Windows instance: aws ec2 run-instances --launch-template LaunchTemplateName=${WindowsSQLServerLaunchTemplate} --placement HostId=${WindowsSQLServerDedicatedHost},Tenancy=host
+      2. Launch Oracle instance: aws ec2 run-instances --launch-template LaunchTemplateName=${OracleDatabaseLaunchTemplate} --placement HostId=${OracleDatabaseDedicatedHost},Tenancy=host
+      3. Associate license configurations with instances using License Manager
+      4. Monitor compliance through CloudWatch dashboard: ${ComplianceDashboardUrl}
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Environment Configuration
+        Parameters:
+          - EnvironmentName
+          - NotificationEmail
+      - Label:
+          default: Network Configuration
+        Parameters:
+          - VpcId
+          - SubnetIdA
+          - SubnetIdB
+          - InstanceSecurityGroupId
+      - Label:
+          default: Security Configuration
+        Parameters:
+          - KeyPairName
+      - Label:
+          default: License Configuration
+        Parameters:
+          - WindowsLicenseCount
+          - OracleLicenseCount
+          - LicenseUtilizationThreshold
+      - Label:
+          default: Instance Configuration
+        Parameters:
+          - WindowsInstanceType
+          - OracleInstanceType
+    ParameterLabels:
+      EnvironmentName:
+        default: Environment Name
+      NotificationEmail:
+        default: Notification Email
+      VpcId:
+        default: VPC ID
+      SubnetIdA:
+        default: Subnet ID (AZ A)
+      SubnetIdB:
+        default: Subnet ID (AZ B)
+      InstanceSecurityGroupId:
+        default: Instance Security Group
+      KeyPairName:
+        default: EC2 Key Pair
+      WindowsLicenseCount:
+        default: Windows License Count
+      OracleLicenseCount:
+        default: Oracle License Count
+      LicenseUtilizationThreshold:
+        default: License Alert Threshold (%)
+      WindowsInstanceType:
+        default: Windows Instance Type
+      OracleInstanceType:
+        default: Oracle Instance Type

@@ -1,0 +1,1408 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Comprehensive video content analysis solution using Amazon Rekognition, Step Functions, and Lambda for automated content moderation and metadata extraction'
+
+# ============================================================================
+# PARAMETERS
+# ============================================================================
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: video-analysis
+    Description: Name prefix for all resources
+    AllowedPattern: ^[a-zA-Z0-9-]+$
+    ConstraintDescription: Must contain only alphanumeric characters and hyphens
+    MaxLength: 20
+    MinLength: 3
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment type for resource naming and configuration
+
+  EnableS3EventTrigger:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable automatic processing when videos are uploaded to S3
+
+  VideoFileExtensions:
+    Type: CommaDelimitedList
+    Default: '.mp4,.avi,.mov,.mkv,.wmv'
+    Description: Video file extensions to process (comma-separated)
+
+  ContentModerationMinConfidence:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    MaxValue: 100
+    Description: Minimum confidence level for content moderation (1-100)
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: Email address for analysis completion notifications (optional)
+    AllowedPattern: ^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address or empty
+
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+    Description: Timeout for Lambda functions in seconds (60-900)
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+    Description: Memory allocation for Lambda functions in MB
+
+  EnableDashboard:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Create CloudWatch dashboard for monitoring
+
+  DataRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: Number of days to retain analysis results in DynamoDB
+
+# ============================================================================
+# CONDITIONS
+# ============================================================================
+
+Conditions:
+  EnableS3Trigger: !Equals [!Ref EnableS3EventTrigger, 'true']
+  EnableEmailNotification: !Not [!Equals [!Ref NotificationEmail, '']]
+  EnableMonitoringDashboard: !Equals [!Ref EnableDashboard, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+# ============================================================================
+# RESOURCES
+# ============================================================================
+
+Resources:
+
+  # ============================================================================
+  # S3 BUCKETS
+  # ============================================================================
+
+  # Source bucket for video uploads
+  VideoSourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-video-source-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - !If
+            - EnableS3Trigger
+            - Event: s3:ObjectCreated:*
+              Function: !GetAtt VideoAnalysisTriggerFunction.Arn
+              Filter:
+                S3Key:
+                  Rules:
+                    - Name: suffix
+                      Value: .mp4
+            - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-video-source-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Video Content Analysis Source
+
+  # Results bucket for analysis outputs
+  VideoResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-video-results-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-video-results-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Video Content Analysis Results
+
+  # Temporary bucket for processing
+  VideoTempBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-video-temp-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteTempFiles
+            Status: Enabled
+            ExpirationInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-video-temp-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Video Content Analysis Temporary Storage
+
+  # S3 bucket policy for secure access
+  VideoSourceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref VideoSourceBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${VideoSourceBucket.Arn}'
+              - !Sub '${VideoSourceBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: AllowSSLRequestsOnly
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${VideoSourceBucket.Arn}'
+              - !Sub '${VideoSourceBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'true'
+
+  # ============================================================================
+  # DYNAMODB TABLE
+  # ============================================================================
+
+  VideoAnalysisTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-video-analysis-${Environment}'
+      AttributeDefinitions:
+        - AttributeName: VideoId
+          AttributeType: S
+        - AttributeName: Timestamp
+          AttributeType: N
+        - AttributeName: JobStatus
+          AttributeType: S
+      KeySchema:
+        - AttributeName: VideoId
+          KeyType: HASH
+        - AttributeName: Timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: JobStatusIndex
+          KeySchema:
+            - AttributeName: JobStatus
+              KeyType: HASH
+            - AttributeName: Timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !If [IsProduction, 10, 5]
+            WriteCapacityUnits: !If [IsProduction, 10, 5]
+      ProvisionedThroughput:
+        ReadCapacityUnits: !If [IsProduction, 20, 10]
+        WriteCapacityUnits: !If [IsProduction, 20, 10]
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-video-analysis-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Video Content Analysis Job Tracking
+
+  # ============================================================================
+  # SNS TOPIC AND SQS QUEUE
+  # ============================================================================
+
+  VideoAnalysisNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-video-analysis-notifications-${Environment}'
+      DisplayName: Video Analysis Notifications
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-video-analysis-notifications-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Video Content Analysis Notifications
+
+  VideoAnalysisQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-video-analysis-queue-${Environment}'
+      KmsMasterKeyId: alias/aws/sqs
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeoutSeconds: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt VideoAnalysisDeadLetterQueue.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-video-analysis-queue-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Video Content Analysis Queue
+
+  VideoAnalysisDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-video-analysis-dlq-${Environment}'
+      KmsMasterKeyId: alias/aws/sqs
+      MessageRetentionPeriod: 1209600  # 14 days
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-video-analysis-dlq-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Video Content Analysis Dead Letter Queue
+
+  VideoAnalysisQueueSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sqs
+      TopicArn: !Ref VideoAnalysisNotificationTopic
+      Endpoint: !GetAtt VideoAnalysisQueue.Arn
+
+  # Email subscription for notifications (optional)
+  VideoAnalysisEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: EnableEmailNotification
+    Properties:
+      Protocol: email
+      TopicArn: !Ref VideoAnalysisNotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # SQS queue policy to allow SNS to send messages
+  VideoAnalysisQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref VideoAnalysisQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt VideoAnalysisQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref VideoAnalysisNotificationTopic
+
+  # ============================================================================
+  # IAM ROLES
+  # ============================================================================
+
+  # Lambda execution role
+  VideoAnalysisLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: VideoAnalysisLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Amazon Rekognition permissions
+              - Effect: Allow
+                Action:
+                  - rekognition:StartMediaAnalysisJob
+                  - rekognition:GetMediaAnalysisJob
+                  - rekognition:StartContentModeration
+                  - rekognition:GetContentModeration
+                  - rekognition:StartSegmentDetection
+                  - rekognition:GetSegmentDetection
+                  - rekognition:StartTextDetection
+                  - rekognition:GetTextDetection
+                  - rekognition:StartLabelDetection
+                  - rekognition:GetLabelDetection
+                Resource: '*'
+              # S3 permissions
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${VideoSourceBucket.Arn}'
+                  - !Sub '${VideoSourceBucket.Arn}/*'
+                  - !Sub '${VideoResultsBucket.Arn}'
+                  - !Sub '${VideoResultsBucket.Arn}/*'
+                  - !Sub '${VideoTempBucket.Arn}'
+                  - !Sub '${VideoTempBucket.Arn}/*'
+              # DynamoDB permissions
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt VideoAnalysisTable.Arn
+                  - !Sub '${VideoAnalysisTable.Arn}/index/*'
+              # SNS permissions
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref VideoAnalysisNotificationTopic
+              # Step Functions permissions
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref VideoAnalysisStateMachine
+              # CloudWatch Logs permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Video Content Analysis Lambda Execution
+
+  # Step Functions execution role
+  VideoAnalysisStepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-stepfunctions-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: VideoAnalysisStepFunctionsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Lambda permissions
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt VideoAnalysisInitFunction.Arn
+                  - !GetAtt VideoAnalysisModerationFunction.Arn
+                  - !GetAtt VideoAnalysisSegmentFunction.Arn
+                  - !GetAtt VideoAnalysisAggregationFunction.Arn
+              # Amazon Rekognition permissions
+              - Effect: Allow
+                Action:
+                  - rekognition:StartMediaAnalysisJob
+                  - rekognition:GetMediaAnalysisJob
+                  - rekognition:StartContentModeration
+                  - rekognition:GetContentModeration
+                  - rekognition:StartSegmentDetection
+                  - rekognition:GetSegmentDetection
+                Resource: '*'
+              # SNS permissions
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref VideoAnalysisNotificationTopic
+              # CloudWatch Logs permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/stepfunctions/${ProjectName}-*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-stepfunctions-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Video Content Analysis Step Functions Execution
+
+  # ============================================================================
+  # LAMBDA FUNCTIONS
+  # ============================================================================
+
+  # Video analysis initialization function
+  VideoAnalysisInitFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-init-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt VideoAnalysisLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          ANALYSIS_TABLE: !Ref VideoAnalysisTable
+          RESULTS_BUCKET: !Ref VideoResultsBucket
+          TEMP_BUCKET: !Ref VideoTempBucket
+          SNS_TOPIC_ARN: !Ref VideoAnalysisNotificationTopic
+          DATA_RETENTION_DAYS: !Ref DataRetentionDays
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          from datetime import datetime, timedelta
+          
+          def lambda_handler(event, context):
+              """
+              Initialize video analysis job
+              """
+              try:
+                  # Extract video information from S3 event
+                  if 'Records' in event:
+                      s3_bucket = event['Records'][0]['s3']['bucket']['name']
+                      s3_key = event['Records'][0]['s3']['object']['key']
+                  else:
+                      s3_bucket = event['s3Bucket']
+                      s3_key = event['s3Key']
+                  
+                  # Generate unique job ID
+                  job_id = str(uuid.uuid4())
+                  
+                  # Calculate TTL for DynamoDB record
+                  ttl = int((datetime.now() + timedelta(days=int(os.environ['DATA_RETENTION_DAYS']))).timestamp())
+                  
+                  # Initialize DynamoDB record
+                  dynamodb = boto3.resource('dynamodb')
+                  table = dynamodb.Table(os.environ['ANALYSIS_TABLE'])
+                  
+                  # Store initial job information
+                  table.put_item(
+                      Item={
+                          'VideoId': f"{s3_bucket}/{s3_key}",
+                          'Timestamp': int(datetime.now().timestamp()),
+                          'JobId': job_id,
+                          'JobStatus': 'INITIATED',
+                          'S3Bucket': s3_bucket,
+                          'S3Key': s3_key,
+                          'CreatedAt': datetime.now().isoformat(),
+                          'TTL': ttl
+                      }
+                  )
+                  
+                  print(f"Initialized analysis job {job_id} for {s3_bucket}/{s3_key}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': {
+                          'jobId': job_id,
+                          'videoId': f"{s3_bucket}/{s3_key}",
+                          's3Bucket': s3_bucket,
+                          's3Key': s3_key,
+                          'status': 'INITIATED'
+                      }
+                  }
+                  
+              except Exception as e:
+                  print(f"Error initializing video analysis: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': {
+                          'error': str(e)
+                      }
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-init-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Video Content Analysis Initialization
+
+  # Content moderation function
+  VideoAnalysisModerationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-moderation-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt VideoAnalysisLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          ANALYSIS_TABLE: !Ref VideoAnalysisTable
+          SNS_TOPIC_ARN: !Ref VideoAnalysisNotificationTopic
+          MIN_CONFIDENCE: !Ref ContentModerationMinConfidence
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              """
+              Start content moderation analysis
+              """
+              try:
+                  rekognition = boto3.client('rekognition')
+                  dynamodb = boto3.resource('dynamodb')
+                  table = dynamodb.Table(os.environ['ANALYSIS_TABLE'])
+                  
+                  # Extract job information
+                  job_id = event['jobId']
+                  s3_bucket = event['s3Bucket']
+                  s3_key = event['s3Key']
+                  video_id = event['videoId']
+                  
+                  # Start content moderation job
+                  response = rekognition.start_content_moderation(
+                      Video={
+                          'S3Object': {
+                              'Bucket': s3_bucket,
+                              'Name': s3_key
+                          }
+                      },
+                      MinConfidence=float(os.environ['MIN_CONFIDENCE']),
+                      NotificationChannel={
+                          'SNSTopicArn': os.environ['SNS_TOPIC_ARN'],
+                          'RoleArn': context.invoked_function_arn.replace(':function:', ':role/').replace(context.function_name, os.environ.get('REKOGNITION_ROLE', 'VideoAnalysisLambdaRole'))
+                      }
+                  )
+                  
+                  moderation_job_id = response['JobId']
+                  
+                  # Update DynamoDB with moderation job ID
+                  table.update_item(
+                      Key={
+                          'VideoId': video_id,
+                          'Timestamp': int(datetime.now().timestamp())
+                      },
+                      UpdateExpression='SET ModerationJobId = :mjid, JobStatus = :status',
+                      ExpressionAttributeValues={
+                          ':mjid': moderation_job_id,
+                          ':status': 'MODERATION_IN_PROGRESS'
+                      }
+                  )
+                  
+                  print(f"Started content moderation job {moderation_job_id} for video {video_id}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': {
+                          'jobId': job_id,
+                          'moderationJobId': moderation_job_id,
+                          'videoId': video_id,
+                          'status': 'MODERATION_IN_PROGRESS'
+                      }
+                  }
+                  
+              except Exception as e:
+                  print(f"Error starting content moderation: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': {
+                          'error': str(e)
+                      }
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-moderation-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Video Content Moderation Analysis
+
+  # Segment detection function
+  VideoAnalysisSegmentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-segment-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt VideoAnalysisLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          ANALYSIS_TABLE: !Ref VideoAnalysisTable
+          SNS_TOPIC_ARN: !Ref VideoAnalysisNotificationTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              """
+              Start segment detection analysis
+              """
+              try:
+                  rekognition = boto3.client('rekognition')
+                  dynamodb = boto3.resource('dynamodb')
+                  table = dynamodb.Table(os.environ['ANALYSIS_TABLE'])
+                  
+                  # Extract job information
+                  job_id = event['jobId']
+                  s3_bucket = event['s3Bucket']
+                  s3_key = event['s3Key']
+                  video_id = event['videoId']
+                  
+                  # Start segment detection job
+                  response = rekognition.start_segment_detection(
+                      Video={
+                          'S3Object': {
+                              'Bucket': s3_bucket,
+                              'Name': s3_key
+                          }
+                      },
+                      SegmentTypes=['TECHNICAL_CUE', 'SHOT'],
+                      NotificationChannel={
+                          'SNSTopicArn': os.environ['SNS_TOPIC_ARN'],
+                          'RoleArn': context.invoked_function_arn.replace(':function:', ':role/').replace(context.function_name, os.environ.get('REKOGNITION_ROLE', 'VideoAnalysisLambdaRole'))
+                      }
+                  )
+                  
+                  segment_job_id = response['JobId']
+                  
+                  # Update DynamoDB with segment job ID
+                  table.update_item(
+                      Key={
+                          'VideoId': video_id,
+                          'Timestamp': int(datetime.now().timestamp())
+                      },
+                      UpdateExpression='SET SegmentJobId = :sjid, JobStatus = :status',
+                      ExpressionAttributeValues={
+                          ':sjid': segment_job_id,
+                          ':status': 'SEGMENT_DETECTION_IN_PROGRESS'
+                      }
+                  )
+                  
+                  print(f"Started segment detection job {segment_job_id} for video {video_id}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': {
+                          'jobId': job_id,
+                          'segmentJobId': segment_job_id,
+                          'videoId': video_id,
+                          'status': 'SEGMENT_DETECTION_IN_PROGRESS'
+                      }
+                  }
+                  
+              except Exception as e:
+                  print(f"Error starting segment detection: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': {
+                          'error': str(e)
+                      }
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-segment-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Video Segment Detection Analysis
+
+  # Results aggregation function
+  VideoAnalysisAggregationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-aggregation-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt VideoAnalysisLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          ANALYSIS_TABLE: !Ref VideoAnalysisTable
+          RESULTS_BUCKET: !Ref VideoResultsBucket
+          SNS_TOPIC_ARN: !Ref VideoAnalysisNotificationTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              """
+              Aggregate and store analysis results
+              """
+              try:
+                  rekognition = boto3.client('rekognition')
+                  dynamodb = boto3.resource('dynamodb')
+                  s3 = boto3.client('s3')
+                  
+                  table = dynamodb.Table(os.environ['ANALYSIS_TABLE'])
+                  
+                  # Extract job information
+                  job_id = event['jobId']
+                  video_id = event['videoId']
+                  moderation_job_id = event.get('moderationJobId')
+                  segment_job_id = event.get('segmentJobId')
+                  
+                  results = {
+                      'jobId': job_id,
+                      'videoId': video_id,
+                      'processedAt': datetime.now().isoformat(),
+                      'moderation': {},
+                      'segments': {},
+                      'summary': {}
+                  }
+                  
+                  # Get content moderation results
+                  if moderation_job_id:
+                      try:
+                          moderation_response = rekognition.get_content_moderation(
+                              JobId=moderation_job_id
+                          )
+                          results['moderation'] = {
+                              'jobStatus': moderation_response['JobStatus'],
+                              'labels': moderation_response.get('ModerationLabels', [])
+                          }
+                      except Exception as e:
+                          print(f"Error getting moderation results: {str(e)}")
+                          results['moderation'] = {'error': str(e)}
+                  
+                  # Get segment detection results
+                  if segment_job_id:
+                      try:
+                          segment_response = rekognition.get_segment_detection(
+                              JobId=segment_job_id
+                          )
+                          results['segments'] = {
+                              'jobStatus': segment_response['JobStatus'],
+                              'technicalCues': segment_response.get('TechnicalCues', []),
+                              'shotSegments': segment_response.get('Segments', [])
+                          }
+                      except Exception as e:
+                          print(f"Error getting segment results: {str(e)}")
+                          results['segments'] = {'error': str(e)}
+                  
+                  # Create summary
+                  moderation_labels = results['moderation'].get('labels', [])
+                  segment_count = len(results['segments'].get('shotSegments', []))
+                  
+                  results['summary'] = {
+                      'moderationLabelsCount': len(moderation_labels),
+                      'segmentCount': segment_count,
+                      'hasInappropriateContent': len(moderation_labels) > 0,
+                      'analysisComplete': True
+                  }
+                  
+                  # Store results in S3
+                  results_key = f"analysis-results/{job_id}/results.json"
+                  s3.put_object(
+                      Bucket=os.environ['RESULTS_BUCKET'],
+                      Key=results_key,
+                      Body=json.dumps(results, indent=2),
+                      ContentType='application/json'
+                  )
+                  
+                  # Update DynamoDB with final results
+                  table.update_item(
+                      Key={
+                          'VideoId': video_id,
+                          'Timestamp': int(datetime.now().timestamp())
+                      },
+                      UpdateExpression='SET JobStatus = :status, ResultsS3Key = :s3key, Summary = :summary',
+                      ExpressionAttributeValues={
+                          ':status': 'COMPLETED',
+                          ':s3key': results_key,
+                          ':summary': results['summary']
+                      }
+                  )
+                  
+                  print(f"Completed analysis aggregation for job {job_id}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': {
+                          'jobId': job_id,
+                          'videoId': video_id,
+                          'resultsLocation': f"s3://{os.environ['RESULTS_BUCKET']}/{results_key}",
+                          'summary': results['summary'],
+                          'status': 'COMPLETED'
+                      }
+                  }
+                  
+              except Exception as e:
+                  print(f"Error aggregating results: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': {
+                          'error': str(e)
+                      }
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-aggregation-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Video Content Analysis Results Aggregation
+
+  # S3 event trigger function
+  VideoAnalysisTriggerFunction:
+    Type: AWS::Lambda::Function
+    Condition: EnableS3Trigger
+    Properties:
+      FunctionName: !Sub '${ProjectName}-trigger-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt VideoAnalysisLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref VideoAnalysisStateMachine
+          VIDEO_EXTENSIONS: !Join [',', !Ref VideoFileExtensions]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          
+          def lambda_handler(event, context):
+              """
+              Trigger video analysis workflow when new video is uploaded
+              """
+              try:
+                  stepfunctions = boto3.client('stepfunctions')
+                  video_extensions = os.environ['VIDEO_EXTENSIONS'].split(',')
+                  
+                  # Extract S3 event information
+                  for record in event['Records']:
+                      bucket = record['s3']['bucket']['name']
+                      key = record['s3']['object']['key']
+                      
+                      # Only process video files
+                      if not any(key.lower().endswith(ext.lower()) for ext in video_extensions):
+                          print(f"Skipping non-video file: {key}")
+                          continue
+                      
+                      # Start Step Functions execution
+                      response = stepfunctions.start_execution(
+                          stateMachineArn=os.environ['STATE_MACHINE_ARN'],
+                          name=f"video-analysis-{key.replace('/', '-').replace('.', '-')}-{int(datetime.now().timestamp())}",
+                          input=json.dumps({
+                              'Records': [record]
+                          })
+                      )
+                      
+                      print(f"Started analysis for {bucket}/{key}: {response['executionArn']}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': 'Video analysis workflow triggered successfully'
+                  }
+                  
+              except Exception as e:
+                  print(f"Error triggering workflow: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': str(e)
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-trigger-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Video Content Analysis S3 Event Trigger
+
+  # Lambda permission for S3 to invoke trigger function
+  VideoAnalysisTriggerPermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableS3Trigger
+    Properties:
+      FunctionName: !Ref VideoAnalysisTriggerFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub '${VideoSourceBucket.Arn}'
+
+  # ============================================================================
+  # STEP FUNCTIONS STATE MACHINE
+  # ============================================================================
+
+  VideoAnalysisStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-workflow-${Environment}'
+      RoleArn: !GetAtt VideoAnalysisStepFunctionsRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Video Content Analysis Workflow",
+          "StartAt": "InitializeAnalysis",
+          "States": {
+            "InitializeAnalysis": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${VideoAnalysisInitFunction}",
+                "Payload.$": "$"
+              },
+              "Next": "ParallelAnalysis",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "NotifyFailure"
+                }
+              ]
+            },
+            "ParallelAnalysis": {
+              "Type": "Parallel",
+              "Branches": [
+                {
+                  "StartAt": "ContentModeration",
+                  "States": {
+                    "ContentModeration": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${VideoAnalysisModerationFunction}",
+                        "Payload.$": "$.Payload.body"
+                      },
+                      "End": true,
+                      "Retry": [
+                        {
+                          "ErrorEquals": ["States.TaskFailed"],
+                          "IntervalSeconds": 10,
+                          "MaxAttempts": 2,
+                          "BackoffRate": 2
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "StartAt": "SegmentDetection",
+                  "States": {
+                    "SegmentDetection": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${VideoAnalysisSegmentFunction}",
+                        "Payload.$": "$.Payload.body"
+                      },
+                      "End": true,
+                      "Retry": [
+                        {
+                          "ErrorEquals": ["States.TaskFailed"],
+                          "IntervalSeconds": 10,
+                          "MaxAttempts": 2,
+                          "BackoffRate": 2
+                        }
+                      ]
+                    }
+                  }
+                }
+              ],
+              "Next": "WaitForCompletion",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "NotifyFailure"
+                }
+              ]
+            },
+            "WaitForCompletion": {
+              "Type": "Wait",
+              "Seconds": 60,
+              "Next": "AggregateResults"
+            },
+            "AggregateResults": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${VideoAnalysisAggregationFunction}",
+                "Payload": {
+                  "jobId.$": "$[0].Payload.body.jobId",
+                  "videoId.$": "$[0].Payload.body.videoId",
+                  "moderationJobId.$": "$[0].Payload.body.moderationJobId",
+                  "segmentJobId.$": "$[1].Payload.body.segmentJobId"
+                }
+              },
+              "Next": "NotifyCompletion",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 10,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "NotifyFailure"
+                }
+              ]
+            },
+            "NotifyCompletion": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${VideoAnalysisNotificationTopic}",
+                "Message": {
+                  "jobId.$": "$.Payload.body.jobId",
+                  "videoId.$": "$.Payload.body.videoId",
+                  "status.$": "$.Payload.body.status",
+                  "resultsLocation.$": "$.Payload.body.resultsLocation",
+                  "summary.$": "$.Payload.body.summary"
+                },
+                "Subject": "Video Analysis Completed Successfully"
+              },
+              "End": true
+            },
+            "NotifyFailure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${VideoAnalysisNotificationTopic}",
+                "Message": {
+                  "error.$": "$.Error",
+                  "cause.$": "$.Cause"
+                },
+                "Subject": "Video Analysis Failed"
+              },
+              "End": true
+            }
+          }
+        }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-workflow-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Video Content Analysis Workflow Orchestration
+
+  # ============================================================================
+  # CLOUDWATCH MONITORING
+  # ============================================================================
+
+  # CloudWatch Log Group for Step Functions
+  VideoAnalysisLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/stepfunctions/${ProjectName}-workflow-${Environment}'
+      RetentionInDays: !If [IsProduction, 90, 30]
+      KmsKeyId: !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-stepfunctions-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Video Content Analysis Step Functions Logs
+
+  # CloudWatch Dashboard
+  VideoAnalysisDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableMonitoringDashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-dashboard-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${VideoAnalysisInitFunction}"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${VideoAnalysisModerationFunction}"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${VideoAnalysisSegmentFunction}"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${VideoAnalysisAggregationFunction}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Duration (ms)"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Errors", "FunctionName", "${VideoAnalysisInitFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${VideoAnalysisModerationFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${VideoAnalysisSegmentFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${VideoAnalysisAggregationFunction}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Errors"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/States", "ExecutionsFailed", "StateMachineArn", "${VideoAnalysisStateMachine}"],
+                  ["AWS/States", "ExecutionsSucceeded", "StateMachineArn", "${VideoAnalysisStateMachine}"],
+                  ["AWS/States", "ExecutionsStarted", "StateMachineArn", "${VideoAnalysisStateMachine}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Step Functions Executions"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${VideoAnalysisTable}"],
+                  ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "${VideoAnalysisTable}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "DynamoDB Capacity Units"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms
+  VideoAnalysisFailedExecutionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-failed-executions-${Environment}'
+      AlarmDescription: Alert when Step Functions executions fail
+      MetricName: ExecutionsFailed
+      Namespace: AWS/States
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref VideoAnalysisNotificationTopic
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref VideoAnalysisStateMachine
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-failed-executions-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Video Content Analysis Failure Monitoring
+
+  VideoAnalysisHighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-high-error-rate-${Environment}'
+      AlarmDescription: Alert when Lambda error rate is high
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref VideoAnalysisNotificationTopic
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref VideoAnalysisInitFunction
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-high-error-rate-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Video Content Analysis Error Rate Monitoring
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+
+Outputs:
+  VideoSourceBucketName:
+    Description: Name of the S3 bucket for video uploads
+    Value: !Ref VideoSourceBucket
+    Export:
+      Name: !Sub '${ProjectName}-source-bucket-${Environment}'
+
+  VideoResultsBucketName:
+    Description: Name of the S3 bucket for analysis results
+    Value: !Ref VideoResultsBucket
+    Export:
+      Name: !Sub '${ProjectName}-results-bucket-${Environment}'
+
+  VideoAnalysisTableName:
+    Description: Name of the DynamoDB table for job tracking
+    Value: !Ref VideoAnalysisTable
+    Export:
+      Name: !Sub '${ProjectName}-table-${Environment}'
+
+  VideoAnalysisStateMachineArn:
+    Description: ARN of the Step Functions state machine
+    Value: !Ref VideoAnalysisStateMachine
+    Export:
+      Name: !Sub '${ProjectName}-state-machine-${Environment}'
+
+  VideoAnalysisNotificationTopicArn:
+    Description: ARN of the SNS topic for notifications
+    Value: !Ref VideoAnalysisNotificationTopic
+    Export:
+      Name: !Sub '${ProjectName}-sns-topic-${Environment}'
+
+  VideoAnalysisQueueUrl:
+    Description: URL of the SQS queue for notifications
+    Value: !Ref VideoAnalysisQueue
+    Export:
+      Name: !Sub '${ProjectName}-queue-url-${Environment}'
+
+  VideoAnalysisDashboardUrl:
+    Description: URL of the CloudWatch dashboard
+    Condition: EnableMonitoringDashboard
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-dashboard-${Environment}'
+
+  LambdaFunctionNames:
+    Description: Names of the Lambda functions created
+    Value: !Sub |
+      Initialization: ${VideoAnalysisInitFunction}
+      Content Moderation: ${VideoAnalysisModerationFunction}
+      Segment Detection: ${VideoAnalysisSegmentFunction}
+      Results Aggregation: ${VideoAnalysisAggregationFunction}
+      ${EnableS3Trigger ? 'S3 Trigger: ' + VideoAnalysisTriggerFunction : ''}
+
+  DeploymentInstructions:
+    Description: Instructions for using the video analysis system
+    Value: !Sub |
+      1. Upload video files to: s3://${VideoSourceBucket}/
+      2. Monitor analysis progress in DynamoDB table: ${VideoAnalysisTable}
+      3. Check results in S3 bucket: s3://${VideoResultsBucket}/
+      4. View execution logs in Step Functions: ${VideoAnalysisStateMachine}
+      5. Monitor system health via CloudWatch dashboard: ${ProjectName}-dashboard-${Environment}
+
+  SecurityNote:
+    Description: Important security considerations
+    Value: |
+      - All S3 buckets are encrypted and block public access
+      - Lambda functions use least-privilege IAM roles
+      - DynamoDB has TTL enabled for automatic data cleanup
+      - SNS topics are encrypted with AWS managed keys
+      - Consider implementing VPC endpoints for enhanced security

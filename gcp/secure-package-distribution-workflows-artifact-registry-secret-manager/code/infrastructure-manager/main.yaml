@@ -1,0 +1,663 @@
+# Infrastructure Manager Configuration for Secure Package Distribution Workflows
+# This configuration deploys a complete secure package distribution system using
+# Google Cloud Artifact Registry, Secret Manager, Cloud Scheduler, and Cloud Tasks
+
+apiVersion: infra.google.com/v1alpha1
+kind: Deployment
+metadata:
+  name: secure-package-distribution
+  labels:
+    solution: package-distribution
+    security-level: high
+    automation: enabled
+
+# Template definition for the secure package distribution infrastructure
+spec:
+  # Input parameters for customization
+  inputs:
+    # Project and location configuration
+    project_id:
+      type: string
+      description: "Google Cloud Project ID"
+      required: true
+    
+    region:
+      type: string
+      description: "Google Cloud region for resource deployment"
+      default: "us-central1"
+    
+    zone:
+      type: string
+      description: "Google Cloud zone for zonal resources"
+      default: "us-central1-a"
+    
+    # Resource naming configuration
+    resource_suffix:
+      type: string
+      description: "Unique suffix for resource names"
+      default: "prod"
+    
+    # Package repository configuration
+    repository_formats:
+      type: array
+      description: "List of repository formats to create"
+      default: ["docker", "npm", "maven"]
+    
+    # Environment configuration
+    target_environments:
+      type: array
+      description: "List of target environments for distribution"
+      default: ["development", "staging", "production"]
+    
+    # Security configuration
+    secret_labels:
+      type: object
+      description: "Labels to apply to Secret Manager secrets"
+      default:
+        managed-by: infrastructure-manager
+        solution: package-distribution
+    
+    # Scheduler configuration
+    nightly_schedule:
+      type: string
+      description: "Cron schedule for nightly package distributions"
+      default: "0 2 * * *"
+    
+    weekly_schedule:
+      type: string
+      description: "Cron schedule for weekly staging distributions"
+      default: "0 6 * * 1"
+    
+    # Function configuration
+    function_memory:
+      type: string
+      description: "Memory allocation for Cloud Functions"
+      default: "512Mi"
+    
+    function_timeout:
+      type: string
+      description: "Timeout for Cloud Functions"
+      default: "300s"
+    
+    # Task queue configuration
+    max_dispatches_per_second:
+      type: integer
+      description: "Maximum dispatches per second for task queues"
+      default: 10
+    
+    max_concurrent_dispatches:
+      type: integer
+      description: "Maximum concurrent dispatches for task queues"
+      default: 5
+
+  # Resource definitions
+  resources:
+    # Enable required Google Cloud APIs
+    - name: enable-apis
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        name: projects/{{ .inputs.project_id }}/services/artifactregistry.googleapis.com
+        consumerId: project:{{ .inputs.project_id }}
+      metadata:
+        dependsOn: []
+    
+    - name: enable-secret-manager-api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        name: projects/{{ .inputs.project_id }}/services/secretmanager.googleapis.com
+        consumerId: project:{{ .inputs.project_id }}
+      metadata:
+        dependsOn: []
+    
+    - name: enable-scheduler-api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        name: projects/{{ .inputs.project_id }}/services/cloudscheduler.googleapis.com
+        consumerId: project:{{ .inputs.project_id }}
+      metadata:
+        dependsOn: []
+    
+    - name: enable-tasks-api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        name: projects/{{ .inputs.project_id }}/services/cloudtasks.googleapis.com
+        consumerId: project:{{ .inputs.project_id }}
+      metadata:
+        dependsOn: []
+    
+    - name: enable-functions-api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        name: projects/{{ .inputs.project_id }}/services/cloudfunctions.googleapis.com
+        consumerId: project:{{ .inputs.project_id }}
+      metadata:
+        dependsOn: []
+    
+    - name: enable-build-api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        name: projects/{{ .inputs.project_id }}/services/cloudbuild.googleapis.com
+        consumerId: project:{{ .inputs.project_id }}
+      metadata:
+        dependsOn: []
+    
+    - name: enable-logging-api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        name: projects/{{ .inputs.project_id }}/services/logging.googleapis.com
+        consumerId: project:{{ .inputs.project_id }}
+      metadata:
+        dependsOn: []
+    
+    - name: enable-monitoring-api
+      type: gcp-types/serviceusage-v1:services
+      properties:
+        name: projects/{{ .inputs.project_id }}/services/monitoring.googleapis.com
+        consumerId: project:{{ .inputs.project_id }}
+      metadata:
+        dependsOn: []
+
+    # Artifact Registry repositories for different package types
+    - name: docker-repository
+      type: gcp-types/artifactregistry-v1:projects.locations.repositories
+      properties:
+        parent: projects/{{ .inputs.project_id }}/locations/{{ .inputs.region }}
+        repositoryId: secure-packages-{{ .inputs.resource_suffix }}
+        repository:
+          format: DOCKER
+          description: "Secure Docker package distribution repository"
+          labels:
+            solution: package-distribution
+            format: docker
+            security-level: high
+      metadata:
+        dependsOn:
+          - enable-apis
+
+    - name: npm-repository
+      type: gcp-types/artifactregistry-v1:projects.locations.repositories
+      properties:
+        parent: projects/{{ .inputs.project_id }}/locations/{{ .inputs.region }}
+        repositoryId: secure-packages-{{ .inputs.resource_suffix }}-npm
+        repository:
+          format: NPM
+          description: "Secure NPM package distribution repository"
+          labels:
+            solution: package-distribution
+            format: npm
+            security-level: high
+      metadata:
+        dependsOn:
+          - enable-apis
+
+    - name: maven-repository
+      type: gcp-types/artifactregistry-v1:projects.locations.repositories
+      properties:
+        parent: projects/{{ .inputs.project_id }}/locations/{{ .inputs.region }}
+        repositoryId: secure-packages-{{ .inputs.resource_suffix }}-maven
+        repository:
+          format: MAVEN
+          description: "Secure Maven package distribution repository"
+          labels:
+            solution: package-distribution
+            format: maven
+            security-level: high
+      metadata:
+        dependsOn:
+          - enable-apis
+
+    # IAM Service Account for package distribution
+    - name: package-distributor-service-account
+      type: gcp-types/iam-v1:projects.serviceAccounts
+      properties:
+        name: projects/{{ .inputs.project_id }}
+        accountId: package-distributor-sa-{{ .inputs.resource_suffix }}
+        serviceAccount:
+          displayName: "Package Distribution Service Account"
+          description: "Service account for automated package distribution workflows"
+          labels:
+            solution: package-distribution
+            purpose: automation
+      metadata:
+        dependsOn:
+          - enable-apis
+
+    # IAM bindings for service account permissions
+    - name: artifactregistry-reader-binding
+      type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+      properties:
+        resource: {{ .inputs.project_id }}
+        policy:
+          bindings:
+            - role: roles/artifactregistry.reader
+              members:
+                - serviceAccount:package-distributor-sa-{{ .inputs.resource_suffix }}@{{ .inputs.project_id }}.iam.gserviceaccount.com
+      metadata:
+        dependsOn:
+          - package-distributor-service-account
+
+    - name: artifactregistry-writer-binding
+      type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+      properties:
+        resource: {{ .inputs.project_id }}
+        policy:
+          bindings:
+            - role: roles/artifactregistry.writer
+              members:
+                - serviceAccount:package-distributor-sa-{{ .inputs.resource_suffix }}@{{ .inputs.project_id }}.iam.gserviceaccount.com
+      metadata:
+        dependsOn:
+          - package-distributor-service-account
+
+    - name: secretmanager-accessor-binding
+      type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+      properties:
+        resource: {{ .inputs.project_id }}
+        policy:
+          bindings:
+            - role: roles/secretmanager.secretAccessor
+              members:
+                - serviceAccount:package-distributor-sa-{{ .inputs.resource_suffix }}@{{ .inputs.project_id }}.iam.gserviceaccount.com
+      metadata:
+        dependsOn:
+          - package-distributor-service-account
+
+    - name: cloudfunctions-invoker-binding
+      type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+      properties:
+        resource: {{ .inputs.project_id }}
+        policy:
+          bindings:
+            - role: roles/cloudfunctions.invoker
+              members:
+                - serviceAccount:package-distributor-sa-{{ .inputs.resource_suffix }}@{{ .inputs.project_id }}.iam.gserviceaccount.com
+      metadata:
+        dependsOn:
+          - package-distributor-service-account
+
+    - name: cloudtasks-enqueuer-binding
+      type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+      properties:
+        resource: {{ .inputs.project_id }}
+        policy:
+          bindings:
+            - role: roles/cloudtasks.enqueuer
+              members:
+                - serviceAccount:package-distributor-sa-{{ .inputs.resource_suffix }}@{{ .inputs.project_id }}.iam.gserviceaccount.com
+      metadata:
+        dependsOn:
+          - package-distributor-service-account
+
+    # Secret Manager secrets for environment credentials
+    - name: dev-credentials-secret
+      type: gcp-types/secretmanager-v1:projects.secrets
+      properties:
+        parent: projects/{{ .inputs.project_id }}
+        secretId: registry-credentials-{{ .inputs.resource_suffix }}-dev
+        secret:
+          labels:
+            environment: development
+            purpose: registry-auth
+            solution: package-distribution
+          replication:
+            automatic: {}
+      metadata:
+        dependsOn:
+          - enable-secret-manager-api
+
+    - name: staging-credentials-secret
+      type: gcp-types/secretmanager-v1:projects.secrets
+      properties:
+        parent: projects/{{ .inputs.project_id }}
+        secretId: registry-credentials-{{ .inputs.resource_suffix }}-staging
+        secret:
+          labels:
+            environment: staging
+            purpose: registry-auth
+            solution: package-distribution
+          replication:
+            automatic: {}
+      metadata:
+        dependsOn:
+          - enable-secret-manager-api
+
+    - name: prod-credentials-secret
+      type: gcp-types/secretmanager-v1:projects.secrets
+      properties:
+        parent: projects/{{ .inputs.project_id }}
+        secretId: registry-credentials-{{ .inputs.resource_suffix }}-prod
+        secret:
+          labels:
+            environment: production
+            purpose: registry-auth
+            solution: package-distribution
+          replication:
+            automatic: {}
+      metadata:
+        dependsOn:
+          - enable-secret-manager-api
+
+    - name: distribution-config-secret
+      type: gcp-types/secretmanager-v1:projects.secrets
+      properties:
+        parent: projects/{{ .inputs.project_id }}
+        secretId: distribution-config-{{ .inputs.resource_suffix }}
+        secret:
+          labels:
+            purpose: distribution-config
+            solution: package-distribution
+          replication:
+            automatic: {}
+      metadata:
+        dependsOn:
+          - enable-secret-manager-api
+
+    # Initial secret versions with placeholder values
+    - name: dev-credentials-version
+      type: gcp-types/secretmanager-v1:projects.secrets.versions
+      properties:
+        parent: projects/{{ .inputs.project_id }}/secrets/registry-credentials-{{ .inputs.resource_suffix }}-dev
+        secretVersion:
+          payload:
+            data: ZGV2LXJlZ2lzdHJ5LXRva2VuLXBsYWNlaG9sZGVy  # Base64 encoded placeholder
+      metadata:
+        dependsOn:
+          - dev-credentials-secret
+
+    - name: staging-credentials-version
+      type: gcp-types/secretmanager-v1:projects.secrets.versions
+      properties:
+        parent: projects/{{ .inputs.project_id }}/secrets/registry-credentials-{{ .inputs.resource_suffix }}-staging
+        secretVersion:
+          payload:
+            data: c3RhZ2luZy1yZWdpc3RyeS10b2tlbi1wbGFjZWhvbGRlcg==  # Base64 encoded placeholder
+      metadata:
+        dependsOn:
+          - staging-credentials-secret
+
+    - name: prod-credentials-version
+      type: gcp-types/secretmanager-v1:projects.secrets.versions
+      properties:
+        parent: projects/{{ .inputs.project_id }}/secrets/registry-credentials-{{ .inputs.resource_suffix }}-prod
+        secretVersion:
+          payload:
+            data: cHJvZC1yZWdpc3RyeS10b2tlbi1wbGFjZWhvbGRlcg==  # Base64 encoded placeholder
+      metadata:
+        dependsOn:
+          - prod-credentials-secret
+
+    - name: distribution-config-version
+      type: gcp-types/secretmanager-v1:projects.secrets.versions
+      properties:
+        parent: projects/{{ .inputs.project_id }}/secrets/distribution-config-{{ .inputs.resource_suffix }}
+        secretVersion:
+          payload:
+            data: ewogICJlbnZpcm9ubWVudHMiOiB7CiAgICAiZGV2ZWxvcG1lbnQiOiB7CiAgICAgICJlbmRwb2ludCI6ICJkZXYuZXhhbXBsZS5jb20iLAogICAgICAidGltZW91dCI6IDMwCiAgICB9LAogICAgInN0YWdpbmciOiB7CiAgICAgICJlbmRwb2ludCI6ICJzdGFnaW5nLmV4YW1wbGUuY29tIiwKICAgICAgInRpbWVvdXQiOiA2MAogICAgfSwKICAgICJwcm9kdWN0aW9uIjogewogICAgICAiZW5kcG9pbnQiOiAicHJvZC5leGFtcGxlLmNvbSIsCiAgICAgICJ0aW1lb3V0IjogMTIwCiAgICB9CiAgfQp9  # Base64 encoded JSON config
+      metadata:
+        dependsOn:
+          - distribution-config-secret
+
+    # Cloud Storage bucket for Cloud Functions source code
+    - name: functions-source-bucket
+      type: gcp-types/storage-v1:buckets
+      properties:
+        name: package-distributor-functions-{{ .inputs.resource_suffix }}-{{ .inputs.project_id }}
+        location: {{ .inputs.region }}
+        storageClass: REGIONAL
+        labels:
+          solution: package-distribution
+          purpose: function-source
+        versioning:
+          enabled: true
+        encryption:
+          defaultKmsKeyName: ""
+        iamConfiguration:
+          uniformBucketLevelAccess:
+            enabled: true
+      metadata:
+        dependsOn:
+          - enable-apis
+
+    # Cloud Tasks queues for workflow orchestration
+    - name: package-distribution-queue
+      type: gcp-types/cloudtasks-v2:projects.locations.queues
+      properties:
+        parent: projects/{{ .inputs.project_id }}/locations/{{ .inputs.region }}
+        queueId: package-distribution-queue
+        queue:
+          rateLimits:
+            maxDispatchesPerSecond: {{ .inputs.max_dispatches_per_second }}
+            maxConcurrentDispatches: {{ .inputs.max_concurrent_dispatches }}
+          retryConfig:
+            maxAttempts: 3
+            maxRetryDuration: 3600s
+          labels:
+            solution: package-distribution
+            priority: standard
+      metadata:
+        dependsOn:
+          - enable-tasks-api
+
+    - name: prod-distribution-queue
+      type: gcp-types/cloudtasks-v2:projects.locations.queues
+      properties:
+        parent: projects/{{ .inputs.project_id }}/locations/{{ .inputs.region }}
+        queueId: prod-distribution-queue
+        queue:
+          rateLimits:
+            maxDispatchesPerSecond: 5
+            maxConcurrentDispatches: 2
+          retryConfig:
+            maxAttempts: 5
+            maxRetryDuration: 7200s
+          labels:
+            solution: package-distribution
+            priority: high
+            environment: production
+      metadata:
+        dependsOn:
+          - enable-tasks-api
+
+    # Cloud Functions for package distribution logic
+    - name: package-distributor-function
+      type: gcp-types/cloudfunctions-v1:projects.locations.functions
+      properties:
+        parent: projects/{{ .inputs.project_id }}/locations/{{ .inputs.region }}
+        functionId: package-distributor-{{ .inputs.resource_suffix }}
+        function:
+          description: "Secure package distribution orchestrator"
+          runtime: python311
+          availableMemoryMb: 512
+          timeout: {{ .inputs.function_timeout }}
+          entryPoint: distribute_package
+          serviceAccountEmail: package-distributor-sa-{{ .inputs.resource_suffix }}@{{ .inputs.project_id }}.iam.gserviceaccount.com
+          environmentVariables:
+            GCP_PROJECT: {{ .inputs.project_id }}
+            RANDOM_SUFFIX: {{ .inputs.resource_suffix }}
+          httpsTrigger:
+            securityLevel: SECURE_ALWAYS
+          labels:
+            solution: package-distribution
+            purpose: distribution-orchestrator
+          sourceArchiveUrl: gs://package-distributor-functions-{{ .inputs.resource_suffix }}-{{ .inputs.project_id }}/function-source.zip
+      metadata:
+        dependsOn:
+          - package-distributor-service-account
+          - functions-source-bucket
+          - enable-functions-api
+
+    # Cloud Scheduler jobs for automated distribution
+    - name: nightly-distribution-job
+      type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+      properties:
+        parent: projects/{{ .inputs.project_id }}/locations/{{ .inputs.region }}
+        jobId: package-distribution-{{ .inputs.resource_suffix }}-nightly
+        job:
+          description: "Nightly package distribution to development environment"
+          schedule: {{ .inputs.nightly_schedule }}
+          timeZone: "America/New_York"
+          httpTarget:
+            uri: https://{{ .inputs.region }}-{{ .inputs.project_id }}.cloudfunctions.net/package-distributor-{{ .inputs.resource_suffix }}
+            httpMethod: POST
+            headers:
+              Content-Type: application/json
+            body: |
+              {
+                "package_name": "webapp",
+                "package_version": "latest",
+                "environment": "development"
+              }
+          labels:
+            solution: package-distribution
+            environment: development
+            frequency: nightly
+      metadata:
+        dependsOn:
+          - package-distributor-function
+          - enable-scheduler-api
+
+    - name: weekly-staging-job
+      type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+      properties:
+        parent: projects/{{ .inputs.project_id }}/locations/{{ .inputs.region }}
+        jobId: package-distribution-{{ .inputs.resource_suffix }}-weekly-staging
+        job:
+          description: "Weekly package distribution to staging environment"
+          schedule: {{ .inputs.weekly_schedule }}
+          timeZone: "America/New_York"
+          httpTarget:
+            uri: https://{{ .inputs.region }}-{{ .inputs.project_id }}.cloudfunctions.net/package-distributor-{{ .inputs.resource_suffix }}
+            httpMethod: POST
+            headers:
+              Content-Type: application/json
+            body: |
+              {
+                "package_name": "webapp",
+                "package_version": "stable",
+                "environment": "staging"
+              }
+          labels:
+            solution: package-distribution
+            environment: staging
+            frequency: weekly
+      metadata:
+        dependsOn:
+          - package-distributor-function
+          - enable-scheduler-api
+
+    - name: prod-manual-job
+      type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+      properties:
+        parent: projects/{{ .inputs.project_id }}/locations/{{ .inputs.region }}
+        jobId: package-distribution-{{ .inputs.resource_suffix }}-prod-manual
+        job:
+          description: "Production package distribution (manual trigger recommended)"
+          schedule: "0 0 1 1 *"  # Very infrequent, intended for manual triggering
+          timeZone: "America/New_York"
+          httpTarget:
+            uri: https://{{ .inputs.region }}-{{ .inputs.project_id }}.cloudfunctions.net/package-distributor-{{ .inputs.resource_suffix }}
+            httpMethod: POST
+            headers:
+              Content-Type: application/json
+            body: |
+              {
+                "package_name": "webapp",
+                "package_version": "release",
+                "environment": "production"
+              }
+          labels:
+            solution: package-distribution
+            environment: production
+            frequency: manual
+      metadata:
+        dependsOn:
+          - package-distributor-function
+          - enable-scheduler-api
+
+    # Cloud Logging metrics for monitoring
+    - name: distribution-failure-metric
+      type: gcp-types/logging-v2:projects.metrics
+      properties:
+        parent: projects/{{ .inputs.project_id }}
+        metricId: package_distribution_failures
+        metric:
+          description: "Count of package distribution failures"
+          filter: |
+            resource.type="cloud_function"
+            resource.labels.function_name="package-distributor-{{ .inputs.resource_suffix }}"
+            severity="ERROR"
+          valueExtractor: "EXTRACT(jsonPayload.error)"
+          labelExtractors:
+            environment: "EXTRACT(jsonPayload.environment)"
+            package_name: "EXTRACT(jsonPayload.package_name)"
+      metadata:
+        dependsOn:
+          - enable-logging-api
+
+    - name: distribution-success-metric
+      type: gcp-types/logging-v2:projects.metrics
+      properties:
+        parent: projects/{{ .inputs.project_id }}
+        metricId: package_distribution_success
+        metric:
+          description: "Count of successful package distributions"
+          filter: |
+            resource.type="cloud_function"
+            resource.labels.function_name="package-distributor-{{ .inputs.resource_suffix }}"
+            jsonPayload.status="success"
+          labelExtractors:
+            environment: "EXTRACT(jsonPayload.environment)"
+            package_name: "EXTRACT(jsonPayload.package_name)"
+      metadata:
+        dependsOn:
+          - enable-logging-api
+
+  # Output values for verification and integration
+  outputs:
+    - name: docker_repository_name
+      value: secure-packages-{{ .inputs.resource_suffix }}
+    
+    - name: npm_repository_name
+      value: secure-packages-{{ .inputs.resource_suffix }}-npm
+    
+    - name: maven_repository_name
+      value: secure-packages-{{ .inputs.resource_suffix }}-maven
+    
+    - name: service_account_email
+      value: package-distributor-sa-{{ .inputs.resource_suffix }}@{{ .inputs.project_id }}.iam.gserviceaccount.com
+    
+    - name: function_name
+      value: package-distributor-{{ .inputs.resource_suffix }}
+    
+    - name: function_url
+      value: https://{{ .inputs.region }}-{{ .inputs.project_id }}.cloudfunctions.net/package-distributor-{{ .inputs.resource_suffix }}
+    
+    - name: package_distribution_queue
+      value: projects/{{ .inputs.project_id }}/locations/{{ .inputs.region }}/queues/package-distribution-queue
+    
+    - name: prod_distribution_queue
+      value: projects/{{ .inputs.project_id }}/locations/{{ .inputs.region }}/queues/prod-distribution-queue
+    
+    - name: nightly_job_name
+      value: package-distribution-{{ .inputs.resource_suffix }}-nightly
+    
+    - name: weekly_job_name
+      value: package-distribution-{{ .inputs.resource_suffix }}-weekly-staging
+    
+    - name: prod_job_name
+      value: package-distribution-{{ .inputs.resource_suffix }}-prod-manual
+    
+    - name: dev_secret_name
+      value: registry-credentials-{{ .inputs.resource_suffix }}-dev
+    
+    - name: staging_secret_name
+      value: registry-credentials-{{ .inputs.resource_suffix }}-staging
+    
+    - name: prod_secret_name
+      value: registry-credentials-{{ .inputs.resource_suffix }}-prod
+    
+    - name: config_secret_name
+      value: distribution-config-{{ .inputs.resource_suffix }}
+    
+    - name: functions_bucket_name
+      value: package-distributor-functions-{{ .inputs.resource_suffix }}-{{ .inputs.project_id }}

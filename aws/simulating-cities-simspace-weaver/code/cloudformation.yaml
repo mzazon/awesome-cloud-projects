@@ -1,0 +1,976 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Smart City Digital Twins with SimSpace Weaver and IoT - Complete infrastructure for real-time urban simulation and analytics'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: smartcity
+    Description: Name prefix for all resources
+    AllowedPattern: '^[a-z][a-z0-9-]{2,15}$'
+    ConstraintDescription: Must be 3-16 characters, start with lowercase letter, contain only lowercase letters, numbers, and hyphens
+  
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, prod]
+    Description: Environment for deployment
+  
+  DynamoDBReadCapacity:
+    Type: Number
+    Default: 10
+    MinValue: 5
+    MaxValue: 100
+    Description: DynamoDB read capacity units
+  
+  DynamoDBWriteCapacity:
+    Type: Number
+    Default: 10
+    MinValue: 5
+    MaxValue: 100
+    Description: DynamoDB write capacity units
+  
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024, 2048]
+    Description: Memory allocation for Lambda functions (MB)
+  
+  EnableStreams:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable DynamoDB Streams for real-time processing
+  
+  IoTThingGroupName:
+    Type: String
+    Default: sensors
+    Description: Name for IoT Thing Group suffix
+    AllowedPattern: '^[a-zA-Z0-9_-]{1,128}$'
+    ConstraintDescription: Must be 1-128 characters, alphanumeric, underscore, or hyphen
+
+Conditions:
+  EnableDynamoDBStreams: !Equals [!Ref EnableStreams, 'true']
+  IsProduction: !Equals [!Ref Environment, prod]
+
+Resources:
+  # DynamoDB Table for Sensor Data Storage
+  SensorDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-sensor-data'
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref DynamoDBReadCapacity
+        WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      AttributeDefinitions:
+        - AttributeName: sensor_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: sensor_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      StreamSpecification: !If
+        - EnableDynamoDBStreams
+        - StreamViewType: NEW_AND_OLD_IMAGES
+        - !Ref 'AWS::NoValue'
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-sensor-data'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: SmartCityDigitalTwin
+
+  # S3 Bucket for SimSpace Weaver simulation artifacts
+  SimulationArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-simulation-${AWS::Region}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: !If [IsProduction, Enabled, Suspended]
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            TransitionInDays: 30
+            StorageClass: STANDARD_IA
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-simulation-artifacts'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: SmartCityDigitalTwin
+
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt SensorDataTable.Arn
+                  - !Sub '${SensorDataTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:ListStreams
+                Resource: !GetAtt SensorDataTable.StreamArn
+        - PolicyName: SimSpaceWeaverAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - simspaceweaver:StartSimulation
+                  - simspaceweaver:StopSimulation
+                  - simspaceweaver:DescribeSimulation
+                  - simspaceweaver:ListSimulations
+                  - simspaceweaver:ListApps
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub '${SimulationArtifactsBucket}/*'
+        - PolicyName: LoggingAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-lambda-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: SmartCityDigitalTwin
+
+  # IAM Role for SimSpace Weaver
+  SimSpaceWeaverRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-simspace-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: simspaceweaver.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SimSpaceWeaverExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt SimulationArtifactsBucket.Arn
+                  - !Sub '${SimulationArtifactsBucket}/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                  - ec2:AttachNetworkInterface
+                  - ec2:DetachNetworkInterface
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-simspace-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: SmartCityDigitalTwin
+
+  # IoT Thing Group for Smart City Sensors
+  IoTThingGroup:
+    Type: AWS::IoT::ThingGroup
+    Properties:
+      ThingGroupName: !Sub '${ProjectName}-${Environment}-${IoTThingGroupName}'
+      ThingGroupProperties:
+        AttributePayload:
+          Attributes:
+            Environment: !Ref Environment
+            Purpose: SmartCityDigitalTwin
+        ThingGroupDescription: Smart city sensor fleet for digital twin simulation
+
+  # IoT Policy for Sensor Devices
+  IoTSensorPolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-${Environment}-sensor-policy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: iot:Connect
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/${aws:username}'
+          - Effect: Allow
+            Action: iot:Publish
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/smartcity/sensors/*'
+          - Effect: Allow
+            Action: iot:Subscribe
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/smartcity/management/*'
+          - Effect: Allow
+            Action: iot:Receive
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/smartcity/management/*'
+
+  # Lambda Function for IoT Data Processing
+  SensorDataProcessor:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-sensor-processor'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: 60
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref SensorDataTable
+          PROJECT_NAME: !Sub '${ProjectName}-${Environment}'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from datetime import datetime
+          from decimal import Decimal
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['TABLE_NAME'])
+          
+          def lambda_handler(event, context):
+              """Process IoT sensor data and store in DynamoDB"""
+              try:
+                  processed_count = 0
+                  
+                  # Handle different event sources
+                  if 'Records' in event:
+                      # SQS or other record-based events
+                      for record in event['Records']:
+                          message = json.loads(record.get('body', record))
+                          process_sensor_message(message)
+                          processed_count += 1
+                  else:
+                      # Direct IoT message
+                      process_sensor_message(event)
+                      processed_count = 1
+                  
+                  logger.info(f"Successfully processed {processed_count} sensor messages")
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Successfully processed {processed_count} messages',
+                          'timestamp': datetime.utcnow().isoformat()
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing sensor data: {str(e)}")
+                  raise
+          
+          def process_sensor_message(message):
+              """Process individual sensor message"""
+              sensor_data = {
+                  'sensor_id': message.get('sensor_id', 'unknown'),
+                  'timestamp': message.get('timestamp', datetime.utcnow().isoformat()),
+                  'sensor_type': message.get('sensor_type', 'generic'),
+                  'location': message.get('location', {}),
+                  'data': json.loads(json.dumps(message.get('data', {})), parse_float=Decimal),
+                  'metadata': {
+                      'processed_at': datetime.utcnow().isoformat(),
+                      'processor_version': '1.0'
+                  }
+              }
+              
+              # Store in DynamoDB
+              table.put_item(Item=sensor_data)
+              logger.info(f"Stored sensor data: {sensor_data['sensor_id']} at {sensor_data['timestamp']}")
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-sensor-processor'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: SmartCityDigitalTwin
+
+  # Lambda Function for DynamoDB Stream Processing
+  StreamProcessor:
+    Type: AWS::Lambda::Function
+    Condition: EnableDynamoDBStreams
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-stream-processor'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: 60
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          PROJECT_NAME: !Sub '${ProjectName}-${Environment}'
+          SIMULATION_BUCKET: !Ref SimulationArtifactsBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          simspace = boto3.client('simspaceweaver')
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              """Process DynamoDB stream events for simulation updates"""
+              try:
+                  processed_events = []
+                  
+                  for record in event['Records']:
+                      event_name = record['eventName']
+                      
+                      if event_name in ['INSERT', 'MODIFY']:
+                          # Extract sensor data from stream record
+                          sensor_data = record['dynamodb']['NewImage']
+                          
+                          # Process for simulation input
+                          simulation_input = {
+                              'sensor_id': sensor_data['sensor_id']['S'],
+                              'timestamp': sensor_data['timestamp']['S'],
+                              'sensor_type': sensor_data.get('sensor_type', {}).get('S', 'unknown'),
+                              'event_type': event_name,
+                              'data': parse_dynamodb_item(sensor_data.get('data', {}))
+                          }
+                          
+                          processed_events.append(simulation_input)
+                          logger.info(f"Processed stream event: {simulation_input['sensor_id']}")
+                  
+                  # TODO: Send processed events to SimSpace Weaver simulation
+                  # This would typically trigger simulation parameter updates
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'processed_events': len(processed_events),
+                          'timestamp': datetime.utcnow().isoformat()
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing stream: {str(e)}")
+                  raise
+          
+          def parse_dynamodb_item(item):
+              """Parse DynamoDB item format to Python object"""
+              if isinstance(item, dict):
+                  if 'S' in item:
+                      return item['S']
+                  elif 'N' in item:
+                      return float(item['N'])
+                  elif 'M' in item:
+                      return {k: parse_dynamodb_item(v) for k, v in item['M'].items()}
+                  elif 'L' in item:
+                      return [parse_dynamodb_item(v) for v in item['L']]
+              return item
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-stream-processor'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: SmartCityDigitalTwin
+
+  # Lambda Function for Simulation Management
+  SimulationManager:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-simulation-manager'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      MemorySize: 512
+      Timeout: 300
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          PROJECT_NAME: !Sub '${ProjectName}-${Environment}'
+          SIMULATION_BUCKET: !Ref SimulationArtifactsBucket
+          SIMSPACE_ROLE_ARN: !GetAtt SimSpaceWeaverRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          simspace = boto3.client('simspaceweaver')
+          
+          def lambda_handler(event, context):
+              """Manage SimSpace Weaver simulations"""
+              try:
+                  action = event.get('action', 'status')
+                  
+                  if action == 'start':
+                      return start_simulation(event, context)
+                  elif action == 'stop':
+                      return stop_simulation(event)
+                  elif action == 'status':
+                      return get_simulation_status()
+                  else:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'Invalid action. Use: start, stop, or status'})
+                      }
+                      
+              except Exception as e:
+                  logger.error(f"Error managing simulation: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def start_simulation(event, context):
+              """Start a new SimSpace Weaver simulation"""
+              simulation_name = event.get('simulation_name', f"{os.environ['PROJECT_NAME']}-simulation")
+              
+              try:
+                  response = simspace.start_simulation(
+                      Name=simulation_name,
+                      RoleArn=os.environ['SIMSPACE_ROLE_ARN'],
+                      SchemaS3Location={
+                          'BucketName': os.environ['SIMULATION_BUCKET'],
+                          'ObjectKey': 'simulation_schema.yaml'
+                      },
+                      MaximumDuration='PT24H'  # 24 hour maximum
+                  )
+                  
+                  logger.info(f"Started simulation: {simulation_name}")
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Simulation started successfully',
+                          'simulation_name': simulation_name,
+                          'simulation_arn': response.get('Arn'),
+                          'timestamp': datetime.utcnow().isoformat()
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Failed to start simulation: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': f'Failed to start simulation: {str(e)}'})
+                  }
+          
+          def stop_simulation(event):
+              """Stop a running simulation"""
+              simulation_name = event.get('simulation_name')
+              
+              if not simulation_name:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'simulation_name is required for stop action'})
+                  }
+              
+              try:
+                  simspace.stop_simulation(Simulation=simulation_name)
+                  
+                  logger.info(f"Stopped simulation: {simulation_name}")
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Simulation stopped successfully',
+                          'simulation_name': simulation_name,
+                          'timestamp': datetime.utcnow().isoformat()
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Failed to stop simulation: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': f'Failed to stop simulation: {str(e)}'})
+                  }
+          
+          def get_simulation_status():
+              """Get status of all simulations"""
+              try:
+                  response = simspace.list_simulations()
+                  
+                  simulations = []
+                  for sim in response.get('Simulations', []):
+                      simulations.append({
+                          'name': sim.get('Name'),
+                          'status': sim.get('Status'),
+                          'created': sim.get('CreationTime').isoformat() if sim.get('CreationTime') else None,
+                          'arn': sim.get('Arn')
+                      })
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'simulations': simulations,
+                          'count': len(simulations),
+                          'timestamp': datetime.utcnow().isoformat()
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Failed to get simulation status: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': f'Failed to get simulation status: {str(e)}'})
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-simulation-manager'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: SmartCityDigitalTwin
+
+  # Lambda Function for Analytics Processing
+  AnalyticsProcessor:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-analytics'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      MemorySize: 1024
+      Timeout: 300
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref SensorDataTable
+          PROJECT_NAME: !Sub '${ProjectName}-${Environment}'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from datetime import datetime, timedelta
+          from decimal import Decimal
+          from boto3.dynamodb.conditions import Key
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['TABLE_NAME'])
+          
+          def lambda_handler(event, context):
+              """Process analytics for smart city insights"""
+              try:
+                  analytics_type = event.get('type', 'traffic_summary')
+                  time_range = event.get('time_range', '24h')
+                  
+                  if analytics_type == 'traffic_summary':
+                      return generate_traffic_summary(time_range)
+                  elif analytics_type == 'sensor_health':
+                      return generate_sensor_health_report()
+                  elif analytics_type == 'simulation_insights':
+                      return generate_simulation_insights()
+                  else:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'Invalid analytics type. Use: traffic_summary, sensor_health, or simulation_insights'})
+                      }
+                      
+              except Exception as e:
+                  logger.error(f"Error processing analytics: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def generate_traffic_summary(time_range):
+              """Generate traffic analytics summary"""
+              try:
+                  # Calculate time range
+                  end_time = datetime.utcnow()
+                  if time_range == '24h':
+                      start_time = end_time - timedelta(hours=24)
+                  elif time_range == '7d':
+                      start_time = end_time - timedelta(days=7)
+                  else:
+                      start_time = end_time - timedelta(hours=1)
+                  
+                  # Query traffic sensor data
+                  response = table.scan(
+                      FilterExpression='sensor_type = :sensor_type AND #timestamp BETWEEN :start_time AND :end_time',
+                      ExpressionAttributeNames={'#timestamp': 'timestamp'},
+                      ExpressionAttributeValues={
+                          ':sensor_type': 'traffic',
+                          ':start_time': start_time.isoformat(),
+                          ':end_time': end_time.isoformat()
+                      }
+                  )
+                  
+                  traffic_data = response['Items']
+                  
+                  # Calculate metrics
+                  total_vehicles = sum(float(item.get('data', {}).get('vehicle_count', 0)) for item in traffic_data)
+                  speeds = [float(item.get('data', {}).get('average_speed', 0)) for item in traffic_data if item.get('data', {}).get('average_speed', 0) > 0]
+                  average_speed = sum(speeds) / len(speeds) if speeds else 0
+                  congestion_score = calculate_congestion_score(traffic_data)
+                  
+                  summary = {
+                      'time_range': time_range,
+                      'total_vehicles': int(total_vehicles),
+                      'average_speed': round(average_speed, 2),
+                      'congestion_score': round(congestion_score, 2),
+                      'sensor_count': len(set(item['sensor_id'] for item in traffic_data)),
+                      'data_points': len(traffic_data),
+                      'generated_at': datetime.utcnow().isoformat()
+                  }
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(summary)
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Failed to generate traffic summary: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': f'Failed to generate traffic summary: {str(e)}'})
+                  }
+          
+          def calculate_congestion_score(traffic_data):
+              """Calculate traffic congestion score (0-100)"""
+              if not traffic_data:
+                  return 0
+              
+              total_score = 0
+              for item in traffic_data:
+                  data = item.get('data', {})
+                  speed = float(data.get('average_speed', 50))
+                  volume = float(data.get('vehicle_count', 0))
+                  
+                  # Higher volume and lower speed = higher congestion
+                  if speed > 0:
+                      score = min(100, (volume / 10) * ((60 - speed) / 60) * 100)
+                      total_score += max(0, score)
+              
+              return total_score / len(traffic_data) if traffic_data else 0
+          
+          def generate_sensor_health_report():
+              """Generate sensor health and connectivity report"""
+              try:
+                  # Query recent sensor data (last hour)
+                  end_time = datetime.utcnow()
+                  start_time = end_time - timedelta(hours=1)
+                  
+                  response = table.scan(
+                      FilterExpression='#timestamp BETWEEN :start_time AND :end_time',
+                      ExpressionAttributeNames={'#timestamp': 'timestamp'},
+                      ExpressionAttributeValues={
+                          ':start_time': start_time.isoformat(),
+                          ':end_time': end_time.isoformat()
+                      }
+                  )
+                  
+                  # Analyze sensor health
+                  sensors = {}
+                  for item in response['Items']:
+                      sensor_id = item['sensor_id']
+                      if sensor_id not in sensors:
+                          sensors[sensor_id] = {
+                              'sensor_id': sensor_id,
+                              'sensor_type': item.get('sensor_type', 'unknown'),
+                              'message_count': 0,
+                              'last_seen': item['timestamp'],
+                              'status': 'active'
+                          }
+                      sensors[sensor_id]['message_count'] += 1
+                      
+                      # Update last seen if this is more recent
+                      if item['timestamp'] > sensors[sensor_id]['last_seen']:
+                          sensors[sensor_id]['last_seen'] = item['timestamp']
+                  
+                  # Determine sensor health status
+                  for sensor in sensors.values():
+                      if sensor['message_count'] < 5:  # Less than 5 messages per hour
+                          sensor['status'] = 'warning'
+                      if sensor['message_count'] == 0:
+                          sensor['status'] = 'offline'
+                  
+                  health_report = {
+                      'total_sensors': len(sensors),
+                      'active_sensors': sum(1 for s in sensors.values() if s['status'] == 'active'),
+                      'warning_sensors': sum(1 for s in sensors.values() if s['status'] == 'warning'),
+                      'offline_sensors': sum(1 for s in sensors.values() if s['status'] == 'offline'),
+                      'sensors': list(sensors.values()),
+                      'generated_at': datetime.utcnow().isoformat()
+                  }
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(health_report)
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Failed to generate sensor health report: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': f'Failed to generate sensor health report: {str(e)}'})
+                  }
+          
+          def generate_simulation_insights():
+              """Generate insights from simulation results"""
+              try:
+                  # Mock insights - in real implementation, this would query simulation results
+                  insights = {
+                      'traffic_optimization': {
+                          'potential_improvement': '15%',
+                          'recommended_actions': [
+                              'Optimize traffic light timing at Main St intersection',
+                              'Implement dynamic routing for congested areas',
+                              'Add traffic sensors to Highway 101 corridor'
+                          ]
+                      },
+                      'emergency_response': {
+                          'average_response_time': '4.2 minutes',
+                          'optimization_opportunities': [
+                              'Relocate ambulance station to reduce coverage gaps',
+                              'Implement priority traffic routing for emergency vehicles'
+                          ]
+                      },
+                      'infrastructure_utilization': {
+                          'capacity_utilization': '68%',
+                          'peak_hours': ['8:00-9:00 AM', '5:00-6:00 PM'],
+                          'recommendations': [
+                              'Implement congestion pricing during peak hours',
+                              'Promote alternative transportation options'
+                          ]
+                      },
+                      'generated_at': datetime.utcnow().isoformat()
+                  }
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(insights)
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Failed to generate simulation insights: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': f'Failed to generate simulation insights: {str(e)}'})
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-analytics'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: SmartCityDigitalTwin
+
+  # IoT Topic Rule for Sensor Data Processing
+  SensorDataRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub '${ProjectName}_${Environment}_sensor_processing'
+      TopicRulePayload:
+        RuleDisabled: false
+        Sql: "SELECT * FROM 'smartcity/sensors/+/data'"
+        Description: Route smart city sensor data to processing Lambda
+        Actions:
+          - Lambda:
+              FunctionArn: !GetAtt SensorDataProcessor.Arn
+
+  # Permission for IoT to invoke Lambda
+  IoTLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SensorDataProcessor
+      Action: lambda:InvokeFunction
+      Principal: iot.amazonaws.com
+      SourceArn: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:rule/${ProjectName}_${Environment}_sensor_processing'
+
+  # Event Source Mapping for DynamoDB Streams
+  StreamEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: EnableDynamoDBStreams
+    Properties:
+      EventSourceArn: !GetAtt SensorDataTable.StreamArn
+      FunctionName: !GetAtt StreamProcessor.Arn
+      StartingPosition: LATEST
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+
+  # CloudWatch Log Groups for Lambda Functions
+  SensorProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${SensorDataProcessor}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  StreamProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableDynamoDBStreams
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${StreamProcessor}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  SimulationManagerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${SimulationManager}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  AnalyticsProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AnalyticsProcessor}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+Outputs:
+  DynamoDBTableName:
+    Description: Name of the DynamoDB table for sensor data
+    Value: !Ref SensorDataTable
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-sensor-table'
+
+  DynamoDBTableArn:
+    Description: ARN of the DynamoDB table
+    Value: !GetAtt SensorDataTable.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-sensor-table-arn'
+
+  DynamoDBStreamArn:
+    Condition: EnableDynamoDBStreams
+    Description: ARN of the DynamoDB stream
+    Value: !GetAtt SensorDataTable.StreamArn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-sensor-stream-arn'
+
+  SimulationBucketName:
+    Description: Name of the S3 bucket for simulation artifacts
+    Value: !Ref SimulationArtifactsBucket
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-simulation-bucket'
+
+  IoTThingGroupName:
+    Description: Name of the IoT Thing Group for sensors
+    Value: !Ref IoTThingGroup
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-iot-thing-group'
+
+  IoTSensorPolicyName:
+    Description: Name of the IoT policy for sensor devices
+    Value: !Ref IoTSensorPolicy
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-iot-sensor-policy'
+
+  SensorProcessorFunctionName:
+    Description: Name of the sensor data processing Lambda function
+    Value: !Ref SensorDataProcessor
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-sensor-processor'
+
+  SimulationManagerFunctionName:
+    Description: Name of the simulation management Lambda function
+    Value: !Ref SimulationManager
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-simulation-manager'
+
+  AnalyticsProcessorFunctionName:
+    Description: Name of the analytics processing Lambda function
+    Value: !Ref AnalyticsProcessor
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-analytics-processor'
+
+  IoTDataEndpoint:
+    Description: IoT data endpoint for device connections
+    Value: !Sub 'https://${AWS::AccountId}.iot.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-iot-endpoint'
+
+  SimSpaceRoleArn:
+    Description: ARN of the SimSpace Weaver execution role
+    Value: !GetAtt SimSpaceWeaverRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-simspace-role-arn'
+
+  DeploymentRegion:
+    Description: AWS region where the stack is deployed
+    Value: !Ref 'AWS::Region'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-region'
+
+  ProjectEnvironment:
+    Description: Environment name for the deployment
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-environment'

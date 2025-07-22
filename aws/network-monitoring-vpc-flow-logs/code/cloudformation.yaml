@@ -1,0 +1,702 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Comprehensive network monitoring solution with VPC Flow Logs, CloudWatch integration, S3 storage, and Athena analytics'
+
+# ============================================================================
+# PARAMETERS
+# ============================================================================
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC ID to monitor with flow logs'
+    ConstraintDescription: 'Must be a valid VPC ID in this region'
+
+  FlowLogRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: 'Number of days to retain flow logs in CloudWatch Logs'
+    ConstraintDescription: 'Must be between 1 and 365 days'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for security alert notifications'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  RejectedConnectionsThreshold:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    MaxValue: 1000
+    Description: 'Threshold for rejected connections alarm (per 5-minute period)'
+    ConstraintDescription: 'Must be between 1 and 1000'
+
+  HighDataTransferThreshold:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+    Description: 'Threshold for high data transfer alarm (events per 5-minute period)'
+    ConstraintDescription: 'Must be between 1 and 100'
+
+  ExternalConnectionsThreshold:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 1000
+    Description: 'Threshold for external connections alarm (per 5-minute period)'
+    ConstraintDescription: 'Must be between 1 and 1000'
+
+  Environment:
+    Type: String
+    Default: 'production'
+    AllowedValues:
+      - 'development'
+      - 'staging'
+      - 'production'
+    Description: 'Environment name for resource tagging'
+
+  CreateDashboard:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Whether to create CloudWatch dashboard'
+
+# ============================================================================
+# CONDITIONS
+# ============================================================================
+Conditions:
+  ShouldCreateDashboard: !Equals [!Ref CreateDashboard, 'true']
+
+# ============================================================================
+# RESOURCES
+# ============================================================================
+Resources:
+  # ------------------------------------------------------------------------
+  # S3 Bucket for Flow Logs Storage
+  # ------------------------------------------------------------------------
+  FlowLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'vpc-flow-logs-${AWS::AccountId}-${AWS::Region}-${Environment}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: FlowLogsLifecycle
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+            ExpirationInDays: 2555  # 7 years retention
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref FlowLogsGroup
+      Tags:
+        - Key: Name
+          Value: !Sub 'vpc-flow-logs-bucket-${Environment}'
+        - Key: Purpose
+          Value: 'VPC Flow Logs Storage'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # ------------------------------------------------------------------------
+  # IAM Role for VPC Flow Logs
+  # ------------------------------------------------------------------------
+  FlowLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'VPCFlowLogsRole-${Environment}-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/VPCFlowLogsDeliveryRolePolicy
+      Policies:
+        - PolicyName: S3FlowLogsDelivery
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetBucketAcl
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt FlowLogsBucket.Arn
+                  - !Sub '${FlowLogsBucket.Arn}/*'
+      Tags:
+        - Key: Name
+          Value: !Sub 'vpc-flow-logs-role-${Environment}'
+        - Key: Purpose
+          Value: 'VPC Flow Logs Service Role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ------------------------------------------------------------------------
+  # CloudWatch Log Group
+  # ------------------------------------------------------------------------
+  FlowLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/vpc/flowlogs/${Environment}'
+      RetentionInDays: !Ref FlowLogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub 'vpc-flow-logs-group-${Environment}'
+        - Key: Purpose
+          Value: 'VPC Flow Logs CloudWatch Storage'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ------------------------------------------------------------------------
+  # VPC Flow Logs
+  # ------------------------------------------------------------------------
+  FlowLogsToCloudWatch:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref VpcId
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref FlowLogsGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogsRole.Arn
+      MaxAggregationInterval: 60
+      Tags:
+        - Key: Name
+          Value: !Sub 'vpc-flow-logs-cloudwatch-${Environment}'
+        - Key: Purpose
+          Value: 'Real-time VPC Flow Logs to CloudWatch'
+        - Key: Environment
+          Value: !Ref Environment
+
+  FlowLogsToS3:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref VpcId
+      TrafficType: ALL
+      LogDestinationType: s3
+      LogDestination: !Sub '${FlowLogsBucket.Arn}/vpc-flow-logs/'
+      LogFormat: '${version} ${account-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${log-status} ${vpc-id} ${subnet-id} ${instance-id} ${tcp-flags} ${type} ${pkt-srcaddr} ${pkt-dstaddr}'
+      MaxAggregationInterval: 60
+      Tags:
+        - Key: Name
+          Value: !Sub 'vpc-flow-logs-s3-${Environment}'
+        - Key: Purpose
+          Value: 'Long-term VPC Flow Logs to S3'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ------------------------------------------------------------------------
+  # SNS Topic for Alerting
+  # ------------------------------------------------------------------------
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'network-monitoring-alerts-${Environment}'
+      DisplayName: 'Network Monitoring Security Alerts'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub 'network-alerts-topic-${Environment}'
+        - Key: Purpose
+          Value: 'Network Security Alerting'
+        - Key: Environment
+          Value: !Ref Environment
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AlertsTopic
+      Endpoint: !Ref NotificationEmail
+
+  # ------------------------------------------------------------------------
+  # CloudWatch Metric Filters
+  # ------------------------------------------------------------------------
+  RejectedConnectionsFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FlowLogsGroup
+      FilterPattern: '[version, account, eni, source, destination, srcport, destport, protocol, packets, bytes, windowstart, windowend, action="REJECT", flowlogstatus]'
+      MetricTransformations:
+        - MetricNamespace: 'VPC/FlowLogs'
+          MetricName: 'RejectedConnections'
+          MetricValue: '1'
+          DefaultValue: 0
+          Unit: Count
+
+  HighDataTransferFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FlowLogsGroup
+      FilterPattern: '[version, account, eni, source, destination, srcport, destport, protocol, packets, bytes>10000000, windowstart, windowend, action, flowlogstatus]'
+      MetricTransformations:
+        - MetricNamespace: 'VPC/FlowLogs'
+          MetricName: 'HighDataTransfer'
+          MetricValue: '1'
+          DefaultValue: 0
+          Unit: Count
+
+  ExternalConnectionsFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FlowLogsGroup
+      FilterPattern: '[version, account, eni, source!="10.*" && source!="172.16.*" && source!="192.168.*", destination, srcport, destport, protocol, packets, bytes, windowstart, windowend, action, flowlogstatus]'
+      MetricTransformations:
+        - MetricNamespace: 'VPC/FlowLogs'
+          MetricName: 'ExternalConnections'
+          MetricValue: '1'
+          DefaultValue: 0
+          Unit: Count
+
+  # ------------------------------------------------------------------------
+  # CloudWatch Alarms
+  # ------------------------------------------------------------------------
+  RejectedConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'VPC-High-Rejected-Connections-${Environment}'
+      AlarmDescription: 'Alert when rejected connections exceed threshold indicating potential security threats'
+      MetricName: RejectedConnections
+      Namespace: 'VPC/FlowLogs'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref RejectedConnectionsThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub 'rejected-connections-alarm-${Environment}'
+        - Key: Purpose
+          Value: 'Network Security Monitoring'
+        - Key: Environment
+          Value: !Ref Environment
+
+  HighDataTransferAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'VPC-High-Data-Transfer-${Environment}'
+      AlarmDescription: 'Alert when high data transfer detected indicating potential data exfiltration'
+      MetricName: HighDataTransfer
+      Namespace: 'VPC/FlowLogs'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref HighDataTransferThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub 'high-data-transfer-alarm-${Environment}'
+        - Key: Purpose
+          Value: 'Data Exfiltration Detection'
+        - Key: Environment
+          Value: !Ref Environment
+
+  ExternalConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'VPC-External-Connections-${Environment}'
+      AlarmDescription: 'Alert when external connections exceed threshold indicating unusual external access patterns'
+      MetricName: ExternalConnections
+      Namespace: 'VPC/FlowLogs'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref ExternalConnectionsThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub 'external-connections-alarm-${Environment}'
+        - Key: Purpose
+          Value: 'External Access Monitoring'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ------------------------------------------------------------------------
+  # Lambda Function for Advanced Analysis
+  # ------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'NetworkAnomalyDetectorRole-${Environment}-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AlertsTopic
+        - PolicyName: LogsAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+
+  AnomalyDetectorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'network-anomaly-detector-${Environment}'
+      Description: 'Advanced analysis of VPC Flow Logs for anomaly detection'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref AlertsTopic
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import gzip
+          import base64
+          import os
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              """
+              Advanced network anomaly detection for VPC Flow Logs
+              Analyzes traffic patterns and detects potential security threats
+              """
+              try:
+                  # Decode and decompress CloudWatch Logs data
+                  compressed_payload = base64.b64decode(event['awslogs']['data'])
+                  uncompressed_payload = gzip.decompress(compressed_payload)
+                  log_data = json.loads(uncompressed_payload)
+                  
+                  anomalies = []
+                  
+                  for log_event in log_data['logEvents']:
+                      message = log_event['message']
+                      fields = message.split(' ')
+                      
+                      if len(fields) >= 14:
+                          srcaddr = fields[3]
+                          dstaddr = fields[4]
+                          srcport = fields[5]
+                          dstport = fields[6]
+                          protocol = fields[7]
+                          bytes_transferred = int(fields[9]) if fields[9].isdigit() else 0
+                          action = fields[12]
+                          
+                          # Detect potential anomalies
+                          if bytes_transferred > 50000000:  # >50MB transfers
+                              anomalies.append({
+                                  'type': 'high_data_transfer',
+                                  'source': srcaddr,
+                                  'destination': dstaddr,
+                                  'bytes': bytes_transferred,
+                                  'timestamp': log_event['timestamp']
+                              })
+                          
+                          if action == 'REJECT' and protocol == '6':  # TCP rejects
+                              anomalies.append({
+                                  'type': 'rejected_tcp_connection',
+                                  'source': srcaddr,
+                                  'destination': dstaddr,
+                                  'port': dstport,
+                                  'timestamp': log_event['timestamp']
+                              })
+                          
+                          # Detect potential port scanning
+                          if action == 'REJECT' and dstport in ['22', '23', '3389', '445', '135']:
+                              anomalies.append({
+                                  'type': 'potential_port_scan',
+                                  'source': srcaddr,
+                                  'destination': dstaddr,
+                                  'port': dstport,
+                                  'timestamp': log_event['timestamp']
+                              })
+                  
+                  # Send notifications for anomalies
+                  if anomalies:
+                      sns = boto3.client('sns')
+                      environment = os.environ.get('ENVIRONMENT', 'unknown')
+                      
+                      message = f"""
+              Network Anomalies Detected in {environment.upper()} Environment
+              
+              Timestamp: {datetime.now().isoformat()}
+              VPC: {log_data.get('logGroup', 'Unknown')}
+              
+              Anomalies Detected:
+              {json.dumps(anomalies, indent=2)}
+              
+              Please investigate these network security events immediately.
+              """
+                      
+                      sns.publish(
+                          TopicArn=os.environ['SNS_TOPIC_ARN'],
+                          Message=message,
+                          Subject=f'🚨 Network Security Alert - {environment.upper()}'
+                      )
+                      
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': 'Anomalies detected and notifications sent',
+                              'anomaly_count': len(anomalies)
+                          })
+                      }
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'message': 'No anomalies detected'})
+                  }
+                  
+              except Exception as e:
+                  print(f"Error processing flow logs: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub 'network-anomaly-detector-${Environment}'
+        - Key: Purpose
+          Value: 'Advanced Network Security Analysis'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Subscription filter to trigger Lambda function
+  LambdaSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      LogGroupName: !Ref FlowLogsGroup
+      FilterPattern: '[version, account, eni, source, destination, srcport, destport, protocol, packets, bytes, windowstart, windowend, action, flowlogstatus]'
+      DestinationArn: !GetAtt AnomalyDetectorFunction.Arn
+
+  # Permission for CloudWatch Logs to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AnomalyDetectorFunction
+      Action: lambda:InvokeFunction
+      Principal: logs.amazonaws.com
+      SourceArn: !Sub '${FlowLogsGroup.Arn}:*'
+
+  # ------------------------------------------------------------------------
+  # Athena Resources for Analytics
+  # ------------------------------------------------------------------------
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub 'vpc-flow-logs-workgroup-${Environment}'
+      Description: 'Workgroup for VPC Flow Logs analysis and reporting'
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${FlowLogsBucket}/athena-results/'
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetrics: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'vpc-flow-logs-workgroup-${Environment}'
+        - Key: Purpose
+          Value: 'VPC Flow Logs Analytics'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Glue Database for Flow Logs
+  FlowLogsDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub 'vpc_flow_logs_${Environment}'
+        Description: 'Database for VPC Flow Logs analysis'
+
+  # ------------------------------------------------------------------------
+  # CloudWatch Dashboard (Conditional)
+  # ------------------------------------------------------------------------
+  NetworkMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: ShouldCreateDashboard
+    Properties:
+      DashboardName: !Sub 'VPC-Flow-Logs-Monitoring-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["VPC/FlowLogs", "RejectedConnections", {"stat": "Sum"}],
+                  [".", "HighDataTransfer", {"stat": "Sum"}],
+                  [".", "ExternalConnections", {"stat": "Sum"}]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Network Security Metrics",
+                "period": 300,
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${FlowLogsGroup}' | fields @timestamp, @message\n| filter @message like /REJECT/\n| stats count() by bin(5m)\n| sort @timestamp desc",
+                "region": "${AWS::Region}",
+                "title": "Rejected Connections Over Time",
+                "view": "table"
+              }
+            },
+            {
+              "type": "log",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${FlowLogsGroup}' | fields @timestamp, @message\n| parse @message \"* * * * * * * * * * * * * *\" as version, account, eni, source, destination, srcport, destport, protocol, packets, bytes, start, end, action, status\n| filter bytes > 10000000\n| stats sum(bytes) by source, destination\n| sort sum desc\n| limit 10",
+                "region": "${AWS::Region}",
+                "title": "Top Data Transfers",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+Outputs:
+  FlowLogsBucketName:
+    Description: 'S3 bucket name for VPC Flow Logs storage'
+    Value: !Ref FlowLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-FlowLogsBucket'
+
+  FlowLogsBucketArn:
+    Description: 'S3 bucket ARN for VPC Flow Logs storage'
+    Value: !GetAtt FlowLogsBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FlowLogsBucketArn'
+
+  CloudWatchLogGroup:
+    Description: 'CloudWatch Log Group for real-time flow logs'
+    Value: !Ref FlowLogsGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  SNSTopicArn:
+    Description: 'SNS Topic ARN for security alerts'
+    Value: !Ref AlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertsTopic'
+
+  LambdaFunctionArn:
+    Description: 'Lambda function ARN for anomaly detection'
+    Value: !GetAtt AnomalyDetectorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AnomalyDetector'
+
+  AthenaWorkGroupName:
+    Description: 'Athena WorkGroup for flow logs analysis'
+    Value: !Ref AthenaWorkGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaWorkGroup'
+
+  CloudWatchFlowLogId:
+    Description: 'VPC Flow Log ID for CloudWatch destination'
+    Value: !Ref FlowLogsToCloudWatch
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchFlowLog'
+
+  S3FlowLogId:
+    Description: 'VPC Flow Log ID for S3 destination'
+    Value: !Ref FlowLogsToS3
+    Export:
+      Name: !Sub '${AWS::StackName}-S3FlowLog'
+
+  DashboardURL:
+    Condition: ShouldCreateDashboard
+    Description: 'CloudWatch Dashboard URL for network monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${NetworkMonitoringDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  GlueDatabaseName:
+    Description: 'Glue database name for VPC Flow Logs'
+    Value: !Ref FlowLogsDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabase'
+
+  MonitoringSetupComplete:
+    Description: 'Confirmation that network monitoring is fully configured'
+    Value: !Sub 'Network monitoring deployed successfully for VPC ${VpcId} in ${Environment} environment'

@@ -1,0 +1,890 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Hybrid Cloud Connectivity with AWS Direct Connect - Complete infrastructure for enterprise hybrid cloud architecture'
+
+# ====================
+# PARAMETERS
+# ====================
+Parameters:
+  # Network Configuration
+  OnPremisesCIDR:
+    Type: String
+    Default: '10.0.0.0/8'
+    Description: 'CIDR block for on-premises network'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(/([0-9]|[1-2][0-9]|3[0-2]))$'
+    ConstraintDescription: 'Must be a valid CIDR block'
+
+  ProductionVPCCIDR:
+    Type: String
+    Default: '10.1.0.0/16'
+    Description: 'CIDR block for production VPC'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(/([0-9]|[1-2][0-9]|3[0-2]))$'
+    ConstraintDescription: 'Must be a valid CIDR block'
+
+  DevelopmentVPCCIDR:
+    Type: String
+    Default: '10.2.0.0/16'
+    Description: 'CIDR block for development VPC'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(/([0-9]|[1-2][0-9]|3[0-2]))$'
+    ConstraintDescription: 'Must be a valid CIDR block'
+
+  SharedServicesVPCCIDR:
+    Type: String
+    Default: '10.3.0.0/16'
+    Description: 'CIDR block for shared services VPC'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(/([0-9]|[1-2][0-9]|3[0-2]))$'
+    ConstraintDescription: 'Must be a valid CIDR block'
+
+  # BGP Configuration
+  OnPremisesASN:
+    Type: Number
+    Default: 65000
+    Description: 'BGP ASN for on-premises network'
+    MinValue: 1
+    MaxValue: 4294967294
+    ConstraintDescription: 'Must be a valid BGP ASN'
+
+  AWSASN:
+    Type: Number
+    Default: 64512
+    Description: 'BGP ASN for AWS resources'
+    MinValue: 1
+    MaxValue: 4294967294
+    ConstraintDescription: 'Must be a valid BGP ASN'
+
+  # Availability Zones
+  AvailabilityZone1:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: 'First availability zone for subnets'
+
+  AvailabilityZone2:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: 'Second availability zone for subnets'
+
+  # Environment Configuration
+  Environment:
+    Type: String
+    Default: 'Production'
+    AllowedValues: ['Production', 'Development', 'Staging']
+    Description: 'Environment for resource tagging'
+
+  ProjectName:
+    Type: String
+    Default: 'HybridCloudConnectivity'
+    Description: 'Project name for resource naming and tagging'
+    MinLength: 1
+    MaxLength: 50
+
+  # Alert Configuration
+  AlertEmail:
+    Type: String
+    Default: 'admin@example.com'
+    Description: 'Email address for CloudWatch alarms'
+    AllowedPattern: '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+    ConstraintDescription: 'Must be a valid email address'
+
+  # Direct Connect Configuration
+  ExistingDirectConnectConnectionId:
+    Type: String
+    Default: ''
+    Description: 'Optional: Existing Direct Connect connection ID (leave empty to create new resources without connection)'
+
+# ====================
+# CONDITIONS
+# ====================
+Conditions:
+  # Environment-based conditions
+  IsProduction: !Equals [!Ref Environment, 'Production']
+  
+  # Direct Connect conditions
+  HasExistingDirectConnectConnection: !Not [!Equals [!Ref ExistingDirectConnectConnectionId, '']]
+  
+  # Multi-AZ conditions
+  CreateMultiAZ: !Condition IsProduction
+
+# ====================
+# RESOURCES
+# ====================
+Resources:
+
+  # =====================
+  # VPC INFRASTRUCTURE
+  # =====================
+  
+  # Production VPC
+  ProductionVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref ProductionVPCCIDR
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-Production-VPC'
+        - Key: Environment
+          Value: Production
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Development VPC
+  DevelopmentVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref DevelopmentVPCCIDR
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-Development-VPC'
+        - Key: Environment
+          Value: Development
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Shared Services VPC
+  SharedServicesVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref SharedServicesVPCCIDR
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-SharedServices-VPC'
+        - Key: Environment
+          Value: Shared
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =====================
+  # TRANSIT GATEWAY SUBNETS
+  # =====================
+  
+  # Production TGW Subnet
+  ProductionTGWSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ProductionVPC
+      CidrBlock: !Select [0, !Cidr [!Ref ProductionVPCCIDR, 4, 8]]
+      AvailabilityZone: !Ref AvailabilityZone1
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-Production-TGW-Subnet'
+        - Key: Environment
+          Value: Production
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Development TGW Subnet
+  DevelopmentTGWSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref DevelopmentVPC
+      CidrBlock: !Select [0, !Cidr [!Ref DevelopmentVPCCIDR, 4, 8]]
+      AvailabilityZone: !Ref AvailabilityZone1
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-Development-TGW-Subnet'
+        - Key: Environment
+          Value: Development
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Shared Services TGW Subnet
+  SharedServicesTGWSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref SharedServicesVPC
+      CidrBlock: !Select [0, !Cidr [!Ref SharedServicesVPCCIDR, 4, 8]]
+      AvailabilityZone: !Ref AvailabilityZone1
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-SharedServices-TGW-Subnet'
+        - Key: Environment
+          Value: Shared
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Secondary TGW Subnet for High Availability (Production only)
+  SharedServicesTGWSubnetSecondary:
+    Type: AWS::EC2::Subnet
+    Condition: CreateMultiAZ
+    Properties:
+      VpcId: !Ref SharedServicesVPC
+      CidrBlock: !Select [1, !Cidr [!Ref SharedServicesVPCCIDR, 4, 8]]
+      AvailabilityZone: !Ref AvailabilityZone2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-SharedServices-TGW-Subnet-Secondary'
+        - Key: Environment
+          Value: Shared
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =====================
+  # TRANSIT GATEWAY
+  # =====================
+  
+  # Transit Gateway
+  TransitGateway:
+    Type: AWS::EC2::TransitGateway
+    Properties:
+      AmazonSideAsn: !Ref AWSASN
+      Description: !Sub 'Corporate hybrid connectivity gateway for ${ProjectName}'
+      DefaultRouteTableAssociation: enable
+      DefaultRouteTablePropagation: enable
+      DnsSupport: enable
+      VpnEcmpSupport: enable
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-Transit-Gateway'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =====================
+  # VPC ATTACHMENTS
+  # =====================
+  
+  # Production VPC Attachment
+  ProductionVPCAttachment:
+    Type: AWS::EC2::TransitGatewayVpcAttachment
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref ProductionVPC
+      SubnetIds:
+        - !Ref ProductionTGWSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-Production-TGW-Attachment'
+        - Key: Environment
+          Value: Production
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Development VPC Attachment
+  DevelopmentVPCAttachment:
+    Type: AWS::EC2::TransitGatewayVpcAttachment
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref DevelopmentVPC
+      SubnetIds:
+        - !Ref DevelopmentTGWSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-Development-TGW-Attachment'
+        - Key: Environment
+          Value: Development
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Shared Services VPC Attachment
+  SharedServicesVPCAttachment:
+    Type: AWS::EC2::TransitGatewayVpcAttachment
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref SharedServicesVPC
+      SubnetIds:
+        - !Ref SharedServicesTGWSubnet
+        - !If [CreateMultiAZ, !Ref SharedServicesTGWSubnetSecondary, !Ref AWS::NoValue]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-SharedServices-TGW-Attachment'
+        - Key: Environment
+          Value: Shared
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =====================
+  # DIRECT CONNECT GATEWAY
+  # =====================
+  
+  # Direct Connect Gateway
+  DirectConnectGateway:
+    Type: AWS::DirectConnect::DirectConnectGateway
+    Properties:
+      Name: !Sub '${ProjectName}-DirectConnect-Gateway'
+      AmazonSideAsn: !Ref AWSASN
+
+  # Direct Connect Gateway Association (only if existing connection provided)
+  DirectConnectGatewayAssociation:
+    Type: AWS::EC2::TransitGatewayDirectConnectGatewayAttachment
+    Condition: HasExistingDirectConnectConnection
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      DirectConnectGatewayId: !Ref DirectConnectGateway
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DX-TGW-Attachment'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =====================
+  # ROUTE TABLE CONFIGURATION
+  # =====================
+  
+  # Route for on-premises traffic in Production VPC
+  ProductionOnPremisesRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref ProductionVPC
+      DestinationCidrBlock: !Ref OnPremisesCIDR
+      TransitGatewayId: !Ref TransitGateway
+    DependsOn: ProductionVPCAttachment
+
+  # Route for on-premises traffic in Development VPC
+  DevelopmentOnPremisesRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref DevelopmentVPC
+      DestinationCidrBlock: !Ref OnPremisesCIDR
+      TransitGatewayId: !Ref TransitGateway
+    DependsOn: DevelopmentVPCAttachment
+
+  # Route for on-premises traffic in Shared Services VPC
+  SharedServicesOnPremisesRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref SharedServicesVPC
+      DestinationCidrBlock: !Ref OnPremisesCIDR
+      TransitGatewayId: !Ref TransitGateway
+    DependsOn: SharedServicesVPCAttachment
+
+  # =====================
+  # SECURITY GROUPS
+  # =====================
+  
+  # Security Group for Route 53 Resolver Endpoints
+  ResolverSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-Resolver-SecurityGroup'
+      GroupDescription: 'Security group for Route 53 Resolver endpoints'
+      VpcId: !Ref SharedServicesVPC
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref OnPremisesCIDR
+          Description: 'DNS UDP from on-premises'
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref OnPremisesCIDR
+          Description: 'DNS TCP from on-premises'
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref ProductionVPCCIDR
+          Description: 'DNS UDP from Production VPC'
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref ProductionVPCCIDR
+          Description: 'DNS TCP from Production VPC'
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref DevelopmentVPCCIDR
+          Description: 'DNS UDP from Development VPC'
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref DevelopmentVPCCIDR
+          Description: 'DNS TCP from Development VPC'
+      SecurityGroupEgress:
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref OnPremisesCIDR
+          Description: 'DNS UDP to on-premises'
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref OnPremisesCIDR
+          Description: 'DNS TCP to on-premises'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-Resolver-SecurityGroup'
+        - Key: Environment
+          Value: Shared
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =====================
+  # NETWORK ACLS
+  # =====================
+  
+  # Network ACL for Shared Services VPC
+  SharedServicesNetworkAcl:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref SharedServicesVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-SharedServices-NACL'
+        - Key: Environment
+          Value: Shared
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # NACL Entry for HTTPS traffic from on-premises
+  SharedServicesNACLEntryHTTPS:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref SharedServicesNetworkAcl
+      RuleNumber: 100
+      Protocol: 6
+      RuleAction: allow
+      CidrBlock: !Ref OnPremisesCIDR
+      PortRange:
+        From: 443
+        To: 443
+
+  # NACL Entry for SSH traffic from on-premises
+  SharedServicesNACLEntrySSH:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref SharedServicesNetworkAcl
+      RuleNumber: 200
+      Protocol: 6
+      RuleAction: allow
+      CidrBlock: !Ref OnPremisesCIDR
+      PortRange:
+        From: 22
+        To: 22
+
+  # NACL Entry for DNS traffic from on-premises
+  SharedServicesNACLEntryDNS:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref SharedServicesNetworkAcl
+      RuleNumber: 300
+      Protocol: 17
+      RuleAction: allow
+      CidrBlock: !Ref OnPremisesCIDR
+      PortRange:
+        From: 53
+        To: 53
+
+  # Outbound NACL entries
+  SharedServicesNACLEntryOutbound:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref SharedServicesNetworkAcl
+      RuleNumber: 100
+      Protocol: -1
+      RuleAction: allow
+      CidrBlock: '0.0.0.0/0'
+      Egress: true
+
+  # =====================
+  # ROUTE 53 RESOLVER
+  # =====================
+  
+  # IAM Role for Route 53 Resolver
+  ResolverRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-Route53Resolver-Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: route53resolver.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/Route53ResolverServiceRolePolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-Route53Resolver-Role'
+        - Key: Environment
+          Value: Shared
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Inbound Resolver Endpoint
+  InboundResolverEndpoint:
+    Type: AWS::Route53Resolver::ResolverEndpoint
+    Properties:
+      Name: !Sub '${ProjectName}-Inbound-Resolver'
+      Direction: INBOUND
+      IpAddresses:
+        - SubnetId: !Ref SharedServicesTGWSubnet
+          Ip: !Select [0, !Split ['/24', !Select [2, !Split ['.', !Ref SharedServicesVPCCIDR]]]]
+      SecurityGroupIds:
+        - !Ref ResolverSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-Inbound-Resolver'
+        - Key: Environment
+          Value: Shared
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Outbound Resolver Endpoint
+  OutboundResolverEndpoint:
+    Type: AWS::Route53Resolver::ResolverEndpoint
+    Properties:
+      Name: !Sub '${ProjectName}-Outbound-Resolver'
+      Direction: OUTBOUND
+      IpAddresses:
+        - SubnetId: !Ref SharedServicesTGWSubnet
+          Ip: !Select [0, !Split ['/24', !Select [3, !Split ['.', !Ref SharedServicesVPCCIDR]]]]
+      SecurityGroupIds:
+        - !Ref ResolverSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-Outbound-Resolver'
+        - Key: Environment
+          Value: Shared
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =====================
+  # VPC FLOW LOGS
+  # =====================
+  
+  # IAM Role for VPC Flow Logs
+  VPCFlowLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-VPCFlowLogs-Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-VPCFlowLogs-Role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Group for VPC Flow Logs
+  VPCFlowLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/vpc/flowlogs-${ProjectName}'
+      RetentionInDays: 14
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-VPCFlowLogs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Flow Logs for Production VPC
+  ProductionVPCFlowLogs:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref ProductionVPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref VPCFlowLogsGroup
+      DeliverLogsPermissionArn: !GetAtt VPCFlowLogsRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-Production-VPC-FlowLogs'
+        - Key: Environment
+          Value: Production
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Flow Logs for Development VPC
+  DevelopmentVPCFlowLogs:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref DevelopmentVPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref VPCFlowLogsGroup
+      DeliverLogsPermissionArn: !GetAtt VPCFlowLogsRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-Development-VPC-FlowLogs'
+        - Key: Environment
+          Value: Development
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Flow Logs for Shared Services VPC
+  SharedServicesVPCFlowLogs:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref SharedServicesVPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref VPCFlowLogsGroup
+      DeliverLogsPermissionArn: !GetAtt VPCFlowLogsRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-SharedServices-VPC-FlowLogs'
+        - Key: Environment
+          Value: Shared
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =====================
+  # CLOUDWATCH MONITORING
+  # =====================
+  
+  # SNS Topic for Alerts
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-DirectConnect-Alerts'
+      DisplayName: !Sub '${ProjectName} Direct Connect Alerts'
+      Subscription:
+        - Endpoint: !Ref AlertEmail
+          Protocol: email
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DirectConnect-Alerts'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Dashboard for Direct Connect Monitoring
+  DirectConnectDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: HasExistingDirectConnectConnection
+    Properties:
+      DashboardName: !Sub '${ProjectName}-DirectConnect-Dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/DX", "ConnectionState", "ConnectionId", "${ExistingDirectConnectConnectionId}"],
+                  [".", "ConnectionBpsEgress", ".", "."],
+                  [".", "ConnectionBpsIngress", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Direct Connect Connection Metrics",
+                "period": 300,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/TransitGateway", "BytesIn", "TransitGateway", "${TransitGateway}"],
+                  [".", "BytesOut", ".", "."],
+                  [".", "PacketDropCount", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Transit Gateway Metrics",
+                "period": 300,
+                "stat": "Sum"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarm for Direct Connect Connection State
+  DirectConnectConnectionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasExistingDirectConnectConnection
+    Properties:
+      AlarmName: !Sub '${ProjectName}-DirectConnect-Connection-Down'
+      AlarmDescription: 'Direct Connect connection is down'
+      MetricName: ConnectionState
+      Namespace: AWS/DX
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+      Dimensions:
+        - Name: ConnectionId
+          Value: !Ref ExistingDirectConnectConnectionId
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DirectConnect-Connection-Alarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarm for Transit Gateway Packet Drop
+  TransitGatewayPacketDropAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-TransitGateway-PacketDrop'
+      AlarmDescription: 'Transit Gateway packet drop count is high'
+      MetricName: PacketDropCount
+      Namespace: AWS/TransitGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      Dimensions:
+        - Name: TransitGateway
+          Value: !Ref TransitGateway
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-TransitGateway-PacketDrop-Alarm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+# ====================
+# OUTPUTS
+# ====================
+Outputs:
+  
+  # VPC Information
+  ProductionVPCId:
+    Description: 'Production VPC ID'
+    Value: !Ref ProductionVPC
+    Export:
+      Name: !Sub '${AWS::StackName}-ProductionVPCId'
+
+  DevelopmentVPCId:
+    Description: 'Development VPC ID'
+    Value: !Ref DevelopmentVPC
+    Export:
+      Name: !Sub '${AWS::StackName}-DevelopmentVPCId'
+
+  SharedServicesVPCId:
+    Description: 'Shared Services VPC ID'
+    Value: !Ref SharedServicesVPC
+    Export:
+      Name: !Sub '${AWS::StackName}-SharedServicesVPCId'
+
+  # Transit Gateway Information
+  TransitGatewayId:
+    Description: 'Transit Gateway ID'
+    Value: !Ref TransitGateway
+    Export:
+      Name: !Sub '${AWS::StackName}-TransitGatewayId'
+
+  # Direct Connect Information
+  DirectConnectGatewayId:
+    Description: 'Direct Connect Gateway ID'
+    Value: !Ref DirectConnectGateway
+    Export:
+      Name: !Sub '${AWS::StackName}-DirectConnectGatewayId'
+
+  # Route 53 Resolver Information
+  InboundResolverEndpointId:
+    Description: 'Inbound Resolver Endpoint ID'
+    Value: !Ref InboundResolverEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-InboundResolverEndpointId'
+
+  OutboundResolverEndpointId:
+    Description: 'Outbound Resolver Endpoint ID'
+    Value: !Ref OutboundResolverEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-OutboundResolverEndpointId'
+
+  # Security Group Information
+  ResolverSecurityGroupId:
+    Description: 'Resolver Security Group ID'
+    Value: !Ref ResolverSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ResolverSecurityGroupId'
+
+  # Monitoring Information
+  AlertTopicArn:
+    Description: 'SNS Topic ARN for alerts'
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertTopicArn'
+
+  VPCFlowLogsGroupName:
+    Description: 'VPC Flow Logs CloudWatch Log Group Name'
+    Value: !Ref VPCFlowLogsGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCFlowLogsGroupName'
+
+  # Connection Information
+  BGPConfiguration:
+    Description: 'BGP Configuration Details'
+    Value: !Sub |
+      AWS ASN: ${AWSASN}
+      On-Premises ASN: ${OnPremisesASN}
+      On-Premises CIDR: ${OnPremisesCIDR}
+      Production VPC CIDR: ${ProductionVPCCIDR}
+      Development VPC CIDR: ${DevelopmentVPCCIDR}
+      Shared Services VPC CIDR: ${SharedServicesVPCCIDR}
+
+  # Deployment Information
+  DeploymentInstructions:
+    Description: 'Post-deployment configuration steps'
+    Value: !Sub |
+      1. Create Virtual Interface (VIF) on your Direct Connect connection
+      2. Associate VIF with Direct Connect Gateway: ${DirectConnectGateway}
+      3. Configure BGP routing with provided ASN values
+      4. Update on-premises DNS to use inbound resolver: ${InboundResolverEndpoint}
+      5. Test connectivity using provided testing scripts
+      6. Monitor connection status via CloudWatch dashboard
+
+  # Stack Information
+  StackName:
+    Description: 'CloudFormation Stack Name'
+    Value: !Ref AWS::StackName
+    Export:
+      Name: !Sub '${AWS::StackName}-StackName'
+
+  Region:
+    Description: 'AWS Region'
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub '${AWS::StackName}-Region'
+
+  AccountId:
+    Description: 'AWS Account ID'
+    Value: !Ref AWS::AccountId
+    Export:
+      Name: !Sub '${AWS::StackName}-AccountId'

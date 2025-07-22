@@ -1,0 +1,889 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Blue-Green Deployment Infrastructure for Containerized Applications on ECS - Production-ready template with best practices'
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+Parameters:
+  # Application Configuration
+  ApplicationName:
+    Type: String
+    Default: bluegreen-app
+    Description: Name of the application for resource naming
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment for deployment (affects resource sizing and configuration)
+
+  # Container Configuration
+  ContainerImage:
+    Type: String
+    Default: nginx:alpine
+    Description: Initial container image to deploy (will be overridden by CodeDeploy)
+    AllowedPattern: '^[a-zA-Z0-9._/-]+:[a-zA-Z0-9._-]+$'
+    ConstraintDescription: Must be a valid Docker image reference with tag
+
+  ContainerPort:
+    Type: Number
+    Default: 80
+    MinValue: 1
+    MaxValue: 65535
+    Description: Port number the container exposes
+
+  # ECS Configuration
+  TaskCpu:
+    Type: Number
+    Default: 256
+    AllowedValues: [256, 512, 1024, 2048, 4096]
+    Description: CPU units for ECS tasks (256 = 0.25 vCPU)
+
+  TaskMemory:
+    Type: Number
+    Default: 512
+    AllowedValues: [512, 1024, 2048, 4096, 8192, 16384, 30720]
+    Description: Memory (MB) for ECS tasks
+
+  DesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Number of desired tasks to run
+
+  # Network Configuration
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])/(1[6-9]|2[0-8])$'
+    Description: CIDR block for VPC
+
+  # ALB Configuration
+  EnableSSL:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable SSL/TLS listener on ALB (requires ACM certificate)
+
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: ACM certificate ARN for SSL/TLS (required if EnableSSL is true)
+
+  # CodeDeploy Configuration
+  DeploymentConfigName:
+    Type: String
+    Default: CodeDeployDefault.ECSAllAtOnce
+    AllowedValues:
+      - CodeDeployDefault.ECSAllAtOnce
+      - CodeDeployDefault.ECSLinear10PercentEvery1Minutes
+      - CodeDeployDefault.ECSLinear10PercentEvery3Minutes
+      - CodeDeployDefault.ECSCanary10Percent5Minutes
+      - CodeDeployDefault.ECSCanary10Percent15Minutes
+    Description: CodeDeploy deployment configuration for traffic shifting
+
+  TerminationWaitTime:
+    Type: Number
+    Default: 5
+    MinValue: 0
+    MaxValue: 60
+    Description: Time in minutes to wait before terminating blue tasks after successful deployment
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+  EnableSSLCondition: !Equals [!Ref EnableSSL, 'true']
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, '']]
+
+# ==============================================================================
+# MAPPINGS
+# ==============================================================================
+Mappings:
+  EnvironmentMap:
+    dev:
+      LogRetentionDays: 7
+      AlarmEvaluationPeriods: 2
+      AlarmDatapointsToAlarm: 1
+    staging:
+      LogRetentionDays: 14
+      AlarmEvaluationPeriods: 2
+      AlarmDatapointsToAlarm: 2
+    prod:
+      LogRetentionDays: 30
+      AlarmEvaluationPeriods: 3
+      AlarmDatapointsToAlarm: 2
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+  # VPC and Networking
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-igw'
+        - Key: Environment
+          Value: !Ref Environment
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # Public Subnets
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Sub 
+        - '${VpcCidrPrefix}.1.0/24'
+        - VpcCidrPrefix: !Select [0, !Split ['.0.0/16', !Ref VpcCidr]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-public-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Sub 
+        - '${VpcCidrPrefix}.2.0/24'
+        - VpcCidrPrefix: !Select [0, !Split ['.0.0/16', !Ref VpcCidr]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-public-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Route Tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-public-rt'
+        - Key: Environment
+          Value: !Ref Environment
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  # Security Groups
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ApplicationName}-${Environment}-alb-sg'
+      GroupDescription: Security group for Application Load Balancer
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP traffic from internet
+        - !If
+          - EnableSSLCondition
+          - IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            CidrIp: 0.0.0.0/0
+            Description: HTTPS traffic from internet
+          - !Ref 'AWS::NoValue'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-alb-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ApplicationName}-${Environment}-ecs-sg'
+      GroupDescription: Security group for ECS tasks
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Traffic from ALB
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-ecs-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ApplicationName}-${Environment}-alb'
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+        - Key: access_logs.s3.enabled
+          Value: 'false'
+        - Key: deletion_protection.enabled
+          Value: !If [IsProduction, 'true', 'false']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-alb'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Target Groups
+  BlueTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ApplicationName}-${Environment}-blue-tg'
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VPC
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '60'
+        - Key: stickiness.enabled
+          Value: 'false'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-blue-tg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  GreenTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ApplicationName}-${Environment}-green-tg'
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VPC
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '60'
+        - Key: stickiness.enabled
+          Value: 'false'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-green-tg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ALB Listeners
+  HTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref BlueTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  HTTPSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: EnableSSLCondition
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref BlueTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+
+  # ECR Repository
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ApplicationName}-${Environment}'
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: MUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["v"]
+                },
+                "action": {
+                  "type": "expire"
+                },
+                "description": "Keep only 10 tagged images"
+              },
+              {
+                "rulePriority": 2,
+                "selection": {
+                  "tagStatus": "untagged"
+                },
+                "action": {
+                  "type": "expire"
+                },
+                "description": "Delete untagged images after 1 day"
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-ecr'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ApplicationName}-${Environment}'
+      RetentionInDays: !FindInMap [EnvironmentMap, !Ref Environment, LogRetentionDays]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ApplicationName}-${Environment}-cluster'
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+          Base: 2
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 4
+      ClusterSettings:
+        - Name: containerInsights
+          Value: !If [IsProduction, 'enabled', 'disabled']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-cluster'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Roles
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-${Environment}-ecs-task-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ECRAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt LogGroup.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-ecs-task-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-${Environment}-ecs-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-ecs-task-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-${Environment}-codedeploy-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRoleForECS
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-codedeploy-service-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ECS Task Definition
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ApplicationName}-${Environment}-task'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: !Sub '${ApplicationName}-container'
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}:latest'
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - !Sub 'curl -f http://localhost:${ContainerPort}/ || exit 1'
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-task'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ECS Service
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: HTTPListener
+    Properties:
+      ServiceName: !Sub '${ApplicationName}-${Environment}-service'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+      LoadBalancers:
+        - ContainerName: !Sub '${ApplicationName}-container'
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref BlueTargetGroup
+      DeploymentController:
+        Type: CODE_DEPLOY
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-service'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CodeDeploy Application
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub '${ApplicationName}-${Environment}-codedeploy'
+      ComputePlatform: ECS
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-codedeploy'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CodeDeploy Deployment Group
+  CodeDeployDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentGroupName: !Sub '${ApplicationName}-${Environment}-deployment-group'
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      DeploymentConfigName: !Ref DeploymentConfigName
+      BlueGreenDeploymentConfiguration:
+        TerminateBlueInstancesOnDeploymentSuccess:
+          Action: TERMINATE
+          TerminationWaitTimeInMinutes: !Ref TerminationWaitTime
+        DeploymentReadyOption:
+          ActionOnTimeout: CONTINUE_DEPLOYMENT
+        GreenFleetProvisioningOption:
+          Action: COPY_AUTO_SCALING_GROUP
+      LoadBalancerInfo:
+        TargetGroupInfoList:
+          - Name: !GetAtt BlueTargetGroup.TargetGroupName
+      ECSServices:
+        - ServiceName: !GetAtt ECSService.Name
+          ClusterName: !Ref ECSCluster
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-deployment-group'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarms
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-high-cpu'
+      AlarmDescription: Alarm when CPU exceeds 80%
+      MetricName: CPUUtilization
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: !FindInMap [EnvironmentMap, !Ref Environment, AlarmEvaluationPeriods]
+      DatapointsToAlarm: !FindInMap [EnvironmentMap, !Ref Environment, AlarmDatapointsToAlarm]
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ServiceName
+          Value: !GetAtt ECSService.Name
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+      TreatMissingData: notBreaching
+
+  HighMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-high-memory'
+      AlarmDescription: Alarm when memory exceeds 80%
+      MetricName: MemoryUtilization
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: !FindInMap [EnvironmentMap, !Ref Environment, AlarmEvaluationPeriods]
+      DatapointsToAlarm: !FindInMap [EnvironmentMap, !Ref Environment, AlarmDatapointsToAlarm]
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ServiceName
+          Value: !GetAtt ECSService.Name
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+      TreatMissingData: notBreaching
+
+  UnhealthyHostsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-unhealthy-hosts'
+      AlarmDescription: Alarm when there are unhealthy hosts
+      MetricName: UnHealthyHostCount
+      Namespace: AWS/ApplicationELB
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt BlueTargetGroup.TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+      TreatMissingData: notBreaching
+
+  # S3 Bucket for CodeDeploy Artifacts
+  DeploymentArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ApplicationName}-${Environment}-deployment-artifacts-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-deployment-artifacts'
+        - Key: Environment
+          Value: !Ref Environment
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+Outputs:
+  # Network Information
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPC-ID'
+
+  PublicSubnet1Id:
+    Description: Public Subnet 1 ID
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet1-ID'
+
+  PublicSubnet2Id:
+    Description: Public Subnet 2 ID
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet2-ID'
+
+  # Load Balancer Information
+  ApplicationLoadBalancerDNS:
+    Description: Application Load Balancer DNS name
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-ALB-DNS'
+
+  ApplicationLoadBalancerArn:
+    Description: Application Load Balancer ARN
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: !Sub '${AWS::StackName}-ALB-ARN'
+
+  ApplicationURL:
+    Description: Application URL
+    Value: !Sub 
+      - '${Protocol}://${DNSName}'
+      - Protocol: !If [EnableSSLCondition, 'https', 'http']
+        DNSName: !GetAtt ApplicationLoadBalancer.DNSName
+
+  # Target Group Information
+  BlueTargetGroupArn:
+    Description: Blue Target Group ARN
+    Value: !Ref BlueTargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-BlueTargetGroup-ARN'
+
+  GreenTargetGroupArn:
+    Description: Green Target Group ARN
+    Value: !Ref GreenTargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-GreenTargetGroup-ARN'
+
+  # ECS Information
+  ECSClusterName:
+    Description: ECS Cluster Name
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSCluster-Name'
+
+  ECSServiceName:
+    Description: ECS Service Name
+    Value: !GetAtt ECSService.Name
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSService-Name'
+
+  TaskDefinitionArn:
+    Description: Task Definition ARN
+    Value: !Ref TaskDefinition
+    Export:
+      Name: !Sub '${AWS::StackName}-TaskDefinition-ARN'
+
+  # ECR Information
+  ECRRepositoryURI:
+    Description: ECR Repository URI
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ECR-URI'
+
+  ECRRepositoryName:
+    Description: ECR Repository Name
+    Value: !Ref ECRRepository
+    Export:
+      Name: !Sub '${AWS::StackName}-ECR-Name'
+
+  # CodeDeploy Information
+  CodeDeployApplicationName:
+    Description: CodeDeploy Application Name
+    Value: !Ref CodeDeployApplication
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeDeployApp-Name'
+
+  CodeDeployDeploymentGroupName:
+    Description: CodeDeploy Deployment Group Name
+    Value: !Ref CodeDeployDeploymentGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeDeployDG-Name'
+
+  # IAM Role Information
+  ECSTaskExecutionRoleArn:
+    Description: ECS Task Execution Role ARN
+    Value: !GetAtt ECSTaskExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSTaskExecutionRole-ARN'
+
+  ECSTaskRoleArn:
+    Description: ECS Task Role ARN
+    Value: !GetAtt ECSTaskRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSTaskRole-ARN'
+
+  CodeDeployServiceRoleArn:
+    Description: CodeDeploy Service Role ARN
+    Value: !GetAtt CodeDeployServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeDeployServiceRole-ARN'
+
+  # S3 Bucket Information
+  DeploymentArtifactsBucketName:
+    Description: S3 Bucket for deployment artifacts
+    Value: !Ref DeploymentArtifactsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentArtifacts-Bucket'
+
+  # CloudWatch Information
+  LogGroupName:
+    Description: CloudWatch Log Group Name
+    Value: !Ref LogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup-Name'
+
+  # Security Group Information
+  ALBSecurityGroupId:
+    Description: ALB Security Group ID
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ALBSecurityGroup-ID'
+
+  ECSSecurityGroupId:
+    Description: ECS Security Group ID
+    Value: !Ref ECSSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSSecurityGroup-ID'
+
+  # Deployment Commands
+  DockerBuildCommand:
+    Description: Docker build command for application
+    Value: !Sub 'docker build -t ${ECRRepository}:latest .'
+
+  DockerPushCommand:
+    Description: Docker push command for ECR
+    Value: !Sub |
+      aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com
+      docker tag ${ECRRepository}:latest ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}:latest
+      docker push ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}:latest
+
+  # Deployment Instructions
+  DeploymentInstructions:
+    Description: Instructions for blue-green deployment
+    Value: !Sub |
+      1. Build and push your container image to ECR
+      2. Create a new task definition revision with your image
+      3. Create an AppSpec file for CodeDeploy
+      4. Upload AppSpec to S3: ${DeploymentArtifactsBucket}
+      5. Create deployment using CodeDeploy application: ${CodeDeployApplication}

@@ -1,0 +1,607 @@
+# Infrastructure Manager configuration for Code Quality Gates with Cloud Build Triggers and Cloud Deploy
+# This configuration deploys a complete CI/CD pipeline with automated quality gates and progressive delivery
+
+# Copyright 2025 Google LLC
+# Licensed under the Apache License, Version 2.0
+
+apiVersion: blueprints.v1alpha1
+kind: BlueprintMetadata
+metadata:
+  name: code-quality-gates-pipeline
+  displayName: "Code Quality Gates with Cloud Build and Deploy"
+  description: "Automated CI/CD pipeline with comprehensive quality gates and progressive delivery"
+  version: "1.0.0"
+
+deploymentSpec:
+  # Main Infrastructure Manager blueprint
+  name: code-quality-pipeline
+  description: |
+    This Infrastructure Manager configuration creates a complete CI/CD pipeline that enforces
+    code quality standards and implements progressive delivery with Cloud Build Triggers and Cloud Deploy.
+    
+    Components deployed:
+    - Cloud Source Repository with sample application
+    - Cloud Build triggers for automated CI/CD
+    - GKE cluster with security features enabled
+    - Cloud Deploy pipeline for progressive delivery
+    - Binary Authorization for container security
+    - Artifact Registry for container storage
+    - IAM roles and service accounts with least privilege
+
+# Project and basic configuration
+resources:
+  # Enable required APIs
+  - name: enable-apis
+    type: google-cloud-apis
+    properties:
+      apis:
+        - cloudbuild.googleapis.com
+        - clouddeploy.googleapis.com
+        - sourcerepo.googleapis.com
+        - binaryauthorization.googleapis.com
+        - container.googleapis.com
+        - artifactregistry.googleapis.com
+        - cloudresourcemanager.googleapis.com
+        - compute.googleapis.com
+        - monitoring.googleapis.com
+        - logging.googleapis.com
+
+  # Create Artifact Registry repository for container images
+  - name: container-registry
+    type: gcp-types/artifactregistry-v1:projects.locations.repositories
+    properties:
+      parent: projects/$(ref.project-id.projectId)/locations/$(ref.region)
+      repositoryId: $(ref.registry-name)
+      repository:
+        format: DOCKER
+        description: Container registry for code quality pipeline
+        labels:
+          purpose: ci-cd
+          component: container-storage
+
+  # Create Cloud Source Repository
+  - name: source-repository
+    type: gcp-types/sourcerepo-v1:projects.repos
+    properties:
+      parent: projects/$(ref.project-id.projectId)
+      name: projects/$(ref.project-id.projectId)/repos/$(ref.repo-name)
+      repo:
+        description: Source repository for code quality pipeline demo
+
+  # Create GKE cluster with security features
+  - name: gke-cluster
+    type: gcp-types/container-v1:projects.zones.clusters
+    properties:
+      parent: projects/$(ref.project-id.projectId)/zones/$(ref.zone)
+      clusterId: $(ref.cluster-name)
+      cluster:
+        description: GKE cluster for progressive deployment pipeline
+        initialNodeCount: 3
+        nodeConfig:
+          machineType: e2-standard-2
+          diskSizeGb: 30
+          oauthScopes:
+            - https://www.googleapis.com/auth/devstorage.read_only
+            - https://www.googleapis.com/auth/logging.write
+            - https://www.googleapis.com/auth/monitoring
+            - https://www.googleapis.com/auth/servicecontrol
+            - https://www.googleapis.com/auth/service.management.readonly
+            - https://www.googleapis.com/auth/trace.append
+          # Enable Workload Identity
+          workloadMetadataConfig:
+            mode: GKE_METADATA
+          # Enable shielded nodes for security
+          shieldedInstanceConfig:
+            enableSecureBoot: true
+            enableIntegrityMonitoring: true
+          tags:
+            - code-quality-pipeline
+          labels:
+            component: compute
+            purpose: ci-cd
+        
+        # Network and security configuration
+        networkConfig:
+          enableIntraNodeVisibility: true
+        
+        # Enable network policy for security
+        networkPolicy:
+          enabled: true
+          provider: CALICO
+        
+        # Enable IP aliasing for better networking
+        ipAllocationPolicy:
+          useIpAliases: true
+        
+        # Enable logging and monitoring
+        loggingService: logging.googleapis.com/kubernetes
+        monitoringService: monitoring.googleapis.com/kubernetes
+        
+        # Enable cluster features
+        addonsConfig:
+          networkPolicyConfig:
+            disabled: false
+          
+        # Enable Binary Authorization
+        binaryAuthorization:
+          enabled: true
+        
+        # Workload Identity configuration
+        workloadIdentityConfig:
+          workloadPool: $(ref.project-id.projectId).svc.id.goog
+        
+        # Maintenance policy
+        maintenancePolicy:
+          window:
+            dailyMaintenanceWindow:
+              startTime: "03:00"
+        
+        # Auto-repair and auto-upgrade
+        nodeManagement:
+          autoRepair: true
+          autoUpgrade: true
+
+  # Create Binary Authorization policy for container security
+  - name: binary-authorization-policy
+    type: gcp-types/binaryauthorization-v1:projects.policy
+    properties:
+      name: projects/$(ref.project-id.projectId)/policy
+      policy:
+        description: Binary Authorization policy for code quality pipeline
+        # Default admission rule
+        defaultAdmissionRule:
+          evaluationMode: REQUIRE_ATTESTATION
+          enforcementMode: ENFORCED_BLOCK_AND_AUDIT_LOG
+          requireAttestationsBy: []
+        
+        # Admission whitelist for system containers
+        admissionWhitelistPatterns:
+          - namePattern: "gcr.io/google_containers/*"
+          - namePattern: "k8s.gcr.io/*"
+          - namePattern: "gcr.io/google-appengine/*"
+        
+        # Cluster-specific rules
+        clusterAdmissionRules:
+          "$(ref.zone).$(ref.cluster-name)":
+            evaluationMode: ALWAYS_ALLOW
+            enforcementMode: ENFORCED_BLOCK_AND_AUDIT_LOG
+            requireAttestationsBy: []
+
+  # Create Cloud Deploy delivery pipeline
+  - name: delivery-pipeline
+    type: gcp-types/clouddeploy-v1:projects.locations.deliveryPipelines
+    properties:
+      parent: projects/$(ref.project-id.projectId)/locations/$(ref.region)
+      deliveryPipelineId: $(ref.pipeline-name)
+      deliveryPipeline:
+        description: Progressive delivery pipeline with quality gates
+        serialPipeline:
+          stages:
+            # Development stage - automated deployment
+            - targetId: development
+              profiles:
+                - development
+              strategy:
+                standard:
+                  verify: false
+            
+            # Staging stage - with verification
+            - targetId: staging
+              profiles:
+                - staging
+              strategy:
+                standard:
+                  verify: true
+            
+            # Production stage - with manual approval and canary deployment
+            - targetId: production
+              profiles:
+                - production
+              strategy:
+                canary:
+                  runtimeConfig:
+                    kubernetes:
+                      gatewayServiceMesh:
+                        httpRoute: code-quality-route
+                        service: code-quality-service
+                  canaryDeployment:
+                    percentages: [25, 50, 100]
+                    verify: true
+                    postDeploy:
+                      actions:
+                        - verify-deployment
+        
+        labels:
+          component: deployment
+          purpose: progressive-delivery
+
+  # Create Cloud Deploy targets for each environment
+  - name: development-target
+    type: gcp-types/clouddeploy-v1:projects.locations.targets
+    properties:
+      parent: projects/$(ref.project-id.projectId)/locations/$(ref.region)
+      targetId: development
+      target:
+        description: Development environment target
+        gke:
+          cluster: projects/$(ref.project-id.projectId)/locations/$(ref.zone)/clusters/$(ref.cluster-name)
+          internalIp: false
+        executionConfigs:
+          - usages:
+              - RENDER
+              - DEPLOY
+            defaultPool:
+              serviceAccount: $(ref.clouddeploy-sa.email)
+        labels:
+          environment: development
+          component: deployment-target
+
+  - name: staging-target
+    type: gcp-types/clouddeploy-v1:projects.locations.targets
+    properties:
+      parent: projects/$(ref.project-id.projectId)/locations/$(ref.region)
+      targetId: staging
+      target:
+        description: Staging environment target with verification
+        requireApproval: false
+        gke:
+          cluster: projects/$(ref.project-id.projectId)/locations/$(ref.zone)/clusters/$(ref.cluster-name)
+          internalIp: false
+        executionConfigs:
+          - usages:
+              - RENDER
+              - DEPLOY
+            defaultPool:
+              serviceAccount: $(ref.clouddeploy-sa.email)
+        labels:
+          environment: staging
+          component: deployment-target
+
+  - name: production-target
+    type: gcp-types/clouddeploy-v1:projects.locations.targets
+    properties:
+      parent: projects/$(ref.project-id.projectId)/locations/$(ref.region)
+      targetId: production
+      target:
+        description: Production environment target with manual approval
+        requireApproval: true
+        gke:
+          cluster: projects/$(ref.project-id.projectId)/locations/$(ref.zone)/clusters/$(ref.cluster-name)
+          internalIp: false
+        executionConfigs:
+          - usages:
+              - RENDER
+              - DEPLOY
+            defaultPool:
+              serviceAccount: $(ref.clouddeploy-sa.email)
+        labels:
+          environment: production
+          component: deployment-target
+
+  # Create service account for Cloud Deploy
+  - name: clouddeploy-sa
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      name: projects/$(ref.project-id.projectId)
+      accountId: clouddeploy-pipeline-sa
+      serviceAccount:
+        displayName: Cloud Deploy Pipeline Service Account
+        description: Service account for Cloud Deploy pipeline execution
+
+  # Create service account for Cloud Build
+  - name: cloudbuild-sa
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      name: projects/$(ref.project-id.projectId)
+      accountId: cloudbuild-pipeline-sa
+      serviceAccount:
+        displayName: Cloud Build Pipeline Service Account
+        description: Service account for Cloud Build pipeline execution
+
+  # IAM role bindings for Cloud Deploy service account
+  - name: clouddeploy-sa-gke-developer
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.projectId)
+      role: roles/container.developer
+      member: serviceAccount:$(ref.clouddeploy-sa.email)
+
+  - name: clouddeploy-sa-logging-writer
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.projectId)
+      role: roles/logging.logWriter
+      member: serviceAccount:$(ref.clouddeploy-sa.email)
+
+  # IAM role bindings for Cloud Build service account
+  - name: cloudbuild-sa-source-reader
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.projectId)
+      role: roles/source.reader
+      member: serviceAccount:$(ref.cloudbuild-sa.email)
+
+  - name: cloudbuild-sa-storage-admin
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.projectId)
+      role: roles/storage.admin
+      member: serviceAccount:$(ref.cloudbuild-sa.email)
+
+  - name: cloudbuild-sa-container-developer
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.projectId)
+      role: roles/container.developer
+      member: serviceAccount:$(ref.cloudbuild-sa.email)
+
+  - name: cloudbuild-sa-clouddeploy-developer
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.projectId)
+      role: roles/clouddeploy.developer
+      member: serviceAccount:$(ref.cloudbuild-sa.email)
+
+  - name: cloudbuild-sa-artifactregistry-writer
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project-id.projectId)
+      role: roles/artifactregistry.writer
+      member: serviceAccount:$(ref.cloudbuild-sa.email)
+
+  # Create Cloud Build trigger
+  - name: main-branch-trigger
+    type: gcp-types/cloudbuild-v1:projects.triggers
+    properties:
+      parent: projects/$(ref.project-id.projectId)
+      trigger:
+        name: main-branch-quality-trigger
+        description: Automated quality pipeline trigger for main branch
+        
+        # Source repository configuration
+        triggerTemplate:
+          projectId: $(ref.project-id.projectId)
+          repoName: $(ref.repo-name)
+          branchName: main
+        
+        # Build configuration
+        build:
+          options:
+            logging: CLOUD_LOGGING_ONLY
+            machineType: E2_STANDARD_4
+          
+          timeout: 1200s
+          
+          # Substitutions for build variables
+          substitutions:
+            _REGION: $(ref.region)
+            _PIPELINE_NAME: $(ref.pipeline-name)
+            _REGISTRY_NAME: $(ref.registry-name)
+          
+          # Build steps for comprehensive quality gates
+          steps:
+            # Install dependencies
+            - name: node:18-alpine
+              entrypoint: npm
+              args: [ci]
+              id: install-deps
+
+            # Run unit tests
+            - name: node:18-alpine
+              entrypoint: npm
+              args: [test]
+              id: unit-tests
+              waitFor: [install-deps]
+
+            # Run code linting
+            - name: node:18-alpine
+              entrypoint: npm
+              args: [run, lint]
+              id: code-lint
+              waitFor: [install-deps]
+
+            # Run security audit
+            - name: node:18-alpine
+              entrypoint: npm
+              args: [run, security]
+              id: security-scan
+              waitFor: [install-deps]
+
+            # Build Docker image
+            - name: gcr.io/cloud-builders/docker
+              args:
+                - build
+                - -t
+                - $(ref.region)-docker.pkg.dev/$(ref.project-id.projectId)/$(ref.registry-name)/code-quality-app:$COMMIT_SHA
+                - -t
+                - $(ref.region)-docker.pkg.dev/$(ref.project-id.projectId)/$(ref.registry-name)/code-quality-app:latest
+                - .
+              id: docker-build
+              waitFor: [unit-tests, code-lint, security-scan]
+
+            # Container security scanning
+            - name: gcr.io/cloud-builders/gcloud
+              entrypoint: bash
+              args:
+                - -c
+                - |
+                  gcloud container images scan $(ref.region)-docker.pkg.dev/$(ref.project-id.projectId)/$(ref.registry-name)/code-quality-app:$COMMIT_SHA \
+                    --format="value(response.scan.analysisCompleted)" \
+                    --quiet || exit 1
+              id: container-scan
+              waitFor: [docker-build]
+
+            # Push Docker image to Artifact Registry
+            - name: gcr.io/cloud-builders/docker
+              args:
+                - push
+                - $(ref.region)-docker.pkg.dev/$(ref.project-id.projectId)/$(ref.registry-name)/code-quality-app:$COMMIT_SHA
+              id: docker-push
+              waitFor: [container-scan]
+
+            # Update Kubernetes manifests
+            - name: gcr.io/cloud-builders/gcloud
+              entrypoint: bash
+              args:
+                - -c
+                - |
+                  sed -i "s|PROJECT_ID|$(ref.project-id.projectId)|g" k8s/deployment.yaml
+                  sed -i "s|REGISTRY_NAME|$(ref.registry-name)|g" k8s/deployment.yaml
+                  sed -i "s|REGION|$(ref.region)|g" k8s/deployment.yaml
+                  sed -i "s|:latest|:$COMMIT_SHA|g" k8s/deployment.yaml
+              id: update-manifests
+              waitFor: [docker-push]
+
+            # Create Cloud Deploy release
+            - name: gcr.io/cloud-builders/gcloud
+              entrypoint: bash
+              args:
+                - -c
+                - |
+                  gcloud deploy releases create release-$BUILD_ID \
+                    --delivery-pipeline=$(ref.pipeline-name) \
+                    --region=$(ref.region) \
+                    --source=. \
+                    --build-artifacts=$(ref.region)-docker.pkg.dev/$(ref.project-id.projectId)/$(ref.registry-name)/code-quality-app:$COMMIT_SHA
+              id: create-release
+              waitFor: [update-manifests]
+
+        # Use custom service account for enhanced permissions
+        serviceAccount: projects/$(ref.project-id.projectId)/serviceAccounts/$(ref.cloudbuild-sa.email)
+        
+        tags:
+          - ci-cd
+          - quality-gates
+          - automated
+
+# Configuration variables and defaults
+variables:
+  # Project configuration
+  - name: project-id
+    description: Google Cloud Project ID
+    type: string
+    default: ${PROJECT_ID}
+
+  - name: region
+    description: Google Cloud region for resources
+    type: string
+    default: us-central1
+
+  - name: zone
+    description: Google Cloud zone for GKE cluster
+    type: string
+    default: us-central1-a
+
+  # Resource naming with randomization for uniqueness
+  - name: repo-name
+    description: Name for Cloud Source Repository
+    type: string
+    default: sample-app-${RANDOM}
+
+  - name: cluster-name
+    description: Name for GKE cluster
+    type: string
+    default: quality-gates-cluster-${RANDOM}
+
+  - name: pipeline-name
+    description: Name for Cloud Deploy pipeline
+    type: string
+    default: quality-pipeline-${RANDOM}
+
+  - name: registry-name
+    description: Name for Artifact Registry repository
+    type: string
+    default: app-registry-${RANDOM}
+
+# Outputs for verification and integration
+outputs:
+  - name: source-repository-url
+    description: URL of the created Cloud Source Repository
+    value: $(ref.source-repository.url)
+
+  - name: gke-cluster-endpoint
+    description: Endpoint of the GKE cluster
+    value: $(ref.gke-cluster.endpoint)
+
+  - name: delivery-pipeline-name
+    description: Name of the Cloud Deploy delivery pipeline
+    value: $(ref.delivery-pipeline.name)
+
+  - name: artifact-registry-url
+    description: URL of the Artifact Registry repository
+    value: $(ref.region)-docker.pkg.dev/$(ref.project-id.projectId)/$(ref.registry-name)
+
+  - name: cloud-build-trigger-id
+    description: ID of the Cloud Build trigger
+    value: $(ref.main-branch-trigger.id)
+
+  - name: binary-authorization-policy
+    description: Binary Authorization policy name
+    value: $(ref.binary-authorization-policy.name)
+
+# Resource dependencies and ordering
+dependencies:
+  # APIs must be enabled before creating resources
+  - resource: source-repository
+    dependsOn: [enable-apis]
+  
+  - resource: container-registry
+    dependsOn: [enable-apis]
+  
+  - resource: gke-cluster
+    dependsOn: [enable-apis]
+  
+  - resource: binary-authorization-policy
+    dependsOn: [enable-apis]
+
+  # Service accounts must exist before IAM bindings
+  - resource: clouddeploy-sa-gke-developer
+    dependsOn: [clouddeploy-sa]
+  
+  - resource: clouddeploy-sa-logging-writer
+    dependsOn: [clouddeploy-sa]
+  
+  - resource: cloudbuild-sa-source-reader
+    dependsOn: [cloudbuild-sa]
+  
+  - resource: cloudbuild-sa-storage-admin
+    dependsOn: [cloudbuild-sa]
+  
+  - resource: cloudbuild-sa-container-developer
+    dependsOn: [cloudbuild-sa]
+  
+  - resource: cloudbuild-sa-clouddeploy-developer
+    dependsOn: [cloudbuild-sa]
+  
+  - resource: cloudbuild-sa-artifactregistry-writer
+    dependsOn: [cloudbuild-sa]
+
+  # Cloud Deploy resources depend on cluster and service accounts
+  - resource: delivery-pipeline
+    dependsOn: [gke-cluster, clouddeploy-sa]
+  
+  - resource: development-target
+    dependsOn: [gke-cluster, clouddeploy-sa]
+  
+  - resource: staging-target
+    dependsOn: [gke-cluster, clouddeploy-sa]
+  
+  - resource: production-target
+    dependsOn: [gke-cluster, clouddeploy-sa]
+
+  # Build trigger depends on repository and service accounts
+  - resource: main-branch-trigger
+    dependsOn: [source-repository, cloudbuild-sa, delivery-pipeline]
+
+# Additional metadata for Infrastructure Manager
+metadata:
+  labels:
+    purpose: ci-cd-pipeline
+    component: code-quality-gates
+    managed-by: infrastructure-manager
+  
+  annotations:
+    description: "Complete CI/CD pipeline with quality gates and progressive delivery"
+    version: "1.0.0"
+    documentation: "See recipe documentation for usage instructions"
+    cost-estimate: "Moderate - includes GKE cluster, storage, and build minutes"

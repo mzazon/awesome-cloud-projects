@@ -1,0 +1,548 @@
+# Infrastructure Manager Configuration for Infrastructure Anomaly Detection
+# This configuration deploys an AI-powered anomaly detection system using
+# Cloud Monitoring, Vertex AI, Cloud Functions, and Pub/Sub
+
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Template metadata
+metadata:
+  name: infrastructure-anomaly-detection-monitoring-gemini
+  description: "AI-powered infrastructure anomaly detection using Cloud Monitoring, Vertex AI Gemini, Cloud Functions, and Pub/Sub"
+  version: "1.0.0"
+  labels:
+    category: monitoring
+    difficulty: intermediate
+    services: monitoring,aiplatform,cloudfunctions,pubsub
+
+# Input parameters for customization
+parameters:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    default: ""
+  
+  region:
+    type: string
+    description: "Google Cloud region for resources"
+    default: "us-central1"
+  
+  zone:
+    type: string
+    description: "Google Cloud zone for compute resources"
+    default: "us-central1-a"
+  
+  resource_prefix:
+    type: string
+    description: "Prefix for resource names to ensure uniqueness"
+    default: "anomaly-detection"
+  
+  notification_email:
+    type: string
+    description: "Email address for anomaly notifications"
+    default: "admin@example.com"
+  
+  enable_test_instance:
+    type: boolean
+    description: "Whether to create test VM instance for monitoring"
+    default: true
+  
+  function_memory:
+    type: string
+    description: "Memory allocation for Cloud Function"
+    default: "1Gi"
+  
+  function_timeout:
+    type: string
+    description: "Timeout for Cloud Function execution"
+    default: "540s"
+  
+  anomaly_threshold:
+    type: number
+    description: "Anomaly probability threshold (0-100) for alerts"
+    default: 70
+
+# Local variables for resource naming and configuration
+locals:
+  # Generate unique suffix for resources
+  random_suffix: ${substr(uuid(), 0, 6)}
+  
+  # Resource names
+  pubsub_topic_name: "${var.resource_prefix}-events-${local.random_suffix}"
+  pubsub_subscription_name: "${var.resource_prefix}-analysis-${local.random_suffix}"
+  function_name: "${var.resource_prefix}-analyzer-${local.random_suffix}"
+  test_instance_name: "${var.resource_prefix}-test-${local.random_suffix}"
+  service_account_name: "${var.resource_prefix}-sa-${local.random_suffix}"
+  
+  # Required APIs
+  required_apis:
+    - monitoring.googleapis.com
+    - aiplatform.googleapis.com
+    - cloudfunctions.googleapis.com
+    - pubsub.googleapis.com
+    - cloudbuild.googleapis.com
+    - compute.googleapis.com
+    - logging.googleapis.com
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  enable_apis:
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      parent: projects/${var.project_id}
+      services:
+        - name: monitoring.googleapis.com
+        - name: aiplatform.googleapis.com
+        - name: cloudfunctions.googleapis.com
+        - name: pubsub.googleapis.com
+        - name: cloudbuild.googleapis.com
+        - name: compute.googleapis.com
+        - name: logging.googleapis.com
+
+  # Create custom service account for Cloud Function
+  anomaly_detection_service_account:
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      parent: projects/${var.project_id}
+      accountId: ${local.service_account_name}
+      serviceAccount:
+        displayName: "Anomaly Detection Service Account"
+        description: "Service account for AI-powered anomaly detection system"
+    depends_on:
+      - enable_apis
+
+  # Grant necessary IAM roles to service account
+  sa_monitoring_viewer_binding:
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      member: serviceAccount:${local.service_account_name}@${var.project_id}.iam.gserviceaccount.com
+      role: roles/monitoring.viewer
+    depends_on:
+      - anomaly_detection_service_account
+
+  sa_aiplatform_user_binding:
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      member: serviceAccount:${local.service_account_name}@${var.project_id}.iam.gserviceaccount.com
+      role: roles/aiplatform.user
+    depends_on:
+      - anomaly_detection_service_account
+
+  sa_pubsub_subscriber_binding:
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      member: serviceAccount:${local.service_account_name}@${var.project_id}.iam.gserviceaccount.com
+      role: roles/pubsub.subscriber
+    depends_on:
+      - anomaly_detection_service_account
+
+  sa_logging_writer_binding:
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMemberBinding
+    properties:
+      resource: ${var.project_id}
+      member: serviceAccount:${local.service_account_name}@${var.project_id}.iam.gserviceaccount.com
+      role: roles/logging.logWriter
+    depends_on:
+      - anomaly_detection_service_account
+
+  # Create Pub/Sub topic for monitoring events
+  monitoring_events_topic:
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/${var.project_id}/topics/${local.pubsub_topic_name}
+      labels:
+        purpose: anomaly-detection
+        component: event-processing
+    depends_on:
+      - enable_apis
+
+  # Create Pub/Sub subscription for Cloud Function trigger
+  anomaly_analysis_subscription:
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/${var.project_id}/subscriptions/${local.pubsub_subscription_name}
+      topic: ${monitoring_events_topic.name}
+      ackDeadlineSeconds: 600
+      messageRetentionDuration: "604800s"  # 7 days
+      retryPolicy:
+        minimumBackoff: "10s"
+        maximumBackoff: "600s"
+      deadLetterPolicy:
+        maxDeliveryAttempts: 5
+      labels:
+        purpose: anomaly-detection
+        component: event-processing
+    depends_on:
+      - monitoring_events_topic
+
+  # Create Cloud Function for AI-powered anomaly analysis
+  anomaly_detection_function:
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    properties:
+      parent: projects/${var.project_id}/locations/${var.region}
+      functionId: ${local.function_name}
+      function:
+        displayName: "AI-Powered Anomaly Detection Function"
+        description: "Analyzes infrastructure metrics for anomalies using Vertex AI Gemini"
+        buildConfig:
+          runtime: python311
+          entryPoint: analyze_anomaly
+          source:
+            storageSource:
+              bucket: ${var.project_id}-gcf-source
+              object: anomaly-detection-source.zip
+          environmentVariables:
+            GCP_PROJECT: ${var.project_id}
+            ANOMALY_THRESHOLD: ${var.anomaly_threshold}
+        serviceConfig:
+          maxInstanceCount: 10
+          minInstanceCount: 0
+          availableMemory: ${var.function_memory}
+          timeoutSeconds: ${substr(var.function_timeout, 0, length(var.function_timeout) - 1)}
+          environmentVariables:
+            GCP_PROJECT: ${var.project_id}
+            ANOMALY_THRESHOLD: ${var.anomaly_threshold}
+          serviceAccountEmail: ${local.service_account_name}@${var.project_id}.iam.gserviceaccount.com
+          ingressSettings: ALLOW_INTERNAL_ONLY
+        eventTrigger:
+          triggerRegion: ${var.region}
+          eventType: google.cloud.pubsub.topic.v1.messagePublished
+          pubsubTopic: ${monitoring_events_topic.name}
+          retryPolicy: RETRY_POLICY_RETRY
+        labels:
+          purpose: anomaly-detection
+          component: ai-analysis
+    depends_on:
+      - anomaly_analysis_subscription
+      - sa_monitoring_viewer_binding
+      - sa_aiplatform_user_binding
+      - sa_pubsub_subscriber_binding
+      - sa_logging_writer_binding
+
+  # Create test VM instance for monitoring (optional)
+  test_monitoring_instance:
+    type: gcp-types/compute-v1:instances
+    properties:
+      zone: ${var.zone}
+      name: ${local.test_instance_name}
+      machineType: zones/${var.zone}/machineTypes/e2-medium
+      disks:
+        - boot: true
+          autoDelete: true
+          initializeParams:
+            sourceImage: projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts
+            diskType: zones/${var.zone}/diskTypes/pd-standard
+            diskSizeGb: 20
+      networkInterfaces:
+        - network: projects/${var.project_id}/global/networks/default
+          accessConfigs:
+            - name: External NAT
+              type: ONE_TO_ONE_NAT
+      serviceAccounts:
+        - email: ${local.service_account_name}@${var.project_id}.iam.gserviceaccount.com
+          scopes:
+            - https://www.googleapis.com/auth/cloud-platform
+      metadata:
+        items:
+          - key: enable-oslogin
+            value: "true"
+          - key: startup-script
+            value: |
+              #!/bin/bash
+              # Install Google Cloud Ops Agent for enhanced monitoring
+              curl -sSO https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh
+              bash add-google-cloud-ops-agent-repo.sh --also-install
+              
+              # Configure additional monitoring
+              systemctl enable google-cloud-ops-agent
+              systemctl start google-cloud-ops-agent
+      tags:
+        items:
+          - monitoring-test
+          - anomaly-detection
+      labels:
+        purpose: anomaly-detection
+        component: test-infrastructure
+    condition: ${var.enable_test_instance}
+    depends_on:
+      - anomaly_detection_service_account
+
+  # Create notification channel for email alerts
+  email_notification_channel:
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      parent: projects/${var.project_id}
+      notificationChannel:
+        type: email
+        displayName: "AI Anomaly Detection Alerts"
+        description: "Email notifications for AI-detected infrastructure anomalies"
+        labels:
+          email_address: ${var.notification_email}
+        enabled: true
+        userLabels:
+          purpose: anomaly-detection
+          component: alerting
+    depends_on:
+      - enable_apis
+
+  # Create alert policy for CPU utilization anomalies
+  cpu_anomaly_alert_policy:
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/${var.project_id}
+      alertPolicy:
+        displayName: "AI-Powered CPU Anomaly Detection"
+        documentation:
+          content: "This alert policy triggers when CPU utilization exceeds normal patterns and initiates AI-powered anomaly analysis."
+          mimeType: text/markdown
+        conditions:
+          - displayName: "CPU utilization anomaly trigger"
+            conditionThreshold:
+              filter: 'resource.type="gce_instance"'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 0.8
+              duration: 300s
+              aggregations:
+                - alignmentPeriod: 60s
+                  perSeriesAligner: ALIGN_MEAN
+                  crossSeriesReducer: REDUCE_MEAN
+                  groupByFields:
+                    - resource.instance_id
+        enabled: true
+        alertStrategy:
+          autoClose: 1800s
+          notificationRateLimit:
+            period: 300s
+        notificationChannels:
+          - ${email_notification_channel.name}
+        userLabels:
+          purpose: anomaly-detection
+          component: alerting
+          severity: medium
+    depends_on:
+      - email_notification_channel
+
+  # Create custom log-based metric for anomaly scores
+  anomaly_score_metric:
+    type: gcp-types/logging-v2:projects.metrics
+    properties:
+      parent: projects/${var.project_id}
+      metricId: anomaly_score
+      logMetric:
+        name: anomaly_score
+        description: "AI-generated anomaly detection scores from Cloud Functions"
+        filter: 'resource.type="cloud_function" AND textPayload:"ALERT:" AND resource.labels.function_name="${local.function_name}"'
+        labelExtractors:
+          severity: 'EXTRACT(textPayload, "severity\":\\s*\"([^\"]+)\")'
+          metric_type: 'EXTRACT(textPayload, "metric\":\\s*\"([^\"]+)\")'
+        valueExtractor: 'EXTRACT(textPayload, "anomaly_probability\":\\s*([0-9.]+))'
+        metricDescriptor:
+          metricKind: GAUGE
+          valueType: DOUBLE
+          displayName: "Anomaly Detection Score"
+          description: "Probability score (0-100) indicating likelihood of infrastructure anomaly"
+          labels:
+            - key: severity
+              valueType: STRING
+              description: "Severity level of detected anomaly"
+            - key: metric_type
+              valueType: STRING
+              description: "Type of infrastructure metric analyzed"
+    depends_on:
+      - anomaly_detection_function
+
+  # Create custom dashboard for anomaly visualization
+  anomaly_detection_dashboard:
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      parent: projects/${var.project_id}
+      dashboard:
+        displayName: "AI-Powered Infrastructure Anomaly Detection"
+        mosaicLayout:
+          tiles:
+            # Anomaly Detection Scores Chart
+            - width: 8
+              height: 4
+              widget:
+                title: "Anomaly Detection Scores Over Time"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="cloud_function" AND metric.type="logging.googleapis.com/user/anomaly_score"'
+                          aggregation:
+                            alignmentPeriod: 300s
+                            perSeriesAligner: ALIGN_MEAN
+                            crossSeriesReducer: REDUCE_MEAN
+                            groupByFields:
+                              - metric.labels.severity
+                      plotType: LINE
+                      targetAxis: Y1
+                  yAxis:
+                    label: "Anomaly Score"
+                    scale: LINEAR
+                  xAxis:
+                    label: "Time"
+                    scale: LINEAR
+                  thresholds:
+                    - value: ${var.anomaly_threshold}
+                      color: RED
+                      direction: ABOVE
+                      label: "Alert Threshold"
+            
+            # Function Execution Count
+            - width: 4
+              height: 4
+              xPos: 8
+              widget:
+                title: "AI Analysis Function Executions"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="cloud_function" AND resource.labels.function_name="${local.function_name}" AND metric.type="cloudfunctions.googleapis.com/function/executions"'
+                          aggregation:
+                            alignmentPeriod: 300s
+                            perSeriesAligner: ALIGN_RATE
+                            crossSeriesReducer: REDUCE_SUM
+                      plotType: STACKED_BAR
+                      targetAxis: Y1
+                  yAxis:
+                    label: "Executions/sec"
+                    scale: LINEAR
+            
+            # CPU Utilization for Test Instance
+            - width: 6
+              height: 4
+              yPos: 4
+              widget:
+                title: "Test Instance CPU Utilization"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="gce_instance" AND resource.labels.instance_id="${local.test_instance_name}" AND metric.type="compute.googleapis.com/instance/cpu/utilization"'
+                          aggregation:
+                            alignmentPeriod: 60s
+                            perSeriesAligner: ALIGN_MEAN
+                            crossSeriesReducer: REDUCE_MEAN
+                      plotType: LINE
+                      targetAxis: Y1
+                  yAxis:
+                    label: "CPU Utilization"
+                    scale: LINEAR
+                  thresholds:
+                    - value: 0.8
+                      color: YELLOW
+                      direction: ABOVE
+                      label: "Anomaly Threshold"
+                condition: ${var.enable_test_instance}
+            
+            # Alert Policy Status
+            - width: 6
+              height: 4
+              xPos: 6
+              yPos: 4
+              widget:
+                title: "Alert Policy Incidents"
+                xyChart:
+                  dataSets:
+                    - timeSeriesQuery:
+                        timeSeriesFilter:
+                          filter: 'resource.type="alerting_policy" AND metric.type="monitoring.googleapis.com/alerting/policy/alert_count"'
+                          aggregation:
+                            alignmentPeriod: 300s
+                            perSeriesAligner: ALIGN_MEAN
+                            crossSeriesReducer: REDUCE_SUM
+                      plotType: STACKED_BAR
+                      targetAxis: Y1
+                  yAxis:
+                    label: "Active Incidents"
+                    scale: LINEAR
+        labels:
+          purpose: anomaly-detection
+          component: visualization
+    depends_on:
+      - anomaly_score_metric
+      - cpu_anomaly_alert_policy
+
+# Output important resource information
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${var.project_id}
+  
+  region:
+    description: "Deployment region"
+    value: ${var.region}
+  
+  pubsub_topic_name:
+    description: "Pub/Sub topic name for monitoring events"
+    value: ${local.pubsub_topic_name}
+  
+  pubsub_subscription_name:
+    description: "Pub/Sub subscription name for anomaly analysis"
+    value: ${local.pubsub_subscription_name}
+  
+  function_name:
+    description: "Cloud Function name for AI anomaly analysis"
+    value: ${local.function_name}
+  
+  service_account_email:
+    description: "Service account email for anomaly detection system"
+    value: ${local.service_account_name}@${var.project_id}.iam.gserviceaccount.com
+  
+  test_instance_name:
+    description: "Test VM instance name (if enabled)"
+    value: ${local.test_instance_name}
+    condition: ${var.enable_test_instance}
+  
+  notification_channel_id:
+    description: "Notification channel ID for alerts"
+    value: ${email_notification_channel.name}
+  
+  alert_policy_id:
+    description: "Alert policy ID for CPU anomaly detection"
+    value: ${cpu_anomaly_alert_policy.name}
+  
+  dashboard_url:
+    description: "URL to access the anomaly detection dashboard"
+    value: https://console.cloud.google.com/monitoring/dashboards/custom/${anomaly_detection_dashboard.name}
+  
+  function_logs_url:
+    description: "URL to view Cloud Function logs"
+    value: https://console.cloud.google.com/functions/details/${var.region}/${local.function_name}/logs?project=${var.project_id}
+  
+  monitoring_console_url:
+    description: "URL to access Cloud Monitoring console"
+    value: https://console.cloud.google.com/monitoring?project=${var.project_id}
+  
+  deployment_summary:
+    description: "Summary of deployed resources for anomaly detection system"
+    value: |
+      AI-Powered Infrastructure Anomaly Detection System deployed successfully!
+      
+      Key Components:
+      - Cloud Function: ${local.function_name} (AI analysis engine)
+      - Pub/Sub Topic: ${local.pubsub_topic_name} (event processing)
+      - Test Instance: ${local.test_instance_name} (monitoring target)
+      - Alert Policy: CPU Anomaly Detection (intelligent alerting)
+      - Dashboard: Custom anomaly visualization
+      - Notification: Email alerts to ${var.notification_email}
+      
+      The system is now ready to detect infrastructure anomalies using Vertex AI Gemini!

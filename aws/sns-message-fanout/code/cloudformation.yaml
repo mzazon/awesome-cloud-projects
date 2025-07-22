@@ -1,0 +1,780 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Message Fan-out Pattern with SNS and Multiple SQS Queues - E-commerce Order Processing System'
+
+# Template Parameters for customization
+Parameters:
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name for resource naming and tagging'
+  
+  ProjectName:
+    Type: String
+    Default: 'ecommerce-fanout'
+    Description: 'Project name for resource naming and tagging'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+  
+  # SQS Configuration Parameters
+  MessageRetentionPeriod:
+    Type: Number
+    Default: 1209600
+    MinValue: 60
+    MaxValue: 1209600
+    Description: 'Message retention period in seconds (14 days default)'
+  
+  VisibilityTimeoutSeconds:
+    Type: Number
+    Default: 300
+    MinValue: 0
+    MaxValue: 43200
+    Description: 'SQS visibility timeout in seconds (5 minutes default)'
+  
+  DLQVisibilityTimeoutSeconds:
+    Type: Number
+    Default: 60
+    MinValue: 0
+    MaxValue: 43200
+    Description: 'Dead Letter Queue visibility timeout in seconds'
+  
+  MaxReceiveCount:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 1000
+    Description: 'Maximum number of receives before sending to DLQ'
+  
+  # CloudWatch Alarm Thresholds
+  InventoryQueueDepthThreshold:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 1000
+    Description: 'Alarm threshold for inventory queue depth'
+  
+  PaymentQueueDepthThreshold:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    MaxValue: 1000
+    Description: 'Alarm threshold for payment queue depth'
+  
+  SNSFailureThreshold:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 100
+    Description: 'Alarm threshold for SNS delivery failures'
+  
+  # Monitoring Configuration
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable detailed CloudWatch monitoring'
+  
+  AlarmNotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for alarm notifications (optional)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
+# Conditions for optional resources
+Conditions:
+  CreateAlarmNotification: !Not [!Equals [!Ref AlarmNotificationEmail, '']]
+  EnableDetailedMonitoringCondition: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+# Template Resources
+Resources:
+  # IAM Role for SNS to SQS delivery
+  SNSSQSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-sns-sqs-fanout-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'iam-role'
+
+  # SNS Topic for Order Events
+  OrderEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-order-events-${Environment}'
+      DisplayName: !Sub '${ProjectName} Order Events Topic'
+      DeliveryPolicy:
+        http:
+          defaultHealthyRetryPolicy:
+            numRetries: 3
+            numNoDelayRetries: 0
+            minDelayTarget: 20
+            maxDelayTarget: 20
+            numMinDelayRetries: 0
+            numMaxDelayRetries: 0
+            backoffFunction: linear
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'sns-topic'
+
+  # Dead Letter Queues
+  InventoryDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-inventory-dlq-${Environment}'
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      VisibilityTimeoutSeconds: !Ref DLQVisibilityTimeoutSeconds
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'dlq'
+        - Key: Service
+          Value: 'inventory'
+
+  PaymentDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-payment-dlq-${Environment}'
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      VisibilityTimeoutSeconds: !Ref DLQVisibilityTimeoutSeconds
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'dlq'
+        - Key: Service
+          Value: 'payment'
+
+  ShippingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-shipping-dlq-${Environment}'
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      VisibilityTimeoutSeconds: !Ref DLQVisibilityTimeoutSeconds
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'dlq'
+        - Key: Service
+          Value: 'shipping'
+
+  AnalyticsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-analytics-dlq-${Environment}'
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      VisibilityTimeoutSeconds: !Ref DLQVisibilityTimeoutSeconds
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'dlq'
+        - Key: Service
+          Value: 'analytics'
+
+  # Primary SQS Queues with DLQ Configuration
+  InventoryQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-inventory-processing-${Environment}'
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      VisibilityTimeoutSeconds: !Ref VisibilityTimeoutSeconds
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt InventoryDLQ.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'sqs-queue'
+        - Key: Service
+          Value: 'inventory'
+
+  PaymentQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-payment-processing-${Environment}'
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      VisibilityTimeoutSeconds: !Ref VisibilityTimeoutSeconds
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt PaymentDLQ.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'sqs-queue'
+        - Key: Service
+          Value: 'payment'
+
+  ShippingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-shipping-notifications-${Environment}'
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      VisibilityTimeoutSeconds: !Ref VisibilityTimeoutSeconds
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ShippingDLQ.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'sqs-queue'
+        - Key: Service
+          Value: 'shipping'
+
+  AnalyticsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-analytics-reporting-${Environment}'
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      VisibilityTimeoutSeconds: !Ref VisibilityTimeoutSeconds
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt AnalyticsDLQ.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'sqs-queue'
+        - Key: Service
+          Value: 'analytics'
+
+  # SQS Queue Policies for SNS Access
+  InventoryQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref InventoryQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: sqs:SendMessage
+            Resource: !GetAtt InventoryQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref OrderEventsTopic
+
+  PaymentQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref PaymentQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: sqs:SendMessage
+            Resource: !GetAtt PaymentQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref OrderEventsTopic
+
+  ShippingQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref ShippingQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: sqs:SendMessage
+            Resource: !GetAtt ShippingQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref OrderEventsTopic
+
+  AnalyticsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref AnalyticsQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: sqs:SendMessage
+            Resource: !GetAtt AnalyticsQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref OrderEventsTopic
+
+  # SNS Subscriptions with Message Filtering
+  InventorySubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sqs
+      TopicArn: !Ref OrderEventsTopic
+      Endpoint: !GetAtt InventoryQueue.Arn
+      FilterPolicy:
+        eventType:
+          - inventory_update
+          - stock_check
+        priority:
+          - high
+          - medium
+    DependsOn: InventoryQueuePolicy
+
+  PaymentSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sqs
+      TopicArn: !Ref OrderEventsTopic
+      Endpoint: !GetAtt PaymentQueue.Arn
+      FilterPolicy:
+        eventType:
+          - payment_request
+          - payment_confirmation
+        priority:
+          - high
+    DependsOn: PaymentQueuePolicy
+
+  ShippingSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sqs
+      TopicArn: !Ref OrderEventsTopic
+      Endpoint: !GetAtt ShippingQueue.Arn
+      FilterPolicy:
+        eventType:
+          - shipping_notification
+          - delivery_update
+        priority:
+          - high
+          - medium
+          - low
+    DependsOn: ShippingQueuePolicy
+
+  AnalyticsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sqs
+      TopicArn: !Ref OrderEventsTopic
+      Endpoint: !GetAtt AnalyticsQueue.Arn
+      # No FilterPolicy - analytics receives all messages
+    DependsOn: AnalyticsQueuePolicy
+
+  # SNS Topic for Alarm Notifications (optional)
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateAlarmNotification
+    Properties:
+      TopicName: !Sub '${ProjectName}-alarm-notifications-${Environment}'
+      DisplayName: !Sub '${ProjectName} Alarm Notifications'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'alarm-topic'
+
+  # Email Subscription for Alarm Notifications
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateAlarmNotification
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AlarmNotificationTopic
+      Endpoint: !Ref AlarmNotificationEmail
+
+  # CloudWatch Alarms for Monitoring
+  InventoryQueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-inventory-queue-depth-${Environment}'
+      AlarmDescription: 'Monitor inventory queue depth for processing bottlenecks'
+      MetricName: ApproximateNumberOfVisibleMessages
+      Namespace: AWS/SQS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref InventoryQueueDepthThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt InventoryQueue.QueueName
+      AlarmActions: !If
+        - CreateAlarmNotification
+        - [!Ref AlarmNotificationTopic]
+        - []
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'cloudwatch-alarm'
+
+  PaymentQueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-payment-queue-depth-${Environment}'
+      AlarmDescription: 'Monitor payment queue depth for processing bottlenecks'
+      MetricName: ApproximateNumberOfVisibleMessages
+      Namespace: AWS/SQS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref PaymentQueueDepthThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt PaymentQueue.QueueName
+      AlarmActions: !If
+        - CreateAlarmNotification
+        - [!Ref AlarmNotificationTopic]
+        - []
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'cloudwatch-alarm'
+
+  SNSFailedDeliveriesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-sns-failed-deliveries-${Environment}'
+      AlarmDescription: 'Monitor SNS failed deliveries for system health'
+      MetricName: NumberOfNotificationsFailed
+      Namespace: AWS/SNS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref SNSFailureThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TopicName
+          Value: !GetAtt OrderEventsTopic.TopicName
+      AlarmActions: !If
+        - CreateAlarmNotification
+        - [!Ref AlarmNotificationTopic]
+        - []
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: 'cloudwatch-alarm'
+
+  # CloudWatch Dashboard for Monitoring
+  FanoutDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      DashboardName: !Sub '${ProjectName}-fanout-dashboard-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/SNS", "NumberOfMessagesPublished", "TopicName", "${OrderEventsTopic.TopicName}"],
+                  ["AWS/SNS", "NumberOfNotificationsFailed", "TopicName", "${OrderEventsTopic.TopicName}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "SNS Message Publishing",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/SQS", "ApproximateNumberOfVisibleMessages", "QueueName", "${InventoryQueue.QueueName}"],
+                  ["AWS/SQS", "ApproximateNumberOfVisibleMessages", "QueueName", "${PaymentQueue.QueueName}"],
+                  ["AWS/SQS", "ApproximateNumberOfVisibleMessages", "QueueName", "${ShippingQueue.QueueName}"],
+                  ["AWS/SQS", "ApproximateNumberOfVisibleMessages", "QueueName", "${AnalyticsQueue.QueueName}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "SQS Queue Depths",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/SQS", "NumberOfMessagesReceived", "QueueName", "${InventoryQueue.QueueName}"],
+                  ["AWS/SQS", "NumberOfMessagesReceived", "QueueName", "${PaymentQueue.QueueName}"],
+                  ["AWS/SQS", "NumberOfMessagesReceived", "QueueName", "${ShippingQueue.QueueName}"],
+                  ["AWS/SQS", "NumberOfMessagesReceived", "QueueName", "${AnalyticsQueue.QueueName}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "SQS Messages Received",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/SQS", "ApproximateNumberOfVisibleMessages", "QueueName", "${InventoryDLQ.QueueName}"],
+                  ["AWS/SQS", "ApproximateNumberOfVisibleMessages", "QueueName", "${PaymentDLQ.QueueName}"],
+                  ["AWS/SQS", "ApproximateNumberOfVisibleMessages", "QueueName", "${ShippingDLQ.QueueName}"],
+                  ["AWS/SQS", "ApproximateNumberOfVisibleMessages", "QueueName", "${AnalyticsDLQ.QueueName}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Dead Letter Queue Depths",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+# Template Outputs
+Outputs:
+  # SNS Topic Information
+  OrderEventsTopicArn:
+    Description: 'ARN of the SNS topic for order events'
+    Value: !Ref OrderEventsTopic
+    Export:
+      Name: !Sub '${ProjectName}-order-events-topic-arn-${Environment}'
+
+  OrderEventsTopicName:
+    Description: 'Name of the SNS topic for order events'
+    Value: !GetAtt OrderEventsTopic.TopicName
+    Export:
+      Name: !Sub '${ProjectName}-order-events-topic-name-${Environment}'
+
+  # Primary Queue URLs
+  InventoryQueueUrl:
+    Description: 'URL of the inventory processing queue'
+    Value: !Ref InventoryQueue
+    Export:
+      Name: !Sub '${ProjectName}-inventory-queue-url-${Environment}'
+
+  PaymentQueueUrl:
+    Description: 'URL of the payment processing queue'
+    Value: !Ref PaymentQueue
+    Export:
+      Name: !Sub '${ProjectName}-payment-queue-url-${Environment}'
+
+  ShippingQueueUrl:
+    Description: 'URL of the shipping notifications queue'
+    Value: !Ref ShippingQueue
+    Export:
+      Name: !Sub '${ProjectName}-shipping-queue-url-${Environment}'
+
+  AnalyticsQueueUrl:
+    Description: 'URL of the analytics reporting queue'
+    Value: !Ref AnalyticsQueue
+    Export:
+      Name: !Sub '${ProjectName}-analytics-queue-url-${Environment}'
+
+  # Primary Queue ARNs
+  InventoryQueueArn:
+    Description: 'ARN of the inventory processing queue'
+    Value: !GetAtt InventoryQueue.Arn
+    Export:
+      Name: !Sub '${ProjectName}-inventory-queue-arn-${Environment}'
+
+  PaymentQueueArn:
+    Description: 'ARN of the payment processing queue'
+    Value: !GetAtt PaymentQueue.Arn
+    Export:
+      Name: !Sub '${ProjectName}-payment-queue-arn-${Environment}'
+
+  ShippingQueueArn:
+    Description: 'ARN of the shipping notifications queue'
+    Value: !GetAtt ShippingQueue.Arn
+    Export:
+      Name: !Sub '${ProjectName}-shipping-queue-arn-${Environment}'
+
+  AnalyticsQueueArn:
+    Description: 'ARN of the analytics reporting queue'
+    Value: !GetAtt AnalyticsQueue.Arn
+    Export:
+      Name: !Sub '${ProjectName}-analytics-queue-arn-${Environment}'
+
+  # Dead Letter Queue URLs
+  InventoryDLQUrl:
+    Description: 'URL of the inventory dead letter queue'
+    Value: !Ref InventoryDLQ
+    Export:
+      Name: !Sub '${ProjectName}-inventory-dlq-url-${Environment}'
+
+  PaymentDLQUrl:
+    Description: 'URL of the payment dead letter queue'
+    Value: !Ref PaymentDLQ
+    Export:
+      Name: !Sub '${ProjectName}-payment-dlq-url-${Environment}'
+
+  ShippingDLQUrl:
+    Description: 'URL of the shipping dead letter queue'
+    Value: !Ref ShippingDLQ
+    Export:
+      Name: !Sub '${ProjectName}-shipping-dlq-url-${Environment}'
+
+  AnalyticsDLQUrl:
+    Description: 'URL of the analytics dead letter queue'
+    Value: !Ref AnalyticsDLQ
+    Export:
+      Name: !Sub '${ProjectName}-analytics-dlq-url-${Environment}'
+
+  # CloudWatch Dashboard
+  DashboardUrl:
+    Condition: EnableDetailedMonitoringCondition
+    Description: 'URL of the CloudWatch dashboard for monitoring'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-fanout-dashboard-${Environment}'
+
+  # Alarm Notification Topic
+  AlarmNotificationTopicArn:
+    Condition: CreateAlarmNotification
+    Description: 'ARN of the SNS topic for alarm notifications'
+    Value: !Ref AlarmNotificationTopic
+    Export:
+      Name: !Sub '${ProjectName}-alarm-topic-arn-${Environment}'
+
+  # Sample CLI Commands for Testing
+  TestInventoryCommand:
+    Description: 'CLI command to test inventory event publishing'
+    Value: !Sub |
+      aws sns publish --topic-arn ${OrderEventsTopic} --message '{"orderId":"test-123","productId":"prod-456","quantity":5}' --message-attributes '{"eventType":{"DataType":"String","StringValue":"inventory_update"},"priority":{"DataType":"String","StringValue":"high"}}'
+
+  TestPaymentCommand:
+    Description: 'CLI command to test payment event publishing'
+    Value: !Sub |
+      aws sns publish --topic-arn ${OrderEventsTopic} --message '{"orderId":"test-123","paymentId":"pay-789","amount":99.99}' --message-attributes '{"eventType":{"DataType":"String","StringValue":"payment_confirmation"},"priority":{"DataType":"String","StringValue":"high"}}'
+
+  TestShippingCommand:
+    Description: 'CLI command to test shipping event publishing'
+    Value: !Sub |
+      aws sns publish --topic-arn ${OrderEventsTopic} --message '{"orderId":"test-123","trackingNumber":"track-456","carrier":"UPS"}' --message-attributes '{"eventType":{"DataType":"String","StringValue":"shipping_notification"},"priority":{"DataType":"String","StringValue":"medium"}}'
+
+# Metadata for template documentation
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Project Configuration'
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: 'SQS Configuration'
+        Parameters:
+          - MessageRetentionPeriod
+          - VisibilityTimeoutSeconds
+          - DLQVisibilityTimeoutSeconds
+          - MaxReceiveCount
+      - Label:
+          default: 'Monitoring Configuration'
+        Parameters:
+          - EnableDetailedMonitoring
+          - InventoryQueueDepthThreshold
+          - PaymentQueueDepthThreshold
+          - SNSFailureThreshold
+          - AlarmNotificationEmail
+    ParameterLabels:
+      ProjectName:
+        default: 'Project Name'
+      Environment:
+        default: 'Environment'
+      MessageRetentionPeriod:
+        default: 'Message Retention Period (seconds)'
+      VisibilityTimeoutSeconds:
+        default: 'Visibility Timeout (seconds)'
+      DLQVisibilityTimeoutSeconds:
+        default: 'DLQ Visibility Timeout (seconds)'
+      MaxReceiveCount:
+        default: 'Max Receive Count'
+      EnableDetailedMonitoring:
+        default: 'Enable Detailed Monitoring'
+      InventoryQueueDepthThreshold:
+        default: 'Inventory Queue Depth Threshold'
+      PaymentQueueDepthThreshold:
+        default: 'Payment Queue Depth Threshold'
+      SNSFailureThreshold:
+        default: 'SNS Failure Threshold'
+      AlarmNotificationEmail:
+        default: 'Alarm Notification Email'

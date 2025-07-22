@@ -1,0 +1,1292 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Data Lake Architecture with S3 and Lake Formation - Comprehensive governance and security implementation'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Data Lake Configuration"
+        Parameters:
+          - DataLakeName
+          - DatabaseName
+          - Environment
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - EnableMultiFactorAuth
+          - DataClassification
+          - CreateSampleData
+      - Label:
+          default: "Governance Configuration"
+        Parameters:
+          - EnableDataCellFilters
+          - EnableCrossAccountSharing
+          - EnableAuditLogging
+    ParameterLabels:
+      DataLakeName:
+        default: "Data Lake Name"
+      DatabaseName:
+        default: "Database Name"
+      Environment:
+        default: "Environment"
+      EnableMultiFactorAuth:
+        default: "Enable Multi-Factor Authentication"
+      DataClassification:
+        default: "Data Classification Level"
+      CreateSampleData:
+        default: "Create Sample Data"
+      EnableDataCellFilters:
+        default: "Enable Data Cell Filters"
+      EnableCrossAccountSharing:
+        default: "Enable Cross-Account Sharing"
+      EnableAuditLogging:
+        default: "Enable Audit Logging"
+
+Parameters:
+  DataLakeName:
+    Type: String
+    Description: 'Name for the data lake (used as prefix for resources)'
+    Default: 'enterprise-datalake'
+    AllowedPattern: '^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$'
+    ConstraintDescription: 'Must be 3-63 characters, lowercase, alphanumeric with hyphens'
+    
+  DatabaseName:
+    Type: String
+    Description: 'Name for the Glue database'
+    Default: 'sales_analytics'
+    AllowedPattern: '^[a-z0-9_]{1,255}$'
+    ConstraintDescription: 'Must be 1-255 characters, lowercase, alphanumeric with underscores'
+    
+  Environment:
+    Type: String
+    Description: 'Environment for the data lake'
+    Default: 'dev'
+    AllowedValues:
+      - 'dev'
+      - 'staging'
+      - 'prod'
+    
+  EnableMultiFactorAuth:
+    Type: String
+    Description: 'Enable MFA for administrative access'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+      
+  DataClassification:
+    Type: String
+    Description: 'Default data classification level'
+    Default: 'Internal'
+    AllowedValues:
+      - 'Public'
+      - 'Internal'
+      - 'Confidential'
+      - 'Restricted'
+      
+  CreateSampleData:
+    Type: String
+    Description: 'Create sample data for testing'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+      
+  EnableDataCellFilters:
+    Type: String
+    Description: 'Enable data cell filters for fine-grained access control'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+      
+  EnableCrossAccountSharing:
+    Type: String
+    Description: 'Enable cross-account data sharing capabilities'
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+      
+  EnableAuditLogging:
+    Type: String
+    Description: 'Enable comprehensive audit logging'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Conditions:
+  CreateSampleDataCondition: !Equals [!Ref CreateSampleData, 'true']
+  EnableMFACondition: !Equals [!Ref EnableMultiFactorAuth, 'true']
+  EnableDataCellFiltersCondition: !Equals [!Ref EnableDataCellFilters, 'true']
+  EnableCrossAccountSharingCondition: !Equals [!Ref EnableCrossAccountSharing, 'true']
+  EnableAuditLoggingCondition: !Equals [!Ref EnableAuditLogging, 'true']
+  IsProductionEnvironment: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # ============================================================================
+  # S3 BUCKETS - DATA LAKE STORAGE ZONES
+  # ============================================================================
+  
+  # Raw Data Zone - Landing area for unprocessed data
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${DataLakeName}-raw-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: raw-data-access-logs/
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref DataLakeLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${DataLakeName}-raw-zone'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: DataZone
+          Value: Raw
+        - Key: Classification
+          Value: !Ref DataClassification
+        - Key: Purpose
+          Value: 'Raw data storage and ingestion'
+
+  # Processed Data Zone - Cleaned and standardized data
+  ProcessedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${DataLakeName}-processed-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: processed-data-access-logs/
+      Tags:
+        - Key: Name
+          Value: !Sub '${DataLakeName}-processed-zone'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: DataZone
+          Value: Processed
+        - Key: Classification
+          Value: !Ref DataClassification
+        - Key: Purpose
+          Value: 'Processed and cleaned data storage'
+
+  # Curated Data Zone - Business-ready analytics data
+  CuratedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${DataLakeName}-curated-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: curated-data-access-logs/
+      Tags:
+        - Key: Name
+          Value: !Sub '${DataLakeName}-curated-zone'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: DataZone
+          Value: Curated
+        - Key: Classification
+          Value: !Ref DataClassification
+        - Key: Purpose
+          Value: 'Curated business-ready data storage'
+
+  # Access Logs Bucket - For S3 access logging
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${DataLakeName}-access-logs-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${DataLakeName}-access-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'S3 access logging storage'
+
+  # ============================================================================
+  # CLOUDWATCH LOGS
+  # ============================================================================
+  
+  # CloudWatch Log Group for Data Lake operations
+  DataLakeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/datalake/${DataLakeName}/${Environment}'
+      RetentionInDays: !If [IsProductionEnvironment, 365, 30]
+      KmsKeyId: !GetAtt DataLakeKMSKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${DataLakeName}-log-group'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Data lake operations logging'
+
+  # CloudWatch Log Group for Lake Formation audit logs
+  LakeFormationAuditLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableAuditLoggingCondition
+    Properties:
+      LogGroupName: !Sub '/aws/lakeformation/audit/${DataLakeName}/${Environment}'
+      RetentionInDays: !If [IsProductionEnvironment, 2555, 90]  # 7 years for prod, 90 days for dev
+      KmsKeyId: !GetAtt DataLakeKMSKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${DataLakeName}-audit-log-group'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Lake Formation audit logging'
+
+  # ============================================================================
+  # KMS KEY FOR ENCRYPTION
+  # ============================================================================
+  
+  # KMS Key for Data Lake encryption
+  DataLakeKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'KMS key for ${DataLakeName} data lake encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow Lake Formation Service
+            Effect: Allow
+            Principal:
+              Service: lakeformation.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+              - 'kms:CreateGrant'
+            Resource: '*'
+          - Sid: Allow Glue Service
+            Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: logs.amazonaws.com
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:CreateGrant'
+              - 'kms:DescribeKey'
+            Resource: '*'
+      KeyUsage: ENCRYPT_DECRYPT
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyRotationStatus: true
+      MultiRegion: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${DataLakeName}-kms-key'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Data lake encryption key'
+
+  # KMS Key Alias for easier reference
+  DataLakeKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${DataLakeName}-${Environment}-key'
+      TargetKeyId: !Ref DataLakeKMSKey
+
+  # ============================================================================
+  # IAM ROLES AND POLICIES
+  # ============================================================================
+  
+  # Lake Formation Service Role
+  LakeFormationServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${DataLakeName}-LakeFormationServiceRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lakeformation.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/LakeFormationServiceRole
+      Policies:
+        - PolicyName: DataLakeS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub '${RawDataBucket}/*'
+                  - !Sub '${ProcessedDataBucket}/*'
+                  - !Sub '${CuratedDataBucket}/*'
+                  - !GetAtt RawDataBucket.Arn
+                  - !GetAtt ProcessedDataBucket.Arn
+                  - !GetAtt CuratedDataBucket.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:CreateGrant
+                Resource: !GetAtt DataLakeKMSKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${DataLakeName}-LakeFormationServiceRole'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Lake Formation service operations'
+
+  # Glue Crawler Role
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${DataLakeName}-GlueCrawlerRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: DataLakeS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub '${RawDataBucket}/*'
+                  - !Sub '${ProcessedDataBucket}/*'
+                  - !Sub '${CuratedDataBucket}/*'
+                  - !GetAtt RawDataBucket.Arn
+                  - !GetAtt ProcessedDataBucket.Arn
+                  - !GetAtt CuratedDataBucket.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt DataLakeKMSKey.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${DataLakeName}-GlueCrawlerRole'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Glue crawler operations'
+
+  # Data Engineer Role
+  DataEngineerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${DataLakeName}-DataEngineerRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref 'AWS::Region'
+              Bool:
+                'aws:MultiFactorAuthPresent': !If [EnableMFACondition, 'true', 'false']
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSGlueConsoleFullAccess
+        - arn:aws:iam::aws:policy/AmazonAthenaFullAccess
+      Policies:
+        - PolicyName: DataLakeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub '${RawDataBucket}/*'
+                  - !Sub '${ProcessedDataBucket}/*'
+                  - !Sub '${CuratedDataBucket}/*'
+                  - !GetAtt RawDataBucket.Arn
+                  - !GetAtt ProcessedDataBucket.Arn
+                  - !GetAtt CuratedDataBucket.Arn
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                  - lakeformation:GetWorkUnits
+                  - lakeformation:GetWorkUnitResults
+                  - lakeformation:StartQueryPlanning
+                  - lakeformation:GetQueryPlanning
+                  - lakeformation:GetQueryState
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt DataLakeKMSKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${DataLakeName}-DataEngineerRole'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Data engineering operations'
+
+  # Data Analyst Role
+  DataAnalystRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${DataLakeName}-DataAnalystRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref 'AWS::Region'
+              Bool:
+                'aws:MultiFactorAuthPresent': !If [EnableMFACondition, 'true', 'false']
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonAthenaFullAccess
+        - arn:aws:iam::aws:policy/AmazonQuickSightFullAccess
+      Policies:
+        - PolicyName: DataLakeReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub '${CuratedDataBucket}/*'
+                  - !GetAtt CuratedDataBucket.Arn
+                  - !Sub '${ProcessedDataBucket}/*'
+                  - !GetAtt ProcessedDataBucket.Arn
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                  - lakeformation:GetWorkUnits
+                  - lakeformation:GetWorkUnitResults
+                  - lakeformation:StartQueryPlanning
+                  - lakeformation:GetQueryPlanning
+                  - lakeformation:GetQueryState
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !GetAtt DataLakeKMSKey.Arn
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${DataLakeName}-DataAnalystRole'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Data analytics operations'
+
+  # Data Lake Administrator Role
+  DataLakeAdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${DataLakeName}-DataLakeAdminRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref 'AWS::Region'
+              Bool:
+                'aws:MultiFactorAuthPresent': !If [EnableMFACondition, 'true', 'false']
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/LakeFormationDataAdmin
+        - arn:aws:iam::aws:policy/AWSGlueConsoleFullAccess
+      Policies:
+        - PolicyName: DataLakeFullAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - !Sub '${RawDataBucket}/*'
+                  - !Sub '${ProcessedDataBucket}/*'
+                  - !Sub '${CuratedDataBucket}/*'
+                  - !GetAtt RawDataBucket.Arn
+                  - !GetAtt ProcessedDataBucket.Arn
+                  - !GetAtt CuratedDataBucket.Arn
+              - Effect: Allow
+                Action:
+                  - kms:*
+                Resource: !GetAtt DataLakeKMSKey.Arn
+              - Effect: Allow
+                Action:
+                  - lakeformation:*
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${DataLakeName}-DataLakeAdminRole'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Data lake administration'
+
+  # ============================================================================
+  # GLUE DATA CATALOG
+  # ============================================================================
+  
+  # Glue Database for the data lake
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseInput:
+        Name: !Ref DatabaseName
+        Description: !Sub 'Data lake database for ${DataLakeName} analytics'
+        Parameters:
+          classification: !Ref DataClassification
+          department: 'Analytics'
+          created_by: 'CloudFormation'
+          data_lake: !Ref DataLakeName
+          environment: !Ref Environment
+
+  # Glue Crawler for Sales Data
+  SalesDataCrawler:
+    Type: AWS::Glue::Crawler
+    Condition: CreateSampleDataCondition
+    Properties:
+      Name: !Sub '${DataLakeName}-sales-crawler-${Environment}'
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub '${RawDataBucket}/sales/'
+            Exclusions:
+              - '**/_SUCCESS'
+              - '**/_temporary/**'
+      TablePrefix: 'sales_'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": {"AddOrUpdateBehavior": "InheritFromTable"},
+            "Tables": {"AddOrUpdateBehavior": "MergeNewColumns"}
+          }
+        }
+      Tags:
+        Name: !Sub '${DataLakeName}-sales-crawler'
+        Environment: !Ref Environment
+        Purpose: 'Sales data cataloging'
+
+  # Glue Crawler for Customer Data
+  CustomerDataCrawler:
+    Type: AWS::Glue::Crawler
+    Condition: CreateSampleDataCondition
+    Properties:
+      Name: !Sub '${DataLakeName}-customer-crawler-${Environment}'
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub '${RawDataBucket}/customers/'
+            Exclusions:
+              - '**/_SUCCESS'
+              - '**/_temporary/**'
+      TablePrefix: 'customer_'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": {"AddOrUpdateBehavior": "InheritFromTable"},
+            "Tables": {"AddOrUpdateBehavior": "MergeNewColumns"}
+          }
+        }
+      Tags:
+        Name: !Sub '${DataLakeName}-customer-crawler'
+        Environment: !Ref Environment
+        Purpose: 'Customer data cataloging'
+
+  # ============================================================================
+  # LAKE FORMATION CONFIGURATION
+  # ============================================================================
+  
+  # Lake Formation Data Lake Settings
+  LakeFormationDataLakeSettings:
+    Type: AWS::LakeFormation::DataLakeSettings
+    Properties:
+      Admins:
+        - DataLakePrincipalIdentifier: !GetAtt DataLakeAdminRole.Arn
+      CreateDatabaseDefaultPermissions: []
+      CreateTableDefaultPermissions: []
+      TrustedResourceOwners:
+        - !Ref 'AWS::AccountId'
+      AllowExternalDataFiltering: true
+      ExternalDataFilteringAllowList:
+        - DataLakePrincipalIdentifier: !Ref 'AWS::AccountId'
+      AllowFullTableExternalDataAccess: !If [EnableCrossAccountSharingCondition, true, false]
+
+  # Register S3 locations with Lake Formation
+  RawDataBucketRegistration:
+    Type: AWS::LakeFormation::Resource
+    Properties:
+      ResourceArn: !GetAtt RawDataBucket.Arn
+      UseServiceLinkedRole: true
+      WithFederation: false
+
+  ProcessedDataBucketRegistration:
+    Type: AWS::LakeFormation::Resource
+    Properties:
+      ResourceArn: !GetAtt ProcessedDataBucket.Arn
+      UseServiceLinkedRole: true
+      WithFederation: false
+
+  CuratedDataBucketRegistration:
+    Type: AWS::LakeFormation::Resource
+    Properties:
+      ResourceArn: !GetAtt CuratedDataBucket.Arn
+      UseServiceLinkedRole: true
+      WithFederation: false
+
+  # Lake Formation Tags for governance
+  DepartmentLFTag:
+    Type: AWS::LakeFormation::Tag
+    Properties:
+      TagKey: 'Department'
+      TagValues:
+        - 'Sales'
+        - 'Marketing'
+        - 'Finance'
+        - 'Engineering'
+        - 'Operations'
+
+  ClassificationLFTag:
+    Type: AWS::LakeFormation::Tag
+    Properties:
+      TagKey: 'Classification'
+      TagValues:
+        - 'Public'
+        - 'Internal'
+        - 'Confidential'
+        - 'Restricted'
+
+  DataZoneLFTag:
+    Type: AWS::LakeFormation::Tag
+    Properties:
+      TagKey: 'DataZone'
+      TagValues:
+        - 'Raw'
+        - 'Processed'
+        - 'Curated'
+
+  AccessLevelLFTag:
+    Type: AWS::LakeFormation::Tag
+    Properties:
+      TagKey: 'AccessLevel'
+      TagValues:
+        - 'ReadOnly'
+        - 'ReadWrite'
+        - 'Admin'
+
+  # Lake Formation Permissions for Data Engineer
+  DataEngineerDatabasePermissions:
+    Type: AWS::LakeFormation::Permissions
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt DataEngineerRole.Arn
+      Resource:
+        DatabaseResource:
+          Name: !Ref GlueDatabase
+      Permissions:
+        - 'CREATE_TABLE'
+        - 'ALTER'
+        - 'DROP'
+        - 'DESCRIBE'
+      PermissionsWithGrantOption: []
+
+  # Lake Formation Permissions for Data Analyst
+  DataAnalystDatabasePermissions:
+    Type: AWS::LakeFormation::Permissions
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt DataAnalystRole.Arn
+      Resource:
+        DatabaseResource:
+          Name: !Ref GlueDatabase
+      Permissions:
+        - 'DESCRIBE'
+      PermissionsWithGrantOption: []
+
+  # Tag-based permissions for Department access
+  DepartmentTagPermissions:
+    Type: AWS::LakeFormation::Permissions
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt DataAnalystRole.Arn
+      Resource:
+        LFTagResource:
+          TagKey: 'Department'
+          TagValues:
+            - 'Sales'
+            - 'Marketing'
+      Permissions:
+        - 'DESCRIBE'
+        - 'SELECT'
+      PermissionsWithGrantOption: []
+
+  # Tag-based permissions for Classification access
+  ClassificationTagPermissions:
+    Type: AWS::LakeFormation::Permissions
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt DataAnalystRole.Arn
+      Resource:
+        LFTagResource:
+          TagKey: 'Classification'
+          TagValues:
+            - 'Internal'
+            - 'Public'
+      Permissions:
+        - 'DESCRIBE'
+        - 'SELECT'
+      PermissionsWithGrantOption: []
+
+  # ============================================================================
+  # CLOUDTRAIL FOR AUDIT LOGGING
+  # ============================================================================
+  
+  # CloudTrail for Lake Formation audit logging
+  LakeFormationAuditTrail:
+    Type: AWS::CloudTrail::Trail
+    Condition: EnableAuditLoggingCondition
+    Properties:
+      TrailName: !Sub '${DataLakeName}-audit-trail-${Environment}'
+      S3BucketName: !Ref AccessLogsBucket
+      S3KeyPrefix: 'cloudtrail-logs/'
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      KMSKeyId: !GetAtt DataLakeKMSKey.Arn
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: 'AWS::S3::Object'
+              Values:
+                - !Sub '${RawDataBucket}/*'
+                - !Sub '${ProcessedDataBucket}/*'
+                - !Sub '${CuratedDataBucket}/*'
+            - Type: 'AWS::LakeFormation::Table'
+              Values:
+                - '*'
+      CloudWatchLogsLogGroupArn: !Sub '${LakeFormationAuditLogGroup.Arn}:*'
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailLogsRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${DataLakeName}-audit-trail'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Lake Formation audit logging'
+
+  # CloudTrail Logs Role
+  CloudTrailLogsRole:
+    Type: AWS::IAM::Role
+    Condition: EnableAuditLoggingCondition
+    Properties:
+      RoleName: !Sub '${DataLakeName}-CloudTrailLogsRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudTrailLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub '${LakeFormationAuditLogGroup.Arn}:*'
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:CreateGrant
+                  - kms:DescribeKey
+                Resource: !GetAtt DataLakeKMSKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${DataLakeName}-CloudTrailLogsRole'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'CloudTrail logging to CloudWatch'
+
+  # ============================================================================
+  # ATHENA WORKGROUP FOR ANALYTICS
+  # ============================================================================
+  
+  # Athena Workgroup for data lake queries
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub '${DataLakeName}-workgroup-${Environment}'
+      Description: !Sub 'Athena workgroup for ${DataLakeName} analytics'
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${CuratedDataBucket}/athena-results/'
+          EncryptionConfiguration:
+            EncryptionOption: SSE_KMS
+            KmsKey: !GetAtt DataLakeKMSKey.Arn
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetrics: true
+        BytesScannedCutoffPerQuery: 1000000000  # 1GB limit
+        RequesterPaysEnabled: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${DataLakeName}-workgroup'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Data lake analytics queries'
+
+  # ============================================================================
+  # LAMBDA FUNCTION FOR SAMPLE DATA CREATION
+  # ============================================================================
+  
+  # Lambda execution role
+  SampleDataLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: CreateSampleDataCondition
+    Properties:
+      RoleName: !Sub '${DataLakeName}-SampleDataLambdaRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3WriteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource:
+                  - !Sub '${RawDataBucket}/*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt DataLakeKMSKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${DataLakeName}-SampleDataLambdaRole'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Sample data creation'
+
+  # Lambda function to create sample data
+  SampleDataFunction:
+    Type: AWS::Lambda::Function
+    Condition: CreateSampleDataCondition
+    Properties:
+      FunctionName: !Sub '${DataLakeName}-create-sample-data-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt SampleDataLambdaRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          RAW_BUCKET: !Ref RawDataBucket
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import csv
+          import io
+          from datetime import datetime, timedelta
+          import random
+          import uuid
+          
+          def lambda_handler(event, context):
+              s3 = boto3.client('s3')
+              bucket = event.get('bucket') or context.function_name.split('-')[0] + '-raw'
+              
+              # Generate sample sales data
+              sales_data = []
+              base_date = datetime.now() - timedelta(days=30)
+              
+              for i in range(100):
+                  sales_data.append({
+                      'customer_id': f'CUST{1000 + i % 50}',
+                      'product_id': f'PROD{random.randint(1, 10):03d}',
+                      'order_date': (base_date + timedelta(days=random.randint(0, 30))).strftime('%Y-%m-%d'),
+                      'quantity': random.randint(1, 5),
+                      'price': round(random.uniform(10.0, 500.0), 2),
+                      'region': random.choice(['North', 'South', 'East', 'West']),
+                      'sales_rep': random.choice(['John Smith', 'Jane Doe', 'Bob Johnson', 'Alice Brown'])
+                  })
+              
+              # Write sales data to S3
+              sales_csv = io.StringIO()
+              writer = csv.DictWriter(sales_csv, fieldnames=sales_data[0].keys())
+              writer.writeheader()
+              writer.writerows(sales_data)
+              
+              s3.put_object(
+                  Bucket=bucket,
+                  Key='sales/sales_data.csv',
+                  Body=sales_csv.getvalue(),
+                  ContentType='text/csv'
+              )
+              
+              # Generate sample customer data
+              customer_data = []
+              first_names = ['Michael', 'Sarah', 'Robert', 'Jennifer', 'William', 'Lisa', 'David', 'Susan']
+              last_names = ['Johnson', 'Davis', 'Wilson', 'Brown', 'Jones', 'Garcia', 'Miller', 'Anderson']
+              
+              for i in range(50):
+                  customer_data.append({
+                      'customer_id': f'CUST{1000 + i}',
+                      'first_name': random.choice(first_names),
+                      'last_name': random.choice(last_names),
+                      'email': f'customer{i}@example.com',
+                      'phone': f'555-{random.randint(1000, 9999)}',
+                      'registration_date': (base_date + timedelta(days=random.randint(-365, 0))).strftime('%Y-%m-%d')
+                  })
+              
+              # Write customer data to S3
+              customer_csv = io.StringIO()
+              writer = csv.DictWriter(customer_csv, fieldnames=customer_data[0].keys())
+              writer.writeheader()
+              writer.writerows(customer_data)
+              
+              s3.put_object(
+                  Bucket=bucket,
+                  Key='customers/customer_data.csv',
+                  Body=customer_csv.getvalue(),
+                  ContentType='text/csv'
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': 'Sample data created successfully',
+                      'sales_records': len(sales_data),
+                      'customer_records': len(customer_data)
+                  })
+              }
+      Tags:
+        - Key: Name
+          Value: !Sub '${DataLakeName}-create-sample-data'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Sample data creation'
+
+  # Custom resource to trigger sample data creation
+  SampleDataCreation:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: CreateSampleDataCondition
+    Properties:
+      ServiceToken: !GetAtt SampleDataFunction.Arn
+      bucket: !Ref RawDataBucket
+      environment: !Ref Environment
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+
+Outputs:
+  DataLakeName:
+    Description: 'Name of the data lake'
+    Value: !Ref DataLakeName
+    Export:
+      Name: !Sub '${AWS::StackName}-DataLakeName'
+
+  RawDataBucket:
+    Description: 'S3 bucket for raw data storage'
+    Value: !Ref RawDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-RawDataBucket'
+
+  ProcessedDataBucket:
+    Description: 'S3 bucket for processed data storage'
+    Value: !Ref ProcessedDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessedDataBucket'
+
+  CuratedDataBucket:
+    Description: 'S3 bucket for curated data storage'
+    Value: !Ref CuratedDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-CuratedDataBucket'
+
+  AccessLogsBucket:
+    Description: 'S3 bucket for access logs'
+    Value: !Ref AccessLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AccessLogsBucket'
+
+  GlueDatabase:
+    Description: 'Glue database for data catalog'
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabase'
+
+  DataLakeKMSKey:
+    Description: 'KMS key for data lake encryption'
+    Value: !Ref DataLakeKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-DataLakeKMSKey'
+
+  DataLakeKMSKeyAlias:
+    Description: 'KMS key alias for data lake encryption'
+    Value: !Ref DataLakeKMSKeyAlias
+    Export:
+      Name: !Sub '${AWS::StackName}-DataLakeKMSKeyAlias'
+
+  LakeFormationServiceRole:
+    Description: 'IAM role for Lake Formation service'
+    Value: !GetAtt LakeFormationServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LakeFormationServiceRole'
+
+  GlueCrawlerRole:
+    Description: 'IAM role for Glue crawlers'
+    Value: !GetAtt GlueCrawlerRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueCrawlerRole'
+
+  DataEngineerRole:
+    Description: 'IAM role for data engineers'
+    Value: !GetAtt DataEngineerRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataEngineerRole'
+
+  DataAnalystRole:
+    Description: 'IAM role for data analysts'
+    Value: !GetAtt DataAnalystRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataAnalystRole'
+
+  DataLakeAdminRole:
+    Description: 'IAM role for data lake administrators'
+    Value: !GetAtt DataLakeAdminRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataLakeAdminRole'
+
+  SalesDataCrawler:
+    Description: 'Glue crawler for sales data'
+    Value: !If [CreateSampleDataCondition, !Ref SalesDataCrawler, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-SalesDataCrawler'
+
+  CustomerDataCrawler:
+    Description: 'Glue crawler for customer data'
+    Value: !If [CreateSampleDataCondition, !Ref CustomerDataCrawler, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomerDataCrawler'
+
+  AthenaWorkgroup:
+    Description: 'Athena workgroup for analytics'
+    Value: !Ref AthenaWorkgroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaWorkgroup'
+
+  DataLakeLogGroup:
+    Description: 'CloudWatch log group for data lake operations'
+    Value: !Ref DataLakeLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-DataLakeLogGroup'
+
+  LakeFormationAuditLogGroup:
+    Description: 'CloudWatch log group for Lake Formation audit logs'
+    Value: !If [EnableAuditLoggingCondition, !Ref LakeFormationAuditLogGroup, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-LakeFormationAuditLogGroup'
+
+  LakeFormationAuditTrail:
+    Description: 'CloudTrail for Lake Formation audit logging'
+    Value: !If [EnableAuditLoggingCondition, !Ref LakeFormationAuditTrail, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-LakeFormationAuditTrail'
+
+  LakeFormationConsoleURL:
+    Description: 'URL to Lake Formation console'
+    Value: !Sub 'https://console.aws.amazon.com/lakeformation/home?region=${AWS::Region}#databases'
+
+  AthenaConsoleURL:
+    Description: 'URL to Athena console'
+    Value: !Sub 'https://console.aws.amazon.com/athena/home?region=${AWS::Region}#query/workgroup/${AthenaWorkgroup}'
+
+  QuickStartGuide:
+    Description: 'Quick start guide for using the data lake'
+    Value: !Sub |
+      1. Assume the DataLakeAdminRole (${DataLakeAdminRole}) for initial setup
+      2. Use the Glue crawlers to catalog your data: ${SalesDataCrawler} and ${CustomerDataCrawler}
+      3. Configure Lake Formation permissions for your users
+      4. Use Athena workgroup (${AthenaWorkgroup}) for querying data
+      5. Monitor operations via CloudWatch logs (${DataLakeLogGroup})

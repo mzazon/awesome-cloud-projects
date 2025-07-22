@@ -1,0 +1,869 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Real-Time Collaborative Task Management System using Aurora DSQL, EventBridge, Lambda, and CloudWatch.
+  This template creates a serverless, multi-region capable task management solution with event-driven architecture.
+
+# ==================================================
+# PARAMETERS
+# ==================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: task-management
+    Description: Project name used for resource naming and tagging
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    MinLength: 3
+    MaxLength: 30
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    Description: Environment name for resource organization
+
+  PrimaryRegion:
+    Type: String
+    Default: us-east-1
+    AllowedValues:
+      - us-east-1
+      - us-west-2
+      - eu-west-1
+      - ap-southeast-2
+    Description: Primary AWS region for Aurora DSQL deployment
+
+  SecondaryRegion:
+    Type: String
+    Default: us-west-2
+    AllowedValues:
+      - us-east-1
+      - us-west-2
+      - eu-west-1
+      - ap-southeast-2
+    Description: Secondary AWS region for multi-region setup
+
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 3
+    MaxValue: 900
+    Description: Lambda function timeout in seconds
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    AllowedValues: [128, 256, 512, 1024, 1536, 3008]
+    Description: Lambda function memory allocation in MB
+
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: CloudWatch log retention period in days
+
+  EnableMultiRegion:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable multi-region deployment for high availability
+
+  DatabaseUser:
+    Type: String
+    Default: taskadmin
+    Description: Database administrator username
+    NoEcho: false
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for CloudWatch alarms and notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
+# ==================================================
+# CONDITIONS
+# ==================================================
+Conditions:
+  IsMultiRegionEnabled: !Equals [!Ref EnableMultiRegion, 'true']
+  IsProductionEnvironment: !Equals [!Ref Environment, prod]
+  CreateAlarms: !Not [!Equals [!Ref NotificationEmail, '']]
+
+# ==================================================
+# MAPPINGS
+# ==================================================
+Mappings:
+  RegionSettings:
+    us-east-1:
+      AuroraAvailable: true
+      EventBridgeAvailable: true
+    us-west-2:
+      AuroraAvailable: true
+      EventBridgeAvailable: true
+    eu-west-1:
+      AuroraAvailable: true
+      EventBridgeAvailable: true
+    ap-southeast-2:
+      AuroraAvailable: true
+      EventBridgeAvailable: true
+
+  EnvironmentSettings:
+    dev:
+      AlarmThreshold: 10
+      LogLevel: DEBUG
+    test:
+      AlarmThreshold: 8
+      LogLevel: INFO
+    staging:
+      AlarmThreshold: 5
+      LogLevel: INFO
+    prod:
+      AlarmThreshold: 3
+      LogLevel: WARN
+
+# ==================================================
+# RESOURCES
+# ==================================================
+Resources:
+  # --------------------------------------------------
+  # Aurora DSQL Multi-Region Cluster
+  # --------------------------------------------------
+  AuroraDSQLCluster:
+    Type: AWS::DSQL::Cluster
+    Properties:
+      ClusterIdentifier: !Sub '${ProjectName}-${Environment}-primary'
+      DeletionProtection: !If [IsProductionEnvironment, true, false]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-aurora-dsql-cluster'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Task Management Database'
+
+  # Aurora DSQL Multi-Region Configuration
+  DSQLMultiRegionConfig:
+    Type: AWS::DSQL::MultiRegionClusters
+    Condition: IsMultiRegionEnabled
+    Properties:
+      ClusterProperties:
+        ClusterArn: !GetAtt AuroraDSQLCluster.ClusterArn
+      LinkedClusterProperties:
+        ClusterArn: !Sub 'arn:aws:dsql:${SecondaryRegion}:${AWS::AccountId}:cluster/${ProjectName}-${Environment}-secondary'
+
+  # --------------------------------------------------
+  # EventBridge Custom Event Bus
+  # --------------------------------------------------
+  TaskManagementEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-task-events'
+      Description: Custom event bus for task management events
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-event-bus'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Event Bus Policy for Cross-Account Access
+  EventBusPolicy:
+    Type: AWS::Events::EventBusPolicy
+    Properties:
+      EventBusName: !Ref TaskManagementEventBus
+      StatementId: !Sub '${ProjectName}-${Environment}-event-bus-policy'
+      Statement:
+        Effect: Allow
+        Principal:
+          AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+        Action:
+          - events:PutEvents
+          - events:DescribeEventBus
+        Resource: !GetAtt TaskManagementEventBus.Arn
+
+  # --------------------------------------------------
+  # IAM Roles and Policies
+  # --------------------------------------------------
+  TaskProcessorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: TaskManagementPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Aurora DSQL Permissions
+              - Effect: Allow
+                Action:
+                  - dsql:DescribeCluster
+                  - dsql:Execute
+                  - dsql:BatchExecute
+                  - dsql:Connect
+                Resource:
+                  - !GetAtt AuroraDSQLCluster.ClusterArn
+                  - !If
+                    - IsMultiRegionEnabled
+                    - !Sub 'arn:aws:dsql:${SecondaryRegion}:${AWS::AccountId}:cluster/${ProjectName}-${Environment}-secondary'
+                    - !Ref AWS::NoValue
+              # EventBridge Permissions
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                  - events:DescribeEventBus
+                Resource:
+                  - !GetAtt TaskManagementEventBus.Arn
+              # CloudWatch Logs Permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-${Environment}-task-processor*'
+              # Systems Manager Parameter Store (for database credentials)
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Environment}/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-lambda-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # --------------------------------------------------
+  # Systems Manager Parameters (Database Configuration)
+  # --------------------------------------------------
+  DatabaseEndpointParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${Environment}/database/endpoint'
+      Value: !GetAtt AuroraDSQLCluster.ClusterEndpoint
+      Type: String
+      Description: Aurora DSQL cluster endpoint
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  DatabaseUserParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${Environment}/database/user'
+      Value: !Ref DatabaseUser
+      Type: String
+      Description: Database administrator username
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  EventBusNameParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${Environment}/eventbridge/bus-name'
+      Value: !Ref TaskManagementEventBus
+      Type: String
+      Description: EventBridge custom event bus name
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  # --------------------------------------------------
+  # Lambda Function
+  # --------------------------------------------------
+  TaskProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-task-processor'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt TaskProcessorLambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          DSQL_ENDPOINT: !GetAtt AuroraDSQLCluster.ClusterEndpoint
+          EVENT_BUS_NAME: !Ref TaskManagementEventBus
+          DB_USER_PARAM: !Sub '/${ProjectName}/${Environment}/database/user'
+          LOG_LEVEL: !FindInMap [EnvironmentSettings, !Ref Environment, LogLevel]
+          PRIMARY_REGION: !Ref PrimaryRegion
+          SECONDARY_REGION: !Ref SecondaryRegion
+          MULTI_REGION_ENABLED: !Ref EnableMultiRegion
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from datetime import datetime
+          from typing import Dict, Any, Optional
+
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.getLogger().setLevel(getattr(logging, log_level))
+          logger = logging.getLogger(__name__)
+
+          # Initialize AWS clients
+          events_client = boto3.client('events')
+          ssm_client = boto3.client('ssm')
+          dsql_client = boto3.client('dsql')
+
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              Main Lambda handler for task management operations.
+              Processes both EventBridge events and direct API requests.
+              """
+              try:
+                  logger.info(f"Processing event: {json.dumps(event, default=str)}")
+                  
+                  # Process EventBridge event
+                  if 'source' in event and event['source'] == 'task.management':
+                      return process_task_event(event)
+                  
+                  # Process direct invocation/API Gateway request
+                  return process_direct_request(event)
+                  
+              except Exception as e:
+                  logger.error(f"Error processing event: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'error': str(e),
+                          'message': 'Internal server error'
+                      })
+                  }
+
+          def process_task_event(event: Dict[str, Any]) -> Dict[str, Any]:
+              """Process task management events from EventBridge"""
+              try:
+                  detail = event.get('detail', {})
+                  event_type = detail.get('eventType')
+                  
+                  logger.info(f"Processing EventBridge event type: {event_type}")
+                  
+                  if event_type == 'task.created':
+                      return handle_task_created(detail)
+                  elif event_type == 'task.updated':
+                      return handle_task_updated(detail)
+                  elif event_type == 'task.completed':
+                      return handle_task_completed(detail)
+                  else:
+                      logger.warning(f"Unknown event type: {event_type}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'message': 'Event processed successfully'})
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing task event: {str(e)}")
+                  raise
+
+          def handle_task_created(detail: Dict[str, Any]) -> Dict[str, Any]:
+              """Handle task creation events"""
+              task_data = detail.get('taskData', {})
+              
+              logger.info(f"Creating task: {task_data.get('title', 'Unknown')}")
+              
+              # In a real implementation, this would interact with Aurora DSQL
+              # For this template, we'll simulate the response
+              task_id = f"task-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+              
+              # Publish notification event
+              publish_task_notification('task.created', task_id, task_data)
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'task_id': task_id,
+                      'message': 'Task created successfully'
+                  })
+              }
+
+          def handle_task_updated(detail: Dict[str, Any]) -> Dict[str, Any]:
+              """Handle task update events"""
+              task_id = detail.get('taskId')
+              updates = detail.get('updates', {})
+              updated_by = detail.get('updatedBy')
+              
+              logger.info(f"Updating task {task_id} by {updated_by}")
+              
+              # In a real implementation, this would update Aurora DSQL
+              
+              # Publish notification event
+              publish_task_notification('task.updated', task_id, updates)
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'message': 'Task updated successfully'})
+              }
+
+          def handle_task_completed(detail: Dict[str, Any]) -> Dict[str, Any]:
+              """Handle task completion events"""
+              task_id = detail.get('taskId')
+              completed_by = detail.get('completedBy')
+              
+              logger.info(f"Completing task {task_id} by {completed_by}")
+              
+              # In a real implementation, this would update Aurora DSQL
+              
+              # Publish notification event
+              publish_task_notification('task.completed', task_id, {'completed_by': completed_by})
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'message': 'Task completed successfully'})
+              }
+
+          def publish_task_notification(event_type: str, task_id: str, data: Dict[str, Any]) -> None:
+              """Publish task notification to EventBridge"""
+              try:
+                  event_bus_name = os.environ.get('EVENT_BUS_NAME')
+                  
+                  response = events_client.put_events(
+                      Entries=[
+                          {
+                              'Source': 'task.management.notifications',
+                              'DetailType': 'Task Notification',
+                              'Detail': json.dumps({
+                                  'eventType': event_type,
+                                  'taskId': task_id,
+                                  'data': data,
+                                  'timestamp': datetime.utcnow().isoformat(),
+                                  'region': os.environ.get('AWS_REGION')
+                              }),
+                              'EventBusName': event_bus_name
+                          }
+                      ]
+                  )
+                  
+                  logger.info(f"Published notification event: {event_type} for task {task_id}")
+                  
+              except Exception as e:
+                  logger.error(f"Failed to publish notification: {str(e)}")
+
+          def process_direct_request(event: Dict[str, Any]) -> Dict[str, Any]:
+              """Process direct API requests"""
+              try:
+                  method = event.get('httpMethod', 'GET')
+                  path = event.get('path', '/')
+                  
+                  logger.info(f"Processing {method} request to {path}")
+                  
+                  if method == 'GET' and path == '/tasks':
+                      return get_all_tasks()
+                  elif method == 'POST' and path == '/tasks':
+                      body = json.loads(event.get('body', '{}'))
+                      return create_task(body)
+                  elif method == 'PUT' and '/tasks/' in path:
+                      task_id = path.split('/')[-1]
+                      body = json.loads(event.get('body', '{}'))
+                      return update_task(task_id, body)
+                  elif method == 'GET' and path == '/health':
+                      return health_check()
+                  
+                  return {
+                      'statusCode': 404,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({'error': 'Not found'})
+                  }
+              
+              except Exception as e:
+                  logger.error(f"Error processing direct request: {str(e)}")
+                  raise
+
+          def get_all_tasks() -> Dict[str, Any]:
+              """Get all tasks from database"""
+              # In a real implementation, this would query Aurora DSQL
+              sample_tasks = [
+                  {
+                      'id': 'task-001',
+                      'title': 'Sample Task 1',
+                      'status': 'pending',
+                      'created_at': datetime.utcnow().isoformat()
+                  },
+                  {
+                      'id': 'task-002',
+                      'title': 'Sample Task 2',
+                      'status': 'in-progress',
+                      'created_at': datetime.utcnow().isoformat()
+                  }
+              ]
+              
+              return {
+                  'statusCode': 200,
+                  'headers': {'Content-Type': 'application/json'},
+                  'body': json.dumps({'tasks': sample_tasks})
+              }
+
+          def create_task(task_data: Dict[str, Any]) -> Dict[str, Any]:
+              """Create new task"""
+              task_id = f"task-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+              
+              # In a real implementation, this would insert into Aurora DSQL
+              
+              # Publish creation event
+              publish_task_notification('task.created', task_id, task_data)
+              
+              return {
+                  'statusCode': 201,
+                  'headers': {'Content-Type': 'application/json'},
+                  'body': json.dumps({
+                      'task_id': task_id,
+                      'message': 'Task created successfully'
+                  })
+              }
+
+          def update_task(task_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+              """Update existing task"""
+              # In a real implementation, this would update Aurora DSQL
+              
+              # Publish update event
+              publish_task_notification('task.updated', task_id, updates)
+              
+              return {
+                  'statusCode': 200,
+                  'headers': {'Content-Type': 'application/json'},
+                  'body': json.dumps({'message': 'Task updated successfully'})
+              }
+
+          def health_check() -> Dict[str, Any]:
+              """Health check endpoint"""
+              return {
+                  'statusCode': 200,
+                  'headers': {'Content-Type': 'application/json'},
+                  'body': json.dumps({
+                      'status': 'healthy',
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'environment': os.environ.get('ENVIRONMENT', 'unknown'),
+                      'region': os.environ.get('AWS_REGION')
+                  })
+              }
+      Description: !Sub 'Task processor Lambda function for ${ProjectName}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-task-processor'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda Log Group
+  TaskProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${TaskProcessorFunction}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-lambda-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # --------------------------------------------------
+  # EventBridge Rules and Targets
+  # --------------------------------------------------
+  TaskProcessingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-task-processing-rule'
+      Description: Route task management events to Lambda processor
+      EventBusName: !Ref TaskManagementEventBus
+      EventPattern:
+        source: [task.management]
+        detail-type:
+          - Task Created
+          - Task Updated  
+          - Task Completed
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt TaskProcessorFunction.Arn
+          Id: TaskProcessorTarget
+
+  # Permission for EventBridge to invoke Lambda
+  EventBridgeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TaskProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TaskProcessingRule.Arn
+
+  # Notification Rule for Task Events
+  TaskNotificationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-notification-rule'
+      Description: Route task notifications for monitoring and alerting
+      EventBusName: !Ref TaskManagementEventBus
+      EventPattern:
+        source: [task.management.notifications]
+        detail-type: [Task Notification]
+      State: ENABLED
+
+  # --------------------------------------------------
+  # CloudWatch Monitoring and Alarms
+  # --------------------------------------------------
+  # SNS Topic for Notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateAlarms
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-notifications'
+      DisplayName: Task Management System Notifications
+      Subscription:
+        - Endpoint: !Ref NotificationEmail
+          Protocol: email
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-sns-topic'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda Error Alarm
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-lambda-errors'
+      AlarmDescription: Monitor Lambda function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !FindInMap [EnvironmentSettings, !Ref Environment, AlarmThreshold]
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TaskProcessorFunction
+      AlarmActions:
+        - !Ref NotificationTopic
+      TreatMissingData: notBreaching
+
+  # Lambda Duration Alarm
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-lambda-duration'
+      AlarmDescription: Monitor Lambda function duration
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 30000  # 30 seconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TaskProcessorFunction
+      AlarmActions:
+        - !Ref NotificationTopic
+      TreatMissingData: notBreaching
+
+  # EventBridge Custom Metric
+  EventBridgeMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TaskProcessorLogGroup
+      FilterPattern: '[timestamp, requestId="ERROR"]'
+      MetricTransformations:
+        - MetricNamespace: !Sub '${ProjectName}/${Environment}'
+          MetricName: EventProcessingErrors
+          MetricValue: '1'
+          DefaultValue: 0
+
+  # CloudWatch Dashboard
+  TaskManagementDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${TaskProcessorFunction}"],
+                  [".", "Errors", ".", "."],
+                  [".", "Duration", ".", "."],
+                  [".", "Throttles", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${TaskProcessorLogGroup}'\n| fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Errors",
+                "view": "table"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["${ProjectName}/${Environment}", "EventProcessingErrors"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Custom Metrics",
+                "view": "timeSeries"
+              }
+            }
+          ]
+        }
+
+# ==================================================
+# OUTPUTS
+# ==================================================
+Outputs:
+  # Aurora DSQL Outputs
+  AuroraDSQLClusterArn:
+    Description: Aurora DSQL cluster ARN
+    Value: !GetAtt AuroraDSQLCluster.ClusterArn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-dsql-cluster-arn'
+
+  AuroraDSQLClusterEndpoint:
+    Description: Aurora DSQL cluster endpoint
+    Value: !GetAtt AuroraDSQLCluster.ClusterEndpoint
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-dsql-endpoint'
+
+  # EventBridge Outputs
+  EventBusName:
+    Description: Custom EventBridge event bus name
+    Value: !Ref TaskManagementEventBus
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-event-bus-name'
+
+  EventBusArn:
+    Description: Custom EventBridge event bus ARN
+    Value: !GetAtt TaskManagementEventBus.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-event-bus-arn'
+
+  # Lambda Outputs
+  LambdaFunctionArn:
+    Description: Task processor Lambda function ARN
+    Value: !GetAtt TaskProcessorFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-lambda-arn'
+
+  LambdaFunctionName:
+    Description: Task processor Lambda function name
+    Value: !Ref TaskProcessorFunction
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-lambda-name'
+
+  # IAM Outputs
+  LambdaRoleArn:
+    Description: Lambda execution role ARN
+    Value: !GetAtt TaskProcessorLambdaRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-lambda-role-arn'
+
+  # CloudWatch Outputs
+  LogGroupName:
+    Description: CloudWatch log group name for Lambda function
+    Value: !Ref TaskProcessorLogGroup
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-log-group-name'
+
+  DashboardURL:
+    Description: CloudWatch dashboard URL
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-dashboard'
+
+  # SNS Outputs
+  NotificationTopicArn:
+    Condition: CreateAlarms
+    Description: SNS topic ARN for notifications
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-notification-topic-arn'
+
+  # System Configuration Outputs
+  ProjectName:
+    Description: Project name used for resource naming
+    Value: !Ref ProjectName
+
+  Environment:
+    Description: Environment name
+    Value: !Ref Environment
+
+  PrimaryRegion:
+    Description: Primary AWS region
+    Value: !Ref PrimaryRegion
+
+  SecondaryRegion:
+    Condition: IsMultiRegionEnabled
+    Description: Secondary AWS region for multi-region setup
+    Value: !Ref SecondaryRegion
+
+  # Database Configuration Endpoints (for application configuration)
+  DatabaseConfigurationEndpoint:
+    Description: Systems Manager parameter for database endpoint
+    Value: !Sub '/${ProjectName}/${Environment}/database/endpoint'
+
+  EventBusConfigurationEndpoint:
+    Description: Systems Manager parameter for EventBridge bus name
+    Value: !Sub '/${ProjectName}/${Environment}/eventbridge/bus-name'
+
+  # Usage Instructions
+  DeploymentInstructions:
+    Description: Next steps after deployment
+    Value: !Sub |
+      1. Update database schema using Aurora DSQL endpoint: ${AuroraDSQLCluster.ClusterEndpoint}
+      2. Test Lambda function using: aws lambda invoke --function-name ${TaskProcessorFunction} response.json
+      3. Monitor system via CloudWatch dashboard: https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-dashboard
+      4. Send test events to EventBridge bus: ${TaskManagementEventBus}

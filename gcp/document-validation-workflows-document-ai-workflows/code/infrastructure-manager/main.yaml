@@ -1,0 +1,626 @@
+# Infrastructure Manager Configuration for Document Validation Workflows
+# This configuration creates a complete document processing pipeline using:
+# - Document AI processors for intelligent document extraction
+# - Cloud Workflows for orchestration and validation logic
+# - Eventarc for event-driven automation
+# - Cloud Storage for document routing and staging
+# - BigQuery for analytics and monitoring
+
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: config.cloud.google.com/v1
+kind: ConfigConnector
+metadata:
+  name: document-validation-workflows
+spec:
+  # Project configuration
+  project: ${PROJECT_ID}
+  location: ${REGION}
+  
+  # Variables for customization
+  variables:
+    project_id:
+      description: "Google Cloud Project ID"
+      type: string
+    region:
+      description: "Google Cloud region for resources"
+      type: string
+      default: "us-central1"
+    random_suffix:
+      description: "Random suffix for resource names"
+      type: string
+      default: "$(shell openssl rand -hex 3)"
+    confidence_threshold:
+      description: "Confidence threshold for document validation"
+      type: number
+      default: 0.8
+
+  # Resources definition
+  resources:
+    # Enable required Google Cloud APIs
+    - name: documentai-api
+      type: gcp-types/serviceusage-v1:projects.services
+      properties:
+        name: projects/${PROJECT_ID}/services/documentai.googleapis.com
+        consumerId: projects/${PROJECT_ID}
+      metadata:
+        runtimePolicy:
+          - UPDATE_ALWAYS
+
+    - name: workflows-api
+      type: gcp-types/serviceusage-v1:projects.services
+      properties:
+        name: projects/${PROJECT_ID}/services/workflows.googleapis.com
+        consumerId: projects/${PROJECT_ID}
+      metadata:
+        runtimePolicy:
+          - UPDATE_ALWAYS
+
+    - name: storage-api
+      type: gcp-types/serviceusage-v1:projects.services
+      properties:
+        name: projects/${PROJECT_ID}/services/storage.googleapis.com
+        consumerId: projects/${PROJECT_ID}
+      metadata:
+        runtimePolicy:
+          - UPDATE_ALWAYS
+
+    - name: eventarc-api
+      type: gcp-types/serviceusage-v1:projects.services
+      properties:
+        name: projects/${PROJECT_ID}/services/eventarc.googleapis.com
+        consumerId: projects/${PROJECT_ID}
+      metadata:
+        runtimePolicy:
+          - UPDATE_ALWAYS
+
+    - name: bigquery-api
+      type: gcp-types/serviceusage-v1:projects.services
+      properties:
+        name: projects/${PROJECT_ID}/services/bigquery.googleapis.com
+        consumerId: projects/${PROJECT_ID}
+      metadata:
+        runtimePolicy:
+          - UPDATE_ALWAYS
+
+    - name: cloudbuild-api
+      type: gcp-types/serviceusage-v1:projects.services
+      properties:
+        name: projects/${PROJECT_ID}/services/cloudbuild.googleapis.com
+        consumerId: projects/${PROJECT_ID}
+      metadata:
+        runtimePolicy:
+          - UPDATE_ALWAYS
+
+    # Cloud Storage buckets for document processing pipeline
+    - name: input-bucket
+      type: gcp-types/storage-v1:bucket
+      properties:
+        name: doc-input-${random_suffix}
+        location: ${region}
+        storageClass: STANDARD
+        uniformBucketLevelAccess:
+          enabled: true
+        versioning:
+          enabled: false
+        lifecycle:
+          rule:
+            - action:
+                type: Delete
+              condition:
+                age: 30  # Delete objects older than 30 days
+        labels:
+          purpose: document-input
+          environment: production
+          managed-by: infrastructure-manager
+      metadata:
+        dependsOn:
+          - storage-api
+
+    - name: valid-bucket
+      type: gcp-types/storage-v1:bucket
+      properties:
+        name: doc-valid-${random_suffix}
+        location: ${region}
+        storageClass: STANDARD
+        uniformBucketLevelAccess:
+          enabled: true
+        versioning:
+          enabled: true
+        lifecycle:
+          rule:
+            - action:
+                type: Delete
+              condition:
+                age: 365  # Keep valid documents for 1 year
+        labels:
+          purpose: document-valid
+          environment: production
+          managed-by: infrastructure-manager
+      metadata:
+        dependsOn:
+          - storage-api
+
+    - name: invalid-bucket
+      type: gcp-types/storage-v1:bucket
+      properties:
+        name: doc-invalid-${random_suffix}
+        location: ${region}
+        storageClass: STANDARD
+        uniformBucketLevelAccess:
+          enabled: true
+        versioning:
+          enabled: true
+        lifecycle:
+          rule:
+            - action:
+                type: Delete
+              condition:
+                age: 90  # Keep invalid documents for 90 days for review
+        labels:
+          purpose: document-invalid
+          environment: production
+          managed-by: infrastructure-manager
+      metadata:
+        dependsOn:
+          - storage-api
+
+    - name: review-bucket
+      type: gcp-types/storage-v1:bucket
+      properties:
+        name: doc-review-${random_suffix}
+        location: ${region}
+        storageClass: STANDARD
+        uniformBucketLevelAccess:
+          enabled: true
+        versioning:
+          enabled: true
+        lifecycle:
+          rule:
+            - action:
+                type: Delete
+              condition:
+                age: 180  # Keep review documents for 6 months
+        labels:
+          purpose: document-review
+          environment: production
+          managed-by: infrastructure-manager
+      metadata:
+        dependsOn:
+          - storage-api
+
+    # Document AI processors for intelligent document extraction
+    - name: form-processor
+      type: gcp-types/documentai-v1:projects.locations.processors
+      properties:
+        parent: projects/${PROJECT_ID}/locations/${region}
+        displayName: form-processor-${random_suffix}
+        type: FORM_PARSER_PROCESSOR
+        defaultProcessorVersion: 
+          processorVersion: "pretrained-form-parser-v1.0-2020-09-23"
+        processorVersionAliases:
+          - alias: "stable"
+            processorVersion: "pretrained-form-parser-v1.0-2020-09-23"
+      metadata:
+        dependsOn:
+          - documentai-api
+
+    - name: invoice-processor
+      type: gcp-types/documentai-v1:projects.locations.processors
+      properties:
+        parent: projects/${PROJECT_ID}/locations/${region}
+        displayName: invoice-processor-${random_suffix}
+        type: INVOICE_PROCESSOR
+        defaultProcessorVersion:
+          processorVersion: "pretrained-invoice-v1.0-2020-09-23"
+        processorVersionAliases:
+          - alias: "stable"
+            processorVersion: "pretrained-invoice-v1.0-2020-09-23"
+      metadata:
+        dependsOn:
+          - documentai-api
+
+    # BigQuery dataset and table for document analytics
+    - name: document-analytics-dataset
+      type: gcp-types/bigquery-v2:dataset
+      properties:
+        datasetId: document_analytics_${random_suffix}
+        location: ${region}
+        friendlyName: "Document Processing Analytics"
+        description: "Dataset for storing document processing metrics and validation results"
+        defaultTableExpirationMs: 31536000000  # 1 year
+        labels:
+          purpose: analytics
+          environment: production
+          managed-by: infrastructure-manager
+        access:
+          - role: "OWNER"
+            userByEmail: "$(gcloud config get-value account)"
+          - role: "READER"
+            specialGroup: "projectReaders"
+          - role: "WRITER"
+            specialGroup: "projectWriters"
+      metadata:
+        dependsOn:
+          - bigquery-api
+
+    - name: processing-results-table
+      type: gcp-types/bigquery-v2:table
+      properties:
+        datasetId: $(ref.document-analytics-dataset.datasetId)
+        tableId: processing_results
+        friendlyName: "Document Processing Results"
+        description: "Table storing document processing results and validation metrics"
+        schema:
+          fields:
+            - name: document_id
+              type: STRING
+              mode: REQUIRED
+              description: "Unique identifier for the processed document"
+            - name: processor_type
+              type: STRING
+              mode: REQUIRED
+              description: "Type of processor used (form, invoice, general)"
+            - name: processing_time
+              type: TIMESTAMP
+              mode: REQUIRED
+              description: "Timestamp when document was processed"
+            - name: validation_status
+              type: STRING
+              mode: REQUIRED
+              description: "Validation result (valid, invalid, needs_review)"
+            - name: confidence_score
+              type: FLOAT
+              mode: NULLABLE
+              description: "Average confidence score of extracted fields"
+            - name: extracted_fields
+              type: JSON
+              mode: NULLABLE
+              description: "JSON object containing extracted field data"
+            - name: validation_errors
+              type: JSON
+              mode: NULLABLE
+              description: "JSON array of validation errors if any"
+        timePartitioning:
+          type: DAY
+          field: processing_time
+          requirePartitionFilter: false
+        clustering:
+          fields:
+            - validation_status
+            - processor_type
+        labels:
+          purpose: processing-results
+          environment: production
+      metadata:
+        dependsOn:
+          - document-analytics-dataset
+
+    # Service account for Eventarc workflows integration
+    - name: eventarc-workflows-sa
+      type: gcp-types/iam-v1:projects.serviceAccounts
+      properties:
+        accountId: eventarc-workflows-sa
+        displayName: "Eventarc Workflows Service Account"
+        description: "Service account for Eventarc to invoke Cloud Workflows"
+        serviceAccount:
+          displayName: "Eventarc Workflows Service Account"
+          description: "Service account for triggering document processing workflows"
+      metadata:
+        dependsOn:
+          - eventarc-api
+
+    # IAM bindings for Eventarc service account
+    - name: eventarc-sa-workflows-invoker
+      type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+      properties:
+        resource: ${PROJECT_ID}
+        policy:
+          bindings:
+            - role: roles/workflows.invoker
+              members:
+                - serviceAccount:$(ref.eventarc-workflows-sa.email)
+    
+    - name: eventarc-sa-event-receiver
+      type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+      properties:
+        resource: ${PROJECT_ID}
+        policy:
+          bindings:
+            - role: roles/eventarc.eventReceiver
+              members:
+                - serviceAccount:$(ref.eventarc-workflows-sa.email)
+
+    # IAM bindings for Compute Engine default service account (workflow execution)
+    - name: compute-sa-documentai-user
+      type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+      properties:
+        resource: ${PROJECT_ID}
+        policy:
+          bindings:
+            - role: roles/documentai.apiUser
+              members:
+                - serviceAccount:${PROJECT_ID}-compute@developer.gserviceaccount.com
+
+    - name: compute-sa-storage-admin
+      type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+      properties:
+        resource: ${PROJECT_ID}
+        policy:
+          bindings:
+            - role: roles/storage.objectAdmin
+              members:
+                - serviceAccount:${PROJECT_ID}-compute@developer.gserviceaccount.com
+
+    - name: compute-sa-bigquery-editor
+      type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+      properties:
+        resource: ${PROJECT_ID}
+        policy:
+          bindings:
+            - role: roles/bigquery.dataEditor
+              members:
+                - serviceAccount:${PROJECT_ID}-compute@developer.gserviceaccount.com
+
+    - name: compute-sa-bigquery-jobuser
+      type: gcp-types/cloudresourcemanager-v1:projects.iamPolicy
+      properties:
+        resource: ${PROJECT_ID}
+        policy:
+          bindings:
+            - role: roles/bigquery.jobUser
+              members:
+                - serviceAccount:${PROJECT_ID}-compute@developer.gserviceaccount.com
+
+    # Cloud Workflows definition for document processing orchestration
+    - name: document-validation-workflow
+      type: gcp-types/workflows-v1:projects.locations.workflows
+      properties:
+        workflowId: document-validation-workflow
+        parent: projects/${PROJECT_ID}/locations/${region}
+        description: "Intelligent document validation workflow with AI processing and routing"
+        labels:
+          purpose: document-processing
+          environment: production
+          managed-by: infrastructure-manager
+        # Environment variables for workflow configuration
+        callLogLevel: LOG_ALL_CALLS
+        serviceAccount: ${PROJECT_ID}-compute@developer.gserviceaccount.com
+        sourceContents: |
+          main:
+            params: [event]
+            steps:
+              - init:
+                  assign:
+                    - bucket: $${event.data.bucket}
+                    - name: $${event.data.name}
+                    - project_id: $${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+                    - region: "${region}"
+                    - form_processor: "$(ref.form-processor.name)"
+                    - invoice_processor: "$(ref.invoice-processor.name)"
+                    - valid_bucket: "$(ref.valid-bucket.name)"
+                    - invalid_bucket: "$(ref.invalid-bucket.name)"
+                    - review_bucket: "$(ref.review-bucket.name)"
+                    - dataset_name: "$(ref.document-analytics-dataset.datasetId)"
+                    - confidence_threshold: ${confidence_threshold}
+              
+              - log_start:
+                  call: sys.log
+                  args:
+                    text: $${"Starting document processing for: " + name}
+                    severity: INFO
+              
+              - determine_document_type:
+                  switch:
+                    - condition: $${text.match_regex(name, ".*invoice.*|.*bill.*|.*receipt.*")}
+                      assign:
+                        - processor_id: $${invoice_processor}
+                        - document_type: "invoice"
+                      next: process_document
+                    - condition: $${text.match_regex(name, ".*form.*|.*application.*")}
+                      assign:
+                        - processor_id: $${form_processor}
+                        - document_type: "form"
+                      next: process_document
+                  next: default_processing
+              
+              - default_processing:
+                  assign:
+                    - processor_id: $${form_processor}
+                    - document_type: "general"
+              
+              - process_document:
+                  try:
+                    call: googleapis.documentai.v1.projects.locations.processors.process
+                    args:
+                      name: $${processor_id}
+                      body:
+                        rawDocument:
+                          content: $${base64.encode(http.get("gs://" + bucket + "/" + name).body)}
+                          mimeType: "application/pdf"
+                    result: processing_result
+                  except:
+                    as: e
+                    steps:
+                      - log_error:
+                          call: sys.log
+                          args:
+                            text: $${"Document processing failed: " + string(e)}
+                            severity: ERROR
+                      - move_to_invalid:
+                          call: googleapis.storage.v1.objects.copy
+                          args:
+                            sourceBucket: $${bucket}
+                            sourceObject: $${name}
+                            destinationBucket: $${invalid_bucket}
+                            destinationObject: $${name}
+                      - return_error:
+                          return: {"status": "error", "message": "Processing failed"}
+              
+              - validate_extraction:
+                  assign:
+                    - validation_errors: []
+                    - extracted_data: $${processing_result.document.entities}
+                    - total_confidence: 0
+                    - field_count: 0
+              
+              - check_confidence:
+                  for:
+                    value: entity
+                    in: $${extracted_data}
+                    steps:
+                      - evaluate_confidence:
+                          switch:
+                            - condition: $${entity.confidence < confidence_threshold}
+                              steps:
+                                - add_error:
+                                    assign:
+                                      - validation_errors: $${list.concat(validation_errors, [{"field": entity.type, "confidence": entity.confidence, "reason": "Low confidence"}])}
+                      - accumulate_confidence:
+                          assign:
+                            - total_confidence: $${total_confidence + entity.confidence}
+                            - field_count: $${field_count + 1}
+              
+              - calculate_average_confidence:
+                  assign:
+                    - average_confidence: $${if(field_count > 0, total_confidence / field_count, 0.0)}
+              
+              - determine_routing:
+                  switch:
+                    - condition: $${len(validation_errors) == 0}
+                      assign:
+                        - destination_bucket: $${valid_bucket}
+                        - validation_status: "valid"
+                      next: route_document
+                    - condition: $${len(validation_errors) > 0 and len(validation_errors) <= 2}
+                      assign:
+                        - destination_bucket: $${review_bucket}
+                        - validation_status: "needs_review"
+                      next: route_document
+                    - condition: $${len(validation_errors) > 2}
+                      assign:
+                        - destination_bucket: $${invalid_bucket}
+                        - validation_status: "invalid"
+                      next: route_document
+              
+              - route_document:
+                  call: googleapis.storage.v1.objects.copy
+                  args:
+                    sourceBucket: $${bucket}
+                    sourceObject: $${name}
+                    destinationBucket: $${destination_bucket}
+                    destinationObject: $${name}
+              
+              - store_analytics:
+                  call: googleapis.bigquery.v2.tabledata.insertAll
+                  args:
+                    projectId: $${project_id}
+                    datasetId: $${dataset_name}
+                    tableId: "processing_results"
+                    body:
+                      rows:
+                        - json:
+                            document_id: $${name}
+                            processor_type: $${document_type}
+                            processing_time: $${time.now()}
+                            validation_status: $${validation_status}
+                            confidence_score: $${average_confidence}
+                            extracted_fields: $${extracted_data}
+                            validation_errors: $${validation_errors}
+              
+              - cleanup_source:
+                  call: googleapis.storage.v1.objects.delete
+                  args:
+                    bucket: $${bucket}
+                    object: $${name}
+              
+              - log_completion:
+                  call: sys.log
+                  args:
+                    text: $${"Document processing completed: " + name + " -> " + validation_status}
+                    severity: INFO
+              
+              - return_result:
+                  return:
+                    status: "success"
+                    document: $${name}
+                    validation_status: $${validation_status}
+                    processor_used: $${document_type}
+                    validation_errors: $${validation_errors}
+                    confidence_score: $${average_confidence}
+      metadata:
+        dependsOn:
+          - workflows-api
+          - form-processor
+          - invoice-processor
+          - valid-bucket
+          - invalid-bucket
+          - review-bucket
+          - document-analytics-dataset
+          - processing-results-table
+
+    # Eventarc trigger for automatic document processing
+    - name: document-upload-trigger
+      type: gcp-types/eventarc-v1:projects.locations.triggers
+      properties:
+        parent: projects/${PROJECT_ID}/locations/${region}
+        triggerId: document-upload-trigger
+        eventFilters:
+          - attribute: type
+            value: google.cloud.storage.object.v1.finalized
+          - attribute: bucket
+            value: $(ref.input-bucket.name)
+        destination:
+          workflow: $(ref.document-validation-workflow.name)
+        serviceAccount: $(ref.eventarc-workflows-sa.email)
+        labels:
+          purpose: document-processing
+          environment: production
+          managed-by: infrastructure-manager
+      metadata:
+        dependsOn:
+          - eventarc-api
+          - document-validation-workflow
+          - eventarc-workflows-sa
+          - input-bucket
+
+  # Outputs for verification and integration
+  outputs:
+    - name: project_id
+      value: ${PROJECT_ID}
+    - name: region
+      value: ${region}
+    - name: input_bucket_name
+      value: $(ref.input-bucket.name)
+    - name: valid_bucket_name
+      value: $(ref.valid-bucket.name)
+    - name: invalid_bucket_name
+      value: $(ref.invalid-bucket.name)
+    - name: review_bucket_name
+      value: $(ref.review-bucket.name)
+    - name: form_processor_id
+      value: $(ref.form-processor.name)
+    - name: invoice_processor_id
+      value: $(ref.invoice-processor.name)
+    - name: workflow_name
+      value: $(ref.document-validation-workflow.name)
+    - name: bigquery_dataset
+      value: $(ref.document-analytics-dataset.datasetId)
+    - name: eventarc_trigger_name
+      value: $(ref.document-upload-trigger.name)
+    - name: eventarc_service_account
+      value: $(ref.eventarc-workflows-sa.email)
+    - name: confidence_threshold
+      value: ${confidence_threshold}

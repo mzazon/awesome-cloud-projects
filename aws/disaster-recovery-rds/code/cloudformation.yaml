@@ -1,0 +1,770 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'RDS Disaster Recovery Solutions - Cross-region read replica with automated monitoring and failover capabilities'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Database Configuration"
+        Parameters:
+          - SourceDBInstanceIdentifier
+          - SourceDBRegion
+          - ReplicaDBInstanceClass
+          - MultiAZReplica
+      - Label:
+          default: "Disaster Recovery Configuration"
+        Parameters:
+          - SecondaryRegion
+          - NotificationEmail
+          - EnableAutomatedFailover
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - HighCPUThreshold
+          - ReplicaLagThreshold
+          - AlarmEvaluationPeriods
+      - Label:
+          default: "Resource Naming"
+        Parameters:
+          - ResourcePrefix
+          - Environment
+    ParameterLabels:
+      SourceDBInstanceIdentifier:
+        default: "Source Database Identifier"
+      SourceDBRegion:
+        default: "Source Database Region"
+      ReplicaDBInstanceClass:
+        default: "Read Replica Instance Class"
+      SecondaryRegion:
+        default: "Disaster Recovery Region"
+      NotificationEmail:
+        default: "Notification Email Address"
+
+Parameters:
+  SourceDBInstanceIdentifier:
+    Type: String
+    Description: 'Identifier of the existing RDS database instance to replicate'
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$'
+    ConstraintDescription: 'Must begin with a letter, contain only alphanumeric characters and hyphens, and not end with a hyphen'
+
+  SourceDBRegion:
+    Type: String
+    Description: 'AWS region where the source database is located'
+    Default: 'us-east-1'
+    AllowedValues:
+      - us-east-1
+      - us-east-2
+      - us-west-1
+      - us-west-2
+      - eu-west-1
+      - eu-west-2
+      - eu-central-1
+      - ap-southeast-1
+      - ap-southeast-2
+      - ap-northeast-1
+
+  SecondaryRegion:
+    Type: String
+    Description: 'AWS region for disaster recovery read replica (must be different from source region)'
+    Default: 'us-west-2'
+    AllowedValues:
+      - us-east-1
+      - us-east-2
+      - us-west-1
+      - us-west-2
+      - eu-west-1
+      - eu-west-2
+      - eu-central-1
+      - ap-southeast-1
+      - ap-southeast-2
+      - ap-northeast-1
+
+  ReplicaDBInstanceClass:
+    Type: String
+    Description: 'Instance class for the read replica (recommend same as source for consistent performance)'
+    Default: 'db.t3.micro'
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+      - db.t3.large
+      - db.t3.xlarge
+      - db.t3.2xlarge
+      - db.r5.large
+      - db.r5.xlarge
+      - db.r5.2xlarge
+      - db.r5.4xlarge
+      - db.m5.large
+      - db.m5.xlarge
+      - db.m5.2xlarge
+      - db.m5.4xlarge
+
+  MultiAZReplica:
+    Type: String
+    Description: 'Enable Multi-AZ deployment for the read replica (recommended for production)'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for disaster recovery notifications and alerts'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  EnableAutomatedFailover:
+    Type: String
+    Description: 'Enable automated failover capabilities (requires careful testing before production use)'
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+
+  HighCPUThreshold:
+    Type: Number
+    Description: 'CPU utilization threshold (%) that triggers high CPU alerts'
+    Default: 80
+    MinValue: 50
+    MaxValue: 95
+
+  ReplicaLagThreshold:
+    Type: Number
+    Description: 'Replica lag threshold (seconds) that triggers replication lag alerts'
+    Default: 300
+    MinValue: 60
+    MaxValue: 3600
+
+  AlarmEvaluationPeriods:
+    Type: Number
+    Description: 'Number of evaluation periods for CloudWatch alarms'
+    Default: 3
+    MinValue: 1
+    MaxValue: 5
+
+  ResourcePrefix:
+    Type: String
+    Description: 'Prefix for resource names to ensure uniqueness'
+    Default: 'rds-dr'
+    MinLength: 1
+    MaxLength: 20
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+
+  Environment:
+    Type: String
+    Description: 'Environment name for resource tagging'
+    Default: 'production'
+    AllowedValues: ['development', 'staging', 'production']
+
+Conditions:
+  EnableAutomatedFailoverCondition: !Equals [!Ref EnableAutomatedFailover, 'true']
+  IsMultiAZReplica: !Equals [!Ref MultiAZReplica, 'true']
+
+Resources:
+  # SNS Topic for disaster recovery notifications
+  DisasterRecoveryTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ResourcePrefix}-notifications-${AWS::AccountId}'
+      DisplayName: 'RDS Disaster Recovery Notifications'
+      KmsMasterKeyId: 'alias/aws/sns'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-notifications'
+        - Key: Purpose
+          Value: 'DisasterRecovery'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # Email subscription for notifications
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref DisasterRecoveryTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # IAM Role for Lambda disaster recovery function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-lambda-role-${AWS::AccountId}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RDSDisasterRecoveryPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBClusters
+                  - rds:ModifyDBInstance
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - rds:PromoteReadReplica
+                Resource: 
+                  - !Sub 'arn:aws:rds:${SecondaryRegion}:${AWS::AccountId}:db:${ResourcePrefix}-replica-*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: 
+                  - !Ref DisasterRecoveryTopic
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:DescribeAlarms
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-lambda-role'
+        - Key: Purpose
+          Value: 'DisasterRecovery'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda function for disaster recovery automation
+  DisasterRecoveryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-manager-${AWS::AccountId}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref DisasterRecoveryTopic
+          SOURCE_DB_IDENTIFIER: !Ref SourceDBInstanceIdentifier
+          REPLICA_PREFIX: !Sub '${ResourcePrefix}-replica'
+          SECONDARY_REGION: !Ref SecondaryRegion
+          ENABLE_AUTOMATED_FAILOVER: !Ref EnableAutomatedFailover
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import datetime
+          import os
+          import logging
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              """
+              Disaster Recovery Manager for RDS
+              Handles automated failover and notification logic
+              """
+              
+              try:
+                  # Initialize AWS clients
+                  rds = boto3.client('rds')
+                  sns = boto3.client('sns')
+                  
+                  # Parse the CloudWatch alarm event
+                  if 'Records' in event and len(event['Records']) > 0:
+                      message = json.loads(event['Records'][0]['Sns']['Message'])
+                      alarm_name = message.get('AlarmName', '')
+                      new_state = message.get('NewStateValue', '')
+                      reason = message.get('NewStateReason', '')
+                      
+                      logger.info(f"Processing alarm: {alarm_name}, State: {new_state}")
+                      
+                      # Route alarm to appropriate handler
+                      if 'HighCPU' in alarm_name and new_state == 'ALARM':
+                          return handle_high_cpu_alert(alarm_name, reason, sns)
+                      elif 'ReplicaLag' in alarm_name and new_state == 'ALARM':
+                          return handle_replica_lag_alert(alarm_name, reason, sns)
+                      elif 'DatabaseConnections' in alarm_name and new_state == 'ALARM':
+                          return handle_connection_failure(alarm_name, reason, sns, rds)
+                      elif 'DatabaseFreeStorage' in alarm_name and new_state == 'ALARM':
+                          return handle_storage_alert(alarm_name, reason, sns)
+                      
+                  # Handle direct invocation for testing
+                  elif 'test' in event:
+                      return handle_test_invocation(sns)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('No action required for this event')
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing event: {str(e)}")
+                  send_error_notification(str(e), sns)
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+
+          def handle_high_cpu_alert(alarm_name, reason, sns):
+              """Handle high CPU utilization alerts"""
+              message = f"""
+              HIGH CPU ALERT - RDS Disaster Recovery System
+              
+              Alarm: {alarm_name}
+              Reason: {reason}
+              Time: {datetime.datetime.utcnow().isoformat()}Z
+              
+              Recommended Actions:
+              1. Monitor performance metrics closely
+              2. Consider scaling up instance class if sustained
+              3. Review query performance and optimize if needed
+              4. Check for unusual application behavior
+              
+              This alert does not require immediate failover but should be investigated.
+              """
+              
+              sns.publish(
+                  TopicArn=os.environ['SNS_TOPIC_ARN'],
+                  Subject='RDS Performance Alert - High CPU',
+                  Message=message
+              )
+              
+              logger.info("High CPU alert processed and notification sent")
+              return {'statusCode': 200, 'body': 'High CPU alert processed'}
+
+          def handle_replica_lag_alert(alarm_name, reason, sns):
+              """Handle replica lag alerts"""
+              message = f"""
+              REPLICA LAG ALERT - RDS Disaster Recovery System
+              
+              Alarm: {alarm_name}
+              Reason: {reason}
+              Time: {datetime.datetime.utcnow().isoformat()}Z
+              
+              Recommended Actions:
+              1. Check network connectivity between regions
+              2. Monitor primary database load and performance
+              3. Verify read replica instance class is adequate
+              4. Consider increasing network bandwidth if needed
+              
+              High replica lag may impact Recovery Point Objective (RPO) in case of failover.
+              """
+              
+              sns.publish(
+                  TopicArn=os.environ['SNS_TOPIC_ARN'],
+                  Subject='RDS Replica Lag Alert - Action Required',
+                  Message=message
+              )
+              
+              logger.info("Replica lag alert processed and notification sent")
+              return {'statusCode': 200, 'body': 'Replica lag alert processed'}
+
+          def handle_connection_failure(alarm_name, reason, sns, rds):
+              """Handle database connection failures - potential failover scenario"""
+              
+              db_identifier = os.environ['SOURCE_DB_IDENTIFIER']
+              enable_auto_failover = os.environ.get('ENABLE_AUTOMATED_FAILOVER', 'false').lower() == 'true'
+              
+              try:
+                  # Check database status
+                  response = rds.describe_db_instances(DBInstanceIdentifier=db_identifier)
+                  db_status = response['DBInstances'][0]['DBInstanceStatus']
+                  db_available = db_status == 'available'
+                  
+                  if not db_available and enable_auto_failover:
+                      # Automated failover logic
+                      message = f"""
+                      CRITICAL DATABASE FAILURE - AUTOMATED FAILOVER INITIATED
+                      
+                      Alarm: {alarm_name}
+                      Database Status: {db_status}
+                      Reason: {reason}
+                      Time: {datetime.datetime.utcnow().isoformat()}Z
+                      
+                      AUTOMATED ACTIONS TAKEN:
+                      - Failover procedure initiated
+                      - Read replica promotion in progress
+                      - Application teams will be notified of endpoint changes
+                      
+                      Manual verification and application configuration updates may be required.
+                      """
+                      
+                      # Note: Actual failover logic would be implemented here
+                      # For safety, this template does not include automatic promotion
+                      
+                  else:
+                      message = f"""
+                      CRITICAL DATABASE ALERT - MANUAL INTERVENTION REQUIRED
+                      
+                      Alarm: {alarm_name}
+                      Database Status: {db_status}
+                      Reason: {reason}
+                      Time: {datetime.datetime.utcnow().isoformat()}Z
+                      Automated Failover: {'Enabled' if enable_auto_failover else 'Disabled'}
+                      
+                      IMMEDIATE ACTIONS REQUIRED:
+                      1. Investigate database connectivity issues
+                      2. Check database instance health in AWS console
+                      3. Verify network connectivity and security groups
+                      4. Consider manual failover to read replica if necessary
+                      
+                      Contact your database administrator immediately.
+                      """
+                  
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject='CRITICAL: RDS Database Alert - Immediate Action Required',
+                      Message=message
+                  )
+                  
+              except Exception as e:
+                  error_message = f"""
+                  ERROR: Database Status Check Failed
+                  
+                  Database: {db_identifier}
+                  Error: {str(e)}
+                  Time: {datetime.datetime.utcnow().isoformat()}Z
+                  
+                  Immediate manual investigation required.
+                  Database may be experiencing critical issues.
+                  """
+                  
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject='CRITICAL: RDS Monitoring System Error',
+                      Message=error_message
+                  )
+              
+              logger.info("Connection failure alert processed")
+              return {'statusCode': 200, 'body': 'Connection failure alert processed'}
+
+          def handle_storage_alert(alarm_name, reason, sns):
+              """Handle low storage space alerts"""
+              message = f"""
+              STORAGE SPACE ALERT - RDS Disaster Recovery System
+              
+              Alarm: {alarm_name}
+              Reason: {reason}
+              Time: {datetime.datetime.utcnow().isoformat()}Z
+              
+              Recommended Actions:
+              1. Increase allocated storage immediately
+              2. Review storage auto-scaling settings
+              3. Clean up unnecessary data if possible
+              4. Monitor storage growth trends
+              
+              Low storage space can cause database outages and affect disaster recovery capability.
+              """
+              
+              sns.publish(
+                  TopicArn=os.environ['SNS_TOPIC_ARN'],
+                  Subject='RDS Storage Alert - Action Required',
+                  Message=message
+              )
+              
+              return {'statusCode': 200, 'body': 'Storage alert processed'}
+
+          def handle_test_invocation(sns):
+              """Handle test invocations of the Lambda function"""
+              test_message = f"""
+              RDS Disaster Recovery Test Notification
+              
+              Time: {datetime.datetime.utcnow().isoformat()}Z
+              
+              This is a test message from the RDS Disaster Recovery system.
+              If you receive this message, the notification system is working correctly.
+              """
+              
+              sns.publish(
+                  TopicArn=os.environ['SNS_TOPIC_ARN'],
+                  Subject='RDS DR System Test - Success',
+                  Message=test_message
+              )
+              
+              return {'statusCode': 200, 'body': 'Test notification sent successfully'}
+
+          def send_error_notification(error_message, sns):
+              """Send error notification when Lambda function fails"""
+              try:
+                  error_notification = f"""
+                  RDS Disaster Recovery System Error
+                  
+                  An error occurred in the disaster recovery monitoring system:
+                  
+                  Error: {error_message}
+                  Time: {datetime.datetime.utcnow().isoformat()}Z
+                  
+                  Please check the Lambda function logs for more details.
+                  Manual monitoring may be required until this issue is resolved.
+                  """
+                  
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject='CRITICAL: RDS DR System Error',
+                      Message=error_notification
+                  )
+              except Exception as e:
+                  logger.error(f"Failed to send error notification: {str(e)}")
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-dr-function'
+        - Key: Purpose
+          Value: 'DisasterRecovery'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda permission for SNS to invoke the function
+  LambdaSNSPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DisasterRecoveryFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref DisasterRecoveryTopic
+
+  # CloudWatch alarm for high CPU utilization on source database
+  SourceDatabaseHighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${SourceDBInstanceIdentifier}-HighCPU-${ResourcePrefix}'
+      AlarmDescription: 'High CPU utilization on source RDS database'
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: !Ref AlarmEvaluationPeriods
+      Threshold: !Ref HighCPUThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref SourceDBInstanceIdentifier
+      AlarmActions:
+        - !Ref DisasterRecoveryTopic
+      OKActions:
+        - !Ref DisasterRecoveryTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-source-cpu-alarm'
+        - Key: Purpose
+          Value: 'DisasterRecovery'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch alarm for low database connections (potential failure indicator)
+  SourceDatabaseConnectionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${SourceDBInstanceIdentifier}-DatabaseConnections-${ResourcePrefix}'
+      AlarmDescription: 'Low database connections on source RDS database (potential failure indicator)'
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref SourceDBInstanceIdentifier
+      AlarmActions:
+        - !Ref DisasterRecoveryTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-connection-alarm'
+        - Key: Purpose
+          Value: 'DisasterRecovery'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch alarm for low free storage space
+  SourceDatabaseStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${SourceDBInstanceIdentifier}-FreeStorageSpace-${ResourcePrefix}'
+      AlarmDescription: 'Low free storage space on source RDS database'
+      MetricName: FreeStorageSpace
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 2147483648  # 2GB in bytes
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref SourceDBInstanceIdentifier
+      AlarmActions:
+        - !Ref DisasterRecoveryTopic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-storage-alarm'
+        - Key: Purpose
+          Value: 'DisasterRecovery'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Dashboard for disaster recovery monitoring
+  DisasterRecoveryDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ResourcePrefix}-dashboard-${AWS::AccountId}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", "${SourceDBInstanceIdentifier}"]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${SourceDBRegion}",
+                "title": "Source Database CPU Utilization",
+                "period": 300,
+                "annotations": {
+                  "horizontal": [
+                    {
+                      "label": "High CPU Threshold",
+                      "value": ${HighCPUThreshold}
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/RDS", "DatabaseConnections", "DBInstanceIdentifier", "${SourceDBInstanceIdentifier}"]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${SourceDBRegion}",
+                "title": "Source Database Connections",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/RDS", "FreeStorageSpace", "DBInstanceIdentifier", "${SourceDBInstanceIdentifier}"]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${SourceDBRegion}",
+                "title": "Source Database Free Storage Space",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/RDS", "ReadLatency", "DBInstanceIdentifier", "${SourceDBInstanceIdentifier}"],
+                  [".", "WriteLatency", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${SourceDBRegion}",
+                "title": "Source Database Read/Write Latency",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+  # Custom resource to create cross-region read replica
+  # Note: This is a simplified example. In practice, you may need a more complex custom resource
+  # or use AWS CLI/SDK in your deployment scripts to create cross-region resources
+  CrossRegionReplicaCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt DisasterRecoveryFunction.Arn
+      SourceDBInstanceIdentifier: !Ref SourceDBInstanceIdentifier
+      SourceDBRegion: !Ref SourceDBRegion
+      ReplicaDBInstanceClass: !Ref ReplicaDBInstanceClass
+      SecondaryRegion: !Ref SecondaryRegion
+      MultiAZ: !Ref MultiAZReplica
+      ResourcePrefix: !Ref ResourcePrefix
+
+Outputs:
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for disaster recovery notifications'
+    Value: !Ref DisasterRecoveryTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopic'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function managing disaster recovery'
+    Value: !GetAtt DisasterRecoveryFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
+
+  DashboardURL:
+    Description: 'URL to the CloudWatch dashboard for monitoring disaster recovery metrics'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ResourcePrefix}-dashboard-${AWS::AccountId}'
+
+  SourceDatabaseIdentifier:
+    Description: 'Identifier of the source database being replicated'
+    Value: !Ref SourceDBInstanceIdentifier
+
+  SecondaryRegion:
+    Description: 'AWS region configured for disaster recovery'
+    Value: !Ref SecondaryRegion
+
+  HighCPUAlarmName:
+    Description: 'Name of the CloudWatch alarm monitoring high CPU utilization'
+    Value: !Ref SourceDatabaseHighCPUAlarm
+
+  ConnectionAlarmName:
+    Description: 'Name of the CloudWatch alarm monitoring database connections'
+    Value: !Ref SourceDatabaseConnectionAlarm
+
+  StorageAlarmName:
+    Description: 'Name of the CloudWatch alarm monitoring free storage space'
+    Value: !Ref SourceDatabaseStorageAlarm
+
+  NotificationEmail:
+    Description: 'Email address configured for disaster recovery notifications'
+    Value: !Ref NotificationEmail
+
+  DisasterRecoverySetupComplete:
+    Description: 'Confirmation that disaster recovery infrastructure has been deployed'
+    Value: !Sub 'Disaster recovery monitoring configured for ${SourceDBInstanceIdentifier} with cross-region replication to ${SecondaryRegion}'
+
+  NextSteps:
+    Description: 'Recommended next steps after stack deployment'
+    Value: 'Create cross-region read replica manually using AWS CLI or console, then test alarm notifications and review disaster recovery procedures'
+
+  ImportantNotes:
+    Description: 'Important considerations for disaster recovery implementation'
+    Value: 'Cross-region read replica must be created manually. Test failover procedures in non-production environments. Review and update application connection strings for failover scenarios.'

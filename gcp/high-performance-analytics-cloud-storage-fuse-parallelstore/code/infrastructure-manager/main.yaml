@@ -1,0 +1,656 @@
+# Infrastructure Manager Configuration for High-Performance Analytics
+# Recipe: Accelerating High-Performance Analytics Workflows with Cloud Storage FUSE and Parallelstore
+# This configuration deploys a complete high-performance analytics infrastructure
+# including Cloud Storage with HNS, Parallelstore, Compute Engine VMs, and Cloud Dataproc
+
+terraform:
+  required_version: ">= 1.0"
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 5.0"
+    random:
+      source: "hashicorp/random"
+      version: "~> 3.6"
+
+# Input variables for customization
+variables:
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    validation:
+      condition: length(var.project_id) > 0
+      error_message: "Project ID must not be empty."
+
+  region:
+    description: "GCP region for resource deployment"
+    type: string
+    default: "us-central1"
+
+  zone:
+    description: "GCP zone for resource deployment"
+    type: string
+    default: "us-central1-a"
+
+  prefix:
+    description: "Prefix for resource names"
+    type: string
+    default: "hpc-analytics"
+
+  bucket_storage_class:
+    description: "Storage class for Cloud Storage bucket"
+    type: string
+    default: "STANDARD"
+    validation:
+      condition: contains(["STANDARD", "NEARLINE", "COLDLINE", "ARCHIVE"], var.bucket_storage_class)
+      error_message: "Storage class must be one of: STANDARD, NEARLINE, COLDLINE, ARCHIVE."
+
+  parallelstore_capacity_gb:
+    description: "Parallelstore capacity in GB (minimum 12000 GB)"
+    type: number
+    default: 12000
+    validation:
+      condition: var.parallelstore_capacity_gb >= 12000
+      error_message: "Parallelstore capacity must be at least 12000 GB."
+
+  vm_machine_type:
+    description: "Machine type for analytics VM"
+    type: string
+    default: "c2-standard-16"
+
+  dataproc_num_workers:
+    description: "Number of Dataproc worker nodes"
+    type: number
+    default: 4
+    validation:
+      condition: var.dataproc_num_workers >= 2
+      error_message: "Minimum 2 worker nodes required."
+
+  enable_monitoring:
+    description: "Enable Cloud Monitoring for resources"
+    type: bool
+    default: true
+
+# Local values for computed configurations
+locals:
+  # Generate random suffix for unique resource names
+  random_suffix = random_id.suffix.hex
+  
+  # Resource names with prefix and suffix
+  bucket_name = "${var.prefix}-data-${local.random_suffix}"
+  cluster_name = "${var.prefix}-cluster-${local.random_suffix}"
+  parallelstore_name = "${var.prefix}-store-${local.random_suffix}"
+  vm_name = "${var.prefix}-vm-${local.random_suffix}"
+  
+  # Common labels for all resources
+  common_labels = {
+    environment = "hpc-analytics"
+    recipe      = "high-performance-analytics"
+    managed-by  = "infrastructure-manager"
+  }
+
+  # Required APIs for the solution
+  required_apis = [
+    "compute.googleapis.com",
+    "storage.googleapis.com",
+    "dataproc.googleapis.com",
+    "bigquery.googleapis.com",
+    "parallelstore.googleapis.com",
+    "monitoring.googleapis.com",
+    "logging.googleapis.com"
+  ]
+}
+
+# Resources configuration
+resources:
+  # Random ID for unique resource naming
+  suffix:
+    type: random_id
+    properties:
+      byte_length: 3
+
+  # Enable required Google Cloud APIs
+  apis:
+    type: google_project_service
+    for_each: toset(local.required_apis)
+    properties:
+      project: ${var.project_id}
+      service: ${each.value}
+      disable_on_destroy: false
+
+  # Cloud Storage bucket with hierarchical namespace
+  storage_bucket:
+    type: google_storage_bucket
+    properties:
+      name: ${local.bucket_name}
+      location: ${var.region}
+      storage_class: ${var.bucket_storage_class}
+      
+      # Enable hierarchical namespace for improved performance
+      hierarchical_namespace:
+        enabled: true
+      
+      # Enable versioning for data protection
+      versioning:
+        enabled: true
+      
+      # Lifecycle management for cost optimization
+      lifecycle_rule:
+        - condition:
+            age: 30
+            matches_storage_class: ["STANDARD"]
+          action:
+            type: "SetStorageClass"
+            storage_class: "NEARLINE"
+        - condition:
+            age: 90
+            matches_storage_class: ["NEARLINE"]
+          action:
+            type: "SetStorageClass"
+            storage_class: "COLDLINE"
+      
+      # Security configurations
+      uniform_bucket_level_access: true
+      public_access_prevention: "enforced"
+      
+      labels: ${local.common_labels}
+    
+    depends_on:
+      - apis
+
+  # BigQuery dataset for analytics
+  bigquery_dataset:
+    type: google_bigquery_dataset
+    properties:
+      dataset_id: "hpc_analytics"
+      project: ${var.project_id}
+      friendly_name: "High-Performance Analytics Dataset"
+      description: "Dataset for high-performance analytics workloads"
+      location: ${var.region}
+      
+      # Access controls
+      access:
+        - role: "OWNER"
+          user_by_email: "${data.google_client_config.current.user_email}"
+        - role: "READER"
+          special_group: "projectReaders"
+        - role: "WRITER"
+          special_group: "projectWriters"
+      
+      labels: ${local.common_labels}
+    
+    depends_on:
+      - apis
+
+  # VPC network for high-performance communication
+  vpc_network:
+    type: google_compute_network
+    properties:
+      name: "${var.prefix}-network"
+      auto_create_subnetworks: false
+      mtu: 8896  # Jumbo frames for high-performance networking
+      
+    depends_on:
+      - apis
+
+  # Subnet for compute resources
+  vpc_subnet:
+    type: google_compute_subnetwork
+    properties:
+      name: "${var.prefix}-subnet"
+      network: ${google_compute_network.vpc_network.id}
+      ip_cidr_range: "10.0.0.0/24"
+      region: ${var.region}
+      
+      # Enable private Google access for API calls
+      private_ip_google_access: true
+      
+    depends_on:
+      - vpc_network
+
+  # Firewall rules for internal communication
+  firewall_internal:
+    type: google_compute_firewall
+    properties:
+      name: "${var.prefix}-allow-internal"
+      network: ${google_compute_network.vpc_network.id}
+      
+      allow:
+        - protocol: "tcp"
+          ports: ["0-65535"]
+        - protocol: "udp"
+          ports: ["0-65535"]
+        - protocol: "icmp"
+      
+      source_ranges: ["10.0.0.0/24"]
+      target_tags: ["hpc-analytics"]
+      
+    depends_on:
+      - vpc_network
+
+  # Firewall rule for SSH access
+  firewall_ssh:
+    type: google_compute_firewall
+    properties:
+      name: "${var.prefix}-allow-ssh"
+      network: ${google_compute_network.vpc_network.id}
+      
+      allow:
+        - protocol: "tcp"
+          ports: ["22"]
+      
+      source_ranges: ["0.0.0.0/0"]
+      target_tags: ["hpc-analytics"]
+      
+    depends_on:
+      - vpc_network
+
+  # Service account for compute resources
+  service_account:
+    type: google_service_account
+    properties:
+      account_id: "${var.prefix}-sa"
+      display_name: "HPC Analytics Service Account"
+      description: "Service account for high-performance analytics resources"
+      project: ${var.project_id}
+      
+    depends_on:
+      - apis
+
+  # IAM bindings for service account
+  sa_storage_admin:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/storage.admin"
+      member: "serviceAccount:${google_service_account.service_account.email}"
+      
+    depends_on:
+      - service_account
+
+  sa_dataproc_editor:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/dataproc.editor"
+      member: "serviceAccount:${google_service_account.service_account.email}"
+      
+    depends_on:
+      - service_account
+
+  sa_bigquery_admin:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/bigquery.admin"
+      member: "serviceAccount:${google_service_account.service_account.email}"
+      
+    depends_on:
+      - service_account
+
+  sa_parallelstore_admin:
+    type: google_project_iam_member
+    properties:
+      project: ${var.project_id}
+      role: "roles/parallelstore.admin"
+      member: "serviceAccount:${google_service_account.service_account.email}"
+      
+    depends_on:
+      - service_account
+
+  # Parallelstore instance for high-performance storage
+  parallelstore_instance:
+    type: google_parallelstore_instance
+    properties:
+      instance_id: ${local.parallelstore_name}
+      location: ${var.zone}
+      capacity_gib: ${var.parallelstore_capacity_gb}
+      
+      # Network configuration
+      network: "projects/${var.project_id}/global/networks/${google_compute_network.vpc_network.name}"
+      
+      # Performance optimization settings
+      file_stripe_level: "FILE_STRIPE_LEVEL_BALANCED"
+      directory_stripe_level: "DIRECTORY_STRIPE_LEVEL_BALANCED"
+      
+      description: "High-performance storage for analytics workflows"
+      labels: ${local.common_labels}
+      
+    depends_on:
+      - vpc_network
+      - apis
+
+  # Analytics VM with Cloud Storage FUSE and Parallelstore mounts
+  analytics_vm:
+    type: google_compute_instance
+    properties:
+      name: ${local.vm_name}
+      machine_type: ${var.vm_machine_type}
+      zone: ${var.zone}
+      
+      # Boot disk configuration
+      boot_disk:
+        initialize_params:
+          image: "projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts"
+          size: 200
+          type: "pd-ssd"
+      
+      # Network configuration
+      network_interface:
+        network: ${google_compute_network.vpc_network.id}
+        subnetwork: ${google_compute_subnetwork.vpc_subnet.id}
+        access_config: {}  # Ephemeral public IP
+      
+      # Service account
+      service_account:
+        email: ${google_service_account.service_account.email}
+        scopes: ["cloud-platform"]
+      
+      # Tags for firewall rules
+      tags: ["hpc-analytics"]
+      
+      # Labels
+      labels: ${local.common_labels}
+      
+      # Startup script for mounting storage
+      metadata_startup_script: |
+        #!/bin/bash
+        set -e
+        
+        # Update system
+        apt-get update
+        
+        # Install Cloud Storage FUSE
+        export GCSFUSE_REPO=gcsfuse-$(lsb_release -c -s)
+        echo "deb https://packages.cloud.google.com/apt $GCSFUSE_REPO main" | \
+            tee /etc/apt/sources.list.d/gcsfuse.list
+        curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | \
+            gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+        echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] \
+            https://packages.cloud.google.com/apt $GCSFUSE_REPO main" | \
+            tee /etc/apt/sources.list.d/gcsfuse.list
+        apt-get update
+        apt-get install -y gcsfuse
+        
+        # Install NFS client for Parallelstore
+        apt-get install -y nfs-common
+        
+        # Create mount points
+        mkdir -p /mnt/gcs-data
+        mkdir -p /mnt/parallel-store
+        
+        # Mount Cloud Storage via FUSE
+        gcsfuse --implicit-dirs "${local.bucket_name}" /mnt/gcs-data
+        
+        # Mount Parallelstore using NFS
+        PARALLELSTORE_IP="${google_parallelstore_instance.parallelstore_instance.access_points[0].access_point_ip}"
+        mount -t nfs $PARALLELSTORE_IP:/parallelstore /mnt/parallel-store
+        
+        # Create fstab entries for persistent mounts
+        echo "${local.bucket_name} /mnt/gcs-data gcsfuse rw,_netdev,implicit_dirs" >> /etc/fstab
+        echo "$PARALLELSTORE_IP:/parallelstore /mnt/parallel-store nfs defaults,_netdev 0 0" >> /etc/fstab
+        
+        # Install additional tools for analytics
+        apt-get install -y python3-pip htop iotop
+        pip3 install pandas numpy scipy
+        
+        echo "Storage mounts configured successfully" > /tmp/mount-status.log
+        echo "VM setup completed at $(date)" >> /tmp/setup.log
+      
+    depends_on:
+      - vpc_subnet
+      - service_account
+      - parallelstore_instance
+      - sa_storage_admin
+      - sa_parallelstore_admin
+
+  # Cloud Dataproc cluster for distributed analytics
+  dataproc_cluster:
+    type: google_dataproc_cluster
+    properties:
+      name: ${local.cluster_name}
+      region: ${var.region}
+      
+      cluster_config:
+        # Software configuration
+        software_config:
+          image_version: "2.1-ubuntu20"
+          enable_ip_alias: true
+          
+          # Enable Cloud Storage FUSE
+          optional_components: ["CLOUD_STORAGE_FUSE"]
+          
+          # Properties for performance optimization
+          properties:
+            "dataproc:dataproc.allow.zero.workers": "false"
+            "spark:spark.sql.adaptive.enabled": "true"
+            "spark:spark.sql.adaptive.coalescePartitions.enabled": "true"
+            "spark:spark.serializer": "org.apache.spark.serializer.KryoSerializer"
+            "spark:spark.sql.execution.arrow.pyspark.enabled": "true"
+        
+        # Master node configuration
+        master_config:
+          num_instances: 1
+          machine_type: "c2-standard-4"
+          disk_config:
+            boot_disk_type: "pd-ssd"
+            boot_disk_size_gb: 200
+        
+        # Worker node configuration
+        worker_config:
+          num_instances: ${var.dataproc_num_workers}
+          machine_type: "c2-standard-8"
+          disk_config:
+            boot_disk_type: "pd-ssd"
+            boot_disk_size_gb: 200
+        
+        # Network configuration
+        gce_cluster_config:
+          zone: ${var.zone}
+          network: ${google_compute_network.vpc_network.id}
+          subnetwork: ${google_compute_subnetwork.vpc_subnet.id}
+          service_account: ${google_service_account.service_account.email}
+          service_account_scopes: ["cloud-platform"]
+          tags: ["hpc-analytics"]
+          
+          # Metadata for Parallelstore integration
+          metadata:
+            parallel-store-ip: ${google_parallelstore_instance.parallelstore_instance.access_points[0].access_point_ip}
+        
+        # Initialization actions for Parallelstore mounting
+        initialization_action:
+          - executable_file: "gs://goog-dataproc-initialization-actions-${var.region}/cloud-storage-fuse/cloud-storage-fuse.sh"
+            execution_timeout: "20m"
+          
+          # Custom initialization for Parallelstore
+          - executable_file: |
+              #!/bin/bash
+              set -e
+              
+              # Install NFS client
+              apt-get update
+              apt-get install -y nfs-common
+              
+              # Create Parallelstore mount point
+              mkdir -p /mnt/parallel-store
+              
+              # Mount Parallelstore
+              PARALLELSTORE_IP=$(curl -H "Metadata-Flavor: Google" \
+                  http://metadata.google.internal/computeMetadata/v1/instance/attributes/parallel-store-ip)
+              mount -t nfs $PARALLELSTORE_IP:/parallelstore /mnt/parallel-store
+              
+              # Add to fstab for persistence
+              echo "$PARALLELSTORE_IP:/parallelstore /mnt/parallel-store nfs defaults,_netdev 0 0" >> /etc/fstab
+              
+              echo "Parallelstore mounted successfully"
+            execution_timeout: "10m"
+      
+      # Labels
+      labels: ${local.common_labels}
+      
+    depends_on:
+      - vpc_subnet
+      - service_account
+      - parallelstore_instance
+      - sa_dataproc_editor
+      - sa_storage_admin
+      - sa_parallelstore_admin
+
+  # Cloud Monitoring alert policy for Parallelstore performance
+  monitoring_alert_policy:
+    count: ${var.enable_monitoring ? 1 : 0}
+    type: google_monitoring_alert_policy
+    properties:
+      display_name: "Parallelstore Performance Alert"
+      combiner: "OR"
+      enabled: true
+      
+      conditions:
+        - display_name: "High Parallelstore Latency"
+          condition_threshold:
+            filter: 'resource.type="gce_instance" AND resource.labels.instance_name=~"${var.prefix}-.*"'
+            comparison: "COMPARISON_GREATER_THAN"
+            threshold_value: 100
+            duration: "300s"
+            aggregations:
+              - alignment_period: "60s"
+                per_series_aligner: "ALIGN_MEAN"
+      
+      alert_strategy:
+        auto_close: "1800s"
+      
+      documentation:
+        content: "Parallelstore latency is above acceptable thresholds. Check storage performance and workload patterns."
+        mime_type: "text/markdown"
+      
+    depends_on:
+      - apis
+
+  # Custom log metric for Parallelstore throughput
+  log_metric:
+    count: ${var.enable_monitoring ? 1 : 0}
+    type: google_logging_metric
+    properties:
+      name: "parallelstore_throughput"
+      description: "Track Parallelstore throughput metrics"
+      filter: 'resource.type="gce_instance" AND "parallelstore"'
+      
+      metric_descriptor:
+        metric_kind: "GAUGE"
+        value_type: "DOUBLE"
+        display_name: "Parallelstore Throughput"
+      
+      value_extractor: "EXTRACT(jsonPayload.throughput)"
+      
+    depends_on:
+      - apis
+
+# Data sources for configuration
+data:
+  google_client_config:
+    current: {}
+
+# Outputs for verification and integration
+outputs:
+  project_id:
+    description: "Project ID where resources are deployed"
+    value: ${var.project_id}
+
+  region:
+    description: "GCP region used for deployment"
+    value: ${var.region}
+
+  zone:
+    description: "GCP zone used for deployment"
+    value: ${var.zone}
+
+  bucket_name:
+    description: "Cloud Storage bucket name with hierarchical namespace"
+    value: ${google_storage_bucket.storage_bucket.name}
+
+  bucket_url:
+    description: "Cloud Storage bucket URL"
+    value: "gs://${google_storage_bucket.storage_bucket.name}"
+
+  parallelstore_name:
+    description: "Parallelstore instance name"
+    value: ${google_parallelstore_instance.parallelstore_instance.instance_id}
+
+  parallelstore_ip:
+    description: "Parallelstore access point IP address"
+    value: ${google_parallelstore_instance.parallelstore_instance.access_points[0].access_point_ip}
+
+  parallelstore_mount_path:
+    description: "Parallelstore NFS mount path"
+    value: "${google_parallelstore_instance.parallelstore_instance.access_points[0].access_point_ip}:/parallelstore"
+
+  analytics_vm_name:
+    description: "Analytics VM instance name"
+    value: ${google_compute_instance.analytics_vm.name}
+
+  analytics_vm_external_ip:
+    description: "Analytics VM external IP address"
+    value: ${google_compute_instance.analytics_vm.network_interface[0].access_config[0].nat_ip}
+
+  analytics_vm_internal_ip:
+    description: "Analytics VM internal IP address"
+    value: ${google_compute_instance.analytics_vm.network_interface[0].network_ip}
+
+  dataproc_cluster_name:
+    description: "Cloud Dataproc cluster name"
+    value: ${google_dataproc_cluster.dataproc_cluster.name}
+
+  dataproc_master_instance:
+    description: "Cloud Dataproc master instance name"
+    value: "${google_dataproc_cluster.dataproc_cluster.cluster_config[0].master_config[0].instance_names[0]}"
+
+  bigquery_dataset_id:
+    description: "BigQuery dataset ID for analytics"
+    value: ${google_bigquery_dataset.bigquery_dataset.dataset_id}
+
+  bigquery_dataset_location:
+    description: "BigQuery dataset location"
+    value: ${google_bigquery_dataset.bigquery_dataset.location}
+
+  vpc_network_name:
+    description: "VPC network name"
+    value: ${google_compute_network.vpc_network.name}
+
+  vpc_subnet_name:
+    description: "VPC subnet name"
+    value: ${google_compute_subnetwork.vpc_subnet.name}
+
+  service_account_email:
+    description: "Service account email for compute resources"
+    value: ${google_service_account.service_account.email}
+
+  ssh_command:
+    description: "SSH command to connect to analytics VM"
+    value: "gcloud compute ssh ${google_compute_instance.analytics_vm.name} --zone=${var.zone} --project=${var.project_id}"
+
+  cloud_storage_fuse_mount:
+    description: "Cloud Storage FUSE mount path on VM"
+    value: "/mnt/gcs-data"
+
+  parallelstore_mount:
+    description: "Parallelstore mount path on VM"
+    value: "/mnt/parallel-store"
+
+  dataproc_submit_job_example:
+    description: "Example command to submit job to Dataproc cluster"
+    value: "gcloud dataproc jobs submit pyspark YOUR_SCRIPT.py --cluster=${google_dataproc_cluster.dataproc_cluster.name} --region=${var.region}"
+
+  bigquery_external_table_example:
+    description: "Example BigQuery external table creation command"
+    value: "bq mk --external_table_definition=@table_def.json ${var.project_id}:${google_bigquery_dataset.bigquery_dataset.dataset_id}.your_table"
+
+  monitoring_dashboard_url:
+    description: "Cloud Monitoring dashboard URL"
+    value: "https://console.cloud.google.com/monitoring/dashboards?project=${var.project_id}"
+
+  cost_estimate:
+    description: "Estimated monthly cost (USD) - varies by usage"
+    value: "Parallelstore (12TB): ~$3,600/month, Dataproc: ~$400/month, VM: ~$200/month, Storage: varies by data volume"

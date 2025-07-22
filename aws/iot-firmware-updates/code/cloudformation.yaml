@@ -1,0 +1,1311 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  IoT Firmware Update Infrastructure with Device Management Jobs
+  Deploys secure over-the-air firmware update capabilities using AWS IoT Jobs,
+  S3 for firmware storage, AWS Signer for code signing, and Lambda for orchestration.
+  Supports graduated rollouts, automatic abort conditions, and comprehensive monitoring.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'iot-firmware-updates'
+    Description: 'Base name for resources (used for naming and tagging)'
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment designation for resource naming and configuration'
+
+  FirmwareBucketName:
+    Type: String
+    Default: ''
+    Description: 'Name for S3 bucket storing firmware files (leave empty for auto-generated name)'
+    AllowedPattern: '^[a-z0-9.-]*$'
+    ConstraintDescription: 'Must be valid S3 bucket name (lowercase letters, numbers, dots, hyphens)'
+
+  IoTThingGroupName:
+    Type: String
+    Default: 'firmware-update-devices'
+    Description: 'Name for IoT Thing Group containing devices for firmware updates'
+    AllowedPattern: '^[a-zA-Z0-9:_-]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, colons, underscores, and hyphens'
+
+  EnableCloudWatchDashboard:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Whether to create CloudWatch dashboard for monitoring'
+
+  FirmwareSigningPlatform:
+    Type: String
+    Default: 'AmazonFreeRTOS-TI-CC3220SF'
+    AllowedValues: 
+      - 'AmazonFreeRTOS-Default'
+      - 'AmazonFreeRTOS-TI-CC3220SF'
+      - 'AWSIoTDeviceManagement-SHA256-ECDSA'
+    Description: 'AWS Signer platform for firmware code signing (matches recipe example)'
+
+  MaxJobExecutionsPerMinute:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 1000
+    Description: 'Maximum number of job executions per minute for rollout control'
+
+  JobAbortFailureThreshold:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    MaxValue: 100
+    Description: 'Percentage of failed devices that triggers automatic job abortion'
+
+  JobTimeoutInMinutes:
+    Type: Number
+    Default: 60
+    MinValue: 5
+    MaxValue: 10080
+    Description: 'Timeout in minutes for individual device job executions'
+
+Conditions:
+  CreateDashboard: !Equals [!Ref EnableCloudWatchDashboard, 'true']
+  AutoGenerateBucketName: !Equals [!Ref FirmwareBucketName, '']
+
+Resources:
+  # S3 Bucket for Firmware Storage
+  FirmwareBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If 
+        - AutoGenerateBucketName
+        - !Sub '${ProjectName}-firmware-${Environment}-${AWS::AccountId}-${AWS::Region}'
+        - !Ref FirmwareBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 90
+          - Id: DeleteIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt FirmwareUploadProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: firmware/
+                  - Name: suffix
+                    Value: .bin
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-firmware-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'IoT Firmware Storage'
+
+  # S3 Bucket Policy for Secure Access
+  FirmwareBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FirmwareBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSSLRequestsOnly
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${FirmwareBucket}/*'
+              - !Ref FirmwareBucket
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: AllowIoTJobsAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt IoTJobsRole.Arn
+            Action:
+              - 's3:GetObject'
+              - 's3:GetObjectVersion'
+            Resource: !Sub '${FirmwareBucket}/*'
+          - Sid: AllowSignerAccess
+            Effect: Allow
+            Principal:
+              Service: signer.amazonaws.com
+            Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+              - 's3:PutObjectAcl'
+            Resource: !Sub '${FirmwareBucket}/*'
+
+  # IAM Role for IoT Jobs Service
+  IoTJobsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-iot-jobs-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSIoTJobsExecutionRole
+      Policies:
+        - PolicyName: FirmwareS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:GetObjectMetadata'
+                Resource: !Sub '${FirmwareBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                  - 's3:GetBucketLocation'
+                Resource: !Ref FirmwareBucket
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-iot-jobs-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: IoTJobsManagement
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'iot:CreateJob'
+                  - 'iot:DescribeJob'
+                  - 'iot:ListJobs'
+                  - 'iot:UpdateJob'
+                  - 'iot:CancelJob'
+                  - 'iot:DeleteJob'
+                  - 'iot:ListJobExecutionsForJob'
+                  - 'iot:ListJobExecutionsForThing'
+                  - 'iot:DescribeJobExecution'
+                  - 'iot:UpdateJobExecution'
+                  - 'iot:ListThingGroupsForThing'
+                  - 'iot:ListThingsInThingGroup'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectMetadata'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                  - 's3:ListBucket'
+                  - 's3:GetBucketLocation'
+                Resource:
+                  - !Ref FirmwareBucket
+                  - !Sub '${FirmwareBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 'signer:StartSigningJob'
+                  - 'signer:DescribeSigningJob'
+                  - 'signer:ListSigningJobs'
+                  - 'signer:GetSigningProfile'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref JobNotificationTopic
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # AWS Signer Signing Profile
+  FirmwareSigningProfile:
+    Type: AWS::Signer::SigningProfile
+    Properties:
+      ProfileName: !Sub '${ProjectName}-firmware-signing-${Environment}'
+      PlatformId: !Ref FirmwareSigningPlatform
+      SignatureValidityPeriod:
+        Value: 365
+        Type: DAYS
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-firmware-signing-profile'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'IoT Firmware Code Signing'
+
+  # SNS Topic for Job Notifications
+  JobNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-job-notifications-${Environment}'
+      DisplayName: 'IoT Firmware Update Job Notifications'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-job-notifications'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group for Lambda Functions
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-firmware-manager-${Environment}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Group for Firmware Upload Events
+  FirmwareUploadLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-firmware-uploads-${Environment}'
+      RetentionInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-firmware-upload-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function for Firmware Update Management
+  FirmwareUpdateManagerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-firmware-manager-${Environment}'
+      Description: 'Manages IoT firmware update jobs with AWS IoT Device Management'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          FIRMWARE_BUCKET: !Ref FirmwareBucket
+          SIGNING_PROFILE_NAME: !Ref FirmwareSigningProfile
+          IOT_JOBS_ROLE_ARN: !GetAtt IoTJobsRole.Arn
+          NOTIFICATION_TOPIC_ARN: !Ref JobNotificationTopic
+          MAX_EXECUTIONS_PER_MINUTE: !Ref MaxJobExecutionsPerMinute
+          ABORT_FAILURE_THRESHOLD: !Ref JobAbortFailureThreshold
+          JOB_TIMEOUT_MINUTES: !Ref JobTimeoutInMinutes
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      TracingConfig:
+        Mode: Active
+      ReservedConcurrencyLimit: 10
+      DeadLetterQueue:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          from datetime import datetime, timedelta
+          from botocore.exceptions import ClientError
+          
+          def lambda_handler(event, context):
+              """
+              Main handler for firmware update management operations
+              Supports: create_job, check_job_status, cancel_job, list_jobs
+              """
+              try:
+                  iot_client = boto3.client('iot')
+                  s3_client = boto3.client('s3')
+                  sns_client = boto3.client('sns')
+                  
+                  action = event.get('action')
+                  
+                  if action == 'create_job':
+                      return create_firmware_job(event, iot_client, s3_client, sns_client)
+                  elif action == 'check_job_status':
+                      return check_job_status(event, iot_client)
+                  elif action == 'cancel_job':
+                      return cancel_job(event, iot_client, sns_client)
+                  elif action == 'list_jobs':
+                      return list_jobs(event, iot_client)
+                  else:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'Invalid action. Supported: create_job, check_job_status, cancel_job, list_jobs'})
+                      }
+              except Exception as e:
+                  print(f"Error in lambda_handler: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': f'Internal server error: {str(e)}'})
+                  }
+          
+          def create_firmware_job(event, iot_client, s3_client, sns_client):
+              """Create a new firmware update job with rollout configuration"""
+              try:
+                  # Extract parameters with validation
+                  firmware_version = event.get('firmware_version')
+                  thing_group = event.get('thing_group')
+                  s3_key = event.get('s3_key')
+                  description = event.get('description', f'Firmware update to version {firmware_version}')
+                  
+                  if not all([firmware_version, thing_group, s3_key]):
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'Missing required parameters: firmware_version, thing_group, s3_key'})
+                      }
+                  
+                  bucket_name = os.environ['FIRMWARE_BUCKET']
+                  
+                  # Verify firmware file exists
+                  try:
+                      obj_info = s3_client.head_object(Bucket=bucket_name, Key=s3_key)
+                      firmware_size = obj_info['ContentLength']
+                      firmware_etag = obj_info.get('ETag', '').replace('"', '')
+                  except ClientError as e:
+                      return {
+                          'statusCode': 404,
+                          'body': json.dumps({'error': f'Firmware file not found: {s3_key}'})
+                      }
+                  
+                  # Create job document
+                  job_document = {
+                      "operation": "firmware_update",
+                      "firmware": {
+                          "version": firmware_version,
+                          "url": f"https://{bucket_name}.s3.amazonaws.com/{s3_key}",
+                          "size": firmware_size,
+                          "checksum": firmware_etag,
+                          "bucket": bucket_name,
+                          "key": s3_key
+                      },
+                      "steps": [
+                          "download_firmware",
+                          "verify_signature", 
+                          "backup_current_firmware",
+                          "install_firmware",
+                          "verify_installation",
+                          "report_status"
+                      ],
+                      "timeout_minutes": int(os.environ.get('JOB_TIMEOUT_MINUTES', 60))
+                  }
+                  
+                  # Generate unique job ID
+                  job_id = f"firmware-update-{firmware_version}-{uuid.uuid4().hex[:8]}"
+                  
+                  # Create the job with advanced configuration
+                  response = iot_client.create_job(
+                      jobId=job_id,
+                      targets=[
+                          f"arn:aws:iot:{boto3.Session().region_name}:{boto3.client('sts').get_caller_identity()['Account']}:thinggroup/{thing_group}"
+                      ],
+                      document=json.dumps(job_document),
+                      description=description,
+                      targetSelection='SNAPSHOT',
+                      jobExecutionsRolloutConfig={
+                          'maximumPerMinute': int(os.environ.get('MAX_EXECUTIONS_PER_MINUTE', 10)),
+                          'exponentialRate': {
+                              'baseRatePerMinute': 5,
+                              'incrementFactor': 2.0,
+                              'rateIncreaseCriteria': {
+                                  'numberOfNotifiedThings': 10,
+                                  'numberOfSucceededThings': 5
+                              }
+                          }
+                      },
+                      abortConfig={
+                          'criteriaList': [
+                              {
+                                  'failureType': 'FAILED',
+                                  'action': 'CANCEL',
+                                  'thresholdPercentage': float(os.environ.get('ABORT_FAILURE_THRESHOLD', 20)),
+                                  'minNumberOfExecutedThings': 5
+                              }
+                          ]
+                      },
+                      timeoutConfig={
+                          'inProgressTimeoutInMinutes': int(os.environ.get('JOB_TIMEOUT_MINUTES', 60))
+                      },
+                      tags=[
+                          {
+                              'Key': 'FirmwareVersion',
+                              'Value': firmware_version
+                          },
+                          {
+                              'Key': 'Environment',
+                              'Value': os.environ.get('ENVIRONMENT', 'dev')
+                          },
+                          {
+                              'Key': 'CreatedBy',
+                              'Value': 'FirmwareUpdateManager'
+                          }
+                      ]
+                  )
+                  
+                  # Send notification
+                  notification_message = {
+                      'job_id': job_id,
+                      'firmware_version': firmware_version,
+                      'thing_group': thing_group,
+                      'action': 'job_created',
+                      'timestamp': datetime.utcnow().isoformat()
+                  }
+                  
+                  sns_client.publish(
+                      TopicArn=os.environ['NOTIFICATION_TOPIC_ARN'],
+                      Subject=f'Firmware Update Job Created: {job_id}',
+                      Message=json.dumps(notification_message)
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'job_id': job_id,
+                          'job_arn': response['jobArn'],
+                          'firmware_version': firmware_version,
+                          'thing_group': thing_group,
+                          'message': 'Firmware update job created successfully'
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in create_firmware_job: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': f'Failed to create job: {str(e)}'})
+                  }
+          
+          def check_job_status(event, iot_client):
+              """Check the status and progress of a firmware update job"""
+              try:
+                  job_id = event.get('job_id')
+                  if not job_id:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'Missing required parameter: job_id'})
+                      }
+                  
+                  # Get job details
+                  job_response = iot_client.describe_job(jobId=job_id)
+                  
+                  # Get job executions
+                  executions_response = iot_client.list_job_executions_for_job(
+                      jobId=job_id,
+                      maxResults=100
+                  )
+                  
+                  # Calculate additional metrics
+                  executions = executions_response.get('executionSummaries', [])
+                  status_counts = {}
+                  for execution in executions:
+                      status = execution.get('status', 'UNKNOWN')
+                      status_counts[status] = status_counts.get(status, 0) + 1
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'job_id': job_id,
+                          'status': job_response['job']['status'],
+                          'created_at': job_response['job']['createdAt'].isoformat() if 'createdAt' in job_response['job'] else None,
+                          'last_updated_at': job_response['job']['lastUpdatedAt'].isoformat() if 'lastUpdatedAt' in job_response['job'] else None,
+                          'process_details': job_response['job'].get('jobProcessDetails', {}),
+                          'execution_summary': status_counts,
+                          'total_executions': len(executions),
+                          'executions': executions[:10]  # Limit to first 10 for response size
+                      })
+                  }
+                  
+              except ClientError as e:
+                  if e.response['Error']['Code'] == 'ResourceNotFoundException':
+                      return {
+                          'statusCode': 404,
+                          'body': json.dumps({'error': f'Job not found: {job_id}'})
+                      }
+                  else:
+                      return {
+                          'statusCode': 500,
+                          'body': json.dumps({'error': f'AWS error: {str(e)}'})
+                      }
+              except Exception as e:
+                  print(f"Error in check_job_status: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': f'Failed to check job status: {str(e)}'})
+                  }
+          
+          def cancel_job(event, iot_client, sns_client):
+              """Cancel a running firmware update job"""
+              try:
+                  job_id = event.get('job_id')
+                  reason = event.get('reason', 'Job cancelled by user')
+                  
+                  if not job_id:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'Missing required parameter: job_id'})
+                      }
+                  
+                  # Cancel the job
+                  iot_client.cancel_job(
+                      jobId=job_id,
+                      reasonCode='USER_INITIATED',
+                      comment=reason
+                  )
+                  
+                  # Send notification
+                  notification_message = {
+                      'job_id': job_id,
+                      'action': 'job_cancelled',
+                      'reason': reason,
+                      'timestamp': datetime.utcnow().isoformat()
+                  }
+                  
+                  sns_client.publish(
+                      TopicArn=os.environ['NOTIFICATION_TOPIC_ARN'],
+                      Subject=f'Firmware Update Job Cancelled: {job_id}',
+                      Message=json.dumps(notification_message)
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'job_id': job_id,
+                          'message': 'Job cancelled successfully',
+                          'reason': reason
+                      })
+                  }
+                  
+              except ClientError as e:
+                  if e.response['Error']['Code'] == 'ResourceNotFoundException':
+                      return {
+                          'statusCode': 404,
+                          'body': json.dumps({'error': f'Job not found: {job_id}'})
+                      }
+                  else:
+                      return {
+                          'statusCode': 500,
+                          'body': json.dumps({'error': f'AWS error: {str(e)}'})
+                      }
+              except Exception as e:
+                  print(f"Error in cancel_job: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': f'Failed to cancel job: {str(e)}'})
+                  }
+          
+          def list_jobs(event, iot_client):
+              """List firmware update jobs with optional filtering"""
+              try:
+                  status_filter = event.get('status')
+                  max_results = min(int(event.get('max_results', 50)), 100)
+                  
+                  # Build parameters
+                  params = {
+                      'maxResults': max_results,
+                      'thingGroupName': event.get('thing_group')
+                  }
+                  
+                  if status_filter:
+                      params['status'] = status_filter
+                  
+                  # Remove None values
+                  params = {k: v for k, v in params.items() if v is not None}
+                  
+                  response = iot_client.list_jobs(**params)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'jobs': response.get('jobs', []),
+                          'next_token': response.get('nextToken'),
+                          'count': len(response.get('jobs', []))
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in list_jobs: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': f'Failed to list jobs: {str(e)}'})
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-firmware-manager'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function for Processing Firmware Uploads
+  FirmwareUploadProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-firmware-upload-processor-${Environment}'
+      Description: 'Automatically processes firmware uploads and initiates signing'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 180
+      MemorySize: 256
+      Environment:
+        Variables:
+          SIGNING_PROFILE_NAME: !Ref FirmwareSigningProfile
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from urllib.parse import unquote_plus
+          
+          def lambda_handler(event, context):
+              """
+              Automatically process firmware uploads and initiate signing
+              Triggered by S3 ObjectCreated events for .bin files
+              """
+              signer_client = boto3.client('signer')
+              
+              for record in event['Records']:
+                  bucket = record['s3']['bucket']['name']
+                  key = unquote_plus(record['s3']['object']['key'])
+                  
+                  print(f"Processing uploaded file: {key}")
+                  
+                  if not key.endswith('.bin'):
+                      print(f"Skipping non-firmware file: {key}")
+                      continue
+                  
+                  try:
+                      # Start signing job for uploaded firmware
+                      response = signer_client.start_signing_job(
+                          source={
+                              's3': {
+                                  'bucketName': bucket,
+                                  'key': key
+                              }
+                          },
+                          destination={
+                              's3': {
+                                  'bucketName': bucket,
+                                  'prefix': 'signed-firmware/'
+                              }
+                          },
+                          profileName=os.environ['SIGNING_PROFILE_NAME']
+                      )
+                      
+                      print(f"Started signing job {response['jobId']} for {key}")
+                      
+                  except Exception as e:
+                      print(f"Error signing firmware {key}: {str(e)}")
+                      raise e
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Firmware upload processing complete')
+              }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-firmware-upload-processor'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda permission for S3 to invoke firmware upload processor
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FirmwareUploadProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt FirmwareBucket.Arn
+
+  # SQS Dead Letter Queue for Lambda Function
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-dlq-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dead-letter-queue'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function for Device Simulation (for testing)
+  DeviceSimulatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-device-simulator-${Environment}'
+      Description: 'Simulates IoT device firmware update process for testing'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt DeviceSimulatorRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import time
+          import random
+          from datetime import datetime
+          from botocore.exceptions import ClientError
+          
+          def lambda_handler(event, context):
+              """
+              Simulates an IoT device processing firmware update jobs
+              Event should contain: thing_name, region (optional)
+              """
+              try:
+                  thing_name = event.get('thing_name')
+                  if not thing_name:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'Missing required parameter: thing_name'})
+                      }
+                  
+                  region_name = event.get('region', boto3.Session().region_name)
+                  iot_data = boto3.client('iot-data', region_name=region_name)
+                  
+                  print(f"Device {thing_name} checking for pending jobs...")
+                  
+                  # Get pending jobs
+                  response = iot_data.get_pending_job_executions(thingName=thing_name)
+                  
+                  in_progress_jobs = response.get('inProgressJobs', [])
+                  queued_jobs = response.get('queuedJobs', [])
+                  
+                  if not in_progress_jobs and not queued_jobs:
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'thing_name': thing_name,
+                              'message': 'No pending jobs found',
+                              'jobs_processed': 0
+                          })
+                      }
+                  
+                  jobs_processed = 0
+                  results = []
+                  
+                  # Process all pending jobs
+                  for job in in_progress_jobs + queued_jobs:
+                      result = process_firmware_job(job, thing_name, iot_data)
+                      results.append(result)
+                      jobs_processed += 1
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'thing_name': thing_name,
+                          'jobs_processed': jobs_processed,
+                          'results': results
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in device simulator: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': f'Device simulation failed: {str(e)}'})
+                  }
+          
+          def process_firmware_job(job, thing_name, iot_data):
+              """Process a single firmware update job"""
+              job_id = job['jobId']
+              print(f"Processing job: {job_id}")
+              
+              try:
+                  # Start job execution if not already started
+                  if job.get('status') != 'IN_PROGRESS':
+                      iot_data.start_next_pending_job_execution(
+                          thingName=thing_name,
+                          statusDetails={
+                              'step': 'starting',
+                              'progress': '0%',
+                              'timestamp': datetime.utcnow().isoformat()
+                          }
+                      )
+                  
+                  # Simulate firmware update steps
+                  steps = [
+                      ('download_firmware', 'Downloading firmware', 20),
+                      ('verify_signature', 'Verifying digital signature', 40),
+                      ('backup_current_firmware', 'Backing up current firmware', 60),
+                      ('install_firmware', 'Installing new firmware', 80),
+                      ('verify_installation', 'Verifying installation', 90),
+                      ('report_status', 'Reporting final status', 100)
+                  ]
+                  
+                  for step, description, progress in steps:
+                      print(f"  {description}... ({progress}%)")
+                      
+                      # Simulate processing time (1-3 seconds per step)
+                      time.sleep(random.uniform(1, 3))
+                      
+                      # Update job status
+                      iot_data.update_job_execution(
+                          jobId=job_id,
+                          thingName=thing_name,
+                          status='IN_PROGRESS',
+                          statusDetails={
+                              'step': step,
+                              'progress': f'{progress}%',
+                              'description': description,
+                              'timestamp': datetime.utcnow().isoformat()
+                          }
+                      )
+                  
+                  # Small chance of failure for testing
+                  if random.random() < 0.05:  # 5% failure rate
+                      raise Exception("Simulated firmware installation failure")
+                  
+                  # Complete the job successfully
+                  iot_data.update_job_execution(
+                      jobId=job_id,
+                      thingName=thing_name,
+                      status='SUCCEEDED',
+                      statusDetails={
+                          'step': 'completed',
+                          'progress': '100%',
+                          'firmware_version': job.get('jobDocument', {}).get('firmware', {}).get('version', 'unknown'),
+                          'completion_time': datetime.utcnow().isoformat(),
+                          'message': 'Firmware update completed successfully'
+                      }
+                  )
+                  
+                  print(f"  ✅ Job {job_id} completed successfully")
+                  return {
+                      'job_id': job_id,
+                      'status': 'SUCCEEDED',
+                      'message': 'Firmware update completed successfully'
+                  }
+                  
+              except Exception as e:
+                  print(f"  ❌ Job {job_id} failed: {str(e)}")
+                  
+                  # Mark job as failed
+                  try:
+                      iot_data.update_job_execution(
+                          jobId=job_id,
+                          thingName=thing_name,
+                          status='FAILED',
+                          statusDetails={
+                              'error': str(e),
+                              'timestamp': datetime.utcnow().isoformat(),
+                              'failure_reason': 'Device simulation error'
+                          }
+                      )
+                  except:
+                      pass  # Best effort to report failure
+                  
+                  return {
+                      'job_id': job_id,
+                      'status': 'FAILED',
+                      'error': str(e)
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-device-simulator'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for Device Simulator
+  DeviceSimulatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-device-simulator-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: IoTDeviceSimulation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'iot-data:GetPendingJobExecutions'
+                  - 'iot-data:StartNextPendingJobExecution'
+                  - 'iot-data:UpdateJobExecution'
+                  - 'iot-data:DescribeJobExecution'
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-device-simulator-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IoT Thing Group for Devices
+  FirmwareUpdateThingGroup:
+    Type: AWS::IoT::ThingGroup
+    Properties:
+      ThingGroupName: !Ref IoTThingGroupName
+      ThingGroupProperties:
+        ThingGroupDescription: 'Devices eligible for firmware updates via OTA'
+        AttributePayload:
+          Attributes:
+            Environment: !Ref Environment
+            ProjectName: !Ref ProjectName
+            Purpose: 'Firmware Updates'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-thing-group'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Dashboard (conditional)
+  IoTFirmwareUpdateDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateDashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-firmware-updates-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/IoT", "JobsCompleted"],
+                  [".", "JobsFailed"],
+                  [".", "JobsInProgress"],
+                  [".", "JobsQueued"],
+                  [".", "JobsCanceled"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "IoT Jobs Status Overview"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${FirmwareUpdateManagerFunction}"],
+                  [".", "Errors", ".", "."],
+                  [".", "Invocations", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Firmware Update Manager Lambda Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/S3", "BucketSizeBytes", "BucketName", "${FirmwareBucket}", "StorageType", "StandardStorage"],
+                  [".", "NumberOfObjects", ".", ".", ".", "AllStorageTypes"]
+                ],
+                "period": 86400,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Firmware Storage Metrics"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 8,
+              "properties": {
+                "query": "SOURCE '${LambdaLogGroup}' | fields @timestamp, @message | filter @message like /ERROR/ or @message like /WARN/ | sort @timestamp desc | limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Errors and Warnings",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Metric Filters for Custom Metrics
+  JobCreatedMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref LambdaLogGroup
+      FilterPattern: '[timestamp, requestId, level="INFO", message="Job created successfully*"]'
+      MetricTransformations:
+        - MetricNamespace: !Sub '${ProjectName}/FirmwareUpdates'
+          MetricName: 'JobsCreated'
+          MetricValue: '1'
+          DefaultValue: 0
+
+  JobFailedMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref LambdaLogGroup
+      FilterPattern: '[timestamp, requestId, level="ERROR", message="Failed to create job*"]'
+      MetricTransformations:
+        - MetricNamespace: !Sub '${ProjectName}/FirmwareUpdates'
+          MetricName: 'JobCreationFailures'
+          MetricValue: '1'
+          DefaultValue: 0
+
+  # CloudWatch Alarm for Job Failures
+  JobFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-job-failures-${Environment}'
+      AlarmDescription: 'Alert when firmware update job creation failures exceed threshold'
+      MetricName: 'JobCreationFailures'
+      Namespace: !Sub '${ProjectName}/FirmwareUpdates'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref JobNotificationTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-job-failure-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  FirmwareBucketName:
+    Description: 'Name of the S3 bucket for firmware storage'
+    Value: !Ref FirmwareBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-FirmwareBucket'
+
+  FirmwareBucketArn:
+    Description: 'ARN of the S3 bucket for firmware storage'
+    Value: !GetAtt FirmwareBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FirmwareBucketArn'
+
+  SigningProfileName:
+    Description: 'Name of the AWS Signer profile for firmware signing'
+    Value: !Ref FirmwareSigningProfile
+    Export:
+      Name: !Sub '${AWS::StackName}-SigningProfile'
+
+  SigningProfileArn:
+    Description: 'ARN of the AWS Signer profile'
+    Value: !Sub 'arn:aws:signer:${AWS::Region}:${AWS::AccountId}:/signing-profiles/${FirmwareSigningProfile}'
+    Export:
+      Name: !Sub '${AWS::StackName}-SigningProfileArn'
+
+  FirmwareUpdateManagerFunctionName:
+    Description: 'Name of the Lambda function for firmware update management'
+    Value: !Ref FirmwareUpdateManagerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-FirmwareManagerFunction'
+
+  FirmwareUpdateManagerFunctionArn:
+    Description: 'ARN of the Lambda function for firmware update management'
+    Value: !GetAtt FirmwareUpdateManagerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FirmwareManagerFunctionArn'
+
+  DeviceSimulatorFunctionName:
+    Description: 'Name of the Lambda function for device simulation'
+    Value: !Ref DeviceSimulatorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-DeviceSimulatorFunction'
+
+  DeviceSimulatorFunctionArn:
+    Description: 'ARN of the Lambda function for device simulation'
+    Value: !GetAtt DeviceSimulatorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DeviceSimulatorFunctionArn'
+
+  ThingGroupName:
+    Description: 'Name of the IoT Thing Group for firmware updates'
+    Value: !Ref FirmwareUpdateThingGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ThingGroup'
+
+  ThingGroupArn:
+    Description: 'ARN of the IoT Thing Group'
+    Value: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:thinggroup/${FirmwareUpdateThingGroup}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ThingGroupArn'
+
+  JobNotificationTopicArn:
+    Description: 'ARN of the SNS topic for job notifications'
+    Value: !Ref JobNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopic'
+
+  IoTJobsRoleArn:
+    Description: 'ARN of the IAM role for IoT Jobs'
+    Value: !GetAtt IoTJobsRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTJobsRole'
+
+  DashboardURL:
+    Condition: CreateDashboard
+    Description: 'URL to the CloudWatch dashboard for monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-firmware-updates-${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  SampleCreateJobCommand:
+    Description: 'Sample CLI command to create a firmware update job'
+    Value: !Sub |
+      aws lambda invoke --function-name ${FirmwareUpdateManagerFunction} --payload '{
+        "action": "create_job",
+        "firmware_version": "1.0.0",
+        "thing_group": "${IoTThingGroupName}",
+        "s3_key": "signed-firmware/your-firmware-file.bin",
+        "description": "Production firmware update v1.0.0"
+      }' response.json
+
+  SampleCheckStatusCommand:
+    Description: 'Sample CLI command to check job status'
+    Value: !Sub |
+      aws lambda invoke --function-name ${FirmwareUpdateManagerFunction} --payload '{
+        "action": "check_job_status",
+        "job_id": "your-job-id"
+      }' status.json
+
+  SampleDeviceSimulationCommand:
+    Description: 'Sample CLI command to simulate device firmware update'
+    Value: !Sub |
+      aws lambda invoke --function-name ${DeviceSimulatorFunction} --payload '{
+        "thing_name": "your-device-name",
+        "region": "${AWS::Region}"
+      }' simulation.json
+
+  FirmwareUploadCommand:
+    Description: 'AWS CLI command to upload firmware for automatic signing'
+    Value: !Sub "aws s3 cp firmware.bin s3://${FirmwareBucket}/firmware/firmware.bin"
+
+  FirmwareUploadProcessorFunctionName:
+    Description: 'Name of the Lambda function for firmware upload processing'
+    Value: !Ref FirmwareUploadProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-FirmwareUploadProcessor'
+
+  DeploymentGuide:
+    Description: 'Quick deployment guide'
+    Value: !Sub |
+      1. Upload firmware: aws s3 cp firmware.bin s3://${FirmwareBucket}/firmware/firmware.bin
+      2. Wait for signing completion (check S3 signed-firmware/ prefix)
+      3. Create job: aws lambda invoke --function-name ${FirmwareUpdateManagerFunction} --payload '{"action":"create_job","firmware_version":"1.0.0","thing_group":"${IoTThingGroupName}","s3_key":"signed-firmware/firmware.bin"}' response.json
+      4. Monitor via CloudWatch dashboard or check status with Lambda function
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - FirmwareBucketName
+      - Label:
+          default: "IoT Configuration"
+        Parameters:
+          - IoTThingGroupName
+          - FirmwareSigningPlatform
+      - Label:
+          default: "Job Configuration"
+        Parameters:
+          - MaxJobExecutionsPerMinute
+          - JobAbortFailureThreshold
+          - JobTimeoutInMinutes
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableCloudWatchDashboard
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      FirmwareBucketName:
+        default: "Firmware S3 Bucket Name"
+      IoTThingGroupName:
+        default: "IoT Thing Group Name"
+      FirmwareSigningPlatform:
+        default: "Firmware Signing Platform"
+      MaxJobExecutionsPerMinute:
+        default: "Max Job Executions Per Minute"
+      JobAbortFailureThreshold:
+        default: "Job Abort Failure Threshold (%)"
+      JobTimeoutInMinutes:
+        default: "Job Timeout (minutes)"
+      EnableCloudWatchDashboard:
+        default: "Enable CloudWatch Dashboard"

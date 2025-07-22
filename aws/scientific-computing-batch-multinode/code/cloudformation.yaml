@@ -1,0 +1,1221 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Scientific Computing with Batch Multi-Node.
+  This template creates a complete infrastructure for running tightly-coupled
+  parallel scientific workloads using AWS Batch multi-node parallel jobs with
+  MPI support, shared storage, and enhanced networking capabilities.
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+
+Parameters:
+  # Environment Configuration
+  Environment:
+    Type: String
+    Default: 'scientific-computing'
+    Description: Environment name for resource tagging and identification
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: Must contain only alphanumeric characters and hyphens
+
+  ProjectName:
+    Type: String
+    Default: 'sci-computing'
+    Description: Project name for resource naming
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: Must contain only alphanumeric characters and hyphens
+
+  # Networking Configuration
+  VpcCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: CIDR block for the VPC
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a valid CIDR notation
+
+  SubnetCidr:
+    Type: String
+    Default: '10.0.1.0/24'
+    Description: CIDR block for the compute subnet
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a valid CIDR notation
+
+  # Compute Environment Configuration
+  MaxvCpus:
+    Type: Number
+    Default: 256
+    MinValue: 1
+    MaxValue: 1024
+    Description: Maximum number of vCPUs in the compute environment
+
+  DesiredvCpus:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 512
+    Description: Desired number of vCPUs to maintain in the compute environment
+
+  InstanceTypes:
+    Type: CommaDelimitedList
+    Default: 'c5.large,c5.xlarge,c5.2xlarge,c5.4xlarge'
+    Description: Instance types for the compute environment (enhanced networking capable)
+
+  # EFS Configuration
+  EfsPerformanceMode:
+    Type: String
+    Default: 'generalPurpose'
+    AllowedValues: ['generalPurpose', 'maxIO']
+    Description: EFS performance mode for shared storage
+
+  EfsThroughputMode:
+    Type: String
+    Default: 'provisioned'
+    AllowedValues: ['bursting', 'provisioned']
+    Description: EFS throughput mode for shared storage
+
+  ProvisionedThroughputInMibps:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 4000
+    Description: Provisioned throughput for EFS (only used if throughput mode is provisioned)
+
+  # Container Configuration
+  ContainerImageUri:
+    Type: String
+    Default: ''
+    Description: ECR URI for the MPI container image (leave empty to create ECR repository only)
+    AllowedPattern: '^$|^[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com\/[a-z0-9-]+:[a-z0-9.-]+$'
+
+  # Job Configuration
+  DefaultNodeCount:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    MaxValue: 16
+    Description: Default number of nodes for multi-node parallel jobs
+
+  DefaultVcpusPerNode:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 96
+    Description: Default vCPUs per node for multi-node parallel jobs
+
+  DefaultMemoryPerNode:
+    Type: Number
+    Default: 4096
+    MinValue: 512
+    MaxValue: 196608
+    Description: Default memory (MB) per node for multi-node parallel jobs
+
+  JobTimeoutSeconds:
+    Type: Number
+    Default: 3600
+    MinValue: 60
+    MaxValue: 86400
+    Description: Default job timeout in seconds
+
+  # Security Configuration
+  AllowedCidrForSSH:
+    Type: String
+    Default: '0.0.0.0/0'
+    Description: CIDR block allowed for SSH access (restrict for production)
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a valid CIDR notation
+
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable detailed CloudWatch monitoring
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: Number of days to retain CloudWatch logs
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+
+Conditions:
+  UseProvisionedThroughput: !Equals [!Ref EfsThroughputMode, 'provisioned']
+  HasContainerImage: !Not [!Equals [!Ref ContainerImageUri, '']]
+  EnableDetailedMonitoringCondition: !Equals [!Ref EnableDetailedMonitoring, 'true']
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+
+Resources:
+  # -------------------------------------------------------------------------
+  # NETWORKING INFRASTRUCTURE
+  # -------------------------------------------------------------------------
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Scientific Computing'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-igw'
+        - Key: Environment
+          Value: !Ref Environment
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref SubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-subnet'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Type
+          Value: 'Public'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-rt'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # VPC Flow Logs for network monitoring
+  VpcFlowLogRole:
+    Type: AWS::IAM::Role
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: '*'
+
+  VpcFlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      LogGroupName: !Sub '/aws/vpc/flowlogs/${ProjectName}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  VpcFlowLog:
+    Type: AWS::EC2::FlowLog
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref VPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref VpcFlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt VpcFlowLogRole.Arn
+
+  # -------------------------------------------------------------------------
+  # SECURITY GROUPS
+  # -------------------------------------------------------------------------
+
+  BatchSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-batch-sg'
+      GroupDescription: Security group for AWS Batch multi-node jobs with MPI support
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # SSH access for debugging
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedCidrForSSH
+          Description: 'SSH access for debugging'
+        # HTTPS for ECR and other AWS services
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+          Description: 'HTTPS for AWS services'
+      SecurityGroupEgress:
+        # Allow all outbound traffic
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+          Description: 'Allow all outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-batch-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Batch Multi-Node Jobs'
+
+  # Self-referencing rule for MPI communication
+  BatchSecurityGroupSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref BatchSecurityGroup
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !Ref BatchSecurityGroup
+      Description: 'Allow all traffic within security group for MPI communication'
+
+  # NFS rule for EFS access
+  BatchSecurityGroupNfsIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref BatchSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      SourceSecurityGroupId: !Ref BatchSecurityGroup
+      Description: 'NFS access for EFS shared storage'
+
+  # -------------------------------------------------------------------------
+  # SHARED STORAGE (EFS)
+  # -------------------------------------------------------------------------
+
+  EfsFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      CreationToken: !Sub '${ProjectName}-efs-${AWS::StackId}'
+      PerformanceMode: !Ref EfsPerformanceMode
+      ThroughputMode: !Ref EfsThroughputMode
+      ProvisionedThroughputInMibps: !If
+        - UseProvisionedThroughput
+        - !Ref ProvisionedThroughputInMibps
+        - !Ref AWS::NoValue
+      Encrypted: true
+      KmsKeyId: !Ref EfsKmsKey
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-efs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Scientific Computing Shared Storage'
+
+  # KMS Key for EFS encryption
+  EfsKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'KMS Key for EFS encryption in scientific computing environment'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow EFS access
+            Effect: Allow
+            Principal:
+              Service: elasticfilesystem.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-efs-key'
+        - Key: Environment
+          Value: !Ref Environment
+
+  EfsKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-efs-key'
+      TargetKeyId: !Ref EfsKmsKey
+
+  EfsMountTarget:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      SubnetId: !Ref PublicSubnet
+      SecurityGroups:
+        - !Ref BatchSecurityGroup
+
+  # EFS Access Point for organized data access
+  EfsAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      PosixUser:
+        Uid: 1000
+        Gid: 1000
+      RootDirectory:
+        CreationInfo:
+          OwnerUid: 1000
+          OwnerGid: 1000
+          Permissions: 755
+        Path: '/scientific-data'
+      AccessPointTags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-efs-ap'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -------------------------------------------------------------------------
+  # CONTAINER REGISTRY (ECR)
+  # -------------------------------------------------------------------------
+
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}-mpi'
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: MUTABLE
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 tagged images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Delete untagged images older than 1 day",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 1
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-mpi'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Scientific Computing Container Images'
+
+  # -------------------------------------------------------------------------
+  # IAM ROLES AND POLICIES
+  # -------------------------------------------------------------------------
+
+  BatchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-batch-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: batch.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-batch-service-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  BatchInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-batch-instance-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: EFSClientPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientWrite
+                  - elasticfilesystem:AccessPoint
+                Resource: 
+                  - !Sub 'arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/${EfsFileSystem}'
+                  - !Sub 'arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:access-point/${EfsAccessPoint}'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey*
+                Resource: !GetAtt EfsKmsKey.Arn
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:DescribeLogGroups
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+        - PolicyName: S3DataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource: 
+                  - !Sub 'arn:aws:s3:::${ProjectName}-*'
+                  - !Sub 'arn:aws:s3:::${ProjectName}-*/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-batch-instance-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  BatchInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ProjectName}-batch-instance-profile'
+      Roles:
+        - !Ref BatchInstanceRole
+
+  # Job execution role for ECS tasks
+  JobExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-job-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ECRAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-job-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -------------------------------------------------------------------------
+  # AWS BATCH COMPUTE ENVIRONMENT
+  # -------------------------------------------------------------------------
+
+  BatchComputeEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      ComputeEnvironmentName: !Sub '${ProjectName}-compute-env'
+      Type: MANAGED
+      State: ENABLED
+      ComputeResources:
+        Type: EC2
+        MinvCpus: 0
+        MaxvCpus: !Ref MaxvCpus
+        DesiredvCpus: !Ref DesiredvCpus
+        InstanceTypes: !Ref InstanceTypes
+        Subnets:
+          - !Ref PublicSubnet
+        SecurityGroupIds:
+          - !Ref BatchSecurityGroup
+        InstanceRole: !GetAtt BatchInstanceProfile.Arn
+        Tags:
+          Environment: !Ref Environment
+          Project: !Ref ProjectName
+          Purpose: 'Scientific Computing'
+        Ec2Configuration:
+          - ImageType: ECS_AL2
+        UserData: !Base64
+          Fn::Sub: |
+            #!/bin/bash
+            yum update -y
+            yum install -y amazon-cloudwatch-agent
+            # Install EFS utilities
+            yum install -y amazon-efs-utils
+            # Create mount point
+            mkdir -p /mnt/efs
+            # Configure CloudWatch agent
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+              -a fetch-config -m ec2 -c default -s
+      ServiceRole: !GetAtt BatchServiceRole.Arn
+      Tags:
+        Name: !Sub '${ProjectName}-compute-env'
+        Environment: !Ref Environment
+        Purpose: 'Scientific Computing'
+
+  # -------------------------------------------------------------------------
+  # AWS BATCH JOB QUEUE
+  # -------------------------------------------------------------------------
+
+  BatchJobQueue:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      JobQueueName: !Sub '${ProjectName}-job-queue'
+      State: ENABLED
+      Priority: 1
+      ComputeEnvironmentOrder:
+        - Order: 1
+          ComputeEnvironment: !Ref BatchComputeEnvironment
+      Tags:
+        Name: !Sub '${ProjectName}-job-queue'
+        Environment: !Ref Environment
+        Purpose: 'Scientific Computing'
+
+  # -------------------------------------------------------------------------
+  # AWS BATCH JOB DEFINITIONS
+  # -------------------------------------------------------------------------
+
+  BasicMultiNodeJobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      JobDefinitionName: !Sub '${ProjectName}-basic-mpi-job'
+      Type: multinode
+      NodeProperties:
+        MainNode: 0
+        NumNodes: !Ref DefaultNodeCount
+        NodeRangeProperties:
+          - TargetNodes: '0:'
+            Container:
+              Image: !If
+                - HasContainerImage
+                - !Ref ContainerImageUri
+                - !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}:latest'
+              Vcpus: !Ref DefaultVcpusPerNode
+              Memory: !Ref DefaultMemoryPerNode
+              JobRoleArn: !GetAtt JobExecutionRole.Arn
+              Environment:
+                - Name: EFS_DNS_NAME
+                  Value: !Sub '${EfsFileSystem}.efs.${AWS::Region}.amazonaws.com'
+                - Name: EFS_MOUNT_POINT
+                  Value: '/mnt/efs'
+                - Name: EFS_ACCESS_POINT_ID
+                  Value: !Ref EfsAccessPoint
+                - Name: OMPI_ALLOW_RUN_AS_ROOT
+                  Value: '1'
+                - Name: OMPI_ALLOW_RUN_AS_ROOT_CONFIRM
+                  Value: '1'
+                - Name: AWS_DEFAULT_REGION
+                  Value: !Ref 'AWS::Region'
+              MountPoints:
+                - SourceVolume: 'tmp'
+                  ContainerPath: '/tmp'
+                - SourceVolume: 'shm'
+                  ContainerPath: '/dev/shm'
+              Volumes:
+                - Name: 'tmp'
+                  Host:
+                    SourcePath: '/tmp'
+                - Name: 'shm'
+                  Host:
+                    SourcePath: '/dev/shm'
+              Privileged: true
+              ReadonlyRootFilesystem: false
+              LinuxParameters:
+                SharedMemorySize: 1024
+                MaxSwap: 0
+                Swappiness: 0
+              LogConfiguration:
+                LogDriver: awslogs
+                Options:
+                  awslogs-group: !Ref BatchJobLogGroup
+                  awslogs-region: !Ref 'AWS::Region'
+                  awslogs-stream-prefix: 'basic-mpi-job'
+      RetryStrategy:
+        Attempts: 1
+      Timeout:
+        AttemptDurationSeconds: !Ref JobTimeoutSeconds
+      Tags:
+        Name: !Sub '${ProjectName}-basic-mpi-job'
+        Environment: !Ref Environment
+        Purpose: 'Scientific Computing'
+
+  ParameterizedMultiNodeJobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      JobDefinitionName: !Sub '${ProjectName}-parameterized-mpi-job'
+      Type: multinode
+      Parameters:
+        inputDataPath: '/mnt/efs/input'
+        outputDataPath: '/mnt/efs/output'
+        computeIntensity: 'medium'
+        nodeCount: !Ref DefaultNodeCount
+        algorithmType: 'monte-carlo'
+        iterationCount: '1000'
+      NodeProperties:
+        MainNode: 0
+        NumNodes: !Ref DefaultNodeCount
+        NodeRangeProperties:
+          - TargetNodes: '0:'
+            Container:
+              Image: !If
+                - HasContainerImage
+                - !Ref ContainerImageUri
+                - !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}:latest'
+              Vcpus: !Ref DefaultVcpusPerNode
+              Memory: !Ref DefaultMemoryPerNode
+              JobRoleArn: !GetAtt JobExecutionRole.Arn
+              Environment:
+                - Name: EFS_DNS_NAME
+                  Value: !Sub '${EfsFileSystem}.efs.${AWS::Region}.amazonaws.com'
+                - Name: EFS_MOUNT_POINT
+                  Value: '/mnt/efs'
+                - Name: EFS_ACCESS_POINT_ID
+                  Value: !Ref EfsAccessPoint
+                - Name: INPUT_PATH
+                  Value: 'Ref::inputDataPath'
+                - Name: OUTPUT_PATH
+                  Value: 'Ref::outputDataPath'
+                - Name: COMPUTE_INTENSITY
+                  Value: 'Ref::computeIntensity'
+                - Name: NODE_COUNT
+                  Value: 'Ref::nodeCount'
+                - Name: ALGORITHM_TYPE
+                  Value: 'Ref::algorithmType'
+                - Name: ITERATION_COUNT
+                  Value: 'Ref::iterationCount'
+                - Name: OMPI_ALLOW_RUN_AS_ROOT
+                  Value: '1'
+                - Name: OMPI_ALLOW_RUN_AS_ROOT_CONFIRM
+                  Value: '1'
+                - Name: AWS_DEFAULT_REGION
+                  Value: !Ref 'AWS::Region'
+              MountPoints:
+                - SourceVolume: 'tmp'
+                  ContainerPath: '/tmp'
+                - SourceVolume: 'shm'
+                  ContainerPath: '/dev/shm'
+              Volumes:
+                - Name: 'tmp'
+                  Host:
+                    SourcePath: '/tmp'
+                - Name: 'shm'
+                  Host:
+                    SourcePath: '/dev/shm'
+              Privileged: true
+              ReadonlyRootFilesystem: false
+              LinuxParameters:
+                SharedMemorySize: 2048
+                MaxSwap: 0
+                Swappiness: 0
+              LogConfiguration:
+                LogDriver: awslogs
+                Options:
+                  awslogs-group: !Ref BatchJobLogGroup
+                  awslogs-region: !Ref 'AWS::Region'
+                  awslogs-stream-prefix: 'parameterized-mpi-job'
+      RetryStrategy:
+        Attempts: 2
+      Timeout:
+        AttemptDurationSeconds: 7200
+      Tags:
+        Name: !Sub '${ProjectName}-parameterized-mpi-job'
+        Environment: !Ref Environment
+        Purpose: 'Scientific Computing'
+
+  # -------------------------------------------------------------------------
+  # CLOUDWATCH MONITORING
+  # -------------------------------------------------------------------------
+
+  BatchJobLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/batch/job/${ProjectName}'
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt EfsKmsKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-batch-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  ScientificComputingLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/scientific-computing/${ProjectName}'
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt EfsKmsKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-scientific-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  JobFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-job-failures'
+      AlarmDescription: 'Alert when Batch jobs fail'
+      MetricName: FailedJobs
+      Namespace: AWS/Batch
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: JobQueue
+          Value: !Ref BatchJobQueue
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-job-failures'
+        - Key: Environment
+          Value: !Ref Environment
+
+  ComputeEnvironmentScalingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-compute-scaling'
+      AlarmDescription: 'Monitor compute environment scaling activity'
+      MetricName: RunningJobs
+      Namespace: AWS/Batch
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: JobQueue
+          Value: !Ref BatchJobQueue
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-compute-scaling'
+        - Key: Environment
+          Value: !Ref Environment
+
+  EfsUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      AlarmName: !Sub '${ProjectName}-efs-utilization'
+      AlarmDescription: 'Monitor EFS I/O utilization'
+      MetricName: TotalIOBytes
+      Namespace: AWS/EFS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 1073741824  # 1GB
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FileSystemId
+          Value: !Ref EfsFileSystem
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-efs-utilization'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Dashboard
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      DashboardName: !Sub '${ProjectName}-scientific-computing'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Batch", "SubmittedJobs", "JobQueue", "${BatchJobQueue}"],
+                  [".", "RunnableJobs", ".", "."],
+                  [".", "RunningJobs", ".", "."],
+                  [".", "CompletedJobs", ".", "."],
+                  [".", "FailedJobs", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Batch Job Status - ${BatchJobQueue}",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/EFS", "TotalIOBytes", "FileSystemId", "${EfsFileSystem}"],
+                  [".", "DataReadIOBytes", ".", "."],
+                  [".", "DataWriteIOBytes", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "EFS Storage I/O - ${EfsFileSystem}",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${BatchJobLogGroup}' | fields @timestamp, @message | filter @message like /MPI/ or @message like /ERROR/ or @message like /WARN/ | sort @timestamp desc | limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent MPI Job Logs",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+
+Outputs:
+  # Infrastructure Outputs
+  VpcId:
+    Description: 'VPC ID for the scientific computing environment'
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-vpc-id'
+
+  PublicSubnetId:
+    Description: 'Public subnet ID for compute instances'
+    Value: !Ref PublicSubnet
+    Export:
+      Name: !Sub '${AWS::StackName}-public-subnet-id'
+
+  SecurityGroupId:
+    Description: 'Security group ID for Batch instances'
+    Value: !Ref BatchSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-security-group-id'
+
+  # Storage Outputs
+  EfsFileSystemId:
+    Description: 'EFS file system ID for shared storage'
+    Value: !Ref EfsFileSystem
+    Export:
+      Name: !Sub '${AWS::StackName}-efs-id'
+
+  EfsFileSystemDnsName:
+    Description: 'EFS DNS name for mounting'
+    Value: !Sub '${EfsFileSystem}.efs.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-efs-dns-name'
+
+  EfsAccessPointId:
+    Description: 'EFS Access Point ID for organized data access'
+    Value: !Ref EfsAccessPoint
+    Export:
+      Name: !Sub '${AWS::StackName}-efs-access-point-id'
+
+  EfsKmsKeyId:
+    Description: 'KMS Key ID for EFS encryption'
+    Value: !Ref EfsKmsKey
+    Export:
+      Name: !Sub '${AWS::StackName}-efs-kms-key-id'
+
+  # Container Registry Outputs
+  EcrRepositoryUri:
+    Description: 'ECR repository URI for container images'
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ecr-uri'
+
+  EcrRepositoryName:
+    Description: 'ECR repository name'
+    Value: !Ref EcrRepository
+    Export:
+      Name: !Sub '${AWS::StackName}-ecr-name'
+
+  # Batch Service Outputs
+  ComputeEnvironmentName:
+    Description: 'AWS Batch compute environment name'
+    Value: !Ref BatchComputeEnvironment
+    Export:
+      Name: !Sub '${AWS::StackName}-compute-environment'
+
+  JobQueueName:
+    Description: 'AWS Batch job queue name'
+    Value: !Ref BatchJobQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-job-queue'
+
+  BasicJobDefinitionArn:
+    Description: 'Basic multi-node job definition ARN'
+    Value: !Ref BasicMultiNodeJobDefinition
+    Export:
+      Name: !Sub '${AWS::StackName}-basic-job-definition'
+
+  ParameterizedJobDefinitionArn:
+    Description: 'Parameterized multi-node job definition ARN'
+    Value: !Ref ParameterizedMultiNodeJobDefinition
+    Export:
+      Name: !Sub '${AWS::StackName}-parameterized-job-definition'
+
+  # IAM Role Outputs
+  BatchServiceRoleArn:
+    Description: 'Batch service role ARN'
+    Value: !GetAtt BatchServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-batch-service-role-arn'
+
+  BatchInstanceRoleArn:
+    Description: 'Batch instance role ARN'
+    Value: !GetAtt BatchInstanceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-batch-instance-role-arn'
+
+  JobExecutionRoleArn:
+    Description: 'Job execution role ARN'
+    Value: !GetAtt JobExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-job-execution-role-arn'
+
+  # Job Submission Examples
+  BasicJobSubmissionCommand:
+    Description: 'Command to submit a basic multi-node job'
+    Value: !Sub |
+      aws batch submit-job \
+        --job-name "scientific-job-$(date +%s)" \
+        --job-queue ${BatchJobQueue} \
+        --job-definition ${BasicMultiNodeJobDefinition}
+
+  ParameterizedJobSubmissionCommand:
+    Description: 'Command to submit a parameterized multi-node job'
+    Value: !Sub |
+      aws batch submit-job \
+        --job-name "parameterized-job-$(date +%s)" \
+        --job-queue ${BatchJobQueue} \
+        --job-definition ${ParameterizedMultiNodeJobDefinition} \
+        --parameters inputDataPath="/mnt/efs/my-input",outputDataPath="/mnt/efs/my-output",computeIntensity="high",nodeCount="4",algorithmType="molecular-dynamics",iterationCount="5000"
+
+  # Monitoring Outputs
+  CloudWatchLogGroup:
+    Description: 'CloudWatch log group for Batch jobs'
+    Value: !Ref BatchJobLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-log-group'
+
+  ScientificLogGroup:
+    Description: 'CloudWatch log group for scientific computing applications'
+    Value: !Ref ScientificComputingLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-scientific-log-group'
+
+  MonitoringDashboardUrl:
+    Description: 'URL to view Batch metrics in CloudWatch console'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-scientific-computing'
+    Condition: EnableDetailedMonitoringCondition
+
+  # Quick Start Commands
+  EcrLoginCommand:
+    Description: 'Command to login to ECR for container image push'
+    Value: !Sub 'aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'
+
+  ContainerBuildCommand:
+    Description: 'Example command to build and push container image'
+    Value: !Sub |
+      docker build -t ${EcrRepository} .
+      docker tag ${EcrRepository}:latest ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}:latest
+      docker push ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}:latest
+
+  EfsMountCommand:
+    Description: 'Command to mount EFS filesystem'
+    Value: !Sub 'sudo mount -t efs -o tls,accesspoint=${EfsAccessPoint} ${EfsFileSystem}:/ /mnt/efs'
+
+  # Management Commands
+  ListJobsCommand:
+    Description: 'Command to list jobs in the queue'
+    Value: !Sub 'aws batch list-jobs --job-queue ${BatchJobQueue}'
+
+  DescribeComputeEnvironmentCommand:
+    Description: 'Command to describe the compute environment'
+    Value: !Sub 'aws batch describe-compute-environments --compute-environments ${BatchComputeEnvironment}'
+
+  ViewLogsCommand:
+    Description: 'Command to view recent job logs'
+    Value: !Sub 'aws logs tail ${BatchJobLogGroup} --follow --since 1h'
+
+# =============================================================================
+# METADATA
+# =============================================================================
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Environment Configuration'
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: 'Network Configuration'
+        Parameters:
+          - VpcCidr
+          - SubnetCidr
+          - AllowedCidrForSSH
+      - Label:
+          default: 'Compute Configuration'
+        Parameters:
+          - MaxvCpus
+          - DesiredvCpus
+          - InstanceTypes
+      - Label:
+          default: 'Storage Configuration'
+        Parameters:
+          - EfsPerformanceMode
+          - EfsThroughputMode
+          - ProvisionedThroughputInMibps
+      - Label:
+          default: 'Container Configuration'
+        Parameters:
+          - ContainerImageUri
+      - Label:
+          default: 'Job Configuration'
+        Parameters:
+          - DefaultNodeCount
+          - DefaultVcpusPerNode
+          - DefaultMemoryPerNode
+          - JobTimeoutSeconds
+      - Label:
+          default: 'Monitoring and Security'
+        Parameters:
+          - EnableDetailedMonitoring
+          - LogRetentionDays
+    ParameterLabels:
+      Environment:
+        default: 'Environment Name'
+      ProjectName:
+        default: 'Project Name'
+      VpcCidr:
+        default: 'VPC CIDR Block'
+      SubnetCidr:
+        default: 'Subnet CIDR Block'
+      AllowedCidrForSSH:
+        default: 'Allowed CIDR for SSH'
+      MaxvCpus:
+        default: 'Maximum vCPUs'
+      DesiredvCpus:
+        default: 'Desired vCPUs'
+      InstanceTypes:
+        default: 'Instance Types'
+      EfsPerformanceMode:
+        default: 'EFS Performance Mode'
+      EfsThroughputMode:
+        default: 'EFS Throughput Mode'
+      ProvisionedThroughputInMibps:
+        default: 'Provisioned Throughput (MiB/s)'
+      ContainerImageUri:
+        default: 'Container Image URI'
+      DefaultNodeCount:
+        default: 'Default Node Count'
+      DefaultVcpusPerNode:
+        default: 'Default vCPUs per Node'
+      DefaultMemoryPerNode:
+        default: 'Default Memory per Node (MB)'
+      JobTimeoutSeconds:
+        default: 'Job Timeout (seconds)'
+      EnableDetailedMonitoring:
+        default: 'Enable Detailed Monitoring'
+      LogRetentionDays:
+        default: 'Log Retention (days)'
+
+  AWS::CloudFormation::Designer:
+    # CloudFormation Designer metadata for visual representation
+    version: '1.0'
+    description: 'Scientific Computing with Batch Multi-Node'

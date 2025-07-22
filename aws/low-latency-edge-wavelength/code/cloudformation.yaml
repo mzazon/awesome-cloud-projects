@@ -1,0 +1,982 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Low-latency edge application architecture using AWS Wavelength and CloudFront for 5G mobile applications'
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'edge-app'
+    Description: 'Name prefix for all resources'
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must start with lowercase letter, contain only lowercase letters, numbers, and hyphens'
+    MinLength: 3
+    MaxLength: 32
+
+  WavelengthZone:
+    Type: String
+    Default: 'us-west-2-wl1-las-wlz-1'
+    Description: 'Wavelength Zone for edge deployment (must be enabled in your account)'
+    AllowedValues:
+      - 'us-west-2-wl1-las-wlz-1'
+      - 'us-west-2-wl1-sfo-wlz-1'
+      - 'us-east-1-wl1-bos-wlz-1'
+      - 'us-east-1-wl1-nyc-wlz-1'
+      - 'us-east-1-wl1-was-wlz-1'
+      - 'us-east-1-wl1-atl-wlz-1'
+      - 'us-east-1-wl1-mia-wlz-1'
+      - 'eu-west-2-wl1-lon-wlz-1'
+      - 'ap-northeast-1-wl1-nrt-wlz-1'
+    ConstraintDescription: 'Must be a valid Wavelength Zone identifier'
+
+  EdgeInstanceType:
+    Type: String
+    Default: 't3.medium'
+    Description: 'EC2 instance type for Wavelength edge servers'
+    AllowedValues:
+      - 't3.medium'
+      - 't3.large'
+      - 't3.xlarge'
+      - 'c5n.large'
+      - 'c5n.xlarge'
+      - 'r5.large'
+      - 'r5.xlarge'
+    ConstraintDescription: 'Must be a valid EC2 instance type supported in Wavelength Zones'
+
+  DomainName:
+    Type: String
+    Default: 'example.com'
+    Description: 'Domain name for the edge application (must be a registered domain you control)'
+    AllowedPattern: '^[a-z0-9.-]+\.[a-z]{2,}$'
+    ConstraintDescription: 'Must be a valid domain name'
+
+  EnableCloudFrontLogging:
+    Type: String
+    Default: 'false'
+    Description: 'Enable CloudFront access logging'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    Description: 'Environment name for resource tagging'
+    AllowedValues:
+      - 'dev'
+      - 'staging'
+      - 'prod'
+    ConstraintDescription: 'Must be dev, staging, or prod'
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  EnableLogging: !Equals [!Ref EnableCloudFrontLogging, 'true']
+  CreateLogsBucket: !And
+    - !Condition EnableLogging
+    - !Condition IsProduction
+
+# =============================================================================
+# MAPPINGS
+# =============================================================================
+Mappings:
+  RegionMap:
+    us-west-2:
+      AMI: 'ami-0c2d3e23eb0c4d0c3'  # Amazon Linux 2 AMI
+    us-east-1:
+      AMI: 'ami-0abcdef1234567890'  # Amazon Linux 2 AMI
+    eu-west-2:
+      AMI: 'ami-0987654321abcdef0'  # Amazon Linux 2 AMI
+    ap-northeast-1:
+      AMI: 'ami-0fedcba9876543210'  # Amazon Linux 2 AMI
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # ---------------------------------------------------------------------------
+  # VPC AND NETWORKING
+  # ---------------------------------------------------------------------------
+  
+  # Main VPC for edge application
+  EdgeVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: '10.0.0.0/16'
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Edge application VPC with Wavelength extension'
+
+  # Wavelength subnet for ultra-low latency edge resources
+  WavelengthSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref EdgeVPC
+      CidrBlock: '10.0.1.0/24'
+      AvailabilityZone: !Ref WavelengthZone
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-wavelength-subnet'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Wavelength Zone subnet for edge computing'
+
+  # Regional subnet for backend services
+  RegionalSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref EdgeVPC
+      CidrBlock: '10.0.2.0/24'
+      AvailabilityZone: !Sub '${AWS::Region}a'
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-regional-subnet'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Regional subnet for backend services'
+
+  # Carrier Gateway for 5G mobile connectivity
+  CarrierGateway:
+    Type: AWS::EC2::CarrierGateway
+    Properties:
+      VpcId: !Ref EdgeVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-carrier-gateway'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: '5G mobile network connectivity gateway'
+
+  # Route table for Wavelength subnet
+  WavelengthRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref EdgeVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-wavelength-rt'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Route for mobile traffic through carrier gateway
+  CarrierGatewayRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref WavelengthRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      CarrierGatewayId: !Ref CarrierGateway
+
+  # Associate route table with Wavelength subnet
+  WavelengthSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref WavelengthSubnet
+      RouteTableId: !Ref WavelengthRouteTable
+
+  # ---------------------------------------------------------------------------
+  # SECURITY GROUPS
+  # ---------------------------------------------------------------------------
+  
+  # Security group for Wavelength edge applications
+  WavelengthSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-wavelength-sg'
+      GroupDescription: 'Security group for Wavelength edge applications with 5G mobile access'
+      VpcId: !Ref EdgeVPC
+      SecurityGroupIngress:
+        # HTTP traffic from mobile clients
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: '0.0.0.0/0'
+          Description: 'HTTP traffic from mobile clients'
+        # HTTPS traffic from mobile clients
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+          Description: 'HTTPS traffic from mobile clients'
+        # Custom application port for game servers/real-time apps
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: '0.0.0.0/0'
+          Description: 'Custom application port for edge services'
+        # Health check port
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          CidrIp: '10.0.0.0/16'
+          Description: 'Health check port for load balancer'
+      SecurityGroupEgress:
+        # Allow all outbound traffic for API calls and data sync
+        - IpProtocol: -1
+          CidrIp: '0.0.0.0/0'
+          Description: 'All outbound traffic for backend connectivity'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-wavelength-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Edge application security with mobile network access'
+
+  # Security group for regional backend services
+  RegionalSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-regional-sg'
+      GroupDescription: 'Security group for regional backend services'
+      VpcId: !Ref EdgeVPC
+      SecurityGroupIngress:
+        # Traffic from Wavelength edge servers
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref WavelengthSecurityGroup
+          Description: 'HTTP traffic from edge servers'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref WavelengthSecurityGroup
+          Description: 'HTTPS traffic from edge servers'
+        # Database and API ports
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WavelengthSecurityGroup
+          Description: 'Database access from edge servers'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-regional-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # IAM ROLES AND POLICIES
+  # ---------------------------------------------------------------------------
+  
+  # IAM role for edge EC2 instances
+  EdgeInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-edge-instance-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: EdgeApplicationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CloudWatch metrics and logs
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              # S3 access for static assets and configuration
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${StaticAssetsBucket}/*'
+              # Systems Manager for configuration management
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-edge-instance-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Instance profile for edge EC2 instances
+  EdgeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ProjectName}-edge-instance-profile'
+      Roles:
+        - !Ref EdgeInstanceRole
+
+  # ---------------------------------------------------------------------------
+  # S3 BUCKET FOR STATIC ASSETS
+  # ---------------------------------------------------------------------------
+  
+  # S3 bucket for static assets served through CloudFront
+  StaticAssetsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-static-assets-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Sub '/aws/s3/${ProjectName}-static-assets'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-static-assets'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Static assets for global CloudFront distribution'
+
+  # CloudFront access logging bucket (conditional)
+  CloudFrontLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateLogsBucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-cloudfront-logs-${AWS::AccountId}'
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 60
+                StorageClass: GLACIER
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cloudfront-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # LAUNCH TEMPLATE AND EC2 INSTANCES
+  # ---------------------------------------------------------------------------
+  
+  # Launch template for edge application servers
+  EdgeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ProjectName}-edge-template'
+      LaunchTemplateData:
+        ImageId: !FindInMap [RegionMap, !Ref AWS::Region, AMI]
+        InstanceType: !Ref EdgeInstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt EdgeInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref WavelengthSecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # Update system and install Docker
+            yum update -y
+            yum install -y docker amazon-cloudwatch-agent
+            systemctl start docker
+            systemctl enable docker
+            usermod -a -G docker ec2-user
+
+            # Install CloudWatch agent
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+                -a fetch-config -m ec2 -s -c ssm:${ProjectName}-cloudwatch-config
+
+            # Create application directory
+            mkdir -p /app/logs
+
+            # Run edge application container with health monitoring
+            docker run -d --name edge-app \
+                -p 8080:8080 \
+                -p 8000:8000 \
+                -v /app/logs:/var/log/app \
+                --restart unless-stopped \
+                --log-driver awslogs \
+                --log-opt awslogs-group=/aws/ec2/${ProjectName}-edge \
+                --log-opt awslogs-region=${AWS::Region} \
+                nginx:alpine
+
+            # Configure nginx for edge application with health checks
+            docker exec edge-app sh -c 'cat > /etc/nginx/conf.d/default.conf << EOF
+            upstream backend {
+                server 127.0.0.1:8081;
+            }
+
+            # Main application server
+            server {
+                listen 8080;
+                server_name _;
+                
+                # Enable real IP from load balancer
+                real_ip_header X-Forwarded-For;
+                set_real_ip_from 10.0.0.0/16;
+                
+                # Logging for performance monitoring
+                access_log /var/log/nginx/access.log combined;
+                error_log /var/log/nginx/error.log warn;
+                
+                # Main application endpoint
+                location / {
+                    add_header X-Edge-Server "${ProjectName}-wavelength" always;
+                    add_header X-Response-Time "\$request_time" always;
+                    add_header X-Timestamp "\$(date +%s%3N)" always;
+                    return 200 "Edge Server Response - Latency: \$(date +%s%3N)ms\nZone: ${WavelengthZone}\nInstance: \$hostname";
+                    add_header Content-Type text/plain;
+                }
+                
+                # API endpoint for mobile applications
+                location /api/ {
+                    add_header X-Edge-Server "${ProjectName}-wavelength" always;
+                    proxy_pass http://backend/;
+                    proxy_set_header Host \$host;
+                    proxy_set_header X-Real-IP \$remote_addr;
+                    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                    proxy_connect_timeout 1s;
+                    proxy_send_timeout 1s;
+                    proxy_read_timeout 1s;
+                }
+            }
+
+            # Health check server
+            server {
+                listen 8000;
+                server_name _;
+                access_log off;
+                
+                location /health {
+                    return 200 "healthy";
+                    add_header Content-Type text/plain;
+                }
+                
+                location /ready {
+                    return 200 "ready";
+                    add_header Content-Type text/plain;
+                }
+            }
+            EOF'
+
+            # Restart nginx with new configuration
+            docker restart edge-app
+
+            # Signal CloudFormation that instance is ready
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource EdgeInstance --region ${AWS::Region}
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${ProjectName}-edge-server'
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: Purpose
+                Value: 'Wavelength edge application server'
+              - Key: Zone
+                Value: !Ref WavelengthZone
+
+  # Edge application instance in Wavelength Zone
+  EdgeInstance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+        Count: 1
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref EdgeLaunchTemplate
+        Version: !GetAtt EdgeLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref WavelengthSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-edge-instance'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # APPLICATION LOAD BALANCER
+  # ---------------------------------------------------------------------------
+  
+  # Application Load Balancer for edge applications
+  EdgeLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-wavelength-alb'
+      Type: application
+      Scheme: internal
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref WavelengthSubnet
+      SecurityGroups:
+        - !Ref WavelengthSecurityGroup
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+        - Key: routing.http2.enabled
+          Value: 'true'
+        - Key: access_logs.s3.enabled
+          Value: !If [EnableLogging, 'true', 'false']
+        - Key: access_logs.s3.bucket
+          Value: !If [EnableLogging, !Ref CloudFrontLogsBucket, !Ref 'AWS::NoValue']
+        - Key: access_logs.s3.prefix
+          Value: !If [EnableLogging, 'alb-logs', !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-wavelength-alb'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Load balancer for Wavelength edge applications'
+
+  # Target group for edge instances
+  EdgeTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-edge-targets'
+      Port: 8080
+      Protocol: HTTP
+      VpcId: !Ref EdgeVPC
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckPath: /health
+      HealthCheckPort: '8000'
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+        - Key: stickiness.enabled
+          Value: 'false'
+      Targets:
+        - Id: !Ref EdgeInstance
+          Port: 8080
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-edge-targets'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Load balancer listener
+  EdgeListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref EdgeTargetGroup
+      LoadBalancerArn: !Ref EdgeLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # ---------------------------------------------------------------------------
+  # CLOUDFRONT DISTRIBUTION
+  # ---------------------------------------------------------------------------
+  
+  # Origin Access Control for S3
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-s3-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+        Description: 'Origin Access Control for S3 static assets'
+
+  # CloudFront distribution for global content delivery
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub 'Edge application distribution for ${ProjectName}'
+        DefaultRootObject: 'index.html'
+        PriceClass: PriceClass_All
+        HttpVersion: http2
+        IPV6Enabled: true
+        
+        # Origins configuration
+        Origins:
+          # S3 origin for static assets
+          - Id: !Sub 'S3-${StaticAssetsBucket}'
+            DomainName: !GetAtt StaticAssetsBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !Ref OriginAccessControl
+            
+          # Wavelength ALB origin for dynamic content
+          - Id: 'Wavelength-ALB'
+            DomainName: !GetAtt EdgeLoadBalancer.DNSName
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+              OriginSSLProtocols:
+                - TLSv1.2
+              OriginReadTimeout: 30
+              OriginKeepaliveTimeout: 5
+        
+        # Default cache behavior (static content from S3)
+        DefaultCacheBehavior:
+          TargetOriginId: !Sub 'S3-${StaticAssetsBucket}'
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: '4135ea2d-6df8-44a3-9df3-4b5a84be39ad'  # CachingOptimized
+          OriginRequestPolicyId: '88a5eaf4-2fd4-4709-b370-b4c650ea3fcf'  # CORS-S3Origin
+          ResponseHeadersPolicyId: '67f7725c-6f97-4210-82d7-5512b31e9d03'  # SecurityHeadersPolicy
+          Compress: true
+          
+        # Cache behaviors for API traffic (routed to Wavelength)
+        CacheBehaviors:
+          - PathPattern: '/api/*'
+            TargetOriginId: 'Wavelength-ALB'
+            ViewerProtocolPolicy: https-only
+            CachePolicyId: '4135ea2d-6df8-44a3-9df3-4b5a84be39ad'  # CachingOptimized
+            OriginRequestPolicyId: 'acba4595-bd28-49b8-b9fe-13317c0390fa'  # UserAgentRefererHeaders
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+              - PUT
+              - POST
+              - PATCH
+              - DELETE
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            CachePolicyId: '725d8d5c-8f73-4938-b291-a2db2b5b5a6c'  # CachingDisabled for API calls
+          
+          - PathPattern: '/health'
+            TargetOriginId: 'Wavelength-ALB'
+            ViewerProtocolPolicy: https-only
+            CachePolicyId: '725d8d5c-8f73-4938-b291-a2db2b5b5a6c'  # CachingDisabled
+            OriginRequestPolicyId: 'acba4595-bd28-49b8-b9fe-13317c0390fa'  # UserAgentRefererHeaders
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+        
+        # Custom error pages
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: '/index.html'
+            ErrorCachingMinTTL: 300
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: '/index.html'
+            ErrorCachingMinTTL: 300
+        
+        # Logging configuration (conditional)
+        Logging: !If
+          - EnableLogging
+          - Bucket: !GetAtt CloudFrontLogsBucket.DomainName
+            Prefix: 'cloudfront-logs/'
+            IncludeCookies: false
+          - !Ref 'AWS::NoValue'
+        
+        # Geographic restrictions (none by default)
+        Restrictions:
+          GeoRestriction:
+            RestrictionType: none
+        
+        # SSL/TLS configuration
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          MinimumProtocolVersion: TLSv1.2_2021
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-distribution'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Global content delivery with Wavelength edge integration'
+
+  # ---------------------------------------------------------------------------
+  # S3 BUCKET POLICY FOR CLOUDFRONT
+  # ---------------------------------------------------------------------------
+  
+  # S3 bucket policy to allow CloudFront access
+  StaticAssetsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StaticAssetsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: 's3:GetObject'
+            Resource: !Sub '${StaticAssetsBucket}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  # ---------------------------------------------------------------------------
+  # ROUTE 53 DNS CONFIGURATION
+  # ---------------------------------------------------------------------------
+  
+  # Route 53 hosted zone for custom domain
+  HostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Ref DomainName
+      HostedZoneConfig:
+        Comment: !Sub 'DNS zone for ${ProjectName} edge application'
+      HostedZoneTags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-hosted-zone'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # DNS record pointing to CloudFront distribution
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZone
+      Name: !Sub 'app.${DomainName}'
+      Type: CNAME
+      TTL: 300
+      ResourceRecords:
+        - !GetAtt CloudFrontDistribution.DomainName
+      Comment: 'CNAME record pointing to CloudFront distribution'
+
+  # ---------------------------------------------------------------------------
+  # CLOUDWATCH MONITORING
+  # ---------------------------------------------------------------------------
+  
+  # CloudWatch Log Group for edge applications
+  EdgeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/ec2/${ProjectName}-edge'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-edge-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch dashboard for monitoring
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-edge-monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${EdgeLoadBalancer}" ],
+                  [ ".", "TargetResponseTime", ".", "." ],
+                  [ ".", "HTTPCode_Target_2XX_Count", ".", "." ],
+                  [ ".", "HTTPCode_Target_4XX_Count", ".", "." ],
+                  [ ".", "HTTPCode_Target_5XX_Count", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Edge Load Balancer Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/CloudFront", "Requests", "DistributionId", "${CloudFrontDistribution}" ],
+                  [ ".", "BytesDownloaded", ".", "." ],
+                  [ ".", "4xxErrorRate", ".", "." ],
+                  [ ".", "5xxErrorRate", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "us-east-1",
+                "title": "CloudFront Distribution Metrics",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  # VPC and networking outputs
+  VPCId:
+    Description: 'VPC ID for the edge application'
+    Value: !Ref EdgeVPC
+    Export:
+      Name: !Sub '${ProjectName}-vpc-id'
+
+  WavelengthSubnetId:
+    Description: 'Subnet ID for Wavelength Zone deployment'
+    Value: !Ref WavelengthSubnet
+    Export:
+      Name: !Sub '${ProjectName}-wavelength-subnet-id'
+
+  CarrierGatewayId:
+    Description: 'Carrier Gateway ID for 5G connectivity'
+    Value: !Ref CarrierGateway
+    Export:
+      Name: !Sub '${ProjectName}-carrier-gateway-id'
+
+  # EC2 and compute outputs
+  EdgeInstanceId:
+    Description: 'Instance ID of the Wavelength edge server'
+    Value: !Ref EdgeInstance
+    Export:
+      Name: !Sub '${ProjectName}-edge-instance-id'
+
+  EdgeInstancePrivateIP:
+    Description: 'Private IP address of the edge instance'
+    Value: !GetAtt EdgeInstance.PrivateIp
+
+  # Load balancer outputs
+  LoadBalancerDNS:
+    Description: 'DNS name of the Application Load Balancer'
+    Value: !GetAtt EdgeLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${ProjectName}-alb-dns'
+
+  LoadBalancerArn:
+    Description: 'ARN of the Application Load Balancer'
+    Value: !Ref EdgeLoadBalancer
+    Export:
+      Name: !Sub '${ProjectName}-alb-arn'
+
+  # S3 and storage outputs
+  StaticAssetsBucketName:
+    Description: 'Name of the S3 bucket for static assets'
+    Value: !Ref StaticAssetsBucket
+    Export:
+      Name: !Sub '${ProjectName}-static-bucket'
+
+  StaticAssetsBucketDomain:
+    Description: 'Domain name of the S3 bucket'
+    Value: !GetAtt StaticAssetsBucket.RegionalDomainName
+
+  # CloudFront outputs
+  CloudFrontDistributionId:
+    Description: 'CloudFront Distribution ID'
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub '${ProjectName}-cloudfront-id'
+
+  CloudFrontDomainName:
+    Description: 'CloudFront Distribution domain name'
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub '${ProjectName}-cloudfront-domain'
+
+  CloudFrontURL:
+    Description: 'Complete HTTPS URL for the CloudFront distribution'
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+
+  # Route 53 outputs
+  HostedZoneId:
+    Description: 'Route 53 Hosted Zone ID'
+    Value: !Ref HostedZone
+    Export:
+      Name: !Sub '${ProjectName}-hosted-zone-id'
+
+  HostedZoneNameServers:
+    Description: 'Name servers for the hosted zone'
+    Value: !Join [', ', !GetAtt HostedZone.NameServers]
+
+  CustomDomainURL:
+    Description: 'Custom domain URL for the edge application'
+    Value: !Sub 'https://app.${DomainName}'
+
+  # Application endpoints
+  EdgeApplicationURL:
+    Description: 'Direct URL to test edge application latency'
+    Value: !Sub 'http://${EdgeLoadBalancer.DNSName}'
+
+  EdgeHealthCheckURL:
+    Description: 'Health check endpoint for the edge application'
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}/health'
+
+  # Monitoring outputs
+  DashboardURL:
+    Description: 'CloudWatch Dashboard URL for monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-edge-monitoring'
+
+  # Configuration summary
+  WavelengthZoneDeployed:
+    Description: 'Wavelength Zone where edge resources are deployed'
+    Value: !Ref WavelengthZone
+
+  # IAM outputs for additional configuration
+  EdgeInstanceRoleArn:
+    Description: 'ARN of the IAM role for edge instances'
+    Value: !GetAtt EdgeInstanceRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-edge-role-arn'
+
+  # Performance testing information
+  LatencyTestCommand:
+    Description: 'Command to test edge application latency'
+    Value: !Sub 'curl -w "Total time: %{time_total}s\n" https://${CloudFrontDistribution.DomainName}/health'
+
+  # Next steps for deployment
+  NextSteps:
+    Description: 'Next steps after deployment'
+    Value: |
+      1. Update your domain's nameservers to use the Route 53 hosted zone
+      2. Upload static content to the S3 bucket
+      3. Test the edge application using the provided URLs
+      4. Monitor performance through the CloudWatch dashboard
+      5. Configure SSL certificate for custom domain if needed

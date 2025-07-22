@@ -1,0 +1,827 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Automated DNS Security Monitoring with Route 53 Resolver DNS Firewall and CloudWatch - Comprehensive threat detection and response solution'
+
+# ============================
+# Parameters Section
+# ============================
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC ID where DNS Firewall will be deployed'
+    
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for DNS security alert notifications'
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    ConstraintDescription: 'Must be a valid email address'
+    
+  ProjectName:
+    Type: String
+    Default: 'dns-security'
+    Description: 'Project name for resource naming and tagging'
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+    MinLength: 3
+    MaxLength: 20
+    
+  Environment:
+    Type: String
+    Default: 'prod'
+    AllowedValues:
+      - 'dev'
+      - 'test'
+      - 'staging'
+      - 'prod'
+    Description: 'Environment for deployment (affects alarm thresholds and retention)'
+    
+  LogRetentionInDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: 'CloudWatch Logs retention period in days'
+    
+  HighBlockRateThreshold:
+    Type: Number
+    Default: 50
+    MinValue: 10
+    MaxValue: 1000
+    Description: 'Threshold for high DNS block rate alarm (queries per 5 minutes)'
+    
+  UnusualVolumeThreshold:
+    Type: Number
+    Default: 1000
+    MinValue: 100
+    MaxValue: 10000
+    Description: 'Threshold for unusual DNS query volume alarm (queries per 15 minutes)'
+    
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable detailed CloudWatch monitoring and additional alarms'
+
+# ============================
+# Conditions Section
+# ============================
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  EnableDetailedMonitoringCondition: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  CreateAdvancedAlarms: !And
+    - !Condition IsProduction
+    - !Condition EnableDetailedMonitoringCondition
+
+# ============================
+# Resources Section
+# ============================
+Resources:
+  
+  # ================================
+  # DNS Firewall Domain Lists
+  # ================================
+  MaliciousDomainList:
+    Type: AWS::Route53Resolver::FirewallDomainList
+    Properties:
+      Name: !Sub '${ProjectName}-malicious-domains-${Environment}'
+      Domains:
+        - 'malware.example'
+        - 'suspicious.tk'
+        - 'phishing.com'
+        - 'badactor.ru'
+        - 'cryptominer.xyz'
+        - 'botnet.info'
+        - 'dnstunnel.net'
+        - 'c2server.org'
+        - 'ransomware.biz'
+        - 'trojan.ml'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-malicious-domains-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'DNS Security - Malicious Domain Blocking'
+  
+  SuspiciousTLDDomainList:
+    Type: AWS::Route53Resolver::FirewallDomainList
+    Properties:
+      Name: !Sub '${ProjectName}-suspicious-tlds-${Environment}'
+      Domains:
+        - '*.tk'
+        - '*.ml'
+        - '*.ga'
+        - '*.cf'
+        - '*.bit'
+        - '*.onion'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-suspicious-tlds-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'DNS Security - Suspicious TLD Monitoring'
+
+  # ================================
+  # DNS Firewall Rule Groups
+  # ================================
+  DNSSecurityRuleGroup:
+    Type: AWS::Route53Resolver::FirewallRuleGroup
+    Properties:
+      Name: !Sub '${ProjectName}-dns-security-rules-${Environment}'
+      FirewallRules:
+        # High priority rule to block confirmed malicious domains
+        - Name: 'block-malicious-domains'
+          Action: 'BLOCK'
+          BlockResponse: 'NXDOMAIN'
+          FirewallDomainListId: !Ref MaliciousDomainList
+          Priority: 100
+        # Medium priority rule to monitor suspicious TLDs
+        - Name: 'alert-suspicious-tlds'
+          Action: 'ALERT'
+          FirewallDomainListId: !Ref SuspiciousTLDDomainList
+          Priority: 200
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dns-security-rules-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'DNS Security - Main Rule Group'
+
+  # ================================
+  # DNS Firewall Rule Group Association
+  # ================================
+  DNSFirewallAssociation:
+    Type: AWS::Route53Resolver::FirewallRuleGroupAssociation
+    Properties:
+      Name: !Sub '${ProjectName}-vpc-dns-security-${Environment}'
+      FirewallRuleGroupId: !Ref DNSSecurityRuleGroup
+      VpcId: !Ref VpcId
+      Priority: 101
+      MutationProtection: 'ENABLED'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc-dns-security-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'DNS Security - VPC Association'
+
+  # ================================
+  # CloudWatch Log Groups
+  # ================================
+  DNSQueryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/route53resolver/${ProjectName}-dns-security-${Environment}'
+      RetentionInDays: !Ref LogRetentionInDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dns-query-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'DNS Security - Query Logging'
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-dns-security-response-${Environment}'
+      RetentionInDays: !Ref LogRetentionInDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'DNS Security - Lambda Function Logs'
+
+  # ================================
+  # DNS Query Logging Configuration
+  # ================================
+  DNSQueryLogConfig:
+    Type: AWS::Route53Resolver::ResolverQueryLoggingConfig
+    Properties:
+      Name: !Sub '${ProjectName}-dns-security-logs-${Environment}'
+      DestinationArn: !GetAtt DNSQueryLogGroup.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dns-security-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'DNS Security - Query Log Configuration'
+
+  DNSQueryLogAssociation:
+    Type: AWS::Route53Resolver::ResolverQueryLoggingConfigAssociation
+    DependsOn: DNSQueryLogConfig
+    Properties:
+      ResolverQueryLogConfigId: !Ref DNSQueryLogConfig
+      ResourceId: !Ref VpcId
+
+  # ================================
+  # IAM Role for Lambda Function
+  # ================================
+  DNSSecurityLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-dns-security-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DNSSecurityResponsePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref DNSSecurityAlertTopic
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:GetMetricStatistics'
+                  - 'cloudwatch:ListMetrics'
+                  - 'cloudwatch:DescribeAlarms'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                Resource: !GetAtt LambdaLogGroup.Arn
+              - Effect: Allow
+                Action:
+                  - 'route53resolver:GetFirewallDomainList'
+                  - 'route53resolver:UpdateFirewallDomains'
+                  - 'route53resolver:ListFirewallDomainLists'
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dns-security-lambda-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'DNS Security - Lambda Execution Role'
+
+  # ================================
+  # Lambda Function for Automated Response
+  # ================================
+  DNSSecurityResponseFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-dns-security-response-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt DNSSecurityLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      ReservedConcurrencyLimit: 10
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref DNSSecurityAlertTopic
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: !If [IsProduction, 'INFO', 'DEBUG']
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          from typing import Dict, Any
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+
+          # Initialize AWS clients
+          sns = boto3.client('sns')
+          cloudwatch = boto3.client('cloudwatch')
+          route53resolver = boto3.client('route53resolver')
+
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              Process DNS security alerts and execute automated response actions.
+              
+              Args:
+                  event: CloudWatch alarm event or direct invocation
+                  context: Lambda execution context
+                  
+              Returns:
+                  Response with status and processed alert information
+              """
+              try:
+                  logger.info(f"Processing DNS security event: {json.dumps(event, default=str)}")
+                  
+                  # Handle CloudWatch alarm events
+                  if 'Records' in event and event['Records']:
+                      for record in event['Records']:
+                          if record.get('EventSource') == 'aws:sns':
+                              message = json.loads(record['Sns']['Message'])
+                              await process_cloudwatch_alarm(message, context)
+                  else:
+                      # Handle direct invocation for testing
+                      logger.info("Direct invocation detected - processing test event")
+                      await send_test_notification(context)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'DNS security alert processed successfully',
+                          'timestamp': datetime.now().isoformat(),
+                          'function': context.function_name
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing DNS security alert: {str(e)}", exc_info=True)
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'timestamp': datetime.now().isoformat()
+                      })
+                  }
+
+          async def process_cloudwatch_alarm(alarm_data: Dict[str, Any], context: Any) -> None:
+              """Process CloudWatch alarm and execute response actions."""
+              
+              alarm_name = alarm_data.get('AlarmName', 'Unknown')
+              alarm_description = alarm_data.get('AlarmDescription', 'No description')
+              metric_name = alarm_data.get('Trigger', {}).get('MetricName', 'Unknown')
+              new_state = alarm_data.get('NewStateValue', 'Unknown')
+              
+              logger.info(f"Processing alarm: {alarm_name}, State: {new_state}")
+              
+              # Generate detailed alert message
+              alert_message = generate_alert_message(alarm_data, context)
+              
+              # Send notification
+              await send_notification(alert_message, alarm_name)
+              
+              # Execute automated response based on alarm type
+              if 'High-Block-Rate' in alarm_name and new_state == 'ALARM':
+                  await handle_high_block_rate_alert(alarm_data)
+              elif 'Unusual-Volume' in alarm_name and new_state == 'ALARM':
+                  await handle_unusual_volume_alert(alarm_data)
+
+          def generate_alert_message(alarm_data: Dict[str, Any], context: Any) -> str:
+              """Generate comprehensive alert message."""
+              
+              alarm_name = alarm_data.get('AlarmName', 'Unknown')
+              alarm_description = alarm_data.get('AlarmDescription', 'No description')
+              metric_name = alarm_data.get('Trigger', {}).get('MetricName', 'Unknown')
+              new_state = alarm_data.get('NewStateValue', 'Unknown')
+              reason = alarm_data.get('NewStateReason', 'No reason provided')
+              
+              return f"""
+          🚨 DNS Security Alert - {new_state}
+
+          Alarm Details:
+          • Name: {alarm_name}
+          • Description: {alarm_description}
+          • Metric: {metric_name}
+          • State: {new_state}
+          • Reason: {reason}
+          • Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+
+          Environment Information:
+          • AWS Account: {context.invoked_function_arn.split(':')[4]}
+          • Region: {context.invoked_function_arn.split(':')[3]}
+          • Project: {os.environ.get('PROJECT_NAME', 'dns-security')}
+          • Environment: {os.environ.get('ENVIRONMENT', 'unknown')}
+
+          Recommended Response Actions:
+          1. 🔍 Review DNS query logs in CloudWatch
+          2. 🕵️ Investigate source IP addresses and EC2 instances
+          3. 🛡️ Consider updating DNS Firewall rules
+          4. 🚫 Block additional domains or IP ranges if needed
+          5. 📊 Analyze traffic patterns for anomalies
+
+          Automated Response:
+          • Alert notification sent to security team
+          • Event logged for audit trail
+          • Metrics collected for trend analysis
+
+          This alert was generated automatically by the DNS Security Monitoring system.
+          For more information, check CloudWatch Logs: /aws/lambda/{context.function_name}
+          """
+
+          async def send_notification(message: str, alarm_name: str) -> None:
+              """Send SNS notification with alert details."""
+              
+              try:
+                  response = sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=f'DNS Security Alert: {alarm_name}',
+                      Message=message
+                  )
+                  logger.info(f"Notification sent successfully: {response['MessageId']}")
+              except Exception as e:
+                  logger.error(f"Failed to send notification: {str(e)}")
+
+          async def handle_high_block_rate_alert(alarm_data: Dict[str, Any]) -> None:
+              """Handle high DNS block rate alerts with automated response."""
+              
+              logger.info("Executing automated response for high block rate alert")
+              
+              # Log the event for security analysis
+              logger.warning("High DNS block rate detected - potential attack in progress")
+              
+              # Additional automated actions could be implemented here:
+              # - Query recent blocked domains
+              # - Analyze source IPs
+              # - Update security groups
+              # - Trigger additional monitoring
+
+          async def handle_unusual_volume_alert(alarm_data: Dict[str, Any]) -> None:
+              """Handle unusual DNS volume alerts."""
+              
+              logger.info("Executing automated response for unusual volume alert")
+              
+              # Log the event for analysis
+              logger.warning("Unusual DNS query volume detected - investigating patterns")
+
+          async def send_test_notification(context: Any) -> None:
+              """Send test notification for direct invocations."""
+              
+              test_message = f"""
+          ✅ DNS Security Monitoring - Test Alert
+
+          This is a test notification from the DNS Security Response system.
+          
+          Function: {context.function_name}
+          Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+          Environment: {os.environ.get('ENVIRONMENT', 'unknown')}
+          
+          The DNS security monitoring system is operational and ready to respond to threats.
+          """
+              
+              await send_notification(test_message, "Test Alert")
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dns-security-response-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'DNS Security - Automated Response Function'
+
+  # ================================
+  # SNS Topic for Security Alerts
+  # ================================
+  DNSSecurityAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-dns-security-alerts-${Environment}'
+      DisplayName: !Sub 'DNS Security Alerts - ${Environment}'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-dns-security-alerts-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'DNS Security - Alert Notifications'
+
+  # Email subscription for notifications
+  DNSSecurityEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref DNSSecurityAlertTopic
+      Endpoint: !Ref NotificationEmail
+
+  # Lambda subscription for automated response
+  DNSSecurityLambdaSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref DNSSecurityAlertTopic
+      Endpoint: !GetAtt DNSSecurityResponseFunction.Arn
+
+  # Permission for SNS to invoke Lambda
+  DNSSecurityLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DNSSecurityResponseFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref DNSSecurityAlertTopic
+
+  # ================================
+  # CloudWatch Alarms
+  # ================================
+  DNSHighBlockRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-DNS-High-Block-Rate-${Environment}'
+      AlarmDescription: 'High rate of blocked DNS queries detected - potential security threat'
+      MetricName: QueryCount
+      Namespace: AWS/Route53Resolver
+      Statistic: Sum
+      Period: 300  # 5 minutes
+      EvaluationPeriods: 2
+      Threshold: !Ref HighBlockRateThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DNSSecurityAlertTopic
+      OKActions:
+        - !Ref DNSSecurityAlertTopic
+      Dimensions:
+        - Name: FirewallRuleGroupId
+          Value: !Ref DNSSecurityRuleGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DNS-High-Block-Rate-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'DNS Security - High Block Rate Detection'
+
+  DNSUnusualVolumeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-DNS-Unusual-Volume-${Environment}'
+      AlarmDescription: 'Unusual DNS query volume detected - investigate for potential issues'
+      MetricName: QueryCount
+      Namespace: AWS/Route53Resolver
+      Statistic: Sum
+      Period: 900  # 15 minutes
+      EvaluationPeriods: 1
+      Threshold: !Ref UnusualVolumeThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DNSSecurityAlertTopic
+      OKActions:
+        - !Ref DNSSecurityAlertTopic
+      Dimensions:
+        - Name: VpcId
+          Value: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DNS-Unusual-Volume-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'DNS Security - Unusual Volume Detection'
+
+  # Advanced alarms for production environments with detailed monitoring
+  DNSBlockedDomainTrendAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAdvancedAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-DNS-Blocked-Domain-Trend-${Environment}'
+      AlarmDescription: 'Trending increase in blocked domain requests over time'
+      MetricName: QueryCount
+      Namespace: AWS/Route53Resolver
+      Statistic: Sum
+      Period: 3600  # 1 hour
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DNSSecurityAlertTopic
+      Dimensions:
+        - Name: FirewallRuleGroupId
+          Value: !Ref DNSSecurityRuleGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DNS-Blocked-Domain-Trend-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'DNS Security - Blocked Domain Trend Analysis'
+
+  DNSQueryLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAdvancedAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-DNS-Query-Latency-${Environment}'
+      AlarmDescription: 'DNS query latency is higher than expected'
+      MetricName: ResponseTime
+      Namespace: AWS/Route53Resolver
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 100  # milliseconds
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DNSSecurityAlertTopic
+      Dimensions:
+        - Name: VpcId
+          Value: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DNS-Query-Latency-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'DNS Security - Query Performance Monitoring'
+
+  # ================================
+  # CloudWatch Dashboard
+  # ================================
+  DNSSecurityDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      DashboardName: !Sub '${ProjectName}-DNS-Security-Dashboard-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Route53Resolver", "QueryCount", "FirewallRuleGroupId", "${DNSSecurityRuleGroup}" ],
+                  [ ".", ".", "VpcId", "${VpcId}" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "DNS Query Volume",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Route53Resolver", "QueryCount", "FirewallRuleGroupId", "${DNSSecurityRuleGroup}", { "stat": "Sum" } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Blocked DNS Queries",
+                "period": 300
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/route53resolver/${ProjectName}-dns-security-${Environment}'\n| fields @timestamp, query_name, response_code, client_ip\n| filter response_code = \"NXDOMAIN\"\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Blocked DNS Queries",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+# ============================
+# Outputs Section
+# ============================
+Outputs:
+  DNSFirewallRuleGroupId:
+    Description: 'ID of the DNS Firewall Rule Group'
+    Value: !Ref DNSSecurityRuleGroup
+    Export:
+      Name: !Sub '${ProjectName}-dns-firewall-rule-group-${Environment}'
+
+  DNSFirewallAssociationId:
+    Description: 'ID of the DNS Firewall VPC Association'
+    Value: !Ref DNSFirewallAssociation
+    Export:
+      Name: !Sub '${ProjectName}-dns-firewall-association-${Environment}'
+
+  MaliciousDomainListId:
+    Description: 'ID of the Malicious Domain List'
+    Value: !Ref MaliciousDomainList
+    Export:
+      Name: !Sub '${ProjectName}-malicious-domain-list-${Environment}'
+
+  SuspiciousTLDDomainListId:
+    Description: 'ID of the Suspicious TLD Domain List'
+    Value: !Ref SuspiciousTLDDomainList
+    Export:
+      Name: !Sub '${ProjectName}-suspicious-tld-domain-list-${Environment}'
+
+  DNSQueryLogGroupName:
+    Description: 'Name of the CloudWatch Log Group for DNS queries'
+    Value: !Ref DNSQueryLogGroup
+    Export:
+      Name: !Sub '${ProjectName}-dns-query-log-group-${Environment}'
+
+  DNSQueryLogConfigId:
+    Description: 'ID of the DNS Query Logging Configuration'
+    Value: !Ref DNSQueryLogConfig
+    Export:
+      Name: !Sub '${ProjectName}-dns-query-log-config-${Environment}'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the DNS Security Response Lambda Function'
+    Value: !GetAtt DNSSecurityResponseFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-lambda-function-arn-${Environment}'
+
+  LambdaFunctionName:
+    Description: 'Name of the DNS Security Response Lambda Function'
+    Value: !Ref DNSSecurityResponseFunction
+    Export:
+      Name: !Sub '${ProjectName}-lambda-function-name-${Environment}'
+
+  SNSTopicArn:
+    Description: 'ARN of the DNS Security Alert SNS Topic'
+    Value: !Ref DNSSecurityAlertTopic
+    Export:
+      Name: !Sub '${ProjectName}-sns-topic-arn-${Environment}'
+
+  HighBlockRateAlarmName:
+    Description: 'Name of the High Block Rate CloudWatch Alarm'
+    Value: !Ref DNSHighBlockRateAlarm
+    Export:
+      Name: !Sub '${ProjectName}-high-block-rate-alarm-${Environment}'
+
+  UnusualVolumeAlarmName:
+    Description: 'Name of the Unusual Volume CloudWatch Alarm'
+    Value: !Ref DNSUnusualVolumeAlarm
+    Export:
+      Name: !Sub '${ProjectName}-unusual-volume-alarm-${Environment}'
+
+  DashboardURL:
+    Condition: EnableDetailedMonitoringCondition
+    Description: 'URL to the CloudWatch Dashboard'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-DNS-Security-Dashboard-${Environment}'
+
+  DeploymentSummary:
+    Description: 'Summary of deployed DNS security monitoring resources'
+    Value: !Sub |
+      DNS Security Monitoring Solution Deployed Successfully:
+      
+      Core Components:
+      • DNS Firewall Rule Group: ${DNSSecurityRuleGroup}
+      • Malicious Domain List: ${MaliciousDomainList} (${MaliciousDomainList})
+      • Suspicious TLD List: ${SuspiciousTLDDomainList}
+      • VPC Association: ${DNSFirewallAssociation}
+      
+      Monitoring & Alerting:
+      • CloudWatch Log Group: ${DNSQueryLogGroup}
+      • Lambda Response Function: ${DNSSecurityResponseFunction}
+      • SNS Alert Topic: ${DNSSecurityAlertTopic}
+      • High Block Rate Alarm: ${DNSHighBlockRateAlarm}
+      • Unusual Volume Alarm: ${DNSUnusualVolumeAlarm}
+      
+      Next Steps:
+      1. Confirm email subscription for alerts
+      2. Test DNS blocking with sample malicious domains
+      3. Monitor CloudWatch metrics and logs
+      4. Customize alarm thresholds based on traffic patterns
+      5. Add additional domain lists as needed
+      
+      Environment: ${Environment}
+      Project: ${ProjectName}

@@ -1,0 +1,1065 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Glue Workflows Data Pipeline Orchestration - Complete infrastructure for building orchestrated ETL pipelines with AWS Glue'
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+      - Label:
+          default: "Data Storage Configuration"
+        Parameters:
+          - RawDataBucketName
+          - ProcessedDataBucketName
+          - CreateSampleData
+      - Label:
+          default: "Workflow Configuration"
+        Parameters:
+          - WorkflowName
+          - ScheduleExpression
+          - MaxConcurrentRuns
+          - GlueVersion
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - EnableCloudTrail
+          - EnableEncryption
+    ParameterLabels:
+      Environment:
+        default: "Environment Name"
+      ProjectName:
+        default: "Project Name"
+      RawDataBucketName:
+        default: "Raw Data S3 Bucket Name"
+      ProcessedDataBucketName:
+        default: "Processed Data S3 Bucket Name"
+      CreateSampleData:
+        default: "Create Sample Data"
+      WorkflowName:
+        default: "Glue Workflow Name"
+      ScheduleExpression:
+        default: "Schedule Expression"
+      MaxConcurrentRuns:
+        default: "Max Concurrent Workflow Runs"
+      GlueVersion:
+        default: "Glue Version"
+      EnableCloudTrail:
+        default: "Enable CloudTrail Logging"
+      EnableEncryption:
+        default: "Enable S3 Encryption"
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name for resource tagging and naming
+    
+  ProjectName:
+    Type: String
+    Default: data-pipeline
+    Description: Project name used for resource naming and tagging
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '[a-z0-9-]*'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    
+  RawDataBucketName:
+    Type: String
+    Default: ''
+    Description: S3 bucket name for raw data (leave empty for auto-generated name)
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: Must be a valid S3 bucket name or empty
+    
+  ProcessedDataBucketName:
+    Type: String
+    Default: ''
+    Description: S3 bucket name for processed data (leave empty for auto-generated name)
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: Must be a valid S3 bucket name or empty
+    
+  CreateSampleData:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Whether to create sample CSV data for testing
+    
+  WorkflowName:
+    Type: String
+    Default: data-pipeline-workflow
+    Description: Name for the Glue workflow
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '[a-zA-Z0-9-_]*'
+    ConstraintDescription: Must contain only letters, numbers, hyphens, and underscores
+    
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 2 * * ? *)
+    Description: Schedule expression for workflow execution (default is daily at 2 AM UTC)
+    
+  MaxConcurrentRuns:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: Maximum number of concurrent workflow runs
+    
+  GlueVersion:
+    Type: String
+    Default: '4.0'
+    AllowedValues:
+      - '3.0'
+      - '4.0'
+    Description: AWS Glue version for jobs
+    
+  EnableCloudTrail:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable CloudTrail logging for API calls
+    
+  EnableEncryption:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable S3 bucket encryption
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  CreateRawBucket: !Equals [!Ref RawDataBucketName, '']
+  CreateProcessedBucket: !Equals [!Ref ProcessedDataBucketName, '']
+  CreateSampleDataCondition: !Equals [!Ref CreateSampleData, 'true']
+  EnableCloudTrailCondition: !Equals [!Ref EnableCloudTrail, 'true']
+  EnableEncryptionCondition: !Equals [!Ref EnableEncryption, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # ---------------------------------------------------------------------------
+  # S3 BUCKETS
+  # ---------------------------------------------------------------------------
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateRawBucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-raw-data-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [EnableEncryptionCondition, AES256, AES256]
+            BucketKeyEnabled: !If [EnableEncryptionCondition, true, false]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: !If [IsProduction, Enabled, Suspended]
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: RawDataStorage
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  ProcessedDataBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateProcessedBucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-processed-data-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [EnableEncryptionCondition, AES256, AES256]
+            BucketKeyEnabled: !If [EnableEncryptionCondition, true, false]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: !If [IsProduction, Enabled, Suspended]
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: ProcessedDataStorage
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # LAMBDA FUNCTION FOR SAMPLE DATA CREATION
+  # ---------------------------------------------------------------------------
+  SampleDataCreatorRole:
+    Type: AWS::IAM::Role
+    Condition: CreateSampleDataCondition
+    Properties:
+      RoleName: !Sub '${ProjectName}-sample-data-creator-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub 
+                  - '${BucketArn}/*'
+                  - BucketArn: !If
+                    - CreateRawBucket
+                    - !GetAtt RawDataBucket.Arn
+                    - !Sub 'arn:aws:s3:::${RawDataBucketName}'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  SampleDataCreatorFunction:
+    Type: AWS::Lambda::Function
+    Condition: CreateSampleDataCondition
+    Properties:
+      FunctionName: !Sub '${ProjectName}-sample-data-creator-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt SampleDataCreatorRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+          
+          def lambda_handler(event, context):
+              s3 = boto3.client('s3')
+              
+              try:
+                  if event['RequestType'] == 'Create':
+                      # Sample CSV data
+                      csv_data = '''customer_id,name,email,purchase_amount,purchase_date
+          1,John Doe,john@example.com,150.00,2024-01-15
+          2,Jane Smith,jane@example.com,200.00,2024-01-16
+          3,Bob Johnson,bob@example.com,75.00,2024-01-17
+          4,Alice Brown,alice@example.com,300.00,2024-01-18
+          5,Charlie Wilson,charlie@example.com,125.00,2024-01-19
+          6,Diana Davis,diana@example.com,225.00,2024-01-20
+          7,Edward Miller,edward@example.com,180.00,2024-01-21
+          8,Fiona Garcia,fiona@example.com,95.00,2024-01-22
+          9,George Martinez,george@example.com,320.00,2024-01-23
+          10,Hannah Rodriguez,hannah@example.com,140.00,2024-01-24'''
+                      
+                      bucket_name = event['ResourceProperties']['BucketName']
+                      
+                      # Upload sample data to S3
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key='input/sample-data.csv',
+                          Body=csv_data,
+                          ContentType='text/csv'
+                      )
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+                  elif event['RequestType'] == 'Delete':
+                      # Clean up sample data
+                      try:
+                          bucket_name = event['ResourceProperties']['BucketName']
+                          s3.delete_object(Bucket=bucket_name, Key='input/sample-data.csv')
+                      except:
+                          pass  # Ignore errors during cleanup
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  SampleDataCreation:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: CreateSampleDataCondition
+    Properties:
+      ServiceToken: !GetAtt SampleDataCreatorFunction.Arn
+      BucketName: !If
+        - CreateRawBucket
+        - !Ref RawDataBucket
+        - !Ref RawDataBucketName
+
+  # ---------------------------------------------------------------------------
+  # IAM ROLES
+  # ---------------------------------------------------------------------------
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-glue-service-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 
+                    - '${BucketArn}'
+                    - BucketArn: !If
+                      - CreateRawBucket
+                      - !GetAtt RawDataBucket.Arn
+                      - !Sub 'arn:aws:s3:::${RawDataBucketName}'
+                  - !Sub 
+                    - '${BucketArn}/*'
+                    - BucketArn: !If
+                      - CreateRawBucket
+                      - !GetAtt RawDataBucket.Arn
+                      - !Sub 'arn:aws:s3:::${RawDataBucketName}'
+                  - !Sub 
+                    - '${BucketArn}'
+                    - BucketArn: !If
+                      - CreateProcessedBucket
+                      - !GetAtt ProcessedDataBucket.Arn
+                      - !Sub 'arn:aws:s3:::${ProcessedDataBucketName}'
+                  - !Sub 
+                    - '${BucketArn}/*'
+                    - BucketArn: !If
+                      - CreateProcessedBucket
+                      - !GetAtt ProcessedDataBucket.Arn
+                      - !Sub 'arn:aws:s3:::${ProcessedDataBucketName}'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # GLUE DATABASE
+  # ---------------------------------------------------------------------------
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectName}_database_${Environment}'
+        Description: !Sub 'Database for ${ProjectName} workflow data catalog in ${Environment} environment'
+        Parameters:
+          classification: database
+          environment: !Ref Environment
+          project: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # GLUE CRAWLERS
+  # ---------------------------------------------------------------------------
+  SourceDataCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ProjectName}-source-crawler-${Environment}'
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Description: Crawler to discover source data schema
+      Targets:
+        S3Targets:
+          - Path: !Sub 
+            - '${BucketName}/input/'
+            - BucketName: !If
+              - CreateRawBucket
+              - !Ref RawDataBucket
+              - !Ref RawDataBucketName
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": {
+              "AddOrUpdateBehavior": "InheritFromTable"
+            }
+          }
+        }
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        Purpose: SourceDataDiscovery
+
+  TargetDataCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ProjectName}-target-crawler-${Environment}'
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Description: Crawler to discover processed data schema
+      Targets:
+        S3Targets:
+          - Path: !Sub 
+            - '${BucketName}/output/'
+            - BucketName: !If
+              - CreateProcessedBucket
+              - !Ref ProcessedDataBucket
+              - !Ref ProcessedDataBucketName
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": {
+              "AddOrUpdateBehavior": "InheritFromTable"
+            }
+          }
+        }
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        Purpose: ProcessedDataDiscovery
+
+  # ---------------------------------------------------------------------------
+  # GLUE ETL JOB
+  # ---------------------------------------------------------------------------
+  ETLJobScript:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt ScriptUploaderFunction.Arn
+      BucketName: !If
+        - CreateProcessedBucket
+        - !Ref ProcessedDataBucket
+        - !Ref ProcessedDataBucketName
+      DatabaseName: !Ref GlueDatabase
+
+  ScriptUploaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-script-uploader-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:DeleteObject
+                Resource: !Sub 
+                  - '${BucketArn}/*'
+                  - BucketArn: !If
+                    - CreateProcessedBucket
+                    - !GetAtt ProcessedDataBucket.Arn
+                    - !Sub 'arn:aws:s3:::${ProcessedDataBucketName}'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ScriptUploaderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-script-uploader-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ScriptUploaderRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+          
+          def lambda_handler(event, context):
+              s3 = boto3.client('s3')
+              
+              try:
+                  if event['RequestType'] == 'Create':
+                      # ETL script content
+                      script_content = '''import sys
+          from awsglue.transforms import *
+          from awsglue.utils import getResolvedOptions
+          from pyspark.context import SparkContext
+          from awsglue.context import GlueContext
+          from awsglue.job import Job
+          from awsglue.dynamicframe import DynamicFrame
+          
+          # Parse job parameters
+          args = getResolvedOptions(sys.argv, ['JOB_NAME', 'DATABASE_NAME', 'OUTPUT_BUCKET'])
+          
+          # Initialize Glue context
+          sc = SparkContext()
+          glueContext = GlueContext(sc)
+          spark = glueContext.spark_session
+          job = Job(glueContext)
+          job.init(args['JOB_NAME'], args)
+          
+          try:
+              # Read data from the catalog
+              datasource0 = glueContext.create_dynamic_frame.from_catalog(
+                  database=args['DATABASE_NAME'],
+                  table_name="input",
+                  transformation_ctx="datasource0"
+              )
+              
+              # Apply transformations - rename columns and convert data types
+              mapped_data = ApplyMapping.apply(
+                  frame=datasource0,
+                  mappings=[
+                      ("customer_id", "string", "customer_id", "int"),
+                      ("name", "string", "customer_name", "string"),
+                      ("email", "string", "email", "string"),
+                      ("purchase_amount", "string", "purchase_amount", "double"),
+                      ("purchase_date", "string", "purchase_date", "string")
+                  ],
+                  transformation_ctx="mapped_data"
+              )
+              
+              # Filter out null values
+              filtered_data = Filter.apply(
+                  frame=mapped_data,
+                  f=lambda x: x["customer_id"] is not None and x["customer_name"] is not None,
+                  transformation_ctx="filtered_data"
+              )
+              
+              # Add calculated column for purchase category
+              def categorize_purchase(rec):
+                  if rec["purchase_amount"] < 100:
+                      rec["purchase_category"] = "Small"
+                  elif rec["purchase_amount"] < 200:
+                      rec["purchase_category"] = "Medium"
+                  else:
+                      rec["purchase_category"] = "Large"
+                  return rec
+              
+              categorized_data = Map.apply(
+                  frame=filtered_data,
+                  f=categorize_purchase,
+                  transformation_ctx="categorized_data"
+              )
+              
+              # Write to S3 in Parquet format
+              glueContext.write_dynamic_frame.from_options(
+                  frame=categorized_data,
+                  connection_type="s3",
+                  connection_options={
+                      "path": f"s3://{args['OUTPUT_BUCKET']}/output/",
+                      "partitionKeys": ["purchase_category"]
+                  },
+                  format="glueparquet",
+                  transformation_ctx="write_output"
+              )
+              
+              # Job completion
+              job.commit()
+              
+          except Exception as e:
+              print(f"Job failed with error: {str(e)}")
+              raise e
+          '''
+                      
+                      bucket_name = event['ResourceProperties']['BucketName']
+                      
+                      # Upload ETL script to S3
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key='scripts/etl-script.py',
+                          Body=script_content,
+                          ContentType='text/plain'
+                      )
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'ScriptLocation': f's3://{bucket_name}/scripts/etl-script.py'
+                      })
+                      
+                  elif event['RequestType'] == 'Delete':
+                      # Clean up script
+                      try:
+                          bucket_name = event['ResourceProperties']['BucketName']
+                          s3.delete_object(Bucket=bucket_name, Key='scripts/etl-script.py')
+                      except:
+                          pass  # Ignore errors during cleanup
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DataProcessingJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${ProjectName}-data-processing-job-${Environment}'
+      Role: !GetAtt GlueServiceRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !GetAtt ETLJobScript.ScriptLocation
+        PythonVersion: '3'
+      DefaultArguments:
+        '--DATABASE_NAME': !Ref GlueDatabase
+        '--OUTPUT_BUCKET': !If
+          - CreateProcessedBucket
+          - !Ref ProcessedDataBucket
+          - !Ref ProcessedDataBucketName
+        '--job-language': python
+        '--job-bookmark-option': job-bookmark-enable
+        '--enable-metrics': ''
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--enable-continuous-log-filter': 'true'
+        '--enable-spark-ui': 'true'
+        '--spark-event-logs-path': !Sub 
+          - 's3://${BucketName}/spark-logs/'
+          - BucketName: !If
+            - CreateProcessedBucket
+            - !Ref ProcessedDataBucket
+            - !Ref ProcessedDataBucketName
+      GlueVersion: !Ref GlueVersion
+      MaxRetries: 1
+      Timeout: 60
+      NumberOfWorkers: 2
+      WorkerType: G.1X
+      Description: ETL job for data processing in workflow
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        Purpose: DataProcessing
+
+  # ---------------------------------------------------------------------------
+  # GLUE WORKFLOW
+  # ---------------------------------------------------------------------------
+  GlueWorkflow:
+    Type: AWS::Glue::Workflow
+    Properties:
+      Name: !Sub '${ProjectName}-${WorkflowName}-${Environment}'
+      Description: !Sub 'Data pipeline workflow orchestrating crawlers and ETL jobs for ${ProjectName} in ${Environment}'
+      MaxConcurrentRuns: !Ref MaxConcurrentRuns
+      DefaultRunProperties:
+        environment: !Ref Environment
+        pipeline_version: '1.0'
+        project: !Ref ProjectName
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        Purpose: DataOrchestration
+
+  # ---------------------------------------------------------------------------
+  # GLUE TRIGGERS
+  # ---------------------------------------------------------------------------
+  ScheduleTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Sub '${ProjectName}-schedule-trigger-${Environment}'
+      WorkflowName: !Ref GlueWorkflow
+      Type: SCHEDULED
+      Schedule: !Ref ScheduleExpression
+      Description: !Sub 'Daily trigger for ${ProjectName} workflow in ${Environment}'
+      StartOnCreation: true
+      Actions:
+        - CrawlerName: !Ref SourceDataCrawler
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        Purpose: WorkflowScheduling
+
+  CrawlerSuccessTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Sub '${ProjectName}-crawler-success-trigger-${Environment}'
+      WorkflowName: !Ref GlueWorkflow
+      Type: CONDITIONAL
+      Description: Trigger ETL job after successful crawler completion
+      StartOnCreation: true
+      Predicate:
+        Logical: AND
+        Conditions:
+          - LogicalOperator: EQUALS
+            CrawlerName: !Ref SourceDataCrawler
+            CrawlState: SUCCEEDED
+      Actions:
+        - JobName: !Ref DataProcessingJob
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        Purpose: WorkflowDependency
+
+  JobSuccessTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Sub '${ProjectName}-job-success-trigger-${Environment}'
+      WorkflowName: !Ref GlueWorkflow
+      Type: CONDITIONAL
+      Description: Trigger target crawler after successful job completion
+      StartOnCreation: true
+      Predicate:
+        Logical: AND
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref DataProcessingJob
+            State: SUCCEEDED
+      Actions:
+        - CrawlerName: !Ref TargetDataCrawler
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        Purpose: WorkflowDependency
+
+  # ---------------------------------------------------------------------------
+  # CLOUDWATCH RESOURCES
+  # ---------------------------------------------------------------------------
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-access-logs-${Environment}'
+      RetentionInDays: !If [IsProduction, 365, 30]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  GlueWorkflowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws-glue/workflows/${ProjectName}-${Environment}'
+      RetentionInDays: !If [IsProduction, 365, 30]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarms for monitoring
+  WorkflowFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-workflow-failure-${Environment}'
+      AlarmDescription: !Sub 'Alarm for ${ProjectName} workflow failures in ${Environment}'
+      MetricName: glue.workflow.failure
+      Namespace: AWS/Glue
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: WorkflowName
+          Value: !Ref GlueWorkflow
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # CLOUDTRAIL (CONDITIONAL)
+  # ---------------------------------------------------------------------------
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Condition: EnableCloudTrailCondition
+    Properties:
+      BucketName: !Sub '${ProjectName}-cloudtrail-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: !If [IsProduction, 2555, 90]  # 7 years for prod, 90 days for dev
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: EnableCloudTrailCondition
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub '${CloudTrailBucket.Arn}'
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CloudTrailBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+
+  DataPipelineCloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Condition: EnableCloudTrailCondition
+    Properties:
+      TrailName: !Sub '${ProjectName}-data-pipeline-trail-${Environment}'
+      S3BucketName: !Ref CloudTrailBucket
+      IncludeGlobalServiceEvents: true
+      IsLogging: true
+      IsMultiRegionTrail: false
+      EnableLogFileValidation: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: AWS::Glue::Job
+              Values:
+                - !Sub '${DataProcessingJob}/*'
+            - Type: AWS::Glue::Crawler
+              Values:
+                - !Sub '${SourceDataCrawler}/*'
+                - !Sub '${TargetDataCrawler}/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  # Environment Information
+  Environment:
+    Description: Environment name
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+  ProjectName:
+    Description: Project name
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectName'
+
+  # S3 Bucket Information
+  RawDataBucketName:
+    Description: Name of the raw data S3 bucket
+    Value: !If
+      - CreateRawBucket
+      - !Ref RawDataBucket
+      - !Ref RawDataBucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-RawDataBucket'
+
+  ProcessedDataBucketName:
+    Description: Name of the processed data S3 bucket
+    Value: !If
+      - CreateProcessedBucket
+      - !Ref ProcessedDataBucket
+      - !Ref ProcessedDataBucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessedDataBucket'
+
+  # Glue Resources
+  GlueDatabaseName:
+    Description: Name of the Glue database
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabase'
+
+  GlueServiceRoleArn:
+    Description: ARN of the Glue service role
+    Value: !GetAtt GlueServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueServiceRole'
+
+  SourceCrawlerName:
+    Description: Name of the source data crawler
+    Value: !Ref SourceDataCrawler
+    Export:
+      Name: !Sub '${AWS::StackName}-SourceCrawler'
+
+  TargetCrawlerName:
+    Description: Name of the target data crawler
+    Value: !Ref TargetDataCrawler
+    Export:
+      Name: !Sub '${AWS::StackName}-TargetCrawler'
+
+  ETLJobName:
+    Description: Name of the ETL job
+    Value: !Ref DataProcessingJob
+    Export:
+      Name: !Sub '${AWS::StackName}-ETLJob'
+
+  # Workflow Information
+  WorkflowName:
+    Description: Name of the Glue workflow
+    Value: !Ref GlueWorkflow
+    Export:
+      Name: !Sub '${AWS::StackName}-Workflow'
+
+  ScheduleTriggerName:
+    Description: Name of the schedule trigger
+    Value: !Ref ScheduleTrigger
+    Export:
+      Name: !Sub '${AWS::StackName}-ScheduleTrigger'
+
+  # Monitoring Information
+  WorkflowLogGroup:
+    Description: CloudWatch Log Group for workflow logs
+    Value: !Ref GlueWorkflowLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-WorkflowLogGroup'
+
+  WorkflowFailureAlarm:
+    Description: CloudWatch alarm for workflow failures
+    Value: !Ref WorkflowFailureAlarm
+    Export:
+      Name: !Sub '${AWS::StackName}-WorkflowFailureAlarm'
+
+  # CloudTrail Information (Conditional)
+  CloudTrailName:
+    Condition: EnableCloudTrailCondition
+    Description: Name of the CloudTrail for API logging
+    Value: !Ref DataPipelineCloudTrail
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrail'
+
+  # Management URLs
+  GlueConsoleURL:
+    Description: URL to the Glue console for this workflow
+    Value: !Sub 'https://console.aws.amazon.com/glue/home?region=${AWS::Region}#/v2/workflows/view/${GlueWorkflow}'
+
+  CloudWatchLogsURL:
+    Description: URL to CloudWatch Logs for workflow monitoring
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logStream:group=${GlueWorkflowLogGroup}'
+
+  # Deployment Information
+  StackName:
+    Description: Name of this CloudFormation stack
+    Value: !Ref AWS::StackName
+
+  Region:
+    Description: AWS Region where resources are deployed
+    Value: !Ref AWS::Region
+
+  AccountId:
+    Description: AWS Account ID
+    Value: !Ref AWS::AccountId
+
+  # Quick Start Commands
+  StartWorkflowCommand:
+    Description: AWS CLI command to start the workflow manually
+    Value: !Sub 'aws glue start-workflow-run --name ${GlueWorkflow} --region ${AWS::Region}'
+
+  MonitorWorkflowCommand:
+    Description: AWS CLI command to monitor workflow runs
+    Value: !Sub 'aws glue get-workflow-runs --name ${GlueWorkflow} --region ${AWS::Region}'
+
+  ViewCatalogCommand:
+    Description: AWS CLI command to view catalog tables
+    Value: !Sub 'aws glue get-tables --database-name ${GlueDatabase} --region ${AWS::Region}'

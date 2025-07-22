@@ -1,0 +1,1121 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Automated Cost Governance with AWS Config and Lambda Remediation - Implements continuous monitoring and automated remediation for cost optimization'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - EnvironmentName
+          - NotificationEmail
+      - Label:
+          default: "Cost Governance Settings"
+        Parameters:
+          - IdleCpuThreshold
+          - VolumeAgeThreshold
+          - EnableAutomaticRemediation
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - ReportingSchedule
+          - EnableDetailedLogging
+    ParameterLabels:
+      EnvironmentName:
+        default: "Environment Name"
+      NotificationEmail:
+        default: "Notification Email Address"
+      IdleCpuThreshold:
+        default: "Idle CPU Threshold (%)"
+      VolumeAgeThreshold:
+        default: "Volume Age Threshold (days)"
+      EnableAutomaticRemediation:
+        default: "Enable Automatic Remediation"
+      ReportingSchedule:
+        default: "Reporting Schedule"
+      EnableDetailedLogging:
+        default: "Enable Detailed Logging"
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: 'cost-governance'
+    Description: 'Name for the cost governance environment (used for resource naming)'
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+    MinLength: 3
+    MaxLength: 20
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for cost governance notifications'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  IdleCpuThreshold:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 20
+    Description: 'CPU utilization threshold (%) below which instances are considered idle'
+
+  VolumeAgeThreshold:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 30
+    Description: 'Number of days after which unattached volumes are flagged for cleanup'
+
+  EnableAutomaticRemediation:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable automatic remediation actions (vs. notification only)'
+
+  ReportingSchedule:
+    Type: String
+    Default: 'rate(7 days)'
+    AllowedValues: ['rate(1 day)', 'rate(3 days)', 'rate(7 days)', 'rate(14 days)']
+    Description: 'Schedule for automated cost governance reports'
+
+  EnableDetailedLogging:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable detailed CloudWatch logging for Lambda functions'
+
+Conditions:
+  AutoRemediationEnabled: !Equals [!Ref EnableAutomaticRemediation, 'true']
+  DetailedLoggingEnabled: !Equals [!Ref EnableDetailedLogging, 'true']
+
+Resources:
+  # S3 Buckets for Config and Reports
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${EnvironmentName}-config-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ConfigDataRetention
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref ConfigLogGroup
+
+  ConfigBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ConfigBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSConfigBucketPermissionsCheck
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt ConfigBucket.Arn
+            Condition:
+              StringEquals:
+                'AWS:SourceAccount': !Ref 'AWS::AccountId'
+          - Sid: AWSConfigBucketExistenceCheck
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:ListBucket
+            Resource: !GetAtt ConfigBucket.Arn
+            Condition:
+              StringEquals:
+                'AWS:SourceAccount': !Ref 'AWS::AccountId'
+          - Sid: AWSConfigBucketDelivery
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${ConfigBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+                'AWS:SourceAccount': !Ref 'AWS::AccountId'
+
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${EnvironmentName}-reports-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ReportsRetention
+            Status: Enabled
+            ExpirationInDays: 365
+            NoncurrentVersionExpirationInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # CloudWatch Log Groups
+  ConfigLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/config/${EnvironmentName}'
+      RetentionInDays: 30
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: DetailedLoggingEnabled
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${EnvironmentName}'
+      RetentionInDays: 14
+
+  # IAM Roles
+  ConfigServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-config-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/ConfigRole
+      Policies:
+        - PolicyName: ConfigBucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketAcl
+                  - s3:ListBucket
+                Resource: !GetAtt ConfigBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub '${ConfigBucket.Arn}/*'
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CostGovernancePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CloudWatch Metrics and Logs
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                Resource: '*'
+              # EC2 Permissions for Cost Optimization
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeSnapshots
+                  - ec2:DescribeLoadBalancers
+                  - ec2:DescribeImages
+                  - ec2:DescribeRegions
+                  - ec2:DescribeAvailabilityZones
+                  - ec2:CreateTags
+                  - ec2:CreateSnapshot
+                  - ec2:ModifyInstanceAttribute
+                Resource: '*'
+              # Conditional EC2 Remediation Actions
+              - Effect: !If [AutoRemediationEnabled, Allow, Deny]
+                Action:
+                  - ec2:StopInstances
+                  - ec2:TerminateInstances
+                  - ec2:DetachVolume
+                  - ec2:DeleteVolume
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'ec2:ResourceTag/CostOptimization': 'enabled'
+              # ELB Permissions
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - elasticloadbalancing:DescribeTargetGroups
+                  - elasticloadbalancing:DescribeTargetHealth
+                  - elasticloadbalancing:AddTags
+                Resource: '*'
+              # Conditional ELB Remediation
+              - Effect: !If [AutoRemediationEnabled, Allow, Deny]
+                Action:
+                  - elasticloadbalancing:DeleteLoadBalancer
+                Resource: '*'
+              # RDS Permissions
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBClusters
+                  - rds:AddTagsToResource
+                Resource: '*'
+              # SNS Permissions
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref CostGovernanceNotificationTopic
+                  - !Ref CriticalCostActionsTopic
+              # S3 Reports Access
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ReportsBucket.Arn
+                  - !Sub '${ReportsBucket.Arn}/*'
+              # Config Service Access
+              - Effect: Allow
+                Action:
+                  - config:GetComplianceDetailsByConfigRule
+                  - config:GetComplianceDetailsByResource
+                  - config:PutEvaluations
+                  - config:GetResourceConfigHistory
+                Resource: '*'
+              # Systems Manager for Parameter Store
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:PutParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${EnvironmentName}/*'
+
+  # SNS Topics for Notifications
+  CostGovernanceNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${EnvironmentName}-cost-governance-alerts'
+      DisplayName: 'Cost Governance Alerts'
+      KmsMasterKeyId: alias/aws/sns
+
+  CriticalCostActionsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${EnvironmentName}-critical-cost-actions'
+      DisplayName: 'Critical Cost Actions'
+      KmsMasterKeyId: alias/aws/sns
+
+  # SNS Subscriptions
+  CostGovernanceEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref CostGovernanceNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  CriticalCostActionsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref CriticalCostActionsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # SQS Queues for Event Processing
+  CostGovernanceQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${EnvironmentName}-cost-governance-queue'
+      VisibilityTimeoutSeconds: 300
+      MessageRetentionPeriod: 1209600  # 14 days
+      ReceiveMessageWaitTimeSeconds: 20
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt CostGovernanceDLQ.Arn
+        maxReceiveCount: 3
+      KmsMasterKeyId: alias/aws/sqs
+
+  CostGovernanceDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${EnvironmentName}-cost-governance-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+
+  # AWS Config Configuration
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Properties:
+      Name: !Sub '${EnvironmentName}-delivery-channel'
+      S3BucketName: !Ref ConfigBucket
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: Daily
+
+  ConfigConfigurationRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      Name: !Sub '${EnvironmentName}-recorder'
+      RoleARN: !GetAtt ConfigServiceRole.Arn
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+        ResourceTypes: []
+
+  # Config Rules for Cost Governance
+  IdleInstancesRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigConfigurationRecorder
+    Properties:
+      ConfigRuleName: !Sub '${EnvironmentName}-idle-ec2-instances'
+      Description: 'Evaluates whether EC2 instances have low CPU utilization'
+      Source:
+        Owner: AWS
+        SourceIdentifier: EC2_INSTANCE_NO_HIGH_LEVEL_FINDINGS
+      InputParameters: !Sub |
+        {
+          "desiredInstanceTypes": "t3.micro,t3.small,t3.medium,t2.micro,t2.small,t2.medium"
+        }
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Instance
+
+  UnattachedVolumesRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigConfigurationRecorder
+    Properties:
+      ConfigRuleName: !Sub '${EnvironmentName}-unattached-ebs-volumes'
+      Description: 'Evaluates whether EBS volumes are attached to EC2 instances'
+      Source:
+        Owner: AWS
+        SourceIdentifier: EBS_OPTIMIZED_INSTANCE
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Volume
+
+  UnusedLoadBalancersRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigConfigurationRecorder
+    Properties:
+      ConfigRuleName: !Sub '${EnvironmentName}-unused-load-balancers'
+      Description: 'Evaluates whether load balancers have healthy targets'
+      Source:
+        Owner: AWS
+        SourceIdentifier: ELB_CROSS_ZONE_LOAD_BALANCING_ENABLED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::ElasticLoadBalancing::LoadBalancer
+
+  # Lambda Functions
+  IdleInstanceDetectorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-idle-instance-detector'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      ReservedConcurrencyLimit: 5
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref CostGovernanceNotificationTopic
+          CRITICAL_SNS_TOPIC_ARN: !Ref CriticalCostActionsTopic
+          CPU_THRESHOLD: !Ref IdleCpuThreshold
+          ENABLE_AUTO_REMEDIATION: !Ref EnableAutomaticRemediation
+          ENVIRONMENT_NAME: !Ref EnvironmentName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime, timedelta
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              ec2 = boto3.client('ec2')
+              cloudwatch = boto3.client('cloudwatch')
+              sns = boto3.client('sns')
+              
+              cpu_threshold = float(os.environ.get('CPU_THRESHOLD', '5'))
+              enable_remediation = os.environ.get('ENABLE_AUTO_REMEDIATION', 'false') == 'true'
+              
+              logger.info(f"Starting idle instance detection with CPU threshold: {cpu_threshold}%")
+              
+              # Get all running instances with cost optimization enabled
+              try:
+                  response = ec2.describe_instances(
+                      Filters=[
+                          {'Name': 'instance-state-name', 'Values': ['running']},
+                          {'Name': 'tag:CostOptimization', 'Values': ['enabled']}
+                      ]
+                  )
+              except Exception as e:
+                  logger.error(f"Error describing instances: {str(e)}")
+                  return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
+              
+              idle_instances = []
+              
+              for reservation in response['Reservations']:
+                  for instance in reservation['Instances']:
+                      instance_id = instance['InstanceId']
+                      instance_type = instance['InstanceType']
+                      launch_time = instance['LaunchTime']
+                      
+                      # Check CPU utilization for last 7 days
+                      end_time = datetime.utcnow()
+                      start_time = end_time - timedelta(days=7)
+                      
+                      try:
+                          cpu_response = cloudwatch.get_metric_statistics(
+                              Namespace='AWS/EC2',
+                              MetricName='CPUUtilization',
+                              Dimensions=[
+                                  {'Name': 'InstanceId', 'Value': instance_id}
+                              ],
+                              StartTime=start_time,
+                              EndTime=end_time,
+                              Period=3600,
+                              Statistics=['Average']
+                          )
+                          
+                          if cpu_response['Datapoints']:
+                              avg_cpu = sum(dp['Average'] for dp in cpu_response['Datapoints']) / len(cpu_response['Datapoints'])
+                              
+                              if avg_cpu < cpu_threshold:
+                                  idle_instances.append({
+                                      'InstanceId': instance_id,
+                                      'InstanceType': instance_type,
+                                      'AvgCPU': round(avg_cpu, 2),
+                                      'LaunchTime': launch_time.isoformat()
+                                  })
+                                  
+                                  # Tag instance as idle
+                                  ec2.create_tags(
+                                      Resources=[instance_id],
+                                      Tags=[
+                                          {'Key': 'CostOptimization:Status', 'Value': 'Idle'},
+                                          {'Key': 'CostOptimization:DetectedDate', 'Value': datetime.utcnow().isoformat()},
+                                          {'Key': 'CostOptimization:AvgCPU', 'Value': str(round(avg_cpu, 2))}
+                                      ]
+                                  )
+                                  
+                                  logger.info(f"Detected idle instance: {instance_id} (CPU: {avg_cpu:.2f}%)")
+                      
+                      except Exception as e:
+                          logger.error(f"Error checking metrics for {instance_id}: {str(e)}")
+              
+              # Send notification if idle instances found
+              if idle_instances:
+                  message = {
+                      'Alert': 'Idle EC2 Instances Detected',
+                      'Count': len(idle_instances),
+                      'CPUThreshold': f"{cpu_threshold}%",
+                      'AutoRemediationEnabled': enable_remediation,
+                      'Instances': idle_instances,
+                      'Recommendation': 'Consider stopping or terminating idle instances to reduce costs',
+                      'GeneratedAt': datetime.utcnow().isoformat()
+                  }
+                  
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=f'Cost Governance Alert: {len(idle_instances)} Idle EC2 Instances Detected',
+                      Message=json.dumps(message, indent=2)
+                  )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': f'Processed {len(idle_instances)} idle instances',
+                      'idle_instances': idle_instances,
+                      'cpu_threshold': cpu_threshold
+                  })
+              }
+
+  VolumeCleanupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-volume-cleanup'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      ReservedConcurrencyLimit: 3
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref CostGovernanceNotificationTopic
+          CRITICAL_SNS_TOPIC_ARN: !Ref CriticalCostActionsTopic
+          VOLUME_AGE_THRESHOLD: !Ref VolumeAgeThreshold
+          ENABLE_AUTO_REMEDIATION: !Ref EnableAutomaticRemediation
+          ENVIRONMENT_NAME: !Ref EnvironmentName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime, timedelta
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              ec2 = boto3.client('ec2')
+              sns = boto3.client('sns')
+              
+              age_threshold = int(os.environ.get('VOLUME_AGE_THRESHOLD', '7'))
+              enable_remediation = os.environ.get('ENABLE_AUTO_REMEDIATION', 'false') == 'true'
+              
+              logger.info(f"Starting volume cleanup with age threshold: {age_threshold} days")
+              
+              # Get all unattached volumes
+              try:
+                  response = ec2.describe_volumes(
+                      Filters=[
+                          {'Name': 'status', 'Values': ['available']}
+                      ]
+                  )
+              except Exception as e:
+                  logger.error(f"Error describing volumes: {str(e)}")
+                  return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
+              
+              volumes_to_clean = []
+              total_cost_savings = 0
+              
+              for volume in response['Volumes']:
+                  volume_id = volume['VolumeId']
+                  size = volume['Size']
+                  volume_type = volume['VolumeType']
+                  create_time = volume['CreateTime']
+                  
+                  # Calculate age in days
+                  age_days = (datetime.now(create_time.tzinfo) - create_time).days
+                  
+                  # Only process volumes older than threshold
+                  if age_days > age_threshold:
+                      # Estimate monthly cost (rough calculation)
+                      cost_per_gb_month = {
+                          'gp2': 0.10, 'gp3': 0.08, 'io1': 0.125, 
+                          'io2': 0.125, 'st1': 0.045, 'sc1': 0.025
+                      }.get(volume_type, 0.10)
+                      
+                      monthly_cost = size * cost_per_gb_month
+                      total_cost_savings += monthly_cost
+                      
+                      try:
+                          # Create snapshot for safety
+                          snapshot_response = ec2.create_snapshot(
+                              VolumeId=volume_id,
+                              Description=f'Pre-cleanup snapshot of {volume_id} - Cost Governance',
+                              TagSpecifications=[
+                                  {
+                                      'ResourceType': 'snapshot',
+                                      'Tags': [
+                                          {'Key': 'CostOptimization', 'Value': 'true'},
+                                          {'Key': 'OriginalVolumeId', 'Value': volume_id},
+                                          {'Key': 'CreatedBy', 'Value': 'CostGovernance'},
+                                          {'Key': 'CreatedDate', 'Value': datetime.utcnow().isoformat()}
+                                      ]
+                                  }
+                              ]
+                          )
+                          
+                          snapshot_id = snapshot_response['SnapshotId']
+                          
+                          # Tag volume for tracking
+                          ec2.create_tags(
+                              Resources=[volume_id],
+                              Tags=[
+                                  {'Key': 'CostOptimization:ScheduledCleanup', 'Value': 'true'},
+                                  {'Key': 'CostOptimization:BackupSnapshot', 'Value': snapshot_id},
+                                  {'Key': 'CostOptimization:DetectedDate', 'Value': datetime.utcnow().isoformat()}
+                              ]
+                          )
+                          
+                          volumes_to_clean.append({
+                              'VolumeId': volume_id,
+                              'Size': size,
+                              'Type': volume_type,
+                              'AgeDays': age_days,
+                              'MonthlyCostSavings': round(monthly_cost, 2),
+                              'BackupSnapshot': snapshot_id
+                          })
+                          
+                          logger.info(f"Tagged volume {volume_id} for cleanup (snapshot: {snapshot_id})")
+                          
+                      except Exception as e:
+                          logger.error(f"Error processing volume {volume_id}: {str(e)}")
+              
+              # Send notification about volumes found
+              if volumes_to_clean:
+                  message = {
+                      'Alert': 'Unattached EBS Volumes Scheduled for Cleanup',
+                      'Count': len(volumes_to_clean),
+                      'TotalMonthlySavings': f'${total_cost_savings:.2f}',
+                      'VolumeAgeThreshold': f'{age_threshold} days',
+                      'AutoRemediationEnabled': enable_remediation,
+                      'Volumes': volumes_to_clean,
+                      'Action': 'Volumes have been tagged and backed up. Manual confirmation required for deletion.',
+                      'GeneratedAt': datetime.utcnow().isoformat()
+                  }
+                  
+                  topic_arn = os.environ['CRITICAL_SNS_TOPIC_ARN'] if total_cost_savings > 100 else os.environ['SNS_TOPIC_ARN']
+                  
+                  sns.publish(
+                      TopicArn=topic_arn,
+                      Subject=f'Cost Governance Alert: {len(volumes_to_clean)} Unattached Volumes (${total_cost_savings:.2f}/month savings)',
+                      Message=json.dumps(message, indent=2)
+                  )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': f'Processed {len(volumes_to_clean)} unattached volumes',
+                      'potential_monthly_savings': f'${total_cost_savings:.2f}',
+                      'volumes': volumes_to_clean
+                  })
+              }
+
+  CostReporterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-cost-reporter'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      ReservedConcurrencyLimit: 2
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref CostGovernanceNotificationTopic
+          REPORTS_BUCKET: !Ref ReportsBucket
+          ENVIRONMENT_NAME: !Ref EnvironmentName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime, timedelta
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              s3 = boto3.client('s3')
+              sns = boto3.client('sns')
+              ec2 = boto3.client('ec2')
+              config_client = boto3.client('config')
+              
+              logger.info("Starting cost governance report generation")
+              
+              # Generate comprehensive cost governance report
+              report_data = {
+                  'ReportDate': datetime.utcnow().isoformat(),
+                  'EnvironmentName': os.environ.get('ENVIRONMENT_NAME'),
+                  'Summary': {},
+                  'Details': {},
+                  'Recommendations': []
+              }
+              
+              try:
+                  # Get Config compliance summary
+                  try:
+                      compliance_response = config_client.get_compliance_summary_by_config_rule()
+                      
+                      total_compliant = 0
+                      total_noncompliant = 0
+                      
+                      for rule_summary in compliance_response.get('ComplianceSummary', []):
+                          compliant = rule_summary.get('ComplianceSummary', {}).get('CompliantResourceCount', {}).get('CappedCount', 0)
+                          noncompliant = rule_summary.get('ComplianceSummary', {}).get('NonCompliantResourceCount', {}).get('CappedCount', 0)
+                          total_compliant += compliant
+                          total_noncompliant += noncompliant
+                      
+                      report_data['Summary']['ConfigCompliance'] = {
+                          'CompliantResources': total_compliant,
+                          'NonCompliantResources': total_noncompliant,
+                          'CompliancePercentage': round((total_compliant / (total_compliant + total_noncompliant)) * 100, 1) if (total_compliant + total_noncompliant) > 0 else 100
+                      }
+                  except Exception as e:
+                      logger.warning(f"Could not get Config compliance data: {str(e)}")
+                      report_data['Summary']['ConfigCompliance'] = {'Error': 'Config data unavailable'}
+                  
+                  # Analyze EC2 instances
+                  instances_response = ec2.describe_instances()
+                  running_instances = 0
+                  stopped_instances = 0
+                  idle_instances = 0
+                  
+                  for reservation in instances_response['Reservations']:
+                      for instance in reservation['Instances']:
+                          state = instance['State']['Name']
+                          if state == 'running':
+                              running_instances += 1
+                              # Check if tagged as idle
+                              for tag in instance.get('Tags', []):
+                                  if tag['Key'] == 'CostOptimization:Status' and tag['Value'] == 'Idle':
+                                      idle_instances += 1
+                                      break
+                          elif state == 'stopped':
+                              stopped_instances += 1
+                  
+                  # Analyze EBS volumes
+                  volumes_response = ec2.describe_volumes()
+                  attached_volumes = 0
+                  unattached_volumes = 0
+                  total_volume_size = 0
+                  
+                  for volume in volumes_response['Volumes']:
+                      total_volume_size += volume['Size']
+                      if volume['State'] == 'available':
+                          unattached_volumes += 1
+                      else:
+                          attached_volumes += 1
+                  
+                  report_data['Summary']['Resources'] = {
+                      'EC2Instances': {
+                          'Running': running_instances,
+                          'Stopped': stopped_instances,
+                          'Idle': idle_instances
+                      },
+                      'EBSVolumes': {
+                          'Attached': attached_volumes,
+                          'Unattached': unattached_volumes,
+                          'TotalSizeGB': total_volume_size
+                      }
+                  }
+                  
+                  # Calculate estimated savings
+                  estimated_savings = {
+                      'IdleInstances': idle_instances * 50,  # $50/month per idle instance estimate
+                      'UnattachedVolumes': unattached_volumes * 8,  # $8/month per volume estimate
+                      'StoppedInstances': 0  # Stopped instances don't incur compute charges
+                  }
+                  
+                  total_potential_savings = sum(estimated_savings.values())
+                  
+                  report_data['Summary']['CostOptimizationOpportunities'] = {
+                      'EstimatedMonthlySavings': estimated_savings,
+                      'TotalPotentialSavings': total_potential_savings
+                  }
+                  
+                  # Generate recommendations
+                  if idle_instances > 0:
+                      report_data['Recommendations'].append({
+                          'Priority': 'High',
+                          'Category': 'EC2 Optimization',
+                          'Issue': f'{idle_instances} idle instances detected',
+                          'Action': 'Review and consider stopping or terminating consistently idle instances',
+                          'PotentialSavings': f'${idle_instances * 50:.2f}/month'
+                      })
+                  
+                  if unattached_volumes > 0:
+                      report_data['Recommendations'].append({
+                          'Priority': 'Medium',
+                          'Category': 'Storage Optimization',
+                          'Issue': f'{unattached_volumes} unattached EBS volumes',
+                          'Action': 'Review unattached volumes and delete unnecessary ones after creating snapshots',
+                          'PotentialSavings': f'${unattached_volumes * 8:.2f}/month'
+                      })
+                  
+                  if stopped_instances > running_instances * 0.3:
+                      report_data['Recommendations'].append({
+                          'Priority': 'Low',
+                          'Category': 'Resource Management',
+                          'Issue': f'{stopped_instances} stopped instances (high ratio)',
+                          'Action': 'Consider terminating permanently unused stopped instances',
+                          'PotentialSavings': 'Minimal - but improves resource management'
+                      })
+                  
+                  # Save report to S3
+                  report_key = f"cost-governance-reports/{datetime.utcnow().strftime('%Y/%m/%d')}/report-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.json"
+                  
+                  s3.put_object(
+                      Bucket=os.environ['REPORTS_BUCKET'],
+                      Key=report_key,
+                      Body=json.dumps(report_data, indent=2),
+                      ContentType='application/json',
+                      ServerSideEncryption='AES256',
+                      Metadata={
+                          'ReportType': 'CostGovernance',
+                          'GeneratedBy': 'CostReporter',
+                          'Environment': os.environ.get('ENVIRONMENT_NAME', 'unknown')
+                      }
+                  )
+                  
+                  # Generate executive summary for notification
+                  summary_message = f"""
+          Cost Governance Report Summary
+          Environment: {os.environ.get('ENVIRONMENT_NAME')}
+          Generated: {report_data['ReportDate']}
+          
+          Resource Summary:
+          - Running EC2 Instances: {running_instances}
+          - Idle Instances: {idle_instances}
+          - Stopped Instances: {stopped_instances}
+          - Unattached EBS Volumes: {unattached_volumes}
+          - Total EBS Storage: {total_volume_size:,} GB
+          
+          Cost Optimization Opportunities:
+          - Estimated Monthly Savings: ${total_potential_savings:.2f}
+          - Idle Instance Savings: ${estimated_savings['IdleInstances']:.2f}
+          - Volume Cleanup Savings: ${estimated_savings['UnattachedVolumes']:.2f}
+          
+          Recommendations: {len(report_data['Recommendations'])} optimization opportunities identified
+          
+          Full report: s3://{os.environ['REPORTS_BUCKET']}/{report_key}
+                  """
+                  
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=f'Cost Governance Report: ${total_potential_savings:.2f}/month optimization opportunity',
+                      Message=summary_message
+                  )
+                  
+                  logger.info(f"Cost governance report generated successfully: {report_key}")
+                  
+              except Exception as e:
+                  logger.error(f"Error generating cost report: {str(e)}")
+                  # Send error notification
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject='Cost Governance Report Error',
+                      Message=f'Error generating cost governance report: {str(e)}'
+                  )
+                  raise
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': 'Cost governance report generated successfully',
+                      'report_location': f"s3://{os.environ['REPORTS_BUCKET']}/{report_key}",
+                      'summary': report_data['Summary']
+                  })
+              }
+
+  # EventBridge Rules for Automation
+  ConfigComplianceRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${EnvironmentName}-config-compliance-changes'
+      Description: 'Trigger cost remediation on Config compliance changes'
+      EventPattern:
+        source:
+          - aws.config
+        detail-type:
+          - Config Rules Compliance Change
+        detail:
+          configRuleName:
+            - !Ref IdleInstancesRule
+            - !Ref UnattachedVolumesRule
+            - !Ref UnusedLoadBalancersRule
+          newEvaluationResult:
+            complianceType:
+              - NON_COMPLIANT
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt IdleInstanceDetectorFunction.Arn
+          Id: IdleInstanceTarget
+          Input: '{"source": "config-compliance"}'
+        - Arn: !GetAtt VolumeCleanupFunction.Arn
+          Id: VolumeCleanupTarget
+          Input: '{"source": "config-compliance"}'
+
+  ScheduledCostOptimizationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${EnvironmentName}-scheduled-cost-scan'
+      Description: 'Scheduled cost optimization scan and reporting'
+      ScheduleExpression: !Ref ReportingSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt IdleInstanceDetectorFunction.Arn
+          Id: ScheduledIdleDetection
+          Input: '{"source": "scheduled-scan"}'
+        - Arn: !GetAtt VolumeCleanupFunction.Arn
+          Id: ScheduledVolumeCleanup
+          Input: '{"source": "scheduled-scan"}'
+        - Arn: !GetAtt CostReporterFunction.Arn
+          Id: ScheduledReporting
+          Input: '{"source": "scheduled-report"}'
+
+  # Lambda Permissions for EventBridge
+  IdleDetectorEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IdleInstanceDetectorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ConfigComplianceRule.Arn
+
+  IdleDetectorSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IdleInstanceDetectorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledCostOptimizationRule.Arn
+
+  VolumeCleanupEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref VolumeCleanupFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ConfigComplianceRule.Arn
+
+  VolumeCleanupSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref VolumeCleanupFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledCostOptimizationRule.Arn
+
+  CostReporterSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CostReporterFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledCostOptimizationRule.Arn
+
+  # Systems Manager Parameters for Configuration
+  CpuThresholdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${EnvironmentName}/cost-governance/cpu-threshold'
+      Type: String
+      Value: !Ref IdleCpuThreshold
+      Description: 'CPU utilization threshold for idle instance detection'
+
+  VolumeAgeParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${EnvironmentName}/cost-governance/volume-age-threshold'
+      Type: String
+      Value: !Ref VolumeAgeThreshold
+      Description: 'Age threshold in days for unattached volume cleanup'
+
+  AutoRemediationParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${EnvironmentName}/cost-governance/auto-remediation'
+      Type: String
+      Value: !Ref EnableAutomaticRemediation
+      Description: 'Enable or disable automatic remediation actions'
+
+Outputs:
+  ConfigBucketName:
+    Description: 'S3 bucket for AWS Config data'
+    Value: !Ref ConfigBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigBucket'
+
+  ReportsBucketName:
+    Description: 'S3 bucket for cost governance reports'
+    Value: !Ref ReportsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ReportsBucket'
+
+  CostGovernanceTopicArn:
+    Description: 'SNS topic ARN for cost governance notifications'
+    Value: !Ref CostGovernanceNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-CostGovernanceTopic'
+
+  CriticalActionsTopicArn:
+    Description: 'SNS topic ARN for critical cost actions'
+    Value: !Ref CriticalCostActionsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-CriticalActionsTopic'
+
+  IdleInstanceDetectorArn:
+    Description: 'Lambda function ARN for idle instance detection'
+    Value: !GetAtt IdleInstanceDetectorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IdleInstanceDetector'
+
+  VolumeCleanupArn:
+    Description: 'Lambda function ARN for volume cleanup'
+    Value: !GetAtt VolumeCleanupFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-VolumeCleanup'
+
+  CostReporterArn:
+    Description: 'Lambda function ARN for cost reporting'
+    Value: !GetAtt CostReporterFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CostReporter'
+
+  ConfigurationRecorderName:
+    Description: 'AWS Config configuration recorder name'
+    Value: !Ref ConfigConfigurationRecorder
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigRecorder'
+
+  DeploymentInstructions:
+    Description: 'Post-deployment configuration steps'
+    Value: !Sub |
+      1. Confirm email subscriptions for ${NotificationEmail}
+      2. Tag EC2 instances with 'CostOptimization=enabled' to include in monitoring
+      3. AWS Config will start recording after deployment - initial compliance evaluations may take 10-15 minutes
+      4. View cost governance reports in S3 bucket: ${ReportsBucket}
+      5. Monitor Lambda function logs in CloudWatch for detailed execution information
+      6. Adjust thresholds via SSM parameters: /${EnvironmentName}/cost-governance/
+
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for this cost governance solution'
+    Value: !Sub |
+      AWS Config: $${!Select(1, !Split(' ', '~$15-30 (depending on resources monitored)'))}
+      Lambda Functions: ~$5-10 (depending on execution frequency)
+      S3 Storage: ~$1-5 (depending on report retention)
+      SNS/SQS: ~$1-2 (depending on notification volume)
+      Total Estimated: ~$22-47/month
+      Note: Actual costs depend on resource count and optimization activity levels
+
+  SecurityConsiderations:
+    Description: 'Important security considerations for this deployment'
+    Value: !Sub |
+      1. IAM roles follow least privilege principles
+      2. Auto-remediation is ${EnableAutomaticRemediation} - only affects tagged resources
+      3. All data is encrypted at rest (S3, SNS, SQS)
+      4. CloudTrail logs all Lambda remediation actions
+      5. Lambda functions have reserved concurrency to prevent runaway executions
+      6. Critical actions require manual confirmation unless auto-remediation is enabled

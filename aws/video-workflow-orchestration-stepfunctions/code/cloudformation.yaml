@@ -1,0 +1,1617 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Automated Video Workflow Orchestration with Step Functions, MediaConvert, S3, Lambda, and API Gateway'
+
+# ============================================================================
+# PARAMETERS
+# ============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'video-workflow'
+    Description: 'Name prefix for all resources'
+    AllowedPattern: '^[a-z][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must start with lowercase letter, contain only lowercase letters, numbers, and hyphens, and end with alphanumeric character'
+    MinLength: 3
+    MaxLength: 20
+
+  Environment:
+    Type: String
+    Default: 'prod'
+    AllowedValues: ['dev', 'test', 'staging', 'prod']
+    Description: 'Environment name for resource tagging and naming'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for workflow notifications (optional)'
+    Default: ''
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+  VideoFileExtensions:
+    Type: CommaDelimitedList
+    Default: 'mp4,mov,avi,mkv'
+    Description: 'List of video file extensions to process (without dots)'
+
+  EnableCORS:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable CORS for API Gateway'
+
+  DynamoDBReadCapacity:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+    Description: 'DynamoDB read capacity units'
+
+  DynamoDBWriteCapacity:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+    Description: 'DynamoDB write capacity units'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 30
+    MaxValue: 900
+    Description: 'Lambda function timeout in seconds'
+
+# ============================================================================
+# CONDITIONS
+# ============================================================================
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  EnableCORSCondition: !Equals [!Ref EnableCORS, 'true']
+
+# ============================================================================
+# RESOURCES
+# ============================================================================
+Resources:
+
+  # ------------------------------------------------------------------------
+  # S3 BUCKETS
+  # ------------------------------------------------------------------------
+  
+  # Source bucket for video uploads
+  SourceBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${ProjectName}-source-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: 'Enabled'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt WorkflowTriggerFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: 'suffix'
+                    Value: '.mp4'
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt WorkflowTriggerFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: 'suffix'
+                    Value: '.mov'
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt WorkflowTriggerFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: 'suffix'
+                    Value: '.avi'
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt WorkflowTriggerFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: 'suffix'
+                    Value: '.mkv'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+      LifecycleConfiguration:
+        Rules:
+          - Id: 'DeleteIncompleteMultipartUploads'
+            Status: 'Enabled'
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-source-bucket'
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+
+  # Output bucket for processed videos
+  OutputBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${ProjectName}-output-${Environment}-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+      LifecycleConfiguration:
+        Rules:
+          - Id: 'TransitionToIA'
+            Status: 'Enabled'
+            Transitions:
+              - StorageClass: 'STANDARD_IA'
+                TransitionInDays: 30
+              - StorageClass: 'GLACIER'
+                TransitionInDays: 90
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-output-bucket'
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+
+  # Archive bucket for source files
+  ArchiveBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${ProjectName}-archive-${Environment}-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+      LifecycleConfiguration:
+        Rules:
+          - Id: 'TransitionToGlacier'
+            Status: 'Enabled'
+            Transitions:
+              - StorageClass: 'GLACIER'
+                TransitionInDays: 30
+              - StorageClass: 'DEEP_ARCHIVE'
+                TransitionInDays: 90
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-archive-bucket'
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+
+  # ------------------------------------------------------------------------
+  # DYNAMODB TABLE
+  # ------------------------------------------------------------------------
+  
+  # Table for tracking video processing jobs
+  JobsTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: !Sub '${ProjectName}-jobs-${Environment}'
+      BillingMode: 'PROVISIONED'
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref DynamoDBReadCapacity
+        WriteCapacityUnits: !Ref DynamoDBWriteCapacity
+      AttributeDefinitions:
+        - AttributeName: 'JobId'
+          AttributeType: 'S'
+        - AttributeName: 'CreatedAt'
+          AttributeType: 'S'
+        - AttributeName: 'JobStatus'
+          AttributeType: 'S'
+      KeySchema:
+        - AttributeName: 'JobId'
+          KeyType: 'HASH'
+      GlobalSecondaryIndexes:
+        - IndexName: 'CreatedAtIndex'
+          KeySchema:
+            - AttributeName: 'CreatedAt'
+              KeyType: 'HASH'
+          Projection:
+            ProjectionType: 'ALL'
+          ProvisionedThroughput:
+            ReadCapacityUnits: 5
+            WriteCapacityUnits: 5
+        - IndexName: 'StatusIndex'
+          KeySchema:
+            - AttributeName: 'JobStatus'
+              KeyType: 'HASH'
+          Projection:
+            ProjectionType: 'ALL'
+          ProvisionedThroughput:
+            ReadCapacityUnits: 5
+            WriteCapacityUnits: 5
+      StreamSpecification:
+        StreamViewType: 'NEW_AND_OLD_IMAGES'
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-jobs-table'
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+
+  # ------------------------------------------------------------------------
+  # SNS TOPIC
+  # ------------------------------------------------------------------------
+  
+  # SNS topic for workflow notifications
+  NotificationTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      TopicName: !Sub '${ProjectName}-notifications-${Environment}'
+      DisplayName: 'Video Workflow Notifications'
+      KmsMasterKeyId: 'alias/aws/sns'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-notifications'
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+
+  # SNS subscription for email notifications (conditional)
+  NotificationSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: 'email'
+      Endpoint: !Ref NotificationEmail
+
+  # ------------------------------------------------------------------------
+  # IAM ROLES
+  # ------------------------------------------------------------------------
+  
+  # MediaConvert service role
+  MediaConvertRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-mediaconvert-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'mediaconvert.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'MediaConvertWorkflowPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                  - 's3:ListBucket'
+                  - 's3:GetBucketLocation'
+                Resource:
+                  - !Sub '${SourceBucket}'
+                  - !Sub '${SourceBucket}/*'
+                  - !Sub '${OutputBucket}'
+                  - !Sub '${OutputBucket}/*'
+                  - !Sub '${ArchiveBucket}'
+                  - !Sub '${ArchiveBucket}/*'
+              - Effect: 'Allow'
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref NotificationTopic
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-mediaconvert-role'
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+
+  # Lambda execution role
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: 'VideoWorkflowLambdaPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                  - 's3:ListBucket'
+                  - 's3:HeadObject'
+                Resource:
+                  - !Sub '${SourceBucket}'
+                  - !Sub '${SourceBucket}/*'
+                  - !Sub '${OutputBucket}'
+                  - !Sub '${OutputBucket}/*'
+                  - !Sub '${ArchiveBucket}'
+                  - !Sub '${ArchiveBucket}/*'
+              - Effect: 'Allow'
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                Resource:
+                  - !GetAtt JobsTable.Arn
+                  - !Sub '${JobsTable.Arn}/index/*'
+              - Effect: 'Allow'
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref NotificationTopic
+              - Effect: 'Allow'
+                Action:
+                  - 'stepfunctions:StartExecution'
+                Resource: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-workflow-${Environment}'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-lambda-role'
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+
+  # Step Functions execution role
+  StepFunctionsRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-stepfunctions-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'states.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'VideoWorkflowStepFunctionsPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource:
+                  - !GetAtt MetadataExtractorFunction.Arn
+                  - !GetAtt QualityControlFunction.Arn
+                  - !GetAtt PublisherFunction.Arn
+              - Effect: 'Allow'
+                Action:
+                  - 'mediaconvert:CreateJob'
+                  - 'mediaconvert:GetJob'
+                  - 'mediaconvert:ListJobs'
+                Resource: '*'
+              - Effect: 'Allow'
+                Action:
+                  - 'iam:PassRole'
+                Resource: !GetAtt MediaConvertRole.Arn
+              - Effect: 'Allow'
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:Query'
+                Resource:
+                  - !GetAtt JobsTable.Arn
+                  - !Sub '${JobsTable.Arn}/index/*'
+              - Effect: 'Allow'
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:CopyObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub '${SourceBucket}'
+                  - !Sub '${SourceBucket}/*'
+                  - !Sub '${OutputBucket}'
+                  - !Sub '${OutputBucket}/*'
+                  - !Sub '${ArchiveBucket}'
+                  - !Sub '${ArchiveBucket}/*'
+              - Effect: 'Allow'
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-stepfunctions-role'
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+
+  # ------------------------------------------------------------------------
+  # LAMBDA FUNCTIONS
+  # ------------------------------------------------------------------------
+  
+  # Metadata extractor Lambda function
+  MetadataExtractorFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-metadata-extractor-${Environment}'
+      Runtime: 'python3.9'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: 512
+      Environment:
+        Variables:
+          JOBS_TABLE: !Ref JobsTable
+          SOURCE_BUCKET: !Ref SourceBucket
+          OUTPUT_BUCKET: !Ref OutputBucket
+          ARCHIVE_BUCKET: !Ref ArchiveBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          s3 = boto3.client('s3')
+          dynamodb = boto3.resource('dynamodb')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Extract input parameters
+                  bucket = event['bucket']
+                  key = event['key']
+                  job_id = event['jobId']
+                  
+                  # Get file metadata from S3
+                  response = s3.head_object(Bucket=bucket, Key=key)
+                  
+                  # Extract basic metadata (simplified for CloudFormation deployment)
+                  metadata = {
+                      'file_size': response['ContentLength'],
+                      'content_type': response.get('ContentType', 'unknown'),
+                      'last_modified': response['LastModified'].isoformat(),
+                      'etag': response['ETag'],
+                      'storage_class': response.get('StorageClass', 'STANDARD')
+                  }
+                  
+                  # Store metadata in DynamoDB
+                  table = dynamodb.Table(os.environ['JOBS_TABLE'])
+                  table.update_item(
+                      Key={'JobId': job_id},
+                      UpdateExpression='SET VideoMetadata = :metadata, MetadataExtractedAt = :timestamp',
+                      ExpressionAttributeValues={
+                          ':metadata': metadata,
+                          ':timestamp': datetime.utcnow().isoformat()
+                      }
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'metadata': metadata,
+                      'jobId': job_id
+                  }
+                  
+              except Exception as e:
+                  print(f"Error extracting metadata: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'error': str(e),
+                      'jobId': job_id
+                  }
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-metadata-extractor'
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+
+  # Quality control Lambda function
+  QualityControlFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-quality-control-${Environment}'
+      Runtime: 'python3.9'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: 512
+      Environment:
+        Variables:
+          JOBS_TABLE: !Ref JobsTable
+          OUTPUT_BUCKET: !Ref OutputBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          s3 = boto3.client('s3')
+          dynamodb = boto3.resource('dynamodb')
+          
+          def lambda_handler(event, context):
+              try:
+                  outputs = event['outputs']
+                  job_id = event['jobId']
+                  
+                  quality_results = []
+                  
+                  for output in outputs:
+                      bucket = output['bucket']
+                      key_prefix = output['key']
+                      format_type = output['format']
+                      
+                      # Perform quality checks
+                      quality_check = perform_quality_validation(bucket, key_prefix, format_type)
+                      quality_results.append(quality_check)
+                  
+                  # Calculate overall quality score
+                  overall_score = calculate_overall_quality(quality_results)
+                  
+                  # Store results in DynamoDB
+                  table = dynamodb.Table(os.environ['JOBS_TABLE'])
+                  table.update_item(
+                      Key={'JobId': job_id},
+                      UpdateExpression='SET QualityResults = :results, QualityScore = :score, QCCompletedAt = :timestamp',
+                      ExpressionAttributeValues={
+                          ':results': quality_results,
+                          ':score': overall_score,
+                          ':timestamp': datetime.utcnow().isoformat()
+                      }
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'qualityResults': quality_results,
+                      'qualityScore': overall_score,
+                      'passed': overall_score >= 0.8,
+                      'jobId': job_id
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in quality control: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'error': str(e),
+                      'jobId': job_id,
+                      'passed': False
+                  }
+          
+          def perform_quality_validation(bucket, key_prefix, format_type):
+              try:
+                  # List objects with the prefix to check for outputs
+                  response = s3.list_objects_v2(Bucket=bucket, Prefix=key_prefix, MaxKeys=10)
+                  
+                  if 'Contents' not in response or len(response['Contents']) == 0:
+                      return {
+                          'bucket': bucket,
+                          'key_prefix': key_prefix,
+                          'format': format_type,
+                          'error': 'No output files found',
+                          'score': 0.0
+                      }
+                  
+                  # Basic checks
+                  total_size = sum(obj['Size'] for obj in response['Contents'])
+                  file_count = len(response['Contents'])
+                  
+                  checks = {
+                      'files_exist': file_count > 0,
+                      'total_size_valid': total_size > 1000,  # Minimum 1KB total
+                      'file_count_reasonable': file_count <= 50,  # Not too many files
+                      'format_valid': format_type in ['mp4', 'hls', 'thumbnails']
+                  }
+                  
+                  score = sum(1 for check in checks.values() if check) / len(checks)
+                  
+                  return {
+                      'bucket': bucket,
+                      'key_prefix': key_prefix,
+                      'format': format_type,
+                      'checks': checks,
+                      'score': score,
+                      'total_size': total_size,
+                      'file_count': file_count
+                  }
+                  
+              except Exception as e:
+                  return {
+                      'bucket': bucket,
+                      'key_prefix': key_prefix,
+                      'format': format_type,
+                      'error': str(e),
+                      'score': 0.0
+                  }
+          
+          def calculate_overall_quality(quality_results):
+              if not quality_results:
+                  return 0.0
+              
+              total_score = sum(result.get('score', 0.0) for result in quality_results)
+              return total_score / len(quality_results)
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-quality-control'
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+
+  # Publisher Lambda function
+  PublisherFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-publisher-${Environment}'
+      Runtime: 'python3.9'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: 256
+      Environment:
+        Variables:
+          JOBS_TABLE: !Ref JobsTable
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          dynamodb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              try:
+                  job_id = event['jobId']
+                  outputs = event['outputs']
+                  quality_passed = event.get('qualityPassed', False)
+                  
+                  table = dynamodb.Table(os.environ['JOBS_TABLE'])
+                  
+                  if quality_passed:
+                      # Publish successful completion
+                      table.update_item(
+                          Key={'JobId': job_id},
+                          UpdateExpression='SET JobStatus = :status, PublishedAt = :timestamp, OutputLocations = :outputs',
+                          ExpressionAttributeValues={
+                              ':status': 'PUBLISHED',
+                              ':timestamp': datetime.utcnow().isoformat(),
+                              ':outputs': outputs
+                          }
+                      )
+                      
+                      message = f"Video processing completed successfully for job {job_id}"
+                      subject = "Video Processing Success"
+                      
+                  else:
+                      # Mark as failed quality control
+                      table.update_item(
+                          Key={'JobId': job_id},
+                          UpdateExpression='SET JobStatus = :status, FailedAt = :timestamp, FailureReason = :reason',
+                          ExpressionAttributeValues={
+                              ':status': 'FAILED_QC',
+                              ':timestamp': datetime.utcnow().isoformat(),
+                              ':reason': 'Quality control validation failed'
+                          }
+                      )
+                      
+                      message = f"Video processing failed quality control for job {job_id}"
+                      subject = "Video Processing Quality Control Failed"
+                  
+                  # Send SNS notification
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Message=message,
+                      Subject=subject
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'jobId': job_id,
+                      'status': 'PUBLISHED' if quality_passed else 'FAILED_QC',
+                      'message': message
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in publishing: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'error': str(e),
+                      'jobId': job_id
+                  }
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-publisher'
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+
+  # Workflow trigger Lambda function
+  WorkflowTriggerFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-workflow-trigger-${Environment}'
+      Runtime: 'python3.9'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref VideoWorkflowStateMachine
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import urllib.parse
+          from datetime import datetime
+          
+          stepfunctions = boto3.client('stepfunctions')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Handle S3 event vs API Gateway event
+                  if 'Records' in event:
+                      # S3 event
+                      for record in event['Records']:
+                          bucket = record['s3']['bucket']['name']
+                          key = urllib.parse.unquote_plus(record['s3']['object']['key'])
+                          
+                          # Start workflow for each uploaded file
+                          start_workflow(bucket, key)
+                      
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({'message': f'Processed {len(event["Records"])} file(s)'})
+                      }
+                  
+                  else:
+                      # API Gateway event
+                      if 'body' in event:
+                          body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
+                      else:
+                          body = event
+                      
+                      bucket = body.get('bucket')
+                      key = body.get('key')
+                      
+                      if not bucket or not key:
+                          return {
+                              'statusCode': 400,
+                              'headers': get_response_headers(),
+                              'body': json.dumps({'error': 'Missing bucket or key parameter'})
+                          }
+                      
+                      # Start workflow
+                      job_id, execution_arn = start_workflow(bucket, key)
+                      
+                      return {
+                          'statusCode': 200,
+                          'headers': get_response_headers(),
+                          'body': json.dumps({
+                              'jobId': job_id,
+                              'executionArn': execution_arn,
+                              'message': 'Video processing workflow started successfully'
+                          })
+                      }
+                      
+              except Exception as e:
+                  print(f"Error starting workflow: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': get_response_headers(),
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def start_workflow(bucket, key):
+              # Generate unique job ID
+              job_id = str(uuid.uuid4())
+              
+              # Start Step Functions execution
+              response = stepfunctions.start_execution(
+                  stateMachineArn=os.environ['STATE_MACHINE_ARN'],
+                  name=f"video-workflow-{job_id}",
+                  input=json.dumps({
+                      'jobId': job_id,
+                      'bucket': bucket,
+                      'key': key,
+                      'requestedAt': datetime.utcnow().isoformat()
+                  })
+              )
+              
+              return job_id, response['executionArn']
+          
+          def get_response_headers():
+              return {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type',
+                  'Access-Control-Allow-Methods': 'POST, OPTIONS'
+              }
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-workflow-trigger'
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+
+  # ------------------------------------------------------------------------
+  # LAMBDA PERMISSIONS
+  # ------------------------------------------------------------------------
+  
+  # Permission for S3 to invoke the trigger function
+  S3TriggerPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref WorkflowTriggerFunction
+      Principal: 's3.amazonaws.com'
+      Action: 'lambda:InvokeFunction'
+      SourceArn: !Sub '${SourceBucket}'
+
+  # Permission for API Gateway to invoke the trigger function
+  APIGatewayTriggerPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref WorkflowTriggerFunction
+      Principal: 'apigateway.amazonaws.com'
+      Action: 'lambda:InvokeFunction'
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${VideoWorkflowAPI}/*/*'
+
+  # ------------------------------------------------------------------------
+  # STEP FUNCTIONS STATE MACHINE
+  # ------------------------------------------------------------------------
+  
+  # CloudWatch Log Group for Step Functions
+  StepFunctionsLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/stepfunctions/${ProjectName}-workflow-${Environment}'
+      RetentionInDays: 30
+      KmsKeyId: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/logs'
+
+  # Step Functions state machine for video workflow orchestration
+  VideoWorkflowStateMachine:
+    Type: 'AWS::StepFunctions::StateMachine'
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-workflow-${Environment}'
+      StateMachineType: 'EXPRESS'
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      LoggingConfiguration:
+        Level: 'ALL'
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StepFunctionsLogGroup.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Comprehensive video processing workflow with quality control",
+          "StartAt": "InitializeJob",
+          "States": {
+            "InitializeJob": {
+              "Type": "Pass",
+              "Parameters": {
+                "jobId.$": "$.jobId",
+                "bucket.$": "$.bucket",
+                "key.$": "$.key",
+                "outputBucket": "${OutputBucket}",
+                "archiveBucket": "${ArchiveBucket}",
+                "timestamp.$": "$$.State.EnteredTime"
+              },
+              "Next": "RecordJobStart"
+            },
+            "RecordJobStart": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:putItem",
+              "Parameters": {
+                "TableName": "${JobsTable}",
+                "Item": {
+                  "JobId": {
+                    "S.$": "$.jobId"
+                  },
+                  "SourceBucket": {
+                    "S.$": "$.bucket"
+                  },
+                  "SourceKey": {
+                    "S.$": "$.key"
+                  },
+                  "CreatedAt": {
+                    "S.$": "$.timestamp"
+                  },
+                  "JobStatus": {
+                    "S": "STARTED"
+                  }
+                }
+              },
+              "Next": "ParallelProcessing",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ]
+            },
+            "ParallelProcessing": {
+              "Type": "Parallel",
+              "Next": "ProcessingComplete",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "HandleProcessingFailure",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "Branches": [
+                {
+                  "StartAt": "ExtractMetadata",
+                  "States": {
+                    "ExtractMetadata": {
+                      "Type": "Task",
+                      "Resource": "${MetadataExtractorFunction.Arn}",
+                      "Parameters": {
+                        "bucket.$": "$.bucket",
+                        "key.$": "$.key",
+                        "jobId.$": "$.jobId"
+                      },
+                      "End": true,
+                      "Retry": [
+                        {
+                          "ErrorEquals": ["States.TaskFailed"],
+                          "IntervalSeconds": 5,
+                          "MaxAttempts": 2
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "StartAt": "TranscodeVideo",
+                  "States": {
+                    "TranscodeVideo": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::mediaconvert:createJob.sync",
+                      "Parameters": {
+                        "Role": "${MediaConvertRole.Arn}",
+                        "Settings": {
+                          "OutputGroups": [
+                            {
+                              "Name": "MP4_Output",
+                              "OutputGroupSettings": {
+                                "Type": "FILE_GROUP_SETTINGS",
+                                "FileGroupSettings": {
+                                  "Destination.$": "States.Format('s3://${OutputBucket}/mp4/{}/', $.jobId)"
+                                }
+                              },
+                              "Outputs": [
+                                {
+                                  "NameModifier": "_1080p",
+                                  "ContainerSettings": {
+                                    "Container": "MP4"
+                                  },
+                                  "VideoDescription": {
+                                    "Width": 1920,
+                                    "Height": 1080,
+                                    "CodecSettings": {
+                                      "Codec": "H_264",
+                                      "H264Settings": {
+                                        "RateControlMode": "QVBR",
+                                        "QvbrSettings": {
+                                          "QvbrQualityLevel": 8
+                                        },
+                                        "MaxBitrate": 5000000
+                                      }
+                                    }
+                                  },
+                                  "AudioDescriptions": [
+                                    {
+                                      "CodecSettings": {
+                                        "Codec": "AAC",
+                                        "AacSettings": {
+                                          "Bitrate": 128000,
+                                          "CodingMode": "CODING_MODE_2_0",
+                                          "SampleRate": 48000
+                                        }
+                                      }
+                                    }
+                                  ]
+                                }
+                              ]
+                            },
+                            {
+                              "Name": "HLS_Output",
+                              "OutputGroupSettings": {
+                                "Type": "HLS_GROUP_SETTINGS",
+                                "HlsGroupSettings": {
+                                  "Destination.$": "States.Format('s3://${OutputBucket}/hls/{}/', $.jobId)",
+                                  "SegmentLength": 6,
+                                  "OutputSelection": "MANIFESTS_AND_SEGMENTS"
+                                }
+                              },
+                              "Outputs": [
+                                {
+                                  "NameModifier": "_hls_720p",
+                                  "ContainerSettings": {
+                                    "Container": "M3U8"
+                                  },
+                                  "VideoDescription": {
+                                    "Width": 1280,
+                                    "Height": 720,
+                                    "CodecSettings": {
+                                      "Codec": "H_264",
+                                      "H264Settings": {
+                                        "RateControlMode": "QVBR",
+                                        "QvbrSettings": {
+                                          "QvbrQualityLevel": 7
+                                        },
+                                        "MaxBitrate": 3000000
+                                      }
+                                    }
+                                  },
+                                  "AudioDescriptions": [
+                                    {
+                                      "CodecSettings": {
+                                        "Codec": "AAC",
+                                        "AacSettings": {
+                                          "Bitrate": 128000,
+                                          "CodingMode": "CODING_MODE_2_0",
+                                          "SampleRate": 48000
+                                        }
+                                      }
+                                    }
+                                  ]
+                                }
+                              ]
+                            },
+                            {
+                              "Name": "Thumbnail_Output",
+                              "OutputGroupSettings": {
+                                "Type": "FILE_GROUP_SETTINGS",
+                                "FileGroupSettings": {
+                                  "Destination.$": "States.Format('s3://${OutputBucket}/thumbnails/{}/', $.jobId)"
+                                }
+                              },
+                              "Outputs": [
+                                {
+                                  "NameModifier": "_thumb_%04d",
+                                  "ContainerSettings": {
+                                    "Container": "RAW"
+                                  },
+                                  "VideoDescription": {
+                                    "Width": 640,
+                                    "Height": 360,
+                                    "CodecSettings": {
+                                      "Codec": "FRAME_CAPTURE",
+                                      "FrameCaptureSettings": {
+                                        "FramerateNumerator": 1,
+                                        "FramerateDenominator": 10,
+                                        "MaxCaptures": 5,
+                                        "Quality": 80
+                                      }
+                                    }
+                                  }
+                                }
+                              ]
+                            }
+                          ],
+                          "Inputs": [
+                            {
+                              "FileInput.$": "States.Format('s3://{}/{}', $.bucket, $.key)",
+                              "AudioSelectors": {
+                                "Audio Selector 1": {
+                                  "Tracks": [1],
+                                  "DefaultSelection": "DEFAULT"
+                                }
+                              },
+                              "VideoSelector": {
+                                "ColorSpace": "FOLLOW"
+                              },
+                              "TimecodeSource": "EMBEDDED"
+                            }
+                          ]
+                        },
+                        "StatusUpdateInterval": "SECONDS_60",
+                        "UserMetadata": {
+                          "WorkflowJobId.$": "$.jobId",
+                          "SourceFile.$": "$.key"
+                        }
+                      },
+                      "End": true,
+                      "Retry": [
+                        {
+                          "ErrorEquals": ["States.TaskFailed"],
+                          "IntervalSeconds": 30,
+                          "MaxAttempts": 2,
+                          "BackoffRate": 2.0
+                        }
+                      ]
+                    }
+                  }
+                }
+              ]
+            },
+            "ProcessingComplete": {
+              "Type": "Pass",
+              "Parameters": {
+                "jobId.$": "$[0].jobId",
+                "metadata.$": "$[0].metadata",
+                "mediaConvertJob.$": "$[1].Job",
+                "outputs": [
+                  {
+                    "format": "mp4",
+                    "bucket": "${OutputBucket}",
+                    "key.$": "States.Format('mp4/{}/', $[0].jobId)"
+                  },
+                  {
+                    "format": "hls",
+                    "bucket": "${OutputBucket}",
+                    "key.$": "States.Format('hls/{}/', $[0].jobId)"
+                  },
+                  {
+                    "format": "thumbnails",
+                    "bucket": "${OutputBucket}",
+                    "key.$": "States.Format('thumbnails/{}/', $[0].jobId)"
+                  }
+                ]
+              },
+              "Next": "QualityControl"
+            },
+            "QualityControl": {
+              "Type": "Task",
+              "Resource": "${QualityControlFunction.Arn}",
+              "Parameters": {
+                "jobId.$": "$.jobId",
+                "outputs.$": "$.outputs",
+                "metadata.$": "$.metadata"
+              },
+              "Next": "QualityDecision",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 10,
+                  "MaxAttempts": 2
+                }
+              ]
+            },
+            "QualityDecision": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.passed",
+                  "BooleanEquals": true,
+                  "Next": "PublishContent"
+                }
+              ],
+              "Default": "QualityControlFailed"
+            },
+            "PublishContent": {
+              "Type": "Task",
+              "Resource": "${PublisherFunction.Arn}",
+              "Parameters": {
+                "jobId.$": "$.jobId",
+                "outputs.$": "$.outputs",
+                "qualityResults.$": "$.qualityResults",
+                "qualityPassed": true
+              },
+              "Next": "ArchiveSource",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 2
+                }
+              ]
+            },
+            "ArchiveSource": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:s3:copyObject",
+              "Parameters": {
+                "Bucket": "${ArchiveBucket}",
+                "CopySource.$": "States.Format('{}/{}', $.bucket, $.key)",
+                "Key.$": "States.Format('archived/{}/{}', $.jobId, $.key)"
+              },
+              "Next": "WorkflowSuccess",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "WorkflowSuccess",
+                  "Comment": "Archive failure doesn't fail the entire workflow"
+                }
+              ]
+            },
+            "WorkflowSuccess": {
+              "Type": "Pass",
+              "Result": {
+                "status": "SUCCESS",
+                "message": "Video processing workflow completed successfully"
+              },
+              "End": true
+            },
+            "QualityControlFailed": {
+              "Type": "Task",
+              "Resource": "${PublisherFunction.Arn}",
+              "Parameters": {
+                "jobId.$": "$.jobId",
+                "outputs.$": "$.outputs",
+                "qualityResults.$": "$.qualityResults",
+                "qualityPassed": false
+              },
+              "Next": "WorkflowFailure"
+            },
+            "HandleProcessingFailure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:updateItem",
+              "Parameters": {
+                "TableName": "${JobsTable}",
+                "Key": {
+                  "JobId": {
+                    "S.$": "$.jobId"
+                  }
+                },
+                "UpdateExpression": "SET JobStatus = :status, ErrorDetails = :error, FailedAt = :timestamp",
+                "ExpressionAttributeValues": {
+                  ":status": {
+                    "S": "FAILED_PROCESSING"
+                  },
+                  ":error": {
+                    "S.$": "$.error.Cause"
+                  },
+                  ":timestamp": {
+                    "S.$": "$$.State.EnteredTime"
+                  }
+                }
+              },
+              "Next": "WorkflowFailure"
+            },
+            "WorkflowFailure": {
+              "Type": "Fail",
+              "Cause": "Video processing workflow failed"
+            }
+          }
+        }
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-state-machine'
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Project'
+          Value: !Ref ProjectName
+
+  # ------------------------------------------------------------------------
+  # API GATEWAY
+  # ------------------------------------------------------------------------
+  
+  # HTTP API for workflow triggering
+  VideoWorkflowAPI:
+    Type: 'AWS::ApiGatewayV2::Api'
+    Properties:
+      Name: !Sub '${ProjectName}-workflow-api-${Environment}'
+      Description: 'Video processing workflow API'
+      ProtocolType: 'HTTP'
+      CorsConfiguration:
+        AllowCredentials: false
+        AllowHeaders: 
+          - '*'
+        AllowMethods: 
+          - '*'
+        AllowOrigins: 
+          - '*'
+      Tags:
+        Name: !Sub '${ProjectName}-workflow-api'
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  # Lambda integration for API Gateway
+  APILambdaIntegration:
+    Type: 'AWS::ApiGatewayV2::Integration'
+    Properties:
+      ApiId: !Ref VideoWorkflowAPI
+      IntegrationType: 'AWS_PROXY'
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WorkflowTriggerFunction.Arn}/invocations'
+      PayloadFormatVersion: '2.0'
+
+  # API route for starting workflows
+  StartWorkflowRoute:
+    Type: 'AWS::ApiGatewayV2::Route'
+    Properties:
+      ApiId: !Ref VideoWorkflowAPI
+      RouteKey: 'POST /start-workflow'
+      Target: !Sub 'integrations/${APILambdaIntegration}'
+
+  # OPTIONS route for CORS preflight
+  OptionsRoute:
+    Type: 'AWS::ApiGatewayV2::Route'
+    Condition: EnableCORSCondition
+    Properties:
+      ApiId: !Ref VideoWorkflowAPI
+      RouteKey: 'OPTIONS /start-workflow'
+      Target: !Sub 'integrations/${APILambdaIntegration}'
+
+  # API deployment
+  APIDeployment:
+    Type: 'AWS::ApiGatewayV2::Deployment'
+    DependsOn: 
+      - StartWorkflowRoute
+    Properties:
+      ApiId: !Ref VideoWorkflowAPI
+      StageName: 'prod'
+
+  # ------------------------------------------------------------------------
+  # CLOUDWATCH DASHBOARD
+  # ------------------------------------------------------------------------
+  
+  # Monitoring dashboard for the video workflow
+  WorkflowDashboard:
+    Type: 'AWS::CloudWatch::Dashboard'
+    Properties:
+      DashboardName: !Sub '${ProjectName}-monitoring-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/States", "ExecutionsSucceeded", "StateMachineArn", "${VideoWorkflowStateMachine}" ],
+                  [ ".", "ExecutionsFailed", ".", "." ],
+                  [ ".", "ExecutionsStarted", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Step Functions Executions",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/MediaConvert", "JobsCompleted" ],
+                  [ ".", "JobsErrored" ],
+                  [ ".", "JobsSubmitted" ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "MediaConvert Jobs",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${MetadataExtractorFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Lambda Functions Performance"
+              }
+            },
+            {
+              "type": "log",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '${StepFunctionsLogGroup}'\n| fields @timestamp, type, execution_arn\n| filter type = \"ExecutionStarted\" or type = \"ExecutionSucceeded\" or type = \"ExecutionFailed\"\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Workflow Executions",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+Outputs:
+  # Workflow Information
+  StateMachineArn:
+    Description: 'ARN of the Step Functions state machine'
+    Value: !Ref VideoWorkflowStateMachine
+    Export:
+      Name: !Sub '${AWS::StackName}-StateMachineArn'
+
+  StateMachineName:
+    Description: 'Name of the Step Functions state machine'
+    Value: !Sub '${ProjectName}-workflow-${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-StateMachineName'
+
+  # API Gateway Information
+  APIEndpoint:
+    Description: 'API Gateway endpoint for triggering workflows'
+    Value: !Sub 'https://${VideoWorkflowAPI}.execute-api.${AWS::Region}.amazonaws.com/prod'
+    Export:
+      Name: !Sub '${AWS::StackName}-APIEndpoint'
+
+  WorkflowTriggerURL:
+    Description: 'Complete URL for triggering video workflows via API'
+    Value: !Sub 'https://${VideoWorkflowAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/start-workflow'
+    Export:
+      Name: !Sub '${AWS::StackName}-WorkflowTriggerURL'
+
+  # Storage Information
+  SourceBucketName:
+    Description: 'Name of the S3 source bucket for video uploads'
+    Value: !Ref SourceBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-SourceBucket'
+
+  OutputBucketName:
+    Description: 'Name of the S3 output bucket for processed videos'
+    Value: !Ref OutputBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-OutputBucket'
+
+  ArchiveBucketName:
+    Description: 'Name of the S3 archive bucket for source files'
+    Value: !Ref ArchiveBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ArchiveBucket'
+
+  # Database Information
+  JobsTableName:
+    Description: 'Name of the DynamoDB jobs table'
+    Value: !Ref JobsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-JobsTable'
+
+  # Notification Information
+  NotificationTopicArn:
+    Description: 'ARN of the SNS notification topic'
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopic'
+
+  # Lambda Function Information
+  MetadataExtractorFunctionName:
+    Description: 'Name of the metadata extractor Lambda function'
+    Value: !Ref MetadataExtractorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-MetadataExtractorFunction'
+
+  QualityControlFunctionName:
+    Description: 'Name of the quality control Lambda function'
+    Value: !Ref QualityControlFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-QualityControlFunction'
+
+  PublisherFunctionName:
+    Description: 'Name of the publisher Lambda function'
+    Value: !Ref PublisherFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-PublisherFunction'
+
+  # IAM Role Information
+  MediaConvertRoleArn:
+    Description: 'ARN of the MediaConvert service role'
+    Value: !GetAtt MediaConvertRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-MediaConvertRole'
+
+  # Monitoring Information
+  DashboardURL:
+    Description: 'URL to the CloudWatch dashboard'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-monitoring-${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  DashboardName:
+    Description: 'Name of the CloudWatch dashboard'
+    Value: !Sub '${ProjectName}-monitoring-${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardName'
+
+  # Usage Instructions
+  UsageInstructions:
+    Description: 'Quick start instructions for using the video workflow'
+    Value: !Sub |
+      1. Upload video files to: s3://${SourceBucket}/
+      2. Or trigger via API: POST https://${VideoWorkflowAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/start-workflow
+      3. Monitor progress in: ${ProjectName}-monitoring-${Environment} dashboard
+      4. Check job status in: ${JobsTable} DynamoDB table
+      5. Find outputs in: s3://${OutputBucket}/
+
+# ============================================================================
+# METADATA
+# ============================================================================
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: 'Project Configuration'
+        Parameters:
+          - ProjectName
+          - Environment
+          - NotificationEmail
+      - Label:
+          default: 'Video Processing Configuration'
+        Parameters:
+          - VideoFileExtensions
+          - LambdaTimeout
+      - Label:
+          default: 'API Configuration'
+        Parameters:
+          - EnableCORS
+      - Label:
+          default: 'Database Configuration'
+        Parameters:
+          - DynamoDBReadCapacity
+          - DynamoDBWriteCapacity
+    ParameterLabels:
+      ProjectName:
+        default: 'Project Name'
+      Environment:
+        default: 'Environment'
+      NotificationEmail:
+        default: 'Notification Email'
+      VideoFileExtensions:
+        default: 'Video File Extensions'
+      EnableCORS:
+        default: 'Enable CORS'
+      DynamoDBReadCapacity:
+        default: 'DynamoDB Read Capacity'
+      DynamoDBWriteCapacity:
+        default: 'DynamoDB Write Capacity'
+      LambdaTimeout:
+        default: 'Lambda Timeout (seconds)'
+
+  'AWS::CloudFormation::Designer':
+    Description: 'CloudFormation template for automated video workflow orchestration using Step Functions, MediaConvert, S3, Lambda, and API Gateway'

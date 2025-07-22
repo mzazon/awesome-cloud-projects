@@ -1,0 +1,671 @@
+# Google Cloud Infrastructure Manager Configuration
+# Multi-Cloud Cost Optimization with Cloud Billing API and Cloud Recommender
+# This configuration deploys a complete cost optimization system with automated
+# billing analysis, recommendation generation, and optimization workflows
+
+metadata:
+  name: multi-cloud-cost-optimization
+  description: "Intelligent cost optimization system using Cloud Billing API and Cloud Recommender"
+  version: "1.0.0"
+  labels:
+    purpose: cost-optimization
+    category: finops
+    automation: true
+
+# Configuration variables for customization
+variables:
+  # Project configuration
+  - name: project_id
+    description: "Google Cloud Project ID for deploying resources"
+    type: string
+    required: true
+    
+  - name: region
+    description: "Primary region for resource deployment"
+    type: string
+    default: "us-central1"
+    
+  - name: zone
+    description: "Compute zone for regional resources"
+    type: string
+    default: "us-central1-a"
+    
+  # Resource naming
+  - name: resource_prefix
+    description: "Prefix for all resource names"
+    type: string
+    default: "cost-opt"
+    
+  - name: environment
+    description: "Environment tag (dev, staging, prod)"
+    type: string
+    default: "prod"
+    
+  # BigQuery configuration
+  - name: dataset_location
+    description: "BigQuery dataset location"
+    type: string
+    default: "US"
+    
+  - name: data_retention_days
+    description: "Data retention period in days"
+    type: number
+    default: 90
+    
+  # Cloud Functions configuration
+  - name: function_memory
+    description: "Memory allocation for Cloud Functions (MB)"
+    type: number
+    default: 512
+    
+  - name: function_timeout
+    description: "Timeout for Cloud Functions (seconds)"
+    type: number
+    default: 540
+    
+  # Notification configuration
+  - name: notification_email
+    description: "Email address for cost optimization alerts"
+    type: string
+    required: true
+    
+  - name: slack_webhook_url
+    description: "Slack webhook URL for notifications (optional)"
+    type: string
+    default: ""
+
+# Required APIs for the cost optimization system
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-apis
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: cloudbilling.googleapis.com
+      consumerId: projects/$(ref.project_id)
+    metadata:
+      dependsOn: []
+      
+  - name: enable-functions-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: cloudfunctions.googleapis.com
+      consumerId: projects/$(ref.project_id)
+      
+  - name: enable-pubsub-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: pubsub.googleapis.com
+      consumerId: projects/$(ref.project_id)
+      
+  - name: enable-bigquery-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: bigquery.googleapis.com
+      consumerId: projects/$(ref.project_id)
+      
+  - name: enable-storage-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: storage.googleapis.com
+      consumerId: projects/$(ref.project_id)
+      
+  - name: enable-recommender-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: recommender.googleapis.com
+      consumerId: projects/$(ref.project_id)
+      
+  - name: enable-scheduler-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: cloudscheduler.googleapis.com
+      consumerId: projects/$(ref.project_id)
+      
+  - name: enable-monitoring-api
+    type: gcp-types/servicemanagement-v1:servicemanagement.services.enable
+    properties:
+      serviceName: monitoring.googleapis.com
+      consumerId: projects/$(ref.project_id)
+
+  # BigQuery Dataset for cost analytics
+  - name: cost-optimization-dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      datasetId: $(ref.resource_prefix)_cost_optimization
+      projectId: $(ref.project_id)
+      location: $(ref.dataset_location)
+      description: "Cost optimization analytics dataset for multi-project billing analysis"
+      defaultTableExpirationMs: $(expr.eval('$(ref.data_retention_days) * 24 * 60 * 60 * 1000'))
+      labels:
+        purpose: cost-optimization
+        environment: $(ref.environment)
+        managed-by: infrastructure-manager
+      access:
+        - role: OWNER
+          userByEmail: $(ref.notification_email)
+        - role: READER
+          specialGroup: projectReaders
+        - role: WRITER
+          specialGroup: projectWriters
+    metadata:
+      dependsOn: [enable-bigquery-api]
+
+  # BigQuery Tables for structured cost data storage
+  - name: cost-analysis-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      tableId: cost_analysis
+      datasetId: $(ref.cost-optimization-dataset.datasetId)
+      projectId: $(ref.project_id)
+      description: "Table for storing detailed cost analysis data across projects"
+      timePartitioning:
+        type: DAY
+        field: usage_date
+      clustering:
+        fields: [project_id, service]
+      schema:
+        fields:
+          - name: project_id
+            type: STRING
+            mode: REQUIRED
+            description: "Google Cloud Project ID"
+          - name: billing_account_id
+            type: STRING
+            mode: REQUIRED
+            description: "Associated billing account ID"
+          - name: service
+            type: STRING
+            mode: REQUIRED
+            description: "Google Cloud service name"
+          - name: cost
+            type: FLOAT
+            mode: REQUIRED
+            description: "Cost amount in billing currency"
+          - name: currency
+            type: STRING
+            mode: REQUIRED
+            description: "Billing currency code"
+          - name: usage_date
+            type: DATE
+            mode: REQUIRED
+            description: "Date of resource usage"
+          - name: optimization_potential
+            type: FLOAT
+            mode: NULLABLE
+            description: "Estimated cost savings potential"
+          - name: created_timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "Record creation timestamp"
+      labels:
+        purpose: cost-analysis
+        table-type: partitioned
+    metadata:
+      dependsOn: [cost-optimization-dataset]
+
+  # Recommendations table for storing optimization suggestions
+  - name: recommendations-table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      tableId: recommendations
+      datasetId: $(ref.cost-optimization-dataset.datasetId)
+      projectId: $(ref.project_id)
+      description: "Table for storing cost optimization recommendations"
+      timePartitioning:
+        type: DAY
+        field: created_date
+      clustering:
+        fields: [project_id, recommender_type, priority]
+      schema:
+        fields:
+          - name: project_id
+            type: STRING
+            mode: REQUIRED
+            description: "Target project for recommendation"
+          - name: recommender_type
+            type: STRING
+            mode: REQUIRED
+            description: "Type of recommender (machine_type, disk, etc.)"
+          - name: recommendation_id
+            type: STRING
+            mode: REQUIRED
+            description: "Unique recommendation identifier"
+          - name: description
+            type: STRING
+            mode: REQUIRED
+            description: "Human-readable recommendation description"
+          - name: potential_savings
+            type: FLOAT
+            mode: REQUIRED
+            description: "Estimated monthly savings amount"
+          - name: priority
+            type: STRING
+            mode: REQUIRED
+            description: "Recommendation priority level"
+          - name: created_date
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "Recommendation generation timestamp"
+          - name: status
+            type: STRING
+            mode: NULLABLE
+            description: "Implementation status"
+      labels:
+        purpose: recommendations
+        table-type: partitioned
+    metadata:
+      dependsOn: [cost-optimization-dataset]
+
+  # Cloud Storage bucket for reports and data exports
+  - name: cost-optimization-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: $(ref.resource_prefix)-cost-optimization-$(ref.project_id)
+      location: $(ref.region)
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - condition:
+              age: $(ref.data_retention_days)
+            action:
+              type: Delete
+          - condition:
+              numNewerVersions: 3
+            action:
+              type: Delete
+      labels:
+        purpose: cost-optimization
+        environment: $(ref.environment)
+        data-type: reports
+    metadata:
+      dependsOn: [enable-storage-api]
+
+  # Pub/Sub topics for event-driven cost optimization workflows
+  - name: cost-optimization-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project_id)/topics/$(ref.resource_prefix)-cost-optimization
+      labels:
+        purpose: cost-optimization
+        workflow: main
+    metadata:
+      dependsOn: [enable-pubsub-api]
+
+  - name: recommendations-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project_id)/topics/$(ref.resource_prefix)-recommendations-generated
+      labels:
+        purpose: cost-optimization
+        workflow: recommendations
+    metadata:
+      dependsOn: [enable-pubsub-api]
+
+  - name: alerts-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project_id)/topics/$(ref.resource_prefix)-optimization-alerts
+      labels:
+        purpose: cost-optimization
+        workflow: alerts
+    metadata:
+      dependsOn: [enable-pubsub-api]
+
+  # Pub/Sub subscriptions for Cloud Functions triggers
+  - name: cost-analysis-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(ref.project_id)/subscriptions/$(ref.resource_prefix)-cost-analysis-sub
+      topic: $(ref.cost-optimization-topic.name)
+      ackDeadlineSeconds: 600
+      messageRetentionDuration: 604800s  # 7 days
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+      deadLetterPolicy:
+        deadLetterTopic: $(ref.cost-optimization-topic.name)
+        maxDeliveryAttempts: 5
+    metadata:
+      dependsOn: [cost-optimization-topic]
+
+  - name: recommendations-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(ref.project_id)/subscriptions/$(ref.resource_prefix)-recommendations-sub
+      topic: $(ref.recommendations-topic.name)
+      ackDeadlineSeconds: 600
+      messageRetentionDuration: 604800s
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+    metadata:
+      dependsOn: [recommendations-topic]
+
+  - name: alerts-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(ref.project_id)/subscriptions/$(ref.resource_prefix)-alerts-sub
+      topic: $(ref.alerts-topic.name)
+      ackDeadlineSeconds: 300
+      messageRetentionDuration: 604800s
+    metadata:
+      dependsOn: [alerts-topic]
+
+  # Cloud Functions for cost optimization processing
+  # Note: Cloud Functions source code deployment requires separate process
+  # This creates the function infrastructure; source deployment happens via CLI
+  
+  # Service Account for Cloud Functions with appropriate permissions
+  - name: cost-optimization-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: $(ref.resource_prefix)-cost-optimization
+      displayName: "Cost Optimization Service Account"
+      description: "Service account for cost optimization Cloud Functions"
+      project: $(ref.project_id)
+    metadata:
+      dependsOn: []
+
+  # IAM bindings for service account permissions
+  - name: billing-viewer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/billing.viewer
+      member: serviceAccount:$(ref.cost-optimization-service-account.email)
+    metadata:
+      dependsOn: [cost-optimization-service-account]
+
+  - name: bigquery-data-editor-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/bigquery.dataEditor
+      member: serviceAccount:$(ref.cost-optimization-service-account.email)
+    metadata:
+      dependsOn: [cost-optimization-service-account]
+
+  - name: storage-object-admin-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/storage.objectAdmin
+      member: serviceAccount:$(ref.cost-optimization-service-account.email)
+    metadata:
+      dependsOn: [cost-optimization-service-account]
+
+  - name: pubsub-editor-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/pubsub.editor
+      member: serviceAccount:$(ref.cost-optimization-service-account.email)
+    metadata:
+      dependsOn: [cost-optimization-service-account]
+
+  - name: recommender-viewer-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id)
+      role: roles/recommender.viewer
+      member: serviceAccount:$(ref.cost-optimization-service-account.email)
+    metadata:
+      dependsOn: [cost-optimization-service-account]
+
+  # Cloud Scheduler jobs for automated cost analysis
+  - name: daily-cost-analysis-job
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/$(ref.project_id)/locations/$(ref.region)
+      name: projects/$(ref.project_id)/locations/$(ref.region)/jobs/$(ref.resource_prefix)-daily-cost-analysis
+      description: "Daily automated cost analysis across all projects"
+      schedule: "0 9 * * *"  # 9 AM daily
+      timeZone: "America/New_York"
+      pubsubTarget:
+        topicName: $(ref.cost-optimization-topic.name)
+        data: $(base64.encode('{"trigger":"scheduled_analysis","type":"daily","automated":true}'))
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 300s
+        minBackoffDuration: 10s
+        maxBackoffDuration: 300s
+        maxDoublings: 3
+    metadata:
+      dependsOn: [enable-scheduler-api, cost-optimization-topic]
+
+  - name: weekly-cost-report-job
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/$(ref.project_id)/locations/$(ref.region)
+      name: projects/$(ref.project_id)/locations/$(ref.region)/jobs/$(ref.resource_prefix)-weekly-cost-report
+      description: "Weekly comprehensive cost optimization report"
+      schedule: "0 8 * * 1"  # 8 AM every Monday
+      timeZone: "America/New_York"
+      pubsubTarget:
+        topicName: $(ref.cost-optimization-topic.name)
+        data: $(base64.encode('{"trigger":"weekly_report","type":"comprehensive","automated":true}'))
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 300s
+    metadata:
+      dependsOn: [enable-scheduler-api, cost-optimization-topic]
+
+  - name: monthly-optimization-review-job
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/$(ref.project_id)/locations/$(ref.region)
+      name: projects/$(ref.project_id)/locations/$(ref.region)/jobs/$(ref.resource_prefix)-monthly-optimization-review
+      description: "Monthly optimization opportunities review and planning"
+      schedule: "0 7 1 * *"  # 7 AM on the 1st of each month
+      timeZone: "America/New_York"
+      pubsubTarget:
+        topicName: $(ref.cost-optimization-topic.name)
+        data: $(base64.encode('{"trigger":"monthly_review","type":"optimization","automated":true}'))
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 300s
+    metadata:
+      dependsOn: [enable-scheduler-api, cost-optimization-topic]
+
+  # Cloud Monitoring notification channel for alerts
+  - name: email-notification-channel
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    properties:
+      parent: projects/$(ref.project_id)
+      displayName: "Cost Optimization Email Alerts"
+      type: "email"
+      labels:
+        email_address: $(ref.notification_email)
+      description: "Email notifications for cost optimization alerts and high-value opportunities"
+      enabled: true
+      userLabels:
+        purpose: cost-optimization
+        alert-type: email
+    metadata:
+      dependsOn: [enable-monitoring-api]
+
+  # Cloud Monitoring alerting policy for high-value optimizations
+  - name: high-value-optimization-alert
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      parent: projects/$(ref.project_id)
+      displayName: "High-Value Cost Optimization Alert"
+      documentation:
+        content: "Alert triggered when cost optimization opportunities exceed $500 in potential monthly savings"
+        mimeType: "text/markdown"
+      combiner: OR
+      enabled: true
+      conditions:
+        - displayName: "High potential savings detected"
+          conditionThreshold:
+            filter: 'resource.type="global" AND metric.type="custom.googleapis.com/cost_optimization/potential_savings"'
+            comparison: COMPARISON_GT
+            thresholdValue: 500.0
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 300s
+                perSeriesAligner: ALIGN_MEAN
+                crossSeriesReducer: REDUCE_SUM
+                groupByFields: [resource.label.project_id]
+      notificationChannels:
+        - $(ref.email-notification-channel.name)
+      alertStrategy:
+        autoClose: 1800s  # 30 minutes
+      severity: WARNING
+      userLabels:
+        purpose: cost-optimization
+        alert-category: high-value
+    metadata:
+      dependsOn: [enable-monitoring-api, email-notification-channel]
+
+  # Cloud Monitoring dashboard for cost optimization metrics
+  - name: cost-optimization-dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      parent: projects/$(ref.project_id)
+      displayName: "Cost Optimization Dashboard"
+      mosaicLayout:
+        tiles:
+          - width: 6
+            height: 4
+            widget:
+              title: "Daily Cost Analysis Function Executions"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="cloud_function" AND resource.label.function_name=~".*cost.*"'
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_RATE
+                          crossSeriesReducer: REDUCE_SUM
+                yAxis:
+                  label: "Executions per minute"
+                  scale: LINEAR
+          - width: 6
+            height: 4
+            xPos: 6
+            widget:
+              title: "Total Potential Monthly Savings"
+              scorecard:
+                timeSeriesQuery:
+                  timeSeriesFilter:
+                    filter: 'metric.type="custom.googleapis.com/cost_optimization/potential_savings"'
+                    aggregation:
+                      alignmentPeriod: 3600s
+                      perSeriesAligner: ALIGN_MEAN
+                      crossSeriesReducer: REDUCE_SUM
+                sparkChartView:
+                  sparkChartType: SPARK_LINE
+          - width: 12
+            height: 4
+            yPos: 4
+            widget:
+              title: "Cost Optimization Recommendations by Project"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'metric.type="custom.googleapis.com/cost_optimization/recommendation_count"'
+                        aggregation:
+                          alignmentPeriod: 3600s
+                          perSeriesAligner: ALIGN_MEAN
+                          crossSeriesReducer: REDUCE_SUM
+                          groupByFields: [resource.label.project_id]
+                yAxis:
+                  label: "Active Recommendations"
+                  scale: LINEAR
+      labels:
+        purpose: cost-optimization
+        dashboard-type: overview
+    metadata:
+      dependsOn: [enable-monitoring-api]
+
+# Outputs for integration and verification
+outputs:
+  - name: project_id
+    description: "Google Cloud Project ID where resources are deployed"
+    value: $(ref.project_id)
+    
+  - name: bigquery_dataset_id
+    description: "BigQuery dataset ID for cost optimization data"
+    value: $(ref.cost-optimization-dataset.datasetId)
+    
+  - name: storage_bucket_name
+    description: "Cloud Storage bucket name for reports and exports"
+    value: $(ref.cost-optimization-bucket.name)
+    
+  - name: storage_bucket_url
+    description: "Cloud Storage bucket URL for programmatic access"
+    value: "gs://$(ref.cost-optimization-bucket.name)"
+    
+  - name: main_pubsub_topic
+    description: "Main Pub/Sub topic for cost optimization events"
+    value: $(ref.cost-optimization-topic.name)
+    
+  - name: recommendations_topic
+    description: "Pub/Sub topic for recommendation workflow events"
+    value: $(ref.recommendations-topic.name)
+    
+  - name: alerts_topic
+    description: "Pub/Sub topic for optimization alerts"
+    value: $(ref.alerts-topic.name)
+    
+  - name: service_account_email
+    description: "Service account email for Cloud Functions authentication"
+    value: $(ref.cost-optimization-service-account.email)
+    
+  - name: dashboard_url
+    description: "Cloud Monitoring dashboard URL for cost optimization metrics"
+    value: "https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.cost-optimization-dashboard.name)"
+    
+  - name: bigquery_cost_analysis_table
+    description: "BigQuery table for cost analysis data"
+    value: "$(ref.project_id).$(ref.cost-optimization-dataset.datasetId).$(ref.cost-analysis-table.tableId)"
+    
+  - name: bigquery_recommendations_table
+    description: "BigQuery table for optimization recommendations"
+    value: "$(ref.project_id).$(ref.cost-optimization-dataset.datasetId).$(ref.recommendations-table.tableId)"
+    
+  - name: scheduler_jobs
+    description: "List of Cloud Scheduler job names for cost optimization automation"
+    value:
+      - $(ref.daily-cost-analysis-job.name)
+      - $(ref.weekly-cost-report-job.name)
+      - $(ref.monthly-optimization-review-job.name)
+    
+  - name: notification_channel_id
+    description: "Cloud Monitoring notification channel ID for alerts"
+    value: $(ref.email-notification-channel.name)
+    
+  - name: next_steps
+    description: "Next steps for completing the cost optimization deployment"
+    value: |
+      1. Deploy Cloud Functions using gcloud CLI with the generated service account
+      2. Verify BigQuery tables are accessible and properly configured
+      3. Test Pub/Sub message flow by publishing a test message
+      4. Configure additional notification channels (Slack, PagerDuty) if needed
+      5. Review and customize Cloud Scheduler job schedules for your organization
+      6. Set up custom metrics in Cloud Monitoring for advanced alerting
+      7. Configure cross-project billing analysis for organization-wide optimization
+
+# Deployment configuration and metadata
+deployment:
+  # Resource creation order and dependencies are automatically handled
+  # by Infrastructure Manager based on the metadata.dependsOn specifications
+  create_timeout: 1800s  # 30 minutes for complete deployment
+  update_timeout: 1200s  # 20 minutes for updates
+  delete_timeout: 1800s  # 30 minutes for cleanup
+  
+  # Deployment labels for resource management
+  labels:
+    deployment-tool: infrastructure-manager
+    recipe-name: multi-cloud-cost-optimization-billing-api-recommender
+    recipe-category: cost-optimization
+    recipe-difficulty: "300"
+    last-updated: "2025-07-12"
+    managed-by: gcp-recipes

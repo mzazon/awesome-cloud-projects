@@ -1,0 +1,575 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudFormation template for implementing S3 Intelligent Tiering and Lifecycle Management.
+  This template creates an S3 bucket with intelligent tiering configuration, lifecycle policies,
+  CloudWatch monitoring, and optional sample data for testing cost optimization strategies.
+
+Parameters:
+  BucketNamePrefix:
+    Type: String
+    Default: intelligent-tiering-demo
+    Description: Prefix for the S3 bucket name (will be made unique with random suffix)
+    AllowedPattern: ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    MinLength: 3
+    MaxLength: 50
+
+  EnableVersioning:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable S3 bucket versioning for data protection
+
+  IntelligentTieringArchiveDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    MaxValue: 2147483647
+    Description: Days before transitioning to Archive Access tier (90-2147483647)
+
+  IntelligentTieringDeepArchiveDays:
+    Type: Number
+    Default: 180
+    MinValue: 1
+    MaxValue: 2147483647
+    Description: Days before transitioning to Deep Archive Access tier (180-2147483647)
+
+  LifecycleTransitionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: Days before transitioning objects to Intelligent Tiering (1-365)
+
+  IncompleteMultipartUploadDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 365
+    Description: Days to abort incomplete multipart uploads (1-365)
+
+  NoncurrentVersionRetentionDays:
+    Type: Number
+    Default: 365
+    MinValue: 1
+    MaxValue: 2147483647
+    Description: Days to retain non-current object versions (1-2147483647)
+
+  CreateSampleData:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Create sample data for testing intelligent tiering
+
+  CreateCloudWatchDashboard:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Create CloudWatch dashboard for monitoring storage metrics
+
+  Environment:
+    Type: String
+    Default: development
+    AllowedValues: [development, staging, production]
+    Description: Environment designation for resource tagging
+
+Conditions:
+  EnableVersioningCondition: !Equals [!Ref EnableVersioning, 'true']
+  CreateSampleDataCondition: !Equals [!Ref CreateSampleData, 'true']
+  CreateDashboardCondition: !Equals [!Ref CreateCloudWatchDashboard, 'true']
+  IsProduction: !Equals [!Ref Environment, production]
+
+Mappings:
+  EnvironmentMap:
+    development:
+      LogRetentionDays: 7
+      MonitoringLevel: basic
+    staging:
+      LogRetentionDays: 30
+      MonitoringLevel: detailed
+    production:
+      LogRetentionDays: 90
+      MonitoringLevel: detailed
+
+Resources:
+  # S3 Bucket with intelligent tiering and lifecycle management
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${BucketNamePrefix}-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: !If [EnableVersioningCondition, Enabled, Suspended]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref CloudWatchLogGroup
+      LifecycleConfiguration:
+        Rules:
+          - Id: OptimizeStorage
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: !Ref LifecycleTransitionDays
+                StorageClass: INTELLIGENT_TIERING
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: !Ref IncompleteMultipartUploadDays
+            NoncurrentVersionTransitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref NoncurrentVersionRetentionDays
+      IntelligentTieringConfigurations:
+        - Id: EntireBucketConfig
+          Status: Enabled
+          OptionalFields:
+            - BucketKeyStatus
+          Tierings:
+            - AccessTier: ARCHIVE_ACCESS
+              Days: !Ref IntelligentTieringArchiveDays
+            - AccessTier: DEEP_ARCHIVE_ACCESS
+              Days: !Ref IntelligentTieringDeepArchiveDays
+      MetricsConfigurations:
+        - Id: EntireBucket
+          Status: Enabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${BucketNamePrefix}-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: intelligent-tiering-demo
+        - Key: CostOptimization
+          Value: enabled
+        - Key: DataClassification
+          Value: internal
+
+  # CloudWatch Log Group for S3 access logging
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/intelligent-tiering/${BucketNamePrefix}'
+      RetentionInDays: !FindInMap [EnvironmentMap, !Ref Environment, LogRetentionDays]
+      Tags:
+        - Key: Name
+          Value: !Sub '${BucketNamePrefix}-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Dashboard for storage monitoring
+  StorageOptimizationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateDashboardCondition
+    Properties:
+      DashboardName: !Sub 'S3-Storage-Optimization-${BucketNamePrefix}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/S3", "BucketSizeBytes", "BucketName", "${S3Bucket}", "StorageType", "StandardStorage"],
+                  [".", ".", ".", ".", ".", "IntelligentTieringIAStorage"],
+                  [".", ".", ".", ".", ".", "IntelligentTieringAAStorage"],
+                  [".", ".", ".", ".", ".", "IntelligentTieringDAStorage"]
+                ],
+                "view": "timeSeries",
+                "stacked": true,
+                "region": "${AWS::Region}",
+                "title": "S3 Storage Distribution by Class",
+                "period": 86400,
+                "stat": "Average",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/S3", "NumberOfObjects", "BucketName", "${S3Bucket}", "StorageType", "AllStorageTypes"]
+                ],
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "title": "Total Object Count",
+                "period": 86400,
+                "stat": "Average",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/S3", "AllRequests", "BucketName", "${S3Bucket}"],
+                  [".", "GetRequests", ".", "."],
+                  [".", "PutRequests", ".", "."]
+                ],
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "title": "Request Metrics",
+                "period": 3600,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/S3", "4xxErrors", "BucketName", "${S3Bucket}"],
+                  [".", "5xxErrors", ".", "."]
+                ],
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "title": "Error Rates",
+                "period": 3600,
+                "stat": "Sum",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/S3", "FirstByteLatency", "BucketName", "${S3Bucket}"],
+                  [".", "TotalRequestLatency", ".", "."]
+                ],
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "title": "Latency Metrics",
+                "period": 3600,
+                "stat": "Average"
+              }
+            }
+          ]
+        }
+
+  # IAM Role for Lambda function (if needed for advanced monitoring)
+  MonitoringLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: IsProduction
+    Properties:
+      RoleName: !Sub '${BucketNamePrefix}-monitoring-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3MonitoringPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:GetBucketNotification
+                  - s3:GetBucketVersioning
+                  - s3:GetLifecycleConfiguration
+                  - s3:GetIntelligentTieringConfiguration
+                  - s3:ListBucket
+                  - cloudwatch:PutMetricData
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub '${S3Bucket}/*'
+                  - !GetAtt S3Bucket.Arn
+                  - 'arn:aws:cloudwatch:*:*:*'
+                  - 'arn:aws:logs:*:*:*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${BucketNamePrefix}-monitoring-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarm for monitoring storage costs
+  StorageCostAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${BucketNamePrefix}-high-storage-cost'
+      AlarmDescription: 'Alarm when S3 storage costs exceed threshold'
+      MetricName: EstimatedCharges
+      Namespace: AWS/Billing
+      Statistic: Maximum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 100.00
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Currency
+          Value: USD
+        - Name: ServiceName
+          Value: AmazonS3
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${BucketNamePrefix}-cost-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Sample data creation (Custom Resource using Lambda)
+  SampleDataLambda:
+    Type: AWS::Lambda::Function
+    Condition: CreateSampleDataCondition
+    Properties:
+      FunctionName: !Sub '${BucketNamePrefix}-sample-data-creator'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt SampleDataLambdaRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+          from datetime import datetime
+          import base64
+          import os
+
+          def lambda_handler(event, context):
+              s3_client = boto3.client('s3')
+              bucket_name = event['ResourceProperties']['BucketName']
+              
+              try:
+                  if event['RequestType'] == 'Create':
+                      # Create sample files
+                      timestamp = datetime.now().isoformat()
+                      
+                      # Frequent access data
+                      s3_client.put_object(
+                          Bucket=bucket_name,
+                          Key='active/frequent-data.txt',
+                          Body=f'Frequently accessed data - {timestamp}',
+                          Tagging='AccessPattern=Frequent&Department=Operations'
+                      )
+                      
+                      # Archive data
+                      s3_client.put_object(
+                          Bucket=bucket_name,
+                          Key='archive/archive-data.txt',
+                          Body=f'Archive data from {timestamp}',
+                          Tagging='AccessPattern=Archive&Department=Legal'
+                      )
+                      
+                      # Large sample file (1MB)
+                      large_data = base64.b64encode(os.urandom(1024*1024)).decode()
+                      s3_client.put_object(
+                          Bucket=bucket_name,
+                          Key='data/large-sample.dat',
+                          Body=large_data,
+                          Tagging='AccessPattern=Mixed&Department=Engineering'
+                      )
+                      
+                      print(f"Successfully created sample data in bucket {bucket_name}")
+                      
+                  elif event['RequestType'] == 'Delete':
+                      # Clean up sample data
+                      try:
+                          response = s3_client.list_objects_v2(Bucket=bucket_name)
+                          if 'Contents' in response:
+                              objects = [{'Key': obj['Key']} for obj in response['Contents']]
+                              s3_client.delete_objects(
+                                  Bucket=bucket_name,
+                                  Delete={'Objects': objects}
+                              )
+                              print(f"Cleaned up sample data from bucket {bucket_name}")
+                      except Exception as e:
+                          print(f"Error cleaning up: {str(e)}")
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  SampleDataLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: CreateSampleDataCondition
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3SampleDataPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectTagging
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${S3Bucket}/*'
+                  - !GetAtt S3Bucket.Arn
+
+  SampleDataCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: CreateSampleDataCondition
+    Properties:
+      ServiceToken: !GetAtt SampleDataLambda.Arn
+      BucketName: !Ref S3Bucket
+    DependsOn: S3Bucket
+
+Outputs:
+  BucketName:
+    Description: Name of the S3 bucket with intelligent tiering enabled
+    Value: !Ref S3Bucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketName'
+
+  BucketArn:
+    Description: ARN of the S3 bucket
+    Value: !GetAtt S3Bucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketArn'
+
+  BucketDomainName:
+    Description: Domain name of the S3 bucket
+    Value: !GetAtt S3Bucket.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketDomainName'
+
+  CloudWatchLogGroup:
+    Description: CloudWatch Log Group for S3 access logs
+    Value: !Ref CloudWatchLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  DashboardURL:
+    Condition: CreateDashboardCondition
+    Description: URL to the CloudWatch dashboard for storage monitoring
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${StorageOptimizationDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  IntelligentTieringConfiguration:
+    Description: Details about the intelligent tiering configuration
+    Value: !Sub |
+      Archive Access Tier: ${IntelligentTieringArchiveDays} days
+      Deep Archive Access Tier: ${IntelligentTieringDeepArchiveDays} days
+      Lifecycle Transition: ${LifecycleTransitionDays} days
+
+  CostOptimizationSummary:
+    Description: Summary of cost optimization features enabled
+    Value: !Sub |
+      - Intelligent Tiering: Enabled with Archive (${IntelligentTieringArchiveDays}d) and Deep Archive (${IntelligentTieringDeepArchiveDays}d)
+      - Lifecycle Policies: Transition to IT after ${LifecycleTransitionDays} days
+      - Incomplete Multipart Upload Cleanup: ${IncompleteMultipartUploadDays} days
+      - Version Management: Non-current versions expire after ${NoncurrentVersionRetentionDays} days
+      - Monitoring: CloudWatch metrics and dashboard enabled
+      - Encryption: AES-256 server-side encryption
+      - Expected Savings: 20-68% reduction in storage costs
+
+  Environment:
+    Description: Environment designation for this deployment
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+  StackCreationTime:
+    Description: Timestamp when the stack was created
+    Value: !Sub '${AWS::Timestamp}'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Bucket Configuration"
+        Parameters:
+          - BucketNamePrefix
+          - EnableVersioning
+          - Environment
+      - Label:
+          default: "Intelligent Tiering Settings"
+        Parameters:
+          - IntelligentTieringArchiveDays
+          - IntelligentTieringDeepArchiveDays
+      - Label:
+          default: "Lifecycle Management"
+        Parameters:
+          - LifecycleTransitionDays
+          - IncompleteMultipartUploadDays
+          - NoncurrentVersionRetentionDays
+      - Label:
+          default: "Optional Features"
+        Parameters:
+          - CreateSampleData
+          - CreateCloudWatchDashboard
+    ParameterLabels:
+      BucketNamePrefix:
+        default: "S3 Bucket Name Prefix"
+      EnableVersioning:
+        default: "Enable Bucket Versioning"
+      IntelligentTieringArchiveDays:
+        default: "Archive Access Transition (Days)"
+      IntelligentTieringDeepArchiveDays:
+        default: "Deep Archive Access Transition (Days)"
+      LifecycleTransitionDays:
+        default: "Lifecycle Transition to IT (Days)"
+      IncompleteMultipartUploadDays:
+        default: "Abort Incomplete Uploads (Days)"
+      NoncurrentVersionRetentionDays:
+        default: "Version Retention Period (Days)"
+      CreateSampleData:
+        default: "Create Sample Test Data"
+      CreateCloudWatchDashboard:
+        default: "Create Monitoring Dashboard"
+      Environment:
+        default: "Environment Type"

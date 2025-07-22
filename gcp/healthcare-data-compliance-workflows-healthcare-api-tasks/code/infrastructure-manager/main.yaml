@@ -1,0 +1,913 @@
+# Healthcare Data Compliance Workflows - Infrastructure Manager Configuration
+# This configuration deploys a comprehensive healthcare data compliance system using
+# Google Cloud Healthcare API, Cloud Tasks, Cloud Functions, and associated services.
+
+apiVersion: config.gcp.crossplane.io/v1
+kind: Configuration
+metadata:
+  name: healthcare-compliance-workflows
+  labels:
+    app: healthcare-compliance
+    compliance: hipaa
+    category: healthcare
+
+# Configure variable inputs for the deployment
+variables:
+  # Project configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID for healthcare compliance deployment"
+    default: "healthcare-compliance-project"
+  
+  # Regional configuration
+  region:
+    type: string
+    description: "Primary region for healthcare data processing"
+    default: "us-central1"
+  
+  location:
+    type: string
+    description: "Location for healthcare dataset (must be HIPAA-compliant region)"
+    default: "us-central1"
+  
+  zone:
+    type: string
+    description: "Zone for compute resources"
+    default: "us-central1-a"
+  
+  # Resource naming
+  resource_suffix:
+    type: string
+    description: "Unique suffix for resource names"
+    default: "001"
+  
+  # Compliance configuration
+  enable_audit_logging:
+    type: bool
+    description: "Enable comprehensive audit logging for compliance"
+    default: true
+  
+  retention_days:
+    type: integer
+    description: "Data retention period in days for compliance"
+    default: 2555  # 7 years for healthcare compliance
+  
+  # Security configuration
+  enable_cmek:
+    type: bool
+    description: "Enable Customer Managed Encryption Keys (CMEK)"
+    default: true
+  
+  # Monitoring configuration
+  enable_monitoring:
+    type: bool
+    description: "Enable monitoring and alerting"
+    default: true
+
+# Infrastructure resources
+resources:
+  # Enable required Google Cloud APIs
+  - name: healthcare-api
+    type: gcp-types/serviceusage-v1:services
+    metadata:
+      name: healthcare-api
+    properties:
+      name: projects/$(ref.project_id.name)/services/healthcare.googleapis.com
+      
+  - name: cloud-tasks-api
+    type: gcp-types/serviceusage-v1:services
+    metadata:
+      name: cloud-tasks-api
+    properties:
+      name: projects/$(ref.project_id.name)/services/cloudtasks.googleapis.com
+      
+  - name: cloud-functions-api
+    type: gcp-types/serviceusage-v1:services
+    metadata:
+      name: cloud-functions-api
+    properties:
+      name: projects/$(ref.project_id.name)/services/cloudfunctions.googleapis.com
+      
+  - name: pub-sub-api
+    type: gcp-types/serviceusage-v1:services
+    metadata:
+      name: pub-sub-api
+    properties:
+      name: projects/$(ref.project_id.name)/services/pubsub.googleapis.com
+      
+  - name: bigquery-api
+    type: gcp-types/serviceusage-v1:services
+    metadata:
+      name: bigquery-api
+    properties:
+      name: projects/$(ref.project_id.name)/services/bigquery.googleapis.com
+      
+  - name: cloud-storage-api
+    type: gcp-types/serviceusage-v1:services
+    metadata:
+      name: cloud-storage-api
+    properties:
+      name: projects/$(ref.project_id.name)/services/storage.googleapis.com
+      
+  - name: cloud-logging-api
+    type: gcp-types/serviceusage-v1:services
+    metadata:
+      name: cloud-logging-api
+    properties:
+      name: projects/$(ref.project_id.name)/services/logging.googleapis.com
+      
+  - name: cloud-monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    metadata:
+      name: cloud-monitoring-api
+    properties:
+      name: projects/$(ref.project_id.name)/services/monitoring.googleapis.com
+
+  # Healthcare Dataset - Foundation for FHIR data storage
+  - name: healthcare-dataset
+    type: gcp-types/healthcare-v1:projects.locations.datasets
+    metadata:
+      name: healthcare-dataset-$(var.resource_suffix)
+    properties:
+      parent: projects/$(var.project_id)/locations/$(var.location)
+      datasetId: healthcare-dataset-$(var.resource_suffix)
+      dataset:
+        name: healthcare-dataset-$(var.resource_suffix)
+        location: $(var.location)
+        timeZone: "UTC"
+        # Enable audit logging for HIPAA compliance
+        auditConfigs:
+          - service: healthcare.googleapis.com
+            auditLogConfigs:
+              - logType: DATA_READ
+                exemptedMembers: []
+              - logType: DATA_WRITE
+                exemptedMembers: []
+              - logType: ADMIN_READ
+                exemptedMembers: []
+    metadata:
+      dependsOn:
+        - healthcare-api
+
+  # FHIR Store - Secure storage for healthcare data
+  - name: fhir-store
+    type: gcp-types/healthcare-v1:projects.locations.datasets.fhirStores
+    metadata:
+      name: fhir-store-$(var.resource_suffix)
+    properties:
+      parent: $(ref.healthcare-dataset.name)
+      fhirStoreId: fhir-store-$(var.resource_suffix)
+      fhirStore:
+        name: fhir-store-$(var.resource_suffix)
+        version: R4
+        enableUpdateCreate: true
+        disableReferentialIntegrity: false
+        disableResourceVersioning: false
+        # Enable Pub/Sub notifications for real-time compliance processing
+        notificationConfigs:
+          - pubsubTopic: $(ref.fhir-events-topic.name)
+            sendFullResource: false
+            sendPreviousResourceOnDelete: false
+        # Configure search parameters for compliance queries
+        searchConfig:
+          searchParameters:
+            - canonicalUrl: "http://hl7.org/fhir/SearchParameter/Patient-identifier"
+              parameter: "identifier"
+            - canonicalUrl: "http://hl7.org/fhir/SearchParameter/Patient-name"
+              parameter: "name"
+            - canonicalUrl: "http://hl7.org/fhir/SearchParameter/Observation-patient"
+              parameter: "patient"
+    metadata:
+      dependsOn:
+        - healthcare-dataset
+        - fhir-events-topic
+
+  # Pub/Sub Topic for FHIR Events - Real-time event processing
+  - name: fhir-events-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    metadata:
+      name: fhir-events-topic-$(var.resource_suffix)
+    properties:
+      name: projects/$(var.project_id)/topics/fhir-events-topic-$(var.resource_suffix)
+      topic:
+        name: fhir-events-topic-$(var.resource_suffix)
+        # Enable message retention for compliance audit trail
+        messageRetentionDuration: 604800s  # 7 days
+        labels:
+          purpose: "healthcare-compliance"
+          data-type: "phi-events"
+          compliance: "hipaa"
+    metadata:
+      dependsOn:
+        - pub-sub-api
+
+  # Pub/Sub Subscription for FHIR Events
+  - name: fhir-events-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    metadata:
+      name: fhir-events-subscription-$(var.resource_suffix)
+    properties:
+      name: projects/$(var.project_id)/subscriptions/fhir-events-subscription-$(var.resource_suffix)
+      subscription:
+        name: fhir-events-subscription-$(var.resource_suffix)
+        topic: $(ref.fhir-events-topic.name)
+        # Configure subscription for reliable message processing
+        messageRetentionDuration: 604800s  # 7 days
+        ackDeadlineSeconds: 600
+        retryPolicy:
+          minimumBackoff: 1s
+          maximumBackoff: 300s
+        deadLetterPolicy:
+          deadLetterTopic: $(ref.dead-letter-topic.name)
+          maxDeliveryAttempts: 5
+        # Enable message ordering for compliance processing
+        enableMessageOrdering: true
+        labels:
+          purpose: "compliance-processing"
+          data-type: "phi-events"
+    metadata:
+      dependsOn:
+        - fhir-events-topic
+        - dead-letter-topic
+
+  # Dead Letter Topic for failed message processing
+  - name: dead-letter-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    metadata:
+      name: dead-letter-topic-$(var.resource_suffix)
+    properties:
+      name: projects/$(var.project_id)/topics/dead-letter-topic-$(var.resource_suffix)
+      topic:
+        name: dead-letter-topic-$(var.resource_suffix)
+        messageRetentionDuration: 2592000s  # 30 days
+        labels:
+          purpose: "error-handling"
+          data-type: "failed-messages"
+    metadata:
+      dependsOn:
+        - pub-sub-api
+
+  # Cloud Tasks Queue for Compliance Processing
+  - name: compliance-task-queue
+    type: gcp-types/cloudtasks-v2:projects.locations.queues
+    metadata:
+      name: compliance-task-queue-$(var.resource_suffix)
+    properties:
+      parent: projects/$(var.project_id)/locations/$(var.location)
+      queueId: compliance-task-queue-$(var.resource_suffix)
+      queue:
+        name: compliance-task-queue-$(var.resource_suffix)
+        # Configure rate limiting for stable processing
+        rateLimits:
+          maxDispatchesPerSecond: 10
+          maxBurstSize: 100
+          maxConcurrentDispatches: 5
+        # Configure retry policy for reliable processing
+        retryConfig:
+          maxAttempts: 3
+          maxRetryDuration: 300s
+          minBackoff: 1s
+          maxBackoff: 300s
+          maxDoublings: 5
+        # Configure task routing for compliance function
+        httpTarget:
+          uriOverride:
+            scheme: HTTPS
+            host: $(var.region)-$(var.project_id).cloudfunctions.net
+            path: /compliance-audit-$(var.resource_suffix)
+        labels:
+          purpose: "compliance-processing"
+          data-type: "phi-validation"
+    metadata:
+      dependsOn:
+        - cloud-tasks-api
+
+  # Cloud Storage Bucket for Compliance Artifacts
+  - name: compliance-storage-bucket
+    type: gcp-types/storage-v1:buckets
+    metadata:
+      name: compliance-storage-bucket-$(var.resource_suffix)
+    properties:
+      project: $(var.project_id)
+      name: healthcare-compliance-$(var.project_id)-$(var.resource_suffix)
+      bucket:
+        name: healthcare-compliance-$(var.project_id)-$(var.resource_suffix)
+        location: $(var.region)
+        storageClass: STANDARD
+        # Enable versioning for compliance audit trail
+        versioning:
+          enabled: true
+        # Configure lifecycle management for cost optimization
+        lifecycle:
+          rule:
+            - action:
+                type: SetStorageClass
+                storageClass: NEARLINE
+              condition:
+                age: 30
+            - action:
+                type: SetStorageClass
+                storageClass: COLDLINE
+              condition:
+                age: 365
+            - action:
+                type: Delete
+              condition:
+                age: $(var.retention_days)
+        # Enable uniform bucket-level access for security
+        iamConfiguration:
+          uniformBucketLevelAccess:
+            enabled: true
+        # Enable audit logging
+        logging:
+          logBucket: compliance-audit-logs-$(var.project_id)-$(var.resource_suffix)
+          logObjectPrefix: "access-logs/"
+        # Configure CORS for web access
+        cors:
+          - origin: ["*"]
+            method: ["GET", "POST", "PUT", "DELETE"]
+            responseHeader: ["Content-Type", "Authorization"]
+            maxAgeSeconds: 3600
+        labels:
+          purpose: "compliance-artifacts"
+          data-type: "audit-logs"
+          compliance: "hipaa"
+          retention: "$(var.retention_days)-days"
+    metadata:
+      dependsOn:
+        - cloud-storage-api
+
+  # BigQuery Dataset for Compliance Analytics
+  - name: compliance-analytics-dataset
+    type: gcp-types/bigquery-v2:datasets
+    metadata:
+      name: compliance-analytics-dataset
+    properties:
+      projectId: $(var.project_id)
+      datasetId: healthcare_compliance_$(var.resource_suffix)
+      dataset:
+        datasetId: healthcare_compliance_$(var.resource_suffix)
+        friendlyName: "Healthcare Compliance Analytics"
+        description: "Analytics dataset for healthcare compliance monitoring and reporting"
+        location: $(var.region)
+        # Set default table expiration for compliance
+        defaultTableExpirationMs: $(var.retention_days * 24 * 60 * 60 * 1000)
+        # Configure access controls
+        access:
+          - role: "OWNER"
+            userByEmail: "healthcare-compliance-sa@$(var.project_id).iam.gserviceaccount.com"
+          - role: "READER"
+            groupByEmail: "healthcare-compliance-readers@$(var.project_id).iam.gserviceaccount.com"
+        labels:
+          purpose: "compliance-analytics"
+          data-type: "audit-data"
+          compliance: "hipaa"
+    metadata:
+      dependsOn:
+        - bigquery-api
+        - compliance-service-account
+
+  # Compliance Events Table in BigQuery
+  - name: compliance-events-table
+    type: gcp-types/bigquery-v2:tables
+    metadata:
+      name: compliance-events-table
+    properties:
+      projectId: $(var.project_id)
+      datasetId: $(ref.compliance-analytics-dataset.datasetId)
+      tableId: compliance_events
+      table:
+        tableId: compliance_events
+        friendlyName: "Compliance Events"
+        description: "Table storing all healthcare compliance events and validation results"
+        # Define table schema for compliance events
+        schema:
+          fields:
+            - name: timestamp
+              type: TIMESTAMP
+              mode: REQUIRED
+              description: "Event timestamp in UTC"
+            - name: event_id
+              type: STRING
+              mode: REQUIRED
+              description: "Unique identifier for the compliance event"
+            - name: resource_name
+              type: STRING
+              mode: REQUIRED
+              description: "FHIR resource name that triggered the event"
+            - name: resource_type
+              type: STRING
+              mode: REQUIRED
+              description: "Type of FHIR resource (Patient, Observation, etc.)"
+            - name: event_type
+              type: STRING
+              mode: REQUIRED
+              description: "Type of operation (CREATE, UPDATE, DELETE, READ)"
+            - name: user_id
+              type: STRING
+              mode: NULLABLE
+              description: "User ID who performed the operation"
+            - name: compliance_status
+              type: STRING
+              mode: REQUIRED
+              description: "Compliance validation status (COMPLIANT, VIOLATION, PENDING)"
+            - name: risk_score
+              type: INTEGER
+              mode: REQUIRED
+              description: "Risk score from 1-5 for the operation"
+            - name: phi_accessed
+              type: BOOLEAN
+              mode: REQUIRED
+              description: "Whether PHI was accessed in this operation"
+            - name: validation_result
+              type: JSON
+              mode: NULLABLE
+              description: "Detailed validation results and findings"
+            - name: remediation_actions
+              type: JSON
+              mode: NULLABLE
+              description: "Required or completed remediation actions"
+            - name: session_id
+              type: STRING
+              mode: NULLABLE
+              description: "Session ID for correlation"
+        # Configure table partitioning for performance
+        timePartitioning:
+          type: DAY
+          field: timestamp
+        # Configure table clustering for query optimization
+        clustering:
+          fields: ["resource_type", "compliance_status", "risk_score"]
+        labels:
+          purpose: "compliance-events"
+          data-type: "audit-data"
+    metadata:
+      dependsOn:
+        - compliance-analytics-dataset
+
+  # Audit Trail Table in BigQuery
+  - name: audit-trail-table
+    type: gcp-types/bigquery-v2:tables
+    metadata:
+      name: audit-trail-table
+    properties:
+      projectId: $(var.project_id)
+      datasetId: $(ref.compliance-analytics-dataset.datasetId)
+      tableId: audit_trail
+      table:
+        tableId: audit_trail
+        friendlyName: "Audit Trail"
+        description: "Comprehensive audit trail for all healthcare data operations"
+        # Define audit trail schema
+        schema:
+          fields:
+            - name: timestamp
+              type: TIMESTAMP
+              mode: REQUIRED
+              description: "Audit event timestamp in UTC"
+            - name: audit_id
+              type: STRING
+              mode: REQUIRED
+              description: "Unique audit trail identifier"
+            - name: user_id
+              type: STRING
+              mode: REQUIRED
+              description: "User performing the operation"
+            - name: user_role
+              type: STRING
+              mode: NULLABLE
+              description: "Role of the user performing the operation"
+            - name: resource_type
+              type: STRING
+              mode: REQUIRED
+              description: "Type of healthcare resource accessed"
+            - name: resource_id
+              type: STRING
+              mode: REQUIRED
+              description: "Unique identifier of the accessed resource"
+            - name: operation
+              type: STRING
+              mode: REQUIRED
+              description: "Operation performed (CREATE, READ, UPDATE, DELETE)"
+            - name: phi_accessed
+              type: BOOLEAN
+              mode: REQUIRED
+              description: "Whether PHI was accessed"
+            - name: compliance_level
+              type: STRING
+              mode: REQUIRED
+              description: "Required compliance level (STANDARD, ENHANCED, CRITICAL)"
+            - name: ip_address
+              type: STRING
+              mode: NULLABLE
+              description: "IP address of the client"
+            - name: user_agent
+              type: STRING
+              mode: NULLABLE
+              description: "User agent string"
+            - name: session_id
+              type: STRING
+              mode: NULLABLE
+              description: "Session identifier for correlation"
+            - name: audit_findings
+              type: JSON
+              mode: NULLABLE
+              description: "Detailed audit findings and recommendations"
+        # Configure partitioning and clustering
+        timePartitioning:
+          type: DAY
+          field: timestamp
+        clustering:
+          fields: ["user_id", "resource_type", "compliance_level"]
+        labels:
+          purpose: "audit-trail"
+          data-type: "audit-data"
+    metadata:
+      dependsOn:
+        - compliance-analytics-dataset
+
+  # Service Account for Healthcare Compliance
+  - name: compliance-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    metadata:
+      name: compliance-service-account
+    properties:
+      name: projects/$(var.project_id)/serviceAccounts/healthcare-compliance-sa@$(var.project_id).iam.gserviceaccount.com
+      accountId: healthcare-compliance-sa
+      serviceAccount:
+        displayName: "Healthcare Compliance Service Account"
+        description: "Service account for healthcare compliance functions and tasks"
+        disabled: false
+    metadata:
+      dependsOn: []
+
+  # IAM Bindings for Healthcare Compliance Service Account
+  - name: compliance-sa-healthcare-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMembers
+    metadata:
+      name: compliance-sa-healthcare-binding
+    properties:
+      resource: $(var.project_id)
+      member: serviceAccount:$(ref.compliance-service-account.email)
+      role: roles/healthcare.datasetAdmin
+    metadata:
+      dependsOn:
+        - compliance-service-account
+
+  - name: compliance-sa-tasks-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMembers
+    metadata:
+      name: compliance-sa-tasks-binding
+    properties:
+      resource: $(var.project_id)
+      member: serviceAccount:$(ref.compliance-service-account.email)
+      role: roles/cloudtasks.enqueuer
+    metadata:
+      dependsOn:
+        - compliance-service-account
+
+  - name: compliance-sa-pubsub-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMembers
+    metadata:
+      name: compliance-sa-pubsub-binding
+    properties:
+      resource: $(var.project_id)
+      member: serviceAccount:$(ref.compliance-service-account.email)
+      role: roles/pubsub.publisher
+    metadata:
+      dependsOn:
+        - compliance-service-account
+
+  - name: compliance-sa-bigquery-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMembers
+    metadata:
+      name: compliance-sa-bigquery-binding
+    properties:
+      resource: $(var.project_id)
+      member: serviceAccount:$(ref.compliance-service-account.email)
+      role: roles/bigquery.dataEditor
+    metadata:
+      dependsOn:
+        - compliance-service-account
+
+  - name: compliance-sa-storage-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMembers
+    metadata:
+      name: compliance-sa-storage-binding
+    properties:
+      resource: $(var.project_id)
+      member: serviceAccount:$(ref.compliance-service-account.email)
+      role: roles/storage.objectAdmin
+    metadata:
+      dependsOn:
+        - compliance-service-account
+
+  - name: compliance-sa-logging-binding
+    type: gcp-types/cloudresourcemanager-v1:projects.iamMembers
+    metadata:
+      name: compliance-sa-logging-binding
+    properties:
+      resource: $(var.project_id)
+      member: serviceAccount:$(ref.compliance-service-account.email)
+      role: roles/logging.logWriter
+    metadata:
+      dependsOn:
+        - compliance-service-account
+
+  # Cloud Function for Compliance Processing
+  - name: compliance-processor-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    metadata:
+      name: compliance-processor-function-$(var.resource_suffix)
+    properties:
+      location: projects/$(var.project_id)/locations/$(var.region)
+      functionId: compliance-processor-$(var.resource_suffix)
+      function:
+        name: compliance-processor-$(var.resource_suffix)
+        description: "Cloud Function for processing healthcare compliance events"
+        # Configure event trigger from Pub/Sub
+        eventTrigger:
+          eventType: providers/cloud.pubsub/eventTypes/topic.publish
+          resource: $(ref.fhir-events-topic.name)
+          failurePolicy:
+            retry: true
+        # Configure runtime environment
+        runtime: python39
+        timeout: 540s
+        availableMemoryMb: 512
+        maxInstances: 10
+        serviceAccountEmail: $(ref.compliance-service-account.email)
+        # Set environment variables for configuration
+        environmentVariables:
+          GCP_PROJECT: $(var.project_id)
+          FUNCTION_REGION: $(var.region)
+          RESOURCE_SUFFIX: $(var.resource_suffix)
+          COMPLIANCE_BUCKET: $(ref.compliance-storage-bucket.name)
+          BIGQUERY_DATASET: $(ref.compliance-analytics-dataset.datasetId)
+          TASK_QUEUE: $(ref.compliance-task-queue.name)
+          ENABLE_AUDIT_LOGGING: "$(var.enable_audit_logging)"
+        # Configure VPC connector for secure networking
+        vpcConnector: projects/$(var.project_id)/locations/$(var.region)/connectors/healthcare-vpc-connector
+        vpcConnectorEgressSettings: PRIVATE_RANGES_ONLY
+        # Configure source code deployment
+        sourceArchiveUrl: gs://$(ref.compliance-storage-bucket.name)/functions/compliance-processor.zip
+        entryPoint: process_fhir_event
+        labels:
+          purpose: "compliance-processing"
+          data-type: "phi-validation"
+          compliance: "hipaa"
+    metadata:
+      dependsOn:
+        - cloud-functions-api
+        - compliance-service-account
+        - fhir-events-topic
+        - compliance-storage-bucket
+        - compliance-analytics-dataset
+        - compliance-task-queue
+
+  # Cloud Function for Compliance Audit
+  - name: compliance-audit-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    metadata:
+      name: compliance-audit-function-$(var.resource_suffix)
+    properties:
+      location: projects/$(var.project_id)/locations/$(var.region)
+      functionId: compliance-audit-$(var.resource_suffix)
+      function:
+        name: compliance-audit-$(var.resource_suffix)
+        description: "Cloud Function for detailed compliance audit processing"
+        # Configure HTTP trigger for Task Queue
+        httpsTrigger:
+          url: https://$(var.region)-$(var.project_id).cloudfunctions.net/compliance-audit-$(var.resource_suffix)
+          securityLevel: SECURE_ALWAYS
+        # Configure runtime environment
+        runtime: python39
+        timeout: 540s
+        availableMemoryMb: 1024
+        maxInstances: 5
+        serviceAccountEmail: $(ref.compliance-service-account.email)
+        # Set environment variables
+        environmentVariables:
+          GCP_PROJECT: $(var.project_id)
+          RESOURCE_SUFFIX: $(var.resource_suffix)
+          COMPLIANCE_BUCKET: $(ref.compliance-storage-bucket.name)
+          BIGQUERY_DATASET: $(ref.compliance-analytics-dataset.datasetId)
+          ENABLE_AUDIT_LOGGING: "$(var.enable_audit_logging)"
+        # Configure VPC and security
+        vpcConnector: projects/$(var.project_id)/locations/$(var.region)/connectors/healthcare-vpc-connector
+        vpcConnectorEgressSettings: PRIVATE_RANGES_ONLY
+        # Configure source code deployment
+        sourceArchiveUrl: gs://$(ref.compliance-storage-bucket.name)/functions/compliance-audit.zip
+        entryPoint: compliance_audit
+        labels:
+          purpose: "compliance-audit"
+          data-type: "phi-audit"
+          compliance: "hipaa"
+    metadata:
+      dependsOn:
+        - cloud-functions-api
+        - compliance-service-account
+        - compliance-storage-bucket
+        - compliance-analytics-dataset
+
+  # Cloud Monitoring Alert Policy for High-Risk Events
+  - name: high-risk-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    metadata:
+      name: high-risk-alert-policy
+    properties:
+      parent: projects/$(var.project_id)
+      alertPolicy:
+        displayName: "High-Risk Healthcare Data Access Alert"
+        documentation:
+          content: "Alert triggered when high-risk healthcare data access is detected. Requires immediate attention for compliance investigation."
+          mimeType: "text/markdown"
+        # Configure alert conditions
+        conditions:
+          - displayName: "High Risk Score Events"
+            conditionThreshold:
+              filter: 'resource.type="cloud_function" AND resource.labels.function_name="compliance-processor-$(var.resource_suffix)"'
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 3
+              duration: 60s
+              aggregations:
+                - alignmentPeriod: 300s
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+                  groupByFields: ["resource.labels.function_name"]
+        # Configure notification channels
+        notificationChannels:
+          - $(ref.compliance-notification-channel.name)
+        # Configure alert strategy
+        alertStrategy:
+          autoClose: 86400s  # 24 hours
+          notificationRateLimit:
+            period: 300s  # 5 minutes
+        # Enable alert policy
+        enabled: true
+        labels:
+          purpose: "compliance-monitoring"
+          severity: "high"
+          compliance: "hipaa"
+    metadata:
+      dependsOn:
+        - cloud-monitoring-api
+        - compliance-notification-channel
+        - compliance-processor-function
+      condition: $(var.enable_monitoring)
+
+  # Notification Channel for Compliance Alerts
+  - name: compliance-notification-channel
+    type: gcp-types/monitoring-v1:projects.notificationChannels
+    metadata:
+      name: compliance-notification-channel
+    properties:
+      parent: projects/$(var.project_id)
+      notificationChannel:
+        displayName: "Healthcare Compliance Alerts"
+        type: email
+        labels:
+          email_address: "healthcare-compliance@example.com"
+        description: "Email notifications for healthcare compliance violations and high-risk events"
+        enabled: true
+        userLabels:
+          purpose: "compliance-alerting"
+          compliance: "hipaa"
+    metadata:
+      dependsOn:
+        - cloud-monitoring-api
+      condition: $(var.enable_monitoring)
+
+  # Cloud Logging Sink for Compliance Audit Logs
+  - name: compliance-audit-log-sink
+    type: gcp-types/logging-v2:projects.sinks
+    metadata:
+      name: compliance-audit-log-sink
+    properties:
+      parent: projects/$(var.project_id)
+      sinkId: healthcare-compliance-audit-sink
+      sink:
+        name: healthcare-compliance-audit-sink
+        description: "Log sink for healthcare compliance audit logs"
+        # Configure log filter for healthcare and compliance events
+        filter: |
+          (resource.type="healthcare_dataset" OR 
+           resource.type="cloud_function" AND resource.labels.function_name=~"compliance-.*" OR
+           protoPayload.serviceName="healthcare.googleapis.com") AND
+          (severity>=WARNING OR
+           protoPayload.methodName=~".*Create.*" OR
+           protoPayload.methodName=~".*Update.*" OR
+           protoPayload.methodName=~".*Delete.*" OR
+           protoPayload.methodName=~".*Search.*")
+        # Configure destination to BigQuery
+        destination: bigquery.googleapis.com/projects/$(var.project_id)/datasets/$(ref.compliance-analytics-dataset.datasetId)
+        # Configure BigQuery options
+        bigqueryOptions:
+          writeMetadata: true
+          usePartitionedTables: true
+        # Enable sink
+        disabled: false
+        labels:
+          purpose: "compliance-audit"
+          data-type: "audit-logs"
+          compliance: "hipaa"
+    metadata:
+      dependsOn:
+        - cloud-logging-api
+        - compliance-analytics-dataset
+      condition: $(var.enable_audit_logging)
+
+# Define outputs for reference and validation
+outputs:
+  # Healthcare API resources
+  healthcare_dataset_id:
+    description: "Healthcare dataset ID for FHIR data storage"
+    value: $(ref.healthcare-dataset.datasetId)
+    
+  fhir_store_id:
+    description: "FHIR store ID for healthcare data"
+    value: $(ref.fhir-store.fhirStoreId)
+    
+  fhir_store_url:
+    description: "FHIR store base URL for API access"
+    value: "https://healthcare.googleapis.com/v1/$(ref.fhir-store.name)/fhir"
+    
+  # Pub/Sub resources
+  fhir_events_topic:
+    description: "Pub/Sub topic for FHIR events"
+    value: $(ref.fhir-events-topic.name)
+    
+  fhir_events_subscription:
+    description: "Pub/Sub subscription for FHIR events"
+    value: $(ref.fhir-events-subscription.name)
+    
+  # Cloud Tasks resources
+  compliance_task_queue:
+    description: "Cloud Tasks queue for compliance processing"
+    value: $(ref.compliance-task-queue.name)
+    
+  # Storage resources
+  compliance_storage_bucket:
+    description: "Cloud Storage bucket for compliance artifacts"
+    value: $(ref.compliance-storage-bucket.name)
+    
+  # BigQuery resources
+  compliance_dataset_id:
+    description: "BigQuery dataset for compliance analytics"
+    value: $(ref.compliance-analytics-dataset.datasetId)
+    
+  compliance_events_table:
+    description: "BigQuery table for compliance events"
+    value: $(ref.compliance-events-table.tableId)
+    
+  audit_trail_table:
+    description: "BigQuery table for audit trail"
+    value: $(ref.audit-trail-table.tableId)
+    
+  # Cloud Functions
+  compliance_processor_function:
+    description: "Cloud Function for compliance processing"
+    value: $(ref.compliance-processor-function.name)
+    
+  compliance_audit_function:
+    description: "Cloud Function for compliance audit"
+    value: $(ref.compliance-audit-function.httpsTrigger.url)
+    
+  # Service Account
+  compliance_service_account:
+    description: "Service account for healthcare compliance"
+    value: $(ref.compliance-service-account.email)
+    
+  # Monitoring resources
+  compliance_alert_policy:
+    description: "Alert policy for compliance monitoring"
+    value: $(ref.high-risk-alert-policy.name)
+    condition: $(var.enable_monitoring)
+    
+  # Deployment summary
+  deployment_summary:
+    description: "Summary of deployed healthcare compliance infrastructure"
+    value: |
+      Healthcare Data Compliance Workflows infrastructure deployed successfully:
+      
+      ✅ Healthcare Dataset: $(ref.healthcare-dataset.datasetId)
+      ✅ FHIR Store: $(ref.fhir-store.fhirStoreId) 
+      ✅ Pub/Sub Topic: $(ref.fhir-events-topic.name)
+      ✅ Task Queue: $(ref.compliance-task-queue.name)
+      ✅ Storage Bucket: $(ref.compliance-storage-bucket.name)
+      ✅ BigQuery Dataset: $(ref.compliance-analytics-dataset.datasetId)
+      ✅ Compliance Functions: 2 deployed
+      ✅ Service Account: $(ref.compliance-service-account.email)
+      ✅ Monitoring: $(if($(var.enable_monitoring), "Enabled", "Disabled"))
+      ✅ Audit Logging: $(if($(var.enable_audit_logging), "Enabled", "Disabled"))
+      
+      🔒 HIPAA Compliance: Configured with appropriate security controls
+      📊 Analytics Ready: BigQuery tables configured for compliance reporting
+      🚨 Monitoring: Real-time alerts for high-risk healthcare data access
+      
+      Next Steps:
+      1. Deploy Cloud Function source code to the storage bucket
+      2. Test FHIR store with sample healthcare data
+      3. Configure notification channel email address
+      4. Review and customize compliance validation rules
+      5. Set up compliance reporting dashboards

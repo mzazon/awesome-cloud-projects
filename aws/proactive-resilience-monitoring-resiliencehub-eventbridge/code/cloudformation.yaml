@@ -1,0 +1,917 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Proactive Application Resilience Monitoring with AWS Resilience Hub and EventBridge - Infrastructure as Code template for automated resilience assessment and response'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Application Configuration"
+        Parameters:
+          - ApplicationName
+          - Environment
+          - ResiliencePolicyTier
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcCidr
+          - PublicSubnet1Cidr
+          - PublicSubnet2Cidr
+          - AvailabilityZone1
+          - AvailabilityZone2
+      - Label:
+          default: "Database Configuration"
+        Parameters:
+          - DatabaseUsername
+          - DatabasePassword
+          - DatabaseInstanceClass
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - ResilienceScoreThreshold
+          - CriticalThreshold
+          - NotificationEmail
+    ParameterLabels:
+      ApplicationName:
+        default: "Application Name"
+      Environment:
+        default: "Environment"
+      ResiliencePolicyTier:
+        default: "Resilience Policy Tier"
+      VpcCidr:
+        default: "VPC CIDR Block"
+      ResilienceScoreThreshold:
+        default: "Resilience Score Warning Threshold"
+      CriticalThreshold:
+        default: "Critical Resilience Score Threshold"
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: resilience-demo-app
+    Description: Name of the application for resilience monitoring
+    AllowedPattern: '^[a-zA-Z0-9\-]+$'
+    ConstraintDescription: Must contain only alphanumeric characters and hyphens
+    
+  Environment:
+    Type: String
+    Default: demo
+    AllowedValues:
+      - demo
+      - dev
+      - staging
+      - prod
+    Description: Environment for the application deployment
+    
+  ResiliencePolicyTier:
+    Type: String
+    Default: MissionCritical
+    AllowedValues:
+      - MissionCritical
+      - Important
+      - CoreServices
+      - NonCritical
+    Description: Resilience policy tier determining RTO/RPO requirements
+    
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$'
+    ConstraintDescription: Must be a valid CIDR notation
+    
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR block for the first public subnet
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$'
+    
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR block for the second public subnet
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$'
+    
+  AvailabilityZone1:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: First Availability Zone for Multi-AZ deployment
+    
+  AvailabilityZone2:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Second Availability Zone for Multi-AZ deployment
+    
+  DatabaseUsername:
+    Type: String
+    Default: admin
+    Description: Username for the RDS database
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9]*$'
+    
+  DatabasePassword:
+    Type: String
+    Default: TempPassword123!
+    Description: Password for the RDS database
+    MinLength: 8
+    MaxLength: 41
+    NoEcho: true
+    
+  DatabaseInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+      - db.t4g.micro
+      - db.t4g.small
+    Description: RDS instance class for the database
+    
+  ResilienceScoreThreshold:
+    Type: Number
+    Default: 80
+    MinValue: 0
+    MaxValue: 100
+    Description: Warning threshold for resilience score (percentage)
+    
+  CriticalThreshold:
+    Type: Number
+    Default: 70
+    MinValue: 0
+    MaxValue: 100
+    Description: Critical threshold for resilience score (percentage)
+    
+  NotificationEmail:
+    Type: String
+    Description: Email address for resilience monitoring notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+
+Conditions:
+  # Condition to check if critical threshold is less than warning threshold
+  ValidThresholds: !And 
+    - !Not [!Equals [!Ref CriticalThreshold, !Ref ResilienceScoreThreshold]]
+    - !Condition ThresholdComparison
+  
+  ThresholdComparison: !Not [!Equals [!Ref CriticalThreshold, !Ref ResilienceScoreThreshold]]
+
+Resources:
+  # VPC and Networking Infrastructure
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+          
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-igw'
+        - Key: Environment
+          Value: !Ref Environment
+          
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+      
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AvailabilityZone1
+      CidrBlock: !Ref PublicSubnet1Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-public-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+          
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AvailabilityZone2
+      CidrBlock: !Ref PublicSubnet2Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-public-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+          
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-public-rt'
+        - Key: Environment
+          Value: !Ref Environment
+          
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+      
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  # Security Groups
+  ApplicationSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ApplicationName}-sg'
+      GroupDescription: Security group for resilience demo application
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref ApplicationSecurityGroup
+          Description: MySQL access from application instances
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP access for web application
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS access for web application
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-security-group'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Roles and Policies
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-ec2-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+          
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ApplicationName}-ec2-profile'
+      Roles:
+        - !Ref EC2InstanceRole
+        
+  ResilienceAutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'ResilienceAutomationRole-${ApplicationName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - ssm.amazonaws.com
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMAutomationRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: ResilienceMonitoringPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - sns:Publish
+                  - resiliencehub:DescribeApp*
+                  - resiliencehub:List*
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # EC2 Instance for Application
+  ApplicationInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
+      InstanceType: t3.micro
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref ApplicationSecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y amazon-cloudwatch-agent
+          
+          # Configure CloudWatch agent
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << EOF
+          {
+            "metrics": {
+              "namespace": "Application/Monitoring",
+              "metrics_collected": {
+                "cpu": {
+                  "measurement": [
+                    "cpu_usage_idle",
+                    "cpu_usage_iowait",
+                    "cpu_usage_user",
+                    "cpu_usage_system"
+                  ],
+                  "metrics_collection_interval": 60
+                },
+                "disk": {
+                  "measurement": [
+                    "used_percent"
+                  ],
+                  "metrics_collection_interval": 60,
+                  "resources": [
+                    "*"
+                  ]
+                },
+                "mem": {
+                  "measurement": [
+                    "mem_used_percent"
+                  ],
+                  "metrics_collection_interval": 60
+                }
+              }
+            }
+          }
+          EOF
+          
+          # Start CloudWatch agent
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+            -a fetch-config -m ec2 -s \
+            -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+            
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-instance'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # RDS Database Subnet Group
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${ApplicationName}-subnet-group'
+      DBSubnetGroupDescription: Subnet group for resilience demo database
+      SubnetIds:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-db-subnet-group'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # RDS Database Instance
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub '${ApplicationName}-db'
+      DBInstanceClass: !Ref DatabaseInstanceClass
+      Engine: mysql
+      EngineVersion: '8.0'
+      MasterUsername: !Ref DatabaseUsername
+      MasterUserPassword: !Ref DatabasePassword
+      AllocatedStorage: 20
+      VPCSecurityGroups:
+        - !Ref ApplicationSecurityGroup
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      BackupRetentionPeriod: 7
+      StorageEncrypted: true
+      MultiAZ: true
+      AutoMinorVersionUpgrade: true
+      DeletionProtection: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-database'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # Resilience Hub Policy
+  ResiliencePolicy:
+    Type: AWS::ResilienceHub::ResiliencyPolicy
+    Properties:
+      PolicyName: !Sub '${ApplicationName}-resilience-policy'
+      PolicyDescription: !Sub 'Resilience policy for ${ApplicationName} monitoring'
+      Tier: !Ref ResiliencePolicyTier
+      Policy:
+        AZ:
+          RtoInSecs: 300
+          RpoInSecs: 60
+        Hardware:
+          RtoInSecs: 600
+          RpoInSecs: 300
+        Software:
+          RtoInSecs: 300
+          RpoInSecs: 60
+        Region:
+          RtoInSecs: 3600
+          RpoInSecs: 1800
+      Tags:
+        Environment: !Ref Environment
+        Purpose: resilience-monitoring
+        Application: !Ref ApplicationName
+
+  # Resilience Hub Application
+  ResilienceHubApplication:
+    Type: AWS::ResilienceHub::App
+    Properties:
+      AppName: !Sub '${ApplicationName}-resiliencehub'
+      Description: !Sub 'Resilience Hub application for ${ApplicationName} monitoring'
+      ResiliencyPolicyArn: !Ref ResiliencePolicy
+      AppTemplateBody: !Sub |
+        {
+          "AWSTemplateFormatVersion": "2010-09-09",
+          "Description": "Resilience Hub application template for demo application",
+          "Resources": {
+            "WebTierInstance": {
+              "Type": "AWS::EC2::Instance",
+              "Properties": {
+                "InstanceId": "${ApplicationInstance}"
+              }
+            },
+            "DatabaseInstance": {
+              "Type": "AWS::RDS::DBInstance",
+              "Properties": {
+                "DBInstanceIdentifier": "${ApplicationInstance}-db"
+              }
+            }
+          }
+        }
+      Tags:
+        Environment: !Ref Environment
+        Purpose: resilience-monitoring
+        Application: !Ref ApplicationName
+
+  # SNS Topic for Notifications
+  ResilienceNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ApplicationName}-resilience-alerts'
+      DisplayName: !Sub '${ApplicationName} Resilience Monitoring Alerts'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # SNS Subscription for Email Notifications
+  EmailNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref ResilienceNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # Lambda Function for Event Processing
+  ResilienceEventProcessor:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ApplicationName}-resilience-processor'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ResilienceAutomationRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+          SNS_TOPIC_ARN: !Ref ResilienceNotificationTopic
+          APPLICATION_NAME: !Ref ApplicationName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              logger.info(f"Received resilience event: {json.dumps(event)}")
+              
+              ssm = boto3.client('ssm')
+              cloudwatch = boto3.client('cloudwatch')
+              sns = boto3.client('sns')
+              
+              try:
+                  # Parse EventBridge event
+                  event_detail = event.get('detail', {})
+                  app_name = event_detail.get('applicationName', os.environ.get('APPLICATION_NAME', 'unknown'))
+                  assessment_status = event_detail.get('assessmentStatus', 'UNKNOWN')
+                  resilience_score = event_detail.get('resilienceScore', 0)
+                  
+                  # Log resilience metrics to CloudWatch
+                  cloudwatch.put_metric_data(
+                      Namespace='ResilienceHub/Monitoring',
+                      MetricData=[
+                          {
+                              'MetricName': 'ResilienceScore',
+                              'Dimensions': [
+                                  {
+                                      'Name': 'ApplicationName',
+                                      'Value': app_name
+                                  }
+                              ],
+                              'Value': resilience_score,
+                              'Unit': 'Percent',
+                              'Timestamp': datetime.utcnow()
+                          },
+                          {
+                              'MetricName': 'AssessmentEvents',
+                              'Dimensions': [
+                                  {
+                                      'Name': 'ApplicationName',
+                                      'Value': app_name
+                                  },
+                                  {
+                                      'Name': 'Status',
+                                      'Value': assessment_status
+                                  }
+                              ],
+                              'Value': 1,
+                              'Unit': 'Count',
+                              'Timestamp': datetime.utcnow()
+                          }
+                      ]
+                  )
+                  
+                  # Trigger remediation if score below threshold
+                  if resilience_score < 80:
+                      logger.info(f"Resilience score {resilience_score}% below threshold, triggering remediation")
+                      
+                      # Create SNS message with detailed information
+                      message = {
+                          'application': app_name,
+                          'resilience_score': resilience_score,
+                          'status': assessment_status,
+                          'timestamp': datetime.utcnow().isoformat(),
+                          'action': 'remediation_required'
+                      }
+                      
+                      # Send SNS notification
+                      sns.publish(
+                          TopicArn=os.environ.get('SNS_TOPIC_ARN'),
+                          Message=json.dumps(message, indent=2),
+                          Subject=f'Resilience Alert: {app_name} - Score {resilience_score}%'
+                      )
+                      
+                      logger.info(f"Sent resilience alert notification")
+                  else:
+                      logger.info(f"Resilience score {resilience_score}% above threshold, no action required")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Event processed successfully',
+                          'application': app_name,
+                          'resilience_score': resilience_score,
+                          'assessment_status': assessment_status
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing event: {str(e)}")
+                  
+                  # Log error metric
+                  cloudwatch.put_metric_data(
+                      Namespace='ResilienceHub/Monitoring',
+                      MetricData=[
+                          {
+                              'MetricName': 'ProcessingErrors',
+                              'Value': 1,
+                              'Unit': 'Count',
+                              'Timestamp': datetime.utcnow()
+                          }
+                      ]
+                  )
+                  
+                  raise e
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # EventBridge Rule for Resilience Events
+  ResilienceEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ApplicationName}-ResilienceHubAssessmentRule'
+      Description: Comprehensive rule for Resilience Hub assessment events
+      EventPattern:
+        source:
+          - aws.resiliencehub
+        detail-type:
+          - Resilience Assessment State Change
+          - Application Assessment Completed
+          - Policy Compliance Change
+        detail:
+          state:
+            - ASSESSMENT_COMPLETED
+            - ASSESSMENT_FAILED
+            - ASSESSMENT_IN_PROGRESS
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ResilienceEventProcessor.Arn
+          Id: "1"
+          InputTransformer:
+            InputPathsMap:
+              app: "$.detail.applicationName"
+              status: "$.detail.state"
+              score: "$.detail.resilienceScore"
+            InputTemplate: '{"applicationName": "<app>", "assessmentStatus": "<status>", "resilienceScore": <score>}'
+
+  # Permission for EventBridge to invoke Lambda
+  EventBridgeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ResilienceEventProcessor
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ResilienceEventRule.Arn
+
+  # CloudWatch Alarms
+  CriticalLowResilienceScoreAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-Critical-Low-Resilience-Score'
+      AlarmDescription: !Sub 'Critical alert when ${ApplicationName} resilience score drops below ${CriticalThreshold}%'
+      MetricName: ResilienceScore
+      Namespace: ResilienceHub/Monitoring
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: !Ref CriticalThreshold
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref ResilienceNotificationTopic
+      OKActions:
+        - !Ref ResilienceNotificationTopic
+      Dimensions:
+        - Name: ApplicationName
+          Value: !Sub '${ApplicationName}-resiliencehub'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Severity
+          Value: Critical
+
+  WarningLowResilienceScoreAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-Warning-Low-Resilience-Score'
+      AlarmDescription: !Sub 'Warning when ${ApplicationName} resilience score drops below ${ResilienceScoreThreshold}%'
+      MetricName: ResilienceScore
+      Namespace: ResilienceHub/Monitoring
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: !Ref ResilienceScoreThreshold
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref ResilienceNotificationTopic
+      Dimensions:
+        - Name: ApplicationName
+          Value: !Sub '${ApplicationName}-resiliencehub'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Severity
+          Value: Warning
+
+  ResilienceAssessmentFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-Resilience-Assessment-Failures'
+      AlarmDescription: !Sub 'Alert when ${ApplicationName} resilience assessments fail repeatedly'
+      MetricName: AssessmentEvents
+      Namespace: ResilienceHub/Monitoring
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 2
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref ResilienceNotificationTopic
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: ApplicationName
+          Value: !Sub '${ApplicationName}-resiliencehub'
+        - Name: Status
+          Value: ASSESSMENT_FAILED
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Severity
+          Value: Warning
+
+  # CloudWatch Dashboard
+  ResilienceMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ApplicationName}-Application-Resilience-Monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["ResilienceHub/Monitoring", "ResilienceScore", "ApplicationName", "${ApplicationName}-resiliencehub"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Application Resilience Score Trend",
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 100
+                  }
+                },
+                "annotations": {
+                  "horizontal": [
+                    {
+                      "value": ${ResilienceScoreThreshold},
+                      "label": "Warning Threshold"
+                    },
+                    {
+                      "value": ${CriticalThreshold},
+                      "label": "Critical Threshold"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["ResilienceHub/Monitoring", "AssessmentEvents", "ApplicationName", "${ApplicationName}-resiliencehub", "Status", "ASSESSMENT_COMPLETED"],
+                  [".", ".", ".", ".", ".", "ASSESSMENT_FAILED"],
+                  [".", "ProcessingErrors"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Assessment Events and Processing Status"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${ApplicationName}-resilience-processor' | fields @timestamp, @message\n| filter @message like /resilience/\n| sort @timestamp desc\n| limit 50",
+                "region": "${AWS::Region}",
+                "title": "Recent Resilience Events and Processing Logs"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  VPCId:
+    Description: ID of the created VPC
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPC-ID'
+
+  ApplicationInstanceId:
+    Description: ID of the application EC2 instance
+    Value: !Ref ApplicationInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-Instance-ID'
+
+  DatabaseEndpoint:
+    Description: RDS database endpoint
+    Value: !GetAtt DatabaseInstance.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-Database-Endpoint'
+
+  ResilienceHubApplicationArn:
+    Description: ARN of the Resilience Hub application
+    Value: !Ref ResilienceHubApplication
+    Export:
+      Name: !Sub '${AWS::StackName}-ResilienceHub-App-ARN'
+
+  ResiliencePolicyArn:
+    Description: ARN of the resilience policy
+    Value: !Ref ResiliencePolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-Resilience-Policy-ARN'
+
+  LambdaFunctionArn:
+    Description: ARN of the resilience event processing Lambda function
+    Value: !GetAtt ResilienceEventProcessor.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-Lambda-Function-ARN'
+
+  EventBridgeRuleArn:
+    Description: ARN of the EventBridge rule for resilience events
+    Value: !GetAtt ResilienceEventRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridge-Rule-ARN'
+
+  SNSTopicArn:
+    Description: ARN of the SNS topic for resilience notifications
+    Value: !Ref ResilienceNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNS-Topic-ARN'
+
+  DashboardURL:
+    Description: URL to the CloudWatch dashboard for resilience monitoring
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ApplicationName}-Application-Resilience-Monitoring'
+
+  ResilienceHubConsoleURL:
+    Description: URL to view the application in Resilience Hub console
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/resiliencehub/home?region=${AWS::Region}#/applications/${ResilienceHubApplication}'
+
+  SecurityGroupId:
+    Description: ID of the application security group
+    Value: !Ref ApplicationSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-Security-Group-ID'
+
+  AutomationRoleArn:
+    Description: ARN of the automation role for resilience monitoring
+    Value: !GetAtt ResilienceAutomationRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-Automation-Role-ARN'

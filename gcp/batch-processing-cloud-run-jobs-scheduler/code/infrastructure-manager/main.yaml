@@ -1,0 +1,559 @@
+# Infrastructure Manager Configuration for Batch Processing Workflows
+# This template deploys Cloud Run Jobs with Cloud Scheduler for automated batch processing
+
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+terraform:
+  # Use the latest stable Google Cloud provider
+  required_providers:
+    google:
+      source: hashicorp/google
+      version: "~> 5.0"
+    google-beta:
+      source: hashicorp/google-beta
+      version: "~> 5.0"
+    random:
+      source: hashicorp/random
+      version: "~> 3.6"
+
+# Variables for customization
+variables:
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    validation:
+      condition: length(var.project_id) > 0
+      error_message: "Project ID must be provided"
+
+  region:
+    description: "Google Cloud region for resource deployment"
+    type: string
+    default: "us-central1"
+    validation:
+      condition: can(regex("^[a-z]+-[a-z]+[0-9]+$", var.region))
+      error_message: "Region must be a valid Google Cloud region format"
+
+  environment:
+    description: "Environment name (dev, staging, prod)"
+    type: string
+    default: "dev"
+    validation:
+      condition: contains(["dev", "staging", "prod"], var.environment)
+      error_message: "Environment must be one of: dev, staging, prod"
+
+  job_name:
+    description: "Name for the Cloud Run Job"
+    type: string
+    default: "batch-processor"
+    validation:
+      condition: can(regex("^[a-z]([a-z0-9-]*[a-z0-9])?$", var.job_name))
+      error_message: "Job name must be lowercase, start with a letter, and contain only letters, numbers, and hyphens"
+
+  container_image:
+    description: "Container image URL for the batch processing job"
+    type: string
+    default: "gcr.io/cloudrun/hello"
+    validation:
+      condition: can(regex("^[a-z0-9.-]+/[a-z0-9._/-]+:[a-z0-9._-]+$|^[a-z0-9.-]+/[a-z0-9._/-]+$", var.container_image))
+      error_message: "Container image must be a valid image URL"
+
+  schedule:
+    description: "Cron schedule for the batch job execution"
+    type: string
+    default: "0 * * * *"
+    validation:
+      condition: can(regex("^[0-9*,-/]+ [0-9*,-/]+ [0-9*,-/]+ [0-9*,-/]+ [0-9*,-/]+$", var.schedule))
+      error_message: "Schedule must be a valid cron expression"
+
+  time_zone:
+    description: "Time zone for the scheduler"
+    type: string
+    default: "America/New_York"
+
+  job_timeout:
+    description: "Job execution timeout in seconds"
+    type: number
+    default: 3600
+    validation:
+      condition: var.job_timeout > 0 && var.job_timeout <= 86400
+      error_message: "Job timeout must be between 1 and 86400 seconds (24 hours)"
+
+  max_retries:
+    description: "Maximum number of retry attempts for failed jobs"
+    type: number
+    default: 3
+    validation:
+      condition: var.max_retries >= 0 && var.max_retries <= 10
+      error_message: "Max retries must be between 0 and 10"
+
+  cpu:
+    description: "CPU allocation for the job (in vCPUs)"
+    type: string
+    default: "1"
+    validation:
+      condition: contains(["0.25", "0.5", "1", "2", "4", "8"], var.cpu)
+      error_message: "CPU must be one of: 0.25, 0.5, 1, 2, 4, 8"
+
+  memory:
+    description: "Memory allocation for the job"
+    type: string
+    default: "2Gi"
+    validation:
+      condition: can(regex("^[0-9]+[GM]i$", var.memory))
+      error_message: "Memory must be specified in format like '1Gi' or '512Mi'"
+
+  parallelism:
+    description: "Number of parallel job tasks"
+    type: number
+    default: 1
+    validation:
+      condition: var.parallelism >= 1 && var.parallelism <= 1000
+      error_message: "Parallelism must be between 1 and 1000"
+
+  task_count:
+    description: "Number of tasks per job execution"
+    type: number
+    default: 1
+    validation:
+      condition: var.task_count >= 1 && var.task_count <= 10000
+      error_message: "Task count must be between 1 and 10000"
+
+  enable_monitoring:
+    description: "Enable advanced monitoring and alerting"
+    type: bool
+    default: true
+
+  labels:
+    description: "Labels to apply to all resources"
+    type: map(string)
+    default: {}
+
+# Local values for computed configurations
+locals:
+  # Common labels applied to all resources
+  common_labels = merge(
+    {
+      environment = var.environment
+      component   = "batch-processing"
+      managed-by  = "infrastructure-manager"
+    },
+    var.labels
+  )
+
+  # Generate unique suffix for resource names
+  resource_suffix = "${var.environment}-${random_string.suffix.result}"
+  
+  # Service account email for Cloud Run Job
+  service_account_email = "${google_service_account.batch_processor.email}"
+  
+  # Cloud Storage bucket name for batch processing data
+  bucket_name = "${var.project_id}-batch-data-${local.resource_suffix}"
+  
+  # Artifact Registry repository name
+  registry_name = "batch-registry-${local.resource_suffix}"
+  
+  # Cloud Scheduler job name
+  scheduler_name = "batch-schedule-${local.resource_suffix}"
+}
+
+# Generate random suffix for unique resource names
+resource "random_string" "suffix" {
+  length  = 6
+  special = false
+  upper   = false
+  numeric = true
+}
+
+# Configure Google Cloud provider
+provider "google" {
+  project = var.project_id
+  region  = var.region
+}
+
+provider "google-beta" {
+  project = var.project_id
+  region  = var.region
+}
+
+# Enable required Google Cloud APIs
+resource "google_project_service" "required_apis" {
+  for_each = toset([
+    "cloudbuild.googleapis.com",
+    "artifactregistry.googleapis.com",
+    "run.googleapis.com",
+    "cloudscheduler.googleapis.com",
+    "storage.googleapis.com",
+    "logging.googleapis.com",
+    "monitoring.googleapis.com",
+    "iam.googleapis.com"
+  ])
+
+  project = var.project_id
+  service = each.value
+
+  # Prevent disabling APIs when destroying
+  disable_dependent_services = false
+  disable_on_destroy         = false
+}
+
+# Create service account for Cloud Run Job
+resource "google_service_account" "batch_processor" {
+  account_id   = "batch-processor-${local.resource_suffix}"
+  display_name = "Batch Processing Service Account"
+  description  = "Service account for Cloud Run batch processing jobs"
+  project      = var.project_id
+
+  depends_on = [google_project_service.required_apis]
+}
+
+# Grant necessary permissions to the service account
+resource "google_project_iam_member" "batch_processor_permissions" {
+  for_each = toset([
+    "roles/storage.objectAdmin",      # Cloud Storage access
+    "roles/logging.logWriter",        # Cloud Logging
+    "roles/monitoring.metricWriter",  # Cloud Monitoring
+    "roles/run.invoker"              # Cloud Run job execution
+  ])
+
+  project = var.project_id
+  role    = each.value
+  member  = "serviceAccount:${google_service_account.batch_processor.email}"
+
+  depends_on = [google_service_account.batch_processor]
+}
+
+# Create Cloud Storage bucket for batch processing data
+resource "google_storage_bucket" "batch_data" {
+  name          = local.bucket_name
+  location      = var.region
+  project       = var.project_id
+  force_destroy = true
+
+  # Enable versioning for data protection
+  versioning {
+    enabled = true
+  }
+
+  # Configure lifecycle management
+  lifecycle_rule {
+    condition {
+      age = 90
+    }
+    action {
+      type = "Delete"
+    }
+  }
+
+  # Enable uniform bucket-level access
+  uniform_bucket_level_access = true
+
+  # Apply labels
+  labels = local.common_labels
+
+  depends_on = [google_project_service.required_apis]
+}
+
+# Create input and output directories in the bucket
+resource "google_storage_bucket_object" "input_directory" {
+  name   = "input/"
+  bucket = google_storage_bucket.batch_data.name
+  content = " "
+}
+
+resource "google_storage_bucket_object" "output_directory" {
+  name   = "output/"
+  bucket = google_storage_bucket.batch_data.name
+  content = " "
+}
+
+# Create Artifact Registry repository for container images
+resource "google_artifact_registry_repository" "batch_registry" {
+  repository_id = local.registry_name
+  format        = "DOCKER"
+  location      = var.region
+  project       = var.project_id
+  description   = "Container registry for batch processing applications"
+
+  # Apply labels
+  labels = local.common_labels
+
+  depends_on = [google_project_service.required_apis]
+}
+
+# Grant access to Artifact Registry for the service account
+resource "google_artifact_registry_repository_iam_member" "batch_processor_registry" {
+  project    = var.project_id
+  location   = google_artifact_registry_repository.batch_registry.location
+  repository = google_artifact_registry_repository.batch_registry.name
+  role       = "roles/artifactregistry.reader"
+  member     = "serviceAccount:${google_service_account.batch_processor.email}"
+}
+
+# Create Cloud Run Job for batch processing
+resource "google_cloud_run_v2_job" "batch_processor" {
+  name     = "${var.job_name}-${local.resource_suffix}"
+  location = var.region
+  project  = var.project_id
+
+  # Apply labels
+  labels = local.common_labels
+
+  template {
+    # Configure job execution parameters
+    parallelism  = var.parallelism
+    task_count   = var.task_count
+    task_timeout = "${var.job_timeout}s"
+
+    template {
+      # Configure service account
+      service_account = google_service_account.batch_processor.email
+
+      # Configure execution environment
+      execution_environment = "EXECUTION_ENVIRONMENT_GEN2"
+      
+      # Configure maximum retry attempts
+      max_retries = var.max_retries
+
+      containers {
+        image = var.container_image
+
+        # Configure resource limits
+        resources {
+          limits = {
+            cpu    = var.cpu
+            memory = var.memory
+          }
+        }
+
+        # Configure environment variables
+        env {
+          name  = "BUCKET_NAME"
+          value = google_storage_bucket.batch_data.name
+        }
+
+        env {
+          name  = "PROJECT_ID"
+          value = var.project_id
+        }
+
+        env {
+          name  = "ENVIRONMENT"
+          value = var.environment
+        }
+
+        env {
+          name  = "BATCH_SIZE"
+          value = "10"
+        }
+
+        # Configure startup probe for health checking
+        startup_probe {
+          initial_delay_seconds = 0
+          timeout_seconds       = 1
+          period_seconds        = 3
+          failure_threshold     = 1
+          tcp_socket {
+            port = 8080
+          }
+        }
+      }
+    }
+  }
+
+  depends_on = [
+    google_project_service.required_apis,
+    google_service_account.batch_processor,
+    google_storage_bucket.batch_data
+  ]
+}
+
+# Create Cloud Scheduler job for automated execution
+resource "google_cloud_scheduler_job" "batch_schedule" {
+  name             = local.scheduler_name
+  region           = var.region
+  project          = var.project_id
+  description      = "Automated batch processing job execution"
+  schedule         = var.schedule
+  time_zone        = var.time_zone
+  attempt_deadline = "${var.job_timeout + 300}s"
+
+  # Configure retry policy
+  retry_config {
+    retry_count          = 3
+    max_retry_duration   = "300s"
+    max_backoff_duration = "60s"
+    min_backoff_duration = "5s"
+  }
+
+  # Configure HTTP target to trigger Cloud Run Job
+  http_target {
+    http_method = "POST"
+    uri         = "https://run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${var.project_id}/jobs/${google_cloud_run_v2_job.batch_processor.name}:run"
+
+    # Configure authentication
+    oauth_token {
+      service_account_email = google_service_account.batch_processor.email
+    }
+
+    # Configure headers
+    headers = {
+      "Content-Type" = "application/json"
+    }
+
+    # Configure request body
+    body = base64encode(jsonencode({
+      overrides = {
+        containerOverrides = [{
+          env = [{
+            name  = "EXECUTION_ID"
+            value = "$${CLOUD_SCHEDULER_JOB_NAME}-$${CLOUD_SCHEDULER_SCHEDULE_TIME}"
+          }]
+        }]
+      }
+    }))
+  }
+
+  depends_on = [
+    google_project_service.required_apis,
+    google_cloud_run_v2_job.batch_processor
+  ]
+}
+
+# Create log-based metrics for monitoring (if enabled)
+resource "google_logging_metric" "batch_job_executions" {
+  count  = var.enable_monitoring ? 1 : 0
+  name   = "batch_job_executions_${local.resource_suffix}"
+  filter = "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"${google_cloud_run_v2_job.batch_processor.name}\""
+  
+  metric_descriptor {
+    metric_kind = "GAUGE"
+    value_type  = "INT64"
+    display_name = "Batch Job Executions"
+    description  = "Number of batch job executions"
+  }
+
+  depends_on = [google_project_service.required_apis]
+}
+
+# Create alerting policy for failed jobs (if monitoring enabled)
+resource "google_monitoring_alert_policy" "batch_job_failures" {
+  count        = var.enable_monitoring ? 1 : 0
+  display_name = "Batch Job Failure Alert - ${local.resource_suffix}"
+  project      = var.project_id
+  
+  conditions {
+    display_name = "Cloud Run Job Failed"
+    
+    condition_threshold {
+      filter         = "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"${google_cloud_run_v2_job.batch_processor.name}\" AND severity=\"ERROR\""
+      duration       = "300s"
+      comparison     = "COMPARISON_GREATER_THAN"
+      threshold_value = 0
+      
+      aggregations {
+        alignment_period   = "300s"
+        per_series_aligner = "ALIGN_RATE"
+      }
+    }
+  }
+
+  alert_strategy {
+    auto_close = "1800s"
+  }
+
+  enabled = true
+
+  depends_on = [google_project_service.required_apis]
+}
+
+# Create notification channel for alerts (if monitoring enabled)
+resource "google_monitoring_notification_channel" "email_notification" {
+  count        = var.enable_monitoring ? 1 : 0
+  display_name = "Email Notification - ${local.resource_suffix}"
+  type         = "email"
+  project      = var.project_id
+  
+  labels = {
+    email_address = "admin@example.com"  # Replace with actual email
+  }
+
+  depends_on = [google_project_service.required_apis]
+}
+
+# Output values for verification and integration
+outputs:
+  project_id:
+    description = "Google Cloud Project ID"
+    value       = var.project_id
+
+  region:
+    description = "Deployment region"
+    value       = var.region
+
+  batch_job_name:
+    description = "Cloud Run Job name"
+    value       = google_cloud_run_v2_job.batch_processor.name
+
+  batch_job_url:
+    description = "Cloud Run Job URL"
+    value       = "https://console.cloud.google.com/run/jobs/details/${var.region}/${google_cloud_run_v2_job.batch_processor.name}"
+
+  scheduler_job_name:
+    description = "Cloud Scheduler job name"
+    value       = google_cloud_scheduler_job.batch_schedule.name
+
+  scheduler_job_url:
+    description = "Cloud Scheduler job URL"
+    value       = "https://console.cloud.google.com/cloudscheduler/jobs/details/${var.region}/${google_cloud_scheduler_job.batch_schedule.name}"
+
+  storage_bucket_name:
+    description = "Cloud Storage bucket name for batch data"
+    value       = google_storage_bucket.batch_data.name
+
+  storage_bucket_url:
+    description = "Cloud Storage bucket URL"
+    value       = "https://console.cloud.google.com/storage/browser/${google_storage_bucket.batch_data.name}"
+
+  artifact_registry_repository:
+    description = "Artifact Registry repository name"
+    value       = google_artifact_registry_repository.batch_registry.name
+
+  artifact_registry_url:
+    description = "Artifact Registry repository URL"
+    value       = "https://console.cloud.google.com/artifacts/docker/${var.project_id}/${var.region}/${google_artifact_registry_repository.batch_registry.name}"
+
+  service_account_email:
+    description = "Service account email for the batch processor"
+    value       = google_service_account.batch_processor.email
+
+  container_image_url:
+    description = "Expected container image URL format"
+    value       = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.batch_registry.name}/batch-processor:latest"
+
+  deployment_commands:
+    description = "Commands to deploy the infrastructure"
+    value = {
+      init    = "gcloud infra-manager deployments create batch-processing-deployment --location=${var.region} --source=."
+      plan    = "gcloud infra-manager deployments describe batch-processing-deployment --location=${var.region}"
+      destroy = "gcloud infra-manager deployments delete batch-processing-deployment --location=${var.region}"
+    }
+
+  monitoring_dashboard_url:
+    description = "Cloud Monitoring dashboard URL"
+    value       = "https://console.cloud.google.com/monitoring/dashboards/custom?project=${var.project_id}"
+
+  logs_url:
+    description = "Cloud Logging URL for batch job logs"
+    value       = "https://console.cloud.google.com/logs/query;query=resource.type%3D%22cloud_run_job%22%20AND%20resource.labels.job_name%3D%22${google_cloud_run_v2_job.batch_processor.name}%22?project=${var.project_id}"

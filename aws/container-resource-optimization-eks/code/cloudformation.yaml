@@ -1,0 +1,707 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Infrastructure as Code for Container Resource Optimization and Right-Sizing with Amazon EKS.
+  This template deploys VPA components, CloudWatch monitoring, cost alerting, and test applications
+  to demonstrate automated container resource optimization using Kubernetes Vertical Pod Autoscaler.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "EKS Cluster Configuration"
+        Parameters:
+          - EKSClusterName
+          - EKSClusterRegion
+          - KubernetesVersion
+      - Label:
+          default: "VPA Configuration"
+        Parameters:
+          - VPAUpdateMode
+          - MinCPURequest
+          - MaxCPURequest
+          - MinMemoryRequest
+          - MaxMemoryRequest
+      - Label:
+          default: "Monitoring & Alerting"
+        Parameters:
+          - EnableContainerInsights
+          - AlertEmail
+          - LowUtilizationThreshold
+          - MonitoringRetentionDays
+      - Label:
+          default: "Cost Optimization"
+        Parameters:
+          - CostOptimizationNamespace
+          - TestApplicationReplicas
+          - ResourceTagPrefix
+    ParameterLabels:
+      EKSClusterName:
+        default: "EKS Cluster Name"
+      AlertEmail:
+        default: "Alert Email Address"
+      LowUtilizationThreshold:
+        default: "Low Utilization Alert Threshold (%)"
+
+Parameters:
+  EKSClusterName:
+    Type: String
+    Description: Name of the existing EKS cluster where VPA will be deployed
+    MinLength: 1
+    MaxLength: 100
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9\-]*$'
+    ConstraintDescription: Must be a valid EKS cluster name (letters, numbers, hyphens)
+
+  EKSClusterRegion:
+    Type: String
+    Description: AWS region where the EKS cluster is located
+    Default: !Ref 'AWS::Region'
+    AllowedPattern: '^[a-z0-9\-]+$'
+    ConstraintDescription: Must be a valid AWS region
+
+  KubernetesVersion:
+    Type: String
+    Description: Kubernetes version of the EKS cluster
+    Default: '1.28'
+    AllowedValues:
+      - '1.26'
+      - '1.27'
+      - '1.28'
+      - '1.29'
+    ConstraintDescription: Must be a supported Kubernetes version
+
+  VPAUpdateMode:
+    Type: String
+    Description: VPA update mode (Off for recommendations only, Auto for automatic updates)
+    Default: 'Off'
+    AllowedValues:
+      - 'Off'
+      - 'Auto'
+      - 'Recreation'
+    ConstraintDescription: Must be a valid VPA update mode
+
+  MinCPURequest:
+    Type: String
+    Description: Minimum CPU request for VPA recommendations
+    Default: '50m'
+    AllowedPattern: '^[0-9]+[m]?$'
+    ConstraintDescription: Must be a valid CPU value (e.g., 50m, 100m)
+
+  MaxCPURequest:
+    Type: String
+    Description: Maximum CPU request for VPA recommendations
+    Default: '2000m'
+    AllowedPattern: '^[0-9]+[m]?$'
+    ConstraintDescription: Must be a valid CPU value (e.g., 1000m, 2000m)
+
+  MinMemoryRequest:
+    Type: String
+    Description: Minimum memory request for VPA recommendations
+    Default: '64Mi'
+    AllowedPattern: '^[0-9]+[MGT]i$'
+    ConstraintDescription: Must be a valid memory value (e.g., 64Mi, 128Mi)
+
+  MaxMemoryRequest:
+    Type: String
+    Description: Maximum memory request for VPA recommendations
+    Default: '2048Mi'
+    AllowedPattern: '^[0-9]+[MGT]i$'
+    ConstraintDescription: Must be a valid memory value (e.g., 1024Mi, 2048Mi)
+
+  EnableContainerInsights:
+    Type: String
+    Description: Enable CloudWatch Container Insights for the EKS cluster
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    ConstraintDescription: Must be true or false
+
+  AlertEmail:
+    Type: String
+    Description: Email address for cost optimization alerts
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+
+  LowUtilizationThreshold:
+    Type: Number
+    Description: CPU utilization threshold below which cost alerts are triggered (percentage)
+    Default: 30
+    MinValue: 10
+    MaxValue: 90
+    ConstraintDescription: Must be between 10 and 90
+
+  MonitoringRetentionDays:
+    Type: Number
+    Description: CloudWatch logs retention period in days
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    ConstraintDescription: Must be a valid CloudWatch retention period
+
+  CostOptimizationNamespace:
+    Type: String
+    Description: Kubernetes namespace for cost optimization workloads
+    Default: 'cost-optimization'
+    AllowedPattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+    ConstraintDescription: Must be a valid Kubernetes namespace name
+
+  TestApplicationReplicas:
+    Type: Number
+    Description: Number of replicas for the test application
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+    ConstraintDescription: Must be between 1 and 10
+
+  ResourceTagPrefix:
+    Type: String
+    Description: Prefix for resource tags
+    Default: 'eks-cost-optimization'
+    AllowedPattern: '^[a-zA-Z0-9\-]+$'
+    ConstraintDescription: Must contain only letters, numbers, and hyphens
+
+Conditions:
+  EnableInsights: !Equals [!Ref EnableContainerInsights, 'true']
+  CreateTestResources: !Not [!Equals [!Ref TestApplicationReplicas, 0]]
+  IsAutoMode: !Equals [!Ref VPAUpdateMode, 'Auto']
+
+Resources:
+  # IAM Role for EKS Container Insights
+  ContainerInsightsRole:
+    Type: AWS::IAM::Role
+    Condition: EnableInsights
+    Properties:
+      RoleName: !Sub '${ResourceTagPrefix}-container-insights-role-${AWS::AccountId}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - ec2.amazonaws.com
+                - eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourceTagPrefix}-container-insights-role'
+        - Key: Environment
+          Value: cost-optimization
+        - Key: Purpose
+          Value: EKS Container Insights monitoring
+
+  # CloudWatch Log Group for EKS cluster logs
+  EKSClusterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/eks/${EKSClusterName}/cluster'
+      RetentionInDays: !Ref MonitoringRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourceTagPrefix}-cluster-logs'
+        - Key: Environment
+          Value: cost-optimization
+        - Key: ClusterName
+          Value: !Ref EKSClusterName
+
+  # CloudWatch Log Group for Container Insights
+  ContainerInsightsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableInsights
+    Properties:
+      LogGroupName: !Sub '/aws/containerinsights/${EKSClusterName}/performance'
+      RetentionInDays: !Ref MonitoringRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourceTagPrefix}-performance-logs'
+        - Key: Environment
+          Value: cost-optimization
+        - Key: ClusterName
+          Value: !Ref EKSClusterName
+
+  # SNS Topic for Cost Optimization Alerts
+  CostOptimizationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ResourceTagPrefix}-alerts'
+      DisplayName: EKS Cost Optimization Alerts
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourceTagPrefix}-sns-topic'
+        - Key: Environment
+          Value: cost-optimization
+        - Key: Purpose
+          Value: Cost optimization alerting
+
+  # SNS Subscription for email alerts
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref CostOptimizationTopic
+      Endpoint: !Ref AlertEmail
+
+  # CloudWatch Alarm for Low CPU Utilization
+  LowCPUUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourceTagPrefix}-low-cpu-utilization'
+      AlarmDescription: !Sub 'Alert when CPU utilization is below ${LowUtilizationThreshold}% in cost-optimization namespace'
+      MetricName: pod_cpu_utilization
+      Namespace: ContainerInsights
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref LowUtilizationThreshold
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: Namespace
+          Value: !Ref CostOptimizationNamespace
+        - Name: ClusterName
+          Value: !Ref EKSClusterName
+      AlarmActions:
+        - !Ref CostOptimizationTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourceTagPrefix}-cpu-alarm'
+        - Key: Environment
+          Value: cost-optimization
+        - Key: AlertType
+          Value: resource-utilization
+
+  # CloudWatch Alarm for Low Memory Utilization
+  LowMemoryUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourceTagPrefix}-low-memory-utilization'
+      AlarmDescription: !Sub 'Alert when memory utilization is below ${LowUtilizationThreshold}% in cost-optimization namespace'
+      MetricName: pod_memory_utilization
+      Namespace: ContainerInsights
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref LowUtilizationThreshold
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: Namespace
+          Value: !Ref CostOptimizationNamespace
+        - Name: ClusterName
+          Value: !Ref EKSClusterName
+      AlarmActions:
+        - !Ref CostOptimizationTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourceTagPrefix}-memory-alarm'
+        - Key: Environment
+          Value: cost-optimization
+        - Key: AlertType
+          Value: resource-utilization
+
+  # CloudWatch Dashboard for Cost Optimization Monitoring
+  CostOptimizationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ResourceTagPrefix}-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["ContainerInsights", "pod_cpu_utilization", "Namespace", "${CostOptimizationNamespace}", "ClusterName", "${EKSClusterName}"],
+                  [".", "pod_memory_utilization", ".", ".", ".", "."],
+                  [".", "pod_cpu_reserved_capacity", ".", ".", ".", "."],
+                  [".", "pod_memory_reserved_capacity", ".", ".", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Resource Utilization vs Reserved Capacity",
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 100
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["ContainerInsights", "pod_number_of_containers", "Namespace", "${CostOptimizationNamespace}", "ClusterName", "${EKSClusterName}"],
+                  [".", "pod_number_of_container_restarts", ".", ".", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Pod Health Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["ContainerInsights", "node_cpu_utilization", "ClusterName", "${EKSClusterName}"],
+                  [".", "node_memory_utilization", ".", "."],
+                  [".", "node_network_total_bytes", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Node-Level Resource Utilization"
+              }
+            }
+          ]
+        }
+
+  # IAM Role for Cost Optimization Lambda
+  CostOptimizationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourceTagPrefix}-lambda-role-${AWS::AccountId}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CostOptimizationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                  - cloudwatch:GetMetricData
+                  - sns:Publish
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourceTagPrefix}-lambda-role'
+        - Key: Environment
+          Value: cost-optimization
+        - Key: Purpose
+          Value: Automated cost optimization monitoring
+
+  # Lambda Function for Cost Optimization Automation
+  CostOptimizationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourceTagPrefix}-automation'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt CostOptimizationLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          CLUSTER_NAME: !Ref EKSClusterName
+          NAMESPACE: !Ref CostOptimizationNamespace
+          SNS_TOPIC_ARN: !Ref CostOptimizationTopic
+          LOW_UTILIZATION_THRESHOLD: !Ref LowUtilizationThreshold
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          import os
+          from datetime import datetime, timedelta
+          
+          def lambda_handler(event, context):
+              """
+              Automated cost optimization monitoring for EKS workloads.
+              Analyzes resource utilization and triggers alerts for optimization opportunities.
+              """
+              try:
+                  # Initialize AWS clients
+                  cloudwatch = boto3.client('cloudwatch')
+                  sns = boto3.client('sns')
+                  
+                  # Get environment variables
+                  cluster_name = os.environ['CLUSTER_NAME']
+                  namespace = os.environ['NAMESPACE']
+                  topic_arn = os.environ['SNS_TOPIC_ARN']
+                  threshold = float(os.environ['LOW_UTILIZATION_THRESHOLD'])
+                  
+                  # Query CPU utilization metrics
+                  cpu_response = cloudwatch.get_metric_statistics(
+                      Namespace='ContainerInsights',
+                      MetricName='pod_cpu_utilization',
+                      Dimensions=[
+                          {'Name': 'Namespace', 'Value': namespace},
+                          {'Name': 'ClusterName', 'Value': cluster_name}
+                      ],
+                      StartTime=datetime.utcnow() - timedelta(hours=1),
+                      EndTime=datetime.utcnow(),
+                      Period=300,
+                      Statistics=['Average']
+                  )
+                  
+                  # Query memory utilization metrics
+                  memory_response = cloudwatch.get_metric_statistics(
+                      Namespace='ContainerInsights',
+                      MetricName='pod_memory_utilization',
+                      Dimensions=[
+                          {'Name': 'Namespace', 'Value': namespace},
+                          {'Name': 'ClusterName', 'Value': cluster_name}
+                      ],
+                      StartTime=datetime.utcnow() - timedelta(hours=1),
+                      EndTime=datetime.utcnow(),
+                      Period=300,
+                      Statistics=['Average']
+                  )
+                  
+                  # Analyze utilization patterns
+                  alerts_sent = 0
+                  
+                  if cpu_response['Datapoints']:
+                      avg_cpu = sum(dp['Average'] for dp in cpu_response['Datapoints']) / len(cpu_response['Datapoints'])
+                      if avg_cpu < threshold:
+                          message = f"""
+                          EKS Cost Optimization Alert
+                          
+                          Cluster: {cluster_name}
+                          Namespace: {namespace}
+                          
+                          Low CPU utilization detected:
+                          - Average CPU Utilization: {avg_cpu:.2f}%
+                          - Threshold: {threshold}%
+                          
+                          Recommended Actions:
+                          1. Review VPA recommendations for right-sizing
+                          2. Consider reducing CPU requests/limits
+                          3. Evaluate workload consolidation opportunities
+                          
+                          Dashboard: https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ResourceTagPrefix}-dashboard
+                          """
+                          
+                          sns.publish(
+                              TopicArn=topic_arn,
+                              Message=message,
+                              Subject=f'EKS Cost Optimization Alert - Low CPU Utilization ({avg_cpu:.1f}%)'
+                          )
+                          alerts_sent += 1
+                  
+                  if memory_response['Datapoints']:
+                      avg_memory = sum(dp['Average'] for dp in memory_response['Datapoints']) / len(memory_response['Datapoints'])
+                      if avg_memory < threshold:
+                          message = f"""
+                          EKS Cost Optimization Alert
+                          
+                          Cluster: {cluster_name}
+                          Namespace: {namespace}
+                          
+                          Low Memory utilization detected:
+                          - Average Memory Utilization: {avg_memory:.2f}%
+                          - Threshold: {threshold}%
+                          
+                          Recommended Actions:
+                          1. Review VPA recommendations for right-sizing
+                          2. Consider reducing memory requests/limits
+                          3. Evaluate workload consolidation opportunities
+                          
+                          Dashboard: https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ResourceTagPrefix}-dashboard
+                          """
+                          
+                          sns.publish(
+                              TopicArn=topic_arn,
+                              Message=message,
+                              Subject=f'EKS Cost Optimization Alert - Low Memory Utilization ({avg_memory:.1f}%)'
+                          )
+                          alerts_sent += 1
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Cost optimization monitoring completed successfully',
+                          'alerts_sent': alerts_sent,
+                          'cluster': cluster_name,
+                          'namespace': namespace
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in cost optimization monitoring: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'message': 'Cost optimization monitoring failed'
+                      })
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourceTagPrefix}-lambda'
+        - Key: Environment
+          Value: cost-optimization
+        - Key: Purpose
+          Value: Automated cost monitoring and alerting
+
+  # EventBridge Rule for scheduled Lambda execution
+  CostOptimizationSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ResourceTagPrefix}-schedule'
+      Description: Scheduled execution of cost optimization monitoring
+      ScheduleExpression: 'rate(30 minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CostOptimizationLambda.Arn
+          Id: CostOptimizationTarget
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CostOptimizationLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CostOptimizationSchedule.Arn
+
+  # S3 Bucket for VPA configuration and reports storage
+  VPAConfigurationBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ResourceTagPrefix}-vpa-config-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourceTagPrefix}-vpa-config'
+        - Key: Environment
+          Value: cost-optimization
+        - Key: Purpose
+          Value: VPA configuration and reports storage
+
+  # S3 Bucket Policy for VPA Configuration Bucket
+  VPAConfigurationBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref VPAConfigurationBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${VPAConfigurationBucket}/*'
+              - !GetAtt VPAConfigurationBucket.Arn
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+Outputs:
+  EKSClusterName:
+    Description: Name of the EKS cluster configured for cost optimization
+    Value: !Ref EKSClusterName
+    Export:
+      Name: !Sub '${AWS::StackName}-cluster-name'
+
+  CostOptimizationNamespace:
+    Description: Kubernetes namespace for cost optimization workloads
+    Value: !Ref CostOptimizationNamespace
+    Export:
+      Name: !Sub '${AWS::StackName}-namespace'
+
+  SNSTopicArn:
+    Description: ARN of the SNS topic for cost optimization alerts
+    Value: !Ref CostOptimizationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-sns-topic'
+
+  CloudWatchDashboardURL:
+    Description: URL to the CloudWatch dashboard for cost optimization monitoring
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ResourceTagPrefix}-dashboard'
+
+  ContainerInsightsLogGroup:
+    Condition: EnableInsights
+    Description: CloudWatch log group for Container Insights
+    Value: !Ref ContainerInsightsLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-insights-log-group'
+
+  VPAConfigurationBucket:
+    Description: S3 bucket for storing VPA configurations and reports
+    Value: !Ref VPAConfigurationBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-vpa-bucket'
+
+  CostOptimizationLambdaArn:
+    Description: ARN of the cost optimization automation Lambda function
+    Value: !GetAtt CostOptimizationLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-lambda-arn'
+
+  LowCPUUtilizationAlarmArn:
+    Description: ARN of the low CPU utilization CloudWatch alarm
+    Value: !GetAtt LowCPUUtilizationAlarm.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-cpu-alarm'
+
+  LowMemoryUtilizationAlarmArn:
+    Description: ARN of the low memory utilization CloudWatch alarm
+    Value: !GetAtt LowMemoryUtilizationAlarm.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-memory-alarm'
+
+  VPAConfiguration:
+    Description: VPA configuration parameters for reference
+    Value: !Sub |
+      Update Mode: ${VPAUpdateMode}
+      CPU Range: ${MinCPURequest} - ${MaxCPURequest}
+      Memory Range: ${MinMemoryRequest} - ${MaxMemoryRequest}
+      Utilization Threshold: ${LowUtilizationThreshold}%
+
+  DeploymentInstructions:
+    Description: Next steps for completing the VPA deployment
+    Value: !Sub |
+      1. Update EKS cluster kubeconfig: aws eks update-kubeconfig --name ${EKSClusterName} --region ${AWS::Region}
+      2. Create namespace: kubectl create namespace ${CostOptimizationNamespace}
+      3. Deploy Metrics Server: kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+      4. Install VPA: git clone https://github.com/kubernetes/autoscaler.git && cd autoscaler/vertical-pod-autoscaler/ && ./hack/vpa-up.sh
+      5. Deploy Container Insights DaemonSet for enhanced monitoring
+      6. Monitor dashboard: https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ResourceTagPrefix}-dashboard

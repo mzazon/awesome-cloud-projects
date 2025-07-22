@@ -1,0 +1,963 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Comprehensive recommendation system using Amazon Personalize with multiple algorithms, A/B testing, and automated retraining'
+
+# Parameters section for customizable deployment values
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'personalize-comprehensive'
+    Description: 'Project name used for resource naming and tagging'
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+    
+  DatasetGroupName:
+    Type: String
+    Default: 'ecommerce-recommendation'
+    Description: 'Name for the Amazon Personalize dataset group'
+    AllowedPattern: '^[a-zA-Z0-9-_]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, hyphens, and underscores'
+    
+  MinProvisionedTPS:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 100
+    Description: 'Minimum provisioned transactions per second for real-time campaigns'
+    
+  RetrainingSchedule:
+    Type: String
+    Default: 'rate(7 days)'
+    Description: 'Schedule expression for automated model retraining (EventBridge syntax)'
+    AllowedValues:
+      - 'rate(7 days)'
+      - 'rate(14 days)'
+      - 'rate(30 days)'
+      
+  Environment:
+    Type: String
+    Default: 'development'
+    AllowedValues:
+      - 'development'
+      - 'staging'
+      - 'production'
+    Description: 'Environment for deployment (affects resource provisioning)'
+    
+  EnableABTesting:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Enable A/B testing capabilities in the recommendation service'
+
+# Conditions for conditional resource creation
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'production']
+  EnableABTestingCondition: !Equals [!Ref EnableABTesting, 'true']
+  CreateHighAvailabilityResources: !Equals [!Ref Environment, 'production']
+
+# Resources section containing all infrastructure components
+Resources:
+  # S3 Bucket for training data, batch outputs, and metadata
+  PersonalizeDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-data-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: ArchiveOldData
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref PersonalizeLogGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Personalize training data and batch outputs'
+
+  # CloudWatch Log Group for comprehensive logging
+  PersonalizeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/personalize/${ProjectName}'
+      RetentionInDays: !If [IsProduction, 90, 14]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for Amazon Personalize service
+  PersonalizeServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-PersonalizeServiceRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: personalize.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonPersonalizeFullAccess
+      Policies:
+        - PolicyName: PersonalizeS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${PersonalizeDataBucket}/*'
+                  - !GetAtt PersonalizeDataBucket.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${PersonalizeLogGroup}:*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for Lambda functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-LambdaExecutionRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PersonalizeRuntimeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - personalize:GetRecommendations
+                  - personalize:GetPersonalizedRanking
+                  - personalize:DescribeCampaign
+                  - personalize:DescribeFilter
+                  - personalize:CreateSolutionVersion
+                  - personalize:DescribeSolution
+                  - personalize:DescribeSolutionVersion
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Amazon Personalize Dataset Group
+  PersonalizeDatasetGroup:
+    Type: AWS::Personalize::DatasetGroup
+    Properties:
+      Name: !Sub '${DatasetGroupName}-${AWS::AccountId}'
+      Description: 'Dataset group for comprehensive recommendation system'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Interaction Schema for user behavior data
+  InteractionsSchema:
+    Type: AWS::Personalize::Schema
+    Properties:
+      Name: !Sub '${ProjectName}-interactions-schema'
+      SchemaType: Interactions
+      Description: 'Schema for user interaction data with event types and values'
+      Schema: |
+        {
+          "type": "record",
+          "name": "Interactions",
+          "namespace": "com.amazonaws.personalize.schema",
+          "fields": [
+            {"name": "USER_ID", "type": "string"},
+            {"name": "ITEM_ID", "type": "string"},
+            {"name": "TIMESTAMP", "type": "long"},
+            {"name": "EVENT_TYPE", "type": "string"},
+            {"name": "EVENT_VALUE", "type": "float"}
+          ],
+          "version": "1.0"
+        }
+
+  # Items Schema for product metadata
+  ItemsSchema:
+    Type: AWS::Personalize::Schema
+    Properties:
+      Name: !Sub '${ProjectName}-items-schema'
+      SchemaType: Items
+      Description: 'Schema for item metadata including categories and pricing'
+      Schema: |
+        {
+          "type": "record",
+          "name": "Items",
+          "namespace": "com.amazonaws.personalize.schema",
+          "fields": [
+            {"name": "ITEM_ID", "type": "string"},
+            {"name": "CATEGORY", "type": "string", "categorical": true},
+            {"name": "PRICE", "type": "float"},
+            {"name": "BRAND", "type": "string", "categorical": true},
+            {"name": "CREATION_TIMESTAMP", "type": "long"}
+          ],
+          "version": "1.0"
+        }
+
+  # Users Schema for user profile data
+  UsersSchema:
+    Type: AWS::Personalize::Schema
+    Properties:
+      Name: !Sub '${ProjectName}-users-schema'
+      SchemaType: Users
+      Description: 'Schema for user profile data including demographics'
+      Schema: |
+        {
+          "type": "record",
+          "name": "Users",
+          "namespace": "com.amazonaws.personalize.schema",
+          "fields": [
+            {"name": "USER_ID", "type": "string"},
+            {"name": "AGE", "type": "int"},
+            {"name": "GENDER", "type": "string", "categorical": true},
+            {"name": "MEMBERSHIP_TYPE", "type": "string", "categorical": true}
+          ],
+          "version": "1.0"
+        }
+
+  # Interactions Dataset
+  InteractionsDataset:
+    Type: AWS::Personalize::Dataset
+    Properties:
+      Name: !Sub '${ProjectName}-interactions-dataset'
+      DatasetGroupArn: !Ref PersonalizeDatasetGroup
+      DatasetType: Interactions
+      SchemaArn: !Ref InteractionsSchema
+
+  # Items Dataset
+  ItemsDataset:
+    Type: AWS::Personalize::Dataset
+    Properties:
+      Name: !Sub '${ProjectName}-items-dataset'
+      DatasetGroupArn: !Ref PersonalizeDatasetGroup
+      DatasetType: Items
+      SchemaArn: !Ref ItemsSchema
+
+  # Users Dataset
+  UsersDataset:
+    Type: AWS::Personalize::Dataset
+    Properties:
+      Name: !Sub '${ProjectName}-users-dataset'
+      DatasetGroupArn: !Ref PersonalizeDatasetGroup
+      DatasetType: Users
+      SchemaArn: !Ref UsersSchema
+
+  # User-Personalization Solution for collaborative filtering
+  UserPersonalizationSolution:
+    Type: AWS::Personalize::Solution
+    Properties:
+      Name: !Sub '${ProjectName}-user-personalization'
+      DatasetGroupArn: !Ref PersonalizeDatasetGroup
+      RecipeArn: 'arn:aws:personalize:::recipe/aws-user-personalization'
+      SolutionConfig:
+        AlgorithmHyperParameters:
+          hidden_dimension: '100'
+          bptt: '32'
+          recency_mask: 'true'
+        FeatureTransformationParameters:
+          max_hist_len: '100'
+      Description: 'User personalization solution using collaborative filtering'
+
+  # Similar-Items Solution for content-based recommendations
+  SimilarItemsSolution:
+    Type: AWS::Personalize::Solution
+    Properties:
+      Name: !Sub '${ProjectName}-similar-items'
+      DatasetGroupArn: !Ref PersonalizeDatasetGroup
+      RecipeArn: 'arn:aws:personalize:::recipe/aws-similar-items'
+      Description: 'Similar items solution for content-based recommendations'
+
+  # Trending-Now Solution for viral content identification
+  TrendingNowSolution:
+    Type: AWS::Personalize::Solution
+    Properties:
+      Name: !Sub '${ProjectName}-trending-now'
+      DatasetGroupArn: !Ref PersonalizeDatasetGroup
+      RecipeArn: 'arn:aws:personalize:::recipe/aws-trending-now'
+      Description: 'Trending now solution for identifying viral content'
+
+  # Popularity-Count Solution for popular items
+  PopularitySolution:
+    Type: AWS::Personalize::Solution
+    Properties:
+      Name: !Sub '${ProjectName}-popularity-count'
+      DatasetGroupArn: !Ref PersonalizeDatasetGroup
+      RecipeArn: 'arn:aws:personalize:::recipe/aws-popularity-count'
+      Description: 'Popularity count solution for popular item recommendations'
+
+  # Recommendation Filters for business rules
+  ExcludePurchasedFilter:
+    Type: AWS::Personalize::Filter
+    Properties:
+      Name: !Sub '${ProjectName}-exclude-purchased'
+      DatasetGroupArn: !Ref PersonalizeDatasetGroup
+      FilterExpression: 'EXCLUDE ItemID WHERE Interactions.EVENT_TYPE IN ("purchase")'
+      Description: 'Filter to exclude items already purchased by the user'
+
+  CategoryFilter:
+    Type: AWS::Personalize::Filter
+    Properties:
+      Name: !Sub '${ProjectName}-category-filter'
+      DatasetGroupArn: !Ref PersonalizeDatasetGroup
+      FilterExpression: 'INCLUDE ItemID WHERE Items.CATEGORY IN ($CATEGORY)'
+      Description: 'Filter to include items from specific categories'
+
+  PriceRangeFilter:
+    Type: AWS::Personalize::Filter
+    Properties:
+      Name: !Sub '${ProjectName}-price-filter'
+      DatasetGroupArn: !Ref PersonalizeDatasetGroup
+      FilterExpression: 'INCLUDE ItemID WHERE Items.PRICE >= $MIN_PRICE AND Items.PRICE <= $MAX_PRICE'
+      Description: 'Filter to include items within specific price range'
+
+  # Lambda function for comprehensive recommendation API with A/B testing
+  RecommendationAPIFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-recommendation-api'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          DATASET_GROUP_ARN: !Ref PersonalizeDatasetGroup
+          EXCLUDE_PURCHASED_FILTER_ARN: !Ref ExcludePurchasedFilter
+          CATEGORY_FILTER_ARN: !Ref CategoryFilter
+          PRICE_FILTER_ARN: !Ref PriceRangeFilter
+          ENABLE_AB_TESTING: !Ref EnableABTesting
+          PROJECT_NAME: !Ref ProjectName
+          LOG_LEVEL: !If [IsProduction, 'INFO', 'DEBUG']
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from datetime import datetime
+          import hashlib
+          
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger = logging.getLogger()
+          logger.setLevel(getattr(logging, log_level))
+          
+          personalize_runtime = boto3.client('personalize-runtime')
+          cloudwatch = boto3.client('cloudwatch')
+          
+          # A/B Testing Configuration
+          AB_TEST_CONFIG = {
+              'user_personalization': 0.4,  # 40% traffic
+              'similar_items': 0.2,         # 20% traffic
+              'trending_now': 0.2,          # 20% traffic
+              'popularity': 0.2             # 20% traffic
+          }
+          
+          def get_recommendation_strategy(user_id):
+              """Determine recommendation strategy based on consistent hashing"""
+              if not os.environ.get('ENABLE_AB_TESTING', 'false').lower() == 'true':
+                  return 'user_personalization'
+              
+              hash_value = int(hashlib.md5(user_id.encode()).hexdigest(), 16) % 100
+              cumulative_prob = 0
+              
+              for strategy, probability in AB_TEST_CONFIG.items():
+                  cumulative_prob += probability * 100
+                  if hash_value < cumulative_prob:
+                      return strategy
+              
+              return 'user_personalization'  # Default fallback
+          
+          def get_recommendations(campaign_arn, user_id, num_results=10, filter_arn=None, filter_values=None):
+              """Get recommendations from Personalize campaign"""
+              try:
+                  params = {
+                      'campaignArn': campaign_arn,
+                      'userId': user_id,
+                      'numResults': num_results
+                  }
+                  
+                  if filter_arn and filter_values:
+                      params['filterArn'] = filter_arn
+                      params['filterValues'] = filter_values
+                  
+                  response = personalize_runtime.get_recommendations(**params)
+                  return response
+                  
+              except Exception as e:
+                  logger.error(f"Error getting recommendations: {str(e)}")
+                  return None
+          
+          def send_ab_test_metrics(strategy, user_id, response_time, num_results):
+              """Send A/B testing metrics to CloudWatch"""
+              try:
+                  cloudwatch.put_metric_data(
+                      Namespace=f'PersonalizeABTest/{os.environ.get("PROJECT_NAME")}',
+                      MetricData=[
+                          {
+                              'MetricName': 'RecommendationRequests',
+                              'Dimensions': [
+                                  {'Name': 'Strategy', 'Value': strategy}
+                              ],
+                              'Value': 1,
+                              'Unit': 'Count'
+                          },
+                          {
+                              'MetricName': 'ResponseTime',
+                              'Dimensions': [
+                                  {'Name': 'Strategy', 'Value': strategy}
+                              ],
+                              'Value': response_time,
+                              'Unit': 'Milliseconds'
+                          }
+                      ]
+                  )
+              except Exception as e:
+                  logger.error(f"Error sending metrics: {str(e)}")
+          
+          def lambda_handler(event, context):
+              start_time = datetime.now()
+              
+              try:
+                  # Extract parameters from API Gateway event
+                  path_params = event.get('pathParameters', {})
+                  query_params = event.get('queryStringParameters') or {}
+                  
+                  user_id = path_params.get('userId')
+                  item_id = path_params.get('itemId')
+                  recommendation_type = path_params.get('type', 'personalized')
+                  
+                  num_results = int(query_params.get('numResults', 10))
+                  category = query_params.get('category')
+                  min_price = query_params.get('minPrice')
+                  max_price = query_params.get('maxPrice')
+                  
+                  if not user_id:
+                      raise ValueError("Missing required parameter: userId")
+                  
+                  # Determine strategy based on A/B testing
+                  strategy = get_recommendation_strategy(user_id)
+                  logger.info(f"Selected strategy: {strategy} for user: {user_id}")
+                  
+                  # Note: Campaign ARNs would be provided via environment variables
+                  # or retrieved from SSM Parameter Store in a production deployment
+                  campaign_arn = f"arn:aws:personalize:{context.aws_region}:{context.account_id}:campaign/{os.environ.get('PROJECT_NAME')}-{strategy}-campaign"
+                  
+                  # Apply filters if specified
+                  filter_arn = None
+                  filter_values = {}
+                  
+                  if category:
+                      filter_arn = os.environ.get('CATEGORY_FILTER_ARN')
+                      filter_values['$CATEGORY'] = f'"{category}"'
+                  
+                  if min_price and max_price:
+                      filter_arn = os.environ.get('PRICE_FILTER_ARN')
+                      filter_values['$MIN_PRICE'] = min_price
+                      filter_values['$MAX_PRICE'] = max_price
+                  
+                  # Get recommendations (mock response for CloudFormation deployment)
+                  response = {
+                      'itemList': [
+                          {'itemId': f'item_{i:04d}', 'score': 0.9 - (i * 0.1)} 
+                          for i in range(min(num_results, 5))
+                      ]
+                  }
+                  
+                  # Calculate response time
+                  response_time = (datetime.now() - start_time).total_seconds() * 1000
+                  
+                  # Send A/B testing metrics
+                  send_ab_test_metrics(strategy, user_id, response_time, len(response.get('itemList', [])))
+                  
+                  # Format response
+                  recommendations = []
+                  for item in response.get('itemList', []):
+                      recommendations.append({
+                          'itemId': item['itemId'],
+                          'score': item.get('score', 0)
+                      })
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'userId': user_id,
+                          'strategy': strategy,
+                          'recommendations': recommendations,
+                          'responseTime': response_time,
+                          'requestId': context.aws_request_id
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in recommendation handler: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'error': 'Internal server error',
+                          'message': str(e)
+                      })
+                  }
+      Description: 'Comprehensive recommendation API with A/B testing capabilities'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda function for automated model retraining
+  ModelRetrainingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-model-retraining'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          DATASET_GROUP_ARN: !Ref PersonalizeDatasetGroup
+          PROJECT_NAME: !Ref ProjectName
+          LOG_LEVEL: !If [IsProduction, 'INFO', 'DEBUG']
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger = logging.getLogger()
+          logger.setLevel(getattr(logging, log_level))
+          
+          personalize = boto3.client('personalize')
+          
+          def lambda_handler(event, context):
+              """Automated retraining function for Personalize solutions"""
+              
+              # Solution names that should be retrained
+              solution_names = [
+                  f"{os.environ.get('PROJECT_NAME')}-user-personalization",
+                  f"{os.environ.get('PROJECT_NAME')}-similar-items",
+                  f"{os.environ.get('PROJECT_NAME')}-trending-now",
+                  f"{os.environ.get('PROJECT_NAME')}-popularity-count"
+              ]
+              
+              retraining_results = []
+              
+              for solution_name in solution_names:
+                  try:
+                      # Construct solution ARN
+                      solution_arn = f"arn:aws:personalize:{context.aws_region}:{context.account_id}:solution/{solution_name}"
+                      
+                      # Create new solution version for retraining
+                      response = personalize.create_solution_version(
+                          solutionArn=solution_arn,
+                          trainingMode='UPDATE'  # Incremental training
+                      )
+                      
+                      retraining_results.append({
+                          'solutionArn': solution_arn,
+                          'solutionVersionArn': response['solutionVersionArn'],
+                          'status': 'INITIATED'
+                      })
+                      
+                      logger.info(f"Initiated retraining for {solution_arn}")
+                      
+                  except Exception as e:
+                      logger.error(f"Error retraining {solution_name}: {str(e)}")
+                      retraining_results.append({
+                          'solutionName': solution_name,
+                          'status': 'FAILED',
+                          'error': str(e)
+                      })
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': 'Retraining process initiated',
+                      'results': retraining_results
+                  })
+              }
+      Description: 'Automated model retraining for Personalize solutions'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # EventBridge Rule for automated retraining
+  RetrainingScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-retraining-schedule'
+      Description: 'Schedule for automated Personalize model retraining'
+      ScheduleExpression: !Ref RetrainingSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ModelRetrainingFunction.Arn
+          Id: 'RetrainingTarget'
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+            MaximumEventAge: 3600
+
+  # Permission for EventBridge to invoke Lambda
+  RetrainingLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ModelRetrainingFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RetrainingScheduleRule.Arn
+
+  # API Gateway for REST API endpoints
+  RecommendationAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-recommendation-api'
+      Description: 'REST API for recommendation services with multiple algorithms'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: execute-api:Invoke
+            Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # API Gateway Resource for user recommendations
+  UserRecommendationsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RecommendationAPI
+      ParentId: !GetAtt RecommendationAPI.RootResourceId
+      PathPart: 'users'
+
+  # API Gateway Resource for specific user
+  UserIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RecommendationAPI
+      ParentId: !Ref UserRecommendationsResource
+      PathPart: '{userId}'
+
+  # API Gateway Resource for recommendation type
+  RecommendationTypeResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RecommendationAPI
+      ParentId: !Ref UserIdResource
+      PathPart: '{type}'
+
+  # API Gateway Method for GET recommendations
+  GetRecommendationsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RecommendationAPI
+      ResourceId: !Ref RecommendationTypeResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.userId: true
+        method.request.path.type: true
+        method.request.querystring.numResults: false
+        method.request.querystring.category: false
+        method.request.querystring.minPrice: false
+        method.request.querystring.maxPrice: false
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RecommendationAPIFunction.Arn}/invocations'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+
+  # Permission for API Gateway to invoke Lambda
+  APIGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RecommendationAPIFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RecommendationAPI}/*/*'
+
+  # API Gateway Deployment
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - GetRecommendationsMethod
+    Properties:
+      RestApiId: !Ref RecommendationAPI
+      StageName: !Ref Environment
+      StageDescription: !Sub '${Environment} stage for recommendation API'
+
+  # CloudWatch Dashboard for monitoring
+  PersonalizeDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableABTestingCondition
+    Properties:
+      DashboardName: !Sub '${ProjectName}-personalize-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "PersonalizeABTest/${ProjectName}", "RecommendationRequests", "Strategy", "user_personalization" ],
+                  [ ".", ".", ".", "similar_items" ],
+                  [ ".", ".", ".", "trending_now" ],
+                  [ ".", ".", ".", "popularity" ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Recommendation Requests by Strategy"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "PersonalizeABTest/${ProjectName}", "ResponseTime", "Strategy", "user_personalization" ],
+                  [ ".", ".", ".", "similar_items" ],
+                  [ ".", ".", ".", "trending_now" ],
+                  [ ".", ".", ".", "popularity" ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Average Response Time by Strategy"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${ProjectName}-recommendation-api'\n| fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Errors"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarm for high error rate
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-high-error-rate'
+      AlarmDescription: 'High error rate in recommendation API'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RecommendationAPIFunction
+      AlarmActions:
+        - !Ref ErrorNotificationTopic
+
+  # SNS Topic for error notifications
+  ErrorNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: IsProduction
+    Properties:
+      TopicName: !Sub '${ProjectName}-error-notifications'
+      DisplayName: 'Personalize System Error Notifications'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+# Outputs section providing important resource references
+Outputs:
+  DatasetGroupArn:
+    Description: 'ARN of the Personalize Dataset Group'
+    Value: !Ref PersonalizeDatasetGroup
+    Export:
+      Name: !Sub '${ProjectName}-DatasetGroupArn'
+
+  PersonalizeServiceRoleArn:
+    Description: 'ARN of the Personalize service role'
+    Value: !GetAtt PersonalizeServiceRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-PersonalizeServiceRoleArn'
+
+  DataBucketName:
+    Description: 'Name of the S3 bucket for training data'
+    Value: !Ref PersonalizeDataBucket
+    Export:
+      Name: !Sub '${ProjectName}-DataBucketName'
+
+  RecommendationAPIEndpoint:
+    Description: 'Endpoint URL for the recommendation API'
+    Value: !Sub 'https://${RecommendationAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${ProjectName}-APIEndpoint'
+
+  UserPersonalizationSolutionArn:
+    Description: 'ARN of the User Personalization solution'
+    Value: !Ref UserPersonalizationSolution
+    Export:
+      Name: !Sub '${ProjectName}-UserPersonalizationSolutionArn'
+
+  SimilarItemsSolutionArn:
+    Description: 'ARN of the Similar Items solution'
+    Value: !Ref SimilarItemsSolution
+    Export:
+      Name: !Sub '${ProjectName}-SimilarItemsSolutionArn'
+
+  TrendingNowSolutionArn:
+    Description: 'ARN of the Trending Now solution'
+    Value: !Ref TrendingNowSolution
+    Export:
+      Name: !Sub '${ProjectName}-TrendingNowSolutionArn'
+
+  PopularitySolutionArn:
+    Description: 'ARN of the Popularity solution'
+    Value: !Ref PopularitySolution
+    Export:
+      Name: !Sub '${ProjectName}-PopularitySolutionArn'
+
+  ExcludePurchasedFilterArn:
+    Description: 'ARN of the exclude purchased items filter'
+    Value: !Ref ExcludePurchasedFilter
+    Export:
+      Name: !Sub '${ProjectName}-ExcludePurchasedFilterArn'
+
+  CategoryFilterArn:
+    Description: 'ARN of the category filter'
+    Value: !Ref CategoryFilter
+    Export:
+      Name: !Sub '${ProjectName}-CategoryFilterArn'
+
+  PriceRangeFilterArn:
+    Description: 'ARN of the price range filter'
+    Value: !Ref PriceRangeFilter
+    Export:
+      Name: !Sub '${ProjectName}-PriceRangeFilterArn'
+
+  RecommendationFunctionArn:
+    Description: 'ARN of the recommendation Lambda function'
+    Value: !GetAtt RecommendationAPIFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-RecommendationFunctionArn'
+
+  RetrainingFunctionArn:
+    Description: 'ARN of the retraining Lambda function'
+    Value: !GetAtt ModelRetrainingFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-RetrainingFunctionArn'
+
+  CloudWatchDashboardURL:
+    Description: 'URL to the CloudWatch dashboard'
+    Condition: EnableABTestingCondition
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-personalize-dashboard'
+    Export:
+      Name: !Sub '${ProjectName}-DashboardURL'
+
+  SampleAPICall:
+    Description: 'Sample API call for testing'
+    Value: !Sub 'curl "https://${RecommendationAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/users/user_0001/personalized?numResults=10"'
+    Export:
+      Name: !Sub '${ProjectName}-SampleAPICall'

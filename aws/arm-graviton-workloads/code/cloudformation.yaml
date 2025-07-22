@@ -1,0 +1,925 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ARM-based Workloads with AWS Graviton Processors - Performance comparison and cost optimization demonstration'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'graviton-workload'
+    Description: 'Name prefix for all resources'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must be lowercase alphanumeric with hyphens only'
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: 'EC2 Key Pair for SSH access to instances'
+    ConstraintDescription: 'Must be the name of an existing EC2 KeyPair'
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC ID where resources will be created'
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: 'List of subnet IDs for multi-AZ deployment (minimum 2 subnets)'
+    MinLength: 2
+
+  AllowedCIDR:
+    Type: String
+    Default: '0.0.0.0/0'
+    Description: 'CIDR block allowed for SSH and HTTP access'
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: 'Must be a valid CIDR notation (e.g., 10.0.0.0/16)'
+
+  InstanceSize:
+    Type: String
+    Default: 'large'
+    AllowedValues: ['medium', 'large', 'xlarge']
+    Description: 'Instance size for both x86 and ARM instances'
+
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable detailed CloudWatch monitoring for instances'
+
+  CostThreshold:
+    Type: Number
+    Default: 50
+    MinValue: 10
+    MaxValue: 1000
+    Description: 'Cost threshold in USD for billing alerts'
+
+Conditions:
+  EnableDetailedMonitoringCondition: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  IsMediumSize: !Equals [!Ref InstanceSize, 'medium']
+  IsLargeSize: !Equals [!Ref InstanceSize, 'large']
+  IsXLargeSize: !Equals [!Ref InstanceSize, 'xlarge']
+
+Mappings:
+  # AWS Linux 2023 AMI IDs by region (ARM64 and x86_64)
+  AmiIdMap:
+    us-east-1:
+      ARM64: 'ami-0c94855ba95b798c7'
+      x86_64: 'ami-0abcdef1234567890'
+    us-west-2:
+      ARM64: 'ami-0f3769c8d8429942f'
+      x86_64: 'ami-0abcdef1234567890'
+    eu-west-1:
+      ARM64: 'ami-0c94855ba95b798c7'
+      x86_64: 'ami-0abcdef1234567890'
+
+  # Instance type mapping based on size parameter
+  InstanceTypeMap:
+    medium:
+      x86: 'c6i.medium'
+      arm: 'c7g.medium'
+    large:
+      x86: 'c6i.large'
+      arm: 'c7g.large'
+    xlarge:
+      x86: 'c6i.xlarge'
+      arm: 'c7g.xlarge'
+
+  # Hourly pricing for cost comparison (USD per hour)
+  PricingMap:
+    medium:
+      x86: 0.0432
+      arm: 0.0346
+    large:
+      x86: 0.0864
+      arm: 0.0691
+    xlarge:
+      x86: 0.1728
+      arm: 0.1382
+
+Resources:
+  # Security Group for Graviton instances
+  GravitonSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-graviton-sg'
+      GroupDescription: 'Security group for Graviton workload demonstration'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedCIDR
+          Description: 'SSH access for performance testing'
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AllowedCIDR
+          Description: 'HTTP access for web application'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref AllowedCIDR
+          Description: 'HTTPS access for secure web application'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: '0.0.0.0/0'
+          Description: 'Allow all outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-graviton-sg'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Graviton performance comparison'
+
+  # IAM Role for EC2 instances
+  GravitonInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-graviton-instance-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: GravitonInstancePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceAttribute
+                  - ec2:DescribeInstanceStatus
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeVolumeStatus
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:PutParameter
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Instance Profile for EC2 instances
+  GravitonInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ProjectName}-graviton-instance-profile'
+      Roles:
+        - !Ref GravitonInstanceRole
+
+  # x86 Baseline Instance
+  X86BaselineInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !FindInMap [AmiIdMap, !Ref 'AWS::Region', 'x86_64']
+      InstanceType: !FindInMap [InstanceTypeMap, !Ref InstanceSize, 'x86']
+      KeyName: !Ref KeyPairName
+      SecurityGroupIds:
+        - !Ref GravitonSecurityGroup
+      SubnetId: !Select [0, !Ref SubnetIds]
+      IamInstanceProfile: !Ref GravitonInstanceProfile
+      Monitoring: !Ref EnableDetailedMonitoringCondition
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Update system and install packages
+          yum update -y
+          yum install -y httpd stress-ng htop amazon-cloudwatch-agent
+
+          # Configure and start web server
+          systemctl start httpd
+          systemctl enable httpd
+
+          # Install CloudWatch agent (x86_64)
+          wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+          rpm -U amazon-cloudwatch-agent.rpm
+
+          # Create web page showing architecture
+          cat > /var/www/html/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>x86 Architecture Server</title>
+              <style>
+                  body { font-family: Arial, sans-serif; margin: 40px; }
+                  .header { background: #f0f0f0; padding: 20px; border-radius: 5px; }
+                  .metrics { margin-top: 20px; }
+                  .metric { display: inline-block; margin: 10px; padding: 10px; background: #e0e0e0; border-radius: 3px; }
+              </style>
+          </head>
+          <body>
+              <div class="header">
+                  <h1>x86 Architecture Server</h1>
+                  <p><strong>Instance ID:</strong> $(curl -s http://169.254.169.254/latest/meta-data/instance-id)</p>
+                  <p><strong>Architecture:</strong> $(uname -m)</p>
+                  <p><strong>Instance Type:</strong> $(curl -s http://169.254.169.254/latest/meta-data/instance-type)</p>
+                  <p><strong>Region:</strong> $(curl -s http://169.254.169.254/latest/meta-data/placement/region)</p>
+              </div>
+              <div class="metrics">
+                  <div class="metric">
+                      <strong>CPU Cores:</strong> $(nproc)
+                  </div>
+                  <div class="metric">
+                      <strong>Memory:</strong> $(free -h | grep Mem | awk '{print $2}')
+                  </div>
+                  <div class="metric">
+                      <strong>Uptime:</strong> $(uptime -p)
+                  </div>
+              </div>
+          </body>
+          </html>
+          EOF
+
+          # Create benchmark script
+          cat > /home/ec2-user/benchmark.sh << 'SCRIPT'
+          #!/bin/bash
+          echo "Starting CPU benchmark on x86 architecture..."
+          echo "Instance Type: $(curl -s http://169.254.169.254/latest/meta-data/instance-type)"
+          echo "CPU Architecture: $(uname -m)"
+          echo "CPU Cores: $(nproc)"
+          echo "Memory: $(free -h | grep Mem | awk '{print $2}')"
+          echo "Starting stress test..."
+          stress-ng --cpu $(nproc) --timeout 60s --metrics-brief
+          echo "Benchmark completed"
+          SCRIPT
+
+          chmod +x /home/ec2-user/benchmark.sh
+          chown ec2-user:ec2-user /home/ec2-user/benchmark.sh
+
+          # Configure CloudWatch agent
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'EOF'
+          {
+              "metrics": {
+                  "namespace": "GravitonDemo",
+                  "metrics_collected": {
+                      "cpu": {
+                          "measurement": [
+                              {"name": "cpu_usage_idle", "rename": "CPU_USAGE_IDLE", "unit": "Percent"},
+                              {"name": "cpu_usage_iowait", "rename": "CPU_USAGE_IOWAIT", "unit": "Percent"},
+                              {"name": "cpu_usage_system", "rename": "CPU_USAGE_SYSTEM", "unit": "Percent"},
+                              {"name": "cpu_usage_user", "rename": "CPU_USAGE_USER", "unit": "Percent"}
+                          ],
+                          "metrics_collection_interval": 60,
+                          "totalcpu": false
+                      },
+                      "disk": {
+                          "measurement": [
+                              {"name": "used_percent", "rename": "DISK_USED_PERCENT", "unit": "Percent"}
+                          ],
+                          "metrics_collection_interval": 60,
+                          "resources": ["*"]
+                      },
+                      "mem": {
+                          "measurement": [
+                              {"name": "mem_used_percent", "rename": "MEM_USED_PERCENT", "unit": "Percent"}
+                          ],
+                          "metrics_collection_interval": 60
+                      }
+                  }
+              }
+          }
+          EOF
+
+          # Start CloudWatch agent
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+
+          # Signal completion
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource X86BaselineInstance --region ${AWS::Region}
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-x86-baseline'
+        - Key: Architecture
+          Value: 'x86_64'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Performance baseline comparison'
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+        Count: 1
+
+  # ARM Graviton Instance
+  ARMGravitonInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !FindInMap [AmiIdMap, !Ref 'AWS::Region', 'ARM64']
+      InstanceType: !FindInMap [InstanceTypeMap, !Ref InstanceSize, 'arm']
+      KeyName: !Ref KeyPairName
+      SecurityGroupIds:
+        - !Ref GravitonSecurityGroup
+      SubnetId: !Select [1, !Ref SubnetIds]
+      IamInstanceProfile: !Ref GravitonInstanceProfile
+      Monitoring: !Ref EnableDetailedMonitoringCondition
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Update system and install packages
+          yum update -y
+          yum install -y httpd stress-ng htop amazon-cloudwatch-agent
+
+          # Configure and start web server
+          systemctl start httpd
+          systemctl enable httpd
+
+          # Install CloudWatch agent (ARM64)
+          wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/arm64/latest/amazon-cloudwatch-agent.rpm
+          rpm -U amazon-cloudwatch-agent.rpm
+
+          # Create web page showing architecture
+          cat > /var/www/html/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>ARM64 Graviton Server</title>
+              <style>
+                  body { font-family: Arial, sans-serif; margin: 40px; }
+                  .header { background: #f0f8ff; padding: 20px; border-radius: 5px; }
+                  .metrics { margin-top: 20px; }
+                  .metric { display: inline-block; margin: 10px; padding: 10px; background: #e0f0ff; border-radius: 3px; }
+                  .graviton { color: #ff9900; font-weight: bold; }
+              </style>
+          </head>
+          <body>
+              <div class="header">
+                  <h1 class="graviton">ARM64 Graviton Server</h1>
+                  <p><strong>Instance ID:</strong> $(curl -s http://169.254.169.254/latest/meta-data/instance-id)</p>
+                  <p><strong>Architecture:</strong> $(uname -m)</p>
+                  <p><strong>Instance Type:</strong> $(curl -s http://169.254.169.254/latest/meta-data/instance-type)</p>
+                  <p><strong>Region:</strong> $(curl -s http://169.254.169.254/latest/meta-data/placement/region)</p>
+              </div>
+              <div class="metrics">
+                  <div class="metric">
+                      <strong>CPU Cores:</strong> $(nproc)
+                  </div>
+                  <div class="metric">
+                      <strong>Memory:</strong> $(free -h | grep Mem | awk '{print $2}')
+                  </div>
+                  <div class="metric">
+                      <strong>Uptime:</strong> $(uptime -p)
+                  </div>
+              </div>
+          </body>
+          </html>
+          EOF
+
+          # Create benchmark script
+          cat > /home/ec2-user/benchmark.sh << 'SCRIPT'
+          #!/bin/bash
+          echo "Starting CPU benchmark on ARM64 Graviton architecture..."
+          echo "Instance Type: $(curl -s http://169.254.169.254/latest/meta-data/instance-type)"
+          echo "CPU Architecture: $(uname -m)"
+          echo "CPU Cores: $(nproc)"
+          echo "Memory: $(free -h | grep Mem | awk '{print $2}')"
+          echo "Starting stress test..."
+          stress-ng --cpu $(nproc) --timeout 60s --metrics-brief
+          echo "Benchmark completed"
+          SCRIPT
+
+          chmod +x /home/ec2-user/benchmark.sh
+          chown ec2-user:ec2-user /home/ec2-user/benchmark.sh
+
+          # Configure CloudWatch agent
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'EOF'
+          {
+              "metrics": {
+                  "namespace": "GravitonDemo",
+                  "metrics_collected": {
+                      "cpu": {
+                          "measurement": [
+                              {"name": "cpu_usage_idle", "rename": "CPU_USAGE_IDLE", "unit": "Percent"},
+                              {"name": "cpu_usage_iowait", "rename": "CPU_USAGE_IOWAIT", "unit": "Percent"},
+                              {"name": "cpu_usage_system", "rename": "CPU_USAGE_SYSTEM", "unit": "Percent"},
+                              {"name": "cpu_usage_user", "rename": "CPU_USAGE_USER", "unit": "Percent"}
+                          ],
+                          "metrics_collection_interval": 60,
+                          "totalcpu": false
+                      },
+                      "disk": {
+                          "measurement": [
+                              {"name": "used_percent", "rename": "DISK_USED_PERCENT", "unit": "Percent"}
+                          ],
+                          "metrics_collection_interval": 60,
+                          "resources": ["*"]
+                      },
+                      "mem": {
+                          "measurement": [
+                              {"name": "mem_used_percent", "rename": "MEM_USED_PERCENT", "unit": "Percent"}
+                          ],
+                          "metrics_collection_interval": 60
+                      }
+                  }
+              }
+          }
+          EOF
+
+          # Start CloudWatch agent
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+
+          # Signal completion
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource ARMGravitonInstance --region ${AWS::Region}
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-arm-graviton'
+        - Key: Architecture
+          Value: 'arm64'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'ARM Graviton performance demonstration'
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+        Count: 1
+
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-alb'
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - !Ref GravitonSecurityGroup
+      Subnets: !Ref SubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alb'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Load balancing between architectures'
+
+  # Target Group for mixed architecture instances
+  MixedArchitectureTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-mixed-tg'
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      HealthCheckEnabled: true
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetType: instance
+      Targets:
+        - Id: !Ref X86BaselineInstance
+          Port: 80
+        - Id: !Ref ARMGravitonInstance
+          Port: 80
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-mixed-tg'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ALB Listener
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref MixedArchitectureTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # Launch Template for ARM Auto Scaling
+  ARMLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ProjectName}-arm-template'
+      LaunchTemplateData:
+        ImageId: !FindInMap [AmiIdMap, !Ref 'AWS::Region', 'ARM64']
+        InstanceType: !FindInMap [InstanceTypeMap, !Ref InstanceSize, 'arm']
+        KeyName: !Ref KeyPairName
+        SecurityGroupIds:
+          - !Ref GravitonSecurityGroup
+        IamInstanceProfile:
+          Arn: !GetAtt GravitonInstanceProfile.Arn
+        Monitoring:
+          Enabled: !Ref EnableDetailedMonitoringCondition
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # Update system and install packages
+            yum update -y
+            yum install -y httpd stress-ng htop amazon-cloudwatch-agent
+
+            # Configure and start web server
+            systemctl start httpd
+            systemctl enable httpd
+
+            # Install CloudWatch agent (ARM64)
+            wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/arm64/latest/amazon-cloudwatch-agent.rpm
+            rpm -U amazon-cloudwatch-agent.rpm
+
+            # Create web page showing architecture
+            cat > /var/www/html/index.html << 'EOF'
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>ARM64 Graviton Auto Scaling Server</title>
+                <style>
+                    body { font-family: Arial, sans-serif; margin: 40px; }
+                    .header { background: #f0f8ff; padding: 20px; border-radius: 5px; }
+                    .metrics { margin-top: 20px; }
+                    .metric { display: inline-block; margin: 10px; padding: 10px; background: #e0f0ff; border-radius: 3px; }
+                    .graviton { color: #ff9900; font-weight: bold; }
+                    .auto-scaling { color: #3f8624; font-weight: bold; }
+                </style>
+            </head>
+            <body>
+                <div class="header">
+                    <h1 class="graviton">ARM64 Graviton Auto Scaling Server</h1>
+                    <p><strong>Instance ID:</strong> $(curl -s http://169.254.169.254/latest/meta-data/instance-id)</p>
+                    <p><strong>Architecture:</strong> $(uname -m)</p>
+                    <p><strong>Instance Type:</strong> $(curl -s http://169.254.169.254/latest/meta-data/instance-type)</p>
+                    <p><strong>Region:</strong> $(curl -s http://169.254.169.254/latest/meta-data/placement/region)</p>
+                    <p class="auto-scaling">Auto Scaling Group: ${ProjectName}-asg-arm</p>
+                </div>
+                <div class="metrics">
+                    <div class="metric">
+                        <strong>CPU Cores:</strong> $(nproc)
+                    </div>
+                    <div class="metric">
+                        <strong>Memory:</strong> $(free -h | grep Mem | awk '{print $2}')
+                    </div>
+                    <div class="metric">
+                        <strong>Uptime:</strong> $(uptime -p)
+                    </div>
+                </div>
+            </body>
+            </html>
+            EOF
+
+            # Create benchmark script
+            cat > /home/ec2-user/benchmark.sh << 'SCRIPT'
+            #!/bin/bash
+            echo "Starting CPU benchmark on ARM64 Graviton architecture (Auto Scaling)..."
+            echo "Instance Type: $(curl -s http://169.254.169.254/latest/meta-data/instance-type)"
+            echo "CPU Architecture: $(uname -m)"
+            echo "CPU Cores: $(nproc)"
+            echo "Memory: $(free -h | grep Mem | awk '{print $2}')"
+            echo "Starting stress test..."
+            stress-ng --cpu $(nproc) --timeout 60s --metrics-brief
+            echo "Benchmark completed"
+            SCRIPT
+
+            chmod +x /home/ec2-user/benchmark.sh
+            chown ec2-user:ec2-user /home/ec2-user/benchmark.sh
+
+            # Configure CloudWatch agent
+            cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'EOF'
+            {
+                "metrics": {
+                    "namespace": "GravitonDemo",
+                    "metrics_collected": {
+                        "cpu": {
+                            "measurement": [
+                                {"name": "cpu_usage_idle", "rename": "CPU_USAGE_IDLE", "unit": "Percent"},
+                                {"name": "cpu_usage_iowait", "rename": "CPU_USAGE_IOWAIT", "unit": "Percent"},
+                                {"name": "cpu_usage_system", "rename": "CPU_USAGE_SYSTEM", "unit": "Percent"},
+                                {"name": "cpu_usage_user", "rename": "CPU_USAGE_USER", "unit": "Percent"}
+                            ],
+                            "metrics_collection_interval": 60,
+                            "totalcpu": false
+                        },
+                        "disk": {
+                            "measurement": [
+                                {"name": "used_percent", "rename": "DISK_USED_PERCENT", "unit": "Percent"}
+                            ],
+                            "metrics_collection_interval": 60,
+                            "resources": ["*"]
+                        },
+                        "mem": {
+                            "measurement": [
+                                {"name": "mem_used_percent", "rename": "MEM_USED_PERCENT", "unit": "Percent"}
+                            ],
+                            "metrics_collection_interval": 60
+                        }
+                    }
+                }
+            }
+            EOF
+
+            # Start CloudWatch agent
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${ProjectName}-asg-arm'
+              - Key: Architecture
+                Value: 'arm64'
+              - Key: Project
+                Value: !Ref ProjectName
+              - Key: Purpose
+                Value: 'ARM Auto Scaling demonstration'
+
+  # Auto Scaling Group for ARM instances
+  ARMAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${ProjectName}-asg-arm'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ARMLaunchTemplate
+        Version: !GetAtt ARMLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 5
+      DesiredCapacity: 2
+      VPCZoneIdentifier: !Ref SubnetIds
+      TargetGroupARNs:
+        - !Ref MixedArchitectureTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      DefaultCooldown: 300
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-asg-arm'
+          PropagateAtLaunch: false
+        - Key: Project
+          Value: !Ref ProjectName
+          PropagateAtLaunch: true
+        - Key: Purpose
+          Value: 'ARM Auto Scaling demonstration'
+          PropagateAtLaunch: true
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT15M
+        SuspendProcesses:
+          - HealthCheck
+          - ReplaceUnhealthy
+          - AZRebalance
+          - AlarmNotification
+          - ScheduledActions
+        WaitOnResourceSignals: false
+
+  # CloudWatch Dashboard for Performance Comparison
+  PerformanceDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-performance-comparison'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${X86BaselineInstance}"],
+                  [".", ".", ".", "${ARMGravitonInstance}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "CPU Utilization Comparison (x86 vs ARM64)",
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 100
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/EC2", "NetworkIn", "InstanceId", "${X86BaselineInstance}"],
+                  [".", ".", ".", "${ARMGravitonInstance}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Network In Comparison (x86 vs ARM64)",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/EC2", "NetworkOut", "InstanceId", "${X86BaselineInstance}"],
+                  [".", ".", ".", "${ARMGravitonInstance}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Network Out Comparison (x86 vs ARM64)",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["GravitonDemo", "CPU_USAGE_USER", "InstanceId", "${X86BaselineInstance}"],
+                  [".", ".", ".", "${ARMGravitonInstance}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "CPU User Utilization (Custom Metrics)",
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 100
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${ApplicationLoadBalancer}"],
+                  [".", "TargetResponseTime", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Application Load Balancer Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarm for Cost Monitoring
+  CostAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-cost-alert'
+      AlarmDescription: 'Alert when estimated charges exceed threshold'
+      MetricName: EstimatedCharges
+      Namespace: AWS/Billing
+      Statistic: Maximum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: !Ref CostThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Currency
+          Value: USD
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref CostAlarmTopic
+
+  # SNS Topic for Cost Alerts
+  CostAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-cost-alerts'
+      DisplayName: 'Graviton Demo Cost Alerts'
+
+  # CloudWatch Log Group for performance logs
+  PerformanceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/graviton-demo/${ProjectName}'
+      RetentionInDays: 7
+
+Outputs:
+  StackName:
+    Description: 'Name of the CloudFormation stack'
+    Value: !Ref AWS::StackName
+    Export:
+      Name: !Sub '${AWS::StackName}-StackName'
+
+  X86InstanceId:
+    Description: 'Instance ID of the x86 baseline instance'
+    Value: !Ref X86BaselineInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-X86InstanceId'
+
+  ARMInstanceId:
+    Description: 'Instance ID of the ARM Graviton instance'
+    Value: !Ref ARMGravitonInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-ARMInstanceId'
+
+  X86PublicIP:
+    Description: 'Public IP address of the x86 baseline instance'
+    Value: !GetAtt X86BaselineInstance.PublicIp
+    Export:
+      Name: !Sub '${AWS::StackName}-X86PublicIP'
+
+  ARMPublicIP:
+    Description: 'Public IP address of the ARM Graviton instance'
+    Value: !GetAtt ARMGravitonInstance.PublicIp
+    Export:
+      Name: !Sub '${AWS::StackName}-ARMPublicIP'
+
+  LoadBalancerDNS:
+    Description: 'DNS name of the Application Load Balancer'
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-LoadBalancerDNS'
+
+  LoadBalancerURL:
+    Description: 'URL of the Application Load Balancer'
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-LoadBalancerURL'
+
+  AutoScalingGroupName:
+    Description: 'Name of the ARM Auto Scaling Group'
+    Value: !Ref ARMAutoScalingGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AutoScalingGroupName'
+
+  CloudWatchDashboardURL:
+    Description: 'URL to the CloudWatch Dashboard'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-performance-comparison'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  SecurityGroupId:
+    Description: 'Security Group ID for the Graviton instances'
+    Value: !Ref GravitonSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroupId'
+
+  InstanceProfile:
+    Description: 'IAM Instance Profile for the Graviton instances'
+    Value: !Ref GravitonInstanceProfile
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceProfile'
+
+  CostComparison:
+    Description: 'Cost comparison between x86 and ARM instances per hour'
+    Value: !Sub 
+      - 'x86 (${x86Type}): $${x86Price}/hr | ARM (${armType}): $${armPrice}/hr | Savings: ${savings}%'
+      - x86Type: !FindInMap [InstanceTypeMap, !Ref InstanceSize, 'x86']
+        armType: !FindInMap [InstanceTypeMap, !Ref InstanceSize, 'arm']
+        x86Price: !FindInMap [PricingMap, !Ref InstanceSize, 'x86']
+        armPrice: !FindInMap [PricingMap, !Ref InstanceSize, 'arm']
+        savings: !If 
+          - IsMediumSize
+          - '19.9'
+          - !If 
+            - IsLargeSize
+            - '20.0'
+            - '20.0'
+    Export:
+      Name: !Sub '${AWS::StackName}-CostComparison'
+
+  TestingInstructions:
+    Description: 'Instructions for testing the Graviton workload'
+    Value: !Sub |
+      1. SSH to x86 instance: ssh -i your-key.pem ec2-user@${X86BaselineInstance.PublicIp}
+      2. SSH to ARM instance: ssh -i your-key.pem ec2-user@${ARMGravitonInstance.PublicIp}
+      3. Run benchmark: ./benchmark.sh
+      4. View web pages: http://${X86BaselineInstance.PublicIp} and http://${ARMGravitonInstance.PublicIp}
+      5. Load balanced access: http://${ApplicationLoadBalancer.DNSName}
+      6. Monitor performance: CloudWatch Dashboard URL above
+    Export:
+      Name: !Sub '${AWS::StackName}-TestingInstructions'

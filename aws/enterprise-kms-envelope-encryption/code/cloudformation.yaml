@@ -1,0 +1,876 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Enterprise KMS Envelope Encryption with Automated Key Rotation
+  Creates a complete enterprise encryption solution with KMS customer master keys,
+  S3 bucket with encryption, Lambda-based key rotation monitoring, and CloudWatch Events automation.
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - EnvironmentName
+          - OwnerTag
+      - Label:
+          default: "KMS Configuration"
+        Parameters:
+          - EnableAutomaticKeyRotation
+          - KeyUsage
+          - KeySpec
+      - Label:
+          default: "S3 Configuration"
+        Parameters:
+          - EnableS3BucketVersioning
+          - EnableS3BucketKey
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaTimeout
+          - LambdaMemorySize
+          - LogRetentionDays
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - MonitoringSchedule
+          - EnableAutoRotationFix
+    ParameterLabels:
+      EnvironmentName:
+        default: "Environment Name"
+      OwnerTag:
+        default: "Resource Owner"
+      EnableAutomaticKeyRotation:
+        default: "Enable Automatic Key Rotation"
+      KeyUsage:
+        default: "Key Usage"
+      KeySpec:
+        default: "Key Specification"
+      EnableS3BucketVersioning:
+        default: "Enable S3 Bucket Versioning"
+      EnableS3BucketKey:
+        default: "Enable S3 Bucket Key Optimization"
+      LambdaTimeout:
+        default: "Lambda Function Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Function Memory (MB)"
+      LogRetentionDays:
+        default: "CloudWatch Log Retention (days)"
+      MonitoringSchedule:
+        default: "Key Rotation Monitoring Schedule"
+      EnableAutoRotationFix:
+        default: "Auto-enable Rotation for Non-compliant Keys"
+
+# Input Parameters
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: enterprise-encryption
+    Description: Environment name used for resource naming and tagging
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must start with a letter and contain only alphanumeric characters and hyphens
+    MinLength: 3
+    MaxLength: 30
+
+  OwnerTag:
+    Type: String
+    Default: security-team
+    Description: Owner tag applied to all resources for cost tracking and management
+    MinLength: 3
+    MaxLength: 50
+
+  EnableAutomaticKeyRotation:
+    Type: String
+    Default: 'true'
+    Description: Enable automatic annual key rotation for the customer master key
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  KeyUsage:
+    Type: String
+    Default: ENCRYPT_DECRYPT
+    Description: Allowed uses for the customer master key
+    AllowedValues:
+      - ENCRYPT_DECRYPT
+      - SIGN_VERIFY
+
+  KeySpec:
+    Type: String
+    Default: SYMMETRIC_DEFAULT
+    Description: Key material specification for the customer master key
+    AllowedValues:
+      - SYMMETRIC_DEFAULT
+      - RSA_2048
+      - RSA_3072
+      - RSA_4096
+      - ECC_NIST_P256
+      - ECC_NIST_P384
+      - ECC_NIST_P521
+      - ECC_SECG_P256K1
+
+  EnableS3BucketVersioning:
+    Type: String
+    Default: 'true'
+    Description: Enable versioning on the S3 bucket for data protection
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableS3BucketKey:
+    Type: String
+    Default: 'true'
+    Description: Enable S3 Bucket Key to reduce KMS API calls and costs
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    Description: Lambda function timeout in seconds
+    MinValue: 30
+    MaxValue: 900
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 128
+    Description: Lambda function memory allocation in MB
+    AllowedValues: [128, 256, 512, 1024, 1536, 2048, 3008]
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    Description: CloudWatch Logs retention period in days
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+  MonitoringSchedule:
+    Type: String
+    Default: rate(7 days)
+    Description: CloudWatch Events schedule expression for key rotation monitoring
+    AllowedValues:
+      - rate(1 day)
+      - rate(3 days)
+      - rate(7 days)
+      - rate(14 days)
+      - rate(30 days)
+
+  EnableAutoRotationFix:
+    Type: String
+    Default: 'true'
+    Description: Automatically enable key rotation for non-compliant keys
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+# Conditional Resource Creation
+Conditions:
+  EnableKeyRotation: !Equals [!Ref EnableAutomaticKeyRotation, 'true']
+  EnableVersioning: !Equals [!Ref EnableS3BucketVersioning, 'true']
+  EnableBucketKey: !Equals [!Ref EnableS3BucketKey, 'true']
+  EnableAutoFix: !Equals [!Ref EnableAutoRotationFix, 'true']
+
+# AWS Resources
+Resources:
+  # ============================================================================
+  # KMS Customer Master Key with Automatic Rotation
+  # ============================================================================
+  
+  EnterpriseCustomerMasterKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub '${EnvironmentName} enterprise envelope encryption master key'
+      KeyUsage: !Ref KeyUsage
+      KeySpec: !Ref KeySpec
+      EnableKeyRotation: !If [EnableKeyRotation, true, false]
+      KeyRotationStatus: !If [EnableKeyRotation, Enabled, Disabled]
+      MultiRegion: false
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # Root account administrative access
+          - Sid: EnableRootAccountAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          
+          # Lambda function key management permissions
+          - Sid: AllowKeyRotationMonitoring
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt KeyRotationMonitorRole.Arn
+            Action:
+              - kms:DescribeKey
+              - kms:GetKeyRotationStatus
+              - kms:EnableKeyRotation
+              - kms:ListKeys
+              - kms:ListAliases
+            Resource: '*'
+          
+          # S3 service permissions for bucket encryption
+          - Sid: AllowS3ServiceAccess
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:ViaService': !Sub 's3.${AWS::Region}.amazonaws.com'
+                'kms:EncryptionContext:aws:s3:arn': !Sub '${EnterpriseEncryptedBucket}/*'
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-enterprise-cmk'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Owner
+          Value: !Ref OwnerTag
+        - Key: Purpose
+          Value: envelope-encryption
+        - Key: AutoRotation
+          Value: !Ref EnableAutomaticKeyRotation
+
+  # KMS Key Alias for human-readable reference
+  EnterpriseKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${EnvironmentName}-enterprise-encryption'
+      TargetKeyId: !Ref EnterpriseCustomerMasterKey
+
+  # ============================================================================
+  # S3 Bucket with KMS Encryption
+  # ============================================================================
+  
+  EnterpriseEncryptedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${EnvironmentName}-encrypted-data-${AWS::AccountId}'
+      
+      # Versioning configuration for data protection
+      VersioningConfiguration:
+        Status: !If [EnableVersioning, Enabled, Suspended]
+      
+      # Server-side encryption with KMS
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref EnterpriseKeyAlias
+            BucketKeyEnabled: !If [EnableBucketKey, true, false]
+      
+      # Public access prevention
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      
+      # Lifecycle management for cost optimization
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transition:
+              StorageClass: GLACIER
+              TransitionInDays: 90
+      
+      # Notification configuration for monitoring
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-encrypted-bucket'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Owner
+          Value: !Ref OwnerTag
+        - Key: Purpose
+          Value: secure-data-storage
+        - Key: Encryption
+          Value: kms-encrypted
+
+  # S3 Bucket Policy for additional security
+  EnterpriseEncryptedBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref EnterpriseEncryptedBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Deny unencrypted uploads
+          - Sid: DenyUnencryptedObjectUploads
+            Effect: Deny
+            Principal: '*'
+            Action: s3:PutObject
+            Resource: !Sub '${EnterpriseEncryptedBucket}/*'
+            Condition:
+              StringNotEquals:
+                's3:x-amz-server-side-encryption': aws:kms
+          
+          # Deny uploads without bucket key (if enabled)
+          - !If
+            - EnableBucketKey
+            - Sid: RequireBucketKeyEncryption
+              Effect: Deny
+              Principal: '*'
+              Action: s3:PutObject
+              Resource: !Sub '${EnterpriseEncryptedBucket}/*'
+              Condition:
+                StringNotEquals:
+                  's3:x-amz-server-side-encryption-bucket-key-enabled': 'true'
+            - !Ref 'AWS::NoValue'
+          
+          # Require SSL/TLS for all requests
+          - Sid: RequireSSLRequestsOnly
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${EnterpriseEncryptedBucket}'
+              - !Sub '${EnterpriseEncryptedBucket}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # ============================================================================
+  # IAM Roles and Policies for Lambda Function
+  # ============================================================================
+  
+  # Lambda execution role for key rotation monitoring
+  KeyRotationMonitorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-key-rotation-monitor-role'
+      Description: IAM role for Lambda function monitoring KMS key rotation
+      
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      
+      Policies:
+        # Custom policy for KMS key management
+        - PolicyName: KMSKeyManagementPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # KMS permissions for key monitoring and rotation
+              - Effect: Allow
+                Action:
+                  - kms:DescribeKey
+                  - kms:GetKeyRotationStatus
+                  - kms:ListKeys
+                  - kms:ListAliases
+                Resource: '*'
+              
+              # Conditional permission to enable key rotation
+              - !If
+                - EnableAutoFix
+                - Effect: Allow
+                  Action:
+                    - kms:EnableKeyRotation
+                  Resource: '*'
+                  Condition:
+                    StringEquals:
+                      'kms:KeyManager': 'CUSTOMER'
+                - !Ref 'AWS::NoValue'
+              
+              # CloudWatch Logs permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-key-rotation-monitor-role'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Owner
+          Value: !Ref OwnerTag
+        - Key: Purpose
+          Value: key-rotation-monitoring
+
+  # ============================================================================
+  # Lambda Function for Key Rotation Monitoring
+  # ============================================================================
+  
+  KeyRotationMonitorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-kms-key-rotator'
+      Description: Monitors KMS key rotation status and ensures compliance
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt KeyRotationMonitorRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      
+      Environment:
+        Variables:
+          ENVIRONMENT_NAME: !Ref EnvironmentName
+          AUTO_FIX_ROTATION: !Ref EnableAutoRotationFix
+          LOG_LEVEL: INFO
+      
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime
+          from typing import List, Dict, Any
+          
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger = logging.getLogger()
+          logger.setLevel(getattr(logging, log_level))
+          
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              Monitor KMS key rotation status and optionally enable rotation
+              for non-compliant customer-managed keys.
+              """
+              kms_client = boto3.client('kms')
+              environment_name = os.environ.get('ENVIRONMENT_NAME', '${EnvironmentName}')
+              auto_fix_enabled = os.environ.get('AUTO_FIX_ROTATION', '${EnableAutoRotationFix}').lower() == 'true'
+              
+              logger.info(f"Starting key rotation monitoring for environment: {environment_name}")
+              logger.info(f"Auto-fix rotation enabled: {auto_fix_enabled}")
+              
+              try:
+                  rotation_status = []
+                  keys_processed = 0
+                  keys_fixed = 0
+                  
+                  # Get paginated list of all KMS keys
+                  paginator = kms_client.get_paginator('list_keys')
+                  
+                  for page in paginator.paginate():
+                      for key in page['Keys']:
+                          key_id = key['KeyId']
+                          keys_processed += 1
+                          
+                          try:
+                              # Get detailed key information
+                              key_details = kms_client.describe_key(KeyId=key_id)
+                              key_metadata = key_details['KeyMetadata']
+                              
+                              # Skip AWS-managed keys (focus on customer-managed keys)
+                              if key_metadata['KeyManager'] == 'AWS':
+                                  logger.debug(f"Skipping AWS-managed key: {key_id}")
+                                  continue
+                              
+                              # Skip keys that are not in enabled state
+                              if key_metadata['KeyState'] != 'Enabled':
+                                  logger.debug(f"Skipping non-enabled key: {key_id}, State: {key_metadata['KeyState']}")
+                                  continue
+                              
+                              # Check key rotation status
+                              rotation_response = kms_client.get_key_rotation_status(KeyId=key_id)
+                              rotation_enabled = rotation_response['KeyRotationEnabled']
+                              
+                              # Get key aliases for better identification
+                              aliases = []
+                              try:
+                                  aliases_response = kms_client.list_aliases(KeyId=key_id)
+                                  aliases = [alias['AliasName'] for alias in aliases_response.get('Aliases', [])]
+                              except Exception as e:
+                                  logger.warning(f"Failed to get aliases for key {key_id}: {str(e)}")
+                              
+                              key_info = {
+                                  'KeyId': key_id,
+                                  'KeyArn': key_metadata['Arn'],
+                                  'Aliases': aliases,
+                                  'RotationEnabled': rotation_enabled,
+                                  'KeyState': key_metadata['KeyState'],
+                                  'KeyUsage': key_metadata['KeyUsage'],
+                                  'KeySpec': key_metadata['KeySpec'],
+                                  'CreationDate': key_metadata['CreationDate'].isoformat(),
+                                  'Description': key_metadata.get('Description', 'No description')
+                              }
+                              
+                              rotation_status.append(key_info)
+                              
+                              # Log current rotation status
+                              alias_info = f" (aliases: {', '.join(aliases)})" if aliases else ""
+                              logger.info(f"Key {key_id}{alias_info}: Rotation {'enabled' if rotation_enabled else 'DISABLED'}")
+                              
+                              # Auto-enable rotation if configured and rotation is disabled
+                              if auto_fix_enabled and not rotation_enabled:
+                                  try:
+                                      kms_client.enable_key_rotation(KeyId=key_id)
+                                      keys_fixed += 1
+                                      logger.warning(f"ENABLED rotation for key {key_id}{alias_info}")
+                                      key_info['RotationEnabled'] = True
+                                      key_info['AutoFixed'] = True
+                                  except Exception as e:
+                                      logger.error(f"Failed to enable rotation for key {key_id}: {str(e)}")
+                                      key_info['AutoFixError'] = str(e)
+                              
+                          except Exception as e:
+                              logger.error(f"Error processing key {key_id}: {str(e)}")
+                              continue
+                  
+                  # Generate summary report
+                  customer_managed_keys = len(rotation_status)
+                  keys_with_rotation = sum(1 for key in rotation_status if key['RotationEnabled'])
+                  keys_without_rotation = customer_managed_keys - keys_with_rotation
+                  
+                  summary = {
+                      'timestamp': datetime.now().isoformat(),
+                      'environment': environment_name,
+                      'total_keys_processed': keys_processed,
+                      'customer_managed_keys': customer_managed_keys,
+                      'keys_with_rotation_enabled': keys_with_rotation,
+                      'keys_without_rotation': keys_without_rotation,
+                      'auto_fix_enabled': auto_fix_enabled,
+                      'keys_auto_fixed': keys_fixed,
+                      'compliance_percentage': round((keys_with_rotation / customer_managed_keys * 100), 2) if customer_managed_keys > 0 else 100
+                  }
+                  
+                  logger.info(f"Key rotation monitoring completed successfully")
+                  logger.info(f"Summary: {json.dumps(summary, indent=2)}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Key rotation monitoring completed successfully',
+                          'summary': summary,
+                          'key_details': rotation_status
+                      }, indent=2)
+                  }
+                  
+              except Exception as e:
+                  error_message = f"Error during key rotation monitoring: {str(e)}"
+                  logger.error(error_message)
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': error_message,
+                          'timestamp': datetime.now().isoformat()
+                      })
+                  }
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-key-rotation-monitor'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Owner
+          Value: !Ref OwnerTag
+        - Key: Purpose
+          Value: key-rotation-monitoring
+
+  # CloudWatch Log Group for Lambda function
+  KeyRotationMonitorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${KeyRotationMonitorFunction}'
+      RetentionInDays: !Ref LogRetentionDays
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-key-rotation-monitor-logs'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Owner
+          Value: !Ref OwnerTag
+        - Key: Purpose
+          Value: key-rotation-monitoring
+
+  # ============================================================================
+  # CloudWatch Events for Automated Scheduling
+  # ============================================================================
+  
+  # CloudWatch Events Rule for scheduled key rotation monitoring
+  KeyRotationMonitorSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${EnvironmentName}-key-rotation-schedule'
+      Description: Scheduled execution of KMS key rotation monitoring
+      ScheduleExpression: !Ref MonitoringSchedule
+      State: ENABLED
+      
+      Targets:
+        - Arn: !GetAtt KeyRotationMonitorFunction.Arn
+          Id: KeyRotationMonitorTarget
+          Input: !Sub |
+            {
+              "source": "cloudwatch-events",
+              "environment": "${EnvironmentName}",
+              "schedule": "${MonitoringSchedule}"
+            }
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-key-rotation-schedule'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Owner
+          Value: !Ref OwnerTag
+        - Key: Purpose
+          Value: key-rotation-monitoring
+
+  # Lambda permission for CloudWatch Events
+  KeyRotationMonitorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref KeyRotationMonitorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt KeyRotationMonitorSchedule.Arn
+
+  # ============================================================================
+  # CloudWatch Logs for S3 Access Monitoring
+  # ============================================================================
+  
+  # Log Group for S3 access monitoring
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${EnvironmentName}-access-logs'
+      RetentionInDays: !Ref LogRetentionDays
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-s3-access-logs'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Owner
+          Value: !Ref OwnerTag
+        - Key: Purpose
+          Value: s3-access-monitoring
+
+  # ============================================================================
+  # CloudWatch Alarms for Security Monitoring
+  # ============================================================================
+  
+  # Alarm for KMS key usage anomalies
+  KMSKeyUsageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-kms-key-usage-anomaly'
+      AlarmDescription: Alert on unusual KMS key usage patterns
+      MetricName: NumberOfRequestsSucceeded
+      Namespace: AWS/KMS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: KeyId
+          Value: !Ref EnterpriseCustomerMasterKey
+      TreatMissingData: notBreaching
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-kms-usage-alarm'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Owner
+          Value: !Ref OwnerTag
+        - Key: Purpose
+          Value: security-monitoring
+
+  # Alarm for Lambda function errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-lambda-function-errors'
+      AlarmDescription: Alert on Lambda function execution errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref KeyRotationMonitorFunction
+      TreatMissingData: notBreaching
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-lambda-error-alarm'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Owner
+          Value: !Ref OwnerTag
+        - Key: Purpose
+          Value: operational-monitoring
+
+# Stack Outputs
+Outputs:
+  # KMS Outputs
+  CustomerMasterKeyId:
+    Description: The ID of the enterprise customer master key
+    Value: !Ref EnterpriseCustomerMasterKey
+    Export:
+      Name: !Sub '${AWS::StackName}-CMK-ID'
+
+  CustomerMasterKeyArn:
+    Description: The ARN of the enterprise customer master key
+    Value: !GetAtt EnterpriseCustomerMasterKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CMK-ARN'
+
+  KeyAlias:
+    Description: The alias for the enterprise customer master key
+    Value: !Ref EnterpriseKeyAlias
+    Export:
+      Name: !Sub '${AWS::StackName}-Key-Alias'
+
+  KeyRotationEnabled:
+    Description: Whether automatic key rotation is enabled
+    Value: !If [EnableKeyRotation, 'Enabled', 'Disabled']
+    Export:
+      Name: !Sub '${AWS::StackName}-Key-Rotation-Status'
+
+  # S3 Outputs
+  EncryptedBucketName:
+    Description: The name of the encrypted S3 bucket
+    Value: !Ref EnterpriseEncryptedBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-Bucket-Name'
+
+  EncryptedBucketArn:
+    Description: The ARN of the encrypted S3 bucket
+    Value: !GetAtt EnterpriseEncryptedBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-Bucket-ARN'
+
+  BucketDomainName:
+    Description: The domain name of the S3 bucket
+    Value: !GetAtt EnterpriseEncryptedBucket.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-Bucket-Domain'
+
+  BucketKeyEnabled:
+    Description: Whether S3 Bucket Key optimization is enabled
+    Value: !If [EnableBucketKey, 'Enabled', 'Disabled']
+    Export:
+      Name: !Sub '${AWS::StackName}-Bucket-Key-Status'
+
+  # Lambda Outputs
+  LambdaFunctionName:
+    Description: The name of the key rotation monitoring Lambda function
+    Value: !Ref KeyRotationMonitorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-Lambda-Function-Name'
+
+  LambdaFunctionArn:
+    Description: The ARN of the key rotation monitoring Lambda function
+    Value: !GetAtt KeyRotationMonitorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-Lambda-Function-ARN'
+
+  LambdaRoleArn:
+    Description: The ARN of the Lambda execution role
+    Value: !GetAtt KeyRotationMonitorRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-Lambda-Role-ARN'
+
+  # CloudWatch Outputs
+  ScheduleRuleName:
+    Description: The name of the CloudWatch Events rule for scheduling
+    Value: !Ref KeyRotationMonitorSchedule
+    Export:
+      Name: !Sub '${AWS::StackName}-Schedule-Rule-Name'
+
+  ScheduleRuleArn:
+    Description: The ARN of the CloudWatch Events rule for scheduling
+    Value: !GetAtt KeyRotationMonitorSchedule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-Schedule-Rule-ARN'
+
+  MonitoringSchedule:
+    Description: The configured monitoring schedule expression
+    Value: !Ref MonitoringSchedule
+    Export:
+      Name: !Sub '${AWS::StackName}-Monitoring-Schedule'
+
+  LogGroupName:
+    Description: The name of the CloudWatch Log Group for Lambda function
+    Value: !Ref KeyRotationMonitorLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-Log-Group-Name'
+
+  # Security and Compliance Outputs
+  ComplianceFeatures:
+    Description: Summary of enabled compliance and security features
+    Value: !Sub |
+      Automatic Key Rotation: ${EnableAutomaticKeyRotation}
+      S3 Bucket Versioning: ${EnableS3BucketVersioning}
+      S3 Bucket Key Optimization: ${EnableS3BucketKey}
+      Auto-fix Non-compliant Keys: ${EnableAutoRotationFix}
+      Monitoring Schedule: ${MonitoringSchedule}
+    Export:
+      Name: !Sub '${AWS::StackName}-Compliance-Features'
+
+  SecurityConfiguration:
+    Description: Security configuration summary
+    Value: !Sub |
+      KMS Encryption: AES-256 with ${KeySpec}
+      S3 Encryption: Server-side with KMS
+      Public Access: Blocked
+      SSL/TLS: Required
+      Log Retention: ${LogRetentionDays} days
+    Export:
+      Name: !Sub '${AWS::StackName}-Security-Configuration'
+
+  # Quick Start Commands
+  TestEncryptionCommand:
+    Description: CLI command to test encryption functionality
+    Value: !Sub |
+      aws s3 cp testfile.txt s3://${EnterpriseEncryptedBucket}/secure-data.txt --sse aws:kms --sse-kms-key-id ${EnterpriseKeyAlias}
+    Export:
+      Name: !Sub '${AWS::StackName}-Test-Encryption-Command'
+
+  InvokeLambdaCommand:
+    Description: CLI command to manually invoke the key rotation monitoring function
+    Value: !Sub |
+      aws lambda invoke --function-name ${KeyRotationMonitorFunction} --payload '{}' response.json
+    Export:
+      Name: !Sub '${AWS::StackName}-Invoke-Lambda-Command'
+
+  # Cost Optimization Information
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost breakdown for the solution
+    Value: !Sub |
+      KMS CMK: $1.00/month
+      S3 Storage: $0.023/GB/month
+      Lambda Executions: $0.20 per 1M requests
+      CloudWatch Logs: $0.50/GB ingested
+      Total Base Cost: ~$5-15/month (excluding S3 storage volume)
+    Export:
+      Name: !Sub '${AWS::StackName}-Cost-Estimate'

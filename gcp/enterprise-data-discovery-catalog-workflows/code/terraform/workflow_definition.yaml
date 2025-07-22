@@ -1,0 +1,343 @@
+# Enterprise Data Discovery Workflow Definition
+# This workflow orchestrates automated data discovery and cataloging
+# across multiple data sources including BigQuery and Cloud Storage
+
+main:
+  params: [input]
+  steps:
+    - initialize:
+        assign:
+          - project_id: ${project_id}
+          - location: ${location}
+          - function_name: ${function_name}
+          - suffix: ${suffix}
+          - discovery_results: {}
+          - function_url: ""
+          
+    - log_start:
+        call: sys.log
+        args:
+          text: ${"Starting enterprise data discovery for project: " + project_id + " with suffix: " + suffix}
+          severity: INFO
+          
+    - get_function_url:
+        try:
+          call: googleapis.cloudfunctions.v2.projects.locations.functions.get
+          args:
+            name: ${"projects/" + project_id + "/locations/" + location + "/functions/" + function_name}
+          result: function_info
+        except:
+          as: e
+          steps:
+            - log_function_error:
+                call: sys.log
+                args:
+                  text: ${"Failed to get function URL: " + e.message}
+                  severity: ERROR
+            - return_error:
+                return:
+                  error: ${"Function not found: " + e.message}
+          
+    - extract_function_url:
+        assign:
+          - function_url: ${function_info.serviceConfig.uri}
+          
+    - log_function_url:
+        call: sys.log
+        args:
+          text: ${"Using function URL: " + function_url}
+          severity: INFO
+          
+    # Parallel discovery execution for better performance
+    - parallel_discovery:
+        parallel:
+          shared: [discovery_results]
+          branches:
+            # BigQuery discovery branch
+            - bigquery_discovery:
+                steps:
+                  - log_bigquery_start:
+                      call: sys.log
+                      args:
+                        text: "Starting BigQuery asset discovery"
+                        severity: INFO
+                        
+                  - discover_bigquery:
+                      try:
+                        call: http.post
+                        args:
+                          url: ${function_url}
+                          headers:
+                            Content-Type: "application/json"
+                          body:
+                            project_id: ${project_id}
+                            location: ${location}
+                            source_type: "bigquery"
+                            comprehensive: ${input.get("comprehensive", false)}
+                          timeout: 300
+                        result: bq_result
+                      retry:
+                        predicate: ${http.default_retry_predicate}
+                        max_retries: 3
+                        backoff:
+                          initial_delay: 2
+                          max_delay: 60
+                          multiplier: 2
+                      except:
+                        as: e
+                        steps:
+                          - log_bq_error:
+                              call: sys.log
+                              args:
+                                text: ${"BigQuery discovery failed: " + e.message}
+                                severity: ERROR
+                          - set_bq_error:
+                              assign:
+                                - bq_result: 
+                                    error: ${e.message}
+                                    source: "bigquery"
+                                    timestamp: ${time.format(sys.now())}
+                                
+                  - store_bq_results:
+                      assign:
+                        - discovery_results.bigquery: ${bq_result}
+                        
+                  - log_bigquery_complete:
+                      call: sys.log
+                      args:
+                        text: ${"BigQuery discovery completed. Assets found: " + string(len(bq_result.get("bigquery_datasets", [])))}
+                        severity: INFO
+                        
+            # Cloud Storage discovery branch
+            - storage_discovery:
+                steps:
+                  - log_storage_start:
+                      call: sys.log
+                      args:
+                        text: "Starting Cloud Storage asset discovery"
+                        severity: INFO
+                        
+                  - discover_storage:
+                      try:
+                        call: http.post
+                        args:
+                          url: ${function_url}
+                          headers:
+                            Content-Type: "application/json"
+                          body:
+                            project_id: ${project_id}
+                            location: ${location}
+                            source_type: "storage"
+                            comprehensive: ${input.get("comprehensive", false)}
+                          timeout: 300
+                        result: storage_result
+                      retry:
+                        predicate: ${http.default_retry_predicate}
+                        max_retries: 3
+                        backoff:
+                          initial_delay: 2
+                          max_delay: 60
+                          multiplier: 2
+                      except:
+                        as: e
+                        steps:
+                          - log_storage_error:
+                              call: sys.log
+                              args:
+                                text: ${"Storage discovery failed: " + e.message}
+                                severity: ERROR
+                          - set_storage_error:
+                              assign:
+                                - storage_result: 
+                                    error: ${e.message}
+                                    source: "storage"
+                                    timestamp: ${time.format(sys.now())}
+                                
+                  - store_storage_results:
+                      assign:
+                        - discovery_results.storage: ${storage_result}
+                        
+                  - log_storage_complete:
+                      call: sys.log
+                      args:
+                        text: ${"Storage discovery completed. Buckets found: " + string(len(storage_result.get("storage_buckets", [])))}
+                        severity: INFO
+                        
+    # Generate comprehensive summary
+    - generate_summary:
+        assign:
+          - total_assets: 0
+          - total_entries_created: 0
+          - total_tags_applied: 0
+          - successful_sources: 0
+          - failed_sources: 0
+          - error_messages: []
+          
+    # Process BigQuery results
+    - process_bigquery_summary:
+        switch:
+          - condition: ${"error" in discovery_results.bigquery}
+            steps:
+              - increment_failed_bq:
+                  assign:
+                    - failed_sources: ${failed_sources + 1}
+                    - error_messages: ${list.concat(error_messages, [discovery_results.bigquery.error])}
+          - condition: true
+            steps:
+              - process_bq_success:
+                  assign:
+                    - bq_datasets: ${discovery_results.bigquery.get("bigquery_datasets", [])}
+                    - total_assets: ${total_assets + len(bq_datasets)}
+                    - total_entries_created: ${total_entries_created + discovery_results.bigquery.get("catalog_entries_created", 0)}
+                    - total_tags_applied: ${total_tags_applied + discovery_results.bigquery.get("tags_applied", 0)}
+                    - successful_sources: ${successful_sources + 1}
+              
+    # Process Storage results
+    - process_storage_summary:
+        switch:
+          - condition: ${"error" in discovery_results.storage}
+            steps:
+              - increment_failed_storage:
+                  assign:
+                    - failed_sources: ${failed_sources + 1}
+                    - error_messages: ${list.concat(error_messages, [discovery_results.storage.error])}
+          - condition: true
+            steps:
+              - process_storage_success:
+                  assign:
+                    - storage_buckets: ${discovery_results.storage.get("storage_buckets", [])}
+                    - total_assets: ${total_assets + len(storage_buckets)}
+                    - total_entries_created: ${total_entries_created + discovery_results.storage.get("catalog_entries_created", 0)}
+                    - total_tags_applied: ${total_tags_applied + discovery_results.storage.get("tags_applied", 0)}
+                    - successful_sources: ${successful_sources + 1}
+    
+    # Validate discovery quality
+    - validate_discovery_quality:
+        assign:
+          - quality_score: 0.0
+          - quality_issues: []
+          
+    - calculate_quality_score:
+        switch:
+          - condition: ${total_assets > 0}
+            assign:
+              - quality_score: ${(total_entries_created + total_tags_applied) / (total_assets * 2)}
+          - condition: true
+            assign:
+              - quality_score: ${successful_sources / 2}  # Base score if no assets found
+              
+    - check_quality_thresholds:
+        switch:
+          - condition: ${quality_score < 0.5}
+            assign:
+              - quality_issues: ${list.concat(quality_issues, ["Low catalog entry creation rate"])}
+          - condition: ${failed_sources > successful_sources}
+            assign:
+              - quality_issues: ${list.concat(quality_issues, ["More sources failed than succeeded"])}
+          - condition: ${total_assets == 0 and len(error_messages) == 0}
+            assign:
+              - quality_issues: ${list.concat(quality_issues, ["No assets discovered and no errors reported"])}
+    
+    # Log quality assessment
+    - log_quality_assessment:
+        call: sys.log
+        args:
+          text: ${"Discovery quality score: " + string(quality_score) + ", Issues: " + string(len(quality_issues))}
+          severity: ${if(len(quality_issues) > 0, "WARNING", "INFO")}
+    
+    # Create detailed execution summary
+    - create_execution_summary:
+        assign:
+          - execution_summary:
+              execution_id: ${sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID")}
+              project_id: ${project_id}
+              location: ${location}
+              start_time: ${time.format(sys.now())}
+              scope: ${input.get("scope", "manual")}
+              comprehensive_analysis: ${input.get("comprehensive", false)}
+              
+              # Asset discovery results
+              assets_discovered:
+                total_count: ${total_assets}
+                bigquery_datasets: ${len(discovery_results.bigquery.get("bigquery_datasets", []))}
+                storage_buckets: ${len(discovery_results.storage.get("storage_buckets", []))}
+                
+              # Cataloging results
+              cataloging_results:
+                entries_created: ${total_entries_created}
+                tags_applied: ${total_tags_applied}
+                success_rate: ${quality_score}
+                
+              # Source processing status
+              source_status:
+                successful_sources: ${successful_sources}
+                failed_sources: ${failed_sources}
+                total_sources: ${successful_sources + failed_sources}
+                
+              # Error information
+              errors:
+                count: ${len(error_messages)}
+                messages: ${error_messages}
+                
+              # Quality assessment
+              quality_assessment:
+                score: ${quality_score}
+                issues: ${quality_issues}
+                threshold_met: ${quality_score >= 0.5}
+                
+    # Log final completion status
+    - log_completion:
+        call: sys.log
+        args:
+          text: ${"Enterprise data discovery completed. Assets: " + string(total_assets) + ", Entries: " + string(total_entries_created) + ", Tags: " + string(total_tags_applied) + ", Success rate: " + string(quality_score)}
+          severity: ${if(quality_score >= 0.5, "INFO", "WARNING")}
+          
+    # Return comprehensive results
+    - return_results:
+        return:
+          summary: ${execution_summary}
+          detailed_results: ${discovery_results}
+          recommendations: ${generate_recommendations(total_assets, quality_score, quality_issues)}
+
+# Helper subworkflow to generate actionable recommendations
+generate_recommendations:
+  params: [asset_count, quality_score, issues]
+  steps:
+    - create_recommendations:
+        assign:
+          - recommendations: []
+          
+    - add_performance_recommendations:
+        switch:
+          - condition: ${asset_count > 1000}
+            assign:
+              - recommendations: ${list.concat(recommendations, ["Consider implementing incremental discovery for large data estates"])}
+          - condition: ${asset_count == 0}
+            assign:
+              - recommendations: ${list.concat(recommendations, ["Verify data sources exist and permissions are properly configured"])}
+              
+    - add_quality_recommendations:
+        switch:
+          - condition: ${quality_score < 0.5}
+            assign:
+              - recommendations: ${list.concat(recommendations, ["Review tag template configurations and function permissions", "Consider manual data steward review for critical assets"])}
+          - condition: ${quality_score >= 0.8}
+            assign:
+              - recommendations: ${list.concat(recommendations, ["Discovery quality is excellent - consider enabling more frequent automated runs"])}
+              
+    - add_issue_specific_recommendations:
+        for:
+          value: issue
+          in: ${issues}
+          steps:
+            - add_issue_recommendation:
+                switch:
+                  - condition: ${text.find_substring(issue, "creation") != -1}
+                    assign:
+                      - recommendations: ${list.concat(recommendations, ["Check Data Catalog API permissions and quota limits"])}
+                  - condition: ${text.find_substring(issue, "failed") != -1}
+                    assign:
+                      - recommendations: ${list.concat(recommendations, ["Review network connectivity and service account permissions"])}
+                      
+    - return_recommendations:
+        return: ${recommendations}

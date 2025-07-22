@@ -1,0 +1,805 @@
+# Google Cloud Infrastructure Manager Configuration
+# Customer Service Automation with Contact Center AI and Vertex AI Search
+# Recipe ID: f8e7d3a9
+
+terraform:
+  required_version: ">= 1.0"
+  required_providers:
+    google:
+      source: "hashicorp/google"
+      version: "~> 5.0"
+    google-beta:
+      source: "hashicorp/google-beta"
+      version: "~> 5.0"
+    random:
+      source: "hashicorp/random"
+      version: "~> 3.1"
+
+# Input variables for customization
+variables:
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    validation:
+      condition: "length(var.project_id) > 0"
+      error_message: "Project ID must not be empty."
+
+  region:
+    description: "Google Cloud region for resources"
+    type: string
+    default: "us-central1"
+    validation:
+      condition: "contains(['us-central1', 'us-east1', 'us-west1', 'us-west2', 'europe-west1', 'europe-west2', 'asia-east1', 'asia-southeast1'], var.region)"
+      error_message: "Region must be a valid Google Cloud region."
+
+  zone:
+    description: "Google Cloud zone for resources"
+    type: string
+    default: "us-central1-a"
+
+  environment:
+    description: "Environment name (dev, staging, prod)"
+    type: string
+    default: "dev"
+    validation:
+      condition: "contains(['dev', 'staging', 'prod'], var.environment)"
+      error_message: "Environment must be dev, staging, or prod."
+
+  min_cloud_run_instances:
+    description: "Minimum number of Cloud Run instances"
+    type: number
+    default: 0
+    validation:
+      condition: "var.min_cloud_run_instances >= 0 && var.min_cloud_run_instances <= 100"
+      error_message: "Min instances must be between 0 and 100."
+
+  max_cloud_run_instances:
+    description: "Maximum number of Cloud Run instances"
+    type: number
+    default: 10
+    validation:
+      condition: "var.max_cloud_run_instances >= 1 && var.max_cloud_run_instances <= 1000"
+      error_message: "Max instances must be between 1 and 1000."
+
+  cloud_run_memory:
+    description: "Memory allocation for Cloud Run service"
+    type: string
+    default: "1Gi"
+    validation:
+      condition: "contains(['512Mi', '1Gi', '2Gi', '4Gi', '8Gi'], var.cloud_run_memory)"
+      error_message: "Memory must be one of: 512Mi, 1Gi, 2Gi, 4Gi, 8Gi."
+
+  cloud_run_cpu:
+    description: "CPU allocation for Cloud Run service"
+    type: string
+    default: "1"
+    validation:
+      condition: "contains(['0.5', '1', '2', '4'], var.cloud_run_cpu)"
+      error_message: "CPU must be one of: 0.5, 1, 2, 4."
+
+  storage_class:
+    description: "Cloud Storage bucket storage class"
+    type: string
+    default: "STANDARD"
+    validation:
+      condition: "contains(['STANDARD', 'NEARLINE', 'COLDLINE', 'ARCHIVE'], var.storage_class)"
+      error_message: "Storage class must be STANDARD, NEARLINE, COLDLINE, or ARCHIVE."
+
+  enable_versioning:
+    description: "Enable versioning on Cloud Storage bucket"
+    type: bool
+    default: true
+
+  lifecycle_age_days:
+    description: "Number of days before transitioning to NEARLINE storage class"
+    type: number
+    default: 30
+    validation:
+      condition: "var.lifecycle_age_days >= 1 && var.lifecycle_age_days <= 365"
+      error_message: "Lifecycle age must be between 1 and 365 days."
+
+  search_tier:
+    description: "Vertex AI Search tier (SEARCH_TIER_STANDARD or SEARCH_TIER_ENTERPRISE)"
+    type: string
+    default: "SEARCH_TIER_STANDARD"
+    validation:
+      condition: "contains(['SEARCH_TIER_STANDARD', 'SEARCH_TIER_ENTERPRISE'], var.search_tier)"
+      error_message: "Search tier must be SEARCH_TIER_STANDARD or SEARCH_TIER_ENTERPRISE."
+
+  enable_public_dashboard:
+    description: "Enable public access to the agent dashboard"
+    type: bool
+    default: false
+
+# Local values for resource naming and configuration
+locals:
+  # Generate unique suffix for resource names to avoid conflicts
+  random_suffix = random_id.suffix.hex
+  
+  # Standardized resource naming
+  resource_prefix = "cs-ai-${var.environment}"
+  
+  # Service names
+  bucket_name = "${local.resource_prefix}-kb-${local.random_suffix}"
+  search_engine_id = "${local.resource_prefix}-search-${local.random_suffix}"
+  cloud_run_service = "${local.resource_prefix}-api-${local.random_suffix}"
+  search_app_id = "${local.search_engine_id}-app"
+  
+  # IAM service accounts
+  cloud_run_sa_email = google_service_account.cloud_run_sa.email
+  
+  # Common labels for all resources
+  common_labels = {
+    environment = var.environment
+    project     = "customer-service-ai"
+    managed-by  = "infrastructure-manager"
+    recipe-id   = "f8e7d3a9"
+  }
+
+# Enable required Google Cloud APIs
+resources:
+  # Random ID generator for unique resource names
+  random_id:
+    suffix:
+      type: random_id
+      properties:
+        byte_length: 3
+
+  # Enable required Google Cloud APIs
+  google_project_service:
+    contactcenterai_api:
+      type: google_project_service
+      properties:
+        project: ${var.project_id}
+        service: contactcenteraiplatform.googleapis.com
+        disable_dependent_services: true
+        disable_on_destroy: false
+
+    discoveryengine_api:
+      type: google_project_service
+      properties:
+        project: ${var.project_id}
+        service: discoveryengine.googleapis.com
+        disable_dependent_services: true
+        disable_on_destroy: false
+
+    run_api:
+      type: google_project_service
+      properties:
+        project: ${var.project_id}
+        service: run.googleapis.com
+        disable_dependent_services: true
+        disable_on_destroy: false
+
+    storage_api:
+      type: google_project_service
+      properties:
+        project: ${var.project_id}
+        service: storage.googleapis.com
+        disable_dependent_services: true
+        disable_on_destroy: false
+
+    aiplatform_api:
+      type: google_project_service
+      properties:
+        project: ${var.project_id}
+        service: aiplatform.googleapis.com
+        disable_dependent_services: true
+        disable_on_destroy: false
+
+    cloudbuild_api:
+      type: google_project_service
+      properties:
+        project: ${var.project_id}
+        service: cloudbuild.googleapis.com
+        disable_dependent_services: true
+        disable_on_destroy: false
+
+  # Cloud Storage bucket for knowledge base documents
+  google_storage_bucket:
+    knowledge_base_bucket:
+      type: google_storage_bucket
+      properties:
+        name: ${local.bucket_name}
+        location: ${var.region}
+        storage_class: ${var.storage_class}
+        
+        # Enable uniform bucket-level access for better security
+        uniform_bucket_level_access: true
+        
+        # Public access prevention for security
+        public_access_prevention: "enforced"
+        
+        # Versioning configuration
+        versioning:
+          enabled: ${var.enable_versioning}
+        
+        # Lifecycle management for cost optimization
+        lifecycle_rule:
+          - condition:
+              age: ${var.lifecycle_age_days}
+            action:
+              type: "SetStorageClass"
+              storage_class: "NEARLINE"
+          - condition:
+              age: 90
+            action:
+              type: "SetStorageClass"
+              storage_class: "COLDLINE"
+        
+        # CORS configuration for web dashboard access
+        cors:
+          - origin: ["*"]
+            method: ["GET", "HEAD"]
+            response_header: ["*"]
+            max_age_seconds: 3600
+        
+        # Labels for resource management
+        labels: ${local.common_labels}
+      
+      depends_on:
+        - google_project_service.storage_api
+
+  # IAM binding for bucket access (conditional public access)
+  google_storage_bucket_iam_member:
+    public_viewer:
+      type: google_storage_bucket_iam_member
+      count: ${var.enable_public_dashboard ? 1 : 0}
+      properties:
+        bucket: ${google_storage_bucket.knowledge_base_bucket.name}
+        role: "roles/storage.objectViewer"
+        member: "allUsers"
+
+  # Service account for Cloud Run application
+  google_service_account:
+    cloud_run_sa:
+      type: google_service_account
+      properties:
+        account_id: "${local.resource_prefix}-run-sa"
+        display_name: "Customer Service AI Cloud Run Service Account"
+        description: "Service account for Cloud Run customer service automation API"
+
+  # IAM roles for Cloud Run service account
+  google_project_iam_member:
+    cloud_run_discoveryengine_admin:
+      type: google_project_iam_member
+      properties:
+        project: ${var.project_id}
+        role: "roles/discoveryengine.admin"
+        member: "serviceAccount:${local.cloud_run_sa_email}"
+
+    cloud_run_contactcenter_admin:
+      type: google_project_iam_member
+      properties:
+        project: ${var.project_id}
+        role: "roles/contactcenteraiplatform.admin"
+        member: "serviceAccount:${local.cloud_run_sa_email}"
+
+    cloud_run_storage_admin:
+      type: google_project_iam_member
+      properties:
+        project: ${var.project_id}
+        role: "roles/storage.admin"
+        member: "serviceAccount:${local.cloud_run_sa_email}"
+
+    cloud_run_aiplatform_user:
+      type: google_project_iam_member
+      properties:
+        project: ${var.project_id}
+        role: "roles/aiplatform.user"
+        member: "serviceAccount:${local.cloud_run_sa_email}"
+
+  # Upload sample knowledge base documents
+  google_storage_bucket_object:
+    customer_faq:
+      type: google_storage_bucket_object
+      properties:
+        name: "knowledge-base/customer-faq.txt"
+        bucket: ${google_storage_bucket.knowledge_base_bucket.name}
+        content: |
+          Frequently Asked Questions
+          
+          Q: How do I reset my password?
+          A: To reset your password, click on the "Forgot Password" link on the login page and follow the instructions sent to your email.
+          
+          Q: What are your business hours?
+          A: Our customer service is available Monday through Friday, 9 AM to 6 PM EST.
+          
+          Q: How do I cancel my subscription?
+          A: You can cancel your subscription by logging into your account and navigating to the billing section.
+          
+          Q: What payment methods do you accept?
+          A: We accept all major credit cards, PayPal, and bank transfers.
+        content_type: "text/plain"
+
+    troubleshooting_guide:
+      type: google_storage_bucket_object
+      properties:
+        name: "knowledge-base/troubleshooting-guide.txt"
+        bucket: ${google_storage_bucket.knowledge_base_bucket.name}
+        content: |
+          Technical Troubleshooting Guide
+          
+          Issue: Login Problems
+          Solution: Clear browser cache and cookies, ensure JavaScript is enabled, try incognito mode.
+          
+          Issue: Payment Processing Errors
+          Solution: Verify card details, check with bank for international transaction blocks, try alternative payment method.
+          
+          Issue: Account Access Issues
+          Solution: Confirm email address, check spam folder for verification emails, contact support if account is locked.
+          
+          Issue: Performance Issues
+          Solution: Check internet connection, try different browser, clear application cache.
+        content_type: "text/plain"
+
+    policies:
+      type: google_storage_bucket_object
+      properties:
+        name: "knowledge-base/policies.txt"
+        bucket: ${google_storage_bucket.knowledge_base_bucket.name}
+        content: |
+          Company Policies and Procedures
+          
+          Refund Policy: Full refunds available within 30 days of purchase with proof of purchase.
+          
+          Privacy Policy: We protect customer data according to GDPR and CCPA regulations.
+          
+          Return Policy: Items must be returned in original condition within 14 days.
+          
+          Shipping Policy: Standard shipping takes 3-5 business days, expedited shipping available.
+        content_type: "text/plain"
+
+  # Vertex AI Search data store
+  google_discovery_engine_data_store:
+    knowledge_base:
+      type: google_discovery_engine_data_store
+      properties:
+        data_store_id: ${local.search_engine_id}
+        location: "global"
+        display_name: "Customer Service Knowledge Base"
+        industry_vertical: "GENERIC"
+        solution_types: ["SOLUTION_TYPE_SEARCH"]
+        content_config: "CONTENT_REQUIRED"
+        
+        # Document processing configuration
+        document_processing_config:
+          default_parsing_config:
+            digital_parsing_config: {}
+      
+      depends_on:
+        - google_project_service.discoveryengine_api
+        - google_storage_bucket_object.customer_faq
+        - google_storage_bucket_object.troubleshooting_guide
+        - google_storage_bucket_object.policies
+
+  # Import documents into Vertex AI Search
+  google_discovery_engine_data_store_schema:
+    knowledge_base_schema:
+      type: google_discovery_engine_data_store_schema
+      properties:
+        data_store_id: ${google_discovery_engine_data_store.knowledge_base.data_store_id}
+        location: ${google_discovery_engine_data_store.knowledge_base.location}
+        schema_id: "default"
+        
+        # Schema definition for document structure
+        json_schema: |
+          {
+            "type": "object",
+            "properties": {
+              "title": {"type": "string"},
+              "content": {"type": "string"},
+              "category": {"type": "string"}
+            }
+          }
+
+  # Vertex AI Search engine (application)
+  google_discovery_engine_search_engine:
+    search_app:
+      type: google_discovery_engine_search_engine
+      properties:
+        engine_id: ${local.search_app_id}
+        collection_id: "default_collection"
+        location: "global"
+        display_name: "Customer Service Search App"
+        data_store_ids: [${google_discovery_engine_data_store.knowledge_base.data_store_id}]
+        
+        # Search engine configuration
+        search_engine_config:
+          search_tier: ${var.search_tier}
+          search_add_ons: ["SEARCH_ADD_ON_LLM"]
+        
+        # Industry vertical and solution type
+        industry_vertical: "GENERIC"
+        solution_type: "SOLUTION_TYPE_SEARCH"
+      
+      depends_on:
+        - google_discovery_engine_data_store.knowledge_base
+
+  # Cloud Run service for the customer service API
+  google_cloud_run_v2_service:
+    customer_service_api:
+      type: google_cloud_run_v2_service
+      properties:
+        name: ${local.cloud_run_service}
+        location: ${var.region}
+        deletion_protection: false
+        ingress: "INGRESS_TRAFFIC_ALL"
+        
+        template:
+          # Service account for proper permissions
+          service_account: ${local.cloud_run_sa_email}
+          
+          # Execution environment configuration
+          execution_environment: "EXECUTION_ENVIRONMENT_GEN2"
+          
+          # Scaling configuration
+          scaling:
+            min_instance_count: ${var.min_cloud_run_instances}
+            max_instance_count: ${var.max_cloud_run_instances}
+          
+          containers:
+            - name: "customer-service-api"
+              
+              # Container image (using Google Cloud Sample)
+              image: "gcr.io/cloudrun/hello"
+              
+              # Resource allocation
+              resources:
+                limits:
+                  cpu: ${var.cloud_run_cpu}
+                  memory: ${var.cloud_run_memory}
+                startup_cpu_boost: true
+              
+              # Environment variables for application configuration
+              env:
+                - name: "PROJECT_ID"
+                  value: ${var.project_id}
+                - name: "SEARCH_ENGINE_ID"
+                  value: ${local.search_engine_id}
+                - name: "SEARCH_APP_ID"
+                  value: ${local.search_app_id}
+                - name: "BUCKET_NAME"
+                  value: ${local.bucket_name}
+                - name: "REGION"
+                  value: ${var.region}
+                - name: "ENVIRONMENT"
+                  value: ${var.environment}
+              
+              # Health check configuration
+              startup_probe:
+                http_get:
+                  path: "/health"
+                  port: 8080
+                initial_delay_seconds: 10
+                timeout_seconds: 5
+                period_seconds: 10
+                failure_threshold: 3
+              
+              liveness_probe:
+                http_get:
+                  path: "/health"
+                  port: 8080
+                timeout_seconds: 5
+                period_seconds: 30
+                failure_threshold: 3
+              
+              # Container port configuration
+              ports:
+                - container_port: 8080
+                  name: "http1"
+        
+        # Traffic configuration
+        traffic:
+          - percent: 100
+            type: "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST"
+        
+        # Labels for resource management
+        labels: ${local.common_labels}
+      
+      depends_on:
+        - google_project_service.run_api
+        - google_service_account.cloud_run_sa
+        - google_discovery_engine_search_engine.search_app
+        - google_project_iam_member.cloud_run_discoveryengine_admin
+
+  # IAM policy for Cloud Run service (allow unauthenticated access)
+  google_cloud_run_service_iam_member:
+    public_access:
+      type: google_cloud_run_service_iam_member
+      properties:
+        service: ${google_cloud_run_v2_service.customer_service_api.name}
+        location: ${google_cloud_run_v2_service.customer_service_api.location}
+        role: "roles/run.invoker"
+        member: "allUsers"
+
+  # Upload agent dashboard to Cloud Storage
+  google_storage_bucket_object:
+    agent_dashboard:
+      type: google_storage_bucket_object
+      properties:
+        name: "dashboard/index.html"
+        bucket: ${google_storage_bucket.knowledge_base_bucket.name}
+        content_type: "text/html"
+        content: |
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>Customer Service AI Dashboard</title>
+              <style>
+                  body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+                  .container { max-width: 1200px; margin: 0 auto; }
+                  .header { background: #4285f4; color: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+                  .card { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+                  .input-group { margin-bottom: 15px; }
+                  .input-group label { display: block; margin-bottom: 5px; font-weight: bold; }
+                  .input-group input, .input-group textarea { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; }
+                  .btn { background: #4285f4; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; }
+                  .btn:hover { background: #3367d6; }
+                  .results { margin-top: 20px; }
+                  .result-item { background: #f8f9fa; padding: 15px; border-left: 4px solid #4285f4; margin-bottom: 10px; }
+                  .status { padding: 10px; margin: 10px 0; border-radius: 4px; }
+                  .status.info { background: #e3f2fd; border: 1px solid #2196f3; }
+                  .status.success { background: #e8f5e8; border: 1px solid #4caf50; }
+                  .status.warning { background: #fff3e0; border: 1px solid #ff9800; }
+              </style>
+          </head>
+          <body>
+              <div class="container">
+                  <div class="header">
+                      <h1>Customer Service AI Assistant</h1>
+                      <p>Intelligent search and conversation analysis for customer support</p>
+                      <p><strong>Environment:</strong> ${var.environment} | <strong>Region:</strong> ${var.region}</p>
+                  </div>
+                  
+                  <div class="status info">
+                      <strong>🔧 Setup Required:</strong> This dashboard requires the Cloud Run API service to be deployed with the customer service application code. 
+                      The current deployment uses a placeholder container. Please deploy the actual application code to enable full functionality.
+                  </div>
+                  
+                  <div class="card">
+                      <h3>🔍 Knowledge Base Search</h3>
+                      <div class="input-group">
+                          <label for="searchQuery">Customer Inquiry:</label>
+                          <input type="text" id="searchQuery" placeholder="Enter customer question or issue...">
+                      </div>
+                      <button class="btn" onclick="searchKnowledgeBase()">Search Knowledge Base</button>
+                      <div id="searchResults" class="results"></div>
+                  </div>
+                  
+                  <div class="card">
+                      <h3>🤖 Conversation Analysis</h3>
+                      <div class="input-group">
+                          <label for="conversationText">Conversation Text:</label>
+                          <textarea id="conversationText" rows="5" placeholder="Paste conversation text here..."></textarea>
+                      </div>
+                      <button class="btn" onclick="analyzeConversation()">Analyze Conversation</button>
+                      <div id="analysisResults" class="results"></div>
+                  </div>
+                  
+                  <div class="card">
+                      <h3>📊 System Information</h3>
+                      <div class="result-item">
+                          <strong>Project ID:</strong> ${var.project_id}<br>
+                          <strong>Search Engine ID:</strong> ${local.search_engine_id}<br>
+                          <strong>Cloud Run Service:</strong> ${local.cloud_run_service}<br>
+                          <strong>Storage Bucket:</strong> ${local.bucket_name}<br>
+                          <strong>Deployment Region:</strong> ${var.region}
+                      </div>
+                  </div>
+              </div>
+
+              <script>
+                  // API Base URL will be populated after Cloud Run deployment
+                  const API_BASE_URL = '${google_cloud_run_v2_service.customer_service_api.uri}';
+                  
+                  async function searchKnowledgeBase() {
+                      const query = document.getElementById('searchQuery').value;
+                      if (!query) {
+                          alert('Please enter a search query');
+                          return;
+                      }
+                      
+                      const resultsDiv = document.getElementById('searchResults');
+                      resultsDiv.innerHTML = '<div class="status info">Searching knowledge base...</div>';
+                      
+                      try {
+                          const response = await fetch(`API_BASE_URL/search`, {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({ query })
+                          });
+                          
+                          if (!response.ok) {
+                              throw new Error(`HTTP error! status: API_response.status`);
+                          }
+                          
+                          const data = await response.json();
+                          displaySearchResults(data);
+                      } catch (error) {
+                          console.error('Search failed:', error);
+                          resultsDiv.innerHTML = `<div class="status warning">Search failed: API_error.message. Please ensure the Cloud Run service is properly deployed with the customer service application.</div>`;
+                      }
+                  }
+                  
+                  function displaySearchResults(data) {
+                      const container = document.getElementById('searchResults');
+                      let html = '<div class="status success">Search completed successfully!</div>';
+                      
+                      if (data.summary) {
+                          html += `<div class="result-item"><strong>🤖 AI Summary:</strong> API_data.summary</div>`;
+                      }
+                      
+                      if (data.results && data.results.length > 0) {
+                          data.results.forEach(result => {
+                              html += `
+                                  <div class="result-item">
+                                      <strong>📄 API_result.title</strong><br>
+                                      API_result.snippet<br>
+                                      <small>📊 Relevance: API_(result.relevance_score * 100).toFixed(1)%</small>
+                                  </div>
+                              `;
+                          });
+                      } else {
+                          html += '<div class="result-item">No results found for this query.</div>';
+                      }
+                      
+                      container.innerHTML = html;
+                  }
+                  
+                  async function analyzeConversation() {
+                      const conversation = document.getElementById('conversationText').value;
+                      if (!conversation) {
+                          alert('Please enter conversation text');
+                          return;
+                      }
+                      
+                      const resultsDiv = document.getElementById('analysisResults');
+                      resultsDiv.innerHTML = '<div class="status info">Analyzing conversation...</div>';
+                      
+                      try {
+                          const response = await fetch(`API_BASE_URL/analyze-conversation`, {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({ conversation })
+                          });
+                          
+                          if (!response.ok) {
+                              throw new Error(`HTTP error! status: API_response.status`);
+                          }
+                          
+                          const data = await response.json();
+                          displayAnalysisResults(data);
+                      } catch (error) {
+                          console.error('Analysis failed:', error);
+                          resultsDiv.innerHTML = `<div class="status warning">Analysis failed: API_error.message. Please ensure the Cloud Run service is properly deployed with the customer service application.</div>`;
+                      }
+                  }
+                  
+                  function displayAnalysisResults(data) {
+                      const container = document.getElementById('analysisResults');
+                      let html = '<div class="status success">Analysis completed successfully!</div>';
+                      
+                      html += `
+                          <div class="result-item">
+                              <strong>🎯 Detected Intent:</strong> API_data.detected_intent<br>
+                              <strong>📊 Confidence:</strong> API_(data.confidence * 100).toFixed(1)%
+                          </div>
+                      `;
+                      
+                      if (data.relevant_documents && data.relevant_documents.length > 0) {
+                          data.relevant_documents.forEach(doc => {
+                              html += `
+                                  <div class="result-item">
+                                      <strong>📚 API_doc.title</strong><br>
+                                      API_doc.snippet
+                                  </div>
+                              `;
+                          });
+                      }
+                      
+                      container.innerHTML = html;
+                  }
+                  
+                  // Health check on page load
+                  window.onload = function() {
+                      fetch(`API_BASE_URL/health`)
+                          .then(response => response.json())
+                          .then(data => {
+                              console.log('API Health Check:', data);
+                          })
+                          .catch(error => {
+                              console.warn('API not available:', error);
+                          });
+                  };
+              </script>
+          </body>
+          </html>
+
+# Output values for reference and integration
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${var.project_id}
+
+  region:
+    description: "Deployment region"
+    value: ${var.region}
+
+  knowledge_base_bucket_name:
+    description: "Cloud Storage bucket name for knowledge base documents"
+    value: ${google_storage_bucket.knowledge_base_bucket.name}
+
+  knowledge_base_bucket_url:
+    description: "Cloud Storage bucket URL"
+    value: ${google_storage_bucket.knowledge_base_bucket.url}
+
+  search_engine_id:
+    description: "Vertex AI Search engine (data store) ID"
+    value: ${google_discovery_engine_data_store.knowledge_base.data_store_id}
+
+  search_app_id:
+    description: "Vertex AI Search application ID"
+    value: ${google_discovery_engine_search_engine.search_app.engine_id}
+
+  cloud_run_service_name:
+    description: "Cloud Run service name"
+    value: ${google_cloud_run_v2_service.customer_service_api.name}
+
+  cloud_run_service_url:
+    description: "Cloud Run service URL"
+    value: ${google_cloud_run_v2_service.customer_service_api.uri}
+
+  cloud_run_service_account_email:
+    description: "Cloud Run service account email"
+    value: ${google_service_account.cloud_run_sa.email}
+
+  agent_dashboard_url:
+    description: "Agent dashboard URL (if public access enabled)"
+    value: ${var.enable_public_dashboard ? "https://storage.googleapis.com/${google_storage_bucket.knowledge_base_bucket.name}/dashboard/index.html" : "Dashboard not publicly accessible"}
+
+  search_data_store_name:
+    description: "Full Vertex AI Search data store resource name"
+    value: ${google_discovery_engine_data_store.knowledge_base.name}
+
+  search_engine_name:
+    description: "Full Vertex AI Search engine resource name"
+    value: ${google_discovery_engine_search_engine.search_app.name}
+
+  deployment_instructions:
+    description: "Next steps for completing the deployment"
+    value: |
+      1. Deploy the Cloud Run service with actual application code
+      2. Configure Contact Center AI integration
+      3. Import additional knowledge base documents
+      4. Test the search and conversation analysis features
+      5. Monitor performance and optimize as needed
+
+  estimated_monthly_cost:
+    description: "Estimated monthly cost breakdown (USD)"
+    value: |
+      - Cloud Storage (1GB): ~$0.02
+      - Vertex AI Search (Standard): ~$10-50 (based on queries)
+      - Cloud Run (100 requests/day): ~$1-5
+      - Contact Center AI: Variable based on usage
+      - Total estimated: $15-100+ per month
+
+  security_considerations:
+    description: "Important security notes"
+    value: |
+      - IAM roles are configured with least privilege principles
+      - Cloud Storage bucket has uniform bucket-level access enabled
+      - Public access prevention is enforced on the storage bucket
+      - Cloud Run service uses dedicated service account
+      - Consider enabling VPC-SC for additional security in production
+
+  optimization_recommendations:
+    description: "Performance and cost optimization suggestions"
+    value: |
+      - Monitor Vertex AI Search query patterns and optimize for frequently asked questions
+      - Use Cloud Storage lifecycle policies to manage document retention costs
+      - Implement Cloud Run concurrency settings based on actual traffic patterns
+      - Consider using Cloud CDN for global dashboard distribution
+      - Set up Cloud Monitoring alerts for cost and performance thresholds

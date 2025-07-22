@@ -1,0 +1,1057 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  GitOps Workflow Infrastructure with Amazon EKS, ArgoCD, and AWS CodeCommit.
+  This template creates a complete GitOps platform including EKS cluster,
+  CodeCommit repository, IAM roles, and supporting infrastructure for
+  implementing continuous deployment workflows.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Cluster Configuration"
+        Parameters:
+          - ClusterName
+          - KubernetesVersion
+          - NodeGroupInstanceType
+          - NodeGroupDesiredSize
+          - NodeGroupMinSize
+          - NodeGroupMaxSize
+      - Label:
+          default: "GitOps Configuration"
+        Parameters:
+          - CodeCommitRepositoryName
+          - CodeCommitRepositoryDescription
+          - ArgoCDNamespace
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcCidr
+          - PublicSubnet1Cidr
+          - PublicSubnet2Cidr
+          - PrivateSubnet1Cidr
+          - PrivateSubnet2Cidr
+      - Label:
+          default: "Tagging"
+        Parameters:
+          - Environment
+          - ProjectName
+    ParameterLabels:
+      ClusterName:
+        default: "EKS Cluster Name"
+      KubernetesVersion:
+        default: "Kubernetes Version"
+      NodeGroupInstanceType:
+        default: "Worker Node Instance Type"
+      CodeCommitRepositoryName:
+        default: "CodeCommit Repository Name"
+
+Parameters:
+  ClusterName:
+    Type: String
+    Description: Name for the EKS cluster
+    Default: gitops-cluster
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9-]*$
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters and hyphens
+    MinLength: 1
+    MaxLength: 100
+
+  KubernetesVersion:
+    Type: String
+    Description: Kubernetes version for the EKS cluster
+    Default: '1.28'
+    AllowedValues:
+      - '1.28'
+      - '1.27'
+      - '1.26'
+
+  NodeGroupInstanceType:
+    Type: String
+    Description: EC2 instance type for the EKS worker nodes
+    Default: t3.medium
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - m5.large
+      - m5.xlarge
+      - m5.2xlarge
+    ConstraintDescription: Must be a valid EC2 instance type
+
+  NodeGroupDesiredSize:
+    Type: Number
+    Description: Desired number of worker nodes
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+
+  NodeGroupMinSize:
+    Type: Number
+    Description: Minimum number of worker nodes
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+
+  NodeGroupMaxSize:
+    Type: Number
+    Description: Maximum number of worker nodes
+    Default: 4
+    MinValue: 1
+    MaxValue: 20
+
+  CodeCommitRepositoryName:
+    Type: String
+    Description: Name for the CodeCommit repository
+    Default: gitops-config-repo
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9._-]*$
+    ConstraintDescription: Repository name must begin with a letter and contain only alphanumeric characters, periods, underscores, and hyphens
+    MinLength: 1
+    MaxLength: 100
+
+  CodeCommitRepositoryDescription:
+    Type: String
+    Description: Description for the CodeCommit repository
+    Default: GitOps configuration repository for EKS deployments
+    MaxLength: 1000
+
+  ArgoCDNamespace:
+    Type: String
+    Description: Kubernetes namespace for ArgoCD installation
+    Default: argocd
+    AllowedPattern: ^[a-z][a-z0-9-]*$
+    ConstraintDescription: Must be a valid Kubernetes namespace name
+    MinLength: 1
+    MaxLength: 63
+
+  VpcCidr:
+    Type: String
+    Description: CIDR block for the VPC
+    Default: 10.0.0.0/16
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$
+    ConstraintDescription: Must be a valid CIDR range
+
+  PublicSubnet1Cidr:
+    Type: String
+    Description: CIDR block for public subnet 1
+    Default: 10.0.1.0/24
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$
+
+  PublicSubnet2Cidr:
+    Type: String
+    Description: CIDR block for public subnet 2
+    Default: 10.0.2.0/24
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Description: CIDR block for private subnet 1
+    Default: 10.0.10.0/24
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Description: CIDR block for private subnet 2
+    Default: 10.0.11.0/24
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$
+
+  Environment:
+    Type: String
+    Description: Environment name for resource tagging
+    Default: development
+    AllowedValues:
+      - development
+      - staging
+      - production
+      - test
+
+  ProjectName:
+    Type: String
+    Description: Project name for resource tagging
+    Default: gitops-platform
+    MinLength: 1
+    MaxLength: 100
+
+Conditions:
+  IsProductionEnvironment: !Equals [!Ref Environment, production]
+
+Resources:
+  # ================================================================
+  # VPC and Networking Infrastructure
+  # ================================================================
+  
+  GitOpsVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+
+  # Internet Gateway for public subnet connectivity
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-igw'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref GitOpsVPC
+
+  # Public Subnets for Load Balancers and NAT Gateways
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref GitOpsVPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet1Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-public-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+        - Key: kubernetes.io/cluster/!Ref ClusterName
+          Value: shared
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref GitOpsVPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet2Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-public-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+        - Key: kubernetes.io/cluster/!Ref ClusterName
+          Value: shared
+
+  # Private Subnets for EKS Worker Nodes
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref GitOpsVPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-private-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+        - Key: kubernetes.io/cluster/!Ref ClusterName
+          Value: owned
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref GitOpsVPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-private-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+        - Key: kubernetes.io/cluster/!Ref ClusterName
+          Value: owned
+
+  # NAT Gateways for private subnet internet access
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-nat-eip-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  NatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-nat-eip-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-nat-gateway-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-nat-gateway-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Route Tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref GitOpsVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-public-routes'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref GitOpsVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-private-routes-1'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref GitOpsVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-private-routes-2'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DefaultPrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet2
+
+  # ================================================================
+  # IAM Roles and Policies for EKS
+  # ================================================================
+
+  # EKS Cluster Service Role
+  EKSClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-eks-cluster-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # EKS Node Group Role
+  EKSNodeGroupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-eks-nodegroup-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # AWS Load Balancer Controller IAM Role
+  AWSLoadBalancerControllerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-aws-load-balancer-controller-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/${EKSCluster.OpenIdConnectIssuerUrl}'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                !Sub '${EKSCluster.OpenIdConnectIssuerUrl}:sub': !Sub 'system:serviceaccount:kube-system:aws-load-balancer-controller'
+                !Sub '${EKSCluster.OpenIdConnectIssuerUrl}:aud': 'sts.amazonaws.com'
+      Policies:
+        - PolicyName: AWSLoadBalancerControllerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:CreateServiceLinkedRole
+                  - ec2:DescribeAccountAttributes
+                  - ec2:DescribeAddresses
+                  - ec2:DescribeAvailabilityZones
+                  - ec2:DescribeInternetGateways
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeInstances
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeTags
+                  - ec2:GetCoipPoolUsage
+                  - ec2:DescribeCoipPools
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - elasticloadbalancing:DescribeLoadBalancerAttributes
+                  - elasticloadbalancing:DescribeListeners
+                  - elasticloadbalancing:DescribeListenerCertificates
+                  - elasticloadbalancing:DescribeSSLPolicies
+                  - elasticloadbalancing:DescribeRules
+                  - elasticloadbalancing:DescribeTargetGroups
+                  - elasticloadbalancing:DescribeTargetGroupAttributes
+                  - elasticloadbalancing:DescribeTargetHealth
+                  - elasticloadbalancing:DescribeTags
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cognito-idp:DescribeUserPoolClient
+                  - acm:ListCertificates
+                  - acm:DescribeCertificate
+                  - iam:ListServerCertificates
+                  - iam:GetServerCertificate
+                  - waf-regional:GetWebACL
+                  - waf-regional:GetWebACLForResource
+                  - waf-regional:AssociateWebACL
+                  - waf-regional:DisassociateWebACL
+                  - wafv2:GetWebACL
+                  - wafv2:GetWebACLForResource
+                  - wafv2:AssociateWebACL
+                  - wafv2:DisassociateWebACL
+                  - shield:DescribeProtection
+                  - shield:GetSubscriptionState
+                  - shield:DescribeSubscription
+                  - shield:DescribeEmergencyContactSettings
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ec2:CreateSecurityGroup
+                  - ec2:CreateTags
+                Resource: !Sub 'arn:aws:ec2:*:${AWS::AccountId}:security-group/*'
+                Condition:
+                  StringEquals:
+                    'ec2:CreateAction': CreateSecurityGroup
+                  Null:
+                    'aws:RequestTag/elbv2.k8s.aws/cluster': 'false'
+              - Effect: Allow
+                Action:
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                Resource: !Sub 'arn:aws:ec2:*:${AWS::AccountId}:security-group/*'
+                Condition:
+                  Null:
+                    'aws:RequestTag/elbv2.k8s.aws/cluster': 'true'
+                    'aws:ResourceTag/elbv2.k8s.aws/cluster': 'false'
+              - Effect: Allow
+                Action:
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:DeleteSecurityGroup
+                Resource: '*'
+                Condition:
+                  Null:
+                    'aws:ResourceTag/elbv2.k8s.aws/cluster': 'false'
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:CreateLoadBalancer
+                  - elasticloadbalancing:CreateTargetGroup
+                Resource: '*'
+                Condition:
+                  Null:
+                    'aws:RequestTag/elbv2.k8s.aws/cluster': 'false'
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:CreateListener
+                  - elasticloadbalancing:DeleteListener
+                  - elasticloadbalancing:CreateRule
+                  - elasticloadbalancing:DeleteRule
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:AddTags
+                  - elasticloadbalancing:RemoveTags
+                Resource:
+                  - !Sub 'arn:aws:elasticloadbalancing:*:${AWS::AccountId}:targetgroup/*/*'
+                  - !Sub 'arn:aws:elasticloadbalancing:*:${AWS::AccountId}:loadbalancer/net/*/*'
+                  - !Sub 'arn:aws:elasticloadbalancing:*:${AWS::AccountId}:loadbalancer/app/*/*'
+                Condition:
+                  Null:
+                    'aws:RequestTag/elbv2.k8s.aws/cluster': 'true'
+                    'aws:ResourceTag/elbv2.k8s.aws/cluster': 'false'
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:AddTags
+                  - elasticloadbalancing:RemoveTags
+                Resource:
+                  - !Sub 'arn:aws:elasticloadbalancing:*:${AWS::AccountId}:listener/net/*/*/*'
+                  - !Sub 'arn:aws:elasticloadbalancing:*:${AWS::AccountId}:listener/app/*/*/*'
+                  - !Sub 'arn:aws:elasticloadbalancing:*:${AWS::AccountId}:listener-rule/net/*/*/*'
+                  - !Sub 'arn:aws:elasticloadbalancing:*:${AWS::AccountId}:listener-rule/app/*/*/*'
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:ModifyLoadBalancerAttributes
+                  - elasticloadbalancing:SetIpAddressType
+                  - elasticloadbalancing:SetSecurityGroups
+                  - elasticloadbalancing:SetSubnets
+                  - elasticloadbalancing:DeleteLoadBalancer
+                  - elasticloadbalancing:ModifyTargetGroup
+                  - elasticloadbalancing:ModifyTargetGroupAttributes
+                  - elasticloadbalancing:DeleteTargetGroup
+                Resource: '*'
+                Condition:
+                  Null:
+                    'aws:ResourceTag/elbv2.k8s.aws/cluster': 'false'
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:RegisterTargets
+                  - elasticloadbalancing:DeregisterTargets
+                Resource: !Sub 'arn:aws:elasticloadbalancing:*:${AWS::AccountId}:targetgroup/*/*'
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:SetWebAcl
+                  - elasticloadbalancing:ModifyListener
+                  - elasticloadbalancing:AddListenerCertificates
+                  - elasticloadbalancing:RemoveListenerCertificates
+                  - elasticloadbalancing:ModifyRule
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================================================
+  # Security Groups
+  # ================================================================
+
+  # EKS Cluster Security Group (additional)
+  EKSClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-${Environment}-eks-cluster-sg'
+      GroupDescription: Security group for EKS cluster control plane
+      VpcId: !Ref GitOpsVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref EKSNodeSecurityGroup
+          Description: Allow HTTPS traffic from worker nodes
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-eks-cluster-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # EKS Node Security Group
+  EKSNodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-${Environment}-eks-node-sg'
+      GroupDescription: Security group for EKS worker nodes
+      VpcId: !Ref GitOpsVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 1025
+          ToPort: 65535
+          SourceSecurityGroupId: !Ref EKSClusterSecurityGroup
+          Description: Allow traffic from EKS cluster
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref EKSClusterSecurityGroup
+          Description: Allow HTTPS from EKS cluster
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-eks-node-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Allow worker nodes to communicate with each other
+  EKSNodeSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allow nodes to communicate with each other
+      GroupId: !Ref EKSNodeSecurityGroup
+      SourceSecurityGroupId: !Ref EKSNodeSecurityGroup
+      IpProtocol: -1
+
+  # ================================================================
+  # Amazon EKS Cluster
+  # ================================================================
+
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt EKSClusterRole.Arn
+      ResourcesVpcConfig:
+        SecurityGroupIds:
+          - !Ref EKSClusterSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+          - !Ref PublicSubnet1
+          - !Ref PublicSubnet2
+        EndpointConfigPrivate: true
+        EndpointConfigPublic: true
+        PublicAccessCidrs:
+          - 0.0.0.0/0
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+            - Type: controllerManager
+            - Type: scheduler
+      EncryptionConfig:
+        - Resources:
+            - secrets
+          Provider:
+            KeyId: alias/aws/eks
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  # EKS Node Group
+  EKSNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref ClusterName
+      NodegroupName: !Sub '${ClusterName}-workers'
+      NodeRole: !GetAtt EKSNodeGroupRole.Arn
+      InstanceTypes:
+        - !Ref NodeGroupInstanceType
+      ScalingConfig:
+        MinSize: !Ref NodeGroupMinSize
+        MaxSize: !Ref NodeGroupMaxSize
+        DesiredSize: !Ref NodeGroupDesiredSize
+      UpdateConfig:
+        MaxUnavailablePercentage: 25
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      RemoteAccess:
+        Ec2SshKey: !If [IsProductionEnvironment, !Ref 'AWS::NoValue', 'default-key']
+      AmiType: AL2_x86_64
+      CapacityType: ON_DEMAND
+      DiskSize: 20
+      ForceUpdateEnabled: false
+      LaunchTemplate:
+        Id: !Ref EKSNodeLaunchTemplate
+        Version: !GetAtt EKSNodeLaunchTemplate.LatestVersionNumber
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        Name: !Sub '${ClusterName}-worker-node'
+
+  # Launch Template for EKS Nodes
+  EKSNodeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ProjectName}-${Environment}-eks-node-template'
+      LaunchTemplateData:
+        SecurityGroupIds:
+          - !Ref EKSNodeSecurityGroup
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${ClusterName}-worker-node'
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: Project
+                Value: !Ref ProjectName
+              - Key: kubernetes.io/cluster/!Ref ClusterName
+                Value: owned
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            /etc/eks/bootstrap.sh ${ClusterName}
+            yum update -y
+            # Install additional tools for GitOps workflow
+            curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+            install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+            curl -sSL -o argocd-linux-amd64 https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+            install -m 555 argocd-linux-amd64 /usr/local/bin/argocd
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: Name
+              Value: !Sub '${ProjectName}-${Environment}-eks-node-template'
+            - Key: Environment
+              Value: !Ref Environment
+            - Key: Project
+              Value: !Ref ProjectName
+
+  # ================================================================
+  # AWS CodeCommit Repository
+  # ================================================================
+
+  GitOpsRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Ref CodeCommitRepositoryName
+      RepositoryDescription: !Ref CodeCommitRepositoryDescription
+      Code:
+        BranchName: main
+        S3:
+          Bucket: !Ref GitOpsConfigBucket
+          Key: initial-gitops-config.zip
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # S3 Bucket for storing initial GitOps configuration
+  GitOpsConfigBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-gitops-config-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================================================
+  # CloudWatch Resources for Monitoring
+  # ================================================================
+
+  # CloudWatch Log Group for EKS Cluster
+  EKSClusterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/eks/${ClusterName}/cluster'
+      RetentionInDays: !If [IsProductionEnvironment, 90, 7]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Group for ArgoCD
+  ArgoCDLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/eks/${ClusterName}/argocd'
+      RetentionInDays: !If [IsProductionEnvironment, 30, 7]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  # ================================================================
+  # Cluster Information
+  # ================================================================
+  
+  ClusterName:
+    Description: Name of the EKS cluster
+    Value: !Ref EKSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterName'
+
+  ClusterEndpoint:
+    Description: EKS cluster endpoint
+    Value: !GetAtt EKSCluster.Endpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterEndpoint'
+
+  ClusterSecurityGroupId:
+    Description: Security group ID for the EKS cluster
+    Value: !GetAtt EKSCluster.ClusterSecurityGroupId
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterSecurityGroupId'
+
+  ClusterArn:
+    Description: ARN of the EKS cluster
+    Value: !GetAtt EKSCluster.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterArn'
+
+  OIDCIssuerURL:
+    Description: OpenID Connect issuer URL for the EKS cluster
+    Value: !GetAtt EKSCluster.OpenIdConnectIssuerUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-OIDCIssuerURL'
+
+  # ================================================================
+  # Network Information
+  # ================================================================
+
+  VpcId:
+    Description: ID of the VPC
+    Value: !Ref GitOpsVPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+
+  PrivateSubnet1Id:
+    Description: ID of private subnet 1
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet1Id'
+
+  PrivateSubnet2Id:
+    Description: ID of private subnet 2
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet2Id'
+
+  PublicSubnet1Id:
+    Description: ID of public subnet 1
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet1Id'
+
+  PublicSubnet2Id:
+    Description: ID of public subnet 2
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet2Id'
+
+  # ================================================================
+  # GitOps Information
+  # ================================================================
+
+  CodeCommitRepositoryName:
+    Description: Name of the CodeCommit repository
+    Value: !GetAtt GitOpsRepository.Name
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeCommitRepositoryName'
+
+  CodeCommitRepositoryArn:
+    Description: ARN of the CodeCommit repository
+    Value: !GetAtt GitOpsRepository.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeCommitRepositoryArn'
+
+  CodeCommitRepositoryCloneUrlHttp:
+    Description: HTTP clone URL for the CodeCommit repository
+    Value: !GetAtt GitOpsRepository.CloneUrlHttp
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeCommitRepositoryCloneUrlHttp'
+
+  CodeCommitRepositoryCloneUrlSsh:
+    Description: SSH clone URL for the CodeCommit repository
+    Value: !GetAtt GitOpsRepository.CloneUrlSsh
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeCommitRepositoryCloneUrlSsh'
+
+  # ================================================================
+  # IAM Role Information
+  # ================================================================
+
+  AWSLoadBalancerControllerRoleArn:
+    Description: ARN of the AWS Load Balancer Controller IAM role
+    Value: !GetAtt AWSLoadBalancerControllerRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AWSLoadBalancerControllerRoleArn'
+
+  EKSClusterRoleArn:
+    Description: ARN of the EKS cluster service role
+    Value: !GetAtt EKSClusterRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EKSClusterRoleArn'
+
+  EKSNodeGroupRoleArn:
+    Description: ARN of the EKS node group role
+    Value: !GetAtt EKSNodeGroupRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EKSNodeGroupRoleArn'
+
+  # ================================================================
+  # Configuration Commands
+  # ================================================================
+
+  KubectlConfigCommand:
+    Description: Command to configure kubectl for this cluster
+    Value: !Sub 'aws eks update-kubeconfig --region ${AWS::Region} --name ${EKSCluster} --profile default'
+
+  ArgoCDNamespace:
+    Description: Kubernetes namespace for ArgoCD installation
+    Value: !Ref ArgoCDNamespace
+    Export:
+      Name: !Sub '${AWS::StackName}-ArgoCDNamespace'
+
+  # ================================================================
+  # Monitoring Resources
+  # ================================================================
+
+  EKSClusterLogGroupName:
+    Description: CloudWatch Log Group for EKS cluster logs
+    Value: !Ref EKSClusterLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-EKSClusterLogGroupName'
+
+  ArgoCDLogGroupName:
+    Description: CloudWatch Log Group for ArgoCD logs
+    Value: !Ref ArgoCDLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ArgoCDLogGroupName'
+
+  # ================================================================
+  # Next Steps
+  # ================================================================
+
+  NextSteps:
+    Description: Next steps to complete the GitOps setup
+    Value: !Sub |
+      1. Configure kubectl: aws eks update-kubeconfig --region ${AWS::Region} --name ${EKSCluster}
+      2. Install ArgoCD: kubectl create namespace ${ArgoCDNamespace} && kubectl apply -n ${ArgoCDNamespace} -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+      3. Install AWS Load Balancer Controller using the provided IAM role ARN: ${AWSLoadBalancerControllerRole.Arn}
+      4. Clone GitOps repository: git clone ${GitOpsRepository.CloneUrlHttp}
+      5. Configure ArgoCD applications and sync with repository

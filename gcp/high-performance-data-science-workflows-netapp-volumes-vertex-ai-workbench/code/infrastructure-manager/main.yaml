@@ -1,0 +1,498 @@
+# Infrastructure Manager Configuration for High-Performance Data Science Workflows
+# Recipe: High-Performance Data Science Workflows with Cloud NetApp Volumes and Vertex AI Workbench
+# This configuration deploys a complete data science environment with high-performance storage
+
+# Project configuration and deployment variables
+imports:
+  - path: variables.yaml
+    name: variables
+
+resources:
+  # Enable required Google Cloud APIs
+  - name: compute-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/compute.googleapis.com
+      
+  - name: notebooks-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/notebooks.googleapis.com
+      
+  - name: netapp-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/netapp.googleapis.com
+      
+  - name: storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/storage.googleapis.com
+      
+  - name: aiplatform-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/aiplatform.googleapis.com
+
+  # Custom VPC Network for optimized performance and security isolation
+  - name: ml-network
+    type: compute.v1.network
+    properties:
+      name: $(ref.variables.network_name)
+      description: "High-performance network for ML workflows with NetApp storage"
+      autoCreateSubnetworks: false
+      routingConfig:
+        routingMode: REGIONAL
+    metadata:
+      dependsOn:
+        - compute-api
+
+  # Subnet with adequate IP range for scaling data science workloads
+  - name: ml-subnet
+    type: compute.v1.subnetwork
+    properties:
+      name: $(ref.variables.network_name)-subnet
+      description: "Subnet for ML instances and NetApp volumes"
+      network: $(ref.ml-network.selfLink)
+      ipCidrRange: "10.0.0.0/24"
+      region: $(ref.variables.region)
+      privateIpGoogleAccess: true
+      logConfig:
+        enable: true
+        aggregationInterval: INTERVAL_5_SEC
+        flowSampling: 0.5
+    metadata:
+      dependsOn:
+        - ml-network
+
+  # Firewall rules for secure access to data science environment
+  - name: ml-firewall-ssh
+    type: compute.v1.firewall
+    properties:
+      name: $(ref.variables.network_name)-allow-ssh
+      description: "Allow SSH access to ML instances"
+      network: $(ref.ml-network.selfLink)
+      direction: INGRESS
+      priority: 1000
+      sourceRanges:
+        - "0.0.0.0/0"
+      allowed:
+        - IPProtocol: tcp
+          ports: ["22"]
+      targetTags:
+        - "ml-workbench"
+    metadata:
+      dependsOn:
+        - ml-network
+
+  # Firewall rule for Jupyter notebook access (HTTPS)
+  - name: ml-firewall-jupyter
+    type: compute.v1.firewall
+    properties:
+      name: $(ref.variables.network_name)-allow-jupyter
+      description: "Allow HTTPS access to Jupyter notebooks"
+      network: $(ref.ml-network.selfLink)
+      direction: INGRESS
+      priority: 1000
+      sourceRanges:
+        - "0.0.0.0/0"
+      allowed:
+        - IPProtocol: tcp
+          ports: ["443", "8080", "8888"]
+      targetTags:
+        - "ml-workbench"
+    metadata:
+      dependsOn:
+        - ml-network
+
+  # Firewall rule for NFS traffic to NetApp volumes
+  - name: ml-firewall-nfs
+    type: compute.v1.firewall
+    properties:
+      name: $(ref.variables.network_name)-allow-nfs
+      description: "Allow NFS traffic to NetApp volumes"
+      network: $(ref.ml-network.selfLink)
+      direction: INGRESS
+      priority: 1000
+      sourceRanges:
+        - "10.0.0.0/24"
+      allowed:
+        - IPProtocol: tcp
+          ports: ["111", "2049", "4045"]
+        - IPProtocol: udp
+          ports: ["111", "2049", "4045"]
+      targetTags:
+        - "ml-workbench"
+    metadata:
+      dependsOn:
+        - ml-network
+
+  # Cloud NetApp Volumes Storage Pool with premium performance tier
+  - name: ml-storage-pool
+    type: gcp-types/netapp-v1:projects.locations.storagePools
+    properties:
+      parent: projects/$(ref.variables.project_id)/locations/$(ref.variables.region)
+      storagePoolId: $(ref.variables.storage_pool_name)
+      body:
+        name: projects/$(ref.variables.project_id)/locations/$(ref.variables.region)/storagePools/$(ref.variables.storage_pool_name)
+        description: "High-performance storage pool for ML datasets and models"
+        serviceLevel: PREMIUM  # Up to 64 MiB/s per TiB throughput
+        capacityGib: "1024"    # 1TB capacity, adjustable based on requirements
+        network: $(ref.ml-network.selfLink)
+        activeDirectory: ""
+        kmsConfig: ""
+        ldapEnabled: false
+        psaRange: ""
+        encryptionType: SERVICE_MANAGED
+        globalAccessAllowed: false
+        labels:
+          environment: "ml-development"
+          cost-center: "data-science"
+          managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - netapp-api
+        - ml-network
+
+  # Cloud NetApp Volume for ML datasets with NFS protocol
+  - name: ml-dataset-volume
+    type: gcp-types/netapp-v1:projects.locations.volumes
+    properties:
+      parent: projects/$(ref.variables.project_id)/locations/$(ref.variables.region)
+      volumeId: $(ref.variables.volume_name)
+      body:
+        name: projects/$(ref.variables.project_id)/locations/$(ref.variables.region)/volumes/$(ref.variables.volume_name)
+        description: "Shared high-performance volume for ML datasets and models"
+        storagePool: $(ref.ml-storage-pool.name)
+        capacityGib: "500"  # 500GB for datasets, adjustable
+        shareName: "ml-datasets"
+        protocols:
+          - NFSV3
+        exportPolicy:
+          rules:
+            - accessType: READ_WRITE
+              allowedClients: "10.0.0.0/24"
+              hasRootAccess: false
+              kerberos5ReadOnly: false
+              kerberos5ReadWrite: false
+              kerberos5iReadOnly: false
+              kerberos5iReadWrite: false
+              kerberos5pReadOnly: false
+              kerberos5pReadWrite: false
+              nfsv3: true
+              nfsv4: false
+        unixPermissions: "0755"
+        securityStyle: UNIX
+        kerberosEnabled: false
+        ldapEnabled: false
+        activeDirectory: ""
+        restoreParameters: {}
+        snapshotPolicy:
+          enabled: true
+          hourlySchedule:
+            snapshotsToKeep: 24
+          dailySchedule:
+            snapshotsToKeep: 7
+          weeklySchedule:
+            snapshotsToKeep: 4
+          monthlySchedule:
+            snapshotsToKeep: 12
+        labels:
+          environment: "ml-development"
+          data-type: "ml-datasets"
+          managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - ml-storage-pool
+
+  # Cloud Storage bucket for data lake integration and model versioning
+  - name: ml-datalake-bucket
+    type: storage.v1.bucket
+    properties:
+      name: $(ref.variables.bucket_name)
+      location: $(ref.variables.region)
+      storageClass: STANDARD
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: SetStorageClass
+              storageClass: NEARLINE
+            condition:
+              age: 30
+              matchesStorageClass:
+                - STANDARD
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 90
+              matchesStorageClass:
+                - NEARLINE
+          - action:
+              type: Delete
+            condition:
+              age: 365
+              matchesStorageClass:
+                - COLDLINE
+      labels:
+        environment: "ml-development"
+        purpose: "data-lake"
+        managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - storage-api
+
+  # IAM Service Account for Vertex AI Workbench with appropriate permissions
+  - name: ml-workbench-sa
+    type: iam.v1.serviceAccount
+    properties:
+      accountId: $(ref.variables.workbench_name)-sa
+      displayName: "ML Workbench Service Account"
+      description: "Service account for Vertex AI Workbench with ML and storage permissions"
+
+  # IAM bindings for the service account
+  - name: ml-workbench-sa-storage-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.variables.project_id)
+      role: roles/storage.objectAdmin
+      member: serviceAccount:$(ref.ml-workbench-sa.email)
+    metadata:
+      dependsOn:
+        - ml-workbench-sa
+
+  - name: ml-workbench-sa-vertex-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.variables.project_id)
+      role: roles/aiplatform.user
+      member: serviceAccount:$(ref.ml-workbench-sa.email)
+    metadata:
+      dependsOn:
+        - ml-workbench-sa
+
+  - name: ml-workbench-sa-compute-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.variables.project_id)
+      role: roles/compute.instanceAdmin.v1
+      member: serviceAccount:$(ref.ml-workbench-sa.email)
+    metadata:
+      dependsOn:
+        - ml-workbench-sa
+
+  - name: ml-workbench-sa-netapp-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.variables.project_id)
+      role: roles/netappcloudvolumes.viewer
+      member: serviceAccount:$(ref.ml-workbench-sa.email)
+    metadata:
+      dependsOn:
+        - ml-workbench-sa
+
+  # Vertex AI Workbench Instance with GPU support for ML acceleration
+  - name: ml-workbench-instance
+    type: gcp-types/notebooks-v1:projects.locations.instances
+    properties:
+      parent: projects/$(ref.variables.project_id)/locations/$(ref.variables.zone)
+      instanceId: $(ref.variables.workbench_name)
+      body:
+        name: projects/$(ref.variables.project_id)/locations/$(ref.variables.zone)/instances/$(ref.variables.workbench_name)
+        machineType: projects/$(ref.variables.project_id)/zones/$(ref.variables.zone)/machineTypes/n1-standard-4
+        acceleratorConfig:
+          type: NVIDIA_TESLA_T4
+          coreCount: "1"
+        vmImage:
+          project: deeplearning-platform-release
+          imageFamily: tf-ent-2-11-cu113-notebooks
+        bootDiskType: PD_SSD
+        bootDiskSizeGb: "100"
+        dataDiskType: PD_STANDARD
+        dataDiskSizeGb: "100"
+        network: $(ref.ml-network.selfLink)
+        subnet: $(ref.ml-subnet.selfLink)
+        noPublicIp: false
+        noProxyAccess: false
+        serviceAccount: $(ref.ml-workbench-sa.email)
+        serviceAccountScopes:
+          - https://www.googleapis.com/auth/cloud-platform
+          - https://www.googleapis.com/auth/userinfo.email
+        tags:
+          - ml-workbench
+        metadata:
+          enable-oslogin: "true"
+          install-nvidia-driver: "true"
+          proxy-mode: service_account
+          notebook-disable-downloads: "false"
+          notebook-disable-terminal: "false"
+          notebook-disable-nbconvert: "false"
+          startup-script: |
+            #!/bin/bash
+            # Create mount point for NetApp volume
+            sudo mkdir -p /mnt/ml-datasets
+            
+            # Install NFS utilities if not present
+            sudo apt-get update
+            sudo apt-get install -y nfs-common
+            
+            # Create directory structure for ML workflows
+            sudo mkdir -p /mnt/ml-datasets/{raw-data,processed-data,models,notebooks,config}
+            sudo chown -R jupyter:jupyter /mnt/ml-datasets
+            
+            # Install additional Python packages for ML workflows
+            sudo -u jupyter pip install --upgrade \
+              pandas numpy scikit-learn matplotlib seaborn plotly \
+              tensorflow keras torch torchvision \
+              jupyter jupyterlab notebook \
+              google-cloud-storage google-cloud-aiplatform
+            
+            # Create sample configuration files
+            cat > /mnt/ml-datasets/config/requirements.txt << 'EOF'
+            pandas>=1.5.0
+            numpy>=1.21.0
+            scikit-learn>=1.1.0
+            tensorflow>=2.11.0
+            matplotlib>=3.5.0
+            seaborn>=0.11.0
+            jupyter>=1.0.0
+            plotly>=5.0.0
+            google-cloud-storage>=2.7.0
+            google-cloud-aiplatform>=1.21.0
+            EOF
+            
+            # Create team guidelines notebook
+            cat > /mnt/ml-datasets/notebooks/team_guidelines.ipynb << 'EOF'
+            {
+             "cells": [
+              {
+               "cell_type": "markdown",
+               "metadata": {},
+               "source": [
+                "# Team Data Science Guidelines\n\n",
+                "## Shared Directory Structure\n",
+                "- **raw-data/**: Original datasets (read-only)\n",
+                "- **processed-data/**: Cleaned and transformed datasets\n",
+                "- **models/**: Trained model artifacts\n",
+                "- **notebooks/**: Jupyter notebooks for experiments\n",
+                "- **config/**: Shared configuration files\n\n",
+                "## NetApp Volume Benefits\n",
+                "- High-performance access (up to 4.5 GiB/sec)\n",
+                "- Instant snapshots for data protection\n",
+                "- Shared access for team collaboration\n",
+                "- POSIX-compliant file system\n\n",
+                "## Getting Started\n",
+                "1. Mount the NetApp volume: `/mnt/ml-datasets`\n",
+                "2. Follow the directory structure guidelines\n",
+                "3. Use version control for notebooks\n",
+                "4. Sync models to Cloud Storage for versioning"
+               ]
+              }
+             ],
+             "metadata": {
+              "kernelspec": {
+               "display_name": "Python 3",
+               "language": "python",
+               "name": "python3"
+              }
+             },
+             "nbformat": 4,
+             "nbformat_minor": 4
+            }
+            EOF
+            
+            # Set proper permissions
+            sudo chown -R jupyter:jupyter /mnt/ml-datasets
+            sudo chmod -R 755 /mnt/ml-datasets
+            
+            # Log completion
+            echo "$(date): Workbench instance setup completed" >> /var/log/startup-script.log
+        labels:
+          environment: "ml-development"
+          workload-type: "data-science"
+          managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - notebooks-api
+        - ml-subnet
+        - ml-workbench-sa
+        - ml-workbench-sa-storage-binding
+        - ml-workbench-sa-vertex-binding
+        - ml-workbench-sa-compute-binding
+        - ml-workbench-sa-netapp-binding
+
+# Output important resource information for verification and access
+outputs:
+  - name: project_id
+    value: $(ref.variables.project_id)
+    
+  - name: network_name
+    value: $(ref.ml-network.name)
+    
+  - name: network_self_link
+    value: $(ref.ml-network.selfLink)
+    
+  - name: subnet_name
+    value: $(ref.ml-subnet.name)
+    
+  - name: subnet_self_link
+    value: $(ref.ml-subnet.selfLink)
+    
+  - name: storage_pool_name
+    value: $(ref.ml-storage-pool.name)
+    
+  - name: volume_name
+    value: $(ref.ml-dataset-volume.name)
+    
+  - name: volume_mount_target
+    value: $(ref.ml-dataset-volume.name)
+    
+  - name: bucket_name
+    value: $(ref.ml-datalake-bucket.name)
+    
+  - name: bucket_url
+    value: gs://$(ref.ml-datalake-bucket.name)
+    
+  - name: workbench_instance_name
+    value: $(ref.ml-workbench-instance.name)
+    
+  - name: workbench_service_account
+    value: $(ref.ml-workbench-sa.email)
+    
+  - name: workbench_proxy_uri
+    value: $(ref.ml-workbench-instance.proxyUri)
+    
+  - name: mount_command
+    value: |
+      # SSH into the instance and run:
+      sudo mount -t nfs $(ref.ml-dataset-volume.name) /mnt/ml-datasets
+      echo '$(ref.ml-dataset-volume.name) /mnt/ml-datasets nfs defaults 0 0' | sudo tee -a /etc/fstab
+    
+  - name: jupyter_access_url
+    value: $(ref.ml-workbench-instance.proxyUri)
+    
+  - name: deployment_summary
+    value: |
+      High-Performance Data Science Environment Deployed Successfully!
+      
+      Components Created:
+      - VPC Network: $(ref.ml-network.name)
+      - Cloud NetApp Storage Pool: $(ref.ml-storage-pool.name) (Premium tier)
+      - Cloud NetApp Volume: $(ref.ml-dataset-volume.name) (500GB, NFS)
+      - Cloud Storage Bucket: $(ref.ml-datalake-bucket.name)
+      - Vertex AI Workbench: $(ref.ml-workbench-instance.name) (GPU-enabled)
+      
+      Access Instructions:
+      1. Access Jupyter: $(ref.ml-workbench-instance.proxyUri)
+      2. Mount NetApp volume in the instance terminal
+      3. Navigate to /mnt/ml-datasets for shared storage
+      
+      Next Steps:
+      - Upload datasets to /mnt/ml-datasets/raw-data/
+      - Create notebooks in /mnt/ml-datasets/notebooks/
+      - Train models with GPU acceleration
+      - Sync artifacts to Cloud Storage for versioning

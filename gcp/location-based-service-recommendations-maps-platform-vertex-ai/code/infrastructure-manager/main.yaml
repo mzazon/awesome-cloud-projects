@@ -1,0 +1,427 @@
+# Infrastructure Manager Configuration for Location-Based Service Recommendations
+# This configuration deploys a complete location-aware AI recommendation system
+# using Google Maps Platform, Vertex AI, Cloud Run, and Cloud Firestore
+
+# Infrastructure Manager metadata
+apiVersion: v1
+kind: Deployment
+metadata:
+  name: location-based-service-recommendations
+  description: "Deploy intelligent location-based recommendation system with Google Maps Platform and Vertex AI"
+  labels:
+    application: location-recommender
+    version: "1.0"
+    category: analytics
+
+# Define input variables for customization
+variables:
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    required: true
+  
+  region:
+    description: "Google Cloud region for resources"
+    type: string
+    default: "us-central1"
+    validation:
+      pattern: "^[a-z0-9-]+$"
+  
+  service_name:
+    description: "Name for the Cloud Run service"
+    type: string
+    default: "location-recommender"
+    validation:
+      pattern: "^[a-z0-9-]+$"
+  
+  firestore_database:
+    description: "Name for the Firestore database"
+    type: string
+    default: "recommendations-db"
+    validation:
+      pattern: "^[a-z0-9-]+$"
+  
+  maps_api_key_name:
+    description: "Display name for the Maps API key"
+    type: string
+    default: "Location Recommender API Key"
+  
+  service_account_name:
+    description: "Service account name for AI operations"
+    type: string
+    default: "location-ai-service"
+    validation:
+      pattern: "^[a-z0-9-]+$"
+  
+  container_image:
+    description: "Container image for the Cloud Run service"
+    type: string
+    default: "gcr.io/cloudrun/hello"  # Will be replaced during deployment
+  
+  enable_apis:
+    description: "Whether to enable required APIs"
+    type: bool
+    default: true
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable-run-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/run.googleapis.com
+      project: $(ref.project_id.value)
+    metadata:
+      dependsOn: []
+    when: $(ref.enable_apis.value)
+
+  - name: enable-aiplatform-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/aiplatform.googleapis.com
+      project: $(ref.project_id.value)
+    metadata:
+      dependsOn: []
+    when: $(ref.enable_apis.value)
+
+  - name: enable-firestore-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/firestore.googleapis.com
+      project: $(ref.project_id.value)
+    metadata:
+      dependsOn: []
+    when: $(ref.enable_apis.value)
+
+  - name: enable-maps-backend-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/maps-backend.googleapis.com
+      project: $(ref.project_id.value)
+    metadata:
+      dependsOn: []
+    when: $(ref.enable_apis.value)
+
+  - name: enable-places-backend-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/places-backend.googleapis.com
+      project: $(ref.project_id.value)
+    metadata:
+      dependsOn: []
+    when: $(ref.enable_apis.value)
+
+  - name: enable-geocoding-backend-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/geocoding-backend.googleapis.com
+      project: $(ref.project_id.value)
+    metadata:
+      dependsOn: []
+    when: $(ref.enable_apis.value)
+
+  - name: enable-mapsgrounding-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/mapsgrounding.googleapis.com
+      project: $(ref.project_id.value)
+    metadata:
+      dependsOn: []
+    when: $(ref.enable_apis.value)
+
+  # Create Google Maps Platform API Key
+  - name: maps-api-key
+    type: gcp-types/apikeys-v2:projects.locations.keys
+    properties:
+      parent: projects/$(ref.project_id.value)/locations/global
+      displayName: $(ref.maps_api_key_name.value)
+      restrictions:
+        apiTargets:
+          - service: maps-backend.googleapis.com
+          - service: places-backend.googleapis.com
+          - service: geocoding-backend.googleapis.com
+          - service: mapsgrounding.googleapis.com
+    metadata:
+      dependsOn:
+        - enable-maps-backend-api
+        - enable-places-backend-api
+        - enable-geocoding-backend-api
+        - enable-mapsgrounding-api
+
+  # Create Firestore database in native mode
+  - name: firestore-database
+    type: gcp-types/firestore-v1:projects.databases
+    properties:
+      parent: projects/$(ref.project_id.value)
+      databaseId: $(ref.firestore_database.value)
+      type: FIRESTORE_NATIVE
+      locationId: $(ref.region.value)
+      appEngineIntegrationMode: DISABLED
+    metadata:
+      dependsOn:
+        - enable-firestore-api
+
+  # Create Firestore composite indexes for efficient querying
+  - name: user-preferences-index
+    type: gcp-types/firestore-v1:projects.databases.collectionGroups.indexes
+    properties:
+      parent: projects/$(ref.project_id.value)/databases/$(ref.firestore_database.value)/collectionGroups/user_preferences
+      fields:
+        - fieldPath: userId
+          order: ASCENDING
+        - fieldPath: lastUpdated
+          order: DESCENDING
+      queryScope: COLLECTION
+    metadata:
+      dependsOn:
+        - firestore-database
+
+  - name: recommendations-cache-index
+    type: gcp-types/firestore-v1:projects.databases.collectionGroups.indexes
+    properties:
+      parent: projects/$(ref.project_id.value)/databases/$(ref.firestore_database.value)/collectionGroups/recommendations_cache
+      fields:
+        - fieldPath: locationHash
+          order: ASCENDING
+        - fieldPath: timestamp
+          order: DESCENDING
+      queryScope: COLLECTION
+    metadata:
+      dependsOn:
+        - firestore-database
+
+  # Create service account for AI operations
+  - name: location-ai-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: $(ref.service_account_name.value)
+      displayName: "Location AI Recommendation Service"
+      description: "Service account for location-based AI recommendation operations"
+      project: $(ref.project_id.value)
+
+  # Grant Vertex AI permissions to service account
+  - name: vertex-ai-user-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id.value)
+      role: roles/aiplatform.user
+      member: serviceAccount:$(ref.location-ai-service-account.email)
+    metadata:
+      dependsOn:
+        - location-ai-service-account
+
+  # Grant Firestore permissions to service account
+  - name: firestore-user-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id.value)
+      role: roles/datastore.user
+      member: serviceAccount:$(ref.location-ai-service-account.email)
+    metadata:
+      dependsOn:
+        - location-ai-service-account
+
+  # Grant Maps Platform permissions to service account
+  - name: maps-user-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id.value)
+      role: roles/serviceusage.serviceUsageConsumer
+      member: serviceAccount:$(ref.location-ai-service-account.email)
+    metadata:
+      dependsOn:
+        - location-ai-service-account
+
+  # Deploy Cloud Run service for the recommendation API
+  - name: location-recommender-service
+    type: gcp-types/run-v1:namespaces.services
+    properties:
+      apiVersion: serving.knative.dev/v1
+      kind: Service
+      metadata:
+        name: $(ref.service_name.value)
+        namespace: $(ref.project_id.value)
+        labels:
+          application: location-recommender
+          version: "1.0"
+        annotations:
+          run.googleapis.com/ingress: all
+          run.googleapis.com/ingress-status: all
+      spec:
+        template:
+          metadata:
+            annotations:
+              # Enable Cloud SQL connections if needed
+              run.googleapis.com/cloudsql-instances: ""
+              # Configure auto-scaling
+              autoscaling.knative.dev/minScale: "0"
+              autoscaling.knative.dev/maxScale: "10"
+              # Configure CPU and memory
+              run.googleapis.com/cpu-throttling: "true"
+              run.googleapis.com/execution-environment: gen2
+          spec:
+            serviceAccountName: $(ref.location-ai-service-account.email)
+            containerConcurrency: 80
+            timeoutSeconds: 300
+            containers:
+              - image: $(ref.container_image.value)
+                name: location-recommender
+                ports:
+                  - name: http1
+                    containerPort: 8080
+                    protocol: TCP
+                env:
+                  - name: PROJECT_ID
+                    value: $(ref.project_id.value)
+                  - name: REGION
+                    value: $(ref.region.value)
+                  - name: FIRESTORE_DATABASE
+                    value: $(ref.firestore_database.value)
+                  - name: MAPS_API_KEY
+                    value: $(ref.maps-api-key.keyString)
+                  - name: PORT
+                    value: "8080"
+                resources:
+                  limits:
+                    cpu: "1000m"
+                    memory: "512Mi"
+                  requests:
+                    cpu: "100m"
+                    memory: "128Mi"
+                livenessProbe:
+                  httpGet:
+                    path: /
+                    port: 8080
+                  initialDelaySeconds: 30
+                  periodSeconds: 60
+                  timeoutSeconds: 10
+                readinessProbe:
+                  httpGet:
+                    path: /
+                    port: 8080
+                  initialDelaySeconds: 10
+                  periodSeconds: 10
+                  timeoutSeconds: 5
+        traffic:
+          - percent: 100
+            latestRevision: true
+    metadata:
+      dependsOn:
+        - enable-run-api
+        - location-ai-service-account
+        - vertex-ai-user-binding
+        - firestore-user-binding
+        - maps-user-binding
+        - maps-api-key
+        - firestore-database
+
+  # Configure IAM policy to allow unauthenticated access to Cloud Run service
+  - name: cloud-run-invoker-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id.value)
+      role: roles/run.invoker
+      member: allUsers
+    metadata:
+      dependsOn:
+        - location-recommender-service
+
+  # Create Cloud Storage bucket for application artifacts (optional)
+  - name: application-artifacts-bucket
+    type: gcp-types/storage-v1:bucket
+    properties:
+      name: $(ref.project_id.value)-location-recommender-artifacts
+      project: $(ref.project_id.value)
+      location: $(ref.region.value)
+      storageClass: REGIONAL
+      uniformBucketLevelAccess:
+        enabled: true
+      versioning:
+        enabled: false
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+      labels:
+        application: location-recommender
+        purpose: artifacts
+
+  # Create Cloud Logging sink for monitoring and debugging
+  - name: recommendation-logs-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      name: location-recommender-logs
+      parent: projects/$(ref.project_id.value)
+      destination: storage.googleapis.com/$(ref.application-artifacts-bucket.name)/logs
+      filter: |
+        resource.type="cloud_run_revision"
+        resource.labels.service_name="$(ref.service_name.value)"
+        severity>=INFO
+      description: "Logs for location-based recommendation service"
+    metadata:
+      dependsOn:
+        - application-artifacts-bucket
+        - location-recommender-service
+
+# Output values for reference and validation
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: $(ref.project_id.value)
+
+  region:
+    description: "Deployment region"
+    value: $(ref.region.value)
+
+  service_url:
+    description: "URL of the deployed Cloud Run service"
+    value: $(ref.location-recommender-service.status.url)
+
+  service_name:
+    description: "Name of the Cloud Run service"
+    value: $(ref.service_name.value)
+
+  maps_api_key:
+    description: "Google Maps Platform API Key (sensitive)"
+    value: $(ref.maps-api-key.keyString)
+    sensitive: true
+
+  firestore_database:
+    description: "Firestore database name"
+    value: $(ref.firestore_database.value)
+
+  service_account_email:
+    description: "Service account email for AI operations"
+    value: $(ref.location-ai-service-account.email)
+
+  artifacts_bucket:
+    description: "Cloud Storage bucket for application artifacts"
+    value: $(ref.application-artifacts-bucket.name)
+
+  recommendation_endpoint:
+    description: "Full URL for the recommendation API endpoint"
+    value: "$(ref.location-recommender-service.status.url)/recommend"
+
+  health_check_endpoint:
+    description: "Health check endpoint for service monitoring"
+    value: "$(ref.location-recommender-service.status.url)/"
+
+# Additional metadata for Infrastructure Manager
+deployment:
+  preview: false
+  importExistingResources: false
+  
+# Labels for resource management and cost tracking
+labels:
+  environment: production
+  application: location-recommender
+  cost-center: analytics
+  managed-by: infrastructure-manager
+
+# Annotations for deployment tracking
+annotations:
+  deployment.cloud.google.com/recipe: "location-based-service-recommendations-maps-platform-vertex-ai"
+  deployment.cloud.google.com/version: "1.0"
+  deployment.cloud.google.com/generator: "infrastructure-manager"

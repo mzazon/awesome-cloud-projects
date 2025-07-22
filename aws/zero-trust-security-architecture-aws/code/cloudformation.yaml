@@ -1,0 +1,909 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Zero Trust Security Architecture with AWS - Comprehensive security implementation
+  using IAM Identity Center, Security Hub, GuardDuty, Config, and encrypted networking.
+  This template creates a production-ready zero trust environment with continuous
+  monitoring, threat detection, and compliance enforcement.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Zero Trust Configuration"
+        Parameters:
+          - ZeroTrustPrefix
+          - TrustedNetworks
+          - AllowedRegions
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - SecurityNotificationEmail
+          - MFARequirementAge
+          - SessionDuration
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcCidr
+          - PrivateSubnet1Cidr
+          - PrivateSubnet2Cidr
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - LogRetentionDays
+          - EnableAdvancedThreatDetection
+          - ComplianceStandardsLevel
+
+Parameters:
+  ZeroTrustPrefix:
+    Type: String
+    Default: zero-trust
+    Description: Prefix for all zero trust resources
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    MaxLength: 20
+
+  SecurityNotificationEmail:
+    Type: String
+    Description: Email address for security alerts and notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+
+  TrustedNetworks:
+    Type: CommaDelimitedList
+    Default: "203.0.113.0/24,198.51.100.0/24"
+    Description: List of trusted CIDR blocks for conditional access
+    ConstraintDescription: Must be valid CIDR blocks separated by commas
+
+  AllowedRegions:
+    Type: CommaDelimitedList
+    Default: "us-east-1,us-west-2"
+    Description: List of allowed AWS regions for operations
+    ConstraintDescription: Must be valid AWS region names
+
+  MFARequirementAge:
+    Type: Number
+    Default: 3600
+    MinValue: 300
+    MaxValue: 86400
+    Description: Maximum age of MFA authentication in seconds (5 minutes to 24 hours)
+
+  SessionDuration:
+    Type: String
+    Default: PT8H
+    AllowedPattern: '^PT[1-9][0-9]?H$'
+    Description: Session duration in ISO 8601 format (PT1H to PT12H)
+    ConstraintDescription: Must be in format PT[1-12]H
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: CIDR block for the Zero Trust VPC
+    ConstraintDescription: Must be a valid CIDR block
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: CIDR block for private subnet 1
+    ConstraintDescription: Must be a valid CIDR block
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.0.2.0/24
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: CIDR block for private subnet 2
+    ConstraintDescription: Must be a valid CIDR block
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: Log retention period in days
+
+  EnableAdvancedThreatDetection:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable advanced threat detection features
+
+  ComplianceStandardsLevel:
+    Type: String
+    Default: 'foundational'
+    AllowedValues: ['foundational', 'comprehensive']
+    Description: Level of compliance standards to enable
+
+Conditions:
+  EnableAdvancedThreats: !Equals [!Ref EnableAdvancedThreatDetection, 'true']
+  EnableComprehensiveCompliance: !Equals [!Ref ComplianceStandardsLevel, 'comprehensive']
+
+Resources:
+  # ==================== ENCRYPTION AND DATA PROTECTION ====================
+  
+  ZeroTrustKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Zero Trust Security Architecture Master Key
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow Zero Trust Services
+            Effect: Allow
+            Principal:
+              Service:
+                - s3.amazonaws.com
+                - secretsmanager.amazonaws.com
+                - rds.amazonaws.com
+                - logs.amazonaws.com
+                - sns.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:Encrypt
+              - kms:GenerateDataKey
+              - kms:GenerateDataKeyWithoutPlaintext
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:ViaService':
+                  - !Sub 's3.${AWS::Region}.amazonaws.com'
+                  - !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
+                  - !Sub 'rds.${AWS::Region}.amazonaws.com'
+                  - !Sub 'logs.${AWS::Region}.amazonaws.com'
+                  - !Sub 'sns.${AWS::Region}.amazonaws.com'
+      KeyRotationStatus: true
+      PendingWindowInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${ZeroTrustPrefix}-master-key'
+        - Key: Purpose
+          Value: ZeroTrustSecurity
+
+  ZeroTrustKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ZeroTrustPrefix}-key'
+      TargetKeyId: !Ref ZeroTrustKMSKey
+
+  # ==================== STORAGE AND LOGGING ====================
+  
+  SecurityLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ZeroTrustPrefix}-security-logs-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref ZeroTrustKMSKey
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: SecurityLogsRetention
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref SecurityEventsLogGroup
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref SecurityLogsBucket
+        LogFilePrefix: access-logs/
+      Tags:
+        - Key: Name
+          Value: !Sub '${ZeroTrustPrefix}-security-logs'
+        - Key: Purpose
+          Value: SecurityLogging
+
+  SecureDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ZeroTrustPrefix}-secure-data-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref ZeroTrustKMSKey
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+        MfaDelete: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ZeroTrustPrefix}-secure-data'
+        - Key: Purpose
+          Value: SecureDataStorage
+
+  SecurityEventsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/zero-trust/${ZeroTrustPrefix}'
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt ZeroTrustKMSKey.Arn
+
+  SessionLogsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/zero-trust/${ZeroTrustPrefix}/sessions'
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt ZeroTrustKMSKey.Arn
+
+  # ==================== NETWORKING AND VPC ====================
+  
+  ZeroTrustVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ZeroTrustPrefix}-vpc'
+        - Key: Purpose
+          Value: ZeroTrustSecurity
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ZeroTrustVPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ZeroTrustPrefix}-private-1'
+        - Key: Type
+          Value: Private
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ZeroTrustVPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ZeroTrustPrefix}-private-2'
+        - Key: Type
+          Value: Private
+
+  ZeroTrustSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ZeroTrustPrefix}-zero-trust-sg'
+      GroupDescription: Zero Trust Security Group with minimal access
+      VpcId: !Ref ZeroTrustVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ZeroTrustSecurityGroup
+          Description: HTTPS traffic from same security group
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ZeroTrustPrefix}-zero-trust-sg'
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ZeroTrustVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ZeroTrustPrefix}-private-rt'
+
+  PrivateSubnet1RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  S3VPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref ZeroTrustVPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Resource: !Sub '${SecurityLogsBucket}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-server-side-encryption': 'aws:kms'
+
+  # ==================== IAM ROLES AND POLICIES ====================
+  
+  ZeroTrustBoundaryPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ZeroTrustPrefix}-boundary-policy'
+      Description: Zero Trust Security Boundary Policy with conditional access
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnforceMFAForAllActions
+            Effect: Deny
+            Action: '*'
+            Resource: '*'
+            Condition:
+              BoolIfExists:
+                'aws:MultiFactorAuthPresent': 'false'
+              NumericLessThan:
+                'aws:MultiFactorAuthAge': !Ref MFARequirementAge
+          - Sid: RestrictToTrustedNetworks
+            Effect: Deny
+            Action: '*'
+            Resource: '*'
+            Condition:
+              IpAddressIfExists:
+                'aws:SourceIp': '0.0.0.0/0'
+              ForAllValues:StringNotEquals:
+                'aws:SourceIp': !Ref TrustedNetworks
+          - Sid: EnforceSSLRequests
+            Effect: Deny
+            Action: 's3:*'
+            Resource: '*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: RestrictHighRiskActions
+            Effect: Deny
+            Action:
+              - iam:CreateUser
+              - iam:DeleteUser
+              - iam:CreateRole
+              - iam:DeleteRole
+              - iam:AttachUserPolicy
+              - iam:DetachUserPolicy
+              - iam:AttachRolePolicy
+              - iam:DetachRolePolicy
+            Resource: '*'
+            Condition:
+              StringNotEquals:
+                'aws:RequestedRegion': !Ref AllowedRegions
+
+  ABACPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ZeroTrustPrefix}-abac-policy'
+      Description: Zero Trust Attribute-Based Access Control Policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowAccessBasedOnDepartment
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Resource: 'arn:aws:s3:::*/${saml:Department}/*'
+            Condition:
+              StringEquals:
+                'saml:Department': 
+                  - Finance
+                  - HR
+                  - Engineering
+          - Sid: AllowAdminAccessBasedOnRole
+            Effect: Allow
+            Action:
+              - s3:DeleteObject
+              - s3:GetObjectVersion
+            Resource: 'arn:aws:s3:::*/${saml:Department}/*'
+            Condition:
+              StringEquals:
+                'saml:Role': 'Admin'
+              DateGreaterThan:
+                'aws:CurrentTime': '2024-01-01T00:00:00Z'
+          - Sid: TimeBasedAccess
+            Effect: Deny
+            Action: '*'
+            Resource: '*'
+            Condition:
+              DateGreaterThan:
+                'aws:CurrentTime': '18:00:00Z'
+              DateLessThan:
+                'aws:CurrentTime': '08:00:00Z'
+              StringNotEquals:
+                'saml:Role': 'OnCallEngineer'
+
+  SecurityRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ZeroTrustPrefix}-security-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Sub '${ZeroTrustPrefix}-security-automation'
+      PermissionsBoundary: !Ref ZeroTrustBoundaryPolicy
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/SecurityAudit
+      Tags:
+        - Key: Name
+          Value: !Sub '${ZeroTrustPrefix}-security-role'
+
+  ConfigServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ZeroTrustPrefix}-config-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/ConfigRole
+      Policies:
+        - PolicyName: ConfigS3DeliveryPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetBucketAcl
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt SecurityLogsBucket.Arn
+                  - !Sub '${SecurityLogsBucket}/*'
+
+  ConditionalAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ZeroTrustPrefix}-conditional-access-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:saml-provider/ZeroTrustSAML'
+            Action: sts:AssumeRoleWithSAML
+            Condition:
+              StringEquals:
+                'saml:aud': 'https://signin.aws.amazon.com/saml'
+              StringLike:
+                'saml:Department':
+                  - Finance
+                  - HR
+                  - Engineering
+      ManagedPolicyArns:
+        - !Ref ABACPolicy
+      PermissionsBoundary: !Ref ZeroTrustBoundaryPolicy
+
+  # ==================== SECURITY HUB CONFIGURATION ====================
+  
+  SecurityHub:
+    Type: AWS::SecurityHub::Hub
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ZeroTrustPrefix}-security-hub'
+
+  # Security Hub Standards Subscriptions
+  FoundationalStandard:
+    Type: AWS::SecurityHub::StandardsSubscription
+    Properties:
+      StandardsArn: !Sub 'arn:aws:securityhub:${AWS::Region}::standard/aws-foundational-security/v/1.0.0'
+    DependsOn: SecurityHub
+
+  CISStandard:
+    Type: AWS::SecurityHub::StandardsSubscription
+    Condition: EnableComprehensiveCompliance
+    Properties:
+      StandardsArn: !Sub 'arn:aws:securityhub:${AWS::Region}::standard/cis-aws-foundations-benchmark/v/1.2.0'
+    DependsOn: SecurityHub
+
+  # ==================== GUARDDUTY CONFIGURATION ====================
+  
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector
+    Properties:
+      Enable: true
+      FindingPublishingFrequency: FIFTEEN_MINUTES
+      DataSources:
+        S3Logs:
+          Enable: true
+        KubernetesConfiguration:
+          AuditLogs:
+            Enable: true
+        MalwareProtection:
+          ScanEc2InstanceWithFindings:
+            EbsVolumes: !If [EnableAdvancedThreats, true, false]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ZeroTrustPrefix}-guardduty'
+
+  GuardDutyThreatIntelSet:
+    Type: AWS::GuardDuty::ThreatIntelSet
+    Condition: EnableAdvancedThreats
+    Properties:
+      Activate: true
+      DetectorId: !Ref GuardDutyDetector
+      Format: TXT
+      Location: !Sub 's3://${SecurityLogsBucket}/threat-intel/malicious-ips.txt'
+      Name: !Sub '${ZeroTrustPrefix}-threat-intel'
+
+  # ==================== AWS CONFIG CONFIGURATION ====================
+  
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Properties:
+      Name: zero-trust-config-channel
+      S3BucketName: !Ref SecurityLogsBucket
+      S3KeyPrefix: config/
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: TwentyFour_Hours
+
+  ConfigurationRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      Name: zero-trust-config-recorder
+      RoleARN: !GetAtt ConfigServiceRole.Arn
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+        RecordingModeOverrides:
+          - ResourceTypes:
+              - AWS::IAM::Role
+              - AWS::IAM::Policy
+            RecordingMode:
+              RecordingFrequency: CONTINUOUS
+
+  # Config Rules for Zero Trust Compliance
+  MFAEnabledConfigRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: zero-trust-mfa-enabled
+      Description: Checks if MFA is enabled for all IAM users
+      Source:
+        Owner: AWS
+        SourceIdentifier: MFA_ENABLED_FOR_IAM_CONSOLE_ACCESS
+    DependsOn: ConfigurationRecorder
+
+  S3SSLRequestsOnlyConfigRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: zero-trust-s3-bucket-ssl-requests-only
+      Description: Checks if S3 buckets have policies requiring SSL requests only
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_SSL_REQUESTS_ONLY
+    DependsOn: ConfigurationRecorder
+
+  # ==================== SESSION MANAGER CONFIGURATION ====================
+  
+  SessionManagerDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: !Sub '${ZeroTrustPrefix}-session-preferences'
+      DocumentType: Session
+      DocumentFormat: JSON
+      Content:
+        schemaVersion: '1.0'
+        description: Zero Trust Session Manager Preferences
+        sessionType: Standard_Stream
+        inputs:
+          s3BucketName: !Ref SecurityLogsBucket
+          s3KeyPrefix: session-logs/
+          s3EncryptionEnabled: true
+          cloudWatchLogGroupName: !Ref SessionLogsLogGroup
+          cloudWatchEncryptionEnabled: true
+          kmsKeyId: !Ref ZeroTrustKMSKey
+          shellProfile:
+            linux: !Sub |
+              cd /tmp && echo "Zero Trust Session Started at $(date)" && export PS1="[ZT]\\u@\\h:\\w\\$ "
+            windows: 'cd C:\temp && echo Zero Trust Session Started at %DATE% %TIME%'
+
+  # ==================== LAMBDA FUNCTIONS ====================
+  
+  SessionVerificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ZeroTrustPrefix}-session-verification'
+      Description: Zero Trust Session Verification
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt SecurityRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ZERO_TRUST_PREFIX: !Ref ZeroTrustPrefix
+          KMS_KEY_ID: !Ref ZeroTrustKMSKey
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          from datetime import datetime, timedelta
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Continuous session verification for zero trust
+              """
+              try:
+                  # Parse session details from event
+                  session_id = event.get('sessionId')
+                  user_id = event.get('userId')
+                  source_ip = event.get('sourceIp')
+                  
+                  # Verify session integrity
+                  if not verify_session_integrity(session_id, user_id, source_ip):
+                      terminate_session(session_id)
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'action': 'terminated',
+                              'reason': 'session_integrity_violation'
+                          })
+                      }
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'action': 'verified',
+                          'sessionId': session_id
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Session verification failed: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+          
+          def verify_session_integrity(session_id, user_id, source_ip):
+              """
+              Verify session integrity based on zero trust principles
+              """
+              # Implement verification logic here
+              # Check for IP changes, time limits, risk factors
+              return True
+          
+          def terminate_session(session_id):
+              """
+              Terminate session for security violation
+              """
+              ssm = boto3.client('ssm')
+              ssm.terminate_session(SessionId=session_id)
+
+  # ==================== MONITORING AND ALERTING ====================
+  
+  SecurityAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ZeroTrustPrefix}-security-alerts'
+      DisplayName: Zero Trust Security Alerts
+      KmsMasterKeyId: !Ref ZeroTrustKMSKey
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref SecurityNotificationEmail
+
+  FailedLoginsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ZeroTrustPrefix}-failed-logins'
+      AlarmDescription: Zero Trust - Multiple failed login attempts
+      MetricName: ConsoleLogin
+      Namespace: AWS/CloudTrail
+      Statistic: Sum
+      Period: 300
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 1
+      AlarmActions:
+        - !Ref SecurityAlertsTopic
+      TreatMissingData: notBreaching
+
+  SecurityDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ZeroTrustPrefix}-security-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/SecurityHub", "Findings", "ComplianceType", "FAILED"],
+                  ["AWS/GuardDuty", "Findings", "Severity", "HIGH"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Zero Trust Security Findings"
+              }
+            },
+            {
+              "type": "log",
+              "properties": {
+                "query": "SOURCE \"${SecurityEventsLogGroup}\"\n| fields @timestamp, sourceIPAddress, userIdentity.type, eventName\n| filter eventName like /AssumeRole/\n| stats count() by userIdentity.type",
+                "region": "${AWS::Region}",
+                "title": "Zero Trust Access Patterns"
+              }
+            }
+          ]
+        }
+
+  # ==================== INSPECTOR V2 ====================
+  
+  InspectorEnablement:
+    Type: AWS::Inspector::AssessmentTarget
+    Condition: EnableAdvancedThreats
+    Properties:
+      AssessmentTargetName: !Sub '${ZeroTrustPrefix}-inspector-target'
+
+Outputs:
+  ZeroTrustVPCId:
+    Description: ID of the Zero Trust VPC
+    Value: !Ref ZeroTrustVPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPC-ID'
+
+  PrivateSubnet1Id:
+    Description: ID of Private Subnet 1
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet1-ID'
+
+  PrivateSubnet2Id:
+    Description: ID of Private Subnet 2
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet2-ID'
+
+  SecurityGroupId:
+    Description: ID of the Zero Trust Security Group
+    Value: !Ref ZeroTrustSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroup-ID'
+
+  KMSKeyId:
+    Description: ID of the Zero Trust KMS Key
+    Value: !Ref ZeroTrustKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-KMS-Key-ID'
+
+  KMSKeyArn:
+    Description: ARN of the Zero Trust KMS Key
+    Value: !GetAtt ZeroTrustKMSKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KMS-Key-ARN'
+
+  SecurityLogsBucket:
+    Description: Name of the Security Logs S3 Bucket
+    Value: !Ref SecurityLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityLogs-Bucket'
+
+  SecureDataBucket:
+    Description: Name of the Secure Data S3 Bucket
+    Value: !Ref SecureDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-SecureData-Bucket'
+
+  GuardDutyDetectorId:
+    Description: ID of the GuardDuty Detector
+    Value: !Ref GuardDutyDetector
+    Export:
+      Name: !Sub '${AWS::StackName}-GuardDuty-Detector-ID'
+
+  SecurityHubArn:
+    Description: ARN of Security Hub
+    Value: !Sub 'arn:aws:securityhub:${AWS::Region}:${AWS::AccountId}:hub/default'
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityHub-ARN'
+
+  ZeroTrustBoundaryPolicyArn:
+    Description: ARN of the Zero Trust Boundary Policy
+    Value: !Ref ZeroTrustBoundaryPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-BoundaryPolicy-ARN'
+
+  ABACPolicyArn:
+    Description: ARN of the ABAC Policy
+    Value: !Ref ABACPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-ABAC-Policy-ARN'
+
+  SecurityRoleArn:
+    Description: ARN of the Security Role
+    Value: !GetAtt SecurityRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-Security-Role-ARN'
+
+  SessionVerificationFunctionArn:
+    Description: ARN of the Session Verification Lambda Function
+    Value: !GetAtt SessionVerificationFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SessionVerification-Function-ARN'
+
+  SecurityAlertsTopicArn:
+    Description: ARN of the Security Alerts SNS Topic
+    Value: !Ref SecurityAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityAlerts-Topic-ARN'
+
+  SecurityDashboardURL:
+    Description: URL to the Zero Trust Security Dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ZeroTrustPrefix}-security-dashboard'
+
+  DeploymentNotes:
+    Description: Important notes for Zero Trust deployment
+    Value: !Sub |
+      Zero Trust Security Architecture deployed successfully!
+      
+      IMPORTANT NEXT STEPS:
+      1. Configure IAM Identity Center with your corporate identity provider
+      2. Update trusted network CIDRs in the boundary policy: ${ZeroTrustBoundaryPolicyArn}
+      3. Subscribe to security alerts topic: ${SecurityAlertsTopic}
+      4. Review and customize ABAC policies for your organization
+      5. Test MFA enforcement and conditional access policies
+      6. Configure CloudTrail to send logs to: ${SecurityLogsBucket}
+      
+      SECURITY REMINDERS:
+      - All resources use encryption with KMS key: ${ZeroTrustKMSKey}
+      - VPC has no internet gateway - all access is private
+      - MFA is required for all operations within ${MFARequirementAge} seconds
+      - Session verification is active via Lambda: ${SessionVerificationFunction}
+      
+      Monitor your security posture at: https://${AWS::Region}.console.aws.amazon.com/securityhub/

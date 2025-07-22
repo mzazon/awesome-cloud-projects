@@ -1,0 +1,586 @@
+# Infrastructure Manager Configuration for Infrastructure Change Monitoring
+# This template creates a comprehensive infrastructure change monitoring system
+# using Cloud Asset Inventory, Pub/Sub, Cloud Functions, and BigQuery
+
+# Template metadata and configuration
+apiVersion: blueprints.cloud.google.com/v1alpha1
+kind: BlueprintMetadata
+metadata:
+  name: infrastructure-change-monitoring
+  displayName: Infrastructure Change Monitoring with Asset Inventory
+  description: |
+    Automated infrastructure change monitoring system that leverages Cloud Asset Inventory
+    to track resource modifications in real-time, processes change events through Pub/Sub
+    messaging, and stores audit data in BigQuery for compliance reporting.
+
+# Template configuration
+template:
+  # Required template variables for customization
+  variables:
+    project_id:
+      description: Google Cloud Project ID
+      type: string
+      required: true
+    
+    region:
+      description: Primary region for resources
+      type: string
+      default: "us-central1"
+    
+    environment:
+      description: Environment name (dev, staging, prod)
+      type: string
+      default: "dev"
+      validation:
+        pattern: "^(dev|staging|prod)$"
+    
+    # Resource naming configuration
+    resource_suffix:
+      description: Suffix for resource names to ensure uniqueness
+      type: string
+      default: "001"
+    
+    # BigQuery configuration
+    bigquery_location:
+      description: Location for BigQuery dataset
+      type: string
+      default: "US"
+    
+    # Cloud Function configuration
+    function_memory:
+      description: Memory allocation for Cloud Function in MB
+      type: integer
+      default: 256
+      validation:
+        minimum: 128
+        maximum: 8192
+    
+    function_timeout:
+      description: Timeout for Cloud Function in seconds
+      type: integer
+      default: 60
+      validation:
+        minimum: 1
+        maximum: 540
+    
+    # Monitoring configuration
+    alert_threshold:
+      description: Threshold for change rate alerts (changes per minute)
+      type: number
+      default: 10.0
+
+  # Template outputs for verification and integration
+  outputs:
+    pubsub_topic_name:
+      description: Name of the Pub/Sub topic for asset changes
+      value: $(ref.pubsub_topic.name)
+    
+    bigquery_dataset_id:
+      description: ID of the BigQuery dataset for audit data
+      value: $(ref.bigquery_dataset.datasetId)
+    
+    cloud_function_name:
+      description: Name of the Cloud Function processing asset changes
+      value: $(ref.cloud_function.name)
+    
+    asset_feed_name:
+      description: Name of the Cloud Asset Inventory feed
+      value: $(ref.asset_feed.name)
+    
+    monitoring_dashboard_url:
+      description: URL to the Cloud Monitoring dashboard
+      value: "https://console.cloud.google.com/monitoring/dashboards/custom/$(ref.monitoring_dashboard.name)?project=$(var.project_id)"
+
+# Resource definitions
+resources:
+  # Enable required Google Cloud APIs
+  - name: enable_apis
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(var.project_id)/services/cloudasset.googleapis.com
+      parent: projects/$(var.project_id)
+    metadata:
+      dependsOn: []
+  
+  - name: enable_pubsub_api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(var.project_id)/services/pubsub.googleapis.com
+      parent: projects/$(var.project_id)
+    metadata:
+      dependsOn: []
+  
+  - name: enable_functions_api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(var.project_id)/services/cloudfunctions.googleapis.com
+      parent: projects/$(var.project_id)
+    metadata:
+      dependsOn: []
+  
+  - name: enable_bigquery_api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(var.project_id)/services/bigquery.googleapis.com
+      parent: projects/$(var.project_id)
+    metadata:
+      dependsOn: []
+  
+  - name: enable_monitoring_api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(var.project_id)/services/monitoring.googleapis.com
+      parent: projects/$(var.project_id)
+    metadata:
+      dependsOn: []
+
+  # Pub/Sub Topic for Asset Change Events
+  # This topic receives real-time notifications from Cloud Asset Inventory
+  # when infrastructure resources are created, modified, or deleted
+  - name: pubsub_topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(var.project_id)/topics/infrastructure-changes-$(var.environment)-$(var.resource_suffix)
+      labels:
+        environment: $(var.environment)
+        purpose: infrastructure-monitoring
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable_pubsub_api
+
+  # Pub/Sub Subscription for Cloud Functions trigger
+  # Configured with appropriate acknowledgment deadline for reliable processing
+  - name: pubsub_subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(var.project_id)/subscriptions/infrastructure-changes-sub-$(var.environment)-$(var.resource_suffix)
+      topic: $(ref.pubsub_topic.name)
+      ackDeadlineSeconds: 60
+      messageRetentionDuration: "604800s"  # 7 days
+      retryPolicy:
+        minimumBackoff: "10s"
+        maximumBackoff: "600s"
+      deadLetterPolicy:
+        deadLetterTopic: $(ref.pubsub_dead_letter_topic.name)
+        maxDeliveryAttempts: 5
+      labels:
+        environment: $(var.environment)
+        purpose: infrastructure-monitoring
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - pubsub_topic
+        - pubsub_dead_letter_topic
+
+  # Dead Letter Topic for failed message processing
+  # Ensures no asset change events are lost due to processing failures
+  - name: pubsub_dead_letter_topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(var.project_id)/topics/infrastructure-changes-dlq-$(var.environment)-$(var.resource_suffix)
+      labels:
+        environment: $(var.environment)
+        purpose: infrastructure-monitoring-dlq
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable_pubsub_api
+
+  # BigQuery Dataset for Audit Data Storage
+  # Stores structured audit trail for compliance reporting and analysis
+  - name: bigquery_dataset
+    type: gcp-types/bigquery-v2:datasets
+    properties:
+      datasetId: infrastructure_audit_$(var.environment)_$(var.resource_suffix)
+      projectId: $(var.project_id)
+      location: $(var.bigquery_location)
+      description: "Infrastructure change audit data for compliance and security monitoring"
+      labels:
+        environment: $(var.environment)
+        purpose: infrastructure-audit
+        managed-by: infrastructure-manager
+      access:
+        - role: OWNER
+          userByEmail: $(ref.cloud_function_service_account.email)
+        - role: WRITER
+          userByEmail: $(ref.cloud_function_service_account.email)
+      defaultTableExpirationMs: "7776000000"  # 90 days
+    metadata:
+      dependsOn:
+        - enable_bigquery_api
+        - cloud_function_service_account
+
+  # BigQuery Table for Asset Changes
+  # Schema designed for compliance reporting and security analysis
+  - name: bigquery_table
+    type: gcp-types/bigquery-v2:tables
+    properties:
+      datasetId: $(ref.bigquery_dataset.datasetId)
+      projectId: $(var.project_id)
+      tableId: asset_changes
+      description: "Detailed audit trail of infrastructure asset changes"
+      labels:
+        environment: $(var.environment)
+        purpose: infrastructure-audit
+        managed-by: infrastructure-manager
+      schema:
+        fields:
+          - name: timestamp
+            type: TIMESTAMP
+            mode: REQUIRED
+            description: "When the change was processed"
+          - name: asset_name
+            type: STRING
+            mode: REQUIRED
+            description: "Full resource name of the changed asset"
+          - name: asset_type
+            type: STRING
+            mode: REQUIRED
+            description: "Type of the asset (e.g., compute.googleapis.com/Instance)"
+          - name: change_type
+            type: STRING
+            mode: REQUIRED
+            description: "Type of change: CREATED, UPDATED, or DELETED"
+          - name: prior_state
+            type: STRING
+            mode: NULLABLE
+            description: "JSON representation of the asset before the change"
+          - name: current_state
+            type: STRING
+            mode: NULLABLE
+            description: "JSON representation of the asset after the change"
+          - name: project_id
+            type: STRING
+            mode: REQUIRED
+            description: "Project ID where the change occurred"
+          - name: location
+            type: STRING
+            mode: NULLABLE
+            description: "Geographic location of the asset"
+          - name: change_time
+            type: TIMESTAMP
+            mode: NULLABLE
+            description: "When the actual change occurred"
+          - name: ancestors
+            type: STRING
+            mode: NULLABLE
+            description: "Comma-separated list of ancestor resources"
+      timePartitioning:
+        type: DAY
+        field: timestamp
+        requirePartitionFilter: false
+      clustering:
+        fields:
+          - asset_type
+          - change_type
+          - project_id
+    metadata:
+      dependsOn:
+        - bigquery_dataset
+
+  # Service Account for Cloud Function
+  # Follows principle of least privilege with minimal required permissions
+  - name: cloud_function_service_account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: asset-monitor-fn-$(var.environment)-$(var.resource_suffix)
+      projectId: $(var.project_id)
+      displayName: "Asset Change Monitor Function Service Account"
+      description: "Service account for processing infrastructure change events"
+    metadata:
+      dependsOn: []
+
+  # IAM Policy Bindings for Cloud Function Service Account
+  # BigQuery Data Editor role for writing audit records
+  - name: function_bigquery_permissions
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicyBinding
+    properties:
+      resource: $(var.project_id)
+      role: roles/bigquery.dataEditor
+      members:
+        - serviceAccount:$(ref.cloud_function_service_account.email)
+    metadata:
+      dependsOn:
+        - cloud_function_service_account
+
+  # Monitoring Metric Writer role for custom metrics
+  - name: function_monitoring_permissions
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicyBinding
+    properties:
+      resource: $(var.project_id)
+      role: roles/monitoring.metricWriter
+      members:
+        - serviceAccount:$(ref.cloud_function_service_account.email)
+    metadata:
+      dependsOn:
+        - cloud_function_service_account
+
+  # Cloud Storage Bucket for Function Source Code
+  # Temporary storage for function deployment package
+  - name: function_source_bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: asset-monitor-source-$(var.project_id)-$(var.environment)-$(var.resource_suffix)
+      project: $(var.project_id)
+      location: $(var.region)
+      storageClass: REGIONAL
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+      labels:
+        environment: $(var.environment)
+        purpose: function-source
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn: []
+
+  # Cloud Function for Processing Asset Changes
+  # Serverless event processor that transforms asset changes into audit records
+  - name: cloud_function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(var.project_id)/locations/$(var.region)
+      name: process-asset-changes-$(var.environment)-$(var.resource_suffix)
+      description: "Processes infrastructure change events from Cloud Asset Inventory"
+      sourceArchiveUrl: gs://$(ref.function_source_bucket.name)/function-source.zip
+      entryPoint: process_asset_change
+      runtime: python39
+      availableMemoryMb: $(var.function_memory)
+      timeout: $(var.function_timeout)s
+      serviceAccountEmail: $(ref.cloud_function_service_account.email)
+      environmentVariables:
+        PROJECT_ID: $(var.project_id)
+        DATASET_NAME: $(ref.bigquery_dataset.datasetId)
+        ENVIRONMENT: $(var.environment)
+      eventTrigger:
+        eventType: providers/cloud.pubsub/eventTypes/topic.publish
+        resource: $(ref.pubsub_topic.name)
+        failurePolicy:
+          retry: {}
+      labels:
+        environment: $(var.environment)
+        purpose: infrastructure-monitoring
+        managed-by: infrastructure-manager
+    metadata:
+      dependsOn:
+        - enable_functions_api
+        - cloud_function_service_account
+        - function_source_bucket
+        - pubsub_topic
+        - bigquery_dataset
+
+  # Cloud Asset Inventory Feed
+  # Real-time monitoring feed that publishes asset changes to Pub/Sub
+  - name: asset_feed
+    type: gcp-types/cloudasset-v1:feeds
+    properties:
+      parent: projects/$(var.project_id)
+      feedId: infrastructure-feed-$(var.environment)-$(var.resource_suffix)
+      feed:
+        name: projects/$(var.project_id)/feeds/infrastructure-feed-$(var.environment)-$(var.resource_suffix)
+        assetTypes:
+          - ".*"  # Monitor all asset types
+        contentType: RESOURCE
+        feedOutputConfig:
+          pubsubDestination:
+            topic: $(ref.pubsub_topic.name)
+        condition:
+          expression: "true"  # Monitor all changes
+          title: "All Infrastructure Changes"
+          description: "Feed for monitoring all infrastructure resource changes"
+    metadata:
+      dependsOn:
+        - enable_apis
+        - pubsub_topic
+
+  # Cloud Monitoring Alert Policy
+  # Proactive alerting for unusual change patterns
+  - name: alert_policy_high_change_rate
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      name: projects/$(var.project_id)/alertPolicies/high-infrastructure-change-rate-$(var.environment)-$(var.resource_suffix)
+      displayName: "High Infrastructure Change Rate - $(var.environment)"
+      documentation:
+        content: |
+          This alert triggers when the rate of infrastructure changes exceeds
+          the configured threshold, which may indicate automated deployment
+          issues, security incidents, or unusual operational activity.
+        mimeType: text/markdown
+      conditions:
+        - displayName: "Change Rate Exceeds Threshold"
+          conditionThreshold:
+            filter: 'resource.type="global" AND metric.type="custom.googleapis.com/infrastructure/changes"'
+            comparison: COMPARISON_GREATER_THAN
+            thresholdValue: $(var.alert_threshold)
+            duration: 300s
+            aggregations:
+              - alignmentPeriod: 60s
+                perSeriesAligner: ALIGN_RATE
+                crossSeriesReducer: REDUCE_SUM
+                groupByFields:
+                  - metric.label.change_type
+      alertStrategy:
+        autoClose: 1800s  # Auto-close after 30 minutes
+      combiner: OR
+      enabled: true
+      severity: WARNING
+    metadata:
+      dependsOn:
+        - enable_monitoring_api
+
+  # Cloud Monitoring Dashboard
+  # Operational visibility dashboard for infrastructure changes
+  - name: monitoring_dashboard
+    type: gcp-types/monitoring-v1:projects.dashboards
+    properties:
+      name: projects/$(var.project_id)/dashboards/infrastructure-monitoring-$(var.environment)-$(var.resource_suffix)
+      displayName: "Infrastructure Change Monitoring - $(var.environment)"
+      mosaicLayout:
+        tiles:
+          - width: 6
+            height: 4
+            widget:
+              title: "Infrastructure Changes by Type"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="global" AND metric.type="custom.googleapis.com/infrastructure/changes"'
+                        aggregation:
+                          alignmentPeriod: 300s
+                          perSeriesAligner: ALIGN_RATE
+                          crossSeriesReducer: REDUCE_SUM
+                          groupByFields:
+                            - metric.label.change_type
+                plotType: LINE
+                timeshiftDuration: 0s
+          - width: 6
+            height: 4
+            xPos: 6
+            widget:
+              title: "Asset Changes by Asset Type"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="global" AND metric.type="custom.googleapis.com/infrastructure/changes"'
+                        aggregation:
+                          alignmentPeriod: 300s
+                          perSeriesAligner: ALIGN_RATE
+                          crossSeriesReducer: REDUCE_SUM
+                          groupByFields:
+                            - metric.label.asset_type
+                plotType: STACKED_AREA
+                timeshiftDuration: 0s
+          - width: 12
+            height: 4
+            yPos: 4
+            widget:
+              title: "Function Execution Metrics"
+              xyChart:
+                dataSets:
+                  - timeSeriesQuery:
+                      timeSeriesFilter:
+                        filter: 'resource.type="cloud_function" AND resource.label.function_name="$(ref.cloud_function.name)"'
+                        aggregation:
+                          alignmentPeriod: 60s
+                          perSeriesAligner: ALIGN_RATE
+                          crossSeriesReducer: REDUCE_SUM
+                plotType: LINE
+                timeshiftDuration: 0s
+    metadata:
+      dependsOn:
+        - enable_monitoring_api
+        - cloud_function
+
+  # IAM Policy for Asset Feed Service Account
+  # Grants the Asset Inventory service permission to publish to Pub/Sub
+  - name: asset_feed_pubsub_permissions
+    type: gcp-types/cloudresourcemanager-v1:projects.iamPolicyBinding
+    properties:
+      resource: $(var.project_id)
+      role: roles/pubsub.publisher
+      members:
+        - serviceAccount:service-$(var.project_id)@gcp-sa-cloudasset.iam.gserviceaccount.com
+    metadata:
+      dependsOn:
+        - pubsub_topic
+
+# Template validation and constraints
+constraints:
+  # Ensure project ID is valid
+  - name: project_id_format
+    constraint: |
+      variables.project_id matches "^[a-z][a-z0-9-]{4,28}[a-z0-9]$"
+    message: "Project ID must be 6-30 characters, start with a letter, and contain only lowercase letters, numbers, and hyphens"
+  
+  # Ensure resource suffix is appropriate
+  - name: resource_suffix_format
+    constraint: |
+      variables.resource_suffix matches "^[a-z0-9]{3,10}$"
+    message: "Resource suffix must be 3-10 characters containing only lowercase letters and numbers"
+  
+  # Validate environment values
+  - name: valid_environment
+    constraint: |
+      variables.environment in ["dev", "staging", "prod"]
+    message: "Environment must be one of: dev, staging, prod"
+
+# Template documentation
+documentation:
+  description: |
+    This Infrastructure Manager template creates a comprehensive infrastructure change monitoring
+    system using Google Cloud services. The solution provides real-time visibility into
+    infrastructure modifications for security, compliance, and operational purposes.
+    
+    ## Components Created:
+    
+    - **Cloud Asset Inventory Feed**: Monitors all resource types for changes
+    - **Pub/Sub Topic & Subscription**: Reliable event delivery with dead letter queue
+    - **Cloud Function**: Processes asset changes and creates audit records
+    - **BigQuery Dataset & Table**: Stores structured audit trail for analysis
+    - **Cloud Monitoring**: Alert policies and dashboard for operational visibility
+    - **IAM Configuration**: Service accounts and permissions following least privilege
+    
+    ## Features:
+    
+    - Real-time infrastructure change detection
+    - Comprehensive audit trail for compliance
+    - Automated alerting for unusual change patterns
+    - Operational dashboard for monitoring
+    - Dead letter queue for reliable event processing
+    - Partitioned BigQuery table for efficient querying
+    
+    ## Post-Deployment Steps:
+    
+    1. Upload the Cloud Function source code to the created storage bucket
+    2. Update the Cloud Function with the actual source code
+    3. Configure notification channels for alert policies
+    4. Customize BigQuery queries for specific compliance requirements
+    
+  examples:
+    - title: "Deploy for Development Environment"
+      description: "Deploy monitoring system for development environment"
+      config: |
+        variables:
+          project_id: "my-dev-project"
+          environment: "dev"
+          region: "us-central1"
+          resource_suffix: "001"
+    
+    - title: "Deploy for Production Environment"
+      description: "Deploy monitoring system for production with enhanced alerting"
+      config: |
+        variables:
+          project_id: "my-prod-project"
+          environment: "prod"
+          region: "us-central1"
+          resource_suffix: "prod"
+          alert_threshold: 5.0
+          function_memory: 512

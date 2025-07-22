@@ -1,0 +1,1277 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  DRM-Protected Video Content Streaming Infrastructure with AWS Elemental MediaPackage,
+  MediaLive, and multi-DRM support (Widevine, PlayReady, FairPlay). This template creates
+  a complete content protection solution with SPEKE API integration, geographic restrictions,
+  and CloudFront distribution for global content delivery.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - Environment
+          - ProjectName
+          - ContentOwner
+      - Label:
+          default: "DRM Configuration"
+        Parameters:
+          - EnableMultiDRM
+          - KeyRotationIntervalSeconds
+          - LicenseDurationSeconds
+          - EnableGeographicRestrictions
+      - Label:
+          default: "MediaLive Configuration"
+        Parameters:
+          - InputType
+          - VideoResolution
+          - MaxBitrate
+          - EnableRedundancy
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - AllowedSourceCIDR
+          - EnableHTTPSOnly
+          - KMSKeyDeletionPolicy
+      - Label:
+          default: "Content Delivery Configuration"
+        Parameters:
+          - PriceClass
+          - EnableLogging
+          - DefaultTTL
+    ParameterLabels:
+      Environment:
+        default: "Deployment Environment"
+      ProjectName:
+        default: "Project Name"
+      ContentOwner:
+        default: "Content Owner/Brand"
+      EnableMultiDRM:
+        default: "Enable Multi-DRM Support"
+      KeyRotationIntervalSeconds:
+        default: "Key Rotation Interval (seconds)"
+      LicenseDurationSeconds:
+        default: "License Duration (seconds)"
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: Deployment environment for resource tagging and configuration
+
+  ProjectName:
+    Type: String
+    Default: drm-protected-streaming
+    Description: Project name used for resource naming and tagging
+    AllowedPattern: ^[a-z0-9-]+$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+
+  ContentOwner:
+    Type: String
+    Default: media-company
+    Description: Content owner identifier for DRM licensing
+    AllowedPattern: ^[a-z0-9-]+$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+
+  EnableMultiDRM:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable support for multiple DRM systems (Widevine, PlayReady, FairPlay)
+
+  KeyRotationIntervalSeconds:
+    Type: Number
+    Default: 3600
+    MinValue: 300
+    MaxValue: 86400
+    Description: Interval for DRM key rotation in seconds (5 minutes to 24 hours)
+
+  LicenseDurationSeconds:
+    Type: Number
+    Default: 86400
+    MinValue: 3600
+    MaxValue: 604800
+    Description: DRM license duration in seconds (1 hour to 7 days)
+
+  EnableGeographicRestrictions:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable geographic content restrictions via CloudFront
+
+  InputType:
+    Type: String
+    Default: RTMP_PUSH
+    AllowedValues:
+      - RTMP_PUSH
+      - RTMP_PULL
+      - RTP_PUSH
+      - UDP_PUSH
+    Description: MediaLive input type for content ingestion
+
+  VideoResolution:
+    Type: String
+    Default: HD
+    AllowedValues:
+      - SD
+      - HD
+      - UHD
+    Description: Maximum video resolution for MediaLive input specification
+
+  MaxBitrate:
+    Type: String
+    Default: MAX_20_MBPS
+    AllowedValues:
+      - MAX_10_MBPS
+      - MAX_20_MBPS
+      - MAX_50_MBPS
+    Description: Maximum bitrate for MediaLive input specification
+
+  EnableRedundancy:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable redundant MediaLive inputs for high availability
+
+  AllowedSourceCIDR:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR block allowed to access MediaLive inputs
+    AllowedPattern: ^([0-9]{1,3}\.){3}[0-9]{1,3}\/[0-9]{1,2}$
+    ConstraintDescription: Must be a valid CIDR notation (e.g., 0.0.0.0/0)
+
+  EnableHTTPSOnly:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enforce HTTPS-only content delivery via CloudFront
+
+  KMSKeyDeletionPolicy:
+    Type: String
+    Default: Delete
+    AllowedValues:
+      - Delete
+      - Retain
+    Description: CloudFormation deletion policy for KMS encryption key
+
+  PriceClass:
+    Type: String
+    Default: PriceClass_All
+    AllowedValues:
+      - PriceClass_100
+      - PriceClass_200
+      - PriceClass_All
+    Description: CloudFront price class for global distribution
+
+  EnableLogging:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable CloudFront access logging
+
+  DefaultTTL:
+    Type: Number
+    Default: 5
+    MinValue: 0
+    MaxValue: 31536000
+    Description: Default TTL for CloudFront caching in seconds
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, production]
+  EnableMultiDRMCondition: !Equals [!Ref EnableMultiDRM, 'true']
+  EnableGeoRestrictionsCondition: !Equals [!Ref EnableGeographicRestrictions, 'true']
+  EnableRedundancyCondition: !Equals [!Ref EnableRedundancy, 'true']
+  EnableHTTPSOnlyCondition: !Equals [!Ref EnableHTTPSOnly, 'true']
+  EnableLoggingCondition: !Equals [!Ref EnableLogging, 'true']
+  RetainKMSKey: !Equals [!Ref KMSKeyDeletionPolicy, Retain]
+
+Resources:
+  # ================================================================
+  # KMS ENCRYPTION KEY FOR DRM CONTENT PROTECTION
+  # ================================================================
+  DRMEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'DRM content encryption key for ${ProjectName}-${Environment}'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow MediaLive Service
+            Effect: Allow
+            Principal:
+              Service: medialive.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: '*'
+          - Sid: Allow MediaPackage Service
+            Effect: Allow
+            Principal:
+              Service: mediapackage.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: '*'
+          - Sid: Allow Lambda SPEKE Function
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt SPEKELambdaRole.Arn
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: '*'
+      KeyUsage: ENCRYPT_DECRYPT
+      KeySpec: SYMMETRIC_DEFAULT
+      EnableKeyRotation: true
+      MultiRegion: false
+      DeletionPolicy: !If [RetainKMSKey, Retain, Delete]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-drm-key'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DRM-Content-Encryption
+
+  DRMEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-${Environment}-drm-content'
+      TargetKeyId: !Ref DRMEncryptionKey
+
+  # ================================================================
+  # SECRETS MANAGER FOR DRM CONFIGURATION
+  # ================================================================
+  DRMConfigurationSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-drm-config'
+      Description: DRM configuration parameters and provider settings
+      SecretString: !Sub |
+        {
+          "widevine_provider": "speke-reference",
+          "playready_provider": "speke-reference",
+          "fairplay_provider": "speke-reference",
+          "content_id_template": "urn:uuid:",
+          "key_rotation_interval_seconds": ${KeyRotationIntervalSeconds},
+          "license_duration_seconds": ${LicenseDurationSeconds},
+          "content_owner": "${ContentOwner}",
+          "environment": "${Environment}"
+        }
+      KmsKeyId: !Ref DRMEncryptionKey
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-drm-config'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DRM-Configuration
+
+  # ================================================================
+  # IAM ROLES AND POLICIES
+  # ================================================================
+  SPEKELambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-speke-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DRMSecretsAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Ref DRMConfigurationSecret
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !GetAtt DRMEncryptionKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-speke-lambda-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  MediaLiveDRMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-medialive-drm-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: medialive.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: MediaPackageAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - mediapackage:*
+                Resource: '*'
+        - PolicyName: DRMSecretsAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Ref DRMConfigurationSecret
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !GetAtt DRMEncryptionKey.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-medialive-drm-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================================================
+  # LAMBDA FUNCTION FOR SPEKE KEY PROVIDER
+  # ================================================================
+  SPEKEKeyProviderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-speke-provider'
+      Description: SPEKE API key provider for multi-DRM content protection
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt SPEKELambdaRole.Arn
+      Environment:
+        Variables:
+          DRM_SECRET_ARN: !Ref DRMConfigurationSecret
+          KEY_ROTATION_INTERVAL: !Ref KeyRotationIntervalSeconds
+          LICENSE_DURATION: !Ref LicenseDurationSeconds
+          CONTENT_OWNER: !Ref ContentOwner
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import base64
+          import uuid
+          import os
+          from datetime import datetime, timedelta
+          import logging
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              """
+              SPEKE API key provider for multi-DRM content protection.
+              Generates encryption keys for Widevine, PlayReady, and FairPlay DRM systems.
+              """
+              try:
+                  logger.info(f"SPEKE request received: {json.dumps(event, indent=2)}")
+                  
+                  # Parse SPEKE request
+                  if 'body' in event:
+                      body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
+                  else:
+                      body = event
+                  
+                  # Extract content ID and DRM systems
+                  content_id = body.get('content_id', str(uuid.uuid4()))
+                  drm_systems = body.get('drm_systems', [])
+                  
+                  logger.info(f"Processing content_id: {content_id}, DRM systems: {len(drm_systems)}")
+                  
+                  # Initialize response
+                  response = {
+                      "content_id": content_id,
+                      "drm_systems": []
+                  }
+                  
+                  # Load DRM configuration from Secrets Manager
+                  drm_config = get_drm_configuration()
+                  
+                  # Generate keys for each requested DRM system
+                  for drm_system in drm_systems:
+                      system_id = drm_system.get('system_id')
+                      
+                      if system_id == 'edef8ba9-79d6-4ace-a3c8-27dcd51d21ed':  # Widevine
+                          drm_response = generate_widevine_keys(content_id, drm_config)
+                      elif system_id == '9a04f079-9840-4286-ab92-e65be0885f95':  # PlayReady  
+                          drm_response = generate_playready_keys(content_id, drm_config)
+                      elif system_id == '94ce86fb-07ff-4f43-adb8-93d2fa968ca2':  # FairPlay
+                          drm_response = generate_fairplay_keys(content_id, drm_config)
+                      else:
+                          logger.warning(f"Unsupported DRM system: {system_id}")
+                          continue
+                      
+                      response['drm_systems'].append(drm_response)
+                      logger.info(f"Generated keys for DRM system: {system_id}")
+                  
+                  logger.info(f"SPEKE response: {len(response['drm_systems'])} DRM systems processed")
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps(response)
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"SPEKE error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json'
+                      },
+                      'body': json.dumps({
+                          'error': 'Internal server error',
+                          'message': str(e)
+                      })
+                  }
+
+          def get_drm_configuration():
+              """Retrieve DRM configuration from AWS Secrets Manager."""
+              try:
+                  secrets_client = boto3.client('secretsmanager')
+                  secret_arn = os.environ['DRM_SECRET_ARN']
+                  
+                  response = secrets_client.get_secret_value(SecretId=secret_arn)
+                  return json.loads(response['SecretString'])
+              except Exception as e:
+                  logger.error(f"Failed to retrieve DRM configuration: {str(e)}")
+                  return {}
+
+          def generate_widevine_keys(content_id, config):
+              """Generate Widevine DRM keys and configuration."""
+              # Generate 16-byte content key and key ID
+              content_key = os.urandom(16)
+              key_id = os.urandom(16)
+              
+              return {
+                  "system_id": "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed",
+                  "key_id": base64.b64encode(key_id).decode('utf-8'),
+                  "content_key": base64.b64encode(content_key).decode('utf-8'),
+                  "url": f"https://proxy.uat.widevine.com/proxy?provider=widevine_test",
+                  "pssh": generate_widevine_pssh(key_id, content_id, config)
+              }
+
+          def generate_playready_keys(content_id, config):
+              """Generate PlayReady DRM keys and configuration."""
+              content_key = os.urandom(16)
+              key_id = os.urandom(16)
+              
+              return {
+                  "system_id": "9a04f079-9840-4286-ab92-e65be0885f95", 
+                  "key_id": base64.b64encode(key_id).decode('utf-8'),
+                  "content_key": base64.b64encode(content_key).decode('utf-8'),
+                  "url": f"https://playready-license.test.com/rightsmanager.asmx",
+                  "pssh": generate_playready_pssh(key_id, content_key, config)
+              }
+
+          def generate_fairplay_keys(content_id, config):
+              """Generate FairPlay DRM keys and configuration."""
+              content_key = os.urandom(16) 
+              key_id = os.urandom(16)
+              iv = os.urandom(16)
+              
+              return {
+                  "system_id": "94ce86fb-07ff-4f43-adb8-93d2fa968ca2",
+                  "key_id": base64.b64encode(key_id).decode('utf-8'),
+                  "content_key": base64.b64encode(content_key).decode('utf-8'),
+                  "url": f"skd://fairplay-license.test.com/license",
+                  "certificate_url": f"https://fairplay-license.test.com/cert",
+                  "iv": base64.b64encode(iv).decode('utf-8')
+              }
+
+          def generate_widevine_pssh(key_id, content_id, config):
+              """Generate Widevine PSSH (Protection System Specific Header)."""
+              pssh_data = {
+                  "key_ids": [base64.b64encode(key_id).decode('utf-8')],
+                  "provider": config.get('widevine_provider', 'widevine_test'),
+                  "content_id": base64.b64encode(key_id).decode('utf-8'),
+                  "policy": "default"
+              }
+              return base64.b64encode(json.dumps(pssh_data).encode()).decode('utf-8')
+
+          def generate_playready_pssh(key_id, content_key, config):
+              """Generate PlayReady PSSH (Protection System Specific Header)."""
+              pssh_data = f"""
+              <WRMHEADER xmlns="http://schemas.microsoft.com/DRM/2007/03/PlayReadyHeader" version="4.0.0.0">
+                  <DATA>
+                      <PROTECTINFO>
+                          <KEYLEN>16</KEYLEN>
+                          <ALGID>AESCTR</ALGID>
+                      </PROTECTINFO>
+                      <KID>{base64.b64encode(key_id).decode('utf-8')}</KID>
+                      <CHECKSUM></CHECKSUM>
+                      <LA_URL>https://playready-license.test.com/rightsmanager.asmx</LA_URL>
+                  </DATA>
+              </WRMHEADER>
+              """
+              return base64.b64encode(pssh_data.strip().encode()).decode('utf-8')
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-speke-provider'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DRM-Key-Provider
+
+  SPEKEFunctionURL:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt SPEKEKeyProviderFunction.Arn
+      AuthType: NONE
+      Cors:
+        AllowCredentials: false
+        AllowHeaders:
+          - content-type
+          - authorization
+        AllowMethods:
+          - POST
+          - OPTIONS
+        AllowOrigins:
+          - '*'
+
+  SPEKEFunctionURLInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunctionUrl
+      FunctionName: !Ref SPEKEKeyProviderFunction
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+
+  # ================================================================
+  # MEDIALIVE INPUT SECURITY GROUP
+  # ================================================================
+  MediaLiveInputSecurityGroup:
+    Type: AWS::MediaLive::InputSecurityGroup
+    Properties:
+      WhitelistRules:
+        - Cidr: !Ref AllowedSourceCIDR
+      Tags:
+        Name: !Sub '${ProjectName}-${Environment}-input-security-group'
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  # ================================================================
+  # MEDIALIVE INPUT
+  # ================================================================
+  MediaLiveInput:
+    Type: AWS::MediaLive::Input
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-drm-input'
+      Type: !Ref InputType
+      InputSecurityGroups:
+        - !Ref MediaLiveInputSecurityGroup
+      Destinations: !If
+        - EnableRedundancyCondition
+        - - StreamName: !Sub '${ProjectName}-primary'
+          - StreamName: !Sub '${ProjectName}-backup'
+        - - StreamName: !Sub '${ProjectName}-live'
+      Tags:
+        Name: !Sub '${ProjectName}-${Environment}-drm-input'
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        Type: DRM-Protected-Input
+
+  # ================================================================
+  # MEDIAPACKAGE CHANNEL
+  # ================================================================
+  MediaPackageChannel:
+    Type: AWS::MediaPackage::Channel
+    Properties:
+      Id: !Sub '${ProjectName}-${Environment}-drm-channel'
+      Description: DRM-protected streaming channel with multi-DRM support
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-drm-channel'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DRM-Protected-Streaming
+
+  # ================================================================
+  # MEDIAPACKAGE ORIGIN ENDPOINTS WITH DRM
+  # ================================================================
+  MediaPackageHLSEndpoint:
+    Type: AWS::MediaPackage::OriginEndpoint
+    Properties:
+      Id: !Sub '${ProjectName}-${Environment}-hls-drm'
+      ChannelId: !Ref MediaPackageChannel
+      ManifestName: index.m3u8
+      Description: HLS endpoint with multi-DRM protection (FairPlay, Widevine)
+      HlsPackage:
+        SegmentDurationSeconds: 6
+        PlaylistType: EVENT
+        PlaylistWindowSeconds: 300
+        ProgramDateTimeIntervalSeconds: 60
+        AdMarkers: SCTE35_ENHANCED
+        IncludeIframeOnlyStream: false
+        UseAudioRenditionGroup: true
+        Encryption: !If
+          - EnableMultiDRMCondition
+          - SpekeKeyProvider:
+              Url: !GetAtt SPEKEFunctionURL.FunctionUrl
+              ResourceId: !Sub '${ProjectName}-${Environment}-hls'
+              SystemIds:
+                - edef8ba9-79d6-4ace-a3c8-27dcd51d21ed  # Widevine
+                - 9a04f079-9840-4286-ab92-e65be0885f95  # PlayReady
+                - 94ce86fb-07ff-4f43-adb8-93d2fa968ca2  # FairPlay
+            KeyRotationIntervalSeconds: !Ref KeyRotationIntervalSeconds
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-hls-drm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Type
+          Value: HLS-MultiDRM
+
+  MediaPackageDASHEndpoint:
+    Type: AWS::MediaPackage::OriginEndpoint
+    Properties:
+      Id: !Sub '${ProjectName}-${Environment}-dash-drm'
+      ChannelId: !Ref MediaPackageChannel
+      ManifestName: index.mpd
+      Description: DASH endpoint with multi-DRM protection (Widevine, PlayReady)
+      DashPackage:
+        SegmentDurationSeconds: 6
+        MinBufferTimeSeconds: 30
+        MinUpdatePeriodSeconds: 15
+        SuggestedPresentationDelaySeconds: 30
+        Profile: NONE
+        PeriodTriggers:
+          - ADS
+        Encryption: !If
+          - EnableMultiDRMCondition
+          - SpekeKeyProvider:
+              Url: !GetAtt SPEKEFunctionURL.FunctionUrl
+              ResourceId: !Sub '${ProjectName}-${Environment}-dash'
+              SystemIds:
+                - edef8ba9-79d6-4ace-a3c8-27dcd51d21ed  # Widevine
+                - 9a04f079-9840-4286-ab92-e65be0885f95  # PlayReady
+            KeyRotationIntervalSeconds: !Ref KeyRotationIntervalSeconds
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-dash-drm'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Type
+          Value: DASH-MultiDRM
+
+  # ================================================================
+  # MEDIALIVE CHANNEL
+  # ================================================================
+  MediaLiveChannel:
+    Type: AWS::MediaLive::Channel
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-drm-channel'
+      RoleArn: !GetAtt MediaLiveDRMRole.Arn
+      InputSpecification:
+        Codec: AVC
+        Resolution: !Ref VideoResolution
+        MaximumBitrate: !Ref MaxBitrate
+      InputAttachments:
+        - InputId: !Ref MediaLiveInput
+          InputAttachmentName: primary-input
+          InputSettings:
+            SourceEndBehavior: CONTINUE
+            InputFilter: AUTO
+            FilterStrength: 1
+            DeblockFilter: ENABLED
+            DenoiseFilter: ENABLED
+      Destinations:
+        - Id: mediapackage-drm-destination
+          MediaPackageSettings:
+            - ChannelId: !Ref MediaPackageChannel
+      EncoderSettings:
+        AudioDescriptions:
+          - Name: audio_aac
+            AudioSelectorName: default
+            AudioTypeControl: FOLLOW_INPUT
+            LanguageCodeControl: FOLLOW_INPUT
+            CodecSettings:
+              AacSettings:
+                Bitrate: 128000
+                CodingMode: CODING_MODE_2_0
+                SampleRate: 48000
+                Spec: MPEG4
+        VideoDescriptions:
+          - Name: video_1080p_drm
+            Width: 1920
+            Height: 1080
+            CodecSettings:
+              H264Settings:
+                Bitrate: 5000000
+                FramerateControl: SPECIFIED
+                FramerateNumerator: 30
+                FramerateDenominator: 1
+                GopBReference: ENABLED
+                GopClosedCadence: 1
+                GopNumBFrames: 3
+                GopSize: 90
+                GopSizeUnits: FRAMES
+                Profile: HIGH
+                Level: H264_LEVEL_4_1
+                RateControlMode: CBR
+                Syntax: DEFAULT
+                AdaptiveQuantization: HIGH
+                ColorMetadata: INSERT
+                EntropyEncoding: CABAC
+                FlickerAq: ENABLED
+                ForceFieldPictures: DISABLED
+                TemporalAq: ENABLED
+                SpatialAq: ENABLED
+            RespondToAfd: RESPOND
+            ScalingBehavior: DEFAULT
+            Sharpness: 50
+          - Name: video_720p_drm
+            Width: 1280
+            Height: 720
+            CodecSettings:
+              H264Settings:
+                Bitrate: 3000000
+                FramerateControl: SPECIFIED
+                FramerateNumerator: 30
+                FramerateDenominator: 1
+                GopBReference: ENABLED
+                GopClosedCadence: 1
+                GopNumBFrames: 3
+                GopSize: 90
+                GopSizeUnits: FRAMES
+                Profile: HIGH
+                Level: H264_LEVEL_3_1
+                RateControlMode: CBR
+                Syntax: DEFAULT
+                AdaptiveQuantization: HIGH
+                TemporalAq: ENABLED
+                SpatialAq: ENABLED
+            RespondToAfd: RESPOND
+            ScalingBehavior: DEFAULT
+            Sharpness: 50
+          - Name: video_480p_drm
+            Width: 854
+            Height: 480
+            CodecSettings:
+              H264Settings:
+                Bitrate: 1500000
+                FramerateControl: SPECIFIED
+                FramerateNumerator: 30
+                FramerateDenominator: 1
+                GopBReference: DISABLED
+                GopClosedCadence: 1
+                GopNumBFrames: 2
+                GopSize: 90
+                GopSizeUnits: FRAMES
+                Profile: MAIN
+                Level: H264_LEVEL_3_0
+                RateControlMode: CBR
+                Syntax: DEFAULT
+                AdaptiveQuantization: MEDIUM
+            RespondToAfd: RESPOND
+            ScalingBehavior: DEFAULT
+            Sharpness: 50
+        OutputGroups:
+          - Name: MediaPackage-DRM-ABR
+            OutputGroupSettings:
+              MediaPackageGroupSettings:
+                Destination:
+                  DestinationRefId: mediapackage-drm-destination
+            Outputs:
+              - OutputName: 1080p-protected
+                VideoDescriptionName: video_1080p_drm
+                AudioDescriptionNames:
+                  - audio_aac
+                OutputSettings:
+                  MediaPackageOutputSettings: {}
+              - OutputName: 720p-protected
+                VideoDescriptionName: video_720p_drm
+                AudioDescriptionNames:
+                  - audio_aac
+                OutputSettings:
+                  MediaPackageOutputSettings: {}
+              - OutputName: 480p-protected
+                VideoDescriptionName: video_480p_drm
+                AudioDescriptionNames:
+                  - audio_aac
+                OutputSettings:
+                  MediaPackageOutputSettings: {}
+        TimecodeConfig:
+          Source: EMBEDDED
+      Tags:
+        Name: !Sub '${ProjectName}-${Environment}-drm-channel'
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        Service: DRM-Protected-Streaming
+        Component: MediaLive
+
+  # ================================================================
+  # S3 BUCKET FOR TEST CONTENT AND LOGGING
+  # ================================================================
+  ContentTestBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-drm-test-content-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+              - HEAD
+            AllowedOrigins:
+              - '*'
+            MaxAge: 3600
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-test-content'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DRM-Test-Content
+
+  ContentTestBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ContentTestBucket
+      PolicyDocument:
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub '${ContentTestBucket}/*'
+
+  CloudFrontLoggingBucket:
+    Type: AWS::S3::Bucket
+    Condition: EnableLoggingCondition
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-cloudfront-logs-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-cloudfront-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: CloudFront-Access-Logs
+
+  # ================================================================
+  # CLOUDFRONT DISTRIBUTION FOR DRM CONTENT DELIVERY
+  # ================================================================
+  DRMCloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub 'DRM-protected content distribution for ${ProjectName}-${Environment}'
+        Enabled: true
+        HttpVersion: http2
+        IPV6Enabled: true
+        PriceClass: !Ref PriceClass
+        DefaultCacheBehavior:
+          TargetOriginId: MediaPackage-HLS-DRM
+          ViewerProtocolPolicy: !If [EnableHTTPSOnlyCondition, 'https-only', 'allow-all']
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # Managed-CachingOptimized
+          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf  # Managed-CORS-S3Origin
+          Compress: false
+          AllowedMethods:
+            - DELETE
+            - GET
+            - HEAD
+            - OPTIONS
+            - PATCH
+            - POST
+            - PUT
+          CachedMethods:
+            - GET
+            - HEAD
+          TrustedSigners:
+            - self
+          MinTTL: 0
+          DefaultTTL: !Ref DefaultTTL
+          MaxTTL: 86400
+        Origins:
+          - Id: MediaPackage-HLS-DRM
+            DomainName: !Select [2, !Split ['/', !GetAtt MediaPackageHLSEndpoint.Url]]
+            OriginPath: !Sub 
+              - '/${Path}'
+              - Path: !Select [3, !Split ['/', !GetAtt MediaPackageHLSEndpoint.Url]]
+            CustomOriginConfig:
+              HTTPPort: 443
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+            OriginCustomHeaders:
+              - HeaderName: X-MediaPackage-CDNIdentifier
+                HeaderValue: !Sub '${ProjectName}-${Environment}-drm-protected'
+          - Id: MediaPackage-DASH-DRM
+            DomainName: !Select [2, !Split ['/', !GetAtt MediaPackageDASHEndpoint.Url]]
+            OriginPath: !Sub 
+              - '/${Path}'
+              - Path: !Select [3, !Split ['/', !GetAtt MediaPackageDASHEndpoint.Url]]
+            CustomOriginConfig:
+              HTTPPort: 443
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+            OriginCustomHeaders:
+              - HeaderName: X-MediaPackage-CDNIdentifier
+                HeaderValue: !Sub '${ProjectName}-${Environment}-drm-protected'
+        CacheBehaviors:
+          - PathPattern: '*.mpd'
+            TargetOriginId: MediaPackage-DASH-DRM
+            ViewerProtocolPolicy: !If [EnableHTTPSOnlyCondition, 'https-only', 'allow-all']
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf
+            Compress: false
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            MinTTL: 0
+            DefaultTTL: 5
+            MaxTTL: 60
+          - PathPattern: '*/license/*'
+            TargetOriginId: MediaPackage-HLS-DRM
+            ViewerProtocolPolicy: !If [EnableHTTPSOnlyCondition, 'https-only', 'allow-all']
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf
+            Compress: false
+            AllowedMethods:
+              - DELETE
+              - GET
+              - HEAD
+              - OPTIONS
+              - PATCH
+              - POST
+              - PUT
+            CachedMethods:
+              - GET
+              - HEAD
+            MinTTL: 0
+            DefaultTTL: 0
+            MaxTTL: 0
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          MinimumProtocolVersion: TLSv1.2_2021
+        Restrictions: !If
+          - EnableGeoRestrictionsCondition
+          - GeoRestriction:
+              RestrictionType: blacklist
+              Locations:
+                - CN
+                - RU
+          - !Ref AWS::NoValue
+        Logging: !If
+          - EnableLoggingCondition
+          - Bucket: !GetAtt CloudFrontLoggingBucket.DomainName
+            IncludeCookies: false
+            Prefix: !Sub '${ProjectName}-${Environment}-'
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-drm-distribution'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DRM-Content-Delivery
+
+  # ================================================================
+  # CLOUDWATCH DASHBOARD FOR MONITORING
+  # ================================================================
+  DRMMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: IsProduction
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}-DRM-Monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${SPEKEKeyProviderFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "SPEKE Lambda Function Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/MediaLive", "InputVideoFrameRate", "ChannelId", "${MediaLiveChannel}", "Pipeline", "0" ],
+                  [ ".", "OutputVideoBitrate", ".", ".", ".", ".", "OutputGroup", "MediaPackage-DRM-ABR" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "MediaLive Channel Health",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/CloudFront", "Requests", "DistributionId", "${DRMCloudFrontDistribution}" ],
+                  [ ".", "BytesDownloaded", ".", "." ],
+                  [ ".", "4xxErrorRate", ".", "." ],
+                  [ ".", "5xxErrorRate", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "us-east-1",
+                "title": "CloudFront Distribution Metrics",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+# ================================================================
+# OUTPUTS
+# ================================================================
+Outputs:
+  # DRM Infrastructure
+  KMSKeyId:
+    Description: KMS key ID for DRM content encryption
+    Value: !Ref DRMEncryptionKey
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyId'
+
+  KMSKeyAlias:
+    Description: KMS key alias for DRM content encryption
+    Value: !Ref DRMEncryptionKeyAlias
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyAlias'
+
+  DRMSecretArn:
+    Description: ARN of the DRM configuration secret
+    Value: !Ref DRMConfigurationSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-DRMSecretArn'
+
+  SPEKEEndpointURL:
+    Description: SPEKE API endpoint URL for DRM key management
+    Value: !GetAtt SPEKEFunctionURL.FunctionUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-SPEKEEndpointURL'
+
+  # MediaLive Resources
+  MediaLiveChannelId:
+    Description: MediaLive channel ID for DRM-protected streaming
+    Value: !Ref MediaLiveChannel
+    Export:
+      Name: !Sub '${AWS::StackName}-MediaLiveChannelId'
+
+  MediaLiveInputId:
+    Description: MediaLive input ID for content ingestion
+    Value: !Ref MediaLiveInput
+    Export:
+      Name: !Sub '${AWS::StackName}-MediaLiveInputId'
+
+  MediaLiveInputEndpoints:
+    Description: MediaLive input endpoints (RTMP URLs)
+    Value: !Sub 
+      - 'Primary: ${Primary}, Backup: ${Backup}'
+      - Primary: !Select [0, !GetAtt MediaLiveInput.Destinations]
+        Backup: !Select [1, !GetAtt MediaLiveInput.Destinations]
+    Export:
+      Name: !Sub '${AWS::StackName}-MediaLiveInputEndpoints'
+
+  # MediaPackage Resources
+  MediaPackageChannelId:
+    Description: MediaPackage channel ID for DRM content packaging
+    Value: !Ref MediaPackageChannel
+    Export:
+      Name: !Sub '${AWS::StackName}-MediaPackageChannelId'
+
+  HLSDRMEndpointURL:
+    Description: HLS endpoint URL with DRM protection
+    Value: !GetAtt MediaPackageHLSEndpoint.Url
+    Export:
+      Name: !Sub '${AWS::StackName}-HLSDRMEndpointURL'
+
+  DASHDRMEndpointURL:
+    Description: DASH endpoint URL with DRM protection
+    Value: !GetAtt MediaPackageDASHEndpoint.Url
+    Export:
+      Name: !Sub '${AWS::StackName}-DASHDRMEndpointURL'
+
+  # CloudFront Distribution
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID for DRM content delivery
+    Value: !Ref DRMCloudFrontDistribution
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFrontDistributionId'
+
+  CloudFrontDistributionDomain:
+    Description: CloudFront distribution domain name
+    Value: !GetAtt DRMCloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFrontDistributionDomain'
+
+  # Protected Content URLs
+  HLSProtectedURL:
+    Description: HLS protected streaming URL via CloudFront
+    Value: !Sub 'https://${DRMCloudFrontDistribution.DomainName}/out/v1/index.m3u8'
+    Export:
+      Name: !Sub '${AWS::StackName}-HLSProtectedURL'
+
+  DASHProtectedURL:
+    Description: DASH protected streaming URL via CloudFront
+    Value: !Sub 'https://${DRMCloudFrontDistribution.DomainName}/out/v1/index.mpd'
+    Export:
+      Name: !Sub '${AWS::StackName}-DASHProtectedURL'
+
+  # Test Resources
+  TestContentBucket:
+    Description: S3 bucket for test content and DRM player
+    Value: !Ref ContentTestBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-TestContentBucket'
+
+  DRMTestPlayerURL:
+    Description: DRM test player web interface URL
+    Value: !Sub 'http://${ContentTestBucket}.s3-website.${AWS::Region}.amazonaws.com/drm-player.html'
+    Export:
+      Name: !Sub '${AWS::StackName}-DRMTestPlayerURL'
+
+  # Monitoring
+  MonitoringDashboard:
+    Condition: IsProduction
+    Description: CloudWatch dashboard for DRM infrastructure monitoring
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-DRM-Monitoring'
+    Export:
+      Name: !Sub '${AWS::StackName}-MonitoringDashboard'
+
+  # Security Configuration
+  GeographicRestrictions:
+    Condition: EnableGeoRestrictionsCondition
+    Description: Geographic restrictions enabled for content protection
+    Value: 'Blocked countries: China (CN), Russia (RU)'
+    Export:
+      Name: !Sub '${AWS::StackName}-GeographicRestrictions'
+
+  SecurityFeatures:
+    Description: DRM security features enabled
+    Value: !Sub 
+      - 'Multi-DRM: ${MultiDRM}, HTTPS-Only: ${HTTPSOnly}, Key Rotation: ${KeyRotation}s, Geo-Restrictions: ${GeoRestrictions}'
+      - MultiDRM: !If [EnableMultiDRMCondition, 'Enabled (Widevine, PlayReady, FairPlay)', 'Disabled']
+        HTTPSOnly: !If [EnableHTTPSOnlyCondition, 'Enabled', 'Disabled']
+        KeyRotation: !Ref KeyRotationIntervalSeconds
+        GeoRestrictions: !If [EnableGeoRestrictionsCondition, 'Enabled', 'Disabled']
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityFeatures'

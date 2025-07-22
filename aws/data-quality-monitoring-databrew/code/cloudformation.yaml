@@ -1,0 +1,858 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for AWS Glue DataBrew Data Quality Monitoring - Creates DataBrew datasets, profile jobs, quality rulesets, and monitoring infrastructure'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "General Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Data Configuration"
+        Parameters:
+          - DataBucketName
+          - DataKeyPrefix
+          - DataFormat
+          - ResultsKeyPrefix
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - NotificationEmail
+          - EnableEventBridge
+          - EnableDetailedMonitoring
+      - Label:
+          default: "Data Quality Rules"
+        Parameters:
+          - CompletenessThreshold
+          - EmailValidationThreshold
+          - MinAge
+          - MaxAge
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      DataBucketName:
+        default: "Data Bucket Name"
+      DataKeyPrefix:
+        default: "Data Key Prefix"
+      DataFormat:
+        default: "Data Format"
+      NotificationEmail:
+        default: "Notification Email"
+      EnableEventBridge:
+        default: "Enable EventBridge Integration"
+      EnableDetailedMonitoring:
+        default: "Enable Detailed Monitoring"
+      CompletenessThreshold:
+        default: "Completeness Threshold"
+      EmailValidationThreshold:
+        default: "Email Validation Threshold"
+      MinAge:
+        default: "Minimum Age"
+      MaxAge:
+        default: "Maximum Age"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Name of the project (used for resource naming)
+    Default: 'databrew-quality-monitoring'
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters and hyphens
+
+  Environment:
+    Type: String
+    Description: Environment name (dev, staging, prod)
+    Default: 'dev'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  DataBucketName:
+    Type: String
+    Description: Name of the S3 bucket containing source data (must already exist)
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: Must be a valid S3 bucket name
+
+  DataKeyPrefix:
+    Type: String
+    Description: S3 key prefix for source data files
+    Default: 'raw-data/'
+    MinLength: 1
+    MaxLength: 100
+
+  DataFormat:
+    Type: String
+    Description: Format of the source data files
+    Default: 'CSV'
+    AllowedValues:
+      - CSV
+      - JSON
+      - PARQUET
+      - EXCEL
+      - ORC
+
+  ResultsKeyPrefix:
+    Type: String
+    Description: S3 key prefix for DataBrew results
+    Default: 'profile-results/'
+    MinLength: 1
+    MaxLength: 100
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for data quality notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+
+  EnableEventBridge:
+    Type: String
+    Description: Enable EventBridge integration for automated monitoring
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableDetailedMonitoring:
+    Type: String
+    Description: Enable detailed CloudWatch monitoring
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  CompletenessThreshold:
+    Type: Number
+    Description: Minimum completeness threshold for data quality validation (0.0 to 1.0)
+    Default: 0.95
+    MinValue: 0.0
+    MaxValue: 1.0
+
+  EmailValidationThreshold:
+    Type: Number
+    Description: Minimum email validation threshold (0.0 to 1.0)
+    Default: 0.8
+    MinValue: 0.0
+    MaxValue: 1.0
+
+  MinAge:
+    Type: Number
+    Description: Minimum valid age for data quality validation
+    Default: 0
+    MinValue: 0
+    MaxValue: 200
+
+  MaxAge:
+    Type: Number
+    Description: Maximum valid age for data quality validation
+    Default: 120
+    MinValue: 0
+    MaxValue: 200
+
+Conditions:
+  IsEventBridgeEnabled: !Equals [!Ref EnableEventBridge, 'true']
+  IsDetailedMonitoringEnabled: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  IsProductionEnvironment: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # S3 Bucket for DataBrew Results
+  DataBrewResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-databrew-results-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldResults
+            Status: Enabled
+            ExpirationInDays: !If [IsProductionEnvironment, 90, 30]
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref DataBrewResultsLogGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: DataBrew
+        - Key: Purpose
+          Value: DataQualityMonitoring
+
+  # CloudWatch Log Group for DataBrew Results
+  DataBrewResultsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-${Environment}-databrew-results'
+      RetentionInDays: !If [IsProductionEnvironment, 90, 30]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for DataBrew Service
+  DataBrewServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-DataBrewServiceRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: databrew.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueDataBrewServiceRole
+      Policies:
+        - PolicyName: DataBrewS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Source data access
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${DataBucketName}'
+                  - !Sub 'arn:aws:s3:::${DataBucketName}/${DataKeyPrefix}*'
+              # Results bucket access
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DataBrewResultsBucket.Arn
+                  - !Sub '${DataBrewResultsBucket.Arn}/*'
+              # CloudWatch Logs access
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/databrew/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: DataBrew
+
+  # SNS Topic for Data Quality Alerts
+  DataQualityAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-data-quality-alerts'
+      DisplayName: 'Data Quality Monitoring Alerts'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: DataBrew
+
+  # SNS Topic Policy
+  DataQualityAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref DataQualityAlertsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - sns:Publish
+            Resource: !Ref DataQualityAlertsTopic
+          - Sid: AllowCloudWatchPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - sns:Publish
+            Resource: !Ref DataQualityAlertsTopic
+
+  # SNS Email Subscription
+  DataQualityAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref DataQualityAlertsTopic
+      Endpoint: !Ref NotificationEmail
+
+  # DataBrew Dataset
+  DataBrewDataset:
+    Type: AWS::DataBrew::Dataset
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-dataset'
+      Format: !Ref DataFormat
+      FormatOptions:
+        Csv:
+          Delimiter: ','
+          HeaderRow: true
+        Json:
+          MultiLine: false
+      Input:
+        S3InputDefinition:
+          Bucket: !Ref DataBucketName
+          Key: !Ref DataKeyPrefix
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: DataBrew
+        - Key: Purpose
+          Value: DataQualityMonitoring
+
+  # DataBrew Data Quality Ruleset
+  DataQualityRuleset:
+    Type: AWS::DataBrew::Ruleset
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-quality-rules'
+      Description: 'Comprehensive data quality rules for customer data validation'
+      TargetArn: !Sub 'arn:aws:databrew:${AWS::Region}:${AWS::AccountId}:dataset/${DataBrewDataset}'
+      Rules:
+        # Customer ID completeness check
+        - Name: customer_id_not_null
+          CheckExpression: !Sub 'COLUMN_COMPLETENESS(customer_id) > ${CompletenessThreshold}'
+          SubstitutionMap: {}
+          Disabled: false
+        # Email format validation
+        - Name: email_format_valid
+          CheckExpression: !Sub 'COLUMN_DATA_TYPE(email) = STRING AND COLUMN_MATCHES_REGEX(email, "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$") > ${EmailValidationThreshold}'
+          SubstitutionMap: {}
+          Disabled: false
+        # Age range validation
+        - Name: age_range_valid
+          CheckExpression: !Sub 'COLUMN_MIN(age) >= ${MinAge} AND COLUMN_MAX(age) <= ${MaxAge}'
+          SubstitutionMap: {}
+          Disabled: false
+        # Account balance validation
+        - Name: balance_positive
+          CheckExpression: 'COLUMN_MIN(account_balance) >= 0'
+          SubstitutionMap: {}
+          Disabled: false
+        # Registration date validation
+        - Name: registration_date_valid
+          CheckExpression: 'COLUMN_DATA_TYPE(registration_date) = DATE'
+          SubstitutionMap: {}
+          Disabled: false
+        # Name completeness check
+        - Name: name_not_null
+          CheckExpression: !Sub 'COLUMN_COMPLETENESS(name) > ${CompletenessThreshold}'
+          SubstitutionMap: {}
+          Disabled: false
+        # Email uniqueness check
+        - Name: email_unique
+          CheckExpression: 'COLUMN_UNIQUENESS(email) > 0.95'
+          SubstitutionMap: {}
+          Disabled: false
+        # Customer ID uniqueness check
+        - Name: customer_id_unique
+          CheckExpression: 'COLUMN_UNIQUENESS(customer_id) = 1.0'
+          SubstitutionMap: {}
+          Disabled: false
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: DataBrew
+        - Key: Purpose
+          Value: DataQualityRules
+
+  # DataBrew Profile Job
+  DataBrewProfileJob:
+    Type: AWS::DataBrew::Job
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-profile-job'
+      Type: PROFILE
+      DatasetName: !Ref DataBrewDataset
+      RoleArn: !GetAtt DataBrewServiceRole.Arn
+      MaxCapacity: 5
+      MaxRetries: 1
+      Timeout: 2880  # 48 hours
+      LogSubscription: ENABLE
+      OutputLocation:
+        Bucket: !Ref DataBrewResultsBucket
+        Key: !Ref ResultsKeyPrefix
+      ProfileConfiguration:
+        DatasetStatisticsConfiguration:
+          IncludedStatistics:
+            - ALL
+        ProfileColumns:
+          - Name: '*'
+            StatisticsConfiguration:
+              IncludedStatistics:
+                - ALL
+        ColumnStatisticsConfigurations:
+          - Statistics:
+              IncludedStatistics:
+                - ALL
+      ValidationConfigurations:
+        - RulesetArn: !Sub 'arn:aws:databrew:${AWS::Region}:${AWS::AccountId}:ruleset/${DataQualityRuleset}'
+          ValidationMode: CHECK_ALL
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: DataBrew
+        - Key: Purpose
+          Value: DataProfiling
+
+  # EventBridge Rule for DataBrew Job State Changes
+  DataBrewJobStateChangeRule:
+    Type: AWS::Events::Rule
+    Condition: IsEventBridgeEnabled
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-databrew-job-state-change'
+      Description: 'Captures DataBrew job state changes for monitoring'
+      EventPattern:
+        source:
+          - 'aws.databrew'
+        detail-type:
+          - 'DataBrew Job State Change'
+        detail:
+          jobName:
+            - !Ref DataBrewProfileJob
+          state:
+            - 'FAILED'
+            - 'SUCCEEDED'
+      State: ENABLED
+      Targets:
+        - Arn: !Ref DataQualityAlertsTopic
+          Id: 'DataBrewJobStateChangeTarget'
+          InputTransformer:
+            InputPathsMap:
+              jobName: '$.detail.jobName'
+              state: '$.detail.state'
+              jobRunId: '$.detail.jobRunId'
+              timestamp: '$.time'
+            InputTemplate: |
+              {
+                "alertType": "DataBrew Job State Change",
+                "jobName": "<jobName>",
+                "state": "<state>",
+                "jobRunId": "<jobRunId>",
+                "timestamp": "<timestamp>",
+                "message": "DataBrew job <jobName> has changed to state: <state>"
+              }
+
+  # EventBridge Rule for DataBrew Data Quality Validation Results
+  DataBrewValidationResultRule:
+    Type: AWS::Events::Rule
+    Condition: IsEventBridgeEnabled
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-databrew-validation-result'
+      Description: 'Captures DataBrew data quality validation results'
+      EventPattern:
+        source:
+          - 'aws.databrew'
+        detail-type:
+          - 'DataBrew Ruleset Validation Result'
+        detail:
+          validationState:
+            - 'FAILED'
+      State: ENABLED
+      Targets:
+        - Arn: !Ref DataQualityAlertsTopic
+          Id: 'DataBrewValidationResultTarget'
+          InputTransformer:
+            InputPathsMap:
+              datasetName: '$.detail.datasetName'
+              rulesetName: '$.detail.rulesetName'
+              state: '$.detail.validationState'
+              reportLocation: '$.detail.validationReportLocation'
+              timestamp: '$.time'
+            InputTemplate: |
+              {
+                "alertType": "Data Quality Validation Failed",
+                "datasetName": "<datasetName>",
+                "rulesetName": "<rulesetName>",
+                "validationState": "<state>",
+                "reportLocation": "<reportLocation>",
+                "timestamp": "<timestamp>",
+                "message": "Data quality validation FAILED for dataset: <datasetName>, ruleset: <rulesetName>. Report available at: <reportLocation>"
+              }
+
+  # CloudWatch Alarm for DataBrew Job Failures
+  DataBrewJobFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsDetailedMonitoringEnabled
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-databrew-job-failures'
+      AlarmDescription: 'Alarm for DataBrew job failures'
+      MetricName: JobFailures
+      Namespace: AWS/Glue/DataBrew
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: JobName
+          Value: !Ref DataBrewProfileJob
+      AlarmActions:
+        - !Ref DataQualityAlertsTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for Data Quality Rule Failures
+  DataQualityRuleFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsDetailedMonitoringEnabled
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-data-quality-rule-failures'
+      AlarmDescription: 'Alarm for data quality rule failures'
+      MetricName: RuleFailures
+      Namespace: AWS/Glue/DataBrew
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: RulesetName
+          Value: !Ref DataQualityRuleset
+      AlarmActions:
+        - !Ref DataQualityAlertsTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch Dashboard for Data Quality Monitoring
+  DataQualityMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: IsDetailedMonitoringEnabled
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}-data-quality-monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Glue/DataBrew", "JobSuccesses", "JobName", "${DataBrewProfileJob}" ],
+                  [ ".", "JobFailures", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "DataBrew Job Execution Status"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Glue/DataBrew", "RuleSuccesses", "RulesetName", "${DataQualityRuleset}" ],
+                  [ ".", "RuleFailures", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Data Quality Rule Validation Results"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/databrew/jobs' | fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent DataBrew Job Errors"
+              }
+            }
+          ]
+        }
+
+  # Lambda Function for Custom Data Quality Metrics
+  DataQualityMetricsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-data-quality-metrics'
+      Description: 'Custom Lambda function for enhanced data quality metrics'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt DataQualityMetricsRole.Arn
+      Timeout: 300
+      MemorySize: 128
+      Environment:
+        Variables:
+          RESULTS_BUCKET: !Ref DataBrewResultsBucket
+          SNS_TOPIC_ARN: !Ref DataQualityAlertsTopic
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              """
+              Process DataBrew profile job results and publish custom metrics
+              """
+              s3 = boto3.client('s3')
+              cloudwatch = boto3.client('cloudwatch')
+              sns = boto3.client('sns')
+              
+              try:
+                  # Parse the S3 event
+                  if 'Records' in event:
+                      for record in event['Records']:
+                          bucket = record['s3']['bucket']['name']
+                          key = record['s3']['object']['key']
+                          
+                          # Process only profile result files
+                          if 'profile-results' in key and key.endswith('.json'):
+                              process_profile_results(s3, cloudwatch, bucket, key)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Successfully processed data quality metrics')
+                  }
+              
+              except Exception as e:
+                  print(f"Error processing data quality metrics: {str(e)}")
+                  # Send error notification
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject='Data Quality Metrics Processing Error',
+                      Message=f'Error processing data quality metrics: {str(e)}'
+                  )
+                  raise
+          
+          def process_profile_results(s3, cloudwatch, bucket, key):
+              """
+              Process DataBrew profile results and publish custom metrics
+              """
+              try:
+                  # Get the profile results
+                  response = s3.get_object(Bucket=bucket, Key=key)
+                  profile_data = json.loads(response['Body'].read())
+                  
+                  # Extract metrics from profile data
+                  metrics = []
+                  
+                  # Add custom metrics based on profile results
+                  if 'columnStatistics' in profile_data:
+                      for column_name, stats in profile_data['columnStatistics'].items():
+                          if 'completeness' in stats:
+                              metrics.append({
+                                  'MetricName': f'ColumnCompleteness_{column_name}',
+                                  'Value': stats['completeness'],
+                                  'Unit': 'Percent'
+                              })
+                          
+                          if 'uniqueness' in stats:
+                              metrics.append({
+                                  'MetricName': f'ColumnUniqueness_{column_name}',
+                                  'Value': stats['uniqueness'],
+                                  'Unit': 'Percent'
+                              })
+                  
+                  # Publish metrics to CloudWatch
+                  if metrics:
+                      cloudwatch.put_metric_data(
+                          Namespace=f'DataQuality/{os.environ["PROJECT_NAME"]}',
+                          MetricData=metrics
+                      )
+                      
+                      print(f"Published {len(metrics)} custom metrics to CloudWatch")
+              
+              except Exception as e:
+                  print(f"Error processing profile results: {str(e)}")
+                  raise
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: Lambda
+
+  # IAM Role for Lambda Function
+  DataQualityMetricsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-DataQualityMetricsRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DataQualityMetricsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub '${DataBrewResultsBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref DataQualityAlertsTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # S3 Bucket Notification for Lambda Function
+  DataQualityMetricsS3Notification:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-databrew-results-${AWS::AccountId}-${AWS::Region}'
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt DataQualityMetricsFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: !Ref ResultsKeyPrefix
+                  - Name: suffix
+                    Value: .json
+    DependsOn: DataQualityMetricsFunction
+
+  # Lambda Permission for S3 Bucket
+  DataQualityMetricsS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataQualityMetricsFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::${ProjectName}-${Environment}-databrew-results-${AWS::AccountId}-${AWS::Region}'
+
+Outputs:
+  DataBrewDatasetName:
+    Description: 'Name of the DataBrew dataset'
+    Value: !Ref DataBrewDataset
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBrewDatasetName'
+
+  DataBrewProfileJobName:
+    Description: 'Name of the DataBrew profile job'
+    Value: !Ref DataBrewProfileJob
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBrewProfileJobName'
+
+  DataQualityRulesetName:
+    Description: 'Name of the data quality ruleset'
+    Value: !Ref DataQualityRuleset
+    Export:
+      Name: !Sub '${AWS::StackName}-DataQualityRulesetName'
+
+  ResultsBucketName:
+    Description: 'Name of the S3 bucket for DataBrew results'
+    Value: !Ref DataBrewResultsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ResultsBucketName'
+
+  ResultsBucketArn:
+    Description: 'ARN of the S3 bucket for DataBrew results'
+    Value: !GetAtt DataBrewResultsBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ResultsBucketArn'
+
+  DataBrewServiceRoleArn:
+    Description: 'ARN of the DataBrew service role'
+    Value: !GetAtt DataBrewServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBrewServiceRoleArn'
+
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for data quality alerts'
+    Value: !Ref DataQualityAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  CloudWatchDashboardURL:
+    Description: 'URL to the CloudWatch dashboard for data quality monitoring'
+    Condition: IsDetailedMonitoringEnabled
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-data-quality-monitoring'
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchDashboardURL'
+
+  DataQualityMetricsFunctionArn:
+    Description: 'ARN of the Lambda function for custom data quality metrics'
+    Value: !GetAtt DataQualityMetricsFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataQualityMetricsFunctionArn'
+
+  ProfileJobStartCommand:
+    Description: 'AWS CLI command to start the profile job'
+    Value: !Sub 'aws databrew start-job-run --name ${DataBrewProfileJob}'
+
+  ValidationInstructions:
+    Description: 'Instructions for validating the data quality monitoring setup'
+    Value: !Sub |
+      1. Upload sample data to s3://${DataBucketName}/${DataKeyPrefix}
+      2. Start the profile job: aws databrew start-job-run --name ${DataBrewProfileJob}
+      3. Monitor results in s3://${DataBrewResultsBucket}/${ResultsKeyPrefix}
+      4. Check CloudWatch dashboard: ${ProjectName}-${Environment}-data-quality-monitoring
+      5. Verify email notifications are received for quality issues

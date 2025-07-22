@@ -1,0 +1,807 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Cost Allocation and Chargeback Systems with AWS Billing and Cost Management - Creates comprehensive cost tracking, automated reporting, and chargeback infrastructure'
+
+Parameters:
+  # Environment Configuration
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name for resource tagging and naming'
+  
+  # Department Configuration
+  DepartmentList:
+    Type: CommaDelimitedList
+    Default: 'Engineering,Marketing,Operations'
+    Description: 'Comma-separated list of departments for cost allocation'
+  
+  # Budget Configuration
+  EngineeringBudgetAmount:
+    Type: Number
+    Default: 1000
+    MinValue: 100
+    MaxValue: 100000
+    Description: 'Monthly budget amount for Engineering department in USD'
+  
+  MarketingBudgetAmount:
+    Type: Number
+    Default: 500
+    MinValue: 100
+    MaxValue: 100000
+    Description: 'Monthly budget amount for Marketing department in USD'
+  
+  OperationsBudgetAmount:
+    Type: Number
+    Default: 750
+    MinValue: 100
+    MaxValue: 100000
+    Description: 'Monthly budget amount for Operations department in USD'
+  
+  # Alert Configuration
+  BudgetThresholdPercentage:
+    Type: Number
+    Default: 80
+    MinValue: 50
+    MaxValue: 100
+    Description: 'Budget threshold percentage for alerts (50-100)'
+  
+  # Notification Configuration
+  NotificationEmail:
+    Type: String
+    Default: 'finance@company.com'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    Description: 'Email address for cost allocation notifications'
+  
+  # Processing Schedule
+  ProcessingSchedule:
+    Type: String
+    Default: 'cron(0 9 1 * ? *)'
+    Description: 'Cron expression for monthly cost processing (default: 1st day of month at 9 AM UTC)'
+  
+  # Cost Report Configuration
+  IncludeResourceDetails:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Include detailed resource information in Cost and Usage Reports'
+  
+  ReportFormat:
+    Type: String
+    Default: 'textORcsv'
+    AllowedValues: ['textORcsv', 'Parquet']
+    Description: 'Cost and Usage Report format'
+
+Conditions:
+  # Environment-based conditions
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  IncludeResources: !Equals [!Ref IncludeResourceDetails, 'true']
+  
+  # Feature flags
+  EnableDetailedReporting: !Equals [!Ref ReportFormat, 'textORcsv']
+
+Resources:
+  # =====================================================
+  # S3 Bucket for Cost Reports Storage
+  # =====================================================
+  CostReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'cost-allocation-reports-${AWS::AccountId}-${Environment}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: CostReportLifecycle
+            Status: Enabled
+            ExpirationInDays: 2555  # 7 years retention for compliance
+            NoncurrentVersionExpirationInDays: 90
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref CostReportsLogGroup
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: CostAllocation
+        - Key: Retention
+          Value: '7Years'
+
+  # S3 Bucket Policy for Cost and Usage Reports
+  CostReportsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CostReportsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowBillingReportsDelivery
+            Effect: Allow
+            Principal:
+              Service: billingreports.amazonaws.com
+            Action:
+              - s3:GetBucketAcl
+              - s3:GetBucketPolicy
+            Resource: !GetAtt CostReportsBucket.Arn
+          - Sid: AllowBillingReportsWrite
+            Effect: Allow
+            Principal:
+              Service: billingreports.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CostReportsBucket.Arn}/cost-reports/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+          - Sid: AllowLambdaAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt CostProcessorRole.Arn
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt CostReportsBucket.Arn
+              - !Sub '${CostReportsBucket.Arn}/*'
+
+  # =====================================================
+  # SNS Topic for Cost Notifications
+  # =====================================================
+  CostAllocationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'cost-allocation-alerts-${Environment}'
+      DisplayName: 'Cost Allocation and Budget Alerts'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: CostAllocation
+
+  # SNS Topic Policy for Budget Service
+  CostAllocationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref CostAllocationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowBudgetService
+            Effect: Allow
+            Principal:
+              Service: budgets.amazonaws.com
+            Action: SNS:Publish
+            Resource: !Ref CostAllocationTopic
+          - Sid: AllowCostAnomalyDetection
+            Effect: Allow
+            Principal:
+              Service: ce.amazonaws.com
+            Action: SNS:Publish
+            Resource: !Ref CostAllocationTopic
+
+  # Email Subscription for Notifications
+  CostAllocationEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref CostAllocationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # =====================================================
+  # CloudWatch Log Group for Cost Processing
+  # =====================================================
+  CostReportsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/cost-allocation-processor-${Environment}'
+      RetentionInDays: !If [IsProduction, 365, 30]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: CostAllocation
+
+  # =====================================================
+  # IAM Role for Lambda Cost Processing Function
+  # =====================================================
+  CostProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'CostAllocationProcessor-${Environment}-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSBillingReadOnlyAccess
+        - arn:aws:iam::aws:policy/AWSBudgetsReadOnlyAccess
+      Policies:
+        - PolicyName: CostAllocationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt CostReportsBucket.Arn
+                  - !Sub '${CostReportsBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref CostAllocationTopic
+              - Effect: Allow
+                Action:
+                  - ce:GetCostAndUsage
+                  - ce:GetDimensionValues
+                  - ce:GetReservationCoverage
+                  - ce:GetReservationPurchaseRecommendation
+                  - ce:GetReservationUtilization
+                  - ce:GetUsageForecast
+                  - ce:ListCostCategoryDefinitions
+                  - ce:GetCostCategories
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - organizations:ListAccounts
+                  - organizations:DescribeOrganization
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: CostAllocation
+
+  # =====================================================
+  # Lambda Function for Cost Processing
+  # =====================================================
+  CostProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'cost-allocation-processor-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt CostProcessorRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref CostAllocationTopic
+          S3_BUCKET: !Ref CostReportsBucket
+          DEPARTMENTS: !Join [',', !Ref DepartmentList]
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import csv
+          import os
+          from datetime import datetime, timedelta
+          from decimal import Decimal
+          import logging
+
+          # Configure logging
+          logging.basicConfig(level=logging.INFO)
+          logger = logging.getLogger(__name__)
+
+          def lambda_handler(event, context):
+              """
+              Process cost allocation data and generate chargeback reports.
+              This function queries AWS Cost Explorer for department-specific costs
+              and generates detailed reports for chargeback billing.
+              """
+              
+              # Initialize AWS clients
+              ce_client = boto3.client('ce')
+              sns_client = boto3.client('sns')
+              s3_client = boto3.client('s3')
+              
+              # Get environment variables
+              sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+              s3_bucket = os.environ['S3_BUCKET']
+              departments = os.environ['DEPARTMENTS'].split(',')
+              environment = os.environ['ENVIRONMENT']
+              
+              # Calculate date range (last 30 days)
+              end_date = datetime.now().strftime('%Y-%m-%d')
+              start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+              
+              try:
+                  logger.info(f"Processing cost allocation for period: {start_date} to {end_date}")
+                  
+                  # Query costs by department tag
+                  response = ce_client.get_cost_and_usage(
+                      TimePeriod={
+                          'Start': start_date,
+                          'End': end_date
+                      },
+                      Granularity='MONTHLY',
+                      Metrics=['BlendedCost', 'UnblendedCost', 'UsageQuantity'],
+                      GroupBy=[
+                          {
+                              'Type': 'TAG',
+                              'Key': 'Department'
+                          },
+                          {
+                              'Type': 'SERVICE'
+                          }
+                      ]
+                  )
+                  
+                  # Process cost data
+                  department_costs = {}
+                  service_breakdown = {}
+                  total_cost = 0
+                  
+                  for result in response['ResultsByTime']:
+                      for group in result['Groups']:
+                          keys = group['Keys']
+                          dept = keys[0] if keys[0] and keys[0] != 'No Department' else 'Untagged'
+                          service = keys[1] if len(keys) > 1 else 'Unknown'
+                          
+                          blended_cost = float(group['Metrics']['BlendedCost']['Amount'])
+                          unblended_cost = float(group['Metrics']['UnblendedCost']['Amount'])
+                          
+                          # Aggregate department costs
+                          if dept not in department_costs:
+                              department_costs[dept] = {
+                                  'blended_cost': 0,
+                                  'unblended_cost': 0,
+                                  'services': {}
+                              }
+                          
+                          department_costs[dept]['blended_cost'] += blended_cost
+                          department_costs[dept]['unblended_cost'] += unblended_cost
+                          
+                          # Service breakdown
+                          if service not in department_costs[dept]['services']:
+                              department_costs[dept]['services'][service] = 0
+                          department_costs[dept]['services'][service] += blended_cost
+                          
+                          total_cost += blended_cost
+                  
+                  # Generate detailed CSV report
+                  report_data = []
+                  for dept, data in department_costs.items():
+                      for service, cost in data['services'].items():
+                          report_data.append({
+                              'Department': dept,
+                              'Service': service,
+                              'Cost': f"{cost:.2f}",
+                              'Percentage': f"{(cost/total_cost*100):.2f}%" if total_cost > 0 else "0%",
+                              'Period': f"{start_date} to {end_date}"
+                          })
+                  
+                  # Save detailed report to S3
+                  csv_content = "Department,Service,Cost,Percentage,Period\n"
+                  for row in report_data:
+                      csv_content += f"{row['Department']},{row['Service']},{row['Cost']},{row['Percentage']},{row['Period']}\n"
+                  
+                  report_key = f"chargeback-reports/{environment}/{end_date}/detailed-cost-allocation.csv"
+                  s3_client.put_object(
+                      Bucket=s3_bucket,
+                      Key=report_key,
+                      Body=csv_content,
+                      ContentType='text/csv'
+                  )
+                  
+                  # Create summary report
+                  summary_report = {
+                      'report_date': end_date,
+                      'period': f"{start_date} to {end_date}",
+                      'environment': environment,
+                      'department_costs': department_costs,
+                      'total_cost': total_cost,
+                      'report_location': f"s3://{s3_bucket}/{report_key}"
+                  }
+                  
+                  # Generate notification message
+                  message_lines = [
+                      f"Cost Allocation Report - {end_date}",
+                      f"Environment: {environment}",
+                      f"Period: {start_date} to {end_date}",
+                      "",
+                      "Department Cost Summary:"
+                  ]
+                  
+                  for dept, data in sorted(department_costs.items()):
+                      percentage = (data['blended_cost']/total_cost*100) if total_cost > 0 else 0
+                      message_lines.append(f"• {dept}: ${data['blended_cost']:.2f} ({percentage:.1f}%)")
+                      
+                      # Top 3 services for this department
+                      top_services = sorted(data['services'].items(), key=lambda x: x[1], reverse=True)[:3]
+                      for service, cost in top_services:
+                          if cost > 0:
+                              message_lines.append(f"  - {service}: ${cost:.2f}")
+                  
+                  message_lines.extend([
+                      "",
+                      f"Total Cost: ${total_cost:.2f}",
+                      f"Detailed Report: s3://{s3_bucket}/{report_key}"
+                  ])
+                  
+                  message = "\n".join(message_lines)
+                  
+                  # Send notification
+                  sns_client.publish(
+                      TopicArn=sns_topic_arn,
+                      Subject=f'Cost Allocation Report - {environment} - {end_date}',
+                      Message=message
+                  )
+                  
+                  logger.info(f"Cost allocation processing completed successfully. Total cost: ${total_cost:.2f}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(summary_report, default=str)
+                  }
+                  
+              except Exception as e:
+                  error_message = f"Error processing cost allocation: {str(e)}"
+                  logger.error(error_message)
+                  
+                  # Send error notification
+                  try:
+                      sns_client.publish(
+                          TopicArn=sns_topic_arn,
+                          Subject=f'Cost Allocation Processing Error - {environment}',
+                          Message=f"Error occurred during cost allocation processing:\n\n{error_message}"
+                      )
+                  except Exception as sns_error:
+                      logger.error(f"Failed to send error notification: {str(sns_error)}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f"Error: {error_message}")
+                  }
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: CostAllocation
+
+  # =====================================================
+  # EventBridge Rule for Automated Processing
+  # =====================================================
+  CostProcessingSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'cost-allocation-schedule-${Environment}'
+      Description: 'Monthly cost allocation processing schedule'
+      ScheduleExpression: !Ref ProcessingSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CostProcessorFunction.Arn
+          Id: CostProcessorTarget
+          Input: !Sub |
+            {
+              "source": "scheduled",
+              "environment": "${Environment}",
+              "trigger_time": "monthly"
+            }
+
+  # Permission for EventBridge to invoke Lambda
+  CostProcessingSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CostProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CostProcessingSchedule.Arn
+
+  # =====================================================
+  # Cost and Usage Report Definition
+  # =====================================================
+  CostAndUsageReport:
+    Type: AWS::CUR::ReportDefinition
+    Properties:
+      ReportName: !Sub 'cost-allocation-report-${Environment}'
+      TimeUnit: DAILY
+      Format: !Ref ReportFormat
+      Compression: GZIP
+      AdditionalSchemaElements:
+        - !If [IncludeResources, 'RESOURCES', !Ref 'AWS::NoValue']
+      S3Bucket: !Ref CostReportsBucket
+      S3Prefix: 'cost-reports/'
+      S3Region: !Ref AWS::Region
+      AdditionalArtifacts:
+        - REDSHIFT
+        - ATHENA
+      RefreshClosedReports: true
+      ReportVersioning: OVERWRITE_REPORT
+
+  # =====================================================
+  # Budget Definitions for Each Department
+  # =====================================================
+  EngineeringBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub 'Engineering-Monthly-Budget-${Environment}'
+        BudgetLimit:
+          Amount: !Ref EngineeringBudgetAmount
+          Unit: USD
+        TimeUnit: MONTHLY
+        BudgetType: COST
+        CostFilters:
+          TagKey:
+            - Department
+          TagValue:
+            - Engineering
+            - Development
+            - DevOps
+        TimePeriod:
+          Start: !Sub '${AWS::AccountId}-01-01'
+          End: '2087-06-15'
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: !Ref BudgetThresholdPercentage
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref CostAllocationTopic
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref CostAllocationTopic
+
+  MarketingBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub 'Marketing-Monthly-Budget-${Environment}'
+        BudgetLimit:
+          Amount: !Ref MarketingBudgetAmount
+          Unit: USD
+        TimeUnit: MONTHLY
+        BudgetType: COST
+        CostFilters:
+          TagKey:
+            - Department
+          TagValue:
+            - Marketing
+            - Sales
+            - Customer Success
+        TimePeriod:
+          Start: !Sub '${AWS::AccountId}-01-01'
+          End: '2087-06-15'
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: !Ref BudgetThresholdPercentage
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref CostAllocationTopic
+
+  OperationsBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub 'Operations-Monthly-Budget-${Environment}'
+        BudgetLimit:
+          Amount: !Ref OperationsBudgetAmount
+          Unit: USD
+        TimeUnit: MONTHLY
+        BudgetType: COST
+        CostFilters:
+          TagKey:
+            - Department
+          TagValue:
+            - Operations
+            - Finance
+            - HR
+        TimePeriod:
+          Start: !Sub '${AWS::AccountId}-01-01'
+          End: '2087-06-15'
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: !Ref BudgetThresholdPercentage
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref CostAllocationTopic
+
+  # =====================================================
+  # Cost Anomaly Detection
+  # =====================================================
+  CostAnomalyDetector:
+    Type: AWS::CE::AnomalyDetector
+    Properties:
+      DetectorName: !Sub 'DepartmentCostAnomalyDetector-${Environment}'
+      MonitorType: DIMENSIONAL
+      DimensionKey: TAG
+      MatchOptions:
+        - EQUALS
+      MonitorSpecification: Department
+
+  CostAnomalySubscription:
+    Type: AWS::CE::AnomalySubscription
+    Properties:
+      SubscriptionName: !Sub 'CostAnomalyAlerts-${Environment}'
+      MonitorArnList:
+        - !GetAtt CostAnomalyDetector.DetectorArn
+      Subscribers:
+        - Address: !Ref CostAllocationTopic
+          Type: SNS
+      Threshold: 100
+      Frequency: DAILY
+
+  # =====================================================
+  # Cost Category Definitions
+  # =====================================================
+  EngineeringCostCategory:
+    Type: AWS::CE::CostCategory
+    Properties:
+      Name: !Sub 'Engineering-CostCenter-${Environment}'
+      RuleVersion: CostCategoryExpression.v1
+      Rules:
+        - Value: Engineering
+          Rule:
+            Tags:
+              Key: Department
+              Values:
+                - Engineering
+                - Development
+                - DevOps
+              MatchOptions:
+                - EQUALS
+
+  MarketingCostCategory:
+    Type: AWS::CE::CostCategory
+    Properties:
+      Name: !Sub 'Marketing-CostCenter-${Environment}'
+      RuleVersion: CostCategoryExpression.v1
+      Rules:
+        - Value: Marketing
+          Rule:
+            Tags:
+              Key: Department
+              Values:
+                - Marketing
+                - Sales
+                - Customer Success
+              MatchOptions:
+                - EQUALS
+
+  OperationsCostCategory:
+    Type: AWS::CE::CostCategory
+    Properties:
+      Name: !Sub 'Operations-CostCenter-${Environment}'
+      RuleVersion: CostCategoryExpression.v1
+      Rules:
+        - Value: Operations
+          Rule:
+            Tags:
+              Key: Department
+              Values:
+                - Operations
+                - Finance
+                - HR
+              MatchOptions:
+                - EQUALS
+
+Outputs:
+  # Infrastructure Outputs
+  CostReportsBucketName:
+    Description: 'S3 bucket name for cost reports storage'
+    Value: !Ref CostReportsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-CostReportsBucket'
+
+  CostReportsBucketArn:
+    Description: 'S3 bucket ARN for cost reports storage'
+    Value: !GetAtt CostReportsBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CostReportsBucketArn'
+
+  SNSTopicArn:
+    Description: 'SNS topic ARN for cost allocation notifications'
+    Value: !Ref CostAllocationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  LambdaFunctionArn:
+    Description: 'Lambda function ARN for cost processing'
+    Value: !GetAtt CostProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  # Budget Information
+  EngineeringBudgetName:
+    Description: 'Engineering department budget name'
+    Value: !Sub 'Engineering-Monthly-Budget-${Environment}'
+
+  MarketingBudgetName:
+    Description: 'Marketing department budget name'
+    Value: !Sub 'Marketing-Monthly-Budget-${Environment}'
+
+  OperationsBudgetName:
+    Description: 'Operations department budget name'
+    Value: !Sub 'Operations-Monthly-Budget-${Environment}'
+
+  # Cost Categories
+  EngineeringCostCategoryArn:
+    Description: 'Engineering cost category ARN'
+    Value: !GetAtt EngineeringCostCategory.Arn
+
+  MarketingCostCategoryArn:
+    Description: 'Marketing cost category ARN'
+    Value: !GetAtt MarketingCostCategory.Arn
+
+  OperationsCostCategoryArn:
+    Description: 'Operations cost category ARN'
+    Value: !GetAtt OperationsCostCategory.Arn
+
+  # Anomaly Detection
+  AnomalyDetectorArn:
+    Description: 'Cost anomaly detector ARN'
+    Value: !GetAtt CostAnomalyDetector.DetectorArn
+
+  # Report Information
+  CostAndUsageReportName:
+    Description: 'Cost and Usage Report name'
+    Value: !Sub 'cost-allocation-report-${Environment}'
+
+  # Processing Schedule
+  ProcessingScheduleArn:
+    Description: 'EventBridge rule ARN for automated processing'
+    Value: !GetAtt CostProcessingSchedule.Arn
+
+  # Quick Start Commands
+  TestLambdaFunction:
+    Description: 'AWS CLI command to test the Lambda function'
+    Value: !Sub 'aws lambda invoke --function-name ${CostProcessorFunction} --payload "{\"test\": true}" response.json'
+
+  ViewBudgets:
+    Description: 'AWS CLI command to view budget status'
+    Value: !Sub 'aws budgets describe-budgets --account-id ${AWS::AccountId}'
+
+  CheckCostReports:
+    Description: 'AWS CLI command to check cost reports'
+    Value: !Sub 'aws s3 ls s3://${CostReportsBucket}/cost-reports/ --recursive'
+
+  # Dashboard URLs (for reference)
+  CostExplorerURL:
+    Description: 'AWS Cost Explorer console URL'
+    Value: 'https://console.aws.amazon.com/cost-reports/home'
+
+  BudgetsConsoleURL:
+    Description: 'AWS Budgets console URL'
+    Value: 'https://console.aws.amazon.com/billing/home#/budgets'

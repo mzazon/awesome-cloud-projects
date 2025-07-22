@@ -1,0 +1,1376 @@
+# Infrastructure Manager Configuration for Data Governance Workflows with Dataplex and Cloud Workflows
+# This configuration deploys a comprehensive data governance solution using Google Cloud services
+
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Infrastructure Manager Deployment Configuration
+apiVersion: config.cloud.google.com/v1
+kind: Deployment
+metadata:
+  name: data-governance-workflows-dataplex
+  namespace: default
+  labels:
+    component: data-governance
+    environment: production
+    team: data-engineering
+spec:
+  # Terraform module configuration
+  module:
+    source: inline
+    tfconfig: |
+      # Provider configuration with required APIs
+      terraform {
+        required_version = ">= 1.0"
+        required_providers {
+          google = {
+            source  = "hashicorp/google"
+            version = "~> 5.0"
+          }
+          google-beta = {
+            source  = "hashicorp/google-beta"
+            version = "~> 5.0"
+          }
+        }
+      }
+
+      # Provider configuration
+      provider "google" {
+        project = var.project_id
+        region  = var.region
+        zone    = var.zone
+      }
+
+      provider "google-beta" {
+        project = var.project_id
+        region  = var.region
+        zone    = var.zone
+      }
+
+      # Input variables for customization
+      variable "project_id" {
+        description = "Google Cloud project ID for the governance infrastructure"
+        type        = string
+        validation {
+          condition     = can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", var.project_id))
+          error_message = "Project ID must be 6-30 characters, start with a letter, and contain only lowercase letters, numbers, and hyphens."
+        }
+      }
+
+      variable "region" {
+        description = "Google Cloud region for regional resources"
+        type        = string
+        default     = "us-central1"
+        validation {
+          condition     = can(regex("^[a-z]+-[a-z]+[0-9]+$", var.region))
+          error_message = "Region must be a valid Google Cloud region (e.g., us-central1)."
+        }
+      }
+
+      variable "zone" {
+        description = "Google Cloud zone for zonal resources"
+        type        = string
+        default     = "us-central1-a"
+        validation {
+          condition     = can(regex("^[a-z]+-[a-z]+[0-9]+-[a-z]$", var.zone))
+          error_message = "Zone must be a valid Google Cloud zone (e.g., us-central1-a)."
+        }
+      }
+
+      variable "environment" {
+        description = "Environment name for resource naming and tagging"
+        type        = string
+        default     = "governance"
+        validation {
+          condition     = can(regex("^[a-z][a-z0-9-]{0,62}$", var.environment))
+          error_message = "Environment must be lowercase alphanumeric with hyphens, max 63 characters."
+        }
+      }
+
+      variable "data_lake_bucket_name" {
+        description = "Name for the data lake storage bucket (must be globally unique)"
+        type        = string
+        default     = ""
+        validation {
+          condition     = var.data_lake_bucket_name == "" || can(regex("^[a-z0-9][a-z0-9-_]{1,61}[a-z0-9]$", var.data_lake_bucket_name))
+          error_message = "Bucket name must be 3-63 characters, lowercase alphanumeric with hyphens and underscores."
+        }
+      }
+
+      variable "enable_uniform_bucket_level_access" {
+        description = "Enable uniform bucket-level access for enhanced security"
+        type        = bool
+        default     = true
+      }
+
+      variable "dlp_inspection_schedule" {
+        description = "Cron schedule for DLP inspection jobs"
+        type        = string
+        default     = "0 2 * * 1"  # Weekly at 2 AM on Monday
+        validation {
+          condition     = can(regex("^[0-5]?[0-9] [0-2]?[0-9] \\* \\* [0-6]$", var.dlp_inspection_schedule))
+          error_message = "Schedule must be a valid cron expression."
+        }
+      }
+
+      variable "data_retention_days" {
+        description = "Number of days to retain governance data in BigQuery"
+        type        = number
+        default     = 90
+        validation {
+          condition     = var.data_retention_days >= 7 && var.data_retention_days <= 3650
+          error_message = "Data retention must be between 7 and 3650 days."
+        }
+      }
+
+      # Local values for resource naming consistency
+      locals {
+        # Generate unique suffix for globally unique resources
+        random_suffix = substr(sha256("${var.project_id}-${var.environment}"), 0, 6)
+        
+        # Common resource naming
+        resource_prefix = "${var.environment}-governance"
+        
+        # Data lake bucket name with fallback
+        bucket_name = var.data_lake_bucket_name != "" ? var.data_lake_bucket_name : "${local.resource_prefix}-data-lake-${local.random_suffix}"
+        
+        # Common labels for all resources
+        common_labels = {
+          environment = var.environment
+          component   = "data-governance"
+          team        = "data-engineering"
+          managed-by  = "infrastructure-manager"
+        }
+      }
+
+      # Enable required Google Cloud APIs
+      resource "google_project_service" "required_apis" {
+        for_each = toset([
+          "dataplex.googleapis.com",
+          "workflows.googleapis.com",
+          "dlp.googleapis.com",
+          "bigquery.googleapis.com",
+          "cloudasset.googleapis.com",
+          "monitoring.googleapis.com",
+          "logging.googleapis.com",
+          "cloudfunctions.googleapis.com",
+          "cloudbuild.googleapis.com",
+          "storage.googleapis.com",
+          "iam.googleapis.com"
+        ])
+        
+        service = each.value
+        project = var.project_id
+        
+        # Prevent accidental deletion of APIs
+        disable_on_destroy = false
+        
+        timeouts {
+          create = "10m"
+          update = "10m"
+        }
+      }
+
+      # Data Lake Storage Bucket
+      resource "google_storage_bucket" "data_lake" {
+        name     = local.bucket_name
+        location = var.region
+        project  = var.project_id
+        
+        # Enable versioning for data protection
+        versioning {
+          enabled = true
+        }
+        
+        # Uniform bucket-level access for security
+        uniform_bucket_level_access = var.enable_uniform_bucket_level_access
+        
+        # Lifecycle management for cost optimization
+        lifecycle_rule {
+          condition {
+            age = 30
+          }
+          action {
+            type          = "SetStorageClass"
+            storage_class = "NEARLINE"
+          }
+        }
+        
+        lifecycle_rule {
+          condition {
+            age = 90
+          }
+          action {
+            type          = "SetStorageClass"
+            storage_class = "COLDLINE"
+          }
+        }
+        
+        lifecycle_rule {
+          condition {
+            age = 365
+          }
+          action {
+            type          = "SetStorageClass"
+            storage_class = "ARCHIVE"
+          }
+        }
+        
+        # Security configurations
+        encryption {
+          default_kms_key_name = google_kms_crypto_key.governance_key.id
+        }
+        
+        # Public access prevention
+        public_access_prevention = "enforced"
+        
+        labels = local.common_labels
+        
+        depends_on = [
+          google_project_service.required_apis,
+          google_kms_crypto_key.governance_key
+        ]
+      }
+
+      # KMS Key for encryption
+      resource "google_kms_key_ring" "governance_keyring" {
+        name     = "${local.resource_prefix}-keyring"
+        location = var.region
+        project  = var.project_id
+        
+        depends_on = [google_project_service.required_apis]
+      }
+
+      resource "google_kms_crypto_key" "governance_key" {
+        name            = "${local.resource_prefix}-key"
+        key_ring        = google_kms_key_ring.governance_keyring.id
+        rotation_period = "2592000s"  # 30 days
+        
+        purpose = "ENCRYPT_DECRYPT"
+        
+        version_template {
+          algorithm = "GOOGLE_SYMMETRIC_ENCRYPTION"
+        }
+        
+        lifecycle {
+          prevent_destroy = true
+        }
+        
+        labels = local.common_labels
+      }
+
+      # BigQuery Dataset for Governance Analytics
+      resource "google_bigquery_dataset" "governance_analytics" {
+        dataset_id  = "${replace(local.resource_prefix, "-", "_")}_analytics"
+        location    = var.region
+        project     = var.project_id
+        description = "Dataset for storing data governance metrics and analytics"
+        
+        # Data retention
+        default_table_expiration_ms = var.data_retention_days * 24 * 60 * 60 * 1000
+        
+        # Access controls
+        access {
+          role          = "OWNER"
+          user_by_email = "serviceAccount:${google_service_account.governance_sa.email}"
+        }
+        
+        access {
+          role   = "READER"
+          domain = "google.com"
+        }
+        
+        labels = local.common_labels
+        
+        depends_on = [
+          google_project_service.required_apis,
+          google_service_account.governance_sa
+        ]
+      }
+
+      # BigQuery Tables for Governance Data
+      resource "google_bigquery_table" "data_quality_metrics" {
+        dataset_id = google_bigquery_dataset.governance_analytics.dataset_id
+        table_id   = "data_quality_metrics"
+        project    = var.project_id
+        
+        description = "Table for storing data quality assessment metrics"
+        
+        schema = jsonencode([
+          {
+            name        = "timestamp"
+            type        = "TIMESTAMP"
+            mode        = "REQUIRED"
+            description = "Timestamp of the quality assessment"
+          },
+          {
+            name        = "asset_name"
+            type        = "STRING"
+            mode        = "REQUIRED"
+            description = "Name of the data asset assessed"
+          },
+          {
+            name        = "zone"
+            type        = "STRING"
+            mode        = "REQUIRED"
+            description = "Dataplex zone containing the asset"
+          },
+          {
+            name        = "quality_score"
+            type        = "FLOAT64"
+            mode        = "REQUIRED"
+            description = "Overall quality score (0.0 to 1.0)"
+          },
+          {
+            name        = "issues_found"
+            type        = "INTEGER"
+            mode        = "REQUIRED"
+            description = "Number of quality issues identified"
+          },
+          {
+            name        = "scan_type"
+            type        = "STRING"
+            mode        = "REQUIRED"
+            description = "Type of scan performed (automated/manual)"
+          },
+          {
+            name        = "details"
+            type        = "JSON"
+            mode        = "NULLABLE"
+            description = "Detailed quality metrics and findings"
+          }
+        ])
+        
+        labels = local.common_labels
+      }
+
+      resource "google_bigquery_table" "compliance_reports" {
+        dataset_id = google_bigquery_dataset.governance_analytics.dataset_id
+        table_id   = "compliance_reports"
+        project    = var.project_id
+        
+        description = "Table for storing compliance monitoring reports"
+        
+        schema = jsonencode([
+          {
+            name        = "timestamp"
+            type        = "TIMESTAMP"
+            mode        = "REQUIRED"
+            description = "Timestamp of the compliance report"
+          },
+          {
+            name        = "asset_name"
+            type        = "STRING"
+            mode        = "REQUIRED"
+            description = "Name of the data asset"
+          },
+          {
+            name        = "compliance_status"
+            type        = "STRING"
+            mode        = "REQUIRED"
+            description = "Compliance status (COMPLIANT/NON_COMPLIANT)"
+          },
+          {
+            name        = "violations"
+            type        = "INTEGER"
+            mode        = "REQUIRED"
+            description = "Number of compliance violations"
+          },
+          {
+            name        = "sensitive_data_types"
+            type        = "STRING"
+            mode        = "NULLABLE"
+            description = "Types of sensitive data found"
+          },
+          {
+            name        = "risk_level"
+            type        = "STRING"
+            mode        = "REQUIRED"
+            description = "Risk level assessment (LOW/MEDIUM/HIGH)"
+          }
+        ])
+        
+        labels = local.common_labels
+      }
+
+      resource "google_bigquery_table" "governance_audit_log" {
+        dataset_id = google_bigquery_dataset.governance_analytics.dataset_id
+        table_id   = "governance_audit_log"
+        project    = var.project_id
+        
+        description = "Table for storing governance audit logs"
+        
+        schema = jsonencode([
+          {
+            name        = "timestamp"
+            type        = "TIMESTAMP"
+            mode        = "REQUIRED"
+            description = "Timestamp of the audit event"
+          },
+          {
+            name        = "action"
+            type        = "STRING"
+            mode        = "REQUIRED"
+            description = "Governance action performed"
+          },
+          {
+            name        = "user"
+            type        = "STRING"
+            mode        = "REQUIRED"
+            description = "User or service account performing the action"
+          },
+          {
+            name        = "asset"
+            type        = "STRING"
+            mode        = "REQUIRED"
+            description = "Asset affected by the action"
+          },
+          {
+            name        = "zone"
+            type        = "STRING"
+            mode        = "REQUIRED"
+            description = "Dataplex zone of the asset"
+          },
+          {
+            name        = "status"
+            type        = "STRING"
+            mode        = "REQUIRED"
+            description = "Status of the action (SUCCESS/FAILURE)"
+          },
+          {
+            name        = "details"
+            type        = "JSON"
+            mode        = "NULLABLE"
+            description = "Additional details about the action"
+          }
+        ])
+        
+        labels = local.common_labels
+      }
+
+      # Service Account for Governance Operations
+      resource "google_service_account" "governance_sa" {
+        account_id   = "${local.resource_prefix}-sa"
+        display_name = "Data Governance Service Account"
+        description  = "Service account for automated data governance operations"
+        project      = var.project_id
+        
+        depends_on = [google_project_service.required_apis]
+      }
+
+      # IAM roles for the governance service account
+      resource "google_project_iam_member" "governance_sa_roles" {
+        for_each = toset([
+          "roles/dataplex.admin",
+          "roles/dlp.admin",
+          "roles/bigquery.dataEditor",
+          "roles/bigquery.jobUser",
+          "roles/storage.objectAdmin",
+          "roles/workflows.invoker",
+          "roles/cloudfunctions.invoker",
+          "roles/logging.logWriter",
+          "roles/monitoring.metricWriter"
+        ])
+        
+        project = var.project_id
+        role    = each.value
+        member  = "serviceAccount:${google_service_account.governance_sa.email}"
+        
+        depends_on = [google_service_account.governance_sa]
+      }
+
+      # Dataplex Lake for Unified Data Management
+      resource "google_dataplex_lake" "governance_lake" {
+        name     = "${local.resource_prefix}-lake"
+        location = var.region
+        project  = var.project_id
+        
+        description = "Intelligent data governance lake for unified asset management"
+        
+        metastore {
+          service = google_dataproc_metastore_service.governance_metastore.id
+        }
+        
+        labels = local.common_labels
+        
+        depends_on = [
+          google_project_service.required_apis,
+          google_dataproc_metastore_service.governance_metastore
+        ]
+      }
+
+      # Dataproc Metastore for Dataplex
+      resource "google_dataproc_metastore_service" "governance_metastore" {
+        service_id = "${local.resource_prefix}-metastore"
+        location   = var.region
+        project    = var.project_id
+        
+        tier = "DEVELOPER"
+        
+        hive_metastore_config {
+          version = "3.1.2"
+        }
+        
+        labels = local.common_labels
+        
+        depends_on = [google_project_service.required_apis]
+      }
+
+      # Dataplex Zones for Data Organization
+      resource "google_dataplex_zone" "raw_data_zone" {
+        name     = "raw-data-zone"
+        location = var.region
+        lake     = google_dataplex_lake.governance_lake.name
+        project  = var.project_id
+        
+        type = "RAW"
+        
+        resource_spec {
+          location_type = "SINGLE_REGION"
+        }
+        
+        discovery_spec {
+          enabled = true
+          
+          schedule = "0 4 * * *"  # Daily at 4 AM
+          
+          csv_options {
+            header_rows     = 1
+            delimiter       = ","
+            encoding        = "UTF-8"
+            disable_type_inference = false
+          }
+          
+          json_options {
+            encoding        = "UTF-8"
+            disable_type_inference = false
+          }
+        }
+        
+        description = "Raw data zone for data ingestion and initial processing"
+        labels      = local.common_labels
+        
+        depends_on = [google_dataplex_lake.governance_lake]
+      }
+
+      resource "google_dataplex_zone" "curated_data_zone" {
+        name     = "curated-data-zone"
+        location = var.region
+        lake     = google_dataplex_lake.governance_lake.name
+        project  = var.project_id
+        
+        type = "CURATED"
+        
+        resource_spec {
+          location_type = "SINGLE_REGION"
+        }
+        
+        discovery_spec {
+          enabled = true
+          
+          schedule = "0 5 * * *"  # Daily at 5 AM
+          
+          csv_options {
+            header_rows     = 1
+            delimiter       = ","
+            encoding        = "UTF-8"
+            disable_type_inference = false
+          }
+          
+          json_options {
+            encoding        = "UTF-8"
+            disable_type_inference = false
+          }
+        }
+        
+        description = "Curated data zone for processed and analytics-ready data"
+        labels      = local.common_labels
+        
+        depends_on = [google_dataplex_zone.raw_data_zone]
+      }
+
+      # Dataplex Assets for Storage Integration
+      resource "google_dataplex_asset" "data_lake_asset" {
+        name     = "data-lake-asset"
+        location = var.region
+        lake     = google_dataplex_lake.governance_lake.name
+        zone     = google_dataplex_zone.raw_data_zone.name
+        project  = var.project_id
+        
+        resource_spec {
+          name = google_storage_bucket.data_lake.name
+          type = "STORAGE_BUCKET"
+        }
+        
+        discovery_spec {
+          enabled = true
+          
+          schedule = "0 6 * * *"  # Daily at 6 AM
+          
+          csv_options {
+            header_rows     = 1
+            delimiter       = ","
+            encoding        = "UTF-8"
+            disable_type_inference = false
+          }
+          
+          json_options {
+            encoding        = "UTF-8"
+            disable_type_inference = false
+          }
+        }
+        
+        description = "Data lake storage asset for governance management"
+        labels      = local.common_labels
+        
+        depends_on = [
+          google_dataplex_zone.raw_data_zone,
+          google_storage_bucket.data_lake
+        ]
+      }
+
+      resource "google_dataplex_asset" "bigquery_asset" {
+        name     = "bigquery-analytics-asset"
+        location = var.region
+        lake     = google_dataplex_lake.governance_lake.name
+        zone     = google_dataplex_zone.curated_data_zone.name
+        project  = var.project_id
+        
+        resource_spec {
+          name = "projects/${var.project_id}/datasets/${google_bigquery_dataset.governance_analytics.dataset_id}"
+          type = "BIGQUERY_DATASET"
+        }
+        
+        discovery_spec {
+          enabled = true
+          
+          schedule = "0 7 * * *"  # Daily at 7 AM
+        }
+        
+        description = "BigQuery analytics dataset asset for governance reporting"
+        labels      = local.common_labels
+        
+        depends_on = [
+          google_dataplex_zone.curated_data_zone,
+          google_bigquery_dataset.governance_analytics
+        ]
+      }
+
+      # Cloud DLP Configuration for Sensitive Data Detection
+      resource "google_data_loss_prevention_inspect_template" "governance_template" {
+        parent       = "projects/${var.project_id}"
+        template_id  = "${local.resource_prefix}-inspect-template"
+        display_name = "Governance Data Inspection Template"
+        description  = "Template for detecting sensitive data in governance workflows"
+        
+        inspect_config {
+          min_likelihood = "POSSIBLE"
+          
+          info_types {
+            name = "EMAIL_ADDRESS"
+          }
+          info_types {
+            name = "PHONE_NUMBER"
+          }
+          info_types {
+            name = "CREDIT_CARD_NUMBER"
+          }
+          info_types {
+            name = "US_SOCIAL_SECURITY_NUMBER"
+          }
+          info_types {
+            name = "PERSON_NAME"
+          }
+          info_types {
+            name = "DATE_OF_BIRTH"
+          }
+          info_types {
+            name = "US_PASSPORT"
+          }
+          info_types {
+            name = "MEDICAL_RECORD_NUMBER"
+          }
+          
+          limits {
+            max_findings_per_request = 1000
+            max_findings_per_info_type {
+              info_type {
+                name = "EMAIL_ADDRESS"
+              }
+              max_findings = 100
+            }
+          }
+          
+          include_quote = true
+          
+          exclude_info_types = false
+        }
+        
+        depends_on = [google_project_service.required_apis]
+      }
+
+      # Cloud DLP Job Trigger for Automated Scanning
+      resource "google_data_loss_prevention_job_trigger" "governance_scan_trigger" {
+        parent       = "projects/${var.project_id}"
+        trigger_id   = "${local.resource_prefix}-scan-trigger"
+        display_name = "Governance Automated Scan Trigger"
+        description  = "Automated trigger for scanning data lake assets for sensitive data"
+        
+        triggers {
+          schedule {
+            recurrence_period_duration = "604800s"  # Weekly
+          }
+        }
+        
+        inspect_job {
+          inspect_template_name = google_data_loss_prevention_inspect_template.governance_template.name
+          
+          storage_config {
+            cloud_storage_options {
+              file_set {
+                url = "gs://${google_storage_bucket.data_lake.name}/*"
+              }
+              bytes_limit_per_file = 1048576  # 1MB
+              
+              file_types = ["CSV", "JSON", "AVRO", "PARQUET"]
+              
+              sample_method = "RANDOM_START"
+            }
+          }
+          
+          actions {
+            pub_sub {
+              topic = google_pubsub_topic.dlp_notifications.id
+            }
+          }
+        }
+        
+        depends_on = [
+          google_data_loss_prevention_inspect_template.governance_template,
+          google_storage_bucket.data_lake,
+          google_pubsub_topic.dlp_notifications
+        ]
+      }
+
+      # Pub/Sub Topic for DLP Notifications
+      resource "google_pubsub_topic" "dlp_notifications" {
+        name    = "${local.resource_prefix}-dlp-notifications"
+        project = var.project_id
+        
+        labels = local.common_labels
+        
+        depends_on = [google_project_service.required_apis]
+      }
+
+      # Cloud Function for Data Quality Assessment
+      resource "google_cloudfunctions2_function" "data_quality_assessor" {
+        name        = "${local.resource_prefix}-quality-assessor"
+        location    = var.region
+        project     = var.project_id
+        description = "Function for automated data quality assessment"
+        
+        build_config {
+          runtime     = "python311"
+          entry_point = "assess_data_quality"
+          
+          source {
+            storage_source {
+              bucket = google_storage_bucket.function_source.name
+              object = google_storage_bucket_object.function_source.name
+            }
+          }
+        }
+        
+        service_config {
+          max_instance_count = 10
+          min_instance_count = 0
+          
+          available_memory   = "512Mi"
+          timeout_seconds    = 300
+          
+          ingress_settings = "ALLOW_INTERNAL_ONLY"
+          
+          environment_variables = {
+            PROJECT_ID   = var.project_id
+            DATASET_NAME = google_bigquery_dataset.governance_analytics.dataset_id
+            REGION       = var.region
+          }
+          
+          service_account_email = google_service_account.governance_sa.email
+        }
+        
+        labels = local.common_labels
+        
+        depends_on = [
+          google_project_service.required_apis,
+          google_storage_bucket_object.function_source,
+          google_service_account.governance_sa
+        ]
+      }
+
+      # Storage bucket for Cloud Function source code
+      resource "google_storage_bucket" "function_source" {
+        name     = "${local.resource_prefix}-function-source-${local.random_suffix}"
+        location = var.region
+        project  = var.project_id
+        
+        uniform_bucket_level_access = true
+        
+        labels = local.common_labels
+        
+        depends_on = [google_project_service.required_apis]
+      }
+
+      # Function source code archive
+      data "archive_file" "function_source" {
+        type        = "zip"
+        output_path = "/tmp/function-source.zip"
+        
+        source {
+          content = <<-EOT
+import functions_framework
+from google.cloud import bigquery
+from google.cloud import dataplex_v1
+import json
+import datetime
+import os
+
+@functions_framework.http
+def assess_data_quality(request):
+    """Assess data quality for governance workflows"""
+    try:
+        client = bigquery.Client()
+        dataplex_client = dataplex_v1.DataplexServiceClient()
+        
+        # Get request parameters
+        request_json = request.get_json(silent=True)
+        asset_name = request_json.get('asset_name', 'unknown')
+        zone = request_json.get('zone', 'unknown')
+        
+        # Simulate quality assessment (replace with actual logic)
+        quality_metrics = {
+            'completeness': 0.95,
+            'validity': 0.88,
+            'consistency': 0.92,
+            'accuracy': 0.89,
+            'timeliness': 0.93,
+            'uniqueness': 0.97
+        }
+        
+        # Calculate overall quality score
+        quality_score = sum(quality_metrics.values()) / len(quality_metrics)
+        issues_found = sum(1 for score in quality_metrics.values() if score < 0.9)
+        
+        # Insert results into BigQuery
+        project_id = os.environ.get('PROJECT_ID')
+        dataset_name = os.environ.get('DATASET_NAME')
+        table_id = f"{project_id}.{dataset_name}.data_quality_metrics"
+        
+        rows_to_insert = [{
+            'timestamp': datetime.datetime.utcnow().isoformat(),
+            'asset_name': asset_name,
+            'zone': zone,
+            'quality_score': quality_score,
+            'issues_found': issues_found,
+            'scan_type': 'automated',
+            'details': quality_metrics
+        }]
+        
+        errors = client.insert_rows_json(table_id, rows_to_insert)
+        
+        return {
+            'status': 'success' if not errors else 'error',
+            'quality_score': quality_score,
+            'issues_found': issues_found,
+            'metrics': quality_metrics,
+            'errors': errors
+        }
+        
+    except Exception as e:
+        return {'status': 'error', 'message': str(e)}
+EOT
+          filename = "main.py"
+        }
+        
+        source {
+          content = <<-EOT
+functions-framework==3.*
+google-cloud-bigquery==3.*
+google-cloud-dataplex==1.*
+EOT
+          filename = "requirements.txt"
+        }
+      }
+
+      # Upload function source to Cloud Storage
+      resource "google_storage_bucket_object" "function_source" {
+        name   = "function-source-${local.random_suffix}.zip"
+        bucket = google_storage_bucket.function_source.name
+        source = data.archive_file.function_source.output_path
+        
+        depends_on = [google_storage_bucket.function_source]
+      }
+
+      # Cloud Workflows for Governance Orchestration
+      resource "google_workflows_workflow" "governance_workflow" {
+        name            = "${local.resource_prefix}-workflow"
+        region          = var.region
+        project         = var.project_id
+        description     = "Intelligent data governance orchestration workflow"
+        service_account = google_service_account.governance_sa.email
+        
+        source_contents = <<-EOT
+# Intelligent Data Governance Orchestration Workflow
+main:
+  params: [args]
+  steps:
+    - init:
+        assign:
+          - projectId: ${var.project_id}
+          - region: ${var.region}
+          - timestamp: $${sys.now()}
+          - assets: []
+          - governance_results: {}
+    
+    - discover_assets:
+        call: discover_data_assets
+        args:
+          project: $${projectId}
+          region: $${region}
+        result: discovered_assets
+    
+    - process_assets:
+        for:
+          value: asset
+          in: $${discovered_assets}
+          steps:
+            - assess_quality:
+                call: http.post
+                args:
+                  url: https://$${region}-$${projectId}.cloudfunctions.net/${google_cloudfunctions2_function.data_quality_assessor.name}
+                  body:
+                    asset_name: $${asset.name}
+                    zone: $${asset.zone}
+                  headers:
+                    Content-Type: "application/json"
+                  auth:
+                    type: OIDC
+                result: quality_result
+            
+            - scan_sensitive_data:
+                call: scan_for_sensitive_data
+                args:
+                  asset: $${asset}
+                  project: $${projectId}
+                result: dlp_result
+            
+            - evaluate_compliance:
+                call: evaluate_compliance_status
+                args:
+                  quality_result: $${quality_result}
+                  dlp_result: $${dlp_result}
+                  asset: $${asset}
+                result: compliance_status
+            
+            - store_results:
+                call: store_governance_results
+                args:
+                  project: $${projectId}
+                  asset: $${asset}
+                  quality: $${quality_result}
+                  compliance: $${compliance_status}
+                  timestamp: $${timestamp}
+    
+    - generate_alerts:
+        call: generate_governance_alerts
+        args:
+          results: $${governance_results}
+          project: $${projectId}
+    
+    - return_summary:
+        return:
+          status: "completed"
+          timestamp: $${timestamp}
+          assets_processed: $${len(discovered_assets)}
+          governance_summary: $${governance_results}
+
+# Discover data assets in Dataplex
+discover_data_assets:
+  params: [project, region]
+  steps:
+    - list_assets:
+        assign:
+          - mock_assets:
+            - name: "customer-data"
+              zone: "raw-data-zone"
+              type: "table"
+            - name: "transaction-logs"
+              zone: "curated-data-zone"
+              type: "bucket"
+            - name: "analytics-dataset"
+              zone: "curated-data-zone"
+              type: "bigquery"
+    - return_assets:
+        return: $${mock_assets}
+
+# Scan for sensitive data using Cloud DLP
+scan_for_sensitive_data:
+  params: [asset, project]
+  steps:
+    - simulate_scan:
+        assign:
+          - scan_result:
+              findings_count: 5
+              info_types: ["EMAIL_ADDRESS", "PHONE_NUMBER", "CREDIT_CARD_NUMBER"]
+              risk_level: "MEDIUM"
+              scan_timestamp: $${sys.now()}
+    - return_scan:
+        return: $${scan_result}
+
+# Evaluate compliance status
+evaluate_compliance_status:
+  params: [quality_result, dlp_result, asset]
+  steps:
+    - calculate_compliance:
+        assign:
+          - quality_score: $${quality_result.body.quality_score}
+          - sensitive_findings: $${dlp_result.findings_count}
+          - compliance_status:
+              status: $${if(quality_score >= 0.9 and sensitive_findings <= 10, "COMPLIANT", "NON_COMPLIANT")}
+              quality_score: $${quality_score}
+              sensitive_data_count: $${sensitive_findings}
+              risk_assessment: $${dlp_result.risk_level}
+              evaluation_timestamp: $${sys.now()}
+    - return_compliance:
+        return: $${compliance_status}
+
+# Store governance results in BigQuery
+store_governance_results:
+  params: [project, asset, quality, compliance, timestamp]
+  steps:
+    - log_result:
+        assign:
+          - result: "stored"
+    - return_result:
+        return: $${result}
+
+# Generate governance alerts
+generate_governance_alerts:
+  params: [results, project]
+  steps:
+    - check_violations:
+        assign:
+          - alerts_generated: 0
+    - return_alerts:
+        return: $${alerts_generated}
+EOT
+        
+        labels = local.common_labels
+        
+        depends_on = [
+          google_project_service.required_apis,
+          google_service_account.governance_sa,
+          google_cloudfunctions2_function.data_quality_assessor
+        ]
+      }
+
+      # Cloud Scheduler for Automated Workflow Execution
+      resource "google_cloud_scheduler_job" "governance_schedule" {
+        name     = "${local.resource_prefix}-schedule"
+        region   = var.region
+        project  = var.project_id
+        schedule = "0 8 * * 1"  # Weekly on Monday at 8 AM
+        
+        description = "Automated execution of governance workflows"
+        
+        http_target {
+          http_method = "POST"
+          uri         = "https://workflowexecutions.googleapis.com/v1/projects/${var.project_id}/locations/${var.region}/workflows/${google_workflows_workflow.governance_workflow.name}/executions"
+          
+          body = base64encode(jsonencode({
+            argument = jsonencode({
+              trigger = "scheduled"
+              scope   = "full_scan"
+            })
+          }))
+          
+          headers = {
+            "Content-Type" = "application/json"
+          }
+          
+          oauth_token {
+            service_account_email = google_service_account.governance_sa.email
+          }
+        }
+        
+        depends_on = [
+          google_workflows_workflow.governance_workflow,
+          google_service_account.governance_sa
+        ]
+      }
+
+      # Cloud Monitoring Dashboard
+      resource "google_monitoring_dashboard" "governance_dashboard" {
+        dashboard_json = jsonencode({
+          displayName = "Data Governance Dashboard"
+          mosaicLayout = {
+            tiles = [
+              {
+                width  = 6
+                height = 4
+                widget = {
+                  title = "Data Quality Scores"
+                  xyChart = {
+                    dataSets = [
+                      {
+                        timeSeriesQuery = {
+                          timeSeriesFilter = {
+                            filter = "resource.type=\"bigquery_dataset\""
+                            aggregation = {
+                              alignmentPeriod  = "300s"
+                              perSeriesAligner = "ALIGN_MEAN"
+                            }
+                          }
+                        }
+                        plotType = "LINE"
+                      }
+                    ]
+                    timeshiftDuration = "0s"
+                    yAxis = {
+                      label = "Quality Score"
+                      scale = "LINEAR"
+                    }
+                  }
+                }
+              },
+              {
+                width  = 6
+                height = 4
+                widget = {
+                  title = "Compliance Status"
+                  scorecard = {
+                    timeSeriesQuery = {
+                      timeSeriesFilter = {
+                        filter = "resource.type=\"cloud_function\""
+                        aggregation = {
+                          alignmentPeriod  = "300s"
+                          perSeriesAligner = "ALIGN_MEAN"
+                        }
+                      }
+                    }
+                    sparkChartView = {
+                      sparkChartType = "SPARK_BAR"
+                    }
+                  }
+                }
+              },
+              {
+                width  = 12
+                height = 4
+                widget = {
+                  title = "Governance Workflow Executions"
+                  xyChart = {
+                    dataSets = [
+                      {
+                        timeSeriesQuery = {
+                          timeSeriesFilter = {
+                            filter = "resource.type=\"workflows.googleapis.com/Workflow\""
+                            aggregation = {
+                              alignmentPeriod  = "300s"
+                              perSeriesAligner = "ALIGN_RATE"
+                            }
+                          }
+                        }
+                        plotType = "STACKED_BAR"
+                      }
+                    ]
+                    timeshiftDuration = "0s"
+                    yAxis = {
+                      label = "Executions per minute"
+                      scale = "LINEAR"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        })
+        
+        depends_on = [google_project_service.required_apis]
+      }
+
+      # Cloud Monitoring Alert Policy
+      resource "google_monitoring_alert_policy" "data_quality_alert" {
+        display_name = "Data Quality Alert Policy"
+        project      = var.project_id
+        
+        documentation {
+          content = "Alert when data quality scores drop below acceptable threshold"
+        }
+        
+        conditions {
+          display_name = "Low Data Quality Score"
+          
+          condition_threshold {
+            filter         = "resource.type=\"cloud_function\""
+            comparison     = "COMPARISON_LESS_THAN"
+            threshold_value = 0.8
+            duration       = "300s"
+            
+            aggregations {
+              alignment_period   = "300s"
+              per_series_aligner = "ALIGN_MEAN"
+            }
+          }
+        }
+        
+        alert_strategy {
+          auto_close = "1800s"
+        }
+        
+        enabled = true
+        
+        depends_on = [google_project_service.required_apis]
+      }
+
+      # Log-based Metrics
+      resource "google_logging_metric" "governance_workflow_executions" {
+        name   = "${local.resource_prefix}-workflow-executions"
+        project = var.project_id
+        
+        filter = "resource.type=\"workflows.googleapis.com/Workflow\" AND jsonPayload.workflow_name=\"${google_workflows_workflow.governance_workflow.name}\""
+        
+        metric_descriptor {
+          metric_kind = "GAUGE"
+          value_type  = "INT64"
+          display_name = "Governance Workflow Executions"
+        }
+        
+        depends_on = [
+          google_project_service.required_apis,
+          google_workflows_workflow.governance_workflow
+        ]
+      }
+
+      # Outputs for infrastructure information
+      output "project_id" {
+        description = "Google Cloud project ID"
+        value       = var.project_id
+      }
+
+      output "region" {
+        description = "Google Cloud region"
+        value       = var.region
+      }
+
+      output "data_lake_bucket_name" {
+        description = "Name of the data lake storage bucket"
+        value       = google_storage_bucket.data_lake.name
+      }
+
+      output "data_lake_bucket_url" {
+        description = "URL of the data lake storage bucket"
+        value       = google_storage_bucket.data_lake.url
+      }
+
+      output "dataplex_lake_name" {
+        description = "Name of the Dataplex lake"
+        value       = google_dataplex_lake.governance_lake.name
+      }
+
+      output "dataplex_lake_id" {
+        description = "Full resource ID of the Dataplex lake"
+        value       = google_dataplex_lake.governance_lake.id
+      }
+
+      output "bigquery_dataset_id" {
+        description = "BigQuery dataset ID for governance analytics"
+        value       = google_bigquery_dataset.governance_analytics.dataset_id
+      }
+
+      output "bigquery_dataset_location" {
+        description = "BigQuery dataset location"
+        value       = google_bigquery_dataset.governance_analytics.location
+      }
+
+      output "governance_workflow_name" {
+        description = "Name of the governance orchestration workflow"
+        value       = google_workflows_workflow.governance_workflow.name
+      }
+
+      output "governance_workflow_id" {
+        description = "Full resource ID of the governance workflow"
+        value       = google_workflows_workflow.governance_workflow.id
+      }
+
+      output "data_quality_function_name" {
+        description = "Name of the data quality assessment Cloud Function"
+        value       = google_cloudfunctions2_function.data_quality_assessor.name
+      }
+
+      output "data_quality_function_url" {
+        description = "URL of the data quality assessment Cloud Function"
+        value       = google_cloudfunctions2_function.data_quality_assessor.service_config[0].uri
+      }
+
+      output "dlp_inspect_template_name" {
+        description = "Name of the DLP inspection template"
+        value       = google_data_loss_prevention_inspect_template.governance_template.name
+      }
+
+      output "dlp_job_trigger_name" {
+        description = "Name of the DLP job trigger"
+        value       = google_data_loss_prevention_job_trigger.governance_scan_trigger.name
+      }
+
+      output "service_account_email" {
+        description = "Email of the governance service account"
+        value       = google_service_account.governance_sa.email
+      }
+
+      output "monitoring_dashboard_url" {
+        description = "URL to the governance monitoring dashboard"
+        value       = "https://console.cloud.google.com/monitoring/dashboards/custom/${google_monitoring_dashboard.governance_dashboard.id}?project=${var.project_id}"
+      }
+
+      output "kms_key_name" {
+        description = "Name of the KMS encryption key"
+        value       = google_kms_crypto_key.governance_key.name
+      }
+
+      output "pubsub_topic_name" {
+        description = "Name of the Pub/Sub topic for DLP notifications"
+        value       = google_pubsub_topic.dlp_notifications.name
+      }
+
+      output "scheduler_job_name" {
+        description = "Name of the Cloud Scheduler job"
+        value       = google_cloud_scheduler_job.governance_schedule.name
+      }
+
+      output "deployment_summary" {
+        description = "Summary of deployed resources"
+        value = {
+          data_lake_bucket    = google_storage_bucket.data_lake.name
+          dataplex_lake       = google_dataplex_lake.governance_lake.name
+          bigquery_dataset    = google_bigquery_dataset.governance_analytics.dataset_id
+          workflows           = google_workflows_workflow.governance_workflow.name
+          cloud_function      = google_cloudfunctions2_function.data_quality_assessor.name
+          service_account     = google_service_account.governance_sa.email
+          dlp_template        = google_data_loss_prevention_inspect_template.governance_template.name
+          monitoring_dashboard = google_monitoring_dashboard.governance_dashboard.id
+          kms_key             = google_kms_crypto_key.governance_key.name
+          scheduler_job       = google_cloud_scheduler_job.governance_schedule.name
+        }
+      }

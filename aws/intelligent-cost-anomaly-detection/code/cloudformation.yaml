@@ -1,0 +1,744 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Automated Cost Anomaly Detection with CloudWatch and Lambda
+  Creates a comprehensive cost monitoring system that uses AWS Cost Anomaly Detection,
+  Lambda functions for intelligent processing, SNS for notifications, and CloudWatch
+  for operational dashboards to detect and respond to unusual spending patterns.
+
+# ==========================================
+# METADATA
+# ==========================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+          - SlackWebhookUrl
+      - Label:
+          default: "Cost Monitoring Configuration"
+        Parameters:
+          - AnomalyThreshold
+          - MonitoredService
+          - NotificationFrequency
+      - Label:
+          default: "Resource Configuration"
+        Parameters:
+          - Environment
+          - ResourcePrefix
+    ParameterLabels:
+      NotificationEmail:
+        default: "Email Address for Cost Alerts"
+      SlackWebhookUrl:
+        default: "Slack Webhook URL (Optional)"
+      AnomalyThreshold:
+        default: "Anomaly Detection Threshold ($)"
+      MonitoredService:
+        default: "AWS Service to Monitor"
+      NotificationFrequency:
+        default: "Notification Frequency"
+      Environment:
+        default: "Environment Tag"
+      ResourcePrefix:
+        default: "Resource Name Prefix"
+
+# ==========================================
+# PARAMETERS
+# ==========================================
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive cost anomaly notifications
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address
+
+  SlackWebhookUrl:
+    Type: String
+    Description: Optional Slack webhook URL for notifications (leave empty to disable)
+    Default: ""
+    NoEcho: true
+
+  AnomalyThreshold:
+    Type: Number
+    Description: Minimum dollar amount for anomaly detection alerts
+    Default: 10.0
+    MinValue: 1.0
+    MaxValue: 10000.0
+    ConstraintDescription: Must be between $1 and $10,000
+
+  MonitoredService:
+    Type: String
+    Description: AWS service to monitor for cost anomalies
+    Default: "Amazon Elastic Compute Cloud - Compute"
+    AllowedValues:
+      - "Amazon Elastic Compute Cloud - Compute"
+      - "Amazon Simple Storage Service"
+      - "Amazon Relational Database Service"
+      - "AWS Lambda"
+      - "Amazon CloudFront"
+      - "Amazon DynamoDB"
+      - "Amazon Elastic Load Balancing"
+      - "Amazon ElastiCache"
+      - "All Services"
+
+  NotificationFrequency:
+    Type: String
+    Description: How often to send anomaly notifications
+    Default: "IMMEDIATE"
+    AllowedValues:
+      - "IMMEDIATE"
+      - "DAILY"
+      - "WEEKLY"
+
+  Environment:
+    Type: String
+    Description: Environment tag for all resources
+    Default: "Production"
+    AllowedValues:
+      - "Development"
+      - "Staging"
+      - "Production"
+
+  ResourcePrefix:
+    Type: String
+    Description: Prefix for all resource names (must be lowercase)
+    Default: "cost-anomaly"
+    AllowedPattern: ^[a-z][a-z0-9\-]{2,30}$
+    ConstraintDescription: Must start with lowercase letter, contain only lowercase letters, numbers, and hyphens, and be 3-31 characters long
+
+# ==========================================
+# CONDITIONS
+# ==========================================
+Conditions:
+  HasSlackWebhook: !Not [!Equals [!Ref SlackWebhookUrl, ""]]
+  MonitorAllServices: !Equals [!Ref MonitoredService, "All Services"]
+  IsProduction: !Equals [!Ref Environment, "Production"]
+
+# ==========================================
+# RESOURCES
+# ==========================================
+Resources:
+
+  # ==========================================
+  # SNS TOPIC AND SUBSCRIPTIONS
+  # ==========================================
+  CostAnomalyNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ResourcePrefix}-alerts"
+      DisplayName: "Cost Anomaly Detection Alerts"
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: CostAnomalyDetection
+        - Key: CreatedBy
+          Value: CloudFormation
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref CostAnomalyNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ==========================================
+  # IAM ROLE FOR LAMBDA FUNCTION
+  # ==========================================
+  CostAnomalyLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CostAnomalyPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ce:GetCostAndUsage
+                  - ce:GetUsageReport
+                  - ce:GetDimensionValues
+                  - ce:GetReservationCoverage
+                  - ce:GetReservationPurchaseRecommendation
+                  - ce:GetReservationUtilization
+                  - ce:GetCostCategories
+                  - ce:GetUsageCategories
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:GetMetricStatistics
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref CostAnomalyNotificationTopic
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ResourcePrefix}/*"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: CostAnomalyDetection
+
+  # ==========================================
+  # SSM PARAMETER FOR SLACK WEBHOOK (IF PROVIDED)
+  # ==========================================
+  SlackWebhookParameter:
+    Type: AWS::SSM::Parameter
+    Condition: HasSlackWebhook
+    Properties:
+      Name: !Sub "/${ResourcePrefix}/slack-webhook-url"
+      Type: SecureString
+      Value: !Ref SlackWebhookUrl
+      Description: Slack webhook URL for cost anomaly notifications
+      Tags:
+        Environment: !Ref Environment
+        Purpose: CostAnomalyDetection
+
+  # ==========================================
+  # LAMBDA FUNCTION
+  # ==========================================
+  CostAnomalyProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-processor"
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: 300
+      MemorySize: 256
+      Role: !GetAtt CostAnomalyLambdaRole.Arn
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref CostAnomalyNotificationTopic
+          SLACK_WEBHOOK_PARAMETER: !If
+            - HasSlackWebhook
+            - !Ref SlackWebhookParameter
+            - ""
+          ENVIRONMENT: !Ref Environment
+      Description: Enhanced Cost Anomaly Detection processor with intelligent analysis
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import urllib3
+          from datetime import datetime, timedelta
+          from decimal import Decimal
+          
+          def lambda_handler(event, context):
+              """
+              Process Cost Anomaly Detection events with enhanced analysis
+              """
+              print(f"Received event: {json.dumps(event, indent=2)}")
+              
+              # Initialize AWS clients
+              ce_client = boto3.client('ce')
+              cloudwatch = boto3.client('cloudwatch')
+              sns = boto3.client('sns')
+              ssm = boto3.client('ssm')
+              
+              try:
+                  # Extract anomaly details from EventBridge event
+                  detail = event['detail']
+                  anomaly_id = detail['anomalyId']
+                  total_impact = detail['impact']['totalImpact']
+                  account_name = detail['accountName']
+                  dimension_value = detail.get('dimensionValue', 'N/A')
+                  
+                  # Calculate percentage impact
+                  total_actual = detail['impact']['totalActualSpend']
+                  total_expected = detail['impact']['totalExpectedSpend']
+                  impact_percentage = detail['impact']['totalImpactPercentage']
+                  
+                  # Get additional cost breakdown
+                  cost_breakdown = get_cost_breakdown(ce_client, detail)
+                  
+                  # Publish custom CloudWatch metrics
+                  publish_metrics(cloudwatch, anomaly_id, total_impact, impact_percentage)
+                  
+                  # Send enhanced notification
+                  send_enhanced_notification(sns, ssm, detail, cost_breakdown)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Successfully processed anomaly {anomaly_id}',
+                          'total_impact': float(total_impact),
+                          'impact_percentage': float(impact_percentage)
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error processing anomaly: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def get_cost_breakdown(ce_client, detail):
+              """Get detailed cost breakdown for the anomaly period"""
+              try:
+                  end_date = detail['anomalyEndDate'][:10]  # YYYY-MM-DD
+                  start_date = detail['anomalyStartDate'][:10]
+                  
+                  # Get cost and usage data
+                  response = ce_client.get_cost_and_usage(
+                      TimePeriod={
+                          'Start': start_date,
+                          'End': end_date
+                      },
+                      Granularity='DAILY',
+                      Metrics=['BlendedCost', 'UsageQuantity'],
+                      GroupBy=[
+                          {'Type': 'DIMENSION', 'Key': 'SERVICE'}
+                      ]
+                  )
+                  
+                  return response.get('ResultsByTime', [])
+                  
+              except Exception as e:
+                  print(f"Error getting cost breakdown: {str(e)}")
+                  return []
+          
+          def publish_metrics(cloudwatch, anomaly_id, total_impact, impact_percentage):
+              """Publish custom CloudWatch metrics for anomaly tracking"""
+              try:
+                  cloudwatch.put_metric_data(
+                      Namespace='AWS/CostAnomaly',
+                      MetricData=[
+                          {
+                              'MetricName': 'AnomalyImpact',
+                              'Value': float(total_impact),
+                              'Unit': 'None',
+                              'Dimensions': [
+                                  {
+                                      'Name': 'AnomalyId',
+                                      'Value': anomaly_id
+                                  },
+                                  {
+                                      'Name': 'Environment',
+                                      'Value': os.environ.get('ENVIRONMENT', 'Unknown')
+                                  }
+                              ]
+                          },
+                          {
+                              'MetricName': 'AnomalyPercentage',
+                              'Value': float(impact_percentage),
+                              'Unit': 'Percent',
+                              'Dimensions': [
+                                  {
+                                      'Name': 'AnomalyId',
+                                      'Value': anomaly_id
+                                  },
+                                  {
+                                      'Name': 'Environment',
+                                      'Value': os.environ.get('ENVIRONMENT', 'Unknown')
+                                  }
+                              ]
+                          }
+                      ]
+                  )
+                  print("✅ Custom metrics published to CloudWatch")
+                  
+              except Exception as e:
+                  print(f"Error publishing metrics: {str(e)}")
+          
+          def send_enhanced_notification(sns, ssm, detail, cost_breakdown):
+              """Send enhanced notification with detailed analysis"""
+              try:
+                  # Format the notification message
+                  message = format_notification_message(detail, cost_breakdown)
+                  
+                  # Publish to SNS
+                  response = sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=f"🚨 AWS Cost Anomaly Detected - ${detail['impact']['totalImpact']:.2f}",
+                      Message=message
+                  )
+                  
+                  print(f"✅ SNS notification sent: {response['MessageId']}")
+                  
+                  # Send Slack notification if webhook is configured
+                  slack_webhook_param = os.environ.get('SLACK_WEBHOOK_PARAMETER')
+                  if slack_webhook_param:
+                      send_slack_notification(ssm, slack_webhook_param, detail)
+                  
+              except Exception as e:
+                  print(f"Error sending notification: {str(e)}")
+          
+          def send_slack_notification(ssm, parameter_name, detail):
+              """Send Slack notification using webhook"""
+              try:
+                  # Get Slack webhook URL from SSM Parameter Store
+                  response = ssm.get_parameter(
+                      Name=parameter_name,
+                      WithDecryption=True
+                  )
+                  webhook_url = response['Parameter']['Value']
+                  
+                  # Format Slack message
+                  slack_message = {
+                      "text": f"🚨 AWS Cost Anomaly Detected",
+                      "attachments": [
+                          {
+                              "color": "danger",
+                              "fields": [
+                                  {
+                                      "title": "Total Impact",
+                                      "value": f"${detail['impact']['totalImpact']:.2f}",
+                                      "short": True
+                                  },
+                                  {
+                                      "title": "Percentage Increase",
+                                      "value": f"{detail['impact']['totalImpactPercentage']:.1f}%",
+                                      "short": True
+                                  },
+                                  {
+                                      "title": "Account",
+                                      "value": detail['accountName'],
+                                      "short": True
+                                  },
+                                  {
+                                      "title": "Service",
+                                      "value": detail.get('dimensionValue', 'Multiple Services'),
+                                      "short": True
+                                  }
+                              ]
+                          }
+                      ]
+                  }
+                  
+                  # Send to Slack
+                  http = urllib3.PoolManager()
+                  response = http.request(
+                      'POST',
+                      webhook_url,
+                      body=json.dumps(slack_message),
+                      headers={'Content-Type': 'application/json'}
+                  )
+                  
+                  print(f"✅ Slack notification sent: {response.status}")
+                  
+              except Exception as e:
+                  print(f"Error sending Slack notification: {str(e)}")
+          
+          def format_notification_message(detail, cost_breakdown):
+              """Format detailed notification message"""
+              impact = detail['impact']
+              
+              message = f"""
+          AWS Cost Anomaly Detection Alert
+          ================================
+          
+          Anomaly ID: {detail['anomalyId']}
+          Account: {detail['accountName']}
+          Service: {detail.get('dimensionValue', 'Multiple Services')}
+          
+          Cost Impact:
+          - Total Impact: ${impact['totalImpact']:.2f}
+          - Actual Spend: ${impact['totalActualSpend']:.2f}
+          - Expected Spend: ${impact['totalExpectedSpend']:.2f}
+          - Percentage Increase: {impact['totalImpactPercentage']:.1f}%
+          
+          Period:
+          - Start: {detail['anomalyStartDate']}
+          - End: {detail['anomalyEndDate']}
+          
+          Anomaly Score:
+          - Current: {detail['anomalyScore']['currentScore']:.3f}
+          - Maximum: {detail['anomalyScore']['maxScore']:.3f}
+          
+          Root Causes:
+          """
+              
+              # Add root cause analysis
+              for cause in detail.get('rootCauses', []):
+                  message += f"""
+          - Account: {cause.get('linkedAccountName', 'N/A')}
+            Service: {cause.get('service', 'N/A')}
+            Region: {cause.get('region', 'N/A')}
+            Usage Type: {cause.get('usageType', 'N/A')}
+            Contribution: ${cause.get('impact', {}).get('contribution', 0):.2f}
+          """
+              
+              message += f"""
+          
+          Next Steps:
+          1. Review the affected services and usage patterns
+          2. Check for any unauthorized usage or misconfigurations
+          3. Consider implementing cost controls if needed
+          4. Monitor for additional anomalies
+          
+          AWS Console Links:
+          - Cost Explorer: https://console.aws.amazon.com/billing/home#/costexplorer
+          - Cost Anomaly Detection: https://console.aws.amazon.com/billing/home#/anomaly-detection
+          
+          Generated by: AWS Cost Anomaly Detection Lambda
+          Environment: {os.environ.get('ENVIRONMENT', 'Unknown')}
+          Timestamp: {datetime.now().isoformat()}
+              """
+              
+              return message
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: CostAnomalyDetection
+
+  # ==========================================
+  # EVENTBRIDGE RULE
+  # ==========================================
+  CostAnomalyEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ResourcePrefix}-event-rule"
+      Description: "Capture Cost Anomaly Detection events"
+      EventPattern:
+        source:
+          - "aws.ce"
+        detail-type:
+          - "Anomaly Detected"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CostAnomalyProcessorFunction.Arn
+          Id: "CostAnomalyLambdaTarget"
+
+  # ==========================================
+  # LAMBDA PERMISSION FOR EVENTBRIDGE
+  # ==========================================
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CostAnomalyProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CostAnomalyEventRule.Arn
+
+  # ==========================================
+  # COST ANOMALY MONITOR
+  # ==========================================
+  CostAnomalyMonitor:
+    Type: AWS::CE::AnomalyMonitor
+    Properties:
+      MonitorName: !Sub "${ResourcePrefix}-monitor"
+      MonitorType: DIMENSIONAL
+      MonitorSpecification: !If
+        - MonitorAllServices
+        - !Ref "AWS::NoValue"
+        - |
+          {
+            "Dimension": "SERVICE",
+            "Key": "SERVICE",
+            "Values": ["${MonitoredService}"],
+            "MatchOptions": ["EQUALS"]
+          }
+      MonitorDimension: !If
+        - MonitorAllServices
+        - "SERVICE"
+        - "SERVICE"
+
+  # ==========================================
+  # COST ANOMALY DETECTOR
+  # ==========================================
+  CostAnomalyDetector:
+    Type: AWS::CE::AnomalyDetector
+    Properties:
+      DetectorName: !Sub "${ResourcePrefix}-detector"
+      MonitorArnList:
+        - !GetAtt CostAnomalyMonitor.MonitorArn
+      Subscribers:
+        - Address: !Ref CostAnomalyNotificationTopic
+          Type: SNS
+          Status: CONFIRMED
+      Threshold: !Ref AnomalyThreshold
+      Frequency: !Ref NotificationFrequency
+
+  # ==========================================
+  # CLOUDWATCH DASHBOARD
+  # ==========================================
+  CostAnomalyDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${ResourcePrefix}-dashboard"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/CostAnomaly", "AnomalyImpact", "Environment", "${Environment}" ],
+                  [ ".", "AnomalyPercentage", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Cost Anomaly Metrics - ${Environment}",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${CostAnomalyProcessorFunction}" ],
+                  [ ".", "Duration", ".", "." ],
+                  [ ".", "Errors", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/SNS", "NumberOfMessagesPublished", "TopicName", "${ResourcePrefix}-alerts" ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "SNS Notification Metrics"
+              }
+            }
+          ]
+        }
+
+  # ==========================================
+  # CLOUDWATCH ALARMS
+  # ==========================================
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-lambda-errors"
+      AlarmDescription: "Alert when Lambda function has errors"
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CostAnomalyProcessorFunction
+      AlarmActions:
+        - !Ref CostAnomalyNotificationTopic
+      TreatMissingData: notBreaching
+
+  HighAnomalyImpactAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-high-impact"
+      AlarmDescription: "Alert when cost anomaly impact exceeds $100"
+      MetricName: AnomalyImpact
+      Namespace: AWS/CostAnomaly
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Environment
+          Value: !Ref Environment
+      AlarmActions:
+        - !Ref CostAnomalyNotificationTopic
+      TreatMissingData: notBreaching
+
+# ==========================================
+# OUTPUTS
+# ==========================================
+Outputs:
+  SNSTopicArn:
+    Description: "ARN of the SNS topic for cost anomaly notifications"
+    Value: !Ref CostAnomalyNotificationTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-SNSTopicArn"
+
+  LambdaFunctionArn:
+    Description: "ARN of the cost anomaly processing Lambda function"
+    Value: !GetAtt CostAnomalyProcessorFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaFunctionArn"
+
+  LambdaFunctionName:
+    Description: "Name of the cost anomaly processing Lambda function"
+    Value: !Ref CostAnomalyProcessorFunction
+
+  CostAnomalyMonitorArn:
+    Description: "ARN of the Cost Anomaly Monitor"
+    Value: !GetAtt CostAnomalyMonitor.MonitorArn
+    Export:
+      Name: !Sub "${AWS::StackName}-MonitorArn"
+
+  CostAnomalyDetectorArn:
+    Description: "ARN of the Cost Anomaly Detector"
+    Value: !GetAtt CostAnomalyDetector.DetectorArn
+    Export:
+      Name: !Sub "${AWS::StackName}-DetectorArn"
+
+  EventBridgeRuleArn:
+    Description: "ARN of the EventBridge rule for cost anomaly events"
+    Value: !GetAtt CostAnomalyEventRule.Arn
+
+  CloudWatchDashboardURL:
+    Description: "URL to the CloudWatch dashboard for cost anomaly monitoring"
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ResourcePrefix}-dashboard"
+
+  IAMRoleArn:
+    Description: "ARN of the IAM role used by the Lambda function"
+    Value: !GetAtt CostAnomalyLambdaRole.Arn
+
+  CostExplorerURL:
+    Description: "URL to AWS Cost Explorer"
+    Value: "https://console.aws.amazon.com/billing/home#/costexplorer"
+
+  CostAnomalyDetectionURL:
+    Description: "URL to AWS Cost Anomaly Detection console"
+    Value: "https://console.aws.amazon.com/billing/home#/anomaly-detection"
+
+  StackInfo:
+    Description: "Information about this CloudFormation stack"
+    Value: !Sub |
+      Stack Name: ${AWS::StackName}
+      Environment: ${Environment}
+      Monitored Service: ${MonitoredService}
+      Anomaly Threshold: $${AnomalyThreshold}
+      Notification Frequency: ${NotificationFrequency}
+      Created: ${AWS::Timestamp}

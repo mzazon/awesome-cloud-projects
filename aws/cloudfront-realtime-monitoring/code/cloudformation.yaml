@@ -1,0 +1,1074 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudFront Real-time Monitoring and Analytics Infrastructure
+  This template creates a comprehensive real-time monitoring system for CloudFront
+  including Kinesis streams, Lambda processing, OpenSearch, and monitoring dashboards.
+
+# =====================
+# PARAMETERS
+# =====================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: cf-monitoring
+    Description: Name prefix for all resources
+    AllowedPattern: '^[a-z0-9-]*$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    MaxLength: 20
+
+  ContentBucketName:
+    Type: String
+    Description: Name for the S3 bucket containing CloudFront content
+    AllowedPattern: '^[a-z0-9.-]*$'
+    ConstraintDescription: Must be a valid S3 bucket name
+
+  LogsBucketName:
+    Type: String
+    Description: Name for the S3 bucket for storing processed logs
+    AllowedPattern: '^[a-z0-9.-]*$'
+    ConstraintDescription: Must be a valid S3 bucket name
+
+  KinesisShardCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Number of shards for the main Kinesis stream
+
+  OpenSearchInstanceType:
+    Type: String
+    Default: t3.small.search
+    AllowedValues:
+      - t3.small.search
+      - t3.medium.search
+      - m6g.large.search
+      - m6g.xlarge.search
+    Description: OpenSearch instance type
+
+  OpenSearchInstanceCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 3
+    Description: Number of OpenSearch instances
+
+  RetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 30
+    Description: Number of days to retain metrics in DynamoDB
+
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable detailed CloudWatch monitoring
+
+# =====================
+# CONDITIONS
+# =====================
+Conditions:
+  EnableDetailedMonitoringCondition: !Equals [!Ref EnableDetailedMonitoring, 'true']
+
+# =====================
+# RESOURCES
+# =====================
+Resources:
+
+  # =====================
+  # S3 BUCKETS
+  # =====================
+  
+  # Content bucket for CloudFront origin
+  ContentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref ContentBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Sub '/aws/s3/${ProjectName}-content-bucket'
+      VersioningConfiguration:
+        Status: Enabled
+
+  # Logs bucket for processed log storage
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref LogsBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 2555  # 7 years for compliance
+
+  # =====================
+  # KINESIS RESOURCES
+  # =====================
+  
+  # Main Kinesis stream for real-time logs
+  KinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${ProjectName}-realtime-logs'
+      ShardCount: !Ref KinesisShardCount
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+      RetentionPeriodHours: 168  # 7 days
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: CloudFront real-time logging
+
+  # Processed data stream
+  ProcessedKinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${ProjectName}-processed-logs'
+      ShardCount: 1
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+      RetentionPeriodHours: 24  # 1 day for processed data
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Processed log data
+
+  # =====================
+  # DYNAMODB TABLE
+  # =====================
+  
+  # Metrics table for aggregated data
+  MetricsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-metrics'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: MetricId
+          AttributeType: S
+        - AttributeName: Timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: MetricId
+          KeyType: HASH
+        - AttributeName: Timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Real-time metrics storage
+
+  # =====================
+  # OPENSEARCH DOMAIN
+  # =====================
+  
+  # OpenSearch domain for log analytics
+  OpenSearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      DomainName: !Sub '${ProjectName}-analytics'
+      EngineVersion: 'OpenSearch_2.3'
+      ClusterConfig:
+        InstanceType: !Ref OpenSearchInstanceType
+        InstanceCount: !Ref OpenSearchInstanceCount
+        DedicatedMasterEnabled: false
+        ZoneAwarenessEnabled: false
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: gp3
+        VolumeSize: 20
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+        TLSSecurityPolicy: Policy-Min-TLS-1-2-2019-07
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+      EncryptionAtRestOptions:
+        Enabled: true
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'es:*'
+            Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ProjectName}-analytics/*'
+      AdvancedOptions:
+        rest.action.multi.allow_explicit_index: 'true'
+        indices.fielddata.cache.size: '20'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Log analytics and search
+
+  # =====================
+  # IAM ROLES AND POLICIES
+  # =====================
+  
+  # Lambda execution role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: KinesisAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:ListStreams
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource:
+                  - !GetAtt KinesisStream.Arn
+                  - !GetAtt ProcessedKinesisStream.Arn
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt MetricsTable.Arn
+        - PolicyName: CloudWatchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Firehose delivery role
+  FirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-firehose-delivery-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt LogsBucket.Arn
+                  - !Sub '${LogsBucket.Arn}/*'
+        - PolicyName: OpenSearchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - es:DescribeElasticsearchDomain
+                  - es:DescribeElasticsearchDomains
+                  - es:DescribeElasticsearchDomainConfig
+                  - es:ESHttpPost
+                  - es:ESHttpPut
+                Resource: !GetAtt OpenSearchDomain.Arn
+        - PolicyName: LogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudFront real-time logs role
+  CloudFrontLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-cloudfront-logs-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: KinesisAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecords
+                  - kinesis:PutRecord
+                Resource: !GetAtt KinesisStream.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =====================
+  # LAMBDA FUNCTION
+  # =====================
+  
+  # Log processing Lambda function
+  LogProcessingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-log-processor'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      ReservedConcurrencyLimit: 100
+      Environment:
+        Variables:
+          METRICS_TABLE: !Ref MetricsTable
+          PROCESSED_STREAM: !Ref ProcessedKinesisStream
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          
+          const cloudwatch = new AWS.CloudWatch();
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          const kinesis = new AWS.Kinesis();
+          
+          const METRICS_TABLE = process.env.METRICS_TABLE;
+          const PROCESSED_STREAM = process.env.PROCESSED_STREAM;
+          
+          exports.handler = async (event) => {
+              console.log('Received event:', JSON.stringify(event, null, 2));
+              
+              const processedRecords = [];
+              const metrics = {
+                  totalRequests: 0,
+                  totalBytes: 0,
+                  errors4xx: 0,
+                  errors5xx: 0,
+                  cacheMisses: 0,
+                  regionCounts: {},
+                  statusCodes: {},
+                  userAgents: {}
+              };
+              
+              for (const record of event.Records) {
+                  try {
+                      // Decode Kinesis data
+                      const data = Buffer.from(record.kinesis.data, 'base64').toString('utf-8');
+                      const logEntries = data.trim().split('\n');
+                      
+                      for (const logEntry of logEntries) {
+                          const processedLog = await processLogEntry(logEntry, metrics);
+                          if (processedLog) {
+                              processedRecords.push(processedLog);
+                          }
+                      }
+                  } catch (error) {
+                      console.error('Error processing record:', error);
+                  }
+              }
+              
+              // Send processed records to output stream
+              if (processedRecords.length > 0) {
+                  await sendToKinesis(processedRecords);
+              }
+              
+              // Store aggregated metrics
+              await storeMetrics(metrics);
+              
+              // Send CloudWatch metrics
+              await sendCloudWatchMetrics(metrics);
+              
+              return {
+                  statusCode: 200,
+                  processedRecords: processedRecords.length
+              };
+          };
+          
+          async function processLogEntry(logEntry, metrics) {
+              try {
+                  // Parse CloudFront log format (tab-separated)
+                  const fields = logEntry.split('\t');
+                  
+                  if (fields.length < 20) {
+                      return null; // Invalid log entry
+                  }
+                  
+                  const timestamp = `${fields[0]} ${fields[1]}`;
+                  const edgeLocation = fields[2];
+                  const bytesDownloaded = parseInt(fields[3]) || 0;
+                  const clientIp = fields[4];
+                  const method = fields[5];
+                  const host = fields[6];
+                  const uri = fields[7];
+                  const status = parseInt(fields[8]) || 0;
+                  const referer = fields[9];
+                  const userAgent = fields[10];
+                  const edgeResultType = fields[13];
+                  const timeTaken = parseFloat(fields[18]) || 0;
+                  
+                  // Update metrics
+                  metrics.totalRequests++;
+                  metrics.totalBytes += bytesDownloaded;
+                  
+                  if (status >= 400 && status < 500) {
+                      metrics.errors4xx++;
+                  } else if (status >= 500) {
+                      metrics.errors5xx++;
+                  }
+                  
+                  if (edgeResultType === 'Miss') {
+                      metrics.cacheMisses++;
+                  }
+                  
+                  // Count status codes
+                  metrics.statusCodes[status] = (metrics.statusCodes[status] || 0) + 1;
+                  
+                  // Create enriched log entry
+                  const enrichedLog = {
+                      timestamp: new Date(timestamp).toISOString(),
+                      edgeLocation,
+                      clientIp,
+                      method,
+                      host,
+                      uri,
+                      status,
+                      bytesDownloaded,
+                      timeTaken,
+                      edgeResultType,
+                      userAgent: categorizeUserAgent(userAgent),
+                      cacheHit: edgeResultType !== 'Miss',
+                      isError: status >= 400,
+                      processingTime: Date.now()
+                  };
+                  
+                  return enrichedLog;
+                  
+              } catch (error) {
+                  console.error('Error parsing log entry:', error);
+                  return null;
+              }
+          }
+          
+          function categorizeUserAgent(userAgent) {
+              if (!userAgent || userAgent === '-') return 'Unknown';
+              
+              const ua = userAgent.toLowerCase();
+              if (ua.includes('chrome')) return 'Chrome';
+              if (ua.includes('firefox')) return 'Firefox';
+              if (ua.includes('safari') && !ua.includes('chrome')) return 'Safari';
+              if (ua.includes('edge')) return 'Edge';
+              if (ua.includes('bot') || ua.includes('crawler')) return 'Bot';
+              if (ua.includes('mobile')) return 'Mobile';
+              
+              return 'Other';
+          }
+          
+          async function sendToKinesis(records) {
+              const batchSize = 500; // Kinesis limit
+              
+              for (let i = 0; i < records.length; i += batchSize) {
+                  const batch = records.slice(i, i + batchSize);
+                  const kinesisRecords = batch.map(record => ({
+                      Data: JSON.stringify(record),
+                      PartitionKey: record.edgeLocation || 'default'
+                  }));
+                  
+                  try {
+                      await kinesis.putRecords({
+                          StreamName: PROCESSED_STREAM,
+                          Records: kinesisRecords
+                      }).promise();
+                  } catch (error) {
+                      console.error('Error sending to Kinesis:', error);
+                  }
+              }
+          }
+          
+          async function storeMetrics(metrics) {
+              const timestamp = new Date().toISOString();
+              const ttl = Math.floor(Date.now() / 1000) + (7 * 24 * 60 * 60); // 7 days
+              
+              try {
+                  await dynamodb.put({
+                      TableName: METRICS_TABLE,
+                      Item: {
+                          MetricId: `metrics-${Date.now()}`,
+                          Timestamp: timestamp,
+                          TotalRequests: metrics.totalRequests,
+                          TotalBytes: metrics.totalBytes,
+                          Errors4xx: metrics.errors4xx,
+                          Errors5xx: metrics.errors5xx,
+                          CacheMisses: metrics.cacheMisses,
+                          RegionCounts: metrics.regionCounts,
+                          StatusCodes: metrics.statusCodes,
+                          UserAgents: metrics.userAgents,
+                          TTL: ttl
+                      }
+                  }).promise();
+              } catch (error) {
+                  console.error('Error storing metrics:', error);
+              }
+          }
+          
+          async function sendCloudWatchMetrics(metrics) {
+              const metricData = [
+                  {
+                      MetricName: 'RequestCount',
+                      Value: metrics.totalRequests,
+                      Unit: 'Count',
+                      Timestamp: new Date()
+                  },
+                  {
+                      MetricName: 'BytesDownloaded',
+                      Value: metrics.totalBytes,
+                      Unit: 'Bytes',
+                      Timestamp: new Date()
+                  },
+                  {
+                      MetricName: 'ErrorRate4xx',
+                      Value: metrics.totalRequests > 0 ? (metrics.errors4xx / metrics.totalRequests) * 100 : 0,
+                      Unit: 'Percent',
+                      Timestamp: new Date()
+                  },
+                  {
+                      MetricName: 'ErrorRate5xx',
+                      Value: metrics.totalRequests > 0 ? (metrics.errors5xx / metrics.totalRequests) * 100 : 0,
+                      Unit: 'Percent',
+                      Timestamp: new Date()
+                  },
+                  {
+                      MetricName: 'CacheMissRate',
+                      Value: metrics.totalRequests > 0 ? (metrics.cacheMisses / metrics.totalRequests) * 100 : 0,
+                      Unit: 'Percent',
+                      Timestamp: new Date()
+                  }
+              ];
+              
+              try {
+                  await cloudwatch.putMetricData({
+                      Namespace: 'CloudFront/RealTime',
+                      MetricData: metricData
+                  }).promise();
+              } catch (error) {
+                  console.error('Error sending CloudWatch metrics:', error);
+              }
+          }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Real-time log processing
+
+  # Lambda event source mapping
+  LambdaEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt KinesisStream.Arn
+      FunctionName: !Ref LogProcessingFunction
+      StartingPosition: LATEST
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 5
+      ParallelizationFactor: 2
+
+  # =====================
+  # KINESIS DATA FIREHOSE
+  # =====================
+  
+  # Firehose delivery stream for S3 and OpenSearch
+  FirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn: OpenSearchDomain
+    Properties:
+      DeliveryStreamName: !Sub '${ProjectName}-logs-delivery'
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt ProcessedKinesisStream.Arn
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+      ExtendedS3DestinationConfiguration:
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        BucketARN: !GetAtt LogsBucket.Arn
+        Prefix: 'cloudfront-logs/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/'
+        BufferingHints:
+          SizeInMBs: 5
+          IntervalInSeconds: 60
+        CompressionFormat: GZIP
+        ProcessingConfiguration:
+          Enabled: false
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Sub '/aws/kinesisfirehose/${ProjectName}'
+          LogStreamName: S3Delivery
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =====================
+  # CLOUDFRONT RESOURCES
+  # =====================
+  
+  # Origin Access Control for S3
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-oac'
+        Description: Origin Access Control for CloudFront monitoring demo
+        SigningProtocol: sigv4
+        SigningBehavior: always
+        OriginAccessControlOriginType: s3
+
+  # CloudFront distribution
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub 'CloudFront distribution for ${ProjectName} monitoring demo'
+        Enabled: true
+        HttpVersion: http2
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt ContentBucket.RegionalDomainName
+            OriginPath: ''
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !Ref OriginAccessControl
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - POST
+            - PATCH
+            - DELETE
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # Managed-CachingOptimized
+        CacheBehaviors:
+          - PathPattern: '/api/*'
+            TargetOriginId: S3Origin
+            ViewerProtocolPolicy: https-only
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+              - PUT
+              - POST
+              - PATCH
+              - DELETE
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # Managed-CachingOptimized
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          MinimumProtocolVersion: TLSv1.2_2021
+        Restrictions:
+          GeoRestriction:
+            RestrictionType: none
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Content delivery with real-time monitoring
+
+  # Real-time log configuration
+  RealTimeLogConfig:
+    Type: AWS::CloudFront::RealtimeLogConfig
+    Properties:
+      Name: !Sub '${ProjectName}-realtime-logs'
+      EndPoints:
+        - StreamType: Kinesis
+          StreamArn: !GetAtt KinesisStream.Arn
+          RoleArn: !GetAtt CloudFrontLogsRole.Arn
+      Fields:
+        - timestamp
+        - c-ip
+        - sc-status
+        - cs-method
+        - cs-uri-stem
+        - cs-uri-query
+        - cs-referer
+        - cs-user-agent
+        - cs-cookie
+        - x-edge-location
+        - x-edge-request-id
+        - x-host-header
+        - cs-protocol
+        - cs-bytes
+        - sc-bytes
+        - time-taken
+        - x-forwarded-for
+        - ssl-protocol
+        - ssl-cipher
+        - x-edge-response-result-type
+
+  # S3 bucket policy for CloudFront access
+  ContentBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ContentBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${ContentBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  # =====================
+  # CLOUDWATCH DASHBOARD
+  # =====================
+  
+  # Comprehensive monitoring dashboard
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      DashboardName: !Sub 'CloudFront-RealTime-Analytics-${ProjectName}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["CloudFront/RealTime", "RequestCount"],
+                  [".", "BytesDownloaded"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Real-time Traffic Volume"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["CloudFront/RealTime", "ErrorRate4xx"],
+                  [".", "ErrorRate5xx"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Real-time Error Rates"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["CloudFront/RealTime", "CacheMissRate"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Cache Performance"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${LogProcessingFunction}"],
+                  [".", "Invocations", ".", "."],
+                  [".", "Errors", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Log Processing Performance"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Kinesis", "IncomingRecords", "StreamName", "${KinesisStream}"],
+                  [".", "OutgoingRecords", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Kinesis Stream Activity"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/CloudFront", "Requests", "DistributionId", "${CloudFrontDistribution}"],
+                  [".", "BytesDownloaded", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "us-east-1",
+                "title": "CloudFront Standard Metrics"
+              }
+            }
+          ]
+        }
+
+  # =====================
+  # CLOUDWATCH ALARMS
+  # =====================
+  
+  # High error rate alarm
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      AlarmName: !Sub '${ProjectName}-high-error-rate'
+      AlarmDescription: 'Alert when 4xx error rate exceeds 10%'
+      MetricName: ErrorRate4xx
+      Namespace: CloudFront/RealTime
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # High cache miss rate alarm
+  HighCacheMissAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      AlarmName: !Sub '${ProjectName}-high-cache-miss-rate'
+      AlarmDescription: 'Alert when cache miss rate exceeds 50%'
+      MetricName: CacheMissRate
+      Namespace: CloudFront/RealTime
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # Lambda errors alarm
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors'
+      AlarmDescription: 'Alert when Lambda function has errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LogProcessingFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+# =====================
+# OUTPUTS
+# =====================
+Outputs:
+  CloudFrontDistributionId:
+    Description: CloudFront Distribution ID
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub '${ProjectName}-cloudfront-distribution-id'
+
+  CloudFrontDistributionDomainName:
+    Description: CloudFront Distribution Domain Name
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub '${ProjectName}-cloudfront-domain-name'
+
+  ContentBucketName:
+    Description: S3 Content Bucket Name
+    Value: !Ref ContentBucket
+    Export:
+      Name: !Sub '${ProjectName}-content-bucket'
+
+  LogsBucketName:
+    Description: S3 Logs Bucket Name
+    Value: !Ref LogsBucket
+    Export:
+      Name: !Sub '${ProjectName}-logs-bucket'
+
+  KinesisStreamName:
+    Description: Main Kinesis Stream Name
+    Value: !Ref KinesisStream
+    Export:
+      Name: !Sub '${ProjectName}-kinesis-stream'
+
+  ProcessedKinesisStreamName:
+    Description: Processed Data Kinesis Stream Name
+    Value: !Ref ProcessedKinesisStream
+    Export:
+      Name: !Sub '${ProjectName}-processed-stream'
+
+  MetricsTableName:
+    Description: DynamoDB Metrics Table Name
+    Value: !Ref MetricsTable
+    Export:
+      Name: !Sub '${ProjectName}-metrics-table'
+
+  OpenSearchDomainEndpoint:
+    Description: OpenSearch Domain Endpoint
+    Value: !GetAtt OpenSearchDomain.DomainEndpoint
+    Export:
+      Name: !Sub '${ProjectName}-opensearch-endpoint'
+
+  OpenSearchDashboardsUrl:
+    Description: OpenSearch Dashboards URL
+    Value: !Sub 'https://${OpenSearchDomain.DomainEndpoint}/_dashboards/'
+    Export:
+      Name: !Sub '${ProjectName}-opensearch-dashboards-url'
+
+  LambdaFunctionName:
+    Description: Log Processing Lambda Function Name
+    Value: !Ref LogProcessingFunction
+    Export:
+      Name: !Sub '${ProjectName}-lambda-function'
+
+  FirehoseDeliveryStreamName:
+    Description: Kinesis Data Firehose Delivery Stream Name
+    Value: !Ref FirehoseDeliveryStream
+    Export:
+      Name: !Sub '${ProjectName}-firehose-stream'
+
+  DashboardUrl:
+    Condition: EnableDetailedMonitoringCondition
+    Description: CloudWatch Dashboard URL
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=CloudFront-RealTime-Analytics-${ProjectName}'
+    Export:
+      Name: !Sub '${ProjectName}-dashboard-url'
+
+  RealTimeLogConfigArn:
+    Description: CloudFront Real-time Log Configuration ARN
+    Value: !GetAtt RealTimeLogConfig.Arn
+    Export:
+      Name: !Sub '${ProjectName}-realtime-log-config'
+
+  ProjectResourcesPrefix:
+    Description: Resource name prefix for this project
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${ProjectName}-resource-prefix'

@@ -1,0 +1,286 @@
+{
+  "Comment": "Disaster Recovery Orchestration State Machine",
+  "StartAt": "ValidateSourceServers",
+  "States": {
+    "ValidateSourceServers": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:drs:describeSourceServers",
+      "Parameters": {},
+      "Next": "CheckSourceServerHealth",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyValidationFailure"
+        }
+      ]
+    },
+    "CheckSourceServerHealth": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.sourceServers",
+          "IsPresent": true,
+          "Next": "CheckReplicationStatus"
+        }
+      ],
+      "Default": "NotifyNoSourceServers"
+    },
+    "CheckReplicationStatus": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:drs:describeSourceServers",
+      "Parameters": {},
+      "Next": "EvaluateReplicationHealth",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ]
+    },
+    "EvaluateReplicationHealth": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.sourceServers[0].dataReplicationInfo.replicationState",
+          "StringEquals": "CONTINUOUS",
+          "Next": "InitiateRecovery"
+        },
+        {
+          "Variable": "$.sourceServers[0].dataReplicationInfo.replicationState",
+          "StringEquals": "INITIATING",
+          "Next": "WaitForReplication"
+        }
+      ],
+      "Default": "NotifyReplicationNotReady"
+    },
+    "WaitForReplication": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "CheckReplicationStatus"
+    },
+    "InitiateRecovery": {
+      "Type": "Task",
+      "Resource": "${failover_lambda_arn}",
+      "Parameters": {
+        "triggerType": "StepFunctions",
+        "timestamp.$": "$$.State.EnteredTime"
+      },
+      "Next": "WaitForRecoveryCompletion",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyRecoveryFailure"
+        }
+      ]
+    },
+    "WaitForRecoveryCompletion": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "MonitorRecoveryJobs"
+    },
+    "MonitorRecoveryJobs": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:drs:describeJobs",
+      "Parameters": {},
+      "Next": "CheckJobStatus",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ]
+    },
+    "CheckJobStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.jobs[0].status",
+          "StringEquals": "COMPLETED",
+          "Next": "UpdateDNSRecords"
+        },
+        {
+          "Variable": "$.jobs[0].status",
+          "StringEquals": "FAILED",
+          "Next": "NotifyJobFailure"
+        },
+        {
+          "Variable": "$.jobs[0].status",
+          "StringEquals": "PENDING",
+          "Next": "WaitForJobCompletion"
+        },
+        {
+          "Variable": "$.jobs[0].status",
+          "StringEquals": "STARTED",
+          "Next": "WaitForJobCompletion"
+        }
+      ],
+      "Default": "WaitForJobCompletion"
+    },
+    "WaitForJobCompletion": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "MonitorRecoveryJobs"
+    },
+    "UpdateDNSRecords": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:route53:changeResourceRecordSets",
+      "Parameters": {
+        "HostedZoneId": "/hostedzone/EXAMPLE",
+        "ChangeBatch": {
+          "Changes": [
+            {
+              "Action": "UPSERT",
+              "ResourceRecordSet": {
+                "Name": "app.example.com",
+                "Type": "A",
+                "SetIdentifier": "DR-Failover",
+                "Failover": "SECONDARY",
+                "TTL": 60,
+                "ResourceRecords": [
+                  {
+                    "Value": "10.100.1.100"
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "Next": "ValidateRecoveredInstances",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 15,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyDNSUpdateFailure"
+        }
+      ]
+    },
+    "ValidateRecoveredInstances": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:drs:describeRecoveryInstances",
+      "Parameters": {},
+      "Next": "CheckInstanceHealth",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ]
+    },
+    "CheckInstanceHealth": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.recoveryInstances[0].recoveryInstanceProperties.instanceState",
+          "StringEquals": "running",
+          "Next": "NotifySuccess"
+        }
+      ],
+      "Default": "WaitForInstanceStartup"
+    },
+    "WaitForInstanceStartup": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "ValidateRecoveredInstances"
+    },
+    "NotifySuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${sns_topic_arn}",
+        "Subject": "DR Orchestration Completed Successfully",
+        "Message.$": "$.format('Disaster recovery orchestration completed successfully at {}. All recovery instances are running and DNS has been updated.', $$.State.EnteredTime)"
+      },
+      "End": true
+    },
+    "NotifyValidationFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${sns_topic_arn}",
+        "Subject": "DR Orchestration - Validation Failed",
+        "Message": "Failed to validate source servers during disaster recovery orchestration. Please check DRS configuration and source server status."
+      },
+      "End": true
+    },
+    "NotifyNoSourceServers": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${sns_topic_arn}",
+        "Subject": "DR Orchestration - No Source Servers",
+        "Message": "No source servers found for disaster recovery. Please verify DRS agent installation and configuration."
+      },
+      "End": true
+    },
+    "NotifyReplicationNotReady": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${sns_topic_arn}",
+        "Subject": "DR Orchestration - Replication Not Ready",
+        "Message": "Source server replication is not in CONTINUOUS state. Cannot proceed with disaster recovery."
+      },
+      "End": true
+    },
+    "NotifyRecoveryFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${sns_topic_arn}",
+        "Subject": "DR Orchestration - Recovery Failed",
+        "Message": "Failed to initiate recovery jobs during disaster recovery orchestration. Check Lambda function logs for details."
+      },
+      "End": true
+    },
+    "NotifyJobFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${sns_topic_arn}",
+        "Subject": "DR Orchestration - Recovery Job Failed",
+        "Message": "One or more recovery jobs failed during disaster recovery orchestration. Check DRS console for job details."
+      },
+      "End": true
+    },
+    "NotifyDNSUpdateFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${sns_topic_arn}",
+        "Subject": "DR Orchestration - DNS Update Failed",
+        "Message": "Recovery completed but DNS update failed. Manual DNS changes may be required to complete failover."
+      },
+      "End": true
+    }
+  }
+}

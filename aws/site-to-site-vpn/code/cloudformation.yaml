@@ -1,0 +1,939 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Site-to-Site VPN Connection Infrastructure - Creates secure IPsec tunnels between on-premises and AWS VPC with BGP routing, monitoring, and test resources'
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Network Configuration
+        Parameters:
+          - VPCCidr
+          - PublicSubnetCidr
+          - PrivateSubnetCidr
+          - AvailabilityZone1
+          - AvailabilityZone2
+      - Label:
+          default: VPN Configuration
+        Parameters:
+          - CustomerGatewayIP
+          - CustomerGatewayBGPASN
+          - AmazonSideBGPASN
+          - OnPremisesCidr
+      - Label:
+          default: Test Infrastructure
+        Parameters:
+          - InstanceType
+          - KeyPairName
+          - CreateTestInstance
+      - Label:
+          default: Monitoring Configuration
+        Parameters:
+          - EnableCloudWatchDashboard
+          - EnableVPNLogging
+      - Label:
+          default: Resource Naming
+        Parameters:
+          - EnvironmentName
+          - ProjectName
+    ParameterLabels:
+      VPCCidr:
+        default: VPC CIDR Block
+      PublicSubnetCidr:
+        default: Public Subnet CIDR
+      PrivateSubnetCidr:
+        default: Private Subnet CIDR
+      CustomerGatewayIP:
+        default: Customer Gateway Public IP
+      CustomerGatewayBGPASN:
+        default: Customer Gateway BGP ASN
+      AmazonSideBGPASN:
+        default: Amazon Side BGP ASN
+      OnPremisesCidr:
+        default: On-Premises Network CIDR
+      InstanceType:
+        default: EC2 Instance Type
+      KeyPairName:
+        default: EC2 Key Pair
+      CreateTestInstance:
+        default: Create Test EC2 Instance
+      EnableCloudWatchDashboard:
+        default: Enable CloudWatch Dashboard
+      EnableVPNLogging:
+        default: Enable VPN Connection Logging
+      EnvironmentName:
+        default: Environment Name
+      ProjectName:
+        default: Project Name
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  # Network Configuration
+  VPCCidr:
+    Type: String
+    Default: 172.31.0.0/16
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    ConstraintDescription: Must be a valid IPv4 CIDR block between /16 and /28
+    Description: CIDR block for the VPC (e.g., 172.31.0.0/16)
+
+  PublicSubnetCidr:
+    Type: String
+    Default: 172.31.0.0/20
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    ConstraintDescription: Must be a valid IPv4 CIDR block within the VPC CIDR range
+    Description: CIDR block for the public subnet (e.g., 172.31.0.0/20)
+
+  PrivateSubnetCidr:
+    Type: String
+    Default: 172.31.16.0/20
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    ConstraintDescription: Must be a valid IPv4 CIDR block within the VPC CIDR range
+    Description: CIDR block for the private subnet (e.g., 172.31.16.0/20)
+
+  AvailabilityZone1:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: First Availability Zone for public subnet
+    ConstraintDescription: Must be a valid Availability Zone
+
+  AvailabilityZone2:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Second Availability Zone for private subnet
+    ConstraintDescription: Must be a valid Availability Zone
+
+  # VPN Configuration
+  CustomerGatewayIP:
+    Type: String
+    Default: 203.0.113.12
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$
+    ConstraintDescription: Must be a valid IPv4 address
+    Description: Public IP address of your on-premises VPN device (replace with actual IP)
+
+  CustomerGatewayBGPASN:
+    Type: Number
+    Default: 65000
+    MinValue: 1
+    MaxValue: 4294967295
+    Description: BGP Autonomous System Number (ASN) for customer gateway (1-4294967295)
+
+  AmazonSideBGPASN:
+    Type: Number
+    Default: 64512
+    MinValue: 64512
+    MaxValue: 65534
+    Description: BGP ASN for Amazon side (64512-65534 for private ASNs)
+
+  OnPremisesCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+    ConstraintDescription: Must be a valid IPv4 CIDR block
+    Description: CIDR block for your on-premises network (e.g., 10.0.0.0/16)
+
+  # Test Infrastructure
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.nano
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t2.nano
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t2.large
+    Description: EC2 instance type for test instance
+
+  KeyPairName:
+    Type: String
+    Default: ''
+    Description: EC2 Key Pair name for SSH access to test instance (leave empty to skip key pair assignment)
+
+  CreateTestInstance:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Whether to create a test EC2 instance in the private subnet
+
+  # Monitoring Configuration
+  EnableCloudWatchDashboard:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Whether to create CloudWatch dashboard for VPN monitoring
+
+  EnableVPNLogging:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Whether to enable VPN connection logging
+
+  # Resource Naming
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedPattern: ^[a-zA-Z0-9-_]+$
+    MaxLength: 20
+    Description: Environment name (e.g., dev, staging, prod)
+
+  ProjectName:
+    Type: String
+    Default: vpn-demo
+    AllowedPattern: ^[a-zA-Z0-9-_]+$
+    MaxLength: 30
+    Description: Project name for resource naming
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+  CreateTestInstanceCondition: !Equals [!Ref CreateTestInstance, 'true']
+  EnableDashboardCondition: !Equals [!Ref EnableCloudWatchDashboard, 'true']
+  EnableLoggingCondition: !Equals [!Ref EnableVPNLogging, 'true']
+  CreateTestInstanceWithKeyPair: !And
+    - !Condition CreateTestInstanceCondition
+    - !Condition HasKeyPair
+  CreateTestInstanceWithoutKeyPair: !And
+    - !Condition CreateTestInstanceCondition
+    - !Not [!Condition HasKeyPair]
+
+# =============================================================================
+# MAPPINGS
+# =============================================================================
+Mappings:
+  # Amazon Linux 2 AMI IDs by region
+  AmazonLinuxAMI:
+    us-east-1:
+      AMI: ami-0abcdef1234567890
+    us-east-2:
+      AMI: ami-0abcdef1234567890
+    us-west-1:
+      AMI: ami-0abcdef1234567890
+    us-west-2:
+      AMI: ami-0abcdef1234567890
+    eu-west-1:
+      AMI: ami-0abcdef1234567890
+    eu-west-2:
+      AMI: ami-0abcdef1234567890
+    eu-central-1:
+      AMI: ami-0abcdef1234567890
+    ap-northeast-1:
+      AMI: ami-0abcdef1234567890
+    ap-southeast-1:
+      AMI: ami-0abcdef1234567890
+    ap-southeast-2:
+      AMI: ami-0abcdef1234567890
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # =============================================================================
+  # VPC AND NETWORKING RESOURCES
+  # =============================================================================
+  
+  # VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VPCCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-vpc'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-igw'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # Public Subnet
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AvailabilityZone1
+      CidrBlock: !Ref PublicSubnetCidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-public-subnet'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Type
+          Value: Public
+
+  # Private Subnet
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AvailabilityZone2
+      CidrBlock: !Ref PrivateSubnetCidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-private-subnet'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Type
+          Value: Private
+
+  # Route Tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-public-rt'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  VPNRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-vpn-rt'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Route Table Associations
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref VPNRouteTable
+      SubnetId: !Ref PrivateSubnet
+
+  # Public Route to Internet Gateway
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # =============================================================================
+  # VPN RESOURCES
+  # =============================================================================
+
+  # Customer Gateway
+  CustomerGateway:
+    Type: AWS::EC2::CustomerGateway
+    Properties:
+      Type: ipsec.1
+      BgpAsn: !Ref CustomerGatewayBGPASN
+      IpAddress: !Ref CustomerGatewayIP
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-cgw'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Virtual Private Gateway
+  VPNGateway:
+    Type: AWS::EC2::VPNGateway
+    Properties:
+      Type: ipsec.1
+      AmazonSideAsn: !Ref AmazonSideBGPASN
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-vgw'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # VPN Gateway Attachment
+  VPNGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      VpnGatewayId: !Ref VPNGateway
+
+  # VPN Connection
+  VPNConnection:
+    Type: AWS::EC2::VPNConnection
+    Properties:
+      Type: ipsec.1
+      StaticRoutesOnly: false
+      CustomerGatewayId: !Ref CustomerGateway
+      VpnGatewayId: !Ref VPNGateway
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-vpn'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Route Propagation
+  VPNRouteTablePropagation:
+    Type: AWS::EC2::VPNGatewayRoutePropagation
+    DependsOn: VPNGatewayAttachment
+    Properties:
+      RouteTableIds:
+        - !Ref VPNRouteTable
+      VpnGatewayId: !Ref VPNGateway
+
+  # =============================================================================
+  # SECURITY GROUPS
+  # =============================================================================
+
+  # Security Group for VPN Testing
+  VPNTestSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-${EnvironmentName}-vpn-test-sg'
+      GroupDescription: Security group for VPN testing - allows access from on-premises network
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # SSH access from on-premises network
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref OnPremisesCidr
+          Description: SSH access from on-premises network
+        # ICMP (ping) from on-premises network
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: !Ref OnPremisesCidr
+          Description: ICMP (ping) from on-premises network
+        # All traffic from VPC (for internal communication)
+        - IpProtocol: -1
+          FromPort: -1
+          ToPort: -1
+          CidrIp: !Ref VPCCidr
+          Description: All traffic from VPC
+      SecurityGroupEgress:
+        # All outbound traffic
+        - IpProtocol: -1
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-vpn-test-sg'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # =============================================================================
+  # TEST INSTANCE
+  # =============================================================================
+
+  # Test Instance with Key Pair
+  TestInstanceWithKeyPair:
+    Type: AWS::EC2::Instance
+    Condition: CreateTestInstanceWithKeyPair
+    Properties:
+      ImageId: !FindInMap [AmazonLinuxAMI, !Ref 'AWS::Region', AMI]
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref VPNTestSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y amazon-cloudwatch-agent
+          
+          # Configure CloudWatch agent
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << EOF
+          {
+            "metrics": {
+              "namespace": "CWAgent",
+              "metrics_collected": {
+                "cpu": {
+                  "measurement": [
+                    "cpu_usage_idle",
+                    "cpu_usage_iowait",
+                    "cpu_usage_user",
+                    "cpu_usage_system"
+                  ],
+                  "metrics_collection_interval": 60
+                },
+                "disk": {
+                  "measurement": [
+                    "used_percent"
+                  ],
+                  "metrics_collection_interval": 60,
+                  "resources": [
+                    "*"
+                  ]
+                },
+                "mem": {
+                  "measurement": [
+                    "mem_used_percent"
+                  ],
+                  "metrics_collection_interval": 60
+                }
+              }
+            }
+          }
+          EOF
+          
+          # Start CloudWatch agent
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+            -a fetch-config -m ec2 -s \
+            -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+          
+          # Install additional tools
+          yum install -y traceroute telnet nc
+          
+          # Create test connectivity script
+          cat > /home/ec2-user/test-connectivity.sh << 'EOF'
+          #!/bin/bash
+          echo "=== VPN Connectivity Test ==="
+          echo "Local IP: $(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)"
+          echo "Instance ID: $(curl -s http://169.254.169.254/latest/meta-data/instance-id)"
+          echo "Availability Zone: $(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)"
+          echo
+          echo "=== Network Configuration ==="
+          ip route show
+          echo
+          echo "=== Testing Internet Connectivity ==="
+          ping -c 3 8.8.8.8
+          echo
+          echo "=== DNS Resolution Test ==="
+          nslookup google.com
+          EOF
+          
+          chmod +x /home/ec2-user/test-connectivity.sh
+          chown ec2-user:ec2-user /home/ec2-user/test-connectivity.sh
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-test-instance'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: VPN Testing
+
+  # Test Instance without Key Pair
+  TestInstanceWithoutKeyPair:
+    Type: AWS::EC2::Instance
+    Condition: CreateTestInstanceWithoutKeyPair
+    Properties:
+      ImageId: !FindInMap [AmazonLinuxAMI, !Ref 'AWS::Region', AMI]
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref VPNTestSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y amazon-cloudwatch-agent
+          
+          # Configure CloudWatch agent
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << EOF
+          {
+            "metrics": {
+              "namespace": "CWAgent",
+              "metrics_collected": {
+                "cpu": {
+                  "measurement": [
+                    "cpu_usage_idle",
+                    "cpu_usage_iowait",
+                    "cpu_usage_user",
+                    "cpu_usage_system"
+                  ],
+                  "metrics_collection_interval": 60
+                },
+                "disk": {
+                  "measurement": [
+                    "used_percent"
+                  ],
+                  "metrics_collection_interval": 60,
+                  "resources": [
+                    "*"
+                  ]
+                },
+                "mem": {
+                  "measurement": [
+                    "mem_used_percent"
+                  ],
+                  "metrics_collection_interval": 60
+                }
+              }
+            }
+          }
+          EOF
+          
+          # Start CloudWatch agent
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+            -a fetch-config -m ec2 -s \
+            -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+          
+          # Install additional tools
+          yum install -y traceroute telnet nc
+          
+          # Create test connectivity script
+          cat > /home/ec2-user/test-connectivity.sh << 'EOF'
+          #!/bin/bash
+          echo "=== VPN Connectivity Test ==="
+          echo "Local IP: $(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)"
+          echo "Instance ID: $(curl -s http://169.254.169.254/latest/meta-data/instance-id)"
+          echo "Availability Zone: $(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)"
+          echo
+          echo "=== Network Configuration ==="
+          ip route show
+          echo
+          echo "=== Testing Internet Connectivity ==="
+          ping -c 3 8.8.8.8
+          echo
+          echo "=== DNS Resolution Test ==="
+          nslookup google.com
+          EOF
+          
+          chmod +x /home/ec2-user/test-connectivity.sh
+          chown ec2-user:ec2-user /home/ec2-user/test-connectivity.sh
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-test-instance'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: VPN Testing
+
+  # =============================================================================
+  # CLOUDWATCH MONITORING
+  # =============================================================================
+
+  # CloudWatch Log Group for VPN Connection
+  VPNLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableLoggingCondition
+    Properties:
+      LogGroupName: !Sub '/aws/vpn/${ProjectName}-${EnvironmentName}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-vpn-logs'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Dashboard for VPN Monitoring
+  VPNDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableDashboardCondition
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${EnvironmentName}-VPN-Dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/VPN", "VpnState", "VpnId", "${VPNConnection}" ],
+                  [ ".", "VpnTunnelState", ".", ".", "TunnelIpAddress", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "VPN Connection Status",
+                "view": "timeSeries",
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 1
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/VPN", "VpnPacketsReceived", "VpnId", "${VPNConnection}" ],
+                  [ ".", "VpnPacketsSent", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "VPN Traffic - Packets",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/VPN", "VpnBytesReceived", "VpnId", "${VPNConnection}" ],
+                  [ ".", "VpnBytesSent", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "VPN Traffic - Bytes",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/VPN", "VpnTunnelState", "VpnId", "${VPNConnection}" ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "VPN Tunnel Health",
+                "view": "timeSeries",
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 1
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms for VPN Monitoring
+  VPNConnectionDownAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-VPN-Connection-Down'
+      AlarmDescription: 'VPN Connection is down'
+      MetricName: VpnState
+      Namespace: AWS/VPN
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0.5
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: VpnId
+          Value: !Ref VPNConnection
+      TreatMissingData: breaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-vpn-down-alarm'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  VPNTunnelDownAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-VPN-Tunnel-Down'
+      AlarmDescription: 'VPN Tunnel is down'
+      MetricName: VpnTunnelState
+      Namespace: AWS/VPN
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0.5
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: VpnId
+          Value: !Ref VPNConnection
+      TreatMissingData: breaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-vpn-tunnel-down-alarm'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  # VPC Information
+  VPCId:
+    Description: ID of the created VPC
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-VPC-ID'
+
+  VPCCidr:
+    Description: CIDR block of the created VPC
+    Value: !Ref VPCCidr
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-VPC-CIDR'
+
+  PublicSubnetId:
+    Description: ID of the public subnet
+    Value: !Ref PublicSubnet
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-Public-Subnet-ID'
+
+  PrivateSubnetId:
+    Description: ID of the private subnet
+    Value: !Ref PrivateSubnet
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-Private-Subnet-ID'
+
+  # VPN Configuration
+  CustomerGatewayId:
+    Description: ID of the Customer Gateway
+    Value: !Ref CustomerGateway
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-Customer-Gateway-ID'
+
+  VPNGatewayId:
+    Description: ID of the Virtual Private Gateway
+    Value: !Ref VPNGateway
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-VPN-Gateway-ID'
+
+  VPNConnectionId:
+    Description: ID of the VPN Connection
+    Value: !Ref VPNConnection
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-VPN-Connection-ID'
+
+  VPNConnectionStatus:
+    Description: Current status of the VPN Connection
+    Value: !GetAtt VPNConnection.State
+
+  # Test Instance Information
+  TestInstanceId:
+    Condition: CreateTestInstanceCondition
+    Description: ID of the test EC2 instance
+    Value: !If 
+      - CreateTestInstanceWithKeyPair
+      - !Ref TestInstanceWithKeyPair
+      - !Ref TestInstanceWithoutKeyPair
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-Test-Instance-ID'
+
+  TestInstancePrivateIP:
+    Condition: CreateTestInstanceCondition
+    Description: Private IP address of the test instance
+    Value: !If
+      - CreateTestInstanceWithKeyPair
+      - !GetAtt TestInstanceWithKeyPair.PrivateIp
+      - !GetAtt TestInstanceWithoutKeyPair.PrivateIp
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-Test-Instance-Private-IP'
+
+  # Security Group Information
+  VPNTestSecurityGroupId:
+    Description: ID of the VPN test security group
+    Value: !Ref VPNTestSecurityGroup
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-VPN-Test-SG-ID'
+
+  # Monitoring Information
+  CloudWatchDashboardURL:
+    Condition: EnableDashboardCondition
+    Description: URL to the CloudWatch dashboard
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${EnvironmentName}-VPN-Dashboard'
+
+  VPNLogGroupName:
+    Condition: EnableLoggingCondition
+    Description: Name of the CloudWatch log group for VPN logs
+    Value: !Ref VPNLogGroup
+
+  # Configuration Information
+  CustomerGatewayConfiguration:
+    Description: Command to download VPN configuration
+    Value: !Sub |
+      aws ec2 describe-vpn-connections --vpn-connection-ids ${VPNConnection} --query 'VpnConnections[0].CustomerGatewayConfiguration' --output text --region ${AWS::Region}
+
+  VPNTunnelStatus:
+    Description: Command to check VPN tunnel status
+    Value: !Sub |
+      aws ec2 describe-vpn-connections --vpn-connection-ids ${VPNConnection} --query 'VpnConnections[0].VgwTelemetry' --output table --region ${AWS::Region}
+
+  # Next Steps
+  NextSteps:
+    Description: Next steps to complete VPN setup
+    Value: !Sub |
+      1. Download VPN configuration: aws ec2 describe-vpn-connections --vpn-connection-ids ${VPNConnection} --query 'VpnConnections[0].CustomerGatewayConfiguration' --output text --region ${AWS::Region}
+      2. Configure your on-premises VPN device using the downloaded configuration
+      3. Test connectivity from your on-premises network to the test instance: ${!If [CreateTestInstanceCondition, !If [CreateTestInstanceWithKeyPair, !GetAtt TestInstanceWithKeyPair.PrivateIp, !GetAtt TestInstanceWithoutKeyPair.PrivateIp], 'No test instance created']}
+      4. Monitor VPN status in CloudWatch dashboard: ${!If [EnableDashboardCondition, !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${EnvironmentName}-VPN-Dashboard', 'Dashboard not enabled']}
+
+  # Cost Estimation
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for VPN resources (excludes data transfer)
+    Value: !Sub |
+      VPN Connection: ~$36.00/month ($0.05/hour)
+      NAT Gateway (if needed): ~$32.85/month ($0.045/hour)
+      EC2 Instance (${InstanceType}): ~$8.50/month (varies by instance type)
+      Data Transfer: $0.09/GB out to internet
+      Total estimated: ~$77.35/month (excluding data transfer)

@@ -1,0 +1,1271 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Text-to-Speech Solutions with Amazon Polly - Complete infrastructure for implementing
+  high-quality speech synthesis with neural voices, batch processing, and advanced features.
+  This template creates S3 storage, Lambda processing functions, IAM roles, and CloudFront
+  distribution for scalable text-to-speech applications.
+
+# ============================================================================
+# METADATA
+# ============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Polly Configuration"
+        Parameters:
+          - DefaultVoiceId
+          - DefaultEngine
+          - SpeechMarkTypes
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - S3BucketPrefix
+          - EnableVersioning
+          - EnableLogging
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaTimeout
+          - LambdaMemorySize
+          - LambdaRuntime
+      - Label:
+          default: "Distribution Configuration"
+        Parameters:
+          - EnableCloudFront
+          - CloudFrontPriceClass
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - EnableSSE
+          - KMSKeyId
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      DefaultVoiceId:
+        default: "Default Polly Voice"
+      DefaultEngine:
+        default: "Default Speech Engine"
+      S3BucketPrefix:
+        default: "S3 Bucket Prefix"
+      EnableCloudFront:
+        default: "Enable CloudFront"
+
+# ============================================================================
+# PARAMETERS
+# ============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: polly-tts-solution
+    Description: Name of the project used for resource naming
+    AllowedPattern: ^[a-z0-9\-]+$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    MinLength: 3
+    MaxLength: 30
+
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment name (dev, test, prod)
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    ConstraintDescription: Must be one of dev, test, staging, or prod
+
+  DefaultVoiceId:
+    Type: String
+    Default: Joanna
+    Description: Default Amazon Polly voice for speech synthesis
+    AllowedValues:
+      - Joanna    # Neural US English Female
+      - Matthew   # Neural US English Male
+      - Ivy       # Neural US English Female (Child)
+      - Kevin     # Neural US English Male (Child)
+      - Kimberly  # Neural US English Female
+      - Salli     # Neural US English Female
+      - Joey      # Neural US English Male
+      - Justin    # Neural US English Male
+      - Kendra    # Neural US English Female
+      - Ruth      # Neural US English Female
+      - Stephen   # Neural US English Male
+    ConstraintDescription: Must be a valid neural voice ID
+
+  DefaultEngine:
+    Type: String
+    Default: neural
+    Description: Default Polly engine type for speech synthesis
+    AllowedValues:
+      - standard
+      - neural
+      - long-form
+      - generative
+    ConstraintDescription: Must be a valid Polly engine type
+
+  SpeechMarkTypes:
+    Type: CommaDelimitedList
+    Default: "sentence,word,viseme,ssml"
+    Description: Speech mark types for synchronization (comma-separated)
+    ConstraintDescription: Valid values are sentence, word, viseme, ssml
+
+  S3BucketPrefix:
+    Type: String
+    Default: polly-audio-storage
+    Description: Prefix for S3 bucket name (random suffix will be added)
+    AllowedPattern: ^[a-z0-9\-]+$
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    MinLength: 3
+    MaxLength: 40
+
+  EnableVersioning:
+    Type: String
+    Default: true
+    Description: Enable S3 bucket versioning
+    AllowedValues:
+      - true
+      - false
+
+  EnableLogging:
+    Type: String
+    Default: true
+    Description: Enable S3 access logging
+    AllowedValues:
+      - true
+      - false
+
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    Description: Lambda function timeout in seconds
+    MinValue: 30
+    MaxValue: 900
+    ConstraintDescription: Must be between 30 and 900 seconds
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    Description: Lambda function memory size in MB
+    AllowedValues:
+      - 128
+      - 256
+      - 512
+      - 1024
+      - 1536
+      - 2048
+      - 3008
+    ConstraintDescription: Must be a valid Lambda memory size
+
+  LambdaRuntime:
+    Type: String
+    Default: python3.11
+    Description: Lambda function runtime
+    AllowedValues:
+      - python3.9
+      - python3.10
+      - python3.11
+      - python3.12
+    ConstraintDescription: Must be a supported Python runtime
+
+  EnableCloudFront:
+    Type: String
+    Default: true
+    Description: Enable CloudFront distribution for audio delivery
+    AllowedValues:
+      - true
+      - false
+
+  CloudFrontPriceClass:
+    Type: String
+    Default: PriceClass_100
+    Description: CloudFront price class for edge locations
+    AllowedValues:
+      - PriceClass_All
+      - PriceClass_200
+      - PriceClass_100
+    ConstraintDescription: Must be a valid CloudFront price class
+
+  EnableSSE:
+    Type: String
+    Default: true
+    Description: Enable S3 server-side encryption
+    AllowedValues:
+      - true
+      - false
+
+  KMSKeyId:
+    Type: String
+    Default: alias/aws/s3
+    Description: KMS key ID for S3 encryption (use alias/aws/s3 for AWS managed key)
+    ConstraintDescription: Must be a valid KMS key ID or alias
+
+# ============================================================================
+# CONDITIONS
+# ============================================================================
+Conditions:
+  EnableVersioningCondition: !Equals [!Ref EnableVersioning, 'true']
+  EnableLoggingCondition: !Equals [!Ref EnableLogging, 'true']
+  EnableCloudFrontCondition: !Equals [!Ref EnableCloudFront, 'true']
+  EnableSSECondition: !Equals [!Ref EnableSSE, 'true']
+  IsProductionEnvironment: !Equals [!Ref Environment, 'prod']
+  CreateLogsBucket: !And
+    - !Condition EnableLoggingCondition
+    - !Condition EnableCloudFrontCondition
+
+# ============================================================================
+# RESOURCES
+# ============================================================================
+Resources:
+  # -------------------------------------------------------------------------
+  # S3 STORAGE RESOURCES
+  # -------------------------------------------------------------------------
+  
+  # Main S3 bucket for audio storage
+  AudioStorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${S3BucketPrefix}-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [EnableSSECondition, 'aws:kms', 'AES256']
+              KMSMasterKeyID: !If [EnableSSECondition, !Ref KMSKeyId, !Ref 'AWS::NoValue']
+            BucketKeyEnabled: !If [EnableSSECondition, true, !Ref 'AWS::NoValue']
+      VersioningConfiguration:
+        Status: !If [EnableVersioningCondition, 'Enabled', 'Suspended']
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+              - HEAD
+            AllowedOrigins:
+              - '*'
+            ExposedHeaders:
+              - ETag
+            MaxAge: 3600
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transition:
+              StorageClass: GLACIER
+              TransitionInDays: 90
+          - Id: DeleteIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      LoggingConfiguration: !If
+        - EnableLoggingCondition
+        - DestinationBucketName: !Ref LoggingBucket
+          LogFilePrefix: access-logs/
+        - !Ref 'AWS::NoValue'
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt BatchProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: input/
+                  - Name: suffix
+                    Value: .txt
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-audio-storage-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Audio file storage for Polly TTS
+
+  # S3 bucket for access logs (conditional)
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Condition: EnableLoggingCondition
+    Properties:
+      BucketName: !Sub "${S3BucketPrefix}-logs-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-access-logs-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: S3 access logs
+
+  # S3 bucket policy for CloudFront access
+  AudioStorageBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: EnableCloudFrontCondition
+    Properties:
+      Bucket: !Ref AudioStorageBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOriginAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${CloudFrontOriginAccessIdentity}"
+            Action: s3:GetObject
+            Resource: !Sub "${AudioStorageBucket}/*"
+
+  # -------------------------------------------------------------------------
+  # IAM ROLES AND POLICIES
+  # -------------------------------------------------------------------------
+  
+  # IAM role for Lambda batch processor
+  BatchProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-batch-processor-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PollyS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - polly:SynthesizeSpeech
+                  - polly:StartSpeechSynthesisTask
+                  - polly:GetSpeechSynthesisTask
+                  - polly:ListSpeechSynthesisTasks
+                  - polly:DescribeVoices
+                  - polly:GetLexicon
+                  - polly:ListLexicons
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub "${AudioStorageBucket}/*"
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Ref AudioStorageBucket
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-batch-processor-role-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM role for streaming processor
+  StreamingProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-streaming-processor-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PollyStreamingAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - polly:SynthesizeSpeech
+                  - polly:DescribeVoices
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-streaming-processor-role-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # -------------------------------------------------------------------------
+  # LAMBDA FUNCTIONS
+  # -------------------------------------------------------------------------
+  
+  # Lambda function for batch text-to-speech processing
+  BatchProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-batch-processor-${Environment}"
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt BatchProcessorRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref AudioStorageBucket
+          DEFAULT_VOICE_ID: !Ref DefaultVoiceId
+          DEFAULT_ENGINE: !Ref DefaultEngine
+          SPEECH_MARK_TYPES: !Join [',', !Ref SpeechMarkTypes]
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import logging
+          from urllib.parse import unquote_plus
+          from botocore.exceptions import ClientError
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              """
+              Lambda function to process text-to-speech requests using Amazon Polly.
+              Supports both S3 event triggers and direct API invocations.
+              """
+              polly = boto3.client('polly')
+              s3 = boto3.client('s3')
+              
+              # Get environment variables
+              bucket_name = os.environ['BUCKET_NAME']
+              default_voice = os.environ.get('DEFAULT_VOICE_ID', 'Joanna')
+              default_engine = os.environ.get('DEFAULT_ENGINE', 'neural')
+              
+              try:
+                  # Handle different event types
+                  if 'Records' in event:
+                      # S3 event trigger
+                      return handle_s3_event(event, polly, s3, bucket_name, default_voice, default_engine)
+                  else:
+                      # Direct API invocation
+                      return handle_api_request(event, polly, s3, bucket_name, default_voice, default_engine, context)
+                      
+              except Exception as e:
+                  logger.error(f"Error processing request: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'request_id': context.aws_request_id
+                      })
+                  }
+
+          def handle_s3_event(event, polly, s3, bucket_name, default_voice, default_engine):
+              """Handle S3 object created events for batch processing."""
+              results = []
+              
+              for record in event['Records']:
+                  try:
+                      # Extract S3 object information
+                      source_bucket = record['s3']['bucket']['name']
+                      source_key = unquote_plus(record['s3']['object']['key'])
+                      
+                      logger.info(f"Processing S3 object: {source_bucket}/{source_key}")
+                      
+                      # Read text content from S3
+                      response = s3.get_object(Bucket=source_bucket, Key=source_key)
+                      text_content = response['Body'].read().decode('utf-8')
+                      
+                      # Process the text
+                      result = synthesize_text(
+                          polly, s3, text_content, bucket_name, 
+                          default_voice, default_engine, source_key
+                      )
+                      results.append(result)
+                      
+                  except Exception as e:
+                      logger.error(f"Error processing S3 record: {str(e)}")
+                      results.append({'error': str(e), 'source_key': source_key})
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': 'S3 batch processing completed',
+                      'results': results
+                  })
+              }
+
+          def handle_api_request(event, polly, s3, bucket_name, default_voice, default_engine, context):
+              """Handle direct API requests for text-to-speech synthesis."""
+              # Extract parameters from event
+              text_content = event.get('text', 'Hello from Amazon Polly!')
+              voice_id = event.get('voice_id', default_voice)
+              engine = event.get('engine', default_engine)
+              output_format = event.get('output_format', 'mp3')
+              text_type = event.get('text_type', 'text')  # text or ssml
+              lexicon_names = event.get('lexicon_names', [])
+              speech_marks = event.get('speech_marks', False)
+              
+              # Process the text
+              result = synthesize_text_api(
+                  polly, s3, text_content, bucket_name, voice_id, 
+                  engine, output_format, text_type, lexicon_names, 
+                  speech_marks, context.aws_request_id
+              )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(result)
+              }
+
+          def synthesize_text(polly, s3, text, bucket_name, voice_id, engine, source_key):
+              """Synthesize text to speech and store in S3."""
+              try:
+                  # Generate unique output key
+                  output_key = f"audio/{source_key.replace('.txt', '')}-{voice_id}.mp3"
+                  
+                  # Synthesize speech
+                  response = polly.synthesize_speech(
+                      Text=text,
+                      OutputFormat='mp3',
+                      VoiceId=voice_id,
+                      Engine=engine
+                  )
+                  
+                  # Save audio to S3
+                  s3.put_object(
+                      Bucket=bucket_name,
+                      Key=output_key,
+                      Body=response['AudioStream'].read(),
+                      ContentType='audio/mpeg',
+                      Metadata={
+                          'voice_id': voice_id,
+                          'engine': engine,
+                          'source_key': source_key,
+                          'character_count': str(len(text))
+                      }
+                  )
+                  
+                  return {
+                      'success': True,
+                      'audio_url': f"s3://{bucket_name}/{output_key}",
+                      'character_count': len(text),
+                      'voice_id': voice_id,
+                      'engine': engine
+                  }
+                  
+              except ClientError as e:
+                  logger.error(f"AWS service error: {str(e)}")
+                  return {'success': False, 'error': str(e)}
+
+          def synthesize_text_api(polly, s3, text, bucket_name, voice_id, engine, 
+                                output_format, text_type, lexicon_names, speech_marks, request_id):
+              """Synthesize text for API requests with advanced options."""
+              try:
+                  # Prepare synthesis parameters
+                  synthesis_params = {
+                      'Text': text,
+                      'OutputFormat': output_format,
+                      'VoiceId': voice_id,
+                      'Engine': engine,
+                      'TextType': text_type
+                  }
+                  
+                  # Add lexicon names if provided
+                  if lexicon_names:
+                      synthesis_params['LexiconNames'] = lexicon_names
+                  
+                  # Handle speech marks
+                  if speech_marks:
+                      synthesis_params['OutputFormat'] = 'json'
+                      synthesis_params['SpeechMarkTypes'] = ['sentence', 'word', 'viseme', 'ssml']
+                  
+                  # Synthesize speech
+                  response = polly.synthesize_speech(**synthesis_params)
+                  
+                  # Generate output key
+                  file_extension = 'json' if speech_marks else output_format
+                  output_key = f"api-audio/{request_id}.{file_extension}"
+                  
+                  # Save to S3
+                  content_type = 'application/json' if speech_marks else f"audio/{output_format}"
+                  s3.put_object(
+                      Bucket=bucket_name,
+                      Key=output_key,
+                      Body=response['AudioStream'].read(),
+                      ContentType=content_type,
+                      Metadata={
+                          'voice_id': voice_id,
+                          'engine': engine,
+                          'output_format': output_format,
+                          'text_type': text_type,
+                          'character_count': str(len(text)),
+                          'speech_marks': str(speech_marks)
+                      }
+                  )
+                  
+                  return {
+                      'success': True,
+                      'audio_url': f"s3://{bucket_name}/{output_key}",
+                      'character_count': len(text),
+                      'voice_id': voice_id,
+                      'engine': engine,
+                      'output_format': output_format,
+                      'speech_marks': speech_marks
+                  }
+                  
+              except ClientError as e:
+                  logger.error(f"AWS service error: {str(e)}")
+                  return {'success': False, 'error': str(e)}
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-batch-processor-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Batch text-to-speech processing
+
+  # Lambda function for real-time streaming
+  StreamingProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-streaming-processor-${Environment}"
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt StreamingProcessorRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          DEFAULT_VOICE_ID: !Ref DefaultVoiceId
+          DEFAULT_ENGINE: !Ref DefaultEngine
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import base64
+          import logging
+          from botocore.exceptions import ClientError
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              """
+              Lambda function for real-time text-to-speech streaming.
+              Returns audio data as base64 encoded string for immediate playback.
+              """
+              polly = boto3.client('polly')
+              
+              try:
+                  # Extract parameters from event
+                  text = event.get('text', 'Hello from Amazon Polly streaming!')
+                  voice_id = event.get('voice_id', os.environ.get('DEFAULT_VOICE_ID', 'Joanna'))
+                  engine = event.get('engine', os.environ.get('DEFAULT_ENGINE', 'neural'))
+                  output_format = event.get('output_format', 'mp3')
+                  text_type = event.get('text_type', 'text')
+                  
+                  logger.info(f"Streaming synthesis: {len(text)} characters, voice: {voice_id}")
+                  
+                  # Synthesize speech
+                  response = polly.synthesize_speech(
+                      Text=text,
+                      OutputFormat=output_format,
+                      VoiceId=voice_id,
+                      Engine=engine,
+                      TextType=text_type
+                  )
+                  
+                  # Read audio stream
+                  audio_data = response['AudioStream'].read()
+                  
+                  # Encode as base64 for transport
+                  audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Headers': 'Content-Type',
+                          'Access-Control-Allow-Methods': 'POST, OPTIONS'
+                      },
+                      'body': json.dumps({
+                          'success': True,
+                          'audio_data': audio_base64,
+                          'content_type': f"audio/{output_format}",
+                          'character_count': len(text),
+                          'voice_id': voice_id,
+                          'engine': engine
+                      })
+                  }
+                  
+              except ClientError as e:
+                  logger.error(f"Polly synthesis error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'success': False,
+                          'error': str(e)
+                      })
+                  }
+              except Exception as e:
+                  logger.error(f"Unexpected error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'success': False,
+                          'error': 'Internal server error'
+                      })
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-streaming-processor-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Real-time text-to-speech streaming
+
+  # Lambda permission for S3 to invoke batch processor
+  BatchProcessorS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BatchProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !Sub "${AudioStorageBucket}/*"
+
+  # -------------------------------------------------------------------------
+  # CLOUDFRONT DISTRIBUTION (CONDITIONAL)
+  # -------------------------------------------------------------------------
+  
+  # CloudFront Origin Access Identity
+  CloudFrontOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Condition: EnableCloudFrontCondition
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub "OAI for ${ProjectName} audio distribution"
+
+  # CloudFront Distribution for global audio delivery
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: EnableCloudFrontCondition
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "${ProjectName} Audio Distribution - ${Environment}"
+        DefaultRootObject: index.html
+        Enabled: true
+        PriceClass: !Ref CloudFrontPriceClass
+        HttpVersion: http2
+        IPV6Enabled: true
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt AudioStorageBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub "origin-access-identity/cloudfront/${CloudFrontOriginAccessIdentity}"
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+            Headers:
+              - Origin
+              - Access-Control-Request-Headers
+              - Access-Control-Request-Method
+          TrustedSigners:
+            - self
+          MinTTL: 0
+          DefaultTTL: 86400
+          MaxTTL: 31536000
+          Compress: true
+        CacheBehaviors:
+          - PathPattern: "audio/*"
+            TargetOriginId: S3Origin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            ForwardedValues:
+              QueryString: false
+              Cookies:
+                Forward: none
+            MinTTL: 3600
+            DefaultTTL: 86400
+            MaxTTL: 31536000
+            Compress: false
+        Logging: !If
+          - CreateLogsBucket
+          - Bucket: !GetAtt LoggingBucket.DomainName
+            IncludeCookies: false
+            Prefix: cloudfront-logs/
+          - !Ref 'AWS::NoValue'
+        WebACLId: !If
+          - IsProductionEnvironment
+          - !Ref WebACL
+          - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-distribution-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: Global audio content distribution
+
+  # -------------------------------------------------------------------------
+  # WAF WEB ACL (PRODUCTION ONLY)
+  # -------------------------------------------------------------------------
+  
+  # WAF Web ACL for production CloudFront protection
+  WebACL:
+    Type: AWS::WAFv2::WebACL
+    Condition: IsProductionEnvironment
+    Properties:
+      Name: !Sub "${ProjectName}-web-acl-${Environment}"
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      Rules:
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CommonRuleSetMetric
+        - Name: RateLimitRule
+          Priority: 2
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 10000
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitMetric
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${ProjectName}WebACL"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-web-acl-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # -------------------------------------------------------------------------
+  # API GATEWAY (FOR STREAMING FUNCTION)
+  # -------------------------------------------------------------------------
+  
+  # API Gateway REST API for streaming processor
+  StreamingAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${ProjectName}-streaming-api-${Environment}"
+      Description: !Sub "Streaming text-to-speech API for ${ProjectName}"
+      EndpointConfiguration:
+        Types:
+          - EDGE
+      BinaryMediaTypes:
+        - 'audio/*'
+        - 'application/octet-stream'
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-streaming-api-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # API Gateway resource for speech synthesis
+  SpeechResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref StreamingAPI
+      ParentId: !GetAtt StreamingAPI.RootResourceId
+      PathPart: speech
+
+  # API Gateway method for POST requests
+  SpeechMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref StreamingAPI
+      ResourceId: !Ref SpeechResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${StreamingProcessorFunction.Arn}/invocations"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: "'*'"
+            Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+            Access-Control-Allow-Methods: "'POST,OPTIONS'"
+
+  # API Gateway OPTIONS method for CORS
+  SpeechOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref StreamingAPI
+      ResourceId: !Ref SpeechResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseHeaders:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              Access-Control-Allow-Methods: "'POST,OPTIONS'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+            Access-Control-Allow-Headers: true
+            Access-Control-Allow-Methods: true
+
+  # API Gateway deployment
+  StreamingAPIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - SpeechMethod
+      - SpeechOptionsMethod
+    Properties:
+      RestApiId: !Ref StreamingAPI
+      StageName: !Ref Environment
+      StageDescription: !Sub "${Environment} stage for streaming API"
+
+  # Lambda permission for API Gateway
+  StreamingProcessorAPIPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StreamingProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${StreamingAPI}/*/*"
+
+  # -------------------------------------------------------------------------
+  # CLOUDWATCH ALARMS AND MONITORING
+  # -------------------------------------------------------------------------
+  
+  # CloudWatch alarm for Lambda errors
+  BatchProcessorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-batch-processor-errors-${Environment}"
+      AlarmDescription: Monitor Lambda function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref BatchProcessorFunction
+      TreatMissingData: notBreaching
+
+  # CloudWatch alarm for Lambda duration
+  BatchProcessorDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-batch-processor-duration-${Environment}"
+      AlarmDescription: Monitor Lambda function duration
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref LambdaTimeout
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref BatchProcessorFunction
+      TreatMissingData: notBreaching
+
+  # CloudWatch alarm for API Gateway 4XX errors
+  APIGateway4XXAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-api-4xx-errors-${Environment}"
+      AlarmDescription: Monitor API Gateway 4XX errors
+      MetricName: 4XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref StreamingAPI
+        - Name: Stage
+          Value: !Ref Environment
+      TreatMissingData: notBreaching
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+Outputs:
+  # -------------------------------------------------------------------------
+  # STORAGE OUTPUTS
+  # -------------------------------------------------------------------------
+  
+  AudioStorageBucketName:
+    Description: Name of the S3 bucket for audio storage
+    Value: !Ref AudioStorageBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-AudioStorageBucket"
+
+  AudioStorageBucketArn:
+    Description: ARN of the S3 bucket for audio storage
+    Value: !GetAtt AudioStorageBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-AudioStorageBucketArn"
+
+  AudioStorageBucketURL:
+    Description: URL of the S3 bucket for audio storage
+    Value: !Sub "https://${AudioStorageBucket}.s3.${AWS::Region}.amazonaws.com"
+    Export:
+      Name: !Sub "${AWS::StackName}-AudioStorageBucketURL"
+
+  LoggingBucketName:
+    Condition: EnableLoggingCondition
+    Description: Name of the S3 bucket for access logs
+    Value: !Ref LoggingBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-LoggingBucket"
+
+  # -------------------------------------------------------------------------
+  # LAMBDA OUTPUTS
+  # -------------------------------------------------------------------------
+  
+  BatchProcessorFunctionName:
+    Description: Name of the batch processor Lambda function
+    Value: !Ref BatchProcessorFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-BatchProcessorFunction"
+
+  BatchProcessorFunctionArn:
+    Description: ARN of the batch processor Lambda function
+    Value: !GetAtt BatchProcessorFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-BatchProcessorFunctionArn"
+
+  StreamingProcessorFunctionName:
+    Description: Name of the streaming processor Lambda function
+    Value: !Ref StreamingProcessorFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-StreamingProcessorFunction"
+
+  StreamingProcessorFunctionArn:
+    Description: ARN of the streaming processor Lambda function
+    Value: !GetAtt StreamingProcessorFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-StreamingProcessorFunctionArn"
+
+  # -------------------------------------------------------------------------
+  # API GATEWAY OUTPUTS
+  # -------------------------------------------------------------------------
+  
+  StreamingAPIURL:
+    Description: URL of the streaming API Gateway
+    Value: !Sub "https://${StreamingAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "${AWS::StackName}-StreamingAPIURL"
+
+  StreamingAPIId:
+    Description: ID of the streaming API Gateway
+    Value: !Ref StreamingAPI
+    Export:
+      Name: !Sub "${AWS::StackName}-StreamingAPIId"
+
+  SpeechEndpoint:
+    Description: Endpoint for text-to-speech requests
+    Value: !Sub "https://${StreamingAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/speech"
+    Export:
+      Name: !Sub "${AWS::StackName}-SpeechEndpoint"
+
+  # -------------------------------------------------------------------------
+  # CLOUDFRONT OUTPUTS
+  # -------------------------------------------------------------------------
+  
+  CloudFrontDistributionId:
+    Condition: EnableCloudFrontCondition
+    Description: ID of the CloudFront distribution
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudFrontDistributionId"
+
+  CloudFrontDistributionDomainName:
+    Condition: EnableCloudFrontCondition
+    Description: Domain name of the CloudFront distribution
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudFrontDomainName"
+
+  CloudFrontDistributionURL:
+    Condition: EnableCloudFrontCondition
+    Description: URL of the CloudFront distribution
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudFrontURL"
+
+  # -------------------------------------------------------------------------
+  # IAM OUTPUTS
+  # -------------------------------------------------------------------------
+  
+  BatchProcessorRoleArn:
+    Description: ARN of the batch processor IAM role
+    Value: !GetAtt BatchProcessorRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-BatchProcessorRoleArn"
+
+  StreamingProcessorRoleArn:
+    Description: ARN of the streaming processor IAM role
+    Value: !GetAtt StreamingProcessorRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-StreamingProcessorRoleArn"
+
+  # -------------------------------------------------------------------------
+  # CONFIGURATION OUTPUTS
+  # -------------------------------------------------------------------------
+  
+  DefaultVoiceId:
+    Description: Default Amazon Polly voice ID configured
+    Value: !Ref DefaultVoiceId
+    Export:
+      Name: !Sub "${AWS::StackName}-DefaultVoiceId"
+
+  DefaultEngine:
+    Description: Default Amazon Polly engine configured
+    Value: !Ref DefaultEngine
+    Export:
+      Name: !Sub "${AWS::StackName}-DefaultEngine"
+
+  SpeechMarkTypes:
+    Description: Configured speech mark types
+    Value: !Join [',', !Ref SpeechMarkTypes]
+    Export:
+      Name: !Sub "${AWS::StackName}-SpeechMarkTypes"
+
+  # -------------------------------------------------------------------------
+  # USAGE OUTPUTS
+  # -------------------------------------------------------------------------
+  
+  UsageInstructions:
+    Description: Instructions for using the text-to-speech solution
+    Value: !Sub |
+      Text-to-Speech Solution Deployed Successfully!
+      
+      📁 Batch Processing:
+      Upload text files to: s3://${AudioStorageBucket}/input/
+      Audio files will be saved to: s3://${AudioStorageBucket}/audio/
+      
+      🎤 Real-time API:
+      POST to: https://${StreamingAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/speech
+      Payload: {"text": "Your text here", "voice_id": "${DefaultVoiceId}"}
+      
+      🌐 Content Delivery:
+      ${!If [EnableCloudFrontCondition, !Sub 'CloudFront URL: https://${CloudFrontDistribution.DomainName}', 'CloudFront is disabled']}
+      
+      📊 Monitoring:
+      Check CloudWatch logs for Lambda functions and API Gateway metrics
+      
+      🧪 Testing:
+      Use the AWS CLI or console to test Polly synthesis with various voices and engines

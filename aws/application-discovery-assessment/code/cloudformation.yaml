@@ -1,0 +1,512 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Application Discovery Service infrastructure for automated discovery and assessment of on-premises environments'
+
+Parameters:
+  # S3 Configuration
+  DiscoveryBucketName:
+    Type: String
+    Default: ''
+    Description: 'Name for the S3 bucket to store discovery data. If empty, a unique name will be generated.'
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be a valid S3 bucket name (lowercase, alphanumeric, hyphens)'
+  
+  # Migration Hub Configuration
+  MigrationHubHomeRegion:
+    Type: String
+    Default: 'us-west-2'
+    Description: 'AWS region to use as Migration Hub home region'
+    AllowedValues:
+      - 'us-east-1'
+      - 'us-west-2'
+      - 'eu-west-1'
+      - 'ap-southeast-2'
+    ConstraintDescription: 'Must be a valid Migration Hub home region'
+  
+  # Application Discovery Configuration
+  ApplicationName:
+    Type: String
+    Default: 'WebApplication'
+    Description: 'Name for the application group in Migration Hub'
+    MinLength: 1
+    MaxLength: 100
+    AllowedPattern: '^[a-zA-Z0-9-_]+$'
+    ConstraintDescription: 'Must contain only alphanumeric characters, hyphens, and underscores'
+  
+  # Export Configuration
+  ExportFormat:
+    Type: String
+    Default: 'CSV'
+    Description: 'Format for discovery data export'
+    AllowedValues:
+      - 'CSV'
+      - 'GRAPHML'
+    ConstraintDescription: 'Must be either CSV or GRAPHML'
+  
+  # Tagging
+  Environment:
+    Type: String
+    Default: 'development'
+    Description: 'Environment tag for resources'
+    AllowedValues:
+      - 'development'
+      - 'staging'
+      - 'production'
+    ConstraintDescription: 'Must be development, staging, or production'
+  
+  ProjectName:
+    Type: String
+    Default: 'discovery-assessment'
+    Description: 'Project name for resource tagging'
+    MinLength: 1
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z0-9-_]+$'
+
+Conditions:
+  # Condition to check if bucket name is provided
+  CreateBucketName: !Equals [!Ref DiscoveryBucketName, '']
+  
+  # Condition to check if we're in Migration Hub home region
+  IsHomeRegion: !Equals [!Ref 'AWS::Region', !Ref MigrationHubHomeRegion]
+  
+  # Condition for CloudWatch Events scheduling
+  EnableScheduling: !Equals [!Ref Environment, 'production']
+
+Resources:
+  # S3 Bucket for Discovery Data Storage
+  DiscoveryDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If
+        - CreateBucketName
+        - !Sub '${ProjectName}-discovery-data-${AWS::AccountId}-${AWS::Region}'
+        - !Ref DiscoveryBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DiscoveryDataRetention
+            Status: Enabled
+            ExpirationInDays: 2555  # 7 years retention
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Application Discovery Service Data Storage'
+        - Key: ManagedBy
+          Value: 'CloudFormation'
+
+  # S3 Bucket Policy for Application Discovery Service
+  DiscoveryDataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DiscoveryDataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowApplicationDiscoveryServiceAccess
+            Effect: Allow
+            Principal:
+              Service: discovery.amazonaws.com
+            Action:
+              - 's3:GetBucketAcl'
+              - 's3:GetBucketLocation'
+              - 's3:ListBucket'
+              - 's3:PutObject'
+              - 's3:GetObject'
+              - 's3:DeleteObject'
+            Resource:
+              - !Sub '${DiscoveryDataBucket}'
+              - !Sub '${DiscoveryDataBucket}/*'
+          - Sid: AllowCrossAccountAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - 's3:GetObject'
+              - 's3:ListBucket'
+            Resource:
+              - !Sub '${DiscoveryDataBucket}'
+              - !Sub '${DiscoveryDataBucket}/*'
+
+  # IAM Role for Application Discovery Service
+  ApplicationDiscoveryServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ApplicationDiscoveryServiceRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: discovery.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/ApplicationDiscoveryServiceContinuousExportServiceRolePolicy
+      Policies:
+        - PolicyName: S3BucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetBucketAcl'
+                  - 's3:GetBucketLocation'
+                  - 's3:ListBucket'
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                  - 's3:DeleteObject'
+                Resource:
+                  - !Sub '${DiscoveryDataBucket}'
+                  - !Sub '${DiscoveryDataBucket}/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Application Discovery Service Access'
+
+  # IAM Role for Lambda Functions
+  DiscoveryLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-DiscoveryLambdaExecutionRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DiscoveryServiceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'discovery:*'
+                  - 'migrationhub:*'
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda function for automated discovery reporting
+  DiscoveryAutomationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-discovery-automation'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt DiscoveryLambdaExecutionRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          DISCOVERY_BUCKET: !Ref DiscoveryDataBucket
+          EXPORT_FORMAT: !Ref ExportFormat
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import logging
+          from datetime import datetime
+          
+          # Set up logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Lambda function to automate discovery data export
+              """
+              try:
+                  # Initialize clients
+                  discovery_client = boto3.client('discovery')
+                  s3_client = boto3.client('s3')
+                  
+                  # Get environment variables
+                  bucket_name = os.environ['DISCOVERY_BUCKET']
+                  export_format = os.environ['EXPORT_FORMAT']
+                  project_name = os.environ['PROJECT_NAME']
+                  
+                  # Create export prefix with timestamp
+                  timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+                  export_prefix = f"automated-exports/{timestamp}/"
+                  
+                  logger.info(f"Starting automated discovery export to {bucket_name}")
+                  
+                  # Start export task
+                  response = discovery_client.start_export_task(
+                      exportDataFormat=export_format,
+                      s3Bucket=bucket_name,
+                      s3Prefix=export_prefix
+                  )
+                  
+                  export_id = response['exportId']
+                  logger.info(f"Export task started with ID: {export_id}")
+                  
+                  # Create a status report
+                  status_report = {
+                      'timestamp': datetime.now().isoformat(),
+                      'export_id': export_id,
+                      'bucket': bucket_name,
+                      'prefix': export_prefix,
+                      'format': export_format,
+                      'status': 'started'
+                  }
+                  
+                  # Upload status report to S3
+                  s3_client.put_object(
+                      Bucket=bucket_name,
+                      Key=f'automation-reports/{timestamp}-export-status.json',
+                      Body=json.dumps(status_report, indent=2),
+                      ContentType='application/json'
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Discovery export started successfully',
+                          'export_id': export_id,
+                          'timestamp': timestamp
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in discovery automation: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'message': 'Failed to start discovery export'
+                      })
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Events Rule for scheduled discovery exports
+  DiscoveryScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: EnableScheduling
+    Properties:
+      Name: !Sub '${ProjectName}-discovery-schedule'
+      Description: 'Weekly automated discovery data export'
+      ScheduleExpression: 'rate(7 days)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DiscoveryAutomationFunction.Arn
+          Id: DiscoveryAutomationTarget
+
+  # Lambda permission for CloudWatch Events
+  DiscoveryLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableScheduling
+    Properties:
+      FunctionName: !Ref DiscoveryAutomationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DiscoveryScheduleRule.Arn
+
+  # Athena Database for Discovery Data Analysis
+  DiscoveryAnalysisDatabase:
+    Type: AWS::Athena::DataCatalog
+    Properties:
+      Name: !Sub '${ProjectName}-discovery-analysis'
+      Type: GLUE
+      Description: 'Data catalog for Application Discovery Service analysis'
+      Parameters:
+        metadata-function: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:aws-glue-catalog-function'
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  # Athena WorkGroup for query organization
+  DiscoveryAnalysisWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub '${ProjectName}-discovery-workgroup'
+      Description: 'Athena workgroup for discovery data analysis'
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${DiscoveryDataBucket}/athena-results/'
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetrics: true
+        BytesScannedCutoffPerQuery: 1000000000  # 1GB limit
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Group for Lambda function
+  DiscoveryLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-discovery-automation'
+      RetentionInDays: 30
+
+  # SNS Topic for notifications
+  DiscoveryNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-discovery-notifications'
+      DisplayName: 'Application Discovery Service Notifications'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarm for failed exports
+  DiscoveryExportFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-discovery-export-failures'
+      AlarmDescription: 'Alarm for failed discovery export tasks'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DiscoveryAutomationFunction
+      AlarmActions:
+        - !Ref DiscoveryNotificationTopic
+      TreatMissingData: notBreaching
+
+  # Systems Manager Parameter for configuration
+  DiscoveryConfigParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/discovery/config'
+      Type: String
+      Value: !Sub |
+        {
+          "bucket": "${DiscoveryDataBucket}",
+          "application_name": "${ApplicationName}",
+          "export_format": "${ExportFormat}",
+          "home_region": "${MigrationHubHomeRegion}",
+          "project": "${ProjectName}",
+          "environment": "${Environment}"
+        }
+      Description: 'Configuration parameters for Application Discovery Service'
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+Outputs:
+  # S3 Bucket Information
+  DiscoveryDataBucketName:
+    Description: 'Name of the S3 bucket for discovery data storage'
+    Value: !Ref DiscoveryDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DiscoveryDataBucket'
+
+  DiscoveryDataBucketArn:
+    Description: 'ARN of the S3 bucket for discovery data storage'
+    Value: !GetAtt DiscoveryDataBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DiscoveryDataBucketArn'
+
+  # IAM Role Information
+  ApplicationDiscoveryServiceRoleArn:
+    Description: 'ARN of the Application Discovery Service IAM role'
+    Value: !GetAtt ApplicationDiscoveryServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DiscoveryServiceRoleArn'
+
+  # Lambda Function Information
+  DiscoveryAutomationFunctionArn:
+    Description: 'ARN of the discovery automation Lambda function'
+    Value: !GetAtt DiscoveryAutomationFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DiscoveryAutomationFunctionArn'
+
+  # Athena Configuration
+  AthenaWorkGroupName:
+    Description: 'Name of the Athena workgroup for discovery analysis'
+    Value: !Ref DiscoveryAnalysisWorkGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaWorkGroup'
+
+  # SNS Topic
+  NotificationTopicArn:
+    Description: 'ARN of the SNS topic for discovery notifications'
+    Value: !Ref DiscoveryNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopicArn'
+
+  # Configuration Commands
+  AgentInstallCommand:
+    Description: 'Command to install discovery agent (Linux)'
+    Value: !Sub 'sudo ./install -r ${AWS::Region} -k <ACCESS_KEY> -s <SECRET_KEY>'
+
+  ContinuousExportCommand:
+    Description: 'AWS CLI command to start continuous export'
+    Value: !Sub 'aws discovery start-continuous-export --s3-bucket ${DiscoveryDataBucket} --region ${AWS::Region}'
+
+  CreateApplicationCommand:
+    Description: 'AWS CLI command to create application group'
+    Value: !Sub 'aws discovery create-application --name "${ApplicationName}" --description "Application group for discovery assessment" --region ${AWS::Region}'
+
+  # Analysis URLs
+  AthenaQueryConsoleUrl:
+    Description: 'URL to Athena query console for discovery data analysis'
+    Value: !Sub 'https://console.aws.amazon.com/athena/home?region=${AWS::Region}#query/workgroup/${DiscoveryAnalysisWorkGroup}'
+
+  S3ConsoleUrl:
+    Description: 'URL to S3 console for discovery data bucket'
+    Value: !Sub 'https://console.aws.amazon.com/s3/buckets/${DiscoveryDataBucket}?region=${AWS::Region}'
+
+  MigrationHubConsoleUrl:
+    Description: 'URL to Migration Hub console'
+    Value: !Sub 'https://console.aws.amazon.com/migrationhub/discover/tools?region=${MigrationHubHomeRegion}'
+
+  # Configuration Information
+  ProjectConfiguration:
+    Description: 'Project configuration summary'
+    Value: !Sub |
+      Project: ${ProjectName}
+      Environment: ${Environment}
+      Bucket: ${DiscoveryDataBucket}
+      Home Region: ${MigrationHubHomeRegion}
+      Export Format: ${ExportFormat}

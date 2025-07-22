@@ -1,0 +1,1030 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Multi-tier caching architecture with CloudFront and ElastiCache.
+  Implements global content delivery through CloudFront edge locations
+  and high-performance application-level caching with ElastiCache Redis.
+  This template creates a complete caching solution for improved performance
+  and reduced infrastructure costs.
+
+# ============================================================================
+# PARAMETERS
+# ============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: cache-demo
+    Description: Project name used for resource naming and tagging
+    AllowedPattern: '^[a-zA-Z0-9-]+$'
+    ConstraintDescription: Must contain only alphanumeric characters and hyphens
+    MinLength: 3
+    MaxLength: 20
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, staging, prod]
+    Description: Environment name for resource tagging and configuration
+
+  CacheNodeType:
+    Type: String
+    Default: cache.t3.micro
+    AllowedValues:
+      - cache.t3.micro
+      - cache.t3.small
+      - cache.t3.medium
+      - cache.m6g.large
+      - cache.m6g.xlarge
+    Description: ElastiCache node type for Redis cluster
+
+  CacheTTL:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 86400
+    Description: Cache TTL in seconds for ElastiCache (60 seconds to 24 hours)
+
+  CloudFrontCacheTTL:
+    Type: Number
+    Default: 60
+    MinValue: 0
+    MaxValue: 31536000
+    Description: CloudFront cache TTL in seconds (0 to 1 year)
+
+  PriceClass:
+    Type: String
+    Default: PriceClass_100
+    AllowedValues:
+      - PriceClass_100
+      - PriceClass_200
+      - PriceClass_All
+    Description: CloudFront price class (geographic distribution)
+
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable detailed CloudWatch monitoring for all resources
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: Email address for CloudWatch alarm notifications (optional)
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address or empty
+
+# ============================================================================
+# CONDITIONS
+# ============================================================================
+Conditions:
+  EnableDetailedMonitoringCondition: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  CreateSNSTopicCondition: !Not [!Equals [!Ref NotificationEmail, '']]
+  IsProductionEnvironment: !Equals [!Ref Environment, 'prod']
+
+# ============================================================================
+# MAPPINGS
+# ============================================================================
+Mappings:
+  EnvironmentConfig:
+    dev:
+      MultiAZ: false
+      BackupRetention: 1
+      DeleteProtection: false
+    test:
+      MultiAZ: false
+      BackupRetention: 3
+      DeleteProtection: false
+    staging:
+      MultiAZ: true
+      BackupRetention: 7
+      DeleteProtection: true
+    prod:
+      MultiAZ: true
+      BackupRetention: 30
+      DeleteProtection: true
+
+# ============================================================================
+# RESOURCES
+# ============================================================================
+Resources:
+
+  # ----------------------------------------------------------------------------
+  # S3 BUCKET FOR STATIC CONTENT
+  # ----------------------------------------------------------------------------
+  StaticContentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-static-content-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-static-content'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # S3 Bucket Policy for CloudFront OAC
+  StaticContentBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StaticContentBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${StaticContentBucket}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  # ----------------------------------------------------------------------------
+  # VPC AND NETWORKING
+  # ----------------------------------------------------------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Private Subnets for ElastiCache
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Security Group for ElastiCache
+  ElastiCacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for ElastiCache Redis cluster
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: Allow Redis access from Lambda functions
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-elasticache-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Security Group for Lambda
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Lambda functions
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          DestinationSecurityGroupId: !Ref ElastiCacheSecurityGroup
+          Description: Allow Redis access to ElastiCache
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTPS outbound for external APIs
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ----------------------------------------------------------------------------
+  # ELASTICACHE REDIS CLUSTER
+  # ----------------------------------------------------------------------------
+  ElastiCacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Subnet group for ElastiCache Redis cluster
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      CacheSubnetGroupName: !Sub '${ProjectName}-cache-subnet-group'
+
+  ElastiCacheParameterGroup:
+    Type: AWS::ElastiCache::ParameterGroup
+    Properties:
+      CacheParameterGroupFamily: redis7.x
+      Description: Parameter group for Redis cluster with optimized settings
+      Properties:
+        maxmemory-policy: allkeys-lru
+        timeout: 300
+        tcp-keepalive: 60
+        # Enable Redis persistence for data durability
+        save: '900 1 300 10 60 10000'
+
+  ElastiCacheCluster:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      CacheClusterName: !Sub '${ProjectName}-redis-cluster'
+      Engine: redis
+      EngineVersion: 7.0
+      CacheNodeType: !Ref CacheNodeType
+      NumCacheNodes: 1
+      Port: 6379
+      CacheSubnetGroupName: !Ref ElastiCacheSubnetGroup
+      CacheParameterGroupName: !Ref ElastiCacheParameterGroup
+      VpcSecurityGroupIds:
+        - !Ref ElastiCacheSecurityGroup
+      PreferredMaintenanceWindow: sun:05:00-sun:06:00
+      SnapshotRetentionLimit: !FindInMap [EnvironmentConfig, !Ref Environment, BackupRetention]
+      SnapshotWindow: 03:00-04:00
+      NotificationTopicArn: !If
+        - CreateSNSTopicCondition
+        - !Ref SNSTopic
+        - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-redis-cluster'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ----------------------------------------------------------------------------
+  # LAMBDA FUNCTION FOR CACHE INTEGRATION
+  # ----------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: ElastiCacheAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticache:DescribeCacheClusters
+                  - elasticache:DescribeReplicationGroups
+                Resource: '*'
+        - PolicyName: CloudWatchMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function
+  CacheFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-cache-function'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          REDIS_ENDPOINT: !GetAtt ElastiCacheCluster.RedisEndpoint.Address
+          CACHE_TTL: !Ref CacheTTL
+          ENVIRONMENT: !Ref Environment
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Code:
+        ZipFile: |
+          import json
+          import redis
+          import time
+          import os
+          import boto3
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              # Environment variables
+              redis_endpoint = os.environ.get('REDIS_ENDPOINT')
+              cache_ttl = int(os.environ.get('CACHE_TTL', '300'))
+              environment = os.environ.get('ENVIRONMENT', 'dev')
+              
+              # CloudWatch client for custom metrics
+              cloudwatch = boto3.client('cloudwatch')
+              
+              try:
+                  # Connect to Redis
+                  r = redis.Redis(host=redis_endpoint, port=6379, decode_responses=True, socket_timeout=5)
+                  
+                  # Extract request path or use default key
+                  path = event.get('path', '/api/data')
+                  cache_key = f"api_data_{path.replace('/', '_')}"
+                  
+                  # Check if data exists in cache
+                  start_time = time.time()
+                  cached_data = r.get(cache_key)
+                  cache_operation_time = time.time() - start_time
+                  
+                  if cached_data:
+                      # Cache hit
+                      data = json.loads(cached_data)
+                      data['cache_hit'] = True
+                      data['source'] = 'ElastiCache'
+                      data['cache_operation_time_ms'] = round(cache_operation_time * 1000, 2)
+                      
+                      # Send cache hit metric
+                      cloudwatch.put_metric_data(
+                          Namespace=f'CacheDemo/{environment}',
+                          MetricData=[
+                              {
+                                  'MetricName': 'CacheHit',
+                                  'Value': 1,
+                                  'Unit': 'Count',
+                                  'Dimensions': [
+                                      {'Name': 'Environment', 'Value': environment}
+                                  ]
+                              }
+                          ]
+                      )
+                  else:
+                      # Cache miss - simulate database query
+                      db_start_time = time.time()
+                      time.sleep(0.1)  # Simulate DB query time
+                      db_operation_time = time.time() - db_start_time
+                      
+                      # Generate fresh data
+                      data = {
+                          'timestamp': datetime.now().isoformat(),
+                          'message': f'Hello from Lambda in {environment}!',
+                          'query_time_ms': round(db_operation_time * 1000, 2),
+                          'cache_hit': False,
+                          'source': 'Database',
+                          'environment': environment
+                      }
+                      
+                      # Cache the data
+                      r.setex(cache_key, cache_ttl, json.dumps(data))
+                      
+                      # Send cache miss metric
+                      cloudwatch.put_metric_data(
+                          Namespace=f'CacheDemo/{environment}',
+                          MetricData=[
+                              {
+                                  'MetricName': 'CacheMiss',
+                                  'Value': 1,
+                                  'Unit': 'Count',
+                                  'Dimensions': [
+                                      {'Name': 'Environment', 'Value': environment}
+                                  ]
+                              }
+                          ]
+                      )
+                  
+                  # Send response time metric
+                  total_response_time = time.time() - start_time
+                  cloudwatch.put_metric_data(
+                      Namespace=f'CacheDemo/{environment}',
+                      MetricData=[
+                          {
+                              'MetricName': 'ResponseTime',
+                              'Value': total_response_time * 1000,
+                              'Unit': 'Milliseconds',
+                              'Dimensions': [
+                                  {'Name': 'Environment', 'Value': environment}
+                              ]
+                          }
+                      ]
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Cache-Control': f'public, max-age={cache_ttl//5}',
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                          'Access-Control-Allow-Methods': 'GET,OPTIONS'
+                      },
+                      'body': json.dumps(data)
+                  }
+                  
+              except Exception as e:
+                  # Send error metric
+                  try:
+                      cloudwatch.put_metric_data(
+                          Namespace=f'CacheDemo/{environment}',
+                          MetricData=[
+                              {
+                                  'MetricName': 'CacheError',
+                                  'Value': 1,
+                                  'Unit': 'Count',
+                                  'Dimensions': [
+                                      {'Name': 'Environment', 'Value': environment}
+                                  ]
+                              }
+                          ]
+                      )
+                  except:
+                      pass
+                  
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'error': str(e),
+                          'message': 'Cache connection failed',
+                          'environment': environment
+                      })
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cache-function'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda Layer for Redis dependency
+  RedisLambdaLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub '${ProjectName}-redis-layer'
+      Description: Redis library for Python Lambda functions
+      Content:
+        S3Bucket: !Sub 'lambda-layers-${AWS::Region}'
+        S3Key: redis-python39.zip
+      CompatibleRuntimes:
+        - python3.9
+      LicenseInfo: BSD-3-Clause
+
+  # ----------------------------------------------------------------------------
+  # API GATEWAY
+  # ----------------------------------------------------------------------------
+  ApiGateway:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ProjectName}-cache-api'
+      Description: API Gateway for multi-tier caching demo
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowCredentials: false
+        AllowHeaders:
+          - Content-Type
+          - X-Amz-Date
+          - Authorization
+          - X-Api-Key
+          - X-Amz-Security-Token
+        AllowMethods:
+          - GET
+          - OPTIONS
+        AllowOrigins:
+          - '*'
+        MaxAge: 86400
+      Tags:
+        Name: !Sub '${ProjectName}-cache-api'
+        Environment: !Ref Environment
+
+  # Lambda Integration
+  ApiGatewayIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGateway
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${CacheFunction}'
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 30000
+
+  # API Routes
+  ApiGatewayRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: 'GET /api/data'
+      Target: !Sub 'integrations/${ApiGatewayIntegration}'
+
+  ApiGatewayOptionsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: 'OPTIONS /api/data'
+      Target: !Sub 'integrations/${ApiGatewayIntegration}'
+
+  # API Deployment
+  ApiGatewayDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+      - ApiGatewayRoute
+      - ApiGatewayOptionsRoute
+    Properties:
+      ApiId: !Ref ApiGateway
+      StageName: prod
+      StageDescription: Production stage for cache demo API
+
+  # Lambda Permission for API Gateway
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CacheFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*'
+
+  # ----------------------------------------------------------------------------
+  # CLOUDFRONT DISTRIBUTION
+  # ----------------------------------------------------------------------------
+  # Origin Access Control for S3
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-s3-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+        Description: Origin Access Control for S3 bucket
+
+  # Custom Cache Policy for API Responses
+  ApiCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${ProjectName}-api-cache-policy'
+        Comment: Cache policy for API responses with query string forwarding
+        DefaultTTL: !Ref CloudFrontCacheTTL
+        MaxTTL: !Ref CloudFrontCacheTTL
+        MinTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingBrotli: true
+          EnableAcceptEncodingGzip: true
+          QueryStringsConfig:
+            QueryStringBehavior: all
+          HeadersConfig:
+            HeaderBehavior: whitelist
+            Headers:
+              - Authorization
+              - CloudFront-Viewer-Country
+              - CloudFront-Is-Mobile-Viewer
+          CookiesConfig:
+            CookieBehavior: none
+
+  # CloudFront Distribution
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub 'Multi-tier caching distribution for ${ProjectName}'
+        Enabled: true
+        HttpVersion: http2
+        IPV6Enabled: true
+        PriceClass: !Ref PriceClass
+        
+        # Default origin for static content (S3)
+        DefaultRootObject: index.html
+        DefaultCacheBehavior:
+          TargetOriginId: !Sub 'S3-${StaticContentBucket}'
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # Managed-CachingOptimized
+          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf  # Managed-CORS-S3Origin
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03  # Managed-SecurityHeadersPolicy
+          Compress: true
+          
+        # Origins
+        Origins:
+          # S3 Origin for static content
+          - Id: !Sub 'S3-${StaticContentBucket}'
+            DomainName: !GetAtt StaticContentBucket.RegionalDomainName
+            OriginAccessControlId: !Ref OriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+          
+          # API Gateway Origin for dynamic content
+          - Id: !Sub 'API-${ApiGateway}'
+            DomainName: !Sub '${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com'
+            OriginPath: /prod
+            CustomOriginConfig:
+              HTTPPort: 443
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+              OriginReadTimeout: 30
+              OriginKeepaliveTimeout: 5
+        
+        # Cache Behaviors
+        CacheBehaviors:
+          # API endpoints caching behavior
+          - PathPattern: '/api/*'
+            TargetOriginId: !Sub 'API-${ApiGateway}'
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: !Ref ApiCachePolicy
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # Managed-AllViewerExceptHostHeader
+            ResponseHeadersPolicyId: 5cc3b908-e619-4b99-88e5-2cf7f45965bd  # Managed-CORS-With-Preflight
+            Compress: true
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            CachedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            
+        # Error Pages
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 404
+            ResponsePagePath: /404.html
+            ErrorCachingMinTTL: 300
+          - ErrorCode: 404
+            ResponseCode: 404
+            ResponsePagePath: /404.html
+            ErrorCachingMinTTL: 300
+          - ErrorCode: 500
+            ResponseCode: 500
+            ResponsePagePath: /500.html
+            ErrorCachingMinTTL: 60
+            
+        # Logging Configuration
+        Logging: !If
+          - EnableDetailedMonitoringCondition
+          - Bucket: !GetAtt CloudFrontLogsBucket.DomainName
+            Prefix: cloudfront-logs/
+            IncludeCookies: false
+          - !Ref 'AWS::NoValue'
+            
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cloudfront-distribution'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudFront Logs Bucket (conditional)
+  CloudFrontLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      BucketName: !Sub '${ProjectName}-cloudfront-logs-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cloudfront-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ----------------------------------------------------------------------------
+  # MONITORING AND ALERTING
+  # ----------------------------------------------------------------------------
+  # SNS Topic for Notifications (conditional)
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSNSTopicCondition
+    Properties:
+      TopicName: !Sub '${ProjectName}-cache-alerts'
+      DisplayName: Cache Demo Alerts
+      KmsMasterKeyId: alias/aws/sns
+
+  SNSSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateSNSTopicCondition
+    Properties:
+      Protocol: email
+      TopicArn: !Ref SNSTopic
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Log Groups
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${CacheFunction}'
+      RetentionInDays: !FindInMap [EnvironmentConfig, !Ref Environment, BackupRetention]
+
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-access-logs'
+      RetentionInDays: 30
+
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}'
+      RetentionInDays: 14
+
+  # CloudWatch Alarms
+  CacheHitRatioAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateSNSTopicCondition
+    Properties:
+      AlarmName: !Sub '${ProjectName}-cache-hit-ratio-low'
+      AlarmDescription: Alert when cache hit ratio falls below threshold
+      MetricName: CacheHitRate
+      Namespace: AWS/CloudFront
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: DistributionId
+          Value: !Ref CloudFrontDistribution
+      AlarmActions:
+        - !Ref SNSTopic
+      TreatMissingData: notBreaching
+
+  ElastiCacheConnectionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateSNSTopicCondition
+    Properties:
+      AlarmName: !Sub '${ProjectName}-elasticache-connections-high'
+      AlarmDescription: Alert when ElastiCache connections are high
+      MetricName: CurrConnections
+      Namespace: AWS/ElastiCache
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: CacheClusterId
+          Value: !Ref ElastiCacheCluster
+      AlarmActions:
+        - !Ref SNSTopic
+
+  LambdaErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateSNSTopicCondition
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-error-rate-high'
+      AlarmDescription: Alert when Lambda error rate is high
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CacheFunction
+      AlarmActions:
+        - !Ref SNSTopic
+
+  # Custom Dashboard
+  CloudWatchDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableDetailedMonitoringCondition
+    Properties:
+      DashboardName: !Sub '${ProjectName}-cache-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/CloudFront", "Requests", "DistributionId", "${CloudFrontDistribution}" ],
+                  [ ".", "BytesDownloaded", ".", "." ],
+                  [ ".", "CacheHitRate", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "CloudFront Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ElastiCache", "CurrConnections", "CacheClusterId", "${ElastiCacheCluster}" ],
+                  [ ".", "CacheHits", ".", "." ],
+                  [ ".", "CacheMisses", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "ElastiCache Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${CacheFunction}" ],
+                  [ ".", "Duration", ".", "." ],
+                  [ ".", "Errors", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "CacheDemo/${Environment}", "CacheHit" ],
+                  [ ".", "CacheMiss" ],
+                  [ ".", "ResponseTime" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Custom Application Metrics",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+Outputs:
+  CloudFrontDistributionDomainName:
+    Description: CloudFront distribution domain name for accessing the cached content
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub '${ProjectName}-cloudfront-domain'
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID for cache invalidation operations
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub '${ProjectName}-cloudfront-id'
+
+  StaticContentBucketName:
+    Description: S3 bucket name for uploading static content
+    Value: !Ref StaticContentBucket
+    Export:
+      Name: !Sub '${ProjectName}-s3-bucket'
+
+  ApiGatewayEndpoint:
+    Description: API Gateway endpoint URL for direct API access (bypassing CloudFront)
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod'
+    Export:
+      Name: !Sub '${ProjectName}-api-endpoint'
+
+  ElastiCacheEndpoint:
+    Description: ElastiCache Redis cluster endpoint for application connections
+    Value: !GetAtt ElastiCacheCluster.RedisEndpoint.Address
+    Export:
+      Name: !Sub '${ProjectName}-redis-endpoint'
+
+  LambdaFunctionName:
+    Description: Lambda function name for monitoring and debugging
+    Value: !Ref CacheFunction
+    Export:
+      Name: !Sub '${ProjectName}-lambda-function'
+
+  VPCId:
+    Description: VPC ID for additional resource deployment
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${ProjectName}-vpc-id'
+
+  PrivateSubnetIds:
+    Description: Private subnet IDs for VPC resources
+    Value: !Join
+      - ','
+      - - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${ProjectName}-private-subnets'
+
+  CacheTestingCommands:
+    Description: Commands to test the multi-tier caching implementation
+    Value: !Sub |
+      # Test static content through CloudFront:
+      curl -I https://${CloudFrontDistribution.DomainName}/
+
+      # Test API through CloudFront (cached):
+      curl https://${CloudFrontDistribution.DomainName}/api/data
+
+      # Test API directly (not cached):
+      curl https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/api/data
+
+      # Upload test content to S3:
+      aws s3 cp your-file.html s3://${StaticContentBucket}/
+
+      # Invalidate CloudFront cache:
+      aws cloudfront create-invalidation --distribution-id ${CloudFrontDistribution} --paths "/*"
+
+  MonitoringDashboardURL:
+    Condition: EnableDetailedMonitoringCondition
+    Description: CloudWatch dashboard URL for monitoring cache performance
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-cache-dashboard'
+
+  CostOptimizationTips:
+    Description: Cost optimization recommendations for the cache infrastructure
+    Value: !Sub |
+      1. Monitor CloudFront cache hit ratio and adjust TTL values accordingly
+      2. Use S3 Intelligent Tiering for static content lifecycle management
+      3. Consider ElastiCache reserved instances for production workloads
+      4. Enable CloudFront compression to reduce data transfer costs
+      5. Monitor Lambda concurrency and consider reserved capacity for consistent workloads
+      6. Use CloudWatch metrics to optimize cache policies and reduce origin requests

@@ -1,0 +1,692 @@
+# Infrastructure Manager Configuration for User Lifecycle Management
+# This configuration deploys Firebase Authentication, Cloud SQL, Cloud Tasks, 
+# Cloud Scheduler, and Cloud Run services for automated user lifecycle management
+
+# Copyright 2025 Google Cloud. Licensed under the Apache License, Version 2.0.
+
+imports:
+  # Import required Google Cloud provider schemas
+  - path: gcp-types/cloudsql-v1beta4:cloudsql.yaml
+  - path: gcp-types/cloudtasks-v2:cloudtasks.yaml
+  - path: gcp-types/cloudscheduler-v1:cloudscheduler.yaml
+  - path: gcp-types/run-v1:run.yaml
+  - path: gcp-types/cloudbuild-v1:cloudbuild.yaml
+  - path: gcp-types/firebase-v1beta1:firebase.yaml
+  - path: gcp-types/appengine-v1:appengine.yaml
+
+variables:
+  # Core project configuration
+  project_id:
+    type: string
+    description: "Google Cloud Project ID for the user lifecycle management system"
+    default: "user-lifecycle-demo"
+  
+  region:
+    type: string
+    description: "Primary Google Cloud region for resource deployment"
+    default: "us-central1"
+  
+  zone:
+    type: string
+    description: "Google Cloud zone for regional resources"
+    default: "us-central1-a"
+  
+  # Naming configuration with random suffix for uniqueness
+  random_suffix:
+    type: string
+    description: "Random suffix for unique resource naming (8 characters)"
+    default: "a1b2c3d4"
+  
+  # Database configuration
+  db_instance_name:
+    type: string
+    description: "Cloud SQL PostgreSQL instance name"
+    default: "user-analytics"
+  
+  db_tier:
+    type: string
+    description: "Cloud SQL instance machine type"
+    default: "db-f1-micro"
+  
+  db_storage_size:
+    type: integer
+    description: "Cloud SQL storage size in GB"
+    default: 10
+  
+  # Task processing configuration
+  task_queue_name:
+    type: string
+    description: "Cloud Tasks queue name for user lifecycle processing"
+    default: "user-lifecycle-queue"
+  
+  worker_service_name:
+    type: string
+    description: "Cloud Run service name for lifecycle worker"
+    default: "lifecycle-worker"
+  
+  # Cloud Run configuration
+  worker_cpu:
+    type: string
+    description: "CPU allocation for Cloud Run worker service"
+    default: "1"
+  
+  worker_memory:
+    type: string
+    description: "Memory allocation for Cloud Run worker service"
+    default: "512Mi"
+  
+  worker_timeout:
+    type: integer
+    description: "Request timeout for Cloud Run worker service in seconds"
+    default: 300
+
+resources:
+  # Enable required Google Cloud APIs
+  enable-firebase-api:
+    type: gcp-types/serviceusage-v1:serviceusage.services
+    name: firebase.googleapis.com
+    properties:
+      parent: projects/{{ variables.project_id }}
+      serviceId: firebase.googleapis.com
+    metadata:
+      description: "Enable Firebase API for authentication services"
+
+  enable-sql-api:
+    type: gcp-types/serviceusage-v1:serviceusage.services
+    name: sqladmin.googleapis.com
+    properties:
+      parent: projects/{{ variables.project_id }}
+      serviceId: sqladmin.googleapis.com
+    metadata:
+      description: "Enable Cloud SQL Admin API for database management"
+
+  enable-tasks-api:
+    type: gcp-types/serviceusage-v1:serviceusage.services
+    name: cloudtasks.googleapis.com
+    properties:
+      parent: projects/{{ variables.project_id }}
+      serviceId: cloudtasks.googleapis.com
+    metadata:
+      description: "Enable Cloud Tasks API for background processing"
+
+  enable-scheduler-api:
+    type: gcp-types/serviceusage-v1:serviceusage.services
+    name: cloudscheduler.googleapis.com
+    properties:
+      parent: projects/{{ variables.project_id }}
+      serviceId: cloudscheduler.googleapis.com
+    metadata:
+      description: "Enable Cloud Scheduler API for automated workflows"
+
+  enable-run-api:
+    type: gcp-types/serviceusage-v1:serviceusage.services
+    name: run.googleapis.com
+    properties:
+      parent: projects/{{ variables.project_id }}
+      serviceId: run.googleapis.com
+    metadata:
+      description: "Enable Cloud Run API for serverless containers"
+
+  enable-build-api:
+    type: gcp-types/serviceusage-v1:serviceusage.services
+    name: cloudbuild.googleapis.com
+    properties:
+      parent: projects/{{ variables.project_id }}
+      serviceId: cloudbuild.googleapis.com
+    metadata:
+      description: "Enable Cloud Build API for container image building"
+
+  # Create App Engine application (required for Cloud Tasks)
+  app-engine-app:
+    type: gcp-types/appengine-v1:appengine.apps
+    properties:
+      id: {{ variables.project_id }}
+      locationId: {{ variables.region }}
+      databaseType: CLOUD_FIRESTORE
+    depends_on:
+      - enable-firebase-api
+      - enable-tasks-api
+    metadata:
+      description: "App Engine application required for Cloud Tasks functionality"
+
+  # Initialize Firebase project
+  firebase-project:
+    type: gcp-types/firebase-v1beta1:firebase.projects
+    properties:
+      projectId: {{ variables.project_id }}
+      resources:
+        hostingSite: {{ variables.project_id }}
+        realtimeDatabaseInstance: {{ variables.project_id }}-default-rtdb
+        storageBucket: {{ variables.project_id }}.appspot.com
+    depends_on:
+      - enable-firebase-api
+      - app-engine-app
+    metadata:
+      description: "Firebase project initialization with authentication services"
+
+  # Create Firestore database for Firebase Authentication
+  firestore-database:
+    type: gcp-types/firestore-v1:firestore.projects.databases
+    properties:
+      parent: projects/{{ variables.project_id }}
+      databaseId: (default)
+      type: FIRESTORE_NATIVE
+      locationId: {{ variables.region }}
+    depends_on:
+      - firebase-project
+    metadata:
+      description: "Firestore database for Firebase Authentication data"
+
+  # Cloud SQL PostgreSQL instance for user analytics
+  sql-instance:
+    type: gcp-types/sqladmin-v1beta4:sqladmin.instances
+    properties:
+      name: {{ variables.db_instance_name }}-{{ variables.random_suffix }}
+      project: {{ variables.project_id }}
+      region: {{ variables.region }}
+      databaseVersion: POSTGRES_15
+      settings:
+        tier: {{ variables.db_tier }}
+        storageAutoResize: true
+        storageAutoResizeLimit: 50
+        dataDiskSizeGb: {{ variables.db_storage_size }}
+        dataDiskType: PD_SSD
+        backupConfiguration:
+          enabled: true
+          startTime: "03:00"
+          pointInTimeRecoveryEnabled: true
+        ipConfiguration:
+          ipv4Enabled: true
+          authorizedNetworks:
+            - name: "allow-all-private"
+              value: "10.0.0.0/8"
+        locationPreference:
+          zone: {{ variables.zone }}
+        activationPolicy: ALWAYS
+        pricingPlan: PER_USE
+        replicationType: SYNCHRONOUS
+        userLabels:
+          environment: "user-lifecycle"
+          component: "analytics-database"
+    depends_on:
+      - enable-sql-api
+    metadata:
+      description: "PostgreSQL database for user engagement analytics and lifecycle tracking"
+
+  # Create database user for application
+  sql-user:
+    type: gcp-types/sqladmin-v1beta4:sqladmin.users
+    properties:
+      name: lifecycle_app
+      instance: {{ variables.db_instance_name }}-{{ variables.random_suffix }}
+      project: {{ variables.project_id }}
+      password: {{ variables.random_suffix }}-user-lifecycle-2025
+      type: BUILT_IN
+    depends_on:
+      - sql-instance
+    metadata:
+      description: "Application database user for lifecycle management service"
+
+  # Create application database
+  sql-database:
+    type: gcp-types/sqladmin-v1beta4:sqladmin.databases
+    properties:
+      name: user_analytics
+      instance: {{ variables.db_instance_name }}-{{ variables.random_suffix }}
+      project: {{ variables.project_id }}
+      charset: UTF8
+      collation: en_US.UTF8
+    depends_on:
+      - sql-instance
+    metadata:
+      description: "User analytics database for engagement metrics and lifecycle data"
+
+  # Cloud Tasks queue for background processing
+  task-queue:
+    type: gcp-types/cloudtasks-v2:cloudtasks.projects.locations.queues
+    properties:
+      name: projects/{{ variables.project_id }}/locations/{{ variables.region }}/queues/{{ variables.task_queue_name }}
+      parent: projects/{{ variables.project_id }}/locations/{{ variables.region }}
+      retryConfig:
+        maxAttempts: 5
+        maxRetryDuration: 3600s
+        minBackoff: 5s
+        maxBackoff: 300s
+        maxDoublings: 3
+      rateLimits:
+        maxDispatchesPerSecond: 5
+        maxBurstSize: 100
+        maxConcurrentDispatches: 10
+      state: RUNNING
+    depends_on:
+      - enable-tasks-api
+      - app-engine-app
+    metadata:
+      description: "Cloud Tasks queue for asynchronous user lifecycle processing"
+
+  # Service account for Cloud Run worker service
+  worker-service-account:
+    type: gcp-types/iam-v1:iam.projects.serviceAccounts
+    properties:
+      accountId: lifecycle-worker-sa
+      displayName: "User Lifecycle Worker Service Account"
+      description: "Service account for Cloud Run lifecycle worker with minimal required permissions"
+      project: {{ variables.project_id }}
+    metadata:
+      description: "Dedicated service account for lifecycle worker with least privilege access"
+
+  # IAM binding for Cloud SQL access
+  sql-client-binding:
+    type: gcp-types/cloudresourcemanager-v1:cloudresourcemanager.projects.setIamPolicy
+    properties:
+      resource: {{ variables.project_id }}
+      policy:
+        bindings:
+          - role: roles/cloudsql.client
+            members:
+              - serviceAccount:lifecycle-worker-sa@{{ variables.project_id }}.iam.gserviceaccount.com
+    depends_on:
+      - worker-service-account
+    metadata:
+      description: "Grant Cloud SQL client access to worker service account"
+
+  # IAM binding for Cloud Tasks access
+  tasks-enqueuer-binding:
+    type: gcp-types/cloudresourcemanager-v1:cloudresourcemanager.projects.setIamPolicy
+    properties:
+      resource: {{ variables.project_id }}
+      policy:
+        bindings:
+          - role: roles/cloudtasks.enqueuer
+            members:
+              - serviceAccount:lifecycle-worker-sa@{{ variables.project_id }}.iam.gserviceaccount.com
+    depends_on:
+      - worker-service-account
+    metadata:
+      description: "Grant Cloud Tasks enqueuer access to worker service account"
+
+  # IAM binding for Firebase Authentication access
+  firebase-admin-binding:
+    type: gcp-types/cloudresourcemanager-v1:cloudresourcemanager.projects.setIamPolicy
+    properties:
+      resource: {{ variables.project_id }}
+      policy:
+        bindings:
+          - role: roles/firebase.admin
+            members:
+              - serviceAccount:lifecycle-worker-sa@{{ variables.project_id }}.iam.gserviceaccount.com
+    depends_on:
+      - worker-service-account
+    metadata:
+      description: "Grant Firebase admin access to worker service account"
+
+  # Cloud Build trigger for worker container
+  build-trigger:
+    type: gcp-types/cloudbuild-v1:cloudbuild.projects.triggers
+    properties:
+      projectId: {{ variables.project_id }}
+      name: lifecycle-worker-build
+      description: "Build trigger for user lifecycle worker container"
+      github:
+        owner: "your-github-org"
+        name: "user-lifecycle-worker"
+        push:
+          branch: "^main$"
+      filename: cloudbuild.yaml
+      substitutions:
+        _SERVICE_NAME: {{ variables.worker_service_name }}
+        _REGION: {{ variables.region }}
+        _DB_INSTANCE: {{ variables.db_instance_name }}-{{ variables.random_suffix }}
+        _TASK_QUEUE: {{ variables.task_queue_name }}
+    depends_on:
+      - enable-build-api
+    metadata:
+      description: "Automated build trigger for lifecycle worker container images"
+
+  # Cloud Run service for lifecycle worker
+  worker-service:
+    type: gcp-types/run-v1:run.namespaces.services
+    properties:
+      apiVersion: serving.knative.dev/v1
+      kind: Service
+      metadata:
+        name: {{ variables.worker_service_name }}
+        namespace: {{ variables.project_id }}
+        annotations:
+          run.googleapis.com/ingress: all
+          run.googleapis.com/execution-environment: gen2
+        labels:
+          cloud.googleapis.com/location: {{ variables.region }}
+          environment: user-lifecycle
+          component: background-worker
+      spec:
+        template:
+          metadata:
+            annotations:
+              autoscaling.knative.dev/maxScale: "10"
+              autoscaling.knative.dev/minScale: "0"
+              run.googleapis.com/cpu-throttling: "true"
+              run.googleapis.com/execution-environment: gen2
+              run.googleapis.com/network-interfaces: '[{"network":"default","subnetwork":"default"}]'
+          spec:
+            containerConcurrency: 10
+            timeoutSeconds: {{ variables.worker_timeout }}
+            serviceAccountName: lifecycle-worker-sa@{{ variables.project_id }}.iam.gserviceaccount.com
+            containers:
+              - image: gcr.io/{{ variables.project_id }}/{{ variables.worker_service_name }}:latest
+                ports:
+                  - containerPort: 8080
+                    protocol: TCP
+                resources:
+                  limits:
+                    cpu: {{ variables.worker_cpu }}
+                    memory: {{ variables.worker_memory }}
+                env:
+                  - name: PROJECT_ID
+                    value: {{ variables.project_id }}
+                  - name: REGION
+                    value: {{ variables.region }}
+                  - name: TASK_QUEUE_NAME
+                    value: {{ variables.task_queue_name }}
+                  - name: DB_INSTANCE_NAME
+                    value: {{ variables.db_instance_name }}-{{ variables.random_suffix }}
+                  - name: DB_NAME
+                    value: user_analytics
+                  - name: DB_USER
+                    value: lifecycle_app
+                  - name: DB_PASSWORD
+                    value: {{ variables.random_suffix }}-user-lifecycle-2025
+                  - name: CONNECTION_NAME
+                    value: {{ variables.project_id }}:{{ variables.region }}:{{ variables.db_instance_name }}-{{ variables.random_suffix }}
+                  - name: GOOGLE_CLOUD_PROJECT
+                    value: {{ variables.project_id }}
+    depends_on:
+      - enable-run-api
+      - worker-service-account
+      - sql-instance
+      - task-queue
+    metadata:
+      description: "Cloud Run service for processing user lifecycle tasks and analytics"
+
+  # Cloud Run IAM policy for public access
+  worker-iam-policy:
+    type: gcp-types/cloudresourcemanager-v1:cloudresourcemanager.projects.setIamPolicy
+    properties:
+      resource: {{ variables.project_id }}
+      policy:
+        bindings:
+          - role: roles/run.invoker
+            members:
+              - allUsers
+    depends_on:
+      - worker-service
+    metadata:
+      description: "Allow public access to Cloud Run worker service endpoints"
+
+  # Cloud Scheduler job for daily engagement analysis
+  daily-engagement-scheduler:
+    type: gcp-types/cloudscheduler-v1:cloudscheduler.projects.locations.jobs
+    properties:
+      name: projects/{{ variables.project_id }}/locations/{{ variables.region }}/jobs/daily-engagement-analysis
+      parent: projects/{{ variables.project_id }}/locations/{{ variables.region }}
+      description: "Daily automated user engagement analysis and processing"
+      schedule: "0 2 * * *"
+      timeZone: "UTC"
+      attemptDeadline: 300s
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 600s
+        minBackoffDuration: 5s
+        maxBackoffDuration: 300s
+      httpTarget:
+        uri: https://{{ variables.worker_service_name }}-{{ hash(variables.project_id) }}-{{ variables.region }}.a.run.app/tasks/process-engagement
+        httpMethod: POST
+        headers:
+          Content-Type: "application/json"
+        body: |
+          {
+            "task_type": "daily_analysis",
+            "scheduled_time": "{{ now() }}",
+            "analysis_window": "24h"
+          }
+        oidcToken:
+          serviceAccountEmail: lifecycle-worker-sa@{{ variables.project_id }}.iam.gserviceaccount.com
+    depends_on:
+      - enable-scheduler-api
+      - worker-service
+      - app-engine-app
+    metadata:
+      description: "Automated daily job for user engagement analysis and lifecycle processing"
+
+  # Cloud Scheduler job for weekly retention campaigns
+  weekly-retention-scheduler:
+    type: gcp-types/cloudscheduler-v1:cloudscheduler.projects.locations.jobs
+    properties:
+      name: projects/{{ variables.project_id }}/locations/{{ variables.region }}/jobs/weekly-retention-check
+      parent: projects/{{ variables.project_id }}/locations/{{ variables.region }}
+      description: "Weekly automated retention campaign processing and user lifecycle updates"
+      schedule: "0 10 * * 1"
+      timeZone: "UTC"
+      attemptDeadline: 300s
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 600s
+        minBackoffDuration: 5s
+        maxBackoffDuration: 300s
+      httpTarget:
+        uri: https://{{ variables.worker_service_name }}-{{ hash(variables.project_id) }}-{{ variables.region }}.a.run.app/tasks/retention-campaign
+        httpMethod: POST
+        headers:
+          Content-Type: "application/json"
+        body: |
+          {
+            "task_type": "weekly_retention",
+            "scheduled_time": "{{ now() }}",
+            "campaign_window": "7d"
+          }
+        oidcToken:
+          serviceAccountEmail: lifecycle-worker-sa@{{ variables.project_id }}.iam.gserviceaccount.com
+    depends_on:
+      - enable-scheduler-api
+      - worker-service
+      - app-engine-app
+    metadata:
+      description: "Weekly automated job for retention campaigns and user lifecycle management"
+
+  # Cloud Scheduler job for monthly lifecycle review
+  monthly-lifecycle-scheduler:
+    type: gcp-types/cloudscheduler-v1:cloudscheduler.projects.locations.jobs
+    properties:
+      name: projects/{{ variables.project_id }}/locations/{{ variables.region }}/jobs/monthly-lifecycle-review
+      parent: projects/{{ variables.project_id }}/locations/{{ variables.region }}
+      description: "Monthly comprehensive user lifecycle review and analytics processing"
+      schedule: "0 8 1 * *"
+      timeZone: "UTC"
+      attemptDeadline: 300s
+      retryConfig:
+        retryCount: 3
+        maxRetryDuration: 900s
+        minBackoffDuration: 10s
+        maxBackoffDuration: 600s
+      httpTarget:
+        uri: https://{{ variables.worker_service_name }}-{{ hash(variables.project_id) }}-{{ variables.region }}.a.run.app/tasks/retention-campaign
+        httpMethod: POST
+        headers:
+          Content-Type: "application/json"
+        body: |
+          {
+            "task_type": "lifecycle_review",
+            "scheduled_time": "{{ now() }}",
+            "review_window": "30d"
+          }
+        oidcToken:
+          serviceAccountEmail: lifecycle-worker-sa@{{ variables.project_id }}.iam.gserviceaccount.com
+    depends_on:
+      - enable-scheduler-api
+      - worker-service
+      - app-engine-app
+    metadata:
+      description: "Monthly comprehensive job for lifecycle review and long-term analytics"
+
+  # Cloud Monitoring notification channel for system alerts
+  monitoring-notification:
+    type: gcp-types/monitoring-v1:monitoring.projects.notificationChannels
+    properties:
+      name: projects/{{ variables.project_id }}/notificationChannels/lifecycle-alerts
+      displayName: "User Lifecycle System Alerts"
+      description: "Notification channel for user lifecycle management system alerts and monitoring"
+      type: email
+      labels:
+        email_address: admin@{{ variables.project_id }}.example.com
+      enabled: true
+    metadata:
+      description: "Email notification channel for system monitoring and alerting"
+
+outputs:
+  # Project and configuration outputs
+  project_id:
+    description: "Google Cloud Project ID for the user lifecycle management system"
+    value: {{ variables.project_id }}
+
+  region:
+    description: "Primary deployment region for all resources"
+    value: {{ variables.region }}
+
+  # Firebase and authentication outputs
+  firebase_project_id:
+    description: "Firebase project identifier for authentication services"
+    value: {{ ref('firebase-project').projectId }}
+
+  firestore_database:
+    description: "Firestore database name for Firebase Authentication data"
+    value: {{ ref('firestore-database').name }}
+
+  # Database connection outputs
+  sql_instance_name:
+    description: "Cloud SQL PostgreSQL instance name for user analytics"
+    value: {{ ref('sql-instance').name }}
+
+  sql_connection_name:
+    description: "Cloud SQL connection string for application connectivity"
+    value: {{ variables.project_id }}:{{ variables.region }}:{{ ref('sql-instance').name }}
+
+  database_name:
+    description: "Analytics database name within Cloud SQL instance"
+    value: {{ ref('sql-database').name }}
+
+  database_user:
+    description: "Application database user for lifecycle management service"
+    value: {{ ref('sql-user').name }}
+
+  # Task processing outputs
+  task_queue_name:
+    description: "Cloud Tasks queue name for background processing"
+    value: {{ ref('task-queue').name }}
+
+  task_queue_location:
+    description: "Cloud Tasks queue location for regional processing"
+    value: {{ variables.region }}
+
+  # Cloud Run service outputs
+  worker_service_name:
+    description: "Cloud Run service name for lifecycle worker"
+    value: {{ ref('worker-service').metadata.name }}
+
+  worker_service_url:
+    description: "Cloud Run service URL for lifecycle worker endpoints"
+    value: https://{{ variables.worker_service_name }}-{{ hash(variables.project_id) }}-{{ variables.region }}.a.run.app
+
+  worker_service_account:
+    description: "Service account email for lifecycle worker authentication"
+    value: {{ ref('worker-service-account').email }}
+
+  # Scheduler job outputs
+  daily_job_name:
+    description: "Cloud Scheduler job name for daily engagement analysis"
+    value: {{ ref('daily-engagement-scheduler').name }}
+
+  weekly_job_name:
+    description: "Cloud Scheduler job name for weekly retention campaigns"
+    value: {{ ref('weekly-retention-scheduler').name }}
+
+  monthly_job_name:
+    description: "Cloud Scheduler job name for monthly lifecycle review"
+    value: {{ ref('monthly-lifecycle-scheduler').name }}
+
+  # Monitoring and operational outputs
+  notification_channel:
+    description: "Cloud Monitoring notification channel for system alerts"
+    value: {{ ref('monitoring-notification').name }}
+
+  # Connection and configuration information
+  deployment_region:
+    description: "Deployed region for all infrastructure components"
+    value: {{ variables.region }}
+
+  deployment_zone:
+    description: "Deployed zone for regional resources"
+    value: {{ variables.zone }}
+
+  random_suffix:
+    description: "Random suffix used for unique resource naming"
+    value: {{ variables.random_suffix }}
+
+metadata:
+  # Infrastructure Manager deployment metadata
+  version: "1.0"
+  description: "User Lifecycle Management infrastructure with Firebase Authentication, Cloud SQL, Cloud Tasks, and automated scheduling"
+  
+  # Resource summary and architecture information
+  architecture:
+    components:
+      - "Firebase Authentication for user identity management"
+      - "Cloud SQL PostgreSQL for user engagement analytics"
+      - "Cloud Tasks for asynchronous background processing"
+      - "Cloud Scheduler for automated workflow triggers"
+      - "Cloud Run for serverless lifecycle worker service"
+      - "Cloud Monitoring for system observability and alerting"
+    
+    data_flow:
+      - "User authentication events trigger Firebase Authentication"
+      - "Authentication events queue lifecycle processing tasks"
+      - "Cloud Run worker processes engagement analytics"
+      - "Cloud Scheduler triggers automated retention workflows"
+      - "Cloud SQL stores comprehensive user lifecycle data"
+    
+    security:
+      - "Least privilege service account permissions"
+      - "VPC-native networking for internal communication"
+      - "Encrypted data at rest and in transit"
+      - "Firebase Authentication for secure user identity"
+      - "Cloud IAM for fine-grained access control"
+  
+  # Cost and operational considerations
+  cost_optimization:
+    - "Cloud SQL db-f1-micro instance for cost-effective analytics storage"
+    - "Cloud Run pay-per-use pricing with automatic scaling"
+    - "Cloud Tasks generous free tier for background processing"
+    - "Firebase Authentication free tier for up to 50,000 monthly users"
+    - "Cloud Scheduler minimal cost for automated job execution"
+  
+  # Deployment and maintenance information
+  deployment:
+    estimated_time: "15-20 minutes for complete infrastructure deployment"
+    dependencies: "Google Cloud Project with billing enabled and appropriate IAM permissions"
+    post_deployment: "Manual configuration required for Firebase Authentication providers and application code deployment"
+  
+  # Compliance and best practices
+  best_practices:
+    - "Follows Google Cloud security best practices"
+    - "Implements proper resource dependency management"
+    - "Uses managed services for operational efficiency"
+    - "Includes comprehensive monitoring and alerting"
+    - "Supports automated scaling and high availability"
+  
+  # Support and documentation references
+  documentation:
+    - "Firebase Authentication: https://firebase.google.com/docs/auth"
+    - "Cloud SQL for PostgreSQL: https://cloud.google.com/sql/docs/postgres"
+    - "Cloud Tasks: https://cloud.google.com/tasks/docs"
+    - "Cloud Scheduler: https://cloud.google.com/scheduler/docs"
+    - "Cloud Run: https://cloud.google.com/run/docs"
+    - "Infrastructure Manager: https://cloud.google.com/infrastructure-manager/docs"

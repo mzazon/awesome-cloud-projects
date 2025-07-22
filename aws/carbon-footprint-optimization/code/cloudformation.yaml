@@ -1,0 +1,970 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Automated Carbon Footprint Optimization System with AWS Customer Carbon Footprint Tool,
+  Cost Explorer, EventBridge, and Lambda. This template creates a comprehensive solution
+  for monitoring, analyzing, and optimizing cloud infrastructure carbon emissions while
+  correlating with cost data for business-aligned sustainability improvements.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Notification Settings"
+        Parameters:
+          - NotificationEmail
+          - AlertThreshold
+      - Label:
+          default: "Analysis Configuration"
+        Parameters:
+          - AnalysisFrequency
+          - RetentionPeriod
+          - CostThreshold
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - KMSKeyId
+          - LogRetentionDays
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment Type"
+      NotificationEmail:
+        default: "Notification Email Address"
+      AlertThreshold:
+        default: "Carbon Alert Threshold (kg CO2e)"
+      AnalysisFrequency:
+        default: "Analysis Frequency (days)"
+      RetentionPeriod:
+        default: "Data Retention Period (days)"
+      CostThreshold:
+        default: "High Impact Cost Threshold ($)"
+      KMSKeyId:
+        default: "KMS Key ID (optional)"
+      LogRetentionDays:
+        default: "CloudWatch Log Retention (days)"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: carbon-optimizer
+    Description: Name prefix for all resources created by this template
+    AllowedPattern: '^[a-z][a-z0-9-]*$'
+    ConstraintDescription: Must start with lowercase letter and contain only lowercase letters, numbers, and hyphens
+    MinLength: 3
+    MaxLength: 50
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - production
+      - staging
+      - development
+    Description: Environment type for resource tagging and configuration
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for carbon footprint optimization notifications
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    ConstraintDescription: Must be a valid email address
+
+  AlertThreshold:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 10000
+    Description: Carbon emissions threshold (kg CO2e) that triggers high-priority alerts
+
+  AnalysisFrequency:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 7, 14, 30]
+    Description: Frequency in days for automated carbon footprint analysis
+
+  RetentionPeriod:
+    Type: Number
+    Default: 365
+    MinValue: 30
+    MaxValue: 2555  # 7 years maximum for compliance
+    Description: Number of days to retain carbon footprint analysis data
+
+  CostThreshold:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 100000
+    Description: Monthly cost threshold ($) for high-impact optimization recommendations
+
+  KMSKeyId:
+    Type: String
+    Default: ''
+    Description: Optional KMS Key ID for encryption (leave empty to use default AWS managed keys)
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: CloudWatch Logs retention period in days
+
+Conditions:
+  UseCustomKMSKey: !Not [!Equals [!Ref KMSKeyId, '']]
+  IsProduction: !Equals [!Ref Environment, production]
+  EnableDetailedLogging: !Not [!Equals [!Ref Environment, production]]
+
+Mappings:
+  EnvironmentConfig:
+    production:
+      LambdaMemory: 1024
+      DynamoDBBilling: PAY_PER_REQUEST
+      S3StorageClass: STANDARD_IA
+      DetailedMonitoring: true
+    staging:
+      LambdaMemory: 512
+      DynamoDBBilling: PAY_PER_REQUEST
+      S3StorageClass: STANDARD
+      DetailedMonitoring: false
+    development:
+      LambdaMemory: 256
+      DynamoDBBilling: PAY_PER_REQUEST
+      S3StorageClass: STANDARD
+      DetailedMonitoring: false
+
+  CarbonIntensityFactors:
+    # Regional carbon intensity factors (kg CO2e per kWh) based on AWS sustainability data
+    us-east-1:
+      Factor: 0.4  # Virginia - renewable energy mix
+    us-west-2:
+      Factor: 0.2  # Oregon - high renewable content
+    eu-west-1:
+      Factor: 0.3  # Ireland - moderate renewable mix
+    ap-southeast-2:
+      Factor: 0.8  # Sydney - higher carbon intensity
+
+Resources:
+  # S3 Bucket for Data Storage
+  CarbonDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [UseCustomKMSKey, 'aws:kms', 'AES256']
+              KMSMasterKeyID: !If [UseCustomKMSKey, !Ref KMSKeyId, !Ref 'AWS::NoValue']
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: OptimizeStorage
+            Status: Enabled
+            TransitionInDays: 30
+            StorageClass: !FindInMap [EnvironmentConfig, !Ref Environment, S3StorageClass]
+          - Id: TransitionToGlacier
+            Status: Enabled
+            TransitionInDays: 90
+            StorageClass: GLACIER
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: !Ref RetentionPeriod
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref CarbonDataLogGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: CarbonFootprintOptimization
+
+  # S3 Bucket Policy
+  CarbonDataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CarbonDataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt CarbonDataBucket.Arn
+              - !Sub '${CarbonDataBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: AllowLambdaAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt CarbonAnalyzerRole.Arn
+            Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+              - 's3:DeleteObject'
+            Resource: !Sub '${CarbonDataBucket.Arn}/*'
+          - Sid: AllowCURDelivery
+            Effect: Allow
+            Principal:
+              Service: billingreports.amazonaws.com
+            Action:
+              - 's3:GetBucketAcl'
+              - 's3:GetBucketPolicy'
+              - 's3:PutObject'
+            Resource:
+              - !GetAtt CarbonDataBucket.Arn
+              - !Sub '${CarbonDataBucket.Arn}/*'
+
+  # DynamoDB Table for Metrics Storage
+  CarbonMetricsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-metrics'
+      BillingMode: !FindInMap [EnvironmentConfig, !Ref Environment, DynamoDBBilling]
+      AttributeDefinitions:
+        - AttributeName: MetricType
+          AttributeType: S
+        - AttributeName: Timestamp
+          AttributeType: S
+        - AttributeName: ServiceName
+          AttributeType: S
+        - AttributeName: CarbonIntensity
+          AttributeType: N
+      KeySchema:
+        - AttributeName: MetricType
+          KeyType: HASH
+        - AttributeName: Timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: ServiceCarbonIndex
+          KeySchema:
+            - AttributeName: ServiceName
+              KeyType: HASH
+            - AttributeName: CarbonIntensity
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - IsProduction
+            - ReadCapacityUnits: 5
+              WriteCapacityUnits: 5
+            - ReadCapacityUnits: 1
+              WriteCapacityUnits: 1
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+        KMSMasterKeyId: !If [UseCustomKMSKey, !Ref KMSKeyId, !Ref 'AWS::NoValue']
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: CarbonMetricsStorage
+
+  # SNS Topic for Notifications
+  CarbonOptimizationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-notifications'
+      DisplayName: Carbon Footprint Optimization Alerts
+      KmsMasterKeyId: !If [UseCustomKMSKey, !Ref KMSKeyId, 'alias/aws/sns']
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: CarbonOptimizationAlerts
+
+  # SNS Subscription
+  CarbonOptimizationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref CarbonOptimizationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Log Group
+  CarbonAnalyzerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-analyzer'
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !If [UseCustomKMSKey, !Ref KMSKeyId, !Ref 'AWS::NoValue']
+
+  # CloudWatch Log Group for S3 events
+  CarbonDataLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-data-events'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # IAM Role for Lambda Function
+  CarbonAnalyzerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CarbonOptimizationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Cost Explorer permissions
+              - Effect: Allow
+                Action:
+                  - ce:GetCostAndUsage
+                  - ce:GetDimensions
+                  - ce:GetUsageReport
+                  - ce:ListCostCategoryDefinitions
+                  - cur:DescribeReportDefinitions
+                Resource: '*'
+              # S3 permissions
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt CarbonDataBucket.Arn
+                  - !Sub '${CarbonDataBucket.Arn}/*'
+              # DynamoDB permissions
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt CarbonMetricsTable.Arn
+                  - !Sub '${CarbonMetricsTable.Arn}/index/*'
+              # SNS permissions
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref CarbonOptimizationTopic
+              # Systems Manager permissions
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                  - ssm:GetParameters
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*'
+              # CloudWatch Logs permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              # KMS permissions (if custom key is used)
+              - !If
+                - UseCustomKMSKey
+                - Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                    - kms:GenerateDataKey
+                  Resource: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/${KMSKeyId}'
+                - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function
+  CarbonAnalyzerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-analyzer'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      MemorySize: !FindInMap [EnvironmentConfig, !Ref Environment, LambdaMemory]
+      Timeout: 300
+      Role: !GetAtt CarbonAnalyzerRole.Arn
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref CarbonMetricsTable
+          S3_BUCKET: !Ref CarbonDataBucket
+          SNS_TOPIC_ARN: !Ref CarbonOptimizationTopic
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          ALERT_THRESHOLD: !Ref AlertThreshold
+          COST_THRESHOLD: !Ref CostThreshold
+          CARBON_INTENSITY_FACTOR: !FindInMap [CarbonIntensityFactors, !Ref 'AWS::Region', Factor]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          from decimal import Decimal
+          import logging
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          # Initialize AWS clients
+          ce_client = boto3.client('ce')
+          dynamodb = boto3.resource('dynamodb')
+          s3_client = boto3.client('s3')
+          sns_client = boto3.client('sns')
+          ssm_client = boto3.client('ssm')
+          
+          # Environment variables
+          TABLE_NAME = os.environ['DYNAMODB_TABLE']
+          S3_BUCKET = os.environ['S3_BUCKET']
+          SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
+          PROJECT_NAME = os.environ['PROJECT_NAME']
+          ENVIRONMENT = os.environ['ENVIRONMENT']
+          ALERT_THRESHOLD = float(os.environ['ALERT_THRESHOLD'])
+          COST_THRESHOLD = float(os.environ['COST_THRESHOLD'])
+          CARBON_INTENSITY_FACTOR = float(os.environ['CARBON_INTENSITY_FACTOR'])
+          
+          table = dynamodb.Table(TABLE_NAME)
+          
+          def lambda_handler(event, context):
+              """
+              Main handler for carbon footprint optimization analysis
+              """
+              try:
+                  logger.info(f"Starting carbon footprint optimization analysis for {PROJECT_NAME}")
+                  
+                  # Get current date range for analysis
+                  end_date = datetime.now().date()
+                  start_date = end_date - timedelta(days=30)
+                  
+                  # Fetch cost and usage data
+                  cost_data = get_cost_and_usage_data(start_date, end_date)
+                  
+                  # Analyze carbon footprint correlations
+                  carbon_analysis = analyze_carbon_footprint(cost_data)
+                  
+                  # Store metrics in DynamoDB
+                  store_metrics(carbon_analysis)
+                  
+                  # Generate optimization recommendations
+                  recommendations = generate_recommendations(carbon_analysis)
+                  
+                  # Send notifications if significant findings
+                  if recommendations['high_impact_actions']:
+                      send_optimization_notifications(recommendations)
+                  
+                  # Store analysis results in S3
+                  store_analysis_results(carbon_analysis, recommendations)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Carbon footprint analysis completed successfully',
+                          'project': PROJECT_NAME,
+                          'environment': ENVIRONMENT,
+                          'total_cost': carbon_analysis['total_cost'],
+                          'estimated_carbon_kg': carbon_analysis['estimated_carbon_kg'],
+                          'recommendations_count': len(recommendations['all_actions']),
+                          'high_impact_count': len(recommendations['high_impact_actions']),
+                          'estimated_monthly_savings': recommendations['estimated_savings']
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error in carbon footprint analysis: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def get_cost_and_usage_data(start_date, end_date):
+              """
+              Retrieve cost and usage data from Cost Explorer
+              """
+              try:
+                  response = ce_client.get_cost_and_usage(
+                      TimePeriod={
+                          'Start': start_date.strftime('%Y-%m-%d'),
+                          'End': end_date.strftime('%Y-%m-%d')
+                      },
+                      Granularity='DAILY',
+                      Metrics=['BlendedCost', 'UsageQuantity'],
+                      GroupBy=[
+                          {'Type': 'DIMENSION', 'Key': 'SERVICE'},
+                          {'Type': 'DIMENSION', 'Key': 'REGION'}
+                      ]
+                  )
+                  
+                  return response['ResultsByTime']
+                  
+              except Exception as e:
+                  logger.error(f"Error retrieving cost data: {str(e)}")
+                  raise
+          
+          def analyze_carbon_footprint(cost_data):
+              """
+              Analyze carbon footprint patterns based on cost and usage data
+              """
+              analysis = {
+                  'total_cost': 0,
+                  'estimated_carbon_kg': 0,
+                  'services': {},
+                  'regions': {},
+                  'optimization_potential': 0,
+                  'timestamp': datetime.now().isoformat()
+              }
+              
+              # Carbon intensity factors (kg CO2e per USD) by service type
+              # These are example factors - in production, use official AWS sustainability data
+              carbon_factors = {
+                  'Amazon Elastic Compute Cloud': 0.5,
+                  'Amazon Simple Storage Service': 0.1,
+                  'Amazon Relational Database Service': 0.7,
+                  'AWS Lambda': 0.05,
+                  'Amazon CloudFront': 0.02,
+                  'Amazon DynamoDB': 0.3,
+                  'Amazon Simple Notification Service': 0.01
+              }
+              
+              for time_period in cost_data:
+                  for group in time_period.get('Groups', []):
+                      service = group['Keys'][0] if len(group['Keys']) > 0 else 'Unknown'
+                      region = group['Keys'][1] if len(group['Keys']) > 1 else 'global'
+                      
+                      cost = float(group['Metrics']['BlendedCost']['Amount'])
+                      analysis['total_cost'] += cost
+                      
+                      # Calculate estimated carbon footprint
+                      service_factor = carbon_factors.get(service, 0.3)  # Default factor
+                      
+                      estimated_carbon = cost * service_factor * CARBON_INTENSITY_FACTOR
+                      analysis['estimated_carbon_kg'] += estimated_carbon
+                      
+                      # Track by service
+                      if service not in analysis['services']:
+                          analysis['services'][service] = {
+                              'cost': 0, 'carbon_kg': 0, 'optimization_score': 0
+                          }
+                      
+                      analysis['services'][service]['cost'] += cost
+                      analysis['services'][service]['carbon_kg'] += estimated_carbon
+                      
+                      # Calculate optimization score (higher = better opportunity)
+                      analysis['services'][service]['optimization_score'] = (
+                          estimated_carbon / cost if cost > 0 else 0
+                      )
+                      
+                      # Track by region
+                      if region not in analysis['regions']:
+                          analysis['regions'][region] = {'cost': 0, 'carbon_kg': 0}
+                      
+                      analysis['regions'][region]['cost'] += cost
+                      analysis['regions'][region]['carbon_kg'] += estimated_carbon
+              
+              return analysis
+          
+          def generate_recommendations(analysis):
+              """
+              Generate carbon footprint optimization recommendations
+              """
+              recommendations = {
+                  'all_actions': [],
+                  'high_impact_actions': [],
+                  'estimated_savings': {'cost': 0, 'carbon_kg': 0}
+              }
+              
+              # Analyze services with high carbon intensity
+              for service, metrics in analysis['services'].items():
+                  if metrics['optimization_score'] > 0.5:  # High carbon per dollar
+                      recommendation = {
+                          'service': service,
+                          'current_cost': metrics['cost'],
+                          'current_carbon_kg': metrics['carbon_kg'],
+                          'action': determine_optimization_action(service, metrics),
+                          'estimated_cost_savings': metrics['cost'] * 0.2,  # 20% savings
+                          'estimated_carbon_reduction': metrics['carbon_kg'] * 0.3  # 30% reduction
+                      }
+                      
+                      recommendations['all_actions'].append(recommendation)
+                      
+                      if metrics['cost'] > COST_THRESHOLD:  # High impact threshold
+                          recommendations['high_impact_actions'].append(recommendation)
+                          recommendations['estimated_savings']['cost'] += recommendation['estimated_cost_savings']
+                          recommendations['estimated_savings']['carbon_kg'] += recommendation['estimated_carbon_reduction']
+              
+              return recommendations
+          
+          def determine_optimization_action(service, metrics):
+              """
+              Determine specific optimization action for a service
+              """
+              action_map = {
+                  'Amazon Elastic Compute Cloud': 'Consider rightsizing instances or migrating to Graviton processors',
+                  'Amazon Simple Storage Service': 'Implement Intelligent Tiering and lifecycle policies',
+                  'Amazon Relational Database Service': 'Evaluate Aurora Serverless or instance rightsizing',
+                  'AWS Lambda': 'Optimize memory allocation and enable Provisioned Concurrency',
+                  'Amazon CloudFront': 'Review caching strategies and origin optimization',
+                  'Amazon DynamoDB': 'Consider on-demand billing and optimize table design'
+              }
+              
+              return action_map.get(service, 'Review resource utilization and consider sustainable alternatives')
+          
+          def store_metrics(analysis):
+              """
+              Store analysis results in DynamoDB
+              """
+              timestamp = datetime.now().isoformat()
+              
+              try:
+                  # Store overall metrics
+                  table.put_item(
+                      Item={
+                          'MetricType': 'OVERALL_ANALYSIS',
+                          'Timestamp': timestamp,
+                          'TotalCost': Decimal(str(analysis['total_cost'])),
+                          'EstimatedCarbonKg': Decimal(str(analysis['estimated_carbon_kg'])),
+                          'ServiceCount': len(analysis['services']),
+                          'TTL': int((datetime.now() + timedelta(days=365)).timestamp())
+                      }
+                  )
+                  
+                  # Store service-specific metrics
+                  for service, metrics in analysis['services'].items():
+                      table.put_item(
+                          Item={
+                              'MetricType': f'SERVICE_{service.replace(" ", "_").upper()}',
+                              'Timestamp': timestamp,
+                              'ServiceName': service,
+                              'Cost': Decimal(str(metrics['cost'])),
+                              'CarbonKg': Decimal(str(metrics['carbon_kg'])),
+                              'CarbonIntensity': Decimal(str(metrics['optimization_score'])),
+                              'TTL': int((datetime.now() + timedelta(days=365)).timestamp())
+                          }
+                      )
+                      
+              except Exception as e:
+                  logger.error(f"Error storing metrics: {str(e)}")
+                  raise
+          
+          def store_analysis_results(analysis, recommendations):
+              """
+              Store detailed analysis results in S3
+              """
+              try:
+                  timestamp = datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
+                  key = f"analysis-results/{timestamp}-carbon-analysis.json"
+                  
+                  results = {
+                      'analysis': analysis,
+                      'recommendations': recommendations,
+                      'metadata': {
+                          'project': PROJECT_NAME,
+                          'environment': ENVIRONMENT,
+                          'timestamp': timestamp,
+                          'alert_threshold': ALERT_THRESHOLD,
+                          'cost_threshold': COST_THRESHOLD
+                      }
+                  }
+                  
+                  s3_client.put_object(
+                      Bucket=S3_BUCKET,
+                      Key=key,
+                      Body=json.dumps(results, default=str),
+                      ContentType='application/json'
+                  )
+                  
+                  logger.info(f"Analysis results stored in S3: {key}")
+                  
+              except Exception as e:
+                  logger.error(f"Error storing analysis results: {str(e)}")
+          
+          def send_optimization_notifications(recommendations):
+              """
+              Send notifications about optimization opportunities
+              """
+              try:
+                  total_carbon = recommendations['estimated_savings']['carbon_kg']
+                  
+                  # Only send alert if carbon savings exceed threshold
+                  if total_carbon > ALERT_THRESHOLD:
+                      message = f"""
+          Carbon Footprint Optimization Alert - {PROJECT_NAME}
+          Environment: {ENVIRONMENT}
+          
+          🌱 HIGH-IMPACT OPPORTUNITIES IDENTIFIED 🌱
+          
+          Summary:
+          - High-Impact Opportunities: {len(recommendations['high_impact_actions'])}
+          - Estimated Monthly Savings:
+            • Cost: ${recommendations['estimated_savings']['cost']:.2f}
+            • Carbon: {recommendations['estimated_savings']['carbon_kg']:.2f} kg CO2e
+          
+          Top Recommendations:
+          """
+                      
+                      for i, action in enumerate(recommendations['high_impact_actions'][:3], 1):
+                          message += f"""
+          {i}. {action['service']}
+             Current Monthly Cost: ${action['current_cost']:.2f}
+             Carbon Impact: {action['current_carbon_kg']:.2f} kg CO2e
+             Recommended Action: {action['action']}
+             Potential Savings: ${action['estimated_cost_savings']:.2f} cost, {action['estimated_carbon_reduction']:.2f} kg CO2e
+          """
+                      
+                      message += f"""
+          
+          📊 View detailed analysis in the AWS Console:
+          - DynamoDB Table: {TABLE_NAME}
+          - S3 Bucket: {S3_BUCKET}
+          
+          For immediate action, review the recommended optimizations and implement
+          changes during your next maintenance window.
+          """
+                      
+                      sns_client.publish(
+                          TopicArn=SNS_TOPIC_ARN,
+                          Subject=f'🌱 Carbon Optimization Alert - {PROJECT_NAME} ({ENVIRONMENT})',
+                          Message=message
+                      )
+                      
+                      logger.info("Carbon optimization notification sent successfully")
+                  
+              except Exception as e:
+                  logger.error(f"Error sending notification: {str(e)}")
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: CarbonFootprintAnalysis
+
+  # EventBridge Scheduler Role
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-scheduler-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt CarbonAnalyzerFunction.Arn
+
+  # EventBridge Schedule for Regular Analysis
+  CarbonAnalysisSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${ProjectName}-analysis-schedule'
+      Description: !Sub 'Automated carbon footprint analysis every ${AnalysisFrequency} days'
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      ScheduleExpression: !Sub 'rate(${AnalysisFrequency} days)'
+      Target:
+        Arn: !GetAtt CarbonAnalyzerFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub |
+          {
+            "source": "eventbridge-scheduler",
+            "detail-type": "Scheduled Carbon Analysis",
+            "detail": {
+              "project": "${ProjectName}",
+              "environment": "${Environment}",
+              "frequency": "${AnalysisFrequency}"
+            }
+          }
+
+  # Systems Manager Parameter for Configuration
+  ScannerConfiguration:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/scanner-config'
+      Type: String
+      Value: !Sub |
+        {
+          "rules": [
+            "ec2-instance-types",
+            "storage-optimization",
+            "graviton-processors",
+            "regional-efficiency"
+          ],
+          "severity": "medium",
+          "auto-fix": false,
+          "project": "${ProjectName}",
+          "environment": "${Environment}",
+          "alert_threshold": ${AlertThreshold},
+          "cost_threshold": ${CostThreshold}
+        }
+      Description: Configuration parameters for AWS Sustainability Scanner
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # Cost and Usage Report
+  CarbonOptimizationCUR:
+    Type: AWS::CUR::ReportDefinition
+    Properties:
+      ReportName: !Sub '${ProjectName}-detailed-report'
+      TimeUnit: DAILY
+      Format: Parquet
+      Compression: GZIP
+      AdditionalSchemaElements:
+        - RESOURCES
+        - SPLIT_COST_ALLOCATION_DATA
+      S3Bucket: !Ref CarbonDataBucket
+      S3Prefix: cost-usage-reports/
+      S3Region: !Ref 'AWS::Region'
+      AdditionalArtifacts:
+        - ATHENA
+      RefreshClosedReports: true
+      ReportVersioning: OVERWRITE_REPORT
+
+  # CloudWatch Alarms
+  HighCarbonFootprintAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-high-carbon-footprint'
+      AlarmDescription: Alert when estimated carbon footprint exceeds threshold
+      MetricName: EstimatedCarbonKg
+      Namespace: !Sub '${ProjectName}/CarbonOptimization'
+      Statistic: Sum
+      Period: 86400  # Daily
+      EvaluationPeriods: 1
+      Threshold: !Ref AlertThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref CarbonOptimizationTopic
+      TreatMissingData: notBreaching
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors'
+      AlarmDescription: Alert on Lambda function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CarbonAnalyzerFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref CarbonOptimizationTopic
+
+Outputs:
+  ProjectName:
+    Description: Project name used for resource naming
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectName'
+
+  CarbonDataBucket:
+    Description: S3 bucket for storing carbon footprint analysis data
+    Value: !Ref CarbonDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-CarbonDataBucket'
+
+  CarbonMetricsTable:
+    Description: DynamoDB table for storing carbon footprint metrics
+    Value: !Ref CarbonMetricsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-CarbonMetricsTable'
+
+  CarbonAnalyzerFunction:
+    Description: Lambda function for carbon footprint analysis
+    Value: !Ref CarbonAnalyzerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-CarbonAnalyzerFunction'
+
+  CarbonAnalyzerFunctionArn:
+    Description: ARN of the carbon footprint analyzer Lambda function
+    Value: !GetAtt CarbonAnalyzerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CarbonAnalyzerFunctionArn'
+
+  CarbonOptimizationTopic:
+    Description: SNS topic for carbon optimization notifications
+    Value: !Ref CarbonOptimizationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-CarbonOptimizationTopic'
+
+  CarbonOptimizationTopicArn:
+    Description: ARN of the carbon optimization SNS topic
+    Value: !Ref CarbonOptimizationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-CarbonOptimizationTopicArn'
+
+  CarbonAnalysisSchedule:
+    Description: EventBridge schedule for automated carbon analysis
+    Value: !Ref CarbonAnalysisSchedule
+    Export:
+      Name: !Sub '${AWS::StackName}-CarbonAnalysisSchedule'
+
+  DashboardURL:
+    Description: CloudWatch dashboard URL for monitoring carbon metrics
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-carbon-optimization'
+
+  CostExplorerURL:
+    Description: AWS Cost Explorer URL for cost analysis
+    Value: 'https://console.aws.amazon.com/cost-management/home#/cost-explorer'
+
+  SustainabilityDashboardURL:
+    Description: AWS Customer Carbon Footprint Tool dashboard
+    Value: 'https://console.aws.amazon.com/costmanagement/home#/carbon-footprint'
+
+  EstimatedMonthlyCost:
+    Description: Estimated monthly cost for running this solution
+    Value: !Sub '$15-25 (based on ${AnalysisFrequency} day analysis frequency)'
+
+  NextSteps:
+    Description: Recommended next steps after deployment
+    Value: !Sub |
+      1. Confirm SNS subscription in email: ${NotificationEmail}
+      2. Wait 24-48 hours for initial analysis data
+      3. Review carbon metrics in DynamoDB table: ${CarbonMetricsTable}
+      4. Check S3 bucket for detailed reports: ${CarbonDataBucket}
+      5. Monitor CloudWatch alarms for optimization opportunities
+      6. Access AWS Customer Carbon Footprint Tool for official data correlation

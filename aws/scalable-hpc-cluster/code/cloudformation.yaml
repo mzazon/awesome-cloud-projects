@@ -1,0 +1,974 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'High Performance Computing Cluster with AWS ParallelCluster - Creates VPC, networking, storage, and foundational resources for HPC workloads with Slurm scheduler'
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+
+Parameters:
+  # General Configuration
+  ClusterName:
+    Type: String
+    Default: 'hpc-cluster'
+    Description: 'Name prefix for the HPC cluster and associated resources'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must begin with a letter and contain only alphanumeric characters and hyphens'
+
+  # Networking Configuration
+  VpcCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: 'CIDR block for the VPC'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$'
+    ConstraintDescription: 'Must be a valid CIDR range (e.g., 10.0.0.0/16)'
+
+  PublicSubnetCidr:
+    Type: String
+    Default: '10.0.1.0/24'
+    Description: 'CIDR block for the public subnet (head node)'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$'
+    ConstraintDescription: 'Must be a valid CIDR range (e.g., 10.0.1.0/24)'
+
+  PrivateSubnetCidr:
+    Type: String
+    Default: '10.0.2.0/24'
+    Description: 'CIDR block for the private subnet (compute nodes)'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$'
+    ConstraintDescription: 'Must be a valid CIDR range (e.g., 10.0.2.0/24)'
+
+  # HPC Configuration
+  HeadNodeInstanceType:
+    Type: String
+    Default: 'm5.large'
+    Description: 'EC2 instance type for the head node'
+    AllowedValues:
+      - 'm5.large'
+      - 'm5.xlarge'
+      - 'm5.2xlarge'
+      - 'm5.4xlarge'
+      - 'c5.large'
+      - 'c5.xlarge'
+      - 'c5.2xlarge'
+    ConstraintDescription: 'Must be a valid EC2 instance type suitable for head node'
+
+  ComputeNodeInstanceType:
+    Type: String
+    Default: 'c5n.large'
+    Description: 'EC2 instance type for compute nodes'
+    AllowedValues:
+      - 'c5n.large'
+      - 'c5n.xlarge'
+      - 'c5n.2xlarge'
+      - 'c5n.4xlarge'
+      - 'c5n.9xlarge'
+      - 'c5n.18xlarge'
+      - 'c5.large'
+      - 'c5.xlarge'
+      - 'c5.2xlarge'
+      - 'c5.4xlarge'
+      - 'c5.9xlarge'
+      - 'c5.18xlarge'
+    ConstraintDescription: 'Must be a valid EC2 instance type suitable for HPC workloads'
+
+  MaxComputeNodes:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+    Description: 'Maximum number of compute nodes for auto-scaling'
+
+  # Storage Configuration
+  SharedStorageSize:
+    Type: Number
+    Default: 100
+    MinValue: 20
+    MaxValue: 1000
+    Description: 'Size of shared EBS storage in GB'
+
+  FSxStorageCapacity:
+    Type: Number
+    Default: 1200
+    MinValue: 1200
+    MaxValue: 100800
+    Description: 'FSx Lustre storage capacity in GB (must be multiple of 1200)'
+
+  # Security Configuration
+  SSHLocation:
+    Type: String
+    Default: '0.0.0.0/0'
+    Description: 'IP CIDR range allowed for SSH access to head node'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(0|[1-9]|[1-2][0-9]|3[0-2]))$'
+    ConstraintDescription: 'Must be a valid IP CIDR range (e.g., 0.0.0.0/0)'
+
+  # Tags
+  Environment:
+    Type: String
+    Default: 'development'
+    AllowedValues:
+      - 'development'
+      - 'staging'
+      - 'production'
+    Description: 'Environment designation for resource tagging'
+
+  CostCenter:
+    Type: String
+    Default: 'hpc-research'
+    Description: 'Cost center for billing allocation'
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+
+Conditions:
+  CreateFSxStorage: !Not [!Equals [!Ref FSxStorageCapacity, 0]]
+  UseHighPerformanceCompute: !Or
+    - !Equals [!Ref ComputeNodeInstanceType, 'c5n.9xlarge']
+    - !Equals [!Ref ComputeNodeInstanceType, 'c5n.18xlarge']
+  
+# =============================================================================
+# RESOURCES
+# =============================================================================
+
+Resources:
+  # -------------------------------------------------------------------------
+  # VPC AND NETWORKING
+  # -------------------------------------------------------------------------
+
+  # VPC for HPC cluster
+  HPCVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: 'HPC-Cluster'
+
+  # Public subnet for head node
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref HPCVpc
+      CidrBlock: !Ref PublicSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-subnet'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Type
+          Value: 'Public'
+
+  # Private subnet for compute nodes
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref HPCVpc
+      CidrBlock: !Ref PrivateSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-subnet'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Type
+          Value: 'Private'
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-igw'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Attach Internet Gateway to VPC
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref HPCVpc
+
+  # Elastic IP for NAT Gateway
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat-eip'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # NAT Gateway for private subnet internet access
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat-gw'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Route table for public subnet
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref HPCVpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-rt'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Default route for public subnet
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Associate public subnet with route table
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+
+  # Route table for private subnet
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref HPCVpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-rt'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Default route for private subnet through NAT Gateway
+  DefaultPrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  # Associate private subnet with route table
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet
+
+  # -------------------------------------------------------------------------
+  # SECURITY GROUPS
+  # -------------------------------------------------------------------------
+
+  # Security group for head node
+  HeadNodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group for HPC head node'
+      VpcId: !Ref HPCVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+          Description: 'SSH access from specified IP range'
+        - IpProtocol: tcp
+          FromPort: 6817
+          ToPort: 6817
+          SourceSecurityGroupId: !Ref ComputeNodeSecurityGroup
+          Description: 'Slurm controller daemon'
+        - IpProtocol: tcp
+          FromPort: 6818
+          ToPort: 6818
+          SourceSecurityGroupId: !Ref ComputeNodeSecurityGroup
+          Description: 'Slurm backup controller daemon'
+        - IpProtocol: tcp
+          FromPort: 6819
+          ToPort: 6819
+          SourceSecurityGroupId: !Ref ComputeNodeSecurityGroup
+          Description: 'Slurm database daemon'
+        - IpProtocol: tcp
+          FromPort: 7321
+          ToPort: 7321
+          SourceSecurityGroupId: !Ref ComputeNodeSecurityGroup
+          Description: 'Slurm accounting daemon'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-head-node-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Security group for compute nodes
+  ComputeNodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group for HPC compute nodes'
+      VpcId: !Ref HPCVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6818
+          ToPort: 6818
+          SourceSecurityGroupId: !Ref HeadNodeSecurityGroup
+          Description: 'Slurm node daemon'
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref HeadNodeSecurityGroup
+          Description: 'SSH from head node'
+        - IpProtocol: -1
+          SourceSecurityGroupId: !Ref ComputeNodeSecurityGroup
+          Description: 'Inter-node communication'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-compute-node-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Security group for FSx Lustre
+  FSxSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateFSxStorage
+    Properties:
+      GroupDescription: 'Security group for FSx Lustre filesystem'
+      VpcId: !Ref HPCVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 988
+          ToPort: 988
+          SourceSecurityGroupId: !Ref HeadNodeSecurityGroup
+          Description: 'Lustre service from head node'
+        - IpProtocol: tcp
+          FromPort: 1021
+          ToPort: 1023
+          SourceSecurityGroupId: !Ref HeadNodeSecurityGroup
+          Description: 'Lustre service range from head node'
+        - IpProtocol: tcp
+          FromPort: 988
+          ToPort: 988
+          SourceSecurityGroupId: !Ref ComputeNodeSecurityGroup
+          Description: 'Lustre service from compute nodes'
+        - IpProtocol: tcp
+          FromPort: 1021
+          ToPort: 1023
+          SourceSecurityGroupId: !Ref ComputeNodeSecurityGroup
+          Description: 'Lustre service range from compute nodes'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-fsx-sg'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # -------------------------------------------------------------------------
+  # STORAGE RESOURCES
+  # -------------------------------------------------------------------------
+
+  # S3 bucket for HPC data storage
+  HPCDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ClusterName}-data-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: HPC-Data-Lifecycle
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+              - StorageClass: DEEP_ARCHIVE
+                TransitionInDays: 365
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-data-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: 'HPC-Data-Storage'
+
+  # FSx Lustre filesystem for high-performance storage
+  FSxLustreFileSystem:
+    Type: AWS::FSx::FileSystem
+    Condition: CreateFSxStorage
+    Properties:
+      FileSystemType: LUSTRE
+      StorageCapacity: !Ref FSxStorageCapacity
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref FSxSecurityGroup
+      LustreConfiguration:
+        DeploymentType: SCRATCH_2
+        ImportPath: !Sub 's3://${HPCDataBucket}/'
+        ExportPath: !Sub 's3://${HPCDataBucket}/output/'
+        ImportedFileChunkSize: 1024
+        AutoImportPolicy: NEW_CHANGED
+        DataCompressionType: LZ4
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-fsx-lustre'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Purpose
+          Value: 'HPC-High-Performance-Storage'
+
+  # -------------------------------------------------------------------------
+  # IAM ROLES AND POLICIES
+  # -------------------------------------------------------------------------
+
+  # IAM role for ParallelCluster instances
+  ParallelClusterInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-ParallelCluster-InstanceRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+      Policies:
+        - PolicyName: ParallelClusterS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${HPCDataBucket}/*'
+                  - !GetAtt HPCDataBucket.Arn
+              - Effect: Allow
+                Action:
+                  - fsx:DescribeFileSystems
+                  - fsx:DescribeBackups
+                  - fsx:TagResource
+                  - fsx:UntagResource
+                  - fsx:ListTagsForResource
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceAttribute
+                  - ec2:DescribeInstanceStatus
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeSnapshots
+                  - ec2:CreateTags
+                  - ec2:DescribeTags
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-instance-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Instance profile for ParallelCluster instances
+  ParallelClusterInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ClusterName}-ParallelCluster-InstanceProfile'
+      Roles:
+        - !Ref ParallelClusterInstanceRole
+
+  # -------------------------------------------------------------------------
+  # KEY PAIR
+  # -------------------------------------------------------------------------
+
+  # EC2 Key Pair for cluster access
+  HPCKeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Sub '${ClusterName}-keypair'
+      KeyType: rsa
+      KeyFormat: pem
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-keypair'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # -------------------------------------------------------------------------
+  # CLOUDWATCH RESOURCES
+  # -------------------------------------------------------------------------
+
+  # CloudWatch dashboard for cluster monitoring
+  HPCDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ClusterName}-performance-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/EC2", "CPUUtilization", "ClusterName", "${ClusterName}" ],
+                  [ ".", "NetworkIn", ".", "." ],
+                  [ ".", "NetworkOut", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "HPC Cluster Performance Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 100
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/EC2", "StatusCheckFailed", "ClusterName", "${ClusterName}" ],
+                  [ ".", "StatusCheckFailed_Instance", ".", "." ],
+                  [ ".", "StatusCheckFailed_System", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "HPC Cluster Health Status",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+  # CloudWatch alarm for high CPU utilization
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ClusterName}-high-cpu-utilization'
+      AlarmDescription: 'Alarm when CPU utilization exceeds 80% for 10 minutes'
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ClusterName
+      AlarmActions:
+        - !Ref HPCNotificationTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch alarm for system failures
+  SystemFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ClusterName}-system-failure'
+      AlarmDescription: 'Alarm when system status check fails'
+      MetricName: StatusCheckFailed_System
+      Namespace: AWS/EC2
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ClusterName
+      AlarmActions:
+        - !Ref HPCNotificationTopic
+      TreatMissingData: notBreaching
+
+  # -------------------------------------------------------------------------
+  # SNS NOTIFICATION
+  # -------------------------------------------------------------------------
+
+  # SNS topic for HPC cluster notifications
+  HPCNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ClusterName}-notifications'
+      DisplayName: 'HPC Cluster Notifications'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-notifications'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # -------------------------------------------------------------------------
+  # LAMBDA FUNCTIONS
+  # -------------------------------------------------------------------------
+
+  # Lambda function for cluster initialization
+  ClusterInitializationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ClusterName}-cluster-initialization'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ClusterInitializationRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import cfnresponse
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              logger.info(f"Received event: {json.dumps(event)}")
+              
+              try:
+                  if event['RequestType'] == 'Create':
+                      # Initialize cluster resources
+                      s3_client = boto3.client('s3')
+                      bucket_name = event['ResourceProperties']['BucketName']
+                      
+                      # Create sample directories in S3
+                      sample_objects = [
+                          {'Key': 'input/sample_data.txt', 'Body': 'Sample HPC input data'},
+                          {'Key': 'jobs/sample_job.sh', 'Body': '#!/bin/bash\necho "Hello from HPC cluster"'},
+                          {'Key': 'output/.placeholder', 'Body': ''}
+                      ]
+                      
+                      for obj in sample_objects:
+                          s3_client.put_object(
+                              Bucket=bucket_name,
+                              Key=obj['Key'],
+                              Body=obj['Body']
+                          )
+                      
+                      logger.info("Cluster initialization completed successfully")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+                  elif event['RequestType'] == 'Delete':
+                      # Clean up resources if needed
+                      logger.info("Cluster cleanup completed")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-init-function'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # IAM role for Lambda initialization function
+  ClusterInitializationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-ClusterInitialization-Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${HPCDataBucket}/*'
+                  - !GetAtt HPCDataBucket.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-init-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+
+  # Custom resource to trigger cluster initialization
+  ClusterInitialization:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt ClusterInitializationFunction.Arn
+      BucketName: !Ref HPCDataBucket
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+
+Outputs:
+  # Networking Outputs
+  VpcId:
+    Description: 'VPC ID for the HPC cluster'
+    Value: !Ref HPCVpc
+    Export:
+      Name: !Sub '${AWS::StackName}-VPC-ID'
+
+  PublicSubnetId:
+    Description: 'Public subnet ID for head node'
+    Value: !Ref PublicSubnet
+    Export:
+      Name: !Sub '${AWS::StackName}-Public-Subnet-ID'
+
+  PrivateSubnetId:
+    Description: 'Private subnet ID for compute nodes'
+    Value: !Ref PrivateSubnet
+    Export:
+      Name: !Sub '${AWS::StackName}-Private-Subnet-ID'
+
+  # Security Group Outputs
+  HeadNodeSecurityGroupId:
+    Description: 'Security group ID for head node'
+    Value: !Ref HeadNodeSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-HeadNode-SG-ID'
+
+  ComputeNodeSecurityGroupId:
+    Description: 'Security group ID for compute nodes'
+    Value: !Ref ComputeNodeSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ComputeNode-SG-ID'
+
+  # Storage Outputs
+  HPCDataBucketName:
+    Description: 'S3 bucket name for HPC data storage'
+    Value: !Ref HPCDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-Data-Bucket-Name'
+
+  HPCDataBucketArn:
+    Description: 'S3 bucket ARN for HPC data storage'
+    Value: !GetAtt HPCDataBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-Data-Bucket-ARN'
+
+  FSxLustreFileSystemId:
+    Description: 'FSx Lustre filesystem ID'
+    Value: !If [CreateFSxStorage, !Ref FSxLustreFileSystem, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-FSx-Lustre-ID'
+
+  FSxLustreFileSystemDNSName:
+    Description: 'FSx Lustre filesystem DNS name'
+    Value: !If [CreateFSxStorage, !GetAtt FSxLustreFileSystem.DNSName, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-FSx-Lustre-DNS'
+
+  FSxLustreMountName:
+    Description: 'FSx Lustre mount name'
+    Value: !If [CreateFSxStorage, !GetAtt FSxLustreFileSystem.LustreMountName, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-FSx-Lustre-Mount'
+
+  # IAM Outputs
+  InstanceProfileArn:
+    Description: 'Instance profile ARN for ParallelCluster instances'
+    Value: !GetAtt ParallelClusterInstanceProfile.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-Instance-Profile-ARN'
+
+  InstanceRoleArn:
+    Description: 'Instance role ARN for ParallelCluster instances'
+    Value: !GetAtt ParallelClusterInstanceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-Instance-Role-ARN'
+
+  # Key Pair Output
+  KeyPairName:
+    Description: 'EC2 key pair name for cluster access'
+    Value: !Ref HPCKeyPair
+    Export:
+      Name: !Sub '${AWS::StackName}-KeyPair-Name'
+
+  # Monitoring Outputs
+  CloudWatchDashboardURL:
+    Description: 'CloudWatch dashboard URL for cluster monitoring'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ClusterName}-performance-dashboard'
+    Export:
+      Name: !Sub '${AWS::StackName}-Dashboard-URL'
+
+  NotificationTopicArn:
+    Description: 'SNS topic ARN for cluster notifications'
+    Value: !Ref HPCNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-Notification-Topic-ARN'
+
+  # Configuration Outputs
+  ClusterConfiguration:
+    Description: 'Summary of cluster configuration'
+    Value: !Sub |
+      Cluster Name: ${ClusterName}
+      Head Node Instance Type: ${HeadNodeInstanceType}
+      Compute Node Instance Type: ${ComputeNodeInstanceType}
+      Max Compute Nodes: ${MaxComputeNodes}
+      Shared Storage Size: ${SharedStorageSize}GB
+      FSx Storage Capacity: ${FSxStorageCapacity}GB
+      Environment: ${Environment}
+      Cost Center: ${CostCenter}
+
+  # Quick Start Commands
+  ParallelClusterConfigTemplate:
+    Description: 'Template for ParallelCluster configuration'
+    Value: !Sub |
+      Region: ${AWS::Region}
+      Image:
+        Os: alinux2
+      HeadNode:
+        InstanceType: ${HeadNodeInstanceType}
+        Networking:
+          SubnetId: ${PublicSubnet}
+        Ssh:
+          KeyName: ${HPCKeyPair}
+        Iam:
+          InstanceProfile: ${ParallelClusterInstanceProfile}
+      Scheduling:
+        Scheduler: slurm
+        SlurmQueues:
+          - Name: compute
+            ComputeResources:
+              - Name: compute-nodes
+                InstanceType: ${ComputeNodeInstanceType}
+                MinCount: 0
+                MaxCount: ${MaxComputeNodes}
+                Efa:
+                  Enabled: true
+            Networking:
+              SubnetIds:
+                - ${PrivateSubnet}
+              SecurityGroups:
+                - ${ComputeNodeSecurityGroup}
+      SharedStorage:
+        - MountDir: /shared
+          Name: shared-storage
+          StorageType: Ebs
+          EbsSettings:
+            Size: ${SharedStorageSize}
+            VolumeType: gp3
+            Encrypted: true
+        - MountDir: /fsx
+          Name: fsx-storage
+          StorageType: FsxLustre
+          FsxLustreSettings:
+            StorageCapacity: ${FSxStorageCapacity}
+            DeploymentType: SCRATCH_2
+            ImportPath: s3://${HPCDataBucket}/
+            ExportPath: s3://${HPCDataBucket}/output/
+      Monitoring:
+        CloudWatch:
+          Enabled: true
+          DashboardName: ${ClusterName}-dashboard

@@ -1,0 +1,589 @@
+# Infrastructure Manager Configuration for Video Content Moderation Workflow
+# This configuration deploys a complete video content moderation system using
+# Google Cloud Video Intelligence API, Cloud Scheduler, Cloud Functions, and Cloud Storage
+#
+# Resources created:
+# - Cloud Storage bucket with organized folder structure
+# - Pub/Sub topic and subscription for event-driven processing
+# - Cloud Function for video analysis and moderation
+# - Cloud Scheduler job for automated batch processing
+# - IAM service accounts and permissions
+# - API enablement for required services
+
+# Input variables for customization
+variables:
+  project_id:
+    type: string
+    description: "Google Cloud Project ID"
+    
+  region:
+    type: string
+    description: "Primary region for resource deployment"
+    default: "us-central1"
+    
+  environment:
+    type: string
+    description: "Environment name (dev, staging, prod)"
+    default: "dev"
+    
+  random_suffix:
+    type: string
+    description: "Random suffix for unique resource naming"
+    default: "abcd123"
+    
+  scheduler_frequency:
+    type: string
+    description: "Cron schedule for video processing (default: every 4 hours)"
+    default: "0 */4 * * *"
+    
+  function_timeout:
+    type: integer
+    description: "Cloud Function timeout in seconds"
+    default: 540
+    
+  function_memory:
+    type: string
+    description: "Cloud Function memory allocation"
+    default: "1Gi"
+    
+  max_function_instances:
+    type: integer
+    description: "Maximum number of Cloud Function instances"
+    default: 10
+
+# Template configuration
+resources:
+  # Project resource reference
+  - name: project
+    type: gcp-types/cloudresourcemanager-v1:projects
+    properties:
+      projectId: ${project_id}
+    accessControl:
+      gcpIamPolicy:
+        bindings: []
+
+  # Enable required Google Cloud APIs
+  - name: video-intelligence-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/videointelligence.googleapis.com
+    metadata:
+      dependsOn:
+        - project
+
+  - name: cloudfunctions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/cloudfunctions.googleapis.com
+    metadata:
+      dependsOn:
+        - project
+
+  - name: cloudscheduler-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/cloudscheduler.googleapis.com
+    metadata:
+      dependsOn:
+        - project
+
+  - name: pubsub-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/pubsub.googleapis.com
+    metadata:
+      dependsOn:
+        - project
+
+  - name: storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/storage.googleapis.com
+    metadata:
+      dependsOn:
+        - project
+
+  - name: logging-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/logging.googleapis.com
+    metadata:
+      dependsOn:
+        - project
+
+  - name: monitoring-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/${project_id}/services/monitoring.googleapis.com
+    metadata:
+      dependsOn:
+        - project
+
+  # Cloud Storage bucket for video processing
+  - name: video-storage-bucket
+    type: gcp-types/storage-v1:buckets
+    properties:
+      name: video-moderation-${environment}-${random_suffix}
+      project: ${project_id}
+      location: ${region}
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      # Lifecycle management for cost optimization
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 90  # Delete videos older than 90 days
+              matchesStorageClass: ["STANDARD"]
+          - action:
+              type: SetStorageClass
+              storageClass: COLDLINE
+            condition:
+              age: 30  # Move to coldline after 30 days
+              matchesStorageClass: ["STANDARD"]
+      # Enable uniform bucket-level access for security
+      iamConfiguration:
+        uniformBucketLevelAccess:
+          enabled: true
+      # Bucket labels for organization
+      labels:
+        environment: ${environment}
+        purpose: "video-moderation"
+        managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - storage-api
+
+  # Pub/Sub topic for video moderation events
+  - name: video-moderation-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/${project_id}/topics/video-moderation-${environment}-${random_suffix}
+      labels:
+        environment: ${environment}
+        purpose: "video-moderation"
+        managed-by: "infrastructure-manager"
+      # Message retention for reliability
+      messageRetentionDuration: "86400s"  # 24 hours
+    metadata:
+      dependsOn:
+        - pubsub-api
+
+  # Pub/Sub subscription for function processing
+  - name: video-moderation-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/${project_id}/subscriptions/video-moderation-${environment}-${random_suffix}-sub
+      topic: $(ref.video-moderation-topic.name)
+      # Extended ack deadline for video processing
+      ackDeadlineSeconds: 600
+      # Message retention for fault tolerance
+      messageRetentionDuration: "86400s"  # 24 hours
+      # Dead letter policy for failed messages
+      deadLetterPolicy:
+        maxDeliveryAttempts: 5
+      labels:
+        environment: ${environment}
+        purpose: "video-moderation"
+        managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - video-moderation-topic
+
+  # Service account for Cloud Scheduler
+  - name: scheduler-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: video-scheduler-${environment}-${random_suffix}
+      serviceAccount:
+        displayName: "Video Moderation Scheduler (${environment})"
+        description: "Service account for automated video moderation scheduling"
+      project: ${project_id}
+    metadata:
+      dependsOn:
+        - project
+
+  # Service account for Cloud Function
+  - name: function-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: video-function-${environment}-${random_suffix}
+      serviceAccount:
+        displayName: "Video Moderation Function (${environment})"
+        description: "Service account for video moderation Cloud Function"
+      project: ${project_id}
+    metadata:
+      dependsOn:
+        - project
+
+  # IAM binding for Pub/Sub publisher role (Scheduler)
+  - name: scheduler-pubsub-publisher-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/pubsub.publisher
+      member: serviceAccount:$(ref.scheduler-service-account.email)
+    metadata:
+      dependsOn:
+        - scheduler-service-account
+
+  # IAM binding for Cloud Scheduler job runner role
+  - name: scheduler-job-runner-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/cloudscheduler.jobRunner
+      member: serviceAccount:$(ref.scheduler-service-account.email)
+    metadata:
+      dependsOn:
+        - scheduler-service-account
+
+  # IAM binding for Video Intelligence API access
+  - name: function-videointelligence-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/videointelligence.editor
+      member: serviceAccount:$(ref.function-service-account.email)
+    metadata:
+      dependsOn:
+        - function-service-account
+
+  # IAM binding for Storage object admin access
+  - name: function-storage-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/storage.objectAdmin
+      member: serviceAccount:$(ref.function-service-account.email)
+    metadata:
+      dependsOn:
+        - function-service-account
+
+  # IAM binding for logging permissions
+  - name: function-logging-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/logging.logWriter
+      member: serviceAccount:$(ref.function-service-account.email)
+    metadata:
+      dependsOn:
+        - function-service-account
+
+  # IAM binding for Pub/Sub subscriber permissions
+  - name: function-pubsub-subscriber-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: ${project_id}
+      role: roles/pubsub.subscriber
+      member: serviceAccount:$(ref.function-service-account.email)
+    metadata:
+      dependsOn:
+        - function-service-account
+
+  # Cloud Function for video moderation processing (Gen 2)
+  - name: video-moderation-function
+    type: gcp-types/cloudfunctions-v2:projects.locations.functions
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      functionId: video-moderator-${environment}-${random_suffix}
+      function:
+        buildConfig:
+          runtime: python311
+          entryPoint: video_moderation_handler
+          source:
+            storageSource:
+              bucket: gcf-v2-sources-${project_id}-${region}  # Default GCF source bucket
+              object: video-moderation-function-source.zip
+          environmentVariables:
+            GOOGLE_FUNCTION_SOURCE: |
+              import json
+              import os
+              import logging
+              from google.cloud import videointelligence
+              from google.cloud import storage
+              from google.cloud import logging as cloud_logging
+              import functions_framework
+
+              cloud_logging.Client().setup_logging()
+              logger = logging.getLogger(__name__)
+
+              @functions_framework.cloud_event
+              def video_moderation_handler(cloud_event):
+                  try:
+                      video_client = videointelligence.VideoIntelligenceServiceClient()
+                      storage_client = storage.Client()
+                      
+                      message_data = json.loads(cloud_event.data.get('message', {}).get('data', '{}'))
+                      bucket_name = message_data.get('bucket', os.environ['BUCKET_NAME'])
+                      
+                      logger.info(f"Processing moderation for bucket: {bucket_name}")
+                      
+                      bucket = storage_client.bucket(bucket_name)
+                      blobs = list(bucket.list_blobs(prefix='processing/'))
+                      
+                      for blob in blobs:
+                          if blob.name.endswith(('.mp4', '.avi', '.mov', '.mkv')):
+                              process_video(video_client, storage_client, bucket_name, blob.name)
+                      
+                      logger.info("Video moderation batch processing completed")
+                      
+                  except Exception as e:
+                      logger.error(f"Error in video moderation: {str(e)}")
+                      raise
+
+              def process_video(video_client, storage_client, bucket_name, video_path):
+                  try:
+                      gcs_uri = f"gs://{bucket_name}/{video_path}"
+                      features = [videointelligence.Feature.EXPLICIT_CONTENT_DETECTION]
+                      
+                      logger.info(f"Analyzing video: {gcs_uri}")
+                      
+                      operation = video_client.annotate_video(
+                          request={
+                              "input_uri": gcs_uri,
+                              "features": features,
+                          }
+                      )
+                      
+                      result = operation.result(timeout=300)
+                      moderation_result = analyze_explicit_content(result)
+                      take_moderation_action(storage_client, bucket_name, video_path, moderation_result)
+                      
+                      logger.info(f"Video analysis completed: {video_path}")
+                      
+                  except Exception as e:
+                      logger.error(f"Error processing video {video_path}: {str(e)}")
+
+              def analyze_explicit_content(result):
+                  explicit_annotation = result.annotation_results[0].explicit_annotation
+                  
+                  total_frames = len(explicit_annotation.frames)
+                  if total_frames == 0:
+                      return {"action": "approve", "confidence": 0.0, "reason": "No frames analyzed"}
+                  
+                  high_confidence_count = 0
+                  total_confidence = 0
+                  
+                  for frame in explicit_annotation.frames:
+                      confidence = frame.pornography_likelihood.value
+                      total_confidence += confidence
+                      
+                      if confidence >= 3:
+                          high_confidence_count += 1
+                  
+                  average_confidence = total_confidence / total_frames
+                  explicit_ratio = high_confidence_count / total_frames
+                  
+                  if explicit_ratio > 0.1 or average_confidence > 3:
+                      return {
+                          "action": "flag",
+                          "confidence": average_confidence,
+                          "explicit_ratio": explicit_ratio,
+                          "reason": f"High explicit content ratio: {explicit_ratio:.2%}"
+                      }
+                  else:
+                      return {
+                          "action": "approve",
+                          "confidence": average_confidence,
+                          "explicit_ratio": explicit_ratio,
+                          "reason": "Content within acceptable thresholds"
+                      }
+
+              def take_moderation_action(storage_client, bucket_name, video_path, moderation_result):
+                  bucket = storage_client.bucket(bucket_name)
+                  source_blob = bucket.blob(video_path)
+                  
+                  if moderation_result["action"] == "flag":
+                      target_path = video_path.replace("processing/", "flagged/")
+                  else:
+                      target_path = video_path.replace("processing/", "approved/")
+                  
+                  target_blob = bucket.copy_blob(source_blob, bucket, target_path)
+                  source_blob.delete()
+                  
+                  logger.info(f"Video moderation completed - Action: {moderation_result['action']}, "
+                              f"Confidence: {moderation_result['confidence']:.2f}, "
+                              f"Target: {target_path}")
+        serviceConfig:
+          maxInstanceCount: ${max_function_instances}
+          availableMemory: ${function_memory}
+          timeoutSeconds: ${function_timeout}
+          environmentVariables:
+            BUCKET_NAME: $(ref.video-storage-bucket.name)
+            PROJECT_ID: ${project_id}
+            ENVIRONMENT: ${environment}
+          serviceAccountEmail: $(ref.function-service-account.email)
+          # Security settings
+          ingressSettings: ALLOW_INTERNAL_ONLY
+          vpcConnectorEgressSettings: PRIVATE_RANGES_ONLY
+        eventTrigger:
+          triggerRegion: ${region}
+          eventType: google.cloud.pubsub.topic.v1.messagePublished
+          pubsubTopic: $(ref.video-moderation-topic.name)
+          retryPolicy: RETRY_POLICY_RETRY
+        labels:
+          environment: ${environment}
+          purpose: "video-moderation"
+          managed-by: "infrastructure-manager"
+    metadata:
+      dependsOn:
+        - video-moderation-topic
+        - function-service-account
+        - function-videointelligence-binding
+        - function-storage-binding
+        - function-logging-binding
+        - function-pubsub-subscriber-binding
+        - cloudfunctions-api
+
+  # Cloud Scheduler job for automated batch processing
+  - name: video-moderation-scheduler-job
+    type: gcp-types/cloudscheduler-v1:projects.locations.jobs
+    properties:
+      parent: projects/${project_id}/locations/${region}
+      job:
+        name: moderation-job-${environment}-${random_suffix}
+        description: "Automated video content moderation scheduling"
+        schedule: ${scheduler_frequency}
+        timeZone: "America/New_York"
+        # Pub/Sub target configuration
+        pubsubTarget:
+          topicName: $(ref.video-moderation-topic.name)
+          data: |
+            {
+              "bucket": "$(ref.video-storage-bucket.name)",
+              "trigger": "scheduled",
+              "environment": "${environment}"
+            }
+          attributes:
+            source: "cloud-scheduler"
+            environment: ${environment}
+        # Retry configuration for reliability
+        retryConfig:
+          retryCount: 3
+          maxRetryDuration: "300s"
+          minBackoffDuration: "10s"
+          maxBackoffDuration: "60s"
+        # Service account for authentication
+        serviceAccountEmail: $(ref.scheduler-service-account.email)
+    metadata:
+      dependsOn:
+        - video-moderation-topic
+        - scheduler-service-account
+        - scheduler-pubsub-publisher-binding
+        - scheduler-job-runner-binding
+        - cloudscheduler-api
+
+  # Cloud Monitoring alert policy for function errors
+  - name: function-error-alert-policy
+    type: gcp-types/monitoring-v1:projects.alertPolicies
+    properties:
+      project: ${project_id}
+      alertPolicy:
+        displayName: "Video Moderation Function Errors (${environment})"
+        documentation:
+          content: "Alert when video moderation function experiences high error rates"
+          mimeType: "text/markdown"
+        conditions:
+          - displayName: "Function Error Rate"
+            conditionThreshold:
+              filter: |
+                resource.type="cloud_function"
+                resource.labels.function_name="$(ref.video-moderation-function.name)"
+                metric.type="cloudfunctions.googleapis.com/function/execution_count"
+                metric.labels.status!="ok"
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 5
+              duration: "300s"
+              aggregations:
+                - alignmentPeriod: "300s"
+                  perSeriesAligner: ALIGN_RATE
+                  crossSeriesReducer: REDUCE_SUM
+        combiner: OR
+        enabled: true
+        notificationChannels: []  # Add notification channels as needed
+    metadata:
+      dependsOn:
+        - video-moderation-function
+        - monitoring-api
+
+  # Cloud Logging sink for video moderation logs
+  - name: video-moderation-log-sink
+    type: gcp-types/logging-v2:projects.sinks
+    properties:
+      parent: projects/${project_id}
+      sink:
+        name: video-moderation-logs-${environment}-${random_suffix}
+        description: "Log sink for video moderation workflow"
+        filter: |
+          resource.type="cloud_function"
+          resource.labels.function_name="$(ref.video-moderation-function.name)"
+        destination: storage.googleapis.com/$(ref.video-storage-bucket.name)/logs
+        # Include writer identity for proper permissions
+        includeWriterIdentity: true
+    metadata:
+      dependsOn:
+        - video-moderation-function
+        - video-storage-bucket
+        - logging-api
+
+# Output values for verification and integration
+outputs:
+  storage_bucket_name:
+    description: "Cloud Storage bucket name for video processing"
+    value: $(ref.video-storage-bucket.name)
+
+  storage_bucket_url:
+    description: "Cloud Storage bucket URL"
+    value: gs://$(ref.video-storage-bucket.name)
+
+  pubsub_topic_name:
+    description: "Pub/Sub topic name for video moderation events"
+    value: $(ref.video-moderation-topic.name)
+
+  pubsub_subscription_name:
+    description: "Pub/Sub subscription name"
+    value: $(ref.video-moderation-subscription.name)
+
+  function_name:
+    description: "Cloud Function name for video moderation"
+    value: $(ref.video-moderation-function.name)
+
+  scheduler_job_name:
+    description: "Cloud Scheduler job name"
+    value: $(ref.video-moderation-scheduler-job.name)
+
+  scheduler_job_schedule:
+    description: "Cloud Scheduler job schedule"
+    value: ${scheduler_frequency}
+
+  function_service_account:
+    description: "Service account email for Cloud Function"
+    value: $(ref.function-service-account.email)
+
+  scheduler_service_account:
+    description: "Service account email for Cloud Scheduler"
+    value: $(ref.scheduler-service-account.email)
+
+  project_id:
+    description: "Google Cloud Project ID"
+    value: ${project_id}
+
+  region:
+    description: "Primary deployment region"
+    value: ${region}
+
+  environment:
+    description: "Environment name"
+    value: ${environment}
+
+  monitoring_alert_policy:
+    description: "Cloud Monitoring alert policy name"
+    value: $(ref.function-error-alert-policy.name)
+
+  log_sink_name:
+    description: "Cloud Logging sink name"
+    value: $(ref.video-moderation-log-sink.name)

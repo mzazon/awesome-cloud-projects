@@ -1,0 +1,373 @@
+# Cloud Workflows Definition for Document Validation Pipeline
+# This workflow orchestrates the complete document validation process including
+# AI-powered extraction, validation logic, and intelligent routing.
+
+main:
+  params: [event]
+  steps:
+    # Initialize workflow variables from event and environment
+    - init:
+        assign:
+          - bucket: $${event.data.bucket}
+          - name: $${event.data.name}
+          - project_id: $${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+          - region: "${region}"
+          - form_processor: $${sys.get_env("FORM_PROCESSOR_ID")}
+          - invoice_processor: $${sys.get_env("INVOICE_PROCESSOR_ID")}
+          - valid_bucket: $${sys.get_env("VALID_BUCKET")}
+          - invalid_bucket: $${sys.get_env("INVALID_BUCKET")}
+          - review_bucket: $${sys.get_env("REVIEW_BUCKET")}
+          - dataset_name: $${sys.get_env("DATASET_NAME")}
+          - confidence_threshold: ${confidence_threshold}
+          - max_validation_errors: ${max_validation_errors}
+    
+    # Log workflow start
+    - log_start:
+        call: sys.log
+        args:
+          text: $${"Starting document processing for: " + name + " in bucket: " + bucket}
+          severity: INFO
+    
+    # Determine document type based on filename patterns
+    - determine_document_type:
+        switch:
+          - condition: $${text.match_regex(name, ".*invoice.*|.*bill.*|.*receipt.*")}
+            assign:
+              - processor_id: $${invoice_processor}
+              - document_type: "invoice"
+            next: validate_file_extension
+          - condition: $${text.match_regex(name, ".*form.*|.*application.*|.*survey.*")}
+            assign:
+              - processor_id: $${form_processor}
+              - document_type: "form"
+            next: validate_file_extension
+        next: default_processing
+    
+    # Default to form processor for unmatched documents
+    - default_processing:
+        assign:
+          - processor_id: $${form_processor}
+          - document_type: "general"
+    
+    # Validate file extension (support PDF, PNG, JPG, TIFF)
+    - validate_file_extension:
+        switch:
+          - condition: $${text.match_regex(name, ".*\\.(pdf|png|jpg|jpeg|tiff)$")}
+            next: determine_mime_type
+        next: unsupported_format
+    
+    # Determine MIME type based on file extension
+    - determine_mime_type:
+        switch:
+          - condition: $${text.match_regex(name, ".*\\.pdf$")}
+            assign:
+              - mime_type: "application/pdf"
+            next: process_document
+          - condition: $${text.match_regex(name, ".*\\.(png)$")}
+            assign:
+              - mime_type: "image/png"
+            next: process_document
+          - condition: $${text.match_regex(name, ".*\\.(jpg|jpeg)$")}
+            assign:
+              - mime_type: "image/jpeg"
+            next: process_document
+          - condition: $${text.match_regex(name, ".*\\.(tiff)$")}
+            assign:
+              - mime_type: "image/tiff"
+            next: process_document
+        next: unsupported_format
+    
+    # Handle unsupported file formats
+    - unsupported_format:
+        steps:
+          - log_unsupported:
+              call: sys.log
+              args:
+                text: $${"Unsupported file format: " + name}
+                severity: WARNING
+          - move_to_invalid_format:
+              call: googleapis.storage.v1.objects.copy
+              args:
+                sourceBucket: $${bucket}
+                sourceObject: $${name}
+                destinationBucket: $${invalid_bucket}
+                destinationObject: $${"unsupported_format/" + name}
+          - cleanup_source_unsupported:
+              call: googleapis.storage.v1.objects.delete
+              args:
+                bucket: $${bucket}
+                object: $${name}
+          - return_unsupported:
+              return: 
+                status: "error"
+                message: "Unsupported file format"
+                document: $${name}
+    
+    # Process document with Document AI
+    - process_document:
+        try:
+          steps:
+            - call_document_ai:
+                call: googleapis.documentai.v1.projects.locations.processors.process
+                args:
+                  name: $${processor_id}
+                  body:
+                    rawDocument:
+                      content: $${base64.encode(http.get("gs://" + bucket + "/" + name).body)}
+                      mimeType: $${mime_type}
+                result: processing_result
+            - log_processing_success:
+                call: sys.log
+                args:
+                  text: $${"Document AI processing completed for: " + name}
+                  severity: INFO
+        except:
+          as: e
+          steps:
+            - log_processing_error:
+                call: sys.log
+                args:
+                  text: $${"Document AI processing failed for: " + name + " - Error: " + string(e)}
+                  severity: ERROR
+            - move_to_invalid_processing:
+                call: googleapis.storage.v1.objects.copy
+                args:
+                  sourceBucket: $${bucket}
+                  sourceObject: $${name}
+                  destinationBucket: $${invalid_bucket}
+                  destinationObject: $${"processing_failed/" + name}
+            - cleanup_source_processing:
+                call: googleapis.storage.v1.objects.delete
+                args:
+                  bucket: $${bucket}
+                  object: $${name}
+            - return_processing_error:
+                return: 
+                  status: "error"
+                  message: "Document AI processing failed"
+                  document: $${name}
+                  error: $${string(e)}
+    
+    # Initialize validation variables
+    - initialize_validation:
+        assign:
+          - validation_errors: []
+          - extracted_data: $${processing_result.document.entities}
+          - total_confidence: 0.0
+          - entity_count: 0
+          - average_confidence: 0.0
+    
+    # Validate extracted data confidence scores
+    - validate_extraction_confidence:
+        for:
+          value: entity
+          in: $${extracted_data}
+          steps:
+            - evaluate_entity_confidence:
+                steps:
+                  - increment_count:
+                      assign:
+                        - entity_count: $${entity_count + 1}
+                        - total_confidence: $${total_confidence + entity.confidence}
+                  - check_confidence_threshold:
+                      switch:
+                        - condition: $${entity.confidence < confidence_threshold}
+                          steps:
+                            - add_confidence_error:
+                                assign:
+                                  - validation_errors: $${list.concat(validation_errors, [{"field": entity.type, "confidence": entity.confidence, "reason": "Low confidence score", "threshold": confidence_threshold}])}
+    
+    # Calculate average confidence
+    - calculate_average_confidence:
+        switch:
+          - condition: $${entity_count > 0}
+            assign:
+              - average_confidence: $${total_confidence / entity_count}
+        next: validate_required_fields
+    
+    # Validate required fields based on document type
+    - validate_required_fields:
+        switch:
+          - condition: $${document_type == "invoice"}
+            steps:
+              - validate_invoice_fields:
+                  steps:
+                    - check_invoice_total:
+                        for:
+                          value: entity
+                          in: $${extracted_data}
+                          steps:
+                            - check_total_amount:
+                                switch:
+                                  - condition: $${entity.type == "total_amount" and entity.confidence >= confidence_threshold}
+                                    next: continue
+                        next: add_missing_total_error
+                    - add_missing_total_error:
+                        assign:
+                          - validation_errors: $${list.concat(validation_errors, [{"field": "total_amount", "reason": "Missing or low confidence total amount", "requirement": "Invoice must have total amount"}])}
+          - condition: $${document_type == "form"}
+            steps:
+              - validate_form_fields:
+                  steps:
+                    - check_form_completeness:
+                        switch:
+                          - condition: $${len(extracted_data) < 3}
+                            assign:
+                              - validation_errors: $${list.concat(validation_errors, [{"field": "form_completeness", "reason": "Insufficient form data extracted", "requirement": "Form must have at least 3 fields"}])}
+    
+    # Perform cross-field validation
+    - cross_field_validation:
+        switch:
+          - condition: $${document_type == "invoice"}
+            steps:
+              - validate_invoice_dates:
+                  assign:
+                    - date_fields: []
+                  for:
+                    value: entity
+                    in: $${extracted_data}
+                    steps:
+                      - collect_dates:
+                          switch:
+                            - condition: $${text.match_regex(entity.type, ".*date.*")}
+                              assign:
+                                - date_fields: $${list.concat(date_fields, [entity])}
+                  next: validate_date_logic
+              - validate_date_logic:
+                  switch:
+                    - condition: $${len(date_fields) >= 2}
+                      steps:
+                        - check_date_consistency:
+                            call: sys.log
+                            args:
+                              text: $${"Found " + string(len(date_fields)) + " date fields for validation"}
+                              severity: INFO
+    
+    # Determine document routing based on validation results
+    - determine_routing:
+        switch:
+          - condition: $${len(validation_errors) == 0}
+            assign:
+              - destination_bucket: $${valid_bucket}
+              - validation_status: "valid"
+              - destination_folder: ""
+            next: route_document
+          - condition: $${len(validation_errors) > 0 and len(validation_errors) <= max_validation_errors}
+            assign:
+              - destination_bucket: $${review_bucket}
+              - validation_status: "needs_review"
+              - destination_folder: "low_confidence/"
+            next: route_document
+          - condition: $${len(validation_errors) > max_validation_errors}
+            assign:
+              - destination_bucket: $${invalid_bucket}
+              - validation_status: "invalid"
+              - destination_folder: "high_error_count/"
+            next: route_document
+    
+    # Route document to appropriate destination
+    - route_document:
+        try:
+          steps:
+            - copy_to_destination:
+                call: googleapis.storage.v1.objects.copy
+                args:
+                  sourceBucket: $${bucket}
+                  sourceObject: $${name}
+                  destinationBucket: $${destination_bucket}
+                  destinationObject: $${destination_folder + name}
+            - log_routing_success:
+                call: sys.log
+                args:
+                  text: $${"Document routed successfully: " + name + " -> " + destination_bucket + "/" + destination_folder}
+                  severity: INFO
+        except:
+          as: e
+          steps:
+            - log_routing_error:
+                call: sys.log
+                args:
+                  text: $${"Failed to route document: " + name + " - Error: " + string(e)}
+                  severity: ERROR
+            - set_routing_error:
+                assign:
+                  - validation_status: "routing_failed"
+    
+    # Store analytics data in BigQuery
+    - store_analytics:
+        try:
+          steps:
+            - insert_analytics_data:
+                call: googleapis.bigquery.v2.tabledata.insertAll
+                args:
+                  projectId: $${project_id}
+                  datasetId: $${dataset_name}
+                  tableId: "processing_results"
+                  body:
+                    rows:
+                      - json:
+                          document_id: $${name}
+                          processor_type: $${document_type}
+                          processing_time: $${time.now()}
+                          validation_status: $${validation_status}
+                          confidence_score: $${average_confidence}
+                          extracted_fields: $${extracted_data}
+                          validation_errors: $${validation_errors}
+            - log_analytics_success:
+                call: sys.log
+                args:
+                  text: $${"Analytics data stored for: " + name}
+                  severity: INFO
+        except:
+          as: e
+          steps:
+            - log_analytics_error:
+                call: sys.log
+                args:
+                  text: $${"Failed to store analytics data: " + name + " - Error: " + string(e)}
+                  severity: WARNING
+    
+    # Clean up source document
+    - cleanup_source:
+        try:
+          steps:
+            - delete_source_document:
+                call: googleapis.storage.v1.objects.delete
+                args:
+                  bucket: $${bucket}
+                  object: $${name}
+            - log_cleanup_success:
+                call: sys.log
+                args:
+                  text: $${"Source document cleaned up: " + name}
+                  severity: INFO
+        except:
+          as: e
+          steps:
+            - log_cleanup_error:
+                call: sys.log
+                args:
+                  text: $${"Failed to cleanup source document: " + name + " - Error: " + string(e)}
+                  severity: WARNING
+    
+    # Log workflow completion
+    - log_completion:
+        call: sys.log
+        args:
+          text: $${"Document processing completed: " + name + " -> " + validation_status + " (" + string(len(validation_errors)) + " validation errors)"}
+          severity: INFO
+    
+    # Return final workflow result
+    - return_result:
+        return:
+          status: "success"
+          document: $${name}
+          document_type: $${document_type}
+          processor_used: $${processor_id}
+          validation_status: $${validation_status}
+          confidence_score: $${average_confidence}
+          validation_errors: $${validation_errors}
+          destination_bucket: $${destination_bucket}
+          destination_path: $${destination_folder + name}
+          extracted_fields_count: $${len(extracted_data)}
+          processing_timestamp: $${time.now()}

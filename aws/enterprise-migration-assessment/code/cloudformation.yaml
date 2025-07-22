@@ -1,0 +1,763 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Infrastructure as Code for Enterprise Migration Assessment with AWS Application Discovery Service.
+  This template creates the necessary AWS resources for discovering and assessing on-premises 
+  infrastructure for cloud migration planning. Includes S3 storage for discovery data,
+  CloudWatch monitoring, EventBridge automation, and Migration Hub integration.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Discovery Configuration"
+        Parameters:
+          - EnableContinuousExport
+          - DataRetentionDays
+          - ExportSchedule
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - EnableS3Encryption
+          - EnableAccessLogging
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableCloudWatchLogs
+          - LogRetentionDays
+    ParameterLabels:
+      ProjectName:
+        default: "Migration Project Name"
+      Environment:
+        default: "Environment (dev/staging/prod)"
+      EnableContinuousExport:
+        default: "Enable Continuous Data Export"
+      DataRetentionDays:
+        default: "Discovery Data Retention (Days)"
+      ExportSchedule:
+        default: "Export Schedule Expression"
+      EnableS3Encryption:
+        default: "Enable S3 Server-Side Encryption"
+      EnableAccessLogging:
+        default: "Enable S3 Access Logging"
+      EnableCloudWatchLogs:
+        default: "Enable CloudWatch Logs"
+      LogRetentionDays:
+        default: "Log Retention Period (Days)"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Name for the migration project (used for resource naming)
+    Default: enterprise-migration
+    AllowedPattern: ^[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]$
+    ConstraintDescription: Must contain only alphanumeric characters and hyphens, cannot start or end with hyphen
+    MinLength: 3
+    MaxLength: 50
+
+  Environment:
+    Type: String
+    Description: Environment designation for resource tagging and organization
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    ConstraintDescription: Must be dev, staging, or prod
+
+  EnableContinuousExport:
+    Type: String
+    Description: Enable continuous export of discovery data to S3
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  DataRetentionDays:
+    Type: Number
+    Description: Number of days to retain discovery data in S3 (0 = never expire)
+    Default: 90
+    MinValue: 0
+    MaxValue: 365
+
+  ExportSchedule:
+    Type: String
+    Description: Schedule expression for automated discovery data exports (EventBridge format)
+    Default: rate(7 days)
+    AllowedPattern: ^(rate\([0-9]+ (minute|minutes|hour|hours|day|days)\)|cron\(.+\))$
+    ConstraintDescription: Must be a valid EventBridge schedule expression
+
+  EnableS3Encryption:
+    Type: String
+    Description: Enable server-side encryption for S3 bucket using AWS KMS
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableAccessLogging:
+    Type: String
+    Description: Enable S3 access logging for audit and compliance
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableCloudWatchLogs:
+    Type: String
+    Description: Enable CloudWatch Logs for discovery service monitoring
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  LogRetentionDays:
+    Type: Number
+    Description: Number of days to retain CloudWatch logs
+    Default: 30
+    AllowedValues:
+      - 1
+      - 3
+      - 5
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+      - 120
+      - 150
+      - 180
+      - 365
+      - 400
+      - 545
+      - 731
+      - 1827
+      - 3653
+
+Conditions:
+  ShouldCreateKMSKey: !Equals [!Ref EnableS3Encryption, 'true']
+  ShouldCreateAccessLogging: !Equals [!Ref EnableAccessLogging, 'true']
+  ShouldCreateCloudWatchLogs: !Equals [!Ref EnableCloudWatchLogs, 'true']
+  ShouldSetDataRetention: !Not [!Equals [!Ref DataRetentionDays, 0]]
+  ShouldEnableContinuousExport: !Equals [!Ref EnableContinuousExport, 'true']
+  IsProductionEnvironment: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # KMS Key for S3 Encryption
+  DiscoveryDataKMSKey:
+    Type: AWS::KMS::Key
+    Condition: ShouldCreateKMSKey
+    Properties:
+      Description: !Sub 'KMS key for encrypting ${ProjectName} discovery data'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow Application Discovery Service
+            Effect: Allow
+            Principal:
+              Service: discovery.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:CreateGrant
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+          - Sid: Allow EventBridge Service
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+      KeyRotationEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-discovery-kms-key'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Discovery Data Encryption'
+
+  DiscoveryDataKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: ShouldCreateKMSKey
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-discovery-data'
+      TargetKeyId: !Ref DiscoveryDataKMSKey
+
+  # S3 Bucket for Access Logging
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: ShouldCreateAccessLogging
+    Properties:
+      BucketName: !Sub '${ProjectName}-discovery-access-logs-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: DeleteAccessLogs
+            Status: Enabled
+            ExpirationInDays: !If [IsProductionEnvironment, 90, 30]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-discovery-access-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'S3 Access Logging'
+
+  # Main S3 Bucket for Discovery Data
+  DiscoveryDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-discovery-data-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [ShouldCreateKMSKey, 'aws:kms', 'AES256']
+              KMSMasterKeyID: !If [ShouldCreateKMSKey, !Ref DiscoveryDataKMSKey, !Ref 'AWS::NoValue']
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration: !If
+        - ShouldCreateAccessLogging
+        - DestinationBucketName: !Ref AccessLogsBucket
+          LogFilePrefix: 'discovery-data-access-logs/'
+        - !Ref 'AWS::NoValue'
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transition:
+              StorageClass: GLACIER
+              TransitionInDays: 90
+          - !If
+            - ShouldSetDataRetention
+            - Id: DeleteOldData
+              Status: Enabled
+              ExpirationInDays: !Ref DataRetentionDays
+            - !Ref 'AWS::NoValue'
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !If [ShouldCreateCloudWatchLogs, !Ref DiscoveryLogGroup, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-discovery-data'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Discovery Data Storage'
+
+  # S3 Bucket Policy for Application Discovery Service
+  DiscoveryDataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DiscoveryDataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowApplicationDiscoveryService
+            Effect: Allow
+            Principal:
+              Service: discovery.amazonaws.com
+            Action:
+              - s3:GetBucketLocation
+              - s3:ListBucket
+              - s3:PutObject
+              - s3:PutObjectAcl
+              - s3:GetObject
+            Resource:
+              - !Sub '${DiscoveryDataBucket}'
+              - !Sub '${DiscoveryDataBucket}/*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+          - Sid: AllowEventBridgeService
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - s3:PutObject
+              - s3:PutObjectAcl
+            Resource: !Sub '${DiscoveryDataBucket}/automated-exports/*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${DiscoveryDataBucket}'
+              - !Sub '${DiscoveryDataBucket}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # CloudWatch Log Group for Discovery Service
+  DiscoveryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ShouldCreateCloudWatchLogs
+    Properties:
+      LogGroupName: !Sub '/aws/discovery/${ProjectName}'
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !If [ShouldCreateKMSKey, !GetAtt DiscoveryDataKMSKey.Arn, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-discovery-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Discovery Service Monitoring'
+
+  # IAM Role for EventBridge to trigger discovery exports
+  DiscoveryExportRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-discovery-export-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEventBridgeFullAccess
+      Policies:
+        - PolicyName: DiscoveryExportPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - discovery:StartExportTask
+                  - discovery:DescribeExportTasks
+                  - discovery:ListConfigurations
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub '${DiscoveryDataBucket}'
+                  - !Sub '${DiscoveryDataBucket}/*'
+              - !If
+                - ShouldCreateKMSKey
+                - Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                    - kms:GenerateDataKey
+                    - kms:CreateGrant
+                    - kms:DescribeKey
+                  Resource: !GetAtt DiscoveryDataKMSKey.Arn
+                - !Ref 'AWS::NoValue'
+              - !If
+                - ShouldCreateCloudWatchLogs
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                    - logs:DescribeLogGroups
+                    - logs:DescribeLogStreams
+                  Resource: !GetAtt DiscoveryLogGroup.Arn
+                - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-discovery-export-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Discovery Export Automation'
+
+  # Lambda Function for Discovery Export Automation
+  DiscoveryExportFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-discovery-export'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt DiscoveryExportLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DiscoveryDataBucket
+          PROJECT_NAME: !Ref ProjectName
+          LOG_GROUP: !If [ShouldCreateCloudWatchLogs, !Ref DiscoveryLogGroup, '']
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import datetime
+          from botocore.exceptions import ClientError
+
+          def lambda_handler(event, context):
+              """
+              Lambda function to trigger Application Discovery Service data export
+              """
+              discovery = boto3.client('discovery')
+              s3_bucket = os.environ['S3_BUCKET']
+              project_name = os.environ['PROJECT_NAME']
+              
+              timestamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+              s3_prefix = f'automated-exports/{timestamp}/'
+              
+              try:
+                  # Start export task
+                  response = discovery.start_export_task(
+                      exportDataFormat=['CSV'],
+                      filters=[
+                          {
+                              'name': 'AgentId',
+                              'values': ['*'],
+                              'condition': 'EQUALS'
+                          }
+                      ],
+                      s3Bucket=s3_bucket,
+                      s3Prefix=s3_prefix
+                  )
+                  
+                  export_id = response['exportId']
+                  
+                  print(f"Started discovery export with ID: {export_id}")
+                  print(f"Export destination: s3://{s3_bucket}/{s3_prefix}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Discovery export started successfully',
+                          'exportId': export_id,
+                          's3Location': f's3://{s3_bucket}/{s3_prefix}'
+                      })
+                  }
+                  
+              except ClientError as e:
+                  error_message = f"Failed to start discovery export: {str(e)}"
+                  print(error_message)
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': error_message
+                      })
+                  }
+              
+              except Exception as e:
+                  error_message = f"Unexpected error: {str(e)}"
+                  print(error_message)
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': error_message
+                      })
+                  }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-discovery-export'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Discovery Export Automation'
+
+  # IAM Role for Lambda Function
+  DiscoveryExportLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-discovery-export-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DiscoveryExportLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - discovery:StartExportTask
+                  - discovery:DescribeExportTasks
+                  - discovery:ListConfigurations
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub '${DiscoveryDataBucket}'
+                  - !Sub '${DiscoveryDataBucket}/*'
+              - !If
+                - ShouldCreateKMSKey
+                - Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                    - kms:GenerateDataKey
+                    - kms:CreateGrant
+                    - kms:DescribeKey
+                  Resource: !GetAtt DiscoveryDataKMSKey.Arn
+                - !Ref 'AWS::NoValue'
+              - !If
+                - ShouldCreateCloudWatchLogs
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+                - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-discovery-export-lambda-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Discovery Export Lambda Execution'
+
+  # EventBridge Rule for Scheduled Discovery Exports
+  DiscoveryExportScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-discovery-export-schedule'
+      Description: !Sub 'Scheduled discovery data export for ${ProjectName}'
+      ScheduleExpression: !Ref ExportSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DiscoveryExportFunction.Arn
+          Id: DiscoveryExportTarget
+          Input: !Sub |
+            {
+              "projectName": "${ProjectName}",
+              "environment": "${Environment}",
+              "s3Bucket": "${DiscoveryDataBucket}",
+              "triggerType": "scheduled"
+            }
+
+  # Permission for EventBridge to invoke Lambda
+  DiscoveryExportLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DiscoveryExportFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DiscoveryExportScheduleRule.Arn
+
+  # CloudWatch Alarms for Monitoring
+  DiscoveryExportFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-discovery-export-failures'
+      AlarmDescription: 'Alarm when discovery export Lambda function fails'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DiscoveryExportFunction
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-discovery-export-failures'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Discovery Export Monitoring'
+
+  # SNS Topic for Notifications (optional)
+  DiscoveryNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-discovery-notifications'
+      DisplayName: !Sub '${ProjectName} Discovery Service Notifications'
+      KmsMasterKeyId: !If [ShouldCreateKMSKey, !Ref DiscoveryDataKMSKey, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-discovery-notifications'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Discovery Service Notifications'
+
+Outputs:
+  DiscoveryDataBucketName:
+    Description: Name of the S3 bucket for storing discovery data
+    Value: !Ref DiscoveryDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DiscoveryDataBucket'
+
+  DiscoveryDataBucketArn:
+    Description: ARN of the S3 bucket for storing discovery data
+    Value: !GetAtt DiscoveryDataBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DiscoveryDataBucketArn'
+
+  AccessLogsBucketName:
+    Description: Name of the S3 bucket for access logs
+    Value: !If [ShouldCreateAccessLogging, !Ref AccessLogsBucket, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-AccessLogsBucket'
+
+  KMSKeyId:
+    Description: ID of the KMS key for encrypting discovery data
+    Value: !If [ShouldCreateKMSKey, !Ref DiscoveryDataKMSKey, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKey'
+
+  KMSKeyArn:
+    Description: ARN of the KMS key for encrypting discovery data
+    Value: !If [ShouldCreateKMSKey, !GetAtt DiscoveryDataKMSKey.Arn, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyArn'
+
+  CloudWatchLogGroupName:
+    Description: Name of the CloudWatch log group for discovery service
+    Value: !If [ShouldCreateCloudWatchLogs, !Ref DiscoveryLogGroup, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  CloudWatchLogGroupArn:
+    Description: ARN of the CloudWatch log group for discovery service
+    Value: !If [ShouldCreateCloudWatchLogs, !GetAtt DiscoveryLogGroup.Arn, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupArn'
+
+  DiscoveryExportFunctionName:
+    Description: Name of the Lambda function for automated discovery exports
+    Value: !Ref DiscoveryExportFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-ExportFunction'
+
+  DiscoveryExportFunctionArn:
+    Description: ARN of the Lambda function for automated discovery exports
+    Value: !GetAtt DiscoveryExportFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ExportFunctionArn'
+
+  EventBridgeRuleName:
+    Description: Name of the EventBridge rule for scheduled exports
+    Value: !Ref DiscoveryExportScheduleRule
+    Export:
+      Name: !Sub '${AWS::StackName}-ScheduleRule'
+
+  EventBridgeRuleArn:
+    Description: ARN of the EventBridge rule for scheduled exports
+    Value: !GetAtt DiscoveryExportScheduleRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ScheduleRuleArn'
+
+  SNSTopicName:
+    Description: Name of the SNS topic for notifications
+    Value: !Ref DiscoveryNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopic'
+
+  SNSTopicArn:
+    Description: ARN of the SNS topic for notifications
+    Value: !Ref DiscoveryNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopicArn'
+
+  ProjectName:
+    Description: Name of the migration project
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectName'
+
+  Environment:
+    Description: Environment designation
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+  AgentDownloadInstructions:
+    Description: Instructions for downloading and installing discovery agents
+    Value: !Sub |
+      Windows Agent: https://aws-discovery-agent.s3.amazonaws.com/windows/latest/AWSApplicationDiscoveryAgentInstaller.exe
+      Linux Agent: https://aws-discovery-agent.s3.amazonaws.com/linux/latest/aws-discovery-agent.tar.gz
+      VMware Connector: https://aws-discovery-connector.s3.amazonaws.com/VMware/latest/AWS-Discovery-Connector.ova
+      
+      Configure agents to use region: ${AWS::Region}
+      S3 bucket for data: ${DiscoveryDataBucket}
+
+  MigrationHubConsoleURL:
+    Description: URL to access Migration Hub console for this region
+    Value: !Sub 'https://console.aws.amazon.com/migrationhub/home?region=${AWS::Region}#/discover'
+
+  NextSteps:
+    Description: Next steps after CloudFormation deployment
+    Value: !Sub |
+      1. Download and install discovery agents on on-premises servers
+      2. Configure Discovery Connector for VMware environments (if applicable)
+      3. Start data collection using AWS CLI: aws discovery start-data-collection-by-agent-ids
+      4. Monitor discovery progress in Migration Hub console
+      5. Export data after 2+ weeks using: aws discovery start-export-task
+      6. Review exported data in S3 bucket: ${DiscoveryDataBucket}

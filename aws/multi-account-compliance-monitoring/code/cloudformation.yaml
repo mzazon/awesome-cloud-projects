@@ -1,0 +1,904 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Cross-Account Compliance Monitoring with AWS Systems Manager and Security Hub.
+  This template deploys automated compliance monitoring infrastructure that centralizes
+  security findings across multiple AWS accounts using Security Hub as the administrator
+  account and Systems Manager for compliance data collection.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Security Hub Configuration"
+        Parameters:
+          - SecurityHubAdminAccountId
+          - EnableDefaultStandards
+          - MemberAccountIds
+      - Label:
+          default: "Compliance Monitoring Configuration"
+        Parameters:
+          - ComplianceCheckSchedule
+          - EnableCustomCompliance
+          - ComplianceNotificationEmail
+      - Label:
+          default: "Resource Configuration"
+        Parameters:
+          - ResourcePrefix
+          - Environment
+          - RetentionPeriodDays
+      - Label:
+          default: "Cross-Account Access"
+        Parameters:
+          - ExternalId
+          - CrossAccountRoleName
+    ParameterLabels:
+      SecurityHubAdminAccountId:
+        default: "Security Hub Administrator Account ID"
+      EnableDefaultStandards:
+        default: "Enable AWS Security Standards"
+      MemberAccountIds:
+        default: "Member Account IDs (comma-separated)"
+      ComplianceCheckSchedule:
+        default: "Compliance Check Schedule"
+      EnableCustomCompliance:
+        default: "Enable Custom Compliance Rules"
+      ComplianceNotificationEmail:
+        default: "Compliance Notification Email"
+      ResourcePrefix:
+        default: "Resource Name Prefix"
+      Environment:
+        default: "Environment Name"
+      RetentionPeriodDays:
+        default: "Log Retention Period (Days)"
+      ExternalId:
+        default: "Cross-Account External ID"
+      CrossAccountRoleName:
+        default: "Cross-Account Role Name"
+
+Parameters:
+  SecurityHubAdminAccountId:
+    Type: String
+    Description: AWS Account ID that will serve as the Security Hub administrator
+    AllowedPattern: '[0-9]{12}'
+    ConstraintDescription: Must be a valid 12-digit AWS Account ID
+    Default: !Ref AWS::AccountId
+
+  EnableDefaultStandards:
+    Type: String
+    Description: Enable AWS Foundational Security Standard and CIS AWS Foundations Benchmark
+    AllowedValues: [true, false]
+    Default: true
+
+  MemberAccountIds:
+    Type: CommaDelimitedList
+    Description: List of AWS Account IDs to monitor for compliance (comma-separated)
+    Default: ""
+
+  ComplianceCheckSchedule:
+    Type: String
+    Description: Schedule expression for automated compliance checks
+    AllowedValues:
+      - "rate(1 hour)"
+      - "rate(6 hours)"
+      - "rate(12 hours)"
+      - "rate(1 day)"
+      - "rate(7 days)"
+    Default: "rate(1 day)"
+
+  EnableCustomCompliance:
+    Type: String
+    Description: Enable custom compliance rules for organizational policies
+    AllowedValues: [true, false]
+    Default: true
+
+  ComplianceNotificationEmail:
+    Type: String
+    Description: Email address for compliance violation notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+    Default: compliance@example.com
+
+  ResourcePrefix:
+    Type: String
+    Description: Prefix for all resource names to ensure uniqueness
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$'
+    ConstraintDescription: Must start with a letter, contain only alphanumeric characters and hyphens, and end with alphanumeric character
+    MinLength: 3
+    MaxLength: 20
+    Default: compliance-monitor
+
+  Environment:
+    Type: String
+    Description: Environment name for resource tagging
+    AllowedValues: [development, staging, production, testing]
+    Default: production
+
+  RetentionPeriodDays:
+    Type: Number
+    Description: Number of days to retain CloudWatch logs and CloudTrail data
+    MinValue: 1
+    MaxValue: 3653
+    Default: 365
+
+  ExternalId:
+    Type: String
+    Description: External ID for cross-account role assumption security
+    AllowedPattern: '^[a-zA-Z0-9+=,.@_-]+$'
+    MinLength: 10
+    MaxLength: 64
+    Default: ComplianceMonitoring-SecureAccess-2024
+
+  CrossAccountRoleName:
+    Type: String
+    Description: Name for the cross-account IAM role
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9+=,.@_-]*[a-zA-Z0-9]$'
+    MinLength: 3
+    MaxLength: 64
+    Default: SecurityHubComplianceRole
+
+Conditions:
+  EnableDefaultStandardsCondition: !Equals [!Ref EnableDefaultStandards, true]
+  EnableCustomComplianceCondition: !Equals [!Ref EnableCustomCompliance, true]
+  HasMemberAccounts: !Not [!Equals [!Join ['', !Ref MemberAccountIds], '']]
+  IsSecurityHubAdmin: !Equals [!Ref SecurityHubAdminAccountId, !Ref AWS::AccountId]
+
+Resources:
+  # =============================================================================
+  # S3 Bucket for CloudTrail Logs
+  # =============================================================================
+  
+  CloudTrailLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ResourcePrefix}-audit-trail-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: !Ref RetentionPeriodDays
+            NoncurrentVersionExpirationInDays: 30
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref CloudTrailLogGroup
+      Tags:
+        - Key: Purpose
+          Value: ComplianceAuditing
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailLogsBucket.Arn
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${ResourcePrefix}-audit-trail"
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${CloudTrailLogsBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+                'AWS:SourceArn': !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${ResourcePrefix}-audit-trail"
+
+  # =============================================================================
+  # CloudWatch Log Group for CloudTrail
+  # =============================================================================
+  
+  CloudTrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/cloudtrail/${ResourcePrefix}-audit-trail"
+      RetentionInDays: !Ref RetentionPeriodDays
+      Tags:
+        - Key: Purpose
+          Value: ComplianceAuditing
+        - Key: Environment
+          Value: !Ref Environment
+
+  CloudTrailLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref CloudTrailLogGroup
+      LogStreamName: !Sub "${AWS::AccountId}_CloudTrail_${AWS::Region}"
+
+  # =============================================================================
+  # CloudTrail for Compliance Auditing
+  # =============================================================================
+  
+  ComplianceAuditTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailBucketPolicy
+    Properties:
+      TrailName: !Sub "${ResourcePrefix}-audit-trail"
+      S3BucketName: !Ref CloudTrailLogsBucket
+      S3KeyPrefix: cloudtrail-logs
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      CloudWatchLogsLogGroupArn: !GetAtt CloudTrailLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailLogRole.Arn
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: "AWS::SSM::ManagedInstanceInventory"
+              Values: ["arn:aws:ssm:*"]
+            - Type: "AWS::SecurityHub::Hub"
+              Values: ["arn:aws:securityhub:*"]
+      InsightSelectors:
+        - InsightType: ApiCallRateInsight
+      Tags:
+        - Key: Purpose
+          Value: ComplianceAuditing
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  CloudTrailLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-cloudtrail-logs-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogsDeliveryRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                Resource: !Sub "${CloudTrailLogGroup.Arn}:*"
+      Tags:
+        - Key: Purpose
+          Value: ComplianceAuditing
+        - Key: Environment
+          Value: !Ref Environment
+
+  # =============================================================================
+  # Security Hub Configuration
+  # =============================================================================
+  
+  SecurityHub:
+    Type: AWS::SecurityHub::Hub
+    Condition: IsSecurityHubAdmin
+    Properties:
+      Tags:
+        Purpose: ComplianceMonitoring
+        Environment: !Ref Environment
+        ManagedBy: CloudFormation
+      EnableDefaultStandards: !Ref EnableDefaultStandards
+      ControlFindingGenerator: SECURITY_CONTROL
+
+  # Enable AWS Config as a Security Hub product
+  ConfigProductSubscription:
+    Type: AWS::SecurityHub::ProductSubscription
+    Condition: IsSecurityHubAdmin
+    DependsOn: SecurityHub
+    Properties:
+      ProductArn: !Sub "arn:aws:securityhub:${AWS::Region}::product/aws/config"
+
+  # Enable Systems Manager as a Security Hub product
+  SystemsManagerProductSubscription:
+    Type: AWS::SecurityHub::ProductSubscription
+    Condition: IsSecurityHubAdmin
+    DependsOn: SecurityHub
+    Properties:
+      ProductArn: !Sub "arn:aws:securityhub:${AWS::Region}::product/aws/systems-manager"
+
+  # =============================================================================
+  # Cross-Account IAM Role for Compliance Access
+  # =============================================================================
+  
+  CrossAccountComplianceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref CrossAccountRoleName
+      Description: Cross-account role for Security Hub compliance monitoring
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${SecurityHubAdminAccountId}:root"
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref ExternalId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess
+      Policies:
+        - PolicyName: ComplianceMonitoringPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:ListComplianceItems
+                  - ssm:ListResourceComplianceSummaries
+                  - ssm:GetComplianceSummary
+                  - ssm:DescribeInstanceInformation
+                  - ssm:DescribeInstanceAssociations
+                  - ssm:DescribeInstancePatches
+                  - ssm:DescribeInstancePatchStates
+                  - ssm:ListComplianceSummaries
+                  - ssm:PutComplianceItems
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - securityhub:BatchImportFindings
+                  - securityhub:BatchUpdateFindings
+                  - securityhub:GetFindings
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeTags
+                Resource: "*"
+      Tags:
+        - Key: Purpose
+          Value: ComplianceMonitoring
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CrossAccountRole
+          Value: "true"
+
+  # =============================================================================
+  # Lambda Function for Compliance Processing
+  # =============================================================================
+  
+  ComplianceProcessingLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}-compliance-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ComplianceProcessingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: 
+                  - !Sub "arn:aws:iam::*:role/${CrossAccountRoleName}"
+              - Effect: Allow
+                Action:
+                  - securityhub:BatchImportFindings
+                  - securityhub:BatchUpdateFindings
+                  - securityhub:GetFindings
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ssm:GetComplianceSummary
+                  - ssm:ListComplianceItems
+                  - ssm:ListResourceComplianceSummaries
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref ComplianceNotificationTopic
+      Tags:
+        - Key: Purpose
+          Value: ComplianceProcessing
+        - Key: Environment
+          Value: !Ref Environment
+
+  ComplianceProcessingLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-compliance-processor"
+      Description: Automated compliance processing for Security Hub findings
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ComplianceProcessingLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          SECURITY_HUB_REGION: !Ref AWS::Region
+          CROSS_ACCOUNT_ROLE_NAME: !Ref CrossAccountRoleName
+          EXTERNAL_ID: !Ref ExternalId
+          SNS_TOPIC_ARN: !Ref ComplianceNotificationTopic
+          MEMBER_ACCOUNTS: !Join [',', !Ref MemberAccountIds]
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          from datetime import datetime
+          import logging
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              """
+              Process Systems Manager compliance events and create Security Hub findings
+              """
+              
+              try:
+                  # Initialize AWS clients
+                  sts = boto3.client('sts')
+                  securityhub = boto3.client('securityhub')
+                  sns = boto3.client('sns')
+                  
+                  # Get environment variables
+                  external_id = os.environ.get('EXTERNAL_ID')
+                  cross_account_role = os.environ.get('CROSS_ACCOUNT_ROLE_NAME')
+                  sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
+                  member_accounts = os.environ.get('MEMBER_ACCOUNTS', '').split(',')
+                  
+                  # Parse the EventBridge event
+                  detail = event.get('detail', {})
+                  source_account = event.get('account', context.invoked_function_arn.split(':')[4])
+                  region = event.get('region', os.environ.get('AWS_REGION'))
+                  
+                  logger.info(f"Processing compliance event from account {source_account}")
+                  
+                  findings = []
+                  
+                  # Process compliance change events
+                  if detail.get('eventName') in ['PutComplianceItems', 'DeleteComplianceItems']:
+                      
+                      # Collect compliance data from member accounts
+                      for account_id in member_accounts:
+                          if account_id.strip():
+                              try:
+                                  # Assume cross-account role
+                                  role_arn = f"arn:aws:iam::{account_id.strip()}:role/{cross_account_role}"
+                                  
+                                  assumed_role = sts.assume_role(
+                                      RoleArn=role_arn,
+                                      RoleSessionName=f"ComplianceProcessor-{context.aws_request_id}",
+                                      ExternalId=external_id
+                                  )
+                                  
+                                  # Create SSM client with assumed role credentials
+                                  ssm_client = boto3.client(
+                                      'ssm',
+                                      aws_access_key_id=assumed_role['Credentials']['AccessKeyId'],
+                                      aws_secret_access_key=assumed_role['Credentials']['SecretAccessKey'],
+                                      aws_session_token=assumed_role['Credentials']['SessionToken']
+                                  )
+                                  
+                                  # Get compliance summary
+                                  compliance_summary = ssm_client.get_compliance_summary()
+                                  
+                                  # Check for non-compliant items
+                                  non_compliant_count = compliance_summary.get('NonCompliantSummary', {}).get('NonCompliantCount', 0)
+                                  
+                                  if non_compliant_count > 0:
+                                      # Create Security Hub finding
+                                      finding = {
+                                          'SchemaVersion': '2018-10-08',
+                                          'Id': f"compliance-violation-{account_id}-{uuid.uuid4()}",
+                                          'ProductArn': f"arn:aws:securityhub:{region}::product/aws/systems-manager",
+                                          'GeneratorId': 'ComplianceMonitoring',
+                                          'AwsAccountId': account_id.strip(),
+                                          'Types': ['Software and Configuration Checks/Vulnerabilities/CVE'],
+                                          'CreatedAt': datetime.utcnow().isoformat() + 'Z',
+                                          'UpdatedAt': datetime.utcnow().isoformat() + 'Z',
+                                          'Severity': {
+                                              'Label': 'HIGH' if non_compliant_count > 10 else 'MEDIUM'
+                                          },
+                                          'Title': 'Systems Manager Compliance Violations Detected',
+                                          'Description': f"Found {non_compliant_count} compliance violations in account {account_id}",
+                                          'Resources': [
+                                              {
+                                                  'Type': 'AwsAccount',
+                                                  'Id': f"AWS::::Account:{account_id.strip()}",
+                                                  'Region': region
+                                              }
+                                          ],
+                                          'Compliance': {
+                                              'Status': 'FAILED'
+                                          },
+                                          'WorkflowState': 'NEW',
+                                          'RecordState': 'ACTIVE'
+                                      }
+                                      
+                                      findings.append(finding)
+                                      
+                                      # Send SNS notification for critical violations
+                                      if non_compliant_count > 10:
+                                          sns.publish(
+                                              TopicArn=sns_topic_arn,
+                                              Message=f"CRITICAL: {non_compliant_count} compliance violations detected in account {account_id}",
+                                              Subject=f"Critical Compliance Alert - Account {account_id}"
+                                          )
+                                      
+                              except Exception as e:
+                                  logger.error(f"Error processing account {account_id}: {str(e)}")
+                                  continue
+                  
+                  # Import findings into Security Hub
+                  if findings:
+                      response = securityhub.batch_import_findings(Findings=findings)
+                      logger.info(f"Imported {len(findings)} findings to Security Hub")
+                      
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': f'Successfully processed {len(findings)} compliance findings',
+                              'findingsImported': len(findings)
+                          })
+                      }
+                  else:
+                      logger.info("No compliance violations found")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({'message': 'No compliance violations to process'})
+                      }
+                      
+              except Exception as e:
+                  logger.error(f"Error processing compliance event: {str(e)}")
+                  raise e
+      Tags:
+        - Key: Purpose
+          Value: ComplianceProcessing
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # =============================================================================
+  # EventBridge Rules for Compliance Automation
+  # =============================================================================
+  
+  ComplianceEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ResourcePrefix}-compliance-rule"
+      Description: Trigger compliance processing on SSM compliance changes
+      EventPattern:
+        source: ["aws.ssm"]
+        detail-type: ["AWS API Call via CloudTrail"]
+        detail:
+          eventName: ["PutComplianceItems", "DeleteComplianceItems"]
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ComplianceProcessingLambda.Arn
+          Id: ComplianceLambdaTarget
+
+  SecurityHubFindingsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ResourcePrefix}-securityhub-findings-rule"
+      Description: Process Security Hub compliance findings
+      EventPattern:
+        source: ["aws.securityhub"]
+        detail-type: ["Security Hub Findings - Imported"]
+        detail:
+          findings:
+            ProductArn:
+              - prefix: "arn:aws:securityhub"
+            Compliance:
+              Status: ["FAILED"]
+      State: ENABLED
+      Targets:
+        - Arn: !Ref ComplianceNotificationTopic
+          Id: SNSNotificationTarget
+
+  # Scheduled rule for periodic compliance checks
+  ScheduledComplianceRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ResourcePrefix}-scheduled-compliance-check"
+      Description: Scheduled compliance monitoring across member accounts
+      ScheduleExpression: !Ref ComplianceCheckSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ComplianceProcessingLambda.Arn
+          Id: ScheduledComplianceCheck
+          Input: !Sub |
+            {
+              "source": "scheduled",
+              "detail": {
+                "eventName": "ScheduledComplianceCheck",
+                "memberAccounts": "${MemberAccountIds}"
+              }
+            }
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ComplianceProcessingLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ComplianceEventRule.Arn
+
+  LambdaScheduledInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ComplianceProcessingLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledComplianceRule.Arn
+
+  # =============================================================================
+  # SNS Topic for Compliance Notifications
+  # =============================================================================
+  
+  ComplianceNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ResourcePrefix}-compliance-notifications"
+      DisplayName: Compliance Monitoring Notifications
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Purpose
+          Value: ComplianceNotifications
+        - Key: Environment
+          Value: !Ref Environment
+
+  ComplianceNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref ComplianceNotificationTopic
+      Protocol: email
+      Endpoint: !Ref ComplianceNotificationEmail
+
+  # =============================================================================
+  # Systems Manager Documents for Custom Compliance
+  # =============================================================================
+  
+  CustomComplianceDocument:
+    Type: AWS::SSM::Document
+    Condition: EnableCustomComplianceCondition
+    Properties:
+      DocumentType: Command
+      DocumentFormat: YAML
+      Name: !Sub "${ResourcePrefix}-custom-compliance-check"
+      Content:
+        schemaVersion: '2.2'
+        description: Custom compliance check for organizational policies
+        parameters:
+          complianceType:
+            type: String
+            description: Type of compliance check to perform
+            default: "Custom:OrganizationalPolicy"
+        mainSteps:
+          - action: aws:runShellScript
+            name: runComplianceCheck
+            inputs:
+              timeoutSeconds: '300'
+              runCommand:
+                - '#!/bin/bash'
+                - 'set -e'
+                - 'echo "Starting custom compliance check..."'
+                - ''
+                - '# Get instance metadata'
+                - 'INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)'
+                - 'COMPLIANCE_TYPE="{{ complianceType }}"'
+                - ''
+                - '# Check for required tags'
+                - 'REQUIRED_TAGS=("Environment" "Owner" "Project" "CostCenter")'
+                - 'COMPLIANCE_STATUS="COMPLIANT"'
+                - 'COMPLIANCE_DETAILS=""'
+                - ''
+                - 'for tag in "${REQUIRED_TAGS[@]}"; do'
+                - '    TAG_VALUE=$(aws ec2 describe-tags \'
+                - '        --filters "Name=resource-id,Values=${INSTANCE_ID}" "Name=key,Values=${tag}" \'
+                - '        --query "Tags[0].Value" --output text 2>/dev/null || echo "None")'
+                - '    '
+                - '    if [ "$TAG_VALUE" = "None" ] || [ -z "$TAG_VALUE" ]; then'
+                - '        COMPLIANCE_STATUS="NON_COMPLIANT"'
+                - '        COMPLIANCE_DETAILS="${COMPLIANCE_DETAILS}Missing required tag: ${tag}; "'
+                - '    fi'
+                - 'done'
+                - ''
+                - '# Check for security group compliance'
+                - 'SG_VIOLATIONS=$(aws ec2 describe-security-groups \'
+                - '    --filters "Name=ip-permission.from-port,Values=22" "Name=ip-permission.cidr,Values=0.0.0.0/0" \'
+                - '    --query "length(SecurityGroups)" --output text 2>/dev/null || echo "0")'
+                - ''
+                - 'if [ "$SG_VIOLATIONS" -gt 0 ]; then'
+                - '    COMPLIANCE_STATUS="NON_COMPLIANT"'
+                - '    COMPLIANCE_DETAILS="${COMPLIANCE_DETAILS}Security group allows SSH from 0.0.0.0/0; "'
+                - 'fi'
+                - ''
+                - '# Report compliance status to Systems Manager'
+                - 'aws ssm put-compliance-items \'
+                - '    --resource-id ${INSTANCE_ID} \'
+                - '    --resource-type "ManagedInstance" \'
+                - '    --compliance-type ${COMPLIANCE_TYPE} \'
+                - '    --execution-summary "ExecutionTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \'
+                - '    --items "Id=OrganizationalPolicy,Title=Organizational Policy Compliance,Severity=HIGH,Status=${COMPLIANCE_STATUS},Details={\"Details\":\"${COMPLIANCE_DETAILS}\"}"'
+                - ''
+                - 'echo "Custom compliance check completed: ${COMPLIANCE_STATUS}"'
+                - 'echo "Details: ${COMPLIANCE_DETAILS}"'
+      Tags:
+        - Key: Purpose
+          Value: CustomCompliance
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Association for custom compliance checks
+  CustomComplianceAssociation:
+    Type: AWS::SSM::Association
+    Condition: EnableCustomComplianceCondition
+    Properties:
+      Name: !Ref CustomComplianceDocument
+      ScheduleExpression: !Ref ComplianceCheckSchedule
+      Targets:
+        - Key: tag:Environment
+          Values: 
+            - !Ref Environment
+      AssociationName: !Sub "${ResourcePrefix}-custom-compliance-association"
+      ComplianceSeverity: HIGH
+      MaxConcurrency: "50%"
+      MaxErrors: "10%"
+
+  # =============================================================================
+  # CloudWatch Dashboard for Compliance Monitoring
+  # =============================================================================
+  
+  ComplianceDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${ResourcePrefix}-compliance-dashboard"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/SecurityHub", "Findings", "ComplianceType", "Patch" ],
+                  [ "...", "Configuration" ],
+                  [ "...", "Custom" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Security Hub Compliance Findings",
+                "period": 300
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${ResourcePrefix}-compliance-processor'\n| fields @timestamp, @message\n| filter @message like /compliance/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Compliance Processing Logs",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+# =============================================================================
+# Outputs
+# =============================================================================
+
+Outputs:
+  SecurityHubArn:
+    Description: ARN of the Security Hub instance
+    Value: !Sub "arn:aws:securityhub:${AWS::Region}:${AWS::AccountId}:hub/default"
+    Condition: IsSecurityHubAdmin
+    Export:
+      Name: !Sub "${AWS::StackName}-SecurityHubArn"
+
+  CrossAccountRoleArn:
+    Description: ARN of the cross-account compliance role
+    Value: !GetAtt CrossAccountComplianceRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CrossAccountRoleArn"
+
+  ComplianceLambdaFunctionName:
+    Description: Name of the compliance processing Lambda function
+    Value: !Ref ComplianceProcessingLambda
+    Export:
+      Name: !Sub "${AWS::StackName}-ComplianceLambdaName"
+
+  CloudTrailArn:
+    Description: ARN of the compliance audit CloudTrail
+    Value: !GetAtt ComplianceAuditTrail.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudTrailArn"
+
+  SNSTopicArn:
+    Description: ARN of the compliance notification SNS topic
+    Value: !Ref ComplianceNotificationTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-SNSTopicArn"
+
+  S3BucketName:
+    Description: Name of the S3 bucket for CloudTrail logs
+    Value: !Ref CloudTrailLogsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-S3BucketName"
+
+  ComplianceDashboardURL:
+    Description: URL to the CloudWatch compliance monitoring dashboard
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ResourcePrefix}-compliance-dashboard"
+    Export:
+      Name: !Sub "${AWS::StackName}-DashboardURL"
+
+  EventBridgeRules:
+    Description: Names of the EventBridge rules for compliance monitoring
+    Value: !Sub "${ComplianceEventRule},${SecurityHubFindingsRule},${ScheduledComplianceRule}"
+    Export:
+      Name: !Sub "${AWS::StackName}-EventBridgeRules"
+
+  ExternalIdForMemberAccounts:
+    Description: External ID to use when configuring the cross-account role in member accounts
+    Value: !Ref ExternalId
+    Export:
+      Name: !Sub "${AWS::StackName}-ExternalId"
+
+  SecurityHubAdminAccountId:
+    Description: Account ID configured as the Security Hub administrator
+    Value: !Ref SecurityHubAdminAccountId
+    Export:
+      Name: !Sub "${AWS::StackName}-SecurityHubAdminAccountId"
+
+  CustomComplianceDocumentName:
+    Description: Name of the custom compliance SSM document
+    Value: !Ref CustomComplianceDocument
+    Condition: EnableCustomComplianceCondition
+    Export:
+      Name: !Sub "${AWS::StackName}-CustomComplianceDocument"

@@ -1,0 +1,785 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Conversational AI Application with Amazon Bedrock Claude, API Gateway, Lambda, and DynamoDB'
+
+Parameters:
+  # Application Configuration
+  ApplicationName:
+    Type: String
+    Default: 'conversational-ai'
+    Description: 'Name prefix for all resources'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must start with a letter and contain only alphanumeric characters and hyphens'
+
+  Environment:
+    Type: String
+    Default: 'prod'
+    Description: 'Environment name (dev, staging, prod)'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  # Claude Model Configuration
+  ClaudeModelId:
+    Type: String
+    Default: 'anthropic.claude-3-haiku-20240307-v1:0'
+    Description: 'Claude model ID for Bedrock'
+    AllowedValues:
+      - anthropic.claude-3-haiku-20240307-v1:0
+      - anthropic.claude-3-sonnet-20240229-v1:0
+      - anthropic.claude-3-opus-20240229-v1:0
+      - anthropic.claude-instant-v1
+
+  # Lambda Configuration
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    Description: 'Lambda function timeout in seconds'
+    MinValue: 3
+    MaxValue: 900
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    Description: 'Lambda function memory size in MB'
+    MinValue: 128
+    MaxValue: 10240
+
+  # AI Configuration
+  MaxTokens:
+    Type: Number
+    Default: 1000
+    Description: 'Maximum tokens for Claude response'
+    MinValue: 1
+    MaxValue: 4096
+
+  Temperature:
+    Type: Number
+    Default: 0.7
+    Description: 'Temperature for Claude model (0.0 to 1.0)'
+    MinValue: 0.0
+    MaxValue: 1.0
+
+  # Conversation History
+  ConversationHistoryLimit:
+    Type: Number
+    Default: 10
+    Description: 'Maximum conversation turns to keep in memory'
+    MinValue: 1
+    MaxValue: 50
+
+  # API Gateway Configuration
+  ApiGatewayEndpointType:
+    Type: String
+    Default: 'REGIONAL'
+    Description: 'API Gateway endpoint type'
+    AllowedValues:
+      - REGIONAL
+      - EDGE
+
+  # DynamoDB Configuration
+  DynamoDBBillingMode:
+    Type: String
+    Default: 'PAY_PER_REQUEST'
+    Description: 'DynamoDB billing mode'
+    AllowedValues:
+      - PAY_PER_REQUEST
+      - PROVISIONED
+
+  # Security Configuration
+  EnableXRayTracing:
+    Type: String
+    Default: 'true'
+    Description: 'Enable X-Ray tracing for Lambda functions'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  # Monitoring Configuration
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    Description: 'Enable detailed CloudWatch monitoring'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  EnableXRay: !Equals [!Ref EnableXRayTracing, 'true']
+  EnableMonitoring: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  IsProvisionedBilling: !Equals [!Ref DynamoDBBillingMode, 'PROVISIONED']
+
+Resources:
+  # =====================================================
+  # DynamoDB Table for Conversation Storage
+  # =====================================================
+  ConversationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ApplicationName}-conversations-${Environment}'
+      BillingMode: !Ref DynamoDBBillingMode
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      ProvisionedThroughput: !If
+        - IsProvisionedBilling
+        - ReadCapacityUnits: 5
+          WriteCapacityUnits: 5
+        - !Ref AWS::NoValue
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-conversations-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Purpose
+          Value: 'Conversation history storage'
+
+  # =====================================================
+  # IAM Role for Lambda Functions
+  # =====================================================
+  ConversationalAILambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !If
+          - EnableXRay
+          - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+          - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: BedrockAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: '*'
+        - PolicyName: DynamoDBAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                Resource: !GetAtt ConversationTable.Arn
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-lambda-role-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # =====================================================
+  # Lambda Function for Conversational AI
+  # =====================================================
+  ConversationalAIFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ApplicationName}-handler-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ConversationalAILambdaRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      TracingConfig:
+        Mode: !If [EnableXRay, 'Active', 'PassThrough']
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ConversationTable
+          CLAUDE_MODEL_ID: !Ref ClaudeModelId
+          MAX_TOKENS: !Ref MaxTokens
+          TEMPERATURE: !Ref Temperature
+          CONVERSATION_HISTORY_LIMIT: !Ref ConversationHistoryLimit
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: !If [IsProduction, 'INFO', 'DEBUG']
+      DeadLetterConfig:
+        TargetArn: !GetAtt ConversationalAIDeadLetterQueue.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import time
+          import os
+          from datetime import datetime, timedelta
+          import logging
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(os.getenv('LOG_LEVEL', 'INFO'))
+          
+          # Initialize AWS clients
+          bedrock_runtime = boto3.client('bedrock-runtime')
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['TABLE_NAME'])
+          
+          # Configuration from environment variables
+          CLAUDE_MODEL_ID = os.environ['CLAUDE_MODEL_ID']
+          MAX_TOKENS = int(os.environ['MAX_TOKENS'])
+          TEMPERATURE = float(os.environ['TEMPERATURE'])
+          CONVERSATION_HISTORY_LIMIT = int(os.environ['CONVERSATION_HISTORY_LIMIT'])
+          
+          def lambda_handler(event, context):
+              """Main handler for conversational AI requests"""
+              
+              try:
+                  # Handle CORS preflight
+                  if event.get('httpMethod') == 'OPTIONS':
+                      return get_cors_response()
+                  
+                  # Parse request body
+                  body = json.loads(event.get('body', '{}'))
+                  user_message = body.get('message', '').strip()
+                  session_id = body.get('session_id', str(uuid.uuid4()))
+                  user_id = body.get('user_id', 'anonymous')
+                  
+                  # Validate input
+                  if not user_message:
+                      return get_error_response(400, 'Message is required')
+                  
+                  if len(user_message) > 4000:
+                      return get_error_response(400, 'Message too long (max 4000 characters)')
+                  
+                  # Get conversation history for context
+                  conversation_history = get_conversation_history(session_id)
+                  
+                  # Build prompt with conversation context
+                  messages = build_messages_with_context(user_message, conversation_history)
+                  
+                  # Call Bedrock Claude model
+                  response = invoke_claude_model(messages)
+                  
+                  # Save conversation turn to DynamoDB
+                  save_conversation_turn(session_id, user_id, user_message, response)
+                  
+                  # Return successful response
+                  return get_success_response({
+                      'response': response,
+                      'session_id': session_id,
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'model_id': CLAUDE_MODEL_ID
+                  })
+                  
+              except Exception as e:
+                  logger.error(f"Error processing request: {str(e)}", exc_info=True)
+                  return get_error_response(500, 'Internal server error')
+          
+          def get_conversation_history(session_id):
+              """Retrieve recent conversation history for context"""
+              
+              try:
+                  # Calculate cutoff time (24 hours ago)
+                  cutoff_time = int((datetime.utcnow() - timedelta(hours=24)).timestamp() * 1000)
+                  
+                  response = table.query(
+                      KeyConditionExpression='session_id = :session_id AND #ts > :cutoff',
+                      ExpressionAttributeNames={'#ts': 'timestamp'},
+                      ExpressionAttributeValues={
+                          ':session_id': session_id,
+                          ':cutoff': cutoff_time
+                      },
+                      ScanIndexForward=False,
+                      Limit=CONVERSATION_HISTORY_LIMIT * 2
+                  )
+                  
+                  # Format conversation history
+                  history = []
+                  for item in reversed(response['Items']):
+                      history.append({
+                          'role': item['role'],
+                          'content': item['content']
+                      })
+                  
+                  return history[-CONVERSATION_HISTORY_LIMIT:] if len(history) > CONVERSATION_HISTORY_LIMIT else history
+                  
+              except Exception as e:
+                  logger.error(f"Error retrieving conversation history: {str(e)}")
+                  return []
+          
+          def build_messages_with_context(user_message, conversation_history):
+              """Build Claude messages with conversation context"""
+              
+              system_prompt = """You are a helpful, knowledgeable, and friendly AI assistant. You provide accurate, informative, and engaging responses to user questions. You maintain context from previous messages in the conversation and provide personalized assistance. Be concise but thorough, and always aim to be helpful while maintaining a professional and friendly tone."""
+              
+              messages = []
+              
+              # Add conversation history
+              for turn in conversation_history:
+                  messages.append({
+                      'role': turn['role'],
+                      'content': turn['content']
+                  })
+              
+              # Add current user message
+              messages.append({
+                  'role': 'user',
+                  'content': user_message
+              })
+              
+              return system_prompt, messages
+          
+          def invoke_claude_model(messages):
+              """Invoke Claude model through Bedrock"""
+              
+              try:
+                  system_prompt, conversation_messages = messages
+                  
+                  # Prepare request body for Claude
+                  request_body = {
+                      'anthropic_version': 'bedrock-2023-05-31',
+                      'max_tokens': MAX_TOKENS,
+                      'temperature': TEMPERATURE,
+                      'system': system_prompt,
+                      'messages': conversation_messages
+                  }
+                  
+                  # Invoke model
+                  response = bedrock_runtime.invoke_model(
+                      modelId=CLAUDE_MODEL_ID,
+                      body=json.dumps(request_body),
+                      contentType='application/json'
+                  )
+                  
+                  # Parse response
+                  response_body = json.loads(response['body'].read())
+                  
+                  # Extract text from Claude response
+                  if 'content' in response_body and len(response_body['content']) > 0:
+                      return response_body['content'][0]['text']
+                  else:
+                      return "I apologize, but I couldn't generate a response. Please try again."
+                      
+              except Exception as e:
+                  logger.error(f"Error invoking Claude model: {str(e)}")
+                  return "I'm experiencing technical difficulties. Please try again later."
+          
+          def save_conversation_turn(session_id, user_id, user_message, assistant_response):
+              """Save conversation turn to DynamoDB"""
+              
+              try:
+                  timestamp = int(time.time() * 1000)
+                  ttl = int((datetime.utcnow() + timedelta(days=30)).timestamp())
+                  
+                  # Save user message
+                  table.put_item(
+                      Item={
+                          'session_id': session_id,
+                          'timestamp': timestamp,
+                          'role': 'user',
+                          'content': user_message,
+                          'user_id': user_id,
+                          'created_at': datetime.utcnow().isoformat(),
+                          'ttl': ttl
+                      }
+                  )
+                  
+                  # Save assistant response
+                  table.put_item(
+                      Item={
+                          'session_id': session_id,
+                          'timestamp': timestamp + 1,
+                          'role': 'assistant',
+                          'content': assistant_response,
+                          'user_id': user_id,
+                          'created_at': datetime.utcnow().isoformat(),
+                          'ttl': ttl
+                      }
+                  )
+                  
+                  logger.info(f"Saved conversation turn for session {session_id}")
+                  
+              except Exception as e:
+                  logger.error(f"Error saving conversation: {str(e)}")
+          
+          def get_cors_response():
+              """Return CORS preflight response"""
+              return {
+                  'statusCode': 200,
+                  'headers': get_cors_headers(),
+                  'body': json.dumps({'message': 'CORS preflight successful'})
+              }
+          
+          def get_success_response(data):
+              """Return successful response with CORS headers"""
+              return {
+                  'statusCode': 200,
+                  'headers': get_cors_headers(),
+                  'body': json.dumps(data)
+              }
+          
+          def get_error_response(status_code, message):
+              """Return error response with CORS headers"""
+              return {
+                  'statusCode': status_code,
+                  'headers': get_cors_headers(),
+                  'body': json.dumps({'error': message})
+              }
+          
+          def get_cors_headers():
+              """Return CORS headers"""
+              return {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+                  'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+              }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-handler-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # =====================================================
+  # Dead Letter Queue for Lambda Function
+  # =====================================================
+  ConversationalAIDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ApplicationName}-dlq-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeoutSeconds: 60
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-dlq-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # =====================================================
+  # CloudWatch Log Group for Lambda
+  # =====================================================
+  ConversationalAILogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ApplicationName}-handler-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-logs-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # =====================================================
+  # API Gateway REST API
+  # =====================================================
+  ConversationalAIApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ApplicationName}-api-${Environment}'
+      Description: 'REST API for Conversational AI application using Bedrock Claude'
+      EndpointConfiguration:
+        Types:
+          - !Ref ApiGatewayEndpointType
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 'execute-api:Invoke'
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-api-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # =====================================================
+  # API Gateway Resources and Methods
+  # =====================================================
+  ChatResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ConversationalAIApi
+      ParentId: !GetAtt ConversationalAIApi.RootResourceId
+      PathPart: chat
+
+  ChatPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ConversationalAIApi
+      ResourceId: !Ref ChatResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ConversationalAIFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: false
+        - StatusCode: 400
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: false
+        - StatusCode: 500
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: false
+
+  ChatOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ConversationalAIApi
+      ResourceId: !Ref ChatResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ConversationalAIFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Headers: false
+
+  # =====================================================
+  # Lambda Permission for API Gateway
+  # =====================================================
+  ApiGatewayInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ConversationalAIFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ConversationalAIApi}/*/*'
+
+  # =====================================================
+  # API Gateway Deployment
+  # =====================================================
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ChatPostMethod
+      - ChatOptionsMethod
+    Properties:
+      RestApiId: !Ref ConversationalAIApi
+      StageName: !Ref Environment
+      StageDescription: !Sub '${Environment} stage for Conversational AI API'
+
+  # =====================================================
+  # CloudWatch Alarms for Monitoring
+  # =====================================================
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-lambda-errors-${Environment}'
+      AlarmDescription: 'Lambda function errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ConversationalAIFunction
+      TreatMissingData: notBreaching
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-lambda-duration-${Environment}'
+      AlarmDescription: 'Lambda function duration'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 25000  # 25 seconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ConversationalAIFunction
+      TreatMissingData: notBreaching
+
+  ApiGateway4XXErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-api-4xx-errors-${Environment}'
+      AlarmDescription: 'API Gateway 4XX errors'
+      MetricName: 4XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref ConversationalAIApi
+        - Name: Stage
+          Value: !Ref Environment
+      TreatMissingData: notBreaching
+
+  ApiGateway5XXErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-api-5xx-errors-${Environment}'
+      AlarmDescription: 'API Gateway 5XX errors'
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref ConversationalAIApi
+        - Name: Stage
+          Value: !Ref Environment
+      TreatMissingData: notBreaching
+
+  DynamoDBThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableMonitoring
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-dynamodb-throttles-${Environment}'
+      AlarmDescription: 'DynamoDB throttled requests'
+      MetricName: ThrottledRequests
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref ConversationTable
+      TreatMissingData: notBreaching
+
+# =====================================================
+# Outputs
+# =====================================================
+Outputs:
+  ApiEndpoint:
+    Description: 'API Gateway endpoint URL for the Conversational AI API'
+    Value: !Sub 'https://${ConversationalAIApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/chat'
+    Export:
+      Name: !Sub '${ApplicationName}-api-endpoint-${Environment}'
+
+  ApiId:
+    Description: 'API Gateway ID'
+    Value: !Ref ConversationalAIApi
+    Export:
+      Name: !Sub '${ApplicationName}-api-id-${Environment}'
+
+  LambdaFunctionName:
+    Description: 'Lambda function name'
+    Value: !Ref ConversationalAIFunction
+    Export:
+      Name: !Sub '${ApplicationName}-lambda-function-${Environment}'
+
+  LambdaFunctionArn:
+    Description: 'Lambda function ARN'
+    Value: !GetAtt ConversationalAIFunction.Arn
+    Export:
+      Name: !Sub '${ApplicationName}-lambda-arn-${Environment}'
+
+  DynamoDBTableName:
+    Description: 'DynamoDB table name for conversation storage'
+    Value: !Ref ConversationTable
+    Export:
+      Name: !Sub '${ApplicationName}-table-name-${Environment}'
+
+  DynamoDBTableArn:
+    Description: 'DynamoDB table ARN'
+    Value: !GetAtt ConversationTable.Arn
+    Export:
+      Name: !Sub '${ApplicationName}-table-arn-${Environment}'
+
+  ClaudeModelId:
+    Description: 'Claude model ID used for AI responses'
+    Value: !Ref ClaudeModelId
+    Export:
+      Name: !Sub '${ApplicationName}-model-id-${Environment}'
+
+  ApplicationName:
+    Description: 'Application name used as resource prefix'
+    Value: !Ref ApplicationName
+    Export:
+      Name: !Sub '${ApplicationName}-name-${Environment}'
+
+  Environment:
+    Description: 'Environment name'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${ApplicationName}-environment-${Environment}'
+
+  TestCurlCommand:
+    Description: 'Sample curl command to test the API'
+    Value: !Sub |
+      curl -X POST https://${ConversationalAIApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/chat \
+        -H "Content-Type: application/json" \
+        -d '{"message": "Hello, how can you help me today?", "session_id": "test-session", "user_id": "test-user"}'
+
+  DashboardUrl:
+    Description: 'CloudWatch dashboard URL for monitoring'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ApplicationName}-${Environment}'
+
+  LogGroupUrl:
+    Description: 'CloudWatch logs URL for Lambda function'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/$252Faws$252Flambda$252F${ApplicationName}-handler-${Environment}'

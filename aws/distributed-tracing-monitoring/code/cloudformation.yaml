@@ -1,0 +1,951 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure monitoring solution with AWS X-Ray for distributed tracing across serverless applications'
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: xray-monitoring
+    Description: Name prefix for all resources
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9-]*'
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters and hyphens
+    MinLength: 3
+    MaxLength: 20
+
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment name (dev, staging, prod)
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  ApiGatewayStageName:
+    Type: String
+    Default: prod
+    Description: API Gateway deployment stage name
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    MinLength: 1
+    MaxLength: 64
+
+  DynamoDbReadCapacity:
+    Type: Number
+    Default: 5
+    Description: DynamoDB read capacity units
+    MinValue: 1
+    MaxValue: 100
+
+  DynamoDbWriteCapacity:
+    Type: Number
+    Default: 5
+    Description: DynamoDB write capacity units
+    MinValue: 1
+    MaxValue: 100
+
+  EnableXRayInsights:
+    Type: String
+    Default: 'true'
+    Description: Enable X-Ray Insights for automated performance analysis
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  CreateDashboard:
+    Type: String
+    Default: 'true'
+    Description: Create CloudWatch dashboard for monitoring
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableTraceAnalyzer:
+    Type: String
+    Default: 'true'
+    Description: Deploy automated trace analysis Lambda function
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+
+Conditions:
+  CreateDashboardCondition: !Equals [!Ref CreateDashboard, 'true']
+  EnableTraceAnalyzerCondition: !Equals [!Ref EnableTraceAnalyzer, 'true']
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+
+Resources:
+
+  # --------------------------------------------------------------------------
+  # IAM ROLES AND POLICIES
+  # --------------------------------------------------------------------------
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt OrdersTable.Arn
+        - PolicyName: XRayAnalysisAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:GetTraceSummaries
+                  - xray:BatchGetTraces
+                  - xray:GetServiceGraph
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # --------------------------------------------------------------------------
+  # DYNAMODB TABLE
+  # --------------------------------------------------------------------------
+
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-orders'
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref DynamoDbReadCapacity
+        WriteCapacityUnits: !Ref DynamoDbWriteCapacity
+      # Enable X-Ray tracing on DynamoDB
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProduction, true, false]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: XRayTracing
+          Value: Enabled
+
+  # --------------------------------------------------------------------------
+  # LAMBDA FUNCTIONS
+  # --------------------------------------------------------------------------
+
+  OrderProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-order-processor'
+      Description: 'Order processing function with X-Ray tracing enabled'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      TracingConfig:
+        Mode: Active
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          from datetime import datetime
+          from aws_xray_sdk.core import xray_recorder
+          from aws_xray_sdk.core import patch_all
+          
+          # Patch AWS SDK calls for X-Ray tracing
+          patch_all()
+          
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['ORDERS_TABLE'])
+          
+          @xray_recorder.capture('process_order')
+          def lambda_handler(event, context):
+              try:
+                  # Add custom annotations for filtering
+                  xray_recorder.put_annotation('service', 'order-processor')
+                  xray_recorder.put_annotation('operation', 'create_order')
+                  xray_recorder.put_annotation('environment', os.environ.get('ENVIRONMENT', 'unknown'))
+                  
+                  # Extract order details
+                  if 'body' in event:
+                      body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
+                  else:
+                      body = event
+                  
+                  order_id = str(uuid.uuid4())
+                  order_data = {
+                      'orderId': order_id,
+                      'customerId': body.get('customerId', 'unknown'),
+                      'productId': body.get('productId', 'unknown'),
+                      'quantity': body.get('quantity', 1),
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'status': 'pending'
+                  }
+                  
+                  # Add custom metadata
+                  xray_recorder.put_metadata('order_details', {
+                      'order_id': order_id,
+                      'customer_id': body.get('customerId'),
+                      'product_id': body.get('productId'),
+                      'total_amount': body.get('quantity', 1) * 10.0  # Mock price calculation
+                  })
+                  
+                  # Store order in DynamoDB
+                  with xray_recorder.in_subsegment('dynamodb_put_item'):
+                      table.put_item(Item=order_data)
+                  
+                  # Simulate calling inventory service
+                  inventory_response = check_inventory(body.get('productId'))
+                  
+                  # Simulate calling notification service
+                  notification_response = send_notification(order_id, body.get('customerId'))
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'orderId': order_id,
+                          'status': 'processed',
+                          'inventory': inventory_response,
+                          'notification': notification_response
+                      })
+                  }
+                  
+              except Exception as e:
+                  xray_recorder.put_annotation('error', str(e))
+                  xray_recorder.put_annotation('error_type', type(e).__name__)
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          @xray_recorder.capture('check_inventory')
+          def check_inventory(product_id):
+              # Simulate inventory check with artificial delay
+              import time
+              time.sleep(0.1)
+              
+              xray_recorder.put_annotation('inventory_check', 'completed')
+              xray_recorder.put_metadata('inventory_result', {
+                  'product_id': product_id,
+                  'available_quantity': 100,
+                  'reserved_quantity': 5
+              })
+              return {'status': 'available', 'quantity': 100}
+          
+          @xray_recorder.capture('send_notification')
+          def send_notification(order_id, customer_id):
+              # Simulate notification sending
+              import time
+              time.sleep(0.05)
+              
+              xray_recorder.put_annotation('notification_sent', 'true')
+              xray_recorder.put_metadata('notification_details', {
+                  'order_id': order_id,
+                  'customer_id': customer_id,
+                  'channel': 'email',
+                  'template': 'order_confirmation'
+              })
+              return {'status': 'sent', 'channel': 'email'}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: XRayTracing
+          Value: Enabled
+
+  InventoryManagerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-inventory-manager'
+      Description: 'Inventory management function with X-Ray tracing enabled'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      TracingConfig:
+        Mode: Active
+      Code:
+        ZipFile: |
+          import json
+          import time
+          import os
+          from aws_xray_sdk.core import xray_recorder
+          from aws_xray_sdk.core import patch_all
+          
+          # Patch AWS SDK calls for X-Ray tracing
+          patch_all()
+          
+          @xray_recorder.capture('inventory_manager')
+          def lambda_handler(event, context):
+              try:
+                  xray_recorder.put_annotation('service', 'inventory-manager')
+                  xray_recorder.put_annotation('operation', 'update_inventory')
+                  xray_recorder.put_annotation('environment', os.environ.get('ENVIRONMENT', 'unknown'))
+                  
+                  # Simulate inventory processing
+                  with xray_recorder.in_subsegment('inventory_validation'):
+                      product_id = event.get('productId', 'unknown')
+                      quantity = event.get('quantity', 1)
+                      
+                      # Simulate database lookup
+                      time.sleep(0.1)
+                      
+                      xray_recorder.put_metadata('inventory_check', {
+                          'product_id': product_id,
+                          'requested_quantity': quantity,
+                          'available_quantity': 100,
+                          'warehouse_location': 'US-EAST-1'
+                      })
+                  
+                  # Simulate inventory update
+                  with xray_recorder.in_subsegment('inventory_update'):
+                      time.sleep(0.05)
+                      xray_recorder.put_annotation('inventory_updated', 'true')
+                      xray_recorder.put_metadata('update_result', {
+                          'previous_quantity': 100,
+                          'new_quantity': 100 - quantity,
+                          'update_timestamp': time.time()
+                      })
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'productId': product_id,
+                          'status': 'reserved',
+                          'availableQuantity': 100 - quantity,
+                          'reservationId': f'res-{int(time.time())}'
+                      })
+                  }
+                  
+              except Exception as e:
+                  xray_recorder.put_annotation('error', str(e))
+                  xray_recorder.put_annotation('error_type', type(e).__name__)
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: XRayTracing
+          Value: Enabled
+
+  TraceAnalyzerFunction:
+    Type: AWS::Lambda::Function
+    Condition: EnableTraceAnalyzerCondition
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-trace-analyzer'
+      Description: 'Automated trace analysis function for performance monitoring'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          
+          xray_client = boto3.client('xray')
+          cloudwatch = boto3.client('cloudwatch')
+          
+          def lambda_handler(event, context):
+              try:
+                  project_name = os.environ.get('PROJECT_NAME', 'unknown')
+                  environment = os.environ.get('ENVIRONMENT', 'unknown')
+                  
+                  # Get traces from last hour
+                  end_time = datetime.utcnow()
+                  start_time = end_time - timedelta(hours=1)
+                  
+                  # Get trace summaries for order processor service
+                  response = xray_client.get_trace_summaries(
+                      TimeRangeType='TimeStamp',
+                      StartTime=start_time,
+                      EndTime=end_time,
+                      FilterExpression=f'service("{project_name}-{environment}-order-processor")'
+                  )
+                  
+                  # Analyze traces
+                  trace_summaries = response.get('TraceSummaries', [])
+                  total_traces = len(trace_summaries)
+                  error_traces = len([t for t in trace_summaries if t.get('IsError', False)])
+                  fault_traces = len([t for t in trace_summaries if t.get('HasFault', False)])
+                  throttle_traces = len([t for t in trace_summaries if t.get('HasThrottle', False)])
+                  high_latency_traces = len([t for t in trace_summaries if t.get('ResponseTime', 0) > 2])
+                  
+                  # Calculate performance metrics
+                  if total_traces > 0:
+                      error_rate = (error_traces / total_traces) * 100
+                      fault_rate = (fault_traces / total_traces) * 100
+                      avg_response_time = sum([t.get('ResponseTime', 0) for t in trace_summaries]) / total_traces
+                  else:
+                      error_rate = 0
+                      fault_rate = 0
+                      avg_response_time = 0
+                  
+                  # Send custom metrics to CloudWatch
+                  metrics = [
+                      {
+                          'MetricName': 'TotalTraces',
+                          'Value': total_traces,
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {'Name': 'Project', 'Value': project_name},
+                              {'Name': 'Environment', 'Value': environment}
+                          ]
+                      },
+                      {
+                          'MetricName': 'ErrorTraces',
+                          'Value': error_traces,
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {'Name': 'Project', 'Value': project_name},
+                              {'Name': 'Environment', 'Value': environment}
+                          ]
+                      },
+                      {
+                          'MetricName': 'FaultTraces',
+                          'Value': fault_traces,
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {'Name': 'Project', 'Value': project_name},
+                              {'Name': 'Environment', 'Value': environment}
+                          ]
+                      },
+                      {
+                          'MetricName': 'HighLatencyTraces',
+                          'Value': high_latency_traces,
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {'Name': 'Project', 'Value': project_name},
+                              {'Name': 'Environment', 'Value': environment}
+                          ]
+                      },
+                      {
+                          'MetricName': 'ErrorRate',
+                          'Value': error_rate,
+                          'Unit': 'Percent',
+                          'Dimensions': [
+                              {'Name': 'Project', 'Value': project_name},
+                              {'Name': 'Environment', 'Value': environment}
+                          ]
+                      },
+                      {
+                          'MetricName': 'AverageResponseTime',
+                          'Value': avg_response_time,
+                          'Unit': 'Seconds',
+                          'Dimensions': [
+                              {'Name': 'Project', 'Value': project_name},
+                              {'Name': 'Environment', 'Value': environment}
+                          ]
+                      }
+                  ]
+                  
+                  # Publish metrics in batches (CloudWatch limit: 20 metrics per call)
+                  for i in range(0, len(metrics), 20):
+                      batch = metrics[i:i+20]
+                      cloudwatch.put_metric_data(
+                          Namespace='XRay/Analysis',
+                          MetricData=batch
+                      )
+                  
+                  print(f"Analyzed {total_traces} traces: {error_traces} errors, {high_latency_traces} high latency")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'total_traces': total_traces,
+                          'error_traces': error_traces,
+                          'fault_traces': fault_traces,
+                          'high_latency_traces': high_latency_traces,
+                          'error_rate': error_rate,
+                          'avg_response_time': avg_response_time
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error analyzing traces: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # --------------------------------------------------------------------------
+  # API GATEWAY
+  # --------------------------------------------------------------------------
+
+  ApiGatewayRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-api'
+      Description: 'API Gateway for X-Ray monitoring demo with distributed tracing'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: execute-api:Invoke
+            Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: XRayTracing
+          Value: Enabled
+
+  ApiGatewayOrdersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      ParentId: !GetAtt ApiGatewayRestApi.RootResourceId
+      PathPart: orders
+
+  ApiGatewayOrdersMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      ResourceId: !Ref ApiGatewayOrdersResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrderProcessorFunction.Arn}/invocations'
+        IntegrationResponses:
+          - StatusCode: 200
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: false
+
+  # OPTIONS method for CORS support
+  ApiGatewayOrdersOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      ResourceId: !Ref ApiGatewayOrdersResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiGatewayOrdersMethod
+      - ApiGatewayOrdersOptionsMethod
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      StageName: !Ref ApiGatewayStageName
+      StageDescription:
+        TracingEnabled: true
+        Variables:
+          project: !Ref ProjectName
+          environment: !Ref Environment
+
+  # Lambda permissions for API Gateway
+  OrderProcessorLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OrderProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGatewayRestApi}/*'
+
+  # --------------------------------------------------------------------------
+  # X-RAY SAMPLING RULES
+  # --------------------------------------------------------------------------
+
+  HighPrioritySamplingRule:
+    Type: AWS::XRay::SamplingRule
+    Properties:
+      SamplingRule:
+        RuleName: !Sub '${ProjectName}-${Environment}-high-priority'
+        ResourceARN: '*'
+        Priority: 100
+        FixedRate: 1.0
+        ReservoirSize: 10
+        ServiceName: !Sub '${ProjectName}-${Environment}-order-processor'
+        ServiceType: '*'
+        Host: '*'
+        HTTPMethod: '*'
+        URLPath: '*'
+        Version: 1
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  ErrorSamplingRule:
+    Type: AWS::XRay::SamplingRule
+    Properties:
+      SamplingRule:
+        RuleName: !Sub '${ProjectName}-${Environment}-errors'
+        ResourceARN: '*'
+        Priority: 50
+        FixedRate: 1.0
+        ReservoirSize: 5
+        ServiceName: '*'
+        ServiceType: '*'
+        Host: '*'
+        HTTPMethod: '*'
+        URLPath: '*'
+        Version: 1
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # --------------------------------------------------------------------------
+  # EVENTBRIDGE RULE FOR AUTOMATED ANALYSIS
+  # --------------------------------------------------------------------------
+
+  TraceAnalysisScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: EnableTraceAnalyzerCondition
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-trace-analysis'
+      Description: 'Scheduled trigger for automated trace analysis'
+      ScheduleExpression: 'rate(1 hour)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt TraceAnalyzerFunction.Arn
+          Id: TraceAnalyzerTarget
+
+  TraceAnalyzerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableTraceAnalyzerCondition
+    Properties:
+      FunctionName: !Ref TraceAnalyzerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TraceAnalysisScheduleRule.Arn
+
+  # --------------------------------------------------------------------------
+  # CLOUDWATCH ALARMS
+  # --------------------------------------------------------------------------
+
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-high-error-rate'
+      AlarmDescription: 'High error rate detected in X-Ray traces'
+      MetricName: ErrorRate
+      Namespace: XRay/Analysis
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Project
+          Value: !Ref ProjectName
+        - Name: Environment
+          Value: !Ref Environment
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  HighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-high-latency'
+      AlarmDescription: 'High latency detected in X-Ray traces'
+      MetricName: AverageResponseTime
+      Namespace: XRay/Analysis
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 2
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Project
+          Value: !Ref ProjectName
+        - Name: Environment
+          Value: !Ref Environment
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # --------------------------------------------------------------------------
+  # CLOUDWATCH DASHBOARD
+  # --------------------------------------------------------------------------
+
+  XRayMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateDashboardCondition
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}-xray-monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["XRay/Analysis", "TotalTraces", "Project", "${ProjectName}", "Environment", "${Environment}"],
+                  [".", "ErrorTraces", ".", ".", ".", "."],
+                  [".", "FaultTraces", ".", ".", ".", "."],
+                  [".", "HighLatencyTraces", ".", ".", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "X-Ray Trace Analysis",
+                "view": "timeSeries",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["XRay/Analysis", "ErrorRate", "Project", "${ProjectName}", "Environment", "${Environment}"],
+                  [".", "AverageResponseTime", ".", ".", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Performance Metrics",
+                "view": "timeSeries",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${OrderProcessorFunction}"],
+                  [".", "Errors", ".", "."],
+                  [".", "Throttles", ".", "."],
+                  [".", "Invocations", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Order Processor Lambda Metrics",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ApiGateway", "Count", "ApiName", "${ApiGatewayRestApi}", "Stage", "${ApiGatewayStageName}"],
+                  [".", "Latency", ".", ".", ".", "."],
+                  [".", "4XXError", ".", ".", ".", "."],
+                  [".", "5XXError", ".", ".", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "API Gateway Metrics",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${OrdersTable}"],
+                  [".", "ConsumedWriteCapacityUnits", ".", "."],
+                  [".", "SuccessfulRequestLatency", ".", ".", "Operation", "PutItem"],
+                  [".", "UserErrors", ".", "."],
+                  [".", "SystemErrors", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "DynamoDB Metrics",
+                "view": "timeSeries"
+              }
+            }
+          ]
+        }
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+
+Outputs:
+  ApiGatewayUrl:
+    Description: 'API Gateway endpoint URL for testing'
+    Value: !Sub 'https://${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiGatewayStageName}'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-api-url'
+
+  OrdersTableName:
+    Description: 'DynamoDB Orders table name'
+    Value: !Ref OrdersTable
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-orders-table'
+
+  OrderProcessorFunctionName:
+    Description: 'Order processor Lambda function name'
+    Value: !Ref OrderProcessorFunction
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-order-processor-function'
+
+  InventoryManagerFunctionName:
+    Description: 'Inventory manager Lambda function name'
+    Value: !Ref InventoryManagerFunction
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-inventory-manager-function'
+
+  TraceAnalyzerFunctionName:
+    Description: 'Trace analyzer Lambda function name'
+    Condition: EnableTraceAnalyzerCondition
+    Value: !Ref TraceAnalyzerFunction
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-trace-analyzer-function'
+
+  LambdaExecutionRoleArn:
+    Description: 'Lambda execution role ARN'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-lambda-role-arn'
+
+  DashboardUrl:
+    Description: 'CloudWatch dashboard URL'
+    Condition: CreateDashboardCondition
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-xray-monitoring'
+
+  XRayConsoleUrl:
+    Description: 'X-Ray console URL for viewing traces'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/xray/home?region=${AWS::Region}#/service-map'
+
+  TestCommand:
+    Description: 'Sample curl command to test the API'
+    Value: !Sub |
+      curl -X POST https://${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiGatewayStageName}/orders \
+        -H "Content-Type: application/json" \
+        -d '{"customerId": "customer-123", "productId": "product-456", "quantity": 2}'
+
+  ProjectTags:
+    Description: 'Project tags for resource identification'
+    Value: !Sub 'Project=${ProjectName},Environment=${Environment}'

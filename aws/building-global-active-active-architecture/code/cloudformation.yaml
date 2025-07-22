@@ -1,0 +1,1112 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Multi-Region Active-Active Application with AWS Global Accelerator
+  
+  This template deploys a globally distributed, active-active application architecture
+  using AWS Global Accelerator for intelligent traffic routing, DynamoDB Global Tables
+  for automatic multi-region data replication, and Lambda functions with Application
+  Load Balancers in multiple regions.
+  
+  Created from recipe: Building Global Active-Active Architecture with AWS Global Accelerator
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Application Configuration"
+        Parameters:
+          - ApplicationName
+          - Environment
+      - Label:
+          default: "Regional Configuration"
+        Parameters:
+          - PrimaryRegion
+          - SecondaryRegionEU
+          - SecondaryRegionAsia
+      - Label:
+          default: "DynamoDB Configuration"
+        Parameters:
+          - TableName
+          - BillingMode
+      - Label:
+          default: "Global Accelerator Configuration"
+        Parameters:
+          - AcceleratorName
+          - EnableAccelerator
+          - HealthCheckIntervalSeconds
+          - HealthyThresholdCount
+          - UnhealthyThresholdCount
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaRuntime
+          - LambdaTimeout
+          - LambdaMemorySize
+    ParameterLabels:
+      ApplicationName:
+        default: "Application Name"
+      Environment:
+        default: "Environment"
+      PrimaryRegion:
+        default: "Primary Region"
+      SecondaryRegionEU:
+        default: "Secondary Region (EU)"
+      SecondaryRegionAsia:
+        default: "Secondary Region (Asia)"
+      TableName:
+        default: "DynamoDB Table Name"
+      BillingMode:
+        default: "DynamoDB Billing Mode"
+      AcceleratorName:
+        default: "Global Accelerator Name"
+      EnableAccelerator:
+        default: "Enable Global Accelerator"
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: global-app
+    Description: Name for the multi-region application
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: ^[a-z][a-z0-9-]*[a-z0-9]$
+    ConstraintDescription: Must start with a lowercase letter, contain only lowercase letters, numbers, and hyphens, and end with a letter or number
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    Description: Environment name for resource tagging and naming
+
+  PrimaryRegion:
+    Type: String
+    Default: us-east-1
+    AllowedValues:
+      - us-east-1
+      - us-west-2
+      - eu-west-1
+      - ap-southeast-1
+      - ap-northeast-1
+    Description: Primary AWS region for deployment
+
+  SecondaryRegionEU:
+    Type: String
+    Default: eu-west-1
+    AllowedValues:
+      - eu-west-1
+      - eu-central-1
+      - eu-north-1
+    Description: Secondary AWS region for EU deployment
+
+  SecondaryRegionAsia:
+    Type: String
+    Default: ap-southeast-1
+    AllowedValues:
+      - ap-southeast-1
+      - ap-northeast-1
+      - ap-south-1
+    Description: Secondary AWS region for Asia deployment
+
+  TableName:
+    Type: String
+    Default: GlobalUserData
+    Description: Name for the DynamoDB Global Table
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$
+    ConstraintDescription: Must start with a letter, contain only letters, numbers, and hyphens, and end with a letter or number
+
+  BillingMode:
+    Type: String
+    Default: PAY_PER_REQUEST
+    AllowedValues:
+      - PAY_PER_REQUEST
+      - PROVISIONED
+    Description: DynamoDB billing mode
+
+  AcceleratorName:
+    Type: String
+    Default: GlobalAccelerator
+    Description: Name for the AWS Global Accelerator
+    MinLength: 3
+    MaxLength: 50
+
+  EnableAccelerator:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable or disable the Global Accelerator
+
+  HealthCheckIntervalSeconds:
+    Type: Number
+    Default: 30
+    MinValue: 10
+    MaxValue: 30
+    Description: Health check interval for Global Accelerator endpoints
+
+  HealthyThresholdCount:
+    Type: Number
+    Default: 3
+    MinValue: 2
+    MaxValue: 10
+    Description: Number of consecutive health checks before marking endpoint healthy
+
+  UnhealthyThresholdCount:
+    Type: Number
+    Default: 3
+    MinValue: 2
+    MaxValue: 10
+    Description: Number of consecutive health check failures before marking endpoint unhealthy
+
+  LambdaRuntime:
+    Type: String
+    Default: python3.11
+    AllowedValues:
+      - python3.9
+      - python3.10
+      - python3.11
+      - python3.12
+    Description: Lambda function runtime version
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 900
+    Description: Lambda function timeout in seconds
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 10240
+    Description: Lambda function memory size in MB
+
+Conditions:
+  IsGlobalAcceleratorEnabled: !Equals [!Ref EnableAccelerator, 'true']
+  IsProvisionedBilling: !Equals [!Ref BillingMode, 'PROVISIONED']
+  IsPrimaryRegion: !Equals [!Ref 'AWS::Region', !Ref PrimaryRegion]
+
+Resources:
+  # =============================================================================
+  # IAM ROLES AND POLICIES
+  # =============================================================================
+  
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-${Environment}-lambda-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBGlobalTableAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:*:${AWS::AccountId}:table/${TableName}-${Environment}'
+                  - !Sub 'arn:aws:dynamodb:*:${AWS::AccountId}:table/${TableName}-${Environment}/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:*:${AWS::AccountId}:*'
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: IAM
+
+  # =============================================================================
+  # DYNAMODB GLOBAL TABLES
+  # =============================================================================
+  
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${TableName}-${Environment}'
+      BillingMode: !Ref BillingMode
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      DeletionProtectionEnabled: true
+      # Global Tables configuration
+      Replicas:
+        - Region: !Ref PrimaryRegion
+          GlobalSecondaryIndexes: []
+          PointInTimeRecoverySpecification:
+            PointInTimeRecoveryEnabled: true
+          SSESpecification:
+            KMSMasterKeyId: alias/aws/dynamodb
+          TableClass: STANDARD
+          Tags:
+            - Key: Application
+              Value: !Ref ApplicationName
+            - Key: Environment
+              Value: !Ref Environment
+            - Key: Component
+              Value: Database
+            - Key: Region
+              Value: !Ref PrimaryRegion
+        - Region: !Ref SecondaryRegionEU
+          GlobalSecondaryIndexes: []
+          PointInTimeRecoverySpecification:
+            PointInTimeRecoveryEnabled: true
+          SSESpecification:
+            KMSMasterKeyId: alias/aws/dynamodb
+          TableClass: STANDARD
+          Tags:
+            - Key: Application
+              Value: !Ref ApplicationName
+            - Key: Environment
+              Value: !Ref Environment
+            - Key: Component
+              Value: Database
+            - Key: Region
+              Value: !Ref SecondaryRegionEU
+        - Region: !Ref SecondaryRegionAsia
+          GlobalSecondaryIndexes: []
+          PointInTimeRecoverySpecification:
+            PointInTimeRecoveryEnabled: true
+          SSESpecification:
+            KMSMasterKeyId: alias/aws/dynamodb
+          TableClass: STANDARD
+          Tags:
+            - Key: Application
+              Value: !Ref ApplicationName
+            - Key: Environment
+              Value: !Ref Environment
+            - Key: Component
+              Value: Database
+            - Key: Region
+              Value: !Ref SecondaryRegionAsia
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: Database
+
+  # =============================================================================
+  # LAMBDA FUNCTIONS
+  # =============================================================================
+  
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ApplicationName}-${Environment}-${AWS::Region}'
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          TABLE_NAME: !Sub '${TableName}-${Environment}'
+          REGION: !Ref 'AWS::Region'
+          ENVIRONMENT: !Ref Environment
+      ReservedConcurrencyLimit: 100
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import time
+          import os
+          from decimal import Decimal
+
+          # Initialize DynamoDB client
+          dynamodb = boto3.resource('dynamodb')
+          table_name = os.environ['TABLE_NAME']
+          table = dynamodb.Table(table_name)
+
+          def lambda_handler(event, context):
+              """
+              Multi-region active-active application handler
+              Supports CRUD operations with automatic regional optimization
+              """
+              
+              try:
+                  # Get HTTP method and path
+                  method = event.get('httpMethod', 'GET')
+                  path = event.get('path', '/')
+                  
+                  # Parse request body for POST/PUT requests
+                  body = {}
+                  if event.get('body'):
+                      body = json.loads(event['body'])
+                  
+                  # Get AWS region from context
+                  region = context.invoked_function_arn.split(':')[3]
+                  
+                  # Route based on HTTP method and path
+                  if method == 'GET' and path == '/health':
+                      return health_check(region)
+                  elif method == 'GET' and path.startswith('/user/'):
+                      user_id = path.split('/')[-1]
+                      return get_user_data(user_id, region)
+                  elif method == 'POST' and path == '/user':
+                      return create_user_data(body, region)
+                  elif method == 'PUT' and path.startswith('/user/'):
+                      user_id = path.split('/')[-1]
+                      return update_user_data(user_id, body, region)
+                  elif method == 'GET' and path == '/users':
+                      return list_users(region)
+                  else:
+                      return {
+                          'statusCode': 404,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': json.dumps({'error': 'Not found'})
+                      }
+                      
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({'error': str(e), 'region': region})
+                  }
+
+          def health_check(region):
+              """Health check endpoint for load balancer"""
+              return {
+                  'statusCode': 200,
+                  'headers': {'Content-Type': 'application/json'},
+                  'body': json.dumps({
+                      'status': 'healthy',
+                      'region': region,
+                      'timestamp': int(time.time())
+                  })
+              }
+
+          def get_user_data(user_id, region):
+              """Get user data with regional context"""
+              try:
+                  # Get latest record for user
+                  response = table.query(
+                      KeyConditionExpression='userId = :userId',
+                      ExpressionAttributeValues={':userId': user_id},
+                      ScanIndexForward=False,
+                      Limit=1
+                  )
+                  
+                  if response['Items']:
+                      item = response['Items'][0]
+                      # Convert Decimal to float for JSON serialization
+                      item = json.loads(json.dumps(item, default=decimal_default))
+                      return {
+                          'statusCode': 200,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': json.dumps({
+                              'user': item,
+                              'served_from_region': region
+                          })
+                      }
+                  else:
+                      return {
+                          'statusCode': 404,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': json.dumps({'error': 'User not found'})
+                      }
+                      
+              except Exception as e:
+                  raise Exception(f"Error getting user data: {str(e)}")
+
+          def create_user_data(body, region):
+              """Create new user data with regional tracking"""
+              try:
+                  user_id = body.get('userId')
+                  if not user_id:
+                      return {
+                          'statusCode': 400,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': json.dumps({'error': 'userId is required'})
+                      }
+                  
+                  timestamp = int(time.time() * 1000)  # milliseconds for better precision
+                  
+                  item = {
+                      'userId': user_id,
+                      'timestamp': timestamp,
+                      'data': body.get('data', {}),
+                      'created_region': region,
+                      'last_updated': timestamp,
+                      'version': 1
+                  }
+                  
+                  table.put_item(Item=item)
+                  
+                  return {
+                      'statusCode': 201,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({
+                          'message': 'User created successfully',
+                          'userId': user_id,
+                          'created_in_region': region,
+                          'timestamp': timestamp
+                      })
+                  }
+                  
+              except Exception as e:
+                  raise Exception(f"Error creating user data: {str(e)}")
+
+          def update_user_data(user_id, body, region):
+              """Update user data with conflict resolution"""
+              try:
+                  timestamp = int(time.time() * 1000)
+                  
+                  # Use atomic update with version control
+                  response = table.update_item(
+                      Key={'userId': user_id, 'timestamp': timestamp},
+                      UpdateExpression='SET #data = :data, last_updated = :timestamp, updated_region = :region ADD version :inc',
+                      ExpressionAttributeNames={'#data': 'data'},
+                      ExpressionAttributeValues={
+                          ':data': body.get('data', {}),
+                          ':timestamp': timestamp,
+                          ':region': region,
+                          ':inc': 1
+                      },
+                      ReturnValues='ALL_NEW'
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({
+                          'message': 'User updated successfully',
+                          'userId': user_id,
+                          'updated_in_region': region,
+                          'timestamp': timestamp
+                      })
+                  }
+                  
+              except Exception as e:
+                  raise Exception(f"Error updating user data: {str(e)}")
+
+          def list_users(region):
+              """List users with pagination support"""
+              try:
+                  # Simple scan with limit (in production, use GSI for better performance)
+                  response = table.scan(Limit=20)
+                  
+                  users = []
+                  processed_users = set()
+                  
+                  for item in response['Items']:
+                      user_id = item['userId']
+                      if user_id not in processed_users:
+                          users.append({
+                              'userId': user_id,
+                              'last_updated': int(item['last_updated']),
+                              'version': int(item.get('version', 1))
+                          })
+                          processed_users.add(user_id)
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({
+                          'users': users,
+                          'count': len(users),
+                          'served_from_region': region
+                      })
+                  }
+                  
+              except Exception as e:
+                  raise Exception(f"Error listing users: {str(e)}")
+
+          def decimal_default(obj):
+              """JSON serializer for objects not serializable by default json code"""
+              if isinstance(obj, Decimal):
+                  return float(obj)
+              raise TypeError
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: Compute
+
+  # Dead Letter Queue for failed Lambda invocations
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ApplicationName}-${Environment}-dlq-${AWS::Region}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: Messaging
+
+  # Lambda permission for ALB to invoke the function
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: elasticloadbalancing.amazonaws.com
+      SourceArn: !Sub 'arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:targetgroup/${ApplicationName}-${Environment}-tg-${AWS::Region}/*'
+
+  # =============================================================================
+  # APPLICATION LOAD BALANCER
+  # =============================================================================
+  
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ApplicationName}-${Environment}-alb-${AWS::Region}'
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+        - Key: routing.http2.enabled
+          Value: 'true'
+        - Key: access_logs.s3.enabled
+          Value: 'false'
+        - Key: deletion_protection.enabled
+          Value: 'false'
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: LoadBalancer
+
+  # Target Group for Lambda functions
+  LambdaTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ApplicationName}-${Environment}-tg-${AWS::Region}'
+      TargetType: lambda
+      Targets:
+        - Id: !GetAtt LambdaFunction.Arn
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 35
+      HealthCheckPath: /health
+      HealthCheckTimeoutSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Matcher:
+        HttpCode: '200'
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: LoadBalancer
+
+  # ALB Listener
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref LambdaTargetGroup
+
+  # =============================================================================
+  # NETWORKING
+  # =============================================================================
+  
+  # VPC (using default VPC for simplicity - in production, create custom VPC)
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-vpc-${AWS::Region}'
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-igw-${AWS::Region}'
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Attach Internet Gateway to VPC
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public Subnets
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-public-subnet-1-${AWS::Region}'
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-public-subnet-2-${AWS::Region}'
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Route Table for Public Subnets
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-public-rt-${AWS::Region}'
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Route to Internet Gateway
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Associate Route Table with Public Subnets
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # =============================================================================
+  # SECURITY GROUPS
+  # =============================================================================
+  
+  # Security Group for Application Load Balancer
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Application Load Balancer
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTP traffic from anywhere
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTPS traffic from anywhere
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ApplicationName}-${Environment}-alb-sg-${AWS::Region}'
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: Security
+
+  # =============================================================================
+  # GLOBAL ACCELERATOR (Only created in primary region)
+  # =============================================================================
+  
+  GlobalAccelerator:
+    Type: AWS::GlobalAccelerator::Accelerator
+    Condition: IsGlobalAcceleratorEnabled
+    Properties:
+      Name: !Sub '${AcceleratorName}-${Environment}'
+      IpAddressType: IPV4
+      Enabled: !Ref EnableAccelerator
+      Attributes:
+        - FlowLogsEnabled: false
+          FlowLogsS3Bucket: ''
+          FlowLogsS3Prefix: ''
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: GlobalAccelerator
+
+  # Global Accelerator Listener
+  GlobalAcceleratorListener:
+    Type: AWS::GlobalAccelerator::Listener
+    Condition: IsGlobalAcceleratorEnabled
+    Properties:
+      AcceleratorArn: !Ref GlobalAccelerator
+      Protocol: TCP
+      PortRanges:
+        - FromPort: 80
+          ToPort: 80
+
+  # Endpoint Group for current region
+  EndpointGroup:
+    Type: AWS::GlobalAccelerator::EndpointGroup
+    Condition: IsGlobalAcceleratorEnabled
+    Properties:
+      ListenerArn: !Ref GlobalAcceleratorListener
+      EndpointGroupRegion: !Ref 'AWS::Region'
+      TrafficDialPercentage: 100
+      HealthCheckIntervalSeconds: !Ref HealthCheckIntervalSeconds
+      HealthyThresholdCount: !Ref HealthyThresholdCount
+      UnhealthyThresholdCount: !Ref UnhealthyThresholdCount
+      EndpointConfigurations:
+        - EndpointId: !Ref ApplicationLoadBalancer
+          Weight: 100
+          ClientIPPreservationEnabled: false
+
+  # =============================================================================
+  # CLOUDWATCH MONITORING
+  # =============================================================================
+  
+  # CloudWatch Log Group for Lambda
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ApplicationName}-${Environment}-${AWS::Region}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: Monitoring
+
+  # CloudWatch Dashboard
+  ApplicationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ApplicationName}-${Environment}-${AWS::Region}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${LambdaFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Invocations", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${ApplicationLoadBalancer}" ],
+                  [ ".", "TargetResponseTime", ".", "." ],
+                  [ ".", "HTTPCode_Target_2XX_Count", ".", "." ],
+                  [ ".", "HTTPCode_Target_4XX_Count", ".", "." ],
+                  [ ".", "HTTPCode_Target_5XX_Count", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Application Load Balancer Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${DynamoDBTable}" ],
+                  [ ".", "ConsumedWriteCapacityUnits", ".", "." ],
+                  [ ".", "ThrottledRequests", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "DynamoDB Metrics",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+
+Outputs:
+  # Application Information
+  ApplicationName:
+    Description: Name of the deployed application
+    Value: !Ref ApplicationName
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationName'
+
+  Environment:
+    Description: Environment name
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
+
+  # DynamoDB Information
+  DynamoDBTableName:
+    Description: Name of the DynamoDB Global Table
+    Value: !Ref DynamoDBTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableName'
+
+  DynamoDBTableArn:
+    Description: ARN of the DynamoDB Global Table
+    Value: !GetAtt DynamoDBTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableArn'
+
+  # Lambda Information
+  LambdaFunctionName:
+    Description: Name of the Lambda function
+    Value: !Ref LambdaFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt LambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  # Load Balancer Information
+  ApplicationLoadBalancerArn:
+    Description: ARN of the Application Load Balancer
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationLoadBalancerArn'
+
+  ApplicationLoadBalancerDNS:
+    Description: DNS name of the Application Load Balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationLoadBalancerDNS'
+
+  ApplicationLoadBalancerURL:
+    Description: URL of the Application Load Balancer
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationLoadBalancerURL'
+
+  # Target Group Information
+  LambdaTargetGroupArn:
+    Description: ARN of the Lambda Target Group
+    Value: !Ref LambdaTargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaTargetGroupArn'
+
+  # Global Accelerator Information (conditional)
+  GlobalAcceleratorArn:
+    Condition: IsGlobalAcceleratorEnabled
+    Description: ARN of the Global Accelerator
+    Value: !Ref GlobalAccelerator
+    Export:
+      Name: !Sub '${AWS::StackName}-GlobalAcceleratorArn'
+
+  GlobalAcceleratorDNS:
+    Condition: IsGlobalAcceleratorEnabled
+    Description: DNS name of the Global Accelerator
+    Value: !GetAtt GlobalAccelerator.DnsName
+    Export:
+      Name: !Sub '${AWS::StackName}-GlobalAcceleratorDNS'
+
+  GlobalAcceleratorIPs:
+    Condition: IsGlobalAcceleratorEnabled
+    Description: Static IP addresses of the Global Accelerator
+    Value: !Join [', ', !GetAtt GlobalAccelerator.Ipv4Addresses]
+    Export:
+      Name: !Sub '${AWS::StackName}-GlobalAcceleratorIPs'
+
+  GlobalAcceleratorURL:
+    Condition: IsGlobalAcceleratorEnabled
+    Description: URL using Global Accelerator static IPs
+    Value: !Sub 'http://${GlobalAccelerator.DnsName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-GlobalAcceleratorURL'
+
+  # Networking Information
+  VPCId:
+    Description: ID of the VPC
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCId'
+
+  PublicSubnet1Id:
+    Description: ID of Public Subnet 1
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet1Id'
+
+  PublicSubnet2Id:
+    Description: ID of Public Subnet 2
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet2Id'
+
+  # Security Group Information
+  ALBSecurityGroupId:
+    Description: ID of the ALB Security Group
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ALBSecurityGroupId'
+
+  # IAM Information
+  LambdaExecutionRoleArn:
+    Description: ARN of the Lambda Execution Role
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  # CloudWatch Information
+  LambdaLogGroupName:
+    Description: Name of the Lambda Log Group
+    Value: !Ref LambdaLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaLogGroupName'
+
+  DashboardURL:
+    Description: URL to the CloudWatch Dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ApplicationName}-${Environment}-${AWS::Region}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  # Deployment Information
+  Region:
+    Description: AWS Region where this stack is deployed
+    Value: !Ref 'AWS::Region'
+    Export:
+      Name: !Sub '${AWS::StackName}-Region'
+
+  StackName:
+    Description: Name of this CloudFormation stack
+    Value: !Ref 'AWS::StackName'
+    Export:
+      Name: !Sub '${AWS::StackName}-StackName'
+
+  # Health Check Endpoints
+  HealthCheckURL:
+    Description: Health check endpoint URL
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}/health'
+    Export:
+      Name: !Sub '${AWS::StackName}-HealthCheckURL'
+
+  APIEndpoints:
+    Description: Available API endpoints
+    Value: !Sub |
+      Base URL: http://${ApplicationLoadBalancer.DNSName}
+      Health Check: /health
+      Create User: POST /user
+      Get User: GET /user/{userId}
+      Update User: PUT /user/{userId}
+      List Users: GET /users
+    Export:
+      Name: !Sub '${AWS::StackName}-APIEndpoints'

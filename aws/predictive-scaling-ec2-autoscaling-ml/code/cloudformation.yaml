@@ -1,0 +1,638 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for Implementing Predictive Scaling for EC2 with Auto Scaling and Machine Learning'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcCidr
+          - Subnet1Cidr
+          - Subnet2Cidr
+          - AvailabilityZone1
+          - AvailabilityZone2
+      - Label:
+          default: "Auto Scaling Configuration"
+        Parameters:
+          - MinSize
+          - MaxSize
+          - DesiredCapacity
+          - InstanceType
+          - TargetCPUUtilization
+      - Label:
+          default: "Predictive Scaling Configuration"
+        Parameters:
+          - PredictiveScalingMode
+          - SchedulingBufferTime
+          - MaxCapacityBuffer
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - CreateDashboard
+    ParameterLabels:
+      VpcCidr:
+        default: "VPC CIDR Block"
+      MinSize:
+        default: "Minimum Instances"
+      MaxSize:
+        default: "Maximum Instances"
+      PredictiveScalingMode:
+        default: "Predictive Scaling Mode"
+
+Parameters:
+  # Network Configuration
+  VpcCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: 'CIDR block for the VPC'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    ConstraintDescription: 'Must be a valid IP CIDR range of the form x.x.x.x/x'
+
+  Subnet1Cidr:
+    Type: String
+    Default: '10.0.1.0/24'
+    Description: 'CIDR block for the first subnet'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    ConstraintDescription: 'Must be a valid IP CIDR range of the form x.x.x.x/x'
+
+  Subnet2Cidr:
+    Type: String
+    Default: '10.0.2.0/24'
+    Description: 'CIDR block for the second subnet'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    ConstraintDescription: 'Must be a valid IP CIDR range of the form x.x.x.x/x'
+
+  AvailabilityZone1:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: 'First Availability Zone for subnet placement'
+
+  AvailabilityZone2:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: 'Second Availability Zone for subnet placement'
+
+  # Auto Scaling Configuration
+  MinSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 100
+    Description: 'Minimum number of instances in Auto Scaling group'
+
+  MaxSize:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 1000
+    Description: 'Maximum number of instances in Auto Scaling group'
+
+  DesiredCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 100
+    Description: 'Initial desired capacity for Auto Scaling group'
+
+  InstanceType:
+    Type: String
+    Default: 't3.micro'
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - t3.2xlarge
+      - c5.large
+      - c5.xlarge
+      - c5.2xlarge
+      - m5.large
+      - m5.xlarge
+      - m5.2xlarge
+    Description: 'EC2 instance type for Auto Scaling group'
+
+  TargetCPUUtilization:
+    Type: Number
+    Default: 50
+    MinValue: 10
+    MaxValue: 90
+    Description: 'Target CPU utilization percentage for scaling policies'
+
+  # Predictive Scaling Configuration
+  PredictiveScalingMode:
+    Type: String
+    Default: 'ForecastOnly'
+    AllowedValues:
+      - 'ForecastOnly'
+      - 'ForecastAndScale'
+    Description: 'Predictive scaling mode - ForecastOnly for evaluation, ForecastAndScale for active scaling'
+
+  SchedulingBufferTime:
+    Type: Number
+    Default: 300
+    MinValue: 0
+    MaxValue: 43200
+    Description: 'Time in seconds to pre-launch instances before predicted demand (0-12 hours)'
+
+  MaxCapacityBuffer:
+    Type: Number
+    Default: 10
+    MinValue: 0
+    MaxValue: 100
+    Description: 'Percentage buffer above max capacity when MaxCapacityBreachBehavior is IncreaseMaxCapacity'
+
+  # Monitoring Configuration
+  CreateDashboard:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: 'Whether to create CloudWatch dashboard for monitoring'
+
+Conditions:
+  ShouldCreateDashboard: !Equals [!Ref CreateDashboard, 'true']
+  IsPredictiveScalingActive: !Equals [!Ref PredictiveScalingMode, 'ForecastAndScale']
+
+Resources:
+  # VPC and Network Infrastructure
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-VPC'
+        - Key: Environment
+          Value: Production
+        - Key: Purpose
+          Value: PredictiveScaling
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-IGW'
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  Subnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref Subnet1Cidr
+      AvailabilityZone: !Ref AvailabilityZone1
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Subnet1'
+
+  Subnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref Subnet2Cidr
+      AvailabilityZone: !Ref AvailabilityZone2
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Subnet2'
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-RouteTable'
+
+  Route:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet1
+      RouteTableId: !Ref RouteTable
+
+  SubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet2
+      RouteTableId: !Ref RouteTable
+
+  # Security Group
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group for Predictive Scaling demo instances'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: '0.0.0.0/0'
+          Description: 'Allow HTTP traffic from anywhere'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+          Description: 'Allow HTTPS traffic from anywhere'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: '0.0.0.0/0'
+          Description: 'Allow all outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-SecurityGroup'
+
+  # IAM Role for EC2 instances
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-EC2Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-EC2Role'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-InstanceProfile'
+      Roles:
+        - !Ref EC2Role
+
+  # Launch Template
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-LaunchTemplate'
+      LaunchTemplateData:
+        ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref SecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd stress
+            systemctl start httpd
+            systemctl enable httpd
+            
+            # Create a simple web page showing instance information
+            cat > /var/www/html/index.html << 'EOF'
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Predictive Scaling Demo</title>
+                <style>
+                    body { font-family: Arial, sans-serif; margin: 40px; }
+                    .info { background-color: #f0f0f0; padding: 20px; border-radius: 5px; }
+                </style>
+            </head>
+            <body>
+                <h1>Predictive Scaling Demo</h1>
+                <div class="info">
+                    <h2>Instance Information</h2>
+                    <p><strong>Instance ID:</strong> $(curl -s http://169.254.169.254/latest/meta-data/instance-id)</p>
+                    <p><strong>Instance Type:</strong> $(curl -s http://169.254.169.254/latest/meta-data/instance-type)</p>
+                    <p><strong>Availability Zone:</strong> $(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)</p>
+                    <p><strong>Stack Name:</strong> ${AWS::StackName}</p>
+                </div>
+                <div class="info" style="margin-top: 20px;">
+                    <h2>Load Generation</h2>
+                    <p>This instance is configured to generate predictable CPU load patterns:</p>
+                    <ul>
+                        <li>High CPU load during business hours (8 AM - 8 PM UTC) on weekdays</li>
+                        <li>Moderate CPU load during weekends (10 AM - 6 PM UTC)</li>
+                    </ul>
+                </div>
+            </body>
+            </html>
+            EOF
+            
+            # Create cron jobs for predictable load patterns to help train the ML model
+            cat > /etc/cron.d/predictive-load << 'CRONEOF'
+            # Generate predictable CPU load patterns for ML training
+            # Business hours load (Monday-Friday 8 AM - 8 PM UTC)
+            0 8 * * 1-5 root /usr/bin/stress --cpu 2 --timeout 12h > /dev/null 2>&1
+            # Weekend load (Saturday-Sunday 10 AM - 6 PM UTC)  
+            0 10 * * 6,0 root /usr/bin/stress --cpu 1 --timeout 8h > /dev/null 2>&1
+            CRONEOF
+            
+            # Install CloudWatch agent for enhanced monitoring
+            wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+            rpm -U ./amazon-cloudwatch-agent.rpm
+            
+            # Signal CloudFormation that instance initialization is complete
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-Instance'
+              - Key: Environment
+                Value: Production
+              - Key: Purpose
+                Value: PredictiveScaling
+
+  # Auto Scaling Group
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${AWS::StackName}-ASG'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      VPCZoneIdentifier:
+        - !Ref Subnet1
+        - !Ref Subnet2
+      DefaultInstanceWarmup: 300
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ASG'
+          PropagateAtLaunch: false
+        - Key: Environment
+          Value: Production
+          PropagateAtLaunch: true
+        - Key: Purpose
+          Value: PredictiveScaling
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref DesiredCapacity
+        Timeout: PT10M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT5M
+        WaitOnResourceSignals: true
+
+  # Target Tracking Scaling Policy for reactive scaling
+  TargetTrackingScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-TargetTrackingPolicy'
+      PolicyType: TargetTrackingScaling
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: !Ref TargetCPUUtilization
+        DisableScaleIn: false
+        ScaleOutCooldown: 300
+        ScaleInCooldown: 300
+
+  # Predictive Scaling Policy
+  PredictiveScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-PredictiveScalingPolicy'
+      PolicyType: PredictiveScaling
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PredictiveScalingConfiguration:
+        MetricSpecifications:
+          - TargetValue: !Ref TargetCPUUtilization
+            PredefinedMetricPairSpecification:
+              PredefinedMetricType: ASGCPUUtilization
+        Mode: !Ref PredictiveScalingMode
+        SchedulingBufferTime: !Ref SchedulingBufferTime
+        MaxCapacityBreachBehavior: IncreaseMaxCapacity
+        MaxCapacityBuffer: !Ref MaxCapacityBuffer
+
+  # CloudWatch Dashboard (conditional)
+  CloudWatchDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: ShouldCreateDashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-PredictiveScalingDashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/EC2", "CPUUtilization", "AutoScalingGroupName", "${AutoScalingGroup}", { "stat": "Average" } ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Auto Scaling Group CPU Utilization",
+                "view": "timeSeries",
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 100
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/AutoScaling", "GroupInServiceInstances", "AutoScalingGroupName", "${AutoScalingGroup}" ],
+                  [ ".", "GroupDesiredCapacity", ".", "." ],
+                  [ ".", "GroupMinSize", ".", "." ],
+                  [ ".", "GroupMaxSize", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Auto Scaling Group Instance Metrics",
+                "view": "timeSeries",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/AutoScaling", "GroupTotalInstances", "AutoScalingGroupName", "${AutoScalingGroup}" ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Total Instances Over Time",
+                "view": "timeSeries",
+                "annotations": {
+                  "horizontal": [
+                    {
+                      "label": "Target CPU Utilization",
+                      "value": ${TargetCPUUtilization}
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms for monitoring
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-HighCPUUtilization'
+      AlarmDescription: 'Alarm when CPU exceeds 80%'
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      TreatMissingData: notBreaching
+
+  LowCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-LowCPUUtilization'
+      AlarmDescription: 'Alarm when CPU is below 10%'
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 5
+      Threshold: 10
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      TreatMissingData: notBreaching
+
+Outputs:
+  VPCId:
+    Description: 'VPC ID created for the predictive scaling infrastructure'
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPC-ID'
+
+  SubnetIds:
+    Description: 'Subnet IDs where instances are launched'
+    Value: !Join [',', [!Ref Subnet1, !Ref Subnet2]]
+    Export:
+      Name: !Sub '${AWS::StackName}-Subnet-IDs'
+
+  AutoScalingGroupName:
+    Description: 'Name of the Auto Scaling Group'
+    Value: !Ref AutoScalingGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ASG-Name'
+
+  AutoScalingGroupARN:
+    Description: 'ARN of the Auto Scaling Group'
+    Value: !Sub 'arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${AutoScalingGroup}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ASG-ARN'
+
+  LaunchTemplateId:
+    Description: 'Launch Template ID used by the Auto Scaling Group'
+    Value: !Ref LaunchTemplate
+    Export:
+      Name: !Sub '${AWS::StackName}-LaunchTemplate-ID'
+
+  SecurityGroupId:
+    Description: 'Security Group ID for the EC2 instances'
+    Value: !Ref SecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroup-ID'
+
+  TargetTrackingPolicyARN:
+    Description: 'ARN of the Target Tracking Scaling Policy'
+    Value: !Ref TargetTrackingScalingPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-TargetTrackingPolicy-ARN'
+
+  PredictiveScalingPolicyARN:
+    Description: 'ARN of the Predictive Scaling Policy'
+    Value: !Ref PredictiveScalingPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-PredictiveScalingPolicy-ARN'
+
+  PredictiveScalingMode:
+    Description: 'Current mode of the Predictive Scaling Policy'
+    Value: !Ref PredictiveScalingMode
+    Export:
+      Name: !Sub '${AWS::StackName}-PredictiveScaling-Mode'
+
+  CloudWatchDashboardURL:
+    Condition: ShouldCreateDashboard
+    Description: 'URL to the CloudWatch Dashboard for monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-PredictiveScalingDashboard'
+    Export:
+      Name: !Sub '${AWS::StackName}-Dashboard-URL'
+
+  ScalingConfiguration:
+    Description: 'Current scaling configuration summary'
+    Value: !Sub 'Min: ${MinSize}, Max: ${MaxSize}, Desired: ${DesiredCapacity}, Target CPU: ${TargetCPUUtilization}%'
+    Export:
+      Name: !Sub '${AWS::StackName}-Scaling-Config'
+
+  MonitoringCommands:
+    Description: 'AWS CLI commands to monitor the predictive scaling setup'
+    Value: !Sub |
+      # View scaling activities:
+      aws autoscaling describe-scaling-activities --auto-scaling-group-name ${AutoScalingGroup} --region ${AWS::Region}
+      
+      # Get predictive scaling forecast:
+      aws autoscaling get-predictive-scaling-forecast --policy-arn ${PredictiveScalingPolicy} --region ${AWS::Region}
+      
+      # View current instance status:
+      aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names ${AutoScalingGroup} --region ${AWS::Region}
+
+  NextSteps:
+    Description: 'Recommended next steps after deployment'
+    Value: !If
+      - IsPredictiveScalingActive
+      - 'Predictive scaling is ACTIVE. Monitor the dashboard and scaling activities. Review forecast accuracy regularly.'
+      - 'Predictive scaling is in FORECAST ONLY mode. Monitor forecasts for 24-48 hours, then update the PredictiveScalingMode parameter to ForecastAndScale to enable active scaling.'

@@ -1,0 +1,1129 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Serverless API Development with SAM and API Gateway - Complete infrastructure for building, testing, and deploying serverless APIs'
+
+# Template Metadata
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "API Configuration"
+        Parameters:
+          - ApiName
+          - ApiDescription
+          - StageName
+          - CorsOrigin
+      - Label:
+          default: "DynamoDB Configuration"
+        Parameters:
+          - TableName
+          - BillingMode
+          - ReadCapacityUnits
+          - WriteCapacityUnits
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaRuntime
+          - LambdaTimeout
+          - LambdaMemorySize
+          - LogRetentionDays
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableXRayTracing
+          - EnableDetailedMetrics
+          - CreateCloudWatchDashboard
+    ParameterLabels:
+      ApiName:
+        default: "API Name"
+      StageName:
+        default: "API Stage Name"
+      TableName:
+        default: "DynamoDB Table Name"
+
+# Input Parameters
+Parameters:
+  ApiName:
+    Type: String
+    Default: "serverless-users-api"
+    Description: "Name for the API Gateway REST API"
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: '^[a-zA-Z0-9-_]+$'
+    ConstraintDescription: "API name must contain only alphanumeric characters, hyphens, and underscores"
+
+  ApiDescription:
+    Type: String
+    Default: "Serverless Users API built with API Gateway and Lambda"
+    Description: "Description for the API Gateway"
+    MaxLength: 200
+
+  StageName:
+    Type: String
+    Default: "dev"
+    Description: "Stage name for API Gateway deployment"
+    AllowedValues:
+      - dev
+      - test
+      - staging
+      - prod
+    ConstraintDescription: "Must be one of: dev, test, staging, prod"
+
+  CorsOrigin:
+    Type: String
+    Default: "*"
+    Description: "CORS allowed origin (use * for all origins, or specify domain)"
+    AllowedPattern: '^(\*|https?://[a-zA-Z0-9.-]+(:[0-9]+)?)$'
+    ConstraintDescription: "Must be * or a valid HTTP/HTTPS URL"
+
+  TableName:
+    Type: String
+    Default: "users-table"
+    Description: "Name for the DynamoDB table"
+    MinLength: 3
+    MaxLength: 255
+    AllowedPattern: '^[a-zA-Z0-9_.-]+$'
+    ConstraintDescription: "Table name must contain only alphanumeric characters, underscores, hyphens, and periods"
+
+  BillingMode:
+    Type: String
+    Default: "PAY_PER_REQUEST"
+    Description: "DynamoDB billing mode"
+    AllowedValues:
+      - PAY_PER_REQUEST
+      - PROVISIONED
+    ConstraintDescription: "Must be either PAY_PER_REQUEST or PROVISIONED"
+
+  ReadCapacityUnits:
+    Type: Number
+    Default: 5
+    Description: "Read capacity units (only used if BillingMode is PROVISIONED)"
+    MinValue: 1
+    MaxValue: 40000
+
+  WriteCapacityUnits:
+    Type: Number
+    Default: 5
+    Description: "Write capacity units (only used if BillingMode is PROVISIONED)"
+    MinValue: 1
+    MaxValue: 40000
+
+  LambdaRuntime:
+    Type: String
+    Default: "python3.9"
+    Description: "Lambda function runtime"
+    AllowedValues:
+      - python3.8
+      - python3.9
+      - python3.10
+      - python3.11
+      - nodejs18.x
+      - nodejs20.x
+    ConstraintDescription: "Must be a supported Lambda runtime"
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    Description: "Lambda function timeout in seconds"
+    MinValue: 3
+    MaxValue: 900
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 128
+    Description: "Lambda function memory size in MB"
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    Description: "CloudWatch log retention period in days"
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+  EnableXRayTracing:
+    Type: String
+    Default: "true"
+    Description: "Enable AWS X-Ray tracing for Lambda functions"
+    AllowedValues: ["true", "false"]
+
+  EnableDetailedMetrics:
+    Type: String
+    Default: "true"
+    Description: "Enable detailed CloudWatch metrics for API Gateway"
+    AllowedValues: ["true", "false"]
+
+  CreateCloudWatchDashboard:
+    Type: String
+    Default: "true"
+    Description: "Create CloudWatch dashboard for monitoring"
+    AllowedValues: ["true", "false"]
+
+# Conditions for conditional resource creation
+Conditions:
+  IsProvisionedBilling: !Equals [!Ref BillingMode, "PROVISIONED"]
+  EnableXRay: !Equals [!Ref EnableXRayTracing, "true"]
+  EnableMetrics: !Equals [!Ref EnableDetailedMetrics, "true"]
+  CreateDashboard: !Equals [!Ref CreateCloudWatchDashboard, "true"]
+  IsProdStage: !Equals [!Ref StageName, "prod"]
+
+# AWS Resources
+Resources:
+  # DynamoDB Table for storing user data
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-${TableName}"
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: !Ref BillingMode
+      # Conditional provisioned throughput
+      ProvisionedThroughput: !If
+        - IsProvisionedBilling
+        - ReadCapacityUnits: !Ref ReadCapacityUnits
+          WriteCapacityUnits: !Ref WriteCapacityUnits
+        - !Ref AWS::NoValue
+      # Enable point-in-time recovery for production
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProdStage, true, false]
+      # Server-side encryption
+      SSESpecification:
+        SSEEnabled: true
+      # Tags for resource management
+      Tags:
+        - Key: Project
+          Value: !Ref AWS::StackName
+        - Key: Environment
+          Value: !Ref StageName
+        - Key: Purpose
+          Value: "Serverless API User Storage"
+
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-lambda-execution-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        # X-Ray permissions if tracing is enabled
+        - !If
+          - EnableXRay
+          - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+          - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                Resource: !GetAtt UsersTable.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref AWS::StackName
+        - Key: Environment
+          Value: !Ref StageName
+
+  # CloudWatch Log Groups for Lambda Functions
+  ListUsersLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-list-users"
+      RetentionInDays: !Ref LogRetentionDays
+
+  CreateUserLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-create-user"
+      RetentionInDays: !Ref LogRetentionDays
+
+  GetUserLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-get-user"
+      RetentionInDays: !Ref LogRetentionDays
+
+  UpdateUserLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-update-user"
+      RetentionInDays: !Ref LogRetentionDays
+
+  DeleteUserLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-delete-user"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # Lambda Function: List Users (GET /users)
+  ListUsersFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-list-users"
+      Description: "List all users from DynamoDB table"
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      TracingConfig:
+        Mode: !If [EnableXRay, "Active", "PassThrough"]
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref UsersTable
+          CORS_ALLOW_ORIGIN: !Ref CorsOrigin
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from botocore.exceptions import ClientError
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['DYNAMODB_TABLE'])
+
+          def create_response(status_code, body):
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': os.environ.get('CORS_ALLOW_ORIGIN', '*'),
+                      'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                      'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                  },
+                  'body': json.dumps(body) if isinstance(body, (dict, list)) else body
+              }
+
+          def lambda_handler(event, context):
+              try:
+                  response = table.scan()
+                  users = response.get('Items', [])
+                  
+                  # Handle pagination
+                  while 'LastEvaluatedKey' in response:
+                      response = table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
+                      users.extend(response.get('Items', []))
+                  
+                  return create_response(200, users)
+                  
+              except ClientError as e:
+                  print(f"DynamoDB error: {e}")
+                  return create_response(500, {'error': 'Internal server error'})
+              except Exception as e:
+                  print(f"Unexpected error: {e}")
+                  return create_response(500, {'error': 'Internal server error'})
+      Tags:
+        - Key: Project
+          Value: !Ref AWS::StackName
+        - Key: Environment
+          Value: !Ref StageName
+        - Key: Function
+          Value: "ListUsers"
+
+  # Lambda Function: Create User (POST /users)
+  CreateUserFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-create-user"
+      Description: "Create a new user in DynamoDB table"
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      TracingConfig:
+        Mode: !If [EnableXRay, "Active", "PassThrough"]
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref UsersTable
+          CORS_ALLOW_ORIGIN: !Ref CorsOrigin
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          from datetime import datetime
+          from botocore.exceptions import ClientError
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['DYNAMODB_TABLE'])
+
+          def create_response(status_code, body):
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': os.environ.get('CORS_ALLOW_ORIGIN', '*'),
+                      'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                      'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                  },
+                  'body': json.dumps(body) if isinstance(body, (dict, list)) else body
+              }
+
+          def lambda_handler(event, context):
+              try:
+                  body = json.loads(event.get('body', '{}'))
+                  
+                  # Validate required fields
+                  if not body.get('name') or not body.get('email'):
+                      return create_response(400, {'error': 'Name and email are required'})
+                  
+                  # Generate user ID and timestamp
+                  user_id = str(uuid.uuid4())
+                  timestamp = datetime.utcnow().isoformat()
+                  
+                  # Create user item
+                  user_item = {
+                      'id': user_id,
+                      'name': body['name'],
+                      'email': body['email'],
+                      'created_at': timestamp,
+                      'updated_at': timestamp
+                  }
+                  
+                  # Optional fields
+                  if body.get('age'):
+                      user_item['age'] = int(body['age'])
+                  
+                  # Put item in DynamoDB
+                  table.put_item(Item=user_item)
+                  
+                  return create_response(201, user_item)
+                  
+              except json.JSONDecodeError:
+                  return create_response(400, {'error': 'Invalid JSON in request body'})
+              except ClientError as e:
+                  print(f"DynamoDB error: {e}")
+                  return create_response(500, {'error': 'Internal server error'})
+              except Exception as e:
+                  print(f"Unexpected error: {e}")
+                  return create_response(500, {'error': 'Internal server error'})
+      Tags:
+        - Key: Project
+          Value: !Ref AWS::StackName
+        - Key: Environment
+          Value: !Ref StageName
+        - Key: Function
+          Value: "CreateUser"
+
+  # Lambda Function: Get User (GET /users/{id})
+  GetUserFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-get-user"
+      Description: "Get a specific user by ID from DynamoDB table"
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      TracingConfig:
+        Mode: !If [EnableXRay, "Active", "PassThrough"]
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref UsersTable
+          CORS_ALLOW_ORIGIN: !Ref CorsOrigin
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from botocore.exceptions import ClientError
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['DYNAMODB_TABLE'])
+
+          def create_response(status_code, body):
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': os.environ.get('CORS_ALLOW_ORIGIN', '*'),
+                      'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                      'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                  },
+                  'body': json.dumps(body) if isinstance(body, (dict, list)) else body
+              }
+
+          def lambda_handler(event, context):
+              try:
+                  user_id = event['pathParameters']['id']
+                  
+                  response = table.get_item(Key={'id': user_id})
+                  
+                  if 'Item' not in response:
+                      return create_response(404, {'error': 'User not found'})
+                  
+                  return create_response(200, response['Item'])
+                  
+              except KeyError:
+                  return create_response(400, {'error': 'User ID is required'})
+              except ClientError as e:
+                  print(f"DynamoDB error: {e}")
+                  return create_response(500, {'error': 'Internal server error'})
+              except Exception as e:
+                  print(f"Unexpected error: {e}")
+                  return create_response(500, {'error': 'Internal server error'})
+      Tags:
+        - Key: Project
+          Value: !Ref AWS::StackName
+        - Key: Environment
+          Value: !Ref StageName
+        - Key: Function
+          Value: "GetUser"
+
+  # Lambda Function: Update User (PUT /users/{id})
+  UpdateUserFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-update-user"
+      Description: "Update a specific user by ID in DynamoDB table"
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      TracingConfig:
+        Mode: !If [EnableXRay, "Active", "PassThrough"]
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref UsersTable
+          CORS_ALLOW_ORIGIN: !Ref CorsOrigin
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          from botocore.exceptions import ClientError
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['DYNAMODB_TABLE'])
+
+          def create_response(status_code, body):
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': os.environ.get('CORS_ALLOW_ORIGIN', '*'),
+                      'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                      'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                  },
+                  'body': json.dumps(body) if isinstance(body, (dict, list)) else body
+              }
+
+          def lambda_handler(event, context):
+              try:
+                  user_id = event['pathParameters']['id']
+                  body = json.loads(event.get('body', '{}'))
+                  
+                  # Check if user exists
+                  response = table.get_item(Key={'id': user_id})
+                  if 'Item' not in response:
+                      return create_response(404, {'error': 'User not found'})
+                  
+                  # Build update expression
+                  update_expression = "SET updated_at = :timestamp"
+                  expression_values = {':timestamp': datetime.utcnow().isoformat()}
+                  expression_names = {}
+                  
+                  if body.get('name'):
+                      update_expression += ", #name = :name"
+                      expression_values[':name'] = body['name']
+                      expression_names['#name'] = 'name'
+                  
+                  if body.get('email'):
+                      update_expression += ", email = :email"
+                      expression_values[':email'] = body['email']
+                  
+                  if body.get('age'):
+                      update_expression += ", age = :age"
+                      expression_values[':age'] = int(body['age'])
+                  
+                  # Update item
+                  response = table.update_item(
+                      Key={'id': user_id},
+                      UpdateExpression=update_expression,
+                      ExpressionAttributeNames=expression_names if expression_names else None,
+                      ExpressionAttributeValues=expression_values,
+                      ReturnValues='ALL_NEW'
+                  )
+                  
+                  return create_response(200, response['Attributes'])
+                  
+              except KeyError:
+                  return create_response(400, {'error': 'User ID is required'})
+              except json.JSONDecodeError:
+                  return create_response(400, {'error': 'Invalid JSON in request body'})
+              except ClientError as e:
+                  print(f"DynamoDB error: {e}")
+                  return create_response(500, {'error': 'Internal server error'})
+              except Exception as e:
+                  print(f"Unexpected error: {e}")
+                  return create_response(500, {'error': 'Internal server error'})
+      Tags:
+        - Key: Project
+          Value: !Ref AWS::StackName
+        - Key: Environment
+          Value: !Ref StageName
+        - Key: Function
+          Value: "UpdateUser"
+
+  # Lambda Function: Delete User (DELETE /users/{id})
+  DeleteUserFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-delete-user"
+      Description: "Delete a specific user by ID from DynamoDB table"
+      Runtime: !Ref LambdaRuntime
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      TracingConfig:
+        Mode: !If [EnableXRay, "Active", "PassThrough"]
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref UsersTable
+          CORS_ALLOW_ORIGIN: !Ref CorsOrigin
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from botocore.exceptions import ClientError
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['DYNAMODB_TABLE'])
+
+          def create_response(status_code, body):
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': os.environ.get('CORS_ALLOW_ORIGIN', '*'),
+                      'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                      'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                  },
+                  'body': json.dumps(body) if isinstance(body, (dict, list)) else body
+              }
+
+          def lambda_handler(event, context):
+              try:
+                  user_id = event['pathParameters']['id']
+                  
+                  # Check if user exists
+                  response = table.get_item(Key={'id': user_id})
+                  if 'Item' not in response:
+                      return create_response(404, {'error': 'User not found'})
+                  
+                  # Delete item
+                  table.delete_item(Key={'id': user_id})
+                  
+                  return create_response(204, '')
+                  
+              except KeyError:
+                  return create_response(400, {'error': 'User ID is required'})
+              except ClientError as e:
+                  print(f"DynamoDB error: {e}")
+                  return create_response(500, {'error': 'Internal server error'})
+              except Exception as e:
+                  print(f"Unexpected error: {e}")
+                  return create_response(500, {'error': 'Internal server error'})
+      Tags:
+        - Key: Project
+          Value: !Ref AWS::StackName
+        - Key: Environment
+          Value: !Ref StageName
+        - Key: Function
+          Value: "DeleteUser"
+
+  # API Gateway REST API
+  UsersApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Ref ApiName
+      Description: !Ref ApiDescription
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      # Enable request validation
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: "execute-api:Invoke"
+            Resource: "*"
+      Tags:
+        - Key: Project
+          Value: !Ref AWS::StackName
+        - Key: Environment
+          Value: !Ref StageName
+
+  # API Gateway: /users Resource
+  UsersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref UsersApi
+      ParentId: !GetAtt UsersApi.RootResourceId
+      PathPart: users
+
+  # API Gateway: /users/{id} Resource
+  UserByIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref UsersApi
+      ParentId: !Ref UsersResource
+      PathPart: "{id}"
+
+  # OPTIONS Method for CORS preflight (users collection)
+  UsersOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UsersApi
+      ResourceId: !Ref UsersResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: !Sub "'${CorsOrigin}'"
+            ResponseTemplates:
+              application/json: ""
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+
+  # OPTIONS Method for CORS preflight (individual user)
+  UserByIdOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UsersApi
+      ResourceId: !Ref UserByIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: !Sub "'${CorsOrigin}'"
+            ResponseTemplates:
+              application/json: ""
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+
+  # GET /users Method
+  ListUsersMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UsersApi
+      ResourceId: !Ref UsersResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ListUsersFunction.Arn}/invocations"
+
+  # POST /users Method
+  CreateUserMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UsersApi
+      ResourceId: !Ref UsersResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      RequestValidatorId: !Ref RequestValidator
+      RequestModels:
+        application/json: !Ref CreateUserModel
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CreateUserFunction.Arn}/invocations"
+
+  # GET /users/{id} Method
+  GetUserMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UsersApi
+      ResourceId: !Ref UserByIdResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.id: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetUserFunction.Arn}/invocations"
+
+  # PUT /users/{id} Method
+  UpdateUserMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UsersApi
+      ResourceId: !Ref UserByIdResource
+      HttpMethod: PUT
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.id: true
+      RequestValidatorId: !Ref RequestValidator
+      RequestModels:
+        application/json: !Ref UpdateUserModel
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UpdateUserFunction.Arn}/invocations"
+
+  # DELETE /users/{id} Method
+  DeleteUserMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UsersApi
+      ResourceId: !Ref UserByIdResource
+      HttpMethod: DELETE
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.id: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DeleteUserFunction.Arn}/invocations"
+
+  # Request Validator
+  RequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      RestApiId: !Ref UsersApi
+      ValidateRequestBody: true
+      ValidateRequestParameters: true
+
+  # Request Models for validation
+  CreateUserModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref UsersApi
+      ContentType: application/json
+      Name: CreateUserModel
+      Schema:
+        $schema: http://json-schema.org/draft-04/schema#
+        title: Create User Schema
+        type: object
+        properties:
+          name:
+            type: string
+            minLength: 1
+            maxLength: 100
+          email:
+            type: string
+            format: email
+            maxLength: 255
+          age:
+            type: integer
+            minimum: 0
+            maximum: 150
+        required:
+          - name
+          - email
+        additionalProperties: false
+
+  UpdateUserModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref UsersApi
+      ContentType: application/json
+      Name: UpdateUserModel
+      Schema:
+        $schema: http://json-schema.org/draft-04/schema#
+        title: Update User Schema
+        type: object
+        properties:
+          name:
+            type: string
+            minLength: 1
+            maxLength: 100
+          email:
+            type: string
+            format: email
+            maxLength: 255
+          age:
+            type: integer
+            minimum: 0
+            maximum: 150
+        additionalProperties: false
+
+  # Lambda Permissions for API Gateway
+  ListUsersPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ListUsersFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UsersApi}/*/*"
+
+  CreateUserPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CreateUserFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UsersApi}/*/*"
+
+  GetUserPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetUserFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UsersApi}/*/*"
+
+  UpdateUserPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UpdateUserFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UsersApi}/*/*"
+
+  DeleteUserPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DeleteUserFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UsersApi}/*/*"
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ListUsersMethod
+      - CreateUserMethod
+      - GetUserMethod
+      - UpdateUserMethod
+      - DeleteUserMethod
+      - UsersOptionsMethod
+      - UserByIdOptionsMethod
+    Properties:
+      RestApiId: !Ref UsersApi
+      Description: !Sub "Deployment for ${StageName} stage"
+
+  # API Gateway Stage
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref UsersApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref StageName
+      Description: !Sub "${StageName} stage for Users API"
+      # Enable detailed metrics if requested
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          MetricsEnabled: !If [EnableMetrics, true, false]
+          DataTraceEnabled: !If [EnableMetrics, true, false]
+          LoggingLevel: !If [EnableMetrics, "INFO", "OFF"]
+      # X-Ray tracing
+      TracingEnabled: !If [EnableXRay, true, false]
+      Tags:
+        - Key: Project
+          Value: !Ref AWS::StackName
+        - Key: Environment
+          Value: !Ref StageName
+
+  # CloudWatch Dashboard (optional)
+  ApiDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateDashboard
+    Properties:
+      DashboardName: !Sub "${AWS::StackName}-api-dashboard"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApiGateway", "Count", "ApiName", "${ApiName}", "Stage", "${StageName}" ],
+                  [ ".", "Latency", ".", ".", ".", "." ],
+                  [ ".", "4XXError", ".", ".", ".", "." ],
+                  [ ".", "5XXError", ".", ".", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "API Gateway Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${ListUsersFunction}" ],
+                  [ ".", ".", ".", "${CreateUserFunction}" ],
+                  [ ".", ".", ".", "${GetUserFunction}" ],
+                  [ ".", ".", ".", "${UpdateUserFunction}" ],
+                  [ ".", ".", ".", "${DeleteUserFunction}" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Duration",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${UsersTable}" ],
+                  [ ".", "ConsumedWriteCapacityUnits", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "DynamoDB Capacity Usage",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+# Stack Outputs
+Outputs:
+  ApiGatewayUrl:
+    Description: "Root URL of the API Gateway"
+    Value: !Sub "https://${UsersApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/"
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiUrl"
+
+  ApiId:
+    Description: "API Gateway ID"
+    Value: !Ref UsersApi
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiId"
+
+  UsersTableName:
+    Description: "DynamoDB Users table name"
+    Value: !Ref UsersTable
+    Export:
+      Name: !Sub "${AWS::StackName}-TableName"
+
+  UsersTableArn:
+    Description: "DynamoDB Users table ARN"
+    Value: !GetAtt UsersTable.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-TableArn"
+
+  LambdaExecutionRoleArn:
+    Description: "Lambda execution role ARN"
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaRoleArn"
+
+  # Individual Lambda Function ARNs
+  ListUsersFunctionArn:
+    Description: "List Users Lambda function ARN"
+    Value: !GetAtt ListUsersFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ListUsersArn"
+
+  CreateUserFunctionArn:
+    Description: "Create User Lambda function ARN"
+    Value: !GetAtt CreateUserFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CreateUserArn"
+
+  GetUserFunctionArn:
+    Description: "Get User Lambda function ARN"
+    Value: !GetAtt GetUserFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-GetUserArn"
+
+  UpdateUserFunctionArn:
+    Description: "Update User Lambda function ARN"
+    Value: !GetAtt UpdateUserFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-UpdateUserArn"
+
+  DeleteUserFunctionArn:
+    Description: "Delete User Lambda function ARN"
+    Value: !GetAtt DeleteUserFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-DeleteUserArn"
+
+  # Monitoring Resources
+  CloudWatchDashboardUrl:
+    Condition: CreateDashboard
+    Description: "CloudWatch Dashboard URL"
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-api-dashboard"
+
+  # Example curl commands for testing
+  TestCommands:
+    Description: "Example API test commands"
+    Value: !Sub |
+      # List all users
+      curl "${UsersApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/users"
+      
+      # Create a user
+      curl -X POST "${UsersApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/users" \
+           -H "Content-Type: application/json" \
+           -d '{"name": "John Doe", "email": "john@example.com", "age": 30}'
+      
+      # Get a user (replace USER_ID with actual ID)
+      curl "${UsersApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/users/USER_ID"
+      
+      # Update a user (replace USER_ID with actual ID)
+      curl -X PUT "${UsersApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/users/USER_ID" \
+           -H "Content-Type: application/json" \
+           -d '{"name": "Jane Doe", "age": 31}'
+      
+      # Delete a user (replace USER_ID with actual ID)
+      curl -X DELETE "${UsersApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/users/USER_ID"

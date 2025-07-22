@@ -1,0 +1,1018 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Automated Report Generation with EventBridge Scheduler and S3
+  Creates a serverless solution for scheduled report generation using EventBridge Scheduler,
+  Lambda, S3, and SES. This template deploys all required infrastructure for automated
+  business reporting with email distribution capabilities.
+
+Parameters:
+  # Environment Configuration
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, prod]
+    Description: Environment name for resource tagging and naming
+    
+  ProjectName:
+    Type: String
+    Default: automated-reports
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z0-9-]+$'
+    Description: Project name for resource naming (lowercase alphanumeric and hyphens only)
+    ConstraintDescription: Must be 3-20 characters, lowercase letters, numbers, and hyphens only
+
+  # Email Configuration
+  ReportEmailAddress:
+    Type: String
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    Description: Email address for receiving reports (must be verified in SES)
+    ConstraintDescription: Must be a valid email address format
+
+  # Scheduling Configuration
+  ReportSchedule:
+    Type: String
+    Default: 'cron(0 9 * * ? *)'
+    Description: EventBridge schedule expression for report generation (default daily at 9 AM UTC)
+    AllowedPattern: '^(cron|rate)\(.+\)$'
+    ConstraintDescription: Must be a valid EventBridge schedule expression
+
+  # Lambda Configuration
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 30
+    MaxValue: 900
+    Description: Lambda function timeout in seconds (30-900)
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+    Description: Lambda function memory allocation in MB
+
+  # S3 Configuration
+  S3DataRetentionDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    MaxValue: 365
+    Description: Number of days to retain data files in S3 (1-365)
+
+  S3ReportRetentionDays:
+    Type: Number
+    Default: 365
+    MinValue: 30
+    MaxValue: 2555
+    Description: Number of days to retain generated reports in S3 (30-2555)
+
+  # Cost Control
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable detailed CloudWatch monitoring (additional costs apply)
+
+Conditions:
+  # Environment-based conditions
+  IsProduction: !Equals [!Ref Environment, prod]
+  IsDetailedMonitoringEnabled: !Equals [!Ref EnableDetailedMonitoring, 'true']
+  
+  # Feature conditions based on environment
+  EnableVersioning: !Or [!Equals [!Ref Environment, prod], !Equals [!Ref Environment, test]]
+  EnableEncryption: !Equals [!Ref Environment, prod]
+
+Mappings:
+  # Region-specific configurations
+  RegionMap:
+    us-east-1:
+      AvailabilityZones: 3
+    us-west-2:
+      AvailabilityZones: 3
+    eu-west-1:
+      AvailabilityZones: 3
+    ap-southeast-1:
+      AvailabilityZones: 3
+
+Resources:
+  # =============================================================================
+  # S3 BUCKETS FOR DATA STORAGE
+  # =============================================================================
+  
+  # S3 Bucket for Source Data Storage
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-data-${Environment}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [EnableVersioning, Enabled, Suspended]
+      LifecycleConfiguration:
+        Rules:
+          - Id: DataRetentionRule
+            Status: Enabled
+            ExpirationInDays: !Ref S3DataRetentionDays
+            NoncurrentVersionExpirationInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchEventConfigurations:
+          - Event: 's3:ObjectCreated:*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: DataStorage
+        - Key: CostCenter
+          Value: Reporting
+
+  # S3 Bucket for Generated Reports
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-reports-${Environment}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [EnableVersioning, Enabled, Suspended]
+      LifecycleConfiguration:
+        Rules:
+          - Id: ReportRetentionRule
+            Status: Enabled
+            ExpirationInDays: !Ref S3ReportRetentionDays
+            NoncurrentVersionExpirationInDays: 90
+          - Id: IncompleteMultipartUploadsRule
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: ReportStorage
+        - Key: CostCenter
+          Value: Reporting
+
+  # =============================================================================
+  # IAM ROLES AND POLICIES
+  # =============================================================================
+
+  # IAM Role for Lambda Function Execution
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref AWS::Region
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${DataBucket}/*'
+                  - !Sub '${ReportsBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !GetAtt ReportsBucket.Arn
+        - PolicyName: SESEmailPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                  - ses:GetIdentityVerificationAttributes
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'ses:FromAddress': !Ref ReportEmailAddress
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: LambdaExecution
+
+  # IAM Role for EventBridge Scheduler
+  SchedulerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-scheduler-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref AWS::Region
+      Policies:
+        - PolicyName: LambdaInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt ReportGeneratorFunction.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: SchedulerExecution
+
+  # =============================================================================
+  # LAMBDA FUNCTION FOR REPORT GENERATION
+  # =============================================================================
+
+  # CloudWatch Log Group for Lambda Function
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-report-generator-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 14]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: LambdaLogs
+
+  # Lambda Function for Report Generation
+  ReportGeneratorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-report-generator-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrencyLimit: !If [IsProduction, 10, 2]
+      Environment:
+        Variables:
+          DATA_BUCKET: !Ref DataBucket
+          REPORTS_BUCKET: !Ref ReportsBucket
+          EMAIL_ADDRESS: !Ref ReportEmailAddress
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      DeadLetterConfig:
+        TargetArn: !GetAtt ErrorNotificationTopic.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import csv
+          import json
+          import os
+          from datetime import datetime
+          from email.mime.multipart import MIMEMultipart
+          from email.mime.text import MIMEText
+          from email.mime.base import MIMEBase
+          from email import encoders
+          import io
+          import logging
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              """
+              Main Lambda handler for automated report generation.
+              Processes data from S3, generates business reports, and sends via email.
+              """
+              s3 = boto3.client('s3')
+              ses = boto3.client('ses')
+              
+              # Get environment variables
+              data_bucket = os.environ['DATA_BUCKET']
+              reports_bucket = os.environ['REPORTS_BUCKET']
+              email_address = os.environ['EMAIL_ADDRESS']
+              environment = os.environ.get('ENVIRONMENT', 'dev')
+              project_name = os.environ.get('PROJECT_NAME', 'automated-reports')
+              
+              try:
+                  logger.info(f"Starting report generation for environment: {environment}")
+                  
+                  # Initialize data containers
+                  sales_data = None
+                  inventory_data = None
+                  
+                  # Read sales data from S3 with error handling
+                  try:
+                      response = s3.get_object(Bucket=data_bucket, Key='sales/sample_sales.csv')
+                      sales_data = response['Body'].read().decode('utf-8')
+                      logger.info("Successfully retrieved sales data from S3")
+                  except s3.exceptions.NoSuchKey:
+                      logger.warning("Sales data file not found, creating sample data")
+                      sales_data = create_sample_sales_data()
+                      s3.put_object(
+                          Bucket=data_bucket,
+                          Key='sales/sample_sales.csv',
+                          Body=sales_data,
+                          ContentType='text/csv'
+                      )
+                  
+                  # Read inventory data from S3 with error handling
+                  try:
+                      response = s3.get_object(Bucket=data_bucket, Key='inventory/sample_inventory.csv')
+                      inventory_data = response['Body'].read().decode('utf-8')
+                      logger.info("Successfully retrieved inventory data from S3")
+                  except s3.exceptions.NoSuchKey:
+                      logger.warning("Inventory data file not found, creating sample data")
+                      inventory_data = create_sample_inventory_data()
+                      s3.put_object(
+                          Bucket=data_bucket,
+                          Key='inventory/sample_inventory.csv',
+                          Body=inventory_data,
+                          ContentType='text/csv'
+                      )
+                  
+                  # Generate comprehensive business report
+                  report_content = generate_report(sales_data, inventory_data)
+                  logger.info("Report generation completed successfully")
+                  
+                  # Save report to S3 with metadata
+                  timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                  report_key = f"reports/daily_report_{timestamp}.csv"
+                  
+                  s3.put_object(
+                      Bucket=reports_bucket,
+                      Key=report_key,
+                      Body=report_content,
+                      ContentType='text/csv',
+                      Metadata={
+                          'GeneratedBy': 'AutomatedReportingSystem',
+                          'Environment': environment,
+                          'ProjectName': project_name,
+                          'ReportType': 'DailyBusinessReport',
+                          'GenerationTimestamp': timestamp
+                      },
+                      ServerSideEncryption='AES256'
+                  )
+                  logger.info(f"Report saved to S3: {report_key}")
+                  
+                  # Send email notification with report attachment
+                  send_email_report(ses, email_address, report_content, report_key, environment)
+                  logger.info("Email notification sent successfully")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Report generated successfully',
+                          'reportKey': report_key,
+                          'timestamp': timestamp,
+                          'environment': environment
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error generating report: {str(e)}", exc_info=True)
+                  
+                  # Send error notification
+                  try:
+                      send_error_notification(ses, email_address, str(e), environment)
+                  except:
+                      logger.error("Failed to send error notification")
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': f'Error generating report: {str(e)}',
+                          'environment': environment
+                      })
+                  }
+          
+          def create_sample_sales_data():
+              """Create sample sales data for demonstration purposes."""
+              return """Date,Product,Sales,Region
+          2025-01-01,Product A,1000,North
+          2025-01-01,Product B,1500,South
+          2025-01-02,Product A,1200,North
+          2025-01-02,Product B,800,South
+          2025-01-03,Product A,1100,North
+          2025-01-03,Product B,1300,South"""
+          
+          def create_sample_inventory_data():
+              """Create sample inventory data for demonstration purposes."""
+              return """Product,Stock,Warehouse,Last_Updated
+          Product A,250,Warehouse 1,2025-01-03
+          Product B,180,Warehouse 1,2025-01-03
+          Product A,300,Warehouse 2,2025-01-03
+          Product B,220,Warehouse 2,2025-01-03"""
+          
+          def generate_report(sales_data, inventory_data):
+              """
+              Generate comprehensive business report from sales and inventory data.
+              Includes data aggregation, calculations, and business insights.
+              """
+              try:
+                  # Process sales data and calculate totals
+                  sales_reader = csv.DictReader(io.StringIO(sales_data))
+                  sales_summary = {}
+                  total_sales = 0
+                  
+                  for row in sales_reader:
+                      product = row['Product']
+                      sales = int(row['Sales'])
+                      total_sales += sales
+                      if product not in sales_summary:
+                          sales_summary[product] = 0
+                      sales_summary[product] += sales
+                  
+                  # Process inventory data and calculate totals
+                  inventory_reader = csv.DictReader(io.StringIO(inventory_data))
+                  inventory_summary = {}
+                  total_inventory = 0
+                  
+                  for row in inventory_reader:
+                      product = row['Product']
+                      stock = int(row['Stock'])
+                      total_inventory += stock
+                      if product not in inventory_summary:
+                          inventory_summary[product] = 0
+                      inventory_summary[product] += stock
+                  
+                  # Generate combined business report with insights
+                  output = io.StringIO()
+                  writer = csv.writer(output)
+                  
+                  # Header with metadata
+                  writer.writerow(['# Daily Business Report Generated on', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+                  writer.writerow(['# Total Sales Value:', f'${total_sales:,}'])
+                  writer.writerow(['# Total Inventory Units:', f'{total_inventory:,}'])
+                  writer.writerow([''])
+                  
+                  # Main report data
+                  writer.writerow(['Product', 'Total Sales', 'Total Inventory', 'Sales Ratio', 'Status'])
+                  
+                  for product in sales_summary:
+                      total_sales_product = sales_summary[product]
+                      total_inventory_product = inventory_summary.get(product, 0)
+                      sales_ratio = total_sales_product / total_inventory_product if total_inventory_product > 0 else 0
+                      
+                      # Business logic for status determination
+                      if sales_ratio > 5:
+                          status = "High Demand - Consider Restocking"
+                      elif sales_ratio > 2:
+                          status = "Normal Demand"
+                      elif sales_ratio > 0.5:
+                          status = "Low Demand"
+                      else:
+                          status = "Very Low Demand - Review Product"
+                      
+                      writer.writerow([
+                          product,
+                          f'${total_sales_product:,}',
+                          f'{total_inventory_product:,}',
+                          f'{sales_ratio:.2f}',
+                          status
+                      ])
+                  
+                  return output.getvalue()
+                  
+              except Exception as e:
+                  logger.error(f"Error in report generation: {str(e)}")
+                  raise
+          
+          def send_email_report(ses, email_address, report_content, report_key, environment):
+              """
+              Send email notification with report attachment and business insights.
+              """
+              try:
+                  subject = f"Daily Business Report - {datetime.now().strftime('%Y-%m-%d')} [{environment.upper()}]"
+                  
+                  msg = MIMEMultipart()
+                  msg['From'] = email_address
+                  msg['To'] = email_address
+                  msg['Subject'] = subject
+                  
+                  # Extract key metrics for email body
+                  lines = report_content.split('\n')
+                  total_sales = next((line.split(':')[1].strip() for line in lines if 'Total Sales Value' in line), 'N/A')
+                  total_inventory = next((line.split(':')[1].strip() for line in lines if 'Total Inventory Units' in line), 'N/A')
+                  
+                  body = f"""
+          Dear Team,
+          
+          Please find attached the daily business report generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.
+          
+          📊 Key Metrics Summary:
+          • Total Sales Value: {total_sales}
+          • Total Inventory Units: {total_inventory}
+          • Environment: {environment.upper()}
+          
+          📋 Report Contents:
+          • Sales summary by product
+          • Current inventory levels
+          • Sales ratio analysis
+          • Business status recommendations
+          
+          📁 Storage Location:
+          This report has been automatically stored in S3 at: {report_key}
+          
+          🔍 Next Steps:
+          • Review high-demand products for restocking opportunities
+          • Analyze low-demand products for potential promotions
+          • Monitor inventory levels for optimal stock management
+          
+          This report was automatically generated by the Automated Reporting System.
+          For questions or support, please contact your system administrator.
+          
+          Best regards,
+          Automated Reporting System
+          Environment: {environment.upper()}
+          """
+                  
+                  msg.attach(MIMEText(body, 'plain'))
+                  
+                  # Attach CSV report with proper encoding
+                  attachment = MIMEBase('application', 'octet-stream')
+                  attachment.set_payload(report_content.encode('utf-8'))
+                  encoders.encode_base64(attachment)
+                  attachment.add_header(
+                      'Content-Disposition',
+                      f'attachment; filename=daily_business_report_{datetime.now().strftime("%Y%m%d")}.csv'
+                  )
+                  msg.attach(attachment)
+                  
+                  # Send email using SES with proper error handling
+                  response = ses.send_raw_email(
+                      Source=email_address,
+                      Destinations=[email_address],
+                      RawMessage={'Data': msg.as_string()}
+                  )
+                  
+                  logger.info(f"Email sent successfully. MessageId: {response['MessageId']}")
+                  
+              except Exception as e:
+                  logger.error(f"Error sending email: {str(e)}")
+                  raise
+          
+          def send_error_notification(ses, email_address, error_message, environment):
+              """Send error notification email to administrators."""
+              try:
+                  subject = f"Report Generation Error - {environment.upper()} - {datetime.now().strftime('%Y-%m-%d')}"
+                  
+                  body = f"""
+          Alert: Report Generation Failure
+          
+          An error occurred during automated report generation:
+          
+          Environment: {environment.upper()}
+          Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+          Error Details: {error_message}
+          
+          Please investigate and resolve the issue.
+          
+          Automated Reporting System
+          """
+                  
+                  ses.send_email(
+                      Source=email_address,
+                      Destination={'ToAddresses': [email_address]},
+                      Message={
+                          'Subject': {'Data': subject},
+                          'Body': {'Text': {'Data': body}}
+                      }
+                  )
+                  
+              except Exception as e:
+                  logger.error(f"Failed to send error notification: {str(e)}")
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: ReportGeneration
+
+  # =============================================================================
+  # EVENTBRIDGE SCHEDULER FOR AUTOMATION
+  # =============================================================================
+
+  # EventBridge Schedule for Automated Report Generation
+  ReportSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${ProjectName}-daily-reports-${Environment}'
+      Description: !Sub 'Automated daily report generation for ${ProjectName} in ${Environment}'
+      State: ENABLED
+      ScheduleExpression: !Ref ReportSchedule
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !GetAtt ReportGeneratorFunction.Arn
+        RoleArn: !GetAtt SchedulerExecutionRole.Arn
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAge: 3600
+        DeadLetterConfig:
+          Arn: !GetAtt ErrorNotificationTopic.Arn
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+        Purpose: ReportScheduling
+
+  # =============================================================================
+  # SNS FOR ERROR NOTIFICATIONS
+  # =============================================================================
+
+  # SNS Topic for Error Notifications and Dead Letter Queue
+  ErrorNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-error-notifications-${Environment}'
+      DisplayName: !Sub 'Error Notifications for ${ProjectName}'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: ErrorNotification
+
+  # SNS Subscription for Error Email Notifications
+  ErrorEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref ErrorNotificationTopic
+      Endpoint: !Ref ReportEmailAddress
+      FilterPolicy:
+        error_type:
+          - lambda_failure
+          - scheduler_failure
+
+  # =============================================================================
+  # CLOUDWATCH MONITORING AND ALARMS
+  # =============================================================================
+
+  # CloudWatch Alarm for Lambda Function Errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsDetailedMonitoringEnabled
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors-${Environment}'
+      AlarmDescription: 'Alert when Lambda function errors exceed threshold'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ReportGeneratorFunction
+      AlarmActions:
+        - !Ref ErrorNotificationTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarm for Lambda Function Duration
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsDetailedMonitoringEnabled
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-duration-${Environment}'
+      AlarmDescription: 'Alert when Lambda function duration approaches timeout'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Sub
+        - '${TimeoutMilliseconds}'
+        - TimeoutMilliseconds: !Ref LambdaTimeout
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ReportGeneratorFunction
+      AlarmActions:
+        - !Ref ErrorNotificationTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch Dashboard for Monitoring
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: IsDetailedMonitoringEnabled
+    Properties:
+      DashboardName: !Sub '${ProjectName}-monitoring-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${ReportGeneratorFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "BucketSizeBytes", "BucketName", "${DataBucket}", "StorageType", "StandardStorage" ],
+                  [ "...", "${ReportsBucket}", ".", "." ]
+                ],
+                "period": 86400,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "S3 Bucket Sizes",
+                "view": "timeSeries"
+              }
+            }
+          ]
+        }
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+
+Outputs:
+  # S3 Bucket Information
+  DataBucketName:
+    Description: 'Name of the S3 bucket for storing source data'
+    Value: !Ref DataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBucket'
+
+  DataBucketArn:
+    Description: 'ARN of the S3 bucket for storing source data'
+    Value: !GetAtt DataBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBucketArn'
+
+  ReportsBucketName:
+    Description: 'Name of the S3 bucket for storing generated reports'
+    Value: !Ref ReportsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ReportsBucket'
+
+  ReportsBucketArn:
+    Description: 'ARN of the S3 bucket for storing generated reports'
+    Value: !GetAtt ReportsBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ReportsBucketArn'
+
+  # Lambda Function Information
+  LambdaFunctionName:
+    Description: 'Name of the report generator Lambda function'
+    Value: !Ref ReportGeneratorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the report generator Lambda function'
+    Value: !GetAtt ReportGeneratorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  # EventBridge Scheduler Information
+  ScheduleName:
+    Description: 'Name of the EventBridge schedule'
+    Value: !Ref ReportSchedule
+    Export:
+      Name: !Sub '${AWS::StackName}-Schedule'
+
+  ScheduleExpression:
+    Description: 'Schedule expression for report generation'
+    Value: !Ref ReportSchedule
+
+  # IAM Role Information
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaRole'
+
+  SchedulerExecutionRoleArn:
+    Description: 'ARN of the EventBridge Scheduler execution role'
+    Value: !GetAtt SchedulerExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SchedulerRole'
+
+  # Monitoring Information
+  ErrorNotificationTopicArn:
+    Description: 'ARN of the SNS topic for error notifications'
+    Value: !Ref ErrorNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-ErrorTopic'
+
+  LambdaLogGroupName:
+    Description: 'Name of the Lambda function CloudWatch log group'
+    Value: !Ref LambdaLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  # Configuration Information
+  EmailAddress:
+    Description: 'Email address configured for report delivery'
+    Value: !Ref ReportEmailAddress
+
+  Environment:
+    Description: 'Environment name for this deployment'
+    Value: !Ref Environment
+
+  ProjectName:
+    Description: 'Project name for this deployment'
+    Value: !Ref ProjectName
+
+  # Dashboard Information
+  DashboardURL:
+    Condition: IsDetailedMonitoringEnabled
+    Description: 'URL to the CloudWatch monitoring dashboard'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-monitoring-${Environment}'
+
+  # Usage Instructions
+  SampleDataUploadCommand:
+    Description: 'AWS CLI command to upload sample data to the data bucket'
+    Value: !Sub |
+      aws s3 cp your-data-file.csv s3://${DataBucket}/sales/
+      aws s3 cp your-inventory-file.csv s3://${ReportsBucket}/inventory/
+
+  ManualExecutionCommand:
+    Description: 'AWS CLI command to manually trigger report generation'
+    Value: !Sub 'aws lambda invoke --function-name ${ReportGeneratorFunction} --payload "{}" response.json'
+
+  SESVerificationCommand:
+    Description: 'AWS CLI command to verify email address in SES'
+    Value: !Sub 'aws ses verify-email-identity --email-address ${ReportEmailAddress}'
+
+# =============================================================================
+# METADATA
+# =============================================================================
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Email Configuration"
+        Parameters:
+          - ReportEmailAddress
+      - Label:
+          default: "Scheduling Configuration"
+        Parameters:
+          - ReportSchedule
+      - Label:
+          default: "Lambda Configuration"
+        Parameters:
+          - LambdaTimeout
+          - LambdaMemorySize
+      - Label:
+          default: "Storage Configuration"
+        Parameters:
+          - S3DataRetentionDays
+          - S3ReportRetentionDays
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - EnableDetailedMonitoring
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      ReportEmailAddress:
+        default: "Report Email Address"
+      ReportSchedule:
+        default: "Report Schedule Expression"
+      LambdaTimeout:
+        default: "Lambda Timeout (seconds)"
+      LambdaMemorySize:
+        default: "Lambda Memory Size (MB)"
+      S3DataRetentionDays:
+        default: "Data Retention (days)"
+      S3ReportRetentionDays:
+        default: "Report Retention (days)"
+      EnableDetailedMonitoring:
+        default: "Enable Detailed Monitoring"
+
+  AWS::CloudFormation::Designer:
+    Description: "Automated Report Generation with EventBridge Scheduler and S3"
+    
+  Documentation:
+    Description: |
+      This CloudFormation template creates a complete serverless automated reporting solution.
+      
+      Key Features:
+      - Automated report generation using EventBridge Scheduler
+      - Serverless compute with AWS Lambda
+      - Secure data storage with S3 encryption and lifecycle policies
+      - Email distribution via Amazon SES
+      - Comprehensive monitoring and error handling
+      - Production-ready security configurations
+      
+      Architecture Components:
+      - EventBridge Scheduler for precise timing control
+      - Lambda function for report processing and generation
+      - S3 buckets for data input and report output storage
+      - SNS for error notifications and dead letter queuing
+      - CloudWatch for monitoring and alerting
+      - IAM roles with least-privilege access
+      
+      Security Features:
+      - S3 server-side encryption with AES-256
+      - Public access blocking on all S3 buckets
+      - IAM roles with minimal required permissions
+      - VPC endpoints support (when deployed in VPC)
+      - CloudTrail integration for audit logging
+      
+      Cost Optimization:
+      - Serverless architecture for pay-per-use pricing
+      - S3 lifecycle policies for automatic data archival
+      - Lambda reserved concurrency to control costs
+      - Optional detailed monitoring to reduce CloudWatch costs
+      
+      Customization Options:
+      - Flexible scheduling expressions for any frequency
+      - Configurable retention policies for data and reports
+      - Environment-specific configurations
+      - Scalable memory and timeout settings for Lambda
+      - Optional enhanced monitoring and alerting

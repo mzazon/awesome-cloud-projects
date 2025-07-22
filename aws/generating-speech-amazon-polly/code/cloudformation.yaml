@@ -1,0 +1,608 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure for Generating Speech with Amazon Polly'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'polly-text-to-speech'
+    Description: 'Name prefix for all resources'
+    MinLength: 3
+    MaxLength: 30
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+
+  BucketName:
+    Type: String
+    Default: ''
+    Description: 'S3 bucket name for audio output (leave empty to auto-generate)'
+    MaxLength: 63
+    AllowedPattern: '^[a-z0-9.-]*$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, dots, and hyphens'
+
+  VoiceId:
+    Type: String
+    Default: 'Joanna'
+    Description: 'Default voice ID for speech synthesis'
+    AllowedValues:
+      - 'Joanna'
+      - 'Matthew'
+      - 'Amy'
+      - 'Brian'
+      - 'Emma'
+      - 'Justin'
+      - 'Kendra'
+      - 'Kimberly'
+      - 'Salli'
+      - 'Joey'
+      - 'Ivy'
+      - 'Ruth'
+      - 'Stephen'
+      - 'Aria'
+      - 'Ayanda'
+      - 'Lupe'
+      - 'Lea'
+      - 'Vicki'
+
+  VoiceEngine:
+    Type: String
+    Default: 'neural'
+    Description: 'Voice engine type for speech synthesis'
+    AllowedValues:
+      - 'neural'
+      - 'standard'
+
+  AudioFormat:
+    Type: String
+    Default: 'mp3'
+    Description: 'Default audio output format'
+    AllowedValues:
+      - 'mp3'
+      - 'ogg_vorbis'
+      - 'pcm'
+
+  EnableVersioning:
+    Type: String
+    Default: 'true'
+    Description: 'Enable S3 bucket versioning'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableLifecyclePolicy:
+    Type: String
+    Default: 'true'
+    Description: 'Enable lifecycle policy to manage audio file retention'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  AudioRetentionDays:
+    Type: Number
+    Default: 30
+    Description: 'Number of days to retain audio files'
+    MinValue: 1
+    MaxValue: 365
+
+  EnableServerSideEncryption:
+    Type: String
+    Default: 'true'
+    Description: 'Enable server-side encryption for S3 bucket'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableCloudWatchLogs:
+    Type: String
+    Default: 'true'
+    Description: 'Enable CloudWatch logs for monitoring'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for notifications (optional)'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]*@[a-zA-Z0-9.-]*\.[a-zA-Z]{2,}$|^$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+Conditions:
+  CreateBucketName: !Equals [!Ref BucketName, '']
+  EnableVersioningCondition: !Equals [!Ref EnableVersioning, 'true']
+  EnableLifecyclePolicyCondition: !Equals [!Ref EnableLifecyclePolicy, 'true']
+  EnableServerSideEncryptionCondition: !Equals [!Ref EnableServerSideEncryption, 'true']
+  EnableCloudWatchLogsCondition: !Equals [!Ref EnableCloudWatchLogs, 'true']
+  CreateNotificationTopic: !Not [!Equals [!Ref NotificationEmail, '']]
+
+Resources:
+  # S3 Bucket for storing audio output files
+  AudioOutputBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !If
+        - CreateBucketName
+        - !Sub '${ProjectName}-audio-output-${AWS::AccountId}-${AWS::Region}'
+        - !Ref BucketName
+      BucketEncryption: !If
+        - EnableServerSideEncryptionCondition
+        - ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: 'AES256'
+        - !Ref 'AWS::NoValue'
+      VersioningConfiguration: !If
+        - EnableVersioningCondition
+        - Status: 'Enabled'
+        - !Ref 'AWS::NoValue'
+      LifecycleConfiguration: !If
+        - EnableLifecyclePolicyCondition
+        - Rules:
+            - Id: 'DeleteOldAudioFiles'
+              Status: 'Enabled'
+              ExpirationInDays: !Ref AudioRetentionDays
+              NoncurrentVersionExpirationInDays: !Ref AudioRetentionDays
+        - !Ref 'AWS::NoValue'
+      NotificationConfiguration: !If
+        - CreateNotificationTopic
+        - TopicConfigurations:
+            - Topic: !Ref NotificationTopic
+              Event: 's3:ObjectCreated:*'
+        - !Ref 'AWS::NoValue'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-audio-output-bucket'
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Purpose'
+          Value: 'Amazon Polly Audio Output'
+
+  # S3 Bucket Policy for Amazon Polly Service
+  AudioOutputBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref AudioOutputBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: 'AllowPollyPutObject'
+            Effect: 'Allow'
+            Principal:
+              Service: 'polly.amazonaws.com'
+            Action:
+              - 's3:PutObject'
+              - 's3:PutObjectAcl'
+            Resource: !Sub '${AudioOutputBucket}/*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+          - Sid: 'AllowPollyGetBucketLocation'
+            Effect: 'Allow'
+            Principal:
+              Service: 'polly.amazonaws.com'
+            Action:
+              - 's3:GetBucketLocation'
+            Resource: !Ref AudioOutputBucket
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+
+  # IAM Role for Amazon Polly Service
+  PollyServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-polly-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'polly.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonPollyReadOnlyAccess'
+      Policies:
+        - PolicyName: 'PollyS3AccessPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 's3:PutObject'
+                  - 's3:PutObjectAcl'
+                  - 's3:GetBucketLocation'
+                Resource:
+                  - !Sub '${AudioOutputBucket}/*'
+                  - !Ref AudioOutputBucket
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-polly-service-role'
+        - Key: 'Project'
+          Value: !Ref ProjectName
+
+  # IAM Role for Lambda Function (if needed for automation)
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: 'PollyLambdaPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'polly:SynthesizeSpeech'
+                  - 'polly:StartSpeechSynthesisTask'
+                  - 'polly:GetSpeechSynthesisTask'
+                  - 'polly:ListSpeechSynthesisTasks'
+                  - 'polly:PutLexicon'
+                  - 'polly:GetLexicon'
+                  - 'polly:ListLexicons'
+                  - 'polly:DeleteLexicon'
+                  - 'polly:DescribeVoices'
+                Resource: '*'
+              - Effect: 'Allow'
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                Resource: !Sub '${AudioOutputBucket}/*'
+              - Effect: 'Allow'
+                Action:
+                  - 's3:ListBucket'
+                  - 's3:GetBucketLocation'
+                Resource: !Ref AudioOutputBucket
+              - Effect: 'Allow'
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-*'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-lambda-execution-role'
+        - Key: 'Project'
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Group for monitoring
+  PollyLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Condition: EnableCloudWatchLogsCondition
+    Properties:
+      LogGroupName: !Sub '/aws/polly/${ProjectName}'
+      RetentionInDays: 30
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-polly-logs'
+        - Key: 'Project'
+          Value: !Ref ProjectName
+
+  # SNS Topic for notifications
+  NotificationTopic:
+    Type: 'AWS::SNS::Topic'
+    Condition: CreateNotificationTopic
+    Properties:
+      TopicName: !Sub '${ProjectName}-polly-notifications'
+      DisplayName: !Sub '${ProjectName} Polly Notifications'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-polly-notifications'
+        - Key: 'Project'
+          Value: !Ref ProjectName
+
+  # SNS Subscription for email notifications
+  NotificationSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Condition: CreateNotificationTopic
+    Properties:
+      Protocol: 'email'
+      Endpoint: !Ref NotificationEmail
+      TopicArn: !Ref NotificationTopic
+
+  # Systems Manager Parameter for storing configuration
+  PollyConfigParameter:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: !Sub '/${ProjectName}/polly/config'
+      Type: 'String'
+      Value: !Sub |
+        {
+          "voiceId": "${VoiceId}",
+          "voiceEngine": "${VoiceEngine}",
+          "audioFormat": "${AudioFormat}",
+          "outputBucket": "${AudioOutputBucket}",
+          "region": "${AWS::Region}"
+        }
+      Description: 'Configuration parameters for Amazon Polly text-to-speech application'
+      Tags:
+        Name: !Sub '${ProjectName}-polly-config'
+        Project: !Ref ProjectName
+
+  # Lambda Function for text-to-speech processing (example implementation)
+  TextToSpeechFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-text-to-speech'
+      Runtime: 'python3.9'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !Ref AudioOutputBucket
+          VOICE_ID: !Ref VoiceId
+          VOICE_ENGINE: !Ref VoiceEngine
+          AUDIO_FORMAT: !Ref AudioFormat
+          LOG_LEVEL: 'INFO'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from datetime import datetime
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+          
+          # Initialize AWS clients
+          polly_client = boto3.client('polly')
+          s3_client = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              """
+              Lambda function to process text-to-speech requests using Amazon Polly
+              """
+              try:
+                  # Extract parameters from event
+                  text = event.get('text', '')
+                  voice_id = event.get('voiceId', os.environ.get('VOICE_ID', 'Joanna'))
+                  voice_engine = event.get('voiceEngine', os.environ.get('VOICE_ENGINE', 'neural'))
+                  audio_format = event.get('audioFormat', os.environ.get('AUDIO_FORMAT', 'mp3'))
+                  output_bucket = event.get('outputBucket', os.environ.get('OUTPUT_BUCKET'))
+                  text_type = event.get('textType', 'text')  # 'text' or 'ssml'
+                  
+                  if not text:
+                      raise ValueError('Text input is required')
+                  
+                  if not output_bucket:
+                      raise ValueError('Output bucket is required')
+                  
+                  # Generate unique filename
+                  timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                  filename = f"audio_output_{timestamp}.{audio_format}"
+                  
+                  # Synthesize speech
+                  response = polly_client.synthesize_speech(
+                      Text=text,
+                      TextType=text_type,
+                      VoiceId=voice_id,
+                      Engine=voice_engine,
+                      OutputFormat=audio_format
+                  )
+                  
+                  # Upload to S3
+                  s3_client.put_object(
+                      Bucket=output_bucket,
+                      Key=filename,
+                      Body=response['AudioStream'].read(),
+                      ContentType=f'audio/{audio_format}',
+                      Metadata={
+                          'voice_id': voice_id,
+                          'voice_engine': voice_engine,
+                          'text_type': text_type,
+                          'character_count': str(len(text))
+                      }
+                  )
+                  
+                  # Generate presigned URL for audio access
+                  presigned_url = s3_client.generate_presigned_url(
+                      'get_object',
+                      Params={'Bucket': output_bucket, 'Key': filename},
+                      ExpiresIn=3600  # 1 hour
+                  )
+                  
+                  logger.info(f'Successfully synthesized speech for {len(text)} characters')
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Speech synthesis completed successfully',
+                          'filename': filename,
+                          'bucket': output_bucket,
+                          'presigned_url': presigned_url,
+                          'voice_id': voice_id,
+                          'voice_engine': voice_engine,
+                          'character_count': len(text)
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f'Error processing text-to-speech request: {str(e)}')
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-text-to-speech-function'
+        - Key: 'Project'
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarm for monitoring Lambda errors
+  LambdaErrorAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Condition: EnableCloudWatchLogsCondition
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-errors'
+      AlarmDescription: 'Monitor Lambda function errors for text-to-speech processing'
+      MetricName: 'Errors'
+      Namespace: 'AWS/Lambda'
+      Statistic: 'Sum'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: 'GreaterThanOrEqualToThreshold'
+      Dimensions:
+        - Name: 'FunctionName'
+          Value: !Ref TextToSpeechFunction
+      AlarmActions: !If
+        - CreateNotificationTopic
+        - [!Ref NotificationTopic]
+        - []
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-lambda-error-alarm'
+        - Key: 'Project'
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarm for monitoring Lambda duration
+  LambdaDurationAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Condition: EnableCloudWatchLogsCondition
+    Properties:
+      AlarmName: !Sub '${ProjectName}-lambda-duration'
+      AlarmDescription: 'Monitor Lambda function duration for text-to-speech processing'
+      MetricName: 'Duration'
+      Namespace: 'AWS/Lambda'
+      Statistic: 'Average'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 30000  # 30 seconds
+      ComparisonOperator: 'GreaterThanThreshold'
+      Dimensions:
+        - Name: 'FunctionName'
+          Value: !Ref TextToSpeechFunction
+      AlarmActions: !If
+        - CreateNotificationTopic
+        - [!Ref NotificationTopic]
+        - []
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${ProjectName}-lambda-duration-alarm'
+        - Key: 'Project'
+          Value: !Ref ProjectName
+
+Outputs:
+  AudioOutputBucket:
+    Description: 'S3 bucket for storing audio output files'
+    Value: !Ref AudioOutputBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AudioOutputBucket'
+
+  AudioOutputBucketArn:
+    Description: 'ARN of the S3 bucket for audio output'
+    Value: !GetAtt AudioOutputBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AudioOutputBucketArn'
+
+  PollyServiceRoleArn:
+    Description: 'ARN of the IAM role for Amazon Polly service'
+    Value: !GetAtt PollyServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PollyServiceRoleArn'
+
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the IAM role for Lambda execution'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  TextToSpeechFunctionArn:
+    Description: 'ARN of the Lambda function for text-to-speech processing'
+    Value: !GetAtt TextToSpeechFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TextToSpeechFunctionArn'
+
+  TextToSpeechFunctionName:
+    Description: 'Name of the Lambda function for text-to-speech processing'
+    Value: !Ref TextToSpeechFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-TextToSpeechFunctionName'
+
+  PollyConfigParameterName:
+    Description: 'Systems Manager parameter name for Polly configuration'
+    Value: !Ref PollyConfigParameter
+    Export:
+      Name: !Sub '${AWS::StackName}-PollyConfigParameterName'
+
+  NotificationTopicArn:
+    Description: 'ARN of the SNS topic for notifications'
+    Value: !If
+      - CreateNotificationTopic
+      - !Ref NotificationTopic
+      - 'Not Created'
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopicArn'
+
+  PollyLogGroupName:
+    Description: 'CloudWatch log group name for Polly monitoring'
+    Value: !If
+      - EnableCloudWatchLogsCondition
+      - !Ref PollyLogGroup
+      - 'Not Created'
+    Export:
+      Name: !Sub '${AWS::StackName}-PollyLogGroupName'
+
+  DefaultVoiceId:
+    Description: 'Default voice ID configured for speech synthesis'
+    Value: !Ref VoiceId
+    Export:
+      Name: !Sub '${AWS::StackName}-DefaultVoiceId'
+
+  DefaultVoiceEngine:
+    Description: 'Default voice engine configured for speech synthesis'
+    Value: !Ref VoiceEngine
+    Export:
+      Name: !Sub '${AWS::StackName}-DefaultVoiceEngine'
+
+  DefaultAudioFormat:
+    Description: 'Default audio format configured for speech synthesis'
+    Value: !Ref AudioFormat
+    Export:
+      Name: !Sub '${AWS::StackName}-DefaultAudioFormat'
+
+  ProjectName:
+    Description: 'Project name used for resource naming'
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectName'
+
+  DeploymentRegion:
+    Description: 'AWS region where resources are deployed'
+    Value: !Ref 'AWS::Region'
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentRegion'
+
+  StackName:
+    Description: 'CloudFormation stack name'
+    Value: !Ref 'AWS::StackName'
+    Export:
+      Name: !Sub '${AWS::StackName}-StackName'
+
+  # Usage Instructions
+  UsageInstructions:
+    Description: 'Instructions for using the deployed infrastructure'
+    Value: !Sub |
+      1. Use the Lambda function ${TextToSpeechFunction} to process text-to-speech requests
+      2. Audio files will be stored in S3 bucket ${AudioOutputBucket}
+      3. Monitor CloudWatch logs at /aws/lambda/${TextToSpeechFunction}
+      4. Configuration stored in Systems Manager parameter ${PollyConfigParameter}
+      5. Notifications sent to ${NotificationEmail} (if configured)

@@ -1,0 +1,730 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Elastic Load Balancing with Application and Network Load Balancers - Complete infrastructure for demonstrating ALB and NLB capabilities with EC2 instances, target groups, and security groups'
+
+################################################################################
+# Parameters
+################################################################################
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'elb-demo'
+    Description: 'Project name used for resource naming and tagging'
+    AllowedPattern: '^[a-z0-9-]+$'
+    MinLength: 3
+    MaxLength: 20
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC ID where resources will be created'
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: 'List of subnet IDs for load balancer deployment (minimum 2 subnets in different AZs)'
+
+  InstanceType:
+    Type: String
+    Default: 't3.micro'
+    Description: 'EC2 instance type for web servers'
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+    ConstraintDescription: 'Must be a valid EC2 instance type'
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: 'EC2 Key Pair for SSH access to instances'
+
+  AllowedCidrBlock:
+    Type: String
+    Default: '0.0.0.0/0'
+    Description: 'CIDR block allowed to access load balancers'
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: 'Must be a valid CIDR block (e.g., 10.0.0.0/16)'
+
+  EnableStickySessions:
+    Type: String
+    Default: 'true'
+    Description: 'Enable sticky sessions for ALB target group'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  Environment:
+    Type: String
+    Default: 'development'
+    Description: 'Environment name for resource tagging'
+    AllowedValues:
+      - development
+      - staging
+      - production
+
+################################################################################
+# Conditions
+################################################################################
+
+Conditions:
+  EnableStickySessionsCondition: !Equals [!Ref EnableStickySessions, 'true']
+  IsProduction: !Equals [!Ref Environment, 'production']
+
+################################################################################
+# Resources
+################################################################################
+
+Resources:
+  # Security Groups
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-alb-sg'
+      GroupDescription: 'Security group for Application Load Balancer - allows HTTP/HTTPS traffic from internet'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AllowedCidrBlock
+          Description: 'HTTP traffic from internet'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref AllowedCidrBlock
+          Description: 'HTTPS traffic from internet'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alb-sg'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  NLBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-nlb-sg'
+      GroupDescription: 'Security group for Network Load Balancer - allows TCP traffic from internet'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AllowedCidrBlock
+          Description: 'TCP traffic on port 80 from internet'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-nlb-sg'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-ec2-sg'
+      GroupDescription: 'Security group for EC2 instances - allows traffic from load balancers and SSH access'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: 'HTTP traffic from ALB'
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref NLBSecurityGroup
+          Description: 'HTTP traffic from NLB'
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedCidrBlock
+          Description: 'SSH access for management'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ec2-sg'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for EC2 instances
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ec2-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ec2-role'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ProjectName}-ec2-profile'
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # Launch Template for EC2 instances
+  EC2LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ProjectName}-launch-template'
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref EC2SecurityGroup
+        KeyName: !Ref KeyPairName
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # Update system packages
+            yum update -y
+            
+            # Install and configure Apache web server
+            yum install -y httpd
+            systemctl start httpd
+            systemctl enable httpd
+            
+            # Create a simple web page with instance information
+            cat > /var/www/html/index.html << 'EOF'
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Load Balancer Demo</title>
+                <style>
+                    body { font-family: Arial, sans-serif; margin: 40px; }
+                    .container { max-width: 800px; margin: 0 auto; }
+                    .header { background: #f0f0f0; padding: 20px; border-radius: 5px; }
+                    .info { background: #e8f4f8; padding: 15px; margin: 10px 0; border-radius: 5px; }
+                    .highlight { color: #0066cc; font-weight: bold; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <div class="header">
+                        <h1>🚀 AWS Load Balancer Demo</h1>
+                        <p>This page is served by an EC2 instance behind AWS Load Balancers</p>
+                    </div>
+                    <div class="info">
+                        <h2>Instance Information</h2>
+                        <p><strong>Instance ID:</strong> <span class="highlight">$(curl -s http://169.254.169.254/latest/meta-data/instance-id)</span></p>
+                        <p><strong>Availability Zone:</strong> <span class="highlight">$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)</span></p>
+                        <p><strong>Instance Type:</strong> <span class="highlight">$(curl -s http://169.254.169.254/latest/meta-data/instance-type)</span></p>
+                        <p><strong>Private IP:</strong> <span class="highlight">$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)</span></p>
+                        <p><strong>Public IP:</strong> <span class="highlight">$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)</span></p>
+                    </div>
+                    <div class="info">
+                        <h2>Load Balancer Types</h2>
+                        <p><strong>Application Load Balancer (ALB):</strong> Layer 7 load balancing with advanced routing</p>
+                        <p><strong>Network Load Balancer (NLB):</strong> Layer 4 load balancing with ultra-high performance</p>
+                    </div>
+                    <div class="info">
+                        <h2>Project Details</h2>
+                        <p><strong>Project:</strong> ${ProjectName}</p>
+                        <p><strong>Environment:</strong> ${Environment}</p>
+                        <p><strong>Timestamp:</strong> $(date)</p>
+                    </div>
+                </div>
+            </body>
+            </html>
+            EOF
+            
+            # Set proper permissions
+            chown apache:apache /var/www/html/index.html
+            chmod 644 /var/www/html/index.html
+            
+            # Install CloudWatch agent for monitoring
+            yum install -y amazon-cloudwatch-agent
+            
+            # Signal CloudFormation that the instance is ready
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource WebServerInstance1 --region ${AWS::Region}
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${ProjectName}-web-server'
+              - Key: Project
+                Value: !Ref ProjectName
+              - Key: Environment
+                Value: !Ref Environment
+
+  # EC2 Instances
+  WebServerInstance1:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref EC2LaunchTemplate
+        Version: !GetAtt EC2LaunchTemplate.LatestVersionNumber
+      SubnetId: !Select [0, !Ref SubnetIds]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-web-server-1'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+        Count: 1
+
+  WebServerInstance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref EC2LaunchTemplate
+        Version: !GetAtt EC2LaunchTemplate.LatestVersionNumber
+      SubnetId: !Select [1, !Ref SubnetIds]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-web-server-2'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+        Count: 1
+
+  # Target Groups
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-alb-tg'
+      Protocol: HTTP
+      Port: 80
+      VpcId: !Ref VpcId
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+        - Key: stickiness.enabled
+          Value: !If [EnableStickySessionsCondition, 'true', 'false']
+        - Key: stickiness.type
+          Value: !If [EnableStickySessionsCondition, 'lb_cookie', '']
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: !If [EnableStickySessionsCondition, '86400', '']
+      Targets:
+        - Id: !Ref WebServerInstance1
+          Port: 80
+        - Id: !Ref WebServerInstance2
+          Port: 80
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alb-tg'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  NLBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-nlb-tg'
+      Protocol: TCP
+      Port: 80
+      VpcId: !Ref VpcId
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 6
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+        - Key: preserve_client_ip.enabled
+          Value: 'true'
+      Targets:
+        - Id: !Ref WebServerInstance1
+          Port: 80
+        - Id: !Ref WebServerInstance2
+          Port: 80
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-nlb-tg'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-alb'
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets: !Ref SubnetIds
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+        - Key: routing.http2.enabled
+          Value: 'true'
+        - Key: access_logs.s3.enabled
+          Value: 'false'
+        - Key: deletion_protection.enabled
+          Value: !If [IsProduction, 'true', 'false']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alb'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Network Load Balancer
+  NetworkLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-nlb'
+      Type: network
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets: !Ref SubnetIds
+      LoadBalancerAttributes:
+        - Key: load_balancing.cross_zone.enabled
+          Value: 'true'
+        - Key: access_logs.s3.enabled
+          Value: 'false'
+        - Key: deletion_protection.enabled
+          Value: !If [IsProduction, 'true', 'false']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-nlb'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Load Balancer Listeners
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  NLBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref NetworkLoadBalancer
+      Protocol: TCP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref NLBTargetGroup
+
+  # CloudWatch Alarms for monitoring
+  ALBTargetResponseTimeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-alb-high-response-time'
+      AlarmDescription: 'ALB target response time is too high'
+      MetricName: TargetResponseTime
+      Namespace: AWS/ApplicationELB
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+      TreatMissingData: notBreaching
+
+  NLBActiveConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-nlb-high-connections'
+      AlarmDescription: 'NLB active connections are too high'
+      MetricName: ActiveFlowCount
+      Namespace: AWS/NetworkELB
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt NetworkLoadBalancer.LoadBalancerFullName
+      TreatMissingData: notBreaching
+
+################################################################################
+# Mappings
+################################################################################
+
+Mappings:
+  # Latest Amazon Linux 2 AMI IDs by region
+  AWSRegionAMI:
+    us-east-1:
+      AMI: ami-0c02fb55956c7d316
+    us-east-2:
+      AMI: ami-0f924dc71d44d23e2
+    us-west-1:
+      AMI: ami-04e35eeae7a7c5883
+    us-west-2:
+      AMI: ami-0aff18ec83b712f05
+    eu-west-1:
+      AMI: ami-0c02fb55956c7d316
+    eu-west-2:
+      AMI: ami-0f924dc71d44d23e2
+    eu-central-1:
+      AMI: ami-04e35eeae7a7c5883
+    ap-southeast-1:
+      AMI: ami-0aff18ec83b712f05
+    ap-southeast-2:
+      AMI: ami-0c02fb55956c7d316
+    ap-northeast-1:
+      AMI: ami-0f924dc71d44d23e2
+
+################################################################################
+# SSM Parameters for latest AMI
+################################################################################
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: 'Latest Amazon Linux 2 AMI ID'
+
+################################################################################
+# Outputs
+################################################################################
+
+Outputs:
+  # Load Balancer Information
+  ApplicationLoadBalancerDNS:
+    Description: 'DNS name of the Application Load Balancer'
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-ALB-DNS'
+
+  ApplicationLoadBalancerArn:
+    Description: 'ARN of the Application Load Balancer'
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: !Sub '${AWS::StackName}-ALB-ARN'
+
+  ApplicationLoadBalancerURL:
+    Description: 'URL of the Application Load Balancer'
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ALB-URL'
+
+  NetworkLoadBalancerDNS:
+    Description: 'DNS name of the Network Load Balancer'
+    Value: !GetAtt NetworkLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-NLB-DNS'
+
+  NetworkLoadBalancerArn:
+    Description: 'ARN of the Network Load Balancer'
+    Value: !Ref NetworkLoadBalancer
+    Export:
+      Name: !Sub '${AWS::StackName}-NLB-ARN'
+
+  NetworkLoadBalancerURL:
+    Description: 'URL of the Network Load Balancer'
+    Value: !Sub 'http://${NetworkLoadBalancer.DNSName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-NLB-URL'
+
+  # Target Group Information
+  ALBTargetGroupArn:
+    Description: 'ARN of the ALB Target Group'
+    Value: !Ref ALBTargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ALB-TG-ARN'
+
+  NLBTargetGroupArn:
+    Description: 'ARN of the NLB Target Group'
+    Value: !Ref NLBTargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-NLB-TG-ARN'
+
+  # EC2 Instance Information
+  WebServerInstance1Id:
+    Description: 'Instance ID of Web Server 1'
+    Value: !Ref WebServerInstance1
+    Export:
+      Name: !Sub '${AWS::StackName}-Instance1-ID'
+
+  WebServerInstance2Id:
+    Description: 'Instance ID of Web Server 2'
+    Value: !Ref WebServerInstance2
+    Export:
+      Name: !Sub '${AWS::StackName}-Instance2-ID'
+
+  # Security Group Information
+  ALBSecurityGroupId:
+    Description: 'Security Group ID for ALB'
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ALB-SG-ID'
+
+  NLBSecurityGroupId:
+    Description: 'Security Group ID for NLB'
+    Value: !Ref NLBSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-NLB-SG-ID'
+
+  EC2SecurityGroupId:
+    Description: 'Security Group ID for EC2 instances'
+    Value: !Ref EC2SecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-EC2-SG-ID'
+
+  # Testing Information
+  TestingInstructions:
+    Description: 'Instructions for testing the load balancers'
+    Value: !Sub |
+      Test ALB: curl -v http://${ApplicationLoadBalancer.DNSName}
+      Test NLB: curl -v http://${NetworkLoadBalancer.DNSName}
+      Multiple requests will show different instance IDs, demonstrating load balancing
+
+  # Cost Information
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost for this infrastructure'
+    Value: !Sub |
+      ALB: ~$16.20/month (plus $0.008 per LCU-hour)
+      NLB: ~$16.20/month (plus $0.006 per NLCU-hour)
+      EC2 instances (2x t3.micro): ~$16.56/month
+      Total estimated: ~$49/month (excluding data transfer costs)
+
+  # Cleanup Information
+  CleanupInstructions:
+    Description: 'Instructions for cleaning up resources'
+    Value: !Sub |
+      Delete this CloudFormation stack to remove all resources:
+      aws cloudformation delete-stack --stack-name ${AWS::StackName}
+      
+      Note: Deletion protection is enabled for production environments.
+      To delete production stacks, first disable deletion protection:
+      aws elbv2 modify-load-balancer-attributes --load-balancer-arn ${ApplicationLoadBalancer} --attributes Key=deletion_protection.enabled,Value=false
+      aws elbv2 modify-load-balancer-attributes --load-balancer-arn ${NetworkLoadBalancer} --attributes Key=deletion_protection.enabled,Value=false
+
+################################################################################
+# Metadata
+################################################################################
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - SubnetIds
+          - AllowedCidrBlock
+      - Label:
+          default: "EC2 Configuration"
+        Parameters:
+          - InstanceType
+          - KeyPairName
+      - Label:
+          default: "Load Balancer Configuration"
+        Parameters:
+          - EnableStickySessions
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name"
+      Environment:
+        default: "Environment"
+      VpcId:
+        default: "VPC ID"
+      SubnetIds:
+        default: "Subnet IDs"
+      AllowedCidrBlock:
+        default: "Allowed CIDR Block"
+      InstanceType:
+        default: "Instance Type"
+      KeyPairName:
+        default: "Key Pair Name"
+      EnableStickySessions:
+        default: "Enable Sticky Sessions"
+
+  AWS::CloudFormation::Designer:
+    ApplicationLoadBalancer:
+      id: alb-designer-node
+      x: 200
+      y: 100
+    NetworkLoadBalancer:
+      id: nlb-designer-node
+      x: 400
+      y: 100
+    ALBTargetGroup:
+      id: alb-tg-designer-node
+      x: 200
+      y: 200
+    NLBTargetGroup:
+      id: nlb-tg-designer-node
+      x: 400
+      y: 200
+    WebServerInstance1:
+      id: ec2-1-designer-node
+      x: 100
+      y: 300
+    WebServerInstance2:
+      id: ec2-2-designer-node
+      x: 500
+      y: 300
+
+  # Template information
+  TemplateVersion: '1.0'
+  TemplateDescription: 'Complete CloudFormation template for AWS Elastic Load Balancing recipe'
+  LastUpdated: '2025-01-15'
+  Author: 'AWS CloudFormation Generator'
+  RecipeId: 'e8a2c6f9'
+  RecipeTitle: 'Elastic Load Balancing with ALB and NLB'

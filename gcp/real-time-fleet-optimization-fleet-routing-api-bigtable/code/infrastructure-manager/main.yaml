@@ -1,0 +1,489 @@
+# Infrastructure Manager Configuration for Real-Time Fleet Optimization
+# This configuration deploys a complete fleet optimization system using:
+# - Cloud Fleet Routing API (Optimization AI)
+# - Cloud Bigtable for traffic data storage
+# - Pub/Sub for real-time event processing
+# - Cloud Functions for serverless processing
+# - IAM roles and service accounts for secure access
+
+metadata:
+  name: fleet-optimization-infrastructure
+  labels:
+    solution: fleet-optimization
+    provider: gcp
+    recipe: real-time-fleet-optimization-fleet-routing-api-bigtable
+
+# Input parameters for customization
+parameters:
+  project_id:
+    description: "Google Cloud Project ID"
+    type: string
+    required: true
+  
+  region:
+    description: "Primary region for deployment"
+    type: string
+    default: "us-central1"
+    allowed:
+      - "us-central1"
+      - "us-east1"
+      - "us-west1"
+      - "europe-west1"
+      - "asia-southeast1"
+  
+  zone:
+    description: "Zone for Bigtable cluster"
+    type: string
+    default: "us-central1-a"
+  
+  bigtable_instance_name:
+    description: "Name for the Bigtable instance"
+    type: string
+    default: "fleet-data-store"
+    pattern: "^[a-z]([a-z0-9-]*[a-z0-9])?$"
+  
+  bigtable_table_name:
+    description: "Name for the traffic patterns table"
+    type: string
+    default: "traffic_patterns"
+    pattern: "^[a-zA-Z_][a-zA-Z0-9_]*$"
+  
+  pubsub_topic_name:
+    description: "Name for the Pub/Sub topic for fleet events"
+    type: string
+    default: "fleet-events"
+    pattern: "^[a-zA-Z]([a-zA-Z0-9_-]*[a-zA-Z0-9])?$"
+  
+  function_name:
+    description: "Name for the Cloud Function"
+    type: string
+    default: "route-optimizer"
+    pattern: "^[a-z]([a-z0-9-]*[a-z0-9])?$"
+  
+  dashboard_function_name:
+    description: "Name for the dashboard Cloud Function"
+    type: string
+    default: "fleet-dashboard"
+    pattern: "^[a-z]([a-z0-9-]*[a-z0-9])?$"
+  
+  bigtable_node_count:
+    description: "Initial number of nodes for Bigtable cluster"
+    type: integer
+    default: 3
+    minimum: 1
+    maximum: 30
+  
+  bigtable_max_nodes:
+    description: "Maximum number of nodes for Bigtable autoscaling"
+    type: integer
+    default: 10
+    minimum: 1
+    maximum: 100
+
+# Resource definitions
+resources:
+  # Enable required APIs for fleet optimization
+  - name: enable-optimization-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/optimization.googleapis.com
+      consumerId: project:$(ref.project_id.value)
+    metadata:
+      dependsOn: []
+
+  - name: enable-bigtable-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/bigtable.googleapis.com
+      consumerId: project:$(ref.project_id.value)
+    metadata:
+      dependsOn: []
+
+  - name: enable-pubsub-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/pubsub.googleapis.com
+      consumerId: project:$(ref.project_id.value)
+    metadata:
+      dependsOn: []
+
+  - name: enable-functions-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/cloudfunctions.googleapis.com
+      consumerId: project:$(ref.project_id.value)
+    metadata:
+      dependsOn: []
+
+  - name: enable-storage-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/storage.googleapis.com
+      consumerId: project:$(ref.project_id.value)
+    metadata:
+      dependsOn: []
+
+  - name: enable-build-api
+    type: gcp-types/serviceusage-v1:services
+    properties:
+      name: projects/$(ref.project_id.value)/services/cloudbuild.googleapis.com
+      consumerId: project:$(ref.project_id.value)
+    metadata:
+      dependsOn: []
+
+  # Service Account for Cloud Functions
+  - name: fleet-optimizer-service-account
+    type: gcp-types/iam-v1:projects.serviceAccounts
+    properties:
+      accountId: fleet-optimizer-sa
+      displayName: "Fleet Optimizer Service Account"
+      description: "Service account for fleet optimization Cloud Functions"
+      project: $(ref.project_id.value)
+    metadata:
+      dependsOn:
+        - enable-bigtable-api
+        - enable-pubsub-api
+        - enable-functions-api
+
+  # IAM bindings for service account
+  - name: bigtable-user-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id.value)
+      role: roles/bigtable.user
+      member: serviceAccount:$(ref.fleet-optimizer-service-account.email)
+    metadata:
+      dependsOn:
+        - fleet-optimizer-service-account
+
+  - name: pubsub-subscriber-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id.value)
+      role: roles/pubsub.subscriber
+      member: serviceAccount:$(ref.fleet-optimizer-service-account.email)
+    metadata:
+      dependsOn:
+        - fleet-optimizer-service-account
+
+  - name: optimization-user-binding
+    type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+    properties:
+      resource: $(ref.project_id.value)
+      role: roles/cloudoptimization.editor
+      member: serviceAccount:$(ref.fleet-optimizer-service-account.email)
+    metadata:
+      dependsOn:
+        - fleet-optimizer-service-account
+
+  # Cloud Storage bucket for Cloud Functions source code
+  - name: function-source-bucket
+    type: gcp-types/storage-v1:bucket
+    properties:
+      name: $(ref.project_id.value)-fleet-functions-source
+      location: $(ref.region.value)
+      storageClass: STANDARD
+      versioning:
+        enabled: true
+      lifecycle:
+        rule:
+          - action:
+              type: Delete
+            condition:
+              age: 30
+              matchesStorageClass:
+                - STANDARD
+    metadata:
+      dependsOn:
+        - enable-storage-api
+
+  # Pub/Sub topic for fleet events
+  - name: fleet-events-topic
+    type: gcp-types/pubsub-v1:projects.topics
+    properties:
+      name: projects/$(ref.project_id.value)/topics/$(ref.pubsub_topic_name.value)
+      labels:
+        purpose: fleet-optimization
+        component: event-processing
+      messageStoragePolicy:
+        allowedPersistenceRegions:
+          - $(ref.region.value)
+    metadata:
+      dependsOn:
+        - enable-pubsub-api
+
+  # Pub/Sub subscription for Cloud Function trigger
+  - name: fleet-events-subscription
+    type: gcp-types/pubsub-v1:projects.subscriptions
+    properties:
+      name: projects/$(ref.project_id.value)/subscriptions/$(ref.pubsub_topic_name.value)-subscription
+      topic: $(ref.fleet-events-topic.name)
+      labels:
+        purpose: fleet-optimization
+        component: event-processing
+      messageRetentionDuration: 604800s  # 7 days
+      retryPolicy:
+        minimumBackoff: 10s
+        maximumBackoff: 600s
+      deadLetterPolicy:
+        deadLetterTopic: $(ref.fleet-events-topic.name)
+        maxDeliveryAttempts: 5
+    metadata:
+      dependsOn:
+        - fleet-events-topic
+
+  # Cloud Bigtable instance for traffic data storage
+  - name: bigtable-instance
+    type: gcp-types/bigtableadmin-v2:projects.instances
+    properties:
+      parent: projects/$(ref.project_id.value)
+      instanceId: $(ref.bigtable_instance_name.value)
+      instance:
+        displayName: "Fleet Traffic Data Store"
+        type: PRODUCTION
+        labels:
+          purpose: fleet-optimization
+          component: data-storage
+        state: READY
+      clusters:
+        main-cluster:
+          location: projects/$(ref.project_id.value)/locations/$(ref.zone.value)
+          serveNodes: $(ref.bigtable_node_count.value)
+          defaultStorageType: SSD
+          encryptionConfig:
+            kmsKeyName: ""  # Use Google-managed encryption
+    metadata:
+      dependsOn:
+        - enable-bigtable-api
+
+  # Bigtable cluster autoscaling policy
+  - name: bigtable-autoscaling-policy
+    type: gcp-types/bigtableadmin-v2:projects.instances.clusters.autoscalingPolicy
+    properties:
+      name: projects/$(ref.project_id.value)/instances/$(ref.bigtable_instance_name.value)/clusters/main-cluster/autoscalingPolicy
+      minServeNodes: 1
+      maxServeNodes: $(ref.bigtable_max_nodes.value)
+      cpuUtilizationPercent: 70
+    metadata:
+      dependsOn:
+        - bigtable-instance
+
+  # Cloud Function for real-time traffic data processing
+  - name: traffic-processor-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      function:
+        name: projects/$(ref.project_id.value)/locations/$(ref.region.value)/functions/$(ref.function_name.value)
+        description: "Processes real-time fleet events and updates traffic data in Bigtable"
+        sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/traffic-processor-source.zip
+        entryPoint: process_fleet_event
+        runtime: python39
+        timeout: 60s
+        availableMemoryMb: 512
+        serviceAccountEmail: $(ref.fleet-optimizer-service-account.email)
+        environmentVariables:
+          GCP_PROJECT: $(ref.project_id.value)
+          BIGTABLE_INSTANCE: $(ref.bigtable_instance_name.value)
+          BIGTABLE_TABLE: $(ref.bigtable_table_name.value)
+          PUBSUB_TOPIC: $(ref.pubsub_topic_name.value)
+        eventTrigger:
+          eventType: providers/cloud.pubsub/eventTypes/topic.publish
+          resource: projects/$(ref.project_id.value)/topics/$(ref.pubsub_topic_name.value)
+          failurePolicy:
+            retry: {}
+        labels:
+          purpose: fleet-optimization
+          component: data-processing
+    metadata:
+      dependsOn:
+        - fleet-events-topic
+        - bigtable-instance
+        - fleet-optimizer-service-account
+        - function-source-bucket
+
+  # Cloud Function for fleet management dashboard
+  - name: dashboard-function
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions
+    properties:
+      location: projects/$(ref.project_id.value)/locations/$(ref.region.value)
+      function:
+        name: projects/$(ref.project_id.value)/locations/$(ref.region.value)/functions/$(ref.dashboard_function_name.value)
+        description: "Serves fleet management dashboard with real-time traffic data"
+        sourceArchiveUrl: gs://$(ref.function-source-bucket.name)/dashboard-source.zip
+        entryPoint: fleet_dashboard
+        runtime: python39
+        timeout: 60s
+        availableMemoryMb: 512
+        serviceAccountEmail: $(ref.fleet-optimizer-service-account.email)
+        environmentVariables:
+          GCP_PROJECT: $(ref.project_id.value)
+          BIGTABLE_INSTANCE: $(ref.bigtable_instance_name.value)
+          BIGTABLE_TABLE: $(ref.bigtable_table_name.value)
+        httpsTrigger:
+          securityLevel: SECURE_ALWAYS
+        labels:
+          purpose: fleet-optimization
+          component: dashboard
+    metadata:
+      dependsOn:
+        - bigtable-instance
+        - fleet-optimizer-service-account
+        - function-source-bucket
+
+  # IAM policy to make dashboard function publicly accessible
+  - name: dashboard-function-iam-policy
+    type: gcp-types/cloudfunctions-v1:projects.locations.functions.setIamPolicy
+    properties:
+      resource: $(ref.dashboard-function.name)
+      policy:
+        bindings:
+          - role: roles/cloudfunctions.invoker
+            members:
+              - allUsers
+    metadata:
+      dependsOn:
+        - dashboard-function
+
+# Computed outputs for reference and integration
+outputs:
+  project_id:
+    description: "Google Cloud Project ID"
+    value: $(ref.project_id.value)
+
+  region:
+    description: "Deployment region"
+    value: $(ref.region.value)
+
+  bigtable_instance_name:
+    description: "Name of the Bigtable instance"
+    value: $(ref.bigtable_instance_name.value)
+
+  bigtable_instance_id:
+    description: "Full resource ID of the Bigtable instance"
+    value: $(ref.bigtable-instance.name)
+
+  bigtable_connection_string:
+    description: "Connection string for Bigtable instance"
+    value: "projects/$(ref.project_id.value)/instances/$(ref.bigtable_instance_name.value)"
+
+  pubsub_topic_name:
+    description: "Name of the Pub/Sub topic for fleet events"
+    value: $(ref.pubsub_topic_name.value)
+
+  pubsub_topic_id:
+    description: "Full resource ID of the Pub/Sub topic"
+    value: $(ref.fleet-events-topic.name)
+
+  pubsub_subscription_name:
+    description: "Name of the Pub/Sub subscription"
+    value: $(ref.fleet-events-subscription.name)
+
+  traffic_processor_function_name:
+    description: "Name of the traffic processing Cloud Function"
+    value: $(ref.function_name.value)
+
+  traffic_processor_function_url:
+    description: "HTTP trigger URL for traffic processor function (if applicable)"
+    value: $(ref.traffic-processor-function.httpsTrigger.url)
+
+  dashboard_function_name:
+    description: "Name of the dashboard Cloud Function"
+    value: $(ref.dashboard_function_name.value)
+
+  dashboard_function_url:
+    description: "Public URL for the fleet management dashboard"
+    value: $(ref.dashboard-function.httpsTrigger.url)
+
+  service_account_email:
+    description: "Email of the service account used by Cloud Functions"
+    value: $(ref.fleet-optimizer-service-account.email)
+
+  function_source_bucket:
+    description: "Cloud Storage bucket for function source code"
+    value: $(ref.function-source-bucket.name)
+
+  # API endpoints for integration
+  optimization_api_endpoint:
+    description: "Cloud Fleet Routing API endpoint"
+    value: "https://optimization.googleapis.com"
+
+  bigtable_api_endpoint:
+    description: "Cloud Bigtable API endpoint"
+    value: "https://bigtable.googleapis.com"
+
+  # Configuration values for applications
+  bigtable_table_name:
+    description: "Name of the traffic patterns table in Bigtable"
+    value: $(ref.bigtable_table_name.value)
+
+  # Monitoring and operations
+  bigtable_cluster_nodes:
+    description: "Current number of nodes in the Bigtable cluster"
+    value: $(ref.bigtable_node_count.value)
+
+  bigtable_max_nodes:
+    description: "Maximum number of nodes for autoscaling"
+    value: $(ref.bigtable_max_nodes.value)
+
+  # Security information
+  project_number:
+    description: "Google Cloud Project number for IAM references"
+    value: $(ref.project_id.projectNumber)
+
+# Pre-deployment actions and validations
+actions:
+  create:
+    # Validate project and region before deployment
+    - name: validate-project
+      type: validate
+      properties:
+        condition: "len($(ref.project_id.value)) > 0"
+        message: "Project ID must be specified"
+
+    - name: validate-region
+      type: validate
+      properties:
+        condition: "$(ref.region.value) in ['us-central1', 'us-east1', 'us-west1', 'europe-west1', 'asia-southeast1']"
+        message: "Region must be one of the supported regions"
+
+    - name: validate-bigtable-nodes
+      type: validate
+      properties:
+        condition: "$(ref.bigtable_node_count.value) <= $(ref.bigtable_max_nodes.value)"
+        message: "Initial node count must be less than or equal to maximum nodes"
+
+  # Post-deployment configuration
+  configure:
+    # Create Bigtable table schema after instance is ready
+    - name: create-bigtable-table
+      type: gcp-types/bigtableadmin-v2:projects.instances.tables
+      properties:
+        parent: $(ref.bigtable-instance.name)
+        tableId: $(ref.bigtable_table_name.value)
+        table:
+          columnFamilies:
+            traffic_speed:
+              gcPolicy:
+                maxAge: 2592000s  # 30 days
+            traffic_volume:
+              gcPolicy:
+                maxAge: 2592000s  # 30 days
+            road_conditions:
+              gcPolicy:
+                maxAge: 2592000s  # 30 days
+          granularity: MILLIS
+      metadata:
+        dependsOn:
+          - bigtable-instance
+
+# Deployment metadata and tags
+tags:
+  solution: fleet-optimization
+  provider: gcp
+  category: analytics
+  difficulty: "300"
+  services: "Cloud Fleet Routing API, Cloud Bigtable, Pub/Sub, Cloud Functions"
+  estimated-time: "120 minutes"
+  recipe-version: "1.0"
+  infrastructure-manager-version: "1.3"

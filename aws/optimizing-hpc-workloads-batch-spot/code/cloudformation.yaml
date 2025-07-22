@@ -1,0 +1,767 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'HPC Workload Optimization with AWS Batch and Spot Instances - Cost-effective, fault-tolerant compute environment for research and scientific computing'
+
+# ============================================================================
+# PARAMETERS
+# ============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'hpc-batch-spot'
+    Description: 'Project name used for resource naming and tagging'
+    MinLength: 3
+    MaxLength: 20
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and hyphens'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'test', 'staging', 'prod']
+    Description: 'Environment name for resource tagging and configuration'
+
+  MaxvCpus:
+    Type: Number
+    Default: 1000
+    MinValue: 0
+    MaxValue: 10000
+    Description: 'Maximum number of vCPUs in the compute environment'
+
+  DesiredvCpus:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 1000
+    Description: 'Desired number of vCPUs in the compute environment'
+
+  SpotBidPercentage:
+    Type: Number
+    Default: 80
+    MinValue: 20
+    MaxValue: 100
+    Description: 'Maximum percentage of On-Demand price to bid for Spot instances'
+
+  JobTimeoutSeconds:
+    Type: Number
+    Default: 3600
+    MinValue: 60
+    MaxValue: 86400
+    Description: 'Job timeout in seconds (1 minute to 24 hours)'
+
+  RetryAttempts:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+    Description: 'Number of retry attempts for failed jobs'
+
+  EFSProvisionedThroughput:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 1000
+    Description: 'EFS provisioned throughput in MiB/s'
+
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: 'CloudWatch log retention period in days'
+
+  EnableAlarms:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable CloudWatch alarms for monitoring'
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for alarm notifications (optional)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+# ============================================================================
+# CONDITIONS
+# ============================================================================
+Conditions:
+  CreateAlarms: !Equals [!Ref EnableAlarms, 'true']
+  HasNotificationEmail: !And
+    - !Condition CreateAlarms
+    - !Not [!Equals [!Ref NotificationEmail, '']]
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+# ============================================================================
+# RESOURCES
+# ============================================================================
+Resources:
+  # ----------------------------------------------------------------------------
+  # S3 BUCKET FOR DATA STORAGE
+  # ----------------------------------------------------------------------------
+  HPCDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-hpc-data-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: !If [IsProduction, 'Enabled', 'Suspended']
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_INFREQUENT_ACCESS
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref S3AccessLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-hpc-data-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'HPC data storage'
+
+  # ----------------------------------------------------------------------------
+  # IAM ROLES AND POLICIES
+  # ----------------------------------------------------------------------------
+  # AWS Batch Service Role
+  BatchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-batch-service-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: batch.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-batch-service-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ECS Instance Role for Batch Compute Nodes
+  ECSInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ecs-instance-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+      Policies:
+        - PolicyName: HPCBatchInstancePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt HPCDataBucket.Arn
+                  - !Sub '${HPCDataBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - efs:ClientMount
+                  - efs:ClientRootAccess
+                  - efs:ClientWrite
+                Resource: !Sub 'arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/${EFSFileSystem}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ecs-instance-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Instance Profile for ECS Instances
+  ECSInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ProjectName}-ecs-instance-profile-${Environment}'
+      Roles:
+        - !Ref ECSInstanceRole
+
+  # Job Execution Role
+  JobExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-job-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: HPCJobExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt HPCDataBucket.Arn
+                  - !Sub '${HPCDataBucket.Arn}/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-job-execution-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ----------------------------------------------------------------------------
+  # VPC AND NETWORKING
+  # ----------------------------------------------------------------------------
+  # Get Default VPC
+  DefaultVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-igw'
+        - Key: Environment
+          Value: !Ref Environment
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref DefaultVPC
+
+  # Subnets
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref DefaultVPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-subnet-1'
+        - Key: Environment
+          Value: !Ref Environment
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref DefaultVPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-subnet-2'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Route Table
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref DefaultVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-routes'
+        - Key: Environment
+          Value: !Ref Environment
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  # ----------------------------------------------------------------------------
+  # SECURITY GROUPS
+  # ----------------------------------------------------------------------------
+  # Security Group for Batch Compute Instances
+  BatchComputeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-batch-compute-sg-${Environment}'
+      GroupDescription: 'Security group for AWS Batch compute environment'
+      VpcId: !Ref DefaultVPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'Allow all outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-batch-compute-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Security Group for EFS
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-efs-sg-${Environment}'
+      GroupDescription: 'Security group for EFS file system'
+      VpcId: !Ref DefaultVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref BatchComputeSecurityGroup
+          Description: 'NFS access from Batch compute instances'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'Allow all outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-efs-sg'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Allow Batch compute instances to access EFS
+  BatchToEFSRule:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref BatchComputeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      DestinationSecurityGroupId: !Ref EFSSecurityGroup
+      Description: 'NFS access to EFS file system'
+
+  # ----------------------------------------------------------------------------
+  # EFS FILE SYSTEM
+  # ----------------------------------------------------------------------------
+  EFSFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      CreationToken: !Sub '${ProjectName}-efs-${Environment}-${AWS::AccountId}'
+      PerformanceMode: generalPurpose
+      ThroughputMode: provisioned
+      ProvisionedThroughputInMibps: !Ref EFSProvisionedThroughput
+      Encrypted: true
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-shared-storage'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'HPC shared storage'
+
+  # EFS Mount Targets
+  EFSMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  EFSMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  # ----------------------------------------------------------------------------
+  # AWS BATCH RESOURCES
+  # ----------------------------------------------------------------------------
+  # Compute Environment
+  HPCComputeEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      ComputeEnvironmentName: !Sub '${ProjectName}-spot-compute-${Environment}'
+      Type: MANAGED
+      State: ENABLED
+      ServiceRole: !GetAtt BatchServiceRole.Arn
+      ComputeResources:
+        Type: EC2
+        AllocationStrategy: SPOT_CAPACITY_OPTIMIZED
+        MinvCpus: 0
+        MaxvCpus: !Ref MaxvCpus
+        DesiredvCpus: !Ref DesiredvCpus
+        InstanceTypes:
+          - c5.large
+          - c5.xlarge
+          - c5.2xlarge
+          - c5.4xlarge
+          - c4.large
+          - c4.xlarge
+          - c4.2xlarge
+          - m5.large
+          - m5.xlarge
+          - m5.2xlarge
+          - m4.large
+          - m4.xlarge
+          - r5.large
+          - r5.xlarge
+        BidPercentage: !Ref SpotBidPercentage
+        Ec2Configuration:
+          - ImageType: ECS_AL2
+        InstanceRole: !GetAtt ECSInstanceProfile.Arn
+        Subnets:
+          - !Ref PublicSubnet1
+          - !Ref PublicSubnet2
+        SecurityGroupIds:
+          - !Ref BatchComputeSecurityGroup
+        Tags:
+          Name: !Sub '${ProjectName}-batch-instance'
+          Environment: !Ref Environment
+          Purpose: 'HPC compute node'
+      Tags:
+        Name: !Sub '${ProjectName}-spot-compute-environment'
+        Environment: !Ref Environment
+
+  # Job Queue
+  HPCJobQueue:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      JobQueueName: !Sub '${ProjectName}-job-queue-${Environment}'
+      State: ENABLED
+      Priority: 1
+      ComputeEnvironmentOrder:
+        - Order: 1
+          ComputeEnvironment: !Ref HPCComputeEnvironment
+      Tags:
+        Name: !Sub '${ProjectName}-job-queue'
+        Environment: !Ref Environment
+
+  # Job Definition
+  HPCJobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      JobDefinitionName: !Sub '${ProjectName}-simulation-${Environment}'
+      Type: container
+      ContainerProperties:
+        Image: 'busybox:latest'
+        Vcpus: 2
+        Memory: 4096
+        JobRoleArn: !GetAtt JobExecutionRole.Arn
+        MountPoints:
+          - SourceVolume: efs-storage
+            ContainerPath: /shared
+            ReadOnly: false
+        Volumes:
+          - Name: efs-storage
+            EfsVolumeConfiguration:
+              FileSystemId: !Ref EFSFileSystem
+              TransitEncryption: ENABLED
+        Environment:
+          - Name: S3_BUCKET
+            Value: !Ref HPCDataBucket
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: EFS_FILE_SYSTEM_ID
+            Value: !Ref EFSFileSystem
+        Command:
+          - sh
+          - -c
+          - |
+            echo "Starting HPC simulation at $(date)"
+            echo "Job ID: $AWS_BATCH_JOB_ID"
+            echo "S3 Bucket: $S3_BUCKET"
+            echo "EFS File System: $EFS_FILE_SYSTEM_ID"
+            echo "Shared storage available at /shared"
+            ls -la /shared
+            echo "Running simulation..."
+            sleep 300
+            echo "Creating checkpoint file..."
+            echo "Checkpoint data $(date)" > /shared/checkpoint_${AWS_BATCH_JOB_ID}.txt
+            echo "Simulation completed at $(date)"
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref BatchJobLogGroup
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: 'hpc-job'
+      RetryStrategy:
+        Attempts: !Ref RetryAttempts
+      Timeout:
+        AttemptDurationSeconds: !Ref JobTimeoutSeconds
+      Tags:
+        Name: !Sub '${ProjectName}-job-definition'
+        Environment: !Ref Environment
+
+  # ----------------------------------------------------------------------------
+  # CLOUDWATCH RESOURCES
+  # ----------------------------------------------------------------------------
+  # Log Groups
+  BatchJobLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/batch/${ProjectName}-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-batch-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  S3AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-s3-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Metric Filters
+  SpotInstanceSavingsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: CreateAlarms
+    Properties:
+      LogGroupName: !Ref BatchJobLogGroup
+      FilterPattern: '[timestamp, level="INFO", message="*SPOT_SAVINGS*"]'
+      MetricTransformations:
+        - MetricNamespace: !Sub 'HPC/${ProjectName}'
+          MetricName: SpotSavings
+          MetricValue: '1'
+          DefaultValue: 0
+
+  # SNS Topic for Alarms
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateAlarms
+    Properties:
+      TopicName: !Sub '${ProjectName}-hpc-alarms-${Environment}'
+      DisplayName: 'HPC Batch Alarms'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alarm-topic'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Subscription
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AlarmNotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Alarms
+  FailedJobsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-FailedJobs-${Environment}'
+      AlarmDescription: 'Alert when Batch jobs fail frequently'
+      MetricName: FailedJobs
+      Namespace: AWS/Batch
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: JobQueue
+          Value: !Ref HPCJobQueue
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-failed-jobs-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+  HighCostAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlarms
+    Properties:
+      AlarmName: !Sub '${ProjectName}-HighCost-${Environment}'
+      AlarmDescription: 'Alert when compute costs exceed threshold'
+      MetricName: EstimatedCharges
+      Namespace: AWS/Billing
+      Statistic: Maximum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Currency
+          Value: USD
+        - Name: ServiceName
+          Value: AmazonEC2
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-high-cost-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+Outputs:
+  # Compute Resources
+  ComputeEnvironmentName:
+    Description: 'Name of the AWS Batch compute environment'
+    Value: !Ref HPCComputeEnvironment
+    Export:
+      Name: !Sub '${AWS::StackName}-ComputeEnvironment'
+
+  JobQueueName:
+    Description: 'Name of the AWS Batch job queue'
+    Value: !Ref HPCJobQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-JobQueue'
+
+  JobDefinitionName:
+    Description: 'Name of the AWS Batch job definition'
+    Value: !Ref HPCJobDefinition
+    Export:
+      Name: !Sub '${AWS::StackName}-JobDefinition'
+
+  JobDefinitionArn:
+    Description: 'ARN of the AWS Batch job definition'
+    Value: !Ref HPCJobDefinition
+    Export:
+      Name: !Sub '${AWS::StackName}-JobDefinitionArn'
+
+  # Storage Resources
+  S3BucketName:
+    Description: 'Name of the S3 bucket for HPC data'
+    Value: !Ref HPCDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3Bucket'
+
+  EFSFileSystemId:
+    Description: 'ID of the EFS file system for shared storage'
+    Value: !Ref EFSFileSystem
+    Export:
+      Name: !Sub '${AWS::StackName}-EFSFileSystem'
+
+  EFSFileSystemDNS:
+    Description: 'DNS name of the EFS file system'
+    Value: !Sub '${EFSFileSystem}.efs.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-EFSFileSystemDNS'
+
+  # Monitoring Resources
+  BatchLogGroupName:
+    Description: 'Name of the CloudWatch log group for Batch jobs'
+    Value: !Ref BatchJobLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-BatchLogGroup'
+
+  AlarmTopicArn:
+    Description: 'ARN of the SNS topic for alarms'
+    Value: !If [CreateAlarms, !Ref AlarmNotificationTopic, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-AlarmTopic'
+
+  # Job Submission Commands
+  SubmitJobCommand:
+    Description: 'AWS CLI command to submit a test job'
+    Value: !Sub |
+      aws batch submit-job \
+        --job-name "test-hpc-job-$(date +%s)" \
+        --job-queue ${HPCJobQueue} \
+        --job-definition ${HPCJobDefinition}
+
+  MonitorJobsCommand:
+    Description: 'AWS CLI command to monitor jobs'
+    Value: !Sub |
+      aws batch list-jobs --job-queue ${HPCJobQueue} --job-status RUNNING
+
+  # Cost Optimization Information
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost range for this infrastructure'
+    Value: '$5-50 (depending on compute usage and Spot pricing)'
+
+  CostOptimizationTips:
+    Description: 'Tips for optimizing costs'
+    Value: |
+      1. Use Spot instances with capacity optimization
+      2. Implement job checkpointing for fault tolerance
+      3. Scale compute environment to zero when not in use
+      4. Use S3 lifecycle policies for data archival
+      5. Monitor CloudWatch metrics for optimization opportunities
+
+  # Security Information
+  SecurityFeatures:
+    Description: 'Security features implemented'
+    Value: |
+      1. IAM roles with least privilege principles
+      2. EFS encryption at rest and in transit
+      3. S3 bucket encryption and access controls
+      4. VPC security groups for network isolation
+      5. CloudWatch logging for audit trails

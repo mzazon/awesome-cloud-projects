@@ -1,0 +1,714 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure for automated Savings Plans recommendations using Cost Explorer API - Creates Lambda function, IAM roles, S3 bucket, and EventBridge automation'
+
+# ====================
+# PARAMETERS
+# ====================
+Parameters:
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - 'dev'
+      - 'staging'
+      - 'prod'
+    Description: 'Environment name for resource naming and tagging'
+  
+  ProjectName:
+    Type: String
+    Default: 'savings-plans-analyzer'
+    Description: 'Project name used for resource naming'
+    MinLength: 3
+    MaxLength: 30
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*$'
+    ConstraintDescription: 'Must begin with a letter and contain only alphanumeric characters and hyphens'
+  
+  LookbackPeriod:
+    Type: String
+    Default: 'SIXTY_DAYS'
+    AllowedValues:
+      - 'SEVEN_DAYS'
+      - 'THIRTY_DAYS'
+      - 'SIXTY_DAYS'
+    Description: 'Historical usage period for analysis'
+  
+  TermYears:
+    Type: String
+    Default: 'ONE_YEAR'
+    AllowedValues:
+      - 'ONE_YEAR'
+      - 'THREE_YEARS'
+    Description: 'Savings Plans commitment term'
+  
+  PaymentOption:
+    Type: String
+    Default: 'NO_UPFRONT'
+    AllowedValues:
+      - 'NO_UPFRONT'
+      - 'PARTIAL_UPFRONT'
+      - 'ALL_UPFRONT'
+    Description: 'Payment option for Savings Plans'
+  
+  AnalysisSchedule:
+    Type: String
+    Default: 'rate(30 days)'
+    Description: 'EventBridge schedule expression for automated analysis'
+    AllowedPattern: '^(rate\([0-9]+ (minute|minutes|hour|hours|day|days)\)|cron\(.+\))$'
+    ConstraintDescription: 'Must be a valid EventBridge schedule expression'
+  
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+    Description: 'Lambda function timeout in seconds'
+  
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+    Description: 'Lambda function memory size in MB'
+  
+  S3BucketRetentionDays:
+    Type: Number
+    Default: 365
+    MinValue: 1
+    MaxValue: 2557
+    Description: 'S3 object retention period in days'
+  
+  EnableCloudWatchDashboard:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Create CloudWatch dashboard for monitoring'
+  
+  EnableEventBridgeAutomation:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable automated analysis via EventBridge'
+  
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: 'Email address for notifications (optional)'
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+
+# ====================
+# CONDITIONS
+# ====================
+Conditions:
+  CreateDashboard: !Equals [!Ref EnableCloudWatchDashboard, 'true']
+  CreateAutomation: !Equals [!Ref EnableEventBridgeAutomation, 'true']
+  CreateNotifications: !Not [!Equals [!Ref NotificationEmail, '']]
+  IsProdEnvironment: !Equals [!Ref Environment, 'prod']
+
+# ====================
+# RESOURCES
+# ====================
+Resources:
+  # ====================
+  # S3 BUCKET FOR REPORTS
+  # ====================
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-reports-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldReports
+            Status: Enabled
+            ExpirationInDays: !Ref S3BucketRetentionDays
+            NoncurrentVersionExpirationInDays: 30
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt SavingsPlansAnalyzerFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: savings-plans-recommendations/
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Savings Plans Analysis Reports'
+
+  # ====================
+  # S3 BUCKET POLICY
+  # ====================
+  ReportsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ReportsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: 
+              - !Sub '${ReportsBucket}/*'
+              - !GetAtt ReportsBucket.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Sid: AllowLambdaAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt LambdaExecutionRole.Arn
+            Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+              - 's3:DeleteObject'
+            Resource: !Sub '${ReportsBucket}/*'
+
+  # ====================
+  # IAM ROLE FOR LAMBDA
+  # ====================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CostExplorerAndSavingsPlansAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ce:GetSavingsPlansPurchaseRecommendation'
+                  - 'ce:StartSavingsPlansPurchaseRecommendationGeneration'
+                  - 'ce:GetCostAndUsage'
+                  - 'ce:GetDimensionValues'
+                  - 'ce:GetUsageReport'
+                  - 'ce:GetReservationCoverage'
+                  - 'ce:GetReservationPurchaseRecommendation'
+                  - 'ce:GetReservationUtilization'
+                  - 'ce:GetCostCategories'
+                  - 'ce:GetRightsizingRecommendation'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'savingsplans:DescribeSavingsPlans'
+                  - 'savingsplans:DescribeSavingsPlansOfferings'
+                  - 'savingsplans:DescribeSavingsPlansOfferingRates'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                Resource: !Sub '${ReportsBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                Resource: !GetAtt ReportsBucket.Arn
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !If [CreateNotifications, !Ref NotificationTopic, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ====================
+  # LAMBDA FUNCTION
+  # ====================
+  SavingsPlansAnalyzerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-analyzer-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          REPORTS_BUCKET: !Ref ReportsBucket
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+          LOOKBACK_PERIOD: !Ref LookbackPeriod
+          TERM_YEARS: !Ref TermYears
+          PAYMENT_OPTION: !Ref PaymentOption
+          SNS_TOPIC_ARN: !If [CreateNotifications, !Ref NotificationTopic, '']
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import datetime
+          import os
+          from decimal import Decimal
+          
+          def lambda_handler(event, context):
+              ce_client = boto3.client('ce')
+              s3_client = boto3.client('s3')
+              sns_client = boto3.client('sns') if os.environ.get('SNS_TOPIC_ARN') else None
+              
+              # Get configuration from environment or event
+              lookback_days = event.get('lookback_days', os.environ.get('LOOKBACK_PERIOD', 'SIXTY_DAYS'))
+              term_years = event.get('term_years', os.environ.get('TERM_YEARS', 'ONE_YEAR'))
+              payment_option = event.get('payment_option', os.environ.get('PAYMENT_OPTION', 'NO_UPFRONT'))
+              bucket_name = event.get('bucket_name', os.environ.get('REPORTS_BUCKET'))
+              
+              results = {
+                  'analysis_date': datetime.datetime.now().isoformat(),
+                  'account_id': context.invoked_function_arn.split(':')[4],
+                  'region': context.invoked_function_arn.split(':')[3],
+                  'parameters': {
+                      'lookback_days': lookback_days,
+                      'term_years': term_years,
+                      'payment_option': payment_option
+                  },
+                  'recommendations': []
+              }
+              
+              # Analyze different Savings Plans types
+              sp_types = ['COMPUTE_SP', 'EC2_INSTANCE_SP', 'SAGEMAKER_SP']
+              
+              for sp_type in sp_types:
+                  try:
+                      print(f"Analyzing {sp_type} recommendations...")
+                      
+                      # Get Savings Plans recommendations
+                      response = ce_client.get_savings_plans_purchase_recommendation(
+                          SavingsPlansType=sp_type,
+                          TermInYears=term_years,
+                          PaymentOption=payment_option,
+                          LookbackPeriodInDays=lookback_days,
+                          PageSize=10
+                      )
+                      
+                      # Process recommendation data
+                      if 'SavingsPlansPurchaseRecommendation' in response:
+                          rec = response['SavingsPlansPurchaseRecommendation']
+                          summary = rec.get('SavingsPlansPurchaseRecommendationSummary', {})
+                          
+                          recommendation = {
+                              'savings_plan_type': sp_type,
+                              'summary': {
+                                  'estimated_monthly_savings': summary.get('EstimatedMonthlySavingsAmount', '0'),
+                                  'estimated_roi': summary.get('EstimatedROI', '0'),
+                                  'estimated_savings_percentage': summary.get('EstimatedSavingsPercentage', '0'),
+                                  'hourly_commitment': summary.get('HourlyCommitmentToPurchase', '0'),
+                                  'total_recommendations': summary.get('TotalRecommendationCount', '0')
+                              },
+                              'details': []
+                          }
+                          
+                          # Add detailed recommendations
+                          for detail in rec.get('SavingsPlansPurchaseRecommendationDetails', []):
+                              recommendation['details'].append({
+                                  'account_id': detail.get('AccountId', ''),
+                                  'currency_code': detail.get('CurrencyCode', 'USD'),
+                                  'estimated_monthly_savings': detail.get('EstimatedMonthlySavingsAmount', '0'),
+                                  'estimated_roi': detail.get('EstimatedROI', '0'),
+                                  'hourly_commitment': detail.get('HourlyCommitmentToPurchase', '0'),
+                                  'upfront_cost': detail.get('UpfrontCost', '0'),
+                                  'savings_plans_details': detail.get('SavingsPlansDetails', {})
+                              })
+                          
+                          results['recommendations'].append(recommendation)
+                      
+                  except Exception as e:
+                      print(f"Error analyzing {sp_type}: {str(e)}")
+                      results['recommendations'].append({
+                          'savings_plan_type': sp_type,
+                          'error': str(e)
+                      })
+              
+              # Calculate total potential savings
+              total_monthly_savings = 0
+              for rec in results['recommendations']:
+                  if 'error' not in rec:
+                      try:
+                          savings = float(rec['summary']['estimated_monthly_savings'])
+                          total_monthly_savings += savings
+                      except (ValueError, KeyError):
+                          pass
+              
+              results['total_monthly_savings'] = total_monthly_savings
+              results['annual_savings_potential'] = total_monthly_savings * 12
+              
+              # Save results to S3
+              if bucket_name:
+                  timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+                  key = f"savings-plans-recommendations/{timestamp}.json"
+                  
+                  s3_client.put_object(
+                      Bucket=bucket_name,
+                      Key=key,
+                      Body=json.dumps(results, indent=2, default=str),
+                      ContentType='application/json'
+                  )
+                  
+                  results['report_location'] = f"s3://{bucket_name}/{key}"
+                  print(f"Report saved to {results['report_location']}")
+              
+              # Send notification if configured
+              if sns_client and os.environ.get('SNS_TOPIC_ARN') and total_monthly_savings > 0:
+                  message = f"""
+          Savings Plans Analysis Complete
+          
+          Analysis Date: {results['analysis_date']}
+          Total Monthly Savings Potential: ${total_monthly_savings:.2f}
+          Annual Savings Potential: ${total_monthly_savings * 12:.2f}
+          
+          Report Location: {results.get('report_location', 'N/A')}
+          
+          Recommendations generated for: {', '.join([r['savings_plan_type'] for r in results['recommendations'] if 'error' not in r])}
+                  """
+                  
+                  sns_client.publish(
+                      TopicArn=os.environ.get('SNS_TOPIC_ARN'),
+                      Subject='Savings Plans Analysis Results',
+                      Message=message
+                  )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(results, indent=2, default=str)
+              }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: 'Savings Plans Analysis'
+
+  # ====================
+  # LAMBDA PERMISSION FOR S3
+  # ====================
+  LambdaInvokePermissionForS3:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SavingsPlansAnalyzerFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub '${ReportsBucket}/*'
+
+  # ====================
+  # SNS TOPIC FOR NOTIFICATIONS
+  # ====================
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateNotifications
+    Properties:
+      TopicName: !Sub '${ProjectName}-notifications-${Environment}'
+      DisplayName: 'Savings Plans Analysis Notifications'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ====================
+  # SNS SUBSCRIPTION
+  # ====================
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: CreateNotifications
+    Properties:
+      Protocol: email
+      TopicArn: !Ref NotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # ====================
+  # EVENTBRIDGE RULE
+  # ====================
+  ScheduledAnalysisRule:
+    Type: AWS::Events::Rule
+    Condition: CreateAutomation
+    Properties:
+      Name: !Sub '${ProjectName}-scheduled-analysis-${Environment}'
+      Description: 'Scheduled Savings Plans analysis'
+      ScheduleExpression: !Ref AnalysisSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SavingsPlansAnalyzerFunction.Arn
+          Id: 'SavingsPlansAnalyzerTarget'
+          Input: !Sub |
+            {
+              "lookback_days": "${LookbackPeriod}",
+              "term_years": "${TermYears}",
+              "payment_option": "${PaymentOption}",
+              "bucket_name": "${ReportsBucket}"
+            }
+
+  # ====================
+  # LAMBDA PERMISSION FOR EVENTBRIDGE
+  # ====================
+  LambdaInvokePermissionForEventBridge:
+    Type: AWS::Lambda::Permission
+    Condition: CreateAutomation
+    Properties:
+      FunctionName: !Ref SavingsPlansAnalyzerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledAnalysisRule.Arn
+
+  # ====================
+  # CLOUDWATCH LOG GROUP
+  # ====================
+  SavingsPlansAnalyzerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${SavingsPlansAnalyzerFunction}'
+      RetentionInDays: !If [IsProdEnvironment, 90, 30]
+      KmsKeyId: !If [IsProdEnvironment, !GetAtt LogsKMSKey.Arn, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ====================
+  # KMS KEY FOR LOGS (PROD ONLY)
+  # ====================
+  LogsKMSKey:
+    Type: AWS::KMS::Key
+    Condition: IsProdEnvironment
+    Properties:
+      Description: 'KMS key for CloudWatch Logs encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:DescribeKey'
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-analyzer-${Environment}'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ====================
+  # KMS KEY ALIAS
+  # ====================
+  LogsKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: IsProdEnvironment
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-logs-${Environment}'
+      TargetKeyId: !Ref LogsKMSKey
+
+  # ====================
+  # CLOUDWATCH DASHBOARD
+  # ====================
+  SavingsPlansAnalyzerDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CreateDashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-dashboard-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${SavingsPlansAnalyzerFunction}"],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${SavingsPlansAnalyzerFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${SavingsPlansAnalyzerFunction}"],
+                  ["AWS/Lambda", "Throttles", "FunctionName", "${SavingsPlansAnalyzerFunction}"]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Savings Plans Analyzer Performance",
+                "period": 300,
+                "stat": "Average",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/S3", "NumberOfObjects", "BucketName", "${ReportsBucket}", "StorageType", "AllStorageTypes"],
+                  ["AWS/S3", "BucketSizeBytes", "BucketName", "${ReportsBucket}", "StorageType", "StandardStorage"]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "S3 Reports Bucket Metrics",
+                "period": 86400,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${SavingsPlansAnalyzerFunction}' | fields @timestamp, @message | filter @message like /ERROR/ or @message like /Exception/ | sort @timestamp desc | limit 50",
+                "region": "${AWS::Region}",
+                "title": "Recent Errors and Exceptions",
+                "view": "table"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${SavingsPlansAnalyzerFunction}' | fields @timestamp, @message | filter @message like /total_monthly_savings/ | sort @timestamp desc | limit 20",
+                "region": "${AWS::Region}",
+                "title": "Savings Analysis Results",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+# ====================
+# OUTPUTS
+# ====================
+Outputs:
+  LambdaFunctionName:
+    Description: 'Name of the Savings Plans analyzer Lambda function'
+    Value: !Ref SavingsPlansAnalyzerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Savings Plans analyzer Lambda function'
+    Value: !GetAtt SavingsPlansAnalyzerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  ReportsBucketName:
+    Description: 'Name of the S3 bucket for storing analysis reports'
+    Value: !Ref ReportsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ReportsBucketName'
+
+  ReportsBucketArn:
+    Description: 'ARN of the S3 bucket for storing analysis reports'
+    Value: !GetAtt ReportsBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ReportsBucketArn'
+
+  IAMRoleArn:
+    Description: 'ARN of the IAM role used by the Lambda function'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IAMRoleArn'
+
+  EventBridgeRuleName:
+    Description: 'Name of the EventBridge rule for scheduled analysis'
+    Value: !If [CreateAutomation, !Ref ScheduledAnalysisRule, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeRuleName'
+
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for notifications'
+    Value: !If [CreateNotifications, !Ref NotificationTopic, 'Not Created']
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  CloudWatchDashboardURL:
+    Description: 'URL to the CloudWatch dashboard'
+    Value: !If 
+      - CreateDashboard
+      - !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-dashboard-${Environment}'
+      - 'Not Created'
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudWatchDashboardURL'
+
+  LogGroupName:
+    Description: 'Name of the CloudWatch log group'
+    Value: !Ref SavingsPlansAnalyzerLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupName'
+
+  DeploymentRegion:
+    Description: 'AWS region where the resources are deployed'
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentRegion'
+
+  StackVersion:
+    Description: 'Version of the CloudFormation stack'
+    Value: '1.0'
+    Export:
+      Name: !Sub '${AWS::StackName}-StackVersion'
+
+  ManualInvocationCommand:
+    Description: 'AWS CLI command to manually invoke the Lambda function'
+    Value: !Sub |
+      aws lambda invoke \
+        --function-name ${SavingsPlansAnalyzerFunction} \
+        --payload '{"lookback_days": "${LookbackPeriod}", "term_years": "${TermYears}", "payment_option": "${PaymentOption}", "bucket_name": "${ReportsBucket}"}' \
+        --region ${AWS::Region} \
+        response.json
+
+  S3ReportsPath:
+    Description: 'S3 path where analysis reports are stored'
+    Value: !Sub 's3://${ReportsBucket}/savings-plans-recommendations/'
+    Export:
+      Name: !Sub '${AWS::StackName}-S3ReportsPath'

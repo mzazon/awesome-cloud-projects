@@ -1,0 +1,511 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for implementing analytics workload isolation with Amazon Redshift Workload Management (WLM). Creates parameter groups, monitoring infrastructure, and IAM resources for multi-tenant workload separation.'
+
+Parameters:
+  ClusterIdentifier:
+    Type: String
+    Description: 'Identifier for the Redshift cluster to apply WLM configuration'
+    Default: 'analytics-wlm-cluster'
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
+    ConstraintDescription: 'Must be a valid Redshift cluster identifier (lowercase, alphanumeric, hyphens allowed)'
+
+  ParameterGroupFamily:
+    Type: String
+    Description: 'Redshift parameter group family version'
+    Default: 'redshift-1.0'
+    AllowedValues:
+      - 'redshift-1.0'
+    ConstraintDescription: 'Must be a valid Redshift parameter group family'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for CloudWatch alarm notifications'
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  Environment:
+    Type: String
+    Description: 'Environment name for resource tagging'
+    Default: 'production'
+    AllowedValues:
+      - 'development'
+      - 'staging'
+      - 'production'
+
+  EnableEnhancedMonitoring:
+    Type: String
+    Description: 'Enable enhanced CloudWatch monitoring for detailed metrics'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Conditions:
+  EnableEnhancedMonitoringCondition: !Equals [!Ref EnableEnhancedMonitoring, 'true']
+
+Resources:
+  # Custom Parameter Group for WLM Configuration
+  RedshiftParameterGroup:
+    Type: AWS::Redshift::ClusterParameterGroup
+    Properties:
+      ParameterGroupName: !Sub '${ClusterIdentifier}-wlm-parameter-group'
+      ParameterGroupFamily: !Ref ParameterGroupFamily
+      Description: 'Analytics workload isolation parameter group with WLM configuration'
+      Parameters:
+        # WLM Configuration with 4 queues for workload isolation
+        # Queue 1: BI Dashboard (15 slots, 25% memory, 2min timeout)
+        # Queue 2: Data Science (3 slots, 40% memory, 2hr timeout)  
+        # Queue 3: ETL Process (5 slots, 25% memory, 1hr timeout)
+        # Queue 4: Default (2 slots, 10% memory, 30min timeout)
+        wlm_json_configuration: !Sub |
+          [
+            {
+              "user_group": "bi-dashboard-group",
+              "query_group": "dashboard",
+              "query_concurrency": 15,
+              "memory_percent_to_use": 25,
+              "max_execution_time": 120000,
+              "query_group_wild_card": 0,
+              "rules": [
+                {
+                  "rule_name": "dashboard_timeout_rule",
+                  "predicate": "query_execution_time > 120",
+                  "action": "abort"
+                },
+                {
+                  "rule_name": "dashboard_cpu_rule",
+                  "predicate": "query_cpu_time > 30",
+                  "action": "log"
+                }
+              ]
+            },
+            {
+              "user_group": "data-science-group",
+              "query_group": "analytics",
+              "query_concurrency": 3,
+              "memory_percent_to_use": 40,
+              "max_execution_time": 7200000,
+              "query_group_wild_card": 0,
+              "rules": [
+                {
+                  "rule_name": "analytics_memory_rule",
+                  "predicate": "query_temp_blocks_to_disk > 100000",
+                  "action": "log"
+                },
+                {
+                  "rule_name": "analytics_nested_loop_rule",
+                  "predicate": "nested_loop_join_row_count > 1000000",
+                  "action": "hop"
+                }
+              ]
+            },
+            {
+              "user_group": "etl-process-group",
+              "query_group": "etl",
+              "query_concurrency": 5,
+              "memory_percent_to_use": 25,
+              "max_execution_time": 3600000,
+              "query_group_wild_card": 0,
+              "rules": [
+                {
+                  "rule_name": "etl_timeout_rule",
+                  "predicate": "query_execution_time > 3600",
+                  "action": "abort"
+                },
+                {
+                  "rule_name": "etl_scan_rule",
+                  "predicate": "scan_row_count > 1000000000",
+                  "action": "log"
+                }
+              ]
+            },
+            {
+              "query_concurrency": 2,
+              "memory_percent_to_use": 10,
+              "max_execution_time": 1800000,
+              "query_group_wild_card": 1,
+              "rules": [
+                {
+                  "rule_name": "default_timeout_rule",
+                  "predicate": "query_execution_time > 1800",
+                  "action": "abort"
+                }
+              ]
+            }
+          ]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Redshift WLM Configuration'
+        - Key: Recipe
+          Value: 'analytics-workload-isolation-redshift-workload-management'
+
+  # SNS Topic for CloudWatch Alarms
+  WLMAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ClusterIdentifier}-wlm-alerts'
+      DisplayName: 'Redshift WLM Performance Alerts'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'WLM Monitoring Alerts'
+
+  # SNS Subscription for Email Notifications
+  WLMAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref WLMAlertsTopic
+      Protocol: 'email'
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Alarm for High Queue Wait Time
+  HighQueueWaitTimeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ClusterIdentifier}-HighQueueWaitTime'
+      AlarmDescription: 'Alert when WLM queue wait time is high indicating resource contention'
+      MetricName: 'QueueLength'
+      Namespace: 'AWS/Redshift'
+      Statistic: 'Average'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: 'GreaterThanThreshold'
+      Dimensions:
+        - Name: 'ClusterIdentifier'
+          Value: !Ref ClusterIdentifier
+      AlarmActions:
+        - !Ref WLMAlertsTopic
+      TreatMissingData: 'notBreaching'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'WLM Queue Monitoring'
+
+  # CloudWatch Alarm for High CPU Utilization
+  HighCPUUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ClusterIdentifier}-HighCPUUtilization'
+      AlarmDescription: 'Alert when cluster CPU utilization is high indicating potential performance issues'
+      MetricName: 'CPUUtilization'
+      Namespace: 'AWS/Redshift'
+      Statistic: 'Average'
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 85
+      ComparisonOperator: 'GreaterThanThreshold'
+      Dimensions:
+        - Name: 'ClusterIdentifier'
+          Value: !Ref ClusterIdentifier
+      AlarmActions:
+        - !Ref WLMAlertsTopic
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Cluster CPU Monitoring'
+
+  # CloudWatch Alarm for Query Completion Rate
+  LowQueryCompletionRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ClusterIdentifier}-LowQueryCompletionRate'
+      AlarmDescription: 'Alert when query completion rate drops indicating system performance degradation'
+      MetricName: 'QueriesCompletedPerSecond'
+      Namespace: 'AWS/Redshift'
+      Statistic: 'Sum'
+      Period: 900
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: 'LessThanThreshold'
+      Dimensions:
+        - Name: 'ClusterIdentifier'
+          Value: !Ref ClusterIdentifier
+      AlarmActions:
+        - !Ref WLMAlertsTopic
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Query Performance Monitoring'
+
+  # Enhanced CloudWatch Alarm for Database Connections (Optional)
+  HighDatabaseConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableEnhancedMonitoringCondition
+    Properties:
+      AlarmName: !Sub '${ClusterIdentifier}-HighDatabaseConnections'
+      AlarmDescription: 'Alert when database connection count is approaching limits'
+      MetricName: 'DatabaseConnections'
+      Namespace: 'AWS/Redshift'
+      Statistic: 'Average'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 450  # Adjust based on cluster size and expected connections
+      ComparisonOperator: 'GreaterThanThreshold'
+      Dimensions:
+        - Name: 'ClusterIdentifier'
+          Value: !Ref ClusterIdentifier
+      AlarmActions:
+        - !Ref WLMAlertsTopic
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Connection Monitoring'
+
+  # CloudWatch Dashboard for WLM Monitoring
+  WLMMonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ClusterIdentifier}-WLM-Performance'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Redshift", "QueueLength", "ClusterIdentifier", "${ClusterIdentifier}" ],
+                  [ ".", "QueriesCompletedPerSecond", ".", "." ],
+                  [ ".", "CPUUtilization", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Redshift WLM Core Performance Metrics",
+                "view": "timeSeries",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Redshift", "DatabaseConnections", "ClusterIdentifier", "${ClusterIdentifier}" ],
+                  [ ".", "HealthStatus", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Cluster Health and Connection Metrics",
+                "view": "timeSeries",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Redshift", "ReadLatency", "ClusterIdentifier", "${ClusterIdentifier}" ],
+                  [ ".", "WriteLatency", ".", "." ],
+                  [ ".", "ReadThroughput", ".", "." ],
+                  [ ".", "WriteThroughput", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Storage Performance Metrics",
+                "view": "timeSeries",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+  # IAM Role for Redshift Enhanced Monitoring (Optional)
+  RedshiftMonitoringRole:
+    Type: AWS::IAM::Role
+    Condition: EnableEnhancedMonitoringCondition
+    Properties:
+      RoleName: !Sub '${ClusterIdentifier}-monitoring-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: redshift.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRedshiftServiceLinkedRolePolicy
+      Policies:
+        - PolicyName: RedshiftEnhancedMonitoring
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/redshift/cluster/${ClusterIdentifier}/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: 'Redshift Monitoring'
+
+Outputs:
+  ParameterGroupName:
+    Description: 'Name of the created Redshift parameter group with WLM configuration'
+    Value: !Ref RedshiftParameterGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ParameterGroupName'
+
+  ParameterGroupFamily:
+    Description: 'Parameter group family version'
+    Value: !Ref ParameterGroupFamily
+    Export:
+      Name: !Sub '${AWS::StackName}-ParameterGroupFamily'
+
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for WLM alerts'
+    Value: !Ref WLMAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  DashboardURL:
+    Description: 'URL to the CloudWatch dashboard for WLM monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ClusterIdentifier}-WLM-Performance'
+
+  WLMConfiguration:
+    Description: 'Summary of WLM queue configuration'
+    Value: 'BI Dashboard Queue (15 slots, 25% memory), Data Science Queue (3 slots, 40% memory), ETL Queue (5 slots, 25% memory), Default Queue (2 slots, 10% memory)'
+
+  ApplyParameterGroupCommand:
+    Description: 'AWS CLI command to apply the parameter group to your Redshift cluster'
+    Value: !Sub |
+      aws redshift modify-cluster --cluster-identifier YOUR_CLUSTER_ID --cluster-parameter-group-name ${RedshiftParameterGroup} --apply-immediately
+
+  UserGroupSetupSQL:
+    Description: 'SQL commands to create user groups for workload isolation'
+    Value: |
+      -- Create user groups for workload isolation
+      CREATE GROUP "bi-dashboard-group";
+      CREATE GROUP "data-science-group";
+      CREATE GROUP "etl-process-group";
+      
+      -- Create sample users (replace passwords with secure values)
+      CREATE USER dashboard_user1 PASSWORD 'CHANGE_ME' IN GROUP "bi-dashboard-group";
+      CREATE USER analytics_user1 PASSWORD 'CHANGE_ME' IN GROUP "data-science-group";
+      CREATE USER etl_user1 PASSWORD 'CHANGE_ME' IN GROUP "etl-process-group";
+      
+      -- Grant appropriate permissions
+      GRANT ALL ON SCHEMA public TO GROUP "bi-dashboard-group";
+      GRANT ALL ON SCHEMA public TO GROUP "data-science-group";
+      GRANT ALL ON SCHEMA public TO GROUP "etl-process-group";
+
+  MonitoringViews:
+    Description: 'SQL to create monitoring views for WLM performance analysis'
+    Value: |
+      -- Create view to monitor queue performance
+      CREATE OR REPLACE VIEW wlm_queue_performance AS
+      SELECT 
+          service_class,
+          CASE 
+              WHEN service_class = 6 THEN 'BI Dashboard Queue'
+              WHEN service_class = 7 THEN 'Data Science Queue'
+              WHEN service_class = 8 THEN 'ETL Queue'
+              WHEN service_class = 5 THEN 'Default Queue'
+              ELSE 'System Queue'
+          END AS queue_name,
+          num_query_tasks,
+          num_executing_queries,
+          num_executed_queries,
+          num_queued_queries,
+          query_working_mem,
+          available_query_mem,
+          ROUND(100.0 * num_executing_queries / num_query_tasks, 2) AS utilization_pct
+      FROM stv_wlm_service_class_state
+      WHERE service_class >= 5
+      ORDER BY service_class;
+
+  MonitoringRole:
+    Condition: EnableEnhancedMonitoringCondition
+    Description: 'IAM role for enhanced Redshift monitoring'
+    Value: !Ref RedshiftMonitoringRole
+    Export:
+      Name: !Sub '${AWS::StackName}-MonitoringRole'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Cluster Configuration"
+        Parameters:
+          - ClusterIdentifier
+          - ParameterGroupFamily
+      - Label:
+          default: "Monitoring Configuration"
+        Parameters:
+          - NotificationEmail
+          - EnableEnhancedMonitoring
+      - Label:
+          default: "Environment Configuration"
+        Parameters:
+          - Environment
+    ParameterLabels:
+      ClusterIdentifier:
+        default: "Redshift Cluster Identifier"
+      ParameterGroupFamily:
+        default: "Parameter Group Family"
+      NotificationEmail:
+        default: "Notification Email"
+      EnableEnhancedMonitoring:
+        default: "Enable Enhanced Monitoring"
+      Environment:
+        default: "Environment Tag"
+
+  Purpose: |
+    This CloudFormation template implements Amazon Redshift Workload Management (WLM) for analytics workload isolation.
+    
+    The template creates:
+    - Custom parameter group with 4-queue WLM configuration
+    - Query monitoring rules for automatic query governance
+    - CloudWatch alarms for proactive monitoring
+    - SNS topic for real-time alerting
+    - CloudWatch dashboard for performance visualization
+    - IAM role for enhanced monitoring (optional)
+    
+    WLM Queue Configuration:
+    - BI Dashboard Queue: 15 concurrent slots, 25% memory, 2-minute timeout
+    - Data Science Queue: 3 concurrent slots, 40% memory, 2-hour timeout
+    - ETL Process Queue: 5 concurrent slots, 25% memory, 1-hour timeout
+    - Default Queue: 2 concurrent slots, 10% memory, 30-minute timeout
+    
+    This configuration ensures workload isolation and prevents resource contention in multi-tenant environments.
+
+  Version: "1.0"
+  LastUpdated: "2025-01-13"

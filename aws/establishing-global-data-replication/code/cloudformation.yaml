@@ -1,0 +1,778 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Multi-Region S3 Data Replication with KMS Encryption, IAM Roles, and CloudWatch Monitoring'
+
+# ============================================================================
+# PARAMETERS
+# ============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: multi-region-s3-replication
+    Description: Project name used for resource naming and tagging
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: Environment designation for resource tagging and configuration
+
+  PrimaryRegion:
+    Type: String
+    Default: us-east-1
+    Description: Primary region for source S3 bucket
+    AllowedValues:
+      - us-east-1
+      - us-east-2
+      - us-west-1
+      - us-west-2
+      - eu-west-1
+      - eu-west-2
+      - eu-central-1
+      - ap-southeast-1
+      - ap-southeast-2
+      - ap-northeast-1
+
+  SecondaryRegion:
+    Type: String
+    Default: us-west-2
+    Description: Secondary region for first destination bucket
+    AllowedValues:
+      - us-east-1
+      - us-east-2
+      - us-west-1
+      - us-west-2
+      - eu-west-1
+      - eu-west-2
+      - eu-central-1
+      - ap-southeast-1
+      - ap-southeast-2
+      - ap-northeast-1
+
+  TertiaryRegion:
+    Type: String
+    Default: eu-west-1
+    Description: Tertiary region for second destination bucket
+    AllowedValues:
+      - us-east-1
+      - us-east-2
+      - us-west-1
+      - us-west-2
+      - eu-west-1
+      - eu-west-2
+      - eu-central-1
+      - ap-southeast-1
+      - ap-southeast-2
+      - ap-northeast-1
+
+  EnableIntelligentTiering:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable S3 Intelligent Tiering for cost optimization
+
+  EnableReplicationTimeControl:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable S3 Replication Time Control (RTC) for 15-minute SLA
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for CloudWatch alarms and notifications
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    ConstraintDescription: Must be a valid email address
+
+  CostCenter:
+    Type: String
+    Default: IT-Storage
+    Description: Cost center for billing and resource allocation
+    MaxLength: 50
+
+  Owner:
+    Type: String
+    Default: DataTeam
+    Description: Team or individual responsible for these resources
+    MaxLength: 50
+
+# ============================================================================
+# CONDITIONS
+# ============================================================================
+Conditions:
+  EnableIntelligentTieringCondition: !Equals [!Ref EnableIntelligentTiering, 'true']
+  EnableRTCCondition: !Equals [!Ref EnableReplicationTimeControl, 'true']
+  IsPrimaryRegion: !Equals [!Ref 'AWS::Region', !Ref PrimaryRegion]
+
+# ============================================================================
+# RESOURCES
+# ============================================================================
+Resources:
+
+  # -------------------------
+  # KMS Keys for Encryption
+  # -------------------------
+  SourceKMSKey:
+    Type: AWS::KMS::Key
+    Condition: IsPrimaryRegion
+    Properties:
+      Description: !Sub 'KMS key for S3 multi-region replication source bucket - ${ProjectName}'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow S3 Service
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+              - 'kms:DescribeKey'
+            Resource: '*'
+          - Sid: Allow Replication Role
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt S3ReplicationRole.Arn
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+              - 'kms:DescribeKey'
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-source-kms-key'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Purpose
+          Value: S3MultiRegionReplication
+
+  SourceKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: IsPrimaryRegion
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-source-key'
+      TargetKeyId: !Ref SourceKMSKey
+
+  # -------------------------
+  # IAM Role for Replication
+  # -------------------------
+  S3ReplicationRole:
+    Type: AWS::IAM::Role
+    Condition: IsPrimaryRegion
+    Properties:
+      RoleName: !Sub '${ProjectName}-replication-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: S3ReplicationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetReplicationConfiguration'
+                  - 's3:ListBucket'
+                  - 's3:GetBucketVersioning'
+                Resource: !Sub '${SourceBucket.Arn}'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObjectVersionForReplication'
+                  - 's3:GetObjectVersionAcl'
+                  - 's3:GetObjectVersionTagging'
+                Resource: !Sub '${SourceBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - 's3:ReplicateObject'
+                  - 's3:ReplicateDelete'
+                  - 's3:ReplicateTags'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ProjectName}-dest1-${AWS::AccountId}/*'
+                  - !Sub 'arn:aws:s3:::${ProjectName}-dest2-${AWS::AccountId}/*'
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:GenerateDataKey'
+                  - 'kms:DescribeKey'
+                Resource:
+                  - !GetAtt SourceKMSKey.Arn
+                  - !Sub 'arn:aws:kms:${SecondaryRegion}:${AWS::AccountId}:key/*'
+                  - !Sub 'arn:aws:kms:${TertiaryRegion}:${AWS::AccountId}:key/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-replication-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+
+  # -------------------------
+  # S3 Source Bucket
+  # -------------------------
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Condition: IsPrimaryRegion
+    Properties:
+      BucketName: !Sub '${ProjectName}-source-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref SourceKMSKey
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveTransition
+            Status: Enabled
+            Filter:
+              Prefix: 'archive/'
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+            NoncurrentVersionTransitions:
+              - TransitionInDays: 7
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 30
+                StorageClass: GLACIER
+            NoncurrentVersionExpirationInDays: 365
+      IntelligentTieringConfigurations:
+        - !If
+          - EnableIntelligentTieringCondition
+          - Id: EntireBucket
+            Status: Enabled
+            Prefix: ''
+            Tierings:
+              - AccessTier: ARCHIVE_ACCESS
+                Days: 90
+              - AccessTier: DEEP_ARCHIVE_ACCESS
+                Days: 180
+            OptionalFields:
+              - BucketKeyStatus
+          - !Ref 'AWS::NoValue'
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-source-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: MultiRegionReplication
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Compliance
+          Value: SOX-GDPR
+        - Key: BackupStrategy
+          Value: MultiRegion
+
+  # Source Bucket Policy
+  SourceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: IsPrimaryRegion
+    Properties:
+      Bucket: !Ref SourceBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${SourceBucket.Arn}'
+              - !Sub '${SourceBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: AllowReplicationRole
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt S3ReplicationRole.Arn
+            Action:
+              - 's3:GetReplicationConfiguration'
+              - 's3:ListBucket'
+              - 's3:GetObjectVersionForReplication'
+              - 's3:GetObjectVersionAcl'
+              - 's3:GetObjectVersionTagging'
+            Resource:
+              - !Sub '${SourceBucket.Arn}'
+              - !Sub '${SourceBucket.Arn}/*'
+
+  # -------------------------
+  # CloudWatch Monitoring
+  # -------------------------
+  ReplicationAlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: IsPrimaryRegion
+    Properties:
+      TopicName: !Sub '${ProjectName}-replication-alerts'
+      DisplayName: 'S3 Multi-Region Replication Alerts'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-replication-alerts'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+
+  ReplicationAlarmTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: IsPrimaryRegion
+    Properties:
+      Protocol: email
+      TopicArn: !Ref ReplicationAlarmTopic
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Alarm for Replication Failures
+  ReplicationFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsPrimaryRegion
+    Properties:
+      AlarmName: !Sub 'S3-Replication-Failure-Rate-${SourceBucket}'
+      AlarmDescription: 'High replication failure rate detected'
+      MetricName: FailedReplication
+      Namespace: AWS/S3
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref ReplicationAlarmTopic
+      Dimensions:
+        - Name: SourceBucket
+          Value: !Ref SourceBucket
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-replication-failure-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Alarm for Replication Latency
+  ReplicationLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsPrimaryRegion
+    Properties:
+      AlarmName: !Sub 'S3-Replication-Latency-${SourceBucket}'
+      AlarmDescription: 'Replication latency exceeds acceptable threshold'
+      MetricName: ReplicationLatency
+      Namespace: AWS/S3
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 900
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref ReplicationAlarmTopic
+      Dimensions:
+        - Name: SourceBucket
+          Value: !Ref SourceBucket
+        - Name: DestinationBucket
+          Value: !Sub '${ProjectName}-dest1-${AWS::AccountId}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-replication-latency-alarm'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Dashboard
+  ReplicationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: IsPrimaryRegion
+    Properties:
+      DashboardName: !Sub '${ProjectName}-Multi-Region-Replication-Dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "ReplicationLatency", "SourceBucket", "${SourceBucket}", "DestinationBucket", "${ProjectName}-dest1-${AWS::AccountId}" ],
+                  [ "AWS/S3", "ReplicationLatency", "SourceBucket", "${SourceBucket}", "DestinationBucket", "${ProjectName}-dest2-${AWS::AccountId}" ],
+                  [ "AWS/S3", "FailedReplication", "SourceBucket", "${SourceBucket}" ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "S3 Multi-Region Replication Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "BucketSizeBytes", "BucketName", "${SourceBucket}", "StorageType", "StandardStorage" ],
+                  [ "AWS/S3", "BucketSizeBytes", "BucketName", "${ProjectName}-dest1-${AWS::AccountId}", "StorageType", "StandardStorage" ],
+                  [ "AWS/S3", "BucketSizeBytes", "BucketName", "${ProjectName}-dest2-${AWS::AccountId}", "StorageType", "StandardStorage" ]
+                ],
+                "period": 86400,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Bucket Size Comparison",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+  # -------------------------
+  # CloudTrail for Audit
+  # -------------------------
+  S3AuditTrail:
+    Type: AWS::CloudTrail::Trail
+    Condition: IsPrimaryRegion
+    Properties:
+      TrailName: !Sub '${ProjectName}-audit-trail'
+      S3BucketName: !Ref SourceBucket
+      S3KeyPrefix: 'cloudtrail-logs/'
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: AWS::S3::Object
+              Values:
+                - !Sub '${SourceBucket}/*'
+            - Type: AWS::S3::Bucket
+              Values:
+                - !Ref SourceBucket
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-audit-trail'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+
+  # -------------------------
+  # Lambda Function for Health Checks
+  # -------------------------
+  HealthCheckExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: IsPrimaryRegion
+    Properties:
+      RoleName: !Sub '${ProjectName}-healthcheck-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3HealthCheckPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                  - 's3:GetBucketLocation'
+                  - 's3:GetBucketVersioning'
+                Resource:
+                  - !Sub '${SourceBucket.Arn}'
+                  - !Sub 'arn:aws:s3:::${ProjectName}-dest1-${AWS::AccountId}'
+                  - !Sub 'arn:aws:s3:::${ProjectName}-dest2-${AWS::AccountId}'
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                Resource: '*'
+
+  HealthCheckFunction:
+    Type: AWS::Lambda::Function
+    Condition: IsPrimaryRegion
+    Properties:
+      FunctionName: !Sub '${ProjectName}-health-check'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt HealthCheckExecutionRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref SourceBucket
+          DEST_BUCKET_1: !Sub '${ProjectName}-dest1-${AWS::AccountId}'
+          DEST_BUCKET_2: !Sub '${ProjectName}-dest2-${AWS::AccountId}'
+          SECONDARY_REGION: !Ref SecondaryRegion
+          TERTIARY_REGION: !Ref TertiaryRegion
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              cloudwatch = boto3.client('cloudwatch')
+              
+              buckets = [
+                  {'name': os.environ['SOURCE_BUCKET'], 'region': 'us-east-1'},
+                  {'name': os.environ['DEST_BUCKET_1'], 'region': os.environ['SECONDARY_REGION']},
+                  {'name': os.environ['DEST_BUCKET_2'], 'region': os.environ['TERTIARY_REGION']}
+              ]
+              
+              results = []
+              
+              for bucket in buckets:
+                  try:
+                      s3 = boto3.client('s3', region_name=bucket['region'])
+                      s3.head_bucket(Bucket=bucket['name'])
+                      health_status = 1  # Healthy
+                      results.append(f"✅ {bucket['name']} is healthy")
+                  except Exception as e:
+                      health_status = 0  # Unhealthy
+                      results.append(f"❌ {bucket['name']} is unavailable: {str(e)}")
+                  
+                  # Send metric to CloudWatch
+                  cloudwatch.put_metric_data(
+                      Namespace='S3/MultiRegion',
+                      MetricData=[
+                          {
+                              'MetricName': 'BucketHealth',
+                              'Dimensions': [
+                                  {
+                                      'Name': 'BucketName',
+                                      'Value': bucket['name']
+                                  },
+                                  {
+                                      'Name': 'Region',
+                                      'Value': bucket['region']
+                                  }
+                              ],
+                              'Value': health_status,
+                              'Unit': 'Count',
+                              'Timestamp': datetime.utcnow()
+                          }
+                      ]
+                  )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': 'Health check completed',
+                      'results': results,
+                      'timestamp': datetime.utcnow().isoformat()
+                  })
+              }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-health-check'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CostCenter
+          Value: !Ref CostCenter
+        - Key: Owner
+          Value: !Ref Owner
+
+  # EventBridge Rule for Scheduled Health Checks
+  HealthCheckScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: IsPrimaryRegion
+    Properties:
+      Name: !Sub '${ProjectName}-health-check-schedule'
+      Description: 'Scheduled health check for S3 multi-region replication'
+      ScheduleExpression: 'rate(5 minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt HealthCheckFunction.Arn
+          Id: 'HealthCheckTarget'
+
+  HealthCheckPermission:
+    Type: AWS::Lambda::Permission
+    Condition: IsPrimaryRegion
+    Properties:
+      FunctionName: !Ref HealthCheckFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt HealthCheckScheduleRule.Arn
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+Outputs:
+  SourceBucketName:
+    Description: 'Name of the source S3 bucket'
+    Value: !Ref SourceBucket
+    Condition: IsPrimaryRegion
+    Export:
+      Name: !Sub '${AWS::StackName}-SourceBucketName'
+
+  SourceBucketArn:
+    Description: 'ARN of the source S3 bucket'
+    Value: !GetAtt SourceBucket.Arn
+    Condition: IsPrimaryRegion
+    Export:
+      Name: !Sub '${AWS::StackName}-SourceBucketArn'
+
+  SourceKMSKeyId:
+    Description: 'KMS Key ID for source bucket encryption'
+    Value: !Ref SourceKMSKey
+    Condition: IsPrimaryRegion
+    Export:
+      Name: !Sub '${AWS::StackName}-SourceKMSKeyId'
+
+  SourceKMSKeyArn:
+    Description: 'KMS Key ARN for source bucket encryption'
+    Value: !GetAtt SourceKMSKey.Arn
+    Condition: IsPrimaryRegion
+    Export:
+      Name: !Sub '${AWS::StackName}-SourceKMSKeyArn'
+
+  ReplicationRoleArn:
+    Description: 'ARN of the IAM role for S3 replication'
+    Value: !GetAtt S3ReplicationRole.Arn
+    Condition: IsPrimaryRegion
+    Export:
+      Name: !Sub '${AWS::StackName}-ReplicationRoleArn'
+
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for replication alerts'
+    Value: !Ref ReplicationAlarmTopic
+    Condition: IsPrimaryRegion
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  CloudWatchDashboardURL:
+    Description: 'URL to the CloudWatch dashboard for monitoring replication'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-Multi-Region-Replication-Dashboard'
+    Condition: IsPrimaryRegion
+
+  DestinationBucket1Name:
+    Description: 'Expected name of the first destination bucket (to be created in secondary region)'
+    Value: !Sub '${ProjectName}-dest1-${AWS::AccountId}'
+    Condition: IsPrimaryRegion
+
+  DestinationBucket2Name:
+    Description: 'Expected name of the second destination bucket (to be created in tertiary region)'
+    Value: !Sub '${ProjectName}-dest2-${AWS::AccountId}'
+    Condition: IsPrimaryRegion
+
+  ReplicationConfigurationCommand:
+    Description: 'AWS CLI command to configure replication (run after destination buckets are created)'
+    Value: !Sub |
+      aws s3api put-bucket-replication --bucket ${SourceBucket} --replication-configuration '{
+        "Role": "${S3ReplicationRole.Arn}",
+        "Rules": [
+          {
+            "ID": "ReplicateAllToSecondary",
+            "Status": "Enabled",
+            "Priority": 1,
+            "Filter": {"Prefix": ""},
+            "DeleteMarkerReplication": {"Status": "Enabled"},
+            "Destination": {
+              "Bucket": "arn:aws:s3:::${ProjectName}-dest1-${AWS::AccountId}",
+              "StorageClass": "STANDARD_IA",
+              "EncryptionConfiguration": {"ReplicaKmsKeyID": "arn:aws:kms:${SecondaryRegion}:${AWS::AccountId}:alias/${ProjectName}-dest1-key"},
+              "Metrics": {"Status": "Enabled", "EventThreshold": {"Minutes": 15}},
+              "ReplicationTime": {"Status": "Enabled", "Time": {"Minutes": 15}}
+            }
+          },
+          {
+            "ID": "ReplicateAllToTertiary",
+            "Status": "Enabled",
+            "Priority": 2,
+            "Filter": {"Prefix": ""},
+            "DeleteMarkerReplication": {"Status": "Enabled"},
+            "Destination": {
+              "Bucket": "arn:aws:s3:::${ProjectName}-dest2-${AWS::AccountId}",
+              "StorageClass": "STANDARD_IA",
+              "EncryptionConfiguration": {"ReplicaKmsKeyID": "arn:aws:kms:${TertiaryRegion}:${AWS::AccountId}:alias/${ProjectName}-dest2-key"},
+              "Metrics": {"Status": "Enabled", "EventThreshold": {"Minutes": 15}},
+              "ReplicationTime": {"Status": "Enabled", "Time": {"Minutes": 15}}
+            }
+          }
+        ]
+      }'
+    Condition: IsPrimaryRegion
+
+  NextSteps:
+    Description: 'Instructions for completing the multi-region setup'
+    Value: !Sub |
+      1. Deploy this template in secondary region (${SecondaryRegion}) with parameter PrimaryRegion=false
+      2. Deploy this template in tertiary region (${TertiaryRegion}) with parameter PrimaryRegion=false
+      3. Create KMS keys in destination regions
+      4. Run the ReplicationConfigurationCommand output
+      5. Test replication by uploading objects to the source bucket
+    Condition: IsPrimaryRegion
+
+  HealthCheckFunctionArn:
+    Description: 'ARN of the Lambda function for health checks'
+    Value: !GetAtt HealthCheckFunction.Arn
+    Condition: IsPrimaryRegion
+    Export:
+      Name: !Sub '${AWS::StackName}-HealthCheckFunctionArn'
+
+  ProjectName:
+    Description: 'Project name used for resource naming'
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectName'
+
+  Environment:
+    Description: 'Environment designation'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${AWS::StackName}-Environment'
